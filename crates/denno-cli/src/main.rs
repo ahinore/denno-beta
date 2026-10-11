@@ -54,6 +54,9 @@ enum Commands {
         /// int8 は exact decoding の決定論 (同seed→同出力) を維持するが
         /// fp32 と同一出力ではない (丸め誤差)
         #[arg(long, default_value = "fp32")] quant: String,
+        /// P4: リクエストキューの上限 (実行中 1 件の他に待ち行列に入れられる数)。
+        /// 同時受け付けがこれを超えると 503 (overloaded_error) を返す
+        #[arg(long, default_value_t = 32)] max_queue: usize,
     },
 }
 
@@ -146,7 +149,7 @@ fn main() -> Result<()> {
             };
             println!("{}", out);
         }
-        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant } => {
+        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue } => {
             let dir = model_dir(&repo);
             if !dir.exists() {
                 bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
@@ -162,6 +165,7 @@ fn main() -> Result<()> {
                 default_seed: seed,
                 prefix_cache_tokens,
                 quant: quant_mode,
+                max_queue,
             }))?;
         }
     }

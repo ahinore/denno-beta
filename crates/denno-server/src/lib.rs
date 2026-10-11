@@ -16,9 +16,14 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 
+mod scheduler;
+pub use scheduler::{Job, QueueFull, Scheduler};
+
 pub struct AppState {
-    pub engine: Mutex<Engine>,
+    pub engine: Arc<Mutex<Engine>>,
     pub api_key: Option<String>,
+    /// P4: リクエストスケジューラ (有界キュー + 単一ワーカー)
+    pub scheduler: Scheduler,
 }
 
 /// serve 設定
@@ -33,6 +38,11 @@ pub struct ServeConfig {
     pub prefix_cache_tokens: Option<usize>,
     /// 重みの量子化モード (P3。デフォルト fp32。int8 は CLI でのみ有効化)
     pub quant: QuantMode,
+    /// P4: リクエストキューの上限 (実行中 1 件の他に待ち行列に入れられる数)。
+    /// 同時受け付けがこれを超えると 503 (overloaded_error) を返す。
+    /// キューに入ったリクエストは実行開始まで待つ (サーバー側の待ち時間
+    /// タイムアウトは無し)。
+    pub max_queue: usize,
 }
 
 // ---------- Anthropic 形式エラー ----------
@@ -55,6 +65,10 @@ impl ApiError {
     }
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found_error", message)
+    }
+    /// キュー満杯 (同時受け付け上限超過)。Anthropic 流の overloaded_error。
+    pub fn overloaded(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, "overloaded_error", message)
     }
     fn api(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "api_error", message)
@@ -186,9 +200,11 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
         ctx
     );
 
+    let engine = Arc::new(Mutex::new(engine));
     let state = Arc::new(AppState {
-        engine: Mutex::new(engine),
+        engine: engine.clone(),
         api_key: cfg.api_key,
+        scheduler: Scheduler::spawn(engine, cfg.max_queue.max(1)),
     });
 
     let app = router(state);
@@ -289,10 +305,32 @@ async fn messages(
     };
 
     if req.stream.unwrap_or(false) {
-        stream_response(state, chat_messages, system, params).await
+        // SSE 応答は即座に開始し、ジョブ実行 (キュー待ち含む) 中は
+        // keep-alive ping (2秒間隔) が流れ続ける
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+        state
+            .scheduler
+            .submit_stream(system, chat_messages, params, tx)
+            .map_err(queue_full_error(&state))?;
+        let stream = ReceiverStream::new(rx);
+        Ok(Sse::new(stream)
+            // prefill 中にイベントが途切れるとクライアント (Hermes 等) がアイドル
+            // タイムアウトで接続を切ってしまうため、短い間隔で keep-alive を送る。
+            .keep_alive(
+                KeepAlive::new()
+                    .interval(std::time::Duration::from_secs(2))
+                    .text("ping"),
+            )
+            .into_response())
     } else {
-        let output = run_engine(state.clone(), chat_messages, system, params)
+        let rx = state
+            .scheduler
+            .submit_chat(system, chat_messages, params)
+            .map_err(queue_full_error(&state))?;
+        let output = rx
             .await
+            .map_err(|e| anyhow::anyhow!("scheduler dropped: {e}"))
+            .and_then(|r| r)
             .map_err(|e| {
                 let msg = format!("{e:#}");
                 if msg.contains("invalid_request_error") {
@@ -306,24 +344,14 @@ async fn messages(
     }
 }
 
-/// エンジン実行(spawn_blocking + Mutex。エンジンは逐次実行)
-async fn run_engine(
-    state: Arc<AppState>,
-    chat_messages: Vec<ChatMessage>,
-    system: Option<String>,
-    params: GenParams,
-) -> Result<ChatOutput, anyhow::Error> {
-    tokio::task::spawn_blocking(move || {
-        let mut g = state.engine.lock().unwrap();
-        g.chat(
-            system.as_deref(),
-            &chat_messages,
-            &params,
-            |_| {}, // 非ストリーミング: 差分は捨てる
-        )
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("join error: {e}"))?
+/// キュー満杯時の 503 エラー (Anthropic 流 overloaded_error)
+fn queue_full_error(state: &AppState) -> impl Fn(QueueFull) -> ApiError + '_ {
+    move |_| {
+        ApiError::overloaded(format!(
+            "server busy: request queue is full (max_queue = {}, in_flight = 1); retry later",
+            state.scheduler.max_queue()
+        ))
+    }
 }
 
 fn message_json(model: &str, out: &ChatOutput) -> serde_json::Value {
@@ -342,130 +370,13 @@ fn message_json(model: &str, out: &ChatOutput) -> serde_json::Value {
     })
 }
 
-fn new_msg_id() -> String {
+pub(crate) fn new_msg_id() -> String {
     let mut rng = rand::thread_rng();
     let id: String = (0..24).map(|_| format!("{:x}", rng.gen::<u8>() % 16)).collect();
     format!("msg_{id}")
 }
 
-// ---------- SSE ストリーミング ----------
-
-async fn stream_response(
-    state: Arc<AppState>,
-    chat_messages: Vec<ChatMessage>,
-    system: Option<String>,
-    params: GenParams,
-) -> Result<Response, ApiError> {
-    let model_name = state.engine.lock().unwrap().name.clone();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
-
-    tokio::task::spawn_blocking(move || {
-        tracing::info!("stream task started");
-        let input_tokens = {
-            // message_start 用に input tokens を事前計算するため、まずテンプレートだけ適用
-            let mut g = state.engine.lock().unwrap();
-            let prompt = g.tok.apply_chat_template(
-                system.as_deref(),
-                &chat_messages,
-            );
-            prompt.ok().and_then(|p| g.tok.encode(&p).ok()).map(|v| v.len()).unwrap_or(0)
-        };
-
-        let send = |v: serde_json::Value| -> bool {
-            match tx.blocking_send(Ok(to_event(&v))) {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::warn!("sse send failed: {e}");
-                    false
-                }
-            }
-        };
-
-        // 1. message_start
-        if !send(json!({
-            "type": "message_start",
-            "message": {
-                "id": new_msg_id(),
-                "type": "message",
-                "role": "assistant",
-                "model": model_name,
-                "content": [],
-                "stop_reason": serde_json::Value::Null,
-                "stop_sequence": serde_json::Value::Null,
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-            }
-        })) {
-            return;
-        }
-        // 2. content_block_start
-        if !send(json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""}
-        })) {
-            return;
-        }
-        // 3. ping
-        let _ = send(json!({"type": "ping"}));
-
-        // 生成
-        let mut output_tokens = 0usize;
-        let mut stop_reason = "max_tokens";
-        let mut stop_sequence: Option<String> = None;
-        let run = {
-            let mut g = state.engine.lock().unwrap();
-            g.chat(system.as_deref(), &chat_messages, &params, |delta| {
-                let _ = send(json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": delta}
-                }));
-            })
-        };
-        match run {
-            Ok(out) => {
-                output_tokens = out.output_tokens;
-                stop_reason = out.stop_reason.as_str();
-                stop_sequence = out.stop_sequence;
-            }
-            Err(e) => {
-                tracing::error!("chat failed in stream: {e:#}");
-                // エラーは error イベントで通知して閉じる
-                let _ = send(json!({
-                    "type": "error",
-                    "error": {"type": "api_error", "message": format!("{e:#}")}
-                }));
-                return;
-            }
-        }
-
-        // 4. content_block_stop
-        if !send(json!({"type": "content_block_stop", "index": 0})) {
-            return;
-        }
-        // 5. message_delta
-        let _ = send(json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
-            "usage": {"output_tokens": output_tokens}
-        }));
-        // 6. message_stop
-        let _ = send(json!({"type": "message_stop"}));
-    });
-
-    let stream = ReceiverStream::new(rx);
-    Ok(Sse::new(stream)
-        // prefill 中にイベントが途切れるとクライアント (Hermes 等) がアイドル
-        // タイムアウトで接続を切ってしまうため、短い間隔で keep-alive を送る。
-        .keep_alive(
-            KeepAlive::new()
-                .interval(std::time::Duration::from_secs(2))
-                .text("ping"),
-        )
-        .into_response())
-}
-
-fn to_event(v: &serde_json::Value) -> Event {
+pub(crate) fn to_event(v: &serde_json::Value) -> Event {
     // Anthropic の SSE は各イベントに event: <type> 行が必要
     // (例: event: message_start / data: {...})
     let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("message");
