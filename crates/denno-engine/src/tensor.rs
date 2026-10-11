@@ -46,6 +46,32 @@ fn par_sgemm(a: &[f32], b: &[f32], rs_b: isize, c: &mut [f32], m: usize, k: usiz
         });
 }
 
+/// c += alpha * a @ b^T (a: [m,k] row-major, b: [n,k] row-major, c: [m,n] row-major)
+/// attention の scores 計算用 (既存値に加算)
+pub fn sgemm_acc(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize, alpha: f32) {
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    let rows_per_task = ((m + 7) / 8).clamp(1, m);
+    c.par_chunks_mut(rows_per_task * n)
+        .enumerate()
+        .for_each(|(ti, chunk)| {
+            let row0 = ti * rows_per_task;
+            let rows = (m - row0).min(rows_per_task);
+            let a_ptr = unsafe { a.as_ptr().add(row0 * k) };
+            let c_ptr = chunk.as_mut_ptr();
+            unsafe {
+                matrixmultiply::sgemm(
+                    rows, k, n, alpha,
+                    a_ptr, k as isize, 1isize,
+                    b.as_ptr(), 1isize, k as isize,
+                    1.0,
+                    c_ptr, n as isize, 1,
+                );
+            }
+        });
+}
+
 /// 各行にバイアスを加算 (x: row-major [rows, cols])
 pub fn add_bias(x: &mut [f32], bias: &[f32], cols: usize) {
     for row in x.chunks_mut(cols) {

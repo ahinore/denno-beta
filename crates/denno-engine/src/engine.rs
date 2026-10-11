@@ -106,6 +106,22 @@ impl Engine {
         let prompt_ids = self.tok.encode(&prompt)?;
 
         let max_tokens = params.max_tokens;
+        // Hermes 等のクライアントは context_length から大きな max_tokens (例: 65535) を
+        // 送ってくることがある。Anthropic API なら 400 を返す場面だが、このサーバーは
+        // 学習用ツールなので「コンテキストに収まる範囲へクランプ」して続行する。
+        let max_tokens = if prompt_ids.len() + max_tokens > self.model.context() {
+            let clamped = self.model.context().saturating_sub(prompt_ids.len());
+            tracing::warn!(
+                "max_tokens {} clamped to {} to fit context {} (prompt {} tokens)",
+                max_tokens,
+                clamped,
+                self.model.context(),
+                prompt_ids.len()
+            );
+            clamped
+        } else {
+            max_tokens
+        };
         if prompt_ids.len() + max_tokens > self.model.context() {
             bail!(
                 "invalid_request_error: prompt ({} tokens) + max_tokens ({}) がモデルのコンテキスト長 {} を超えます",

@@ -1,0 +1,3 @@
+[build]
+# AVX2/FMA を有効化(attention のスカラー演算の自動ベクトル化に効く)
+rustflags = ["-C", "target-cpu=native"]

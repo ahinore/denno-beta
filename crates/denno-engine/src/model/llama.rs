@@ -181,34 +181,49 @@ impl Model for LlamaQwen2 {
             let mut att = vec![0.0f32; n * heads * dh];
             {
                 let (kc, vc) = cache.kv_bufs(li);
-                let mut scores = vec![0.0f32; pos0 + n];
+                let t_total = pos0 + n;
                 let scale = 1.0 / (dh as f32).sqrt();
-                for i in 0..n {
-                    let t_ctx = pos0 + i + 1;
-                    for qh in 0..heads {
-                        let kvh = qh / group;
-                        let off = qh * dh;
-                        let kv_off = kvh * dh;
-                        let qrow = &q[i * heads * dh + off..][..dh];
-                        for j in 0..t_ctx {
-                            let krow = &kc[j * kv_dim + kv_off..][..dh];
-                            let mut dot = 0.0f32;
-                            for d in 0..dh {
-                                dot += qrow[d] * krow[d];
-                            }
-                            scores[j] = dot * scale;
+                // GQA: 同じ kv ヘッドを共有する group 個の q ヘッドをまとめて処理する。
+                // scores[i,j] = q[i,gh] · k[j,kh] は sgemm で一括計算し(行列積)、
+                // causal mask → softmax → att = probs @ v も sgemm で行う。
+                let mut scores = vec![0.0f32; n * t_total];
+                let mut kh = vec![0.0f32; t_total * dh];
+                let mut vh = vec![0.0f32; t_total * dh];
+                for kvh in 0..kv_heads {
+                    // K/V ヘッド列の抽出 (contiguous 化)
+                    for j in 0..t_total {
+                        kh[j * dh..][..dh].copy_from_slice(&kc[j * kv_dim + kvh * dh..][..dh]);
+                        vh[j * dh..][..dh].copy_from_slice(&vc[j * kv_dim + kvh * dh..][..dh]);
+                    }
+                    for g in 0..group {
+                        let qh = kvh * group + g;
+                        // Q ヘッド列の抽出 [n, dh]
+                        let mut qg = vec![0.0f32; n * dh];
+                        for i in 0..n {
+                            qg[i * dh..][..dh].copy_from_slice(
+                                &q[i * heads * dh + qh * dh..][..dh],
+                            );
                         }
-                        crate::tensor::softmax(&mut scores[..t_ctx]);
-                        let out = &mut att[i * heads * dh + off..][..dh];
-                        for v_val in out.iter_mut() {
-                            *v_val = 0.0;
+                        // scores[i,j] = qg[i] · kh[j] * scale  (kh は [t_total, dh] row-major → matmul_bt で a@b^T)
+                        for s in scores.iter_mut() {
+                            *s = 0.0;
                         }
-                        for j in 0..t_ctx {
-                            let w = scores[j];
-                            let vrow = &vc[j * kv_dim + kv_off..][..dh];
-                            for d in 0..dh {
-                                out[d] += w * vrow[d];
+                        crate::tensor::sgemm_acc(
+                            &qg, &kh, &mut scores, n, dh, t_total, scale,
+                        );
+                        // causal mask (prefill 時、未来の位置を -inf に)
+                        for i in 0..n {
+                            let row = &mut scores[i * t_total..][..t_total];
+                            for j in (pos0 + i + 1)..t_total {
+                                row[j] = f32::NEG_INFINITY;
                             }
+                            crate::tensor::softmax(row);
+                        }
+                        // att_head[i] = Σ_j probs[i,j] * vh[j]  (通常の行列積)
+                        let out = crate::tensor::matmul(&scores, &vh, n, t_total, dh);
+                        for i in 0..n {
+                            att[i * heads * dh + qh * dh..][..dh]
+                                .copy_from_slice(&out[i * dh..][..dh]);
                         }
                     }
                 }

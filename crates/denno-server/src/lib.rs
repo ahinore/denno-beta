@@ -147,7 +147,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/messages", post(messages))
+        .layer(axum::middleware::from_fn(log_requests))
         .with_state(state)
+}
+
+async fn log_requests(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    tracing::info!("{} {}", req.method(), req.uri().path());
+    let resp = next.run(req).await;
+    tracing::info!("-> {}", resp.status());
+    resp
 }
 
 pub async fn run(cfg: ServeConfig) -> Result<()> {
@@ -339,6 +350,7 @@ async fn stream_response(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::task::spawn_blocking(move || {
+        tracing::info!("stream task started");
         let input_tokens = {
             // message_start 用に input tokens を事前計算するため、まずテンプレートだけ適用
             let mut g = state.engine.lock().unwrap();
@@ -349,7 +361,15 @@ async fn stream_response(
             prompt.ok().and_then(|p| g.tok.encode(&p).ok()).map(|v| v.len()).unwrap_or(0)
         };
 
-        let send = |v: serde_json::Value| -> bool { tx.blocking_send(Ok(to_event(&v))).is_ok() };
+        let send = |v: serde_json::Value| -> bool {
+            match tx.blocking_send(Ok(to_event(&v))) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!("sse send failed: {e}");
+                    false
+                }
+            }
+        };
 
         // 1. message_start
         if !send(json!({
@@ -399,6 +419,7 @@ async fn stream_response(
                 stop_sequence = out.stop_sequence;
             }
             Err(e) => {
+                tracing::error!("chat failed in stream: {e:#}");
                 // エラーは error イベントで通知して閉じる
                 let _ = send(json!({
                     "type": "error",
@@ -424,10 +445,19 @@ async fn stream_response(
 
     let stream = ReceiverStream::new(rx);
     Ok(Sse::new(stream)
-        .keep_alive(KeepAlive::default())
+        // prefill 中にイベントが途切れるとクライアント (Hermes 等) がアイドル
+        // タイムアウトで接続を切ってしまうため、短い間隔で keep-alive を送る。
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(2))
+                .text("ping"),
+        )
         .into_response())
 }
 
 fn to_event(v: &serde_json::Value) -> Event {
-    Event::default().data(v.to_string())
+    // Anthropic の SSE は各イベントに event: <type> 行が必要
+    // (例: event: message_start / data: {...})
+    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("message");
+    Event::default().event(ty).data(v.to_string())
 }
