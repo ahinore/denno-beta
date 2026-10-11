@@ -71,6 +71,10 @@ pub struct Engine {
     pub cache: KvCache,
     pub name: String,
     pub default_seed: Option<u64>,
+    /// KVキャッシュに入っているプロンプトトークン列 (prefix cache 用)。
+    /// cached_prompt[i] の KV は cache の i 行目にある。
+    /// (生成トークンの KV も cache には残るが cached_prompt には含めない)
+    cached_prompt: Vec<u32>,
 }
 
 impl Engine {
@@ -86,6 +90,7 @@ impl Engine {
             cache,
             name: name.into(),
             default_seed,
+            cached_prompt: Vec::new(),
         })
     }
 
@@ -131,9 +136,31 @@ impl Engine {
             );
         }
 
-        // prefill
-        self.cache.reset();
-        let mut logits = self.model.forward(&prompt_ids, &mut self.cache)?;
+        // --- prefill (prefix cache 付き) ---
+        // 前回リクエストのプロンプトと共通する接頭辞の KV は計算済みなので再利用する。
+        // (Hermes 等は毎回同じ system prompt を送ってくるため、prefill の大半を省略できる)
+        let lcp = prompt_ids
+            .iter()
+            .zip(self.cached_prompt.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        // logits は forward した最終位置からしか得られないので、
+        // 少なくとも最後の 1 トークンは必ず forward する
+        let lcp = lcp.min(prompt_ids.len().saturating_sub(1));
+        if lcp > 0 {
+            tracing::info!(
+                "prefix cache hit: reuse {} / {} tokens (recompute {})",
+                lcp,
+                prompt_ids.len(),
+                prompt_ids.len() - lcp
+            );
+        }
+        // cache.len() >= lcp が常に成り立つ (生成トークン分だけ長いことがある) ので
+        // truncate で共通接頭辞まで戻し、残りを forward する。
+        // truncate された stale な行は forward 中に上書きされるか、そもそも参照されない。
+        self.cache.truncate(lcp);
+        let mut logits = self.model.forward(&prompt_ids[lcp..], &mut self.cache)?;
+        self.cached_prompt = prompt_ids.clone();
 
         let seed = params.seed.or(self.default_seed);
         let mut sampler = Sampler::new(params.temperature, params.top_k, params.top_p, seed);

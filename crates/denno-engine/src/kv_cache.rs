@@ -63,4 +63,12 @@ impl KvCache {
         );
         self.len += n;
     }
+
+    /// キャッシュを len トークンまで縮める (prefix cache 用)。
+    /// 縮められた領域の行は stale になるが、attention は 0..len+n しか
+    /// 参照しないため読まれることはない。次の forward で上書きされる。
+    pub fn truncate(&mut self, len: usize) {
+        assert!(len <= self.len, "KV cache truncate: {len} > {}", self.len);
+        self.len = len;
+    }
 }

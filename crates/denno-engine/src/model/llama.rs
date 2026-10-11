@@ -121,6 +121,16 @@ impl LlamaQwen2 {
     }
 }
 
+/// nn.Linear 相当 (b: [out,in] row-major)。decode (m==1) は出力分割並列の
+/// matvec に切り替える (重み約1GB/トークンを1スレッドで読むと律速になるため)。
+fn lin(a: &[f32], w: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    if m == 1 {
+        crate::tensor::matvec_bt(a, w, k, n)
+    } else {
+        crate::tensor::matmul_bt(a, w, m, k, n)
+    }
+}
+
 impl Model for LlamaQwen2 {
     fn context(&self) -> usize {
         self.ctx
@@ -154,9 +164,9 @@ impl Model for LlamaQwen2 {
         for (li, layer) in self.layers.iter().enumerate() {
             // --- attention ---
             let h = rmsnorm(&x, &layer.ln1_w, e, self.eps);
-            let mut q = matmul_bt(&h, &layer.q_w, n, e, heads * dh); // [n, H*dh]
-            let mut k = matmul_bt(&h, &layer.k_w, n, e, kv_dim); // [n, K*dh]
-            let mut v = matmul_bt(&h, &layer.v_w, n, e, kv_dim);
+            let mut q = lin(&h, &layer.q_w, n, e, heads * dh); // [n, H*dh]
+            let mut k = lin(&h, &layer.k_w, n, e, kv_dim); // [n, K*dh]
+            let mut v = lin(&h, &layer.v_w, n, e, kv_dim);
             if let Some(b) = &layer.q_b {
                 add_bias(&mut q, b, heads * dh);
             }
@@ -229,20 +239,20 @@ impl Model for LlamaQwen2 {
                 }
             }
 
-            let proj = matmul_bt(&att, &layer.o_w, n, heads * dh, e);
+            let proj = lin(&att, &layer.o_w, n, heads * dh, e);
             for i in 0..n * e {
                 x[i] += proj[i];
             }
 
             // --- mlp (SwiGLU) ---
             let h2 = rmsnorm(&x, &layer.ln2_w, e, self.eps);
-            let mut gate = matmul_bt(&h2, &layer.gate_w, n, e, self.ff);
-            let up = matmul_bt(&h2, &layer.up_w, n, e, self.ff);
+            let mut gate = lin(&h2, &layer.gate_w, n, e, self.ff);
+            let up = lin(&h2, &layer.up_w, n, e, self.ff);
             silu_inplace(&mut gate);
             for i in 0..n * self.ff {
                 gate[i] *= up[i];
             }
-            let down = matmul_bt(&gate, &layer.down_w, n, self.ff, e);
+            let down = lin(&gate, &layer.down_w, n, self.ff, e);
             for i in 0..n * e {
                 x[i] += down[i];
             }
@@ -251,8 +261,8 @@ impl Model for LlamaQwen2 {
         let last = &x[(n - 1) * e..];
         let hn = rmsnorm(last, &self.norm_w, e, self.eps);
         let logits = match &self.lm_head {
-            Some(w) => matmul_bt(&hn, w, 1, e, self.vocab),
-            None => matmul_bt(&hn, &self.embed, 1, e, self.vocab), // tied
+            Some(w) => lin(&hn, w, 1, e, self.vocab),
+            None => lin(&hn, &self.embed, 1, e, self.vocab), // tied
         };
 
         cache.advance(n);

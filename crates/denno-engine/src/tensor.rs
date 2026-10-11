@@ -72,6 +72,25 @@ pub fn sgemm_acc(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
         });
 }
 
+/// c[j] = dot(a, b[j*k..][..k]) を出力分割で並列に計算 (decode 用 matvec)。
+/// m=1 の行列積は A 側で分割できないため、出力列 (= B の行) で並列化する。
+/// b: [n,k] row-major (nn.Linear 形状)。
+pub fn matvec_bt(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; n];
+    c.par_iter_mut()
+        .enumerate()
+        .with_min_len(64)
+        .for_each(|(j, cj)| {
+            let row = &b[j * k..][..k];
+            let mut s = 0.0f32;
+            for d in 0..k {
+                s += a[d] * row[d];
+            }
+            *cj = s;
+        });
+    c
+}
+
 /// 各行にバイアスを加算 (x: row-major [rows, cols])
 pub fn add_bias(x: &mut [f32], bias: &[f32], cols: usize) {
     for row in x.chunks_mut(cols) {
