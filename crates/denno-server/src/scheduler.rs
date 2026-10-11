@@ -1,29 +1,29 @@
-//! P4: 連続バッチングスケジューラ (同時受け付け + prefill/decode インターリーブ)。
+//! P6: 連続バッチングスケジューラ (同時受け付け + prefill/decode インターリーブ)。
 //!
 //! 設計:
 //!
 //! - HTTP ハンドラは検証が通ったリクエストを直ちに有界キュー (`sync_channel`)
 //!   に入れる (**同時受け付け**)。キューが満杯のとき `QueueFull` を返し、
 //!   ハンドラは HTTP 503 (overloaded_error) を返す。
-//! - ワーカーは 1 つだけあり、エンジンの Mutex を **1 forward ステップ単位**で
-//!   取得して複数リクエストの生成を時分割で進める:
-//!   - 実行中リクエストの decode 1 ステップの合間に、新規リクエストの prefill
-//!     (1 forward) を割り込ませる (**prefill/decode インターリーブ**。TTFT 改善)。
-//!     優先度は 実行中 decode > 新規 prefill。
-//!   - decode 中の複数リクエストは round-robin で 1 ステップずつ進める (フェアネス)。
-//!   - 切替時、単一 KV キャッシュの内容を `suspend_session` / `install_session`
-//!     でスナップショット/復元する。KV の各行はトークン接頭辞のみに依存するため
-//!     切替えは bit 完全に可逆 (**exactness 維持**: インターリーブ下でも各
-//!     リクエストの出力は単独実行と完全一致)。
-//! - 同時に live (KV キャッシュ保持者) にできるのは 1 リクエスト。進行中
-//!   (live + suspend 済み) のリクエスト数は [`MAX_ACTIVE_SESSIONS`] に制限する
-//!   (suspend KV スナップショットのメモリ上限)。
+//! - ワーカーは 1 つだけあり、エンジンの Mutex を **1 ステップ単位**で取得して
+//!   複数リクエストの生成を進める:
+//!   - 各リクエストは [`MAX_ACTIVE_SESSIONS`] 個の KV キャッシュスロットの
+//!     いずれかに**完了まで常駐**する (P4 の suspend/restore ローテーション廃止)。
+//!   - decode 中の全リクエストは [`Engine::step_chat_batch`] で **1 forward に
+//!     まとめて**進める (P6 バッチ並列 decode。線形層で重み読み出しを共有)。
+//!   - 新規リクエストの prefill は decode ステップの合間に 1 forward で割り込ませる
+//!     (**prefill/decode インターリーブ**。TTFT 改善)。優先度は 実行中 decode > 新規 prefill。
+//!   - exactness: `forward_batch` は各セッションの KV/演算列が単独 decode と
+//!     ビット一致 (engine 側の契約)。サンプラはセッション毎に独立した RNG を
+//!     持つため、バッチの構成は各リクエストの出力に影響しない
+//!     (**インターリーブ下でも各リクエストの出力は単独実行と完全一致**)。
+//! - 進行中のリクエスト数は [`MAX_ACTIVE_SESSIONS`] (KV キャッシュスロット数) に
+//!   制限する。
 //! - キューに入ったリクエストは実行開始まで待つ (**サーバー側の待ち時間
 //!   タイムアウトは無し**。タイムアウト制御はクライアント側の責務)。
 //!   SSE リクエストは応答ストリームを即座に開始するため、待ち行列中も
 //!   keep-alive ping (2秒間隔) が流れ続けて接続が切れない。
 
-use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -36,9 +36,8 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::{new_msg_id, to_event};
 
-/// ワーカーが同時に進行できるリクエスト数の上限 (live + suspend 済み)。
-/// キュー (`max_queue`) とは別の上限で、suspend KV スナップショットの
-/// メモリ (1 リクエストあたり最大コンテキスト長分の KV) を抑える。
+/// ワーカーが同時に進行できるリクエスト数の上限 (= エンジンの KV キャッシュ
+/// スロット数と一致させる)。キュー (`max_queue`) とは別の上限。
 pub const MAX_ACTIVE_SESSIONS: usize = 4;
 
 /// スケジューラに積むジョブ。検証済みのパラメータのみが入る。
@@ -134,115 +133,117 @@ impl Scheduler {
 }
 
 /// ワーカーメインループ。エンジン Mutex を 1 ステップ単位で取得し、
-/// 複数リクエストを時分割で進める。
+/// 複数リクエストを並行して進める (decode は 1 forward にバッチ)。
 fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<AtomicUsize>) {
-    // live (KV キャッシュ保持者) のセッション
-    let mut live: Option<Run> = None;
-    // suspend 済み (KV を退避している) のセッション群
-    let mut pending: VecDeque<Run> = VecDeque::new();
-    // 直前の割り込みが「新規 prefill の pull」だったか。
-    // 新規が連続で到着しても pending (decode 中) を飢えさせないため、
-    // 1 pull ごとに 1 回 rotate を挟む。
-    let mut last_was_pull = false;
+    // 常駐中 (KV スロット占有中) のセッション群
+    let mut active: Vec<Run> = Vec::new();
 
     loop {
-        // --- live を確保する ---
-        if live.is_none() {
-            let (mut run, from_rx) = match pending.pop_front() {
-                Some(r) => (r, false),
-                None => match rx.recv() {
-                    Ok(job) => {
-                        in_flight.fetch_add(1, Ordering::SeqCst);
-                        (build_run(&engine, job), true)
+        // --- 新規ジョブの pull (空きスロットがある限り同時受け付け) ---
+        while active.len() < MAX_ACTIVE_SESSIONS {
+            match rx.try_recv() {
+                Ok(job) => {
+                    in_flight.fetch_add(1, Ordering::SeqCst);
+                    let mut run = build_run(&engine, job);
+                    if let Err(e) = admit(&engine, &mut run) {
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        send_error(&mut run, e);
+                    } else {
+                        active.push(run);
                     }
-                    // 全 sender drop → 終了
-                    Err(_) => break,
-                },
-            };
-            if let Err(e) = admit(&engine, &mut run) {
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-                send_error(&mut run, e);
-                continue;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if active.is_empty() {
+                        return;
+                    }
+                    break;
+                }
             }
-            live = Some(run);
-            last_was_pull = from_rx;
         }
 
-        // --- 1 ステップ実行 (エンジン Mutex を 1 forward 分だけ取得) ---
-        let step = {
-            let run = live.as_mut().unwrap();
-            let mut g = engine.lock().unwrap();
-            match run.events.as_ref() {
-                Some(events) => {
-                    let events = events.clone();
-                    let mut cb = |delta: &str| {
+        // --- prefill (優先): 未 prefill のセッションを 1 つ進める ---
+        // (prefill はプロンプト全体の 1 forward — バッチ化せず個別実行。
+        //  decode の合間に割り込ませることで新規リクエストの TTFT を抑える)
+        if let Some(i) = active
+            .iter()
+            .position(|r| !r.sess.as_ref().unwrap().prefill_done())
+        {
+            let step = {
+                let mut g = engine.lock().unwrap();
+                g.step_chat(active[i].sess.as_mut().unwrap(), &mut |_| {})
+            };
+            if let Err(e) = step {
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let mut run = active.remove(i);
+                {
+                    let mut g = engine.lock().unwrap();
+                    g.release_session(run.sess.as_mut().unwrap());
+                }
+                send_error(&mut run, e);
+            }
+            continue;
+        }
+
+        // --- decode: 全セッションを 1 ステップまとめて進める ---
+        // (SSE 送信者は先に clone しておき、セッションの可変借用と分離する)
+        let senders: Vec<Option<tokio_mpsc::Sender<Result<Event, Infallible>>>> =
+            active.iter().map(|r| r.events.clone()).collect();
+        let mut boxed_cbs: Vec<Box<dyn FnMut(&str)>> = senders
+            .into_iter()
+            .map(|s| -> Box<dyn FnMut(&str)> {
+                match s {
+                    Some(events) => Box::new(move |delta: &str| {
                         let _ = events.blocking_send(Ok(to_event(&json!({
                             "type": "content_block_delta",
                             "index": 0,
                             "delta": {"type": "text_delta", "text": delta},
                         }))));
-                    };
-                    g.step_chat(&mut run.sess.as_mut().unwrap(), &mut cb)
+                    }),
+                    None => Box::new(|_: &str| {}),
                 }
-                None => g.step_chat(&mut run.sess.as_mut().unwrap(), &mut |_| {}),
-            }
+            })
+            .collect();
+        let step = {
+            let mut g = engine.lock().unwrap();
+            let mut sess_refs: Vec<&mut ChatSession> =
+                active.iter_mut().map(|r| r.sess.as_mut().unwrap()).collect();
+            g.step_chat_batch(&mut sess_refs, &mut boxed_cbs)
         };
         match step {
-            Ok(false) => {}
-            Ok(true) => {
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-                finish_run(live.take().unwrap());
-                if prof::enabled() {
+            Ok(done) => {
+                // 完了したセッションを外して後処理 (後ろから外すことで添字を維持)
+                let mut i = done.len();
+                while i > 0 {
+                    i -= 1;
+                    if done[i] {
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        let mut run = active.remove(i);
+                        {
+                            let mut g = engine.lock().unwrap();
+                            g.release_session(run.sess.as_mut().unwrap());
+                        }
+                        finish_run(run);
+                    }
+                }
+                if active.is_empty() && prof::enabled() {
                     tracing::info!("{}", prof::summary());
                 }
-                continue;
             }
             Err(e) => {
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-                send_error(&mut live.take().unwrap(), e);
-                continue;
-            }
-        }
-
-        // --- ステップ間のスケジューリング (インターリーブ) ---
-        let active = 1 + pending.len();
-        let want_pull = active < MAX_ACTIVE_SESSIONS && (!last_was_pull || pending.is_empty());
-        let mut scheduled = false;
-        if want_pull {
-            if let Ok(job) = rx.try_recv() {
-                // 新規リクエストの prefill を decode の合間に割り込ませる:
-                // 実行中を suspend して pending へ、新規を live (prefill) へ
-                in_flight.fetch_add(1, Ordering::SeqCst);
-                {
-                    let mut g = engine.lock().unwrap();
-                    g.suspend_session(&mut live.as_mut().unwrap().sess.as_mut().unwrap());
-                }
-                pending.push_back(live.take().unwrap());
-                let mut nrun = build_run(&engine, job);
-                if let Err(e) = admit(&engine, &mut nrun) {
+                // バッチ全体が失敗 (detok エラー等。実運用では稀)。
+                // 全セッションをエラーで終わらせる。
+                let mut runs = std::mem::take(&mut active);
+                for run in runs.iter_mut() {
                     in_flight.fetch_sub(1, Ordering::SeqCst);
-                    send_error(&mut nrun, e);
-                } else {
-                    live = Some(nrun);
-                    last_was_pull = true;
+                    let mut g = engine.lock().unwrap();
+                    g.release_session(run.sess.as_mut().unwrap());
                 }
-                scheduled = true;
+                for mut run in runs {
+                    let msg = format!("{e:#}");
+                    send_error(&mut run, anyhow::anyhow!(msg));
+                }
             }
-        }
-        if !scheduled && !pending.is_empty() {
-            // round-robin: 実行中を suspend し、pending の先頭を resume
-            {
-                let mut g = engine.lock().unwrap();
-                g.suspend_session(&mut live.as_mut().unwrap().sess.as_mut().unwrap());
-            }
-            pending.push_back(live.take().unwrap());
-            let mut next = pending.pop_front().unwrap();
-            {
-                let mut g = engine.lock().unwrap();
-                g.install_session(&mut next.sess.as_mut().unwrap());
-            }
-            live = Some(next);
-            last_was_pull = false;
         }
     }
 }
@@ -274,7 +275,8 @@ fn admit(engine: &Arc<Mutex<Engine>>, run: &mut Run) -> Result<()> {
     }
     {
         let mut g = engine.lock().unwrap();
-        g.install_session(run.sess.as_mut().unwrap());
+        g.install_session(run.sess.as_mut().unwrap())
+            .map_err(|e| e.context("KVキャッシュスロットの取得に失敗"))?;
     }
     if run.events.is_some() && !run.started {
         run.started = true;

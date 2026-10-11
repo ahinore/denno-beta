@@ -160,6 +160,18 @@ impl Linear {
         }
     }
 
+    /// P6 バッチ decode 用: 複数セッション分の行 (a: [m,k]) を 1 回の重み
+    /// ストリーミングで計算する。各 (i,j) の演算順序は `apply_bt` の m==1
+    /// 経路 (matvec_bt / matvec_bt_i8) と完全一致するため、**バッチでまとめて
+    /// decode しても各セッションは単独実行とビット一致する**。
+    /// (prefill が使う m>1 の sgemm 経路は fp32 で累積順が異なるため使わない)
+    pub fn apply_batch_bt(&self, a: &[f32], m: usize) -> Vec<f32> {
+        match self {
+            Linear::F32 { w, k, n } => crate::tensor::matvec_rows_bt(a, w, *k, *n, m),
+            Linear::Q8(q) => crate::tensor::matvec_rows_bt_i8(a, &q.w, &q.scale, q.k, q.n, m),
+        }
+    }
+
     /// c = a @ W を計算する (a: [m,k], W: [k,n] fp32 / Q8 は内部 [n,k]、戻り値 [m,n])。
     /// GPT-2 の Conv1D 形式用。Q8 は転置格納なので bt カーネルで計算する。
     pub fn apply(&self, a: &[f32], m: usize) -> Vec<f32> {

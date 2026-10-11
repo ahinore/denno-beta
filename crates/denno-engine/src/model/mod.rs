@@ -16,6 +16,20 @@ pub trait Model: Send {
     fn eos_ids(&self) -> &[u32];
     /// tokens を forward し、最後の位置の logits を返す
     fn forward(&mut self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>>;
+    /// P6: 複数セッションの decode 1 ステップ (各 1 トークン) を 1 forward に
+    /// まとめて進める。toks[i] はセッション i の次トークン、caches[i] はその
+    /// KV キャッシュ。戻り値は各セッションの logits。
+    /// **exactness 契約**: 各セッションの logits は単独 forward とビット一致
+    /// すること (デフォルト実装は単独 forward のループで満たす。バッチ化する
+    /// 実装は演算順序を保つカーネルで満たす必要がある)。
+    fn forward_batch(&mut self, toks: &[u32], caches: &mut [&mut KvCache]) -> Result<Vec<Vec<f32>>> {
+        debug_assert_eq!(toks.len(), caches.len());
+        let mut outs = Vec::with_capacity(toks.len());
+        for (t, c) in toks.iter().zip(caches.iter_mut()) {
+            outs.push(self.forward(&[*t], c)?);
+        }
+        Ok(outs)
+    }
     /// 新しい KvCache を作る
     fn new_cache(&self) -> KvCache;
 }

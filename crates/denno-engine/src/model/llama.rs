@@ -320,4 +320,371 @@ impl Model for LlamaQwen2 {
         cache.advance(n);
         Ok(logits)
     }
+
+    /// P6: 複数セッションの decode 1 ステップをまとめて実行する (各セッション
+    /// 1 トークン)。線形層 (qkv/o_proj/gate/up/down/lm_head) は全セッション分の
+    /// 行を 1 回の重みストリーミングで計算するビット一致バッチカーネル
+    /// (`apply_batch_bt`) を使い、attention は各セッションの KV キャッシュに
+    /// 対して `forward` の decode (n==1) 経路と同一の演算列を実行する。
+    /// → 各セッションの logits は単独 decode とビット一致する。
+    fn forward_batch(
+        &mut self,
+        toks: &[u32],
+        caches: &mut [&mut KvCache],
+    ) -> Result<Vec<Vec<f32>>> {
+        debug_assert_eq!(toks.len(), caches.len());
+        let b = toks.len();
+        let e = self.e;
+        let dh = self.dh;
+        let heads = self.heads;
+        let kv_heads = self.kv_heads;
+        let kv_dim = kv_heads * dh;
+        let group = heads / kv_heads; // GQA group size
+
+        let lin_b = |a: &[f32], w: &Linear, m: usize| w.apply_batch_bt(a, m);
+
+        // --- embed (セッションごとに lookup、行間の相互作用なし) ---
+        let mut x = vec![0.0f32; b * e];
+        crate::prof::time(crate::prof::EMBED, || {
+            for (i, &t) in toks.iter().enumerate() {
+                let emb = &self.embed[t as usize * e..][..e];
+                x[i * e..][..e].copy_from_slice(emb);
+            }
+        });
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            // --- attention ---
+            // rmsnorm は行独立なので [b, e] にまとめて適用できる (行ごとに同一演算)
+            let h = crate::prof::time(crate::prof::RMSNORM, || {
+                rmsnorm(&x, &layer.ln1_w, e, self.eps)
+            });
+            let mut q = crate::prof::time(crate::prof::QKV, || lin_b(&h, &layer.q_w, b)); // [b, H*dh]
+            let mut k = crate::prof::time(crate::prof::QKV, || lin_b(&h, &layer.k_w, b)); // [b, K*dh]
+            let mut v = crate::prof::time(crate::prof::QKV, || lin_b(&h, &layer.v_w, b));
+            if let Some(bias) = &layer.q_b {
+                add_bias(&mut q, bias, heads * dh);
+            }
+            if let Some(bias) = &layer.k_b {
+                add_bias(&mut k, bias, kv_dim);
+            }
+            if let Some(bias) = &layer.v_b {
+                add_bias(&mut v, bias, kv_dim);
+            }
+
+            // RoPE: セッションごとに位置が異なる (cache.len()) ので 1 行ずつ適用。
+            // rope_row は rope_rows の 1 行処理と同一演算列 → ビット一致。
+            crate::prof::time(crate::prof::ROPE, || {
+                for i in 0..b {
+                    let pos = caches[i].len();
+                    crate::tensor::rope_row(
+                        &mut q[i * heads * dh..][..heads * dh],
+                        heads,
+                        dh,
+                        pos,
+                        self.theta,
+                    );
+                    crate::tensor::rope_row(
+                        &mut k[i * kv_dim..][..kv_dim],
+                        kv_heads,
+                        dh,
+                        pos,
+                        self.theta,
+                    );
+                }
+            });
+
+            // KV 書き込み: 各セッションの自分のキャッシュへ (decode 1 トークン分)
+            for i in 0..b {
+                let pos = caches[i].len();
+                let (kc, vc) = caches[i].kv_bufs(li);
+                kc[pos * kv_dim..][..kv_dim].copy_from_slice(&k[i * kv_dim..][..kv_dim]);
+                vc[pos * kv_dim..][..kv_dim].copy_from_slice(&v[i * kv_dim..][..kv_dim]);
+            }
+
+            // attention: セッションごとに独立 (自分のキャッシュのみ参照)。
+            // 演算列は forward() の decode (n==1) 経路と完全に同一。
+            let mut att = vec![0.0f32; b * heads * dh];
+            crate::prof::time(crate::prof::ATTN, || {
+                let scale = 1.0 / (dh as f32).sqrt();
+                for i in 0..b {
+                    let t_total = caches[i].len() + 1; // pos + 1
+                    let (kc, vc) = caches[i].kv_bufs(li);
+                    let mut kh = vec![0.0f32; t_total * dh];
+                    let mut vh = vec![0.0f32; t_total * dh];
+                    for kvh in 0..kv_heads {
+                        for j in 0..t_total {
+                            kh[j * dh..][..dh].copy_from_slice(&kc[j * kv_dim + kvh * dh..][..dh]);
+                            vh[j * dh..][..dh].copy_from_slice(&vc[j * kv_dim + kvh * dh..][..dh]);
+                        }
+                        for g in 0..group {
+                            let qh = kvh * group + g;
+                            let qg: Vec<f32> =
+                                q[i * heads * dh + qh * dh..][..dh].to_vec();
+                            // scores[j] = qg · kh[j] * scale (n==1 の sgemm 経路と同一)
+                            let mut scores = vec![0.0f32; t_total];
+                            crate::tensor::sgemm_acc(
+                                &qg, &kh, &mut scores, 1, dh, t_total, scale,
+                            );
+                            // causal mask: decode では未来位置なし (pos+1..pos+1 は空)
+                            crate::tensor::softmax(&mut scores);
+                            // att_head = Σ_j probs[j] * vh[j] (matmul (n==1) と同一)
+                            let out = crate::tensor::matmul(&scores, &vh, 1, t_total, dh);
+                            att[i * heads * dh + qh * dh..][..dh].copy_from_slice(&out);
+                        }
+                    }
+                }
+            });
+
+            let proj = crate::prof::time(crate::prof::OPROJ, || lin_b(&att, &layer.o_w, b));
+            for i in 0..b * e {
+                x[i] += proj[i];
+            }
+
+            // --- mlp (SwiGLU) ---
+            let h2 = crate::prof::time(crate::prof::RMSNORM, || {
+                rmsnorm(&x, &layer.ln2_w, e, self.eps)
+            });
+            let mut gate = crate::prof::time(crate::prof::GATE_UP, || lin_b(&h2, &layer.gate_w, b));
+            let up = crate::prof::time(crate::prof::GATE_UP, || lin_b(&h2, &layer.up_w, b));
+            crate::prof::time(crate::prof::SWIGLU, || {
+                silu_inplace(&mut gate);
+                for i in 0..b * self.ff {
+                    gate[i] *= up[i];
+                }
+            });
+            let down = crate::prof::time(crate::prof::DOWN, || lin_b(&gate, &layer.down_w, b));
+            for i in 0..b * e {
+                x[i] += down[i];
+            }
+        }
+
+        // --- final norm (行独立) + lm_head (バッチ) ---
+        let mut hn = vec![0.0f32; b * e];
+        crate::prof::time(crate::prof::FINAL_NORM, || {
+            for i in 0..b {
+                let r = rmsnorm(&x[i * e..][..e], &self.norm_w, e, self.eps);
+                hn[i * e..][..e].copy_from_slice(&r);
+            }
+        });
+        let logits = crate::prof::time(crate::prof::LM_HEAD, || match &self.lm_head {
+            Some(w) => lin_b(&hn, w, b),
+            // tied (fp32 モード): embed を [vocab, e] のまま転置使用
+            None => crate::tensor::matvec_rows_bt(&hn, &self.embed, e, self.vocab, b),
+        });
+
+        for c in caches.iter_mut() {
+            c.advance(1);
+        }
+        Ok((0..b).map(|i| logits[i * self.vocab..][..self.vocab].to_vec()).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quant::QuantMode;
+
+    /// 決定論的な擬似乱数ベクトル (tensor.rs の pseudo_random と同一系列)
+    fn prng(len: usize, seed: u32) -> Vec<f32> {
+        let mut x = seed;
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((x >> 16) % 2000) as f32 / 977.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// テスト用の極小 Qwen2 (2層, GQA, QKV bias あり) を直接構築する。
+    /// Fp32 は tied (lm_head なし) / Int8 は untied 相当の独立 lm_head。
+    fn tiny(mode: QuantMode) -> LlamaQwen2 {
+        let e = 16usize;
+        let heads = 4;
+        let kv_heads = 2;
+        let dh = 4;
+        let ff = 32;
+        let vocab = 64;
+        let ctx = 64;
+        let mk = |w: Vec<f32>, k: usize, n: usize| Linear::new(w, k, n, mode);
+        let mut layers = Vec::new();
+        for i in 0..2u32 {
+            layers.push(Layer {
+                ln1_w: prng(e, 100 + i),
+                q_w: mk(prng(heads * dh * e, 200 + i), e, heads * dh),
+                k_w: mk(prng(kv_heads * dh * e, 300 + i), e, kv_heads * dh),
+                v_w: mk(prng(kv_heads * dh * e, 400 + i), e, kv_heads * dh),
+                q_b: Some(prng(heads * dh, 500 + i)),
+                k_b: Some(prng(kv_heads * dh, 600 + i)),
+                v_b: Some(prng(kv_heads * dh, 700 + i)),
+                o_w: mk(prng(e * heads * dh, 800 + i), heads * dh, e),
+                ln2_w: prng(e, 900 + i),
+                gate_w: mk(prng(ff * e, 1000 + i), e, ff),
+                up_w: mk(prng(ff * e, 1100 + i), e, ff),
+                down_w: mk(prng(e * ff, 1200 + i), ff, e),
+            });
+        }
+        let lm_head = match mode {
+            QuantMode::Fp32 => None,
+            QuantMode::Int8 => Some(mk(prng(vocab * e, 9999), e, vocab)),
+        };
+        LlamaQwen2 {
+            e,
+            heads,
+            kv_heads,
+            dh,
+            ff,
+            ctx,
+            vocab,
+            eps: 1e-6,
+            theta: 10_000.0,
+            eos_ids: vec![63],
+            embed: prng(vocab * e, 7),
+            norm_w: prng(e, 8),
+            lm_head,
+            layers,
+            quant_bytes: 0,
+        }
+    }
+
+    /// greedy argmax (テスト用。tie は両経路で同一 logits なので同一インデックス)
+    fn argmax(logits: &[f32]) -> u32 {
+        let mut best = 0usize;
+        let mut bv = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > bv {
+                bv = v;
+                best = i;
+            }
+        }
+        best as u32
+    }
+
+    #[test]
+    fn forward_batch_matches_solo_decode_bit_exactly() {
+        // P6 の中核検証: 複数セッションをバッチ decode しても、各セッションの
+        // logits は単独 decode とビット一致する (fp32 / int8 両モード)。
+        for mode in [QuantMode::Fp32, QuantMode::Int8] {
+            let prompts: Vec<Vec<u32>> = vec![
+                vec![5, 11, 23],
+                vec![1, 2, 3, 4, 5],
+                vec![7, 9],
+            ];
+            let steps = 4;
+
+            // --- 単独リファレンス: 各セッションを別々に decode ---
+            let mut solo = tiny(mode);
+            let mut solo_caches: Vec<KvCache> =
+                (0..prompts.len()).map(|_| solo.new_cache()).collect();
+            let mut solo_seq: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+            // prefill (各セッション単独)
+            let mut solo_logits: Vec<Vec<f32>> = Vec::new();
+            for (s, p) in prompts.iter().enumerate() {
+                let lg = solo.forward(p, &mut solo_caches[s]).unwrap();
+                solo_logits.push(lg);
+            }
+            // step ごとの decode 後 logits を保存 (バッチ側と段階比較するため)
+            let mut solo_hist: Vec<Vec<Vec<f32>>> = vec![Vec::new(); steps];
+            for step in 0..steps {
+                for s in 0..prompts.len() {
+                    let t = argmax(&solo_logits[s]);
+                    solo_seq[s].push(t);
+                    solo_logits[s] = solo.forward(&[t], &mut solo_caches[s]).unwrap();
+                    solo_hist[step].push(solo_logits[s].clone());
+                }
+            }
+
+            // --- バッチ: 全セッションを 1 forward にまとめて decode ---
+            // (エンジンと同じ流れ: prefill logits から 1 トークン目をサンプルし、
+            //  そのトークンを全セッション分まとめて forward する)
+            let mut bat = tiny(mode);
+            let mut bat_caches: Vec<KvCache> =
+                (0..prompts.len()).map(|_| bat.new_cache()).collect();
+            let mut bat_seq: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+            let mut bat_logits: Vec<Vec<f32>> = Vec::new();
+            for (s, p) in prompts.iter().enumerate() {
+                let lg = bat.forward(p, &mut bat_caches[s]).unwrap();
+                bat_logits.push(lg);
+            }
+            for step in 0..steps {
+                let toks: Vec<u32> = (0..prompts.len())
+                    .map(|s| argmax(&bat_logits[s]))
+                    .collect();
+                let mut caches: Vec<&mut KvCache> = bat_caches.iter_mut().collect();
+                let outs = bat.forward_batch(&toks, &mut caches).unwrap();
+                for s in 0..prompts.len() {
+                    assert_eq!(
+                        outs[s], solo_hist[step][s],
+                        "{mode:?} step={step} session={s}: バッチ logits が単独と不一致"
+                    );
+                    bat_seq[s].push(toks[s]);
+                    bat_logits[s] = outs[s].clone();
+                }
+            }
+            for s in 0..prompts.len() {
+                assert_eq!(bat_seq[s], solo_seq[s], "{mode:?} session={s}: 生成列が不一致");
+            }
+        }
+    }
+
+    #[test]
+    fn forward_batch_single_session_matches_solo() {
+        // バッチサイズ 1 でも経路が単独 decode とビット一致すること
+        let mut solo = tiny(QuantMode::Fp32);
+        let mut c1 = solo.new_cache();
+        let lg1 = solo.forward(&[3, 14, 15], &mut c1).unwrap();
+
+        let mut bat = tiny(QuantMode::Fp32);
+        let mut c2 = bat.new_cache();
+        let lg2 = bat.forward(&[3, 14, 15], &mut c2).unwrap();
+        assert_eq!(lg1, lg2);
+        let t = argmax(&lg1);
+        let out = bat.forward_batch(&[t], &mut [&mut c2]).unwrap();
+        let ref_lg = solo.forward(&[t], &mut c1).unwrap();
+        assert_eq!(out[0], ref_lg);
+    }
+
+    #[test]
+    fn debug_batch_layer0() {
+        // デバッグ用: レイヤー0の各段階でバッチと単独を比較する
+        let mode = QuantMode::Fp32;
+        let prompts: Vec<Vec<u32>> = vec![vec![5, 11, 23], vec![1, 2, 3, 4, 5], vec![7, 9]];
+        let mut solo = tiny(mode);
+        let mut solo_caches: Vec<KvCache> =
+            (0..prompts.len()).map(|_| solo.new_cache()).collect();
+        let mut solo_logits: Vec<Vec<f32>> = Vec::new();
+        for (s, p) in prompts.iter().enumerate() {
+            let lg = solo.forward(p, &mut solo_caches[s]).unwrap();
+            solo_logits.push(lg);
+        }
+
+        let mut bat = tiny(mode);
+        let mut bat_caches: Vec<KvCache> =
+            (0..prompts.len()).map(|_| bat.new_cache()).collect();
+        let mut bat_logits: Vec<Vec<f32>> = Vec::new();
+        for (s, p) in prompts.iter().enumerate() {
+            let lg = bat.forward(p, &mut bat_caches[s]).unwrap();
+            assert_eq!(lg, solo_logits[s], "prefill s{s}");
+            bat_logits.push(lg);
+        }
+
+        for step in 0..3 {
+            let toks: Vec<u32> = (0..prompts.len()).map(|s| argmax(&bat_logits[s])).collect();
+            let mut caches: Vec<&mut KvCache> = bat_caches.iter_mut().collect();
+            let outs = bat.forward_batch(&toks, &mut caches).unwrap();
+            for s in 0..prompts.len() {
+                let r = solo.forward(&[toks[s]], &mut solo_caches[s]).unwrap();
+                let diff: Vec<usize> = outs[s]
+                    .iter()
+                    .zip(&r)
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(i, _)| i)
+                    .collect();
+                println!("step={step} s={s} toks[s]={} diff={}", toks[s], diff.len());
+                assert!(diff.is_empty(), "step={step} s={s}: {diff:?}");
+                solo_logits[s] = r;
+                bat_logits[s] = outs[s].clone();
+            }
+        }
+    }
 }

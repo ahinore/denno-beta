@@ -2,6 +2,23 @@
 
 use rayon::prelude::*;
 
+/// 生ポインタを rayon タスク間で共有するためのラッパ。
+/// 使い方は呼び出し側で保証する: 各タスクは担当ブロックの c[i*n + j0..]
+/// (他タスクと非重複) にのみ書き込む。
+/// (フィールド直接アクセス `.0` は edition 2021 の disjoint closure capture
+/// で *mut f32 単体がキャプチャされてしまうため、必ず `write` メソッド経由)
+#[derive(Clone, Copy)]
+struct SendPtr(*mut f32);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+
+impl SendPtr {
+    #[inline(always)]
+    unsafe fn write(self, idx: usize, v: f32) {
+        *self.0.add(idx) = v;
+    }
+}
+
 /// c = a @ b  (a: row-major [m,k], b: row-major [k,n], 戻り値: row-major [m,n])
 pub fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     let mut c = vec![0.0f32; m * n];
@@ -88,6 +105,60 @@ pub fn matvec_bt(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
             }
             *cj = s;
         });
+    c
+}
+
+/// c[i][j] = Σ_d a[i*k+d] * b[j*k+d] を計算するバッチ decode 用 matvec (P6)。
+/// a: [m,k] row-major、b: [n,k] row-major → c: [m,n] row-major。
+///
+/// 各出力 (i,j) の累積は d について逐次 (`s += a[d] * row[d]`) で、
+/// matvec_bt (m==1) と完全に同一の演算順序 → **どの行も単独 decode と
+/// ビット一致**する (m>1 の sgemm 経路 matmul_bt とは累積順が違い一致しない
+/// ため、バッチ decode ではこのカーネルを使う)。
+/// 重み行 b[j] は 1 回の読み込みで m 入力分のドットに再利用されるため、
+/// 線形層の重み帯域が実質 1/m になる (decode の律速は重みストリーミング)。
+pub fn matvec_rows_bt(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec<f32> {
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(b.len(), k * n);
+    if m == 1 {
+        return matvec_bt(a, b, k, n);
+    }
+    let mut c = vec![0.0f32; m * n];
+    // 出力チャネル j を JB ブロックに分割して並列化。
+    // 各タスクは担当ブロックの c[i*n + j0..] にのみ書く (他タスクと非重複)。
+    const JB: usize = 64;
+    let cp = SendPtr(c.as_mut_ptr());
+    b.par_chunks_exact(k * JB)
+        .enumerate()
+        .for_each(|(bi, bw)| {
+            let j0 = bi * JB;
+            for (jj, row) in bw.chunks_exact(k).enumerate() {
+                let j = j0 + jj;
+                for i in 0..m {
+                    let ar = &a[i * k..][..k];
+                    let mut s = 0.0f32;
+                    for d in 0..k {
+                        s += ar[d] * row[d];
+                    }
+                    unsafe { cp.write(i * n + j, s) };
+                }
+            }
+        });
+    // 端数ブロック (n が JB の倍数でない場合)
+    let rem = (n / JB) * JB;
+    if rem < n {
+        for j in rem..n {
+            let row = &b[j * k..][..k];
+            for i in 0..m {
+                let ar = &a[i * k..][..k];
+                let mut s = 0.0f32;
+                for d in 0..k {
+                    s += ar[d] * row[d];
+                }
+                c[i * n + j] = s;
+            }
+        }
+    }
     c
 }
 
@@ -272,6 +343,66 @@ pub fn matvec_bt_i8(a: &[f32], q: &[i8], scale: &[f32], k: usize, n: usize) -> V
 }
 
 /// c[i][j] = (Σ_d aq_i[d] * q[j*k+d]) as f32 * ascale_i * scale[j]
+/// — バッチ decode 用 int8 matvec (P6)。a: [m,k]、q: [n,k] → c: [m,n]。
+///
+/// 各入力行は `matvec_bt_i8` と**同一規則**で動的量子化し、i32 ドットで
+/// 計算する。整数 i32 累積は順序不変のため、どの行も単独 decode
+/// (matvec_bt_i8) とビット一致する。重み行は 1 回の読み込みで m 入力分に
+/// 再利用される (帯域 1/m)。並列化は出力チャネル j ブロック単位。
+pub fn matvec_rows_bt_i8(
+    a: &[f32],
+    q: &[i8],
+    scale: &[f32],
+    k: usize,
+    n: usize,
+    m: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(q.len(), k * n);
+    debug_assert_eq!(scale.len(), n);
+    if m == 1 {
+        return matvec_bt_i8(a, q, scale, k, n);
+    }
+    // 各トークンを動的量子化 (decode と同一規則 → 行単位でビット一致)
+    let mut aq = vec![0i8; m * k];
+    let mut asc = vec![0f32; m];
+    for i in 0..m {
+        let (qi, si) = quantize_row_i8(&a[i * k..][..k]);
+        aq[i * k..][..k].copy_from_slice(&qi);
+        asc[i] = si;
+    }
+    let mut c = vec![0.0f32; m * n];
+    const JB: usize = 64;
+    let cp = SendPtr(c.as_mut_ptr());
+    q.par_chunks_exact(k * JB)
+        .zip(scale.par_chunks(JB))
+        .enumerate()
+        .for_each(|(bi, (qw, sc))| {
+            let j0 = bi * JB;
+            for (jj, &sj) in sc.iter().enumerate() {
+                let j = j0 + jj;
+                let wrow = &qw[jj * k..][..k];
+                for i in 0..m {
+                    let dot = i8_dot(&aq[i * k..][..k], wrow);
+                    unsafe { cp.write(i * n + j, dot as f32 * asc[i] * sj) };
+                }
+            }
+        });
+    // 端数ブロック (n が JB の倍数でない場合)
+    let rem = (n / JB) * JB;
+    if rem < n {
+        for j in rem..n {
+            let wrow = &q[j * k..][..k];
+            let sj = scale[j];
+            for i in 0..m {
+                let dot = i8_dot(&aq[i * k..][..k], wrow);
+                c[i * n + j] = dot as f32 * asc[i] * sj;
+            }
+        }
+    }
+    c
+}
+
+/// c[i][j] = (Σ_d aq_i[d] * q[j*k+d]) as f32 * ascale_i * scale[j]
 /// — int8×int8 の整数 SIMD ドットによる prefill 用 GEMM (q: [n,k] row-major)。
 ///
 /// a の各行 (トークン) を `matvec_bt_i8` と**同一規則**で per-token i8 に動的
@@ -394,23 +525,30 @@ pub fn softmax(x: &mut [f32]) {
     }
 }
 
+/// 1行分の RoPE (位置 pos)。`rope_rows` の行ごとの処理と完全に同一の演算列
+/// (バッチ decode で各セッションが異なる位置を持つときに使う、P6)。
+pub fn rope_row(x: &mut [f32], heads: usize, dh: usize, pos: usize, theta: f32) {
+    let half = dh / 2;
+    let pos = pos as f32;
+    for h in 0..heads {
+        let base = h * dh;
+        for d in 0..half {
+            let ang = pos * theta.powf(-2.0 * d as f32 / dh as f32);
+            let (c, s) = (ang.cos(), ang.sin());
+            let x1 = x[base + d];
+            let x2 = x[base + half + d];
+            x[base + d] = x1 * c - x2 * s;
+            x[base + half + d] = x1 * s + x2 * c;
+        }
+    }
+}
+
 /// RoPE (rotate_half 方式: Llama/Qwen2)
 /// x: [rows, heads*dh] を in-place で回転。theta は rope_theta。
 pub fn rope_rows(x: &mut [f32], rows: usize, heads: usize, dh: usize, pos0: usize, theta: f32) {
-    let half = dh / 2;
+    let width = heads * dh;
     for i in 0..rows {
-        let pos = (pos0 + i) as f32;
-        for h in 0..heads {
-            let base = i * heads * dh + h * dh;
-            for d in 0..half {
-                let ang = pos * theta.powf(-2.0 * d as f32 / dh as f32);
-                let (c, s) = (ang.cos(), ang.sin());
-                let x1 = x[base + d];
-                let x2 = x[base + half + d];
-                x[base + d] = x1 * c - x2 * s;
-                x[base + half + d] = x1 * s + x2 * c;
-            }
-        }
+        rope_row(&mut x[i * width..][..width], heads, dh, pos0 + i, theta);
     }
 }
 
@@ -518,6 +656,66 @@ mod tests {
         let b = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0];
         // dot([1,2], [1,0])=1, dot([1,2],[0,1])=2, dot([1,2],[1,1])=3, dot([1,2],[2,2])=6
         assert_eq!(matvec_bt(&a, &b, 2, 4), vec![1.0, 2.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn matvec_rows_bt_matches_matvec_bt_bit_exactly() {
+        // P6: バッチ decode カーネルの各行は単独 decode (matvec_bt) とビット一致
+        for m in [1usize, 2, 3, 5] {
+            for (k, n) in [(8usize, 16usize), (37usize, 200usize), (64usize, 130usize)] {
+                let a = pseudo_random(m * k, 5 + m as u32);
+                let b = pseudo_random(n * k, 6);
+                let batched = matvec_rows_bt(&a, &b, k, n, m);
+                assert_eq!(batched.len(), m * n);
+                for i in 0..m {
+                    let solo = matvec_bt(&a[i * k..][..k], &b, k, n);
+                    assert_eq!(
+                        &batched[i * n..][..n],
+                        &solo[..],
+                        "m={m} k={k} n={n} row={i}: バッチが単独と不一致"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matvec_rows_bt_i8_matches_matvec_bt_i8_bit_exactly() {
+        // P6: int8 バッチ decode カーネルの各行は単独 decode とビット一致
+        // (i32 累積は順序不変なので構造的に一致する)
+        let k = 64usize;
+        let n = 100usize;
+        let q: Vec<i8> = pseudo_random(n * k, 12).iter().map(|&v| (v * 100.0) as i8).collect();
+        let scale: Vec<f32> = pseudo_random(n, 13).iter().map(|v| 0.001 + v.abs() * 0.01).collect();
+        for m in [1usize, 2, 4] {
+            let a = pseudo_random(m * k, 14 + m as u32);
+            let batched = matvec_rows_bt_i8(&a, &q, &scale, k, n, m);
+            for i in 0..m {
+                let solo = matvec_bt_i8(&a[i * k..][..k], &q, &scale, k, n);
+                assert_eq!(
+                    &batched[i * n..][..n],
+                    &solo[..],
+                    "int8 m={m} row={i}: バッチが単独と不一致"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rope_row_matches_rope_rows_single_position() {
+        // rope_row は rope_rows の 1 行処理と完全同一 (リファクタリングの保証)
+        let heads = 3usize;
+        let dh = 8usize;
+        let width = heads * dh;
+        let x0 = pseudo_random(2 * width, 21);
+        let mut a = x0.clone();
+        rope_rows(&mut a, 2, heads, dh, 7, 10_000.0);
+        let mut b0 = x0[..width].to_vec();
+        let mut b1 = x0[width..].to_vec();
+        rope_row(&mut b0, heads, dh, 7, 10_000.0);
+        rope_row(&mut b1, heads, dh, 8, 10_000.0);
+        assert_eq!(a[..width], b0[..]);
+        assert_eq!(a[width..], b1[..]);
     }
 
     #[test]

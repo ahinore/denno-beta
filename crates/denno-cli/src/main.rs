@@ -151,8 +151,8 @@ fn main() -> Result<()> {
             let out = if raw {
                 // 生プロンプトで生成
                 let ids = engine.tok.encode(&prompt)?;
-                engine.cache.reset();
-                let mut logits = engine.model.forward(&ids, &mut engine.cache)?;
+                engine.caches[0].reset();
+                let mut logits = engine.model.forward(&ids, &mut engine.caches[0])?;
                 use denno_engine::sampler::Sampler;
                 let mut sampler = Sampler::new(temperature, None, None, seed);
                 let mut generated = Vec::new();
@@ -160,7 +160,7 @@ fn main() -> Result<()> {
                     let t = sampler.sample(&logits) as u32;
                     if engine.model.eos_ids().contains(&t) { break; }
                     generated.push(t);
-                    logits = engine.model.forward(&[t], &mut engine.cache)?;
+                    logits = engine.model.forward(&[t], &mut engine.caches[0])?;
                 }
                 engine.tok.decode(&generated)?
             } else {
