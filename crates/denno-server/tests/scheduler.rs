@@ -64,7 +64,12 @@ fn test_app_with(model: Box<dyn Model>, max_queue: usize) -> (Router, Arc<AppSta
     let engine = Engine::from_parts(model, tok, "denno-test", None);
     let engine = Arc::new(Mutex::new(engine));
     let scheduler = Scheduler::spawn(engine.clone(), max_queue);
-    let state = Arc::new(AppState { engine, api_key: None, scheduler });
+    let state = Arc::new(AppState {
+        engine,
+        api_key: None,
+        scheduler,
+        model_name: "denno-test".to_string(),
+    });
     let app = denno_server::router(state.clone());
     (app, state)
 }
@@ -224,11 +229,16 @@ async fn concurrent_requests_are_all_accepted_and_interleaved() {
 #[tokio::test]
 async fn concurrent_different_prompts_match_solo_reference() {
     // 単独実行の基準 (各プロンプトを独立エンジンで)
-    let refs: Vec<String> = ["t0", "t15"]
+    // 順序注意: リクエスト 1 はトークンを多く生成する "t15"。
+    // "t0" はダミーモデルで即 EOS になるため先頭だとオーバーラップ窓が
+    // 1 forward 分しかなく、環境によって並行進行が観測できなくなる。
+    let refs: Vec<String> = ["t15", "t0"]
         .iter()
         .map(|p| {
             let mut e = kv_sensitive_engine("ref", None).unwrap();
-            e.chat(None, &user_msg(p), &greedy_params(8), |_| {})
+            // トークン数を多めに取り、リクエスト 2 の HTTP セットアップ遅延が
+            // あっても必ずリクエスト 1 の decode 中に到着するようにする
+            e.chat(None, &user_msg(p), &greedy_params(24), |_| {})
                 .unwrap()
                 .text
         })
@@ -238,7 +248,9 @@ async fn concurrent_different_prompts_match_solo_reference() {
     // forward に僅かな遅延を入れて、リクエスト2の到着中にリクエスト1が
     // decode 中になる (インターリーブが実際に起きる) 状況を作る
     let (app, state) = test_app_with(
-        Box::new(KvSensitiveModel { delay: Duration::from_millis(2) }),
+        // CI ランナーは HTTP セットアップが遅いことがあるため、リクエスト 2 が
+        // 確実にリクエスト 1 の decode 中に到着するよう十分な遅延を入れる
+        Box::new(KvSensitiveModel { delay: Duration::from_millis(20) }),
         8,
     );
 
@@ -257,9 +269,20 @@ async fn concurrent_different_prompts_match_solo_reference() {
     };
 
     let mut handles = Vec::new();
-    for p in ["t0", "t15"] {
+    for (i, p) in ["t15", "t0"].iter().enumerate() {
+        if i == 1 {
+            // リクエスト 1 が実際に進行中になってから送る (タイミング依存の排除)
+            let state2 = state.clone();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state2.scheduler.in_flight() == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("リクエスト 1 が in-flight にならない");
+        }
         let app = app.clone();
-        let body = request_body(p, 8, false);
+        let body = request_body(p, 24, false);
         handles.push(tokio::spawn(async move { post(&app, body).await }));
     }
     let mut results = Vec::new();

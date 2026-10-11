@@ -24,6 +24,10 @@ pub struct AppState {
     pub api_key: Option<String>,
     /// P4: リクエストスケジューラ (有界キュー + 単一ワーカー)
     pub scheduler: Scheduler,
+    /// モデル名 (不変)。ハンドラが engine.lock() を取らずに済むようにキャッシュ。
+    /// (ワーカーは mutex をステップ間でほぼ連続保持するため、ハンドラが
+    ///  generation 中に lock を奪おうとすると starve し得る)
+    pub model_name: String,
 }
 
 /// serve 設定
@@ -200,11 +204,13 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
         ctx
     );
 
+    let model_name = engine.name.clone();
     let engine = Arc::new(Mutex::new(engine));
     let state = Arc::new(AppState {
         engine: engine.clone(),
         api_key: cfg.api_key,
         scheduler: Scheduler::spawn(engine, cfg.max_queue.max(1)),
+        model_name,
     });
 
     let app = router(state);
@@ -269,7 +275,7 @@ async fn messages(
         ApiError::invalid_request(format!("invalid request body: {}", e))
     })?;
 
-    if req.model != state.engine.lock().unwrap().name {
+    if req.model != state.model_name {
         return Err(ApiError::not_found(format!(
             "model: {} not found",
             req.model
@@ -339,8 +345,7 @@ async fn messages(
                     ApiError::api(msg)
                 }
             })?;
-        let model_name = state.engine.lock().unwrap().name.clone();
-        Ok(Json(message_json(&model_name, &output)).into_response())
+        Ok(Json(message_json(&state.model_name, &output)).into_response())
     }
 }
 
