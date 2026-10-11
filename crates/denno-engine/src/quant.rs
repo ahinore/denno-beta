@@ -201,15 +201,24 @@ mod tests {
             .collect()
     }
 
-    /// 素朴なリファレンス: c[j] = scale[j] * Σ_d a[d] * q[j*k+d] (スカラー順次)
+    /// 素朴なリファレンス (整数ドット仕様): a をトークンごとに動的量子化し、
+    /// c[j] = (Σ_d aq[d]*q[j*k+d]) as f32 * ascale * scale[j] (i32 逐次累積)。
+    /// 整数累積は結合則が成立するため SIMD カーネルとビット一致する。
     fn naive_matvec_bt_i8(a: &[f32], q: &[i8], scale: &[f32], k: usize, n: usize) -> Vec<f32> {
+        let maxabs = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let ascale = if maxabs > 0.0 { maxabs / 127.0 } else { 1.0 };
+        let inv = 1.0 / ascale;
+        let aq: Vec<i8> = a
+            .iter()
+            .map(|&v| ((v * inv).round().clamp(-127.0, 127.0)) as i8)
+            .collect();
         (0..n)
             .map(|j| {
-                let mut s = 0.0f32;
+                let mut s = 0i32;
                 for d in 0..k {
-                    s += a[d] * q[j * k + d] as f32;
+                    s += aq[d] as i32 * q[j * k + d] as i32;
                 }
-                s * scale[j]
+                s as f32 * ascale * scale[j]
             })
             .collect()
     }
@@ -300,13 +309,15 @@ mod tests {
 
     #[test]
     fn matvec_bt_i8_known_values() {
-        // a = [1, 2], 行: [1,0]/scale 1, [0,1]/scale 2, [1,1]/scale 0.5
-        // → dot = 1, 2, 3 → c = [1, 4, 1.5]
-        let a = [1.0f32, 2.0];
+        // a = [-127, 127] は max|a|=127 → ascale=1 で厳密に量子化される (aq = a)。
+        // 行 [1,0]/s=1 → dot=-127 → -127*1*1
+        // 行 [0,1]/s=2 → dot= 127 → 127*1*2 = 254
+        // 行 [1,1]/s=0.5 → dot= 0 → 0*0.5 = 0
+        let a = [-127.0f32, 127.0];
         let qw = [1i8, 0, 0, 1, 1, 1];
         let scale = [1.0f32, 2.0, 0.5];
         let got = crate::tensor::matvec_bt_i8(&a, &qw, &scale, 2, 3);
-        let want = [1.0f32, 4.0, 1.5];
+        let want = [-127.0f32, 254.0, 0.0];
         for (g, wv) in got.iter().zip(&want) {
             assert_eq!(g.to_bits(), wv.to_bits());
         }
@@ -314,33 +325,47 @@ mod tests {
 
     #[test]
     fn matmul_bt_i8_matches_matvec_rowwise_and_naive() {
-        // prefill 用 i8 GEMM: 各行が decode 用 matvec と完全一致し、
-        // デ量子化重みでの素朴な fp32 実装とも許容誤差内で一致する
-        for (m, k, n) in [(3usize, 8usize, 16usize), (1, 64, 200), (17, 5, 3)] {
+        // prefill 用 i8 GEMM: 各行が decode 用 matvec と**ビット完全一致**
+        // (両方とも同一規則の per-token 量子化 + 厳密な整数ドットのため。
+        //  これが prefix cache ヒット/非ヒットでの決定論の根拠)。
+        // デ量子化重みでの素朴な fp32 実装とは、アクティベーション量子化誤差の
+        // 理論上界 |差| ≤ 127*k*ascale_i*scale_j 内で一致する。
+        for (m, k, n) in [(3usize, 8usize, 16usize), (1, 64, 200), (17, 5, 3), (40, 896, 1152)] {
             let w = pseudo_random(k * n, 15);
             let q = Quant8Linear::quantize(&w, k, n);
             let a = pseudo_random(m * k, 16);
             let got = crate::tensor::matmul_bt_i8(&a, &q.w, &q.scale, m, k, n);
 
-            // 行ごとに matvec と一致 (sgemm とスカラーは積順序が異なるため
-            // bit 一致ではなくデ量子化誤差の範囲で一致)
+            // 行ごとに matvec とビット一致
             for i in 0..m {
                 let row = crate::tensor::matvec_bt_i8(&a[i * k..][..k], &q.w, &q.scale, k, n);
-                for (g, v) in got[i * n..][..n].iter().zip(&row) {
-                    let denom = v.abs().max(q.scale.iter().cloned().fold(0f32, f32::max));
-                    assert!(
-                        (g - v).abs() <= denom * 1e-3 + 1e-9,
-                        "m={m} k={k} n={n} i={i}: {g} != {v}"
+                for j in 0..n {
+                    assert_eq!(
+                        got[i * n + j].to_bits(),
+                        row[j].to_bits(),
+                        "m={m} k={k} n={n} i={i} j={j}: prefill row != decode matvec"
                     );
                 }
             }
 
-            // デ量子化重みでの fp32 素朴実装と一致 (デ量子化後は純粋な fp32 演算)
+            // デ量子化重みでの fp32 素朴実装と一致 (アクティベーション量子化の
+            // 誤差上界内: |Δa| ≤ ascale_i/2、|deq_w| ≤ 127*scale_j、
+            // |a| ≤ 127*ascale_i、|Δw| ≤ scale_j/2 → |差| ≤ 127*k*ascale_i*scale_j)
             let deq = q.dequantize();
             let want = naive_matmul_bt(&a, &deq, m, k, n);
-            for (g, wv) in got.iter().zip(&want) {
-                let denom = wv.abs().max(1e-6);
-                assert!((g - wv).abs() / denom < 1e-4, "m={m} k={k} n={n}: {g} != {wv}");
+            for i in 0..m {
+                let amax = a[i * k..][..k].iter().fold(0f32, |mv, v| mv.max(v.abs()));
+                let ascale_i = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                for j in 0..n {
+                    let bound = 127.0 * k as f32 * ascale_i * q.scale[j] + 1e-6;
+                    assert!(
+                        (got[i * n + j] - want[i * n + j]).abs() <= bound,
+                        "m={m} k={k} n={n} i={i} j={j}: {got} != {want} (bound={bound})",
+                        got = got[i * n + j],
+                        want = want[i * n + j],
+                        bound = bound
+                    );
+                }
             }
         }
     }

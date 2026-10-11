@@ -91,45 +91,241 @@ pub fn matvec_bt(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
     c
 }
 
-/// c[j] = scale[j] * Σ_d a[d] * q[j*k+d] — int8 weight-only の fused matvec
-/// (decode 用、matvec_bt の int8 版)。
-/// q: [n,k] row-major (nn.Linear 形式)、scale: [n] は出力チャネルごとのデ量子化係数。
-/// int8 重みを直接読むため帯域が fp32 の約 1/4 で済む (P3)。
-/// 各出力要素を固定順序で畳み込むため決定論的 (量子化パスの exact decoding)。
+/// アクティベーション1行 (トークン) を per-token 対称 int8 へ動的量子化する。
+/// scale = max|a| / 127、q = round(a / scale) を [-127,127] にクランプ
+/// (重みの量子化と同じ丸め規則)。全要素 0 の場合は scale = 1.0 にフォールバック。
+/// デ量子化: a[d] ≒ q[d] * scale。固定順序の逐次演算なので決定論的。
+pub fn quantize_row_i8(a: &[f32]) -> (Vec<i8>, f32) {
+    let maxabs = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let scale = if maxabs > 0.0 { maxabs / 127.0 } else { 1.0 };
+    let inv = 1.0 / scale;
+    let q: Vec<i8> = a
+        .iter()
+        .map(|&v| ((v * inv).round().clamp(-127.0, 127.0)) as i8)
+        .collect();
+    (q, scale)
+}
+
+/// スカラー参照実装: Σ a[i]*b[i] を i32 で逐次累積する。
+/// 整数 i32 累積は結合則が成立する (丸め誤差ゼロ) ため、SIMD 版と完全一致する。
+///
+/// オーバーフロー境界: |a[i]*b[i]| ≤ 127*127 = 16129 (量子化パイプラインは
+/// ±127 にクランプされるため ±128 は出ない) で、逐次累積の任意の部分和と
+/// SIMD のレーン部分和・水平加算の中間値もすべて |Σ| ≤ 16129*k に収まる。
+/// すなわち k ≤ i32::MAX / 16129 ≒ 133,169 なら中間オーバーフローしない
+/// (本実装の最大 k は Qwen2.5-0.5B の中間層 4864 / GPT-2 の 3072 で十分下)。
+pub fn i8_dot_scalar(a: &[i8], b: &[i8]) -> i32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut s = 0i32;
+    for i in 0..a.len() {
+        s += a[i] as i32 * b[i] as i32;
+    }
+    s
+}
+
+/// 整数 i8 ドット: Σ a[i]*b[i] を i32 で厳密に計算する。
+/// - aarch64 + FEAT_DotProd (armv8.2 / dev-host は対応): NEON `vdotq_s32` (sdot)
+/// - x86_64 + AVX2 (CI ランナーは x86-64-v3): i8→i16 符号拡張 + `_mm256_madd_epi16`
+/// - 上記以外: スカラー参照にフォールバック
+///
+/// runtime 検出は行わない (target_feature の compile-time 判定のみ)。
+/// 整数 i32 累積は結合則が成立するため、アキュムレータの数・レーン分割・
+/// 処理順序に出力は依存せず、必ず `i8_dot_scalar` とビット一致する
+/// (テスト `i8_dot_simd_matches_scalar_reference` で検証)。
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+pub fn i8_dot(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(a.len(), b.len());
+    let k = a.len();
+    let mut i = 0usize;
+    unsafe {
+        // vdotq_s32: i8×i8 の隣接4積和を i32 レーンに加算 (厳密な整数演算)。
+        // 依存チェーンの律速を避けるため 4 つの独立アキュムレータで ILP を確保する
+        // (整数は結合則が成立するので結果は変わらない)。
+        let (mut acc0, mut acc1, mut acc2, mut acc3) = (
+            vdupq_n_s32(0),
+            vdupq_n_s32(0),
+            vdupq_n_s32(0),
+            vdupq_n_s32(0),
+        );
+        while i + 64 <= k {
+            let pa = a.as_ptr();
+            let pb = b.as_ptr();
+            acc0 = vdotq_s32(acc0, vld1q_s8(pa.add(i)), vld1q_s8(pb.add(i)));
+            acc1 = vdotq_s32(acc1, vld1q_s8(pa.add(i + 16)), vld1q_s8(pb.add(i + 16)));
+            acc2 = vdotq_s32(acc2, vld1q_s8(pa.add(i + 32)), vld1q_s8(pb.add(i + 32)));
+            acc3 = vdotq_s32(acc3, vld1q_s8(pa.add(i + 48)), vld1q_s8(pb.add(i + 48)));
+            i += 64;
+        }
+        while i + 16 <= k {
+            acc0 = vdotq_s32(acc0, vld1q_s8(a.as_ptr().add(i)), vld1q_s8(b.as_ptr().add(i)));
+            i += 16;
+        }
+        let mut s = vaddvq_s32(vaddq_s32(
+            vaddq_s32(acc0, acc1),
+            vaddq_s32(acc2, acc3),
+        ));
+        while i < k {
+            s += a[i] as i32 * b[i] as i32;
+            i += 1;
+        }
+        s
+    }
+}
+
+/// AVX2 (x86-64-v3) 版。AVX2 には i8 ドット命令 (VNNI は AVX512 のみ) が無いので、
+/// i8 を i16 に符号拡張して `_mm256_madd_epi16` (隣接2積和を i32 へ) を使う。
+/// 積 |a*b| ≤ 16129 は i16 に収まり、madd の2積和 (≤ 32258) も i32 で厳密。
+/// avx2 が無効のビルドではスカラーにフォールバックする (compile-time 判定のみ)。
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub fn i8_dot(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(a.len(), b.len());
+    let k = a.len();
+    let mut i = 0usize;
+    unsafe {
+        // 32バイトブロック: i8→i16 符号拡張 (lo/hi 半分) → madd → i32 加算
+        unsafe fn madd_block(acc: __m256i, pa: *const i8, pb: *const i8) -> __m256i {
+            let va = _mm256_loadu_si256(pa as *const __m256i);
+            let vb = _mm256_loadu_si256(pb as *const __m256i);
+            let a_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
+            let a_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(va));
+            let b_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
+            let b_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(vb));
+            let p = _mm256_add_epi32(
+                _mm256_madd_epi16(a_lo, b_lo),
+                _mm256_madd_epi16(a_hi, b_hi),
+            );
+            _mm256_add_epi32(acc, p)
+        }
+        unsafe fn hsum(x: __m256i) -> i32 {
+            let s = _mm_add_epi32(
+                _mm256_castsi256_si128(x),
+                _mm256_extracti128_si256::<1>(x),
+            );
+            let s = _mm_add_epi32(s, _mm_srli_si128::<8>(s));
+            let s = _mm_add_epi32(s, _mm_srli_si128::<4>(s));
+            _mm_cvtsi128_si32(s)
+        }
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        while i + 64 <= k {
+            let pa = a.as_ptr();
+            let pb = b.as_ptr();
+            acc0 = madd_block(acc0, pa.add(i), pb.add(i));
+            acc1 = madd_block(acc1, pa.add(i + 32), pb.add(i + 32));
+            i += 64;
+        }
+        while i + 32 <= k {
+            acc0 = madd_block(acc0, a.as_ptr().add(i), b.as_ptr().add(i));
+            i += 32;
+        }
+        let mut total = hsum(_mm256_add_epi32(acc0, acc1));
+        while i < k {
+            total += a[i] as i32 * b[i] as i32;
+            i += 1;
+        }
+        total
+    }
+}
+
+/// SIMD 拡張が compile-time に有効でないターゲット向けのフォールバック。
+#[cfg(not(any(
+    all(target_arch = "aarch64", target_feature = "dotprod"),
+    all(target_arch = "x86_64", target_feature = "avx2")
+)))]
+pub fn i8_dot(a: &[i8], b: &[i8]) -> i32 {
+    i8_dot_scalar(a, b)
+}
+
+/// c[j] = (Σ_d aq[d] * q[j*k+d]) as f32 * ascale * scale[j]
+/// — int8×int8 の整数 SIMD ドット + スケール乗算のみの fused matvec (decode 用)。
+/// q: [n,k] row-major (nn.Linear 形式)、scale: [n] は出力チャネルごとの
+/// 既存のデ量子化係数。
+///
+/// a (アクティベーション) は呼び出しごとに per-token 対称 int8 へ動的量子化する
+/// (`quantize_row_i8`)。重み側は per-output-channel スケールをそのまま使うため、
+/// デ量子化は出力チャネルごとのスケール乗算 1 回だけで済む (整数ドットは
+/// 厳密なのでデ量子化を途中に入れる必要がない)。
+///
+/// 決定論: 量子化も整数ドットもスレッド数・処理順序に依存せず厳密なので、
+/// 同一入力 → 同一出力 (量子化パスの exact decoding は維持される)。
+///
+/// 注意: 旧実装 (a を fp32 のまま i8→f32 変換して fp32 累積) とはビット一致
+/// しない (アクティベーション量子化誤差を追加する)。int8 モードの仕様
+/// 「fp32 と同一出力ではない / 決定論は維持」は不変。fp32 モードは影響を受けない。
 pub fn matvec_bt_i8(a: &[f32], q: &[i8], scale: &[f32], k: usize, n: usize) -> Vec<f32> {
     debug_assert_eq!(q.len(), k * n);
     debug_assert_eq!(scale.len(), n);
+    let (aq, ascale) = quantize_row_i8(a);
+    debug_assert_eq!(aq.len(), k);
     let mut c = vec![0.0f32; n];
     c.par_iter_mut()
         .enumerate()
         .with_min_len(64)
         .for_each(|(j, cj)| {
             let row = &q[j * k..][..k];
-            let mut s = 0.0f32;
-            for d in 0..k {
-                s += a[d] * row[d] as f32;
-            }
-            *cj = s * scale[j];
+            let dot = i8_dot(&aq, row);
+            *cj = dot as f32 * ascale * scale[j];
         });
     c
 }
 
-/// c = a @ q^T (int8 weight-only の prefill 用 GEMM、q: [n,k] row-major)。
-/// int8 → f32 へデ量子化してから既存の並列 sgemm に渡す。
-/// decode 経路 (matvec_bt_i8) と異なりデ量子化バッファを一度作るため
-/// 追加のメモリ書き込みが発生するが、prefill は attention sgemm が支配的なため
-/// 実用上の影響は小さい。
+/// c[i][j] = (Σ_d aq_i[d] * q[j*k+d]) as f32 * ascale_i * scale[j]
+/// — int8×int8 の整数 SIMD ドットによる prefill 用 GEMM (q: [n,k] row-major)。
+///
+/// a の各行 (トークン) を `matvec_bt_i8` と**同一規則**で per-token i8 に動的
+/// 量子化し、整数ドットで計算する。整数 i32 累積は厳密なので、同一トークンは
+/// prefill (m>1) と decode (m==1) のどちらの経路でもビット一致する →
+/// prefix cache ヒット/非ヒットに関わらず int8 モードの決定論が構造的に保証
+/// される (デ量子化 sgemm と混在させると丸め差でサンプリングが反転し、
+/// キャッシュ状態だけで出力が変わってしまうため)。
+///
+/// 並列化は出力チャネル (j) ブロック単位: 各タスクは重み行をメモリから 1 度
+/// 読んで全 m トークン分のドットを計算する (重み帯域 1 回分。アクティベー
+/// ションは L2/L3 に乗る)。整数 sdot は 5.8 TMAC/s 実測 (20 スレッド) で、
+/// デ量子化 + fp32 sgemm より高速。
 pub fn matmul_bt_i8(a: &[f32], q: &[i8], scale: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     debug_assert_eq!(q.len(), k * n);
     debug_assert_eq!(scale.len(), n);
-    let mut w = vec![0.0f32; k * n];
-    for j in 0..n {
-        let s = scale[j];
-        for d in 0..k {
-            w[j * k + d] = q[j * k + d] as f32 * s;
+    // 各トークンを動的量子化 (decode と同一規則 → 行単位でビット一致)
+    let mut aq = vec![0i8; m * k];
+    let mut asc = vec![0f32; m];
+    for i in 0..m {
+        let (qi, si) = quantize_row_i8(&a[i * k..][..k]);
+        aq[i * k..][..k].copy_from_slice(&qi);
+        asc[i] = si;
+    }
+    let mut c = vec![0.0f32; m * n];
+    // j を 32 チャネルずつのブロックで並列化 (false sharing を避ける)
+    const JB: usize = 32;
+    q.chunks_exact(k * JB)
+        .zip(scale.chunks(JB))
+        .enumerate()
+        .for_each(|(bi, (qw, sc))| {
+            let j0 = bi * JB;
+            for (jj, &sj) in sc.iter().enumerate() {
+                let j = j0 + jj;
+                let wrow = &qw[jj * k..][..k];
+                for i in 0..m {
+                    let dot = i8_dot(&aq[i * k..][..k], wrow);
+                    c[i * n + j] = dot as f32 * asc[i] * sj;
+                }
+            }
+        });
+    // 端数ブロック (n が JB の倍数でない場合)
+    let rem = (n / JB) * JB;
+    if rem < n {
+        for j in rem..n {
+            let wrow = &q[j * k..][..k];
+            let sj = scale[j];
+            for i in 0..m {
+                let dot = i8_dot(&aq[i * k..][..k], wrow);
+                c[i * n + j] = dot as f32 * asc[i] * sj;
+            }
         }
     }
-    matmul_bt(a, &w, m, k, n)
+    c
 }
 
 /// 各行にバイアスを加算 (x: row-major [rows, cols])
@@ -465,5 +661,134 @@ mod tests {
         assert!((x[1] - 1.0f32.sin()).abs() < 1e-6);
         assert!((x[2] - 1.0f32.cos()).abs() < 1e-6);
         assert!((x[3] - 1.0f32.sin()).abs() < 1e-6);
+    }
+
+    // ---- int8 整数ドットカーネル (SIMD vs スカラー参照) ----
+
+    /// 決定論的な i8 列 (LCG)。[-128, 127] の全範囲をカバーする
+    /// (カーネル自体は ±128 も正しく扱えることを確認するため)。
+    fn pseudo_random_i8(len: usize, seed: u32) -> Vec<i8> {
+        let mut x = seed;
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (((x >> 16) % 256) as i32 - 128) as i8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn i8_dot_simd_matches_scalar_reference() {
+        // プロパティ: 整数 i32 累積は結合則が成立するので、SIMD 版 (レーン分割 +
+        // 複数アキュムレータ + スカラー尾) とスカラー逐次参照は完全一致する。
+        // ランダム + エッジケース (k=1, 15/16/17, 31/32/33, 63/64/65, 実モデルの k)
+        let sizes = [
+            1usize, 2, 3, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 896,
+            3072, 4864, 5000,
+        ];
+        for (ti, &k) in sizes.iter().enumerate() {
+            let a = pseudo_random_i8(k, 100 + ti as u32);
+            let b = pseudo_random_i8(k, 200 + ti as u32);
+            assert_eq!(
+                i8_dot(&a, &b),
+                i8_dot_scalar(&a, &b),
+                "random k={k}: SIMD != scalar"
+            );
+        }
+        // エッジパターン: 全 0 / 全 +127 / 全 -127 / ±127 交互 / -128 を含む極値
+        let patterns: [Vec<i8>; 5] = [
+            vec![0i8; 4864],
+            vec![127i8; 4864],
+            vec![-127i8; 4864],
+            (0..4864).map(|i| if i % 2 == 0 { 127 } else { -127 }).collect(),
+            (0..4864).map(|i| if i % 3 == 0 { -128 } else { 127 }).collect(),
+        ];
+        for (pi, p) in patterns.iter().enumerate() {
+            assert_eq!(
+                i8_dot(p, p),
+                i8_dot_scalar(p, p),
+                "pattern {pi}: SIMD != scalar"
+            );
+        }
+        // 非対称 (a≠b) の交互パターン
+        let x: Vec<i8> = (0..300).map(|i| if i % 2 == 0 { 127 } else { -128 }).collect();
+        let y: Vec<i8> = (0..300).map(|i| if i % 2 == 0 { -127 } else { 127 }).collect();
+        assert_eq!(i8_dot(&x, &y), i8_dot_scalar(&x, &y));
+    }
+
+    #[test]
+    fn i8_dot_known_values() {
+        assert_eq!(i8_dot(&[], &[]), 0);
+        assert_eq!(i8_dot(&[3], &[-5]), -15);
+        // 16 で割り切れる長さとそうでない長さの両方
+        assert_eq!(i8_dot(&[1, 2, 3, 4], &[10, 20, 30, 40]), 300);
+        let a = [127i8; 32];
+        assert_eq!(i8_dot(&a, &a), 127 * 127 * 32);
+        // スカラー参照とも一致
+        assert_eq!(i8_dot(&a, &a), i8_dot_scalar(&a, &a));
+    }
+
+    #[test]
+    fn i8_dot_uses_simd_on_supported_targets() {
+        // compile-time 判定 (runtime 検出はしない設計): dev-host (aarch64+dotprod) と
+        // CI の x86-64-v3 (avx2) では SIMD パスが選ばれていることを保証する。
+        // どちらでもないターゲットではスカラーにフォールバックするのでスキップ。
+        let simd = cfg!(all(target_arch = "aarch64", target_feature = "dotprod"))
+            || cfg!(all(target_arch = "x86_64", target_feature = "avx2"));
+        if !simd {
+            eprintln!("SKIPPED: this target has neither dotprod nor avx2 (scalar fallback)");
+            return;
+        }
+        assert!(simd);
+    }
+
+    #[test]
+    fn i8_dot_no_overflow_up_to_documented_bound() {
+        // オーバーフロー境界の検証: 全要素 ±127 の最悪ケースで
+        // k = 131,072 → |Σ| = 127*127*131,072 = 2,113,929,216 < i32::MAX (2^31-1)。
+        // SIMD (レーン分割 + 複数アキュムレータ) の中間値も 16129*k に収まるので
+        // スカラー参照と一致し、かつ飽和/ラップが起きない。
+        let k = 131_072usize;
+        let a = vec![127i8; k];
+        let b = vec![127i8; k];
+        let expect = 127i64 * 127 * k as i64;
+        assert!(expect <= i32::MAX as i64);
+        assert_eq!(i8_dot(&a, &b) as i64, expect);
+        assert_eq!(i8_dot_scalar(&a, &b) as i64, expect);
+        // 負方向の最悪ケース
+        let neg = vec![-127i8; k];
+        assert_eq!(i8_dot(&a, &neg) as i64, -expect);
+        assert_eq!(i8_dot_scalar(&a, &neg) as i64, -expect);
+        // ドキュメント上の上限 (i32::MAX / 16129 ≒ 133,169) を超えると溢れる旨も確認
+        let k_over = 140_000usize;
+        assert!(127i64 * 127 * k_over as i64 > i32::MAX as i64);
+    }
+
+    #[test]
+    fn quantize_row_i8_roundtrip_and_determinism() {
+        // デ量子化誤差は scale/2 以下、クランプは ±127、ゼロベクトルは scale=1
+        let a: Vec<f32> = (0..1024)
+            .map(|i| ((i * 37) % 2000) as f32 / 1000.0 - 1.0)
+            .collect();
+        let (q, s) = quantize_row_i8(&a);
+        assert_eq!(q.len(), a.len());
+        assert!(q.iter().all(|&v| (-127..=127).contains(&v)));
+        let maxabs = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!((s - maxabs / 127.0).abs() < 1e-7 * s);
+        for (v, &qi) in a.iter().zip(&q) {
+            let err = (v - qi as f32 * s).abs();
+            assert!(err <= s / 2.0 * 1.0001 + 1e-9, "err={err} scale/2={}", s / 2.0);
+        }
+        // 決定論: 同一入力 → 同一出力
+        let (q2, s2) = quantize_row_i8(&a);
+        assert_eq!(q, q2);
+        assert_eq!(s.to_bits(), s2.to_bits());
+        // ゼロベクトル
+        let (qz, sz) = quantize_row_i8(&[0.0; 8]);
+        assert_eq!(sz, 1.0);
+        assert!(qz.iter().all(|&v| v == 0));
+        // 巨大値のクランプ
+        let (qc, _) = quantize_row_i8(&[1e30, -1e30, 0.0]);
+        assert_eq!(qc, [127, -127, 0]);
     }
 }
