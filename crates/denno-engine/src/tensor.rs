@@ -91,6 +91,47 @@ pub fn matvec_bt(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
     c
 }
 
+/// c[j] = scale[j] * Σ_d a[d] * q[j*k+d] — int8 weight-only の fused matvec
+/// (decode 用、matvec_bt の int8 版)。
+/// q: [n,k] row-major (nn.Linear 形式)、scale: [n] は出力チャネルごとのデ量子化係数。
+/// int8 重みを直接読むため帯域が fp32 の約 1/4 で済む (P3)。
+/// 各出力要素を固定順序で畳み込むため決定論的 (量子化パスの exact decoding)。
+pub fn matvec_bt_i8(a: &[f32], q: &[i8], scale: &[f32], k: usize, n: usize) -> Vec<f32> {
+    debug_assert_eq!(q.len(), k * n);
+    debug_assert_eq!(scale.len(), n);
+    let mut c = vec![0.0f32; n];
+    c.par_iter_mut()
+        .enumerate()
+        .with_min_len(64)
+        .for_each(|(j, cj)| {
+            let row = &q[j * k..][..k];
+            let mut s = 0.0f32;
+            for d in 0..k {
+                s += a[d] * row[d] as f32;
+            }
+            *cj = s * scale[j];
+        });
+    c
+}
+
+/// c = a @ q^T (int8 weight-only の prefill 用 GEMM、q: [n,k] row-major)。
+/// int8 → f32 へデ量子化してから既存の並列 sgemm に渡す。
+/// decode 経路 (matvec_bt_i8) と異なりデ量子化バッファを一度作るため
+/// 追加のメモリ書き込みが発生するが、prefill は attention sgemm が支配的なため
+/// 実用上の影響は小さい。
+pub fn matmul_bt_i8(a: &[f32], q: &[i8], scale: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    debug_assert_eq!(q.len(), k * n);
+    debug_assert_eq!(scale.len(), n);
+    let mut w = vec![0.0f32; k * n];
+    for j in 0..n {
+        let s = scale[j];
+        for d in 0..k {
+            w[j * k + d] = q[j * k + d] as f32 * s;
+        }
+    }
+    matmul_bt(a, &w, m, k, n)
+}
+
 /// 各行にバイアスを加算 (x: row-major [rows, cols])
 pub fn add_bias(x: &mut [f32], bias: &[f32], cols: usize) {
     for row in x.chunks_mut(cols) {

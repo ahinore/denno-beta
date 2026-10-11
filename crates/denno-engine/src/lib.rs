@@ -8,6 +8,7 @@ pub mod kv_cache;
 pub mod load;
 pub mod model;
 pub mod prefix_cache;
+pub mod quant;
 pub mod sampler;
 pub mod tensor;
 pub mod tokenizer;
@@ -16,3 +17,4 @@ pub mod tokenizer;
 pub mod testutil;
 
 pub use engine::{ChatMessage, ChatOutput, Engine, GenParams, PrefixHit, StopReason};
+pub use quant::{Linear, Quant8Linear, QuantMode};

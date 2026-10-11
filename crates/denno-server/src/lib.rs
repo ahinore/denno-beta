@@ -8,7 +8,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use denno_engine::{ChatMessage, ChatOutput, Engine, GenParams};
+use denno_engine::{ChatMessage, ChatOutput, Engine, GenParams, QuantMode};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
@@ -31,6 +31,8 @@ pub struct ServeConfig {
     pub default_seed: Option<u64>,
     /// マルチエントリ prefix cache のトークン上限 (None なら env/デフォルトのまま)
     pub prefix_cache_tokens: Option<usize>,
+    /// 重みの量子化モード (P3。デフォルト fp32。int8 は CLI でのみ有効化)
+    pub quant: QuantMode,
 }
 
 // ---------- Anthropic 形式エラー ----------
@@ -167,10 +169,12 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
     let model_dir = cfg.model_dir.clone();
     let name = cfg.name.clone();
     let seed = cfg.default_seed;
+    let quant = cfg.quant;
     tracing::info!("loading model from {:?} ...", model_dir);
-    let mut engine = tokio::task::spawn_blocking(move || Engine::load(&model_dir, name, seed))
-        .await
-        .map_err(|e| anyhow::anyhow!("join error: {e}"))??;
+    let mut engine =
+        tokio::task::spawn_blocking(move || Engine::load(&model_dir, name, seed, quant))
+            .await
+            .map_err(|e| anyhow::anyhow!("join error: {e}"))??;
     let ctx = engine.context();
     // CLI 引数での prefix cache 上限指定 (env より優先)
     if let Some(n) = cfg.prefix_cache_tokens {

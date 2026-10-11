@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::kv_cache::KvCache;
 use crate::model::{load_model, Model};
 use crate::prefix_cache::PrefixCache;
+use crate::quant::QuantMode;
 use crate::sampler::Sampler;
 use crate::tokenizer::DennoTokenizer;
 
@@ -100,8 +101,21 @@ pub struct Engine {
 impl Engine {
     /// モデルディレクトリ(HF形式: config.json + model.safetensors + tokenizer.json
     /// + tokenizer_config.json)からロードする。
-    pub fn load(dir: &Path, name: impl Into<String>, default_seed: Option<u64>) -> Result<Self> {
-        let model = load_model(dir).context("モデルのロードに失敗")?;
+    ///
+    /// `quant` は重みの量子化モード (P3):
+    /// - `QuantMode::Fp32` (デフォルト): 従来動作。HANDOFF §5 の exactness 基準は
+    ///   このモードのもの。
+    /// - `QuantMode::Int8`: 線形層の重みをロード時に per-channel scale の int8 へ
+    ///   量子化する。**同一 seed + 温度 0 → 同一出力の決定論は維持されるが、
+    ///   fp32 モードと同一の出力にはならない** (丸め誤差)。CLI でのみ有効化
+    ///   (`denno serve --quant int8`)。
+    pub fn load(
+        dir: &Path,
+        name: impl Into<String>,
+        default_seed: Option<u64>,
+        quant: QuantMode,
+    ) -> Result<Self> {
+        let model = load_model(dir, quant).context("モデルのロードに失敗")?;
         let tok = DennoTokenizer::load(dir).context("トークナイザのロードに失敗")?;
         let cache = model.new_cache();
         // マルチエントリ prefix cache のトークン上限。
@@ -114,6 +128,15 @@ impl Engine {
             "prefix cache: multi-entry LRU, budget = {} tokens (~{:.0} MB KV)",
             max_tokens,
             max_tokens as f64 * cache.bytes_per_token() as f64 / 1e6
+        );
+        tracing::info!(
+            "quant mode: {}{}",
+            quant.label(),
+            if quant == QuantMode::Int8 {
+                " (決定論は維持されるが fp32 と同一出力ではない)"
+            } else {
+                ""
+            }
         );
         Ok(Self {
             model,

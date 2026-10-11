@@ -5,7 +5,7 @@
 //!   DENNO_QWEN_DIR  (default: /home/dev/.cache/denno/hub/models--Qwen--Qwen2.5-0.5B-Instruct)
 //!   DENNO_GPT2_DIR  (default: /home/dev/.cache/denno/hub/models--openai--gpt2)
 
-use denno_engine::{ChatMessage, Engine, GenParams};
+use denno_engine::{ChatMessage, Engine, GenParams, QuantMode};
 use std::path::PathBuf;
 
 fn model_dir(env_key: &str, default: &str) -> Option<PathBuf> {
@@ -47,7 +47,7 @@ fn qwen_1plus1_matches_baseline() {
     ) else {
         return;
     };
-    let mut e = Engine::load(&dir, "denno-test", Some(42)).unwrap();
+    let mut e = Engine::load(&dir, "denno-test", Some(42), QuantMode::Fp32).unwrap();
     let out = e.chat(None, &user_msg("1+1は?"), &greedy(50), |_| {}).unwrap();
     assert_eq!(
         out.text,
@@ -69,11 +69,11 @@ fn qwen_prefix_cache_keeps_exact_output() {
     };
 
     // cold: 何もキャッシュが無い状態で「日本の首都は?」
-    let mut cold = Engine::load(&dir, "denno-test", Some(42)).unwrap();
+    let mut cold = Engine::load(&dir, "denno-test", Some(42), QuantMode::Fp32).unwrap();
     let cold_out = cold.chat(None, &user_msg("日本の首都は?"), &greedy(30), |_| {}).unwrap();
 
     // warm: 別の会話を挟んでから同一プロンプト (LCP 再利用が走る)
-    let mut warm = Engine::load(&dir, "denno-test", Some(42)).unwrap();
+    let mut warm = Engine::load(&dir, "denno-test", Some(42), QuantMode::Fp32).unwrap();
     warm.chat(None, &user_msg("1+1は?"), &greedy(10), |_| {}).unwrap();
     let warm_out = warm.chat(None, &user_msg("日本の首都は?"), &greedy(30), |_| {}).unwrap();
 
@@ -92,7 +92,7 @@ fn qwen_exact_decoding_is_reproducible() {
     ) else {
         return;
     };
-    let mut e = Engine::load(&dir, "denno-test", Some(42)).unwrap();
+    let mut e = Engine::load(&dir, "denno-test", Some(42), QuantMode::Fp32).unwrap();
     let a = e.chat(None, &user_msg("1+1は?"), &greedy(20), |_| {}).unwrap();
     let b = e.chat(None, &user_msg("1+1は?"), &greedy(20), |_| {}).unwrap();
     assert_eq!(a.text, b.text);
@@ -110,7 +110,7 @@ fn gpt2_japan_capital_matches_baseline() {
     ) else {
         return;
     };
-    let mut e = Engine::load(&dir, "gpt2-test", Some(42)).unwrap();
+    let mut e = Engine::load(&dir, "gpt2-test", Some(42), QuantMode::Fp32).unwrap();
     let out = e.chat(None, &user_msg("日本の首都は?"), &greedy(40), |_| {}).unwrap();
     println!("gpt2 output: {}", out.text);
     assert!(
@@ -120,4 +120,23 @@ fn gpt2_japan_capital_matches_baseline() {
         "unexpected output: {}",
         out.text
     );
+}
+
+/// P3: int8 モードの決定論。同一 seed + 温度 0 → 同一出力が維持される。
+/// ただし fp32 と同一出力ではないことは仕様 (丸め誤差)。
+#[test]
+#[ignore]
+fn qwen_int8_mode_is_deterministic() {
+    let Some(dir) = model_dir(
+        "DENNO_QWEN_DIR",
+        "/home/dev/.cache/denno/hub/models--Qwen--Qwen2.5-0.5B-Instruct",
+    ) else {
+        return;
+    };
+    let mut e = Engine::load(&dir, "denno-test-i8", Some(42), QuantMode::Int8).unwrap();
+    let a = e.chat(None, &user_msg("1+1は?"), &greedy(50), |_| {}).unwrap();
+    let b = e.chat(None, &user_msg("1+1は?"), &greedy(50), |_| {}).unwrap();
+    assert_eq!(a.text, b.text, "int8 モードで同 seed → 同一出力が崩れた");
+    assert_eq!(a.output_tokens, b.output_tokens);
+    println!("int8 output: {}", a.text);
 }

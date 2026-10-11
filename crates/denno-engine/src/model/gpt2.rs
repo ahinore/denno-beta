@@ -1,5 +1,10 @@
 //! GPT-2 (124M 等)。最も単純な構成: LayerNorm + GELU + causal attention。
 //! 重みは HF Conv1D 形式で [in, out] 保存 → forward は x @ W + b。
+//!
+//! 線形層の重みは `quant::Linear` で保持され、QuantMode::Int8 時はロード時に
+//! per-channel scale の int8 へオフライン量子化される (P3)。int8 は転置した
+//! [out,in] 形で保持するため bt カーネルで計算する。lm_head (tied: wte を転置
+//! 使用) も int8 モードでは量子化コピーを持つ。
 
 use anyhow::Result;
 use memmap2::Mmap;
@@ -8,20 +13,21 @@ use std::path::Path;
 use crate::kv_cache::KvCache;
 use crate::load::get_f32;
 use crate::model::{cfg_u64, Model};
-use crate::tensor::{add_bias, gelu_inplace, layernorm, matmul, matmul_bt, softmax};
+use crate::quant::{Linear, QuantMode};
+use crate::tensor::{add_bias, gelu_inplace, layernorm, softmax};
 
 struct Layer {
     ln1_w: Vec<f32>,
     ln1_b: Vec<f32>,
-    attn_w: Vec<f32>,   // [e, 3e]
-    attn_b: Vec<f32>,   // [3e]
-    attn_proj_w: Vec<f32>, // [e, e]
+    attn_w: Linear,   // [e, 3e] (Conv1D)
+    attn_b: Vec<f32>, // [3e]
+    attn_proj_w: Linear, // [e, e]
     attn_proj_b: Vec<f32>,
     ln2_w: Vec<f32>,
     ln2_b: Vec<f32>,
-    fc_w: Vec<f32>,     // [e, 4e]
+    fc_w: Linear,     // [e, 4e]
     fc_b: Vec<f32>,
-    mlp_proj_w: Vec<f32>, // [4e, e]
+    mlp_proj_w: Linear, // [4e, e]
     mlp_proj_b: Vec<f32>,
 }
 
@@ -31,15 +37,18 @@ pub struct Gpt2 {
     ctx: usize,        // n_ctx
     vocab: usize,
     eos: u32,
-    wte: Vec<f32>,     // [vocab, e]
+    wte: Vec<f32>,     // [vocab, e] (embedding lookup 用、常に fp32)
     wpe: Vec<f32>,     // [ctx, e]
     lnf_w: Vec<f32>,
     lnf_b: Vec<f32>,
+    /// lm_head。None なら tied → wte を [vocab,e] のまま転置使用 (fp32)。
+    /// int8 モードでは常に Some (wte の量子化コピー)。
+    lm_head: Option<Linear>,
     layers: Vec<Layer>,
 }
 
 impl Gpt2 {
-    pub fn load(dir: &Path, cfg: &serde_json::Value) -> Result<Self> {
+    pub fn load(dir: &Path, cfg: &serde_json::Value, quant: QuantMode) -> Result<Self> {
         let e = cfg_u64(cfg, "n_embd")? as usize;
         let heads = cfg_u64(cfg, "n_head")? as usize;
         let ctx = cfg_u64(cfg, "n_ctx")? as usize;
@@ -52,6 +61,12 @@ impl Gpt2 {
         let st = safetensors::SafeTensors::deserialize(&mmap)?;
 
         let g = |name: &str| get_f32(&st, name);
+        let mut quant_bytes = 0usize;
+        let mut lin_col = |w: &[f32], k: usize, n: usize| -> Linear {
+            let l = Linear::from_colmajor(w, k, n, quant);
+            quant_bytes += l.weight_bytes();
+            l
+        };
 
         let mut layers = Vec::with_capacity(n_layer);
         for i in 0..n_layer {
@@ -59,17 +74,36 @@ impl Gpt2 {
             layers.push(Layer {
                 ln1_w: g(&format!("{p}ln_1.weight"))?,
                 ln1_b: g(&format!("{p}ln_1.bias"))?,
-                attn_w: g(&format!("{p}attn.c_attn.weight"))?,
+                attn_w: lin_col(&g(&format!("{p}attn.c_attn.weight"))?, e, 3 * e),
                 attn_b: g(&format!("{p}attn.c_attn.bias"))?,
-                attn_proj_w: g(&format!("{p}attn.c_proj.weight"))?,
+                attn_proj_w: lin_col(&g(&format!("{p}attn.c_proj.weight"))?, e, e),
                 attn_proj_b: g(&format!("{p}attn.c_proj.bias"))?,
                 ln2_w: g(&format!("{p}ln_2.weight"))?,
                 ln2_b: g(&format!("{p}ln_2.bias"))?,
-                fc_w: g(&format!("{p}mlp.c_fc.weight"))?,
+                fc_w: lin_col(&g(&format!("{p}mlp.c_fc.weight"))?, e, 4 * e),
                 fc_b: g(&format!("{p}mlp.c_fc.bias"))?,
-                mlp_proj_w: g(&format!("{p}mlp.c_proj.weight"))?,
+                mlp_proj_w: lin_col(&g(&format!("{p}mlp.c_proj.weight"))?, 4 * e, e),
                 mlp_proj_b: g(&format!("{p}mlp.c_proj.bias"))?,
             });
+        }
+
+        // lm_head: tied は wte を [vocab,e] (= nn.Linear 形) のまま転置使用。
+        // int8 モードでは lm_head 用の量子化コピーを持つ (wte 本体は lookup 用に
+        // fp32 のまま残す)。
+        let lm_head = match quant {
+            QuantMode::Fp32 => None,
+            QuantMode::Int8 => {
+                let l = Linear::new(g("wte.weight")?, e, vocab, quant);
+                quant_bytes += l.weight_bytes();
+                Some(l)
+            }
+        };
+        if quant == QuantMode::Int8 {
+            tracing::info!(
+                "int8 quantization: GPT-2 linear weights quantized ({:.0} MB, fp32 なら {:.0} MB)",
+                quant_bytes as f64 / 1e6,
+                (quant_bytes as f64 * 4.0) / 1e6
+            );
         }
 
         Ok(Self {
@@ -82,6 +116,7 @@ impl Gpt2 {
             wpe: g("wpe.weight")?,
             lnf_w: g("ln_f.weight")?,
             lnf_b: g("ln_f.bias")?,
+            lm_head,
             layers,
         })
     }
@@ -120,7 +155,7 @@ impl Model for Gpt2 {
         for (li, layer) in self.layers.iter().enumerate() {
             // --- attention block ---
             let h = layernorm(&x, &layer.ln1_w, &layer.ln1_b, e, 1e-5);
-            let mut qkv = matmul(&h, &layer.attn_w, n, e, 3 * e);
+            let mut qkv = layer.attn_w.apply(&h, n); // [n, 3e]
             add_bias(&mut qkv, &layer.attn_b, 3 * e);
 
             // K, V をキャッシュに書き込み
@@ -169,7 +204,7 @@ impl Model for Gpt2 {
                 }
             }
 
-            let mut proj = matmul(&att, &layer.attn_proj_w, n, e, e);
+            let mut proj = layer.attn_proj_w.apply(&att, n);
             add_bias(&mut proj, &layer.attn_proj_b, e);
             for i in 0..n * e {
                 x[i] += proj[i];
@@ -177,20 +212,24 @@ impl Model for Gpt2 {
 
             // --- mlp block ---
             let h2 = layernorm(&x, &layer.ln2_w, &layer.ln2_b, e, 1e-5);
-            let mut f1 = matmul(&h2, &layer.fc_w, n, e, 4 * e);
+            let mut f1 = layer.fc_w.apply(&h2, n);
             add_bias(&mut f1, &layer.fc_b, 4 * e);
             gelu_inplace(&mut f1);
-            let mut f2 = matmul(&f1, &layer.mlp_proj_w, n, 4 * e, e);
+            let mut f2 = layer.mlp_proj_w.apply(&f1, n);
             add_bias(&mut f2, &layer.mlp_proj_b, e);
             for i in 0..n * e {
                 x[i] += f2[i];
             }
         }
 
-        // 最終位置だけ LayerNorm → lm head (wte を転置使用: tied embeddings)
+        // 最終位置だけ LayerNorm → lm head
+        // fp32: wte を [vocab,e] のまま転置使用。int8: 量子化コピーの bt カーネル。
         let last = &x[(n - 1) * e..];
         let hn = layernorm(last, &self.lnf_w, &self.lnf_b, e, 1e-5);
-        let logits = matmul_bt(&hn, &self.wte, 1, e, self.vocab);
+        let logits = match &self.lm_head {
+            Some(w) => w.apply_bt(&hn, 1),
+            None => crate::tensor::matvec_bt(&hn, &self.wte, e, self.vocab), // tied
+        };
 
         cache.advance(n);
         Ok(logits)

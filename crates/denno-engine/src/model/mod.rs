@@ -7,6 +7,7 @@ use anyhow::{bail, Result};
 use std::path::Path;
 
 use crate::kv_cache::KvCache;
+use crate::quant::QuantMode;
 
 pub trait Model: Send {
     /// コンテキスト長(prompt+生成 の上限)
@@ -26,16 +27,18 @@ pub fn cfg_u64(cfg: &serde_json::Value, key: &str) -> Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("config.json に {} がありません", key))
 }
 
-/// config.json の model_type からファミリーを決めてロードする
-pub fn load_model(dir: &Path) -> Result<Box<dyn Model>> {
+/// config.json の model_type からファミリーを決めてロードする。
+/// `mode` が Int8 の場合は線形層の重みをロード時に int8 へオフライン量子化する
+/// (P3。デフォルトの Fp32 は従来動作を完全維持)。
+pub fn load_model(dir: &Path, mode: QuantMode) -> Result<Box<dyn Model>> {
     let cfg_path = dir.join("config.json");
     let cfg: serde_json::Value = serde_json::from_reader(
         std::fs::File::open(&cfg_path)
             .map_err(|e| anyhow::anyhow!("config.json を開けません ({:?}): {}", cfg_path, e))?,
     )?;
     match cfg.get("model_type").and_then(|v| v.as_str()) {
-        Some("gpt2") => Ok(Box::new(gpt2::Gpt2::load(dir, &cfg)?)),
-        Some("qwen2") => Ok(Box::new(llama::LlamaQwen2::load(dir, &cfg)?)),
+        Some("gpt2") => Ok(Box::new(gpt2::Gpt2::load(dir, &cfg, mode)?)),
+        Some("qwen2") => Ok(Box::new(llama::LlamaQwen2::load(dir, &cfg, mode)?)),
         other => bail!("未対応の model_type: {:?}(gpt2 / qwen2 のみ対応)", other),
     }
 }

@@ -29,6 +29,9 @@ enum Commands {
         #[arg(long, default_value_t = 128)] max_tokens: usize,
         #[arg(long)] temperature: Option<f32>,
         #[arg(long)] seed: Option<u64>,
+        /// 重みの量子化モード (fp32 / int8)。int8 は決定論を維持するが
+        /// fp32 と同一出力にはならない
+        #[arg(long, default_value = "fp32")] quant: String,
         /// chat template を適用しない(生プロンプト)
         #[arg(long)] raw: bool,
     },
@@ -47,6 +50,10 @@ enum Commands {
         /// マルチエントリ prefix cache のトークン上限
         /// (未指定時は DENNO_PREFIX_CACHE_MAX_TOKENS、それも無ければコンテキスト長)
         #[arg(long)] prefix_cache_tokens: Option<usize>,
+        /// 重みの量子化モード (fp32 / int8、デフォルト fp32)。
+        /// int8 は exact decoding の決定論 (同seed→同出力) を維持するが
+        /// fp32 と同一出力ではない (丸め誤差)
+        #[arg(long, default_value = "fp32")] quant: String,
     },
 }
 
@@ -106,12 +113,13 @@ fn main() -> Result<()> {
                 println!("weights:   {:.1} MB", bytes as f64 / 1e6);
             }
         }
-        Commands::Generate { repo, prompt, system, max_tokens, temperature, seed, raw } => {
+        Commands::Generate { repo, prompt, system, max_tokens, temperature, seed, quant, raw } => {
             let dir = model_dir(&repo);
             if !dir.exists() {
                 bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
             }
-            let mut engine = denno_engine::Engine::load(&dir, repo.clone(), seed)?;
+            let quant_mode = denno_engine::QuantMode::parse(&quant)?;
+            let mut engine = denno_engine::Engine::load(&dir, repo.clone(), seed, quant_mode)?;
             let params = denno_engine::GenParams {
                 max_tokens,
                 temperature,
@@ -138,11 +146,12 @@ fn main() -> Result<()> {
             };
             println!("{}", out);
         }
-        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens } => {
+        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant } => {
             let dir = model_dir(&repo);
             if !dir.exists() {
                 bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
             }
+            let quant_mode = denno_engine::QuantMode::parse(&quant)?;
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(denno_server::run(denno_server::ServeConfig {
                 model_dir: dir,
@@ -152,6 +161,7 @@ fn main() -> Result<()> {
                 api_key,
                 default_seed: seed,
                 prefix_cache_tokens,
+                quant: quant_mode,
             }))?;
         }
     }
