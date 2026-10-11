@@ -195,17 +195,21 @@ impl Model for LlamaQwen2 {
         let n = tokens.len();
 
         let mut x = vec![0.0f32; n * e];
-        for (i, &t) in tokens.iter().enumerate() {
-            let emb = &self.embed[t as usize * e..][..e];
-            x[i * e..][..e].copy_from_slice(emb);
-        }
+        crate::prof::time(crate::prof::EMBED, || {
+            for (i, &t) in tokens.iter().enumerate() {
+                let emb = &self.embed[t as usize * e..][..e];
+                x[i * e..][..e].copy_from_slice(emb);
+            }
+        });
 
         for (li, layer) in self.layers.iter().enumerate() {
             // --- attention ---
-            let h = rmsnorm(&x, &layer.ln1_w, e, self.eps);
-            let mut q = lin(&h, &layer.q_w, n); // [n, H*dh]
-            let mut k = lin(&h, &layer.k_w, n); // [n, K*dh]
-            let mut v = lin(&h, &layer.v_w, n);
+            let h = crate::prof::time(crate::prof::RMSNORM, || {
+                rmsnorm(&x, &layer.ln1_w, e, self.eps)
+            });
+            let mut q = crate::prof::time(crate::prof::QKV, || lin(&h, &layer.q_w, n)); // [n, H*dh]
+            let mut k = crate::prof::time(crate::prof::QKV, || lin(&h, &layer.k_w, n)); // [n, K*dh]
+            let mut v = crate::prof::time(crate::prof::QKV, || lin(&h, &layer.v_w, n));
             if let Some(b) = &layer.q_b {
                 add_bias(&mut q, b, heads * dh);
             }
@@ -216,8 +220,10 @@ impl Model for LlamaQwen2 {
                 add_bias(&mut v, b, kv_dim);
             }
 
-            rope_rows(&mut q, n, heads, dh, pos0, self.theta);
-            rope_rows(&mut k, n, kv_heads, dh, pos0, self.theta);
+            crate::prof::time(crate::prof::ROPE, || {
+                rope_rows(&mut q, n, heads, dh, pos0, self.theta);
+                rope_rows(&mut k, n, kv_heads, dh, pos0, self.theta);
+            });
 
             {
                 let (kc, vc) = cache.kv_bufs(li);
@@ -228,7 +234,7 @@ impl Model for LlamaQwen2 {
             }
 
             let mut att = vec![0.0f32; n * heads * dh];
-            {
+            crate::prof::time(crate::prof::ATTN, || {
                 let (kc, vc) = cache.kv_bufs(li);
                 let t_total = pos0 + n;
                 let scale = 1.0 / (dh as f32).sqrt();
@@ -276,34 +282,40 @@ impl Model for LlamaQwen2 {
                         }
                     }
                 }
-            }
+            });
 
-            let proj = lin(&att, &layer.o_w, n);
+            let proj = crate::prof::time(crate::prof::OPROJ, || lin(&att, &layer.o_w, n));
             for i in 0..n * e {
                 x[i] += proj[i];
             }
 
             // --- mlp (SwiGLU) ---
-            let h2 = rmsnorm(&x, &layer.ln2_w, e, self.eps);
-            let mut gate = lin(&h2, &layer.gate_w, n);
-            let up = lin(&h2, &layer.up_w, n);
-            silu_inplace(&mut gate);
-            for i in 0..n * self.ff {
-                gate[i] *= up[i];
-            }
-            let down = lin(&gate, &layer.down_w, n);
+            let h2 = crate::prof::time(crate::prof::RMSNORM, || {
+                rmsnorm(&x, &layer.ln2_w, e, self.eps)
+            });
+            let mut gate = crate::prof::time(crate::prof::GATE_UP, || lin(&h2, &layer.gate_w, n));
+            let up = crate::prof::time(crate::prof::GATE_UP, || lin(&h2, &layer.up_w, n));
+            crate::prof::time(crate::prof::SWIGLU, || {
+                silu_inplace(&mut gate);
+                for i in 0..n * self.ff {
+                    gate[i] *= up[i];
+                }
+            });
+            let down = crate::prof::time(crate::prof::DOWN, || lin(&gate, &layer.down_w, n));
             for i in 0..n * e {
                 x[i] += down[i];
             }
         }
 
         let last = &x[(n - 1) * e..];
-        let hn = rmsnorm(last, &self.norm_w, e, self.eps);
-        let logits = match &self.lm_head {
+        let hn = crate::prof::time(crate::prof::FINAL_NORM, || {
+            rmsnorm(last, &self.norm_w, e, self.eps)
+        });
+        let logits = crate::prof::time(crate::prof::LM_HEAD, || match &self.lm_head {
             Some(w) => lin(&hn, w, 1),
             // tied (fp32 モード): embed を [vocab, e] のまま転置使用
             None => crate::tensor::matvec_bt(&hn, &self.embed, e, self.vocab),
-        };
+        });
 
         cache.advance(n);
         Ok(logits)

@@ -445,7 +445,8 @@ impl Engine {
         }
 
         // decode 1 ステップ (旧 chat() のループ 1 回分と同一)
-        let next = sess.sampler.sample(&sess.logits) as u32;
+        let next =
+            crate::prof::time(crate::prof::SAMPLER, || sess.sampler.sample(&sess.logits)) as u32;
         sess.generated.push(next);
 
         if self.model.eos_ids().contains(&next) {
@@ -454,7 +455,7 @@ impl Engine {
         }
 
         // 差分だけストリーミング(部分的なUTF-8を避けるため全decode→diff)
-        let full = self.tok.decode(&sess.generated)?;
+        let full = crate::prof::time(crate::prof::DETOK, || self.tok.decode(&sess.generated))?;
         if full.len() > sess.text.len() && full.is_char_boundary(sess.text.len()) {
             let delta = &full[sess.text.len()..];
             on_delta(delta);

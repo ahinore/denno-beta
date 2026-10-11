@@ -30,7 +30,7 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::{bail, Result};
 use axum::response::sse::Event;
-use denno_engine::{ChatMessage, ChatOutput, ChatSession, Engine, GenParams};
+use denno_engine::{prof, ChatMessage, ChatOutput, ChatSession, Engine, GenParams};
 use serde_json::json;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
@@ -192,6 +192,9 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
             Ok(true) => {
                 in_flight.fetch_sub(1, Ordering::SeqCst);
                 finish_run(live.take().unwrap());
+                if prof::enabled() {
+                    tracing::info!("{}", prof::summary());
+                }
                 continue;
             }
             Err(e) => {

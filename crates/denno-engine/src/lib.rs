@@ -8,6 +8,7 @@ pub mod kv_cache;
 pub mod load;
 pub mod model;
 pub mod prefix_cache;
+pub mod prof;
 pub mod quant;
 pub mod sampler;
 pub mod tensor;
