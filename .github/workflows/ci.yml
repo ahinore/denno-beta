@@ -7,6 +7,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI では target-cpu=native を使わない。rust-cache がランナー間で共有されるため、
+  # 前回のランナーの CPU 用にネイティブビルドされた依存が別世代の CPU で
+  # SIGILL (Illegal instruction) を起こすことがある。
+  # x86-64-v3 (AVX2/FMA) は全ランナーが対応し、FMA を含むため
+  # dev-host (aarch64) で生成した exactness 基準との浮動小数点挙動も近い。
+  RUSTFLAGS: "-C target-cpu=x86-64-v3"
 
 jobs:
   build-test:
@@ -19,6 +25,9 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          # native ビルドのキャッシュを無効化するためキーを変更
+          key: ci-v3
 
       - name: Build (workspace, release)
         run: cargo build --workspace --release
@@ -40,6 +49,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-v3
 
       - name: Pull model
         run: cargo run --release --bin denno -- pull Qwen/Qwen2.5-0.5B-Instruct
