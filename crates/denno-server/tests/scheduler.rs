@@ -19,9 +19,11 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use denno_engine::kv_cache::KvCache;
 use denno_engine::model::Model;
-use denno_engine::testutil::{dummy_tokenizer, DUMMY_CONTEXT, DUMMY_EOS, DUMMY_VOCAB};
+use denno_engine::testutil::{
+    dummy_tokenizer, kv_sensitive_engine, KvSensitiveModel, DUMMY_CONTEXT, DUMMY_EOS, DUMMY_VOCAB,
+};
 use denno_engine::{ChatMessage, Engine, GenParams};
-use denno_server::{AppState, Scheduler};
+use denno_server::{AppState, Scheduler, MAX_ACTIVE_SESSIONS};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -57,14 +59,9 @@ impl Model for SleepModel {
 }
 
 /// テスト用 AppState + Router を構築する
-fn test_app(delay_ms: u64, max_queue: usize) -> (Router, Arc<AppState>) {
+fn test_app_with(model: Box<dyn Model>, max_queue: usize) -> (Router, Arc<AppState>) {
     let tok = dummy_tokenizer().unwrap();
-    let engine = Engine::from_parts(
-        Box::new(SleepModel { delay: Duration::from_millis(delay_ms) }),
-        tok,
-        "denno-test",
-        None,
-    );
+    let engine = Engine::from_parts(model, tok, "denno-test", None);
     let engine = Arc::new(Mutex::new(engine));
     let scheduler = Scheduler::spawn(engine.clone(), max_queue);
     let state = Arc::new(AppState { engine, api_key: None, scheduler });
@@ -72,13 +69,20 @@ fn test_app(delay_ms: u64, max_queue: usize) -> (Router, Arc<AppState>) {
     (app, state)
 }
 
-fn request_body(max_tokens: usize, stream: bool) -> String {
+fn test_app(delay_ms: u64, max_queue: usize) -> (Router, Arc<AppState>) {
+    test_app_with(
+        Box::new(SleepModel { delay: Duration::from_millis(delay_ms) }),
+        max_queue,
+    )
+}
+
+fn request_body(content: &str, max_tokens: usize, stream: bool) -> String {
     json!({
         "model": "denno-test",
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": stream,
-        "messages": [{"role": "user", "content": "t0"}]
+        "messages": [{"role": "user", "content": content}]
     })
     .to_string()
 }
@@ -141,7 +145,7 @@ async fn single_request_matches_engine_reference_output() {
     let reference = direct.chat(None, &user_msg("t0"), &greedy_params(20), |_| {}).unwrap();
 
     let (app, _state) = test_app(0, 8);
-    let (status, body) = post(&app, request_body(20, false)).await;
+    let (status, body) = post(&app, request_body("t0", 20, false)).await;
 
     assert_eq!(status, StatusCode::OK, "body = {body}");
     assert_eq!(body["type"], "message");
@@ -155,15 +159,16 @@ async fn single_request_matches_engine_reference_output() {
     assert_eq!(body["usage"]["output_tokens"], json!(reference.output_tokens));
 }
 
-// ---------- 同時受け付け + 直列実行 + 同時実行上限 ----------
+// ---------- 同時受け付け + インターリーブ実行 ----------
 
-/// 複数リクエストが同時に受け付けられ、全て完了する。実行は直列
-/// (in_flight が常に 1 以下) で、出力は全リクエストで同一 (exactness)。
+/// 複数リクエストが同時に受け付けられ、全て完了する。実行はステップ単位で
+/// インターリーブされるため in_flight (進行中) は 2 以上になり得るが、
+/// 出力は全リクエストで同一 (exactness)。
 #[tokio::test]
-async fn concurrent_requests_are_all_accepted_and_executed_serially() {
-    let (app, state) = test_app(10, 16); // forward 10ms × 8 回 ≒ 80ms/リクエスト
+async fn concurrent_requests_are_all_accepted_and_interleaved() {
+    let (app, state) = test_app(10, 16); // forward 10ms × 9 回 ≒ 90ms/リクエスト
 
-    // 実行中ジョブ数の最大値を監視
+    // 進行中ジョブ数の最大値を監視
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
     let monitor = {
@@ -173,7 +178,7 @@ async fn concurrent_requests_are_all_accepted_and_executed_serially() {
         tokio::spawn(async move {
             while !done.load(Ordering::SeqCst) {
                 max_in_flight.fetch_max(state.scheduler.in_flight(), Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(2)).await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
     };
@@ -182,7 +187,7 @@ async fn concurrent_requests_are_all_accepted_and_executed_serially() {
     let mut handles = Vec::new();
     for _ in 0..4 {
         let app = app.clone();
-        let body = request_body(20, false);
+        let body = request_body("t0", 20, false);
         handles.push(tokio::spawn(async move { post(&app, body).await }));
     }
     let mut results = Vec::new();
@@ -198,13 +203,84 @@ async fn concurrent_requests_are_all_accepted_and_executed_serially() {
         assert_eq!(body["content"][0]["text"], EXPECTED_GREEDY_TEXT);
     }
 
-    // 同時実行上限 (=1) を超えていないこと
-    assert_eq!(
-        max_in_flight.load(Ordering::SeqCst),
-        1,
-        "同時実行が 1 を超えた (直列実行が崩れている)"
+    // インターリーブされていること (decode 中に別リクエストの prefill/decode が
+    // 割り込むため進行中が 2 以上になる)。上限は MAX_ACTIVE_SESSIONS。
+    let max = max_in_flight.load(Ordering::SeqCst);
+    assert!(
+        max >= 2,
+        "進行中ジョブが 2 以上にならない (インターリーブが効いていない): max={max}"
     );
-    // 全完了後は実行中 0
+    assert!(
+        max <= MAX_ACTIVE_SESSIONS,
+        "進行中ジョブが上限を超えた: max={max}"
+    );
+    // 全完了後は進行中 0
+    assert_eq!(state.scheduler.in_flight(), 0);
+}
+
+/// 異なるプロンプトの並列 2 リクエストが、KV 依存モデル (KvSensitiveModel) で
+/// 各々の単独実行と完全一致すること (P4 最重要: インターリーブ下の exactness)。
+/// DummyModel は KV を参照しないため、KV 切替えの破綻を検出できるのはこのモデル。
+#[tokio::test]
+async fn concurrent_different_prompts_match_solo_reference() {
+    // 単独実行の基準 (各プロンプトを独立エンジンで)
+    let refs: Vec<String> = ["t0", "t15"]
+        .iter()
+        .map(|p| {
+            let mut e = kv_sensitive_engine("ref", None).unwrap();
+            e.chat(None, &user_msg(p), &greedy_params(8), |_| {})
+                .unwrap()
+                .text
+        })
+        .collect();
+    assert_ne!(refs[0], refs[1], "テストの前提: プロンプトが異なれば出力も異なること");
+
+    // forward に僅かな遅延を入れて、リクエスト2の到着中にリクエスト1が
+    // decode 中になる (インターリーブが実際に起きる) 状況を作る
+    let (app, state) = test_app_with(
+        Box::new(KvSensitiveModel { delay: Duration::from_millis(2) }),
+        8,
+    );
+
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let monitor = {
+        let done = done.clone();
+        let max_in_flight = max_in_flight.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            while !done.load(Ordering::SeqCst) {
+                max_in_flight.fetch_max(state.scheduler.in_flight(), Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
+
+    let mut handles = Vec::new();
+    for p in ["t0", "t15"] {
+        let app = app.clone();
+        let body = request_body(p, 8, false);
+        handles.push(tokio::spawn(async move { post(&app, body).await }));
+    }
+    let mut results = Vec::new();
+    for h in handles {
+        results.push(h.await.unwrap());
+    }
+    done.store(true, Ordering::SeqCst);
+    let _ = monitor.await;
+
+    for (i, ((status, body), r)) in results.iter().zip(refs.iter()).enumerate() {
+        assert_eq!(*status, StatusCode::OK, "request {i}: {body}");
+        assert_eq!(
+            body["content"][0]["text"].as_str().unwrap(),
+            r.as_str(),
+            "request {i} の出力が単独実行と不一致 (インターリーブで KV 切替えが壊れた)"
+        );
+    }
+    assert!(
+        max_in_flight.load(Ordering::SeqCst) >= 2,
+        "2 リクエストが並行進行していない (テストがインターリーブを検証できていない)"
+    );
     assert_eq!(state.scheduler.in_flight(), 0);
 }
 
@@ -216,7 +292,7 @@ async fn queue_overflow_returns_503_overloaded() {
     let mut handles = Vec::new();
     for _ in 0..5 {
         let app = app.clone();
-        let body = request_body(20, false);
+        let body = request_body("t0", 20, false);
         handles.push(tokio::spawn(async move { post(&app, body).await }));
     }
     let mut ok = 0;
@@ -241,12 +317,17 @@ async fn queue_overflow_returns_503_overloaded() {
         }
     }
     assert_eq!(ok + overloaded, 5);
-    // 実行中 1 + キュー 2 = 最大 3 件受理。残りは 503 で即座に拒否される。
-    // (ワーカーの起動タイミングで受理数は 2〜3 の間で揺れる)
+    // インターリーブ設計では、ワーカーがステップ間でジョブを pull して
+    // アクティブセッション (live + suspend 済み) にするとチャネルスロットが
+    // 空くため、受理数はキュー容量ではなく MAX_ACTIVE_SESSIONS まで増え得る。
+    // 残りは 503 で即座に拒否される。
     assert!(overloaded >= 1, "503 が 1 件も無い (キュー上限が効いていない)");
-    assert!(ok >= 2 && ok <= 3, "受理数が想定範囲外: ok={ok} overloaded={overloaded}");
+    assert!(
+        ok >= 2 && ok <= MAX_ACTIVE_SESSIONS,
+        "受理数が想定範囲外: ok={ok} overloaded={overloaded}"
+    );
     // 満杯で拒否された後もサーバーは継続して応答できる
-    let (status, body) = post(&app, request_body(20, false)).await;
+    let (status, body) = post(&app, request_body("t0", 20, false)).await;
     assert_eq!(status, StatusCode::OK, "body = {body}");
     assert_eq!(body["content"][0]["text"], EXPECTED_GREEDY_TEXT);
     assert_eq!(state.scheduler.in_flight(), 0);
@@ -308,7 +389,7 @@ async fn streaming_request_works_through_queue() {
         .method("POST")
         .uri("/v1/messages")
         .header("content-type", "application/json")
-        .body(Body::from(request_body(20, true)))
+        .body(Body::from(request_body("t0", 20, true)))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -334,7 +415,7 @@ async fn queued_streaming_requests_both_complete() {
     let mut handles = Vec::new();
     for _ in 0..2 {
         let app = app.clone();
-        let body = request_body(20, true);
+        let body = request_body("t0", 20, true);
         handles.push(tokio::spawn(async move {
             let req = Request::builder()
                 .method("POST")

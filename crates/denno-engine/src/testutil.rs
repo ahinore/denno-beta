@@ -82,6 +82,102 @@ pub fn dummy_engine(name: &str, seed: Option<u64>) -> Result<Engine> {
     Ok(Engine::from_parts(Box::new(DummyModel), tok, name, seed))
 }
 
+/// KV キャッシュの内容に依存する決定論的ダミーモデル (P4 インターリーブ exactness 用)。
+///
+/// DummyModel は KV の中身を参照しないため、suspend/restore の切替えが壊れても
+/// logits が変わらず検証にならない。このモデルは forward のたびに K/V 行
+/// (トークン+位置に依存する決定論的値) を書き込み、logits の argmax を
+/// 「キャッシュ内 K 全行の加重和」から決める。KV の退避/復元が壊れる
+/// (行が欠落・入れ替わる) と logits が変わり生成トークン列が一致しなくなるため、
+/// 単一 KV キャッシュの時分割切替えの exactness 検証に使える。
+pub struct KvSensitiveModel {
+    /// forward ごとの sleep (スケジューラのインターリーブを確実に起こす用)
+    pub delay: std::time::Duration,
+}
+
+impl KvSensitiveModel {
+    /// 遅延無しで構築
+    pub fn new() -> Self {
+        Self { delay: std::time::Duration::ZERO }
+    }
+
+    fn kv_k(t: u32, pos: usize, d: usize, kv_dim: usize) -> f32 {
+        (((t as usize + 2 * d + pos) % 11) as f32) / 3.0 + ((t as usize * (d + 1)) % 7) as f32
+    }
+
+    fn kv_v(t: u32, pos: usize, d: usize, kv_dim: usize) -> f32 {
+        (((t as usize + 3 * d + pos) % 13) as f32) / 5.0
+    }
+}
+
+impl Default for KvSensitiveModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Model for KvSensitiveModel {
+    fn context(&self) -> usize {
+        DUMMY_CONTEXT
+    }
+
+    fn eos_ids(&self) -> &[u32] {
+        &[DUMMY_EOS]
+    }
+
+    fn forward(&mut self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>> {
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        let pos = cache.len();
+        let kv_dim = cache.kv_dim();
+        for (i, &t) in tokens.iter().enumerate() {
+            let p = pos + i;
+            let (k, v) = cache.kv_bufs(0);
+            for d in 0..kv_dim {
+                k[p * kv_dim + d] = Self::kv_k(t, p, d, kv_dim);
+                v[p * kv_dim + d] = Self::kv_v(t, p, d, kv_dim);
+            }
+        }
+        cache.advance(tokens.len());
+        // logits の argmax は K 全行の加重和に依存する (V は参照のみで exactness に
+        // 影響しないが、壊れた restore を K 側で検出できれば十分)
+        let len = cache.len();
+        let acc;
+        let acc2;
+        {
+            let (k, _) = cache.kv_bufs(0);
+            let mut a1 = 0.0f32;
+            let mut a2 = 0.0f32;
+            for p in 0..len {
+                for d in 0..kv_dim {
+                    let x = k[p * kv_dim + d];
+                    a1 += x * ((p % 4 + 1) as f32);
+                    a2 += x * ((p % 5 + 2) as f32);
+                }
+            }
+            acc = a1;
+            acc2 = a2;
+        }
+        let mut logits = vec![0.0f32; DUMMY_VOCAB];
+        let peak = ((acc * 7.0).round() as i64).rem_euclid(DUMMY_VOCAB as i64) as usize;
+        let second = ((acc2 * 3.0).round() as i64).rem_euclid(DUMMY_VOCAB as i64) as usize;
+        logits[peak] = 5.0;
+        logits[second] = 1.0;
+        Ok(logits)
+    }
+
+    fn new_cache(&self) -> KvCache {
+        KvCache::new(1, 4, DUMMY_CONTEXT)
+    }
+}
+
+/// KvSensitiveModel (KV 依存ダミー) で Engine を構築する
+pub fn kv_sensitive_engine(name: &str, seed: Option<u64>) -> Result<Engine> {
+    let tok = dummy_tokenizer()?;
+    Ok(Engine::from_parts(Box::new(KvSensitiveModel::new()), tok, name, seed))
+}
+
 /// int8 量子化パスの生成決定論テスト用ダミーモデル (P3)。
 ///
 /// logits = W @ a を `quant::Linear` 経由で計算する (a は直前トークンIDから

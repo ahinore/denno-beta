@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 
 mod scheduler;
-pub use scheduler::{Job, QueueFull, Scheduler};
+pub use scheduler::{Job, MAX_ACTIVE_SESSIONS, QueueFull, Scheduler};
 
 pub struct AppState {
     pub engine: Arc<Mutex<Engine>>,

@@ -98,6 +98,60 @@ pub struct Engine {
     last_prefix_hit: PrefixHit,
 }
 
+/// P4 ステッパ: 1リクエスト分の生成状態。
+///
+/// 単一の KvCache を複数リクエストで時分割するため、実行中リクエストを
+/// [`Engine::suspend_session`] で KV キャッシュから退避し (KV スナップショットを
+/// この構造体に保持)、別リクエストの prefill/decode を割り込ませてから
+/// [`Engine::install_session`] で復元できる。
+/// KV の各行はトークン接頭辞のみに依存 (causal attention) するため、
+/// 退避/復元は bit 完全に可逆 → インターリーブ下でも各リクエストの 出力は
+/// 単独実行と完全一致する。
+pub struct ChatSession {
+    prompt_ids: Vec<u32>,
+    /// prefill で再利用した prefix 長 (KV に既にある先頭トークン数)
+    lcp: usize,
+    prefill_done: bool,
+    /// 直近の forward の logits (最終位置)
+    logits: Vec<f32>,
+    generated: Vec<u32>,
+    text: String,
+    max_tokens: usize,
+    stop_sequences: Vec<String>,
+    sampler: Sampler,
+    stop_reason: StopReason,
+    stop_sequence: Option<String>,
+    /// suspend 中の KV スナップショット (None = 未 suspend)
+    kv: Option<SuspendedKv>,
+    input_tokens: usize,
+}
+
+/// suspend 中の KV スナップショット (KvCache::snapshot と同じ形式)。
+/// 行 i はトークン列 prompt (+生成済み分) の位置 i の KV。
+pub struct SuspendedKv {
+    k: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
+    n: usize,
+}
+
+impl ChatSession {
+    /// プロンプトのトークン数 (SSE message_start の usage 用)
+    pub fn input_tokens(&self) -> usize {
+        self.input_tokens
+    }
+
+    /// 生成結果を取り出す (step_chat が true を返した後)
+    pub fn into_output(self) -> ChatOutput {
+        ChatOutput {
+            text: self.text,
+            stop_reason: self.stop_reason,
+            stop_sequence: self.stop_sequence,
+            input_tokens: self.input_tokens,
+            output_tokens: self.generated.len(),
+        }
+    }
+}
+
 impl Engine {
     /// モデルディレクトリ(HF形式: config.json + model.safetensors + tokenizer.json
     /// + tokenizer_config.json)からロードする。
@@ -208,15 +262,15 @@ impl Engine {
         Some((self.cached_prompt.clone(), k, v, kv_len))
     }
 
-    /// チャット実行。トークン生成ごとに on_delta(差分テキスト) が呼ばれる
-    /// (ストリーミング用。非ストリーミングでは空クロージャでよい)。
-    pub fn chat(
-        &mut self,
+    /// P4 ステッパ: リクエスト状態を準備する (トークン化 + max_tokens クランプ +
+    /// サンプラ構築)。KV キャッシュには触れない。
+    /// 以後 `install_session` → `step_chat` (true が返るまで) の順に進める。
+    pub fn begin_chat(
+        &self,
         system: Option<&str>,
         messages: &[ChatMessage],
         params: &GenParams,
-        mut on_delta: impl FnMut(&str),
-    ) -> Result<ChatOutput> {
+    ) -> Result<ChatSession> {
         let prompt = self.tok.apply_chat_template(system, messages)?;
         let prompt_ids = self.tok.encode(&prompt)?;
 
@@ -246,17 +300,62 @@ impl Engine {
             );
         }
 
-        // --- prefill (マルチエントリ LRU prefix cache 付き) ---
-        // 候補は2つ:
-        //   live: 直前リクエストの KV (まだ KvCache に入っている、truncate だけで再利用)
-        //   entry: 過去会話のスナップショット (KvCache へ復元して再利用)
-        // LCP が最大の候補を採用する。Hermes 等は毎回同じ system prompt を送ってくる
-        // ので、同一セッションの継続 (live) でも別セッションの復帰 (entry) でも
-        // prefill の大半を省略できる。
-        let cap = prompt_ids.len().saturating_sub(1);
+        let seed = params.seed.or(self.default_seed);
+        let sampler = Sampler::new(params.temperature, params.top_k, params.top_p, seed);
+
+        Ok(ChatSession {
+            input_tokens: prompt_ids.len(),
+            prompt_ids,
+            lcp: 0,
+            prefill_done: false,
+            logits: Vec::new(),
+            generated: Vec::new(),
+            text: String::new(),
+            max_tokens,
+            stop_sequences: params.stop_sequences.clone(),
+            sampler,
+            stop_reason: StopReason::MaxTokens,
+            stop_sequence: None,
+            kv: None,
+        })
+    }
+
+    /// P4 ステッパ: セッションを live (エンジンの単一 KV キャッシュに乗った状態)
+    /// にする。
+    ///
+    /// - 初回 (suspend 履歴なし): 旧 `chat()` と同一の prefix cache 経路選択
+    ///   (live LCP vs マルチエントリストアの LCP、LCP が最大の候補を採用) で
+    ///   KV を準備し、`sess.lcp` に再利用長を設定する
+    /// - 再開 (suspend 済み): 退避しておいた KV スナップショットを bit 完全に復元する
+    /// - いずれの場合も、その前に live に残っている完了済みリクエストの KV を
+    ///   ストアへ退避する (旧 chat() が「次のリクエスト開始時」に退避するのと同じ)
+    pub fn install_session(&mut self, sess: &mut ChatSession) {
+        // live に残っている前リクエスト完了分の KV をストアへ退避。
+        // (同一 prompt のエントリが既にあれば insert_snapshot が置き換え/保持する。
+        //  KV 行はトークン接頭辞のみに依存するため、古いエントリでも
+        //  共通接頭辞分の復元には bit 完全に使える → exactness に影響しない)
+        if let Some((p, k, v, n)) = self.snapshot_live() {
+            if !self.prefix_cache.contains_prompt(&p) {
+                self.prefix_cache.insert_snapshot(p, k, v, n);
+            }
+        }
+
+        if let Some(kv) = sess.kv.take() {
+            // 再開: 退避済み KV (prompt + 生成済みトークン分) を復元
+            self.cache.restore(&kv.k, &kv.v, kv.n);
+            self.cached_prompt = sess.prompt_ids.clone();
+            sess.lcp = sess.prompt_ids.len();
+            sess.prefill_done = true;
+            self.last_prefix_hit = PrefixHit::Live;
+            return;
+        }
+
+        // --- 初回: 旧 chat() と同一の prefix cache 経路選択 ---
+        let cap = sess.prompt_ids.len().saturating_sub(1);
         // logits は forward した最終位置からしか得られないので、
         // 少なくとも最後の 1 トークンは必ず forward する
-        let live_lcp = prompt_ids
+        let live_lcp = sess
+            .prompt_ids
             .iter()
             .zip(self.cached_prompt.iter())
             .take_while(|(a, b)| a == b)
@@ -265,21 +364,16 @@ impl Engine {
             .min(self.cache.len());
         let best_entry = self
             .prefix_cache
-            .best_match(&prompt_ids)
+            .best_match(&sess.prompt_ids)
             .map(|(i, l)| (i, l.min(cap)));
 
         let lcp;
         let hit;
         if let Some((idx, entry_lcp)) = best_entry.filter(|&(_, l)| l > live_lcp) {
-            // 別セッションのエントリへ切り替え: live の KV をスナップショットしてから
-            // (復元が live の行を上書きするため先に退避)、エントリの先頭 entry_lcp 行を復元。
-            let snap = self.snapshot_live();
+            // 別セッションのエントリへ切り替え (live の退避は冒頭で済み)
             let restored = self
                 .prefix_cache
                 .restore_into(idx, entry_lcp, &mut self.cache);
-            if let Some((p, k, v, n)) = snap {
-                self.prefix_cache.insert_snapshot(p, k, v, n);
-            }
             if restored {
                 lcp = entry_lcp;
                 hit = PrefixHit::Entry;
@@ -290,27 +384,12 @@ impl Engine {
                 hit = PrefixHit::None;
             }
         } else if live_lcp > 0 {
-            // live 再利用 (単一エントリ時代と同じ経路)。cache.len() >= live_lcp が
-            // 常に成り立つ (生成トークン分だけ長いことがある) ので truncate で戻せる。
-            // ただし live の会話がまだストアに無い場合は退避しておく:
-            // live との共通接頭辞 (system prompt 等) だけでは別セッション固有の
-            // suffix は再計算になってしまうため、ストアに無いと交互セッションで
-            // エントリが永遠に増えない。
-            if !self.prefix_cache.contains_prompt(&self.cached_prompt) {
-                let snap = self.snapshot_live();
-                if let Some((p, k, v, n)) = snap {
-                    self.prefix_cache.insert_snapshot(p, k, v, n);
-                }
-            }
+            // live 再利用 (truncate のみ、コピー無し)
             self.cache.truncate(live_lcp);
             lcp = live_lcp;
             hit = PrefixHit::Live;
         } else {
-            // 共通接頭辞なし: live をストアに退避してフル prefill
-            let snap = self.snapshot_live();
-            if let Some((p, k, v, n)) = snap {
-                self.prefix_cache.insert_snapshot(p, k, v, n);
-            }
+            // 共通接頭辞なし: フル prefill (live の退避は冒頭で済み)
             self.cache.reset();
             lcp = 0;
             hit = PrefixHit::None;
@@ -319,71 +398,113 @@ impl Engine {
             tracing::info!(
                 "prefix cache hit: reuse {} / {} tokens (recompute {})",
                 lcp,
-                prompt_ids.len(),
-                prompt_ids.len() - lcp
+                sess.prompt_ids.len(),
+                sess.prompt_ids.len() - lcp
             );
         }
-        // truncate/restore された stale な行は forward 中に上書きされるか、
-        // そもそも参照されない。
-        let mut logits = self.model.forward(&prompt_ids[lcp..], &mut self.cache)?;
-        self.cached_prompt = prompt_ids.clone();
+        sess.lcp = lcp;
         self.last_prefix_hit = hit;
+    }
 
-        let seed = params.seed.or(self.default_seed);
-        let mut sampler = Sampler::new(params.temperature, params.top_k, params.top_p, seed);
+    /// P4 ステッパ: 実行中 (live) のセッションを KV キャッシュから退避する。
+    /// 別のセッションを `install_session` で live にする前に呼ぶ。
+    /// cache の行データは物理的には残るが `cached_prompt` を空にするため、
+    /// 次の install では参照されない (上書き or reset)。
+    pub fn suspend_session(&mut self, sess: &mut ChatSession) {
+        debug_assert!(sess.kv.is_none(), "既に suspend 済みのセッション");
+        debug_assert!(sess.prefill_done, "prefill 前のセッションは suspend できない");
+        let kv_len = self.cache.len();
+        let (k, v) = self.cache.snapshot(kv_len);
+        sess.kv = Some(SuspendedKv { k, v, n: kv_len });
+        self.cached_prompt.clear();
+    }
 
-        let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-        let mut text = String::new();
-        let mut stop_reason = StopReason::MaxTokens;
-        let mut stop_sequence: Option<String> = None;
-
-        for step in 0..max_tokens {
-            let next = sampler.sample(&logits) as u32;
-            generated.push(next);
-
-            if self.model.eos_ids().contains(&next) {
-                stop_reason = StopReason::EndTurn;
-                break;
-            }
-
-            // 差分だけストリーミング(部分的なUTF-8を避けるため全decode→diff)
-            let full = self.tok.decode(&generated)?;
-            if full.len() > text.len() && full.is_char_boundary(text.len()) {
-                let delta = &full[text.len()..];
-                on_delta(delta);
-                text.push_str(delta);
-            }
-
-            // stop_sequences チェック(生成テキスト中の最も早い出現で打ち切り)
-            if let Some(seq) = params
-                .stop_sequences
-                .iter()
-                .find(|s| !s.is_empty() && text.contains(s.as_str()))
-            {
-                let idx = params
-                    .stop_sequences
-                    .iter()
-                    .filter_map(|s| text.find(s.as_str()))
-                    .min()
-                    .unwrap_or(text.len());
-                text.truncate(idx);
-                stop_reason = StopReason::StopSequence;
-                stop_sequence = Some(seq.clone());
-                break;
-            }
-
-            if step + 1 < max_tokens {
-                logits = self.model.forward(&[next], &mut self.cache)?;
-            }
+    /// P4 ステッパ: 生成を 1 forward 進める (prefill 全体 or decode 1 トークン)。
+    /// 完了 (EOS / stop sequence / max_tokens) で true を返す。
+    /// 呼び出し前にセッションが live (`install_session` 済み) であること。
+    pub fn step_chat(
+        &mut self,
+        sess: &mut ChatSession,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<bool> {
+        if !sess.prefill_done {
+            // prefill: 旧 chat() と同一形状 (残りプロンプトを 1 回の forward で処理)。
+            // 分割すると GEMM の蓄積順が変わり exactness が壊れ得るため
+            // 単一呼び出しの形状を維持する。
+            let logits = self.model.forward(&sess.prompt_ids[sess.lcp..], &mut self.cache)?;
+            self.cached_prompt = sess.prompt_ids.clone();
+            sess.logits = logits;
+            sess.prefill_done = true;
+            return Ok(false);
         }
 
-        Ok(ChatOutput {
-            text,
-            stop_reason,
-            stop_sequence,
-            input_tokens: prompt_ids.len(),
-            output_tokens: generated.len(),
-        })
+        if sess.generated.len() >= sess.max_tokens {
+            // max_tokens = 0 (prefill のみで確定) の場合
+            sess.stop_reason = StopReason::MaxTokens;
+            return Ok(true);
+        }
+
+        // decode 1 ステップ (旧 chat() のループ 1 回分と同一)
+        let next = sess.sampler.sample(&sess.logits) as u32;
+        sess.generated.push(next);
+
+        if self.model.eos_ids().contains(&next) {
+            sess.stop_reason = StopReason::EndTurn;
+            return Ok(true);
+        }
+
+        // 差分だけストリーミング(部分的なUTF-8を避けるため全decode→diff)
+        let full = self.tok.decode(&sess.generated)?;
+        if full.len() > sess.text.len() && full.is_char_boundary(sess.text.len()) {
+            let delta = &full[sess.text.len()..];
+            on_delta(delta);
+            sess.text.push_str(delta);
+        }
+
+        // stop_sequences チェック(生成テキスト中の最も早い出現で打ち切り)
+        if let Some(seq) = sess
+            .stop_sequences
+            .iter()
+            .find(|s| !s.is_empty() && sess.text.contains(s.as_str()))
+        {
+            let idx = sess
+                .stop_sequences
+                .iter()
+                .filter_map(|s| sess.text.find(s.as_str()))
+                .min()
+                .unwrap_or(sess.text.len());
+            sess.text.truncate(idx);
+            sess.stop_reason = StopReason::StopSequence;
+            sess.stop_sequence = Some(seq.clone());
+            return Ok(true);
+        }
+
+        if sess.generated.len() < sess.max_tokens {
+            let logits = self.model.forward(&[next], &mut self.cache)?;
+            sess.logits = logits;
+            return Ok(false);
+        }
+        sess.stop_reason = StopReason::MaxTokens;
+        Ok(true)
+    }
+
+    /// チャット実行 (単発 API)。トークン生成ごとに on_delta(差分テキスト) が呼ばれる
+    /// (ストリーミング用。非ストリーミングでは空クロージャでよい)。
+    ///
+    /// P4 で stepper (begin/install/step) ベースに書き換えたが、1 セッションを
+    /// 通しで実行する経路は旧実装と同一の操作列 (同一形状の forward 呼び出し、
+    /// 同一の prefix cache 経路選択) なので挙動は完全に変わらない。
+    pub fn chat(
+        &mut self,
+        system: Option<&str>,
+        messages: &[ChatMessage],
+        params: &GenParams,
+        mut on_delta: impl FnMut(&str),
+    ) -> Result<ChatOutput> {
+        let mut sess = self.begin_chat(system, messages, params)?;
+        self.install_session(&mut sess);
+        while !self.step_chat(&mut sess, &mut on_delta)? {}
+        Ok(sess.into_output())
     }
 }
 
@@ -601,5 +722,107 @@ mod tests {
         let mut e2 = dummy_engine("m", None).unwrap();
         let without_sys = e2.chat(None, &msgs("t0"), &params(20), |_| {}).unwrap();
         assert!(with_sys.input_tokens > without_sys.input_tokens);
+    }
+
+    // ---------- P4 ステッパ (インターリーブ) ----------
+
+    use crate::testutil::kv_sensitive_engine;
+
+    /// インターリーブ下 (A prefill → A suspend → B 完了まで → A 再開) でも
+    /// 各リクエストの出力は単独実行と完全一致する (P4 最重要要件)。
+    /// DummyModel は KV を参照しないため、KV 依存の KvSensitiveModel を使う。
+    #[test]
+    fn interleaved_sessions_match_standalone_outputs() {
+        let p = params(6);
+        // 単独実行の基準 (それぞれ独立したエンジンで full prefill)
+        let mut ra = kv_sensitive_engine("a", None).unwrap();
+        let ref_a = ra.chat(None, &msgs("t0"), &p, |_| {}).unwrap();
+        let mut rb = kv_sensitive_engine("b", None).unwrap();
+        let ref_b = rb.chat(None, &msgs("t15"), &p, |_| {}).unwrap();
+        assert_ne!(
+            ref_a.text, ref_b.text,
+            "テストの前提: プロンプトが異なれば出力も異なること"
+        );
+
+        let mut e = kv_sensitive_engine("m", None).unwrap();
+        let mut sa = e.begin_chat(None, &msgs("t0"), &p).unwrap();
+        let mut sb = e.begin_chat(None, &msgs("t15"), &p).unwrap();
+
+        // A: prefill まで進める
+        e.install_session(&mut sa);
+        assert!(!e.step_chat(&mut sa, &mut |_| {}).unwrap());
+
+        // A を suspend して B を割り込ませ、完了まで進める
+        e.suspend_session(&mut sa);
+        e.install_session(&mut sb);
+        for _ in 0..100 {
+            if e.step_chat(&mut sb, &mut |_| {}).unwrap() {
+                break;
+            }
+        }
+        let out_b = sb.into_output();
+
+        // A を再開 (KV 復元) して完了まで進める
+        e.install_session(&mut sa);
+        for _ in 0..100 {
+            if e.step_chat(&mut sa, &mut |_| {}).unwrap() {
+                break;
+            }
+        }
+        let out_a = sa.into_output();
+
+        assert_eq!(out_a, ref_a, "インターリーブ後の A が単独実行と不一致");
+        assert_eq!(out_b, ref_b, "割り込んだ B が単独実行と不一致");
+    }
+
+    /// 4 セッション (同一プロンプト含む) を 1 ステップずつ round-robin で進めても
+    /// 全て単独実行と完全一致。
+    #[test]
+    fn round_robin_stepping_matches_standalone_outputs() {
+        let prompts = ["t0", "t15", "t0", "t13"];
+        let p = params(6);
+        // 単独実行の基準
+        let refs: Vec<ChatOutput> = prompts
+            .iter()
+            .map(|t| {
+                let mut solo = kv_sensitive_engine(t, None).unwrap();
+                solo.chat(None, &msgs(t), &p, |_| {}).unwrap()
+            })
+            .collect();
+        assert_eq!(refs[0].text, refs[2].text);
+
+        let mut e = kv_sensitive_engine("m", None).unwrap();
+        let mut sessions: Vec<ChatSession> = prompts
+            .iter()
+            .map(|t| e.begin_chat(None, &msgs(t), &p).unwrap())
+            .collect();
+
+        // 全員の prefill を順に済ませる (install → prefill step → suspend)
+        for s in sessions.iter_mut() {
+            e.install_session(s);
+            assert!(!e.step_chat(s, &mut |_| {}).unwrap());
+            e.suspend_session(s);
+        }
+
+        // round-robin で decode (完了したセッションは suspend せず放置)
+        let mut done = vec![false; sessions.len()];
+        for _ in 0..200 {
+            let active: Vec<usize> = (0..sessions.len()).filter(|&i| !done[i]).collect();
+            if active.is_empty() {
+                break;
+            }
+            for &i in &active {
+                e.install_session(&mut sessions[i]);
+                done[i] = e.step_chat(&mut sessions[i], &mut |_| {}).unwrap();
+                if !done[i] {
+                    e.suspend_session(&mut sessions[i]);
+                }
+            }
+        }
+        assert!(done.iter().all(|&d| d), "全セッションが完了していない");
+
+        for (i, s) in sessions.into_iter().enumerate() {
+            assert_eq!(s.into_output(), refs[i], "session {i} が単独実行と不一致");
+        }
     }
 }

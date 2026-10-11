@@ -16,5 +16,5 @@ pub mod tokenizer;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod testutil;
 
-pub use engine::{ChatMessage, ChatOutput, Engine, GenParams, PrefixHit, StopReason};
+pub use engine::{ChatMessage, ChatOutput, ChatSession, Engine, GenParams, PrefixHit, StopReason};
 pub use quant::{Linear, Quant8Linear, QuantMode};
