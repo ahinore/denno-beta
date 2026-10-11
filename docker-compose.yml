@@ -1,0 +1,14 @@
+services:
+  denno:
+    build: .
+    image: denno-beta:latest
+    container_name: denno-beta
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      DENNO_NAME: claude-local
+      DENNO_SEED: "42"
+      # DENNO_API_KEY: ""   # 認証をかけたい場合のみ設定
+    restart: unless-stopped
