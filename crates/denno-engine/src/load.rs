@@ -11,6 +11,14 @@ pub fn get_f32(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
     tensor_to_f32(&view)
 }
 
+/// 存在しない場合は None (例: bias の有無がモデルにより異なる)
+pub fn get_f32_opt(st: &SafeTensors, name: &str) -> Result<Option<Vec<f32>>> {
+    match st.tensor(name) {
+        Ok(view) => Ok(Some(tensor_to_f32(&view)?)),
+        Err(_) => Ok(None),
+    }
+}
+
 /// TensorView のデータを f32 に変換
 pub fn tensor_to_f32(view: &safetensors::tensor::TensorView) -> Result<Vec<f32>> {
     let n: usize = view.shape().iter().product();

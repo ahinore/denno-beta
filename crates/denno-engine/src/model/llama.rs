@@ -7,15 +7,18 @@ use memmap2::Mmap;
 use std::path::Path;
 
 use crate::kv_cache::KvCache;
-use crate::load::get_f32;
+use crate::load::{get_f32, get_f32_opt};
 use crate::model::{cfg_u64, Model};
-use crate::tensor::{matmul_bt, rmsnorm, rope_rows, silu_inplace};
+use crate::tensor::{add_bias, matmul_bt, rmsnorm, rope_rows, silu_inplace};
 
 struct Layer {
     ln1_w: Vec<f32>,         // input_layernorm
     q_w: Vec<f32>,           // [H, e]
     k_w: Vec<f32>,           // [K, e]
     v_w: Vec<f32>,           // [K, e]
+    q_b: Option<Vec<f32>>,   // Qwen2.5-0.5B 等は QKV bias あり
+    k_b: Option<Vec<f32>>,
+    v_b: Option<Vec<f32>>,
     o_w: Vec<f32>,           // [e, H]
     ln2_w: Vec<f32>,         // post_attention_layernorm
     gate_w: Vec<f32>,        // [ff, e]
@@ -71,6 +74,7 @@ impl LlamaQwen2 {
         let mmap = unsafe { Mmap::map(&file)? };
         let st = safetensors::SafeTensors::deserialize(&mmap)?;
         let g = |name: &str| get_f32(&st, name);
+        let go = |name: &str| get_f32_opt(&st, name);
 
         let mut layers = Vec::with_capacity(cfg_u64(cfg, "num_hidden_layers")? as usize);
         let n_layer = layers.capacity();
@@ -81,6 +85,9 @@ impl LlamaQwen2 {
                 q_w: g(&format!("{p}self_attn.q_proj.weight"))?,
                 k_w: g(&format!("{p}self_attn.k_proj.weight"))?,
                 v_w: g(&format!("{p}self_attn.v_proj.weight"))?,
+                q_b: go(&format!("{p}self_attn.q_proj.bias"))?,
+                k_b: go(&format!("{p}self_attn.k_proj.bias"))?,
+                v_b: go(&format!("{p}self_attn.v_proj.bias"))?,
                 o_w: g(&format!("{p}self_attn.o_proj.weight"))?,
                 ln2_w: g(&format!("{p}post_attention_layernorm.weight"))?,
                 gate_w: g(&format!("{p}mlp.gate_proj.weight"))?,
@@ -149,7 +156,16 @@ impl Model for LlamaQwen2 {
             let h = rmsnorm(&x, &layer.ln1_w, e, self.eps);
             let mut q = matmul_bt(&h, &layer.q_w, n, e, heads * dh); // [n, H*dh]
             let mut k = matmul_bt(&h, &layer.k_w, n, e, kv_dim); // [n, K*dh]
-            let v = matmul_bt(&h, &layer.v_w, n, e, kv_dim);
+            let mut v = matmul_bt(&h, &layer.v_w, n, e, kv_dim);
+            if let Some(b) = &layer.q_b {
+                add_bias(&mut q, b, heads * dh);
+            }
+            if let Some(b) = &layer.k_b {
+                add_bias(&mut k, b, kv_dim);
+            }
+            if let Some(b) = &layer.v_b {
+                add_bias(&mut v, b, kv_dim);
+            }
 
             rope_rows(&mut q, n, heads, dh, pos0, self.theta);
             rope_rows(&mut k, n, kv_heads, dh, pos0, self.theta);
