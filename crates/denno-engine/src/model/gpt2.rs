@@ -7,11 +7,10 @@
 //! 使用) も int8 モードでは量子化コピーを持つ。
 
 use anyhow::Result;
-use memmap2::Mmap;
 use std::path::Path;
 
 use crate::kv_cache::KvCache;
-use crate::load::get_f32;
+use crate::load::WeightStore;
 use crate::model::{cfg_u64, Model};
 use crate::quant::{Linear, QuantMode};
 use crate::tensor::{add_bias, gelu_inplace, layernorm, softmax};
@@ -56,11 +55,9 @@ impl Gpt2 {
         let n_layer = cfg_u64(cfg, "n_layer")? as usize;
         let eos = cfg["eos_token_id"].as_u64().unwrap_or(50256) as u32;
 
-        let file = std::fs::File::open(dir.join("model.safetensors"))?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let st = safetensors::SafeTensors::deserialize(&mmap)?;
-
-        let g = |name: &str| get_f32(&st, name);
+        // 単一ファイル / 分割 checkpoint を透過的に開く
+        let ws = WeightStore::open(dir)?;
+        let g = |name: &str| ws.get_f32(name);
         let mut quant_bytes = 0usize;
         let mut lin_col = |w: &[f32], k: usize, n: usize| -> Linear {
             let l = Linear::from_colmajor(w, k, n, quant);

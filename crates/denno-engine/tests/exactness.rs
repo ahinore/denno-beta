@@ -12,7 +12,10 @@ fn model_dir(env_key: &str, default: &str) -> Option<PathBuf> {
     let dir = std::env::var(env_key)
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(default));
-    if dir.join("config.json").exists() && dir.join("model.safetensors").exists() {
+    if dir.join("config.json").exists()
+        && (dir.join("model.safetensors").exists()
+            || dir.join("model.safetensors.index.json").exists())
+    {
         Some(dir)
     } else {
         eprintln!(

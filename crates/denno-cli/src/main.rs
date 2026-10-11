@@ -110,8 +110,28 @@ fn main() -> Result<()> {
             println!("vocab:     {}", cfg["vocab_size"].as_u64().unwrap_or(0));
             let ctx = cfg["max_position_embeddings"].as_u64().unwrap_or(cfg["n_ctx"].as_u64().unwrap_or(0));
             println!("context:   {}", ctx);
+            let index_path = dir.join("model.safetensors.index.json");
             let st_path = dir.join("model.safetensors");
-            if st_path.exists() {
+            if index_path.exists() {
+                // 分割 checkpoint: weight_map が参照する shard ファイルの合計
+                if let Ok(index) =
+                    serde_json::from_reader::<_, serde_json::Value>(std::fs::File::open(&index_path)?)
+                {
+                    let mut files: Vec<&str> = index
+                        .get("weight_map")
+                        .and_then(|v| v.as_object())
+                        .map(|m| m.values().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    files.sort_unstable();
+                    files.dedup();
+                    let total: u64 = files
+                        .iter()
+                        .filter_map(|f| std::fs::metadata(dir.join(f)).ok())
+                        .map(|m| m.len())
+                        .sum();
+                    println!("weights:   {:.1} MB ({} shard(s))", total as f64 / 1e6, files.len());
+                }
+            } else if st_path.exists() {
                 let bytes = std::fs::metadata(&st_path)?.len();
                 println!("weights:   {:.1} MB", bytes as f64 / 1e6);
             }

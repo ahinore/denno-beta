@@ -9,11 +9,10 @@
 //! (decode 時の logits matvec も int8 帯域の対象にするため)。
 
 use anyhow::{Context, Result};
-use memmap2::Mmap;
 use std::path::Path;
 
 use crate::kv_cache::KvCache;
-use crate::load::{get_f32, get_f32_opt};
+use crate::load::WeightStore;
 use crate::model::{cfg_u64, Model};
 use crate::quant::{Linear, QuantMode};
 use crate::tensor::{add_bias, rmsnorm, rope_rows, silu_inplace};
@@ -80,11 +79,12 @@ impl LlamaQwen2 {
             _ => eos_ids.push(151643), // Qwen系のデフォルト
         }
 
-        let file = std::fs::File::open(dir.join("model.safetensors"))?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let st = safetensors::SafeTensors::deserialize(&mmap)?;
-        let g = |name: &str| get_f32(&st, name);
-        let go = |name: &str| get_f32_opt(&st, name);
+        // 単一ファイル / 分割 checkpoint(index.json + shard 群)を透過的に開く。
+        // untied lm_head (例: Qwen2.5-7B の lm_head.weight) は WeightStore が
+        // どの shard にあっても解決する。
+        let ws = WeightStore::open(dir)?;
+        let g = |name: &str| ws.get_f32(name);
+        let go = |name: &str| ws.get_f32_opt(name);
 
         let mut layers = Vec::with_capacity(cfg_u64(cfg, "num_hidden_layers")? as usize);
         let n_layer = layers.capacity();
