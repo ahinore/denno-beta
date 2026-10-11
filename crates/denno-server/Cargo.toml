@@ -1,0 +1,15 @@
+[package]
+name = "denno-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+denno-engine = { path = "../denno-engine" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["sync"] }
+axum = { version = "0.7", features = ["json"] }
+rand = "0.8"
+tracing.workspace = true

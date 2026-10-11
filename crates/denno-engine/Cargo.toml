@@ -1,0 +1,18 @@
+[package]
+name = "denno-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokenizers = "0.21"
+safetensors = "0.4"
+memmap2 = "0.9"
+half = "2"
+matrixmultiply = "0.3"
+rayon = "1"
+minijinja = "2"
+rand = "0.8"
