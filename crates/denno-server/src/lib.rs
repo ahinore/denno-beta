@@ -29,6 +29,8 @@ pub struct ServeConfig {
     pub port: u16,
     pub api_key: Option<String>,
     pub default_seed: Option<u64>,
+    /// マルチエントリ prefix cache のトークン上限 (None なら env/デフォルトのまま)
+    pub prefix_cache_tokens: Option<usize>,
 }
 
 // ---------- Anthropic 形式エラー ----------
@@ -166,10 +168,14 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
     let name = cfg.name.clone();
     let seed = cfg.default_seed;
     tracing::info!("loading model from {:?} ...", model_dir);
-    let engine = tokio::task::spawn_blocking(move || Engine::load(&model_dir, name, seed))
+    let mut engine = tokio::task::spawn_blocking(move || Engine::load(&model_dir, name, seed))
         .await
         .map_err(|e| anyhow::anyhow!("join error: {e}"))??;
     let ctx = engine.context();
+    // CLI 引数での prefix cache 上限指定 (env より優先)
+    if let Some(n) = cfg.prefix_cache_tokens {
+        engine.set_prefix_cache_max_tokens(n);
+    }
     tracing::info!(
         "model loaded: {} (context = {}, engine = denno)",
         engine.name,

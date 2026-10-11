@@ -39,3 +39,23 @@ pub fn load_model(dir: &Path) -> Result<Box<dyn Model>> {
         other => bail!("未対応の model_type: {:?}(gpt2 / qwen2 のみ対応)", other),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cfg_u64_reads_present_value() {
+        let cfg: serde_json::Value = serde_json::json!({"num_layers": 24, "zero": 0});
+        assert_eq!(cfg_u64(&cfg, "num_layers").unwrap(), 24);
+        assert_eq!(cfg_u64(&cfg, "zero").unwrap(), 0);
+    }
+
+    #[test]
+    fn cfg_u64_errors_on_missing_or_non_integer() {
+        let cfg: serde_json::Value = serde_json::json!({"name": "gpt2", "f": 1.5});
+        assert!(cfg_u64(&cfg, "missing").is_err());
+        assert!(cfg_u64(&cfg, "name").is_err()); // 文字列
+        assert!(cfg_u64(&cfg, "f").is_err()); // 小数 (as_u64 は None)
+    }
+}

@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (workspace, release)
+        run: cargo build --workspace --release
+
+      # モデルDLを要する exactness テストは #[ignore] 付きなので除外される
+      - name: Test (workspace)
+        run: cargo test --workspace
+
+  exactness:
+    # 実モデルを使った exactness 検証(Qwen2.5-0.5B をDLして基準出力と比較)
+    # push時のみ実行(時間がかかるためPRでは省略)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Pull model
+        run: cargo run --release --bin denno -- pull Qwen/Qwen2.5-0.5B-Instruct
+
+      - name: Run exactness tests (ignored)
+        run: cargo test --release --workspace -- --ignored

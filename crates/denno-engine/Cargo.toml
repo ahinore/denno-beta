@@ -16,3 +16,8 @@ matrixmultiply = "0.3"
 rayon = "1"
 minijinja = "2"
 rand = "0.8"
+
+[features]
+# テスト用ユーティリティ (ダミーモデル/ダミートークナイザ) を公開する。
+# denno-server の統合テストがモデルDLなしで Engine を構築できるようにするためのもの。
+test-utils = []

@@ -7,8 +7,12 @@ pub mod engine;
 pub mod kv_cache;
 pub mod load;
 pub mod model;
+pub mod prefix_cache;
 pub mod sampler;
 pub mod tensor;
 pub mod tokenizer;
 
-pub use engine::{ChatMessage, ChatOutput, Engine, GenParams, StopReason};
+#[cfg(any(test, feature = "test-utils"))]
+pub mod testutil;
+
+pub use engine::{ChatMessage, ChatOutput, Engine, GenParams, PrefixHit, StopReason};

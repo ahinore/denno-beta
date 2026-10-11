@@ -44,6 +44,9 @@ enum Commands {
         #[arg(long, default_value_t = 256)] max_tokens: usize,
         /// デフォルト seed(固定すると決定論的)
         #[arg(long)] seed: Option<u64>,
+        /// マルチエントリ prefix cache のトークン上限
+        /// (未指定時は DENNO_PREFIX_CACHE_MAX_TOKENS、それも無ければコンテキスト長)
+        #[arg(long)] prefix_cache_tokens: Option<usize>,
     },
 }
 
@@ -135,7 +138,7 @@ fn main() -> Result<()> {
             };
             println!("{}", out);
         }
-        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed } => {
+        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens } => {
             let dir = model_dir(&repo);
             if !dir.exists() {
                 bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
@@ -148,6 +151,7 @@ fn main() -> Result<()> {
                 port,
                 api_key,
                 default_seed: seed,
+                prefix_cache_tokens,
             }))?;
         }
     }
