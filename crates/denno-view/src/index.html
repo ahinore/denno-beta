@@ -65,6 +65,7 @@
     position: absolute; z-index: 6; padding: 1px 6px; border-radius: 10px; font-size: 11px;
     background: #1f3a5f; border: 1px solid var(--acc); color: #a5d6ff;
     transition: transform 1.1s cubic-bezier(.3,.7,.4,1), opacity .4s; will-change: transform;
+    max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .node {
     border: 1px solid var(--line); border-radius: 8px; background: var(--panel2);
@@ -96,9 +97,10 @@
     border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; opacity: 0;
     transition: opacity .2s; pointer-events: none; white-space: nowrap;
   }
-  #tokens { display: flex; flex-wrap: wrap; gap: 4px; max-height: 130px; overflow-y: auto; }
-  #tokens .t { padding: 1px 6px; border-radius: 10px; font-size: 11px;
+  #tokens, #intokens { display: flex; flex-wrap: wrap; gap: 4px; max-height: 130px; overflow-y: auto; }
+  #tokens .t, #intokens .t { padding: 1px 6px; border-radius: 10px; font-size: 11px;
                background: #14351c; border: 1px solid var(--glow); color: #7ee788; }
+  #intokens .t { background: #1f3a5f; border-color: var(--acc); color: #a5d6ff; }
 </style>
 </head>
 <body>
@@ -157,6 +159,8 @@
       <div class="node" id="n-detok"><span class="name">detok</span>
         <div class="sub">ストリーミング差分デコード</div></div>
     </div>
+    <h2 style="margin-top:8px">入力トークン <span id="tokstat" class="muted" style="font-size:10px"></span></h2>
+    <div id="intokens"></div>
     <h2 style="margin-top:8px">出力トークン</h2>
     <div id="tokens"></div>
     <div id="fallzone"></div>
@@ -247,6 +251,57 @@ function decodeFrame(buf) {
 const OP_NAMES = ["embed","rmsnorm","rope","qkv_proj","attn_core","o_proj",
   "gate_up_proj","swiglu","down_proj","final_norm","lm_head","sampler","detok"];
 
+// ---------- トークナイザ (id → 文字。/tokenizer.json は denno-view が配信) ----------
+// byte-level BPE (GPT-2 方式) の逆マップ: トークン文字列をバイト列に戻して UTF-8 デコード
+const B2U = (() => {
+  const bs = [], cs = [];
+  for (let b = 33; b <= 126; b++) bs.push(b);
+  for (let b = 161; b <= 172; b++) bs.push(b);
+  for (let b = 174; b <= 255; b++) bs.push(b);
+  cs.push(...bs);
+  let n = 0;
+  for (let b = 0; b < 256; b++) {
+    if (!(b >= 33 && b <= 126) && !(b >= 161 && b <= 172) && !(b >= 174 && b <= 255)) {
+      bs.push(b); cs.push(256 + n++);
+    }
+  }
+  const m = new Map();
+  bs.forEach((b, i) => m.set(cs[i], b));
+  return m;
+})();
+let TOK = null;               // id -> 生トークン文字列
+let TOK_SPECIAL = new Set();  // added_tokens (special) は byte-decode せず素の文字列
+let TOK_STREAM = null;        // マルチバイト文字がトークン境界を跨いでも正しく復元する
+async function loadTokenizer() {
+  try {
+    const r = await fetch("/tokenizer.json");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const t = await r.json();
+    const map = {};
+    for (const [tok, id] of Object.entries(t.model.vocab)) map[id] = tok;
+    (t.added_tokens || []).forEach(a => { map[a.id] = a.content; if (a.special) TOK_SPECIAL.add(a.id); });
+    TOK = map;
+    TOK_STREAM = new TextDecoder("utf-8");
+    $("tokstat").textContent = `文字表示 OK (vocab ${Object.keys(map).length})`;
+  } catch (e) {
+    $("tokstat").textContent = "(トークナイザ無し — id 表示)";
+  }
+}
+function tokText(id) {
+  if (TOK === null) return "t" + id;
+  const raw = TOK[id];
+  if (raw === undefined) return "t" + id;
+  if (TOK_SPECIAL.has(id)) return raw;  // <|im_start|> などはそのまま
+  const bytes = [];
+  for (const ch of raw) {
+    const c = ch.codePointAt(0);
+    bytes.push(B2U.has(c) ? B2U.get(c) : (c & 0xff));
+  }
+  // ストリーミング decode: 境界を跨ぐ UTF-8 シーケンスは次のトークンに持ち越される
+  return TOK_STREAM.decode(new Uint8Array(bytes), { stream: true });
+}
+loadTokenizer();
+
 // ---------- DOM ----------
 const $ = (id) => document.getElementById(id);
 const srv = $("srvinfo"), sessEl = $("sess"), gapEl = $("gap"), statEl = $("stat");
@@ -315,7 +370,7 @@ function fallTokens(tokens, targetId) {
   const show = tokens.slice(0, 40);
   show.forEach((t, i) => {
     const c = document.createElement("div");
-    c.className = "tokchip"; c.textContent = "t" + t;
+    c.className = "tokchip"; c.textContent = tokText(t) || "·"; c.title = "id " + t;
     c.style.left = (r.left - g.left + 20 + (i % 8) * 34) + "px";
     c.style.top = "6px";
     fallzone.appendChild(c);
@@ -338,9 +393,25 @@ function fallTokens(tokens, targetId) {
 // ---------- 出力トークン ----------
 function addOutToken(id) {
   const t = document.createElement("span");
-  t.className = "t"; t.textContent = "t" + id;
+  t.className = "t"; t.textContent = tokText(id) || "·"; t.title = "id " + id;
   $("tokens").appendChild(t);
   $("tokens").scrollTop = 1e9;
+}
+// ---------- 入力トークン ----------
+function setInputTokens(tokens) {
+  const box = $("intokens");
+  box.innerHTML = "";
+  const show = tokens.slice(0, 200);
+  show.forEach((id) => {
+    const t = document.createElement("span");
+    t.className = "t"; t.textContent = tokText(id) || "·"; t.title = "id " + id;
+    box.appendChild(t);
+  });
+  if (tokens.length > show.length) {
+    const t = document.createElement("span");
+    t.className = "t"; t.textContent = `+${tokens.length - show.length} tok`;
+    box.appendChild(t);
+  }
 }
 
 // ---------- フレーム処理 (アニメーション本体) ----------
@@ -360,13 +431,15 @@ function handleFrame(f) {
     case "SessionAdmit": {
       sessEl.textContent = `session ${f.session} (slot ${f.slot})`;
       $("tokens").innerHTML = "";
+      $("intokens").innerHTML = "";
       statEl.textContent = "prefill 中…";
       lit($("n-sched")); lit($("n-step"));
       break;
     }
     case "Prefill": {
-      // プロンプトの列が上から降りて embed に入る
+      // プロンプトの列が上から降りて embed に入る (文字表示つきチップ)
       fallTokens(f.tokens, "op-embed");
+      setInputTokens(f.tokens);
       lit($("op-embed"), "litwarm", 900);
       // prefill の forward 全層をすばやく通過演出 (層パネルが上から下へ流れる)
       for (let i = 0; i < nLayers; i++) {
@@ -423,14 +496,14 @@ function handleFrame(f) {
     }
     case "Token": {
       addOutToken(f.token);
-      $("val-token").textContent = `t${f.token} (pos ${f.pos})`;
+      $("val-token").textContent = `${tokText(f.token) || "?"} (id ${f.token}, pos ${f.pos})`;
       lit($("var-token"));
       lit($("n-detok"));
       break;
     }
     case "TopK": {
       $("val-logits").innerHTML = f.entries.map(([id, p]) =>
-        `<div class="bar-row"><span class="bar-label">t${id}</span>
+        `<div class="bar-row" title="id ${id}"><span class="bar-label">${(tokText(id) || "?" ).slice(0, 8)}</span>
          <div class="bar-track"><div class="bar-fill" style="width:${(p * 100).toFixed(1)}%"></div></div>
          <span style="width:46px;text-align:right">${(p * 100).toFixed(1)}%</span></div>`).join("");
       $("val-entropy").textContent = f.entropy_f16.toFixed(3);

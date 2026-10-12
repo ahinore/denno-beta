@@ -37,6 +37,26 @@ struct AppState {
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// tokenizer.json (ブラウザ側でのトークン→文字デコード用)。
+/// `VIEW_TOKENIZER` でパス指定があった場合のみ読み込む (無ければ 404 → UI は id 表示)。
+static TOKENIZER: std::sync::OnceLock<Option<axum::body::Bytes>> = std::sync::OnceLock::new();
+
+async fn tokenizer_json() -> axum::response::Response {
+    match TOKENIZER.get().and_then(|o| o.as_ref()) {
+        Some(bytes) => axum::response::Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(bytes.clone()))
+            .unwrap(),
+        None => axum::response::Response::builder()
+            .status(404)
+            .body(axum::body::Body::from(
+                "tokenizer not configured (set VIEW_TOKENIZER)",
+            ))
+            .unwrap(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -52,6 +72,20 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8093);
     let record = std::env::var("VIEW_RECORD").ok();
+
+    // tokenizer.json を起動時に一読 (数 MB 程度。無指定/読込失敗時は配信しない)
+    let tok_path = std::env::var("VIEW_TOKENIZER").ok();
+    let tok_bytes = tok_path.and_then(|p| match std::fs::read(&p) {
+        Ok(b) => {
+            tracing::info!("tokenizer.json loaded from {} ({} bytes)", p, b.len());
+            Some(axum::body::Bytes::from(b))
+        }
+        Err(e) => {
+            tracing::warn!("tokenizer.json read failed ({}): {e} — token text display disabled", p);
+            None
+        }
+    });
+    let _ = TOKENIZER.set(tok_bytes);
 
     let (tx, _) = broadcast::channel::<Vec<u8>>(1024);
     let bcast: Bcast = Arc::new(tx);
@@ -90,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/ws", get(view_ws))
+        .route("/tokenizer.json", get(tokenizer_json))
         .with_state(app);
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("denno-view listening on http://{} (upstream: {})", addr, upstream);
