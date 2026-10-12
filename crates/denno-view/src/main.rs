@@ -11,7 +11,7 @@
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Html;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use denno_telemetry::{self as telem, Frame};
 use futures_util::StreamExt;
@@ -32,6 +32,9 @@ struct AppState {
     bcast: Bcast,
     srv: Snap,
     kv: Snap,
+    /// チャットプロキシ先 (VIEW_UPSTREAM から導出した http base、例 http://127.0.0.1:8090)
+    api: Arc<String>,
+    http: reqwest::Client,
 }
 
 static FRAMES: AtomicU64 = AtomicU64::new(0);
@@ -89,10 +92,23 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, _) = broadcast::channel::<Vec<u8>>(1024);
     let bcast: Bcast = Arc::new(tx);
+    // チャットプロキシ先: ws://host:port/v1/telemetry/ws → http://host:port
+    let api = {
+        let s = upstream
+            .replace("ws://", "http://")
+            .replace("wss://", "https://");
+        match s.find("/v1/") {
+            Some(i) => s[..i].to_string(),
+            None => s.trim_end_matches('/').to_string(),
+        }
+    };
+    tracing::info!("chat proxy target: {}/v1/messages", api);
     let app = AppState {
         bcast: bcast.clone(),
         srv: Arc::new(std::sync::RwLock::new(None)),
         kv: Arc::new(std::sync::RwLock::new(None)),
+        api: Arc::new(api),
+        http: reqwest::Client::new(),
     };
 
     // 上流接続 (再試行付き) → broadcast へ流す pump
@@ -125,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(dashboard))
         .route("/ws", get(view_ws))
         .route("/tokenizer.json", get(tokenizer_json))
+        .route("/chat", post(chat_proxy))
         .with_state(app);
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("denno-view listening on http://{} (upstream: {})", addr, upstream);
@@ -227,6 +244,55 @@ async fn pump_upstream(
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// POST /chat — ブラウザのチャットを上流 denno の /v1/messages へ中継する。
+/// ボディは Anthropic Messages 形式の JSON をそのまま転送し、応答 (JSON/SSE) を
+/// ステータス込みで素通しする。テレメトリは通常経路で流れるのでアニメーションが連動する。
+async fn chat_proxy(
+    axum::extract::State(app): axum::extract::State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let url = format!("{}/v1/messages", app.api);
+    let resp = match app
+        .http
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return axum::response::Response::builder()
+                .status(502)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    format!("{{\"error\":{{\"message\":\"upstream unreachable: {e}\",\"type\":\"api_error\"}}}}"),
+                ))
+                .unwrap();
+        }
+    };
+    let status = axum::http::StatusCode::from_u16(resp.status().as_u16()).unwrap_or_else(|_| {
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    });
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    match resp.bytes().await {
+        Ok(bytes) => axum::response::Response::builder()
+            .status(status)
+            .header("content-type", ctype)
+            .body(axum::body::Body::from(bytes))
+            .unwrap(),
+        Err(e) => axum::response::Response::builder()
+            .status(502)
+            .body(axum::body::Body::from(format!("upstream read error: {e}")))
+            .unwrap(),
     }
 }
 

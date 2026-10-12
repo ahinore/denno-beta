@@ -101,6 +101,23 @@
   #tokens .t, #intokens .t { padding: 1px 6px; border-radius: 10px; font-size: 11px;
                background: #14351c; border: 1px solid var(--glow); color: #7ee788; }
   #intokens .t { background: #1f3a5f; border-color: var(--acc); color: #a5d6ff; }
+
+  /* ---- チャット ---- */
+  #chatlog { max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+  #chatlog .msg { max-width: 85%; padding: 4px 9px; border-radius: 9px; font-size: 12px;
+                  white-space: pre-wrap; word-break: break-word; }
+  #chatlog .u { align-self: flex-end; background: #1f3a5f; border: 1px solid var(--acc); color: #a5d6ff; }
+  #chatlog .a { align-self: flex-start; background: #17301f; border: 1px solid var(--glow); color: #7ee788; }
+  #chatlog .e { align-self: flex-start; color: var(--warn); font-size: 11px; }
+  #chatbar { display: flex; gap: 6px; margin-top: 6px; }
+  #chatin { flex: 1; background: var(--panel2); border: 1px solid var(--line); color: var(--fg);
+            border-radius: 6px; padding: 5px 8px; font-family: var(--mono); font-size: 12px; }
+  #chatin:focus { outline: none; border-color: var(--acc); }
+  #chatbar button { background: var(--panel2); border: 1px solid var(--line); color: var(--fg);
+                    border-radius: 6px; padding: 5px 10px; cursor: pointer; font-family: var(--mono); }
+  #chatbar button:hover:not(:disabled) { border-color: var(--acc); }
+  #chatbar button:disabled { opacity: .5; cursor: default; }
+  #chatbar .mt { width: 60px; }
 </style>
 </head>
 <body>
@@ -163,6 +180,15 @@
     <div id="intokens"></div>
     <h2 style="margin-top:8px">出力トークン</h2>
     <div id="tokens"></div>
+    <h2 style="margin-top:8px">チャット <span class="muted" style="font-size:10px">(送信するとアニメーションが流れます)</span></h2>
+    <div id="chatlog"></div>
+    <div id="chatbar">
+      <input id="chatin" type="text" placeholder="メッセージを入力 (Enter で送信)" autocomplete="off">
+      <label class="muted" style="font-size:10px;align-self:center">max<br>tokens</label>
+      <input id="chatmt" class="mt" type="number" value="256" min="1" max="4096">
+      <button id="chatsend">送信</button>
+      <button id="chatclear" title="履歴クリア">✕</button>
+    </div>
     <div id="fallzone"></div>
     <div id="pulse"></div>
     <div id="oplabel"></div>
@@ -423,6 +449,7 @@ function handleFrame(f) {
   switch (f.kind) {
     case "ServerInfo": {
       srv.textContent = `${f.model} (quant=${f.quant}, slots=${f.slots}, ctx=${f.context}, layers=${f.layers})`;
+      modelName = f.model;
       ctxLen = f.context;
       buildLayers(f.layers); buildSlots(f.slots);
       lit($("n-serve"));
@@ -592,6 +619,61 @@ function connect() {
   };
 }
 $("speed").addEventListener("input", (e) => { speed = parseFloat(e.target.value); });
+
+// ---------- チャット (view の /chat → 上流 denno /v1/messages) ----------
+let chatHistory = [];
+let chatPending = false;
+let modelName = null;  // ServerInfo で確定
+function addBubble(cls, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + cls;
+  d.textContent = text;
+  const log = $("chatlog");
+  log.appendChild(d);
+  log.scrollTop = 1e9;
+}
+async function sendChat() {
+  const inp = $("chatin");
+  const text = inp.value.trim();
+  if (!text || chatPending) return;
+  inp.value = "";
+  addBubble("u", text);
+  chatHistory.push({ role: "user", content: text });
+  chatPending = true;
+  $("chatsend").disabled = true;
+  const maxTokens = Math.max(1, Math.min(4096, parseInt($("chatmt").value) || 256));
+  try {
+    const r = await fetch("/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: modelName || "claude-local",
+        max_tokens: maxTokens,
+        messages: chatHistory,
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || "HTTP " + r.status);
+    const reply = (j.content || []).map((c) => c.text || "").join("");
+    if (j.usage) {
+      addBubble("a", reply + `\n(入力 ${j.usage.input_tokens} / 出力 ${j.usage.output_tokens} tok)`);
+    } else {
+      addBubble("a", reply);
+    }
+    chatHistory.push({ role: "assistant", content: reply });
+  } catch (e) {
+    addBubble("e", "エラー: " + e.message + " — 履歴から直前の発言を取り消します");
+    chatHistory.pop();
+  }
+  chatPending = false;
+  $("chatsend").disabled = false;
+}
+$("chatsend").addEventListener("click", sendChat);
+$("chatin").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+$("chatclear").addEventListener("click", () => {
+  chatHistory = [];
+  $("chatlog").innerHTML = "";
+});
 connect();
 </script>
 </body>
