@@ -787,7 +787,7 @@ async function sendChat() {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: modelName || "claude-local",
+        model: modelName || "denno-dev",
         max_tokens: maxTokens,
         messages: chatHistory,
       }),
