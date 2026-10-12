@@ -52,6 +52,12 @@ impl KvCache {
         (&mut self.k[layer], &mut self.v[layer])
     }
 
+    /// 指定層の K/V バッファ (読み取り専用)。attention など並列タスクから
+    /// 各セッションのキャッシュを共有読み込みする際に使う (P10)。
+    pub fn kv_bufs_ref(&self, layer: usize) -> (&[f32], &[f32]) {
+        (&self.k[layer], &self.v[layer])
+    }
+
     /// 指定層の K バッファ全体 (使用済みは先頭 len 行)
     pub fn k_buf(&mut self, layer: usize) -> &mut [f32] {
         &mut self.k[layer]

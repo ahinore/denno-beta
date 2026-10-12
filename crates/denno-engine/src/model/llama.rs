@@ -9,6 +9,7 @@
 //! (decode 時の logits matvec も int8 帯域の対象にするため)。
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::path::Path;
 
 use crate::kv_cache::KvCache;
@@ -401,21 +402,31 @@ impl Model for LlamaQwen2 {
                 vc[pos * kv_dim..][..kv_dim].copy_from_slice(&v[i * kv_dim..][..kv_dim]);
             }
 
-            // attention: セッションごとに独立 (自分のキャッシュのみ参照)。
-            // 演算列は forward() の decode (n==1) 経路と完全に同一。
+            // attention: セッション×KVヘッドを rayon で並列実行 (P10)。
+            // 各タスクは (セッション i, kv ヘッド kvh) を担当し、att への書き込み
+            // 先は非重複スライス。タスク内の演算列は forward() の decode (n==1)
+            // 経路と完全に同一 (sgemm_acc → softmax → matmul の同一形状呼び出し)
+            // で、セッション/KVヘッド間に数値的な相互作用はない → ビット一致。
             let mut att = vec![0.0f32; b * heads * dh];
             crate::prof::time(crate::prof::ATTN, || {
                 let scale = 1.0 / (dh as f32).sqrt();
-                for i in 0..b {
-                    let t_total = caches[i].len() + 1; // pos + 1
-                    let (kc, vc) = caches[i].kv_bufs(li);
-                    let mut kh = vec![0.0f32; t_total * dh];
-                    let mut vh = vec![0.0f32; t_total * dh];
-                    for kvh in 0..kv_heads {
+                // 読み取り専用借用に切り替えて各セッションのキャッシュを共有
+                let cache_refs: Vec<&KvCache> = caches.iter().map(|c| &**c).collect();
+                let parts: Vec<(usize, usize, Vec<f32>)> = (0..b)
+                    .into_par_iter()
+                    .flat_map_iter(|i| (0..kv_heads).map(move |kvh| (i, kvh)))
+                    .map(|(i, kvh)| {
+                        let t_total = cache_refs[i].len() + 1; // pos + 1
+                        let (kc, vc) = cache_refs[i].kv_bufs_ref(li);
+                        let mut kh = vec![0.0f32; t_total * dh];
+                        let mut vh = vec![0.0f32; t_total * dh];
                         for j in 0..t_total {
-                            kh[j * dh..][..dh].copy_from_slice(&kc[j * kv_dim + kvh * dh..][..dh]);
-                            vh[j * dh..][..dh].copy_from_slice(&vc[j * kv_dim + kvh * dh..][..dh]);
+                            kh[j * dh..][..dh]
+                                .copy_from_slice(&kc[j * kv_dim + kvh * dh..][..dh]);
+                            vh[j * dh..][..dh]
+                                .copy_from_slice(&vc[j * kv_dim + kvh * dh..][..dh]);
                         }
+                        let mut att_h = vec![0.0f32; group * dh];
                         for g in 0..group {
                             let qh = kvh * group + g;
                             let qg: Vec<f32> =
@@ -428,10 +439,16 @@ impl Model for LlamaQwen2 {
                             // causal mask: decode では未来位置なし (pos+1..pos+1 は空)
                             crate::tensor::softmax(&mut scores);
                             // att_head = Σ_j probs[j] * vh[j] (matmul (n==1) と同一)
-                            let out = crate::tensor::matmul(&scores, &vh, 1, t_total, dh);
-                            att[i * heads * dh + qh * dh..][..dh].copy_from_slice(&out);
+                            let out =
+                                crate::tensor::matmul(&scores, &vh, 1, t_total, dh);
+                            att_h[g * dh..][..dh].copy_from_slice(&out);
                         }
-                    }
+                        (i, kvh, att_h)
+                    })
+                    .collect();
+                for (i, kvh, a) in parts {
+                    let o = i * heads * dh + kvh * group * dh;
+                    att[o..][..group * dh].copy_from_slice(&a);
                 }
             });
 
