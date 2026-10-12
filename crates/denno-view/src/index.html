@@ -149,6 +149,7 @@
   .cline.cur { color: #e6edf3; background: #17301f; border-left-color: var(--glow); }
   .cline.cur .ln { color: var(--glow); }
   .cline.state-lit { color: #7ee788; background: #17301f; border-left-color: var(--glow); }
+  .rhead { color: var(--acc); font-size: 10px; padding: 6px 8px 2px; border-top: 1px solid var(--border); }
   #flysvg { position: fixed; inset: 0; width: 100%; height: 100%;
            pointer-events: none; z-index: 50; }
   /* セクション分離線: 入力トークン / グラフ / 出力トークン を仕切る */
@@ -204,7 +205,9 @@
     <div id="midrow">
       <svg id="zoomlink"><polygon id="zlpoly"/><line id="zl1"/><line id="zl2"/></svg>
       <div id="codewrap">
-        <h2 style="margin-top:0;border-top:none;padding-top:0">Implementation code — expanded from model_forward</h2>
+        <h2 style="margin-top:0;border-top:none;padding-top:0">Implementation code
+          <button id="codesrc" type="button" style="float:right;font-size:10px;padding:1px 6px;cursor:pointer"
+                  title="toggle between pseudo-code and the actual implementation">real code ▸</button></h2>
         <div class="node scope" id="zoomsrc">
           <span class="name">model_forward</span>
           <div class="sub" id="zoomlive" style="display:none"></div>
@@ -443,8 +446,9 @@ const CODE = [
   ["c25", "}", null, null],
 ];
 const OP_LINE = { 0: "c10", 2: "c14", 3: "c13", 4: "c15", 5: "c16", 6: "c18", 7: "c19", 8: "c20" };
-(function buildCode() {
+function buildPseudo() {
   const box = $("code");
+  box.innerHTML = "";
   CODE.forEach(([id, text, op, side], i) => {
     const d = document.createElement("div");
     d.className = "cline"; d.id = id;
@@ -463,9 +467,116 @@ const OP_LINE = { 0: "c10", 2: "c14", 3: "c13", 4: "c15", 5: "c16", 6: "c18", 7:
     if (side) d.dataset.side = side;
     box.appendChild(d);
   });
-})();
+}
+buildPseudo();
+
+// ---------- 実コード表示モード (pseudo ⇔ real、既定は pseudo) ----------
+// 実ソースは denno-view が include_str! で埋め込み、/code/src で配信する
+// (表示されるコードは常に動いているバイナリと同じ世代)。
+let codeMode = "pseudo";
+let REAL = null;
+const REAL_MAP = {};   // pseudo id → 実コード行の要素 id
+const REAL_REGIONS = {
+  scheduler: { start: /^\s*loop \{\s*$/, end: /step_chat_batch\(&mut sess_refs/, pad: 2,
+               name: "denno-server/src/scheduler.rs (worker loop)" },
+  engine:    { start: /pub fn step_chat\(/, end: /^    \}$/, pad: 0,
+               name: "denno-engine/src/engine.rs (step_chat)" },
+  llama:     { start: /fn forward\(&mut self/, end: /Ok\(logits\)/, pad: 1,
+               name: "denno-engine/src/model/llama.rs (forward)" },
+};
+const REAL_ANCHORS = {  // pseudo id → 実ソース行のアンカー (擬似コード行に相当する場所)
+  c2:  ["scheduler", /admit\(&engine/],
+  c3:  ["scheduler", /^\s*loop \{\s*$/],
+  c4:  ["scheduler", /step_chat_batch\(&mut sess_refs/],
+  c5:  ["scheduler", /content_block_delta/],
+  c9:  ["engine", /pub fn step_chat\(/],
+  c10: ["llama", /prof::EMBED/],
+  c11: ["llama", /for \(li, layer\)/],
+  c12: ["llama", /ln1_w/],
+  c13: ["llama", /prof::QKV/],
+  c14: ["llama", /rope_rows/],
+  c15: ["llama", /prof::ATTN/],
+  s1:  ["llama", /kc\[\(pos0 \+ i\)/],
+  s2:  ["llama", /vc\[\(pos0 \+ i\)/],
+  c16: ["llama", /prof::OPROJ/],
+  c17: ["llama", /ln2_w/],
+  c18: ["llama", /prof::GATE_UP/],
+  c19: ["llama", /prof::SWIGLU/],
+  c20: ["llama", /prof::DOWN/],
+  c22: ["llama", /prof::FINAL_NORM/],
+  c23: ["llama", /prof::LM_HEAD/],
+  c24: ["engine", /sampler\.sample/],
+};
+// 現モードでの要素 id (pseudo はそのまま、real はマップ済みの実コード行)
+function modeId(id) { return codeMode === "real" ? (REAL_MAP[id] || null) : id; }
+
+async function loadRealCode() {
+  if (REAL) return true;
+  try {
+    const r = await fetch("/code/src");
+    if (!r.ok) return false;
+    const j = await r.json();
+    const box = $("code");
+    box.innerHTML = "";
+    for (const key of Object.keys(REAL_REGIONS)) {
+      const cfg = REAL_REGIONS[key];
+      const lines = j[key].split("\n");
+      const s = lines.findIndex((l) => cfg.start.test(l));
+      if (s < 0) continue;
+      let e = s;
+      for (let i = s; i < lines.length; i++) if (cfg.end.test(lines[i])) { e = i; break; }
+      e = Math.min(lines.length - 1, e + cfg.pad);
+      const hd = document.createElement("div");
+      hd.className = "rhead";
+      hd.textContent = `── ${cfg.name} : lines ${s + 1}–${e + 1}`;
+      box.appendChild(hd);
+      for (let i = s; i <= e; i++) {
+        const d = document.createElement("div");
+        d.className = "cline"; d.id = `r_${key}_${i}`;
+        const ln = document.createElement("span");
+        ln.className = "ln"; ln.textContent = i + 1;
+        const tx = document.createElement("span");
+        tx.className = "tx"; tx.textContent = lines[i] === "" ? " " : lines[i];
+        d.appendChild(ln); d.appendChild(tx);
+        box.appendChild(d);
+      }
+    }
+    for (const [pid, [key, re]] of Object.entries(REAL_ANCHORS)) {
+      const lines = j[key].split("\n");
+      const s = lines.findIndex((l) => REAL_REGIONS[key].start.test(l));
+      if (s < 0) continue;
+      for (let i = s; i < lines.length; i++) {
+        if (re.test(lines[i])) { REAL_MAP[pid] = `r_${key}_${i}`; break; }
+      }
+    }
+    REAL = true;
+    return true;
+  } catch (e) {
+    console.error("real code load failed", e);
+    return false;
+  }
+}
+$("codesrc").addEventListener("click", async () => {
+  if (codeMode === "pseudo") {
+    if (!(await loadRealCode())) return;
+    codeMode = "real";
+    $("codesrc").textContent = "◂ pseudo code";
+  } else {
+    codeMode = "pseudo";
+    $("codesrc").textContent = "real code ▸";
+    buildPseudo();
+  }
+  if (curLine) curLine.classList.remove("cur");
+  curLine = null;
+  drawCone();
+});
 let curLine = null;
 function codeGo(id) {
+  if (codeMode === "real") {
+    const m = REAL_MAP[id];
+    if (!m) return;
+    id = m;
+  }
   const el = document.getElementById(id);
   if (!el) return;
   if (curLine && curLine !== el) curLine.classList.remove("cur");
@@ -754,10 +865,11 @@ function handleFrame(f) {
           // attn_core: K/V を KV キャッシュへ書き込む (ループ内・実物どおりの位置)
           // カーソルが c15 → s1 → s2 → (次の op) の順に進むようスロットを追加
           const st = Math.max(8, 70 / speed);
-          setTimeout(() => { lit($("s1"), "state-lit", 450); codeGo("s1"); }, delay + st);
+          setTimeout(() => { lit($(modeId("s1")), "state-lit", 450); codeGo("s1"); }, delay + st);
           setTimeout(() => {
-            lit($("s2"), "state-lit", 450);
-            flyLine($("s2"), $("kvslots"), "#3fb950");
+            lit($(modeId("s2")), "state-lit", 450);
+            const s2el = $(modeId("s2"));
+            if (s2el) flyLine(s2el, $("kvslots"), "#3fb950");
             codeGo("s2");
           }, delay + 2 * st);
           delay += 2 * st;
@@ -786,8 +898,9 @@ function handleFrame(f) {
       $("val-token").textContent = `${tokText(f.token) || "?"} (id ${f.token}, pos ${f.pos})`;
       lit($("var-token"));
       lit($("n-detok"));
-      lit($("c5"), "state-lit", 450);    // emit(chosen)
-      flyLine($("c5"), $("var-token"), "#7ee788");
+      lit($(modeId("c5")), "state-lit", 450);    // emit(chosen)
+      const c5el = $(modeId("c5"));
+      if (c5el) flyLine(c5el, $("var-token"), "#7ee788");
       codeGo("c5");
       break;
     }
@@ -800,8 +913,9 @@ function handleFrame(f) {
       lit($("var-logits")); lit($("var-entropy"));
       lit($("n-step"), "lit", 200);
       lit($("n-sample"), "litwarm", 400);
-      lit($("c24"), "state-lit", 450);   // chosen = greedy(logits)
-      flyLine($("c24"), $("var-logits"), "#d29922");
+      lit($(modeId("c24")), "state-lit", 450);   // chosen = greedy(logits)
+      const c24el = $(modeId("c24"));
+      if (c24el) flyLine(c24el, $("var-logits"), "#d29922");
       pulseTo($("n-sample"), `p=${((f.entries[0]?.[1] || 0) * 100).toFixed(1)}%`);
       codeGo("c24");
       break;
@@ -824,8 +938,9 @@ function handleFrame(f) {
     case "Step": {
       lit($("n-step"));
       codeGo("c4");
-      lit($("c20"), "state-lit", 450);   // x = x + down_proj(act) が残差ストリームの最終更新
-      flyLine($("c20"), $("var-x"), "#58a6ff");
+      lit($(modeId("c20")), "state-lit", 450);   // x = x + down_proj(act) が残差ストリームの最終更新
+      const c20el = $(modeId("c20"));
+      if (c20el) flyLine(c20el, $("var-x"), "#58a6ff");
       $("n-step").querySelector(".sub").textContent =
         `batch ${f.width} / ${(f.ns / 1e6).toFixed(1)} ms`;
       break;

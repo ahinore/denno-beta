@@ -520,6 +520,7 @@ dependencies = [
  "denno-telemetry",
  "futures-util",
  "reqwest",
+ "serde_json",
  "tokio",
  "tokio-tungstenite 0.23.1",
  "tracing",

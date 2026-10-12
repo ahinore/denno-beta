@@ -141,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(dashboard))
         .route("/ws", get(view_ws))
         .route("/tokenizer.json", get(tokenizer_json))
+        .route("/code/src", get(code_src))
         .route("/chat", post(chat_proxy))
         .with_state(app);
     let addr = format!("0.0.0.0:{port}");
@@ -298,6 +299,21 @@ async fn chat_proxy(
 
 async fn dashboard() -> Html<&'static str> {
     Html(include_str!("index.html"))
+}
+
+/// 実装ソース 3 ファイル (実コード表示用)。コンパイル時に埋め込むので
+/// ブラウザに見えるコードは常にビルドされたバイナリと同じ世代。
+async fn code_src() -> axum::response::Response {
+    let body = serde_json::json!({
+        "scheduler": include_str!("../../denno-server/src/scheduler.rs"),
+        "engine": include_str!("../../denno-engine/src/engine.rs"),
+        "llama": include_str!("../../denno-engine/src/model/llama.rs"),
+    });
+    axum::response::Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
 }
 
 /// GET /ws — ブラウザへのフレーム中継 (複数クライアント可)。
