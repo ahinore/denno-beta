@@ -429,6 +429,8 @@ const CODE = [
   ["c13", "    let qkv = qkv_proj(&h);", 3, null],
   ["c14", "    let q = rope(qkv.q, li);", 2, null],
   ["c15", "    let a = attn_core(q, kv);", 4, null],
+  ["s1",  "    kv.k[li][pos] = qkv.k;  // write K", null, null],
+  ["s2",  "    kv.v[li][pos] = qkv.v;  // write V", null, null],
   ["c16", "    x = x + o_proj(a);     // residual", 5, null],
   ["c17", "    let h = rmsnorm(&x);   // mlp in", 1, "mlp"],
   ["c18", "    let gu = gate_up_proj(&h);", 6, null],
@@ -439,13 +441,6 @@ const CODE = [
   ["c23", "  let logits = lm_head(&h);", 10, null],
   ["c24", "  sampler::greedy(logits, seed)", "topk", null],
   ["c25", "}", null, null],
-  ["c26", "", null, null],
-  ["c27", "// state updates (KV cache & variables)", null, null],
-  ["s1", "kv.k[li][pos] = qkv.k;   // write K", null, null],
-  ["s2", "kv.v[li][pos] = qkv.v;   // write V", null, null],
-  ["s3", "hidden_x = x;            // residual stream update", null, null],
-  ["s4", "chosen = greedy(logits);  // pick token", null, null],
-  ["s5", "emit(chosen);            // emit output token", null, null],
 ];
 const OP_LINE = { 0: "c10", 2: "c14", 3: "c13", 4: "c15", 5: "c16", 6: "c18", 7: "c19", 8: "c20" };
 (function buildCode() {
@@ -756,9 +751,16 @@ function handleFrame(f) {
         if (op === 5) passedOproj = true;   // o_proj の後の rmsnorm は mlp 側
         if (op === 8) passedOproj = false;  // down_proj の後は次層の attn 側
         if (op === 4) {
-          // attn_core: K/V を KV キャッシュへ書き込む (状態更新コード → 左のKVへ)
-          lit($("s1"), "state-lit", 450); lit($("s2"), "state-lit", 450);
-          flyLine($("s2"), $("kvslots"), "#3fb950");
+          // attn_core: K/V を KV キャッシュへ書き込む (ループ内・実物どおりの位置)
+          // カーソルが c15 → s1 → s2 → (次の op) の順に進むようスロットを追加
+          const st = Math.max(8, 70 / speed);
+          setTimeout(() => { lit($("s1"), "state-lit", 450); codeGo("s1"); }, delay + st);
+          setTimeout(() => {
+            lit($("s2"), "state-lit", 450);
+            flyLine($("s2"), $("kvslots"), "#3fb950");
+            codeGo("s2");
+          }, delay + 2 * st);
+          delay += 2 * st;
         }
       }
       // この層のカスケード全体が終わる時間を記録 (再生キューの pacing に使う)
@@ -784,8 +786,8 @@ function handleFrame(f) {
       $("val-token").textContent = `${tokText(f.token) || "?"} (id ${f.token}, pos ${f.pos})`;
       lit($("var-token"));
       lit($("n-detok"));
-      lit($("s5"), "state-lit", 450);
-      flyLine($("s5"), $("var-token"), "#7ee788");
+      lit($("c5"), "state-lit", 450);    // emit(chosen)
+      flyLine($("c5"), $("var-token"), "#7ee788");
       codeGo("c5");
       break;
     }
@@ -798,8 +800,8 @@ function handleFrame(f) {
       lit($("var-logits")); lit($("var-entropy"));
       lit($("n-step"), "lit", 200);
       lit($("n-sample"), "litwarm", 400);
-      lit($("s4"), "state-lit", 450);
-      flyLine($("s4"), $("var-logits"), "#d29922");
+      lit($("c24"), "state-lit", 450);   // chosen = greedy(logits)
+      flyLine($("c24"), $("var-logits"), "#d29922");
       pulseTo($("n-sample"), `p=${((f.entries[0]?.[1] || 0) * 100).toFixed(1)}%`);
       codeGo("c24");
       break;
@@ -822,8 +824,8 @@ function handleFrame(f) {
     case "Step": {
       lit($("n-step"));
       codeGo("c4");
-      lit($("s3"), "state-lit", 450);
-      flyLine($("s3"), $("var-x"), "#58a6ff");
+      lit($("c20"), "state-lit", 450);   // x = x + down_proj(act) が残差ストリームの最終更新
+      flyLine($("c20"), $("var-x"), "#58a6ff");
       $("n-step").querySelector(".sub").textContent =
         `batch ${f.width} / ${(f.ns / 1e6).toFixed(1)} ms`;
       break;
