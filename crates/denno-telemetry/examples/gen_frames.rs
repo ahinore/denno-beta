@@ -5,6 +5,7 @@ fn main() {
     let frames = vec![
         denno_telemetry::Frame::ServerInfo {
             model: "denno-dev".into(),
+            model_id: "Qwen/Qwen2.5-0.5B-Instruct".into(),
             quant: "fp32".into(),
             slots: 4,
             context: 32768,

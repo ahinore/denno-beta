@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>denno-view — 推論フローアニメーション (P14)</title>
+<title>denno-view — inference flow animation</title>
 <style>
   :root {
     --bg: #14161a; --panel: #1a1d23; --panel2: #20242c; --line: #2a2f38;
@@ -150,7 +150,10 @@
   .cline.cur .ln { color: var(--glow); }
   .cline.state-lit { color: #7ee788; background: #17301f; border-left-color: var(--glow); }
   #flysvg { position: fixed; inset: 0; width: 100%; height: 100%;
-            pointer-events: none; z-index: 50; }
+           pointer-events: none; z-index: 50; }
+  /* セクション分離線: 入力トークン / グラフ / 出力トークン を仕切る */
+  #center > h2 { border-top: 1px solid var(--border); padding-top: 12px; margin-top: 16px; }
+  #center > h2:first-child { border-top: none; padding-top: 0; margin-top: 0; }
 
   /* ---- 拡大コーン: model_forward ノード → 実装コードパネルへの接続 ---- */
   #midrow { position: relative; }
@@ -167,55 +170,55 @@
 <body>
 <header>
   <span class="logo">denno-view</span>
-  <span id="srvinfo" class="muted">未接続</span>
+  <span id="srvinfo" class="muted">disconnected</span>
   <span id="sess" class="muted"></span>
   <span id="gap" class="warn"></span>
   <span id="stat" class="muted" style="margin-left:auto"></span>
-  <label class="muted">速度 <input id="speed" type="range" min="0.5" max="8" step="0.5" value="1"></label>
+  <label class="muted">speed <input id="speed" type="range" min="0.5" max="8" step="0.5" value="1"></label>
 </header>
 <main>
   <!-- 左: KVキャッシュ + 変数 -->
   <section class="panel" id="left">
-    <h2>KVキャッシュ</h2>
+    <h2>KV cache</h2>
     <div id="kvslots"></div>
-    <h2 style="margin-top:10px">変数</h2>
+    <h2 style="margin-top:10px">variables</h2>
     <div class="var" id="var-x"><h3>hidden x (residual)</h3><div class="val" id="val-x">-</div></div>
     <div class="var" id="var-logits"><h3>logits top-k</h3>
       <div class="val topk" id="val-logits">-</div></div>
     <div class="var" id="var-entropy"><h3>entropy (nat)</h3><div class="val" id="val-entropy">-</div></div>
     <div class="var" id="var-token"><h3>chosen token</h3><div class="val" id="val-token">-</div></div>
-    <h2 style="margin-top:10px">op timing (前ステップ, ms)</h2>
+    <h2 style="margin-top:10px">op timing (last step, ms)</h2>
     <div id="ops" class="muted" style="font-size:11px">-</div>
   </section>
 
-  <!-- 中央: 実装コード + コールグラフ / トークン+チャット の2ペイン -->
+  <!-- 中央: 実装コード + モデル駆動プログラム / チャット の2ペイン -->
   <div id="centercol">
   <section class="panel" id="center">
-    <h2>入力トークン <span id="tokstat" class="muted" style="font-size:10px"></span></h2>
+    <h2>Input tokens <span id="tokstat" class="muted" style="font-size:10px"></span></h2>
     <div id="intokens"></div>
-    <h2 style="margin-top:8px">コールグラフ (モデル駆動プログラム) — 左で実装コードがステップ実行される</h2>
+    <h2>Model-Driven Program — implementation code (left) steps through it</h2>
     <div id="midrow">
       <svg id="zoomlink"><polygon id="zlpoly"/><line id="zl1"/><line id="zl2"/></svg>
       <div id="codewrap">
-        <h2 style="margin-top:0">実装コード — model_forward を拡大</h2>
+        <h2 style="margin-top:0;border-top:none;padding-top:0">Implementation code — expanded from model_forward</h2>
         <div class="node scope" id="zoomsrc">
           <span class="name">model_forward</span>
-          <div class="sub">実装コードに展開 — <span id="zoomlive">-</span></div>
+          <div class="sub" id="zoomlive" style="display:none"></div>
         </div>
         <div id="code"></div>
       </div>
       <div id="graphwrap">
         <div id="graph">
       <div class="node" id="n-serve"><span class="name">denno serve</span>
-        <div class="sub">HTTP + WS エンドポイント</div></div>
+        <div class="sub">HTTP + WS endpoint</div></div>
       <div class="node" id="n-sched"><span class="name">scheduler</span>
-        <div class="sub">セッション管理 / バッチ組成</div></div>
+        <div class="sub">session management / batching</div></div>
       <div class="node" id="n-step"><span class="name">engine.step_chat</span>
-        <div class="sub">prefill / decode 1 ステップ</div></div>
+        <div class="sub">prefill / one decode step</div></div>
       <div class="node scope" id="n-forward"><span class="name">model.forward</span>
         <div class="ops">
           <div class="op" id="op-embed">embed <span class="badge"></span></div>
-          <div class="arrow">│ layer ×N (右パネルと連動)</div>
+          <div class="arrow">│ layer ×N (synced with right panel)</div>
           <div class="op" id="op-1">rmsnorm (attn in) <span class="badge"></span></div>
           <div class="op" id="op-3">qkv_proj <span class="badge"></span></div>
           <div class="op" id="op-2">rope <span class="badge"></span></div>
@@ -230,41 +233,41 @@
         <div class="op" id="op-10">lm_head <span class="badge"></span></div>
       </div>
       <div class="node" id="n-sample"><span class="name">sampler</span>
-        <div class="sub">greedy (seed 固定)</div></div>
+        <div class="sub">greedy (fixed seed)</div></div>
       <div class="node" id="n-detok"><span class="name">detok</span>
-        <div class="sub">ストリーミング差分デコード</div></div>
+        <div class="sub">streaming incremental decode</div></div>
         </div>
         <div id="fallzone"></div>
         <div id="pulse"></div>
         <div id="oplabel"></div>
       </div>
     </div>
-    <h2 style="margin-top:8px">出力トークン</h2>
+    <h2>Output tokens</h2>
     <div id="tokens"></div>
   </section>
 
   <section class="panel" id="tokenpane">
-    <h2>チャット <span class="muted" style="font-size:10px">(送信するとアニメーションが流れます)</span></h2>
+    <h2>Chat <span class="muted" style="font-size:10px">(sending a message runs the animation)</span></h2>
     <div id="chatlog"></div>
     <div id="chatbar">
-      <input id="chatin" type="text" placeholder="メッセージを入力 (Enter で送信)" autocomplete="off">
+      <input id="chatin" type="text" placeholder="Type a message (Enter to send)" autocomplete="off">
       <label class="muted" style="font-size:10px;align-self:center">max<br>tokens</label>
       <input id="chatmt" class="mt" type="number" value="256" min="1" max="4096">
-      <button id="chatsend">送信</button>
-      <button id="chatclear" title="履歴クリア">✕</button>
+      <button id="chatsend">Send</button>
+      <button id="chatclear" title="clear history">✕</button>
     </div>
   </section>
   </div>
 
   <!-- 右: モデル構造 (層スタック) -->
   <section class="panel" id="right">
-    <h2>モデル構造 — 直近の演算内容</h2>
-    <div class="lump" id="lump-embed">embed — トークン → ベクトル</div>
+    <h2>Model structure — latest ops</h2>
+    <div class="lump" id="lump-embed">embed — tokens → vectors</div>
     <div class="lgroup">
       <div class="ghead">decoder layer × <span id="gcount">-</span> <span class="muted">(Attention + MLP)</span></div>
       <div id="layers"></div>
     </div>
-    <div class="lump" id="lump-final">final_norm → lm_head — 語彙スコア</div>
+    <div class="lump" id="lump-final">final_norm → lm_head — vocab scores</div>
   </section>
 </main>
 <svg id="flysvg"></svg>
@@ -301,8 +304,8 @@ function decodeFrame(buf) {
   const f16r = () => { const v = buf[p] | (buf[p + 1] << 8); p += 2; return v; };
   switch (kind) {
     case 1: { // ServerInfo
-      const model = str(), quant = str();
-      return { kind: "ServerInfo", model, quant, slots: u32(), context: u32(), layers: u32() };
+      const model = str(), model_id = str(), quant = str();
+      return { kind: "ServerInfo", model, model_id, quant, slots: u32(), context: u32(), layers: u32() };
     }
     case 2: return { kind: "SessionAdmit", session: u32(), slot: u32(), prompt_tokens: u32() };
     case 3: return { kind: "SessionDone", session: u32(), reason: buf[p++], output_tokens: u32() };
@@ -376,9 +379,9 @@ async function loadTokenizer() {
     (t.added_tokens || []).forEach(a => { map[a.id] = a.content; if (a.special) TOK_SPECIAL.add(a.id); });
     TOK = map;
     TOK_STREAM = new TextDecoder("utf-8");
-    $("tokstat").textContent = `文字表示 OK (vocab ${Object.keys(map).length})`;
+    $("tokstat").textContent = `char display OK (vocab ${Object.keys(map).length})`;
   } catch (e) {
-    $("tokstat").textContent = "(トークナイザ無し — id 表示)";
+    $("tokstat").textContent = "(no tokenizer — showing ids)";
   }
 }
 function tokText(id) {
@@ -405,14 +408,14 @@ let nLayers = 0, ctxLen = 0, speed = 1;
 // denno-engine/src/model/llama.rs + engine.rs の構造に対応する擬似コード。
 // op 番号は prof の OP 定数 (= LayerRun / OpSummary の op) と一致させる。
 const CODE = [
-  ["c1",  "// denno-server: セッションループ", null, null],
+  ["c1",  "// denno-server: session loop", null, null],
   ["c2",  "let session = scheduler.admit(req);", "admit", null],
   ["c3",  "loop {", null, null],
   ["c4",  "  let step = engine.step_chat(sess);", "step", null],
   ["c5",  "  scheduler.emit_token(step.token);", "token", null],
   ["c6",  "}", null, null],
   ["c7",  "", null, null],
-  ["c8",  "// denno-engine: 1 ステップの実体", null, null],
+  ["c8",  "// denno-engine: one step", null, null],
   ["c9",  "fn step_chat(sess) -> Step {", null, null],
   ["c10", "  let mut x = embed(last_token);", 0, null],
   ["c11", "  for (li, layer) in layers {", "loop", "watch"],
@@ -431,12 +434,12 @@ const CODE = [
   ["c24", "  sampler::greedy(logits, seed)", "topk", null],
   ["c25", "}", null, null],
   ["c26", "", null, null],
-  ["c27", "// 状態の更新 (KV キャッシュと変数)", null, null],
-  ["s1", "kv.k[li][pos] = qkv.k;   // K を書き込み", null, null],
-  ["s2", "kv.v[li][pos] = qkv.v;   // V を書き込み", null, null],
-  ["s3", "hidden_x = x;            // 残差ストリーム更新", null, null],
-  ["s4", "chosen = greedy(logits);  // トークン決定", null, null],
-  ["s5", "emit(chosen);            // 出力トークン送出", null, null],
+  ["c27", "// state updates (KV cache & variables)", null, null],
+  ["s1", "kv.k[li][pos] = qkv.k;   // write K", null, null],
+  ["s2", "kv.v[li][pos] = qkv.v;   // write V", null, null],
+  ["s3", "hidden_x = x;            // residual stream update", null, null],
+  ["s4", "chosen = greedy(logits);  // pick token", null, null],
+  ["s5", "emit(chosen);            // emit output token", null, null],
 ];
 const OP_LINE = { 0: "c10", 2: "c14", 3: "c13", 4: "c15", 5: "c16", 6: "c18", 7: "c19", 8: "c20" };
 (function buildCode() {
@@ -518,10 +521,12 @@ function lensSet(el) {
   lensCur = el;
   const nm = el.querySelector(":scope > .name");
   const bd = el.querySelector(":scope > .badge");
-  const extra = lastCodeLine ? ` ↔ コード ${lastCodeLine} 行目` : "";
-  $("zoomlive").textContent =
-    `実行中: ${nm ? nm.textContent : el.id}` +
+  const extra = lastCodeLine ? ` ↔ code line ${lastCodeLine}` : "";
+  const zl = $("zoomlive");
+  zl.textContent =
+    `running: ${nm ? nm.textContent : el.id}` +
     (bd && bd.textContent ? ` ${bd.textContent}` : "") + extra;
+  zl.style.display = "inline";
 }
 function drawCone() {
   const mid = $("midrow"), s = $("zoomsrc"), t = $("n-forward");
@@ -666,7 +671,7 @@ function rmsNode() { return passedOproj ? $("op-1b") : $("op-1"); }
 function handleFrame(f) {
   switch (f.kind) {
     case "ServerInfo": {
-      srv.textContent = `${f.model} (quant=${f.quant}, slots=${f.slots}, ctx=${f.context}, layers=${f.layers})`;
+      srv.textContent = `${f.model_id || f.model} [${f.model}] (quant=${f.quant}, slots=${f.slots}, ctx=${f.context}, layers=${f.layers})`;
       modelName = f.model;
       ctxLen = f.context;
       buildLayers(f.layers); buildSlots(f.slots);
@@ -677,7 +682,7 @@ function handleFrame(f) {
       sessEl.textContent = `session ${f.session} (slot ${f.slot})`;
       $("tokens").innerHTML = "";
       $("intokens").innerHTML = "";
-      statEl.textContent = "prefill 中…";
+      statEl.textContent = "prefill…";
       lit($("n-sched")); lit($("n-step"));
       codeGo("c2");
       break;
@@ -750,7 +755,7 @@ function handleFrame(f) {
         }
       }
       // 隠れ変数 (residual stream) の更新表示
-      $("val-x").textContent = `L${f.layer} 通過: ${f.ops.map(o => OP_NAMES[o[0]] ?? o[0]).join("→")}`;
+      $("val-x").textContent = `L${f.layer} passed: ${f.ops.map(o => OP_NAMES[o[0]] ?? o[0]).join("→")}`;
       lit($("var-x"), "lit", 180);
       break;
     }
@@ -816,7 +821,7 @@ function handleFrame(f) {
     }
     case "SessionDone": {
       const rs = ["end_turn", "max_tokens", "stop_sequence", "error"][f.reason] ?? f.reason;
-      statEl.textContent = `session ${f.session} 完了 (${rs}, ${f.output_tokens} tok)`;
+      statEl.textContent = `session ${f.session} done (${rs}, ${f.output_tokens} tok)`;
       lit($("n-serve"), "litwarm", 600);
       break;
     }
@@ -852,9 +857,9 @@ function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { statEl.textContent = "接続"; };
+  ws.onopen = () => { statEl.textContent = "connected"; };
   ws.onclose = () => {
-    statEl.textContent = "切断 — 2秒後に再接続";
+    statEl.textContent = "disconnected — retrying in 2s";
     setTimeout(connect, 2000);
   };
   ws.onmessage = (ev) => {
@@ -909,13 +914,13 @@ async function sendChat() {
     if (!r.ok) throw new Error((j.error && j.error.message) || "HTTP " + r.status);
     const reply = (j.content || []).map((c) => c.text || "").join("");
     if (j.usage) {
-      addBubble("a", reply + `\n(入力 ${j.usage.input_tokens} / 出力 ${j.usage.output_tokens} tok)`);
+      addBubble("a", reply + `\n(in ${j.usage.input_tokens} / out ${j.usage.output_tokens} tok)`);
     } else {
       addBubble("a", reply);
     }
     chatHistory.push({ role: "assistant", content: reply });
   } catch (e) {
-    addBubble("e", "エラー: " + e.message + " — 履歴から直前の発言を取り消します");
+    addBubble("e", "error: " + e.message + " — removing the last message from history");
     chatHistory.pop();
   }
   chatPending = false;

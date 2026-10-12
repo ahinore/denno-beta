@@ -179,6 +179,7 @@ fn main() -> Result<()> {
             rt.block_on(denno_server::run(denno_server::ServeConfig {
                 model_dir: dir,
                 name: name.unwrap_or_else(|| repo.clone()),
+                model_id: repo.clone(),
                 host,
                 port,
                 api_key,

@@ -187,7 +187,7 @@ pub fn get_varint_u32(buf: &[u8]) -> Result<(u32, usize), String> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     /// WS 接続時のサーバー情報
-    ServerInfo { model: String, quant: String, slots: u32, context: u32, layers: u32 },
+    ServerInfo { model: String, model_id: String, quant: String, slots: u32, context: u32, layers: u32 },
     /// セッションが KV スロットを取得 (install)
     SessionAdmit { session: u32, slot: u32, prompt_tokens: u32 },
     /// セッション終了 (release)
@@ -234,9 +234,11 @@ impl Frame {
         b.push(VERSION);
         b.push(self.kind());
         match self {
-            Frame::ServerInfo { model, quant, slots, context, layers } => {
+            Frame::ServerInfo { model, model_id, quant, slots, context, layers } => {
                 put_varint_u32(&mut b, model.len() as u32);
                 b.extend_from_slice(model.as_bytes());
+                put_varint_u32(&mut b, model_id.len() as u32);
+                b.extend_from_slice(model_id.as_bytes());
                 put_varint_u32(&mut b, quant.len() as u32);
                 b.extend_from_slice(quant.as_bytes());
                 put_varint_u32(&mut b, *slots);
@@ -338,13 +340,16 @@ impl Frame {
                 let n = u32v(p, &mut i)? as usize;
                 let model = String::from_utf8(p[i..i + n].to_vec()).map_err(|e| e.to_string())?;
                 i += n;
+                let nid = u32v(p, &mut i)? as usize;
+                let model_id = String::from_utf8(p[i..i + nid].to_vec()).map_err(|e| e.to_string())?;
+                i += nid;
                 let n2 = u32v(p, &mut i)? as usize;
                 let quant = String::from_utf8(p[i..i + n2].to_vec()).map_err(|e| e.to_string())?;
                 i += n2;
                 let slots = u32v(p, &mut i)?;
                 let context = u32v(p, &mut i)?;
                 let layers = u32v(p, &mut i)?;
-                Frame::ServerInfo { model, quant, slots, context, layers }
+                Frame::ServerInfo { model, model_id, quant, slots, context, layers }
             }
             kind::SESSION_ADMIT => {
                 let session = u32v(p, &mut i)?;
@@ -693,6 +698,7 @@ mod tests {
         let frames = vec![
             Frame::ServerInfo {
                 model: "Qwen/Qwen2.5-0.5B-Instruct".into(),
+                model_id: "Qwen/Qwen2.5-0.5B-Instruct".into(),
                 quant: "fp32".into(),
                 slots: 4,
                 context: 32768,

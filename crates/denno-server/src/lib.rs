@@ -31,12 +31,16 @@ pub struct AppState {
     /// (ワーカーは mutex をステップ間でほぼ連続保持するため、ハンドラが
     ///  generation 中に lock を奪おうとすると starve し得る)
     pub model_name: String,
+    /// 実行中のモデル ID (例: Qwen/Qwen2.5-0.5B-Instruct)。テレメトリ ServerInfo 用。
+    pub model_id: String,
 }
 
 /// serve 設定
 pub struct ServeConfig {
     pub model_dir: std::path::PathBuf,
     pub name: String,
+    /// モデル ID (pull 元の repo id)。テレメトリで報告する
+    pub model_id: String,
     pub host: String,
     pub port: u16,
     pub api_key: Option<String>,
@@ -211,12 +215,14 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
     );
 
     let model_name = engine.name.clone();
+    let model_id = cfg.model_id.clone();
     let engine = Arc::new(Mutex::new(engine));
     let state = Arc::new(AppState {
         engine: engine.clone(),
         api_key: cfg.api_key,
         scheduler: Scheduler::spawn(engine, cfg.max_queue.max(1)),
         model_name,
+        model_id,
     });
 
     // P13: テレメトリが有効ならハブ → broadcast への転送タスクを起動する。
@@ -453,18 +459,19 @@ async fn telemetry_ws(
 }
 
 async fn telemetry_socket(mut socket: WebSocket, state: Arc<AppState>) {
-    // 最初に ServerInfo (モデル/量子化/スロット数/コンテキスト長/層数)
-    let (model, quant, slots, context, layers) = {
+    // 最初に ServerInfo (モデル/モデルID/量子化/スロット数/コンテキスト長/層数)
+    let (model, model_id, quant, slots, context, layers) = {
         let g = state.engine.lock().unwrap();
         (
             g.name.clone(),
+            state.model_id.clone(),
             g.quant.label().to_string(),
             g.caches.len() as u32,
             g.context() as u32,
             g.caches.first().map(|c| c.n_layers()).unwrap_or(0) as u32,
         )
     };
-    let info = Frame::ServerInfo { model, quant, slots, context, layers };
+    let info = Frame::ServerInfo { model, model_id, quant, slots, context, layers };
     if socket.send(Message::Binary(info.encode())).await.is_err() {
         return;
     }

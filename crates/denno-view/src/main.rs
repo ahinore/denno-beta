@@ -184,7 +184,7 @@ async fn pump_upstream(
                             // ServerInfo / SessionAdmit / SessionDone / Gap はログにも出す
                             if let Ok(f) = Frame::decode(&bin) {
                                 match &f {
-                                    Frame::ServerInfo { model, quant, slots, context, layers } => {
+                                    Frame::ServerInfo { model, quant, slots, context, layers, .. } => {
                                         *srv_snap.write().unwrap() = Some(bin.clone());
                                         tracing::info!(
                                             "server: {} (quant={}, slots={}, ctx={}, layers={})",
