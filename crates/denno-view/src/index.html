@@ -476,7 +476,6 @@ buildPseudo();
 // 実ソースは denno-view が include_str! で埋め込み、/code/src で配信する
 // (表示されるコードは常に動いているバイナリと同じ世代)。
 let codeMode = "pseudo";
-let REAL = null;
 const REAL_MAP = {};   // pseudo id → 実コード行の要素 id
 const REAL_REGIONS = {
   scheduler: { start: /^\s*loop \{\s*$/, end: /step_chat_batch\(&mut sess_refs/, pad: 2,
@@ -512,51 +511,54 @@ const REAL_ANCHORS = {  // pseudo id → 実ソース行のアンカー (擬似�
 // 現モードでの要素 id (pseudo はそのまま、real はマップ済みの実コード行)
 function modeId(id) { return codeMode === "real" ? (REAL_MAP[id] || null) : id; }
 
+let REAL_J = null;
 async function loadRealCode() {
-  if (REAL) return true;
-  try {
-    const r = await fetch("/code/src");
-    if (!r.ok) return false;
-    const j = await r.json();
-    const box = $("code");
-    box.innerHTML = "";
-    for (const key of Object.keys(REAL_REGIONS)) {
-      const cfg = REAL_REGIONS[key];
-      const lines = j[key].split("\n");
-      const s = lines.findIndex((l) => cfg.start.test(l));
-      if (s < 0) continue;
-      let e = s;
-      for (let i = s; i < lines.length; i++) if (cfg.end.test(lines[i])) { e = i; break; }
-      e = Math.min(lines.length - 1, e + cfg.pad);
-      const hd = document.createElement("div");
-      hd.className = "rhead";
-      hd.textContent = `── ${cfg.name} : lines ${s + 1}–${e + 1}`;
-      box.appendChild(hd);
-      for (let i = s; i <= e; i++) {
-        const d = document.createElement("div");
-        d.className = "cline"; d.id = `r_${key}_${i}`;
-        const ln = document.createElement("span");
-        ln.className = "ln"; ln.textContent = i + 1;
-        const tx = document.createElement("span");
-        tx.className = "tx"; tx.textContent = lines[i] === "" ? " " : lines[i];
-        d.appendChild(ln); d.appendChild(tx);
-        box.appendChild(d);
-      }
+  if (!REAL_J) {
+    try {
+      const r = await fetch("/code/src");
+      if (!r.ok) return false;
+      REAL_J = await r.json();
+    } catch (e) {
+      console.error("real code load failed", e);
+      return false;
     }
-    for (const [pid, [key, re]] of Object.entries(REAL_ANCHORS)) {
-      const lines = j[key].split("\n");
-      const s = lines.findIndex((l) => REAL_REGIONS[key].start.test(l));
-      if (s < 0) continue;
-      for (let i = s; i < lines.length; i++) {
-        if (re.test(lines[i])) { REAL_MAP[pid] = `r_${key}_${i}`; break; }
-      }
-    }
-    REAL = true;
-    return true;
-  } catch (e) {
-    console.error("real code load failed", e);
-    return false;
   }
+  const j = REAL_J;
+  const box = $("code");
+  box.innerHTML = "";
+  for (const key of Object.keys(REAL_REGIONS)) {
+    const cfg = REAL_REGIONS[key];
+    const lines = j[key].split("\n");
+    const s = lines.findIndex((l) => cfg.start.test(l));
+    if (s < 0) continue;
+    let e = s;
+    for (let i = s; i < lines.length; i++) if (cfg.end.test(lines[i])) { e = i; break; }
+    e = Math.min(lines.length - 1, e + cfg.pad);
+    const hd = document.createElement("div");
+    hd.className = "rhead";
+    hd.textContent = `── ${cfg.name} : lines ${s + 1}–${e + 1}`;
+    box.appendChild(hd);
+    for (let i = s; i <= e; i++) {
+      const d = document.createElement("div");
+      d.className = "cline"; d.id = `r_${key}_${i}`;
+      const ln = document.createElement("span");
+      ln.className = "ln"; ln.textContent = i + 1;
+      const tx = document.createElement("span");
+      tx.className = "tx"; tx.textContent = lines[i] === "" ? " " : lines[i];
+      d.appendChild(ln); d.appendChild(tx);
+      box.appendChild(d);
+    }
+  }
+  for (const pid of Object.keys(REAL_MAP)) delete REAL_MAP[pid];
+  for (const [pid, [key, re]] of Object.entries(REAL_ANCHORS)) {
+    const lines = j[key].split("\n");
+    const s = lines.findIndex((l) => REAL_REGIONS[key].start.test(l));
+    if (s < 0) continue;
+    for (let i = s; i < lines.length; i++) {
+      if (re.test(lines[i])) { REAL_MAP[pid] = `r_${key}_${i}`; break; }
+    }
+  }
+  return true;
 }
 $("codesrc").addEventListener("click", async () => {
   if (codeMode === "pseudo") {
