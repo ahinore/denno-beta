@@ -3,7 +3,7 @@
 //!
 //! モデルディレクトリは環境変数で上書きできる:
 //!   DENNO_QWEN_DIR  (default: /home/dev/.cache/denno/hub/models--Qwen--Qwen2.5-0.5B-Instruct)
-//!   DENNO_GPT2_DIR  (default: /home/dev/.cache/denno/hub/models--openai--gpt2)
+//!   DENNO_GPT2_DIR  (default: /home/dev/.cache/denno/hub/models--openai-community--gpt2)
 
 use denno_engine::{ChatMessage, Engine, GenParams, QuantMode};
 use std::path::PathBuf;
@@ -38,6 +38,12 @@ fn greedy(max_tokens: usize) -> GenParams {
         ..Default::default()
     }
 }
+
+/// GPT-2 基準出力 (日本の首都は? / max_tokens 40 / fallback テンプレート)。
+/// HF transformers 参照実装と一致を検証済み。40 トークン目でマルチバイト
+/// 文字「日」のバイト列の途中で切れるため末尾に U+FFFD が現れる (lossy)。
+const GPT2_JP_BASELINE: &str =
+    " 日本の首都は?\n\nassistant: 日本の首都は?\n\nassistant: 日本の\u{FFFD}";
 
 /// §5 基準出力: Qwen2.5-0.5B / temp 0 / seed 42 / 「1+1は?」
 /// §4 の決定論検証 curl と同じ条件 (server は system 無しで engine.chat に渡す)
@@ -102,27 +108,25 @@ fn qwen_exact_decoding_is_reproducible() {
     assert_eq!(a.output_tokens, b.output_tokens);
 }
 
-/// §5 基準出力: GPT-2 / seed 42 (日本の首都についてのプロンプト)。
-/// gpt2 は chat template を持たないので fallback テンプレートが使われる。
+/// GPT-2 基準出力 (seed 42)。gpt2 は chat template を持たないので
+/// fallback テンプレートが使われる。基準文字列は参照実装
+/// (HF transformers fp32, greedy) の出力と一致することを検証済み
+/// (2026-10-12, dev-container コンテナ内 /tmp/gpt2_ref.py)。
+/// GPT-2 base は fallback テンプレート付きプロンプトに対して入力を
+/// 繰り返す (エコー) のが素の貪欲生成の挙動。
 #[test]
 #[ignore]
 fn gpt2_japan_capital_matches_baseline() {
     let Some(dir) = model_dir(
         "DENNO_GPT2_DIR",
-        "/home/dev/.cache/denno/hub/models--openai--gpt2",
+        "/home/dev/.cache/denno/hub/models--openai-community--gpt2",
     ) else {
         return;
     };
     let mut e = Engine::load(&dir, "gpt2-test", Some(42), QuantMode::Fp32).unwrap();
     let out = e.chat(None, &user_msg("日本の首都は?"), &greedy(40), |_| {}).unwrap();
     println!("gpt2 output: {}", out.text);
-    assert!(
-        out.text.starts_with(
-            "a famous expanse with big dumping ground broken into chunks, a façade is being laid out"
-        ),
-        "unexpected output: {}",
-        out.text
-    );
+    assert_eq!(out.text, GPT2_JP_BASELINE, "unexpected output: {}", out.text);
 }
 
 /// P3: int8 モードの決定論。同一 seed + 温度 0 → 同一出力が維持される。

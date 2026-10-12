@@ -482,6 +482,7 @@ impl Engine {
 
         if self.model.eos_ids().contains(&next) {
             sess.stop_reason = StopReason::EndTurn;
+            self.flush_stream(sess, 1, on_delta)?;
             return Ok(true);
         }
 
@@ -496,7 +497,29 @@ impl Engine {
             return Ok(false);
         }
         sess.stop_reason = StopReason::MaxTokens;
+        self.flush_stream(sess, 0, on_delta)?;
         Ok(true)
+    }
+
+    /// 生成終了時のフラッシュ: emit で保留中のトークン (末尾がマルチバイト
+    /// 文字の途中で終わるバイト列) を最終 decode で確定させて流す。
+    /// EOS / max_tokens で打ち切られたステップでは通常の emit が行われない
+    /// (または保留が起きる) ため、完了時に必ず呼ぶ。
+    /// `exclude_last` は decode から除外する末尾トークン数 (EOS 分 = 1)。
+    fn flush_stream(
+        &self,
+        sess: &mut ChatSession,
+        exclude_last: usize,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        let n = sess.generated.len().saturating_sub(exclude_last);
+        let full = self.tok.decode(&sess.generated[..n])?; // lossy (不正バイトは U+FFFD)
+        if full.len() > sess.text.len() && full.is_char_boundary(sess.text.len()) {
+            let delta = &full[sess.text.len()..];
+            on_delta(delta);
+            sess.text.push_str(delta);
+        }
+        Ok(())
     }
 
     /// decode 1 ステップの共通後処理: 差分ストリーミング + stop_sequences チェック。
@@ -507,8 +530,21 @@ impl Engine {
         sess: &mut ChatSession,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<bool> {
-        // 差分だけストリーミング(部分的なUTF-8を避けるため全decode→diff)
-        let full = crate::prof::time(crate::prof::DETOK, || self.tok.decode(&sess.generated))?;
+        // 差分だけストリーミング(部分的なUTF-8を避けるため全decode→diff)。
+        // バイトレベルBPE (GPT-2 等) ではマルチバイト文字がトークン境界で
+        // 分割され、未完成バイト列は decode が U+FFFD に置き換える。その
+        // U+FFFD を確定済みテキスト (sess.text) に混入させると以後のバイト
+        // 差分がずれて文字が欠落するため、**末尾が U+FFFD になるトークンは
+        // 保留**し、文字が完成したステップでまとめて差分として流す。
+        let full = crate::prof::time(crate::prof::DETOK, || -> Result<String> {
+            let mut n = sess.generated.len();
+            let mut full = self.tok.decode(&sess.generated[..n])?;
+            while n > 0 && full.ends_with('\u{FFFD}') {
+                n -= 1;
+                full = self.tok.decode(&sess.generated[..n])?;
+            }
+            Ok(full)
+        })?;
         if full.len() > sess.text.len() && full.is_char_boundary(sess.text.len()) {
             let delta = &full[sess.text.len()..];
             on_delta(delta);
@@ -574,6 +610,7 @@ impl Engine {
 
             if self.model.eos_ids().contains(&next) {
                 sess.stop_reason = StopReason::EndTurn;
+                self.flush_stream(sess, 1, on_deltas[i].as_mut())?;
                 done[i] = true;
                 continue;
             }
@@ -583,6 +620,7 @@ impl Engine {
             }
             if sess.generated.len() >= sess.max_tokens {
                 sess.stop_reason = StopReason::MaxTokens;
+                self.flush_stream(sess, 0, on_deltas[i].as_mut())?;
                 done[i] = true;
                 continue;
             }
