@@ -22,6 +22,18 @@ use tokio::sync::broadcast;
 /// 上流から受信した生フレーム (エンコード済み) をブラウザへ配信するチャネル
 type Bcast = Arc<broadcast::Sender<Vec<u8>>>;
 
+/// 最新状態のスナップショット (ServerInfo / KvUsage の生フレーム)。
+/// 新規ブラウザ接続時に即時配信する — ページ読み込みが ServerInfo より後でも
+/// 層スタック / KV スロットが構築できるようにする (P14.1)。
+type Snap = Arc<std::sync::RwLock<Option<Vec<u8>>>>;
+
+#[derive(Clone)]
+struct AppState {
+    bcast: Bcast,
+    srv: Snap,
+    kv: Snap,
+}
+
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -43,14 +55,21 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, _) = broadcast::channel::<Vec<u8>>(1024);
     let bcast: Bcast = Arc::new(tx);
+    let app = AppState {
+        bcast: bcast.clone(),
+        srv: Arc::new(std::sync::RwLock::new(None)),
+        kv: Arc::new(std::sync::RwLock::new(None)),
+    };
 
     // 上流接続 (再試行付き) → broadcast へ流す pump
     {
         let bcast = bcast.clone();
         let upstream = upstream.clone();
         let record = record.clone();
+        let srv = app.srv.clone();
+        let kv = app.kv.clone();
         tokio::spawn(async move {
-            pump_upstream(upstream, bcast, record).await;
+            pump_upstream(upstream, bcast, record, srv, kv).await;
         });
     }
 
@@ -71,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/ws", get(view_ws))
-        .with_state(bcast);
+        .with_state(app);
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("denno-view listening on http://{} (upstream: {})", addr, upstream);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -81,7 +100,13 @@ async fn main() -> anyhow::Result<()> {
 
 /// 上流 denno サーバーへ接続してフレームを broadcast に流す。
 /// 切断されたら 2 秒間隔で再接続する (denno の再起動に追従)。
-async fn pump_upstream(url: String, bcast: Bcast, record: Option<String>) {
+async fn pump_upstream(
+    url: String,
+    bcast: Bcast,
+    record: Option<String>,
+    srv_snap: Snap,
+    kv_snap: Snap,
+) {
     let mut record_file = record.and_then(|p| {
         std::fs::OpenOptions::new()
             .create(true)
@@ -108,6 +133,7 @@ async fn pump_upstream(url: String, bcast: Bcast, record: Option<String>) {
                             if let Ok(f) = Frame::decode(&bin) {
                                 match &f {
                                     Frame::ServerInfo { model, quant, slots, context, layers } => {
+                                        *srv_snap.write().unwrap() = Some(bin.clone());
                                         tracing::info!(
                                             "server: {} (quant={}, slots={}, ctx={}, layers={})",
                                             model, quant, slots, context, layers
@@ -124,6 +150,9 @@ async fn pump_upstream(url: String, bcast: Bcast, record: Option<String>) {
                                             "session {} done (reason {}, {} tok)",
                                             session, reason, output_tokens
                                         );
+                                    }
+                                    Frame::KvUsage { .. } => {
+                                        *kv_snap.write().unwrap() = Some(bin.clone());
                                     }
                                     Frame::Gap { lost } => {
                                         gap_pending += lost;
@@ -172,14 +201,28 @@ async fn dashboard() -> Html<&'static str> {
 
 /// GET /ws — ブラウザへのフレーム中継 (複数クライアント可)。
 async fn view_ws(
-    axum::extract::State(bcast): axum::extract::State<Bcast>,
+    axum::extract::State(app): axum::extract::State<AppState>,
     upgrade: WebSocketUpgrade,
 ) -> axum::response::Response {
-    upgrade.on_upgrade(move |socket| view_socket(socket, bcast))
+    upgrade.on_upgrade(move |socket| view_socket(socket, app))
 }
 
-async fn view_socket(mut socket: WebSocket, bcast: Bcast) {
-    let mut rx = bcast.subscribe();
+async fn view_socket(mut socket: WebSocket, app: AppState) {
+    // 新規クライアントにまず最新スナップショット (ServerInfo / KvUsage) を配信 —
+    // ページ読み込みがフレーム列の途中でも層スタックと KV スロットが構築される
+    let srv_bin = app.srv.read().unwrap().clone();
+    if let Some(bin) = srv_bin {
+        if socket.send(Message::Binary(bin)).await.is_err() {
+            return;
+        }
+    }
+    let kv_bin = app.kv.read().unwrap().clone();
+    if let Some(bin) = kv_bin {
+        if socket.send(Message::Binary(bin)).await.is_err() {
+            return;
+        }
+    }
+    let mut rx = app.bcast.subscribe();
     loop {
         tokio::select! {
             r = rx.recv() => {

@@ -19,7 +19,7 @@
   header .muted { color: var(--mut); }
   header .warn { color: var(--warn); }
   main {
-    display: grid; grid-template-columns: 250px minmax(380px, 1fr) 200px;
+    display: grid; grid-template-columns: 250px minmax(380px, 1fr) 250px;
     gap: 10px; padding: 10px; align-items: start;
   }
   h2 { font-size: 12px; color: var(--mut); border-bottom: 1px solid var(--line);
@@ -45,6 +45,18 @@
   .topk .bar-track { flex: 1; background: #22262d; height: 8px; }
   .topk .bar-fill { height: 8px; background: var(--acc); }
   .topk .bar-label { width: 60px; color: var(--mut); }
+
+  /* ---- 右: 層スタック (LayerRun ごとに演算内容を表示) ---- */
+  .layer { border: 1px solid var(--line); border-radius: 6px; padding: 4px 7px; margin-bottom: 4px;
+           background: var(--panel2); transition: box-shadow .2s, border-color .2s; }
+  .layer .lhead { display: flex; justify-content: space-between; align-items: baseline; }
+  .layer .lname { font-size: 12px; }
+  .layer .lms { color: var(--warm); font-size: 10px; }
+  .layer .lops { font-size: 10px; color: var(--acc); white-space: nowrap; overflow: hidden;
+                 text-overflow: ellipsis; min-height: 13px; margin-top: 1px; }
+  .layer .lops .n { color: var(--mut); }
+  .layer.lit { border-color: var(--glow); box-shadow: 0 0 10px #3fb95055; }
+  .layer.pass { border-left: 3px solid var(--glow); }
 
   /* ---- 中央: コールグラフ ---- */
   #center { position: relative; }
@@ -154,7 +166,7 @@
 
   <!-- 右: 層スタック -->
   <section class="panel" id="right">
-    <h2>モデルの層</h2>
+    <h2>モデルの層 — 直近の演算内容</h2>
     <div id="layers"></div>
   </section>
 </main>
@@ -274,7 +286,10 @@ function buildLayers(n) {
   box.innerHTML = "";
   for (let i = 0; i < n; i++) {
     const d = document.createElement("div");
-    d.className = "layer"; d.id = "layer-" + i; d.textContent = "layer " + i;
+    d.className = "layer"; d.id = "layer-" + i;
+    d.innerHTML = `<div class="lhead"><span class="lname">layer ${i}</span>
+                   <span class="lms"></span></div>
+                   <div class="lops"><span class="n">-</span></div>`;
     box.appendChild(d);
   }
 }
@@ -365,9 +380,18 @@ function handleFrame(f) {
       break;
     }
     case "LayerRun": {
-      // 層が点灯 → 中央の対応 op が順に点灯 → 値が次の層へ渡る
+      // 層が点灯 → 演算内容 (op列+実測ms) を層行に表示 → 中央の対応 op が順に点灯
       const L = $("layer-" + f.layer);
       lit(L);
+      if (L) {
+        const total = f.ops.reduce((s, o) => s + o[1], 0);
+        const lms = L.querySelector(".lms");
+        if (lms) lms.textContent = (total / 1e6).toFixed(2) + "ms";
+        const lops = L.querySelector(".lops");
+        if (lops) lops.innerHTML = f.ops.map(([op, ns]) =>
+          `<b>${OP_NAMES[op] ?? op}</b><span class="n">${(ns / 1e6).toFixed(2)}</span>`
+        ).join(" ");
+      }
       if (f.layer > 0) $("layer-" + (f.layer - 1))?.classList.add("pass");
       pulseTo(L, `layer ${f.layer}`);
       let delay = 0;
