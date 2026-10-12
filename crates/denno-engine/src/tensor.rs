@@ -108,24 +108,157 @@ pub fn matvec_bt(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
     c
 }
 
-/// c[i][j] = Σ_d a[i*k+d] * b[j*k+d] を計算するバッチ decode 用 matvec (P6)。
+/// c[i][j] = Σ_d a[i*k+d] * b[j*k+d] を計算するバッチ decode 用 matvec (P6/P9)。
 /// a: [m,k] row-major、b: [n,k] row-major → c: [m,n] row-major。
 ///
-/// 各出力 (i,j) の累積は d について逐次 (`s += a[d] * row[d]`) で、
-/// matvec_bt (m==1) と完全に同一の演算順序 → **どの行も単独 decode と
-/// ビット一致**する (m>1 の sgemm 経路 matmul_bt とは累積順が違い一致しない
-/// ため、バッチ decode ではこのカーネルを使う)。
+/// **exactness 契約**: 各出力要素 (i,j) の d 累積は厳密に逐次
+/// (`s += a[d] * row[d]` と同じ順序で同じ丸め) → どの行も単独 decode
+/// (`matvec_bt`) とビット一致する。m>1 の sgemm 経路 (`matmul_bt`) とは
+/// 累積順が違い一致しないため、バッチ decode ではこのカーネルを使う。
+///
+/// **P9 SIMD 化**: SIMD レーンは i 方向 (バッチ内のセッション) と j 方向
+/// (出力チャネルの ILP 用グループ) にのみ張る。k 方向はレーン化しない
+/// (順序が変わるため) — 各レーンは自分の担当 (i,j) の d 累積を 1 個ずつ
+/// 順番に加算する。FMA は使わない (積と加算の丸めを分離するため
+/// `vmulq_f32`+`vaddq_f32` / `_mm_mul_ps`+`_mm_add_ps` のみ)。
 /// 重み行 b[j] は 1 回の読み込みで m 入力分のドットに再利用されるため、
-/// 線形層の重み帯域が実質 1/m になる (decode の律速は重みストリーミング)。
+/// 線形層の重み帯域が実質 1/m のまま、演算は 4 レーン同時になる。
 pub fn matvec_rows_bt(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec<f32> {
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(b.len(), k * n);
     if m == 1 {
         return matvec_bt(a, b, k, n);
     }
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    {
+        matvec_rows_bt_vec(a, b, k, n, m)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        matvec_rows_bt_scalar(a, b, k, n, m)
+    }
+}
+
+/// SIMD 版本体 (P9)。レーン構成: 4 出力チャネル × 4 バッチセッション。
+/// k 累積はチャネル毎・セッション毎に独立した逐次チェーン (ビット一致の核心)。
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn matvec_rows_bt_vec(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec<f32> {
+    const LANES: usize = 4; // バッチ (i) 方向のレーン数 = SIMD 幅
+    const JG: usize = 4; // 同時に処理する出力チャネル数 (ILP 用、順序には無関係)
+    const JB: usize = 64; // rayon 出力ブロック (既存と同一)
+
+    let mp = m.div_ceil(LANES) * LANES;
+    // アクティベーションを [k][mp] に転置 + ゼロパディング。
+    // m*k は高々数十 KB で L1/L2 に乗るので転置コストは重みストリームに対して無視できる。
+    let mut at = vec![0.0f32; k * mp];
+    for i in 0..m {
+        let src = &a[i * k..][..k];
+        for d in 0..k {
+            at[d * mp + i] = src[d];
+        }
+    }
     let mut c = vec![0.0f32; m * n];
-    // 出力チャネル j を JB ブロックに分割して並列化。
-    // 各タスクは担当ブロックの c[i*n + j0..] にのみ書く (他タスクと非重複)。
+    let cp = SendPtr(c.as_mut_ptr());
+    let n_groups = mp / LANES;
+    b.par_chunks_exact(k * JB)
+        .enumerate()
+        .for_each(|(bi, bw)| {
+            let j0 = bi * JB;
+            for jj in (0..JB).step_by(JG) {
+                let rows: [&[f32]; JG] = std::array::from_fn(|t| {
+                    let j = j0 + jj + t;
+                    &b[j * k..][..k]
+                });
+                for g in 0..n_groups {
+                    let col = &at[g * LANES..];
+                    let s = dot_lanes_j4(col, &rows, k, mp);
+                    for t in 0..JG {
+                        let j = j0 + jj + t;
+                        for l in 0..LANES {
+                            let i = g * LANES + l;
+                            if i < m {
+                                unsafe { cp.write(i * n + j, s[t][l]) };
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    // 端数ブロック (n が JB の倍数でない場合) — 逐次スカラーのまま (行数が少ない)。
+    matvec_rows_bt_rem_scalar(a, b, k, n, m, (n / JB) * JB, &mut c);
+    c
+}
+
+/// JG=4 本の重み行 × 4 バッチレーンのドットを同時に計算する。
+/// 各 (j, lane) の累積は d について厳密に逐次 — ビット一致の不変条件。
+/// レーンロードは転置済みアクティベーション `at[d*stride + g*4 ..]` から連続 4 個。
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline]
+fn dot_lanes_j4(at_col: &[f32], rows: &[&[f32]], k: usize, stride: usize) -> [[f32; 4]; 4] {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for d in 0..k {
+            let av = vld1q_f32(at_col.as_ptr().add(d * stride));
+            for t in 0..4 {
+                let rv = vdupq_n_f32(rows[t][d]);
+                acc[t] = vaddq_f32(acc[t], vmulq_f32(av, rv));
+            }
+        }
+        let mut out = [[0.0f32; 4]; 4];
+        for t in 0..4 {
+            vst1q_f32(out[t].as_mut_ptr(), acc[t]);
+        }
+        out
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let mut acc = [_mm_setzero_ps(); 4];
+        for d in 0..k {
+            let av = _mm_loadu_ps(at_col.as_ptr().add(d * stride));
+            for t in 0..4 {
+                let rv = _mm_set1_ps(rows[t][d]);
+                acc[t] = _mm_add_ps(acc[t], _mm_mul_ps(av, rv));
+            }
+        }
+        let mut out = [[0.0f32; 4]; 4];
+        for t in 0..4 {
+            _mm_storeu_ps(out[t].as_mut_ptr(), acc[t]);
+        }
+        out
+    }
+}
+
+/// 端数出力チャネル (n % JB) の逐次スカラー処理。累積順は本体と同一。
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn matvec_rows_bt_rem_scalar(
+    a: &[f32],
+    b: &[f32],
+    k: usize,
+    n: usize,
+    m: usize,
+    rem: usize,
+    c: &mut [f32],
+) {
+    for j in rem..n {
+        let row = &b[j * k..][..k];
+        for i in 0..m {
+            let ar = &a[i * k..][..k];
+            let mut s = 0.0f32;
+            for d in 0..k {
+                s += ar[d] * row[d];
+            }
+            c[i * n + j] = s;
+        }
+    }
+}
+
+/// SIMD 非対応ターゲット向けの逐次スカラー版 (旧 P6 実装そのまま)。
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn matvec_rows_bt_scalar(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
     const JB: usize = 64;
     let cp = SendPtr(c.as_mut_ptr());
     b.par_chunks_exact(k * JB)
@@ -144,22 +277,32 @@ pub fn matvec_rows_bt(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec
                 }
             }
         });
-    // 端数ブロック (n が JB の倍数でない場合)
-    let rem = (n / JB) * JB;
-    if rem < n {
-        for j in rem..n {
-            let row = &b[j * k..][..k];
-            for i in 0..m {
-                let ar = &a[i * k..][..k];
-                let mut s = 0.0f32;
-                for d in 0..k {
-                    s += ar[d] * row[d];
-                }
-                c[i * n + j] = s;
+    matvec_rows_bt_rem_scalar_generic(a, b, k, n, m, (n / JB) * JB, &mut c);
+    c
+}
+
+/// 上のスカラー版用端数処理 (cfg を分けるため別名)。
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn matvec_rows_bt_rem_scalar_generic(
+    a: &[f32],
+    b: &[f32],
+    k: usize,
+    n: usize,
+    m: usize,
+    rem: usize,
+    c: &mut [f32],
+) {
+    for j in rem..n {
+        let row = &b[j * k..][..k];
+        for i in 0..m {
+            let ar = &a[i * k..][..k];
+            let mut s = 0.0f32;
+            for d in 0..k {
+                s += ar[d] * row[d];
             }
+            c[i * n + j] = s;
         }
     }
-    c
 }
 
 /// アクティベーション1行 (トークン) を per-token 対称 int8 へ動的量子化する。
@@ -660,9 +803,18 @@ mod tests {
 
     #[test]
     fn matvec_rows_bt_matches_matvec_bt_bit_exactly() {
-        // P6: バッチ decode カーネルの各行は単独 decode (matvec_bt) とビット一致
-        for m in [1usize, 2, 3, 5] {
-            for (k, n) in [(8usize, 16usize), (37usize, 200usize), (64usize, 130usize)] {
+        // P6/P9: バッチ decode カーネルの各行は単独 decode (matvec_bt) とビット一致。
+        // m=4/7/8 は SIMD レーンの満/端数グループ、k は 4 の倍数と端数の両方をカバー
+        for m in [1usize, 2, 3, 4, 5, 7, 8] {
+            for (k, n) in [
+                (8usize, 16usize),
+                (37usize, 200usize),
+                (64usize, 130usize),
+                (1usize, 64usize),
+                (4usize, 65usize),
+                (65usize, 64usize),
+                (896usize, 192usize),
+            ] {
                 let a = pseudo_random(m * k, 5 + m as u32);
                 let b = pseudo_random(n * k, 6);
                 let batched = matvec_rows_bt(&a, &b, k, n, m);
@@ -676,6 +828,41 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    #[ignore] // 手動実行用マイクロベンチ: cargo test --release bench_matvec_rows_bt -- --ignored --nocapture
+    fn bench_matvec_rows_bt_m4() {
+        // P9: fp32 バッチカーネル (i方向4レーンSIMD) vs 単独 matvec_bt ×4 の速度比較
+        // 形状は Qwen2.5-0.5B の gate_up (k=896,n=4864) と down (k=4864,n=896)
+        for (k, n, label) in [(896usize, 4864usize, "gate_up"), (4864, 896, "down")] {
+            let a = pseudo_random(4 * k, 21);
+            let b = pseudo_random(n * k, 22);
+            // ウォームアップ
+            let _ = matvec_rows_bt(&a, &b, k, n, 4);
+            let iters = 5;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let _ = matvec_rows_bt(&a, &b, k, n, 4);
+            }
+            let batch = t0.elapsed().as_secs_f64() / iters as f64;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                for i in 0..4 {
+                    let _ = matvec_bt(&a[i * k..][..k], &b, k, n);
+                }
+            }
+            let solo4 = t0.elapsed().as_secs_f64() / iters as f64;
+            let macs = (4 * k * n) as f64;
+            let bm = batch * 1e3;
+            let sm = solo4 * 1e3;
+            let gbs = macs / batch / 1e9;
+            let gss = macs / solo4 / 1e9;
+            let ratio = solo4 / batch;
+            println!(
+                "[{label}] k={k} n={n}: batch4 {bm:.1}ms ({gbs:.1} GMAC/s) / solo4 {sm:.1}ms ({gss:.1} GMAC/s) = {ratio:.2}x"
+            );
         }
     }
 
