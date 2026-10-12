@@ -149,16 +149,14 @@
   .cline.cur { color: #e6edf3; background: #17301f; border-left-color: var(--glow); }
   .cline.cur .ln { color: var(--glow); }
 
-  /* ---- 拡大レンズ: 実行中のコールグラフノードをコード上部に拡大表示 ---- */
-  #lens { border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px;
-          margin: 0 2px 6px; background: var(--panel2);
-          transition: border-color .15s, box-shadow .15s; }
-  #lens.lit { border-color: var(--glow); box-shadow: 0 0 12px #3fb95055; }
-  #lens.litwarm { border-color: var(--warm); box-shadow: 0 0 12px #d2992255; }
-  #lenscap { font-size: 9px; color: var(--acc); letter-spacing: .1em; }
-  #lensname { font-size: 17px; font-weight: 600; color: #e6edf3; line-height: 1.3; }
-  #lenssub { font-size: 11px; color: var(--mut); white-space: nowrap;
-             overflow: hidden; text-overflow: ellipsis; }
+  /* ---- 拡大コーン: model_forward ノード → 実装コードパネルへの接続 ---- */
+  #midrow { position: relative; }
+  #zoomlink { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+  #zoomlink polygon { fill: var(--acc); fill-opacity: .13; stroke: none; }
+  #zoomlink line { stroke: var(--acc); stroke-opacity: .5; stroke-dasharray: 5 4; }
+  #zoomsrc { border-color: var(--acc); background: var(--panel); }
+  #zoomsrc .sub { color: var(--acc); }
+  #zoomsrc .name { color: #e6edf3; }
   .node.focus { border-color: var(--acc); transform: scale(1.03); z-index: 3; }
   .node { transition: box-shadow .2s, border-color .2s, background .2s, transform .15s; }
 </style>
@@ -192,12 +190,12 @@
   <section class="panel" id="center">
     <h2>コールグラフ (モデル駆動プログラム) — 左で実装コードがステップ実行される</h2>
     <div id="midrow">
+      <svg id="zoomlink"><polygon id="zlpoly"/><line id="zl1"/><line id="zl2"/></svg>
       <div id="codewrap">
-        <h2 style="margin-top:0">実装コード (llama.rs 構造)</h2>
-        <div id="lens">
-          <div id="lenscap">⌕ コールグラフ拡大</div>
-          <div id="lensname">—</div>
-          <div id="lenssub"></div>
+        <h2 style="margin-top:0">実装コード — model_forward を拡大</h2>
+        <div class="node scope" id="zoomsrc">
+          <span class="name">model_forward</span>
+          <div class="sub">実装コードに展開 — <span id="zoomlive">-</span></div>
         </div>
         <div id="code"></div>
       </div>
@@ -497,8 +495,8 @@ function pulseTo(el, label) {
   }
 }
 
-// 拡大レンズ: 実行中のグラフノードを実装コードの上に拡大表示し、
-// 実物のノードにもフォーカス枠を出す (コード↔グラフの対応位置の可視化)
+// 拡大コーン: 実装コードパネル(= model_forward の拡大領域)と
+// グラフ上の model_forward ノードを線で結び、対応を可視化する
 let lensCur = null, lastCodeLine = null;
 function lensSet(el) {
   if (!el) return;
@@ -508,17 +506,33 @@ function lensSet(el) {
   el.classList.add("focus");
   lensCur = el;
   const nm = el.querySelector(":scope > .name");
-  const sub = el.querySelector(":scope > .sub");
   const bd = el.querySelector(":scope > .badge");
-  $("lensname").textContent = nm ? nm.textContent : (el.id || "");
-  const extra = lastCodeLine ? `  ↔ コード ${lastCodeLine} 行目` : "";
-  $("lenssub").textContent =
-    (sub ? sub.textContent + "  " : "") + (bd && bd.textContent ? bd.textContent + "  " : "") + extra;
-  const lens = $("lens");
-  const warm = el.classList.contains("litwarm");
-  lens.classList.toggle("lit", !warm);
-  lens.classList.toggle("litwarm", warm);
+  const extra = lastCodeLine ? ` ↔ コード ${lastCodeLine} 行目` : "";
+  $("zoomlive").textContent =
+    `実行中: ${nm ? nm.textContent : el.id}` +
+    (bd && bd.textContent ? ` ${bd.textContent}` : "") + extra;
 }
+function drawCone() {
+  const mid = $("midrow"), s = $("zoomsrc"), t = $("n-forward");
+  if (!mid || !s || !t) return;
+  const mr = mid.getBoundingClientRect();
+  const sr = s.getBoundingClientRect(), tr = t.getBoundingClientRect();
+  const svg = $("zoomlink");
+  svg.setAttribute("width", mr.width); svg.setAttribute("height", mr.height);
+  const x1 = sr.right - mr.left + 2, y1 = sr.top + sr.height / 2 - mr.top;
+  const x2 = tr.left - mr.left - 2;
+  const ya = tr.top + 6 - mr.top, yb = tr.bottom - 6 - mr.top, sp = 10;
+  $("zlpoly").setAttribute("points",
+    `${x1},${y1 - sp} ${x1},${y1 + sp} ${x2},${yb} ${x2},${ya}`);
+  const L1 = $("zl1"), L2 = $("zl2");
+  L1.setAttribute("x1", x1); L1.setAttribute("y1", y1 - sp);
+  L1.setAttribute("x2", x2); L1.setAttribute("y2", ya);
+  L2.setAttribute("x1", x1); L2.setAttribute("y1", y1 + sp);
+  L2.setAttribute("x2", x2); L2.setAttribute("y2", yb);
+}
+setInterval(drawCone, 400);
+addEventListener("resize", drawCone);
+addEventListener("scroll", drawCone, true);
 
 // ---------- 層スタック / KV スロット構築 ----------
 function buildLayers(n) {
