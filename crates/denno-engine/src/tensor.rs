@@ -89,6 +89,41 @@ pub fn sgemm_acc(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
         });
 }
 
+/// c = a @ b — decode attention の probs@V 用 (P12)。
+/// a: [m,k] row-major、b: 行ストライド rs_b の [k,n] (各行の n 要素は連続)。
+/// 行統合 (m=group を 1 回の sgemm で実行) + v のストライド直接参照により、
+/// 従来の per-g `matmul(m=1)` × group 回 + vh 連続化コピーを 1 回に置き換える。
+/// ビット一致は `decode_attention_probs_v_bitexact` テストで担保。
+///
+/// 注意 (P12 検証メモ): matrixmultiply はストライド/行数でカーネルを選ぶため
+/// 数値が変わる。scores 側 (b を [n,k] 転置レイアウト rs=1/cs=k で渡す経路) は
+/// 行統合・ストライド参照のどちらもビット不一致になるため従来経路のまま
+/// (sgemm_acc(m=1) + 連続化コピー)。row-major b (cs=1) の本関数は行統合・
+/// ストライドともビット一致を実測で確認済み。
+pub fn matmul_rows_bstrided(
+    a: &[f32],
+    b: &[f32],
+    rs_b: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    if m == 0 || n == 0 || k == 0 {
+        return c;
+    }
+    unsafe {
+        matrixmultiply::sgemm(
+            m, k, n, 1.0,
+            a.as_ptr(), k as isize, 1isize,
+            b.as_ptr(), rs_b as isize, 1isize,
+            0.0,
+            c.as_mut_ptr(), n as isize, 1isize,
+        );
+    }
+    c
+}
+
 /// c[j] = dot(a, b[j*k..][..k]) を出力分割で並列に計算 (decode 用 matvec)。
 /// m=1 の行列積は A 側で分割できないため、出力列 (= B の行) で並列化する。
 /// b: [n,k] row-major (nn.Linear 形状)。
@@ -1175,5 +1210,75 @@ mod tests {
         // 巨大値のクランプ
         let (qc, _) = quantize_row_i8(&[1e30, -1e30, 0.0]);
         assert_eq!(qc, [127, -127, 0]);
+    }
+
+    /// 決定論的 LCG 乱数 (シード固定、外部クレート無し)。
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_f32(&mut self) -> f32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 40) & 0xFFFFFF) as f32 / 8388608.0 - 1.0 // [-1, 1)
+        }
+        fn fill(&mut self, v: &mut [f32]) {
+            for x in v.iter_mut() {
+                *x = self.next_f32();
+            }
+        }
+    }
+
+    /// P12: decode attention の scores 計算に関する検証メモ:
+    /// 行統合 (rows=m) もストライド参照 (rs_b=kv_dim) も、従来の
+    /// `sgemm_acc(m=1, 連続 b)` とビット不一致になることを実測で確認した
+    /// (matrixmultiply はストライド/行数でカーネルを選ぶため)。
+    /// そのため scores は従来経路 (per-g sgemm_acc(m=1) + kh 連続化コピー) のまま。
+    /// probs@V 側のみ行統合+ストライド参照がビット一致する (下のテスト)。
+
+    /// P12: probs@V の行統合 matmul (ストライド付き v) が、従来の per-row
+    /// `matmul(m=1)` (連続 v) とビット一致すること。
+    #[test]
+    fn decode_attention_probs_v_bitexact() {
+        let cases = [
+            (128usize, 1usize, 7usize, 256usize), // dh, t, group, kv_dim
+            (128, 270, 7, 256),
+            (64, 41, 4, 128),
+        ];
+        for &(dh, t, m, kv_dim) in &cases {
+            let mut rng = Lcg(777);
+            let mut probs = vec![0.0f32; m * t];
+            rng.fill(&mut probs);
+            // probs は softmax 後なので正規化しておく (値の性質を寄せる)
+            for i in 0..m {
+                let s: f32 = probs[i * t..][..t].iter().sum();
+                for p in probs[i * t..][..t].iter_mut() {
+                    *p /= s;
+                }
+            }
+            let mut v_contig = vec![0.0f32; t * dh];
+            rng.fill(&mut v_contig);
+            let mut v_strided = vec![0.0f32; (t - 1) * kv_dim + dh];
+            for j in 0..t {
+                v_strided[j * kv_dim..][..dh].copy_from_slice(&v_contig[j * dh..][..dh]);
+            }
+
+            // 従来経路: per-row matmul(m=1, 連続 v)
+            let mut old = vec![0.0f32; m * dh];
+            for i in 0..m {
+                let out = matmul(&probs[i * t..][..t], &v_contig, 1, t, dh);
+                old[i * dh..][..dh].copy_from_slice(&out);
+            }
+            // 新経路: 行統合 + ストライド参照
+            let new = matmul_rows_bstrided(&probs, &v_strided, kv_dim, m, t, dh);
+
+            for i in 0..m * dh {
+                assert_eq!(
+                    old[i].to_bits(),
+                    new[i].to_bits(),
+                    "bit mismatch at {i} (dh={dh}, t={t}, m={m}, kv_dim={kv_dim})"
+                );
+            }
+        }
     }
 }

@@ -171,6 +171,72 @@ fn lin(a: &[f32], w: &Linear, m: usize) -> Vec<f32> {
     w.apply_bt(a, m)
 }
 
+// P12: decode attention のスクラッチバッファ (rayon ワーカースレッドごとに再利用)。
+// t×dh のバッファは malloc の mmap 閾値 (~128KB) を超えるため、毎ステップ
+// 毎レイヤーの確保/解放が mmap/munmap システムコールになる — スレッドローカル
+// で再利用して排除する。内容は毎回全上書きするため数値・決定論には影響しない。
+thread_local! {
+    static KH_SCRATCH: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+    static SCORES_SCRATCH: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// decode 1 ステップの attention 本体 (1 セッション × 1 kv ヘッド) → [group*dh]。
+/// `forward` (n==1) と `forward_batch` の双方からこの関数を通るため、
+/// 単独 decode とバッチ decode はビット一致する。
+///
+/// P12 の変更点 (数値は従来経路とビット一致):
+/// - probs@V: 従来の per-g `matmul(m=1)` × group 回 + vh 連続化コピー →
+///   1 回の `matmul_rows_bstrided(m=group, v ストライド直接参照)`
+///   (`decode_attention_probs_v_bitexact` テストでビット一致を担保)
+/// - scores: 従来通り per-g `sgemm_acc(m=1, kh 連続化コピー)`
+///   (行統合・ストライド参照は matrixmultiply がカーネルを選び替えて
+///   ビット不一致になるため使わない — tensor.rs の検証メモ参照)
+/// - qg のコピーを廃止 (q 行の当該区間は連続なのでそのまま渡す)
+/// - kh/scores をスレッドローカルスクラッチで再利用 (mmap チャーン除去)
+///
+/// 数値的な注意: scores/probs/v の各要素の演算列は従来と完全に同一
+/// (sgemm_acc(m=1) → softmax → matmul の同一形状呼び出し)。セッション/
+/// kv ヘッド間に数値的な相互作用はない → 単独/バッチ・変更前/変更後でビット一致。
+#[allow(clippy::too_many_arguments)]
+fn attention_decode_kvhead(
+    q_row: &[f32],  // セッション 1 行分 [heads*dh]
+    kc: &[f32],     // レイヤ全体 K バッファ (行ストライド kv_dim)
+    vc: &[f32],     // レイヤ全体 V バッファ (行ストライド kv_dim)
+    kvh: usize,
+    group: usize,
+    dh: usize,
+    kv_dim: usize,
+    t_total: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let kh_off = kvh * dh;
+    KH_SCRATCH.with(|kh_cell| {
+        SCORES_SCRATCH.with(|sc_cell| {
+            let mut kh = kh_cell.borrow_mut();
+            kh.clear();
+            kh.resize(t_total * dh, 0.0);
+            for j in 0..t_total {
+                kh[j * dh..][..dh].copy_from_slice(&kc[j * kv_dim + kh_off..][..dh]);
+            }
+            let mut scores = sc_cell.borrow_mut();
+            scores.clear();
+            scores.resize(group * t_total, 0.0);
+            for g in 0..group {
+                let qg = &q_row[(kvh * group + g) * dh..][..dh];
+                let row = &mut scores[g * t_total..][..t_total];
+                // scores[j] = qg · kh[j] * scale (従来の n==1 sgemm 経路と同一)。
+                // causal mask: decode では未来位置なし (マスク範囲が空) → softmax のみ
+                crate::tensor::sgemm_acc(qg, &kh, row, 1, dh, t_total, scale);
+                crate::tensor::softmax(row);
+            }
+            // att_head[g] = Σ_j probs[g,j] * vh[j] — 行統合 + v ストライド直接参照
+            crate::tensor::matmul_rows_bstrided(
+                &scores, &vc[kh_off..], kv_dim, group, t_total, dh,
+            )
+        })
+    })
+}
+
 impl Model for LlamaQwen2 {
     fn context(&self) -> usize {
         self.ctx
@@ -239,6 +305,16 @@ impl Model for LlamaQwen2 {
                 let (kc, vc) = cache.kv_bufs(li);
                 let t_total = pos0 + n;
                 let scale = 1.0 / (dh as f32).sqrt();
+                if n == 1 {
+                    // decode: P12 統一経路 (forward_batch と同一関数
+                    // `attention_decode_kvhead` → 単独/バッチ decode でビット一致)
+                    for kvh in 0..kv_heads {
+                        let a =
+                            attention_decode_kvhead(&q, kc, vc, kvh, group, dh, kv_dim, t_total, scale);
+                        att[kvh * group * dh..][..group * dh].copy_from_slice(&a);
+                    }
+                    return;
+                }
                 // GQA: 同じ kv ヘッドを共有する group 個の q ヘッドをまとめて処理する。
                 // scores[i,j] = q[i,gh] · k[j,kh] は sgemm で一括計算し(行列積)、
                 // causal mask → softmax → att = probs @ v も sgemm で行う。
@@ -404,9 +480,10 @@ impl Model for LlamaQwen2 {
 
             // attention: セッション×KVヘッドを rayon で並列実行 (P10)。
             // 各タスクは (セッション i, kv ヘッド kvh) を担当し、att への書き込み
-            // 先は非重複スライス。タスク内の演算列は forward() の decode (n==1)
-            // 経路と完全に同一 (sgemm_acc → softmax → matmul の同一形状呼び出し)
-            // で、セッション/KVヘッド間に数値的な相互作用はない → ビット一致。
+            // 先は非重複スライス。タスク内は `attention_decode_kvhead` に統一され
+            // forward() の decode (n==1) 経路と同一関数・同一演算列 → ビット一致。
+            // (P12: probs@V は行統合+ストライド直接参照、スクラッチ再利用 —
+            //  数値は従来の per-(kvh,g) m=1 経路とビット一致、テスト担保)
             let mut att = vec![0.0f32; b * heads * dh];
             crate::prof::time(crate::prof::ATTN, || {
                 let scale = 1.0 / (dh as f32).sqrt();
@@ -418,32 +495,18 @@ impl Model for LlamaQwen2 {
                     .map(|(i, kvh)| {
                         let t_total = cache_refs[i].len() + 1; // pos + 1
                         let (kc, vc) = cache_refs[i].kv_bufs_ref(li);
-                        let mut kh = vec![0.0f32; t_total * dh];
-                        let mut vh = vec![0.0f32; t_total * dh];
-                        for j in 0..t_total {
-                            kh[j * dh..][..dh]
-                                .copy_from_slice(&kc[j * kv_dim + kvh * dh..][..dh]);
-                            vh[j * dh..][..dh]
-                                .copy_from_slice(&vc[j * kv_dim + kvh * dh..][..dh]);
-                        }
-                        let mut att_h = vec![0.0f32; group * dh];
-                        for g in 0..group {
-                            let qh = kvh * group + g;
-                            let qg: Vec<f32> =
-                                q[i * heads * dh + qh * dh..][..dh].to_vec();
-                            // scores[j] = qg · kh[j] * scale (n==1 の sgemm 経路と同一)
-                            let mut scores = vec![0.0f32; t_total];
-                            crate::tensor::sgemm_acc(
-                                &qg, &kh, &mut scores, 1, dh, t_total, scale,
-                            );
-                            // causal mask: decode では未来位置なし (pos+1..pos+1 は空)
-                            crate::tensor::softmax(&mut scores);
-                            // att_head = Σ_j probs[j] * vh[j] (matmul (n==1) と同一)
-                            let out =
-                                crate::tensor::matmul(&scores, &vh, 1, t_total, dh);
-                            att_h[g * dh..][..dh].copy_from_slice(&out);
-                        }
-                        (i, kvh, att_h)
+                        let a = attention_decode_kvhead(
+                            &q[i * heads * dh..][..heads * dh],
+                            kc,
+                            vc,
+                            kvh,
+                            group,
+                            dh,
+                            kv_dim,
+                            t_total,
+                            scale,
+                        );
+                        (i, kvh, a)
                     })
                     .collect();
                 for (i, kvh, a) in parts {
