@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+denno-telemetry = { path = "../denno-telemetry" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
@@ -21,3 +22,7 @@ rand = "0.8"
 # テスト用ユーティリティ (ダミーモデル/ダミートークナイザ) を公開する。
 # denno-server の統合テストがモデルDLなしで Engine を構築できるようにするためのもの。
 test-utils = []
+
+[dev-dependencies]
+# 統合テスト (tests/) から test-utils (ダミーモデル) を使うための自己参照。
+denno-engine = { path = ".", features = ["test-utils"] }

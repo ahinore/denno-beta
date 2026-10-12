@@ -19,3 +19,14 @@ pub mod testutil;
 
 pub use engine::{ChatMessage, ChatOutput, ChatSession, Engine, GenParams, PrefixHit, StopReason};
 pub use quant::{Linear, Quant8Linear, QuantMode};
+
+/// prof フックからテレメトリハブへの薄い委譲 (P13)。
+/// prof.rs を denno-telemetry の直接依存から切り離すための関数。
+pub fn telemetry_on() -> bool {
+    denno_telemetry::enabled()
+}
+
+/// op の所要時間をテレメトリの OpSummary 累積に加算する。
+pub fn telemetry_add_op(op: usize, ns: u64) {
+    denno_telemetry::add_op(op, ns);
+}

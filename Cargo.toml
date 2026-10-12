@@ -4,6 +4,8 @@ members = [
     "crates/denno-engine",
     "crates/denno-server",
     "crates/denno-cli",
+    "crates/denno-telemetry",
+    "crates/denno-view",
 ]
 
 [workspace.package]

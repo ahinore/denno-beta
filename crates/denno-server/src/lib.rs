@@ -2,6 +2,7 @@
 //! POST /v1/messages (非ストリーミング + SSE)、GET /v1/models、GET /health。
 
 use anyhow::Result;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -9,9 +10,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use denno_engine::{ChatMessage, ChatOutput, Engine, GenParams, QuantMode};
+use denno_telemetry::{self as telem, Frame};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::OnceLock;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
@@ -169,6 +172,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/messages", post(messages))
+        // P13: 推論テレメトリの WebSocket ストリーム (denno-trace)。
+        // Anthropic 互換 API とは別系統で、互換性には影響しない。
+        .route("/v1/telemetry/ws", get(telemetry_ws))
         .layer(axum::middleware::from_fn(log_requests))
         .with_state(state)
 }
@@ -212,6 +218,12 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
         scheduler: Scheduler::spawn(engine, cfg.max_queue.max(1)),
         model_name,
     });
+
+    // P13: テレメトリが有効ならハブ → broadcast への転送タスクを起動する。
+    // (OFF のままならこのタスクは存在せず、捕捉コストもゼロ)
+    if telem::enabled() {
+        start_telemetry_relay();
+    }
 
     let app = router(state);
     let addr = format!("{}:{}", cfg.host, cfg.port);
@@ -386,4 +398,103 @@ pub(crate) fn to_event(v: &serde_json::Value) -> Event {
     // (例: event: message_start / data: {...})
     let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("message");
     Event::default().event(ty).data(v.to_string())
+}
+
+// ---------- P13: 推論テレメトリ WebSocket (denno-trace) ----------
+
+/// ハブ → broadcast の転送経路 (1 プロセス 1 個)。
+/// ハブの単一消費者は下の relay スレッドで、複数の WS クライアントには
+/// broadcast で配信する (クライアントが追いつかない場合は Lagged → Gap フレーム)。
+static TEL_BCAST: OnceLock<tokio::sync::broadcast::Sender<Frame>> = OnceLock::new();
+
+/// ハブの単一消費者スレッドを起動する (telemetry 有効時のみ run() から呼ぶ)。
+fn start_telemetry_relay() {
+    let (tx, _) = tokio::sync::broadcast::channel::<Frame>(256);
+    if TEL_BCAST.set(tx).is_err() {
+        return; // 既に起動済み
+    }
+    let btx = TEL_BCAST.get().unwrap().clone();
+    std::thread::Builder::new()
+        .name("denno-telemetry".into())
+        .spawn(move || {
+            let mut last_dropped = telem::dropped();
+            loop {
+                // ドロップが増えていたら Gap を先に流す (黙って飛ばさない)
+                let now_dropped = telem::dropped();
+                if now_dropped > last_dropped {
+                    let lost = (now_dropped - last_dropped) as u32;
+                    last_dropped = now_dropped;
+                    let _ = btx.send(Frame::Gap { lost });
+                }
+                match telem::try_recv_timeout(std::time::Duration::from_millis(50)) {
+                    Some(f) => {
+                        let _ = btx.send(f);
+                    }
+                    None => continue,
+                }
+            }
+        })
+        .expect("telemetry relay thread の起動に失敗");
+}
+
+/// GET /v1/telemetry/ws — 推論テレメトリのバイナリフレームストリーム。
+async fn telemetry_ws(
+    State(state): State<Arc<AppState>>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    if !telem::enabled() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "telemetry disabled (set DENNO_TELEMETRY=1)",
+        )
+            .into_response();
+    }
+    upgrade.on_upgrade(move |socket| telemetry_socket(socket, state))
+}
+
+async fn telemetry_socket(mut socket: WebSocket, state: Arc<AppState>) {
+    // 最初に ServerInfo (モデル/量子化/スロット数/コンテキスト長)
+    let (model, quant, slots, context) = {
+        let g = state.engine.lock().unwrap();
+        (
+            g.name.clone(),
+            g.quant.label().to_string(),
+            g.caches.len() as u32,
+            g.context() as u32,
+        )
+    };
+    let info = Frame::ServerInfo { model, quant, slots, context };
+    if socket.send(Message::Binary(info.encode())).await.is_err() {
+        return;
+    }
+    let Some(btx) = TEL_BCAST.get() else { return };
+    let mut rx = btx.subscribe();
+    loop {
+        tokio::select! {
+            r = rx.recv() => {
+                match r {
+                    Ok(f) => {
+                        if socket.send(Message::Binary(f.encode())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // クライアントが追いつかなかった分を Gap で明示
+                        let gap = Frame::Gap { lost: n as u32 };
+                        if socket.send(Message::Binary(gap.encode())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            // クライアント→サーバーのコマンド (focus プロトコルは P15)。今は無視。
+            m = socket.recv() => {
+                match m {
+                    Some(Ok(Message::Binary(_))) | Some(Ok(Message::Text(_))) | Some(Ok(_)) => {}
+                    _ => break,
+                }
+            }
+        }
+    }
 }

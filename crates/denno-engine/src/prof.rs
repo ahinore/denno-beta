@@ -49,14 +49,24 @@ pub fn enabled() -> bool {
 }
 
 /// `f` の実行時間を op に計上して結果を返す。
+/// (P13: テレメトリ有効時は op 時間を telemetry ハブにも累積する。
+/// どちらも計測のみで数値経路には触れないため exactness は不変)
 pub fn time<T>(op: usize, f: impl FnOnce() -> T) -> T {
-    if !enabled() {
+    let prof_on = enabled();
+    let tel_on = crate::telemetry_on();
+    if !prof_on && !tel_on {
         return f();
     }
     let t = Instant::now();
     let r = f();
-    NS[op].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    CALLS[op].fetch_add(1, Ordering::Relaxed);
+    let ns = t.elapsed().as_nanos() as u64;
+    if prof_on {
+        NS[op].fetch_add(ns, Ordering::Relaxed);
+        CALLS[op].fetch_add(1, Ordering::Relaxed);
+    }
+    if tel_on {
+        crate::telemetry_add_op(op, ns);
+    }
     r
 }
 

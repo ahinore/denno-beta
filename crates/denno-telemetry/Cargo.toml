@@ -1,0 +1,8 @@
+[package]
+name = "denno-telemetry"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# 意図的に依存無し (std のみ)。エンジン・サーバー・ビューア (将来 wasm 含む)
+# の全てが同じ形式を扱うため、依存を増やさず自己完結させる。

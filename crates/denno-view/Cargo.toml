@@ -1,0 +1,15 @@
+[package]
+name = "denno-view"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+denno-telemetry = { path = "../denno-telemetry" }
+anyhow.workspace = true
+tokio.workspace = true
+axum = { version = "0.7", features = ["ws"] }
+# 上流 (denno サーバー) への WS クライアント接続
+tokio-tungstenite = "0.23"
+futures-util = "0.3"
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

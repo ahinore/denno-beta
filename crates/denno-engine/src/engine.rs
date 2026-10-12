@@ -8,6 +8,8 @@ use crate::kv_cache::KvCache;
 use crate::model::{load_model, Model};
 use crate::prefix_cache::PrefixCache;
 use crate::quant::QuantMode;
+use denno_telemetry as telem;
+use denno_telemetry::Frame;
 use crate::sampler::Sampler;
 use crate::tokenizer::DennoTokenizer;
 
@@ -102,6 +104,8 @@ pub struct Engine {
     prefix_cache: PrefixCache,
     /// 直前のリクエストでの prefix cache ヒット状況
     last_prefix_hit: PrefixHit,
+    /// 重みの量子化モード (テレメトリの ServerInfo 用に保持。数値経路には不変)
+    pub quant: QuantMode,
 }
 
 /// KV キャッシュスロット数の既定値 (環境変数 `DENNO_BATCH_SLOTS` で変更可)。
@@ -140,6 +144,8 @@ pub struct ChatSession {
     /// 占有中の KV キャッシュスロット (None = 未 install / release 済み)
     slot: Option<usize>,
     input_tokens: usize,
+    /// テレメトリ用のセッション ID (採番順。数値経路には無関係)
+    pub id: u32,
 }
 
 impl ChatSession {
@@ -225,11 +231,28 @@ impl Engine {
             default_seed,
             prefix_cache: PrefixCache::new(max_tokens),
             last_prefix_hit: PrefixHit::None,
+            quant,
         })
     }
 
     pub fn context(&self) -> usize {
         self.model.context()
+    }
+
+    /// テレメトリ: KV スロット使用状況フレームを作る (enabled 時のみ呼ばれる)。
+    fn kv_usage_frame(&self) -> Frame {
+        Frame::KvUsage {
+            busy: self.slot_busy.clone(),
+            t_lens: self.caches.iter().map(|c| c.len() as u32).collect(),
+        }
+    }
+
+    /// テレメトリ: prof フックで累積した op 時間を OpSummary 1 フレームにして流す。
+    fn flush_ops_frame(&self) {
+        let ops = telem::take_ops();
+        if !ops.is_empty() {
+            telem::emit(Frame::OpSummary { ops });
+        }
     }
 
     /// テスト用 (test-utils feature): モデルファイル無しで Engine を直接構築する。
@@ -257,6 +280,7 @@ impl Engine {
             default_seed,
             prefix_cache: PrefixCache::new(max_tokens),
             last_prefix_hit: PrefixHit::None,
+            quant: QuantMode::Fp32,
         }
     }
 
@@ -319,6 +343,13 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("no free KV cache slot ({} slots)", self.caches.len()))?;
         self.slot_busy[slot] = true;
         sess.slot = Some(slot);
+        if telem::enabled() {
+            telem::emit(Frame::SessionAdmit {
+                session: sess.id,
+                slot: slot as u32,
+                prompt_tokens: sess.prompt_ids.len() as u32,
+            });
+        }
 
         // --- prefix cache 経路選択 (旧 chat() と同一) ---
         let lcp;
@@ -376,6 +407,18 @@ impl Engine {
     /// install_session の live 再利用経路 (truncate のみ、コピー無し) で
     /// 使える — 旧単一キャッシュ構成の live 再利用を再現する。
     pub fn release_session(&mut self, sess: &mut ChatSession) {
+        if telem::enabled() {
+            let reason = match sess.stop_reason {
+                StopReason::EndTurn => telem::done_reason::END_TURN,
+                StopReason::MaxTokens => telem::done_reason::MAX_TOKENS,
+                StopReason::StopSequence => telem::done_reason::STOP_SEQUENCE,
+            };
+            telem::emit(Frame::SessionDone {
+                session: sess.id,
+                reason,
+                output_tokens: sess.generated.len() as u32,
+            });
+        }
         let Some(slot) = sess.slot.take() else { return };
         self.slot_busy[slot] = false;
         if !self.cached_prompts[slot].is_empty() && !self.caches[slot].is_empty() {
@@ -443,6 +486,7 @@ impl Engine {
             stop_reason: StopReason::MaxTokens,
             stop_sequence: None,
             slot: None,
+            id: telem::next_session_id(),
         })
     }
 
@@ -460,9 +504,19 @@ impl Engine {
             // 分割すると GEMM の蓄積順が変わり exactness が壊れ得るため
             // 単一呼び出しの形状を維持する。
             let slot = sess.slot.expect("install_session 済みのセッション");
+            let t0 = telem::enabled().then(std::time::Instant::now);
             let logits =
                 self.model
                     .forward(&sess.prompt_ids[sess.lcp..], &mut self.caches[slot])?;
+            if let Some(t0) = t0 {
+                telem::emit(Frame::Prefill {
+                    session: sess.id,
+                    prompt_tokens: (sess.prompt_ids.len() - sess.lcp) as u32,
+                    ns: t0.elapsed().as_nanos() as u64,
+                });
+                telem::emit(self.kv_usage_frame());
+                self.flush_ops_frame();
+            }
             self.cached_prompts[slot] = sess.prompt_ids.clone();
             sess.logits = logits;
             sess.prefill_done = true;
@@ -479,6 +533,20 @@ impl Engine {
         let next =
             crate::prof::time(crate::prof::SAMPLER, || sess.sampler.sample(&sess.logits)) as u32;
         sess.generated.push(next);
+        if telem::enabled() {
+            telem::emit(Frame::Token { session: sess.id, token: next, pos: sess.generated.len() as u32 });
+            let tk = telem::topk_softmax(&sess.logits, 8);
+            telem::emit(Frame::TopK {
+                session: sess.id,
+                chosen: next,
+                entropy_f16: telem::f32_to_f16_bits(tk.entropy),
+                entries: tk
+                    .entries
+                    .iter()
+                    .map(|&(id, p)| (id, telem::f32_to_f16_bits(p)))
+                    .collect(),
+            });
+        }
 
         if self.model.eos_ids().contains(&next) {
             sess.stop_reason = StopReason::EndTurn;
@@ -493,6 +561,10 @@ impl Engine {
         if sess.generated.len() < sess.max_tokens {
             let slot = sess.slot.expect("install_session 済みのセッション");
             let logits = self.model.forward(&[next], &mut self.caches[slot])?;
+            if telem::enabled() {
+                telem::emit(self.kv_usage_frame());
+                self.flush_ops_frame();
+            }
             sess.logits = logits;
             return Ok(false);
         }
@@ -607,6 +679,24 @@ impl Engine {
                 sess.sampler.sample(&sess.logits)
             }) as u32;
             sess.generated.push(next);
+            if telem::enabled() {
+                telem::emit(Frame::Token {
+                    session: sess.id,
+                    token: next,
+                    pos: sess.generated.len() as u32,
+                });
+                let tk = telem::topk_softmax(&sess.logits, 8);
+                telem::emit(Frame::TopK {
+                    session: sess.id,
+                    chosen: next,
+                    entropy_f16: telem::f32_to_f16_bits(tk.entropy),
+                    entries: tk
+                        .entries
+                        .iter()
+                        .map(|&(id, p)| (id, telem::f32_to_f16_bits(p)))
+                        .collect(),
+                });
+            }
 
             if self.model.eos_ids().contains(&next) {
                 sess.stop_reason = StopReason::EndTurn;
@@ -638,14 +728,27 @@ impl Engine {
             let mut order: Vec<usize> = (0..need_fwd.len()).collect();
             order.sort_by_key(|&k| slots[k]);
             let sorted_toks: Vec<u32> = order.iter().map(|&k| toks[k]).collect();
+            let t0 = telem::enabled().then(std::time::Instant::now);
             let model = &mut *self.model;
             let caches = &mut *self.caches;
             let mut cache_refs = pick_caches(caches, &slots, &order);
             let outs = model.forward_batch(&sorted_toks, &mut cache_refs)?;
+            if let Some(t0) = t0 {
+                telem::emit(Frame::Step {
+                    width: need_fwd.len() as u32,
+                    ns: t0.elapsed().as_nanos() as u64,
+                });
+            }
             for (row, &k) in outs.into_iter().zip(&order) {
                 let i = need_fwd[k];
                 batch[i].logits = row;
             }
+        }
+        // 空バッチ (アイドルポーリング) では発出しない — アイドル中の
+        // KvUsage フレーム洪水を防ぐ (P13 e2e で発見)
+        if telem::enabled() && !batch.is_empty() {
+            telem::emit(self.kv_usage_frame());
+            self.flush_ops_frame();
         }
         Ok(done)
     }
