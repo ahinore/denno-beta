@@ -132,6 +132,7 @@
   .ghead { font-size: 10px; color: var(--acc); margin-bottom: 4px; }
 
   /* ---- 中央左: 実装コード (デバッガ風ステップ実行) ---- */
+  #centercol { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
   #midrow { display: flex; gap: 10px; align-items: flex-start; }
   #graphwrap { flex: 1 1 0; min-width: 0; position: relative; }
   #codewrap { flex: 1 1 0; min-width: 0; border: 1px solid var(--line); border-radius: 8px;
@@ -186,7 +187,8 @@
     <div id="ops" class="muted" style="font-size:11px">-</div>
   </section>
 
-  <!-- 中央: 実装コード + コールグラフ -->
+  <!-- 中央: 実装コード + コールグラフ / トークン+チャット の2ペイン -->
+  <div id="centercol">
   <section class="panel" id="center">
     <h2>コールグラフ (モデル駆動プログラム) — 左で実装コードがステップ実行される</h2>
     <div id="midrow">
@@ -234,9 +236,12 @@
         <div id="oplabel"></div>
       </div>
     </div>
-    <h2 style="margin-top:8px">入力トークン <span id="tokstat" class="muted" style="font-size:10px"></span></h2>
+  </section>
+
+  <section class="panel" id="tokenpane">
+    <h2>入力トークン <span id="tokstat" class="muted" style="font-size:10px"></span></h2>
     <div id="intokens"></div>
-    <h2 style="margin-top:8px">出力トークン</h2>
+    <h2>出力トークン</h2>
     <div id="tokens"></div>
     <h2 style="margin-top:8px">チャット <span class="muted" style="font-size:10px">(送信するとアニメーションが流れます)</span></h2>
     <div id="chatlog"></div>
@@ -248,6 +253,7 @@
       <button id="chatclear" title="履歴クリア">✕</button>
     </div>
   </section>
+  </div>
 
   <!-- 右: モデル構造 (層スタック) -->
   <section class="panel" id="right">
