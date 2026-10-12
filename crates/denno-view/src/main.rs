@@ -107,10 +107,10 @@ async fn pump_upstream(url: String, bcast: Bcast, record: Option<String>) {
                             // ServerInfo / SessionAdmit / SessionDone / Gap はログにも出す
                             if let Ok(f) = Frame::decode(&bin) {
                                 match &f {
-                                    Frame::ServerInfo { model, quant, slots, context } => {
+                                    Frame::ServerInfo { model, quant, slots, context, layers } => {
                                         tracing::info!(
-                                            "server: {} (quant={}, slots={}, ctx={})",
-                                            model, quant, slots, context
+                                            "server: {} (quant={}, slots={}, ctx={}, layers={})",
+                                            model, quant, slots, context, layers
                                         );
                                     }
                                     Frame::SessionAdmit { session, slot, prompt_tokens } => {

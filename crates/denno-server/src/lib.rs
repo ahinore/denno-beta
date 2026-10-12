@@ -453,17 +453,18 @@ async fn telemetry_ws(
 }
 
 async fn telemetry_socket(mut socket: WebSocket, state: Arc<AppState>) {
-    // 最初に ServerInfo (モデル/量子化/スロット数/コンテキスト長)
-    let (model, quant, slots, context) = {
+    // 最初に ServerInfo (モデル/量子化/スロット数/コンテキスト長/層数)
+    let (model, quant, slots, context, layers) = {
         let g = state.engine.lock().unwrap();
         (
             g.name.clone(),
             g.quant.label().to_string(),
             g.caches.len() as u32,
             g.context() as u32,
+            g.caches.first().map(|c| c.n_layers()).unwrap_or(0) as u32,
         )
     };
-    let info = Frame::ServerInfo { model, quant, slots, context };
+    let info = Frame::ServerInfo { model, quant, slots, context, layers };
     if socket.send(Message::Binary(info.encode())).await.is_err() {
         return;
     }

@@ -70,6 +70,30 @@ pub fn time<T>(op: usize, f: impl FnOnce() -> T) -> T {
     r
 }
 
+/// `time` の層付き版 (P14: LayerRun フレーム用)。層ループ内の op に使う。
+/// op 時間は OpSummary 累積に加算され、さらに telemetry の層バッファに
+/// 実行順で記録される (`telemetry_layer_begin` 〜 `telemetry_layer_flush` 間)。
+/// layer 引数は呼び出し側の文脈明示用 (記録は層バッファ側が担当する)。
+pub fn time_layer<T>(op: usize, _layer: usize, f: impl FnOnce() -> T) -> T {
+    let prof_on = enabled();
+    let tel_on = crate::telemetry_on();
+    if !prof_on && !tel_on {
+        return f();
+    }
+    let t = Instant::now();
+    let r = f();
+    let ns = t.elapsed().as_nanos() as u64;
+    if prof_on {
+        NS[op].fetch_add(ns, Ordering::Relaxed);
+        CALLS[op].fetch_add(1, Ordering::Relaxed);
+    }
+    if tel_on {
+        crate::telemetry_add_op(op, ns);
+        denno_telemetry::record_layer_op(op, ns);
+    }
+    r
+}
+
 pub fn reset() {
     for i in 0..N_OPS {
         NS[i].store(0, Ordering::Relaxed);

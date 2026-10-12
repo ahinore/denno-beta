@@ -16,6 +16,7 @@
 //! payload 内の整数は LEB128 varint、確率は f16 ビット (u16)。
 //! ```
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicI8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
@@ -33,6 +34,8 @@ pub mod kind {
     pub const KV_USAGE: u8 = 8;
     pub const GAP: u8 = 9;
     pub const TOP_K: u8 = 10;
+    /// 1 層の forward 内で実行された op 列 (実行順)。
+    pub const LAYER_RUN: u8 = 11;
 }
 
 pub const MAGIC: [u8; 4] = *b"DNTL";
@@ -184,13 +187,13 @@ pub fn get_varint_u32(buf: &[u8]) -> Result<(u32, usize), String> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     /// WS 接続時のサーバー情報
-    ServerInfo { model: String, quant: String, slots: u32, context: u32 },
+    ServerInfo { model: String, quant: String, slots: u32, context: u32, layers: u32 },
     /// セッションが KV スロットを取得 (install)
     SessionAdmit { session: u32, slot: u32, prompt_tokens: u32 },
     /// セッション終了 (release)
     SessionDone { session: u32, reason: u8, output_tokens: u32 },
-    /// prefill 1 forward 完了
-    Prefill { session: u32, prompt_tokens: u32, ns: u64 },
+    /// prefill 1 forward 完了 (tokens = 処理したプロンプトトークン id 列)
+    Prefill { session: u32, prompt_tokens: u32, ns: u64, tokens: Vec<u32> },
     /// decode で 1 トークン確定
     Token { session: u32, token: u32, pos: u32 },
     /// バッチ decode の forward 1 回分の所要時間 (session = バッチ全体)
@@ -203,6 +206,9 @@ pub enum Frame {
     Gap { lost: u32 },
     /// sampler の top-k (確率は f16 ビット)
     TopK { session: u32, chosen: u32, entropy_f16: u16, entries: Vec<(u32, u16)> },
+    /// 1 層の forward で実行された op 列 (op id, ns)。層の実行順に送出される
+    /// (P14: ビューアのコールグラフ/層パネルの点灯アニメーション用)。
+    LayerRun { layer: u16, ops: Vec<(u8, u64)> },
 }
 
 impl Frame {
@@ -218,6 +224,7 @@ impl Frame {
             Frame::KvUsage { .. } => kind::KV_USAGE,
             Frame::Gap { .. } => kind::GAP,
             Frame::TopK { .. } => kind::TOP_K,
+            Frame::LayerRun { .. } => kind::LAYER_RUN,
         }
     }
 
@@ -227,13 +234,14 @@ impl Frame {
         b.push(VERSION);
         b.push(self.kind());
         match self {
-            Frame::ServerInfo { model, quant, slots, context } => {
+            Frame::ServerInfo { model, quant, slots, context, layers } => {
                 put_varint_u32(&mut b, model.len() as u32);
                 b.extend_from_slice(model.as_bytes());
                 put_varint_u32(&mut b, quant.len() as u32);
                 b.extend_from_slice(quant.as_bytes());
                 put_varint_u32(&mut b, *slots);
                 put_varint_u32(&mut b, *context);
+                put_varint_u32(&mut b, *layers);
             }
             Frame::SessionAdmit { session, slot, prompt_tokens } => {
                 put_varint_u32(&mut b, *session);
@@ -245,10 +253,14 @@ impl Frame {
                 b.push(*reason);
                 put_varint_u32(&mut b, *output_tokens);
             }
-            Frame::Prefill { session, prompt_tokens, ns } => {
+            Frame::Prefill { session, prompt_tokens, ns, tokens } => {
                 put_varint_u32(&mut b, *session);
                 put_varint_u32(&mut b, *prompt_tokens);
                 put_varint_u64(&mut b, *ns);
+                put_varint_u32(&mut b, tokens.len() as u32);
+                for &t in tokens {
+                    put_varint_u32(&mut b, t);
+                }
             }
             Frame::Token { session, token, pos } => {
                 put_varint_u32(&mut b, *session);
@@ -288,6 +300,14 @@ impl Frame {
                     b.extend_from_slice(&p.to_le_bytes());
                 }
             }
+            Frame::LayerRun { layer, ops } => {
+                put_varint_u32(&mut b, *layer as u32);
+                put_varint_u32(&mut b, ops.len() as u32);
+                for (op, ns) in ops {
+                    b.push(*op);
+                    put_varint_u64(&mut b, *ns);
+                }
+            }
         }
         b
     }
@@ -323,7 +343,8 @@ impl Frame {
                 i += n2;
                 let slots = u32v(p, &mut i)?;
                 let context = u32v(p, &mut i)?;
-                Frame::ServerInfo { model, quant, slots, context }
+                let layers = u32v(p, &mut i)?;
+                Frame::ServerInfo { model, quant, slots, context, layers }
             }
             kind::SESSION_ADMIT => {
                 let session = u32v(p, &mut i)?;
@@ -342,7 +363,12 @@ impl Frame {
                 let session = u32v(p, &mut i)?;
                 let prompt_tokens = u32v(p, &mut i)?;
                 let ns = u64v(p, &mut i)?;
-                Frame::Prefill { session, prompt_tokens, ns }
+                let n = u32v(p, &mut i)? as usize;
+                let mut tokens = Vec::with_capacity(n);
+                for _ in 0..n {
+                    tokens.push(u32v(p, &mut i)?);
+                }
+                Frame::Prefill { session, prompt_tokens, ns, tokens }
             }
             kind::TOKEN => {
                 let session = u32v(p, &mut i)?;
@@ -397,6 +423,18 @@ impl Frame {
                     entries.push((id, u16::from_le_bytes(pb)));
                 }
                 Frame::TopK { session, chosen, entropy_f16, entries }
+            }
+            kind::LAYER_RUN => {
+                let layer = u32v(p, &mut i)? as u16;
+                let n = u32v(p, &mut i)? as usize;
+                let mut ops = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let op = p[i];
+                    i += 1;
+                    let ns = u64v(p, &mut i)?;
+                    ops.push((op, ns));
+                }
+                Frame::LayerRun { layer, ops }
             }
             other => return Err(format!("unknown kind: {other}")),
         };
@@ -490,6 +528,46 @@ pub fn take_ops() -> Vec<(u8, u64)> {
         .map(|i| (i as u8, OP_NS[i].swap(0, Ordering::Relaxed)))
         .filter(|&(_, ns)| ns > 0)
         .collect()
+}
+
+// ---------- 層単位の op 列記録 (P14: LayerRun フレーム用) ----------
+
+thread_local! {
+    /// 現在記録中の層 (layer id, ops)。`layer_begin` 〜 `layer_flush` 間のみ有効。
+    static LAYER_BUF: RefCell<Option<(u16, Vec<(u8, u64)>)>> = const { RefCell::new(None) };
+}
+
+/// 層の forward 開始を記録する (この後 `record_layer_op` で op 列を蓄積し、
+/// `layer_flush` で LayerRun フレーム 1 個として送出する)。
+/// テレメトリ無効時は何もしない。
+pub fn layer_begin(layer: u16) {
+    if !enabled() {
+        return;
+    }
+    LAYER_BUF.with(|b| *b.borrow_mut() = Some((layer, Vec::new())));
+}
+
+/// 層内 op の所要 ns を現在の層バッファに記録する (`add_op` と併用)。
+/// バッファが無い (layer_begin 未呼び出し/無効) 場合は何もしない。
+pub fn record_layer_op(op: usize, ns: u64) {
+    if op >= u8::MAX as usize {
+        return;
+    }
+    LAYER_BUF.with(|b| {
+        if let Some((_, ops)) = b.borrow_mut().as_mut() {
+            ops.push((op as u8, ns));
+        }
+    });
+}
+
+/// 層の forward 終了。蓄積した op 列を LayerRun フレームとして送出する。
+pub fn layer_flush() {
+    let buf = LAYER_BUF.with(|b| b.borrow_mut().take());
+    if let Some((layer, ops)) = buf {
+        if !ops.is_empty() {
+            emit(Frame::LayerRun { layer, ops });
+        }
+    }
 }
 
 /// 消費側: 1 フレームを受信 (タイムアウト付き)。サーバーの WS 転送タスクが使う。
@@ -618,10 +696,16 @@ mod tests {
                 quant: "fp32".into(),
                 slots: 4,
                 context: 32768,
+                layers: 24,
             },
             Frame::SessionAdmit { session: 7, slot: 2, prompt_tokens: 34 },
             Frame::SessionDone { session: 7, reason: done_reason::END_TURN, output_tokens: 26 },
-            Frame::Prefill { session: 7, prompt_tokens: 34, ns: 123_456_789 },
+            Frame::Prefill {
+                session: 7,
+                prompt_tokens: 34,
+                ns: 123_456_789,
+                tokens: vec![972, 198, 3585, 370, 151644],
+            },
             Frame::Token { session: 7, token: 99_999, pos: 12 },
             Frame::Step { width: 4, ns: 8_765_432 },
             Frame::OpSummary { ops: vec![(4, 1_000), (11, 2_500)] },
@@ -632,6 +716,10 @@ mod tests {
                 chosen: 831,
                 entropy_f16: f32_to_f16_bits(1.25),
                 entries: vec![(831, f32_to_f16_bits(0.5)), (12, f32_to_f16_bits(0.25))],
+            },
+            Frame::LayerRun {
+                layer: 5,
+                ops: vec![(1, 2100), (3, 154_000), (2, 8800), (4, 1_204_500), (5, 96_000)],
             },
         ];
         for f in frames {

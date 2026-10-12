@@ -8,9 +8,15 @@ fn main() {
             quant: "fp32".into(),
             slots: 4,
             context: 32768,
+            layers: 24,
         },
         denno_telemetry::Frame::SessionAdmit { session: 1, slot: 0, prompt_tokens: 34 },
-        denno_telemetry::Frame::Prefill { session: 1, prompt_tokens: 34, ns: 123_456_789 },
+        denno_telemetry::Frame::Prefill {
+            session: 1,
+            prompt_tokens: 34,
+            ns: 123_456_789,
+            tokens: (0..34).map(|i| 9700 + i).collect(),
+        },
         denno_telemetry::Frame::Token { session: 1, token: 100, pos: 1 },
         denno_telemetry::Frame::TopK {
             session: 1,
@@ -25,6 +31,11 @@ fn main() {
             t_lens: vec![34, 0, 5, 0],
         },
         denno_telemetry::Frame::Gap { lost: 3 },
+        denno_telemetry::Frame::LayerRun { layer: 0, ops: vec![(1, 3_100), (3, 210_400)] },
+        denno_telemetry::Frame::LayerRun {
+            layer: 23,
+            ops: vec![(1, 2_900), (4, 1_100_000), (8, 190_000)],
+        },
         denno_telemetry::Frame::SessionDone {
             session: 1,
             reason: denno_telemetry::done_reason::END_TURN,

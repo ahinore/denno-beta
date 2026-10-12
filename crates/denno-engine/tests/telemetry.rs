@@ -69,6 +69,8 @@ fn telemetry_off_then_on_lifecycle_and_output_invariance() {
     assert!(has(&frames, &|f| matches!(f, Frame::KvUsage { .. })), "KvUsage 無し");
     assert!(has(&frames, &|f| matches!(f, Frame::SessionDone { .. })), "SessionDone 無し");
     assert!(has(&frames, &|f| matches!(f, Frame::OpSummary { .. })), "OpSummary 無し");
+    // 注: LayerRun (P14) は llama.rs の層ループで発生する。ダミーモデルは層フックを
+    // 持たないためここでは出ない (roundtrip は telemetry crate の単体テストで担保)。
 
     // Token の pos は 1 から始まる連番 (1 セッション分)
     let toks: Vec<u32> = frames

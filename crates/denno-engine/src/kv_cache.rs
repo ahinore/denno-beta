@@ -37,6 +37,11 @@ impl KvCache {
         self.kv_dim
     }
 
+    /// 層数 (P14: ビューアの層パネル用)。
+    pub fn n_layers(&self) -> usize {
+        self.n_layers
+    }
+
     /// バッファの最大トークン数 (コンテキスト長と一致する)
     pub fn max_len(&self) -> usize {
         self.max_len

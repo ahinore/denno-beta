@@ -30,3 +30,12 @@ pub fn telemetry_on() -> bool {
 pub fn telemetry_add_op(op: usize, ns: u64) {
     denno_telemetry::add_op(op, ns);
 }
+
+/// 層 forward の op 列記録 (P14: LayerRun フレーム用)。
+pub fn telemetry_layer_begin(layer: u16) {
+    denno_telemetry::layer_begin(layer);
+}
+
+pub fn telemetry_layer_flush() {
+    denno_telemetry::layer_flush();
+}

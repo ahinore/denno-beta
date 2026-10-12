@@ -2,188 +2,499 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<title>denno-trace viewer (P13 skeleton)</title>
+<title>denno-view — 推論フローアニメーション (P14)</title>
 <style>
-  body { font-family: monospace; background: #14161a; color: #d7dae0; margin: 16px; }
-  h1 { font-size: 16px; color: #9aa4b2; }
-  h2 { font-size: 13px; color: #9aa4b2; border-bottom: 1px solid #2a2f38; margin-bottom: 4px; }
-  .info { color: #79b8ff; }
-  .bar-row { display: flex; align-items: center; margin: 1px 0; }
-  .bar-label { width: 110px; color: #9aa4b2; }
-  .bar-track { flex: 1; background: #22262d; height: 12px; }
-  .bar-fill { height: 12px; background: #3fb950; }
-  .bar-val { width: 80px; text-align: right; }
-  table { border-collapse: collapse; font-size: 12px; }
-  td, th { border: 1px solid #2a2f38; padding: 2px 8px; text-align: right; }
-  th { color: #9aa4b2; }
-  #tokens { max-height: 160px; overflow-y: auto; font-size: 12px; color: #a5d6ff; }
-  .grid { display: flex; gap: 2px; flex-wrap: wrap; }
-  .cell { width: 14px; height: 14px; background: #22262d; border: 1px solid #2a2f38; }
-  .cell.busy { background: #d29922; }
-  .cell.active { background: #3fb950; }
-  .topk { font-size: 12px; }
-  .topk .bar-track { max-width: 300px; height: 8px; }
-  .topk .bar-fill { background: #58a6ff; }
-  .warn { color: #f85149; }
-  section { margin-bottom: 14px; }
+  :root {
+    --bg: #14161a; --panel: #1a1d23; --panel2: #20242c; --line: #2a2f38;
+    --fg: #d7dae0; --mut: #9aa4b2; --acc: #58a6ff; --glow: #3fb950;
+    --warm: #d29922; --warn: #f85149; --mono: ui-monospace, Consolas, "Courier New", monospace;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: var(--mono); background: var(--bg); color: var(--fg); margin: 0; font-size: 13px; }
+  header {
+    display: flex; align-items: center; gap: 14px; padding: 6px 14px;
+    background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 10;
+  }
+  header .logo { font-weight: bold; color: var(--acc); }
+  header .muted { color: var(--mut); }
+  header .warn { color: var(--warn); }
+  main {
+    display: grid; grid-template-columns: 250px minmax(380px, 1fr) 200px;
+    gap: 10px; padding: 10px; align-items: start;
+  }
+  h2 { font-size: 12px; color: var(--mut); border-bottom: 1px solid var(--line);
+       margin: 0 0 6px; padding-bottom: 2px; font-weight: normal; letter-spacing: .08em; }
+  section.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+
+  /* ---- 左: KVキャッシュ + 変数 ---- */
+  .slot { border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; margin-bottom: 5px;
+          background: var(--panel2); transition: box-shadow .25s, border-color .25s; }
+  .slot .row { display: flex; justify-content: space-between; }
+  .slot .len { color: var(--acc); }
+  .slot.busy { border-color: #3b4a5a; }
+  .slot.lit { border-color: var(--glow); box-shadow: 0 0 10px #3fb95055; }
+  .slot .track { height: 4px; background: #22262d; border-radius: 2px; margin-top: 4px; }
+  .slot .fill { height: 4px; border-radius: 2px; background: var(--warm); width: 0%;
+                transition: width .3s; }
+  .var { border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; margin-bottom: 5px;
+         background: var(--panel2); transition: box-shadow .25s, border-color .25s; }
+  .var h3 { margin: 0 0 3px; font-size: 11px; color: var(--mut); font-weight: normal; }
+  .var .val { font-size: 12px; word-break: break-all; min-height: 14px; }
+  .var.lit { border-color: var(--glow); box-shadow: 0 0 10px #3fb95055; }
+  .topk .bar-row { display: flex; align-items: center; margin: 1px 0; }
+  .topk .bar-track { flex: 1; background: #22262d; height: 8px; }
+  .topk .bar-fill { height: 8px; background: var(--acc); }
+  .topk .bar-label { width: 60px; color: var(--mut); }
+
+  /* ---- 中央: コールグラフ ---- */
+  #center { position: relative; }
+  #fallzone { position: absolute; top: 0; left: 0; right: 0; height: 100%; pointer-events: none; z-index: 5; }
+  .tokchip {
+    position: absolute; z-index: 6; padding: 1px 6px; border-radius: 10px; font-size: 11px;
+    background: #1f3a5f; border: 1px solid var(--acc); color: #a5d6ff;
+    transition: transform 1.1s cubic-bezier(.3,.7,.4,1), opacity .4s; will-change: transform;
+  }
+  .node {
+    border: 1px solid var(--line); border-radius: 8px; background: var(--panel2);
+    padding: 5px 12px; margin: 0 auto 8px; width: 78%; text-align: center; position: relative;
+    transition: box-shadow .2s, border-color .2s, background .2s;
+  }
+  .node .sub { color: var(--mut); font-size: 10px; }
+  .node .name { font-size: 13px; }
+  .node.lit { border-color: var(--glow); background: #17301f; box-shadow: 0 0 14px #3fb95066; }
+  .node.litwarm { border-color: var(--warm); background: #33290f; box-shadow: 0 0 14px #d2992266; }
+  .node.scope { width: 88%; padding: 8px 10px 4px; background: var(--panel); }
+  .node.scope > .name { color: var(--mut); }
+  .ops { display: flex; flex-direction: column; gap: 3px; margin: 4px 0; }
+  .op {
+    border: 1px solid var(--line); border-radius: 6px; background: var(--panel2);
+    padding: 2px 8px; font-size: 12px; text-align: center; position: relative;
+    transition: box-shadow .15s, border-color .15s, background .15s;
+  }
+  .op .badge { position: absolute; right: 6px; top: 2px; font-size: 10px; color: var(--mut); }
+  .op.lit { border-color: var(--glow); background: #17301f; box-shadow: 0 0 10px #3fb95077; z-index: 2; }
+  .arrow { text-align: center; color: var(--mut); font-size: 10px; margin: -2px 0 2px; }
+  #pulse {
+    position: absolute; z-index: 7; width: 10px; height: 10px; border-radius: 50%;
+    background: var(--glow); box-shadow: 0 0 12px var(--glow); opacity: 0;
+    transition: top .18s ease-in-out, left .18s ease-in-out, opacity .2s; pointer-events: none;
+  }
+  #oplabel {
+    position: absolute; z-index: 7; font-size: 11px; color: var(--glow); background: #14161acc;
+    border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; opacity: 0;
+    transition: opacity .2s; pointer-events: none; white-space: nowrap;
+  }
+  #tokens { display: flex; flex-wrap: wrap; gap: 4px; max-height: 130px; overflow-y: auto; }
+  #tokens .t { padding: 1px 6px; border-radius: 10px; font-size: 11px;
+               background: #14351c; border: 1px solid var(--glow); color: #7ee788; }
 </style>
 </head>
 <body>
-<h1>denno-trace viewer <span class="info" id="server"></span> <span class="warn" id="gap"></span></h1>
-<div id="status">connecting...</div>
+<header>
+  <span class="logo">denno-view</span>
+  <span id="srvinfo" class="muted">未接続</span>
+  <span id="sess" class="muted"></span>
+  <span id="gap" class="warn"></span>
+  <span id="stat" class="muted" style="margin-left:auto"></span>
+  <label class="muted">速度 <input id="speed" type="range" min="0.5" max="8" step="0.5" value="1"></label>
+</header>
+<main>
+  <!-- 左: KVキャッシュ + 変数 -->
+  <section class="panel" id="left">
+    <h2>KVキャッシュ</h2>
+    <div id="kvslots"></div>
+    <h2 style="margin-top:10px">変数</h2>
+    <div class="var" id="var-x"><h3>hidden x (residual)</h3><div class="val" id="val-x">-</div></div>
+    <div class="var" id="var-logits"><h3>logits top-k</h3>
+      <div class="val topk" id="val-logits">-</div></div>
+    <div class="var" id="var-entropy"><h3>entropy (nat)</h3><div class="val" id="val-entropy">-</div></div>
+    <div class="var" id="var-token"><h3>chosen token</h3><div class="val" id="val-token">-</div></div>
+    <h2 style="margin-top:10px">op timing (前ステップ, ms)</h2>
+    <div id="ops" class="muted" style="font-size:11px">-</div>
+  </section>
 
-<section>
-  <h2>KV slots</h2>
-  <div class="grid" id="kv"></div>
-</section>
+  <!-- 中央: コールグラフ -->
+  <section class="panel" id="center">
+    <h2>コールグラフ (モデル駆動プログラム)</h2>
+    <div id="graph">
+      <div class="node" id="n-serve"><span class="name">denno serve</span>
+        <div class="sub">HTTP + WS エンドポイント</div></div>
+      <div class="node" id="n-sched"><span class="name">scheduler</span>
+        <div class="sub">セッション管理 / バッチ組成</div></div>
+      <div class="node" id="n-step"><span class="name">engine.step_chat</span>
+        <div class="sub">prefill / decode 1 ステップ</div></div>
+      <div class="node scope" id="n-forward"><span class="name">model.forward</span>
+        <div class="ops">
+          <div class="op" id="op-embed">embed <span class="badge"></span></div>
+          <div class="arrow">│ layer ×N (右パネルと連動)</div>
+          <div class="op" id="op-1">rmsnorm (attn in) <span class="badge"></span></div>
+          <div class="op" id="op-3">qkv_proj <span class="badge"></span></div>
+          <div class="op" id="op-2">rope <span class="badge"></span></div>
+          <div class="op" id="op-4">attn_core <span class="badge"></span></div>
+          <div class="op" id="op-5">o_proj <span class="badge"></span></div>
+          <div class="op" id="op-1b">rmsnorm (mlp in) <span class="badge"></span></div>
+          <div class="op" id="op-6">gate_up_proj <span class="badge"></span></div>
+          <div class="op" id="op-7">swiglu <span class="badge"></span></div>
+          <div class="op" id="op-8">down_proj <span class="badge"></span></div>
+        </div>
+        <div class="op" id="op-9">final_norm <span class="badge"></span></div>
+        <div class="op" id="op-10">lm_head <span class="badge"></span></div>
+      </div>
+      <div class="node" id="n-sample"><span class="name">sampler</span>
+        <div class="sub">greedy (seed 固定)</div></div>
+      <div class="node" id="n-detok"><span class="name">detok</span>
+        <div class="sub">ストリーミング差分デコード</div></div>
+    </div>
+    <h2 style="margin-top:8px">出力トークン</h2>
+    <div id="tokens"></div>
+    <div id="fallzone"></div>
+    <div id="pulse"></div>
+    <div id="oplabel"></div>
+  </section>
 
-<section>
-  <h2>op timing (last OpSummary, μs)</h2>
-  <div id="ops"></div>
-</section>
-
-<section>
-  <h2>sampler top-k</h2>
-  <div class="topk" id="topk"></div>
-</section>
-
-<section>
-  <h2>token stream</h2>
-  <div id="tokens"></div>
-</section>
-
-<section>
-  <h2>sessions</h2>
-  <table id="sessions"><thead><tr><th>id</th><th>slot</th><th>prompt</th><th>out</th><th>state</th></tr></thead><tbody></tbody></table>
-</section>
+  <!-- 右: 層スタック -->
+  <section class="panel" id="right">
+    <h2>モデルの層</h2>
+    <div id="layers"></div>
+  </section>
+</main>
 
 <script>
 "use strict";
-// denno-telemetry フレームの JS デコーダ (P13 骨組み。P14 で WASM 化)
-const MAGIC = [0x44,0x4e,0x54,0x4c]; // "DNTL"
-const K = { SERVER_INFO:1, SESSION_ADMIT:2, SESSION_DONE:3, PREFILL:4, TOKEN:5, STEP:6, OP_SUMMARY:7, KV_USAGE:8, GAP:9, TOP_K:10 };
-const OP_NAMES = ["embed","rmsnorm","rope","qkv_proj","attn_core","o_proj","gate_up_proj","swiglu","down_proj","final_norm","lm_head","sampler","detok"];
-
+// ---------- フレームデコーダ (形式 v1: DNTL + varint + f16) ----------
+function getVarint(buf, p) {
+  let v = 0n, shift = 0n;
+  for (let i = p; i < buf.length; i++) {
+    v |= BigInt(buf[i] & 0x7f) << shift;
+    if ((buf[i] & 0x80) === 0) return [Number(v), i + 1 - p];
+    shift += 7n;
+    if (shift > 63n) throw new Error("varint too long");
+  }
+  throw new Error("varint truncated");
+}
 function f16(h) {
   const s = (h & 0x8000) ? -1 : 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
   if (e === 0) return s * m * 2 ** -24;
   if (e === 31) return m ? NaN : s * Infinity;
   return s * (1 + m / 1024) * 2 ** (e - 15);
 }
-function decodeFrame(b) {
-  if (b.length < 6 || MAGIC.some((v, i) => b[i] !== v)) throw "bad magic";
-  const kind = b[5];
-  let i = 6;
-  const u32 = () => { let v = 0, sh = 0; for (;;) { const c = b[i++]; v |= (c & 0x7f) << sh; if (!(c & 0x80)) return v >>> 0; sh += 7; } };
-  const u64 = () => { let v = 0n, sh = 0n; for (;;) { const c = b[i++]; v |= BigInt(c & 0x7f) << sh; if (!(c & 0x80)) return v; sh += 7n; } };
-  const s = (n) => { const str = new TextDecoder().decode(b.slice(i, i + n)); i += n; return str; };
+function decodeFrame(buf) {
+  if (buf.length < 6) throw new Error("short frame");
+  const magic = String.fromCharCode(...buf.slice(0, 4));
+  if (magic !== "DNTL") throw new Error("bad magic: " + magic);
+  const ver = buf[4], kind = buf[5];
+  if (ver !== 1) throw new Error("unsupported version: " + ver);
+  let p = 6;
+  const u32 = () => { const [v, n] = getVarint(buf, p); p += n; return v; };
+  const u64 = () => { const [v, n] = getVarint(buf, p); p += n; return v; };
+  const str = () => { const n = u32(); const s = new TextDecoder().decode(buf.slice(p, p + n)); p += n; return s; };
+  const f16r = () => { const v = buf[p] | (buf[p + 1] << 8); p += 2; return v; };
   switch (kind) {
-    case K.SERVER_INFO: { const n = u32(); const model = s(n); const n2 = u32(); const quant = s(n2); return { t: "server", model, quant, slots: u32(), context: u32() }; }
-    case K.SESSION_ADMIT: return { t: "admit", session: u32(), slot: u32(), prompt: u32() };
-    case K.SESSION_DONE: { const session = u32(); const reason = b[i++]; return { t: "done", session, reason, out: u32() }; }
-    case K.PREFILL: return { t: "prefill", session: u32(), prompt: u32(), ns: Number(u64()) };
-    case K.TOKEN: return { t: "token", session: u32(), token: u32(), pos: u32() };
-    case K.STEP: return { t: "step", width: u32(), ns: Number(u64()) };
-    case K.OP_SUMMARY: { const n = u32(); const ops = []; for (let k = 0; k < n; k++) { const op = b[i++]; ops.push([op, Number(u64())]); } return { t: "ops", ops }; }
-    case K.KV_USAGE: { const n = u32(); const busy = [], lens = []; for (let k = 0; k < n; k++) busy.push(b[i++] !== 0); for (let k = 0; k < n; k++) lens.push(u32()); return { t: "kv", busy, lens }; }
-    case K.GAP: return { t: "gap", lost: u32() };
-    case K.TOP_K: { const session = u32(); const chosen = u32(); const h = b[i] | (b[i+1] << 8); i += 2; const n = u32(); const entries = []; for (let k = 0; k < n; k++) { const id = u32(); const p = b[i] | (b[i+1] << 8); i += 2; entries.push([id, f16(p)]); } return { t: "topk", session, chosen, entropy: f16(h), entries }; }
-    default: return { t: "unknown", kind };
+    case 1: { // ServerInfo
+      const model = str(), quant = str();
+      return { kind: "ServerInfo", model, quant, slots: u32(), context: u32(), layers: u32() };
+    }
+    case 2: return { kind: "SessionAdmit", session: u32(), slot: u32(), prompt_tokens: u32() };
+    case 3: return { kind: "SessionDone", session: u32(), reason: buf[p++], output_tokens: u32() };
+    case 4: { // Prefill (P14: tokens 付き)
+      const session = u32(), prompt_tokens = u32(), ns = u64();
+      const n = u32(); const tokens = [];
+      for (let k = 0; k < n; k++) tokens.push(u32());
+      return { kind: "Prefill", session, prompt_tokens, ns, tokens };
+    }
+    case 5: return { kind: "Token", session: u32(), token: u32(), pos: u32() };
+    case 6: return { kind: "Step", width: u32(), ns: u64() };
+    case 7: { // OpSummary
+      const n = u32(); const ops = [];
+      for (let k = 0; k < n; k++) { const op = buf[p++]; ops.push([op, u64()]); }
+      return { kind: "OpSummary", ops };
+    }
+    case 8: { // KvUsage
+      const n = u32(); const busy = [], t_lens = [];
+      for (let k = 0; k < n; k++) busy.push(buf[p++] !== 0);
+      for (let k = 0; k < n; k++) t_lens.push(u32());
+      return { kind: "KvUsage", busy, t_lens };
+    }
+    case 9: return { kind: "Gap", lost: u32() };
+    case 10: { // TopK
+      const session = u32(), chosen = u32(), entropy_f16 = f16(f16r());
+      const n = u32(); const entries = [];
+      for (let k = 0; k < n; k++) { const id = u32(); entries.push([id, f16(f16r())]); }
+      return { kind: "TopK", session, chosen, entropy_f16, entries };
+    }
+    case 11: { // LayerRun (P14)
+      const layer = u32(), n = u32(); const ops = [];
+      for (let k = 0; k < n; k++) { const op = buf[p++]; ops.push([op, u64()]); }
+      return { kind: "LayerRun", layer, ops };
+    }
+    default: throw new Error("unknown kind: " + kind);
   }
 }
 
-const sessions = new Map();
-let totalGap = 0;
+// ---------- OP 名 (denno-engine::prof と同一対応) ----------
+const OP_NAMES = ["embed","rmsnorm","rope","qkv_proj","attn_core","o_proj",
+  "gate_up_proj","swiglu","down_proj","final_norm","lm_head","sampler","detok"];
 
-function renderKv(kv) {
-  const el = document.getElementById("kv");
-  el.innerHTML = "";
-  kv.busy.forEach((busy, s) => {
+// ---------- DOM ----------
+const $ = (id) => document.getElementById(id);
+const srv = $("srvinfo"), sessEl = $("sess"), gapEl = $("gap"), statEl = $("stat");
+let nLayers = 0, ctxLen = 0, speed = 1;
+
+function lit(el, cls = "lit", ms = 320) {
+  if (!el) return;
+  el.classList.remove("lit", "litwarm");
+  void el.offsetWidth; // transition 再始動
+  el.classList.add(cls);
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove(cls), ms);
+}
+
+// 発光パルス: 中央グラフ内を移動する「値」の点
+const pulse = $("pulse"), oplabel = $("oplabel");
+function pulseTo(el, label) {
+  if (!el) return;
+  const g = $("graph").getBoundingClientRect(), r = el.getBoundingClientRect();
+  pulse.style.opacity = 1;
+  pulse.style.left = (r.left - g.left + r.width / 2 - 5) + "px";
+  pulse.style.top = (r.top - g.top + r.height / 2 - 5) + "px";
+  if (label !== undefined) {
+    oplabel.textContent = label;
+    oplabel.style.opacity = 1;
+    oplabel.style.left = Math.min(r.left - g.left + r.width + 8, g.width - 140) + "px";
+    oplabel.style.top = (r.top - g.top) + "px";
+    clearTimeout(oplabel._t);
+    oplabel._t = setTimeout(() => { oplabel.style.opacity = 0; }, 700);
+  }
+}
+
+// ---------- 層スタック / KV スロット構築 ----------
+function buildLayers(n) {
+  nLayers = n;
+  const box = $("layers");
+  box.innerHTML = "";
+  for (let i = 0; i < n; i++) {
+    const d = document.createElement("div");
+    d.className = "layer"; d.id = "layer-" + i; d.textContent = "layer " + i;
+    box.appendChild(d);
+  }
+}
+function buildSlots(n) {
+  const box = $("kvslots");
+  box.innerHTML = "";
+  for (let i = 0; i < n; i++) {
+    const d = document.createElement("div");
+    d.className = "slot"; d.id = "slot-" + i;
+    d.innerHTML = `<div class="row"><span>slot ${i}</span><span class="len">0 tok</span></div>
+                   <div class="track"><div class="fill"></div></div>`;
+    box.appendChild(d);
+  }
+}
+
+// ---------- プロンプト降下アニメーション ----------
+const fallzone = $("fallzone");
+function fallTokens(tokens, targetId) {
+  const target = $(targetId);
+  if (!target) return;
+  const g = $("graph").getBoundingClientRect();
+  const r = target.getBoundingClientRect();
+  const show = tokens.slice(0, 40);
+  show.forEach((t, i) => {
     const c = document.createElement("div");
-    c.className = "cell" + (busy ? " busy" : "");
-    c.title = `slot ${s}: ${kv.lens[s]} tokens`;
-    c.textContent = s;
-    el.appendChild(c);
+    c.className = "tokchip"; c.textContent = "t" + t;
+    c.style.left = (r.left - g.left + 20 + (i % 8) * 34) + "px";
+    c.style.top = "6px";
+    fallzone.appendChild(c);
+    setTimeout(() => {
+      c.style.transform = `translateY(${r.top - g.top - 8}px)`;
+      c.style.opacity = "0.15";
+    }, 60 + i * 55);
+    setTimeout(() => c.remove(), 60 + i * 55 + 1400);
   });
-}
-function renderOps(ops) {
-  const max = Math.max(...ops.ops.map(o => o[1]), 1);
-  const el = document.getElementById("ops");
-  el.innerHTML = ops.ops.map(([op, ns]) => {
-    const name = OP_NAMES[op] || ("op" + op);
-    const w = (ns / max * 100).toFixed(1);
-    const us = (ns / 1000).toFixed(0);
-    return `<div class="bar-row"><div class="bar-label">${name}</div><div class="bar-track"><div class="bar-fill" style="width:${w}%"></div></div><div class="bar-val">${us} μs</div></div>`;
-  }).join("");
-}
-function renderTopK(topk) {
-  const max = Math.max(...topk.entries.map(e => e[1]), 1e-9);
-  document.getElementById("topk").innerHTML =
-    `chosen: ${topk.chosen}, entropy: ${topk.entropy.toFixed(3)} nat<br>` +
-    topk.entries.map(([id, p]) =>
-      `<div class="bar-row"><div class="bar-label">tok ${id}</div><div class="bar-track"><div class="bar-fill" style="width:${(p / max * 100).toFixed(1)}%"></div></div><div class="bar-val">${(p * 100).toFixed(1)}%</div></div>`).join("");
-}
-function renderSessions() {
-  const tb = document.querySelector("#sessions tbody");
-  tb.innerHTML = [...sessions.entries()].map(([id, s]) =>
-    `<tr><td>${id}</td><td>${s.slot ?? "-"}</td><td>${s.prompt ?? "-"}</td><td>${s.out ?? 0}</td><td>${s.state}</td></tr>`).join("");
-}
-
-function handle(f) {
-  switch (f.t) {
-    case "server":
-      document.getElementById("server").textContent = `— ${f.model} (${f.quant}, slots=${f.slots}, ctx=${f.context})`;
-      document.getElementById("status").textContent = "connected";
-      break;
-    case "admit":
-      sessions.set(f.session, { slot: f.slot, prompt: f.prompt, out: 0, state: "running" });
-      renderSessions();
-      break;
-    case "done": {
-      const s = sessions.get(f.session) || {};
-      s.state = ["end_turn", "max_tokens", "stop_seq", "error"][f.reason] || f.reason;
-      s.out = f.out;
-      sessions.set(f.session, s);
-      renderSessions();
-      break;
-    }
-    case "token": {
-      const s = sessions.get(f.session) || { state: "running" };
-      s.out = Math.max(s.out || 0, f.pos);
-      sessions.set(f.session, s);
-      renderSessions();
-      const el = document.getElementById("tokens");
-      const line = document.createElement("div");
-      line.textContent = `s${f.session} pos${f.pos} tok ${f.token}`;
-      el.prepend(line);
-      while (el.childElementCount > 40) el.lastChild.remove();
-      break;
-    }
-    case "kv": renderKv(f); break;
-    case "ops": renderOps(f); break;
-    case "topk": renderTopK(f); break;
-    case "step": break; // タイムラインは P14
-    case "prefill": break;
-    case "gap":
-      totalGap += f.lost;
-      document.getElementById("gap").textContent = `gap: lost ${totalGap} frames`;
-      break;
+  if (tokens.length > show.length) {
+    const c = document.createElement("div");
+    c.className = "tokchip"; c.textContent = `+${tokens.length - show.length} tok`;
+    c.style.left = (r.left - g.left + 20 + 8 * 34) + "px"; c.style.top = "6px";
+    fallzone.appendChild(c);
+    setTimeout(() => { c.style.transform = `translateY(${r.top - g.top - 8}px)`; c.style.opacity = "0.15"; }, 60 + show.length * 55);
+    setTimeout(() => c.remove(), 2400);
   }
 }
 
+// ---------- 出力トークン ----------
+function addOutToken(id) {
+  const t = document.createElement("span");
+  t.className = "t"; t.textContent = "t" + id;
+  $("tokens").appendChild(t);
+  $("tokens").scrollTop = 1e9;
+}
+
+// ---------- フレーム処理 (アニメーション本体) ----------
+// rmsnorm が attn 側 (op-1) か mlp 側 (op-1b) か: 直近に o_proj を通ったら mlp 側
+let passedOproj = false;
+function rmsNode() { return passedOproj ? $("op-1b") : $("op-1"); }
+
+function handleFrame(f) {
+  switch (f.kind) {
+    case "ServerInfo": {
+      srv.textContent = `${f.model} (quant=${f.quant}, slots=${f.slots}, ctx=${f.context}, layers=${f.layers})`;
+      ctxLen = f.context;
+      buildLayers(f.layers); buildSlots(f.slots);
+      lit($("n-serve"));
+      break;
+    }
+    case "SessionAdmit": {
+      sessEl.textContent = `session ${f.session} (slot ${f.slot})`;
+      $("tokens").innerHTML = "";
+      statEl.textContent = "prefill 中…";
+      lit($("n-sched")); lit($("n-step"));
+      break;
+    }
+    case "Prefill": {
+      // プロンプトの列が上から降りて embed に入る
+      fallTokens(f.tokens, "op-embed");
+      lit($("op-embed"), "litwarm", 900);
+      // prefill の forward 全層をすばやく通過演出 (層パネルが上から下へ流れる)
+      for (let i = 0; i < nLayers; i++) {
+        setTimeout(() => {
+          lit($("layer-" + i));
+          if (i > 0) $("layer-" + (i - 1))?.classList.add("pass");
+        }, 120 + i * (900 / Math.max(1, nLayers)));
+      }
+      $("val-x").textContent = `${f.prompt_tokens} tok (prefill ${Math.floor(f.ns / 1e6)} ms)`;
+      lit($("var-x"));
+      break;
+    }
+    case "LayerRun": {
+      // 層が点灯 → 中央の対応 op が順に点灯 → 値が次の層へ渡る
+      const L = $("layer-" + f.layer);
+      lit(L);
+      if (f.layer > 0) $("layer-" + (f.layer - 1))?.classList.add("pass");
+      pulseTo(L, `layer ${f.layer}`);
+      let delay = 0;
+      for (const [op, ns] of f.ops) {
+        let el = null;
+        if (op === 1) el = rmsNode();
+        else if (op <= 10) el = $("op-" + op);
+        if (el) {
+          setTimeout(() => {
+            lit(el);
+            const badge = el.querySelector(".badge");
+            if (badge) badge.textContent = (ns / 1e6).toFixed(2) + "ms";
+            pulseTo(el, `${OP_NAMES[op]} L${f.layer} ${(ns / 1e6).toFixed(2)}ms`);
+          }, delay);
+          delay += Math.max(8, 70 / speed);
+        }
+        if (op === 5) passedOproj = true;   // o_proj の後の rmsnorm は mlp 側
+        if (op === 8) passedOproj = false;  // down_proj の後は次層の attn 側
+      }
+      // 隠れ変数 (residual stream) の更新表示
+      $("val-x").textContent = `L${f.layer} 通過: ${f.ops.map(o => OP_NAMES[o[0]] ?? o[0]).join("→")}`;
+      lit($("var-x"), "lit", 180);
+      break;
+    }
+    case "OpSummary": {
+      $("ops").textContent = f.ops.map(([op, ns]) =>
+        `${OP_NAMES[op] ?? op}: ${(ns / 1e6).toFixed(1)}`).join(" / ");
+      break;
+    }
+    case "Token": {
+      addOutToken(f.token);
+      $("val-token").textContent = `t${f.token} (pos ${f.pos})`;
+      lit($("var-token"));
+      lit($("n-detok"));
+      break;
+    }
+    case "TopK": {
+      $("val-logits").innerHTML = f.entries.map(([id, p]) =>
+        `<div class="bar-row"><span class="bar-label">t${id}</span>
+         <div class="bar-track"><div class="bar-fill" style="width:${(p * 100).toFixed(1)}%"></div></div>
+         <span style="width:46px;text-align:right">${(p * 100).toFixed(1)}%</span></div>`).join("");
+      $("val-entropy").textContent = f.entropy_f16.toFixed(3);
+      lit($("var-logits")); lit($("var-entropy"));
+      lit($("n-step"), "lit", 200);
+      lit($("n-sample"), "litwarm", 400);
+      pulseTo($("n-sample"), `p=${((f.entries[0]?.[1] || 0) * 100).toFixed(1)}%`);
+      break;
+    }
+    case "KvUsage": {
+      f.busy.forEach((b, i) => {
+        const el = $("slot-" + i);
+        if (!el) return;
+        const wasBusy = el.classList.contains("busy");
+        el.classList.toggle("busy", b);
+        const len = f.t_lens[i] ?? 0;
+        el.querySelector(".len").textContent = `${len} tok`;
+        el.querySelector(".fill").style.width =
+          (ctxLen ? Math.min(100, len / ctxLen * 100) : 0) + "%";
+        if (b && (!wasBusy || el._last !== len)) lit(el, "lit", 260);
+        el._last = len;
+      });
+      break;
+    }
+    case "Step": {
+      lit($("n-step"));
+      $("n-step").querySelector(".sub").textContent =
+        `batch ${f.width} / ${(f.ns / 1e6).toFixed(1)} ms`;
+      break;
+    }
+    case "SessionDone": {
+      const rs = ["end_turn", "max_tokens", "stop_sequence", "error"][f.reason] ?? f.reason;
+      statEl.textContent = `session ${f.session} 完了 (${rs}, ${f.output_tokens} tok)`;
+      lit($("n-serve"), "litwarm", 600);
+      break;
+    }
+    case "Gap": break; // カウンタは WS 側で処理
+  }
+}
+
+// ---------- 再生キュー (アニメーションは推論を待たせない: 溢れたら間引き) ----------
+let queue = [];
+function drain() {
+  const budget = Math.max(1, Math.round(2 * speed));
+  for (let i = 0; i < budget && queue.length; i++) {
+    const f = queue.shift();
+    try { handleFrame(f); } catch (e) { console.error("frame error", e, f); }
+  }
+  if (queue.length > 240) {
+    // LayerRun を間引いて最新に追いつく (他の種別は保持)
+    const keep = [];
+    let layerKept = 0;
+    for (let i = queue.length - 1; i >= 0; i--) {
+      const f = queue[i];
+      if (f.kind === "LayerRun") { if (layerKept++ < 48) keep.unshift(f); }
+      else keep.unshift(f);
+    }
+    queue = keep;
+  }
+}
+setInterval(drain, 33);
+
+// ---------- WS 接続 ----------
+let gapCount = 0;
 function connect() {
-  const ws = new WebSocket(`ws://${location.host}/ws`);
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { document.getElementById("status").textContent = "waiting frames..."; };
-  ws.onmessage = (ev) => {
-    try { handle(decodeFrame(new Uint8Array(ev.data))); }
-    catch (e) { console.warn("decode error", e); }
-  };
+  ws.onopen = () => { statEl.textContent = "接続"; };
   ws.onclose = () => {
-    document.getElementById("status").textContent = "disconnected, retrying...";
+    statEl.textContent = "切断 — 2秒後に再接続";
     setTimeout(connect, 2000);
   };
+  ws.onmessage = (ev) => {
+    if (!(ev.data instanceof ArrayBuffer)) return;
+    try {
+      const f = decodeFrame(new Uint8Array(ev.data));
+      if (f.kind === "Gap") { gapCount += f.lost; gapEl.textContent = `gap: ${gapCount}`; return; }
+      // アニメーション系はキュー経由 (pacing)、統計系は即時
+      if (f.kind === "LayerRun" || f.kind === "Prefill" || f.kind === "Token" || f.kind === "TopK") {
+        queue.push(f);
+      } else {
+        handleFrame(f);
+      }
+    } catch (e) { console.error("decode error", e); }
+  };
 }
+$("speed").addEventListener("input", (e) => { speed = parseFloat(e.target.value); });
 connect();
 </script>
 </body>

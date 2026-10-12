@@ -270,13 +270,14 @@ impl Model for LlamaQwen2 {
         });
 
         for (li, layer) in self.layers.iter().enumerate() {
+            crate::telemetry_layer_begin(li as u16);
             // --- attention ---
-            let h = crate::prof::time(crate::prof::RMSNORM, || {
+            let h = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
                 rmsnorm(&x, &layer.ln1_w, e, self.eps)
             });
-            let mut q = crate::prof::time(crate::prof::QKV, || lin(&h, &layer.q_w, n)); // [n, H*dh]
-            let mut k = crate::prof::time(crate::prof::QKV, || lin(&h, &layer.k_w, n)); // [n, K*dh]
-            let mut v = crate::prof::time(crate::prof::QKV, || lin(&h, &layer.v_w, n));
+            let mut q = crate::prof::time_layer(crate::prof::QKV, li, || lin(&h, &layer.q_w, n)); // [n, H*dh]
+            let mut k = crate::prof::time_layer(crate::prof::QKV, li, || lin(&h, &layer.k_w, n)); // [n, K*dh]
+            let mut v = crate::prof::time_layer(crate::prof::QKV, li, || lin(&h, &layer.v_w, n));
             if let Some(b) = &layer.q_b {
                 add_bias(&mut q, b, heads * dh);
             }
@@ -287,7 +288,7 @@ impl Model for LlamaQwen2 {
                 add_bias(&mut v, b, kv_dim);
             }
 
-            crate::prof::time(crate::prof::ROPE, || {
+            crate::prof::time_layer(crate::prof::ROPE, li, || {
                 rope_rows(&mut q, n, heads, dh, pos0, self.theta);
                 rope_rows(&mut k, n, kv_heads, dh, pos0, self.theta);
             });
@@ -301,7 +302,7 @@ impl Model for LlamaQwen2 {
             }
 
             let mut att = vec![0.0f32; n * heads * dh];
-            crate::prof::time(crate::prof::ATTN, || {
+            crate::prof::time_layer(crate::prof::ATTN, li, || {
                 let (kc, vc) = cache.kv_bufs(li);
                 let t_total = pos0 + n;
                 let scale = 1.0 / (dh as f32).sqrt();
@@ -361,27 +362,29 @@ impl Model for LlamaQwen2 {
                 }
             });
 
-            let proj = crate::prof::time(crate::prof::OPROJ, || lin(&att, &layer.o_w, n));
+            let proj = crate::prof::time_layer(crate::prof::OPROJ, li, || lin(&att, &layer.o_w, n));
             for i in 0..n * e {
                 x[i] += proj[i];
             }
 
             // --- mlp (SwiGLU) ---
-            let h2 = crate::prof::time(crate::prof::RMSNORM, || {
+            let h2 = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
                 rmsnorm(&x, &layer.ln2_w, e, self.eps)
             });
-            let mut gate = crate::prof::time(crate::prof::GATE_UP, || lin(&h2, &layer.gate_w, n));
-            let up = crate::prof::time(crate::prof::GATE_UP, || lin(&h2, &layer.up_w, n));
-            crate::prof::time(crate::prof::SWIGLU, || {
+            let mut gate =
+                crate::prof::time_layer(crate::prof::GATE_UP, li, || lin(&h2, &layer.gate_w, n));
+            let up = crate::prof::time_layer(crate::prof::GATE_UP, li, || lin(&h2, &layer.up_w, n));
+            crate::prof::time_layer(crate::prof::SWIGLU, li, || {
                 silu_inplace(&mut gate);
                 for i in 0..n * self.ff {
                     gate[i] *= up[i];
                 }
             });
-            let down = crate::prof::time(crate::prof::DOWN, || lin(&gate, &layer.down_w, n));
+            let down = crate::prof::time_layer(crate::prof::DOWN, li, || lin(&gate, &layer.down_w, n));
             for i in 0..n * e {
                 x[i] += down[i];
             }
+            crate::telemetry_layer_flush();
         }
 
         let last = &x[(n - 1) * e..];
@@ -430,14 +433,17 @@ impl Model for LlamaQwen2 {
         });
 
         for (li, layer) in self.layers.iter().enumerate() {
+            crate::telemetry_layer_begin(li as u16);
             // --- attention ---
             // rmsnorm は行独立なので [b, e] にまとめて適用できる (行ごとに同一演算)
-            let h = crate::prof::time(crate::prof::RMSNORM, || {
+            let h = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
                 rmsnorm(&x, &layer.ln1_w, e, self.eps)
             });
-            let mut q = crate::prof::time(crate::prof::QKV, || lin_b(&h, &layer.q_w, b)); // [b, H*dh]
-            let mut k = crate::prof::time(crate::prof::QKV, || lin_b(&h, &layer.k_w, b)); // [b, K*dh]
-            let mut v = crate::prof::time(crate::prof::QKV, || lin_b(&h, &layer.v_w, b));
+            let mut q =
+                crate::prof::time_layer(crate::prof::QKV, li, || lin_b(&h, &layer.q_w, b)); // [b, H*dh]
+            let mut k =
+                crate::prof::time_layer(crate::prof::QKV, li, || lin_b(&h, &layer.k_w, b)); // [b, K*dh]
+            let mut v = crate::prof::time_layer(crate::prof::QKV, li, || lin_b(&h, &layer.v_w, b));
             if let Some(bias) = &layer.q_b {
                 add_bias(&mut q, bias, heads * dh);
             }
@@ -450,7 +456,7 @@ impl Model for LlamaQwen2 {
 
             // RoPE: セッションごとに位置が異なる (cache.len()) ので 1 行ずつ適用。
             // rope_row は rope_rows の 1 行処理と同一演算列 → ビット一致。
-            crate::prof::time(crate::prof::ROPE, || {
+            crate::prof::time_layer(crate::prof::ROPE, li, || {
                 for i in 0..b {
                     let pos = caches[i].len();
                     crate::tensor::rope_row(
@@ -485,7 +491,7 @@ impl Model for LlamaQwen2 {
             // (P12: probs@V は行統合+ストライド直接参照、スクラッチ再利用 —
             //  数値は従来の per-(kvh,g) m=1 経路とビット一致、テスト担保)
             let mut att = vec![0.0f32; b * heads * dh];
-            crate::prof::time(crate::prof::ATTN, || {
+            crate::prof::time_layer(crate::prof::ATTN, li, || {
                 let scale = 1.0 / (dh as f32).sqrt();
                 // 読み取り専用借用に切り替えて各セッションのキャッシュを共有
                 let cache_refs: Vec<&KvCache> = caches.iter().map(|c| &**c).collect();
@@ -515,27 +521,32 @@ impl Model for LlamaQwen2 {
                 }
             });
 
-            let proj = crate::prof::time(crate::prof::OPROJ, || lin_b(&att, &layer.o_w, b));
+            let proj = crate::prof::time_layer(crate::prof::OPROJ, li, || lin_b(&att, &layer.o_w, b));
             for i in 0..b * e {
                 x[i] += proj[i];
             }
 
             // --- mlp (SwiGLU) ---
-            let h2 = crate::prof::time(crate::prof::RMSNORM, || {
+            let h2 = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
                 rmsnorm(&x, &layer.ln2_w, e, self.eps)
             });
-            let mut gate = crate::prof::time(crate::prof::GATE_UP, || lin_b(&h2, &layer.gate_w, b));
-            let up = crate::prof::time(crate::prof::GATE_UP, || lin_b(&h2, &layer.up_w, b));
-            crate::prof::time(crate::prof::SWIGLU, || {
+            let mut gate = crate::prof::time_layer(crate::prof::GATE_UP, li, || {
+                lin_b(&h2, &layer.gate_w, b)
+            });
+            let up =
+                crate::prof::time_layer(crate::prof::GATE_UP, li, || lin_b(&h2, &layer.up_w, b));
+            crate::prof::time_layer(crate::prof::SWIGLU, li, || {
                 silu_inplace(&mut gate);
                 for i in 0..b * self.ff {
                     gate[i] *= up[i];
                 }
             });
-            let down = crate::prof::time(crate::prof::DOWN, || lin_b(&gate, &layer.down_w, b));
+            let down =
+                crate::prof::time_layer(crate::prof::DOWN, li, || lin_b(&gate, &layer.down_w, b));
             for i in 0..b * e {
                 x[i] += down[i];
             }
+            crate::telemetry_layer_flush();
         }
 
         // --- final norm (行独立) + lm_head (バッチ) ---

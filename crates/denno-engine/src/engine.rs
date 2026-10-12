@@ -513,6 +513,7 @@ impl Engine {
                     session: sess.id,
                     prompt_tokens: (sess.prompt_ids.len() - sess.lcp) as u32,
                     ns: t0.elapsed().as_nanos() as u64,
+                    tokens: sess.prompt_ids[sess.lcp..].to_vec(),
                 });
                 telem::emit(self.kv_usage_frame());
                 self.flush_ops_frame();
