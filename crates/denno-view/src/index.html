@@ -709,6 +709,7 @@ function handleFrame(f) {
       }
       $("val-x").textContent = `${f.prompt_tokens} tok (prefill ${Math.floor(f.ns / 1e6)} ms)`;
       lit($("var-x"));
+      f._dur = 1140 / speed;   // prefill カスケード分だけ次のフレームを待つ
       break;
     }
     case "LayerRun": {
@@ -760,6 +761,8 @@ function handleFrame(f) {
           flyLine($("s2"), $("kvslots"), "#3fb950");
         }
       }
+      // この層のカスケード全体が終わる時間を記録 (再生キューの pacing に使う)
+      f._dur = delay + 120 / speed;
       // 隠れ変数 (residual stream) の更新表示
       $("val-x").textContent = `L${f.layer} passed: ${f.ops.map(o => OP_NAMES[o[0]] ?? o[0]).join("→")}`;
       lit($("var-x"), "lit", 180);
@@ -836,13 +839,17 @@ function handleFrame(f) {
 }
 
 // ---------- 再生キュー (アニメーションは推論を待たせない: 溢れたら間引き) ----------
+// speed が再生間隔を決める: low(0.5)では層カスケード約1.4秒+フレーム間 240ms で
+// 目で追えるスローモーション、high(8)ではほぼ実時間。追いつかない分は間引き。
 let queue = [];
+let playAt = 0;   // 次のフレームを再生してよい時刻 (performance.now 基準)
 function drain() {
-  const budget = Math.max(1, Math.round(2 * speed));
-  for (let i = 0; i < budget && queue.length; i++) {
-    const f = queue.shift();
-    try { handleFrame(f); } catch (e) { console.error("frame error", e, f); }
-  }
+  const now = performance.now();
+  if (now < playAt || !queue.length) return;
+  const f = queue.shift();
+  try { handleFrame(f); } catch (e) { console.error("frame error", e, f); }
+  // LayerRun は自分のカスケード長 (_dur) だけ次まで待つ。他は 120/speed ms
+  playAt = performance.now() + (f._dur !== undefined ? f._dur : 120 / speed);
   if (queue.length > 240) {
     // LayerRun を間引いて最新に追いつく (他の種別は保持)
     const keep = [];
