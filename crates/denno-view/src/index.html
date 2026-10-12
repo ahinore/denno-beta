@@ -433,9 +433,9 @@ const CODE = [
   ["c12", "    let h = rmsnorm(&x);   // attn in", 1, "attn"],
   ["c13", "    let qkv = qkv_proj(&h);", 3, null],
   ["c14", "    let q = rope(qkv.q, li);", 2, null],
-  ["c15", "    let a = attn_core(q, kv);", 4, null],
   ["s1",  "    kv.k[li][pos] = qkv.k;  // write K", null, null],
   ["s2",  "    kv.v[li][pos] = qkv.v;  // write V", null, null],
+  ["c15", "    let a = attn_core(q, &kv[li][..pos+1]);  // reads K/V", 4, null],
   ["c16", "    x = x + o_proj(a);     // residual", 5, null],
   ["c17", "    let h = rmsnorm(&x);   // mlp in", 1, "mlp"],
   ["c18", "    let gu = gate_up_proj(&h);", 6, null],
@@ -865,9 +865,9 @@ function handleFrame(f) {
         }
         if (op === 5) passedOproj = true;   // o_proj の後の rmsnorm は mlp 側
         if (op === 8) passedOproj = false;  // down_proj の後は次層の attn 側
-        if (op === 4) {
-          // attn_core: K/V を KV キャッシュへ書き込む (ループ内・実物どおりの位置)
-          // カーソルが c15 → s1 → s2 → (次の op) の順に進むようスロットを追加
+        if (op === 2) {
+          // rope の直後、実物 (llama.rs 296-302) と同じ位置で K/V をキャッシュへ書き込む
+          // カーソル: c14 → s1 → s2 → (次の op = attn)
           const st = Math.max(8, 70 / speed);
           setTimeout(() => { lit($(modeId("s1")), "state-lit", 450); codeGo("s1"); }, delay + st);
           setTimeout(() => {
@@ -877,6 +877,21 @@ function handleFrame(f) {
             codeGo("s2");
           }, delay + 2 * st);
           delay += 2 * st;
+        }
+        if (op === 3) {
+          // qkv_proj は rmsnorm(&x) の出力を消費する → var-x から c12 へ
+          const c12el = $(modeId("c12"));
+          if (c12el) flyLine($("var-x"), c12el, "#58a6ff");
+        }
+        if (op === 4) {
+          // attn_core が KV キャッシュを読む → kvslots から c15 へ (書き込みとは逆方向)
+          const c15el = $(modeId("c15"));
+          if (c15el) flyLine($("kvslots"), c15el, "#f778ba");
+        }
+        if (op === 6) {
+          // gate_up_proj も rmsnorm(&x) の出力を消費 → var-x から c17 へ
+          const c17el = $(modeId("c17"));
+          if (c17el) flyLine($("var-x"), c17el, "#58a6ff");
         }
       }
       // この層のカスケード全体が終わる時間を記録 (再生キューの pacing に使う)
@@ -894,6 +909,8 @@ function handleFrame(f) {
       lit($("lump-final"), "lit", 600);
       lit($("op-9"), "lit", 260);
       codeGo("c22");
+      const c22el = $(modeId("c22"));
+      if (c22el) flyLine($("var-x"), c22el, "#58a6ff");   // final_norm が x を読む
       setTimeout(() => { lit($("op-10"), "lit", 260); codeGo("c24"); }, 140 / speed);
       break;
     }
