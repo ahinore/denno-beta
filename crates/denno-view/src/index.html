@@ -148,6 +148,9 @@
   .cline.done { color: #c3cdd9; }
   .cline.cur { color: #e6edf3; background: #17301f; border-left-color: var(--glow); }
   .cline.cur .ln { color: var(--glow); }
+  .cline.state-lit { color: #7ee788; background: #17301f; border-left-color: var(--glow); }
+  #flysvg { position: fixed; inset: 0; width: 100%; height: 100%;
+            pointer-events: none; z-index: 50; }
 
   /* ---- 拡大コーン: model_forward ノード → 実装コードパネルへの接続 ---- */
   #midrow { position: relative; }
@@ -188,7 +191,9 @@
   <!-- 中央: 実装コード + コールグラフ / トークン+チャット の2ペイン -->
   <div id="centercol">
   <section class="panel" id="center">
-    <h2>コールグラフ (モデル駆動プログラム) — 左で実装コードがステップ実行される</h2>
+    <h2>入力トークン <span id="tokstat" class="muted" style="font-size:10px"></span></h2>
+    <div id="intokens"></div>
+    <h2 style="margin-top:8px">コールグラフ (モデル駆動プログラム) — 左で実装コードがステップ実行される</h2>
     <div id="midrow">
       <svg id="zoomlink"><polygon id="zlpoly"/><line id="zl1"/><line id="zl2"/></svg>
       <div id="codewrap">
@@ -234,14 +239,12 @@
         <div id="oplabel"></div>
       </div>
     </div>
+    <h2 style="margin-top:8px">出力トークン</h2>
+    <div id="tokens"></div>
   </section>
 
   <section class="panel" id="tokenpane">
-    <h2>入力トークン <span id="tokstat" class="muted" style="font-size:10px"></span></h2>
-    <div id="intokens"></div>
-    <h2>出力トークン</h2>
-    <div id="tokens"></div>
-    <h2 style="margin-top:8px">チャット <span class="muted" style="font-size:10px">(送信するとアニメーションが流れます)</span></h2>
+    <h2>チャット <span class="muted" style="font-size:10px">(送信するとアニメーションが流れます)</span></h2>
     <div id="chatlog"></div>
     <div id="chatbar">
       <input id="chatin" type="text" placeholder="メッセージを入力 (Enter で送信)" autocomplete="off">
@@ -264,6 +267,7 @@
     <div class="lump" id="lump-final">final_norm → lm_head — 語彙スコア</div>
   </section>
 </main>
+<svg id="flysvg"></svg>
 
 <script>
 "use strict";
@@ -426,6 +430,13 @@ const CODE = [
   ["c23", "  let logits = lm_head(&h);", 10, null],
   ["c24", "  sampler::greedy(logits, seed)", "topk", null],
   ["c25", "}", null, null],
+  ["c26", "", null, null],
+  ["c27", "// 状態の更新 (KV キャッシュと変数)", null, null],
+  ["s1", "kv.k[li][pos] = qkv.k;   // K を書き込み", null, null],
+  ["s2", "kv.v[li][pos] = qkv.v;   // V を書き込み", null, null],
+  ["s3", "hidden_x = x;            // 残差ストリーム更新", null, null],
+  ["s4", "chosen = greedy(logits);  // トークン決定", null, null],
+  ["s5", "emit(chosen);            // 出力トークン送出", null, null],
 ];
 const OP_LINE = { 0: "c10", 2: "c14", 3: "c13", 4: "c15", 5: "c16", 6: "c18", 7: "c19", 8: "c20" };
 (function buildCode() {
@@ -533,6 +544,32 @@ function drawCone() {
 setInterval(drawCone, 400);
 addEventListener("resize", drawCone);
 addEventListener("scroll", drawCone, true);
+
+// ---------- 状態更新行 → KVキャッシュ/変数 への飛点 ----------
+const flysvg = $("flysvg");
+const lastFly = {};
+function flyLine(fromEl, toEl, color) {
+  if (!fromEl || !toEl || !flysvg) return;
+  const now = performance.now();
+  if (now - (lastFly[toEl.id] || 0) < 160) return;   // 同一ターゲットへの洪水防止
+  lastFly[toEl.id] = now;
+  const a = fromEl.getBoundingClientRect(), b = toEl.getBoundingClientRect();
+  const x1 = a.left + a.width / 2, y1 = a.top + a.height / 2;
+  const x2 = b.left + b.width / 2, y2 = b.top + b.height / 2;
+  const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  c.setAttribute("r", 4); c.setAttribute("fill", color);
+  flysvg.appendChild(c);
+  const t0 = performance.now(), dur = 550;
+  function step(t) {
+    const k = Math.min(1, (t - t0) / dur);
+    const e = k * k * (3 - 2 * k);                    // smoothstep
+    c.setAttribute("cx", x1 + (x2 - x1) * e);
+    c.setAttribute("cy", y1 + (y2 - y1) * e);
+    c.setAttribute("opacity", 1 - k * 0.6);
+    if (k < 1) requestAnimationFrame(step); else c.remove();
+  }
+  requestAnimationFrame(step);
+}
 
 // ---------- 層スタック / KV スロット構築 ----------
 function buildLayers(n) {
@@ -706,6 +743,11 @@ function handleFrame(f) {
         }
         if (op === 5) passedOproj = true;   // o_proj の後の rmsnorm は mlp 側
         if (op === 8) passedOproj = false;  // down_proj の後は次層の attn 側
+        if (op === 4) {
+          // attn_core: K/V を KV キャッシュへ書き込む (状態更新コード → 左のKVへ)
+          lit($("s1"), "state-lit", 450); lit($("s2"), "state-lit", 450);
+          flyLine($("s2"), $("kvslots"), "#3fb950");
+        }
       }
       // 隠れ変数 (residual stream) の更新表示
       $("val-x").textContent = `L${f.layer} 通過: ${f.ops.map(o => OP_NAMES[o[0]] ?? o[0]).join("→")}`;
@@ -728,6 +770,8 @@ function handleFrame(f) {
       $("val-token").textContent = `${tokText(f.token) || "?"} (id ${f.token}, pos ${f.pos})`;
       lit($("var-token"));
       lit($("n-detok"));
+      lit($("s5"), "state-lit", 450);
+      flyLine($("s5"), $("var-token"), "#7ee788");
       codeGo("c5");
       break;
     }
@@ -740,6 +784,8 @@ function handleFrame(f) {
       lit($("var-logits")); lit($("var-entropy"));
       lit($("n-step"), "lit", 200);
       lit($("n-sample"), "litwarm", 400);
+      lit($("s4"), "state-lit", 450);
+      flyLine($("s4"), $("var-logits"), "#d29922");
       pulseTo($("n-sample"), `p=${((f.entries[0]?.[1] || 0) * 100).toFixed(1)}%`);
       codeGo("c24");
       break;
@@ -762,6 +808,8 @@ function handleFrame(f) {
     case "Step": {
       lit($("n-step"));
       codeGo("c4");
+      lit($("s3"), "state-lit", 450);
+      flyLine($("s3"), $("var-x"), "#58a6ff");
       $("n-step").querySelector(".sub").textContent =
         `batch ${f.width} / ${(f.ns / 1e6).toFixed(1)} ms`;
       break;
