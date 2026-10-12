@@ -118,6 +118,33 @@
   #chatbar button:hover:not(:disabled) { border-color: var(--acc); }
   #chatbar button:disabled { opacity: .5; cursor: default; }
   #chatbar .mt { width: 60px; }
+  .layer .lsec { display: flex; align-items: center; gap: 2px; margin-top: 2px; flex-wrap: wrap; }
+  .layer .tag { font-size: 8px; color: var(--mut); width: 26px; flex: none; }
+  .layer .chip { font-size: 9px; padding: 0 3px; border: 1px solid var(--line); border-radius: 4px;
+                 color: var(--mut); transition: box-shadow .15s, color .15s, border-color .15s; }
+  .layer .chip.lit { border-color: var(--glow); color: #7ee788; box-shadow: 0 0 6px #3fb95055; }
+  .lump { border: 1px solid var(--line); border-radius: 6px; padding: 4px 7px; margin-bottom: 4px;
+          background: var(--panel2); font-size: 11px; color: var(--mut);
+          transition: box-shadow .2s, border-color .2s; }
+  .lump.lit { border-color: var(--warm); box-shadow: 0 0 10px #d2992255; }
+  .lgroup { border: 1px dashed var(--line); border-radius: 8px; padding: 5px; margin-bottom: 4px; }
+  .ghead { font-size: 10px; color: var(--acc); margin-bottom: 4px; }
+
+  /* ---- 中央左: 実装コード (デバッガ風ステップ実行) ---- */
+  #midrow { display: flex; gap: 10px; align-items: flex-start; }
+  #codewrap { width: 252px; flex: none; border: 1px solid var(--line); border-radius: 8px;
+              padding: 6px 4px; background: #14171c; overflow: hidden; }
+  #code { max-height: 560px; overflow-y: auto; }
+  .cline { white-space: pre; font-size: 10.5px; color: #8ea0b5; padding: 0 4px;
+           border-left: 2px solid transparent; line-height: 1.45; }
+  .cline .ln { color: #4a5563; display: inline-block; width: 20px; text-align: right;
+               margin-right: 7px; user-select: none; }
+  .cline .tx { white-space: pre; }
+  .cline .cm { color: #4f5a66; }
+  .cline .watch { color: var(--warm); }
+  .cline.done { color: #c3cdd9; }
+  .cline.cur { color: #e6edf3; background: #17301f; border-left-color: var(--glow); }
+  .cline.cur .ln { color: var(--glow); }
 </style>
 </head>
 <body>
@@ -144,10 +171,16 @@
     <div id="ops" class="muted" style="font-size:11px">-</div>
   </section>
 
-  <!-- 中央: コールグラフ -->
+  <!-- 中央: 実装コード + コールグラフ -->
   <section class="panel" id="center">
-    <h2>コールグラフ (モデル駆動プログラム)</h2>
-    <div id="graph">
+    <h2>コールグラフ (モデル駆動プログラム) — 左で実装コードがステップ実行される</h2>
+    <div id="midrow">
+      <div id="codewrap">
+        <h2 style="margin-top:0">実装コード (llama.rs 構造)</h2>
+        <div id="code"></div>
+      </div>
+      <div id="graphwrap">
+        <div id="graph">
       <div class="node" id="n-serve"><span class="name">denno serve</span>
         <div class="sub">HTTP + WS エンドポイント</div></div>
       <div class="node" id="n-sched"><span class="name">scheduler</span>
@@ -175,6 +208,11 @@
         <div class="sub">greedy (seed 固定)</div></div>
       <div class="node" id="n-detok"><span class="name">detok</span>
         <div class="sub">ストリーミング差分デコード</div></div>
+        </div>
+        <div id="fallzone"></div>
+        <div id="pulse"></div>
+        <div id="oplabel"></div>
+      </div>
     </div>
     <h2 style="margin-top:8px">入力トークン <span id="tokstat" class="muted" style="font-size:10px"></span></h2>
     <div id="intokens"></div>
@@ -189,15 +227,17 @@
       <button id="chatsend">送信</button>
       <button id="chatclear" title="履歴クリア">✕</button>
     </div>
-    <div id="fallzone"></div>
-    <div id="pulse"></div>
-    <div id="oplabel"></div>
   </section>
 
-  <!-- 右: 層スタック -->
+  <!-- 右: モデル構造 (層スタック) -->
   <section class="panel" id="right">
-    <h2>モデルの層 — 直近の演算内容</h2>
-    <div id="layers"></div>
+    <h2>モデル構造 — 直近の演算内容</h2>
+    <div class="lump" id="lump-embed">embed — トークン → ベクトル</div>
+    <div class="lgroup">
+      <div class="ghead">decoder layer × <span id="gcount">-</span> <span class="muted">(Attention + MLP)</span></div>
+      <div id="layers"></div>
+    </div>
+    <div class="lump" id="lump-final">final_norm → lm_head — 語彙スコア</div>
   </section>
 </main>
 
@@ -333,6 +373,73 @@ const $ = (id) => document.getElementById(id);
 const srv = $("srvinfo"), sessEl = $("sess"), gapEl = $("gap"), statEl = $("stat");
 let nLayers = 0, ctxLen = 0, speed = 1;
 
+// ---------- 実装コードパネル (デバッガ風ステップ実行) ----------
+// denno-engine/src/model/llama.rs + engine.rs の構造に対応する擬似コード。
+// op 番号は prof の OP 定数 (= LayerRun / OpSummary の op) と一致させる。
+const CODE = [
+  ["c1",  "// denno-server: セッションループ", null, null],
+  ["c2",  "let session = scheduler.admit(req);", "admit", null],
+  ["c3",  "loop {", null, null],
+  ["c4",  "  let step = engine.step_chat(sess);", "step", null],
+  ["c5",  "  scheduler.emit_token(step.token);", "token", null],
+  ["c6",  "}", null, null],
+  ["c7",  "", null, null],
+  ["c8",  "// denno-engine: 1 ステップの実体", null, null],
+  ["c9",  "fn step_chat(sess) -> Step {", null, null],
+  ["c10", "  let mut x = embed(last_token);", 0, null],
+  ["c11", "  for (li, layer) in layers {", "loop", "watch"],
+  ["c12", "    let h = rmsnorm(&x);   // attn in", 1, "attn"],
+  ["c13", "    let qkv = qkv_proj(&h);", 3, null],
+  ["c14", "    let q = rope(qkv.q, li);", 2, null],
+  ["c15", "    let a = attn_core(q, kv);", 4, null],
+  ["c16", "    x = x + o_proj(a);     // residual", 5, null],
+  ["c17", "    let h = rmsnorm(&x);   // mlp in", 1, "mlp"],
+  ["c18", "    let gu = gate_up_proj(&h);", 6, null],
+  ["c19", "    let act = swiglu(gu);", 7, null],
+  ["c20", "    x = x + down_proj(act); // residual", 8, null],
+  ["c21", "  }", null, null],
+  ["c22", "  let h = final_norm(&x);", 9, null],
+  ["c23", "  let logits = lm_head(&h);", 10, null],
+  ["c24", "  sampler::greedy(logits, seed)", "topk", null],
+  ["c25", "}", null, null],
+];
+const OP_LINE = { 0: "c10", 2: "c14", 3: "c13", 4: "c15", 5: "c16", 6: "c18", 7: "c19", 8: "c20" };
+(function buildCode() {
+  const box = $("code");
+  CODE.forEach(([id, text, op, side], i) => {
+    const d = document.createElement("div");
+    d.className = "cline"; d.id = id;
+    const ln = document.createElement("span");
+    ln.className = "ln"; ln.textContent = i + 1;
+    const tx = document.createElement("span");
+    tx.className = "tx"; tx.textContent = text;
+    d.appendChild(ln); d.appendChild(tx);
+    if (id === "c11") {
+      const w = document.createElement("span");
+      w.id = "cli"; w.className = "watch"; w.textContent = "  li = -";
+      d.appendChild(w);
+    }
+    if (typeof op === "number") d.dataset.op = op;
+    if (side) d.dataset.side = side;
+    box.appendChild(d);
+  });
+})();
+let curLine = null;
+function codeGo(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (curLine && curLine !== el) curLine.classList.remove("cur");
+  el.classList.add("cur", "done");
+  curLine = el;
+  const box = $("code");
+  const top = el.offsetTop - box.clientHeight / 2;
+  box.scrollTop = Math.max(0, top);
+}
+function lineForOp(op) {
+  if (op === 1) return passedOproj ? "c17" : "c12";  // attn 側 / mlp 側
+  return OP_LINE[op] ?? null;
+}
+
 function lit(el, cls = "lit", ms = 320) {
   if (!el) return;
   el.classList.remove("lit", "litwarm");
@@ -363,13 +470,20 @@ function pulseTo(el, label) {
 // ---------- 層スタック / KV スロット構築 ----------
 function buildLayers(n) {
   nLayers = n;
+  $("gcount").textContent = n;
   const box = $("layers");
   box.innerHTML = "";
+  const ATT = [[1, "rms"], [3, "qkv"], [2, "rope"], [4, "attn"], [5, "o_p"]];
+  const MLP = [[6, "g_u"], [7, "swi"], [8, "down"]];
+  const chips = (arr) => arr.map(([op, nm]) =>
+    `<span class="chip" data-op="${op}">${nm}</span>`).join("");
   for (let i = 0; i < n; i++) {
     const d = document.createElement("div");
     d.className = "layer"; d.id = "layer-" + i;
-    d.innerHTML = `<div class="lhead"><span class="lname">layer ${i}</span>
+    d.innerHTML = `<div class="lhead"><span class="lname">L${i}</span>
                    <span class="lms"></span></div>
+                   <div class="lsec"><span class="tag">ATT</span>${chips(ATT)}</div>
+                   <div class="lsec"><span class="tag">MLP</span>${chips(MLP)}</div>
                    <div class="lops"><span class="n">-</span></div>`;
     box.appendChild(d);
   }
@@ -461,12 +575,15 @@ function handleFrame(f) {
       $("intokens").innerHTML = "";
       statEl.textContent = "prefill 中…";
       lit($("n-sched")); lit($("n-step"));
+      codeGo("c2");
       break;
     }
     case "Prefill": {
       // プロンプトの列が上から降りて embed に入る (文字表示つきチップ)
       fallTokens(f.tokens, "op-embed");
       setInputTokens(f.tokens);
+      lit($("lump-embed"), "lit", 900);
+      codeGo("c10");
       lit($("op-embed"), "litwarm", 900);
       // prefill の forward 全層をすばやく通過演出 (層パネルが上から下へ流れる)
       for (let i = 0; i < nLayers; i++) {
@@ -481,8 +598,12 @@ function handleFrame(f) {
     }
     case "LayerRun": {
       // 層が点灯 → 演算内容 (op列+実測ms) を層行に表示 → 中央の対応 op が順に点灯
+      // → 左の実装コードもデバッガのステップ実行のように追従
       const L = $("layer-" + f.layer);
       lit(L);
+      codeGo("c11");
+      const w = $("cli");
+      if (w) w.textContent = `  li = ${f.layer}/${nLayers}`;
       if (L) {
         const total = f.ops.reduce((s, o) => s + o[1], 0);
         const lms = L.querySelector(".lms");
@@ -499,6 +620,8 @@ function handleFrame(f) {
         let el = null;
         if (op === 1) el = rmsNode();
         else if (op <= 10) el = $("op-" + op);
+        const lineId = lineForOp(op);
+        const chip = L?.querySelector(`.chip[data-op="${op}"]`);
         if (el) {
           setTimeout(() => {
             lit(el);
@@ -507,6 +630,12 @@ function handleFrame(f) {
             pulseTo(el, `${OP_NAMES[op]} L${f.layer} ${(ns / 1e6).toFixed(2)}ms`);
           }, delay);
           delay += Math.max(8, 70 / speed);
+        }
+        if (lineId) {
+          setTimeout(() => {
+            codeGo(lineId);
+            if (chip) lit(chip, "lit", Math.max(60, 180 / speed));
+          }, delay);
         }
         if (op === 5) passedOproj = true;   // o_proj の後の rmsnorm は mlp 側
         if (op === 8) passedOproj = false;  // down_proj の後は次層の attn 側
@@ -519,6 +648,12 @@ function handleFrame(f) {
     case "OpSummary": {
       $("ops").textContent = f.ops.map(([op, ns]) =>
         `${OP_NAMES[op] ?? op}: ${(ns / 1e6).toFixed(1)}`).join(" / ");
+      // 層ループの外側で走る final_norm / lm_head は LayerRun に含まれないため
+      // OpSummary 到着時に点灯 + コードも前進させる
+      lit($("lump-final"), "lit", 600);
+      lit($("op-9"), "lit", 260);
+      codeGo("c22");
+      setTimeout(() => { lit($("op-10"), "lit", 260); codeGo("c24"); }, 140);
       break;
     }
     case "Token": {
@@ -526,6 +661,7 @@ function handleFrame(f) {
       $("val-token").textContent = `${tokText(f.token) || "?"} (id ${f.token}, pos ${f.pos})`;
       lit($("var-token"));
       lit($("n-detok"));
+      codeGo("c5");
       break;
     }
     case "TopK": {
@@ -538,6 +674,7 @@ function handleFrame(f) {
       lit($("n-step"), "lit", 200);
       lit($("n-sample"), "litwarm", 400);
       pulseTo($("n-sample"), `p=${((f.entries[0]?.[1] || 0) * 100).toFixed(1)}%`);
+      codeGo("c24");
       break;
     }
     case "KvUsage": {
@@ -557,6 +694,7 @@ function handleFrame(f) {
     }
     case "Step": {
       lit($("n-step"));
+      codeGo("c4");
       $("n-step").querySelector(".sub").textContent =
         `batch ${f.width} / ${(f.ns / 1e6).toFixed(1)} ms`;
       break;
