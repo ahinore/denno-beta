@@ -24,22 +24,22 @@ flowchart LR
         A[pull / models / info / generate / serve]
     end
     subgraph Server["denno-server (axum)"]
-        B["POST /v1/messages\n(非ストリーミング + SSE)"]
+        B["POST /v1/messages<br/>(非ストリーミング + SSE)"]
         C["GET /v1/models, /health"]
-        S[scheduler\n有界キュー + 連続バッチング]
+        S[scheduler<br/>有界キュー + 連続バッチング]
     end
     subgraph Engine["denno-engine (推論コア)"]
-        D[tokenizer\nHF tokenizers + chat template]
-        E[model\nGPT-2 / Llama系 Qwen2]
-        F[KvCache\nスロットプール + prefix cache]
-        G[Sampler\ngreedy / top-k / top-p]
-        T[tensor\nsgemm / norm / rope]
-        Q[quant\nint8 + SIMD i8×i8]
-        P[prof\nセルフプロファイラ]
-        TL[telemetry\n捕捉フック]
+        D[tokenizer<br/>HF tokenizers + chat template]
+        E[model<br/>GPT-2 / Llama系 Qwen2]
+        F[KvCache<br/>スロットプール + prefix cache]
+        G[Sampler<br/>greedy / top-k / top-p]
+        T[tensor<br/>sgemm / norm / rope]
+        Q[quant<br/>int8 + SIMD i8×i8]
+        P[prof<br/>セルフプロファイラ]
+        TL[telemetry<br/>捕捉フック]
     end
     subgraph View["denno-view (可視化中継・別プロセス)"]
-        V[ダッシュボード\nWS multiplex + /chat プロキシ]
+        V[ダッシュボード<br/>WS multiplex + /chat プロキシ]
     end
     A --> B --> S --> D --> E --> T
     E --> F
@@ -85,26 +85,26 @@ denno-beta/
 
 ```mermaid
 flowchart TB
-    REQ["POST /v1/messages"] --> AUTH{api key 検証\nmodel 名検証}
+    REQ["POST /v1/messages"] --> AUTH{api key 検証<br/>model 名検証}
     AUTH -->|"queue 満杯"| E503["503 overloaded_error"]
-    AUTH --> TOK["tokenizer\napply_chat_template → encode"]
-    TOK --> SUB[scheduler.submit_chat\n有界キュー(mpsc sync_channel)]
+    AUTH --> TOK["tokenizer<br/>apply_chat_template → encode"]
+    TOK --> SUB["scheduler.submit_chat<br/>有界キュー(mpsc sync_channel)"]
     SUB -->|"キュー満杯"| E503
-    SUB --> W[ワーカー(単一スレッド)]
-    W --> ADMIT[admit: begin_chat\nchat template / max_tokens クランプ]
-    ADMIT --> PC{prefix cache\nLCP 最大エントリ?}
-    PC -->|"ヒット"| TR[truncate して KV 再利用\nrecompute は差分のみ]
-    PC -->|"ミス"| PF[全 prompt を prefill\n(重み × 入力の GEMM)]
+    SUB --> W["ワーカー(単一スレッド)"]
+    W --> ADMIT[admit: begin_chat<br/>chat template / max_tokens クランプ]
+    ADMIT --> PC{prefix cache<br/>LCP 最大エントリ?}
+    PC -->|"ヒット"| TR[truncate して KV 再利用<br/>recompute は差分のみ]
+    PC -->|"ミス"| PF["全 prompt を prefill<br/>(重み × 入力の GEMM)"]
     TR --> LIVE[live セッション]
     PF --> LIVE
-    LIVE --> LOOP["step_chat × N\n(エンジン mutex を 1 forward ずつ)"]
-    LOOP --> PULL["ステップ間に新規到着を pull\n(スロットに空きがあれば admit)"]
-    PULL --> BATCH["decode は全常駐セッションを\n1 forward にまとめる(P6)"]
-    BATCH --> STOP{停止条件?\nEOS / max_tokens / stop_seq}
-    STOP -->|"継続"| SAMP[sampler\ngreedy / temperature / top_p / top_k\nseed 固定で決定論]
+    LIVE --> LOOP["step_chat × N<br/>(エンジン mutex を 1 forward ずつ)"]
+    LOOP --> PULL["ステップ間に新規到着を pull<br/>(スロットに空きがあれば admit)"]
+    PULL --> BATCH["decode は全常駐セッションを<br/>1 forward にまとめる(P6)"]
+    BATCH --> STOP{停止条件?<br/>EOS / max_tokens / stop_seq}
+    STOP -->|"継続"| SAMP[sampler<br/>greedy / temperature / top_p / top_k<br/>seed 固定で決定論]
     SAMP --> LOOP
-    STOP -->|"停止"| OUT[ChatOutput\ntext / stop_reason / usage]
-    OUT --> RESP["JSON または SSE\n(event: 行 + keep-alive 2秒)"]
+    STOP -->|"停止"| OUT[ChatOutput<br/>text / stop_reason / usage]
+    OUT --> RESP["JSON または SSE<br/>(event: 行 + keep-alive 2秒)"]
 ```
 
 ### ポイント
@@ -229,17 +229,17 @@ event: message_stop
 
 ```mermaid
 flowchart TB
-    REQ["新リクエスト"] --> Q["有界キュー\n(満席なら 503)"]
-    Q --> W{"空きスロット?\nactive < MAX_ACTIVE"}
-    W -->|あり| ADM["install_session\n空きスロット選定\n(LCP最大のスロットを優先)"]
+    REQ["新リクエスト"] --> Q["有界キュー<br/>(満席なら 503)"]
+    Q --> W{"空きスロット?<br/>active < MAX_ACTIVE"}
+    W -->|あり| ADM["install_session<br/>空きスロット選定<br/>(LCP最大のスロットを優先)"]
     W -->|なし| WAIT["キューで待機"]
     ADM --> PRE{"prefill済?"}
-    PRE -->|未| PF["step_chat: 残りプロンプトを\n1回のforwardで処理"]
+    PRE -->|未| PF["step_chat: 残りプロンプトを<br/>1回のforwardで処理"]
     PRE -->|済| DEC
-    PF --> DEC["step_chat_batch:\n全常駐セッションのサンプル+終了判定を個別に、\nforwardは 1回の forward_batch にまとめる"]
+    PF --> DEC["step_chat_batch:<br/>全常駐セッションのサンプル+終了判定を個別に、<br/>forwardは 1回の forward_batch にまとめる"]
     DEC --> DONE{"全員完了?"}
     DONE -->|いいえ| W
-    DONE -->|完了セッションあり| REL["release_session:\nprefix storeへ退避(重複はスキップ)\nKV行とcached_promptsは残置\n→ 次セッションがゼロコピーlive再利用"]
+    DONE -->|完了セッションあり| REL["release_session:<br/>prefix storeへ退避(重複はスキップ)<br/>KV行とcached_promptsは残置<br/>→ 次セッションがゼロコピーlive再利用"]
     REL --> W
 ```
 
@@ -257,10 +257,10 @@ exactnessの根拠は2段:
 
 ```mermaid
 flowchart LR
-    A[config.json] -->|"model_type = gpt2"| B[Gpt2\nmodel/gpt2.rs]
-    A -->|"model_type = qwen2"| C[LlamaQwen2\nmodel/llama.rs]
-    A -->|その他| D[エラー\n未対応の model_type]
-    B --> E[Model トレイト\nforward / new_cache / eos_ids / context]
+    A[config.json] -->|"model_type = gpt2"| B[Gpt2<br/>model/gpt2.rs]
+    A -->|"model_type = qwen2"| C[LlamaQwen2<br/>model/llama.rs]
+    A -->|その他| D[エラー<br/>未対応の model_type]
+    B --> E[Model トレイト<br/>forward / new_cache / eos_ids / context]
     C --> E
 ```
 
@@ -285,9 +285,9 @@ flowchart LR
 ```mermaid
 flowchart TB
     X[x 入力] --> N1["LayerNorm(重み + bias)"]
-    N1 --> CAT["c_attn: 1つの Conv1D で Q,K,V を連結した\n[n, 3e] を一括出力(biasあり)"]
-    CAT --> KVW["K, V を KVキャッシュへ書き込み\n(全ヘッド分)"]
-    KVW --> ATT["causal attention\n位置i × ヘッドごとのループで\nq·k → softmax → Σ w·v"]
+    N1 --> CAT["c_attn: 1つの Conv1D で Q,K,V を連結した<br/>[n, 3e] を一括出力(biasあり)"]
+    CAT --> KVW["K, V を KVキャッシュへ書き込み<br/>(全ヘッド分)"]
+    KVW --> ATT["causal attention<br/>位置i × ヘッドごとのループで<br/>q·k → softmax → Σ w·v"]
     ATT --> PROJ["c_proj(線形)+ bias"]
     X -->|"residual +"| ADD1[(+)]
     PROJ --> ADD1
@@ -304,10 +304,10 @@ flowchart TB
 ```mermaid
 flowchart TB
     X2[x 入力] --> N1B["rmsnorm(biasなし)"]
-    N1B --> QKV["q/k/v を独立の Linear で3回計算\n(0.5B は q/k/v に bias あり)"]
-    QKV --> R["RoPE 適用\nq は全ヘッド / k は kv_heads"]
-    R --> KVW2["K, V を KVキャッシュへ書き込み\n(kv_heads 分だけ = GQA)"]
-    KVW2 --> ATTB["GQA attention\nkv-head × group で scores = q@k^T を sgemm 一括計算\n→ causal mask → softmax → probs@V も行列積"]
+    N1B --> QKV["q/k/v を独立の Linear で3回計算<br/>(0.5B は q/k/v に bias あり)"]
+    QKV --> R["RoPE 適用<br/>q は全ヘッド / k は kv_heads"]
+    R --> KVW2["K, V を KVキャッシュへ書き込み<br/>(kv_heads 分だけ = GQA)"]
+    KVW2 --> ATTB["GQA attention<br/>kv-head × group で scores = q@k^T を sgemm 一括計算<br/>→ causal mask → softmax → probs@V も行列積"]
     X2 -->|"residual +"| ADD1B[(+)]
     ATTB --> OP["o_proj(線形)"]
     OP --> ADD1B
@@ -337,18 +337,18 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    TOK["トークン列 tokens[n]"] --> EMB["埋め込み: x[i] = wte[tok_i] + wpe[pos_i]\n(位置は学習済みテーブルを直接参照)"]
+    TOK["トークン列 tokens[n]"] --> EMB["埋め込み: x[i] = wte[tok_i] + wpe[pos_i]<br/>(位置は学習済みテーブルを直接参照)"]
     EMB --> L["▼ 24層ループ ─────────────────"]
     L --> LN1["layernorm(x) — 重み+bias"]
-    LN1 --> QKV["c_attn: 1つの Conv1D で [n, 3e] を一括出力\n(Q,K,Vが連結・biasあり) → add_bias"]
-    QKV --> KVW["K, V を KVキャッシュへ書き込み\n(全ヘッド = e次元)"]
-    KVW --> ATT["causal attention:\n位置i × ヘッドごとのループで\nq·k → softmax → Σ w·v\n(スカラーdotの二重ループ)"]
+    LN1 --> QKV["c_attn: 1つの Conv1D で [n, 3e] を一括出力<br/>(Q,K,Vが連結・biasあり) → add_bias"]
+    QKV --> KVW["K, V を KVキャッシュへ書き込み<br/>(全ヘッド = e次元)"]
+    KVW --> ATT["causal attention:<br/>位置i × ヘッドごとのループで<br/>q·k → softmax → Σ w·v<br/>(スカラーdotの二重ループ)"]
     ATT --> PROJ["c_proj + bias → x に加算(residual)"]
     PROJ --> LN2["layernorm(x)"]
     LN2 --> MLP["mlp: 4e に拡張 → GELU → 投影 → x に加算(residual)"]
     MLP -->|"次の層 / 層終了"| L
     L --> FIN["最終 layernorm"]
-    FIN --> LOG["logits = h @ wte^T\n(tied: 埋め込み行列を転置使用)"]
+    FIN --> LOG["logits = h @ wte^T<br/>(tied: 埋め込み行列を転置使用)"]
 ```
 
 **特徴**: QKVを1つの大きなmatmulで同時出力する(GEMM 1回で済む=GPU向き)。位置情報は埋め込みの段階で付与済みなのでattention内に位置処理がない。attention本体は「位置iごと・ヘッドごと」の素直なループ構造。
@@ -359,19 +359,19 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    TOK["トークン列 tokens[n]"] --> EMB["埋め込み: x[i] = embed[tok_i]\n(位置情報はまだ加えない)"]
+    TOK["トークン列 tokens[n]"] --> EMB["埋め込み: x[i] = embed[tok_i]<br/>(位置情報はまだ加えない)"]
     EMB --> L["▼ 24層ループ ─────────────────"]
     L --> N1["rmsnorm(x) — biasなし"]
-    N1 --> QKV3["q/k/v を独立の Linear で3回計算\n(0.5Bは q/k/v にbiasあり — Llama系には通常ない)"]
-    QKV3 --> ROPE["RoPE: q と k に相対位置を回転として注入\n(絶対位置テーブルは使わない)"]
-    ROPE --> KVW["K, V を KVキャッシュへ書き込み\n(kv_heads 分だけ = GQA)"]
-    KVW --> ATT["GQA attention (sgemmで一括):\nkv-head × group の二重ループだが\nscores = q@k^T を行列積で計算\n→ causal mask → softmax → probs@V も行列積"]
+    N1 --> QKV3["q/k/v を独立の Linear で3回計算<br/>(0.5Bは q/k/v にbiasあり — Llama系には通常ない)"]
+    QKV3 --> ROPE["RoPE: q と k に相対位置を回転として注入<br/>(絶対位置テーブルは使わない)"]
+    ROPE --> KVW["K, V を KVキャッシュへ書き込み<br/>(kv_heads 分だけ = GQA)"]
+    KVW --> ATT["GQA attention (sgemmで一括):<br/>kv-head × group の二重ループだが<br/>scores = q@k^T を行列積で計算<br/>→ causal mask → softmax → probs@V も行列積"]
     ATT --> OPROJ["o_proj → x に加算(residual)"]
     OPROJ --> N2["rmsnorm(x)"]
-    N2 --> MLP["gate_proj + up_proj → silu(gate)×up\n(SwiGLU) → down_proj → x に加算(residual)"]
+    N2 --> MLP["gate_proj + up_proj → silu(gate)×up<br/>(SwiGLU) → down_proj → x に加算(residual)"]
     MLP -->|"次の層 / 層終了"| L
     L --> FIN["最終 rmsnorm"]
-    FIN --> LOG["logits = lm_head(h)\n(untied: 独立重み / tied: embed^T)"]
+    FIN --> LOG["logits = lm_head(h)<br/>(untied: 独立重み / tied: embed^T)"]
 ```
 
 **特徴**:
@@ -412,7 +412,7 @@ P6以降は複数セッション同時実行時に `step_chat_batch` が使わ�
 
 ```mermaid
 flowchart LR
-    PULL["denno pull REPO"] --> HUB[HF hub キャッシュに DL\n(単一 model.safetensors)]
+    PULL["denno pull REPO"] --> HUB["HF hub キャッシュに DL<br/>(単一 model.safetensors)"]
     PULL -->|"3B/7B: index.json"| SHARD["分割 shard を全て DL"]
     SERVE["denno serve REPO"] --> CFG[config.json を読む]
     CFG --> MT{"model_type?"}
@@ -421,7 +421,7 @@ flowchart LR
     G2 --> Q{quant mode?}
     LQ --> Q
     Q -->|fp32| FP[重みをそのまま fp32 で保持]
-    Q -->|int8| I8["線形層を per-channel scale でオフライン量子化\n(embedding は fp32 維持)"]
+    Q -->|int8| I8["線形層を per-channel scale でオフライン量子化<br/>(embedding は fp32 維持)"]
     FP --> READY[Model トレイトとして engine に渡す]
     I8 --> READY
 ```

@@ -24,22 +24,22 @@ flowchart LR
         A[pull / models / info / generate / serve]
     end
     subgraph Server["denno-server (axum)"]
-        B["POST /v1/messages\n(non-streaming + SSE)"]
+        B["POST /v1/messages<br/>(non-streaming + SSE)"]
         C["GET /v1/models, /health"]
-        S[scheduler\nbounded queue + continuous batching]
+        S[scheduler<br/>bounded queue + continuous batching]
     end
     subgraph Engine["denno-engine (inference core)"]
-        D[tokenizer\nHF tokenizers + chat template]
-        E[model\nGPT-2 / Llama-family Qwen2]
-        F[KvCache\nslot pool + prefix cache]
-        G[Sampler\ngreedy / top-k / top-p]
-        T[tensor\nsgemm / norm / rope]
-        Q[quant\nint8 + SIMD i8×i8]
-        P[prof\nself-profiler]
-        TL[telemetry\ncapture hooks]
+        D[tokenizer<br/>HF tokenizers + chat template]
+        E[model<br/>GPT-2 / Llama-family Qwen2]
+        F[KvCache<br/>slot pool + prefix cache]
+        G[Sampler<br/>greedy / top-k / top-p]
+        T[tensor<br/>sgemm / norm / rope]
+        Q[quant<br/>int8 + SIMD i8×i8]
+        P[prof<br/>self-profiler]
+        TL[telemetry<br/>capture hooks]
     end
     subgraph View["denno-view (visualization relay, separate process)"]
-        V[dashboard\nWS multiplex + /chat proxy]
+        V[dashboard<br/>WS multiplex + /chat proxy]
     end
     A --> B --> S --> D --> E --> T
     E --> F
@@ -85,26 +85,26 @@ denno-beta/
 
 ```mermaid
 flowchart TB
-    REQ["POST /v1/messages"] --> AUTH{api key check\nmodel name check}
+    REQ["POST /v1/messages"] --> AUTH{api key check<br/>model name check}
     AUTH -->|"queue full"| E503["503 overloaded_error"]
-    AUTH --> TOK["tokenizer\napply_chat_template → encode"]
-    TOK --> SUB[scheduler.submit_chat\nbounded queue (mpsc sync_channel)]
+    AUTH --> TOK["tokenizer<br/>apply_chat_template → encode"]
+    TOK --> SUB["scheduler.submit_chat<br/>bounded queue (mpsc sync_channel)"]
     SUB -->|"queue full"| E503
-    SUB --> W[worker (single thread)]
-    W --> ADMIT[admit: begin_chat\nchat template / max_tokens clamp]
-    ADMIT --> PC{prefix cache\nlargest LCP entry?}
-    PC -->|"hit"| TR[truncate and reuse KV\nrecompute only the difference]
-    PC -->|"miss"| PF[prefill the whole prompt\n(weights × input GEMM)]
+    SUB --> W["worker (single thread)"]
+    W --> ADMIT[admit: begin_chat<br/>chat template / max_tokens clamp]
+    ADMIT --> PC{prefix cache<br/>largest LCP entry?}
+    PC -->|"hit"| TR[truncate and reuse KV<br/>recompute only the difference]
+    PC -->|"miss"| PF["prefill the whole prompt<br/>(weights × input GEMM)"]
     TR --> LIVE[live session]
     PF --> LIVE
-    LIVE --> LOOP["step_chat × N\n(engine mutex one forward at a time)"]
-    LOOP --> PULL["pull newly arrived requests between steps\n(admit when a slot is free)"]
-    PULL --> BATCH["decode: combine all resident sessions\ninto a single forward (P6)"]
-    BATCH --> STOP{stop condition?\nEOS / max_tokens / stop_seq}
-    STOP -->|"continue"| SAMP[sampler\ngreedy / temperature / top_p / top_k\nfixed seed for determinism]
+    LIVE --> LOOP["step_chat × N<br/>(engine mutex one forward at a time)"]
+    LOOP --> PULL["pull newly arrived requests between steps<br/>(admit when a slot is free)"]
+    PULL --> BATCH["decode: combine all resident sessions<br/>into a single forward (P6)"]
+    BATCH --> STOP{stop condition?<br/>EOS / max_tokens / stop_seq}
+    STOP -->|"continue"| SAMP[sampler<br/>greedy / temperature / top_p / top_k<br/>fixed seed for determinism]
     SAMP --> LOOP
-    STOP -->|"stop"| OUT[ChatOutput\ntext / stop_reason / usage]
-    OUT --> RESP["JSON or SSE\n(event: lines + 2-second keep-alive)"]
+    STOP -->|"stop"| OUT[ChatOutput<br/>text / stop_reason / usage]
+    OUT --> RESP["JSON or SSE<br/>(event: lines + 2-second keep-alive)"]
 ```
 
 ### Key points
@@ -229,17 +229,17 @@ A single worker thread advances a **set of resident sessions** together. The KV 
 
 ```mermaid
 flowchart TB
-    REQ["new request"] --> Q["bounded queue\n(503 when full)"]
-    Q --> W{"free slot?\nactive < MAX_ACTIVE"}
-    W -->|yes| ADM["install_session\npick a free slot\n(prefer the largest-LCP slot)"]
+    REQ["new request"] --> Q["bounded queue<br/>(503 when full)"]
+    Q --> W{"free slot?<br/>active < MAX_ACTIVE"}
+    W -->|yes| ADM["install_session<br/>pick a free slot<br/>(prefer the largest-LCP slot)"]
     W -->|no| WAIT["wait in queue"]
     ADM --> PRE{"prefilled?"}
-    PRE -->|no| PF["step_chat: remaining prompt\nin a single forward"]
+    PRE -->|no| PF["step_chat: remaining prompt<br/>in a single forward"]
     PRE -->|yes| DEC
-    PF --> DEC["step_chat_batch:\nsample + termination check per session,\nforward combined into one forward_batch"]
+    PF --> DEC["step_chat_batch:<br/>sample + termination check per session,<br/>forward combined into one forward_batch"]
     DEC --> DONE{"all done?"}
     DONE -->|no| W
-    DONE -->|"some sessions finished"| REL["release_session:\nevict to prefix store (skip duplicates)\nKV rows and cached_prompts stay\n→ next session reuses them zero-copy"]
+    DONE -->|"some sessions finished"| REL["release_session:<br/>evict to prefix store (skip duplicates)<br/>KV rows and cached_prompts stay<br/>→ next session reuses them zero-copy"]
     REL --> W
 ```
 
@@ -257,10 +257,10 @@ Throughput at 0.5B: fp32 1.35× / int8 1.7× (b=4). At b=4, 0.5B transitions to 
 
 ```mermaid
 flowchart LR
-    A[config.json] -->|"model_type = gpt2"| B[Gpt2\nmodel/gpt2.rs]
-    A -->|"model_type = qwen2"| C[LlamaQwen2\nmodel/llama.rs]
-    A -->|other| D[error\nunsupported model_type]
-    B --> E[Model trait\nforward / new_cache / eos_ids / context]
+    A[config.json] -->|"model_type = gpt2"| B[Gpt2<br/>model/gpt2.rs]
+    A -->|"model_type = qwen2"| C[LlamaQwen2<br/>model/llama.rs]
+    A -->|other| D[error<br/>unsupported model_type]
+    B --> E[Model trait<br/>forward / new_cache / eos_ids / context]
     C --> E
 ```
 
@@ -285,9 +285,9 @@ flowchart LR
 ```mermaid
 flowchart TB
     X[x input] --> N1["LayerNorm(weight + bias)"]
-    N1 --> CAT["c_attn: one Conv1D outputs concatenated Q,K,V\n[n, 3e] in one shot (with bias)"]
-    CAT --> KVW["write K, V to the KV cache\n(all heads)"]
-    KVW --> ATT["causal attention\nper-position × per-head loops:\nq·k → softmax → Σ w·v"]
+    N1 --> CAT["c_attn: one Conv1D outputs concatenated Q,K,V<br/>[n, 3e] in one shot (with bias)"]
+    CAT --> KVW["write K, V to the KV cache<br/>(all heads)"]
+    KVW --> ATT["causal attention<br/>per-position × per-head loops:<br/>q·k → softmax → Σ w·v"]
     ATT --> PROJ["c_proj (linear) + bias"]
     X -->|"residual +"| ADD1[(+)]
     PROJ --> ADD1
@@ -304,10 +304,10 @@ flowchart TB
 ```mermaid
 flowchart TB
     X2[x input] --> N1B["rmsnorm (no bias)"]
-    N1B --> QKV["q/k/v computed as three separate Linears\n(0.5B has bias on q/k/v)"]
-    QKV --> R["apply RoPE\nq for all heads / k for kv_heads"]
-    R --> KVW2["write K, V to the KV cache\n(kv_heads only = GQA)"]
-    KVW2 --> ATTB["GQA attention\nscores = q@k^T computed as one sgemm per kv-head × group\n→ causal mask → softmax → probs@V also a matmul"]
+    N1B --> QKV["q/k/v computed as three separate Linears<br/>(0.5B has bias on q/k/v)"]
+    QKV --> R["apply RoPE<br/>q for all heads / k for kv_heads"]
+    R --> KVW2["write K, V to the KV cache<br/>(kv_heads only = GQA)"]
+    KVW2 --> ATTB["GQA attention<br/>scores = q@k^T computed as one sgemm per kv-head × group<br/>→ causal mask → softmax → probs@V also a matmul"]
     X2 -->|"residual +"| ADD1B[(+)]
     ATTB --> OP["o_proj (linear)"]
     OP --> ADD1B
@@ -337,18 +337,18 @@ What `gpt2.rs`'s `forward(tokens, cache)` executes, in order. **The prompt (pref
 
 ```mermaid
 flowchart TB
-    TOK["token list tokens[n]"] --> EMB["embedding: x[i] = wte[tok_i] + wpe[pos_i]\n(positions read from a learned table)"]
+    TOK["token list tokens[n]"] --> EMB["embedding: x[i] = wte[tok_i] + wpe[pos_i]<br/>(positions read from a learned table)"]
     EMB --> L["▼ 24-layer loop ─────────────────"]
     L --> LN1["layernorm(x) — weight+bias"]
-    LN1 --> QKV["c_attn: one Conv1D outputs [n, 3e] in one shot\n(Q,K,V concatenated, with bias) → add_bias"]
-    QKV --> KVW["write K, V to the KV cache\n(all heads = e dims)"]
-    KVW --> ATT["causal attention:\nper-position × per-head loops:\nq·k → softmax → Σ w·v\n(double loop of scalar dots)"]
+    LN1 --> QKV["c_attn: one Conv1D outputs [n, 3e] in one shot<br/>(Q,K,V concatenated, with bias) → add_bias"]
+    QKV --> KVW["write K, V to the KV cache<br/>(all heads = e dims)"]
+    KVW --> ATT["causal attention:<br/>per-position × per-head loops:<br/>q·k → softmax → Σ w·v<br/>(double loop of scalar dots)"]
     ATT --> PROJ["c_proj + bias → add to x (residual)"]
     PROJ --> LN2["layernorm(x)"]
     LN2 --> MLP["mlp: expand to 4e → GELU → project → add to x (residual)"]
     MLP -->|"next layer / loop end"| L
     L --> FIN["final layernorm"]
-    FIN --> LOG["logits = h @ wte^T\n(tied: uses the transposed embedding matrix)"]
+    FIN --> LOG["logits = h @ wte^T<br/>(tied: uses the transposed embedding matrix)"]
 ```
 
 **Characteristics**: QKV comes out of one big matmul (a single GEMM = GPU-friendly). Positions are added at the embedding stage, so attention has no positional processing. The attention core is a straightforward "per-position, per-head" loop structure.
@@ -359,19 +359,19 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    TOK["token list tokens[n]"] --> EMB["embedding: x[i] = embed[tok_i]\n(no position added yet)"]
+    TOK["token list tokens[n]"] --> EMB["embedding: x[i] = embed[tok_i]<br/>(no position added yet)"]
     EMB --> L["▼ 24-layer loop ─────────────────"]
     L --> N1["rmsnorm(x) — no bias"]
-    N1 --> QKV3["q/k/v computed as three separate Linears\n(0.5B has bias on q/k/v — unusual for Llama-family)"]
-    QKV3 --> ROPE["RoPE: inject relative position into q and k as rotations\n(no absolute position table)"]
-    ROPE --> KVW["write K, V to the KV cache\n(kv_heads only = GQA)"]
-    KVW --> ATT["GQA attention (one sgemm):\ndouble loop over kv-head × group, but\nscores = q@k^T computed as a matmul\n→ causal mask → softmax → probs@V also a matmul"]
+    N1 --> QKV3["q/k/v computed as three separate Linears<br/>(0.5B has bias on q/k/v — unusual for Llama-family)"]
+    QKV3 --> ROPE["RoPE: inject relative position into q and k as rotations<br/>(no absolute position table)"]
+    ROPE --> KVW["write K, V to the KV cache<br/>(kv_heads only = GQA)"]
+    KVW --> ATT["GQA attention (one sgemm):<br/>double loop over kv-head × group, but<br/>scores = q@k^T computed as a matmul<br/>→ causal mask → softmax → probs@V also a matmul"]
     ATT --> OPROJ["o_proj → add to x (residual)"]
     OPROJ --> N2["rmsnorm(x)"]
-    N2 --> MLP["gate_proj + up_proj → silu(gate)×up\n(SwiGLU) → down_proj → add to x (residual)"]
+    N2 --> MLP["gate_proj + up_proj → silu(gate)×up<br/>(SwiGLU) → down_proj → add to x (residual)"]
     MLP -->|"next layer / loop end"| L
     L --> FIN["final rmsnorm"]
-    FIN --> LOG["logits = lm_head(h)\n(untied: separate weights / tied: embed^T)"]
+    FIN --> LOG["logits = lm_head(h)<br/>(untied: separate weights / tied: embed^T)"]
 ```
 
 **Characteristics**:
@@ -412,7 +412,7 @@ From P6 on, `step_chat_batch` is used when multiple sessions run concurrently, a
 
 ```mermaid
 flowchart LR
-    PULL["denno pull REPO"] --> HUB["download into the HF hub cache\n(single model.safetensors)"]
+    PULL["denno pull REPO"] --> HUB["download into the HF hub cache<br/>(single model.safetensors)"]
     PULL -->|"3B/7B: index.json"| SHARD["download all shards"]
     SERVE["denno serve REPO"] --> CFG[read config.json]
     CFG --> MT{"model_type?"}
@@ -421,7 +421,7 @@ flowchart LR
     G2 --> Q{quant mode?}
     LQ --> Q
     Q -->|fp32| FP[keep weights as fp32]
-    Q -->|int8| I8["quantize linear layers offline with per-channel scales\n(embeddings stay fp32)"]
+    Q -->|int8| I8["quantize linear layers offline with per-channel scales<br/>(embeddings stay fp32)"]
     FP --> READY[hand to the engine as the Model trait]
     I8 --> READY
 ```
