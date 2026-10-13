@@ -250,12 +250,20 @@ extern "C" __global__ void dno_attention(
 //   scores[i,j] = q[i,h] · K[j,kh_off..] * scale   (j = 0..pos0+i — causal)
 //   att[i,h]    = Σ_j softmax_j * V[j, kh_off..]
 // K/V は GPU 側 KV ミラー ([t_total, kv_dim] 行-major、ホスト KvCache と同一)。
-// exp は dno_expf (glibc 再現)。online softmax の累積順は「タイル昇順・タイル内
-// kk 昇順・出力次元 d はスレッド tid = d 専属」で固定。
+// exp は exp2f ベース (P17k): attention は数値緩和枠 (ユーザー承認済み) のため
+// glibc 完全再現の dno_expf (f64 演算主体・デスクトップ GPU では 1/64 レートで
+// 増悪) をやめ、ハード命令 MUFU.EX2 の exp2f に置換する。expf(x) =
+// exp2f(x * log2(e)) で置き換えるため p に ~1e-6 相対差が出るが、**決定論は
+// 維持** (exp2f は固定のハード演算・同一入力に対し常に同一結果)。decode 用の
+// dno_attention はビット一致枠のため dno_expf のまま変更しない。
+// online softmax の累積順は「タイル昇順・タイル内 kk 昇順・出力次元 d はスレッド
+// tid = d 専属」で固定。
 // 制約 (ホスト側でも検証): dh >= 32 (block が PF_BQ 行 owner を持つため) &&
 //   shmem <= 48KB (dh <= 152 @ BQ=16/BK=32)。
 #define PF_BQ 16
 #define PF_BK 32
+// exp2f ベース softmax 用 (expf(x) = exp2f(x * log2(e)))
+#define LOG2E_F 1.44269504088896340736f
 extern "C" __global__ void dno_attention_prefill(
     const float *__restrict__ q,     // [n, heads*dh]
     const float *__restrict__ kc,    // [t_total, kv_dim]
@@ -331,8 +339,8 @@ extern "C" __global__ void dno_attention_prefill(
         if (tid < PF_BQ) {
             float mx = m_run;
             for (int kk = 0; kk < PF_BK; ++kk) mx = fmaxf(mx, s_sm[tid * PF_BK + kk]);
-            // m_run=-inf → expf(-inf)=0 (dno_expf の -inf 早期 return)
-            corr_sm[tid] = dno_expf(m_run - mx);
+            // m_run=-inf → exp2f(-inf * log2e)=0 (ハード命令の -inf 処理)
+            corr_sm[tid] = exp2f((m_run - mx) * LOG2E_F);
             mnew_sm[tid] = mx;
         }
         __syncthreads();
@@ -340,7 +348,7 @@ extern "C" __global__ void dno_attention_prefill(
         for (int pid = tid; pid < PF_BQ * PF_BK; pid += dh) {
             const int r = pid / PF_BK;
             const int kk = pid % PF_BK;
-            s_sm[r * PF_BK + kk] = dno_expf(s_sm[r * PF_BK + kk] - mnew_sm[r]);
+            s_sm[r * PF_BK + kk] = exp2f((s_sm[r * PF_BK + kk] - mnew_sm[r]) * LOG2E_F);
         }
         __syncthreads();
         if (tid < PF_BQ) {

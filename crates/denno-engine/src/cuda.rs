@@ -1983,6 +1983,110 @@ pub fn chain_attention_prefill(
     })
 }
 
+/// P17k: o_proj をデバイス常駐で実行 — 入力は `chain_attention_prefill` が書いた
+/// CH_ATT スロット (デバイス上の att [m, k]) を直接読む。従来は att を 81MB D2H
+/// + to_vec + o_proj で再 H2D していた往復を消す。
+/// ビット一致: quantize + dno_gemm_i8 は CPU と同一演算 → 出力は CPU 経路と一致。
+/// 失敗時 None (呼び出し側は chain_download で att を取得して従来経路へ)。
+pub fn maybe_gpu_oproj(o: &Quant8Linear, m: usize, k: usize, li: usize) -> Option<Vec<f32>> {
+    if !cuda_enabled() {
+        return None;
+    }
+    if !(m > max_m() && m >= gemm_min_m() && gemm_enabled()) {
+        return None;
+    }
+    debug_assert_eq!(o.k, k);
+    let e = o.n;
+    // CH_ATT スロットは chain_attention_prefill 成功時に確保済みのはず
+    if !CHAIN.with(|cell| {
+        cell.borrow()
+            .bufs
+            .get(CH_ATT)
+            .map_or(false, |b| b.as_ref().map_or(false, |b| b.bytes >= m * k * 4))
+    }) {
+        return None;
+    }
+    let ctx = shared_ctx()?;
+    if let Err(err) = ctx.make_current() {
+        tracing::error!("CUDA cuCtxSetCurrent failed, using CPU int8: {err:#}");
+        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    let gw = match weights_for(o.uid, &o.w, &o.scale, k, e) {
+        Ok(g) => g,
+        Err(err) => {
+            tracing::error!("CUDA o_proj weight upload failed, using CPU: {err:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+    };
+    let lib = lib().ok()?;
+    let aptr = CHAIN.with(|cell| -> Option<u64> {
+        cell.borrow()
+            .bufs[CH_ATT]
+            .as_ref()
+            .map(|b| b.ptr())
+    })?;
+    let r = SCRATCH.with(|cell| -> Result<Vec<f32>> {
+        let mut s = cell.borrow_mut();
+        let Scratch { aq, asc, out, ho, .. } = &mut *s;
+        Scratch::ensure(aq, m * k)?;
+        Scratch::ensure(asc, m * 4)?;
+        Scratch::ensure(out, m * e * 4)?;
+        Scratch::ensure_pin(ho, m * e * 4)?;
+        let (daq, dasc, dout) = (aq.as_ref().unwrap(), asc.as_ref().unwrap(), out.as_ref().unwrap());
+        let ho = ho.as_mut().unwrap();
+        unsafe {
+            crate::prof::time_layer(crate::prof::OPROJ, li, || -> Result<()> {
+                // 1) att (CH_ATT) をデバイス上で量子化
+                let (mut px, mut paq, mut pasc) = (aptr, daq.ptr(), dasc.ptr());
+                let (mut mc, mut kc) = (m as c_int, k as c_int);
+                let mut args = [
+                    &mut px as *mut _ as *mut c_void,
+                    &mut paq as *mut _ as *mut c_void,
+                    &mut pasc as *mut _ as *mut c_void,
+                    &mut mc as *mut _ as *mut c_void,
+                    &mut kc as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(ctx.f_quant, (m as u32, 1, 1), (256, 1, 1), 256 * 4, &mut args)?;
+                // 2) o_proj GEMM: [m, k] → [m, e]
+                let (mut paqi, mut pasci, mut pw, mut psc, mut pout) =
+                    (daq.ptr(), dasc.ptr(), gw.w.ptr(), gw.sc.ptr(), dout.ptr());
+                let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, e as c_int);
+                let mut args = [
+                    &mut paqi as *mut _ as *mut c_void,
+                    &mut pasci as *mut _ as *mut c_void,
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut psc as *mut _ as *mut c_void,
+                    &mut pout as *mut _ as *mut c_void,
+                    &mut mc as *mut _ as *mut c_void,
+                    &mut kc as *mut _ as *mut c_void,
+                    &mut nc as *mut _ as *mut c_void,
+                ];
+                let gmx = m.div_ceil(64) as u32;
+                let gmy = e.div_ceil(64) as u32;
+                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 2 * 64 * 32, &mut args)?;
+                // 3) D2H + 同期 (attention カーネルは同一ストリームの先行発行なので完結済み)
+                check(
+                    (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), m * e * 4, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync",
+                )?;
+                ctx.sync()?;
+                Ok(())
+            })?;
+        }
+        Ok(ho.as_slice::<f32>()[..m * e].to_vec())
+    });
+    match r {
+        Ok(out) => Some(out),
+        Err(err) => {
+            tracing::error!("CUDA o_proj failed, falling back to CPU: {err:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+}
+
 /// P17g: バッチ decode 用 — セッションごとに `chain_attention` を起動し、
 /// 結果をホスト `att` [b, heads*dh] に集める。solo chain と同一カーネル・
 /// 同一入力 → 単独/バッチでビット一致を維持 (exactness 契約 P6)。

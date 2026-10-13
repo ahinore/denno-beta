@@ -548,6 +548,10 @@ impl Model for LlamaQwen2 {
             }
 
             let mut att = vec![0.0f32; n * heads * dh];
+            // P17k: GPU attention+o_proj 完了時の o_proj 出力 (att をホストに落とさず
+            // o_proj まで実行。クロージャの外で受け取る)
+            #[cfg(feature = "cuda")]
+            let mut gpu_oproj: Option<Vec<f32>> = None;
             crate::prof::time_layer(crate::prof::ATTN, li, || {
                 let (kc, vc) = cache.kv_bufs_ref(li);
                 let t_total = pos0 + n;
@@ -599,6 +603,10 @@ impl Model for LlamaQwen2 {
                 // 試行。q/KV は全てホスト側にあるため失敗時もこのブロック内で
                 // CPU 経路にフォールバックできる (forward 全体の再実行は不要・
                 // ホスト状態は不変)。数値は attention 緩和枠 (ユーザー承認)。
+                // P17k: GPU attention 成功時は o_proj もデバイス常駐で実行し att
+                // をホストに落とさない (81MB D2H + to_vec + 再 H2D を消す)。
+                // o_proj が失敗した場合のみ chain_download で att を取得して
+                // 従来経路 (CPU o_proj) へ。o_proj 出力はビット一致なので緩和不要。
                 #[cfg(feature = "cuda")]
                 {
                     if crate::cuda::chain_attention_prefill(
@@ -617,10 +625,23 @@ impl Model for LlamaQwen2 {
                     )
                     .is_some()
                     {
-                        if let Some(av) =
-                            crate::cuda::chain_download(crate::cuda::CH_ATT, n * heads * dh)
-                        {
-                            att.copy_from_slice(&av);
+                        let mut done = false;
+                        if let Some(oq) = layer.o_w.quant8() {
+                            if let Some(proj) =
+                                crate::cuda::maybe_gpu_oproj(oq, n, heads * dh, li)
+                            {
+                                gpu_oproj = Some(proj);
+                                done = true;
+                            }
+                        }
+                        if !done {
+                            if let Some(av) =
+                                crate::cuda::chain_download(crate::cuda::CH_ATT, n * heads * dh)
+                            {
+                                att.copy_from_slice(&av);
+                                return;
+                            }
+                        } else {
                             return;
                         }
                     }
@@ -663,6 +684,15 @@ impl Model for LlamaQwen2 {
                 }
             });
 
+            // P17k: GPU attention+o_proj が完結した場合は lin をスキップ
+            // (o_proj 出力は maybe_gpu_oproj 内で OPROJ タイマーに計上済み)
+            #[cfg(feature = "cuda")]
+            let proj = if let Some(p) = gpu_oproj {
+                p
+            } else {
+                crate::prof::time_layer(crate::prof::OPROJ, li, || lin(&att, &layer.o_w, n))
+            };
+            #[cfg(not(feature = "cuda"))]
             let proj = crate::prof::time_layer(crate::prof::OPROJ, li, || lin(&att, &layer.o_w, n));
             for i in 0..n * e {
                 x[i] += proj[i];
