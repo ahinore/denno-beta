@@ -286,7 +286,21 @@ pie showData title P9 fp32 batch (4x256) per-op time
 - **Decode-only offload**: GEMV-style kernels (1 warp per output) re-read the weights proportionally to m, so they lose to prefill GEMMs (**measured 0.39× at m=128**). `m > DENNO_CUDA_MAX_M` (default 16) stays on CPU — prefill performance is untouched; only decode and batch decode (m ≤ threshold) run on the GPU
 - **Verification**: ①pipeline bit-exactness via apply_bt (4 shapes, including lm_head 1536×151936) ②whole-forward GPU offload bit-exactness on the tiny model (prefill + batch decode vs solo) ③the 106 CPU tests regress to zero changes (without the cuda feature) ④**e2e**: Qwen2.5-1.5B int8 — CPU serve vs GPU serve produce fully identical response text and usage (2 prompts, 200-token greedy; concurrent batch decode of 2 requests also matches solo)
 - **e2e measurement**: 200-token greedy generation **CPU 9.08s → GPU 2.66s (3.4×)**. VRAM usage is lm_head 234MB + layer weights ≈ just over 1GB
-- **Per-op profile comparison** (`DENNO_PROFILE=1`, 200-token greedy ×3 requests, 600 decode steps + prefill cumulative): on CPU, gate_up 40.9% / down 21.4% / attn 11.2% / lm_head 10.7% (**TOTAL 28,591ms**); with CUDA offload, **the linear layers shrink from 86% to 62% and attn_core becomes the top op (28.6%, TOTAL 9,686ms)** — clearly identifying attention fusion as the next bottleneck. Per-layer speedups: gate_up 4.99× / down 4.26× / lm_head **10.9×** / o 2.70× / qkv 1.27× (3 split calls × 50,400 — fixed overhead dominates, a fusion candidate). Decode 22.1→**75.8 tok/s**
+- **Per-op profile comparison** (`DENNO_PROFILE=1`, 200-token greedy ×3 requests, 600 decode steps + prefill cumulative):
+
+  | op | CPU ms | CPU % | CUDA ms | CUDA % | speedup |
+  |---|---:|---:|---:|---:|---:|
+  | lm_head | 3,049 | 10.7% | 281 | 2.9% | **10.9×** |
+  | gate_up | 11,685 | 40.9% | 2,340 | 24.2% | **4.99×** |
+  | down | 6,108 | 21.4% | 1,432 | 14.8% | 4.26× |
+  | o | 1,594 | 5.6% | 590 | 6.1% | 2.70× |
+  | qkv | 2,051 | 7.2% | 1,614 | 16.7% | 1.27× |
+  | attn_core | 3,190 | 11.2% | 2,767 | 28.6% | 1.15× |
+  | swiglu | 554 | 1.9% | 420 | 4.3% | 1.32× |
+  | other | ≈361 | 1.3% | ≈243 | 2.5% | 1.49× |
+  | **TOTAL** | **28,591** | 100% | **9,686** | 100% | **2.95×** |
+
+  Decode 22.1→**75.8 tok/s** (e2e 3.4×). **The linear layers shrink from 86% to 62% and attn_core becomes the top op (28.6%)** — clearly identifying attention fusion as the next bottleneck. qkv stays at 1.27× (3 split calls × 50,400 — fixed overhead dominates) → fused in P17c
 
 ### P17c: Fused GPU linear groups (qkv / gate+up single call) ✅ (2026-10-13, commit `7bf9eb0`)
 
@@ -296,7 +310,21 @@ pie showData title P9 fp32 batch (4x256) per-op time
 - **Discovery: CUDA current context is thread-local (the biggest lesson of this phase)**: libtest spawns a **new thread per test even with `--test-threads=1`**, so calling `cuCtxSetCurrent` once on the initializing thread leaves `cuMemAlloc` failing on other threads with **error 201 INVALID_CONTEXT**. Worse, the failure is silently absorbed by GPU_BROKEN→CPU fallback, so "GPU tests green" no longer means "ran on the GPU" (only the new fusion test `expect`ed on None, which exposed it — the P17b model-integration test could have been passing as CPU-vs-CPU). Fixed by calling `CudaCtx::make_current()` at every GPU entry point; this also removes a latent bug in the multithreaded server
 - **Verification**: ①fused vs separate-call bit-exactness (qkv-type 3 parts with differing n + gate/up-type 2 parts, m=1/4) ②whole-forward bit-exactness on the tiny model (prefill + batch decode) ③the 106 CPU tests regress to zero changes ④**e2e**: Qwen2.5-1.5B int8 200-token greedy — **text and usage fully identical** to CPU serve (3 requests, usage 49 in/200 out)
 - **e2e measurement**: 200-token generation **GPU 2.638s → 2.146s (−19%)**, matching the theoretical prediction (overhead removed 84µs/layer/step × 28 layers × 600 steps ≈ 0.47s/request → 2.64−0.47=2.17s). CPU 10.67s → **4.96×**. Weight uploads: grouped 56 (=28 layers × 2 groups) + separate 57 (=down 28 + o 28 + lm_head 1), fully consistent with the call breakdown
-- Remaining CUDA candidates: attention fusion kernel (attn_core 28.6% = top GPU op), paged KV, sampler kernel
+- **Post-fusion profile re-acquisition** (`DENNO_PROFILE=1`, same workload as the P17b section — the pre-fusion distribution is the P17b table):
+
+  | op | P17b GPU ms | P17c GPU ms | change |
+  |---|---:|---:|---:|
+  | qkv | 1,614 | 610 | **−62%** |
+  | gate_up | 2,340 | 1,850 | **−21%** |
+  | attn_core | 2,767 | 2,623 | −5% |
+  | swiglu | 420 | 405 | −4% |
+  | lm_head | 281 | 275 | −2% |
+  | down | 1,432 | 1,426 | ±0% |
+  | o | 590 | 591 | ±0% |
+  | **TOTAL** | **9,686** | **8,021** | **−17%** |
+
+  The CPU side re-measures at TOTAL 28,532ms (nearly unchanged from P17b's 28,591ms). Op-sum ratio **2.95×→3.56×**, decode **75.8→96.1 tok/s**, e2e (CPU 9.07s → GPU 2.08s) **4.36×**. The reductions match theory (qkv: 2 calls' worth 941ms/3req theoretical vs −1,004ms measured; gate_up: 470ms vs −489ms). **attn_core becomes even more dominant (28.6%→32.7%)** — attention fusion is confirmed as the next bottleneck
+- Remaining CUDA candidates: attention fusion kernel (attn_core 32.7% = top GPU op), paged KV, sampler kernel
 
 ## 4. Candidate List
 
