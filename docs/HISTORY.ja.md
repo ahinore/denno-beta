@@ -6,7 +6,7 @@
 > **追記フォーマット**: `### Pn: 機能名 (日付, commit)` の下に **実装** / **テスト** / **プロファイル** / **次の実装内容** を記載する。完了した項目は「次の実装内容」を候補リストへ反映する。
 
 **更新**: 2026-10-13
-**リポジトリ**: https://github.com/ahinore/denno-beta (main, `f97016b` 同期済み)
+**リポジトリ**: https://github.com/ahinore/denno-beta (main, `3ff6175` 同期済み)
 
 ---
 
@@ -208,7 +208,7 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **実装**: `emit_delta_and_check_stop` — 末尾がU+FFFDになるトークンを**保留**し、文字が完成したステップでまとめて差分として流す。新設 `flush_stream` — 生成終了時(EOS/max_tokens)に保留分をフラッシュ(step_chat/step_chat_batch両方、EOS分はdecodeから除外)。**テキスト経路のみで数値経路は不変**(プロファイル対象外、性能無関係 — 基準出力と4セッション同時==soloの実測で確認)
 - **テスト**: 単体99+7 全緑 + exactness 5件全緑(aarch64)。**CI 38244751670 ✅** — ワークフローにgpt2 pullを追加し、**x86上でgpt2テストが実際に走って緑**(基準文字列は参照実装と一致することを実証)。本番デプロイ済み・基準出力不変
 
-### P12: 残り律速の分析 + decode attention最適化(probs@V行統合+ストライド直接参照) ✅ (2026-10-12, commit `55c1de0`/`d659b54`)
+### P12: 残り律速の分析 + decode attention最適化(probs@V行統合+ストライド直接参照) ✅ (2026-10-12, commit `55c1de0`/`f3dea3b`)
 
 - **発端**: 開発環境の移行が完了し、他ワークロード負荷のないクリーン環境でP9以来の残り律速(平均バッチ幅低下/メモリ系競合/prefill割込み)を定量化
 - **分析1(バッチ幅スケーリング)**: 同時発火×256tok上限(EOSで自然終端、トークン数は幅間で異なるため**集約tok/sで比較**)。fp32はW=8まで素直に伸びる(16.2→~50)、int8は**W=4で頭打ち**(149→132〜135とW=8で微減)。スロット数は`DENNO_BATCH_SLOTS`(既定4)で、幅8の真のバッチには8が必要(既定4だと2ウェイのキューイングになる)
@@ -216,11 +216,11 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **発見(カーネル差し替えの落とし穴)**: matrixmultiplyは**ストライドと行数でSIMDカーネルを選び替えるため数値が変わる**。scores側(b を転置レイアウト rs=1/cs=k で渡す経路)は行統合(rows=m)・ストライド参照のどちらもビット不一致(実測で確認)。probs@V側(row-major b)は**行統合+ストライド参照でビット一致**(実測) → ビット一致規律を守れるのはV側のみ
 - **実装**: ①`tensor::matmul_rows_bstrided` — probs@Vを per-g matmul(m=1)×group回+vh連続化コピー → **1回の行統合sgemm+キャッシュのストライド直接参照**(コピー無し)②`attention_decode_kvhead` 新設 — forward()(n==1)とforward_batch()が同一関数を通る構造に統一 ③qgコピー廃止、kh/scoresをthread_localスクラッチで再利用(mmapチャーン除去)④scores側は従来経路のまま(sgemm_acc(m=1)+kh連続化コピー — 数値上必須と判明)
 - **テスト**: 単体100+7全緑 + `decode_attention_probs_v_bitexact`(行統合+ストライド vs 従来per-row、to_bits比較)+ **exactness 5件全緑(基準出力含めビット一致・出力不変)**
-- **A/B実測**(クリーン環境、old f566e10 vs P12、交互2ラウンド、スロット8):
+- **A/B実測**(クリーン環境、old 1a7fee6 vs P12、交互2ラウンド、スロット8):
 
 #### プロファイル
 
-| 構成 | old (f566e10) | P12 (55c1de0) | 差 |
+| 構成 | old (1a7fee6) | P12 (55c1de0) | 差 |
 |---|---:|---:|---:|
 | fp32 W=4 | 26.8 / 26.8 tok/s | 27.7 / 27.7 tok/s | **+3.4%** |
 | int8 W=4 | 126.4 / 122.5 tok/s | 130.4 / 126.2 tok/s | **+3.1%** |
@@ -237,7 +237,7 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **測定上の教訓**: ①A/Bサーバーは別バイナリ名(`/tmp/denno_old`/`/tmp/denno_p12`)で起動したが、pkillパターン`denno serve`が`denno_old serve`に**マッチせず全12回が同じサーバーに当たり無効データになった**(2回目で修正、quant modeログで毎回確認)②op別プロファイルの`grep -A14 … | tail -13`は**先頭行(最大op)を切り捨てる** — 最初の分析でattnを48.9%と誤読(gate_up行がカットされていた。正しくは29.5% gate_up / 19.4% attn)
 - **次の実装内容**: scores側の根本最適化(k方向SIMD/パック再利用)はビット一致規律と両立不可 → **基準出力の更新を許容するかの判断が必要**。3B/7Bのb=4実測。CUDA最適化(§8)
 
-### P13: 推論可視化(denno-trace)テレメトリ基盤 + denno-view中継 ✅ (2026-10-13, commit `2efbf80`)
+### P13: 推論可視化(denno-trace)テレメトリ基盤 + denno-view中継 ✅ (2026-10-13, commit `69663e6`)
 
 - **発端**: ユーザー指示の推論可視化機能(§11)。推論中のコールスタック・隠れ層・KV状態をストリーミングで別サーバーに転送し、WASMでリアルタイム表示する構成の第1段階(L0フロー/L1統計)
 - **実装**: ①`denno-telemetry` crate新設(**依存ゼロ/stdのみ** — エンジン・サーバー・ビューア(WASM含む)が同一形式を共有するため)。フレーム形式v1 = `"DNTL"`(4B)+version(1B)+kind(1B)+payload、整数はLEB128 varint、確率はf16(RNE自前実装)。kind: ServerInfo/SessionAdmit/SessionDone/Prefill/Token/Step/OpSummary/KvUsage/Gap/TopK ②エンジン捕捉フック(install/release/step_chat/step_chat_batch。すべて`telem::enabled()`ガード+read-onlyで数値経路に非接触)③prof.rsのop計時をtelemetryにも累積(lib.rs経由の委譲でprof→telemetryの直接依存を回避)④denno-serverにWSエンドポイント`/v1/telemetry/ws`(バイナリフレーム、接続直後にServerInfo。ハブ→broadcast中継スレッド。テレメトリ無効時は503)⑤`denno-view` crate新設 — 上流dennoへWSクライアント接続(切断時2秒再試行)、複数ブラウザへのmultiplex中継、`VIEW_RECORD`でリプレイ記録([u32 len][bytes]追記形式。P14のスクラバー入力)、簡易ライブダッシュボード(HTML+JSデコーダ。WASM化はP14)
@@ -248,17 +248,17 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **CI**: 38275707105 ✅(build+test+exactness)。本番反映済み・基準出力ビット一致(本番はテレメトリOFF運用)
 - **次の実装内容**: P14(WASMビューア: wasm-bindgen+canvas/WebGL2、リプレイスクラバー)/ P15(L2テンソルfocus)
 
-### P14: denno-view 推論フローアニメーション(コールグラフ+層パネル+KV/変数) ✅ (2026-10-13, commit `43ba483`, JS版。WASM移植は残課題)
+### P14: denno-view 推論フローアニメーション(コールグラフ+層パネル+KV/変数) ✅ (2026-10-13, commit `8befe3f`, JS版。WASM移植は残課題)
 
 - **発端**: ユーザー指定の denno-view 仕様 — 中央にモデル駆動プログラムのコールグラフ(プロンプトが降りて関数が順に点灯・値がパルスで渡る)、右にモデル各層のスタック(参照時に発光)、左に KV キャッシュ+隠れ変数(格納時に発光・値表示)
 - **テレメトリ拡張**: コールグラフ逐次点灯に必要なデータをフレームに追加 — ①`LayerRun { layer, ops }`(1 層の op 列を実行順で 1 フレームに圧縮、24フレーム/トークン)②`ServerInfo.layers` ③`Prefill.tokens`(降下アニメ用)。実装は thread-local 層バッファ+`prof::time_layer`
 - **denno-view UI**: 3カラム(中央=コールグラフ+実装コードパネル/左=KVスロット+変数+op timing/右=モデル構造)。ブラウザ側も再生キュー+間引きで**推論を待たせない**設計を維持
 - **検証**: テスト全緑+exactness 5/5+JSデコーダ12種一致+e2e基準出力**ビット一致**・Gap 0件(LayerRun 509フレーム)。CI 38298659275
-- **P14.1〜P14.3 機能追加 (2026-10-13, commits `6ccb633`/`1567bff`/`93288db`)**: ①層パネル修正 — view が ServerInfo/KvUsage スナップショットを保持し後から開いたブラウザにも即時表示+層行に op 名/実測 ms ②トークン文字表示 — `VIEW_TOKENIZER`→`/tokenizer.json` 配信、BPE 逆マップ+ストリーミング UTF-8 デコードでマルチバイト境界を正しく復元、入力/出力トークンを文字チップ表示 ③内蔵チャット — view の `POST /chat` が上流 denno の `/v1/messages` へ中継され、送信するとアニメーションが自動連動
-- **P14.4 ステップ実行コード+モデル構造 (2026-10-13, commit `b9282f3`)**: 中央左に**実装コードパネル**(擬似コード、実行中行がデバッガの PC のように前進+`li = N/24` ウォッチ)、右パネルを**モデル構造**表示(embed→decoder×24[ATT+MLP チップ]→final_norm→lm_head、LayerRun に応じてチップ個別発光)
-- **P14.4b〜k UI ブラッシュアップ (詳細省略, commits `65b7a64`〜`b7defb7`)**: レイアウト修正(隙間/等分/ペイン分離/セクション分離線)、拡大コーン(コードパネル=model_forward ノードの拡大コールアウト)、トークンの配置(入力=グラフ上・出力=下)、KV/変数への飛点(SVG 飛線)、UI 全面英語化、見出し「denno (LLM Server)」、speed スライダー(low/high・既定最速・low で目で追えるスローモーション)、ServerInfo に model_id 追加(実モデル ID 表示)。**推論を待たせない設計は全過程で不変**
-- **P14.4l〜q コードパネルの正確化+実コード切替 (commits `9ffea46`〜`f97016b`)**: ①擬似コードの実行順序を実物どおりに修正 — KV 書き込みはループ内(rope 直後)、attn_core がキャッシュを読む(`&kv[li][..pos+1]`)、prefill 分岐(p1-p4)も追加。Prefill 時はカーソルが p1→p2(KV 一括書き込み)→層カスケード→p3 と歩く ②**疑似⇔実コード切替**(「real code ▸」ボタン、既定 pseudo)— scheduler.rs/engine.rs/llama.rs を `include_str!` でコンパイル時埋め込み+`/code/src` 配信(表示コードは常に稼働バイナリと同世代)、擬似↔実を内容アンカーでマップしカーソル/状態点灯/飛線が両モードで動作 ③KV キャッシュと hidden x の**使用箇所**を飛線で可視化(KV→attn 読み出し・x→rmsnorm/final_norm)
-- **P14.4r チャット出力を emit_token に同期 (commit `d8404c4`)**: 内蔵チャットの出力表示がアニメーション速度と無関係(応答受信後に一括表示)だったのを、**Token フレーム再生時にバブルへトークンを追記**する方式へ変更(speed=low なら出力表示もゆっくり)。送信後の最初の SessionAdmit でセッションを捕捉し、usage 確定で全トークン再生後に usage 付きで確定。tokenizer 未読込/テレメトリ無効/Token フレーム欠落時は従来どおり応答全文表示へフォールバック(4秒監視)。併せて tokText の1トークン2重呼び出し(ストリーミング UTF-8 デコーダを2回消費する潜在バグ)を1回に修正。検証: JS 構文 OK・dev サーバー再ビルド+再起動・チャット応答 OK・p143_check CHAT_OK(トークン19フレーム)
+- **P14.1〜P14.3 機能追加 (2026-10-13, commits `6b198f2`/`e34e411`/`06df5ed`)**: ①層パネル修正 — view が ServerInfo/KvUsage スナップショットを保持し後から開いたブラウザにも即時表示+層行に op 名/実測 ms ②トークン文字表示 — `VIEW_TOKENIZER`→`/tokenizer.json` 配信、BPE 逆マップ+ストリーミング UTF-8 デコードでマルチバイト境界を正しく復元、入力/出力トークンを文字チップ表示 ③内蔵チャット — view の `POST /chat` が上流 denno の `/v1/messages` へ中継され、送信するとアニメーションが自動連動
+- **P14.4 ステップ実行コード+モデル構造 (2026-10-13, commit `91bbb6a`)**: 中央左に**実装コードパネル**(擬似コード、実行中行がデバッガの PC のように前進+`li = N/24` ウォッチ)、右パネルを**モデル構造**表示(embed→decoder×24[ATT+MLP チップ]→final_norm→lm_head、LayerRun に応じてチップ個別発光)
+- **P14.4b〜k UI ブラッシュアップ (詳細省略, commits `62acfc8`〜`5e64eef`)**: レイアウト修正(隙間/等分/ペイン分離/セクション分離線)、拡大コーン(コードパネル=model_forward ノードの拡大コールアウト)、トークンの配置(入力=グラフ上・出力=下)、KV/変数への飛点(SVG 飛線)、UI 全面英語化、見出し「denno (LLM Server)」、speed スライダー(low/high・既定最速・low で目で追えるスローモーション)、ServerInfo に model_id 追加(実モデル ID 表示)。**推論を待たせない設計は全過程で不変**
+- **P14.4l〜q コードパネルの正確化+実コード切替 (commits `091da66`〜`3ff6175`)**: ①擬似コードの実行順序を実物どおりに修正 — KV 書き込みはループ内(rope 直後)、attn_core がキャッシュを読む(`&kv[li][..pos+1]`)、prefill 分岐(p1-p4)も追加。Prefill 時はカーソルが p1→p2(KV 一括書き込み)→層カスケード→p3 と歩く ②**疑似⇔実コード切替**(「real code ▸」ボタン、既定 pseudo)— scheduler.rs/engine.rs/llama.rs を `include_str!` でコンパイル時埋め込み+`/code/src` 配信(表示コードは常に稼働バイナリと同世代)、擬似↔実を内容アンカーでマップしカーソル/状態点灯/飛線が両モードで動作 ③KV キャッシュと hidden x の**使用箇所**を飛線で可視化(KV→attn 読み出し・x→rmsnorm/final_norm)
+- **P14.4r チャット出力を emit_token に同期 (commit `b1e6ecb`)**: 内蔵チャットの出力表示がアニメーション速度と無関係(応答受信後に一括表示)だったのを、**Token フレーム再生時にバブルへトークンを追記**する方式へ変更(speed=low なら出力表示もゆっくり)。送信後の最初の SessionAdmit でセッションを捕捉し、usage 確定で全トークン再生後に usage 付きで確定。tokenizer 未読込/テレメトリ無効/Token フレーム欠落時は従来どおり応答全文表示へフォールバック(4秒監視)。併せて tokText の1トークン2重呼び出し(ストリーミング UTF-8 デコーダを2回消費する潜在バグ)を1回に修正。検証: JS 構文 OK・dev サーバー再ビルド+再起動・チャット応答 OK・p143_check CHAT_OK(トークン19フレーム)
 - **残課題**: ①WASM 移植(デコーダ+状態機械を wasm-bindgen 化 — JS 版は先行実装として維持)②リプレイスクラバー(VIEW_RECORD 再生 UI)③L2 テンソル focus(P15、隠れ変数の実値表示は現状 KV 長/top-k/token など L1 統計のみ)
 
 ## 4. 次の実装候補
@@ -269,8 +269,8 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - [x] ~~**attentionのバッチ化(P10候補)**: `forward_batch`内のattention本体がセッション毎の逐次ループ~~ → **P10で完了**(セッション×KVヘッドでrayon並列、ビット一致維持)。効果は**集約+4%**(交互A/B実測。attn_coreはバッチ時5.5%なので理論上限と一致)。softmaxのmax減算/sumはセッション毎独立のためバッチ化しても決定論は維持された
 - [x] ~~gpt2 exactness テストの失敗(文字化け)~~ → **P11で完了**(モデル再取得では直らず。原因=①テストがCIでスキップされ続けて基準が古い②ストリーミングdetokのバイト分割文字バグ。HF transformers参照実装と一致する基準に更新+detok保留/フラッシュ機構+CIでgpt2 pull追加)
 - [x] ~~**残り律速の分析**: P9プロファイルで判明した①平均バッチ幅の低下②in-serverでのメモリ系競合③prefill割込み~~ → **P12で完了**(クリーン環境で定量化。fp32はW=8までスケール/int8はW=4で頭打ち。int8のop別: gate_up 29.5% / attn 19.4% / down 18.0% / lm_head 10.8%。attentionのオーバーヘッド(V側の統合+コピー+アロケーション)をP12で削減。scores側の根本最適化はビット一致規律と両立不可 — 基準更新の判断が残る)
-- [x] ~~**推論可視化(denno-trace)P13: テレメトリ基盤**: 推論プロセスから観測を完全分離する構成(詳細は[アーキテクチャ解説](ARCHITECTURE.ja.md)§11)。`denno-telemetry` crate(バージョン付きフラット形式、f16/varint、Gapフレーム)+denno側捕捉(L0フロー/L1統計: profフック・phase遷移・sampler top-k・KV使用率・出力トークン)+WSエンドポイント(`/v1/telemetry/ws`)+denno-viewサーバー骨組み。設計原則: ①可視化は推論に含めない(dennoは流すだけ)②boundedチャネル+ドロップ許容で推論を絶対に待たせない③既定OFF・read-only捕捉でbit-exact規律と両立(exactness全緑を担保条件に)~~ → **P13で完了**(commit `2efbf80`。テレメトリON/OFFで出力完全一致・e2eでGap 0件・JSデコーダ全10種一致を確認。詳細はP13節)
-- [x] ~~**推論可視化 P14: ビューア(L0/L1)**: フロー図・トークンストリーム・KV使用率グリッド・sampler top-kビュー・リプレイ記録+スクラバー~~ → **P14で完了(JS版で先行実装、commit `43ba483`)**: ユーザー指定仕様のアニメーションUI(モデル駆動プログラム+実装コードパネル+層パネル+KV/変数+内蔵チャット)。**WASM移植・リプレイスクラバーは残課題**(詳細はP14節)
+- [x] ~~**推論可視化(denno-trace)P13: テレメトリ基盤**: 推論プロセスから観測を完全分離する構成(詳細は[アーキテクチャ解説](ARCHITECTURE.ja.md)§11)。`denno-telemetry` crate(バージョン付きフラット形式、f16/varint、Gapフレーム)+denno側捕捉(L0フロー/L1統計: profフック・phase遷移・sampler top-k・KV使用率・出力トークン)+WSエンドポイント(`/v1/telemetry/ws`)+denno-viewサーバー骨組み。設計原則: ①可視化は推論に含めない(dennoは流すだけ)②boundedチャネル+ドロップ許容で推論を絶対に待たせない③既定OFF・read-only捕捉でbit-exact規律と両立(exactness全緑を担保条件に)~~ → **P13で完了**(commit `69663e6`。テレメトリON/OFFで出力完全一致・e2eでGap 0件・JSデコーダ全10種一致を確認。詳細はP13節)
+- [x] ~~**推論可視化 P14: ビューア(L0/L1)**: フロー図・トークンストリーム・KV使用率グリッド・sampler top-kビュー・リプレイ記録+スクラバー~~ → **P14で完了(JS版で先行実装、commit `8befe3f`)**: ユーザー指定仕様のアニメーションUI(モデル駆動プログラム+実装コードパネル+層パネル+KV/変数+内蔵チャット)。**WASM移植・リプレイスクラバーは残課題**(詳細はP14節)
 - [ ] **推論可視化 P15: L2テンソルストリーミング**: focusプロトコル(ビューアがセッション×layer×tensor種別を指定、dennoはその組だけをストリーム)。隠れ状態ヒートマップ、attention確率マップ(1トークンがどの過去トークンを見ているか)、K/V実体ビューア。予算: focus先1セッション≤5%(f16+絞り込み)
 - [ ] **3B/7Bのb=4実測**: 計測のみ。帯域律速のままならバッチ幅を増やすほど素直に効くはず(交互A/Bで計測すること)。大型モデルのキャッシュ追加(`denno pull`)が必要
 - [ ] **CUDA最適化**: 実装ポイントの分析は[アーキテクチャ解説](ARCHITECTURE.ja.md)§8に記載(線形層→cuBLAS、attention融合、samplerカーネル、paged KV)。int8路線ならCPU/GPUでビット一致が維持できる。P6のスロットプール+forward_batch構造はGPUのcontinuous batchingと同型なのでそのまま移植可能
