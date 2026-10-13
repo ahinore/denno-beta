@@ -349,6 +349,18 @@ pie showData title P9 fp32 batch (4x256) per-op time
 - Lesson: **models (dummy models) that advance `len` via `advance()` alone could skip capacity allocation** — demand-based allocation introduces the contract "a model writing KV must call `kv_bufs(layer, n)` before writing", and the 3 dummy models plus denno-server's test model were adapted to it. The old build made "snapshot works after advance alone" pass silently because everything was preallocated, which hid the contract from tests
 - Remaining CUDA candidates: attention fusion kernel (needs the exactness-contract relaxation decision = deferred), paged KV, sampler kernel
 
+### P17f: Fundamental scores-side optimization (baseline update, user-approved) ✅ (2026-10-13, commit `d7d126e`)
+
+> The scores-side transposed-layout optimization deferred since P12 was implemented with user approval ("change the baseline"). matrixmultiply switches SIMD kernels based on strides/row counts, so numerics change — but **determinism (same shapes → same results) is preserved**. Per the baseline-update rule, verified against the HF transformers reference before landing.
+
+- **Decode scores**: per-g `sgemm_acc(m=1, kh contiguous copy)` × group → a single `sgemm_scores_kvstrided(m=group, kc strided reference)`. Eliminates the kh contiguous copy (t_total×dh × kv_heads×layers per step) and KH_SCRATCH
+- **Prefill**: all qg/kh/vh contiguous copies removed; scores computed with strided references into the Q row buffer and the KV buffers. probs@V now uses `matmul_rows_bstrided_par` (row-chunked parallel) reading v in place
+- **Numerics**: intentionally not bit-identical to the P12 path (as expected). However **the greedy output text of all 6 stored baselines is unchanged** (0.5B fp32 "1+1", "日本の首都は?", GPT-2, Qwen3 included). **HF verification: 0.5B fp32 200-token greedy generation is identical to the transformers reference** (prefecture enumeration prompt)
+- **Determinism**: solo/batch decode bit-exactness and prefix-cache exactness tests all pass (identical shapes always produce identical results)
+- **Performance** (1.5B int8, 200-token e2e): CPU warm 9.10s → **8.46s**; GPU chain 2.15s → **1.57s** (the chain's CPU attention goes through the same function and improves automatically)
+- **Fix (discovered)**: the committed `kernels_elem.ptx` **did not match** compiling the committed `.cu` with `nvcc -arch=compute_75 -fmad=false` (committed at P17d without a hash check); this caused a 1/455,078,062 mismatch in the GPU expf test. Replaced with a fresh compile; GPU tests back to 12/12. **Lesson: always hash-verify generated artifacts (.ptx) against the validated build before committing**
+- Verification: engine CPU 110 ok + workspace green + GPU cuda_ 12/12 + e2e GPU/CPU responses fully identical (18091/18092)
+
 ## 4. Candidate List
 
 - [x] ~~**sampler optimization**: softmax + top-p sort over the 152k vocab cost a fixed ~3.5ms/step (found in P7.5)~~ → **done in P8** (0.66ms/step, greedy unchanged)
