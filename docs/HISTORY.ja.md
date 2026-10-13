@@ -421,10 +421,16 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
   - **テスト**: `cuda_ffn_bit_exact_vs_cpu_reference` — CPU 参照(grouped matvec → silu_inplace+要素積 → down matvec、prefill 従来経路と同一の行ごと gate 分割)と**ビット一致**。GPU cuda_ **20/20**(3 連続で安定)、CPU **110**、exactness **6 基準**
   - **性能**(13,252 トークン cold): **wall 77.9s → 33.6s・PROFILE TOTAL 73.6s → 29.1s**。gate_up_proj 36.0s → **0.6ms**、swiglu 8.2s → **0.2ms**(共に消滅)。FFN ブロック実質 1.77s/層 → 0.18s/層(**約 10 倍**)。応答正常("OK")。残り律速: attn_core 12.1s (41%) / down 5.1s(実態は gate_up+swiglu のキュー待ちを含む)/ qkv 4.5s / rope 2.7s / o_proj 2.4s
   - **PTX**(kernels_elem): sha256 `da87a462ef27bf7b71fbe5f5b1a0701a36807ba5b2651cb0f576ce90461d100a`(dno_swiglu_int 追加・再コンパイル照合済み)
-- **残る実装候補(ステップ 3 以降)**:
-  1. **attention 周りのデバイス連続化**: qkv GEMM 出力をデバイスに置いたまま rope(GPU・dno_rope_qkv はビット一致済み)→ K/V をホストキャッシュに D2H(小: 27MB/層)→ attention(P17j 済)→ o_proj が att を CH_ATT から直接読む。qkv/rope/o_proj の往復転送(計 ~4.5s+2.7s)が対象
+- **ステップ 3: attention 後のデバイス連続化 + exp2f(✅ 2026-10-14・commit 870bb87)**:
+  - **`maybe_gpu_oproj`(cuda.rs)**: `chain_attention_prefill` が CH_ATT スロットに書いた att(デバイス上)を**直接読んで** o_proj を実行(quantize → dno_gemm_i8 → [m, e] のみ D2H)。従来の att 81MB D2H+to_vec+o_proj 再 H2D の往復を消す。o_proj GEMM はビット一致枠なので緩和不要。llama.rs prefill フック: GPU attention 成功時は GPU o_proj を試行(失敗時のみ chain_download で att を取得し従来経路)
+  - **`dno_attention_prefill` の exp2f 化**: `dno_expf`(f64 による glibc 完全再現・デスクトップ GPU では DP レート 1/64)→ `exp2f((x-mx)*LOG2E_F)`(ハード命令 MUFU.EX2)。attention 緩和枠内(ユーザー承認済み)・**決定論は維持**(同一入力→同一結果)。CPU 参照との差は **maxabs 1.79e-7**(expf 版 1.49e-7 からほぼ不変)。decode 用 `dno_attention` はビット一致枠のため dno_expf のまま
+  - **発見: attn_core は expf 律速ではなかった** — exp2f 化で attn_core 11.86s → 11.11s(ほぼ不変)。GPU SM 使用率はリクエスト中 30/30 サンプル 0%(7257MiB)で、GEMM ベンチの同時 nvidia-smi 観察により **DMA 転送中は nvidia-smi の SM 使用率が 0% 表示になる**ことを確認 → attn_core の残り ~400ms/層は転送+同期構造が本体
+  - **pinned H2D 実験**: attention q アップロード(81MB)を同期 pageable `copy_from` → pinned ステージング+async H2D に変更 → **attn_core 11.1s → 11.3s(不変)**。H2D 自体は律速でない(変更は保持・非同期化は今後の基盤)
+  - **性能**(13,252 トークン cold): **PROFILE TOTAL 29.1s → 26.4s・wall 33.6s → 30.7s**。o_proj 2.37s → **0.49s**。attn_core 11.1s (42%) / down 5.0s(キュー待ち含む)/ qkv 4.5s / rope 2.8s / rmsnorm 2.3s。テスト: GPU cuda_ **20/20**・exactness **6**・応答正常("OK")
+  - **PTX**: sha256 `528563f5a8e5ac59372a4f37051378affb615980ab8163fb48c13b7e3754cbc0`
+- **残る実装候補(ステップ 4 以降)**:
+  1. **qkv→rope→attention のデバイス連続化**: qkv GEMM 出力をデバイスに置いたまま rope(GPU・dno_rope_qkv はビット一致済みだが 1 行/ブロック設計のため prefill 用の行並列版+行ごとの pos テーブルが必要)→ K/V をホストキャッシュに D2H(27MB/層)→ attention はデバイス q を読む(P17j カーネルの q 入力をスロット参照に)。qkv 4.5s・rope 2.8s・attn_core の転送分(~4-6s)が対象。attn_core の ~400ms/層の内訳(ミラー upload・oproj 待ち・D2H・同期回数)の特定が前提
   2. **GEMM カーネル改善**: 現行 64×64・1 thread 4×4・TK=32 はレイテンシ律速気味。128×128 タイル+8×8/thread+ベクトルロードで 2-4x を見込む(整数累積なのでビット一致は構造的に保証)
-  3. **prefill attention の exp 高速化**: dno_expf(f64 による glibc 完全再現)は m²/2×heads ≈ 10 億回呼ばれ attn_core 12.1s の大部分の可能性。attention は緩和枠(ユーザー承認済み)なので `exp2f` ベースに置換可能(決定論は維持・タイル内順序不変)
 
 ## 4. 次の実装候補
 

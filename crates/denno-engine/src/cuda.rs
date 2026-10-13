@@ -1388,6 +1388,7 @@ struct ChainScratch {
     rope_tab: Option<DevBuffer>,  // P17h: rope cos/sin テーブル [cos(half)|sin(half)]
     rope_bias: Option<DevBuffer>, // P17h: qkv bias パック [qb|kb|vb]
     pin_rope: Option<PinMem>,     // P17h: rope テーブル/... ステップ 1 回のアップロード用
+    pin_pf: Option<PinMem>,       // P17k: prefill attention q の pinned ステージング用
     kv_stage: Option<PinMem>,     // P17h: k/v の非同期 D2H ステージング [n_layers][k|v]
     // P17h: ステップ内で sync が無くなるため pinned は (層×用途) ごとに専用化する
     // (async H2D の DMA 完了前にホストが上書きする競合を避ける)。id は呼び出し側が
@@ -1407,6 +1408,7 @@ thread_local! {
         rope_tab: None,
         rope_bias: None,
         pin_rope: None,
+        pin_pf: None,
         kv_stage: None,
         pins: Vec::new(),
     });
@@ -1954,7 +1956,19 @@ pub fn chain_attention_prefill(
     CHAIN.with(|cell| -> Option<()> {
         let mut s = cell.borrow_mut();
         ok(Scratch::ensure(&mut s.attn_pf_q, q.len() * 4))?;
-        ok(s.attn_pf_q.as_ref().unwrap().copy_from(q))?;
+        // P17k: pinned ステージング + async H2D (同期 pageable copy_from より高速)。
+        // DMA 完了は同一ストリーム順序でカーネルが待つため sync 不要。pin_pf の
+        // 次回上書きは次層の attention で、その前に oproj/download の sync が挟まる。
+        ok(Scratch::ensure_pin(&mut s.pin_pf, q.len() * 4))?;
+        let buf = s.attn_pf_q.as_ref().unwrap().ptr();
+        s.pin_pf.as_mut().unwrap().as_mut_slice::<f32>()[..q.len()].copy_from_slice(q);
+        let lib = ok(lib())?;
+        unsafe {
+            ok(check(
+                (lib.memcpy_htod_async)(buf, s.pin_pf.as_ref().unwrap().ptr as *const c_void, q.len() * 4, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync (attn_pf_q)",
+            ))?;
+        }
         let mut qptr = s.attn_pf_q.as_ref().unwrap().ptr();
         let mut aptr = s.bufs[CH_ATT].as_ref().unwrap().ptr();
         let mut args: Vec<*mut c_void> = vec![
