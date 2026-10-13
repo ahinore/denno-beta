@@ -227,7 +227,6 @@ fn lin_gateup_gpu(layer: &Layer, h: &[f32], n: usize, ff: usize) -> Option<(Vec<
 // 毎レイヤーの確保/解放が mmap/munmap システムコールになる — スレッドローカル
 // で再利用して排除する。内容は毎回全上書きするため数値・決定論には影響しない。
 thread_local! {
-    static KH_SCRATCH: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
     static SCORES_SCRATCH: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
 }
 
@@ -235,19 +234,21 @@ thread_local! {
 /// `forward` (n==1) と `forward_batch` の双方からこの関数を通るため、
 /// 単独 decode とバッチ decode はビット一致する。
 ///
-/// P12 の変更点 (数値は従来経路とビット一致):
+/// P12 の変更点:
 /// - probs@V: 従来の per-g `matmul(m=1)` × group 回 + vh 連続化コピー →
 ///   1 回の `matmul_rows_bstrided(m=group, v ストライド直接参照)`
-///   (`decode_attention_probs_v_bitexact` テストでビット一致を担保)
-/// - scores: 従来通り per-g `sgemm_acc(m=1, kh 連続化コピー)`
-///   (行統合・ストライド参照は matrixmultiply がカーネルを選び替えて
-///   ビット不一致になるため使わない — tensor.rs の検証メモ参照)
+///   (`decode_attention_probs_v_bitexact` テストで担保)
 /// - qg のコピーを廃止 (q 行の当該区間は連続なのでそのまま渡す)
 /// - kh/scores をスレッドローカルスクラッチで再利用 (mmap チャーン除去)
 ///
-/// 数値的な注意: scores/probs/v の各要素の演算列は従来と完全に同一
-/// (sgemm_acc(m=1) → softmax → matmul の同一形状呼び出し)。セッション/
-/// kv ヘッド間に数値的な相互作用はない → 単独/バッチ・変更前/変更後でビット一致。
+/// P17f の変更点 (scores 側基準更新・ユーザー承認):
+/// - scores: per-g `sgemm_acc(m=1, kh 連続化コピー)` × group 回 →
+///   1 回の `sgemm_scores_kvstrided(m=group, kc ストライド直接参照)`。
+///   kh 連続化コピー (t_total×dh × kv_heads×層数/step のメモリ移動) を廃止。
+///   matrixmultiply のカーネル選択が形状/ストライド依存のため **数値は P12
+///   経路とビット不一致** (P12 で検証済みの性質)。同一形状呼び出しは常に
+///   同一結果 → 単独/バッチ decode・セッション間の決定論は維持。
+/// - probs@V は P12 から不変 (row-major b 経路・同一形状呼び出し)
 #[allow(clippy::too_many_arguments)]
 fn attention_decode_kvhead(
     q_row: &[f32],  // セッション 1 行分 [heads*dh]
@@ -261,30 +262,31 @@ fn attention_decode_kvhead(
     scale: f32,
 ) -> Vec<f32> {
     let kh_off = kvh * dh;
-    KH_SCRATCH.with(|kh_cell| {
-        SCORES_SCRATCH.with(|sc_cell| {
-            let mut kh = kh_cell.borrow_mut();
-            kh.clear();
-            kh.resize(t_total * dh, 0.0);
-            for j in 0..t_total {
-                kh[j * dh..][..dh].copy_from_slice(&kc[j * kv_dim + kh_off..][..dh]);
-            }
-            let mut scores = sc_cell.borrow_mut();
-            scores.clear();
-            scores.resize(group * t_total, 0.0);
-            for g in 0..group {
-                let qg = &q_row[(kvh * group + g) * dh..][..dh];
-                let row = &mut scores[g * t_total..][..t_total];
-                // scores[j] = qg · kh[j] * scale (従来の n==1 sgemm 経路と同一)。
-                // causal mask: decode では未来位置なし (マスク範囲が空) → softmax のみ
-                crate::tensor::sgemm_acc(qg, &kh, row, 1, dh, t_total, scale);
-                crate::tensor::softmax(row);
-            }
-            // att_head[g] = Σ_j probs[g,j] * vh[j] — 行統合 + v ストライド直接参照
-            crate::tensor::matmul_rows_bstrided(
-                &scores, &vc[kh_off..], kv_dim, group, t_total, dh,
-            )
-        })
+    SCORES_SCRATCH.with(|sc_cell| {
+        let mut scores = sc_cell.borrow_mut();
+        scores.clear();
+        scores.resize(group * t_total, 0.0);
+        // scores[g,j] = q[kvh*group+g] · kc[j,kvh] * scale — 1 回の sgemm で
+        // group 行全てを計算 (q は q_row 内の連続区間、k は kv バッファ直接参照)。
+        // causal mask: decode では未来位置なし (マスク範囲が空) → softmax のみ
+        crate::tensor::sgemm_scores_kvstrided(
+            &q_row[kvh * group * dh..],
+            dh,
+            &kc[kh_off..],
+            kv_dim,
+            &mut scores,
+            group,
+            dh,
+            t_total,
+            scale,
+        );
+        for g in 0..group {
+            crate::tensor::softmax(&mut scores[g * t_total..][..t_total]);
+        }
+        // att_head[g] = Σ_j probs[g,j] * vh[j] — 行統合 + v ストライド直接参照
+        crate::tensor::matmul_rows_bstrided(
+            &scores, &vc[kh_off..], kv_dim, group, t_total, dh,
+        )
     })
 }
 
@@ -537,30 +539,26 @@ impl Model for LlamaQwen2 {
                 // GQA: 同じ kv ヘッドを共有する group 個の q ヘッドをまとめて処理する。
                 // scores[i,j] = q[i,gh] · k[j,kh] は sgemm で一括計算し(行列積)、
                 // causal mask → softmax → att = probs @ v も sgemm で行う。
+                // P17f: qg/kh/vh の連続化コピーを廃止し、Q 行バッファと kv バッファへ
+                // ストライド直接参照で sgemm を実行 (数値は基準更新済み・決定論は維持)。
                 let mut scores = vec![0.0f32; n * t_total];
-                let mut kh = vec![0.0f32; t_total * dh];
-                let mut vh = vec![0.0f32; t_total * dh];
                 for kvh in 0..kv_heads {
-                    // K/V ヘッド列の抽出 (contiguous 化)
-                    for j in 0..t_total {
-                        kh[j * dh..][..dh].copy_from_slice(&kc[j * kv_dim + kvh * dh..][..dh]);
-                        vh[j * dh..][..dh].copy_from_slice(&vc[j * kv_dim + kvh * dh..][..dh]);
-                    }
                     for g in 0..group {
                         let qh = kvh * group + g;
-                        // Q ヘッド列の抽出 [n, dh]
-                        let mut qg = vec![0.0f32; n * dh];
-                        for i in 0..n {
-                            qg[i * dh..][..dh].copy_from_slice(
-                                &q[i * heads * dh + qh * dh..][..dh],
-                            );
-                        }
-                        // scores[i,j] = qg[i] · kh[j] * scale  (kh は [t_total, dh] row-major → matmul_bt で a@b^T)
+                        // scores[i,j] = q[i,qh] · k[j,kvh] * scale
                         for s in scores.iter_mut() {
                             *s = 0.0;
                         }
-                        crate::tensor::sgemm_acc(
-                            &qg, &kh, &mut scores, n, dh, t_total, scale,
+                        crate::tensor::sgemm_scores_kvstrided(
+                            &q[qh * dh..],
+                            heads * dh,
+                            &kc[kvh * dh..],
+                            kv_dim,
+                            &mut scores,
+                            n,
+                            dh,
+                            t_total,
+                            scale,
                         );
                         // causal mask (prefill 時、未来の位置を -inf に)
                         for i in 0..n {
@@ -570,8 +568,10 @@ impl Model for LlamaQwen2 {
                             }
                             crate::tensor::softmax(row);
                         }
-                        // att_head[i] = Σ_j probs[i,j] * vh[j]  (通常の行列積)
-                        let out = crate::tensor::matmul(&scores, &vh, n, t_total, dh);
+                        // att_head[i] = Σ_j probs[i,j] * v[j,kvh] — v ストライド直接参照 (並列)
+                        let out = crate::tensor::matmul_rows_bstrided_par(
+                            &scores, &vc[kvh * dh..], kv_dim, n, t_total, dh,
+                        );
                         for i in 0..n {
                             att[i * heads * dh + qh * dh..][..dh]
                                 .copy_from_slice(&out[i * dh..][..dh]);

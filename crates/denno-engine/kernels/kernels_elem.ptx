@@ -28,7 +28,7 @@
 	.reg .pred 	%p<7>;
 	.reg .f32 	%f<16>;
 	.reg .b32 	%r<9>;
-	.reg .f64 	%fd<22>;
+	.reg .f64 	%fd<19>;
 	.reg .b64 	%rd<21>;
 
 
@@ -79,14 +79,14 @@ $L__BB0_4:
 
 $L__BB0_6:
 	cvt.f64.f32 	%fd1, %f2;
-	ld.const.f64 	%fd2, [DNO_EXP_INVLN2N];
-	mul.rn.f64 	%fd3, %fd2, %fd1;
-	ld.const.f64 	%fd4, [DNO_EXP_SHIFT];
-	add.rn.f64 	%fd5, %fd3, %fd4;
-	mov.b64 	%rd8, %fd5;
-	neg.f64 	%fd6, %fd4;
-	add.rn.f64 	%fd7, %fd5, %fd6;
-	sub.rn.f64 	%fd8, %fd3, %fd7;
+	ld.const.f64 	%fd2, [DNO_EXP_SHIFT];
+	ld.const.f64 	%fd3, [DNO_EXP_INVLN2N];
+	fma.rn.f64 	%fd4, %fd3, %fd1, %fd2;
+	mov.b64 	%rd8, %fd4;
+	neg.f64 	%fd5, %fd2;
+	add.rn.f64 	%fd6, %fd4, %fd5;
+	neg.f64 	%fd7, %fd6;
+	fma.rn.f64 	%fd8, %fd3, %fd1, %fd7;
 	shl.b64 	%rd9, %rd8, 3;
 	and.b64  	%rd10, %rd9, 248;
 	mov.u64 	%rd11, DNO_EXP2_TAB;
@@ -95,19 +95,16 @@ $L__BB0_6:
 	ld.global.u64 	%rd14, [%rd12];
 	add.s64 	%rd15, %rd14, %rd13;
 	mov.b64 	%fd9, %rd15;
-	ld.global.f64 	%fd10, [DNO_EXP_POLY];
-	mul.rn.f64 	%fd11, %fd10, %fd8;
-	ld.global.f64 	%fd12, [DNO_EXP_POLY+8];
-	add.rn.f64 	%fd13, %fd11, %fd12;
-	mul.rn.f64 	%fd14, %fd8, %fd8;
-	ld.global.f64 	%fd15, [DNO_EXP_POLY+16];
-	mul.rn.f64 	%fd16, %fd15, %fd8;
-	mov.f64 	%fd17, 0d3FF0000000000000;
-	add.rn.f64 	%fd18, %fd16, %fd17;
-	mul.rn.f64 	%fd19, %fd13, %fd14;
-	add.rn.f64 	%fd20, %fd19, %fd18;
-	mul.rn.f64 	%fd21, %fd20, %fd9;
-	cvt.rn.f32.f64 	%f15, %fd21;
+	ld.global.f64 	%fd10, [DNO_EXP_POLY+8];
+	ld.global.f64 	%fd11, [DNO_EXP_POLY];
+	fma.rn.f64 	%fd12, %fd11, %fd8, %fd10;
+	mul.rn.f64 	%fd13, %fd8, %fd8;
+	ld.global.f64 	%fd14, [DNO_EXP_POLY+16];
+	mov.f64 	%fd15, 0d3FF0000000000000;
+	fma.rn.f64 	%fd16, %fd14, %fd8, %fd15;
+	fma.rn.f64 	%fd17, %fd12, %fd13, %fd16;
+	mul.rn.f64 	%fd18, %fd17, %fd9;
+	cvt.rn.f32.f64 	%f15, %fd18;
 
 $L__BB0_8:
 	mov.f32 	%f9, 0f3F800000;
@@ -308,7 +305,7 @@ $L__BB1_19:
 	.reg .pred 	%p<7>;
 	.reg .f32 	%f<10>;
 	.reg .b32 	%r<9>;
-	.reg .f64 	%fd<22>;
+	.reg .f64 	%fd<19>;
 	.reg .b64 	%rd<18>;
 
 
@@ -357,14 +354,14 @@ $L__BB2_4:
 
 $L__BB2_6:
 	cvt.f64.f32 	%fd1, %f1;
-	ld.const.f64 	%fd2, [DNO_EXP_INVLN2N];
-	mul.rn.f64 	%fd3, %fd2, %fd1;
-	ld.const.f64 	%fd4, [DNO_EXP_SHIFT];
-	add.rn.f64 	%fd5, %fd3, %fd4;
-	mov.b64 	%rd7, %fd5;
-	neg.f64 	%fd6, %fd4;
-	add.rn.f64 	%fd7, %fd5, %fd6;
-	sub.rn.f64 	%fd8, %fd3, %fd7;
+	ld.const.f64 	%fd2, [DNO_EXP_SHIFT];
+	ld.const.f64 	%fd3, [DNO_EXP_INVLN2N];
+	fma.rn.f64 	%fd4, %fd3, %fd1, %fd2;
+	mov.b64 	%rd7, %fd4;
+	neg.f64 	%fd5, %fd2;
+	add.rn.f64 	%fd6, %fd4, %fd5;
+	neg.f64 	%fd7, %fd6;
+	fma.rn.f64 	%fd8, %fd3, %fd1, %fd7;
 	shl.b64 	%rd8, %rd7, 3;
 	and.b64  	%rd9, %rd8, 248;
 	mov.u64 	%rd10, DNO_EXP2_TAB;
@@ -373,19 +370,16 @@ $L__BB2_6:
 	ld.global.u64 	%rd13, [%rd11];
 	add.s64 	%rd14, %rd13, %rd12;
 	mov.b64 	%fd9, %rd14;
-	ld.global.f64 	%fd10, [DNO_EXP_POLY];
-	mul.rn.f64 	%fd11, %fd10, %fd8;
-	ld.global.f64 	%fd12, [DNO_EXP_POLY+8];
-	add.rn.f64 	%fd13, %fd11, %fd12;
-	mul.rn.f64 	%fd14, %fd8, %fd8;
-	ld.global.f64 	%fd15, [DNO_EXP_POLY+16];
-	mul.rn.f64 	%fd16, %fd15, %fd8;
-	mov.f64 	%fd17, 0d3FF0000000000000;
-	add.rn.f64 	%fd18, %fd16, %fd17;
-	mul.rn.f64 	%fd19, %fd13, %fd14;
-	add.rn.f64 	%fd20, %fd19, %fd18;
-	mul.rn.f64 	%fd21, %fd20, %fd9;
-	cvt.rn.f32.f64 	%f9, %fd21;
+	ld.global.f64 	%fd10, [DNO_EXP_POLY+8];
+	ld.global.f64 	%fd11, [DNO_EXP_POLY];
+	fma.rn.f64 	%fd12, %fd11, %fd8, %fd10;
+	mul.rn.f64 	%fd13, %fd8, %fd8;
+	ld.global.f64 	%fd14, [DNO_EXP_POLY+16];
+	mov.f64 	%fd15, 0d3FF0000000000000;
+	fma.rn.f64 	%fd16, %fd14, %fd8, %fd15;
+	fma.rn.f64 	%fd17, %fd12, %fd13, %fd16;
+	mul.rn.f64 	%fd18, %fd17, %fd9;
+	cvt.rn.f32.f64 	%f9, %fd18;
 
 $L__BB2_8:
 	cvta.to.global.u64 	%rd15, %rd3;
