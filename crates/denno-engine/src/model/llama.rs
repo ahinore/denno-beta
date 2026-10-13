@@ -288,6 +288,142 @@ fn attention_decode_kvhead(
     })
 }
 
+// P17d: solo decode (n==1) を隠れ状態デバイス常駐チェーンで実行する。
+// 埋め込み → [rmsnorm(+residual) → qkv(grouped) → (CPU: rope/attention) →
+// o_proj → rmsnorm(+residual) → gate/up(grouped) → swiglu → down] ×層数
+// → final norm(+residual) → lm_head → logits の順で、x / 中間テンソルを
+// GPU 上に置き続ける (ホスト往復は qkv と logits のみ)。sync は層あたり
+// qkv の D2H 待ち 1 回で、CPU attention の間 GPU は次層 FFN を先読み実行。
+// ビット一致: 線形は P17b/c と同一カーネル、rmsnorm/swiglu は CPU と同一の
+// 演算順序 (expf は glibc e_expf を f64 演算で完全再現した dno_expf)。
+// 戻り None = 従来の CPU/GPU per-op 経路で forward をやり直す
+// (bias / Qwen3 QK-Norm / tied lm_head は非対応 → None。k/v 書き込みは冪等で
+// advance は最後に 1 回なので途中失敗でも安全にやり直せる)。
+#[cfg(feature = "cuda")]
+impl LlamaQwen2 {
+    fn forward_decode_gpu(
+        &mut self,
+        token: u32,
+        cache: &mut KvCache,
+        pos0: usize,
+    ) -> Option<Vec<f32>> {
+        use crate::cuda::{
+            chain_download, chain_linear_grouped, chain_rmsnorm, chain_swiglu, chain_upload,
+            CH_ACT, CH_ATT, CH_DOWN, CH_GA, CH_H, CH_LOGITS, CH_O, CH_QKV, CH_X,
+        };
+        let e = self.e;
+        let dh = self.dh;
+        let heads = self.heads;
+        let kv_heads = self.kv_heads;
+        let kv_dim = kv_heads * dh;
+        let group = heads / kv_heads; // GQA group size
+
+        // 非対応構造は従来経路へ
+        if self.lm_head.is_none() {
+            return None;
+        }
+        for layer in &self.layers {
+            if layer.q_b.is_some() || layer.k_b.is_some() || layer.v_b.is_some() {
+                return None;
+            }
+            if layer.q_norm_w.is_some() || layer.k_norm_w.is_some() {
+                return None; // Qwen3 QK-Norm は従来経路
+            }
+            for w in [
+                &layer.q_w, &layer.k_w, &layer.v_w, &layer.o_w, &layer.gate_w, &layer.up_w,
+                &layer.down_w,
+            ] {
+                if w.quant8().is_none() {
+                    return None; // 一部 fp32 → 従来経路
+                }
+            }
+        }
+        if self.lm_head.as_ref().unwrap().quant8().is_none() {
+            return None;
+        }
+
+        // 埋め込み 1 行をアップロード (residual stream 常駐開始)
+        chain_upload(CH_X, &self.embed[token as usize * e..][..e], e, 1)?;
+        let mut pending: Option<usize> = None;
+        let mut att = vec![0.0f32; heads * dh];
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            crate::telemetry_layer_begin(li as u16);
+            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+                chain_rmsnorm(&layer.ln1_w, self.eps, pending, CH_H, e, 1)
+            })?;
+            let (mut q, mut k, v) =
+                crate::prof::time_layer(crate::prof::QKV, li, || -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+                    let qw = layer.q_w.quant8()?;
+                    let kw = layer.k_w.quant8()?;
+                    let vw = layer.v_w.quant8()?;
+                    chain_linear_grouped(&[qw, kw, vw], CH_H, CH_QKV, 1)?;
+                    let all = chain_download(CH_QKV, heads * dh + 2 * kv_dim)?;
+                    Some((
+                        all[..heads * dh].to_vec(),
+                        all[heads * dh..heads * dh + kv_dim].to_vec(),
+                        all[heads * dh + kv_dim..].to_vec(),
+                    ))
+                })?;
+
+            // --- rope / KV 書き込み / attention (CPU — 従来経路と同一の演算列) ---
+            crate::prof::time_layer(crate::prof::ROPE, li, || {
+                rope_rows(&mut q, 1, heads, dh, pos0, self.theta);
+                rope_rows(&mut k, 1, kv_heads, dh, pos0, self.theta);
+            });
+            {
+                let (kc, vc) = cache.kv_bufs(li);
+                kc[pos0 * kv_dim..][..kv_dim].copy_from_slice(&k);
+                vc[pos0 * kv_dim..][..kv_dim].copy_from_slice(&v);
+            }
+            crate::prof::time_layer(crate::prof::ATTN, li, || {
+                let (kc, vc) = cache.kv_bufs(li);
+                let t_total = pos0 + 1;
+                let scale = 1.0 / (dh as f32).sqrt();
+                for kvh in 0..kv_heads {
+                    let a = attention_decode_kvhead(
+                        &q, kc, vc, kvh, group, dh, kv_dim, t_total, scale,
+                    );
+                    att[kvh * group * dh..][..group * dh].copy_from_slice(&a);
+                }
+            });
+
+            // --- o_proj → residual+rmsnorm → gate/up → swiglu → down (全てデバイス内) ---
+            crate::prof::time_layer(crate::prof::OPROJ, li, || -> Option<()> {
+                chain_upload(CH_ATT, &att, heads * dh, 1)?;
+                let ow = layer.o_w.quant8()?;
+                chain_linear_grouped(&[ow], CH_ATT, CH_O, 1)
+            })?;
+            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+                chain_rmsnorm(&layer.ln2_w, self.eps, Some(CH_O), CH_H, e, 1)
+            })?;
+            crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
+                let gw = layer.gate_w.quant8()?;
+                let uw = layer.up_w.quant8()?;
+                chain_linear_grouped(&[gw, uw], CH_H, CH_GA, 1)
+            })?;
+            crate::prof::time_layer(crate::prof::SWIGLU, li, || {
+                chain_swiglu(CH_GA, CH_ACT, self.ff, 1)
+            })?;
+            crate::prof::time_layer(crate::prof::DOWN, li, || -> Option<()> {
+                let dw = layer.down_w.quant8()?;
+                chain_linear_grouped(&[dw], CH_ACT, CH_DOWN, 1)
+            })?;
+            pending = Some(CH_DOWN);
+            crate::telemetry_layer_flush();
+        }
+
+        let logits = crate::prof::time(crate::prof::LM_HEAD, || -> Option<Vec<f32>> {
+            chain_rmsnorm(&self.norm_w, self.eps, pending, CH_H, e, 1)?;
+            let lmq = self.lm_head.as_ref().unwrap().quant8()?;
+            chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)?;
+            chain_download(CH_LOGITS, self.vocab)
+        })?;
+        cache.advance(1);
+        Some(logits)
+    }
+}
+
 impl Model for LlamaQwen2 {
     fn context(&self) -> usize {
         self.ctx
@@ -311,6 +447,15 @@ impl Model for LlamaQwen2 {
         let group = heads / kv_heads; // GQA group size
         let pos0 = cache.len();
         let n = tokens.len();
+
+        // P17d: solo decode (n==1) はデバイス常駐チェーンで実行
+        // (GPU 無効/非対応構造/実行時エラー → None → 従来経路でやり直し)
+        #[cfg(feature = "cuda")]
+        if n == 1 {
+            if let Some(logits) = self.forward_decode_gpu(tokens[0], cache, pos0) {
+                return Ok(logits);
+            }
+        }
 
         let mut x = vec![0.0f32; n * e];
         crate::prof::time(crate::prof::EMBED, || {

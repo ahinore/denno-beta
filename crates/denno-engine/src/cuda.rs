@@ -263,9 +263,17 @@ pub struct CudaCtx {
     module: CUmodule,
     f_quant: CUfunction,
     f_mv: CUfunction,
+    // P17d: 要素演算モジュール (swiglu / add+rmsnorm / expf probe)
+    #[allow(dead_code)]
+    module_elem: CUmodule,
+    f_swiglu: CUfunction,
+    f_addnorm: CUfunction,
+    #[allow(dead_code)]
+    f_expf: CUfunction,
 }
 
 const PTX: &[u8] = include_bytes!("../kernels/kernels_int8.ptx");
+const PTX_ELEM: &[u8] = include_bytes!("../kernels/kernels_elem.ptx");
 
 // 中身は生ハンドル (context / module / function)。CUcontext はスレッドごとに
 // current 設定して使うハンドルであり、所有権の移動は伴わないため Send/Sync を
@@ -323,6 +331,31 @@ impl CudaCtx {
                 "cuModuleGetFunction(dno_matvec_rows_bt_i8)",
             )?;
 
+            // P17d: 要素演算モジュール (-fmad=false でコンパイル済み。FMA 縮約は
+            // CPU とビット一致しないため禁止)
+            let mut module_elem: CUmodule = std::ptr::null_mut();
+            let mut image_elem = PTX_ELEM.to_vec();
+            image_elem.push(0);
+            check(
+                (lib.module_load_data)(&mut module_elem, image_elem.as_ptr() as *const c_void),
+                "cuModuleLoadData (elem PTX JIT)",
+            )?;
+            let mut f_swiglu: CUfunction = std::ptr::null_mut();
+            let mut f_addnorm: CUfunction = std::ptr::null_mut();
+            let mut f_expf: CUfunction = std::ptr::null_mut();
+            check(
+                (lib.module_get_function)(&mut f_swiglu, module_elem, b"dno_swiglu\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_swiglu)",
+            )?;
+            check(
+                (lib.module_get_function)(&mut f_addnorm, module_elem, b"dno_add_rmsnorm\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_add_rmsnorm)",
+            )?;
+            check(
+                (lib.module_get_function)(&mut f_expf, module_elem, b"dno_expf_probe\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_expf_probe)",
+            )?;
+
             Ok(Self {
                 device: dev,
                 name,
@@ -332,6 +365,10 @@ impl CudaCtx {
                 module,
                 f_quant,
                 f_mv,
+                module_elem,
+                f_swiglu,
+                f_addnorm,
+                f_expf,
             })
         }
     }
@@ -863,6 +900,311 @@ fn linear_pinned(
     })
 }
 
+// ===========================================================================
+// P17d: decode chain (隠れ状態デバイス常駐 + 要素演算融合)
+// ===========================================================================
+// solo decode (n==1) の 1 ステップを
+//   埋め込み H2D → [rmsnorm(+residual) → qkv → (CPU: rope/attention) →
+//   o_proj → rmsnorm(+residual) → gate/up → swiglu → down] ×層数
+//   → final norm(+residual) → lm_head → logits D2H
+// のデバイス常駐パイプラインで実行する。
+// - 線形カーネル (f_quant / f_mv) と重みレジストリは P17b/c と同一 → ビット一致
+// - rmsnorm / swiglu は CPU と同一の演算順序 (expf は glibc e_expf を f64 演算
+//   で完全再現した dno_expf) → ビット一致
+// - 同期は層あたり 1 回 (qkv の D2H 待ち)。CPU attention の間 GPU は次層の
+//   FFN チェーンを先読み実行する
+// - どのステップで失敗しても GPU_BROKEN → 呼び出し側が従来 CPU 経路で forward
+//   をやり直す (k/v 書き込みは冪等・advance は最後に 1 回なので安全)
+
+/// デバイス常駐スロット (ChainScratch.bufs のインデックス)
+pub const CH_X: usize = 0; // residual stream [m*e]
+pub const CH_H: usize = 1; // rmsnorm 出力 [m*e]
+pub const CH_QKV: usize = 2; // qkv 連結出力 [m*(qn+2*kvn)] (q|k|v の列ブロック)
+pub const CH_ATT: usize = 3; // attention 出力 (o_proj 入力) [m*(heads*dh)]
+pub const CH_O: usize = 4; // o_proj 出力 [m*(heads*dh)]
+pub const CH_GA: usize = 5; // gate/up 連結出力 [m*2ff] (gate が前半)
+pub const CH_ACT: usize = 6; // swiglu 出力 [m*ff]
+pub const CH_DOWN: usize = 7; // down 出力 [m*e]
+pub const CH_LOGITS: usize = 8; // lm_head 出力 [m*vocab]
+const CH_SLOTS: usize = 9;
+
+struct ChainScratch {
+    bufs: Vec<Option<DevBuffer>>,
+    pin_x: Option<PinMem>,  // x / att アップロード用 (使用間に必ず sync が挟まる)
+    pin_w0: Option<PinMem>, // rmsnorm 重み用 (ピンポンバッファ: 連続呼び出しでも競合しない)
+    pin_w1: Option<PinMem>,
+    w_toggle: bool,         // pin_w0/pin_w1 を呼び出しごとに交互に使う
+    pin_dn: Option<PinMem>, // ダウンロード用
+    aq: Option<DevBuffer>,  // int8 カーネル用スクラッチ (chain 専用)
+}
+
+thread_local! {
+    static CHAIN: std::cell::RefCell<ChainScratch> = std::cell::RefCell::new(ChainScratch {
+        bufs: (0..CH_SLOTS).map(|_| None).collect(),
+        pin_x: None,
+        pin_w0: None,
+        pin_w1: None,
+        w_toggle: false,
+        pin_dn: None,
+        aq: None,
+    });
+}
+
+fn chain_err(e: anyhow::Error) -> anyhow::Error {
+    tracing::error!("cuda chain failed (falling back to CPU): {e:#}");
+    eprintln!("cuda chain failed (falling back to CPU): {e:#}");
+    GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    e
+}
+
+fn chain_fail(e: anyhow::Error) -> Option<()> {
+    chain_err(e);
+    None
+}
+
+/// Result を Option に変換しつつ GPU_BROKEN をマークする
+fn ok<T>(r: Result<T, anyhow::Error>) -> Option<T> {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) => {
+            chain_err(e);
+            None
+        }
+    }
+}
+
+fn chain_ctx() -> Option<&'static CudaCtx> {
+    if !cuda_enabled() {
+        return None;
+    }
+    let ctx = shared_ctx()?;
+    if let Err(e) = ctx.make_current() {
+        chain_err(anyhow::anyhow!("cuCtxSetCurrent: {e:#}"));
+        return None;
+    }
+    Some(ctx)
+}
+
+fn chain_ensure_buf(slot: usize, bytes: usize) -> Result<(), anyhow::Error> {
+    CHAIN.with(|cell| {
+        let mut s = cell.borrow_mut();
+        Scratch::ensure(&mut s.bufs[slot], bytes).map_err(chain_err)
+    })
+}
+
+/// ホストデータをスロットへアップロード (async、同期はしない)。
+/// 呼び出し間に sync が挟まる (qkv download) ので pinned バッファの再利用は安全。
+pub fn chain_upload(slot: usize, data: &[f32], cols: usize, m: usize) -> Option<()> {
+    let _ = chain_ctx()?;
+    let bytes = m.checked_mul(cols)?.checked_mul(4)?;
+    if data.len() != m * cols {
+        return chain_fail(anyhow::anyhow!("chain_upload: size mismatch"));
+    }
+    ok(chain_ensure_buf(slot, bytes))?;
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure_pin(&mut s.pin_x, bytes))?;
+        let buf = s.bufs[slot].as_ref().unwrap().ptr();
+        let pin = s.pin_x.as_mut().unwrap();
+        pin.as_mut_slice::<f32>()[..m * cols].copy_from_slice(data);
+        let lib = ok(lib())?;
+        unsafe {
+            ok(check(
+                (lib.memcpy_htod_async)(buf, pin.ptr as *const c_void, bytes, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync (chain)",
+            ))
+        }
+    })
+}
+
+/// スロットからホストへダウンロード (D2H + 同期)。
+pub fn chain_download(slot: usize, len: usize) -> Option<Vec<f32>> {
+    let ctx = chain_ctx()?;
+    let bytes = len.checked_mul(4)?;
+    ok(chain_ensure_buf(slot, bytes))?;
+    CHAIN.with(|cell| -> Option<Vec<f32>> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure_pin(&mut s.pin_dn, bytes))?;
+        let buf = s.bufs[slot].as_ref().unwrap().ptr();
+        let pin = s.pin_dn.as_mut().unwrap();
+        {
+            let lib = ok(lib())?;
+            unsafe {
+                ok(check(
+                    (lib.memcpy_dtoh_async)(pin.ptr as *mut c_void, buf, bytes, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (chain)",
+                ))?;
+            }
+        }
+        ok(ctx.sync())?;
+        Some(pin.as_slice::<f32>()[..len].to_vec())
+    })
+}
+
+/// out = rmsnorm(x [+ residual]) — residual スロットを指定すると x += p を先に
+/// 行う (o_proj / down 出力の残差加算と融合)。CPU tensor::rmsnorm とビット一致。
+/// grid = m ブロック、平方和は thread 0 が CPU と同一の逐次順で計算。
+pub fn chain_rmsnorm(
+    w: &[f32],
+    eps: f32,
+    add_slot: Option<usize>,
+    out_slot: usize,
+    cols: usize,
+    m: usize,
+) -> Option<()> {
+    let ctx = chain_ctx()?;
+    if w.len() != cols {
+        return chain_fail(anyhow::anyhow!("chain_rmsnorm: w size mismatch"));
+    }
+    let wb = cols * 4;
+    ok(chain_ensure_buf(out_slot, m * cols * 4 + wb))?; // 末尾 wb バイトは w の作業領域
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        // w はピンポン pinned から毎回アップロード (6KB 程度、同期なし)。
+        // 前回転送の完了を待たずに次の呼び出しが同じ pinned を上書きしないよう
+        // 呼び出しごとに 0/1 を交互に使う。
+        s.w_toggle = !s.w_toggle;
+        let wsrc = {
+            let pin_w = if s.w_toggle { &mut s.pin_w0 } else { &mut s.pin_w1 };
+            ok(Scratch::ensure_pin(pin_w, wb))?;
+            let pin = pin_w.as_mut().unwrap();
+            pin.as_mut_slice::<f32>()[..cols].copy_from_slice(w);
+            pin.ptr as *const c_void
+        };
+        let out_buf = s.bufs[out_slot].as_ref().unwrap();
+        let wdev = out_buf.ptr() + (m * cols * 4) as u64; // バッファ末尾に置く
+        let xptr = s.bufs[CH_X].as_ref().unwrap().ptr();
+        let pptr = match add_slot {
+            Some(sl) => s.bufs[sl].as_ref().unwrap().ptr(),
+            None => 0, // NULL → 単純 rmsnorm
+        };
+        let optr = out_buf.ptr();
+        let lib = ok(lib())?;
+        unsafe {
+            ok(check(
+                (lib.memcpy_htod_async)(wdev, wsrc, wb, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync (chain rmsnorm w)",
+            ))?;
+        }
+        let (mut px, mut pp, mut pw, mut po) = (xptr, pptr, wdev, optr);
+        let (mut mc, mut ec) = (cols as c_int, eps);
+        let mut args = [
+            &mut px as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut pw as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut mc as *mut _ as *mut c_void,
+            &mut ec as *mut _ as *mut c_void,
+        ];
+        ok(unsafe {
+            ctx.launch_async(ctx.f_addnorm, (m as u32, 1, 1), (256, 1, 1), cols as u32 * 4, &mut args)
+        })
+    })
+}
+
+/// スロット内の f32 を int8 量子化して grouped GEMV (デバイス内完結)。
+/// H2D/D2H/同期なし。f_quant / f_mv / 重みレジストリは P17b/c と同一 → ビット一致。
+pub fn chain_linear_grouped(
+    parts: &[&Quant8Linear],
+    in_slot: usize,
+    out_slot: usize,
+    m: usize,
+) -> Option<()> {
+    let ctx = chain_ctx()?;
+    if m > max_m() {
+        return None;
+    }
+    let k = parts[0].k;
+    let n: usize = parts.iter().map(|p| p.n).sum();
+    let uids: Vec<u64> = parts.iter().map(|p| p.uid).collect();
+    let gw = ok(weights_for_group(&uids, parts, k, n))?;
+    ok(chain_ensure_buf(in_slot, m * k * 4))?;
+    ok(chain_ensure_buf(out_slot, m * n * 4))?;
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure(&mut s.aq, m * k))?;
+        let iptr = s.bufs[in_slot].as_ref().unwrap().ptr();
+        let optr = s.bufs[out_slot].as_ref().unwrap().ptr();
+        let aq = s.aq.as_ref().unwrap().ptr();
+        // asc は per-op SCRATCH を共有 (同一スレッド内なので競合しない)
+        SCRATCH.with(|c2| -> Option<()> {
+            let mut s2 = c2.borrow_mut();
+            ok(Scratch::ensure(&mut s2.asc, m * 4))?;
+            let asc = s2.asc.as_ref().unwrap().ptr();
+            let (mut px, mut paq, mut pasc) = (iptr, aq, asc);
+            let (mut mc, mut kc) = (m as c_int, k as c_int);
+            let mut args = [
+                &mut px as *mut _ as *mut c_void,
+                &mut paq as *mut _ as *mut c_void,
+                &mut pasc as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+            ];
+            ok(unsafe { ctx.launch_async(ctx.f_quant, (m as u32, 1, 1), (256, 1, 1), 256 * 4, &mut args) })?;
+            let (mut paqi, mut pasci, mut pw, mut psc, mut po) =
+                (aq, asc, gw.w.ptr(), gw.sc.ptr(), optr);
+            let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, n as c_int);
+            let mut args = [
+                &mut paqi as *mut _ as *mut c_void,
+                &mut pasci as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut psc as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            ok(unsafe { ctx.launch_async(ctx.f_mv, (n as u32, 1, 1), (128, 1, 1), 0, &mut args) })
+        })
+    })
+}
+
+/// swiglu: ga スロットの [gate|up] から act = (g/(1+exp(-g)))*u を計算
+/// (デバイス内完結)。CPU silu_inplace + gate[i] *= up[i] とビット一致。
+pub fn chain_swiglu(ga_slot: usize, act_slot: usize, ff: usize, m: usize) -> Option<()> {
+    let ctx = chain_ctx()?;
+    ok(chain_ensure_buf(act_slot, m * ff * 4))?;
+    CHAIN.with(|cell| -> Option<()> {
+        let s = cell.borrow();
+        let gaptr = s.bufs[ga_slot].as_ref().unwrap().ptr();
+        let optr = s.bufs[act_slot].as_ref().unwrap().ptr();
+        let (mut pg, mut pu, mut po) = (gaptr, gaptr + (ff as u64) * 4, optr);
+        let mut tc = (m * ff) as c_int;
+        let mut args = [
+            &mut pg as *mut _ as *mut c_void,
+            &mut pu as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut tc as *mut _ as *mut c_void,
+        ];
+        let grid = ((m * ff) as u32).div_ceil(256);
+        ok(unsafe { ctx.launch_async(ctx.f_swiglu, (grid, 1, 1), (256, 1, 1), 0, &mut args) })
+    })
+}
+
+/// テスト用: dno_expf (glibc expf の bit-exact 再現) を要素ごとに適用する
+pub fn chain_expf_probe(inp: &[f32]) -> Option<Vec<f32>> {
+    let ctx = chain_ctx()?;
+    let n = inp.len();
+    chain_upload(CH_GA, inp, n, 1)?;
+    ok(chain_ensure_buf(CH_ACT, n * 4))?;
+    CHAIN.with(|cell| -> Option<()> {
+        let s = cell.borrow();
+        let ip = s.bufs[CH_GA].as_ref().unwrap().ptr();
+        let op = s.bufs[CH_ACT].as_ref().unwrap().ptr();
+        let (mut pi, mut po) = (ip, op);
+        let mut nc = n as c_int;
+        let mut args = [
+            &mut pi as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+        ];
+        let grid = (n as u32).div_ceil(256);
+        ok(unsafe { ctx.launch_async(ctx.f_expf, (grid, 1, 1), (256, 1, 1), 0, &mut args) })
+    })?;
+    chain_download(CH_ACT, n)
+}
+
+// ===========================================================================
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
@@ -1240,5 +1582,206 @@ mod tests {
                 r = cpu / gpu,
             );
         }
+    }
+
+    /// P17d: GPU dno_expf (glibc e_expf の f64 再現) が CPU f32::exp (glibc) と
+    /// ビット一致するか。ビットパターン走査 + ランダム + 特殊値。
+    #[test]
+    #[ignore]
+    fn cuda_expf_glibc_bit_exact_vs_cpu() {
+        enable_for_tests();
+        CudaCtx::new().unwrap();
+        let mut vals: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            -88.0,
+            -103.0,
+            -103.28,
+            -103.97,
+            -104.0,
+            -110.0,
+            88.0,
+            88.72,
+            89.0,
+            100.0,
+        ];
+        // 主要指数帯のビットパターン走査 (指数部 0x3C..0xC2, mantissa 5 step)
+        for exp_hi in 0x3Cu32..=0xC2 {
+            for sign in [0u32, 1] {
+                let hi = (sign << 31) | (exp_hi << 23);
+                for mi in (0u32..(1 << 23)).step_by(5) {
+                    vals.push(f32::from_bits(hi | mi));
+                }
+            }
+        }
+        // ランダムビット (|x| <= 120 にフィルタ + 範囲外も一部保持)
+        let mut x: u32 = 123_456_789;
+        for _ in 0..4_000_000 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = f32::from_bits(x);
+            if v.abs() <= 120.0 || v.is_infinite() {
+                vals.push(v);
+            }
+        }
+        let got = chain_expf_probe(&vals).expect("chain_expf_probe");
+        assert_eq!(got.len(), vals.len());
+        // 本番 CPU 経路 (silu) は要素ごとのスカラー呼び出しなので、比較基準も
+        // スカラー expf に固定する (LLVM の自動ベクトル化で libmvec に置換される
+        // とスカラー結果と 1ULP 異なるため inline(never) で回避)
+        fn exp_ref(x: f32) -> f32 {
+            #[inline(never)]
+            fn inner(x: f32) -> f32 {
+                x.exp()
+            }
+            inner(x)
+        }
+        let mut mismatches = 0usize;
+        for (i, (&v, &g)) in vals.iter().zip(got.iter()).enumerate() {
+            let want = exp_ref(v);
+            if want.is_nan() && g.is_nan() {
+                continue; // NaN は payload を比較しない
+            }
+            if want.to_bits() != g.to_bits() {
+                if mismatches < 10 {
+                    println!(
+                        "MISMATCH idx={i}: x={v:?} (bits {:#010x}) cpu={want:?} ({}), gpu={g:?} ({})",
+                        v.to_bits(),
+                        want.to_bits(),
+                        g.to_bits()
+                    );
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(mismatches, 0, "expf bit mismatch: {mismatches} / {}", vals.len());
+        println!("expf bit-exact: {} values OK", vals.len());
+    }
+
+    /// P17d: GPU rmsnorm / add+rmsnorm / swiglu が CPU とビット一致するか
+    #[test]
+    #[ignore]
+    fn cuda_chain_elem_bit_exact_vs_cpu() {
+        CudaCtx::new().unwrap();
+        let (cols, m) = (1536usize, 4usize);
+        let w = pseudo_random(cols, 201);
+        // 1) 単純 rmsnorm
+        let x = pseudo_random(cols * m, 200);
+        chain_upload(CH_X, &x, cols, m).unwrap();
+        chain_rmsnorm(&w, 1e-6, None, CH_H, cols, m).unwrap();
+        let got = chain_download(CH_H, cols * m).unwrap();
+        for row in 0..m {
+            let want = tensor::rmsnorm(&x[row * cols..][..cols], &w, cols, 1e-6);
+            for i in 0..cols {
+                assert_eq!(got[row * cols + i].to_bits(), want[i].to_bits(), "rmsnorm row={row} i={i}");
+            }
+        }
+        // 2) residual add + rmsnorm
+        let proj = pseudo_random(cols * m, 202);
+        chain_upload(CH_X, &x, cols, m).unwrap();
+        chain_upload(CH_O, &proj, cols, m).unwrap();
+        chain_rmsnorm(&w, 1e-6, Some(CH_O), CH_H, cols, m).unwrap();
+        let got = chain_download(CH_H, cols * m).unwrap();
+        let mut xr = x.clone();
+        for i in 0..cols * m {
+            xr[i] += proj[i];
+        }
+        for row in 0..m {
+            let want = tensor::rmsnorm(&xr[row * cols..][..cols], &w, cols, 1e-6);
+            for i in 0..cols {
+                assert_eq!(
+                    got[row * cols + i].to_bits(),
+                    want[i].to_bits(),
+                    "add+rmsnorm row={row} i={i}"
+                );
+            }
+        }
+        // 3) swiglu (gate|up 連結レイアウト)
+        let ff = 8960usize;
+        let g = pseudo_random(ff, 203);
+        let u = pseudo_random(ff, 204);
+        let mut ga = g.clone();
+        ga.extend_from_slice(&u);
+        chain_upload(CH_GA, &ga, ff * 2, 1).unwrap();
+        chain_swiglu(CH_GA, CH_ACT, ff, 1).unwrap();
+        let got = chain_download(CH_ACT, ff).unwrap();
+        let mut want = g.clone();
+        tensor::silu_inplace(&mut want);
+        for i in 0..ff {
+            want[i] *= u[i];
+        }
+        for i in 0..ff {
+            assert_eq!(got[i].to_bits(), want[i].to_bits(), "swiglu i={i}");
+        }
+    }
+
+    /// P17d: decode chain 全体 (rmsnorm → grouped qkv → download) が
+    /// CPU 経路 (rmsnorm → apply_bt 個別 3 回) とビット一致するか
+    #[test]
+    #[ignore]
+    fn cuda_decode_chain_bit_exact_vs_cpu() {
+        CudaCtx::new().unwrap();
+        let (e, qn, kvn, ff) = (96usize, 40usize, 24usize, 64usize);
+        let qkv_n = qn + 2 * kvn;
+        let ln1 = pseudo_random(e, 300);
+        let qw = crate::quant::Quant8Linear::quantize(&pseudo_random(qn * e, 310), e, qn);
+        let kw = crate::quant::Quant8Linear::quantize(&pseudo_random(kvn * e, 311), e, kvn);
+        let vw = crate::quant::Quant8Linear::quantize(&pseudo_random(kvn * e, 312), e, kvn);
+        let x = pseudo_random(e, 320);
+        // GPU chain
+        chain_upload(CH_X, &x, e, 1).unwrap();
+        chain_rmsnorm(&ln1, 1e-6, None, CH_H, e, 1).unwrap();
+        chain_linear_grouped(&[&qw, &kw, &vw], CH_H, CH_QKV, 1).unwrap();
+        let got = chain_download(CH_QKV, qkv_n).unwrap();
+        // CPU reference
+        let h = tensor::rmsnorm(&x, &ln1, e, 1e-6);
+        let mut want = Vec::with_capacity(qkv_n);
+        want.extend_from_slice(&tensor::matvec_bt_i8(&h, &qw.w, &qw.scale, qw.k, qw.n));
+        want.extend_from_slice(&tensor::matvec_bt_i8(&h, &kw.w, &kw.scale, kw.k, kw.n));
+        want.extend_from_slice(&tensor::matvec_bt_i8(&h, &vw.w, &vw.scale, vw.k, vw.n));
+        for i in 0..qkv_n {
+            assert_eq!(got[i].to_bits(), want[i].to_bits(), "chain qkv i={i}");
+        }
+        // FFN 部: o → add+rmsnorm → gate_up → swiglu → down → add+rmsnorm(final)
+        let ow = crate::quant::Quant8Linear::quantize(&pseudo_random(e * qn, 330), qn, e);
+        let gw = crate::quant::Quant8Linear::quantize(&pseudo_random(ff * e, 331), e, ff);
+        let uw = crate::quant::Quant8Linear::quantize(&pseudo_random(ff * e, 332), e, ff);
+        let dw = crate::quant::Quant8Linear::quantize(&pseudo_random(e * ff, 333), ff, e);
+        let ln2 = pseudo_random(e, 340);
+        let norm_w = pseudo_random(e, 341);
+        let att = pseudo_random(qn, 350);
+        chain_upload(CH_ATT, &att, qn, 1).unwrap();
+        chain_linear_grouped(&[&ow], CH_ATT, CH_O, 1).unwrap();
+        chain_rmsnorm(&ln2, 1e-6, Some(CH_O), CH_H, e, 1).unwrap();
+        chain_linear_grouped(&[&gw, &uw], CH_H, CH_GA, 1).unwrap();
+        chain_swiglu(CH_GA, CH_ACT, ff, 1).unwrap();
+        chain_linear_grouped(&[&dw], CH_ACT, CH_DOWN, 1).unwrap();
+        chain_rmsnorm(&norm_w, 1e-6, Some(CH_DOWN), CH_H, e, 1).unwrap();
+        let got = chain_download(CH_H, e).unwrap();
+        // CPU mirror
+        let o = tensor::matvec_bt_i8(&att, &ow.w, &ow.scale, ow.k, ow.n);
+        let mut xr = x.clone();
+        for i in 0..e {
+            xr[i] += o[i];
+        }
+        let h2 = tensor::rmsnorm(&xr, &ln2, e, 1e-6);
+        let mut ga_cpu = tensor::matvec_bt_i8(&h2, &gw.w, &gw.scale, gw.k, gw.n);
+        let up = tensor::matvec_bt_i8(&h2, &uw.w, &uw.scale, uw.k, uw.n);
+        ga_cpu.extend_from_slice(&up);
+        tensor::silu_inplace(&mut ga_cpu[..ff]);
+        for i in 0..ff {
+            ga_cpu[i] *= ga_cpu[ff + i];
+        }
+        let d = tensor::matvec_bt_i8(&ga_cpu[..ff], &dw.w, &dw.scale, dw.k, dw.n);
+        let mut xf = xr.clone();
+        for i in 0..e {
+            xf[i] += d[i];
+        }
+        let want = tensor::rmsnorm(&xf, &norm_w, e, 1e-6);
+        for i in 0..e {
+            assert_eq!(got[i].to_bits(), want[i].to_bits(), "chain ffn i={i}");
+        }
+        println!("decode chain bit-exact OK (e={e} qkv={qkv_n} ff={ff})");
     }
 }
