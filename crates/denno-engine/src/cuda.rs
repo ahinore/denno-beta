@@ -2419,6 +2419,60 @@ mod tests {
         println!("dno_gemm_i8 bit-exact vs CPU/GEMV OK ({} cases)", cases.len());
     }
 
+    /// P17k 調査: prefill 実形状での linear_gemm_i8 の内訳計測 (kernel / D2H / to_vec)。
+    /// `#[ignore]` — GPU が必要。cargo test --release -p denno-engine --features cuda
+    /// cuda_gemm_i8_bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn cuda_gemm_i8_bench_prefill_shapes() {
+        let ctx = CudaCtx::new().unwrap();
+        println!("device: {}", ctx.info());
+        let m = 8000usize;
+        // (label, k, n) — Qwen2.5-1.5B の gate_up / down / qkv
+        let shapes = [
+            ("gate_up", 1536usize, 17920usize),
+            ("down", 8960usize, 1536usize),
+            ("qkv", 1536usize, 2048usize),
+        ];
+        for (label, k, n) in shapes {
+            let q = pseudo_i8(k * n, 77);
+            let scale = positive_scales(n, 78);
+            let a = pseudo_random(m * k, 79);
+            let w = ctx.upload_i8(&q).unwrap();
+            let sc = ctx.upload_f32(&scale).unwrap();
+            // ウォームアップ (JIT + L2)
+            let _ = ctx.linear_gemm_i8(&a, &w, &sc, m, k, n).unwrap();
+            let t0 = std::time::Instant::now();
+            let out = ctx.linear_gemm_i8(&a, &w, &sc, m, k, n).unwrap();
+            let total = t0.elapsed();
+            // 出力 D2H 単体の時間 (同サイズの to_vec 込み)
+            let t1 = std::time::Instant::now();
+            let _ = ctx.linear_gemm_i8(&a, &w, &sc, m, k, n).unwrap();
+            let total2 = t1.elapsed();
+            println!(
+                "{label}: m={m} k={k} n={n} linear_gemm total={total:?} / {total2:?} out={}MB checksum={}",
+                out.len() * 4 / 1_000_000,
+                out[1234].to_bits()
+            );
+        }
+
+        // 本番経路 (linear_gemm: Scratch + pinned) で 28 層分連続実行
+        {
+            let (k, n) = (1536usize, 17920usize);
+            let q = pseudo_i8(k * n, 87);
+            let scale = positive_scales(n, 88);
+            let a = pseudo_random(m * k, 89);
+            let gw = weights_for(999_001, &q, &scale, k, n).unwrap();
+            let _ = linear_gemm(&ctx, &a, gw, m, k, n).unwrap(); // warmup
+            let t0 = std::time::Instant::now();
+            for _ in 0..28 {
+                let _ = linear_gemm(&ctx, &a, gw, m, k, n).unwrap();
+            }
+            let per = t0.elapsed() / 28;
+            println!("linear_gemm (production path) 28x gate_up: per-call {per:?}");
+        }
+    }
+
     /// マイクロベンチ: Qwen2.5-1.5B の線形層 (int8) を decode (m=1) で
     /// GPU vs CPU 比較。実効帯域 (重み bytes / 時間) も出す。
     #[test]
