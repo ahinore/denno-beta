@@ -4,7 +4,8 @@
 //! - 上流: `VIEW_UPSTREAM` (既定 ws://127.0.0.1:8080/v1/telemetry/ws)
 //! - 待受: `VIEW_PORT` (既定 8093)。GET / = ダッシュボード、GET /ws = フレーム中継
 //! - 記録: `VIEW_RECORD=/path/to/file` でフレームを [u32 len][bytes] で追記
-//!   (P14 のリプレイ再生の入力形式)
+//! - 再生: `VIEW_REPLAY=/path/to/file` で記録ファイルを読み込み `GET /replay`
+//!   で生フレーム列を配信 (P16 のリプレイスクラバーがブラウザ側で解析・再生)
 //!
 //! P13 の位置づけ: パイプライン全体 (denno 捕捉 → WS → 中継 → ブラウザ) の
 //! 疎通確認が目的。WASM ビューアは P14。
@@ -43,6 +44,35 @@ static BYTES: AtomicU64 = AtomicU64::new(0);
 /// tokenizer.json (ブラウザ側でのトークン→文字デコード用)。
 /// `VIEW_TOKENIZER` でパス指定があった場合のみ読み込む (無ければ 404 → UI は id 表示)。
 static TOKENIZER: std::sync::OnceLock<Option<axum::body::Bytes>> = std::sync::OnceLock::new();
+
+/// リプレイ記録ファイル ([u32 len][bytes] の連結)。`VIEW_REPLAY` でパスを指定し、
+/// リクエスト毎に読み込む (記録を続けながら再生できる。強制終了で末尾が途切れた
+/// 記録はブラウザ側パーサが途中まで読む)。
+static REPLAY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+async fn replay_bin() -> axum::response::Response {
+    let not_conf = || {
+        axum::response::Response::builder()
+            .status(404)
+            .body(axum::body::Body::from(
+                "replay record not configured (set VIEW_REPLAY)",
+            ))
+            .unwrap()
+    };
+    let path = REPLAY.get().and_then(|o| o.as_ref());
+    let Some(path) = path else { return not_conf() };
+    match std::fs::read(path) {
+        Ok(bytes) => axum::response::Response::builder()
+            .status(200)
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(bytes))
+            .unwrap(),
+        Err(e) => axum::response::Response::builder()
+            .status(404)
+            .body(axum::body::Body::from(format!("replay record read failed: {e}")))
+            .unwrap(),
+    }
+}
 
 async fn tokenizer_json() -> axum::response::Response {
     match TOKENIZER.get().and_then(|o| o.as_ref()) {
@@ -89,6 +119,13 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     let _ = TOKENIZER.set(tok_bytes);
+
+    // リプレイ記録のパスを保持 (実体はリクエスト毎に読み込む)
+    let replay_path = std::env::var("VIEW_REPLAY").ok();
+    if let Some(p) = &replay_path {
+        tracing::info!("replay record path: {p}");
+    }
+    let _ = REPLAY.set(replay_path);
 
     let (tx, _) = broadcast::channel::<Vec<u8>>(1024);
     let bcast: Bcast = Arc::new(tx);
@@ -141,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(dashboard))
         .route("/ws", get(view_ws))
         .route("/tokenizer.json", get(tokenizer_json))
+        .route("/replay", get(replay_bin))
         .route("/code/src", get(code_src))
         .route("/chat", post(chat_proxy))
         .with_state(app);
