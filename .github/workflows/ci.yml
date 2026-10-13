@@ -36,6 +36,11 @@ jobs:
       - name: Test (workspace)
         run: cargo test --workspace
 
+      # P17: cuda feature のコンパイルチェック (GPU 不要 — libcuda は実行時 dlopen)。
+      # PTX はコミット済みのため include_bytes もランナー上で解決できる。
+      - name: Check cuda feature (compile only)
+        run: cargo check -p denno-engine --features cuda
+
   exactness:
     # 実モデルを使った exactness 検証(Qwen2.5-0.5B をDLして基準出力と比較)
     # push時のみ実行(時間がかかるためPRでは省略)
