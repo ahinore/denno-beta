@@ -122,6 +122,15 @@ pub enum Linear {
 }
 
 impl Linear {
+    /// int8 (Q8) なら内部の Quant8Linear を返す (P17c 融合呼び出し用)。
+    /// fp32 モードでは None (融合は int8 のみ — ビット一致のため)。
+    pub fn quant8(&self) -> Option<&Quant8Linear> {
+        match self {
+            Linear::Q8(q) => Some(q),
+            Linear::F32 { .. } => None,
+        }
+    }
+
     /// w: [n,k] row-major (nn.Linear 形式) から構築。mode が Int8 ならここで
     /// オフライン量子化する (safetensors ロード直後に呼ばれる)。
     pub fn new(w: Vec<f32>, k: usize, n: usize, mode: QuantMode) -> Self {

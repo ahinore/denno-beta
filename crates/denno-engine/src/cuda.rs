@@ -380,6 +380,17 @@ impl CudaCtx {
         unsafe { check((lib.ctx_sync)(), "cuCtxSynchronize") }
     }
 
+    /// 呼び出しスレッドに primary context を current として設定する。
+    /// CUDA の current context は**スレッドローカル** (P17c の教訓: libtest は
+    /// テスト毎に新スレッドを立てるため、初期化スレッドで 1 回だけ設定したのでは
+    /// 他スレッドの cuMemAlloc が error 201 INVALID_CONTEXT で落ちる)。共有
+    /// CudaCtx を複数スレッドから触るため、GPU 操作の入口で毎回張り直す
+    /// (cuCtxSetCurrent は冪等かつ軽量)。
+    pub fn make_current(&self) -> Result<()> {
+        let lib = lib()?;
+        unsafe { check((lib.ctx_set_current)(self.ctx), "cuCtxSetCurrent") }
+    }
+
     /// `tensor::quantize_row_i8` の GPU 版 (m 行一括)。
     /// 戻り値: (量子化済みアクティベーション [m*k] i8, ascale [m] f32) の
     /// デバイスバッファ (後続の `matvec_rows_bt_i8_dev` にそのまま渡せる)。
@@ -654,6 +665,86 @@ fn max_m() -> usize {
     })
 }
 
+use crate::quant::Quant8Linear;
+
+/// P17c: 複数の int8 Linear を 1 回の GPU 呼び出しに融合する (QKV / gate+up 用)。
+/// 同じ入力を消費する線形層群の重み行を**パート順に連結**した 1 つのバッファとして
+/// 登録・計算する。各行の演算 (量子化スケール・i32 累積・スケール乗算) は個別
+/// 呼び出しと完全に同一なので、出力をパート幅で切り分ければビット一致する。
+/// 1 線形層 1 同期の固定オーバーヘッド (約 28µs) がパート数 → 1 になる効果:
+/// 実測で qkv は 3 呼び出し分の 96µs/層 → 約 40µs/層。
+///
+/// 戻り値 None = CPU パス (無効/初期化失敗/実行時エラー/m>閾値/一部が Q8 でない)。
+pub fn maybe_gpu_linear_grouped(parts: &[&Quant8Linear], a: &[f32], m: usize) -> Option<Vec<f32>> {
+    if !cuda_enabled() || m > max_m() || parts.is_empty() {
+        return None;
+    }
+    let k = parts[0].k;
+    let n: usize = parts.iter().map(|p| p.n).sum();
+    let uids: Vec<u64> = parts.iter().map(|p| p.uid).collect();
+    let ctx = shared_ctx()?;
+    if let Err(e) = ctx.make_current() {
+        tracing::error!("CUDA cuCtxSetCurrent failed, using CPU int8: {e:#}");
+        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    let gw = match weights_for_group(&uids, parts, k, n) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!("CUDA grouped weight upload failed, using CPU int8: {e:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+    };
+    match linear_pinned(ctx, a, gw, m, k, n) {
+        Ok(out) => Some(out),
+        Err(e) => {
+            tracing::error!("CUDA grouped linear failed, falling back to CPU permanently: {e:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+fn weights_for_group(
+    uids: &[u64],
+    parts: &[&Quant8Linear],
+    k: usize,
+    n: usize,
+) -> Result<&'static GpuW> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static REG: OnceLock<Mutex<HashMap<Vec<u64>, Box<GpuW>>>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = reg.lock().expect("weights registry poisoned");
+    if !map.contains_key(uids) {
+        // パート順にホスト側で行連結してから 1 回でアップロードする
+        // (ホスト連結バッファはアップロード後 immediately drop → RAM 定常増なし)
+        let mut w = Vec::with_capacity(k * n);
+        let mut sc = Vec::with_capacity(n);
+        for p in parts {
+            debug_assert_eq!(p.k, k, "融合グループ内で k が不一致");
+            if p.k != k {
+                bail!("CUDA grouped linear: k mismatch ({} vs {})", p.k, k);
+            }
+            w.extend_from_slice(&p.w);
+            sc.extend_from_slice(&p.scale);
+        }
+        debug_assert_eq!(w.len(), k * n);
+        let w = DevBuffer::from_slice(&w)?;
+        let sc = DevBuffer::from_slice(&sc)?;
+        tracing::info!(
+            "CUDA grouped weight upload ({} parts, uids={}..): k={k} n={n} ({:.1} MB)",
+            parts.len(),
+            uids[0],
+            (k * n + n * 4) as f64 / 1e6
+        );
+        map.insert(uids.to_vec(), Box::new(GpuW { w, sc, k, n }));
+    }
+    let e = map.get(uids).expect("just inserted");
+    Ok(unsafe { std::mem::transmute::<&GpuW, &'static GpuW>(e.as_ref()) })
+}
+
 /// P17b 統合エントリ: int8 線形層を GPU で実行するかどうかを判定し、
 /// 実行するなら結果 (CPU カーネルとビット一致) を返す。
 /// 戻り値 None = CPU パスを使うこと (無効/初期化失敗/実行時エラー/m>閾値)。
@@ -670,6 +761,11 @@ pub fn maybe_gpu_linear(
         return None;
     }
     let ctx = shared_ctx()?;
+    if let Err(e) = ctx.make_current() {
+        tracing::error!("CUDA cuCtxSetCurrent failed, using CPU int8: {e:#}");
+        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
     let gw = match weights_for(uid, qw, scale, k, n) {
         Ok(g) => g,
         Err(e) => {
@@ -701,6 +797,8 @@ fn linear_pinned(
 ) -> Result<Vec<f32>> {
     debug_assert_eq!(a.len(), m * k);
     let lib = lib()?;
+    // current context はスレッドローカル → 毎回張り直す (冪端・軽量)
+    ctx.make_current()?;
     SCRATCH.with(|cell| {
         let mut s = cell.borrow_mut();
         // デストラクチャしてフィールド単位の借用にする (RefMut 経由の
@@ -943,6 +1041,93 @@ mod tests {
                 for idx in 0..m * n {
                     assert_eq!(got_b[idx].to_bits(), want[idx].to_bits(), "apply_batch_bt m={m}");
                 }
+            }
+        }
+    }
+
+    /// P17c: 融合呼び出し (grouped) vs 個別呼び出しのビット一致。
+    /// qkv 相当 (3 パート・異なる n) と gate/up 相当 (2 パート) を m=1/m=4 で検証。
+    /// 個別の CPU カーネル結果を列連結したものが正解。
+    #[test]
+    #[ignore]
+    fn cuda_grouped_linear_bit_exact_vs_cpu() {
+        crate::cuda::enable_for_tests();
+        for m in [1usize, 4usize] {
+            let k = 96usize;
+            // qkv 相当: n の異なる 3 パート
+            let parts_w: Vec<Vec<f32>> = vec![
+                pseudo_random(40 * k, 71),
+                pseudo_random(24 * k, 72),
+                pseudo_random(24 * k, 73),
+            ];
+            let ns = [40usize, 24, 24];
+            let a = pseudo_random(m * k, 74 + m as u32);
+            let lins: Vec<crate::quant::Linear> = parts_w
+                .iter()
+                .zip(ns)
+                .map(|(w, n)| {
+                    crate::quant::Linear::new(w.clone(), k, n, crate::quant::QuantMode::Int8)
+                })
+                .collect();
+            let q8: Vec<&crate::quant::Quant8Linear> =
+                lins.iter().map(|l| l.quant8().unwrap()).collect();
+            let got =
+                crate::cuda::maybe_gpu_linear_grouped(&q8, &a, m).expect("grouped should run");
+            // 正解: 個別 CPU カーネル結果の列連結
+            let n_total: usize = ns.iter().sum();
+            let mut want = vec![0.0f32; m * n_total];
+            let mut col = 0usize;
+            for (i, l) in lins.iter().enumerate() {
+                let q = crate::quant::Quant8Linear::quantize(&parts_w[i], k, ns[i]);
+                let r = if m == 1 {
+                    crate::tensor::matvec_bt_i8(&a, &q.w, &q.scale, k, ns[i])
+                } else {
+                    crate::tensor::matmul_bt_i8(&a, &q.w, &q.scale, m, k, ns[i])
+                };
+                for row in 0..m {
+                    want[row * n_total + col..][..ns[i]].copy_from_slice(&r[row * ns[i]..][..ns[i]]);
+                }
+                col += ns[i];
+            }
+            for idx in 0..m * n_total {
+                assert_eq!(
+                    got[idx].to_bits(),
+                    want[idx].to_bits(),
+                    "grouped m={m} idx={idx}"
+                );
+            }
+        }
+        // gate/up 相当: 2 パート同幅 (llama.rs の lin_gateup_gpu 経路相当)
+        let k = 64usize;
+        let ff = 48usize;
+        let gw = pseudo_random(ff * k, 75);
+        let uw = pseudo_random(ff * k, 76);
+        let a = pseudo_random(2 * k, 77);
+        let gl = crate::quant::Linear::new(gw, k, ff, crate::quant::QuantMode::Int8);
+        let ul = crate::quant::Linear::new(uw, k, ff, crate::quant::QuantMode::Int8);
+        let got = crate::cuda::maybe_gpu_linear_grouped(
+            &[gl.quant8().unwrap(), ul.quant8().unwrap()],
+            &a,
+            2,
+        )
+        .expect("grouped should run");
+        // 個別 CPU (apply_batch_bt は GPU フックを持つので CPU カーネルを直接使う)
+        let gq = crate::quant::Quant8Linear::quantize(&pseudo_random(ff * k, 75), k, ff);
+        let uq = crate::quant::Quant8Linear::quantize(&pseudo_random(ff * k, 76), k, ff);
+        let gr = crate::tensor::matvec_rows_bt_i8(&a, &gq.w, &gq.scale, k, ff, 2);
+        let ur = crate::tensor::matvec_rows_bt_i8(&a, &uq.w, &uq.scale, k, ff, 2);
+        for row in 0..2 {
+            for j in 0..ff {
+                assert_eq!(
+                    got[row * (2 * ff) + j].to_bits(),
+                    gr[row * ff + j].to_bits(),
+                    "gate row={row} j={j}"
+                );
+                assert_eq!(
+                    got[row * (2 * ff) + ff + j].to_bits(),
+                    ur[row * ff + j].to_bits(),
+                    "up row={row} j={j}"
+                );
             }
         }
     }
