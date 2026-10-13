@@ -124,6 +124,80 @@ pub fn matmul_rows_bstrided(
     c
 }
 
+/// `matmul_rows_bstrided` の行チャンク並列版 (prefill 用)。
+/// 出力行を rayon でチャンク分割する以外は同一 (チャンク内の各行は独立に
+/// 全 k 累積するため行間の数値相互作用はない。チャンク幅は m 依存だが
+/// 同一 m なら常に同一分割 → 決定論は維持)。
+pub fn matmul_rows_bstrided_par(
+    a: &[f32],
+    b: &[f32],
+    rs_b: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    if m == 0 || n == 0 || k == 0 {
+        return c;
+    }
+    let rows_per_task = ((m + 7) / 8).clamp(1, m);
+    c.par_chunks_mut(rows_per_task * n)
+        .enumerate()
+        .for_each(|(ti, chunk)| {
+            let row0 = ti * rows_per_task;
+            let rows = (m - row0).min(rows_per_task);
+            let a_ptr = unsafe { a.as_ptr().add(row0 * k) };
+            unsafe {
+                matrixmultiply::sgemm(
+                    rows, k, n, 1.0,
+                    a_ptr, k as isize, 1isize,
+                    b.as_ptr(), rs_b as isize, 1isize,
+                    0.0,
+                    chunk.as_mut_ptr(), n as isize, 1isize,
+                );
+            }
+        });
+    c
+}
+
+/// P17f: attention scores を K/V バッファ・Q 行バッファへのストライド直接参照で
+/// 1 回の sgemm で計算する (kh 連続化コピー + per-g m=1 呼び出しを廃止)。
+///
+/// - a: [m,k] 行ストライド rs_a (cs=1) — q 全行バッファ内の当該ヘッド区間
+/// - b: kv バッファ [t_total, kv_dim] 内のヘッド列。b[l,j] = b_ptr[l + j*cs_b]
+///   (l: ヘッド内要素 dh 次元=連続、j: トークン位置=cs_b ストライド) を
+///   b^T [k=dh, n=t_total] として (rs_b=1, cs_b=cs_b) で渡す
+/// - c: [m,n] row-major、beta=1.0 累積 (呼び出し側で 0 埋め)
+///
+/// 数値: matrixmultiply のカーネル選択は形状/ストライド依存のため従来経路
+/// (sgemm_acc(m=1) + 連続化コピー) とはビット不一致 — **P17f で基準更新済み**
+/// (ユーザー承認・HISTORY 参照)。同一形状/ストライドの呼び出しは常に同一結果
+/// なので単独/バッチ decode・セッション間・リクエスト間の決定論は維持される。
+pub fn sgemm_scores_kvstrided(
+    a: &[f32],
+    rs_a: usize,
+    b: &[f32],
+    cs_b: usize,
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+) {
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    unsafe {
+        matrixmultiply::sgemm(
+            m, k, n, alpha,
+            a.as_ptr(), rs_a as isize, 1isize,
+            b.as_ptr(), 1isize, cs_b as isize,
+            1.0,
+            c.as_mut_ptr(), n as isize, 1isize,
+        );
+    }
+}
+
 /// c[j] = dot(a, b[j*k..][..k]) を出力分割で並列に計算 (decode 用 matvec)。
 /// m=1 の行列積は A 側で分割できないため、出力列 (= B の行) で並列化する。
 /// b: [n,k] row-major (nn.Linear 形状)。
