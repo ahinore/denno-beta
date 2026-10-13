@@ -170,7 +170,7 @@ fn qwen3_qknorm_matches_baseline() {
     assert_eq!(a.output_tokens, b.output_tokens);
     assert_eq!(
         a.text,
-        "\u{3c}think\u{3e}\nOkay, the user is asking \"1+1は?\" which translates to \"What is 1+1?\" in English. They want to know the result of adding 1 and ",
+        "<think>\nOkay, the user is asking \"1+1は?\" which translates to \"What is 1+1?\" in English. They want to know the result of adding 1 and ",
         "unexpected output: {}",
         a.text
     );
