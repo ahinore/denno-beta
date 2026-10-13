@@ -374,6 +374,18 @@ pie showData title P9 fp32 batch (4x256) per-op time
 - **Performance** (1.5B int8, long-context decode, t≈7700, 128 tokens): CPU attention **18.52s → GPU attention 4.23s** (**4.4x**). At short contexts (t≈130) ON/OFF are nearly equal (sync-bound); the benefit concentrates at long context
 - **Known remaining items**: ① long-prompt prefill is slow (~100s at t≈2810; pre-existing issue unrelated to P17g, needs investigation) ② GPU/CPU e2e responses now differ due to the relaxed attention (start the GPU side with `DENNO_GPU_ATTN=0` to restore bit-exact comparison) ③ GPU attention gains little at short context (rope/syncs remain — next candidate)
 
+### P17h: GPU offload of rope + sync-free decode chain (dno_rope_qkv + device-resident qkv) ✅ (2026-10-13, commit `b090d03`)
+
+> Resolves P17g remaining item ③ (little gain at short context = rope/syncs remain). rope is NOT part of the relaxed contract, so it is GPU-offloaded while **staying bit-exact**.
+
+- **dno_rope_qkv kernel**: performs qkv bias addition + rope in one kernel. grid=(heads + 2*kv_heads), block=(dh). Blocks b < heads handle q heads (bias+rope), heads ≤ b < heads+kv_heads handle k heads (bias+rope), the rest handle v heads (bias only). Bias is a single concatenated [qb | kb | vb] buffer (NULL when absent)
+- **Bit-exact design**: cos/sin are computed on the host (glibc sinf/cosf of the same process) with the **same formula** as CPU `rope_row`, and uploaded as a `[cos(half)|sin(half)]` table once per step (`chain_rope_prepare`). Device-side arithmetic uses `-fmad=false` mul.rn/add.rn/sub.rn (same rounding as Rust scalar ops). Bias is added before rope (same order as the CPU path). Verified bit-exact by `cuda_rope_qkv_bitexact_vs_cpu` at pos0=0/1/7/63, with and without bias
+- **Removing per-step syncs**: the qkv linear output stays device-resident (no CPU download); rope/attention complete on-device. Roped k/v are asynchronously D2H-copied into a pinned staging buffer, and the host KvCache (always authoritative) is updated once per step after the final sync (logits download) via `chain_kv_stage_flush`. Pinned buffers abandon ping-pong in favor of **dedicated slots per (layer × purpose)** (with no syncs, async DMA overwrites are avoided by id assignment)
+- **Applied path**: forward_batch **delegates b==1 to the solo chain (forward_decode_gpu)** (so P17h reaches the server's actual decode path; falls back to the batch path on failure). The qkv-bias condition is removed from chain_compatible (dno_rope_qkv supports bias)
+- Tests: `cuda_solo_chain_bias_rope_gpu_matches_cpu` (bias-bearing Qwen2.5-like structure; **asserts the chain fires** via Some return + CPU greedy match). GPU cuda_ **16/16**, CPU **110**, exactness **6 criteria** pass, 0 errors in the serve log
+- **Performance** (1.5B int8, dev 8090): short request (t≈38, 2 tokens) **11.0ms** (vs 14.4ms on the `DENNO_GPU_ATTN=0` batch path — sync-removal effect); long decode (t≈7657, 128 tokens, warm) **4.23s → 3.88s** (1.09x). Cold prefill unchanged (~366s; pre-existing issue)
+- **PTX**: sha256 `a78c645c23b4e0d17504c705c23fb4fbbf10ba0737a0ca3c12bd65c342fe10e5` (verified against a fresh `nvcc -arch=compute_75 -fmad=false -ptx` compile)
+
 ## 4. Candidate List
 
 - [x] ~~**sampler optimization**: softmax + top-p sort over the 152k vocab cost a fixed ~3.5ms/step (found in P7.5)~~ → **done in P8** (0.66ms/step, greedy unchanged)
