@@ -45,6 +45,8 @@ impl Model for SleepModel {
 
     fn forward(&mut self, tokens: &[u32], cache: &mut KvCache) -> anyhow::Result<Vec<f32>> {
         std::thread::sleep(self.delay);
+        // P17e: 需要ベース確保 (書き込み前に容量確保) のダミー側契約
+        let _ = cache.kv_bufs(0, tokens.len());
         cache.advance(tokens.len());
         let last = tokens.last().copied().unwrap_or(0) as usize;
         let mut logits = vec![0.0f32; DUMMY_VOCAB];

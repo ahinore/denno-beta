@@ -1,10 +1,20 @@
-//! KVキャッシュ。層ごとに [max_len, kv_dim] の連続バッファを保持する。
+//! KVキャッシュ。層ごとに連続バッファを保持する (P17e: 需要ベース確保)。
+//!
+//! 旧実装は `[max_len, kv_dim]` をスロット作成時に全量確保していた
+//! (1 スロット = ctx 全幅 × bytes_per_token。Qwen2.5-1.5B で ~1.9GB)。
+//! P17e では**初期確保 0** で、書き込み量に応じて全層のバッファを
+//! 倍々で成長させる (上限 max_len)。メモリレイアウトは「先頭 len 行が
+//! 使用済みの連続バッファ」のままだので、attention を含む数値経路は
+//! 旧実装と完全に同一 (ビット一致)。成長時の realloc コピーは既に
+//! 書き済みの行を保存する (倍々なので償却 O(1))。
 
 pub struct KvCache {
     n_layers: usize,
     kv_dim: usize,
     max_len: usize,
     len: usize,
+    /// 確保済みトークン数 (全層共通・倍々成長)
+    cap: usize,
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
 }
@@ -16,8 +26,9 @@ impl KvCache {
             kv_dim,
             max_len,
             len: 0,
-            k: vec![vec![0.0; max_len * kv_dim]; n_layers],
-            v: vec![vec![0.0; max_len * kv_dim]; n_layers],
+            cap: 0,
+            k: vec![Vec::new(); n_layers],
+            v: vec![Vec::new(); n_layers],
         }
     }
 
@@ -47,13 +58,40 @@ impl KvCache {
         self.max_len
     }
 
-    /// トークンあたりの KV メモリ (K + V、f32)
-    pub fn bytes_per_token(&self) -> usize {
-        self.k.len() * self.kv_dim * 2 * std::mem::size_of::<f32>()
+    /// 現在確保済みのトークン数 (P17e: フットプリント計算用)
+    pub fn capacity(&self) -> usize {
+        self.cap
     }
 
-    /// 指定層の K/V バッファ(分割借用)
-    pub fn kv_bufs(&mut self, layer: usize) -> (&mut [f32], &mut [f32]) {
+    /// トークンあたりの KV メモリ (K + V、f32)。静的な値
+    /// (レイアウトは先頭 len 行使用の連続バッファで不変)。
+    pub fn bytes_per_token(&self) -> usize {
+        self.n_layers * self.kv_dim * 2 * std::mem::size_of::<f32>()
+    }
+
+    /// 全層のバッファを need トークン分まで成長させる (倍々・上限 max_len)。
+    /// 既に書き込んだ行は保存される。
+    fn ensure(&mut self, need: usize) {
+        assert!(
+            need <= self.max_len,
+            "KV cache overflow: {need} > {}",
+            self.max_len
+        );
+        if need <= self.cap {
+            return;
+        }
+        let new_cap = self.max_len.min(need.max(self.cap.saturating_mul(2)));
+        let elems = new_cap * self.kv_dim;
+        for buf in self.k.iter_mut().chain(self.v.iter_mut()) {
+            buf.resize(elems, 0.0);
+        }
+        self.cap = new_cap;
+    }
+
+    /// 層 `layer` の K/V バッファ (分割借用)。続けて n トークン分を
+    /// `len` 行目から書き込めるよう、事前に全層の容量を確保する (P17e)。
+    pub fn kv_bufs(&mut self, layer: usize, n: usize) -> (&mut [f32], &mut [f32]) {
+        self.ensure(self.len + n);
         (&mut self.k[layer], &mut self.v[layer])
     }
 
@@ -63,13 +101,15 @@ impl KvCache {
         (&self.k[layer], &self.v[layer])
     }
 
-    /// 指定層の K バッファ全体 (使用済みは先頭 len 行)
-    pub fn k_buf(&mut self, layer: usize) -> &mut [f32] {
+    /// 指定層の K バッファ全体 (使用済みは先頭 len 行)。n トークン追記分を確保。
+    pub fn k_buf(&mut self, layer: usize, n: usize) -> &mut [f32] {
+        self.ensure(self.len + n);
         &mut self.k[layer]
     }
 
-    /// 指定層の V バッファ全体
-    pub fn v_buf(&mut self, layer: usize) -> &mut [f32] {
+    /// 指定層の V バッファ全体。n トークン追記分を確保。
+    pub fn v_buf(&mut self, layer: usize, n: usize) -> &mut [f32] {
+        self.ensure(self.len + n);
         &mut self.v[layer]
     }
 
@@ -105,10 +145,12 @@ impl KvCache {
 
     /// スナップショットの先頭 n 行を復元し、len を n に設定する。
     /// prefix cache のエントリから共通接頭辞分だけ KV を戻すのに使う。
+    /// 復元分の容量が無ければ成長させる (P17e)。
     pub fn restore(&mut self, k: &[Vec<f32>], v: &[Vec<f32>], n: usize) {
         assert!(n <= self.max_len, "KV cache restore: {n} > {}", self.max_len);
         assert_eq!(k.len(), self.k.len(), "KV cache restore: layer count mismatch");
         assert_eq!(v.len(), self.v.len(), "KV cache restore: layer count mismatch");
+        self.ensure(n);
         let take = n * self.kv_dim;
         for (dst, src) in self.k.iter_mut().zip(k.iter()) {
             assert!(src.len() >= take, "KV cache restore: snapshot too short");
@@ -132,6 +174,8 @@ mod tests {
         assert_eq!(c.len(), 0);
         assert!(c.is_empty());
         assert_eq!(c.kv_dim(), 8);
+        // P17e: 初期確保は 0
+        assert_eq!(c.capacity(), 0);
     }
 
     #[test]
@@ -189,30 +233,60 @@ mod tests {
     #[test]
     fn kv_bufs_are_per_layer_and_persist() {
         let mut c = KvCache::new(2, 4, 8);
-        // レイヤ0に書き込み
-        let (k, v) = c.kv_bufs(0);
+        // レイヤ0に書き込み (kv_bufs が成長を担う)
+        let (k, v) = c.kv_bufs(0, 1);
         k[0..4].copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
         v[0..4].copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
         // レイヤ1には影響しない
-        let (k1, v1) = c.kv_bufs(1);
+        let (k1, v1) = c.kv_bufs(1, 0);
         assert_eq!(k1[0..4], [0.0; 4]);
         assert_eq!(v1[0..4], [0.0; 4]);
         // レイヤ0の値は保持されている
-        let (k0, v0) = c.kv_bufs(0);
+        let (k0, v0) = c.kv_bufs(0, 0);
         assert_eq!(k0[0..4], [1.0, 2.0, 3.0, 4.0]);
         assert_eq!(v0[0..4], [5.0, 6.0, 7.0, 8.0]);
     }
 
     #[test]
-    fn k_buf_v_buf_have_full_capacity() {
+    fn kv_bufs_grows_on_demand_and_preserves_rows() {
+        let mut c = KvCache::new(2, 2, 64);
+        // 1 トークン書き込み → cap は最低 1
+        {
+            let (k, _) = c.kv_bufs(0, 1);
+            k[0..2].copy_from_slice(&[7.0, 7.0]);
+        }
+        c.advance(1);
+        assert_eq!(c.capacity(), 1);
+        // 追記で倍々成長・既存行は保存される
+        {
+            let (k, _) = c.kv_bufs(0, 1);
+            k[2..4].copy_from_slice(&[8.0, 8.0]);
+        }
+        c.advance(1);
+        assert!(c.capacity() >= 2);
+        let (k, _) = c.kv_bufs(0, 0);
+        assert_eq!(k[0..4], [7.0, 7.0, 8.0, 8.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "KV cache overflow")]
+    fn kv_bufs_overflow_panics() {
+        let mut c = KvCache::new(1, 4, 4);
+        let _ = c.kv_bufs(0, 5);
+    }
+
+    #[test]
+    fn k_buf_v_buf_grow_and_hold_capacity() {
         let layers = 3;
         let kv_dim = 4;
-        let max_len = 10;
-        let mut c = KvCache::new(layers, kv_dim, max_len);
+        let mut c = KvCache::new(layers, kv_dim, 10);
         for l in 0..layers {
-            assert_eq!(c.k_buf(l).len(), max_len * kv_dim);
-            assert_eq!(c.v_buf(l).len(), max_len * kv_dim);
+            let kb = c.k_buf(l, 10);
+            assert_eq!(kb.len(), 10 * kv_dim);
+            let vb = c.v_buf(l, 10);
+            assert_eq!(vb.len(), 10 * kv_dim);
         }
+        assert_eq!(c.capacity(), 10);
     }
 
     #[test]
@@ -222,11 +296,23 @@ mod tests {
     }
 
     #[test]
+    fn bytes_per_token_is_static() {
+        // P17e: 確保状態に依らず n_layers * kv_dim * 2 * 4
+        let mut c = KvCache::new(3, 2, 16);
+        assert_eq!(c.bytes_per_token(), 3 * 2 * 2 * 4);
+        let _ = c.kv_bufs(0, 4);
+        c.advance(4);
+        assert_eq!(c.bytes_per_token(), 3 * 2 * 2 * 4);
+    }
+
+    #[test]
     fn snapshot_takes_first_n_rows() {
         let mut c = KvCache::new(2, 2, 8);
-        let (k, v) = c.kv_bufs(0);
-        k[0..4].copy_from_slice(&[1.0, 2.0, 3.0, 4.0]); // 行0,1
-        v[0..4].copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+        {
+            let (k, v) = c.kv_bufs(0, 3);
+            k[0..4].copy_from_slice(&[1.0, 2.0, 3.0, 4.0]); // 行0,1
+            v[0..4].copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+        }
         c.advance(3);
         let (sk, sv) = c.snapshot(2);
         assert_eq!(sk.len(), 2); // 層数
@@ -248,7 +334,7 @@ mod tests {
     fn restore_sets_len_and_copies_rows() {
         let mut src = KvCache::new(1, 2, 8);
         {
-            let (k, _) = src.kv_bufs(0);
+            let (k, _) = src.kv_bufs(0, 2);
             k[0..4].copy_from_slice(&[9.0, 8.0, 7.0, 6.0]);
         }
         src.advance(2);
@@ -258,7 +344,7 @@ mod tests {
         dst.advance(5); // 復元で len は上書きされる
         dst.restore(&sk, &sv, 2);
         assert_eq!(dst.len(), 2);
-        let (k, _) = dst.kv_bufs(0);
+        let (k, _) = dst.kv_bufs(0, 0);
         assert_eq!(k[0..4], [9.0, 8.0, 7.0, 6.0]);
         // 復元後も続きから書ける (prefix 再計算フロー)
         dst.advance(1);
@@ -266,10 +352,30 @@ mod tests {
     }
 
     #[test]
+    fn restore_grows_capacity_when_needed() {
+        // P17e: 復元先が空 (未確保) でも成長して復元できる
+        let mut src = KvCache::new(1, 2, 8);
+        {
+            let (k, _) = src.kv_bufs(0, 2);
+            k[0..4].copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        }
+        src.advance(2);
+        let (sk, sv) = src.snapshot(2);
+
+        let mut dst = KvCache::new(1, 2, 8);
+        assert_eq!(dst.capacity(), 0);
+        dst.restore(&sk, &sv, 2);
+        assert_eq!(dst.capacity(), 2);
+        assert_eq!(dst.len(), 2);
+        let (k, _) = dst.kv_bufs(0, 0);
+        assert_eq!(k[0..4], [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
     fn restore_only_copies_requested_rows() {
         let mut src = KvCache::new(1, 2, 8);
         {
-            let (k, _) = src.kv_bufs(0);
+            let (k, _) = src.kv_bufs(0, 4);
             k[0..8].copy_from_slice(&[1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]);
         }
         src.advance(4);
@@ -279,7 +385,7 @@ mod tests {
         // 先頭 1 行だけ復元 (LCP が 1 のとき)
         dst.restore(&sk, &sv, 1);
         assert_eq!(dst.len(), 1);
-        let (k, _) = dst.kv_bufs(0);
+        let (k, _) = dst.kv_bufs(0, 1); // 2 行目まで成長させて stale 行を確認
         assert_eq!(k[0..2], [1.0, 1.0]);
         assert_eq!(k[2..4], [0.0, 0.0]); // 2行目以降は触られない
     }

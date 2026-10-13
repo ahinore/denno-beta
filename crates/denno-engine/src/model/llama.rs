@@ -372,12 +372,12 @@ impl LlamaQwen2 {
                 rope_rows(&mut k, 1, kv_heads, dh, pos0, self.theta);
             });
             {
-                let (kc, vc) = cache.kv_bufs(li);
+                let (kc, vc) = cache.kv_bufs(li, 1);
                 kc[pos0 * kv_dim..][..kv_dim].copy_from_slice(&k);
                 vc[pos0 * kv_dim..][..kv_dim].copy_from_slice(&v);
             }
             crate::prof::time_layer(crate::prof::ATTN, li, || {
-                let (kc, vc) = cache.kv_bufs(li);
+                let (kc, vc) = cache.kv_bufs_ref(li);
                 let t_total = pos0 + 1;
                 let scale = 1.0 / (dh as f32).sqrt();
                 for kvh in 0..kv_heads {
@@ -512,7 +512,7 @@ impl Model for LlamaQwen2 {
             });
 
             {
-                let (kc, vc) = cache.kv_bufs(li);
+                let (kc, vc) = cache.kv_bufs(li, n);
                 for i in 0..n {
                     kc[(pos0 + i) * kv_dim..][..kv_dim].copy_from_slice(&k[i * kv_dim..][..kv_dim]);
                     vc[(pos0 + i) * kv_dim..][..kv_dim].copy_from_slice(&v[i * kv_dim..][..kv_dim]);
@@ -521,7 +521,7 @@ impl Model for LlamaQwen2 {
 
             let mut att = vec![0.0f32; n * heads * dh];
             crate::prof::time_layer(crate::prof::ATTN, li, || {
-                let (kc, vc) = cache.kv_bufs(li);
+                let (kc, vc) = cache.kv_bufs_ref(li);
                 let t_total = pos0 + n;
                 let scale = 1.0 / (dh as f32).sqrt();
                 if n == 1 {
@@ -721,7 +721,7 @@ impl Model for LlamaQwen2 {
             // KV 書き込み: 各セッションの自分のキャッシュへ (decode 1 トークン分)
             for i in 0..b {
                 let pos = caches[i].len();
-                let (kc, vc) = caches[i].kv_bufs(li);
+                let (kc, vc) = caches[i].kv_bufs(li, 1);
                 kc[pos * kv_dim..][..kv_dim].copy_from_slice(&k[i * kv_dim..][..kv_dim]);
                 vc[pos * kv_dim..][..kv_dim].copy_from_slice(&v[i * kv_dim..][..kv_dim]);
             }

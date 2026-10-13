@@ -157,7 +157,7 @@ impl Model for Gpt2 {
 
             // K, V をキャッシュに書き込み
             {
-                let (kc, vc) = cache.kv_bufs(li);
+                let (kc, vc) = cache.kv_bufs(li, n);
                 for i in 0..n {
                     let src_k = &qkv[i * 3 * e + e..][..e];
                     let src_v = &qkv[i * 3 * e + 2 * e..][..e];
@@ -169,7 +169,7 @@ impl Model for Gpt2 {
             // causal attention (query位置 i は cache の 0..pos0+i+1 を参照)
             let mut att = vec![0.0f32; n * e];
             {
-                let (kc, vc) = cache.kv_bufs(li);
+                let (kc, vc) = cache.kv_bufs_ref(li);
                 let mut scores = vec![0.0f32; pos0 + n];
                 let scale = 1.0 / (dh as f32).sqrt();
                 for i in 0..n {

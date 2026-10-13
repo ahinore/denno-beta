@@ -58,6 +58,9 @@ impl Model for DummyModel {
     }
 
     fn forward(&mut self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>> {
+        // P17e: 需要ベース確保。実モデルは KV 書き込み経路で成長するため、
+        // ダミーも同じ契約 (書き込み前に容量確保) に合わせる
+        let _ = cache.kv_bufs(0, tokens.len());
         cache.advance(tokens.len());
         let last = tokens.last().copied().unwrap_or(0) as usize;
         let mut logits = vec![0.0f32; DUMMY_VOCAB];
@@ -133,7 +136,7 @@ impl Model for KvSensitiveModel {
         let kv_dim = cache.kv_dim();
         for (i, &t) in tokens.iter().enumerate() {
             let p = pos + i;
-            let (k, v) = cache.kv_bufs(0);
+            let (k, v) = cache.kv_bufs(0, tokens.len());
             for d in 0..kv_dim {
                 k[p * kv_dim + d] = Self::kv_k(t, p, d, kv_dim);
                 v[p * kv_dim + d] = Self::kv_v(t, p, d, kv_dim);
@@ -146,7 +149,7 @@ impl Model for KvSensitiveModel {
         let acc;
         let acc2;
         {
-            let (k, _) = cache.kv_bufs(0);
+            let (k, _) = cache.kv_bufs_ref(0);
             let mut a1 = 0.0f32;
             let mut a2 = 0.0f32;
             for p in 0..len {
@@ -224,6 +227,8 @@ impl Model for QuantMatModel {
     }
 
     fn forward(&mut self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>> {
+        // P17e: DummyModel と同じく書き込み前に容量確保 (需要ベース契約)
+        let _ = cache.kv_bufs(0, tokens.len());
         cache.advance(tokens.len());
         let last = tokens.last().copied().unwrap_or(0) as usize;
         let mut a = vec![0f32; DUMMY_QDIM];
