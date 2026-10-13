@@ -373,7 +373,7 @@ pub fn i8_dot_scalar(a: &[i8], b: &[i8]) -> i32 {
 }
 
 /// 整数 i8 ドット: Σ a[i]*b[i] を i32 で厳密に計算する。
-/// - aarch64 + FEAT_DotProd (armv8.2 / dev-host は対応): NEON `vdotq_s32` (sdot)
+/// - aarch64 + FEAT_DotProd (armv8.2): NEON `vdotq_s32` (sdot)
 /// - x86_64 + AVX2 (CI ランナーは x86-64-v3): i8→i16 符号拡張 + `_mm256_madd_epi16`
 /// - 上記以外: スカラー参照にフォールバック
 ///
@@ -1150,7 +1150,7 @@ mod tests {
 
     #[test]
     fn i8_dot_uses_simd_on_supported_targets() {
-        // compile-time 判定 (runtime 検出はしない設計): dev-host (aarch64+dotprod) と
+        // compile-time 判定 (runtime 検出はしない設計): aarch64+dotprod と
         // CI の x86-64-v3 (avx2) では SIMD パスが選ばれていることを保証する。
         // どちらでもないターゲットではスカラーにフォールバックするのでスキップ。
         let simd = cfg!(all(target_arch = "aarch64", target_feature = "dotprod"))

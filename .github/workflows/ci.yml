@@ -11,7 +11,7 @@ env:
   # 前回のランナーの CPU 用にネイティブビルドされた依存が別世代の CPU で
   # SIGILL (Illegal instruction) を起こすことがある。
   # x86-64-v3 (AVX2/FMA) は全ランナーが対応し、FMA を含むため
-  # dev-host (aarch64) で生成した exactness 基準との浮動小数点挙動も近い。
+  # aarch64 で生成した exactness 基準との浮動小数点挙動も近い。
   RUSTFLAGS: "-C target-cpu=x86-64-v3"
 
 jobs:

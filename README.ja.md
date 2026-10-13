@@ -1,5 +1,7 @@
 # denno-beta
 
+[![CI](https://github.com/ahinore/denno-beta/actions/workflows/ci.yml/badge.svg)](https://github.com/ahinore/denno-beta/actions/workflows/ci.yml)
+
 [English](README.md) | 日本語
 
 Rustで書いたAnthropic Messages API互換のLLMサーバー。
