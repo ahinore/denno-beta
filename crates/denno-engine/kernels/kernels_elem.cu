@@ -101,6 +101,24 @@ extern "C" __global__ void dno_swiglu(
     }
 }
 
+/// P17k: [m, 2ff] の interleaved (行ごとに [gate|up]) レイアウトから swiglu。
+/// gate_up grouped GEMM の出力を D2H せず直接読むための変種。
+/// 演算自体は dno_swiglu と同一 (dno_expf + __fdiv_rn + __fadd_rn + __fmul_rn)
+/// なので CPU 経路 (silu_inplace + gate*=up) とビット一致する。
+extern "C" __global__ void dno_swiglu_int(
+    const float *gateup, float *out, int ff, int width, long long total) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        int r = (int)(i / ff);
+        int f = (int)(i - (long long)r * ff);
+        float g = gateup[(size_t)r * width + f];
+        float u = gateup[(size_t)r * width + ff + f];
+        float e = dno_expf(-g);
+        float s = __fdiv_rn(g, __fadd_rn(1.0f, e));
+        out[i] = __fmul_rn(s, u);
+    }
+}
+
 /// residual add + RMSNorm (proj == NULL で単純 rmsnorm)。
 /// grid = rows, block = 256, dynamic shmem = cols * 4 bytes.
 /// 平方和は CPU と同一の逐次順 (i = 0..cols-1) で thread 0 が計算する。

@@ -295,6 +295,8 @@ pub struct CudaCtx {
     #[allow(dead_code)]
     module_elem: CUmodule,
     f_swiglu: CUfunction,
+    // P17k: interleaved swiglu ([m, 2ff] 行ごと [gate|up] → [m, ff])
+    f_swiglu_int: CUfunction,
     f_addnorm: CUfunction,
     #[allow(dead_code)]
     f_expf: CUfunction,
@@ -387,6 +389,11 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_swiglu, module_elem, b"dno_swiglu\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_swiglu)",
             )?;
+            let mut f_swiglu_int: CUfunction = std::ptr::null_mut();
+            check(
+                (lib.module_get_function)(&mut f_swiglu_int, module_elem, b"dno_swiglu_int\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_swiglu_int)",
+            )?;
             check(
                 (lib.module_get_function)(&mut f_addnorm, module_elem, b"dno_add_rmsnorm\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_add_rmsnorm)",
@@ -424,6 +431,7 @@ impl CudaCtx {
                 f_gemm,
                 module_elem,
                 f_swiglu,
+                f_swiglu_int,
                 f_addnorm,
                 f_expf,
                 f_attn,
@@ -699,11 +707,17 @@ struct Scratch {
     out: Option<DevBuffer>, // [m*n] f32 出力
     hx: Option<PinMem>,     // x の転送元 (ピン留め)
     ho: Option<PinMem>,     // out の転送先 (ピン留め)
+    // P17k: FFN デバイス常駐 (maybe_gpu_ffn)
+    act: Option<DevBuffer>,  // [m*ff] f32 swiglu 出力
+    aq2: Option<DevBuffer>,  // [m*ff] i8 (act の量子化)
+    asc2: Option<DevBuffer>, // [m] f32 (act の ascale)
+    out2: Option<DevBuffer>, // [m*e] f32 (down 出力)
 }
 
 thread_local! {
     static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch {
         x: None, aq: None, asc: None, out: None, hx: None, ho: None,
+        act: None, aq2: None, asc2: None, out2: None,
     });
 }
 
@@ -895,6 +909,194 @@ pub fn maybe_gpu_linear_grouped(parts: &[&Quant8Linear], a: &[f32], m: usize) ->
     }
 }
 
+/// P17k: FFN 線形ブロック (gate_up GEMM → swiglu → down GEMM) をデバイス常駐で実行。
+/// h [m, e] から down 出力 [m, e] を返す。中間の [m, 2ff] (13k tok で 949MB) を
+/// ホストに落とさないため、従来経路の D2H + to_vec + gate/up 分割コピー +
+/// swiglu (CPU f64 expf) + H2D が全て消える。
+///
+/// ビット一致: gate_up/down は dno_gemm_i8 (整数累積で順序不変)、swiglu は
+/// dno_swiglu_int (dno_swiglu と同一演算列) → CPU 経路と出力は完全一致。
+/// 失敗時 None (呼び出し側で従来経路: gate/up Vec + CPU swiglu + down)。
+/// m が GEMM 閾値未満なら None (小さい m は従来どおり CPU が最速)。
+#[allow(clippy::too_many_arguments)]
+pub fn maybe_gpu_ffn(
+    gate: &Quant8Linear,
+    up: &Quant8Linear,
+    down: &Quant8Linear,
+    h: &[f32],
+    m: usize,
+    ff: usize,
+    li: usize,
+) -> Option<Vec<f32>> {
+    if !cuda_enabled() {
+        return None;
+    }
+    if !(m > max_m() && m >= gemm_min_m() && gemm_enabled()) {
+        return None;
+    }
+    let e = gate.k;
+    debug_assert_eq!(up.k, e);
+    debug_assert_eq!(down.k, ff);
+    debug_assert_eq!(down.n, e);
+    let ctx = shared_ctx()?;
+    if let Err(err) = ctx.make_current() {
+        tracing::error!("CUDA cuCtxSetCurrent failed, using CPU int8: {err:#}");
+        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    let gw1 = match weights_for_group(&[gate.uid, up.uid], &[gate, up], e, 2 * ff) {
+        Ok(g) => g,
+        Err(err) => {
+            tracing::error!("CUDA FFN weight upload failed, using CPU: {err:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+    };
+    let gw2 = match weights_for(down.uid, &down.w, &down.scale, ff, e) {
+        Ok(g) => g,
+        Err(err) => {
+            tracing::error!("CUDA FFN down weight upload failed, using CPU: {err:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+    };
+    let lib = lib().ok()?;
+    let r = SCRATCH.with(|cell| -> Result<Vec<f32>> {
+        let mut s = cell.borrow_mut();
+        let Scratch {
+            x,
+            aq,
+            asc,
+            out,
+            hx,
+            ho,
+            act,
+            aq2,
+            asc2,
+            out2,
+        } = &mut *s;
+        let bytes_x = m * e * 4;
+        Scratch::ensure(x, bytes_x)?;
+        Scratch::ensure(aq, m * e)?;
+        Scratch::ensure(asc, m * 4)?;
+        Scratch::ensure(out, m * 2 * ff * 4)?;
+        Scratch::ensure(act, m * ff * 4)?;
+        Scratch::ensure(aq2, m * ff)?;
+        Scratch::ensure(asc2, m * 4)?;
+        Scratch::ensure(out2, m * e * 4)?;
+        Scratch::ensure_pin(hx, bytes_x)?;
+        Scratch::ensure_pin(ho, m * e * 4)?;
+        let (dx, daq, dasc, dout, dact, daq2, dasc2, dout2) = (
+            x.as_ref().unwrap(),
+            aq.as_ref().unwrap(),
+            asc.as_ref().unwrap(),
+            out.as_ref().unwrap(),
+            act.as_ref().unwrap(),
+            aq2.as_ref().unwrap(),
+            asc2.as_ref().unwrap(),
+            out2.as_ref().unwrap(),
+        );
+        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        hx.as_mut_slice::<f32>()[..m * e].copy_from_slice(h);
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(dx.ptr(), hx.ptr as *const c_void, bytes_x, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync",
+            )?;
+            // 1) gate_up GEMM: [m, e] → [m, 2ff] (デバイス上に保持)
+            crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Result<()> {
+                let (mut px, mut paq, mut pasc) = (dx.ptr(), daq.ptr(), dasc.ptr());
+                let (mut mc, mut kc) = (m as c_int, e as c_int);
+                let mut args = [
+                    &mut px as *mut _ as *mut c_void,
+                    &mut paq as *mut _ as *mut c_void,
+                    &mut pasc as *mut _ as *mut c_void,
+                    &mut mc as *mut _ as *mut c_void,
+                    &mut kc as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(ctx.f_quant, (m as u32, 1, 1), (256, 1, 1), 256 * 4, &mut args)?;
+                let (mut paqi, mut pasci, mut pw, mut psc, mut pout) =
+                    (daq.ptr(), dasc.ptr(), gw1.w.ptr(), gw1.sc.ptr(), dout.ptr());
+                let (mut mc, mut kc, mut nc) = (m as c_int, e as c_int, (2 * ff) as c_int);
+                let mut args = [
+                    &mut paqi as *mut _ as *mut c_void,
+                    &mut pasci as *mut _ as *mut c_void,
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut psc as *mut _ as *mut c_void,
+                    &mut pout as *mut _ as *mut c_void,
+                    &mut mc as *mut _ as *mut c_void,
+                    &mut kc as *mut _ as *mut c_void,
+                    &mut nc as *mut _ as *mut c_void,
+                ];
+                let gmx = m.div_ceil(64) as u32;
+                let gmy = (2 * ff).div_ceil(64) as u32;
+                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 2 * 64 * 32, &mut args)?;
+                Ok(())
+            })?;
+            // 2) swiglu (interleaved): [m, 2ff] → act [m, ff] (デバイス上に保持)
+            crate::prof::time_layer(crate::prof::SWIGLU, li, || -> Result<()> {
+                let (mut pg, mut po) = (dout.ptr(), dact.ptr());
+                let (mut pff, mut pw, mut pt) = (ff as c_int, (2 * ff) as c_int, (m * ff) as i64);
+                let mut args = [
+                    &mut pg as *mut _ as *mut c_void,
+                    &mut po as *mut _ as *mut c_void,
+                    &mut pff as *mut _ as *mut c_void,
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut pt as *mut _ as *mut c_void,
+                ];
+                let grid = (m * ff).div_ceil(256) as u32;
+                ctx.launch_async(ctx.f_swiglu_int, (grid, 1, 1), (256, 1, 1), 0, &mut args)?;
+                Ok(())
+            })?;
+            // 3) down GEMM: act [m, ff] → out2 [m, e] + D2H。キュー待ちの実態を
+            // DOWN に帰属させるため同期をこのタイマー内に入れる。
+            crate::prof::time_layer(crate::prof::DOWN, li, || -> Result<()> {
+                let (mut px, mut paq, mut pasc) = (dact.ptr(), daq2.ptr(), dasc2.ptr());
+                let (mut mc, mut kc) = (m as c_int, ff as c_int);
+                let mut args = [
+                    &mut px as *mut _ as *mut c_void,
+                    &mut paq as *mut _ as *mut c_void,
+                    &mut pasc as *mut _ as *mut c_void,
+                    &mut mc as *mut _ as *mut c_void,
+                    &mut kc as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(ctx.f_quant, (m as u32, 1, 1), (256, 1, 1), 256 * 4, &mut args)?;
+                let (mut paqi, mut pasci, mut pw, mut psc, mut pout) =
+                    (daq2.ptr(), dasc2.ptr(), gw2.w.ptr(), gw2.sc.ptr(), dout2.ptr());
+                let (mut mc, mut kc, mut nc) = (m as c_int, ff as c_int, e as c_int);
+                let mut args = [
+                    &mut paqi as *mut _ as *mut c_void,
+                    &mut pasci as *mut _ as *mut c_void,
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut psc as *mut _ as *mut c_void,
+                    &mut pout as *mut _ as *mut c_void,
+                    &mut mc as *mut _ as *mut c_void,
+                    &mut kc as *mut _ as *mut c_void,
+                    &mut nc as *mut _ as *mut c_void,
+                ];
+                let gmx = m.div_ceil(64) as u32;
+                let gmy = e.div_ceil(64) as u32;
+                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 2 * 64 * 32, &mut args)?;
+                check(
+                    (lib.memcpy_dtoh_async)(ho.ptr, dout2.ptr(), m * e * 4, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync",
+                )?;
+                ctx.sync()?;
+                Ok(())
+            })?;
+        }
+        Ok(ho.as_slice::<f32>()[..m * e].to_vec())
+    });
+    match r {
+        Ok(out) => Some(out),
+        Err(err) => {
+            tracing::error!("CUDA FFN block failed, falling back to CPU: {err:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+}
+
 fn weights_for_group(
     uids: &[u64],
     parts: &[&Quant8Linear],
@@ -1005,7 +1207,7 @@ fn linear_pinned(
         let mut s = cell.borrow_mut();
         // デストラクチャしてフィールド単位の借用にする (RefMut 経由の
         // 全体借用だと dx (不変) と hx/ho (可変) が競合するため)
-        let Scratch { x, aq, asc, out, hx, ho } = &mut *s;
+        let Scratch { x, aq, asc, out, hx, ho, .. } = &mut *s;
         let bytes_x = m * k * 4;
         let bytes_out = m * n * 4;
         Scratch::ensure(x, bytes_x)?;
@@ -1081,7 +1283,7 @@ fn linear_gemm(
     ctx.make_current()?;
     SCRATCH.with(|cell| {
         let mut s = cell.borrow_mut();
-        let Scratch { x, aq, asc, out, hx, ho } = &mut *s;
+        let Scratch { x, aq, asc, out, hx, ho, .. } = &mut *s;
         let bytes_x = m * k * 4;
         let bytes_out = m * n * 4;
         Scratch::ensure(x, bytes_x)?;
@@ -2370,6 +2572,79 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// P17k: maybe_gpu_ffn (デバイス常駐 FFN ブロック) vs CPU 参照実装のビット一致。
+    /// CPU 参照は llama.rs prefill 従来経路と同一コード: gate/up を行連結した
+    /// grouped matvec_rows_bt_i8 → silu_inplace + 要素積 → down matvec_rows_bt_i8。
+    #[test]
+    #[ignore]
+    fn cuda_ffn_bit_exact_vs_cpu_reference() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ctx = CudaCtx::new().unwrap();
+        println!("device: {}", ctx.info());
+        crate::cuda::enable_for_tests();
+
+        // GEMM 経路の条件 (m > max_m=16 かつ m >= gemm_min_m) を満たすよう閾値を下げる
+        std::env::set_var("DENNO_CUDA_GEMM_MIN_M", "8");
+
+        let (m, e, ff) = (40usize, 96usize, 64usize);
+        let gate = Quant8Linear {
+            w: pseudo_i8(e * ff, 90),
+            scale: positive_scales(ff, 91),
+            k: e,
+            n: ff,
+            uid: 901,
+        };
+        let up = Quant8Linear {
+            w: pseudo_i8(e * ff, 92),
+            scale: positive_scales(ff, 93),
+            k: e,
+            n: ff,
+            uid: 902,
+        };
+        let down = Quant8Linear {
+            w: pseudo_i8(ff * e, 94),
+            scale: positive_scales(e, 95),
+            k: ff,
+            n: e,
+            uid: 903,
+        };
+        let h = pseudo_random(m * e, 96);
+
+        let got = maybe_gpu_ffn(&gate, &up, &down, &h, m, ff, 0).unwrap();
+
+        // CPU 参照 (llama.rs prefill 従来経路と同一の演算列)。
+        // out1 は [m, 2ff] 行-major: gate は各行の前半 ff 列 (平坦スライス不可)。
+        let n2 = 2 * ff;
+        let mut gw = Vec::with_capacity(e * n2);
+        gw.extend_from_slice(&gate.w);
+        gw.extend_from_slice(&up.w);
+        let mut gsc = Vec::with_capacity(n2);
+        gsc.extend_from_slice(&gate.scale);
+        gsc.extend_from_slice(&up.scale);
+        let out1 = tensor::matvec_rows_bt_i8(&h, &gw, &gsc, e, n2, m);
+        let mut act = vec![0.0f32; m * ff];
+        for i in 0..m {
+            let row = &out1[i * n2..(i + 1) * n2];
+            act[i * ff..(i + 1) * ff].copy_from_slice(&row[..ff]);
+            tensor::silu_inplace(&mut act[i * ff..(i + 1) * ff]);
+            for f in 0..ff {
+                act[i * ff + f] *= row[ff + f];
+            }
+        }
+        let want = tensor::matvec_rows_bt_i8(&act, &down.w, &down.scale, ff, e, m);
+
+        assert_eq!(got.len(), want.len());
+        for idx in 0..want.len() {
+            assert_eq!(
+                got[idx].to_bits(),
+                want[idx].to_bits(),
+                "FFN ブロック不一致 @{} (GPU 常駐経路 vs CPU 参照)",
+                idx
+            );
+        }
+        println!("cuda_ffn_bit_exact_vs_cpu_reference: bit-exact (m={m}, e={e}, ff={ff})");
     }
 
     /// P17i: tiled GEMM カーネル (dno_gemm_i8) が CPU int8 線形と**ビット一致**
