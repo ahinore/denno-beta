@@ -26,6 +26,10 @@ rand = "0.8"
 # テスト用ユーティリティ (ダミーモデル/ダミートークナイザ) を公開する。
 # denno-server の統合テストがモデルDLなしで Engine を構築できるようにするためのもの。
 test-utils = []
+# P17: CUDA int8 オフロード (denno-engine/src/cuda.rs)。依存ゼロ (dlopen ベース)。
+# ビルドには kernels/kernels_int8.ptx (コミット済み) のみが必要で、libcuda は
+# 実行時に解決される。GPU 無し環境では有効化しない。
+cuda = []
 
 [dev-dependencies]
 # 統合テスト (tests/) から test-utils (ダミーモデル) を使うための自己参照。

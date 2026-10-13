@@ -14,6 +14,10 @@ pub mod sampler;
 pub mod tensor;
 pub mod tokenizer;
 
+/// P17: CUDA int8 オフロード (feature = "cuda" のみ。GPU 無し環境では完全に除外)。
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
 #[cfg(any(test, feature = "test-utils"))]
 pub mod testutil;
 
