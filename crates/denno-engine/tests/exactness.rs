@@ -150,7 +150,7 @@ fn qwen_int8_mode_is_deterministic() {
 
 /// P15: Qwen3 (QK-Norm) の基準出力 + 決定論。
 /// Qwen3-0.6B は chat template が thinking モード用のため greedy でも思考
-/// セクション (`...`) が先頭に出る。基準文字列は参照実装
+/// セクション (`<think>...</think>`) が先頭に出る。基準文字列は参照実装
 /// (HF transformers fp32, greedy, 同一 chat template) の出力と完全一致を
 /// 検証済み (ai_work_sync/qwen3_ref.py、開発コンテナ内)。
 /// (QK-Norm 経路のバッチ/単独ビット一致は llama.rs の単体テストで担保)
