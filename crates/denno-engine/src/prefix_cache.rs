@@ -187,6 +187,8 @@ mod tests {
 
     fn cache_with(len: usize) -> KvCache {
         let mut c = KvCache::new(1, 2, 64);
+        // P17e: 需要ベース確保なので、事前に len トークン分のバッファを成長させる
+        let _ = c.kv_bufs(0, len);
         c.advance(len);
         c
     }
@@ -268,7 +270,7 @@ mod tests {
     fn restore_into_copies_prefix_rows() {
         let mut src = KvCache::new(1, 2, 64);
         {
-            let (k, _) = src.kv_bufs(0);
+            let (k, _) = src.kv_bufs(0, 3);
             k[0..6].copy_from_slice(&[1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
         }
         src.advance(3);
@@ -278,7 +280,7 @@ mod tests {
         let mut dst = KvCache::new(1, 2, 64);
         assert!(pc.restore_into(0, 2, &mut dst)); // LCP 2 分だけ復元
         assert_eq!(dst.len(), 2);
-        let (k, _) = dst.kv_bufs(0);
+        let (k, _) = dst.kv_bufs(0, 1); // 3 行目まで成長させて stale 行を確認
         assert_eq!(k[0..4], [1.0, 1.0, 2.0, 2.0]);
         assert_eq!(k[4..6], [0.0, 0.0]);
     }

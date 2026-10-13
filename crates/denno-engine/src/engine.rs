@@ -98,6 +98,8 @@ pub struct Engine {
     cached_prompts: Vec<Vec<u32>>,
     /// slot の使用中フラグ (install_session が取得、release_session が解放)
     slot_busy: Vec<bool>,
+    /// slot ごとの KV 予約トークン数 (prompt + max_tokens。P17e の予算ハード保証用)
+    slot_reserved: Vec<usize>,
     pub name: String,
     pub default_seed: Option<u64>,
     /// 過去会話の KV スナップショット群 (マルチエントリ LRU prefix cache)
@@ -108,9 +110,17 @@ pub struct Engine {
     pub quant: QuantMode,
 }
 
-/// KV キャッシュスロット数の既定値 (環境変数 `DENNO_BATCH_SLOTS` で変更可)。
-pub const DEFAULT_BATCH_SLOTS: usize = 4;
+/// KV キャッシュスロット数の上限 (環境変数 `DENNO_BATCH_SLOTS` で変更可)。
+/// P17e から KV は需要ベース確保 (初期 0・書き込みで倍々成長) なので、
+/// スロット数は「1 セッションあたりの目安予約 [`SESSION_RESERVE_TOKENS`]
+/// トークン分が予算に収まる数」を既定とし、この上限で抑える。
+pub const DEFAULT_BATCH_SLOTS: usize = 32;
 pub const BATCH_SLOTS_ENV: &str = "DENNO_BATCH_SLOTS";
+
+/// 1 セッションの目安予約トークン数 (P17e)。スロット数の既定計算と
+/// install 時の KV 予算ハード保証に使う (prompt + max_tokens の合計が
+/// この値なら、全スロットが同時に埋まっても KV は予算内に収まる)。
+pub const SESSION_RESERVE_TOKENS: usize = 4096;
 
 /// P15: KV メモリ予算の既定値 (MB) と環境変数。
 /// バッチスロット + prefix cache の合計 KV の目安。巨大 KV モデル
@@ -129,14 +139,16 @@ fn kv_budget_bytes() -> usize {
         .saturating_mul(1024 * 1024)
 }
 
-/// スロット KV バイト数とメモリ予算から、バッチスロット数と
-/// prefix cache トークン上限を決める (純粋関数: 単体テストあり)。
+/// スロット数と prefix cache トークン上限を決める (純粋関数: 単体テストあり)。
+///
+/// P17e: KV は需要ベース確保なので「スロット 1 個 = ctx 全幅の事前確保」
+/// ではなく「1 セッション = [`SESSION_RESERVE_TOKENS`] トークンの予約」が
+/// 予算単位になる。
 ///
 /// - `explicit_slots` / `explicit_prefix`: 環境変数による明示指定 (最優先)
-/// - 明示指定が無い場合: 予算内でスロットを優先して確保し、残りを
-///   prefix cache に充てる (最低でも 2048 トークンは確保)
-/// - `DEFAULT_BATCH_SLOTS` と予算から従来構成 (4 スロット + ctx 全幅) が
-///   収まるモデル (Qwen2.5-0.5B/1.5B) は従来値を完全維持
+/// - 明示指定が無い場合: スロット数 = 予算内に目安予約が収まる数
+///   ([`DEFAULT_BATCH_SLOTS`] 上限)。残り予算を prefix cache に充てる
+///   (最低でも 2048 トークンは確保)
 fn resolve_kv_budget(
     slot_max_len: usize,
     bytes_per_token: usize,
@@ -145,32 +157,25 @@ fn resolve_kv_budget(
     budget_bytes: usize,
 ) -> (usize, usize) {
     let bpt = bytes_per_token.max(1);
-    let slot_bytes = slot_max_len.saturating_mul(bpt);
+    let reserve_bytes = SESSION_RESERVE_TOKENS.min(slot_max_len).saturating_mul(bpt);
     let slots = match explicit_slots {
         Some(n) => n.max(1),
-        None => DEFAULT_BATCH_SLOTS.min((budget_bytes / slot_bytes.max(1)).max(1)),
+        None => DEFAULT_BATCH_SLOTS.min((budget_bytes / reserve_bytes.max(1)).max(1)),
     };
+    let reserved = slots.saturating_mul(reserve_bytes);
     let prefix = match explicit_prefix {
         Some(n) => n,
         None => {
             let floor = 2048.min(slot_max_len);
-            if slots.saturating_mul(slot_bytes) >= budget_bytes {
+            if reserved >= budget_bytes {
                 floor
             } else {
-                let rest = budget_bytes - slots * slot_bytes;
+                let rest = budget_bytes - reserved;
                 slot_max_len.min(rest / bpt).max(floor)
             }
         }
     };
     (slots, prefix)
-}
-
-fn batch_slots() -> usize {
-    std::env::var(BATCH_SLOTS_ENV)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_BATCH_SLOTS)
 }
 
 /// P4 ステッパ: 1リクエスト分の生成状態。
@@ -267,9 +272,10 @@ impl Engine {
             max_tokens as f64 * slot0.bytes_per_token() as f64 / 1e6
         );
         tracing::info!(
-            "batch slots: {} (KV ~{:.0} MB/slot, env {BATCH_SLOTS_ENV}; total KV budget {} MB, env {KV_BUDGET_ENV})",
+            "batch slots: {} (KV 予約 ~{:.0} MB/slot @{} tok, env {BATCH_SLOTS_ENV}; total KV budget {} MB, env {KV_BUDGET_ENV})",
             slots,
-            slot0.max_len() as f64 * slot0.bytes_per_token() as f64 / 1e6,
+            SESSION_RESERVE_TOKENS.min(slot0.max_len()) as f64 * slot0.bytes_per_token() as f64 / 1e6,
+            SESSION_RESERVE_TOKENS,
             kv_budget_bytes() / (1024 * 1024)
         );
         tracing::info!(
@@ -284,12 +290,14 @@ impl Engine {
         let caches: Vec<KvCache> = (0..slots).map(|_| model.new_cache()).collect();
         let cached_prompts = vec![Vec::new(); slots];
         let slot_busy = vec![false; slots];
+        let slot_reserved = vec![0usize; slots];
         Ok(Self {
             model,
             tok,
             caches,
             cached_prompts,
             slot_busy,
+            slot_reserved,
             name: name.into(),
             default_seed,
             prefix_cache: PrefixCache::new(max_tokens),
@@ -329,16 +337,34 @@ impl Engine {
     ) -> Self {
         let slot0 = model.new_cache();
         let max_tokens = slot0.max_len();
-        let slots = batch_slots();
+        let slots = {
+            let explicit_slots = std::env::var(BATCH_SLOTS_ENV)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n >= 1);
+            let explicit_prefix = std::env::var(PREFIX_CACHE_ENV)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok());
+            let (slots, _prefix_tokens) = resolve_kv_budget(
+                slot0.max_len(),
+                slot0.bytes_per_token(),
+                explicit_slots,
+                explicit_prefix,
+                kv_budget_bytes(),
+            );
+            slots
+        };
         let caches: Vec<KvCache> = (0..slots).map(|_| model.new_cache()).collect();
         let cached_prompts = vec![Vec::new(); slots];
         let slot_busy = vec![false; slots];
+        let slot_reserved = vec![0usize; slots];
         Self {
             model,
             tok,
             caches,
             cached_prompts,
             slot_busy,
+            slot_reserved,
             name: name.into(),
             default_seed,
             prefix_cache: PrefixCache::new(max_tokens),
@@ -375,9 +401,43 @@ impl Engine {
     ///   ストアの LCP、LCP が最大の候補を採用) で `sess.lcp` に再利用長を設定
     /// - スロットが全て使用中ならエラー (スケジューラは同時実行数を
     ///   スロット数以下に制限するため通常起こらない)
+    ///
+    /// P17e: install 時に `prompt + max_tokens` を KV 予約として登録し、
+    /// 2 つのハード保証を行う。
+    /// 1. 予約合計がスロットの `max_len` を超えない (KV 書き込みが
+    ///    物理的に入る保証。超過は 400 相当のエラーで拒否)
+    /// 2. 全 busy スロットの予約合計 × bytes_per_token が KV 予算
+    ///    (`DENNO_KV_BUDGET_MB`) を超えない
     pub fn install_session(&mut self, sess: &mut ChatSession) -> Result<()> {
         if sess.slot.is_some() {
             return Ok(()); // 既に常駐済み
+        }
+        // --- P17e: 予約トークン数 (prompt + max_tokens) のハード保証 ---
+        let need = sess.prompt_ids.len() + sess.max_tokens;
+        let budget = self
+            .caches
+            .first()
+            .map(|c| (c.max_len(), c.bytes_per_token()))
+            .unwrap_or((0, 0));
+        if need > budget.0 {
+            anyhow::bail!(
+                "invalid_request_error: prompt ({} tokens) + max_tokens ({}) が KV スロットの上限 {} を超えます",
+                sess.prompt_ids.len(),
+                sess.max_tokens,
+                budget.0
+            );
+        }
+        let reserved_total: usize = self.slot_reserved.iter().sum();
+        let budget_bytes = kv_budget_bytes();
+        if (reserved_total + need).saturating_mul(budget.1) > budget_bytes {
+            anyhow::bail!(
+                "invalid_request_error: KV 予算超過 (予約 {} + {} tokens × {} B/token > {} MB)。同時リクエストを減らすか {} を上げてください",
+                reserved_total,
+                need,
+                budget.1,
+                budget_bytes / (1024 * 1024),
+                KV_BUDGET_ENV
+            );
         }
         // --- 空きスロットを選ぶ (live 再利用候補が最長のもの) ---
         let cap = sess.prompt_ids.len().saturating_sub(1);
@@ -405,6 +465,7 @@ impl Engine {
         let slot = best_slot
             .ok_or_else(|| anyhow::anyhow!("no free KV cache slot ({} slots)", self.caches.len()))?;
         self.slot_busy[slot] = true;
+        self.slot_reserved[slot] = need;
         sess.slot = Some(slot);
         if telem::enabled() {
             telem::emit(Frame::SessionAdmit {
@@ -484,6 +545,7 @@ impl Engine {
         }
         let Some(slot) = sess.slot.take() else { return };
         self.slot_busy[slot] = false;
+        self.slot_reserved[slot] = 0;
         if !self.cached_prompts[slot].is_empty() && !self.caches[slot].is_empty() {
             let p = self.cached_prompts[slot].clone();
             if !self.prefix_cache.contains_prompt(&p) {
@@ -1283,28 +1345,35 @@ mod tests {
     }
 
     #[test]
-    fn resolve_kv_budget_keeps_small_kv_models_at_defaults() {
-        // Qwen2.5-0.5B 相当 (slot 940MB): 従来どおり 4 スロット + ctx 全幅 prefix
+    fn resolve_kv_budget_scales_slots_by_reservation() {
+        // P17e: スロット数 = 予算内に 4096tok 予約が収まる数 (上限 32)。
+        // Qwen2.5-0.5B 相当 (bpt 24,576): 予約 100.7MB → 予算 12GB で上限 32
         let (slots, prefix) = resolve_kv_budget(32768, 24_576, None, None, 12288 * 1024 * 1024);
-        assert_eq!(slots, DEFAULT_BATCH_SLOTS);
+        assert_eq!(slots, 32);
         assert_eq!(prefix, 32768);
-        // Qwen2.5-1.5B 相当 (slot 1.88GB): 4 スロット + ctx 全幅が予算内に収まる
+        // Qwen2.5-1.5B 相当 (bpt 57,344): 予約 235MB → 予算 12GB で 52 → 上限 32
         let (slots, prefix) = resolve_kv_budget(32768, 57_344, None, None, 12288 * 1024 * 1024);
-        assert_eq!(slots, DEFAULT_BATCH_SLOTS);
+        assert_eq!(slots, 32);
         assert_eq!(prefix, 32768);
     }
 
     #[test]
     fn resolve_kv_budget_shrinks_for_large_kv_models() {
-        // Qwen3-0.6B 相当 (slot ~9.4GB): スロット 1、残り予算を prefix に充てる
+        // Qwen3-0.6B 相当 (bpt ~229KB): 予約 939.5MB → 13 スロット、
+        // 残り予算 (671MB) を prefix に充てる
         let (slots, prefix) =
             resolve_kv_budget(40960, 229_376, None, None, 12288 * 1024 * 1024);
-        assert_eq!(slots, 1);
-        assert_eq!(prefix, (12288 * 1024 * 1024 - 40960 * 229_376) / 229_376); // 15214
-        // スロットが予算の半分以下なら残りを prefix に充てる
+        assert_eq!(slots, 13);
+        assert_eq!(prefix, 2925);
+        // 中間 (bpt 114,688): 予約 469.8MB → 27 スロット。残り予算は 1755 トークン
+        // 分だが prefix の floor (2048) が下限として効く
         let (slots, prefix) = resolve_kv_budget(32768, 114_688, None, None, 12288 * 1024 * 1024);
-        assert_eq!(slots, 3); // 3.66GB × 3 = 11GB ≤ 12.288GB
-        assert_eq!(prefix, 32768.min((12288 * 1024 * 1024 - 3 * 32768 * 114_688) / 114_688));
+        assert_eq!(slots, 27);
+        assert_eq!(prefix, 2048);
+        // 予算 0 でも最低 1 スロット + floor 2048 は確保される
+        let (slots, prefix) = resolve_kv_budget(40960, 229_376, None, None, 0);
+        assert_eq!(slots, 1);
+        assert_eq!(prefix, 2048);
     }
 
     #[test]
