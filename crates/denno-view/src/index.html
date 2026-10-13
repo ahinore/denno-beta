@@ -763,9 +763,10 @@ function fallTokens(tokens, targetId) {
 }
 
 // ---------- 出力トークン ----------
-function addOutToken(id) {
+function addOutToken(id, txt) {
   const t = document.createElement("span");
-  t.className = "t"; t.textContent = tokText(id) || "·"; t.title = "id " + id;
+  // txt が渡されなければ tokText(id) を消費 (TOK_STREAM は1トークン1回だけ消費すること)
+  t.className = "t"; t.textContent = txt !== undefined ? txt : (tokText(id) || "·"); t.title = "id " + id;
   $("tokens").appendChild(t);
   $("tokens").scrollTop = 1e9;
 }
@@ -808,6 +809,13 @@ function handleFrame(f) {
       statEl.textContent = "prefill…";
       lit($("n-sched")); lit($("n-step"));
       codeGo("c2");
+      // チャット送信後の最初の admit をチャットセッションとして捕捉
+      // (以後、このセッションの Token フレーム再生時にバブルへ出力する)
+      if (chatActive && chatActive.phase === "wait") {
+        chatActive.phase = "run";
+        chatActive.session = f.session;
+        chatActive.el = addBubble("a", "");
+      }
       break;
     }
     case "Prefill": {
@@ -929,14 +937,25 @@ function handleFrame(f) {
       break;
     }
     case "Token": {
-      addOutToken(f.token);
-      $("val-token").textContent = `${tokText(f.token) || "?"} (id ${f.token}, pos ${f.pos})`;
+      const txt = tokText(f.token);   // TOK_STREAM を消費するのはここ1回 (チップとチャットで共用)
+      addOutToken(f.token, txt);
+      $("val-token").textContent = `${txt || "?"} (id ${f.token}, pos ${f.pos})`;
       lit($("var-token"));
       lit($("n-detok"));
       lit($(modeId("c5")), "state-lit", 450);    // emit(chosen)
       const c5el = $(modeId("c5"));
       if (c5el) flyLine(c5el, $("var-token"), "#7ee788");
       codeGo("c5");
+      // チャット出力は emit_token (Token フレーム) の再生に同期する。
+      // アニメーションが遅い (speed=low) なら出力表示もそれに合わせて遅くなる。
+      if (chatActive && chatActive.phase === "run" && f.session === chatActive.session) {
+        chatActive.text += txt;
+        chatActive.count++;
+        chatActive.last = performance.now();
+        chatActive.el.textContent = chatActive.text;
+        $("chatlog").scrollTop = 1e9;
+        if (chatActive.expect > 0 && chatActive.count >= chatActive.expect) finishChat();
+      }
       break;
     }
     case "TopK": {
@@ -997,6 +1016,9 @@ let queue = [];
 let playAt = 0;   // 次のフレームを再生してよい時刻 (performance.now 基準)
 function drain() {
   const now = performance.now();
+  // チャット同期表示の安全弁: 応答受信済みでトークンが 4 秒進まない場合
+  // (テレメトリ無効・WS切断・GapでTokenフレーム欠落) は応答全文で確定する
+  if (chatActive && chatActive.reply !== null && now - chatActive.last > 4000) finishChat();
   if (now < playAt || !queue.length) return;
   const f = queue.shift();
   try { handleFrame(f); } catch (e) { console.error("frame error", e, f); }
@@ -1054,6 +1076,28 @@ function addBubble(cls, text) {
   const log = $("chatlog");
   log.appendChild(d);
   log.scrollTop = 1e9;
+  return d;
+}
+// ---------- チャット出力の Token フレーム同期 ----------
+// chatActive = 送信中のチャット。SessionAdmit でセッションを捕捉し、
+// Token フレーム (emit_token) の再生時にバブルへトークンを追記する。
+// 応答 (usage) 確定で全トークン再生後に usage 付きで確定。
+// tokenizer 未読込 / テレメトリ無効 / Token 欠落時は応答全文表示へフォールバック。
+let chatActive = null;
+function finishChat() {
+  if (!chatActive) return;
+  const c = chatActive;
+  chatActive = null;
+  const complete = c.expect > 0 && c.count >= c.expect;
+  const body = complete ? c.text : (c.reply !== null ? c.reply : c.text);
+  if (c.el) {
+    c.el.textContent = body + c.usage;
+    $("chatlog").scrollTop = 1e9;
+  } else {
+    addBubble("a", body + c.usage);
+  }
+  chatPending = false;
+  $("chatsend").disabled = false;
 }
 async function sendChat() {
   const inp = $("chatin");
@@ -1065,6 +1109,11 @@ async function sendChat() {
   chatPending = true;
   $("chatsend").disabled = true;
   const maxTokens = Math.max(1, Math.min(4096, parseInt($("chatmt").value) || 256));
+  // tokenizer が読めていれば Token フレーム同期表示、なければ従来の即時表示
+  chatActive = TOK !== null ? {
+    phase: "wait", session: null, el: null, text: "", count: 0,
+    expect: 0, usage: "", reply: null, last: performance.now(),
+  } : null;
   try {
     const r = await fetch("/chat", {
       method: "POST",
@@ -1078,18 +1127,31 @@ async function sendChat() {
     const j = await r.json();
     if (!r.ok) throw new Error((j.error && j.error.message) || "HTTP " + r.status);
     const reply = (j.content || []).map((c) => c.text || "").join("");
-    if (j.usage) {
-      addBubble("a", reply + `\n(in ${j.usage.input_tokens} / out ${j.usage.output_tokens} tok)`);
-    } else {
-      addBubble("a", reply);
-    }
     chatHistory.push({ role: "assistant", content: reply });
+    if (!chatActive) {
+      const usage = j.usage ? `\n(in ${j.usage.input_tokens} / out ${j.usage.output_tokens} tok)` : "";
+      addBubble("a", reply + usage);
+      chatPending = false;
+      $("chatsend").disabled = false;
+    } else if (j.usage) {
+      chatActive.reply = reply;
+      chatActive.expect = j.usage.output_tokens;
+      chatActive.usage = `\n(in ${j.usage.input_tokens} / out ${j.usage.output_tokens} tok)`;
+      chatActive.last = performance.now();
+      // 応答到着時点で全トークン再生済みならここで確定
+      if (chatActive.phase === "run" && chatActive.count >= chatActive.expect) finishChat();
+    } else {
+      chatActive.reply = reply;
+      finishChat();
+    }
   } catch (e) {
+    if (chatActive && chatActive.el) chatActive.el.remove();   // 空のまま残ったバブルを始末
+    chatActive = null;
     addBubble("e", "error: " + e.message + " — removing the last message from history");
     chatHistory.pop();
+    chatPending = false;
+    $("chatsend").disabled = false;
   }
-  chatPending = false;
-  $("chatsend").disabled = false;
 }
 $("chatsend").addEventListener("click", sendChat);
 $("chatin").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
