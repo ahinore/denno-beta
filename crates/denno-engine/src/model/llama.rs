@@ -176,6 +176,52 @@ fn lin(a: &[f32], w: &Linear, m: usize) -> Vec<f32> {
     w.apply_bt(a, m)
 }
 
+/// P17c: QKV 融合 (cuda feature 時)。q/k/v は同一入力 (`h`) を消費するため、
+/// 重み行を [q|k|v] の順に連結した 1 回の GPU 呼び出しで計算し、出力を列ブロック
+/// で切り分ける。各行の演算は個別呼び出しと完全に同一 (量子化も行単位) なので
+/// **ビット一致**。GPU 無効/エラー/一部が fp32 の場合は None → 従来の 3 分割。
+#[cfg(feature = "cuda")]
+fn lin_qkv_gpu(
+    layer: &Layer,
+    h: &[f32],
+    n: usize,
+    qn: usize,
+    kvn: usize,
+) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let parts = [
+        layer.q_w.quant8()?,
+        layer.k_w.quant8()?,
+        layer.v_w.quant8()?,
+    ];
+    let out = crate::cuda::maybe_gpu_linear_grouped(&parts, h, n)?;
+    let width = qn + 2 * kvn;
+    let mut q = Vec::with_capacity(n * qn);
+    let mut k = Vec::with_capacity(n * kvn);
+    let mut v = Vec::with_capacity(n * kvn);
+    for i in 0..n {
+        let row = &out[i * width..][..width];
+        q.extend_from_slice(&row[..qn]);
+        k.extend_from_slice(&row[qn..qn + kvn]);
+        v.extend_from_slice(&row[qn + kvn..]);
+    }
+    Some((q, k, v))
+}
+
+/// P17c: gate/up 融合 (cuda feature 時)。仕様は lin_qkv_gpu と同じ。
+#[cfg(feature = "cuda")]
+fn lin_gateup_gpu(layer: &Layer, h: &[f32], n: usize, ff: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+    let parts = [layer.gate_w.quant8()?, layer.up_w.quant8()?];
+    let out = crate::cuda::maybe_gpu_linear_grouped(&parts, h, n)?;
+    let mut gate = Vec::with_capacity(n * ff);
+    let mut up = Vec::with_capacity(n * ff);
+    for i in 0..n {
+        let row = &out[i * (2 * ff)..][..2 * ff];
+        gate.extend_from_slice(&row[..ff]);
+        up.extend_from_slice(&row[ff..]);
+    }
+    Some((gate, up))
+}
+
 // P12: decode attention のスクラッチバッファ (rayon ワーカースレッドごとに再利用)。
 // t×dh のバッファは malloc の mmap 閾値 (~128KB) を超えるため、毎ステップ
 // 毎レイヤーの確保/解放が mmap/munmap システムコールになる — スレッドローカル
@@ -280,9 +326,19 @@ impl Model for LlamaQwen2 {
             let h = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
                 rmsnorm(&x, &layer.ln1_w, e, self.eps)
             });
-            let mut q = crate::prof::time_layer(crate::prof::QKV, li, || lin(&h, &layer.q_w, n)); // [n, H*dh]
-            let mut k = crate::prof::time_layer(crate::prof::QKV, li, || lin(&h, &layer.k_w, n)); // [n, K*dh]
-            let mut v = crate::prof::time_layer(crate::prof::QKV, li, || lin(&h, &layer.v_w, n));
+            let (mut q, mut k, mut v) = crate::prof::time_layer(crate::prof::QKV, li, || {
+                // P17c: q/k/v は同一入力 → 1 回の GPU 呼び出しに融合
+                // (GPU 無効/エラー時は従来の 3 分割呼び出しにフォールバック)
+                #[cfg(feature = "cuda")]
+                if let Some((q, k, v)) = lin_qkv_gpu(layer, &h, n, heads * dh, kv_dim) {
+                    return (q, k, v);
+                }
+                (
+                    lin(&h, &layer.q_w, n), // [n, H*dh]
+                    lin(&h, &layer.k_w, n), // [n, K*dh]
+                    lin(&h, &layer.v_w, n),
+                )
+            });
             if let Some(b) = &layer.q_b {
                 add_bias(&mut q, b, heads * dh);
             }
@@ -388,9 +444,14 @@ impl Model for LlamaQwen2 {
             let h2 = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
                 rmsnorm(&x, &layer.ln2_w, e, self.eps)
             });
-            let mut gate =
-                crate::prof::time_layer(crate::prof::GATE_UP, li, || lin(&h2, &layer.gate_w, n));
-            let up = crate::prof::time_layer(crate::prof::GATE_UP, li, || lin(&h2, &layer.up_w, n));
+            let (mut gate, up) = crate::prof::time_layer(crate::prof::GATE_UP, li, || {
+                // P17c: gate/up は同一入力 → 1 回の GPU 呼び出しに融合
+                #[cfg(feature = "cuda")]
+                if let Some((gate, up)) = lin_gateup_gpu(layer, &h2, n, self.ff) {
+                    return (gate, up);
+                }
+                (lin(&h2, &layer.gate_w, n), lin(&h2, &layer.up_w, n))
+            });
             crate::prof::time_layer(crate::prof::SWIGLU, li, || {
                 silu_inplace(&mut gate);
                 for i in 0..n * self.ff {
@@ -456,11 +517,18 @@ impl Model for LlamaQwen2 {
             let h = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
                 rmsnorm(&x, &layer.ln1_w, e, self.eps)
             });
-            let mut q =
-                crate::prof::time_layer(crate::prof::QKV, li, || lin_b(&h, &layer.q_w, b)); // [b, H*dh]
-            let mut k =
-                crate::prof::time_layer(crate::prof::QKV, li, || lin_b(&h, &layer.k_w, b)); // [b, K*dh]
-            let mut v = crate::prof::time_layer(crate::prof::QKV, li, || lin_b(&h, &layer.v_w, b));
+            let (mut q, mut k, mut v) = crate::prof::time_layer(crate::prof::QKV, li, || {
+                // P17c: q/k/v は同一入力 → 1 回の GPU 呼び出しに融合
+                #[cfg(feature = "cuda")]
+                if let Some((q, k, v)) = lin_qkv_gpu(layer, &h, b, heads * dh, kv_dim) {
+                    return (q, k, v);
+                }
+                (
+                    lin_b(&h, &layer.q_w, b), // [b, H*dh]
+                    lin_b(&h, &layer.k_w, b), // [b, K*dh]
+                    lin_b(&h, &layer.v_w, b),
+                )
+            });
             if let Some(bias) = &layer.q_b {
                 add_bias(&mut q, bias, heads * dh);
             }
@@ -559,11 +627,14 @@ impl Model for LlamaQwen2 {
             let h2 = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
                 rmsnorm(&x, &layer.ln2_w, e, self.eps)
             });
-            let mut gate = crate::prof::time_layer(crate::prof::GATE_UP, li, || {
-                lin_b(&h2, &layer.gate_w, b)
+            let (mut gate, up) = crate::prof::time_layer(crate::prof::GATE_UP, li, || {
+                // P17c: gate/up は同一入力 → 1 回の GPU 呼び出しに融合
+                #[cfg(feature = "cuda")]
+                if let Some((gate, up)) = lin_gateup_gpu(layer, &h2, b, self.ff) {
+                    return (gate, up);
+                }
+                (lin_b(&h2, &layer.gate_w, b), lin_b(&h2, &layer.up_w, b))
             });
-            let up =
-                crate::prof::time_layer(crate::prof::GATE_UP, li, || lin_b(&h2, &layer.up_w, b));
             crate::prof::time_layer(crate::prof::SWIGLU, li, || {
                 silu_inplace(&mut gate);
                 for i in 0..b * self.ff {
