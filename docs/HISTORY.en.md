@@ -386,6 +386,18 @@ pie showData title P9 fp32 batch (4x256) per-op time
 - **Performance** (1.5B int8, dev 8090): short request (t≈38, 2 tokens) **11.0ms** (vs 14.4ms on the `DENNO_GPU_ATTN=0` batch path — sync-removal effect); long decode (t≈7657, 128 tokens, warm) **4.23s → 3.88s** (1.09x). Cold prefill unchanged (~366s; pre-existing issue)
 - **PTX**: sha256 `a78c645c23b4e0d17504c705c23fb4fbbf10ba0737a0ca3c12bd65c342fe10e5` (verified against a fresh `nvcc -arch=compute_75 -fmad=false -ptx` compile)
 
+### P17i: GPU offload of int8 linears for long prefill (tiled GEMM, dno_gemm_i8) ✅ (2026-10-13, commit `f2c1831`)
+
+> Resolves the post-P17h remaining issue "cold prefill unchanged (~100s at t≈2810)". Profiling had shown 83% of prefill time in CPU GEMMs of the linears (gate_up 47s, down 29s), so the `maybe_gpu_linear` gate **m > DENNO_CUDA_MAX_M (default 16) → CPU** was replaced with a GEMM path.
+
+- **dno_gemm_i8 kernel** (kernels_int8.cu): 64×64 tiles, 1 thread computes 4×4 outputs, dp4a, A/B tiles in shared memory. **Bit-exactness rationale**: integer accumulation is associative, so tiling/ordering cannot change the result; the f32 side uses the same order as the GEMV kernel, `((dot as f32) * ascale) * scale[j]`. When k is not a multiple of 4/32, zero padding at tile boundaries handles the edge correctly
+- **Dispatch**: GEMM path when `m > max_m() && m >= gemm_min_m()` (default 256, `DENNO_CUDA_GEMM_MIN_M`); `m <= max_m()` keeps the GEMV path; **17..255 stays on CPU** (for small m the per-layer syncs cost more than the CPU GEMM; short prompts are fastest on CPU). `DENNO_CUDA_GEMM=0` disables the GEMM path (escape hatch)
+- **Tests**: `cuda_gemm_i8_bit_exact_vs_cpu` (8 shapes: tile edges 63/64/65/100/128/130, k not a multiple of 4 such as 1533/17911; **also bit-exact vs the GEMV kernel on the same input** — verifying order-invariance of integer accumulation). GPU cuda_ **17/17**, CPU **110**, exactness **6 criteria** pass
+- **Performance** (1.5B int8, dev 8090, longreq2 t=2827/max 256): **cold ~100s → 32.4s**; warm (prefix cache hit) 3.70s (same as P17h 3.88s = no decode regression); short request (t=38, 2 tokens) **11.1ms (identical to P17h** — below the threshold, short prompts stay on the CPU path)
+- **Bit-exactness in production**: the cold-prefill response is **identical** to P17h (CPU prefill) — compared via the longreq2 output text. 0 errors in the serve log
+- **PTX** (kernels_int8): sha256 `9021673e1a10214eaf11d1bfe1a3a697ee7b6dde10d5f0f0c5be0a39f10c02da` (verified against a fresh `nvcc -ptx -arch=compute_75 -fmad=false -O3` compile)
+- Known observation: responses on a prefix-cache hit (warm) may differ from cold — **pre-existing behavior unrelated to P17i** (prefill does not run at all on a warm hit)
+
 ## 4. Candidate List
 
 - [x] ~~**sampler optimization**: softmax + top-p sort over the 152k vocab cost a fixed ~3.5ms/step (found in P7.5)~~ → **done in P8** (0.66ms/step, greedy unchanged)
