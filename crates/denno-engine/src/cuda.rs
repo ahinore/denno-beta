@@ -71,6 +71,12 @@ type FnCuMemAllocV2 = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
 type FnCuMemFreeV2 = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
 type FnCuMemcpyHtoDV2 = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type FnCuMemcpyDtoHV2 = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
+type FnCuMemHostAlloc = unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> CUresult;
+type FnCuMemFreeHost = unsafe extern "C" fn(*mut c_void) -> CUresult;
+type FnCuMemcpyHtoDAsyncV2 =
+    unsafe extern "C" fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult;
+type FnCuMemcpyDtoHAsyncV2 =
+    unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult;
 type FnCuLaunchKernel = unsafe extern "C" fn(
     CUfunction,
     u32,
@@ -102,6 +108,10 @@ struct CudaLib {
     mem_free: FnCuMemFreeV2,
     memcpy_htod: FnCuMemcpyHtoDV2,
     memcpy_dtoh: FnCuMemcpyDtoHV2,
+    mem_host_alloc: FnCuMemHostAlloc,
+    mem_host_free: FnCuMemFreeHost,
+    memcpy_htod_async: FnCuMemcpyHtoDAsyncV2,
+    memcpy_dtoh_async: FnCuMemcpyDtoHAsyncV2,
     launch: FnCuLaunchKernel,
 }
 
@@ -135,6 +145,10 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
         mem_free: std::mem::transmute(sym(handle, "cuMemFree_v2")?),
         memcpy_htod: std::mem::transmute(sym(handle, "cuMemcpyHtoD_v2")?),
         memcpy_dtoh: std::mem::transmute(sym(handle, "cuMemcpyDtoH_v2")?),
+        mem_host_alloc: std::mem::transmute(sym(handle, "cuMemHostAlloc")?),
+        mem_host_free: std::mem::transmute(sym(handle, "cuMemFreeHost")?),
+        memcpy_htod_async: std::mem::transmute(sym(handle, "cuMemcpyHtoDAsync_v2")?),
+        memcpy_dtoh_async: std::mem::transmute(sym(handle, "cuMemcpyDtoHAsync_v2")?),
         launch: std::mem::transmute(sym(handle, "cuLaunchKernel")?),
     })
 }
@@ -220,6 +234,11 @@ impl DevBuffer {
     pub fn bytes(&self) -> usize {
         self.bytes
     }
+
+    /// 生デバイスポインタ (カーネル引数の組み立て用)
+    pub fn ptr(&self) -> CUdeviceptr {
+        self.ptr
+    }
 }
 
 impl Drop for DevBuffer {
@@ -247,6 +266,12 @@ pub struct CudaCtx {
 }
 
 const PTX: &[u8] = include_bytes!("../kernels/kernels_int8.ptx");
+
+// 中身は生ハンドル (context / module / function)。CUcontext はスレッドごとに
+// current 設定して使うハンドルであり、所有権の移動は伴わないため Send/Sync を
+// 与える (primary context 自体は driver がスレッド安全に管理する)。
+unsafe impl Send for CudaCtx {}
+unsafe impl Sync for CudaCtx {}
 
 impl CudaCtx {
     /// デバイス 0 (または `DENNO_CUDA_DEVICE`) の primary context を初期化し、
@@ -320,8 +345,9 @@ impl CudaCtx {
         self.device
     }
 
-    /// カーネル起動 + 同期 (デフォルトストリーム)
-    unsafe fn launch(
+    /// カーネル起動のみ (同期しない — デフォルトストリームにエンキュー)。
+    /// P17b: 固定オーバーヘッド削減のため launch/sync を分離。
+    unsafe fn launch_async(
         &self,
         f: CUfunction,
         grid: (u32, u32, u32),
@@ -345,8 +371,13 @@ impl CudaCtx {
                 std::ptr::null_mut(),
             ),
             "cuLaunchKernel",
-        )?;
-        check((lib.ctx_sync)(), "cuCtxSynchronize")
+        )
+    }
+
+    /// デフォルトストリームの同期 (エンキュー済み全操作の完了待ち)
+    pub fn sync(&self) -> Result<()> {
+        let lib = lib()?;
+        unsafe { check((lib.ctx_sync)(), "cuCtxSynchronize") }
     }
 
     /// `tensor::quantize_row_i8` の GPU 版 (m 行一括)。
@@ -368,13 +399,14 @@ impl CudaCtx {
                 &mut kc as *mut _ as *mut c_void,
             ];
             // 1 block per row, 256 threads, shmem 256*4 bytes
-            self.launch(
+            self.launch_async(
                 self.f_quant,
                 (m as u32, 1, 1),
                 (256, 1, 1),
                 256 * 4,
                 &mut args,
             )?;
+            self.sync()?;
         }
         Ok((dev_aq, dev_asc))
     }
@@ -409,7 +441,8 @@ impl CudaCtx {
             // 1 warp per (i,j): block 256 = 8 warps
             let total = (m * n) as u64;
             let blocks = total.div_ceil(8) as u32;
-            self.launch(self.f_mv, (blocks, 1, 1), (256, 1, 1), 0, &mut args)?;
+            self.launch_async(self.f_mv, (blocks, 1, 1), (256, 1, 1), 0, &mut args)?;
+            self.sync()?;
         }
         dev_out.to_vec::<f32>(m * n)
     }
@@ -441,6 +474,295 @@ impl CudaCtx {
     pub fn upload_f32(&self, data: &[f32]) -> Result<DevBuffer> {
         DevBuffer::from_slice(data)
     }
+}
+
+// ===========================================================================
+// P17b: エンジン統合 (重み VRAM 常駐 + ピン留め/非同期パイプライン)
+// ===========================================================================
+//
+// `quant::Linear` の int8 パス (apply_bt / apply_batch_bt / apply) から呼ばれ、
+// `DENNO_CUDA=1` + feature `cuda` のとき int8 線形層を GPU にオフロードする。
+// - 数値は CPU カーネルとビット一致 (同一カーネル = P17 の exactness 契約そのまま)
+// - 重みは初回呼び出し時に VRAM へアップロードして常駐 (Quant8Linear のバッファ
+//   ポインタをキーにしたレジストリ。ロード後の重みは不変であることが前提)
+// - 固定オーバーヘッド削減: ピン留めホストメモリ + 非同期コピー/起動で
+//   **1 線形層 = 1 同期** (P17 マイクロベンチでは起動+同期+コピーで約40µs/呼び出し)
+// - 初期化失敗/実行時エラーは CPU パスへフォールバック (両者は同一仕様なので
+//   出力は不変。実行時エラー後は二度と試さない)
+
+/// ピン留めホストメモリ (非同期コピーの転送元/転送先)。
+struct PinMem {
+    ptr: *mut c_void,
+    bytes: usize,
+}
+
+// 生ポインタを保持するだけ (スレッド局所で共有しない)
+unsafe impl Send for PinMem {}
+
+impl PinMem {
+    fn alloc(bytes: usize) -> Result<Self> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        // PORTABLE: どのコンテキストからでも有効 (保険)
+        const CU_MEMHOSTALLOC_PORTABLE: u32 = 0x01;
+        unsafe {
+            check(
+                (lib()?.mem_host_alloc)(&mut ptr, bytes.max(1), CU_MEMHOSTALLOC_PORTABLE),
+                "cuMemHostAlloc",
+            )?;
+        }
+        Ok(Self { ptr, bytes: bytes.max(1) })
+    }
+
+    fn as_slice<T>(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr as *const T, self.bytes / std::mem::size_of::<T>()) }
+    }
+
+    fn as_mut_slice<T>(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.bytes / std::mem::size_of::<T>()) }
+    }
+}
+
+impl Drop for PinMem {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = (lib().unwrap().mem_host_free)(self.ptr);
+        }
+    }
+}
+
+/// 1 スレッド分の再利用スクラッチ (grow-only)。scheduler ワーカーは単一スレッド
+/// のため thread_local で競合なし。スレッド終了時の解放はベストエフォート
+/// (コンテキストは static で生き続けるため、失敗してもリークはワーカー寿命分)。
+struct Scratch {
+    x: Option<DevBuffer>,   // [m*k] f32 入力
+    aq: Option<DevBuffer>,  // [m*k] i8 量子化済み
+    asc: Option<DevBuffer>, // [m] f32 ascale
+    out: Option<DevBuffer>, // [m*n] f32 出力
+    hx: Option<PinMem>,     // x の転送元 (ピン留め)
+    ho: Option<PinMem>,     // out の転送先 (ピン留め)
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch {
+        x: None, aq: None, asc: None, out: None, hx: None, ho: None,
+    });
+}
+
+impl Scratch {
+    fn ensure(cap: &mut Option<DevBuffer>, bytes: usize) -> Result<()> {
+        if cap.as_ref().map(|b| b.bytes()).unwrap_or(0) < bytes {
+            *cap = Some(DevBuffer::alloc(bytes)?);
+        }
+        Ok(())
+    }
+    fn ensure_pin(cap: &mut Option<PinMem>, bytes: usize) -> Result<()> {
+        if cap.as_ref().map(|b| b.bytes).unwrap_or(0) < bytes {
+            *cap = Some(PinMem::alloc(bytes)?);
+        }
+        Ok(())
+    }
+}
+
+static GPU_CTX: OnceLock<Option<CudaCtx>> = OnceLock::new();
+static GPU_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static GPU_FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn cuda_enabled() -> bool {
+    if GPU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    #[cfg(test)]
+    if GPU_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        matches!(
+            std::env::var("DENNO_CUDA").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
+/// テスト用: env を介さず GPU 経路を強制有効化 (ignored テストでのみ使用)。
+#[cfg(test)]
+pub fn enable_for_tests() {
+    GPU_FORCE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 共有 CudaCtx (遅延初期化)。無効 or 初期化失敗なら None (CPU フォールバック)。
+fn shared_ctx() -> Option<&'static CudaCtx> {
+    GPU_CTX
+        .get_or_init(|| match CudaCtx::new() {
+            Ok(ctx) => {
+                tracing::info!("CUDA int8 offload enabled: {}", ctx.info());
+                Some(ctx)
+            }
+            Err(e) => {
+                tracing::warn!("CUDA int8 offload unavailable, using CPU int8: {e:#}");
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// int8 重みの VRAM レジストリ (キー = Quant8Linear.uid)。
+/// uid は Linear 構築時に採番されるため、Vec アドレスの再利用で別内容の重みが
+/// 同一キーに現れることはない。Clone は uid を共有するが内容が同一なので安全。
+/// エントリは解放しない (実運用は 1 モデル = 約 2GB、テストは微小)。
+struct GpuW {
+    w: DevBuffer,
+    sc: DevBuffer,
+    k: usize,
+    n: usize,
+}
+
+fn weights_for(uid: u64, qw: &[i8], scale: &[f32], k: usize, n: usize) -> Result<&'static GpuW> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static REG: OnceLock<Mutex<HashMap<u64, Box<GpuW>>>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = reg.lock().expect("weights registry poisoned");
+    if !map.contains_key(&uid) {
+        let w = DevBuffer::from_slice(qw)?;
+        let sc = DevBuffer::from_slice(scale)?;
+        tracing::info!(
+            "CUDA weight upload (uid={uid}): k={k} n={n} ({:.1} MB)",
+            (k * n + n * 4) as f64 / 1e6
+        );
+        map.insert(uid, Box::new(GpuW { w, sc, k, n }));
+    }
+    let e = map.get(&uid).expect("just inserted");
+    debug_assert_eq!((e.k, e.n), (k, n), "uid 重複: 同一 uid に異なる形状");
+    // &'static 化: REG は static、Box の中身は移動しない
+    Ok(unsafe { std::mem::transmute::<&GpuW, &'static GpuW>(e.as_ref()) })
+}
+
+/// GPU オフロードする最大の m (行数)。decode / バッチ decode (m≤閾値) のみ
+/// オフロードし、prefill (m が大きい GEMM) は CPU のまま — GEMV 型カーネルは
+/// 行数に比例して重み再読みが増えるため m が大きいと CPU sgemm に負ける
+/// (P17b 実測: m=128 で 0.39x)。閾値は `DENNO_CUDA_MAX_M` で変更可能。
+fn max_m() -> usize {
+    static MAX_M: OnceLock<usize> = OnceLock::new();
+    *MAX_M.get_or_init(|| {
+        std::env::var("DENNO_CUDA_MAX_M")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16)
+    })
+}
+
+/// P17b 統合エントリ: int8 線形層を GPU で実行するかどうかを判定し、
+/// 実行するなら結果 (CPU カーネルとビット一致) を返す。
+/// 戻り値 None = CPU パスを使うこと (無効/初期化失敗/実行時エラー/m>閾値)。
+pub fn maybe_gpu_linear(
+    uid: u64,
+    a: &[f32],
+    qw: &[i8],
+    scale: &[f32],
+    k: usize,
+    n: usize,
+    m: usize,
+) -> Option<Vec<f32>> {
+    if !cuda_enabled() || m > max_m() {
+        return None;
+    }
+    let ctx = shared_ctx()?;
+    let gw = match weights_for(uid, qw, scale, k, n) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!("CUDA weight upload failed, using CPU int8: {e:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+    };
+    match linear_pinned(ctx, a, gw, m, k, n) {
+        Ok(out) => Some(out),
+        Err(e) => {
+            // 実行時エラーは再試行せず恒久的に CPU へ (数値は同一仕様なので不変)
+            tracing::error!("CUDA linear failed, falling back to CPU permanently: {e:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// ピン留め + 非同期 1 同期パイプライン:
+///   H2D(x, async) → quantize kernel → gemv kernel → D2H(out, async) → sync ×1
+fn linear_pinned(
+    ctx: &CudaCtx,
+    a: &[f32],
+    gw: &GpuW,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>> {
+    debug_assert_eq!(a.len(), m * k);
+    let lib = lib()?;
+    SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        // デストラクチャしてフィールド単位の借用にする (RefMut 経由の
+        // 全体借用だと dx (不変) と hx/ho (可変) が競合するため)
+        let Scratch { x, aq, asc, out, hx, ho } = &mut *s;
+        let bytes_x = m * k * 4;
+        let bytes_out = m * n * 4;
+        Scratch::ensure(x, bytes_x)?;
+        Scratch::ensure(aq, m * k)?;
+        Scratch::ensure(asc, m * 4)?;
+        Scratch::ensure(out, bytes_out)?;
+        Scratch::ensure_pin(hx, bytes_x)?;
+        Scratch::ensure_pin(ho, bytes_out)?;
+        let (dx, daq, dasc, dout) = (
+            x.as_ref().unwrap(),
+            aq.as_ref().unwrap(),
+            asc.as_ref().unwrap(),
+            out.as_ref().unwrap(),
+        );
+        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        hx.as_mut_slice::<f32>()[..m * k].copy_from_slice(a);
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(dx.ptr(), hx.ptr as *const c_void, bytes_x, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync",
+            )?;
+            let (mut px, mut paq, mut pasc) = (dx.ptr(), daq.ptr(), dasc.ptr());
+            let (mut mc, mut kc) = (m as c_int, k as c_int);
+            let mut args = [
+                &mut px as *mut _ as *mut c_void,
+                &mut paq as *mut _ as *mut c_void,
+                &mut pasc as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(ctx.f_quant, (m as u32, 1, 1), (256, 1, 1), 256 * 4, &mut args)?;
+
+            let (mut paqi, mut pasci, mut pw, mut psc, mut pout) =
+                (daq.ptr(), dasc.ptr(), gw.w.ptr(), gw.sc.ptr(), dout.ptr());
+            let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, n as c_int);
+            let mut args = [
+                &mut paqi as *mut _ as *mut c_void,
+                &mut pasci as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut psc as *mut _ as *mut c_void,
+                &mut pout as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            let total = (m * n) as u64;
+            let blocks = total.div_ceil(8) as u32;
+            ctx.launch_async(ctx.f_mv, (blocks, 1, 1), (256, 1, 1), 0, &mut args)?;
+
+            check(
+                (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync",
+            )?;
+        }
+        ctx.sync()?;
+        Ok(ho.as_slice::<f32>()[..m * n].to_vec())
+    })
 }
 
 #[cfg(all(test, feature = "cuda"))]
@@ -584,6 +906,119 @@ mod tests {
                 cw = wb / cpu / 1e9,
                 r = cpu / gpu,
             );
+        }
+    }
+
+    /// P17b パイプライン (ピン留め+非同期+1同期+重みレジストリ) の
+    /// ビット一致検証。`quant::Linear` のフック経由 (apply_bt / apply_batch_bt /
+    /// apply の Q8 パス) で CPU カーネルと比較する。
+    #[test]
+    #[ignore]
+    fn cuda_pipeline_bit_exact_vs_cpu_via_linear() {
+        crate::cuda::enable_for_tests();
+        for (m, k, n) in [(1usize, 896usize, 1152usize), (1, 1536, 151936), (4, 1536, 17920), (3, 8960, 1536)] {
+            let w = pseudo_random(k * n, 90);
+            let a = pseudo_random(m * k, 91 + m as u32);
+            let lin = crate::quant::Linear::new(w.clone(), k, n, crate::quant::QuantMode::Int8);
+
+            // GPU 経路 (フック経由)
+            let got = lin.apply_bt(&a, m);
+            // CPU リファレンス (同一仕様の rows カーネル)
+            let q = crate::quant::Quant8Linear::quantize(&w, k, n);
+            let want = if m == 1 {
+                crate::tensor::matvec_bt_i8(&a, &q.w, &q.scale, k, n)
+            } else {
+                crate::tensor::matmul_bt_i8(&a, &q.w, &q.scale, m, k, n)
+            };
+            for idx in 0..m * n {
+                assert_eq!(
+                    got[idx].to_bits(),
+                    want[idx].to_bits(),
+                    "apply_bt m={m} k={k} n={n} idx={idx}"
+                );
+            }
+            // apply_batch_bt 経路 (P6 バッチ decode)
+            if m > 1 {
+                let got_b = lin.apply_batch_bt(&a, m);
+                for idx in 0..m * n {
+                    assert_eq!(got_b[idx].to_bits(), want[idx].to_bits(), "apply_batch_bt m={m}");
+                }
+            }
+        }
+    }
+
+    /// P17b パイプラインの固定オーバーヘッド測定 (P17 の linear_bt_i8 = 同期×4
+    /// との比較)。decode m=1 の 5 形状。
+    #[test]
+    #[ignore]
+    fn bench_cuda_pipeline_overhead_1p5b_decode() {
+        crate::cuda::enable_for_tests();
+        let shapes: [(&str, usize, usize); 5] = [
+            ("qkv_proj", 1536, 2048),
+            ("o_proj", 1536, 1536),
+            ("gate_up", 1536, 17920),
+            ("down", 8960, 1536),
+            ("lm_head", 1536, 151936),
+        ];
+        for (label, k, n) in shapes {
+            let w = pseudo_random(k * n, 92);
+            let a = pseudo_random(k, 93);
+            let lin = crate::quant::Linear::new(w, k, n, crate::quant::QuantMode::Int8);
+            let iters = 50;
+            let _ = lin.apply_bt(&a, 1); // warmup + 重みアップロード
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let _ = lin.apply_bt(&a, 1);
+            }
+            let gpu = t0.elapsed().as_secs_f64() / iters as f64;
+            let cpu = lin.dims(); // (CPU 経路は既存ベンチの値を参照)
+            let _ = cpu;
+            println!("[{label}] P17b pipeline m=1: {ms:.3}ms", ms = gpu * 1e3);
+        }
+    }
+
+    /// prefill (m>1 GEMM) の GPU vs CPU 比較 — GPU 統合が prefill を
+    /// 逆に遅くしていないか (m が大きいと GEMV 型カーネルは不利) を確認する。
+    #[test]
+    #[ignore]
+    fn bench_cuda_pipeline_1p5b_prefill() {
+        crate::cuda::enable_for_tests();
+        let shapes: [(&str, usize, usize); 3] = [
+            ("qkv_proj", 1536, 2048),
+            ("gate_up", 1536, 17920),
+            ("down", 8960, 1536),
+        ];
+        for m in [32usize, 128, 512] {
+            for (label, k, n) in shapes {
+                let w = pseudo_random(k * n, 94);
+                let a = pseudo_random(m * k, 95);
+                let lin = crate::quant::Linear::new(w, k, n, crate::quant::QuantMode::Int8);
+                let iters = 10;
+                let _ = lin.apply_bt(&a, m); // warmup
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    let _ = lin.apply_bt(&a, m);
+                }
+                let gpu = t0.elapsed().as_secs_f64() / iters as f64;
+                // CPU (matmul_bt_i8)
+                let q = crate::quant::Quant8Linear::quantize(
+                    &pseudo_random(k * n, 94),
+                    k,
+                    n,
+                );
+                let _ = crate::tensor::matmul_bt_i8(&a, &q.w, &q.scale, m, k, n);
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    let _ = crate::tensor::matmul_bt_i8(&a, &q.w, &q.scale, m, k, n);
+                }
+                let cpu = t0.elapsed().as_secs_f64() / iters as f64;
+                println!(
+                    "[{label} prefill m={m}] GPU {g:.3}ms / CPU {c:.3}ms = {r:.2}x",
+                    g = gpu * 1e3,
+                    c = cpu * 1e3,
+                    r = cpu / gpu,
+                );
+            }
         }
     }
 

@@ -54,6 +54,17 @@ pub struct Quant8Linear {
     pub scale: Vec<f32>,
     pub k: usize,
     pub n: usize,
+    /// GPU オフロード用の重み識別子 (P17b)。構築時に採番され、Clone でも共有する
+    /// (Clone は同一内容のディープコピーなので VRAM バッファの共有は数値的に安全)。
+    /// ポインタではなく uid で識別するのは、Vec の解放→再確保でアドレスが再利用
+    /// され、別内容の重みが同一アドレスに現れても誤参照しないため。
+    pub uid: u64,
+}
+
+static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_uid() -> u64 {
+    std::sync::atomic::AtomicU64::fetch_add(&NEXT_UID, 1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Quant8Linear {
@@ -77,7 +88,7 @@ impl Quant8Linear {
                 *q = qi.clamp(-127.0, 127.0) as i8;
             }
         }
-        Self { w: qw, scale, k, n }
+        Self { w: qw, scale, k: k, n: n, uid: next_uid() }
     }
 
     /// デ量子化して f32 重み [n, k] を返す (テストと prefill 用)。
@@ -151,6 +162,14 @@ impl Linear {
                 }
             }
             Linear::Q8(q) => {
+                // P17b: DENNO_CUDA=1 なら GPU オフロード (CPU カーネルとビット一致)。
+                // 無効/初期化失敗/実行時エラー時は None で既存 CPU 経路にフォールバック。
+                #[cfg(feature = "cuda")]
+                if let Some(out) =
+                    crate::cuda::maybe_gpu_linear(q.uid, a, &q.w, &q.scale, q.k, q.n, m)
+                {
+                    return out;
+                }
                 if m == 1 {
                     crate::tensor::matvec_bt_i8(a, &q.w, &q.scale, q.k, q.n)
                 } else {
@@ -168,7 +187,15 @@ impl Linear {
     pub fn apply_batch_bt(&self, a: &[f32], m: usize) -> Vec<f32> {
         match self {
             Linear::F32 { w, k, n } => crate::tensor::matvec_rows_bt(a, w, *k, *n, m),
-            Linear::Q8(q) => crate::tensor::matvec_rows_bt_i8(a, &q.w, &q.scale, q.k, q.n, m),
+            Linear::Q8(q) => {
+                #[cfg(feature = "cuda")]
+                if let Some(out) =
+                    crate::cuda::maybe_gpu_linear(q.uid, a, &q.w, &q.scale, q.k, q.n, m)
+                {
+                    return out;
+                }
+                crate::tensor::matvec_rows_bt_i8(a, &q.w, &q.scale, q.k, q.n, m)
+            }
         }
     }
 
@@ -177,7 +204,16 @@ impl Linear {
     pub fn apply(&self, a: &[f32], m: usize) -> Vec<f32> {
         match self {
             Linear::F32 { w, k, n } => crate::tensor::matmul(a, w, m, *k, *n),
-            Linear::Q8(q) => crate::tensor::matmul_bt_i8(a, &q.w, &q.scale, m, q.k, q.n),
+            Linear::Q8(q) => {
+                // Q8 は転置格納 [n,k] → bt カーネル (GPU 経路も同じ rows 仕様)
+                #[cfg(feature = "cuda")]
+                if let Some(out) =
+                    crate::cuda::maybe_gpu_linear(q.uid, a, &q.w, &q.scale, q.k, q.n, m)
+                {
+                    return out;
+                }
+                crate::tensor::matmul_bt_i8(a, &q.w, &q.scale, m, q.k, q.n)
+            }
         }
     }
 
