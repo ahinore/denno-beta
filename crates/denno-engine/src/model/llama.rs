@@ -595,6 +595,36 @@ impl Model for LlamaQwen2 {
                 // P17f: qg/kh/vh の連続化コピーを廃止し、Q 行バッファと kv バッファへ
                 // ストライド直接参照で sgemm を実行 (数値は基準更新済み・決定論は維持)。
                 let mut scores = vec![0.0f32; n * t_total];
+                // P17j: prefill GPU attention (flash 風 online softmax) を先に
+                // 試行。q/KV は全てホスト側にあるため失敗時もこのブロック内で
+                // CPU 経路にフォールバックできる (forward 全体の再実行は不要・
+                // ホスト状態は不変)。数値は attention 緩和枠 (ユーザー承認)。
+                #[cfg(feature = "cuda")]
+                {
+                    if crate::cuda::chain_attention_prefill(
+                        cache.kv_id(),
+                        li,
+                        self.layers.len(),
+                        &q,
+                        cache,
+                        pos0,
+                        n,
+                        t_total,
+                        group,
+                        dh,
+                        kv_dim,
+                        scale,
+                    )
+                    .is_some()
+                    {
+                        if let Some(av) =
+                            crate::cuda::chain_download(crate::cuda::CH_ATT, n * heads * dh)
+                        {
+                            att.copy_from_slice(&av);
+                            return;
+                        }
+                    }
+                }
                 for kvh in 0..kv_heads {
                     for g in 0..group {
                         let qh = kvh * group + g;
@@ -1148,6 +1178,7 @@ mod tests {
     #[test]
     #[ignore]
     fn cuda_offload_forward_bit_exact_vs_cpu() {
+        let _g = crate::cuda::test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::cuda::enable_for_tests();
         let mode = QuantMode::Int8;
         let prompts: Vec<Vec<u32>> = vec![vec![5, 11, 23], vec![1, 2, 3, 4, 5], vec![7, 9]];
@@ -1211,6 +1242,7 @@ mod tests {
     #[test]
     #[ignore]
     fn cuda_gpu_attention_forward_vs_cpu_close() {
+        let _g = crate::cuda::test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::cuda::enable_for_tests();
         let prompt = vec![5u32, 11, 23];
         let steps = 8;
@@ -1257,6 +1289,7 @@ mod tests {
     #[test]
     #[ignore]
     fn cuda_rope_qkv_bitexact_vs_cpu() {
+        let _g = crate::cuda::test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::cuda::enable_for_tests();
         use crate::cuda::{chain_download, chain_rope_prepare, chain_rope_qkv, chain_upload, CH_QKV};
         use crate::tensor::rope_rows;
@@ -1322,6 +1355,7 @@ mod tests {
     #[test]
     #[ignore]
     fn cuda_solo_chain_bias_rope_gpu_matches_cpu() {
+        let _g = crate::cuda::test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::cuda::enable_for_tests();
         let prompt = vec![5u32, 11, 23];
         let steps = 6;

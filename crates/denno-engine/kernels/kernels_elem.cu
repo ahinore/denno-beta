@@ -219,6 +219,140 @@ extern "C" __global__ void dno_attention(
     att[(size_t)h * dh + threadIdx.x] = acc * inv;
 }
 
+// ---------------------------------------------------------------------------
+// P17j: prefill attention (n > 1, causal) — flash 風 online softmax。
+// exactness 契約は decode attention (P17g) と同じく attention のみ緩和
+// (ユーザー承認)。数値は CPU (sgemm 経路) とビット不一致だが、**決定論は
+// 維持** (タイルサイズ・累積順固定・原子操作なし: 同一入力 → 同一出力)。
+//
+// grid = (heads, ceil(n / PF_BQ)), block = (dh), dynamic shmem =
+//   (PF_BQ + 2*PF_BK) * dh + PF_BQ*PF_BK + 2*PF_BQ floats (<= 48KB)。
+// block (h, qt) が q ヘッド h のクエリ行 [qt*PF_BQ, qt*PF_BQ+PF_BQ) を担当。
+//   kvh = h / group, kh_off = kvh * dh
+//   scores[i,j] = q[i,h] · K[j,kh_off..] * scale   (j = 0..pos0+i — causal)
+//   att[i,h]    = Σ_j softmax_j * V[j, kh_off..]
+// K/V は GPU 側 KV ミラー ([t_total, kv_dim] 行-major、ホスト KvCache と同一)。
+// exp は dno_expf (glibc 再現)。online softmax の累積順は「タイル昇順・タイル内
+// kk 昇順・出力次元 d はスレッド tid = d 専属」で固定。
+// 制約 (ホスト側でも検証): dh >= 32 (block が PF_BQ 行 owner を持つため) &&
+//   shmem <= 48KB (dh <= 152 @ BQ=16/BK=32)。
+#define PF_BQ 16
+#define PF_BK 32
+extern "C" __global__ void dno_attention_prefill(
+    const float *__restrict__ q,     // [n, heads*dh]
+    const float *__restrict__ kc,    // [t_total, kv_dim]
+    const float *__restrict__ vc,    // [t_total, kv_dim]
+    float *__restrict__ att,         // [n, heads*dh]
+    int heads, int n, int pos0, int kv_dim, int t_total, int group, int dh,
+    float scale) {
+    extern __shared__ float sh[];
+    float *q_sm = sh;                     // [PF_BQ][dh]
+    float *k_sm = q_sm + PF_BQ * dh;      // [PF_BK][dh]
+    float *v_sm = k_sm + PF_BK * dh;      // [PF_BK][dh]
+    float *s_sm = v_sm + PF_BK * dh;      // [PF_BQ][PF_BK] scores → probs
+    float *corr_sm = s_sm + PF_BQ * PF_BK;  // [PF_BQ] (最終フェーズで 1/l に再利用)
+    float *mnew_sm = corr_sm + PF_BQ;       // [PF_BQ]
+
+    const int h = blockIdx.x;
+    const int i0 = blockIdx.y * PF_BQ;
+    const int kh_off = (h / group) * dh;
+    const int tid = threadIdx.x;
+    // この block が見る必要のある最大 key (行ごとの causal 界の最大値)
+    const int jend = min(t_total, pos0 + i0 + PF_BQ);
+
+    // 出力次元 d=tid の全 row 累積 / row tid (= owner スレッド) の online 状態
+    float acc[PF_BQ];
+    for (int r = 0; r < PF_BQ; ++r) acc[r] = 0.0f;
+    float m_run = -INFINITY;
+    float l_run = 0.0f;
+
+    // q を shared へ (範囲外行は 0 埋め → スコア 0・l > 0 で NaN なし・出力は書かない)
+    for (int r = 0; r < PF_BQ; ++r) {
+        const int i = i0 + r;
+        q_sm[r * dh + tid] =
+            (i < n) ? q[(size_t)i * heads * dh + (size_t)h * dh + tid] : 0.0f;
+    }
+
+    for (int j0 = 0; j0 < jend; j0 += PF_BK) {
+        // K/V タイルを shared へ (範囲外は 0 — masked pair は p=0 で参照されない)
+        for (int kk = 0; kk < PF_BK; ++kk) {
+            const int j = j0 + kk;
+            if (j < t_total) {
+                k_sm[kk * dh + tid] = kc[(size_t)j * kv_dim + kh_off + tid];
+                v_sm[kk * dh + tid] = vc[(size_t)j * kv_dim + kh_off + tid];
+            } else {
+                k_sm[kk * dh + tid] = 0.0f;
+                v_sm[kk * dh + tid] = 0.0f;
+            }
+        }
+        __syncthreads();
+        // scores: (r, kk) ペアをスレッド分散。ドットは dh 逐次 fmaf
+        // (decode kernel dno_attention と同一の演算順)。
+        for (int pid = tid; pid < PF_BQ * PF_BK; pid += dh) {
+            const int r = pid / PF_BK;
+            const int kk = pid % PF_BK;
+            const int i = i0 + r;
+            const int j = j0 + kk;
+            float s;
+            if (i >= n) {
+                // 無効行: m_new を 0 に保ち NaN を避ける (acc はゴミだが書かない)
+                s = 0.0f;
+            } else if (j < t_total && j <= pos0 + i) {
+                const float *qr = &q_sm[r * dh];
+                const float *kr = &k_sm[kk * dh];
+                float d = 0.0f;
+                for (int t2 = 0; t2 < dh; ++t2) d = fmaf(qr[t2], kr[t2], d);
+                s = d * scale;
+            } else {
+                s = -INFINITY;  // causal mask (exp 後 0)
+            }
+            s_sm[r * PF_BK + kk] = s;
+        }
+        __syncthreads();
+        // タイル内 row max + online 更新 (owner = thread r)
+        if (tid < PF_BQ) {
+            float mx = m_run;
+            for (int kk = 0; kk < PF_BK; ++kk) mx = fmaxf(mx, s_sm[tid * PF_BK + kk]);
+            // m_run=-inf → expf(-inf)=0 (dno_expf の -inf 早期 return)
+            corr_sm[tid] = dno_expf(m_run - mx);
+            mnew_sm[tid] = mx;
+        }
+        __syncthreads();
+        // p = exp(s - m_new) を s_sm に上書き (無効 pair は 0)
+        for (int pid = tid; pid < PF_BQ * PF_BK; pid += dh) {
+            const int r = pid / PF_BK;
+            const int kk = pid % PF_BK;
+            s_sm[r * PF_BK + kk] = dno_expf(s_sm[r * PF_BK + kk] - mnew_sm[r]);
+        }
+        __syncthreads();
+        if (tid < PF_BQ) {
+            float l = l_run * corr_sm[tid];
+            for (int kk = 0; kk < PF_BK; ++kk) l += s_sm[tid * PF_BK + kk];
+            l_run = l;
+            m_run = mnew_sm[tid];
+        }
+        // acc 再スケール + probs@V 累積 (出力次元 d=tid 専属)
+        for (int r = 0; r < PF_BQ; ++r) acc[r] *= corr_sm[r];
+        for (int r = 0; r < PF_BQ; ++r) {
+            for (int kk = 0; kk < PF_BK; ++kk) {
+                acc[r] = fmaf(s_sm[r * PF_BK + kk], v_sm[kk * dh + tid], acc[r]);
+            }
+        }
+        __syncthreads();  // 次タイルの k_sm/v_sm/s_sm 上書き前の壁
+    }
+
+    // 正規化 + 書き出し (corr_sm を 1/l に再利用)。有効 row は必ず j=0 が
+    // causal 内なので l >= 1 > 0。無効行 (i >= n) は書かない。
+    if (tid < PF_BQ) corr_sm[tid] = 1.0f / l_run;
+    __syncthreads();
+    for (int r = 0; r < PF_BQ; ++r) {
+        const int i = i0 + r;
+        if (i < n) {
+            att[(size_t)i * heads * dh + (size_t)h * dh + tid] = acc[r] * corr_sm[r];
+        }
+    }
+}
+
 // P17h: decode 用 qkv rope (qkv bias 対応)。CPU tensor::rope_row とビット一致
 // させるため cos/sin はホスト (同一プロセスの glibc sinf/cosf) で計算した
 // テーブルを渡し、演算は -fmad=false の mul.rn/add.rn/sub.rn (Rust のスカラー

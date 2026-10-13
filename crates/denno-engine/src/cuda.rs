@@ -300,6 +300,8 @@ pub struct CudaCtx {
     f_expf: CUfunction,
     // P17g: decode attention (exactness 緩和・ユーザー承認)
     f_attn: CUfunction,
+    // P17j: prefill attention (flash 風 online softmax・exactness 緩和・ユーザー承認)
+    f_attn_pf: CUfunction,
     // P17h: qkv rope + bias (CPU rope_row とビット一致)
     f_rope: CUfunction,
 }
@@ -398,6 +400,12 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_attn, module_elem, b"dno_attention\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_attention)",
             )?;
+            // P17j: prefill attention
+            let mut f_attn_pf: CUfunction = std::ptr::null_mut();
+            check(
+                (lib.module_get_function)(&mut f_attn_pf, module_elem, b"dno_attention_prefill\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_attention_prefill)",
+            )?;
             let mut f_rope: CUfunction = std::ptr::null_mut();
             check(
                 (lib.module_get_function)(&mut f_rope, module_elem, b"dno_rope_qkv\0".as_ptr() as *const c_char),
@@ -419,6 +427,7 @@ impl CudaCtx {
                 f_addnorm,
                 f_expf,
                 f_attn,
+                f_attn_pf,
                 f_rope,
             })
         }
@@ -740,6 +749,19 @@ fn cuda_enabled() -> bool {
 #[cfg(test)]
 pub fn enable_for_tests() {
     GPU_FORCE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// テスト用: GPU 関連テストの直列化ロック (P17j)。
+/// `set_gpu_attention_enabled` でグローバルフラグを差し替えるテストと、フラグ
+/// 状態に依存するテスト (attention ON/OFF でビット一致/近似一致が変わる) が
+/// 並列実行で競合し、片方の失敗が GPU_BROKEN 経由で他テストにも連鎖していた
+/// (P17g から潜在・テスト数増加で顕在化)。フラグを扱う/依存するテストは
+/// このロックを取得する。
+#[cfg(test)]
+#[doc(hidden)]
+pub fn test_lock() -> &'static std::sync::Mutex<()> {
+    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 /// 共有 CudaCtx (遅延初期化)。無効 or 初期化失敗なら None (CPU フォールバック)。
@@ -1148,6 +1170,11 @@ pub const CH_DOWN: usize = 7; // down 出力 [m*e]
 pub const CH_LOGITS: usize = 8; // lm_head 出力 [m*vocab]
 const CH_SLOTS: usize = 9;
 
+// P17j: prefill attention カーネルのタイル定数 (kernels_elem.cu の PF_BQ/PF_BK
+// と同期すること)。BQ=行タイル・BK=key タイル。
+const ATTN_PF_BQ: usize = 16;
+const ATTN_PF_BK: usize = 32;
+
 struct ChainScratch {
     bufs: Vec<Option<DevBuffer>>,
     pin_x: Option<PinMem>,  // x / att アップロード用 (使用間に必ず sync が挟まる)
@@ -1155,6 +1182,7 @@ struct ChainScratch {
     aq: Option<DevBuffer>,  // int8 カーネル用スクラッチ (chain 専用)
     attn_q: Option<DevBuffer>,  // P17g: attention q アップロード用
     attn_sc: Option<DevBuffer>, // P17g: attention scores スクラッチ [heads*t_total]
+    attn_pf_q: Option<DevBuffer>, // P17j: prefill attention q アップロード用 [n*heads*dh]
     rope_tab: Option<DevBuffer>,  // P17h: rope cos/sin テーブル [cos(half)|sin(half)]
     rope_bias: Option<DevBuffer>, // P17h: qkv bias パック [qb|kb|vb]
     pin_rope: Option<PinMem>,     // P17h: rope テーブル/... ステップ 1 回のアップロード用
@@ -1173,6 +1201,7 @@ thread_local! {
         aq: None,
         attn_q: None,
         attn_sc: None,
+        attn_pf_q: None,
         rope_tab: None,
         rope_bias: None,
         pin_rope: None,
@@ -1646,6 +1675,112 @@ pub fn chain_attention(
     })
 }
 
+/// P17j: prefill (n > 1) 用 GPU attention (dno_attention_prefill・flash 風
+/// online softmax)。q ([n, heads*dh]、rope/QK-Norm 加算済み) とホスト KvCache
+/// (現在レイヤの行 [pos0..t_total) は呼び出し側が書き込み済み) を受け取り、
+/// ミラーを同期して prefill attention カーネルを起動し、結果 [n, heads*dh] を
+/// CH_ATT に書く (呼び出し側が chain_download する)。
+/// 戻り None = CPU attention にフォールバック。prefill は q/KV が全てホスト側に
+/// あるため decode chain と異なり **attention ブロック内で完結**する
+/// (forward 全体の再実行は不要・ホスト状態は不変)。
+/// 数値は CPU (sgemm 経路) とビット不一致 — exactness 契約の attention 緩和
+/// (ユーザー承認・P17g) と同一枠。**決定論は維持** (カーネル内の固定タイル・
+/// 固定累積順・原子操作なし)。
+#[allow(clippy::too_many_arguments)]
+pub fn chain_attention_prefill(
+    key: u64,
+    li: usize,
+    n_layers: usize,
+    q: &[f32],
+    cache: &crate::kv_cache::KvCache,
+    pos0: usize,
+    n: usize,
+    t_total: usize,
+    group: usize,
+    dh: usize,
+    kv_dim: usize,
+    scale: f32,
+) -> Option<()> {
+    if !gpu_attention_enabled() {
+        return None;
+    }
+    if n == 0 || t_total == 0 || group == 0 || t_total > cache.max_len() {
+        return None;
+    }
+    // カーネル制約: block = dh スレッドが PF_BQ 行 owner + 出力次元 d=tid を
+    // 担当するため dh >= PF_BQ、smem <= 48KB。
+    if dh < ATTN_PF_BQ || dh > 1024 {
+        return None;
+    }
+    let sh_f = ATTN_PF_BQ * dh + 2 * ATTN_PF_BK * dh + ATTN_PF_BQ * ATTN_PF_BK + 2 * ATTN_PF_BQ;
+    if sh_f * 4 > 48 * 1024 {
+        return None;
+    }
+    let heads = q.len() / (n * dh);
+    if heads == 0 || n.checked_mul(dh).map(|x| x * heads) != Some(q.len()) {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+
+    let mut heads_c = heads as c_int;
+    let mut n_c = n as c_int;
+    let mut pos0_c = pos0 as c_int;
+    let mut kv_dim_c = kv_dim as c_int;
+    let mut t_c = t_total as c_int;
+    let mut group_c = group as c_int;
+    let mut dh_c = dh as c_int;
+    let mut scale_c = scale;
+
+    ok(chain_ensure_buf(CH_ATT, n * heads * dh * 4))?;
+
+    // ミラーの取得/生成 + レイヤ li の行同期 (decode と同一経路)。
+    let (mut kptr, mut vptr) = with_mirror(key, li, n_layers, t_total, kv_dim, |m, have| {
+        let (kc_ref, vc_ref) = cache.kv_bufs_ref(li);
+        if have < t_total {
+            let kb = m.layers[li].0.as_ref().unwrap();
+            let vb = m.layers[li].1.as_ref().unwrap();
+            ok(kb.copy_from_at(have * kv_dim * 4, &kc_ref[have * kv_dim..t_total * kv_dim]))?;
+            ok(vb.copy_from_at(have * kv_dim * 4, &vc_ref[have * kv_dim..t_total * kv_dim]))?;
+        }
+        m.len[li] = t_total;
+        Some((
+            m.layers[li].0.as_ref().unwrap().ptr(),
+            m.layers[li].1.as_ref().unwrap().ptr(),
+        ))
+    })?;
+
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure(&mut s.attn_pf_q, q.len() * 4))?;
+        ok(s.attn_pf_q.as_ref().unwrap().copy_from(q))?;
+        let mut qptr = s.attn_pf_q.as_ref().unwrap().ptr();
+        let mut aptr = s.bufs[CH_ATT].as_ref().unwrap().ptr();
+        let mut args: Vec<*mut c_void> = vec![
+            &mut qptr as *mut _ as *mut c_void,
+            &mut kptr as *mut _ as *mut c_void,
+            &mut vptr as *mut _ as *mut c_void,
+            &mut aptr as *mut _ as *mut c_void,
+            &mut heads_c as *mut _ as *mut c_void,
+            &mut n_c as *mut _ as *mut c_void,
+            &mut pos0_c as *mut _ as *mut c_void,
+            &mut kv_dim_c as *mut _ as *mut c_void,
+            &mut t_c as *mut _ as *mut c_void,
+            &mut group_c as *mut _ as *mut c_void,
+            &mut dh_c as *mut _ as *mut c_void,
+            &mut scale_c as *mut _ as *mut c_void,
+        ];
+        ok(unsafe {
+            ctx.launch_async(
+                ctx.f_attn_pf,
+                (heads as u32, n.div_ceil(ATTN_PF_BQ) as u32, 1),
+                (dh as u32, 1, 1),
+                (sh_f * 4) as u32,
+                &mut args,
+            )
+        })
+    })
+}
+
 /// P17g: バッチ decode 用 — セッションごとに `chain_attention` を起動し、
 /// 結果をホスト `att` [b, heads*dh] に集める。solo chain と同一カーネル・
 /// 同一入力 → 単独/バッチでビット一致を維持 (exactness 契約 P6)。
@@ -2035,6 +2170,144 @@ mod tests {
             .iter()
             .map(|v| 0.001 + v.abs() * 0.01)
             .collect()
+    }
+
+    /// P17j: prefill attention の CPU 参照 (model/llama.rs forward の prefill
+    /// 経路と同一コード: sgemm_scores_kvstrided + causal mask + softmax +
+    /// matmul_rows_bstrided_par)。
+    fn prefill_attention_cpu(
+        q: &[f32],
+        kc: &[f32],
+        vc: &[f32],
+        heads: usize,
+        kv_heads: usize,
+        dh: usize,
+        n: usize,
+        pos0: usize,
+        t_total: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let kv_dim = kv_heads * dh;
+        let group = heads / kv_heads;
+        let mut att = vec![0.0f32; n * heads * dh];
+        for kvh in 0..kv_heads {
+            for g in 0..group {
+                let qh = kvh * group + g;
+                let mut scores = vec![0.0f32; n * t_total];
+                tensor::sgemm_scores_kvstrided(
+                    &q[qh * dh..],
+                    heads * dh,
+                    &kc[kvh * dh..],
+                    kv_dim,
+                    &mut scores,
+                    n,
+                    dh,
+                    t_total,
+                    scale,
+                );
+                for i in 0..n {
+                    let row = &mut scores[i * t_total..][..t_total];
+                    for j in (pos0 + i + 1)..t_total {
+                        row[j] = f32::NEG_INFINITY;
+                    }
+                    tensor::softmax(row);
+                }
+                let out =
+                    tensor::matmul_rows_bstrided_par(&scores, &vc[kvh * dh..], kv_dim, n, t_total, dh);
+                for i in 0..n {
+                    att[i * heads * dh + qh * dh..][..dh].copy_from_slice(&out[i * dh..][..dh]);
+                }
+            }
+        }
+        att
+    }
+
+    /// P17j: prefill attention カーネル (dno_attention_prefill) が CPU 参照経路と
+    /// **近似一致**すること (exactness 契約は attention のみ緩和・ユーザー承認)。
+    /// 加えて ①決定論 (同一入力の 2 回起動でビット一致) ②causal (未来の K/V を
+    /// 書き換えても過去行の出力はビット不変) を検証する。
+    #[test]
+    #[ignore] // GPU が必要: cargo test --release --features cuda -- --ignored
+    fn cuda_attention_prefill_vs_cpu_reference() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let (heads, kv_heads, dh) = (12usize, 2usize, 128usize);
+        let group = heads / kv_heads;
+        let kv_dim = kv_heads * dh;
+        let (pos0, n) = (5usize, 37usize); // BQ/BK タイル境界をまたぐ
+        let t_total = pos0 + n;
+        let scale = 1.0 / (dh as f32).sqrt();
+        let q = pseudo_random(n * heads * dh, 11);
+        let kc = pseudo_random(t_total * kv_dim, 12);
+        let vc = pseudo_random(t_total * kv_dim, 13);
+
+        let att_ref =
+            prefill_attention_cpu(&q, &kc, &vc, heads, kv_heads, dh, n, pos0, t_total, scale);
+
+        // GPU 実経路 (KvCache 生成 + ミラー同期 + カーネル起動 + D2H)
+        let run_gpu = |kc: &[f32], vc: &[f32]| -> Vec<f32> {
+            let mut cache = crate::kv_cache::KvCache::new(1, kv_dim, t_total + 64);
+            {
+                let (kbuf, vbuf) = cache.kv_bufs(0, t_total);
+                kbuf[..t_total * kv_dim].copy_from_slice(kc);
+                vbuf[..t_total * kv_dim].copy_from_slice(vc);
+            }
+            assert!(
+                chain_attention_prefill(
+                    cache.kv_id(),
+                    0,
+                    1,
+                    &q,
+                    &cache,
+                    pos0,
+                    n,
+                    t_total,
+                    group,
+                    dh,
+                    kv_dim,
+                    scale,
+                )
+                .is_some(),
+                "prefill attention kernel が発動すべき (dh={dh})"
+            );
+            chain_download(CH_ATT, n * heads * dh).unwrap()
+        };
+
+        let got = run_gpu(&kc, &vc);
+        let maxd = got
+            .iter()
+            .zip(att_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("prefill attention maxabs diff vs cpu: {maxd}");
+        assert!(maxd < 1e-3, "prefill attention maxabs diff {maxd}");
+
+        // 決定論: 同一入力の 2 回目はビット一致
+        let got2 = run_gpu(&kc, &vc);
+        assert_eq!(got, got2, "prefill attention が非決定論的");
+
+        // causal: 未来の行 (j > pos0 + i) を書き換えても過去行の出力はビット不変
+        let mut kc2 = kc.clone();
+        let mut vc2 = vc.clone();
+        for j in (pos0 + 3)..t_total {
+            let seed = 99 + j as u32;
+            kc2[j * kv_dim..(j + 1) * kv_dim].copy_from_slice(&pseudo_random(kv_dim, seed));
+            vc2[j * kv_dim..(j + 1) * kv_dim].copy_from_slice(&pseudo_random(kv_dim, seed + 1000));
+        }
+        let got3 = run_gpu(&kc2, &vc2);
+        // 行 0..2 の causal 界 (j <= pos0+i) は変更範囲 (j >= pos0+3) の外 → ビット一致
+        for i in 0..3usize {
+            let a = &got[i * heads * dh..][..heads * dh];
+            let b = &got3[i * heads * dh..][..heads * dh];
+            assert_eq!(
+                a, b,
+                "causal 違反: row {i} が未来の K/V 変更の影響を受けた"
+            );
+        }
+        // 行 3 は causal 界 (j <= pos0+3) が変更範囲に含まれる → 変わるはず
+        let a = &got[3 * heads * dh..][..heads * dh];
+        let b = &got3[3 * heads * dh..][..heads * dh];
+        assert_ne!(a, b, "row 3 が未来の K/V 変更に反応していない (テスト無効)");
     }
 
     /// GPU の量子化が CPU (`tensor::quantize_row_i8`) とビット一致するか
@@ -2508,7 +2781,8 @@ mod tests {
     #[test]
     #[ignore]
     fn cuda_chain_elem_bit_exact_vs_cpu() {
-        CudaCtx::new().unwrap();
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ctx = CudaCtx::new().unwrap();
         let (cols, m) = (1536usize, 4usize);
         let w = pseudo_random(cols, 201);
         // 1) 単純 rmsnorm
@@ -2525,6 +2799,11 @@ mod tests {
         // 2) residual add + rmsnorm
         let proj = pseudo_random(cols * m, 202);
         chain_upload(CH_X, &x, cols, m).unwrap();
+        // P17j: 連続する chain_upload は pinned (pin_x) を共有するため間に sync
+        // が必須 (DMA 完了前の pinned 上書き競合 → CH_X が化ける。本番経路は
+        // upload 間に download 同期が挟まるため問題にならないが、このテストは
+        // sync 無しの 2 連続 upload で競合し並列実行時にフレームしていた)。
+        ctx.sync().unwrap();
         chain_upload(CH_O, &proj, cols, m).unwrap();
         chain_rmsnorm(&w, 1e-6, Some(CH_O), CH_H, cols, m, 1).unwrap();
         let got = chain_download(CH_H, cols * m).unwrap();
@@ -2566,6 +2845,7 @@ mod tests {
     #[test]
     #[ignore]
     fn cuda_decode_chain_bit_exact_vs_cpu() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         CudaCtx::new().unwrap();
         let (e, qn, kvn, ff) = (96usize, 40usize, 24usize, 64usize);
         let qkv_n = qn + 2 * kvn;
@@ -2637,6 +2917,7 @@ mod tests {
     #[test]
     #[ignore]
     fn cuda_attention_kernel_vs_cpu_close() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::cuda::enable_for_tests();
         CudaCtx::new().unwrap();
         let (kv_heads, group, dh) = (2usize, 6usize, 128usize);
