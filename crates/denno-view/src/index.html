@@ -428,6 +428,10 @@ const CODE = [
   ["c7",  "", null, null],
   ["c8",  "// denno-engine: one step", null, null],
   ["c9",  "fn step_chat(sess) -> Step {", null, null],
+  ["p1",  "  if (!sess.prefill_done) {   // prefill: whole prompt in one forward", null, null],
+  ["p2",  "    sess.logits = forward(&sess.prompt[..]);  // KV pos 0..N written in bulk", null, null],
+  ["p3",  "    sess.prefill_done = true; return Ok(false);", null, null],
+  ["p4",  "  }", null, null],
   ["c10", "  let mut x = embed(last_token);", 0, null],
   ["c11", "  for (li, layer) in layers {", "loop", "watch"],
   ["c12", "    let h = rmsnorm(&x);   // attn in", 1, "attn"],
@@ -491,6 +495,9 @@ const REAL_ANCHORS = {  // pseudo id → 実ソース行のアンカー (擬似�
   c4:  ["scheduler", /step_chat_batch\(&mut sess_refs/],
   c5:  ["scheduler", /content_block_delta/],
   c9:  ["engine", /pub fn step_chat\(/],
+  p1:  ["engine", /if !sess\.prefill_done/],
+  p2:  ["engine", /forward\(&sess\.prompt_ids/],
+  p3:  ["engine", /prefill_done = true/],
   c10: ["llama", /prof::EMBED/],
   c11: ["llama", /for \(li, layer\)/],
   c12: ["llama", /ln1_w/],
@@ -807,9 +814,15 @@ function handleFrame(f) {
       // プロンプトの列が上から降りて embed に入る (文字表示つきチップ)
       fallTokens(f.tokens, "op-embed");
       setInputTokens(f.tokens);
+      // prefill 分岐: p1 → p2 (forward 一括実行・KV へ一括書き込み) → カスケード → p3
+      codeGo("p1");
       lit($("lump-embed"), "lit", 900);
-      codeGo("c10");
       lit($("op-embed"), "litwarm", 900);
+      setTimeout(() => {
+        codeGo("p2");
+        const p2el = $(modeId("p2"));
+        if (p2el) flyLine(p2el, $("kvslots"), "#3fb950");   // プロンプト全体の K/V を一括書き込み
+      }, 120 / speed);
       // prefill の forward 全層をすばやく通過演出 (層パネルが上から下へ流れる)
       for (let i = 0; i < nLayers; i++) {
         setTimeout(() => {
@@ -817,6 +830,7 @@ function handleFrame(f) {
           if (i > 0) $("layer-" + (i - 1))?.classList.add("pass");
         }, (120 + i * (900 / Math.max(1, nLayers))) / speed);
       }
+      setTimeout(() => codeGo("p3"), 1140 / speed);   // prefill 完了 → return
       $("val-x").textContent = `${f.prompt_tokens} tok (prefill ${Math.floor(f.ns / 1e6)} ms)`;
       lit($("var-x"));
       f._dur = 1140 / speed;   // prefill カスケード分だけ次のフレームを待つ
