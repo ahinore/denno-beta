@@ -277,6 +277,8 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - [ ] **GitHub push自動化**: deploy key登録後にコンテナから直接push
 - [ ] tool use(Anthropic APIのtoolsパラメータ対応)
 - [ ] Llama系バリアント(GQA無しモデル、RoPEスケーリング)
+- [ ] **他ファミリー対応**: Qwen3(QK-Norm化+thinking/non-thinkingモード切替+MoE派生)、DeepSeekシリーズ(MoE+共有エキスパート)、GLMシリーズ、gpt-oss(attention sink+sliding window+MXFP4)
+- [ ] **各モデル独自機構の可視化**: MoEルーティング(トークンごとに発火したエキスパート+ルータ確率の表示)、MLAの潜在圧縮KV(通常MHAとのキャッシュサイズ比較)、attention sink(先頭トークンへの注目集中)、sliding windowの帯パターン(attentionマスクの可視化)、thinkingモードのトークン流れ
 - [ ] sliding window attention(長コンテキストのKVメモリ削減)
 - [ ] マルチモデル同時 serve(1プロセスで複数モデル)
 

@@ -278,6 +278,8 @@ pie showData title P9 fp32 batch (4x256) per-op time
 - [ ] **GitHub push automation**: direct container push after deploy key registration
 - [ ] tool use (Anthropic API tools parameter)
 - [ ] Llama-family variants (models without GQA, RoPE scaling)
+- [ ] **Other model families**: Qwen3 (QK-Norm + thinking/non-thinking mode switch + MoE variants), DeepSeek series (MoE + shared experts), GLM series, gpt-oss (attention sink + sliding window + MXFP4)
+- [ ] **Visualizing each family's unique mechanisms**: MoE routing (which experts fired per token + router probabilities), MLA latent-compressed KV (cache-size comparison vs regular MHA), attention sink (attention concentrating on the first token), sliding-window band pattern (attention mask visualization), thinking-mode token flow
 - [ ] sliding window attention (long-context KV memory reduction)
 - [ ] multi-model serving (several models in one process)
 
