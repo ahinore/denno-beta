@@ -218,3 +218,53 @@ extern "C" __global__ void dno_attention(
     }
     att[(size_t)h * dh + threadIdx.x] = acc * inv;
 }
+
+// P17h: decode 用 qkv rope (qkv bias 対応)。CPU tensor::rope_row とビット一致
+// させるため cos/sin はホスト (同一プロセスの glibc sinf/cosf) で計算した
+// テーブルを渡し、演算は -fmad=false の mul.rn/add.rn/sub.rn (Rust のスカラー
+// 演算と同一の丸め) を使う。bias 加算は rope の前 (CPU 経路と同一順)。
+// grid = (heads + 2*kv_heads), block = (dh), shared なし。
+//   block b < heads             : q ヘッド b — bias 加算 + rope
+//   heads <= b < heads+kv_heads : k ヘッド    — bias 加算 + rope
+//   heads+kv_heads <= b         : v ヘッド    — bias 加算のみ
+// bias は [qb(heads*dh) | kb(kv_dim) | vb(kv_dim)] 連結の 1 バッファ (無ければ NULL)。
+// tab は [cos(half) | sin(half)] (half = dh/2)。
+extern "C" __global__ void dno_rope_qkv(float *qkv, const float *tab, const float *bias,
+                                        int heads, int kv_heads, int dh) {
+    const int half = dh / 2;
+    const int b = blockIdx.x;
+    if (b < heads + kv_heads) {
+        float *dst;
+        const float *bl;
+        if (b < heads) {
+            dst = qkv + (size_t)b * dh;
+            bl = bias ? bias + (size_t)b * dh : nullptr;
+        } else {
+            const int kh = b - heads;
+            dst = qkv + (size_t)heads * dh + (size_t)kh * dh;
+            bl = bias ? bias + (size_t)heads * dh + (size_t)kh * dh : nullptr;
+        }
+        if (threadIdx.x < half) {
+            const int d = threadIdx.x;
+            const float c = tab[d];
+            const float s = tab[half + d];
+            float x1 = dst[d];
+            float x2 = dst[half + d];
+            if (bl) {
+                x1 += bl[d];
+                x2 += bl[half + d];
+            }
+            dst[d] = x1 * c - x2 * s;
+            dst[half + d] = x1 * s + x2 * c;
+        }
+    } else {
+        const int vh = b - heads - kv_heads;
+        float *dst = qkv + (size_t)(heads + kv_heads) * dh + (size_t)vh * dh;
+        const float *bl = bias ? bias + (size_t)(heads + kv_heads) * dh + (size_t)vh * dh
+                               : nullptr;
+        const int d = threadIdx.x;
+        float x = dst[d];
+        if (bl) x += bl[d];
+        dst[d] = x;
+    }
+}
