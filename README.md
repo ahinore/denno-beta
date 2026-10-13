@@ -69,3 +69,7 @@ VIEW_TOKENIZER=~/.cache/denno/hub/models--Qwen--Qwen2.5-0.5B-Instruct/tokenizer.
 - [Architecture (English)](docs/ARCHITECTURE.en.md) / [アーキテクチャ解説(日本語)](docs/ARCHITECTURE.ja.md) — design principles, inference flow, KV cache, compute kernels, model differences, visualization architecture, usage
 - [Development History (English)](docs/HISTORY.en.md) / [開発履歴(日本語)](docs/HISTORY.ja.md) — implementation records P1–P14, measurement data, lessons learned
 - [API spec](docs/api.md)
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
