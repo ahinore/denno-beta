@@ -149,3 +149,72 @@ extern "C" __global__ void dno_expf_probe(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) out[i] = dno_expf(in[i]);
 }
+
+// ---------------------------------------------------------------------------
+// P17g: decode attention (GQA) — exactness 契約は attention のみ緩和 (ユーザー承認)。
+// 線形層 (int8) / expf / swiglu / rmsnorm のビット一致契約は変更しない。
+//
+// grid = (heads, 1, 1), block = (dh, 1, 1) (dh <= 1024), shared = dh * 4 bytes。
+// block h が q ヘッド h の scores/softmax/probs@V を担当する。
+//   kvh = h / group, kh_off = kvh * dh
+//   scores[j] = q[h] · K[j, kh_off..] * scale   (j = 0..t_total)
+//   att[h,i]  = Σ_j softmax(scores)[j] * V[j, kh_off + i]
+// K/V は GPU 側 KV ミラー ([t_total, kv_dim] 行-major、ホスト KvCache と同一内容)。
+// softmax の exp は dno_expf (glibc 再現) を使い CPU との差を最小化する
+// (ビット一致は要求しない — 累積順が異なるため)。
+extern "C" __global__ void dno_attention(
+    const float *__restrict__ q,     // [heads * dh]
+    const float *__restrict__ kc,    // [t_total, kv_dim]
+    const float *__restrict__ vc,    // [t_total, kv_dim]
+    float *__restrict__ att,         // [heads * dh]
+    float *__restrict__ scores,      // scratch [heads * t_total]
+    int kv_dim, int t_total, int group, int dh, float scale) {
+    extern __shared__ float sh[];
+    int h = blockIdx.x;
+    int kvh = h / group;
+    int kh_off = kvh * dh;
+    const float *qg = q + (size_t)h * dh;
+    float *sg = scores + (size_t)h * t_total;
+
+    // phase 1: scores + max (スレッド間で t をストライド分担)
+    float mx = -INFINITY;
+    for (int j = threadIdx.x; j < t_total; j += blockDim.x) {
+        const float *krow = kc + (size_t)j * kv_dim + kh_off;
+        float s = 0.0f;
+        for (int i = 0; i < dh; ++i) s = fmaf(qg[i], krow[i], s);
+        s *= scale;
+        sg[j] = s;
+        mx = fmaxf(mx, s);
+    }
+    sh[threadIdx.x] = mx;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + off]);
+        __syncthreads();
+    }
+    mx = sh[0];
+
+    // phase 2: exp + sum (block 足し合わせ)
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < t_total; j += blockDim.x) {
+        float e = dno_expf(sg[j] - mx);
+        sg[j] = e;
+        sum += e;
+    }
+    sh[threadIdx.x] = sum;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) sh[threadIdx.x] += sh[threadIdx.x + off];
+        __syncthreads();
+    }
+    float inv = 1.0f / sh[0];
+
+    // phase 3: att[h, threadIdx.x] = inv * Σ_j p[j] * V[j, kh_off + threadIdx.x]
+    // 各反復でスレッド列が V の 1 行 (dh 連続要素) を coalesced 読み。
+    // p[j] (sg[j]) は全スレッドが同じアドレスを読むので broadcast。
+    float acc = 0.0f;
+    for (int j = 0; j < t_total; ++j) {
+        acc = fmaf(sg[j], vc[(size_t)j * kv_dim + kh_off + threadIdx.x], acc);
+    }
+    att[(size_t)h * dh + threadIdx.x] = acc * inv;
+}

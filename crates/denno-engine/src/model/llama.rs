@@ -303,6 +303,36 @@ fn attention_decode_kvhead(
 // advance は最後に 1 回なので途中失敗でも安全にやり直せる)。
 #[cfg(feature = "cuda")]
 impl LlamaQwen2 {
+    /// P17g: solo decode chain と batch GPU attention の共通適合条件。
+    /// bias / QK-Norm / fp32 混在モデルは solo chain を使えないため、
+    /// solo chain (forward_decode_gpu) が使える構造か (lm_head 有・全層 bias 無し・
+    /// QK-Norm 無し・全線形 int8)。GPU attention 自体はこの条件に依存しない
+    /// (加算済み q/k/v を受けるだけで bias/QK-Norm と無関係・forward/forward_batch
+    /// の両経路で個別に試行する)。batch も GPU attention を使うが、solo と同一
+    /// カーネル・同一入力なので単独/バッチのビット一致 (P6 契約) は維持される。
+    fn chain_compatible(&self) -> bool {
+        if self.lm_head.is_none() {
+            return false;
+        }
+        for layer in &self.layers {
+            if layer.q_b.is_some() || layer.k_b.is_some() || layer.v_b.is_some() {
+                return false;
+            }
+            if layer.q_norm_w.is_some() || layer.k_norm_w.is_some() {
+                return false; // Qwen3 QK-Norm は従来経路
+            }
+            for w in [
+                &layer.q_w, &layer.k_w, &layer.v_w, &layer.o_w, &layer.gate_w, &layer.up_w,
+                &layer.down_w,
+            ] {
+                if w.quant8().is_none() {
+                    return false; // 一部 fp32 → 従来経路
+                }
+            }
+        }
+        self.lm_head.as_ref().unwrap().quant8().is_some()
+    }
+
     fn forward_decode_gpu(
         &mut self,
         token: u32,
@@ -321,33 +351,13 @@ impl LlamaQwen2 {
         let group = heads / kv_heads; // GQA group size
 
         // 非対応構造は従来経路へ
-        if self.lm_head.is_none() {
-            return None;
-        }
-        for layer in &self.layers {
-            if layer.q_b.is_some() || layer.k_b.is_some() || layer.v_b.is_some() {
-                return None;
-            }
-            if layer.q_norm_w.is_some() || layer.k_norm_w.is_some() {
-                return None; // Qwen3 QK-Norm は従来経路
-            }
-            for w in [
-                &layer.q_w, &layer.k_w, &layer.v_w, &layer.o_w, &layer.gate_w, &layer.up_w,
-                &layer.down_w,
-            ] {
-                if w.quant8().is_none() {
-                    return None; // 一部 fp32 → 従来経路
-                }
-            }
-        }
-        if self.lm_head.as_ref().unwrap().quant8().is_none() {
+        if !self.chain_compatible() {
             return None;
         }
 
         // 埋め込み 1 行をアップロード (residual stream 常駐開始)
         chain_upload(CH_X, &self.embed[token as usize * e..][..e], e, 1)?;
         let mut pending: Option<usize> = None;
-        let mut att = vec![0.0f32; heads * dh];
 
         for (li, layer) in self.layers.iter().enumerate() {
             crate::telemetry_layer_begin(li as u16);
@@ -368,7 +378,7 @@ impl LlamaQwen2 {
                     ))
                 })?;
 
-            // --- rope / KV 書き込み / attention (CPU — 従来経路と同一の演算列) ---
+            // --- rope / KV 書き込み (CPU — ホスト KvCache が常に正) ---
             crate::prof::time_layer(crate::prof::ROPE, li, || {
                 rope_rows(&mut q, 1, heads, dh, pos0, self.theta);
                 rope_rows(&mut k, 1, kv_heads, dh, pos0, self.theta);
@@ -378,21 +388,41 @@ impl LlamaQwen2 {
                 kc[pos0 * kv_dim..][..kv_dim].copy_from_slice(&k);
                 vc[pos0 * kv_dim..][..kv_dim].copy_from_slice(&v);
             }
-            crate::prof::time_layer(crate::prof::ATTN, li, || {
-                let (kc, vc) = cache.kv_bufs_ref(li);
-                let t_total = pos0 + 1;
-                let scale = 1.0 / (dh as f32).sqrt();
-                for kvh in 0..kv_heads {
-                    let a = attention_decode_kvhead(
-                        &q, kc, vc, kvh, group, dh, kv_dim, t_total, scale,
-                    );
-                    att[kvh * group * dh..][..group * dh].copy_from_slice(&a);
-                }
-            });
+            // --- attention (P17g: GPU カーネル + KV ミラー。無効/失敗時は CPU
+            //     attention → forward 全体を従来経路でやり直し)。exactness 契約は
+            //     attention のみ緩和 (ユーザー承認) — 線形層/expf/swiglu/rmsnorm は
+            //     ビット一致維持。
+            let t_total = pos0 + 1;
+            let scale = 1.0 / (dh as f32).sqrt();
+            if crate::cuda::chain_attention(
+                cache.kv_id(),
+                li,
+                self.layers.len(),
+                &q,
+                cache,
+                t_total,
+                group,
+                dh,
+                kv_dim,
+                scale,
+            )
+            .is_none()
+            {
+                let mut att = vec![0.0f32; heads * dh];
+                crate::prof::time_layer(crate::prof::ATTN, li, || {
+                    let (kc, vc) = cache.kv_bufs_ref(li);
+                    for kvh in 0..kv_heads {
+                        let a = attention_decode_kvhead(
+                            &q, kc, vc, kvh, group, dh, kv_dim, t_total, scale,
+                        );
+                        att[kvh * group * dh..][..group * dh].copy_from_slice(&a);
+                    }
+                });
+                chain_upload(CH_ATT, &att, heads * dh, 1)?;
+            }
 
             // --- o_proj → residual+rmsnorm → gate/up → swiglu → down (全てデバイス内) ---
             crate::prof::time_layer(crate::prof::OPROJ, li, || -> Option<()> {
-                chain_upload(CH_ATT, &att, heads * dh, 1)?;
                 let ow = layer.o_w.quant8()?;
                 chain_linear_grouped(&[ow], CH_ATT, CH_O, 1)
             })?;
@@ -527,8 +557,35 @@ impl Model for LlamaQwen2 {
                 let t_total = pos0 + n;
                 let scale = 1.0 / (dh as f32).sqrt();
                 if n == 1 {
-                    // decode: P12 統一経路 (forward_batch と同一関数
-                    // `attention_decode_kvhead` → 単独/バッチ decode でビット一致)
+                    // decode: P17g GPU attention を先に試行 (forward_batch と同一
+                    // カーネル・同一ミラー内容 → 単独/バッチでビット一致)。bias /
+                    // QK-Norm は q/k/v の加算済み値に影響するだけで attention 自体と
+                    // 無関係 → chain_compatible に依存させない。失敗時は CPU 経路
+                    // (P12 統一経路、forward_batch と同一関数 → ビット一致)。
+                    #[cfg(feature = "cuda")]
+                    {
+                        if crate::cuda::chain_attention(
+                            cache.kv_id(),
+                            li,
+                            self.layers.len(),
+                            &q,
+                            cache,
+                            t_total,
+                            group,
+                            dh,
+                            kv_dim,
+                            scale,
+                        )
+                        .is_some()
+                        {
+                            if let Some(av) =
+                                crate::cuda::chain_download(crate::cuda::CH_ATT, heads * dh)
+                            {
+                                att[..heads * dh].copy_from_slice(&av);
+                                return;
+                            }
+                        }
+                    }
                     for kvh in 0..kv_heads {
                         let a =
                             attention_decode_kvhead(&q, kc, vc, kvh, group, dh, kv_dim, t_total, scale);
@@ -646,6 +703,11 @@ impl Model for LlamaQwen2 {
 
         let lin_b = |a: &[f32], w: &Linear, m: usize| w.apply_batch_bt(a, m);
 
+        // P6 契約 (単独/バッチのビット一致): GPU attention は solo と batch で
+        // 同一カーネル・同一入力 (加算済み q/k/v) を使うため bit 一致する。
+        // 注意: batch の GPU attention は chain_compatible (solo chain の条件) に
+        // 依存しない (加算済み q/k/v を受けるだけで bias/QK-Norm と無関係)。
+
         // --- embed (セッションごとに lookup、行間の相互作用なし) ---
         let mut x = vec![0.0f32; b * e];
         crate::prof::time(crate::prof::EMBED, || {
@@ -732,9 +794,34 @@ impl Model for LlamaQwen2 {
             // forward() の decode (n==1) 経路と同一関数・同一演算列 → ビット一致。
             // (P12: probs@V は行統合+ストライド直接参照、スクラッチ再利用 —
             //  数値は従来の per-(kvh,g) m=1 経路とビット一致、テスト担保)
+            //
+            // P17g: GPU attention (solo と同一カーネル・同一ミラー内容 → 単独/バッチで
+            // ビット一致を維持)。全セッション成功時のみ採用 — 1 つでも失敗すれば
+            // 全セッションを CPU attention でやり直す (混合防止)。
+            // 注意: GPU attention は加算済み q/k/v を受けるだけで bias/QK-Norm と
+            // 無関係 → chain_compatible (solo chain の条件) に依存させない。
             let mut att = vec![0.0f32; b * heads * dh];
             crate::prof::time_layer(crate::prof::ATTN, li, || {
                 let scale = 1.0 / (dh as f32).sqrt();
+                #[cfg(feature = "cuda")]
+                {
+                    let cache_refs: Vec<&crate::kv_cache::KvCache> =
+                        caches.iter().map(|c| &**c).collect();
+                    if crate::cuda::chain_attention_batch(
+                        li,
+                        self.layers.len(),
+                        &q,
+                        &cache_refs,
+                        heads,
+                        group,
+                        dh,
+                        kv_dim,
+                        scale,
+                        &mut att,
+                    ) {
+                        return;
+                    }
+                }
                 // 読み取り専用借用に切り替えて各セッションのキャッシュを共有
                 let cache_refs: Vec<&KvCache> = caches.iter().map(|c| &**c).collect();
                 let parts: Vec<(usize, usize, Vec<f32>)> = (0..b)
@@ -836,6 +923,17 @@ mod tests {
     /// `with_qk` = true で Qwen3 相当の QK-Norm 重みを持たせる。
     fn tiny(mode: QuantMode) -> LlamaQwen2 {
         tiny_opt(mode, false)
+    }
+
+    /// P17g テスト用: bias 無し tiny (solo decode chain 適合構造)
+    fn tiny_chain(mode: QuantMode) -> LlamaQwen2 {
+        let mut m = tiny(mode);
+        for layer in m.layers.iter_mut() {
+            layer.q_b = None;
+            layer.k_b = None;
+            layer.v_b = None;
+        }
+        m
     }
 
     fn tiny_opt(mode: QuantMode, with_qk: bool) -> LlamaQwen2 {
@@ -1095,6 +1193,53 @@ mod tests {
                 bat_logits[s] = outs[s].clone();
             }
         }
+    }
+
+    /// P17g: GPU attention 有効時の forward (solo decode chain) が CPU attention
+    /// (緩和無効時) と**近似一致**すること。exactness 契約は attention のみ緩和
+    /// (ユーザー承認) — greedy トークン列は一致、logits は微小差を許容。
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    #[ignore]
+    fn cuda_gpu_attention_forward_vs_cpu_close() {
+        crate::cuda::enable_for_tests();
+        let prompt = vec![5u32, 11, 23];
+        let steps = 8;
+
+        // CPU attention 参照 (GPU attention を無効化して chain 経路で実行 —
+        // chain の線形層/expf/swiglu/rmsnorm はビット一致済みなので
+        // 純粋な CPU forward と等価)
+        let prev = crate::cuda::set_gpu_attention_enabled(false);
+        let mut cpu_m = tiny_chain(QuantMode::Int8);
+        let mut cpu_cache = cpu_m.new_cache();
+        let mut ref_logits = cpu_m.forward(&prompt, &mut cpu_cache).unwrap();
+        let mut ref_seq = Vec::new();
+        let mut ref_hist: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..steps {
+            let t = argmax(&ref_logits);
+            ref_seq.push(t);
+            ref_logits = cpu_m.forward(&[t], &mut cpu_cache).unwrap();
+            ref_hist.push(ref_logits.clone());
+        }
+        crate::cuda::set_gpu_attention_enabled(true);
+
+        // GPU attention
+        let mut gpu_m = tiny_chain(QuantMode::Int8);
+        let mut gpu_cache = gpu_m.new_cache();
+        let mut logits = gpu_m.forward(&prompt, &mut gpu_cache).unwrap();
+        for (step, want_tok) in ref_seq.iter().enumerate() {
+            let t = argmax(&logits);
+            assert_eq!(t, *want_tok, "greedy token step={step}");
+            logits = gpu_m.forward(&[t], &mut gpu_cache).unwrap();
+            let maxd = logits
+                .iter()
+                .zip(ref_hist[step].iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(maxd < 0.05, "logits maxabs diff step={step}: {maxd}");
+        }
+        crate::cuda::set_gpu_attention_enabled(prev);
+        println!("gpu attention forward vs cpu close OK ({} steps)", steps);
     }
 
     #[test]
