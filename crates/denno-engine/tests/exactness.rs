@@ -111,7 +111,7 @@ fn qwen_exact_decoding_is_reproducible() {
 /// GPT-2 基準出力 (seed 42)。gpt2 は chat template を持たないので
 /// fallback テンプレートが使われる。基準文字列は参照実装
 /// (HF transformers fp32, greedy) の出力と一致することを検証済み
-/// (2026-10-12, dev-container コンテナ内 /tmp/gpt2_ref.py)。
+/// (2026-10-12, 開発コンテナ内の参照実装スクリプト)。
 /// GPT-2 base は fallback テンプレート付きプロンプトに対して入力を
 /// 繰り返す (エコー) のが素の貪欲生成の挙動。
 #[test]

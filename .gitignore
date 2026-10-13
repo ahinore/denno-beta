@@ -3,3 +3,6 @@
 models/
 __pycache__/
 .DS_Store
+vgcore*
+data/
+*.replay
