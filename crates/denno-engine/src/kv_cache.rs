@@ -17,7 +17,12 @@ pub struct KvCache {
     cap: usize,
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
+    /// GPU KV ミラー (P17g) のキー。プロセス内で一意 (Clone しないので衝突しない)
+    id: u64,
 }
+
+/// KvCache インスタンス ID 採番 (P17g: GPU KV ミラーのキー)
+static KV_ID_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl KvCache {
     pub fn new(n_layers: usize, kv_dim: usize, max_len: usize) -> Self {
@@ -29,7 +34,13 @@ impl KvCache {
             cap: 0,
             k: vec![Vec::new(); n_layers],
             v: vec![Vec::new(); n_layers],
+            id: KV_ID_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// GPU KV ミラーのキー (P17g)
+    pub fn kv_id(&self) -> u64 {
+        self.id
     }
 
     pub fn reset(&mut self) {

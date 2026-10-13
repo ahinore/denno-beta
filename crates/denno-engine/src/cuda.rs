@@ -231,6 +231,28 @@ impl DevBuffer {
         Ok(())
     }
 
+    /// 既存バッファのバイトオフセット位置へホストから上書きコピー (P17g: KV ミラー追記用)
+    pub fn copy_from_at<T: Copy>(&self, offset_bytes: usize, data: &[T]) -> Result<()> {
+        let bytes = std::mem::size_of_val(data);
+        assert!(
+            offset_bytes + bytes <= self.bytes,
+            "DevBuffer::copy_from_at: size overflow"
+        );
+        if bytes > 0 {
+            unsafe {
+                check(
+                    (lib()?.memcpy_htod)(
+                        self.ptr + offset_bytes as CUdeviceptr,
+                        data.as_ptr() as *const c_void,
+                        bytes,
+                    ),
+                    "cuMemcpyHtoD",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -270,6 +292,8 @@ pub struct CudaCtx {
     f_addnorm: CUfunction,
     #[allow(dead_code)]
     f_expf: CUfunction,
+    // P17g: decode attention (exactness 緩和・ユーザー承認)
+    f_attn: CUfunction,
 }
 
 const PTX: &[u8] = include_bytes!("../kernels/kernels_int8.ptx");
@@ -355,6 +379,11 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_expf, module_elem, b"dno_expf_probe\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_expf_probe)",
             )?;
+            let mut f_attn: CUfunction = std::ptr::null_mut();
+            check(
+                (lib.module_get_function)(&mut f_attn, module_elem, b"dno_attention\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_attention)",
+            )?;
 
             Ok(Self {
                 device: dev,
@@ -369,6 +398,7 @@ impl CudaCtx {
                 f_swiglu,
                 f_addnorm,
                 f_expf,
+                f_attn,
             })
         }
     }
@@ -936,6 +966,8 @@ struct ChainScratch {
     w_toggle: bool,         // pin_w0/pin_w1 を呼び出しごとに交互に使う
     pin_dn: Option<PinMem>, // ダウンロード用
     aq: Option<DevBuffer>,  // int8 カーネル用スクラッチ (chain 専用)
+    attn_q: Option<DevBuffer>,  // P17g: attention q アップロード用
+    attn_sc: Option<DevBuffer>, // P17g: attention scores スクラッチ [heads*t_total]
 }
 
 thread_local! {
@@ -947,6 +979,8 @@ thread_local! {
         w_toggle: false,
         pin_dn: None,
         aq: None,
+        attn_q: None,
+        attn_sc: None,
     });
 }
 
@@ -1179,6 +1213,271 @@ pub fn chain_swiglu(ga_slot: usize, act_slot: usize, ff: usize, m: usize) -> Opt
         let grid = ((m * ff) as u32).div_ceil(256);
         ok(unsafe { ctx.launch_async(ctx.f_swiglu, (grid, 1, 1), (256, 1, 1), 0, &mut args) })
     })
+}
+
+// ---------------------------------------------------------------------------
+// P17g: GPU KV ミラー + decode attention (exactness 緩和・ユーザー承認)。
+//
+// ホスト KvCache は CPU 経路・snapshot/prefix cache の正として残し、decode
+// chain で使う K/V のコピーをデバイス側に保持する (per-session ミラー)。
+// ミラーはホストキャッシュの行 [0..len) と常に同一内容に保たれる
+// (不足行は次回の chain_attention で一括 H2D)。ミラー破損/ロールバック/
+// エビクト時も len 比較で自動再シードされるため、ホストが正・ミラーは従。
+// メモリ上限 `DENNO_GPU_KV_MB` (既定 8192MB) を超えると LRU でエビクト
+// (必要時に再シード)。
+//
+// 注意: attention のみ exactness 契約が緩和されている (CPU と GPU で累積順が
+// 異なり出力ビットは一致しない)。線形層 (int8) / expf / swiglu / rmsnorm は
+// 従来どおりビット一致。`DENNO_GPU_ATTN=0` で無効化 (CPU attention・
+// ビット一致経路に戻る)。
+
+/// GPU attention の有効フラグ (既定 ON・`DENNO_GPU_ATTN=0` で無効)。
+/// テストから差し替え可能にするため AtomicBool。
+static GPU_ATTN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static GPU_ATTN_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+fn gpu_attention_enabled() -> bool {
+    GPU_ATTN_INIT.get_or_init(|| {
+        if std::env::var("DENNO_GPU_ATTN").ok().as_deref() == Some("0") {
+            GPU_ATTN.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    GPU_ATTN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// テスト用: GPU attention の ON/OFF を直接差し替える (戻り値は設定前の値)
+#[doc(hidden)]
+pub fn set_gpu_attention_enabled(on: bool) -> bool {
+    GPU_ATTN_INIT.get_or_init(|| {});
+    GPU_ATTN.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+struct KvMirror {
+    /// (k, v) デバイスバッファ per layer。各 [cap, kv_dim] f32
+    layers: Vec<(Option<DevBuffer>, Option<DevBuffer>)>,
+    cap: usize,
+    /// layer ごとにミラー済みの行数 (ホスト cache.len() との差分を H2D する)
+    len: Vec<usize>,
+}
+
+impl KvMirror {
+    fn bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|(k, v)| {
+                k.as_ref().map(|b| b.bytes()).unwrap_or(0)
+                    + v.as_ref().map(|b| b.bytes()).unwrap_or(0)
+            })
+            .sum()
+    }
+}
+
+static KV_MIRRORS: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, KvMirror, std::time::Instant)>>> =
+    std::sync::OnceLock::new();
+
+fn gpu_kv_limit_bytes() -> usize {
+    std::env::var("DENNO_GPU_KV_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8192)
+        * 1024
+        * 1024
+}
+
+fn kv_mirror_cap(t_total: usize, old_cap: usize) -> usize {
+    // 倍々成長 (ホスト KvCache と同じ方針)。下限 1024 行
+    (old_cap.max(1024) * 2).max(t_total.next_power_of_two())
+}
+
+/// decode chain 用 GPU attention。q (CPU 側で rope 済み [heads*dh]) と
+/// ホスト KvCache (現在レイヤの行は呼び出し側が書き込み済み) を受け取り、
+/// ミラーを同期して attention カーネルを起動し、結果を CH_ATT に書く。
+/// 戻り None = CPU attention にフォールバック (forward 全体を従来経路で再実行)。
+#[allow(clippy::too_many_arguments)]
+pub fn chain_attention(
+    key: u64,
+    li: usize,
+    n_layers: usize,
+    q: &[f32],
+    cache: &crate::kv_cache::KvCache,
+    t_total: usize,
+    group: usize,
+    dh: usize,
+    kv_dim: usize,
+    scale: f32,
+) -> Option<()> {
+    if !gpu_attention_enabled() {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+    let heads = q.len() / dh;
+    if heads == 0 || group == 0 || dh == 0 || dh > 1024 || t_total == 0 || t_total > cache.max_len()
+    {
+        return None;
+    }
+    let mut kv_dim_c = kv_dim as c_int;
+    let mut t_c = t_total as c_int;
+    let mut group_c = group as c_int;
+    let mut dh_c = dh as c_int;
+
+    // CH_ATT は後続の o_proj 入力そのもの (chain_upload を省略)
+    ok(chain_ensure_buf(CH_ATT, heads * dh * 4))?;
+
+    // ミラーの取得/生成 + レイヤ li の同期。ポインタはロック解放前に抽出する。
+    let (mut kptr, mut vptr) = {
+        let mirrors = KV_MIRRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        let mut ms = ok(mirrors.lock().map_err(|e| anyhow::anyhow!("{e}")))?;
+        let now = std::time::Instant::now();
+        let idx = match ms.iter().position(|(k, _, _)| *k == key) {
+            Some(i) => {
+                ms[i].2 = now;
+                i
+            }
+            None => {
+                ms.push((
+                    key,
+                    KvMirror {
+                        layers: (0..n_layers).map(|_| (None, None)).collect(),
+                        cap: 0,
+                        len: vec![0; n_layers],
+                    },
+                    now,
+                ));
+                ms.len() - 1
+            }
+        };
+        // エビクト: 上限超過で LRU (自分は除外)
+        let limit = gpu_kv_limit_bytes();
+        let mut total: usize = ms.iter().map(|(_, m, _)| m.bytes()).sum();
+        while total > limit && ms.len() > 1 {
+            let vic = (0..ms.len())
+                .filter(|&i| ms[i].0 != key)
+                .min_by_key(|&i| ms[i].2)
+                .unwrap();
+            total -= ms[vic].1.bytes();
+            ms.swap_remove(vic);
+            // swap_remove で index がずれ得る — 自分の位置を探し直す
+        }
+        let idx = ms.iter().position(|(k, _, _)| *k == key)?;
+        let m = &mut ms[idx].1;
+        if li >= m.layers.len() {
+            return None; // n_layers 不一致 (起こらないはず)
+        }
+        // cap 成長 (全レイヤ realloc + len リセット → 各レイヤ次回使用時に再シード)
+        if m.cap < t_total {
+            let newcap = kv_mirror_cap(t_total, m.cap);
+            let bytes = newcap * kv_dim * 4;
+            for l in m.layers.iter_mut() {
+                l.0 = None;
+                l.1 = None;
+                ok(Scratch::ensure(&mut l.0, bytes))?;
+                ok(Scratch::ensure(&mut l.1, bytes))?;
+            }
+            m.cap = newcap;
+            m.len.iter_mut().for_each(|l| *l = 0);
+        }
+        // 行同期: ミラーが持っている [0..have) とホストの [0..t_total) を突き合わせ。
+        // ホストの行 pos0 は呼び出し側が既に書き込み済み (cache.advance は forward
+        // の最後なので cache.len() はまだ進んでいない — t_total を正として使う)。
+        // ロールバック (restore/reset) で have > t_total になったら全再シード。
+        let (kc_ref, vc_ref) = cache.kv_bufs_ref(li);
+        let have = if m.len[li] > t_total { 0 } else { m.len[li] };
+        if have < t_total {
+            let kb = m.layers[li].0.as_ref().unwrap();
+            let vb = m.layers[li].1.as_ref().unwrap();
+            ok(kb.copy_from_at(have * kv_dim * 4, &kc_ref[have * kv_dim..t_total * kv_dim]))?;
+            ok(vb.copy_from_at(have * kv_dim * 4, &vc_ref[have * kv_dim..t_total * kv_dim]))?;
+        }
+        m.len[li] = t_total;
+        (
+            m.layers[li].0.as_ref().unwrap().ptr(),
+            m.layers[li].1.as_ref().unwrap().ptr(),
+        )
+    };
+
+    // q / scores スクラッチ (スレッドローカル — chain は 1 スレッド 1 セッション)
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure(&mut s.attn_q, q.len() * 4))?;
+        ok(Scratch::ensure(&mut s.attn_sc, heads * t_total * 4))?;
+        ok(s.attn_q.as_ref().unwrap().copy_from(q))?;
+        let mut qptr = s.attn_q.as_ref().unwrap().ptr();
+        let mut scptr = s.attn_sc.as_ref().unwrap().ptr();
+        let mut aptr = s.bufs[CH_ATT].as_ref().unwrap().ptr();
+        let mut scale_c = scale;
+        let mut args: Vec<*mut c_void> = vec![
+            &mut qptr as *mut _ as *mut c_void,
+            &mut kptr as *mut _ as *mut c_void,
+            &mut vptr as *mut _ as *mut c_void,
+            &mut aptr as *mut _ as *mut c_void,
+            &mut scptr as *mut _ as *mut c_void,
+            &mut kv_dim_c as *mut _ as *mut c_void,
+            &mut t_c as *mut _ as *mut c_void,
+            &mut group_c as *mut _ as *mut c_void,
+            &mut dh_c as *mut _ as *mut c_void,
+            &mut scale_c as *mut _ as *mut c_void,
+        ];
+        ok(unsafe {
+            ctx.launch_async(
+                ctx.f_attn,
+                (heads as u32, 1, 1),
+                (dh as u32, 1, 1),
+                (dh * 4) as u32,
+                &mut args,
+            )
+        })
+    })
+}
+
+/// P17g: バッチ decode 用 — セッションごとに `chain_attention` を起動し、
+/// 結果をホスト `att` [b, heads*dh] に集める。solo chain と同一カーネル・
+/// 同一入力 → 単独/バッチでビット一致を維持 (exactness 契約 P6)。
+/// 全セッション成功時 true。1 つでも失敗すれば false を返し、呼び出し側は
+/// 全セッションを CPU attention でやり直す (GPU/CPU 混合の数値混在を防止)。
+#[allow(clippy::too_many_arguments)]
+pub fn chain_attention_batch(
+    li: usize,
+    n_layers: usize,
+    q: &[f32],
+    caches: &[&crate::kv_cache::KvCache],
+    heads: usize,
+    group: usize,
+    dh: usize,
+    kv_dim: usize,
+    scale: f32,
+    att: &mut [f32],
+) -> bool {
+    let hd = heads * dh;
+    if !gpu_attention_enabled()
+        || caches.is_empty()
+        || q.len() != caches.len() * hd
+        || att.len() != q.len()
+    {
+        return false;
+    }
+    for (i, cache) in caches.iter().enumerate() {
+        let t_total = cache.len() + 1;
+        let ok1 = chain_attention(
+            cache.kv_id(),
+            li,
+            n_layers,
+            &q[i * hd..][..hd],
+            cache,
+            t_total,
+            group,
+            dh,
+            kv_dim,
+            scale,
+        );
+        if ok1.is_none() {
+            return false;
+        }
+        match chain_download(CH_ATT, hd) {
+            Some(row) => att[i * hd..][..hd].copy_from_slice(&row),
+            None => return false,
+        }
+    }
+    true
 }
 
 /// テスト用: dno_expf (glibc expf の bit-exact 再現) を要素ごとに適用する
@@ -1783,5 +2082,75 @@ mod tests {
             assert_eq!(got[i].to_bits(), want[i].to_bits(), "chain ffn i={i}");
         }
         println!("decode chain bit-exact OK (e={e} qkv={qkv_n} ff={ff})");
+    }
+
+    /// P17g: dno_attention カーネルと CPU 参照実装の一致 (緩和契約 —
+    /// ビット一致ではなく近似一致を検証)。rope 済み q とランダム K/V を使い、
+    /// GQA (kv_heads=2, group=6, dh=128) でスコア/softmax/probs@V を比較する。
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    #[ignore]
+    fn cuda_attention_kernel_vs_cpu_close() {
+        crate::cuda::enable_for_tests();
+        CudaCtx::new().unwrap();
+        let (kv_heads, group, dh) = (2usize, 6usize, 128usize);
+        let heads = kv_heads * group;
+        let kv_dim = kv_heads * dh;
+        let t_total = 577usize;
+        let scale = 1.0 / (dh as f32).sqrt();
+
+        let mut cache = crate::kv_cache::KvCache::new(1, kv_dim, 4096);
+        {
+            let (kc, vc) = cache.kv_bufs(0, t_total);
+            for i in 0..t_total * kv_dim {
+                kc[i] = ((i * 7919 % 2009) as f32 / 2009.0 - 0.5) * 2.0;
+                vc[i] = ((i * 6271 % 1987) as f32 / 1987.0 - 0.5) * 2.0;
+            }
+        }
+        cache.advance(t_total);
+        let q: Vec<f32> = (0..heads * dh)
+            .map(|i| ((i * 6151 % 1999) as f32 / 1999.0 - 0.5) * 4.0)
+            .collect();
+
+        // GPU カーネル (ミラーキーはテスト専用値)
+        chain_attention(900_001, 0, 1, &q, &cache, t_total, group, dh, kv_dim, scale).unwrap();
+        let got = chain_download(CH_ATT, heads * dh).unwrap();
+
+        // CPU 参照 (スコア → softmax → probs@V、スレッド i が att[h*dh+i] を担当
+        // するカーネルと同じ累積順: j 昇順 fmaf)
+        let (kc_ref, vc_ref) = cache.kv_bufs_ref(0);
+        let mut maxd = 0.0f32;
+        for kvh in 0..kv_heads {
+            for g in 0..group {
+                let h = kvh * group + g;
+                let mut scores = vec![0f32; t_total];
+                let mut mx = f32::NEG_INFINITY;
+                for j in 0..t_total {
+                    let mut s = 0f32;
+                    for i in 0..dh {
+                        s += q[h * dh + i] * kc_ref[j * kv_dim + kvh * dh + i];
+                    }
+                    s *= scale;
+                    scores[j] = s;
+                    mx = mx.max(s);
+                }
+                let mut sum = 0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                for i in 0..dh {
+                    let mut acc = 0f32;
+                    for j in 0..t_total {
+                        acc += scores[j] * vc_ref[j * kv_dim + kvh * dh + i];
+                    }
+                    let want = acc / sum;
+                    let d = (got[h * dh + i] - want).abs();
+                    maxd = maxd.max(d);
+                }
+            }
+        }
+        println!("attention kernel vs CPU close OK (t={t_total} maxabs={maxd:.3e})");
+        assert!(maxd < 1e-3, "attention maxabs diff {maxd}");
     }
 }
