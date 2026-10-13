@@ -285,6 +285,7 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **decode 限定オフロード**: GEMV 型カーネル(1 warp/出力)は行数 m に比例して重み再読みが増えるため prefill の GEMM に弱い(**実測 m=128 で 0.39x**)。`m > DENNO_CUDA_MAX_M`(既定 16)は CPU のまま — prefill の性能を損なわず、decode・バッチ decode(m≤閾値)のみ GPU 化
 - **検証**: ①パイプライン bit-exact(apply_bt 経由、4 形状・lm_head 1536×151936 含む)②tiny モデル forward 全体の GPU オフロード bit-exact(prefill+バッチ decode vs 単独)③CPU 106 テスト回帰変わりなし(cuda feature 無し)④**e2e**: Qwen2.5-1.5B int8 で CPU serve と GPU serve の応答テキスト・usage を完全一致(2 プロンプト・200 tok greedy・並行 2 リクエストのバッチ decode も単独と一致)
 - **e2e 実測**: 200 tok greedy 生成 **CPU 9.08s → GPU 2.66s(3.4x)**。VRAM 使用は重み 234MB(lm_head)+層重み ≈ 1GB 強
+- **op 別プロファイル比較** (`DENNO_PROFILE=1`、200 tok greedy ×3 リクエスト・600 decode step+prefill 累計): CPU では gate_up 40.9% / down 21.4% / attn 11.2% / lm_head 10.7%(**TOTAL 28,591ms**)だったのに対し、CUDA オフロードでは **線形層が 86%→62% に縮小し attn_core が最大 op 化(28.6%、TOTAL 9,686ms)** — 次の律速は attention 融合カーネルと明確化。層別倍率: gate_up 4.99x / down 4.26x / lm_head **10.9x** / o 2.70x / qkv 1.27x(3 分割 × 50,400 呼び出しで固定オーバーヘッド支配 — 融合候補)。decode 22.1→**75.8 tok/s**
 
 ## 4. 次の実装候補
 

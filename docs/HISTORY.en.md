@@ -286,6 +286,7 @@ pie showData title P9 fp32 batch (4x256) per-op time
 - **Decode-only offload**: GEMV-style kernels (1 warp per output) re-read the weights proportionally to m, so they lose to prefill GEMMs (**measured 0.39× at m=128**). `m > DENNO_CUDA_MAX_M` (default 16) stays on CPU — prefill performance is untouched; only decode and batch decode (m ≤ threshold) run on the GPU
 - **Verification**: ①pipeline bit-exactness via apply_bt (4 shapes, including lm_head 1536×151936) ②whole-forward GPU offload bit-exactness on the tiny model (prefill + batch decode vs solo) ③the 106 CPU tests regress to zero changes (without the cuda feature) ④**e2e**: Qwen2.5-1.5B int8 — CPU serve vs GPU serve produce fully identical response text and usage (2 prompts, 200-token greedy; concurrent batch decode of 2 requests also matches solo)
 - **e2e measurement**: 200-token greedy generation **CPU 9.08s → GPU 2.66s (3.4×)**. VRAM usage is lm_head 234MB + layer weights ≈ just over 1GB
+- **Per-op profile comparison** (`DENNO_PROFILE=1`, 200-token greedy ×3 requests, 600 decode steps + prefill cumulative): on CPU, gate_up 40.9% / down 21.4% / attn 11.2% / lm_head 10.7% (**TOTAL 28,591ms**); with CUDA offload, **the linear layers shrink from 86% to 62% and attn_core becomes the top op (28.6%, TOTAL 9,686ms)** — clearly identifying attention fusion as the next bottleneck. Per-layer speedups: gate_up 4.99× / down 4.26× / lm_head **10.9×** / o 2.70× / qkv 1.27× (3 split calls × 50,400 — fixed overhead dominates, a fusion candidate). Decode 22.1→**75.8 tok/s**
 
 ## 4. Candidate List
 
