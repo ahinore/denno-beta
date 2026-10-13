@@ -287,6 +287,16 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **e2e 実測**: 200 tok greedy 生成 **CPU 9.08s → GPU 2.66s(3.4x)**。VRAM 使用は重み 234MB(lm_head)+層重み ≈ 1GB 強
 - **op 別プロファイル比較** (`DENNO_PROFILE=1`、200 tok greedy ×3 リクエスト・600 decode step+prefill 累計): CPU では gate_up 40.9% / down 21.4% / attn 11.2% / lm_head 10.7%(**TOTAL 28,591ms**)だったのに対し、CUDA オフロードでは **線形層が 86%→62% に縮小し attn_core が最大 op 化(28.6%、TOTAL 9,686ms)** — 次の律速は attention 融合カーネルと明確化。層別倍率: gate_up 4.99x / down 4.26x / lm_head **10.9x** / o 2.70x / qkv 1.27x(3 分割 × 50,400 呼び出しで固定オーバーヘッド支配 — 融合候補)。decode 22.1→**75.8 tok/s**
 
+### P17c: GPU 線形層融合(qkv / gate+up のグループ化呼び出し) ✅ (2026-10-13, commit `7bf9eb0`)
+
+> P17b プロファイルで明確化された「qkv 3 分割 × 50,400 呼び出し(600 step × 28 層 × 3)の固定オーバーヘッド」を解消。同一入力を消費する線形層群を 1 回の GPU 呼び出しに融合し、e2e 19% 短縮。
+
+- **融合は行連結**: q/k/v(または gate/up)の重み行をパート順に連結した単一バッファとして、uid ベクトルをキャッシュキーに登録・計算し、出力を列ブロックで切り分ける。行単位の演算(量子化規則・i32 累積・スケール乗算順)は個別呼び出しと完全に同一なので**ビット一致が構造的に保証**される(新しい演算規則を導入しない設計)。ホスト側の連結バッファはアップロード後に drop するため RAM 定常増もなし。GPU 無効/エラー/一部が fp32 の場合は従来の個別 3+2 呼び出しにフォールバック
+- **スレッドローカル current context の発見(本フェーズ最大の教訓)**: CUDA の current context はスレッドローカル。libtest は `--test-threads=1` でも**テスト毎に新スレッドを立てる**ため、初期化スレッドで 1 回 `cuCtxSetCurrent` しただけでは他スレッドの `cuMemAlloc` が **error 201 INVALID_CONTEXT** で失敗する。さらに失敗は GPU_BROKEN→CPU フォールバックで静かに吸収されるため「GPU テストが緑 = GPU で実行された」にならない(今回追加した融合テストだけが `expect` で None を明示的に落としたため発覚 — P17b のモデル統合テストは CPU vs CPU の比較になっていても緑になり得た)。`CudaCtx::make_current()` を GPU 操作入口で毎回呼ぶよう修正し、サーバー側マルチスレッドの潜在バグも同時に解消
+- **検証**: ①融合 vs 個別呼び出しの bit-exact(qkv 型 3 パート(異なる n)+gate/up 型 2 パート、m=1/4)②tiny モデル forward 全体の bit-exact(prefill+バッチ decode)③CPU 106 テスト回帰変わりなし④**e2e**: Qwen2.5-1.5B int8 200 tok greedy で CPU serve と**テキスト・usage 完全一致**(3 リクエスト、usage 49 in/200 out)
+- **e2e 実測**: 200 tok 生成 **GPU 2.638s → 2.146s(−19%)**。理論予測(削減オーバーヘッド 84µs/層/step × 28 層 × 600 step ≈ 0.47s/リクエスト → 2.64−0.47=2.17s)と一致。CPU 10.67s → **4.96x**。重みアップロードは grouped 56(=28 層 × 2 グループ)+ 個別 57(=down 28+o 28+lm_head 1)で呼び出し内訳と完全整合
+- 残る CUDA 候補: attention 融合カーネル(attn_core 28.6% = GPU 最大 op)・paged KV・sampler カーネル
+
 ## 4. 次の実装候補
 
 - [x] ~~**sampler最適化**: 152k語彙のsoftmax+top-pソートが約3.5ms/stepの固定コスト(P7.5で判明)~~ → **P8で完了**(0.66ms/step、greedy不変)
@@ -299,7 +309,7 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - [x] ~~**推論可視化 P14: ビューア(L0/L1)**: フロー図・トークンストリーム・KV使用率グリッド・sampler top-kビュー・リプレイ記録+スクラバー~~ → **P14で完了(JS版で先行実装、commit `8befe3f`)**: ユーザー指定仕様のアニメーションUI(モデル駆動プログラム+実装コードパネル+層パネル+KV/変数+内蔵チャット)。**WASM移植・リプレイスクラバーは残課題**(詳細はP14節)
 - [ ] **推論可視化 P18: L2テンソルストリーミング**(旧 P17 — CUDA 最適化を P17 として実施したため繰り下げ): focusプロトコル(ビューアがセッション×layer×tensor種別を指定、dennoはその組だけをストリーム)。隠れ状態ヒートマップ、attention確率マップ(1トークンがどの過去トークンを見ているか)、K/V実体ビューア。予算: focus先1セッション≤5%(f16+絞り込み)
 - [ ] **3B/7Bのb=4実測**: 計測のみ。帯域律速のままならバッチ幅を増やすほど素直に効くはず(交互A/Bで計測すること)。大型モデルのキャッシュ追加(`denno pull`)が必要
-- [x] ~~**CUDA最適化**: 実装ポイントの分析は[アーキテクチャ解説](ARCHITECTURE.ja.md)§8に記載(線形層→cuBLAS、attention融合、samplerカーネル、paged KV)。int8路線ならCPU/GPUでビット一致が維持できる。P6のスロットプール+forward_batch構造はGPUのcontinuous batchingと同型なのでそのまま移植可能~~ → **P17で第一段完了** (commit `11281dd`: int8 線形層カーネルを CPU int8 パスと**ビット一致**で実装・RTX 5090 で実機検証・lm_head 18.6x。cuBLAS ではなく自前カーネル(dlopen+ドライバAPI・依存ゼロ)で exactness を構造的に担保)。**エンジン統合は P17b で完了** (commit `197a06c`: 重み常駐 uid レジストリ+ピン留め非同期パイプライン+decode 限定オフロード、e2e で 3.4x・応答完全一致、詳細はP17b節)。**attention融合/paged KV は残**、詳細はP17節)
+- [x] ~~**CUDA最適化**: 実装ポイントの分析は[アーキテクチャ解説](ARCHITECTURE.ja.md)§8に記載(線形層→cuBLAS、attention融合、samplerカーネル、paged KV)。int8路線ならCPU/GPUでビット一致が維持できる。P6のスロットプール+forward_batch構造はGPUのcontinuous batchingと同型なのでそのまま移植可能~~ → **P17で第一段完了** (commit `11281dd`: int8 線形層カーネルを CPU int8 パスと**ビット一致**で実装・RTX 5090 で実機検証・lm_head 18.6x。cuBLAS ではなく自前カーネル(dlopen+ドライバAPI・依存ゼロ)で exactness を構造的に担保)。**エンジン統合は P17b で完了** (commit `197a06c`: 重み常駐 uid レジストリ+ピン留め非同期パイプライン+decode 限定オフロード、e2e で 3.4x・応答完全一致、詳細はP17b節)。**qkv/gate_up の融合呼び出しは P17c で完了** (commit `7bf9eb0`: 同一入力の線形層群を 1 呼び出しに融合・e2e 4.96x、詳細はP17c節)。**attention カーネル融合/paged KV は残**、詳細はP17節)
 - [ ] **GitHub push自動化**: deploy key登録後にコンテナから直接push
 - [ ] tool use(Anthropic APIのtoolsパラメータ対応)
 - [ ] Llama系バリアント(GQA無しモデル、RoPEスケーリング)
@@ -332,4 +342,5 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **KV事前確保はスロット数×最大コンテキストで決まる**(P15の教訓): Qwen3-0.6BはGQA(kv_heads 8)でも28層×40960ctxで1スロット約9.4GBになり、4スロット+prefixで約47GBを確保しようとしてSIGKILL(exit 137)した。OOMではなく事前確保の問題 — 「空きメモリが足りているのに落ちる」場合はKV事前確保を疑う。`resolve_kv_budget`(純粋関数+単体テスト)で予算内に収め、明示envは最優先とする設計
 - **HFチャットテンプレートはPythonのstrメソッドに依存する**(P15の教訓): Qwen3のテンプレートは`startswith`を使用 — minijinjaのunknown method fallbackでは描画に失敗し静かにフォールバックするため「テンプレートが使われていない」ことに気づきにくい。`minijinja_contrib::pycompat::unknown_method_callback`を`set_unknown_method_callback`に登録するのが公式の解。**テンプレート描画の成否は生成結果の先頭トークンで確認する**(thinkingテンプレートなら`<think>`から始まる)
 - **int8の結合則はCPU/GPUのビット一致を可能にする**(P17の核心): i32累積は加算順序に依存しないため、GPUのwarpリダクション・レーン分割・タイリングをどう変えてもCPUのSIMDカーネルとビット一致する。必要なのは①同一の量子化規則(maxabsは丸めを伴わないので順序不変、CUDA `roundf`=Rust `f32::round`、clamp±127を同一)②スケール乗算の結合順を合わせること(`(float)dot * ascale * scale[j]` を左から順)。fp32はreduction順序で値が変わるためこの保証がなく、§8.3.5の通りint8がGPU exactnessの本命。**CUDAを依存ゼロで使うならdlopen+ドライバAPI**(リンク時依存がなくfeatureを外せばCI/GPU無し環境に影響しない)。カーネルはcompute_75 PTXをコミットしてドライバJITに任せる(新アーキsm_120でも再ビルド不要)。**GPU化の第1の壁はカーネル性能ではなく小さいopの固定オーバーヘッド**(起動+同期+H2D/D2H 約40µs/呼び出し) — デバイス滞留パイプライン(同期を1ステップ1回に)が統合時の必須設計
+- **GPU テストの「緑」は GPU で実行された証拠にならない**(P17c の教訓): CUDA の実行時エラーは GPU_BROKEN→CPU フォールバックで**静かに吸収**されるため、「GPU 結果 vs CPU 結果」の比較テストは GPU が一度も動いていなくても(CPU vs CPU で)合格する。GPU 経路を本当に通したテストは戻り値 None を `expect` で明示的に落とすこと。併せて、**CUDA の current context はスレッドローカル**(libtest は `--test-threads=1` でもテスト毎に新スレッドを立てる)なので、共有 context は GPU 操作の入口で毎回 `cuCtxSetCurrent` する — 初期化スレッドで 1 回だけ設定したのでは他スレッドの cuMemAlloc が error 201 で落ちる
 - **デバッグ実例(初期)**: sgemmストライド設計ミス→SIGSEGV、Qwen2のQKV bias発見(optionalロード)、Hermesの`max_tokens: 65535`クランプ、SSE `event:`行欠落で無限リトライ、prefill中のkeep-alive欠落でアイドル切断
