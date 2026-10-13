@@ -28,4 +28,4 @@ EXPOSE 8080
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["Qwen/Qwen2.5-0.5B-Instruct"]
+CMD ["Qwen/Qwen2.5-1.5B-Instruct"]
