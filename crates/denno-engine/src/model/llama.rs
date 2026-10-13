@@ -305,8 +305,9 @@ fn attention_decode_kvhead(
 impl LlamaQwen2 {
     /// P17g: solo decode chain と batch GPU attention の共通適合条件。
     /// bias / QK-Norm / fp32 混在モデルは solo chain を使えないため、
-    /// solo chain (forward_decode_gpu) が使える構造か (lm_head 有・全層 bias 無し・
-    /// QK-Norm 無し・全線形 int8)。GPU attention 自体はこの条件に依存しない
+    /// solo chain (forward_decode_gpu) が使える構造か (lm_head 有・QK-Norm 無し・
+    /// 全線形 int8)。P17h で qkv bias をサポート (dno_rope_qkv が bias 加算+rope
+    /// を CPU とビット一致で実行)。GPU attention 自体はこの条件に依存しない
     /// (加算済み q/k/v を受けるだけで bias/QK-Norm と無関係・forward/forward_batch
     /// の両経路で個別に試行する)。batch も GPU attention を使うが、solo と同一
     /// カーネル・同一入力なので単独/バッチのビット一致 (P6 契約) は維持される。
@@ -315,9 +316,6 @@ impl LlamaQwen2 {
             return false;
         }
         for layer in &self.layers {
-            if layer.q_b.is_some() || layer.k_b.is_some() || layer.v_b.is_some() {
-                return false;
-            }
             if layer.q_norm_w.is_some() || layer.k_norm_w.is_some() {
                 return false; // Qwen3 QK-Norm は従来経路
             }
@@ -340,8 +338,10 @@ impl LlamaQwen2 {
         pos0: usize,
     ) -> Option<Vec<f32>> {
         use crate::cuda::{
-            chain_download, chain_linear_grouped, chain_rmsnorm, chain_swiglu, chain_upload,
-            CH_ACT, CH_ATT, CH_DOWN, CH_GA, CH_H, CH_LOGITS, CH_O, CH_QKV, CH_X,
+            chain_attention_dev, chain_download, chain_kv_stage_flush, chain_linear_grouped,
+            chain_rope_prepare, chain_rope_qkv, chain_rmsnorm, chain_swiglu, chain_upload,
+            gpu_attention_enabled, CH_ACT, CH_ATT, CH_DOWN, CH_GA, CH_H, CH_LOGITS, CH_O, CH_QKV,
+            CH_X,
         };
         let e = self.e;
         let dh = self.dh;
@@ -349,77 +349,71 @@ impl LlamaQwen2 {
         let kv_heads = self.kv_heads;
         let kv_dim = kv_heads * dh;
         let group = heads / kv_heads; // GQA group size
+        let n_layers = self.layers.len();
 
         // 非対応構造は従来経路へ
         if !self.chain_compatible() {
             return None;
         }
+        // P17h: chain は q/k/v をデバイス常駐させるため attention は GPU 必須。
+        // DENNO_GPU_ATTN=0 なら従来 (CPU・ビット一致) 経路へ (escape hatch)。
+        if !gpu_attention_enabled() {
+            return None;
+        }
 
         // 埋め込み 1 行をアップロード (residual stream 常駐開始)
         chain_upload(CH_X, &self.embed[token as usize * e..][..e], e, 1)?;
+        // rope テーブル (1 ステップ 1 回 — CPU rope_row と同一式・ビット一致)
+        chain_rope_prepare(pos0, dh, self.theta)?;
         let mut pending: Option<usize> = None;
 
         for (li, layer) in self.layers.iter().enumerate() {
             crate::telemetry_layer_begin(li as u16);
             crate::prof::time_layer(crate::prof::RMSNORM, li, || {
-                chain_rmsnorm(&layer.ln1_w, self.eps, pending, CH_H, e, 1)
+                chain_rmsnorm(&layer.ln1_w, self.eps, pending, CH_H, e, 1, li * 3)
             })?;
-            let (mut q, mut k, v) =
-                crate::prof::time_layer(crate::prof::QKV, li, || -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-                    let qw = layer.q_w.quant8()?;
-                    let kw = layer.k_w.quant8()?;
-                    let vw = layer.v_w.quant8()?;
-                    chain_linear_grouped(&[qw, kw, vw], CH_H, CH_QKV, 1)?;
-                    let all = chain_download(CH_QKV, heads * dh + 2 * kv_dim)?;
-                    Some((
-                        all[..heads * dh].to_vec(),
-                        all[heads * dh..heads * dh + kv_dim].to_vec(),
-                        all[heads * dh + kv_dim..].to_vec(),
-                    ))
-                })?;
-
-            // --- rope / KV 書き込み (CPU — ホスト KvCache が常に正) ---
+            // qkv: デバイス内で完結 (download なし — P17h で層あたりの sync を廃止)
+            crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
+                let qw = layer.q_w.quant8()?;
+                let kw = layer.k_w.quant8()?;
+                let vw = layer.v_w.quant8()?;
+                chain_linear_grouped(&[qw, kw, vw], CH_H, CH_QKV, 1)
+            })?;
+            // bias 加算 + rope (GPU・CPU add_bias→rope_row とビット一致)
             crate::prof::time_layer(crate::prof::ROPE, li, || {
-                rope_rows(&mut q, 1, heads, dh, pos0, self.theta);
-                rope_rows(&mut k, 1, kv_heads, dh, pos0, self.theta);
-            });
-            {
-                let (kc, vc) = cache.kv_bufs(li, 1);
-                kc[pos0 * kv_dim..][..kv_dim].copy_from_slice(&k);
-                vc[pos0 * kv_dim..][..kv_dim].copy_from_slice(&v);
-            }
-            // --- attention (P17g: GPU カーネル + KV ミラー。無効/失敗時は CPU
-            //     attention → forward 全体を従来経路でやり直し)。exactness 契約は
-            //     attention のみ緩和 (ユーザー承認) — 線形層/expf/swiglu/rmsnorm は
+                chain_rope_qkv(
+                    layer.q_b.as_deref(),
+                    layer.k_b.as_deref(),
+                    layer.v_b.as_deref(),
+                    heads,
+                    kv_heads,
+                    dh,
+                    n_layers * 3 + 1 + li,
+                )
+            })?;
+            // --- attention (P17g/P17h: GPU カーネル + KV ミラー + q/k/v デバイス常駐)。
+            //     rope 済み k/v は非同期 D2H でステージングし、ホストキャッシュへの
+            //     反映はステップ最後の sync 後 (chain_kv_stage_flush)。失敗時は
+            //     forward 全体を従来経路でやり直し。exactness 契約は attention のみ
+            //     緩和 (ユーザー承認) — 線形層/bias/rope/expf/swiglu/rmsnorm は
             //     ビット一致維持。
             let t_total = pos0 + 1;
             let scale = 1.0 / (dh as f32).sqrt();
-            if crate::cuda::chain_attention(
-                cache.kv_id(),
-                li,
-                self.layers.len(),
-                &q,
-                cache,
-                t_total,
-                group,
-                dh,
-                kv_dim,
-                scale,
-            )
-            .is_none()
-            {
-                let mut att = vec![0.0f32; heads * dh];
-                crate::prof::time_layer(crate::prof::ATTN, li, || {
-                    let (kc, vc) = cache.kv_bufs_ref(li);
-                    for kvh in 0..kv_heads {
-                        let a = attention_decode_kvhead(
-                            &q, kc, vc, kvh, group, dh, kv_dim, t_total, scale,
-                        );
-                        att[kvh * group * dh..][..group * dh].copy_from_slice(&a);
-                    }
-                });
-                chain_upload(CH_ATT, &att, heads * dh, 1)?;
-            }
+            crate::prof::time_layer(crate::prof::ATTN, li, || {
+                chain_attention_dev(
+                    cache.kv_id(),
+                    li,
+                    n_layers,
+                    cache,
+                    pos0,
+                    t_total,
+                    heads,
+                    group,
+                    dh,
+                    kv_dim,
+                    scale,
+                )
+            })?;
 
             // --- o_proj → residual+rmsnorm → gate/up → swiglu → down (全てデバイス内) ---
             crate::prof::time_layer(crate::prof::OPROJ, li, || -> Option<()> {
@@ -427,7 +421,7 @@ impl LlamaQwen2 {
                 chain_linear_grouped(&[ow], CH_ATT, CH_O, 1)
             })?;
             crate::prof::time_layer(crate::prof::RMSNORM, li, || {
-                chain_rmsnorm(&layer.ln2_w, self.eps, Some(CH_O), CH_H, e, 1)
+                chain_rmsnorm(&layer.ln2_w, self.eps, Some(CH_O), CH_H, e, 1, li * 3 + 1)
             })?;
             crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
                 let gw = layer.gate_w.quant8()?;
@@ -446,11 +440,13 @@ impl LlamaQwen2 {
         }
 
         let logits = crate::prof::time(crate::prof::LM_HEAD, || -> Option<Vec<f32>> {
-            chain_rmsnorm(&self.norm_w, self.eps, pending, CH_H, e, 1)?;
+            chain_rmsnorm(&self.norm_w, self.eps, pending, CH_H, e, 1, n_layers * 3)?;
             let lmq = self.lm_head.as_ref().unwrap().quant8()?;
             chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)?;
             chain_download(CH_LOGITS, self.vocab)
         })?;
+        // ホストキャッシュへ rope 済み k/v を反映 (logits download の sync で全 D2H 完了)
+        chain_kv_stage_flush(cache, n_layers, kv_dim, pos0)?;
         cache.advance(1);
         Some(logits)
     }
@@ -694,6 +690,19 @@ impl Model for LlamaQwen2 {
     ) -> Result<Vec<Vec<f32>>> {
         debug_assert_eq!(toks.len(), caches.len());
         let b = toks.len();
+
+        // P17h: b==1 は solo decode chain (rope GPU 化+qkv デバイス常駐・ステップ内
+        // の sync 廃止) に委譲する。GPU 無効/非対応構造/実行時エラー → None →
+        // 従来のバッチ経路でやり直し (キャッシュ状態は失敗時に不変)。GPU attention
+        // は solo/batch で同一カーネル・同一入力なので P6 契約どおり数値は一致する。
+        #[cfg(feature = "cuda")]
+        if b == 1 {
+            let pos0 = caches[0].len();
+            if let Some(logits) = self.forward_decode_gpu(toks[0], caches[0], pos0) {
+                return Ok(vec![logits]);
+            }
+        }
+
         let e = self.e;
         let dh = self.dh;
         let heads = self.heads;
@@ -1240,6 +1249,119 @@ mod tests {
         }
         crate::cuda::set_gpu_attention_enabled(prev);
         println!("gpu attention forward vs cpu close OK ({} steps)", steps);
+    }
+
+    /// P17h: dno_rope_qkv (bias 加算 + rope・GPU) が CPU 経路 (add_bias →
+    /// rope_rows) と**ビット一致**すること。exactness 契約: rope は緩和対象外。
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    #[ignore]
+    fn cuda_rope_qkv_bitexact_vs_cpu() {
+        crate::cuda::enable_for_tests();
+        use crate::cuda::{chain_download, chain_rope_prepare, chain_rope_qkv, chain_upload, CH_QKV};
+        use crate::tensor::rope_rows;
+        let heads = 4usize;
+        let kv_heads = 2usize;
+        let dh = 4usize;
+        let hd = heads * dh;
+        let kv_dim = kv_heads * dh;
+        let q_b = prng(hd, 500);
+        let k_b = prng(kv_dim, 600);
+        let v_b = prng(kv_dim, 700);
+        for pos0 in [0usize, 1, 7, 63] {
+            let qkv = prng(hd + 2 * kv_dim, 9000 + pos0 as u32);
+            // --- CPU リファレンス: add_bias → rope (forward の CPU 経路と同一順) ---
+            let mut cpu = qkv.clone();
+            for i in 0..hd {
+                cpu[i] += q_b[i];
+            }
+            for i in 0..kv_dim {
+                cpu[hd + i] += k_b[i];
+                cpu[hd + kv_dim + i] += v_b[i];
+            }
+            let (mut cq, mut ck) = (cpu[..hd].to_vec(), cpu[hd..hd + kv_dim].to_vec());
+            rope_rows(&mut cq, 1, heads, dh, pos0, 10_000.0);
+            rope_rows(&mut ck, 1, kv_heads, dh, pos0, 10_000.0);
+            cpu[..hd].copy_from_slice(&cq);
+            cpu[hd..hd + kv_dim].copy_from_slice(&ck);
+            // --- GPU: bias 加算 + rope をカーネルで ---
+            chain_upload(CH_QKV, &qkv, hd + 2 * kv_dim, 1).unwrap();
+            chain_rope_prepare(pos0, dh, 10_000.0).unwrap();
+            chain_rope_qkv(
+                Some(&q_b),
+                Some(&k_b),
+                Some(&v_b),
+                heads,
+                kv_heads,
+                dh,
+                0, // pin id (テスト専用スロット)
+            )
+            .unwrap();
+            let gpu = chain_download(CH_QKV, hd + 2 * kv_dim).unwrap();
+            assert_eq!(gpu, cpu, "rope+bias bit-exact pos0={pos0}");
+            // --- bias 無し (NULL) も CPU (bias 0 加算) とビット一致 ---
+            let mut cpu0 = qkv.clone();
+            let (mut cq0, mut ck0) = (cpu0[..hd].to_vec(), cpu0[hd..hd + kv_dim].to_vec());
+            rope_rows(&mut cq0, 1, heads, dh, pos0, 10_000.0);
+            rope_rows(&mut ck0, 1, kv_heads, dh, pos0, 10_000.0);
+            cpu0[..hd].copy_from_slice(&cq0);
+            cpu0[hd..hd + kv_dim].copy_from_slice(&ck0);
+            chain_upload(CH_QKV, &qkv, hd + 2 * kv_dim, 1).unwrap();
+            chain_rope_prepare(pos0, dh, 10_000.0).unwrap();
+            chain_rope_qkv(None, None, None, heads, kv_heads, dh, 0).unwrap();
+            let gpu0 = chain_download(CH_QKV, hd + 2 * kv_dim).unwrap();
+            assert_eq!(gpu0, cpu0, "rope (no bias) bit-exact pos0={pos0}");
+        }
+        println!("rope_qkv bit-exact vs CPU OK (pos0=0,1,7,63, with/without bias)");
+    }
+
+    /// P17h: solo decode chain (bias あり・Qwen2.5 と同構造) が forward_decode_gpu
+    /// で**発動**し (Some 返却を明示検証 — 教訓⑭: 「テスト緑」は経路発動の証拠に
+    /// ならない)、CPU 経路と greedy 一致 + logits 近似一致すること。
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    #[ignore]
+    fn cuda_solo_chain_bias_rope_gpu_matches_cpu() {
+        crate::cuda::enable_for_tests();
+        let prompt = vec![5u32, 11, 23];
+        let steps = 6;
+
+        // CPU 参照 (GPU attention 無効 → forward_decode_gpu は None → CPU 経路)
+        let prev = crate::cuda::set_gpu_attention_enabled(false);
+        let mut cpu_m = tiny(QuantMode::Int8); // bias あり (Qwen2.5 と同構造)
+        let mut cpu_cache = cpu_m.new_cache();
+        let mut ref_logits = cpu_m.forward(&prompt, &mut cpu_cache).unwrap();
+        let mut ref_seq = Vec::new();
+        let mut ref_hist: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..steps {
+            let t = argmax(&ref_logits);
+            ref_seq.push(t);
+            ref_logits = cpu_m.forward(&[t], &mut cpu_cache).unwrap();
+            ref_hist.push(ref_logits.clone());
+        }
+        crate::cuda::set_gpu_attention_enabled(true);
+
+        // GPU solo chain (rope + bias GPU 化・qkv デバイス常駐・ステップ内 sync なし)
+        let mut gpu_m = tiny(QuantMode::Int8);
+        let mut gpu_cache = gpu_m.new_cache();
+        let mut logits = gpu_m.forward(&prompt, &mut gpu_cache).unwrap();
+        for (step, want_tok) in ref_seq.iter().enumerate() {
+            let t = argmax(&logits);
+            assert_eq!(t, *want_tok, "greedy token step={step}");
+            let pos0 = prompt.len() + step;
+            let lg = gpu_m
+                .forward_decode_gpu(t, &mut gpu_cache, pos0)
+                .expect("solo chain must fire (P17h: bias + rope GPU)");
+            logits = lg;
+            let maxd = logits
+                .iter()
+                .zip(ref_hist[step].iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(maxd < 0.05, "logits maxabs diff step={step}: {maxd}");
+        }
+        crate::cuda::set_gpu_attention_enabled(prev);
+        println!("solo chain (bias+rope GPU) matches CPU OK ({steps} steps)");
     }
 
     #[test]
