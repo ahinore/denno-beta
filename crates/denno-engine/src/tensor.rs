@@ -673,6 +673,25 @@ pub fn rmsnorm(x: &[f32], w: &[f32], cols: usize, eps: f32) -> Vec<f32> {
     out
 }
 
+/// QK-Norm (Qwen3): 各ヘッドの head_dim ベクトルに RMSNorm を適用する
+/// (行 × ヘッド単位、in-place)。x は行 major の [rows, heads*dh]。
+/// q には q_norm (heads 個)、k には k_norm (kv_heads 個) を使う
+/// (重みはヘッド間で共有、RoPE の前に適用する)。
+/// 演算順序は `rmsnorm` と同一 (逐次 2 乗和 → rsqrt → x*inv*w) なので
+/// 行/ヘッド単位で独立、バッチと単独でビット一致する。
+pub fn qknorm_rows_inplace(x: &mut [f32], rows: usize, heads: usize, dh: usize, w: &[f32], eps: f32) {
+    for r in 0..rows {
+        for h in 0..heads {
+            let seg = &mut x[r * heads * dh + h * dh..][..dh];
+            let ss = seg.iter().map(|v| v * v).sum::<f32>() / dh as f32;
+            let inv = 1.0 / (ss + eps).sqrt();
+            for (i, v) in seg.iter_mut().enumerate() {
+                *v = *v * inv * w[i];
+            }
+        }
+    }
+}
+
 /// gelu_new (GPT-2 の tanh 近似)
 pub fn gelu_inplace(x: &mut [f32]) {
     for v in x.iter_mut() {
@@ -1004,6 +1023,27 @@ mod tests {
         let inv = 1.0 / 12.5f32.sqrt();
         assert!((out[0] - 3.0 * inv).abs() < 1e-6);
         assert!((out[1] - 4.0 * inv).abs() < 1e-6);
+    }
+
+    #[test]
+    fn qknorm_matches_per_head_rmsnorm() {
+        // 各ヘッド区間の結果が rmsnorm(単独) と一致し、行/ヘッドが独立であること
+        let (heads, dh, rows, eps) = (3usize, 4usize, 2usize, 1e-6);
+        let w = [0.5, 1.0, 2.0, 1.0];
+        let mut x = pseudo_random(rows * heads * dh, 123);
+        let orig = x.clone();
+        qknorm_rows_inplace(&mut x, rows, heads, dh, &w, eps);
+        for r in 0..rows {
+            for h in 0..heads {
+                let seg_in = &orig[r * heads * dh + h * dh..][..dh];
+                let want = rmsnorm(seg_in, &w, dh, eps);
+                assert_eq!(
+                    &x[r * heads * dh + h * dh..][..dh],
+                    &want[..],
+                    "row={r} head={h}"
+                );
+            }
+        }
     }
 
     #[test]

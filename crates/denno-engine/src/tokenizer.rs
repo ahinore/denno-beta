@@ -95,6 +95,9 @@ impl DennoTokenizer {
                 "tools": serde_json::Value::Null,
             });
             let mut env = minijinja::Environment::new();
+            // Python 風 str メソッド (startswith 等) を登録 — HF chat template
+            // (Qwen3 等) はこれらに依存する
+            env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
             env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
             match env.render_str(template, ctx) {
                 Ok(s) if !s.is_empty() => return Ok(s),
@@ -196,6 +199,21 @@ mod tests {
         // system は messages の先頭に挿入される → messages[0] は system、長さは 2
         let out = tok.apply_chat_template(Some("SYS"), &msgs("t0")).unwrap();
         assert_eq!(out, "[2]SYS");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn chat_template_python_string_methods_render() {
+        // pycompat: HF chat template (Qwen3 等) が使う Python 風 str メソッド
+        // (startswith / lstrip / split) が描画できること
+        let (tok, dir) = load_minimal(Some(
+            "{% if messages[0].content.startswith('u') %}U{% endif %}\
+             {{ messages[0].content.lstrip('u') }}\
+             {% set parts = messages[0].content.split(':') %}{{ parts[-1] }}",
+        ));
+        let out = tok.apply_chat_template(None, &msgs("u:hi")).unwrap();
+        // U (startswith) + :hi (lstrip('u')) + hi (split(':')[-1])
+        assert_eq!(out, "U:hihi");
         std::fs::remove_dir_all(dir).ok();
     }
 

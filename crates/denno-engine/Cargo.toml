@@ -17,6 +17,9 @@ half = "2"
 matrixmultiply = "0.3"
 rayon = "1"
 minijinja = "2"
+# HF chat template 互換 (Python 風 str メソッド: startswith/lstrip/rstrip/split 等)。
+# Qwen3 の chat template がこれらを使うため必須。
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 rand = "0.8"
 
 [features]

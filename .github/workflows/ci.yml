@@ -52,8 +52,10 @@ jobs:
         with:
           key: ci-v3
 
-      - name: Pull model
-        run: cargo run --release --bin denno -- pull Qwen/Qwen2.5-0.5B-Instruct
+      - name: Pull models
+        run: |
+          cargo run --release --bin denno -- pull Qwen/Qwen2.5-0.5B-Instruct
+          cargo run --release --bin denno -- pull Qwen/Qwen3-0.6B
 
       - name: Run exactness tests (ignored)
         run: cargo test --release --workspace -- --ignored

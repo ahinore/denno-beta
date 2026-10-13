@@ -147,3 +147,31 @@ fn qwen_int8_mode_is_deterministic() {
     assert_eq!(a.output_tokens, b.output_tokens);
     println!("int8 output: {}", a.text);
 }
+
+/// P15: Qwen3 (QK-Norm) の基準出力 + 決定論。
+/// Qwen3-0.6B は chat template が thinking モード用のため greedy でも思考
+/// セクション (`...`) が先頭に出る。基準文字列は参照実装
+/// (HF transformers fp32, greedy, 同一 chat template) の出力と完全一致を
+/// 検証済み (ai_work_sync/qwen3_ref.py、開発コンテナ内)。
+/// (QK-Norm 経路のバッチ/単独ビット一致は llama.rs の単体テストで担保)
+#[test]
+#[ignore]
+fn qwen3_qknorm_matches_baseline() {
+    let Some(dir) = model_dir(
+        "DENNO_QWEN3_DIR",
+        "/home/dev/.cache/denno/hub/models--Qwen--Qwen3-0.6B",
+    ) else {
+        return;
+    };
+    let mut e = Engine::load(&dir, "denno-test-q3", Some(42), QuantMode::Fp32).unwrap();
+    let a = e.chat(None, &user_msg("1+1は?"), &greedy(40), |_| {}).unwrap();
+    let b = e.chat(None, &user_msg("1+1は?"), &greedy(40), |_| {}).unwrap();
+    assert_eq!(a.text, b.text, "Qwen3 で同 seed → 同一出力が崩れた");
+    assert_eq!(a.output_tokens, b.output_tokens);
+    assert_eq!(
+        a.text,
+        "\u{3c}think\u{3e}\nOkay, the user is asking \"1+1は?\" which translates to \"What is 1+1?\" in English. They want to know the result of adding 1 and ",
+        "unexpected output: {}",
+        a.text
+    );
+}

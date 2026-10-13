@@ -31,6 +31,8 @@ struct Layer {
     gate_w: Linear,          // [ff, e]
     up_w: Linear,            // [ff, e]
     down_w: Linear,          // [e, ff]
+    q_norm_w: Option<Vec<f32>>, // Qwen3 QK-Norm: [dh] (q/k の投影直後・RoPE 前に適用)
+    k_norm_w: Option<Vec<f32>>, // None (Qwen2.5 等) なら QK-Norm 無効
 }
 
 pub struct LlamaQwen2 {
@@ -110,6 +112,9 @@ impl LlamaQwen2 {
                 gate_w: lin(g(&format!("{p}mlp.gate_proj.weight"))?, e, ff),
                 up_w: lin(g(&format!("{p}mlp.up_proj.weight"))?, e, ff),
                 down_w: lin(g(&format!("{p}mlp.down_proj.weight"))?, ff, e),
+                // Qwen3 のみ存在する QK-Norm 重み (Qwen2.5 では None)
+                q_norm_w: go(&format!("{p}self_attn.q_norm.weight"))?,
+                k_norm_w: go(&format!("{p}self_attn.k_norm.weight"))?,
             });
         }
 
@@ -287,6 +292,18 @@ impl Model for LlamaQwen2 {
             if let Some(b) = &layer.v_b {
                 add_bias(&mut v, b, kv_dim);
             }
+            // Qwen3 QK-Norm: q/k を head_dim 単位で RMSNorm する (RoPE の前)。
+            // 行/ヘッド単位で独立 → バッチ/単独でビット一致
+            if layer.q_norm_w.is_some() || layer.k_norm_w.is_some() {
+                crate::prof::time_layer(crate::prof::QKNORM, li, || {
+                    if let Some(w) = &layer.q_norm_w {
+                        crate::tensor::qknorm_rows_inplace(&mut q, n, heads, dh, w, self.eps);
+                    }
+                    if let Some(w) = &layer.k_norm_w {
+                        crate::tensor::qknorm_rows_inplace(&mut k, n, kv_heads, dh, w, self.eps);
+                    }
+                });
+            }
 
             crate::prof::time_layer(crate::prof::ROPE, li, || {
                 rope_rows(&mut q, n, heads, dh, pos0, self.theta);
@@ -453,6 +470,18 @@ impl Model for LlamaQwen2 {
             if let Some(bias) = &layer.v_b {
                 add_bias(&mut v, bias, kv_dim);
             }
+            // Qwen3 QK-Norm: q/k を head_dim 単位で RMSNorm する (RoPE の前)。
+            // forward() と同一の行/ヘッド単位演算 → 単独 decode とビット一致
+            if layer.q_norm_w.is_some() || layer.k_norm_w.is_some() {
+                crate::prof::time_layer(crate::prof::QKNORM, li, || {
+                    if let Some(w) = &layer.q_norm_w {
+                        crate::tensor::qknorm_rows_inplace(&mut q, b, heads, dh, w, self.eps);
+                    }
+                    if let Some(w) = &layer.k_norm_w {
+                        crate::tensor::qknorm_rows_inplace(&mut k, b, kv_heads, dh, w, self.eps);
+                    }
+                });
+            }
 
             // RoPE: セッションごとに位置が異なる (cache.len()) ので 1 行ずつ適用。
             // rope_row は rope_rows の 1 行処理と同一演算列 → ビット一致。
@@ -588,7 +617,12 @@ mod tests {
 
     /// テスト用の極小 Qwen2 (2層, GQA, QKV bias あり) を直接構築する。
     /// Fp32 は tied (lm_head なし) / Int8 は untied 相当の独立 lm_head。
+    /// `with_qk` = true で Qwen3 相当の QK-Norm 重みを持たせる。
     fn tiny(mode: QuantMode) -> LlamaQwen2 {
+        tiny_opt(mode, false)
+    }
+
+    fn tiny_opt(mode: QuantMode, with_qk: bool) -> LlamaQwen2 {
         let e = 16usize;
         let heads = 4;
         let kv_heads = 2;
@@ -612,6 +646,8 @@ mod tests {
                 gate_w: mk(prng(ff * e, 1000 + i), e, ff),
                 up_w: mk(prng(ff * e, 1100 + i), e, ff),
                 down_w: mk(prng(e * ff, 1200 + i), ff, e),
+                q_norm_w: if with_qk { Some(prng(dh, 1300 + i)) } else { None },
+                k_norm_w: if with_qk { Some(prng(dh, 1400 + i)) } else { None },
             });
         }
         let lm_head = match mode {
@@ -732,6 +768,53 @@ mod tests {
         let out = bat.forward_batch(&[t], &mut [&mut c2]).unwrap();
         let ref_lg = solo.forward(&[t], &mut c1).unwrap();
         assert_eq!(out[0], ref_lg);
+    }
+
+    #[test]
+    fn qk_norm_batch_matches_solo_decode_bit_exactly() {
+        // Qwen3 (QK-Norm あり) でもバッチ decode が単独 decode とビット一致する。
+        // また QK-Norm が適用されていること (無効化した場合と出力が変わる) を確認。
+        for mode in [QuantMode::Fp32, QuantMode::Int8] {
+            let prompts: Vec<Vec<u32>> = vec![vec![5, 11, 23], vec![1, 2, 3, 4, 5], vec![7, 9]];
+
+            // --- 単独リファレンス ---
+            let mut solo = tiny_opt(mode, true);
+            let mut solo_caches: Vec<KvCache> =
+                (0..prompts.len()).map(|_| solo.new_cache()).collect();
+            let mut solo_prefill: Vec<Vec<f32>> = Vec::new();
+            for (s, p) in prompts.iter().enumerate() {
+                let lg = solo.forward(p, &mut solo_caches[s]).unwrap();
+                solo_prefill.push(lg);
+            }
+            let mut solo_decode: Vec<Vec<f32>> = Vec::new();
+            for s in 0..prompts.len() {
+                let t = argmax(&solo_prefill[s]);
+                solo_decode.push(solo.forward(&[t], &mut solo_caches[s]).unwrap());
+            }
+
+            // --- バッチ decode ---
+            let mut bat = tiny_opt(mode, true);
+            let mut bat_caches: Vec<KvCache> =
+                (0..prompts.len()).map(|_| bat.new_cache()).collect();
+            let mut bat_logits: Vec<Vec<f32>> = Vec::new();
+            for (s, p) in prompts.iter().enumerate() {
+                let lg = bat.forward(p, &mut bat_caches[s]).unwrap();
+                assert_eq!(lg, solo_prefill[s], "{mode:?} prefill s={s}");
+                bat_logits.push(lg);
+            }
+            let toks: Vec<u32> = (0..prompts.len()).map(|s| argmax(&bat_logits[s])).collect();
+            let mut caches: Vec<&mut KvCache> = bat_caches.iter_mut().collect();
+            let outs = bat.forward_batch(&toks, &mut caches).unwrap();
+            for s in 0..prompts.len() {
+                assert_eq!(outs[s], solo_decode[s], "{mode:?} decode s={s}");
+            }
+
+            // --- QK-Norm が効いていることの確認 (無し版と出力が異なる) ---
+            let mut noqk = tiny_opt(mode, false);
+            let mut c = noqk.new_cache();
+            let lg_noqk = noqk.forward(&[5, 11, 23], &mut c).unwrap();
+            assert_ne!(lg_noqk, solo_prefill[0], "QK-Norm が適用されていない");
+        }
     }
 
     #[test]

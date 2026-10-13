@@ -112,6 +112,59 @@ pub struct Engine {
 pub const DEFAULT_BATCH_SLOTS: usize = 4;
 pub const BATCH_SLOTS_ENV: &str = "DENNO_BATCH_SLOTS";
 
+/// P15: KV メモリ予算の既定値 (MB) と環境変数。
+/// バッチスロット + prefix cache の合計 KV の目安。巨大 KV モデル
+/// (例: Qwen3-0.6B は kv_heads 8 × head_dim 128 × 28 層で 1 スロット
+/// ~9.4GB) で既定構成の事前確保が物理メモリを超えないよう、予算から
+/// スロット数と prefix cache トークン数を絞る。明示的な環境変数
+/// (`DENNO_BATCH_SLOTS` / `DENNO_PREFIX_CACHE_TOKENS`) は予算より優先。
+pub const KV_BUDGET_ENV: &str = "DENNO_KV_BUDGET_MB";
+pub const DEFAULT_KV_BUDGET_MB: usize = 12288;
+
+fn kv_budget_bytes() -> usize {
+    std::env::var(KV_BUDGET_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_KV_BUDGET_MB)
+        .saturating_mul(1024 * 1024)
+}
+
+/// スロット KV バイト数とメモリ予算から、バッチスロット数と
+/// prefix cache トークン上限を決める (純粋関数: 単体テストあり)。
+///
+/// - `explicit_slots` / `explicit_prefix`: 環境変数による明示指定 (最優先)
+/// - 明示指定が無い場合: 予算内でスロットを優先して確保し、残りを
+///   prefix cache に充てる (最低でも 2048 トークンは確保)
+/// - `DEFAULT_BATCH_SLOTS` と予算から従来構成 (4 スロット + ctx 全幅) が
+///   収まるモデル (Qwen2.5-0.5B/1.5B) は従来値を完全維持
+fn resolve_kv_budget(
+    slot_max_len: usize,
+    bytes_per_token: usize,
+    explicit_slots: Option<usize>,
+    explicit_prefix: Option<usize>,
+    budget_bytes: usize,
+) -> (usize, usize) {
+    let bpt = bytes_per_token.max(1);
+    let slot_bytes = slot_max_len.saturating_mul(bpt);
+    let slots = match explicit_slots {
+        Some(n) => n.max(1),
+        None => DEFAULT_BATCH_SLOTS.min((budget_bytes / slot_bytes.max(1)).max(1)),
+    };
+    let prefix = match explicit_prefix {
+        Some(n) => n,
+        None => {
+            let floor = 2048.min(slot_max_len);
+            if slots.saturating_mul(slot_bytes) >= budget_bytes {
+                floor
+            } else {
+                let rest = budget_bytes - slots * slot_bytes;
+                slot_max_len.min(rest / bpt).max(floor)
+            }
+        }
+    };
+    (slots, prefix)
+}
+
 fn batch_slots() -> usize {
     std::env::var(BATCH_SLOTS_ENV)
         .ok()
@@ -192,22 +245,32 @@ impl Engine {
         let model = load_model(dir, quant).context("モデルのロードに失敗")?;
         let tok = DennoTokenizer::load(dir).context("トークナイザのロードに失敗")?;
         let slot0 = model.new_cache();
-        // マルチエントリ prefix cache のトークン上限。
-        // デフォルトは KvCache の max_len (コンテキスト長) と同じ (Qwen2.5-0.5B なら 32k)。
-        let max_tokens = std::env::var(PREFIX_CACHE_ENV)
+        // マルチエントリ prefix cache のトークン上限 (P15: KV メモリ予算から
+        // スロット数と一緒に決める。明示 env は予算より優先)。
+        let explicit_slots = std::env::var(BATCH_SLOTS_ENV)
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or_else(|| slot0.max_len());
-        let slots = batch_slots();
+            .filter(|&n| n >= 1);
+        let explicit_prefix = std::env::var(PREFIX_CACHE_ENV)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        let (slots, max_tokens) = resolve_kv_budget(
+            slot0.max_len(),
+            slot0.bytes_per_token(),
+            explicit_slots,
+            explicit_prefix,
+            kv_budget_bytes(),
+        );
         tracing::info!(
             "prefix cache: multi-entry LRU, budget = {} tokens (~{:.0} MB KV)",
             max_tokens,
             max_tokens as f64 * slot0.bytes_per_token() as f64 / 1e6
         );
         tracing::info!(
-            "batch slots: {} (KV ~{:.0} MB/slot, env {BATCH_SLOTS_ENV})",
+            "batch slots: {} (KV ~{:.0} MB/slot, env {BATCH_SLOTS_ENV}; total KV budget {} MB, env {KV_BUDGET_ENV})",
             slots,
-            slot0.max_len() as f64 * slot0.bytes_per_token() as f64 / 1e6
+            slot0.max_len() as f64 * slot0.bytes_per_token() as f64 / 1e6,
+            kv_budget_bytes() / (1024 * 1024)
         );
         tracing::info!(
             "quant mode: {}{}",
@@ -1217,5 +1280,41 @@ mod tests {
         assert!(done_any, "短い側がバッチ途中で完了していること");
         assert_eq!(s0.into_output(), ref_s);
         assert_eq!(s1.into_output(), ref_l);
+    }
+
+    #[test]
+    fn resolve_kv_budget_keeps_small_kv_models_at_defaults() {
+        // Qwen2.5-0.5B 相当 (slot 940MB): 従来どおり 4 スロット + ctx 全幅 prefix
+        let (slots, prefix) = resolve_kv_budget(32768, 24_576, None, None, 12288 * 1024 * 1024);
+        assert_eq!(slots, DEFAULT_BATCH_SLOTS);
+        assert_eq!(prefix, 32768);
+        // Qwen2.5-1.5B 相当 (slot 1.88GB): 4 スロット + ctx 全幅が予算内に収まる
+        let (slots, prefix) = resolve_kv_budget(32768, 57_344, None, None, 12288 * 1024 * 1024);
+        assert_eq!(slots, DEFAULT_BATCH_SLOTS);
+        assert_eq!(prefix, 32768);
+    }
+
+    #[test]
+    fn resolve_kv_budget_shrinks_for_large_kv_models() {
+        // Qwen3-0.6B 相当 (slot ~9.4GB): スロット 1、残り予算を prefix に充てる
+        let (slots, prefix) =
+            resolve_kv_budget(40960, 229_376, None, None, 12288 * 1024 * 1024);
+        assert_eq!(slots, 1);
+        assert_eq!(prefix, (12288 * 1024 * 1024 - 40960 * 229_376) / 229_376); // 15214
+        // スロットが予算の半分以下なら残りを prefix に充てる
+        let (slots, prefix) = resolve_kv_budget(32768, 114_688, None, None, 12288 * 1024 * 1024);
+        assert_eq!(slots, 3); // 3.66GB × 3 = 11GB ≤ 12.288GB
+        assert_eq!(prefix, 32768.min((12288 * 1024 * 1024 - 3 * 32768 * 114_688) / 114_688));
+    }
+
+    #[test]
+    fn resolve_kv_budget_respects_explicit_env() {
+        // 明示指定は予算より優先
+        let (slots, prefix) = resolve_kv_budget(40960, 229_376, Some(2), Some(1000), 0);
+        assert_eq!(slots, 2);
+        assert_eq!(prefix, 1000);
+        // スロット 0 指定は 1 にクランプ
+        let (slots, _) = resolve_kv_budget(32768, 24_576, Some(0), None, 12288 * 1024 * 1024);
+        assert_eq!(slots, 1);
     }
 }

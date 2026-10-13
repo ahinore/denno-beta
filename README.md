@@ -8,7 +8,7 @@ An Anthropic Messages API–compatible LLM server written in Rust.
 The goal is to understand how LLMs work (tokenization → forward pass → sampling → decode loop) through code, so the **inference kernel is implemented entirely from scratch** (no existing LLM libraries such as candle). Structural reference: [ashhart/TensorFold](https://github.com/ashhart/TensorFold)
 
 - **Single binary** `denno` (CLI `pull/models/info/generate/serve` + axum HTTP server + inference engine). CPU only, no GPU required
-- Supported models: GPT-2 124M, Llama-family (RMSNorm+RoPE+SwiGLU+GQA) = **Qwen2.5-0.5B–7B-Instruct** (with chat templates)
+- Supported models: GPT-2 124M, Llama-family (RMSNorm+RoPE+SwiGLU+GQA) = **Qwen2.5-0.5B–7B-Instruct**, **Qwen3-0.6B** (QK-Norm, thinking mode) — with chat templates
 - **Exact decoding**: fixed seed + temperature 0 → bit-identical output for the same input. A discipline kept intact across optimizations and parallelization (continuous batching / SIMD), enforced by exactness tests in CI
 - Continuous batching (decode of multiple sessions combined into one forward, KV slot pool), prefix cache (largest-LCP selection), int8 quantization (SIMD integer kernel, half the weight memory)
 - **Inference visualization (denno-trace)**: telemetry that never makes inference wait (`DENNO_TELEMETRY=1`, off by default, read-only) + a separate visualization server `denno-view`. Watch the model-driven program animation (stepped implementation code, layer panel, KV/variables) in the browser

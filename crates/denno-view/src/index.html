@@ -355,7 +355,7 @@ function decodeFrame(buf) {
 
 // ---------- OP 名 (denno-engine::prof と同一対応) ----------
 const OP_NAMES = ["embed","rmsnorm","rope","qkv_proj","attn_core","o_proj",
-  "gate_up_proj","swiglu","down_proj","final_norm","lm_head","sampler","detok"];
+  "gate_up_proj","swiglu","down_proj","final_norm","lm_head","sampler","detok","qk_norm"];
 
 // ---------- トークナイザ (id → 文字。/tokenizer.json は denno-view が配信) ----------
 // byte-level BPE (GPT-2 方式) の逆マップ: トークン文字列をバイト列に戻して UTF-8 デコード
