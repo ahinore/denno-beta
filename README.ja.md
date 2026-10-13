@@ -58,6 +58,10 @@ VIEW_TOKENIZER=~/.cache/denno/hub/models--Qwen--Qwen2.5-0.5B-Instruct/tokenizer.
 #    モデル駆動プログラム・層パネル・KV/変数のアニメーションが連動して動く
 ```
 
+**動作デモ** — 内蔵チャットで生成すると、モデル駆動プログラムが実装コードをステップ実行し、層/KV/変数パネルが連動してアニメーションします:
+
+![denno-view 動作デモ](docs/assets/denno_view.gif)
+
 `denno-view` の環境変数: `VIEW_UPSTREAM`(既定 `ws://127.0.0.1:8080/v1/telemetry/ws`)、`VIEW_PORT`(既定 8093)、`VIEW_RECORD`(フレームをファイル記録=リプレイ用)、`VIEW_TOKENIZER`(トークン文字表示用の tokenizer.json パス)。
 
 ## ドキュメント
