@@ -285,7 +285,21 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **decode 限定オフロード**: GEMV 型カーネル(1 warp/出力)は行数 m に比例して重み再読みが増えるため prefill の GEMM に弱い(**実測 m=128 で 0.39x**)。`m > DENNO_CUDA_MAX_M`(既定 16)は CPU のまま — prefill の性能を損なわず、decode・バッチ decode(m≤閾値)のみ GPU 化
 - **検証**: ①パイプライン bit-exact(apply_bt 経由、4 形状・lm_head 1536×151936 含む)②tiny モデル forward 全体の GPU オフロード bit-exact(prefill+バッチ decode vs 単独)③CPU 106 テスト回帰変わりなし(cuda feature 無し)④**e2e**: Qwen2.5-1.5B int8 で CPU serve と GPU serve の応答テキスト・usage を完全一致(2 プロンプト・200 tok greedy・並行 2 リクエストのバッチ decode も単独と一致)
 - **e2e 実測**: 200 tok greedy 生成 **CPU 9.08s → GPU 2.66s(3.4x)**。VRAM 使用は重み 234MB(lm_head)+層重み ≈ 1GB 強
-- **op 別プロファイル比較** (`DENNO_PROFILE=1`、200 tok greedy ×3 リクエスト・600 decode step+prefill 累計): CPU では gate_up 40.9% / down 21.4% / attn 11.2% / lm_head 10.7%(**TOTAL 28,591ms**)だったのに対し、CUDA オフロードでは **線形層が 86%→62% に縮小し attn_core が最大 op 化(28.6%、TOTAL 9,686ms)** — 次の律速は attention 融合カーネルと明確化。層別倍率: gate_up 4.99x / down 4.26x / lm_head **10.9x** / o 2.70x / qkv 1.27x(3 分割 × 50,400 呼び出しで固定オーバーヘッド支配 — 融合候補)。decode 22.1→**75.8 tok/s**
+- **op 別プロファイル比較** (`DENNO_PROFILE=1`、200 tok greedy ×3 リクエスト・600 decode step+prefill 累計):
+
+  | op | CPU ms | CPU % | CUDA ms | CUDA % | 高速化 |
+  |---|---:|---:|---:|---:|---:|
+  | lm_head | 3,049 | 10.7% | 281 | 2.9% | **10.9x** |
+  | gate_up | 11,685 | 40.9% | 2,340 | 24.2% | **4.99x** |
+  | down | 6,108 | 21.4% | 1,432 | 14.8% | 4.26x |
+  | o | 1,594 | 5.6% | 590 | 6.1% | 2.70x |
+  | qkv | 2,051 | 7.2% | 1,614 | 16.7% | 1.27x |
+  | attn_core | 3,190 | 11.2% | 2,767 | 28.6% | 1.15x |
+  | swiglu | 554 | 1.9% | 420 | 4.3% | 1.32x |
+  | other | ≈361 | 1.3% | ≈243 | 2.5% | 1.49x |
+  | **TOTAL** | **28,591** | 100% | **9,686** | 100% | **2.95x** |
+
+  decode 22.1→**75.8 tok/s**(e2e 3.4x)。**線形層が 86%→62% に縮小し attn_core が最大 op 化(28.6%)** — 次の律速は attention 融合カーネルと明確化。qkv は 3 分割 × 50,400 呼び出しで固定オーバーヘッド支配(1.27x)→ P17c で融合
 
 ### P17c: GPU 線形層融合(qkv / gate+up のグループ化呼び出し) ✅ (2026-10-13, commit `7bf9eb0`)
 
@@ -295,7 +309,21 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **スレッドローカル current context の発見(本フェーズ最大の教訓)**: CUDA の current context はスレッドローカル。libtest は `--test-threads=1` でも**テスト毎に新スレッドを立てる**ため、初期化スレッドで 1 回 `cuCtxSetCurrent` しただけでは他スレッドの `cuMemAlloc` が **error 201 INVALID_CONTEXT** で失敗する。さらに失敗は GPU_BROKEN→CPU フォールバックで静かに吸収されるため「GPU テストが緑 = GPU で実行された」にならない(今回追加した融合テストだけが `expect` で None を明示的に落としたため発覚 — P17b のモデル統合テストは CPU vs CPU の比較になっていても緑になり得た)。`CudaCtx::make_current()` を GPU 操作入口で毎回呼ぶよう修正し、サーバー側マルチスレッドの潜在バグも同時に解消
 - **検証**: ①融合 vs 個別呼び出しの bit-exact(qkv 型 3 パート(異なる n)+gate/up 型 2 パート、m=1/4)②tiny モデル forward 全体の bit-exact(prefill+バッチ decode)③CPU 106 テスト回帰変わりなし④**e2e**: Qwen2.5-1.5B int8 200 tok greedy で CPU serve と**テキスト・usage 完全一致**(3 リクエスト、usage 49 in/200 out)
 - **e2e 実測**: 200 tok 生成 **GPU 2.638s → 2.146s(−19%)**。理論予測(削減オーバーヘッド 84µs/層/step × 28 層 × 600 step ≈ 0.47s/リクエスト → 2.64−0.47=2.17s)と一致。CPU 10.67s → **4.96x**。重みアップロードは grouped 56(=28 層 × 2 グループ)+ 個別 57(=down 28+o 28+lm_head 1)で呼び出し内訳と完全整合
-- 残る CUDA 候補: attention 融合カーネル(attn_core 28.6% = GPU 最大 op)・paged KV・sampler カーネル
+- **融合後プロファイル再取得**(`DENNO_PROFILE=1`・P17b 節と同一ワークロード・融合前の分布は P17b 節の表参照):
+
+  | op | P17b GPU ms | P17c GPU ms | 変化 |
+  |---|---:|---:|---:|
+  | qkv | 1,614 | 610 | **−62%** |
+  | gate_up | 2,340 | 1,850 | **−21%** |
+  | attn_core | 2,767 | 2,623 | −5% |
+  | swiglu | 420 | 405 | −4% |
+  | lm_head | 281 | 275 | −2% |
+  | down | 1,432 | 1,426 | ±0% |
+  | o | 590 | 591 | ±0% |
+  | **TOTAL** | **9,686** | **8,021** | **−17%** |
+
+  CPU 側は再計測で TOTAL 28,532ms(P17b の 28,591ms とほぼ不変)。op 合計比 **2.95x→3.56x**・decode **75.8→96.1 tok/s**・e2e(CPU 9.07s → GPU 2.08s)**4.36x**。削減量は理論値と一致(qkv: 2 呼び出し分 941ms/3req 理論 vs −1,004ms 実測・gate_up: 470ms vs −489ms)。**attn_core がさらに最大 op 化(28.6%→32.7%)** — 次の律速は attention 融合カーネルで確定
+- 残る CUDA 候補: attention 融合カーネル(attn_core 32.7% = GPU 最大 op)・paged KV・sampler カーネル
 
 ## 4. 次の実装候補
 
