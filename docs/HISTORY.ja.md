@@ -408,17 +408,23 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **PTX**(kernels_elem): sha256 `c41520a9c7b50b4f2aaea0c6fe6b2083c8361efd87e7a997999b89de1ad57971`(コンテナ内 `nvcc -ptx -arch=compute_75 -fmad=false -O3` で 2 回コンパイルし照合済み)
 - **テスト基盤の修正(P17g から潜在していたフレークを顕在化・解消)**: ①グローバル `GPU_ATTN` フラグを差し替えるテストとフラグ状態に依存するテスト(ビット一致/近似一致がフラグで変わる)が並列実行で競合 — `test_lock()` でフラグを扱う/依存する cuda テストを直列化(毒化は `unwrap_or_else(PoisonError::into_inner)` で復帰)②`chain_upload` は pinned (pin_x) を共有するため**同期を挟まない連続 2 回 upload** で DMA 完了前に pinned が上書きされデバイス入力が化ける(`cuda_chain_elem_bit_exact_vs_cpu` が並列実行時にフレーム。本番経路は upload 間に download 同期が挟まるため無問題 — テスト側に `ctx.sync()` を追加)
 
-### P17k(調査のみ・未実装): post-P17j の律速分析 — prefill 線形層の GEMM/転送構造 (2026-10-14)
+### P17k: prefill 線形層のデバイス常駐化 — FFN ブロック (gate_up → swiglu → down) ✅ (2026-10-14)
 
 > P17j 後の 13,252 トークン cold prefill(単発・PROFILE TOTAL 73.6s)の残り律速: gate_up_proj 36.0s (49.0%) / attn_core 12.1s (16.4%) / swiglu 8.2s / down_proj 5.2s / qkv_proj 4.5s / rope 2.7s / o_proj 2.4s / rmsnorm 2.3s。**prefill 中の GPU 使用率はほぼ 0%**(スパイクのみ)— 壁時間はカーネルではなく CPU 側処理+転送+同期構造が支配。
 
-- **計測**(`cuda_gemm_i8_bench_prefill_shapes`、#[ignore]): m=13,252 での 1 呼び出し — gate_up (k=1536,n=17920) **508ms**(出力 949MB!)・down (k=8960,n=1536) 125ms・qkv (k=1536,n=2048) 65ms。本番経路(linear_gemm: Scratch+pinned)で 28 回連続だと **845ms/回**に悪化(単発比 +66% — 持続負荷でのスロットリング/メモリ圧の疑い)。28 層 × 845ms ≈ 23.7s + 層間の他処理の干渉 → プロファイルの 36s と整合
+- **調査**(2026-10-14 前半・`cuda_gemm_i8_bench_prefill_shapes`、#[ignore]): m=13,252 での 1 呼び出し — gate_up (k=1536,n=17920) **508ms**(出力 949MB!)・down (k=8960,n=1536) 125ms・qkv (k=1536,n=2048) 65ms。本番経路(linear_gemm: Scratch+pinned)で 28 回連続だと **845ms/回**に悪化(単発比 +66% — 持続負荷でのスロットリング/メモリ圧の疑い)
 - **構造問題**: `linear_gemm` は毎回 **[m,n] fp32 出力を丸ごと D2H(949MB)+to_vec(949MB の Vec アロケート+コピー)** してから次層の入力として再度 H2D している。gate_up 1 回で約 1.9GB がホスト⇔デバイスを行き帰りする
-- **次の実装候補(P17k 本体)の優先順**:
-  1. **prefill のデバイス常駐パイプライン**(P17d の decode chain の prefill 版): [m,n] 出力をホストに落とさず次層へ渡す → gate_up/down/qkv/o_proj の D2H+H2D(約 7-10s)と to_vec のアロケートが消える。rope/attention(P17j 済)/rmsnorm/swiglu は既にビット一致 GPU カーネルがあるので流用可能
-  2. **swiglu の prefill 適用**: dno_swiglu は decode chain でビット一致済み → そのまま prefill に使えば CPU の f64 expf 8.2s ほぼゼロに(1 だけでも簡単で効果大)
-  3. **GEMM カーネル改善**: 現行 64×64・1 thread 4×4・TK=32 はレイテンシ律速気味。128×128 タイル+8×8/thread+ベクトルロードで 2-4x を見込む(整数累積なのでビット一致は構造的に保証)
-  4. **prefill attention の exp 高速化**: dno_expf(f64 による glibc 完全再現)は m²/2×heads ≈ 10 億回呼ばれ attn_core 12.1s の大部分の可能性。attention は緩和枠(ユーザー承認済み)なので `exp2f` ベースに置換可能(決定論は維持・タイル内順序不変)
+- **実装(ステップ 1+2: FFN デバイス常駐)**:
+  - 新カーネル **`dno_swiglu_int`**(kernels_elem): [m, 2ff] の interleaved(行ごと [gate|up])レイアウトから直接 swiglu — grouped GEMM 出力を D2H せず読むための変種。演算列は dno_swiglu と同一(dno_expf + `__fdiv_rn` + `__fadd_rn` + `__fmul_rn`)なので CPU(silu_inplace+要素積)と**ビット一致**
+  - **`maybe_gpu_ffn`(cuda.rs)**: gate_up GEMM → swiglu_int → act 量子化 → down GEMM を**全てデバイス上で連結実行**し down 出力 [m, e](81MB)のみ D2H。中間 [m, 2ff](949MB)の D2H+to_vec+分割コピー+swiglu CPU+H2D が全て消える。Scratch に act/aq2/asc2/out2 を追加。prof は GATE_UP/SWIGLU/DOWN に帰属(キュー待ちの実態は sync を含む DOWN に計上)
+  - llama.rs prefill の mlp ブロックに `#[cfg(feature="cuda")]` フック(成功時 residual add + `continue`、失敗時/対象外は従来経路)。**全段が CPU とビット一致**(GEMM: 整数累積・quantize/swiglu: 実証済み同一演算)なので緩和は不要
+  - **テスト**: `cuda_ffn_bit_exact_vs_cpu_reference` — CPU 参照(grouped matvec → silu_inplace+要素積 → down matvec、prefill 従来経路と同一の行ごと gate 分割)と**ビット一致**。GPU cuda_ **20/20**(3 連続で安定)、CPU **110**、exactness **6 基準**
+  - **性能**(13,252 トークン cold): **wall 77.9s → 33.6s・PROFILE TOTAL 73.6s → 29.1s**。gate_up_proj 36.0s → **0.6ms**、swiglu 8.2s → **0.2ms**(共に消滅)。FFN ブロック実質 1.77s/層 → 0.18s/層(**約 10 倍**)。応答正常("OK")。残り律速: attn_core 12.1s (41%) / down 5.1s(実態は gate_up+swiglu のキュー待ちを含む)/ qkv 4.5s / rope 2.7s / o_proj 2.4s
+  - **PTX**(kernels_elem): sha256 `da87a462ef27bf7b71fbe5f5b1a0701a36807ba5b2651cb0f576ce90461d100a`(dno_swiglu_int 追加・再コンパイル照合済み)
+- **残る実装候補(ステップ 3 以降)**:
+  1. **attention 周りのデバイス連続化**: qkv GEMM 出力をデバイスに置いたまま rope(GPU・dno_rope_qkv はビット一致済み)→ K/V をホストキャッシュに D2H(小: 27MB/層)→ attention(P17j 済)→ o_proj が att を CH_ATT から直接読む。qkv/rope/o_proj の往復転送(計 ~4.5s+2.7s)が対象
+  2. **GEMM カーネル改善**: 現行 64×64・1 thread 4×4・TK=32 はレイテンシ律速気味。128×128 タイル+8×8/thread+ベクトルロードで 2-4x を見込む(整数累積なのでビット一致は構造的に保証)
+  3. **prefill attention の exp 高速化**: dno_expf(f64 による glibc 完全再現)は m²/2×heads ≈ 10 億回呼ばれ attn_core 12.1s の大部分の可能性。attention は緩和枠(ユーザー承認済み)なので `exp2f` ベースに置換可能(決定論は維持・タイル内順序不変)
 
 ## 4. 次の実装候補
 

@@ -672,6 +672,26 @@ impl Model for LlamaQwen2 {
             let h2 = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
                 rmsnorm(&x, &layer.ln2_w, e, self.eps)
             });
+            // P17k: FFN 線形ブロック (gate_up → swiglu → down) をデバイス常駐で
+            // 実行。全段ビット一致 (GEMM: 整数累積・swiglu: dno_swiglu と同一演算)
+            // なので出力は従来経路と完全同一。中間 [m, 2ff] をホストに落とさない。
+            // 失敗時/対象外 (m が小さい等) は従来経路へフォールバック。
+            #[cfg(feature = "cuda")]
+            {
+                if let (Some(gq), Some(uq), Some(dq)) = (
+                    layer.gate_w.quant8(),
+                    layer.up_w.quant8(),
+                    layer.down_w.quant8(),
+                ) {
+                    if let Some(down) = crate::cuda::maybe_gpu_ffn(gq, uq, dq, &h2, n, self.ff, li) {
+                        for i in 0..n * e {
+                            x[i] += down[i];
+                        }
+                        crate::telemetry_layer_flush();
+                        continue;
+                    }
+                }
+            }
             let (mut gate, up) = crate::prof::time_layer(crate::prof::GATE_UP, li, || {
                 // P17c: gate/up は同一入力 → 1 回の GPU 呼び出しに融合
                 #[cfg(feature = "cuda")]
