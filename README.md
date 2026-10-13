@@ -72,4 +72,4 @@ VIEW_TOKENIZER=~/.cache/denno/hub/models--Qwen--Qwen2.5-0.5B-Instruct/tokenizer.
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+Dual licensed under MIT or Apache License 2.0 — see [LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE).
