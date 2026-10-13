@@ -72,4 +72,4 @@ VIEW_TOKENIZER=~/.cache/denno/hub/models--Qwen--Qwen2.5-0.5B-Instruct/tokenizer.
 
 ## ライセンス
 
-Apache License 2.0 — [LICENSE](LICENSE) を参照。
+MIT または Apache License 2.0 のデュアルライセンス — [LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE) を参照。
