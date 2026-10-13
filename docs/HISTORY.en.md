@@ -361,6 +361,19 @@ pie showData title P9 fp32 batch (4x256) per-op time
 - **Fix (discovered)**: the committed `kernels_elem.ptx` **did not match** compiling the committed `.cu` with `nvcc -arch=compute_75 -fmad=false` (committed at P17d without a hash check); this caused a 1/455,078,062 mismatch in the GPU expf test. Replaced with a fresh compile; GPU tests back to 12/12. **Lesson: always hash-verify generated artifacts (.ptx) against the validated build before committing**
 - Verification: engine CPU 110 ok + workspace green + GPU cuda_ 12/12 + e2e GPU/CPU responses fully identical (18091/18092)
 
+### P17g: GPU offload of decode attention (dno_attention kernel + GPU KV mirror) ✅ (2026-10-13, commit `bf2a3c6`)
+
+> With user approval ("CPU/GPU mismatch is acceptable"), only the attention exactness contract is relaxed to enable GPU offload. The bit-exactness contracts for linear layers (int8) / expf / swiglu / rmsnorm are unchanged.
+
+- **dno_attention kernel**: grid=(heads), block=(dh); one block handles one q head (GQA: kvh=h/group). scores → softmax (exp uses dno_expf to minimize the CPU delta) → probs@V. Shared memory dh*4 bytes
+- **GPU KV mirror**: the host KvCache stays authoritative; a decode-chain copy is kept per session on the device (keyed by `KvCache::kv_id()`, no collisions since caches are not cloned). Missing rows are bulk-uploaded H2D on the next chain_attention; rollback/evict re-seed automatically via the len comparison. LRU eviction beyond `DENNO_GPU_KV_MB` (default 8192MB)
+- **Applied on both paths**: solo (forward/forward_decode_gpu) and batch (forward_batch/chain_attention_batch). **GPU attention only consumes already-biased q/k/v and is independent of bias/QK-Norm**, so it does not depend on chain_compatible (the solo chain condition). Adopted only when all sessions succeed; any failure redoes all sessions with CPU attention (no mixing) → the solo/batch bit-identity contract (P6) is preserved
+- **Key finding**: production Qwen2.5-1.5B **has QKV biases** (from safetensors), so the solo chain had never fired since P17d (the P17f GPU e2e speedup came from per-op GPU linears). The initial implementation gated GPU attention on chain_compatible, so it never engaged either; identified by temporary logging, then the gate was removed and the per-op path also wired up. **Lesson: "green" does not prove a path fires — verify path gates once against the real model structure**
+- **`DENNO_GPU_ATTN=0`**: escape hatch that disables GPU attention and restores the bit-exact CPU attention path
+- Tests: `cuda_attention_kernel_vs_cpu_close` (kernel vs CPU reference, maxabs 2.98e-8) and `cuda_gpu_attention_forward_vs_cpu_close` (GPU/CPU greedy token match + small logits tolerance). GPU cuda_ **14/14**, CPU **110**, exactness **6 criteria** pass
+- **Performance** (1.5B int8, long-context decode, t≈7700, 128 tokens): CPU attention **18.52s → GPU attention 4.23s** (**4.4x**). At short contexts (t≈130) ON/OFF are nearly equal (sync-bound); the benefit concentrates at long context
+- **Known remaining items**: ① long-prompt prefill is slow (~100s at t≈2810; pre-existing issue unrelated to P17g, needs investigation) ② GPU/CPU e2e responses now differ due to the relaxed attention (start the GPU side with `DENNO_GPU_ATTN=0` to restore bit-exact comparison) ③ GPU attention gains little at short context (rope/syncs remain — next candidate)
+
 ## 4. Candidate List
 
 - [x] ~~**sampler optimization**: softmax + top-p sort over the 152k vocab cost a fixed ~3.5ms/step (found in P7.5)~~ → **done in P8** (0.66ms/step, greedy unchanged)
