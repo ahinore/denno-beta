@@ -289,6 +289,8 @@ pub struct CudaCtx {
     module: CUmodule,
     f_quant: CUfunction,
     f_mv: CUfunction,
+    // P17i: prefill 用 tiled GEMM (dno_gemm_i8)
+    f_gemm: CUfunction,
     // P17d: 要素演算モジュール (swiglu / add+rmsnorm / expf probe)
     #[allow(dead_code)]
     module_elem: CUmodule,
@@ -352,6 +354,7 @@ impl CudaCtx {
 
             let mut f_quant: CUfunction = std::ptr::null_mut();
             let mut f_mv: CUfunction = std::ptr::null_mut();
+            let mut f_gemm: CUfunction = std::ptr::null_mut();
             check(
                 (lib.module_get_function)(&mut f_quant, module, b"dno_quantize_rows\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_quantize_rows)",
@@ -359,6 +362,11 @@ impl CudaCtx {
             check(
                 (lib.module_get_function)(&mut f_mv, module, b"dno_matvec_rows_bt_i8\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_matvec_rows_bt_i8)",
+            )?;
+            // P17i: prefill 用 tiled GEMM (m が大きいときの GEMV 型カーネル置き換え)
+            check(
+                (lib.module_get_function)(&mut f_gemm, module, b"dno_gemm_i8\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_gemm_i8)",
             )?;
 
             // P17d: 要素演算モジュール (-fmad=false でコンパイル済み。FMA 縮約は
@@ -405,6 +413,7 @@ impl CudaCtx {
                 module,
                 f_quant,
                 f_mv,
+                f_gemm,
                 module_elem,
                 f_swiglu,
                 f_addnorm,
@@ -553,6 +562,57 @@ impl CudaCtx {
         debug_assert_eq!(scale.bytes(), n * 4);
         let (aq, asc) = self.quantize_rows(a, m, k)?;
         self.matvec_rows_bt_i8_dev(&aq, &asc, w, scale, m, k, n)
+    }
+
+    /// P17i: tiled GEMM (dno_gemm_i8) で実行。`linear_bt_i8` とビット一致。
+    /// テストとベンチ用 (本番経路は `linear_gemm` を使う)。
+    pub fn linear_gemm_i8_dev(
+        &self,
+        aq: &DevBuffer,
+        asc: &DevBuffer,
+        w: &DevBuffer,
+        scale: &DevBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>> {
+        let dev_out = DevBuffer::alloc(m * n * 4)?;
+        unsafe {
+            let (mut paq, mut pasc, mut pw, mut psc, mut pout) =
+                (aq.ptr, asc.ptr, w.ptr, scale.ptr, dev_out.ptr);
+            let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, n as c_int);
+            let mut args = [
+                &mut paq as *mut _ as *mut c_void,
+                &mut pasc as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut psc as *mut _ as *mut c_void,
+                &mut pout as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            let gmx = m.div_ceil(64) as u32;
+            let gmy = n.div_ceil(64) as u32;
+            self.launch_async(self.f_gemm, (gmx, gmy, 1), (16, 16, 1), 2 * 64 * 32, &mut args)?;
+            self.sync()?;
+        }
+        dev_out.to_vec::<f32>(m * n)
+    }
+
+    /// P17i: ホストのアクティベーションから tiled GEMM を実行 (量子化込み)。
+    pub fn linear_gemm_i8(
+        &self,
+        a: &[f32],
+        w: &DevBuffer,
+        scale: &DevBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>> {
+        debug_assert_eq!(w.bytes(), k * n);
+        debug_assert_eq!(scale.bytes(), n * 4);
+        let (aq, asc) = self.quantize_rows(a, m, k)?;
+        self.linear_gemm_i8_dev(&aq, &asc, w, scale, m, k, n)
     }
 
     /// 重みを VRAM へアップロード (起動時に1度)
@@ -746,6 +806,23 @@ fn max_m() -> usize {
 
 use crate::quant::Quant8Linear;
 
+/// P17i: 大きい m (prefill) 用の tiled GEMM 経路を有効にするか。
+/// `DENNO_CUDA_GEMM=0` で無効化 (従来どおり CPU へ)。
+fn gemm_enabled() -> bool {
+    std::env::var("DENNO_CUDA_GEMM").ok().as_deref() != Some("0")
+}
+
+/// P17i: tiled GEMM を発動する最小の m。小さい m では GEMM 経路の層あたり
+/// sync (H2D/quantize/gemm/D2H × 4 層/層) が CPU GEMM より高くつくため、
+/// ある程度大きい m から発動させる (m=38 の短文 prefill は CPU が速い)。
+/// `DENNO_CUDA_GEMM_MIN_M` で変更可。0 にすると m>max_m() で常に発動。
+fn gemm_min_m() -> usize {
+    std::env::var("DENNO_CUDA_GEMM_MIN_M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+}
+
 /// P17c: 複数の int8 Linear を 1 回の GPU 呼び出しに融合する (QKV / gate+up 用)。
 /// 同じ入力を消費する線形層群の重み行を**パート順に連結**した 1 つのバッファとして
 /// 登録・計算する。各行の演算 (量子化スケール・i32 累積・スケール乗算) は個別
@@ -755,7 +832,12 @@ use crate::quant::Quant8Linear;
 ///
 /// 戻り値 None = CPU パス (無効/初期化失敗/実行時エラー/m>閾値/一部が Q8 でない)。
 pub fn maybe_gpu_linear_grouped(parts: &[&Quant8Linear], a: &[f32], m: usize) -> Option<Vec<f32>> {
-    if !cuda_enabled() || m > max_m() || parts.is_empty() {
+    if !cuda_enabled() || parts.is_empty() {
+        return None;
+    }
+    let use_gemm = m > max_m() && m >= gemm_min_m() && gemm_enabled();
+    // m が GEMV 経路の上限を超えて GEMM も発動しないなら CPU へ
+    if m > max_m() && !use_gemm {
         return None;
     }
     let k = parts[0].k;
@@ -775,7 +857,13 @@ pub fn maybe_gpu_linear_grouped(parts: &[&Quant8Linear], a: &[f32], m: usize) ->
             return None;
         }
     };
-    match linear_pinned(ctx, a, gw, m, k, n) {
+    // P17i: m が大きい (prefill) ときは tiled GEMM、小さいときは GEMV 型
+    let r = if use_gemm {
+        linear_gemm(ctx, a, gw, m, k, n)
+    } else {
+        linear_pinned(ctx, a, gw, m, k, n)
+    };
+    match r {
         Ok(out) => Some(out),
         Err(e) => {
             tracing::error!("CUDA grouped linear failed, falling back to CPU permanently: {e:#}");
@@ -836,7 +924,12 @@ pub fn maybe_gpu_linear(
     n: usize,
     m: usize,
 ) -> Option<Vec<f32>> {
-    if !cuda_enabled() || m > max_m() {
+    if !cuda_enabled() {
+        return None;
+    }
+    let use_gemm = m > max_m() && m >= gemm_min_m() && gemm_enabled();
+    // m が GEMV 経路の上限を超えて GEMM も発動しないなら CPU へ
+    if m > max_m() && !use_gemm {
         return None;
     }
     let ctx = shared_ctx()?;
@@ -853,7 +946,15 @@ pub fn maybe_gpu_linear(
             return None;
         }
     };
-    match linear_pinned(ctx, a, gw, m, k, n) {
+    // P17i: m が大きい (prefill) ときは tiled GEMM、小さい (decode/batch) ときは
+    // GEMV 型カーネル (固定オーバーヘッドが小さい) を使い分ける。どちらも CPU と
+    // ビット一致。
+    let r = if use_gemm {
+        linear_gemm(ctx, a, gw, m, k, n)
+    } else {
+        linear_pinned(ctx, a, gw, m, k, n)
+    };
+    match r {
         Ok(out) => Some(out),
         Err(e) => {
             // 実行時エラーは再試行せず恒久的に CPU へ (数値は同一仕様なので不変)
@@ -931,6 +1032,83 @@ fn linear_pinned(
             let total = (m * n) as u64;
             let blocks = total.div_ceil(8) as u32;
             ctx.launch_async(ctx.f_mv, (blocks, 1, 1), (256, 1, 1), 0, &mut args)?;
+
+            check(
+                (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync",
+            )?;
+        }
+        ctx.sync()?;
+        Ok(ho.as_slice::<f32>()[..m * n].to_vec())
+    })
+}
+
+/// P17i: 大きい m (prefill) 用 — tiled GEMM カーネル (dno_gemm_i8) で実行。
+/// パイプラインは linear_pinned と同一 (H2D → quantize → gemm → D2H → sync ×1)。
+/// 整数累積は順序不変なのでタイル化しても CPU とビット一致。
+fn linear_gemm(
+    ctx: &CudaCtx,
+    a: &[f32],
+    gw: &GpuW,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>> {
+    debug_assert_eq!(a.len(), m * k);
+    let lib = lib()?;
+    ctx.make_current()?;
+    SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        let Scratch { x, aq, asc, out, hx, ho } = &mut *s;
+        let bytes_x = m * k * 4;
+        let bytes_out = m * n * 4;
+        Scratch::ensure(x, bytes_x)?;
+        Scratch::ensure(aq, m * k)?;
+        Scratch::ensure(asc, m * 4)?;
+        Scratch::ensure(out, bytes_out)?;
+        Scratch::ensure_pin(hx, bytes_x)?;
+        Scratch::ensure_pin(ho, bytes_out)?;
+        let (dx, daq, dasc, dout) = (
+            x.as_ref().unwrap(),
+            aq.as_ref().unwrap(),
+            asc.as_ref().unwrap(),
+            out.as_ref().unwrap(),
+        );
+        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        hx.as_mut_slice::<f32>()[..m * k].copy_from_slice(a);
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(dx.ptr(), hx.ptr as *const c_void, bytes_x, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync",
+            )?;
+            let (mut px, mut paq, mut pasc) = (dx.ptr(), daq.ptr(), dasc.ptr());
+            let (mut mc, mut kc) = (m as c_int, k as c_int);
+            let mut args = [
+                &mut px as *mut _ as *mut c_void,
+                &mut paq as *mut _ as *mut c_void,
+                &mut pasc as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(ctx.f_quant, (m as u32, 1, 1), (256, 1, 1), 256 * 4, &mut args)?;
+
+            let (mut paqi, mut pasci, mut pw, mut psc, mut pout) =
+                (daq.ptr(), dasc.ptr(), gw.w.ptr(), gw.sc.ptr(), dout.ptr());
+            let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, n as c_int);
+            let mut args = [
+                &mut paqi as *mut _ as *mut c_void,
+                &mut pasci as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut psc as *mut _ as *mut c_void,
+                &mut pout as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            // 64x64 タイル × 16x16 thread (1 thread が 4x4 出力)
+            let gmx = m.div_ceil(64) as u32;
+            let gmy = n.div_ceil(64) as u32;
+            ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 2 * 64 * 32, &mut args)?;
 
             check(
                 (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
@@ -1919,6 +2097,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// P17i: tiled GEMM カーネル (dno_gemm_i8) が CPU int8 線形と**ビット一致**
+    /// すること。タイル境界 (m/n が 64 の倍数でない)・k が 4/32 の倍数でない
+    /// 場合・GEMV との比較 (同一入力で両カーネルが同一結果) を含む。
+    #[test]
+    #[ignore]
+    fn cuda_gemm_i8_bit_exact_vs_cpu() {
+        let ctx = CudaCtx::new().unwrap();
+        println!("device: {}", ctx.info());
+        // m はタイル境界をまたぐ値 (1/63/64/65/100/2827 相当)・k/n は 4 や 32 の
+        // 倍数でない値を含む。実モデル形状 (k=1536/8960) も含む。
+        let cases: [(usize, usize, usize); 8] = [
+            (1, 8, 16),
+            (63, 37, 200),
+            (65, 30, 197),
+            (100, 1536, 17920),
+            (128, 8960, 1536),
+            (100, 1536, 2048),
+            (130, 1533, 17911),
+            (64, 1536, 17920),
+        ];
+        for (ci, &(m, k, n)) in cases.iter().enumerate() {
+            let q = pseudo_i8(k * n, 40 + ci as u32);
+            let scale = positive_scales(n, 50 + ci as u32);
+            let a = pseudo_random(m * k, 60 + ci as u32);
+            let w = ctx.upload_i8(&q).unwrap();
+            let sc = ctx.upload_f32(&scale).unwrap();
+            // GEMM カーネル vs CPU
+            let got = ctx.linear_gemm_i8(&a, &w, &sc, m, k, n).unwrap();
+            let want = tensor::matvec_rows_bt_i8(&a, &q, &scale, k, n, m);
+            for idx in 0..m * n {
+                assert_eq!(
+                    got[idx].to_bits(),
+                    want[idx].to_bits(),
+                    "gemm m={m} k={k} n={n} idx={idx} (i={} j={}): GPU != CPU",
+                    idx / n,
+                    idx % n
+                );
+            }
+            // GEMV カーネルともビット一致 (整数累積の順序不変性の検証)
+            let gotv = ctx.linear_bt_i8(&a, &w, &sc, m, k, n).unwrap();
+            for idx in 0..m * n {
+                assert_eq!(got[idx].to_bits(), gotv[idx].to_bits(), "gemm vs gemv m={m} k={k} n={n} idx={idx}");
+            }
+        }
+        println!("dno_gemm_i8 bit-exact vs CPU/GEMV OK ({} cases)", cases.len());
     }
 
     /// マイクロベンチ: Qwen2.5-1.5B の線形層 (int8) を decode (m=1) で
