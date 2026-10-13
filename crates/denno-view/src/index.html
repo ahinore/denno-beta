@@ -180,6 +180,15 @@
     <input id="speed" type="range" min="0.5" max="8" step="0.5" value="8">
     <span style="font-size:10px">high</span>
   </label>
+  <span id="rp-bar" class="muted" style="border-left:1px solid var(--border);padding-left:8px">
+    <button id="rp-mode" title="toggle live / replay">replay</button>
+    <button id="rp-play" title="play / pause" disabled>▶</button>
+    <button id="rp-start" title="to start" disabled>⏮</button>
+    <button id="rp-back" title="step back" disabled>◂</button>
+    <button id="rp-fwd" title="step forward" disabled>▸</button>
+    <input id="rp-slider" type="range" min="0" max="0" value="0" disabled style="width:120px">
+    <span id="rp-pos" style="font-size:10px">–</span>
+  </span>
 </header>
 <main>
   <!-- 左: KVキャッシュ + 変数 -->
@@ -1050,6 +1059,7 @@ function connect() {
     setTimeout(connect, 2000);
   };
   ws.onmessage = (ev) => {
+    if (rpMode) return;   // リプレイモード中はライブフレームを無視する
     if (!(ev.data instanceof ArrayBuffer)) return;
     try {
       const f = decodeFrame(new Uint8Array(ev.data));
@@ -1064,6 +1074,160 @@ function connect() {
   };
 }
 $("speed").addEventListener("input", (e) => { speed = parseFloat(e.target.value); });
+
+// ---------- リプレイスクラバー (P16) ----------
+// VIEW_REPLAY で読み込んだ記録 ([u32 len][bytes] の連結) をブラウザ側で解析し、
+// ライブと同じ handleFrame 経路で再生する。シークは先頭からの状態再構築
+// (fast-forward: 演出系は skip して状態のみ適用)。ライブの pacing (queue+drain) を再利用。
+let rpFrames = [];     // デコード済みフレーム列
+let rpCursor = 0;      // 次に queue へ積むフレーム index
+let rpMode = false;    // true の間はライブ WS フレームを無視
+let rpPlaying = false;
+let rpSeeking = false;
+let RP_FFWD = false;   // fast-forward 中 (handleFrame が状態のみ適用する)
+function rpSetEnabled(on) {
+  for (const id of ["rp-play", "rp-start", "rp-back", "rp-fwd", "rp-slider"]) $(id).disabled = !on;
+}
+function rpLabel() {
+  $("rp-pos").textContent = rpFrames.length
+    ? `${Math.min(rpCursor, rpFrames.length)} / ${rpFrames.length}` : "–";
+}
+function rpSetSlider() {
+  const s = $("rp-slider");
+  s.max = Math.max(0, rpFrames.length - 1);
+  s.value = Math.max(0, Math.min(rpCursor, rpFrames.length) - 1);
+}
+async function rpLoad() {
+  statEl.textContent = "replay: loading…";
+  let buf;
+  try {
+    const r = await fetch("/replay");
+    if (!r.ok) { statEl.textContent = "replay: no record (set VIEW_REPLAY)"; return false; }
+    buf = new Uint8Array(await r.arrayBuffer());
+  } catch (e) { statEl.textContent = "replay: fetch failed"; return false; }
+  const frames = [];
+  let o = 0;
+  while (o + 4 <= buf.length) {
+    const len = buf[o] | (buf[o + 1] << 8) | (buf[o + 2] << 16) | (buf[o + 3] << 24);
+    o += 4;
+    if (len <= 0 || o + len > buf.length) break;
+    try { frames.push(decodeFrame(buf.subarray(o, o + len))); }
+    catch (e) { console.error("replay decode error", e); }
+    o += len;
+  }
+  rpFrames = frames;
+  rpCursor = 0;
+  rpSeeking = false;
+  rpSetEnabled(frames.length > 0);
+  rpLabel(); rpSetSlider();
+  statEl.textContent = `replay: ${frames.length} frames loaded`;
+  return frames.length > 0;
+}
+// fast-forward 中のフレーム適用: スナップショット系は通常経路、
+// アニメーション系は状態 (テキスト/チップ/層統計) のみ更新して演出を skip
+function ffwdFrame(f) {
+  switch (f.kind) {
+    case "ServerInfo":
+    case "KvUsage": {
+      RP_FFWD = false; try { handleFrame(f); } finally { RP_FFWD = true; }
+      break;
+    }
+    case "SessionAdmit":
+      sessEl.textContent = `session ${f.session} (slot ${f.slot})`;
+      $("tokens").innerHTML = ""; $("intokens").innerHTML = "";
+      break;
+    case "Prefill":
+      setInputTokens(f.tokens);
+      $("val-x").textContent = `${f.prompt_tokens} tok (prefill ${Math.floor(f.ns / 1e6)} ms)`;
+      break;
+    case "LayerRun": {
+      const L = $("layer-" + f.layer);
+      const w = $("cli");
+      if (w) w.textContent = `  li = ${f.layer}/${nLayers}`;
+      if (L) {
+        const total = f.ops.reduce((s, o) => s + o[1], 0);
+        const lms = L.querySelector(".lms");
+        if (lms) lms.textContent = (total / 1e6).toFixed(2) + "ms";
+        const lops = L.querySelector(".lops");
+        if (lops) lops.innerHTML = f.ops.map(([op, ns]) =>
+          `<b>${OP_NAMES[op] ?? op}</b><span class="n">${(ns / 1e6).toFixed(2)}</span>`
+        ).join(" ");
+      }
+      break;
+    }
+    case "Token": {
+      const txt = tokText(f.token);
+      addOutToken(f.token, txt);
+      $("val-token").textContent = `${txt || "?"} (id ${f.token}, pos ${f.pos})`;
+      break;
+    }
+    case "TopK": {
+      $("val-logits").innerHTML = f.entries.map(([id, p]) =>
+        `<div class="bar-row" title="id ${id}"><span class="bar-label">${(tokText(id) || "?").slice(0, 8)}</span>
+         <div class="bar-track"><div class="bar-fill" style="width:${(p * 100).toFixed(1)}%"></div></div>
+         <span style="width:46px;text-align:right">${(p * 100).toFixed(1)}%</span></div>`).join("");
+      $("val-entropy").textContent = f.entropy_f16.toFixed(3);
+      break;
+    }
+  }
+}
+function rpFastTo(idx) {
+  // 先頭から index まで再適用して状態を再構築する (SessionAdmit がトークン列を
+  // クリアするのでチップの重複は起きない。KvUsage/ServerInfo は冪等スナップショット)
+  RP_FFWD = true;
+  for (let k = 0; k <= idx && k < rpFrames.length; k++) {
+    try { handleFrame(rpFrames[k]); } catch (e) { console.error("replay ffwd error", e); }
+  }
+  RP_FFWD = false;
+  rpCursor = idx + 1;
+  rpSeeking = false;
+  rpLabel(); rpSetSlider();
+}
+function rpScrub(idx) {
+  rpPlaying = false; $("rp-play").textContent = "▶";
+  rpSeeking = true;
+  statEl.textContent = "replay: seeking…";
+  setTimeout(() => { rpFastTo(idx); statEl.textContent = "replay mode"; }, 10);
+}
+function rpPump() {
+  if (!rpPlaying || !rpMode || rpSeeking) return;
+  // queue に空きができたら次のフレームを積む (再生は既存の drain pacing に従う)
+  let budget = 48 - queue.length;
+  while (budget-- > 0 && rpCursor < rpFrames.length) {
+    queue.push(rpFrames[rpCursor++]);
+  }
+  rpLabel(); rpSetSlider();
+  if (rpCursor >= rpFrames.length && queue.length === 0) {
+    rpPlaying = false; $("rp-play").textContent = "▶";
+    statEl.textContent = "replay: end";
+  }
+}
+setInterval(rpPump, 33);
+$("rp-mode").addEventListener("click", async () => {
+  if (!rpMode) {
+    if (!(await rpLoad())) return;
+    rpMode = true;
+    $("rp-mode").textContent = "live";
+  } else {
+    rpMode = false; rpPlaying = false; rpSeeking = false;
+    $("rp-play").textContent = "▶";
+    $("rp-mode").textContent = "replay";
+    statEl.textContent = "live mode";
+  }
+});
+$("rp-play").addEventListener("click", () => {
+  if (!rpFrames.length) return;
+  if (rpPlaying) {
+    rpPlaying = false; $("rp-play").textContent = "▶";
+    return;
+  }
+  if (rpCursor >= rpFrames.length) rpScrub(0);   // 終端からは最初へ戻って再生
+  rpPlaying = true; $("rp-play").textContent = "⏸";
+});
+$("rp-start").addEventListener("click", () => rpScrub(0));
+$("rp-back").addEventListener("click", () => rpScrub(Math.max(0, rpCursor - 2)));
+$("rp-fwd").addEventListener("click", () => rpScrub(Math.min(rpFrames.length - 1, rpCursor)));
+$("rp-slider").addEventListener("input", (e) => rpScrub(parseInt(e.target.value, 10)));
 
 // ---------- チャット (view の /chat → 上流 denno /v1/messages) ----------
 let chatHistory = [];
