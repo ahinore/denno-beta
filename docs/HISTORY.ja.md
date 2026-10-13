@@ -259,7 +259,8 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **P14.4b〜k UI ブラッシュアップ (詳細省略, commits `62acfc8`〜`5e64eef`)**: レイアウト修正(隙間/等分/ペイン分離/セクション分離線)、拡大コーン(コードパネル=model_forward ノードの拡大コールアウト)、トークンの配置(入力=グラフ上・出力=下)、KV/変数への飛点(SVG 飛線)、UI 全面英語化、見出し「denno (LLM Server)」、speed スライダー(low/high・既定最速・low で目で追えるスローモーション)、ServerInfo に model_id 追加(実モデル ID 表示)。**推論を待たせない設計は全過程で不変**
 - **P14.4l〜q コードパネルの正確化+実コード切替 (commits `091da66`〜`3ff6175`)**: ①擬似コードの実行順序を実物どおりに修正 — KV 書き込みはループ内(rope 直後)、attn_core がキャッシュを読む(`&kv[li][..pos+1]`)、prefill 分岐(p1-p4)も追加。Prefill 時はカーソルが p1→p2(KV 一括書き込み)→層カスケード→p3 と歩く ②**疑似⇔実コード切替**(「real code ▸」ボタン、既定 pseudo)— scheduler.rs/engine.rs/llama.rs を `include_str!` でコンパイル時埋め込み+`/code/src` 配信(表示コードは常に稼働バイナリと同世代)、擬似↔実を内容アンカーでマップしカーソル/状態点灯/飛線が両モードで動作 ③KV キャッシュと hidden x の**使用箇所**を飛線で可視化(KV→attn 読み出し・x→rmsnorm/final_norm)
 - **P14.4r チャット出力を emit_token に同期 (commit `b1e6ecb`)**: 内蔵チャットの出力表示がアニメーション速度と無関係(応答受信後に一括表示)だったのを、**Token フレーム再生時にバブルへトークンを追記**する方式へ変更(speed=low なら出力表示もゆっくり)。送信後の最初の SessionAdmit でセッションを捕捉し、usage 確定で全トークン再生後に usage 付きで確定。tokenizer 未読込/テレメトリ無効/Token フレーム欠落時は従来どおり応答全文表示へフォールバック(4秒監視)。併せて tokText の1トークン2重呼び出し(ストリーミング UTF-8 デコーダを2回消費する潜在バグ)を1回に修正。検証: JS 構文 OK・dev サーバー再ビルド+再起動・チャット応答 OK・p143_check CHAT_OK(トークン19フレーム)
-- **残課題**: ①WASM 移植(デコーダ+状態機械を wasm-bindgen 化 — JS 版は先行実装として維持)②リプレイスクラバー(VIEW_RECORD 再生 UI)③L2 テンソル focus(P15、隠れ変数の実値表示は現状 KV 長/top-k/token など L1 統計のみ)
+- **P15 Qwen3対応 (commit `e67eeb2`)**: **Qwen3 = Qwen2 + QK-Norm**(q_norm/k_norm.weight を head_dim 単位の RMSNorm として QKV bias 後・RoPE 前に適用。`qknorm_rows_inplace`、prof に `qk_norm` op 追加)。バッチ/単独 decode のビット一致を単体テストで担保(`qk_norm_batch_matches_solo_decode_bit_exactly`)。**KV メモリ予算**(`DENNO_KV_BUDGET_MB`、既定 12288MB): 明示 env 最優先・予算内でスロット優先+残りを prefix cache(最低 2048 トークン保証)・小 KV モデルは従来構成完全維持 — Qwen3-0.6B は KV 事前確保が約 47GB に達して SIGKILL していた問題の解消。**minijinja-contrib pycompat**: HF チャットテンプレートが使う Python 風 str メソッド(startswith 等)を登録し Qwen3 の thinking テンプレートが描画されるように。exactness: Qwen3-0.6B greedy 出力を HF transformers(fp32)参照実装と完全一致検証+CI で Qwen3-0.6B pull を追加
+- **残課題**: ①WASM 移植(デコーダ+状態機械を wasm-bindgen 化 — JS 版は先行実装として維持)②リプレイスクラバー(VIEW_RECORD 再生 UI)③L2 テンソル focus(P16、隠れ変数の実値表示は現状 KV 長/top-k/token など L1 統計のみ)
 
 ## 4. 次の実装候補
 
@@ -271,13 +272,13 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - [x] ~~**残り律速の分析**: P9プロファイルで判明した①平均バッチ幅の低下②in-serverでのメモリ系競合③prefill割込み~~ → **P12で完了**(クリーン環境で定量化。fp32はW=8までスケール/int8はW=4で頭打ち。int8のop別: gate_up 29.5% / attn 19.4% / down 18.0% / lm_head 10.8%。attentionのオーバーヘッド(V側の統合+コピー+アロケーション)をP12で削減。scores側の根本最適化はビット一致規律と両立不可 — 基準更新の判断が残る)
 - [x] ~~**推論可視化(denno-trace)P13: テレメトリ基盤**: 推論プロセスから観測を完全分離する構成(詳細は[アーキテクチャ解説](ARCHITECTURE.ja.md)§11)。`denno-telemetry` crate(バージョン付きフラット形式、f16/varint、Gapフレーム)+denno側捕捉(L0フロー/L1統計: profフック・phase遷移・sampler top-k・KV使用率・出力トークン)+WSエンドポイント(`/v1/telemetry/ws`)+denno-viewサーバー骨組み。設計原則: ①可視化は推論に含めない(dennoは流すだけ)②boundedチャネル+ドロップ許容で推論を絶対に待たせない③既定OFF・read-only捕捉でbit-exact規律と両立(exactness全緑を担保条件に)~~ → **P13で完了**(commit `69663e6`。テレメトリON/OFFで出力完全一致・e2eでGap 0件・JSデコーダ全10種一致を確認。詳細はP13節)
 - [x] ~~**推論可視化 P14: ビューア(L0/L1)**: フロー図・トークンストリーム・KV使用率グリッド・sampler top-kビュー・リプレイ記録+スクラバー~~ → **P14で完了(JS版で先行実装、commit `8befe3f`)**: ユーザー指定仕様のアニメーションUI(モデル駆動プログラム+実装コードパネル+層パネル+KV/変数+内蔵チャット)。**WASM移植・リプレイスクラバーは残課題**(詳細はP14節)
-- [ ] **推論可視化 P15: L2テンソルストリーミング**: focusプロトコル(ビューアがセッション×layer×tensor種別を指定、dennoはその組だけをストリーム)。隠れ状態ヒートマップ、attention確率マップ(1トークンがどの過去トークンを見ているか)、K/V実体ビューア。予算: focus先1セッション≤5%(f16+絞り込み)
+- [ ] **推論可視化 P16: L2テンソルストリーミング**: focusプロトコル(ビューアがセッション×layer×tensor種別を指定、dennoはその組だけをストリーム)。隠れ状態ヒートマップ、attention確率マップ(1トークンがどの過去トークンを見ているか)、K/V実体ビューア。予算: focus先1セッション≤5%(f16+絞り込み)
 - [ ] **3B/7Bのb=4実測**: 計測のみ。帯域律速のままならバッチ幅を増やすほど素直に効くはず(交互A/Bで計測すること)。大型モデルのキャッシュ追加(`denno pull`)が必要
 - [ ] **CUDA最適化**: 実装ポイントの分析は[アーキテクチャ解説](ARCHITECTURE.ja.md)§8に記載(線形層→cuBLAS、attention融合、samplerカーネル、paged KV)。int8路線ならCPU/GPUでビット一致が維持できる。P6のスロットプール+forward_batch構造はGPUのcontinuous batchingと同型なのでそのまま移植可能
 - [ ] **GitHub push自動化**: deploy key登録後にコンテナから直接push
 - [ ] tool use(Anthropic APIのtoolsパラメータ対応)
 - [ ] Llama系バリアント(GQA無しモデル、RoPEスケーリング)
-- [ ] **他ファミリー対応**: Qwen3(QK-Norm化+thinking/non-thinkingモード切替+MoE派生)、DeepSeekシリーズ(MoE+共有エキスパート)、GLMシリーズ、gpt-oss(attention sink+sliding window+MXFP4)
+- [ ] **他ファミリー対応**: DeepSeekシリーズ(MoE+共有エキスパート)、GLMシリーズ、gpt-oss(attention sink+sliding window+MXFP4)。~~Qwen3(QK-Norm)~~ → **P15で完了**(thinkingモード切替とMoE派生は未対応)
 - [ ] **各モデル独自機構の可視化**: MoEルーティング(トークンごとに発火したエキスパート+ルータ確率の表示)、MLAの潜在圧縮KV(通常MHAとのキャッシュサイズ比較)、attention sink(先頭トークンへの注目集中)、sliding windowの帯パターン(attentionマスクの可視化)、thinkingモードのトークン流れ
 - [ ] sliding window attention(長コンテキストのKVメモリ削減)
 - [ ] マルチモデル同時 serve(1プロセスで複数モデル)
@@ -303,4 +304,6 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **モデル移植の壁**: アーキテクチャが同じ(qwen2)なら次元が違うだけのモデルは無変更で動く。壁になるのはcheckpoint形式(分割)と重み共有(tied/untied)のような「ローダ側の差分」(P7で実証)
 - **本番と開発の分離**: 本番はポート8080(denno-betaコンテナ)、開発テストは8090。本番は長時間止めない
 - **既知のモデル特性**: 「1たす1は？」(漢数字)だと壊れた出力になるがモデル自体の弱点でバグではない。「1+1は?」なら正常
+- **KV事前確保はスロット数×最大コンテキストで決まる**(P15の教訓): Qwen3-0.6BはGQA(kv_heads 8)でも28層×40960ctxで1スロット約9.4GBになり、4スロット+prefixで約47GBを確保しようとしてSIGKILL(exit 137)した。OOMではなく事前確保の問題 — 「空きメモリが足りているのに落ちる」場合はKV事前確保を疑う。`resolve_kv_budget`(純粋関数+単体テスト)で予算内に収め、明示envは最優先とする設計
+- **HFチャットテンプレートはPythonのstrメソッドに依存する**(P15の教訓): Qwen3のテンプレートは`startswith`を使用 — minijinjaのunknown method fallbackでは描画に失敗し静かにフォールバックするため「テンプレートが使われていない」ことに気づきにくい。`minijinja_contrib::pycompat::unknown_method_callback`を`set_unknown_method_callback`に登録するのが公式の解。**テンプレート描画の成否は生成結果の先頭トークンで確認する**(thinkingテンプレートなら[think]から始まる)
 - **デバッグ実例(初期)**: sgemmストライド設計ミス→SIGSEGV、Qwen2のQKV bias発見(optionalロード)、Hermesの`max_tokens: 65535`クランプ、SSE `event:`行欠落で無限リトライ、prefill中のkeep-alive欠落でアイドル切断
