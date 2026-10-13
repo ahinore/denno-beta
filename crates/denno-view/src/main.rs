@@ -398,7 +398,7 @@ async fn view_socket(mut socket: WebSocket, app: AppState) {
             }
             m = socket.recv() => {
                 match m {
-                    Some(Ok(_)) => {} // クライアント→サーバーのコマンドは P15 (focus) で使用
+                    Some(Ok(_)) => {} // クライアント→サーバーのコマンドは P18 (L2 focus) で使用
                     _ => break,
                 }
             }
