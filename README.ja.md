@@ -8,7 +8,7 @@ Rustで書いたAnthropic Messages API互換のLLMサーバー。
 LLMの動作原理(トークン化 → forward pass → サンプリング → デコードループ)をコードで理解することを目的に、**推論カーネルを完全自前実装**している(candle等の既存LLMライブラリは不使用)。構成の参考: [ashhart/TensorFold](https://github.com/ashhart/TensorFold)
 
 - **単一バイナリ** `denno`(CLI `pull/models/info/generate/serve` + axum HTTPサーバー + 推論エンジン)。CPUのみ・GPU不要
-- 対応モデル: GPT-2 124M、Llama系(RMSNorm+RoPE+SwiGLU+GQA)= **Qwen2.5-0.5B〜7B-Instruct**(チャットテンプレート対応)
+- 対応モデル: GPT-2 124M、Llama系(RMSNorm+RoPE+SwiGLU+GQA)= **Qwen2.5-0.5B〜7B-Instruct**、**Qwen3-0.6B**(QK-Norm、thinking モード対応)(チャットテンプレート対応)
 - **exact decoding**: seed固定・温度0で同一入力→ビット完全同一出力。最適化・並列化(連続バッチング/SIMD)をしても壊さない規律(CIでexactnessテストを担保)
 - 連続バッチング(複数セッションのdecodeを1 forwardに統合・KVスロットプール)、prefix cache(LCP最大選択)、int8量子化(SIMD整数カーネル、重みメモリ半減)
 - **推論可視化(denno-trace)**: 推論を一切待たせない設計のテレメトリ(DENNO_TELEMETRY=1、既定OFF・read-only)+ 別プロセスの可視化サーバー `denno-view`。ブラウザでモデル駆動プログラムのアニメーション(実装コードのステップ実行・層パネル・KV/変数)が見られる

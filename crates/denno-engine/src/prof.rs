@@ -24,11 +24,12 @@ pub const FINAL_NORM: usize = 9; // 最終 RMSNorm
 pub const LM_HEAD: usize = 10; // 最終 logits 投影 (vocab 次元 matvec)
 pub const SAMPLER: usize = 11; // サンプリング
 pub const DETOK: usize = 12; // トークン→テキスト デコード (ストリーミング差分用)
-pub const N_OPS: usize = 13;
+pub const QKNORM: usize = 13; // QK-Norm (Qwen3 のみ。q/k の head_dim 単位 RMSNorm)
+pub const N_OPS: usize = 14;
 
 const NAMES: [&str; N_OPS] = [
     "embed", "rmsnorm", "rope", "qkv_proj", "attn_core", "o_proj", "gate_up_proj", "swiglu",
-    "down_proj", "final_norm", "lm_head", "sampler", "detok",
+    "down_proj", "final_norm", "lm_head", "sampler", "detok", "qk_norm",
 ];
 
 static NS: [AtomicU64; N_OPS] = {

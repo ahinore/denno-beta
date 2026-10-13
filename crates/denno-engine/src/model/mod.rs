@@ -53,7 +53,10 @@ pub fn load_model(dir: &Path, mode: QuantMode) -> Result<Box<dyn Model>> {
     match cfg.get("model_type").and_then(|v| v.as_str()) {
         Some("gpt2") => Ok(Box::new(gpt2::Gpt2::load(dir, &cfg, mode)?)),
         Some("qwen2") => Ok(Box::new(llama::LlamaQwen2::load(dir, &cfg, mode)?)),
-        other => bail!("未対応の model_type: {:?}(gpt2 / qwen2 のみ対応)", other),
+        // Qwen3: Qwen2 との差分は QK-Norm (q/k 投影直後の head_dim 単位 RMSNorm) のみ。
+        // QKV bias なし / tied・untied は config.json に従い LlamaQwen2 が両対応。
+        Some("qwen3") => Ok(Box::new(llama::LlamaQwen2::load(dir, &cfg, mode)?)),
+        other => bail!("未対応の model_type: {:?}(gpt2 / qwen2 / qwen3 のみ対応)", other),
     }
 }
 
