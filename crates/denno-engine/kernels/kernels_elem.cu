@@ -447,3 +447,69 @@ extern "C" __global__ void dno_rope_qkv(float *qkv, const float *tab, const floa
         dst[d] = x;
     }
 }
+
+// P17k ステップ 5: prefill 用行並列 rope (qkv→rope→attention デバイス連続化)。
+// grid = (heads + 2*kv_heads, n), block = (dh), shared なし。
+//   block b < heads             : q ヘッド b — rope して qout [n, heads*dh] (連続) へ
+//   heads <= b < heads+kv_heads : k ヘッド    — rope して km の (pos0+i) 行へ
+//   heads+kv_heads <= b         : v ヘッド    — vm の (pos0+i) 行へコピー
+// qkv は [n, width] 行-major (width = (heads+2*kv_heads)*dh、行内 [qn|kn|vn])。
+// km/vm は GPU KV ミラー ([cap, kv_dim] 行-major・ホスト KvCache と同一)。
+// tab は [n, dh] — 行 i が pos=pos0+i の [cos(half) | sin(half)] (CPU が
+// rope_row と同一式で生成 → mul/sub のみの適用でビット一致)。
+// bias は [qb | kb | vb] 連結 1 バッファ (無ければ NULL)。
+extern "C" __global__ void dno_rope_qkv_pf(float *qkv, float *qout, float *km, float *vm,
+                                           const float *tab, const float *bias, int pos0,
+                                           int heads, int kv_heads, int dh, int kv_dim) {
+    const int half = dh / 2;
+    const int b = blockIdx.x;
+    const int i = blockIdx.y;
+    const int width = (heads + 2 * kv_heads) * dh;
+    const float *src = qkv + (size_t)i * width;
+    const float *trow = tab + (size_t)i * dh;  // 2*half == dh
+    if (b < heads) {
+        // q: rope → qout[i, b*dh..]
+        const int d = threadIdx.x;
+        if (d < half) {
+            const float *bl = bias ? bias + (size_t)b * dh : nullptr;
+            const float c = trow[d];
+            const float s = trow[half + d];
+            float x1 = src[(size_t)b * dh + d];
+            float x2 = src[(size_t)b * dh + half + d];
+            if (bl) {
+                x1 += bl[d];
+                x2 += bl[half + d];
+            }
+            float *dst = qout + (size_t)i * heads * dh + (size_t)b * dh;
+            dst[d] = x1 * c - x2 * s;
+            dst[half + d] = x1 * s + x2 * c;
+        }
+    } else if (b < heads + kv_heads) {
+        // k: rope → km の (pos0+i) 行
+        const int kh = b - heads;
+        const int d = threadIdx.x;
+        if (d < half) {
+            const float *bl = bias ? bias + (size_t)heads * dh + (size_t)kh * dh : nullptr;
+            const float c = trow[d];
+            const float s = trow[half + d];
+            float x1 = src[(size_t)heads * dh + (size_t)kh * dh + d];
+            float x2 = src[(size_t)heads * dh + (size_t)kh * dh + half + d];
+            if (bl) {
+                x1 += bl[d];
+                x2 += bl[half + d];
+            }
+            float *dst = km + (size_t)(pos0 + i) * kv_dim + (size_t)kh * dh;
+            dst[d] = x1 * c - x2 * s;
+            dst[half + d] = x1 * s + x2 * c;
+        }
+    } else {
+        // v: bias 加算して vm の (pos0+i) 行へ
+        const int vh = b - heads - kv_heads;
+        const int d = threadIdx.x;
+        const float *bl =
+            bias ? bias + (size_t)(heads + kv_heads) * dh + (size_t)vh * dh : nullptr;
+        float x = src[(size_t)(heads + kv_heads) * dh + (size_t)vh * dh + d];
+        if (bl) x += bl[d];
+        vm[(size_t)(pos0 + i) * kv_dim + (size_t)vh * dh + d] = x;
+    }
+}

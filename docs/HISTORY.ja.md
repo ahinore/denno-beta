@@ -435,9 +435,16 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
   - **性能**(13,252 トークン cold): **attn_core 11.1s → 5.12s・PROFILE TOTAL 26.4s → 20.5s・wall 30.7s → 24.5s**。残り律速: down 5.1s(キュー待ち含む)/ qkv 4.5s / attn_core 5.1s / rope 2.8s / rmsnorm 2.3s。maxabs vs CPU 1.79e-7 不変・GPU cuda_ **22/22**(ベンチ 2 種含む)・exactness **6**・応答正常("OK")
   - **実測上の注意**: 動的 smem は ~35KB まで安定だが **~43KB 以上でカーネルが不正アドレス(error 700)**で落ちる(BQ=64/BK=8・BQ=48/BK=16 で再現・詳細未解明)。BQ=48/BK=8(34.9KB)を実効上限とする
   - **PTX**: sha256 `28f50332e4f2262dcaa5ae1e8caa6470f8c998d08b31fecd7f43c1253c91e9bc`
-- **残る実装候補(ステップ 5 以降)**:
-  1. **qkv→rope→attention のデバイス連続化**: qkv GEMM 出力をデバイスに置いたまま rope(GPU・dno_rope_qkv はビット一致済みだが 1 行/ブロック設計のため prefill 用の行並列版+行ごとの pos テーブルが必要)→ K/V をホストキャッシュに D2H(27MB/層)→ attention はデバイス q を読む(P17j カーネルの q 入力をスロット参照に)。qkv 4.5s・rope 2.8s・attn_core の転送分(~4-6s)が対象。attn_core の ~400ms/層の内訳(ミラー upload・oproj 待ち・D2H・同期回数)の特定が前提
-  2. **GEMM カーネル改善**: 現行 64×64・1 thread 4×4・TK=32 はレイテンシ律速気味。128×128 タイル+8×8/thread+ベクトルロードで 2-4x を見込む(整数累積なのでビット一致は構造的に保証)
+- **ステップ 5: qkv→rope→K/V 書き込み→attention のデバイス連続化(✅ 2026-10-14)**:
+  - **不発動の顛末(最初の E2E は wall 24.7s で変化なし)**: 診断ログで `qkv dev gate: qb=true kb=true vb=true` を確認 — **Qwen2.5-1.5B は QKV bias を持つ**(config に `attention_bias` が明示されず safetensors に `q/k/v_proj.bias` が存在)ため、当初のゲート「bias 無しのみ」が全層でフォールバックしていた。→ `dno_rope_qkv_pf` に **[qb|kb|vb] 連結 bias 加算(rope 前)**を実装(CPU 経路の add_bias→rope_rows と同一順序・ビット一致)して解決
+  - **デバイス側の流れ(層ごと)**: rmsnorm 後の h を 1 回 H2D → qkv GEMM(dno_gemm_i8・デバイス常駐)→ **dno_rope_qkv_pf**(grid=(heads+2·kv_heads, n)・block=(dh))が q を rope して連続 qout へ・k/v を rope して GPU KV ミラーの (pos0+i) 行へ直接書き込み → attention はステップ 4 カーネルがデバイス q を読む → K/V の [pos0..t_total) 行のみ D2H(27MB/層)。**従来のホスト qkv 122MB D2H+q 81MB H2D+CPU rope が全廃**
+  - **性能**(13,252 トークン cold): **qkv_proj 4,511ms → 0.7ms・rope 2,754ms → 0.4ms・PROFILE TOTAL 20.4s → 12.7s・wall 24.5-24.7s → 17.6s**。残り律速: down 5.0s(39%)/ attn_core 4.7s / rmsnorm 2.3s。maxabs 1.79e-7 不変・GPU cuda_ **23/23**(rope_qkv_pf ビット一致テスト新規追加)・応答正常("OK")
+  - **テスト基盤修正**: テスト用 GPU ミラーのキーが実 KvCache の kv_id(グローバル連番)と衝突し他テストを汚染(フル実行のみ失敗する現象)→ 番兵キー `u64::MAX-1` に変更
+  - **インフラ修正(denno-server)**: PROFILE ロガーがアイドル時に空ブロックを秒間 ~25 万回出力し serve ログが **~470GB/1h** に肥大(ディスク 100% 3 回目)。調査用のタイムアウト grep が削除済み 506GB ログを掴み続け df−du 差 ~700GB の不可視消費(lsof +L1 → kill -9 で回復)。根本修正: PROFILE 出力を「最後のセッション完了後 1 回」に限定(`done.iter().any(|&d| d)` ゲート)
+  - **PTX**: sha256 `21fc893194c8f68ad2b11311e471dc55b9558772d5332aea83feb32e18cecfdd`
+- **残る実装候補(ステップ 6 以降)**:
+  1. **rmsnorm の GPU 化**: rmsnorm 2.3s(1 層あたり ~40ms)が h H2D(81MB)と直列。prefill 経路で h をデバイスで生成できれば H2D も削減できる(要素演算は既にビット一致実装済み)
+  2. **GEMM カーネル改善**: 現行 64×64・1 thread 4×4・TK=32 はレイテンシ律速気味。128×128 タイル+8×8/thread+ベクトルロードで 2-4x を見込む(整数累積なのでビット一致は構造的に保証)。down_proj 5.0s(残り最大)が対象
 
 ## 4. 次の実装候補
 

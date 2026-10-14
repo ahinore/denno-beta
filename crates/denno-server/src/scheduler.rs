@@ -226,7 +226,11 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
                         finish_run(run);
                     }
                 }
-                if active.is_empty() && prof::enabled() {
+                // P17k: 最後のセッションが完了した時点で 1 回だけ出力する。
+                // (旧: active が空なら毎 tick 出力 — ワーカーループはブロックなしで
+                // 回るためアイドル時に空 PROFILE ブロックを秒間数十万回ログし、
+                // /tmp ログが数時間で数百 GB に膨らむ事故の原因だった)
+                if done.iter().any(|&d| d) && active.is_empty() && prof::enabled() {
                     tracing::info!("{}", prof::summary());
                 }
             }
