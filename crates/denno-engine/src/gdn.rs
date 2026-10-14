@@ -269,8 +269,10 @@ pub fn forward_token_core(
     let dv = p.head_v_dim;
     let mut o = vec![0.0f32; vd];
     for h in 0..p.n_v_heads {
-        // k は n_k_heads と n_v_heads が異なる場合は repeat (0.8B は同一)
-        let kh = h % p.n_k_heads;
+        // k/q は n_k_heads と n_v_heads が異なる場合は repeat_interleave 規約
+        // (HF repeat_interleave / llama.cpp ggml_repeat = blocked タイリング:
+        //  v-head h → k-head h/(nv/nk)。0.8B は nk==nv で同一・9B は nk=16/nv=32)
+        let kh = h * p.n_k_heads / p.n_v_heads;
         let qh = &q[kh * dk..kh * dk + dk];
         let kh_v = &k[kh * dk..kh * dk + dk];
         let vh = &v_raw[h * dv..h * dv + dv];

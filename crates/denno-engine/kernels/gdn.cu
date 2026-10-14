@@ -34,7 +34,9 @@ extern "C" __global__ void dno_gdn_scan(
     float eps, float q_scale)
 {
     const int h = blockIdx.x;       // v-head
-    const int kh = h % nk;
+    // q/k は repeat_interleave 規約 (HF / llama.cpp ggml_repeat = blocked タイリング):
+    // v-head h → k-head h/(nv/nk)。0.8B は nk==nv で同一・9B は nk=16/nv=32。
+    const int kh = h * nk / nv;
     const int kd_total = nk * dk;   // q/k チャネル総数
     const int vd = nv * dv;
     const int c = threadIdx.x;      // 0..dk (== dv)
