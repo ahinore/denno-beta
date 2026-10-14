@@ -459,7 +459,32 @@ pie showData title P9 fp32 batch (4x256) per-op time
   1. **attn_core 3.5s (remaining 47%)**: reduce v re-reads in the V accumulation (row chunking); larger BK (>48KB smem needs opt-in via `cuFuncSetAttribute`)
   2. **GPU rmsnorm**: rmsnorm 2.3s (~20ms/layer) sits serially before the h upload (81MB H2D). Generating h on device in the prefill path would remove that upload too (elementwise ops are already bit-exact)
 
+### P19: Qwen3.5 support (GGUF loader + Gated DeltaNet hybrid) through B2 model integration + E2E ✅ (2026-10-14, commits `49ac073`/`0bbfa79`/`cb9d30b`/`feab1c8`)
+
+> Origin: supporting Qwen3.8-27B (UD-IQ2_XXS mixed-quant GGUF) → stepwise implementation of the Qwen3.5 hybrid architecture (**Gated DeltaNet 3:1 + full attention**). Stages: A = GGUF+dequant foundation → B = GDN CPU reference → B2 = model integration + E2E (this section) → GPU offload → 9B → 27B scale.
+
+- **GGUF foundation (`49ac073`)**: ① GGUF container reader (`gguf.rs`, mmap, header/KV/tensor info) ② dequant for **18 GGML k-quant/IQ types** (`kquant.rs` + generated `kquant_tables.rs` via `ref/gen_kquant_tables.py`) ③ **bit-exact verification vs llama.cpp** with an LCG fixture (16 blocks × 18 types, all matching) + real-GGUF verification over 320 tensors. The table file is strictly generated (no manual edits). The initial commit failures were caused by `.gitignore`'s `data/` rule excluding the fixture (fixed with negation patterns)
+- **GDN CPU reference (`0bbfa79`/`cb9d30b`)**: 1:1 port of llama.cpp `delta-net-base.cpp` `build_delta_net_autoregressive` (sequential AR form). Math: g = ssm_a (negative) × softplus(alpha + dt_bias) → S ← S·exp(g) → delta rule (sk=Σk·S, d=β(v−sk), S+=k⊗d, o=Σq·S), q/k L2-normalized, output = gated RMS norm (rmsnorm(o)·w·silu(z)), causal depthwise conv + SiLU. softplus follows the ggml convention. **Bit-exactness vs llama.cpp is not required** (the denno contract is same-input→same-output + determinism; the sequential AR form is mathematically equivalent to the chunked form)
+- **B2 model integration (`feab1c8`)**: `model/qwen35.rs` (`model_type: qwen3_5` dispatch) — 24 layers = 18 GDN + 6 full attention (3:1) · full-attention layers use fused Q+gate (attn_output_gate) · partial MRoPE (interleaved [11,11,10], equivalent to standard RoPE for text) · QK-Norm · sigmoid output gate · tied embeddings (vocab 248,320) · **GGUF (incl. Unsloth Dynamic mixed quants) → dequant → re-quantize into the existing Fp32/Int8 pipeline** (no new GEMM needed). Large matrices use the existing `Linear`; tiny f32 tensors (conv1d/ssm_a/ssm_dt/ssm_norm) go through a `GdnCore<'a>` reference view + `forward_token_core`. GDN state lives in per-layer GDN slots of the KvCache (conv buffer + SSM matrix)
+- **Three bugs found and fixed during implementation**:
+  1. **KV capacity bug**: `cache.len()` does not advance until forward() finishes, so per-token `kv_bufs(li,1)` panics out-of-range on the 2nd token → pre-allocate capacity for all tokens at the top of forward()
+  2. **Recurrent state × prefix reuse** (most important): KV live-reuse `truncate` / prefix-entry restore invalidates GDN conv/SSM state (recurrent state is not position-sliceable) → measured **nondeterminism where the same seed produced different outputs**. Added `Model::is_recurrent()`; recurrent models reuse KV only on pure extension (lcp == current length), otherwise fall back to full prefill
+  3. **int8 quality degradation on control signals**: a per-tensor quantization-error probe (test included) showed all tensors at 0.8–1.5% (normal range) with the worst on `ssm_beta/ssm_alpha` (control signals passing through sigmoid/softplus) → these are **kept Fp32 even in Int8 mode** (< ~1MB across 24 layers, negligible cost)
+- **Tests**: gdn lib 4/4 (independent oracle match, batched-prefill vs token-by-token bit-exact, determinism) · real-GGUF layer-0 (Q8_0/UD-IQ2_XXS both, decay exp(g)=0.0086–0.9995 confirming multi-timescale behavior) · `qwen35_model` (load/forward/determinism 2-run bit-exact/**cache continuity forward(3)+forward(1)==forward(4) bit-exact**) · lib 114 passed
+- **E2E verification** (GPU dev environment, both fp32 and int8; UD-IQ2_XXS is the default pick so the mixed-quant path is the production path): Japanese QA (correct answer), English haiku, 307-token summarization all coherent · greedy (temp=0) correct on both int8 and fp32 · **identical output across 3 consecutive requests at seed 42**. prefill ~90ms/token, decode ~20ms/token (CPU token-by-token) → GPU offload is the next bottleneck
+- **Next**: GDN/prefill GPU offload → 9B (untied) → 27B
+
 ## 4. Candidate List
+
+### Qwen3.5 main line (final goal: Qwen3.8-27B on UD-IQ2_XXS)
+
+- [ ] **GDN/prefill GPU offload** (top priority): currently CPU token-by-token at prefill ~90ms/token, decode ~20ms/token. First port the sequential AR kernels, then consider a chunked-scan form
+- [ ] **Qwen3.5-9B real E2E**: 32 layers = 24 GDN + 8 full, untied, nearly identical head layout (model download needed). Final validation before 27B
+- [ ] **Qwen3.8-27B scale**: 64 layers = 48 GDN + 16 full, int8 required. GPU offload is a prerequisite (CPU sequential prefill exceeds practical time)
+- [ ] **GDN state snapshots in the prefix cache** (optional): recurrent models currently always full-prefill (correctness first). Speeds up multi-turn chats
+- [ ] **rmsnorm GPU offload** (P17k leftover, 2.3s) / **attn_core V accumulation** (leftover 3.51s, largest op)
+
+### Earlier candidates
 
 - [x] ~~**sampler optimization**: softmax + top-p sort over the 152k vocab cost a fixed ~3.5ms/step (found in P7.5)~~ → **done in P8** (0.66ms/step, greedy unchanged)
 - [x] ~~**P6 resume: true parallel decode**: batched matrix form for concurrent session decode~~ → **done in P6** (slot pool + forward_batch, fp32 1.35× / int8 1.7× @b=4). **Remaining: b=4 shifts to compute-bound, so k-direction order-preserving SIMD widening** (SDOT etc., pairwise adds that keep accumulation order) could further improve batch efficiency
