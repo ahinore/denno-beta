@@ -287,7 +287,12 @@ impl Qwen35 {
         }
 
         // tied lm_head: Int8 モードでは logits 用の量子化コピーを持つ
-        let tied = tc["tie_word_embeddings"].as_bool().unwrap_or(true);
+        // (tie_word_embeddings は text_config 内 or トップレベル (VLM ラッパ) の
+        //  どちらかにあり得る — 9B はトップレベルのみ)
+        let tied = tc["tie_word_embeddings"]
+            .as_bool()
+            .or_else(|| cfg["tie_word_embeddings"].as_bool())
+            .unwrap_or(true);
         let embed = dt("token_embd.weight")?;
         let lm_head = if tied {
             match quant {

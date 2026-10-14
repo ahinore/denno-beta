@@ -177,7 +177,7 @@ fn gdn_gpu_scan_close_to_cpu() {
         ((rng >> 33) as f32) / (u32::MAX as f32) - 0.5
     };
 
-    let (nk, nv, dk, dv) = (2usize, 2usize, 8usize, 8usize);
+    let (nk, nv, dk, dv) = (2usize, 4usize, 8usize, 8usize);
     let d_conv = 4usize;
     let n = 12usize;
     let conv_dim = 2 * nk * dk + nv * dv;
@@ -267,3 +267,5 @@ fn gdn_gpu_scan_close_to_cpu() {
     assert!(maxd < 1e-3, "y maxabs diff {maxd}");
     assert!(maxd_s < 1e-3, "ssm maxabs diff {maxd_s}");
 }
+
+
