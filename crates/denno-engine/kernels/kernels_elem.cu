@@ -243,13 +243,18 @@ extern "C" __global__ void dno_attention(
 // (ユーザー承認)。数値は CPU (sgemm 経路) とビット不一致だが、**決定論は
 // 維持** (タイルサイズ・累積順固定・原子操作なし: 同一入力 → 同一出力)。
 //
-// grid = (heads, ceil(n / PF_BQ)), block = (dh), dynamic shmem =
-//   (PF_BQ + 2*PF_BK) * dh + PF_BQ*PF_BK + 2*PF_BQ floats (<= 48KB)。
-// block (h, qt) が q ヘッド h のクエリ行 [qt*PF_BQ, qt*PF_BQ+PF_BQ) を担当。
+// grid = (ceil(n / PF_BQ), heads), block = (dh), dynamic shmem =
+//   (PF_BQ + 2*PF_BK) * (dh+1) + PF_BQ*PF_BK + 2*PF_BQ floats (<= 48KB)。
+// block (qt, h) が q ヘッド h のクエリ行 [qt*PF_BQ, qt*PF_BQ+PF_BQ) を担当。
+//   x=行ブロック (最速次元) → 同時実行ブロックが同一 head の K/V を共有 (L2)。
 //   kvh = h / group, kh_off = kvh * dh
 //   scores[i,j] = q[i,h] · K[j,kh_off..] * scale   (j = 0..pos0+i — causal)
 //   att[i,h]    = Σ_j softmax_j * V[j, kh_off..]
 // K/V は GPU 側 KV ミラー ([t_total, kv_dim] 行-major、ホスト KvCache と同一)。
+// P17k 性能修正 ③: q/k/v smem の行ストライドを dh+1 にパディング。dh=128 は
+// そのままだとストライドが 32 の倍数でスコア dot の smem 読み (k_sm[kk*dh+t2])
+// が 32-way bank conflict になり SM 帯域が ~1/32 に落ちる。+1 パッドで bank を
+// 行ごとにずらし conflict 解消。メモリ配置のみの変更で**数値は完全不変**。
 // exp は exp2f ベース (P17k): attention は数値緩和枠 (ユーザー承認済み) のため
 // glibc 完全再現の dno_expf (f64 演算主体・デスクトップ GPU では 1/64 レートで
 // 増悪) をやめ、ハード命令 MUFU.EX2 の exp2f に置換する。expf(x) =
@@ -258,10 +263,24 @@ extern "C" __global__ void dno_attention(
 // dno_attention はビット一致枠のため dno_expf のまま変更しない。
 // online softmax の累積順は「タイル昇順・タイル内 kk 昇順・出力次元 d はスレッド
 // tid = d 専属」で固定。
-// 制約 (ホスト側でも検証): dh >= 32 (block が PF_BQ 行 owner を持つため) &&
-//   shmem <= 48KB (dh <= 152 @ BQ=16/BK=32)。
-#define PF_BQ 16
-#define PF_BK 32
+// 制約 (ホスト側でも検証): dh >= 48 (block が PF_BQ 行 owner を持つため) &&
+//   shmem <= 48KB (dh <= 185 @ BQ=48/BK=8)。**実測上の注意**: 動的 smem は
+//   ~35KB までは安定だが ~43KB 以上でカーネルが不正アドレス (error 700) で
+//   落ちた (BQ=64/BK=8・BQ=48/BK=16 で再現、詳細未解明)。48KB 制約内でも
+//   BQ=48/BK=8 (34.9KB) を上限として使うこと。
+// P17k 性能修正 (2026-10-14): ①PF_BQ 16→48 (K/V の再読みトラフィックは BQ に
+// 反比例 — 総トラフィック ~314GB→104GB)・PF_BK 32→8 (smem を実効安全域に収める)。
+// ②grid を (行ブロック, heads) に反転 (x=行ブロックが最速次元 → 同時実行
+// ブロックが同一 head の K/V 27MB を共有し L2 に乗る。旧 layout は 14 head 分
+// ~380MB のワーキングセットで L2 に乗らず DRAM 律速だった)。③q/k/v smem の
+// 行ストライドを dh+1 にパディング (dh=128 は 32 の倍数でスコア dot の smem 読み
+// が 32-way bank conflict → SM 帯域 ~1/32。+1 パッドで解消)。③はメモリ配置のみ
+// で**数値完全不変**。①はタイル境界が変わり online softmax の中間丸めが変わるが
+// attention 緩和枠内・決定論は維持 (固定タイル・固定累積順)。②は数値に影響しない。
+// 実測 (n=13252・t=13252・14 heads・RTX 5090): 368ms → **112ms/call** (3.3 倍)。
+//   内訳: ③パッドで 284ms→149ms、①+②で→112ms。
+#define PF_BQ 48
+#define PF_BK 8
 // exp2f ベース softmax 用 (expf(x) = exp2f(x * log2(e)))
 #define LOG2E_F 1.44269504088896340736f
 extern "C" __global__ void dno_attention_prefill(
@@ -272,15 +291,15 @@ extern "C" __global__ void dno_attention_prefill(
     int heads, int n, int pos0, int kv_dim, int t_total, int group, int dh,
     float scale) {
     extern __shared__ float sh[];
-    float *q_sm = sh;                     // [PF_BQ][dh]
-    float *k_sm = q_sm + PF_BQ * dh;      // [PF_BK][dh]
-    float *v_sm = k_sm + PF_BK * dh;      // [PF_BK][dh]
-    float *s_sm = v_sm + PF_BK * dh;      // [PF_BQ][PF_BK] scores → probs
+    float *q_sm = sh;                     // [PF_BQ][dh+1] (bank conflict 回避の pad)
+    float *k_sm = sh + PF_BQ * (dh + 1);  // [PF_BK][dh+1]
+    float *v_sm = k_sm + PF_BK * (dh + 1);  // [PF_BK][dh+1]
+    float *s_sm = v_sm + PF_BK * (dh + 1);  // [PF_BQ][PF_BK] scores → probs
     float *corr_sm = s_sm + PF_BQ * PF_BK;  // [PF_BQ] (最終フェーズで 1/l に再利用)
     float *mnew_sm = corr_sm + PF_BQ;       // [PF_BQ]
 
-    const int h = blockIdx.x;
-    const int i0 = blockIdx.y * PF_BQ;
+    const int h = blockIdx.y;
+    const int i0 = blockIdx.x * PF_BQ;
     const int kh_off = (h / group) * dh;
     const int tid = threadIdx.x;
     // この block が見る必要のある最大 key (行ごとの causal 界の最大値)
@@ -295,7 +314,7 @@ extern "C" __global__ void dno_attention_prefill(
     // q を shared へ (範囲外行は 0 埋め → スコア 0・l > 0 で NaN なし・出力は書かない)
     for (int r = 0; r < PF_BQ; ++r) {
         const int i = i0 + r;
-        q_sm[r * dh + tid] =
+        q_sm[r * (dh + 1) + tid] =
             (i < n) ? q[(size_t)i * heads * dh + (size_t)h * dh + tid] : 0.0f;
     }
 
@@ -304,11 +323,11 @@ extern "C" __global__ void dno_attention_prefill(
         for (int kk = 0; kk < PF_BK; ++kk) {
             const int j = j0 + kk;
             if (j < t_total) {
-                k_sm[kk * dh + tid] = kc[(size_t)j * kv_dim + kh_off + tid];
-                v_sm[kk * dh + tid] = vc[(size_t)j * kv_dim + kh_off + tid];
+                k_sm[kk * (dh + 1) + tid] = kc[(size_t)j * kv_dim + kh_off + tid];
+                v_sm[kk * (dh + 1) + tid] = vc[(size_t)j * kv_dim + kh_off + tid];
             } else {
-                k_sm[kk * dh + tid] = 0.0f;
-                v_sm[kk * dh + tid] = 0.0f;
+                k_sm[kk * (dh + 1) + tid] = 0.0f;
+                v_sm[kk * (dh + 1) + tid] = 0.0f;
             }
         }
         __syncthreads();
@@ -324,8 +343,8 @@ extern "C" __global__ void dno_attention_prefill(
                 // 無効行: m_new を 0 に保ち NaN を避ける (acc はゴミだが書かない)
                 s = 0.0f;
             } else if (j < t_total && j <= pos0 + i) {
-                const float *qr = &q_sm[r * dh];
-                const float *kr = &k_sm[kk * dh];
+                const float *qr = &q_sm[r * (dh + 1)];
+                const float *kr = &k_sm[kk * (dh + 1)];
                 float d = 0.0f;
                 for (int t2 = 0; t2 < dh; ++t2) d = fmaf(qr[t2], kr[t2], d);
                 s = d * scale;
@@ -361,7 +380,7 @@ extern "C" __global__ void dno_attention_prefill(
         for (int r = 0; r < PF_BQ; ++r) acc[r] *= corr_sm[r];
         for (int r = 0; r < PF_BQ; ++r) {
             for (int kk = 0; kk < PF_BK; ++kk) {
-                acc[r] = fmaf(s_sm[r * PF_BK + kk], v_sm[kk * dh + tid], acc[r]);
+                acc[r] = fmaf(s_sm[r * PF_BK + kk], v_sm[kk * (dh + 1) + tid], acc[r]);
             }
         }
         __syncthreads();  // 次タイルの k_sm/v_sm/s_sm 上書き前の壁
