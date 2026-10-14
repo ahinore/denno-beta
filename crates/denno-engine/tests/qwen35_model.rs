@@ -112,3 +112,45 @@ fn qwen35_int8_vs_fp32_logits() {
     eprintln!("fp32 top5: {:?}", top5(&l32));
     eprintln!("int8 top5: {:?}", top5(&li8));
 }
+
+/// A1: バッチ prefill (n>1・投影一括 GEMM) がトークン逐次経路と bit-exact である
+/// ことを検証する (i32 累積は順序不変 → m>1 の行が m==1 と一致する根拠)。
+#[test]
+#[ignore]
+fn qwen35_prefill_batch_matches_tokenwise() {
+    // CI (-- --ignored) ではモデルが無いのでスキップ(パニックにしない)
+    let Ok(dir) = std::env::var("QWEN35_DIR") else {
+        eprintln!("skip: QWEN35_DIR 未設定");
+        return;
+    };
+    let toks: Vec<u32> = (0..12).map(|i| 1000 + i * 37).collect();
+
+    // トークン逐次 (n==1 を 12 回)
+    let mut m1 = load_model(std::path::Path::new(&dir), QuantMode::Int8).unwrap();
+    let mut c1 = m1.new_cache();
+    let mut l1 = Vec::new();
+    for t in &toks {
+        l1 = m1.forward(&[*t], &mut c1).unwrap();
+    }
+
+    // バッチ prefill (n==12 を 1 回)
+    let mut m2 = load_model(std::path::Path::new(&dir), QuantMode::Int8).unwrap();
+    let mut c2 = m2.new_cache();
+    let l2 = m2.forward(&toks, &mut c2).unwrap();
+
+    assert_eq!(l1.len(), l2.len());
+    for (i, (a, b)) in l1.iter().zip(l2.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "prefill batch != tokenwise at logits[{i}]"
+        );
+    }
+    // キャッシュ連続性: どちらの経路でも以後の 1 トークン forward が一致
+    let la = m1.forward(&[toks[0]], &mut c1).unwrap();
+    let lb = m2.forward(&[toks[0]], &mut c2).unwrap();
+    for (a, b) in la.iter().zip(lb.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits());
+    }
+    eprintln!("prefill batch == tokenwise (bit-exact, {} logits)", l1.len());
+}

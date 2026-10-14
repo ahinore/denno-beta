@@ -140,6 +140,19 @@ impl Linear {
         }
     }
 
+    /// m>1 のバッチ投影 (prefill 用)。各行が m==1 (apply_bt) と**ビット一致**する
+    /// 経路を選ぶ:
+    /// - Q8: apply_bt (matmul_bt_i8 / GPU dno_gemm_i8) — i32 累積は順序不変なので
+    ///   行単位で m==1 と一致
+    /// - F32: matvec_rows_bt (P9 順序保存レーン並列・k 方向は逐次) — matmul_bt
+    ///   (sgemm) は累積順が異なり一致しないため使わない
+    pub fn apply_bt_rows(&self, a: &[f32], m: usize) -> Vec<f32> {
+        match self {
+            Linear::F32 { w, k, n } => crate::tensor::matvec_rows_bt(a, w, *k, *n, m),
+            Linear::Q8(_) => self.apply_bt(a, m),
+        }
+    }
+
     /// w: [k,n] row-major (GPT-2 Conv1D 形式) から構築。
     /// Int8 の場合は転置して [n,k] 形で量子化する (fp32 は既存カーネルを
     /// 使えるよう元の形状のまま保持)。

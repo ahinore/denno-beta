@@ -341,15 +341,36 @@ impl Qwen35 {
         li: usize,
         pos: usize,
     ) -> Result<Vec<f32>> {
+        let qg = lf.q_w.apply_bt(h, 1); // [heads*2*dh]
+        let k = lf.k_w.apply_bt(h, 1); // [kv_dim]
+        let v = lf.v_w.apply_bt(h, 1);
+        let att = self.full_attn_core(lf, &qg, &k, &v, cache, li, pos);
+        Ok(lf.o_w.apply_bt(&att, 1))
+    }
+
+    /// full attention コア: 投影済み qg [heads*2*dh] / k, v [kv_dim] の 1 行から
+    /// QK-Norm → partial RoPE → KV 書き込み → GQA attention → sigmoid 出力ゲート
+    /// まで (prefill バッチ経路と共用・演算順序はトークン逐次経路と同一のため
+    /// bit-exact)。
+    #[allow(clippy::too_many_arguments)]
+    fn full_attn_core(
+        &self,
+        lf: &FullLayer,
+        qg: &[f32],
+        k_row: &[f32],
+        v_row: &[f32],
+        cache: &mut KvCache,
+        li: usize,
+        pos: usize,
+    ) -> Vec<f32> {
         let dh = self.dh;
         let heads = self.heads;
         let kv_heads = self.kv_heads;
         let kv_dim = kv_heads * dh;
         let group = heads / kv_heads;
 
-        let qg = lf.q_w.apply_bt(h, 1); // [heads*2*dh]
-        let mut k = lf.k_w.apply_bt(h, 1); // [kv_dim]
-        let v = lf.v_w.apply_bt(h, 1);
+        let mut k = k_row.to_vec();
+        let v = v_row;
 
         // QK-Norm (head 単位・RoPE 前) + q の分離
         let mut q = vec![0.0f32; heads * dh];
@@ -409,7 +430,7 @@ impl Qwen35 {
             }
         }
 
-        Ok(lf.o_w.apply_bt(&att, 1))
+        att
     }
 
     /// GDN 層の 1 トークン forward → attn 出力 [e]。
@@ -418,7 +439,24 @@ impl Qwen35 {
         let z = lg.gate_w.apply_bt(h, 1);
         let beta_raw = lg.beta_w.apply_bt(h, 1);
         let alpha = lg.alpha_w.apply_bt(h, 1);
+        let y = self.gdn_scan(lg, &qkv, &z, &beta_raw, &alpha, cache, li);
+        lg.out_w.apply_bt(&y, 1)
+    }
 
+    /// GDN スキャン 1 トークン分 (投影済みの行を受け取る)。prefill バッチ経路と
+    /// 共用 — 状態読み出し → forward_token_core → 状態書き戻しのみを担当する
+    /// (演算順序はトークン逐次経路と同一のため bit-exact)。
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_scan(
+        &self,
+        lg: &GdnLayer,
+        qkv: &[f32],
+        z: &[f32],
+        beta_raw: &[f32],
+        alpha: &[f32],
+        cache: &mut KvCache,
+        li: usize,
+    ) -> Vec<f32> {
         let (conv, ssm) = cache
             .gdn_state_mut(li)
             .expect("GDN state slot が未初期化");
@@ -432,14 +470,13 @@ impl Qwen35 {
             ssm_dt: &lg.ssm_dt,
             ssm_norm: &lg.ssm_norm,
         };
-        let y = forward_token_core(&self.gdn_p, &cw, &qkv, &z, &beta_raw, &alpha, &mut st);
+        let y = forward_token_core(&self.gdn_p, &cw, qkv, z, beta_raw, alpha, &mut st);
         let (conv, ssm) = cache
             .gdn_state_mut(li)
             .expect("GDN state slot が未初期化");
         conv.copy_from_slice(&st.conv);
         ssm.copy_from_slice(&st.ssm);
-
-        lg.out_w.apply_bt(&y, 1)
+        y
     }
 
     /// FFN (SwiGLU)。
@@ -508,6 +545,14 @@ impl Model for Qwen35 {
         // 先に全トークン分の K/V 容量を確保 (cache.len() は最後に advance する
         // ため、トークンごとの kv_bufs(li,1) では不十分)
         let _ = cache.kv_bufs(0, tokens.len());
+        // A1: prefill (n>1) は投影 (Linear) をバッチ一括で回す (GPU では tiled
+        // GEMM dno_gemm_i8 が発動)。GDN スキャン / full attention コアはトークン
+        // 逐次のまま (再帰状態は逐次更新が必須)。投影の m>1 経路は i32 累積が
+        // 順序不変のため m==1 (matvec) と行単位でビット一致 → 出力はトークン
+        // 逐次経路と bit-exact。
+        if tokens.len() > 1 {
+            return self.forward_prefill(tokens, cache);
+        }
         let mut logits = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = pos0 + i;
@@ -541,6 +586,141 @@ impl Model for Qwen35 {
             logits = self.logits(&hf);
         }
         cache.advance(tokens.len());
+        Ok(logits)
+    }
+}
+
+impl Qwen35 {
+    /// prefill (n>1): 投影をバッチ一括 GEMM、GDN スキャン / full attention は
+    /// トークン逐次。トークン逐次経路と bit-exact (テスト: qwen35_prefill_batch
+    /// _matches_tokenwise)。
+    fn forward_prefill(&self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>> {
+        let e = self.e;
+        let n = tokens.len();
+        let pos0 = cache.len();
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = pos0 + i;
+            if pos >= self.ctx {
+                bail!("context overflow: pos={pos} >= {}", self.ctx);
+            }
+            if tok as usize >= self.vocab {
+                bail!("token id {tok} が vocab ({}) を超過", self.vocab);
+            }
+        }
+        // 埋め込み X [n, e]
+        let mut x = vec![0.0f32; n * e];
+        for (i, &tok) in tokens.iter().enumerate() {
+            x[i * e..(i + 1) * e].copy_from_slice(&self.embed[tok as usize * e..][..e]);
+        }
+        let heads = self.heads;
+        let kv_heads = self.kv_heads;
+        let dh = self.dh;
+        let kv_dim = kv_heads * dh;
+        let ff = self.ff;
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            // --- attention: rmsnorm を行単位で一括計算 ---
+            let mut h = vec![0.0f32; n * e];
+            for i in 0..n {
+                let r = rmsnorm(&x[i * e..(i + 1) * e], layer.attn_ln1(), e, self.eps);
+                h[i * e..(i + 1) * e].copy_from_slice(&r);
+            }
+            match &layer.attn {
+                AttnKind::Gdn(g) => {
+                    // 投影はバッチ一括 (m=n → GPU tiled GEMM)
+                    let (kqkv, nqkv) = g.qkv_w.dims();
+                    let (_, nz) = g.gate_w.dims();
+                    let (_, nb) = g.beta_w.dims();
+                    let (_, na) = g.alpha_w.dims();
+                    debug_assert_eq!(kqkv, e);
+                    let qkv = g.qkv_w.apply_bt_rows(&h, n);
+                    let z = g.gate_w.apply_bt_rows(&h, n);
+                    let beta_raw = g.beta_w.apply_bt_rows(&h, n);
+                    let alpha = g.alpha_w.apply_bt_rows(&h, n);
+                    // スキャンはトークン逐次 (再帰状態)
+                    let dy = g.out_w.dims().0; // value_dim
+                    let mut ys = vec![0.0f32; n * dy];
+                    for i in 0..n {
+                        let y = self.gdn_scan(
+                            g,
+                            &qkv[i * nqkv..(i + 1) * nqkv],
+                            &z[i * nz..(i + 1) * nz],
+                            &beta_raw[i * nb..(i + 1) * nb],
+                            &alpha[i * na..(i + 1) * na],
+                            cache,
+                            li,
+                        );
+                        ys[i * dy..(i + 1) * dy].copy_from_slice(&y);
+                    }
+                    let out = g.out_w.apply_bt_rows(&ys, n);
+                    for i in 0..n {
+                        for (xi, ai) in x[i * e..(i + 1) * e]
+                            .iter_mut()
+                            .zip(&out[i * e..(i + 1) * e])
+                        {
+                            *xi += ai;
+                        }
+                    }
+                }
+                AttnKind::Full(fl) => {
+                    let qg = fl.q_w.apply_bt_rows(&h, n); // [n, heads*2*dh]
+                    let k = fl.k_w.apply_bt_rows(&h, n); // [n, kv_dim]
+                    let v = fl.v_w.apply_bt_rows(&h, n); // [n, kv_dim]
+                    let mut att = vec![0.0f32; n * heads * dh];
+                    for i in 0..n {
+                        let a = self.full_attn_core(
+                            fl,
+                            &qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
+                            &k[i * kv_dim..(i + 1) * kv_dim],
+                            &v[i * kv_dim..(i + 1) * kv_dim],
+                            cache,
+                            li,
+                            pos0 + i,
+                        );
+                        att[i * heads * dh..(i + 1) * heads * dh].copy_from_slice(&a);
+                    }
+                    let out = fl.o_w.apply_bt_rows(&att, n);
+                    for i in 0..n {
+                        for (xi, ai) in x[i * e..(i + 1) * e]
+                            .iter_mut()
+                            .zip(&out[i * e..(i + 1) * e])
+                        {
+                            *xi += ai;
+                        }
+                    }
+                }
+            }
+            // --- FFN: SwiGLU をバッチ一括 ---
+            let mut h2 = vec![0.0f32; n * e];
+            for i in 0..n {
+                let r = rmsnorm(&x[i * e..(i + 1) * e], &layer.ln2_w, e, self.eps);
+                h2[i * e..(i + 1) * e].copy_from_slice(&r);
+            }
+            let gate = layer.gate_w.apply_bt_rows(&h2, n);
+            let up = layer.up_w.apply_bt_rows(&h2, n);
+            let mut hh = vec![0.0f32; n * ff];
+            for i in 0..n {
+                for j in 0..ff {
+                    let gv = gate[i * ff + j];
+                    let uv = up[i * ff + j];
+                    hh[i * ff + j] = gv / (1.0 + (-gv).exp()) * uv;
+                }
+            }
+            let down = layer.down_w.apply_bt_rows(&hh, n);
+            for i in 0..n {
+                for (xi, di) in x[i * e..(i + 1) * e]
+                    .iter_mut()
+                    .zip(&down[i * e..(i + 1) * e])
+                {
+                    *xi += di;
+                }
+            }
+        }
+
+        // 最終 norm + logits は最終トークンのみ (トークン逐次経路の最終値と同一)
+        let hf = rmsnorm(&x[(n - 1) * e..], &self.norm_w, e, self.eps);
+        let logits = self.logits(&hf);
+        cache.advance(n);
         Ok(logits)
     }
 }
