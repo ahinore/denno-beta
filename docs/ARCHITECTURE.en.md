@@ -581,3 +581,62 @@ Three columns. The browser side also uses a playback queue + decimation so it **
 
 ---
 Development history, verification data, and future plans: [Development History](HISTORY.en.md)
+## 12. Qwen3.5 hybrid architecture (Gated DeltaNet) and the GGUF loader (P19)
+
+> The third model family, added in P19. On top of the existing safetensors + `model_type` dispatch route, two new elements arrived: a **GGUF loader route** and **layers with recurrent state (Gated DeltaNet)**. Measurement data: [Development History](HISTORY.en.md), P19 section.
+
+### 12.1 Layer layout of Qwen3.5 (3:1 hybrid)
+
+Qwen3.5 consists of two layer types throughout (0.8B: 24 layers = **18 GDN + 6 full attention**, 3:1 period. 27B: 64 layers = 48+16):
+
+- **GDN layers (Gated DeltaNet)**: instead of attention, past context is memorized by a **recurrent linear state SSM** (Delta-Rule family). No KV cache; a fixed-size state matrix is carried instead
+- **full attention layers**: GQA attention like previous Qwen2/3 (with QK-Norm, partial MRoPE, sigmoid output gate). Only these layers use the KV cache
+
+### 12.2 GDN numerics (1 token, head h)
+
+```
+g[h]   = ssm_a[h] * softplus(alpha[h] + ssm_dt[h])   # ssm_a is negative (= -exp(A_log))
+S      <- S * exp(g)                                  # decay (per-head time scales)
+sk[c]  = sum_r k[r] * S[r][c]
+d[c]   = beta[h] * (v[c] - sk[c])                     # beta = sigmoid(W_beta*x) ∈ (0,1)
+S[r][c]+= k[r] * d[c]                                 # delta-rule state update
+o[c]   = sum_r q[r] * S[r][c]
+output  = rmsnorm(o) * w * silu(z)                    # gated RMS norm (z from attn_gate)
+```
+
+- q/k are **L2-normalized** beforehand (x/sqrt(Σx²+eps); q additionally 1/sqrt(head_k_dim))
+- softplus follows the ggml convention (`x > 20 ? x : log(1+exp(x))`)
+- The implementation is a 1:1 port of llama.cpp `delta-net-base.cpp`'s `build_delta_net_autoregressive` (sequential AR form). Bit-identity with llama.cpp is not required — only the denno contract (same input → same output + determinism) is guaranteed (the sequential AR form and the chunked form are mathematically equivalent)
+- Code layout: `gdn.rs` has `GdnCore<'a>` (reference views of the tiny f32 tensors: conv1d/ssm_a/ssm_dt/ssm_norm) + `forward_token_core` (math core). Larger matrices (qkv/gate/beta/alpha/out) reuse the existing `Linear` → `model/qwen35.rs` assembles the layers
+
+### 12.3 GGUF loader route (new in P19)
+
+Previously HF safetensors was the only route; P19 added a **second weights route in GGUF format**:
+
+```
+*.gguf (mmap) → gguf.rs (container/KV/tensor info)
+  → kquant.rs + kquant_tables.rs (auto-generated): dequant for 18 GGML k-quant/IQ types
+     (bit-exact with llama.cpp: LCG fixtures, 16 blocks × 18 types all matched)
+  → dequantized f32 weights re-quantized into the existing Fp32/Int8 pipeline
+     (no new GEMM needed; Linear::new(w, k, n, mode) used as-is)
+```
+
+- Even mixed per-layer quantization like Unsloth Dynamic (UD-IQ2_XXS etc.) becomes identical to the existing route after dequantization
+- **`ssm_beta`/`ssm_alpha` stay Fp32 even in Int8 mode**: control signals passed through sigmoid/softplus; ~1% per-row int8 noise breaks the output (beta directly scales the whole delta rule, alpha the decay rate)
+- `pick_gguf`: selects from .gguf files in the directory, preferring UD-IQ2_XXS (`DENNO_GGUF_FILE` for explicit selection)
+
+### 12.4 Recurrent-state management (KvCache extension and engine constraints)
+
+GDN state is not "per token position" but a **function of the whole sequence**, imposing new constraints on KV-cache reuse design:
+
+- KvCache gains a **GDN slot** (`gdn: Vec<Option<(conv_buf, ssm_matrix)>>`, per layer), allocated via `attach_gdn_slot`, zero-cleared by `reset()`
+- `Model::is_recurrent()` (default false, true only for qwen35) added. For recurrent models:
+  - **Prefix cache entry restoration (KV-only copy) is not used** — GDN state cannot be restored
+  - KV live reuse (truncate) is **safe only for pure extension (lcp == current length)**; truncating mid-sequence invalidates GDN state and falls back to full prefill
+  - Ignoring this constraint causes **nondeterminism where the same seed changes the output** (observed and fixed in P19)
+
+### 12.5 Determinism / exactness contract (P19 additions)
+
+- Model level: forward determinism (2 runs bit-identical) + **cache continuity (forward(3)+forward(1) == forward(4) bit-identical)**
+- Only dequant requires bit-exactness with llama.cpp (the GDN sequential math does not)
+- GDN state, like KV, "grows monotonically within a session", so it inherits the existing KV guarantees (P6's solo==batch, P17e's demand-based allocation contract `kv_bufs(layer,n)` called ahead)

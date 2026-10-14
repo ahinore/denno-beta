@@ -580,3 +580,62 @@ graph LR
 
 ---
 開発の経緯・検証データ・今後の計画: [開発履歴](HISTORY.ja.md)
+## 12. Qwen3.5 ハイブリッドアーキテクチャ(Gated DeltaNet)と GGUF ローダ(P19)
+
+> P19 で追加された 3 番目のモデルファミリー。従来の safetensors+`model_type` 判定の経路に加え、**GGUF 形式のローダ経路**と**再帰状態を持つ層(Gated DeltaNet)**という新しい要素が入った。計測データは [開発履歴](HISTORY.ja.md) の P19 節。
+
+### 12.1 Qwen3.5 の層構成(3:1 ハイブリッド)
+
+Qwen3.5 は全層を 2 種類の層で構成する(0.8B: 24 層 = **18 GDN + 6 full attention**、3:1 周期。27B: 64 層 = 48+16):
+
+- **GDN 層(Gated DeltaNet)**: attention の代わりに**再帰的な線形状態 SSM**(Delta Rule 系)で過去を記憶する。KV キャッシュを持たず、代わりに固定サイズの状態行列を持ち回す
+- **full attention 層**: 従来の Qwen2/3 と同じ GQA attention(QK-Norm・partial MRoPE・sigmoid 出力ゲート付き)。KV キャッシュはこの層だけが使う
+
+### 12.2 GDN の数値(1 トークン・head h)
+
+```
+g[h]   = ssm_a[h] * softplus(alpha[h] + ssm_dt[h])   # ssm_a は負値(= -exp(A_log)済み)
+S      <- S * exp(g)                                  # 減衰(head ごとに異なる時間スケール)
+sk[c]  = sum_r k[r] * S[r][c]
+d[c]   = beta[h] * (v[c] - sk[c])                     # beta = sigmoid(W_beta*x) ∈ (0,1)
+S[r][c]+= k[r] * d[c]                                 # delta rule の状態更新
+o[c]   = sum_r q[r] * S[r][c]
+出力    = rmsnorm(o) * w * silu(z)                    # gated RMS norm(attn_gate から z)
+```
+
+- q/k は事前に **L2 正規化**(x/sqrt(Σx²+eps)・q のみ追加で 1/sqrt(head_k_dim))
+- softplus は ggml 規約(`x > 20 ? x : log(1+exp(x))`)
+- 実装は llama.cpp `delta-net-base.cpp` の `build_delta_net_autoregressive`(逐次 AR 形式)の 1:1 移植。llama.cpp とのビット一致は要求せず、denno 契約(同一入力→同一出力+決定論)のみを担保(逐次 AR 形式と chunked 形式は数学的に等価)
+- コード構成: `gdn.rs` に `GdnCore<'a>`(極小 f32 テンソル: conv1d/ssm_a/ssm_dt/ssm_norm の参照ビュー)+ `forward_token_core`(数学コア)。大きい行列(qkv/gate/beta/alpha/out)は既存 `Linear` を再利用 → `model/qwen35.rs` が層を組み立てる
+
+### 12.3 GGUF ローダ経路(P19・新規)
+
+従来は HF safetensors のみだったが、P19 で **GGUF 形式の第 2 の重み経路**が入った:
+
+```
+*.gguf (mmap) → gguf.rs(コンテナ/KV/テンソル情報)
+  → kquant.rs + kquant_tables.rs(自動生成): GGML k-quant/IQ 18 型の dequant
+     (llama.cpp と bit-exact: LCG fixture で 16 ブロック×18 型全一致)
+  → dequant 済み f32 重みを既存の Fp32/Int8 パイプラインへ再量子化
+     (新 GEMM は不要・Linear::new(w, k, n, mode) をそのまま使う)
+```
+
+- Unsloth Dynamic(UD-IQ2_XXS 等)のような**層ごとに異なる量子型の混合**でも、dequant してしまえば以降は既存経路と同一
+- **Int8 モードでも `ssm_beta`/`ssm_alpha` は Fp32 維持**: sigmoid/softplus を通る制御信号で、per-row int8 の ~1% ノイズが出力を崩す(beta は delta rule 全体の強さ・alpha は減衰率に直接効く)
+- `pick_gguf`: ディレクトリ内の .gguf から UD-IQ2_XXS 優先で選択(`DENNO_GGUF_FILE` で明示指定可)
+
+### 12.4 再帰状態の管理(KvCache 拡張と engine の制約)
+
+GDN は状態が「トークン位置ごと」ではなく**シーケンス全体の関数**なので、KV キャッシュ系の再利用設計に新たな制約を課す:
+
+- KvCache に **GDN スロット**(`gdn: Vec<Option<(conv_buf, ssm_matrix)>>`・層ごと)を追加。`attach_gdn_slot` で確保・`reset()` でゼロクリア
+- `Model::is_recurrent()`(既定 false・qwen35 のみ true)を新設。recurrent モデルでは:
+  - **prefix cache entry の復元(KV のみコピー)は不使用** — GDN 状態を復元できない
+  - KV の live 再利用(truncate)は**純拡張(lcp == 現在長)のときのみ**安全。途中まで truncate すると GDN 状態が無効になるためフル prefill に落ちる
+  - この制約を無視すると**同一 seed でも出力が変わる非決定論**になる(P19 で実測して修正済み)
+
+### 12.5 決定論・exactness 契約(P19 分)
+
+- モデルレベル: forward の決定論(2 回 bit 一致)+ **キャッシュ連続性(forward(3)+forward(1) == forward(4) bit 一致)**
+- dequant のみ llama.cpp との bit-exact を要求(GDN の逐次演算は要求しない)
+- GDN 状態は KV と同じく「同じセッション内では単調に成長」するため、既存の KV 保証(P6 の solo==batch・P17e の需要ベース確保契約 `kv_bufs(layer,n)` 先行呼び出し)をそのまま継承する

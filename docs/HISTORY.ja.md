@@ -5,8 +5,8 @@
 >
 > **追記フォーマット**: `### Pn: 機能名 (日付, commit)` の下に **実装** / **テスト** / **プロファイル** / **次の実装内容** を記載する。完了した項目は「次の実装内容」を候補リストへ反映する。
 
-**更新**: 2026-10-13
-**リポジトリ**: https://github.com/ahinore/denno-beta (main, `3ff6175` 同期済み)
+**更新**: 2026-10-15(P19-A2 完了・`9183e7e`)
+**リポジトリ**: https://github.com/ahinore/denno-beta (main, `9183e7e` 同期済み)
 
 ---
 
@@ -473,36 +473,87 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **E2E 実機検証**(GPU 開発環境・fp32/int8 両方・UD-IQ2_XXS がデフォルト選択=混合量子が本番経路): 日本語 QA(正答)・英語 haiku・307 トークン要約が coherent・greedy(temp=0)で int8 も fp32 も正答・**seed 42 × 3 連続リクエスト完全一致**。prefill ~90ms/token・decode ~20ms/token(CPU トークン逐次)→ GPU 化が次の律速
 - **次の実装内容**: GDN/prefill の GPU 化 → 9B(untied)→ 27B
 
+##### P19-B2.5: GitHub 同期+CI 修正 ✅ (2026-10-14, commits `31790f9`/`3a42252`/`1cecae7`/`2769c7f`)
+
+- **実装**: P19 の 4 コミット(`49ac073`〜`feab1c8`)を push。docs/HISTORY.ja.md+en.md に P19 節と候補リスト(Qwen3.5 主線)を追記
+- **公開規律修正**: P17 文書に残っていた環境固有名(ホスト名等)を汎化表現に修正(`3a42252`)
+- **CI 修正**: exactness ジョブ(push 時 `cargo test -- --ignored`)が環境依存テスト(`GGUF_PATH`/`QWEN35_DIR` を expect で要求)で panic → **5 テスト(gdn_gguf/qwen35_model×2/gguf_inspect/qwen35_int8_probe)を env 未設定時は eprintln+return でスキップ**に変更。ローカルで `cargo test -p denno-engine --release -- --ignored` 全 green を確認後 push
+- **結果**: commit `2769c7f` で **CI 緑**(build-test + exactness success)
+- **教訓**: `#[ignore]` テストでも exactness ワークフローは `--ignored` 付きで実行するため、実モデル/GGUF 依存テストは必ず env 未設定 graceful skip を書く
+
+##### P19-A1: Qwen3.5 GPU 化 第一段階(Linear 自動オフロード+バッチ prefill)✅ (2026-10-14, commit `57727f4`)
+
+**目的**: qwen35 モデルを CUDA ON で動かし、prefill のボトルネック(トークン逐次 m=1 投影)を解消する。
+
+- **段階 1(Linear 自動オフロード)**: qwen35 は既存 `Linear` 経由なので CUDA ON で大きい行列は自動的に GPU へ(P17b/P17i の仕組みを再利用)。GDN コアは CPU のまま。
+  - E2E 実測(285 in / 64 out, int8): **5.59s**(CPU 約 28s → **約 5x**)
+  - **ビット一致検証**: GPU サーバー(8091)と CPU int8 サーバー(8092)の応答 `"text"` が md5 完全一致(2 リクエスト)。3 連続実行も同一(決定論)。
+- **段階 2(バッチ prefill, commit `57727f4`)**: `forward_prefill`(n>1)を新設し、投影を層ごとに m=n 一括発射(GPU tiled GEMM)。
+  - **bit-exact の鍵**: Q8 投影は i32 累積が順序不変 → m=n と m=1 は行単位で一致。**F32 投影(ssm_beta/ssm_alpha は Int8 モードでも Fp32 維持)は `matmul_bt`(sgemm)が m=1 と累積順が違い一致しない**ため、新設 `Linear::apply_bt_rows` → P9 の `matvec_rows_bt`(順序保存レーン並列)を使う。
+  - GDN スキャン / full attention コアは再帰状態のためトークン逐次のまま → `gdn_scan` / `full_attn_core` ヘルパーに分割しトークン経路と共用(トークン経路は無変更)。
+  - テスト: `qwen35_prefill_batch_matches_tokenwise`(batch 12 トークン == 逐次 12 回+後続 1 トークン、logits 全 248,320 要素ビット一致)。lib 114 passed・CI 緑。
+  - **リファクタは数値不変を確認**(feab1c8 コードと同一値)。
+  - E2E 実測: 285 in/64 out → **5.11〜5.83s**・16 in/48 out → 0.94s・テキスト md5 は CPU int8 と完全一致。
+
+**教訓**: F32 の m>1 sgemm は累積順が異なる(`matvec_rows_bt` の doc に明記)。バッチ化でビット一致を保つには Q8(i32)/F32(順序保存)で経路を選ぶ必要がある。次のボトルネックは GDN スキャン本体(A1 継続: GDN カーネル GPU 移植)。
+
+###### P19-A1 step 3: GDN スキャン本体の GPU カーネル ✅ (2026-10-14, commit `8e9a874`)
+
+- **カーネル**: `kernels/gdn.cu` + `kernels_gdn.ptx`(sha256 `65f28863…`・2 回生成照合済み)。**head ごと 1 ブロック(grid=nv)・スレッド=S 列(dv)**を保持 → デルタルールの全更新(sk/外積/出力)がスレッド内完結・**スレッド間 reduction 不要**。conv(causal depthwise d_conv=4)は担当 3 チャネル(q/k/v)のウィンドウをレジスタロール。q/k の L2 正規化と出力 RMS は block 内 thread0 の逐次和(CPU と同一順序)。
+- **決定論保証**(GDN は bit 一致不要契約): launch 構成固定・atomic/ワープ縮約不使用・すべての和は固定順序。`expf`/`logf` 使用可。
+- **cuda.rs**: `PTX_GDN` include_bytes + `gdn_scan_batch` 公開 API(同期 1 launch・`GPU_BROKEN` 化→CPU フォールバック)。前提 assert: dk==dv・d_conv==4。
+- **qwen35.rs**: `forward_prefill` の GDN スキャンを `n>1 && dk==dv` で GPU 化(`#[cfg(feature="cuda")]` ゲート)。トークン逐次フォールバック `gdn_scan_rows` に抽出。decode(n==1)は従来通り CPU 逐次。
+- **検証**:
+  - 新テスト `gdn_gpu_scan_close_to_cpu`(cuda feature 専用・DENNO_CUDA 未設定 graceful skip): **y maxabs=3.353e-8・ssm maxabs=7.451e-9**(実質 fp32 ノイズ・緩和枠 1e-3 に対し余裕)・conv 状態は bit 一致。qwen35_model 4 passed・lib 114 passed(cuda feature)。
+  - **E2E(285 in/64 out)**: resp2 **5.11s → 2.09s(2.4x)**・resp1 0.94s → **0.68s**。
+  - **決定論: resp2 3 連続 md5 一致(`e9302a99…`)**。md5 が CPU int8 アンカー(`e2ee5b52…`)と異なるのは GDN 数値が GPU で僅かに変わるため(契約どおり)・テキストは自然な日本語要約を維持。
+- **教訓**: `launch_async` は unsafe → unsafe ブロック必須。payload の `model` 名はサーバー登録 ID(`local/qwen35-0.8b`)と一致させる必要(404 の原因)。
+
+###### P19-A2: Qwen3.5-9B 実 E2E ✅ (2026-10-14〜15, commit `9183e7e`)
+
+9B (nk=16/nv=32・untied・32 層=24 GDN+8 full) の garble を 2 段階のバグ修正で解決:
+
+1. **GDN k-head 規約修正**: v-head→k-head マッピングを `h % nk` → `h * nk / nv` (repeat_interleave = HF / llama.cpp ggml_repeat の blocked タイリング) に修正 (gdn.rs/gdn.cu+PTX 再生成)。0.8B は nk==nv で不問・9B で顕在化。ops.cpp:1698-1760 の精査+層 0 numpy 検証 (blocked 0.27% vs interleaved 73%) で確定。
+2. **untied lm_head 根本原因**: 9B config.json は VLM ラッパ形式で `tie_word_embeddings: false` が**トップレベル**にあり `text_config` 内に無い。ローダは `tc["tie_word_embeddings"].unwrap_or(true)` で tied 扱い → embed を lm_head 代わりに使用 → logits 全滅 (hidden 状態は層 0-31 numpy 完全一致だったのに出力のみ garble、という症状の説明と一致)。0.8B は真に tied なので無影響。修正: text_config から解決出来ない場合トップレベルにフォールバック。
+
+- **検証 (numpy 参照実装 × QWEN35_DUMP)**: fp32 単トークン全 32 層 numpy 一致 (最大 relerr 1e-4) / 3 トークン逐次 logits numpy 一致 (1e-4) / 逐次とバッチ prefill は bit 一致 (P19 契約維持) / llama.cpp 同 GGUF は正常出力 (エンジン固有バグと切り分け)。
+- **E2E 結果 (int8 GPU)**: q35_9b_1 で正常な思考出力。md5 `90fe7e5850b48d4b7aba157922af7113` が連続 2 回+サーバー再起動後も bit 一致 (決定論契約達成)。fp32 も動作するが temperature 0 greedy で反復傾向あり (int8 固有ではなくテンプレート/生成品質の課題 → 次ステップ)。
+- デバッグ基盤 (qwen35.rs 診断メソッド+qwen35_9b_debug_trace テスト、ホスト numpy 参照実装 tmp/ref_*.py) は commit 前に撤去済み。学習: untied モデルは 9B が初 ⇒ lm_head 経路が初めて実戦使用された。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B UD-IQ2_XXS 動作)
 
-- [ ] **GDN/prefill の GPU 化**(最優先): 現状 CPU トークン逐次で prefill ~90ms/token・decode ~20ms/token。まず逐次 AR カーネルの GPU 移植、その後 chunked scan 形式の検討
-- [ ] **Qwen3.5-9B 実 E2E**: 32 層=24 GDN+8 full・untied・head 構造ほぼ同一(モデル DL 必要)。27B 前の最終検証
-- [ ] **Qwen3.8-27B スケール**: 64 層=48 GDN+16 full・int8 必須。GPU 化が前提(prefill が CPU 逐次では実用時間を超える)
-- [ ] **prefix cache への GDN 状態スナップショット**(任意): 現在 recurrent モデルはフル prefill 固定(正しさ優先)。マルチターン高速化
-- [ ] **rmsnorm の GPU 化**(P17k 残課題・2.3s)/ **attn_core の V 累積**(残 3.51s・最大 op)
+- [x] **A1: GDN/prefill の GPU 化 — 完了**(commit `57727f4` 第一段階+バッチ prefill → `8e9a874` GDN カーネル): Linear 自動オフロード+投影 m=n 一括(F32 は `apply_bt_rows`/matvec_rows_bt でビット一致維持)+**GDN スキャン GPU カーネル**(head ごと 1 ブロック・S 列保持・reduction 不要)。285 in/64 out: CPU ~28s → 5.1〜5.8s → **2.09s(約 13x)**。GPU/CPU 差 y maxabs=3.4e-8・決定論 3 連続 md5 一致。decode(n==1)は CPU 逐次のまま(chunked scan は将来課題)
+- [ ] **A1 残課題(任意)**: GDN chunked scan(長 prefill の更なる高速化)・decode の GDN GPU 化
+- [x] **A2: Qwen3.5-9B 実 E2E — 完了**(commit `9183e7e`): GDN k-head 規約修正+untied lm_head 修正で garble 解決。fp32 全 32 層 numpy 一致・逐次==バッチ prefill bit 一致・int8 GPU E2E 決定論 md5 一致(連続+再起動)
+- [ ] **A3: Qwen3.8-27B スケール**: 64 層=48 GDN+16 full・int8 必須・VRAM/RAM/KV 予算の再確認。A1 の GPU 化が前提(prefill が CPU 逐次では実用時間を超える)
+- [ ] **A2.5: 9B 生成品質の改善(A3 前に推奨)**: int8/fp32 とも temperature 0 greedy で反復傾向。チャットテンプレートの Qwen3.5 公式準拠確認(thinking マーカー・enable_thinking)・repetition penalty 等。llama.cpp との出力比較で切り分け
+- [ ] **A4: prefix cache への GDN 状態スナップショット**(任意): 現在 recurrent モデルはフル prefill 固定(正しさ優先)。マルチターン高速化
 
-### 従来候補
+### P17 系残課題(CUDA)
 
-- [x] ~~**sampler最適化**: 152k語彙のsoftmax+top-pソートが約3.5ms/stepの固定コスト(P7.5で判明)~~ → **P8で完了**(0.66ms/step、greedy不変)
-- [x] ~~**P6再開: 真の並列decode**: バッチ行列化で複数セッション同時decode~~ → **P6で完了**(スロットプール+forward_batch、fp32 1.35倍/int8 1.7倍@b=4)。**残課題: b=4で演算律速に遷移するためk方向の順序保存SIMD幅拡大**(SDOT等、累積順を保ったペアワイズ加算)でバッチ効率をさらに伸ばせる
-- [x] ~~**バッチ効率の向上(P6追補)**: `matvec_rows_bt`のk方向SIMD化(順序保存)~~ → **P9で完了**。ただし実装したのはk方向ではなく**i方向(バッチレーン)並列**(k方向のSIMDはfp32では累積順が変わり不可。i方向なら各要素のk累積を逐次のまま4セッション同時演算できる=ビット一致維持)。カーネル3.9〜5.9倍。プロファイルの結果、e2eの次の律速は**平均バッチ幅の低下(完了時間の偏り)+attention(セッション毎処理)+メモリ系競合**
-- [x] ~~**attentionのバッチ化(P10候補)**: `forward_batch`内のattention本体がセッション毎の逐次ループ~~ → **P10で完了**(セッション×KVヘッドでrayon並列、ビット一致維持)。効果は**集約+4%**(交互A/B実測。attn_coreはバッチ時5.5%なので理論上限と一致)。softmaxのmax減算/sumはセッション毎独立のためバッチ化しても決定論は維持された
-- [x] ~~gpt2 exactness テストの失敗(文字化け)~~ → **P11で完了**(モデル再取得では直らず。原因=①テストがCIでスキップされ続けて基準が古い②ストリーミングdetokのバイト分割文字バグ。HF transformers参照実装と一致する基準に更新+detok保留/フラッシュ機構+CIでgpt2 pull追加)
-- [x] ~~**残り律速の分析**: P9プロファイルで判明した①平均バッチ幅の低下②in-serverでのメモリ系競合③prefill割込み~~ → **P12で完了**(クリーン環境で定量化。fp32はW=8までスケール/int8はW=4で頭打ち。int8のop別: gate_up 29.5% / attn 19.4% / down 18.0% / lm_head 10.8%。attentionのオーバーヘッド(V側の統合+コピー+アロケーション)をP12で削減。scores側の根本最適化はビット一致規律と両立不可 — 基準更新の判断が残る)
-- [x] ~~**推論可視化(denno-trace)P13: テレメトリ基盤**: 推論プロセスから観測を完全分離する構成(詳細は[アーキテクチャ解説](ARCHITECTURE.ja.md)§11)。`denno-telemetry` crate(バージョン付きフラット形式、f16/varint、Gapフレーム)+denno側捕捉(L0フロー/L1統計: profフック・phase遷移・sampler top-k・KV使用率・出力トークン)+WSエンドポイント(`/v1/telemetry/ws`)+denno-viewサーバー骨組み。設計原則: ①可視化は推論に含めない(dennoは流すだけ)②boundedチャネル+ドロップ許容で推論を絶対に待たせない③既定OFF・read-only捕捉でbit-exact規律と両立(exactness全緑を担保条件に)~~ → **P13で完了**(commit `69663e6`。テレメトリON/OFFで出力完全一致・e2eでGap 0件・JSデコーダ全10種一致を確認。詳細はP13節)
-- [x] ~~**推論可視化 P14: ビューア(L0/L1)**: フロー図・トークンストリーム・KV使用率グリッド・sampler top-kビュー・リプレイ記録+スクラバー~~ → **P14で完了(JS版で先行実装、commit `8befe3f`)**: ユーザー指定仕様のアニメーションUI(モデル駆動プログラム+実装コードパネル+層パネル+KV/変数+内蔵チャット)。**WASM移植・リプレイスクラバーは残課題**(詳細はP14節)
-- [ ] **推論可視化 P18: L2テンソルストリーミング**(旧 P17 — CUDA 最適化を P17 として実施したため繰り下げ): focusプロトコル(ビューアがセッション×layer×tensor種別を指定、dennoはその組だけをストリーム)。隠れ状態ヒートマップ、attention確率マップ(1トークンがどの過去トークンを見ているか)、K/V実体ビューア。予算: focus先1セッション≤5%(f16+絞り込み)
-- [ ] **3B/7Bのb=4実測**: 計測のみ。帯域律速のままならバッチ幅を増やすほど素直に効くはず(交互A/Bで計測すること)。大型モデルのキャッシュ追加(`denno pull`)が必要
-- [x] ~~**CUDA最適化**: 実装ポイントの分析は[アーキテクチャ解説](ARCHITECTURE.ja.md)§8に記載(線形層→cuBLAS、attention融合、samplerカーネル、paged KV)。int8路線ならCPU/GPUでビット一致が維持できる。P6のスロットプール+forward_batch構造はGPUのcontinuous batchingと同型なのでそのまま移植可能~~ → **P17で第一段完了** (commit `11281dd`: int8 線形層カーネルを CPU int8 パスと**ビット一致**で実装・RTX 5090 で実機検証・lm_head 18.6x。cuBLAS ではなく自前カーネル(dlopen+ドライバAPI・依存ゼロ)で exactness を構造的に担保)。**エンジン統合は P17b で完了** (commit `197a06c`: 重み常駐 uid レジストリ+ピン留め非同期パイプライン+decode 限定オフロード、e2e で 3.4x・応答完全一致、詳細はP17b節)。**qkv/gate_up の融合呼び出しは P17c で完了** (commit `7bf9eb0`: 同一入力の線形層群を 1 呼び出しに融合・e2e 4.96x、詳細はP17c節)。**要素演算 GPU 化+デコードチェーンは P17d で完了** (commit `121aa3a`: glibc expf を FMA 縮約込みで完全再現・隠れ状態デバイス常駐パイプライン、詳細はP17d節)。**KV は P17e で需要ベース確保に変更** (commit `c889336`: スロット事前確保 ~7.5GB → 起動時 0・スロット 4→32・install 時予約ハード保証、詳細はP17e節)。**attention カーネル融合/paged KV は残**、詳細はP17節)
+- [ ] **B1: rmsnorm の GPU 化**: P17k プロファイルで残 2.3s(TOTAL ~31%)。P17d 要素演算カーネルの延長・実装容易
+- [ ] **B2: attn_core の V 累積**: 残 3.51s(最大 op)。dno_attention 拡張(attention は緩和契約済み)
+- [ ] **B3: b>1 バッチの rope GPU 化**(優先度低): バッチ時は同期が隠蔽される
+- [x] ~~**3B/7Bのb=4実測**~~ → **P17k で実施**(対象は Gemma3n 13,252 tok に変更して完了)
+
+### 運用・周辺
+
+- [x] ~~**C1: P19 の GitHub 同期**~~ → **完了**(push `64827e6..feab1c8`+CI 修正 4 コミット・CI 緑)
+- [x] ~~**C2: docs/HISTORY.ja.md+en.md に P19 を追記**~~ → **完了**(`31790f9`・P17 文書の環境固有名汎化 `3a42252`)
+- [ ] **C3: dev サーバー(8090)の P19 バイナリ化**: 現在 P17i 時点。engine.rs の is_recurrent は non-recurrent で no-op なので安全
 - [ ] **GitHub push自動化**: deploy key登録後にコンテナから直接push
 - [ ] tool use(Anthropic APIのtoolsパラメータ対応)
 - [ ] Llama系バリアント(GQA無しモデル、RoPEスケーリング)
-- [ ] **他ファミリー対応**: DeepSeekシリーズ(MoE+共有エキスパート)、GLMシリーズ、gpt-oss(attention sink+sliding window+MXFP4)。~~Qwen3(QK-Norm)~~ → **P15で完了**(thinkingモード切替とMoE派生は未対応)
-- [ ] **各モデル独自機構の可視化**: MoEルーティング(トークンごとに発火したエキスパート+ルータ確率の表示)、MLAの潜在圧縮KV(通常MHAとのキャッシュサイズ比較)、attention sink(先頭トークンへの注目集中)、sliding windowの帯パターン(attentionマスクの可視化)、thinkingモードのトークン流れ
+- [ ] **他ファミリー対応**: DeepSeekシリーズ(MoE+共有エキスパート)、GLMシリーズ、gpt-oss(attention sink+sliding window+MXFP4)。GGUF 経路(P19)により入口が拡大
+- [ ] **各モデル独自機構の可視化**: MoEルーティング、MLA潜在圧縮KV、attention sink、sliding window帯パターン、thinkingモード
 - [ ] sliding window attention(長コンテキストのKVメモリ削減)
 - [ ] マルチモデル同時 serve(1プロセスで複数モデル)
+- [ ] **推論可視化 P18: L2テンソルストリーミング**: focusプロトコル(ビューアがセッション×layer×tensor種別を指定、dennoはその組だけをストリーム)。隠れ状態ヒートマップ、attention確率マップ、K/V実体ビューア
+- [ ] **denno-view WASM移植**(JS版は先行実装として維持)
+
+**推奨着手順**: ~~C1+C2~~(完了)→ **A1 継続(GDN コア GPU 化)**→ A2(9B)→ A3(27B)。A1 を先にする理由: 大型モデルを CPU 逐次で検証すると prefill が実用時間を超えるため「GPU化の見込みが立ってから大型モデルに投資」が効率的。B1/B2 は A1 の合間に挟める小さめタスク。
 
 ## 5. 学習メモ(設計判断の記録)
 
@@ -515,6 +566,8 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **CIの教訓**: `target-cpu=native` はキャッシュ共有されるCIでは危険(rust-cacheがランナー間で成果物を共有し、別世代CPUでSIGILL)。CIでは固定ターゲット(x86-64-v3)、ネイティブ最適化は自己ホストの本番ビルドでのみ
 - **mutex starveの教訓**: 1つのスレッドがmutexをループでほぼ連続取得すると、std::sync::Mutex(非フェア)では他スレッドが数百ms以上奪えないことがある。ハンドラが参照するだけの不変データはロック外にキャッシュする設計が吉
 - **量子化の現実**: 「重みだけ量子化してデ量子化込みfp32積」では速度が出ない(P3で実証)。アクティベーションも量子化して真の整数演算+SIMDで初めて大幅高速化(P5で約3.5倍)。整数i32累積は結合則が成立するためSIMD化しても決定論を維持できる
+- **生ポインタをキャッシュキーにしてはいけない**(P17bの教訓): Vecの解放→再確保でアドレスが再利用され、同一アドレスに別内容のデータが現れる。同一サイズ・同一形状の別オブジェクトで必ず発生する(実テストで露呈)。構築時にuid採番してIDで引くのが正解。形状チェックだけでは同一形状の衝突を拾えない
+- **GPUテストの「緑」はGPUで実行された証拠にならない**(P17cの教訓): CUDAの実行時エラーはGPU_BROKEN→CPUフォールバックで**静かに吸収**されるため「GPU vs CPU」の比較テストはGPUが一度も動いていなくても(CPU vs CPUで)合格する。GPU経路を通すテストは戻り値Noneを`expect`で明示的に落とす。併せて**CUDAのcurrent contextはスレッドローカル**(libtestは`--test-threads=1`でもテスト毎に新スレッド)なので、共有contextはGPU操作の入口で毎回`cuCtxSetCurrent`する — 初期化スレッドで1回だけでは他スレッドのcuMemAllocがerror 201で落ちる。サーバーのマルチスレッドでも同種の潜在バグになり得る
 - **コンテナ内プロファイリング**: perf(カーネル制限)、valgrind(aarch64 native命令でSIGILL)、gdb(ptrace禁止)がすべて使えない → 軽量セルフインストルメンテーション(`prof.rs`)が最適解。env varゲート+数値経路非接触でexactnessを壊さない設計が重要
 - **エージェント開発の運用**: 40ターン上限でセッションが切れるため、「実装(エージェント)→検証・コミット(エージェントor人)」を区切って回すのが安定。テストスイートがあるので引き継ぎが容易。**複数エージェントを同一作業ツリーで同時走らせない**(P6の競合教訓)
 - **同一ホスト上の性能計測は交互A/B必須(P10の教訓)**: 他の常駐推論ワークロードが同ホストのCPUを使う+本番サーバーも常時稼働のため、時間帯で背景負荷が大きく変動する(同一コードで8.4s↔16sを実観測)。**離れた時点での前後比較は無効** — new/oldを交互にビルドし直して同ワークロードで計測し平均を比べる。単純前後比較で「2倍改善」に見えたものが交互A/Bでは+4%だった実例あり(計測スクリプト `p10_ab2.sh`)
@@ -523,10 +576,24 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **fp32で「順序保存SIMD」は可能(P9の核心)**: k方向のレーン化は不可だが、**i方向(バッチレーン)・j方向(ILP)へのレーン分割なら各要素のk累積は逐次のまま** → NEON/AVX2でビット一致のまま4倍並列。要点は ①FMAを避けて`vmul`+`vadd`に分離する(積の丸めを独立させる)、②アクティベーションを[k][4]に転置してレーンロードを連続化、③依存チェーン律速回避のILPは「複数出力チャネルの独立チェーン」で得る(複数アキュムレータのd分割は順序が変わるため不可)。int8はi32累積の結合則でそもそも順序自由(P5のSDOTがそのまま使える) — fp32だけがこの特殊制約を持つ
 - **Rust NLLの落とし穴**: `Vec<&mut dyn FnMut>`(参照型を要素に持つVec)は暗黙drop位置まで借用リージョンが延びる → `Box<dyn FnMut>`を直接渡すAPIにするのが最も簡単な解。rayonでrawポインタを共有する際は、edition 2021のdisjoint closure captureがフィールド単体(`cp.0`)をキャプチャしてE0277を起こすので`SendPtr::write(self, idx, v)`のように**メソッド経由で構造体全体をキャプチャ**させる
 - **モデル移植の壁**: アーキテクチャが同じ(qwen2)なら次元が違うだけのモデルは無変更で動く。壁になるのはcheckpoint形式(分割)と重み共有(tied/untied)のような「ローダ側の差分」(P7で実証)
-- **本番と開発の分離**: 本番はポート8080(denno-betaコンテナ)、開発テストは8090。本番は長時間止めない
-- **既知のモデル特性**: 「1たす1は？」(漢数字)だと壊れた出力になるがモデル自体の弱点でバグではない。「1+1は?」なら正常
 - **KV事前確保はスロット数×最大コンテキストで決まる**(P15の教訓): Qwen3-0.6BはGQA(kv_heads 8)でも28層×40960ctxで1スロット約9.4GBになり、4スロット+prefixで約47GBを確保しようとしてSIGKILL(exit 137)した。OOMではなく事前確保の問題 — 「空きメモリが足りているのに落ちる」場合はKV事前確保を疑う。`resolve_kv_budget`(純粋関数+単体テスト)で予算内に収め、明示envは最優先とする設計
 - **HFチャットテンプレートはPythonのstrメソッドに依存する**(P15の教訓): Qwen3のテンプレートは`startswith`を使用 — minijinjaのunknown method fallbackでは描画に失敗し静かにフォールバックするため「テンプレートが使われていない」ことに気づきにくい。`minijinja_contrib::pycompat::unknown_method_callback`を`set_unknown_method_callback`に登録するのが公式の解。**テンプレート描画の成否は生成結果の先頭トークンで確認する**(thinkingテンプレートなら`<think>`から始まる)
-- **int8の結合則はCPU/GPUのビット一致を可能にする**(P17の核心): i32累積は加算順序に依存しないため、GPUのwarpリダクション・レーン分割・タイリングをどう変えてもCPUのSIMDカーネルとビット一致する。必要なのは①同一の量子化規則(maxabsは丸めを伴わないので順序不変、CUDA `roundf`=Rust `f32::round`、clamp±127を同一)②スケール乗算の結合順を合わせること(`(float)dot * ascale * scale[j]` を左から順)。fp32はreduction順序で値が変わるためこの保証がなく、§8.3.5の通りint8がGPU exactnessの本命。**CUDAを依存ゼロで使うならdlopen+ドライバAPI**(リンク時依存がなくfeatureを外せばCI/GPU無し環境に影響しない)。カーネルはcompute_75 PTXをコミットしてドライバJITに任せる(新アーキsm_120でも再ビルド不要)。**GPU化の第1の壁はカーネル性能ではなく小さいopの固定オーバーヘッド**(起動+同期+H2D/D2H 約40µs/呼び出し) — デバイス滞留パイプライン(同期を1ステップ1回に)が統合時の必須設計
-- **GPU テストの「緑」は GPU で実行された証拠にならない**(P17c の教訓): CUDA の実行時エラーは GPU_BROKEN→CPU フォールバックで**静かに吸収**されるため、「GPU 結果 vs CPU 結果」の比較テストは GPU が一度も動いていなくても(CPU vs CPU で)合格する。GPU 経路を本当に通したテストは戻り値 None を `expect` で明示的に落とすこと。併せて、**CUDA の current context はスレッドローカル**(libtest は `--test-threads=1` でもテスト毎に新スレッドを立てる)なので、共有 context は GPU 操作の入口で毎回 `cuCtxSetCurrent` する — 初期化スレッドで 1 回だけ設定したのでは他スレッドの cuMemAlloc が error 201 で落ちる
+- **本番と開発の分離**: 本番はポート8080(denno-betaコンテナ)、開発テストは8090。本番は長時間止めない
+- **既知のモデル特性**: 「1たす1は？」(漢数字)だと壊れた出力になるがモデル自体の弱点でバグではない。「1+1は?」なら正常
+- **int8の結合則はCPU/GPUのビット一致を可能にする**(P17の核心): i32累積は加算順序に依存しないため、GPUのwarpリダクション・レーン分割・タイリングをどう変えてもCPUのSIMDカーネルとビット一致する。必要なのは①同一の量子化規則(maxabsは丸めを伴わないので順序不変、CUDA `roundf`=Rust `f32::round`、clamp±127を同一)②スケール乗算の結合順を合わせること(`(float)dot * ascale * scale[j]` を左から順)。fp32はreduction順序で値が変わるためこの保証がなく、解説§8.3.5の通りint8がGPU exactnessの本命。**CUDAを依存ゼロで使うならdlopen+ドライバAPI**(リンク時依存がなくfeatureを外せばCI/GPU無し環境に影響しない)。カーネルはcompute_75 PTXをコミットしてドライバJITに任せる(新アーキsm_120でも再ビルド不要)。**GPU化の第1の壁はカーネル性能ではなく小さいopの固定オーバーヘッド**(起動+同期+H2D/D2H 約40µs/呼び出し) — デバイス滞留パイプライン(同期を1ステップ1回に)が統合時の必須設計
 - **デバッグ実例(初期)**: sgemmストライド設計ミス→SIGSEGV、Qwen2のQKV bias発見(optionalロード)、Hermesの`max_tokens: 65535`クランプ、SSE `event:`行欠落で無限リトライ、prefill中のkeep-alive欠落でアイドル切断
+
+#### 参照実装とライセンス確認 (2026-10-14)
+
+P19 で参照した外部実装とライセンス上の位置づけ(各ソースファイルのヘッダコメントにも同内容を明記・commit 済み):
+
+| 参照元 | ライセンス | 使い方 | 判定 |
+|---|---|---|---|
+| llama.cpp `ggml-quants.c` (dequantize_row_*) | MIT (Copyright (c) 2023-2026 The ggml authors) | **忠実移植**(ビット一致契約) | OK — MIT の表示義務を `kquant.rs` ヘッダで履行 |
+| ggml-common.h の kquant テーブル (kquant_tables.rs 自動生成) | 同上 | **テーブル値の逐語抽出**(gen_kquant_tables.py) | OK — 生成物ヘッダに著作権表示を埋め込み(再生成済み) |
+| llama.cpp `delta-net-base.cpp`/`qwen35.cpp` (GDN 数学) | 同上 | 数式・演算順序の移植(Rust 再実装・逐語コピー無し) | OK — `gdn.rs` ヘッダに出典表示 |
+| llama.cpp `delta-net-base.cpp` (GDN 数学 → CUDA カーネル) | 同上 | 同一の数式を CUDA へ移植(`kernels/gdn.cu`・2026-10-14 追加)。GDN は bit 一致不要契約のため `expf` 等使用・決定論のみ保証 | OK — `gdn.cu` ヘッダに MIT 表示 |
+| GGUF 形式仕様 (gguf.cpp) | 同上 | 形式仕様の参照のみ(パーサは独自実装) | OK — `gguf.rs` ヘッダに出典表示 |
+| Qwen3.5 モデル(設定値・重み) | Apache-2.0 | 設定値参照・GGUF 重みをロード | OK — `qwen35.rs` ヘッダに出典表示 |
+
+**結論**: 本リポジトリのライセンス (MIT OR Apache-2.0) とすべて両立。MIT 由来部分(kquant 移植・テーブル抽出)は MIT の表示義務に従い upstream の著作権表示を該当ファイルに保持。GPL 等の汚染は無し。新規に参照実装を取り込む場合はこの表とファイルヘッダに追記する運用とする。
