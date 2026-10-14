@@ -1916,7 +1916,9 @@ pub fn chain_attention_prefill(
     if dh < ATTN_PF_BQ || dh > 1024 {
         return None;
     }
-    let sh_f = ATTN_PF_BQ * dh + 2 * ATTN_PF_BK * dh + ATTN_PF_BQ * ATTN_PF_BK + 2 * ATTN_PF_BQ;
+    let sh_f = (ATTN_PF_BQ + 2 * ATTN_PF_BK) * (dh + 1)
+        + ATTN_PF_BQ * ATTN_PF_BK
+        + 2 * ATTN_PF_BQ;
     if sh_f * 4 > 48 * 1024 {
         return None;
     }
@@ -1988,7 +1990,9 @@ pub fn chain_attention_prefill(
         ok(unsafe {
             ctx.launch_async(
                 ctx.f_attn_pf,
-                (heads as u32, n.div_ceil(ATTN_PF_BQ) as u32, 1),
+                // P17k: (行ブロック, heads) — x=行ブロック最速次元で同一 head の
+                // K/V を同時実行ブロック間で共有し L2 ヒット率を上げる
+                (n.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1),
                 (dh as u32, 1, 1),
                 (sh_f * 4) as u32,
                 &mut args,
@@ -2864,6 +2868,184 @@ mod tests {
             let per = t0.elapsed() / 28;
             println!("linear_gemm (production path) 28x gate_up: per-call {per:?}");
         }
+    }
+
+    /// P17k 診断: 生転送帯域の実測 (H2D/D2H × pageable/pinned × sync/async)。
+    /// attn_core ~400ms/層の内訳が転送律速かどうかの判定用。
+    #[test]
+    #[ignore]
+    fn cuda_transfer_bench() {
+        let ctx = CudaCtx::new().unwrap();
+        println!("device: {}", ctx.info());
+        const BYTES: usize = 128 * 1024 * 1024; // 128MB
+        let elems = BYTES / 4;
+        let host: Vec<f32> = pseudo_random(elems, 60);
+        let dev = ctx.upload_f32(&host).unwrap();
+        let lib = lib().unwrap();
+        let gb = |bytes: usize, secs: f64| bytes as f64 / 1e9 / secs;
+
+        // 1) H2D 同期 pageable (DevBuffer::copy_from / ミラー copy_from_at と同一)
+        let t = std::time::Instant::now();
+        let iters = 4;
+        for _ in 0..iters {
+            dev.copy_from(&host).unwrap();
+        }
+        let e = t.elapsed().as_secs_f64() / iters as f64;
+        println!("H2D sync pageable 128MB: {e:.4?}s  {:.1} GB/s", gb(BYTES, e));
+
+        // 2) H2D pinned + 毎回 sync (async 発行→sync)
+        let mut pin = PinMem::alloc(BYTES).unwrap();
+        pin.as_mut_slice::<f32>()[..elems].copy_from_slice(&host);
+        let iters = 8;
+        unsafe {
+            (lib.memcpy_htod_async)(dev.ptr(), pin.ptr, BYTES, std::ptr::null_mut());
+            ctx.sync().unwrap();
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            unsafe {
+                check(
+                    (lib.memcpy_htod_async)(dev.ptr(), pin.ptr, BYTES, std::ptr::null_mut()),
+                    "h2d pin",
+                )
+                .unwrap();
+                ctx.sync().unwrap();
+            }
+        }
+        let e = t.elapsed().as_secs_f64() / iters as f64;
+        println!("H2D pinned+sync 128MB:   {e:.4?}s  {:.1} GB/s", gb(BYTES, e));
+
+        // 3) H2D pinned 連続 async 発行 + 最後に 1 回 sync (オーバーラップ上限)
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            unsafe {
+                (lib.memcpy_htod_async)(dev.ptr(), pin.ptr, BYTES, std::ptr::null_mut());
+            }
+        }
+        ctx.sync().unwrap();
+        let e = t.elapsed().as_secs_f64() / iters as f64;
+        println!("H2D pinned async burst:  {e:.4?}s  {:.1} GB/s (per-op)", gb(BYTES, e));
+
+        // 4) D2H 同期 pageable
+        let mut dst = vec![0f32; elems];
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            unsafe {
+                (lib.memcpy_dtoh)(dst.as_mut_ptr() as *mut c_void, dev.ptr(), BYTES);
+            }
+        }
+        let e = t.elapsed().as_secs_f64() / iters as f64;
+        println!("D2H sync pageable 128MB: {e:.4?}s  {:.1} GB/s", gb(BYTES, e));
+
+        // 5) D2H pinned + sync (maybe_gpu_oproj / chain_download の経路)
+        let out_pin = PinMem::alloc(BYTES).unwrap();
+        unsafe {
+            (lib.memcpy_dtoh_async)(out_pin.ptr, dev.ptr(), BYTES, std::ptr::null_mut());
+            ctx.sync().unwrap();
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            unsafe {
+                (lib.memcpy_dtoh_async)(out_pin.ptr, dev.ptr(), BYTES, std::ptr::null_mut());
+            }
+            ctx.sync().unwrap();
+        }
+        let e = t.elapsed().as_secs_f64() / iters as f64;
+        println!("D2H pinned+sync 128MB:   {e:.4?}s  {:.1} GB/s", gb(BYTES, e));
+
+        // 6) cudaMalloc のコスト参考 (ミラー cap 成長時の全層 realloc)
+        let t = std::time::Instant::now();
+        for _ in 0..8 {
+            let _b = ctx.upload_f32(&host).unwrap();
+        }
+        println!(
+            "upload_f32 (alloc+H2D) 128MB x8: {:?}/op",
+            t.elapsed() / 8
+        );
+    }
+
+    /// P17k 診断: prefill attention カーネル単体の実形状タイミング。
+    /// (n, t_total, heads, kv_dim, dh) = (13252, 13252, 14, 256, 128) — 実リクエストと同一。
+    /// カーネル自体の時間を分離するため q/KV はランダム、転送は事前に完了させておく。
+    #[test]
+    #[ignore]
+    fn cuda_attn_pf_bench() {
+        let ctx = CudaCtx::new().unwrap();
+        println!("device: {}", ctx.info());
+        let (n, t_total, heads, kv_dim, dh) = (13252usize, 13252usize, 14usize, 256usize, 128usize);
+        let q: Vec<f32> = pseudo_random(n * heads * dh, 61);
+        // KV ミラーを直接用意 (with_mirror を使わず専用 mirror key でシード)
+        let key = 999_111u64;
+        let (kptr, vptr) = with_mirror(key, 0, 1, t_total, kv_dim, |m, _have| {
+            let kb = m.layers[0].0.as_ref().unwrap();
+            let vb = m.layers[0].1.as_ref().unwrap();
+            let kv: Vec<f32> = pseudo_random(t_total * kv_dim, 62);
+            kb.copy_from(&kv).unwrap();
+            vb.copy_from(&kv).unwrap();
+            m.len[0] = t_total;
+            Some((kb.ptr(), vb.ptr()))
+        })
+        .unwrap();
+        let dev_q = ctx.upload_f32(&q).unwrap();
+        let dev_att = ctx.upload_f32(&vec![0f32; n * heads * dh]).unwrap();
+
+        let mut heads_c = heads as c_int;
+        let mut n_c = n as c_int;
+        let mut pos0_c = 0 as c_int;
+        let mut kv_dim_c = kv_dim as c_int;
+        let mut t_c = t_total as c_int;
+        let mut group_c = 2 as c_int;
+        let mut dh_c = dh as c_int;
+        let mut scale_c = 0.08838834764831845f32;
+
+        let sh_f = (ATTN_PF_BQ + 2 * ATTN_PF_BK) * (dh + 1)
+            + ATTN_PF_BQ * ATTN_PF_BK
+            + 2 * ATTN_PF_BQ;
+        // DevBuffer の ptr は Copy 値なので引数組み立ては毎回行う
+        let mut launch = |ctx: &CudaCtx| -> Result<()> {
+            let mut qp = dev_q.ptr();
+            let mut kp = kptr;
+            let mut vp = vptr;
+            let mut ap = dev_att.ptr();
+            let mut args: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut ap as *mut _ as *mut c_void,
+                &mut heads_c as *mut _ as *mut c_void,
+                &mut n_c as *mut _ as *mut c_void,
+                &mut pos0_c as *mut _ as *mut c_void,
+                &mut kv_dim_c as *mut _ as *mut c_void,
+                &mut t_c as *mut _ as *mut c_void,
+                &mut group_c as *mut _ as *mut c_void,
+                &mut dh_c as *mut _ as *mut c_void,
+                &mut scale_c as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                ctx.launch_async(
+                    ctx.f_attn_pf,
+                    // P17k: (行ブロック, heads) — x=行ブロック最速次元で同一 head の
+                    // K/V を同時実行ブロック間で共有し L2 ヒット率を上げる
+                    (n.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1),
+                    (dh as u32, 1, 1),
+                    (sh_f * 4) as u32,
+                    &mut args,
+                )
+            }
+        };
+        launch(&ctx).unwrap();
+        ctx.sync().unwrap();
+        let iters = 5;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            launch(&ctx).unwrap();
+        }
+        ctx.sync().unwrap();
+        let per = t.elapsed() / iters;
+        println!(
+            "attn_pf kernel-only n={n} t={t_total} heads={heads}: {per:?}/call (x28 layers = {:?})",
+            per * 28
+        );
     }
 
     /// マイクロベンチ: Qwen2.5-1.5B の線形層 (int8) を decode (m=1) で
