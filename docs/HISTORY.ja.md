@@ -428,7 +428,14 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
   - **pinned H2D 実験**: attention q アップロード(81MB)を同期 pageable `copy_from` → pinned ステージング+async H2D に変更 → **attn_core 11.1s → 11.3s(不変)**。H2D 自体は律速でない(変更は保持・非同期化は今後の基盤)
   - **性能**(13,252 トークン cold): **PROFILE TOTAL 29.1s → 26.4s・wall 33.6s → 30.7s**。o_proj 2.37s → **0.49s**。attn_core 11.1s (42%) / down 5.0s(キュー待ち含む)/ qkv 4.5s / rope 2.8s / rmsnorm 2.3s。テスト: GPU cuda_ **20/20**・exactness **6**・応答正常("OK")
   - **PTX**: sha256 `528563f5a8e5ac59372a4f37051378affb615980ab8163fb48c13b7e3754cbc0`
-- **残る実装候補(ステップ 4 以降)**:
+- **ステップ 4: attn_core 内訳特定と prefill attention カーネル 3.3 倍化(✅ 2026-10-14・commit 99d2940)**:
+  - **診断ベンチ 2 種**(`cuda_transfer_bench`・`cuda_attn_pf_bench`、#[ignore]): 生転送帯域は H2D 14.2GB/s・D2H pinned 14.3GB/s(pageable D2H は 8.6GB/s)— 転送は 1 層あたり ~25-35ms 分しかなく、**attention カーネル単体が実形状 (n=t=13252・14 heads) で 368ms/call**(x28 層 = 10.3s)— attn_core のほぼ全てがカーネル本体だった
+  - **修正 3 点**(いずれも attention 緩和枠内・決定論維持): ①grid を (heads, 行ブロック) → **(行ブロック, heads) に反転** — x 最速次元で同時実行ブロックが同一 head の K/V 27MB を共有し L2 に乗る(旧 layout は 14 head 分 ~380MB のワーキングセットで DRAM 律速・数値不変)②**q/k/v smem の行ストライドを dh+1 にパディング** — dh=128 は 32 の倍数でスコア dot の smem 読みが **32-way bank conflict**(SM 帯域 ~1/32)になっていた・メモリ配置のみで数値完全不変 ③**PF_BQ 16→48 / PF_BK 32→8** — K/V 再読みトラフィックは BQ に反比例(~314GB→104GB)・smem を実効安全域に
+  - **カーネル単体実測**: 368ms → 149.5ms(パッド)→ **112.2ms/call(3.3 倍)**
+  - **性能**(13,252 トークン cold): **attn_core 11.1s → 5.12s・PROFILE TOTAL 26.4s → 20.5s・wall 30.7s → 24.5s**。残り律速: down 5.1s(キュー待ち含む)/ qkv 4.5s / attn_core 5.1s / rope 2.8s / rmsnorm 2.3s。maxabs vs CPU 1.79e-7 不変・GPU cuda_ **22/22**(ベンチ 2 種含む)・exactness **6**・応答正常("OK")
+  - **実測上の注意**: 動的 smem は ~35KB まで安定だが **~43KB 以上でカーネルが不正アドレス(error 700)**で落ちる(BQ=64/BK=8・BQ=48/BK=16 で再現・詳細未解明)。BQ=48/BK=8(34.9KB)を実効上限とする
+  - **PTX**: sha256 `28f50332e4f2262dcaa5ae1e8caa6470f8c998d08b31fecd7f43c1253c91e9bc`
+- **残る実装候補(ステップ 5 以降)**:
   1. **qkv→rope→attention のデバイス連続化**: qkv GEMM 出力をデバイスに置いたまま rope(GPU・dno_rope_qkv はビット一致済みだが 1 行/ブロック設計のため prefill 用の行並列版+行ごとの pos テーブルが必要)→ K/V をホストキャッシュに D2H(27MB/層)→ attention はデバイス q を読む(P17j カーネルの q 入力をスロット参照に)。qkv 4.5s・rope 2.8s・attn_core の転送分(~4-6s)が対象。attn_core の ~400ms/層の内訳(ミラー upload・oproj 待ち・D2H・同期回数)の特定が前提
   2. **GEMM カーネル改善**: 現行 64×64・1 thread 4×4・TK=32 はレイテンシ律速気味。128×128 タイル+8×8/thread+ベクトルロードで 2-4x を見込む(整数累積なのでビット一致は構造的に保証)
 
