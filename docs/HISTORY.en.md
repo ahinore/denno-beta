@@ -5,8 +5,8 @@
 >
 > **Entry format**: under `### Pn: Feature (date, commit)`, record **Implementation** / **Tests** / **Profile** / **Next up**. Completed items are reflected in the candidate list under "Next up".
 
-**Updated**: 2026-10-13
-**Repository**: https://github.com/ahinore/denno-beta (main, `3ff6175` synced)
+**Updated**: 2026-10-15
+**Repository**: https://github.com/ahinore/denno-beta (main, `9183e7e` synced)
 
 ---
 
@@ -473,37 +473,87 @@ pie showData title P9 fp32 batch (4x256) per-op time
 - **Tests**: gdn lib 4/4 (independent oracle match, batched-prefill vs token-by-token bit-exact, determinism) · real-GGUF layer-0 (Q8_0/UD-IQ2_XXS both, decay exp(g)=0.0086–0.9995 confirming multi-timescale behavior) · `qwen35_model` (load/forward/determinism 2-run bit-exact/**cache continuity forward(3)+forward(1)==forward(4) bit-exact**) · lib 114 passed
 - **E2E verification** (GPU dev environment, both fp32 and int8; UD-IQ2_XXS is the default pick so the mixed-quant path is the production path): Japanese QA (correct answer), English haiku, 307-token summarization all coherent · greedy (temp=0) correct on both int8 and fp32 · **identical output across 3 consecutive requests at seed 42**. prefill ~90ms/token, decode ~20ms/token (CPU token-by-token) → GPU offload is the next bottleneck
 - **Next**: GDN/prefill GPU offload → 9B (untied) → 27B
+##### P19-B2.5: GitHub sync + CI fixes ✅ (2026-10-14, commits `31790f9`/`3a42252`/`1cecae7`/`2769c7f`)
+
+- **Implementation**: pushed P19's 4 commits (`49ac073`–`feab1c8`). Added the P19 section and the candidate list (Qwen3.5 main line) to docs/HISTORY.ja.md + en.md
+- **Publication-discipline fix**: environment-specific names (hostnames etc.) remaining in the P17 documents were generalized (`3a42252`)
+- **CI fix**: the exactness job (runs `cargo test -- --ignored` on push) panicked on environment-dependent tests (`GGUF_PATH`/`QWEN35_DIR` expected) → **5 tests (gdn_gguf/qwen35_model×2/gguf_inspect/qwen35_int8_probe) now skip gracefully (eprintln + return) when the env vars are unset**. Verified locally with `cargo test -p denno-engine --release -- --ignored` all green, then pushed
+- **Result**: commit `2769c7f` — **CI green** (build-test + exactness success)
+- **Lesson**: even `#[ignore]` tests are run with `--ignored` by the exactness workflow, so model/GGUF-dependent tests must always include a graceful skip for unset env vars
+
+##### P19-A1: Qwen3.5 GPU acceleration, stage 1 (automatic Linear offload + batch prefill) ✅ (2026-10-14, commit `57727f4`)
+
+**Goal**: run the qwen35 model with CUDA ON and remove the prefill bottleneck (token-by-token m=1 projections).
+
+- **Stage 1 (automatic Linear offload)**: qwen35 goes through the existing `Linear`, so with CUDA ON larger matrices are offloaded to the GPU automatically (reusing the P17b/P17i machinery). The GDN core stays on CPU.
+  - E2E measurement (285 in / 64 out, int8): **5.59s** (CPU ≈ 28s → **~5x**)
+  - **Bit-identity verification**: the `"text"` md5 of responses from the GPU server (8091) and the CPU int8 server (8092) matched exactly (2 requests). 3 consecutive runs identical (determinism).
+- **Stage 2 (batch prefill, commit `57727f4`)**: added `forward_prefill` (n>1), firing projections per layer with m=n in one shot (GPU tiled GEMM).
+  - **Key to bit-exactness**: Q8 projections accumulate in i32, order-independent → m=n matches m=1 row-by-row. **F32 projections (ssm_beta/ssm_alpha stay Fp32 even in Int8 mode) do not match m=1 because `matmul_bt` (sgemm) accumulates in a different order**, so the new `Linear::apply_bt_rows` uses P9's `matvec_rows_bt` (order-preserving lanes).
+  - The GDN scan / full-attention core stays token-sequential due to recurrent state → split into `gdn_scan` / `full_attn_core` helpers shared with the token path (token path unchanged).
+  - Tests: `qwen35_prefill_batch_matches_tokenwise` (batch of 12 tokens == 12 sequential calls + 1 follow-up token, all 248,320 logits bit-identical). lib 114 passed, CI green.
+  - **Refactor verified numerically identical** (same values as the feab1c8 code).
+  - E2E measurement: 285 in/64 out → **5.11–5.83s**, 16 in/48 out → 0.94s, text md5 exactly matches CPU int8.
+
+**Lesson**: F32 m>1 sgemm changes accumulation order (documented in `matvec_rows_bt`'s docs). Keeping bit-identity under batching requires choosing the path per dtype: Q8 (i32) vs F32 (order-preserving). Next bottleneck: the GDN scan itself (A1 continues: GDN kernel GPU port).
+
+###### P19-A1 step 3: GPU kernel for the GDN scan itself ✅ (2026-10-14, commit `8e9a874`)
+
+- **Kernel**: `kernels/gdn.cu` + `kernels_gdn.ptx` (sha256 `65f28863…`, generated and cross-checked twice). Keeps **one block per head (grid=nv), threads = S columns (dv)** → all delta-rule updates (sk/outer product/output) complete within a thread, **no inter-thread reduction needed**. conv (causal depthwise d_conv=4) register-rolls the window over the 3 assigned channels (q/k/v). q/k L2 normalization and output RMS use thread0's sequential sum inside the block (same order as CPU).
+- **Determinism guarantee** (GDN has a no-bit-identity contract): fixed launch configuration, no atomics/warp reductions, all sums in fixed order. `expf`/`logf` allowed.
+- **cuda.rs**: `PTX_GDN` include_bytes + public `gdn_scan_batch` API (synchronous single launch, GPU_BROKEN → CPU fallback). Preconditions asserted: dk==dv, d_conv==4.
+- **qwen35.rs**: `forward_prefill`'s GDN scan GPU-accelerated when `n>1 && dk==dv` (`#[cfg(feature="cuda")]` gated). Token-sequential fallback extracted as `gdn_scan_rows`. decode (n==1) stays CPU-sequential as before.
+- **Verification**:
+  - New test `gdn_gpu_scan_close_to_cpu` (cuda feature only, graceful skip without DENNO_CUDA): **y maxabs=3.353e-8, ssm maxabs=7.451e-9** (effectively fp32 noise, ample margin vs the relaxed 1e-3 bound), conv state bit-identical. qwen35_model 4 passed, lib 114 passed (cuda feature).
+  - **E2E (285 in/64 out)**: resp2 **5.11s → 2.09s (2.4x)**, resp1 0.94s → **0.68s**.
+  - **Determinism: 3 consecutive resp2 md5 matches (`e9302a99…`)**. The md5 differs from the CPU int8 anchor (`e2ee5b52…`) because GDN numerics change slightly on the GPU (per contract); the text remains a natural Japanese summary.
+- **Lessons**: `launch_async` is unsafe → must be inside an unsafe block. The payload's `model` name must match the server-registered ID (`local/qwen35-0.8b`) (cause of 404s).
+
+###### P19-A2: Qwen3.5-9B real E2E ✅ (2026-10-14–15, commit `9183e7e`)
+
+Resolved the 9B (nk=16/nv=32, untied, 32 layers = 24 GDN + 8 full) garble with two bug fixes:
+
+1. **GDN k-head convention fix**: changed the v-head→k-head mapping from `h % nk` to `h * nk / nv` (repeat_interleave = HF / llama.cpp ggml_repeat's blocked tiling) (gdn.rs/gdn.cu + PTX regenerated). Harmless for 0.8B (nk==nv), visible on 9B. Confirmed by inspecting ops.cpp:1698-1760 + layer-0 numpy verification (blocked 0.27% vs interleaved 73%).
+2. **Untied lm_head root cause**: the 9B config.json is in VLM-wrapper form with `tie_word_embeddings: false` at the **top level**, not inside `text_config`. The loader treated it as tied via `tc["tie_word_embeddings"].unwrap_or(true)` → used the embedding as lm_head → logits destroyed (consistent with the symptom: hidden states matched numpy for all 32 layers while only the output garbled). 0.8B is genuinely tied, so unaffected. Fix: fall back to the top level when text_config doesn't resolve it.
+
+- **Verification (numpy reference × QWEN35_DUMP)**: fp32 single-token all-32-layer numpy match (max relerr 1e-4) / 3-token sequential logits numpy match (1e-4) / sequential == batch prefill bit-identity (P19 contract) / llama.cpp on the same GGUF produces correct output (isolating the engine-specific bug).
+- **E2E result (int8 GPU)**: q35_9b_1 yields natural thinking output. md5 `90fe7e5850b48d4b7aba157922af7113` bit-identical across 2 consecutive runs + a server restart (determinism contract met). fp32 also runs but repeats at temperature 0 greedy (not int8-specific — a template/generation-quality issue → next step).
+- Debug scaffolding (qwen35.rs diagnostic methods + qwen35_9b_debug_trace test, host numpy reference tmp/ref_*.py) removed before commit. Lesson: 9B is the first untied model ⇒ the lm_head path was exercised in battle for the first time.
 
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B on UD-IQ2_XXS)
 
-- [ ] **GDN/prefill GPU offload** (top priority): currently CPU token-by-token at prefill ~90ms/token, decode ~20ms/token. First port the sequential AR kernels, then consider a chunked-scan form
-- [ ] **Qwen3.5-9B real E2E**: 32 layers = 24 GDN + 8 full, untied, nearly identical head layout (model download needed). Final validation before 27B
-- [ ] **Qwen3.8-27B scale**: 64 layers = 48 GDN + 16 full, int8 required. GPU offload is a prerequisite (CPU sequential prefill exceeds practical time)
-- [ ] **GDN state snapshots in the prefix cache** (optional): recurrent models currently always full-prefill (correctness first). Speeds up multi-turn chats
-- [ ] **rmsnorm GPU offload** (P17k leftover, 2.3s) / **attn_core V accumulation** (leftover 3.51s, largest op)
+- [x] **A1: GDN/prefill GPU acceleration — done** (commit `57727f4` stage 1 + batch prefill → `8e9a874` GDN kernel): automatic Linear offload + m=n batched projections (F32 via `apply_bt_rows`/matvec_rows_bt to preserve bit-identity) + **GDN scan GPU kernel** (one block per head, S columns resident, no reduction needed). 285 in/64 out: CPU ~28s → 5.1–5.8s → **2.09s (~13x)**. GPU/CPU delta y maxabs=3.4e-8, determinism over 3 runs (md5 identical). decode (n==1) remains CPU-sequential (chunked scan is future work)
+- [ ] **A1 leftovers (optional)**: GDN chunked scan (further long-prefill speedup) · GDN GPU decode
+- [x] **A2: Qwen3.5-9B real E2E — done** (commit `9183e7e`): garble resolved by the GDN k-head convention fix + untied lm_head fix. fp32 all-32-layer numpy match, sequential == batch prefill bit-identity, int8 GPU E2E deterministic md5 (repeat + restart)
+- [ ] **A3: Qwen3.8-27B scale**: 64 layers = 48 GDN + 16 full, int8 required, re-check the VRAM/RAM/KV budget. Presupposes A1's GPU acceleration (CPU-sequential prefill exceeds practical time)
+- [ ] **A2.5: 9B generation quality (recommended before A3)**: both int8/fp32 repeat at temperature 0 greedy. Verify the chat template against the official Qwen3.5 spec (thinking markers, enable_thinking), repetition penalty, etc. Isolate by comparing output against llama.cpp
+- [ ] **A4: GDN state snapshot in the prefix cache** (optional): recurrent models currently always full-prefill (correctness first). Faster multi-turn
 
-### Earlier candidates
+### P17-family leftovers (CUDA)
 
-- [x] ~~**sampler optimization**: softmax + top-p sort over the 152k vocab cost a fixed ~3.5ms/step (found in P7.5)~~ → **done in P8** (0.66ms/step, greedy unchanged)
-- [x] ~~**P6 resume: true parallel decode**: batched matrix form for concurrent session decode~~ → **done in P6** (slot pool + forward_batch, fp32 1.35× / int8 1.7× @b=4). **Remaining: b=4 shifts to compute-bound, so k-direction order-preserving SIMD widening** (SDOT etc., pairwise adds that keep accumulation order) could further improve batch efficiency
-- [x] ~~**Batch efficiency improvement (P6 addendum)**: k-direction SIMD of `matvec_rows_bt` (order-preserving)~~ → **done in P9**. What was implemented was not k-direction but **i-direction (batch-lane) parallelism** (k-direction SIMD is impossible in fp32 because accumulation order changes; i-direction keeps each element's k accumulation sequential while computing 4 sessions simultaneously = bit-identity preserved). Kernel 3.9–5.9×. Per the profile, the next e2e bottlenecks are **average batch width drop (completion skew) + attention (per-session processing) + memory-system contention**
-- [x] ~~**Attention batching (P10 candidate)**: `forward_batch`'s attention core was a per-session sequential loop~~ → **done in P10** (rayon parallel over session × KV head, bit-identity preserved). Effect: **aggregate +4%** (interleaved A/B; attn_core was 5.5% in batch, matching the theoretical cap). softmax's max subtraction/sum are session-independent so determinism held under batching too
-- [x] ~~gpt2 exactness test failure (garbled text)~~ → **done in P11** (not fixed by re-downloading. Causes: ①the test was skipped in CI so the baseline went stale ②streaming detok byte-split character bug. Baseline updated to match the HF transformers reference + detok hold/flush + CI pulls gpt2)
-- [x] ~~**Remaining bottleneck analysis**: from the P9 profile — ①average batch width drop ②in-server memory contention ③prefill interruption~~ → **done in P12** (quantified in a clean environment. fp32 scales to W=8 / int8 tops at W=4. int8 per-op: gate_up 29.5% / attn 19.4% / down 18.0% / lm_head 10.8%. Attention overhead (V-side merge + copies + allocations) reduced in P12. Fundamental scores-side optimization is incompatible with bit-exactness — the reference-update decision remains)
-- [x] ~~**Inference visualization (denno-trace) P13: telemetry foundation**: fully decouple observation from the inference process (details in Architecture Guide §11). `denno-telemetry` crate (versioned flat format, f16/varint, Gap frames) + denno-side capture (L0 flow / L1 statistics: prof hooks, phase transitions, sampler top-k, KV usage, output tokens) + WS endpoint (`/v1/telemetry/ws`) + denno-view server skeleton. Principles: ①visualization not inside inference (denno only streams) ②bounded channel + drop-allowed so inference never waits ③OFF by default + read-only capture compatible with bit-exactness (all-green exactness as the gate)~~ → **done in P13** (commit `69663e6`. ON/OFF outputs fully identical, e2e Gap 0, JS decoder all 10 kinds matched. Details in the P13 section)
-- [x] ~~**Inference visualization P14: viewer (L0/L1)**: flow diagram, token stream, KV usage grid, sampler top-k view, replay recording + scrubber~~ → **done in P14 (JS version first, commit `8befe3f`)**: the user-specified animation UI (model-driven program + implementation-code panel + layer panel + KV/variables + built-in chat). **WASM port and replay scrubber remain** (details in the P14 section)
-- [ ] **Inference visualization P18: L2 tensor streaming** (formerly P17 — CUDA optimization took P17, so this moves down): focus protocol (viewer specifies session × layer × tensor kind; denno streams only that combination). Hidden-state heatmap, attention probability map (which past tokens a token attends to), raw K/V viewer. Budget: ≤5% for the focused session (f16 + narrowing)
-- [ ] **b=4 measurements for 3B/7B**: measurement only. If still bandwidth-bound, wider batches should scale linearly (measure with interleaved A/B). Requires pulling large models into the cache (`denno pull`)
-- [x] ~~**CUDA optimization**: the analysis is in Architecture Guide §8 (linear→cuBLAS, attention fusion, sampler kernel, paged KV). The int8 route can keep CPU/GPU bit-identity. P6's slot pool + forward_batch structure is isomorphic to GPU continuous batching and ports directly~~ → **step 1 done in P17** (commit `11281dd`: int8 linear-layer kernels implemented **bit-exactly** against the CPU int8 path, verified on an RTX 5090, lm_head 18.6×. Hand-written kernels via dlopen + the Driver API (zero deps) rather than cuBLAS, so exactness is guaranteed structurally). **Engine integration done in P17b** (commit `197a06c`: uid-keyed resident-weight registry + pinned async pipeline + decode-only offload; 3.4× e2e with fully identical responses — details in the P17b section). **Fused qkv/gate_up GPU calls done in P17c** (commit `7bf9eb0`: linear layers sharing the same input fused into one call, e2e 4.96× — details in the P17c section). **Elementwise GPU kernels + decode chain done in P17d** (commit `121aa3a`: glibc expf replicated exactly including the FMA contraction sites, device-resident hidden-state pipeline — details in the P17d section). **KV switched to demand-based allocation in P17e** (commit `c889336`: slot preallocation ~7.5GB → 0 at startup, slots 4→32, install-time reservation hard guarantee — details in the P17e section). **Attention kernel fusion / paged KV remain** — details in the P17 section)
-- [ ] **GitHub push automation**: direct container push after deploy key registration
-- [ ] tool use (Anthropic API tools parameter)
+- [ ] **B1: rmsnorm GPU offload**: 2.3s left per the P17k profile (~31% of TOTAL). An extension of the P17d elementwise kernels; easy to implement
+- [ ] **B2: attn_core V accumulation**: 3.51s left (largest op). dno_attention extension (attention already has a relaxed contract)
+- [ ] **B3: rope GPU for b>1 batches** (low priority): syncs are hidden in batch mode
+- [x] ~~**3B/7B b=4 measurement**~~ → **done in P17k** (target changed to Gemma3n 13,252 tok)
+
+### Ops & peripheral
+
+- [x] ~~**C1: P19 GitHub sync**~~ → **done** (push `64827e6..feab1c8` + 4 CI-fix commits, CI green)
+- [x] ~~**C2: add P19 to docs/HISTORY.ja.md+en.md**~~ → **done** (`31790f9`; P17 doc generalization of environment-specific names `3a42252`)
+- [ ] **C3: P19 binary for the dev server (8090)**: currently at P17i. engine.rs's is_recurrent is a no-op for non-recurrent models, so safe
+- [ ] **GitHub push automation**: register a deploy key to push directly from the container
+- [ ] tool use (Anthropic API tools parameter support)
 - [ ] Llama-family variants (models without GQA, RoPE scaling)
-- [ ] **Other model families**: DeepSeek series (MoE + shared experts), GLM series, gpt-oss (attention sink + sliding window + MXFP4). ~~Qwen3 (QK-Norm)~~ → **done in P15** (thinking-mode switch and MoE variants not covered)
-- [ ] **Visualizing each family's unique mechanisms**: MoE routing (which experts fired per token + router probabilities), MLA latent-compressed KV (cache-size comparison vs regular MHA), attention sink (attention concentrating on the first token), sliding-window band pattern (attention mask visualization), thinking-mode token flow
-- [ ] sliding window attention (long-context KV memory reduction)
-- [ ] multi-model serving (several models in one process)
+- [ ] **Other families**: DeepSeek series (MoE + shared experts), GLM series, gpt-oss (attention sink + sliding window + MXFP4). The GGUF route (P19) widens the entry point
+- [ ] **Per-model mechanism visualization**: MoE routing, MLA latent-compressed KV, attention sink, sliding-window band patterns, thinking mode
+- [ ] sliding window attention (KV memory reduction for long contexts)
+- [ ] multi-model serve (multiple models in one process)
+- [ ] **Inference visualization P18: L2 tensor streaming**: focus protocol (viewer specifies session × layer × tensor type; denno streams only those). Hidden-state heatmaps, attention probability maps, K/V entity viewer
+- [ ] **denno-view WASM port** (the JS version remains as the early implementation)
+
+**Recommended order**: ~~C1+C2~~ (done) → **continue A1 (GDN core GPU)** → A2 (9B) → A3 (27B). Reason for A1 first: verifying large models with CPU-sequential prefill exceeds practical time, so "invest in large models only once GPU acceleration is in sight" is efficient. B1/B2 are small tasks that fit between A1 steps.
 
 ## 5. Lessons (Design Decisions on Record)
 
@@ -523,11 +573,26 @@ pie showData title P9 fp32 batch (4x256) per-op time
 - **Batching and determinism (the core of P6)**: fp32 sgemm changes accumulation order → not bit-identical, so "make each element's k-direction accumulation order in the multi-column matvec identical to a standalone matvec" is how the exactness contract is realized. If the sampler gives each session an independent RNG, batch composition has zero effect on each session's output (verified on hardware: 4 sessions solo==batch). **Batching helps bandwidth-bound decode, but growing b shifts to compute-bound** (weight stream once, FLOPs × b). Extending the factor requires k-direction SIMD widening, which coexists with the "order-preserving" constraint just like i32 accumulation (P5)
 - **Order-preserving SIMD is possible in fp32 (the core of P9)**: k-direction lanes are impossible, but **splitting lanes along i (batch) and j (ILP) keeps each element's k accumulation sequential** → NEON/AVX2 gives 4× parallelism while bit-identical. Key points: ①avoid FMA and use separate `vmul`+`vadd` (keep product rounding independent), ②transpose activations to [k][4] for contiguous lane loads, ③avoid dependency-chain stalls with ILP across "independent chains of multiple output channels" (splitting d across multiple accumulators would change order — not allowed). int8 is order-free anyway thanks to i32 associativity (P5's SDOT applies as-is) — only fp32 carries this special constraint
 - **Rust NLL pitfall**: `Vec<&mut dyn FnMut>` (a Vec of reference-typed elements) extends the borrow region to the implicit drop position → the simplest fix is an API that takes `Box<dyn FnMut>` directly. When sharing raw pointers with rayon, edition-2021 disjoint closure capture captures per-field (`cp.0`) and raises E0277, so capture the whole struct via a method like `SendPtr::write(self, idx, v)`
+- **Never use a raw pointer as a cache key** (P17b lesson): Vec reallocation → re-allocation reuses addresses, so the same address can hold different content. Inevitable with another object of the same size/shape (surfaced in a real test). Assign a uid at construction and look up by ID; shape checks alone cannot catch same-shape collisions
 - **Model porting walls**: if the architecture is the same (qwen2), models differing only in dimension run unchanged. Walls are checkpoint format (sharding) and weight sharing (tied/untied) — "loader-side differences" (proven in P7)
 - **Production/dev separation**: production on port 8080 (denno-beta container), dev testing on 8090. Production is not stopped for long periods
 - **Known model quirks**: "1たす1は?" (kanji numerals) produces broken output — a model weakness, not a bug. "1+1は?" is fine
 - **KV preallocation is determined by slot count × max context** (P15 lesson): Qwen3-0.6B reaches ~9.4GB per KV slot even with GQA (kv_heads 8) — 28 layers × 40960 ctx — and tried to allocate ~47GB (4 slots + prefix), dying with SIGKILL (exit 137). It wasn't OOM but preallocation — when "memory seems available but the process dies", suspect KV preallocation. `resolve_kv_budget` (pure function + unit tests) keeps the footprint within budget while explicit env vars take priority
 - **HF chat templates depend on Python str methods** (P15 lesson): Qwen3's template uses `startswith` — minijinja's unknown-method fallback fails silently, so it's easy not to notice the template isn't being applied. The official fix is registering `minijinja_contrib::pycompat::unknown_method_callback` via `set_unknown_method_callback`. **Verify template rendering by checking the first token of the output** (a thinking template starts with `<think>`)
 - **int8 associativity enables CPU/GPU bit-identity** (core of P17): i32 accumulation is independent of addition order, so no matter how the GPU splits warps/lanes/tiles, it matches the CPU SIMD kernels bit-for-bit. What must match: ①the same quantization rule (maxabs involves no rounding so its order is irrelevant; CUDA `roundf` = Rust `f32::round`; the ±127 clamp identical) ②the associativity of the scale multiplies (`(float)dot * ascale * scale[j]` left-to-right). fp32 changes with reduction order and has no such guarantee — per §8.3.5, int8 is the definitive GPU exactness route. **To use CUDA with zero dependencies: dlopen + the Driver API** (no link-time dependency; builds without the feature are untouched in CI / GPU-less environments). Commit the kernel as compute_75 PTX and let the driver JIT handle it (no rebuild needed even on new archs like sm_120). **The first wall of GPU porting is not kernel throughput but the fixed overhead of small ops** (launch + sync + H2D/D2H ≈ 40µs per call) — a device-resident pipeline (one sync per step) is the mandatory design at integration time
-- **A green GPU test is not evidence the GPU ran** (P17c lesson): CUDA runtime errors are **silently absorbed** by GPU_BROKEN→CPU fallback, so a "GPU result vs CPU result" comparison test can pass as CPU-vs-CPU without the GPU ever running. Tests that must exercise the GPU path should `expect` on the returned None. Also, **the CUDA current context is thread-local** (libtest spawns a new thread per test even with `--test-threads=1`), so a shared context must call `cuCtxSetCurrent` at every GPU entry point — setting it once on the initializing thread makes cuMemAlloc fail on other threads with error 201
+- **A green GPU test is not evidence the GPU ran** (P17c lesson): CUDA runtime errors are **silently absorbed** by GPU_BROKEN→CPU fallback, so a "GPU result vs CPU result" comparison test can pass as CPU-vs-CPU without the GPU ever running. Tests that must exercise the GPU path should `expect` on the returned None. Also, **the CUDA current context is thread-local** (libtest spawns a new thread per test even with `--test-threads=1`), so a shared context must call `cuCtxSetCurrent` at every GPU entry point — setting it once on the initializing thread makes cuMemAlloc fail on other threads with error 201. The server's multithreaded paths can harbor the same class of latent bug
 - **Debugging examples (early days)**: sgemm stride design mistake → SIGSEGV; discovery of Qwen2's QKV bias (optional load); Hermes' `max_tokens: 65535` clamp; missing SSE `event:` lines causing infinite retries; idle disconnects from missing keep-alive during prefill
+#### Reference implementations and license review (2026-10-14)
+
+External implementations referenced in P19 and their licensing status (the same content is noted in each source file's header comment, committed):
+
+| Reference | License | Usage | Verdict |
+|---|---|---|---|
+| llama.cpp `ggml-quants.c` (dequantize_row_*) | MIT (Copyright (c) 2023-2026 The ggml authors) | **Faithful port** (bit-identity contract) | OK — MIT notice fulfilled in the `kquant.rs` header |
+| k-quant tables from ggml-common.h (auto-generated kquant_tables.rs) | same | **Verbatim table extraction** (gen_kquant_tables.py) | OK — copyright notice embedded in the generated-file header (regenerated) |
+| llama.cpp `delta-net-base.cpp`/`qwen35.cpp` (GDN math) | same | Port of formulas and operation order (Rust reimplementation, no verbatim copying) | OK — attribution in the `gdn.rs` header |
+| llama.cpp `delta-net-base.cpp` (GDN math → CUDA kernel) | same | Same formulas ported to CUDA (`kernels/gdn.cu`, added 2026-10-14). GDN has a no-bit-identity contract, so `expf` etc. are allowed; only determinism is guaranteed | OK — MIT notice in the `gdn.cu` header |
+| GGUF format spec (gguf.cpp) | same | Format reference only (parser is original) | OK — attribution in the `gguf.rs` header |
+| Qwen3.5 model (config values, weights) | Apache-2.0 | Config values referenced, GGUF weights loaded | OK — attribution in the `qwen35.rs` header |
+
+**Conclusion**: all compatible with this repository's license (MIT OR Apache-2.0). MIT-derived parts (kquant ports, table extraction) keep the upstream copyright notice in the relevant files per MIT's notice requirement. No GPL or other contamination. When new reference implementations are adopted, append to this table and the file headers.
