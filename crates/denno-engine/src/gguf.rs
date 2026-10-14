@@ -3,6 +3,9 @@
 //! v2/v3 形式に対応 (Qwen3.5 の unsloth GGUF は v3)。仕様:
 //! https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/gguf.cpp
 //!
+//! - 参照: GGUF 形式仕様 (ggml/llama.cpp — MIT License,
+//!   Copyright (c) 2023-2026 The ggml authors)。形式仕様の参照のみで、
+//!   パーサ本体は独自の Rust 実装 (コードの逐語コピーは含まない)。
 //! - メタデータ KV とテンソル情報のみパースし、データ部は mmap のまま参照する。
 //! - テンソル名は llama.cpp が付ける正規名 (例: blk.0.attn_q.weight)。
 

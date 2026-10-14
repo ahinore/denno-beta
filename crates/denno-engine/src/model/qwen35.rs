@@ -13,6 +13,10 @@
 //!
 //! exactness: GDN/attention は新規経路のため数値緩和 (maxabs < 1e-3) 枠内。
 //! 決定論は同一入力→同一演算順序で保証 (テストで bit 一致 assert)。
+//!
+//! 参照: モデルアーキテクチャは Qwen3.5 (Apache-2.0) の設定値・GGUF テンソル名は
+//! llama.cpp (MIT License — Copyright (c) 2023-2026 The ggml authors) の正規名。
+//! 実装は独自の Rust コード (GGUF ローダは gguf.rs・GDN 数式は gdn.rs 参照)。
 
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;

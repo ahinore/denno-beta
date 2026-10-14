@@ -2,6 +2,9 @@
 //!
 //! llama.cpp `src/models/delta-net-base.cpp` の build_delta_net_autoregressive
 //! (+ qwen35.cpp のグラフ構成) を 1:1 で移植した逐次形式。
+//! - 参照実装: llama.cpp (https://github.com/ggml-org/llama.cpp)
+//!   MIT License — Copyright (c) 2023-2026 The ggml authors。
+//!   本ファイルは数学・演算順序の移植であり、コードの逐語コピーは含まない。
 //! - 状態 S は head ごとに [head_k_dim × head_v_dim] の f32 (mamba_ssm_dtype=float32)。
 //! - 逐次 AR 形式は chunked 形式と数学的に等価 (精度差のみ)。denno 内の契約は
 //!   「同一入力→同一出力・決定論」で、llama.cpp とのビット一致は要求しない。
