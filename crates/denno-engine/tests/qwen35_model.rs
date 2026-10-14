@@ -154,3 +154,116 @@ fn qwen35_prefill_batch_matches_tokenwise() {
     }
     eprintln!("prefill batch == tokenwise (bit-exact, {} logits)", l1.len());
 }
+
+/// P19-A1: GDN GPU スキャンカーネルと CPU 逐次 (forward_token_core) の近似一致。
+/// GDN は bit 一致不要契約 (maxabs < 1e-3 の緩和枠)。GPU が無い環境では skip。
+/// cuda feature が無いビルド (CI 等) ではテスト自体が存在しない。
+#[test]
+#[ignore]
+#[cfg(feature = "cuda")]
+fn gdn_gpu_scan_close_to_cpu() {
+    use denno_engine::cuda::gdn_scan_batch;
+    use denno_engine::gdn::{forward_token_core, GdnCore, GdnParams, GdnState};
+
+    // GPU が使えない環境 (CI 等) では静かに skip
+    if std::env::var("DENNO_CUDA").as_deref() != Ok("1") {
+        eprintln!("skip: DENNO_CUDA=1 未設定");
+        return;
+    }
+    // 決定的な疑似ランダム (LCG)
+    let mut rng: u64 = 0x1234_5678_9abc_def0;
+    let mut rnd = || {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((rng >> 33) as f32) / (u32::MAX as f32) - 0.5
+    };
+
+    let (nk, nv, dk, dv) = (2usize, 2usize, 8usize, 8usize);
+    let d_conv = 4usize;
+    let n = 12usize;
+    let conv_dim = 2 * nk * dk + nv * dv;
+    let p = GdnParams {
+        n_embd: 16,
+        n_k_heads: nk,
+        n_v_heads: nv,
+        head_k_dim: dk,
+        head_v_dim: dv,
+        d_conv,
+        eps: 1e-6,
+    };
+    let wconv: Vec<f32> = (0..conv_dim * d_conv).map(|_| rnd()).collect();
+    let ssm_a: Vec<f32> = (0..nv).map(|_| -1.0 - rnd().abs()).collect();
+    let ssm_dt: Vec<f32> = (0..nv).map(|_| rnd()).collect();
+    let ssm_norm: Vec<f32> = (0..dv).map(|_| 0.5 + rnd().abs()).collect();
+    let qkv: Vec<f32> = (0..n * conv_dim).map(|_| rnd()).collect();
+    let z: Vec<f32> = (0..n * nv * dv).map(|_| rnd()).collect();
+    let beta: Vec<f32> = (0..n * nv).map(|_| rnd()).collect();
+    let alpha: Vec<f32> = (0..n * nv).map(|_| rnd()).collect();
+    let conv_st0: Vec<f32> = (0..conv_dim * (d_conv - 1)).map(|_| rnd()).collect();
+    let ssm_st0: Vec<f32> = (0..nv * dk * dv).map(|_| rnd()).collect();
+
+    // ---- CPU 逐次 (トークンごとに forward_token_core) ----
+    let mut st = GdnState {
+        conv: conv_st0.clone(),
+        ssm: ssm_st0.clone(),
+    };
+    let cw = GdnCore {
+        conv1d: &wconv,
+        ssm_a: &ssm_a,
+        ssm_dt: &ssm_dt,
+        ssm_norm: &ssm_norm,
+    };
+    let nqkv = conv_dim;
+    let mut ys_cpu = vec![0.0f32; n * nv * dv];
+    for t in 0..n {
+        let y = forward_token_core(
+            &p,
+            &cw,
+            &qkv[t * nqkv..(t + 1) * nqkv],
+            &z[t * nv * dv..(t + 1) * nv * dv],
+            &beta[t * nv..(t + 1) * nv],
+            &alpha[t * nv..(t + 1) * nv],
+            &mut st,
+        );
+        ys_cpu[t * nv * dv..(t + 1) * nv * dv].copy_from_slice(&y);
+    }
+
+    // ---- GPU (1 launch) ----
+    let mut conv_g = conv_st0.clone();
+    let mut ssm_g = ssm_st0.clone();
+    let ys_gpu = gdn_scan_batch(
+        &qkv,
+        &z,
+        &beta,
+        &alpha,
+        &mut conv_g,
+        &mut ssm_g,
+        &wconv,
+        &ssm_a,
+        &ssm_dt,
+        &ssm_norm,
+        n,
+        nk,
+        nv,
+        dk,
+        dv,
+        d_conv,
+        p.eps,
+        1.0 / (dk as f32).sqrt(),
+    )
+    .expect("GPU スキャンが None (GPU 未初期化?)");
+
+    let mut maxd = 0.0f32;
+    for (a, b) in ys_cpu.iter().zip(ys_gpu.iter()) {
+        maxd = maxd.max((a - b).abs());
+    }
+    // 状態も比較
+    let mut maxd_s = 0.0f32;
+    for (a, b) in st.ssm.iter().zip(ssm_g.iter()) {
+        maxd_s = maxd_s.max((a - b).abs());
+    }
+    // conv 状態は整数値のロールで同一のはず (bit 一致)
+    assert_eq!(st.conv, conv_g, "conv 状態が不一致");
+    eprintln!("gdn gpu vs cpu: y maxabs={maxd:.3e} ssm maxabs={maxd_s:.3e}");
+    assert!(maxd < 1e-3, "y maxabs diff {maxd}");
+    assert!(maxd_s < 1e-3, "ssm maxabs diff {maxd_s}");
+}
