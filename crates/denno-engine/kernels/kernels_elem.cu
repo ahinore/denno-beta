@@ -263,11 +263,10 @@ extern "C" __global__ void dno_attention(
 // dno_attention はビット一致枠のため dno_expf のまま変更しない。
 // online softmax の累積順は「タイル昇順・タイル内 kk 昇順・出力次元 d はスレッド
 // tid = d 専属」で固定。
-// 制約 (ホスト側でも検証): dh >= 48 (block が PF_BQ 行 owner を持つため) &&
-//   shmem <= 48KB (dh <= 185 @ BQ=48/BK=8)。**実測上の注意**: 動的 smem は
-//   ~35KB までは安定だが ~43KB 以上でカーネルが不正アドレス (error 700) で
-//   落ちた (BQ=64/BK=8・BQ=48/BK=16 で再現、詳細未解明)。48KB 制約内でも
-//   BQ=48/BK=8 (34.9KB) を上限として使うこと。
+// 制約 (ホスト側でも検証): dh >= PF_BQ (block が PF_BQ 行 owner を持つため) &&
+//   shmem <= 48KB (dh <= 144 @ BQ=64/BK=8)。BQ=64/BK=8 (43.8KB) は実測安定
+//   (かつて「~43KB で error 700」とされたのはホスト sh_f がカーネル必要量を
+//   下回る領域外書きが原因 — ステップ 7 で定数同期により解消、上記参照)。
 // P17k 性能修正 (2026-10-14): ①PF_BQ 16→48 (K/V の再読みトラフィックは BQ に
 // 反比例 — 総トラフィック ~314GB→104GB)・PF_BK 32→8 (smem を実効安全域に収める)。
 // ②grid を (行ブロック, heads) に反転 (x=行ブロックが最速次元 → 同時実行
@@ -279,7 +278,29 @@ extern "C" __global__ void dno_attention(
 // attention 緩和枠内・決定論は維持 (固定タイル・固定累積順)。②は数値に影響しない。
 // 実測 (n=13252・t=13252・14 heads・RTX 5090): 368ms → **112ms/call** (3.3 倍)。
 //   内訳: ③パッドで 284ms→149ms、①+②で→112ms。
-#define PF_BQ 48
+// P17k ステップ 7 (2026-10-14): レイテンシ律速対策の 2 点。
+// ④ **K/V タイルのソフトウェアパイプライン**: 次タイルをレジスタにプリフェッチ
+//   してからスコア/softmax/V 累積を回すことで、グローバル読み (~500-800 cycle)
+//   を演算フェーズで隠蔽 (旧構造は syncthreads 壁で毎タイル待ち)。読み条件
+//   (j < t_total・範囲外 0 埋め) は旧版と同一 → **数値は完全不変**。
+// ⑤ **スコア dot の 4-way アンロール**: 依存 FMA チェーン (128 段) を 4 本の
+//   独立チェーンに分割 (d0..d3 → ((d0+d1)+(d2+d3))・結合順固定) して ILP を向上。
+//   累積順が変わるため CPU との差は僅かに変わりうるが attention 緩和枠内・
+//   **決定論は維持** (結合順は dh とタイルサイズのみで決まる固定順)。
+//   dh%4 の余りはスカラーで処理 (実運用 dh=128 では発生しない)。
+// ⑥ **2r×2k クアッド dot**: 1 thread が行 {r0,r0+1} × key {k0,k0+1} の 4 ペアを
+//   担当し q/k の smem 読みを 4 FMA で共有 → スコア phase の smem 読みが
+//   FMA あたり 2 回 → 1 回に半減 (V 累積と合わせるとカーネルは smem 帯域律速で、
+//   ④⑤単体では ~1% しか出なかったが ⑥ で **90→69ms (1.3 倍)**)。
+//   クアッド数 = PF_BQ*PF_BK/4 (= dh @ 64×8)・nth > dh でも動作 (余剰 thread は idle)。
+//   累積順は ⑥ でも更に変わるが緩和枠内・決定論維持 (テスト: maxabs 1.97e-7 @ n=2056)。
+// 実測 (n=13252・t=13252・14 heads・RTX 5090): 368ms (ステップ 4 前) → 112ms
+//   (ステップ 6 = ③+過大 grid) → **69.3ms/call** (ステップ 7 = ④⑤⑥+grid 修正)。
+// P17k ステップ 7 の重要修正 (cuda.rs 側): ATTN_PF_BQ/BK が 16/32 のままだった
+//   ため grid が約 4 倍過剰 (i0 >= n の無効ブロックがフル time ループを回す)。
+//   64/8 に統一で **attn_core 4.5s → 3.5s**。「~43KB で error 700」の正体も
+//   ホスト sh_f (16/32 基準 43.4KB) がカーネル必要量を下回る smem 領域外書き。
+#define PF_BQ 64
 #define PF_BK 8
 // exp2f ベース softmax 用 (expf(x) = exp2f(x * log2(e)))
 #define LOG2E_F 1.44269504088896340736f
@@ -302,6 +323,10 @@ extern "C" __global__ void dno_attention_prefill(
     const int i0 = blockIdx.x * PF_BQ;
     const int kh_off = (h / group) * dh;
     const int tid = threadIdx.x;
+    // P17k ステップ 7: block は dh または 2*dh スレッド。tid >= dh のスレッドは
+    // スコア/exp フェーズのみ参加 (出力次元を持たない)。blockDim を 2 倍にして
+    // スコア phase のワープ数を増やしレイテンシを隠蔽する。
+    const int nth = blockDim.x;
     // この block が見る必要のある最大 key (行ごとの causal 界の最大値)
     const int jend = min(t_total, pos0 + i0 + PF_BQ);
 
@@ -311,47 +336,113 @@ extern "C" __global__ void dno_attention_prefill(
     float m_run = -INFINITY;
     float l_run = 0.0f;
 
+    // ④ プリフェッチバッファ (スレッド tid の K/V 列要素 × BK)
+    float k_next[PF_BK], v_next[PF_BK];
+
     // q を shared へ (範囲外行は 0 埋め → スコア 0・l > 0 で NaN なし・出力は書かない)
-    for (int r = 0; r < PF_BQ; ++r) {
-        const int i = i0 + r;
-        q_sm[r * (dh + 1) + tid] =
-            (i < n) ? q[(size_t)i * heads * dh + (size_t)h * dh + tid] : 0.0f;
+    if (tid < dh) {
+        for (int r = 0; r < PF_BQ; ++r) {
+            const int i = i0 + r;
+            q_sm[r * (dh + 1) + tid] =
+                (i < n) ? q[(size_t)i * heads * dh + (size_t)h * dh + tid] : 0.0f;
+        }
+    }
+
+    // ④ プロローグ: 最初のタイル (j0=0) をレジスタへ
+    if (tid < dh) {
+        for (int kk = 0; kk < PF_BK; ++kk) {
+            const int j = kk;
+            if (j < t_total) {
+                k_next[kk] = kc[(size_t)j * kv_dim + kh_off + tid];
+                v_next[kk] = vc[(size_t)j * kv_dim + kh_off + tid];
+            } else {
+                k_next[kk] = 0.0f;
+                v_next[kk] = 0.0f;
+            }
+        }
     }
 
     for (int j0 = 0; j0 < jend; j0 += PF_BK) {
-        // K/V タイルを shared へ (範囲外は 0 — masked pair は p=0 で参照されない)
-        for (int kk = 0; kk < PF_BK; ++kk) {
-            const int j = j0 + kk;
-            if (j < t_total) {
-                k_sm[kk * (dh + 1) + tid] = kc[(size_t)j * kv_dim + kh_off + tid];
-                v_sm[kk * (dh + 1) + tid] = vc[(size_t)j * kv_dim + kh_off + tid];
-            } else {
-                k_sm[kk * (dh + 1) + tid] = 0.0f;
-                v_sm[kk * (dh + 1) + tid] = 0.0f;
+        // ④ レジスタ → shared (前回プリフェッチ分)
+        if (tid < dh) {
+            for (int kk = 0; kk < PF_BK; ++kk) {
+                k_sm[kk * (dh + 1) + tid] = k_next[kk];
+                v_sm[kk * (dh + 1) + tid] = v_next[kk];
             }
         }
         __syncthreads();
-        // scores: (r, kk) ペアをスレッド分散。ドットは dh 逐次 fmaf
-        // (decode kernel dno_attention と同一の演算順)。
-        for (int pid = tid; pid < PF_BQ * PF_BK; pid += dh) {
-            const int r = pid / PF_BK;
-            const int kk = pid % PF_BK;
-            const int i = i0 + r;
-            const int j = j0 + kk;
-            float s;
-            if (i >= n) {
-                // 無効行: m_new を 0 に保ち NaN を避ける (acc はゴミだが書かない)
-                s = 0.0f;
-            } else if (j < t_total && j <= pos0 + i) {
-                const float *qr = &q_sm[r * (dh + 1)];
-                const float *kr = &k_sm[kk * (dh + 1)];
-                float d = 0.0f;
-                for (int t2 = 0; t2 < dh; ++t2) d = fmaf(qr[t2], kr[t2], d);
-                s = d * scale;
-            } else {
-                s = -INFINITY;  // causal mask (exp 後 0)
+        // ④ 次タイルを先に読み始める (グローバル読みを演算フェーズと重ねる)。
+        //    読み条件は旧版と同一 (j < t_total・範囲外 0)。
+        if (tid < dh) {
+            const int jn = j0 + PF_BK;
+            for (int kk = 0; kk < PF_BK; ++kk) {
+                const int j = jn + kk;
+                if (j < t_total) {
+                    k_next[kk] = kc[(size_t)j * kv_dim + kh_off + tid];
+                    v_next[kk] = vc[(size_t)j * kv_dim + kh_off + tid];
+                } else {
+                    k_next[kk] = 0.0f;
+                    v_next[kk] = 0.0f;
+                }
             }
-            s_sm[r * PF_BK + kk] = s;
+        }
+        // scores: (r, kk) ペアをスレッド分散。⑥ 2r×2k クアッド + 4-way アンロール:
+        // thread が行 {r0,r0+1} × key {k0,k0+1} の 4 ペアを担当し q/k の smem 読みを
+        // 共有 (読み量を FMA あたり 2 回 → 1 回に半減)。t2 も 4 本の独立チェーンに
+        // 分割 ((a+b)+(c+d) の固定順で統合 — 決定論維持・attention 緩和枠内)。
+        // クアッド数 = PF_BQ*PF_BK/4 (= dh @ 64×8)。
+        for (int q4 = tid; q4 < PF_BQ * PF_BK / 4; q4 += nth) {
+            const int r0 = (q4 / (PF_BK / 2)) * 2;
+            const int k0 = (q4 % (PF_BK / 2)) * 2;
+            const int ia = i0 + r0;
+            const int ib = i0 + r0 + 1;
+            const int ja = j0 + k0;
+            const int jb = j0 + k0 + 1;
+            const float *qa = &q_sm[r0 * (dh + 1)];
+            const float *qb = &q_sm[(r0 + 1) * (dh + 1)];
+            const float *ka = &k_sm[k0 * (dh + 1)];
+            const float *kb = &k_sm[(k0 + 1) * (dh + 1)];
+            float d00a = 0.0f, d00b = 0.0f, d00c = 0.0f, d00d = 0.0f;
+            float d01a = 0.0f, d01b = 0.0f, d01c = 0.0f, d01d = 0.0f;
+            float d10a = 0.0f, d10b = 0.0f, d10c = 0.0f, d10d = 0.0f;
+            float d11a = 0.0f, d11b = 0.0f, d11c = 0.0f, d11d = 0.0f;
+            int t2 = 0;
+            for (; t2 + 4 <= dh; t2 += 4) {
+                const float qa0 = qa[t2], qa1 = qa[t2 + 1], qa2 = qa[t2 + 2], qa3 = qa[t2 + 3];
+                const float qb0 = qb[t2], qb1 = qb[t2 + 1], qb2 = qb[t2 + 2], qb3 = qb[t2 + 3];
+                const float ka0 = ka[t2], ka1 = ka[t2 + 1], ka2 = ka[t2 + 2], ka3 = ka[t2 + 3];
+                const float kb0 = kb[t2], kb1 = kb[t2 + 1], kb2 = kb[t2 + 2], kb3 = kb[t2 + 3];
+                d00a = fmaf(qa0, ka0, d00a); d01a = fmaf(qa0, kb0, d01a);
+                d10a = fmaf(qb0, ka0, d10a); d11a = fmaf(qb0, kb0, d11a);
+                d00b = fmaf(qa1, ka1, d00b); d01b = fmaf(qa1, kb1, d01b);
+                d10b = fmaf(qb1, ka1, d10b); d11b = fmaf(qb1, kb1, d11b);
+                d00c = fmaf(qa2, ka2, d00c); d01c = fmaf(qa2, kb2, d01c);
+                d10c = fmaf(qb2, ka2, d10c); d11c = fmaf(qb2, kb2, d11c);
+                d00d = fmaf(qa3, ka3, d00d); d01d = fmaf(qa3, kb3, d01d);
+                d10d = fmaf(qb3, ka3, d10d); d11d = fmaf(qb3, kb3, d11d);
+            }
+            float d00 = ((d00a + d00b) + (d00c + d00d));
+            float d01 = ((d01a + d01b) + (d01c + d01d));
+            float d10 = ((d10a + d10b) + (d10c + d10d));
+            float d11 = ((d11a + d11b) + (d11c + d11d));
+            for (; t2 < dh; ++t2) {
+                const float qa0 = qa[t2], qb0 = qb[t2], ka0 = ka[t2], kb0 = kb[t2];
+                // 余り分は d00 (先頭チェーン) に逐次加算 (実運用 dh=128 では不使用)
+                d00 += qa0 * ka0; d01 += qa0 * kb0; d10 += qb0 * ka0; d11 += qb0 * kb0;
+            }
+            float s00, s01, s10, s11;
+            if (ia >= n) { s00 = 0.0f; s01 = 0.0f; } else {
+                s00 = (ja < t_total && ja <= pos0 + ia) ? d00 * scale : -INFINITY;
+                s01 = (jb < t_total && jb <= pos0 + ia) ? d01 * scale : -INFINITY;
+            }
+            if (ib >= n) { s10 = 0.0f; s11 = 0.0f; } else {
+                s10 = (ja < t_total && ja <= pos0 + ib) ? d10 * scale : -INFINITY;
+                s11 = (jb < t_total && jb <= pos0 + ib) ? d11 * scale : -INFINITY;
+            }
+            s_sm[r0 * PF_BK + k0] = s00;
+            s_sm[r0 * PF_BK + k0 + 1] = s01;
+            s_sm[(r0 + 1) * PF_BK + k0] = s10;
+            s_sm[(r0 + 1) * PF_BK + k0 + 1] = s11;
         }
         __syncthreads();
         // タイル内 row max + online 更新 (owner = thread r)
@@ -364,7 +455,7 @@ extern "C" __global__ void dno_attention_prefill(
         }
         __syncthreads();
         // p = exp(s - m_new) を s_sm に上書き (無効 pair は 0)
-        for (int pid = tid; pid < PF_BQ * PF_BK; pid += dh) {
+        for (int pid = tid; pid < PF_BQ * PF_BK; pid += nth) {
             const int r = pid / PF_BK;
             const int kk = pid % PF_BK;
             s_sm[r * PF_BK + kk] = exp2f((s_sm[r * PF_BK + kk] - mnew_sm[r]) * LOG2E_F);
@@ -376,11 +467,13 @@ extern "C" __global__ void dno_attention_prefill(
             l_run = l;
             m_run = mnew_sm[tid];
         }
-        // acc 再スケール + probs@V 累積 (出力次元 d=tid 専属)
-        for (int r = 0; r < PF_BQ; ++r) acc[r] *= corr_sm[r];
-        for (int r = 0; r < PF_BQ; ++r) {
-            for (int kk = 0; kk < PF_BK; ++kk) {
-                acc[r] = fmaf(s_sm[r * PF_BK + kk], v_sm[kk * (dh + 1) + tid], acc[r]);
+        // acc 再スケール + probs@V 累積 (出力次元 d=tid 専属 — tid < dh のみ)
+        if (tid < dh) {
+            for (int r = 0; r < PF_BQ; ++r) acc[r] *= corr_sm[r];
+            for (int r = 0; r < PF_BQ; ++r) {
+                for (int kk = 0; kk < PF_BK; ++kk) {
+                    acc[r] = fmaf(s_sm[r * PF_BK + kk], v_sm[kk * (dh + 1) + tid], acc[r]);
+                }
             }
         }
         __syncthreads();  // 次タイルの k_sm/v_sm/s_sm 上書き前の壁
@@ -390,10 +483,12 @@ extern "C" __global__ void dno_attention_prefill(
     // causal 内なので l >= 1 > 0。無効行 (i >= n) は書かない。
     if (tid < PF_BQ) corr_sm[tid] = 1.0f / l_run;
     __syncthreads();
-    for (int r = 0; r < PF_BQ; ++r) {
-        const int i = i0 + r;
-        if (i < n) {
-            att[(size_t)i * heads * dh + (size_t)h * dh + tid] = acc[r] * corr_sm[r];
+    if (tid < dh) {
+        for (int r = 0; r < PF_BQ; ++r) {
+            const int i = i0 + r;
+            if (i < n) {
+                att[(size_t)i * heads * dh + (size_t)h * dh + tid] = acc[r] * corr_sm[r];
+            }
         }
     }
 }

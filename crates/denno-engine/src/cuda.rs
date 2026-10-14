@@ -1383,8 +1383,13 @@ const CH_SLOTS: usize = 9;
 
 // P17j: prefill attention カーネルのタイル定数 (kernels_elem.cu の PF_BQ/PF_BK
 // と同期すること)。BQ=行タイル・BK=key タイル。
-const ATTN_PF_BQ: usize = 16;
-const ATTN_PF_BK: usize = 32;
+// P17k ステップ 7 修正: ステップ 4 でカーネルを 48/8→(実験 64/8) に変えた際に
+// ここが 16/32 のまま残り、①grid が約 4 倍過剰 (i0 >= n の無効ブロックがフルの
+// time ループを回す) ②sh_f も 16/32 基準で、カーネルの必要量を下回ると
+// smem 領域外書きになり error 700 (不正アドレス) になっていた —
+// 「~43KB 以上で error 700」の正体はこの不一致。64/8 (43.8KB) に統一。
+const ATTN_PF_BQ: usize = 64;
+const ATTN_PF_BK: usize = 8;
 
 struct ChainScratch {
     bufs: Vec<Option<DevBuffer>>,
@@ -3201,6 +3206,70 @@ mod tests {
         let a = &got[3 * heads * dh..][..heads * dh];
         let b = &got3[3 * heads * dh..][..heads * dh];
         assert_ne!(a, b, "row 3 が未来の K/V 変更に反応していない (テスト無効)");
+    }
+
+    /// P17k ステップ 7: 大規模 n での prefill attention (n=37 のテストは 1 行
+    /// ブロック・少数タイルしか通らないため、複数行ブロック×多数タイル・
+    /// prefetch が実データを読む規模での近似一致と決定論を検証する)。
+    #[test]
+    #[ignore] // GPU が必要: cargo test --release --features cuda -- --ignored
+    fn cuda_attention_prefill_vs_cpu_large() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let (heads, kv_heads, dh) = (12usize, 2usize, 128usize);
+        let group = heads / kv_heads;
+        let kv_dim = kv_heads * dh;
+        let (pos0, n) = (64usize, 2056usize); // 行ブロック 33 個・tile 数百
+        let t_total = pos0 + n;
+        let scale = 1.0 / (dh as f32).sqrt();
+        let q = pseudo_random(n * heads * dh, 21);
+        let kc = pseudo_random(t_total * kv_dim, 22);
+        let vc = pseudo_random(t_total * kv_dim, 23);
+
+        let att_ref =
+            prefill_attention_cpu(&q, &kc, &vc, heads, kv_heads, dh, n, pos0, t_total, scale);
+
+        let run_gpu = |kc: &[f32], vc: &[f32]| -> Vec<f32> {
+            let mut cache = crate::kv_cache::KvCache::new(1, kv_dim, t_total + 64);
+            {
+                let (kbuf, vbuf) = cache.kv_bufs(0, t_total);
+                kbuf[..t_total * kv_dim].copy_from_slice(kc);
+                vbuf[..t_total * kv_dim].copy_from_slice(vc);
+            }
+            assert!(
+                chain_attention_prefill(
+                    cache.kv_id(),
+                    0,
+                    1,
+                    &q,
+                    &cache,
+                    pos0,
+                    n,
+                    t_total,
+                    group,
+                    dh,
+                    kv_dim,
+                    scale,
+                )
+                .is_some(),
+                "prefill attention kernel が発動すべき (dh={dh})"
+            );
+            chain_download(CH_ATT, n * heads * dh).unwrap()
+        };
+
+        let got = run_gpu(&kc, &vc);
+        let maxd = got
+            .iter()
+            .zip(att_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("prefill attention (n={n}) maxabs diff vs cpu: {maxd}");
+        assert!(maxd < 1e-3, "prefill attention (n={n}) maxabs diff {maxd}");
+
+        // 決定論: 同一入力の 2 回目はビット一致
+        let got2 = run_gpu(&kc, &vc);
+        assert_eq!(got, got2, "prefill attention (n={n}) が非決定論的");
+        println!("prefill attention large n=({n}) determinism OK");
     }
 
     /// GPU の量子化が CPU (`tensor::quantize_row_i8`) とビット一致するか
