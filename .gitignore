@@ -5,4 +5,7 @@ __pycache__/
 .DS_Store
 vgcore*
 data/
+# テストフィクスチャは除外対象から外す (P19: dequant_ref.bin)
+!crates/denno-engine/tests/data/
+!crates/denno-engine/tests/data/**
 *.replay
