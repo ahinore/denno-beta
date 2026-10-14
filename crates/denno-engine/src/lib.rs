@@ -4,6 +4,9 @@
 //! KVキャッシュ、サンプリング、デコードループを持つ。CPUのみ・自前カーネル。
 
 pub mod engine;
+pub mod gguf;
+pub mod kquant;
+pub mod kquant_tables;
 pub mod kv_cache;
 pub mod load;
 pub mod model;
