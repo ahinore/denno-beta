@@ -443,9 +443,14 @@ pie showData title P9 fp32 batch (4x256) per-op time
   - **Test infrastructure fix**: the test-only GPU mirror key collided with real KvCache kv_ids (global sequence), polluting other tests (failed only in full runs) → switched to the sentinel key `u64::MAX-1`
   - **Infra fix (denno-server)**: the PROFILE logger emitted empty blocks ~250k times/sec while idle, growing the serve log **~470GB/hour** (3rd disk-full incident). A timed-out investigation grep also kept holding the deleted 506GB log, adding ~700GB of invisible usage (df−du gap; recovered via lsof +L1 → kill -9). Root fix: PROFILE output limited to one line after the last session completes (`done.iter().any(|&d| d)` gate)
   - **PTX**: sha256 `21fc893194c8f68ad2b11311e471dc55b9558772d5332aea83feb32e18cecfdd`
-- **Remaining candidates (step 6 onward)**:
-  1. **GPU rmsnorm**: rmsnorm 2.3s (~40ms/layer) sits serially before the h upload (81MB H2D). Generating h on device in the prefill path would remove that upload too (elementwise ops are already bit-exact)
-  2. **GEMM kernel improvement**: the current 64×64 / 1-thread-4×4 / TK=32 is latency-bound-ish. 128×128 tiles + 8×8/thread + vectorized loads should give 2-4x (integer accumulation structurally guarantees bit-exactness). Targets down_proj 5.0s (largest remaining)
+- **Step 6: GEMM kernel improvement — 128×128 tiles + smem stride padding (✅ 2026-10-14)**:
+  - **Problem with the old kernel**: with 64×64 tiles and a 32B smem row stride, the **sB row reads (adjacent threads on different rows) all hit the same bank and serialized 16-way** (32B stride is a multiple of 32 banks), and compute density between syncs was low (16 dp4a/thread/chunk)
+  - **Fix**: **128×128 tiles, 8×8 outputs per thread** + smem stride padded to `GEMM_TK+1` (33B — adjacent threads' 8-row gap = 264B = 66 words → banks 2 apart, conflict-free) + A re-reads halved. **Integer accumulation structurally guarantees bit-exactness** (dp4a and the f32 epilogue are identical to the old kernel)
+  - **Performance**: GEMM bench (m=8000): down 125ms → **48.1ms (2.6x)**, qkv 65 → 33.5ms, gate_up 508 → 260ms, bit-exact 8 cases OK. **E2E (13,252-token cold): down_proj 5,009ms → 1,147ms (4.4x), o_proj 494 → 272ms, PROFILE TOTAL 12.7s → 8.4s, wall 17.6s → 13.0s**. GPU cuda_ **23/23**, response correct ("OK")
+  - **PTX (kernels_int8)**: sha256 `a008361079c039166edcc68219d256fba8f97d8506f649ab271c11ed87ff2c51`
+- **Remaining candidates (step 7 onward)**:
+  1. **attn_core 4.5s (remaining 53%)**: further optimization of the step-4 kernel (reduce K/V re-reads, rework smem layout)
+  2. **GPU rmsnorm**: rmsnorm 2.3s (~20ms/layer) sits serially before the h upload (81MB H2D). Generating h on device in the prefill path would remove that upload too (elementwise ops are already bit-exact)
 
 ## 4. Candidate List
 

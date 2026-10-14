@@ -617,9 +617,9 @@ impl CudaCtx {
                 &mut kc as *mut _ as *mut c_void,
                 &mut nc as *mut _ as *mut c_void,
             ];
-            let gmx = m.div_ceil(64) as u32;
-            let gmy = n.div_ceil(64) as u32;
-            self.launch_async(self.f_gemm, (gmx, gmy, 1), (16, 16, 1), 2 * 64 * 32, &mut args)?;
+            let gmx = m.div_ceil(128) as u32;
+            let gmy = n.div_ceil(128) as u32;
+            self.launch_async(self.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args)?;
             self.sync()?;
         }
         dev_out.to_vec::<f32>(m * n)
@@ -1037,9 +1037,9 @@ pub fn maybe_gpu_ffn(
                     &mut kc as *mut _ as *mut c_void,
                     &mut nc as *mut _ as *mut c_void,
                 ];
-                let gmx = m.div_ceil(64) as u32;
-                let gmy = (2 * ff).div_ceil(64) as u32;
-                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 2 * 64 * 32, &mut args)?;
+                let gmx = m.div_ceil(128) as u32;
+                let gmy = (2 * ff).div_ceil(128) as u32;
+                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args)?;
                 Ok(())
             })?;
             // 2) swiglu (interleaved): [m, 2ff] → act [m, ff] (デバイス上に保持)
@@ -1083,9 +1083,9 @@ pub fn maybe_gpu_ffn(
                     &mut kc as *mut _ as *mut c_void,
                     &mut nc as *mut _ as *mut c_void,
                 ];
-                let gmx = m.div_ceil(64) as u32;
-                let gmy = e.div_ceil(64) as u32;
-                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 2 * 64 * 32, &mut args)?;
+                let gmx = m.div_ceil(128) as u32;
+                let gmy = e.div_ceil(128) as u32;
+                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args)?;
                 check(
                     (lib.memcpy_dtoh_async)(ho.ptr, dout2.ptr(), m * e * 4, std::ptr::null_mut()),
                     "cuMemcpyDtoHAsync",
@@ -1338,10 +1338,10 @@ fn linear_gemm(
                 &mut kc as *mut _ as *mut c_void,
                 &mut nc as *mut _ as *mut c_void,
             ];
-            // 64x64 タイル × 16x16 thread (1 thread が 4x4 出力)
-            let gmx = m.div_ceil(64) as u32;
-            let gmy = n.div_ceil(64) as u32;
-            ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 2 * 64 * 32, &mut args)?;
+            // 128x128 タイル × 16x16 thread (1 thread が 8x8 出力)
+            let gmx = m.div_ceil(128) as u32;
+            let gmy = n.div_ceil(128) as u32;
+            ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args)?;
 
             check(
                 (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
@@ -2105,9 +2105,9 @@ pub fn maybe_gpu_oproj(o: &Quant8Linear, m: usize, k: usize, li: usize) -> Optio
                     &mut kc as *mut _ as *mut c_void,
                     &mut nc as *mut _ as *mut c_void,
                 ];
-                let gmx = m.div_ceil(64) as u32;
-                let gmy = e.div_ceil(64) as u32;
-                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 2 * 64 * 32, &mut args)?;
+                let gmx = m.div_ceil(128) as u32;
+                let gmy = e.div_ceil(128) as u32;
+                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args)?;
                 // 3) D2H + 同期 (attention カーネルは同一ストリームの先行発行なので完結済み)
                 check(
                     (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), m * e * 4, std::ptr::null_mut()),
@@ -2500,9 +2500,9 @@ pub fn chain_qkv_rope_prefill(
                 &mut kc_ as *mut _ as *mut c_void,
                 &mut nc as *mut _ as *mut c_void,
             ];
-            let gmx = n.div_ceil(64) as u32;
-            let gmy = width.div_ceil(64) as u32;
-            ok(unsafe { ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 2 * 64 * 32, &mut args) })
+            let gmx = n.div_ceil(128) as u32;
+            let gmy = width.div_ceil(128) as u32;
+            ok(unsafe { ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args) })
         })?;
 
         // 2) rope テーブル (行ごと pos0+i・rope_row と同一式) と bias

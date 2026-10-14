@@ -111,14 +111,20 @@ extern "C" __global__ void dno_matvec_rows_bt_i8(
 }
 
 // ---------------------------------------------------------------------------
-// P17i: tiled int8 GEMM (prefill 用の大きい m)。64x64 タイル・1 スレッド 4x4
-// 出力・dp4a。重みはタイルごとに共有メモリへ一度読めばよいので、出力要素ごとに
-// 重み行を再読する GEMV 型カーネル (上記) と異なり大 m で効く。
+// P17i: tiled int8 GEMM (prefill 用の大きい m)。dp4a。重みはタイルごとに共有メモリ
+// へ一度読めばよいので、出力要素ごとに重み行を再読する GEMV 型カーネル (上記) と
+// 異なり大 m で効く。
+// P17k ステップ 6: 128x128 タイル (1 thread 8x8 出力) + smem ストライドパッド。
+// 旧版 (64x64・ストライド 32) は sB 行読み (隣接 thread が 8 行差) が
+// ストライド 32B = 32 の倍数で同一 bank に衝突し 16-way serialized していた。
+// ストライドを GEMM_TK+1 (33B) にすると隣接 thread の 8 行差 = 264B = 66 words で
+// bank が 2 ずつ離れ conflict 無し。タイル 128 で A 再読みも半減。
 // ビット一致: 整数累積は結合則が成立するためタイル化/順序に依存しない。f32 側は
 // GEMV カーネルと同一の ((dot as f32) * ascale) * scale[j] の順。k が 4 の倍数で
 // ない場合もタイル境界の 0 パディングで正しく処理される (0 は積に寄与しない)。
-#define GEMM_TILE 64
+#define GEMM_TILE 128
 #define GEMM_TK 32
+#define GEMM_SP (GEMM_TK + 1)
 extern "C" __global__ void dno_gemm_i8(
     const signed char* __restrict__ aq,   // [m,k]
     const float* __restrict__ ascale,     // [m]
@@ -127,26 +133,26 @@ extern "C" __global__ void dno_gemm_i8(
     float* __restrict__ out,              // [m,n] row-major
     int m, int k, int n)
 {
-    const int tx = threadIdx.x; // 0..15 → j 方向 4 列ずつ
-    const int ty = threadIdx.y; // 0..15 → i 方向 4 行ずつ
+    const int tx = threadIdx.x; // 0..15 → j 方向 8 列ずつ
+    const int ty = threadIdx.y; // 0..15 → i 方向 8 行ずつ
     const int tid = ty * 16 + tx;
     const int i0 = blockIdx.x * GEMM_TILE;
     const int j0 = blockIdx.y * GEMM_TILE;
 
-    int acc[4][4];
+    int acc[8][8];
     #pragma unroll
-    for (int u = 0; u < 4; u++) {
+    for (int u = 0; u < 8; u++) {
         #pragma unroll
-        for (int v = 0; v < 4; v++) {
+        for (int v = 0; v < 8; v++) {
             acc[u][v] = 0;
         }
     }
 
-    __shared__ signed char sA[GEMM_TILE][GEMM_TK];
-    __shared__ signed char sB[GEMM_TILE][GEMM_TK];
+    __shared__ signed char sA[GEMM_TILE][GEMM_SP];
+    __shared__ signed char sB[GEMM_TILE][GEMM_SP];
 
     for (int kb = 0; kb < k; kb += GEMM_TK) {
-        // A/B タイル (各 64x32 = 2048B) を 256 thread で共有メモリへ
+        // A/B タイル (各 128x32 = 4096B) を 256 thread で共有メモリへ
         for (int t = tid; t < GEMM_TILE * GEMM_TK; t += 256) {
             const int r = t / GEMM_TK;
             const int c = t - r * GEMM_TK;
@@ -164,20 +170,20 @@ extern "C" __global__ void dno_gemm_i8(
         __syncthreads();
         #pragma unroll
         for (int c0 = 0; c0 < GEMM_TK; c0 += 4) {
-            int a4[4];
+            int a4[8];
             #pragma unroll
-            for (int u = 0; u < 4; u++) {
-                const signed char* p = &sA[ty * 4 + u][c0];
+            for (int u = 0; u < 8; u++) {
+                const signed char* p = &sA[ty * 8 + u][c0];
                 a4[u] = ((int)(unsigned char)p[0]) | (((int)(unsigned char)p[1]) << 8)
                       | (((int)(unsigned char)p[2]) << 16) | (((int)(unsigned char)p[3]) << 24);
             }
             #pragma unroll
-            for (int v = 0; v < 4; v++) {
-                const signed char* p = &sB[tx * 4 + v][c0];
+            for (int v = 0; v < 8; v++) {
+                const signed char* p = &sB[tx * 8 + v][c0];
                 const int b4 = ((int)(unsigned char)p[0]) | (((int)(unsigned char)p[1]) << 8)
                              | (((int)(unsigned char)p[2]) << 16) | (((int)(unsigned char)p[3]) << 24);
                 #pragma unroll
-                for (int u = 0; u < 4; u++) {
+                for (int u = 0; u < 8; u++) {
                     acc[u][v] = __dp4a(a4[u], b4, acc[u][v]);
                 }
             }
@@ -186,11 +192,11 @@ extern "C" __global__ void dno_gemm_i8(
     }
 
     #pragma unroll
-    for (int u = 0; u < 4; u++) {
+    for (int u = 0; u < 8; u++) {
         #pragma unroll
-        for (int v = 0; v < 4; v++) {
-            const int gi = i0 + ty * 4 + u;
-            const int gj = j0 + tx * 4 + v;
+        for (int v = 0; v < 8; v++) {
+            const int gi = i0 + ty * 8 + u;
+            const int gj = j0 + tx * 8 + v;
             if (gi < m && gj < n) {
                 const float o = (float)acc[u][v] * ascale[gi];
                 out[(size_t)gi * (size_t)n + gj] = o * scale[gj];
