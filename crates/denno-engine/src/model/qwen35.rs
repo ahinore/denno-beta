@@ -483,6 +483,41 @@ impl Qwen35 {
         y
     }
 
+    /// GDN スキャンのトークン逐次フォールバック (GPU 無効時・n==1)。
+    /// 投影済みの全トークン行を受け取り、行ごとに gdn_scan を回す。
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_scan_rows(
+        &self,
+        g: &GdnLayer,
+        qkv: &[f32],
+        z: &[f32],
+        beta_raw: &[f32],
+        alpha: &[f32],
+        cache: &mut KvCache,
+        li: usize,
+        n: usize,
+        dy: usize,
+    ) -> Vec<f32> {
+        let nqkv = g.qkv_w.dims().1;
+        let nz = g.gate_w.dims().1;
+        let nb = g.beta_w.dims().1;
+        let na = g.alpha_w.dims().1;
+        let mut ys = vec![0.0f32; n * dy];
+        for i in 0..n {
+            let y = self.gdn_scan(
+                g,
+                &qkv[i * nqkv..(i + 1) * nqkv],
+                &z[i * nz..(i + 1) * nz],
+                &beta_raw[i * nb..(i + 1) * nb],
+                &alpha[i * na..(i + 1) * na],
+                cache,
+                li,
+            );
+            ys[i * dy..(i + 1) * dy].copy_from_slice(&y);
+        }
+        ys
+    }
+
     /// FFN (SwiGLU)。
     fn ffn(&self, layer: &Layer, x: &[f32]) -> Vec<f32> {
         let gate = layer.gate_w.apply_bt(x, 1);
@@ -632,30 +667,52 @@ impl Qwen35 {
             match &layer.attn {
                 AttnKind::Gdn(g) => {
                     // 投影はバッチ一括 (m=n → GPU tiled GEMM)
-                    let (kqkv, nqkv) = g.qkv_w.dims();
-                    let (_, nz) = g.gate_w.dims();
-                    let (_, nb) = g.beta_w.dims();
-                    let (_, na) = g.alpha_w.dims();
+                    let (kqkv, _) = g.qkv_w.dims();
                     debug_assert_eq!(kqkv, e);
                     let qkv = g.qkv_w.apply_bt_rows(&h, n);
                     let z = g.gate_w.apply_bt_rows(&h, n);
                     let beta_raw = g.beta_w.apply_bt_rows(&h, n);
                     let alpha = g.alpha_w.apply_bt_rows(&h, n);
-                    // スキャンはトークン逐次 (再帰状態)
+                    // スキャン: GPU カーネル 1 発 (P19-A1・cuda 有効時)。GDN は
+                    // bit 一致不要のため GPU/CPU で数値は僅かに異なる (決定論は維持)。
+                    // GPU 無効時はトークン逐次 (再帰状態) にフォールバック。
                     let dy = g.out_w.dims().0; // value_dim
-                    let mut ys = vec![0.0f32; n * dy];
-                    for i in 0..n {
-                        let y = self.gdn_scan(
-                            g,
-                            &qkv[i * nqkv..(i + 1) * nqkv],
-                            &z[i * nz..(i + 1) * nz],
-                            &beta_raw[i * nb..(i + 1) * nb],
-                            &alpha[i * na..(i + 1) * na],
-                            cache,
-                            li,
-                        );
-                        ys[i * dy..(i + 1) * dy].copy_from_slice(&y);
-                    }
+                    #[cfg(feature = "cuda")]
+                    let p = &self.gdn_p;
+                    #[cfg(feature = "cuda")]
+                    let ys: Vec<f32> = if n > 1 && p.head_k_dim == p.head_v_dim {
+                        let (conv, ssm) = cache
+                            .gdn_state_mut(li)
+                            .expect("GDN state slot が未初期化");
+                        match crate::cuda::gdn_scan_batch(
+                            &qkv,
+                            &z,
+                            &beta_raw,
+                            &alpha,
+                            conv,
+                            ssm,
+                            &g.conv1d,
+                            &g.ssm_a,
+                            &g.ssm_dt,
+                            &g.ssm_norm,
+                            n,
+                            p.n_k_heads,
+                            p.n_v_heads,
+                            p.head_k_dim,
+                            p.head_v_dim,
+                            p.d_conv,
+                            p.eps,
+                            1.0 / (p.head_k_dim as f32).sqrt(),
+                        ) {
+                            Some(y) => y,
+                            None => self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy),
+                        }
+                    } else {
+                        self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy)
+                    };
+                    #[cfg(not(feature = "cuda"))]
+                    let ys: Vec<f32> =
+                        self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy);
                     let out = g.out_w.apply_bt_rows(&ys, n);
                     for i in 0..n {
                         for (xi, ai) in x[i * e..(i + 1) * e]

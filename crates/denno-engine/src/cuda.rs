@@ -308,10 +308,15 @@ pub struct CudaCtx {
     f_rope: CUfunction,
     // P17k ステップ 5: prefill 用行並列 rope (qkv→rope→attention 連続化)
     f_rope_pf: CUfunction,
+    // P19-A1: GDN 逐次 AR スキャン (prefill バッチ・GDN は bit 一致不要/決定論のみ)
+    #[allow(dead_code)]
+    module_gdn: CUmodule,
+    f_gdn: CUfunction,
 }
 
 const PTX: &[u8] = include_bytes!("../kernels/kernels_int8.ptx");
 const PTX_ELEM: &[u8] = include_bytes!("../kernels/kernels_elem.ptx");
+const PTX_GDN: &[u8] = include_bytes!("../kernels/kernels_gdn.ptx");
 
 // 中身は生ハンドル (context / module / function)。CUcontext はスレッドごとに
 // current 設定して使うハンドルであり、所有権の移動は伴わないため Send/Sync を
@@ -427,6 +432,20 @@ impl CudaCtx {
                 "cuModuleGetFunction(dno_rope_qkv_pf)",
             )?;
 
+            // P19-A1: GDN 逐次スキャンモジュール
+            let mut module_gdn: CUmodule = std::ptr::null_mut();
+            let mut image_gdn = PTX_GDN.to_vec();
+            image_gdn.push(0);
+            check(
+                (lib.module_load_data)(&mut module_gdn, image_gdn.as_ptr() as *const c_void),
+                "cuModuleLoadData (gdn PTX JIT)",
+            )?;
+            let mut f_gdn: CUfunction = std::ptr::null_mut();
+            check(
+                (lib.module_get_function)(&mut f_gdn, module_gdn, b"dno_gdn_scan\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_gdn_scan)",
+            )?;
+
             Ok(Self {
                 device: dev,
                 name,
@@ -446,6 +465,8 @@ impl CudaCtx {
                 f_attn_pf,
                 f_rope,
                 f_rope_pf,
+                module_gdn,
+                f_gdn,
             })
         }
     }
@@ -4247,4 +4268,160 @@ mod tests {
         println!("attention kernel vs CPU close OK (t={t_total} maxabs={maxd:.3e})");
         assert!(maxd < 1e-3, "attention maxabs diff {maxd}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// P19-A1: GDN 逐次 AR スキャン (prefill バッチ)
+// ---------------------------------------------------------------------------
+
+/// GDN prefill バッチスキャン (レイヤー 1 回のカーネル launch)。
+///
+/// - 入力: 投影済み qkv/z/beta/alpha の全トークン分行 + レイヤー状態 (conv/ssm)
+/// - 出力: y [n × value_dim] (gated RMS norm 済み・out_w 投影前)。状態は in-place 更新。
+/// - GDN は bit 一致不要 (CPU 逐次経路と数値は僅かに異なる・契約は決定論のみ)。
+/// - GPU 無効/未初期化/実行時エラー時は None (呼び出し側は CPU 逐次にフォールバック)。
+/// - 前提: head_k_dim == head_v_dim かつ d_conv == 4 (Qwen3.5 は常に成立)。
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_scan_batch(
+    qkv: &[f32],
+    z: &[f32],
+    beta: &[f32],
+    alpha: &[f32],
+    conv_st: &mut [f32],
+    ssm_st: &mut [f32],
+    wconv: &[f32],
+    wa: &[f32],
+    wdt: &[f32],
+    wnorm: &[f32],
+    n: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    eps: f32,
+    q_scale: f32,
+) -> Option<Vec<f32>> {
+    if !cuda_enabled() {
+        return None;
+    }
+    let ctx = shared_ctx()?;
+    if let Err(e) = ctx.make_current() {
+        tracing::error!("CUDA cuCtxSetCurrent failed, GDN scan using CPU: {e:#}");
+        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    match gdn_scan_impl(
+        ctx, qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv,
+        d_conv, eps, q_scale,
+    ) {
+        Ok(y) => Some(y),
+        Err(e) => {
+            tracing::error!("CUDA GDN scan failed, using CPU permanently: {e:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// 実装 (同期コピー + 1 launch + 1 同期。prefill はリクエストあたり層数回しか
+/// 呼ばれないためピン留めパイプライン化の恩恵は小さい)。
+#[allow(clippy::too_many_arguments)]
+fn gdn_scan_impl(
+    ctx: &CudaCtx,
+    qkv: &[f32],
+    z: &[f32],
+    beta: &[f32],
+    alpha: &[f32],
+    conv_st: &mut [f32],
+    ssm_st: &mut [f32],
+    wconv: &[f32],
+    wa: &[f32],
+    wdt: &[f32],
+    wnorm: &[f32],
+    n: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    eps: f32,
+    q_scale: f32,
+) -> Result<Vec<f32>> {
+    let cs = d_conv - 1;
+    let conv_dim = 2 * nk * dk + nv * dv;
+    let vd = nv * dv;
+    debug_assert_eq!(qkv.len(), n * conv_dim);
+    debug_assert_eq!(z.len(), n * vd);
+    debug_assert_eq!(beta.len(), n * nv);
+    debug_assert_eq!(alpha.len(), n * nv);
+    debug_assert_eq!(conv_st.len(), conv_dim * cs);
+    debug_assert_eq!(ssm_st.len(), nv * dk * dv);
+
+    ctx.make_current()?;
+    let dq = DevBuffer::from_slice(qkv)?;
+    let dz = DevBuffer::from_slice(z)?;
+    let dbeta = DevBuffer::from_slice(beta)?;
+    let dalpha = DevBuffer::from_slice(alpha)?;
+    let dconv_in = DevBuffer::from_slice(conv_st)?;
+    let dssm_in = DevBuffer::from_slice(ssm_st)?;
+    let dwc = DevBuffer::from_slice(wconv)?;
+    let dwa = DevBuffer::from_slice(wa)?;
+    let dwd = DevBuffer::from_slice(wdt)?;
+    let dwn = DevBuffer::from_slice(wnorm)?;
+    let dy = DevBuffer::from_slice(&vec![0.0f32; n * vd])?;
+    let dconv_out = DevBuffer::from_slice(&vec![0.0f32; conv_dim * cs])?;
+    let dssm_out = DevBuffer::from_slice(&vec![0.0f32; nv * dk * dv])?;
+
+    let (mut pq, mut pz, mut pb, mut pa) = (
+        dq.ptr(),
+        dz.ptr(),
+        dbeta.ptr(),
+        dalpha.ptr(),
+    );
+    let (mut pci, mut psi) = (dconv_in.ptr(), dssm_in.ptr());
+    let (mut pwc, mut pwa, mut pwd, mut pwn) = (dwc.ptr(), dwa.ptr(), dwd.ptr(), dwn.ptr());
+    let (mut py, mut pco, mut pso) = (dy.ptr(), dconv_out.ptr(), dssm_out.ptr());
+    let (mut ni, mut nki, mut nvi, mut dki, mut dvi) = (
+        n as c_int, nk as c_int, nv as c_int, dk as c_int, dv as c_int,
+    );
+    let (mut cdi, mut dci, mut csi) = (conv_dim as c_int, d_conv as c_int, cs as c_int);
+    let (mut epsi, mut qsi) = (eps, q_scale);
+    let mut args = [
+        &mut pq as *mut _ as *mut c_void,
+        &mut pz as *mut _ as *mut c_void,
+        &mut pb as *mut _ as *mut c_void,
+        &mut pa as *mut _ as *mut c_void,
+        &mut pci as *mut _ as *mut c_void,
+        &mut psi as *mut _ as *mut c_void,
+        &mut pwc as *mut _ as *mut c_void,
+        &mut pwa as *mut _ as *mut c_void,
+        &mut pwd as *mut _ as *mut c_void,
+        &mut pwn as *mut _ as *mut c_void,
+        &mut py as *mut _ as *mut c_void,
+        &mut pco as *mut _ as *mut c_void,
+        &mut pso as *mut _ as *mut c_void,
+        &mut ni as *mut _ as *mut c_void,
+        &mut nki as *mut _ as *mut c_void,
+        &mut nvi as *mut _ as *mut c_void,
+        &mut dki as *mut _ as *mut c_void,
+        &mut dvi as *mut _ as *mut c_void,
+        &mut cdi as *mut _ as *mut c_void,
+        &mut dci as *mut _ as *mut c_void,
+        &mut csi as *mut _ as *mut c_void,
+        &mut epsi as *mut _ as *mut c_void,
+        &mut qsi as *mut _ as *mut c_void,
+    ];
+    let shmem = ((3 * dk + dv + 5) * 4) as u32;
+    unsafe {
+        ctx.launch_async(ctx.f_gdn, (nv as u32, 1, 1), (dk as u32, 1, 1), shmem, &mut args)?;
+    }
+    ctx.sync()?;
+
+    let y = dy.to_vec::<f32>(n * vd)?;
+    let conv_new = dconv_out.to_vec::<f32>(conv_dim * cs)?;
+    let ssm_new = dssm_out.to_vec::<f32>(nv * dk * dv)?;
+    conv_st.copy_from_slice(&conv_new);
+    ssm_st.copy_from_slice(&ssm_new);
+    Ok(y)
 }
