@@ -181,135 +181,165 @@ impl GdnParams {
         let z = matvec(&w.w_gate, x, self.value_dim(), self.n_embd);
         let beta_raw = matvec(&w.w_beta, x, self.n_v_heads, self.n_embd);
         let alpha = matvec(&w.w_alpha, x, self.n_v_heads, self.n_embd);
-
-        // ---- causal depthwise conv + silu --------------------------------
-        // 入力列 = [conv_state (d_conv-1), qkv_t] をチャネルごとに畳み込み
-        let cs = self.d_conv - 1;
-        let cd = self.conv_dim();
-        let mut conv_in = vec![0.0f32; cd * self.d_conv];
-        for c in 0..cd {
-            conv_in[c * self.d_conv..c * self.d_conv + cs]
-                .copy_from_slice(&st.conv[c * cs..(c + 1) * cs]);
-            conv_in[c * self.d_conv + cs] = qkv[c];
-        }
-        // 状態をロール: 新 state = 直近 d_conv-1 入力
-        for c in 0..cd {
-            st.conv[c * cs..(c + 1) * cs]
-                .copy_from_slice(&conv_in[c * self.d_conv + 1..(c + 1) * self.d_conv]);
-        }
-        let mut conv_out = vec![0.0f32; cd];
-        for c in 0..cd {
-            let row = &w.conv1d[c * self.d_conv..(c + 1) * self.d_conv];
-            let inp = &conv_in[c * self.d_conv..(c + 1) * self.d_conv];
-            let mut acc = 0.0f32;
-            for (a, b) in row.iter().zip(inp.iter()) {
-                acc += a * b;
-            }
-            conv_out[c] = silu(acc);
-        }
-
-        // ---- split q/k/v ---------------------------------------------------
-        let kd = self.key_dim();
-        let vd = self.value_dim();
-        let q_raw = &conv_out[0..kd];
-        let k_raw = &conv_out[kd..2 * kd];
-        let v_raw = &conv_out[2 * kd..2 * kd + vd];
-
-        // ---- L2 正規化 (head ごと) + q スケール -----------------------------
-        let q_scale = 1.0 / (self.head_k_dim as f32).sqrt();
-        let mut q = vec![0.0f32; kd];
-        let mut k = vec![0.0f32; kd];
-        for h in 0..self.n_k_heads {
-            let o = h * self.head_k_dim;
-            q[o..o + self.head_k_dim].copy_from_slice(&q_raw[o..o + self.head_k_dim]);
-            k[o..o + self.head_k_dim].copy_from_slice(&k_raw[o..o + self.head_k_dim]);
-            l2_norm(&mut q[o..o + self.head_k_dim], self.eps);
-            l2_norm(&mut k[o..o + self.head_k_dim], self.eps);
-            for v in q[o..o + self.head_k_dim].iter_mut() {
-                *v *= q_scale;
-            }
-        }
-
-        // ---- デルタルール (head ごと・AR 形式) ------------------------------
-        let dk = self.head_k_dim;
-        let dv = self.head_v_dim;
-        let mut o = vec![0.0f32; vd];
-        for h in 0..self.n_v_heads {
-            // k は n_k_heads と n_v_heads が異なる場合は repeat (0.8B は同一)
-            let kh = h % self.n_k_heads;
-            let qh = &q[kh * dk..kh * dk + dk];
-            let kh_v = &k[kh * dk..kh * dk + dk];
-            let vh = &v_raw[h * dv..h * dv + dv];
-
-            // decay: g = ssm_a * softplus(alpha + dt)
-            let g = w.ssm_a[h] * softplus(alpha[h] + w.ssm_dt[h]);
-            let eg = g.exp();
-
-            // S ← S * exp(g)   (S[h] は [dk][dv] 行優先)
-            let s_base = h * dk * dv;
-            for r in 0..dk {
-                for c in 0..dv {
-                    st.ssm[s_base + r * dv + c] *= eg;
-                }
-            }
-
-            // sk[c] = Σ_r k[r] * S[r][c]
-            let mut sk = vec![0.0f32; dv];
-            for r in 0..dk {
-                let kr = kh_v[r];
-                if kr != 0.0 {
-                    let row = &st.ssm[s_base + r * dv..s_base + r * dv + dv];
-                    for (c, skc) in sk.iter_mut().enumerate() {
-                        *skc += kr * row[c];
-                    }
-                }
-            }
-
-            // d[c] = beta * (v[c] - sk[c])
-            let b = sigmoid(beta_raw[h]);
-            let mut d = vec![0.0f32; dv];
-            for c in 0..dv {
-                d[c] = b * (vh[c] - sk[c]);
-            }
-
-            // S[r][c] += k[r] * d[c]
-            for r in 0..dk {
-                let kr = kh_v[r];
-                if kr != 0.0 {
-                    let row = &mut st.ssm[s_base + r * dv..s_base + r * dv + dv];
-                    for (c, dc) in d.iter().enumerate() {
-                        row[c] += kr * dc;
-                    }
-                }
-            }
-
-            // o[c] = Σ_r q[r] * S[r][c]
-            let obase = h * dv;
-            for r in 0..dk {
-                let qr = qh[r];
-                if qr != 0.0 {
-                    let row = &st.ssm[s_base + r * dv..s_base + r * dv + dv];
-                    for (c, oc) in o[obase..obase + dv].iter_mut().enumerate() {
-                        *oc += qr * row[c];
-                    }
-                }
-            }
-        }
-
-        // ---- gated RMS norm (head ごと): rmsnorm(o)*w * silu(z) -------------
-        let mut y = vec![0.0f32; vd];
-        for h in 0..self.n_v_heads {
-            let obase = h * dv;
-            let mut seg: Vec<f32> = o[obase..obase + dv].to_vec();
-            rms_norm(&mut seg, self.eps);
-            for (c, v) in seg.iter_mut().enumerate() {
-                *v *= w.ssm_norm[c] * silu(z[obase + c]);
-            }
-            y[obase..obase + dv].copy_from_slice(&seg);
-        }
-
-        matvec(&w.w_out, &y, self.n_embd, vd)
+        let cw = GdnCore {
+            conv1d: &w.conv1d,
+            ssm_a: &w.ssm_a,
+            ssm_dt: &w.ssm_dt,
+            ssm_norm: &w.ssm_norm,
+        };
+        let y = forward_token_core(self, &cw, &qkv, &z, &beta_raw, &alpha, st);
+        matvec(&w.w_out, &y, self.n_embd, self.value_dim())
     }
+}
+
+/// 逆畳み込み/SSM 部の重み (小さい f32 テンソル群)。モデル側では
+/// Linear (int8 再量子化) で持つ大きい行列 (qkv/gate/beta/alpha/out) と
+/// 分離して受けるためのビュー。
+pub struct GdnCore<'a> {
+    pub conv1d: &'a [f32],  // [conv_dim][d_conv]
+    pub ssm_a: &'a [f32],   // [n_v_heads] (負値)
+    pub ssm_dt: &'a [f32],  // [n_v_heads]
+    pub ssm_norm: &'a [f32], // [head_v_dim]
+}
+
+/// コア本体: 投影済み qkv/z/beta/alpha から gated-norm 済み出力 [value_dim] を返す。
+/// forward_token と同じ演算順序 (bit 一致)。
+pub fn forward_token_core(
+    p: &GdnParams,
+    cw: &GdnCore<'_>,
+    qkv: &[f32],
+    z: &[f32],
+    beta_raw: &[f32],
+    alpha: &[f32],
+    st: &mut GdnState,
+) -> Vec<f32> {
+    // ---- causal depthwise conv + silu --------------------------------
+    // 入力列 = [conv_state (d_conv-1), qkv_t] をチャネルごとに畳み込み
+    let cs = p.d_conv - 1;
+    let cd = p.conv_dim();
+    let mut conv_in = vec![0.0f32; cd * p.d_conv];
+    for c in 0..cd {
+        conv_in[c * p.d_conv..c * p.d_conv + cs]
+            .copy_from_slice(&st.conv[c * cs..(c + 1) * cs]);
+        conv_in[c * p.d_conv + cs] = qkv[c];
+    }
+    // 状態をロール: 新 state = 直近 d_conv-1 入力
+    for c in 0..cd {
+        st.conv[c * cs..(c + 1) * cs]
+            .copy_from_slice(&conv_in[c * p.d_conv + 1..(c + 1) * p.d_conv]);
+    }
+    let mut conv_out = vec![0.0f32; cd];
+    for c in 0..cd {
+        let row = &cw.conv1d[c * p.d_conv..(c + 1) * p.d_conv];
+        let inp = &conv_in[c * p.d_conv..(c + 1) * p.d_conv];
+        let mut acc = 0.0f32;
+        for (a, b) in row.iter().zip(inp.iter()) {
+            acc += a * b;
+        }
+        conv_out[c] = silu(acc);
+    }
+
+    // ---- split q/k/v ---------------------------------------------------
+    let kd = p.key_dim();
+    let vd = p.value_dim();
+    let q_raw = &conv_out[0..kd];
+    let k_raw = &conv_out[kd..2 * kd];
+    let v_raw = &conv_out[2 * kd..2 * kd + vd];
+
+    // ---- L2 正規化 (head ごと) + q スケール -----------------------------
+    let q_scale = 1.0 / (p.head_k_dim as f32).sqrt();
+    let mut q = vec![0.0f32; kd];
+    let mut k = vec![0.0f32; kd];
+    for h in 0..p.n_k_heads {
+        let o = h * p.head_k_dim;
+        q[o..o + p.head_k_dim].copy_from_slice(&q_raw[o..o + p.head_k_dim]);
+        k[o..o + p.head_k_dim].copy_from_slice(&k_raw[o..o + p.head_k_dim]);
+        l2_norm(&mut q[o..o + p.head_k_dim], p.eps);
+        l2_norm(&mut k[o..o + p.head_k_dim], p.eps);
+        for v in q[o..o + p.head_k_dim].iter_mut() {
+            *v *= q_scale;
+        }
+    }
+
+    // ---- デルタルール (head ごと・AR 形式) ------------------------------
+    let dk = p.head_k_dim;
+    let dv = p.head_v_dim;
+    let mut o = vec![0.0f32; vd];
+    for h in 0..p.n_v_heads {
+        // k は n_k_heads と n_v_heads が異なる場合は repeat (0.8B は同一)
+        let kh = h % p.n_k_heads;
+        let qh = &q[kh * dk..kh * dk + dk];
+        let kh_v = &k[kh * dk..kh * dk + dk];
+        let vh = &v_raw[h * dv..h * dv + dv];
+
+        // decay: g = ssm_a * softplus(alpha + dt)
+        let g = cw.ssm_a[h] * softplus(alpha[h] + cw.ssm_dt[h]);
+        let eg = g.exp();
+
+        // S ← S * exp(g)   (S[h] は [dk][dv] 行優先)
+        let s_base = h * dk * dv;
+        for r in 0..dk {
+            for c in 0..dv {
+                st.ssm[s_base + r * dv + c] *= eg;
+            }
+        }
+
+        // sk[c] = Σ_r k[r] * S[r][c]
+        let mut sk = vec![0.0f32; dv];
+        for r in 0..dk {
+            let kr = kh_v[r];
+            if kr != 0.0 {
+                let row = &st.ssm[s_base + r * dv..s_base + r * dv + dv];
+                for (c, skc) in sk.iter_mut().enumerate() {
+                    *skc += kr * row[c];
+                }
+            }
+        }
+
+        // d[c] = beta * (v[c] - sk[c])
+        let b = sigmoid(beta_raw[h]);
+        let mut d = vec![0.0f32; dv];
+        for c in 0..dv {
+            d[c] = b * (vh[c] - sk[c]);
+        }
+
+        // S[r][c] += k[r] * d[c]
+        for r in 0..dk {
+            let kr = kh_v[r];
+            if kr != 0.0 {
+                let row = &mut st.ssm[s_base + r * dv..s_base + r * dv + dv];
+                for (c, dc) in d.iter().enumerate() {
+                    row[c] += kr * dc;
+                }
+            }
+        }
+
+        // o[c] = Σ_r q[r] * S[r][c]
+        let obase = h * dv;
+        for r in 0..dk {
+            let qr = qh[r];
+            if qr != 0.0 {
+                let row = &st.ssm[s_base + r * dv..s_base + r * dv + dv];
+                for (c, oc) in o[obase..obase + dv].iter_mut().enumerate() {
+                    *oc += qr * row[c];
+                }
+            }
+        }
+    }
+
+    // ---- gated RMS norm (head ごと): rmsnorm(o)*w * silu(z) -------------
+    let mut y = vec![0.0f32; vd];
+    for h in 0..p.n_v_heads {
+        let obase = h * dv;
+        let mut seg: Vec<f32> = o[obase..obase + dv].to_vec();
+        rms_norm(&mut seg, p.eps);
+        for (c, v) in seg.iter_mut().enumerate() {
+            *v *= cw.ssm_norm[c] * silu(z[obase + c]);
+        }
+        y[obase..obase + dv].copy_from_slice(&seg);
+    }
+
+    y
 }
 
 #[cfg(test)]
