@@ -4,6 +4,11 @@
 //! **契約: llama.cpp とのビット一致**(同一ブロック列 → 同一 f32 列)。
 //! 検証は C リファレンス(ref/ggml からビルドした dequant_ref)との比較テストで行う。
 //!
+//! 参照実装: llama.cpp ggml (https://github.com/ggml-org/llama.cpp)
+//! MIT License — Copyright (c) 2023-2026 The ggml authors。
+//! ビット一致契約のため演算を ggml に忠実に移植している (MIT 表示義務を満たすため
+//! 本表示を保持する)。
+//!
 //! テーブル (KQUANT_TABLES) は ggml-common.h から自動生成 (gen_kquant_tables.py)。
 //! 手で編集しない。
 

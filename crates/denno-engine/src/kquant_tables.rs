@@ -1,5 +1,10 @@
 // 自動生成: ref/ggml/ggml-common.h から gen_kquant_tables.py で変換。
 // 手で編集しないこと (llama.cpp の ggml テーブルとビット一致が契約)。
+//
+// テーブル値の参照元: llama.cpp ggml (https://github.com/ggml-org/llama.cpp)
+// MIT License — Copyright (c) 2023-2026 The ggml authors。
+// ggml-common.h からの抽出データであり、MIT ライセンスの表示義務に従い
+// 上記著作権表示を保持する。
 // #![allow(dead_code)] 相当: 未使用テーブルは将来の型拡張用。
 #![allow(dead_code)]
 
