@@ -458,7 +458,32 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
   1. **attn_core 3.5s(残り 47%)**: V 累積の v 再読み削減(行チャンク化)・BK 拡大(48KB 超 smem は `cuFuncSetAttribute` での opt-in が必要)
   2. **rmsnorm の GPU 化**: rmsnorm 2.3s(1 層あたり ~20ms)が h H2D(81MB)と直列。prefill 経路で h をデバイスで生成できれば H2D も削減できる(要素演算は既にビット一致実装済み)
 
+### P19: Qwen3.5 対応(GGUF ローダ+Gated DeltaNet ハイブリッド)〜B2 モデル統合+E2E ✅ (2026-10-14, commits `49ac073`/`0bbfa79`/`cb9d30b`/`feab1c8`)
+
+> 発端: Qwen3.8-27B(UD-IQ2_XXS 混合量子 GGUF)対応 → Qwen3.5 ハイブリッドアーキテクチャ(**Gated DeltaNet 3:1 + full attention**)対応を段階的に実装。段階: A=GGUF+dequant 基盤 → B=GDN CPU リファレンス → B2=モデル統合+E2E(本節)→ GPU 化 → 9B → 27B スケール。
+
+- **GGUF 基盤 (`49ac073`)**: ①GGUF コンテナリーダ(`gguf.rs`・mmap・header/KV/テンソル情報)②GGML k-quant/IQ **18 型の dequant**(`kquant.rs`+自動生成 `kquant_tables.rs`・`ref/gen_kquant_tables.py`)③LCG fixture による **llama.cpp bit-exact 検証**(16 ブロック×18 型全一致)+実 GGUF 320 テンソル検証。`kquant_tables.rs` は生成物に限定(手編集禁止)。commit 失敗の原因は `.gitignore` の `data/` が fixture を除外していたこと(negation で解決)
+- **GDN CPU リファレンス (`0bbfa79`/`cb9d30b`)**: llama.cpp `delta-net-base.cpp` の `build_delta_net_autoregressive`(逐次 AR 形式)を 1:1 移植。数学: g=ssm_a(負値)×softplus(alpha+dt_bias)→S←S·exp(g)→delta ルール(sk=Σk·S, d=β(v−sk), S+=k⊗d, o=Σq·S)・q/k は L2 正規化・出力は gated RMS norm(rmsnorm(o)·w·silu(z))・causal depthwise conv+SiLU。softplus は ggml 規約。**llama.cpp とのビット一致は要求しない**(denno 契約=同一入力→同一出力+決定論・逐次 AR 形式は chunked 形式と数学等価)
+- **B2 モデル統合 (`feab1c8`)**: `model/qwen35.rs`(`model_type: qwen3_5` dispatch) — 24 層=18 GDN+6 full attention(3:1)・full attn は Q+gate 融合(attn_output_gate)・partial MRoPE(interleaved [11,11,10]・テキストでは通常 RoPE 等価)・QK-Norm・sigmoid 出力ゲート・tied embeddings(vocab 248,320)・**GGUF(Unsloth Dynamic 混合量子含む)→dequant→既存 Fp32/Int8 パイプライン再量子化**(新 GEMM 不要)。大きい行列は `Linear`・極小 f32 テンソル(conv1d/ssm_a/ssm_dt/ssm_norm)は `GdnCore<'a>` 参照ビュー+`forward_token_core`。GDN 状態は KvCache の GDN スロット(conv バッファ+SSM 行列)
+- **実装中に発見・修正したバグ 3 件**:
+  1. **KV 容量バグ**: `cache.len()` は forward 終了まで進まないため、トークンごとの `kv_bufs(li,1)` では 2 トークン目で範囲外 panic → forward 冒頭で全トークン分一括確保
+  2. **再帰状態 × prefix 再利用**(最重要): KV live 再利用の `truncate`/prefix entry 復元は GDN の conv/SSM 状態を無効化(再帰状態は位置スライス不可)→ **同一 seed でも出力が変わる非決定論**を実測。`Model::is_recurrent()` を新設し、recurrent モデルは純拡張(lcp==len)のみ再利用・それ以外はフル prefill
+  3. **int8 制御信号の品質劣化**: per-tensor 量子化誤差プローブ(テスト同梱)で全テンソル 0.8〜1.5%(正常範囲)だが最悪が `ssm_beta/ssm_alpha`(sigmoid/softplus を通る制御信号)→ **Int8 モードでも Fp32 維持**(24 層で ~1MB 未満・コスト無視可能)
+- **テスト**: gdn lib 4/4(独立オラクル一致・prefill 一括 vs トークン逐次 bit 一致・決定論)・実 GGUF layer-0(Q8_0/UD-IQ2_XXS 両方・減衰 exp(g)=0.0086〜0.9995 の多時間スケール確認)・`qwen35_model`(ロード/forward/決定論 2 回 bit 一致/**キャッシュ連続性 forward(3)+forward(1)==forward(4) bit 一致**)・lib 114 passed
+- **E2E 実機検証**(GPU 開発環境・fp32/int8 両方・UD-IQ2_XXS がデフォルト選択=混合量子が本番経路): 日本語 QA(正答)・英語 haiku・307 トークン要約が coherent・greedy(temp=0)で int8 も fp32 も正答・**seed 42 × 3 連続リクエスト完全一致**。prefill ~90ms/token・decode ~20ms/token(CPU トークン逐次)→ GPU 化が次の律速
+- **次の実装内容**: GDN/prefill の GPU 化 → 9B(untied)→ 27B
+
 ## 4. 次の実装候補
+
+### Qwen3.5 主線(最終目標: Qwen3.8-27B UD-IQ2_XXS 動作)
+
+- [ ] **GDN/prefill の GPU 化**(最優先): 現状 CPU トークン逐次で prefill ~90ms/token・decode ~20ms/token。まず逐次 AR カーネルの GPU 移植、その後 chunked scan 形式の検討
+- [ ] **Qwen3.5-9B 実 E2E**: 32 層=24 GDN+8 full・untied・head 構造ほぼ同一(モデル DL 必要)。27B 前の最終検証
+- [ ] **Qwen3.8-27B スケール**: 64 層=48 GDN+16 full・int8 必須。GPU 化が前提(prefill が CPU 逐次では実用時間を超える)
+- [ ] **prefix cache への GDN 状態スナップショット**(任意): 現在 recurrent モデルはフル prefill 固定(正しさ優先)。マルチターン高速化
+- [ ] **rmsnorm の GPU 化**(P17k 残課題・2.3s)/ **attn_core の V 累積**(残 3.51s・最大 op)
+
+### 従来候補
 
 - [x] ~~**sampler最適化**: 152k語彙のsoftmax+top-pソートが約3.5ms/stepの固定コスト(P7.5で判明)~~ → **P8で完了**(0.66ms/step、greedy不変)
 - [x] ~~**P6再開: 真の並列decode**: バッチ行列化で複数セッション同時decode~~ → **P6で完了**(スロットプール+forward_batch、fp32 1.35倍/int8 1.7倍@b=4)。**残課題: b=4で演算律速に遷移するためk方向の順序保存SIMD幅拡大**(SDOT等、累積順を保ったペアワイズ加算)でバッチ効率をさらに伸ばせる
