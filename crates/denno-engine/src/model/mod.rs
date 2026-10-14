@@ -2,6 +2,7 @@
 
 pub mod gpt2;
 pub mod llama;
+pub mod qwen35;
 
 use anyhow::{bail, Result};
 use std::path::Path;
@@ -14,6 +15,12 @@ pub trait Model: Send {
     fn context(&self) -> usize;
     /// EOS トークンID(複数あり得る: Qwen2.5 は generation_config で2つ指定される)
     fn eos_ids(&self) -> &[u32];
+    /// 再帰状態 (Qwen3.5 GDN の conv/SSM 状態) を持つモデルか。
+    /// true の場合、KV の位置スライス再利用 (truncate / prefix entry 復元) は
+    /// 状態を無効化するため、エンジンは拡張 (lcp == 現在長) の場合のみ再利用する。
+    fn is_recurrent(&self) -> bool {
+        false
+    }
     /// tokens を forward し、最後の位置の logits を返す
     fn forward(&mut self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>>;
     /// P6: 複数セッションの decode 1 ステップ (各 1 トークン) を 1 forward に
@@ -56,6 +63,8 @@ pub fn load_model(dir: &Path, mode: QuantMode) -> Result<Box<dyn Model>> {
         // Qwen3: Qwen2 との差分は QK-Norm (q/k 投影直後の head_dim 単位 RMSNorm) のみ。
         // QKV bias なし / tied・untied は config.json に従い LlamaQwen2 が両対応。
         Some("qwen3") => Ok(Box::new(llama::LlamaQwen2::load(dir, &cfg, mode)?)),
+        // Qwen3.5: ハイブリッド GDN + GatedAttention・GGUF ローダ (P19-B/C)
+        Some("qwen3_5") => Ok(Box::new(qwen35::Qwen35::load(dir, &cfg, mode)?)),
         other => bail!("未対応の model_type: {:?}(gpt2 / qwen2 / qwen3 のみ対応)", other),
     }
 }

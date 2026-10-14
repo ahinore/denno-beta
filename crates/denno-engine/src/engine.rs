@@ -478,10 +478,18 @@ impl Engine {
         // --- prefix cache 経路選択 (旧 chat() と同一) ---
         let lcp;
         let hit;
-        let best_entry = self
-            .prefix_cache
-            .best_match(&sess.prompt_ids)
-            .map(|(i, l)| (i, l.min(cap)));
+        // 再帰状態を持つモデル (Qwen3.5 GDN) では prefix entry 復元 (KV のみ
+        // コピー) は GDN conv/SSM 状態を復元できないため使わない。
+        // live 再利用も「拡張」(lcp == 現在長・truncate 不要) の場合のみ安全
+        // (truncate すると再帰状態が無効になる)。それ以外はフル prefill。
+        let recurrent = self.model.is_recurrent();
+        let best_entry = if recurrent {
+            None
+        } else {
+            self.prefix_cache
+                .best_match(&sess.prompt_ids)
+                .map(|(i, l)| (i, l.min(cap)))
+        };
         if let Some((idx, entry_lcp)) = best_entry.filter(|&(_, l)| l > best_live_lcp) {
             // 別セッションのエントリから KV を復元
             let restored = self
@@ -497,9 +505,12 @@ impl Engine {
                 lcp = 0;
                 hit = PrefixHit::None;
             }
-        } else if best_live_lcp > 0 {
-            // スロット残留 KV の live 再利用 (truncate のみ、コピー無し)
-            self.caches[slot].truncate(best_live_lcp);
+        } else if best_live_lcp > 0 && (!recurrent || best_live_lcp == self.caches[slot].len()) {
+            // スロット残留 KV の live 再利用 (truncate のみ、コピー無し)。
+            // recurrent モデルでは純拡張 (lcp == len・truncate 不要) のみ到達。
+            if best_live_lcp < self.caches[slot].len() {
+                self.caches[slot].truncate(best_live_lcp);
+            }
             lcp = best_live_lcp;
             hit = PrefixHit::Live;
         } else {

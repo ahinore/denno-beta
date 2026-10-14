@@ -19,6 +19,9 @@ pub struct KvCache {
     v: Vec<Vec<f32>>,
     /// GPU KV ミラー (P17g) のキー。プロセス内で一意 (Clone しないので衝突しない)
     id: u64,
+    /// GDN (Qwen3.5 linear_attention) 層の状態スロット。layer index → (conv, ssm)。
+    /// attach_gdn_slot で作られ、reset でゼロに戻る。通常の full attention 層は None。
+    gdn: Vec<Option<(Vec<f32>, Vec<f32>)>>,
 }
 
 /// KvCache インスタンス ID 採番 (P17g: GPU KV ミラーのキー)
@@ -35,6 +38,22 @@ impl KvCache {
             k: vec![Vec::new(); n_layers],
             v: vec![Vec::new(); n_layers],
             id: KV_ID_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            gdn: vec![None; n_layers],
+        }
+    }
+
+    /// GDN 層の状態スロットを用意する (Qwen3.5 用)。conv_len = conv_dim*(d_conv-1)、
+    /// ssm_len = n_v_heads*head_k_dim*head_v_dim。
+    pub fn attach_gdn_slot(&mut self, layer: usize, conv_len: usize, ssm_len: usize) {
+        assert!(layer < self.n_layers);
+        self.gdn[layer] = Some((vec![0.0; conv_len], vec![0.0; ssm_len]));
+    }
+
+    /// GDN 層の状態 (conv バッファ, SSM 行列) への可変参照。
+    pub fn gdn_state_mut(&mut self, layer: usize) -> Option<(&mut [f32], &mut [f32])> {
+        match &mut self.gdn[layer] {
+            Some((c, s)) => Some((c.as_mut_slice(), s.as_mut_slice())),
+            None => None,
         }
     }
 
@@ -45,6 +64,10 @@ impl KvCache {
 
     pub fn reset(&mut self) {
         self.len = 0;
+        for g in self.gdn.iter_mut().flatten() {
+            g.0.fill(0.0);
+            g.1.fill(0.0);
+        }
     }
 
     pub fn len(&self) -> usize {
