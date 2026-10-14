@@ -306,6 +306,8 @@ pub struct CudaCtx {
     f_attn_pf: CUfunction,
     // P17h: qkv rope + bias (CPU rope_row とビット一致)
     f_rope: CUfunction,
+    // P17k ステップ 5: prefill 用行並列 rope (qkv→rope→attention 連続化)
+    f_rope_pf: CUfunction,
 }
 
 const PTX: &[u8] = include_bytes!("../kernels/kernels_int8.ptx");
@@ -418,6 +420,12 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_rope, module_elem, b"dno_rope_qkv\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_rope_qkv)",
             )?;
+            // P17k ステップ 5: prefill 用行並列 rope
+            let mut f_rope_pf: CUfunction = std::ptr::null_mut();
+            check(
+                (lib.module_get_function)(&mut f_rope_pf, module_elem, b"dno_rope_qkv_pf\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_rope_qkv_pf)",
+            )?;
 
             Ok(Self {
                 device: dev,
@@ -437,6 +445,7 @@ impl CudaCtx {
                 f_attn,
                 f_attn_pf,
                 f_rope,
+                f_rope_pf,
             })
         }
     }
@@ -1390,6 +1399,14 @@ struct ChainScratch {
     pin_rope: Option<PinMem>,     // P17h: rope テーブル/... ステップ 1 回のアップロード用
     pin_pf: Option<PinMem>,       // P17k: prefill attention q の pinned ステージング用
     kv_stage: Option<PinMem>,     // P17h: k/v の非同期 D2H ステージング [n_layers][k|v]
+    // P17k ステップ 5: qkv→rope→attention デバイス連続化用 (prefill)
+    qkv_x: Option<DevBuffer>,     // GEMM 入力 h [n, e] fp32
+    qkv_aq: Option<DevBuffer>,    // GEMM 入力量子化 [n, e] int8
+    qkv_asc: Option<DevBuffer>,   // GEMM 入力スケール [n] f32
+    qkv_pf: Option<DevBuffer>,    // GEMM 出力 [n, qn+kn+vn] (q/k/v 連結・行-major)
+    qkv_q: Option<DevBuffer>,     // rope 後 q [n, heads*dh] (attention 入力)
+    rope_tab_pf: Option<DevBuffer>, // rope テーブル [n, dh] (行 i = pos0+i の cos|sin)
+    pin_qkv: Option<PinMem>,      // h / rope テーブル / bias アップロード用 pinned
     // P17h: ステップ内で sync が無くなるため pinned は (層×用途) ごとに専用化する
     // (async H2D の DMA 完了前にホストが上書きする競合を避ける)。id は呼び出し側が
     // 層番号と用途から一意に採番する。
@@ -1410,6 +1427,13 @@ thread_local! {
         pin_rope: None,
         pin_pf: None,
         kv_stage: None,
+        qkv_x: None,
+        qkv_aq: None,
+        qkv_asc: None,
+        qkv_pf: None,
+        qkv_q: None,
+        rope_tab_pf: None,
+        pin_qkv: None,
         pins: Vec::new(),
     });
 }
@@ -2276,6 +2300,393 @@ pub fn chain_rope_qkv(
     })
 }
 
+/// P17k ステップ 5: dno_rope_qkv_pf の起動 (chain_qkv_rope_prefill とテスト共用)。
+#[allow(clippy::too_many_arguments)]
+fn launch_rope_qkv_pf(
+    ctx: &CudaCtx,
+    qkv: CUdeviceptr,
+    qout: CUdeviceptr,
+    km: CUdeviceptr,
+    vm: CUdeviceptr,
+    tab: CUdeviceptr,
+    bias: CUdeviceptr,
+    pos0: usize,
+    n: usize,
+    heads: usize,
+    kv_heads: usize,
+    dh: usize,
+    kv_dim: usize,
+) -> Result<()> {
+    let (mut pq, mut pqo, mut pkm, mut pvm, mut pt, mut pb) = (qkv, qout, km, vm, tab, bias);
+    let (mut p0c, mut hc, mut khc, mut dc, mut kdc) = (
+        pos0 as c_int,
+        heads as c_int,
+        kv_heads as c_int,
+        dh as c_int,
+        kv_dim as c_int,
+    );
+    let mut args: Vec<*mut c_void> = vec![
+        &mut pq as *mut _ as *mut c_void,
+        &mut pqo as *mut _ as *mut c_void,
+        &mut pkm as *mut _ as *mut c_void,
+        &mut pvm as *mut _ as *mut c_void,
+        &mut pt as *mut _ as *mut c_void,
+        &mut pb as *mut _ as *mut c_void,
+        &mut p0c as *mut _ as *mut c_void,
+        &mut hc as *mut _ as *mut c_void,
+        &mut khc as *mut _ as *mut c_void,
+        &mut dc as *mut _ as *mut c_void,
+        &mut kdc as *mut _ as *mut c_void,
+    ];
+    unsafe {
+        ctx.launch_async(
+            ctx.f_rope_pf,
+            ((heads + 2 * kv_heads) as u32, n as u32, 1),
+            (dh as u32, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+}
+
+/// P17k ステップ 5: prefill の qkv GEMM → bias/rope → K/V キャッシュ書き込みまでを
+/// デバイスで完結させる (qkv→rope→attention 連続化の前半)。従来経路との差分:
+/// - qkv GEMM 出力 [n, width] (122MB @13k tok) の D2H + q/k/v 分割コピーが消える
+/// - rope が CPU (f32 powf/cos/sin × n×(heads+kv_heads)×half) から GPU へ
+/// - rope 後 q の H2D (81MB) が消える (attention は chain_attention_prefill_dev
+///   でデバイス q を直接読む)
+/// - K/V は rope カーネルが GPU ミラーに直接書き、[pos0..t_total) 行だけ D2H
+///   (27MB) でホストキャッシュへ (旧: CPU キャッシュ書き込み + ミラー H2D 27MB)
+///
+/// ビット一致: GEMM は dno_gemm_i8、bias は単一 add、rope は mul/sub (tab は
+/// CPU が rope_row と同一式で生成) — CPU 経路 (lin_qkv_gpu → add_bias →
+/// rope_rows → cache 書き込み) と q/K/V は完全一致。緩和不要。
+///
+/// 前提: 呼び出し側が bias/QK-Norm 無しを確認済み・cache は t_total 行分の容量
+/// 確保済み・現在レイヤのホスト行 [pos0..t_total) は未書き込み (本関数が D2H で
+/// 書く)。失敗時 None (ホスト状態不変 → 呼び出し側が従来経路でやり直し)。
+/// ロープテーブル/rope カーネル成功後にミラー len を t_total に確定する。
+#[allow(clippy::too_many_arguments)]
+pub fn chain_qkv_rope_prefill(
+    q_w: &Quant8Linear,
+    k_w: &Quant8Linear,
+    v_w: &Quant8Linear,
+    h: &[f32],
+    cache: &mut crate::kv_cache::KvCache,
+    key: u64,
+    li: usize,
+    n_layers: usize,
+    pos0: usize,
+    n: usize,
+    t_total: usize,
+    heads: usize,
+    kv_heads: usize,
+    dh: usize,
+    theta: f32,
+    bias: &[f32],
+) -> Option<()> {
+    if !gpu_attention_enabled() || !gemm_enabled() {
+        return None;
+    }
+    if !(n > max_m() && n >= gemm_min_m()) {
+        return None;
+    }
+    if n == 0 || t_total > cache.max_len() || n > 65535 {
+        return None; // rope カーネルの grid.y 上限
+    }
+    let qn = heads.checked_mul(dh)?;
+    let kv_dim = kv_heads.checked_mul(dh)?;
+    let width = qn.checked_add(2 * kv_dim)?;
+    let e = q_w.k;
+    if k_w.k != e || v_w.k != e || k_w.n != kv_dim || v_w.n != kv_dim || q_w.n != qn {
+        return None;
+    }
+    if h.len() != n * e {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+    let lib = ok(lib())?;
+
+    // ミラー取得 + 履歴行 [have..pos0) の同期 (現在行 [pos0..t_total) は rope
+    // カーネルが書く)。have > pos0 はミラーがホストに先行 → フォールバック
+    // (ホストキャッシュが完全でないため)。
+    let (kptr, vptr) = with_mirror(key, li, n_layers, t_total, kv_dim, |m, have| {
+        if have > pos0 {
+            return None;
+        }
+        if have < pos0 {
+            let (kc_ref, vc_ref) = cache.kv_bufs_ref(li);
+            let kb = m.layers[li].0.as_ref().unwrap();
+            let vb = m.layers[li].1.as_ref().unwrap();
+            ok(kb.copy_from_at(have * kv_dim * 4, &kc_ref[have * kv_dim..pos0 * kv_dim]))?;
+            ok(vb.copy_from_at(have * kv_dim * 4, &vc_ref[have * kv_dim..pos0 * kv_dim]))?;
+        }
+        Some((
+            m.layers[li].0.as_ref().unwrap().ptr(),
+            m.layers[li].1.as_ref().unwrap().ptr(),
+        ))
+    })?;
+
+    let uids = [q_w.uid, k_w.uid, v_w.uid];
+    let gw = match weights_for_group(&uids, &[q_w, k_w, v_w], e, width) {
+        Ok(g) => g,
+        Err(err) => {
+            tracing::error!("CUDA qkv weight upload failed, using CPU: {err:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+    };
+
+    // bias: [qb | kb | vb] 連結 1 バッファ (空なら無し)。dno_rope_qkv_pf が
+    // rope 前に加算する (CPU 経路の add_bias → rope_rows と同一順序・ビット一致)。
+    let bias_len = bias.len();
+    if !bias.is_empty() && bias_len != width {
+        return None;
+    }
+
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure(&mut s.qkv_x, n * e * 4))?;
+        ok(Scratch::ensure(&mut s.qkv_aq, n * e))?;
+        ok(Scratch::ensure(&mut s.qkv_asc, n * 4))?;
+        ok(Scratch::ensure(&mut s.qkv_pf, n * width * 4))?;
+        ok(Scratch::ensure(&mut s.qkv_q, n * qn * 4))?;
+        ok(Scratch::ensure(&mut s.rope_tab_pf, (n * dh + bias_len) * 4))?;
+        ok(Scratch::ensure_pin(&mut s.pin_qkv, (n * e * 4).max(n * dh * 4 + bias_len * 4)))?;
+
+        // h アップロード (pinned + async)。pin は次層で上書きするが、その前に
+        // 本関数内の sync が挟まるため安全。
+        {
+            let pin = s.pin_qkv.as_mut().unwrap();
+            pin.as_mut_slice::<f32>()[..n * e].copy_from_slice(h);
+        }
+        let (dx, daq, dasc, dqkv, dq, dtab) = (
+            s.qkv_x.as_ref().unwrap().ptr(),
+            s.qkv_aq.as_ref().unwrap().ptr(),
+            s.qkv_asc.as_ref().unwrap().ptr(),
+            s.qkv_pf.as_ref().unwrap().ptr(),
+            s.qkv_q.as_ref().unwrap().ptr(),
+            s.rope_tab_pf.as_ref().unwrap().ptr(),
+        );
+        let pin_ptr = s.pin_qkv.as_ref().unwrap().ptr;
+        unsafe {
+            ok(check(
+                (lib.memcpy_htod_async)(dx, pin_ptr as *const c_void, n * e * 4, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync (qkv x)",
+            ))?;
+        }
+        // 1) qkv GEMM: h [n,e] → [n, width] (dno_gemm_i8・CPU lin とビット一致)
+        crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
+            let (mut px, mut paq, mut pasc) = (dx, daq, dasc);
+            let (mut mc, mut kc_) = (n as c_int, e as c_int);
+            let mut args = [
+                &mut px as *mut _ as *mut c_void,
+                &mut paq as *mut _ as *mut c_void,
+                &mut pasc as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc_ as *mut _ as *mut c_void,
+            ];
+            ok(unsafe { ctx.launch_async(ctx.f_quant, (n as u32, 1, 1), (256, 1, 1), 256 * 4, &mut args) })?;
+            let (mut paqi, mut pasci, mut pw, mut psc, mut pout) =
+                (daq, dasc, gw.w.ptr(), gw.sc.ptr(), dqkv);
+            let (mut mc, mut kc_, mut nc) = (n as c_int, e as c_int, width as c_int);
+            let mut args = [
+                &mut paqi as *mut _ as *mut c_void,
+                &mut pasci as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut psc as *mut _ as *mut c_void,
+                &mut pout as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc_ as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            let gmx = n.div_ceil(64) as u32;
+            let gmy = width.div_ceil(64) as u32;
+            ok(unsafe { ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 2 * 64 * 32, &mut args) })
+        })?;
+
+        // 2) rope テーブル (行ごと pos0+i・rope_row と同一式) と bias
+        //    ([qb|kb|vb] 連結) を pinned に入れてアップロード。
+        {
+            let pin = s.pin_qkv.as_mut().unwrap();
+            let tab = &mut pin.as_mut_slice::<f32>()[..n * dh];
+            let half = dh / 2;
+            for i in 0..n {
+                let pos = (pos0 + i) as f32;
+                let row = &mut tab[i * dh..][..dh];
+                for d in 0..half {
+                    let ang = pos * theta.powf(-2.0 * d as f32 / dh as f32);
+                    row[d] = ang.cos();
+                    row[half + d] = ang.sin();
+                }
+            }
+            if bias_len > 0 {
+                let dst = &mut pin.as_mut_slice::<f32>()[n * dh..n * dh + bias_len];
+                dst.copy_from_slice(bias);
+            }
+        }
+        unsafe {
+            ok(check(
+                (lib.memcpy_htod_async)(dtab, pin_ptr as *const c_void, n * dh * 4, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync (rope tab pf)",
+            ))?;
+            if bias_len > 0 {
+                ok(check(
+                    (lib.memcpy_htod_async)(
+                        dtab + (n * dh * 4) as CUdeviceptr,
+                        (pin_ptr as *const u8).add(n * dh * 4) as *const c_void,
+                        bias_len * 4,
+                        std::ptr::null_mut(),
+                    ),
+                    "cuMemcpyHtoDAsync (rope bias pf)",
+                ))?;
+            }
+        }
+        // 3) rope: q → qkv_q (連続)、k/v → ミラーの (pos0+i) 行へ
+        let dbias = if bias_len > 0 {
+            dtab + (n * dh * 4) as CUdeviceptr
+        } else {
+            0
+        };
+        crate::prof::time_layer(crate::prof::ROPE, li, || {
+            ok(launch_rope_qkv_pf(
+                ctx, dqkv, dq, kptr, vptr, dtab, dbias, pos0, n, heads, kv_heads, dh, kv_dim,
+            ))
+        })?;
+        // 4) sync して K/V 現在行をホストキャッシュへ D2H (27MB・~3ms)。
+        //    以降ホスト側に q/k/v Vec は存在しない。
+        ok(ctx.sync())?;
+        {
+            let kb = cache.k_buf(li, 0);
+            ok(unsafe {
+                check(
+                    (lib.memcpy_dtoh)(
+                        kb[pos0 * kv_dim..t_total * kv_dim].as_mut_ptr() as *mut c_void,
+                        kptr + (pos0 * kv_dim * 4) as CUdeviceptr,
+                        n * kv_dim * 4,
+                    ),
+                    "cuMemcpyDtoH (qkv pf k)",
+                )
+            })?;
+        }
+        {
+            let vb = cache.v_buf(li, 0);
+            ok(unsafe {
+                check(
+                    (lib.memcpy_dtoh)(
+                        vb[pos0 * kv_dim..t_total * kv_dim].as_mut_ptr() as *mut c_void,
+                        vptr + (pos0 * kv_dim * 4) as CUdeviceptr,
+                        n * kv_dim * 4,
+                    ),
+                    "cuMemcpyDtoH (qkv pf v)",
+                )
+            })?;
+        }
+        Some(())
+    })?;
+
+    // 5) ミラー len 確定 (rope カーネルのミラー書き込みが成功した後でのみ)。
+    with_mirror(key, li, n_layers, t_total, kv_dim, |m, _| {
+        m.len[li] = t_total;
+        Some(())
+    })
+}
+
+/// P17k ステップ 5: prefill GPU attention — q が **デバイス常駐** (chain_
+/// qkv_rope_prefill が書いた qkv_q) で K/V ミラーも同期済みの場合の variant。
+/// q の H2D (81MB/層) とミラー行同期が不要。数値は chain_attention_prefill と
+/// 完全同一 (同一カーネル・同一引数・q の内容も同一)。
+/// 戻り None = CPU attention へ (chain_qkv_q_download で q を取得してから)。
+#[allow(clippy::too_many_arguments)]
+pub fn chain_attention_prefill_dev(
+    key: u64,
+    li: usize,
+    n_layers: usize,
+    pos0: usize,
+    n: usize,
+    t_total: usize,
+    heads: usize,
+    group: usize,
+    dh: usize,
+    kv_dim: usize,
+    scale: f32,
+) -> Option<()> {
+    if !gpu_attention_enabled() {
+        return None;
+    }
+    if n == 0 || t_total == 0 || group == 0 || t_total > 65535 {
+        return None;
+    }
+    // カーネル制約: chain_attention_prefill と同一
+    if dh < ATTN_PF_BQ || dh > 1024 {
+        return None;
+    }
+    let sh_f = (ATTN_PF_BQ + 2 * ATTN_PF_BK) * (dh + 1)
+        + ATTN_PF_BQ * ATTN_PF_BK
+        + 2 * ATTN_PF_BQ;
+    if sh_f * 4 > 48 * 1024 {
+        return None;
+    }
+    let qn = heads.checked_mul(dh)?;
+    let ctx = chain_ctx()?;
+    ok(chain_ensure_buf(CH_ATT, n * qn * 4))?;
+    let (mut kptr, mut vptr) = with_mirror(key, li, n_layers, t_total, kv_dim, |m, _| {
+        // 現在行は chain_qkv_rope_prefill が書き込み済み (len が t_total に確定済み)。
+        if m.len[li] < t_total {
+            return None;
+        }
+        Some((
+            m.layers[li].0.as_ref().unwrap().ptr(),
+            m.layers[li].1.as_ref().unwrap().ptr(),
+        ))
+    })?;
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        let mut qptr = s.qkv_q.as_ref()?.ptr();
+        let mut aptr = s.bufs[CH_ATT].as_ref().unwrap().ptr();
+        let (mut heads_c, mut n_c, mut pos0_c) =
+            (heads as c_int, n as c_int, pos0 as c_int);
+        let (mut kv_dim_c, mut t_c, mut group_c) =
+            (kv_dim as c_int, t_total as c_int, group as c_int);
+        let (mut dh_c, mut scale_c) = (dh as c_int, scale);
+        let mut args: Vec<*mut c_void> = vec![
+            &mut qptr as *mut _ as *mut c_void,
+            &mut kptr as *mut _ as *mut c_void,
+            &mut vptr as *mut _ as *mut c_void,
+            &mut aptr as *mut _ as *mut c_void,
+            &mut heads_c as *mut _ as *mut c_void,
+            &mut n_c as *mut _ as *mut c_void,
+            &mut pos0_c as *mut _ as *mut c_void,
+            &mut kv_dim_c as *mut _ as *mut c_void,
+            &mut t_c as *mut _ as *mut c_void,
+            &mut group_c as *mut _ as *mut c_void,
+            &mut dh_c as *mut _ as *mut c_void,
+            &mut scale_c as *mut _ as *mut c_void,
+        ];
+        ok(unsafe {
+            ctx.launch_async(
+                ctx.f_attn_pf,
+                // P17k: (行ブロック, heads) — x=行ブロック最速次元で同一 head の
+                // K/V を同時実行ブロック間で共有し L2 ヒット率を上げる
+                (n.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1),
+                (dh as u32, 1, 1),
+                (sh_f * 4) as u32,
+                &mut args,
+            )
+        })
+    })
+}
+
+/// P17k ステップ 5: デバイス常駐 q (qkv_q) をホストにダウンロードする
+/// (attention フォールバック用)。同期 D2H。
+pub fn chain_qkv_q_download(n: usize, qn: usize) -> Option<Vec<f32>> {
+    CHAIN.with(|cell| -> Option<Vec<f32>> {
+        let s = cell.borrow_mut();
+        let buf = s.qkv_q.as_ref()?;
+        ok(buf.to_vec(n * qn))
+    })
+}
+
 /// P17h: decode chain 用 GPU attention — q/k/v が **デバイス常駐** (CH_QKV) の
 /// 場合の variant。rope 済み k/v 現在行を CH_QKV からミラーへ D2D し、履歴行を
 /// ホストキャッシュから H2D 同期してカーネルを起動する。rope 済み k/v は
@@ -2544,6 +2955,164 @@ mod tests {
             }
         }
         att
+    }
+
+    /// P17k ステップ 5: dno_rope_qkv_pf (qkv 出力 → rope → q 連続化 +
+    /// k/v を GPU KV ミラーへ直接書き込み) が CPU 参照経路 (rope_row) と
+    /// **ビット一致**することを検証する。tab は CPU が rope_row と同一式で
+    /// 生成し、カーネルは mul/sub のみ適用するため一致が契約。
+    /// (qkv GEMM 自体は dno_gemm_i8 = cuda_gemm_i8_bit_exact_vs_cpu で担保)
+    #[test]
+    #[ignore] // GPU が必要: cargo test --release --features cuda -- --ignored
+    fn cuda_rope_qkv_pf_bitexact() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let (heads, kv_heads, dh) = (12usize, 2usize, 128usize);
+        let qn = heads * dh;
+        let kv_dim = kv_heads * dh;
+        let width = qn + 2 * kv_dim;
+        let (pos0, n) = (5usize, 37usize);
+        let t_total = pos0 + n;
+        let theta = 1_000_000.0f32;
+
+        let ctx = CudaCtx::new().unwrap();
+        // qkv GEMM 出力のエミュレーション (行 i = [qn | kv_dim | kv_dim]) + bias
+        let qkv = pseudo_random(n * width, 41);
+        let bias = pseudo_random(width, 42);
+        // rope テーブル: chain_qkv_rope_prefill 内と同一式 (rope_row とビット一致)
+        let mut tab = vec![0.0f32; n * dh];
+        let half = dh / 2;
+        for i in 0..n {
+            let pos = (pos0 + i) as f32;
+            let row = &mut tab[i * dh..][..dh];
+            for d in 0..half {
+                let ang = pos * theta.powf(-2.0 * d as f32 / dh as f32);
+                row[d] = ang.cos();
+                row[half + d] = ang.sin();
+            }
+        }
+        let dqkv = ctx.upload_f32(&qkv).unwrap();
+        let dbias = ctx.upload_f32(&bias).unwrap();
+        let dtab = ctx.upload_f32(&tab).unwrap();
+        let dq = DevBuffer::alloc(n * qn * 4).unwrap();
+
+        // CPU 参照: 行分割 ([n, width] 行-major → q/k/v) + bias 加算 + rope_row
+        let mut q_ref = vec![0.0f32; n * qn];
+        let mut k_ref = vec![0.0f32; n * kv_dim];
+        let mut v_ref = vec![0.0f32; n * kv_dim];
+        for i in 0..n {
+            let row = &qkv[i * width..][..width];
+            q_ref[i * qn..][..qn].copy_from_slice(&row[..qn]);
+            k_ref[i * kv_dim..][..kv_dim].copy_from_slice(&row[qn..qn + kv_dim]);
+            v_ref[i * kv_dim..][..kv_dim].copy_from_slice(&row[qn + kv_dim..]);
+        }
+        for b in q_ref.chunks_mut(qn) {
+            for (o, bi) in b.iter_mut().zip(&bias[..qn]) {
+                *o += *bi;
+            }
+        }
+        for b in k_ref.chunks_mut(kv_dim) {
+            for (o, bi) in b.iter_mut().zip(&bias[qn..qn + kv_dim]) {
+                *o += *bi;
+            }
+        }
+        for b in v_ref.chunks_mut(kv_dim) {
+            for (o, bi) in b.iter_mut().zip(&bias[qn + kv_dim..]) {
+                *o += *bi;
+            }
+        }
+        crate::tensor::rope_rows(&mut q_ref, n, heads, dh, pos0, theta);
+        crate::tensor::rope_rows(&mut k_ref, n, kv_heads, dh, pos0, theta);
+
+        // GPU 実経路: ミラー取得 (履歴行 [0..pos0) をシード — 現在行
+        // [pos0..t_total) は rope カーネルが書く。chain_qkv_rope_prefill と同一)。
+        // キーは番兵 (u64::MAX-1) — 実キャッシュの kv_id (1 からの連番) と
+        // 衝突すると他テストにミラーを残して汚染する (実害あり)。
+        const MIRROR_TEST_KEY: u64 = u64::MAX - 1;
+        let mut cache = crate::kv_cache::KvCache::new(1, kv_dim, t_total + 64);
+        {
+            let (kbuf, vbuf) = cache.kv_bufs(0, t_total);
+            kbuf[..t_total * kv_dim].copy_from_slice(&pseudo_random(t_total * kv_dim, 46));
+            vbuf[..t_total * kv_dim].copy_from_slice(&pseudo_random(t_total * kv_dim, 47));
+        }
+        let (kptr, vptr) = with_mirror(MIRROR_TEST_KEY, 0, 1, t_total, kv_dim, |m, have| {
+            if have < pos0 {
+                let (kc_ref, vc_ref) = cache.kv_bufs_ref(0);
+                let kb = m.layers[0].0.as_ref().unwrap();
+                let vb = m.layers[0].1.as_ref().unwrap();
+                kb.copy_from_at(have * kv_dim * 4, &kc_ref[have * kv_dim..pos0 * kv_dim])
+                    .unwrap();
+                vb.copy_from_at(have * kv_dim * 4, &vc_ref[have * kv_dim..pos0 * kv_dim])
+                    .unwrap();
+            }
+            Some((
+                m.layers[0].0.as_ref().unwrap().ptr(),
+                m.layers[0].1.as_ref().unwrap().ptr(),
+            ))
+        })
+        .unwrap();
+        launch_rope_qkv_pf(
+            &ctx,
+            dqkv.ptr(),
+            dq.ptr(),
+            kptr,
+            vptr,
+            dtab.ptr(),
+            dbias.ptr(),
+            pos0,
+            n,
+            heads,
+            kv_heads,
+            dh,
+            kv_dim,
+        )
+        .unwrap();
+        ctx.sync().unwrap();
+
+        // q: rope+連続化 → ビット一致
+        let q_gpu = dq.to_vec::<f32>(n * qn).unwrap();
+        if q_gpu != q_ref {
+            let bad = q_gpu
+                .iter()
+                .zip(&q_ref)
+                .position(|(a, b)| a.to_bits() != b.to_bits())
+                .unwrap();
+            let (i, r) = (bad / qn, bad % qn);
+            panic!(
+                "q ビット不一致: idx {bad} (i={i} h={} d={} in-head-d={}) gpu={} ({:08x}) ref={} ({:08x})",
+                r / dh,
+                r % dh,
+                {
+                    let d = r % dh;
+                    if d < dh / 2 { d } else { d - dh / 2 }
+                },
+                q_gpu[bad],
+                q_gpu[bad].to_bits(),
+                q_ref[bad],
+                q_ref[bad].to_bits()
+            );
+        }
+        // k/v: ミラーの [pos0..t_total) 行だけ rope 後の値とビット一致
+        // (履歴行 [0..pos0) はシード値のまま・不変)
+        let k_hist = pseudo_random(t_total * kv_dim, 46);
+        let v_hist = pseudo_random(t_total * kv_dim, 47);
+        let m2 = KV_MIRRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        let ms = m2.lock().unwrap();
+        let (_, mir, _) = ms
+            .iter()
+            .find(|(k, _, _)| *k == MIRROR_TEST_KEY)
+            .unwrap();
+        let k_gpu: Vec<f32> = mir.layers[0].0.as_ref().unwrap().to_vec(t_total * kv_dim).unwrap();
+        let v_gpu: Vec<f32> = mir.layers[0].1.as_ref().unwrap().to_vec(t_total * kv_dim).unwrap();
+        drop(ms);
+        for i in 0..t_total {
+            let off = i * kv_dim;
+            let wk = if i < pos0 { &k_hist[off..off + kv_dim] } else { &k_ref[(i - pos0) * kv_dim..(i - pos0 + 1) * kv_dim] };
+            let wv = if i < pos0 { &v_hist[off..off + kv_dim] } else { &v_ref[(i - pos0) * kv_dim..(i - pos0 + 1) * kv_dim] };
+            assert_eq!(&k_gpu[off..off + kv_dim], wk, "k 行 {i} ビット不一致");
+            assert_eq!(&v_gpu[off..off + kv_dim], wv, "v 行 {i} ビット不一致");
+        }
+        println!("rope_qkv_pf bit-exact OK (q {n}x{qn}, k/v rows {pos0}..{t_total})");
     }
 
     /// P17j: prefill attention カーネル (dno_attention_prefill) が CPU 参照経路と

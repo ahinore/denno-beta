@@ -499,51 +499,108 @@ impl Model for LlamaQwen2 {
             let h = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
                 rmsnorm(&x, &layer.ln1_w, e, self.eps)
             });
-            let (mut q, mut k, mut v) = crate::prof::time_layer(crate::prof::QKV, li, || {
-                // P17c: q/k/v は同一入力 → 1 回の GPU 呼び出しに融合
-                // (GPU 無効/エラー時は従来の 3 分割呼び出しにフォールバック)
-                #[cfg(feature = "cuda")]
-                if let Some((q, k, v)) = lin_qkv_gpu(layer, &h, n, heads * dh, kv_dim) {
-                    return (q, k, v);
-                }
-                (
-                    lin(&h, &layer.q_w, n), // [n, H*dh]
-                    lin(&h, &layer.k_w, n), // [n, K*dh]
-                    lin(&h, &layer.v_w, n),
-                )
-            });
-            if let Some(b) = &layer.q_b {
-                add_bias(&mut q, b, heads * dh);
-            }
-            if let Some(b) = &layer.k_b {
-                add_bias(&mut k, b, kv_dim);
-            }
-            if let Some(b) = &layer.v_b {
-                add_bias(&mut v, b, kv_dim);
-            }
-            // Qwen3 QK-Norm: q/k を head_dim 単位で RMSNorm する (RoPE の前)。
-            // 行/ヘッド単位で独立 → バッチ/単独でビット一致
-            if layer.q_norm_w.is_some() || layer.k_norm_w.is_some() {
-                crate::prof::time_layer(crate::prof::QKNORM, li, || {
-                    if let Some(w) = &layer.q_norm_w {
-                        crate::tensor::qknorm_rows_inplace(&mut q, n, heads, dh, w, self.eps);
-                    }
-                    if let Some(w) = &layer.k_norm_w {
-                        crate::tensor::qknorm_rows_inplace(&mut k, n, kv_heads, dh, w, self.eps);
-                    }
-                });
-            }
-
-            crate::prof::time_layer(crate::prof::ROPE, li, || {
-                rope_rows(&mut q, n, heads, dh, pos0, self.theta);
-                rope_rows(&mut k, n, kv_heads, dh, pos0, self.theta);
-            });
-
+            // P17k ステップ 5: qkv GEMM → rope → K/V キャッシュ書き込みまでを
+            // デバイスで完結する経路 (bias/QK-Norm 無し・n>1・GEMM 閾値以上の
+            // 場合のみ)。成功時 q/k/v のホスト Vec は作らない — q はデバイス
+            // (qkv_q・attention が直接読む)、K/V は rope カーネルが GPU ミラーに
+            // 直接書き [pos0..t_total) 行だけ D2H でホストキャッシュへ。GEMM/rope
+            // は CPU とビット一致 (緩和不要)。失敗時は従来経路にフォールバック
+            // (ホスト状態不変)。
+            #[cfg(feature = "cuda")]
+            let mut dev_qkv = false;
+            #[cfg(feature = "cuda")]
+            if n > 1
+                && layer.q_norm_w.is_none()
+                && layer.k_norm_w.is_none()
             {
-                let (kc, vc) = cache.kv_bufs(li, n);
-                for i in 0..n {
-                    kc[(pos0 + i) * kv_dim..][..kv_dim].copy_from_slice(&k[i * kv_dim..][..kv_dim]);
-                    vc[(pos0 + i) * kv_dim..][..kv_dim].copy_from_slice(&v[i * kv_dim..][..kv_dim]);
+                // QKV bias があれば [qb|kb|vb] 連結でカーネルへ (rope 前加算・
+                // CPU 経路とビット一致)。3 つ揃っていない場合はフォールバック。
+                let bias: Option<Vec<f32>> = match (&layer.q_b, &layer.k_b, &layer.v_b) {
+                    (Some(qb), Some(kb), Some(vb)) => {
+                        let mut b = Vec::with_capacity(heads * dh + 2 * kv_dim);
+                        b.extend_from_slice(qb);
+                        b.extend_from_slice(kb);
+                        b.extend_from_slice(vb);
+                        Some(b)
+                    }
+                    (None, None, None) => None,
+                    _ => None,
+                };
+                let kv_key = cache.kv_id();
+                let _ = cache.kv_bufs(li, n); // 容量確保
+                let qkv_ok = match (
+                    layer.q_w.quant8(),
+                    layer.k_w.quant8(),
+                    layer.v_w.quant8(),
+                ) {
+                    (Some(qw), Some(kw), Some(vw)) => crate::cuda::chain_qkv_rope_prefill(
+                        qw, kw, vw, &h, cache, kv_key, li, self.layers.len(), pos0, n,
+                        pos0 + n, heads, kv_heads, dh, self.theta,
+                        bias.as_deref().unwrap_or(&[]),
+                    ),
+                    _ => None,
+                };
+                if qkv_ok.is_some() {
+                    dev_qkv = true;
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            let dev_qkv = false;
+            let (mut q, mut k, mut v) = if !dev_qkv {
+                crate::prof::time_layer(crate::prof::QKV, li, || {
+                    // P17c: q/k/v は同一入力 → 1 回の GPU 呼び出しに融合
+                    // (GPU 無効/エラー時は従来の 3 分割呼び出しにフォールバック)
+                    #[cfg(feature = "cuda")]
+                    if let Some((q, k, v)) = lin_qkv_gpu(layer, &h, n, heads * dh, kv_dim) {
+                        return (q, k, v);
+                    }
+                    (
+                        lin(&h, &layer.q_w, n), // [n, H*dh]
+                        lin(&h, &layer.k_w, n), // [n, K*dh]
+                        lin(&h, &layer.v_w, n),
+                    )
+                })
+            } else {
+                // デバイス常駐: ホスト Vec は不要 (attention フォールバック時のみ
+                // q を chain_qkv_q_download で受け取る)
+                (Vec::new(), Vec::new(), Vec::new())
+            };
+            if !dev_qkv {
+                if let Some(b) = &layer.q_b {
+                    add_bias(&mut q, b, heads * dh);
+                }
+                if let Some(b) = &layer.k_b {
+                    add_bias(&mut k, b, kv_dim);
+                }
+                if let Some(b) = &layer.v_b {
+                    add_bias(&mut v, b, kv_dim);
+                }
+                // Qwen3 QK-Norm: q/k を head_dim 単位で RMSNorm する (RoPE の前)。
+                // 行/ヘッド単位で独立 → バッチ/単独でビット一致
+                if layer.q_norm_w.is_some() || layer.k_norm_w.is_some() {
+                    crate::prof::time_layer(crate::prof::QKNORM, li, || {
+                        if let Some(w) = &layer.q_norm_w {
+                            crate::tensor::qknorm_rows_inplace(&mut q, n, heads, dh, w, self.eps);
+                        }
+                        if let Some(w) = &layer.k_norm_w {
+                            crate::tensor::qknorm_rows_inplace(&mut k, n, kv_heads, dh, w, self.eps);
+                        }
+                    });
+                }
+
+                crate::prof::time_layer(crate::prof::ROPE, li, || {
+                    rope_rows(&mut q, n, heads, dh, pos0, self.theta);
+                    rope_rows(&mut k, n, kv_heads, dh, pos0, self.theta);
+                });
+
+                {
+                    let (kc, vc) = cache.kv_bufs(li, n);
+                    for i in 0..n {
+                        kc[(pos0 + i) * kv_dim..][..kv_dim]
+                            .copy_from_slice(&k[i * kv_dim..][..kv_dim]);
+                        vc[(pos0 + i) * kv_dim..][..kv_dim]
+                            .copy_from_slice(&v[i * kv_dim..][..kv_dim]);
+                    }
                 }
             }
 
@@ -556,6 +613,56 @@ impl Model for LlamaQwen2 {
                 let (kc, vc) = cache.kv_bufs_ref(li);
                 let t_total = pos0 + n;
                 let scale = 1.0 / (dh as f32).sqrt();
+                // P17k ステップ 5: q がデバイス常駐 (dev_qkv) → H2D なしで GPU
+                // attention を試行。K/V ミラーは chain_qkv_rope_prefill が書き込み
+                // 済み。成功時は o_proj もデバイスで (P17k ステップ 3 と同一経路)。
+                // 失敗時は q を D2H して下の CPU 経路へ (K/V はホストキャッシュに
+                // あるため CPU attention はそのまま動く)。
+                #[cfg(feature = "cuda")]
+                if dev_qkv {
+                    if crate::cuda::chain_attention_prefill_dev(
+                        cache.kv_id(),
+                        li,
+                        self.layers.len(),
+                        pos0,
+                        n,
+                        t_total,
+                        heads,
+                        group,
+                        dh,
+                        kv_dim,
+                        scale,
+                    )
+                    .is_some()
+                    {
+                        let mut done = false;
+                        if let Some(oq) = layer.o_w.quant8() {
+                            if let Some(proj) =
+                                crate::cuda::maybe_gpu_oproj(oq, n, heads * dh, li)
+                            {
+                                gpu_oproj = Some(proj);
+                                done = true;
+                            }
+                        }
+                        if done {
+                            return;
+                        }
+                        if let Some(av) =
+                            crate::cuda::chain_download(crate::cuda::CH_ATT, n * heads * dh)
+                        {
+                            att.copy_from_slice(&av);
+                            return;
+                        }
+                        // oproj も att download も失敗 → CPU attention へ
+                    }
+                    match crate::cuda::chain_qkv_q_download(n, heads * dh) {
+                        Some(qh) => q = qh,
+                        None => {
+                            tracing::error!("cuda qkv dev: device q download failed");
+                            return;
+                        }
+                    }
+                }
                 if n == 1 {
                     // decode: P17g GPU attention を先に試行 (forward_batch と同一
                     // カーネル・同一ミラー内容 → 単独/バッチでビット一致)。bias /
