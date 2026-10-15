@@ -599,6 +599,18 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **検証**: cargo test --workspace(CPU)全 green(lib 147 不変)+ cargo check --features cuda --tests green。**実機での再検証が必要**: ①`cuda_attn_pf_bench`(n=t=13252)のカーネル単体タイミング(旧 69.3ms/call からの改善幅)②`cuda_attention_prefill_vs_cpu_reference/large` の maxabs・決定論再確認 ③E2E PROFILE 計測(P17k 手順)。GPU バイナリ再ビルド+サーバー再起動は人間対応
 - **残課題**: 実機 E2E 計測 + BK 拡大の A/B 実験(smem >48KB の opt-in)+ スコア phase のさらなる共有(4r×2k)
 
+### B3: b>1 バッチ decode の rope GPU 化 — `dno_rope_qk_batch` 新設 ✅ (2026-10-15)
+
+> P17 系残課題の B3(優先度低・「バッチ時は同期が隠蔽される」ため効果は CPU 演算削減が主)。バッチ経路 (`forward_batch`・b>1) の rope は CPU で session ごと `tensor::rope_row` を適用しており、powf/cos/sin が session × (heads+kv_heads) × half × 層数 × ステップで走る。P17 系で bit 一致実績のある rope カーネル (P17h `dno_rope_qkv` / P17k `dno_rope_qkv_pf`) と同一の方式 (ホスト生成テーブル + mul/sub のみ) を再利用して GPU 化。
+
+- **新カーネル `dno_rope_qk_batch`(kernels_elem.cu)**: grid = (heads + kv_heads, b)・block = (dh)・shared なし。block.x < heads は q ヘッド (q[i, b*dh..] を rope)、heads 以上は k ヘッド (k[i, kh*dh..])。q [b, heads*dh] / k [b, kv_dim] は行-major in-place・テーブル tab は [b, dh](行 i = セッション i の pos の [cos(half)|sin(half)])。bias/QK-Norm は呼び出し側が既に CPU で適用済みの値を受ける (rope はそれらと無関係)
+- **数値契約: ビット一致(rope は緩和対象外)** — rope は exactness 契約の緩和対象外 (P17h 節「rope は緩和対象外のためビット一致必須」) のため CPU 経路とビット一致必須。①テーブルはホストが `tensor::rope_row` と同一式 (同一プロセスの glibc powf/cosf/sinf) で生成 → テーブル値はビット一致 ②カーネルは mul/sub のみ (-fmad=false → PTX は mul.rn/sub.rn/add.rn のみ・fma 縮約なし = Rust スカラー演算と同一の丸め)。検証: ホスト C++ シミュレーション (テーブル生成+適用 vs rope_row の直接計算・非正規/±0/FLT_MAX 含む・8 形状 × 4 theta × 3 pos × 40 試行) で **5,427,840 要素比較が -O0/-O2(-ffp-contract=off) とも全ビット一致**。既存カーネルは旧 PTX とバイト一致 (差分は dno_rope_qk_batch の純追加 104 行に局所)
+- **Rust 側 (`cuda.rs` `batch_rope_qk` 新設)**: q/k デバイスバッファ + [q|k] 連結 pinned ステージング (H2D → カーネル → sync → D2H → sync → ホスト書き戻し)。**失敗時はホスト q/k 不変で false** (D2H 完了後に初めて書き戻す) → 呼び出し側が CPU rope でやり直し (GPU/CPU 混合なし)。テーブルは (poss・dh・theta) 完全一致でキャッシュ (1 ステップの層ループで同一 poss が層数回来るため 2 層目以降は生成 + H2D をスキップ)。形状ガード (b ≤ 65535 = grid.y 上限・dh ≤ 1024 = block 上限・heads+kv_heads ≤ 65535) 非該当は静かに CPU フォールバック
+- **呼び出し箇所 (`llama.rs` `forward_batch`)**: rope ブロック先頭で `batch_rope_qk` を試行 (b==1 が solo chain フォールバックで到達する場合も同様)。成功なら GPU・失敗なら従来の CPU rope。KV 書き込み/attention 以降は無変更 (rope 後の q/k をそのまま使用・attention への q 再 H2D も従来どおり)
+- **PTX**(kernels_elem.ptx): sha256 `364dc15312a58cb4b5ff05c4a9de0f25e688c50e2c00e4a2d6fadf88c9c59be0`。手順: ①変更前ソースの再コンパイルが committed PTX (f196f07e… = B2) と sha256 一致することを先に検証 ②変更後に再生成
+- **テスト**: `cuda_batch_rope_qk_bitexact_vs_cpu` 新設 (cuda feature + #[ignore]・b=1/3/8 × pos0=0/1/7/63 で GPU バッチ rope と CPU session ごと rope_row の全ビット一致・テーブルキャッシュの生成/ヒット両経路を検証)。cargo test --workspace (CPU) 全 green (lib 147 不変) + cargo test --features cuda --no-run green
+- **実機計測は人間対応**: ①`cuda_batch_rope_qk_bitexact_vs_cpu` の実機実行 (--ignored) ②b>1 マルチセッション E2E の PROFILE (`DENNO_PROFILE=1`) で rope フェーズの削減幅確認 ③既存 rope 関連 cuda テストの再実行 (`cuda_rope_qkv_bitexact_vs_cpu` 等)。kernels_elem.ptx 差し替えのため GPU バイナリ再ビルド + サーバー再起動が必要
+
 ### 8095 GPU E2E リグレッション調査 — Qwen3.5-9B の GPU prefill 破綻 (調査記録・2026-10-15)
 
 > A2-green (`9183e7e`) 以降の運用で、GPU サーバの Qwen3.5-9B int8 E2E 出力が破綻するリグレッションを検出(同一 payload の CPU サーバは正常)。第1セッションで再現と切り分け、第2セッションでコード同一性の完全化と CPU 再現検証、第3セッションで drift 注入実験による説明の確定を実施(本節は調査記録・コード変更なし)。
@@ -646,7 +658,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 - [x] ~~**B1: rmsnorm の GPU 化**: P17k プロファイルで残 2.3s(TOTAL ~31%)。P17d 要素演算カーネルの延長・実装容易~~ → **完了 (2026-10-15)**: prefill (n>1) を隠れ状態デバイス常駐チェーン化 — 層あたり 2 回の CPU rmsnorm を dno_add_rmsnorm で GPU 化(residual 加算融合・CPU とビット一致)し「rmsnorm 2.3s が h H2D と直列」を解消。h/proj/down のホスト往復(81MB×4/層)も廃止。実機 E2E 計測は残課題
 - [x] ~~**B2: attn_core の V 累積**: 残 3.51s(最大 op)。dno_attention 拡張(attention は緩和契約済み)~~ → **完了 (2026-10-15)**: `dno_attention_prefill` の probs@V 累積を v hoist + 2 行インターリーブ + float2 荷載に再構築(v 再読み 64 回 → 1 回・acc への FMA 列は kk 昇順で旧実装と完全同一 = **ビット一致**・旧カーネルの acc local spill も解消)。ホスト側無変更。実機計測(`cuda_attn_pf_bench`・E2E PROFILE)と BK 拡大 A/B は残課題
-- [ ] **B3: b>1 バッチの rope GPU 化**(優先度低): バッチ時は同期が隠蔽される
+- [x] ~~**B3: b>1 バッチの rope GPU 化**(優先度低): バッチ時は同期が隠蔽される~~ → **完了 (2026-10-15)**: `forward_batch` の rope を `dno_rope_qk_batch` で GPU 化 (P17h/P17k と同一方式=ホスト生成テーブル + mul/sub のみ・CPU `rope_row` とビット一致・rope は緩和対象外・テーブルキャッシュで層ループの再生成を回避・失敗時はホスト不変で CPU フォールバック)。§3 B3 節参照。実機 E2E 計測は残課題
 - [x] ~~**3B/7Bのb=4実測**~~ → **P17k で実施**(対象は Gemma3n 13,252 tok に変更して完了)
 
 ### 運用・周辺

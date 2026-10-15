@@ -635,3 +635,39 @@ extern "C" __global__ void dno_rope_qkv_pf(float *qkv, float *qout, float *km, f
         vm[(size_t)(pos0 + i) * kv_dim + (size_t)vh * dh + d] = x;
     }
 }
+
+// B3: b>1 バッチ decode 用 rope (q/k in-place・セッションごとに独立した位置)。
+// P17h/P17k の rope カーネルと同一の演算列 (mul/sub のみ・-fmad=false) で、
+// cos/sin はホストが tensor::rope_row と同一式で生成したテーブルを渡す →
+// CPU の session ごと rope_row 適用 (forward_batch) とビット一致
+// (exactness 契約: rope は緩和対象外・bias/QK-Norm は既に呼び出し側が適用済み)。
+// grid = (heads + kv_heads, b), block = (dh), shared なし。
+//   block b < heads : q ヘッド b — q[i, b*dh ..] を rope
+//   heads <= b      : k ヘッド b-heads — k[i, kh*dh ..] を rope
+// q は [b, heads*dh] 行-major・k は [b, kv_dim] 行-major (ともに in-place)。
+// tab は [b, dh] — 行 i が pos=poss[i] の [cos(half) | sin(half)] (half = dh/2)。
+extern "C" __global__ void dno_rope_qk_batch(float *q, float *k, const float *tab,
+                                             int heads, int kv_heads, int dh) {
+    const int half = dh / 2;
+    const int b = blockIdx.x;
+    const int i = blockIdx.y;
+    const int d = threadIdx.x;
+    if (d >= half) return;
+    const float *trow = tab + (size_t)i * dh;
+    const float c = trow[d];
+    const float s = trow[half + d];
+    if (b < heads) {
+        float *dst = q + (size_t)i * heads * dh + (size_t)b * dh;
+        const float x1 = dst[d];
+        const float x2 = dst[half + d];
+        dst[d] = x1 * c - x2 * s;
+        dst[half + d] = x1 * s + x2 * c;
+    } else {
+        const int kh = b - heads;
+        float *dst = k + (size_t)i * kv_heads * dh + (size_t)kh * dh;
+        const float x1 = dst[d];
+        const float x2 = dst[half + d];
+        dst[d] = x1 * c - x2 * s;
+        dst[half + d] = x1 * s + x2 * c;
+    }
+}

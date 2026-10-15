@@ -1147,7 +1147,25 @@ impl Model for LlamaQwen2 {
 
             // RoPE: セッションごとに位置が異なる (cache.len()) ので 1 行ずつ適用。
             // rope_row は rope_rows の 1 行処理と同一演算列 → ビット一致。
+            // B3: b>1 も rope を GPU へ (P17 系 rope カーネルと同一演算列・CPU と
+            // ビット一致・rope は緩和対象外)。失敗時は q/k 不変で false →
+            // 従来の CPU rope でやり直し (混合なし)。
             crate::prof::time_layer(crate::prof::ROPE, li, || {
+                #[cfg(feature = "cuda")]
+                {
+                    let poss: Vec<usize> = (0..b).map(|i| caches[i].len()).collect();
+                    if crate::cuda::batch_rope_qk(
+                        &mut q,
+                        &mut k,
+                        &poss,
+                        heads,
+                        kv_heads,
+                        dh,
+                        self.theta,
+                    ) {
+                        return;
+                    }
+                }
                 for i in 0..b {
                     let pos = caches[i].len();
                     crate::tensor::rope_row(
@@ -1694,6 +1712,59 @@ mod tests {
             assert_eq!(gpu0, cpu0, "rope (no bias) bit-exact pos0={pos0}");
         }
         println!("rope_qkv bit-exact vs CPU OK (pos0=0,1,7,63, with/without bias)");
+    }
+
+    /// B3: dno_rope_qk_batch (b>1 バッチ rope・GPU) が CPU 経路 (forward_batch の
+    /// session ごと rope_row 適用) と**ビット一致**すること。exactness 契約:
+    /// rope は緩和対象外。テーブルキャッシュ (同一 poss で再呼び出し → ヒット経路)
+    /// も同一結果を返すことを確認。
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    #[ignore]
+    fn cuda_batch_rope_qk_bitexact_vs_cpu() {
+        let _g = crate::cuda::test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::cuda::enable_for_tests();
+        use crate::tensor::rope_row;
+        let heads = 4usize;
+        let kv_heads = 2usize;
+        let dh = 4usize;
+        let hd = heads * dh;
+        let kv_dim = kv_heads * dh;
+        let theta = 10_000.0f32;
+        for b in [1usize, 3, 8] {
+            for base_pos in [0usize, 1, 7, 63] {
+                // セッションごとに異なる位置 (forward_batch と同じ構造)
+                let poss: Vec<usize> = (0..b).map(|i| base_pos + i * 3).collect();
+                let q0 = prng(b * hd, 9100 + b as u32);
+                let k0 = prng(b * kv_dim, 9200 + b as u32);
+                // --- CPU リファレンス: session ごとに rope_row ---
+                let mut cpu_q = q0.clone();
+                let mut cpu_k = k0.clone();
+                for (i, &pos) in poss.iter().enumerate() {
+                    rope_row(&mut cpu_q[i * hd..][..hd], heads, dh, pos, theta);
+                    rope_row(&mut cpu_k[i * kv_dim..][..kv_dim], kv_heads, dh, pos, theta);
+                }
+                // --- GPU: バッチ rope (1 回目・テーブル生成経路) ---
+                let mut gq = q0.clone();
+                let mut gk = k0.clone();
+                assert!(
+                    crate::cuda::batch_rope_qk(&mut gq, &mut gk, &poss, heads, kv_heads, dh, theta),
+                    "batch_rope_qk must fire (b={b} base={base_pos})"
+                );
+                assert_eq!(gq, cpu_q, "batch rope q bit-exact b={b} base={base_pos}");
+                assert_eq!(gk, cpu_k, "batch rope k bit-exact b={b} base={base_pos}");
+                // --- 2 回目 (テーブルキャッシュヒット経路) も同一 ---
+                let mut gq2 = q0.clone();
+                let mut gk2 = k0.clone();
+                assert!(
+                    crate::cuda::batch_rope_qk(&mut gq2, &mut gk2, &poss, heads, kv_heads, dh, theta),
+                    "batch_rope_qk (cache hit) must fire (b={b} base={base_pos})"
+                );
+                assert_eq!(gq2, cpu_q, "batch rope q (cache hit) bit-exact b={b} base={base_pos}");
+                assert_eq!(gk2, cpu_k, "batch rope k (cache hit) bit-exact b={b} base={base_pos}");
+            }
+        }
+        println!("batch rope_qk bit-exact vs CPU OK (b=1,3,8・pos0=0,1,7,63・cache gen/hit)");
     }
 
     /// P17h: solo decode chain (bias あり・Qwen2.5 と同構造) が forward_decode_gpu
