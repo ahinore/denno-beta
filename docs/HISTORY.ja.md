@@ -560,6 +560,20 @@ P19-A1 step 3 の残課題 (①長 prefill の更なる高速化 — 単発カ�
 - **テスト**: gdn lib +6 (`chunk_plan` 境界・単一 chunk bit 一致・複数 chunk 緩和一致 maxabs<1e-3/cos>0.999・chunked prefill → 逐次 decode の状態継続・分割不変性・決定論 2 回 bit 一致)・`qwen35_model` に `gdn_gpu_chunked_scan_close_to_cpu` (cuda feature・DENNO_CUDA 未設定で graceful skip・n=5000 で chunked ルート発動・CPU 逐次との緩和一致 + 決定論 2 回 bit 一致)。workspace 全 green (lib 134 passed)
 - **残課題**: 実機 GPU での E2E 計測 (chunked 効果・decode 応答速度) は GPU バイナリ再ビルド+サーバー再起動が必要なため人間対応。
 
+###### A4: prefix cache への GDN 状態スナップショット ✅ (2026-10-15)
+
+A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を使わずフル prefill 固定だった (KV のみコピーでは GDN 状態を復元できず、静かな非決定論の危険があるため)。A4 で **KV + GDN 状態のペア復元**を実装し、マルチターン会話の 2 ターン目以降で prefill を省略できるようになった:
+
+- **GDN 状態スナップショット**: GDN 状態 (conv + SSM) はシーケンス全体の関数なので「トークン位置ごと」には保存できない。**prompt 境界 (prefill 直後・decode 前)** の状態 1 回分だけを KV スナップショットとペアで保存する (`KvCache::gdn_snapshot()` / `gdn_restore()`・bit コピー)
+- **退避タイミングの変更**: 従来は完了時 (`release_session`) に KV を prefix store へ退避していたが、その時点では GDN 状態が生成トークン分進んでいるため使えない。**prefill 直後** (`step_chat` の prefill 分岐) に退避するよう変更し、KV 行は prompt ちょうどの長さで保存する (restore は `n <= prompt.len` に制限されるため生成分の行は復元に使えない)
+- **復元条件 (`best_full_match`)**: 新しい prompt がエントリ prompt 全長を接頭辞として含む場合のみ復元 (状態を持てるのは prompt 境界位置だけ)。部分一致では KV のみの復元も行わず `false` を返して full prefill にフォールバック — **KV だけ復元して再帰状態を不整合にする経路は構造的に存在しない**。同一 prompt 再実行 (prompt 境界の状態からは最終トークンの logits が作れない) も full prefill
+- **eviction 重み**: GDN 状態スナップショットのバイト数を `bytes_per_token` で割ってトークン換算し、KV 予算に計上 (27B では ~150MB/エントリの状態があっても合計メモリが予算内に収まる)。`PrefixCache::new(max_tokens, bytes_per_token)`
+- **live 再利用との優先順位**: recurrent では live truncate が不可能なため、live が純拡張で使える (コピー無しで最良) 場合を除きエントリ復元を優先。非 recurrent は従来どおり「エントリが厳に長い」場合のみエントリを選ぶ
+- **数値契約**: 復元後の継続 forward はフル prefill と **bit 一致** (キャッシュ連続性 forward(a)+forward(b)==forward(a++b) と状態の bit コピーから従う)。CPU 参照・数値経路の変更は一切なし (snapshot/restore は純粋なメモリコピー)
+- **テスト +13**: kv_cache 4 (`gdn_snapshot_restore_roundtrip_is_bit_exact`・restore panic 3 件)・prefix_cache 4 (`best_full_match_requires_full_prefix`・`gdn_state_counts_into_eviction_weight`・`gdn_entry_restores_state_only_at_prompt_boundary`・`insert_snapshot_replaces_gdn_state_on_dedupe`)・engine 3 (`RecurStateModel` — GDN 状態と KV の両方に依存する決定論的ダミーモデルを新設 — によるマルチターン entry 復元 == フル prefill 完全一致・部分一致フォールバック・同一 prompt フォールバック)・qwen35 2 (合成 27B シェイプで snapshot restore 継続が **bit 一致** + Engine 経路のマルチターン一致)。**対照実験**: KV のみ復元 (GDN 状態を復元しない) では出力が変わることを確認 — テストが状態の復元を実際に検証している (teeth-check)
+- **検証**: workspace 全 green (lib 147 passed = 134 + 13・server 7・cli 5・失敗 0)
+- **残課題**: 実機でのマルチターン E2E 計測 (2 ターン目の prefill 省略効果)。27B では状態 ~150MB/エントリのため prefix cache 予算 (既定 32k トークン換算) への影響の実測。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B UD-IQ2_XXS 動作)
@@ -569,7 +583,7 @@ P19-A1 step 3 の残課題 (①長 prefill の更なる高速化 — 単発カ�
 - [x] **A2: Qwen3.5-9B 実 E2E — 完了**(commit `9183e7e`): GDN k-head 規約修正+untied lm_head 修正で garble 解決。fp32 全 32 層 numpy 一致・逐次==バッチ prefill bit 一致・int8 GPU E2E 決定論 md5 一致(連続+再起動)
 - [x] ~~**A3: Qwen3.8-27B スケール**~~ → **完了 (コード/予算面・2026-10-15)**: 64 層 = 48 GDN + 16 full を合成モデルで検証 (決定論・prefill bit 一致契約・untied lm_head)・`output_gate_type: "swish"` は参照実装が不使用のため動作不変・GDN 層の KV バッファ確保廃止で KV 実量 1/4 (512KB → 128KB B/token)・GDN ヘッド比のロード時ガード。実 GGUF での E2E (UD-IQ2_XXS 配置+実機 GPU) は残課題
 - [x] ~~**A2.5: 9B 生成品質の改善(A3 前に推奨)**~~ → **完了**: チャットテンプレートは Qwen3.5 公式準拠を確認(不一致なし)・repetition penalty 実装(HF 互換・決定論・penalty 1.1 で反復解消)。根本の数値原因の切り分け(llama.cpp 同 GGUF 比較)は継続
-- [ ] **A4: prefix cache への GDN 状態スナップショット**(任意): 現在 recurrent モデルはフル prefill 固定(正しさ優先)。マルチターン高速化
+- [x] ~~**A4: prefix cache への GDN 状態スナップショット**(任意): recurrent モデルはフル prefill 固定(正しさ優先)~~ → **完了 (2026-10-15)**: KV + GDN 状態のペア復元 (prompt 境界スナップショット・`best_full_match` のときのみ復元・部分一致と同一 prompt は full prefill フォールバック)。復元後の継続 forward はフル prefill と bit 一致・退避は prefill 直後に変更。実機マルチターン E2E 計測は残課題
 
 ### P17 系残課題(CUDA)
 

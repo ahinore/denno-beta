@@ -299,6 +299,8 @@ impl Engine {
         let cached_prompts = vec![Vec::new(); slots];
         let slot_busy = vec![false; slots];
         let slot_reserved = vec![0usize; slots];
+        // A4: GDN 状態スナップショットをトークン換算するためのスケール
+        let kv_bytes_per_token = caches[0].bytes_per_token();
         Ok(Self {
             model,
             tok,
@@ -308,7 +310,7 @@ impl Engine {
             slot_reserved,
             name: name.into(),
             default_seed,
-            prefix_cache: PrefixCache::new(max_tokens),
+            prefix_cache: PrefixCache::new(max_tokens, kv_bytes_per_token),
             last_prefix_hit: PrefixHit::None,
             quant,
         })
@@ -366,6 +368,8 @@ impl Engine {
         let cached_prompts = vec![Vec::new(); slots];
         let slot_busy = vec![false; slots];
         let slot_reserved = vec![0usize; slots];
+        // A4: GDN 状態スナップショットをトークン換算するためのスケール
+        let kv_bytes_per_token = caches[0].bytes_per_token();
         Self {
             model,
             tok,
@@ -375,7 +379,7 @@ impl Engine {
             slot_reserved,
             name: name.into(),
             default_seed,
-            prefix_cache: PrefixCache::new(max_tokens),
+            prefix_cache: PrefixCache::new(max_tokens, kv_bytes_per_token),
             last_prefix_hit: PrefixHit::None,
             quant: QuantMode::Fp32,
         }
@@ -486,20 +490,29 @@ impl Engine {
         // --- prefix cache 経路選択 (旧 chat() と同一) ---
         let lcp;
         let hit;
-        // 再帰状態を持つモデル (Qwen3.5 GDN) では prefix entry 復元 (KV のみ
-        // コピー) は GDN conv/SSM 状態を復元できないため使わない。
-        // live 再利用も「拡張」(lcp == 現在長・truncate 不要) の場合のみ安全
-        // (truncate すると再帰状態が無効になる)。それ以外はフル prefill。
+        // A4: 再帰状態を持つモデル (Qwen3.5 GDN) も「GDN 状態スナップショット付き
+        // エントリ」からの復元で KV + 状態をペア復元できる。状態はエントリの
+        // prompt 境界 (prefill 直後) でしか取得していないため、新しい prompt が
+        // エントリ prompt 全長を接頭辞として含む場合 (best_full_match) に限り有効。
+        // live 再利用は従来どおり純拡張 (lcp == 現在長) のみで、truncate は不可。
         let recurrent = self.model.is_recurrent();
         let best_entry = if recurrent {
-            None
+            self.prefix_cache
+                .best_full_match(&sess.prompt_ids)
+                .filter(|&(_, l)| l <= cap)
         } else {
             self.prefix_cache
                 .best_match(&sess.prompt_ids)
                 .map(|(i, l)| (i, l.min(cap)))
         };
-        if let Some((idx, entry_lcp)) = best_entry.filter(|&(_, l)| l > best_live_lcp) {
-            // 別セッションのエントリから KV を復元
+        // recurrent では live truncate が不可能なため、live が純拡張で使える
+        // (コピー無しで最良) 場合を除きエントリ復元を優先する。
+        // 非 recurrent は従来どおり「エントリが厳に長い」場合のみエントリを選ぶ。
+        let prefer_entry = recurrent && best_live_lcp != self.caches[slot].len();
+        if let Some((idx, entry_lcp)) =
+            best_entry.filter(|&(_, l)| l > best_live_lcp || prefer_entry)
+        {
+            // 別セッションのエントリから KV (+ GDN 状態) を復元
             let restored = self
                 .prefix_cache
                 .restore_into(idx, entry_lcp, &mut self.caches[slot]);
@@ -507,7 +520,7 @@ impl Engine {
                 lcp = entry_lcp;
                 hit = PrefixHit::Entry;
             } else {
-                // エントリが消えていたなど → フル prefill にフォールバック
+                // 状態を持てない位置での復元要求など → フル prefill にフォールバック
                 self.caches[slot].reset();
                 self.cached_prompts[slot].clear();
                 lcp = 0;
@@ -542,8 +555,10 @@ impl Engine {
     }
 
     /// P6 ステッパ: 完了 (またはエラー) したセッションのスロットを解放する。
-    /// KV スナップショットをマルチエントリ prefix store へ退避してから
-    /// スロットを空きに戻す (旧 install 冒頭の退避と同一の操作)。
+    /// KV スナップショットの prefix store への退避は **prefill 直後**
+    /// (`step_chat` の prefill 分岐・A4) に行われる。GDN 状態はシーケンス全体の
+    /// 関数なので、KV と状態を同じ位置 (prompt 境界) でペア保存する必要があり、
+    /// 生成トークンで状態が進んだ後の release 時点では退避できないため。
     ///
     /// スロットの KV 行データと cached_prompts[slot] は**そのまま残す**。
     /// 次にこのスロットを取得したセッションが同じ接頭辞を持てば
@@ -565,14 +580,6 @@ impl Engine {
         let Some(slot) = sess.slot.take() else { return };
         self.slot_busy[slot] = false;
         self.slot_reserved[slot] = 0;
-        if !self.cached_prompts[slot].is_empty() && !self.caches[slot].is_empty() {
-            let p = self.cached_prompts[slot].clone();
-            if !self.prefix_cache.contains_prompt(&p) {
-                let kv_len = self.caches[slot].len();
-                let (k, v) = self.caches[slot].snapshot(kv_len);
-                self.prefix_cache.insert_snapshot(p, k, v, kv_len);
-            }
-        }
     }
 
     /// P4 ステッパ: リクエスト状態を準備する (トークン化 + max_tokens クランプ +
@@ -676,6 +683,23 @@ impl Engine {
                 self.flush_ops_frame();
             }
             self.cached_prompts[slot] = sess.prompt_ids.clone();
+            // A4: prefill 直後 (prompt 境界) のスナップショットを prefix store へ退避。
+            // GDN 状態はシーケンス全体の関数なので、KV と状態を同じ位置
+            // (cache.len() == prompt 長) でペア保存する。decode 中は状態位置が
+            // 進むため退避しない (release 時点の状態は prompt 境界のものではない)。
+            // KV 行は prompt ちょうどの長さで保存する (restore は n <= prompt.len
+            // に制限されるため生成分の行を保存しても復元に使えない)。
+            debug_assert_eq!(self.caches[slot].len(), sess.prompt_ids.len());
+            {
+                let kv_len = self.caches[slot].len();
+                let gdn = self
+                    .model
+                    .is_recurrent()
+                    .then(|| self.caches[slot].gdn_snapshot());
+                let (k, v) = self.caches[slot].snapshot(kv_len);
+                self.prefix_cache
+                    .insert_snapshot(sess.prompt_ids.clone(), k, v, kv_len, gdn);
+            }
             sess.logits = logits;
             sess.prefill_done = true;
             return Ok(false);
@@ -971,7 +995,7 @@ fn pick_caches<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{dummy_engine, DUMMY_CONTEXT};
+    use crate::testutil::{dummy_engine, recurrent_engine, DUMMY_CONTEXT};
 
     fn params(max_tokens: usize) -> GenParams {
         GenParams {
@@ -1112,6 +1136,93 @@ mod tests {
         // 同一セッション連続は live 経路 (単一エントリ時代と同じ、コピー無し)
         e.chat(None, &msgs("t0"), &params(20), |_| {}).unwrap();
         assert_eq!(e.last_prefix_hit(), PrefixHit::Live);
+    }
+
+    // ===== A4: 再帰モデル (GDN 状態スナップショット) の prefix cache 復元 =====
+
+    /// (role, content) の列からメッセージ列を作る
+    fn msgs_multi(turns: &[(&str, &str)]) -> Vec<ChatMessage> {
+        turns
+            .iter()
+            .map(|(role, content)| ChatMessage {
+                role: (*role).into(),
+                content: (*content).into(),
+            })
+            .collect()
+    }
+
+    /// A4: 再帰モデルのマルチターン会話で、エントリ復元 (KV + GDN 状態の
+    /// ペア復元) 後の出力が「フル prefill の参照エンジン」と完全一致する。
+    /// fallback テンプレートにより turn_{n+1} の prompt は turn_n の prompt を
+    /// トークン列として完全に含む ("user: t0\n\nassistant: <生成>\n\nuser: ...")
+    /// → best_full_match が成立し GDN 状態スナップショットが使われる。
+    /// RecurStateModel は logits が GDN 状態 + KV 両方に依存するため、
+    /// どちらかの復元が欠けると生成列が一致しなくなる。
+    #[test]
+    fn recurrent_entry_restore_matches_full_prefill() {
+        let mut e = recurrent_engine("recur", None).unwrap();
+        let mut ref2 = recurrent_engine("recur-ref2", None).unwrap();
+        let mut ref3 = recurrent_engine("recur-ref3", None).unwrap();
+
+        // turn1: フル prefill (prefill 直後にエントリが作られる)
+        let out1 = e.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
+        assert_eq!(e.prefix_cache_entries(), 1);
+        assert_eq!(e.last_prefix_hit(), PrefixHit::None);
+
+        // turn2: turn1 の prompt を完全に含むマルチターン prompt
+        let m2 = msgs_multi(&[("user", "t0"), ("assistant", &out1.text), ("user", "t15")]);
+        let expect2 = ref2.chat(None, &m2, &params(3), |_| {}).unwrap();
+        let out2 = e.chat(None, &m2, &params(3), |_| {}).unwrap();
+        assert_eq!(
+            e.last_prefix_hit(),
+            PrefixHit::Entry,
+            "GDN 状態スナップショット経由で復元されるべき"
+        );
+        assert_eq!(out2, expect2, "エントリ復元 (KV+GDN 状態) 後の出力がフル prefill と不一致");
+
+        // turn3: turn2 の prompt をさらに完全に含む (スナップショットの連鎖)
+        let m3 = msgs_multi(&[
+            ("user", "t0"),
+            ("assistant", &out1.text),
+            ("user", "t15"),
+            ("assistant", &out2.text),
+            ("user", "t13"),
+        ]);
+        let expect3 = ref3.chat(None, &m3, &params(3), |_| {}).unwrap();
+        let out3 = e.chat(None, &m3, &params(3), |_| {}).unwrap();
+        assert_eq!(e.last_prefix_hit(), PrefixHit::Entry);
+        assert_eq!(out3, expect3, "2 回目のエントリ復元後の出力がフル prefill と不一致");
+    }
+
+    /// A4: 部分一致 (LCP < エントリ prompt 長) の prompt では再帰モデルは
+    /// 状態を復元できず full prefill にフォールバックする
+    /// (KV のみ復元して静かに出力を変える経路は存在しない)。
+    #[test]
+    fn recurrent_partial_prefix_falls_back_to_full_prefill() {
+        let mut e = recurrent_engine("recur", None).unwrap();
+        let mut r = recurrent_engine("recur-ref", None).unwrap();
+        e.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
+        // "t1" は "t0" とトークン接頭辞が UNK 1 個分しか一致しない
+        // → 完全一致エントリ無し → live も拡張でない → full prefill
+        let expect = r.chat(None, &msgs("t1"), &params(3), |_| {}).unwrap();
+        let out = e.chat(None, &msgs("t1"), &params(3), |_| {}).unwrap();
+        assert_eq!(e.last_prefix_hit(), PrefixHit::None);
+        assert_eq!(out, expect);
+    }
+
+    /// A4: 同一 prompt の再実行は状態スナップショットを使えない
+    /// (prompt 境界の状態では最終トークンの logits が作れない) ので full prefill。
+    /// 出力はフル prefill と完全一致する (状態の整合は保たれる)。
+    #[test]
+    fn recurrent_identical_prompt_falls_back_to_full_prefill() {
+        let mut e = recurrent_engine("recur", None).unwrap();
+        let mut r = recurrent_engine("recur-ref", None).unwrap();
+        let out1 = e.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
+        let out2 = e.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
+        let expect = r.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
+        assert_ne!(e.last_prefix_hit(), PrefixHit::Entry);
+        assert_eq!(out2, out1, "同一 prompt 再実行で出力が変わってはならない");
+        assert_eq!(out2, expect);
     }
 
     #[test]

@@ -254,6 +254,103 @@ pub fn quant_dummy_engine(
     Ok(Engine::from_parts(Box::new(QuantMatModel::new(mode)), tok, name, seed))
 }
 
+/// A4: 再帰状態 (GDN スロット) と KV の**両方**に依存する決定論的ダミーモデル。
+///
+/// Qwen3.5 GDN 向け prefix cache 復元 (KV + GDN 状態のペア復元) を engine 経路で
+/// 検証するためのもの。DummyModel は状態を参照せず、KvSensitiveModel は KV のみ
+/// 参照するため、GDN 状態の退避/復元が壊れても logits が変わらず検証にならない。
+/// このモデルは:
+/// - GDN スロット (層 0: conv 2 / ssm 1) を持ち、トークンごとに `s ← s + t/8`、
+///   `conv ← [直前トークン, t]` と更新する (状態はシーケンス全体の関数 —
+///   収縮しないので、状態の欠落がスコア差として**減衰せず残り**、argmax が
+///   必ずずれる: 差 Δs = Σt_prompt/8 に対し score 差 = Δs × 41 × 7 ≡ 一定 mod 16)
+/// - KV 行も KvSensitiveModel 同様 (トークン + 位置に依存する決定論的値) に書く
+/// - logits の argmax を「GDN 状態と KV 全行の加重和の合成スコア」から決める
+///
+/// → GDN 状態の復元が欠けると greedy 列の**先頭トークンから**変わり、
+///   KV 復元が欠けると以降のステップで変わるため、ペア復元の検証に使える。
+pub struct RecurStateModel;
+
+impl Model for RecurStateModel {
+    fn context(&self) -> usize {
+        DUMMY_CONTEXT
+    }
+
+    fn eos_ids(&self) -> &[u32] {
+        &[DUMMY_EOS]
+    }
+
+    fn is_recurrent(&self) -> bool {
+        true
+    }
+
+    fn forward(&mut self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>> {
+        let pos = cache.len();
+        let kv_dim = cache.kv_dim();
+        for (i, &t) in tokens.iter().enumerate() {
+            let p = pos + i;
+            // KV 行を書く (層 0 = KV 層・KvSensitiveModel と同じ決定論的値)
+            {
+                let (k, v) = cache.kv_bufs(0, tokens.len());
+                for d in 0..kv_dim {
+                    k[p * kv_dim + d] = KvSensitiveModel::kv_k(t, p, d, kv_dim);
+                    v[p * kv_dim + d] = KvSensitiveModel::kv_v(t, p, d, kv_dim);
+                }
+            }
+            // GDN 状態を更新 (層 1 = GDN 層・t に依存する決定論的遷移・
+            // 非収縮なので過去トークンの寄与が状態差として残り続ける)
+            {
+                let (conv, ssm) = cache.gdn_state_mut(1).expect("GDN スロット未初期化");
+                let prev = conv[1];
+                ssm[0] += t as f32 * 0.125;
+                conv.copy_from_slice(&[prev, t as f32]);
+            }
+        }
+        cache.advance(tokens.len());
+        // logits: GDN 状態 (s・conv) と KV 全行の加重和の合成スコアから決める。
+        // 状態依存を強くするため s に大きい係数を掛け、状態が違えば argmax が
+        // 最初のステップで変わるようにする。
+        let (s, conv_last);
+        {
+            let (conv, ssm) = cache.gdn_state_mut(1).expect("GDN スロット未初期化");
+            s = ssm[0];
+            conv_last = conv[1];
+        }
+        let len = cache.len();
+        let kv_acc;
+        {
+            let (k, _) = cache.kv_bufs_ref(0);
+            let mut a = 0.0f32;
+            for p in 0..len {
+                for d in 0..kv_dim {
+                    a += k[p * kv_dim + d] * ((p % 4 + 1) as f32);
+                }
+            }
+            kv_acc = a;
+        }
+        let score = s * 41.0 + conv_last * 3.0 + kv_acc;
+        let mut logits = vec![0.0f32; DUMMY_VOCAB];
+        let peak = ((score * 7.0).round() as i64).rem_euclid(DUMMY_VOCAB as i64) as usize;
+        let second = ((score * 5.0 + 3.0).round() as i64).rem_euclid(DUMMY_VOCAB as i64) as usize;
+        logits[peak] = 5.0;
+        logits[second] = 1.0;
+        Ok(logits)
+    }
+
+    fn new_cache(&self) -> KvCache {
+        // 層 0 = KV 層・層 1 = GDN 層 (conv 2 / ssm 1)
+        let mut c = KvCache::new(2, 4, DUMMY_CONTEXT);
+        c.attach_gdn_slot(1, 2, 1);
+        c
+    }
+}
+
+/// RecurStateModel (状態依存ダミー) で Engine を構築する
+pub fn recurrent_engine(name: &str, seed: Option<u64>) -> Result<Engine> {
+    let tok = dummy_tokenizer()?;
+    Ok(Engine::from_parts(Box::new(RecurStateModel), tok, name, seed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

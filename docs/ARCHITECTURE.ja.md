@@ -92,8 +92,8 @@ flowchart TB
     SUB -->|"キュー満杯"| E503
     SUB --> W["ワーカー(単一スレッド)"]
     W --> ADMIT[admit: begin_chat<br/>chat template / max_tokens クランプ]
-    ADMIT --> PC{prefix cache<br/>LCP 最大エントリ?}
-    PC -->|"ヒット"| TR[truncate して KV 再利用<br/>recompute は差分のみ]
+    ADMIT --> PC{prefix cache<br/>LCP 最大エントリ?<br/>(recurrent は prompt 全長一致のみ)}
+    PC -->|"ヒット"| TR["KV 再利用 (truncate)・recompute は差分のみ<br/>recurrent は KV+GDN 状態をペア復元 (truncate 不可)"]
     PC -->|"ミス"| PF["全 prompt を prefill<br/>(重み × 入力の GEMM)"]
     TR --> LIVE[live セッション]
     PF --> LIVE
@@ -239,7 +239,7 @@ flowchart TB
     PF --> DEC["step_chat_batch:<br/>全常駐セッションのサンプル+終了判定を個別に、<br/>forwardは 1回の forward_batch にまとめる"]
     DEC --> DONE{"全員完了?"}
     DONE -->|いいえ| W
-    DONE -->|完了セッションあり| REL["release_session:<br/>prefix storeへ退避(重複はスキップ)<br/>KV行とcached_promptsは残置<br/>→ 次セッションがゼロコピーlive再利用"]
+    DONE -->|完了セッションあり| REL["release_session:<br/>スロット解放(prefix storeへのKV退避は<br/>prefill 直後に実施済み・A4)<br/>KV行とcached_promptsは残置<br/>→ 次セッションがゼロコピーlive再利用"]
     REL --> W
 ```
 
@@ -631,9 +631,10 @@ GDN は状態が「トークン位置ごと」ではなく**シーケンス全�
 
 - KvCache に **GDN スロット**(`gdn: Vec<Option<(conv_buf, ssm_matrix)>>`・層ごと)を追加。`attach_gdn_slot` で確保・`reset()` でゼロクリア
 - `Model::is_recurrent()`(既定 false・qwen35 のみ true)を新設。recurrent モデルでは:
-  - **prefix cache entry の復元(KV のみコピー)は不使用** — GDN 状態を復元できない
+  - **prefix cache entry の復元は「KV + GDN 状態のペア復元」で可能 (A4)** — エントリには **prompt 境界(prefill 直後・decode 前)** の GDN 状態スナップショットを KV とペアで保存する(`KvCache::gdn_snapshot()`/`gdn_restore()`・bit コピー)。状態はシーケンス全体の関数なので 1 つの位置でしか有効でなく、復元は「新しい prompt がエントリ prompt 全長を接頭辞として含む」(`best_full_match`)ときのみ。部分一致では KV のみの復元も行わず full prefill にフォールバックするため、**KV だけ復元して再帰状態を不整合にする経路は構造的に存在しない**
   - KV の live 再利用(truncate)は**純拡張(lcp == 現在長)のときのみ**安全。途中まで truncate すると GDN 状態が無効になるためフル prefill に落ちる
-  - この制約を無視すると**同一 seed でも出力が変わる非決定論**になる(P19 で実測して修正済み)
+  - エントリへの退避タイミングは **prefill 直後**(engine の `step_chat` prefill 分岐)。完了時(`release_session`)には生成トークンで状態が進んでいるため退避できない。GDN 状態のバイト数は `bytes_per_token` でトークン換算し、prefix cache の LRU 予算に計上する(A4)
+  - この制約を無視すると**同一 seed でも出力が変わる非決定論**になる(P19 で実測して修正済み)。A4 の復元経路は「復元後の継続 forward がフル prefill と bit 一致」をテストで担保する(qwen35 合成 27B シェイプ + engine テスト。対照実験として KV のみ復元だと出力が変わることも確認)
 
 ### 12.5 決定論・exactness 契約(P19 分)
 
