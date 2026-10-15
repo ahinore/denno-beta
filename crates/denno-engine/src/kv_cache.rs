@@ -7,6 +7,12 @@
 //! 使用済みの連続バッファ」のままだので、attention を含む数値経路は
 //! 旧実装と完全に同一 (ビット一致)。成長時の realloc コピーは既に
 //! 書き済みの行を保存する (倍々なので償却 O(1))。
+//!
+//! A3 (Qwen3.8-27B スケール): GDN 状態スロットを持つ層 (Qwen3.5 の
+//! linear_attention 層) は KV を書かないため、バッファ確保・
+//! bytes_per_token・snapshot 対象から除外する。27B (64 層 = 48 GDN +
+//! 16 full) では KV 実量が 1/4 になる (512KB→128KB B/token)。GDN スロット
+//! の無いモデル (llama / gpt2) は従来動作のまま。
 
 pub struct KvCache {
     n_layers: usize,
@@ -99,8 +105,15 @@ impl KvCache {
 
     /// トークンあたりの KV メモリ (K + V、f32)。静的な値
     /// (レイアウトは先頭 len 行使用の連続バッファで不変)。
+    /// GDN スロット層は KV を使わないため対象外 (A3)。
     pub fn bytes_per_token(&self) -> usize {
-        self.n_layers * self.kv_dim * 2 * std::mem::size_of::<f32>()
+        let kv_layers = self
+            .k
+            .iter()
+            .zip(self.gdn.iter())
+            .filter(|(_, g)| g.is_none())
+            .count();
+        kv_layers * self.kv_dim * 2 * std::mem::size_of::<f32>()
     }
 
     /// 全層のバッファを need トークン分まで成長させる (倍々・上限 max_len)。
@@ -116,7 +129,19 @@ impl KvCache {
         }
         let new_cap = self.max_len.min(need.max(self.cap.saturating_mul(2)));
         let elems = new_cap * self.kv_dim;
-        for buf in self.k.iter_mut().chain(self.v.iter_mut()) {
+        // GDN スロット層は KV を書かないので確保しない (A3)。空 Vec のまま →
+        // kv_bufs/kv_bufs_ref が GDN 層で呼ばれないのは呼び出し側契約
+        // (qwen35.rs は full_attention 層にのみ書く)。
+        for (buf, g) in self.k.iter_mut().zip(self.gdn.iter()) {
+            if g.is_some() {
+                continue;
+            }
+            buf.resize(elems, 0.0);
+        }
+        for (buf, g) in self.v.iter_mut().zip(self.gdn.iter()) {
+            if g.is_some() {
+                continue;
+            }
             buf.resize(elems, 0.0);
         }
         self.cap = new_cap;
@@ -172,8 +197,31 @@ impl KvCache {
     pub fn snapshot(&self, n: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
         assert!(n <= self.len, "KV cache snapshot: {n} > {}", self.len);
         let take = n * self.kv_dim;
-        let k = self.k.iter().map(|buf| buf[..take].to_vec()).collect();
-        let v = self.v.iter().map(|buf| buf[..take].to_vec()).collect();
+        // GDN スロット層は空ベクタ (KV 非保持)。restore 側も空なら skip する。
+        let k = self
+            .k
+            .iter()
+            .zip(self.gdn.iter())
+            .map(|(buf, g)| {
+                if g.is_some() {
+                    Vec::new()
+                } else {
+                    buf[..take].to_vec()
+                }
+            })
+            .collect();
+        let v = self
+            .v
+            .iter()
+            .zip(self.gdn.iter())
+            .map(|(buf, g)| {
+                if g.is_some() {
+                    Vec::new()
+                } else {
+                    buf[..take].to_vec()
+                }
+            })
+            .collect();
         (k, v)
     }
 
@@ -186,11 +234,25 @@ impl KvCache {
         assert_eq!(v.len(), self.v.len(), "KV cache restore: layer count mismatch");
         self.ensure(n);
         let take = n * self.kv_dim;
-        for (dst, src) in self.k.iter_mut().zip(k.iter()) {
+        for (i, (dst, src)) in self.k.iter_mut().zip(k.iter()).enumerate() {
+            if src.is_empty() {
+                assert!(
+                    self.gdn[i].is_some(),
+                    "KV cache restore: 空スナップショット層は GDN 層のみ (layer {i})"
+                );
+                continue;
+            }
             assert!(src.len() >= take, "KV cache restore: snapshot too short");
             dst[..take].copy_from_slice(&src[..take]);
         }
-        for (dst, src) in self.v.iter_mut().zip(v.iter()) {
+        for (i, (dst, src)) in self.v.iter_mut().zip(v.iter()).enumerate() {
+            if src.is_empty() {
+                assert!(
+                    self.gdn[i].is_some(),
+                    "KV cache restore: 空スナップショット層は GDN 層のみ (layer {i})"
+                );
+                continue;
+            }
             assert!(src.len() >= take, "KV cache restore: snapshot too short");
             dst[..take].copy_from_slice(&src[..take]);
         }
@@ -431,5 +493,45 @@ mod tests {
         let k = vec![vec![0.0; 2]; 1];
         let v = vec![vec![0.0; 2]; 1];
         dst.restore(&k, &v, 1);
+    }
+
+    /// A3: GDN スロット層は KV バッファ確保・bytes_per_token・snapshot/restore
+    /// の対象外になる (Qwen3.5 の 48 GDN + 16 full で KV 実量 1/4)。
+    #[test]
+    fn gdn_slot_layers_are_excluded_from_kv() {
+        let mut c = KvCache::new(4, 2, 16);
+        c.attach_gdn_slot(0, 3, 5);
+        c.attach_gdn_slot(2, 3, 5);
+        // bytes_per_token: KV 層 2 のみ (GDN 層 2 つは除外)
+        assert_eq!(c.bytes_per_token(), 2 * 2 * 2 * 4);
+        // 書き込みは GDN でない層経由 (kv_bufs(0,..) は成長トリガとしてだけ使う)
+        {
+            let (k, _) = c.kv_bufs(1, 2);
+            k[0..4].copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        }
+        c.advance(2);
+        assert_eq!(c.capacity(), 2);
+        // GDN 層のバッファは空のまま (未確保)
+        assert!(c.kv_bufs_ref(0).0.is_empty());
+        assert!(c.kv_bufs_ref(2).1.is_empty());
+        // KV 層は確保されている
+        assert_eq!(c.kv_bufs_ref(1).0.len(), 2 * 2);
+        // snapshot: GDN 層は空・KV 層は実データ
+        let (sk, sv) = c.snapshot(2);
+        assert!(sk[0].is_empty() && sk[2].is_empty());
+        assert!(sv[0].is_empty() && sv[2].is_empty());
+        assert_eq!(sk[1], vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(sk[3].len(), 4);
+        // restore: GDN 層は skip・KV 層は復元される
+        let mut d = KvCache::new(4, 2, 16);
+        d.attach_gdn_slot(0, 3, 5);
+        d.attach_gdn_slot(2, 3, 5);
+        d.restore(&sk, &sv, 2);
+        assert_eq!(d.len(), 2);
+        assert_eq!(d.kv_bufs_ref(1).0[0..4], [1.0, 2.0, 3.0, 4.0]);
+        assert!(d.kv_bufs_ref(0).0.is_empty());
+        // GDN スロットの無いキャッシュは従来動作 (全層が対象)
+        let mut plain = KvCache::new(2, 2, 8);
+        assert_eq!(plain.bytes_per_token(), 2 * 2 * 2 * 4);
     }
 }
