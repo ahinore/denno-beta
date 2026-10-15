@@ -184,6 +184,31 @@ impl Qwen35 {
             d_conv: cfg_u64(tc, "linear_conv_kernel_dim")? as usize,
             eps,
         };
+        // A3: repeat_interleave 規約 (gdn.rs: v-head h → k-head h*nk/nv) は
+        // n_v_heads が n_k_heads の整数倍であることを要求する (0.8B 1x・9B 2x・
+        // 27B 3x)。割り切れない構成は静かに誤マップするためロード時に拒否する。
+        if gdn_p.n_v_heads % gdn_p.n_k_heads != 0 {
+            bail!(
+                "linear_num_value_heads ({}) が linear_num_key_heads ({}) の整数倍ではありません (GDN k-head repeat_interleave 規約)",
+                gdn_p.n_v_heads,
+                gdn_p.n_k_heads
+            );
+        }
+
+        // Qwen3.8-27B config に新設されたキー (値 "swish")。参照実装
+        // (transformers / vLLM / llama.cpp) はどこも消費しておらず、full
+        // attention 出力ゲートは sigmoid・GDN z ゲートは silu (=swish) が正。
+        // 本実装も同一のため動作は不変だが、参照実装が将来これを消費した場合に
+        // 備えて存在をログに残す (実機 E2E で出力品質を確認する)。
+        match tc.get("output_gate_type").and_then(|v| v.as_str()) {
+            Some("swish") => tracing::info!(
+                "output_gate_type=swish (full-attn 出力ゲート sigmoid / GDN z ゲート silu の参照規約を採用・動作不変)"
+            ),
+            Some(other) => tracing::warn!(
+                "output_gate_type={other} は未対応 (swish のみ想定)。参照実装が消費する場合は出力が乖離する可能性"
+            ),
+            None => {}
+        }
 
         let mut eos_ids = Vec::new();
         match &tc["eos_token_id"] {
@@ -310,6 +335,18 @@ impl Qwen35 {
             Some(_) => dt("output_norm.weight")?,
             None => dt("model.norm.weight")?,
         };
+
+        // A3: 層構成の可観測性 (27B = 48 GDN + 16 full を起動ログで確認できる)
+        let n_gdn = layers
+            .iter()
+            .filter(|l| matches!(l.attn, AttnKind::Gdn(_)))
+            .count();
+        tracing::info!(
+            "qwen35 layers: {} ({} GDN + {} full_attention)",
+            layers.len(),
+            n_gdn,
+            layers.len() - n_gdn
+        );
 
         if quant == QuantMode::Int8 {
             let qb = quant_bytes.get();
@@ -788,5 +825,352 @@ impl Qwen35 {
         let logits = self.logits(&hf);
         cache.advance(n);
         Ok(logits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! A3 (Qwen3.8-27B スケール): 実 GGUF が配置されていない環境でも 27B と
+    //! 同一構造 (64 層 = 48 GDN + 16 full・nv=3*nk・untied lm_head・VLM ラッパ
+    //! config) のモデルをテスト内で合成し、ローダ → forward → KV 予算までを
+    //! 検証する。実 GGUF の dequant (UD-IQ2_XXS 混合量子等) は既存の
+    //! dequant_ref.rs / qwen35_model.rs (ignored・実モデル) が担保する。
+
+    use super::*;
+    use std::path::PathBuf;
+
+    // ---- 合成 27B シェイプ (実 27B の構造比を保持した小型 dims) ----
+    const E: usize = 96; // hidden (実 5120)
+    const HEADS: usize = 6; // full attention q heads (実 24)
+    const KVH: usize = 2; // full attention kv heads (実 4)
+    const DH: usize = 16; // head_dim (実 256)
+    const FF: usize = 128; // intermediate (実 17408)
+    const VOCAB: usize = 128; // (実 248320)
+    const NL: usize = 64; // 64 層 = 48 GDN + 16 full (interval 4)
+    const NK: usize = 2; // linear_num_key_heads (実 16)
+    const NV: usize = 6; // linear_num_value_heads (実 48 = 3x)
+    const DK: usize = 8; // linear_key_head_dim (実 128)
+    const DV: usize = 8; // linear_value_head_dim (実 128)
+    const DCONV: usize = 4; // linear_conv_kernel_dim
+
+    const KD: usize = NK * DK; // 16
+    const VD: usize = NV * DV; // 48
+    const QKVD: usize = 2 * KD + VD; // 80
+    const KVDIM: usize = KVH * DH; // 32
+    const QTOT: usize = HEADS * DH * 2; // 192 (q|gate 融合)
+
+    fn lcg_next(s: &mut u32) -> f32 {
+        *s = s.wrapping_mul(1103515245).wrapping_add(12345);
+        (((*s >> 16) & 0xff) as f32 / 255.0 - 0.5) * 0.16
+    }
+
+    fn wr_u32(v: &mut Vec<u8>, x: u32) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    fn wr_u64(v: &mut Vec<u8>, x: u64) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    fn wr_str(v: &mut Vec<u8>, s: &str) {
+        wr_u64(v, s.len() as u64);
+        v.extend_from_slice(s.as_bytes());
+    }
+
+    /// F32 テンソルのみの最小 GGUF v3 ライタ (テスト専用)。
+    /// ne は GGUF 順 (ne[0] = 最速次元 = in_features)。
+    fn write_gguf_f32(path: &PathBuf, tensors: &[(String, Vec<u64>, Vec<f32>)]) {
+        const ALIGN: usize = 32;
+        let mut b = Vec::new();
+        wr_u32(&mut b, 0x4655_4747); // magic "GGUF"
+        wr_u32(&mut b, 3); // version
+        wr_u64(&mut b, tensors.len() as u64);
+        wr_u64(&mut b, 1); // metadata kv count
+        wr_str(&mut b, "general.architecture");
+        wr_u32(&mut b, 8); // GT_STRING
+        wr_str(&mut b, "qwen3_5");
+        let mut off = 0u64;
+        let mut data = Vec::new();
+        for (name, ne, vals) in tensors {
+            wr_str(&mut b, name);
+            wr_u32(&mut b, ne.len() as u32);
+            for d in ne {
+                wr_u64(&mut b, *d);
+            }
+            wr_u32(&mut b, 0); // GGML_F32
+            let pad = (ALIGN - (off as usize % ALIGN)) % ALIGN;
+            if pad != 0 {
+                off += pad as u64;
+                data.extend(std::iter::repeat(0u8).take(pad));
+            }
+            wr_u64(&mut b, off);
+            for v in vals {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+            off += (vals.len() * 4) as u64;
+        }
+        while b.len() % ALIGN != 0 {
+            b.push(0);
+        }
+        b.extend_from_slice(&data);
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// 27B シェイプの合成モデルディレクトリ (config.json + model.gguf) を作る。
+    /// `wrapper` = VLM ラッパ形式 (text_config、9B/27B と同形) / false = 平文 config。
+    fn build_dir(name: &str, wrapper: bool, nk: usize, nv: usize) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("denno_a3_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let kd = nk * DK;
+        let vd = nv * DV;
+        let qkvd = 2 * kd + vd;
+        let mut st = 0x12_34_56_78u32;
+        // 全ての乱数生成をこのクロージャに集約 (st への直接アクセスは競合するため)
+        let mut w = |n: usize| -> Vec<f32> { (0..n).map(|_| lcg_next(&mut st)).collect() };
+        let mut ts: Vec<(String, Vec<u64>, Vec<f32>)> = Vec::new();
+        ts.push(("token_embd.weight".into(), vec![E as u64, VOCAB as u64], w(VOCAB * E)));
+        ts.push(("output.weight".into(), vec![E as u64, VOCAB as u64], w(VOCAB * E)));
+        ts.push(("output_norm.weight".into(), vec![E as u64], vec![1.0; E]));
+        for i in 0..NL {
+            let p = format!("blk.{i}.");
+            let is_gdn = i % 4 != 3;
+            ts.push((format!("{p}attn_norm.weight"), vec![E as u64], vec![1.0; E]));
+            ts.push((format!("{p}post_attention_norm.weight"), vec![E as u64], vec![1.0; E]));
+            ts.push((format!("{p}ffn_gate.weight"), vec![E as u64, FF as u64], w(FF * E)));
+            ts.push((format!("{p}ffn_up.weight"), vec![E as u64, FF as u64], w(FF * E)));
+            ts.push((format!("{p}ffn_down.weight"), vec![FF as u64, E as u64], w(E * FF)));
+            if is_gdn {
+                ts.push((format!("{p}attn_qkv.weight"), vec![E as u64, qkvd as u64], w(qkvd * E)));
+                ts.push((format!("{p}attn_gate.weight"), vec![E as u64, vd as u64], w(vd * E)));
+                ts.push((format!("{p}ssm_beta.weight"), vec![E as u64, nv as u64], w(nv * E)));
+                ts.push((format!("{p}ssm_alpha.weight"), vec![E as u64, nv as u64], w(nv * E)));
+                ts.push((
+                    format!("{p}ssm_conv1d.weight"),
+                    vec![DCONV as u64, qkvd as u64],
+                    w(qkvd * DCONV),
+                ));
+                // ssm_a は負値 (-exp(A_log))・ssm_norm はゲート重み (~1)
+                let a: Vec<f32> = w(nv).iter().map(|v| -(0.5 + v.abs())).collect();
+                ts.push((format!("{p}ssm_a"), vec![nv as u64], a));
+                ts.push((format!("{p}ssm_dt.bias"), vec![nv as u64], w(nv)));
+                ts.push((format!("{p}ssm_norm.weight"), vec![DV as u64], vec![1.0; DV]));
+                ts.push((format!("{p}ssm_out.weight"), vec![vd as u64, E as u64], w(E * vd)));
+            } else {
+                ts.push((format!("{p}attn_q.weight"), vec![E as u64, QTOT as u64], w(QTOT * E)));
+                ts.push((format!("{p}attn_k.weight"), vec![E as u64, KVDIM as u64], w(KVDIM * E)));
+                ts.push((format!("{p}attn_v.weight"), vec![E as u64, KVDIM as u64], w(KVDIM * E)));
+                ts.push((format!("{p}attn_q_norm.weight"), vec![DH as u64], vec![1.0; DH]));
+                ts.push((format!("{p}attn_k_norm.weight"), vec![DH as u64], vec![1.0; DH]));
+                ts.push((
+                    format!("{p}attn_output.weight"),
+                    vec![(HEADS * DH) as u64, E as u64],
+                    w(E * HEADS * DH),
+                ));
+            }
+        }
+        write_gguf_f32(&dir.join("model.gguf"), &ts);
+
+        let layer_types: Vec<&str> = (0..NL)
+            .map(|i| if i % 4 == 3 { "full_attention" } else { "linear_attention" })
+            .collect();
+        let tc = serde_json::json!({
+            "attention_bias": false,
+            "attn_output_gate": true,
+            "dtype": "bfloat16",
+            "eos_token_id": 151643,
+            "full_attention_interval": 4,
+            "head_dim": DH,
+            "hidden_act": "silu",
+            "hidden_size": E,
+            "intermediate_size": FF,
+            "layer_types": layer_types,
+            "linear_conv_kernel_dim": DCONV,
+            "linear_key_head_dim": DK,
+            "linear_num_key_heads": nk,
+            "linear_num_value_heads": nv,
+            "linear_value_head_dim": DV,
+            "max_position_embeddings": 512,
+            "mtp_num_hidden_layers": 1,
+            "num_attention_heads": HEADS,
+            "num_hidden_layers": NL,
+            "num_key_value_heads": KVH,
+            "output_gate_type": "swish",
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {
+                "mrope_interleaved": true,
+                "mrope_section": [2, 1, 1],
+                "rope_theta": 10000,
+                "partial_rotary_factor": 0.25
+            },
+            "vocab_size": VOCAB
+        });
+        let cfg = if wrapper {
+            serde_json::json!({
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "text_config": tc,
+                "tie_word_embeddings": false,
+                "vision_config": {"model_type": "qwen3_5", "hidden_size": 64}
+            })
+        } else {
+            let mut c = tc.clone();
+            c["model_type"] = serde_json::json!("qwen3_5");
+            c["tie_word_embeddings"] = serde_json::json!(false);
+            c["architectures"] = serde_json::json!(["Qwen3_5ForCausalLM"]);
+            c
+        };
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    fn load_int8(dir: &PathBuf) -> Qwen35 {
+        let cfg: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap())
+                .unwrap();
+        Qwen35::load(dir, &cfg, QuantMode::Int8).expect("合成 27B モデルのロードに失敗")
+    }
+
+    /// 構造検証: 64 層 = 48 GDN + 16 full・untied lm_head・int8 再量子化・
+    /// KV 予算 (GDN 層を除外した bytes_per_token)。
+    #[test]
+    fn qwen38_27b_shape_structure_and_kv_budget() {
+        let dir = build_dir("struct", true, NK, NV);
+        let m = load_int8(&dir);
+        assert_eq!(m.layers.len(), NL);
+        let n_gdn = m.layers.iter().filter(|l| matches!(l.attn, AttnKind::Gdn(_))).count();
+        assert_eq!(n_gdn, 48, "GDN 層数");
+        assert_eq!(m.layers.len() - n_gdn, 16, "full attention 層数");
+        assert_eq!((m.gdn_p.n_k_heads, m.gdn_p.n_v_heads, m.gdn_p.head_k_dim), (NK, NV, DK));
+        assert_eq!((m.e, m.heads, m.kv_heads, m.dh, m.ff, m.vocab), (E, HEADS, KVH, DH, FF, VOCAB));
+        assert!(m.lm_head.is_some(), "untied lm_head (27B は output.weight を持つ)");
+        assert!(m.quant_bytes > 0, "int8 再量子化経路");
+        // KV 予算: KV を使うのは full attention 16 層のみ
+        let c = m.new_cache();
+        assert_eq!(c.n_layers(), NL);
+        assert_eq!(c.bytes_per_token(), 16 * KVDIM * 2 * 4, "KV 層のみで計量 (A3)");
+        assert_eq!(c.max_len(), 512);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// forward: 有限 logits・決定論 (連続 2 回 bit 一致)・キャッシュ連続性
+    /// (3+1 == 4 bit 一致)・decode 継続。
+    #[test]
+    fn qwen38_27b_shape_forward_determinism_and_continuity() {
+        let dir = build_dir("fwd", true, NK, NV);
+        let mut m = load_int8(&dir);
+        let toks: Vec<u32> = [7u32, 33, 100, 64].to_vec();
+
+        let mut c1 = m.new_cache();
+        let l1 = m.forward(&toks, &mut c1).unwrap();
+        assert_eq!(l1.len(), VOCAB);
+        assert!(l1.iter().all(|v| v.is_finite()));
+
+        let mut c2 = m.new_cache();
+        let l2 = m.forward(&toks, &mut c2).unwrap();
+        assert_eq!(bits(&l1), bits(&l2), "決定論違反");
+
+        // キャッシュ連続性: 3+1 == 4 (bit 一致)
+        let mut c3 = m.new_cache();
+        let _ = m.forward(&toks[..3], &mut c3).unwrap();
+        let l3 = m.forward(&[toks[3]], &mut c3).unwrap();
+        let mut c4 = m.new_cache();
+        let l4 = m.forward(&toks[..4], &mut c4).unwrap();
+        assert_eq!(bits(&l3), bits(&l4), "キャッシュ連続性違反 (3+1 != 4)");
+
+        // decode 継続
+        let mut c5 = m.new_cache();
+        let _ = m.forward(&toks[..3], &mut c5).unwrap();
+        for t in &toks[3..] {
+            let l = m.forward(&[*t], &mut c5).unwrap();
+            assert!(l.iter().all(|v| v.is_finite()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A1 契約の 27B シェイプ再確認: バッチ prefill (n>1) がトークン逐次と
+    /// bit-exact (i32 累積の順序不変 + F32 は apply_bt_rows の順序保存)。
+    #[test]
+    fn qwen38_27b_shape_prefill_batch_bit_exact() {
+        let dir = build_dir("prefill", true, NK, NV);
+        let mut m = load_int8(&dir);
+        let toks: Vec<u32> = [5u32, 41, 97, 12, 78].to_vec();
+
+        // バッチ prefill → 続き 1 トークン
+        let mut cb = m.new_cache();
+        let lb1 = m.forward(&toks, &mut cb).unwrap();
+        let lb2 = m.forward(&[9u32], &mut cb).unwrap();
+
+        // トークン逐次
+        let mut cs = m.new_cache();
+        let mut ls = Vec::new();
+        for t in &toks {
+            ls.push(m.forward(&[*t], &mut cs).unwrap());
+        }
+        let ls2 = m.forward(&[9u32], &mut cs).unwrap();
+
+        assert_eq!(bits(&lb1), bits(ls.last().unwrap()), "prefill batch != tokenwise");
+        assert_eq!(bits(&lb2), bits(&ls2), "prefill 後の decode が不一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// int8 再量子化が fp32 と相関のある出力になること ( cosine > 0.8・両者有限)。
+    /// 完全ランダム (未学習) の重みでは int8 のテンソルごとの丸め誤差が 64 層で
+    /// 累積するため、閾値は 0.8 に留める (実モデルでの品質は qwen35_int8_probe.rs
+    /// の実機 E2E が担保)。
+    #[test]
+    fn qwen38_27b_shape_int8_vs_fp32_close() {
+        let dir = build_dir("quant", true, NK, NV);
+        let cfg: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap()).unwrap();
+        let mut m32 = Qwen35::load(&dir, &cfg, QuantMode::Fp32).unwrap();
+        let mut mi8 = load_int8(&dir);
+        let toks: Vec<u32> = [7u32, 33, 100, 64].to_vec();
+        let l32 = m32.forward(&toks, &mut m32.new_cache()).unwrap();
+        let li8 = mi8.forward(&toks, &mut mi8.new_cache()).unwrap();
+        assert!(l32.iter().all(|v| v.is_finite()) && li8.iter().all(|v| v.is_finite()));
+        let dot: f32 = l32.iter().zip(li8.iter()).map(|(a, b)| a * b).sum();
+        let n32: f32 = l32.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let n8: f32 = li8.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let cos = dot / (n32 * n8);
+        assert!(cos > 0.8, "int8 と fp32 の logits cosine が低い: {cos}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 平文 config (text_config ラッパ無し) もロードできる (27B がラッパ無しで
+    /// 提供された場合の保険。実 27B はラッパ形式を想定)。
+    #[test]
+    fn qwen38_27b_shape_plain_config_loads() {
+        let dir = build_dir("plain", false, NK, NV);
+        let mut m = load_int8(&dir);
+        let mut c = m.new_cache();
+        let l = m.forward(&[3u32, 50, 11], &mut c).unwrap();
+        assert!(l.iter().all(|v| v.is_finite()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GDN ヘッド比が整数倍でない構成はロード時に明確なエラーで拒否される
+    /// (静かに誤マップしないための A3 ガード)。
+    #[test]
+    fn gdn_head_ratio_must_divide() {
+        let dir = build_dir("ratio", true, 4, 6); // 6 % 4 != 0
+        let cfg: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap()).unwrap();
+        let err = match Qwen35::load(&dir, &cfg, QuantMode::Int8) {
+            Err(e) => e,
+            Ok(_) => panic!("GDN ヘッド比違反がロードを通過してしまった"),
+        };
+        assert!(
+            format!("{err:#}").contains("整数倍ではありません"),
+            "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

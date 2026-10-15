@@ -1422,4 +1422,23 @@ mod tests {
         let (slots, _) = resolve_kv_budget(32768, 24_576, Some(0), None, 12288 * 1024 * 1024);
         assert_eq!(slots, 1);
     }
+
+    #[test]
+    fn resolve_kv_budget_qwen38_27b_scale() {
+        // A3: Qwen3.8-27B 実構成 (64 層 = 48 GDN + 16 full、kv_heads 4 ×
+        // head_dim 256)。KV を使うのは full attention 16 層のみなので
+        // bytes_per_token = 16 × 1024 × 2 × 4 = 131,072 B/token。
+        // (A3 で GDN 層の KV バッファ確保を廃止する前は 64 層分の 524,288
+        // B/token で計上され、4 倍に過大評価していた)
+        let bpt = 16 * (4 * 256) * 2 * 4;
+        assert_eq!(bpt, 131_072);
+        // 予約 4096 tok × 128KB = 512MB/slot → 12GB / 512MB = 24 スロット (上限 32)
+        let (slots, prefix) = resolve_kv_budget(262_144, bpt, None, None, 12288 * 1024 * 1024);
+        assert_eq!(slots, 24);
+        // 24 スロットの予約で予算を使い切るため prefix は floor (2048) が効く
+        assert_eq!(prefix, 2048);
+        // 単一リクエストは 予算 / bpt = 98,304 トークンまで (32K prefill は 4GB)
+        let need_32k = 32768 * bpt;
+        assert_eq!(need_32k, 4 * 1024 * 1024 * 1024);
+    }
 }

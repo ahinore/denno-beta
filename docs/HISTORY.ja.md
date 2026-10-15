@@ -535,6 +535,19 @@ temperature 0 greedy での反復退化 (q35_9b_2 で同一フレーズの繰り
 
 - **残課題**: 反復退化の根本の数値原因は未特定 (llama.cpp 同 GGUF 比較での切り分け継続)・thinking モード出力の取り扱い検討・GPU サーバーバイナリの再ビルド (penalty を GPU で使うには新バイナリが必要)・A2 の md5 アンカー (`90fe7e58…`) が penalty 無し greedy で手元再現しなかった件の調査。
 
+###### A3: Qwen3.8-27B スケール対応 ✅ (2026-10-15)
+
+27B (64 層 = 48 GDN + 16 full・untied lm_head) を既存経路で動かすための構造検証と VRAM/RAM/KV 予算の再確認。実 GGUF は未配置のため、**27B と同一構造の合成モデルをテスト内で生成して**ローダ → forward → KV 予算までを検証した:
+
+1. **27B config の実物確認**: HF 公開の Qwen3.8-27B config は handoff 記載どおり 64 層 (`full_attention_interval: 4`・48 GDN + 16 full)・untied lm_head・VLM ラッパ形式。9B に無い新キー `output_gate_type: "swish"` を確認 → 参照実装 3 系統 (transformers main / vLLM / llama.cpp master) をクロスチェックした結果、**どこもこのキーを消費しておらず**、full attention 出力ゲートは sigmoid・GDN z ゲートは silu (=swish) が正。本実装の既存動作と一致するため数値経路は変更なし。キーの存在時は info ログを出し、未知の値は warn (実機 E2E で出力品質を確認する)。
+2. **合成 27B シェイプテスト** (qwen35.rs の `#[cfg(test)]`): F32 専用の最小 GGUF v3 ライタで 27B の構造比を保持した小型モデル (64 層 = 48 GDN + 16 full・nv = 3*nk・untied lm_head・VLM ラッパ config) を合成し検証 — 構造 assert (48/16 層・untied・int8 再量子化)・決定論 (連続 2 回 bit 一致)・キャッシュ連続性 (3+1 == 4 bit 一致)・**バッチ prefill == トークン逐次 bit 一致** (A1 契約の 27B シェイプ再確認)・int8 vs fp32 の logits 相関 (cos > 0.8・未学習ランダム重みは誤差が累積するための緩和)・平文 config (text_config ラッパ無し) のロード。
+3. **GDN ヘッド比ガード**: repeat_interleave 規約 (gdn.rs の v-head `h` → k-head `h * nk / nv`) は `n_v_heads` が `n_k_heads` の整数倍であることを要求する (0.8B 1x・9B 2x・27B 3x)。割り切れない構成は静かに誤マップするため、ロード時に明確なエラーで拒否する。
+4. **KV 予算の再確認 → GDN 層の KV バッファ確保を廃止 (実量 1/4)**: KvCache が GDN 層 (KV を書かない層) を含む全層分の KV バッファを確保・計上しており、27B では 512KB/トークン = 実量の 4 倍の過大計上だった。GDN スロット層を確保・`bytes_per_token`・snapshot 対象から除外 → **27B は 128KB/トークン** (9B も 256KB → 64KB に削減)。snapshot は GDN 層を空ベクタとして退避し restore は skip (recurrent モデルは prefix cache の entry restore を使わないため影響なし・GDN スロットの無い llama/gpt2 は従来動作のまま)。数値経路は一切変更なし (GDN 層の KV バッファは未使用)。
+5. **27B の予算見積り** (int8・KV 予算 12GB 既定): 線形層 int8 ~24.6GB + embed fp32 ~5.1GB + lm_head int8 ~1.3GB ≈ **~31GB (ホスト RAM)**。GPU 常駐は線形層 int8 ~24.6GB (+lm_head) → 32GB 級 GPU では残り ~6GB が KV ミラー+ワークスペース。KV 128KB/トークンで 32K prefill = 4GB・既定予算では 24 スロット (予約 512MB/スロット)・単一リクエスト上限 ~98K トークン。ctx 262,144 の全幅は KV ~34GB で既定予算を超えるため `DENNO_KV_BUDGET_MB` の引き上げが必要。UD-IQ2_XXS GGUF は ~7.3GB (unsloth・単一ファイル) で、使用量子形式 (iq2_xxs/iq3_xxs/q2_K/q4_K/q8_0) は全て dequant 対応済み。
+6. **検証**: lib テスト 128 passed (新規 7 テスト: 構造+KV 予算・決定論+連続性・prefill bit 一致・int8 vs fp32・平文 config・ヘッド比拒否・kv_cache の GDN 除外)・workspace テスト green (server 7・cli 5)。
+
+- **残課題**: 27B 実 GGUF の配置と実機 E2E (UD-IQ2_XXS・GPU での決定論 md5・生成品質)・`output_gate_type` を参照実装が将来消費した場合の追従。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B UD-IQ2_XXS 動作)
@@ -542,7 +555,7 @@ temperature 0 greedy での反復退化 (q35_9b_2 で同一フレーズの繰り
 - [x] **A1: GDN/prefill の GPU 化 — 完了**(commit `57727f4` 第一段階+バッチ prefill → `8e9a874` GDN カーネル): Linear 自動オフロード+投影 m=n 一括(F32 は `apply_bt_rows`/matvec_rows_bt でビット一致維持)+**GDN スキャン GPU カーネル**(head ごと 1 ブロック・S 列保持・reduction 不要)。285 in/64 out: CPU ~28s → 5.1〜5.8s → **2.09s(約 13x)**。GPU/CPU 差 y maxabs=3.4e-8・決定論 3 連続 md5 一致。decode(n==1)は CPU 逐次のまま(chunked scan は将来課題)
 - [ ] **A1 残課題(任意)**: GDN chunked scan(長 prefill の更なる高速化)・decode の GDN GPU 化
 - [x] **A2: Qwen3.5-9B 実 E2E — 完了**(commit `9183e7e`): GDN k-head 規約修正+untied lm_head 修正で garble 解決。fp32 全 32 層 numpy 一致・逐次==バッチ prefill bit 一致・int8 GPU E2E 決定論 md5 一致(連続+再起動)
-- [ ] **A3: Qwen3.8-27B スケール**: 64 層=48 GDN+16 full・int8 必須・VRAM/RAM/KV 予算の再確認。A1 の GPU 化が前提(prefill が CPU 逐次では実用時間を超える)
+- [x] ~~**A3: Qwen3.8-27B スケール**~~ → **完了 (コード/予算面・2026-10-15)**: 64 層 = 48 GDN + 16 full を合成モデルで検証 (決定論・prefill bit 一致契約・untied lm_head)・`output_gate_type: "swish"` は参照実装が不使用のため動作不変・GDN 層の KV バッファ確保廃止で KV 実量 1/4 (512KB → 128KB B/token)・GDN ヘッド比のロード時ガード。実 GGUF での E2E (UD-IQ2_XXS 配置+実機 GPU) は残課題
 - [x] ~~**A2.5: 9B 生成品質の改善(A3 前に推奨)**~~ → **完了**: チャットテンプレートは Qwen3.5 公式準拠を確認(不一致なし)・repetition penalty 実装(HF 互換・決定論・penalty 1.1 で反復解消)。根本の数値原因の切り分け(llama.cpp 同 GGUF 比較)は継続
 - [ ] **A4: prefix cache への GDN 状態スナップショット**(任意): 現在 recurrent モデルはフル prefill 固定(正しさ優先)。マルチターン高速化
 
