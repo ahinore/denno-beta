@@ -587,6 +587,18 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - **Verification**: cargo test --workspace (CPU) all green (lib 147, server 7, cli 5, 0 failures) + cargo check --workspace + the cuda-feature build (check --tests) green. **Real-machine GPU E2E measurement and running the new GPU test (`cargo test --release --features cuda -- --ignored`) need a GPU binary rebuild + server restart — human follow-up**
 - **Remaining work**: real-machine E2E measurement (effect of removing rmsnorm + the host round-trips; P17k procedure). Next candidate: B2 attn_core V accumulation (3.51s)
 
+### B2: attn_core V-accumulation optimization — row-chunked probs@V ✅ (2026-10-15)
+
+> Remaining bottleneck after B1: attn_core 3,514ms (largest op of the 13,252-token cold prefill; it surfaced as the top op once B1 removed rmsnorm). Implements P17k "remaining candidates" item 1, "reduce v re-reads in the V accumulation (row chunking)". A kernel-internal rebuild only — **numerics are bit-identical** (same output as the old kernel).
+
+- **Kernel change (kernels_elem.cu — only the probs@V accumulation of `dno_attention_prefill`)**: the old code re-read `v_sm[kk]` once per row (PF_BQ=64 times) inside the row loop, issuing s 512 + v 512 + corr 64 shared-memory load instructions per thread per tile. v_sm[kk] is now hoisted out of the row loop (one read per kk) and reused across 2 interleaved rows, with s_sm/corr_sm loaded as float2 (8B) → **s 256 + v 8 + corr 32** (v re-reads 64× → 1×, ~3.7× fewer LDS instructions). s_sm row starts are on PF_BK=8-float (32B) strides and the dynamic smem base is 16B-aligned, so the float2 accesses are always aligned (kk steps in pairs)
+- **Numerical contract: bit-identical** — the FMA sequence into each acc[r] is exactly the old one ("fixed r, ascending kk": `fmaf(p.y, v1, fmaf(p.x, v0, acc))` computes kk inside and kk+1 outside). Attention sits in the relaxed slot, but the numbers are fully unchanged (the maxabs 1.79e-7/1.97e-7 vs the CPU reference should be identical to the old kernel too) and determinism keeps the fixed order (no atomics). Verification: a host C++ simulation comparing old vs new loops over 128 threads × 64 rows × random values (including denormals/±0/FLT_MAX) — **all bits equal at -O0 and -O2**
+- **Side effect found in static PTX analysis**: the old PTX spilled acc[PF_BQ] to local memory (ld.local 81/st.local 33); the new code has **zero spills** (dynamic smem loads in the V phase drop from ~1,088 to ~296 instructions per thread per tile). All other kernels (dno_swiglu/swiglu_int/add_rmsnorm/attention(decode)/rope_qkv/rope_qkv_pf) are byte-identical to the old PTX (the diff is local to dno_attention_prefill)
+- **PTX (kernels_elem.ptx)**: sha256 `f196f07ec1747c4a6d34b9bc1e02352788cddcfa750fa335d20aac112db0ce54`. Procedure: ①first verified that recompiling the pre-change source matches the committed PTX by sha256 (`efc3a711…`) ②then regenerated after the change. Host side is **unchanged** (sh_f/grid/block/ATTN_PF_BQ=64/BK=8 identical; no new Rust code)
+- **BK expansion deferred**: BK 8→16 would need ~54KB smem (a cuFuncSetAttribute opt-in) and risks dropping occupancy from 2 blocks/SM to 1 (worse latency hiding in the score phase). It should only be judged by an on-machine A/B test, so it stays a leftover
+- **Verification**: cargo test --workspace (CPU) all green (lib 147 unchanged) + cargo check --features cuda --tests green. **Real-machine re-verification needed**: ①`cuda_attn_pf_bench` (n=t=13252) kernel timing (improvement over the old 69.3ms/call) ②maxabs/determinism re-check of `cuda_attention_prefill_vs_cpu_reference/large` ③E2E PROFILE measurement (P17k procedure). The GPU binary rebuild + server restart are human follow-up
+- **Remaining work**: real-machine E2E measurement + a BK-expansion A/B experiment (smem >48KB opt-in) + further score-phase sharing (4r×2k)
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B on UD-IQ2_XXS)
@@ -601,7 +613,7 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 ### P17-family leftovers (CUDA)
 
 - [x] ~~**B1: rmsnorm GPU offload**: 2.3s left per the P17k profile (~31% of TOTAL). An extension of the P17d elementwise kernels; easy to implement~~ → **done (2026-10-15)**: prefill (n>1) now runs as a device-resident hidden-state chain — the 2 CPU rmsnorms per layer are GPU-offloaded via dno_add_rmsnorm (fused residual add, bit-exact vs CPU), resolving "rmsnorm 2.3s serial with the h H2D". The h/proj/down host round-trips (81MB ×4/layer) are gone too. Real-machine E2E measurement remains
-- [ ] **B2: attn_core V accumulation**: 3.51s left (largest op). dno_attention extension (attention already has a relaxed contract)
+- [x] ~~**B2: attn_core V accumulation**: 3.51s left (largest op). dno_attention extension (attention already has a relaxed contract)~~ → **done (2026-10-15)**: the probs@V accumulation of `dno_attention_prefill` is rebuilt as v-hoist + 2-row interleave + float2 loads (v re-reads 64× → 1×, the FMA sequence into each acc keeps ascending kk = **bit-identical** to the old kernel, and the old kernel's acc local spill is gone too). Host side unchanged. Real-machine measurement (`cuda_attn_pf_bench`, E2E PROFILE) and the BK-expansion A/B remain
 - [ ] **B3: rope GPU for b>1 batches** (low priority): syncs are hidden in batch mode
 - [x] ~~**3B/7B b=4 measurement**~~ → **done in P17k** (target changed to Gemma3n 13,252 tok)
 

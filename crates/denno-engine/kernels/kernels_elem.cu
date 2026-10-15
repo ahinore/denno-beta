@@ -300,6 +300,17 @@ extern "C" __global__ void dno_attention(
 //   ため grid が約 4 倍過剰 (i0 >= n の無効ブロックがフル time ループを回す)。
 //   64/8 に統一で **attn_core 4.5s → 3.5s**。「~43KB で error 700」の正体も
 //   ホスト sh_f (16/32 基準 43.4KB) がカーネル必要量を下回る smem 領域外書き。
+// B2 (2026-10-15): probs@V 累積の行チャンク化。v_sm[kk] を行ループの外 (kk ごと
+//   1 回) に hoist し 2 行インターリーブで再利用 + s_sm/corr_sm を float2 (8B)
+//   荷載にする。スレッドあたりタイル当たりの LDS 命令: s 512 + v 512 + corr 64
+//   → s 256 + v 8 + corr 32 (v_sm の再読みが行数 PF_BQ 回 → 1 回に減る)。
+//   acc[r] への FMA 列は「r 固定・kk 昇順」で旧実装と完全同一
+//   (fmaf(p.y, v1, fmaf(p.x, v0, acc)) の内側が kk・外側が kk+1) のため
+//   **数値はビット一致** (attention 緩和枠だが変化なし・決定論も固定順のまま・
+//   原子操作なし)。ホスト側は無変更 (sh_f / grid / block は同一)。
+//   実測は実機で cuda_attn_pf_bench を再実行すること。s_sm の行先頭は
+//   PF_BK=8 floats (32B) 刻み・動的 smem ベースは 16B 整列のため float2 (8B)
+//   アクセスの整列は常に成立する (kk は偶数ステップ)。
 #define PF_BQ 64
 #define PF_BK 8
 // exp2f ベース softmax 用 (expf(x) = exp2f(x * log2(e)))
@@ -467,12 +478,28 @@ extern "C" __global__ void dno_attention_prefill(
             l_run = l;
             m_run = mnew_sm[tid];
         }
-        // acc 再スケール + probs@V 累積 (出力次元 d=tid 専属 — tid < dh のみ)
+        // acc 再スケール + probs@V 累積 (出力次元 d=tid 専属 — tid < dh のみ)。
+        // B2: 行チャンク化 — v_sm[kk] を hoist (行数回の再読み → kk ごと 1 回)・
+        // 2 行インターリーブ・s/corr を float2 荷載。acc[r] への FMA 列は
+        // 「r 固定・kk 昇順」で旧実装と完全同一 → ビット一致 (決定論も不変)。
         if (tid < dh) {
-            for (int r = 0; r < PF_BQ; ++r) acc[r] *= corr_sm[r];
-            for (int r = 0; r < PF_BQ; ++r) {
-                for (int kk = 0; kk < PF_BK; ++kk) {
-                    acc[r] = fmaf(s_sm[r * PF_BK + kk], v_sm[kk * (dh + 1) + tid], acc[r]);
+            for (int rc = 0; rc < PF_BQ / 2; ++rc) {
+                const float2 c = *reinterpret_cast<const float2 *>(&corr_sm[rc * 2]);
+                acc[rc * 2] *= c.x;
+                acc[rc * 2 + 1] *= c.y;
+            }
+            for (int kk = 0; kk < PF_BK; kk += 2) {
+                const float v0 = v_sm[kk * (dh + 1) + tid];
+                const float v1 = v_sm[(kk + 1) * (dh + 1) + tid];
+                #pragma unroll
+                for (int rp = 0; rp < PF_BQ / 2; ++rp) {
+                    const int r0 = rp * 2;
+                    const float2 pa =
+                        *reinterpret_cast<const float2 *>(&s_sm[r0 * PF_BK + kk]);
+                    const float2 pb =
+                        *reinterpret_cast<const float2 *>(&s_sm[(r0 + 1) * PF_BK + kk]);
+                    acc[r0] = fmaf(pa.y, v1, fmaf(pa.x, v0, acc[r0]));
+                    acc[r0 + 1] = fmaf(pb.y, v1, fmaf(pb.x, v0, acc[r0 + 1]));
                 }
             }
         }
