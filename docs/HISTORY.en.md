@@ -520,6 +520,21 @@ Resolved the 9B (nk=16/nv=32, untied, 32 layers = 24 GDN + 8 full) garble with t
 - **E2E result (int8 GPU)**: q35_9b_1 yields natural thinking output. md5 `90fe7e5850b48d4b7aba157922af7113` bit-identical across 2 consecutive runs + a server restart (determinism contract met). fp32 also runs but repeats at temperature 0 greedy (not int8-specific — a template/generation-quality issue → next step).
 - Debug scaffolding (qwen35.rs diagnostic methods + qwen35_9b_debug_trace test, host numpy reference tmp/ref_*.py) removed before commit. Lesson: 9B is the first untied model ⇒ the lm_head path was exercised in battle for the first time.
 
+###### A2.5: Qwen3.5-9B generation quality — repetition penalty ✅ (2026-10-15)
+
+Addressed the repetition degradation at temperature 0 greedy (q35_9b_2 repeating the same phrase; similar tendency in fp32) with a chat-template audit and a repetition penalty implementation:
+
+1. **Chat template audit → confirmed compliant with the official Qwen3.5 spec (no mismatch)**: fully expanded the `chat_template` in `tokenizer_config.json` and verified the minijinja+pycompat rendering with a real CPU test (thinking markers, enable_thinking handling, `<|im_start|>`/`<|im_end|>` structure). The template was not the cause of the repetition — no change needed.
+2. **Repetition penalty implementation (HF-compatible, deterministic)**: `sampler::apply_repetition_penalty` — applies once to the **unique** tokens already present in the context (prompt + generated): `logit > 0 → logit / penalty`, `logit <= 0 → logit * penalty` (same rule as HF transformers' `RepetitionPenaltyLogitsProcessor`). Applied before temperature/top-k/top-p (raw logits). Uses no RNG, so greedy is fully deterministic and the sampling sequence with a fixed seed remains bit-reproducible. `penalty == 1.0` is an exact bit-level no-op (bit-identical to the existing path). Exposed via `GenParams.repetition_penalty`, an optional `/v1/messages` field (denno extension), and the CLI `denno generate --repetition-penalty`. Applied just before sampling in both server decode paths (sequential step_chat and batch P6).
+3. **Verification**:
+   - Unit tests (sampler.rs): positive/negative logit rules, duplicate ids applied once (HF set semantics), out-of-vocab ids ignored, penalty=1.0 bit no-op, greedy loop breaking + determinism.
+   - **9B int8 E2E (penalty 1.1)**: q35_9b_1 breaks the loop and keeps the thinking structure. md5 `4551f00f5fcab87e6cf03e8ca18915e0` bit-identical across 2 consecutive runs + a server restart (determinism contract met). q35_9b_2 also keeps its structure and escapes the loop (md5 `7562493ed6e3bdf13dd3b488a389c493`).
+   - penalty 1.15/1.3 over-suppresses → **1.1 is the sweet spot** (matches the llama.cpp default).
+   - Confirmed the old GPU binary (from A2) ignores the new request field without an error (forward compatibility).
+   - Added the durable regression test `qwen35_9b_int8_penalty_determinism` (ignored, graceful skip without `QWEN35_9B_DIR`) to qwen35_model.rs: determinism (2 consecutive bit-identical runs) + a top-4-gram canary to detect repetition loops.
+
+- **Remaining work**: the root numerical cause of the repetition is still unidentified (continue isolating via a llama.cpp same-GGUF comparison) · handling of thinking-mode output · GPU server binary rebuild (the GPU needs a new binary to use the penalty) · investigate why the A2 md5 anchor (`90fe7e58…`) did not reproduce locally under greedy without penalty.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B on UD-IQ2_XXS)
@@ -528,7 +543,7 @@ Resolved the 9B (nk=16/nv=32, untied, 32 layers = 24 GDN + 8 full) garble with t
 - [ ] **A1 leftovers (optional)**: GDN chunked scan (further long-prefill speedup) · GDN GPU decode
 - [x] **A2: Qwen3.5-9B real E2E — done** (commit `9183e7e`): garble resolved by the GDN k-head convention fix + untied lm_head fix. fp32 all-32-layer numpy match, sequential == batch prefill bit-identity, int8 GPU E2E deterministic md5 (repeat + restart)
 - [ ] **A3: Qwen3.8-27B scale**: 64 layers = 48 GDN + 16 full, int8 required, re-check the VRAM/RAM/KV budget. Presupposes A1's GPU acceleration (CPU-sequential prefill exceeds practical time)
-- [ ] **A2.5: 9B generation quality (recommended before A3)**: both int8/fp32 repeat at temperature 0 greedy. Verify the chat template against the official Qwen3.5 spec (thinking markers, enable_thinking), repetition penalty, etc. Isolate by comparing output against llama.cpp
+- [x] ~~**A2.5: 9B generation quality (recommended before A3)**~~ → **done**: chat template verified against the official Qwen3.5 spec (no mismatch) · repetition penalty implemented (HF-compatible, deterministic; 1.1 breaks the loop). Root-cause isolation (llama.cpp same-GGUF comparison) continues
 - [ ] **A4: GDN state snapshot in the prefix cache** (optional): recurrent models currently always full-prefill (correctness first). Faster multi-turn
 
 ### P17-family leftovers (CUDA)

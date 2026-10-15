@@ -63,7 +63,7 @@ denno-beta/
 │   │   ├── quant.rs           # int8量子化 + SIMD i8×i8ドット積 (NEON/AVX2)
 │   │   ├── kv_cache.rs        # KVキャッシュ (truncate で prefix cache)
 │   │   ├── prefix_cache.rs    # マルチエントリ LRU prefix cache
-│   │   ├── sampler.rs         # 温度/top-k/top-p サンプリング
+│   │   ├── sampler.rs         # 温度/top-k/top-p サンプリング + repetition penalty (A2.5)
 │   │   ├── load.rs            # safetensors 読み込み (単一/分割shard、F16/BF16→f32)
 │   │   ├── tokenizer.rs       # tokenizer.json + minijinja chat template
 │   │   ├── engine.rs          # begin/step_chat(): prefill→decode ステッパ
@@ -101,7 +101,7 @@ flowchart TB
     LOOP --> PULL["ステップ間に新規到着を pull<br/>(スロットに空きがあれば admit)"]
     PULL --> BATCH["decode は全常駐セッションを<br/>1 forward にまとめる(P6)"]
     BATCH --> STOP{停止条件?<br/>EOS / max_tokens / stop_seq}
-    STOP -->|"継続"| SAMP[sampler<br/>greedy / temperature / top_p / top_k<br/>seed 固定で決定論]
+    STOP -->|"継続"| SAMP[sampler<br/>greedy / temperature / top_p / top_k<br/>repetition penalty (A2.5)<br/>seed 固定で決定論]
     SAMP --> LOOP
     STOP -->|"停止"| OUT[ChatOutput<br/>text / stop_reason / usage]
     OUT --> RESP["JSON または SSE<br/>(event: 行 + keep-alive 2秒)"]
@@ -386,6 +386,7 @@ flowchart TB
 
 ```
 step_chat() の 1 ステップ:
+  apply_repetition_penalty       ← A2.5: penalty 指定時のみ既出ユニークトークンを抑制 (無効時はビット不変)
   sampler.sample(logits)        ← greedy / temperature / top-k / top-p (seed固定)
   → EOS / stop_sequences 判定
   → tok.decode(全生成) の差分をストリーミング

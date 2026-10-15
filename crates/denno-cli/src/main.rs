@@ -29,6 +29,8 @@ enum Commands {
         #[arg(long, default_value_t = 128)] max_tokens: usize,
         #[arg(long)] temperature: Option<f32>,
         #[arg(long)] seed: Option<u64>,
+        /// A2.5: 反復ペナルティ (例: 1.1。未指定 = 無効)
+        #[arg(long)] repetition_penalty: Option<f32>,
         /// 重みの量子化モード (fp32 / int8)。int8 は決定論を維持するが
         /// fp32 と同一出力にはならない
         #[arg(long, default_value = "fp32")] quant: String,
@@ -136,7 +138,7 @@ fn main() -> Result<()> {
                 println!("weights:   {:.1} MB", bytes as f64 / 1e6);
             }
         }
-        Commands::Generate { repo, prompt, system, max_tokens, temperature, seed, quant, raw } => {
+        Commands::Generate { repo, prompt, system, max_tokens, temperature, seed, repetition_penalty, quant, raw } => {
             let dir = model_dir(&repo);
             if !dir.exists() {
                 bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
@@ -146,6 +148,7 @@ fn main() -> Result<()> {
             let params = denno_engine::GenParams {
                 max_tokens,
                 temperature,
+                repetition_penalty,
                 ..Default::default()
             };
             let out = if raw {
@@ -157,6 +160,13 @@ fn main() -> Result<()> {
                 let mut sampler = Sampler::new(temperature, None, None, seed);
                 let mut generated = Vec::new();
                 for _ in 0..max_tokens {
+                    // A2.5: penalty 指定時のみ既出トークンを抑制 (無効時はビット不変)
+                    if let Some(p) = repetition_penalty {
+                        let mut ctx = Vec::with_capacity(ids.len() + generated.len());
+                        ctx.extend_from_slice(&ids);
+                        ctx.extend_from_slice(&generated);
+                        denno_engine::sampler::apply_repetition_penalty(&mut logits, &ctx, p);
+                    }
                     let t = sampler.sample(&logits) as u32;
                     if engine.model.eos_ids().contains(&t) { break; }
                     generated.push(t);
