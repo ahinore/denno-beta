@@ -101,7 +101,7 @@ flowchart TB
     LOOP --> PULL["ステップ間に新規到着を pull<br/>(スロットに空きがあれば admit)"]
     PULL --> BATCH["decode は全常駐セッションを<br/>1 forward にまとめる(P6)"]
     BATCH --> STOP{停止条件?<br/>EOS / max_tokens / stop_seq}
-    STOP -->|"継続"| SAMP[sampler<br/>greedy / temperature / top_p / top_k<br/>repetition penalty (A2.5)<br/>seed 固定で決定論]
+    STOP -->|"継続"| SAMP["sampler<br/>greedy / temperature / top_p / top_k<br/>repetition penalty (A2.5)<br/>seed 固定で決定論"]
     SAMP --> LOOP
     STOP -->|"停止"| OUT[ChatOutput<br/>text / stop_reason / usage]
     OUT --> RESP["JSON または SSE<br/>(event: 行 + keep-alive 2秒)"]
