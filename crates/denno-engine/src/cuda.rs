@@ -1150,6 +1150,145 @@ pub fn maybe_gpu_ffn(
     }
 }
 
+/// B1: prefill デバイス常駐チェーン用 FFN ブロック — maybe_gpu_ffn と同一の
+/// カーネル列 (gate_up GEMM → swiglu_int → down GEMM) を、入力 `in_slot`
+/// (chain_rmsnorm が書いた h2・デバイス常駐) から出力 CH_DOWN (デバイス常駐) へ
+/// **同期・ホスト往復なし**で実行する。h2 の H2D (81MB/層) と down の D2H
+/// (81MB/層) を廃止。全段ビット一致 (GEMM: 整数累積・swiglu: dno_swiglu_int と
+/// 同一演算)。戻り None = チェーン全体を従来経路でやり直し。
+pub fn maybe_gpu_ffn_dev(
+    gate: &Quant8Linear,
+    up: &Quant8Linear,
+    down: &Quant8Linear,
+    in_slot: usize,
+    m: usize,
+    ff: usize,
+    li: usize,
+) -> Option<()> {
+    if !(m > max_m() && m >= gemm_min_m() && gemm_enabled()) {
+        return None;
+    }
+    let e = gate.k;
+    debug_assert_eq!(up.k, e);
+    debug_assert_eq!(down.k, ff);
+    debug_assert_eq!(down.n, e);
+    let ctx = chain_ctx()?;
+    let gw1 = match weights_for_group(&[gate.uid, up.uid], &[gate, up], e, 2 * ff) {
+        Ok(g) => g,
+        Err(err) => {
+            tracing::error!("CUDA FFN weight upload failed, using CPU: {err:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+    };
+    let gw2 = match weights_for(down.uid, &down.w, &down.scale, ff, e) {
+        Ok(g) => g,
+        Err(err) => {
+            tracing::error!("CUDA FFN down weight upload failed, using CPU: {err:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+    };
+    ok(chain_ensure_buf(in_slot, m * e * 4))?;
+    ok(chain_ensure_buf(CH_DOWN, m * e * 4))?;
+    CHAIN.with(|cell| -> Option<()> {
+        let s = cell.borrow();
+        let dptr_in = s.bufs[in_slot].as_ref().unwrap().ptr();
+        let dptr_out = s.bufs[CH_DOWN].as_ref().unwrap().ptr();
+        SCRATCH.with(|c2| -> Option<()> {
+            let mut s2 = c2.borrow_mut();
+            ok(Scratch::ensure(&mut s2.aq, m * e))?;
+            ok(Scratch::ensure(&mut s2.asc, m * 4))?;
+            ok(Scratch::ensure(&mut s2.out, m * 2 * ff * 4))?;
+            ok(Scratch::ensure(&mut s2.act, m * ff * 4))?;
+            ok(Scratch::ensure(&mut s2.aq2, m * ff))?;
+            ok(Scratch::ensure(&mut s2.asc2, m * 4))?;
+            let (daq, dasc, dout, dact, daq2, dasc2) = (
+                s2.aq.as_ref().unwrap(),
+                s2.asc.as_ref().unwrap(),
+                s2.out.as_ref().unwrap(),
+                s2.act.as_ref().unwrap(),
+                s2.aq2.as_ref().unwrap(),
+                s2.asc2.as_ref().unwrap(),
+            );
+            unsafe {
+                // 1) gate_up GEMM: [m, e] → [m, 2ff] (デバイス上に保持)
+                crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
+                    let (mut px, mut paq, mut pasc) = (dptr_in, daq.ptr(), dasc.ptr());
+                    let (mut mc, mut kc) = (m as c_int, e as c_int);
+                    let mut args = [
+                        &mut px as *mut _ as *mut c_void,
+                        &mut paq as *mut _ as *mut c_void,
+                        &mut pasc as *mut _ as *mut c_void,
+                        &mut mc as *mut _ as *mut c_void,
+                        &mut kc as *mut _ as *mut c_void,
+                    ];
+                    ok(ctx.launch_async(ctx.f_quant, (m as u32, 1, 1), (256, 1, 1), 256 * 4, &mut args))?;
+                    let (mut paqi, mut pasci, mut pw, mut psc, mut pout) =
+                        (daq.ptr(), dasc.ptr(), gw1.w.ptr(), gw1.sc.ptr(), dout.ptr());
+                    let (mut mc, mut kc, mut nc) = (m as c_int, e as c_int, (2 * ff) as c_int);
+                    let mut args = [
+                        &mut paqi as *mut _ as *mut c_void,
+                        &mut pasci as *mut _ as *mut c_void,
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut psc as *mut _ as *mut c_void,
+                        &mut pout as *mut _ as *mut c_void,
+                        &mut mc as *mut _ as *mut c_void,
+                        &mut kc as *mut _ as *mut c_void,
+                        &mut nc as *mut _ as *mut c_void,
+                    ];
+                    let gmx = m.div_ceil(128) as u32;
+                    let gmy = (2 * ff).div_ceil(128) as u32;
+                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args))
+                })?;
+                // 2) swiglu (interleaved): [m, 2ff] → act [m, ff] (デバイス上に保持)
+                crate::prof::time_layer(crate::prof::SWIGLU, li, || -> Option<()> {
+                    let (mut pg, mut po) = (dout.ptr(), dact.ptr());
+                    let (mut pff, mut pw, mut pt) = (ff as c_int, (2 * ff) as c_int, (m * ff) as i64);
+                    let mut args = [
+                        &mut pg as *mut _ as *mut c_void,
+                        &mut po as *mut _ as *mut c_void,
+                        &mut pff as *mut _ as *mut c_void,
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut pt as *mut _ as *mut c_void,
+                    ];
+                    let grid = (m * ff).div_ceil(256) as u32;
+                    ok(ctx.launch_async(ctx.f_swiglu_int, (grid, 1, 1), (256, 1, 1), 0, &mut args))
+                })?;
+                // 3) down GEMM: act [m, ff] → CH_DOWN [m, e] (デバイス常駐・同期なし)
+                crate::prof::time_layer(crate::prof::DOWN, li, || -> Option<()> {
+                    let (mut px, mut paq, mut pasc) = (dact.ptr(), daq2.ptr(), dasc2.ptr());
+                    let (mut mc, mut kc) = (m as c_int, ff as c_int);
+                    let mut args = [
+                        &mut px as *mut _ as *mut c_void,
+                        &mut paq as *mut _ as *mut c_void,
+                        &mut pasc as *mut _ as *mut c_void,
+                        &mut mc as *mut _ as *mut c_void,
+                        &mut kc as *mut _ as *mut c_void,
+                    ];
+                    ok(ctx.launch_async(ctx.f_quant, (m as u32, 1, 1), (256, 1, 1), 256 * 4, &mut args))?;
+                    let (mut paqi, mut pasci, mut pw, mut psc, mut pout) =
+                        (daq2.ptr(), dasc2.ptr(), gw2.w.ptr(), gw2.sc.ptr(), dptr_out);
+                    let (mut mc, mut kc, mut nc) = (m as c_int, ff as c_int, e as c_int);
+                    let mut args = [
+                        &mut paqi as *mut _ as *mut c_void,
+                        &mut pasci as *mut _ as *mut c_void,
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut psc as *mut _ as *mut c_void,
+                        &mut pout as *mut _ as *mut c_void,
+                        &mut mc as *mut _ as *mut c_void,
+                        &mut kc as *mut _ as *mut c_void,
+                        &mut nc as *mut _ as *mut c_void,
+                    ];
+                    let gmx = m.div_ceil(128) as u32;
+                    let gmy = e.div_ceil(128) as u32;
+                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args))
+                })
+            }
+        })
+    })
+}
+
 fn weights_for_group(
     uids: &[u64],
     parts: &[&Quant8Linear],
@@ -1510,6 +1649,35 @@ fn ok<T>(r: Result<T, anyhow::Error>) -> Option<T> {
     }
 }
 
+/// B1: prefill デバイス常駐チェーン (`LlamaQwen2::forward_prefill_gpu`) を発動して
+/// よいかの事前ゲート (カーネル制約の mirror)。チェーンは all-or-nothing (途中失敗
+/// → forward 全体を従来経路でやり直し) なので、構造的に確実に失敗する形状は
+/// 開始前に弾く (GPU_BROKEN ラッチの無駄な発火防止)。
+/// - `e` (hidden): dno_add_rmsnorm が動的 shmem = e*4 を使う (≤48KB)
+/// - `dh`/`t_total`: dno_attention_prefill の制約 (chain_attention_prefill_dev と同一)
+pub fn prefill_chain_gpu_supported(e: usize, dh: usize, t_total: usize) -> bool {
+    if e == 0 || e * 4 > 48 * 1024 {
+        return false;
+    }
+    if dh < ATTN_PF_BQ || dh > 1024 || t_total == 0 || t_total > 65535 {
+        return false;
+    }
+    let sh_f = (ATTN_PF_BQ + 2 * ATTN_PF_BK) * (dh + 1)
+        + ATTN_PF_BQ * ATTN_PF_BK
+        + 2 * ATTN_PF_BQ;
+    if sh_f * 4 > 48 * 1024 {
+        return false;
+    }
+    true
+}
+
+/// B1: GEMM 経路 (dno_gemm_i8) が発動する m か。maybe_gpu_ffn / maybe_gpu_oproj /
+/// chain_qkv_rope_prefill の内部ゲートと同一条件 (チェーン途中で失敗させないため
+/// 呼び出し側が事前確認する)。
+pub fn gemm_path_active(m: usize) -> bool {
+    m > max_m() && m >= gemm_min_m() && gemm_enabled()
+}
+
 fn chain_ctx() -> Option<&'static CudaCtx> {
     if !cuda_enabled() {
         return None;
@@ -1570,6 +1738,41 @@ pub fn chain_download(slot: usize, len: usize) -> Option<Vec<f32>> {
                 ok(check(
                     (lib.memcpy_dtoh_async)(pin.ptr as *mut c_void, buf, bytes, std::ptr::null_mut()),
                     "cuMemcpyDtoHAsync (chain)",
+                ))?;
+            }
+        }
+        ok(ctx.sync())?;
+        Some(pin.as_slice::<f32>()[..len].to_vec())
+    })
+}
+
+/// スロット内の要素オフセット `elem_off` から `len` 個の f32 をダウンロード
+/// (D2H + 同期)。B1: prefill チェーンの最終 norm 出力 (CH_H の最終行のみ)
+/// 取得用 — [n, e] 全行の D2H を避ける。呼び出し時点でスロットには
+/// (elem_off + len) 個分のデータが存在することを前提とする (不足時は None)。
+pub fn chain_download_at(slot: usize, elem_off: usize, len: usize) -> Option<Vec<f32>> {
+    let ctx = chain_ctx()?;
+    let bytes = len.checked_mul(4)?;
+    let need = elem_off.checked_mul(4)?.checked_add(bytes)?;
+    if !CHAIN.with(|cell| {
+        cell.borrow()
+            .bufs
+            .get(slot)
+            .map_or(false, |b| b.as_ref().map_or(false, |b| b.bytes() >= need))
+    }) {
+        return None;
+    }
+    CHAIN.with(|cell| -> Option<Vec<f32>> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure_pin(&mut s.pin_dn, bytes))?;
+        let buf = s.bufs[slot].as_ref().unwrap().ptr() + (elem_off * 4) as CUdeviceptr;
+        let pin = s.pin_dn.as_mut().unwrap();
+        {
+            let lib = ok(lib())?;
+            unsafe {
+                ok(check(
+                    (lib.memcpy_dtoh_async)(pin.ptr as *mut c_void, buf, bytes, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (chain download at)",
                 ))?;
             }
         }
@@ -2178,6 +2381,86 @@ pub fn maybe_gpu_oproj(o: &Quant8Linear, m: usize, k: usize, li: usize) -> Optio
     }
 }
 
+/// B1: prefill デバイス常駐チェーン用 o_proj — CH_ATT の attention 出力を D2H せず
+/// デバイス上で o_proj (quantize → dno_gemm_i8) し、CH_O に書く (同期なし。後続の
+/// chain_rmsnorm が同一ストリームで順次読む)。GEMM は maybe_gpu_oproj と同一カーネル
+/// → ビット一致。CH_ATT は chain_attention_prefill(_dev) 成功時に確保済み前提。
+/// 戻り None = チェーン全体を従来経路でやり直し。
+pub fn maybe_gpu_oproj_dev(o: &Quant8Linear, m: usize, k: usize, li: usize) -> Option<()> {
+    if !(m > max_m() && m >= gemm_min_m() && gemm_enabled()) {
+        return None;
+    }
+    debug_assert_eq!(o.k, k);
+    let e = o.n;
+    let ctx = chain_ctx()?;
+    // CH_ATT スロットは chain_attention_prefill(_dev) 成功時に確保済みのはず
+    if !CHAIN.with(|cell| {
+        cell.borrow()
+            .bufs
+            .get(CH_ATT)
+            .map_or(false, |b| b.as_ref().map_or(false, |b| b.bytes() >= m * k * 4))
+    }) {
+        return None;
+    }
+    let gw = match weights_for(o.uid, &o.w, &o.scale, k, e) {
+        Ok(g) => g,
+        Err(err) => {
+            tracing::error!("CUDA o_proj weight upload failed, using CPU: {err:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+    };
+    let aptr = CHAIN.with(|cell| -> Option<u64> {
+        cell.borrow()
+            .bufs[CH_ATT]
+            .as_ref()
+            .map(|b| b.ptr())
+    })?;
+    ok(chain_ensure_buf(CH_O, m * e * 4))?;
+    CHAIN.with(|cell| -> Option<()> {
+        let optr = cell.borrow().bufs[CH_O].as_ref().unwrap().ptr();
+        SCRATCH.with(|c2| -> Option<()> {
+            let mut s2 = c2.borrow_mut();
+            ok(Scratch::ensure(&mut s2.aq, m * k))?;
+            ok(Scratch::ensure(&mut s2.asc, m * 4))?;
+            ok(Scratch::ensure(&mut s2.out, m * e * 4))?;
+            let (daq, dasc) = (s2.aq.as_ref().unwrap(), s2.asc.as_ref().unwrap());
+            crate::prof::time_layer(crate::prof::OPROJ, li, || -> Option<()> {
+                unsafe {
+                    // 1) att (CH_ATT) をデバイス上で量子化
+                    let (mut px, mut paq, mut pasc) = (aptr, daq.ptr(), dasc.ptr());
+                    let (mut mc, mut kc) = (m as c_int, k as c_int);
+                    let mut args = [
+                        &mut px as *mut _ as *mut c_void,
+                        &mut paq as *mut _ as *mut c_void,
+                        &mut pasc as *mut _ as *mut c_void,
+                        &mut mc as *mut _ as *mut c_void,
+                        &mut kc as *mut _ as *mut c_void,
+                    ];
+                    ok(ctx.launch_async(ctx.f_quant, (m as u32, 1, 1), (256, 1, 1), 256 * 4, &mut args))?;
+                    // 2) o_proj GEMM: [m, k] → [m, e] (CH_O にデバイス常駐)
+                    let (mut paqi, mut pasci, mut pw, mut psc, mut pout) =
+                        (daq.ptr(), dasc.ptr(), gw.w.ptr(), gw.sc.ptr(), optr);
+                    let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, e as c_int);
+                    let mut args = [
+                        &mut paqi as *mut _ as *mut c_void,
+                        &mut pasci as *mut _ as *mut c_void,
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut psc as *mut _ as *mut c_void,
+                        &mut pout as *mut _ as *mut c_void,
+                        &mut mc as *mut _ as *mut c_void,
+                        &mut kc as *mut _ as *mut c_void,
+                        &mut nc as *mut _ as *mut c_void,
+                    ];
+                    let gmx = m.div_ceil(128) as u32;
+                    let gmy = e.div_ceil(128) as u32;
+                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args))
+                }
+            })
+        })
+    })
+}
+
 /// P17g: バッチ decode 用 — セッションごとに `chain_attention` を起動し、
 /// 結果をホスト `att` [b, heads*dh] に集める。solo chain と同一カーネル・
 /// 同一入力 → 単独/バッチでビット一致を維持 (exactness 契約 P6)。
@@ -2433,6 +2716,10 @@ pub fn chain_qkv_rope_prefill(
     dh: usize,
     theta: f32,
     bias: &[f32],
+    // B1: Some(slot) なら h は chain_rmsnorm が既にそのスロットに書き込んだ
+    // デバイス常駐データとして直接読む (ホスト h の H2D 81MB/層を廃止)。
+    // None なら従来どおりホスト `h` をアップロードする。Some 時は `h` を空でよい。
+    h_dev: Option<usize>,
 ) -> Option<()> {
     if !gpu_attention_enabled() || !gemm_enabled() {
         return None;
@@ -2450,7 +2737,7 @@ pub fn chain_qkv_rope_prefill(
     if k_w.k != e || v_w.k != e || k_w.n != kv_dim || v_w.n != kv_dim || q_w.n != qn {
         return None;
     }
-    if h.len() != n * e {
+    if h_dev.is_none() && h.len() != n * e {
         return None;
     }
     let ctx = chain_ctx()?;
@@ -2495,7 +2782,6 @@ pub fn chain_qkv_rope_prefill(
 
     CHAIN.with(|cell| -> Option<()> {
         let mut s = cell.borrow_mut();
-        ok(Scratch::ensure(&mut s.qkv_x, n * e * 4))?;
         ok(Scratch::ensure(&mut s.qkv_aq, n * e))?;
         ok(Scratch::ensure(&mut s.qkv_asc, n * 4))?;
         ok(Scratch::ensure(&mut s.qkv_pf, n * width * 4))?;
@@ -2503,14 +2789,43 @@ pub fn chain_qkv_rope_prefill(
         ok(Scratch::ensure(&mut s.rope_tab_pf, (n * dh + bias_len) * 4))?;
         ok(Scratch::ensure_pin(&mut s.pin_qkv, (n * e * 4).max(n * dh * 4 + bias_len * 4)))?;
 
-        // h アップロード (pinned + async)。pin は次層で上書きするが、その前に
-        // 本関数内の sync が挟まるため安全。
-        {
-            let pin = s.pin_qkv.as_mut().unwrap();
-            pin.as_mut_slice::<f32>()[..n * e].copy_from_slice(h);
-        }
-        let (dx, daq, dasc, dqkv, dq, dtab) = (
-            s.qkv_x.as_ref().unwrap().ptr(),
+        // GEMM 入力 h: B1 では chain_rmsnorm が書いたデバイス常駐スロット (CH_H)
+        // を直接読む (H2D 不要)。None の場合は従来どおり pinned からアップロード。
+        let dx = match h_dev {
+            Some(slot) => {
+                let b = match s.bufs.get(slot) {
+                    Some(Some(b)) => b,
+                    _ => return chain_fail(anyhow::anyhow!("chain_qkv_rope_prefill: h_dev slot missing")),
+                };
+                if b.bytes() < n * e * 4 {
+                    return chain_fail(anyhow::anyhow!("chain_qkv_rope_prefill: h_dev slot too small"));
+                }
+                b.ptr()
+            }
+            None => {
+                ok(Scratch::ensure(&mut s.qkv_x, n * e * 4))?;
+                // h アップロード (pinned + async)。pin は次層で上書きするが、その前に
+                // 本関数内の sync が挟まるため安全。
+                {
+                    let pin = s.pin_qkv.as_mut().unwrap();
+                    pin.as_mut_slice::<f32>()[..n * e].copy_from_slice(h);
+                }
+                let pin_ptr = s.pin_qkv.as_ref().unwrap().ptr;
+                unsafe {
+                    ok(check(
+                        (lib.memcpy_htod_async)(
+                            s.qkv_x.as_ref().unwrap().ptr(),
+                            pin_ptr as *const c_void,
+                            n * e * 4,
+                            std::ptr::null_mut(),
+                        ),
+                        "cuMemcpyHtoDAsync (qkv x)",
+                    ))?;
+                }
+                s.qkv_x.as_ref().unwrap().ptr()
+            }
+        };
+        let (daq, dasc, dqkv, dq, dtab) = (
             s.qkv_aq.as_ref().unwrap().ptr(),
             s.qkv_asc.as_ref().unwrap().ptr(),
             s.qkv_pf.as_ref().unwrap().ptr(),
@@ -2518,12 +2833,6 @@ pub fn chain_qkv_rope_prefill(
             s.rope_tab_pf.as_ref().unwrap().ptr(),
         );
         let pin_ptr = s.pin_qkv.as_ref().unwrap().ptr;
-        unsafe {
-            ok(check(
-                (lib.memcpy_htod_async)(dx, pin_ptr as *const c_void, n * e * 4, std::ptr::null_mut()),
-                "cuMemcpyHtoDAsync (qkv x)",
-            ))?;
-        }
         // 1) qkv GEMM: h [n,e] → [n, width] (dno_gemm_i8・CPU lin とビット一致)
         crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
             let (mut px, mut paq, mut pasc) = (dx, daq, dasc);
@@ -4290,6 +4599,191 @@ mod tests {
         }
         println!("attention kernel vs CPU close OK (t={t_total} maxabs={maxd:.3e})");
         assert!(maxd < 1e-3, "attention maxabs diff {maxd}");
+    }
+
+    /// B1: prefill デバイス常駐チェーン全体 (llama.rs forward_prefill_gpu と同一の
+    /// 呼び出し列・単層) が CPU 参照経路と**ビット一致**すること:
+    ///   chain_rmsnorm(#1) → chain_qkv_rope_prefill (h_dev=Some(CH_H): デバイス h 直読み)
+    ///   → [attention は緩和契約のためランダム att を CH_ATT に注入]
+    ///   → maybe_gpu_oproj_dev (CH_ATT 直読み) → chain_rmsnorm(#2, residual 融合)
+    ///   → maybe_gpu_ffn_dev (デバイス常駐) → chain_rmsnorm(最終, residual 融合)。
+    /// rmsnorm (dno_add_rmsnorm・in-place x += proj 含む) / GEMM / rope / swiglu /
+    /// residual 加算は全て従来経路と同一カーネル・同一演算順序 → ビット一致が契約
+    /// (attention のみ緩和枠・ユーザー承認済み)。検証: rope 後 q (デバイス常駐
+    /// qkv_q)・K/V キャッシュ行 [pos0..t_total) (rope カーネル → D2H)・最終 hn
+    /// (CH_H 全行 + chain_download_at の最終行)・最終 residual (CH_X 全行)。
+    #[test]
+    #[ignore] // GPU が必要: cargo test --release --features cuda -- --ignored
+    fn cuda_prefill_chain_bit_exact_vs_cpu() {
+        fn assert_bits_eq(got: &[f32], want: &[f32], label: &str) {
+            assert_eq!(got.len(), want.len(), "{label}: len mismatch");
+            if let Some(i) = got.iter().zip(want).position(|(a, b)| a.to_bits() != b.to_bits()) {
+                panic!(
+                    "{label}: bit mismatch @{i} gpu={:?} ({:08x}) cpu={:?} ({:08x})",
+                    got[i],
+                    got[i].to_bits(),
+                    want[i],
+                    want[i].to_bits()
+                );
+            }
+        }
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        CudaCtx::new().unwrap();
+        enable_for_tests();
+        // GEMM 経路 (m > max_m=16 かつ m >= gemm_min_m) を満たすよう閾値を下げる
+        std::env::set_var("DENNO_CUDA_GEMM_MIN_M", "8");
+
+        let (n, e, ff) = (40usize, 96usize, 64usize);
+        let (heads, kv_heads, dh) = (4usize, 2usize, 16usize);
+        let pos0 = 5usize;
+        let t_total = pos0 + n;
+        let qn = heads * dh;
+        let kv_dim = kv_heads * dh;
+        let width = qn + 2 * kv_dim;
+        let eps = 1e-6f32;
+        let theta = 10_000.0f32;
+        assert!(gemm_path_active(n), "テスト形状が GEMM 経路の事前ゲートを通らない");
+
+        // 重み (本番と同一の Quant8Linear::quantize 構築経路・uid は自動採番)
+        let qw = crate::quant::Quant8Linear::quantize(&pseudo_random(qn * e, 400), e, qn);
+        let kw = crate::quant::Quant8Linear::quantize(&pseudo_random(kv_dim * e, 401), e, kv_dim);
+        let vw = crate::quant::Quant8Linear::quantize(&pseudo_random(kv_dim * e, 402), e, kv_dim);
+        let ow = crate::quant::Quant8Linear::quantize(&pseudo_random(e * qn, 403), qn, e);
+        let gate = crate::quant::Quant8Linear::quantize(&pseudo_random(ff * e, 404), e, ff);
+        let up = crate::quant::Quant8Linear::quantize(&pseudo_random(ff * e, 405), e, ff);
+        let down = crate::quant::Quant8Linear::quantize(&pseudo_random(e * ff, 406), ff, e);
+        let ln1 = pseudo_random(e, 407);
+        let ln2 = pseudo_random(e, 408);
+        let norm_w = pseudo_random(e, 409);
+
+        // KV キャッシュ: 履歴行 [0..pos0) をシードして advance (pos0>0 経路)。
+        // 現在行 [pos0..t_total) は chain_qkv_rope_prefill が rope カーネル → D2H で
+        // 書く (前提: 未書き込み)。容量確保は従来経路と同一 (P17e 契約)。
+        let mut cache = crate::kv_cache::KvCache::new(1, kv_dim, t_total + 64);
+        {
+            let (kbuf, vbuf) = cache.kv_bufs(0, pos0);
+            kbuf[..pos0 * kv_dim].copy_from_slice(&pseudo_random(pos0 * kv_dim, 410));
+            vbuf[..pos0 * kv_dim].copy_from_slice(&pseudo_random(pos0 * kv_dim, 411));
+        }
+        cache.advance(pos0);
+        let _ = cache.kv_bufs(0, n);
+        let key = cache.kv_id();
+
+        // ---- GPU デバイス常駐チェーン (forward_prefill_gpu と同一呼び出し列) ----
+        let x = pseudo_random(n * e, 412);
+        chain_upload(CH_X, &x, e, n).unwrap();
+        chain_rmsnorm(&ln1, eps, None, CH_H, e, n, 0).unwrap(); // pin_id = li*3
+        chain_qkv_rope_prefill(
+            &qw, &kw, &vw, &[], &mut cache, key, 0, 1, pos0, n, t_total, heads, kv_heads, dh,
+            theta, &[], Some(CH_H),
+        )
+        .unwrap();
+        // attention は緩和契約 (cuda_attention_prefill_vs_cpu_reference で担保) のため
+        // ランダム att を CH_ATT に注入し、以降のデバイス常駐チェーンだけを検証する
+        let att = pseudo_random(n * qn, 413);
+        chain_upload(CH_ATT, &att, qn, n).unwrap();
+        maybe_gpu_oproj_dev(&ow, n, qn, 0).unwrap();
+        chain_rmsnorm(&ln2, eps, Some(CH_O), CH_H, e, n, 1).unwrap(); // pin_id = li*3+1
+        maybe_gpu_ffn_dev(&gate, &up, &down, CH_H, n, ff, 0).unwrap();
+        chain_rmsnorm(&norm_w, eps, Some(CH_DOWN), CH_H, e, n, 3).unwrap(); // pin_id = n_layers*3
+
+        // ---- CPU 参照 (従来経路と同一演算列) ----
+        let mut h = vec![0.0f32; n * e];
+        for i in 0..n {
+            h[i * e..][..e].copy_from_slice(&tensor::rmsnorm(&x[i * e..][..e], &ln1, e, eps));
+        }
+        // qkv GEMM (dno_gemm_i8 とビット一致の matvec_rows_bt_i8)。行 = [q | k | v]
+        let mut qkv_w = Vec::with_capacity(e * width);
+        qkv_w.extend_from_slice(&qw.w);
+        qkv_w.extend_from_slice(&kw.w);
+        qkv_w.extend_from_slice(&vw.w);
+        let mut qkv_sc = Vec::with_capacity(width);
+        qkv_sc.extend_from_slice(&qw.scale);
+        qkv_sc.extend_from_slice(&kw.scale);
+        qkv_sc.extend_from_slice(&vw.scale);
+        let qkv = tensor::matvec_rows_bt_i8(&h, &qkv_w, &qkv_sc, e, width, n);
+        let mut q_ref = vec![0.0f32; n * qn];
+        let mut k_ref = vec![0.0f32; n * kv_dim];
+        let mut v_ref = vec![0.0f32; n * kv_dim];
+        for i in 0..n {
+            let row = &qkv[i * width..][..width];
+            q_ref[i * qn..][..qn].copy_from_slice(&row[..qn]);
+            k_ref[i * kv_dim..][..kv_dim].copy_from_slice(&row[qn..qn + kv_dim]);
+            v_ref[i * kv_dim..][..kv_dim].copy_from_slice(&row[qn + kv_dim..]);
+        }
+        tensor::rope_rows(&mut q_ref, n, heads, dh, pos0, theta);
+        tensor::rope_rows(&mut k_ref, n, kv_heads, dh, pos0, theta);
+        // o_proj → residual 加算 (dno_add_rmsnorm の in-place x += proj と同一) → rmsnorm #2
+        let o = tensor::matvec_rows_bt_i8(&att, &ow.w, &ow.scale, qn, e, n);
+        let mut xr = x.clone();
+        for i in 0..n * e {
+            xr[i] += o[i];
+        }
+        let mut h2 = vec![0.0f32; n * e];
+        for i in 0..n {
+            h2[i * e..][..e].copy_from_slice(&tensor::rmsnorm(&xr[i * e..][..e], &ln2, e, eps));
+        }
+        // FFN: gate|up 連結 GEMM → silu*up → down
+        let mut gu_w = Vec::with_capacity(e * 2 * ff);
+        gu_w.extend_from_slice(&gate.w);
+        gu_w.extend_from_slice(&up.w);
+        let mut gu_sc = Vec::with_capacity(2 * ff);
+        gu_sc.extend_from_slice(&gate.scale);
+        gu_sc.extend_from_slice(&up.scale);
+        let out1 = tensor::matvec_rows_bt_i8(&h2, &gu_w, &gu_sc, e, 2 * ff, n);
+        let mut act = vec![0.0f32; n * ff];
+        for i in 0..n {
+            let row = &out1[i * 2 * ff..(i + 1) * 2 * ff];
+            act[i * ff..(i + 1) * ff].copy_from_slice(&row[..ff]);
+            tensor::silu_inplace(&mut act[i * ff..(i + 1) * ff]);
+            for f in 0..ff {
+                act[i * ff + f] *= row[ff + f];
+            }
+        }
+        let d = tensor::matvec_rows_bt_i8(&act, &down.w, &down.scale, ff, e, n);
+        let mut xf = xr;
+        for i in 0..n * e {
+            xf[i] += d[i];
+        }
+        let mut hn = vec![0.0f32; n * e];
+        for i in 0..n {
+            hn[i * e..][..e].copy_from_slice(&tensor::rmsnorm(&xf[i * e..][..e], &norm_w, e, eps));
+        }
+
+        // ---- 検証 ----
+        // 1) rope 後 q (デバイス常駐 qkv_q)
+        let q_gpu = chain_qkv_q_download(n, qn).unwrap();
+        assert_bits_eq(&q_gpu, &q_ref, "rope 後 q");
+        // 2) K/V キャッシュ行: 現在行 [pos0..t_total) は rope 後と一致・履歴行 [0..pos0)
+        //    はシード値のまま (rope カーネルが履歴を書き換えていないこと)
+        let (kc, vc) = cache.kv_bufs_ref(0);
+        let k_hist = pseudo_random(pos0 * kv_dim, 410);
+        let v_hist = pseudo_random(pos0 * kv_dim, 411);
+        for i in 0..t_total {
+            let off = i * kv_dim;
+            let wk: &[f32] = if i < pos0 {
+                &k_hist[off..off + kv_dim]
+            } else {
+                &k_ref[(i - pos0) * kv_dim..(i - pos0 + 1) * kv_dim]
+            };
+            let wv: &[f32] = if i < pos0 {
+                &v_hist[off..off + kv_dim]
+            } else {
+                &v_ref[(i - pos0) * kv_dim..(i - pos0 + 1) * kv_dim]
+            };
+            assert_bits_eq(&kc[off..off + kv_dim], wk, &format!("k 行 {i}"));
+            assert_bits_eq(&vc[off..off + kv_dim], wv, &format!("v 行 {i}"));
+        }
+        // 3) 最終 hn (CH_H 全行) + chain_download_at の最終行 (本番が lm_head 入力と
+        //    して取り出す [n-1] 行のみの D2H — B1 ヘルパー)
+        let hn_gpu = chain_download(CH_H, n * e).unwrap();
+        assert_bits_eq(&hn_gpu, &hn, "最終 hn");
+        let hn_last = chain_download_at(CH_H, (n - 1) * e, e).unwrap();
+        assert_bits_eq(&hn_last, &hn[(n - 1) * e..], "最終 hn (download_at)");
+        // 4) 最終 residual (CH_X 全行 — 層内 2 回の in-place x += proj/down を含む)
+        let xf_gpu = chain_download(CH_X, n * e).unwrap();
+        assert_bits_eq(&xf_gpu, &xf, "最終 residual (CH_X)");
+        println!("prefill chain bit-exact OK (n={n} e={e} ff={ff} pos0={pos0} t={t_total})");
     }
 }
 
