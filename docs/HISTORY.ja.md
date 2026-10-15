@@ -599,6 +599,30 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **検証**: cargo test --workspace(CPU)全 green(lib 147 不変)+ cargo check --features cuda --tests green。**実機での再検証が必要**: ①`cuda_attn_pf_bench`(n=t=13252)のカーネル単体タイミング(旧 69.3ms/call からの改善幅)②`cuda_attention_prefill_vs_cpu_reference/large` の maxabs・決定論再確認 ③E2E PROFILE 計測(P17k 手順)。GPU バイナリ再ビルド+サーバー再起動は人間対応
 - **残課題**: 実機 E2E 計測 + BK 拡大の A/B 実験(smem >48KB の opt-in)+ スコア phase のさらなる共有(4r×2k)
 
+### 8095 GPU E2E リグレッション調査 — Qwen3.5-9B の GPU prefill 破綻 (調査記録・2026-10-15)
+
+> A2-green (`9183e7e`) 以降の運用で、GPU サーバの Qwen3.5-9B int8 E2E 出力が破綻するリグレッションを検出(同一 payload の CPU サーバは正常)。第1セッションで再現と切り分け、第2セッションでコード同一性の完全化と CPU 再現検証を実施。原因は未特定(本節は調査記録・コード変更なし)。
+
+**切り分け結果(第1セッション)**:
+- GPU は最初のトークンで既に破綻(`max_tokens=1` で GPU/CPU の 1 token が不一致)→ **原因は prefill 経路**(decode 経路の A1-r2 n==1 GPU GDN は無関係)
+- コールドプロンプト(真の full prefill)でも破綻 → **GPU 上の full prefill そのものが壊れている**
+- 同一リクエスト 5 連続で完全同一出力 → 恒常的な誤り(決定論自体は維持)・GPU サーバは repetition_penalty に応答 → A2.5 以降の新バイナリ
+- B1 (`forward_prefill_gpu`) は llama 専属で Qwen3.5 に到達しない・B2 の `dno_attention_prefill` も Qwen3.5 prefill では発火しない
+
+**コード同一性の完全化(第2セッション)** — A2-green と HEAD (`699d902`) の GPU 経路ファイルを旧ファイル行番号マップで関数単位に全 diff:
+- `cuda.rs` で変更された既存関数は 3 つのみ: ①`CudaCtx`/`new` — A1-r2 chunked 3 カーネルハンドルの追加読み込み(既存動作不変)②`gdn_scan_batch` — chunked ルーティング追加(`n >= 2048 && dk==dv && d_conv==4`)・**非該当時は旧 `gdn_scan_impl` へ同一引数で委譲** ③`chain_qkv_rope_prefill` — B1 の `h_dev` 追加(llama 専属)。`gdn_scan_impl` 本文は無変更。その他の差分は新規関数の純追加(llama chain / chunked / テスト)
+- `gdn.rs`・`kernels/gdn.cu`: **変更行ゼロの純追加**(chunked CPU 参照 + 3 カーネル追記)。`kernels_elem.cu` の変更は B2 の `dno_attention_prefill` のみ(llama 専属)
+- PTX: `kernels_int8.ptx` は A2-green と HEAD で sha256 一致。`kernels_gdn.ptx` は A1-r2 以降不変・単発 `dno_gdn_scan` 部は A2-green とバイト一致(第1セッション検証済み)。`kernels_elem.ptx` 差分は dno_attention_prefill に局所(B2 検証済み)
+- → **A2-green → HEAD のどの変更も Qwen3.5 GPU prefill 経路に到達しない**ことが確定
+
+**CPU 再現検証**: HEAD (`699d902`) のローカル CPU ビルドで GPU サーバと同一 payload(`q35_9b_1.json` 相当・`--seed 42 --quant int8`)を実行 → 出力 md5 (content) = `3a0ddf1c4fbe9c9213f6d13b11d0685c` で CPU サーバと**完全一致** → HEAD コードの CPU 経路は正常(破綻は GPU 実行に固有)
+
+**残る仮説**: H1 = GPU サーバのバイナリが別ソース(同期漏れ/dirty tree/ホスト・PTX 不整合)からビルドされている(最有力)/ H2 = GPU 環境変化(ドライバ更新等)
+
+**診断ツール(未 commit)**: `DENNO_DEBUG_LAYER_CHKSUM=1` で Qwen3.5 prefill の層別 hidden-state checksum(最終行の bitsum/maxabs/ssq・emb/L00..L31 attn/ffn/final hf/final logits argmax)を stderr の `[LCHK]` 行に出す env-gated パッチ(`diag_layer_checksum.patch`・`qwen35.rs` のみ・動作検証済み: CPU ビルドで 32 層分出力・出力 md5 不変)。GPU バイナリと `DENNO_CUDA=0`(CPU モード)の `[LCHK]` 行を突き合わせれば初発散層を特定できる(GDN 層は緩和契約のため微小 drift は正常・full attention 層は drift 消滅まで bit 一致のはず)
+
+**残課題(人間対応)**: ①診断パッチ適用で GPU バイナリを再ビルド+起動し `[LCHK]` 比較(出力が正常化すれば H1 確定=配備不整合)②またはクリーンな `699d902` チェックアウトからの再ビルドで H1 を直接検証。詳細手順は REPORT_NEXT.md 参照
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B UD-IQ2_XXS 動作)
@@ -609,6 +633,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] ~~**A3: Qwen3.8-27B スケール**~~ → **完了 (コード/予算面・2026-10-15)**: 64 層 = 48 GDN + 16 full を合成モデルで検証 (決定論・prefill bit 一致契約・untied lm_head)・`output_gate_type: "swish"` は参照実装が不使用のため動作不変・GDN 層の KV バッファ確保廃止で KV 実量 1/4 (512KB → 128KB B/token)・GDN ヘッド比のロード時ガード。実 GGUF での E2E (UD-IQ2_XXS 配置+実機 GPU) は残課題
 - [x] ~~**A2.5: 9B 生成品質の改善(A3 前に推奨)**~~ → **完了**: チャットテンプレートは Qwen3.5 公式準拠を確認(不一致なし)・repetition penalty 実装(HF 互換・決定論・penalty 1.1 で反復解消)。根本の数値原因の切り分け(llama.cpp 同 GGUF 比較)は継続
 - [x] ~~**A4: prefix cache への GDN 状態スナップショット**(任意): recurrent モデルはフル prefill 固定(正しさ優先)~~ → **完了 (2026-10-15)**: KV + GDN 状態のペア復元 (prompt 境界スナップショット・`best_full_match` のときのみ復元・部分一致と同一 prompt は full prefill フォールバック)。復元後の継続 forward はフル prefill と bit 一致・退避は prefill 直後に変更。実機マルチターン E2E 計測は残課題
+- [ ] **8095 GPU E2E リグレッションの解明(人間対応)**: GPU prefill が最初の 1 token から破綻・コード同一性は閉じた(A2-green → HEAD の変更は Qwen3.5 GPU prefill 経路に到達しない)・HEAD CPU ビルドは CPU サーバと md5 一致で正常。残仮説は H1(GPU バイナリの別ソースビルド・最有力)/ H2(GPU 環境変化)。診断パッチ(`DENNO_DEBUG_LAYER_CHKSUM` 層別 checksum)適用での GPU 再ビルド+`[LCHK]` 比較、またはクリーンな `699d902` からの再ビルドで特定する(§3 調査節+REPORT_NEXT.md 参照)
 
 ### P17 系残課題(CUDA)
 
