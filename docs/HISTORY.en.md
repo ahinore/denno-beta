@@ -599,6 +599,30 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - **Verification**: cargo test --workspace (CPU) all green (lib 147 unchanged) + cargo check --features cuda --tests green. **Real-machine re-verification needed**: ①`cuda_attn_pf_bench` (n=t=13252) kernel timing (improvement over the old 69.3ms/call) ②maxabs/determinism re-check of `cuda_attention_prefill_vs_cpu_reference/large` ③E2E PROFILE measurement (P17k procedure). The GPU binary rebuild + server restart are human follow-up
 - **Remaining work**: real-machine E2E measurement + a BK-expansion A/B experiment (smem >48KB opt-in) + further score-phase sharing (4r×2k)
 
+### 8095 GPU E2E regression investigation — Qwen3.5-9B GPU prefill broken (investigation record, 2026-10-15)
+
+> During operation after A2-green (`9183e7e`), a regression was detected where the GPU server's Qwen3.5-9B int8 E2E output is garbled while the CPU server is fine with the same payload. Session 1 reproduced and triaged it; session 2 completed the code-identity audit and the CPU reproduction check. Root cause not yet identified (this section is an investigation record — no code change).
+
+**Triage results (session 1)**:
+- The GPU output is broken from the very first token (with `max_tokens=1` the single GPU/CPU tokens differ) → **the prefill path is at fault** (the A1-r2 n==1 GPU GDN decode entry is unrelated)
+- A cold prompt (a true full prefill) is also broken → **the full prefill running on the GPU itself is broken**
+- 5 identical requests produce exactly the same output → a persistent error (determinism itself holds); the GPU server responds to repetition_penalty → a post-A2.5 binary
+- B1 (`forward_prefill_gpu`) is llama-only and never reached by Qwen3.5; B2's `dno_attention_prefill` does not fire on the Qwen3.5 prefill either
+
+**Code identity audit (session 2)** — full function-level diff of the GPU-path files between A2-green and HEAD (`699d902`), attributing each diff hunk to its enclosing function via an old-file line-number map:
+- Only 3 existing functions changed in `cuda.rs`: ①`CudaCtx`/`new` — A1-r2 added the 3 chunked-kernel handles (existing behavior unchanged) ②`gdn_scan_batch` — added chunked routing (`n >= 2048 && dk==dv && d_conv==4`); **otherwise it forwards to the old `gdn_scan_impl` with identical arguments** ③`chain_qkv_rope_prefill` — B1's `h_dev` addition (llama-only). The body of `gdn_scan_impl` is unchanged. All other diffs are pure additions of new functions (llama chain / chunked / tests)
+- `gdn.rs` and `kernels/gdn.cu`: **zero changed lines, pure additions** (the chunked CPU reference + 3 appended kernels). `kernels_elem.cu` changed only in B2's `dno_attention_prefill` (llama-only)
+- PTX: `kernels_int8.ptx` has an identical sha256 at A2-green and HEAD. `kernels_gdn.ptx` is unchanged since A1-r2 and its single-shot `dno_gdn_scan` part is byte-identical to A2-green (verified in session 1). The `kernels_elem.ptx` diff is local to dno_attention_prefill (verified in B2)
+- → Established that **no A2-green → HEAD change reaches the Qwen3.5 GPU prefill path**
+
+**CPU reproduction check**: a local CPU build of HEAD (`699d902`) running the same payload as the GPU server (`q35_9b_1.json` equivalent, `--seed 42 --quant int8`) produced output md5 (content) = `3a0ddf1c4fbe9c9213f6d13b11d0685c`, an **exact match** with the CPU server → the HEAD code's CPU path is healthy (the breakage is specific to GPU execution)
+
+**Remaining hypotheses**: H1 = the GPU server binary was built from different sources (sync miss / dirty tree / host-vs-PTX mismatch) (most likely) / H2 = a GPU environment change (e.g. driver update)
+
+**Diagnostic tool (not committed)**: with `DENNO_DEBUG_LAYER_CHKSUM=1`, an env-gated patch prints per-layer hidden-state checksums of the Qwen3.5 prefill (last-row bitsum/maxabs/ssq at emb / L00..L31 attn/ffn / final hf / final logits argmax) as `[LCHK]` lines on stderr (`diag_layer_checksum.patch`, touches only `qwen35.rs`, verified working: 32 layers printed by the CPU build, output md5 unchanged). Pairing the `[LCHK]` lines of the GPU binary against `DENNO_CUDA=0` (CPU mode) pinpoints the first diverging layer (small drift at GDN layers is expected under the relaxed contract; full-attention layers should be bit-identical until drift propagates in)
+
+**Remaining work (human follow-up)**: ①rebuild + restart the GPU binary with the diagnostic patch applied and compare `[LCHK]` lines (if the output becomes correct, H1 is confirmed = deployment mismatch) ②or rebuild from a clean `699d902` checkout to test H1 directly. See REPORT_NEXT.md for the detailed procedure
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B on UD-IQ2_XXS)
@@ -609,6 +633,7 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - [x] ~~**A3: Qwen3.8-27B scale**~~ → **done (code/budget side, 2026-10-15)**: verified 64 layers = 48 GDN + 16 full with a synthetic model (determinism, prefill bit-exactness contract, untied lm_head) · `output_gate_type: "swish"` is unconsumed by reference implementations, so behavior is unchanged · dropping KV buffers for GDN layers cuts real KV usage to 1/4 (512KB → 128KB B/token) · load-time guard for the GDN head ratio. Real-GGUF E2E (UD-IQ2_XXS placement + real GPU) remains
 - [x] ~~**A2.5: 9B generation quality (recommended before A3)**~~ → **done**: chat template verified against the official Qwen3.5 spec (no mismatch) · repetition penalty implemented (HF-compatible, deterministic; 1.1 breaks the loop). Root-cause isolation (llama.cpp same-GGUF comparison) continues
 - [x] ~~**A4: GDN state snapshot in the prefix cache** (optional): recurrent models always full-prefill (correctness first)~~ → **done (2026-10-15)**: paired KV + GDN-state restore (prompt-boundary snapshot, restored only via `best_full_match`; partial matches and identical prompts fall back to a full prefill). The continuation after restore is bit-identical to a full prefill, and the snapshot timing moved to right after prefill. Real-machine multi-turn E2E measurement remains
+- [ ] **Resolve the 8095 GPU E2E regression (human follow-up)**: the GPU prefill is broken from the very first token; the code identity audit is closed (no A2-green → HEAD change reaches the Qwen3.5 GPU prefill path) and the HEAD CPU build is healthy (matching the CPU server's md5). Remaining hypotheses: H1 (GPU binary built from different sources, most likely) / H2 (GPU environment change). Pinpoint via a GPU rebuild with the diagnostic patch (`DENNO_DEBUG_LAYER_CHKSUM` per-layer checksums) + `[LCHK]` comparison, or a clean rebuild from `699d902` (see §3 investigation section + REPORT_NEXT.md)
 
 ### P17-family leftovers (CUDA)
 
