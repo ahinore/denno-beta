@@ -308,6 +308,8 @@ pub struct CudaCtx {
     f_rope: CUfunction,
     // P17k ステップ 5: prefill 用行並列 rope (qkv→rope→attention 連続化)
     f_rope_pf: CUfunction,
+    // B3: b>1 バッチ decode 用 rope (q/k in-place・行ごと独立位置・CPU rope_row とビット一致)
+    f_rope_b: CUfunction,
     // P19-A1: GDN 逐次 AR スキャン (prefill バッチ・GDN は bit 一致不要/決定論のみ)
     #[allow(dead_code)]
     module_gdn: CUmodule,
@@ -435,6 +437,12 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_rope_pf, module_elem, b"dno_rope_qkv_pf\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_rope_qkv_pf)",
             )?;
+            // B3: b>1 バッチ decode 用 rope
+            let mut f_rope_b: CUfunction = std::ptr::null_mut();
+            check(
+                (lib.module_get_function)(&mut f_rope_b, module_elem, b"dno_rope_qk_batch\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_rope_qk_batch)",
+            )?;
 
             // P19-A1: GDN 逐次スキャンモジュール
             let mut module_gdn: CUmodule = std::ptr::null_mut();
@@ -485,6 +493,7 @@ impl CudaCtx {
                 f_attn_pf,
                 f_rope,
                 f_rope_pf,
+                f_rope_b,
                 module_gdn,
                 f_gdn,
                 f_gdn_chunk_pre,
@@ -1595,6 +1604,16 @@ struct ChainScratch {
     qkv_q: Option<DevBuffer>,     // rope 後 q [n, heads*dh] (attention 入力)
     rope_tab_pf: Option<DevBuffer>, // rope テーブル [n, dh] (行 i = pos0+i の cos|sin)
     pin_qkv: Option<PinMem>,      // h / rope テーブル / bias アップロード用 pinned
+    // B3: b>1 バッチ decode の rope (batch_rope_qk)
+    br_q: Option<DevBuffer>,      // [b, heads*dh] f32 (in-place rope)
+    br_k: Option<DevBuffer>,      // [b, kv_dim] f32 (in-place rope)
+    br_tab: Option<DevBuffer>,    // [b, dh] f32 テーブル (行 i = poss[i] の [cos|sin])
+    br_pin_qk: Option<PinMem>,    // q/k の H2D/D2H ステージング (sync を挟むので再利用安全)
+    br_pin_tab: Option<PinMem>,   // テーブル H2D ステージング
+    br_tab_key: Vec<usize>,       // テーブルキャッシュキー (poss・完全一致)
+    br_tab_dh: usize,             // テーブルキャッシュキー (dh)
+    br_tab_theta: f32,            // テーブルキャッシュキー (theta・bits 比較)
+    br_tab_valid: bool,           // dev 上のテーブルがキャッシュキーと一致するか
     // P17h: ステップ内で sync が無くなるため pinned は (層×用途) ごとに専用化する
     // (async H2D の DMA 完了前にホストが上書きする競合を避ける)。id は呼び出し側が
     // 層番号と用途から一意に採番する。
@@ -1622,6 +1641,15 @@ thread_local! {
         qkv_q: None,
         rope_tab_pf: None,
         pin_qkv: None,
+        br_q: None,
+        br_k: None,
+        br_tab: None,
+        br_pin_qk: None,
+        br_pin_tab: None,
+        br_tab_key: Vec::new(),
+        br_tab_dh: 0,
+        br_tab_theta: 0.0,
+        br_tab_valid: false,
         pins: Vec::new(),
     });
 }
@@ -2629,6 +2657,206 @@ pub fn chain_rope_qkv(
                 &mut args,
             )
         })
+    })
+}
+
+// ===========================================================================
+// B3: b>1 バッチ decode の rope GPU 化 (P17 系 rope カーネルの再利用)
+// ===========================================================================
+
+/// B3: b>1 バッチ decode の rope を GPU で実行する (q/k in-place・セッションごと
+/// に独立した位置)。CPU 経路 (forward_batch の session ごと `tensor::rope_row`
+/// 適用) と**ビット一致** (exactness 契約: rope は緩和対象外):
+/// - テーブルは CPU が rope_row と同一式 (同一プロセスの glibc powf/cosf/sinf)
+///   で生成 → テーブル値はビット一致
+/// - カーネル `dno_rope_qk_batch` は mul/sub のみ (-fmad=false → mul.rn/sub.rn/
+///   add.rn = Rust スカラー演算と同一の丸め)
+/// - bias/QK-Norm は呼び出し側が既に CPU で適用済みの q/k を渡す (rope は
+///   bias/QK-Norm と無関係・CPU 経路と同一の演算列)
+/// 失敗時は false を返しホスト q/k は不変 (呼び出し側が CPU rope でやり直せる —
+/// D2H 完了後に初めてホストへ書き戻す)。テーブルは (poss・dh・theta) 完全一致
+/// でキャッシュ (1 ステップの層ループで同一 poss が層数回来るため H2D もスキップ)。
+#[allow(clippy::too_many_arguments)]
+pub fn batch_rope_qk(
+    q: &mut [f32],
+    k: &mut [f32],
+    poss: &[usize],
+    heads: usize,
+    kv_heads: usize,
+    dh: usize,
+    theta: f32,
+) -> bool {
+    let Some(ctx) = chain_ctx() else { return false };
+    let b = poss.len();
+    // カーネル/転送の形状ガード (grid/block 上限・size_t オーバーフロー防止)。
+    // 非該当 shapes は静かに CPU フォールバック (GPU_BROKEN ラッチも不要)。
+    let Some(hd) = heads.checked_mul(dh) else { return false };
+    let Some(kv_dim) = kv_heads.checked_mul(dh) else { return false };
+    let Some(q_floats) = b.checked_mul(hd) else { return false };
+    let Some(k_floats) = b.checked_mul(kv_dim) else { return false };
+    if b == 0 || b > 65535 || dh == 0 || dh > 1024 || heads + kv_heads > 65535 {
+        return false;
+    }
+    let q_bytes = q_floats * 4;
+    let k_bytes = k_floats * 4;
+    let tab_floats = b * dh;
+    let tab_bytes = tab_floats * 4;
+    CHAIN.with(|cell| -> bool {
+        let mut s = cell.borrow_mut();
+        // --- テーブル (キャッシュヒットなら生成 + H2D をスキップ) ---
+        let cache_hit = s.br_tab_valid
+            && s.br_tab_dh == dh
+            && s.br_tab_theta.to_bits() == theta.to_bits()
+            && s.br_tab_key.len() == b
+            && s.br_tab_key.iter().zip(poss.iter()).all(|(a, p)| a == p);
+        if !cache_hit {
+            if ok(Scratch::ensure(&mut s.br_tab, tab_bytes)).is_none()
+                || ok(Scratch::ensure_pin(&mut s.br_pin_tab, tab_bytes)).is_none()
+            {
+                return false;
+            }
+            {
+                // tensor::rope_row と同一式で生成 (同一プロセスの glibc
+                // powf/cosf/sinf → 値はビット一致・P17h chain_rope_prepare と同じ)
+                let tab = s.br_pin_tab.as_mut().unwrap().as_mut_slice::<f32>();
+                let half = dh / 2;
+                for (i, &pos) in poss.iter().enumerate() {
+                    let posf = pos as f32;
+                    let row = &mut tab[i * dh..][..dh];
+                    for d in 0..half {
+                        let ang = posf * theta.powf(-2.0 * d as f32 / dh as f32);
+                        row[d] = ang.cos();
+                        row[half + d] = ang.sin();
+                    }
+                }
+            }
+            let lib = match ok(lib()) {
+                Some(l) => l,
+                None => return false,
+            };
+            let dev = s.br_tab.as_ref().unwrap().ptr();
+            let pin = s.br_pin_tab.as_ref().unwrap();
+            unsafe {
+                if ok(check(
+                    (lib.memcpy_htod_async)(dev, pin.ptr as *const c_void, tab_bytes, std::ptr::null_mut()),
+                    "cuMemcpyHtoDAsync (batch rope tab)",
+                ))
+                .is_none()
+                {
+                    return false;
+                }
+            }
+            s.br_tab_key.clear();
+            s.br_tab_key.extend_from_slice(poss);
+            s.br_tab_dh = dh;
+            s.br_tab_theta = theta;
+            s.br_tab_valid = true;
+        }
+        // --- バッファ確保 + q/k アップロード (pin は [q|k] 連結で 1 本) ---
+        if ok(Scratch::ensure(&mut s.br_q, q_bytes)).is_none()
+            || ok(Scratch::ensure(&mut s.br_k, k_bytes)).is_none()
+            || ok(Scratch::ensure_pin(&mut s.br_pin_qk, q_bytes + k_bytes)).is_none()
+        {
+            return false;
+        }
+        let lib = match ok(lib()) {
+            Some(l) => l,
+            None => return false,
+        };
+        let (dq, dk) = (
+            s.br_q.as_ref().unwrap().ptr(),
+            s.br_k.as_ref().unwrap().ptr(),
+        );
+        unsafe {
+            {
+                let pin = s.br_pin_qk.as_mut().unwrap();
+                pin.as_mut_slice::<f32>()[..q_floats].copy_from_slice(q);
+                if ok(check(
+                    (lib.memcpy_htod_async)(dq, pin.ptr as *const c_void, q_bytes, std::ptr::null_mut()),
+                    "cuMemcpyHtoDAsync (batch rope q)",
+                ))
+                .is_none()
+                {
+                    return false;
+                }
+            }
+            {
+                let pin = s.br_pin_qk.as_mut().unwrap();
+                pin.as_mut_slice::<f32>()[q_floats..q_floats + k_floats].copy_from_slice(k);
+                let ksrc = (pin.ptr as *const u8).add(q_bytes) as *const c_void;
+                if ok(check(
+                    (lib.memcpy_htod_async)(dk, ksrc, k_bytes, std::ptr::null_mut()),
+                    "cuMemcpyHtoDAsync (batch rope k)",
+                ))
+                .is_none()
+                {
+                    return false;
+                }
+            }
+        }
+        // --- カーネル起動 (grid = (heads + kv_heads, b)・block = (dh)) ---
+        let (mut pq, mut pk, mut pt) = (dq, dk, s.br_tab.as_ref().unwrap().ptr());
+        let (mut hc, mut khc, mut dc) = (heads as c_int, kv_heads as c_int, dh as c_int);
+        let mut args: Vec<*mut c_void> = vec![
+            &mut pq as *mut _ as *mut c_void,
+            &mut pk as *mut _ as *mut c_void,
+            &mut pt as *mut _ as *mut c_void,
+            &mut hc as *mut _ as *mut c_void,
+            &mut khc as *mut _ as *mut c_void,
+            &mut dc as *mut _ as *mut c_void,
+        ];
+        if ok(unsafe {
+            ctx.launch_async(
+                ctx.f_rope_b,
+                ((heads + kv_heads) as u32, b as u32, 1),
+                (dh as u32, 1, 1),
+                0,
+                &mut args,
+            )
+        })
+        .is_none()
+        {
+            return false;
+        }
+        if ok(ctx.sync()).is_none() {
+            return false;
+        }
+        // --- 結果 D2H ([q|k] を pin の非重複領域へ・両方成功するまでホスト q/k は不変) ---
+        unsafe {
+            {
+                let pin = s.br_pin_qk.as_mut().unwrap();
+                if ok(check(
+                    (lib.memcpy_dtoh_async)(pin.ptr, dq, q_bytes, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (batch rope q)",
+                ))
+                .is_none()
+                {
+                    return false;
+                }
+            }
+            {
+                let pin = s.br_pin_qk.as_mut().unwrap();
+                let kdst = (pin.ptr as *mut u8).add(q_bytes) as *mut c_void;
+                if ok(check(
+                    (lib.memcpy_dtoh_async)(kdst, dk, k_bytes, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (batch rope k)",
+                ))
+                .is_none()
+                {
+                    return false;
+                }
+            }
+        }
+        if ok(ctx.sync()).is_none() {
+            return false;
+        }
+        {
+            let pin = s.br_pin_qk.as_ref().unwrap();
+            let sl = pin.as_slice::<f32>();
+            q.copy_from_slice(&sl[..q_floats]);
+            k.copy_from_slice(&sl[q_floats..q_floats + k_floats]);
+        }
+        true
     })
 }
 
