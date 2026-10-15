@@ -634,6 +634,9 @@ o[c]   = sum_r q[r] * S[r][c]
 - Unsloth Dynamic(UD-IQ2_XXS 等)のような**層ごとに異なる量子型の混合**でも、dequant してしまえば以降は既存経路と同一
 - **Int8 モードでも `ssm_beta`/`ssm_alpha` は Fp32 維持**: sigmoid/softplus を通る制御信号で、per-row int8 の ~1% ノイズが出力を崩す(beta は delta rule 全体の強さ・alpha は減衰率に直接効く)
 - `pick_gguf`: ディレクトリ内の .gguf から UD-IQ2_XXS 優先で選択(`DENNO_GGUF_FILE` で明示指定可)
+- **ロード時形状ガード (`expect_ne`)**: 層テンソルを dequant する前に、GGUF ヘッダ上の形状 (ne) を config 由来の期待値と照合する (末尾の 1 は無視)。想定外の構造 (full-attn の q|gate 融合の有無・out-gate 構造・MTP 層の混入) を静かに誤読して logits を壊す前に、ロード時に明確なエラーで拒否する (27B out-gate 構造調査の反映)
+- **MTP (nextn) 層の除外**: GGUF `block_count` が config `num_hidden_layers` を超過する分は、`nextn_predict_layers` と一致しかつ超過ブロックが `nextn.eh_proj` を持ち `ssm_a` を持たない場合のみ nextn (MTP) 層として読み飛ばす (27B: block_count=65 = trunk 64 + 1)。不整合はロード拒否 — nextn を通常層として読むと意味論が壊れるため
+- **27B の full-attention 構造は 0.8B/9B と共通** (2026-10-16 確定): attn_q=[e, 2×heads×dh] 融合 (head ごと [q|gate])・out-gate は attention 後 o_proj 前 sigmoid・attn_output=[heads×dh, e] 非正方形。9B は heads×dh == e で偶然正方形なだけで、エンジンの既定経路が 3 サイズ共通で正解 (transformers modeling_qwen3_5 / llama.cpp qwen35.cpp / 実 GGUF ヘッダ照合)
 
 ### 12.4 再帰状態の管理(KvCache 拡張と engine の制約)
 

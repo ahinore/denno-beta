@@ -584,8 +584,8 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **all-or-nothing 契約**: チェーン途中失敗 → forward 全体を従来経路でやり直し(P17d decode chain と同一。KV 書き込みは冪等・advance は最後の 1 回で安全)。非対応構造(Qwen3 QK-Norm・一部 fp32・qkv bias が [qb|kb|vb] 揃っていない)・カーネル制約違反は事前ゲートで弾き GPU_BROKEN の無駄な発火を避ける
 - **数値契約**: rmsnorm/GEMM/rope/swiglu/residual 加算は全て従来経路と同一カーネル・同一演算順序 → **ビット一致**(緩和不要)。attention のみ緩和枠(P17j から不変)。**新規カーネル無し**(kernels_elem/int8 の既存 PTX を再利用・sha256 不変)
 - **テスト**: `cuda_prefill_chain_bit_exact_vs_cpu`(`#[ignore]`)— forward_prefill_gpu と同一呼び出し列(単層・m=40/e=96/ff=64/heads=4/kv_heads=2/dh=16/pos0=5・`DENNO_CUDA_GEMM_MIN_M=8`)で rope 後 q(デバイス常駐 qkv_q)・K/V キャッシュ行 [pos0..t_total)(rope カーネル → D2H・履歴行不変も検証)・最終 hn(CH_H 全行 + `chain_download_at` 最終行)・最終 residual(CH_X 全行 — in-place x += proj/down を含む)を CPU 参照(tensor::rmsnorm + matvec_rows_bt_i8 + rope_rows + silu_inplace)と**ビット一致**検証。attention は緩和契約のためランダム att を CH_ATT に注入(カーネル自体は cuda_attention_prefill_vs_cpu_reference で担保済み)
-- **検証**: cargo test --workspace(CPU)全 green(lib 147・server 7・cli 5・失敗 0)+ cargo check --workspace + cuda feature ビルド(check --tests)green。**実機 GPU E2E 計測と新 GPU テストの実行(`cargo test --release --features cuda -- --ignored`)は GPU バイナリ再ビルド+サーバー再起動が必要なため人間対応**
-- **残課題**: 実機 E2E 計測(rmsnorm 消滅+ホスト往復廃止の効果・P17k 手順)。次の候補は B2 attn_core V 累積(3.51s)
+- **検証**: cargo test --workspace(CPU)全 green(lib 147・server 7・cli 5・失敗 0)+ cargo check --workspace + cuda feature ビルド(check --tests)green。**実機**: 新 GPU テストを含む ignored cuda テストは第11セッションで実機実行済み (27/27 全緑・§3 27B 節)。残る実機 GPU E2E 計測は wall 基準で人間対応
+- **残課題**: 実機 E2E wall 計測(rmsnorm 消滅+ホスト往復廃止の効果・op 計上は B1 チェーン以降最終 sync に吸収され無意味化 → wall 基準)
 
 ### B2: attn_core の V 累積最適化 — probs@V の行チャンク化 ✅ (2026-10-15)
 
@@ -596,8 +596,8 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **PTX 静的解析の副次効果**: 旧 PTX は acc[PF_BQ] が local memory に spill(ld.local 81/st.local 33)していたが、新実装は **spill 0**(V 累積部の動的 smem 荷載は ~1,088 → ~296 命令/スレッド/タイル)。他カーネル(dno_swiglu/swiglu_int/add_rmsnorm/attention(decode)/rope_qkv/rope_qkv_pf)は旧 PTX とバイト一致(差分は dno_attention_prefill に局所)
 - **PTX**(kernels_elem.ptx): sha256 `f196f07ec1747c4a6d34b9bc1e02352788cddcfa750fa335d20aac112db0ce54`。手順: ①変更前ソースの再コンパイル結果が committed PTX と sha256 一致(`efc3a711…`)を先に検証 ②変更後に再生成。ホスト側は**無変更**(sh_f/grid/block/ATTN_PF_BQ=64/BK=8 は同一・新規 Rust コードなし)
 - **BK 拡大は見送り**: BK 8→16 は smem ~54KB となり cuFuncSetAttribute の opt-in が必要なうえ、2 blocks/SM → 1 blocks/SM への占有率低下(スコア phase の latency hiding が悪化)のリスクがある。実機 A/B でのみ判断すべきため残課題に残す
-- **検証**: cargo test --workspace(CPU)全 green(lib 147 不変)+ cargo check --features cuda --tests green。**実機での再検証が必要**: ①`cuda_attn_pf_bench`(n=t=13252)のカーネル単体タイミング(旧 69.3ms/call からの改善幅)②`cuda_attention_prefill_vs_cpu_reference/large` の maxabs・決定論再確認 ③E2E PROFILE 計測(P17k 手順)。GPU バイナリ再ビルド+サーバー再起動は人間対応
-- **残課題**: 実機 E2E 計測 + BK 拡大の A/B 実験(smem >48KB の opt-in)+ スコア phase のさらなる共有(4r×2k)
+- **検証**: cargo test --workspace(CPU)全 green(lib 147 不変)+ cargo check --features cuda --tests green。**実機での再検証**: ②`cuda_attention_prefill_vs_cpu_reference/large` の maxabs・決定論再確認は完了 (第11セッション・ignored cuda テスト 27/27 実機全緑・§3 27B 節)。残る人間対応: ①`cuda_attn_pf_bench`(n=t=13252)のカーネル単体タイミング(旧 69.3ms/call からの改善幅)③E2E wall 計測
+- **残課題**: 実機 E2E wall 計測 + BK 拡大の A/B 実験(smem >48KB の opt-in)+ スコア phase のさらなる共有(4r×2k)
 
 ### B3: b>1 バッチ decode の rope GPU 化 — `dno_rope_qk_batch` 新設 ✅ (2026-10-15)
 
@@ -609,7 +609,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **呼び出し箇所 (`llama.rs` `forward_batch`)**: rope ブロック先頭で `batch_rope_qk` を試行 (b==1 が solo chain フォールバックで到達する場合も同様)。成功なら GPU・失敗なら従来の CPU rope。KV 書き込み/attention 以降は無変更 (rope 後の q/k をそのまま使用・attention への q 再 H2D も従来どおり)
 - **PTX**(kernels_elem.ptx): sha256 `364dc15312a58cb4b5ff05c4a9de0f25e688c50e2c00e4a2d6fadf88c9c59be0`。手順: ①変更前ソースの再コンパイルが committed PTX (f196f07e… = B2) と sha256 一致することを先に検証 ②変更後に再生成
 - **テスト**: `cuda_batch_rope_qk_bitexact_vs_cpu` 新設 (cuda feature + #[ignore]・b=1/3/8 × pos0=0/1/7/63 で GPU バッチ rope と CPU session ごと rope_row の全ビット一致・テーブルキャッシュの生成/ヒット両経路を検証)。cargo test --workspace (CPU) 全 green (lib 147 不変) + cargo test --features cuda --no-run green
-- **実機計測は人間対応**: ①`cuda_batch_rope_qk_bitexact_vs_cpu` の実機実行 (--ignored) ②b>1 マルチセッション E2E の PROFILE (`DENNO_PROFILE=1`) で rope フェーズの削減幅確認 ③既存 rope 関連 cuda テストの再実行 (`cuda_rope_qkv_bitexact_vs_cpu` 等)。kernels_elem.ptx 差し替えのため GPU バイナリ再ビルド + サーバー再起動が必要
+- **実機チェック (第11セッション)**: ①③の cuda テスト (`cuda_batch_rope_qk_bitexact_vs_cpu`・既存 rope 関連含む) は ignored 27/27 実機全緑 (§3 27B 節)。残る人間対応: ②b>1 マルチセッション E2E の wall 計測 (rope フェーズの削減幅・DENNO_PROFILE の op 計上は B1 以降無意味化)
 
 ### 8095 GPU E2E リグレッション調査 — Qwen3.5-9B の GPU prefill 破綻 (調査記録・2026-10-15)
 
@@ -655,23 +655,53 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **実機 curl 検証** (コンテナ内 CPU サーバ・qwen35-test int8・検証後停止): tools 付きで tool_use block 生成 (in=277・`{"city":"Tokyo"}`・stop_reason tool_use) → tool_result を返す 2 ターン目で結果を反映した回答 (in=332) → `tool_choice: none` は tools 無しと同一出力 (非公開の実証) → tools 経路の連続 2 回決定論確認 (in/out/stop_reason/name/input 一致)
 - **将来課題**: streaming の tool_use 対応 (content_block_start/input_json_delta — 現在は tools+stream を 400 で拒否)・`any`/`tool` の拘束デコード。並列呼び出し (1 応答内の複数 tool_call) は抽出順に複数の tool_use block として返す形で対応済み
 
+### Qwen3.8-27B 構造検証とロード時ガード — out-gate 仮説の否定 + MTP (nextn) 除外 ✅ (2026-10-16)
+
+> 実機 GPU の 27B E2E 出力破綻 (後述) を受けて第10セッションで検証した「27B の out-gate 構造がエンジンと不一致では」という仮説は**否定された**。本節は (1) 構造検証の確定結果 (第10セッション調査)、(2) 想定外の構造を黙って読まないためのロード時ガード実装 (第10セッション実装・第11セッションで docs/commit 化)、(3) 第11セッションの実機チェック結果の記録。
+
+**27B full-attention 構造の確定 (仮説否定)** — transformers `modeling_qwen3_5.py`・llama.cpp `src/models/qwen35.cpp`・実 GGUF ヘッダ (0.8B/9B/27B の Q4_0) の 3 点照合:
+
+| 項目 | 0.8B | 9B | 27B |
+|---|---|---|---|
+| attn_q (q+gate 融合) | `[e, 2×heads×dh]` (head ごと `[q|gate]`) | 同左 | 同左 |
+| out-gate | attention 後 o_proj 前 sigmoid | 同左 | 同左 |
+| attn_output | 非正方形 `[heads×dh, e]` (1024→2048) | 正方形 (4096→4096) | 非正方形 (5120→6144) |
+
+- 27B の full-attention 構造は**現行エンジンと完全一致**。9B が `heads×dh == e` (4096) で正方形なのは偶然で、0.8B/27B の非正方形はエンジンの既定経路がそのまま正解 (0.8B は E2E 検証済み)。out-gate の位置も 3 サイズ共通
+- → **27B 出力破綻の原因は構造不一致ではなく未解明** (別途調査)。構造が正と確定したことで、以後の調査対象は数値経路の drift / 品質要因に絞られる
+
+**ロード時形状ガード `expect_ne` + MTP (nextn) 除外** (数値経路は無変更・ロード時の検証のみ):
+
+- `expect_ne(f, name, ne)`: 層テンソルを dequant する前に GGUF ヘッダ上の形状を config 由来の期待値と照合する (末尾の 1 は無視・期待より高い次元も拒否)。想定外の構造 (q|gate 融合の有無・out-gate 構造の違い・MTP 層の混入) を静かに誤読して logits を壊す前に、ロード時に明確なエラーで拒否する。層テンソル全般 (norm/gate/up/down/attn_qkv/attn_gate/ssm_*/ssm_out/attn_q/k/v/q_norm/k_norm/attn_output/embed/output/final norm) に適用
+- **MTP (nextn) 除外**: GGUF `block_count` が config `num_hidden_layers` を超過する分は、`nextn_predict_layers` と一致しかつ超過ブロックが `blk.{n}.nextn.eh_proj` を持ち `ssm_a` を持たない (nextn/MTP 層の構成) 場合のみ読み飛ばす (27B: block_count=65 = trunk 64 + 1・blk.64 は nextn.enorm/hnorm/eh_proj + attn_* を持つ)。不整合 (超過分が nextn 構成でない・nextn_predict_layers 不一致・`block_count < n_layer`) はロード拒否 — nextn を通常層として読むと意味論が壊れるため
+- **テスト**: 合成テスト 4 件追加 (実 27B と同形の MTP 層があっても trunk は config の層数のみでロードされ決定論は不変・非 nextn 超過ブロックは拒否・`attn_output` 形状不一致 `[2×heads×dh, e]` を拒否・`attn_q` 非融合 `[e, heads×dh]` を拒否) + 実 27B GGUF ヘッダ検証テスト `tests/qwen35_27b_header.rs` (ignored・`QWEN35_27B_DIR` 未設定で graceful skip・dequant 無しのヘッダのみ検証: block_count=64+1・48 GDN+16 full と config layer_types 一致・GDN/full の各テンソル形状・MTP 層構成・untied lm_head)。**実 27B GGUF で PASS 済み**
+- **検証**: `cargo test --workspace` 188 passed / 0 failed (engine lib 152 = 148 + 4) + cuda feature `--no-run` / `--doc` green
+
+**第11セッションの実機チェック結果 (人間対応分)**:
+
+- **B1-B3 の ignored cuda テスト 27/27 全緑** (denno-engine lib: cuda.rs 22 + model/llama.rs 5)。B1 `cuda_prefill_chain_bit_exact_vs_cpu`・B2 `cuda_attention_prefill_vs_cpu_reference`+`_large`・B3 `cuda_batch_rope_qk_bitexact_vs_cpu` いずれも実機ビット一致
+- **DENNO_PROFILE 注記**: B1 のデバイス常駐チェーン化以降は op 内訳が最終 sync に吸収され、op 単位の計上は実質無意味化 → **以後の実機計測は wall 基準**
+- **27B 起動テスト**: UD-IQ2_XXS は IQ1_M (GGML type id=29) の dequant 未対応で起動不可 → unsloth 均一 Q4_0 版 (16.06GB) でロード成功・GPU E2E 成功 (VRAM 30.2GB/32.6GB・8090 併存可・warm decode ~0.9s/step・3 回 md5 完全一致 `1aeac03a5347346086e0f02aed5559dd`)。ただし**出力品質に問題** (greedy で破綻・`` 反復ループ) = 未解明 (構造は本節で正と確定済み)
+- **cuda doctest の調査結果**: `cuda.rs` モジュールドックの doctest は本ツリーでエラーを再現せず・ignore 指定済み (コードフェンス・引数順 `a, w, scale, m, k, n` は実シグネチャ `linear_bt_i8` と一致)・`cargo test --features cuda --doc` green
+
 ## 4. 次の実装候補
 
-### Qwen3.5 主線(最終目標: Qwen3.8-27B UD-IQ2_XXS 動作)
+### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
 
 - [x] **A1: GDN/prefill の GPU 化 — 完了**(commit `57727f4` 第一段階+バッチ prefill → `8e9a874` GDN カーネル): Linear 自動オフロード+投影 m=n 一括(F32 は `apply_bt_rows`/matvec_rows_bt でビット一致維持)+**GDN スキャン GPU カーネル**(head ごと 1 ブロック・S 列保持・reduction 不要)。285 in/64 out: CPU ~28s → 5.1〜5.8s → **2.09s(約 13x)**。GPU/CPU 差 y maxabs=3.4e-8・決定論 3 連続 md5 一致。decode(n==1)は CPU 逐次のまま(chunked scan は将来課題)
 - [x] ~~**A1 残課題(任意)**: GDN chunked scan(長 prefill の更なる高速化)・decode の GDN GPU 化~~ → **完了 (2026-10-15, A1-r2)**: n ≥ 2048 の長 prefill は chunked 3-pass カーネル・decode (n==1) も GPU カーネル (単発) にルーティング。実機 E2E 計測は残課題
 - [x] **A2: Qwen3.5-9B 実 E2E — 完了**(commit `9183e7e`): GDN k-head 規約修正+untied lm_head 修正で garble 解決。fp32 全 32 層 numpy 一致・逐次==バッチ prefill bit 一致・int8 GPU E2E 決定論 md5 一致(連続+再起動)
-- [x] ~~**A3: Qwen3.8-27B スケール**~~ → **完了 (コード/予算面・2026-10-15)**: 64 層 = 48 GDN + 16 full を合成モデルで検証 (決定論・prefill bit 一致契約・untied lm_head)・`output_gate_type: "swish"` は参照実装が不使用のため動作不変・GDN 層の KV バッファ確保廃止で KV 実量 1/4 (512KB → 128KB B/token)・GDN ヘッド比のロード時ガード。実 GGUF での E2E (UD-IQ2_XXS 配置+実機 GPU) は残課題
+- [x] ~~**A3: Qwen3.8-27B スケール**~~ → **完了 (コード/予算面・2026-10-15)**: 64 層 = 48 GDN + 16 full を合成モデルで検証 (決定論・prefill bit 一致契約・untied lm_head)・`output_gate_type: "swish"` は参照実装が不使用のため動作不変・GDN 層の KV バッファ確保廃止で KV 実量 1/4 (512KB → 128KB B/token)・GDN ヘッド比のロード時ガード。実 GGUF の起動+E2E は完了 (2026-10-16・§3 27B 節): UD-IQ2_XXS は IQ1_M 未対応で不可 → 均一 Q4_0 でロード+GPU E2E 成功 (決定論 md5 一致)・ただし出力品質問題 (greedy 破綻) が未解明で実用化は継続調査
 - [x] ~~**A2.5: 9B 生成品質の改善(A3 前に推奨)**~~ → **完了**: チャットテンプレートは Qwen3.5 公式準拠を確認(不一致なし)・repetition penalty 実装(HF 互換・決定論・penalty 1.1 で反復解消)。根本の数値原因の切り分け(llama.cpp 同 GGUF 比較)は継続
 - [x] ~~**A4: prefix cache への GDN 状態スナップショット**(任意): recurrent モデルはフル prefill 固定(正しさ優先)~~ → **完了 (2026-10-15)**: KV + GDN 状態のペア復元 (prompt 境界スナップショット・`best_full_match` のときのみ復元・部分一致と同一 prompt は full prefill フォールバック)。復元後の継続 forward はフル prefill と bit 一致・退避は prefill 直後に変更。実機マルチターン E2E 計測は残課題
 - [x] ~~**8095 GPU E2E リグレッションの解明**~~ → **説明確定 (2026-10-15 第3セッション)**: 診断パッチ適用 GPU E2E(人間対応)の `[LCHK]` 比較で初発散層 = L00 GDN attn(drift ~4e-7 = 緩和契約内)・H1/H3 は否定。CPU drift 注入実験により「near-tie(90700 "Thinking" vs 8160 "Here"・logit 差 2.03)を微小 drift が 32 層のカオス的増幅で反転する temperature 0 greedy の不安定性」として定量的に説明(§3 参照・GPU カーネル異常の証拠は無し)。**残りは運用対応(人間)**: ①~~元 payload 復元+GPU E2E 再検証~~ → **完了 (第4セッション)**: 新正規 payload で GPU アンカー取得済み(seed 42・int8・HEAD 相当バイナリ・各々連続 2 回完全一致 = GPU 上の決定論確認済み・§3 参照) ②GPU バイナリ清浄再ビルド配備 ③B1/B2 実機計測 ④E2E 回帰判定基準の見直し(GPU 決定論+出力妥当性)⑤GPU LCHK ログの final argmax(8160/90700)確認。新アンカー: CPU `q35_9b_1b.json`→`3a0ddf1c…`・`q35_9b_2b.json`→`95199a33…` / GPU `q35_9b_1b.json`→`1a4ea71a…`・`q35_9b_2b.json`→`b4e58cb3…`
+- [ ] **27B 出力品質問題の解明**: 構造は正と確定 (§3 27B 節・out-gate 仮説否定) — 数値経路/品質要因の調査。起動は unsloth 均一 Q4_0 前提 (UD-IQ2_XXS は IQ1_M dequant 未対応)
 
 ### P17 系残課題(CUDA)
 
-- [x] ~~**B1: rmsnorm の GPU 化**: P17k プロファイルで残 2.3s(TOTAL ~31%)。P17d 要素演算カーネルの延長・実装容易~~ → **完了 (2026-10-15)**: prefill (n>1) を隠れ状態デバイス常駐チェーン化 — 層あたり 2 回の CPU rmsnorm を dno_add_rmsnorm で GPU 化(residual 加算融合・CPU とビット一致)し「rmsnorm 2.3s が h H2D と直列」を解消。h/proj/down のホスト往復(81MB×4/層)も廃止。実機 E2E 計測は残課題
-- [x] ~~**B2: attn_core の V 累積**: 残 3.51s(最大 op)。dno_attention 拡張(attention は緩和契約済み)~~ → **完了 (2026-10-15)**: `dno_attention_prefill` の probs@V 累積を v hoist + 2 行インターリーブ + float2 荷載に再構築(v 再読み 64 回 → 1 回・acc への FMA 列は kk 昇順で旧実装と完全同一 = **ビット一致**・旧カーネルの acc local spill も解消)。ホスト側無変更。実機計測(`cuda_attn_pf_bench`・E2E PROFILE)と BK 拡大 A/B は残課題
-- [x] ~~**B3: b>1 バッチの rope GPU 化**(優先度低): バッチ時は同期が隠蔽される~~ → **完了 (2026-10-15)**: `forward_batch` の rope を `dno_rope_qk_batch` で GPU 化 (P17h/P17k と同一方式=ホスト生成テーブル + mul/sub のみ・CPU `rope_row` とビット一致・rope は緩和対象外・テーブルキャッシュで層ループの再生成を回避・失敗時はホスト不変で CPU フォールバック)。§3 B3 節参照。実機 E2E 計測は残課題
+- [x] ~~**B1: rmsnorm の GPU 化**: P17k プロファイルで残 2.3s(TOTAL ~31%)。P17d 要素演算カーネルの延長・実装容易~~ → **完了 (2026-10-15)**: prefill (n>1) を隠れ状態デバイス常駐チェーン化 — 層あたり 2 回の CPU rmsnorm を dno_add_rmsnorm で GPU 化(residual 加算融合・CPU とビット一致)し「rmsnorm 2.3s が h H2D と直列」を解消。h/proj/down のホスト往復(81MB×4/層)も廃止。実機 ignored cuda テスト 27/27 全緑 (ビット一致・2026-10-16・§3 27B 節)。E2E wall 計測は残課題 (op 計上は B1 チェーン以降最終 sync に吸収され無意味 → wall 基準)
+- [x] ~~**B2: attn_core の V 累積**: 残 3.51s(最大 op)。dno_attention 拡張(attention は緩和契約済み)~~ → **完了 (2026-10-15)**: `dno_attention_prefill` の probs@V 累積を v hoist + 2 行インターリーブ + float2 荷載に再構築(v 再読み 64 回 → 1 回・acc への FMA 列は kk 昇順で旧実装と完全同一 = **ビット一致**・旧カーネルの acc local spill も解消)。ホスト側無変更。実機 ignored cuda テスト 27/27 全緑 (ビット一致・2026-10-16・§3 27B 節)。`cuda_attn_pf_bench` と BK 拡大 A/B、および E2E wall 計測は残課題
+- [x] ~~**B3: b>1 バッチの rope GPU 化**(優先度低): バッチ時は同期が隠蔽される~~ → **完了 (2026-10-15)**: `forward_batch` の rope を `dno_rope_qk_batch` で GPU 化 (P17h/P17k と同一方式=ホスト生成テーブル + mul/sub のみ・CPU `rope_row` とビット一致・rope は緩和対象外・テーブルキャッシュで層ループの再生成を回避・失敗時はホスト不変で CPU フォールバック)。§3 B3 節参照。実機 ignored cuda テスト 27/27 全緑 (ビット一致・2026-10-16・§3 27B 節)。E2E wall 計測 (b>1 の rope 削減幅) は残課題
 - [x] ~~**3B/7Bのb=4実測**~~ → **P17k で実施**(対象は Gemma3n 13,252 tok に変更して完了)
 
 ### 運用・周辺
