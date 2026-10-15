@@ -101,7 +101,7 @@ flowchart TB
     LOOP --> PULL["pull newly arrived requests between steps<br/>(admit when a slot is free)"]
     PULL --> BATCH["decode: combine all resident sessions<br/>into a single forward (P6)"]
     BATCH --> STOP{stop condition?<br/>EOS / max_tokens / stop_seq}
-    STOP -->|"continue"| SAMP[sampler<br/>greedy / temperature / top_p / top_k<br/>repetition penalty (A2.5)<br/>fixed seed for determinism]
+    STOP -->|"continue"| SAMP["sampler<br/>greedy / temperature / top_p / top_k<br/>repetition penalty (A2.5)<br/>fixed seed for determinism"]
     SAMP --> LOOP
     STOP -->|"stop"| OUT[ChatOutput<br/>text / stop_reason / usage]
     OUT --> RESP["JSON or SSE<br/>(event: lines + 2-second keep-alive)"]
