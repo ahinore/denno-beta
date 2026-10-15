@@ -1207,4 +1207,119 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A4: GDN 状態スナップショット (prompt 境界) + KV 復元からの継続 forward が
+    /// フル prefill と **bit 一致**する。GDN 状態はシーケンス全体の関数なので、
+    /// 「prompt 全体を処理した直後の conv + SSM 状態」を KV スナップショットと
+    /// ペアで保存・復元すれば、続きの prefill/decode はフル prefill と同じ計算に
+    /// なる (キャッシュ連続性 3+1==4 と同じ性質を、キャッシュをまたいで成立させる)。
+    #[test]
+    fn qwen38_27b_shape_gdn_snapshot_restore_bit_exact() {
+        let dir = build_dir("snap", true, NK, NV);
+        let mut m = load_int8(&dir);
+        let p: Vec<u32> = [7u32, 33, 100, 64].to_vec();
+        let q: Vec<u32> = [9u32, 41].to_vec();
+
+        fn gdn_bits(g: &[Option<(Vec<f32>, Vec<f32>)>]) -> Vec<Option<(Vec<u32>, Vec<u32>)>> {
+            g.iter()
+                .map(|o| {
+                    o.as_ref().map(|(a, b)| {
+                        (
+                            a.iter().map(|x| x.to_bits()).collect(),
+                            b.iter().map(|x| x.to_bits()).collect(),
+                        )
+                    })
+                })
+                .collect()
+        }
+
+        // 参照: フル prefill (P++Q)
+        let mut cref = m.new_cache();
+        let lref = m.forward(&[p.clone(), q.clone()].concat(), &mut cref).unwrap();
+        let sref = gdn_bits(&cref.gdn_snapshot());
+        assert!(sref.iter().any(|o| o.is_some()), "GDN 状態が存在する");
+
+        // スナップショット経路: P を forward → prompt 境界で KV + GDN 状態を退避 →
+        // 新しいキャッシュへ復元 → Q を継続 forward
+        let mut c1 = m.new_cache();
+        let _ = m.forward(&p, &mut c1).unwrap();
+        let (k, v) = c1.snapshot(p.len());
+        let gdn = c1.gdn_snapshot();
+
+        let mut c2 = m.new_cache();
+        c2.restore(&k, &v, p.len());
+        c2.gdn_restore(&gdn);
+        let l2 = m.forward(&q, &mut c2).unwrap();
+        assert_eq!(bits(&l2), bits(&lref), "スナップショット復元後の継続がフル prefill と不一致");
+        assert_eq!(
+            gdn_bits(&c2.gdn_snapshot()),
+            sref,
+            "復元経路の最終 GDN 状態がフル prefill と不一致"
+        );
+
+        // 対照実験: KV のみ復元 (GDN 状態を復元しない) では出力が変わる =
+        // テストが状態の復元を実際に検証している
+        let mut c3 = m.new_cache();
+        c3.restore(&k, &v, p.len());
+        let l3 = m.forward(&q, &mut c3).unwrap();
+        assert_ne!(
+            bits(&l3),
+            bits(&lref),
+            "GDN 状態を復元しなくても一致してしまった (テストが無 tooth)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A4: 合成 27B シェイプモデルを実際の Engine に載せたマルチターン会話で、
+    /// 2 ターン目以降が prefix cache エントリ (KV + GDN 状態) の復元で処理され、
+    /// 出力が「別エンジンでフル prefill した参照」と完全一致する。
+    /// engine.rs の RecurStateModel テスト (engine 経路の形状) に対し、
+    /// こちらは実 Qwen35 実装 (GDN 層 + full attention 層の混在) での検証。
+    #[test]
+    fn qwen38_27b_shape_engine_multi_turn_entry_restore() {
+        use crate::engine::{ChatMessage, Engine, GenParams, PrefixHit};
+        use crate::testutil::dummy_tokenizer;
+
+        fn params(max_tokens: usize) -> GenParams {
+            GenParams { max_tokens, temperature: Some(0.0), ..Default::default() }
+        }
+        fn msgs(turns: &[(&str, &str)]) -> Vec<ChatMessage> {
+            turns
+                .iter()
+                .map(|(role, content)| ChatMessage {
+                    role: (*role).into(),
+                    content: (*content).into(),
+                })
+                .collect()
+        }
+
+        let dir = build_dir("a4engine", true, NK, NV);
+        let model = load_int8(&dir);
+        let mut e = Engine::from_parts(Box::new(model), dummy_tokenizer().unwrap(), "a4", None);
+        let ref_m = load_int8(&dir);
+        let mut r = Engine::from_parts(
+            Box::new(ref_m),
+            dummy_tokenizer().unwrap(),
+            "a4-ref",
+            None,
+        );
+
+        // turn1: フル prefill
+        let out1 = e.chat(None, &msgs(&[("user", "t0")]), &params(2), |_| {}).unwrap();
+        assert_eq!(e.prefix_cache_entries(), 1, "prefill 直後にエントリが作られる");
+        assert_eq!(e.last_prefix_hit(), PrefixHit::None);
+
+        // turn2: turn1 の prompt を完全に含むマルチターン prompt
+        let m2 = msgs(&[("user", "t0"), ("assistant", &out1.text), ("user", "t15")]);
+        let expect2 = r.chat(None, &m2, &params(2), |_| {}).unwrap();
+        let out2 = e.chat(None, &m2, &params(2), |_| {}).unwrap();
+        assert_eq!(
+            e.last_prefix_hit(),
+            PrefixHit::Entry,
+            "GDN 状態スナップショット経由で復元されるべき"
+        );
+        assert_eq!(out2, expect2, "エントリ復元後の出力がフル prefill の参照と不一致");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

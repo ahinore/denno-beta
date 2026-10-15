@@ -92,8 +92,8 @@ flowchart TB
     SUB -->|"queue full"| E503
     SUB --> W["worker (single thread)"]
     W --> ADMIT[admit: begin_chat<br/>chat template / max_tokens clamp]
-    ADMIT --> PC{prefix cache<br/>largest LCP entry?}
-    PC -->|"hit"| TR[truncate and reuse KV<br/>recompute only the difference]
+    ADMIT --> PC{prefix cache<br/>largest LCP entry?<br/>(recurrent: full prompt match only)}
+    PC -->|"hit"| TR["reuse KV (truncate) · recompute only the difference<br/>recurrent restores KV+GDN state as a pair (no truncate)"]
     PC -->|"miss"| PF["prefill the whole prompt<br/>(weights × input GEMM)"]
     TR --> LIVE[live session]
     PF --> LIVE
@@ -239,7 +239,7 @@ flowchart TB
     PF --> DEC["step_chat_batch:<br/>sample + termination check per session,<br/>forward combined into one forward_batch"]
     DEC --> DONE{"all done?"}
     DONE -->|no| W
-    DONE -->|"some sessions finished"| REL["release_session:<br/>evict to prefix store (skip duplicates)<br/>KV rows and cached_prompts stay<br/>→ next session reuses them zero-copy"]
+    DONE -->|"some sessions finished"| REL["release_session:<br/>free the slot (the KV snapshot into the prefix store<br/>is taken right after prefill since A4)<br/>KV rows and cached_prompts stay<br/>→ next session reuses them zero-copy"]
     REL --> W
 ```
 
@@ -632,9 +632,10 @@ GDN state is not "per token position" but a **function of the whole sequence**, 
 
 - KvCache gains a **GDN slot** (`gdn: Vec<Option<(conv_buf, ssm_matrix)>>`, per layer), allocated via `attach_gdn_slot`, zero-cleared by `reset()`
 - `Model::is_recurrent()` (default false, true only for qwen35) added. For recurrent models:
-  - **Prefix cache entry restoration (KV-only copy) is not used** — GDN state cannot be restored
+  - **Prefix cache entry restoration is possible as a paired KV + GDN-state restore (A4)** — entries store a **GDN state snapshot taken at the prompt boundary (right after prefill, before decode)** paired with the KV rows (`KvCache::gdn_snapshot()`/`gdn_restore()`, a bit-exact copy). Since the state is a function of the whole sequence, it is valid at exactly one position: restoration only happens when the new prompt fully contains the entry prompt as a prefix (`best_full_match`). On a partial match even the KV-only restore is refused and the request falls back to a full prefill, so **there is structurally no path that restores the KV only and leaves the recurrent state inconsistent**
   - KV live reuse (truncate) is **safe only for pure extension (lcp == current length)**; truncating mid-sequence invalidates GDN state and falls back to full prefill
-  - Ignoring this constraint causes **nondeterminism where the same seed changes the output** (observed and fixed in P19)
+  - The snapshot is evacuated into the entry **right after prefill** (the prefill branch of engine `step_chat`); at completion (`release_session`) the state has already advanced with the generated tokens, so it cannot be evacuated there. The GDN state's byte size is converted to a token count via `bytes_per_token` and counted into the prefix-cache LRU budget (A4)
+  - Ignoring this constraint causes **nondeterminism where the same seed changes the output** (observed and fixed in P19). The A4 restore path is test-guaranteed to be **bit-identical to a full prefill after restore** (qwen35 synthetic 27B shape + engine tests; a contrast experiment also confirms that a KV-only restore does change the output)
 
 ### 12.5 Determinism / exactness contract (P19 additions)
 

@@ -258,6 +258,47 @@ impl KvCache {
         }
         self.len = n;
     }
+
+    /// GDN スロット状態のスナップショット (A4・層 index 順)。
+    /// GDN 層は `Some((conv, ssm))`・full attention 層は `None`。
+    /// 状態は「スナップショット取得時点のシーケンス長」に強く紐づく
+    /// (再帰状態は位置スライス不可) ので、取得位置との整合は呼び出し側契約
+    /// (engine は prefill 直後 = prompt 境界で取得し、同じ位置で復元する)。
+    pub fn gdn_snapshot(&self) -> Vec<Option<(Vec<f32>, Vec<f32>)>> {
+        self.gdn
+            .iter()
+            .map(|g| g.as_ref().map(|(c, s)| (c.clone(), s.clone())))
+            .collect()
+    }
+
+    /// `gdn_snapshot` の状態を GDN スロットへ復元する (A4)。
+    /// 層数が一致しない場合・状態とスロットの形状が不一致の場合は panic
+    /// (同一モデルのキャッシュ間の復元なので不一致はバグのみ)。
+    pub fn gdn_restore(&mut self, states: &[Option<(Vec<f32>, Vec<f32>)>]) {
+        assert_eq!(
+            states.len(),
+            self.gdn.len(),
+            "GDN state restore: layer count mismatch"
+        );
+        for (i, st) in states.iter().enumerate() {
+            let Some((conv, ssm)) = st else { continue };
+            let slot = self.gdn[i]
+                .as_mut()
+                .unwrap_or_else(|| panic!("GDN state restore: layer {i} にスロットが無い"));
+            assert_eq!(
+                slot.0.len(),
+                conv.len(),
+                "GDN state restore: conv len mismatch (layer {i})"
+            );
+            assert_eq!(
+                slot.1.len(),
+                ssm.len(),
+                "GDN state restore: ssm len mismatch (layer {i})"
+            );
+            slot.0.copy_from_slice(conv);
+            slot.1.copy_from_slice(ssm);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -533,5 +574,82 @@ mod tests {
         // GDN スロットの無いキャッシュは従来動作 (全層が対象)
         let mut plain = KvCache::new(2, 2, 8);
         assert_eq!(plain.bytes_per_token(), 2 * 2 * 2 * 4);
+    }
+
+    /// A4: gdn_snapshot → gdn_restore で GDN 状態が bit 一致で復元される。
+    /// full attention 層 (None) は触られない。
+    #[test]
+    fn gdn_snapshot_restore_roundtrip_is_bit_exact() {
+        let mut c = KvCache::new(3, 2, 16);
+        c.attach_gdn_slot(0, 3, 5); // conv_len 3 / ssm_len 5
+        c.attach_gdn_slot(2, 3, 5);
+        {
+            let (_, s) = c.gdn_state_mut(0).unwrap();
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = (i as f32 + 1.0) * 0.25;
+            }
+            let (cv, _) = c.gdn_state_mut(0).unwrap();
+            cv.copy_from_slice(&[7.5, -2.25, 0.125]);
+            let (_, s2) = c.gdn_state_mut(2).unwrap();
+            s2[0] = -1.5;
+        }
+        let snap = c.gdn_snapshot();
+        assert_eq!(snap.len(), 3);
+        assert!(snap[1].is_none(), "full attention 層は None");
+        let (c0, s0) = snap[0].as_ref().unwrap();
+        assert_eq!(c0, &vec![7.5, -2.25, 0.125]);
+        assert_eq!(s0[0], 0.25);
+        assert_eq!(s0[4], 1.25);
+
+        // 復元先 (ゼロ初期化) へ戻す → bit 一致
+        let mut d = KvCache::new(3, 2, 16);
+        d.attach_gdn_slot(0, 3, 5);
+        d.attach_gdn_slot(2, 3, 5);
+        d.gdn_restore(&snap);
+        let snap2 = d.gdn_snapshot();
+        let bits = |g: &Vec<Option<(Vec<f32>, Vec<f32>)>>| {
+            g.iter()
+                .map(|o| {
+                    o.as_ref().map(|(a, b)| {
+                        (
+                            a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                            b.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&snap), bits(&snap2), "gdn restore が bit 一致しない");
+    }
+
+    #[test]
+    #[should_panic(expected = "layer count mismatch")]
+    fn gdn_restore_layer_count_mismatch_panics() {
+        let mut c = KvCache::new(2, 2, 8);
+        c.attach_gdn_slot(0, 2, 2);
+        let snap = c.gdn_snapshot();
+        let mut d = KvCache::new(3, 2, 8); // 層数が違う
+        d.attach_gdn_slot(0, 2, 2);
+        d.gdn_restore(&snap);
+    }
+
+    #[test]
+    #[should_panic(expected = "conv len mismatch")]
+    fn gdn_restore_shape_mismatch_panics() {
+        let mut c = KvCache::new(1, 2, 8);
+        c.attach_gdn_slot(0, 3, 2);
+        let snap = c.gdn_snapshot();
+        let mut d = KvCache::new(1, 2, 8);
+        d.attach_gdn_slot(0, 4, 2); // conv_len が違う
+        d.gdn_restore(&snap);
+    }
+
+    #[test]
+    #[should_panic(expected = "スロットが無い")]
+    fn gdn_restore_missing_slot_panics() {
+        let mut d = KvCache::new(2, 2, 8);
+        // d にはスロットを attach しない → layer 0 の Some を復元できず panic
+        let snap = vec![Some((vec![1.0, 2.0], vec![0.0, 0.0])), None];
+        d.gdn_restore(&snap);
     }
 }
