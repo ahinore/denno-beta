@@ -601,7 +601,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 ### 8095 GPU E2E リグレッション調査 — Qwen3.5-9B の GPU prefill 破綻 (調査記録・2026-10-15)
 
-> A2-green (`9183e7e`) 以降の運用で、GPU サーバの Qwen3.5-9B int8 E2E 出力が破綻するリグレッションを検出(同一 payload の CPU サーバは正常)。第1セッションで再現と切り分け、第2セッションでコード同一性の完全化と CPU 再現検証を実施。原因は未特定(本節は調査記録・コード変更なし)。
+> A2-green (`9183e7e`) 以降の運用で、GPU サーバの Qwen3.5-9B int8 E2E 出力が破綻するリグレッションを検出(同一 payload の CPU サーバは正常)。第1セッションで再現と切り分け、第2セッションでコード同一性の完全化と CPU 再現検証、第3セッションで drift 注入実験による説明の確定を実施(本節は調査記録・コード変更なし)。
 
 **切り分け結果(第1セッション)**:
 - GPU は最初のトークンで既に破綻(`max_tokens=1` で GPU/CPU の 1 token が不一致)→ **原因は prefill 経路**(decode 経路の A1-r2 n==1 GPU GDN は無関係)
@@ -623,6 +623,13 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 **残課題(人間対応)**: ①診断パッチ適用で GPU バイナリを再ビルド+起動し `[LCHK]` 比較(出力が正常化すれば H1 確定=配備不整合)②またはクリーンな `699d902` チェックアウトからの再ビルドで H1 を直接検証。詳細手順は REPORT_NEXT.md 参照
 
+**GDN drift 増幅の切り分け実験(第3セッション)** — 診断パッチ適用による GPU E2E(人間対応)で初発散層が確定: **L00(GDN 第1層) attn・ssq 相対差 ~4e-7(GDN 緩和契約内の drift)**・深層で増幅されて final argmax が分裂・embedding と full attention 層は bit 一致。H1(別ソースビルド)/H3(モデル破損)は否定(ドライバ不変・モデル GGUF はソースと md5 一致)。残る課題「微小 drift が temperature 0 greedy で品質崩壊に増幅するのは正常挙動か」を CPU ビルドの drift 注入実験で切り分けた(コード変更なし・実験コードは commit 外で `diag_drift_inject.patch` として退避):
+
+- **手法**: `forward_prefill` の各層残差加算直後の隠れ状態(LCHK 計測点と同一)へ、相対 ssq ‖p‖²/‖x‖²=eps の決定論的ランダム摂動を env-gated 注入(`DENNO_DRIFT_INJECT`)。注入 32 config = eps ∈ {1e-7, 4e-7, 1e-6, 1e-5, 1e-4} × 注入位置 {L00 attn/ffn, L16/L24/L31 attn} × scope {全トークン行, 最終行} + eps=0 control + baseline 2 回(決定論確認)。生成は step_chat と同一形状の greedy ループ・payload は q35_9b_1 相当(14 token・48 生成)
+- **結果**: **eps=1e-7(観測 drift より小さい)でも L00 注入で final argmax が分裂**。分裂先(9 config が分裂)は最終位置 runner-up の **8160 ("Here") が最頻(6/9)**・final position の top-2 は 90700 ("Thinking") と 8160 で logit 差 2.03(near-tie)。隠れ状態の相対 ssq 差は 32 層で ~1e-5 → O(0.1) に 3〜4 桁カオス的増幅。深層(L24/L31)への 4e-7 注入では出力不変 — **発源が早い層ほど増幅が大きい**(GPU の発散発源が最も早い GDN 層 L00 だったことと整合)
+- **判定**: GPU 観測は **「temperature 0 greedy の不安定性(仕様上の脆弱性)」として説明可能 — GDN GPU カーネルの drift が異常に大きい証拠は無い**。観測値(LCHK メトリック 4e-7)は実験注入スケールより 1 桁以上小さく・分裂先が GPU 観測と同一 attractor・GPU 側の決定論維持とも整合
+- **含意**: GDN モデルの GPU E2E 回帰判定は「CPU との bit 一致」ではなく **「GPU 上の決定論(同一 payload→同一出力)+ 出力の妥当性」** を用いる(near-tie prompt では greedy でも緩和契約内の drift で分裂し得る)。新正規 payload アンカー: `q35_9b_1b.json` → 出力 md5 `3a0ddf1c4fbe9c9213f6d13b11d0685c`・`q35_9b_2b.json` → `95199a33a6f5e58ff0b9236736fe41fe`(清浄 CPU ビルド・HTTP 経路・各々連続 2 回+再起動後一致)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B UD-IQ2_XXS 動作)
@@ -633,7 +640,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] ~~**A3: Qwen3.8-27B スケール**~~ → **完了 (コード/予算面・2026-10-15)**: 64 層 = 48 GDN + 16 full を合成モデルで検証 (決定論・prefill bit 一致契約・untied lm_head)・`output_gate_type: "swish"` は参照実装が不使用のため動作不変・GDN 層の KV バッファ確保廃止で KV 実量 1/4 (512KB → 128KB B/token)・GDN ヘッド比のロード時ガード。実 GGUF での E2E (UD-IQ2_XXS 配置+実機 GPU) は残課題
 - [x] ~~**A2.5: 9B 生成品質の改善(A3 前に推奨)**~~ → **完了**: チャットテンプレートは Qwen3.5 公式準拠を確認(不一致なし)・repetition penalty 実装(HF 互換・決定論・penalty 1.1 で反復解消)。根本の数値原因の切り分け(llama.cpp 同 GGUF 比較)は継続
 - [x] ~~**A4: prefix cache への GDN 状態スナップショット**(任意): recurrent モデルはフル prefill 固定(正しさ優先)~~ → **完了 (2026-10-15)**: KV + GDN 状態のペア復元 (prompt 境界スナップショット・`best_full_match` のときのみ復元・部分一致と同一 prompt は full prefill フォールバック)。復元後の継続 forward はフル prefill と bit 一致・退避は prefill 直後に変更。実機マルチターン E2E 計測は残課題
-- [ ] **8095 GPU E2E リグレッションの解明(人間対応)**: GPU prefill が最初の 1 token から破綻・コード同一性は閉じた(A2-green → HEAD の変更は Qwen3.5 GPU prefill 経路に到達しない)・HEAD CPU ビルドは CPU サーバと md5 一致で正常。残仮説は H1(GPU バイナリの別ソースビルド・最有力)/ H2(GPU 環境変化)。診断パッチ(`DENNO_DEBUG_LAYER_CHKSUM` 層別 checksum)適用での GPU 再ビルド+`[LCHK]` 比較、またはクリーンな `699d902` からの再ビルドで特定する(§3 調査節+REPORT_NEXT.md 参照)
+- [x] ~~**8095 GPU E2E リグレッションの解明**~~ → **説明確定 (2026-10-15 第3セッション)**: 診断パッチ適用 GPU E2E(人間対応)の `[LCHK]` 比較で初発散層 = L00 GDN attn(drift ~4e-7 = 緩和契約内)・H1/H3 は否定。CPU drift 注入実験により「near-tie(90700 "Thinking" vs 8160 "Here"・logit 差 2.03)を微小 drift が 32 層のカオス的増幅で反転する temperature 0 greedy の不安定性」として定量的に説明(§3 参照・GPU カーネル異常の証拠は無し)。**残りは運用対応(人間)**: ①元 payload 復元+GPU E2E 再検証 ②GPU バイナリ清浄再ビルド配備 ③B1/B2 実機計測 ④E2E 回帰判定基準の見直し(GPU 決定論+出力妥当性)⑤GPU LCHK ログの final argmax(8160/90700)確認。新アンカー: `q35_9b_1b.json`→`3a0ddf1c…`・`q35_9b_2b.json`→`95199a33…`
 
 ### P17 系残課題(CUDA)
 
