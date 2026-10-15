@@ -22,6 +22,38 @@ use rand::{rngs::StdRng, SeedableRng, Rng};
 /// cutoff がこのサイズに達したらフルソートにフォールバックする。
 const TOP_P_SUBSET: usize = 2048;
 
+/// 反復ペナルティ (A2.5)。HF transformers の `RepetitionPenaltyLogitsProcessor`
+/// と同じ変換を、文脈 (prompt + 生成済み) 中に現れた**ユニークな**トークンへ
+/// 一度だけ適用する:
+///
+/// ```text
+/// logit > 0  → logit / penalty
+/// logit <= 0 → logit * penalty
+/// ```
+///
+/// - `penalty > 1.0` で既出トークンが抑えられ、greedy の反復ループを打破する
+/// - temperature / top-k / top-p より前 (生 logits) に適用する (HF と同じ順序)
+/// - RNG を一切使わないため、temperature=0 (greedy) は完全決定論。
+///   temperature>0 でも seed 固定なら同一入力→同一出力が保たれる
+/// - `penalty == 1.0` は完全な no-op (既存出力とビット一致)
+///
+/// `context` は適用対象のトークン列 (prompt_ids + generated)。語彙外の id は
+/// 無視する。同一 id の重複は 1 回だけ適用する (HF の set セマンティクス)。
+pub fn apply_repetition_penalty(logits: &mut [f32], context: &[u32], penalty: f32) {
+    if penalty == 1.0 {
+        return;
+    }
+    let mut seen = vec![false; logits.len()];
+    for &t in context {
+        let t = t as usize;
+        if t < logits.len() && !seen[t] {
+            seen[t] = true;
+            let l = &mut logits[t];
+            *l = if *l > 0.0 { *l / penalty } else { *l * penalty };
+        }
+    }
+}
+
 pub struct Sampler {
     temperature: f32,
     top_k: Option<usize>,
@@ -418,5 +450,81 @@ mod tests {
             (0..100).map(|_| s.sample(&[2.0, 1.5])).collect();
         assert!(picked.contains(&0));
         assert!(picked.contains(&1), "temp=1.0 で非argmaxが一度も選ばれない");
+    }
+
+    // ---------- A2.5: repetition penalty ----------
+
+    #[test]
+    fn penalty_suppresses_repeated_positive_logit() {
+        // token 1 が文脈に現れたら正の logit が割り引かれる
+        let mut logits = vec![1.0f32, 4.0, 2.0];
+        apply_repetition_penalty(&mut logits, &[1], 2.0);
+        assert_eq!(logits[0], 1.0, "文脈外は不変");
+        assert_eq!(logits[1], 2.0, "4.0/2.0 = 2.0");
+        assert_eq!(logits[2], 2.0, "文脈外は不変");
+    }
+
+    #[test]
+    fn penalty_pushes_negative_logit_down() {
+        let mut logits = vec![-2.0f32];
+        apply_repetition_penalty(&mut logits, &[0], 1.5);
+        assert_eq!(logits[0], -3.0, "-2.0*1.5 = -3.0");
+    }
+
+    #[test]
+    fn penalty_duplicate_ids_applied_once() {
+        // 同一 id が文脈に複数回現れても 1 回だけ適用 (HF の set セマンティクス)
+        let mut a = vec![4.0f32, 0.0];
+        apply_repetition_penalty(&mut a, &[0, 0, 0], 2.0);
+        let mut b = vec![4.0f32, 0.0];
+        apply_repetition_penalty(&mut b, &[0], 2.0);
+        assert_eq!(a, b, "重複適用で 4/2/2=1.0 になってはいけない");
+    }
+
+    #[test]
+    fn penalty_one_is_exact_noop() {
+        // penalty == 1.0 はビット完全な no-op (既存経路との互換契約)
+        let base: Vec<f32> = (0..1000).map(|i| (i as f32) * 0.37 - 100.0).collect();
+        let mut x = base.clone();
+        apply_repetition_penalty(&mut x, &(0..1000).collect::<Vec<u32>>(), 1.0);
+        assert_eq!(x, base, "penalty=1.0 でビットが変わった");
+    }
+
+    #[test]
+    fn penalty_out_of_vocab_id_is_ignored() {
+        let mut logits = vec![1.0f32, 2.0];
+        apply_repetition_penalty(&mut logits, &[999, u32::MAX], 2.0);
+        assert_eq!(logits, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn penalty_greedy_breaks_loop_deterministically() {
+        // greedy で token 1 のループに落ちている状況 (token 0 は未出) を模し、
+        // penalty で選択が変わること + 2 回実行で同一結果 (決定論) を確認
+        let logits = vec![3.0f32, 5.0];
+        let ctx = [1u32, 1, 1];
+
+        let mut a = logits.clone();
+        apply_repetition_penalty(&mut a, &ctx, 1.5);
+        let pick = |l: &[f32]| {
+            let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
+            for (i, &v) in l.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            bi
+        };
+        // token 1 のみ減衰: 5.0/1.5 ≈ 3.33 > 3.0 → まだ 1
+        let mut b = logits.clone();
+        apply_repetition_penalty(&mut b, &ctx, 2.0);
+        assert_eq!(pick(&a), 1, "penalty 1.5 (5/1.5≈3.33>3) ではまだ 1");
+        // penalty 2.0: token 1 → 2.5 < 3.0 (token 0 は不変) で argmax が反転
+        assert_eq!(pick(&b), 0, "penalty 2.0 (5/2=2.5<3) で argmax が反転");
+        // 決定論: 同一入力→同一ビット
+        let mut c = logits.clone();
+        apply_repetition_penalty(&mut c, &ctx, 2.0);
+        assert_eq!(c, b);
     }
 }

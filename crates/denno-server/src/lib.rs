@@ -109,6 +109,8 @@ pub struct MessagesRequest {
     pub top_k: Option<usize>,
     #[serde(default)]
     pub stop_sequences: Vec<String>,
+    /// A2.5: 反復ペナルティ (denno 拡張・任意。None = 無効)
+    pub repetition_penalty: Option<f32>,
     pub stream: Option<bool>,
 }
 
@@ -326,6 +328,7 @@ async fn messages(
         top_k: req.top_k,
         stop_sequences: req.stop_sequences.clone(),
         seed: None,
+        repetition_penalty: req.repetition_penalty,
     };
 
     if req.stream.unwrap_or(false) {

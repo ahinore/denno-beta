@@ -63,7 +63,7 @@ denno-beta/
 │   │   ├── quant.rs           # int8 quantization + SIMD i8×i8 dot products (NEON/AVX2)
 │   │   ├── kv_cache.rs        # KV cache (truncate for prefix reuse)
 │   │   ├── prefix_cache.rs    # multi-entry LRU prefix cache
-│   │   ├── sampler.rs         # temperature/top-k/top-p sampling
+│   │   ├── sampler.rs         # temperature/top-k/top-p sampling + repetition penalty (A2.5)
 │   │   ├── load.rs            # safetensors loading (single/sharded, F16/BF16→f32)
 │   │   ├── tokenizer.rs       # tokenizer.json + minijinja chat template
 │   │   ├── engine.rs          # begin/step_chat(): prefill→decode stepper
@@ -101,7 +101,7 @@ flowchart TB
     LOOP --> PULL["pull newly arrived requests between steps<br/>(admit when a slot is free)"]
     PULL --> BATCH["decode: combine all resident sessions<br/>into a single forward (P6)"]
     BATCH --> STOP{stop condition?<br/>EOS / max_tokens / stop_seq}
-    STOP -->|"continue"| SAMP[sampler<br/>greedy / temperature / top_p / top_k<br/>fixed seed for determinism]
+    STOP -->|"continue"| SAMP[sampler<br/>greedy / temperature / top_p / top_k<br/>repetition penalty (A2.5)<br/>fixed seed for determinism]
     SAMP --> LOOP
     STOP -->|"stop"| OUT[ChatOutput<br/>text / stop_reason / usage]
     OUT --> RESP["JSON or SSE<br/>(event: lines + 2-second keep-alive)"]
@@ -386,6 +386,7 @@ Model differences live only inside `forward` above. The stepping loop and sampli
 
 ```
 one step of step_chat():
+  apply_repetition_penalty       ← A2.5: only when requested (unique context tokens; bit-identical no-op when disabled)
   sampler.sample(logits)        ← greedy / temperature / top-k / top-p (fixed seed)
   → EOS / stop_sequences check
   → stream the diff of tok.decode(all generated)

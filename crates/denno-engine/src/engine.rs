@@ -43,6 +43,11 @@ pub struct GenParams {
     pub top_k: Option<usize>,
     pub stop_sequences: Vec<String>,
     pub seed: Option<u64>,
+    /// A2.5: 反復ペナルティ (None = 無効・既定)。1.0 も無効と同一 (no-op)。
+    /// 文脈 (prompt + 生成済み) の既出トークンの logit を HF と同じ規則で
+    /// 抑える (詳細は `sampler::apply_repetition_penalty`)。RNG 不関与のため
+    /// greedy は完全決定論・seed 固定時の出力系列も bit 再現可能。
+    pub repetition_penalty: Option<f32>,
 }
 
 impl Default for GenParams {
@@ -54,6 +59,7 @@ impl Default for GenParams {
             top_k: None,
             stop_sequences: Vec::new(),
             seed: None,
+            repetition_penalty: None,
         }
     }
 }
@@ -202,6 +208,8 @@ pub struct ChatSession {
     /// 占有中の KV キャッシュスロット (None = 未 install / release 済み)
     slot: Option<usize>,
     input_tokens: usize,
+    /// A2.5: 反復ペナルティ (None = 無効)
+    repetition_penalty: Option<f32>,
     /// テレメトリ用のセッション ID (採番順。数値経路には無関係)
     pub id: u32,
 }
@@ -622,8 +630,21 @@ impl Engine {
             stop_reason: StopReason::MaxTokens,
             stop_sequence: None,
             slot: None,
+            repetition_penalty: params.repetition_penalty,
             id: telem::next_session_id(),
         })
+    }
+
+    /// A2.5: repetition_penalty をセッションの logits に適用する (サンプル直前)。
+    /// 適用対象は prompt_ids + generated (ユニーク id・1 回だけ)。penalty 無効
+    /// (None) なら何もしない = 従来経路とビット一致。
+    fn apply_session_penalty(sess: &mut ChatSession) {
+        if let Some(p) = sess.repetition_penalty {
+            let mut ctx = Vec::with_capacity(sess.prompt_ids.len() + sess.generated.len());
+            ctx.extend_from_slice(&sess.prompt_ids);
+            ctx.extend_from_slice(&sess.generated);
+            crate::sampler::apply_repetition_penalty(&mut sess.logits, &ctx, p);
+        }
     }
 
     /// P4 ステッパ: 生成を 1 forward 進める (prefill 全体 or decode 1 トークン)。
@@ -667,6 +688,8 @@ impl Engine {
         }
 
         // decode 1 ステップ (旧 chat() のループ 1 回分と同一)
+        // A2.5: penalty 指定時のみ既出トークンを抑制 (無効時はビット不変)
+        Self::apply_session_penalty(sess);
         let next =
             crate::prof::time(crate::prof::SAMPLER, || sess.sampler.sample(&sess.logits)) as u32;
         sess.generated.push(next);
@@ -812,6 +835,8 @@ impl Engine {
                 done[i] = true;
                 continue;
             }
+            // A2.5: penalty 指定時のみ既出トークンを抑制 (無効時はビット不変)
+            Self::apply_session_penalty(sess);
             let next = crate::prof::time(crate::prof::SAMPLER, || {
                 sess.sampler.sample(&sess.logits)
             }) as u32;

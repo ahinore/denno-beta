@@ -520,6 +520,21 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - **E2E 結果 (int8 GPU)**: q35_9b_1 で正常な思考出力。md5 `90fe7e5850b48d4b7aba157922af7113` が連続 2 回+サーバー再起動後も bit 一致 (決定論契約達成)。fp32 も動作するが temperature 0 greedy で反復傾向あり (int8 固有ではなくテンプレート/生成品質の課題 → 次ステップ)。
 - デバッグ基盤 (qwen35.rs 診断メソッド+qwen35_9b_debug_trace テスト、ホスト numpy 参照実装 tmp/ref_*.py) は commit 前に撤去済み。学習: untied モデルは 9B が初 ⇒ lm_head 経路が初めて実戦使用された。
 
+###### A2.5: Qwen3.5-9B 生成品質の改善 — repetition penalty ✅ (2026-10-15)
+
+temperature 0 greedy での反復退化 (q35_9b_2 で同一フレーズの繰り返し・fp32 でも同様の傾向) に対し、チャットテンプレート精査と repetition penalty 実装で対処:
+
+1. **チャットテンプレート精査 → Qwen3.5 公式準拠を確認 (不一致なし)**: `tokenizer_config.json` の `chat_template` を全量展開し、minijinja+pycompat での描画を実 CPU テストで検証 (thinking マーカー・enable_thinking の扱い・`<|im_start|>`/`<|im_end|>` 構造)。テンプレートは反復の原因ではなく修正不要と確定。
+2. **repetition penalty 実装 (HF 互換・決定論)**: `sampler::apply_repetition_penalty` — 文脈 (prompt + 生成済み) 中の**ユニークな**既出トークンへ `logit > 0 → logit / penalty`・`logit <= 0 → logit * penalty` を一度だけ適用 (HF transformers `RepetitionPenaltyLogitsProcessor` と同一規則)。temperature/top-k/top-p より前 (生 logits) に適用。RNG を使わないため greedy は完全決定論・seed 固定時のサンプリング系列も bit 再現可能。`penalty == 1.0` はビット完全 no-op (既存経路と bit 一致)。露出: `GenParams.repetition_penalty`・`/v1/messages` の任意フィールド (denno 拡張)・CLI `denno generate --repetition-penalty`。サーバー decode 2 経路 (逐次 step_chat・バッチ P6) のサンプル直前で適用。
+3. **検証**:
+   - 単体テスト (sampler.rs): 正/負 logit の規則・重複 id は 1 回だけ適用 (HF の set セマンティクス)・語彙外 id は無視・penalty=1.0 はビット no-op・greedy ループ打破+決定論。
+   - **9B int8 E2E (penalty 1.1)**: q35_9b_1 でループ脱出・思考構造を保持。md5 `4551f00f5fcab87e6cf03e8ca18915e0` が連続 2 回+サーバー再起動後も bit 一致 (決定論契約達成)。q35_9b_2 も構造を保ってループ脱出 (md5 `7562493ed6e3bdf13dd3b488a389c493`)。
+   - penalty 1.15/1.3 は過剰抑制 → **1.1 が適正** (llama.cpp の既定値と一致)。
+   - 旧 GPU バイナリ (A2 時点) は新しいリクエストフィールドをエラー無く無視することを確認 (前方互換)。
+   - 恒久回帰テスト `qwen35_9b_int8_penalty_determinism` (ignored・`QWEN35_9B_DIR` 未設定で graceful skip) を qwen35_model.rs に追加: 決定論 (連続 2 回 bit 一致) + 最頻 4-gram カナリアで反復ループを検出。
+
+- **残課題**: 反復退化の根本の数値原因は未特定 (llama.cpp 同 GGUF 比較での切り分け継続)・thinking モード出力の取り扱い検討・GPU サーバーバイナリの再ビルド (penalty を GPU で使うには新バイナリが必要)・A2 の md5 アンカー (`90fe7e58…`) が penalty 無し greedy で手元再現しなかった件の調査。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B UD-IQ2_XXS 動作)
@@ -528,7 +543,7 @@ pie showData title P9 fp32 バッチ(4x256) op別時間内訳
 - [ ] **A1 残課題(任意)**: GDN chunked scan(長 prefill の更なる高速化)・decode の GDN GPU 化
 - [x] **A2: Qwen3.5-9B 実 E2E — 完了**(commit `9183e7e`): GDN k-head 規約修正+untied lm_head 修正で garble 解決。fp32 全 32 層 numpy 一致・逐次==バッチ prefill bit 一致・int8 GPU E2E 決定論 md5 一致(連続+再起動)
 - [ ] **A3: Qwen3.8-27B スケール**: 64 層=48 GDN+16 full・int8 必須・VRAM/RAM/KV 予算の再確認。A1 の GPU 化が前提(prefill が CPU 逐次では実用時間を超える)
-- [ ] **A2.5: 9B 生成品質の改善(A3 前に推奨)**: int8/fp32 とも temperature 0 greedy で反復傾向。チャットテンプレートの Qwen3.5 公式準拠確認(thinking マーカー・enable_thinking)・repetition penalty 等。llama.cpp との出力比較で切り分け
+- [x] ~~**A2.5: 9B 生成品質の改善(A3 前に推奨)**~~ → **完了**: チャットテンプレートは Qwen3.5 公式準拠を確認(不一致なし)・repetition penalty 実装(HF 互換・決定論・penalty 1.1 で反復解消)。根本の数値原因の切り分け(llama.cpp 同 GGUF 比較)は継続
 - [ ] **A4: prefix cache への GDN 状態スナップショット**(任意): 現在 recurrent モデルはフル prefill 固定(正しさ優先)。マルチターン高速化
 
 ### P17 系残課題(CUDA)

@@ -269,3 +269,62 @@ fn gdn_gpu_scan_close_to_cpu() {
 }
 
 
+
+/// A2.5: 9B int8 で repetition penalty 経路を検証 (実 GGUF・ignored)。
+/// 環境変数: QWEN35_9B_DIR (config.json + *.gguf を含むディレクトリ・例: data/qwen35-9b)。
+/// 未設定なら graceful skip (CI ではモデルが無いため常時 skip)。
+///
+/// 検証内容:
+/// 1. greedy + penalty 1.1 が同一入力→同一出力 (連続 2 回 bit 一致・決定論契約)
+/// 2. 反復退化の代理指標: 最頻 4-gram の出現数がテキスト長に対して過大でない
+///    (penalty 無しの greedy は数トークンでフレーズ反復ループに落ちる)
+#[test]
+#[ignore]
+fn qwen35_9b_int8_penalty_determinism() {
+    use denno_engine::{ChatMessage, Engine, GenParams};
+    let Ok(dir) = std::env::var("QWEN35_9B_DIR") else {
+        eprintln!("skip: QWEN35_9B_DIR 未設定");
+        return;
+    };
+    let mut e = Engine::load(
+        std::path::Path::new(&dir),
+        "q35-9b-test",
+        Some(42),
+        QuantMode::Int8,
+    )
+    .expect("9B ロード失敗");
+    let msgs = vec![ChatMessage { role: "user".into(), content: "日本の首都は?".into() }];
+    let params = GenParams {
+        max_tokens: 32,
+        temperature: Some(0.0),
+        seed: Some(42),
+        repetition_penalty: Some(1.1),
+        ..Default::default()
+    };
+    let a = e.chat(None, &msgs, &params, |_| {}).unwrap();
+    let b = e.chat(None, &msgs, &params, |_| {}).unwrap();
+    assert_eq!(a.text, b.text, "greedy+penalty の決定論違反");
+    assert_eq!(a.output_tokens, b.output_tokens);
+
+    // 反復退化の代理指標: 文字 4-gram の最頻出現数が過大でないこと。
+    // しきい値は緩く (長さの 1/6)、明らかなフレーズ反復ループだけを検出する。
+    let chars: Vec<char> = a.text.chars().collect();
+    if chars.len() >= 12 {
+        let mut counts: std::collections::HashMap<Vec<char>, usize> =
+            std::collections::HashMap::new();
+        for w in chars.windows(4) {
+            *counts.entry(w.to_vec()).or_default() += 1;
+        }
+        let top = counts.values().copied().max().unwrap_or(0);
+        assert!(
+            top * 6 <= chars.len(),
+            "反復ループ検出: 最頻 4-gram が {top} 回 / 長さ {}",
+            chars.len()
+        );
+    }
+    eprintln!(
+        "penalty determinism ok: out={} tokens, text={:?}",
+        a.output_tokens,
+        a.text
+    );
+}
