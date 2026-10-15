@@ -548,12 +548,24 @@ temperature 0 greedy での反復退化 (q35_9b_2 で同一フレーズの繰り
 
 - **残課題**: 27B 実 GGUF の配置と実機 E2E (UD-IQ2_XXS・GPU での決定論 md5・生成品質)・`output_gate_type` を参照実装が将来消費した場合の追従。
 
+###### A1-r2: GDN chunked scan + decode の GDN GPU 化 ✅ (2026-10-15)
+
+P19-A1 step 3 の残課題 (①長 prefill の更なる高速化 — 単発カーネルは 1 ブロック/head でトークン逐次 ②decode (n==1) が CPU 逐次) を解消した:
+
+- **chunked scan (GPU 専用・3-pass)**: delta rule の 1 ステップは S への**線形**写像 S ← eg·(I − βkkᵀ)·S + βkvᵀ なので、chunk をまたぐ依存を「ローカル遷移の計算」と「状態の伝播」に分解できる。K1 `dno_gdn_chunk_pre` (chunk 並列): W[ci] = S=0 起点ローカル AR 終状態・M[ci] = 恒等行列からの遷移伝播 → K2 `dno_gdn_chunk_state` (chunk 直列): Sinit[0]=S_in・Sinit[ci+1] = M[ci]·Sinit[ci] + W[ci] → K3 `dno_gdn_chunk_scan` (chunk 並列): Sinit[ci] から chunk 内を逐次 AR。決定論方針は既存 `dno_gdn_scan` と同一 (launch 構成固定・昇順逐次和・atomic 不使用)
+- **CPU 参照実装** (`gdn.rs`): `chunk_plan` + `scan_chunked_core`。**CPU の forward 経路からは呼ばない** (既存契約「逐次 == バッチ prefill bit 一致」を維持)。単一 chunk は逐次 AR と bit 一致 (テスト担保)・複数 chunk は数学的に等価 (丸め順のみ異なる)。数値安全性: k は L2 正規化 (‖k‖≈1)・β ∈ (0,1)・eg = exp(g) < 1 → 各因子のスペクトルノルム ≤ 1・M は縮小写像で丸め誤差が増幅しない
+- **cuda.rs**: カーネル 3 ハンドル追加・`gdn_scan_chunked_impl` (3 launch + sync)・`gdn_scan_batch` の閾値ルーティング (**n ≥ 2048 で chunked**、非成立時は従来の単発カーネル)。chunk 分割は `chunk_plan(n, 2048, 1024, 16)` を CPU 参照と共有。decode (n==1) も `gdn_scan_batch` が入口 (単発カーネル)
+- **qwen35.rs**: decode パス (n==1) の `gdn_scan` を GPU 化 (`#[cfg(feature="cuda")]`)。prefill バッチと同一カーネル・同一 launch 構成のため **GPU 上ではトークン逐次とバッチの GDN 出力が bit 一致**になる。GPU 無効/GPU_BROKEN 時は CPU 逐次フォールバック (GPU_BROKEN 後は再試行しない)
+- **PTX**: `kernels_gdn.ptx` 再生成 (nvcc 12.9.86・`-arch=compute_75 -fmad=false -O3`・cudart 12.6.77 ヘッダ)。既存 `dno_gdn_scan` の PTX は旧ファイルと bit 一致で不変 (カーネル部照合済み・sha256 `4c14d84a…` → 全体 `456fe750…`)
+- **テスト**: gdn lib +6 (`chunk_plan` 境界・単一 chunk bit 一致・複数 chunk 緩和一致 maxabs<1e-3/cos>0.999・chunked prefill → 逐次 decode の状態継続・分割不変性・決定論 2 回 bit 一致)・`qwen35_model` に `gdn_gpu_chunked_scan_close_to_cpu` (cuda feature・DENNO_CUDA 未設定で graceful skip・n=5000 で chunked ルート発動・CPU 逐次との緩和一致 + 決定論 2 回 bit 一致)。workspace 全 green (lib 134 passed)
+- **残課題**: 実機 GPU での E2E 計測 (chunked 効果・decode 応答速度) は GPU バイナリ再ビルド+サーバー再起動が必要なため人間対応。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B UD-IQ2_XXS 動作)
 
 - [x] **A1: GDN/prefill の GPU 化 — 完了**(commit `57727f4` 第一段階+バッチ prefill → `8e9a874` GDN カーネル): Linear 自動オフロード+投影 m=n 一括(F32 は `apply_bt_rows`/matvec_rows_bt でビット一致維持)+**GDN スキャン GPU カーネル**(head ごと 1 ブロック・S 列保持・reduction 不要)。285 in/64 out: CPU ~28s → 5.1〜5.8s → **2.09s(約 13x)**。GPU/CPU 差 y maxabs=3.4e-8・決定論 3 連続 md5 一致。decode(n==1)は CPU 逐次のまま(chunked scan は将来課題)
-- [ ] **A1 残課題(任意)**: GDN chunked scan(長 prefill の更なる高速化)・decode の GDN GPU 化
+- [x] ~~**A1 残課題(任意)**: GDN chunked scan(長 prefill の更なる高速化)・decode の GDN GPU 化~~ → **完了 (2026-10-15, A1-r2)**: n ≥ 2048 の長 prefill は chunked 3-pass カーネル・decode (n==1) も GPU カーネル (単発) にルーティング。実機 E2E 計測は残課題
 - [x] **A2: Qwen3.5-9B 実 E2E — 完了**(commit `9183e7e`): GDN k-head 規約修正+untied lm_head 修正で garble 解決。fp32 全 32 層 numpy 一致・逐次==バッチ prefill bit 一致・int8 GPU E2E 決定論 md5 一致(連続+再起動)
 - [x] ~~**A3: Qwen3.8-27B スケール**~~ → **完了 (コード/予算面・2026-10-15)**: 64 層 = 48 GDN + 16 full を合成モデルで検証 (決定論・prefill bit 一致契約・untied lm_head)・`output_gate_type: "swish"` は参照実装が不使用のため動作不変・GDN 層の KV バッファ確保廃止で KV 実量 1/4 (512KB → 128KB B/token)・GDN ヘッド比のロード時ガード。実 GGUF での E2E (UD-IQ2_XXS 配置+実機 GPU) は残課題
 - [x] ~~**A2.5: 9B 生成品質の改善(A3 前に推奨)**~~ → **完了**: チャットテンプレートは Qwen3.5 公式準拠を確認(不一致なし)・repetition penalty 実装(HF 互換・決定論・penalty 1.1 で反復解消)。根本の数値原因の切り分け(llama.cpp 同 GGUF 比較)は継続

@@ -641,3 +641,20 @@ GDN state is not "per token position" but a **function of the whole sequence**, 
 - Model level: forward determinism (2 runs bit-identical) + **cache continuity (forward(3)+forward(1) == forward(4) bit-identical)**
 - Only dequant requires bit-exactness with llama.cpp (the GDN sequential math does not)
 - GDN state, like KV, "grows monotonically within a session", so it inherits the existing KV guarantees (P6's solo==batch, P17e's demand-based allocation contract `kv_bufs(layer,n)` called ahead)
+
+### 12.6 GDN GPU kernels and chunked scan (P19-A1 / A1-r2)
+
+The GDN scan GPU kernel (`kernels/gdn.cu` + `kernels_gdn.ptx`) keeps **one block per head (grid = nv) with each thread holding one column of S**, so every delta-rule update completes within a thread (no cross-thread reduction). Determinism policy: fixed launch configuration, ascending-order sequential sums, no atomics / warp reductions. GDN falls under the relaxed contract (no bit-identity required), so `expf` etc. are allowed and CPU/GPU numerical agreement is verified within the relaxed bounds (maxabs < 1e-3, cos > 0.999).
+
+Route selection (`cuda::gdn_scan_batch` is the single entry point, requires dk == dv / d_conv == 4):
+
+- **decode (n==1)**: single-shot kernel `dno_gdn_scan`, 1 launch. Same kernel and launch configuration as batch prefill, so on the GPU the token-by-token and batch GDN outputs are bit-identical
+- **prefill (1 < n < 2048)**: the same single-shot kernel, 1 launch (sequential token scan)
+- **long prefill (n ≥ 2048)**: 3-pass **chunked scan** (`dno_gdn_chunk_pre` / `dno_gdn_chunk_state` / `dno_gdn_chunk_scan`):
+  1. K1 (chunks in parallel): per-chunk local transitions W[ci] (end state of a local AR scan starting from S=0) and M[ci] (transition matrix propagated column-wise from the identity)
+  2. K2 (chunks serial): serial propagation of the chunk-start states Sinit (Sinit[0]=S_in, Sinit[ci+1] = M[ci]·Sinit[ci] + W[ci])
+  3. K3 (chunks in parallel): sequential AR scan within each chunk from Sinit[ci] → y and the final state
+
+- Chunking is shared with the CPU reference implementation via `chunk_plan(n, 2048, 1024, 16)` (`gdn::scan_chunked_core`): chunk_tokens=1024, up to 16 chunks, remainder concentrated in the last chunk (all chunks non-empty)
+- The chunked path is **GPU-only** (never called from the CPU forward paths), so the CPU contract "sequential == batch prefill bit-identical" is unchanged. A single chunk is bit-identical to sequential AR; multiple chunks are mathematically equivalent (only rounding order differs). The GPU chunked path is also deterministic (same input → bit-identical), covered by tests
+- Mathematical basis: one delta-rule step is a **linear** map on S, S ← eg·(I − βkkᵀ)·S + βkvᵀ, so the cross-chunk dependency decomposes into "local transition computation" and "state propagation". k is L2-normalized (‖k‖≈1), β ∈ (0,1), eg = exp(g) < 1 — every factor has spectral norm ≤ 1, so M is a contraction and rounding error is not amplified

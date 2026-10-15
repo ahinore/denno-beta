@@ -640,3 +640,20 @@ GDN は状態が「トークン位置ごと」ではなく**シーケンス全�
 - モデルレベル: forward の決定論(2 回 bit 一致)+ **キャッシュ連続性(forward(3)+forward(1) == forward(4) bit 一致)**
 - dequant のみ llama.cpp との bit-exact を要求(GDN の逐次演算は要求しない)
 - GDN 状態は KV と同じく「同じセッション内では単調に成長」するため、既存の KV 保証(P6 の solo==batch・P17e の需要ベース確保契約 `kv_bufs(layer,n)` 先行呼び出し)をそのまま継承する
+
+### 12.6 GDN の GPU 化と chunked scan(P19-A1 / A1-r2)
+
+GDN スキャンの GPU カーネル(`kernels/gdn.cu` + `kernels_gdn.ptx`)は **head ごと 1 ブロック(grid = nv)・スレッド = S の 1 列**を保持し、delta rule の全更新をスレッド内で完結させる(スレッド間 reduction 不要)。決定論の方針は launch 構成固定・昇順逐次和・atomic/ワープ縮約不使用。GDN は bit 一致不要契約のため `expf` 等を使用し、CPU との数値一致は緩和枠(maxabs < 1e-3・cos > 0.999)で担保する。
+
+経路の割り振り(`cuda::gdn_scan_batch` が唯一の入口・前提 dk == dv / d_conv == 4):
+
+- **decode(n==1)**: 単発カーネル `dno_gdn_scan` 1 launch。prefill バッチと同一カーネル・同一 launch 構成のため、GPU 上ではトークン逐次とバッチの GDN 出力が bit 一致になる
+- **prefill(1 < n < 2048)**: 同じ単発カーネルを 1 launch(トークン逐次スキャン)
+- **長 prefill(n ≥ 2048)**: 3-pass **chunked scan**(`dno_gdn_chunk_pre` / `dno_gdn_chunk_state` / `dno_gdn_chunk_scan`):
+  1. K1(chunk 並列): 各 chunk のローカル遷移 W[ci](S=0 起点のローカル AR 終状態)と M[ci](恒等行列から列ごとに伝播した遷移行列)
+  2. K2(chunk 直列): chunk 先頭状態 Sinit の直列伝播(Sinit[0]=S_in・Sinit[ci+1] = M[ci]·Sinit[ci] + W[ci])
+  3. K3(chunk 並列): Sinit[ci] から chunk 内を逐次 AR スキャン → y と最終状態
+
+- chunk 分割は `chunk_plan(n, 2048, 1024, 16)` を CPU 参照実装(`gdn::scan_chunked_core`)と共有。chunk_tokens=1024・最大 16 chunk・最終 chunk に端数が集中(全 chunk 非空)
+- chunked は **GPU 専用**(CPU の forward 経路からは呼ばれない)ため、CPU の契約「逐次 == バッチ prefill bit 一致」は不変。単一 chunk は逐次 AR と bit 一致・複数 chunk は数学的に等価(丸め順のみ異なる)。GPU 上の chunked 経路も決定論(同一入力 → bit 一致)をテストで担保
+- 数学の根拠: delta rule の 1 ステップは S への**線形**写像 S ← eg·(I − βkkᵀ)·S + βkvᵀ なので chunk をまたぐ依存を「ローカル遷移の計算」と「状態の伝播」に分解できる。k は L2 正規化(‖k‖≈1)・β ∈ (0,1)・eg = exp(g) < 1 で各因子のスペクトルノルム ≤ 1 → M は縮小写像となり丸め誤差が増幅しない
