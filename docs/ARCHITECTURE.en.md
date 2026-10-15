@@ -12,7 +12,7 @@
 
 - An LLM server written in Rust with a **fully hand-written inference kernel** (Anthropic Messages API compatible)
 - The goal is understanding LLM internals through code → no existing inference libraries
-- CPU only, single binary, exact decoding with a fixed seed (same seed + temperature 0 → **bit-identical output**)
+- Single binary, exact decoding with a fixed seed (same seed + temperature 0 → **bit-identical output**). Runs on CPU by default; CUDA GPU offload is optional via a `--features cuda` build (§8; linear layers etc. stay bit-identical to CPU)
 - The topmost discipline: optimizations and parallelization must never break "same input → same output"
 - Operations policy: **keep the host machine clean; everything runs inside Docker**
 
@@ -30,11 +30,12 @@ flowchart LR
     end
     subgraph Engine["denno-engine (inference core)"]
         D[tokenizer<br/>HF tokenizers + chat template]
-        E[model<br/>GPT-2 / Llama-family Qwen2]
+        E["model<br/>GPT-2 / Qwen2 (Llama-family) / Qwen3.5 (GDN)"]
         F[KvCache<br/>slot pool + prefix cache]
-        G[Sampler<br/>greedy / top-k / top-p]
+        G["Sampler<br/>greedy / temperature / top-p / top-k<br/>repetition penalty (A2.5)"]
         T[tensor<br/>sgemm / norm / rope]
         Q[quant<br/>int8 + SIMD i8×i8]
+        U["cuda<br/>GPU offload (--features cuda)"]
         P[prof<br/>self-profiler]
         TL[telemetry<br/>capture hooks]
     end
@@ -45,12 +46,13 @@ flowchart LR
     E --> F
     E --> G
     E --> Q
+    E --> U
     TL -.->|observation only| W2[GET /v1/telemetry/ws]
     W2 --> V
 ```
 
 - A cargo workspace built around the **single binary** `denno` (cli/server/engine + telemetry), plus the visualization relay `denno-view` running as a separate process
-- CPU only, no GPU. Runs Qwen2.5-0.5B–7B-Instruct and GPT-2 124M
+- Runs Qwen2.5-0.5B–7B-Instruct, GPT-2 124M, and **Qwen3.5 (GDN, via the GGUF loader path, §12)**. CPU-only by default; a `--features cuda` build keeps weights/KV/hidden states resident in VRAM with kernel offload (§8)
 - Inference is guarded by `std::sync::Mutex<Engine>`, and the **scheduler steps the engine one forward at a time**, letting new prefills interrupt decoding (P4; converted to continuous batching in P6)
 
 ```
@@ -67,11 +69,17 @@ denno-beta/
 │   │   ├── load.rs            # safetensors loading (single/sharded, F16/BF16→f32)
 │   │   ├── tokenizer.rs       # tokenizer.json + minijinja chat template
 │   │   ├── engine.rs          # begin/step_chat(): prefill→decode stepper
+│   │   ├── cuda.rs            # CUDA kernel dispatch + GPU chains (feature "cuda", §8)
+│   │   ├── gguf.rs            # GGUF container/KV/tensor reading (§12)
+│   │   ├── kquant.rs          # GGML k-quant/IQ dequant (bit-exact with llama.cpp)
+│   │   ├── kquant_tables.rs   # auto-generated tables for the above (do not hand-edit)
 │   │   ├── prof.rs            # self-profiler (DENNO_PROFILE=1)
 │   │   └── model/
 │   │       ├── mod.rs         # Model trait + load_model dispatch
 │   │       ├── gpt2.rs        # GPT-2 (LayerNorm + GELU)
-│   │       └── llama.rs       # Llama/Qwen2 (RMSNorm + RoPE + SwiGLU + GQA)
+│   │       ├── llama.rs       # Llama/Qwen2 (RMSNorm + RoPE + SwiGLU + GQA)
+│   │       ├── qwen35.rs      # Qwen3.5 hybrid (GDN + full attention, §12)
+│   │       └── gdn.rs         # Gated DeltaNet math core (sequential AR form)
 │   ├── denno-server/src/
 │   │   ├── lib.rs             # axum HTTP server + SSE + telemetry WS
 │   │   └── scheduler.rs       # bounded queue + continuous batching worker
@@ -259,9 +267,11 @@ Throughput at 0.5B: fp32 1.35× / int8 1.7× (b=4). At b=4, 0.5B transitions to 
 flowchart LR
     A[config.json] -->|"model_type = gpt2"| B[Gpt2<br/>model/gpt2.rs]
     A -->|"model_type = qwen2"| C[LlamaQwen2<br/>model/llama.rs]
+    A -->|"GGUF: arch = qwen35"| Q35["Qwen35<br/>model/qwen35.rs (§12)"]
     A -->|other| D[error<br/>unsupported model_type]
     B --> E[Model trait<br/>forward / new_cache / eos_ids / context]
     C --> E
+    Q35 --> E
 ```
 
 ### 7.2 Architecture comparison
@@ -429,42 +439,42 @@ flowchart LR
 
 `WeightStore` handles single and sharded checkpoints transparently, resolving shards via the `model.safetensors.index.json` mapping.
 
-## 8. CUDA Optimization Notes
+## 8. CUDA Optimization (implemented — P17 through B3)
 
-Connection points for future CUDA (NVIDIA GPU) optimization. **Architecturally, implementing a `GpuModel` that satisfies the `Model` trait (`forward(tokens, cache) → logits`) requires no changes to engine/scheduler/server.** The crux of porting is the GPU support of the `KvCache` abstraction.
+Enabled by a `--features cuda` build. The P17 series implemented GPU offload of both the decode and prefill paths, and P19-A1 extended it to Qwen3.5 (GDN). **The 13,252-token cold prefill went from 395.8s → 12.2s** (at P17k), and B1 additionally removed the rmsnorm and host round trips structurally. All kernels are hand-written (no cuBLAS); committed `.ptx` files are managed by the procedure "first verify that recompiling the pre-change source reproduces the committed PTX sha256, then regenerate."
 
-### 8.1 Which parts are CUDA implementation points (backed by the P7.5 profile)
+### 8.1 GPU path overview
 
-| Current implementation | Share (CPU) | CUDA implementation point |
-|---|---|---|
-| Linear layers `lin` / `Linear::apply_bt` (qkv/o/gate_up/down) | **~80%** | cuBLAS GEMM (prefill) / custom GEMV (decode). Decode is weight-bandwidth-bound, so simply **keeping weights resident in VRAM** helps a lot. int8 → dp4a / Tensor Cores (INT8) |
-| Attention core `sgemm_acc` + softmax + matmul | 10–18% | **FlashAttention-style fused kernel** (scores never hit HBM; softmax completes in shared memory). PagedAttention for KV fragment management (vLLM style) |
-| lm_head (`matvec_bt` / `lin`, vocab 152k) | 3.5–5.7% | Large GEMV. Split reduction. Computing only top-k candidates on GPU first is also possible |
-| sampler (`sampler.sample`) | **fixed 3.5ms/step** | softmax + top-p sort → µs-class with a single-block radix-select/top-k kernel. **Small but a fixed cost every step** |
-| Elementwise (rmsnorm/rope/silu/softmax) | ~1% | Not worth it alone, but **fused with surrounding kernels** (add+residual+rmsnorm, swiglu fusion) to cut HBM round trips — the CUDA standard playbook |
+The basic structure keeps **weights, the KV mirror, and hidden states resident in VRAM**, while the CPU handles scheduler/tokenizer/sampler. Kernel dispatch is centralized in `cuda.rs`:
 
-### 8.2 What stays on CPU
+| Path | Composition |
+|---|---|
+| decode chain (P17b/P17c/P17d/P17g/P17h) | embedding → rmsnorm → rope (`dno_rope_qkv`) → qkv GEMV (int8) → attention (`dno_attention` + GPU KV mirror) → o_proj → swiglu → down, chained with **hidden-state device residency and no syncs**. Linear layers group qkv / gate+up calls |
+| prefill chain (P17i/P17j/P17k+B1) | Long prefill uses tiled int8 GEMM (`dno_gemm_i8`) + Flash-style online softmax (`dno_attention_prefill`) + resident FFN block (gate_up → swiglu → down). **B1's `forward_prefill_gpu` (Llama-family)** also moves rmsnorm (`dno_add_rmsnorm`, fused with residual add) to GPU and restructures into "one embedding H2D → everything resident on device within a layer → one D2H for the last row" (removing host round trips of 81MB × 4/layer ≈ 9GB/request; only KV-mirror-row D2H and the final row remain) |
+| batched decode (B3) | rope for b>1 offloaded to `dno_rope_qk_batch` (host-generated tables + `(poss,dh,theta)` cache; on failure the host buffers stay untouched and it falls back to CPU) |
+| Qwen3.5 (GDN, P19-A1/A1-r2) | Linear auto-offload + GDN scan kernels (decode n==1 single-shot; prefill n≥2048 3-pass chunked, §12.6). GDN state is VRAM-resident |
+
+- **Demand-based KV allocation (P17e)**: the GPU KV mirror uses grow-on-demand allocation + advance reservation (`kv_bufs(layer,n)`) as a hard guarantee
+- **all-or-nothing contract**: if a chain fails mid-way, the whole forward is redone on the CPU path (KV writes are idempotent; no GPU/CPU mixing)
+- **Measured**: Qwen3.5-9B int8 cold prefill ~28s on CPU → 2.09s on GPU (285 in/64 out, A1) → 13,252 tokens in 12.2s (P17k)
+
+### 8.2 Numerical contract (exactness)
+
+| Operation | Contract |
+|---|---|
+| Linear layers (int8 GEMV/GEMM), rmsnorm, rope, swiglu, residual add | **Bit-identical to CPU** (int8 i32 accumulation is associative + fixed operation order; `-fmad=false` prevents fma contraction) |
+| attention (decode `dno_attention` / prefill `dno_attention_prefill`) | **Approved relaxation window** (maxabs < 1e-3, cos > 0.999, user-approved) |
+| GDN scan | bit-identity not required (contract is only "same input → same output + determinism"; `expf` etc. allowed) |
+
+- **E2E regression criteria**: models dominated by linear layers are judged by "bit-identical to CPU"; GDN models by "**(a) determinism on GPU (same payload → same output) and (b) validity of the output content**". On near-tie prompts even temperature-0 greedy can flip the argmax through chaotic amplification across 32 layers of a tiny within-contract drift (~4e-7 observed) — see the "8095 GPU E2E regression investigation" section in the [Development History](HISTORY.en.md)
+- Existing contracts — sequential == batched prefill bit-identity, solo == batch decode — hold on the GPU path too
+
+### 8.3 What stays on CPU
 
 - tokenizer / detok (HF tokenizers, CPU-friendly)
 - scheduler, HTTP (scheduler.rs, lib.rs) — outside CUDA porting
 - the engine's step_chat loop body (though its content becomes a sequence of kernel launches)
-
-### 8.3 CUDA-specific design challenges
-
-1. **Decode becomes kernel-launch-latency-bound** — hundreds of small kernels per token. **CUDA Graphs** (record and replay one token) is mandatory (same as vLLM etc.)
-2. **KV cache management** — currently contiguous `[max_len, kv_dim]` buffers + truncate. On GPU a **paged KV cache** (block-indirect references) fits the multi-session prefix cache better
-3. **Prefix cache snapshots** — `suspend_session`'s `cache.snapshot()` is a CPU memory copy. On GPU a device-to-device copy (no PCIe) is cheap. Rather, **leaving KV in place for concurrent sessions is realistic on GPU** and merges naturally with P6 (batched matrix form)
-4. **Impact of model differences** — GPT-2's `c_attn` single GEMM lands on cuBLAS as-is. Qwen2's GQA currently loops kv-head × group; **fusing q-heads into the dim for one GEMM** is the proper GPU approach (scores shape unchanged, compatible with determinism design)
-5. **Bit-exactness is the biggest issue**:
-   - **fp32 cannot be bit-identical to CPU** (GPU reduction order and tiling differ). A GPU version is either "a different exact decoding (deterministic within GPU)" or uses deterministic algorithms (deterministic cuBLAS mode + fixed tiling)
-   - **int8 (i32 accumulation) is order-invariant, so CPU/GPU bit-identical output is maintainable** — P5's "associative integer accumulation" design pays off directly. If exactness must survive the GPU migration, int8 is the mainline
-
-### 8.4 Recommended porting order (if implemented)
-
-1. Linear layers only to cuBLAS (weight residency + GEMV/GEMM) → ~80% of the time, biggest win
-2. Fuse attention into one kernel (FlashAttention style)
-3. Sampler top-k kernel + CUDA Graphs
-4. Paged KV cache → concurrent-session decode (merges with P6)
+- sampler (RNG and top-p sorting stay on CPU, preserving the §5 determinism contract)
 
 ## 9. Usage
 

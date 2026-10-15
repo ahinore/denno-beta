@@ -12,7 +12,7 @@
 
 - 推論カーネルを**完全自前実装**したRust製LLMサーバー(Anthropic Messages API互換)
 - 目的はLLMの動作原理のコードによる理解 → 既存推論ライブラリは不使用
-- CPUのみ・単一バイナリ・seed固定のexact decoding(同seed+温度0なら**ビット完全同一出力**)
+- 単一バイナリ・seed固定のexact decoding(同seed+温度0なら**ビット完全同一出力**)・CPUのみで動作し、CUDA による GPU オフロードは `--features cuda` ビルドの optional(§8・線形層等は CPU とビット一致)
 - 最適化・並列化をしても「同一入力→同一出力」を壊さないことを最優先の規律とする
 - 運用方針: **ホストはクリーンに保ち、すべてDocker内で完結**
 
@@ -30,11 +30,12 @@ flowchart LR
     end
     subgraph Engine["denno-engine (推論コア)"]
         D[tokenizer<br/>HF tokenizers + chat template]
-        E[model<br/>GPT-2 / Llama系 Qwen2]
+        E["model<br/>GPT-2 / Qwen2(Llama系) / Qwen3.5(GDN)"]
         F[KvCache<br/>スロットプール + prefix cache]
-        G[Sampler<br/>greedy / top-k / top-p]
+        G["Sampler<br/>greedy / temperature / top-p / top-k<br/>repetition penalty (A2.5)"]
         T[tensor<br/>sgemm / norm / rope]
         Q[quant<br/>int8 + SIMD i8×i8]
+        U["cuda<br/>GPU オフロード (--features cuda)"]
         P[prof<br/>セルフプロファイラ]
         TL[telemetry<br/>捕捉フック]
     end
@@ -45,12 +46,13 @@ flowchart LR
     E --> F
     E --> G
     E --> Q
+    E --> U
     TL -.->|観測のみ| W2[GET /v1/telemetry/ws]
     W2 --> V
 ```
 
 - **単一バイナリ** `denno`(cli/server/engine + telemetry)に加え、可視化中継の `denno-view` を別プロセスで動かすcargoワークスペース
-- CPUのみ、GPU不要。Qwen2.5-0.5B〜7B-Instruct と GPT-2 124M が動く
+- Qwen2.5-0.5B〜7B-Instruct・GPT-2 124M・**Qwen3.5(GDN・GGUF ローダ経路・§12)**が動く。既定は CPU のみ、`--features cuda` ビルドで重み/KV/隠れ状態の VRAM 常駐+カーネルオフロード(§8)
 - 推論は `std::sync::Mutex<Engine>` で保護しつつ、**スケジューラが1 forward単位でステップ実行**し、decode中にも新規prefillを割り込ませる(P4、P6で連続バッチング化)
 
 ```
@@ -67,11 +69,17 @@ denno-beta/
 │   │   ├── load.rs            # safetensors 読み込み (単一/分割shard、F16/BF16→f32)
 │   │   ├── tokenizer.rs       # tokenizer.json + minijinja chat template
 │   │   ├── engine.rs          # begin/step_chat(): prefill→decode ステッパ
+│   │   ├── cuda.rs            # CUDA カーネル呼び出し+GPU チェーン (feature "cuda"・§8)
+│   │   ├── gguf.rs            # GGUF コンテナ/KV/テンソル読み込み (§12)
+│   │   ├── kquant.rs          # GGML k-quant/IQ dequant (llama.cpp bit-exact)
+│   │   ├── kquant_tables.rs   # ↑の自動生成テーブル (手編集禁止)
 │   │   ├── prof.rs            # セルフプロファイラ (DENNO_PROFILE=1)
 │   │   └── model/
 │   │       ├── mod.rs         # Model トレイト + load_model ディスパッチ
 │   │       ├── gpt2.rs        # GPT-2 (LayerNorm + GELU)
-│   │       └── llama.rs       # Llama/Qwen2 (RMSNorm + RoPE + SwiGLU + GQA)
+│   │       ├── llama.rs       # Llama/Qwen2 (RMSNorm + RoPE + SwiGLU + GQA)
+│   │       ├── qwen35.rs      # Qwen3.5 ハイブリッド (GDN + full attention・§12)
+│   │       └── gdn.rs         # Gated DeltaNet 数値コア (逐次 AR 形式)
 │   ├── denno-server/src/
 │   │   ├── lib.rs             # axum HTTPサーバー + SSE + テレメトリWS
 │   │   └── scheduler.rs       # 有界キュー + 連続バッチング実行ワーカー
@@ -259,9 +267,11 @@ exactnessの根拠は2段:
 flowchart LR
     A[config.json] -->|"model_type = gpt2"| B[Gpt2<br/>model/gpt2.rs]
     A -->|"model_type = qwen2"| C[LlamaQwen2<br/>model/llama.rs]
+    A -->|"GGUF: arch = qwen35"| Q35["Qwen35<br/>model/qwen35.rs (§12)"]
     A -->|その他| D[エラー<br/>未対応の model_type]
     B --> E[Model トレイト<br/>forward / new_cache / eos_ids / context]
     C --> E
+    Q35 --> E
 ```
 
 ### 7.2 アーキテクチャ比較
@@ -429,42 +439,42 @@ flowchart LR
 
 `WeightStore` が単一/分割checkpointを透過的に扱う。テンソル名から `model.safetensors.index.json` の対応表でshardを解決する。
 
-## 8. CUDA最適化の実装ポイント
+## 8. CUDA 最適化(実装済み — P17〜B3)
 
-将来的にCUDA(NVIDIA GPU)へ最適化する場合の接続点。**アーキテクチャ上は `Model` トレイト(`forward(tokens, cache) → logits`)を満たす `GpuModel` を実装すれば engine/scheduler/server は無変更**で済む設計。移植の要は `KvCache` 抽象のGPU対応。
+`--features cuda` ビルドで有効。P17 系で decode/prefill 両経路の GPU オフロードを実装し、P19-A1 で Qwen3.5(GDN)へ拡張。**13,252 トークンの cold prefill は 395.8s → 12.2s**(P17k 時点)で、B1 により rmsnorm とホスト往復も構造的に廃止。カーネルは全て自前実装(cuBLAS 不使用)で、PTX はコミット済み `.ptx` を「変更前ソースの再コンパイルが committed PTX と sha256 一致することを先に検証 → 再生成」の手順で管理する。
 
-### 8.1 どの処理がCUDAの実装ポイントか(P7.5プロファイルの裏付け)
+### 8.1 GPU 経路の全体像
 
-| 現在の実装箇所 | 占有率(CPU) | CUDA実装ポイント |
-|---|---|---|
-| 線形層 `lin` / `Linear::apply_bt`(qkv/o/gate_up/down) | **約80%** | cuBLAS GEMM(prefill)/カスタムGEMV(decode)。decodeは重み帯域律速なので**重みをVRAM常駐**させるだけで大幅改善。int8は dp4a / Tensor Core(INT8) |
-| attention本体 `sgemm_acc` + softmax + matmul | 10〜18% | **FlashAttention型の融合カーネル**(scoresをHBMに書き出さずshared memory内でsoftmaxまで完結)。PagedAttentionでKV断片管理(vLLM方式) |
-| lm_head(`matvec_bt` / `lin`, vocab 152k) | 3.5〜5.7% | 大きいGEMV。分割リダクション。top-k候補だけを先にGPUで計算する方式も可能 |
-| sampler(`sampler.sample`) | **3.5ms/step固定** | softmax+top-pソートを1ブロックのradix-select/top-kカーネルでµs級に。**小さいが毎ステップ必ず走る固定コスト** |
-| 要素演算(rmsnorm/rope/silu/softmax) | ~1% | 単独では不要だが、**前後のカーネルと融合**(add+residual+rmsnorm、swiglu融合)してHBMラウンドトリップを削減するのがCUDAの定石 |
+基本構造は**重み・KV ミラー・隠れ状態を VRAM 常駐**させ、CPU は scheduler/tokenizer/sampler を担当する。カーネル呼び出しは `cuda.rs` に集約:
 
-### 8.2 CPUには残すもの
+| 経路 | 構成 |
+|---|---|
+| decode チェーン(P17b/P17c/P17d/P17g/P17h) | 埋め込み → rmsnorm → rope(`dno_rope_qkv`)→ qkv GEMV(int8)→ attention(`dno_attention`+GPU KV ミラー)→ o_proj → swiglu → down が**隠れ状態デバイス常駐・同期なし**で連結。線形層は qkv/gate+up をグループ化呼び出し |
+| prefill チェーン(P17i/P17j/P17k+B1) | 長 prefill は tiled int8 GEMM(`dno_gemm_i8`)+ flash 風 online softmax(`dno_attention_prefill`)+ FFN ブロック常駐(gate_up → swiglu → down)。**B1 の `forward_prefill_gpu`(llama 系)**で rmsnorm(`dno_add_rmsnorm`・residual 加算融合)も GPU 化し、「埋め込み 1 回 H2D → 層内全てデバイス常駐 → 最終行 1 回 D2H」に再構成(ホスト往復 81MB×4/層 = ~9GB/リクエスト相当を廃止・KV ミラー行 D2H と最終行のみ残存) |
+| バッチ decode(B3) | b>1 の rope を `dno_rope_qk_batch` で GPU 化(ホスト生成テーブル+`(poss,dh,theta)` キャッシュ・失敗時はホスト不変で CPU フォールバック) |
+| Qwen3.5(GDN・P19-A1/A1-r2) | Linear 自動オフロード+GDN スキャンカーネル(decode n==1 は単発・prefill n≥2048 は 3-pass chunked・§12.6)。GDN 状態は VRAM 常駐 |
+
+- **需要ベース KV 確保(P17e)**: GPU KV ミラーは成長型確保+先行呼び出し予約(`kv_bufs(layer,n)`)でハード保証
+- **all-or-nothing 契約**: チェーン途中失敗時は forward 全体を CPU 経路でやり直す(KV 書き込みは冪等・GPU/CPU 混合なし)
+- **実測**: 9B Qwen3.5 int8 の cold prefill は CPU ~28s → GPU 2.09s(285 in/64 out・A1)→ 13,252 トークン 12.2s(P17k)
+
+### 8.2 数値契約(exactness)
+
+| 演算 | 契約 |
+|---|---|
+| 線形層(int8 GEMV/GEMM)・rmsnorm・rope・swiglu・residual 加算 | **CPU とビット一致**(int8 の i32 累積は結合則が成立+演算順序固定・`-fmad=false` で fma 縮約なし) |
+| attention(decode `dno_attention`/prefill `dno_attention_prefill`) | **数値緩和枠**(maxabs < 1e-3・cos > 0.999・ユーザー承認済み) |
+| GDN スキャン | bit 一致不要(契約は「同一入力→同一出力+決定論」のみ・`expf` 等使用可) |
+
+- **E2E 回帰判定基準**: 線形層中心のモデルは「CPU とのビット一致」、GDN モデルは「**(a) GPU 上の決定論(同一 payload → 同一出力)(b) 出力内容の妥当性**」。near-tie prompt では temperature 0 greedy でも緩和契約内の微小 drift(観測 ~4e-7)が 32 層のカオス的増幅で argmax を反転させ得るため(詳細は [開発履歴](HISTORY.ja.md)「8095 GPU E2E リグレッション調査」節)
+- 逐次とバッチ prefill のビット一致、solo==batch decode などの既存契約は GPU 経路でも維持
+
+### 8.3 CPU に残すもの
 
 - tokenizer / detok(HF tokenizers、CPU向き)
 - scheduler・HTTP(scheduler.rs、lib.rs)— CUDA移植の対象外
 - engine の step_chat ループ本体(ただし中身が kernel launch の連発に変わる)
-
-### 8.3 CUDA固有の設計課題
-
-1. **decodeはカーネル起動レイテンシが律速になる** — 1トークンに数百個の小カーネルが飛ぶ。**CUDA Graphs**で1トークン分を記録し再生するのが必須(vLLM等と同じ)
-2. **KVキャッシュの管理方式** — 現在は `[max_len, kv_dim]` の連続バッファ+truncate。GPU版は**paged KV cache**(ブロック単位の間接参照)にすると prefix cache の複数セッション管理と相性が良い
-3. **prefix cacheのスナップショット** — `suspend_session` の `cache.snapshot()` はCPUメモリコピー。GPU版は device-to-device copy(PCIeを介さない)で安価になる。むしろ**GPUではKVを残したまま複数セッション並行が現実的**になり、P6(バッチ行列化)と自然に合流する
-4. **モデル差分の影響** — GPT-2の `c_attn` 一括GEMMはcuBLASにそのまま載る。Qwen2のGQAは現在 kv-head × group のループだが、**q-headを次元に束ねて1 GEMMに融合**するのがGPUでの正攻法(スコアの形が変わらないため決定論設計と両立)
-5. **exactness(ビット一致)の扱いが最大の論点**:
-   - **fp32はCPUとビット一致しない**(GPUのreduction順序・タイリングが違うため)。GPU版は「別のexact decoding(GPU内では決定論)」と割り切るか、決定論的アルゴリズム(deterministic cuBLASモード+固定タイリング)を使う
-   - **int8(i32累積)は順序不変なのでCPU/GPUでビット同一出力を維持できる** — P5の「結合則が成立する整数累積」設計がそのまま活きる。GPU移行時にexactnessを保ちたいなら int8 路線が本命
-
-### 8.4 移植ステップの推奨順(実装するなら)
-
-1. 線形層だけcuBLASへ(重み常駐+GEMV/GEMM)→ 約80%が対象で効果が最大
-2. attentionを融合カーネル化(FlashAttention型)
-3. samplerのtop-kカーネル+CUDA Graphs
-4. KV cacheのpaged化 → 複数セッション並行decode(P6と合流)
+- sampler(RNG・top-p ソートは CPU のまま・§5 の決定論契約を維持)
 
 ## 9. 使い方
 
