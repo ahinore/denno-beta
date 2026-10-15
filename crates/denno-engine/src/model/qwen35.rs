@@ -8,6 +8,17 @@
 //! sections [11,11,10] — テキストでは t=h=w なので通常 RoPE と等価)、
 //! QK-Norm、sigmoid 出力ゲートを持つ。embedding は tied (lm_head 無し)。
 //!
+//! 27B (Qwen3.8) も同一構造 (2026-10-16 実 GGUF ヘッダ + transformers
+//! modeling_qwen3_5 + llama.cpp src/models/qwen35.cpp の照合で確認):
+//! attn_q = [e, 2*heads*dh] 融合 (head ごと [q(dh)|gate(dh)])・out-gate は
+//! attention 後 o_proj 前 (sigmoid)・attn_output = [heads*dh, e]。9B は
+//! heads*dh == e (4096) で偶然正方形だが、27B は非正方形 (6144→5120)・
+//! 0.8B も非正方形 (2048→1024) でエンジンの既定経路がそのまま正解。ローダは
+//! テンソル形状をヘッダ段階で config 由来の期待値と照合し (expect_ne)、
+//! 想定外の構造を静かに誤読せずロード時に拒否する。GGUF block_count が
+//! config num_hidden_layers を超過する分は MTP (nextn) 層
+//! (blk.{n}.nextn.*) として読み飛ばす (27B: block_count=65 = trunk 64 + 1)。
+//!
 //! GDN 層の状態 (conv バッファ + SSM 行列) は KvCache の GDN スロットに保持
 //! (セッションごと)。forward はトークン逐次 (prefill/decode 共通・bit 一致)。
 //!
@@ -130,6 +141,29 @@ fn pick_gguf(dir: &Path) -> Result<std::path::PathBuf> {
     Ok(candidates[0].clone())
 }
 
+/// ロード時の構造検証: テンソルを dequant する前に、GGUF ヘッダ上の形状
+/// (ne[0], ne[1], …) を config 由来の期待値と照合する (末尾の 1 は無視)。
+/// 想定外の構造 (full-attn の q|gate 融合の有無・out-gate の位置の違い・
+/// MTP 層の混入など) を静かに誤読すると logits が壊れるため、不一致は
+/// ロード時に明確なエラーで拒否する (27B out-gate 構造調査の反映)。
+fn expect_ne(f: &GgufFile, name: &str, ne: &[u64]) -> Result<()> {
+    let t = f
+        .tensor(name)
+        .ok_or_else(|| anyhow::anyhow!("テンソル {name} が GGUF にありません"))?;
+    for (i, &want) in ne.iter().enumerate() {
+        if t.dims[i] != want {
+            bail!(
+                "{name}: GGUF 形状 ne={:?} が期待 ne={ne:?} (末尾 1 を除く) と不一致 — config と GGUF の構造ミスマッチ (full-attn の q|gate 融合 / out-gate 構造 / MTP 層の有無を確認)",
+                t.dims
+            );
+        }
+    }
+    if t.dims.iter().skip(ne.len()).any(|&d| d != 1) {
+        bail!("{name}: 期待 ne={ne:?} より高い次元のテンソル (ne={:?})", t.dims);
+    }
+    Ok(())
+}
+
 /// interleaved partial RoPE: 各 head の先頭 n_rot 次元のみペア (2d, 2d+1) で回転。
 /// GGML/HF (mrope_interleaved) と同一規約。テキストでは t=h=w で
 /// mrope sections 分割は通常 RoPE に縮退する。
@@ -244,8 +278,59 @@ impl Qwen35 {
             f.dequant_tensor(name)
                 .with_context(|| format!("tensor {name}"))
         };
+        // 構造検証付き dequant: ヘッダ上の形状を config 由来の期待値と照合して
+        // から読む (想定外の構造は静かに誤読せずロード時に拒否)
+        let dt_shaped = |name: &str, ne: &[u64]| -> Result<Vec<f32>> {
+            expect_ne(&f, name, ne).with_context(|| format!("tensor {name}"))?;
+            dt(name)
+        };
 
         let n_layer = cfg_u64(tc, "num_hidden_layers")? as usize;
+
+        // 層数の整合確認 (MTP/nextn 除外): GGUF の block_count は MTP (nextn)
+        // 層を含み得る (27B: block_count=65 = trunk 64 + nextn 1・
+        // nextn_predict_layers=1)。推論トランクの層数決定元は config の
+        // num_hidden_layers を正とし、超過分の blk.{n_layer}.. は nextn 層
+        // (nextn.eh_proj を持ち ssm_a を持たない) のときだけ読み飛ばす。
+        // nextn を通常層として読むと意味論が壊れるため、不整合はロード時に拒否。
+        // (9B: block_count=32 == num_hidden_layers、nextn KV 無し → 何もしない)
+        let block_count = f
+            .get(&format!("{arch}.block_count"))
+            .and_then(|v| v.as_u64());
+        let nextn_predict = f
+            .get(&format!("{arch}.nextn_predict_layers"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if let Some(bc) = block_count {
+            if (bc as usize) < n_layer {
+                bail!(
+                    "config num_hidden_layers ({n_layer}) が GGUF block_count ({bc}) を超過 — config と GGUF の不一致"
+                );
+            }
+            let extra = bc as usize - n_layer;
+            if extra > 0 {
+                if nextn_predict as usize != extra {
+                    bail!(
+                        "GGUF block_count ({bc}) - config num_hidden_layers ({n_layer}) = {extra} 層の超過が nextn_predict_layers ({nextn_predict}) と不一致 — config と GGUF の構造ミスマッチ"
+                    );
+                }
+                for i in n_layer..bc as usize {
+                    let p = format!("blk.{i}.");
+                    if f.tensor(&format!("{p}nextn.eh_proj.weight")).is_none()
+                        || f.tensor(&format!("{p}ssm_a")).is_some()
+                    {
+                        bail!(
+                            "blk.{i} が nextn (MTP) 層の構成を持たない (nextn.eh_proj.weight 無し or ssm_a 有り) — config num_hidden_layers={n_layer} と GGUF block_count={bc} の不整合"
+                        );
+                    }
+                }
+                tracing::info!(
+                    "MTP (nextn) 層 {extra} 個 (blk.{n_layer}..blk.{}) を読み飛ばし (推論トランク = config の {n_layer} 層)",
+                    bc - 1
+                );
+            }
+        }
+
         let mut layers: Vec<Layer> = Vec::with_capacity(n_layer);
         let mut quant_bytes = std::cell::Cell::new(0usize);
         let lin = |w: Vec<f32>, k: usize, n: usize| -> Linear {
@@ -267,39 +352,85 @@ impl Qwen35 {
         let vd = gdn_p.value_dim();
         let qkv_dim = gdn_p.qkv_dim();
 
+        let eu = e as u64;
         for i in 0..n_layer {
             let p = format!("blk.{i}.");
-            let ln1_w = dt(&format!("{p}attn_norm.weight"))?;
-            let ln2_w = dt(&format!("{p}post_attention_norm.weight"))?;
-            let gate_w = lin(dt(&format!("{p}ffn_gate.weight"))?, e, ff);
-            let up_w = lin(dt(&format!("{p}ffn_up.weight"))?, e, ff);
-            let down_w = lin(dt(&format!("{p}ffn_down.weight"))?, ff, e);
+            let ln1_w = dt_shaped(&format!("{p}attn_norm.weight"), &[eu])?;
+            let ln2_w = dt_shaped(&format!("{p}post_attention_norm.weight"), &[eu])?;
+            let gate_w = lin(dt_shaped(&format!("{p}ffn_gate.weight"), &[eu, ff as u64])?, e, ff);
+            let up_w = lin(dt_shaped(&format!("{p}ffn_up.weight"), &[eu, ff as u64])?, e, ff);
+            let down_w = lin(dt_shaped(&format!("{p}ffn_down.weight"), &[ff as u64, eu])?, ff, e);
 
             let attn = if f.tensor(&format!("{p}ssm_a")).is_some() {
                 // GDN (linear_attention) 層
                 AttnKind::Gdn(GdnLayer {
                     ln1_w,
-                    qkv_w: lin(dt(&format!("{p}attn_qkv.weight"))?, e, qkv_dim),
-                    gate_w: lin(dt(&format!("{p}attn_gate.weight"))?, e, vd),
-                    beta_w: lin_ctl(dt(&format!("{p}ssm_beta.weight"))?, e, gdn_p.n_v_heads),
-                    alpha_w: lin_ctl(dt(&format!("{p}ssm_alpha.weight"))?, e, gdn_p.n_v_heads),
-                    conv1d: dt(&format!("{p}ssm_conv1d.weight"))?,
-                    ssm_a: dt(&format!("{p}ssm_a"))?,
-                    ssm_dt: dt(&format!("{p}ssm_dt.bias"))?,
-                    ssm_norm: dt(&format!("{p}ssm_norm.weight"))?,
-                    out_w: lin(dt(&format!("{p}ssm_out.weight"))?, vd, e),
+                    qkv_w: lin(
+                        dt_shaped(&format!("{p}attn_qkv.weight"), &[eu, qkv_dim as u64])?,
+                        e,
+                        qkv_dim,
+                    ),
+                    gate_w: lin(
+                        dt_shaped(&format!("{p}attn_gate.weight"), &[eu, vd as u64])?,
+                        e,
+                        vd,
+                    ),
+                    beta_w: lin_ctl(
+                        dt_shaped(&format!("{p}ssm_beta.weight"), &[eu, gdn_p.n_v_heads as u64])?,
+                        e,
+                        gdn_p.n_v_heads,
+                    ),
+                    alpha_w: lin_ctl(
+                        dt_shaped(&format!("{p}ssm_alpha.weight"), &[eu, gdn_p.n_v_heads as u64])?,
+                        e,
+                        gdn_p.n_v_heads,
+                    ),
+                    conv1d: dt_shaped(
+                        &format!("{p}ssm_conv1d.weight"),
+                        &[gdn_p.d_conv as u64, qkv_dim as u64],
+                    )?,
+                    ssm_a: dt_shaped(&format!("{p}ssm_a"), &[gdn_p.n_v_heads as u64])?,
+                    ssm_dt: dt_shaped(&format!("{p}ssm_dt.bias"), &[gdn_p.n_v_heads as u64])?,
+                    ssm_norm: dt_shaped(&format!("{p}ssm_norm.weight"), &[gdn_p.head_v_dim as u64])?,
+                    out_w: lin(
+                        dt_shaped(&format!("{p}ssm_out.weight"), &[vd as u64, eu])?,
+                        vd,
+                        e,
+                    ),
                 })
             } else {
-                // full_attention 層 (Q+gate 融合: out = heads*[q(dh)|gate(dh)])
+                // full_attention 層 (Q+gate 融合: out = heads*[q(dh)|gate(dh)])。
+                // 構造は 0.8B/9B/27B 実 GGUF + transformers/llama.cpp 両参照で共通
+                // を確認 (27B: attn_q=[e, 2*heads*dh] 融合・attn_output=
+                // [heads*dh, e] 非正方形・out-gate は attention 後 o_proj 前)。
                 let q_total = heads * dh * 2;
                 AttnKind::Full(FullLayer {
                     ln1_w,
-                    q_w: lin(dt(&format!("{p}attn_q.weight"))?, e, q_total),
-                    k_w: lin(dt(&format!("{p}attn_k.weight"))?, e, kv_heads * dh),
-                    v_w: lin(dt(&format!("{p}attn_v.weight"))?, e, kv_heads * dh),
-                    q_norm_w: dt(&format!("{p}attn_q_norm.weight"))?,
-                    k_norm_w: dt(&format!("{p}attn_k_norm.weight"))?,
-                    o_w: lin(dt(&format!("{p}attn_output.weight"))?, heads * dh, e),
+                    q_w: lin(
+                        dt_shaped(&format!("{p}attn_q.weight"), &[eu, q_total as u64])?,
+                        e,
+                        q_total,
+                    ),
+                    k_w: lin(
+                        dt_shaped(&format!("{p}attn_k.weight"), &[eu, (kv_heads * dh) as u64])?,
+                        e,
+                        kv_heads * dh,
+                    ),
+                    v_w: lin(
+                        dt_shaped(&format!("{p}attn_v.weight"), &[eu, (kv_heads * dh) as u64])?,
+                        e,
+                        kv_heads * dh,
+                    ),
+                    q_norm_w: dt_shaped(&format!("{p}attn_q_norm.weight"), &[dh as u64])?,
+                    k_norm_w: dt_shaped(&format!("{p}attn_k_norm.weight"), &[dh as u64])?,
+                    o_w: lin(
+                        dt_shaped(
+                            &format!("{p}attn_output.weight"),
+                            &[(heads * dh) as u64, eu],
+                        )?,
+                        heads * dh,
+                        e,
+                    ),
                 })
             };
             layers.push(Layer {
@@ -318,7 +449,7 @@ impl Qwen35 {
             .as_bool()
             .or_else(|| cfg["tie_word_embeddings"].as_bool())
             .unwrap_or(true);
-        let embed = dt("token_embd.weight")?;
+        let embed = dt_shaped("token_embd.weight", &[eu, vocab as u64])?;
         let lm_head = if tied {
             match quant {
                 QuantMode::Fp32 => None,
@@ -329,11 +460,11 @@ impl Qwen35 {
                 }
             }
         } else {
-            Some(lin(dt("output.weight")?, e, vocab))
+            Some(lin(dt_shaped("output.weight", &[eu, vocab as u64])?, e, vocab))
         };
         let norm_w = match f.tensor("output_norm.weight") {
-            Some(_) => dt("output_norm.weight")?,
-            None => dt("model.norm.weight")?,
+            Some(_) => dt_shaped("output_norm.weight", &[eu])?,
+            None => dt_shaped("model.norm.weight", &[eu])?,
         };
 
         // A3: 層構成の可観測性 (27B = 48 GDN + 16 full を起動ログで確認できる)
@@ -911,16 +1042,26 @@ mod tests {
 
     /// F32 テンソルのみの最小 GGUF v3 ライタ (テスト専用)。
     /// ne は GGUF 順 (ne[0] = 最速次元 = in_features)。
-    fn write_gguf_f32(path: &PathBuf, tensors: &[(String, Vec<u64>, Vec<f32>)]) {
+    /// `extra_kv` は general.architecture に追加する u64 KV (例: block_count)。
+    fn write_gguf_f32(
+        path: &PathBuf,
+        tensors: &[(String, Vec<u64>, Vec<f32>)],
+        extra_kv: &[(&str, u64)],
+    ) {
         const ALIGN: usize = 32;
         let mut b = Vec::new();
         wr_u32(&mut b, 0x4655_4747); // magic "GGUF"
         wr_u32(&mut b, 3); // version
         wr_u64(&mut b, tensors.len() as u64);
-        wr_u64(&mut b, 1); // metadata kv count
+        wr_u64(&mut b, 1 + extra_kv.len() as u64); // metadata kv count
         wr_str(&mut b, "general.architecture");
         wr_u32(&mut b, 8); // GT_STRING
         wr_str(&mut b, "qwen3_5");
+        for (key, val) in extra_kv {
+            wr_str(&mut b, key);
+            wr_u32(&mut b, 10); // GT_U64
+            wr_u64(&mut b, *val);
+        }
         let mut off = 0u64;
         let mut data = Vec::new();
         for (name, ne, vals) in tensors {
@@ -951,6 +1092,21 @@ mod tests {
     /// 27B シェイプの合成モデルディレクトリ (config.json + model.gguf) を作る。
     /// `wrapper` = VLM ラッパ形式 (text_config、9B/27B と同形) / false = 平文 config。
     fn build_dir(name: &str, wrapper: bool, nk: usize, nv: usize) -> PathBuf {
+        build_dir_x(name, wrapper, nk, nv, false, |_| {})
+    }
+
+    /// 拡張版。`mtp_nextn` = true で blk.NL を nextn (MTP) 層として追加し、
+    /// GGUF KV に block_count=NL+1 / nextn_predict_layers=1 を足す (実 27B の
+    /// blk.64 と同一構成のテンソル名)。`mutate` は書き出し前のテンソルリスト
+    /// 調整 (形状不一致テスト用)。
+    fn build_dir_x(
+        name: &str,
+        wrapper: bool,
+        nk: usize,
+        nv: usize,
+        mtp_nextn: bool,
+        mutate: impl FnOnce(&mut Vec<(String, Vec<u64>, Vec<f32>)>),
+    ) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("denno_a3_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1002,7 +1158,43 @@ mod tests {
                 ));
             }
         }
-        write_gguf_f32(&dir.join("model.gguf"), &ts);
+        if mtp_nextn {
+            // blk.NL: 実 27B の blk.64 と同一構成のテンソル名 (中身はダミー —
+            // トランクは config の NL 層のみで nextn は読まれない)
+            let p = format!("blk.{NL}.");
+            ts.push((format!("{p}attn_norm.weight"), vec![E as u64], vec![1.0; E]));
+            ts.push((format!("{p}post_attention_norm.weight"), vec![E as u64], vec![1.0; E]));
+            ts.push((format!("{p}ffn_gate.weight"), vec![E as u64, FF as u64], w(FF * E)));
+            ts.push((format!("{p}ffn_up.weight"), vec![E as u64, FF as u64], w(FF * E)));
+            ts.push((format!("{p}ffn_down.weight"), vec![FF as u64, E as u64], w(E * FF)));
+            ts.push((format!("{p}attn_q.weight"), vec![E as u64, QTOT as u64], w(QTOT * E)));
+            ts.push((format!("{p}attn_k.weight"), vec![E as u64, KVDIM as u64], w(KVDIM * E)));
+            ts.push((format!("{p}attn_v.weight"), vec![E as u64, KVDIM as u64], w(KVDIM * E)));
+            ts.push((format!("{p}attn_q_norm.weight"), vec![DH as u64], vec![1.0; DH]));
+            ts.push((format!("{p}attn_k_norm.weight"), vec![DH as u64], vec![1.0; DH]));
+            ts.push((
+                format!("{p}attn_output.weight"),
+                vec![(HEADS * DH) as u64, E as u64],
+                w(E * HEADS * DH),
+            ));
+            ts.push((
+                format!("{p}nextn.eh_proj.weight"),
+                vec![(2 * E) as u64, E as u64],
+                w(2 * E * E),
+            ));
+            ts.push((format!("{p}nextn.enorm.weight"), vec![E as u64], vec![1.0; E]));
+            ts.push((format!("{p}nextn.hnorm.weight"), vec![E as u64], vec![1.0; E]));
+        }
+        mutate(&mut ts);
+        let kvs: Vec<(&str, u64)> = if mtp_nextn {
+            vec![
+                ("qwen3_5.block_count", (NL + 1) as u64),
+                ("qwen3_5.nextn_predict_layers", 1),
+            ]
+        } else {
+            vec![]
+        };
+        write_gguf_f32(&dir.join("model.gguf"), &ts, &kvs);
 
         let layer_types: Vec<&str> = (0..NL)
             .map(|i| if i % 4 == 3 { "full_attention" } else { "linear_attention" })
@@ -1187,6 +1379,95 @@ mod tests {
         let mut c = m.new_cache();
         let l = m.forward(&[3u32, 50, 11], &mut c).unwrap();
         assert!(l.iter().all(|v| v.is_finite()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 実 27B と同形の MTP (nextn) 層 (blk.NL + block_count=NL+1 KV) があって
+    /// も、推論トランクは config の NL 層のみでロードに成功する (nextn 層は
+    /// 読み飛ばされる — blk.NL を通常層としては読まない)。
+    #[test]
+    fn qwen38_27b_shape_mtp_nextn_layer_skipped() {
+        let dir = build_dir_x("mtp", true, NK, NV, true, |_| {});
+        let mut m = load_int8(&dir);
+        assert_eq!(
+            m.layers.len(),
+            NL,
+            "トランクは config の NL 層のみ (nextn 層を含まない)"
+        );
+        let mut c = m.new_cache();
+        let l1 = m.forward(&[3u32, 50, 11], &mut c).unwrap();
+        let l2 = m.forward(&[3u32, 50, 11], &mut m.new_cache()).unwrap();
+        assert!(l1.iter().all(|v| v.is_finite()));
+        assert_eq!(bits(&l1), bits(&l2), "MTP 層の存在で決定論が変わってはいけない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// blk.NL が存在するのに nextn 構成を持たない (nextn.eh_proj 無し) 場合は
+    /// ロードを拒否する (config/GGUF 不整合を静かに無視しない)。
+    #[test]
+    fn qwen38_27b_shape_non_nextn_extra_block_rejected() {
+        let dir = build_dir_x("mtpbad", true, NK, NV, true, |ts| {
+            ts.retain(|(n, _, _)| !n.contains(&format!("blk.{NL}.nextn.")));
+        });
+        let cfg: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap()).unwrap();
+        let err = match Qwen35::load(&dir, &cfg, QuantMode::Int8) {
+            Err(e) => e,
+            Ok(_) => panic!("nextn 構成を持たない超過ブロックのロードが通ってしまった"),
+        };
+        assert!(
+            format!("{err:#}").contains("nextn"),
+            "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// full_attention 層の attn_output が想定外の形状 ([2*heads*dh, e] —
+    /// 「o_proj の手前で [att|gate] を連結し o_proj 後に gate を適用する」
+    /// 別構造の想定) なら、静かに誤読せずロードを拒否する (27B out-gate
+    /// 調査の反映: 27B の正は [heads*dh, e]・不一致はロード時に明確化)。
+    #[test]
+    fn qwen38_27b_shape_attn_output_shape_mismatch_rejected() {
+        let dir = build_dir_x("oshape", true, NK, NV, false, |ts| {
+            for (n, ne, vals) in ts.iter_mut() {
+                if n == "blk.3.attn_output.weight" {
+                    *ne = vec![(2 * HEADS * DH) as u64, E as u64];
+                    *vals = vec![0.01; 2 * HEADS * DH * E];
+                }
+            }
+        });
+        let cfg: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap()).unwrap();
+        let err = match Qwen35::load(&dir, &cfg, QuantMode::Int8) {
+            Err(e) => e,
+            Ok(_) => panic!("attn_output 形状不一致のロードが通ってしまった"),
+        };
+        assert!(
+            format!("{err:#}").contains("attn_output"),
+            "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// attn_q が q|gate 融合でない想定外構造 (out = heads*dh のみ・ゲート無し)
+    /// なら、head ごとの [q|gate] split を静かに誤読しないようロードを拒否する。
+    #[test]
+    fn qwen38_27b_shape_fused_q_gate_shape_mismatch_rejected() {
+        let dir = build_dir_x("qshape", true, NK, NV, false, |ts| {
+            for (n, ne, vals) in ts.iter_mut() {
+                if n == "blk.3.attn_q.weight" {
+                    *ne = vec![E as u64, (HEADS * DH) as u64];
+                    *vals = vec![0.01; E * HEADS * DH];
+                }
+            }
+        });
+        let cfg: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap()).unwrap();
+        let err = match Qwen35::load(&dir, &cfg, QuantMode::Int8) {
+            Err(e) => e,
+            Ok(_) => panic!("attn_q 形状不一致のロードが通ってしまった"),
+        };
+        assert!(format!("{err:#}").contains("attn_q"), "unexpected error: {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

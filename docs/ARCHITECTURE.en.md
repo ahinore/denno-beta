@@ -635,6 +635,9 @@ Previously HF safetensors was the only route; P19 added a **second weights route
 - Even mixed per-layer quantization like Unsloth Dynamic (UD-IQ2_XXS etc.) becomes identical to the existing route after dequantization
 - **`ssm_beta`/`ssm_alpha` stay Fp32 even in Int8 mode**: control signals passed through sigmoid/softplus; ~1% per-row int8 noise breaks the output (beta directly scales the whole delta rule, alpha the decay rate)
 - `pick_gguf`: selects from .gguf files in the directory, preferring UD-IQ2_XXS (`DENNO_GGUF_FILE` for explicit selection)
+- **Load-time shape guard (`expect_ne`)**: before dequantizing any layer tensor, its GGUF header shape (ne) is checked against config-derived expectations (trailing 1s ignored). Unexpected structures (presence/absence of full-attn q|gate fusion, out-gate structure, mixed-in MTP layers) are rejected with a clear load-time error instead of being silently misread until the logits break (a product of the 27B out-gate structure investigation)
+- **MTP (nextn) layer exclusion**: the portion of GGUF `block_count` exceeding config `num_hidden_layers` is skipped as nextn (MTP) layers only when it matches `nextn_predict_layers` and each extra block carries `nextn.eh_proj` without `ssm_a` (27B: block_count=65 = trunk 64 + 1). Inconsistencies are rejected at load — reading a nextn layer as an ordinary layer would corrupt the semantics
+- **The 27B full-attention structure is common to 0.8B/9B** (settled 2026-10-16): attn_q=[e, 2×heads×dh] fused (per-head [q|gate]) · out-gate = sigmoid after attention, before o_proj · attn_output=[heads×dh, e] non-square. 9B is square only by coincidence (heads×dh == e); the engine's default path is correct for all three sizes (cross-checked against transformers modeling_qwen3_5 / llama.cpp qwen35.cpp / the real GGUF headers)
 
 ### 12.4 Recurrent-state management (KvCache extension and engine constraints)
 
