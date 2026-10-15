@@ -574,6 +574,19 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **検証**: workspace 全 green (lib 147 passed = 134 + 13・server 7・cli 5・失敗 0)
 - **残課題**: 実機でのマルチターン E2E 計測 (2 ターン目の prefill 省略効果)。27B では状態 ~150MB/エントリのため prefix cache 予算 (既定 32k トークン換算) への影響の実測。
 
+### B1: prefill の rmsnorm GPU 化 — 隠れ状態デバイス常駐チェーン ✅ (2026-10-15)
+
+> P17k 後の残り律速: rmsnorm 2.3s(TOTAL ~31%)が h の H2D(81MB/層)と直列(P17k「残る実装候補」2)。rmsnorm 2 回の GPU 化に留まらず、prefill (n>1) 全体を「埋め込み 1 回 H2D → 層内は全てデバイス常駐 → 最終行 1 回 D2H」のチェーンに再構成し、h/proj/down のホスト往復を構造的に廃止した。
+
+- **`forward_prefill_gpu`(llama.rs・`#[cfg(feature="cuda")]`)**: prefill を「埋め込み H2D → [rmsnorm #1(前層 down との residual 加算を融合) → qkv GEMM(デバイス h 直読み) → rope → (GPU attention) → o_proj(CH_ATT 直読み) → residual+rmsnorm #2 → FFN(デバイス常駐)] ×層数 → 最終 residual+norm(m=n) → 最終行 D2H → lm_head(m=1 matvec・従来と同一コード)」で実行。P17k 従来経路との差分: ①層あたり 2 回の CPU rmsnorm が GPU 化(dno_add_rmsnorm・CPU tensor::rmsnorm と同一演算順序で**ビット一致**)②h/proj/down のホスト往復(e=1536・13k prefill で 81MB×4/層 = ~9GB/リクエスト相当)と x += proj/down の CPU 要素演算が全て消える。残るホスト転送は KV ミラー行 D2H(P17k と同一・27MB/層)と最終行 hn D2H のみ。attention は P17j/P17k の緩和枠(ユーザー承認済み)をそのまま利用
+- **in-place 残差蓄積**: `dno_add_rmsnorm` は x += proj を入力バッファ(CH_X)へ書き戻すため、residual stream は CH_X 1 本で層をまたいで蓄積する(h をホストへ上げ直す経路が構造的に存在しない)
+- **cuda.rs 新規関数**: `maybe_gpu_ffn_dev`(in_slot → CH_DOWN・同期/ホスト往復なし)/`maybe_gpu_oproj_dev`(CH_ATT → CH_O・同期なし)/`prefill_chain_gpu_supported`(発動前ゲート: dno_add_rmsnorm の動的 shmem ≤48KB・dno_attention_prefill 制約)/`gemm_path_active`(GEMM 経路ゲートの mirror)/`chain_download_at`(スロット内オフセットから部分 D2H — 最終行 hn 取得用、[n,e] 全行 D2H を回避)。`chain_qkv_rope_prefill` に `h_dev: Option<usize>` を追加(Some 時は CH_H デバイス常駐データを直接読む・ホスト h H2D 廃止)
+- **all-or-nothing 契約**: チェーン途中失敗 → forward 全体を従来経路でやり直し(P17d decode chain と同一。KV 書き込みは冪等・advance は最後の 1 回で安全)。非対応構造(Qwen3 QK-Norm・一部 fp32・qkv bias が [qb|kb|vb] 揃っていない)・カーネル制約違反は事前ゲートで弾き GPU_BROKEN の無駄な発火を避ける
+- **数値契約**: rmsnorm/GEMM/rope/swiglu/residual 加算は全て従来経路と同一カーネル・同一演算順序 → **ビット一致**(緩和不要)。attention のみ緩和枠(P17j から不変)。**新規カーネル無し**(kernels_elem/int8 の既存 PTX を再利用・sha256 不変)
+- **テスト**: `cuda_prefill_chain_bit_exact_vs_cpu`(`#[ignore]`)— forward_prefill_gpu と同一呼び出し列(単層・m=40/e=96/ff=64/heads=4/kv_heads=2/dh=16/pos0=5・`DENNO_CUDA_GEMM_MIN_M=8`)で rope 後 q(デバイス常駐 qkv_q)・K/V キャッシュ行 [pos0..t_total)(rope カーネル → D2H・履歴行不変も検証)・最終 hn(CH_H 全行 + `chain_download_at` 最終行)・最終 residual(CH_X 全行 — in-place x += proj/down を含む)を CPU 参照(tensor::rmsnorm + matvec_rows_bt_i8 + rope_rows + silu_inplace)と**ビット一致**検証。attention は緩和契約のためランダム att を CH_ATT に注入(カーネル自体は cuda_attention_prefill_vs_cpu_reference で担保済み)
+- **検証**: cargo test --workspace(CPU)全 green(lib 147・server 7・cli 5・失敗 0)+ cargo check --workspace + cuda feature ビルド(check --tests)green。**実機 GPU E2E 計測と新 GPU テストの実行(`cargo test --release --features cuda -- --ignored`)は GPU バイナリ再ビルド+サーバー再起動が必要なため人間対応**
+- **残課題**: 実機 E2E 計測(rmsnorm 消滅+ホスト往復廃止の効果・P17k 手順)。次の候補は B2 attn_core V 累積(3.51s)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B UD-IQ2_XXS 動作)
@@ -587,7 +600,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 ### P17 系残課題(CUDA)
 
-- [ ] **B1: rmsnorm の GPU 化**: P17k プロファイルで残 2.3s(TOTAL ~31%)。P17d 要素演算カーネルの延長・実装容易
+- [x] ~~**B1: rmsnorm の GPU 化**: P17k プロファイルで残 2.3s(TOTAL ~31%)。P17d 要素演算カーネルの延長・実装容易~~ → **完了 (2026-10-15)**: prefill (n>1) を隠れ状態デバイス常駐チェーン化 — 層あたり 2 回の CPU rmsnorm を dno_add_rmsnorm で GPU 化(residual 加算融合・CPU とビット一致)し「rmsnorm 2.3s が h H2D と直列」を解消。h/proj/down のホスト往復(81MB×4/層)も廃止。実機 E2E 計測は残課題
 - [ ] **B2: attn_core の V 累積**: 残 3.51s(最大 op)。dno_attention 拡張(attention は緩和契約済み)
 - [ ] **B3: b>1 バッチの rope GPU 化**(優先度低): バッチ時は同期が隠蔽される
 - [x] ~~**3B/7Bのb=4実測**~~ → **P17k で実施**(対象は Gemma3n 13,252 tok に変更して完了)

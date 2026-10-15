@@ -450,6 +450,183 @@ impl LlamaQwen2 {
         cache.advance(1);
         Some(logits)
     }
+
+    /// B1: prefill (n>1) を隠れ状態デバイス常駐チェーンで実行する。
+    /// 埋め込み 1 回 H2D → [rmsnorm(→CH_H) → qkv GEMM (デバイス h 直読み) → rope →
+    /// (GPU attention) → o_proj (CH_O デバイス常駐) → residual+rmsnorm → FFN
+    /// (CH_DOWN デバイス常駐)] ×層数 → 最終 residual+norm (m=n) → 最終行 D2H →
+    /// lm_head の順。P17k 従来経路との差分: ①層あたり 2 回の CPU rmsnorm が GPU 化
+    /// (dno_add_rmsnorm・CPU tensor::rmsnorm と同一演算順序でビット一致)
+    /// ②h/proj/down のホスト往復 (e=1536・13k prefill で 81MB×4/層) と
+    /// x += proj/down の CPU 要素演算が全て消える。ホスト転送は KV ミラー行の
+    /// D2H (P17k と同一) と最終行 hn の 1 回のみ。
+    /// 数値: rmsnorm/GEMM/rope/swiglu/residual は全て従来経路とビット一致のカーネ
+    /// ル・同一演算順序。attention のみ緩和枠 (ユーザー承認済み・P17j と同一)。
+    /// 戻り None = 従来経路で forward 全体をやり直し (P17d decode chain と同一契約。
+    /// KV 書き込みは冪等・advance は最後の 1 回なので安全。途中まで書いた KV ミラー
+    /// の行は次回 rope カーネルが上書きするため汚染しない)。失敗時は GPU_BROKEN が
+    /// 立ち以降の forward は従来経路のみ (1 回限りのコスト)。
+    #[cfg(feature = "cuda")]
+    fn forward_prefill_gpu(
+        &mut self,
+        tokens: &[u32],
+        cache: &mut KvCache,
+        pos0: usize,
+        n: usize,
+    ) -> Option<Vec<f32>> {
+        use crate::cuda::{
+            chain_attention_prefill_dev, chain_download_at, chain_qkv_rope_prefill, chain_rmsnorm,
+            chain_upload, gemm_path_active, gpu_attention_enabled, maybe_gpu_ffn_dev,
+            maybe_gpu_oproj_dev, prefill_chain_gpu_supported, CH_DOWN, CH_H, CH_O, CH_X,
+        };
+        let e = self.e;
+        let dh = self.dh;
+        let heads = self.heads;
+        let kv_heads = self.kv_heads;
+        let group = heads / kv_heads; // GQA group size
+        let n_layers = self.layers.len();
+        let t_total = pos0 + n;
+
+        // 非対応構造・カーネル制約・GEMM 閾値は事前ゲート (チェーン途中失敗の回避)
+        if !gpu_attention_enabled()
+            || !gemm_path_active(n)
+            || !prefill_chain_gpu_supported(e, dh, t_total)
+        {
+            return None;
+        }
+        if t_total > cache.max_len() {
+            return None;
+        }
+        for layer in &self.layers {
+            if layer.q_norm_w.is_some() || layer.k_norm_w.is_some() {
+                return None; // Qwen3 QK-Norm は従来経路
+            }
+            for w in [
+                &layer.q_w, &layer.k_w, &layer.v_w, &layer.o_w, &layer.gate_w, &layer.up_w,
+                &layer.down_w,
+            ] {
+                if w.quant8().is_none() {
+                    return None; // 一部 fp32 → 従来経路
+                }
+            }
+            // qkv bias は [qb|kb|vb] 揃う場合のみデバイス経路可 (rope カーネル対応)
+            let bias_ok = matches!(
+                (&layer.q_b, &layer.k_b, &layer.v_b),
+                (None, None, None) | (Some(_), Some(_), Some(_))
+            );
+            if !bias_ok {
+                return None;
+            }
+        }
+
+        // KV 容量確保 (従来経路と同一 — P17e 契約)
+        for li in 0..n_layers {
+            let _ = cache.kv_bufs(li, n);
+        }
+
+        // 埋め込み → residual stream をデバイス常駐開始 (ホスト x は以後不要)
+        let mut x = vec![0.0f32; n * e];
+        crate::prof::time(crate::prof::EMBED, || {
+            for (i, &t) in tokens.iter().enumerate() {
+                let emb = &self.embed[t as usize * e..][..e];
+                x[i * e..][..e].copy_from_slice(emb);
+            }
+        });
+        chain_upload(CH_X, &x, e, n)?;
+        drop(x);
+        let key = cache.kv_id();
+        let mut pending: Option<usize> = None;
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            crate::telemetry_layer_begin(li as u16);
+            // --- rmsnorm #1 (デバイス: 前層 down との residual 加算も融合) ---
+            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+                chain_rmsnorm(&layer.ln1_w, self.eps, pending, CH_H, e, n, li * 3)
+            })?;
+            // --- qkv GEMM (デバイス h 直読み) → rope → K/V ミラー書き込み + D2H ---
+            let bias: Option<Vec<f32>> = match (&layer.q_b, &layer.k_b, &layer.v_b) {
+                (Some(qb), Some(kb), Some(vb)) => {
+                    let mut b = Vec::with_capacity(heads * dh + 2 * kv_heads * dh);
+                    b.extend_from_slice(qb);
+                    b.extend_from_slice(kb);
+                    b.extend_from_slice(vb);
+                    Some(b)
+                }
+                _ => None,
+            };
+            chain_qkv_rope_prefill(
+                layer.q_w.quant8()?,
+                layer.k_w.quant8()?,
+                layer.v_w.quant8()?,
+                &[],
+                cache,
+                key,
+                li,
+                n_layers,
+                pos0,
+                n,
+                t_total,
+                heads,
+                kv_heads,
+                dh,
+                self.theta,
+                bias.as_deref().unwrap_or(&[]),
+                Some(CH_H),
+            )?;
+            // --- GPU attention (q はデバイス常駐・att は CH_ATT) ---
+            crate::prof::time_layer(crate::prof::ATTN, li, || {
+                chain_attention_prefill_dev(
+                    key,
+                    li,
+                    n_layers,
+                    pos0,
+                    n,
+                    t_total,
+                    heads,
+                    group,
+                    dh,
+                    kv_heads * dh,
+                    1.0 / (dh as f32).sqrt(),
+                )
+            })?;
+            // --- o_proj (デバイス常駐 → CH_O) ---
+            maybe_gpu_oproj_dev(layer.o_w.quant8()?, n, heads * dh, li)?;
+            // --- residual + rmsnorm #2 (デバイス: x += o_proj 出力も融合) ---
+            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+                chain_rmsnorm(&layer.ln2_w, self.eps, Some(CH_O), CH_H, e, n, li * 3 + 1)
+            })?;
+            // --- FFN (デバイス常駐 → CH_DOWN) ---
+            maybe_gpu_ffn_dev(
+                layer.gate_w.quant8()?,
+                layer.up_w.quant8()?,
+                layer.down_w.quant8()?,
+                CH_H,
+                n,
+                self.ff,
+                li,
+            )?;
+            crate::telemetry_layer_flush();
+            pending = Some(CH_DOWN);
+        }
+
+        // --- 最終 residual + norm (m=n 全行: x += down もデバイスで完結) ---
+        crate::prof::time(crate::prof::FINAL_NORM, || {
+            chain_rmsnorm(&self.norm_w, self.eps, pending, CH_H, e, n, n_layers * 3)
+        })?;
+        // 最終行の hn だけ D2H (logits に不要な [n-1, e] は転送しない)。
+        // lm_head は従来経路と同一コード (m=1 matvec)。
+        let logits = crate::prof::time(crate::prof::LM_HEAD, || -> Option<Vec<f32>> {
+            let hn = chain_download_at(CH_H, (n - 1) * e, e)?;
+            Some(match &self.lm_head {
+                Some(w) => lin(&hn, w, 1),
+                // tied (fp32 モード): embed を [vocab, e] のまま転置使用
+                None => crate::tensor::matvec_bt(&hn, &self.embed, e, self.vocab),
+            })
+        })?;
+
+        cache.advance(n);
+        Some(logits)
+    }
 }
 
 impl Model for LlamaQwen2 {
@@ -481,6 +658,17 @@ impl Model for LlamaQwen2 {
         #[cfg(feature = "cuda")]
         if n == 1 {
             if let Some(logits) = self.forward_decode_gpu(tokens[0], cache, pos0) {
+                return Ok(logits);
+            }
+        }
+
+        // B1: prefill (n>1) もデバイス常駐チェーンで実行 — 層あたり 2 回の CPU
+        // rmsnorm を GPU 化し、h/proj/down のホスト往復と x += proj/down の CPU
+        // 要素演算を廃止する。失敗時は従来経路で forward 全体をやり直し
+        // (KV 書き込みは冪等・advance は最後の 1 回なので安全)。
+        #[cfg(feature = "cuda")]
+        if n > 1 {
+            if let Some(logits) = self.forward_prefill_gpu(tokens, cache, pos0, n) {
                 return Ok(logits);
             }
         }
@@ -537,6 +725,9 @@ impl Model for LlamaQwen2 {
                         qw, kw, vw, &h, cache, kv_key, li, self.layers.len(), pos0, n,
                         pos0 + n, heads, kv_heads, dh, self.theta,
                         bias.as_deref().unwrap_or(&[]),
+                        // 従来経路: h はホストからアップロード (B1 デバイス常駐経路は
+                        // forward_prefill_gpu が Some(CH_H) を渡す)
+                        None,
                     ),
                     _ => None,
                 };
