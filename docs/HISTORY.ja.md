@@ -642,6 +642,19 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **判定**: GPU 観測は **「temperature 0 greedy の不安定性(仕様上の脆弱性)」として説明可能 — GDN GPU カーネルの drift が異常に大きい証拠は無い**。観測値(LCHK メトリック 4e-7)は実験注入スケールより 1 桁以上小さく・分裂先が GPU 観測と同一 attractor・GPU 側の決定論維持とも整合
 - **含意**: GDN モデルの GPU E2E 回帰判定は「CPU との bit 一致」ではなく **「GPU 上の決定論(同一 payload→同一出力)+ 出力の妥当性」** を用いる(near-tie prompt では greedy でも緩和契約内の drift で分裂し得る)。新正規 payload アンカー: `q35_9b_1b.json` → 出力 md5 `3a0ddf1c4fbe9c9213f6d13b11d0685c`・`q35_9b_2b.json` → `95199a33a6f5e58ff0b9236736fe41fe`(清浄 CPU ビルド・HTTP 経路・各々連続 2 回+再起動後一致)。**GPU アンカー(第4セッション追記)**: seed 42・int8・HEAD 相当バイナリで `q35_9b_1b.json` → `1a4ea71aa353ee293baae8e6f6f7fcb1`・`q35_9b_2b.json` → `b4e58cb38fbc8655dda25279f940e922`(各々連続 2 回完全一致 = GPU 上の決定論を確認済み)。GPU と CPU の出力が異なるのは GDN 緩和契約内の drift と本節実験で説明した temperature 0 greedy の不安定性によるものであり、GPU E2E の回帰判定は REPORT_NEXT.md §6 のとおり **「(a) GPU 上の決定論 (b) 出力内容の妥当性」** を用いる
 
+### tool use 対応(Anthropic Messages API 互換の tools / tool_choice) ✅ (2026-10-16)
+
+> §4 運用・周辺の候補「tool use(Anthropic APIのtoolsパラメータ対応)」を完了。第5設計 (第7/第8セッションで実装着手・未 commit だった差分) を引き継いで完成させたもの。API ハンドラ層の実装のみでモデル/エンジン側の数値経路は無変更 (tools 無し経路はビット同一)。
+
+- **リクエスト側**: `tools` (Anthropic 形式ツール定義配列・`input_schema` 必須) と `tool_choice` (`auto`/`none`/`any`/`{"type":"tool","name":...}`) をパース。`any`/`tool` (強制) は拘束デコードを持たないため auto と同一挙動 (受理のみ・Named はツール存在検証)。tools 未指定での `tool_choice` 指定・不正な定義/choice・`tools`+`stream:true` は 400
+- **プロンプト側**: 検証済み tools を Qwen/HF 形式 (`{"type":"function","function":{name,description,parameters}}`) に変換し chat template の `tools` 変数へ (`apply_chat_template` に tools 引数を追加・minijinja に json feature 追加)。`tool_choice: none` と tools 無しはテンプレートに tools を渡さない (従来経路と同一プロンプト)。Qwen3.5 の公式テンプレートの tool 対応は公式準拠で確認済み
+- **履歴織り込み**: assistant メッセージの `tool_use` block は公式テンプレートがモデルに出力させる `<tool_call>` XML 形式へ変換 (`tool_use_to_xml`・文字列値は raw・非文字列は tojson 相当)。user メッセージの `tool_result` block は `<tool_response>` で包む (公式テンプレートの multi_step_tool 判定と整合)。`tool_use.id` の会話内一意検証と `tool_result.tool_use_id` の前方参照検証 (未知参照は 400) を実施
+- **応答側**: モデル出力から完全な `<tool_call>` block を構造化抽出 (`extract_tool_calls`)。公式テンプレートの XML 形式に加え JSON 形式 (`{"name":...,"arguments":{...}}`・`parameters`/`input` キーも受ける) を許容。**抽出に成功した block だけテキストから除去** (パース失敗/未完結 block はテキストとして残す=形式例出力への防御)。tools 有り+抽出 ≥1 件なら content=[text block(非空なら)]+tool_use blocks (`toolu_`+24hex id)・`stop_reason:"tool_use"`。それ以外は従来どおり text+元 stop_reason
+- **決定論/exactness**: tools 無しリクエストは全経路で従来とビット同一 (テンプレートの `tools` 変数は null を渡す=旧ハードコードと同一・`to_text` の text block 連結も無変更)。tools 経路の生成自体は通常の greedy と同一サンプラ
+- **テスト**: denno-server lib に tool テスト 8 件追加 (tool_choice パース・tools 検証・tool_use/tool_result の履歴変換と 400 系・抽出関数 XML/JSON/複数件/不正 block・message_json の block 組み立て) + ワイヤレベル統合テスト `tests/tools.rs` 8 件 (tools 付き受理・tool_choice none・stream+tools 400・tool_result 2 ターン目・未知 tool_use_id 400 など・ダミーモデル)。`tests/scheduler.rs` は Job シグネチャ追従 (tools 引数追加)。denno-engine lib はテンプレート tools 変数テスト追加 (148 = 147+1)
+- **実機 curl 検証** (コンテナ内 CPU サーバ・qwen35-test int8・検証後停止): tools 付きで tool_use block 生成 (in=277・`{"city":"Tokyo"}`・stop_reason tool_use) → tool_result を返す 2 ターン目で結果を反映した回答 (in=332) → `tool_choice: none` は tools 無しと同一出力 (非公開の実証) → tools 経路の連続 2 回決定論確認 (in/out/stop_reason/name/input 一致)
+- **将来課題**: streaming の tool_use 対応 (content_block_start/input_json_delta — 現在は tools+stream を 400 で拒否)・`any`/`tool` の拘束デコード。並列呼び出し (1 応答内の複数 tool_call) は抽出順に複数の tool_use block として返す形で対応済み
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B UD-IQ2_XXS 動作)
@@ -667,7 +680,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] ~~**C2: docs/HISTORY.ja.md+en.md に P19 を追記**~~ → **完了**(`31790f9`・P17 文書の環境固有名汎化 `3a42252`)
 - [ ] **C3: dev サーバー(8090)の P19 バイナリ化**: 現在 P17i 時点。engine.rs の is_recurrent は non-recurrent で no-op なので安全
 - [ ] **GitHub push自動化**: deploy key登録後にコンテナから直接push
-- [ ] tool use(Anthropic APIのtoolsパラメータ対応)
+- [x] ~~tool use(Anthropic APIのtoolsパラメータ対応)~~ → **完了 (2026-10-16)**: §3「tool use 対応」節参照。streaming の tool_use 対応と `any`/`tool` の拘束デコードは将来課題
 - [ ] Llama系バリアント(GQA無しモデル、RoPEスケーリング)
 - [ ] **他ファミリー対応**: DeepSeekシリーズ(MoE+共有エキスパート)、GLMシリーズ、gpt-oss(attention sink+sliding window+MXFP4)。GGUF 経路(P19)により入口が拡大
 - [ ] **各モデル独自機構の可視化**: MoEルーティング、MLA潜在圧縮KV、attention sink、sliding window帯パターン、thinkingモード
