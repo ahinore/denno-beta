@@ -14,6 +14,7 @@ use denno_telemetry::{self as telem, Frame};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
@@ -58,6 +59,7 @@ pub struct ServeConfig {
 
 // ---------- Anthropic 形式エラー ----------
 
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     kind: &'static str,
@@ -112,6 +114,114 @@ pub struct MessagesRequest {
     /// A2.5: 反復ペナルティ (denno 拡張・任意。None = 無効)
     pub repetition_penalty: Option<f32>,
     pub stream: Option<bool>,
+    /// tool use: ツール定義 (Anthropic 形式)。空配列は tools 無しと同様に扱う
+    #[serde(default)]
+    pub tools: Option<Vec<ToolDef>>,
+    /// tool use: "auto" | "none" | "any" | {"type": "auto"|"none"|"any"|"tool", "name"?}
+    /// 既定は auto。`any`/`tool` (強制) は拘束デコードを持たないため auto と同一挙動
+    /// (受理はする。詳細は docs/api.md)。
+    pub tool_choice: Option<serde_json::Value>,
+}
+
+/// tool use: ツール定義 1 件 (Anthropic 形式。type フィールドは受け流す)
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// JSON Schema。必須 (欠落は 400)
+    pub input_schema: serde_json::Value,
+}
+
+/// tool_choice の正規化結果。Named は指定ツールの存在検証にのみ使い、
+/// プロンプト/抽出の挙動は Any (実質 auto) と同一。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolChoice {
+    Auto,
+    None,
+    Any,
+    Named(String),
+}
+
+/// tool_choice を正規化する (未指定 = Auto。不正値は 400)
+pub fn parse_tool_choice(v: &Option<serde_json::Value>) -> Result<ToolChoice, ApiError> {
+    let choice = match v {
+        None => ToolChoice::Auto,
+        Some(serde_json::Value::String(s)) => parse_tool_choice_str(s)?,
+        Some(serde_json::Value::Object(m)) => {
+            let ty = m.get("type").and_then(|t| t.as_str()).ok_or_else(|| {
+                ApiError::invalid_request("tool_choice: object form requires a string \"type\"")
+            })?;
+            match ty {
+                "auto" | "none" | "any" => parse_tool_choice_str(ty)?,
+                "tool" => {
+                    let name = m.get("name").and_then(|n| n.as_str()).ok_or_else(|| {
+                        ApiError::invalid_request(
+                            "tool_choice: {\"type\":\"tool\"} requires a string \"name\"",
+                        )
+                    })?;
+                    if name.is_empty() {
+                        return Err(ApiError::invalid_request(
+                            "tool_choice: \"name\" must be non-empty",
+                        ));
+                    }
+                    ToolChoice::Named(name.to_string())
+                }
+                other => {
+                    return Err(ApiError::invalid_request(format!(
+                        "tool_choice.type: unsupported value {:?} (auto/none/any/tool)",
+                        other
+                    )))
+                }
+            }
+        }
+        Some(_) => {
+            return Err(ApiError::invalid_request(
+                "tool_choice must be a string (auto/none/any) or an object",
+            ))
+        }
+    };
+    Ok(choice)
+}
+
+fn parse_tool_choice_str(s: &str) -> Result<ToolChoice, ApiError> {
+    match s {
+        "auto" => Ok(ToolChoice::Auto),
+        "none" => Ok(ToolChoice::None),
+        "any" => Ok(ToolChoice::Any),
+        other => Err(ApiError::invalid_request(format!(
+            "tool_choice: unsupported value {:?} (auto/none/any)",
+            other
+        ))),
+    }
+}
+
+/// tools 定義の検証 (name 非空・input_schema は object)。
+/// 正常ならテンプレートへ渡す Qwen (HF) 形式の配列を返す。
+pub fn validate_tools(tools: &[ToolDef]) -> Result<serde_json::Value, ApiError> {
+    let mut out = Vec::with_capacity(tools.len());
+    for t in tools {
+        if t.name.trim().is_empty() {
+            return Err(ApiError::invalid_request(
+                "tools[].name must be a non-empty string",
+            ));
+        }
+        if !t.input_schema.is_object() {
+            return Err(ApiError::invalid_request(format!(
+                "tools[{}].input_schema must be an object",
+                t.name
+            )));
+        }
+        out.push(json!({
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description.clone().unwrap_or_default(),
+                "parameters": t.input_schema,
+            }
+        }));
+    }
+    Ok(json!(out))
 }
 
 #[derive(Deserialize)]
@@ -121,8 +231,16 @@ pub struct InMessage {
 }
 
 impl InMessage {
-    /// content: 文字列 or [{type:"text", text:...}] の両対応
-    fn to_text(&self) -> Result<String, ApiError> {
+    /// content: 文字列 or content blocks のテキスト化 (tools 対応)。
+    /// `tool_use_ids` はここまでの会話で現れた tool_use の id 集合 (重複/未知参照の検証用)。
+    ///
+    /// - assistant の tool_use block → 公式テンプレートと同一形式の
+    ///   `<tool_call>` XML テキストへ変換 (モデル出力と同一形式で履歴に織り込む)
+    /// - user の tool_result block → `<tool_response>` で包んで user テキストへ
+    ///   (公式テンプレートの multi_step_tool 判定は「trim 後の user content が
+    ///   `<tool_response>` で始まり `<\/tool_response>` で終わる」ことなので
+    ///   tool_result のみのメッセージはその形になる)
+    fn to_text(&self, tool_use_ids: &mut HashSet<String>) -> Result<String, ApiError> {
         match &self.content {
             serde_json::Value::String(s) => Ok(s.clone()),
             serde_json::Value::Array(blocks) => {
@@ -130,13 +248,115 @@ impl InMessage {
                 for b in blocks {
                     match b.get("type").and_then(|v| v.as_str()) {
                         Some("text") => {
+                            // 従来経路: text block は無条件で連結 (tools 無しリクエストで
+                            // 結果が変わらないように区切り挿入はしない)
                             out.push_str(
                                 b.get("text").and_then(|v| v.as_str()).unwrap_or_default(),
                             );
                         }
+                        Some("tool_use") => {
+                            if self.role != "assistant" {
+                                return Err(ApiError::invalid_request(
+                                    "tool_use block is only allowed in assistant messages",
+                                ));
+                            }
+                            let id = b
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .ok_or_else(|| {
+                                    ApiError::invalid_request(
+                                        "tool_use.id must be a non-empty string",
+                                    )
+                                })?;
+                            if !tool_use_ids.insert(id.to_string()) {
+                                return Err(ApiError::invalid_request(format!(
+                                    "tool_use.id: duplicate id {:?}",
+                                    id
+                                )));
+                            }
+                            let name = b
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .ok_or_else(|| {
+                                    ApiError::invalid_request(
+                                        "tool_use.name must be a non-empty string",
+                                    )
+                                })?;
+                            let input = match b.get("input") {
+                                None | Some(serde_json::Value::Null) => json!({}),
+                                Some(v) if v.is_object() => v.clone(),
+                                Some(_) => {
+                                    return Err(ApiError::invalid_request(
+                                        "tool_use.input must be an object",
+                                    ))
+                                }
+                            };
+                            if !out.is_empty() {
+                                out.push_str("\n\n");
+                            }
+                            out.push_str(&tool_use_to_xml(name, &input));
+                        }
+                        Some("tool_result") => {
+                            if self.role != "user" {
+                                return Err(ApiError::invalid_request(
+                                    "tool_result block is only allowed in user messages",
+                                ));
+                            }
+                            let tuid = b
+                                .get("tool_use_id")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .ok_or_else(|| {
+                                    ApiError::invalid_request(
+                                        "tool_result.tool_use_id must be a non-empty string",
+                                    )
+                                })?;
+                            if !tool_use_ids.contains(tuid) {
+                                return Err(ApiError::invalid_request(format!(
+                                    "tool_result.tool_use_id {:?} does not match any tool_use block in a previous assistant message",
+                                    tuid
+                                )));
+                            }
+                            let body = match b.get("content") {
+                                None | Some(serde_json::Value::Null) => String::new(),
+                                Some(serde_json::Value::String(s)) => s.clone(),
+                                Some(serde_json::Value::Array(items)) => {
+                                    let mut s = String::new();
+                                    for it in items {
+                                        if it.get("type").and_then(|t| t.as_str()) == Some("text")
+                                        {
+                                            s.push_str(
+                                                it.get("text").and_then(|t| t.as_str())
+                                                    .unwrap_or_default(),
+                                            );
+                                        } else {
+                                            return Err(ApiError::invalid_request(format!(
+                                                "unsupported tool_result content block type: {:?} (text blocks only)",
+                                                it.get("type")
+                                            )));
+                                        }
+                                    }
+                                    s
+                                }
+                                Some(_) => {
+                                    return Err(ApiError::invalid_request(
+                                        "tool_result.content must be a string or an array of text blocks",
+                                    ))
+                                }
+                            };
+                            if !out.is_empty() {
+                                out.push('\n');
+                            }
+                            out.push_str(&format!(
+                                "<tool_response>\n{}\n</tool_response>",
+                                body
+                            ));
+                        }
                         other => {
                             return Err(ApiError::invalid_request(format!(
-                                "unsupported content block type: {:?} (text blocks only)",
+                                "unsupported content block type: {:?} (text/tool_use/tool_result blocks only)",
                                 other
                             )))
                         }
@@ -149,6 +369,25 @@ impl InMessage {
             )),
         }
     }
+}
+
+/// tool_use block を公式テンプレート (Qwen3.5) がモデルに出力させる
+/// `<tool_call>` XML 形式へ変換する (履歴織り込み用。モデル自身の出力と同一形式)。
+/// 非文字列値は tojson 相当の JSON 直列化、文字列値は raw のまま (公式テンプレート準拠)。
+fn tool_use_to_xml(name: &str, input: &serde_json::Value) -> String {
+    let mut s = format!("<tool_call>\n<function={name}>\n");
+    if let Some(obj) = input.as_object() {
+        for (k, v) in obj {
+            s.push_str(&format!("<parameter={k}>\n"));
+            match v {
+                serde_json::Value::String(raw) => s.push_str(raw),
+                other => s.push_str(&other.to_string()),
+            }
+            s.push_str("\n</parameter>\n");
+        }
+    }
+    s.push_str("</function>\n</tool_call>");
+    s
 }
 
 /// system: 文字列 or [{type:"text",...}]
@@ -169,6 +408,126 @@ fn system_to_text(v: &Option<serde_json::Value>) -> Result<Option<String>, ApiEr
             "system must be a string or an array of text blocks",
         )),
     }
+}
+
+// ---------- tool use: モデル出力からの tool_call 抽出 ----------
+
+/// 抽出された 1 件の tool call (input は Anthropic の `input` オブジェクト)
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractedToolCall {
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+const TOOL_CALL_CLOSE: &str = "</tool_call>";
+
+/// モデル出力テキストから完全な `&lt;tool_call&gt;` block を抽出する。
+///
+/// 戻り値は (tool_call block を完全に除去+trim した残りテキスト, 抽出された呼び出し列)。
+/// - block 単位で独立にパースし、パースに成功した block だけ除去する
+///   (失敗 block はテキストとして残す。モデルが形式例を出した場合への防御)
+/// - 未完結 (閉じ tag 無し) は block とみなさずテキストとして残す
+/// - 対応形式: 公式テンプレートの XML 形式
+///   `&lt;tool_call&gt;\n&lt;function=name&gt;\n&lt;parameter=k&gt;\nvalue\n&lt;/parameter&gt;\n&lt;/function&gt;\n&lt;/tool_call&gt;`
+///   と JSON 形式 `{"name":..., "arguments":{...}}` ("parameters"/"input" も受ける)
+pub fn extract_tool_calls(text: &str) -> (String, Vec<ExtractedToolCall>) {
+    let mut calls = Vec::new();
+    let mut keep = String::with_capacity(text.len());
+    let mut pos = 0usize;
+    while let Some(s) = text[pos..].find(TOOL_CALL_OPEN) {
+        let s = pos + s;
+        keep.push_str(&text[pos..s]);
+        let inner_start = s + TOOL_CALL_OPEN.len();
+        let Some(e_rel) = text[inner_start..].find(TOOL_CALL_CLOSE) else {
+            // 未完結: 残り全体をテキストとして残す
+            keep.push_str(&text[s..]);
+            pos = text.len();
+            break;
+        };
+        let inner = &text[inner_start..inner_start + e_rel];
+        pos = inner_start + e_rel + TOOL_CALL_CLOSE.len();
+        match parse_tool_call_inner(inner) {
+            Some(c) => calls.push(c),
+            None => keep.push_str(&text[s..pos]),
+        }
+    }
+    keep.push_str(&text[pos..]);
+    (keep.trim().to_string(), calls)
+}
+
+/// tool_call block の中身 (open/close 間) をパースする。失敗は None。
+fn parse_tool_call_inner(inner: &str) -> Option<ExtractedToolCall> {
+    let inner = inner.trim();
+    // 1) XML 形式: <function=NAME> ... </function>
+    if let Some(body) = inner.strip_prefix("<function=").and_then(|r| r.strip_suffix("</function>"))
+    {
+        let gt = body.find('>')?;
+        let name = body[..gt].trim();
+        if name.is_empty() {
+            return None;
+        }
+        let mut input = serde_json::Map::new();
+        let mut rest = &body[gt + 1..];
+        while let Some(p) = rest.find("<parameter=") {
+            let after = &rest[p + "<parameter=".len()..];
+            let gt = after.find('>')?;
+            let key = after[..gt].trim();
+            if key.is_empty() {
+                return None;
+            }
+            let vstart = gt + 1;
+            let vend_rel = after[vstart..].find("</parameter>")?;
+            let raw = &after[vstart..vstart + vend_rel];
+            rest = &after[vstart + vend_rel + "</parameter>".len()..];
+            input.insert(key.to_string(), parse_param_value(raw));
+        }
+        return Some(ExtractedToolCall {
+            name: name.to_string(),
+            input: serde_json::Value::Object(input),
+        });
+    }
+    // 2) JSON 形式: {"name": ..., "arguments"|"parameters"|"input": {...}}
+    let v: serde_json::Value = serde_json::from_str(inner).ok()?;
+    let obj = v.as_object()?;
+    let name = obj.get("name")?.as_str()?;
+    if name.is_empty() {
+        return None;
+    }
+    let args = obj
+        .get("arguments")
+        .or_else(|| obj.get("parameters"))
+        .or_else(|| obj.get("input"));
+    let input = match args {
+        None => serde_json::Map::new(),
+        Some(a) if a.is_object() => a.as_object().unwrap().clone(),
+        Some(_) => return None,
+    };
+    Some(ExtractedToolCall {
+        name: name.to_string(),
+        input: serde_json::Value::Object(input),
+    })
+}
+
+/// `<parameter=k>` の値を復元する。JSON 値 (数値/真偽/null/object/array/引用文字列)
+/// としてパースできればその値、できなければ raw 文字列。
+/// 公式テンプレートは非文字列値を tojson し文字列値を raw 出力するため、
+/// テンプレートに値を渡した際の `tojson | safe` と一致する規則。
+fn parse_param_value(raw: &str) -> serde_json::Value {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) {
+        return v;
+    }
+    // テンプレートが付与する前後の改行 1 つずつを落として生文字列として返す
+    let s = raw.strip_prefix('\n').unwrap_or(raw);
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    serde_json::Value::String(s.to_string())
+}
+
+/// tool_use block の id (`toolu_` + 24hex)。msg id と同一の乱数経路。
+pub(crate) fn new_tool_id() -> String {
+    let mut rng = rand::thread_rng();
+    let id: String = (0..24).map(|_| format!("{:x}", rng.gen::<u8>() % 16)).collect();
+    format!("toolu_{id}")
 }
 
 // ---------- ルーター ----------
@@ -307,6 +666,31 @@ async fn messages(
         ));
     }
 
+    // tool use: 定義と tool_choice の検証 (tools 未指定時の tool_choice は 400)
+    let tools = match &req.tools {
+        None => Vec::new(),
+        Some(t) => t.clone(),
+    };
+    if req.tool_choice.is_some() && tools.is_empty() {
+        return Err(ApiError::invalid_request(
+            "tool_choice is only allowed when tools are provided",
+        ));
+    }
+    let tool_choice = parse_tool_choice(&req.tool_choice)?;
+    let tools_json = validate_tools(&tools)?;
+    if let ToolChoice::Named(n) = &tool_choice {
+        if !tools.iter().any(|t| &t.name == n) {
+            return Err(ApiError::invalid_request(format!(
+                "tool_choice: tool {:?} is not defined in tools",
+                n
+            )));
+        }
+    }
+    // ツールをモデルに見せるか (none = 非公開・抽出もしない。空配列も実質無し)
+    let tools_active = !tools.is_empty() && tool_choice != ToolChoice::None;
+    let tools_for_prompt = if tools_active { Some(tools_json) } else { None };
+
+    let mut tool_use_ids = HashSet::new();
     let mut chat_messages = Vec::with_capacity(req.messages.len());
     for m in &req.messages {
         if m.role != "user" && m.role != "assistant" {
@@ -317,7 +701,7 @@ async fn messages(
         }
         chat_messages.push(ChatMessage {
             role: m.role.clone(),
-            content: m.to_text()?,
+            content: m.to_text(&mut tool_use_ids)?,
         });
     }
     let system = system_to_text(&req.system)?;
@@ -332,12 +716,19 @@ async fn messages(
     };
 
     if req.stream.unwrap_or(false) {
+        // tool use は SSE 未対応 (tool_use block の content_block_start/input_json_delta
+        // が未実装)。誤用に気づくよう明示的に 400 を返す。
+        if tools_active {
+            return Err(ApiError::invalid_request(
+                "tools with stream=true is not supported (use stream=false)",
+            ));
+        }
         // SSE 応答は即座に開始し、ジョブ実行 (キュー待ち含む) 中は
         // keep-alive ping (2秒間隔) が流れ続ける
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
         state
             .scheduler
-            .submit_stream(system, chat_messages, params, tx)
+            .submit_stream(system, chat_messages, params, None, tx)
             .map_err(queue_full_error(&state))?;
         let stream = ReceiverStream::new(rx);
         Ok(Sse::new(stream)
@@ -352,9 +743,9 @@ async fn messages(
     } else {
         let rx = state
             .scheduler
-            .submit_chat(system, chat_messages, params)
+            .submit_chat(system, chat_messages, params, tools_for_prompt)
             .map_err(queue_full_error(&state))?;
-        let output = rx
+        let mut output = rx
             .await
             .map_err(|e| anyhow::anyhow!("scheduler dropped: {e}"))
             .and_then(|r| r)
@@ -366,7 +757,14 @@ async fn messages(
                     ApiError::api(msg)
                 }
             })?;
-        Ok(Json(message_json(&state.model_name, &output)).into_response())
+        // tool use: モデル出力から tool_call block を抽出し content blocks を組む
+        let mut calls = Vec::new();
+        if tools_active {
+            let (clean_text, extracted) = extract_tool_calls(&output.text);
+            output.text = clean_text;
+            calls = extracted;
+        }
+        Ok(Json(message_json(&state.model_name, &output, &calls)).into_response())
     }
 }
 
@@ -380,15 +778,38 @@ fn queue_full_error(state: &AppState) -> impl Fn(QueueFull) -> ApiError + '_ {
     }
 }
 
-fn message_json(model: &str, out: &ChatOutput) -> serde_json::Value {
+/// 応答 JSON を組む。`calls` が空でなければ content は
+/// [text block (非空なら)] + tool_use blocks、stop_reason は "tool_use"。
+fn message_json(
+    model: &str,
+    out: &ChatOutput,
+    calls: &[ExtractedToolCall],
+) -> serde_json::Value {
+    let mut content = Vec::new();
+    if !out.text.is_empty() || calls.is_empty() {
+        content.push(json!({"type": "text", "text": out.text}));
+    }
+    for c in calls {
+        content.push(json!({
+            "type": "tool_use",
+            "id": new_tool_id(),
+            "name": c.name,
+            "input": c.input,
+        }));
+    }
+    let (stop_reason, stop_sequence) = if calls.is_empty() {
+        (out.stop_reason.as_str(), out.stop_sequence.clone())
+    } else {
+        ("tool_use", None)
+    };
     json!({
         "id": new_msg_id(),
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{"type": "text", "text": out.text}],
-        "stop_reason": out.stop_reason.as_str(),
-        "stop_sequence": out.stop_sequence,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": stop_sequence,
         "usage": {
             "input_tokens": out.input_tokens,
             "output_tokens": out.output_tokens,
@@ -507,5 +928,402 @@ async fn telemetry_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 }
             }
         }
+    }
+}
+
+// ---------- tool use テスト ----------
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+    use denno_engine::StopReason;
+
+    fn tool_defs() -> Vec<ToolDef> {
+        vec![ToolDef {
+            name: "get_weather".into(),
+            description: Some("Get weather".into()),
+            input_schema: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+        }]
+    }
+
+    fn chat_output(text: impl Into<String>) -> ChatOutput {
+        ChatOutput {
+            text: text.into(),
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            input_tokens: 10,
+            output_tokens: 5,
+        }
+    }
+
+    // ---- tool_choice パース ----
+
+    #[test]
+    fn tool_choice_parse() {
+        assert_eq!(parse_tool_choice(&None).unwrap(), ToolChoice::Auto);
+        for (v, want) in [
+            (json!("auto"), ToolChoice::Auto),
+            (json!("none"), ToolChoice::None),
+            (json!("any"), ToolChoice::Any),
+            (json!({"type": "auto"}), ToolChoice::Auto),
+            (json!({"type": "none"}), ToolChoice::None),
+            (json!({"type": "any"}), ToolChoice::Any),
+            (json!({"type": "tool", "name": "f"}), ToolChoice::Named("f".into())),
+        ] {
+            assert_eq!(parse_tool_choice(&Some(v)).unwrap(), want);
+        }
+        assert!(parse_tool_choice(&Some(json!("bogus"))).is_err());
+        assert!(parse_tool_choice(&Some(json!(1))).is_err());
+        assert!(parse_tool_choice(&Some(json!({"name": "f"}))).is_err());
+        assert!(parse_tool_choice(&Some(json!({"type": "tool"}))).is_err());
+        assert!(parse_tool_choice(&Some(json!({"type": "tool", "name": ""}))).is_err());
+        assert!(parse_tool_choice(&Some(json!({"type": "bogus"}))).is_err());
+    }
+
+    // ---- tools 定義の検証 ----
+
+    #[test]
+    fn validate_tools_ok_and_err() {
+        let v = validate_tools(&tool_defs()).unwrap();
+        assert_eq!(
+            v,
+            json!([{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                }
+            }])
+        );
+        // 空配列 OK
+        assert_eq!(validate_tools(&[]).unwrap(), json!([]));
+        // name 空
+        let bad = vec![ToolDef {
+            name: " ".into(),
+            description: None,
+            input_schema: json!({}),
+        }];
+        assert!(validate_tools(&bad).is_err());
+        // input_schema が object 以外
+        let bad = vec![ToolDef {
+            name: "f".into(),
+            description: None,
+            input_schema: json!("not an object"),
+        }];
+        assert!(validate_tools(&bad).is_err());
+    }
+
+    // ---- tool_use (assistant 履歴) → XML 変換 ----
+
+    #[test]
+    fn assistant_tool_use_block_becomes_xml() {
+        let m = InMessage {
+            role: "assistant".into(),
+            content: json!([
+                {"type": "text", "text": "Let me check."},
+                {"type": "tool_use", "id": "toolu_01", "name": "get_weather",
+                 "input": {"city": "Tokyo", "days": 3, "rain": true}}
+            ]),
+        };
+        let mut ids = HashSet::new();
+        let text = m.to_text(&mut ids).unwrap();
+        assert_eq!(
+            text,
+            "Let me check.\n\n<tool_call>\n<function=get_weather>\n\
+             <parameter=city>\nTokyo\n</parameter>\n\
+             <parameter=days>\n3\n</parameter>\n\
+             <parameter=rain>\ntrue\n</parameter>\n\
+             </function>\n</tool_call>"
+        );
+        assert!(ids.contains("toolu_01"));
+    }
+
+    #[test]
+    fn assistant_tool_use_validation_errors() {
+        let mut ids = HashSet::new();
+        // user への tool_use は不可
+        let m = InMessage {
+            role: "user".into(),
+            content: json!([{"type": "tool_use", "id": "x", "name": "f", "input": {}}]),
+        };
+        assert!(m.to_text(&mut ids).is_err());
+        // input が object 以外
+        let m = InMessage {
+            role: "assistant".into(),
+            content: json!([{"type": "tool_use", "id": "x", "name": "f", "input": [1]}]),
+        };
+        assert!(m.to_text(&mut ids).is_err());
+        // id 欠落
+        let m = InMessage {
+            role: "assistant".into(),
+            content: json!([{"type": "tool_use", "name": "f", "input": {}}]),
+        };
+        assert!(m.to_text(&mut ids).is_err());
+        // 重複 id
+        let m = InMessage {
+            role: "assistant".into(),
+            content: json!([{"type": "tool_use", "id": "dup", "name": "f", "input": {}}]),
+        };
+        assert!(m.to_text(&mut ids).is_ok());
+        let m = InMessage {
+            role: "assistant".into(),
+            content: json!([{"type": "tool_use", "id": "dup", "name": "f", "input": {}}]),
+        };
+        assert!(m.to_text(&mut ids).is_err());
+    }
+
+    // ---- tool_result (user 履歴) → tool_response 変換 ----
+
+    #[test]
+    fn user_tool_result_block_becomes_tool_response() {
+        let mut ids = HashSet::new();
+        let m = InMessage {
+            role: "assistant".into(),
+            content: json!([{"type": "tool_use", "id": "toolu_09", "name": "f", "input": {}}]),
+        };
+        m.to_text(&mut ids).unwrap();
+
+        // 文字列 content
+        let m = InMessage {
+            role: "user".into(),
+            content: json!([
+                {"type": "tool_result", "tool_use_id": "toolu_09", "content": "sunny 25C"}
+            ]),
+        };
+        let text = m.to_text(&mut ids).unwrap();
+        assert_eq!(text, "<tool_response>\nsunny 25C\n</tool_response>");
+
+        // 配列 content (text blocks)
+        let m = InMessage {
+            role: "user".into(),
+            content: json!([
+                {"type": "tool_result", "tool_use_id": "toolu_09",
+                 "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}
+            ]),
+        };
+        let text = m.to_text(&mut ids).unwrap();
+        assert_eq!(text, "<tool_response>\nab\n</tool_response>");
+
+        // text + tool_result の混合
+        let m = InMessage {
+            role: "user".into(),
+            content: json!([
+                {"type": "text", "text": "result below"},
+                {"type": "tool_result", "tool_use_id": "toolu_09", "content": "x"}
+            ]),
+        };
+        let text = m.to_text(&mut ids).unwrap();
+        assert_eq!(text, "result below\n<tool_response>\nx\n</tool_response>");
+    }
+
+    #[test]
+    fn user_tool_result_validation_errors() {
+        let mut ids = HashSet::new();
+        // 未知の tool_use_id
+        let m = InMessage {
+            role: "user".into(),
+            content: json!([{"type": "tool_result", "tool_use_id": "nope", "content": "x"}]),
+        };
+        assert!(m.to_text(&mut ids).is_err());
+        // assistant への tool_result は不可
+        let m = InMessage {
+            role: "assistant".into(),
+            content: json!([{"type": "tool_result", "tool_use_id": "nope", "content": "x"}]),
+        };
+        assert!(m.to_text(&mut ids).is_err());
+        // content が文字列/配列以外
+        let m = InMessage {
+            role: "user".into(),
+            content: json!([{"type": "tool_result", "tool_use_id": "nope", "content": 3}]),
+        };
+        assert!(m.to_text(&mut ids).is_err());
+    }
+
+    // ---- tool_call 抽出 ----
+
+    fn xml_call(name: &str, params: &[(&str, &str)]) -> String {
+        let mut s = format!("<tool_call>\n<function={name}>\n");
+        for (k, v) in params {
+            s.push_str(&format!("<parameter={k}>\n{v}\n</parameter>\n"));
+        }
+        s.push_str("</function>\n</tool_call>");
+        s
+    }
+
+    #[test]
+    fn extract_xml_tool_call_with_text() {
+        let text = format!(
+            "Let me check the weather.\n\n{}\n",
+            xml_call("get_weather", &[("city", "Tokyo"), ("days", "3")])
+        );
+        let (clean, calls) = extract_tool_calls(&text);
+        assert_eq!(clean, "Let me check the weather.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(
+            calls[0].input,
+            json!({"city": "Tokyo", "days": 3}) // 文字列は raw・数値は JSON 値
+        );
+    }
+
+    #[test]
+    fn extract_multiple_calls_in_order() {
+        let text = format!(
+            "{}\nmiddle text\n{}",
+            xml_call("f1", &[("a", "1")]),
+            xml_call("f2", &[])
+        );
+        let (clean, calls) = extract_tool_calls(&text);
+        assert_eq!(clean, "middle text");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "f1");
+        assert_eq!(calls[0].input, json!({"a": 1}));
+        assert_eq!(calls[1].name, "f2");
+        assert_eq!(calls[1].input, json!({}));
+    }
+
+    #[test]
+    fn extract_xml_param_value_types() {
+        let text = xml_call(
+            "f",
+            &[
+                ("s", "hello world"),              // raw 文字列
+                ("n", "42"),                        // 数値
+                ("b", "false"),                     // 真偽
+                ("arr", "[1, 2]"),                  // 配列
+                ("obj", "{\"k\": \"v\"}"),          // object
+                ("q", "\"quoted\""),                // 引用文字列
+                ("multi", "line1\nline2"),          // 複数行 raw 文字列
+            ],
+        );
+        let (clean, calls) = extract_tool_calls(&text);
+        assert_eq!(clean, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].input,
+            json!({
+                "s": "hello world",
+                "n": 42,
+                "b": false,
+                "arr": [1, 2],
+                "obj": {"k": "v"},
+                "q": "quoted",
+                "multi": "line1\nline2",
+            })
+        );
+    }
+
+    #[test]
+    fn extract_json_style_tool_call() {
+        let (clean, calls) = extract_tool_calls(
+            r#"prefix
+<tool_call>
+{"name": "get_weather", "arguments": {"city": "Osaka"}}
+</tool_call>"#,
+        );
+        assert_eq!(clean, "prefix");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].input, json!({"city": "Osaka"}));
+
+        // parameters / input キーも受ける・arguments 無しは {}
+        for args_key in ["parameters", "input"] {
+            let body = format!(
+                r#"{{"name": "f", "{args_key}": {{"x": 1}}}}"#
+            );
+            let text = format!("<tool_call>\n{body}\n</tool_call>");
+            let (_, calls) = extract_tool_calls(&text);
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].input, json!({"x": 1}));
+        }
+        let (_, calls) = extract_tool_calls("<tool_call>\n{\"name\": \"f\"}\n</tool_call>");
+        assert_eq!(calls[0].input, json!({}));
+    }
+
+    #[test]
+    fn incomplete_or_invalid_blocks_stay_in_text() {
+        // 未完結 (閉じ tag 無し)
+        let (clean, calls) = extract_tool_calls("<tool_call>\n<function=f>\n");
+        assert!(calls.is_empty());
+        assert_eq!(clean, "<tool_call>\n<function=f>");
+
+        // 閉じているが中身が不正 (name 欠落 JSON)
+        let (clean, calls) = extract_tool_calls("<tool_call>\n{\"arguments\": {}}\n</tool_call>");
+        assert!(calls.is_empty());
+        assert_eq!(clean, "<tool_call>\n{\"arguments\": {}}\n</tool_call>");
+
+        // name が空の XML
+        let (clean, calls) = extract_tool_calls("<tool_call>\n<function=>\n</function>\n</tool_call>");
+        assert!(calls.is_empty());
+        assert_eq!(clean, "<tool_call>\n<function=>\n</function>\n</tool_call>");
+
+        // tool_call tag 無し
+        let (clean, calls) = extract_tool_calls("just text");
+        assert!(calls.is_empty());
+        assert_eq!(clean, "just text");
+    }
+
+    #[test]
+    fn roundtrip_history_xml_is_extracted() {
+        // 履歴織り込み (tool_use_to_xml) で作ったテキストは抽出関数で復元できる
+        let xml = tool_use_to_xml(
+            "get_weather",
+            &json!({"city": "Tokyo", "days": 3, "rain": true}),
+        );
+        let (clean, calls) = extract_tool_calls(&xml);
+        assert_eq!(clean, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].input, json!({"city": "Tokyo", "days": 3, "rain": true}));
+    }
+
+    // ---- 応答 JSON 組み立て ----
+
+    #[test]
+    fn message_json_without_calls_is_legacy() {
+        let out = chat_output("hello");
+        let v = message_json("m", &out, &[]);
+        assert_eq!(
+            v["content"],
+            json!([{"type": "text", "text": "hello"}])
+        );
+        assert_eq!(v["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn message_json_with_calls_has_tool_use_blocks() {
+        let out = chat_output(format!(
+            "Checking...\n{}",
+            xml_call("get_weather", &[("city", "Tokyo")])
+        ));
+        let (clean, calls) = extract_tool_calls(&out.text);
+        let out = ChatOutput { text: clean, ..out };
+        let v = message_json("m", &out, &calls);
+        assert_eq!(v["stop_reason"], "tool_use");
+        assert_eq!(v["stop_sequence"], serde_json::Value::Null);
+        let content = v["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Checking...");
+        assert_eq!(content[1]["type"], "tool_use");
+        assert_eq!(content[1]["name"], "get_weather");
+        assert_eq!(content[1]["input"], json!({"city": "Tokyo"}));
+        let id = content[1]["id"].as_str().unwrap();
+        assert!(id.starts_with("toolu_") && id.len() == "toolu_".len() + 24);
+    }
+
+    #[test]
+    fn message_json_empty_text_with_calls_drops_text_block() {
+        // handler は extract_tool_calls の trim 済みテキストを渡すため同じにする
+        let (clean, _) = extract_tool_calls("  \n");
+        let out = chat_output(clean);
+        let v = message_json("m", &out, &[ExtractedToolCall {
+            name: "f".into(),
+            input: json!({}),
+        }]);
+        let content = v["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "tool_use");
     }
 }

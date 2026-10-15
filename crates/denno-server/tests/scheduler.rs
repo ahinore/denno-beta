@@ -376,7 +376,7 @@ async fn scheduler_rejects_beyond_queue_capacity() {
     let sched = Scheduler::spawn(engine.clone(), 1);
 
     // 1 件目: 実行開始を待つ
-    let rx1 = sched.submit_chat(None, user_msg("t0"), greedy_params(20)).unwrap();
+    let rx1 = sched.submit_chat(None, user_msg("t0"), greedy_params(20), None).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while sched.in_flight() == 0 {
         assert!(std::time::Instant::now() < deadline, "job never started");
@@ -386,11 +386,11 @@ async fn scheduler_rejects_beyond_queue_capacity() {
 
     // 2 件目: キュー (上限 1) に入る
     let rx2 = sched
-        .submit_chat(None, user_msg("t0"), greedy_params(20))
+        .submit_chat(None, user_msg("t0"), greedy_params(20), None)
         .expect("2件目はキューに入るべき");
     // 3 件目: 満杯 → QueueFull
     let err = sched
-        .submit_chat(None, user_msg("t0"), greedy_params(20))
+        .submit_chat(None, user_msg("t0"), greedy_params(20), None)
         .expect_err("3件目は QueueFull であるべき");
     assert!(matches!(err, denno_server::QueueFull));
 
@@ -400,7 +400,7 @@ async fn scheduler_rejects_beyond_queue_capacity() {
     assert_eq!(out2.text, EXPECTED_GREEDY_TEXT);
     // 完了後は実行中 0 に戻り、再度受理できる
     assert_eq!(sched.in_flight(), 0);
-    let rx3 = sched.submit_chat(None, user_msg("t0"), greedy_params(20)).unwrap();
+    let rx3 = sched.submit_chat(None, user_msg("t0"), greedy_params(20), None).unwrap();
     assert_eq!(rx3.await.unwrap().unwrap().text, EXPECTED_GREEDY_TEXT);
 }
 

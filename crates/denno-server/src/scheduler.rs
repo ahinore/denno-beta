@@ -41,12 +41,14 @@ use crate::{new_msg_id, to_event};
 pub const MAX_ACTIVE_SESSIONS: usize = 4;
 
 /// スケジューラに積むジョブ。検証済みのパラメータのみが入る。
+/// `tools` は chat template の `tools` 変数へ渡す値 (None = tools 無し)。
 pub enum Job {
     /// 非ストリーミング生成 (結果を oneshot で返す)
     Chat {
         system: Option<String>,
         messages: Vec<ChatMessage>,
         params: GenParams,
+        tools: Option<serde_json::Value>,
         respond: oneshot::Sender<Result<ChatOutput>>,
     },
     /// SSE ストリーミング生成 (イベントを events チャネルに流す)
@@ -54,6 +56,7 @@ pub enum Job {
         system: Option<String>,
         messages: Vec<ChatMessage>,
         params: GenParams,
+        tools: Option<serde_json::Value>,
         events: tokio_mpsc::Sender<Result<Event, Infallible>>,
     },
 }
@@ -110,10 +113,11 @@ impl Scheduler {
         system: Option<String>,
         messages: Vec<ChatMessage>,
         params: GenParams,
+        tools: Option<serde_json::Value>,
     ) -> Result<oneshot::Receiver<Result<ChatOutput>>, QueueFull> {
         let (respond, rx) = oneshot::channel();
         self.tx
-            .try_send(Job::Chat { system, messages, params, respond })
+            .try_send(Job::Chat { system, messages, params, tools, respond })
             .map_err(|_| QueueFull)?;
         Ok(rx)
     }
@@ -124,10 +128,11 @@ impl Scheduler {
         system: Option<String>,
         messages: Vec<ChatMessage>,
         params: GenParams,
+        tools: Option<serde_json::Value>,
         events: tokio_mpsc::Sender<Result<Event, Infallible>>,
     ) -> Result<(), QueueFull> {
         self.tx
-            .try_send(Job::Stream { system, messages, params, events })
+            .try_send(Job::Stream { system, messages, params, tools, events })
             .map_err(|_| QueueFull)
     }
 }
@@ -254,17 +259,17 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
 
 /// ジョブから実行状態を作る (begin_chat まで。KV には触れない)。
 fn build_run(engine: &Arc<Mutex<Engine>>, job: Job) -> Run {
-    let (system, messages, params, respond, events) = match job {
-        Job::Chat { system, messages, params, respond } => {
-            (system, messages, params, Some(respond), None)
+    let (system, messages, params, tools, respond, events) = match job {
+        Job::Chat { system, messages, params, tools, respond } => {
+            (system, messages, params, tools, Some(respond), None)
         }
-        Job::Stream { system, messages, params, events } => {
-            (system, messages, params, None, Some(events))
+        Job::Stream { system, messages, params, tools, events } => {
+            (system, messages, params, tools, None, Some(events))
         }
     };
     let (sess, error) = {
         let g = engine.lock().unwrap();
-        match g.begin_chat(system.as_deref(), &messages, &params) {
+        match g.begin_chat_with_tools(system.as_deref(), &messages, &params, tools.as_ref()) {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e)),
         }

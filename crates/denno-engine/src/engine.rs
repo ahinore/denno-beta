@@ -591,7 +591,19 @@ impl Engine {
         messages: &[ChatMessage],
         params: &GenParams,
     ) -> Result<ChatSession> {
-        let prompt = self.tok.apply_chat_template(system, messages)?;
+        self.begin_chat_with_tools(system, messages, params, None)
+    }
+
+    /// tools 付きの begin_chat。`tools` は chat template の `tools` 変数へ
+    /// そのまま渡される (None = tools 無し。従来経路と完全同一)。
+    pub fn begin_chat_with_tools(
+        &self,
+        system: Option<&str>,
+        messages: &[ChatMessage],
+        params: &GenParams,
+        tools: Option<&serde_json::Value>,
+    ) -> Result<ChatSession> {
+        let prompt = self.tok.apply_chat_template(system, messages, tools)?;
         let prompt_ids = self.tok.encode(&prompt)?;
 
         let max_tokens = params.max_tokens;
@@ -1051,7 +1063,7 @@ mod tests {
         // スロット 0 の cached_prompt にプロンプト全体が入っている
         let prompt = e
             .tok
-            .apply_chat_template(None, &msgs("t0"))
+            .apply_chat_template(None, &msgs("t0"), None)
             .unwrap();
         let prompt_ids = e.tok.encode(&prompt).unwrap();
         assert_eq!(e.cached_prompts[0], prompt_ids);
