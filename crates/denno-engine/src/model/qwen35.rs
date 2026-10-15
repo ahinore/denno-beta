@@ -492,6 +492,12 @@ impl Qwen35 {
     /// GDN スキャン 1 トークン分 (投影済みの行を受け取る)。prefill バッチ経路と
     /// 共用 — 状態読み出し → forward_token_core → 状態書き戻しのみを担当する
     /// (演算順序はトークン逐次経路と同一のため bit-exact)。
+    ///
+    /// A1-r2: cuda 有効時は decode (n==1) も GPU カーネル (dno_gdn_scan) で処理
+    /// する。prefill バッチ経路と同一カーネル・同一 launch 構成のため、トークン
+    /// 逐次 GPU 経路とバッチ GPU 経路の GDN 出力は bit 一致する。GDN は bit 一致
+    /// 不要契約 (CPU 逐次とは数値が僅かに異なる・決定論のみ保証)。GPU 無効/
+    /// エラー時は CPU 逐次にフォールバック (GPU_BROKEN 後は再試行しない)。
     #[allow(clippy::too_many_arguments)]
     fn gdn_scan(
         &self,
@@ -503,6 +509,34 @@ impl Qwen35 {
         cache: &mut KvCache,
         li: usize,
     ) -> Vec<f32> {
+        #[cfg(feature = "cuda")]
+        if self.gdn_p.head_k_dim == self.gdn_p.head_v_dim {
+            let (conv, ssm) = cache
+                .gdn_state_mut(li)
+                .expect("GDN state slot が未初期化");
+            if let Some(y) = crate::cuda::gdn_scan_batch(
+                qkv,
+                z,
+                beta_raw,
+                alpha,
+                conv,
+                ssm,
+                &lg.conv1d,
+                &lg.ssm_a,
+                &lg.ssm_dt,
+                &lg.ssm_norm,
+                1,
+                self.gdn_p.n_k_heads,
+                self.gdn_p.n_v_heads,
+                self.gdn_p.head_k_dim,
+                self.gdn_p.head_v_dim,
+                self.gdn_p.d_conv,
+                self.gdn_p.eps,
+                1.0 / (self.gdn_p.head_k_dim as f32).sqrt(),
+            ) {
+                return y;
+            }
+        }
         let (conv, ssm) = cache
             .gdn_state_mut(li)
             .expect("GDN state slot が未初期化");

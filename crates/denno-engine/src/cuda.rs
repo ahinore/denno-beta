@@ -312,6 +312,10 @@ pub struct CudaCtx {
     #[allow(dead_code)]
     module_gdn: CUmodule,
     f_gdn: CUfunction,
+    // A1-r2: GDN chunked scan 3 カーネル (長 prefill 用・CPU 参照 gdn::scan_chunked_core)
+    f_gdn_chunk_pre: CUfunction,
+    f_gdn_chunk_state: CUfunction,
+    f_gdn_chunk_scan: CUfunction,
 }
 
 const PTX: &[u8] = include_bytes!("../kernels/kernels_int8.ptx");
@@ -445,6 +449,22 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_gdn, module_gdn, b"dno_gdn_scan\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_gdn_scan)",
             )?;
+            // A1-r2: chunked scan 3 カーネル
+            let mut f_gdn_chunk_pre: CUfunction = std::ptr::null_mut();
+            check(
+                (lib.module_get_function)(&mut f_gdn_chunk_pre, module_gdn, b"dno_gdn_chunk_pre\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_gdn_chunk_pre)",
+            )?;
+            let mut f_gdn_chunk_state: CUfunction = std::ptr::null_mut();
+            check(
+                (lib.module_get_function)(&mut f_gdn_chunk_state, module_gdn, b"dno_gdn_chunk_state\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_gdn_chunk_state)",
+            )?;
+            let mut f_gdn_chunk_scan: CUfunction = std::ptr::null_mut();
+            check(
+                (lib.module_get_function)(&mut f_gdn_chunk_scan, module_gdn, b"dno_gdn_chunk_scan\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_gdn_chunk_scan)",
+            )?;
 
             Ok(Self {
                 device: dev,
@@ -467,6 +487,9 @@ impl CudaCtx {
                 f_rope_pf,
                 module_gdn,
                 f_gdn,
+                f_gdn_chunk_pre,
+                f_gdn_chunk_state,
+                f_gdn_chunk_scan,
             })
         }
     }
@@ -4281,6 +4304,9 @@ mod tests {
 /// - GDN は bit 一致不要 (CPU 逐次経路と数値は僅かに異なる・契約は決定論のみ)。
 /// - GPU 無効/未初期化/実行時エラー時は None (呼び出し側は CPU 逐次にフォールバック)。
 /// - 前提: head_k_dim == head_v_dim かつ d_conv == 4 (Qwen3.5 は常に成立)。
+/// - A1-r2: n >= GDN_CHUNK_MIN_TOKENS の長 prefill は 3-pass chunked カーネルに
+///   ルーティング (chunked は GPU 専用・CPU 経路の契約は不変)。n == 1 は decode
+///   入口 (qwen35 の gdn_scan から呼ばれる)。
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_scan_batch(
     qkv: &[f32],
@@ -4311,10 +4337,21 @@ pub fn gdn_scan_batch(
         GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
-    match gdn_scan_impl(
-        ctx, qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv,
-        d_conv, eps, q_scale,
-    ) {
+    // A1-r2: 長 prefill は chunked 3 カーネルへ。chunked は dk==dv / d_conv==4
+    // 前提のカーネルのため、非成立時は従来の単発カーネルにフォールバック。
+    let chunked = n >= GDN_CHUNK_MIN_TOKENS && dk == dv && d_conv == 4;
+    let result = if chunked {
+        gdn_scan_chunked_impl(
+            ctx, qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv,
+            d_conv, eps, q_scale,
+        )
+    } else {
+        gdn_scan_impl(
+            ctx, qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv,
+            d_conv, eps, q_scale,
+        )
+    };
+    match result {
         Ok(y) => Some(y),
         Err(e) => {
             tracing::error!("CUDA GDN scan failed, using CPU permanently: {e:#}");
@@ -4415,6 +4452,206 @@ fn gdn_scan_impl(
     let shmem = ((3 * dk + dv + 5) * 4) as u32;
     unsafe {
         ctx.launch_async(ctx.f_gdn, (nv as u32, 1, 1), (dk as u32, 1, 1), shmem, &mut args)?;
+    }
+    ctx.sync()?;
+
+    let y = dy.to_vec::<f32>(n * vd)?;
+    let conv_new = dconv_out.to_vec::<f32>(conv_dim * cs)?;
+    let ssm_new = dssm_out.to_vec::<f32>(nv * dk * dv)?;
+    conv_st.copy_from_slice(&conv_new);
+    ssm_st.copy_from_slice(&ssm_new);
+    Ok(y)
+}
+
+// ---------------------------------------------------------------------------
+// A1-r2: GDN chunked scan (長 prefill 用・3-pass 構成)
+// ---------------------------------------------------------------------------
+
+/// chunked ルーティングの閾値 (n がこれ以上で 3-pass chunked カーネルを使用)。
+/// chunk 分割は [`crate::gdn::chunk_plan`](n, この閾値, 1024, 16) を CPU 参照と共有。
+pub(crate) const GDN_CHUNK_MIN_TOKENS: usize = 2048;
+
+/// A1-r2: GDN chunked scan 実装 (3 カーネル・長 prefill 用)。
+///
+/// CPU 参照: [`crate::gdn::scan_chunked_core`]。3-pass 構成:
+/// - K1 `dno_gdn_chunk_pre` (chunk 並列): ローカル遷移 W[ci]・M[ci]
+/// - K2 `dno_gdn_chunk_state` (chunk 直列): chunk 先頭状態 Sinit の直列伝播
+/// - K3 `dno_gdn_chunk_scan` (chunk 並列): Sinit からの逐次 AR スキャン → y・
+///   最終状態 (最終 chunk ブロックが書き戻す)
+///
+/// 決定論: 各カーネルとも launch 構成固定・昇順逐次和・atomic/ワープ縮約不使用
+/// (gdn.cu の方針どおり)。演算は単発カーネル `dno_gdn_scan` と同一で、chunk
+/// 境界でのみ状態を持ち越す。前提: dk == dv・d_conv == 4 (呼び出し側で保証)。
+#[allow(clippy::too_many_arguments)]
+fn gdn_scan_chunked_impl(
+    ctx: &CudaCtx,
+    qkv: &[f32],
+    z: &[f32],
+    beta: &[f32],
+    alpha: &[f32],
+    conv_st: &mut [f32],
+    ssm_st: &mut [f32],
+    wconv: &[f32],
+    wa: &[f32],
+    wdt: &[f32],
+    wnorm: &[f32],
+    n: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    eps: f32,
+    q_scale: f32,
+) -> Result<Vec<f32>> {
+    let cs = d_conv - 1;
+    let conv_dim = 2 * nk * dk + nv * dv;
+    let vd = nv * dv;
+    debug_assert_eq!(qkv.len(), n * conv_dim);
+    debug_assert_eq!(z.len(), n * vd);
+    debug_assert_eq!(beta.len(), n * nv);
+    debug_assert_eq!(alpha.len(), n * nv);
+    debug_assert_eq!(conv_st.len(), conv_dim * cs);
+    debug_assert_eq!(ssm_st.len(), nv * dk * dv);
+    debug_assert_eq!(dk, dv, "chunked scan は dk == dv 前提");
+    debug_assert_eq!(d_conv, 4, "chunked scan は d_conv == 4 前提");
+
+    let (n_chunks, chunk_len) = crate::gdn::chunk_plan(n, GDN_CHUNK_MIN_TOKENS, 1024, 16);
+
+    ctx.make_current()?;
+    let dq = DevBuffer::from_slice(qkv)?;
+    let dz = DevBuffer::from_slice(z)?;
+    let dbeta = DevBuffer::from_slice(beta)?;
+    let dalpha = DevBuffer::from_slice(alpha)?;
+    let dconv_in = DevBuffer::from_slice(conv_st)?;
+    let dssm_in = DevBuffer::from_slice(ssm_st)?;
+    let dwc = DevBuffer::from_slice(wconv)?;
+    let dwa = DevBuffer::from_slice(wa)?;
+    let dwd = DevBuffer::from_slice(wdt)?;
+    let dwn = DevBuffer::from_slice(wnorm)?;
+    let dw = DevBuffer::from_slice(&vec![0.0f32; n_chunks * nv * dk * dv])?;
+    let dm = DevBuffer::from_slice(&vec![0.0f32; n_chunks * nv * dk * dk])?;
+    let dsinit = DevBuffer::from_slice(&vec![0.0f32; n_chunks * nv * dk * dv])?;
+    let dy = DevBuffer::from_slice(&vec![0.0f32; n * vd])?;
+    // 最終状態は最終 chunk ブロックのみ書き込むためゼロ初期化 (未書込部は未使用)
+    let dconv_out = DevBuffer::from_slice(&vec![0.0f32; conv_dim * cs])?;
+    let dssm_out = DevBuffer::from_slice(&vec![0.0f32; nv * dk * dv])?;
+
+    // ---- pass 1: chunk 並列でローカル遷移 (W[ci], M[ci]) --------------------
+    let (mut pq, mut pb, mut pa) = (dq.ptr(), dbeta.ptr(), dalpha.ptr());
+    let (mut pci, mut pwc, mut pwa, mut pwd) = (dconv_in.ptr(), dwc.ptr(), dwa.ptr(), dwd.ptr());
+    let (mut pw, mut pm) = (dw.ptr(), dm.ptr());
+    let (mut ni, mut cli, mut nki, mut nvi, mut dki, mut dvi) = (
+        n as c_int,
+        chunk_len as c_int,
+        nk as c_int,
+        nv as c_int,
+        dk as c_int,
+        dv as c_int,
+    );
+    let (mut cdi, mut csi, mut epsi) = (conv_dim as c_int, cs as c_int, eps);
+    let mut args_pre = [
+        &mut pq as *mut _ as *mut c_void,
+        &mut pb as *mut _ as *mut c_void,
+        &mut pa as *mut _ as *mut c_void,
+        &mut pci as *mut _ as *mut c_void,
+        &mut pwc as *mut _ as *mut c_void,
+        &mut pwa as *mut _ as *mut c_void,
+        &mut pwd as *mut _ as *mut c_void,
+        &mut pw as *mut _ as *mut c_void,
+        &mut pm as *mut _ as *mut c_void,
+        &mut ni as *mut _ as *mut c_void,
+        &mut cli as *mut _ as *mut c_void,
+        &mut nki as *mut _ as *mut c_void,
+        &mut nvi as *mut _ as *mut c_void,
+        &mut dki as *mut _ as *mut c_void,
+        &mut dvi as *mut _ as *mut c_void,
+        &mut cdi as *mut _ as *mut c_void,
+        &mut csi as *mut _ as *mut c_void,
+        &mut epsi as *mut _ as *mut c_void,
+    ];
+    let shmem_pre = ((2 * dk + 3) * 4) as u32;
+    unsafe {
+        ctx.launch_async(
+            ctx.f_gdn_chunk_pre,
+            (n_chunks as u32, nv as u32, 1),
+            (dk as u32, 1, 1),
+            shmem_pre,
+            &mut args_pre,
+        )?;
+    }
+    ctx.sync()?;
+
+    // ---- pass 2: chunk 先頭状態 Sinit の直列伝播 ----------------------------
+    let (mut psi, mut pm2, mut pw2, mut psinit) =
+        (dssm_in.ptr(), dm.ptr(), dw.ptr(), dsinit.ptr());
+    let (mut nc2, mut nv2, mut dk2, mut dv2) =
+        (n_chunks as c_int, nv as c_int, dk as c_int, dv as c_int);
+    let mut args_state = [
+        &mut psi as *mut _ as *mut c_void,
+        &mut pm2 as *mut _ as *mut c_void,
+        &mut pw2 as *mut _ as *mut c_void,
+        &mut psinit as *mut _ as *mut c_void,
+        &mut nc2 as *mut _ as *mut c_void,
+        &mut nv2 as *mut _ as *mut c_void,
+        &mut dk2 as *mut _ as *mut c_void,
+        &mut dv2 as *mut _ as *mut c_void,
+    ];
+    unsafe {
+        ctx.launch_async(
+            ctx.f_gdn_chunk_state,
+            (nv as u32, 1, 1),
+            (dk as u32, 1, 1),
+            0,
+            &mut args_state,
+        )?;
+    }
+    ctx.sync()?;
+
+    // ---- pass 3: Sinit[ci] からの逐次 AR スキャン (chunk 並列) ---------------
+    let (mut pq3, mut pz3, mut pb3, mut pa3) = (dq.ptr(), dz.ptr(), dbeta.ptr(), dalpha.ptr());
+    let (mut pci3, mut psinit3) = (dconv_in.ptr(), dsinit.ptr());
+    let (mut pwc3, mut pwa3, mut pwd3, mut pwn3) = (dwc.ptr(), dwa.ptr(), dwd.ptr(), dwn.ptr());
+    let (mut py, mut pco, mut pso) = (dy.ptr(), dconv_out.ptr(), dssm_out.ptr());
+    let (mut ni3, mut cli3) = (n as c_int, chunk_len as c_int);
+    let (mut nki3, mut nvi3, mut dki3, mut dvi3) =
+        (nk as c_int, nv as c_int, dk as c_int, dv as c_int);
+    let (mut cdi3, mut csi3, mut epsi3, mut qsi3) =
+        (conv_dim as c_int, cs as c_int, eps, q_scale);
+    let mut args_scan = [
+        &mut pq3 as *mut _ as *mut c_void,
+        &mut pz3 as *mut _ as *mut c_void,
+        &mut pb3 as *mut _ as *mut c_void,
+        &mut pa3 as *mut _ as *mut c_void,
+        &mut pci3 as *mut _ as *mut c_void,
+        &mut psinit3 as *mut _ as *mut c_void,
+        &mut pwc3 as *mut _ as *mut c_void,
+        &mut pwa3 as *mut _ as *mut c_void,
+        &mut pwd3 as *mut _ as *mut c_void,
+        &mut pwn3 as *mut _ as *mut c_void,
+        &mut py as *mut _ as *mut c_void,
+        &mut pco as *mut _ as *mut c_void,
+        &mut pso as *mut _ as *mut c_void,
+        &mut ni3 as *mut _ as *mut c_void,
+        &mut cli3 as *mut _ as *mut c_void,
+        &mut nki3 as *mut _ as *mut c_void,
+        &mut nvi3 as *mut _ as *mut c_void,
+        &mut dki3 as *mut _ as *mut c_void,
+        &mut dvi3 as *mut _ as *mut c_void,
+        &mut cdi3 as *mut _ as *mut c_void,
+        &mut csi3 as *mut _ as *mut c_void,
+        &mut epsi3 as *mut _ as *mut c_void,
+        &mut qsi3 as *mut _ as *mut c_void,
+    ];
+    let shmem_scan = ((3 * dk + dv + 5) * 4) as u32;
+    unsafe {
+        ctx.launch_async(
+            ctx.f_gdn_chunk_scan,
+            (n_chunks as u32, nv as u32, 1),
+            (dk as u32, 1, 1),
+            shmem_scan,
+            &mut args_scan,
+        )?;
     }
     ctx.sync()?;
 
