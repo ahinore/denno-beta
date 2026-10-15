@@ -587,6 +587,18 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **検証**: cargo test --workspace(CPU)全 green(lib 147・server 7・cli 5・失敗 0)+ cargo check --workspace + cuda feature ビルド(check --tests)green。**実機 GPU E2E 計測と新 GPU テストの実行(`cargo test --release --features cuda -- --ignored`)は GPU バイナリ再ビルド+サーバー再起動が必要なため人間対応**
 - **残課題**: 実機 E2E 計測(rmsnorm 消滅+ホスト往復廃止の効果・P17k 手順)。次の候補は B2 attn_core V 累積(3.51s)
 
+### B2: attn_core の V 累積最適化 — probs@V の行チャンク化 ✅ (2026-10-15)
+
+> P17k 後の残り律速: attn_core 3,514ms(最大 op・13,252 トークン cold prefill)。B1 で rmsnorm が消滅したため最大 op に浮上。P17k「残る実装候補」1 の「V 累積の v 再読み削減(行チャンク化)」を実施。カーネル内部の再構築のみで**数値はビット一致**(旧カーネルと同一出力)。
+
+- **カーネル変更(kernels_elem.cu・`dno_attention_prefill` の probs@V 累積部のみ)**: 旧実装は行ループ内で `v_sm[kk]` を行数(PF_BQ=64)回再読みし、スレッドあたりタイル当たり s 512 + v 512 + corr 64 の smem 荷載命令が発行されていた。v_sm[kk] を行ループの外へ hoist(kk ごと 1 回読み)し、行を 2 行インターリーブして再利用 + s_sm/corr_sm を float2 (8B) 荷載に変更 → **s 256 + v 8 + corr 32**(v 再読み 64 回 → 1 回・LDS 命令数 ~3.7 倍減)。s_sm の行先頭は PF_BK=8 floats(32B)刻み・動的 smem ベースは 16B 整列のため float2 アクセスの整列は常に成立(kk は偶数ステップ)
+- **数値契約: ビット一致** — acc[r] への FMA 列は「r 固定・kk 昇順」で旧実装と完全同一(`fmaf(p.y, v1, fmaf(p.x, v0, acc))` の内側が kk・外側が kk+1)。attention は緩和枠だが**数値は完全不変**(CPU 参照との maxabs 1.79e-7/1.97e-7 も旧カーネルと同一のはず)・決定論も従来どおり固定順(原子操作なし)。検証: ホスト C++ シミュレーションで新旧ループを 128 スレッド × 64 行 × ランダム値(非正規/±0/最大値含む)で比較し **-O0/-O2 とも全ビット一致**
+- **PTX 静的解析の副次効果**: 旧 PTX は acc[PF_BQ] が local memory に spill(ld.local 81/st.local 33)していたが、新実装は **spill 0**(V 累積部の動的 smem 荷載は ~1,088 → ~296 命令/スレッド/タイル)。他カーネル(dno_swiglu/swiglu_int/add_rmsnorm/attention(decode)/rope_qkv/rope_qkv_pf)は旧 PTX とバイト一致(差分は dno_attention_prefill に局所)
+- **PTX**(kernels_elem.ptx): sha256 `f196f07ec1747c4a6d34b9bc1e02352788cddcfa750fa335d20aac112db0ce54`。手順: ①変更前ソースの再コンパイル結果が committed PTX と sha256 一致(`efc3a711…`)を先に検証 ②変更後に再生成。ホスト側は**無変更**(sh_f/grid/block/ATTN_PF_BQ=64/BK=8 は同一・新規 Rust コードなし)
+- **BK 拡大は見送り**: BK 8→16 は smem ~54KB となり cuFuncSetAttribute の opt-in が必要なうえ、2 blocks/SM → 1 blocks/SM への占有率低下(スコア phase の latency hiding が悪化)のリスクがある。実機 A/B でのみ判断すべきため残課題に残す
+- **検証**: cargo test --workspace(CPU)全 green(lib 147 不変)+ cargo check --features cuda --tests green。**実機での再検証が必要**: ①`cuda_attn_pf_bench`(n=t=13252)のカーネル単体タイミング(旧 69.3ms/call からの改善幅)②`cuda_attention_prefill_vs_cpu_reference/large` の maxabs・決定論再確認 ③E2E PROFILE 計測(P17k 手順)。GPU バイナリ再ビルド+サーバー再起動は人間対応
+- **残課題**: 実機 E2E 計測 + BK 拡大の A/B 実験(smem >48KB の opt-in)+ スコア phase のさらなる共有(4r×2k)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B UD-IQ2_XXS 動作)
@@ -601,7 +613,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 ### P17 系残課題(CUDA)
 
 - [x] ~~**B1: rmsnorm の GPU 化**: P17k プロファイルで残 2.3s(TOTAL ~31%)。P17d 要素演算カーネルの延長・実装容易~~ → **完了 (2026-10-15)**: prefill (n>1) を隠れ状態デバイス常駐チェーン化 — 層あたり 2 回の CPU rmsnorm を dno_add_rmsnorm で GPU 化(residual 加算融合・CPU とビット一致)し「rmsnorm 2.3s が h H2D と直列」を解消。h/proj/down のホスト往復(81MB×4/層)も廃止。実機 E2E 計測は残課題
-- [ ] **B2: attn_core の V 累積**: 残 3.51s(最大 op)。dno_attention 拡張(attention は緩和契約済み)
+- [x] ~~**B2: attn_core の V 累積**: 残 3.51s(最大 op)。dno_attention 拡張(attention は緩和契約済み)~~ → **完了 (2026-10-15)**: `dno_attention_prefill` の probs@V 累積を v hoist + 2 行インターリーブ + float2 荷載に再構築(v 再読み 64 回 → 1 回・acc への FMA 列は kk 昇順で旧実装と完全同一 = **ビット一致**・旧カーネルの acc local spill も解消)。ホスト側無変更。実機計測(`cuda_attn_pf_bench`・E2E PROFILE)と BK 拡大 A/B は残課題
 - [ ] **B3: b>1 バッチの rope GPU 化**(優先度低): バッチ時は同期が隠蔽される
 - [x] ~~**3B/7Bのb=4実測**~~ → **P17k で実施**(対象は Gemma3n 13,252 tok に変更して完了)
 
