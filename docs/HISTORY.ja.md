@@ -1004,6 +1004,35 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 `cargo test --workspace` **229 passed / 0 failed** (旧 227 + 2)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)。**実機での分岐消滅確認 (1b→2b シーケンスの再実行) は人間対応**
 
+### 案 B: CPU prefill の rayon 並列化 (bit 一致契約を維持) ✅ (2026-10-16)
+
+> 第42セッション。REPORT_NEXT16 の方案策定 (案 A/B/C 比較) で推奨された案 B の実装。8095 で大きな system+tools プロンプト (n≈2000-2500) の prefill が 40 秒級・GPU ほぼ 0%・CPU 1 コアのみ 100% になる問題への対策で、prefill の CPU 部 — full attention の O(n²) トークン逐次と `matmul_bt_i8` の逐次 GEMM — を「出力要素ごとの累積順を変えない」並列化に置き換える。決定論/exactness 契約は一切変更しない (prefill バッチ == トークン逐次 の bit 一致契約を構造維持・CPU 参照 md5 は全て不変の前提)・`.cu` / PTX は無変更 (PTX 再生成は不要・8095 配備用 cuda バイナリの再ビルドのみ人間対応)。
+
+**実装 (tensor.rs)**:
+
+- `matmul_bt_i8` (prefill 投影の Q8 GEMM — 旧実装はコメントに「並列化」とあるのみで実際は逐次 `chunks_exact` だった: REPORT_NEXT16 §0 副次発見 1) を rayon 化。①入力の動的量子化 (行独立) を `par_chunks_exact_mut` の行並列に ②GEMM 本体を j ブロック並列 (32 チャネルずつ・false sharing 回避) にし出力書き込みは `SendPtr` 経由 (P6 `matvec_rows_bt_i8` と同一パターン)・端数ブロックは逐次のまま。出力要素ごとの演算列 (量子化 → i32 ドット → f32 変換 × asc × scale) は並列化前と同一のためビット一致・スレッド数非依存
+
+**実装 (model/qwen35.rs)**:
+
+- `full_attn_core` (decode n==1 経路) を `full_attn_prepare` (KV 書き込み + QK-Norm + partial interleaved RoPE — decode と共用・トークン順に逐次実行) と `full_attn_attend_head` (1 head 分の scores → softmax → probs@V → sigmoid 出力ゲート・読み取り専用) に分割。decode は同一関数列を逐次呼びする形で無変更
+- prefill バッチ経路 (`forward_prefill` の Full 分岐) は全トークンの prepare をトークン順に逐次実行してから、attend を `att.par_chunks_exact_mut(dh)` の (i, head) 並列で rayon 実行 — attend は読み取り専用で (i, head) ごとに独立・scores はタスクローカルスクラッチ (llama.rs の SCORES_SCRATCH と同一パターン)。O(n²) の full attention トークン逐次が長 prefill の主律速だった (REPORT_NEXT16 §1.2)
+- 行独立ステージ (rmsnorm ×2・残差加算 ×3・SwiGLU) も行並列化 (`par_chunks_exact_mut`)
+
+**決定論**: i/j 方向のみの並列で出力要素ごとの累積順は不変 — 既存 P6/P9 (`matvec_rows_bt` 系) と同一の保証クラス。CPU 参照 md5 (`feea9444` / `da0b1f57`) と既存アンカーは全て不変 (9B 実モデル E2E で 16T / 1T 双方の再取得済み)。GPU 経路は一切変更しないため、epoch 修正後の 2b 分岐実機確認とも完全に独立
+
+**テスト** (新規 2 件):
+
+- `tensor.rs::matmul_bt_i8_parallel_bit_exact_and_thread_count_independent`: 各出力行が `matvec_bt_i8` (decode 単独行の参照) と `to_bits` 完全一致・ローカルプール 1/4 スレッドで同一結果 (n=300 = JB=32 の倍数 + 端数ブロックの両方を包含)
+- `qwen35.rs::qwen38_27b_shape_prefill_thread_count_bit_exact`: 合成 27B 形状で prefill (n=24) + 継続 decode をローカルプール 1/2/7/16 スレッドで bits 完全一致 (1 スレッド = 逐次相当)。既存 `qwen38_27b_shape_prefill_batch_bit_exact` (並列 prefill == トークン逐次) と合わせて「並列化しても逐次と bit 一致」を両面から担保
+
+**実測** (9B 実モデル E2E・開発コンテナの CPU ビルド (8C/16T)・int8・seed 42・長プロンプト n=2480 / max_tokens 4):
+
+- 1b / 2b アンカー md5: 16T・1T 双方で `feea9444` / `da0b1f57` 不変
+- 長プロンプト E2E wall (prefill + 4 トークン decode): 16 スレッド **111.6 秒**・1 スレッド **568.4 秒** (16T 比 5.09 倍 — 出力は同一 md5 `f9b7f6be`)
+- REPORT_NEXT16 §2 の演算ステージ別プロトタイプ計測 (リポジトリ外・本コンテナ同一 CPU): attention 層 9.2-10.3 倍・`matmul_bt_i8` 相当 8.2-8.9 倍・SwiGLU 5.6 倍 — 全構成 (1T/8T/16T) で逐次版と bit 一致を確認済み
+
+`cargo test --workspace` **231 passed / 0 failed** (旧 229 + 2)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)。8095 配備用 cuda バイナリの再ビルドは人間対応 (PTX 再生成は不要)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)

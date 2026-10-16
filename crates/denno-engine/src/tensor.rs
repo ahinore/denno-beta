@@ -668,22 +668,33 @@ pub fn matvec_rows_bt_i8(
 /// 読んで全 m トークン分のドットを計算する (重み帯域 1 回分。アクティベー
 /// ションは L2/L3 に乗る)。整数 sdot は 5.8 TMAC/s 実測 (20 スレッド) で、
 /// デ量子化 + fp32 sgemm より高速。
+///
+/// s42 (Plan B): 実際に rayon で並列化する (旧実装はこのコメントのみで逐次
+/// `chunks_exact` だった — REPORT_NEXT16 §0 副次発見 1)。`matvec_rows_bt_i8`
+/// (P6) と同一の j ブロック並列 + 出力書き込みは SendPtr 経由。出力要素ごとの
+/// 演算列 (量子化 → i32 ドット → f32 変換 × asc × scale) は並列化前と同一の
+/// ためビット一致・スレッド数非依存。量子化 (行独立) も行並列にする。
 pub fn matmul_bt_i8(a: &[f32], q: &[i8], scale: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     debug_assert_eq!(q.len(), k * n);
     debug_assert_eq!(scale.len(), n);
-    // 各トークンを動的量子化 (decode と同一規則 → 行単位でビット一致)
+    // 各トークンを動的量子化 (decode と同一規則 → 行単位でビット一致)。
+    // 行独立のため行並列 (書き込み先は non-overlapping な chunks_mut に分割)。
     let mut aq = vec![0i8; m * k];
     let mut asc = vec![0f32; m];
-    for i in 0..m {
-        let (qi, si) = quantize_row_i8(&a[i * k..][..k]);
-        aq[i * k..][..k].copy_from_slice(&qi);
-        asc[i] = si;
-    }
+    aq.par_chunks_exact_mut(k)
+        .zip(asc.par_iter_mut())
+        .zip(a.par_chunks_exact(k))
+        .for_each(|((aq_row, asc_row), a_row)| {
+            let (qi, si) = quantize_row_i8(a_row);
+            aq_row.copy_from_slice(&qi);
+            *asc_row = si;
+        });
     let mut c = vec![0.0f32; m * n];
     // j を 32 チャネルずつのブロックで並列化 (false sharing を避ける)
     const JB: usize = 32;
-    q.chunks_exact(k * JB)
-        .zip(scale.chunks(JB))
+    let cp = SendPtr(c.as_mut_ptr());
+    q.par_chunks_exact(k * JB)
+        .zip(scale.par_chunks(JB))
         .enumerate()
         .for_each(|(bi, (qw, sc))| {
             let j0 = bi * JB;
@@ -692,7 +703,7 @@ pub fn matmul_bt_i8(a: &[f32], q: &[i8], scale: &[f32], m: usize, k: usize, n: u
                 let wrow = &qw[jj * k..][..k];
                 for i in 0..m {
                     let dot = i8_dot(&aq[i * k..][..k], wrow);
-                    c[i * n + j] = dot as f32 * asc[i] * sj;
+                    unsafe { cp.write(i * n + j, dot as f32 * asc[i] * sj) };
                 }
             }
         });
@@ -1393,6 +1404,47 @@ mod tests {
                     "bit mismatch at {i} (dh={dh}, t={t}, m={m}, kv_dim={kv_dim})"
                 );
             }
+        }
+    }
+
+    /// s42 (Plan B): `matmul_bt_i8` の rayon 並列化 (j ブロック並列 + 量子化行並列)
+    /// がビット一致であること。①各行が `matvec_bt_i8` (decode 単独行の参照・同一
+    /// 量子化規則 + 同一 i32 ドット + 同一 f32 変換順) とビット一致 ②ローカル
+    /// プール 1/4 スレッドで同一結果 (rayon スレッド数非依存)。n は JB=32 の倍数
+    /// と端数の両方を含む (端数ブロックは逐次のまま)。
+    #[test]
+    fn matmul_bt_i8_parallel_bit_exact_and_thread_count_independent() {
+        let (m, k, n) = (37usize, 128usize, 300usize); // 300 = 32*9 + 12 (端数あり)
+        let a = pseudo_random(m * k, 101);
+        let q = pseudo_random_i8(k * n, 102);
+        let scale: Vec<f32> = pseudo_random(n, 103).iter().map(|v| 0.01 + v.abs() * 0.02).collect();
+
+        // 参照: 各行を matvec_bt_i8 (decode m==1 経路) で逐次計算
+        let reference_rows: Vec<Vec<f32>> = (0..m)
+            .map(|i| matvec_bt_i8(&a[i * k..][..k], &q, &scale, k, n))
+            .collect();
+
+        let check = |c: &[f32]| {
+            assert_eq!(c.len(), m * n);
+            for i in 0..m {
+                for j in 0..n {
+                    assert_eq!(
+                        c[i * n + j].to_bits(),
+                        reference_rows[i][j].to_bits(),
+                        "matmul_bt_i8[{i}][{j}] != matvec_bt_i8"
+                    );
+                }
+            }
+        };
+
+        // 既定 (グローバルプール)
+        check(&matmul_bt_i8(&a, &q, &scale, m, k, n));
+
+        // スレッド数非依存 (ローカルプール 1 / 4 スレッド)
+        for th in [1usize, 4] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(th).build().unwrap();
+            let c = pool.install(|| matmul_bt_i8(&a, &q, &scale, m, k, n));
+            check(&c);
         }
     }
 }
