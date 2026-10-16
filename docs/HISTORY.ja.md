@@ -1093,6 +1093,36 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 `cargo test --workspace` **242 passed / 0 failed** (旧 237 + 5)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)・push は人間対応
 
+### thinking 制御 (`thinking`: "off" | "brief" | "full") の実装 (s47) ✅ (2026-10-17)
+
+> 第47セッション。/v1/messages に thinking 制御を追加した (`thinking` トップレベル任意フィールド・文字列・Anthropic API には無い denno 拡張・未知フィールド拒否なしの現行パーサ維持)。「full」は現行経路とビット同一で数値経路への影響は無し。off 分岐の構造は実 Qwen3.5 テンプレートの実ファイル (tokenizer_config.json の chat_template・python3 で検証) に基づく。
+
+**仕様**:
+
+- `"off"`: chat template に `enable_thinking=false` を渡す。実 Qwen3.5 テンプレートは generation prompt が `<|im_start|>assistant\n` + `<think>\n\n\n</think>\n\n` (空の think block・**think 終了タグの直前が改行3つ** = 実モデルの chat_template.jinja と同一の anchor) に変わり、思考済みの空 block が閉じた状態で開始するため即答する
+- `"brief"` (既定): 思考 ON のまま・system 冒頭に決定的な短答誘導文 (`THINKING_BRIEF_INSTRUCTION`) を注入する (**ハード制御ではない** — モデルの生成を強制しないソフトな誘導)。既存 system は保持・未指定/空なら誘導文単独になる
+- `"full"`: 現行経路のまま (注入なし・`enable_thinking` 変数も渡さない = prompt はビット同一)
+- 未指定は `"brief"` が適用される (prompt に誘導文が注入される**意図的変更**)。不正値は 400 invalid_request_error (tool_choice のバリデーション慣習と同一・大文字小文字厳密一致)
+
+**実装**:
+
+- `tokenizer.rs`: `apply_chat_template` / `apply_chat_template_base` / `render_chat_template` に `enable_thinking: Option<bool>` を追加 — 指定されたときだけ ctx 変数として渡す (None = 変数無し = 従来経路と同一。実テンプレートは `{% if enable_thinking is defined and enable_thinking is false %}` の形で参照し、未定義は思考 ON = 現状の実機観測と一致)。fallback テンプレートに thinking の概念は無い
+- `engine.rs`: `begin_chat_with_tools` に `enable_thinking` を追加。base 検出 (s46 split prefill) も同一引数で行われるため thinking=off でも recurrent モデルの base 復元が働く
+- `denno-server/lib.rs`: `MessagesRequest.thinking` + `Thinking` 列挙 + `parse_thinking` (未指定 = Brief・不正値 400) + `brief_system` (誘導文を system 冒頭へ注入・既存 system は保持)。off/full は注入なし・off のみ `enable_thinking=Some(false)` (brief/full は変数無し = 従来描画)
+- `denno-server/scheduler.rs`: `Job::Chat`/`Job::Stream` に `enable_thinking` を追加 (非ストリーム/SSE 両経路で同一制御)
+- `testutil.rs`: `ThinkingSimModel` (直前トークンが think 終了タグなら即 EOS・それ以外は思考フィラ 3 トークン後に EOS の決定論的ダミー) + qwen_style テンプレートに実 Qwen3.5 と同一の `enable_thinking` 分岐 + think 開始/終了タグを added_tokens に登録 (実 Qwen3.5 と同一・special=false・id は語彙側と同一を再利用 → Whitespace 前処理で分割されず単一トークン化 = テストでも off = full + [<think>, </think>])
+
+**テスト** (新規 11 件):
+
+- `tokenizer.rs` 2 件: `chat_template_receives_enable_thinking_variable` (実 Qwen3.5 と同一の `is defined and is false` 形で None=思考 ON/Some(true)=思考 ON/Some(false)=off・minijinja が `is defined`/`is false` を解釈できることも含む)・`chat_template_base_receives_enable_thinking_variable` (base 描画も同一変数を受ける = off でも s46 base 検出が成立)
+- `engine.rs` 3 件: `thinking_off_renders_empty_think_block_in_generation_prompt` (off = full + [<think>, </think>] = prompt 2 トークン増・終了タグ直前が改行3つの実構造・Some(true) は従来経路と完全同一)・`thinking_off_short_circuits_generation_and_full_thinks` (off=即 EOS 1 トークンで完答/full=思考フィラ 3 + EOS)・`thinking_off_keeps_recurrent_base_split` (off でも s46 base 復元が働き PrefixHit::Entry・出力はコールド full prefill と完全一致)
+- `denno-server/tests/thinking_control.rs` 6 件: `parse_thinking_maps_all_modes_and_defaults_to_brief` (全モード+大文字小文字を含む不正値拒否)・`brief_system_prepends_fixed_instruction_deterministically` (決定的固定文・既存 system 保持)・`thinking_off_short_circuits_and_brief_full_think` (wire 層: off=1 トークン即答・未指定=brief=full は思考経路)・`thinking_brief_injects_system_and_full_is_unchanged` (brief の注入を全 prompt トークンに依存する状態依存モデルの出力差分で観測・off も prompt 変化を観測)・`thinking_unknown_value_is_rejected_with_400`・`thinking_off_streams_immediately_and_full_streams_thinking` (SSE 経路も同一制御)
+- 既存 `scheduler.rs` 2 件の基準側を更新 (wire の未指定 = brief で注入される実効 system 付きに変更 — エンジン直接実行との等価性検証の趣旨は不変。SleepModel 経由の他 wire テストは生成テキスト不変のため無影響・直接 scheduler submit 系は HTTP を通らないため無影響)
+
+**数値経路への影響**: 無し — "full" はビット同一 (変数無し = 従来描画)・"off" はテンプレート変数の違いのみ (モデル/サンプラには触れない)・"brief" は system テキストの変更のみ (決定的固定文)。エンジン直実行系の既存テストは全て system 無しのまま = 既存アンカー/CPU 参照 md5 の前提経路は不変
+
+`cargo test --workspace` **253 passed / 0 failed** (旧 242 + 11)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)・push は人間対応
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -1125,6 +1155,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] **クライアント切断検知 (SSE ストリームの生成打ち切り)** → **完了 (2026-10-16)**: §3「クライアント切断検知と生成 abort」節参照。~~非ストリームは検知経路が無く対象外~~ → **非ストリームも対応 (s44)**: §3「非ストリーム /v1/messages のクライアント切断後処理の堅牢化」節参照
 - [x] **非ストリーム /v1/messages のクライアント切断後処理の堅牢化 (非ストリーム切断 abort + 非同期ロギングによる wedge 対策)** → **完了 (2026-10-16)**: §3「非ストリーム /v1/messages のクライアント切断後処理の堅牢化」節参照。数値経路は無変更
 - [x] **chat 用 max_tokens 既定上限 (未指定時のみ適用・明示指定は尊重)** → **完了 (2026-10-16)**: §3「chat 用 max_tokens 既定上限」節参照。既定 4096 (engine の SESSION_RESERVE_TOKENS と同値)・数値経路は無変更
+- [x] **thinking 制御 (`thinking`: "off" | "brief" | "full")** → **完了 (2026-10-17)**: §3「thinking 制御の実装」節参照。off は `enable_thinking=false` (空の think block で即答)・brief (既定) は短答誘導文の system 注入 (**ハード制御ではない**)・full は従来経路とビット同一。数値経路は無変更
 - [ ] Llama系バリアント(GQA無しモデル、RoPEスケーリング)
 - [ ] **他ファミリー対応**: DeepSeekシリーズ(MoE+共有エキスパート)、GLMシリーズ、gpt-oss(attention sink+sliding window+MXFP4)。GGUF 経路(P19)により入口が拡大
 - [ ] **各モデル独自機構の可視化**: MoEルーティング、MLA潜在圧縮KV、attention sink、sliding window帯パターン、thinkingモード

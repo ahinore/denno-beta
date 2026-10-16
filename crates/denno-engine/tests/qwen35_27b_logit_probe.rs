@@ -41,7 +41,12 @@ fn qwen35_27b_logit_probe() {
     let prompt_text = std::env::var("QWEN35_PROBE_PROMPT")
         .unwrap_or_else(|_| "What is the capital of France?".to_string());
     let prompt = tok
-        .apply_chat_template(None, &[ChatMessage { role: "user".into(), content: prompt_text }], None)
+        .apply_chat_template(
+            None,
+            &[ChatMessage { role: "user".into(), content: prompt_text }],
+            None,
+            None,
+        )
         .expect("template 失敗");
     eprintln!("PROMPT: {prompt:?}");
     let ids = tok.encode(&prompt).expect("encode 失敗");

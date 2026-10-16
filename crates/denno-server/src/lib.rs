@@ -152,6 +152,11 @@ pub struct MessagesRequest {
     /// 既定は auto。`any`/`tool` (強制) は拘束デコード (第21) が有効:
     /// モデル生成を tool_call block (公式テンプレート形式) へ強制する。
     pub tool_choice: Option<serde_json::Value>,
+    /// s47: thinking 制御 ("off" | "brief" | "full")。既定は "brief"。
+    /// denno 拡張のトップレベル任意フィールド (文字列。Anthropic API には無い)。
+    /// 未指定のリクエストは brief が適用される (prompt に短答誘導文が注入される
+    /// 意図的変更)。未知フィールドを拒否しない現行パーサの挙動は維持。
+    pub thinking: Option<String>,
 }
 
 /// tool use: ツール定義 1 件 (Anthropic 形式。type フィールドは受け流す)
@@ -225,6 +230,51 @@ fn parse_tool_choice_str(s: &str) -> Result<ToolChoice, ApiError> {
             other
         ))),
     }
+}
+
+// ---------- s47: thinking 制御 ----------
+
+/// s47: thinking 制御のモード (`thinking` トップレベル任意フィールド・文字列)。
+///
+/// - `Off`: chat template に `enable_thinking=false` を渡す (実モデルでは空の
+///   think block が generation prompt に入り、思考せず即答する)
+/// - `Brief` (既定): 思考 ON のまま、system 冒頭に短答誘導文を注入する
+///   (**ハード制御ではない** — モデルの生成を強制しないソフトな誘導)
+/// - `Full`: 従来経路のまま (注入なし・`enable_thinking` 変数も渡さない =
+///   prompt はビット同一)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Thinking {
+    Off,
+    Brief,
+    Full,
+}
+
+/// thinking=brief のとき system 冒頭へ注入する誘導文 (決定的・固定文字列。
+/// 同一入力→同一出力の契約のため、内容はコードに固定する)。
+pub const THINKING_BRIEF_INSTRUCTION: &str = "思考は短く数文で済ませ、すぐに回答を書いてください。";
+
+/// thinking をパースする (未指定 = Brief。不正値は 400 invalid_request_error —
+/// tool_choice のバリデーション慣習と同一)。
+pub fn parse_thinking(v: &Option<String>) -> Result<Thinking, ApiError> {
+    match v.as_deref() {
+        None => Ok(Thinking::Brief),
+        Some("off") => Ok(Thinking::Off),
+        Some("brief") => Ok(Thinking::Brief),
+        Some("full") => Ok(Thinking::Full),
+        Some(other) => Err(ApiError::invalid_request(format!(
+            "thinking: unsupported value {:?} (off/brief/full)",
+            other
+        ))),
+    }
+}
+
+/// thinking=brief の実効 system を組む (誘導文を system 冒頭へ注入。
+/// 既存 system は保持・未指定/空なら誘導文単独の system になる)。
+pub fn brief_system(system: Option<String>) -> Option<String> {
+    Some(match system {
+        Some(s) if !s.is_empty() => format!("{THINKING_BRIEF_INSTRUCTION}\n\n{s}"),
+        _ => THINKING_BRIEF_INSTRUCTION.to_string(),
+    })
 }
 
 /// tools 定義の検証 (name 非空・input_schema は object)。
@@ -747,6 +797,18 @@ async fn messages(
         });
     }
     let system = system_to_text(&req.system)?;
+    // s47: thinking 制御。brief (既定) は system 冒頭に短答誘導文を注入
+    // (off/full は注入なし)。off は chat template の enable_thinking 変数で
+    // 制御する (Some(false)・brief/full は変数無し = 従来経路と同一)。
+    let thinking = parse_thinking(&req.thinking)?;
+    let system = match thinking {
+        Thinking::Brief => brief_system(system),
+        Thinking::Off | Thinking::Full => system,
+    };
+    let enable_thinking = match thinking {
+        Thinking::Off => Some(false),
+        Thinking::Brief | Thinking::Full => None,
+    };
     // s39: max_tokens / max_completion_tokens の未指定時は既定上限 (DEFAULT_MAX_TOKENS)
     // を適用する。明示指定は尊重。数値経路への影響は無い (設定値の既定適用のみ)。
     let params = GenParams {
@@ -772,6 +834,7 @@ async fn messages(
                 params,
                 tools_for_prompt,
                 tool_constraint,
+                enable_thinking,
                 tx,
             )
             .map_err(queue_full_error(&state))?;
@@ -788,7 +851,7 @@ async fn messages(
     } else {
         let rx = state
             .scheduler
-            .submit_chat(system, chat_messages, params, tools_for_prompt, tool_constraint)
+            .submit_chat(system, chat_messages, params, tools_for_prompt, tool_constraint, enable_thinking)
             .map_err(queue_full_error(&state))?;
         let mut output = rx
             .await

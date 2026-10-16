@@ -57,6 +57,8 @@ pub const MAX_ACTIVE_SESSIONS: usize = 4;
 
 /// スケジューラに積むジョブ。検証済みのパラメータのみが入る。
 /// `tools` は chat template の `tools` 変数へ渡す値 (None = tools 無し)。
+/// `enable_thinking` (s47) は chat template の `enable_thinking` 変数として渡すか
+/// 否か (None = 変数無し = 従来経路と同一。thinking=off のとき Some(false))。
 pub enum Job {
     /// 非ストリーミング生成 (結果を oneshot で返す)
     Chat {
@@ -66,6 +68,8 @@ pub enum Job {
         tools: Option<serde_json::Value>,
         /// 第21: tool_choice any/Named の拘束デコード (None = 無マスク)
         constraint: Option<ToolConstraint>,
+        /// s47: thinking 制御 (off のとき Some(false)・brief/full は None)
+        enable_thinking: Option<bool>,
         respond: oneshot::Sender<Result<ChatOutput>>,
     },
     /// SSE ストリーミング生成 (イベントを events チャネルに流す)
@@ -76,6 +80,8 @@ pub enum Job {
         tools: Option<serde_json::Value>,
         /// 第21: tool_choice any/Named の拘束デコード (None = 無マスク)
         constraint: Option<ToolConstraint>,
+        /// s47: thinking 制御 (off のとき Some(false)・brief/full は None)
+        enable_thinking: Option<bool>,
         events: tokio_mpsc::Sender<Result<Event, Infallible>>,
     },
 }
@@ -161,10 +167,11 @@ impl Scheduler {
         params: GenParams,
         tools: Option<serde_json::Value>,
         constraint: Option<ToolConstraint>,
+        enable_thinking: Option<bool>,
     ) -> Result<oneshot::Receiver<Result<ChatOutput>>, QueueFull> {
         let (respond, rx) = oneshot::channel();
         self.tx
-            .try_send(Job::Chat { system, messages, params, tools, constraint, respond })
+            .try_send(Job::Chat { system, messages, params, tools, constraint, enable_thinking, respond })
             .map_err(|_| QueueFull)?;
         Ok(rx)
     }
@@ -177,10 +184,11 @@ impl Scheduler {
         params: GenParams,
         tools: Option<serde_json::Value>,
         constraint: Option<ToolConstraint>,
+        enable_thinking: Option<bool>,
         events: tokio_mpsc::Sender<Result<Event, Infallible>>,
     ) -> Result<(), QueueFull> {
         self.tx
-            .try_send(Job::Stream { system, messages, params, tools, constraint, events })
+            .try_send(Job::Stream { system, messages, params, tools, constraint, enable_thinking, events })
             .map_err(|_| QueueFull)
     }
 }
@@ -355,12 +363,12 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
 
 /// ジョブから実行状態を作る (begin_chat まで。KV には触れない)。
 fn build_run(engine: &Arc<Mutex<Engine>>, job: Job) -> Run {
-    let (system, messages, params, tools, constraint, respond, events) = match job {
-        Job::Chat { system, messages, params, tools, constraint, respond } => {
-            (system, messages, params, tools, constraint, Some(respond), None)
+    let (system, messages, params, tools, constraint, enable_thinking, respond, events) = match job {
+        Job::Chat { system, messages, params, tools, constraint, enable_thinking, respond } => {
+            (system, messages, params, tools, constraint, enable_thinking, Some(respond), None)
         }
-        Job::Stream { system, messages, params, tools, constraint, events } => {
-            (system, messages, params, tools, constraint, None, Some(events))
+        Job::Stream { system, messages, params, tools, constraint, enable_thinking, events } => {
+            (system, messages, params, tools, constraint, enable_thinking, None, Some(events))
         }
     };
     let (sess, error) = {
@@ -371,6 +379,7 @@ fn build_run(engine: &Arc<Mutex<Engine>>, job: Job) -> Run {
             &params,
             tools.as_ref(),
             constraint.as_ref(),
+            enable_thinking,
         ) {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e)),

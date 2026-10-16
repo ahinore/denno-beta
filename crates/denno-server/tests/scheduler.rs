@@ -23,7 +23,7 @@ use denno_engine::testutil::{
     dummy_tokenizer, kv_sensitive_engine, KvSensitiveModel, DUMMY_CONTEXT, DUMMY_EOS, DUMMY_VOCAB,
 };
 use denno_engine::{ChatMessage, Engine, GenParams};
-use denno_server::{AppState, Scheduler, MAX_ACTIVE_SESSIONS};
+use denno_server::{AppState, Scheduler, THINKING_BRIEF_INSTRUCTION, MAX_ACTIVE_SESSIONS};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -150,7 +150,16 @@ async fn single_request_matches_engine_reference_output() {
         "denno-test",
         None,
     );
-    let reference = direct.chat(None, &user_msg("t0"), &greedy_params(20), |_| {}).unwrap();
+    // s47: 未指定の thinking は brief (既定) → wire 層で短答誘導文が system に注入
+    // される。基準も同一の実効 system で直接実行する (等価性検証の趣旨は不変)。
+    let reference = direct
+        .chat(
+            Some(THINKING_BRIEF_INSTRUCTION),
+            &user_msg("t0"),
+            &greedy_params(20),
+            |_| {},
+        )
+        .unwrap();
 
     let (app, _state) = test_app(0, 8);
     let (status, body) = post(&app, request_body("t0", 20, false)).await;
@@ -241,9 +250,15 @@ async fn concurrent_different_prompts_match_solo_reference() {
             let mut e = kv_sensitive_engine("ref", None).unwrap();
             // トークン数を多めに取り、リクエスト 2 の HTTP セットアップ遅延が
             // あっても必ずリクエスト 1 の decode 中に到着するようにする
-            e.chat(None, &user_msg(p), &greedy_params(24), |_| {})
-                .unwrap()
-                .text
+            // (s47: 未指定 = brief の実効 system 付き = wire リクエストと同一条件)
+            e.chat(
+                Some(THINKING_BRIEF_INSTRUCTION),
+                &user_msg(p),
+                &greedy_params(24),
+                |_| {},
+            )
+            .unwrap()
+            .text
         })
         .collect();
     assert_ne!(refs[0], refs[1], "テストの前提: プロンプトが異なれば出力も異なること");
@@ -376,7 +391,7 @@ async fn scheduler_rejects_beyond_queue_capacity() {
     let sched = Scheduler::spawn(engine.clone(), 1);
 
     // 1 件目: 実行開始を待つ
-    let rx1 = sched.submit_chat(None, user_msg("t0"), greedy_params(20), None, None).unwrap();
+    let rx1 = sched.submit_chat(None, user_msg("t0"), greedy_params(20), None, None, None).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while sched.in_flight() == 0 {
         assert!(std::time::Instant::now() < deadline, "job never started");
@@ -386,11 +401,11 @@ async fn scheduler_rejects_beyond_queue_capacity() {
 
     // 2 件目: キュー (上限 1) に入る
     let rx2 = sched
-        .submit_chat(None, user_msg("t0"), greedy_params(20), None, None)
+        .submit_chat(None, user_msg("t0"), greedy_params(20), None, None, None)
         .expect("2件目はキューに入るべき");
     // 3 件目: 満杯 → QueueFull
     let err = sched
-        .submit_chat(None, user_msg("t0"), greedy_params(20), None, None)
+        .submit_chat(None, user_msg("t0"), greedy_params(20), None, None, None)
         .expect_err("3件目は QueueFull であるべき");
     assert!(matches!(err, denno_server::QueueFull));
 
@@ -400,7 +415,7 @@ async fn scheduler_rejects_beyond_queue_capacity() {
     assert_eq!(out2.text, EXPECTED_GREEDY_TEXT);
     // 完了後は実行中 0 に戻り、再度受理できる
     assert_eq!(sched.in_flight(), 0);
-    let rx3 = sched.submit_chat(None, user_msg("t0"), greedy_params(20), None, None).unwrap();
+    let rx3 = sched.submit_chat(None, user_msg("t0"), greedy_params(20), None, None, None).unwrap();
     assert_eq!(rx3.await.unwrap().unwrap().text, EXPECTED_GREEDY_TEXT);
 }
 
