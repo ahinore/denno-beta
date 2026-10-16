@@ -881,7 +881,10 @@ impl Engine {
     pub fn step_chat_batch(
         &mut self,
         batch: &mut [&mut ChatSession],
-        on_deltas: &mut [Box<dyn FnMut(&str)>],
+        // 第27: scheduler が Run から取り出した SSE アセンブラへの &mut を
+        // クロージャに捕ませるため短命トレイトオブジェクトを許す
+        // (Box<dyn FnMut> は既定で 'static 要求になるため明示的に '_ を付ける)
+        on_deltas: &mut [Box<dyn FnMut(&str) + '_>],
     ) -> Result<Vec<bool>> {
         debug_assert_eq!(batch.len(), on_deltas.len());
         let mut done = vec![false; batch.len()];
@@ -1614,12 +1617,12 @@ mod tests {
             .unwrap_or_else(|| panic!("vocab missing: {piece}"))
     }
 
-    /// 完全な tool_call block を吐くスクリプト。
+    /// 完全な tool_call block を吐くスクリプト (第27: 閉じタグ `</tool_call>` 付き = 抽出対象)。
     /// `name` はモデルが「選ぼうとする」ツール名 (拘束の有無で分岐を見る)。
     fn block_script(name: &str) -> Vec<u32> {
         [
             "Checking.", "<tool_call>", "Ċ", "<function=", name, ">", "city", "Tokyo",
-            "</parameter>", "</tool_call>", "eos",
+            "</parameter>", "</function>", "</tool_call>", "eos",
         ]
         .iter()
         .map(|p| tid(p))

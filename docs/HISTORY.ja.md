@@ -882,6 +882,29 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 3. 速度再実測 (27.9 ms/step からの変化。確保はプロセス内 1 回のみなので影響ゼロのはず)
 4. アンカー再取得 (chain 発動時の出力は修正前の乱れた値から変わる → CPU アンカーとの一致を確認)
 
+### streaming tool_use 対応 (SSE アセンブラ) ✅ (2026-10-16)
+
+> §3「tool use 対応」節の将来課題「streaming の tool_use」を完了 (第33セッションで実装本体、第34セッションで借用エラーとテスト不整合を修正して完成)。server 配線と新規 SSE アセンブラのみで engine の数値経路は無変更 (tools 無しの stream も delta 送出経路はビット同一)。
+
+**設計 (非ストリーミング `extract_tool_calls` と同一の意味論を delta ストリームへ移植)**:
+
+- 新規 `server/stream_asm.rs`: `StreamAssembler` が detok 済み delta piece を受け取り、`<tool_call>` block の境界検出をしながら Anthropic 形式 SSE イベント列 (text block / tool_use block の start/delta/stop) を組み立てる。Stream ジョブごとに 1 個
+- **block 単位の確定のみ tool_use 化**: OPEN〜CLOSE 間が揃った時点で `parse_tool_call_inner` でパースし、成功なら tool_use block (content_block_start → input_json_delta → content_block_stop を即時完結)・失敗なら block 全体をテキストへ (非ストリーミングの「パース失敗 block はテキストとして残す」と同一)。OPEN/CLOSE が delta 境界で分割されても `scan` バッファで追跡し、`scan` 末尾が OPEN 接頭辞の可能性がなくなるまで確定テキストとしては出力しない (分割到着する OPEN の先頭部分を誤出力しない)
+- **trim 規約も非ストリーミングと一致**: 先頭の空白は非空白を 1 つも出力するまで除去・末尾の空白は「block 後に室内空白になるか最後で削られるか未確定」のため hold し finish で削る → 任意の delta 分割で `extract_tool_calls(全文)` の残テキストと一致 (unit テストで全分割幅/全バイト境界を検証)
+- 未完結 (CLOSE 無し) block は finish 時にテキスト化 (非ストリーミングの「未完結は block とみなさない」と同一)。tool_use block を 1 つでも出した場合 `finish_run` の message_delta stop_reason は `"tool_use"` (非ストリーミング `message_json` と同一規則)
+
+**配線 (server)**:
+
+- `scheduler.rs`: `Run` に `asm: Option<StreamAssembler>`。decode ステップでアセンブラを Run から取り出し delta コールバックへ渡し (コールバックは `Box<dyn FnMut>` で `&mut StreamAssembler` を捕まえる)、ステップ完了後に Run へ戻す。`finish_run` はアセンブラの残りイベント (末尾テキスト flush + open block の close) を送出してから message_delta
+- `lib.rs`: tools+stream の 400 拒否を撤去し `submit_stream` へ `tools_for_prompt`/`tool_constraint` を渡す (第21〜26セッションの拘束デコードが streaming 経路でも有効化。a16b203 で `Job::Stream` に追加済みの引数の配線)
+- `engine.rs`: `step_chat_batch` の `on_deltas` を `Box<dyn FnMut(&str) + '_>` に変更 (scheduler が Run から取り出したアセンブラへの短命借用をクロージャに捕ませるため。`Box<dyn FnMut>` 単体は既定で 'static 要求)。`testutil.rs`: TOOL_VOCAB に `</function>` (32) を追加し E2E 用スクリプトを完全な XML block に拡張
+
+**テスト (server lib 25 = 15 + stream_asm 10 / workspace 215 = 旧 205 + 10)**:
+
+- `stream_asm.rs` 単体 10 件: テキストのみ / テキスト+block の任意分割 (chunk 1〜100) で `extract_tool_calls` と同一テキスト・block のみ (空 text block 0 を閉じて tool block は index 1)・パース失敗 block のテキスト化・OPEN/CLOSE を全バイト境界で分割しても検出・部分 OPEN 接頭辞 (`<` 等) の hold・未完結 block の finish 時テキスト化・複数 block の index 昇順と text block 再オープン・block 前の空白のみ領域は delta 無し・前後空白の室内空白化
+- 統合テスト `tests/tools.rs`: `tools_with_stream_is_rejected` (400 拒否) を `tools_with_stream_is_accepted` (SSE 完整性: 全イベント種別の event: 行・tool block 無し時は tool_use を含まない・delta 結合 = greedy 期待値・stop_reason) に置換
+- `cargo test --workspace` **215 passed / 0 failed** (engine lib 169 変更無し)・`cargo check --features cuda --lib` 通過 — 警告 12 本は **HEAD と同一内容** (engine.rs のシグネチャ変更で新規警告ゼロ)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -909,7 +932,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] ~~**C2: docs/HISTORY.ja.md+en.md に P19 を追記**~~ → **完了**(`31790f9`・P17 文書の環境固有名汎化 `3a42252`)
 - [ ] **C3: dev サーバー(8090)の P19 バイナリ化**: 現在 P17i 時点。engine.rs の is_recurrent は non-recurrent で no-op なので安全
 - [ ] **GitHub push自動化**: deploy key登録後にコンテナから直接push
-- [x] ~~tool use(Anthropic APIのtoolsパラメータ対応)~~ → **完了 (2026-10-16)**: §3「tool use 対応」節参照。~~`any`/`tool` の拘束デコード~~ → **完了 (2026-10-16)**: §3「tool_choice 拘束デコード」節参照。streaming の tool_use 対応は将来課題
+- [x] ~~tool use(Anthropic APIのtoolsパラメータ対応)~~ → **完了 (2026-10-16)**: §3「tool use 対応」節参照。~~`any`/`tool` の拘束デコード~~ → **完了 (2026-10-16)**: §3「tool_choice 拘束デコード」節参照。~~streaming の tool_use 対応~~ → **完了 (2026-10-16)**: §3「streaming tool_use 対応」節参照
 - [ ] Llama系バリアント(GQA無しモデル、RoPEスケーリング)
 - [ ] **他ファミリー対応**: DeepSeekシリーズ(MoE+共有エキスパート)、GLMシリーズ、gpt-oss(attention sink+sliding window+MXFP4)。GGUF 経路(P19)により入口が拡大
 - [ ] **各モデル独自機構の可視化**: MoEルーティング、MLA潜在圧縮KV、attention sink、sliding window帯パターン、thinkingモード

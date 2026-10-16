@@ -118,6 +118,7 @@ pub const TOOL_VOCAB: &[(&str, u32)] = &[
     ("天", 29),
     ("気", 30),
     ("天気", 31),
+    ("</function>", 32), // 第27: 完全な tool_call block (XML 閉じタグ) 用
 ];
 
 /// tool use E2E テスト用トークナイザ (ByteLevel decoder + TOOL_VOCAB)。
