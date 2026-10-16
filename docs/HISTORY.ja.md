@@ -928,6 +928,34 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - GPU 再ビルド不要 (修正は scheduler.rs のみ・PTX 無関係・数値経路無変更)
 - 抜本対策候補 (次タスク): qwen35 prefill full attention の GPU 化 (`chain_attention_prefill` 流用を検討) or prefill 分割。GPU_BROKEN ラッチの時間経過リセットは設計判断が必要 (再試行で prefill 全体のやり直しが 2 重化するトレードオフ)
 
+### クライアント切断検知と生成 abort (SSE ストリーム) ✅ (2026-10-16)
+
+> オペレーター確定タスク (第38セッション)。8095 でデスクトップ側が接続を放棄 (aborted/timeout) してもサーバーが生成を継続し (実測 13 分超・単一ワーカーのため後続リクエストが全て列待ち)、「ずっと返ってこない」の主因の一つになっていた。SSE ストリームに限りクライアント切断を検知して該当 Run の生成を打ち切るようにした (数値経路・engine のサンプリング/decode 計算には触れない)。
+
+**検知経路**: SSE ストリームの応答ボディは `ReceiverStream` (events チャネルの受信側) で、クライアントが接続を切ると hyper が SSE イベント / keep-alive ping (2秒間隔) の**書き込み時に** broken pipe / connection reset を検知してボディを drop する → チャネルの Receiver が全て消え `Sender::is_closed()` が true になる。ワーカーはこの閉鎖をステップ境界ごとに確認する。既存実装は delta コールバック内の送信失敗を握り潰しており (`let _ = blocking_send`)、delta を 1 つも送らない状態 (prefill 実行中・待ち行列中) では切断を永久に検知できなかった。
+
+**実装 (scheduler.rs)**:
+
+- `Run::client_gone()`: events チャネルの閉鎖判定 (Stream ジョブのみ。Job::Chat は None → 常に false)
+- 切断スイープ: ワーカーは decode / prefill の**各ステップ境界**で全 active Run の閉鎖を確認し、該当 Run を active から除去 + `release_session` (KV スロット解放) + ログ 1 行 (`client disconnected; generation aborted`) で打ち切る。待ち行列 pull 直後〜prefill 前の切断も拾うため、切断済みクライアントの分の無駄な prefill を実行しない
+- decode ステップ後の判定: `step_chat_batch` の完了処理と同じ後ろからの除去パスで、完了 (`done`) 以外にチャネル閉鎖を確認して abort (通常完了と同一の除去経路なので他 Run / engine の KV・Scratch 状態への影響は無い)
+- pull 経路の共通化 (`admit_job`): 2 箇所に重複していた admit + エラー処理を関数化し、admit 失敗時 (SSE プリアンブル送信が broken pipe で失敗等) にチャネル閉鎖があればエラー (`tracing::error!`) ではなく打ち切り (info 1 行) として記録
+
+**対応範囲と限界**:
+
+- **非ストリーム (Job::Chat) は対象外**: リクエストボディ読み込み後、hyper はレスポンス送信まで接続状態を観測する機会が無く (読みも書きも発生しない)、ハンドラ/ワーカー側から切断を知る手段が無い。応答ヘッダの先行送信や空白キープアライブ等の検知策はあるが、全クライアントに影響するワイヤ形式の変更 (chunked 化・JSON 前置空白) になるため見送った (REPORT_NEXT14.md に将来案として記録)
+- **abort はステップ境界単位**: 1 forward の途中 (数千トークンの O(n²) prefill 等) では打ち切れず、その forward 完了後に効く。decode は 1 トークン/ステップなので実用上即時
+- 打ち切った Run の KV スロットは即座に解放され、後続リクエストの列待ちが解消する
+
+**テスト**: 新規 `server/tests/client_disconnect.rs` 4 件 (実 TCP ソケットで切断を再現・EOS 無し+forward 毎 sleep のモデルで「切断しなければ完了しない生成」を作る):
+
+- 生成中 (最初の delta 受信後) の切断 → in_flight が 5 秒以内に 0 に戻り、後続の非ストリーム リクエストが即座に完走 (**修正前コードでは FAIL** — 生成完了まで 1 のまま)
+- 最初のトークン前 (message_start 受信後) の切断 → 同様に打ち切り (**修正前コードでは FAIL**)
+- 受信側を先に drop したジョブ (Scheduler 直操作・HTTP 経路無し) → pull/admit 時点で打ち切られ、通常ジョブが完走
+- 正常系: 接続を維持した SSE リクエストは最後まで完了 (誤 abort 無し・delta 結合は非空)
+
+`cargo test --workspace` **220 passed / 0 failed** (旧 216 + 4)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -956,6 +984,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [ ] **C3: dev サーバー(8090)の P19 バイナリ化**: 現在 P17i 時点。engine.rs の is_recurrent は non-recurrent で no-op なので安全
 - [ ] **GitHub push自動化**: deploy key登録後にコンテナから直接push
 - [x] ~~tool use(Anthropic APIのtoolsパラメータ対応)~~ → **完了 (2026-10-16)**: §3「tool use 対応」節参照。~~`any`/`tool` の拘束デコード~~ → **完了 (2026-10-16)**: §3「tool_choice 拘束デコード」節参照。~~streaming の tool_use 対応~~ → **完了 (2026-10-16)**: §3「streaming tool_use 対応」節参照
+- [x] **クライアント切断検知 (SSE ストリームの生成打ち切り)** → **完了 (2026-10-16)**: §3「クライアント切断検知と生成 abort」節参照。非ストリームは検知経路が無く対象外
 - [ ] Llama系バリアント(GQA無しモデル、RoPEスケーリング)
 - [ ] **他ファミリー対応**: DeepSeekシリーズ(MoE+共有エキスパート)、GLMシリーズ、gpt-oss(attention sink+sliding window+MXFP4)。GGUF 経路(P19)により入口が拡大
 - [ ] **各モデル独自機構の可視化**: MoEルーティング、MLA潜在圧縮KV、attention sink、sliding window帯パターン、thinkingモード

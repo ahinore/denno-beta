@@ -928,6 +928,34 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - No GPU rebuild needed (the fix touches only scheduler.rs; unrelated to PTX; numeric paths unchanged)
 - Root-cause candidates for a follow-up task: GPU-offloading qwen35 prefill full attention (consider reusing `chain_attention_prefill`) or prefill chunking. Time-based reset of the GPU_BROKEN latch needs a design decision (retrying doubles full-prefill work on persistent errors)
 
+### Client-disconnect detection and generation abort (SSE streaming) ✅ (2026-10-16)
+
+> Confirmed operator task (session 38). On the hardware box, when the desktop client abandoned the connection (aborted/timeout), the server kept generating (observed 13+ minutes; with the single worker, every subsequent request queued up) — one of the main causes of "never comes back". The server now detects client disconnects for SSE streaming and aborts the corresponding Run (no change to the numeric path or the engine's sampling/decode computation).
+
+**Detection path**: the SSE response body is a `ReceiverStream` (the receiving side of the events channel). When the client drops the connection, hyper detects broken pipe / connection reset **on write** (SSE events / keep-alive pings every 2s) and drops the body → all channel receivers disappear and `Sender::is_closed()` turns true. The worker checks for this closure at every step boundary. The previous implementation swallowed send failures inside the delta callback (`let _ = blocking_send`), and while nothing was being sent (during prefill or while queued) a disconnect could never be noticed.
+
+**Implementation (scheduler.rs)**:
+
+- `Run::client_gone()`: closure check of the events channel (Stream jobs only; Job::Chat is None → always false)
+- Disconnect sweep: at **every decode / prefill step boundary** the worker checks all active Runs, and for a closed one removes it from active + `release_session` (KV slot freed) + a single log line (`client disconnected; generation aborted`). Disconnects between queue pull and the first prefill are also caught, so no wasted prefill is run for a gone client
+- Post-decode-step check: in the same back-to-front removal pass used for completion, a closed channel aborts the Run (same removal path as normal completion, so no impact on other Runs or on engine KV/Scratch state)
+- Pull-path consolidation (`admit_job`): the duplicated admit + error handling at the two pull sites is now one function; when admit fails (e.g. the SSE preamble write hits a broken pipe) and the channel is closed, it is recorded as an abort (one info line) instead of an error (`tracing::error!`)
+
+**Scope and limits**:
+
+- **Non-streaming (Job::Chat) is out of scope**: after the request body is read, hyper has no opportunity to observe the connection state until the response is written (neither reads nor writes happen), so the handler/worker cannot learn of the disconnect. Detection tricks exist (sending response headers early, whitespace keep-alives), but they change the wire format for all clients (chunked encoding, leading whitespace in JSON) and were declined (recorded as a future option in REPORT_NEXT14.md)
+- **Aborts happen at step boundaries**: an in-flight forward (e.g. an O(n²) prefill of several thousand tokens) cannot be cut mid-way; the abort takes effect once that forward finishes. Decode is one token per step, so in practice it is immediate
+- The aborted Run's KV slot is freed immediately, clearing the queue wait for subsequent requests
+
+**Tests**: new `server/tests/client_disconnect.rs`, 4 cases (disconnect reproduced over a real TCP socket; a no-EOS model that sleeps per forward creates a "generation that never finishes unless disconnected"):
+
+- Disconnect mid-generation (after the first delta) → in_flight returns to 0 within 5s and a subsequent non-streaming request completes immediately (**FAILS on the pre-fix code** — stayed 1 until generation finished)
+- Disconnect before the first token (after message_start) → likewise aborted (**FAILS on the pre-fix code**)
+- Job whose receiver is dropped first (direct Scheduler use, no HTTP) → aborted at pull/admit; a normal job then completes
+- Healthy path: an SSE request that keeps the connection open runs to completion (no false abort; concatenated deltas are non-empty)
+
+`cargo test --workspace` **220 passed / 0 failed** (was 216 + 4)·`cargo check --features cuda --lib` passes (all 12 warnings identical to HEAD, no new warnings)
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
@@ -956,6 +984,7 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - [ ] **C3: P19 binary for the dev server (8090)**: currently at P17i. engine.rs's is_recurrent is a no-op for non-recurrent models, so safe
 - [ ] **GitHub push automation**: register a deploy key to push directly from the container
 - [x] ~~tool use (Anthropic API tools parameter support)~~ → **done (2026-10-16)**: see the §3 "tool use support" section. ~~Constrained decoding for `any`/`tool`~~ → **done (2026-10-16)**: see the §3 "tool_choice constrained decoding" section. ~~Streaming tool_use~~ → **done (2026-10-16)**: see the §3 "streaming tool_use support" section
+- [x] **Client-disconnect detection (abort streaming generation)** → **done (2026-10-16)**: see the §3 "Client-disconnect detection and generation abort" section. Non-streaming requests are out of scope (no detection path exists)
 - [ ] Llama-family variants (models without GQA, RoPE scaling)
 - [ ] **Other families**: DeepSeek series (MoE + shared experts), GLM series, gpt-oss (attention sink + sliding window + MXFP4). The GGUF route (P19) widens the entry point
 - [ ] **Per-model mechanism visualization**: MoE routing, MLA latent-compressed KV, attention sink, sliding-window band patterns, thinking mode
