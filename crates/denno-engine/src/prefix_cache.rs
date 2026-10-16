@@ -147,6 +147,10 @@ impl PrefixCache {
     ///
     /// GDN 状態スナップショットはエントリの prompt 境界位置でしか取得していない
     /// ため、再帰モデルの復元は「エントリ prompt 全長との一致」が必須。
+    /// 完全一致候補が複数ある場合は**最長のもの**を返す (s46: エントリは
+    /// generation prompt 前までの「base」で保存されるため、マルチターン会話では
+    /// turn1..turnN の base がすべて完全一致候補になる。最長を選ばないと
+    /// turn_{n} の継続で turn_1 の base が復元され、再計算が減らない)。
     /// 戻り値の lcp は `entry.prompt.len()` そのものになる。
     pub fn best_full_match(&self, prompt: &[u32]) -> Option<(usize, usize)> {
         let mut best: Option<(usize, usize)> = None;
@@ -154,8 +158,12 @@ impl PrefixCache {
             if e.prompt.is_empty() || e.lcp_with(prompt) != e.prompt.len() {
                 continue;
             }
-            // 完全一致候補が複数あれば最も最近使われた方 (走査順で先に見つかった方)
-            if best.is_none() {
+            // 完全一致候補のうち最長のもの (同長は走査順で先に見つかった方)
+            let better = match best {
+                None => true,
+                Some((_, bl)) => e.prompt.len() > bl,
+            };
+            if better {
                 best = Some((i, e.prompt.len()));
             }
         }
@@ -335,6 +343,30 @@ mod tests {
         assert!(pc.best_match(&[1, 2, 4]).is_some());
         // 同一 prompt も完全一致
         assert!(pc.best_full_match(&[1, 2, 3]).is_some());
+    }
+
+    /// s46: 完全一致候補が複数ある場合は最長のものを選ぶ。
+    /// (base エントリ化により、マルチターン会話では turn1..turnN の base が
+    /// すべて完全一致候補になる。最長を選ばないと turn_{n} の継続で turn_1 の
+    /// base が復元され、再計算が減らない)
+    #[test]
+    fn best_full_match_picks_longest_full_match() {
+        let mut pc = pc(100);
+        pc.insert(vec![1, 2], &cache_with(2), 2); // turn1 の base
+        pc.insert(vec![1, 2, 3, 4], &cache_with(4), 4); // turn2 の base (turn1 base を完全に含む)
+
+        // どちらのエントリも prompt を完全に含む → 最長 (4) が選ばれる
+        let (i, lcp) = pc.best_full_match(&[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(i, 1);
+        assert_eq!(lcp, 4);
+
+        // 短い方しか完全に含まない場合は短い方が選ばれる
+        let (i, lcp) = pc.best_full_match(&[1, 2, 8, 8]).unwrap();
+        assert_eq!(i, 0);
+        assert_eq!(lcp, 2);
+
+        // 完全一致候補が無い場合
+        assert!(pc.best_full_match(&[1, 9, 9]).is_none());
     }
 
     #[test]

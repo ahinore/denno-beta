@@ -1065,6 +1065,34 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 `cargo test --workspace` **237 passed / 0 failed** (旧 231 + 6)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)
 
+### recurrent モデルで prefix cache が 1 度もヒットしない問題の修正 — generation prompt 境界の split prefill + base エントリ復元 (s46) ✅ (2026-10-17)
+
+> 第46セッション。A4 (2026-10-15) で導入した recurrent モデル向け prefix cache (KV+GDN ペア復元) が、実モデル (Qwen3.5) では 1 度もヒットしない問題の根因を確定して修正した。数値経路は「prefill を 2 forward に分割しても bit 一致」という契約の追加のみで、演算・サンプリングの内容は無変更 (CPU 参照 md5 や既存アンカーが前提とする経路は不変)。
+
+**根因 — chat template の generation prompt が prompt 全体を次ターンのトークン接頭辞にしない**:
+
+- chat template は毎回 prompt を generation prompt で終える (Qwen3.5: `<|im_start|>assistant\n\n\n` → トークン列末尾に `<think>`)。次ターンの描画ではこの部分が assistant メッセージ本文に**置き換わる**ため、turn_{n+1} の prompt は turn_n の prompt をトークン接頭辞として含まない (実 9B で確認: turn2 の prompt は turn1 の末尾 2 トークン `<think>\n` で分岐する)
+- A4 のエントリは prompt 全体をキーにしており `best_full_match` (完全一致要求) は永遠に成立せず、Live ヒット (同スロット連続で prompt が伸びる場合) も template 描画では起こらない → recurrent モデルは常に full prefill となり、prefix cache が実質無効だった (REPORT_NEXT19 実機観察の説明)
+
+**修正 (A5)**:
+
+- `tokenizer.rs`: `apply_chat_template_base()` 新設 — `add_generation_prompt: false` で描画した「base」(generation prompt 直前まで = 次ターンの prompt にそのまま現れる履歴部分) を返す。テンプレート未搭載/描画失敗/空出力は Err → 呼び出し側は境界不明 = 従来経路にフォールバック (fallback テンプレートは generation prompt 込みの単一形状のため base を作れない)。`apply_chat_template` は描画実体 `render_chat_template(add_gen_prompt)` への薄いラッパに整理 (動作不変)
+- `engine.rs`: `ChatSession` に `gen_prompt_start` を追加 — **recurrent モデルのみ**・base が実際に prompt のトークン接頭辞になった場合だけ検出 (`prompt_ids.starts_with(base_ids)`・base 非空/短縮チェック込み)。非 recurrent・fallback テンプレート・接頭辞にならなかった場合は None = 完全に従来経路
+- `engine.rs` (`step_chat` prefill): split 経路 — generation prompt 境界 `b` が検出できた場合のみ prefill を `[base 部分][generation prompt]` の 2 forward に分割し、base 境界で KV+GDN スナップショットを prefix store へ退避する (prompt 全体のエントリは作らない = ヒットしないエントリを溜めない)。エントリ復元で lcp が既に b の場合は base 部の forward を skip し generation prompt 部のみ計算。`forward(a) + forward(b)` は `forward(a++b)` と bit 一致 (GEMM は行独立の i32 累積・GDN/attention はトークン逐次 = 分割で蓄積順が変わらない)
+- `prefix_cache.rs`: `best_full_match` は完全一致候補が複数あるとき**最長**を選ぶ (マルチターンでは turn1..turnN の base がすべて完全一致候補になる。最長を選ばないと turn_n の継続で turn_1 の base が復元され再計算が減らない。同長のときは従来どおり走査順先頭)
+
+**テスト** (新規 5 件 + 実モデル 1 件):
+
+- `testutil.rs` に Qwen3.5 風 chat template (ChatML + `<|im_start|>assistant\n\n\n` 末尾・次ターンで assistant 本文に置換される構造 = 実モデルと同一) を持つテスト用エンジンを追加
+- `engine.rs` 3 件: `recurrent_qwen_style_template_hits_entry_on_multiturn` (turn1→2→3 で PrefixHit::Entry・出力は各ターン独立エンジンの full prefill と完全一致・turn3 は複数完全一致候補のうち最長 (turn2 base) が選ばれることも検証)・`recurrent_qwen_style_template_identical_resend_hits_entry` (同一 messages 再実行も base 復元でヒットし出力不変)・`recurrent_qwen_style_template_partial_prefix_still_falls_back` (LCP が base に満たない部分一致は従来どおり full prefill フォールバック)
+- `prefix_cache.rs` 1 件: `best_full_match_picks_longest_full_match` (最長完全一致の選択・短い方しか含まない場合・候補無し)
+- `qwen35.rs` 1 件: `qwen38_27b_shape_split_prefill_bit_exact` (合成 27B 形状で分割 prefill == 単一 forward を 4 面で bit 検証: logits・base 境界の KV 行 (単一 forward の先頭 base.len() 行と一致 = prefix store 退避内容の正当性)・分割完了後の GDN 状態 (同一位置)・継続 decode)
+- `tests/exactness.rs` 1 件 (#[ignore]・実 9B): `qwen35_9b_multiturn_prefix_cache_exact` — 3 ターン会話が turn2/turn3 で PrefixHit::Entry (entries 1→2→3) となり、各ターンの出力が「同一ターンをコールド full prefill で計算した場合」と完全一致 (参照は逆順実行 turn3→turn2→turn1 で取得 — 順方向だと参照側もキャッシュにヒットするため。各参照実行で PrefixHit::None をアサートし参照が真の full prefill であることを担保)
+
+**期待効果**: recurrent モデル (Qwen3.5) のマルチターン会話で、ターンごとの prefill が「履歴全体の再計算」から「base 復元 + 新規ターン部分の差分計算」になる — 長い system+tools と長い履歴を持つ運用で prefill 時間が履歴長に比例して削減される。実 9B E2E (コンテナ CPU・int8・seed 42・3 ターン) で Entry ヒットと出力完全一致を確認済み。実機 GPU での効果計測は人間対応
+
+`cargo test --workspace` **242 passed / 0 failed** (旧 237 + 5)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)・push は人間対応
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -1074,7 +1102,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] **A2: Qwen3.5-9B 実 E2E — 完了**(commit `9183e7e`): GDN k-head 規約修正+untied lm_head 修正で garble 解決。fp32 全 32 層 numpy 一致・逐次==バッチ prefill bit 一致・int8 GPU E2E 決定論 md5 一致(連続+再起動)
 - [x] ~~**A3: Qwen3.8-27B スケール**~~ → **完了 (コード/予算面・2026-10-15)**: 64 層 = 48 GDN + 16 full を合成モデルで検証 (決定論・prefill bit 一致契約・untied lm_head)・`output_gate_type: "swish"` は参照実装が不使用のため動作不変・GDN 層の KV バッファ確保廃止で KV 実量 1/4 (512KB → 128KB B/token)・GDN ヘッド比のロード時ガード。実 GGUF の起動+E2E は完了 (2026-10-16・§3 27B 節): UD-IQ2_XXS は IQ1_M 未対応で不可 → 均一 Q4_0 でロード+GPU E2E 成功 (決定論 md5 一致)・ただし出力品質問題 (greedy 破綻) が未解明で実用化は継続調査
 - [x] ~~**A2.5: 9B 生成品質の改善(A3 前に推奨)**~~ → **完了**: チャットテンプレートは Qwen3.5 公式準拠を確認(不一致なし)・repetition penalty 実装(HF 互換・決定論・penalty 1.1 で反復解消)。根本の数値原因の切り分け(llama.cpp 同 GGUF 比較)は継続
-- [x] ~~**A4: prefix cache への GDN 状態スナップショット**(任意): recurrent モデルはフル prefill 固定(正しさ優先)~~ → **完了 (2026-10-15)**: KV + GDN 状態のペア復元 (prompt 境界スナップショット・`best_full_match` のときのみ復元・部分一致と同一 prompt は full prefill フォールバック)。復元後の継続 forward はフル prefill と bit 一致・退避は prefill 直後に変更。実機マルチターン E2E 計測は残課題
+- [x] ~~**A4: prefix cache への GDN 状態スナップショット**(任意): recurrent モデルはフル prefill 固定(正しさ優先)~~ → **完了 (2026-10-15)**: KV + GDN 状態のペア復元 (prompt 境界スナップショット・`best_full_match` のときのみ復元・部分一致と同一 prompt は full prefill フォールバック)。復元後の継続 forward はフル prefill と bit 一致・退避は prefill 直後に変更。**s46 で根因修正**: 実モデルの chat template では prompt 全体が次ターンのトークン接頭辞にならず `best_full_match` が不発だった → generation prompt 境界の split prefill + base エントリ復元で解消 (§3 s46 節参照・実 9B E2E で Entry ヒットと出力完全一致を確認)。実機での効果計測は残課題
 - [x] ~~**8095 GPU E2E リグレッションの解明**~~ → **説明確定 (2026-10-15 第3セッション)**: 診断パッチ適用 GPU E2E(人間対応)の `[LCHK]` 比較で初発散層 = L00 GDN attn(drift ~4e-7 = 緩和契約内)・H1/H3 は否定。CPU drift 注入実験により「near-tie(90700 "Thinking" vs 8160 "Here"・logit 差 2.03)を微小 drift が 32 層のカオス的増幅で反転する temperature 0 greedy の不安定性」として定量的に説明(§3 参照・GPU カーネル異常の証拠は無し)。**残りは運用対応(人間)**: ①~~元 payload 復元+GPU E2E 再検証~~ → **完了 (第4セッション)**: 新正規 payload で GPU アンカー取得済み(seed 42・int8・HEAD 相当バイナリ・各々連続 2 回完全一致 = GPU 上の決定論確認済み・§3 参照) ②GPU バイナリ清浄再ビルド配備 ③B1/B2 実機計測 ④E2E 回帰判定基準の見直し(GPU 決定論+出力妥当性)⑤GPU LCHK ログの final argmax(8160/90700)確認。新アンカー: CPU `q35_9b_1b.json`→`3a0ddf1c…`・`q35_9b_2b.json`→`95199a33…` / GPU `q35_9b_1b.json`→`1a4ea71a…`・`q35_9b_2b.json`→`b4e58cb3…`
 - [x] ~~**27B 出力品質問題の解明**~~ → **完了 (2026-10-16 第14〜17セッション)**: 根因は **GDN の GQA head mapping** (blocked `h*nk/nv` → タイル repeat `h % nk` に修正・CPU 2 箇所+GPU カーネル 3 箇所)。llama.cpp との層別/substage 比較で初発散 = GDN scan の `o` と特定し strided のみ cos≈1 (9B/27B)・27B CPU E2E で France/日本語とも正答 (早期 `<|im_end|>` 放棄とテンプレート断片ループが解消)・9B も同根因で新ベースライン `feea9444…`/`da0b1f57…` (各連続 2 回一致)。**残りは人間対応**: GPU E2E 再検証+アンカーの正式更新 (旧 GPU アンカー `1a4ea71a…`/`b4e58cb3…` は本修正で変化)。§3「GDN GQA head mapping 修正」節参照。起動は unsloth 均一 Q4_0 前提 (UD-IQ2_XXS は IQ1_M dequant 未対応)
 

@@ -467,6 +467,55 @@ pub fn recurrent_engine(name: &str, seed: Option<u64>) -> Result<Engine> {
     Ok(Engine::from_parts(Box::new(RecurStateModel), tok, name, seed))
 }
 
+/// s46: Qwen3.5 風 chat template 用トークナイザ (WordLevel・whitespace 前処理)。
+/// テンプレートは毎回 prompt を `<|im_start|>assistant\n\n\n` (→ 末尾に
+/// `<think>` トークンが残る) で終えるため、**次ターンの描画は直前 prompt の
+/// トークン接頭辞にならない** (実 Qwen3.5 と同じ prefix 崩れを再現する)。
+/// 語彙: t0..t11=0..11, eos=12, t13..t15=13..15, `<|im_start|>`=16,
+/// `<|im_end|>`=17, user=18, assistant=19, `<think>`=20, [UNK]=21。
+pub const QWEN_STYLE_TOKENIZER_JSON: &str = r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Whitespace"},
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "t0": 0, "t1": 1, "t2": 2, "t3": 3, "t4": 4, "t5": 5, "t6": 6,
+      "t7": 7, "t8": 8, "t9": 9, "t10": 10, "t11": 11, "eos": 12,
+      "t13": 13, "t14": 14, "t15": 15,
+      "<|im_start|>": 16, "<|im_end|>": 17, "user": 18, "assistant": 19,
+      "<think>": 20, "[UNK]": 21
+    },
+    "unk_token": "[UNK]"
+  }
+}"#;
+
+/// Qwen3.5 風 chat template (ChatML + `<think>` 付き generation prompt)。
+/// turn_{n+1} の描画は turn_n の prompt 末尾の generation prompt
+/// (`<|im_start|>assistant\n\n\n` のうち `<think>` トークン) を assistant 本文で
+/// 置き換えるため、トークン接頭辞が崩れる (s46 の根因と同一構造)。
+pub const QWEN_STYLE_TEMPLATE: &str = "{%- for m in messages %}\
+<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n\
+{%- endfor %}\
+{%- if add_generation_prompt %}<|im_start|>assistant\n\n\n{%- endif %}";
+
+/// Qwen3.5 風テンプレートのトークナイザ
+pub fn qwen_style_tokenizer() -> Result<DennoTokenizer> {
+    DennoTokenizer::from_json_str(QWEN_STYLE_TOKENIZER_JSON, Some(QWEN_STYLE_TEMPLATE.into()))
+}
+
+/// RecurStateModel + Qwen3.5 風テンプレートで Engine を構築する
+/// (s46: generation prompt 境界の split prefill + base エントリ復元の検証用)。
+pub fn recurrent_qwen_style_engine(name: &str, seed: Option<u64>) -> Result<Engine> {
+    let tok = qwen_style_tokenizer()?;
+    Ok(Engine::from_parts(Box::new(RecurStateModel), tok, name, seed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

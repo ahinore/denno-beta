@@ -4,6 +4,7 @@
 //! モデルディレクトリは環境変数で上書きできる:
 //!   DENNO_QWEN_DIR  (default: /home/dev/.cache/denno/hub/models--Qwen--Qwen2.5-0.5B-Instruct)
 //!   DENNO_GPT2_DIR  (default: /home/dev/.cache/denno/hub/models--openai-community--gpt2)
+//!   QWEN35_9B_DIR   (qwen35_model.rs と共通・config.json + *.gguf のディレクトリ)
 
 use denno_engine::{ChatMessage, Engine, GenParams, QuantMode};
 use std::path::PathBuf;
@@ -173,5 +174,94 @@ fn qwen3_qknorm_matches_baseline() {
         "<think>\nOkay, the user is asking \"1+1は?\" which translates to \"What is 1+1?\" in English. They want to know the result of adding 1 and ",
         "unexpected output: {}",
         a.text
+    );
+}
+
+/// s46: 実 9B (Qwen3.5・recurrent) マルチターン exact。generation prompt 境界で
+/// prefill を分割して base (generation prompt 直前まで) の KV+GDN スナップショットを
+/// prefix store に退避する経路 (A5) でも、各ターンの出力が「同一ターンをコールド
+/// full prefill で計算した場合」と完全一致し、turn2/turn3 で PrefixHit::Entry
+/// (base 復元) が発生することを確認する。
+///
+/// 参照出力は別エンジンで turn3→turn2→turn1 の**逆順**に実行して得る。順方向だと
+/// turn_{n+1} が turn_n の base エントリにヒットしてしまい参照にならないが、逆順なら
+/// 各ターンの prompt は直前ターンの base エントリと完全一致しないためコールド
+/// full prefill (= スタンドアロン実行と同一計算) になる。各参照実行で
+/// PrefixHit::None をアサートし、参照が本当に full prefill であることを担保する。
+#[test]
+#[ignore]
+fn qwen35_9b_multiturn_prefix_cache_exact() {
+    let Ok(dir) = std::env::var("QWEN35_9B_DIR") else {
+        eprintln!("skip: QWEN35_9B_DIR 未設定");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+
+    fn msgs(turns: &[(&str, &str)]) -> Vec<ChatMessage> {
+        turns
+            .iter()
+            .map(|(role, content)| ChatMessage { role: (*role).into(), content: (*content).into() })
+            .collect()
+    }
+    fn push_assistant(m: &mut Vec<ChatMessage>, text: &str) {
+        m.push(ChatMessage { role: "assistant".into(), content: text.to_string() });
+    }
+    let params = GenParams {
+        max_tokens: 16,
+        temperature: Some(0.0),
+        seed: Some(42),
+        ..Default::default()
+    };
+
+    // ---- 被検側: 順方向マルチターン (prefix cache 有効・split prefill 経路) ----
+    let mut e = Engine::load(&dir, "q35-9b-s46", Some(42), QuantMode::Int8)
+        .expect("9B ロード失敗");
+    let m1 = msgs(&[("user", "日本の首都は?")]);
+    let out1 = e.chat(None, &m1, &params, |_| {}).unwrap();
+    assert_eq!(e.last_prefix_hit(), denno_engine::PrefixHit::None, "turn1 はコールド");
+    assert_eq!(e.prefix_cache_entries(), 1, "turn1 の base エントリが退避される");
+
+    let mut m2 = m1.clone();
+    push_assistant(&mut m2, &out1.text);
+    m2.push(ChatMessage { role: "user".into(), content: "いま答えた都市の人口は?".into() });
+    let out2 = e.chat(None, &m2, &params, |_| {}).unwrap();
+    assert_eq!(
+        e.last_prefix_hit(),
+        denno_engine::PrefixHit::Entry,
+        "turn2 は turn1 base の復元でヒットするべき"
+    );
+    assert_eq!(e.prefix_cache_entries(), 2);
+
+    let mut m3 = m2.clone();
+    push_assistant(&mut m3, &out2.text);
+    m3.push(ChatMessage { role: "user".into(), content: "それを一文でまとめて".into() });
+    let out3 = e.chat(None, &m3, &params, |_| {}).unwrap();
+    assert_eq!(
+        e.last_prefix_hit(),
+        denno_engine::PrefixHit::Entry,
+        "turn3 は最長完全一致 (turn2 base) の復元でヒットするべき"
+    );
+    assert_eq!(e.prefix_cache_entries(), 3);
+
+    // ---- 参照側: 逆順 (turn3→turn2→turn1) で各ターンをコールド full prefill ----
+    let mut r = Engine::load(&dir, "q35-9b-s46-ref", Some(42), QuantMode::Int8)
+        .expect("9B ロード失敗 (参照)");
+    let ref3 = r.chat(None, &m3, &params, |_| {}).unwrap();
+    assert_eq!(r.last_prefix_hit(), denno_engine::PrefixHit::None, "参照 turn3 はコールド");
+    let ref2 = r.chat(None, &m2, &params, |_| {}).unwrap();
+    assert_eq!(r.last_prefix_hit(), denno_engine::PrefixHit::None, "参照 turn2 はコールド");
+    let ref1 = r.chat(None, &m1, &params, |_| {}).unwrap();
+    assert_eq!(r.last_prefix_hit(), denno_engine::PrefixHit::None, "参照 turn1 はコールド");
+
+    // マルチターン (base 復元あり) と単独 full prefill の完全一致
+    assert_eq!(out1.text, ref1.text, "turn1 出力が参照と不一致");
+    assert_eq!(out1.output_tokens, ref1.output_tokens);
+    assert_eq!(out2.text, ref2.text, "turn2 出力 (base 復元後) が参照と不一致");
+    assert_eq!(out2.output_tokens, ref2.output_tokens);
+    assert_eq!(out3.text, ref3.text, "turn3 出力 (base 復元後) が参照と不一致");
+    assert_eq!(out3.output_tokens, ref3.output_tokens);
+    eprintln!(
+        "9B multiturn exact ok: t1={:?} t2={:?} t3={:?}",
+        out1.text, out2.text, out3.text
     );
 }

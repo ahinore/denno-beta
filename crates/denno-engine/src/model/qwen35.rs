@@ -1821,6 +1821,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// s46 (A5): prefill を 2 回の forward に分割しても単一 forward と bit 一致
+    /// (engine が generation prompt 境界で prefill を分割して base 境界の
+    /// KV+GDN スナップショットを退避するための契約)。logits・base 境界までの
+    /// KV 行 (単一 forward の先頭 base.len() 行と一致 = engine が prefix store に
+    /// 退避する内容の正当性)・分割完了後の GDN 状態 (単一 forward と同一位置)
+    /// を比較し、分割後の decode 継続も一致させる。
+    #[test]
+    fn qwen38_27b_shape_split_prefill_bit_exact() {
+        let dir = build_dir("split", true, NK, NV);
+        let mut m = load_int8(&dir);
+        let base = [5u32, 41, 97, 12, 78, 33, 100];
+        let gen = [64u32, 7]; // generation prompt 相当 (base の直後に来る 2 トークン)
+
+        // 単一 forward (base + gen)
+        let mut c1 = m.new_cache();
+        let l1 = m.forward(&base.iter().chain(gen.iter()).copied().collect::<Vec<_>>(), &mut c1).unwrap();
+
+        // 分割 forward: base → (base 境界の KV スナップショット) → gen
+        let mut c2 = m.new_cache();
+        let _ = m.forward(&base, &mut c2).unwrap();
+        let (snap_k, snap_v) = {
+            let kv_len = c2.len();
+            c2.snapshot(kv_len)
+        };
+        let l2 = m.forward(&gen, &mut c2).unwrap();
+        // GDN 状態は分割完了後 (pos = base+gen) で単一 forward と同一位置
+        let snap_gdn = c2.gdn_snapshot();
+
+        assert_eq!(bits(&l1), bits(&l2), "分割 prefill の logits が単一 forward と不一致");
+        // base 境界の KV スナップショット = 単一 forward の先頭 base.len() 行と一致
+        // (GDN 層は両側空ベクタなので自明に一致)
+        let kv_len = c1.len();
+        let (k1, v1) = c1.snapshot(kv_len);
+        for (li, (a, b)) in snap_k.iter().zip(k1.iter()).enumerate() {
+            assert_eq!(a[..], b[..a.len()], "層 {li} の K 行 (base 境界まで) が不一致");
+        }
+        for (li, (a, b)) in snap_v.iter().zip(v1.iter()).enumerate() {
+            assert_eq!(a[..], b[..a.len()], "層 {li} の V 行 (base 境界まで) が不一致");
+        }
+        // GDN 状態 (分割完了後 pos = base+gen vs 単一 forward 同一位置):
+        // トークン逐次なので分割で状態遷移列は不変
+        let g1 = c1.gdn_snapshot();
+        for (li, (a, b)) in snap_gdn.iter().zip(g1.iter()).enumerate() {
+            match (a, b) {
+                (None, None) => {}
+                (Some((ac, as_)), Some((bc, bs))) => {
+                    assert_eq!(ac, bc, "層 {li} の conv 状態が不一致");
+                    assert_eq!(as_, bs, "層 {li} の ssm 状態が不一致");
+                }
+                _ => panic!("層 {li} の GDN スロット有無が不一致"),
+            }
+        }
+        // 分割経路の直後 decode も単一経路と bit 一致
+        let d1 = m.forward(&[9u32], &mut c1).unwrap();
+        let d2 = m.forward(&[9u32], &mut c2).unwrap();
+        assert_eq!(bits(&d1), bits(&d2), "分割後の decode 継続が不一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// s42 (Plan B): CPU prefill の rayon 並列化 (full attention attend の (i, head)
     /// 並列・rmsnorm/swiglu/残差の行並列・matmul_bt_i8 の j ブロック並列) が
     /// rayon スレッド数に依存しないこと (bits 完全一致)。par_* は pool.install()
