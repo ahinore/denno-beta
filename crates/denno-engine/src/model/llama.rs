@@ -587,6 +587,7 @@ impl LlamaQwen2 {
                     dh,
                     kv_heads * dh,
                     1.0 / (dh as f32).sqrt(),
+                    cache.epoch(),
                 )
             })?;
             // --- o_proj (デバイス常駐 → CH_O) ---
@@ -823,6 +824,7 @@ impl Model for LlamaQwen2 {
                         dh,
                         kv_dim,
                         scale,
+                        cache.epoch(),
                     )
                     .is_some()
                     {
