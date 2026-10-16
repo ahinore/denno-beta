@@ -600,11 +600,14 @@ impl Engine {
         messages: &[ChatMessage],
         params: &GenParams,
     ) -> Result<ChatSession> {
-        self.begin_chat_with_tools(system, messages, params, None, None)
+        self.begin_chat_with_tools(system, messages, params, None, None, None)
     }
 
     /// tools 付きの begin_chat。`tools` は chat template の `tools` 変数へ
     /// そのまま渡される (None = tools 無し。従来経路と完全同一)。
+    /// `enable_thinking` (s47) は chat template の `enable_thinking` 変数として
+    /// 渡すか否か (None = 変数無し = 従来経路と同一。Some(false) = thinking off。
+    /// 描画に使うテンプレートが無い場合は反映されない)。
     /// `constraint` (第21) は tool_choice any/Named の拘束デコード。
     /// None なら無マスク (auto / tools 無し経路とビット同一)。
     pub fn begin_chat_with_tools(
@@ -614,8 +617,9 @@ impl Engine {
         params: &GenParams,
         tools: Option<&serde_json::Value>,
         constraint: Option<&crate::toolmask::ToolConstraint>,
+        enable_thinking: Option<bool>,
     ) -> Result<ChatSession> {
-        let prompt = self.tok.apply_chat_template(system, messages, tools)?;
+        let prompt = self.tok.apply_chat_template(system, messages, tools, enable_thinking)?;
         let prompt_ids = self.tok.encode(&prompt)?;
 
         // A5/s46: 末尾 generation prompt のトークン境界を検出する (recurrent
@@ -632,7 +636,7 @@ impl Engine {
         // (step_chat の split 経路参照)。
         let gen_prompt_start = if self.model.is_recurrent() {
             self.tok
-                .apply_chat_template_base(system, messages, tools)
+                .apply_chat_template_base(system, messages, tools, enable_thinking)
                 .ok()
                 .and_then(|base| self.tok.encode(&base).ok())
                 .filter(|base_ids| {
@@ -1135,7 +1139,10 @@ fn pick_caches<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{dummy_engine, recurrent_engine, recurrent_qwen_style_engine, DUMMY_CONTEXT};
+    use crate::testutil::{
+        dummy_engine, recurrent_engine, recurrent_qwen_style_engine, thinking_sim_engine,
+        DUMMY_CONTEXT,
+    };
 
     fn params(max_tokens: usize) -> GenParams {
         GenParams {
@@ -1191,7 +1198,7 @@ mod tests {
         // スロット 0 の cached_prompt にプロンプト全体が入っている
         let prompt = e
             .tok
-            .apply_chat_template(None, &msgs("t0"), None)
+            .apply_chat_template(None, &msgs("t0"), None, None)
             .unwrap();
         let prompt_ids = e.tok.encode(&prompt).unwrap();
         assert_eq!(e.cached_prompts[0], prompt_ids);
@@ -1391,11 +1398,11 @@ mod tests {
         // base エントリ (長さ < prompt 全長) のみ
         let turn1_full = e
             .tok
-            .encode(&e.tok.apply_chat_template(None, &msgs("t0"), None).unwrap())
+            .encode(&e.tok.apply_chat_template(None, &msgs("t0"), None, None).unwrap())
             .unwrap();
         let turn1_base = e
             .tok
-            .encode(&e.tok.apply_chat_template_base(None, &msgs("t0"), None).unwrap())
+            .encode(&e.tok.apply_chat_template_base(None, &msgs("t0"), None, None).unwrap())
             .unwrap();
         assert!(turn1_full.starts_with(&turn1_base), "base 描画がトークン接頭辞");
         assert!(turn1_base.len() < turn1_full.len(), "generation prompt で末尾が伸びる");
@@ -1429,15 +1436,15 @@ mod tests {
         ]);
         let turn3_full = e
             .tok
-            .encode(&e.tok.apply_chat_template(None, &m3, None).unwrap())
+            .encode(&e.tok.apply_chat_template(None, &m3, None, None).unwrap())
             .unwrap();
         let turn2_full = e
             .tok
-            .encode(&e.tok.apply_chat_template(None, &m2, None).unwrap())
+            .encode(&e.tok.apply_chat_template(None, &m2, None, None).unwrap())
             .unwrap();
         let turn2_base = e
             .tok
-            .encode(&e.tok.apply_chat_template_base(None, &m2, None).unwrap())
+            .encode(&e.tok.apply_chat_template_base(None, &m2, None, None).unwrap())
             .unwrap();
         assert!(turn3_full.starts_with(&turn2_full[..turn2_base.len()]), "turn2 base は turn3 の接頭辞");
         let (_, pick_len) = e
@@ -1482,6 +1489,99 @@ mod tests {
         let out = e.chat(None, &msgs("t1"), &params(3), |_| {}).unwrap();
         assert_eq!(e.last_prefix_hit(), PrefixHit::None);
         assert_eq!(out, expect);
+    }
+
+    // ---------- s47: thinking 制御 ----------
+
+    /// thinking=off を engine 経路 (begin_chat_with_tools) で回すヘルパ。
+    fn run_chat_with_thinking(
+        e: &mut Engine,
+        messages: &[ChatMessage],
+        max_tokens: usize,
+        enable_thinking: Option<bool>,
+    ) -> ChatOutput {
+        let mut sess = e
+            .begin_chat_with_tools(None, messages, &params(max_tokens), None, None, enable_thinking)
+            .unwrap();
+        e.install_session(&mut sess).unwrap();
+        while !e.step_chat(&mut sess, &mut |_| {}).unwrap() {}
+        e.release_session(&mut sess);
+        sess.into_output()
+    }
+
+    /// s47: thinking=off (enable_thinking=Some(false)) は generation prompt を
+    /// 実 Qwen3.5 と同じ空の think block に変える。従来経路 (None/Some(true)) の
+    /// generation prompt は assistant (19) で終わる (開いた think block = 思考開始待ち)。
+    /// off (Some(false)) は `<think>` (20) と `</think>` (22) を追加する (実 Qwen3.5 と
+    /// 同一の「think 終了タグの直前が改行3つ」構造 = `assistant\n` + `<think>` + `\n\n\n` +
+    /// `</think>`。2 タグは added_tokens 登録済みで単一トークン化・間/後続の改行は
+    /// Whitespace 前処理で落ちる = prompt は 2 トークン伸びて off = full + [20, 22])。
+    #[test]
+    fn thinking_off_renders_empty_think_block_in_generation_prompt() {
+        let e = recurrent_qwen_style_engine("qwen-style", None).unwrap();
+        let m = msgs("t0");
+
+        // 従来経路 (None = 変数無し): assistant (19) で終わる (開いた think block)
+        let ids_full = e
+            .tok
+            .encode(&e.tok.apply_chat_template(None, &m, None, None).unwrap())
+            .unwrap();
+        assert_eq!(ids_full.last().copied(), Some(19));
+        assert!(!ids_full.contains(&22), "従来経路に空 think block は現れない");
+
+        // off (Some(false)): 空の think block → 末尾が [<think> (20), </think> (22)]
+        // (added_tokens 登録済みで単一トークン化・間の改行3つは前処理で落ちる)
+        let ids_off = e
+            .tok
+            .encode(&e.tok.apply_chat_template(None, &m, None, Some(false)).unwrap())
+            .unwrap();
+        assert_eq!(ids_off.last().copied(), Some(22));
+        assert_eq!(ids_off.len(), ids_full.len() + 2, "空 think block で prompt が 2 トークン伸びる");
+        assert_eq!(&ids_off[ids_full.len()..], &[20, 22], "off = full + [20, 22]");
+        assert!(ids_off.starts_with(&ids_full), "off でも履歴部 (base) はトークン接頭辞のまま");
+
+        // Some(true) は変数を渡すが思考 ON = 従来経路と同一の描画
+        let ids_on = e
+            .tok
+            .encode(&e.tok.apply_chat_template(None, &m, None, Some(true)).unwrap())
+            .unwrap();
+        assert_eq!(ids_on, ids_full);
+    }
+
+    /// s47: thinking=off は即答 (空 think block 直後で EOS・1 トークンで完答)、
+    /// full (None) は従来どおり思考する (フィラ 3 トークン + EOS)。
+    /// ThinkingSimModel が実モデルの「思考する/しない」をトークンレベルで模倣する。
+    #[test]
+    fn thinking_off_short_circuits_generation_and_full_thinks() {
+        let mut e = thinking_sim_engine("think-sim").unwrap();
+        let m = msgs("t0");
+
+        let out_off = run_chat_with_thinking(&mut e, &m, 20, Some(false));
+        assert_eq!(out_off.output_tokens, 1, "off は空 think block 直後で即 EOS (EOS のみ)");
+        assert_eq!(out_off.stop_reason, StopReason::EndTurn);
+
+        let out_full = run_chat_with_thinking(&mut e, &m, 20, None);
+        assert_eq!(out_full.output_tokens, 4, "full は思考フィラ 3 トークン + EOS");
+        assert_eq!(out_full.stop_reason, StopReason::EndTurn);
+    }
+
+    /// s47: thinking=off でも recurrent モデルの base 検出 (s46 split prefill) が
+    /// 働く。base 描画は同一引数 (enable_thinking 込み) で行われるため、
+    /// off のマルチターンでも PrefixHit::Entry になり出力はフル prefill と一致する。
+    #[test]
+    fn thinking_off_keeps_recurrent_base_split() {
+        let mut e = recurrent_qwen_style_engine("qwen-style", None).unwrap();
+        let mut r = recurrent_qwen_style_engine("qwen-style-ref", None).unwrap();
+
+        let out1 = run_chat_with_thinking(&mut e, &msgs("t0"), 3, Some(false));
+        assert_eq!(e.last_prefix_hit(), PrefixHit::None);
+        assert_eq!(e.prefix_cache_entries(), 1, "off でも base エントリが退避される");
+
+        let m2 = msgs_multi(&[("user", "t0"), ("assistant", &out1.text), ("user", "t15")]);
+        let expect2 = run_chat_with_thinking(&mut r, &m2, 3, Some(false));
+        let out2 = run_chat_with_thinking(&mut e, &m2, 3, Some(false));
+        assert_eq!(e.last_prefix_hit(), PrefixHit::Entry, "off でも base 復元でヒットする");
+        assert_eq!(out2, expect2, "off 経路の出力がフル prefill と不一致");
     }
 
     #[test]
@@ -1890,7 +1990,7 @@ mod tests {
         let mut e =
             crate::testutil::tool_script_engine("m", None, script.to_vec(), fallback).unwrap();
         let mut sess = e
-            .begin_chat_with_tools(None, &msgs("t0"), &params(40), None, constraint)
+            .begin_chat_with_tools(None, &msgs("t0"), &params(40), None, constraint, None)
             .unwrap();
         e.install_session(&mut sess).unwrap();
         while !e.step_chat(&mut sess, &mut |_| {}).unwrap() {}

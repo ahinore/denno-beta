@@ -467,17 +467,82 @@ pub fn recurrent_engine(name: &str, seed: Option<u64>) -> Result<Engine> {
     Ok(Engine::from_parts(Box::new(RecurStateModel), tok, name, seed))
 }
 
+/// s47: thinking 制御の挙動をトークンレベルで模倣する決定論的ダミーモデル
+/// (qwen_style_tokenizer 前提・語彙 0..=22)。
+///
+/// - 直前トークンが </think> (22・thinking off の空 think block 末尾) なら即 EOS
+///   (空の think block が閉じている = 思考済み → 即答)
+/// - それ以外 (デフォルト/brief 経路の prompt 末尾 = assistant 直後の開いた
+///   think block) はフィラ 3 トークン (t13→t14→t15) の後に EOS (思考してから答える)
+///   (テスト用トークナイザは generation prompt 末尾の改行を落とすため、思考 ON の
+///   prompt は assistant (19) で終わる = 開いた think block の扱い)
+///
+/// → thinking=off で「思考文が長く続かず短時間で完答する」ことと
+///   off/full で prompt (→ 生成長) が変わることを出力トークン数で観測できる。
+pub struct ThinkingSimModel;
+
+/// qwen_style_tokenizer の語彙数 (t0..t15, eos, `<|im_start|>`, `<|im_end|>`,
+/// user, assistant, <think>, [UNK], </think>)
+pub const THINK_SIM_VOCAB: usize = 23;
+
+impl Model for ThinkingSimModel {
+    fn context(&self) -> usize {
+        DUMMY_CONTEXT
+    }
+
+    fn eos_ids(&self) -> &[u32] {
+        // qwen_style 語彙の "eos"
+        &[12]
+    }
+
+    fn forward(&mut self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>> {
+        let _ = cache.kv_bufs(0, tokens.len());
+        cache.advance(tokens.len());
+        let last = tokens.last().copied().unwrap_or(0);
+        let mut logits = vec![0.0f32; THINK_SIM_VOCAB];
+        let peak: usize = match last {
+            22 => 12, // </think> (空 think block 末尾) → 即答 (EOS)
+            20 => 13, // <think> → 思考開始 (フィラへ)
+            13 => 14,
+            14 => 15,
+            15 => 12, // 思考終わり → EOS
+            _ => 13,  // その他 (assistant 直後 = 開いた think block) → 思考開始
+        };
+        logits[peak] = 5.0;
+        Ok(logits)
+    }
+
+    fn new_cache(&self) -> KvCache {
+        KvCache::new(1, 4, DUMMY_CONTEXT)
+    }
+}
+
+/// ThinkingSimModel + Qwen3.5 風テンプレートで Engine を構築する
+/// (s47: thinking 制御の engine 経路検証用)。
+pub fn thinking_sim_engine(name: &str) -> Result<Engine> {
+    let tok = qwen_style_tokenizer()?;
+    Ok(Engine::from_parts(Box::new(ThinkingSimModel), tok, name, None))
+}
+
 /// s46: Qwen3.5 風 chat template 用トークナイザ (WordLevel・whitespace 前処理)。
 /// テンプレートは毎回 prompt を `<|im_start|>assistant\n\n\n` (→ 末尾に
 /// `<think>` トークンが残る) で終えるため、**次ターンの描画は直前 prompt の
 /// トークン接頭辞にならない** (実 Qwen3.5 と同じ prefix 崩れを再現する)。
 /// 語彙: t0..t11=0..11, eos=12, t13..t15=13..15, `<|im_start|>`=16,
-/// `<|im_end|>`=17, user=18, assistant=19, `<think>`=20, [UNK]=21。
+/// `<|im_end|>`=17, user=18, assistant=19, `<think>`=20, [UNK]=21,
+/// s47: `</think>`=22 (thinking=off の空 think block 用・added_tokens にも登録 =
+/// 実 Qwen3.5 と同一・special=false・id は語彙側と同一を再利用)。
+/// added_tokens は前処理より先に照合されるため Whitespace 前処理で分割されず
+/// 単一トークンになる = テンプレートが `<think>\n\n\n</think>` と連続で並んでも
+/// [20, 22] として出る (id は語彙側と同一を再利用)。
 pub const QWEN_STYLE_TOKENIZER_JSON: &str = r#"{
   "version": "1.0",
   "truncation": null,
   "padding": null,
-  "added_tokens": [],
+  "added_tokens": [
+    {"id": 20, "content": "<think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false},
+    {"id": 22, "content": "</think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false}
+  ],
   "normalizer": null,
   "pre_tokenizer": {"type": "Whitespace"},
   "post_processor": null,
@@ -489,7 +554,7 @@ pub const QWEN_STYLE_TOKENIZER_JSON: &str = r#"{
       "t7": 7, "t8": 8, "t9": 9, "t10": 10, "t11": 11, "eos": 12,
       "t13": 13, "t14": 14, "t15": 15,
       "<|im_start|>": 16, "<|im_end|>": 17, "user": 18, "assistant": 19,
-      "<think>": 20, "[UNK]": 21
+      "<think>": 20, "[UNK]": 21, "</think>": 22
     },
     "unk_token": "[UNK]"
   }
@@ -499,10 +564,19 @@ pub const QWEN_STYLE_TOKENIZER_JSON: &str = r#"{
 /// turn_{n+1} の描画は turn_n の prompt 末尾の generation prompt
 /// (`<|im_start|>assistant\n\n\n` のうち `<think>` トークン) を assistant 本文で
 /// 置き換えるため、トークン接頭辞が崩れる (s46 の根因と同一構造)。
+/// s47: generation prompt は実 Qwen3.5 と同一の分岐構造を持つ
+/// (`{% if enable_thinking is defined and enable_thinking is false %}`)。
+/// 既定/brief/full: `<|im_start|>assistant\n\n\n` = assistant 改行 + 開いた
+/// think block (s46 と同一のトークン列)。off: `assistant\n` + `<think>` +
+/// `\n\n\n` + `</think>` + `\n\n` = **think 終了タグの直前が改行3つ** (実モデルの
+/// chat_template.jinja と同一の anchor・間の改行はトークン化で落ちる)。
 pub const QWEN_STYLE_TEMPLATE: &str = "{%- for m in messages %}\
 <|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n\
 {%- endfor %}\
-{%- if add_generation_prompt %}<|im_start|>assistant\n\n\n{%- endif %}";
+{%- if add_generation_prompt %}<|im_start|>assistant\n\
+{%- if enable_thinking is defined and enable_thinking is false %}<think>\n\n\n</think>\n\n\
+{%- else %}\n\n{%- endif %}\
+{%- endif %}";
 
 /// Qwen3.5 風テンプレートのトークナイザ
 pub fn qwen_style_tokenizer() -> Result<DennoTokenizer> {

@@ -119,17 +119,21 @@ impl DennoTokenizer {
 
     /// messages + system (+ tools) をモデルの chat template でプロンプト文字列にする。
     /// `tools` はテンプレートの `tools` 変数へそのまま渡す (None なら null)。
-    /// テンプレートがない/失敗する場合は簡易フォールバック (tools は反映されない)。
+    /// `enable_thinking` はテンプレート変数として渡すか否か (None = 変数無し =
+    /// 従来経路と同一。テンプレート側は未定義を思考 ON として扱う — 実モデル観測と一致)。
+    /// テンプレートがない/失敗する場合は簡易フォールバック (tools / enable_thinking
+    /// は反映されない — fallback テンプレートに thinking の概念は無い)。
     pub fn apply_chat_template(
         &self,
         system: Option<&str>,
         messages: &[ChatMessage],
         tools: Option<&serde_json::Value>,
+        enable_thinking: Option<bool>,
     ) -> Result<String> {
         if messages.is_empty() {
             bail!("messages が空です");
         }
-        match self.render_chat_template(system, messages, tools, true) {
+        match self.render_chat_template(system, messages, tools, true, enable_thinking) {
             Some(s) => Ok(s),
             None => Ok(fallback_template(system, messages)),
         }
@@ -145,11 +149,12 @@ impl DennoTokenizer {
         system: Option<&str>,
         messages: &[ChatMessage],
         tools: Option<&serde_json::Value>,
+        enable_thinking: Option<bool>,
     ) -> Result<String> {
         if messages.is_empty() {
             bail!("messages が空です");
         }
-        self.render_chat_template(system, messages, tools, false)
+        self.render_chat_template(system, messages, tools, false, enable_thinking)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!("chat template が無く base 描画が不可能"))
     }
@@ -163,6 +168,7 @@ impl DennoTokenizer {
         messages: &[ChatMessage],
         tools: Option<&serde_json::Value>,
         add_gen_prompt: bool,
+        enable_thinking: Option<bool>,
     ) -> Option<String> {
         let mut msgs: Vec<serde_json::Value> = Vec::new();
         if let Some(sys) = system {
@@ -178,7 +184,7 @@ impl DennoTokenizer {
         }
 
         if let Some(template) = &self.template {
-            let ctx = serde_json::json!({
+            let mut ctx = serde_json::json!({
                 "messages": msgs,
                 "add_generation_prompt": add_gen_prompt,
                 "bos_token": self.bos_token,
@@ -188,6 +194,13 @@ impl DennoTokenizer {
                 // テンプレート描画結果は tools 無しリクエストでビット同一
                 "tools": tools.cloned().unwrap_or(serde_json::Value::Null),
             });
+            // s47: enable_thinking は指定されたときだけ変数として渡す (None = 変数無し
+            // = 従来経路と同一。実テンプレート (Qwen3.5) は
+            // `{% if enable_thinking is defined and enable_thinking is false %}` の
+            // 形で参照し、未定義は思考 ON として扱う = 現状の実機観測と一致)。
+            if let Some(v) = enable_thinking {
+                ctx["enable_thinking"] = serde_json::json!(v);
+            }
             let mut env = minijinja::Environment::new();
             // Python 風 str メソッド (startswith 等) を登録 — HF chat template
             // (Qwen3 等) はこれらに依存する
@@ -314,11 +327,11 @@ mod tests {
     #[test]
     fn chat_template_is_applied_when_present() {
         let (tok, dir) = load_minimal(Some("[{{ messages | length }}]{{ messages[0]['content'] }}"));
-        let out = tok.apply_chat_template(None, &msgs("t0"), None).unwrap();
+        let out = tok.apply_chat_template(None, &msgs("t0"), None, None).unwrap();
         assert_eq!(out, "[1]t0");
 
         // system は messages の先頭に挿入される → messages[0] は system、長さは 2
-        let out = tok.apply_chat_template(Some("SYS"), &msgs("t0"), None).unwrap();
+        let out = tok.apply_chat_template(Some("SYS"), &msgs("t0"), None, None).unwrap();
         assert_eq!(out, "[2]SYS");
         std::fs::remove_dir_all(dir).ok();
     }
@@ -328,14 +341,48 @@ mod tests {
         // tools は ctx の "tools" 変数として参照できる (公式 Qwen3.5 テンプレートが依存)
         let (tok, dir) =
             load_minimal(Some("{% if tools %}T:{{ tools | length }}{% else %}NOTOOLS{% endif %}"));
-        let out = tok.apply_chat_template(None, &msgs("t0"), None).unwrap();
+        let out = tok.apply_chat_template(None, &msgs("t0"), None, None).unwrap();
         assert_eq!(out, "NOTOOLS");
 
         let tools = serde_json::json!([
             {"type": "function", "function": {"name": "f1", "description": "d", "parameters": {}}}
         ]);
-        let out = tok.apply_chat_template(None, &msgs("t0"), Some(&tools)).unwrap();
+        let out = tok.apply_chat_template(None, &msgs("t0"), Some(&tools), None).unwrap();
         assert_eq!(out, "T:1");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn chat_template_receives_enable_thinking_variable() {
+        // s47: enable_thinking は指定時のみ ctx 変数になる (実 Qwen3.5 テンプレートと
+        // 同一の `{% if enable_thinking is defined and enable_thinking is false %}` 形で
+        // 検証する。minijinja が `is defined` / `is false` を解釈できることも含む)。
+        let tpl = "{%- if enable_thinking is defined and enable_thinking is false %}OFF\
+                   {%- else %}THINK{%- endif %}";
+        let (tok, dir) = load_minimal(Some(tpl));
+        // None = 変数無し → 未定義 → 思考 ON (従来経路と同一)
+        let out = tok.apply_chat_template(None, &msgs("t0"), None, None).unwrap();
+        assert_eq!(out, "THINK");
+        // Some(true) → 思考 ON
+        let out = tok.apply_chat_template(None, &msgs("t0"), None, Some(true)).unwrap();
+        assert_eq!(out, "THINK");
+        // Some(false) → thinking off
+        let out = tok.apply_chat_template(None, &msgs("t0"), None, Some(false)).unwrap();
+        assert_eq!(out, "OFF");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn chat_template_base_receives_enable_thinking_variable() {
+        // base 描画 (add_generation_prompt: false) も同一の変数を受け取る
+        // (thinking=off でも base 検出が同一引数で行われることの担保)
+        let tpl = "{% if enable_thinking is defined and enable_thinking is false %}OFF\
+                   {% else %}THINK{% endif %}{{ messages | length }}";
+        let (tok, dir) = load_minimal(Some(tpl));
+        let out = tok.apply_chat_template_base(None, &msgs("t0"), None, None).unwrap();
+        assert_eq!(out, "THINK1");
+        let out = tok.apply_chat_template_base(None, &msgs("t0"), None, Some(false)).unwrap();
+        assert_eq!(out, "OFF1");
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -348,7 +395,7 @@ mod tests {
              {{ messages[0].content.lstrip('u') }}\
              {% set parts = messages[0].content.split(':') %}{{ parts[-1] }}",
         ));
-        let out = tok.apply_chat_template(None, &msgs("u:hi"), None).unwrap();
+        let out = tok.apply_chat_template(None, &msgs("u:hi"), None, None).unwrap();
         // U (startswith) + :hi (lstrip('u')) + hi (split(':')[-1])
         assert_eq!(out, "U:hihi");
         std::fs::remove_dir_all(dir).ok();
@@ -357,7 +404,7 @@ mod tests {
     #[test]
     fn empty_messages_is_an_error() {
         let (tok, dir) = load_minimal(None);
-        assert!(tok.apply_chat_template(None, &[], None).is_err());
+        assert!(tok.apply_chat_template(None, &[], None, None).is_err());
         std::fs::remove_dir_all(dir).ok();
     }
 

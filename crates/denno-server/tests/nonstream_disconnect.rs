@@ -207,6 +207,7 @@ async fn dropped_chat_receiver_aborts_run_without_generation() {
             GenParams { max_tokens: 400, temperature: Some(0.0), ..Default::default() },
             None,
             None,
+            None,
         )
         .unwrap();
     drop(rx); // クライアント切断相当 (hyper による handler キャンセル → Receiver drop)
@@ -222,6 +223,7 @@ async fn dropped_chat_receiver_aborts_run_without_generation() {
             None,
             vec![ChatMessage { role: "user".into(), content: "t0".into() }],
             GenParams { max_tokens: 4, temperature: Some(0.0), ..Default::default() },
+            None,
             None,
             None,
         )
@@ -249,6 +251,7 @@ async fn healthy_nonstream_request_completes() {
             None,
             vec![ChatMessage { role: "user".into(), content: "t0".into() }],
             GenParams { max_tokens: 4, temperature: Some(0.0), ..Default::default() },
+            None,
             None,
             None,
         )

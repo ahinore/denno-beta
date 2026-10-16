@@ -245,6 +245,7 @@ async fn dropped_receiver_aborts_run_without_generation() {
             GenParams { max_tokens: 400, temperature: Some(0.0), ..Default::default() },
             None,
             None,
+            None,
             tx,
         )
         .unwrap();
@@ -261,6 +262,7 @@ async fn dropped_receiver_aborts_run_without_generation() {
             None,
             vec![ChatMessage { role: "user".into(), content: "t0".into() }],
             GenParams { max_tokens: 4, temperature: Some(0.0), ..Default::default() },
+            None,
             None,
             None,
         )

@@ -1093,6 +1093,36 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 
 `cargo test --workspace` **242 passed / 0 failed** (was 237 + 5)·`cargo check --features cuda --lib` passes (all 12 warnings identical to HEAD, no new warnings)·push is a human task
 
+### Implementing thinking control (`thinking`: "off" | "brief" | "full") (s47) ✅ (2026-10-17)
+
+> Session 47. Adds thinking control to /v1/messages (`thinking` optional top-level field, string, a denno extension not present in the Anthropic API; the current parser still does not reject unknown fields). "full" is bit-identical to the legacy path and leaves the numeric path untouched. The off branch follows the actual Qwen3.5 template file (chat_template in tokenizer_config.json, verified with python3).
+
+**Spec**:
+
+- `"off"`: pass `enable_thinking=false` to the chat template. The real Qwen3.5 template turns the generation prompt into `<|im_start|>assistant\n` + `<think>\n\n\n</think>\n\n` (empty think block, **three newlines right before the think end tag** = the same anchor as the model's chat_template.jinja) — the block is closed as already-thought, so the model answers immediately
+- `"brief"` (default): thinking stays ON and a deterministic brevity hint (`THINKING_BRIEF_INSTRUCTION`) is prepended to the system (**not hard control** — a soft nudge that does not force the model's generation). The existing system is preserved; when absent/empty the hint becomes the whole system
+- `"full"`: the legacy path as-is (no injection and the `enable_thinking` variable is not passed = bit-identical prompt)
+- Unspecified requests get `"brief"` (an **intentional change** that injects the hint into the prompt). Invalid values get 400 invalid_request_error (same convention as tool_choice validation, case-sensitive exact match)
+
+**Implementation**:
+
+- `tokenizer.rs`: `apply_chat_template` / `apply_chat_template_base` / `render_chat_template` take `enable_thinking: Option<bool>` — the ctx variable is passed only when specified (None = no variable = identical to the legacy path. The real template references it as `{% if enable_thinking is defined and enable_thinking is false %}`, treating undefined as thinking ON = matches the current real-machine observation). The fallback template has no notion of thinking
+- `engine.rs`: `begin_chat_with_tools` takes `enable_thinking`. Base detection (s46 split prefill) uses the same argument, so the recurrent base restore also works with thinking=off
+- `denno-server/lib.rs`: `MessagesRequest.thinking` + the `Thinking` enum + `parse_thinking` (unspecified = Brief, invalid → 400) + `brief_system` (prepends the hint to the system, preserving the existing one). off/full inject nothing; only off passes `enable_thinking=Some(false)` (brief/full pass no variable = legacy rendering)
+- `denno-server/scheduler.rs`: `Job::Chat`/`Job::Stream` take `enable_thinking` (the same control on both the non-streaming and SSE paths)
+- `testutil.rs`: `ThinkingSimModel` (a deterministic dummy that answers with EOS immediately when the previous token is the think end tag, otherwise emits three thinking-filler tokens then EOS) + the qwen_style template gains the real Qwen3.5 `enable_thinking` branch + the think start/end tags are registered in added_tokens (same as real Qwen3.5, special=false, reusing the vocab-side ids → matched before preprocessing, so they stay single tokens = tests observe off = full + [<think>, </think>])
+
+**Tests** (11 new):
+
+- `tokenizer.rs` 2: `chat_template_receives_enable_thinking_variable` (None=thinking ON / Some(true)=ON / Some(false)=off through the real Qwen3.5-shaped `is defined and is false` branch, including minijinja's handling of `is defined`/`is false`) · `chat_template_base_receives_enable_thinking_variable` (base rendering receives the same variable = s46 base detection holds with off)
+- `engine.rs` 3: `thinking_off_renders_empty_think_block_in_generation_prompt` (off = full + [<think>, </think>] = prompt grows by 2 tokens, three newlines before the end tag, Some(true) fully identical to the legacy path) · `thinking_off_short_circuits_generation_and_full_thinks` (off answers with a single EOS token / full emits three thinking fillers + EOS) · `thinking_off_keeps_recurrent_base_split` (with off the s46 base restore still fires: PrefixHit::Entry and output exactly matches a cold full prefill)
+- `denno-server/tests/thinking_control.rs` 6: `parse_thinking_maps_all_modes_and_defaults_to_brief` (all modes + rejecting invalid values including case variants) · `brief_system_prepends_fixed_instruction_deterministically` (deterministic fixed text, existing system preserved) · `thinking_off_short_circuits_and_brief_full_think` (wire level: off answers in 1 token, unspecified=brief=full take the thinking path) · `thinking_brief_injects_system_and_full_is_unchanged` (the brief injection is observed via the output delta of a state-dependent model that depends on every prompt token; off's prompt change is observed too) · `thinking_unknown_value_is_rejected_with_400` · `thinking_off_streams_immediately_and_full_streams_thinking` (the SSE path receives the same control)
+- 2 existing `scheduler.rs` tests updated on the reference side (they now run the direct engine with the effective system injected by the default brief — the equivalence-check intent is unchanged. Other wire tests via SleepModel are unaffected because the generated text is unchanged, and direct scheduler-submit tests never go through HTTP)
+
+**Impact on the numeric path**: none — "full" is bit-identical (no variable = legacy rendering), "off" only changes a template variable (the model/sampler are untouched), "brief" only changes the system text (deterministic fixed text). Existing engine-direct tests all keep system-less inputs = the premises of the existing anchors/CPU reference md5 are unchanged
+
+`cargo test --workspace` **253 passed / 0 failed** (was 242 + 11)·`cargo check --features cuda --lib` passes (all 12 warnings identical to HEAD, no new warnings)·push is a human task
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
@@ -1125,6 +1155,7 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - [x] **Client-disconnect detection (abort streaming generation)** → **done (2026-10-16)**: see the §3 "Client-disconnect detection and generation abort" section. ~~Non-streaming requests are out of scope (no detection path exists)~~ → **non-streaming is covered too (s44)**: see the §3 "Hardening the post-disconnect handling of non-streaming /v1/messages" section
 - [x] **Hardening the post-disconnect handling of non-streaming /v1/messages (non-streaming disconnect abort + async logging against the wedge)** → **done (2026-10-16)**: see the §3 "Hardening the post-disconnect handling of non-streaming /v1/messages" section. Numeric path unchanged
 - [x] **Default max_tokens cap for chat (only when unspecified · explicit values respected)** → **done (2026-10-16)**: see the §3 "Default max_tokens cap for chat" section. Default 4096 (same as the engine's SESSION_RESERVE_TOKENS) · numeric path unchanged
+- [x] **thinking control (`thinking`: "off" | "brief" | "full")** → **done (2026-10-17)**: see the §3 "Implementing thinking control" section. off passes `enable_thinking=false` (empty think block → immediate answer) · brief (default) injects a brevity hint into the system (**not hard control**) · full is bit-identical to the legacy path. Numeric path unchanged
 - [ ] Llama-family variants (models without GQA, RoPE scaling)
 - [ ] **Other families**: DeepSeek series (MoE + shared experts), GLM series, gpt-oss (attention sink + sliding window + MXFP4). The GGUF route (P19) widens the entry point
 - [ ] **Per-model mechanism visualization**: MoE routing, MLA latent-compressed KV, attention sink, sliding-window band patterns, thinking mode
