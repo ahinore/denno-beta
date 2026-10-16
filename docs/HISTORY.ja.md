@@ -956,6 +956,30 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 `cargo test --workspace` **220 passed / 0 failed** (旧 216 + 4)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)
 
+### chat 用 max_tokens 既定上限 (未指定時のみ適用) ✅ (2026-10-16)
+
+> オペレーター確定タスク (第39セッション)。8095 で thinking モデルが超長生成を続け、単一ワーカー構成のサーバーで後続リクエストを長時間列待ちさせる問題への対策。chat completions API の `max_tokens` / `max_completion_tokens` が**未指定の場合のみ**既定上限を適用し、明示指定は尊重する (数値経路・サンプリング計算には触れない — 設定値の既定適用のみ)。未指定リクエストは旧実装では必須フィールド欠落の 400 になるため、本変更で「未指定を許容 + 既定上限 4096 でワーカー占有を保証」の挙動になる。s38 の切断検知はクライアント切断時のみ有効 (非ストリームは対象外) であり、本変更は生成開始前のリクエスト側で上限を保証する補完。
+
+**実装 (server/src/lib.rs)**:
+
+- `DEFAULT_MAX_TOKENS = 4096` (新規定数) + `resolve_max_tokens(max_tokens, max_completion_tokens)` (純関数): `max_tokens` を優先し、無ければ OpenAI chat completions 互換の別名 `max_completion_tokens`、双方未指定なら 4096。明示指定 (0 含む) はそのまま尊重
+- `MessagesRequest.max_tokens` を必須 (`usize`) → 任意 (`Option<usize>`) に変更 + `max_completion_tokens` を追加。Anthropic API 仕様上 max_tokens は必須だが、本サーバーは学習用ツールのため未指定を 400 にせず既定上限で受理する
+- 適用箇所は `messages` ハンドラの `GenParams` 構築の 1 箇所のみ → 非ストリーム (Job::Chat) とストリーム (Job::Stream) の両経路に同一に効く
+- 既定値 4096 の根拠: engine の `SESSION_RESERVE_TOKENS` (P17e の 1 セッションあたり KV 予約の目安) と同値で KV 予算設計の前提と整合する。明示指定の巨大値 (Hermes の `max_tokens: 65535` 等) への対応は従来どおり engine 側のコンテキスト クランプに委ねられ、本変更では触れていない
+
+**対象範囲の判断**: 本サーバーの chat 系エンドポイントは `/v1/messages` のみ (他は `/v1/models`・`/health`・`/v1/telemetry/ws`) で、Job::Chat / Job::Stream がその 2 経路に対応するため、他エンドポイントへの揃え込みは発生しなかった。`max_completion_tokens` は OpenAI 形式のクライアントが送ってきても同じ扱いにするだけの別名 (既存 Anthropic クライアントは送らないため影響ゼロ・両方指定時は `max_tokens` 優先)。CLI (`denno generate` / `denno serve`) はローカル生成経路で対象外 — `serve` の `--max-tokens` は以前から無視されるフラグで本件でも触れていない
+
+**finish_reason**: 上限で打ち切られた場合は従来経路どおり Anthropic 形式の `stop_reason = "max_tokens"` (OpenAI の `finish_reason = "length"` 相当) が出る — 非ストリームは応答 JSON、ストリームは `message_delta` の `delta.stop_reason` + `usage.output_tokens` の双方で検証
+
+**テスト**: 新規 `server/tests/max_tokens_default.rs` 7 件 (EOS を決して出さない EndlessModel をテスト内定義 — 生成が max_tokens まで必ず続き、`usage.output_tokens` で実効上限を直接観測できる):
+
+- `resolve_max_tokens` 単体: 未指定 → 4096・明示 (5 / 0 / 100000) → 尊重・別名のみ → 採用・両方 → max_tokens 優先
+- 未指定 (非ストリーム) → 200・output_tokens = 4096・stop_reason = "max_tokens" (**旧コードでは必須フィールド欠落で 400**)
+- 未指定 (stream=true) → SSE の message_delta で同一の打ち切り (stop_reason + usage.output_tokens)
+- 明示 5 → output_tokens = 5 (4096 に引き上げられない)・別名 7 のみ → 7・両方指定 → max_tokens 優先・明示 0 → 0 (空応答で打ち切り)
+
+`cargo test --workspace` **227 passed / 0 failed** (旧 220 + 7)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -985,6 +1009,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [ ] **GitHub push自動化**: deploy key登録後にコンテナから直接push
 - [x] ~~tool use(Anthropic APIのtoolsパラメータ対応)~~ → **完了 (2026-10-16)**: §3「tool use 対応」節参照。~~`any`/`tool` の拘束デコード~~ → **完了 (2026-10-16)**: §3「tool_choice 拘束デコード」節参照。~~streaming の tool_use 対応~~ → **完了 (2026-10-16)**: §3「streaming tool_use 対応」節参照
 - [x] **クライアント切断検知 (SSE ストリームの生成打ち切り)** → **完了 (2026-10-16)**: §3「クライアント切断検知と生成 abort」節参照。非ストリームは検知経路が無く対象外
+- [x] **chat 用 max_tokens 既定上限 (未指定時のみ適用・明示指定は尊重)** → **完了 (2026-10-16)**: §3「chat 用 max_tokens 既定上限」節参照。既定 4096 (engine の SESSION_RESERVE_TOKENS と同値)・数値経路は無変更
 - [ ] Llama系バリアント(GQA無しモデル、RoPEスケーリング)
 - [ ] **他ファミリー対応**: DeepSeekシリーズ(MoE+共有エキスパート)、GLMシリーズ、gpt-oss(attention sink+sliding window+MXFP4)。GGUF 経路(P19)により入口が拡大
 - [ ] **各モデル独自機構の可視化**: MoEルーティング、MLA潜在圧縮KV、attention sink、sliding window帯パターン、thinkingモード

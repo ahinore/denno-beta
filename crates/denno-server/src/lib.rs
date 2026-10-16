@@ -101,10 +101,38 @@ impl IntoResponse for ApiError {
 
 // ---------- リクエストDTO ----------
 
+/// chat 用 max_tokens の既定上限 (リクエストで未指定の場合のみ適用する。
+/// 明示指定は尊重 — コンテキストへのクランプは engine 側の既存挙動のまま)。
+///
+/// 値の根拠: engine の `SESSION_RESERVE_TOKENS` (P17e の 1 セッションあたり
+/// KV 予約の目安・engine.rs) と同値で、KV 予算設計の前提と整合する。
+/// thinking モデルが max_tokens 未指定のまま超長生成し、単一ワーカー構成の
+/// サーバーで後続リクエストを長時間列待ちさせる問題 (8095 運用・s38 の切断
+/// 検知はクライアント切断時のみ有効) の対策として、未指定リクエストに上限を
+/// 保証する。Anthropic API 仕様上 max_tokens は必須だが、本サーバーは学習用
+/// ツールのため未指定を 400 にせず既定上限で受理する。
+pub const DEFAULT_MAX_TOKENS: usize = 4096;
+
+/// chat 経路の実効 max_tokens を決める (未指定 → `DEFAULT_MAX_TOKENS`)。
+/// `max_tokens` を優先し、無ければ OpenAI chat completions 互換の別名
+/// `max_completion_tokens` を使う。明示指定 (0 含む) はそのまま尊重する。
+pub fn resolve_max_tokens(
+    max_tokens: Option<usize>,
+    max_completion_tokens: Option<usize>,
+) -> usize {
+    max_tokens.or(max_completion_tokens).unwrap_or(DEFAULT_MAX_TOKENS)
+}
+
 #[derive(Deserialize)]
 pub struct MessagesRequest {
     pub model: String,
-    pub max_tokens: usize,
+    /// 生成上限トークン数。未指定 (max_completion_tokens も未指定) の場合は
+    /// 既定上限 `DEFAULT_MAX_TOKENS` を適用する。明示指定は尊重される
+    /// (コンテキスト超過分のクランプは engine の既存挙動)。
+    pub max_tokens: Option<usize>,
+    /// OpenAI chat completions 互換の別名 (max_tokens 未指定時のみ使用。
+    /// 両方指定された場合は max_tokens を優先)。
+    pub max_completion_tokens: Option<usize>,
     pub messages: Vec<InMessage>,
     pub system: Option<serde_json::Value>,
     pub temperature: Option<f32>,
@@ -717,8 +745,10 @@ async fn messages(
         });
     }
     let system = system_to_text(&req.system)?;
+    // s39: max_tokens / max_completion_tokens の未指定時は既定上限 (DEFAULT_MAX_TOKENS)
+    // を適用する。明示指定は尊重。数値経路への影響は無い (設定値の既定適用のみ)。
     let params = GenParams {
-        max_tokens: req.max_tokens,
+        max_tokens: resolve_max_tokens(req.max_tokens, req.max_completion_tokens),
         temperature: req.temperature,
         top_p: req.top_p,
         top_k: req.top_k,
