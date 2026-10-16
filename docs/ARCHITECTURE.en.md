@@ -617,6 +617,7 @@ output  = rmsnorm(o) * w * silu(z)                    # gated RMS norm (z from a
 
 - q/k are **L2-normalized** beforehand (x/sqrt(Σx²+eps); q additionally 1/sqrt(head_k_dim))
 - softplus follows the ggml convention (`x > 20 ? x : log(1+exp(x))`)
+- **The GQA head mapping follows the tiled-repeat convention**: when n_v_heads > n_k_heads, the k/q head that v-head h refers to is **`h % n_k_heads`** (cyclic tile, same as GGUF/llama.cpp `ggml_repeat`). This is a **different convention** from HF transformers' `repeat_interleave` (blocked, `h // g`) and follows the GGUF-path semantics (0.8B is nk==nv so they coincide; 9B is 2x, 27B is 3x; non-divisible configurations are rejected at load). The old blocked implementation was the root cause of the 27B output failure (fixed 2026-10-16 — see [development history](HISTORY.en.md), "GDN GQA head mapping fix" section)
 - The implementation is a 1:1 port of llama.cpp `delta-net-base.cpp`'s `build_delta_net_autoregressive` (sequential AR form). Bit-identity with llama.cpp is not required — only the denno contract (same input → same output + determinism) is guaranteed (the sequential AR form and the chunked form are mathematically equivalent)
 - Code layout: `gdn.rs` has `GdnCore<'a>` (reference views of the tiny f32 tensors: conv1d/ssm_a/ssm_dt/ssm_norm) + `forward_token_core` (math core). Larger matrices (qkv/gate/beta/alpha/out) reuse the existing `Linear` → `model/qwen35.rs` assembles the layers
 
@@ -658,7 +659,7 @@ GDN state is not "per token position" but a **function of the whole sequence**, 
 
 ### 12.6 GDN GPU kernels and chunked scan (P19-A1 / A1-r2)
 
-The GDN scan GPU kernel (`kernels/gdn.cu` + `kernels_gdn.ptx`) keeps **one block per head (grid = nv) with each thread holding one column of S**, so every delta-rule update completes within a thread (no cross-thread reduction). Determinism policy: fixed launch configuration, ascending-order sequential sums, no atomics / warp reductions. GDN falls under the relaxed contract (no bit-identity required), so `expf` etc. are allowed and CPU/GPU numerical agreement is verified within the relaxed bounds (maxabs < 1e-3, cos > 0.999).
+The GDN scan GPU kernel (`kernels/gdn.cu` + `kernels_gdn.ptx`) keeps **one block per head (grid = nv) with each thread holding one column of S**, so every delta-rule update completes within a thread (no cross-thread reduction). Determinism policy: fixed launch configuration, ascending-order sequential sums, no atomics / warp reductions. GDN falls under the relaxed contract (no bit-identity required), so `expf` etc. are allowed and CPU/GPU numerical agreement is verified within the relaxed bounds (maxabs < 1e-3, cos > 0.999). The k/q head mapping uses the same **tiled-repeat convention** as the CPU (`kh = h % nk`, §12.2), common to all three kernels (`dno_gdn_scan`/`dno_gdn_chunk_pre`/`dno_gdn_chunk_scan`) (fixed 2026-10-16).
 
 Route selection (`cuda::gdn_scan_batch` is the single entry point, requires dk == dv / d_conv == 4):
 

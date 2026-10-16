@@ -1,4 +1,4 @@
-//! 27B 出力品質調査用の logit/top-k プローブ (実 GGUF・ignored・QWEN35_27B_DIR で実行)。
+//! 27B/9B 出力品質調査用の logit/top-k プローブ (実 GGUF・ignored・QWEN35_27B_DIR で実行)。
 //!
 //! 目的: 27B の出力破綻 (早期 `<|im_end|>` → テンプレート断片ループ) の切り分けを続けられるよう、
 //! chat プロンプト 1 本の prefill logits top-k と greedy 各ステップの argmax/top-k を
@@ -6,10 +6,13 @@
 //! (第13セッション: llama.cpp は同 GGUF で正答 → 本エンジン固有の差分あり)。
 //!
 //! 環境変数: QWEN35_27B_DIR (config.json + *.gguf を含むディレクトリ・未設定で graceful skip)。
+//! 9B モデルを指定すれば 9B 経路の検証にも流用できる (第16セッション)。
 //! 実行: `cargo test -p denno-engine --test qwen35_27b_logit_probe -- --ignored --nocapture`
 //!
 //! 既知の所見 (第12セッション): "What is the capital of France?" は greedy step 7 で
 //! `<|im_end|>` (logit 19.25・runner-up 16.5) を出して思考を放棄する。prefill 自体は決定論的。
+//! 第16セッション: 原因は GDN の k/q ヘッド対応 (blocked → タイル repeat に修正)。
+//! 修正後は 27B も greedy で正答する (本テストは回帰監視として恒久化)。
 
 use denno_engine::engine::ChatMessage;
 use denno_engine::model::{load_model, Model};
@@ -35,8 +38,10 @@ fn qwen35_27b_logit_probe() {
         .expect("モデルロード失敗");
     let tok = DennoTokenizer::load(std::path::Path::new(&dir)).expect("tokenizer ロード失敗");
 
+    let prompt_text = std::env::var("QWEN35_PROBE_PROMPT")
+        .unwrap_or_else(|_| "What is the capital of France?".to_string());
     let prompt = tok
-        .apply_chat_template(None, &[ChatMessage { role: "user".into(), content: "What is the capital of France?".into() }], None)
+        .apply_chat_template(None, &[ChatMessage { role: "user".into(), content: prompt_text }], None)
         .expect("template 失敗");
     eprintln!("PROMPT: {prompt:?}");
     let ids = tok.encode(&prompt).expect("encode 失敗");
@@ -79,7 +84,12 @@ fn qwen35_27b_logit_probe() {
     let text = tok.decode(&gen).unwrap_or_default();
     eprintln!("GENERATED_TEXT: {text:?}");
 
-    // 決定論確認: 同一 prefill をやり直して bit 一致
+    // 決定論確認: 同一 prefill をやり直して bit 一致 (層別診断時は [LCHK] 出力が
+    // 2 パスにならないようスキップ)
+    if std::env::var("DENNO_DEBUG_LAYER_CHKSUM").ok().as_deref() == Some("1") {
+        eprintln!("DETERMINISM: skipped (layer checksum diag)");
+        return;
+    }
     let mut cache2 = model.new_cache();
     let logits2 = model.forward(&ids, &mut cache2).expect("prefill (2) 失敗");
     let same = logits

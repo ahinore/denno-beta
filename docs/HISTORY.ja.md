@@ -714,6 +714,40 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 **thinking 無効化 (`enable_thinking=false`)**: テンプレートは対応するがエンジン未対応 — 本調査では未実施 (候補として継続)
 
+### Qwen3.5 GDN GQA head mapping 修正 (blocked → タイル repeat) — 27B 出力破綻の根因確定と修正 ✅ (2026-10-16)
+
+> 第14〜17セッション。前節の 27B 出力品質調査で「prefill 最終位置 logits で既に乖離・残候補は GQA group 6 / GDN v-head 48 / 実重みテンソル対応」とまで絞っていたうち、**GDN の GQA head mapping (v-head h が参照する k/q head)** が根因と確定し修正した。9B も同一根因で旧実装 (blocked) は「耐えられていただけ」だった。数値経路の変更は head index 計算 1 行のみ (CPU 2 箇所・GPU 3 箇所)。
+
+**発見経緯 (第14〜16セッション・llama.cpp との層別比較)**:
+
+- llama.cpp 側に層別 checksum ツール (`tools/lchk`・[LCHK] 行) を用意し、同一 GGUF・同一プロンプト・同一トークン化で層別比較 → **初発散は GDN 層の attn サブステージ** (full attention 層・emb・FFN・final は一致)。GQA group (full attention) と実重みテンソル対応の候補はここで消失
+- GDN サブステージ per-token ダンプ (`DENNO_DEBUG_GDN_DUMP`・エンジン側 gdump と llama.cpp lchk GDN detail モードを同一順序 qkv,z,beta,gate,conv,q,k,v,o,y で比較) → **scan の出力 `o` で乖離**・それより前 (qkv〜k/v 投影) は一致 → 差分はスキャン内部の head 対応に限定
+- head mapping を変えた再計算比較: **strided (`kh = h % nk`・llama.cpp ggml_repeat 相当) のみが llama.cpp の `o` と一致** — 9B: cos ≥ 0.99984 (med 0.99998)・27B: cos 0.99999 (全トークン)。旧実装の blocked (`kh = h * nk / nv` = HF `repeat_interleave` 相当) は乖離
+- llama.cpp 側の根拠: `qwen35.cpp` 非融合経路は `ggml_repeat_4d` (head 次元の cyclic タイル)・融合カーネルは `iv1 % neq1` — どちらも `h % nk` 相当
+
+**修正内容**:
+
+- `gdn.rs`: `forward_token_core` と chunked scan (`scan_chunked_core`) の `kh = h * n_k_heads / n_v_heads` → **`kh = h % n_k_heads`**
+- `kernels/gdn.cu`: `dno_gdn_scan` / `dno_gdn_chunk_pre` / `dno_gdn_chunk_scan` の同箇所 (GPU 経路も同一規約に統一)。**PTX は本修正では未再生成** — コンテナに nvcc が無いためで、`kernels_gdn.ptx` の再生成 (`nvcc -ptx -arch=compute_75 -fmad=false -O3 kernels_gdn.cu -o kernels_gdn.ptx`) までは GPU 経路が旧 blocked PTX のまま動く (**人間対応**: 再生成後に GPU E2E 再検証を行う)
+- `model/qwen35.rs`: 規約コメント/ロード時ガードのエラーメッセージ更新 (repeat_interleave → タイル repeat)。n_v_heads が n_k_heads の整数倍でない構成は引き続きロード拒否 (0.8B 1x・9B 2x・27B 3x)
+- **恒久診断**: 層別 checksum `[LCHK]` (`DENNO_DEBUG_LAYER_CHKSUM`・`DENNO_DEBUG_LAYER_CHKSUM_FILE`) と GDN サブステージダンプ `[GDUMP]` (`DENNO_DEBUG_GDN_DUMP` + `DENNO_DEBUG_GDN_DUMP_LAYER`) は env ゲート・未指定時 no-op で恒久保持 (撤去せず)。第13セッションのプローブテスト恒久化と同じ方針
+
+**新テスト**: `gdn_gqa_head_mapping_is_tiled` (合成 GDN・dk=dv=2・nk=2/nv=4・2 トークン・decay なし) — v-head が参照した k head を `o`/gated norm 後の `y` の方向として観測し strided 規約を固定。blocked/strided を区別できない入力になっていないことを assertion で担保 (テスト自体の自己検証)
+
+**検証 (すべてコンテナ内 CPU・修正後 release バイナリ)**:
+
+- `cargo test --workspace` **189 passed / 0 failed** (engine lib 153 = 152 + 1・ignored 14 は env ゲートの実モデルテスト)
+- **27B (unsloth 均一 Q4_0・int8) E2E — 出力破綻が解消**: "What is the capital of France?" → 思考 `The user is asking a simple factual question: What is the capital of France? The answer is Paris.` → 回答 **`The capital of France is **Paris**.`**・`stop_reason=end_turn`・md5 `a021580f7dbb0b45c0673b264b9ae02f` 連続 2 回一致。第12/13セッションの「質問エコー → step 7 で `<|im_end|>` 放棄 → テンプレート断片ループ」が解消。"日本の首都は?" も正常 (思考 → 回答 `日本の首都は**東京**です。`・md5 `1483c4fe9f3ab9318f6e33e4aaaa8d74`)
+- **9B E2E (int8)**: `q35_9b_1b.json` → **`feea94449780dea3685980fbda6e4661`**・`q35_9b_2b.json` → **`da0b1f578575e857cba2fc70ccc44fd9`** (各連続 2 回一致・決定論)。**修正により従来アンカーは変化が前提** (旧 CPU: `3a0ddf1c…` / `95199a33…`・旧 GPU: `1a4ea71a…` / `b4e58cb3…`) — 上記 2 つが新ベースライン候補。**アンカーの正式更新は人間側 GPU 検証後に行う (人間対応)**
+- **0.8B (qwen35-test int8) 回帰確認**: `q35_gpu1.json`/`q35_gpu2.json` とも正常応答 (nk==nv で head mapping 規約は不変のため数値は不変のはず)
+
+**strided が GGUF 由来の正しい解釈である理由 (HF との乖離の説明)**:
+
+- 本エンジンの qwen3.5 は **GGUF 経路のみ**でロードする。GGUF+llama.cpp の意味論では k/q の v-head 対応は cyclic タイル (`ggml_repeat_4d` = `h % nk`) であり、実 GGUF のサブステージ比較でその解釈が `o` を cos≈1 で再現すること・同 GGUF で llama.cpp が正答すること (前節) をもって、**当該 GGUF に対する正しい解釈は cyclic と実測確定**した
+- 一方 HF transformers (5.19.0) の `GatedDeltaNet` は in_proj 出力を `[b, s, H_k, dk]` に reshape した後 `repeat_interleave` (**blocked**・v-head h → k-head h//g) する (`modeling_qwen3_5.py:610-612`) — safetensors の行順を blocked で読む前提
+- 両者が正であるためには GGUF 変換 (unsloth/新めの convert_hf_to_gguf) が k/q 行を再配置 (interleave) していることになる。ローカルの mainline clone (59d5fad) の convert_hf_to_gguf.py は qwen3.5 未対応のため変換器の直接確認は不可 (**残検証・人間対応候補**)。ただし本エンジンは GGUF のみを消費するため、当該 GGUF に対する規約の正しさは上記の実測で確定済み (エンジンが safetensors を直接読む経路は無い)
+- 0.8B は nk==nv で両規約同一 (影響なし)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -725,7 +759,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] ~~**A2.5: 9B 生成品質の改善(A3 前に推奨)**~~ → **完了**: チャットテンプレートは Qwen3.5 公式準拠を確認(不一致なし)・repetition penalty 実装(HF 互換・決定論・penalty 1.1 で反復解消)。根本の数値原因の切り分け(llama.cpp 同 GGUF 比較)は継続
 - [x] ~~**A4: prefix cache への GDN 状態スナップショット**(任意): recurrent モデルはフル prefill 固定(正しさ優先)~~ → **完了 (2026-10-15)**: KV + GDN 状態のペア復元 (prompt 境界スナップショット・`best_full_match` のときのみ復元・部分一致と同一 prompt は full prefill フォールバック)。復元後の継続 forward はフル prefill と bit 一致・退避は prefill 直後に変更。実機マルチターン E2E 計測は残課題
 - [x] ~~**8095 GPU E2E リグレッションの解明**~~ → **説明確定 (2026-10-15 第3セッション)**: 診断パッチ適用 GPU E2E(人間対応)の `[LCHK]` 比較で初発散層 = L00 GDN attn(drift ~4e-7 = 緩和契約内)・H1/H3 は否定。CPU drift 注入実験により「near-tie(90700 "Thinking" vs 8160 "Here"・logit 差 2.03)を微小 drift が 32 層のカオス的増幅で反転する temperature 0 greedy の不安定性」として定量的に説明(§3 参照・GPU カーネル異常の証拠は無し)。**残りは運用対応(人間)**: ①~~元 payload 復元+GPU E2E 再検証~~ → **完了 (第4セッション)**: 新正規 payload で GPU アンカー取得済み(seed 42・int8・HEAD 相当バイナリ・各々連続 2 回完全一致 = GPU 上の決定論確認済み・§3 参照) ②GPU バイナリ清浄再ビルド配備 ③B1/B2 実機計測 ④E2E 回帰判定基準の見直し(GPU 決定論+出力妥当性)⑤GPU LCHK ログの final argmax(8160/90700)確認。新アンカー: CPU `q35_9b_1b.json`→`3a0ddf1c…`・`q35_9b_2b.json`→`95199a33…` / GPU `q35_9b_1b.json`→`1a4ea71a…`・`q35_9b_2b.json`→`b4e58cb3…`
-- [ ] **27B 出力品質問題の解明**: 構造は正と確定 (§3 27B 節・out-gate 仮説否定)。**GGUF 品質も否定・エンジン固有バグと確定** (§3 27B 品質調査節・llama.cpp 同一 GGUF で正答/本エンジンは生成 step 0 で乖離・質問エコー)。次段: llama.cpp との層別隠れ状態比較で初発散層を特定 (GQA group 6 / GDN v-head 48 / 実重みテンソル対応)。起動は unsloth 均一 Q4_0 前提 (UD-IQ2_XXS は IQ1_M dequant 未対応)
+- [x] ~~**27B 出力品質問題の解明**~~ → **完了 (2026-10-16 第14〜17セッション)**: 根因は **GDN の GQA head mapping** (blocked `h*nk/nv` → タイル repeat `h % nk` に修正・CPU 2 箇所+GPU カーネル 3 箇所)。llama.cpp との層別/substage 比較で初発散 = GDN scan の `o` と特定し strided のみ cos≈1 (9B/27B)・27B CPU E2E で France/日本語とも正答 (早期 `<|im_end|>` 放棄とテンプレート断片ループが解消)・9B も同根因で新ベースライン `feea9444…`/`da0b1f57…` (各連続 2 回一致)。**残りは人間対応**: GPU E2E 再検証+アンカーの正式更新 (旧 GPU アンカー `1a4ea71a…`/`b4e58cb3…` は本修正で変化)。§3「GDN GQA head mapping 修正」節参照。起動は unsloth 均一 Q4_0 前提 (UD-IQ2_XXS は IQ1_M dequant 未対応)
 
 ### P17 系残課題(CUDA)
 

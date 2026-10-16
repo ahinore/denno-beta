@@ -216,6 +216,27 @@ pub fn forward_token_core(
     alpha: &[f32],
     st: &mut GdnState,
 ) -> Vec<f32> {
+    // 恒久診断: GDN サブステージ per-token ダンプ (27B 初発散層の stage 内切り
+    // 分け用)。DENNO_DEBUG_GDN_DUMP=<file> + DENNO_DEBUG_GDN_DUMP_LAYER=<li> で、
+    // 指定層の全トークンのサブステージを llama.cpp tools/lchk の GDN detail モード
+    // と同一順序 (qkv,z,beta,gate,conv,q,k,v,o,y) で raw f32 追記する。
+    // env ゲート済み・未指定時は no-op (恒久保持)。
+    let dbg_layer = DBG_CUR_LAYER.with(|c| c.get());
+    let dbg = matches!(gdump_cfg(), Some((_, l)) if l == dbg_layer && dbg_layer >= 0);
+    if dbg {
+        gdump("qkv", qkv);
+        gdump("z", z);
+    }
+    let (beta_sig, gate_dbg) = if dbg {
+        let bs: Vec<f32> = beta_raw.iter().map(|&b| sigmoid(b)).collect();
+        let g: Vec<f32> = (0..p.n_v_heads)
+            .map(|h| cw.ssm_a[h] * softplus(alpha[h] + cw.ssm_dt[h]))
+            .collect();
+        (bs, g)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     // ---- causal depthwise conv + silu --------------------------------
     // 入力列 = [conv_state (d_conv-1), qkv_t] をチャネルごとに畳み込み
     let cs = p.d_conv - 1;
@@ -241,6 +262,11 @@ pub fn forward_token_core(
         }
         conv_out[c] = silu(acc);
     }
+    if dbg {
+        gdump("conv", &conv_out);
+        gdump("beta", &beta_sig);
+        gdump("gate", &gate_dbg);
+    }
 
     // ---- split q/k/v ---------------------------------------------------
     let kd = p.key_dim();
@@ -263,16 +289,24 @@ pub fn forward_token_core(
             *v *= q_scale;
         }
     }
+    if dbg {
+        gdump("q", &q); // q_scale 適用済み (llama.cpp は scan 内で scale)
+        gdump("k", &k);
+        gdump("v", v_raw);
+    }
 
     // ---- デルタルール (head ごと・AR 形式) ------------------------------
     let dk = p.head_k_dim;
     let dv = p.head_v_dim;
     let mut o = vec![0.0f32; vd];
     for h in 0..p.n_v_heads {
-        // k/q は n_k_heads と n_v_heads が異なる場合は repeat_interleave 規約
-        // (HF repeat_interleave / llama.cpp ggml_repeat = blocked タイリング:
-        //  v-head h → k-head h/(nv/nk)。0.8B は nk==nv で同一・9B は nk=16/nv=32)
-        let kh = h * p.n_k_heads / p.n_v_heads;
+        // k/q は n_k_heads と n_v_heads が異なる場合はタイル repeat 規約
+        // (GGUF / llama.cpp ggml_repeat / fused カーネル `iv1 % neq1` = strided:
+        //  v-head h → k/q head h % nk。0.8B は nk==nv で同一・9B は nk=16/nv=32・
+        //  27B は nk=16/nv=48)。HF transformers の repeat_interleave (blocked) と
+        //  は異なる規約であり、第15/16セッションの lchk サブステージ比較で 9B/27B
+        //  とも llama.cpp の o が strided のみ cos≈1 で一致することを確認済み。
+        let kh = h % p.n_k_heads;
         let qh = &q[kh * dk..kh * dk + dk];
         let kh_v = &k[kh * dk..kh * dk + dk];
         let vh = &v_raw[h * dv..h * dv + dv];
@@ -343,8 +377,78 @@ pub fn forward_token_core(
         }
         y[obase..obase + dv].copy_from_slice(&seg);
     }
+    if dbg {
+        gdump("o", &o); // scan 出力 (gated norm 前)
+        gdump("y", &y); // gated norm 後
+    }
 
     y
+}
+
+// ---------------------------------------------------------------------------
+// 恒久診断: GDN サブステージ per-token ダンプ (27B 初発散層の stage 内切り分け
+// 用)。DENNO_DEBUG_GDN_DUMP=<file> + DENNO_DEBUG_GDN_DUMP_LAYER=<li> で、指定層
+// の全トークンのサブステージを llama.cpp tools/lchk の GDN detail モードと同一
+// 順序 (qkv,z,beta,gate,conv,q,k,v,o,y) で raw f32 追記する。
+// 層インデックスは qwen35.rs gdn_scan から gdn_dbg_set_layer で通知する。
+// env ゲート済み・未指定時は no-op (恒久保持)。
+// ---------------------------------------------------------------------------
+thread_local! {
+    static DBG_CUR_LAYER: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+}
+
+/// 現在処理中の GDN 層インデックスを診断スレッドへ通知 (qwen35.rs の gdn_scan)。
+pub fn gdn_dbg_set_layer(li: i64) {
+    DBG_CUR_LAYER.with(|c| c.set(li));
+}
+
+/// 診断ダンプが指定層に対して有効か (qwen35.rs の出力投影後ダンプのゲート)。
+pub fn gdn_dbg_enabled_for(li: i64) -> bool {
+    matches!(gdump_cfg(), Some((_, l)) if l == li)
+}
+
+/// 層コンテキストなしで明示 stage 名をダンプ (qwen35.rs の出力投影後など)。
+pub fn gdn_dbg_pub(stage: &str, v: &[f32]) {
+    gdump(stage, v);
+}
+
+fn gdump_cfg() -> Option<(std::path::PathBuf, i64)> {
+    static G: std::sync::OnceLock<Option<(std::path::PathBuf, i64)>> = std::sync::OnceLock::new();
+    G.get_or_init(|| {
+        let path = std::env::var("DENNO_DEBUG_GDN_DUMP").ok()?;
+        let layer = std::env::var("DENNO_DEBUG_GDN_DUMP_LAYER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0i64);
+        Some((std::path::PathBuf::from(path), layer))
+    })
+    .clone()
+}
+
+fn gdump(stage: &str, v: &[f32]) {
+    if let Some((path, _)) = gdump_cfg() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let _ = f.write_all(&bytes);
+        }
+        let mut bitsum: u64 = 0;
+        let mut maxabs = 0f32;
+        let mut ssq = 0f64;
+        for &x in v {
+            bitsum = bitsum.wrapping_add(x.to_bits() as u64);
+            maxabs = maxabs.max(x.abs());
+            ssq += (x as f64) * (x as f64);
+        }
+        eprintln!(
+            "[GDUMP] {stage} len={} bitsum={bitsum:016x} maxabs={maxabs:.6e} ssq={ssq:.10e}",
+            v.len()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -562,7 +666,8 @@ pub fn scan_chunked_core(
         let t0 = ci * chunk_len;
         let t1 = n.min(t0 + chunk_len);
         for h in 0..nv {
-            let kh = h * p.n_k_heads / nv; // repeat_interleave 規約
+            // タイル repeat 規約 (forward_token_core と同一・llama.cpp ggml_repeat 相当)
+            let kh = h % p.n_k_heads;
             let w_off = (ci * nv + h) * dk * dv;
             let m_off = (ci * nv + h) * dk * dk;
             // W スキャン: S = 0 起点の AR (列 c ごと)
@@ -875,6 +980,137 @@ mod tests {
         assert!(out.iter().all(|o| o.iter().all(|v| v.is_finite())));
         // 出力が発散しない (decay あり)
         assert!(out.iter().all(|o| o.iter().all(|v| v.abs() < 1e3)));
+    }
+
+    /// GQA ヘッド対応の固定テスト: v-head h が参照する k/q head はタイル repeat 規約
+    /// (h % nk・GGUF/llama.cpp ggml_repeat + fused カーネル `iv1 % neq1` 相当)。
+    /// 旧実装 (blocked: h*nk/nv = HF repeat_interleave 相当) は 9B/27B とも llama.cpp
+    /// の GDN scan 出力 o と乖離し 27B 出力破綻の原因だった (第15/16セッション確定)。
+    /// 構成: dk=2/dv=2・nk=2/nv=4・2 トークン・decay なし (ssm_a=0)・β≈1。
+    /// t0 と t1 で k head の向きを入れ替えることで、「どの k head をどの時刻で使ったか」
+    /// が o (→ gated norm 後の y) の方向として観測できる。
+    #[test]
+    fn gdn_gqa_head_mapping_is_tiled() {
+        let p = GdnParams {
+            n_embd: 4,
+            n_k_heads: 2,
+            n_v_heads: 4,
+            head_k_dim: 2,
+            head_v_dim: 2,
+            d_conv: 4,
+            eps: 1e-6,
+        };
+        let vd = p.value_dim(); // 8
+        let cd = p.conv_dim(); // 16
+        // conv1d: 最終 tap のみ 1.0 → conv_out[c] = silu(qkv[c]) (conv 状態は不問)
+        let mut conv1d = vec![0.0f32; cd * p.d_conv];
+        for c in 0..cd {
+            conv1d[c * p.d_conv + p.d_conv - 1] = 1.0;
+        }
+        let cw = GdnCore {
+            conv1d: &conv1d,
+            ssm_a: &[0.0; 4], // decay なし (eg = 1)
+            ssm_dt: &[0.0; 4],
+            ssm_norm: &[1.0, 1.0],
+        };
+        // q チャネル (両トークン共通): kh0=[3,0] kh1=[0,3] → silu+L2 で [1,0]/[0,1] (×q_scale)
+        let q_ch = [3.0f32, 0.0, 0.0, 3.0];
+        // k チャネル: t0 は全 kh [1,0] 向き / t1 は全 kh [0,1] 向き
+        // → (q_kh·k_t0kh, q_kh·k_t1kh) = (q_kh[0], q_kh[1]) となり o[t1] は q_kh に比例
+        let k_ch = [
+            [3.0f32, 0.0, 3.0, 0.0],
+            [0.0, 3.0, 0.0, 3.0],
+        ];
+        // v チャネル: t0 全 head [3,0] / t1 全 head [0,3] (d0=[s,0] d1=[0,s] 方向)
+        let v_ch = [
+            [3.0f32, 0.0, 3.0, 0.0, 3.0, 0.0, 3.0, 0.0],
+            [0.0, 3.0, 0.0, 3.0, 0.0, 3.0, 0.0, 3.0],
+        ];
+        let z = vec![1.0f32; vd];
+        let beta_raw = vec![20.0f32; 4]; // sigmoid ≈ 1
+        let alpha = vec![0.0f32; 4];
+
+        let mut y = Vec::new();
+        let mut st = GdnState::new(&p);
+        for t in 0..2 {
+            let mut qkv = Vec::with_capacity(cd);
+            qkv.extend_from_slice(&q_ch);
+            qkv.extend_from_slice(&k_ch[t]);
+            qkv.extend_from_slice(&v_ch[t]);
+            y.push(forward_token_core(&p, &cw, &qkv, &z, &beta_raw, &alpha, &mut st));
+        }
+
+        // 独立に期待値を計算 (decay なし・β≈1 → o[t] = Σ_τ (q_kh·k_τkh)·d_τ)
+        let silu = |x: f32| x / (1.0 + (-x).exp());
+        let l2 = |mut x: Vec<f32>| {
+            let s: f32 = x.iter().map(|t| t * t).sum();
+            let inv = 1.0 / (s + p.eps).sqrt();
+            for t in x.iter_mut() {
+                *t *= inv;
+            }
+            x
+        };
+        let qscale = 1.0f32 / (p.head_k_dim as f32).sqrt();
+        let qh: Vec<Vec<f32>> = (0..2)
+            .map(|h| {
+                l2(q_ch[h * 2..h * 2 + 2].to_vec())
+                    .iter()
+                    .map(|t| t * qscale)
+                    .collect()
+            })
+            .collect();
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let beta = 1.0f32 / (1.0 + (-20.0f32).exp());
+        let d: Vec<[f32; 2]> = (0..2)
+            .map(|t| {
+                let s = silu(3.0);
+                if t == 0 {
+                    [beta * s, 0.0]
+                } else {
+                    [0.0, beta * s]
+                }
+            })
+            .collect();
+        // k の L2 後の向き (両 kh 同一・トークンで異なる)
+        let k_l2: Vec<[f32; 2]> = (0..2)
+            .map(|t| {
+                let v = l2(k_ch[t][0..2].to_vec());
+                [v[0], v[1]]
+            })
+            .collect();
+        // t=1 の o: (c0, c1) = (q_kh·k_t0kh, q_kh·k_t1kh) で d0/d1 を線形結合
+        let o_of = |kh: usize| {
+            let c0 = dot(&qh[kh], &k_l2[0]);
+            let c1 = dot(&qh[kh], &k_l2[1]);
+            [c0 * d[0][0], c1 * d[1][1]]
+        };
+        // gated rms norm (dv=2) 後の期待 y
+        let y_of = |o: [f32; 2]| {
+            let mean2 = (o[0] * o[0] + o[1] * o[1]) / 2.0;
+            let inv = 1.0 / (mean2 + p.eps).sqrt();
+            [(o[0] * inv) * silu(1.0), (o[1] * inv) * silu(1.0)]
+        };
+        let expect1: Vec<f32> = (0..4)
+            .flat_map(|h| y_of(o_of(h % 2)))
+            .collect();
+        // 判別力: blocked (h*nk/nv) では h=2 が k-head 1 (=q [0,1] 向き) を使う
+        let expect1_blocked_h2 = y_of(o_of(2 * 2 / 4));
+        assert!(
+            (expect1[4] - expect1_blocked_h2[0]).abs() > 1e-3
+                || (expect1[5] - expect1_blocked_h2[1]).abs() > 1e-3,
+            "テスト入力が blocked/strided を区別できていない"
+        );
+        for h in 0..4 {
+            assert!(
+                (y[1][h * 2] - expect1[h * 2]).abs() < 1e-4
+                    && (y[1][h * 2 + 1] - expect1[h * 2 + 1]).abs() < 1e-4,
+                "h={h}: got=({:.6},{:.6}) want(strided)=({:.6},{:.6})",
+                y[1][h * 2],
+                y[1][h * 2 + 1],
+                expect1[h * 2],
+                expect1[h * 2 + 1]
+            );
+        }
     }
 
     // ==================== A1-r2: chunked scan テスト ========================

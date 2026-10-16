@@ -616,6 +616,7 @@ o[c]   = sum_r q[r] * S[r][c]
 
 - q/k は事前に **L2 正規化**(x/sqrt(Σx²+eps)・q のみ追加で 1/sqrt(head_k_dim))
 - softplus は ggml 規約(`x > 20 ? x : log(1+exp(x))`)
+- **GQA head mapping はタイル repeat 規約**: n_v_heads > n_k_heads のとき v-head h が参照する k/q head は **`h % n_k_heads`**(cyclic タイル・GGUF/llama.cpp `ggml_repeat` と同一)。HF transformers の `repeat_interleave`(blocked・`h // g`)とは**異なる規約**で、GGUF 経路の意味論に従う(0.8B は nk==nv で同一・9B 2x・27B 3x。割り切れない構成はロード拒否)。旧実装の blocked は 27B 出力破綻の根因だった(2026-10-16 修正・[開発履歴](HISTORY.ja.md)「GDN GQA head mapping 修正」節)
 - 実装は llama.cpp `delta-net-base.cpp` の `build_delta_net_autoregressive`(逐次 AR 形式)の 1:1 移植。llama.cpp とのビット一致は要求せず、denno 契約(同一入力→同一出力+決定論)のみを担保(逐次 AR 形式と chunked 形式は数学的に等価)
 - コード構成: `gdn.rs` に `GdnCore<'a>`(極小 f32 テンソル: conv1d/ssm_a/ssm_dt/ssm_norm の参照ビュー)+ `forward_token_core`(数学コア)。大きい行列(qkv/gate/beta/alpha/out)は既存 `Linear` を再利用 → `model/qwen35.rs` が層を組み立てる
 
@@ -657,7 +658,7 @@ GDN は状態が「トークン位置ごと」ではなく**シーケンス全�
 
 ### 12.6 GDN の GPU 化と chunked scan(P19-A1 / A1-r2)
 
-GDN スキャンの GPU カーネル(`kernels/gdn.cu` + `kernels_gdn.ptx`)は **head ごと 1 ブロック(grid = nv)・スレッド = S の 1 列**を保持し、delta rule の全更新をスレッド内で完結させる(スレッド間 reduction 不要)。決定論の方針は launch 構成固定・昇順逐次和・atomic/ワープ縮約不使用。GDN は bit 一致不要契約のため `expf` 等を使用し、CPU との数値一致は緩和枠(maxabs < 1e-3・cos > 0.999)で担保する。
+GDN スキャンの GPU カーネル(`kernels/gdn.cu` + `kernels_gdn.ptx`)は **head ごと 1 ブロック(grid = nv)・スレッド = S の 1 列**を保持し、delta rule の全更新をスレッド内で完結させる(スレッド間 reduction 不要)。決定論の方針は launch 構成固定・昇順逐次和・atomic/ワープ縮約不使用。GDN は bit 一致不要契約のため `expf` 等を使用し、CPU との数値一致は緩和枠(maxabs < 1e-3・cos > 0.999)で担保する。k/q の head 対応は CPU と同一の**タイル repeat 規約**(`kh = h % nk`・§12.2)で、3 カーネル(`dno_gdn_scan`/`dno_gdn_chunk_pre`/`dno_gdn_chunk_scan`)共通(2026-10-16 修正)。
 
 経路の割り振り(`cuda::gdn_scan_batch` が唯一の入口・前提 dk == dv / d_conv == 4):
 

@@ -218,12 +218,13 @@ impl Qwen35 {
             d_conv: cfg_u64(tc, "linear_conv_kernel_dim")? as usize,
             eps,
         };
-        // A3: repeat_interleave 規約 (gdn.rs: v-head h → k-head h*nk/nv) は
-        // n_v_heads が n_k_heads の整数倍であることを要求する (0.8B 1x・9B 2x・
-        // 27B 3x)。割り切れない構成は静かに誤マップするためロード時に拒否する。
+        // A3: タイル repeat 規約 (gdn.rs: v-head h → k/q head h % nk・llama.cpp
+        // ggml_repeat 相当) は n_v_heads が n_k_heads の整数倍であることを要求する
+        // (0.8B 1x・9B 2x・27B 3x。llama.cpp delta-net-base も H_v % H_k == 0 を
+        // assert)。割り切れない構成はロード時に拒否する。
         if gdn_p.n_v_heads % gdn_p.n_k_heads != 0 {
             bail!(
-                "linear_num_value_heads ({}) が linear_num_key_heads ({}) の整数倍ではありません (GDN k-head repeat_interleave 規約)",
+                "linear_num_value_heads ({}) が linear_num_key_heads ({}) の整数倍ではありません (GDN k/q head タイル repeat 規約)",
                 gdn_p.n_v_heads,
                 gdn_p.n_k_heads
             );
@@ -675,6 +676,7 @@ impl Qwen35 {
             conv: conv.to_vec(),
             ssm: ssm.to_vec(),
         };
+        crate::gdn::gdn_dbg_set_layer(li as i64); // 恒久診断 (env ゲート・未指定時 no-op)
         let cw = GdnCore {
             conv1d: &lg.conv1d,
             ssm_a: &lg.ssm_a,
@@ -858,6 +860,7 @@ impl Qwen35 {
         for (i, &tok) in tokens.iter().enumerate() {
             x[i * e..(i + 1) * e].copy_from_slice(&self.embed[tok as usize * e..][..e]);
         }
+        lchk("prefill emb", &x[(n - 1) * e..]); // 恒久診断 (env ゲート・未指定時 no-op)
         let heads = self.heads;
         let kv_heads = self.kv_heads;
         let dh = self.dh;
@@ -921,6 +924,12 @@ impl Qwen35 {
                     let ys: Vec<f32> =
                         self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy);
                     let out = g.out_w.apply_bt_rows(&ys, n);
+                    if crate::gdn::gdn_dbg_enabled_for(li as i64) {
+                        // 恒久診断 (env ゲート・未指定時 no-op): 出力投影後 (llama.cpp linear_attn_out 相当)
+                        for i in 0..n {
+                            crate::gdn::gdn_dbg_pub("attnout", &out[i * e..(i + 1) * e]);
+                        }
+                    }
                     for i in 0..n {
                         for (xi, ai) in x[i * e..(i + 1) * e]
                             .iter_mut()
@@ -958,6 +967,7 @@ impl Qwen35 {
                     }
                 }
             }
+            lchk(&format!("L{li:02} attn"), &x[(n - 1) * e..]); // 恒久診断 (env ゲート・未指定時 no-op)
             // --- FFN: SwiGLU をバッチ一括 ---
             let mut h2 = vec![0.0f32; n * e];
             for i in 0..n {
@@ -983,14 +993,80 @@ impl Qwen35 {
                     *xi += di;
                 }
             }
+            lchk(&format!("L{li:02} ffn"), &x[(n - 1) * e..]); // 恒久診断 (env ゲート・未指定時 no-op)
         }
 
         // 最終 norm + logits は最終トークンのみ (トークン逐次経路の最終値と同一)
         let hf = rmsnorm(&x[(n - 1) * e..], &self.norm_w, e, self.eps);
         let logits = self.logits(&hf);
+        lchk("final hf", &hf); // 恒久診断 (env ゲート・未指定時 no-op)
+        lchk("final logits", &logits); // 恒久診断 (env ゲート・未指定時 no-op)
+        lchk_argmax("final logits", &logits); // 恒久診断 (env ゲート・未指定時 no-op)
         cache.advance(n);
         Ok(logits)
     }
+}
+
+// ---------------------------------------------------------------------------
+// 恒久診断 (env ゲート・未指定時 no-op): 層別 hidden-state checksum ダンプ
+// (DENNO_DEBUG_LAYER_CHKSUM=1)
+// 27B 出力破綻の初発散層特定用 (HANDOFF_NEXT 第14セッション)。llama.cpp 側の
+// リファレンスツール (/work/llama.cpp/tools/lchk) と同一書式の [LCHK] 行を
+// stderr に出力し、同一プロンプト・同一 GGUF での層別比較に使う。
+// DENNO_DEBUG_LAYER_CHKSUM_FILE が設定されていれば、さらにステージ順に最終
+// トークン行の raw f32 (LE) を追記する (dim 単位比較用)。
+// env ゲート済み・未指定時は no-op (恒久保持)。
+// ---------------------------------------------------------------------------
+fn lchk_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| std::env::var("DENNO_DEBUG_LAYER_CHKSUM").ok().as_deref() == Some("1"))
+}
+
+fn lchk(stage: &str, v: &[f32]) {
+    if !lchk_enabled() {
+        return;
+    }
+    let mut bitsum: u64 = 0;
+    let mut maxabs: f32 = 0.0;
+    let mut ssq: f64 = 0.0;
+    for &f in v {
+        bitsum = bitsum.wrapping_add(f.to_bits() as u64);
+        let a = f.abs();
+        if a > maxabs {
+            maxabs = a;
+        }
+        ssq += (f as f64) * (f as f64);
+    }
+    eprintln!(
+        "[LCHK] {stage} len={} bitsum={bitsum:016x} maxabs={maxabs:.6e} ssq={ssq:.10e}",
+        v.len()
+    );
+    if let Ok(path) = std::env::var("DENNO_DEBUG_LAYER_CHKSUM_FILE") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let _ = f.write_all(&bytes);
+        }
+    }
+}
+
+fn lchk_argmax(stage: &str, logits: &[f32]) {
+    if !lchk_enabled() {
+        return;
+    }
+    let mut bi = 0usize;
+    let mut bv = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > bv {
+            bv = v;
+            bi = i;
+        }
+    }
+    eprintln!("[LCHK] {stage} argmax={bi} logit={bv:.6e}");
 }
 
 #[cfg(test)]
