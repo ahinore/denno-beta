@@ -905,6 +905,29 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - 統合テスト `tests/tools.rs`: `tools_with_stream_is_rejected` (400 拒否) を `tools_with_stream_is_accepted` (SSE 完整性: 全イベント種別の event: 行・tool block 無し時は tool_use を含まない・delta 結合 = greedy 期待値・stop_reason) に置換
 - `cargo test --workspace` **215 passed / 0 failed** (engine lib 169 変更無し)・`cargo check --features cuda --lib` 通過 — 警告 12 本は **HEAD と同一内容** (engine.rs のシグネチャ変更で新規警告ゼロ)
 
+### スケジューラ ワーカー アイドル busy-spin の修正 + 8095 断発ハングのコードレベル監査 (2026-10-16)
+
+> 実機で観察された断発ハング (リクエスト受諾後 200+ping のまま生成が始まらず・GPU 0%・denno-scheduler スレッド 1 本が 100% CPU で恒久スピン・再起動のたび数リクエスト後に再発・tools/max_tokens/stream 不問・gdb ではスピン スレッドの frame #0 が `Qwen35::full_attn_core` 内) のコードレベル監査 (第37セッション)。監査により「sync/イベント待ちの無限スピン」「pinned 確保失敗の握り潰し+待機ループ」の仮説は**コード上存在しない**ことを確認。実在したスピン源 (スケジューラ ワーカーのアイドル busy-loop) を修正し、ハング本体の最有力説明は「CPU フォールバック後の O(n²) prefill attention」として実機検証を人間対応に委譲。
+
+**監査結果 (仮説の棄却と実在欠陥の特定)**:
+
+1. **full_attn_core に無限ループは存在しない**: 全ループは heads / dh / t_total 有界で、t_total ≤ ctx は `forward` / `forward_prefill` の `bail!` と decode chain の `t_total_overflow` ゲートで強制される。`full_attn_core` は CPU 純関数で sync / cuCtxSynchronize 呼び出しを含まない (GPU chain は cuda.rs 側・per-op が `?`/`ok()` で伝播)。「sync が full_attn_core にインラインされスピン」という gdb 読み替え説は成立しない (sampler / softmax / kv_cache / tokenizer にも rejecting loop・収束ループ無しを確認)
+2. **確保失敗の握り潰し+待機ループは存在しない**: GPU バッファ確保の唯一の入口は `DevBuffer::alloc` (cuMemAlloc) と `PinMem::alloc` (cuMemHostAlloc) で、両者とも `check()` → `Result` で伝播する。呼び出し側は `Scratch::ensure` / `ensure_pin` → `ok()` / `chain_err` (GPU_BROKEN ラッチ + CPU フォールバック) か `tracing::error!` + ラッチのどれかで、待機/再試行ループは crate 全体の loop/while 監査でも存在しない
+3. **実在したスピン**: `scheduler.rs` worker のアイドル busy-loop。旧実装は active 空 + キュー空でも `try_recv` + engine Mutex + 空 `step_chat_batch` を全速で回し続け (P17k コメントに「秒間数十万回」の記録)、**アイドル中も denno-scheduler スレッドが 100% CPU を恒久消費**していた。P17k の修正は空 PROFILE ブロックのログ洪水 (470GB/h 事故) だけを止めてループ自体は残しており、同一スピンの別症状
+4. **ハング観測の最有力説明**: qwen35 の prefill full attention は GPU カーネルが無く**常に CPU** (`forward_prefill` がトークン毎に `full_attn_core` を呼ぶ・decode chain の `chain_q35_fullattn` は n==1 専用) で O(n²) 単スレッド。一過的な GPU エラー (メモリ逼迫下の cuMemHostAlloc / cuMemAlloc OOM 等) で **GPU_BROKEN が恒久ラッチ**されると decode も CPU に落ち、長めコンテキストの forward が「永久スピン」に見える。ストリーミングは prefill 完了まで出力が無く・非ストリームは応答全体がブロックされ・tools/max_tokens/stream 不問で症状が完全一致。「数リクエスト後に再発」はラッチ発火がたまたま起きるまで正常動作→発火後は全リクエストが低速 CPU 経路という形状で説明できる。ラッチ発火時は `cuda chain failed (falling back to CPU)` / `CUDA ... failed, using CPU` が stderr + tracing に 1 回出るので実機ログで判別可能
+
+**修正 (scheduler.rs・数値経路無変更)**: worker ループ先頭で active 空のとき `rx.recv()` にブロックするよう変更 (ジョブ到着で即座に起床・全 Sender drop で終了。応答性・終了条件は旧 try_recv ポーリングと同一)。アイドル時の 100% CPU 恒久消費が解消され、メモリ/CPU 逼迫環境での常時 CPU 競合も除去される
+
+**テスト**: 新規 `server/tests/scheduler_idle.rs` — `/proc/self/task/<tid>/stat` の utime+stime をアイドル 500ms の前後で測定し増分 < 20 tick を assert (旧実装では ~50 tick 増加で FAIL・修正後はほぼ 0 で PASS の両方を確認済み)。同名スレッド混入防止のため単独テストバイナリ化。`cargo test --workspace` **216 passed / 0 failed** (旧 215 + 1)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)
+
+**人間対応 (実機での切り分け)**:
+
+- ハング再現時に stderr / tracing ログの `cuda chain failed (falling back to CPU)` / `CUDA ... failed, using CPU` 行の有無を確認 (GPU_BROKEN 恒久ラッチの発火証拠。「メモリ逼迫 → pinned 確保失敗」は握り潰しではなくラッチ+CPU フォールバックとして実装済みで、発火すれば必ず記録される)
+- ハング時リクエストのプロンプト トークン数を確認 (数千超なら O(n²) CPU prefill attention 仮説が確定。prefill の full attention は GPU 化されていないため長プロンプトで所要時間が 2 乗で増える)
+- スピン スレッドの PC を gdb/perf で 2 回サンプルし位置が動いていれば「進行はしているが遅い」(O(n²) 計算中) と断定できる
+- GPU 再ビルド不要 (修正は scheduler.rs のみ・PTX 無関係・数値経路無変更)
+- 抜本対策候補 (次タスク): qwen35 prefill full attention の GPU 化 (`chain_attention_prefill` 流用を検討) or prefill 分割。GPU_BROKEN ラッチの時間経過リセットは設計判断が必要 (再試行で prefill 全体のやり直しが 2 重化するトレードオフ)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -949,7 +972,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **CIでスキップされるテストは「実行されたことがない」のと同じ**(P11の教訓): `#[ignore]`+モデル未キャッシュで早期returnするテストは、基準文字列が古くなっても誰も気づかない。参照実装(HF transformers等)との一致検証で基準を更新し、CIにモデルpullを追加して本当に走らせた
 - **matrixmultiplyはストライド/行数でSIMDカーネルを選び替えるため数値が変わる**(P12の教訓): GEMM呼び出しの形状・ストライドを変える最適化は、ビット一致を実測(to_bits比較)して確認するまで採用できない。scores側(転置レイアウト)は行統合・ストライド両方不一致、probs@V側(row-major)は両方一致 — 同一ライブラリでも経路で性質が違う。単体テストを永久に残して担保する
 - **測定スクリプトの教訓**(P12): ①pkillパターンは実際のコマンドラインに一致させる(`denno serve`は`/tmp/denno_old serve`にマッチしない→A/B全12回が同じサーバーに当たり無効データ)。起動ログの`quant mode`を毎回確認してサーバー Identity を保証する ②op別プロファイルの表示で`tail -n`は先頭(最大op)行を切り捨てる — 最大opが欠けた状態でshare比を読むと誤解する
-- **常時ポーリングするループに観測フックを足すと洪水になる**(P13の教訓): スケジューラワーカーはアイドル時も空バッチで`step_chat_batch`を回し続ける設計のため、telemetryのKvUsage発出をバッチ内容に関係なく入れると毎秒数千フレーム→ハブ満杯→Gap洪水。**「発出条件=意味のあるイベントが起きた時」**(空バッチは発出しない)がテレメトリ設計の原則。観測系を足したら必ず実機e2eでフレーム流量を確認する
+- **常時ポーリングするループに観測フックを足すと洪水になる**(P13の教訓): スケジューラワーカーはアイドル時も空バッチで`step_chat_batch`を回し続ける設計のため、telemetryのKvUsage発出をバッチ内容に関係なく入れると毎秒数千フレーム→ハブ満杯→Gap洪水。**「発出条件=意味のあるイベントが起きた時」**(空バッチは発出しない)がテレメトリ設計の原則。観測系を足したら必ず実機e2eでフレーム流量を確認する(2026-10-16 補足: アイドルポーリング自体も後日「active 空 + キュー空で `rx.recv()` にブロック」に修正済み — §3「スケジューラ ワーカー アイドル busy-spin の修正」節。空バッチ発出抑止はバッチ構成が遷移する瞬間に仍有効)
 - **f16自前実装の落とし穴**(P13): エンコード(RNE丸め・非正規・Inf/NaN)より**デコードの非正規正規化で指数を取り違えやすい**(2^14倍のオフで0.999に化けた)。既知値テストは「encodeの期待値表」+「decodeの既知値(0x0001/0x0400/0x03FF)」の**両方向**を用意する。往復テスト(relative error)だけでも片方向のバグは拾えるが、非正規域は往復相対誤差が大きくなるので既知値が確実
 - **CIの教訓**: `target-cpu=native` はキャッシュ共有されるCIでは危険(rust-cacheがランナー間で成果物を共有し、別世代CPUでSIGILL)。CIでは固定ターゲット(x86-64-v3)、ネイティブ最適化は自己ホストの本番ビルドでのみ
 - **mutex starveの教訓**: 1つのスレッドがmutexをループでほぼ連続取得すると、std::sync::Mutex(非フェア)では他スレッドが数百ms以上奪えないことがある。ハンドラが参照するだけの不変データはロック外にキャッシュする設計が吉

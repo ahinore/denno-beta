@@ -156,6 +156,29 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
 
     loop {
         // --- 新規ジョブの pull (空きスロットがある限り同時受け付け) ---
+        // s37: active が空のときは try_recv ポーリングではなく recv でブロックする。
+        // 旧実装はワーカーループ全体がブロック無しで回る設計で (P17k コメントの
+        // 「秒間数十万回」参照)、ジョブが無い間も try_recv + engine Mutex + 空
+        // step_chat_batch を全速で回し続け、アイドル中のワーカースレッドが
+        // 100% CPU を恒久消費していた (実機 8095 の「denno プロセスの 1 スレッド
+        // が 100% CPU で永久スピン」観測のスピン源)。recv はジョブ到着で即座に
+        // 起床するため応答性は不変・全 Sender drop で終了する (旧終了条件
+        // Disconnected && active.is_empty() と同一)。
+        if active.is_empty() {
+            match rx.recv() {
+                Ok(job) => {
+                    in_flight.fetch_add(1, Ordering::SeqCst);
+                    let mut run = build_run(&engine, job);
+                    if let Err(e) = admit(&engine, &mut run) {
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        send_error(&mut run, e);
+                    } else {
+                        active.push(run);
+                    }
+                }
+                Err(_) => return,
+            }
+        }
         while active.len() < MAX_ACTIVE_SESSIONS {
             match rx.try_recv() {
                 Ok(job) => {
