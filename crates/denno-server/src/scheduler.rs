@@ -27,8 +27,16 @@
 //!   hyper が書き込み失敗 (broken pipe / connection reset) を検知して応答ボディを
 //!   drop し、events チャネルが閉鎖する。ワーカーはステップ境界ごとに閉鎖を確認し、
 //!   該当 Run の生成を打ち切る (KV スロット解放 + ログ 1 行。他 Run への影響無し・
-//!   数値経路には触れない)。非ストリーム (Job::Chat) はレスポンス送信まで接続状態を
-//!   観測する手段が無いため対象外。
+//!   数値経路には触れない)。
+//! - s44: 非ストリーム (Job::Chat) も同様に検知する。hyper は応答 future が
+//!   pending の間も接続の read 側を監視しており、クライアント切断を検知すると
+//!   接続タスクごと handler future をキャンセル (drop) する。handler は
+//!   respond (oneshot) の Receiver を保持しているため、キャンセルされると
+//!   Sender 側の is_closed() が true になる — これを切断の間接観測に使い、
+//!   SSE と同一の打ち切り経路 (sweep) に乗せる。切断が応答書き込みの瞬間まで
+//!   検知されなかった場合 (EPIPE) は生成が完走し、hyper がその接続タスクだけを
+//!   終了させるため、いずれの経路でもジョブは完走/破棄のどちらかで確実に整理され、
+//!   ワーカー・KV・受付ループへの残留影響は無い。
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -92,13 +100,25 @@ struct Run {
 }
 
 impl Run {
-    /// s38: クライアント切断検知。SSE 応答ボディ (ReceiverStream) が drop されると
-    /// events チャネルの Receiver が全て消えて `Sender::is_closed()` が true になる。
-    /// hyper はクライアント切断 (broken pipe / connection reset) を書き込み時に検知し
-    /// ボディを drop するため、この判定は切断の間接観測になる。
-    /// Job::Chat (非ストリーム) は検知経路が存在しない (None → 常に false)。
+    /// s38/s44: クライアント切断検知。切断済みクライアントへの応答チャネルが
+    /// 閉鎖すると true になる。
+    ///
+    /// - SSE (Stream): hyper はクライアント切断 (broken pipe / connection reset) を
+    ///   書き込み時に検知し応答ボディを drop する → ReceiverStream の Receiver が
+    ///   全て消えて `events.is_closed()` が true になる。
+    /// - 非ストリーム (Chat): hyper は応答 future pending 中のクライアント切断
+    ///   (read 側の EOF / RST) を検知すると接続タスクごと handler future を
+    ///   キャンセルする → handler が保持していた respond の Receiver が drop され
+    ///   `respond.is_closed()` が true になる (s38 当時は検知経路が無かったが、
+    ///   この観測で SSE と同一の sweep に乗せられる)。
     fn client_gone(&self) -> bool {
-        self.events.as_ref().map_or(false, |e| e.is_closed())
+        if let Some(events) = &self.events {
+            return events.is_closed();
+        }
+        if let Some(respond) = &self.respond {
+            return respond.is_closed();
+        }
+        false
     }
 }
 
@@ -297,8 +317,9 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
                         }
                         finish_run(run);
                     } else if active[i].client_gone() {
-                        // s38: decode ステップ中にクライアントが切断
-                        // (書き込み失敗 → 応答ボディ drop → チャネル閉鎖)。
+                        // s38/s44: decode ステップ中にクライアントが切断。
+                        // Stream: 書き込み失敗 → 応答ボディ drop → チャネル閉鎖。
+                        // Chat: hyper が handler future をキャンセル → respond 閉鎖。
                         // 生成を打ち切って KV スロットを解放する (通常完了と同一の
                         // 除去経路なので他 Run / engine 状態への影響は無い)
                         in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -365,7 +386,8 @@ fn build_run(engine: &Arc<Mutex<Engine>>, job: Job) -> Run {
 
 /// 新規ジョブの admit (pull 経路 2 箇所の共通化)。成功なら active へ push する。
 /// admit 失敗時は send_error で応答するが、s38: 切断由来 (events チャネル閉鎖 —
-/// SSE プリアンブル送信が broken pipe で失敗する等) の場合はエラーではなく
+/// SSE プリアンブル送信が broken pipe で失敗する等 / s44: respond Receiver drop —
+/// 待ち行列中にクライアントが切断した場合) の場合はエラーではなく
 /// 打ち切りとして扱う (クライアントは既に居ないため送信先が存在しない)。
 fn admit_job(
     engine: &Arc<Mutex<Engine>>,
@@ -387,7 +409,7 @@ fn admit_job(
     }
 }
 
-/// s38: クライアント切断による Run 打ち切り。KV スロットを解放し 1 行だけ記録する。
+/// s38/s44: クライアント切断による Run 打ち切り。KV スロットを解放し 1 行だけ記録する。
 /// 送信は行わない (送信先チャネルは既に閉じている)。engine 側は通常完了と同一の
 /// `release_session` のみで、KV/Scratch 状態は次のセッションからそのまま使える。
 /// install 前 (admit 失敗・未実施) の場合も `release_session` は slot 無しで no-op。

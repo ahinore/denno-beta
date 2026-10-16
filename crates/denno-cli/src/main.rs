@@ -75,12 +75,19 @@ pub fn model_dir(repo: &str) -> PathBuf {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new("info")
-    });
-    tracing_subscriber::fmt().init();
+    let cli = Cli::parse();
+    // s44: serve のみ非同期ロギングを使う (logging.rs — stdout 消費者の凍結で
+    // サーバスレッドがブロックしない)。他サブコマンドは従来どおりの同期ロギング。
+    if matches!(cli.command, Commands::Serve { .. }) {
+        denno_server::init_serve_logging();
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new("info")
+        });
+        tracing_subscriber::fmt().init();
+    }
 
-    match Cli::parse().command {
+    match cli.command {
         Commands::Pull { repo } => {
             let dir = model_dir(&repo);
             pull::pull(&repo, &dir)?;

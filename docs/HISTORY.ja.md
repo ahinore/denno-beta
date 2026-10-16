@@ -1033,6 +1033,38 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 `cargo test --workspace` **231 passed / 0 failed** (旧 229 + 2)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)。8095 配備用 cuda バイナリの再ビルドは人間対応 (PTX 再生成は不要)
 
+### 非ストリーム /v1/messages のクライアント切断後処理の堅牢化 (s44) ✅ (2026-10-16)
+
+> 第44セッション (§4 に記録した REPORT_NEXT17 §4 観察 — 非ストリームのクライアント切断後に完了ログが欠落し、ログ消費者死亡後にサーバが新規接続に応答しなくなる wedge — の解明と修正)。2 つの独立した問題 (①非ストリームの切断が検知されない ②同期 stdout ロギングが凍結でサーバを wedge させる) を確定し、それぞれ修正した。数値経路・決定論への影響は構造的にゼロ (ロギングとスケジューラの Run 整理のみ・推論/サンプリングに触れない)。
+
+**根因 1 — 非ストリームの切断が検知されない (s38 の前提を訂正)**:
+
+- s38 当時は「hyper はレスポンス送信まで接続状態を観測する機会が無い (読みも書きも発生しない)」として非ストリームを対象外にしていたが、スクラッチ実験で hyper 1.12 は**応答 future が pending の間も接続の read 側を監視しており**、クライアント切断 (read 側 EOF / RST) を検知すると**接続タスクごと handler future をキャンセル (drop)** することを観測した (切断後に handler の完了フラグが立たない)
+- handler は respond (oneshot) の Receiver を保持しているため、キャンセルされると Sender 側の `is_closed()` が true になる — これを切断の間接観測に使え、SSE (s38) と同一の sweep に乗せられる
+
+**修正 A (scheduler.rs)**: `Run::client_gone()` に respond の閉鎖判定を追加 (events が None の Job::Chat は `respond.is_closed()`)。非ストリームも s38 の切断 sweep (decode ステップ境界の打ち切り・KV スロット解放・in_flight 減算) に同一経路で乗る。切断が応答書き込みの瞬間まで検知されなかった場合 (EPIPE) は生成が完走し、hyper がその接続タスクだけを終了させる — いずれの経路でもジョブは完走 / 破棄のどちらかで確実に整理され、ワーカー・KV・受付ループへの残留影響は無い
+
+**根因 2 — 同期 stdout ロギングによる wedge**:
+
+- 旧実装 (`tracing_subscriber::fmt().init()`) はログ行を呼び出し元スレッドから同期的に stdout へ書く。stdout がパイプ (`denno serve ... | tee` 等) の場合: ①消費者 (tee) が凍結するとパイプバッファ (64KB) が満杯 ②最初のログ書き込みスレッドは `std::io::stdout()` のグローバルロックを保持したまま `write()` で永久ブロックする (実測: wchan `anon_pipe_write`) ③以後の全ログ書き込みはそのグローバルロック待ち (futex) で停止する — `log_requests` ミドルウェアが全リクエストで 1 行書くため、接続タスクごとに tokio ワーカーが停止する ④ワーカー枯渇 → ランタイム全体が進行不能 (CPU 0%・プロセス生存・`/health` 無応答 = wedge 事例と完全一致。パイプを排出すると即座に復旧することを実証)
+- つまり wedge は「非ストリームの切断後処理」と「ログ凍結」の複合 — 非ストリームの応答書き込み失敗 (EPIPE) で完了ログが欠落していたのは根因 1 の現象で、その後の新規接続無応答は根因 2 が単独で引き起こし得る (実験では分離して再現)
+
+**修正 B (logging.rs 新規)**: `NonBlockingStdout` — ログ行を有界キュー (4096 行・`try_send`) に入れ、stdout への書き込みは専用 `denno-logger` スレッド 1 本だけが行う。サーバスレッド (tokio ワーカー・スケジューラ) は stdout のロックやパイプ書き込みで決してブロックしない
+
+- キュー満杯: 行を破棄してカウントし、復旧後に `denno-logger: N log line(s) dropped (stdout consumer stalled or queue full)` の 1 行で報告する (ログはベストエフォート)
+- EPIPE (消費者死亡) 等の書き込みエラーは無視 (行喪失のみ・パニック無し)
+- `init_serve_logging()`: 従来経路と同一のフィルタ規則 (`RUST_LOG`・未設定時 info) で非同期ライタを初期化。CLI は `serve` サブコマンドのみで使用し、他サブコマンドは従来どおりの同期ロギング
+
+**テスト** (新規 6 件):
+
+- `logging.rs` 単体 2 件: `write_never_blocks_on_stalled_consumer` (シンク停止 + キュー満杯でも `write()` がブロックせず行を破棄してカウント・シンク復旧後に 3 行書き戻し + ドロップ数 1 行報告 + カウンタリセット)・`sink_write_errors_are_swallowed` (EPIPE 相当の書き込みエラーでもパニック / ブロック無く継続する)
+- 新規 `server/tests/nonstream_disconnect.rs` 3 件 (s38 の `client_disconnect.rs` と同型の実 TCP + SlowNoEosModel): 生成中の切断で非ストリーム Run も打ち切られる (**修正前コードでは生成完了まで in_flight が 1 のまま = 単一ワーカーを塞ぐ**)・受信側が先に消えたジョブ (Receiver drop) は生成無しで pull/admit 時点に打ち切られる・正常系は最後まで完了し応答も受信できる (誤 abort 無し)
+- 新規 `server/tests/frozen_log_robustness.rs` 1 件: 凍結したログ消費者 (write が決して戻らないシンク) をグローバルサブスクライバに設定した状態で、切断 → abort → `/health` → 後続リクエストが完遂され、ログ行が容量超過で**破棄**されていたこと (ブロックではなく破棄で対処した証拠) を検証 — 実機 wedge 事例の回帰防止
+
+**検証**: スクラッチ実験で修正後バイナリが FIFO 満杯下 (ログ消費者凍結) でも `/health` に応答することを確認 (wedge 消滅)。
+
+`cargo test --workspace` **237 passed / 0 failed** (旧 231 + 6)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -1062,7 +1094,8 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [ ] **C3: dev サーバー(8090)の P19 バイナリ化**: 現在 P17i 時点。engine.rs の is_recurrent は non-recurrent で no-op なので安全
 - [ ] **GitHub push自動化**: deploy key登録後にコンテナから直接push
 - [x] ~~tool use(Anthropic APIのtoolsパラメータ対応)~~ → **完了 (2026-10-16)**: §3「tool use 対応」節参照。~~`any`/`tool` の拘束デコード~~ → **完了 (2026-10-16)**: §3「tool_choice 拘束デコード」節参照。~~streaming の tool_use 対応~~ → **完了 (2026-10-16)**: §3「streaming tool_use 対応」節参照
-- [x] **クライアント切断検知 (SSE ストリームの生成打ち切り)** → **完了 (2026-10-16)**: §3「クライアント切断検知と生成 abort」節参照。非ストリームは検知経路が無く対象外
+- [x] **クライアント切断検知 (SSE ストリームの生成打ち切り)** → **完了 (2026-10-16)**: §3「クライアント切断検知と生成 abort」節参照。~~非ストリームは検知経路が無く対象外~~ → **非ストリームも対応 (s44)**: §3「非ストリーム /v1/messages のクライアント切断後処理の堅牢化」節参照
+- [x] **非ストリーム /v1/messages のクライアント切断後処理の堅牢化 (非ストリーム切断 abort + 非同期ロギングによる wedge 対策)** → **完了 (2026-10-16)**: §3「非ストリーム /v1/messages のクライアント切断後処理の堅牢化」節参照。数値経路は無変更
 - [x] **chat 用 max_tokens 既定上限 (未指定時のみ適用・明示指定は尊重)** → **完了 (2026-10-16)**: §3「chat 用 max_tokens 既定上限」節参照。既定 4096 (engine の SESSION_RESERVE_TOKENS と同値)・数値経路は無変更
 - [ ] Llama系バリアント(GQA無しモデル、RoPEスケーリング)
 - [ ] **他ファミリー対応**: DeepSeekシリーズ(MoE+共有エキスパート)、GLMシリーズ、gpt-oss(attention sink+sliding window+MXFP4)。GGUF 経路(P19)により入口が拡大
