@@ -79,6 +79,121 @@ pub fn dummy_tokenizer() -> Result<DennoTokenizer> {
     DennoTokenizer::from_json_str(TOKENIZER_JSON, None)
 }
 
+// ---------- 第21: tool use (streaming tool_use / 拘束デコード) の E2E テスト用 ----------
+
+/// tool use E2E テスト用語彙 (**連番の密な id**)。
+/// ByteLevel decoder と組み合わせるとデコード空間が byte-level BPE と同一になる
+/// ("Ċ" → "\n")。tool_call スキャフォールド + 2 ツール名 + マルチバイト名を含む。
+/// id は logits 長 48 の ScriptModel で使う。
+pub const TOOL_VOCAB: &[(&str, u32)] = &[
+    ("t0", 0),
+    ("t1", 1),
+    ("t2", 2),
+    ("t3", 3),
+    ("t4", 4),
+    ("t5", 5),
+    ("t6", 6),
+    ("t7", 7),
+    ("t8", 8),
+    ("t9", 9),
+    ("t10", 10),
+    ("t11", 11),
+    ("eos", 12), // DUMMY_EOS と一致させる
+    ("[UNK]", 13),
+    ("<", 14),
+    ("`", 15),
+    ("``", 16),
+    ("Ċ", 17), // byte-level の "\n"
+    ("<function=", 18),
+    (">", 19),
+    ("<parameter=", 20),
+    ("</parameter>", 21),
+    ("<tool_call>", 22),
+    ("</tool_call>", 23),
+    ("get_weather", 24),
+    ("run_tool", 25),
+    ("city", 26),
+    ("Tokyo", 27),
+    ("Checking.", 28),
+    ("天", 29),
+    ("気", 30),
+    ("天気", 31),
+];
+
+/// tool use E2E テスト用トークナイザ (ByteLevel decoder + TOOL_VOCAB)。
+pub fn tool_tokenizer() -> Result<DennoTokenizer> {
+    DennoTokenizer::testutil_vocab_tokenizer(
+        TOOL_VOCAB,
+        Some(serde_json::json!({
+            "type": "ByteLevel", "add_prefix_space": false,
+            "trim_offsets": true, "use_regex": true
+        })),
+    )
+}
+
+/// tool use E2E 用: 固定トークン列 (スクリプト) を one-hot logits で出す決定論モデル。
+///
+/// forward 1 呼び出し = スクリプト 1 位置前進 (prefill も 1 call として数える。
+/// 少なくとも最終トークンは必ず forward されるため call 0 は常に prefill)。
+/// **単一セッション専用** (call 数 = スクリプト位置のため複数セッション同時実行では
+/// 位置が混在する。tool use E2E テストは 1 リクエストずつ実行する)。
+/// `fallback` は one-hot がマスクで禁止されたときに選ばれる準ピーク (1.0) —
+/// 拘束デコードが「指定外ツール名を禁止して別トークンに落ちる」ことを実証する。
+pub struct ScriptModel {
+    pub script: Vec<u32>,
+    pub fallback: u32,
+    /// logits 長 (スクリプトの最大 id より大きいこと)
+    pub vocab: usize,
+    calls: usize,
+}
+
+impl ScriptModel {
+    pub fn new(script: Vec<u32>, fallback: u32) -> Self {
+        Self { script, fallback, vocab: 48, calls: 0 }
+    }
+}
+
+impl Model for ScriptModel {
+    fn context(&self) -> usize {
+        DUMMY_CONTEXT
+    }
+
+    fn eos_ids(&self) -> &[u32] {
+        &[DUMMY_EOS]
+    }
+
+    fn forward(&mut self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>> {
+        let _ = cache.kv_bufs(0, tokens.len());
+        cache.advance(tokens.len());
+        let idx = self.calls.min(self.script.len().saturating_sub(1));
+        self.calls += 1;
+        let mut logits = vec![0.0f32; self.vocab];
+        let peak = self.script.get(idx).copied();
+        if let Some(t) = peak {
+            logits[t as usize] = 5.0;
+        }
+        if (self.fallback as usize) < self.vocab && Some(self.fallback) != peak {
+            logits[self.fallback as usize] = 1.0;
+        }
+        Ok(logits)
+    }
+
+    fn new_cache(&self) -> KvCache {
+        KvCache::new(1, 4, DUMMY_CONTEXT)
+    }
+}
+
+/// ScriptModel + tool_tokenizer で Engine を構築する
+pub fn tool_script_engine(
+    name: &str,
+    seed: Option<u64>,
+    script: Vec<u32>,
+    fallback: u32,
+) -> Result<Engine> {
+    let tok = tool_tokenizer()?;
+    Ok(Engine::from_parts(Box::new(ScriptModel::new(script, fallback)), tok, name, seed))
+}
+
 /// ダミーモデル + ダミートークナイザで Engine を構築する
 pub fn dummy_engine(name: &str, seed: Option<u64>) -> Result<Engine> {
     let tok = dummy_tokenizer()?;

@@ -788,6 +788,32 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 2. 実機 E2E 再検証 + `cargo test --features cuda --lib qwen35_solo_chain -- --ignored` — 発動明示 + greedy 一致 + logits 近似一致
 3. 9B/27B アンカーの再取得 (前節の新ベースライン候補 `feea9444…`/`da0b1f57…` と併せて人間対応)
 
+### tool_choice 拘束デコード (`any`/`tool` の token-level 制約) ✅ (2026-10-16)
+
+> §3「tool use 対応」節の将来課題のうち `any`/`tool` の拘束デコードを完了。第21〜24セッションで設計を固め、第25セッションで実装本体、第26セッションで完成 (テスト修正・commit 化)。エンジン層 (新規 `toolmask.rs`) と server 配線のみでモデル/数値経路は無変更 (拘束無し経路はビット同一)。
+
+**設計 (sample 直前の logits マスクで公式テンプレートの tool_call block 形式へ強制)**:
+
+- 新規 `toolmask.rs`: `ToolConstraint { names }` (拘束対象ツール名群) と `ToolMask` 状態機械。状態は `Watch` (自由テキスト中・`<tool_call>` の出現を KMP 風前進で監視) → `Head` (`\n<function=` を 1 バイトずつ強制) → `Name` (許容名の接頭辞のみ許容・byte-level 前提で名前が複数トークンに跨っても追跡) → `Body` (arguments 領域は自由・CLOSE 終端 `</tool_call>` を KMP で監視) → `Done` (拘束充足・無マスク)
+- 許容集合は全語彙を現在の状態に仮供給して生存する id を集める (`compute_allowed`・状態変化時のみ再計算しキャッシュ)。マスク適用は許容集合以外を -inf にするだけ (O(V+A)・アロケーション無し) で数値経路は無接触
+- **EOS 強制**: 拘束未充足の間は EOS を許容集合から除外 (block 中途での早期終了を防止) → CLOSE 完了 (Done) で EOS 許可に戻る = CLOSE 直後に自然終了 (EndTurn)。語彙が足りず許容集合が空になる場合は警告の上マスク解除 (全確率 0 で壊れるより緩める)
+- 死に筋の防止: sample 後に sample 済みトークンの piece で状態機械を前進させ、遷移不能 (マスク許容と feed の不整合) になった場合は状態を Done に落として拘束解除 (無限ループ防止・警告)
+- 抽出器との整合: 名前に `>` を含むツール/空名は拘束対象から除外 (`<function=NAME>` 規約と両立しないため)
+
+**配線 (engine / server)**:
+
+- `engine.rs`: `ChatSession` に `tool_mask`、`begin_chat_with_tools` に `constraint` 引数 (None = 無マスク)。solo (`step_chat`) と batch (`step_chat_batch`) の両 decode 経路で sample 直前 `apply` + sample 後 `feed`。`begin_chat` (tools 無し) はシグネチャ不変
+- `tokenizer.rs`: `piece_bytes` を新設 (byte-level BPE のエスケープ表記を生バイトへ戻す・戻り値は `decode([id])` の UTF-8 バイト列と一致。byte-level でない簡易トークナイザは素通し) — 許容集合計算の共通基盤
+- `server/lib.rs` + `scheduler.rs`: `tool_choice` 正規化結果から `ToolConstraint` を組み立て (`any` = 全定義ツール名、`tool` = 指定ツールのみ、`auto`/`none` = None = 無マスク)。`Job::Chat`/`Job::Stream` に constraint を追加し scheduler 経由で渡す (streaming 側の適用は今後の配線対象)
+
+**テスト (engine lib 169 = 156 + 13)**:
+
+- `toolmask.rs` 単体 9 件: Watch 状態の許容集合 (EOS のみ禁止)・Head スキャフォールドのバイト単位強制・Named の他名禁止・Body 自由+CLOSE 途中の逸脱から KMP fallback で復帰・Done 後の EOS 許可・OPEN/CLOSE のトークン分割追跡・マルチバイト名のバイト分割・`>` 含む名/空名の除外
+- engine E2E 4 件 (testutil に tool use E2E 用 TOOL_VOCAB 32 語彙 + ByteLevel decoder トークナイザ + one-hot スクリプトモデル `ScriptModel` を追加・scheduler の `build_run` と同一の呼び出し経路): 拘束なし=素の生成・**許容集合に完全準拠するスクリプトなら拘束有りでも無しとビット同一**・Named で指定外ツール名のピークを許容名へ強制 (マスクでピークが禁止され fallback へ落ちる実証)・マルチバイト名を 1 文字ずつのトークンで構築しても通る
+- `cargo test --workspace` **205 passed / 0 failed** (engine lib 169 = 156 + 13)・`cargo check --features cuda --lib` 通過 (新コード由来の新規警告ゼロ — 既存 12 本は HEAD と同一内容)
+
+**決定論/exactness**: 拘束無し (`auto`/`none`/tools 無し) はマスクが存在せず従来経路とビット同一。拘束ありでも block 完了後 (Done) は無マスク = 同一。マスクは logits の -inf 置換のみで forward/数値は無接触。実モデルでの `any`/`tool` curl 検証は未実施 (将来の実機確認候補)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -815,7 +841,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] ~~**C2: docs/HISTORY.ja.md+en.md に P19 を追記**~~ → **完了**(`31790f9`・P17 文書の環境固有名汎化 `3a42252`)
 - [ ] **C3: dev サーバー(8090)の P19 バイナリ化**: 現在 P17i 時点。engine.rs の is_recurrent は non-recurrent で no-op なので安全
 - [ ] **GitHub push自動化**: deploy key登録後にコンテナから直接push
-- [x] ~~tool use(Anthropic APIのtoolsパラメータ対応)~~ → **完了 (2026-10-16)**: §3「tool use 対応」節参照。streaming の tool_use 対応と `any`/`tool` の拘束デコードは将来課題
+- [x] ~~tool use(Anthropic APIのtoolsパラメータ対応)~~ → **完了 (2026-10-16)**: §3「tool use 対応」節参照。~~`any`/`tool` の拘束デコード~~ → **完了 (2026-10-16)**: §3「tool_choice 拘束デコード」節参照。streaming の tool_use 対応は将来課題
 - [ ] Llama系バリアント(GQA無しモデル、RoPEスケーリング)
 - [ ] **他ファミリー対応**: DeepSeekシリーズ(MoE+共有エキスパート)、GLMシリーズ、gpt-oss(attention sink+sliding window+MXFP4)。GGUF 経路(P19)により入口が拡大
 - [ ] **各モデル独自機構の可視化**: MoEルーティング、MLA潜在圧縮KV、attention sink、sliding window帯パターン、thinkingモード

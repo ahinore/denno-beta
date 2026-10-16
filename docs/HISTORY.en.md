@@ -788,6 +788,32 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 2. Real-GPU E2E re-verification + `cargo test --features cuda --lib qwen35_solo_chain -- --ignored` — explicit activation + greedy match + logits closeness
 3. Re-acquire the 9B/27B anchors (together with the new baseline candidates `feea9444…`/`da0b1f57…` from the previous section)
 
+### tool_choice constrained decoding (token-level constraint for `any`/`tool`) ✅ (2026-10-16)
+
+> Completes the `any`/`tool` constrained decoding item from the future-work list of the §3 "tool use support" section. The design was settled across sessions 21-24, the implementation landed in session 25, and session 26 finished it (test fix + commit). Engine layer (new `toolmask.rs`) plus server wiring only — the model/numeric paths are untouched (the unconstrained path is bit-identical).
+
+**Design (a logits mask applied just before sampling forces the official template's tool_call block format)**:
+
+- New `toolmask.rs`: `ToolConstraint { names }` (tool names to constrain to) and the `ToolMask` state machine. States: `Watch` (free text; watches for `<tool_call>` with KMP-style advancement) → `Head` (forces `\n<function=` byte by byte) → `Name` (only prefixes of allowed names; byte-level aware, so a name spanning multiple tokens is tracked) → `Body` (arguments area is free; watches for the CLOSE terminator `</tool_call>` via KMP) → `Done` (constraint satisfied; no mask)
+- The allowed set is computed by tentatively feeding every vocab id into the current state and keeping survivors (`compute_allowed`; recomputed only on state change and cached). Applying the mask just sets everything outside the allowed set to -inf (O(V+A), allocation-free) — the numeric path is never touched
+- **EOS forcing**: while the constraint is unsatisfied, EOS is excluded from the allowed set (prevents early termination mid-block) → once CLOSE completes (Done), EOS is allowed again = natural termination right after CLOSE (EndTurn). If the vocabulary is too small and the allowed set comes up empty, the mask is relaxed with a warning (better than breaking with all-zero probability)
+- Dead-end prevention: after sampling, the sampled token's piece advances the state machine; if a transition becomes impossible (mask/feed mismatch), the state drops to Done and the constraint is lifted (prevents infinite loops, with a warning)
+- Extractor alignment: tools whose name contains `>` (or is empty) are excluded from the constraint (incompatible with the `<function=NAME>` convention)
+
+**Wiring (engine / server)**:
+
+- `engine.rs`: `ChatSession` gains `tool_mask`, `begin_chat_with_tools` gains a `constraint` argument (None = no mask). Both decode paths — solo (`step_chat`) and batch (`step_chat_batch`) — apply the mask before sampling and feed the sampled token afterwards. `begin_chat` (no tools) keeps its signature
+- `tokenizer.rs`: new `piece_bytes` (converts byte-level BPE escape notation back to raw bytes; the result equals the UTF-8 bytes of `decode([id])`; plain non-byte-level tokenizers pass through) — the common foundation for allowed-set computation
+- `server/lib.rs` + `scheduler.rs`: builds a `ToolConstraint` from the normalized `tool_choice` (`any` = all defined tool names, `tool` = only the named tool, `auto`/`none` = None = no mask). `Job::Chat`/`Job::Stream` carry the constraint through the scheduler (applying it on the streaming side is future wiring)
+
+**Tests (engine lib 169 = 156 + 13)**:
+
+- 9 unit tests in `toolmask.rs`: Watch-state allowed set (only EOS forbidden) · byte-wise Head scaffold forcing · Named blocks other names · Body is free and recovers from mid-CLOSE deviation via KMP fallback · EOS allowed after Done · OPEN/CLOSE split across tokens · multibyte name split into bytes · names with `>`/empty names excluded
+- 4 engine E2E tests (testutil gains a 32-entry TOOL_VOCAB + ByteLevel-decoder tokenizer + a one-hot script model `ScriptModel`; same call path as the scheduler's `build_run`): no constraint = plain generation · **a fully compliant script produces bit-identical output with and without the mask** · Named forces a disallowed tool-name peak onto the allowed name (demonstrates the mask banning the peak and falling back) · a multibyte name built from per-character tokens passes
+- `cargo test --workspace` **205 passed / 0 failed** (engine lib 169 = 156 + 13) · `cargo check --features cuda --lib` passes (zero new warnings from the new code — the existing 12 are identical to HEAD)
+
+**Determinism/exactness**: with no constraint (`auto`/`none`/no tools) the mask does not exist and the path is bit-identical to before; with a constraint, Done is also unmasked = identical. The mask only rewrites logits to -inf and never touches forward/numerics. Real-model `any`/`tool` curl verification is not yet done (a future hardware-verification candidate)
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
@@ -815,7 +841,7 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - [x] ~~**C2: add P19 to docs/HISTORY.ja.md+en.md**~~ → **done** (`31790f9`; P17 doc generalization of environment-specific names `3a42252`)
 - [ ] **C3: P19 binary for the dev server (8090)**: currently at P17i. engine.rs's is_recurrent is a no-op for non-recurrent models, so safe
 - [ ] **GitHub push automation**: register a deploy key to push directly from the container
-- [x] ~~tool use (Anthropic API tools parameter support)~~ → **done (2026-10-16)**: see the §3 "tool use support" section. Streaming tool_use and constrained decoding for `any`/`tool` remain future work
+- [x] ~~tool use (Anthropic API tools parameter support)~~ → **done (2026-10-16)**: see the §3 "tool use support" section. ~~Constrained decoding for `any`/`tool`~~ → **done (2026-10-16)**: see the §3 "tool_choice constrained decoding" section. Streaming tool_use remains future work
 - [ ] Llama-family variants (models without GQA, RoPE scaling)
 - [ ] **Other families**: DeepSeek series (MoE + shared experts), GLM series, gpt-oss (attention sink + sliding window + MXFP4). The GGUF route (P19) widens the entry point
 - [ ] **Per-model mechanism visualization**: MoE routing, MLA latent-compressed KV, attention sink, sliding-window band patterns, thinking mode

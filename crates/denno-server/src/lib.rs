@@ -9,7 +9,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use denno_engine::{ChatMessage, ChatOutput, Engine, GenParams, QuantMode};
+use denno_engine::{ChatMessage, ChatOutput, Engine, GenParams, QuantMode, ToolConstraint};
 use denno_telemetry::{self as telem, Frame};
 use rand::Rng;
 use serde::Deserialize;
@@ -118,8 +118,8 @@ pub struct MessagesRequest {
     #[serde(default)]
     pub tools: Option<Vec<ToolDef>>,
     /// tool use: "auto" | "none" | "any" | {"type": "auto"|"none"|"any"|"tool", "name"?}
-    /// 既定は auto。`any`/`tool` (強制) は拘束デコードを持たないため auto と同一挙動
-    /// (受理はする。詳細は docs/api.md)。
+    /// 既定は auto。`any`/`tool` (強制) は拘束デコード (第21) が有効:
+    /// モデル生成を tool_call block (公式テンプレート形式) へ強制する。
     pub tool_choice: Option<serde_json::Value>,
 }
 
@@ -133,8 +133,8 @@ pub struct ToolDef {
     pub input_schema: serde_json::Value,
 }
 
-/// tool_choice の正規化結果。Named は指定ツールの存在検証にのみ使い、
-/// プロンプト/抽出の挙動は Any (実質 auto) と同一。
+/// tool_choice の正規化結果。Named は指定ツールの存在検証と拘束デコード (第21)
+/// の許容名に使い、プロンプト/抽出の挙動は Any (実質 auto) と同一。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolChoice {
     Auto,
@@ -689,6 +689,17 @@ async fn messages(
     // ツールをモデルに見せるか (none = 非公開・抽出もしない。空配列も実質無し)
     let tools_active = !tools.is_empty() && tool_choice != ToolChoice::None;
     let tools_for_prompt = if tools_active { Some(tools_json) } else { None };
+    // 第21: tool_choice any/Named の拘束デコード。any = 全定義ツール、
+    // Named = 指定ツールのみを許容名として tool_call block までの生成を強制する
+    // (auto/none は None = 無マスク経路とビット同一。any/Named 到達時点で
+    // tools 非空は検証済み — tools 無し/未定義ツール指定は 400)。
+    let tool_constraint = match &tool_choice {
+        ToolChoice::Any => Some(ToolConstraint {
+            names: tools.iter().map(|t| t.name.clone()).collect(),
+        }),
+        ToolChoice::Named(n) => Some(ToolConstraint { names: vec![n.clone()] }),
+        ToolChoice::Auto | ToolChoice::None => None,
+    };
 
     let mut tool_use_ids = HashSet::new();
     let mut chat_messages = Vec::with_capacity(req.messages.len());
@@ -728,7 +739,7 @@ async fn messages(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
         state
             .scheduler
-            .submit_stream(system, chat_messages, params, None, tx)
+            .submit_stream(system, chat_messages, params, None, None, tx)
             .map_err(queue_full_error(&state))?;
         let stream = ReceiverStream::new(rx);
         Ok(Sse::new(stream)
@@ -743,7 +754,7 @@ async fn messages(
     } else {
         let rx = state
             .scheduler
-            .submit_chat(system, chat_messages, params, tools_for_prompt)
+            .submit_chat(system, chat_messages, params, tools_for_prompt, tool_constraint)
             .map_err(queue_full_error(&state))?;
         let mut output = rx
             .await

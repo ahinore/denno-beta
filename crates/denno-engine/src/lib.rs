@@ -17,6 +17,7 @@ pub mod quant;
 pub mod sampler;
 pub mod tensor;
 pub mod tokenizer;
+pub mod toolmask;
 
 /// P17: CUDA int8 オフロード (feature = "cuda" のみ。GPU 無し環境では完全に除外)。
 #[cfg(feature = "cuda")]
@@ -27,6 +28,7 @@ pub mod testutil;
 
 pub use engine::{ChatMessage, ChatOutput, ChatSession, Engine, GenParams, PrefixHit, StopReason};
 pub use quant::{Linear, Quant8Linear, QuantMode};
+pub use toolmask::ToolConstraint;
 
 /// prof フックからテレメトリハブへの薄い委譲 (P13)。
 /// prof.rs を denno-telemetry の直接依存から切り離すための関数。

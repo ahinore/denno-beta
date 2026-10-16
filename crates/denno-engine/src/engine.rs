@@ -210,6 +210,10 @@ pub struct ChatSession {
     input_tokens: usize,
     /// A2.5: 反復ペナルティ (None = 無効)
     repetition_penalty: Option<f32>,
+    /// 第21: tool_choice 拘束デコード (None = 無効・無マスク経路とビット同一)。
+    /// Some のとき decode 毎に sample 直前に logits マスクを適用し、
+    /// サンプル後に状態機械を前進させる (toolmask.rs)。
+    tool_mask: Option<crate::toolmask::ToolMask>,
     /// テレメトリ用のセッション ID (採番順。数値経路には無関係)
     pub id: u32,
 }
@@ -591,17 +595,20 @@ impl Engine {
         messages: &[ChatMessage],
         params: &GenParams,
     ) -> Result<ChatSession> {
-        self.begin_chat_with_tools(system, messages, params, None)
+        self.begin_chat_with_tools(system, messages, params, None, None)
     }
 
     /// tools 付きの begin_chat。`tools` は chat template の `tools` 変数へ
     /// そのまま渡される (None = tools 無し。従来経路と完全同一)。
+    /// `constraint` (第21) は tool_choice any/Named の拘束デコード。
+    /// None なら無マスク (auto / tools 無し経路とビット同一)。
     pub fn begin_chat_with_tools(
         &self,
         system: Option<&str>,
         messages: &[ChatMessage],
         params: &GenParams,
         tools: Option<&serde_json::Value>,
+        constraint: Option<&crate::toolmask::ToolConstraint>,
     ) -> Result<ChatSession> {
         let prompt = self.tok.apply_chat_template(system, messages, tools)?;
         let prompt_ids = self.tok.encode(&prompt)?;
@@ -634,6 +641,10 @@ impl Engine {
 
         let seed = params.seed.or(self.default_seed);
         let sampler = Sampler::new(params.temperature, params.top_k, params.top_p, seed);
+        // 第21: 拘束デコード (tool_choice any/Named)。names が実質空なら無効
+        let tool_mask = constraint
+            .filter(|c| !c.names.is_empty())
+            .and_then(|c| crate::toolmask::ToolMask::new(c.names.clone()));
 
         Ok(ChatSession {
             input_tokens: prompt_ids.len(),
@@ -650,6 +661,7 @@ impl Engine {
             stop_sequence: None,
             slot: None,
             repetition_penalty: params.repetition_penalty,
+            tool_mask,
             id: telem::next_session_id(),
         })
     }
@@ -726,9 +738,22 @@ impl Engine {
         // decode 1 ステップ (旧 chat() のループ 1 回分と同一)
         // A2.5: penalty 指定時のみ既出トークンを抑制 (無効時はビット不変)
         Self::apply_session_penalty(sess);
+        // 第21: tool_choice 拘束 (Some のとき sample 直前に許容集合マスク)。
+        // 拘束完了後は no-op = 無マスク経路とビット同一
+        if sess.tool_mask.is_some() {
+            let eos = self.model.eos_ids().to_vec();
+            sess.tool_mask
+                .as_mut()
+                .unwrap()
+                .apply(&mut sess.logits, &self.tok, &eos);
+        }
         let next =
             crate::prof::time(crate::prof::SAMPLER, || sess.sampler.sample(&sess.logits)) as u32;
         sess.generated.push(next);
+        // 第21: 拘束状態の前進 (サンプル済みトークンの piece で状態遷移)
+        if let Some(mask) = sess.tool_mask.as_mut() {
+            mask.feed(&self.tok, next);
+        }
         if telem::enabled() {
             telem::emit(Frame::Token { session: sess.id, token: next, pos: sess.generated.len() as u32 });
             let tk = telem::topk_softmax(&sess.logits, 8);
@@ -873,10 +898,23 @@ impl Engine {
             }
             // A2.5: penalty 指定時のみ既出トークンを抑制 (無効時はビット不変)
             Self::apply_session_penalty(sess);
+            // 第21: tool_choice 拘束 (Some のとき sample 直前に許容集合マスク)。
+            // 拘束完了後は no-op = 無マスク経路とビット同一
+            if sess.tool_mask.is_some() {
+                let eos = self.model.eos_ids().to_vec();
+                sess.tool_mask
+                    .as_mut()
+                    .unwrap()
+                    .apply(&mut sess.logits, &self.tok, &eos);
+            }
             let next = crate::prof::time(crate::prof::SAMPLER, || {
                 sess.sampler.sample(&sess.logits)
             }) as u32;
             sess.generated.push(next);
+            // 第21: 拘束状態の前進 (サンプル済みトークンの piece で状態遷移)
+            if let Some(mask) = sess.tool_mask.as_mut() {
+                mask.feed(&self.tok, next);
+            }
             if telem::enabled() {
                 telem::emit(Frame::Token {
                     session: sess.id,
@@ -1563,5 +1601,101 @@ mod tests {
         // 単一リクエストは 予算 / bpt = 98,304 トークンまで (32K prefill は 4GB)
         let need_32k = 32768 * bpt;
         assert_eq!(need_32k, 4 * 1024 * 1024 * 1024);
+    }
+
+    // ---------- 第21: tool_choice 拘束デコード (engine 経路) ----------
+
+    /// TOOL_VOCAB の piece → id (スクリプト可読性のための逆引き)。
+    fn tid(piece: &str) -> u32 {
+        crate::testutil::TOOL_VOCAB
+            .iter()
+            .find(|(p, _)| *p == piece)
+            .map(|(_, id)| *id)
+            .unwrap_or_else(|| panic!("vocab missing: {piece}"))
+    }
+
+    /// 完全な tool_call block を吐くスクリプト。
+    /// `name` はモデルが「選ぼうとする」ツール名 (拘束の有無で分岐を見る)。
+    fn block_script(name: &str) -> Vec<u32> {
+        [
+            "Checking.", "<tool_call>", "Ċ", "<function=", name, ">", "city", "Tokyo",
+            "</parameter>", "</tool_call>", "eos",
+        ]
+        .iter()
+        .map(|p| tid(p))
+        .collect()
+    }
+
+    /// ScriptModel + tool_tokenizer で begin_chat_with_tools → step まで回す
+    /// (scheduler build_run と同一の呼び出し経路)。fallback は拘束で禁止された
+    /// ピークの代わりに選ばれる準ピーク。
+    fn run_script(
+        script: &[u32],
+        fallback: u32,
+        constraint: Option<&crate::toolmask::ToolConstraint>,
+    ) -> ChatOutput {
+        let mut e =
+            crate::testutil::tool_script_engine("m", None, script.to_vec(), fallback).unwrap();
+        let mut sess = e
+            .begin_chat_with_tools(None, &msgs("t0"), &params(40), None, constraint)
+            .unwrap();
+        e.install_session(&mut sess).unwrap();
+        while !e.step_chat(&mut sess, &mut |_| {}).unwrap() {}
+        e.release_session(&mut sess);
+        sess.into_output()
+    }
+
+    #[test]
+    fn tool_mask_off_matches_plain_generation() {
+        // 拘束なし = スクリプトをそのまま再生
+        let out = run_script(&block_script("run_tool"), tid("city"), None);
+        assert!(out.text.contains("<function=run_tool>"), "text = {}", out.text);
+        assert_eq!(out.stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn tool_mask_any_is_bit_identical_when_compliant() {
+        // スクリプトが許容集合に完全準拠なら拘束ありでも無しと同一出力
+        let a = run_script(&block_script("get_weather"), tid("city"), None);
+        let b = run_script(
+            &block_script("get_weather"),
+            tid("city"),
+            Some(&crate::toolmask::ToolConstraint {
+                names: vec!["get_weather".into(), "run_tool".into()],
+            }),
+        );
+        assert_eq!(a.text, b.text);
+        assert_eq!(a.stop_reason, b.stop_reason);
+    }
+
+    #[test]
+    fn tool_mask_named_forces_allowed_tool_name() {
+        // モデルが指定外ツール名 (run_tool) をピークに出しても、
+        // 拘束により許容名 (get_weather) へ強制される
+        let forced = run_script(
+            &block_script("run_tool"),
+            tid("get_weather"),
+            Some(&crate::toolmask::ToolConstraint { names: vec!["get_weather".into()] }),
+        );
+        assert!(forced.text.contains("<function=get_weather>"), "text = {}", forced.text);
+        assert!(!forced.text.contains("run_tool"), "text = {}", forced.text);
+        assert_eq!(forced.stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn tool_mask_multibyte_name_split_tokens_pass() {
+        // マルチバイト名 (天気) を 1 文字ずつのトークン (天/気) で構築しても
+        // byte-level 前提の許容計算で通る
+        let script = vec![
+            tid("Checking."), tid("<tool_call>"), tid("Ċ"), tid("<function="),
+            tid("天"), tid("気"), tid(">"), tid("Tokyo"), tid("</tool_call>"), tid("eos"),
+        ];
+        let out = run_script(
+            &script,
+            tid("city"),
+            Some(&crate::toolmask::ToolConstraint { names: vec!["天気".into()] }),
+        );
+        assert!(out.text.contains("<function=天気>"), "text = {}", out.text);
+        assert_eq!(out.stop_reason, StopReason::EndTurn);
     }
 }

@@ -54,7 +54,10 @@ Anthropic 形式の `tool_use` block として返す。
 
 - `tools[].input_schema` は必須 (JSON Schema・object 以外は 400)。`type` フィールドは受け流す
 - `tool_choice`: `auto`(既定)/ `none`(モデルへ非公開・抽出もしない)/ `any` / `{"type":"tool","name":...}`。
-  **`any` / `tool` (強制) は拘束デコードを持たないため auto と同一挙動** (受理のみ・指定ツールの存在検証は実施)
+  **`any` / `tool` (強制) は拘束デコードが有効**: sample 直前に logits マスクを適用し、モデル生成を
+  公式テンプレート形式の `<tool_call>` block へ強制する (`any` = 全定義ツール、`tool` = 指定ツールのみ許容)。
+  block 完了 (`</tool_call>` 終端) まで EOS を抑制し、完了後は無マスク。
+  `auto` / `none` / tools 無しは従来経路とビット同一
 - `tools` + `stream:true` は未対応 (400)。streaming の tool_use 対応は将来課題
 
 ### 会話履歴 (assistant tool_use / user tool_result)

@@ -30,7 +30,7 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::{bail, Result};
 use axum::response::sse::Event;
-use denno_engine::{prof, ChatMessage, ChatOutput, ChatSession, Engine, GenParams};
+use denno_engine::{prof, ChatMessage, ChatOutput, ChatSession, Engine, GenParams, ToolConstraint};
 use serde_json::json;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
@@ -49,6 +49,8 @@ pub enum Job {
         messages: Vec<ChatMessage>,
         params: GenParams,
         tools: Option<serde_json::Value>,
+        /// 第21: tool_choice any/Named の拘束デコード (None = 無マスク)
+        constraint: Option<ToolConstraint>,
         respond: oneshot::Sender<Result<ChatOutput>>,
     },
     /// SSE ストリーミング生成 (イベントを events チャネルに流す)
@@ -57,6 +59,8 @@ pub enum Job {
         messages: Vec<ChatMessage>,
         params: GenParams,
         tools: Option<serde_json::Value>,
+        /// 第21: tool_choice any/Named の拘束デコード (None = 無マスク)
+        constraint: Option<ToolConstraint>,
         events: tokio_mpsc::Sender<Result<Event, Infallible>>,
     },
 }
@@ -114,10 +118,11 @@ impl Scheduler {
         messages: Vec<ChatMessage>,
         params: GenParams,
         tools: Option<serde_json::Value>,
+        constraint: Option<ToolConstraint>,
     ) -> Result<oneshot::Receiver<Result<ChatOutput>>, QueueFull> {
         let (respond, rx) = oneshot::channel();
         self.tx
-            .try_send(Job::Chat { system, messages, params, tools, respond })
+            .try_send(Job::Chat { system, messages, params, tools, constraint, respond })
             .map_err(|_| QueueFull)?;
         Ok(rx)
     }
@@ -129,10 +134,11 @@ impl Scheduler {
         messages: Vec<ChatMessage>,
         params: GenParams,
         tools: Option<serde_json::Value>,
+        constraint: Option<ToolConstraint>,
         events: tokio_mpsc::Sender<Result<Event, Infallible>>,
     ) -> Result<(), QueueFull> {
         self.tx
-            .try_send(Job::Stream { system, messages, params, tools, events })
+            .try_send(Job::Stream { system, messages, params, tools, constraint, events })
             .map_err(|_| QueueFull)
     }
 }
@@ -259,17 +265,23 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
 
 /// ジョブから実行状態を作る (begin_chat まで。KV には触れない)。
 fn build_run(engine: &Arc<Mutex<Engine>>, job: Job) -> Run {
-    let (system, messages, params, tools, respond, events) = match job {
-        Job::Chat { system, messages, params, tools, respond } => {
-            (system, messages, params, tools, Some(respond), None)
+    let (system, messages, params, tools, constraint, respond, events) = match job {
+        Job::Chat { system, messages, params, tools, constraint, respond } => {
+            (system, messages, params, tools, constraint, Some(respond), None)
         }
-        Job::Stream { system, messages, params, tools, events } => {
-            (system, messages, params, tools, None, Some(events))
+        Job::Stream { system, messages, params, tools, constraint, events } => {
+            (system, messages, params, tools, constraint, None, Some(events))
         }
     };
     let (sess, error) = {
         let g = engine.lock().unwrap();
-        match g.begin_chat_with_tools(system.as_deref(), &messages, &params, tools.as_ref()) {
+        match g.begin_chat_with_tools(
+            system.as_deref(),
+            &messages,
+            &params,
+            tools.as_ref(),
+            constraint.as_ref(),
+        ) {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e)),
         }
