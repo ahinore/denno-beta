@@ -847,6 +847,41 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 3. Measure speed (improvement over the rolled-back fc78586 binary's 77 ms/step)
 4. Re-take the 9B/27B anchors (the k-path fix changes the full-attention layers' k, so C4-chain output may change; after the fix it should match the CPU path — confirm against the CPU anchors)
 
+### C4 output nondeterminism fix (mid-step grow reallocation freed in-flight kernel buffers) — hardware verification is a human task (2026-10-16)
+
+> Session 28. After applying 2994feb (the segfault fix), the real-machine verification hit **run-to-run nondeterminism: all four requests produced different text** (q35_9b_1b run1/run2, q35_9b_2b run1/run2; run1 started with garbage like "Thinkingyaçm"). Speed was normal at 27.9 ms/step (2.8× the old 77 ms). With no GPU in the container, the null-stream ordering, pinned/device buffer lifetimes, and step-boundary sync points were fully audited and the race identified.
+
+**Root cause: mid-step grow reallocation of CH_QKV / CH_ATT / aq freed in-flight buffers**
+
+- `Scratch::ensure` is grow-only, but **on shortfall it frees the old buffer and allocates a new one**. The C4 chain has no sync inside a step (only the single final logits download; null stream fully ordered), so the just-launched kernel's write target / read source can collide with that free
+- **CH_QKV (confirmed direct cause)**: right after the GDN layer's grouped GEMV `[qkv (conv_dim) | z (vd)]`, the `chain_ensure_buf(CH_QKV, width*4)` at the top of `chain_q35_gdn_scan` (width = conv_dim + vd + 2*nv, including the beta/alpha tail) triggers a grow reallocation. **It fires deterministically on the first decode step that passes a GDN layer in a process**: the grouped GEMV's in-flight write target is freed, nobody ever writes `[0..qkv+z)` of the new buffer, and `dno_gdn_scan` reads uninitialized VRAM. Since uninitialized VRAM contents differ per process launch, this explains all observations: ① all runs differ ② garbage at the very start of generation (corruption enters at layer 0 of the first step and propagates) ③ speed is normal ④ before 2994feb the layer-1 segfault killed the process first, so it was never observed. The four all-different E2E requests are consistent with a process restart per run (each run's first step fires the race)
+- **aq (same class, minor)**: `chain_linear_grouped` grows per group k, so the first down GEMV (k=ff) reallocates and frees the just-launched gate/up GEMV's in-flight read source (freed blocks usually keep their contents, but this is UB)
+- **CH_ATT (same class, latent)**: for shapes with `heads*dh > vd`, the full layer's ensure could free the just-launched GDN scan's in-flight write target (not triggered on the 9B where vd == heads*dh)
+
+**Fix: the "allocate the full step size up front" convention extended to every step buffer**
+
+- Three new pure functions (single source for the byte counts): `q35_ch_qkv_bytes(heads, dh, kv_heads, nk, nv, dk, dv)` (max of the GDN `[qkv|z|beta|alpha]` and full `[qg|k|v]` layouts), `q35_ch_att_bytes(nv, dv, heads, dh)` (max(vd, heads*dh)), and `q35_kv_stage_bytes(n_layers, kv_dim)` (replaces the inline computation in fullattn)
+- Three new public entry points: `chain_q35_step_reserve(slot, bytes)` / `chain_q35_step_reserve_aq(max_k)` / `chain_q35_kv_stage_begin(bytes)`. `forward_decode_chain` reserves CH_QKV, CH_ATT, aq, and kv_stage in one go at step start (**before chain_upload, before any kernel launch**) → every in-step ensure becomes a no-op and freeing an in-flight buffer is structurally impossible (gdn_stage was done in 2994feb; kv_stage is now doubly defended)
+- No change to the numeric path (allocation timing only). Steps 2+, second-and-later requests, and the llama path are unaffected
+
+**Tests (3 new cfg-cuda pure-function tests, no GPU needed)**:
+
+- `q35_ch_qkv_bytes_covers_gdn_and_full_sections`: the GDN z/beta/alpha section ends and the full k/v section end all fit inside the reservation, plus a reproduction assert that the post-grouped-GEMV size is smaller than the reservation (= the old path did grow)
+- `q35_ch_att_bytes_covers_gdn_y_and_full_att`: both write widths (vd and heads*dh) fit (equal / GDN-larger / full-larger)
+- `q35_kv_stage_bytes_matches_full_layer_staging`: every li's staging end (with GDN skips) fits in the total
+
+**Verification (CPU)**:
+
+- `cargo test --workspace` **205 passed / 0 failed** (engine lib 169, unchanged) · `cargo test --features cuda --lib q35_` **9 passed** (including the 3 new)
+- `cargo check --features cuda --lib` passes — 12 lib warnings / 27 cuda-test-build warnings are **identical to HEAD** (zero new warnings)
+
+**Human tasks (GPU)**:
+
+1. Re-verify the 9B GPU E2E: the same payload twice in one process + twice after a process restart → all four md5s must match (before the fix, 4/4 differed)
+2. `cargo test --features cuda --lib qwen35_solo_chain -- --ignored`
+3. Re-measure speed (vs 27.9 ms/step; the allocation happens once per process, so the impact should be zero)
+4. Re-take the anchors (C4-chain output changes from the corrupted pre-fix values → confirm they match the CPU anchors)
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
@@ -866,7 +901,7 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - [x] ~~**B2: attn_core V accumulation**: 3.51s left (largest op). dno_attention extension (attention already has a relaxed contract)~~ → **done (2026-10-15)**: the probs@V accumulation of `dno_attention_prefill` is rebuilt as v-hoist + 2-row interleave + float2 loads (v re-reads 64× → 1×, the FMA sequence into each acc keeps ascending kk = **bit-identical** to the old kernel, and the old kernel's acc local spill is gone too). Host side unchanged. Real-machine ignored cuda tests 27/27 all green (bit-exact, 2026-10-16, §3 27B section). `cuda_attn_pf_bench`, the BK-expansion A/B, and E2E wall measurement remain
 - [x] ~~**B3: rope GPU for b>1 batches** (low priority): syncs are hidden in batch mode~~ → **done (2026-10-15)**: `forward_batch`'s rope is GPU-offloaded via `dno_rope_qk_batch` (same approach as P17h/P17k = host-generated table + mul/sub only, bit-identical to the CPU `rope_row`, rope not in the relaxed slot, table cache skips regeneration across the layer loop, on failure the host is untouched and it falls back to the CPU). See §3 B3. Real-machine ignored cuda tests 27/27 all green (bit-exact, 2026-10-16, §3 27B section). E2E wall measurement (rope reduction for b>1) remains
 - [x] ~~**3B/7B b=4 measurement**~~ → **done in P17k** (target changed to Gemma3n 13,252 tok)
-- [x] ~~**C4: qwen35 device-resident decode chain (GDN state GPU mirror)**~~ → **implemented, verified on CPU (2026-10-16)**: decode (n==1) becomes a solo chain of "one embedding H2D → all layers chained on GPU → one sync+D2H for the final logits" (same skeleton as llama P17h; GDN state is a ping-pong GPU mirror + staged D2H keeping the host correct; on failure it returns None before advance and falls back to the legacy per-op path). Three new kernels (dno_matvec_f32 / dno_qknorm_rope_pi / dno_attn_gate_mul, all under the bit-identity contract). **kernels_elem.ptx regeneration + real-GPU E2E are human tasks** — until regenerated the chain stays inactive (lazy fetch caches None, no GPU_BROKEN) and the existing paths keep running. See the §3 "C4" section. **The segfault found during the real-GPU verification is fixed (2026-10-16 · see the §3 "C4 GPU segfault fix" section · hardware re-verification is a human task)**: the GDN staged-D2H pinned buffer was sized for one layer (later layers wrote out of bounds → SIGSEGV inside libcuda), plus the full-attention k path's wrong src_off/strides (out-of-section reads, out-of-row writes)
+- [x] ~~**C4: qwen35 device-resident decode chain (GDN state GPU mirror)**~~ → **implemented, verified on CPU (2026-10-16)**: decode (n==1) becomes a solo chain of "one embedding H2D → all layers chained on GPU → one sync+D2H for the final logits" (same skeleton as llama P17h; GDN state is a ping-pong GPU mirror + staged D2H keeping the host correct; on failure it returns None before advance and falls back to the legacy per-op path). Three new kernels (dno_matvec_f32 / dno_qknorm_rope_pi / dno_attn_gate_mul, all under the bit-identity contract). **kernels_elem.ptx regeneration + real-GPU E2E are human tasks** — until regenerated the chain stays inactive (lazy fetch caches None, no GPU_BROKEN) and the existing paths keep running. See the §3 "C4" section. **The segfault found during the real-GPU verification is fixed (2026-10-16 · see the §3 "C4 GPU segfault fix" section · hardware re-verification is a human task)**: the GDN staged-D2H pinned buffer was sized for one layer (later layers wrote out of bounds → SIGSEGV inside libcuda), plus the full-attention k path's wrong src_off/strides (out-of-section reads, out-of-row writes). **The output nondeterminism found during the post-sefault-fix verification (all four requests different) is fixed too (2026-10-16 · see the §3 "C4 output nondeterminism fix" section · hardware re-verification is a human task)**: mid-step grow reallocation (CH_QKV/aq/CH_ATT) freed grouped-GEMV etc. in-flight buffers and dno_gdn_scan read uninitialized VRAM → the whole step is now reserved up front (same convention as kv_stage/gdn_stage; no change to the numeric path)
 
 ### Ops & peripheral
 

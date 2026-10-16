@@ -3643,6 +3643,48 @@ pub fn q35_gdn_stage_bytes(
     n_gdn * (conv_elems + ssm_elems) * 4
 }
 
+/// C4: decode chain 1 ステップの CH_QKV 要請バイト数 (純関数・単一ソース)。
+/// - GDN 層: [qkv (2nk*dk+nv*dv) | z (nv*dv) | beta (nv) | alpha (nv)]
+///   (= chain_q35_gdn_scan の `width`)
+/// - full 層: [qg (heads*2dh) | k (kv_heads*dh) | v (kv_heads*dh)]
+/// の大きい方。ステップ開始時にこのサイズで一括確保する。
+///
+/// 2994feb 時点では事前確保が無く、GDN 層の grouped GEMV (qkv+z) 直後に
+/// chain_q35_gdn_scan 頭部の `chain_ensure_buf(CH_QKV, width*4)` が grow 再確保
+/// (旧バッファ解放 + 新バッファ確保) を走らせていた。直前 launch の in-flight
+/// 書き込み先が解放され、新バッファの [0..qkv+z) は誰にも書かれないまま
+/// dno_gdn_scan が未初期化内容を読む (初期化されていない VRAM 内容は起動ごとに
+/// 異なるため、実機 E2E の run 間出力差 + 冒頭乱れの直接原因)。
+pub fn q35_ch_qkv_bytes(
+    heads: usize,
+    dh: usize,
+    kv_heads: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+) -> usize {
+    let kv_dim = kv_heads * dh;
+    let gdn = (2 * nk * dk + nv * dv) + nv * dv + 2 * nv;
+    let full = heads * 2 * dh + 2 * kv_dim;
+    gdn.max(full) * 4
+}
+
+/// C4: decode chain 1 ステップの CH_ATT 要請バイト数 (純関数)。
+/// GDN 層の出力 y は [vd = nv*dv]・full 層は [heads*dh]。
+/// CH_QKV と同一の競合クラス (full 層側の ensure が直前 GDN scan の in-flight
+/// 書き込み先を解放し得る) をステップ開始時の一括確保で排除する。
+pub fn q35_ch_att_bytes(nv: usize, dv: usize, heads: usize, dh: usize) -> usize {
+    (nv * dv).max(heads * dh) * 4
+}
+
+/// C4: KV ステージ (full 層の k/v 行 staged D2H 転送先 pinned) のステップ全体
+/// バイト数 (純関数)。full 層 li の積み位置は li*2*kv_dim 要素・1 層分は
+/// 2*kv_dim 要素 (chain_q35_kv_stage_flush の読み出しと同一式)。
+pub fn q35_kv_stage_bytes(n_layers: usize, kv_dim: usize) -> usize {
+    n_layers * 2 * kv_dim * 4
+}
+
 /// C4: fp32 重みのデバイスキャッシュ取得 (無ければ同期 H2D でアップロード)。
 /// 初回 1 回のみ同期コピーが走る (chain 発動セッションの最初のステップ)。
 fn q35_w_dev(mid: u64, li: usize, tag: u8, w: &[f32]) -> Option<CUdeviceptr> {
@@ -3938,7 +3980,7 @@ pub fn chain_q35_fullattn(
     }
     CHAIN.with(|cell| -> Option<()> {
         let mut s = cell.borrow_mut();
-        let stage_bytes = n_layers * 2 * (kv_dim * 4);
+        let stage_bytes = q35_kv_stage_bytes(n_layers, kv_dim);
         ok(Scratch::ensure_pin(&mut s.kv_stage, stage_bytes))?;
         let off = li * 2 * kv_dim * 4;
         let pin = s.kv_stage.as_ref().unwrap();
@@ -4236,6 +4278,37 @@ pub fn chain_q35_gdn_stage_begin(stage_bytes: usize) -> Option<()> {
         ok(Scratch::ensure_pin(&mut s.q35_gdn_stage, stage_bytes))?;
         s.q35_gdn_stage_list.clear();
         Some(())
+    })
+}
+
+/// C4: チャネルスロットをステップ開始時に事前確保する (同期・カーネル発行なし)。
+/// kv_stage / gdn_stage と同一の「最初に全体サイズを確保」規約の CH_QKV /
+/// CH_ATT 版。事前確保後はステップ内の ensure が全て no-op になり、
+/// in-flight カーネルの書き込み先 / 読み出し元の grow 再確保による解放が
+/// 構造的に起こらない (q35_ch_qkv_bytes の doc を参照)。
+pub fn chain_q35_step_reserve(slot: usize, bytes: usize) -> Option<()> {
+    let _ = chain_ctx()?;
+    ok(chain_ensure_buf(slot, bytes))
+}
+
+/// C4: int8 量子化スクラッチ (aq) をステップ開始時に最大 k 分事前確保する。
+/// chain_linear_grouped はグループごとの k で grow するため、2994feb 時点では
+/// 初回 down GEMV (k=ff) で再確保が走り、直前 GEMV (gate/up) の in-flight
+/// 読み出し元を解放していた (解放済みブロックの内容は多くの場合残るが UB)。
+pub fn chain_q35_step_reserve_aq(max_k: usize) -> Option<()> {
+    let _ = chain_ctx()?;
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure(&mut s.aq, 1 * max_k))
+    })
+}
+
+/// C4: KV ステージ pinned をステップ開始時に全体分事前確保する (gdn_stage と
+/// 同一規約)。chain_q35_fullattn 内の ensure は事前確保後 no-op の二重防御。
+pub fn chain_q35_kv_stage_begin(stage_bytes: usize) -> Option<()> {
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure_pin(&mut s.kv_stage, stage_bytes))
     })
 }
 
@@ -5909,6 +5982,92 @@ mod tests {
             // はミラー行 (kv_dim 幅) の外
             if kv_heads >= 2 {
                 assert!((kv_heads - 1) * kv_dim + dh > kv_dim, "旧 dst_stride は行外に書く");
+            }
+        }
+    }
+
+    /// C4: CH_QKV ステップ事前確保は GDN 層 ([qkv|z|beta|alpha]) と full 層
+    /// ([qg|k|v]) の両レイアウトを覆う。旧実装 (事前確保なし) では GDN 層の
+    /// grouped GEMV 直後に chain_q35_gdn_scan 頭部の ensure が grow 再確保で
+    /// in-flight 書き込み先を解放し、dno_gdn_scan が未初期化バッファを読んでいた
+    /// (実機 E2E 出力非決定論の直接原因)。grouped GEMV 直後の確保サイズ
+    /// (conv_dim + z) が事前確保より小さい = 旧経路で grow が走ることの再現 assert。
+    #[test]
+    fn q35_ch_qkv_bytes_covers_gdn_and_full_sections() {
+        // (heads, kv_heads, dh, nk, nv, dk, dv) — 9B 相当 / 0.8B 相当 / 縮小
+        let cases: [(usize, usize, usize, usize, usize, usize, usize); 3] = [
+            (32, 8, 128, 16, 32, 128, 128),
+            (16, 4, 128, 8, 8, 128, 128),
+            (8, 2, 64, 4, 4, 64, 64),
+        ];
+        for &(heads, kv_heads, dh, nk, nv, dk, dv) in &cases {
+            let kv_dim = kv_heads * dh;
+            let conv_dim = 2 * nk * dk + nv * dv;
+            let vd = nv * dv;
+            let reserved = q35_ch_qkv_bytes(heads, dh, kv_heads, nk, nv, dk, dv);
+            // GDN レイアウトの各セクション末尾が予約域に収まる
+            // (chain_q35_gdn_scan の pz/pb/pa オフセット + カーネル読み出し幅)
+            let z_end = conv_dim + vd;
+            let beta_end = z_end + nv;
+            let alpha_end = beta_end + nv;
+            assert!(z_end * 4 <= reserved, "z 節域外");
+            assert!(beta_end * 4 <= reserved, "beta 節域外");
+            assert!(alpha_end * 4 <= reserved, "alpha 節域外");
+            // full レイアウト (q35_fullattn_k_off 経由の k/v セクション) も収まる
+            let k_off = q35_fullattn_k_off(heads, dh);
+            assert!(k_off * 4 <= reserved);
+            assert!((k_off + 2 * kv_dim) * 4 <= reserved, "full k/v 節域外");
+            // 旧経路の再現: grouped GEMV 直後の確保サイズ (conv_dim + z) は
+            // 予約域より小さい → scan 頭部の ensure で grow 再確保が走っていた
+            let grouped_after_gemv = (conv_dim + vd) * 4;
+            assert!(
+                grouped_after_gemv < reserved,
+                "grouped 直後 ({grouped_after_gemv}) < 予約域 ({reserved}) が崩れた"
+            );
+        }
+        // 単調性: 形状を大きくすると予約域も大きくなる (公式の取りこぼし防止)
+        assert!(
+            q35_ch_qkv_bytes(32, 128, 8, 16, 32, 128, 128)
+                >= q35_ch_qkv_bytes(8, 64, 2, 4, 4, 64, 64)
+        );
+    }
+
+    /// C4: CH_ATT ステップ事前確保は GDN 出力 y [vd] と full attention 出力
+    /// [heads*dh] の両方を覆う。旧実装では heads*dh > vd の形状で full 層側の
+    /// ensure が直前 GDN scan の in-flight 書き込み先を解放し得た。
+    #[test]
+    fn q35_ch_att_bytes_covers_gdn_y_and_full_att() {
+        // (nv, dv, heads, dh)
+        let cases: [(usize, usize, usize, usize); 4] = [
+            (32, 128, 32, 128), // vd == heads*dh (等しい)
+            (8, 128, 32, 128),  // vd < heads*dh → full 側が最大
+            (32, 128, 8, 128),  // vd > heads*dh → GDN 側が最大
+            (4, 64, 4, 64),
+        ];
+        for &(nv, dv, heads, dh) in &cases {
+            let expected = (nv * dv).max(heads * dh) * 4;
+            assert_eq!(q35_ch_att_bytes(nv, dv, heads, dh), expected);
+            // 両出力の書き込み幅が予約域に収まる
+            assert!((nv * dv) * 4 <= expected, "GDN y 節域外");
+            assert!(heads * dh * 4 <= expected, "full att 節域外");
+        }
+    }
+
+    /// C4: KV ステージの事前確保バイト数は full 層 li の積み位置
+    /// (li*2*kv_dim 要素・1 層分 2*kv_dim 要素) と chain_q35_kv_stage_flush の
+    /// 読み出し範囲を覆う。GDN 層はステージしない (skip) ため積み位置に穴が
+    /// 開くが、全体サイズは最終層 (li = n_layers-1) の末尾で決まる。
+    #[test]
+    fn q35_kv_stage_bytes_matches_full_layer_staging() {
+        // (n_layers, kv_dim)
+        let cases: [(usize, usize); 3] = [(48, 1024), (24, 512), (4, 128)];
+        for &(n_layers, kv_dim) in &cases {
+            let total_elems = q35_kv_stage_bytes(n_layers, kv_dim) / 4;
+            assert_eq!(total_elems, n_layers * 2 * kv_dim);
+            // GDN 層 (skip される li) を含む全 li の積み末尾が総容量に収まる
+            for li in 0..n_layers {
+                let off = li * 2 * kv_dim;
+                assert!(off + 2 * kv_dim <= total_elems, "li={li} の k/v 行が節域外");
             }
         }
     }
