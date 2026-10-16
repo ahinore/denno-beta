@@ -453,6 +453,7 @@ flowchart LR
 | prefill チェーン(P17i/P17j/P17k+B1) | 長 prefill は tiled int8 GEMM(`dno_gemm_i8`)+ flash 風 online softmax(`dno_attention_prefill`)+ FFN ブロック常駐(gate_up → swiglu → down)。**B1 の `forward_prefill_gpu`(llama 系)**で rmsnorm(`dno_add_rmsnorm`・residual 加算融合)も GPU 化し、「埋め込み 1 回 H2D → 層内全てデバイス常駐 → 最終行 1 回 D2H」に再構成(ホスト往復 81MB×4/層 = ~9GB/リクエスト相当を廃止・KV ミラー行 D2H と最終行のみ残存) |
 | バッチ decode(B3) | b>1 の rope を `dno_rope_qk_batch` で GPU 化(ホスト生成テーブル+`(poss,dh,theta)` キャッシュ・失敗時はホスト不変で CPU フォールバック) |
 | Qwen3.5(GDN・P19-A1/A1-r2) | Linear 自動オフロード+GDN スキャンカーネル(decode n==1 は単発・prefill n≥2048 は 3-pass chunked・§12.6)。GDN 状態は VRAM 常駐 |
+| Qwen3.5 decode chain(C4) | decode (n==1) を solo chain 化: 埋め込み 1 回 H2D → 全層 GPU 内連結 → 最終 logits 1 回 sync+D2H。GDN 状態 (conv/ssm) は ping-pong GPU ミラー・新状態は staged async D2H → sync 後ホスト反映 (ホスト正保・失敗時は advance 前 None で従来 per-op 経路へフォールバック)。新カーネル: `dno_matvec_f32`(beta/alpha fp32 matvec)/`dno_qknorm_rope_pi`(QK-Norm+partial interleaved rope)/`dno_attn_gate_mul`(sigmoid 出力ゲート) — いずれもビット一致。kernels_elem.ptx 未再生成の間は不発動 (lazy fetch・GPU_BROKEN にしない) |
 
 - **需要ベース KV 確保(P17e)**: GPU KV ミラーは成長型確保+先行呼び出し予約(`kv_bufs(layer,n)`)でハード保証
 - **all-or-nothing 契約**: チェーン途中失敗時は forward 全体を CPU 経路でやり直す(KV 書き込みは冪等・GPU/CPU 混合なし)
@@ -463,6 +464,7 @@ flowchart LR
 | 演算 | 契約 |
 |---|---|
 | 線形層(int8 GEMV/GEMM)・rmsnorm・rope・swiglu・residual 加算 | **CPU とビット一致**(int8 の i32 累積は結合則が成立+演算順序固定・`-fmad=false` で fma 縮約なし) |
+| QK-Norm・partial interleaved rope・sigmoid 出力ゲート・beta/alpha fp32 matvec(C4) | **CPU とビット一致**(`dno_qknorm_rope_pi`/`dno_attn_gate_mul`/`dno_matvec_f32`) |
 | attention(decode `dno_attention`/prefill `dno_attention_prefill`) | **数値緩和枠**(maxabs < 1e-3・cos > 0.999・ユーザー承認済み) |
 | GDN スキャン | bit 一致不要(契約は「同一入力→同一出力+決定論」のみ・`expf` 等使用可) |
 
@@ -672,3 +674,4 @@ GDN スキャンの GPU カーネル(`kernels/gdn.cu` + `kernels_gdn.ptx`)は **
 - chunk 分割は `chunk_plan(n, 2048, 1024, 16)` を CPU 参照実装(`gdn::scan_chunked_core`)と共有。chunk_tokens=1024・最大 16 chunk・最終 chunk に端数が集中(全 chunk 非空)
 - chunked は **GPU 専用**(CPU の forward 経路からは呼ばれない)ため、CPU の契約「逐次 == バッチ prefill bit 一致」は不変。単一 chunk は逐次 AR と bit 一致・複数 chunk は数学的に等価(丸め順のみ異なる)。GPU 上の chunked 経路も決定論(同一入力 → bit 一致)をテストで担保
 - 数学の根拠: delta rule の 1 ステップは S への**線形**写像 S ← eg·(I − βkkᵀ)·S + βkvᵀ なので chunk をまたぐ依存を「ローカル遷移の計算」と「状態の伝播」に分解できる。k は L2 正規化(‖k‖≈1)・β ∈ (0,1)・eg = exp(g) < 1 で各因子のスペクトルノルム ≤ 1 → M は縮小写像となり丸め誤差が増幅しない
+- **C4(デバイス常駐 decode chain・2026-10-16)**: decode (n==1) は `forward_decode_chain`(model/qwen35.rs)が GDN 層/Full 層を `chain_q35_gdn_scan`/`chain_q35_fullattn` で 1 ステップ完結させる。GDN 状態ミラーは KvMirror 拡張(ping-pong 2 面・`gdn_pos` で層ごとに seed 判定)— `dno_gdn_scan` は in/out 別ポインタ前提のため in==out エイリアスは禁止(nv>nk で複数ブロックが同一 conv チャネルを共有する)。ホスト状態は logits download の sync 後に staged D2H から復元され常に正(CPU 再実行/snapshot 契約は不変)。kernels_elem.ptx に新カーネル(dno_matvec_f32/dno_qknorm_rope_pi/dno_attn_gate_mul)が無い(未再生成)場合は chain 不発動(lazy fetch が None をキャッシュ・GPU_BROKEN にはしない)。GPU 実機検証は人間対応

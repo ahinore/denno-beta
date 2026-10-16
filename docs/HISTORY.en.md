@@ -748,6 +748,46 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - For both to be correct, the GGUF conversion (unsloth / newer convert_hf_to_gguf) must rearrange the k/q rows (interleave). The mainline clone locally (59d5fad) lacks qwen3.5 support in convert_hf_to_gguf.py, so the converter itself could not be checked directly (**remaining verification, candidate human task**). Since this engine consumes GGUF only, the convention for these GGUFs is settled empirically as above (the engine has no path that reads safetensors directly)
 - 0.8B is nk==nv, so both conventions coincide (unaffected)
 
+### C4: qwen35 device-resident decode chain (GDN state GPU mirror) — implemented, verified on CPU (2026-10-16)
+
+> Sessions 18–20. Following DESIGN_C4.md, one decode step (n==1) of qwen35 now runs through a device-resident chain with the same skeleton as the llama P17b-g/P17h solo chain. Since the container has no GPU/nvcc, **numerical verification is CPU-side only (cargo check/test)** — regenerating kernels_elem.ptx and the real-GPU E2E are human tasks (below).
+
+**Design (one decode step = one embedding H2D → all layers chained on GPU → one sync+D2H for the final logits)**:
+
+- `forward_decode_chain` (`model/qwen35.rs`, cfg cuda): same skeleton as llama `forward_decode_gpu`. Branches per layer kind — GDN (`chain_q35_gdn_scan`) vs full attention (`chain_q35_fullattn`) — and the decode branch (n==1) of `forward()` tries it: Some returns immediately, None falls through to the legacy per-op path
+- **GDN state GPU mirror**: KvMirror extended to hold conv/ssm in a ping-pong pair (`dno_gdn_scan` requires separate in/out pointers — in==out aliasing is invalid because multiple blocks share the same conv channels when nv>nk). New states are staged async D2H → after the logits download's sync, `chain_q35_gdn_stage_flush` reflects them into the host cache — **the host state stays correct at all times** (CPU re-run / snapshot contract preserved). On failure it returns None before advance and the whole forward is redone on the legacy path (host untouched; the mirror re-seeds automatically via position matching)
+- **Activation gates (unsupported → quiet fallback to the legacy path)**: all-int8 linears + Q8 lm_head + F32 beta/alpha (`q35_chain_compatible`) · kernel shape limits (dk==dv / d_conv==4 / dk≤256 / dh≤1024 / n_rot≤dh even / GQA divisibility — `q35_chain_shapes_ok`) · `DENNO_GPU_ATTN` (escape hatch) · the new kernels exist in kernels_elem.ptx (lazy fetch; failure caches None and does NOT set GPU_BROKEN — zero impact on the llama path). Validation (pos≥ctx / tok≥vocab) is delegated to the legacy path's contract
+- fp32 weights (beta/alpha/QK-Norm/conv1d/ssm family) are cached on the device keyed by `(model_id, layer, tag)` because `Linear::F32` has no uid — `model_id` is assigned per load (`Q35_MODEL_SEQ`, so a model reload never hits a stale cache)
+- The KV mirror skips KV cap growth on GDN-layer calls (`with_mirror_ext` with alloc_kv=false) — avoids multi-GB wasted allocation at 27B scale (GDN state size is fixed)
+
+**Three new kernels (`kernels/kernels_elem.cu` — PTX regeneration is a human task)**:
+
+- `dno_matvec_f32`: fp32 matvec (dedicated to the beta/alpha control projections — int8 breaks the delta-rule gate precision, so Fp32 retention is the spec). One thread per output, sequential over k (`__fadd_rn`/`__fmul_rn` keep multiply and add rounding separate = -fmad=false equivalent) → **bit-identical** to `tensor::matvec_bt`
+- `dno_qknorm_rope_pi`: QK-Norm + partial interleaved rope in one launch, bit-exact. Thread 0 performs the same sequential sum-of-squares as CPU `tensor::rmsnorm` → pairs (2d, 2d+1) are rotated (the table is generated on the host with the same formula as `rope_partial_interleaved` → cos/sin bit-identical). q goes from the CH_QKV [q|gate] fusion (stride 2dh) to the new slot CH_Q35_Q; k is written directly into the mirror's pos0 row
+- `dno_attn_gate_mul`: sigmoid output gate (`dno_expf` + `__fdiv_rn` → bit-identical to `full_attn_core`)
+
+**Exactness contract**: rmsnorm / int8 GEMV / swiglu / expf / rope / QK-Norm / sigmoid gate / fp32 matvec are bit-identical; only attention scores/softmax stay in the relaxation window (P17g, user-approved); the GDN scan reuses the existing `dno_gdn_scan` (bit-identity not required — determinism only).
+
+**New tests (4 + 1 GPU ignored)**:
+
+- `q35_rope_pi_table_bit_matches_rope_partial_interleaved`: the rotation via the rope table (`q35_rope_pi_table`) is **bit-identical** to `rope_partial_interleaved` (sweeps n_rot/dh/pos; also verifies the partial contract that d≥n_rot is unrotated)
+- `q35_model_id_unique_per_load`: mid is unique per load (including same-dir reload and the Fp32 load)
+- `q35_chain_gate_on_synthetic_model`: the synthetic 27B shape (int8 load) is chain-compatible; the Fp32 load is not
+- `q35_chain_shapes_ok_gates` (cfg cuda, pure function): 1 positive + 12 negative cases of the shape gate (dk!=dv / d_conv!=4 / dk>256 / dk=0 / e=0 / ff=0 / dh=0 / dh>1024 / n_rot>dh / n_rot odd / GQA non-divisible / heads=0)
+- `qwen35_solo_chain_gpu_matches_cpu` (#[ignore], cfg cuda): on a real GPU + regenerated PTX the chain **fires** (Some return verified via expect — lesson ⑭) and matches the CPU greedily + logits maxabs<0.05 (same shape as llama `cuda_solo_chain`)
+
+**Verification (CPU)**:
+
+- Both `cargo check --features cuda --lib` and `cargo check --lib` pass (zero new warnings from the new code — the existing 12/8 warnings are identical to HEAD)
+- `cargo test --workspace` **192 passed / 0 failed** (engine lib 156 = 153 + 3)
+- `cargo test --features cuda --lib` also compiles (including cfg-cuda tests; the shape-gate test passes)
+
+**Human tasks (GPU)**:
+
+1. `nvcc -ptx -arch=compute_75 -fmad=false -O3 kernels/kernels_elem.cu -o kernels/kernels_elem.ptx` — until then the GPU path keeps the C4 chain inactive (lazy fetch returns None; all existing per-op paths keep working as-is)
+2. Real-GPU E2E re-verification + `cargo test --features cuda --lib qwen35_solo_chain -- --ignored` — explicit activation + greedy match + logits closeness
+3. Re-acquire the 9B/27B anchors (together with the new baseline candidates `feea9444…`/`da0b1f57…` from the previous section)
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
@@ -767,6 +807,7 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - [x] ~~**B2: attn_core V accumulation**: 3.51s left (largest op). dno_attention extension (attention already has a relaxed contract)~~ → **done (2026-10-15)**: the probs@V accumulation of `dno_attention_prefill` is rebuilt as v-hoist + 2-row interleave + float2 loads (v re-reads 64× → 1×, the FMA sequence into each acc keeps ascending kk = **bit-identical** to the old kernel, and the old kernel's acc local spill is gone too). Host side unchanged. Real-machine ignored cuda tests 27/27 all green (bit-exact, 2026-10-16, §3 27B section). `cuda_attn_pf_bench`, the BK-expansion A/B, and E2E wall measurement remain
 - [x] ~~**B3: rope GPU for b>1 batches** (low priority): syncs are hidden in batch mode~~ → **done (2026-10-15)**: `forward_batch`'s rope is GPU-offloaded via `dno_rope_qk_batch` (same approach as P17h/P17k = host-generated table + mul/sub only, bit-identical to the CPU `rope_row`, rope not in the relaxed slot, table cache skips regeneration across the layer loop, on failure the host is untouched and it falls back to the CPU). See §3 B3. Real-machine ignored cuda tests 27/27 all green (bit-exact, 2026-10-16, §3 27B section). E2E wall measurement (rope reduction for b>1) remains
 - [x] ~~**3B/7B b=4 measurement**~~ → **done in P17k** (target changed to Gemma3n 13,252 tok)
+- [x] ~~**C4: qwen35 device-resident decode chain (GDN state GPU mirror)**~~ → **implemented, verified on CPU (2026-10-16)**: decode (n==1) becomes a solo chain of "one embedding H2D → all layers chained on GPU → one sync+D2H for the final logits" (same skeleton as llama P17h; GDN state is a ping-pong GPU mirror + staged D2H keeping the host correct; on failure it returns None before advance and falls back to the legacy per-op path). Three new kernels (dno_matvec_f32 / dno_qknorm_rope_pi / dno_attn_gate_mul, all under the bit-identity contract). **kernels_elem.ptx regeneration + real-GPU E2E are human tasks** — until regenerated the chain stays inactive (lazy fetch caches None, no GPU_BROKEN) and the existing paths keep running. See the §3 "C4" section
 
 ### Ops & peripheral
 
