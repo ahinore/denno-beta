@@ -847,6 +847,41 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 3. 速度実測 (ロールバック中の fc78586 バイナリ 77ms/step からの改善幅)
 4. 9B/27B アンカー再取得 (k 経路修正により full attention 層の k が変わる = C4 chain 発動時の出力が変わる可能性。ただし修正後は CPU 経路と一致するはず → CPU アンカーとの一致を確認)
 
+### C4 出力非決定論の修正 (ステップ内 grow 再確保が in-flight カーネルのバッファを解放) — 実機検証は人間対応 (2026-10-16)
+
+> 第28セッション。2994feb (segfault 修正) 適用後の実機検証で**同一 payload の run 間で出力が全て異なる非決定論** (q35_9b_1b run1/run2・q35_9b_2b run1/run2 の 4 リクエスト全て別テキスト・run1 冒頭に「Thinkingyaçm」様の乱れ) が発生。速度は 27.9 ms/step (旧 77ms から 2.8 倍) と正常。コンテナに GPU が無いため null stream の順序付け・pinned/デバイスバッファの寿命・ステップ境界の同期点を全監査し、競合を特定した。
+
+**原因: CH_QKV / CH_ATT / aq のステップ中途 grow 再確保が直前 launch の in-flight バッファを解放していた**
+
+- `Scratch::ensure` は grow-only だが**不足時は旧バッファを解放して新規確保する**。C4 chain はステップ内に sync が無い (最終 logits download の 1 回のみ・null stream 全順序) ため、直前に launch したカーネルの書き込み先/読み出し元がこの解放と重なり得る
+- **CH_QKV (確定した直接原因)**: GDN 層の grouped GEMV `[qkv (conv_dim) | z (vd)]` の直後に `chain_q35_gdn_scan` 頭部の `chain_ensure_buf(CH_QKV, width*4)` (width = conv_dim + vd + 2*nv = beta/alpha テール込み) が grow 再確保を走らせる。**プロセス内で初めて GDN 層の decode ステップを通るときに確実に発火**し、grouped GEMV の in-flight 書き込み先が解放されて新バッファの `[0..qkv+z)` は誰にも書かれず、`dno_gdn_scan` が未初期化 VRAM を読む。未初期化 VRAM の内容はプロセス起動ごとに異なるため: ①run 間で出力が全て異なる ②乱れが生成冒頭 (初回ステップの層 0 から破壊が伝播) ③速度は正常 ④2994feb 以前は層 1 の segfault が先に死ぬため観測されなかった — の全てと整合する。実機 E2E の 4 リクエスト全別テキストは run ごとのプロセス再起動 (各 run で初回ステップ = 各 run で発火) と整合
+- **aq (同種・軽微)**: `chain_linear_grouped` がグループごとの k で grow するため、初回 down GEMV (k=ff) で再確保が走り直前 gate/up GEMV の in-flight 読み出し元を解放していた (解放済みブロックの内容は多くの場合残るが UB)
+- **CH_ATT (同種・潜在)**: `heads*dh > vd` の形状では full 層側の ensure が直前 GDN scan の in-flight 書き込み先を解放し得る (9B では vd == heads*dh で不発)
+
+**修正: 「最初に全体サイズを確保」規約をステップ内の全バッファへ拡張**
+
+- 新純関数 3 件 (バイト数の単一ソース): `q35_ch_qkv_bytes(heads, dh, kv_heads, nk, nv, dk, dv)` (GDN `[qkv|z|beta|alpha]` と full `[qg|k|v]` の大きい方)・`q35_ch_att_bytes(nv, dv, heads, dh)` (max(vd, heads*dh))・`q35_kv_stage_bytes(n_layers, kv_dim)` (fullattn 内の inline 計算を置換)
+- 新公開関数 3 件: `chain_q35_step_reserve(slot, bytes)` / `chain_q35_step_reserve_aq(max_k)` / `chain_q35_kv_stage_begin(bytes)`。`forward_decode_chain` のステップ開始時 (**chain_upload 前・カーネル発行前**) に CH_QKV・CH_ATT・aq・kv_stage を一括確保 → ステップ内の全 ensure が no-op になり in-flight バッファの解放が構造的に不可能になる (gdn_stage は 2994feb 済・kv_stage は二重防御)
+- 数値経路は無変更 (確保タイミングのみ)。ステップ 2 以降・2 リクエスト目以降・llama 経路への影響はゼロ
+
+**テスト (cfg cuda 純関数 3 件追加・GPU 不要)**:
+
+- `q35_ch_qkv_bytes_covers_gdn_and_full_sections`: GDN の z/beta/alpha 各セクション末尾と full の k/v セクション末尾が予約域に収ること + 「grouped GEMV 直後の確保サイズ < 予約域」= 旧経路で grow が走ることの再現 assert
+- `q35_ch_att_bytes_covers_gdn_y_and_full_att`: vd と heads*dh の両書き込み幅が予約域に収ること (等しい/GDN 側が最大/full 側が最大)
+- `q35_kv_stage_bytes_matches_full_layer_staging`: GDN skip ありの全 li の積み末尾が総容量に収ること
+
+**検証 (CPU)**:
+
+- `cargo test --workspace` **205 passed / 0 failed** (engine lib 169 変更無し)・`cargo test --features cuda --lib q35_` **9 passed** (新規 3 件含む)
+- `cargo check --features cuda --lib` 通過 — 警告 12 本 / cuda test ビルド 27 本は **HEAD と完全同一** (新規警告ゼロ)
+
+**人間対応 (GPU)**:
+
+1. 9B GPU E2E 再検証: 同一 payload を同一プロセスで連続 2 回 + プロセス再起動後に 2 回 → 4 実行の md5 が全て一致すること (修正前は 4/4 不一致)
+2. `cargo test --features cuda --lib qwen35_solo_chain -- --ignored`
+3. 速度再実測 (27.9 ms/step からの変化。確保はプロセス内 1 回のみなので影響ゼロのはず)
+4. アンカー再取得 (chain 発動時の出力は修正前の乱れた値から変わる → CPU アンカーとの一致を確認)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -866,7 +901,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] ~~**B2: attn_core の V 累積**: 残 3.51s(最大 op)。dno_attention 拡張(attention は緩和契約済み)~~ → **完了 (2026-10-15)**: `dno_attention_prefill` の probs@V 累積を v hoist + 2 行インターリーブ + float2 荷載に再構築(v 再読み 64 回 → 1 回・acc への FMA 列は kk 昇順で旧実装と完全同一 = **ビット一致**・旧カーネルの acc local spill も解消)。ホスト側無変更。実機 ignored cuda テスト 27/27 全緑 (ビット一致・2026-10-16・§3 27B 節)。`cuda_attn_pf_bench` と BK 拡大 A/B、および E2E wall 計測は残課題
 - [x] ~~**B3: b>1 バッチの rope GPU 化**(優先度低): バッチ時は同期が隠蔽される~~ → **完了 (2026-10-15)**: `forward_batch` の rope を `dno_rope_qk_batch` で GPU 化 (P17h/P17k と同一方式=ホスト生成テーブル + mul/sub のみ・CPU `rope_row` とビット一致・rope は緩和対象外・テーブルキャッシュで層ループの再生成を回避・失敗時はホスト不変で CPU フォールバック)。§3 B3 節参照。実機 ignored cuda テスト 27/27 全緑 (ビット一致・2026-10-16・§3 27B 節)。E2E wall 計測 (b>1 の rope 削減幅) は残課題
 - [x] ~~**3B/7Bのb=4実測**~~ → **P17k で実施**(対象は Gemma3n 13,252 tok に変更して完了)
-- [x] ~~**C4: qwen35 デバイス常駐 decode chain (GDN 状態 GPU ミラー)**~~ → **実装完了・CPU 検証まで (2026-10-16)**: decode (n==1) を「埋め込み 1 回 H2D → 全層 GPU 内連結 → 最終 logits 1 回 sync+D2H」にする solo chain (llama P17h と同一骨格・GDN 状態は ping-pong GPU ミラー + staged D2H でホスト正保・失敗時は advance 前 None で従来 per-op 経路にフォールバック)。新カーネル 3 種 (dno_matvec_f32 / dno_qknorm_rope_pi / dno_attn_gate_mul・いずれもビット一致契約)。**kernels_elem.ptx 再生成 + GPU 実機 E2E は人間対応** — 未再生成の間は chain 不発動 (lazy fetch が None をキャッシュ・GPU_BROKEN にならない) で既存経路のまま。§3「C4」節参照。**GPU 実機検証で発覚した segfault は修正済み (2026-10-16・§3「C4 GPU segfault の修正」節参照・実機再検証は人間対応)**: GDN staged D2H の pinned 1 層分確保 (2 層目以降が領域外書き → libcuda 内 SIGSEGV) + full attention k 経路の src_off/ストライド誤り (k セクション外読み・ミラー行外書き)
+- [x] ~~**C4: qwen35 デバイス常駐 decode chain (GDN 状態 GPU ミラー)**~~ → **実装完了・CPU 検証まで (2026-10-16)**: decode (n==1) を「埋め込み 1 回 H2D → 全層 GPU 内連結 → 最終 logits 1 回 sync+D2H」にする solo chain (llama P17h と同一骨格・GDN 状態は ping-pong GPU ミラー + staged D2H でホスト正保・失敗時は advance 前 None で従来 per-op 経路にフォールバック)。新カーネル 3 種 (dno_matvec_f32 / dno_qknorm_rope_pi / dno_attn_gate_mul・いずれもビット一致契約)。**kernels_elem.ptx 再生成 + GPU 実機 E2E は人間対応** — 未再生成の間は chain 不発動 (lazy fetch が None をキャッシュ・GPU_BROKEN にならない) で既存経路のまま。§3「C4」節参照。**GPU 実機検証で発覚した segfault は修正済み (2026-10-16・§3「C4 GPU segfault の修正」節参照・実機再検証は人間対応)**: GDN staged D2H の pinned 1 層分確保 (2 層目以降が領域外書き → libcuda 内 SIGSEGV) + full attention k 経路の src_off/ストライド誤り (k セクション外読み・ミラー行外書き)。**segfault 修正後の実機検証で発覚した出力非決定論 (4 リクエスト全別テキスト) も修正済み (2026-10-16・§3「C4 出力非決定論の修正」節参照・実機再検証は人間対応)**: ステップ中途の grow 再確保 (CH_QKV/aq/CH_ATT) が grouped GEMV 等の in-flight バッファを解放し dno_gdn_scan が未初期化 VRAM を読む競合 → ステップ開始時の一括事前確保 (kv_stage/gdn_stage と同一規約・数値経路は無変更)
 
 ### 運用・周辺
 

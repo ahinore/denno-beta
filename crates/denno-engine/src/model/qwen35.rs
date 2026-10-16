@@ -1170,9 +1170,11 @@ impl Qwen35 {
     ) -> Option<Vec<f32>> {
         use crate::cuda::{
             chain_download, chain_linear_grouped, chain_q35_fullattn, chain_q35_gdn_scan,
-            chain_q35_gdn_stage_begin, chain_q35_gdn_stage_flush, chain_q35_kv_stage_flush,
-            chain_q35_rope_pi_upload, chain_rmsnorm, chain_swiglu, chain_upload,
-            gpu_attention_enabled, q35_chain_shapes_ok, q35_fns_available, q35_gdn_stage_bytes,
+            chain_q35_gdn_stage_begin, chain_q35_gdn_stage_flush, chain_q35_kv_stage_begin,
+            chain_q35_kv_stage_flush, chain_q35_rope_pi_upload, chain_q35_step_reserve,
+            chain_q35_step_reserve_aq, chain_rmsnorm, chain_swiglu, chain_upload,
+            gpu_attention_enabled, q35_chain_shapes_ok, q35_ch_att_bytes, q35_ch_qkv_bytes,
+            q35_fns_available, q35_gdn_stage_bytes, q35_kv_stage_bytes,
             CH_ACT, CH_ATT, CH_DOWN, CH_GA, CH_H, CH_LOGITS, CH_O, CH_QKV, CH_X,
         };
         let e = self.e;
@@ -1226,6 +1228,21 @@ impl Qwen35 {
             .filter(|l| matches!(l.attn, AttnKind::Gdn(_)))
             .count();
         chain_q35_gdn_stage_begin(q35_gdn_stage_bytes(n_gdn, nk, nv, dk, dv, d_conv))?;
+
+        // CH_QKV / CH_ATT / aq / kv_stage もステップ開始時に一括確保 (gdn_stage と
+        // 同一の「最初に全体サイズ」規約)。2994feb 時点では CH_QKV の事前確保が
+        // 無く、GDN 層の grouped GEMV (qkv+z) 直後に chain_q35_gdn_scan 頭部の
+        // chain_ensure_buf(CH_QKV, width*4) が grow 再確保で in-flight 書き込み先を
+        // 解放し、dno_gdn_scan が未初期化の新バッファを読んでいた (実機 E2E の
+        // 出力非決定論 + 冒頭乱れの直接原因)。aq は初回 down GEMV (k=ff) の
+        // 再確保が直前 GEMV の in-flight 読み出し元を解放するのを避ける。
+        chain_q35_step_reserve(
+            CH_QKV,
+            q35_ch_qkv_bytes(heads, dh, kv_heads, nk, nv, dk, dv),
+        )?;
+        chain_q35_step_reserve(CH_ATT, q35_ch_att_bytes(nv, dv, heads, dh))?;
+        chain_q35_step_reserve_aq(e.max(ff).max(nv * dv).max(heads * dh))?;
+        chain_q35_kv_stage_begin(q35_kv_stage_bytes(n_layers, kv_dim))?;
 
         // 埋め込み 1 行 → residual stream デバイス常駐開始
         chain_upload(CH_X, &self.embed[token as usize * e..][..e], e, 1)?;
