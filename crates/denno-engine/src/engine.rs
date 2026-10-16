@@ -210,6 +210,11 @@ pub struct ChatSession {
     input_tokens: usize,
     /// A2.5: 反復ペナルティ (None = 無効)
     repetition_penalty: Option<f32>,
+    /// A5/s46: 末尾 generation prompt のトークン境界 (prompt_ids[..境界] が
+    /// 「base」= 次ターンにも現れる履歴部分)。テンプレート描画から検出できた
+    /// 場合のみ Some (非 recurrent モデル・fallback テンプレート・base が
+    /// トークン接頭辞にならなかった場合は None = 従来経路)。
+    gen_prompt_start: Option<usize>,
     /// 第21: tool_choice 拘束デコード (None = 無効・無マスク経路とビット同一)。
     /// Some のとき decode 毎に sample 直前に logits マスクを適用し、
     /// サンプル後に状態機械を前進させる (toolmask.rs)。
@@ -613,6 +618,33 @@ impl Engine {
         let prompt = self.tok.apply_chat_template(system, messages, tools)?;
         let prompt_ids = self.tok.encode(&prompt)?;
 
+        // A5/s46: 末尾 generation prompt のトークン境界を検出する (recurrent
+        // モデルのみ・prefix cache の base エントリ用)。
+        // chat template は毎回 prompt を generation prompt
+        // (Qwen3.5 なら `<|im_start|>assistant\n\n\n`) で終えるが、次ターンの
+        // 描画ではこの部分が assistant メッセージ本文に置き換わるため、
+        // **prompt 全体は次ターンのトークン接頭辞にならない** (実 9B で確認:
+        // turn2 の prompt は turn1 の末尾 2 トークン `<think>\n` で分岐)。
+        // これが prefix cache が 1 度もヒットしない根因。
+        // 「generation prompt 直前まで」(base) は次ターンにもそのまま現れるため、
+        // base 境界を記録して prefill を base + generation prompt の 2 forward に
+        // 分割し、base 境界で KV+GDN スナップショットを退避できるようにする
+        // (step_chat の split 経路参照)。
+        let gen_prompt_start = if self.model.is_recurrent() {
+            self.tok
+                .apply_chat_template_base(system, messages, tools)
+                .ok()
+                .and_then(|base| self.tok.encode(&base).ok())
+                .filter(|base_ids| {
+                    !base_ids.is_empty()
+                        && base_ids.len() < prompt_ids.len()
+                        && prompt_ids.starts_with(base_ids.as_slice())
+                })
+                .map(|base_ids| base_ids.len())
+        } else {
+            None
+        };
+
         let max_tokens = params.max_tokens;
         // Hermes 等のクライアントは context_length から大きな max_tokens (例: 65535) を
         // 送ってくることがある。Anthropic API なら 400 を返す場面だが、このサーバーは
@@ -661,6 +693,7 @@ impl Engine {
             stop_sequence: None,
             slot: None,
             repetition_penalty: params.repetition_penalty,
+            gen_prompt_start,
             tool_mask,
             id: telem::next_session_id(),
         })
@@ -689,13 +722,62 @@ impl Engine {
     ) -> Result<bool> {
         if !sess.prefill_done {
             // prefill: 旧 chat() と同一形状 (残りプロンプトを 1 回の forward で処理)。
-            // 分割すると GEMM の蓄積順が変わり exactness が壊れ得るため
-            // 単一呼び出しの形状を維持する。
+            // A5/s46: recurrent モデルで generation prompt 境界が検出できた場合のみ、
+            // prefill を [base 部分][generation prompt] の 2 forward に分割する。
+            // forward(a) + forward(b) は forward(a++b) と bit 一致 (GEMM は行独立の
+            // i32 累積・GDN/attention はトークン逐次のため分割で蓄積順が変わらない。
+            // 契約テスト: qwen35::qwen38_27b_shape_split_prefill_bit_exact)。
+            // 分割により base 境界 (= 次ターンの prompt にそのまま現れる履歴部分の
+            // 末尾) で KV+GDN スナップショットを退避でき、次ターン以降の
+            // best_full_match → ペア復元が成立する。境界不明 (fallback テンプレート
+            // 等) や非 recurrent は従来どおり単一 forward。
             let slot = sess.slot.expect("install_session 済みのセッション");
             let t0 = telem::enabled().then(std::time::Instant::now);
-            let logits =
+            let split_base = match sess.gen_prompt_start {
+                Some(b)
+                    if self.model.is_recurrent()
+                        && b > 0
+                        && b >= sess.lcp
+                        && b < sess.prompt_ids.len() =>
+                {
+                    Some(b)
+                }
+                _ => None,
+            };
+            let logits = if let Some(b) = split_base {
+                // (1) base 部分: 復元済み lcp から base 境界まで (lcp == b なら skip。
+                //     エントリ復元で KV+GDN 状態が既に base 境界にあるため)
+                if b > sess.lcp {
+                    let _ = self
+                        .model
+                        .forward(&sess.prompt_ids[sess.lcp..b], &mut self.caches[slot])?;
+                }
+                // (2) base 境界でスナップショット退避 (A4 と同一の KV+GDN ペア保存。
+                //     kv_len = cache.len() == b: (1) 完了直後 or lcp == b の復元直後)
+                debug_assert_eq!(self.caches[slot].len(), b);
+                {
+                    let kv_len = self.caches[slot].len();
+                    let gdn = self
+                        .model
+                        .is_recurrent()
+                        .then(|| self.caches[slot].gdn_snapshot());
+                    let (k, v) = self.caches[slot].snapshot(kv_len);
+                    self.prefix_cache.insert_snapshot(
+                        sess.prompt_ids[..b].to_vec(),
+                        k,
+                        v,
+                        kv_len,
+                        gdn,
+                    );
+                }
+                // (3) generation prompt 部分: base 境界から prompt 末尾まで。
+                //     logits は最終位置の forward から得る
                 self.model
-                    .forward(&sess.prompt_ids[sess.lcp..], &mut self.caches[slot])?;
+                    .forward(&sess.prompt_ids[b..], &mut self.caches[slot])?
+            } else {
+                self.model
+                    .forward(&sess.prompt_ids[sess.lcp..], &mut self.caches[slot])?
+            };
             if let Some(t0) = t0 {
                 telem::emit(Frame::Prefill {
                     session: sess.id,
@@ -707,23 +789,28 @@ impl Engine {
                 self.flush_ops_frame();
             }
             self.cached_prompts[slot] = sess.prompt_ids.clone();
-            // A4: prefill 直後 (prompt 境界) のスナップショットを prefix store へ退避。
-            // GDN 状態はシーケンス全体の関数なので、KV と状態を同じ位置
-            // (cache.len() == prompt 長) でペア保存する。decode 中は状態位置が
-            // 進むため退避しない (release 時点の状態は prompt 境界のものではない)。
-            // KV 行は prompt ちょうどの長さで保存する (restore は n <= prompt.len
-            // に制限されるため生成分の行を保存しても復元に使えない)。
-            debug_assert_eq!(self.caches[slot].len(), sess.prompt_ids.len());
-            {
-                let kv_len = self.caches[slot].len();
-                let gdn = self
-                    .model
-                    .is_recurrent()
-                    .then(|| self.caches[slot].gdn_snapshot());
-                let (k, v) = self.caches[slot].snapshot(kv_len);
-                self.prefix_cache
-                    .insert_snapshot(sess.prompt_ids.clone(), k, v, kv_len, gdn);
+            // A4: prefill 直後のスナップショットを prefix store へ退避。
+            // split 経路では上で base 境界に退避済み (prompt 全体は次ターンの
+            // トークン接頭辞にならないため、全体のエントリを作ってもヒットせず
+            // 退避しない)。GDN 状態はシーケンス全体の関数なので、KV と状態を
+            // 同じ位置 (cache.len() == prompt 長) でペア保存する。decode 中は
+            // 状態位置が進むため退避しない (release 時点の状態は prompt 境界の
+            // ものではない)。KV 行は prompt ちょうどの長さで保存する (restore は
+            // n <= prompt.len に制限されるため生成分の行を保存しても復元に使えない)。
+            if split_base.is_none() {
+                debug_assert_eq!(self.caches[slot].len(), sess.prompt_ids.len());
+                {
+                    let kv_len = self.caches[slot].len();
+                    let gdn = self
+                        .model
+                        .is_recurrent()
+                        .then(|| self.caches[slot].gdn_snapshot());
+                    let (k, v) = self.caches[slot].snapshot(kv_len);
+                    self.prefix_cache
+                        .insert_snapshot(sess.prompt_ids.clone(), k, v, kv_len, gdn);
+                }
             }
+            debug_assert_eq!(self.caches[slot].len(), sess.prompt_ids.len());
             sess.logits = logits;
             sess.prefill_done = true;
             return Ok(false);
@@ -1048,7 +1135,7 @@ fn pick_caches<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{dummy_engine, recurrent_engine, DUMMY_CONTEXT};
+    use crate::testutil::{dummy_engine, recurrent_engine, recurrent_qwen_style_engine, DUMMY_CONTEXT};
 
     fn params(max_tokens: usize) -> GenParams {
         GenParams {
@@ -1276,6 +1363,125 @@ mod tests {
         assert_ne!(e.last_prefix_hit(), PrefixHit::Entry);
         assert_eq!(out2, out1, "同一 prompt 再実行で出力が変わってはならない");
         assert_eq!(out2, expect);
+    }
+
+    // ===== s46: generation prompt 境界の split prefill + base エントリ復元 =====
+
+    /// s46: Qwen3.5 風テンプレート (各 prompt を generation prompt
+    /// `<|im_start|>assistant\n\n\n` = 末尾に `<think>` トークンで終える) では
+    /// turn_{n+1} の prompt が turn_n の prompt をトークン接頭辞として含まない
+    /// (generation prompt が assistant 本文で置き換わる = 実 Qwen3.5 と同一構造)。
+    /// 修正前は best_full_match が永遠に成立せず recurrent モデルの prefix cache
+    /// が 1 度もヒットしない (REPORT_NEXT19 の実機観察と同一)。
+    /// 修正後: prefill が generation prompt 境界で分割され、base
+    /// (= generation prompt 直前まで) の KV+GDN スナップショットが退避され、
+    /// 次ターン以降で復元される。出力はフル prefill の参照エンジンと完全一致。
+    #[test]
+    fn recurrent_qwen_style_template_hits_entry_on_multiturn() {
+        let mut e = recurrent_qwen_style_engine("qwen-style", None).unwrap();
+        let mut ref2 = recurrent_qwen_style_engine("qwen-style-ref2", None).unwrap();
+        let mut ref3 = recurrent_qwen_style_engine("qwen-style-ref3", None).unwrap();
+
+        // turn1: フル prefill。エントリは prompt 全体ではなく base
+        // (generation prompt 直前まで) で保存される
+        let out1 = e.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
+        assert_eq!(e.prefix_cache_entries(), 1);
+        assert_eq!(e.last_prefix_hit(), PrefixHit::None);
+        // base キーイングの確認: turn1 prompt 全体を渡しても完全一致するのは
+        // base エントリ (長さ < prompt 全長) のみ
+        let turn1_full = e
+            .tok
+            .encode(&e.tok.apply_chat_template(None, &msgs("t0"), None).unwrap())
+            .unwrap();
+        let turn1_base = e
+            .tok
+            .encode(&e.tok.apply_chat_template_base(None, &msgs("t0"), None).unwrap())
+            .unwrap();
+        assert!(turn1_full.starts_with(&turn1_base), "base 描画がトークン接頭辞");
+        assert!(turn1_base.len() < turn1_full.len(), "generation prompt で末尾が伸びる");
+        let (_, base_len) = e
+            .prefix_cache
+            .best_full_match(&turn1_full)
+            .expect("turn1 の base エントリが完全一致する");
+        assert_eq!(base_len, turn1_base.len(), "エントリは base 境界で保存される");
+
+        // turn2: turn1 の prompt を接頭辞に含まない (generation prompt が置換)。
+        // 修正後は Entry 復元 + base 部の差分 forward で出力がフル prefill と一致
+        let m2 = msgs_multi(&[("user", "t0"), ("assistant", &out1.text), ("user", "t15")]);
+        let expect2 = ref2.chat(None, &m2, &params(3), |_| {}).unwrap();
+        let out2 = e.chat(None, &m2, &params(3), |_| {}).unwrap();
+        assert_eq!(
+            e.last_prefix_hit(),
+            PrefixHit::Entry,
+            "generation prompt 境界の base 復元でヒットするべき"
+        );
+        assert_eq!(out2, expect2, "base 復元後の出力がフル prefill と不一致");
+        assert_eq!(e.prefix_cache_entries(), 2, "turn2 の base も退避される");
+
+        // turn3: 複数の完全一致候補 (turn1/turn2 の base) のうち最長 (turn2 base)
+        // が選ばれる (turn3 自身の base はこの時点では未登録)
+        let m3 = msgs_multi(&[
+            ("user", "t0"),
+            ("assistant", &out1.text),
+            ("user", "t15"),
+            ("assistant", &out2.text),
+            ("user", "t13"),
+        ]);
+        let turn3_full = e
+            .tok
+            .encode(&e.tok.apply_chat_template(None, &m3, None).unwrap())
+            .unwrap();
+        let turn2_full = e
+            .tok
+            .encode(&e.tok.apply_chat_template(None, &m2, None).unwrap())
+            .unwrap();
+        let turn2_base = e
+            .tok
+            .encode(&e.tok.apply_chat_template_base(None, &m2, None).unwrap())
+            .unwrap();
+        assert!(turn3_full.starts_with(&turn2_full[..turn2_base.len()]), "turn2 base は turn3 の接頭辞");
+        let (_, pick_len) = e
+            .prefix_cache
+            .best_full_match(&turn3_full)
+            .expect("turn3 には完全一致候補がある");
+        assert_eq!(pick_len, turn2_base.len(), "最長の完全一致 (turn2 の base) が選ばれる");
+        let expect3 = ref3.chat(None, &m3, &params(3), |_| {}).unwrap();
+        let out3 = e.chat(None, &m3, &params(3), |_| {}).unwrap();
+        assert_eq!(e.last_prefix_hit(), PrefixHit::Entry);
+        assert_eq!(out3, expect3, "2 回目の base 復元後の出力がフル prefill と不一致");
+    }
+
+    /// s46: 同一 prompt (同一 messages) の再実行も base 復元でヒットする
+    /// (generation prompt 部分のみ再 forward)。fallback テンプレートの
+    /// recurrent_identical_prompt_falls_back_to_full_prefill と対照的
+    /// (fallback は境界不明 = 従来経路のまま)。
+    #[test]
+    fn recurrent_qwen_style_template_identical_resend_hits_entry() {
+        let mut e = recurrent_qwen_style_engine("qwen-style", None).unwrap();
+        let out1 = e.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
+        assert_eq!(e.last_prefix_hit(), PrefixHit::None);
+        let out2 = e.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
+        assert_eq!(e.last_prefix_hit(), PrefixHit::Entry, "同一 messages 再実行も base 復元でヒット");
+        assert_eq!(out2, out1, "同一 messages 再実行で出力が変わってはならない");
+        // 3 回目も同様にヒット (復元 → base 部 skip (lcp == b) → gen 部のみ forward)
+        let out3 = e.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
+        assert_eq!(e.last_prefix_hit(), PrefixHit::Entry);
+        assert_eq!(out3, out1);
+    }
+
+    /// s46: Qwen3.5 風テンプレートでも prefix 崩れ以外の部分一致
+    /// (LCP < エントリ base 長) は状態を復元できないので full prefill に
+    /// フォールバックする (安全側経路の維持確認)。
+    #[test]
+    fn recurrent_qwen_style_template_partial_prefix_still_falls_back() {
+        let mut e = recurrent_qwen_style_engine("qwen-style", None).unwrap();
+        let mut r = recurrent_qwen_style_engine("qwen-style-ref", None).unwrap();
+        e.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
+        // "t1" は "t0" と共通接頭辞を持たない → base エントリとも完全一致しない
+        let expect = r.chat(None, &msgs("t1"), &params(3), |_| {}).unwrap();
+        let out = e.chat(None, &msgs("t1"), &params(3), |_| {}).unwrap();
+        assert_eq!(e.last_prefix_hit(), PrefixHit::None);
+        assert_eq!(out, expect);
     }
 
     #[test]
