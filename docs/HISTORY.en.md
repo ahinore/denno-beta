@@ -684,6 +684,36 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - **27B startup test**: UD-IQ2_XXS cannot start because IQ1_M (GGML type id=29) dequant is unsupported → the unsloth uniform Q4_0 (16.06GB) loads and runs GPU E2E successfully (VRAM 30.2GB/32.6GB, co-resident with the 8090 server, warm decode ~0.9s/step, 3 runs with identical md5 `1aeac03a5347346086e0f02aed5559dd`). However **output quality is broken** (greedy collapse, a `` repetition loop) = unknown cause (structure confirmed correct in this section)
 - **cuda doctest investigation**: the `cuda.rs` module-doc doctest does not reproduce the error in this tree, is already ignore-fenced (argument order `a, w, scale, m, k, n` matches the real `linear_bt_i8` signature), and `cargo test --features cuda --doc` is green
 
+### Qwen3.8-27B output quality investigation — CPU triage + llama.cpp reference comparison (investigation record, 2026-10-16)
+
+> Continuation of the real-machine GPU E2E output collapse triage (previous section). Session 12 reproduced it on in-container CPU with a logit probe; session 13 compared against mainline llama.cpp on the same GGUF. The only code change is making the diagnostic test permanent (numeric path unchanged).
+
+**Session 12: in-container CPU reproduction — the collapse is not GPU-specific**:
+
+- Starting the 27B unsloth uniform Q4_0 on the in-container CPU (int8) and running E2E → **the output breaks the same way as on the GPU** (prompt-fragment echo + `assistant`/`` template-fragment loop). The breakage is a code-common problem (template/loader/numeric path); "GPU numeric-path drift amplification" is essentially ruled out
+- repetition penalty 1.1 does not fix it (the loop merely becomes an early end_turn = the logit distribution itself is wrong)
+- GGUF header check: all metadata KVs match the config and tensor shapes are as expected. Only Q4_0/Q4_1/Q5_K/Q6_K/Q8_0/F32 are used and all are supported (no IQ types)
+- chat template: the 27B tokenizer_config.json chat_template is byte-identical to the 9B one. The template supports an `enable_thinking` variable, but the engine does not pass it, so the HTTP path always runs in thinking mode (ending with `<think>\n`)
+
+**Logit probe (sessions 12+13, diagnostic test made permanent) — the early give-up is actually a token-exact echo of the question**:
+
+- The diagnostic test `tests/qwen35_27b_logit_probe.rs` (#[ignore], graceful skip when `QWEN35_27B_DIR` is unset) was reshaped into a permanent triage tool (removed the drift_exp file output; findings documented in the header)
+- Greedy 24 steps on "What is the capital of France?" (17 tokens): **steps 0-6 echo the user's question token-for-token** (`What is the capital of France?` = exactly the question tokens 3710..30 from the prompt) and **step 7 emits `<|im_end|>` (logit 19.25, runner-up 16.5)**, after which it falls into a `<|im_start|>`/`<|im_end|>`/`\n` template-fragment loop. The session-12 note that "steps 0-6 are sane" was wrong in hindsight: it was an echo of the question, not a sane thinking start (thinking should begin like `The user is asking...`)
+- The prefill is bit-identical across runs (determinism holds; last-position logits maxabs=15.79)
+
+**Session 13: llama.cpp reference comparison — GGUF-quality candidate rejected; confirmed as an engine-specific bug**:
+
+- Cloned mainline llama.cpp (commit `59d5fad`, with qwen35.cpp) and built for CPU (`cmake -DGGML_NATIVE=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON` — llama-cli depends on LLAMA_BUILD_SERVER=ON because tools/cli depends on the server implementation)
+- **On the same GGUF (unsloth uniform Q4_0) and the same questions (greedy), llama.cpp answers correctly**:
+  - "What is the capital of France?" → thinking `We need answer simple. Need final.` → **`Paris is the capital of France.`**
+  - "日本の首都は?" → thinking `The user is asking "What is the capital of Japan?" in Japanese. This is a simple factual question. The capital of Japan is Tokyo (東京). I should answer in Japanese since the question was asked in Japanese.` → answer starts `日本の` (the thinking consumed the 48-token cap and the answer was cut off mid-way; content is sane)
+- Comparing the **generated step-0 distribution on the identical raw prompt** (same bytes as the engine's chat-template rendering; llama.cpp's tokens_evaluated=17 confirms identical tokenization): llama.cpp's top-1 is `The` (logprob ≈ 0, more than 10 nats above the runner-up `Simple`), while this engine's top-1 is `What` (logit 15.79) with `The` at top-2 (14.15, gap 1.63); this engine's top-1 `What` is not even in llama.cpp's top-5. **The two already diverge at generated step 0 (= the prefill last-position logits)** — the collapse is not greedy amplification but an error in this engine's 27B prefill numeric path
+- → Candidate ④ "the quality of the unsloth uniform Q4_0 GGUF itself" is **rejected**. **The 27B collapse is confirmed to be an engine-specific problem**. Remaining differential candidates: ① GQA q24/kv4 (group 6; 9B is group 4) ② GDN v-head 48 (repeat 3; 9B is 2) ③ tensor mapping with the real weights (shapes are verified by expect_ne, but content transposition cannot be caught by synthetic tests). Next step: per-layer hidden-state comparison (add a [LCHK]-style per-layer checksum output to llama.cpp and identify the first diverging layer)
+
+**9B anchor reproduction (session 13)**: today's clean build (`203deed` HEAD, release) reproduces `q35_9b_1b.json` → **`3a0ddf1c4fbe9c9213f6d13b11d0685c`** (2 consecutive identical runs) — the 9B path (loader/template/numerics) is healthy, corroborating that the problem is 27B-specific
+
+**Disabling thinking (`enable_thinking=false`)**: the template supports it but the engine does not — not attempted in this investigation (kept as a candidate)
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
@@ -695,7 +725,7 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - [x] ~~**A2.5: 9B generation quality (recommended before A3)**~~ → **done**: chat template verified against the official Qwen3.5 spec (no mismatch) · repetition penalty implemented (HF-compatible, deterministic; 1.1 breaks the loop). Root-cause isolation (llama.cpp same-GGUF comparison) continues
 - [x] ~~**A4: GDN state snapshot in the prefix cache** (optional): recurrent models always full-prefill (correctness first)~~ → **done (2026-10-15)**: paired KV + GDN-state restore (prompt-boundary snapshot, restored only via `best_full_match`; partial matches and identical prompts fall back to a full prefill). The continuation after restore is bit-identical to a full prefill, and the snapshot timing moved to right after prefill. Real-machine multi-turn E2E measurement remains
 - [x] ~~**Resolve the 8095 GPU E2E regression**~~ → **explanation settled (session 3, 2026-10-15)**: the `[LCHK]` comparison from the human-run GPU E2E with the diagnostic patch pinned the first diverging layer at L00 GDN attn (drift ~4e-7 = within contract) and ruled out H1/H3. A CPU drift-injection experiment explains it quantitatively as temperature-0 greedy instability — a near-tie (90700 "Thinking" vs 8160 "Here", logit gap 2.03) flipped by a tiny drift chaotically amplified across the 32 layers (see §3; no evidence of an abnormal GPU kernel). **Remaining items are operational (human follow-up)**: ①~~restore the original payload + re-verify GPU E2E~~ → **done (session 4)**: GPU anchors acquired for the new canonical payloads (seed 42, int8, HEAD-equivalent binary, 2 consecutive exact matches each = GPU-side determinism confirmed, see §3) ②clean GPU binary rebuild + deployment ③B1/B2 real-machine measurement ④revise the E2E regression criterion (GPU determinism + output sanity) ⑤confirm the GPU LCHK log's final argmax (8160/90700). New anchors: CPU `q35_9b_1b.json`→`3a0ddf1c…`, `q35_9b_2b.json`→`95199a33…` / GPU `q35_9b_1b.json`→`1a4ea71a…`, `q35_9b_2b.json`→`b4e58cb3…`
-- [ ] **Resolve the 27B output quality problem**: the structure is confirmed correct (§3 27B section, out-gate hypothesis rejected) — investigate numeric-path / quality factors. Startup assumes the unsloth uniform Q4_0 (UD-IQ2_XXS needs unsupported IQ1_M dequant)
+- [ ] **Resolve the 27B output quality problem**: the structure is confirmed correct (§3 27B section, out-gate hypothesis rejected). **The GGUF quality candidate is also rejected — confirmed as an engine-specific bug** (§3 27B quality investigation section: llama.cpp answers correctly on the same GGUF while this engine already diverges at generated step 0 with a question echo). Next step: per-layer hidden-state comparison against llama.cpp to identify the first diverging layer (GQA group 6 / GDN v-head 48 / real-weight tensor mapping). Startup assumes the unsloth uniform Q4_0 (UD-IQ2_XXS needs unsupported IQ1_M dequant)
 
 ### P17-family leftovers (CUDA)
 

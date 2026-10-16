@@ -684,6 +684,36 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **27B 起動テスト**: UD-IQ2_XXS は IQ1_M (GGML type id=29) の dequant 未対応で起動不可 → unsloth 均一 Q4_0 版 (16.06GB) でロード成功・GPU E2E 成功 (VRAM 30.2GB/32.6GB・8090 併存可・warm decode ~0.9s/step・3 回 md5 完全一致 `1aeac03a5347346086e0f02aed5559dd`)。ただし**出力品質に問題** (greedy で破綻・`` 反復ループ) = 未解明 (構造は本節で正と確定済み)
 - **cuda doctest の調査結果**: `cuda.rs` モジュールドックの doctest は本ツリーでエラーを再現せず・ignore 指定済み (コードフェンス・引数順 `a, w, scale, m, k, n` は実シグネチャ `linear_bt_i8` と一致)・`cargo test --features cuda --doc` green
 
+### Qwen3.8-27B 出力品質調査 — CPU 切り分け + llama.cpp リファレンス比較 (調査記録・2026-10-16)
+
+> 実機 GPU E2E の出力破綻 (前節) の切り分けの続き。第12セッションでコンテナ内 CPU での再現とロジットプローブ、第13セッションで mainline llama.cpp との同一 GGUF 比較を実施。コード変更は診断テストの恒久化のみ (数値経路は無変更)。
+
+**第12セッション: コンテナ内 CPU での再現 — 破綻は GPU に非依存**:
+
+- 27B unsloth 均一 Q4_0 をコンテナ内 CPU (int8) で起動し E2E → **出力は GPU と同系の破綻** (プロンプト断片のエコー + `assistant`/`` テンプレート断片ループ)。破綻はコード共通 (テンプレート/ローダ/数値経路) の問題で、「GPU 数値経路の drift 増幅」はほぼ否定
+- repetition penalty 1.1 では解消しない (ループが早期 end_turn に変わるだけ = logits 分布自体が誤り)
+- GGUF ヘッダ照合: metadata 全 KV が config と一致・テンソル形状も期待どおり。使用型は Q4_0/Q4_1/Q5_K/Q6_K/Q8_0/F32 のみで全て対応済み (IQ 系は含まれない)
+- chat template: 27B の tokenizer_config.json の chat_template は 9B とバイト完全一致。テンプレートは `enable_thinking` 変数をサポートするがエンジンは渡していないため HTTP 経路は常に thinking モード (末尾 `<think>\n`)
+
+**ロジットプローブ (第12+13セッション・診断テストを恒久化) — 早期放棄の実態は「質問のトークン単位エコー」**:
+
+- 診断テスト `tests/qwen35_27b_logit_probe.rs` (#[ignore]・`QWEN35_27B_DIR` 未設定で graceful skip) を恒久の切り分けツールへ整形 (drift_exp へのファイル書き出しを廃止・所見をヘッダに記載)
+- "What is the capital of France?" (17 token) の greedy 24 step: **step 0〜6 でユーザー質問文をトークン単位で完全エコー** (`What is the capital of France?` = プロンプト内の質問トークン 3710..30 と同一列) し、**step 7 で `<|im_end|>` (logit 19.25・runner-up 16.5) を出して終了**、以後 `<|im_start|>`/`<|im_end|>`/`\n` のテンプレート断片ループ。第12セッション時点で「step 0〜6 は健全」と記録していたが、実態は質問のエコーであり健全な思考開始ではない (思考は `The user is asking...` のように始まるべき)
+- prefill は bit 一致 (決定論は維持・最終位置 logits maxabs=15.79)
+
+**第13セッション: llama.cpp リファレンス比較 — GGUF 品質候補を否定しエンジン固有バグと確定**:
+
+- mainline llama.cpp (commit `59d5fad`・qwen35.cpp 対応) を clone・CPU ビルド (`cmake -DGGML_NATIVE=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON` — llama-cli は tools/cli が server 実装に依存するため LLAMA_BUILD_SERVER=ON が必要)
+- **同一 GGUF (unsloth 均一 Q4_0) + 同一質問 (greedy) で llama.cpp は正答**:
+  - "What is the capital of France?" → 思考 `We need answer simple. Need final.` → **`Paris is the capital of France.`**
+  - "日本の首都は?" → 思考 `The user is asking "What is the capital of Japan?" in Japanese. This is a simple factual question. The capital of Japan is Tokyo (東京). I should answer in Japanese since the question was asked in Japanese.` → 回答冒頭 `日本の` (思考が 48 token 上限を消費し回答途中で打ち切り・内容は正常)
+- 同一 raw プロンプト (エンジンの chat template 描画と同一バイト列・llama.cpp 側 tokens_evaluated=17 で同一トークン化を確認) での **生成 step 0 の分布比較**: llama.cpp の top-1 は `The` (logprob ≈ 0・runner-up `Simple` と 10 nat 超の差) / 本エンジンの top-1 は `What` (logit 15.79) で `The` は top-2 (14.15・差 1.63)・本エンジンの top-1 `What` は llama.cpp の top-5 に入らない。**両者は生成 step 0 (= prefill 最終位置 logits) で既に乖離** — 破綻は greedy の増幅ではなく本エンジンの 27B prefill 数値経路の誤りを示す
+- → 差分候補④「unsloth 均一 Q4_0 GGUF 自体の品質」は**否定**。**27B の破綻は本エンジンの 27B 経路固有の問題と確定**。残る差分候補: ①GQA q24/kv4 (group 6・9B は group 4) ②GDN v-head 48 (repeat 3・9B は 2) ③実重みでのテンソル対応 (形状は expect_ne で検証済みだが内容の取り違えは合成テストでは検出不可)。次段は層別隠れ状態比較 (llama.cpp 側に [LCHK] 相当の層別チェックサム出力を追加し初発散層を特定)
+
+**9B アンカー再現 (第13セッション)**: 今日のクリーンビルド (`203deed` HEAD・release) で `q35_9b_1b.json` → **`3a0ddf1c4fbe9c9213f6d13b11d0685c`** を再現 (連続 2 回一致) — 9B 経路 (ローダ/テンプレート/数値) は健全で問題は 27B 固有と裏取り
+
+**thinking 無効化 (`enable_thinking=false`)**: テンプレートは対応するがエンジン未対応 — 本調査では未実施 (候補として継続)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -695,7 +725,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] ~~**A2.5: 9B 生成品質の改善(A3 前に推奨)**~~ → **完了**: チャットテンプレートは Qwen3.5 公式準拠を確認(不一致なし)・repetition penalty 実装(HF 互換・決定論・penalty 1.1 で反復解消)。根本の数値原因の切り分け(llama.cpp 同 GGUF 比較)は継続
 - [x] ~~**A4: prefix cache への GDN 状態スナップショット**(任意): recurrent モデルはフル prefill 固定(正しさ優先)~~ → **完了 (2026-10-15)**: KV + GDN 状態のペア復元 (prompt 境界スナップショット・`best_full_match` のときのみ復元・部分一致と同一 prompt は full prefill フォールバック)。復元後の継続 forward はフル prefill と bit 一致・退避は prefill 直後に変更。実機マルチターン E2E 計測は残課題
 - [x] ~~**8095 GPU E2E リグレッションの解明**~~ → **説明確定 (2026-10-15 第3セッション)**: 診断パッチ適用 GPU E2E(人間対応)の `[LCHK]` 比較で初発散層 = L00 GDN attn(drift ~4e-7 = 緩和契約内)・H1/H3 は否定。CPU drift 注入実験により「near-tie(90700 "Thinking" vs 8160 "Here"・logit 差 2.03)を微小 drift が 32 層のカオス的増幅で反転する temperature 0 greedy の不安定性」として定量的に説明(§3 参照・GPU カーネル異常の証拠は無し)。**残りは運用対応(人間)**: ①~~元 payload 復元+GPU E2E 再検証~~ → **完了 (第4セッション)**: 新正規 payload で GPU アンカー取得済み(seed 42・int8・HEAD 相当バイナリ・各々連続 2 回完全一致 = GPU 上の決定論確認済み・§3 参照) ②GPU バイナリ清浄再ビルド配備 ③B1/B2 実機計測 ④E2E 回帰判定基準の見直し(GPU 決定論+出力妥当性)⑤GPU LCHK ログの final argmax(8160/90700)確認。新アンカー: CPU `q35_9b_1b.json`→`3a0ddf1c…`・`q35_9b_2b.json`→`95199a33…` / GPU `q35_9b_1b.json`→`1a4ea71a…`・`q35_9b_2b.json`→`b4e58cb3…`
-- [ ] **27B 出力品質問題の解明**: 構造は正と確定 (§3 27B 節・out-gate 仮説否定) — 数値経路/品質要因の調査。起動は unsloth 均一 Q4_0 前提 (UD-IQ2_XXS は IQ1_M dequant 未対応)
+- [ ] **27B 出力品質問題の解明**: 構造は正と確定 (§3 27B 節・out-gate 仮説否定)。**GGUF 品質も否定・エンジン固有バグと確定** (§3 27B 品質調査節・llama.cpp 同一 GGUF で正答/本エンジンは生成 step 0 で乖離・質問エコー)。次段: llama.cpp との層別隠れ状態比較で初発散層を特定 (GQA group 6 / GDN v-head 48 / 実重みテンソル対応)。起動は unsloth 均一 Q4_0 前提 (UD-IQ2_XXS は IQ1_M dequant 未対応)
 
 ### P17 系残課題(CUDA)
 
