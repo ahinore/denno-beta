@@ -8,8 +8,8 @@
 //! events チャネルが閉鎖 → ワーカーの切断スイープ / decode ステップ後の判定が
 //! 該当 Run を abort する (KV スロット解放・ログ 1 行)。
 //!
-//! 非ストリーム (Job::Chat) はレスポンス送信まで接続状態を観測する手段が無いため
-//! 対象外 (HISTORY §3 参照)。
+//! 非ストリーム (Job::Chat) は s44 から respond (oneshot) の閉鎖検知で同じく
+//! 打ち切り対象 (tests/nonstream_disconnect.rs 参照)。
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

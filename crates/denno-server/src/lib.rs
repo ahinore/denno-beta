@@ -20,8 +20,10 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 
+mod logging;
 mod scheduler;
 mod stream_asm;
+pub use logging::{init_serve_logging, NonBlockingStdout};
 pub use scheduler::{Job, MAX_ACTIVE_SESSIONS, QueueFull, Scheduler};
 
 pub struct AppState {

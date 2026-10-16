@@ -1033,6 +1033,38 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 
 `cargo test --workspace` **231 passed / 0 failed** (was 229 + 2)·`cargo check --features cuda --lib` passes (all 12 warnings identical to HEAD, no new warnings). Rebuilding the cuda binary for 8095 deployment is a human follow-up (no PTX regeneration needed)
 
+### Hardening the post-disconnect handling of non-streaming /v1/messages (s44) ✅ (2026-10-16)
+
+> Session 44 (resolving the observation recorded in §4 — REPORT_NEXT17 §4: after a non-streaming client disconnect the completion log went missing, and once the log consumer died the server stopped responding to new connections — a wedge). Two independent problems were pinned down and fixed: (1) the non-streaming disconnect was not detected, and (2) synchronous stdout logging wedged the server when the log consumer stalled. No structural impact on the numeric path or determinism (logging and scheduler Run cleanup only; inference/sampling untouched).
+
+**Root cause 1 — the non-streaming disconnect was undetected (correcting the s38 assumption)**:
+
+- In s38 the non-streaming path was declared out of scope on the assumption that "hyper has no chance to observe the connection state until the response is sent (neither reads nor writes happen)", but a scratch experiment showed that hyper 1.12 **monitors the connection's read side while the response future is pending**, and on client disconnect (read-side EOF / RST) **cancels (drops) the handler future together with the connection task** (the handler's completion flag was never set after the disconnect)
+- The handler holds the respond (oneshot) Receiver, so once it is cancelled the Sender side's `is_closed()` becomes true — usable as an indirect disconnect observation, letting non-streaming jobs ride the same sweep as SSE (s38)
+
+**Fix A (scheduler.rs)**: `Run::client_gone()` now also checks the respond channel's closure (for Job::Chat, where events is None, it checks `respond.is_closed()`). Non-streaming jobs now terminate through the same s38 disconnect sweep (per-step-boundary abort, KV slot release, in_flight decrement). If the disconnect is only detected at response-write time (EPIPE), the generation completes as before and hyper just ends that one connection task — in either path every job is reliably cleaned up as completed or discarded, with no residual impact on workers, KV, or the accept loop
+
+**Root cause 2 — synchronous stdout logging wedging the server**:
+
+- The old implementation (`tracing_subscriber::fmt().init()`) writes log lines synchronously to stdout from the calling thread. When stdout is a pipe (`denno serve ... | tee` etc.): (1) a stalled consumer (tee) fills the 64KB pipe buffer; (2) the first thread to write a log line blocks forever inside `write()` while holding the `std::io::stdout()` global lock (measured: wchan `anon_pipe_write`); (3) every subsequent log write stalls on that global lock (futex) — since the `log_requests` middleware writes one line per request, a tokio worker stops per connection task; (4) worker exhaustion → the whole runtime stops making progress (CPU 0%, process alive, `/health` unresponsive = exactly the wedge incident. Draining the pipe recovered it immediately, which was demonstrated)
+- So the wedge was a compound of "post-disconnect handling of non-streaming requests" and "the frozen log": the missing completion log after the non-streaming response write failure (EPIPE) was the symptom of root cause 1, while the unresponsiveness to new connections afterwards can be caused by root cause 2 alone (reproduced separately in the experiments)
+
+**Fix B (new logging.rs)**: `NonBlockingStdout` — log lines go into a bounded queue (4096 lines, `try_send`), and only one dedicated `denno-logger` thread ever writes to stdout. Server threads (tokio workers, the scheduler) never block on the stdout lock or a pipe write
+
+- Queue full: the line is discarded and counted; after recovery the thread reports it in one line, `denno-logger: N log line(s) dropped (stdout consumer stalled or queue full)` (logging is best-effort)
+- Write errors such as EPIPE (consumer died) are ignored (only the line is lost; no panic)
+- `init_serve_logging()`: initializes the async writer with the same filter rules as before (`RUST_LOG`, info when unset). The CLI uses it only for the `serve` subcommand; other subcommands keep the legacy synchronous logging
+
+**Tests** (6 new):
+
+- `logging.rs` unit tests, 2: `write_never_blocks_on_stalled_consumer` (with a stalled sink + full queue, `write()` never blocks — the line is discarded and counted; after the sink recovers the 3 lines are written back + the drop count is reported in one line + the counter resets) and `sink_write_errors_are_swallowed` (EPIPE-equivalent write errors cause no panic/blocking and logging continues)
+- New `server/tests/nonstream_disconnect.rs`, 3 (same shape as s38's `client_disconnect.rs` — real TCP + SlowNoEosModel): a disconnect during generation aborts the non-streaming Run too (**before the fix, in_flight stayed 1 until generation completed = the single worker stayed occupied**) · a job whose receiver vanished first (Receiver drop) is aborted at pull/admit time without generating · the healthy path completes to the end and the response is received (no false abort)
+- New `server/tests/frozen_log_robustness.rs`, 1: with a frozen log consumer (a sink whose `write` never returns) installed as the global subscriber, disconnect → abort → `/health` → follow-up request all complete, and the log lines were **discarded** past capacity (proof that the response was discarding, not blocking) — regression guard for the real-machine wedge incident
+
+**Verification**: a scratch experiment confirmed the fixed binary still answers `/health` under a full FIFO (frozen log consumer) — the wedge is gone.
+
+`cargo test --workspace` **237 passed / 0 failed** (was 231 + 6)·`cargo check --features cuda --lib` passes (all 12 warnings identical to HEAD, no new warnings)
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
@@ -1062,7 +1094,8 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - [ ] **C3: P19 binary for the dev server (8090)**: currently at P17i. engine.rs's is_recurrent is a no-op for non-recurrent models, so safe
 - [ ] **GitHub push automation**: register a deploy key to push directly from the container
 - [x] ~~tool use (Anthropic API tools parameter support)~~ → **done (2026-10-16)**: see the §3 "tool use support" section. ~~Constrained decoding for `any`/`tool`~~ → **done (2026-10-16)**: see the §3 "tool_choice constrained decoding" section. ~~Streaming tool_use~~ → **done (2026-10-16)**: see the §3 "streaming tool_use support" section
-- [x] **Client-disconnect detection (abort streaming generation)** → **done (2026-10-16)**: see the §3 "Client-disconnect detection and generation abort" section. Non-streaming requests are out of scope (no detection path exists)
+- [x] **Client-disconnect detection (abort streaming generation)** → **done (2026-10-16)**: see the §3 "Client-disconnect detection and generation abort" section. ~~Non-streaming requests are out of scope (no detection path exists)~~ → **non-streaming is covered too (s44)**: see the §3 "Hardening the post-disconnect handling of non-streaming /v1/messages" section
+- [x] **Hardening the post-disconnect handling of non-streaming /v1/messages (non-streaming disconnect abort + async logging against the wedge)** → **done (2026-10-16)**: see the §3 "Hardening the post-disconnect handling of non-streaming /v1/messages" section. Numeric path unchanged
 - [x] **Default max_tokens cap for chat (only when unspecified · explicit values respected)** → **done (2026-10-16)**: see the §3 "Default max_tokens cap for chat" section. Default 4096 (same as the engine's SESSION_RESERVE_TOKENS) · numeric path unchanged
 - [ ] Llama-family variants (models without GQA, RoPE scaling)
 - [ ] **Other families**: DeepSeek series (MoE + shared experts), GLM series, gpt-oss (attention sink + sliding window + MXFP4). The GGUF route (P19) widens the entry point
