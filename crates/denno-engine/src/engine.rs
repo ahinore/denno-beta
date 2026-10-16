@@ -1401,6 +1401,50 @@ mod tests {
         assert_eq!(out_b, ref_b, "割り込んだ B が単独実行と不一致");
     }
 
+    /// s41: 同一エンジン (同一 KV スロット) で短い会話 A の後に長い別会話 B を
+    /// 実行しても B の出力は単独実行と完全一致する (1b→2b 順序の再現テスト)。
+    /// CPU 経路では GPU KV ミラーが介在しないため常に成立するアンカーだが、
+    /// GPU 経路では「同一 kv_id のミラーが前会話の行 [0..have) を正規行として
+    /// 再利用する」不具合 (s35 の 2b 2 値分岐) がこの順序でのみ顕在化した
+    /// (fresh 初回は len=0 で全行再 seed・2 回目以降は rollback ガードで再 seed)。
+    /// 修正 (KvCache epoch + with_mirror_ext の世代検証) 後は GPU 経路でも成立する。
+    /// 併せて長→短 (rollback ガード経路) と prefix cache 再利用 (live/entry) 経路も
+    /// 単独実行と一致することを固定する。
+    #[test]
+    fn short_then_long_conversation_matches_standalone_outputs() {
+        let p = params(6);
+        let short = "t0";
+        let long = "t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t13 t14 t15 t0 t1 t2 t3";
+        let ref_a = {
+            let mut solo = kv_sensitive_engine("a", None).unwrap();
+            solo.chat(None, &msgs(short), &p, |_| {}).unwrap()
+        };
+        let ref_b = {
+            let mut solo = kv_sensitive_engine("b", None).unwrap();
+            solo.chat(None, &msgs(long), &p, |_| {}).unwrap()
+        };
+        assert_ne!(
+            ref_a.text, ref_b.text,
+            "テストの前提: プロンプトが異なれば出力も異なること"
+        );
+
+        let mut e = kv_sensitive_engine("m", None).unwrap();
+        // 短 → 長 (1b→2b 相当・問題の順序)
+        let a1 = e.chat(None, &msgs(short), &p, |_| {}).unwrap();
+        assert_eq!(a1, ref_a);
+        let b1 = e.chat(None, &msgs(long), &p, |_| {}).unwrap();
+        assert_eq!(b1, ref_b, "短い会話の後の長い会話が単独実行と不一致");
+        // 長 → 長 (旧実装でも rollback ガードで再 seed されて安定していた経路)
+        let b2 = e.chat(None, &msgs(long), &p, |_| {}).unwrap();
+        assert_eq!(b2, ref_b);
+        // 長 → 短 (rollback ガード経路)
+        let a2 = e.chat(None, &msgs(short), &p, |_| {}).unwrap();
+        assert_eq!(a2, ref_a);
+        // 短 → 長 をもう一度 (切替は繰り返し発火する・entry restore 経路)
+        let b3 = e.chat(None, &msgs(long), &p, |_| {}).unwrap();
+        assert_eq!(b3, ref_b);
+    }
+
     /// 4 セッション (同一プロンプト含む) を 1 ステップずつ round-robin で進めても
     /// 全て単独実行と完全一致。P6 では全員が同時にスロットに常駐する。
     #[test]

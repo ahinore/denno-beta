@@ -980,6 +980,30 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 `cargo test --workspace` **227 passed / 0 failed** (旧 220 + 7)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)
 
+### GPU KV ミラーのコンテンツ世代 (epoch) 検証 — 2b 2 値分岐の根本修正 ✅ (2026-10-16)
+
+> 第41〜42セッション。REPORT_NEXT12 で未解明だった 2b (283tok prefill payload) の GPU 出力 2 値分岐 (md5 `3a1fbabe` / `d46ab41f` ペア) の根因を同定し修正した。0c94b05 (decode chain の grow 競合修正) が確立した「全体サイズを最初に確保し整合を開始前に取る」規約を KV ミラー側に拡張するもの (ミラー行の正規性検証を prefill 開始前の同期に寄せる)。演算・サンプリングの数値経路は無変更で、CPU 参照 md5 (`feea9444` / `da0b1f57`) は不変の前提。
+
+**根因 (ミラー行再利用)**:
+
+- GPU KV ミラー (P17g) は kv_id (スロット) ごとに層別のミラー済み行数 `len` を保持し、「行 [0..have) はホストキャッシュと同一内容」を前提に差分のみ H2D する。旧実装の整合検証は「`len > t_total` なら rollback で全再シード」という**収縮検出のみ**
+- 同一スロットに**短い会話の後に長い別会話**が来ると `0 < len ≤ t_total` となり rollback ガードが発火せず、前会話の行 [0..len) が次会話の正規行として再利用される。fresh 初回は len=0 で必ず全行再 seed・同長以上の次会話は rollback ガードで再 seed されるため、**短→長の切替直後の 1 リクエストだけ**汚染 prefill になる
+- 実機 E2E (1b→2b シーケンス) では、解放スロットのミラーに 1b (14 行) が残った状態で 2b (283 行) が載ると汚染 prefill、fresh スロットに載ると正しい prefill になる — スロット割当の揺れで出力がちょうど 2 値に分岐した。decode は prefill 結果から決定論的に続くため 2 値で安定する (REPORT_NEXT12 §6 の推論と整合)。**分岐 md5 ペア `3a1fbabe`/`d46ab41f` はこのミラー行再利用の証拠だった**
+
+**修正**:
+
+- `KvCache` にコンテンツ世代 `epoch: u64` を追加。行内容を無効化する操作 (`reset` / `restore`) でのみ加算し、append (`kv_bufs` / `advance`) と `truncate` (先頭行保存) では不変
+- `with_mirror` / `with_mirror_ext` に `cache.epoch()` を渡すようにし、ミラー側の `epoch` がホストと不一致なら**全層の `len` と GDN 状態位置 `gdn_pos` を無効化** (次回の層呼び出しで全行 / 全状態再 seed)。同一 kv_id を別会話が再利用しても前会話の行は決して正規行にならない
+- 適用箇所: decode 経路 (`chain_attention` / `chain_attention_dev` / `chain_q35_fullattn`)・prefill 経路 (`chain_attention_prefill` / `chain_qkv_rope_prefill` / `chain_attention_prefill_dev` — llama.rs 側に epoch 引数を追加)・GDN 状態ミラー (`chain_q35_gdn_scan` の取得 / 確定の両呼び出し)
+
+**テスト**:
+
+- 新規 `kv_cache.rs::epoch_advances_only_on_content_invalidating_ops`: epoch が reset / restore でのみ進み append / truncate で不変であること (ミラー検証の前提)
+- 新規 `engine.rs::short_then_long_conversation_matches_standalone_outputs`: **1b→2b 順序の再現テスト** (合成モデル・CPU 経路はアンカー)。同一エンジンで短い会話 A → 長い会話 B を実行しても B の出力が単独実行と完全一致することを assert (旧実装は GPU 経路でこの順序でのみ破綻)。長→長 (rollback 経路)・長→短・再切替 (entry restore 経路) も固定
+- 新規 `#[ignore]` cuda テスト `cuda.rs::cuda_kv_mirror_epoch_invalidation`: epoch 不一致でミラーの `len` / `gdn_pos` が無効化されることを直接観測 (**GPU 実機で実行が必要**: `cargo test --release --features cuda -p denno-engine -- --ignored`)
+
+`cargo test --workspace` **229 passed / 0 failed** (旧 227 + 2)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)。**実機での分岐消滅確認 (1b→2b シーケンスの再実行) は人間対応**
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -1000,6 +1024,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] ~~**B3: b>1 バッチの rope GPU 化**(優先度低): バッチ時は同期が隠蔽される~~ → **完了 (2026-10-15)**: `forward_batch` の rope を `dno_rope_qk_batch` で GPU 化 (P17h/P17k と同一方式=ホスト生成テーブル + mul/sub のみ・CPU `rope_row` とビット一致・rope は緩和対象外・テーブルキャッシュで層ループの再生成を回避・失敗時はホスト不変で CPU フォールバック)。§3 B3 節参照。実機 ignored cuda テスト 27/27 全緑 (ビット一致・2026-10-16・§3 27B 節)。E2E wall 計測 (b>1 の rope 削減幅) は残課題
 - [x] ~~**3B/7Bのb=4実測**~~ → **P17k で実施**(対象は Gemma3n 13,252 tok に変更して完了)
 - [x] ~~**C4: qwen35 デバイス常駐 decode chain (GDN 状態 GPU ミラー)**~~ → **実装完了・CPU 検証まで (2026-10-16)**: decode (n==1) を「埋め込み 1 回 H2D → 全層 GPU 内連結 → 最終 logits 1 回 sync+D2H」にする solo chain (llama P17h と同一骨格・GDN 状態は ping-pong GPU ミラー + staged D2H でホスト正保・失敗時は advance 前 None で従来 per-op 経路にフォールバック)。新カーネル 3 種 (dno_matvec_f32 / dno_qknorm_rope_pi / dno_attn_gate_mul・いずれもビット一致契約)。**kernels_elem.ptx 再生成 + GPU 実機 E2E は人間対応** — 未再生成の間は chain 不発動 (lazy fetch が None をキャッシュ・GPU_BROKEN にならない) で既存経路のまま。§3「C4」節参照。**GPU 実機検証で発覚した segfault は修正済み (2026-10-16・§3「C4 GPU segfault の修正」節参照・実機再検証は人間対応)**: GDN staged D2H の pinned 1 層分確保 (2 層目以降が領域外書き → libcuda 内 SIGSEGV) + full attention k 経路の src_off/ストライド誤り (k セクション外読み・ミラー行外書き)。**segfault 修正後の実機検証で発覚した出力非決定論 (4 リクエスト全別テキスト) も修正済み (2026-10-16・§3「C4 出力非決定論の修正」節参照・実機再検証は人間対応)**: ステップ中途の grow 再確保 (CH_QKV/aq/CH_ATT) が grouped GEMV 等の in-flight バッファを解放し dno_gdn_scan が未初期化 VRAM を読む競合 → ステップ開始時の一括事前確保 (kv_stage/gdn_stage と同一規約・数値経路は無変更)
+- [x] ~~**2b (283tok prefill) 出力 2 値分岐の解明と修正**~~ → **完了 (2026-10-16 第41〜42セッション)**: 根因は GPU KV ミラーが同一 kv_id (スロット) 再利用時に前会話の行 [0..have) を正規行として再利用すること (短→長の切替直後の 1 リクエストのみ発現・スロット割当の揺れで 2 値に分岐・分岐 md5 `3a1fbabe`/`d46ab41f` はミラー行再利用の証拠)。KvCache にコンテンツ世代 (epoch) を導入し with_mirror_ext で検証・全層無効化。§3「GPU KV ミラーのコンテンツ世代 (epoch) 検証」節参照。実機での分岐消滅確認 (1b→2b シーケンス再実行) は人間対応
 
 ### 運用・周辺
 

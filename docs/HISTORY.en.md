@@ -980,6 +980,30 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 
 `cargo test --workspace` **227 passed / 0 failed** (was 220 + 7)·`cargo check --features cuda --lib` passes (all 12 warnings identical to HEAD, no new warnings)
 
+### GPU KV mirror content-generation (epoch) validation — root-cause fix for the 2b two-value output split ✅ (2026-10-16)
+
+> Sessions 41–42. Identifies and fixes the root cause of the 2b (283-token prefill payload) GPU output two-value split (md5 pair `3a1fbabe` / `d46ab41f`) that REPORT_NEXT12 had left unresolved. This extends to the KV mirror the discipline established by 0c94b05 (the decode-chain grow-race fix): allocate/validate the full extent up front, before the work begins (the mirror-row canonicality check now happens in the pre-sync before prefill starts). The numeric path (arithmetic and sampling) is unchanged; the CPU reference md5s (`feea9444` / `da0b1f57`) are unchanged by design.
+
+**Root cause (mirror-row reuse)**:
+
+- The GPU KV mirror (P17g) keeps a per-layer mirrored-row count `len` per kv_id (slot) and H2D-syncs only the diff, on the assumption that "rows [0..have) are identical to the host cache". The old validity check was **shrink detection only**: "if `len > t_total`, roll back and re-seed everything"
+- When the same slot is reused by a **longer conversation after a shorter one**, `0 < len ≤ t_total` and the rollback guard does not fire — the previous conversation's rows [0..len) are treated as canonical rows of the new conversation. A fresh first use always has len=0 (full re-seed) and a next conversation of equal-or-greater length triggers the rollback guard, so **only the single request right after a short→long switch** gets a polluted prefill
+- In the real-machine E2E (1b→2b sequence), when 2b (283 rows) lands on a released slot whose mirror still holds 1b (14 rows) the prefill is polluted; when it lands on a fresh slot the prefill is correct — slot-assignment jitter split the output into exactly two values. Decode continues deterministically from the prefill result, which is why the split is stable at two values (consistent with REPORT_NEXT12 §6). **The branch md5 pair `3a1fbabe`/`d46ab41f` was the fingerprint of this mirror-row reuse**
+
+**Fix**:
+
+- `KvCache` gains a content generation `epoch: u64`. It is bumped only by operations that invalidate row contents (`reset` / `restore`); appends (`kv_bufs` / `advance`) and `truncate` (which preserves leading rows) leave it unchanged
+- `with_mirror` / `with_mirror_ext` now take `cache.epoch()`; when the mirror's epoch mismatches the host, **all layers' `len` and the GDN state positions `gdn_pos` are invalidated** (full re-seed of all rows / states on the next per-layer call). A reused kv_id can never serve a previous conversation's rows as canonical again
+- Applied at: decode path (`chain_attention` / `chain_attention_dev` / `chain_q35_fullattn`) · prefill path (`chain_attention_prefill` / `chain_qkv_rope_prefill` / `chain_attention_prefill_dev` — llama.rs passes the new epoch argument) · GDN state mirror (both the acquire and finalize calls in `chain_q35_gdn_scan`)
+
+**Tests**:
+
+- New in-crate `kv_cache.rs::epoch_advances_only_on_content_invalidating_ops`: epoch advances only on reset / restore and stays unchanged on append / truncate (the premise of the mirror validation)
+- New `engine.rs::short_then_long_conversation_matches_standalone_outputs`: **reproduction test for the 1b→2b order** (synthetic model; the CPU path is the anchor). Asserts that running a short conversation A followed by a long conversation B on the same engine matches B's standalone output exactly (the old implementation broke on the GPU path exactly in this order). Long→long (rollback path), long→short, and repeated switching (entry-restore path) are also pinned
+- New `#[ignore]` cuda test `cuda.rs::cuda_kv_mirror_epoch_invalidation`: directly observes that an epoch mismatch invalidates the mirror's `len` / `gdn_pos` (**requires the GPU box**: `cargo test --release --features cuda -p denno-engine -- --ignored`)
+
+`cargo test --workspace` **229 passed / 0 failed** (was 227 + 2)·`cargo check --features cuda --lib` passes (all 12 warnings identical to HEAD, no new warnings). **Human follow-up: re-run the 1b→2b sequence on the real machine to confirm the split is gone**
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
@@ -1000,6 +1024,7 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - [x] ~~**B3: rope GPU for b>1 batches** (low priority): syncs are hidden in batch mode~~ → **done (2026-10-15)**: `forward_batch`'s rope is GPU-offloaded via `dno_rope_qk_batch` (same approach as P17h/P17k = host-generated table + mul/sub only, bit-identical to the CPU `rope_row`, rope not in the relaxed slot, table cache skips regeneration across the layer loop, on failure the host is untouched and it falls back to the CPU). See §3 B3. Real-machine ignored cuda tests 27/27 all green (bit-exact, 2026-10-16, §3 27B section). E2E wall measurement (rope reduction for b>1) remains
 - [x] ~~**3B/7B b=4 measurement**~~ → **done in P17k** (target changed to Gemma3n 13,252 tok)
 - [x] ~~**C4: qwen35 device-resident decode chain (GDN state GPU mirror)**~~ → **implemented, verified on CPU (2026-10-16)**: decode (n==1) becomes a solo chain of "one embedding H2D → all layers chained on GPU → one sync+D2H for the final logits" (same skeleton as llama P17h; GDN state is a ping-pong GPU mirror + staged D2H keeping the host correct; on failure it returns None before advance and falls back to the legacy per-op path). Three new kernels (dno_matvec_f32 / dno_qknorm_rope_pi / dno_attn_gate_mul, all under the bit-identity contract). **kernels_elem.ptx regeneration + real-GPU E2E are human tasks** — until regenerated the chain stays inactive (lazy fetch caches None, no GPU_BROKEN) and the existing paths keep running. See the §3 "C4" section. **The segfault found during the real-GPU verification is fixed (2026-10-16 · see the §3 "C4 GPU segfault fix" section · hardware re-verification is a human task)**: the GDN staged-D2H pinned buffer was sized for one layer (later layers wrote out of bounds → SIGSEGV inside libcuda), plus the full-attention k path's wrong src_off/strides (out-of-section reads, out-of-row writes). **The output nondeterminism found during the post-sefault-fix verification (all four requests different) is fixed too (2026-10-16 · see the §3 "C4 output nondeterminism fix" section · hardware re-verification is a human task)**: mid-step grow reallocation (CH_QKV/aq/CH_ATT) freed grouped-GEMV etc. in-flight buffers and dno_gdn_scan read uninitialized VRAM → the whole step is now reserved up front (same convention as kv_stage/gdn_stage; no change to the numeric path)
+- [x] ~~**Identify and fix the 2b (283-token prefill) two-value output split**~~ → **done (sessions 41–42, 2026-10-16)**: the root cause was the GPU KV mirror treating a previous conversation's rows [0..have) as canonical when the same kv_id (slot) was reused (fires only on the single request right after a short→long switch; slot-assignment jitter splits the output into two values — the branch md5 pair `3a1fbabe`/`d46ab41f` was the fingerprint of this mirror-row reuse). `KvCache` now carries a content generation (epoch) and `with_mirror_ext` validates it, invalidating all layers on mismatch. See the §3 "GPU KV mirror content-generation (epoch) validation" section. Human follow-up: re-run the 1b→2b sequence on the real machine to confirm the split is gone
 
 ### Ops & peripheral
 

@@ -2020,6 +2020,11 @@ struct KvMirror {
     cap: usize,
     /// layer ごとにミラー済みの行数 (ホスト cache.len() との差分を H2D する)
     len: Vec<usize>,
+    /// ミラー行が同期しているホスト KV コンテンツの世代 (s41)。
+    /// KvCache::epoch() と一致するときだけ行 [0..len) / GDN 状態を再利用してよい。
+    /// 不一致 (同一スロットで reset/restore → 別会話で再 prefill) なら with_mirror_ext
+    /// が全層の len と gdn_pos を無効化する (s35 の 2b 2 値分岐の修正)。
+    epoch: u64,
     /// C4 (qwen35): GDN 状態ミラー。GDN 層のみ Some (full attention 層は None)。
     /// 状態サイズはコンテキスト長に依存しないため cap 成長の影響を受けない。
     gdn: Vec<Option<GdnDev>>,
@@ -2090,9 +2095,10 @@ fn with_mirror<T>(
     n_layers: usize,
     t_total: usize,
     kv_dim: usize,
+    epoch: u64,
     f: impl FnOnce(&mut KvMirror, usize) -> Option<T>,
 ) -> Option<T> {
-    with_mirror_ext(key, li, n_layers, t_total, kv_dim, true, f)
+    with_mirror_ext(key, li, n_layers, t_total, kv_dim, epoch, true, f)
 }
 
 /// C4: with_mirror の拡張版。`alloc_kv = false` で KV cap 成長をスキップする
@@ -2105,6 +2111,7 @@ fn with_mirror_ext<T>(
     n_layers: usize,
     t_total: usize,
     kv_dim: usize,
+    epoch: u64,
     alloc_kv: bool,
     f: impl FnOnce(&mut KvMirror, usize) -> Option<T>,
 ) -> Option<T> {
@@ -2123,6 +2130,7 @@ fn with_mirror_ext<T>(
                     layers: (0..n_layers).map(|_| (None, None)).collect(),
                     cap: 0,
                     len: vec![0; n_layers],
+                    epoch,
                     gdn: (0..n_layers).map(|_| None).collect(),
                     gdn_pos: vec![None; n_layers],
                 },
@@ -2146,6 +2154,19 @@ fn with_mirror_ext<T>(
     let m = &mut ms[idx].1;
     if li >= m.layers.len() {
         return None; // n_layers 不一致 (起こらないはず)
+    }
+    // s41: コンテンツ世代の検証。同一 kv_id (スロット) でホスト cache が reset /
+    // restore され別会話の KV で再 prefill された場合、ミラーの行 [0..len) と
+    // GDN 状態は前会話のものなので全層無効化する (次回の層呼び出しで全行再 seed)。
+    // 旧実装は「len > t_total なら rollback」という収縮検出のみで、同一スロットに
+    // 短い会話の後に長い別会話が来ると 0 < len ≤ t_total の古い行を正規行として
+    // 使ってしまい (fresh 初回は len=0 で必ず再 seed・同長以上の次会話は rollback
+    // ガードで再 seed)、短→長の切替直後の 1 リクエストだけ出力が変わる 2 値分岐
+    // を生んでいた。
+    if m.epoch != epoch {
+        m.len.iter_mut().for_each(|l| *l = 0);
+        m.gdn_pos.iter_mut().for_each(|p| *p = None);
+        m.epoch = epoch;
     }
     // cap 成長 (全レイヤ realloc + len リセット → 各レイヤ次回使用時に再シード)。
     // alloc_kv = false (GDN 専用呼び出し) ではスキップ — cap/len は使わない。
@@ -2200,7 +2221,8 @@ pub fn chain_attention(
     ok(chain_ensure_buf(CH_ATT, heads * dh * 4))?;
 
     // ミラーの取得/生成 + レイヤ li の行同期。ポインタはロック解放前に抽出する。
-    let (mut kptr, mut vptr) = with_mirror(key, li, n_layers, t_total, kv_dim, |m, have| {
+    let (mut kptr, mut vptr) =
+        with_mirror(key, li, n_layers, t_total, kv_dim, cache.epoch(), |m, have| {
         // 行同期: ミラーが持っている [0..have) とホストの [0..t_total) を突き合わせ。
         // ホストの行 pos0 は呼び出し側が既に書き込み済み。
         // ロールバック (restore/reset) で have > t_total になったら全再シード (have=0)。
@@ -2313,7 +2335,8 @@ pub fn chain_attention_prefill(
     ok(chain_ensure_buf(CH_ATT, n * heads * dh * 4))?;
 
     // ミラーの取得/生成 + レイヤ li の行同期 (decode と同一経路)。
-    let (mut kptr, mut vptr) = with_mirror(key, li, n_layers, t_total, kv_dim, |m, have| {
+    let (mut kptr, mut vptr) =
+        with_mirror(key, li, n_layers, t_total, kv_dim, cache.epoch(), |m, have| {
         let (kc_ref, vc_ref) = cache.kv_bufs_ref(li);
         if have < t_total {
             let kb = m.layers[li].0.as_ref().unwrap();
@@ -3043,7 +3066,8 @@ pub fn chain_qkv_rope_prefill(
     // ミラー取得 + 履歴行 [have..pos0) の同期 (現在行 [pos0..t_total) は rope
     // カーネルが書く)。have > pos0 はミラーがホストに先行 → フォールバック
     // (ホストキャッシュが完全でないため)。
-    let (kptr, vptr) = with_mirror(key, li, n_layers, t_total, kv_dim, |m, have| {
+    let (kptr, vptr) =
+        with_mirror(key, li, n_layers, t_total, kv_dim, cache.epoch(), |m, have| {
         if have > pos0 {
             return None;
         }
@@ -3241,7 +3265,7 @@ pub fn chain_qkv_rope_prefill(
     })?;
 
     // 5) ミラー len 確定 (rope カーネルのミラー書き込みが成功した後でのみ)。
-    with_mirror(key, li, n_layers, t_total, kv_dim, |m, _| {
+    with_mirror(key, li, n_layers, t_total, kv_dim, cache.epoch(), |m, _| {
         m.len[li] = t_total;
         Some(())
     })
@@ -3265,6 +3289,7 @@ pub fn chain_attention_prefill_dev(
     dh: usize,
     kv_dim: usize,
     scale: f32,
+    epoch: u64,
 ) -> Option<()> {
     if !gpu_attention_enabled() {
         return None;
@@ -3285,7 +3310,8 @@ pub fn chain_attention_prefill_dev(
     let qn = heads.checked_mul(dh)?;
     let ctx = chain_ctx()?;
     ok(chain_ensure_buf(CH_ATT, n * qn * 4))?;
-    let (mut kptr, mut vptr) = with_mirror(key, li, n_layers, t_total, kv_dim, |m, _| {
+    let (mut kptr, mut vptr) =
+        with_mirror(key, li, n_layers, t_total, kv_dim, epoch, |m, _| {
         // 現在行は chain_qkv_rope_prefill が書き込み済み (len が t_total に確定済み)。
         if m.len[li] < t_total {
             return None;
@@ -3372,7 +3398,8 @@ pub fn chain_attention_dev(
     }
     ok(chain_ensure_buf(CH_ATT, heads * dh * 4))?;
 
-    let (mut kptr, mut vptr) = with_mirror(key, li, n_layers, t_total, kv_dim, |m, have| {
+    let (mut kptr, mut vptr) =
+        with_mirror(key, li, n_layers, t_total, kv_dim, cache.epoch(), |m, have| {
         // 履歴行 [have..pos0) をホストキャッシュから同期 (現在行 pos0 は CH_QKV から D2D)。
         if have < pos0 {
             let (kc_ref, vc_ref) = cache.kv_bufs_ref(li);
@@ -3922,7 +3949,8 @@ pub fn chain_q35_fullattn(
     ok(chain_ensure_buf(CH_Q35_Q, hd * 4))?;
 
     // 1) ミラー取得 + 履歴行同期 (ポインタはロック解放前に抽出)
-    let (mut kptr, mut vptr) = with_mirror(key, li, n_layers, t_total, kv_dim, |m, have| {
+    let (mut kptr, mut vptr) =
+        with_mirror(key, li, n_layers, t_total, kv_dim, cache.epoch(), |m, have| {
         if have < pos0 {
             let (kc_ref, vc_ref) = cache.kv_bufs_ref(li);
             let kb = m.layers[li].0.as_ref().unwrap();
@@ -4116,7 +4144,7 @@ pub fn chain_q35_gdn_scan(
 
     // GDN 状態ミラー: 取得/seed (ポインタはロック解放前に抽出)
     let (conv_in, ssm_in, conv_out, ssm_out) =
-        with_mirror_ext(key, li, n_layers, t_total, 0, false, |m, _| {
+        with_mirror_ext(key, li, n_layers, t_total, 0, cache.epoch(), false, |m, _| {
             if m.gdn[li].is_none() {
                 let mut g = GdnDev {
                     conv: [None, None],
@@ -4257,7 +4285,7 @@ pub fn chain_q35_gdn_scan(
 
     // ミラー位置の確定 (launch 成功後 — 失敗時は GPU_BROKEN で chain 停止のため
     // 誤更新は残らない)。ping-pong 面を交換。
-    with_mirror_ext(key, li, n_layers, t_total, 0, false, |m, _| {
+    with_mirror_ext(key, li, n_layers, t_total, 0, cache.epoch(), false, |m, _| {
         m.gdn_pos[li] = Some(pos0 + 1);
         if let Some(gd) = m.gdn[li].as_mut() {
             gd.cur = 1 - gd.cur;
@@ -4524,7 +4552,8 @@ mod tests {
             kbuf[..t_total * kv_dim].copy_from_slice(&pseudo_random(t_total * kv_dim, 46));
             vbuf[..t_total * kv_dim].copy_from_slice(&pseudo_random(t_total * kv_dim, 47));
         }
-        let (kptr, vptr) = with_mirror(MIRROR_TEST_KEY, 0, 1, t_total, kv_dim, |m, have| {
+        let (kptr, vptr) =
+            with_mirror(MIRROR_TEST_KEY, 0, 1, t_total, kv_dim, 0, |m, have| {
             if have < pos0 {
                 let (kc_ref, vc_ref) = cache.kv_bufs_ref(0);
                 let kb = m.layers[0].0.as_ref().unwrap();
@@ -4540,6 +4569,61 @@ mod tests {
             ))
         })
         .unwrap();
+
+        // s41: コンテンツ世代 (epoch) 不一致で KV ミラーの全層 len と GDN gdn_pos
+        // が無効化されること。同一 kv_id (スロット) の cache が reset/restore されて
+        // 別会話の KV で再 prefill された場合、前会話の行 [0..have) を正規行として
+        // 使ってしまう 2b 2 値分岐 (s35) の根本修正の検証。CPU では実行不可
+        // (KV_MIRRORS が cuda feature 配下のため) ので GPU 実機で実行する。
+        #[test]
+        #[ignore] // GPU が必要: cargo test --release --features cuda -p denno-engine -- --ignored
+        fn cuda_kv_mirror_epoch_invalidation() {
+            let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            enable_for_tests();
+            let _ctx = CudaCtx::new().unwrap();
+            let (kv_dim, t_total) = (64usize, 40usize);
+            // 番兵キー (MIRROR_TEST_KEY = u64::MAX-1 と衝突しない)
+            let key = u64::MAX - 3;
+            let mut cache = crate::kv_cache::KvCache::new(1, kv_dim, t_total + 64);
+            // 会話 A: epoch 0 で seed → len[0] = t_total・gdn_pos にダミー値
+            {
+                let (kbuf, vbuf) = cache.kv_bufs(0, t_total);
+                kbuf[..t_total * kv_dim].copy_from_slice(&pseudo_random(t_total * kv_dim, 71));
+                vbuf[..t_total * kv_dim].copy_from_slice(&pseudo_random(t_total * kv_dim, 72));
+            }
+            with_mirror(key, 0, 1, t_total, kv_dim, cache.epoch(), |m, have| {
+                assert_eq!(have, 0, "初回はミラー空 (全行シード)");
+                m.len[0] = t_total;
+                m.gdn_pos[0] = Some(t_total - 1);
+                Some(())
+            })
+            .unwrap();
+            // 会話 B: reset → 別内容で再 prefill (epoch が 1 に上がる)
+            cache.reset();
+            assert_eq!(cache.epoch(), 1);
+            {
+                let (kbuf, vbuf) = cache.kv_bufs(0, t_total);
+                kbuf[..t_total * kv_dim].copy_from_slice(&pseudo_random(t_total * kv_dim, 73));
+                vbuf[..t_total * kv_dim].copy_from_slice(&pseudo_random(t_total * kv_dim, 74));
+            }
+            let mut have_b = None;
+            with_mirror(key, 0, 1, t_total, kv_dim, cache.epoch(), |m, have| {
+                have_b = Some(have);
+                Some(())
+            })
+            .unwrap();
+            assert_eq!(
+                have_b,
+                Some(0),
+                "epoch 不一致で len がリセットされ、前会話の行が再利用されないこと"
+            );
+            // GDN 状態位置も epoch 不一致で無効化される (次回 decode で全状態再 seed)
+            with_mirror_ext(key, 0, 1, t_total, 0, cache.epoch(), false, |m, _| {
+                assert!(m.gdn_pos[0].is_none(), "GDN 状態位置も無効化されること");
+                Some(())
+            })
+            .unwrap();
+        }
         launch_rope_qkv_pf(
             &ctx,
             dqkv.ptr(),
@@ -5098,7 +5182,7 @@ mod tests {
         let q: Vec<f32> = pseudo_random(n * heads * dh, 61);
         // KV ミラーを直接用意 (with_mirror を使わず専用 mirror key でシード)
         let key = 999_111u64;
-        let (kptr, vptr) = with_mirror(key, 0, 1, t_total, kv_dim, |m, _have| {
+        let (kptr, vptr) = with_mirror(key, 0, 1, t_total, kv_dim, 0, |m, _have| {
             let kb = m.layers[0].0.as_ref().unwrap();
             let vb = m.layers[0].1.as_ref().unwrap();
             let kv: Vec<f32> = pseudo_random(t_total * kv_dim, 62);

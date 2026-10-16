@@ -25,6 +25,12 @@ pub struct KvCache {
     v: Vec<Vec<f32>>,
     /// GPU KV ミラー (P17g) のキー。プロセス内で一意 (Clone しないので衝突しない)
     id: u64,
+    /// KV 行コンテンツの世代 (s41)。reset / restore で行内容 [0..len) が
+    /// 別会話のもので上書きされるたびに加算される。GPU KV ミラーは同一 kv_id
+    /// (スロット) を使い回すため、ミラー側が「行 [0..have) はホストと同一内容」
+    /// を検証するのに使う (with_mirror_ext の epoch 不一致 → 全層 len/gdn_pos
+    /// 無効化)。append (kv_bufs/advance) は内容を壊さないので加算しない。
+    epoch: u64,
     /// GDN (Qwen3.5 linear_attention) 層の状態スロット。layer index → (conv, ssm)。
     /// attach_gdn_slot で作られ、reset でゼロに戻る。通常の full attention 層は None。
     gdn: Vec<Option<(Vec<f32>, Vec<f32>)>>,
@@ -44,6 +50,7 @@ impl KvCache {
             k: vec![Vec::new(); n_layers],
             v: vec![Vec::new(); n_layers],
             id: KV_ID_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            epoch: 0,
             gdn: vec![None; n_layers],
         }
     }
@@ -68,8 +75,22 @@ impl KvCache {
         self.id
     }
 
+    /// KV 行コンテンツの世代 (s41)。with_mirror に渡し、ミラーが前会話の
+    /// 行を再利用しないための検証に使う。
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// 行内容を無効化する操作 (reset / restore) で epoch を進める。
+    /// truncate は先頭行を保存するため対象外 (ミラーの len > t_total ガードが
+    /// 収縮を検出する)。
+    fn bump_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
     pub fn reset(&mut self) {
         self.len = 0;
+        self.bump_epoch();
         for g in self.gdn.iter_mut().flatten() {
             g.0.fill(0.0);
             g.1.fill(0.0);
@@ -233,6 +254,7 @@ impl KvCache {
         assert_eq!(k.len(), self.k.len(), "KV cache restore: layer count mismatch");
         assert_eq!(v.len(), self.v.len(), "KV cache restore: layer count mismatch");
         self.ensure(n);
+        self.bump_epoch();
         let take = n * self.kv_dim;
         for (i, (dst, src)) in self.k.iter_mut().zip(k.iter()).enumerate() {
             if src.is_empty() {
@@ -410,6 +432,32 @@ mod tests {
     fn kv_bufs_overflow_panics() {
         let mut c = KvCache::new(1, 4, 4);
         let _ = c.kv_bufs(0, 5);
+    }
+
+    /// s41: epoch は行内容を無効化する操作 (reset / restore) でのみ進む。
+    /// append (kv_bufs + advance) と truncate (先頭行保存) は内容を壊さないため
+    /// 不変。GPU KV ミラー (with_mirror_ext) はこの値で「行 [0..have) がホストと
+    /// 同一内容か」を検証する (同一スロットで別会話を再 prefill した場合に
+    /// 前会話の行を再利用しないための修正)。
+    #[test]
+    fn epoch_advances_only_on_content_invalidating_ops() {
+        let mut c = KvCache::new(1, 4, 64);
+        let e0 = c.epoch();
+        {
+            let (k, v) = c.kv_bufs(0, 4);
+            k[..16].copy_from_slice(&[1.0; 16]);
+            v[..16].copy_from_slice(&[2.0; 16]);
+        }
+        c.advance(4);
+        assert_eq!(c.epoch(), e0, "append (kv_bufs/advance) は epoch を進めない");
+        c.truncate(2);
+        assert_eq!(c.epoch(), e0, "truncate は先頭行を保存するため進めない");
+        c.reset();
+        assert_eq!(c.epoch(), e0 + 1, "reset は行内容を消すため進む");
+        let k = vec![vec![0.0f32; 8]];
+        let v = vec![vec![0.0f32; 8]];
+        c.restore(&k, &v, 2);
+        assert_eq!(c.epoch(), e0 + 2, "restore は行 [0..n) を上書きするため進む");
     }
 
     #[test]
