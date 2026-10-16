@@ -671,3 +671,102 @@ extern "C" __global__ void dno_rope_qk_batch(float *q, float *k, const float *ta
         dst[half + d] = x1 * s + x2 * c;
     }
 }
+
+// ---------------------------------------------------------------------------
+// C4: qwen35 デバイス常駐 decode チェーン用カーネル
+// (QK-Norm+partial interleaved rope / sigmoid 出力ゲート / fp32 matvec)
+// ---------------------------------------------------------------------------
+
+// QK-Norm + partial interleaved RoPE (Qwen3.5 full-attention 層の decode 用)。
+// grid = (heads|kv_heads, 1, 1), block = (cols, 1, 1) (cols = head_dim <= 1024),
+// shared = (cols + 1) * 4 bytes (末尾 1 要素は inv の受け渡し)。
+//
+// 演算列 (CPU とビット一致・exactness 契約: QK-Norm は rmsnorm 枠・rope は緩和対象外):
+//   1) thread 0 が CPU tensor::rmsnorm と同一の逐次 2 乗和
+//      (ss += x_i*x_i を i = 0..cols-1、ss/cols、1/sqrt(ss/cols + eps))
+//   2) 全スレッド: normed[i] = (x[i] * inv) * w[i] (左結合 — dno_add_rmsnorm と同一)
+//   3) d < n_rot/2 のスレッド: interleaved ペア (2d, 2d+1) を回転
+//      (x1*c - x2*s / x1*s + x2*c — mul/sub のみ・-fmad=false。tab はホストが
+//      rope_partial_interleaved と同一式 (ang = pos * theta^(-2d/n_rot)) で生成)
+//   4) out[b*out_stride + i] へ書き戻し
+// x は行-major だが行ストライドが cols と異なるレイアウト (q: [q|gate] 融合で
+// stride 2*cols / k: kv 行で stride kv_dim) を x_stride で受ける。
+// rope しない次元 (d >= n_rot) は normed 値をそのまま出力する。
+extern "C" __global__ void dno_qknorm_rope_pi(
+    const float *__restrict__ x,  // [rows, x_stride] — block b が head b の行を読む
+    int x_stride,
+    const float *__restrict__ w,  // [cols] (q_norm/k_norm・ヘッド間共有)
+    const float *__restrict__ tab, // [cos(n_rot/2) | sin(n_rot/2)]
+    float *__restrict__ out,      // [rows, out_stride]
+    int out_stride,
+    int cols, int n_rot, float eps) {
+    extern __shared__ float sh[];
+    const int b = blockIdx.x;
+    const int half = n_rot / 2;
+    const float *row = x + (size_t)b * x_stride;
+    // 1) 逐次 2 乗和 (thread 0 のみ — dno_add_rmsnorm と同一演算列)
+    __shared__ float s_inv;
+    if (threadIdx.x == 0) {
+        float ss = 0.0f;
+        for (int i = 0; i < cols; ++i) {
+            ss = __fadd_rn(ss, __fmul_rn(row[i], row[i]));
+        }
+        ss = __fdiv_rn(ss, (float)cols);
+        s_inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(ss, eps)));
+    }
+    __syncthreads();
+    // 2) normed[i] = (x[i] * inv) * w[i]
+    const int d = threadIdx.x;
+    const float inv = s_inv;
+    sh[d] = __fmul_rn(__fmul_rn(row[d], inv), w[d]);
+    __syncthreads();
+    // 3) partial interleaved rope (ペアは 1 スレッドが担当 → 書き込み競合なし)
+    if (d < half) {
+        const float c = tab[d];
+        const float s = tab[half + d];
+        const float x1 = sh[2 * d];
+        const float x2 = sh[2 * d + 1];
+        sh[2 * d] = x1 * c - x2 * s;
+        sh[2 * d + 1] = x1 * s + x2 * c;
+    }
+    __syncthreads();
+    // 4) 出力
+    out[(size_t)b * out_stride + d] = sh[d];
+}
+
+// sigmoid 出力ゲート (Qwen3.5 full-attention: att[h,i] *= sigmoid(gate[h,i]))。
+// gate は q 投影出力の後半 ([q|gate] 融合・head ごと [dh|dh]) なので
+// qg + h*2*dh + dh から読む。CPU (full_attn_core): `*av /= 1.0 + (-gate[d]).exp()`
+// — dno_expf (glibc expf 再現) + __fdiv_rn/__fadd_rn でビット一致。
+// grid = (heads, 1, 1), block = (dh, 1, 1)。
+extern "C" __global__ void dno_attn_gate_mul(
+    float *__restrict__ att,        // [heads * dh] (in-place 更新)
+    const float *__restrict__ qg,   // [heads * 2*dh] — head ごと [q | gate]
+    int heads, int dh) {
+    const int h = blockIdx.x;
+    const int i = threadIdx.x;
+    float *av = att + (size_t)h * dh + i;
+    const float g = qg[(size_t)h * 2 * dh + dh + i];
+    const float e = dno_expf(-g);
+    *av = __fdiv_rn(*av, __fadd_rn(1.0f, e));
+}
+
+// fp32 matvec (beta/alpha 制御投影専用 — これらは int8 では delta-rule ゲートの
+// 精度が崩れるため Fp32 保持が仕様)。1 スレッド 1 出力・k 逐次
+// (`s += h[d] * w[d]` と同一順序・積と加算の丸めを分離 = -fmad=false 相当) →
+// tensor::matvec_bt とビット一致。n (nv) は最大数十のため逐次ループでも十分軽い。
+// grid = (n, 1, 1), block = (128, 1, 1)。
+extern "C" __global__ void dno_matvec_f32(
+    const float *__restrict__ h,   // [k]
+    const float *__restrict__ w,   // [n, k] row-major
+    float *__restrict__ out,       // [n]
+    int k, int n) {
+    const int j = blockIdx.x;
+    if (j >= n) return;
+    const float *row = w + (size_t)j * k;
+    float s = 0.0f;
+    for (int d = 0; d < k; ++d) {
+        s = __fadd_rn(s, __fmul_rn(h[d], row[d]));
+    }
+    out[j] = s;
+}

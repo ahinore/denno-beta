@@ -748,6 +748,46 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - 両者が正であるためには GGUF 変換 (unsloth/新めの convert_hf_to_gguf) が k/q 行を再配置 (interleave) していることになる。ローカルの mainline clone (59d5fad) の convert_hf_to_gguf.py は qwen3.5 未対応のため変換器の直接確認は不可 (**残検証・人間対応候補**)。ただし本エンジンは GGUF のみを消費するため、当該 GGUF に対する規約の正しさは上記の実測で確定済み (エンジンが safetensors を直接読む経路は無い)
 - 0.8B は nk==nv で両規約同一 (影響なし)
 
+### C4: qwen35 デバイス常駐 decode chain (GDN 状態 GPU ミラー) — 実装完了・CPU 検証まで (2026-10-16)
+
+> 第18〜20セッション。DESIGN_C4.md の設計に従い、qwen35 の decode 1 ステップ (n==1) を llama P17b-g/P17h solo chain と同一骨格のデバイス常駐チェーンで実行する。コンテナに GPU/nvcc が無いため**数値検証は CPU 側 (cargo check/test) のみ** — kernels_elem.ptx の再生成と GPU 実機 E2E は人間対応 (後述)。
+
+**設計 (decode 1 ステップ = 埋め込み 1 回 H2D → 全層 GPU 内連結 → 最終 logits 1 回 sync+D2H)**:
+
+- `forward_decode_chain` (`model/qwen35.rs`・cfg cuda): llama `forward_decode_gpu` と同一骨格。GDN 層 (`chain_q35_gdn_scan`) と full attention 層 (`chain_q35_fullattn`) を分岐し、`forward()` の decode 分岐 (n==1) で試行 → Some なら即 return・None なら従来 per-op 経路
+- **GDN 状態の GPU ミラー**: KvMirror を拡張し conv/ssm を ping-pong 2 面で保持 (`dno_gdn_scan` は in/out 別ポインタ前提のため in==out エイリアスは不正 — nv>nk で複数ブロックが同一 conv チャネルを共有する)。新状態は staged async D2H → logits download の sync 後に `chain_q35_gdn_stage_flush` でホストキャッシュへ反映 — **ホスト状態は常に正であり続ける** (CPU 再実行 / snapshot 契約の維持)。失敗時は advance 前に None を返し forward 全体を従来経路でやり直し (ホスト未汚染・ミラーは pos 位置合わせで自動再 seed)
+- **発動ゲート (非対応は静かに従来経路へフォールバック)**: 全 int8 線形 + lm_head Q8 + beta/alpha F32 (`q35_chain_compatible`)・カーネル形状 (dk==dv / d_conv==4 / dk≤256 / dh≤1024 / n_rot≤dh 偶数 / GQA 整除 — `q35_chain_shapes_ok`)・`DENNO_GPU_ATTN` (escape hatch)・kernels_elem.ptx に新カーネルが存在 (lazy fetch・失敗は None をキャッシュし GPU_BROKEN にしない — llama 経路への影響ゼロ)。検証 (pos≥ctx / tok≥vocab) は従来経路の契約に委譲
+- fp32 重み (beta/alpha/QK-Norm/conv1d/ssm 系) は `Linear::F32` に uid が無いため `(model_id, layer, tag)` でデバイスキャッシュ — `model_id` はロード毎に採番 (`Q35_MODEL_SEQ`・モデル再ロードで誤キャッシュにならない)
+- KV ミラーは GDN 層の呼び出しで KV cap 成長をスキップ (`with_mirror_ext` alloc_kv=false) — 27B で数 GB 規模の無駄確保を回避 (GDN は状態サイズ固定)
+
+**新カーネル 3 種 (`kernels/kernels_elem.cu` — PTX 再生成は人間対応)**:
+
+- `dno_matvec_f32`: fp32 matvec (beta/alpha 制御投影専用 — int8 では delta-rule ゲートの精度が崩れるため Fp32 保持が仕様)。1 スレッド 1 出力・k 逐次 (`__fadd_rn`/`__fmul_rn` で積と加算の丸めを分離 = -fmad=false 相当) → `tensor::matvec_bt` とビット一致
+- `dno_qknorm_rope_pi`: QK-Norm + partial interleaved rope を 1 launch で bit-exact 処理。thread 0 が CPU `tensor::rmsnorm` と同一の逐次 2 乗和 → ペア (2d, 2d+1) を回転 (rope テーブルはホストが `rope_partial_interleaved` と同一式で生成 → cos/sin ビット一致)。q は CH_QKV の [q|gate] 融合 (stride 2dh) → 新スロット CH_Q35_Q、k は KV ミラーの pos0 行へ直接書き込み
+- `dno_attn_gate_mul`: sigmoid 出力ゲート (`dno_expf` + `__fdiv_rn` → `full_attn_core` とビット一致)
+
+**exactness 契約**: rmsnorm / int8 GEMV / swiglu / expf / rope / QK-Norm / sigmoid ゲート / fp32 matvec はビット一致、attention のスコア/softmax のみ緩和 (P17g・ユーザー承認済み)、GDN スキャンは既存 `dno_gdn_scan` を流用 (bit 一致不要契約 = 決定論のみ)。
+
+**新テスト (4 + GPU ignored 1)**:
+
+- `q35_rope_pi_table_bit_matches_rope_partial_interleaved`: rope テーブル (`q35_rope_pi_table`) 経路の回転が `rope_partial_interleaved` と **bit 一致** (n_rot/dh/pos を掃引・partial 契約 d≥n_rot は無回転も検証)
+- `q35_model_id_unique_per_load`: mid がロード毎に一意 (同 dir 再ロード・Fp32 ロード含む)
+- `q35_chain_gate_on_synthetic_model`: 合成 27B シェイプ (int8 ロード) で chain 適合・Fp32 ロードで不適合
+- `q35_chain_shapes_ok_gates` (cfg cuda・純関数): 形状ゲートの肯定 1 + 否定 12 ケース (dk!=dv / d_conv!=4 / dk>256 / dk=0 / e=0 / ff=0 / dh=0 / dh>1024 / n_rot>dh / n_rot 奇数 / GQA 非整除 / heads=0)
+- `qwen35_solo_chain_gpu_matches_cpu` (#[ignore]・cfg cuda): 実機 + PTX 再生成後に chain が**発動** (Some 返却を expect で明示検証 — 教訓⑭) し CPU と greedy 一致 + logits maxabs<0.05 (llama `cuda_solo_chain` と同型)
+
+**検証 (CPU)**:
+
+- `cargo check --features cuda --lib` と `cargo check --lib` の両方通過 (新コード由来の新規警告はゼロ — 既存警告 12/8 本は HEAD と同一内容)
+- `cargo test --workspace` **192 passed / 0 failed** (engine lib 156 = 153 + 3)
+- `cargo test --features cuda --lib` もコンパイル通過 (cfg cuda テスト含む・形状ゲート テストは合格)
+
+**人間対応 (GPU)**:
+
+1. `nvcc -ptx -arch=compute_75 -fmad=false -O3 kernels/kernels_elem.cu -o kernels/kernels_elem.ptx` — 再生成まで GPU 経路は C4 chain 不発動 (lazy fetch が None・既存 per-op 経路は全て現状動作)
+2. 実機 E2E 再検証 + `cargo test --features cuda --lib qwen35_solo_chain -- --ignored` — 発動明示 + greedy 一致 + logits 近似一致
+3. 9B/27B アンカーの再取得 (前節の新ベースライン候補 `feea9444…`/`da0b1f57…` と併せて人間対応)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -767,6 +807,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] ~~**B2: attn_core の V 累積**: 残 3.51s(最大 op)。dno_attention 拡張(attention は緩和契約済み)~~ → **完了 (2026-10-15)**: `dno_attention_prefill` の probs@V 累積を v hoist + 2 行インターリーブ + float2 荷載に再構築(v 再読み 64 回 → 1 回・acc への FMA 列は kk 昇順で旧実装と完全同一 = **ビット一致**・旧カーネルの acc local spill も解消)。ホスト側無変更。実機 ignored cuda テスト 27/27 全緑 (ビット一致・2026-10-16・§3 27B 節)。`cuda_attn_pf_bench` と BK 拡大 A/B、および E2E wall 計測は残課題
 - [x] ~~**B3: b>1 バッチの rope GPU 化**(優先度低): バッチ時は同期が隠蔽される~~ → **完了 (2026-10-15)**: `forward_batch` の rope を `dno_rope_qk_batch` で GPU 化 (P17h/P17k と同一方式=ホスト生成テーブル + mul/sub のみ・CPU `rope_row` とビット一致・rope は緩和対象外・テーブルキャッシュで層ループの再生成を回避・失敗時はホスト不変で CPU フォールバック)。§3 B3 節参照。実機 ignored cuda テスト 27/27 全緑 (ビット一致・2026-10-16・§3 27B 節)。E2E wall 計測 (b>1 の rope 削減幅) は残課題
 - [x] ~~**3B/7Bのb=4実測**~~ → **P17k で実施**(対象は Gemma3n 13,252 tok に変更して完了)
+- [x] ~~**C4: qwen35 デバイス常駐 decode chain (GDN 状態 GPU ミラー)**~~ → **実装完了・CPU 検証まで (2026-10-16)**: decode (n==1) を「埋め込み 1 回 H2D → 全層 GPU 内連結 → 最終 logits 1 回 sync+D2H」にする solo chain (llama P17h と同一骨格・GDN 状態は ping-pong GPU ミラー + staged D2H でホスト正保・失敗時は advance 前 None で従来 per-op 経路にフォールバック)。新カーネル 3 種 (dno_matvec_f32 / dno_qknorm_rope_pi / dno_attn_gate_mul・いずれもビット一致契約)。**kernels_elem.ptx 再生成 + GPU 実機 E2E は人間対応** — 未再生成の間は chain 不発動 (lazy fetch が None をキャッシュ・GPU_BROKEN にならない) で既存経路のまま。§3「C4」節参照
 
 ### 運用・周辺
 

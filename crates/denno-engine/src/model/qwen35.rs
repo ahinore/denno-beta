@@ -105,7 +105,14 @@ pub struct Qwen35 {
     gdn_p: GdnParams,
     layers: Vec<Layer>,
     quant_bytes: usize,
+    /// C4: プロセス内で一意なモデル ID (ロード毎に採番)。cuda chain が fp32 重み
+    /// (beta/alpha/QK-Norm/conv/ssm 系) を (model_id, layer, tag) でデバイス
+    /// キャッシュするためのキー。Linear には uid が無い (F32 系) ための代替。
+    mid: u64,
 }
+
+/// C4: Qwen35 ロード毎のモデル ID 採番 (1 から・0 は未使用マーカに相当)。
+static Q35_MODEL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// モデルディレクトリから GGUF ファイルを選ぶ。優先順: Q8_0 (精度検証用) >
 /// UD-IQ2_XXS > 辞書順先頭。環境変数 DENNO_GGUF_FILE で明示指定も可。
@@ -507,6 +514,7 @@ impl Qwen35 {
             gdn_p,
             layers,
             quant_bytes: quant_bytes.get(),
+            mid: Q35_MODEL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -801,6 +809,16 @@ impl Model for Qwen35 {
         if tokens.len() > 1 {
             return self.forward_prefill(tokens, cache);
         }
+        // C4: solo decode (n==1) はデバイス常駐チェーンで実行 (GDN 状態 GPU ミラー)。
+        // GPU 無効/非対応構造/形状非対応/kernels_elem.ptx に新カーネルが無い/
+        // 実行時エラー → None → 従来の per-op 経路で forward 全体をやり直し
+        // (ホスト状態は冪等・未汚染のため安全。DESIGN_C4.md 参照)。
+        #[cfg(feature = "cuda")]
+        if tokens.len() == 1 {
+            if let Some(logits) = self.forward_decode_chain(tokens[0], cache, pos0) {
+                return Ok(logits);
+            }
+        }
         let mut logits = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = pos0 + i;
@@ -1067,6 +1085,272 @@ fn lchk_argmax(stage: &str, logits: &[f32]) {
         }
     }
     eprintln!("[LCHK] {stage} argmax={bi} logit={bv:.6e}");
+}
+
+// ===========================================================================
+// C4: デバイス常駐 decode chain (GDN 状態 GPU ミラー)。DESIGN_C4.md 参照。
+// 雛形は llama P17h solo chain (forward_decode_gpu + cuda.rs chain_*)。
+// decode 1 ステップを「埋め込み 1 回 H2D → 全層 GPU 内連結 → 最終 logits
+// 1 回 sync+D2H」にする。GDN 状態 (conv/ssm) は GPU ミラーに置き、ホスト状態は
+// ステップ末尾 (logits download の sync 後) に staged D2H → フラッシュして
+// 正であり続ける (snapshot / CPU 再実行契約維持)。
+
+/// partial interleaved rope テーブル 1 行分 [cos(n_rot/2) | sin(n_rot/2)]。
+/// pos 依存のため decode ステップ毎に生成 + chain_q35_rope_pi_upload する。
+/// 値は rope_partial_interleaved と**同一式** (ang = pos * theta^(-2d/n_rot) を
+/// f32 で cos/sin) でビット一致が契約 — dno_qknorm_rope_pi の回転結果を
+/// CPU 経路と bit-exact にするため (テーブル値の一致 = 回転演算の一致)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn q35_rope_pi_table(pos: usize, n_rot: usize, theta: f32) -> Vec<f32> {
+    let half = n_rot / 2;
+    let mut tab = vec![0.0f32; 2 * half];
+    let pos = pos as f32;
+    for d in 0..half {
+        let ang = pos * theta.powf(-2.0 * d as f32 / n_rot as f32);
+        tab[d] = ang.cos();
+        tab[half + d] = ang.sin();
+    }
+    tab
+}
+
+/// C4: decode chain が使える構造か (全 int8 線形 + lm_head 量子化 +
+/// beta/alpha は Fp32)。beta/alpha は dno_matvec_f32 が fp32 重みの生スライスを
+/// 受ける (Linear::F32 に uid は無いため q35_w_dev は (model_id, layer, tag) キー
+/// でキャッシュ) — Q8 化されているモデルは chain 不発動 (現ローダは lin_ctl で
+/// 常に Fp32 を維持するため実モデルは常にこの条件を満たす)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn q35_chain_compatible(m: &Qwen35) -> bool {
+    if m.lm_head.as_ref().map_or(true, |l| l.quant8().is_none()) {
+        return false;
+    }
+    for layer in &m.layers {
+        match &layer.attn {
+            AttnKind::Gdn(g) => {
+                for w in [&g.qkv_w, &g.gate_w, &g.out_w] {
+                    if w.quant8().is_none() {
+                        return false;
+                    }
+                }
+                if !matches!(&g.beta_w, Linear::F32 { .. })
+                    || !matches!(&g.alpha_w, Linear::F32 { .. })
+                {
+                    return false;
+                }
+            }
+            AttnKind::Full(f) => {
+                for w in [&f.q_w, &f.k_w, &f.v_w, &f.o_w] {
+                    if w.quant8().is_none() {
+                        return false;
+                    }
+                }
+            }
+        }
+        for w in [&layer.gate_w, &layer.up_w, &layer.down_w] {
+            if w.quant8().is_none() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(feature = "cuda")]
+impl Qwen35 {
+    /// C4: decode 1 ステップのデバイス常駐 chain。llama forward_decode_gpu と同一
+    /// 骨格 + GDN 層 (chain_q35_gdn_scan) / full 層 (chain_q35_fullattn) の分岐。
+    /// 成功: logits download の sync で全 staged async D2H が完了 → Full 層の
+    /// rope 済み k/v 行と GDN 状態 (conv/ssm) をホストキャッシュへ反映 → advance(1)。
+    /// 失敗: advance 前に None を返す → forward 全体を従来経路でやり直し
+    /// (GDN 状態・KV 行は冪等・ホスト未汚染。ミラー側は pos 位置合わせで自動再 seed)。
+    fn forward_decode_chain(
+        &mut self,
+        token: u32,
+        cache: &mut KvCache,
+        pos0: usize,
+    ) -> Option<Vec<f32>> {
+        use crate::cuda::{
+            chain_download, chain_linear_grouped, chain_q35_fullattn, chain_q35_gdn_scan,
+            chain_q35_gdn_stage_begin, chain_q35_gdn_stage_flush, chain_q35_kv_stage_flush,
+            chain_q35_rope_pi_upload, chain_rmsnorm, chain_swiglu, chain_upload,
+            gpu_attention_enabled, q35_chain_shapes_ok, q35_fns_available, CH_ACT, CH_ATT, CH_DOWN,
+            CH_GA, CH_H, CH_LOGITS, CH_O, CH_QKV, CH_X,
+        };
+        let e = self.e;
+        let ff = self.ff;
+        let heads = self.heads;
+        let kv_heads = self.kv_heads;
+        let dh = self.dh;
+        let kv_dim = kv_heads * dh;
+        let n_layers = self.layers.len();
+        let (nk, nv, dk, dv, d_conv) = (
+            self.gdn_p.n_k_heads,
+            self.gdn_p.n_v_heads,
+            self.gdn_p.head_k_dim,
+            self.gdn_p.head_v_dim,
+            self.gdn_p.d_conv,
+        );
+        let eps = self.eps;
+
+        // --- 事前ゲート (チェーン途中失敗の回避)。非対応は静かに従来経路へ委譲 ---
+        // DENNO_GPU_ATTN=0 (escape hatch) / 新カーネル未生成 (kernels_elem.ptx に
+        // dno_matvec_f32 等が無い → lazy fetch 失敗) / 非対応構造 / 形状制約違反。
+        if !gpu_attention_enabled() || !q35_fns_available() || !q35_chain_compatible(self) {
+            return None;
+        }
+        if !q35_chain_shapes_ok(e, ff, dh, heads, kv_heads, self.n_rot, dk, dv, d_conv) {
+            return None;
+        }
+        // 検証 (pos>=ctx / tok>=vocab) は従来経路の契約 (bail!) に委譲する
+        if pos0 >= self.ctx || token as usize >= self.vocab {
+            return None;
+        }
+        if t_total_overflow(pos0, cache.max_len()) {
+            return None;
+        }
+
+        let key = cache.kv_id();
+        let mid = self.mid;
+        // KV 容量 (forward 側で kv_bufs(0, 1) 済みだが単独呼び出しでも安全なように)
+        let _ = cache.kv_bufs(0, 1);
+
+        // rope テーブル (pos 依存・1 ステップ 1 回。CPU rope_partial_interleaved と
+        // 同一式 → dno_qknorm_rope_pi の QK-Norm+rope を bit-exact にする)
+        let tab = q35_rope_pi_table(pos0, self.n_rot, self.theta);
+        chain_q35_rope_pi_upload(&tab)?;
+        // GDN 状態ステージのリセット (前ステップの残りを誤フラッシュしないため)
+        chain_q35_gdn_stage_begin()?;
+
+        // 埋め込み 1 行 → residual stream デバイス常駐開始
+        chain_upload(CH_X, &self.embed[token as usize * e..][..e], e, 1)?;
+
+        let mut pending: Option<usize> = None;
+        // GDN 層の層番号 (昇順) — KV ステージフラッシュの skip リスト
+        let mut gdn_layers: Vec<usize> = Vec::new();
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            crate::telemetry_layer_begin(li as u16);
+            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+                chain_rmsnorm(layer.attn_ln1(), eps, pending, CH_H, e, 1, li * 3)
+            })?;
+            match &layer.attn {
+                AttnKind::Gdn(g) => {
+                    gdn_layers.push(li);
+                    // qkv + z 投影: CH_QKV = [qkv (2nk*dk+nv*dv) | z (nv)]
+                    crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
+                        let qkv = g.qkv_w.quant8()?;
+                        let zw = g.gate_w.quant8()?;
+                        chain_linear_grouped(&[qkv, zw], CH_H, CH_QKV, 1)
+                    })?;
+                    // beta/alpha (fp32 matvec・CH_QKV テール) → dno_gdn_scan
+                    // (y → CH_ATT・新状態は staged async D2H・ping-pong 面 交換)
+                    crate::prof::time_layer(crate::prof::ATTN, li, || -> Option<()> {
+                        let (bw, aw) = match (&g.beta_w, &g.alpha_w) {
+                            (Linear::F32 { w: bw, .. }, Linear::F32 { w: aw, .. }) => (bw, aw),
+                            _ => return None, // q35_chain_compatible で除外済み
+                        };
+                        chain_q35_gdn_scan(
+                            mid,
+                            key,
+                            li,
+                            n_layers,
+                            cache,
+                            pos0,
+                            nk,
+                            nv,
+                            dk,
+                            dv,
+                            d_conv,
+                            self.gdn_p.eps,
+                            1.0 / (dk as f32).sqrt(),
+                            &g.conv1d,
+                            &g.ssm_a,
+                            &g.ssm_dt,
+                            &g.ssm_norm,
+                            bw,
+                            aw,
+                            e,
+                        )
+                    })?;
+                    // out_proj: y (CH_ATT) → e (CH_O)
+                    crate::prof::time_layer(crate::prof::OPROJ, li, || -> Option<()> {
+                        let ow = g.out_w.quant8()?;
+                        chain_linear_grouped(&[ow], CH_ATT, CH_O, 1)
+                    })?;
+                }
+                AttnKind::Full(f) => {
+                    // qkv 投影: CH_QKV = [qg (heads*2dh) | k (kv_dim) | v (kv_dim)]
+                    crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
+                        let qw = f.q_w.quant8()?;
+                        let kw = f.k_w.quant8()?;
+                        let vw = f.v_w.quant8()?;
+                        chain_linear_grouped(&[qw, kw, vw], CH_H, CH_QKV, 1)
+                    })?;
+                    // QK-Norm + partial rope (q → CH_Q35_Q・k → KV ミラー pos0 行直書き)
+                    // → GQA attention → sigmoid 出力ゲート (k/v 行は staged async D2H)
+                    crate::prof::time_layer(crate::prof::ATTN, li, || {
+                        chain_q35_fullattn(
+                            mid,
+                            key,
+                            li,
+                            n_layers,
+                            cache,
+                            pos0,
+                            heads,
+                            kv_heads,
+                            dh,
+                            self.n_rot,
+                            eps,
+                            &f.q_norm_w,
+                            &f.k_norm_w,
+                        )
+                    })?;
+                    // o_proj: att (CH_ATT) → e (CH_O)
+                    crate::prof::time_layer(crate::prof::OPROJ, li, || -> Option<()> {
+                        let ow = f.o_w.quant8()?;
+                        chain_linear_grouped(&[ow], CH_ATT, CH_O, 1)
+                    })?;
+                }
+            }
+            pending = Some(CH_O);
+            // --- FFN (llama chain と同一): residual+rmsnorm → gate/up → swiglu → down
+            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+                chain_rmsnorm(&layer.ln2_w, eps, pending, CH_H, e, 1, li * 3 + 1)
+            })?;
+            crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
+                let gw = layer.gate_w.quant8()?;
+                let uw = layer.up_w.quant8()?;
+                chain_linear_grouped(&[gw, uw], CH_H, CH_GA, 1)
+            })?;
+            crate::prof::time_layer(crate::prof::SWIGLU, li, || {
+                chain_swiglu(CH_GA, CH_ACT, self.ff, 1)
+            })?;
+            crate::prof::time_layer(crate::prof::DOWN, li, || -> Option<()> {
+                let dw = layer.down_w.quant8()?;
+                chain_linear_grouped(&[dw], CH_ACT, CH_DOWN, 1)
+            })?;
+            pending = Some(CH_DOWN);
+            crate::telemetry_layer_flush();
+        }
+
+        // 最終 norm + lm_head → logits (この download の sync で全 staged D2H 完了)
+        let logits = crate::prof::time(crate::prof::LM_HEAD, || -> Option<Vec<f32>> {
+            chain_rmsnorm(&self.norm_w, eps, pending, CH_H, e, 1, n_layers * 3)?;
+            let lmq = self.lm_head.as_ref().unwrap().quant8()?;
+            chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)?;
+            chain_download(CH_LOGITS, self.vocab)
+        })?;
+        // ホスト反映: Full 層 k/v 行 (GDN 層はステージしないため skip) + GDN 状態
+        chain_q35_kv_stage_flush(cache, n_layers, kv_dim, pos0, &gdn_layers)?;
+        chain_q35_gdn_stage_flush(cache)?;
+        cache.advance(1);
+        Some(logits)
+    }
+}
+
+/// pos0+1 がキャッシュ上限を超えるか (chain は従来経路へ委譲)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn t_total_overflow(pos0: usize, max_len: usize) -> bool {
+    pos0 + 1 > max_len
 }
 
 #[cfg(test)]
@@ -1677,6 +1961,192 @@ mod tests {
         );
         assert_eq!(out2, expect2, "エントリ復元後の出力がフル prefill の参照と不一致");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===========================================================================
+    // C4: デバイス常駐 decode chain の CPU 検証 (rope テーブル bit 一致 / mid
+    // 一意性 / chain ゲート)。GPU 経路自体は qwen35_solo_chain_gpu_matches_cpu
+    // (ignored・実機 + kernels_elem.ptx 再生成後) が担保する。
+    // ===========================================================================
+
+    /// C4: rope テーブル (q35_rope_pi_table) が rope_partial_interleaved と
+    /// **ビット一致**する回転を与えること。dno_qknorm_rope_pi はテーブル値で
+    /// `x1*c - x2*s` / `x1*s + x2*c` を計算するため、テーブル値の bit 一致 =
+    /// 回転結果の bit 一致 (CPU 経路との exactness 契約の根拠)。
+    /// partial 契約 (d >= n_rot は無回転) も検証する。
+    #[test]
+    fn q35_rope_pi_table_bit_matches_rope_partial_interleaved() {
+        let mut st = 0xC4_00_01u32;
+        let mut next = |s: &mut u32| -> f32 {
+            *s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            (((*s >> 16) & 0xff) as f32 / 255.0 - 0.5) * 2.0
+        };
+        let theta = 10000.0f32;
+        // 合成モデル実次元 (n_rot=4/dh=16) を含む・n_rot <= dh・偶数のみ
+        for &(n_rot, dh) in &[(2usize, 8usize), (4, 16), (16, 64), (128, 128)] {
+            for &pos in &[0usize, 1, 7, 63, 1000, 5000] {
+                let tab = q35_rope_pi_table(pos, n_rot, theta);
+                assert_eq!(tab.len(), n_rot, "テーブル長 = [cos(n_rot/2)|sin(n_rot/2)]");
+                let heads = 2usize;
+                let x0: Vec<f32> = (0..heads * dh).map(|_| next(&mut st)).collect();
+                // (a) リファレンス: rope_partial_interleaved
+                let mut a = x0.clone();
+                rope_partial_interleaved(&mut a, heads, dh, n_rot, pos, theta);
+                // (b) テーブル値で同一回転 (dno_qknorm_rope_pi と同一演算列)
+                let half = n_rot / 2;
+                let mut b = x0.clone();
+                for h in 0..heads {
+                    let base = h * dh;
+                    for d in 0..half {
+                        let (c, s) = (tab[d], tab[half + d]);
+                        let (x1, x2) = (b[base + 2 * d], b[base + 2 * d + 1]);
+                        b[base + 2 * d] = x1 * c - x2 * s;
+                        b[base + 2 * d + 1] = x1 * s + x2 * c;
+                    }
+                    // partial 契約: n_rot 以降は無回転
+                    assert_eq!(
+                        bits(&b[base + n_rot..base + dh]),
+                        bits(&x0[base + n_rot..base + dh]),
+                        "partial rope: d >= n_rot は無回転 (n_rot={n_rot} dh={dh} pos={pos})"
+                    );
+                }
+                assert_eq!(
+                    bits(&a),
+                    bits(&b),
+                    "rope テーブル経路の回転が rope_partial_interleaved と不一致 (n_rot={n_rot} pos={pos})"
+                );
+            }
+        }
+    }
+
+    /// C4: model_id (mid) がロード毎に一意に採番されること。cuda chain は fp32
+    /// 重み (beta/alpha/QK-Norm/conv 系) を (mid, layer, tag) でデバイスキャッシュ
+    /// する — Linear::F32 に uid が無いための代替キーで、同 dir 再ロードでも
+    /// 別 mid が採番されないとモデル切替時に誤キャッシュを参照する。
+    #[test]
+    fn q35_model_id_unique_per_load() {
+        let dir = build_dir("c4mid", true, NK, NV);
+        let cfg: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap())
+                .unwrap();
+        let m1 = Qwen35::load(&dir, &cfg, QuantMode::Int8).unwrap();
+        let m2 = Qwen35::load(&dir, &cfg, QuantMode::Int8).unwrap();
+        let m3 = Qwen35::load(&dir, &cfg, QuantMode::Fp32).unwrap();
+        assert_ne!(m1.mid, 0, "mid は 1 起点採番 (0 は未使用マーカ)");
+        assert_ne!(m1.mid, m2.mid, "同 dir の再ロードでも別 mid");
+        assert_ne!(m1.mid, m3.mid);
+        assert_ne!(m2.mid, m3.mid);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C4: chain 適合ゲート (q35_chain_compatible)。合成 27B シェイプ
+    /// (全 int8 線形 + untied lm_head Q8 + beta/alpha F32) で適合、Fp32 ロード
+    /// (quant8 無し) では不適合。形状ゲート (cuda.rs q35_chain_shapes_ok) は
+    /// cuda cfg テスト (q35_chain_shapes_ok_gates) が担保する。
+    #[test]
+    fn q35_chain_gate_on_synthetic_model() {
+        let dir = build_dir("c4gate", true, NK, NV);
+        let cfg: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap())
+                .unwrap();
+        let mi = Qwen35::load(&dir, &cfg, QuantMode::Int8).unwrap();
+        assert_eq!(mi.n_rot, DH / 4, "partial_rotary_factor 0.25");
+        assert!(q35_chain_compatible(&mi), "int8 ロードは chain 適合");
+        let mf = Qwen35::load(&dir, &cfg, QuantMode::Fp32).unwrap();
+        assert!(
+            !q35_chain_compatible(&mf),
+            "Fp32 ロードは lm_head/線形に quant8 が無く chain 不適合"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C4: カーネル形状ゲート (cuda.rs q35_chain_shapes_ok・純関数)。合成モデルの
+    /// 実次元で発動し、dno_gdn_scan 前提違反 (dk!=dv / d_conv!=4 / dk>256 /
+    /// dk=0) や QK-Norm 側前提違反 (dh>1024 / n_rot>dh / n_rot 奇数 / GQA 非整除)
+    /// で拒否されること。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn q35_chain_shapes_ok_gates() {
+        use crate::cuda::q35_chain_shapes_ok;
+        let n_rot = DH / 4; // partial_rotary_factor 0.25
+        assert!(q35_chain_shapes_ok(E, FF, DH, HEADS, KVH, n_rot, DK, DV, DCONV));
+        // dno_gdn_scan 前提 (kernels/gdn.cu)
+        assert!(!q35_chain_shapes_ok(E, FF, DH, HEADS, KVH, n_rot, DK + 1, DV, DCONV), "dk != dv");
+        assert!(!q35_chain_shapes_ok(E, FF, DH, HEADS, KVH, n_rot, DK, DV, 3), "d_conv != 4");
+        assert!(!q35_chain_shapes_ok(E, FF, DH, HEADS, KVH, n_rot, 512, 512, DCONV), "dk > 256");
+        assert!(!q35_chain_shapes_ok(E, FF, DH, HEADS, KVH, n_rot, 0, 0, DCONV), "dk == 0");
+        // rmsnorm / QK-Norm / attention 側の前提
+        assert!(!q35_chain_shapes_ok(0, FF, DH, HEADS, KVH, n_rot, DK, DV, DCONV), "e == 0");
+        assert!(!q35_chain_shapes_ok(E, 0, DH, HEADS, KVH, n_rot, DK, DV, DCONV), "ff == 0");
+        assert!(!q35_chain_shapes_ok(E, FF, 0, HEADS, KVH, n_rot, DK, DV, DCONV), "dh == 0");
+        assert!(!q35_chain_shapes_ok(E, FF, 2048, HEADS, KVH, 1024, DK, DV, DCONV), "dh > 1024");
+        assert!(!q35_chain_shapes_ok(E, FF, DH, HEADS, KVH, DH + 2, DK, DV, DCONV), "n_rot > dh");
+        assert!(!q35_chain_shapes_ok(E, FF, DH, HEADS, KVH, 3, DK, DV, DCONV), "n_rot 奇数");
+        assert!(!q35_chain_shapes_ok(E, FF, DH, 6, 4, n_rot, DK, DV, DCONV), "GQA 非整除");
+        assert!(!q35_chain_shapes_ok(E, FF, DH, 0, KVH, n_rot, DK, DV, DCONV), "heads == 0");
+    }
+
+    /// C4: solo decode chain (GDN 状態 GPU ミラー) が forward_decode_chain で
+    /// **発動**し (Some 返却を明示検証 — 教訓⑭: 「テスト緑」は経路発動の証拠に
+    /// ならない)、CPU 経路と greedy 一致 + logits 近似一致すること。
+    /// 実機 GPU + kernels_elem.ptx 再生成後のみ意味を持つ (新カーネルが PTX に
+    /// 無い場合は lazy fetch が None を返し expect で失敗する = 発動検証)。
+    /// 実行: `cargo test --features cuda --lib qwen35_solo_chain -- --ignored`
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    #[ignore]
+    fn qwen35_solo_chain_gpu_matches_cpu() {
+        fn argmax(v: &[f32]) -> u32 {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0 as u32
+        }
+        let _g = crate::cuda::test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::cuda::enable_for_tests();
+        let dir = build_dir("c4gpu", true, NK, NV);
+        let prompt = vec![5u32, 11, 23];
+        let steps = 4;
+
+        // CPU 参照 (GPU attention 無効 → chain は不発動 → 従来 per-op 経路)
+        let prev = crate::cuda::set_gpu_attention_enabled(false);
+        let mut cpu_m = load_int8(&dir);
+        let mut cpu_cache = cpu_m.new_cache();
+        let mut ref_logits = cpu_m.forward(&prompt, &mut cpu_cache).unwrap();
+        let mut ref_seq = Vec::new();
+        let mut ref_hist: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..steps {
+            let t = argmax(&ref_logits);
+            ref_seq.push(t);
+            ref_logits = cpu_m.forward(&[t], &mut cpu_cache).unwrap();
+            ref_hist.push(ref_logits.clone());
+        }
+        crate::cuda::set_gpu_attention_enabled(true);
+
+        // GPU solo chain (C4: 埋め込み 1 回 H2D → 全層 GPU 内連結 → logits 1 回 D2H)
+        let mut gpu_m = load_int8(&dir);
+        let mut gpu_cache = gpu_m.new_cache();
+        let mut logits = gpu_m.forward(&prompt, &mut gpu_cache).unwrap();
+        for (step, want_tok) in ref_seq.iter().enumerate() {
+            let t = argmax(&logits);
+            assert_eq!(t, *want_tok, "greedy token step={step}");
+            let pos0 = prompt.len() + step;
+            let lg = gpu_m
+                .forward_decode_chain(t, &mut gpu_cache, pos0)
+                .expect("solo chain must fire (C4: int8 + lm_head Q8 + beta/alpha F32 + 新カーネル)");
+            logits = lg;
+            let maxd = logits
+                .iter()
+                .zip(ref_hist[step].iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            // attention スコア/softmax のみ緩和契約 (P17g と同一)・GDN は bit 一致不要
+            assert!(maxd < 0.05, "logits maxabs diff step={step}: {maxd}");
+        }
+        crate::cuda::set_gpu_attention_enabled(prev);
+        println!("C4 solo chain (GDN GPU mirror) matches CPU OK ({steps} steps)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1571,7 +1571,11 @@ pub const CH_GA: usize = 5; // gate/up 連結出力 [m*2ff] (gate が前半)
 pub const CH_ACT: usize = 6; // swiglu 出力 [m*ff]
 pub const CH_DOWN: usize = 7; // down 出力 [m*e]
 pub const CH_LOGITS: usize = 8; // lm_head 出力 [m*vocab]
-const CH_SLOTS: usize = 9;
+// C4 (qwen35): QK-Norm + partial interleaved rope 済み q [heads*dh]。
+// llama chain と異なり qkv 出力が head ごと [q|gate] 融合のため、attention へ渡す
+// q は別スロットに分離して書く (chain_q35_qknorm_rope)。
+pub const CH_Q35_Q: usize = 9;
+const CH_SLOTS: usize = 10;
 
 // P17j: prefill attention カーネルのタイル定数 (kernels_elem.cu の PF_BQ/PF_BK
 // と同期すること)。BQ=行タイル・BK=key タイル。
@@ -1618,6 +1622,19 @@ struct ChainScratch {
     // (async H2D の DMA 完了前にホストが上書きする競合を避ける)。id は呼び出し側が
     // 層番号と用途から一意に採番する。
     pins: Vec<Option<PinMem>>,
+    // C4: qwen35 chain
+    // rope テーブル [cos(n_rot/2) | sin(n_rot/2)] + 転送元 pinned
+    q35_tab: Option<DevBuffer>,
+    q35_pin_tab: Option<PinMem>,
+    /// fp32 重みのデバイスキャッシュ (beta/alpha 制御投影・QK-Norm q/k norm)。
+    /// Linear::F32 / Vec<f32> には uid が無いため (model_id, layer, tag) でキー化
+    /// する。model_id はロード毎に採番されるため、モデル再ロードで誤キャッシュに
+    /// なることはない。
+    q35_w_cache: std::collections::HashMap<(u64, usize, u8), DevBuffer>,
+    /// GDN 新状態の staged async D2H 先 (pin)。レイアウトは gdn_stage_list の並び。
+    q35_gdn_stage: Option<PinMem>,
+    /// (li, conv_off, conv_len, ssm_off, ssm_len) — 要素単位。chain 内で層順に積む。
+    q35_gdn_stage_list: Vec<(usize, usize, usize, usize, usize)>,
 }
 
 thread_local! {
@@ -1651,6 +1668,11 @@ thread_local! {
         br_tab_theta: 0.0,
         br_tab_valid: false,
         pins: Vec::new(),
+        q35_tab: None,
+        q35_pin_tab: None,
+        q35_w_cache: std::collections::HashMap::new(),
+        q35_gdn_stage: None,
+        q35_gdn_stage_list: Vec::new(),
     });
 }
 
@@ -1998,6 +2020,33 @@ struct KvMirror {
     cap: usize,
     /// layer ごとにミラー済みの行数 (ホスト cache.len() との差分を H2D する)
     len: Vec<usize>,
+    /// C4 (qwen35): GDN 状態ミラー。GDN 層のみ Some (full attention 層は None)。
+    /// 状態サイズはコンテキスト長に依存しないため cap 成長の影響を受けない。
+    gdn: Vec<Option<GdnDev>>,
+    /// GDN ミラーが同期している位置 (層ごと・cache.len() 相当)。Some(pos0) なら
+    /// seed 不要。層ごとに持つ (層ごとの seed 判定を独立させる — 1 層でも
+    /// gdn_pos を共有すると残り層が全て再 seed になってしまう)。
+    gdn_pos: Vec<Option<usize>>,
+}
+
+/// C4 (qwen35): GDN 状態 (conv + SSM) のデバイスミラー 1 層分。
+/// dno_gdn_scan は in/out に別ポインタを要求する (nv > nk のとき複数ブロックが
+/// 同一 conv チャネルを共有するため in==out エイリアスは不正) — ping-pong 2 面で
+/// 「cur を読み、1-cur に書き、cur を交換」する。
+struct GdnDev {
+    conv: [Option<DevBuffer>; 2], // 各 [conv_dim, cs] f32
+    ssm: [Option<DevBuffer>; 2],  // 各 [nv, dk, dv] f32
+    cur: usize,
+}
+
+impl GdnDev {
+    fn bytes(&self) -> usize {
+        self.conv
+            .iter()
+            .chain(self.ssm.iter())
+            .map(|b| b.as_ref().map(|b| b.bytes()).unwrap_or(0))
+            .sum()
+    }
 }
 
 impl KvMirror {
@@ -2008,7 +2057,8 @@ impl KvMirror {
                 k.as_ref().map(|b| b.bytes()).unwrap_or(0)
                     + v.as_ref().map(|b| b.bytes()).unwrap_or(0)
             })
-            .sum()
+            .sum::<usize>()
+            + self.gdn.iter().flatten().map(|g| g.bytes()).sum::<usize>()
     }
 }
 
@@ -2042,6 +2092,22 @@ fn with_mirror<T>(
     kv_dim: usize,
     f: impl FnOnce(&mut KvMirror, usize) -> Option<T>,
 ) -> Option<T> {
+    with_mirror_ext(key, li, n_layers, t_total, kv_dim, true, f)
+}
+
+/// C4: with_mirror の拡張版。`alloc_kv = false` で KV cap 成長をスキップする
+/// (qwen35 の GDN 層は KV を使わないため、GDN 層の呼び出しで全層分の KV ミラー
+/// バッファを確保しない — 27B では数 GB 規模の無駄を避ける)。GDN 層は
+/// m.layers[li] / m.len[li] を触らず gdn/gdn_pos のみを使う。
+fn with_mirror_ext<T>(
+    key: u64,
+    li: usize,
+    n_layers: usize,
+    t_total: usize,
+    kv_dim: usize,
+    alloc_kv: bool,
+    f: impl FnOnce(&mut KvMirror, usize) -> Option<T>,
+) -> Option<T> {
     let mirrors = KV_MIRRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
     let mut ms = ok(mirrors.lock().map_err(|e| anyhow::anyhow!("{e}")))?;
     let now = std::time::Instant::now();
@@ -2057,6 +2123,8 @@ fn with_mirror<T>(
                     layers: (0..n_layers).map(|_| (None, None)).collect(),
                     cap: 0,
                     len: vec![0; n_layers],
+                    gdn: (0..n_layers).map(|_| None).collect(),
+                    gdn_pos: vec![None; n_layers],
                 },
                 now,
             ));
@@ -2079,8 +2147,9 @@ fn with_mirror<T>(
     if li >= m.layers.len() {
         return None; // n_layers 不一致 (起こらないはず)
     }
-    // cap 成長 (全レイヤ realloc + len リセット → 各レイヤ次回使用時に再シード)
-    if m.cap < t_total {
+    // cap 成長 (全レイヤ realloc + len リセット → 各レイヤ次回使用時に再シード)。
+    // alloc_kv = false (GDN 専用呼び出し) ではスキップ — cap/len は使わない。
+    if alloc_kv && m.cap < t_total {
         let newcap = kv_mirror_cap(t_total, m.cap);
         let bytes = newcap * kv_dim * 4;
         for l in m.layers.iter_mut() {
@@ -3456,6 +3525,726 @@ pub fn chain_expf_probe(inp: &[f32]) -> Option<Vec<f32>> {
         ok(unsafe { ctx.launch_async(ctx.f_expf, (grid, 1, 1), (256, 1, 1), 0, &mut args) })
     })?;
     chain_download(CH_ACT, n)
+}
+
+// ===========================================================================
+// C4: qwen35 デバイス常駐 decode チェーン (GDN 状態 GPU ミラー)
+// ===========================================================================
+//
+// 雛形は llama P17b-g/P17h solo chain (forward_decode_gpu)。decode 1 ステップを
+// 「埋め込み 1 回 H2D → 全層 GPU 内連結 → 最終 logits 1 回 sync+D2H」にする。
+// qwen35 固有の追加要素:
+// - full attention 層: qkv 出力が head ごと [q|gate] 融合 → QK-Norm + partial
+//   interleaved rope (dno_qknorm_rope_pi) + sigmoid 出力ゲート (dno_attn_gate_mul)
+// - GDN 層: beta/alpha 制御投影が Fp32 (int8 では精度崩壊の実測あり) →
+//   dno_matvec_f32 (tensor::matvec_bt とビット一致) で CH_QKV テールへ出力
+// - GDN 状態 (conv/SSM) の GPU ミラー (KvMirror 拡張・ping-pong 2 面)。
+//   ホスト状態はステップ末尾 (logits download の sync 後) に staged D2H から
+//   復元して正であり続ける (CPU 再実行 / snapshot 契約の維持)
+//
+// exactness 契約 (llama chain と同じ枠組み):
+// - ビット一致: rmsnorm / int8 GEMV / swiglu / expf / rope / QK-Norm / sigmoid
+//   ゲート / fp32 matvec (beta/alpha)
+// - 緩和 (ユーザー承認・P17g と同一): attention のスコア/softmax 累積順
+// - bit 一致不要契約 (決定論のみ): GDN スキャン (既存 dno_gdn_scan と同一カーネル)
+//
+// 発動条件を満たせない (kernels_elem.ptx に新カーネルが無い / 非対応形状 / int8
+// 混在) 場合は全て None を返し、呼び出し側が従来の per-op 経路で forward を
+// やり直す。GPU_BROKEN は立ち**ない** (llama 経路への影響ゼロ)。
+
+/// C4: qwen35 chain 用新カーネルの関数ハンドル。lazy fetch —
+/// kernels_elem.ptx に未収録 (PTX 未再生成) の場合は None をキャッシュして
+/// chain を恒久不発動にする。GPU_BROKEN にはしない (既存 llama 経路を壊さない。
+/// PTX 再生成は人間対応・再生成後の次回プロセス起動から発動)。
+#[derive(Clone, Copy)]
+struct Q35Fns {
+    f_matvec_f32: CUfunction,
+    f_qknorm_rope: CUfunction,
+    f_gate: CUfunction,
+}
+
+// 中身は生ハンドル (関数ハンドル)。所有権の移動は伴わないため Send/Sync を
+// 与える (CudaCtx と同一の規約・driver がスレッド安全に管理する)。
+unsafe impl Send for Q35Fns {}
+unsafe impl Sync for Q35Fns {}
+
+static Q35_FNS: OnceLock<Option<Q35Fns>> = OnceLock::new();
+
+fn q35_fns() -> Option<&'static Q35Fns> {
+    Q35_FNS
+        .get_or_init(|| {
+            let ctx = chain_ctx()?;
+            let lib = ok(lib())?;
+            let get = |name: &[u8]| -> Option<CUfunction> {
+                let mut f: CUfunction = std::ptr::null_mut();
+                let r = unsafe {
+                    (lib.module_get_function)(
+                        &mut f,
+                        ctx.module_elem,
+                        name.as_ptr() as *const c_char,
+                    )
+                };
+                if r != 0 {
+                    None
+                } else {
+                    Some(f)
+                }
+            };
+            Some(Q35Fns {
+                f_matvec_f32: get(b"dno_matvec_f32\0")?,
+                f_qknorm_rope: get(b"dno_qknorm_rope_pi\0")?,
+                f_gate: get(b"dno_attn_gate_mul\0")?,
+            })
+        })
+        .as_ref()
+}
+
+/// C4: qwen35 chain 用新カーネルが利用可能か (発動前ゲート用)。
+pub fn q35_fns_available() -> bool {
+    q35_fns().is_some()
+}
+
+/// C4: qwen35 chain 用 fp32 重みのキャッシュタグ。
+/// (model_id, layer, tag) をキーにデバイスバッファをキャッシュする
+/// (Linear::F32 / Vec<f32> には uid が無いため)。
+pub const Q35_TAG_BETA: u8 = 0; // ssm_beta.weight [e, nv]
+pub const Q35_TAG_ALPHA: u8 = 1; // ssm_alpha.weight [e, nv]
+pub const Q35_TAG_QNORM: u8 = 2; // q_norm.weight [dh]
+pub const Q35_TAG_KNORM: u8 = 3; // k_norm.weight [dh]
+pub const Q35_TAG_CONV: u8 = 4; // conv1d.weight [conv_dim, d_conv]
+pub const Q35_TAG_WA: u8 = 5; // ssm_a [nv]
+pub const Q35_TAG_WDT: u8 = 6; // ssm_dt.bias [nv]
+pub const Q35_TAG_WNORM: u8 = 7; // ssm_norm.weight [dv]
+
+/// C4: fp32 重みのデバイスキャッシュ取得 (無ければ同期 H2D でアップロード)。
+/// 初回 1 回のみ同期コピーが走る (chain 発動セッションの最初のステップ)。
+fn q35_w_dev(mid: u64, li: usize, tag: u8, w: &[f32]) -> Option<CUdeviceptr> {
+    let _ = chain_ctx()?;
+    CHAIN.with(|cell| -> Option<CUdeviceptr> {
+        let mut s = cell.borrow_mut();
+        if let Some(b) = s.q35_w_cache.get(&(mid, li, tag)) {
+            if b.bytes() == w.len() * 4 {
+                return Some(b.ptr());
+            }
+        }
+        let buf = ok(DevBuffer::from_slice(w))?;
+        let p = buf.ptr();
+        s.q35_w_cache.insert((mid, li, tag), buf);
+        Some(p)
+    })
+}
+
+/// C4: qwen35 chain の発動条件 (カーネル形状ゲート)。数値契約は
+/// rmsnorm/int8 GEMV/swiglu/expf/rope/QK-Norm/gate/fp32 matvec がビット一致、
+/// attention スコア/softmax のみ緩和 (P17g・ユーザー承認済み)、GDN スキャンは
+/// bit 一致不要契約 (決定論のみ)。形状はカーネルの前提 (gdn.cu / kernels_elem.cu
+/// の C4 節コメント) と一致させる。
+#[allow(clippy::too_many_arguments)]
+pub fn q35_chain_shapes_ok(
+    e: usize,
+    ff: usize,
+    dh: usize,
+    heads: usize,
+    kv_heads: usize,
+    n_rot: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+) -> bool {
+    // dno_add_rmsnorm の動的共有メモリ上限 (48KB / 4B)
+    if e == 0 || e > 12_288 || ff == 0 {
+        return false;
+    }
+    if dh == 0 || dh > 1024 || heads == 0 || kv_heads == 0 || heads % kv_heads != 0 {
+        return false;
+    }
+    // partial interleaved rope: ペア数 n_rot/2 は dh 内・ペア単位で回転
+    if n_rot == 0 || n_rot > dh || n_rot % 2 != 0 {
+        return false;
+    }
+    // dno_gdn_scan の前提 (gdn.cu 先頭コメント): dk==dv・d_conv==4・dk<=256
+    dk == dv && d_conv == 4 && (1..=256).contains(&dk)
+}
+
+/// C4: ホスト生成の partial interleaved rope テーブル [cos(n_rot/2) | sin(n_rot/2)]
+/// をデバイスへアップロード (1 ステップ 1 回)。テーブルの生成は model::qwen35 側
+/// (rope_partial_interleaved と同一式) が担当し、cuda 側は転送のみを担う
+/// (テーブル値のビット一致を生成箇所で保証する)。専用 pinned スロットを使う
+/// (P17h 規約: ステップ内 sync 無しのため pinned は用途ごとに専用化)。
+pub fn chain_q35_rope_pi_upload(tab: &[f32]) -> Option<()> {
+    let _ = chain_ctx()?;
+    let bytes = tab.len().checked_mul(4)?;
+    if bytes == 0 {
+        return None;
+    }
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure(&mut s.q35_tab, bytes))?;
+        ok(Scratch::ensure_pin(&mut s.q35_pin_tab, bytes))?;
+        {
+            let pin = s.q35_pin_tab.as_mut().unwrap();
+            pin.as_mut_slice::<f32>()[..tab.len()].copy_from_slice(tab);
+        }
+        let dev = s.q35_tab.as_ref().unwrap().ptr();
+        let pin = s.q35_pin_tab.as_ref().unwrap();
+        let lib = ok(lib())?;
+        unsafe {
+            ok(check(
+                (lib.memcpy_htod_async)(dev, pin.ptr as *const c_void, bytes, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync (q35 rope tab)",
+            ))
+        }
+    })
+}
+
+/// C4: GDN 制御投影 (beta/alpha) を dno_matvec_f32 で CH_H → CH_QKV テールへ
+/// 出力する (tensor::matvec_bt とビット一致)。out_off は CH_QKV 内の要素
+/// オフセット (grouped GEMV 出力 [qkv|z] の直後)。CH_QKV はテール分もここで
+/// 確保する (chain_linear_grouped の ensure は grow-only なので上書きされない)。
+fn chain_q35_ctl_f32(
+    mid: u64,
+    li: usize,
+    tag: u8,
+    w: &[f32],
+    k: usize,
+    n: usize,
+    out_off: usize,
+) -> Option<()> {
+    let ctx = chain_ctx()?;
+    let fns = q35_fns()?;
+    if w.len() != k * n || n == 0 || n > 65535 {
+        return None;
+    }
+    ok(chain_ensure_buf(CH_QKV, (out_off + n) * 4))?;
+    let wptr = q35_w_dev(mid, li, tag, w)?;
+    CHAIN.with(|cell| -> Option<()> {
+        let s = cell.borrow();
+        let hptr = s.bufs[CH_H].as_ref()?.ptr();
+        let optr = s.bufs[CH_QKV].as_ref()?.ptr() + (out_off * 4) as u64;
+        let (mut ph, mut pw, mut po) = (hptr, wptr, optr);
+        let (mut kc, mut nc) = (k as c_int, n as c_int);
+        let mut args = [
+            &mut ph as *mut _ as *mut c_void,
+            &mut pw as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut kc as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+        ];
+        ok(unsafe {
+            ctx.launch_async(fns.f_matvec_f32, (n as u32, 1, 1), (128, 1, 1), 0, &mut args)
+        })
+    })
+}
+
+/// C4: QK-Norm + partial interleaved rope (dno_qknorm_rope_pi)。
+/// src スロットの src_off (要素) を先頭に stride x_stride で並ぶ heads 行
+/// (block = heads) を処理し、dst_ptr + i*dst_stride へ書く。
+/// - q: src = CH_QKV (head ごと [q|gate] 融合・x_stride = 2*dh) → CH_Q35_Q
+/// - k: src = CH_QKV の k 部 (x_stride = kv_dim) → KV ミラーの pos0 行
+/// rope テーブルは chain_q35_rope_pi_upload 済み (q35_tab) を使う。
+#[allow(clippy::too_many_arguments)]
+fn chain_q35_qknorm_rope(
+    mid: u64,
+    li: usize,
+    tag: u8,
+    w: &[f32],
+    src_slot: usize,
+    src_off: usize,
+    x_stride: usize,
+    heads: usize,
+    cols: usize,
+    n_rot: usize,
+    eps: f32,
+    dst_ptr: CUdeviceptr,
+    dst_stride: usize,
+) -> Option<()> {
+    let ctx = chain_ctx()?;
+    let fns = q35_fns()?;
+    if w.len() != cols
+        || heads == 0
+        || cols == 0
+        || cols > 1024
+        || n_rot == 0
+        || n_rot > cols
+        || n_rot % 2 != 0
+    {
+        return None;
+    }
+    ok(chain_ensure_buf(src_slot, (src_off + heads * x_stride) * 4))?;
+    let wptr = q35_w_dev(mid, li, tag, w)?;
+    let tabp = CHAIN.with(|cell| -> Option<CUdeviceptr> {
+        let s = cell.borrow();
+        Some(s.q35_tab.as_ref()?.ptr())
+    })?;
+    CHAIN.with(|cell| -> Option<()> {
+        let s = cell.borrow();
+        let xptr = s.bufs[src_slot].as_ref()?.ptr() + (src_off * 4) as u64;
+        let (mut px, mut pxs, mut pw, mut pt, mut po, mut pst) = (
+            xptr,
+            x_stride as c_int,
+            wptr,
+            tabp,
+            dst_ptr,
+            dst_stride as c_int,
+        );
+        let (mut cc, mut nc, mut ec) = (cols as c_int, n_rot as c_int, eps);
+        let mut args = [
+            &mut px as *mut _ as *mut c_void,
+            &mut pxs as *mut _ as *mut c_void,
+            &mut pw as *mut _ as *mut c_void,
+            &mut pt as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut pst as *mut _ as *mut c_void,
+            &mut cc as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut ec as *mut _ as *mut c_void,
+        ];
+        ok(unsafe {
+            ctx.launch_async(
+                fns.f_qknorm_rope,
+                (heads as u32, 1, 1),
+                (cols as u32, 1, 1),
+                ((cols + 1) * 4) as u32,
+                &mut args,
+            )
+        })
+    })
+}
+
+/// C4: qwen35 full-attention 層の decode attention (デバイス常駐)。
+/// 前提: CH_QKV に [qg (heads*2dh) | k (kv_dim) | v (kv_dim)] がある
+/// (chain_linear_grouped 直後)。処理:
+/// 1. KV ミラー取得 + 履歴行 [have..pos0) をホストから同期
+/// 2. k: dno_qknorm_rope_pi が KV ミラーの pos0 行へ直接書く (QK-Norm + rope)
+///    q: 同カーネルが CH_Q35_Q へ書く (attention 入力)
+/// 3. v: CH_QKV からミラー pos0 行へ D2D + staged async D2H (k/v 行)
+/// 4. dno_attention (GQA・緩和枠) → dno_attn_gate_mul (sigmoid ゲート・ビット一致)
+/// ホストキャッシュへの反映は sync 後の chain_q35_kv_stage_flush。
+/// 失敗時 None (forward 全体を従来経路でやり直し — ホスト状態不変のため安全)。
+#[allow(clippy::too_many_arguments)]
+pub fn chain_q35_fullattn(
+    mid: u64,
+    key: u64,
+    li: usize,
+    n_layers: usize,
+    cache: &crate::kv_cache::KvCache,
+    pos0: usize,
+    heads: usize,
+    kv_heads: usize,
+    dh: usize,
+    n_rot: usize,
+    eps: f32,
+    q_norm_w: &[f32],
+    k_norm_w: &[f32],
+) -> Option<()> {
+    if !gpu_attention_enabled() {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+    let fns = q35_fns()?;
+    let kv_dim = kv_heads * dh;
+    let t_total = pos0 + 1;
+    if heads == 0 || dh == 0 || dh > 1024 || t_total == 0 || t_total > cache.max_len() {
+        return None;
+    }
+    let group = heads / kv_heads;
+    let hd = heads * dh;
+    ok(chain_ensure_buf(CH_ATT, hd * 4))?;
+    ok(chain_ensure_buf(CH_Q35_Q, hd * 4))?;
+
+    // 1) ミラー取得 + 履歴行同期 (ポインタはロック解放前に抽出)
+    let (mut kptr, mut vptr) = with_mirror(key, li, n_layers, t_total, kv_dim, |m, have| {
+        if have < pos0 {
+            let (kc_ref, vc_ref) = cache.kv_bufs_ref(li);
+            let kb = m.layers[li].0.as_ref().unwrap();
+            let vb = m.layers[li].1.as_ref().unwrap();
+            ok(kb.copy_from_at(have * kv_dim * 4, &kc_ref[have * kv_dim..pos0 * kv_dim]))?;
+            ok(vb.copy_from_at(have * kv_dim * 4, &vc_ref[have * kv_dim..pos0 * kv_dim]))?;
+        }
+        m.len[li] = t_total;
+        Some((
+            m.layers[li].0.as_ref().unwrap().ptr(),
+            m.layers[li].1.as_ref().unwrap().ptr(),
+        ))
+    })?;
+
+    // 2) QK-Norm + rope: k はミラー pos0 行へ直接・q は CH_Q35_Q へ
+    //    (CH_QKV レイアウト: [qg (heads*2dh) | k (kv_dim) | v (kv_dim)])
+    let km_row = kptr + (pos0 * kv_dim * 4) as u64;
+    let q_ptr = CHAIN.with(|cell| -> Option<CUdeviceptr> {
+        let s = cell.borrow();
+        Some(s.bufs[CH_Q35_Q].as_ref()?.ptr())
+    })?;
+    chain_q35_qknorm_rope(
+        mid, li, Q35_TAG_QNORM, q_norm_w,
+        CH_QKV, 0, 2 * dh, heads, dh, n_rot, eps,
+        q_ptr,
+        dh,
+    )?;
+    chain_q35_qknorm_rope(
+        mid, li, Q35_TAG_KNORM, k_norm_w,
+        CH_QKV, hd, kv_dim, kv_heads, dh, n_rot, eps, km_row, kv_dim,
+    )?;
+
+    // 3) v 行 D2D + k/v 行の staged async D2H (ホスト反映は sync 後)
+    let (vp_src, kv_dim64) = CHAIN.with(|cell| -> Option<(CUdeviceptr, u64)> {
+        let s = cell.borrow();
+        let base = s.bufs[CH_QKV].as_ref()?.ptr();
+        Some((base + (((heads * 2 * dh) + kv_dim) * 4) as u64, (kv_dim * 4) as u64))
+    })?;
+    let lib = ok(lib())?;
+    unsafe {
+        ok(check(
+            (lib.memcpy_dtod_async)(
+                vptr + (pos0 as u64 * kv_dim64),
+                vp_src,
+                kv_dim64 as usize,
+                std::ptr::null_mut(),
+            ),
+            "cuMemcpyDtoDAsync (q35 v row)",
+        ))?;
+    }
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        let stage_bytes = n_layers * 2 * (kv_dim * 4);
+        ok(Scratch::ensure_pin(&mut s.kv_stage, stage_bytes))?;
+        let off = li * 2 * kv_dim * 4;
+        let pin = s.kv_stage.as_ref().unwrap();
+        unsafe {
+            ok(check(
+                (lib.memcpy_dtoh_async)(
+                    (pin.ptr as *mut c_void).add(off),
+                    km_row,
+                    kv_dim * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (q35 k stage)",
+            ))?;
+            ok(check(
+                (lib.memcpy_dtoh_async)(
+                    (pin.ptr as *mut c_void).add(off + kv_dim * 4),
+                    vp_src,
+                    kv_dim * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (q35 v stage)",
+            ))?;
+        }
+        Some(())
+    })?;
+
+    // 4) attention (q は CH_Q35_Q) + sigmoid 出力ゲート
+    let scale = 1.0 / (dh as f32).sqrt();
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure(&mut s.attn_sc, heads * t_total * 4))?;
+        let mut qptr = s.bufs[CH_Q35_Q].as_ref()?.ptr();
+        let mut scptr = s.attn_sc.as_ref().unwrap().ptr();
+        let mut aptr = s.bufs[CH_ATT].as_ref().unwrap().ptr();
+        let mut scale_c = scale;
+        let mut kv_dim_c = kv_dim as c_int;
+        let mut t_c = t_total as c_int;
+        let mut group_c = group as c_int;
+        let mut dh_c = dh as c_int;
+        let mut args: Vec<*mut c_void> = vec![
+            &mut qptr as *mut _ as *mut c_void,
+            &mut kptr as *mut _ as *mut c_void,
+            &mut vptr as *mut _ as *mut c_void,
+            &mut aptr as *mut _ as *mut c_void,
+            &mut scptr as *mut _ as *mut c_void,
+            &mut kv_dim_c as *mut _ as *mut c_void,
+            &mut t_c as *mut _ as *mut c_void,
+            &mut group_c as *mut _ as *mut c_void,
+            &mut dh_c as *mut _ as *mut c_void,
+            &mut scale_c as *mut _ as *mut c_void,
+        ];
+        ok(unsafe {
+            ctx.launch_async(
+                ctx.f_attn,
+                (heads as u32, 1, 1),
+                (dh as u32, 1, 1),
+                (dh * 4) as u32,
+                &mut args,
+            )
+        })?;
+        // sigmoid 出力ゲート: att[h,i] /= (1 + exp(-qg[h*2dh + dh + i]))
+        let mut qgptr = s.bufs[CH_QKV].as_ref()?.ptr();
+        let (mut hc, mut dhc) = (heads as c_int, dh as c_int);
+        let mut gargs = [
+            &mut aptr as *mut _ as *mut c_void,
+            &mut qgptr as *mut _ as *mut c_void,
+            &mut hc as *mut _ as *mut c_void,
+            &mut dhc as *mut _ as *mut c_void,
+        ];
+        ok(unsafe {
+            ctx.launch_async(fns.f_gate, (heads as u32, 1, 1), (dh as u32, 1, 1), 0, &mut gargs)
+        })
+    })
+}
+
+/// C4: qwen35 GDN 層の decode スキャン (デバイス常駐)。
+/// 前提: CH_H に rmsnorm 出力、CH_QKV に [qkv (conv_dim) | z (vd)] がある
+/// (chain_linear_grouped 直後)。beta/alpha は本関数が dno_matvec_f32 で
+/// CH_QKV テール [(conv_dim+vd)..] へ出力する。GDN 状態ミラー (ping-pong) を
+/// seed/更新し、dno_gdn_scan (既存カーネル・grid=(nv,), block=(dk,)) を起動 —
+/// y を CH_ATT に書き、新状態を staged async D2H する。
+/// ホスト反映は sync 後の chain_q35_gdn_stage_flush。
+/// 失敗時 None (forward 全体を従来経路でやり直し)。
+#[allow(clippy::too_many_arguments)]
+pub fn chain_q35_gdn_scan(
+    mid: u64,
+    key: u64,
+    li: usize,
+    n_layers: usize,
+    cache: &mut crate::kv_cache::KvCache,
+    pos0: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    eps: f32,
+    q_scale: f32,
+    wconv: &[f32],
+    wa: &[f32],
+    wdt: &[f32],
+    wnorm: &[f32],
+    beta_w: &[f32],
+    alpha_w: &[f32],
+    e: usize,
+) -> Option<()> {
+    let ctx = chain_ctx()?;
+    // 新カーネル (dno_matvec_f32) の存在確認を早めに行う (ctl_f32 内でも失敗するが
+    // ここで弾く方が意図が明確)。
+    if q35_fns().is_none() {
+        return None;
+    }
+    let cs = d_conv - 1;
+    let conv_dim = 2 * nk * dk + nv * dv; // == qkv_w.n (GDN カーネルの qkv 行幅)
+    let vd = nv * dv;
+    let t_total = pos0 + 1;
+    if dk == 0 || dv == 0 || dk != dv || d_conv != 4 || !(1..=256).contains(&dk) {
+        return None;
+    }
+    if wconv.len() != conv_dim * d_conv || wa.len() != nv || wdt.len() != nv || wnorm.len() != dv {
+        return None;
+    }
+    if beta_w.len() != e * nv || alpha_w.len() != e * nv {
+        return None;
+    }
+    let width = conv_dim + vd + 2 * nv;
+    ok(chain_ensure_buf(CH_QKV, width * 4))?;
+    ok(chain_ensure_buf(CH_ATT, vd * 4))?;
+
+    // beta/alpha 制御投影 (fp32 matvec・CH_QKV テールへ)
+    chain_q35_ctl_f32(mid, li, Q35_TAG_BETA, beta_w, e, nv, conv_dim + vd)?;
+    chain_q35_ctl_f32(mid, li, Q35_TAG_ALPHA, alpha_w, e, nv, conv_dim + vd + nv)?;
+
+    // GDN 状態ミラー: 取得/seed (ポインタはロック解放前に抽出)
+    let (conv_in, ssm_in, conv_out, ssm_out) =
+        with_mirror_ext(key, li, n_layers, t_total, 0, false, |m, _| {
+            if m.gdn[li].is_none() {
+                let mut g = GdnDev {
+                    conv: [None, None],
+                    ssm: [None, None],
+                    cur: 0,
+                };
+                ok(Scratch::ensure(&mut g.conv[0], conv_dim * cs * 4))?;
+                ok(Scratch::ensure(&mut g.conv[1], conv_dim * cs * 4))?;
+                ok(Scratch::ensure(&mut g.ssm[0], nv * dk * dv * 4))?;
+                ok(Scratch::ensure(&mut g.ssm[1], nv * dk * dv * 4))?;
+                m.gdn[li] = Some(g);
+            }
+            let gd = m.gdn[li].as_mut().unwrap();
+            // seed: この層のミラーが pos0 に同期していなければホスト状態を H2D
+            if m.gdn_pos[li] != Some(pos0) {
+                let (conv_h, ssm_h) = cache.gdn_state_mut(li)?;
+                ok(gd.conv[0].as_ref().unwrap().copy_from(conv_h))?;
+                ok(gd.ssm[0].as_ref().unwrap().copy_from(ssm_h))?;
+                gd.cur = 0;
+            }
+            let cur = gd.cur;
+            let nxt = 1 - cur;
+            Some((
+                gd.conv[cur].as_ref().unwrap().ptr(),
+                gd.ssm[cur].as_ref().unwrap().ptr(),
+                gd.conv[nxt].as_ref().unwrap().ptr(),
+                gd.ssm[nxt].as_ref().unwrap().ptr(),
+            ))
+        })?;
+
+    // dno_gdn_scan 起動 (qkv/z は CH_QKV・beta/alpha はテール・y は CH_ATT)
+    let (mut pq, mut pz, mut pb, mut pa, mut pci, mut psi) = CHAIN.with(
+        |cell| -> Option<(CUdeviceptr, CUdeviceptr, CUdeviceptr, CUdeviceptr, CUdeviceptr, CUdeviceptr)> {
+            let s = cell.borrow();
+            let base = s.bufs[CH_QKV].as_ref()?.ptr();
+            Some((
+                base,
+                base + (conv_dim * 4) as u64,
+                base + ((conv_dim + vd) * 4) as u64,
+                base + ((conv_dim + vd + nv) * 4) as u64,
+                conv_in,
+                ssm_in,
+            ))
+        },
+    )?;
+    let pwc = q35_w_dev(mid, li, Q35_TAG_CONV, wconv)?;
+    let pwa = q35_w_dev(mid, li, Q35_TAG_WA, wa)?;
+    let pwd = q35_w_dev(mid, li, Q35_TAG_WDT, wdt)?;
+    let pwn = q35_w_dev(mid, li, Q35_TAG_WNORM, wnorm)?;
+    let (mut pwc, mut pwa, mut pwd, mut pwn) = (pwc, pwa, pwd, pwn);
+    let (mut py, mut pco, mut pso) = (
+        CHAIN.with(|cell| -> Option<CUdeviceptr> {
+            let s = cell.borrow();
+            Some(s.bufs[CH_ATT].as_ref()?.ptr())
+        })?,
+        conv_out,
+        ssm_out,
+    );
+    let (mut ni, mut nki, mut nvi, mut dki, mut dvi) = (
+        1 as c_int, nk as c_int, nv as c_int, dk as c_int, dv as c_int,
+    );
+    let (mut cdi, mut dci, mut csi) = (conv_dim as c_int, d_conv as c_int, cs as c_int);
+    let (mut epsi, mut qsi) = (eps, q_scale);
+    let mut args = [
+        &mut pq as *mut _ as *mut c_void,
+        &mut pz as *mut _ as *mut c_void,
+        &mut pb as *mut _ as *mut c_void,
+        &mut pa as *mut _ as *mut c_void,
+        &mut pci as *mut _ as *mut c_void,
+        &mut psi as *mut _ as *mut c_void,
+        &mut pwc as *mut _ as *mut c_void,
+        &mut pwa as *mut _ as *mut c_void,
+        &mut pwd as *mut _ as *mut c_void,
+        &mut pwn as *mut _ as *mut c_void,
+        &mut py as *mut _ as *mut c_void,
+        &mut pco as *mut _ as *mut c_void,
+        &mut pso as *mut _ as *mut c_void,
+        &mut ni as *mut _ as *mut c_void,
+        &mut nki as *mut _ as *mut c_void,
+        &mut nvi as *mut _ as *mut c_void,
+        &mut dki as *mut _ as *mut c_void,
+        &mut dvi as *mut _ as *mut c_void,
+        &mut cdi as *mut _ as *mut c_void,
+        &mut dci as *mut _ as *mut c_void,
+        &mut csi as *mut _ as *mut c_void,
+        &mut epsi as *mut _ as *mut c_void,
+        &mut qsi as *mut _ as *mut c_void,
+    ];
+    let shmem = ((3 * dk + dv + 5) * 4) as u32;
+    ok(unsafe {
+        // dno_gdn_scan は既存カーネル (kernels_gdn.ptx・ctx.f_gdn に取得済み) を
+        // そのまま使う — 新 PTX は不要 (kernels_elem 側の新カーネルのみ人間再生成)。
+        ctx.launch_async(ctx.f_gdn, (nv as u32, 1, 1), (dk as u32, 1, 1), shmem, &mut args)
+    })?;
+
+    // 新状態 (ping-pong の書き込み面) を staged async D2H → ホスト反映は sync 後
+    let lib = ok(lib())?;
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        let conv_elems = conv_dim * cs;
+        let ssm_elems = nv * dk * dv;
+        let need = (conv_elems + ssm_elems) * 4;
+        ok(Scratch::ensure_pin(&mut s.q35_gdn_stage, need))?;
+        // ステージの積み位置 = 前エントリの末尾 (ssm_off + ssm_len)
+        let prev: usize = s
+            .q35_gdn_stage_list
+            .last()
+            .map(|(_, _, _, so, sl)| so + sl)
+            .unwrap_or(0);
+        let pin = s.q35_gdn_stage.as_ref().unwrap();
+        unsafe {
+            ok(check(
+                (lib.memcpy_dtoh_async)(
+                    (pin.ptr as *mut c_void).add(prev * 4),
+                    conv_out,
+                    conv_elems * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (q35 conv stage)",
+            ))?;
+            ok(check(
+                (lib.memcpy_dtoh_async)(
+                    (pin.ptr as *mut c_void).add((prev + conv_elems) * 4),
+                    ssm_out,
+                    ssm_elems * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (q35 ssm stage)",
+            ))?;
+        }
+        s.q35_gdn_stage_list
+            .push((li, prev, conv_elems, prev + conv_elems, ssm_elems));
+        Some(())
+    })?;
+
+    // ミラー位置の確定 (launch 成功後 — 失敗時は GPU_BROKEN で chain 停止のため
+    // 誤更新は残らない)。ping-pong 面を交換。
+    with_mirror_ext(key, li, n_layers, t_total, 0, false, |m, _| {
+        m.gdn_pos[li] = Some(pos0 + 1);
+        if let Some(gd) = m.gdn[li].as_mut() {
+            gd.cur = 1 - gd.cur;
+        }
+        Some(())
+    })
+}
+
+/// C4: chain ステップ開始時に GDN ステージリストをリセットする
+/// (前ステップの残りを誤ってフラッシュしないため)。
+pub fn chain_q35_gdn_stage_begin() -> Option<()> {
+    CHAIN.with(|cell| -> Option<()> {
+        cell.borrow_mut().q35_gdn_stage_list.clear();
+        Some(())
+    })
+}
+
+/// C4: staged GDN 状態をホストキャッシュへ反映 (logits download の sync 後 —
+/// 全 staged D2H 完了済み)。ホスト GDN 状態は従来どおり正であり続ける
+/// (CPU 再実行 / snapshot 互換)。
+pub fn chain_q35_gdn_stage_flush(cache: &mut crate::kv_cache::KvCache) -> Option<()> {
+    CHAIN.with(|cell| -> Option<()> {
+        let s = cell.borrow();
+        let stage = s.q35_gdn_stage.as_ref()?;
+        let slice = stage.as_slice::<f32>();
+        for &(li, conv_off, conv_len, ssm_off, ssm_len) in &s.q35_gdn_stage_list {
+            let (conv, ssm) = cache.gdn_state_mut(li)?;
+            if conv.len() < conv_len || ssm.len() < ssm_len {
+                return None;
+            }
+            conv[..conv_len].copy_from_slice(&slice[conv_off..conv_off + conv_len]);
+            ssm[..ssm_len].copy_from_slice(&slice[ssm_off..ssm_off + ssm_len]);
+        }
+        Some(())
+    })
+}
+
+/// C4: qwen35 用 KV ステージフラッシュ (GDN 層は KV をステージしないため
+/// 該当層をスキップする。llama 用 chain_kv_stage_flush は全層をフラッシュする
+/// ため流用できない)。
+pub fn chain_q35_kv_stage_flush(
+    cache: &mut crate::kv_cache::KvCache,
+    n_layers: usize,
+    kv_dim: usize,
+    pos0: usize,
+    skip: &[usize],
+) -> Option<()> {
+    CHAIN.with(|cell| -> Option<()> {
+        let s = cell.borrow();
+        let stage = s.kv_stage.as_ref()?;
+        let slice = stage.as_slice::<f32>();
+        let mut si = 0usize;
+        for li in 0..n_layers {
+            if si < skip.len() && skip[si] == li {
+                si += 1;
+                continue;
+            }
+            let off = li * 2 * kv_dim;
+            let (kc, vc) = cache.kv_bufs(li, 1);
+            kc[pos0 * kv_dim..][..kv_dim].copy_from_slice(&slice[off..off + kv_dim]);
+            vc[pos0 * kv_dim..][..kv_dim].copy_from_slice(&slice[off + kv_dim..off + 2 * kv_dim]);
+        }
+        Some(())
+    })
 }
 
 // ===========================================================================
