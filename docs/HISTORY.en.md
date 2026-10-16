@@ -882,6 +882,29 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 3. Re-measure speed (vs 27.9 ms/step; the allocation happens once per process, so the impact should be zero)
 4. Re-take the anchors (C4-chain output changes from the corrupted pre-fix values → confirm they match the CPU anchors)
 
+### streaming tool_use support (SSE assembler) ✅ (2026-10-16)
+
+> Completes the §3 "tool use support" future-work item "streaming tool_use" (implementation body written in session 33; borrow errors and test mismatches fixed in session 34 to finish). Server wiring plus a new SSE assembler only — no changes to engine numeric paths (the no-tools stream delta path is bit-identical).
+
+**Design (the same semantics as non-streaming `extract_tool_calls`, ported to the delta stream)**:
+
+- New `server/stream_asm.rs`: `StreamAssembler` receives detokenized delta pieces and builds the Anthropic-style SSE event sequence (text block / tool_use block start/delta/stop) while detecting `<tool_call>` block boundaries. One per Stream job
+- **Only complete blocks become tool_use**: once the OPEN..CLOSE span is fully arrived, `parse_tool_call_inner` parses it — success emits a tool_use block (content_block_start → input_json_delta → content_block_stop, completed immediately), failure keeps the whole block as text (same as the non-streaming "failed blocks stay as text" rule). OPEN/CLOSE split across delta boundaries are tracked in a `scan` buffer; confirmed text is not emitted while the tail of `scan` could still be an OPEN prefix (so a partially-arrived OPEN is never flushed as text)
+- **Trim rules also match non-streaming**: leading whitespace is dropped until the first non-whitespace is emitted; trailing whitespace is held (it may become interior whitespace after a block, or be trimmed at the end) and cut at finish → any delta split yields exactly the text of `extract_tool_calls(full)` (unit tests verify every chunk size / every byte boundary)
+- An unfinished block (no CLOSE) becomes text at finish (same as the non-streaming "incomplete is not a block" rule). When at least one tool_use block was emitted, `finish_run`'s message_delta stop_reason is `"tool_use"` (same rule as non-streaming `message_json`)
+
+**Wiring (server)**:
+
+- `scheduler.rs`: `Run` gains `asm: Option<StreamAssembler>`. Each decode step takes the assembler out of the Run, hands it to the delta callback (the callback captures `&mut StreamAssembler` inside a `Box<dyn FnMut>`), and puts it back after the step. `finish_run` flushes the assembler's remaining events (tail text + closing the open block) before message_delta
+- `lib.rs`: the tools+stream 400 rejection is removed; `submit_stream` now receives `tools_for_prompt`/`tool_constraint` (constrained decoding from sessions 21-26 is now active on the streaming path too — wiring the arguments added to `Job::Stream` in a16b203)
+- `engine.rs`: `step_chat_batch`'s `on_deltas` becomes `Box<dyn FnMut(&str) + '_>` (so the scheduler can capture a short-lived borrow of the assembler taken out of the Run; a bare `Box<dyn FnMut>` demands 'static). `testutil.rs`: TOOL_VOCAB gains `</function>` (32) and the E2E script emits a complete XML block
+
+**Tests (server lib 25 = 15 + stream_asm 10 / workspace 215 = 205 + 10)**:
+
+- 10 `stream_asm.rs` unit tests: text-only / text+block with every chunk size (1-100) matching `extract_tool_calls` text exactly · block-only (closes the empty text block 0, tool block is index 1) · unparsable block becomes text · OPEN/CLOSE split at every byte boundary still detected · partial OPEN prefix (`<` etc.) held not emitted · incomplete block becomes text at finish · multiple blocks with ascending indices and text-block reopening · whitespace-only region before a block emits no delta · whitespace around blocks becomes interior
+- Integration `tests/tools.rs`: `tools_with_stream_is_rejected` (400) replaced by `tools_with_stream_is_accepted` (SSE completeness: every event type's `event:` line, no tool_use block when the model emits none, joined deltas = greedy expectation, stop_reason)
+- `cargo test --workspace` **215 passed / 0 failed** (engine lib 169 unchanged)·`cargo check --features cuda --lib` passes — the 12 warnings are **identical to HEAD** (the engine.rs signature change adds no new warnings)
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
@@ -909,7 +932,7 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - [x] ~~**C2: add P19 to docs/HISTORY.ja.md+en.md**~~ → **done** (`31790f9`; P17 doc generalization of environment-specific names `3a42252`)
 - [ ] **C3: P19 binary for the dev server (8090)**: currently at P17i. engine.rs's is_recurrent is a no-op for non-recurrent models, so safe
 - [ ] **GitHub push automation**: register a deploy key to push directly from the container
-- [x] ~~tool use (Anthropic API tools parameter support)~~ → **done (2026-10-16)**: see the §3 "tool use support" section. ~~Constrained decoding for `any`/`tool`~~ → **done (2026-10-16)**: see the §3 "tool_choice constrained decoding" section. Streaming tool_use remains future work
+- [x] ~~tool use (Anthropic API tools parameter support)~~ → **done (2026-10-16)**: see the §3 "tool use support" section. ~~Constrained decoding for `any`/`tool`~~ → **done (2026-10-16)**: see the §3 "tool_choice constrained decoding" section. ~~Streaming tool_use~~ → **done (2026-10-16)**: see the §3 "streaming tool_use support" section
 - [ ] Llama-family variants (models without GQA, RoPE scaling)
 - [ ] **Other families**: DeepSeek series (MoE + shared experts), GLM series, gpt-oss (attention sink + sliding window + MXFP4). The GGUF route (P19) widens the entry point
 - [ ] **Per-model mechanism visualization**: MoE routing, MLA latent-compressed KV, attention sink, sliding-window band patterns, thinking mode

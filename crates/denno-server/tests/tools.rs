@@ -8,7 +8,9 @@
 //! カバー項目:
 //! - tools 付きリクエストが受理され従来と同一の content blocks で応答される
 //! - tool_choice none (ツール非公開) も受理される
-//! - tools + stream=true は 400 (SSE の tool_use 対応は範囲外)
+//! - tools + stream=true は SSE で受理される (第27: streaming tool_use 対応。
+//!   ダミーモデルは tool_call を出さないため text block のみの SSE を検証。
+//!   tool block の組み立ては lib.rs / stream_asm.rs の unit テスト)
 //! - tool_choice 単独指定 / 不正な tools 定義 / 不正な tool_choice は 400
 //! - tool_result のみの 2 ターン目が受理される (履歴織り込み経路)
 //! - 未知 tool_use_id 参照の tool_result は 400
@@ -112,23 +114,56 @@ async fn tool_choice_none_is_accepted() {
     assert_eq!(body["content"][0]["text"], EXPECTED_GREEDY_TEXT);
 }
 
+/// tools + stream=true が受理され、text block のみの完全な SSE を返す。
+/// (第27: 旧来は 400 拒否だったが streaming tool_use 対応で解禁。
+///  ダミーモデルは tool_call を出さないため delta 結合 = greedy 期待値)
 #[tokio::test]
-async fn tools_with_stream_is_rejected() {
+async fn tools_with_stream_is_accepted() {
     let app = test_app();
-    let (status, body) = post(
-        &app,
-        json!({
-            "model": "denno-test",
-            "max_tokens": 20,
-            "stream": true,
-            "messages": [{"role": "user", "content": "t0"}],
-            "tools": tools_json(),
-        }),
-    )
-    .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model": "denno-test",
+                "max_tokens": 20,
+                "temperature": 0.0,
+                "stream": true,
+                "messages": [{"role": "user", "content": "t0"}],
+                "tools": tools_json(),
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    assert!(ct.starts_with("text/event-stream"), "content-type = {ct}");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
 
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
-    assert_eq!(body["error"]["type"], "invalid_request_error");
+    // 完全な SSE イベント列 (event: 行必須)
+    for ty in ["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"] {
+        assert!(text.contains(&format!("event: {ty}\n")), "missing event: {ty} in:\n{text}");
+    }
+    // tool block 無し → tool_use block は出ない
+    assert!(!text.contains("\"tool_use\""), "unexpected tool_use block in:\n{text}");
+    // delta 結合が greedy 期待値と一致
+    let mut out = String::new();
+    for line in text.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if let Ok(v) = serde_json::from_str::<Value>(data) {
+                if v["type"] == "content_block_delta" {
+                    if let Some(t) = v["delta"]["text"].as_str() {
+                        out.push_str(t);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(out, EXPECTED_GREEDY_TEXT, "delta 結合が期待値と不一致:\n{text}");
+    assert!(text.contains("\"stop_reason\":\"end_turn\""));
 }
 
 #[tokio::test]

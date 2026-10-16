@@ -513,7 +513,7 @@ Being Anthropic Messages API compatible, it works as-is with the official SDKs a
 
 ## 10. Known Limitations
 
-- Tool use is supported (tools/tool_choice, tool_use/tool_result history weaving, constrained decoding for `any`/`tool`). Streaming tool_use is not yet supported (tools+stream returns 400)
+- Tool use is supported (tools/tool_choice, tool_use/tool_result history weaving, constrained decoding for `any`/`tool`, streaming tool_use via the SSE assembler)
 - One model per process (multi-model serving is a future candidate). Concurrent decode of multiple sessions is already handled by continuous batching (P6)
 - The viewer is the JS version (WASM port, replay scrubber, and L2 tensor display remain)
 - Large-model download verification and performance are recorded in the [Development History](HISTORY.en.md)

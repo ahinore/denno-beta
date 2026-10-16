@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 
 mod scheduler;
+mod stream_asm;
 pub use scheduler::{Job, MAX_ACTIVE_SESSIONS, QueueFull, Scheduler};
 
 pub struct AppState {
@@ -727,19 +728,20 @@ async fn messages(
     };
 
     if req.stream.unwrap_or(false) {
-        // tool use は SSE 未対応 (tool_use block の content_block_start/input_json_delta
-        // が未実装)。誤用に気づくよう明示的に 400 を返す。
-        if tools_active {
-            return Err(ApiError::invalid_request(
-                "tools with stream=true is not supported (use stream=false)",
-            ));
-        }
-        // SSE 応答は即座に開始し、ジョブ実行 (キュー待ち含む) 中は
-        // keep-alive ping (2秒間隔) が流れ続ける
+        // 第27: tools + stream を許可。SSE アセンブラ (stream_asm) が delta ストリームの
+        // <tool_call> block を検出し tool_use block (content_block_start /
+        // input_json_delta / content_block_stop) として流す
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
         state
             .scheduler
-            .submit_stream(system, chat_messages, params, None, None, tx)
+            .submit_stream(
+                system,
+                chat_messages,
+                params,
+                tools_for_prompt,
+                tool_constraint,
+                tx,
+            )
             .map_err(queue_full_error(&state))?;
         let stream = ReceiverStream::new(rx);
         Ok(Sse::new(stream)

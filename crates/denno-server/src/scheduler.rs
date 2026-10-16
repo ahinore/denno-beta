@@ -35,6 +35,7 @@ use serde_json::json;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::{new_msg_id, to_event};
+use crate::stream_asm::StreamAssembler;
 
 /// ワーカーが同時に進行できるリクエスト数の上限 (= エンジンの KV キャッシュ
 /// スロット数と一致させる)。キュー (`max_queue`) とは別の上限。
@@ -78,6 +79,10 @@ struct Run {
     events: Option<tokio_mpsc::Sender<Result<Event, Infallible>>>,
     /// SSE プリアンブル (message_start 等) を送信済みか
     started: bool,
+    /// 第27: streaming tool_use の SSE アセンブラ (Stream ジョブのみ Some)。
+    /// decode ステップの間のみ取り出して delta コールバックへ渡す
+    /// (ステップ完了後に Run へ戻す。finish_run が残りイベントを出す)
+    asm: Option<StreamAssembler>,
 }
 
 /// リクエストスケジューラ。有界キュー + 単一ワーカースレッド。
@@ -197,25 +202,38 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
         }
 
         // --- decode: 全セッションを 1 ステップまとめて進める ---
-        // (SSE 送信者は先に clone しておき、セッションの可変借用と分離する)
-        let senders: Vec<Option<tokio_mpsc::Sender<Result<Event, Infallible>>>> =
-            active.iter().map(|r| r.events.clone()).collect();
-        let mut boxed_cbs: Vec<Box<dyn FnMut(&str)>> = senders
-            .into_iter()
-            .map(|s| -> Box<dyn FnMut(&str)> {
-                match s {
-                    Some(events) => Box::new(move |delta: &str| {
-                        let _ = events.blocking_send(Ok(to_event(&json!({
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {"type": "text_delta", "text": delta},
-                        }))));
-                    }),
-                    None => Box::new(|_: &str| {}),
-                }
-            })
-            .collect();
+        // (SSE 送信者は先に clone しておき、セッションの可変借用と分離する。
+        //  アセンブラも Run から取り出して delta コールバックへ渡す —
+        //  コールバックは Box<dyn FnMut> なので &mut StreamAssembler を直接捕まえる
+        //  ためには engine 側の Box<dyn FnMut + '_> 寿命拡張が必要。第27)
+        let mut asms: Vec<Option<StreamAssembler>> =
+            active.iter_mut().map(|r| r.asm.take()).collect();
+        // コールバック (asms への &mut 借用を保持する) はこの block 内で drop させる
+        // — ステップ完了後に asms を Run へ move し戻す必要があるため、借用と
+        // move の区間を重ねない (E0505 対策)
         let step = {
+            let mut boxed_cbs: Vec<Box<dyn FnMut(&str) + '_>> = asms
+                .iter_mut()
+                .zip(active.iter())
+                .map(|(asm, run)| -> Box<dyn FnMut(&str) + '_> {
+                    let events = run.events.clone();
+                    match asm {
+                        Some(asm) => Box::new(move |delta: &str| {
+                            // 第27: block 境界検出付きの SSE 組み立て (tool_use block も流す)
+                            asm.push_delta(delta);
+                            for ev in asm.take_events() {
+                                if let Some(events) = &events {
+                                    let _ = events.blocking_send(Ok(to_event(&ev)));
+                                }
+                            }
+                        }),
+                        None => Box::new(move |_: &str| {
+                            // 非ストリーム (Job::Chat) は送信先が無い → no-op
+                            let _ = &events;
+                        }),
+                    }
+                })
+                .collect();
             let mut g = engine.lock().unwrap();
             let mut sess_refs: Vec<&mut ChatSession> =
                 active.iter_mut().map(|r| r.sess.as_mut().unwrap()).collect();
@@ -223,6 +241,10 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
         };
         match step {
             Ok(done) => {
+                // アセンブラを Run へ戻す (done 判定の添字は active の並びと一致)
+                for (run, asm) in active.iter_mut().zip(asms) {
+                    run.asm = asm;
+                }
                 // 完了したセッションを外して後処理 (後ろから外すことで添字を維持)
                 let mut i = done.len();
                 while i > 0 {
@@ -286,7 +308,12 @@ fn build_run(engine: &Arc<Mutex<Engine>>, job: Job) -> Run {
             Err(e) => (None, Some(e)),
         }
     };
-    Run { sess, error, respond, events, started: false }
+    // Stream ジョブは SSE アセンブラを持つ (index 0 の text block は admit が開ける)
+    let asm = match respond {
+        Some(_) => None,
+        None => Some(StreamAssembler::new(0)),
+    };
+    Run { sess, error, respond, events, started: false, asm }
 }
 
 /// セッションを live にする (install) + 初回なら SSE プリアンブルを送る。
@@ -339,7 +366,7 @@ fn admit(engine: &Arc<Mutex<Engine>>, run: &mut Run) -> Result<()> {
 
 /// 完了したセッションの後処理 (respond or SSE 後半イベント)。
 fn finish_run(run: Run) {
-    let Run { sess, respond, events, .. } = run;
+    let Run { sess, respond, events, mut asm, .. } = run;
     let Some(sess) = sess else { return };
     let out = sess.into_output();
     if let Some(respond) = respond {
@@ -350,14 +377,23 @@ fn finish_run(run: Run) {
         let send = |v: serde_json::Value| -> bool {
             events.blocking_send(Ok(to_event(&v))).is_ok()
         };
-        // 4. content_block_stop
-        if !send(json!({"type": "content_block_stop", "index": 0})) {
-            return;
+        // 4. content_block_stop (アセンブラが残りテキストのフラッシュ + open block の
+        //    close を行う。tool block を出した場合 stop_reason は "tool_use")
+        let tool_use = asm.as_ref().map_or(false, |a| a.blocks_emitted() > 0);
+        if let Some(asm) = asm.as_mut() {
+            asm.finish();
+            for ev in asm.take_events() {
+                if !send(ev) {
+                    return;
+                }
+            }
         }
-        // 5. message_delta
+        // 5. message_delta (tool_use block を出した場合は "tool_use" —
+        //    非ストリーミング message_json と同一規則)
+        let stop_reason = if tool_use { "tool_use" } else { out.stop_reason.as_str() };
         let _ = send(json!({
             "type": "message_delta",
-            "delta": {"stop_reason": out.stop_reason.as_str(), "stop_sequence": out.stop_sequence},
+            "delta": {"stop_reason": stop_reason, "stop_sequence": out.stop_sequence},
             "usage": {"output_tokens": out.output_tokens}
         }));
         // 6. message_stop

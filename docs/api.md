@@ -109,6 +109,13 @@ message_start → content_block_start → ping
 → content_block_stop → message_delta (stop_reason, usage) → message_stop
 ```
 
+tools + stream の場合、生成中の `<tool_call>` block は block 単位で確定した時点で tool_use block
+として挿入される (content_block_start (type: tool_use, id/name/input) → content_block_delta
+(input_json_delta) → content_block_stop を即時完結)。block 境界が delta で分割されても検出され、
+パース失敗 / 未完結 block はテキストとして流れる (非ストリーミング抽出 `extract_tool_calls` と
+同一規約・delta 結合も同一)。tool_use block を 1 つでも出した場合 message_delta の stop_reason は
+`"tool_use"` (非ストリーミングと同一規則)
+
 ## エラー形式
 
 ```json

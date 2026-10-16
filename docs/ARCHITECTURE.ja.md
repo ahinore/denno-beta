@@ -512,7 +512,7 @@ Anthropic Messages API互換なので、公式SDKやAnthropic互換クライア�
 
 ## 10. 既知の制約
 
-- tool use (tools/tool_choice・tool_use/tool_result 履歴織り込み・`any`/`tool` の拘束デコード) 対応済み。streaming の tool_use は未対応 (tools+stream は 400)
+- tool use (tools/tool_choice・tool_use/tool_result 履歴織り込み・`any`/`tool` の拘束デコード・streaming tool_use の SSE アセンブラ) 対応済み
 - 1プロセス1モデル(マルチモデル同時serveは今後の候補)。複数セッションの同時decodeは連続バッチング(P6)で対応済み
 - ビューアはJS版(WASM移植・リプレイスクラバー・L2テンソル表示は残課題)
 - 大型モデルのDL検証・性能は [開発履歴](HISTORY.ja.md) に記録
