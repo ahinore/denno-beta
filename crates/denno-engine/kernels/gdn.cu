@@ -34,9 +34,11 @@ extern "C" __global__ void dno_gdn_scan(
     float eps, float q_scale)
 {
     const int h = blockIdx.x;       // v-head
-    // q/k は repeat_interleave 規約 (HF / llama.cpp ggml_repeat = blocked タイリング):
-    // v-head h → k-head h/(nv/nk)。0.8B は nk==nv で同一・9B は nk=16/nv=32。
-    const int kh = h * nk / nv;
+    // q/k はタイル repeat 規約 (GGUF / llama.cpp ggml_repeat / fused カーネル
+    // `iv1 % neq1` = strided): v-head h → k/q head h % nk。0.8B は nk==nv で同一・
+    // 9B は nk=16/nv=32・27B は nk=16/nv=48。HF transformers の repeat_interleave
+    // (blocked) とは異なる規約 (第15/16セッション lchk サブステージ比較で確定)。
+    const int kh = h % nk;
     const int kd_total = nk * dk;   // q/k チャネル総数
     const int vd = nv * dv;
     const int c = threadIdx.x;      // 0..dk (== dv)
@@ -219,7 +221,7 @@ extern "C" __global__ void dno_gdn_chunk_pre(
 {
     const int ci = blockIdx.x; // chunk
     const int h = blockIdx.y;  // v-head
-    const int kh = h * nk / nv;
+    const int kh = h % nk;     // タイル repeat 規約 (gdn.rs と同一・llama.cpp 相当)
     const int kd_total = nk * dk;
     const int c = threadIdx.x; // 0..dk (== dv)
     const int t0 = ci * chunk_len;
@@ -382,7 +384,7 @@ extern "C" __global__ void dno_gdn_chunk_scan(
 {
     const int ci = blockIdx.x; // chunk
     const int h = blockIdx.y;  // v-head
-    const int kh = h * nk / nv;
+    const int kh = h % nk;     // タイル repeat 規約 (gdn.rs と同一・llama.cpp 相当)
     const int kd_total = nk * dk;
     const int vd = nv * dv;
     const int c = threadIdx.x; // 0..dk (== dv)
