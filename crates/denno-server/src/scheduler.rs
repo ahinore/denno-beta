@@ -23,6 +23,12 @@
 //!   タイムアウトは無し**。タイムアウト制御はクライアント側の責務)。
 //!   SSE リクエストは応答ストリームを即座に開始するため、待ち行列中も
 //!   keep-alive ping (2秒間隔) が流れ続けて接続が切れない。
+//! - s38: クライアント切断の検知。SSE ストリームではクライアントが接続を切ると
+//!   hyper が書き込み失敗 (broken pipe / connection reset) を検知して応答ボディを
+//!   drop し、events チャネルが閉鎖する。ワーカーはステップ境界ごとに閉鎖を確認し、
+//!   該当 Run の生成を打ち切る (KV スロット解放 + ログ 1 行。他 Run への影響無し・
+//!   数値経路には触れない)。非ストリーム (Job::Chat) はレスポンス送信まで接続状態を
+//!   観測する手段が無いため対象外。
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -83,6 +89,17 @@ struct Run {
     /// decode ステップの間のみ取り出して delta コールバックへ渡す
     /// (ステップ完了後に Run へ戻す。finish_run が残りイベントを出す)
     asm: Option<StreamAssembler>,
+}
+
+impl Run {
+    /// s38: クライアント切断検知。SSE 応答ボディ (ReceiverStream) が drop されると
+    /// events チャネルの Receiver が全て消えて `Sender::is_closed()` が true になる。
+    /// hyper はクライアント切断 (broken pipe / connection reset) を書き込み時に検知し
+    /// ボディを drop するため、この判定は切断の間接観測になる。
+    /// Job::Chat (非ストリーム) は検知経路が存在しない (None → 常に false)。
+    fn client_gone(&self) -> bool {
+        self.events.as_ref().map_or(false, |e| e.is_closed())
+    }
 }
 
 /// リクエストスケジューラ。有界キュー + 単一ワーカースレッド。
@@ -166,31 +183,13 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
         // Disconnected && active.is_empty() と同一)。
         if active.is_empty() {
             match rx.recv() {
-                Ok(job) => {
-                    in_flight.fetch_add(1, Ordering::SeqCst);
-                    let mut run = build_run(&engine, job);
-                    if let Err(e) = admit(&engine, &mut run) {
-                        in_flight.fetch_sub(1, Ordering::SeqCst);
-                        send_error(&mut run, e);
-                    } else {
-                        active.push(run);
-                    }
-                }
+                Ok(job) => admit_job(&engine, job, &in_flight, &mut active),
                 Err(_) => return,
             }
         }
         while active.len() < MAX_ACTIVE_SESSIONS {
             match rx.try_recv() {
-                Ok(job) => {
-                    in_flight.fetch_add(1, Ordering::SeqCst);
-                    let mut run = build_run(&engine, job);
-                    if let Err(e) = admit(&engine, &mut run) {
-                        in_flight.fetch_sub(1, Ordering::SeqCst);
-                        send_error(&mut run, e);
-                    } else {
-                        active.push(run);
-                    }
-                }
+                Ok(job) => admit_job(&engine, job, &in_flight, &mut active),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if active.is_empty() {
@@ -199,6 +198,23 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
                     break;
                 }
             }
+        }
+
+        // --- s38: 切断スイープ (decode / prefill の各ステップ境界で評価) ---
+        // 前ステップ以降にクライアントが切断した Run (SSE 応答ボディの drop →
+        // events チャネル閉鎖) を打ち切る。待ち行列 pull 直後〜prefill 前の切断も
+        // ここで拾うため、切断済みクライアントの分の無駄な prefill を実行しない。
+        let mut i = active.len();
+        while i > 0 {
+            i -= 1;
+            if active[i].client_gone() {
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let run = active.remove(i);
+                abort_disconnected(&engine, run);
+            }
+        }
+        if active.is_empty() {
+            continue;
         }
 
         // --- prefill (優先): 未 prefill のセッションを 1 つ進める ---
@@ -268,7 +284,7 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
                 for (run, asm) in active.iter_mut().zip(asms) {
                     run.asm = asm;
                 }
-                // 完了したセッションを外して後処理 (後ろから外すことで添字を維持)
+                // 完了/切断したセッションを外して後処理 (後ろから外すことで添字を維持)
                 let mut i = done.len();
                 while i > 0 {
                     i -= 1;
@@ -280,6 +296,14 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
                             g.release_session(run.sess.as_mut().unwrap());
                         }
                         finish_run(run);
+                    } else if active[i].client_gone() {
+                        // s38: decode ステップ中にクライアントが切断
+                        // (書き込み失敗 → 応答ボディ drop → チャネル閉鎖)。
+                        // 生成を打ち切って KV スロットを解放する (通常完了と同一の
+                        // 除去経路なので他 Run / engine 状態への影響は無い)
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        let run = active.remove(i);
+                        abort_disconnected(&engine, run);
                     }
                 }
                 // P17k: 最後のセッションが完了した時点で 1 回だけ出力する。
@@ -337,6 +361,41 @@ fn build_run(engine: &Arc<Mutex<Engine>>, job: Job) -> Run {
         None => Some(StreamAssembler::new(0)),
     };
     Run { sess, error, respond, events, started: false, asm }
+}
+
+/// 新規ジョブの admit (pull 経路 2 箇所の共通化)。成功なら active へ push する。
+/// admit 失敗時は send_error で応答するが、s38: 切断由来 (events チャネル閉鎖 —
+/// SSE プリアンブル送信が broken pipe で失敗する等) の場合はエラーではなく
+/// 打ち切りとして扱う (クライアントは既に居ないため送信先が存在しない)。
+fn admit_job(
+    engine: &Arc<Mutex<Engine>>,
+    job: Job,
+    in_flight: &AtomicUsize,
+    active: &mut Vec<Run>,
+) {
+    in_flight.fetch_add(1, Ordering::SeqCst);
+    let mut run = build_run(engine, job);
+    if let Err(e) = admit(engine, &mut run) {
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+        if run.client_gone() {
+            abort_disconnected(engine, run);
+        } else {
+            send_error(&mut run, e);
+        }
+    } else {
+        active.push(run);
+    }
+}
+
+/// s38: クライアント切断による Run 打ち切り。KV スロットを解放し 1 行だけ記録する。
+/// 送信は行わない (送信先チャネルは既に閉じている)。engine 側は通常完了と同一の
+/// `release_session` のみで、KV/Scratch 状態は次のセッションからそのまま使える。
+/// install 前 (admit 失敗・未実施) の場合も `release_session` は slot 無しで no-op。
+fn abort_disconnected(engine: &Arc<Mutex<Engine>>, mut run: Run) {
+    if let Some(sess) = run.sess.as_mut() {
+        engine.lock().unwrap().release_session(sess);
+    }
+    tracing::info!("client disconnected; generation aborted");
 }
 
 /// セッションを live にする (install) + 初回なら SSE プリアンブルを送る。
