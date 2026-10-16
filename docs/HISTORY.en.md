@@ -956,6 +956,30 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 
 `cargo test --workspace` **220 passed / 0 failed** (was 216 + 4)·`cargo check --features cuda --lib` passes (all 12 warnings identical to HEAD, no new warnings)
 
+### Default max_tokens cap for chat (applied only when unspecified) ✅ (2026-10-16)
+
+> Confirmed operator task (session 39). Mitigation for the hardware box where a thinking model kept generating for a very long time and, with the single-worker design, left every subsequent request queued. A default cap is applied **only when** the chat completions API's `max_tokens` / `max_completion_tokens` is unspecified; explicit values are respected (the numeric path and sampling computation are untouched — this is only a default for a config value). Unspecified requests used to fail with 400 (missing required field), so this change makes the server accept them with a default cap of 4096, guaranteeing a bound on worker occupancy per request. The session-38 disconnect detection only helps when the client drops the connection (non-streaming is out of scope); this change complements it by bounding requests before generation starts.
+
+**Implementation (server/src/lib.rs)**:
+
+- New constant `DEFAULT_MAX_TOKENS = 4096` + `resolve_max_tokens(max_tokens, max_completion_tokens)` (pure function): prefers `max_tokens`, falls back to the OpenAI chat completions alias `max_completion_tokens`, and to 4096 when neither is given. Explicit values (including 0) are respected as-is
+- `MessagesRequest.max_tokens` changed from required (`usize`) to optional (`Option<usize>`) + new `max_completion_tokens`. The Anthropic API spec requires max_tokens, but since this server is a learning tool, unspecified requests are accepted with the default cap instead of a 400
+- Applied in one place only — the `GenParams` construction in the `messages` handler → affects both the non-streaming (Job::Chat) and streaming (Job::Stream) paths identically
+- Rationale for 4096: same value as the engine's `SESSION_RESERVE_TOKENS` (the per-session KV reservation guideline from P17e), keeping it consistent with the KV budget design assumption. Handling explicitly-huge values (e.g. Hermes' `max_tokens: 65535`) remains, as before, the engine's context clamp — untouched by this change
+
+**Scope decision**: the server's only chat endpoint is `/v1/messages` (the rest are `/v1/models`, `/health`, `/v1/telemetry/ws`), and Job::Chat / Job::Stream correspond to its two paths, so there was nothing else to align. `max_completion_tokens` is accepted purely as an alias so OpenAI-style clients get identical treatment (existing Anthropic clients never send it → zero impact; when both are given, `max_tokens` wins). The CLI (`denno generate` / `denno serve`) is the local generation path and out of scope — `serve`'s `--max-tokens` flag has always been ignored and was left untouched
+
+**finish_reason**: when truncated at the cap, the existing path emits the Anthropic-style `stop_reason = "max_tokens"` (equivalent to OpenAI's `finish_reason = "length"`) — verified for both the non-streaming response JSON and the SSE `message_delta` (`delta.stop_reason` + `usage.output_tokens`)
+
+**Tests**: new `server/tests/max_tokens_default.rs`, 7 cases (a local EndlessModel that never emits EOS — generation always runs to max_tokens, so the effective cap is directly observable via `usage.output_tokens`):
+
+- `resolve_max_tokens` unit: unspecified → 4096 · explicit (5 / 0 / 100000) → respected · alias only → adopted · both → `max_tokens` wins
+- Unspecified (non-streaming) → 200 · output_tokens = 4096 · stop_reason = "max_tokens" (**the pre-fix code returned 400 for the missing required field**)
+- Unspecified (stream=true) → the same truncation in the SSE message_delta (stop_reason + usage.output_tokens)
+- Explicit 5 → output_tokens = 5 (not raised to 4096) · alias-only 7 → 7 · both → `max_tokens` wins · explicit 0 → 0 (empty output)
+
+`cargo test --workspace` **227 passed / 0 failed** (was 220 + 7)·`cargo check --features cuda --lib` passes (all 12 warnings identical to HEAD, no new warnings)
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
@@ -985,6 +1009,7 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - [ ] **GitHub push automation**: register a deploy key to push directly from the container
 - [x] ~~tool use (Anthropic API tools parameter support)~~ → **done (2026-10-16)**: see the §3 "tool use support" section. ~~Constrained decoding for `any`/`tool`~~ → **done (2026-10-16)**: see the §3 "tool_choice constrained decoding" section. ~~Streaming tool_use~~ → **done (2026-10-16)**: see the §3 "streaming tool_use support" section
 - [x] **Client-disconnect detection (abort streaming generation)** → **done (2026-10-16)**: see the §3 "Client-disconnect detection and generation abort" section. Non-streaming requests are out of scope (no detection path exists)
+- [x] **Default max_tokens cap for chat (only when unspecified · explicit values respected)** → **done (2026-10-16)**: see the §3 "Default max_tokens cap for chat" section. Default 4096 (same as the engine's SESSION_RESERVE_TOKENS) · numeric path unchanged
 - [ ] Llama-family variants (models without GQA, RoPE scaling)
 - [ ] **Other families**: DeepSeek series (MoE + shared experts), GLM series, gpt-oss (attention sink + sliding window + MXFP4). The GGUF route (P19) widens the entry point
 - [ ] **Per-model mechanism visualization**: MoE routing, MLA latent-compressed KV, attention sink, sliding-window band patterns, thinking mode
