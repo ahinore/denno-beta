@@ -1004,6 +1004,35 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 
 `cargo test --workspace` **229 passed / 0 failed** (was 227 + 2)·`cargo check --features cuda --lib` passes (all 12 warnings identical to HEAD, no new warnings). **Human follow-up: re-run the 1b→2b sequence on the real machine to confirm the split is gone**
 
+### Plan B: rayon parallelization of the CPU prefill (bit-exactness contract kept) ✅ (2026-10-16)
+
+> Session 42. Implements Plan B, the option recommended by the option study in REPORT_NEXT16 (comparison of Plans A/B/C). Countermeasure for the 8095 issue where a large system+tools prompt (n≈2000-2500) makes prefill take ~40 s with the GPU near 0% and a single CPU core at 100%: the CPU part of prefill — the O(n²) token-sequential full attention and the sequential `matmul_bt_i8` GEMM — is replaced with a parallelization that "never changes the accumulation order per output element". The determinism/exactness contract is untouched (the prefill-batch == token-sequential bit-exactness contract is kept structurally; all CPU reference md5s remain valid by design) and `.cu` / PTX are unchanged (no PTX regeneration needed; only rebuilding the cuda binary for 8095 deployment is a human follow-up).
+
+**Implementation (tensor.rs)**:
+
+- `matmul_bt_i8` (the Q8 GEMM used by prefill projections — the old implementation only claimed parallelization in its comment while actually running a sequential `chunks_exact`; see REPORT_NEXT16 §0 side-finding 1) is now rayon-parallelized. (1) the dynamic per-row quantization (row-independent) runs row-parallel via `par_chunks_exact_mut`; (2) the GEMM core is parallelized over j blocks of 32 channels (avoiding false sharing) with output writes via `SendPtr` (the same pattern as P6 `matvec_rows_bt_i8`); the remainder block stays sequential. The per-output-element op sequence (quantize → i32 dot → f32 convert × asc × scale) is identical to before, so results are bit-identical and thread-count independent
+
+**Implementation (model/qwen35.rs)**:
+
+- `full_attn_core` (the decode n==1 path) is split into `full_attn_prepare` (KV write + QK-Norm + partial interleaved RoPE — shared with decode, run sequentially in token order) and `full_attn_attend_head` (per-head scores → softmax → probs@V → sigmoid output gate; read-only). Decode calls the same function sequence sequentially — unchanged
+- The prefill batch path (the Full branch of `forward_prefill`) runs prepare for all tokens sequentially in token order, then runs attend in parallel over (i, head) via `att.par_chunks_exact_mut(dh)` with rayon — attend is read-only and independent per (i, head), and scores are task-local scratch (the same pattern as llama.rs SCORES_SCRATCH). The O(n²) token-sequential full attention was the dominant bottleneck of long prefills (REPORT_NEXT16 §1.2)
+- Row-independent stages (rmsnorm ×2, residual adds ×3, SwiGLU) are also row-parallelized (`par_chunks_exact_mut`)
+
+**Determinism**: only i/j-direction parallelism — the accumulation order per output element is unchanged, the same guarantee class as the existing P6/P9 (`matvec_rows_bt` family). The CPU reference md5s (`feea9444` / `da0b1f57`) and all existing anchors are unchanged (re-confirmed on the 9B real-model E2E at both 16T and 1T). The GPU path is untouched, so this is fully independent of the post-epoch-fix 2b split confirmation on the real machine
+
+**Tests** (2 new):
+
+- `tensor.rs::matmul_bt_i8_parallel_bit_exact_and_thread_count_independent`: every output row matches `matvec_bt_i8` (the decode single-row reference) exactly at `to_bits` level; identical results with a local pool of 1/4 threads (n=300 covers both a multiple of JB=32 and a remainder block)
+- `qwen35.rs::qwen38_27b_shape_prefill_thread_count_bit_exact`: on the synthetic 27B shape, prefill (n=24) + one follow-up decode match bit-for-bit across a local pool of 1/2/7/16 threads (1 thread ≡ sequential). Together with the existing `qwen38_27b_shape_prefill_batch_bit_exact` (parallel prefill == token-sequential), "parallelized output still matches sequential bit-for-bit" is pinned from both sides
+
+**Measurements** (9B real-model E2E on the dev container's CPU build (8C/16T), int8, seed 42, long prompt n=2480 / max_tokens 4):
+
+- 1b / 2b anchor md5s unchanged at both 16T and 1T: `feea9444` / `da0b1f57`
+- Long-prompt E2E wall (prefill + 4-token decode): 16 threads **111.6 s**, 1 thread **568.4 s** (5.09x the 16T time — identical output md5 `f9b7f6be`)
+- Per-stage prototype measurements from REPORT_NEXT16 §2 (outside the repo, same container CPU): attention layer 9.2-10.3x, `matmul_bt_i8`-equivalent 8.2-8.9x, SwiGLU 5.6x — bit-identical to the sequential version in all configurations (1T/8T/16T)
+
+`cargo test --workspace` **231 passed / 0 failed** (was 229 + 2)·`cargo check --features cuda --lib` passes (all 12 warnings identical to HEAD, no new warnings). Rebuilding the cuda binary for 8095 deployment is a human follow-up (no PTX regeneration needed)
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)

@@ -536,8 +536,12 @@ impl Qwen35 {
 
     /// full attention コア: 投影済み qg [heads*2*dh] / k, v [kv_dim] の 1 行から
     /// QK-Norm → partial RoPE → KV 書き込み → GQA attention → sigmoid 出力ゲート
-    /// まで (prefill バッチ経路と共用・演算順序はトークン逐次経路と同一のため
-    /// bit-exact)。
+    /// まで (decode n==1 経路)。内部は full_attn_prepare (KV 書き込み + QK-Norm +
+    /// RoPE) と full_attn_attend_head (1 head 分の attend) に分割してあり、prefill
+    /// バッチ経路 (forward_prefill) は同一の関数列を prepare 逐次 → attend を
+    /// (i, head) 並列で実行する — トークン 1 行 / 1 head 分の演算列はこの逐次実行
+    /// と同一のため bit-exact (テスト: qwen38_27b_shape_prefill_batch_bit_exact +
+    /// qwen38_27b_shape_prefill_thread_count_bit_exact)。
     #[allow(clippy::too_many_arguments)]
     fn full_attn_core(
         &self,
@@ -549,21 +553,56 @@ impl Qwen35 {
         li: usize,
         pos: usize,
     ) -> Vec<f32> {
+        let heads = self.heads;
+        let dh = self.dh;
+        let mut q = vec![0.0f32; heads * dh];
+        self.full_attn_prepare(lf, qg, k_row, v_row, cache, li, pos, &mut q);
+        let (kcr, vcr) = cache.kv_bufs_ref(li);
+        let mut att = vec![0.0f32; heads * dh];
+        for hh in 0..heads {
+            self.full_attn_attend_head(
+                qg,
+                &q,
+                kcr,
+                vcr,
+                pos + 1,
+                hh,
+                &mut att[hh * dh..(hh + 1) * dh],
+            );
+        }
+        att
+    }
+
+    /// full attention の prepare: QK-Norm (head 単位・RoPE 前) + partial interleaved
+    /// RoPE + K/V をキャッシュの pos 行へ書き込み。norm+rope 済の q [heads*dh] を
+    /// qout に出力する。decode (full_attn_core) と prefill バッチ (forward_prefill)
+    /// で共用 — トークン 1 行分の演算列はトークン逐次経路と同一のため bit-exact。
+    /// prefill では全トークンの prepare をトークン順に逐次実行してから attend に
+    /// 入る (attend は読み取り専用のため全行書き込み後でも結果は同一)。
+    #[allow(clippy::too_many_arguments)]
+    fn full_attn_prepare(
+        &self,
+        lf: &FullLayer,
+        qg: &[f32],
+        k_row: &[f32],
+        v_row: &[f32],
+        cache: &mut KvCache,
+        li: usize,
+        pos: usize,
+        qout: &mut [f32],
+    ) {
         let dh = self.dh;
         let heads = self.heads;
         let kv_heads = self.kv_heads;
         let kv_dim = kv_heads * dh;
-        let group = heads / kv_heads;
 
         let mut k = k_row.to_vec();
-        let v = v_row;
 
         // QK-Norm (head 単位・RoPE 前) + q の分離
-        let mut q = vec![0.0f32; heads * dh];
         for hh in 0..heads {
             let src = &qg[hh * 2 * dh..hh * 2 * dh + dh];
             let wq = rmsnorm(src, &lf.q_norm_w, dh, self.eps);
-            q[hh * dh..(hh + 1) * dh].copy_from_slice(&wq);
+            qout[hh * dh..(hh + 1) * dh].copy_from_slice(&wq);
         }
         for kvh in 0..kv_heads {
             let seg = &mut k[kvh * dh..(kvh + 1) * dh];
@@ -572,51 +611,63 @@ impl Qwen35 {
         }
 
         // partial interleaved RoPE
-        rope_partial_interleaved(&mut q, heads, dh, self.n_rot, pos, self.theta);
+        rope_partial_interleaved(qout, heads, dh, self.n_rot, pos, self.theta);
         rope_partial_interleaved(&mut k, kv_heads, dh, self.n_rot, pos, self.theta);
 
         // K/V をキャッシュへ
         let (kc, vc) = cache.kv_bufs(li, 1);
         kc[pos * kv_dim..][..kv_dim].copy_from_slice(&k);
-        vc[pos * kv_dim..][..kv_dim].copy_from_slice(&v);
+        vc[pos * kv_dim..][..kv_dim].copy_from_slice(v_row);
+    }
 
-        // attention (1 query トークン・GQA)
-        let (kcr, vcr) = cache.kv_bufs_ref(li);
-        let t_total = pos + 1;
+    /// full attention の 1 head 分: scores (QK ドット・k 昇順の逐次累積) → softmax
+    /// → probs@V (d 昇順の逐次累積) → sigmoid 出力ゲート。読み取り専用 (kcr/vcr は
+    /// キャッシュ KV 行・q は prepare 済・qg はゲート部参照) で結果を att_head [dh]
+    /// に書く。出力要素ごとの累積順はトークン逐次経路と同一のため bit-exact・
+    /// (i, head) ごとに独立 → prefill バッチ経路はこの関数を rayon で並列呼び出し
+    /// する (スレッド数非依存・scores はタスクローカルスクラッチ = llama.rs の
+    /// SCORES_SCRATCH と同一パターン)。
+    #[allow(clippy::too_many_arguments)]
+    fn full_attn_attend_head(
+        &self,
+        qg: &[f32],
+        q: &[f32],
+        kcr: &[f32],
+        vcr: &[f32],
+        t_total: usize,
+        hh: usize,
+        att_head: &mut [f32],
+    ) {
+        let dh = self.dh;
+        let kv_heads = self.kv_heads;
+        let kv_dim = kv_heads * dh;
+        let group = self.heads / kv_heads;
+        let kvh = hh / group;
+        let qh = &q[hh * dh..(hh + 1) * dh];
         let scale = 1.0 / (dh as f32).sqrt();
-        let mut att = vec![0.0f32; heads * dh];
-        for hh in 0..heads {
-            let kvh = hh / group;
-            let qh = &q[hh * dh..(hh + 1) * dh];
-            let mut scores = vec![0.0f32; t_total];
-            for j in 0..t_total {
-                let kj = &kcr[j * kv_dim + kvh * dh..][..dh];
-                let mut acc = 0.0f32;
-                for (a, b) in qh.iter().zip(kj.iter()) {
-                    acc += a * b;
-                }
-                scores[j] = acc * scale;
+        let mut scores = vec![0.0f32; t_total];
+        for j in 0..t_total {
+            let kj = &kcr[j * kv_dim + kvh * dh..][..dh];
+            let mut acc = 0.0f32;
+            for (a, b) in qh.iter().zip(kj.iter()) {
+                acc += a * b;
             }
-            softmax(&mut scores);
-            let avh = &mut att[hh * dh..(hh + 1) * dh];
-            for j in 0..t_total {
-                let vj = &vcr[j * kv_dim + kvh * dh..][..dh];
-                let pv = scores[j];
-                for (a, b) in avh.iter_mut().zip(vj.iter()) {
-                    *a += pv * b;
-                }
+            scores[j] = acc * scale;
+        }
+        softmax(&mut scores);
+        for j in 0..t_total {
+            let vj = &vcr[j * kv_dim + kvh * dh..][..dh];
+            let pv = scores[j];
+            for (a, b) in att_head.iter_mut().zip(vj.iter()) {
+                *a += pv * b;
             }
         }
 
         // sigmoid 出力ゲート (head ごと [dh]) — gate は q 投影出力の後半
-        for hh in 0..heads {
-            let gate = &qg[hh * 2 * dh + dh..(hh + 1) * 2 * dh];
-            for (d, av) in att[hh * dh..(hh + 1) * dh].iter_mut().enumerate() {
-                *av /= 1.0 + (-gate[d]).exp(); // sigmoid(gate)
-            }
+        let gate = &qg[hh * 2 * dh + dh..(hh + 1) * 2 * dh];
+        for (d, av) in att_head.iter_mut().enumerate() {
+            *av /= 1.0 + (-gate[d]).exp(); // sigmoid(gate)
         }
-
-        att
     }
 
     /// GDN 層の 1 トークン forward → attn 出力 [e]。
@@ -886,12 +937,15 @@ impl Qwen35 {
         let ff = self.ff;
 
         for (li, layer) in self.layers.iter().enumerate() {
-            // --- attention: rmsnorm を行単位で一括計算 ---
+            // --- attention: rmsnorm を行単位で一括計算 (s42: 行独立 → 行並列。
+            // 各要素の演算列は不変のため bit-exact・スレッド数非依存) ---
             let mut h = vec![0.0f32; n * e];
-            for i in 0..n {
-                let r = rmsnorm(&x[i * e..(i + 1) * e], layer.attn_ln1(), e, self.eps);
-                h[i * e..(i + 1) * e].copy_from_slice(&r);
-            }
+            h.par_chunks_exact_mut(e)
+                .zip(x.par_chunks_exact(e))
+                .for_each(|(h_row, x_row)| {
+                    let r = rmsnorm(x_row, layer.attn_ln1(), e, self.eps);
+                    h_row.copy_from_slice(&r);
+                });
             match &layer.attn {
                 AttnKind::Gdn(g) => {
                     // 投影はバッチ一括 (m=n → GPU tiled GEMM)
@@ -948,22 +1002,27 @@ impl Qwen35 {
                             crate::gdn::gdn_dbg_pub("attnout", &out[i * e..(i + 1) * e]);
                         }
                     }
-                    for i in 0..n {
-                        for (xi, ai) in x[i * e..(i + 1) * e]
-                            .iter_mut()
-                            .zip(&out[i * e..(i + 1) * e])
-                        {
-                            *xi += ai;
-                        }
-                    }
+                    // s42: 残差加算は行独立 → 行並列 (bit-exact)
+                    x.par_chunks_exact_mut(e)
+                        .zip(out.par_chunks_exact(e))
+                        .for_each(|(x_row, out_row)| {
+                            for (xi, ai) in x_row.iter_mut().zip(out_row.iter()) {
+                                *xi += ai;
+                            }
+                        });
                 }
                 AttnKind::Full(fl) => {
                     let qg = fl.q_w.apply_bt_rows(&h, n); // [n, heads*2*dh]
                     let k = fl.k_w.apply_bt_rows(&h, n); // [n, kv_dim]
                     let v = fl.v_w.apply_bt_rows(&h, n); // [n, kv_dim]
                     let mut att = vec![0.0f32; n * heads * dh];
+                    // s42 (Plan B): prepare (KV 書き込み + QK-Norm + RoPE) をトークン順
+                    // に逐次実行 (トークン逐次経路と同一の演算列・decode 経路の
+                    // full_attn_core と共用)。attend は読み取り専用のため全トークンの
+                    // prepare 完了後に並列実行しても結果は同一 (bit-exact)。
+                    let mut q = vec![0.0f32; n * heads * dh];
                     for i in 0..n {
-                        let a = self.full_attn_core(
+                        self.full_attn_prepare(
                             fl,
                             &qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
                             &k[i * kv_dim..(i + 1) * kv_dim],
@@ -971,46 +1030,77 @@ impl Qwen35 {
                             cache,
                             li,
                             pos0 + i,
+                            &mut q[i * heads * dh..(i + 1) * heads * dh],
                         );
-                        att[i * heads * dh..(i + 1) * heads * dh].copy_from_slice(&a);
                     }
+                    // s42: attend を (i, head) 並列で実行 (旧実装はトークン逐次 —
+                    // O(n²) の単スレッド部分が長 prefill の律速)。1 head 分の
+                    // scores → softmax → probs@V → gate はトークン逐次経路と同一の
+                    // 演算列のため bit-exact・rayon スレッド数非依存 (決定論検証:
+                    // qwen38_27b_shape_prefill_thread_count_bit_exact)。scores は
+                    // タスクローカル (共有スクラッチなし・書き込み先は各タスク専属の
+                    // att チャンクのみ)。
+                    let (kcr, vcr) = cache.kv_bufs_ref(li);
+                    att.par_chunks_exact_mut(dh)
+                        .enumerate()
+                        .for_each(|(t, att_head)| {
+                            let i = t / heads;
+                            let hh = t % heads;
+                            self.full_attn_attend_head(
+                                &qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
+                                &q[i * heads * dh..(i + 1) * heads * dh],
+                                kcr,
+                                vcr,
+                                pos0 + i + 1,
+                                hh,
+                                att_head,
+                            );
+                        });
                     let out = fl.o_w.apply_bt_rows(&att, n);
-                    for i in 0..n {
-                        for (xi, ai) in x[i * e..(i + 1) * e]
-                            .iter_mut()
-                            .zip(&out[i * e..(i + 1) * e])
-                        {
-                            *xi += ai;
-                        }
-                    }
+                    // s42: 残差加算は行独立 → 行並列 (bit-exact)
+                    x.par_chunks_exact_mut(e)
+                        .zip(out.par_chunks_exact(e))
+                        .for_each(|(x_row, out_row)| {
+                            for (xi, ai) in x_row.iter_mut().zip(out_row.iter()) {
+                                *xi += ai;
+                            }
+                        });
                 }
             }
             lchk(&format!("L{li:02} attn"), &x[(n - 1) * e..]); // 恒久診断 (env ゲート・未指定時 no-op)
             // --- FFN: SwiGLU をバッチ一括 ---
             let mut h2 = vec![0.0f32; n * e];
-            for i in 0..n {
-                let r = rmsnorm(&x[i * e..(i + 1) * e], &layer.ln2_w, e, self.eps);
-                h2[i * e..(i + 1) * e].copy_from_slice(&r);
-            }
+            // s42: rmsnorm は行独立 → 行並列 (bit-exact)
+            h2.par_chunks_exact_mut(e)
+                .zip(x.par_chunks_exact(e))
+                .for_each(|(h2_row, x_row)| {
+                    let r = rmsnorm(x_row, &layer.ln2_w, e, self.eps);
+                    h2_row.copy_from_slice(&r);
+                });
             let gate = layer.gate_w.apply_bt_rows(&h2, n);
             let up = layer.up_w.apply_bt_rows(&h2, n);
             let mut hh = vec![0.0f32; n * ff];
-            for i in 0..n {
-                for j in 0..ff {
-                    let gv = gate[i * ff + j];
-                    let uv = up[i * ff + j];
-                    hh[i * ff + j] = gv / (1.0 + (-gv).exp()) * uv;
-                }
-            }
+            // s42: SwiGLU は行独立 → 行並列 (bit-exact)
+            hh.par_chunks_exact_mut(ff)
+                .zip(gate.par_chunks_exact(ff).zip(up.par_chunks_exact(ff)))
+                .for_each(|(hh_row, (gate_row, up_row))| {
+                    for ((gv, uv), hhv) in gate_row
+                        .iter()
+                        .zip(up_row.iter())
+                        .zip(hh_row.iter_mut())
+                    {
+                        *hhv = gv / (1.0 + (-gv).exp()) * uv;
+                    }
+                });
             let down = layer.down_w.apply_bt_rows(&hh, n);
-            for i in 0..n {
-                for (xi, di) in x[i * e..(i + 1) * e]
-                    .iter_mut()
-                    .zip(&down[i * e..(i + 1) * e])
-                {
-                    *xi += di;
-                }
-            }
+            // s42: 残差加算は行独立 → 行並列 (bit-exact)
+            x.par_chunks_exact_mut(e)
+                .zip(down.par_chunks_exact(e))
+                .for_each(|(x_row, down_row)| {
+                    for (xi, di) in x_row.iter_mut().zip(down_row.iter()) {
+                        *xi += di;
+                    }
+                });
             lchk(&format!("L{li:02} ffn"), &x[(n - 1) * e..]); // 恒久診断 (env ゲート・未指定時 no-op)
         }
 
@@ -1728,6 +1818,51 @@ mod tests {
 
         assert_eq!(bits(&lb1), bits(ls.last().unwrap()), "prefill batch != tokenwise");
         assert_eq!(bits(&lb2), bits(&ls2), "prefill 後の decode が不一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// s42 (Plan B): CPU prefill の rayon 並列化 (full attention attend の (i, head)
+    /// 並列・rmsnorm/swiglu/残差の行並列・matmul_bt_i8 の j ブロック並列) が
+    /// rayon スレッド数に依存しないこと (bits 完全一致)。par_* は pool.install()
+    /// 中ではそのローカルプールで実行されるため、同一 forward を 1/2/7/16 スレッド
+    /// で回して prefill logits と継続 decode を比較する。1 スレッド = 逐次相当で、
+    /// 既存の qwen38_27b_shape_prefill_batch_bit_exact (トークン逐次との bit-exact)
+    /// と合わせて「並列化しても逐次と bit 一致」を両面から担保する。
+    /// (実 GPU が無い環境では GDN/projection は全て CPU 経路で走る)
+    #[test]
+    fn qwen38_27b_shape_prefill_thread_count_bit_exact() {
+        let dir = build_dir("rayon", true, NK, NV);
+        let toks: Vec<u32> = (0..24u32).map(|i| (i * 5 + 3) % VOCAB as u32).collect();
+
+        // 指定スレッド数のローカルプールで prefill (n=24) → 続き 1 トークン decode
+        let run = |threads: usize| -> (Vec<f32>, Vec<f32>) {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut m = load_int8(&dir);
+            let mut c = m.new_cache();
+            pool.install(|| {
+                let a = m.forward(&toks, &mut c).unwrap();
+                let b = m.forward(&[toks[0]], &mut c).unwrap();
+                (a, b)
+            })
+        };
+
+        let (ref1, dec1) = run(1);
+        for th in [2usize, 7, 16] {
+            let (lp, decp) = run(th);
+            assert_eq!(
+                bits(&ref1),
+                bits(&lp),
+                "prefill logits がスレッド数 {th} で不一致"
+            );
+            assert_eq!(
+                bits(&dec1),
+                bits(&decp),
+                "継続 decode がスレッド数 {th} で不一致"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
