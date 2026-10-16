@@ -814,6 +814,39 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 
 **Determinism/exactness**: with no constraint (`auto`/`none`/no tools) the mask does not exist and the path is bit-identical to before; with a constraint, Done is also unmasked = identical. The mask only rewrites logits to -inf and never touches forward/numerics. Real-model `any`/`tool` curl verification is not yet done (a future hardware-verification candidate)
 
+### C4 GPU segfault fix (out-of-bounds write past a staged D2H pinned buffer + full-attention k-path layout error) — hardware verification is a human task (2026-10-16)
+
+> Session 27. C4 (18c97fe) was 192-green on CPU, but the human-side GPU hardware verification hit a **process death on the first request (segfault in libcuda.so · 3/3 reproductions · fault address with an identical trailing pattern every time)**. The container has no GPU/nvcc, so the cause was located by source analysis plus CPU-side tests.
+
+**Cause 1 (the segfault itself): the GDN staged-D2H pinned buffer was sized for one layer only**
+
+- `chain_q35_gdn_scan` stacks the new GDN state (conv/ssm) into a shared pinned buffer (`q35_gdn_stage`) **layer by layer** (stacking position `prev` = end of the previous entry, cumulative), yet the requested size `need` was **always one layer's worth** `(conv+ssm)*4`. Grow-only `ensure_pin` saw the layer-1 allocation as big enough for all later layers and never reallocated → **the second GDN layer's `cuMemcpyDtoHAsync` wrote past the end of the pinned region (at exactly the allocation end = prev*4 bytes)**
+- A DtoH on the null (legacy default) stream is executed by the driver on the host side, so a store to an out-of-region host address becomes a **SIGSEGV inside libcuda** (fault address = pinned base + a fixed offset — matching the identical trailing pattern every run). It also matches the observation that death came right after chain activation (layers 0 and 1 are GDN → dead at layer 1's D2H)
+- **Fix**: ① `chain_q35_gdn_stage_begin` now takes the whole-step byte count and **pre-allocates all GDN layers up front at step start** (unifying with kv_stage's "allocate the full size first" convention; mid-step grow reallocation is also forbidden because freeing (`cuMemHostFree`) a pinned buffer still in use by an in-flight async D2H is undefined) ② the scan-side ensure now requests the **cumulative size** `(prev + conv + ssm) * 4` (a no-op once begin has pre-sized — belt and braces). New pure function `q35_gdn_stage_bytes(n_gdn, nk, nv, dk, dv, d_conv)` is the single source for the byte count
+
+**Cause 2 (data corruption — not fatal, but wrong results): the full-attention k path read outside CH_QKV's k section / wrote outside the mirror row**
+
+- The CH_QKV layout is `[qg (heads*2dh) | k (kv_heads*dh) | v (kv_heads*dh)]` (chain_linear_grouped concatenates parts in order), so the k section starts at `heads*2*dh`. The old code passed `hd = heads*dh` (the second half of qg = the gate parts), **treating gate values as k for QK-Norm+rope**
+- It also used `kv_dim` as the per-head stride (correct value: `dh`): head b's read left the k section and read v/gate values, and the **write landed outside the mirror row (kv_dim wide)** — head kv_heads-1 wrote several KB past the row end, i.e. ~25 KB past the mirror buffer itself on the last row (device-side OOB write)
+- **Fix**: new `q35_fullattn_k_off(heads, dh)` makes the k-section start single-sourced; src_off = `heads*2*dh`, x_stride = `dh`, dst_stride = `dh` (the v-row start in vp_src also goes through k_off)
+
+**Tests (2 new cfg-cuda pure-function tests, no GPU needed)**:
+
+- `q35_gdn_stage_bytes_covers_all_layers_staging`: every layer's stacking position prev and write end fit inside the pre-allocated element count (the old one-layer-only sizing fails at i=1) · 2 shapes (9B/27B-like and 0.8B-like) × 4 n_gdn values
+- `q35_fullattn_k_layout_matches_ch_qkv_sections`: k-section placement, per-head read/write ranges stay in bounds, and reproducing asserts that the old src_off/stride always left the section under GQA
+
+**Verification (CPU)**:
+
+- `cargo test --workspace` **205 passed / 0 failed** (engine lib 169 = unchanged; the 2 new tests are cfg cuda) · `cargo test --features cuda --lib q35_` 6 passed (including the 2 new ones)
+- `cargo check --features cuda --lib` passes — 12 warnings on the lib build / 27 on the cuda test build, both **exactly identical to HEAD** (zero new warnings)
+
+**Human tasks (GPU · hardware verification of this fix)**:
+
+1. Rebuild cuda in a clean worktree → 9B GPU E2E (the process must survive the first request and answer normally)
+2. `cargo test --features cuda --lib qwen35_solo_chain -- --ignored` (explicit chain activation + greedy match + logits closeness)
+3. Measure speed (improvement over the rolled-back fc78586 binary's 77 ms/step)
+4. Re-take the 9B/27B anchors (the k-path fix changes the full-attention layers' k, so C4-chain output may change; after the fix it should match the CPU path — confirm against the CPU anchors)
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
@@ -833,7 +866,7 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 - [x] ~~**B2: attn_core V accumulation**: 3.51s left (largest op). dno_attention extension (attention already has a relaxed contract)~~ → **done (2026-10-15)**: the probs@V accumulation of `dno_attention_prefill` is rebuilt as v-hoist + 2-row interleave + float2 loads (v re-reads 64× → 1×, the FMA sequence into each acc keeps ascending kk = **bit-identical** to the old kernel, and the old kernel's acc local spill is gone too). Host side unchanged. Real-machine ignored cuda tests 27/27 all green (bit-exact, 2026-10-16, §3 27B section). `cuda_attn_pf_bench`, the BK-expansion A/B, and E2E wall measurement remain
 - [x] ~~**B3: rope GPU for b>1 batches** (low priority): syncs are hidden in batch mode~~ → **done (2026-10-15)**: `forward_batch`'s rope is GPU-offloaded via `dno_rope_qk_batch` (same approach as P17h/P17k = host-generated table + mul/sub only, bit-identical to the CPU `rope_row`, rope not in the relaxed slot, table cache skips regeneration across the layer loop, on failure the host is untouched and it falls back to the CPU). See §3 B3. Real-machine ignored cuda tests 27/27 all green (bit-exact, 2026-10-16, §3 27B section). E2E wall measurement (rope reduction for b>1) remains
 - [x] ~~**3B/7B b=4 measurement**~~ → **done in P17k** (target changed to Gemma3n 13,252 tok)
-- [x] ~~**C4: qwen35 device-resident decode chain (GDN state GPU mirror)**~~ → **implemented, verified on CPU (2026-10-16)**: decode (n==1) becomes a solo chain of "one embedding H2D → all layers chained on GPU → one sync+D2H for the final logits" (same skeleton as llama P17h; GDN state is a ping-pong GPU mirror + staged D2H keeping the host correct; on failure it returns None before advance and falls back to the legacy per-op path). Three new kernels (dno_matvec_f32 / dno_qknorm_rope_pi / dno_attn_gate_mul, all under the bit-identity contract). **kernels_elem.ptx regeneration + real-GPU E2E are human tasks** — until regenerated the chain stays inactive (lazy fetch caches None, no GPU_BROKEN) and the existing paths keep running. See the §3 "C4" section
+- [x] ~~**C4: qwen35 device-resident decode chain (GDN state GPU mirror)**~~ → **implemented, verified on CPU (2026-10-16)**: decode (n==1) becomes a solo chain of "one embedding H2D → all layers chained on GPU → one sync+D2H for the final logits" (same skeleton as llama P17h; GDN state is a ping-pong GPU mirror + staged D2H keeping the host correct; on failure it returns None before advance and falls back to the legacy per-op path). Three new kernels (dno_matvec_f32 / dno_qknorm_rope_pi / dno_attn_gate_mul, all under the bit-identity contract). **kernels_elem.ptx regeneration + real-GPU E2E are human tasks** — until regenerated the chain stays inactive (lazy fetch caches None, no GPU_BROKEN) and the existing paths keep running. See the §3 "C4" section. **The segfault found during the real-GPU verification is fixed (2026-10-16 · see the §3 "C4 GPU segfault fix" section · hardware re-verification is a human task)**: the GDN staged-D2H pinned buffer was sized for one layer (later layers wrote out of bounds → SIGSEGV inside libcuda), plus the full-attention k path's wrong src_off/strides (out-of-section reads, out-of-row writes)
 
 ### Ops & peripheral
 

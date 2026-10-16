@@ -1172,8 +1172,8 @@ impl Qwen35 {
             chain_download, chain_linear_grouped, chain_q35_fullattn, chain_q35_gdn_scan,
             chain_q35_gdn_stage_begin, chain_q35_gdn_stage_flush, chain_q35_kv_stage_flush,
             chain_q35_rope_pi_upload, chain_rmsnorm, chain_swiglu, chain_upload,
-            gpu_attention_enabled, q35_chain_shapes_ok, q35_fns_available, CH_ACT, CH_ATT, CH_DOWN,
-            CH_GA, CH_H, CH_LOGITS, CH_O, CH_QKV, CH_X,
+            gpu_attention_enabled, q35_chain_shapes_ok, q35_fns_available, q35_gdn_stage_bytes,
+            CH_ACT, CH_ATT, CH_DOWN, CH_GA, CH_H, CH_LOGITS, CH_O, CH_QKV, CH_X,
         };
         let e = self.e;
         let ff = self.ff;
@@ -1217,8 +1217,15 @@ impl Qwen35 {
         // 同一式 → dno_qknorm_rope_pi の QK-Norm+rope を bit-exact にする)
         let tab = q35_rope_pi_table(pos0, self.n_rot, self.theta);
         chain_q35_rope_pi_upload(&tab)?;
-        // GDN 状態ステージのリセット (前ステップの残りを誤フラッシュしないため)
-        chain_q35_gdn_stage_begin()?;
+        // GDN 状態ステージのリセット + 全 GDN 層分の pinned を事前確保
+        // (ステップ中途の grow 再確保 = in-flight async D2H 転送先の解放を避ける。
+        // kv_stage と同一の「ステップ開始時に全体サイズを確保」規約)。
+        let n_gdn = self
+            .layers
+            .iter()
+            .filter(|l| matches!(l.attn, AttnKind::Gdn(_)))
+            .count();
+        chain_q35_gdn_stage_begin(q35_gdn_stage_bytes(n_gdn, nk, nv, dk, dv, d_conv))?;
 
         // 埋め込み 1 行 → residual stream デバイス常駐開始
         chain_upload(CH_X, &self.embed[token as usize * e..][..e], e, 1)?;

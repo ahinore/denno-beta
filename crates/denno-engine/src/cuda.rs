@@ -3616,6 +3616,33 @@ pub const Q35_TAG_WA: u8 = 5; // ssm_a [nv]
 pub const Q35_TAG_WDT: u8 = 6; // ssm_dt.bias [nv]
 pub const Q35_TAG_WNORM: u8 = 7; // ssm_norm.weight [dv]
 
+/// C4: full_attention 層の CH_QKV 内 k セクション先頭 (要素オフセット)。
+/// レイアウトは [qg (heads*2dh) | k (kv_heads*dh) | v (kv_heads*dh)] —
+/// chain_linear_grouped が parts 順に連結する。q は head ごと [q|gate] 融合で
+/// head 間隔 2*dh だが、k/v は head 間隔 dh (chain_q35_fullattn の k 経路が
+/// この関数を使い、誤ったオフセット/ストライドを防ぐ)。
+fn q35_fullattn_k_off(heads: usize, dh: usize) -> usize {
+    heads * 2 * dh
+}
+
+/// C4: GDN 状態ステージ (chain_q35_gdn_stage_begin) のステップ全体バイト数。
+/// GDN 層 1 層分 = conv [conv_dim * cs] + SSM [nv*dk*dv] (要素) × 4B。
+/// ステップ開始時に全 GDN 層分を一括確保する (ステップ中途の grow 再確保は
+/// in-flight async D2H の転送先 pinned を解放する危険があるため禁止 —
+/// kv_stage と同一の「最初に全体サイズを確保」規約)。
+pub fn q35_gdn_stage_bytes(
+    n_gdn: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+) -> usize {
+    let conv_elems = (2 * nk * dk + nv * dv) * d_conv.saturating_sub(1);
+    let ssm_elems = nv * dk * dv;
+    n_gdn * (conv_elems + ssm_elems) * 4
+}
+
 /// C4: fp32 重みのデバイスキャッシュ取得 (無ければ同期 H2D でアップロード)。
 /// 初回 1 回のみ同期コピーが走る (chain 発動セッションの最初のステップ)。
 fn q35_w_dev(mid: u64, li: usize, tag: u8, w: &[f32]) -> Option<CUdeviceptr> {
@@ -3868,8 +3895,13 @@ pub fn chain_q35_fullattn(
         ))
     })?;
 
-    // 2) QK-Norm + rope: k はミラー pos0 行へ直接・q は CH_Q35_Q へ
-    //    (CH_QKV レイアウト: [qg (heads*2dh) | k (kv_dim) | v (kv_dim)])
+    // 2) QK-Norm + rope: k はミラー pos0 行へ直接書く・q は CH_Q35_Q へ
+    //    (CH_QKV レイアウト: [qg (heads*2dh) | k (kv_dim) | v (kv_dim)] —
+    //    k セクション先頭は q35_fullattn_k_off (heads*2*dh)・head b の行内
+    //    位置は b*dh (head 間隔 dh。融合 [q|gate] の q とは間隔が異なる)。
+    //    旧実装は src_off=hd (qg 後半を読む)・head 間隔 kv_dim (k 節域を外れて
+    //    読む + ミラー行の外へ書く) で、k 履歴を破壊していた。
+    let k_off = q35_fullattn_k_off(heads, dh);
     let km_row = kptr + (pos0 * kv_dim * 4) as u64;
     let q_ptr = CHAIN.with(|cell| -> Option<CUdeviceptr> {
         let s = cell.borrow();
@@ -3883,14 +3915,14 @@ pub fn chain_q35_fullattn(
     )?;
     chain_q35_qknorm_rope(
         mid, li, Q35_TAG_KNORM, k_norm_w,
-        CH_QKV, hd, kv_dim, kv_heads, dh, n_rot, eps, km_row, kv_dim,
+        CH_QKV, k_off, dh, kv_heads, dh, n_rot, eps, km_row, dh,
     )?;
 
     // 3) v 行 D2D + k/v 行の staged async D2H (ホスト反映は sync 後)
     let (vp_src, kv_dim64) = CHAIN.with(|cell| -> Option<(CUdeviceptr, u64)> {
         let s = cell.borrow();
         let base = s.bufs[CH_QKV].as_ref()?.ptr();
-        Some((base + (((heads * 2 * dh) + kv_dim) * 4) as u64, (kv_dim * 4) as u64))
+        Some((base + ((k_off + kv_dim) * 4) as u64, (kv_dim * 4) as u64))
     })?;
     let lib = ok(lib())?;
     unsafe {
@@ -4144,14 +4176,17 @@ pub fn chain_q35_gdn_scan(
         let mut s = cell.borrow_mut();
         let conv_elems = conv_dim * cs;
         let ssm_elems = nv * dk * dv;
-        let need = (conv_elems + ssm_elems) * 4;
-        ok(Scratch::ensure_pin(&mut s.q35_gdn_stage, need))?;
-        // ステージの積み位置 = 前エントリの末尾 (ssm_off + ssm_len)
+        // ステージの積み位置 = 前エントリの末尾 (ssm_off + ssm_len)。
+        // 確保は**累積サイズ**で行う (begin の全体事前確保があれば no-op)。旧実装は
+        // 1 層分のみを確保して prev を累積させたため、2 番目の GDN 層以降の
+        // cuMemcpyDtoHAsync が pinned 領域の外へ書いていた (segfault の原因)。
         let prev: usize = s
             .q35_gdn_stage_list
             .last()
             .map(|(_, _, _, so, sl)| so + sl)
             .unwrap_or(0);
+        let need = (prev + conv_elems + ssm_elems) * 4;
+        ok(Scratch::ensure_pin(&mut s.q35_gdn_stage, need))?;
         let pin = s.q35_gdn_stage.as_ref().unwrap();
         unsafe {
             ok(check(
@@ -4189,11 +4224,17 @@ pub fn chain_q35_gdn_scan(
     })
 }
 
-/// C4: chain ステップ開始時に GDN ステージリストをリセットする
-/// (前ステップの残りを誤ってフラッシュしないため)。
-pub fn chain_q35_gdn_stage_begin() -> Option<()> {
+/// C4: chain ステップ開始時に GDN ステージリストをリセットし、ステップ全体分の
+/// pinned ステージを**事前確保**する。ステップ中途の grow 再確保は、前層の
+/// in-flight async D2H が使用中の pinned を cuMemHostFree する危険があるため
+/// 禁止 (kv_stage と同一の「ステップ開始時に全体サイズを確保」規約)。
+/// 旧実装 (1 層分のみを scan 側で ensure) では 2 番目の GDN 層の
+/// cuMemcpyDtoHAsync が pinned 領域の外へ書き、libcuda 内で SIGSEGV していた。
+pub fn chain_q35_gdn_stage_begin(stage_bytes: usize) -> Option<()> {
     CHAIN.with(|cell| -> Option<()> {
-        cell.borrow_mut().q35_gdn_stage_list.clear();
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure_pin(&mut s.q35_gdn_stage, stage_bytes))?;
+        s.q35_gdn_stage_list.clear();
         Some(())
     })
 }
@@ -5801,6 +5842,75 @@ mod tests {
         let xf_gpu = chain_download(CH_X, n * e).unwrap();
         assert_bits_eq(&xf_gpu, &xf, "最終 residual (CH_X)");
         println!("prefill chain bit-exact OK (n={n} e={e} ff={ff} pos0={pos0} t={t_total})");
+    }
+
+    // === C4 GPU segfault 修正 (2026-10-16) の回帰テスト (純関数・GPU 不要) ===
+
+    /// C4: GDN ステージ pinned はステップ全体分を begin で事前確保する。
+    /// 各 GDN 層の積み位置 prev = i*(conv+ssm) に対し、書き込み末尾
+    /// (prev + conv + ssm) が事前確保要素数に収まること。旧実装は 1 層分のみを
+    /// scan 側で ensure したため、2 番目の GDN 層の cuMemcpyDtoHAsync が pinned
+    /// 領域の外へ書き、libcuda 内で SIGSEGV していた (実機 3/3 再現)。
+    #[test]
+    fn q35_gdn_stage_bytes_covers_all_layers_staging() {
+        // 9B/27B 相当 (dk=dv=128・d_conv=4・nk=16・nv=32) と 0.8B 相当の 2 種
+        let cases: [(usize, usize, usize, usize, usize); 2] =
+            [(16, 32, 128, 128, 4), (8, 8, 128, 128, 4)];
+        for &(nk, nv, dk, dv, d_conv) in &cases {
+            let conv_elems = (2 * nk * dk + nv * dv) * (d_conv - 1);
+            let ssm_elems = nv * dk * dv;
+            for n_gdn in [1usize, 3, 18, 48] {
+                let total_elems = q35_gdn_stage_bytes(n_gdn, nk, nv, dk, dv, d_conv) / 4;
+                assert_eq!(
+                    total_elems,
+                    n_gdn * (conv_elems + ssm_elems),
+                    "n_gdn={n_gdn} の総要素数"
+                );
+                // 各層の積み位置 + 1 層分が総容量に収まる (flush の as_slice 読みも同範囲)。
+                // 旧実装 (1 層分のみ確保 = per_layer) では i=1 のこの assert が
+                // 失敗する (prev + conv + ssm = 2*per_layer > per_layer)。
+                for i in 0..n_gdn {
+                    let prev = i * (conv_elems + ssm_elems);
+                    assert!(prev + conv_elems + ssm_elems <= total_elems);
+                }
+            }
+        }
+        // d_conv < 1 でもパニックしない (saturating)
+        assert_eq!(q35_gdn_stage_bytes(1, 1, 1, 1, 1, 0), 4);
+    }
+
+    /// C4: full_attention の CH_QKV k セクション配置と KV ミラー行内配置。
+    /// 旧実装は src_off=hd (qg の後半 = gate 部を読む)・head 間隔 kv_dim
+    /// (k 節域を外れて v/gate を読む・head kv_heads-1 はミラー行の外へ書く)
+    /// だったため、k 履歴が破壊されていた。
+    #[test]
+    fn q35_fullattn_k_layout_matches_ch_qkv_sections() {
+        // (heads, kv_heads, dh) — 9B 相当と縮小形状
+        let cases: [(usize, usize, usize); 3] = [(32, 8, 128), (16, 4, 128), (8, 2, 64)];
+        for &(heads, kv_heads, dh) in &cases {
+            let kv_dim = kv_heads * dh;
+            let k_off = q35_fullattn_k_off(heads, dh);
+            // k セクションは qg (heads*2dh) の直後
+            assert_eq!(k_off, heads * 2 * dh);
+            let k_end = k_off + kv_dim;
+            // head b の読み出し [k_off + b*dh .. + dh) は k セクション内
+            for b in 0..kv_heads {
+                assert!(k_off + b * dh + dh <= k_end, "k head {b} read OOB");
+                // ミラー行 (kv_dim 幅) への書き込み [b*dh .. + dh) も行内
+                assert!(b * dh + dh <= kv_dim, "k head {b} write out of mirror row");
+            }
+            // 旧実装の再現: head 1 の旧読み出し位置 (src_off=hd + 1*kv_dim) は
+            // k セクション開始位置よりも前 (= qg 内) で、GQA (kv_heads < heads) なら常にそうなる
+            let old_src_off = heads * dh;
+            if kv_heads < heads {
+                assert!(old_src_off + kv_dim < k_off, "旧 src_off は qg 内に留まる");
+            }
+            // 旧実装の再現: head kv_heads-1 の旧書き込み位置 ((kv_heads-1)*kv_dim)
+            // はミラー行 (kv_dim 幅) の外
+            if kv_heads >= 2 {
+                assert!((kv_heads - 1) * kv_dim + dh > kv_dim, "旧 dst_stride は行外に書く");
+            }
+        }
     }
 }
 
