@@ -1172,6 +1172,33 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 `cargo test --workspace` **253 passed / 0 failed / 18 ignored** (s48 と同一 = CPU 経路無変更の裏取り)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)・`cargo test --features cuda --no-run` 通過 (新規 ignored テストのコンパイル確認・B3 の慣行どおり)。期待効果 (推定): fp32 serve (既定) の decode から lm_head の ~2.4GB/ステップの重み読み + matvec が消え (初回 1 回の 2.4GB H2D 以後は h 16KB + logits 0.6MB の転送/ステップ)、fp32 decode ms/step の大幅短縮が見込まれる — 実機での再計測は人間対応
 
+### decode D2H のデルタ化 — GDN 状態の GPU ミラー権威化 + 遅延フラッシュ (s50) ✅ (2026-10-17)
+
+> 第50セッション。C4 decode chain が各ステップ末尾に GDN 新状態 (conv/ssm) を staged async D2H でホストへ戻していた (9B で ~75MB/step = decode の支配項) のをやめ、GPU ミラーを権威のままにして「ホスト状態が実際に必要になる時点」まで転送を遅らせる (デルタ化)。KV 側はステップ毎の D2H が無い設計のため対象外。`.cu` / PTX は無変更 (新カーネル無し・PTX 再生成不要)。
+
+**背景**:
+
+- 旧実装: `chain_q35_gdn_scan` が conv/ssm の新状態 (ping-pong 書き込み面) を pinned へ staged async D2H → `chain_download` の sync 後に `chain_q35_gdn_stage_flush` でホスト cache へ反映。decode の D2H は logits (0.6MB) 以外は全てこの GDN 状態転送で、9B で ~75MB/step に達する (実装コメント記載の推定)
+- 一方 decode chain は ping-pong 2 面 (cur を読み 1-cur に書き cur を交換) の GPU ミラーを持つため、次ステップは必ずミラーから読む — ホストへの戻しは「chain 以外の経路がホスト状態を読むとき」にしか要らない。ホストが実際に必要になるのは ①次の prefill (`forward_prefill` はホスト状態を正として読み/書く) ②chain 不発時の CPU フォールバック (`forward`) の 2 箇所のみ
+
+**実装**:
+
+- `cuda.rs`: `KvMirror` に `gdn_pending: Option<usize>` 新設 (Some(pos) = 最後に遅延した decode ステップの pos0+1・正常完了後は cache.len() と一致・Some の間はホスト GDN 状態が古い可能性)。LRU エビクトの候補選定に `gdn_pending.is_none()` 条件を追加 (フラッシュ前にミラーがエビクトされると回復不能になるため)。mirror epoch リセット (reset/restore) で pending を破棄 (前会話のデータは使わない = ホストが正)
+- `cuda.rs`: `chain_q35_gdn_scan` から staged async D2H を削除 — launch 成功後に `gdn_pos` / `gdn_pending` = Some(pos0+1) を確定し ping-pong 面を交換するだけ (ミラー位置の確定は launch 成功後 = 失敗時は GPU_BROKEN で chain 停止のため誤更新は残らない)。層途中で chain が失敗した場合は掃けた層だけ pending に載る (flush 側は gdn_pos と cache.len() の整合で掃けた面だけを回復できる)
+- `cuda.rs`: `chain_q35_gdn_flush_pending(cache)` 新設 (pub) — 「ホスト状態が実際に必要になる時点」でミラーの現行面を同期 D2H (`DevBuffer::to_vec`) でホスト cache へ回復する。契約: ①ミラーの内容は各 decode ステップ末尾の `chain_download` (sync) で確定済み (ステップ末尾にステップ後の非同期カーネルを残さない現行設計) → 同期 D2H は確定値を読む・転送は bit そのまま (演算なし) = フラッシュ後のホスト状態は「毎ステップフラッシュした場合」と bit 一致 ②位置整合は層ごとに判定 (`gdn_pos == target` → cur 面 / `== target+1` → 1-cur 面 = 層途中失敗ステップの ping-pong 入力面 / `None` → chain 未走層 = ホストが最新 → スキップ / それ以外は不整合 → pending 破棄のうえ None) ③epoch 不一致 → pending 破棄の no-op (reset/restore でホストが正に戻った) ④pending 無し / ミラー無し → no-op ⑤ミラーロック保持中に D2H を実施 (解放すると LRU エビクトが走り得て読み出し元 DevBuffer が解放される競合回避 — with_mirror 内 H2D と同一方針)。戻り値 None = 回復不能 → 呼び出し側は要求を落とす (古い状態で黙って継続するより安全)
+- `cuda.rs`: 旧 `chain_q35_gdn_stage_begin` / `chain_q35_gdn_stage_flush` / `q35_gdn_stage_bytes` を削除 (GDN はステージしなくなった・staged D2H 用 pinned 領域 `gdn_stage` も廃止)。`chain_q35_kv_stage_begin` は kv_stage のみの事前確保に (内容は同じ)
+- `qwen35.rs`: ①`forward` (decode n==1) で chain 不発/失敗 → CPU フォールバックの直前に flush ②`forward_prefill` 冒頭に flush (いずれも `cfg(feature = "cuda")`・None の場合はエラーで要求を落とす = ミラー失同步時に古い状態で継続しない)
+- `qwen35.rs` (prof・観測のみ): `forward_prefill` に llama.rs 規約準拠の prefill prof 内訳を追加 (EMBED / RMSNORM (attn h・FFN h2) / QKV (full q/k/v 一括 + GDN qkv/gate) / QKNORM / ROPE / ATTN (full attend = GPU 試行含む・GDN スキャン + beta/alpha 投影) / OPROJ (full o_w・GDN out_w) / GATE_UP / SWIGLU / DOWN / FINAL_NORM・LM_HEAD は s49 の `logits()` ラッパで計上済み)。`full_attn_prepare` は QKNORM/ROPE バケット分割のため 3 段 (`full_attn_qknorm` / `full_attn_rope` / KV 書き込み) に分離したが decode 経路 (`full_attn_core`) は本関数経由で現行どおり・呼び出し順と演算列は不変 = bit-exact。KV 書き込みは llama prefill と同様に個別計上しない。GDN 投影の計上区分は decode chain と同一 (qkv+z → QKV・beta/alpha → ATTN) で prefill と decode chain のプロファイル比較可能性を維持
+
+**数値影響**: なし (bit 一致契約) — 遅延フラッシュの転送は bit そのまま (演算なし) で、ミラーの ping-pong 読み出し面は変更されないため各ステップの計算結果は完全に同一。CPU 経路 (`feea9444` / `da0b1f57`)・1b GPU アンカー (`3fb48936`)・2b GPU アンカー (`d46ab41f`) は全て不変。非 cuda ビルドは cfg ブロックごと消えるため完全に現行経路。prof 内訳追加も観測のみ (prof 無効時は分岐 1 回)。効果は D2H 転送量の削減のみ — decode の D2H が logits (0.6MB) + prefill 境界時の GDN 状態 1 回になり、ステップ毎 ~75MB/step (9B) が消える
+
+**テスト** (新規 2 件):
+
+- `cuda.rs`: `cuda_gdn_flush_pending_faces_positions_and_epoch` (`#[ignore]` = 実機 GPU 実行) — flush の契約検証: ①`gdn_pos == cache.len()` → cur 面回復 ②`gdn_pos == cache.len()+1` → 1-cur 面 (層途中失敗ステップの入力面) 回復 ③epoch 不一致 → pending 破棄の no-op ④pending 無し / ミラー無し → no-op ⑤位置不整合 (バグのみ) → None + pending 破棄 ⑥chain 未走層 (`gdn_pos == None`) → スキップ。転送は bit そのままのためコピー内容の bit 一致で検証
+- `qwen35.rs`: `qwen38_27b_shape_chain_gdn_deferred_flush_bit_exact` (`#[cfg(feature = "cuda")]` + `#[ignore]`) — 合成 int8 27B モデルで chain レベルの bit 一致検証。「毎ステップ明示 flush (旧挙動相当)」vs「遅延 (flush 無し・GPU ミラー権威)」の 2 経路を ①ステップ毎 logits (初回 prefill logits + 4 ステップ greedy decode chain) ②prefill 境界継続 (遅延中の prefill = 冒頭 flush でホスト回復してから計算) ③attn 無効化による CPU フォールバック継続 (forward 冒頭 flush で回復) ④最終 GDN ホスト状態 を bits 比較 — 不一致なら遅延経路が数値に触れている (=バグ)
+
+`cargo test --workspace` **253 passed / 0 failed / 18 ignored** (s49 と同一 = CPU 経路無変更の裏取り)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・cuda.rs の 3 件は挿入行による行番号シフトのみ・新規警告ゼロ)・`cargo test --features cuda --no-run` 通過 (新規 ignored テスト 2 件のコンパイル確認)。期待効果 (推定): decode のステップ毎 D2H ~75MB/step (9B) が消え、D2H は logits (0.6MB) + prefill 境界時の GDN 状態 1 回のみ — decode ms/step の大幅短縮が見込まれる。実機での ignored テスト実行・decode 再計測・cuda バイナリ再ビルド/8095 再配備・push は人間対応
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -1195,6 +1222,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] ~~**2b (283tok prefill) 出力 2 値分岐の解明と修正**~~ → **完了 (2026-10-16 第41〜42セッション)**: 根因は GPU KV ミラーが同一 kv_id (スロット) 再利用時に前会話の行 [0..have) を正規行として再利用すること (短→長の切替直後の 1 リクエストのみ発現・スロット割当の揺れで 2 値に分岐・分岐 md5 `3a1fbabe`/`d46ab41f` はミラー行再利用の証拠)。KvCache にコンテンツ世代 (epoch) を導入し with_mirror_ext で検証・全層無効化。§3「GPU KV ミラーのコンテンツ世代 (epoch) 検証」節参照。実機での分岐消滅確認 (1b→2b シーケンス再実行) は人間対応
 - [x] ~~**qwen35 prefill full attention の GPU バッチ化 (案 C・C1 最小構成・REPORT_NEXT19 §3.1)**~~ → **実装完了・CPU 検証まで (2026-10-17・s48)**: §3「qwen35 prefill full attention の GPU バッチ化」節参照。`dno_attention_prefill` 流用 (モデル非依存・`.cu`/PTX 無変更) + 動的 smem の `cuFuncSetAttribute` opt-in (C1-a)。発動ゲート n≥gemm_min_m() (既定 256) で 1b/CPU 経路の bit 温存・`DENNO_GPU_ATTN=0` escape hatch 流用。実機での opt-in 確認・2b アンカー再取得・wall 計測は人間対応
 - [x] ~~**fp32 lm_head の GPU 化 (serve 既定 fp32 モードの decode 律速・REPORT_NEXT23)**~~ → **実装完了・CPU 検証まで (2026-10-17・s49)**: §3「fp32 lm_head の GPU 化」節参照。C4 chain の `dno_matvec_f32` 流用 (`.cu`/PTX 無変更・block=(1,1,1) 起動で vocab 規模の grid.x を直接扱う) + **bit 一致契約** (CPU 経路・1b/2b GPU アンカー不変) + スコープドラッチ `LMV32_BROKEN` (GPU_BROKEN に触れない = int8 経路への影響ゼロ)。prof に D2H op (`d2h_state`) 新設 (decode chain の lm_head バケットからの sync 待ち分離・観測のみ)。実機での ignored テスト実行・fp32 decode ms/step 再計測・cuda バイナリ再ビルド/8095 再配備は人間対応
+- [x] ~~**decode D2H のデルタ化 (GDN 状態の GPU ミラー権威化 + 遅延フラッシュ)**~~ → **実装完了・CPU 検証まで (2026-10-17・s50)**: §3「decode D2H のデルタ化」節参照。ステップ毎 D2H ~75MB/step (9B) を「ホスト状態が実際に必要になる時点」(prefill 冒頭・CPU フォールバック時) の同期 D2H 1 回に遅延 (転送のみで bit 一致契約・LRU エビクト除外・epoch リセットで pending 破棄・旧 gdn_stage 系 API 削除)。あわせて `forward_prefill` に llama 規約の prof 内訳 (EMBED…FINAL_NORM) を追加 (観測のみ・bit-exact)。実機での ignored テスト実行・decode 再計測・cuda バイナリ再ビルド/8095 再配備・push は人間対応
 
 ### 運用・周辺
 

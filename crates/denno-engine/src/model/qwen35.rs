@@ -579,6 +579,10 @@ impl Qwen35 {
     /// で共用 — トークン 1 行分の演算列はトークン逐次経路と同一のため bit-exact。
     /// prefill では全トークンの prepare をトークン順に逐次実行してから attend に
     /// 入る (attend は読み取り専用のため全行書き込み後でも結果は同一)。
+    /// (s50: prefill の prof を llama 規約の QKNORM / ROPE バケットに分割計上する
+    /// ため full_attn_qknorm → full_attn_rope → KV 書き込みの 3 段構成にした —
+    /// 呼び出し順と演算列は不変で bit-exact・decode 経路 (full_attn_core) は本関数
+    /// 経由で現行どおり。)
     #[allow(clippy::too_many_arguments)]
     fn full_attn_prepare(
         &self,
@@ -591,11 +595,28 @@ impl Qwen35 {
         pos: usize,
         qout: &mut [f32],
     ) {
+        let mut k = self.full_attn_qknorm(lf, qg, k_row, qout);
+        self.full_attn_rope(qout, &mut k, pos);
+        // K/V をキャッシュへ
+        let kv_dim = self.kv_heads * self.dh;
+        let (kc, vc) = cache.kv_bufs(li, 1);
+        kc[pos * kv_dim..][..kv_dim].copy_from_slice(&k);
+        vc[pos * kv_dim..][..kv_dim].copy_from_slice(v_row);
+    }
+
+    /// prepare 前段: QK-Norm (head 単位・RoPE 前) + q の分離 (qg の head ごと前半
+    /// dh)。norm 済 k [kv_dim] を返す (RoPE は未適用)。full_attn_prepare と同一の
+    /// 演算列 (分離のみで数値不変)。
+    fn full_attn_qknorm(
+        &self,
+        lf: &FullLayer,
+        qg: &[f32],
+        k_row: &[f32],
+        qout: &mut [f32],
+    ) -> Vec<f32> {
         let dh = self.dh;
         let heads = self.heads;
         let kv_heads = self.kv_heads;
-        let kv_dim = kv_heads * dh;
-
         let mut k = k_row.to_vec();
 
         // QK-Norm (head 単位・RoPE 前) + q の分離
@@ -609,15 +630,15 @@ impl Qwen35 {
             let wn = rmsnorm(seg, &lf.k_norm_w, dh, self.eps);
             seg.copy_from_slice(&wn);
         }
+        k
+    }
 
-        // partial interleaved RoPE
-        rope_partial_interleaved(qout, heads, dh, self.n_rot, pos, self.theta);
-        rope_partial_interleaved(&mut k, kv_heads, dh, self.n_rot, pos, self.theta);
-
-        // K/V をキャッシュへ
-        let (kc, vc) = cache.kv_bufs(li, 1);
-        kc[pos * kv_dim..][..kv_dim].copy_from_slice(&k);
-        vc[pos * kv_dim..][..kv_dim].copy_from_slice(v_row);
+    /// prepare 中段: partial interleaved RoPE (q/k・in place)。full_attn_prepare と
+    /// 同一の演算列 (分離のみで数値不変)。
+    fn full_attn_rope(&self, qout: &mut [f32], k: &mut [f32], pos: usize) {
+        let dh = self.dh;
+        rope_partial_interleaved(qout, self.heads, dh, self.n_rot, pos, self.theta);
+        rope_partial_interleaved(k, self.kv_heads, dh, self.n_rot, pos, self.theta);
     }
 
     /// full attention の 1 head 分: scores (QK ドット・k 昇順の逐次累積) → softmax
@@ -973,6 +994,13 @@ impl Model for Qwen35 {
             if let Some(logits) = self.forward_decode_chain(tokens[0], cache, pos0) {
                 return Ok(logits);
             }
+            // s50: chain 不発/失敗 → 従来経路。直前の decode chain が GDN の新状態を
+            // GPU ミラーに遅延させている可能性があるため、まずホストへ回復してから
+            // CPU 経路に入る (回復不能 = ミラー失同步 → 古い状態で黙って継続するより
+            // 要求を落とす方が安全)。
+            crate::cuda::chain_q35_gdn_flush_pending(cache).ok_or_else(|| {
+                anyhow::anyhow!("deferred GDN state flush failed; cannot fall back to CPU path")
+            })?;
         }
         let mut logits = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
@@ -1016,6 +1044,12 @@ impl Qwen35 {
     /// トークン逐次。トークン逐次経路と bit-exact (テスト: qwen35_prefill_batch
     /// _matches_tokenwise)。
     fn forward_prefill(&self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>> {
+        // s50: decode chain で遅延中の GDN 状態 (GPU ミラーが権威) をホストへ回復
+        // する。prefill はホスト状態を正として読み/書くため、ここで同期 D2H で
+        // 一致させておく (回復不能 = ミラー失同步 → 要求を落とす)。
+        #[cfg(feature = "cuda")]
+        crate::cuda::chain_q35_gdn_flush_pending(cache)
+            .ok_or_else(|| anyhow::anyhow!("deferred GDN state flush failed before prefill"))?;
         let e = self.e;
         let n = tokens.len();
         let pos0 = cache.len();
@@ -1030,9 +1064,13 @@ impl Qwen35 {
         }
         // 埋め込み X [n, e]
         let mut x = vec![0.0f32; n * e];
-        for (i, &tok) in tokens.iter().enumerate() {
-            x[i * e..(i + 1) * e].copy_from_slice(&self.embed[tok as usize * e..][..e]);
-        }
+        // s50: prefill prof 内訳 (llama.rs 規約準拠 — LM_HEAD は s49 の logits()
+        // ラッパで計上済み・prof 無効時は分岐 1 回で演算不変 = bit-exact)
+        crate::prof::time(crate::prof::EMBED, || {
+            for (i, &tok) in tokens.iter().enumerate() {
+                x[i * e..(i + 1) * e].copy_from_slice(&self.embed[tok as usize * e..][..e]);
+            }
+        });
         lchk("prefill emb", &x[(n - 1) * e..]); // 恒久診断 (env ゲート・未指定時 no-op)
         let heads = self.heads;
         let kv_heads = self.kv_heads;
@@ -1044,62 +1082,78 @@ impl Qwen35 {
             // --- attention: rmsnorm を行単位で一括計算 (s42: 行独立 → 行並列。
             // 各要素の演算列は不変のため bit-exact・スレッド数非依存) ---
             let mut h = vec![0.0f32; n * e];
-            h.par_chunks_exact_mut(e)
-                .zip(x.par_chunks_exact(e))
-                .for_each(|(h_row, x_row)| {
-                    let r = rmsnorm(x_row, layer.attn_ln1(), e, self.eps);
-                    h_row.copy_from_slice(&r);
-                });
+            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+                h.par_chunks_exact_mut(e)
+                    .zip(x.par_chunks_exact(e))
+                    .for_each(|(h_row, x_row)| {
+                        let r = rmsnorm(x_row, layer.attn_ln1(), e, self.eps);
+                        h_row.copy_from_slice(&r);
+                    });
+            });
             match &layer.attn {
                 AttnKind::Gdn(g) => {
-                    // 投影はバッチ一括 (m=n → GPU tiled GEMM)
+                    // 投影はバッチ一括 (m=n → GPU tiled GEMM)。qkv+z は decode chain
+                    // と同一の QKV バケット・beta/alpha は chain の dno_gdn_scan 頭部
+                    // matvec と同一の ATTN バケットに計上 (prefill と decode chain の
+                    // プロファイル比較可能性維持)。
                     let (kqkv, _) = g.qkv_w.dims();
                     debug_assert_eq!(kqkv, e);
-                    let qkv = g.qkv_w.apply_bt_rows(&h, n);
-                    let z = g.gate_w.apply_bt_rows(&h, n);
-                    let beta_raw = g.beta_w.apply_bt_rows(&h, n);
-                    let alpha = g.alpha_w.apply_bt_rows(&h, n);
+                    let qkv = crate::prof::time_layer(crate::prof::QKV, li, || {
+                        g.qkv_w.apply_bt_rows(&h, n)
+                    });
+                    let z =
+                        crate::prof::time_layer(crate::prof::QKV, li, || g.gate_w.apply_bt_rows(&h, n));
+                    let beta_raw = crate::prof::time_layer(crate::prof::ATTN, li, || {
+                        g.beta_w.apply_bt_rows(&h, n)
+                    });
+                    let alpha = crate::prof::time_layer(crate::prof::ATTN, li, || {
+                        g.alpha_w.apply_bt_rows(&h, n)
+                    });
                     // スキャン: GPU カーネル 1 発 (P19-A1・cuda 有効時)。GDN は
                     // bit 一致不要のため GPU/CPU で数値は僅かに異なる (決定論は維持)。
                     // GPU 無効時はトークン逐次 (再帰状態) にフォールバック。
                     let dy = g.out_w.dims().0; // value_dim
                     #[cfg(feature = "cuda")]
-                    let p = &self.gdn_p;
-                    #[cfg(feature = "cuda")]
-                    let ys: Vec<f32> = if n > 1 && p.head_k_dim == p.head_v_dim {
-                        let (conv, ssm) = cache
-                            .gdn_state_mut(li)
-                            .expect("GDN state slot が未初期化");
-                        match crate::cuda::gdn_scan_batch(
-                            &qkv,
-                            &z,
-                            &beta_raw,
-                            &alpha,
-                            conv,
-                            ssm,
-                            &g.conv1d,
-                            &g.ssm_a,
-                            &g.ssm_dt,
-                            &g.ssm_norm,
-                            n,
-                            p.n_k_heads,
-                            p.n_v_heads,
-                            p.head_k_dim,
-                            p.head_v_dim,
-                            p.d_conv,
-                            p.eps,
-                            1.0 / (p.head_k_dim as f32).sqrt(),
-                        ) {
-                            Some(y) => y,
-                            None => self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy),
+                    let ys: Vec<f32> = crate::prof::time_layer(crate::prof::ATTN, li, || {
+                        let p = &self.gdn_p;
+                        if n > 1 && p.head_k_dim == p.head_v_dim {
+                            let (conv, ssm) = cache
+                                .gdn_state_mut(li)
+                                .expect("GDN state slot が未初期化");
+                            match crate::cuda::gdn_scan_batch(
+                                &qkv,
+                                &z,
+                                &beta_raw,
+                                &alpha,
+                                conv,
+                                ssm,
+                                &g.conv1d,
+                                &g.ssm_a,
+                                &g.ssm_dt,
+                                &g.ssm_norm,
+                                n,
+                                p.n_k_heads,
+                                p.n_v_heads,
+                                p.head_k_dim,
+                                p.head_v_dim,
+                                p.d_conv,
+                                p.eps,
+                                1.0 / (p.head_k_dim as f32).sqrt(),
+                            ) {
+                                Some(y) => y,
+                                None => self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy),
+                            }
+                        } else {
+                            self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy)
                         }
-                    } else {
-                        self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy)
-                    };
+                    });
                     #[cfg(not(feature = "cuda"))]
-                    let ys: Vec<f32> =
-                        self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy);
-                    let out = g.out_w.apply_bt_rows(&ys, n);
+                    let ys: Vec<f32> = crate::prof::time_layer(crate::prof::ATTN, li, || {
+                        self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy)
+                    });
+                    let out = crate::prof::time_layer(crate::prof::OPROJ, li, || {
+                        g.out_w.apply_bt_rows(&ys, n)
+                    });
                     if crate::gdn::gdn_dbg_enabled_for(li as i64) {
                         // 恒久診断 (env ゲート・未指定時 no-op): 出力投影後 (llama.cpp linear_attn_out 相当)
                         for i in 0..n {
@@ -1116,26 +1170,39 @@ impl Qwen35 {
                         });
                 }
                 AttnKind::Full(fl) => {
-                    let qg = fl.q_w.apply_bt_rows(&h, n); // [n, heads*2*dh]
-                    let k = fl.k_w.apply_bt_rows(&h, n); // [n, kv_dim]
-                    let v = fl.v_w.apply_bt_rows(&h, n); // [n, kv_dim]
+                    let (qg, k, v) = crate::prof::time_layer(crate::prof::QKV, li, || {
+                        (
+                            fl.q_w.apply_bt_rows(&h, n), // [n, heads*2*dh]
+                            fl.k_w.apply_bt_rows(&h, n), // [n, kv_dim]
+                            fl.v_w.apply_bt_rows(&h, n), // [n, kv_dim]
+                        )
+                    });
                     let mut att = vec![0.0f32; n * heads * dh];
                     // s42 (Plan B): prepare (KV 書き込み + QK-Norm + RoPE) をトークン順
                     // に逐次実行 (トークン逐次経路と同一の演算列・decode 経路の
                     // full_attn_core と共用)。attend は読み取り専用のため全トークンの
                     // prepare 完了後に並列実行しても結果は同一 (bit-exact)。
+                    // (s50: prof は QKNORM / ROPE バケットに分割計上 — 演算列は
+                    // full_attn_prepare 1 回呼び出しと同一 (順序不変) = bit-exact。
+                    // KV 書き込みは llama prefill と同様に個別計上しない)
                     let mut q = vec![0.0f32; n * heads * dh];
                     for i in 0..n {
-                        self.full_attn_prepare(
-                            fl,
-                            &qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
-                            &k[i * kv_dim..(i + 1) * kv_dim],
-                            &v[i * kv_dim..(i + 1) * kv_dim],
-                            cache,
-                            li,
-                            pos0 + i,
-                            &mut q[i * heads * dh..(i + 1) * heads * dh],
-                        );
+                        let q_r = &mut q[i * heads * dh..(i + 1) * heads * dh];
+                        let mut kn = crate::prof::time_layer(crate::prof::QKNORM, li, || {
+                            self.full_attn_qknorm(
+                                fl,
+                                &qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
+                                &k[i * kv_dim..(i + 1) * kv_dim],
+                                q_r,
+                            )
+                        });
+                        crate::prof::time_layer(crate::prof::ROPE, li, || {
+                            self.full_attn_rope(q_r, &mut kn, pos0 + i)
+                        });
+                        let (kc, vc) = cache.kv_bufs(li, 1);
+                        kc[(pos0 + i) * kv_dim..][..kv_dim].copy_from_slice(&kn);
+                        vc[(pos0 + i) * kv_dim..][..kv_dim]
+                            .copy_from_slice(&v[i * kv_dim..(i + 1) * kv_dim]);
                     }
                     // s48 (C1): cuda ビルドでは attend を GPU バッチ (dno_attention_prefill
                     // 1 発 + D2H 後のホスト sigmoid ゲート) に置き換えて試行する。
@@ -1143,37 +1210,41 @@ impl Qwen35 {
                     // 書き込み済み = 冪等) で、chain 失敗時は下の既存 rayon attend に
                     // 落ちる (数値は現行どおり bit 一致・発動ゲート n>=gemm_min_m()
                     // で短文は CPU のまま・`DENNO_GPU_ATTN=0` で全経路現行に戻る)。
-                    #[cfg(feature = "cuda")]
-                    let att_done =
-                        self.full_attn_attend_gpu(&qg, &q, cache, li, pos0, n, &mut att);
-                    #[cfg(not(feature = "cuda"))]
-                    let att_done = false;
-                    if !att_done {
-                        // s42: attend を (i, head) 並列で実行 (旧実装はトークン逐次 —
-                        // O(n²) の単スレッド部分が長 prefill の律速)。1 head 分の
-                        // scores → softmax → probs@V → gate はトークン逐次経路と同一の
-                        // 演算列のため bit-exact・rayon スレッド数非依存 (決定論検証:
-                        // qwen38_27b_shape_prefill_thread_count_bit_exact)。scores は
-                        // タスクローカル (共有スクラッチなし・書き込み先は各タスク専属の
-                        // att チャンクのみ)。
-                        let (kcr, vcr) = cache.kv_bufs_ref(li);
-                        att.par_chunks_exact_mut(dh)
-                            .enumerate()
-                            .for_each(|(t, att_head)| {
-                                let i = t / heads;
-                                let hh = t % heads;
-                                self.full_attn_attend_head(
-                                    &qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
-                                    &q[i * heads * dh..(i + 1) * heads * dh],
-                                    kcr,
-                                    vcr,
-                                    pos0 + i + 1,
-                                    hh,
-                                    att_head,
-                                );
-                            });
-                    }
-                    let out = fl.o_w.apply_bt_rows(&att, n);
+                    crate::prof::time_layer(crate::prof::ATTN, li, || {
+                        #[cfg(feature = "cuda")]
+                        let att_done =
+                            self.full_attn_attend_gpu(&qg, &q, cache, li, pos0, n, &mut att);
+                        #[cfg(not(feature = "cuda"))]
+                        let att_done = false;
+                        if !att_done {
+                            // s42: attend を (i, head) 並列で実行 (旧実装はトークン逐次 —
+                            // O(n²) の単スレッド部分が長 prefill の律速)。1 head 分の
+                            // scores → softmax → probs@V → gate はトークン逐次経路と同一の
+                            // 演算列のため bit-exact・rayon スレッド数非依存 (決定論検証:
+                            // qwen38_27b_shape_prefill_thread_count_bit_exact)。scores は
+                            // タスクローカル (共有スクラッチなし・書き込み先は各タスク専属の
+                            // att チャンクのみ)。
+                            let (kcr, vcr) = cache.kv_bufs_ref(li);
+                            att.par_chunks_exact_mut(dh)
+                                .enumerate()
+                                .for_each(|(t, att_head)| {
+                                    let i = t / heads;
+                                    let hh = t % heads;
+                                    self.full_attn_attend_head(
+                                        &qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
+                                        &q[i * heads * dh..(i + 1) * heads * dh],
+                                        kcr,
+                                        vcr,
+                                        pos0 + i + 1,
+                                        hh,
+                                        att_head,
+                                    );
+                                });
+                        }
+                    });
+                    let out = crate::prof::time_layer(crate::prof::OPROJ, li, || {
+                        fl.o_w.apply_bt_rows(&att, n)
+                    });
                     // s42: 残差加算は行独立 → 行並列 (bit-exact)
                     x.par_chunks_exact_mut(e)
                         .zip(out.par_chunks_exact(e))
@@ -1188,28 +1259,35 @@ impl Qwen35 {
             // --- FFN: SwiGLU をバッチ一括 ---
             let mut h2 = vec![0.0f32; n * e];
             // s42: rmsnorm は行独立 → 行並列 (bit-exact)
-            h2.par_chunks_exact_mut(e)
-                .zip(x.par_chunks_exact(e))
-                .for_each(|(h2_row, x_row)| {
-                    let r = rmsnorm(x_row, &layer.ln2_w, e, self.eps);
-                    h2_row.copy_from_slice(&r);
-                });
-            let gate = layer.gate_w.apply_bt_rows(&h2, n);
-            let up = layer.up_w.apply_bt_rows(&h2, n);
+            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+                h2.par_chunks_exact_mut(e)
+                    .zip(x.par_chunks_exact(e))
+                    .for_each(|(h2_row, x_row)| {
+                        let r = rmsnorm(x_row, &layer.ln2_w, e, self.eps);
+                        h2_row.copy_from_slice(&r);
+                    });
+            });
+            let (gate, up) = crate::prof::time_layer(crate::prof::GATE_UP, li, || {
+                (layer.gate_w.apply_bt_rows(&h2, n), layer.up_w.apply_bt_rows(&h2, n))
+            });
             let mut hh = vec![0.0f32; n * ff];
             // s42: SwiGLU は行独立 → 行並列 (bit-exact)
-            hh.par_chunks_exact_mut(ff)
-                .zip(gate.par_chunks_exact(ff).zip(up.par_chunks_exact(ff)))
-                .for_each(|(hh_row, (gate_row, up_row))| {
-                    for ((gv, uv), hhv) in gate_row
-                        .iter()
-                        .zip(up_row.iter())
-                        .zip(hh_row.iter_mut())
-                    {
-                        *hhv = gv / (1.0 + (-gv).exp()) * uv;
-                    }
-                });
-            let down = layer.down_w.apply_bt_rows(&hh, n);
+            crate::prof::time_layer(crate::prof::SWIGLU, li, || {
+                hh.par_chunks_exact_mut(ff)
+                    .zip(gate.par_chunks_exact(ff).zip(up.par_chunks_exact(ff)))
+                    .for_each(|(hh_row, (gate_row, up_row))| {
+                        for ((gv, uv), hhv) in gate_row
+                            .iter()
+                            .zip(up_row.iter())
+                            .zip(hh_row.iter_mut())
+                        {
+                            *hhv = gv / (1.0 + (-gv).exp()) * uv;
+                        }
+                    });
+            });
+            let down = crate::prof::time_layer(crate::prof::DOWN, li, || {
+                layer.down_w.apply_bt_rows(&hh, n)
+            });
             // s42: 残差加算は行独立 → 行並列 (bit-exact)
             x.par_chunks_exact_mut(e)
                 .zip(down.par_chunks_exact(e))
@@ -1221,8 +1299,11 @@ impl Qwen35 {
             lchk(&format!("L{li:02} ffn"), &x[(n - 1) * e..]); // 恒久診断 (env ゲート・未指定時 no-op)
         }
 
-        // 最終 norm + logits は最終トークンのみ (トークン逐次経路の最終値と同一)
-        let hf = rmsnorm(&x[(n - 1) * e..], &self.norm_w, e, self.eps);
+        // 最終 norm + logits は最終トークンのみ (トークン逐次経路の最終値と同一)。
+        // FINAL_NORM を個別計上 (LM_HEAD は s49 の logits() ラッパで計上済み)
+        let hf = crate::prof::time(crate::prof::FINAL_NORM, || {
+            rmsnorm(&x[(n - 1) * e..], &self.norm_w, e, self.eps)
+        });
         let logits = self.logits(&hf);
         lchk("final hf", &hf); // 恒久診断 (env ゲート・未指定時 no-op)
         lchk("final logits", &logits); // 恒久診断 (env ゲート・未指定時 no-op)
@@ -1377,12 +1458,11 @@ impl Qwen35 {
     ) -> Option<Vec<f32>> {
         use crate::cuda::{
             chain_download, chain_linear_grouped, chain_q35_fullattn, chain_q35_gdn_scan,
-            chain_q35_gdn_stage_begin, chain_q35_gdn_stage_flush, chain_q35_kv_stage_begin,
-            chain_q35_kv_stage_flush, chain_q35_rope_pi_upload, chain_q35_step_reserve,
-            chain_q35_step_reserve_aq, chain_rmsnorm, chain_swiglu, chain_upload,
-            gpu_attention_enabled, q35_chain_shapes_ok, q35_ch_att_bytes, q35_ch_qkv_bytes,
-            q35_fns_available, q35_gdn_stage_bytes, q35_kv_stage_bytes,
-            CH_ACT, CH_ATT, CH_DOWN, CH_GA, CH_H, CH_LOGITS, CH_O, CH_QKV, CH_X,
+            chain_q35_kv_stage_begin, chain_q35_kv_stage_flush, chain_q35_rope_pi_upload,
+            chain_q35_step_reserve, chain_q35_step_reserve_aq, chain_rmsnorm, chain_swiglu,
+            chain_upload, gpu_attention_enabled, q35_chain_shapes_ok, q35_ch_att_bytes,
+            q35_ch_qkv_bytes, q35_fns_available, q35_kv_stage_bytes, CH_ACT, CH_ATT, CH_DOWN,
+            CH_GA, CH_H, CH_LOGITS, CH_O, CH_QKV, CH_X,
         };
         let e = self.e;
         let ff = self.ff;
@@ -1426,23 +1506,16 @@ impl Qwen35 {
         // 同一式 → dno_qknorm_rope_pi の QK-Norm+rope を bit-exact にする)
         let tab = q35_rope_pi_table(pos0, self.n_rot, self.theta);
         chain_q35_rope_pi_upload(&tab)?;
-        // GDN 状態ステージのリセット + 全 GDN 層分の pinned を事前確保
-        // (ステップ中途の grow 再確保 = in-flight async D2H 転送先の解放を避ける。
-        // kv_stage と同一の「ステップ開始時に全体サイズを確保」規約)。
-        let n_gdn = self
-            .layers
-            .iter()
-            .filter(|l| matches!(l.attn, AttnKind::Gdn(_)))
-            .count();
-        chain_q35_gdn_stage_begin(q35_gdn_stage_bytes(n_gdn, nk, nv, dk, dv, d_conv))?;
 
-        // CH_QKV / CH_ATT / aq / kv_stage もステップ開始時に一括確保 (gdn_stage と
-        // 同一の「最初に全体サイズ」規約)。2994feb 時点では CH_QKV の事前確保が
+        // CH_QKV / CH_ATT / aq / kv_stage をステップ開始時に一括確保
+        // (「最初に全体サイズ」規約)。2994feb 時点では CH_QKV の事前確保が
         // 無く、GDN 層の grouped GEMV (qkv+z) 直後に chain_q35_gdn_scan 頭部の
         // chain_ensure_buf(CH_QKV, width*4) が grow 再確保で in-flight 書き込み先を
         // 解放し、dno_gdn_scan が未初期化の新バッファを読んでいた (実機 E2E の
         // 出力非決定論 + 冒頭乱れの直接原因)。aq は初回 down GEMV (k=ff) の
         // 再確保が直前 GEMV の in-flight 読み出し元を解放するのを避ける。
+        // (s50: GDN 状態のステージは廃止 — 新状態は GPU ミラーに留める。pinned
+        // ステージの事前確保は kv_stage のみ残る。)
         chain_q35_step_reserve(
             CH_QKV,
             q35_ch_qkv_bytes(heads, dh, kv_heads, nk, nv, dk, dv),
@@ -1564,8 +1637,8 @@ impl Qwen35 {
         }
 
         // 最終 norm + lm_head (s49: logits download を D2H バケットに分離 — この
-        // download の sync が全 staged D2H + ステップ全体の GPU 実行の完了待ちを
-        // 吸収するため、lm_head 計算だけのバケットに分けないと実機プロファイルの
+        // download の sync がステップ全体の GPU 実行の完了待ちを吸収するため、
+        // lm_head 計算だけのバケットに分けないと実機プロファイルの
         // 「lm_head」が sync 待ち込みで過大帰属になる。観測のみで数値経路不変)
         crate::prof::time(crate::prof::LM_HEAD, || -> Option<()> {
             chain_rmsnorm(&self.norm_w, eps, pending, CH_H, e, 1, n_layers * 3)?;
@@ -1575,10 +1648,12 @@ impl Qwen35 {
         let logits = crate::prof::time(crate::prof::D2H, || {
             chain_download(CH_LOGITS, self.vocab)
         })?;
-        // ホスト反映: Full 層 k/v 行 (GDN 層はステージしないため skip) + GDN 状態
-        crate::prof::time(crate::prof::D2H, || -> Option<()> {
-            chain_q35_kv_stage_flush(cache, n_layers, kv_dim, pos0, &gdn_layers)?;
-            chain_q35_gdn_stage_flush(cache)
+        // ホスト反映: Full 層 k/v 行のみ (s50: GDN 状態はステップ毎に戻さず
+        // GPU ミラーを権威のままにする — 次の prefill 冒頭 / CPU フォールバック時に
+        // chain_q35_gdn_flush_pending が回復する。ステップ毎 D2H ~75MB/step が
+        // decode の支配項だったため)
+        crate::prof::time(crate::prof::D2H, || {
+            chain_q35_kv_stage_flush(cache, n_layers, kv_dim, pos0, &gdn_layers)
         })?;
         cache.advance(1);
         Some(logits)
@@ -2001,6 +2076,100 @@ mod tests {
         let d1 = m.forward(&[9u32], &mut c1).unwrap();
         let d2 = m.forward(&[9u32], &mut c2).unwrap();
         assert_eq!(bits(&d1), bits(&d2), "分割後の decode 継続が不一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// s50: decode chain の GDN 状態遅延フラッシュ (chain_q35_gdn_flush_pending) の
+    /// chain レベル bit 一致検証 (合成 int8 27B モデル)。旧挙動 (s49 以前: 各ステップ
+    /// 末尾に staged async D2H → sync 後ホスト反映) は「各ステップ後に明示 flush」で
+    /// 再現し、s50 の遅延 (ステップ毎のホスト反映なし・GPU ミラー権威) と
+    /// ①ステップ毎 logits ②prefill 境界継続 (forward_prefill 冒頭の flush でホスト
+    /// 回復してから計算) ③attn 無効化による CPU フォールバック継続 (forward 冒頭の
+    /// flush で回復) を bits 比較する。遅延フラッシュの転送は bit そのまま (演算なし)
+    /// のため全比較が bit 一致するはず — 不一致なら遅延経路が数値経路に触れている
+    /// (=バグ)。
+    /// 実行: `cargo test --features cuda --lib qwen38_27b_shape_chain_gdn_deferred -- --ignored`
+    /// (実機 GPU + kernels_elem.ptx 再生成後・コンテナ内は GPU 無しのため非実行)
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn qwen38_27b_shape_chain_gdn_deferred_flush_bit_exact() {
+        fn argmax(v: &[f32]) -> u32 {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0 as u32
+        }
+        let _g =
+            crate::cuda::test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::cuda::enable_for_tests();
+        let _ctx = crate::cuda::CudaCtx::new().expect("GPU 必須 (ignored テスト)");
+        let dir = build_dir("c4defer", true, NK, NV);
+        let prompt = vec![5u32, 11, 23];
+        let steps = 4usize;
+
+        // --- 経路 A: 旧挙動相当 (毎ステップ明示 flush → ホスト GDN 状態は常に最新) ---
+        let mut ma = load_int8(&dir);
+        let mut ca = ma.new_cache();
+        let mut la = ma.forward(&prompt, &mut ca).unwrap();
+        let pre_a = bits(&la); // 初回 prefill logits (経路間比較用)
+        let mut seq: Vec<u32> = Vec::new();
+        let mut hist_a: Vec<Vec<u32>> = Vec::new();
+        for step in 0..steps {
+            let t = argmax(&la);
+            seq.push(t);
+            let pos0 = prompt.len() + step;
+            la = ma
+                .forward_decode_chain(t, &mut ca, pos0)
+                .expect("decode chain 発動 (int8 + lm_head Q8 + beta/alpha F32)");
+            // 旧挙動相当: ステップ毎にホストへ反映 (s49 以前の staged async D2H +
+            // sync 後 flush と同一効果・遅延分は直前ステップの 1 ステップ分のみ)
+            crate::cuda::chain_q35_gdn_flush_pending(&mut ca)
+                .expect("明示フラッシュ (旧挙動相当) は成功する");
+            hist_a.push(bits(&la));
+        }
+        // ② prefill 境界継続 (n>1 → forward_prefill・A は冒頭 flush が no-op)
+        let pa = ma.forward(&[64u32, 7], &mut ca).unwrap();
+        // ③ attn 無効化 → chain 不発 → forward 冒頭 flush (no-op) → CPU 経路
+        let prev = crate::cuda::set_gpu_attention_enabled(false);
+        let fa = ma.forward(&[seq[0]], &mut ca).unwrap();
+        crate::cuda::set_gpu_attention_enabled(prev);
+
+        // --- 経路 B: s50 遅延 (flush 無し・GPU ミラーが権威・ホストは古いまま) ---
+        let mut mb = load_int8(&dir);
+        let mut cb = mb.new_cache();
+        let mut lb = mb.forward(&prompt, &mut cb).unwrap();
+        assert_eq!(bits(&lb), pre_a, "初回 prefill logits が不一致");
+        for (step, &t) in seq.iter().enumerate() {
+            let pos0 = prompt.len() + step;
+            lb = mb
+                .forward_decode_chain(t, &mut cb, pos0)
+                .expect("decode chain 発動");
+            // flush しない — chain は GPU ミラーの ping-pong 面を読むため出力は不変
+            assert_eq!(
+                bits(&lb),
+                hist_a[step],
+                "①ステップ毎 logits が旧挙動 (毎ステップ flush) と不一致 step={step}"
+            );
+        }
+        // ② 遅延中の prefill: forward_prefill 冒頭の flush でホスト回復してから計算
+        let pb = mb.forward(&[64u32, 7], &mut cb).unwrap();
+        assert_eq!(bits(&pb), bits(&pa), "②prefill 境界継続が不一致");
+        // ③ 遅延中の CPU フォールバック: chain 不発 → forward 冒頭 flush で回復 →
+        //    CPU 経路 (GDN はホスト状態の GPU カーネル・full attention は CPU attend)
+        let prev = crate::cuda::set_gpu_attention_enabled(false);
+        let fb = mb.forward(&[seq[0]], &mut cb).unwrap();
+        crate::cuda::set_gpu_attention_enabled(prev);
+        assert_eq!(bits(&fb), bits(&fa), "③CPU フォールバック継続が不一致");
+        // ④ 最終 GDN ホスト状態も旧挙動と bit 一致 (転送が bit そのままの裏取り)
+        let gdn_bits = |c: &KvCache| -> Vec<Option<(Vec<u32>, Vec<u32>)>> {
+            c.gdn_snapshot()
+                .iter()
+                .map(|o| o.as_ref().map(|(a, b)| (bits(a), bits(b))))
+                .collect()
+        };
+        assert_eq!(gdn_bits(&cb), gdn_bits(&ca), "④最終 GDN ホスト状態が不一致");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
