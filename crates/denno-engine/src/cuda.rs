@@ -1900,10 +1900,6 @@ struct ChainScratch {
     /// する。model_id はロード毎に採番されるため、モデル再ロードで誤キャッシュに
     /// なることはない。
     q35_w_cache: std::collections::HashMap<(u64, usize, u8), DevBuffer>,
-    /// GDN 新状態の staged async D2H 先 (pin)。レイアウトは gdn_stage_list の並び。
-    q35_gdn_stage: Option<PinMem>,
-    /// (li, conv_off, conv_len, ssm_off, ssm_len) — 要素単位。chain 内で層順に積む。
-    q35_gdn_stage_list: Vec<(usize, usize, usize, usize, usize)>,
 }
 
 thread_local! {
@@ -1940,8 +1936,6 @@ thread_local! {
         q35_tab: None,
         q35_pin_tab: None,
         q35_w_cache: std::collections::HashMap::new(),
-        q35_gdn_stage: None,
-        q35_gdn_stage_list: Vec::new(),
     });
 }
 
@@ -2333,6 +2327,15 @@ struct KvMirror {
     /// seed 不要。層ごとに持つ (層ごとの seed 判定を独立させる — 1 層でも
     /// gdn_pos を共有すると残り層が全て再 seed になってしまう)。
     gdn_pos: Vec<Option<usize>>,
+    /// s50: 遅延 GDN 状態フラッシュの pending。decode chain は GDN の新状態
+    /// (conv/ssm) をステップ毎にホストへ戻さず GPU ミラーを権威のままにする
+    /// (ステップ毎 D2H が decode の支配項だったため)。Some(pos) = 最後に遅延した
+    /// decode ステップの pos0+1 (正常完了後は cache.len() と一致)。Some の間は
+    /// ホスト GDN 状態が古い可能性があり、chain_q35_gdn_flush_pending が
+    /// 「ホスト状態が実際に必要になる時点」(prefill 開始前・CPU フォールバック時)
+    /// でミラーから回復する。pending 保持中のミラーは LRU エビクト対象外
+    /// (フラッシュ前にデータが失われると回復不能になるため)。
+    gdn_pending: Option<usize>,
 }
 
 /// C4 (qwen35): GDN 状態 (conv + SSM) のデバイスミラー 1 層分。
@@ -2434,20 +2437,26 @@ fn with_mirror_ext<T>(
                     epoch,
                     gdn: (0..n_layers).map(|_| None).collect(),
                     gdn_pos: vec![None; n_layers],
+                    gdn_pending: None,
                 },
                 now,
             ));
             ms.len() - 1
         }
     };
-    // エビクト: 上限超過で LRU (自分は除外)
+    // エビクト: 上限超過で LRU (自分は除外)。s50: GDN 遅延フラッシュ pending 中の
+    // ミラーは除外 — エビクトすると未フラッシュの GDN 状態 (ホストより新しい唯一の
+    // コピー) が失われ回復不能になる。pending は次の prefill / CPU フォールバックの
+    // 冒頭でフラッシュして解除されるため、上限超過は高々 1 リクエスト分の遅延。
     let limit = gpu_kv_limit_bytes();
     let mut total: usize = ms.iter().map(|(_, m, _)| m.bytes()).sum();
     while total > limit && ms.len() > 1 {
         let vic = (0..ms.len())
-            .filter(|&i| ms[i].0 != key)
-            .min_by_key(|&i| ms[i].2)
-            .unwrap();
+            .filter(|&i| ms[i].0 != key && ms[i].1.gdn_pending.is_none())
+            .min_by_key(|&i| ms[i].2);
+        let Some(vic) = vic else {
+            break;
+        };
         total -= ms[vic].1.bytes();
         ms.swap_remove(vic);
     }
@@ -2467,6 +2476,10 @@ fn with_mirror_ext<T>(
     if m.epoch != epoch {
         m.len.iter_mut().for_each(|l| *l = 0);
         m.gdn_pos.iter_mut().for_each(|p| *p = None);
+        // s50: 世代が変わった = ホストが reset/restore で正に戻っている。遅延
+        // pending は前会話のデータを指すため破棄 (chain_q35_gdn_flush_pending が
+        // no-op になり、ホスト状態をそのまま使う)。
+        m.gdn_pending = None;
         m.epoch = epoch;
     }
     // cap 成長 (全レイヤ realloc + len リセット → 各レイヤ次回使用時に再シード)。
@@ -3948,24 +3961,6 @@ fn q35_fullattn_k_off(heads: usize, dh: usize) -> usize {
     heads * 2 * dh
 }
 
-/// C4: GDN 状態ステージ (chain_q35_gdn_stage_begin) のステップ全体バイト数。
-/// GDN 層 1 層分 = conv [conv_dim * cs] + SSM [nv*dk*dv] (要素) × 4B。
-/// ステップ開始時に全 GDN 層分を一括確保する (ステップ中途の grow 再確保は
-/// in-flight async D2H の転送先 pinned を解放する危険があるため禁止 —
-/// kv_stage と同一の「最初に全体サイズを確保」規約)。
-pub fn q35_gdn_stage_bytes(
-    n_gdn: usize,
-    nk: usize,
-    nv: usize,
-    dk: usize,
-    dv: usize,
-    d_conv: usize,
-) -> usize {
-    let conv_elems = (2 * nk * dk + nv * dv) * d_conv.saturating_sub(1);
-    let ssm_elems = nv * dk * dv;
-    n_gdn * (conv_elems + ssm_elems) * 4
-}
-
 /// C4: decode chain 1 ステップの CH_QKV 要請バイト数 (純関数・単一ソース)。
 /// - GDN 層: [qkv (2nk*dk+nv*dv) | z (nv*dv) | beta (nv) | alpha (nv)]
 ///   (= chain_q35_gdn_scan の `width`)
@@ -4385,9 +4380,9 @@ pub fn chain_q35_fullattn(
 /// (chain_linear_grouped 直後)。beta/alpha は本関数が dno_matvec_f32 で
 /// CH_QKV テール [(conv_dim+vd)..] へ出力する。GDN 状態ミラー (ping-pong) を
 /// seed/更新し、dno_gdn_scan (既存カーネル・grid=(nv,), block=(dk,)) を起動 —
-/// y を CH_ATT に書き、新状態を staged async D2H する。
-/// ホスト反映は sync 後の chain_q35_gdn_stage_flush。
-/// 失敗時 None (forward 全体を従来経路でやり直し)。
+/// y を CH_ATT に書く。新状態 (conv/ssm) は s50 からミラーの書き込み面に留め、
+/// ステップ毎のホスト D2H はしない (遅延フラッシュ — 契約と回復手順は
+/// chain_q35_gdn_flush_pending)。失敗時 None (forward 全体を従来経路でやり直し)。
 #[allow(clippy::too_many_arguments)]
 pub fn chain_q35_gdn_scan(
     mid: u64,
@@ -4536,53 +4531,19 @@ pub fn chain_q35_gdn_scan(
         ctx.launch_async(ctx.f_gdn, (nv as u32, 1, 1), (dk as u32, 1, 1), shmem, &mut args)
     })?;
 
-    // 新状態 (ping-pong の書き込み面) を staged async D2H → ホスト反映は sync 後
-    let lib = ok(lib())?;
-    CHAIN.with(|cell| -> Option<()> {
-        let mut s = cell.borrow_mut();
-        let conv_elems = conv_dim * cs;
-        let ssm_elems = nv * dk * dv;
-        // ステージの積み位置 = 前エントリの末尾 (ssm_off + ssm_len)。
-        // 確保は**累積サイズ**で行う (begin の全体事前確保があれば no-op)。旧実装は
-        // 1 層分のみを確保して prev を累積させたため、2 番目の GDN 層以降の
-        // cuMemcpyDtoHAsync が pinned 領域の外へ書いていた (segfault の原因)。
-        let prev: usize = s
-            .q35_gdn_stage_list
-            .last()
-            .map(|(_, _, _, so, sl)| so + sl)
-            .unwrap_or(0);
-        let need = (prev + conv_elems + ssm_elems) * 4;
-        ok(Scratch::ensure_pin(&mut s.q35_gdn_stage, need))?;
-        let pin = s.q35_gdn_stage.as_ref().unwrap();
-        unsafe {
-            ok(check(
-                (lib.memcpy_dtoh_async)(
-                    (pin.ptr as *mut c_void).add(prev * 4),
-                    conv_out,
-                    conv_elems * 4,
-                    std::ptr::null_mut(),
-                ),
-                "cuMemcpyDtoHAsync (q35 conv stage)",
-            ))?;
-            ok(check(
-                (lib.memcpy_dtoh_async)(
-                    (pin.ptr as *mut c_void).add((prev + conv_elems) * 4),
-                    ssm_out,
-                    ssm_elems * 4,
-                    std::ptr::null_mut(),
-                ),
-                "cuMemcpyDtoHAsync (q35 ssm stage)",
-            ))?;
-        }
-        s.q35_gdn_stage_list
-            .push((li, prev, conv_elems, prev + conv_elems, ssm_elems));
-        Some(())
-    })?;
+    // s50: 新状態 (ping-pong の書き込み面) はホストへ戻さない (遅延フラッシュ)。
+    // 旧実装はここで conv/ssm を pinned へ staged async D2H し、sync 後の
+    // chain_q35_gdn_stage_flush でホストへ反映していた。ステップ毎 D2H は
+    // 9B で ~75MB/step = decode の支配項だったため、ミラーを権威のままにして
+    // 「ホスト状態が実際に必要になる時点」まで転送を遅らせる。
 
     // ミラー位置の確定 (launch 成功後 — 失敗時は GPU_BROKEN で chain 停止のため
-    // 誤更新は残らない)。ping-pong 面を交換。
+    // 誤更新は残らない)。ping-pong 面を交換し、この層の新状態を遅延 pending に
+    // 載せる。層途中で chain が失敗した場合は掃けた層だけ pending になる — flush 側は
+    // gdn_pos と cache.len() の整合で掃けた面だけを回復できる。
     with_mirror_ext(key, li, n_layers, t_total, 0, cache.epoch(), false, |m, _| {
         m.gdn_pos[li] = Some(pos0 + 1);
+        m.gdn_pending = Some(pos0 + 1);
         if let Some(gd) = m.gdn[li].as_mut() {
             gd.cur = 1 - gd.cur;
         }
@@ -4590,23 +4551,92 @@ pub fn chain_q35_gdn_scan(
     })
 }
 
-/// C4: chain ステップ開始時に GDN ステージリストをリセットし、ステップ全体分の
-/// pinned ステージを**事前確保**する。ステップ中途の grow 再確保は、前層の
-/// in-flight async D2H が使用中の pinned を cuMemHostFree する危険があるため
-/// 禁止 (kv_stage と同一の「ステップ開始時に全体サイズを確保」規約)。
-/// 旧実装 (1 層分のみを scan 側で ensure) では 2 番目の GDN 層の
-/// cuMemcpyDtoHAsync が pinned 領域の外へ書き、libcuda 内で SIGSEGV していた。
-pub fn chain_q35_gdn_stage_begin(stage_bytes: usize) -> Option<()> {
+/// C4: KV ステージ pinned をステップ開始時に全体分事前確保する (s50 から GDN は
+/// ステージしないため kv_stage のみ)。chain_q35_fullattn 内の ensure は事前確保後
+/// no-op の二重防御。
+pub fn chain_q35_kv_stage_begin(stage_bytes: usize) -> Option<()> {
     CHAIN.with(|cell| -> Option<()> {
         let mut s = cell.borrow_mut();
-        ok(Scratch::ensure_pin(&mut s.q35_gdn_stage, stage_bytes))?;
-        s.q35_gdn_stage_list.clear();
-        Some(())
+        ok(Scratch::ensure_pin(&mut s.kv_stage, stage_bytes))
     })
 }
 
+/// s50: 遅延 GDN 状態フラッシュ。decode chain は GDN の新状態 (conv/ssm) をステップ
+/// 毎にホストへ戻さず GPU ミラー (ping-pong の cur 面) を権威のままにする
+/// (chain_q35_gdn_scan の doc 参照 — 旧実装のステップ毎 D2H は 9B で ~75MB/step =
+/// decode の支配項)。本関数は「ホスト状態が実際に必要になる時点」—
+/// ①次の prefill の冒頭 (forward_prefill はホスト状態を正として読み/書く)
+/// ②decode chain から従来 CPU 経路へのフォールバック時 (forward) —
+/// に呼ばれ、ミラーの現行面を同期 D2H でホストキャッシュへ回復する。
+///
+/// 契約:
+/// - ミラーの内容は各 decode ステップ末尾の chain_download (sync) で確定済み
+///   (ステップ末尾にステップ後の非同期カーネルを残さない現行設計) → 同期 D2H
+///   (DevBuffer::to_vec) は確定値を読む。転送は bit そのまま (演算なし) のため、
+///   フラッシュ後のホスト状態は「毎ステップフラッシュした場合」と bit 一致。
+/// - 位置整合: 対象位置 = cache.len()。gdn_pos[li] == target → cur 面、
+///   gdn_pos[li] == target+1 → 1-cur 面 (直前の chain ステップが層途中で失敗した
+///   ケースの ping-pong 入力面 = state at target)。gdn_pos[li] == None → その層は
+///   chain で 1 度も走っていない (ホスト状態が最新) → スキップ。それ以外は不整合
+///   (バグのみ) → pending 破棄のうえ None (呼び出し側は bail で要求を落とす =
+///   古い状態で黙って継続するより安全)。
+/// - epoch 不一致 (reset/restore でホストが正に戻った) → pending 破棄で no-op
+///   (前会話のデータは使わない — ホストが正)。
+/// - pending 無し (通常の prefill 毎・fp32 モード等) は no-op (登録簿参照のみ)。
+/// - ミラーロック保持中に D2H を実施する (解放すると LRU エビクトが走り得て
+///   読み出し元の DevBuffer が解放される競合になる — with_mirror 内 H2D と同一方針)。
+/// 戻り値: None = ホスト状態を回復できなかった (呼び出し側は継続してはならない)。
+pub fn chain_q35_gdn_flush_pending(cache: &mut crate::kv_cache::KvCache) -> Option<()> {
+    let key = cache.kv_id();
+    let epoch = cache.epoch();
+    let target = cache.len();
+    let mirrors = KV_MIRRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut ms = ok(mirrors.lock().map_err(|e| anyhow::anyhow!("{e}")))?;
+    let Some(idx) = ms.iter().position(|(k, _, _)| *k == key) else {
+        return Some(()); // ミラー未作成 = 遅延も存在し得ない
+    };
+    let m = &mut ms[idx].1;
+    if m.gdn_pending.is_none() {
+        return Some(()); // 遅延なし
+    }
+    if m.epoch != epoch {
+        m.gdn_pending = None;
+        return Some(());
+    }
+    for li in 0..m.gdn.len() {
+        let Some(gd) = m.gdn[li].as_ref() else {
+            continue; // GDN 層ではない (full attention 層)
+        };
+        let face = match m.gdn_pos[li] {
+            Some(p) if p == target => gd.cur,
+            Some(p) if p == target + 1 => 1 - gd.cur,
+            Some(_) => {
+                // 不整合 (正常系では起こらない — バグのみ)
+                m.gdn_pending = None;
+                return None;
+            }
+            None => continue, // chain 未走層 = ホストが最新
+        };
+        let (Some(cb), Some(sb)) = (&gd.conv[face], &gd.ssm[face]) else {
+            m.gdn_pending = None;
+            return None;
+        };
+        let conv = ok(cb.to_vec::<f32>(cb.bytes() / 4))?;
+        let ssm = ok(sb.to_vec::<f32>(sb.bytes() / 4))?;
+        let (conv_h, ssm_h) = cache.gdn_state_mut(li)?;
+        if conv_h.len() < conv.len() || ssm_h.len() < ssm.len() {
+            m.gdn_pending = None;
+            return None;
+        }
+        conv_h[..conv.len()].copy_from_slice(&conv);
+        ssm_h[..ssm.len()].copy_from_slice(&ssm);
+    }
+    m.gdn_pending = None;
+    Some(())
+}
+
 /// C4: チャネルスロットをステップ開始時に事前確保する (同期・カーネル発行なし)。
-/// kv_stage / gdn_stage と同一の「最初に全体サイズを確保」規約の CH_QKV /
+/// kv_stage と同一の「最初に全体サイズを確保」規約の CH_QKV /
 /// CH_ATT 版。事前確保後はステップ内の ensure が全て no-op になり、
 /// in-flight カーネルの書き込み先 / 読み出し元の grow 再確保による解放が
 /// 構造的に起こらない (q35_ch_qkv_bytes の doc を参照)。
@@ -4624,35 +4654,6 @@ pub fn chain_q35_step_reserve_aq(max_k: usize) -> Option<()> {
     CHAIN.with(|cell| -> Option<()> {
         let mut s = cell.borrow_mut();
         ok(Scratch::ensure(&mut s.aq, 1 * max_k))
-    })
-}
-
-/// C4: KV ステージ pinned をステップ開始時に全体分事前確保する (gdn_stage と
-/// 同一規約)。chain_q35_fullattn 内の ensure は事前確保後 no-op の二重防御。
-pub fn chain_q35_kv_stage_begin(stage_bytes: usize) -> Option<()> {
-    CHAIN.with(|cell| -> Option<()> {
-        let mut s = cell.borrow_mut();
-        ok(Scratch::ensure_pin(&mut s.kv_stage, stage_bytes))
-    })
-}
-
-/// C4: staged GDN 状態をホストキャッシュへ反映 (logits download の sync 後 —
-/// 全 staged D2H 完了済み)。ホスト GDN 状態は従来どおり正であり続ける
-/// (CPU 再実行 / snapshot 互換)。
-pub fn chain_q35_gdn_stage_flush(cache: &mut crate::kv_cache::KvCache) -> Option<()> {
-    CHAIN.with(|cell| -> Option<()> {
-        let s = cell.borrow();
-        let stage = s.q35_gdn_stage.as_ref()?;
-        let slice = stage.as_slice::<f32>();
-        for &(li, conv_off, conv_len, ssm_off, ssm_len) in &s.q35_gdn_stage_list {
-            let (conv, ssm) = cache.gdn_state_mut(li)?;
-            if conv.len() < conv_len || ssm.len() < ssm_len {
-                return None;
-            }
-            conv[..conv_len].copy_from_slice(&slice[conv_off..conv_off + conv_len]);
-            ssm[..ssm_len].copy_from_slice(&slice[ssm_off..ssm_off + ssm_len]);
-        }
-        Some(())
     })
 }
 
@@ -6435,39 +6436,6 @@ mod tests {
 
     // === C4 GPU segfault 修正 (2026-10-16) の回帰テスト (純関数・GPU 不要) ===
 
-    /// C4: GDN ステージ pinned はステップ全体分を begin で事前確保する。
-    /// 各 GDN 層の積み位置 prev = i*(conv+ssm) に対し、書き込み末尾
-    /// (prev + conv + ssm) が事前確保要素数に収まること。旧実装は 1 層分のみを
-    /// scan 側で ensure したため、2 番目の GDN 層の cuMemcpyDtoHAsync が pinned
-    /// 領域の外へ書き、libcuda 内で SIGSEGV していた (実機 3/3 再現)。
-    #[test]
-    fn q35_gdn_stage_bytes_covers_all_layers_staging() {
-        // 9B/27B 相当 (dk=dv=128・d_conv=4・nk=16・nv=32) と 0.8B 相当の 2 種
-        let cases: [(usize, usize, usize, usize, usize); 2] =
-            [(16, 32, 128, 128, 4), (8, 8, 128, 128, 4)];
-        for &(nk, nv, dk, dv, d_conv) in &cases {
-            let conv_elems = (2 * nk * dk + nv * dv) * (d_conv - 1);
-            let ssm_elems = nv * dk * dv;
-            for n_gdn in [1usize, 3, 18, 48] {
-                let total_elems = q35_gdn_stage_bytes(n_gdn, nk, nv, dk, dv, d_conv) / 4;
-                assert_eq!(
-                    total_elems,
-                    n_gdn * (conv_elems + ssm_elems),
-                    "n_gdn={n_gdn} の総要素数"
-                );
-                // 各層の積み位置 + 1 層分が総容量に収まる (flush の as_slice 読みも同範囲)。
-                // 旧実装 (1 層分のみ確保 = per_layer) では i=1 のこの assert が
-                // 失敗する (prev + conv + ssm = 2*per_layer > per_layer)。
-                for i in 0..n_gdn {
-                    let prev = i * (conv_elems + ssm_elems);
-                    assert!(prev + conv_elems + ssm_elems <= total_elems);
-                }
-            }
-        }
-        // d_conv < 1 でもパニックしない (saturating)
-        assert_eq!(q35_gdn_stage_bytes(1, 1, 1, 1, 1, 0), 4);
-    }
-
     /// C4: full_attention の CH_QKV k セクション配置と KV ミラー行内配置。
     /// 旧実装は src_off=hd (qg の後半 = gate 部を読む)・head 間隔 kv_dim
     /// (k 節域を外れて v/gate を読む・head kv_heads-1 はミラー行の外へ書く)
@@ -6586,6 +6554,175 @@ mod tests {
                 assert!(off + 2 * kv_dim <= total_elems, "li={li} の k/v 行が節域外");
             }
         }
+    }
+
+    /// s50: 遅延 GDN 状態フラッシュ (chain_q35_gdn_flush_pending) の契約検証。
+    /// GPU 必須 (DevBuffer D2H + KV_MIRRORS が cuda feature 配下のため)。
+    /// ①gdn_pos == cache.len() → cur 面 (成功ステップ後の現行状態)
+    /// ②gdn_pos == cache.len()+1 → 1-cur 面 (層途中で失敗したステップの入力面)
+    /// ③epoch 不一致 → pending 破棄の no-op (ホストが正)
+    /// ④pending 無し / ミラー無し → no-op
+    /// ⑤位置不整合 (バグのみ) → None + pending 破棄
+    /// ⑥gdn_pos == None (chain 未走層) → スキップ
+    /// 転送は bit そのまま (演算なし) のため、コピー内容の bit 一致で検証する。
+    #[test]
+    #[ignore] // GPU が必要: cargo test --release --features cuda -p denno-engine -- --ignored
+    fn cuda_gdn_flush_pending_faces_positions_and_epoch() {
+        fn assert_bits_eq(got: &[f32], want: &[f32], label: &str) {
+            assert_eq!(got.len(), want.len(), "{label}: len mismatch");
+            if let Some(i) = got.iter().zip(want).position(|(a, b)| a.to_bits() != b.to_bits()) {
+                panic!(
+                    "{label}: bit mismatch @{i} got={:?} ({:08x}) want={:?} ({:08x})",
+                    got[i],
+                    got[i].to_bits(),
+                    want[i],
+                    want[i].to_bits()
+                );
+            }
+        }
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let _ctx = CudaCtx::new().unwrap();
+        // 番兵キー (MIRROR_TEST_KEY = u64::MAX-1 / 別テストの u64::MAX-3 と衝突しない)
+        let key = u64::MAX - 5;
+        let (nk, nv, dk, dv, d_conv) = (2usize, 4, 8, 8, 4);
+        let conv_len = (2 * nk * dk + nv * dv) * (d_conv - 1); // 192
+        let ssm_len = nv * dk * dv; // 256
+        let mut cache = crate::kv_cache::KvCache::new(1, 64, 256);
+        cache.attach_gdn_slot(0, conv_len, ssm_len);
+
+        // 面に既知パターンを書く: face0 = A (state at target)、face1 = B (state at target+1)
+        let conv_a = pseudo_random(conv_len, 81);
+        let ssm_a = pseudo_random(ssm_len, 82);
+        let conv_b = pseudo_random(conv_len, 83);
+        let ssm_b = pseudo_random(ssm_len, 84);
+        with_mirror_ext(key, 0, 1, 4, 0, cache.epoch(), false, |m, _| {
+            if m.gdn[0].is_none() {
+                let mut g = GdnDev {
+                    conv: [None, None],
+                    ssm: [None, None],
+                    cur: 0,
+                };
+                ok(Scratch::ensure(&mut g.conv[0], conv_len * 4))?;
+                ok(Scratch::ensure(&mut g.conv[1], conv_len * 4))?;
+                ok(Scratch::ensure(&mut g.ssm[0], ssm_len * 4))?;
+                ok(Scratch::ensure(&mut g.ssm[1], ssm_len * 4))?;
+                m.gdn[0] = Some(g);
+            }
+            let gd = m.gdn[0].as_mut().unwrap();
+            ok(gd.conv[0].as_ref().unwrap().copy_from(&conv_a))?;
+            ok(gd.ssm[0].as_ref().unwrap().copy_from(&ssm_a))?;
+            ok(gd.conv[1].as_ref().unwrap().copy_from(&conv_b))?;
+            ok(gd.ssm[1].as_ref().unwrap().copy_from(&ssm_b))?;
+            gd.cur = 0;
+            m.gdn_pos[0] = Some(1);
+            m.gdn_pending = Some(1);
+            Some(())
+        })
+        .unwrap();
+
+        let host = |cache: &mut crate::kv_cache::KvCache| {
+            let (c, s) = cache.gdn_state_mut(0).unwrap();
+            (c.to_vec(), s.to_vec())
+        };
+        let mirror_pending = || {
+            let mirrors = KV_MIRRORS.get().unwrap();
+            let ms = mirrors.lock().unwrap();
+            let idx = ms.iter().position(|(k, _, _)| *k == key).unwrap();
+            ms[idx].1.gdn_pending
+        };
+
+        // ① 成功ステップ後: gdn_pos = 1 == cache.len() (advance 後) → cur 面 = A
+        cache.advance(1);
+        assert_eq!(chain_q35_gdn_flush_pending(&mut cache), Some(()));
+        let (hc, hs) = host(&mut cache);
+        assert_bits_eq(&hc, &conv_a, "①conv は cur 面 (A) と bit 一致");
+        assert_bits_eq(&hs, &ssm_a, "①ssm は cur 面 (A) と bit 一致");
+        assert_eq!(mirror_pending(), None, "①フラッシュ後 pending は解除");
+
+        // ② 層途中失敗: swap 済み (cur = 書き込み面 = state at 2)・cache.len() = 1
+        //    → 1-cur 面 (= state at 1 = A) を回復する
+        cache.advance(1); // len = 2
+        with_mirror_ext(key, 0, 1, 4, 0, cache.epoch(), false, |m, _| {
+            let gd = m.gdn[0].as_mut().unwrap();
+            gd.cur = 1; // 成功ステップが cur を B 面へ交換した直後の想定
+            m.gdn_pos[0] = Some(3);
+            m.gdn_pending = Some(3);
+            Some(())
+        })
+        .unwrap();
+        // cache.len() = 2・gdn_pos = 3 = target+1 → 1-cur = 0 面 = A
+        assert_eq!(chain_q35_gdn_flush_pending(&mut cache), Some(()));
+        let (hc, hs) = host(&mut cache);
+        assert_bits_eq(&hc, &conv_a, "②conv は 1-cur 面 (A) と bit 一致");
+        assert_bits_eq(&hs, &ssm_a, "②ssm は 1-cur 面 (A) と bit 一致");
+
+        // ②' 成功ステップ後 (cur 面が B): gdn_pos = target → cur 面 = B
+        cache.advance(1); // len = 3
+        with_mirror_ext(key, 0, 1, 4, 0, cache.epoch(), false, |m, _| {
+            let gd = m.gdn[0].as_mut().unwrap();
+            gd.cur = 1; // B 面が現行
+            m.gdn_pos[0] = Some(3);
+            m.gdn_pending = Some(3);
+            Some(())
+        })
+        .unwrap();
+        assert_eq!(chain_q35_gdn_flush_pending(&mut cache), Some(()));
+        let (hc, hs) = host(&mut cache);
+        assert_bits_eq(&hc, &conv_b, "②'conv は cur 面 (B) と bit 一致");
+        assert_bits_eq(&hs, &ssm_b, "②'ssm は cur 面 (B) と bit 一致");
+
+        // ⑤ 位置不整合 (正常系では起こらない) → None + pending 破棄
+        with_mirror_ext(key, 0, 1, 4, 0, cache.epoch(), false, |m, _| {
+            m.gdn_pos[0] = Some(7);
+            m.gdn_pending = Some(7);
+            Some(())
+        })
+        .unwrap();
+        assert_eq!(
+            chain_q35_gdn_flush_pending(&mut cache),
+            None,
+            "位置不整合は None (呼び出し側は継続しない)"
+        );
+        assert_eq!(mirror_pending(), None, "⑤不整合時も pending は破棄");
+
+        // ⑥ gdn_pos = None (chain 未走層) → スキップで no-op (ホスト不変)
+        with_mirror_ext(key, 0, 1, 4, 0, cache.epoch(), false, |m, _| {
+            m.gdn_pos[0] = None;
+            m.gdn_pending = Some(1);
+            Some(())
+        })
+        .unwrap();
+        let (hc0, hs0) = host(&mut cache);
+        assert_eq!(chain_q35_gdn_flush_pending(&mut cache), Some(()));
+        let (hc1, hs1) = host(&mut cache);
+        assert_eq!(hc0.len(), hc1.len(), "⑥conv len 不変");
+        assert_eq!(hs0.len(), hs1.len(), "⑥ssm len 不変");
+        assert!(
+            hc0.iter().zip(&hc1).all(|(a, b)| a.to_bits() == b.to_bits())
+                && hs0.iter().zip(&hs1).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "⑥chain 未走層はホスト不変 (bit 一致)"
+        );
+
+        // ③ epoch 不一致 (reset = ホストが正) → pending 破棄の no-op
+        cache.reset(); // GDN スロットは 0 埋め・epoch +1
+        with_mirror_ext(key, 0, 1, 4, 0, cache.epoch(), false, |m, _| {
+            m.gdn_pos[0] = Some(9);
+            m.gdn_pending = Some(9);
+            Some(())
+        })
+        .unwrap();
+        assert_eq!(chain_q35_gdn_flush_pending(&mut cache), Some(()));
+        assert_eq!(mirror_pending(), None, "③epoch 不一致で pending は破棄");
+        let (hc, hs) = host(&mut cache);
+        assert!(hc.iter().all(|&v| v == 0.0) && hs.iter().all(|&v| v == 0.0),
+            "③reset 済みホスト (0 埋め) は旧面で上書きされない");
+
+        // ④ pending 無し / ミラー無し → no-op
+        assert_eq!(chain_q35_gdn_flush_pending(&mut cache), Some(()));
+        let other = crate::kv_cache::KvCache::new(1, 64, 256); // 別 kv_id・ミラー無し
+        let mut other = other;
+        assert_eq!(chain_q35_gdn_flush_pending(&mut other), Some(()));
     }
 }
 
