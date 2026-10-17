@@ -1123,6 +1123,25 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 `cargo test --workspace` **253 passed / 0 failed** (旧 242 + 11)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)・push は人間対応
 
+### qwen35 prefill full attention の GPU バッチ化 — dno_attention_prefill 流用 + 動的 smem opt-in (s48) ✅ (2026-10-17)
+
+> 第48セッション。REPORT_NEXT19 §3.1 の案 C 最小構成 (C1: full attention の GPU バッチ化のみ・GDN は現行維持) を実装。qwen35 の `forward_prefill` Full 分岐で、prepare (KV 書き込み + QK-Norm + RoPE・トークン逐次のまま無変更) 完了後の rayon attend を P17j の `dno_attention_prefill` カーネル 1 発に置き換える。`.cu` / PTX は無変更 (C1-a 方式・PTX 再生成不要)。
+
+**実装**:
+
+- `cuda.rs`: dlsym に `cuDeviceGetAttribute` / `cuFuncSetAttribute` を Option で追加 (シンボルが無い古い driver でも全体を落とさない)。`CudaCtx` 生成時にデバイスの opt-in 上限 (`CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`) を取得し、48KB 既定を超えるなら `dno_attention_prefill` へ `cuFuncSetAttribute` (`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`) で opt-in — qwen35 dh=256 の動的 smem 84.8KB (タイル BQ=64/BK=8) を 1 ブロックで通すため。上限は `ATTN_PF_DYN_SMEM` (既定 48KB) に反映され、smem 必要量 `attn_pf_sh_f(dh)` との比較ゲート 4 箇所 (`prefill_chain_gpu_supported` / `attn_prefill_gpu_supported` / `chain_attention_prefill` / `chain_attention_prefill_dev`) を 48KB 固定から opt-in 済み上限に統一。llama (dh=128 = 43.8KB) は opt-in の有無に依らず不変。`CudaCtx::info()` に opt-in 後の上限表示を追加 (実機確認用)
+- `cuda.rs`: `attn_prefill_gpu_supported(n, dh, t_total)` 新設 — qwen35 prefill attention の事前ゲート (cuda 有効 && `gpu_attention_enabled()` && `n >= gemm_min_m()` (既定 256) && dh 制約 && smem 上限内 && ctx 生成済み)。発動ゲート n≥256 で 1b (m=14) を含む短文は CPU attend のまま bit 不変 (アンカー温存・`maybe_gpu_linear` の GEMM 発動帯域と一致)・`DENNO_GPU_ATTN=0` で全経路現行に戻る (escape hatch 流用・新 env 変数は作らない)
+- `qwen35.rs`: `full_attn_attend_gpu` 新設 (`cfg(feature = "cuda")`) — `chain_attention_prefill` (KV ミラー同期 + `dno_attention_prefill` 1 launch・epoch 引数は s41 から組み込み済み) → `chain_download(CH_ATT)` D2H → sigmoid 出力ゲートをホストで要素ごとに適用 (`dno_attn_gate_mul` は 1 トークン専用 grid=(heads) のため n トークン版は使わない・行独立演算 = rayon 行並列・スレッド数非依存で決定論・C3 でデバイス連結する際に n トークン版カーネルを追加)。成功時は att に gate 適用済み出力を書いて true・失敗時は att 無変更で false → 呼び出し側は既存 rayon attend (s42・トークン逐次経路と bit 一致) に落ちる (prepare は冪等で KV はホスト cache に書き込み済み = 層単位フォールバック・llama P17j と同一設計・GPU 実行時エラーの GPU_BROKEN ラッチ後も静かに CPU へ戻る)。`forward_prefill` Full 分岐は cuda ビルドで GPU 試行 → 不発なら従来経路 (非 cuda ビルドは現行どおり)
+
+**数値影響**: attention のみ緩和枠 (maxabs<1e-3・llama P17j と同一クラス・ユーザー承認済み) — `dno_attention_prefill` は flash 風 online softmax で CPU attend と累積順が異なるため、n≥256 の prefill を含むリクエストで logits が変化し得る (near-tie のカオス的増幅で長期生成テキストも変わり得る = 本節既知現象)。CPU 経路 (`feea9444` / `da0b1f57`)・1b GPU アンカー (`3fb48936`)・案 B の契約 (prefill バッチ == トークン逐次 bit・スレッド数非依存) は全て不変。決定論は維持 (タイル昇順・固定結合順・原子操作なし = スレッド数/起動順に依存しない)。2b GPU アンカー (`d46ab41f`) は本変更で変化し得る → 再取得は人間対応
+
+**テスト** (新規 1 件・`#[ignore]` = 実機 GPU で実行):
+
+- `cuda.rs`: `cuda_attention_prefill_qwen35_shape_vs_cpu_reference` — qwen35 9B 実形状 (dh=256・heads=16・kv_heads=4・group=4) で ①opt-in 成功確認 (上限 ≥ 84.8KB・失敗時は C1-b タイル縮小 + `.cu` 変更/PTX 再生成への切替判断材料) ②ゲート発動条件 (n=276 で発動・`gemm_min_m()-1` で不発) ③CPU 参照との近似一致 (maxabs<1e-3) ④決定論 (同一入力の 2 回起動でビット一致) を検証
+- CPU ビルドの既存テストは全て現行経路のまま (`cfg(not(feature = "cuda"))` 側は att_done = false のみ = rayon attend)
+
+`cargo test --workspace` **253 passed / 0 failed / 18 ignored** (s47 と同一 = CPU 経路無変更の裏取り)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・cuda.rs の 3 件は挿入行による行番号シフトのみ・新規警告ゼロ)。期待効果 (推定・REPORT_NEXT19 §3.1): n≈2.5k の prefill で 33.6s → 16-22s — 実機での opt-in 確認・wall 計測・アンカー再取得は人間対応
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -1144,6 +1163,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] ~~**3B/7Bのb=4実測**~~ → **P17k で実施**(対象は Gemma3n 13,252 tok に変更して完了)
 - [x] ~~**C4: qwen35 デバイス常駐 decode chain (GDN 状態 GPU ミラー)**~~ → **実装完了・CPU 検証まで (2026-10-16)**: decode (n==1) を「埋め込み 1 回 H2D → 全層 GPU 内連結 → 最終 logits 1 回 sync+D2H」にする solo chain (llama P17h と同一骨格・GDN 状態は ping-pong GPU ミラー + staged D2H でホスト正保・失敗時は advance 前 None で従来 per-op 経路にフォールバック)。新カーネル 3 種 (dno_matvec_f32 / dno_qknorm_rope_pi / dno_attn_gate_mul・いずれもビット一致契約)。**kernels_elem.ptx 再生成 + GPU 実機 E2E は人間対応** — 未再生成の間は chain 不発動 (lazy fetch が None をキャッシュ・GPU_BROKEN にならない) で既存経路のまま。§3「C4」節参照。**GPU 実機検証で発覚した segfault は修正済み (2026-10-16・§3「C4 GPU segfault の修正」節参照・実機再検証は人間対応)**: GDN staged D2H の pinned 1 層分確保 (2 層目以降が領域外書き → libcuda 内 SIGSEGV) + full attention k 経路の src_off/ストライド誤り (k セクション外読み・ミラー行外書き)。**segfault 修正後の実機検証で発覚した出力非決定論 (4 リクエスト全別テキスト) も修正済み (2026-10-16・§3「C4 出力非決定論の修正」節参照・実機再検証は人間対応)**: ステップ中途の grow 再確保 (CH_QKV/aq/CH_ATT) が grouped GEMV 等の in-flight バッファを解放し dno_gdn_scan が未初期化 VRAM を読む競合 → ステップ開始時の一括事前確保 (kv_stage/gdn_stage と同一規約・数値経路は無変更)
 - [x] ~~**2b (283tok prefill) 出力 2 値分岐の解明と修正**~~ → **完了 (2026-10-16 第41〜42セッション)**: 根因は GPU KV ミラーが同一 kv_id (スロット) 再利用時に前会話の行 [0..have) を正規行として再利用すること (短→長の切替直後の 1 リクエストのみ発現・スロット割当の揺れで 2 値に分岐・分岐 md5 `3a1fbabe`/`d46ab41f` はミラー行再利用の証拠)。KvCache にコンテンツ世代 (epoch) を導入し with_mirror_ext で検証・全層無効化。§3「GPU KV ミラーのコンテンツ世代 (epoch) 検証」節参照。実機での分岐消滅確認 (1b→2b シーケンス再実行) は人間対応
+- [x] ~~**qwen35 prefill full attention の GPU バッチ化 (案 C・C1 最小構成・REPORT_NEXT19 §3.1)**~~ → **実装完了・CPU 検証まで (2026-10-17・s48)**: §3「qwen35 prefill full attention の GPU バッチ化」節参照。`dno_attention_prefill` 流用 (モデル非依存・`.cu`/PTX 無変更) + 動的 smem の `cuFuncSetAttribute` opt-in (C1-a)。発動ゲート n≥gemm_min_m() (既定 256) で 1b/CPU 経路の bit 温存・`DENNO_GPU_ATTN=0` escape hatch 流用。実機での opt-in 確認・2b アンカー再取得・wall 計測は人間対応
 
 ### 運用・周辺
 
