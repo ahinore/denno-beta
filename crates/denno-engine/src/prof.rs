@@ -25,11 +25,12 @@ pub const LM_HEAD: usize = 10; // 最終 logits 投影 (vocab 次元 matvec)
 pub const SAMPLER: usize = 11; // サンプリング
 pub const DETOK: usize = 12; // トークン→テキスト デコード (ストリーミング差分用)
 pub const QKNORM: usize = 13; // QK-Norm (Qwen3 のみ。q/k の head_dim 単位 RMSNorm)
-pub const N_OPS: usize = 14;
+pub const D2H: usize = 14; // s49: デバイス→ホスト戻し (chain の logits download + staged 状態フラッシュ)
+pub const N_OPS: usize = 15;
 
 const NAMES: [&str; N_OPS] = [
     "embed", "rmsnorm", "rope", "qkv_proj", "attn_core", "o_proj", "gate_up_proj", "swiglu",
-    "down_proj", "final_norm", "lm_head", "sampler", "detok", "qk_norm",
+    "down_proj", "final_norm", "lm_head", "sampler", "detok", "qk_norm", "d2h_state",
 ];
 
 static NS: [AtomicU64; N_OPS] = {

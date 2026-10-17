@@ -1593,6 +1593,197 @@ fn linear_gemm(
 }
 
 // ===========================================================================
+// s49: fp32 lm_head の GPU 化 (per-op・dno_matvec_f32 流用・.cu/PTX 無変更)
+// ===========================================================================
+// serve 既定の fp32 モード (--quant fp32) では lm_head が Linear::F32 のまま
+// (untied: output.weight / tied: embed) で CPU matvec (tensor::matvec_bt) が
+// decode の主律速だった (s45 実機計測: decode 29ms/step の 46.3% = 19.6ms/step)。
+// int8 モードの lm_head は P17b (maybe_gpu_linear) / C4 chain
+// (chain_linear_grouped) のいずれでも既に GPU・ビット一致のため本節では触れない。
+//
+// 発動条件: DENNO_CUDA=1 (cuda_enabled) かつ kernels_elem.ptx に dno_matvec_f32
+// が収録済み (3931b70 で再生成済み)。カーネルは C4 chain の beta/alpha 制御投影用
+// dno_matvec_f32 を**そのまま**流用 (.cu/PTX 変更なし):
+//   - 出力 j = blockIdx.x ごとに d を昇順で
+//     s = __fadd_rn(s, __fmul_rn(h[d], row[d])) と累積 = tensor::matvec_bt の
+//     `s += a[d] * row[d]` (積と加算の丸め分離・d 逐次) と**ビット一致**
+//   - カーネルは block 内の全スレッドが同一計算をする実装のため block=(1,1,1)
+//     で起動して冗長スレッドを排除する (chain_q35_ctl_f32 の block=(128) は
+//     n=数十が前提。vocab n=151936 では 128 倍の冗長演算になる)。grid.x は
+//     2^31-1 まで合法なので n>65535 もそのまま扱える (65535 ガードは chain 側
+//     呼び出し規約のみでハードウェア限界ではない)。
+// - 失敗時は本経路のみのスコープドラッチ (LMV32_BROKEN) で恒久 CPU フォール
+//   バック (GPU_BROKEN にはしない = int8 経路への影響ゼロ)。PTX 未収録は
+//   q35_fns と同一の None キャッシュ規約 (ラッチ無し・次回プロセス起動まで
+//   不発動)。数値はどちらの経路でも同一 (bit 一致) なのでフォールバックは
+//   出力を変えない。
+// - 重みは呼び出し側が渡すモデルロード毎に一意な key (qwen35 の mid 由来) で
+//   グローバル登録し 1 回だけ同期 H2D する (fp32 9B untied で ~2.4GB・初回 1 回
+//   のみ。以後は h 16KB の H2D + logits 0.6MB の D2H + sync ×1/ステップ)。
+
+/// s49: fp32 lm_head 経路のスコープド恒久ラッチ (GPU_BROKEN とは独立。
+/// 本経路の失敗で int8 経路を落とさない)。
+static LMV32_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// s49: dno_matvec_f32 のハンドル (lazy fetch・未収録 PTX では None をキャッシュ
+/// して恒久不発動 = q35_fns と同一規約・GPU_BROKEN にはしない)。
+/// 生ハンドルの静的保持は Q35Fns と同一の規約 (所有権移動なし・driver が
+/// スレッド安全に管理) で Send/Sync を与える。
+#[derive(Clone, Copy)]
+struct Lmv32Fn(CUfunction);
+unsafe impl Send for Lmv32Fn {}
+unsafe impl Sync for Lmv32Fn {}
+
+static LMV32_FNS: OnceLock<Option<Lmv32Fn>> = OnceLock::new();
+
+/// s49: fp32 重み (lm_head / tied embed) のデバイスキャッシュ。key はモデル
+/// ロード毎に一意 (qwen35 の mid 由来)。無ければ同期 H2D でアップロードし
+/// 初回 1 回のみ走る (eviction 無し = P17b 重みレジストリと同一方針)。
+static LMV32_W: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, DevBuffer>>> =
+    OnceLock::new();
+
+/// s49: fp32 lm_head の matvec (m==1) を GPU で実行する (CPU とビット一致)。
+/// 戻り値 None = CPU パスを使うこと (無効/PTX 未収録/実行時エラー)。
+/// key: モデルロード毎に一意 (untied と tied で別値にすること)。
+pub fn maybe_gpu_matvec_f32(
+    key: u64,
+    w: &[f32],
+    a: &[f32],
+    k: usize,
+    n: usize,
+) -> Option<Vec<f32>> {
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering as AO;
+    use std::sync::Mutex;
+    if !cuda_enabled() || LMV32_BROKEN.load(AO::Relaxed) {
+        return None;
+    }
+    if k == 0
+        || n == 0
+        || w.len() != k * n
+        || a.len() != k
+        || k > i32::MAX as usize
+        || n > i32::MAX as usize
+    {
+        return None;
+    }
+    let ctx = shared_ctx()?;
+    if let Err(e) = ctx.make_current() {
+        tracing::error!("CUDA cuCtxSetCurrent failed (fp32 lm_head), using CPU: {e:#}");
+        LMV32_BROKEN.store(true, AO::Relaxed);
+        return None;
+    }
+    // カーネルハンドル (lazy fetch・None キャッシュ = PTX 未収録はラッチ無し)
+    let f = LMV32_FNS
+        .get_or_init(|| {
+            let lib = lib().ok()?;
+            let mut f: CUfunction = std::ptr::null_mut();
+            let r = unsafe {
+                (lib.module_get_function)(
+                    &mut f,
+                    ctx.module_elem,
+                    b"dno_matvec_f32\0".as_ptr() as *const c_char,
+                )
+            };
+            if r != 0 {
+                None
+            } else {
+                Some(Lmv32Fn(f))
+            }
+        })
+        .as_ref()?
+        .0;
+    // 重みアップロード (初回 1 回・同期。他スレッドとの二重アップロード防止に
+    // ロック内で行う)
+    let reg = LMV32_W.get_or_init(|| Mutex::new(HashMap::new()));
+    let wp = {
+        let mut map = match reg.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::error!("CUDA fp32 lm_head weight registry poisoned, using CPU");
+                LMV32_BROKEN.store(true, AO::Relaxed);
+                return None;
+            }
+        };
+        match map.get(&key) {
+            Some(b) if b.bytes() == w.len() * 4 => b.ptr(),
+            _ => match DevBuffer::from_slice(w) {
+                Ok(buf) => {
+                    tracing::info!(
+                        "CUDA fp32 lm_head weight upload: k={k} n={n} ({:.1} MB)",
+                        (k * n * 4) as f64 / 1e6
+                    );
+                    let p = buf.ptr();
+                    map.insert(key, buf);
+                    p
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "CUDA fp32 lm_head weight upload failed, using CPU permanently: {e:#}"
+                    );
+                    LMV32_BROKEN.store(true, AO::Relaxed);
+                    return None;
+                }
+            },
+        }
+    };
+    // 実行: H2D(h) → dno_matvec_f32 → D2H(out) → sync ×1 (linear_pinned と同一)
+    let lib = match lib() {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("CUDA lib load failed (fp32 lm_head), using CPU: {e:#}");
+            LMV32_BROKEN.store(true, AO::Relaxed);
+            return None;
+        }
+    };
+    let r = SCRATCH.with(|cell| -> Result<Vec<f32>> {
+        let mut s = cell.borrow_mut();
+        let Scratch { x, out, hx, ho, .. } = &mut *s;
+        let bytes_x = k * 4;
+        let bytes_out = n * 4;
+        Scratch::ensure(x, bytes_x)?;
+        Scratch::ensure(out, bytes_out)?;
+        Scratch::ensure_pin(hx, bytes_x)?;
+        Scratch::ensure_pin(ho, bytes_out)?;
+        let (dx, dout) = (x.as_ref().unwrap(), out.as_ref().unwrap());
+        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        hx.as_mut_slice::<f32>()[..k].copy_from_slice(a);
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(dx.ptr(), hx.ptr as *const c_void, bytes_x, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync",
+            )?;
+            let (mut ph, mut pw, mut po) = (dx.ptr(), wp, dout.ptr());
+            let (mut kc, mut nc) = (k as c_int, n as c_int);
+            let mut args = [
+                &mut ph as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            // 1 block = 1 出力 (カーネルが block 内全スレッドで同一計算するため
+            // block=(1,1,1)。grid.x は 2^31-1 まで合法 = vocab 規模もそのまま)
+            ctx.launch_async(f, (n as u32, 1, 1), (1, 1, 1), 0, &mut args)?;
+            check(
+                (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync",
+            )?;
+        }
+        ctx.sync()?;
+        Ok(ho.as_slice::<f32>()[..n].to_vec())
+    });
+    match r {
+        Ok(out) => Some(out),
+        Err(e) => {
+            tracing::error!("CUDA fp32 lm_head matvec failed, using CPU permanently: {e:#}");
+            LMV32_BROKEN.store(true, AO::Relaxed);
+            None
+        }
+    }
+}
+
+// ===========================================================================
 // P17d: decode chain (隠れ状態デバイス常駐 + 要素演算融合)
 // ===========================================================================
 // solo decode (n==1) の 1 ステップを
@@ -4943,6 +5134,55 @@ mod tests {
         let got2 = run_gpu(&kc, &vc);
         assert_eq!(got, got2, "prefill attention (n={n}) が非決定論的");
         println!("prefill attention large n=({n}) determinism OK");
+    }
+
+    /// s49: fp32 lm_head GPU 経路 (maybe_gpu_matvec_f32) が tensor::matvec_bt と
+    /// ビット一致すること。dno_matvec_f32 (C4 chain の beta/alpha 制御投影用
+    /// カーネル・.cu/PTX 無変更で流用) を block=(1,1,1)・grid=(n,1,1) で起動する:
+    /// ①lm_head 実形状相当 (k=4096) での bit 一致 ②n>65535 (vocab 規模) でも
+    /// grid.x が正しく機能する (65535 は chain 側呼び出し規約のみのガード) こと
+    /// ③決定論 (同一入力 2 回起動でビット一致) ④小さい k (境界) でも一致。
+    #[test]
+    #[ignore] // GPU が必要: cargo test --release --features cuda -- --ignored
+    fn cuda_matvec_f32_lmhead_bit_exact_vs_cpu() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let _ctx = CudaCtx::new().unwrap();
+        // PTX 未再生成 (dno_matvec_f32 未収録) の場合は不発で CPU に落ちるため
+        // 最初の呼び出しで発動を明示して fail させる (PTX 再生成後の再実行が前提)。
+        for (k, n, seed) in [
+            (4096usize, 4096usize, 71),   // lm_head 実形状相当 (k=4096)
+            (4096, 131_072 + 17, 72),     // n > 65535 (vocab 規模) の grid.x 検証
+            (8, 1, 73),                   // 最小境界 (n=1・小 k)
+            (128, 511, 74),               // 端数 n
+        ] {
+            let w = pseudo_random(k * n, seed);
+            let a = pseudo_random(k, seed + 100);
+            let ref_cpu = tensor::matvec_bt(&a, &w, k, n);
+            let got = maybe_gpu_matvec_f32(9_000_001, &w, &a, k, n)
+                .expect("GPU 経路が不発 (kernels_elem.ptx に dno_matvec_f32 が無い/PTX 未再生成の可能性)");
+            assert_eq!(
+                got.len(),
+                ref_cpu.len(),
+                "k={k} n={n}: 出力長不一致"
+            );
+            for (i, (g, r)) in got.iter().zip(ref_cpu.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    r.to_bits(),
+                    "k={k} n={n}: logits[{i}] が bit 不一致 (g={g} r={r})"
+                );
+            }
+            // 決定論: 同一入力の 2 回起動でビット一致
+            let got2 = maybe_gpu_matvec_f32(9_000_001, &w, &a, k, n).unwrap();
+            for (g, g2) in got.iter().zip(got2.iter()) {
+                assert_eq!(g.to_bits(), g2.to_bits(), "k={k} n={n}: 非決定論");
+            }
+            println!("cuda matvec_f32 k={k} n={n}: bit exact OK");
+        }
+        // ゲート: 形状不正 (w.len() != k*n) は None (CPU フォールバック) であること
+        let w = vec![0.0f32; 10];
+        assert!(maybe_gpu_matvec_f32(9_000_002, &w, &[0.0; 4], 4, 3).is_none());
     }
 
     /// s48 (C1): qwen35 形状 (dh=256・heads=16・kv_heads=4・group=4 = 実 9B の
