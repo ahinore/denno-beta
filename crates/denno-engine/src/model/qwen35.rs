@@ -670,6 +670,80 @@ impl Qwen35 {
         }
     }
 
+    /// s48 (C1): full attention prefill の attend を GPU カーネル 1 発
+    /// (dno_attention_prefill) で実行する。prepare (KV 書き込み + QK-Norm + RoPE)
+    /// は呼び出し側がトークン逐次で完了済みの前提 (KV はホスト cache に書き込み
+    /// 済み → KV ミラー同期は chain 内で行われ、失敗時もホスト状態は不変で冪等
+    /// なため forward 全体の再実行は不要 — llama P17j と同一の設計)。
+    /// 成功時は att に sigmoid 出力ゲートまで適用した結果を書いて true を返す。
+    /// 失敗時は att を変更せず false を返す (呼び出し側が既存 CPU attend に落ちる
+    /// = 数値は現行どおり bit 一致)。GPU 実行時エラーで GPU_BROKEN が立った場合
+    /// も以後の経路は CPU に静かに戻る (llama と同一挙動)。
+    /// 数値: カーネルは flash 風 online softmax (タイル昇順・固定結合順・原子操作
+    /// なし = 決定論・スレッド数/起動順に依存しない) で CPU attend とは厳密には
+    /// 異なるが attention 緩和枠内 (maxabs<1e-3・llama P17j と同一クラス・承認済み)。
+    /// sigmoid 出力ゲートはカーネル外: 既存の dno_attn_gate_mul は 1 トークン専用
+    /// (grid=(heads)) なため、D2H 後にホストで要素ごとに適用する (行独立 = 決定論
+    /// 維持・C3 でデバイス連結する際に n トークン版カーネルを追加する)。
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn full_attn_attend_gpu(
+        &self,
+        qg: &[f32],
+        q: &[f32],
+        cache: &mut KvCache,
+        li: usize,
+        pos0: usize,
+        n: usize,
+        att: &mut [f32],
+    ) -> bool {
+        let heads = self.heads;
+        let dh = self.dh;
+        let kv_dim = self.kv_heads * dh;
+        let group = heads / self.kv_heads;
+        let t_total = pos0 + n;
+        if !crate::cuda::attn_prefill_gpu_supported(n, dh, t_total) {
+            return false;
+        }
+        if crate::cuda::chain_attention_prefill(
+            cache.kv_id(),
+            li,
+            self.layers.len(),
+            q,
+            cache,
+            pos0,
+            n,
+            t_total,
+            group,
+            dh,
+            kv_dim,
+            1.0 / (dh as f32).sqrt(),
+        )
+        .is_none()
+        {
+            return false;
+        }
+        let mut ga = match crate::cuda::chain_download(crate::cuda::CH_ATT, n * heads * dh) {
+            Some(v) => v,
+            None => return false,
+        };
+        // sigmoid 出力ゲート: att[t] /= 1+exp(-gate[t]) — CPU attend
+        // (full_attn_attend_head) と同一の要素ごと演算 (行独立 → 行並列・
+        // スレッド数非依存で決定論)。
+        ga.par_chunks_exact_mut(dh)
+            .enumerate()
+            .for_each(|(t, att_head)| {
+                let i = t / heads;
+                let hh = t % heads;
+                let gate = &qg[i * heads * 2 * dh + hh * 2 * dh + dh..][..dh];
+                for (d, av) in att_head.iter_mut().enumerate() {
+                    *av /= 1.0 + (-gate[d]).exp();
+                }
+            });
+        att.copy_from_slice(&ga);
+        true
+    }
+
     /// GDN 層の 1 トークン forward → attn 出力 [e]。
     fn gdn_attn_token(&self, lg: &GdnLayer, h: &[f32], cache: &mut KvCache, li: usize) -> Vec<f32> {
         let qkv = lg.qkv_w.apply_bt(h, 1);
@@ -1033,29 +1107,42 @@ impl Qwen35 {
                             &mut q[i * heads * dh..(i + 1) * heads * dh],
                         );
                     }
-                    // s42: attend を (i, head) 並列で実行 (旧実装はトークン逐次 —
-                    // O(n²) の単スレッド部分が長 prefill の律速)。1 head 分の
-                    // scores → softmax → probs@V → gate はトークン逐次経路と同一の
-                    // 演算列のため bit-exact・rayon スレッド数非依存 (決定論検証:
-                    // qwen38_27b_shape_prefill_thread_count_bit_exact)。scores は
-                    // タスクローカル (共有スクラッチなし・書き込み先は各タスク専属の
-                    // att チャンクのみ)。
-                    let (kcr, vcr) = cache.kv_bufs_ref(li);
-                    att.par_chunks_exact_mut(dh)
-                        .enumerate()
-                        .for_each(|(t, att_head)| {
-                            let i = t / heads;
-                            let hh = t % heads;
-                            self.full_attn_attend_head(
-                                &qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
-                                &q[i * heads * dh..(i + 1) * heads * dh],
-                                kcr,
-                                vcr,
-                                pos0 + i + 1,
-                                hh,
-                                att_head,
-                            );
-                        });
+                    // s48 (C1): cuda ビルドでは attend を GPU バッチ (dno_attention_prefill
+                    // 1 発 + D2H 後のホスト sigmoid ゲート) に置き換えて試行する。
+                    // prepare は上記のとおりトークン逐次のまま (KV はホスト cache に
+                    // 書き込み済み = 冪等) で、chain 失敗時は下の既存 rayon attend に
+                    // 落ちる (数値は現行どおり bit 一致・発動ゲート n>=gemm_min_m()
+                    // で短文は CPU のまま・`DENNO_GPU_ATTN=0` で全経路現行に戻る)。
+                    #[cfg(feature = "cuda")]
+                    let att_done =
+                        self.full_attn_attend_gpu(&qg, &q, cache, li, pos0, n, &mut att);
+                    #[cfg(not(feature = "cuda"))]
+                    let att_done = false;
+                    if !att_done {
+                        // s42: attend を (i, head) 並列で実行 (旧実装はトークン逐次 —
+                        // O(n²) の単スレッド部分が長 prefill の律速)。1 head 分の
+                        // scores → softmax → probs@V → gate はトークン逐次経路と同一の
+                        // 演算列のため bit-exact・rayon スレッド数非依存 (決定論検証:
+                        // qwen38_27b_shape_prefill_thread_count_bit_exact)。scores は
+                        // タスクローカル (共有スクラッチなし・書き込み先は各タスク専属の
+                        // att チャンクのみ)。
+                        let (kcr, vcr) = cache.kv_bufs_ref(li);
+                        att.par_chunks_exact_mut(dh)
+                            .enumerate()
+                            .for_each(|(t, att_head)| {
+                                let i = t / heads;
+                                let hh = t % heads;
+                                self.full_attn_attend_head(
+                                    &qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
+                                    &q[i * heads * dh..(i + 1) * heads * dh],
+                                    kcr,
+                                    vcr,
+                                    pos0 + i + 1,
+                                    hh,
+                                    att_head,
+                                );
+                            });
+                    }
                     let out = fl.o_w.apply_bt_rows(&att, n);
                     // s42: 残差加算は行独立 → 行並列 (bit-exact)
                     x.par_chunks_exact_mut(e)

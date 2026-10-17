@@ -79,6 +79,8 @@ type FnCuMemcpyDtoHAsyncV2 =
     unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult;
 type FnCuMemcpyDtoDAsyncV2 =
     unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult;
+type FnCuDeviceGetAttribute = unsafe extern "C" fn(*mut c_int, c_int, CUdevice) -> CUresult;
+type FnCuFuncSetAttribute = unsafe extern "C" fn(CUfunction, c_int, c_int) -> CUresult;
 type FnCuLaunchKernel = unsafe extern "C" fn(
     CUfunction,
     u32,
@@ -115,6 +117,10 @@ struct CudaLib {
     memcpy_htod_async: FnCuMemcpyHtoDAsyncV2,
     memcpy_dtoh_async: FnCuMemcpyDtoHAsyncV2,
     memcpy_dtod_async: FnCuMemcpyDtoDAsyncV2,
+    // s48 (C1-a): 動的 smem の opt-in (cuFuncSetAttribute)。CUDA 9.0 以降に存在
+    // するが、dlsym 失敗でも全体を落とさないよう Option (無ければ 48KB 既定のまま)。
+    device_get_attribute: Option<FnCuDeviceGetAttribute>,
+    func_set_attribute: Option<FnCuFuncSetAttribute>,
     launch: FnCuLaunchKernel,
 }
 
@@ -125,6 +131,17 @@ unsafe fn sym(handle: *mut c_void, name: &'static str) -> Result<*mut c_void> {
         bail!("dlsym({name}) が失敗 — driver が古い/不完全の可能性");
     }
     Ok(p)
+}
+
+/// dlsym だが失敗を許容する (オプションシンボル用)。
+unsafe fn sym_opt(handle: *mut c_void, name: &'static str) -> Option<*mut c_void> {
+    let cname = std::ffi::CString::new(name).unwrap();
+    let p = dlsym(handle, cname.as_ptr());
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
 }
 
 unsafe fn open_libcuda() -> Result<CudaLib> {
@@ -153,6 +170,10 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
         memcpy_htod_async: std::mem::transmute(sym(handle, "cuMemcpyHtoDAsync_v2")?),
         memcpy_dtoh_async: std::mem::transmute(sym(handle, "cuMemcpyDtoHAsync_v2")?),
         memcpy_dtod_async: std::mem::transmute(sym(handle, "cuMemcpyDtoDAsync_v2")?),
+        device_get_attribute: sym_opt(handle, "cuDeviceGetAttribute")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuDeviceGetAttribute>(p) }),
+        func_set_attribute: sym_opt(handle, "cuFuncSetAttribute")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuFuncSetAttribute>(p) }),
         launch: std::mem::transmute(sym(handle, "cuLaunchKernel")?),
     })
 }
@@ -304,6 +325,9 @@ pub struct CudaCtx {
     f_attn: CUfunction,
     // P17j: prefill attention (flash 風 online softmax・exactness 緩和・ユーザー承認)
     f_attn_pf: CUfunction,
+    // s48 (C1-a): dno_attention_prefill の動的 smem 上限 (bytes)。opt-in 成功時は
+    // デバイスの opt-in 上限・失敗時は 48KB 既定 (ATTN_PF_DYN_SMEM にも反映)。
+    attn_pf_dyn_smem: usize,
     // P17h: qkv rope + bias (CPU rope_row とビット一致)
     f_rope: CUfunction,
     // P17k ステップ 5: prefill 用行並列 rope (qkv→rope→attention 連続化)
@@ -426,6 +450,21 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_attn_pf, module_elem, b"dno_attention_prefill\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_attention_prefill)",
             )?;
+            // s48 (C1-a): 動的 smem の opt-in 試行。デバイスの opt-in 上限を取得し、
+            // 48KB を超えるなら dno_attention_prefill へ設定する (qwen35 dh=256 =
+            // 84.8KB を通すため)。失敗しても ctx 生成は続行 (48KB 既定のまま =
+            // qwen35 prefill attention はゲートで CPU へ静かにフォールバック)。
+            let mut attn_pf_dyn_smem: usize = ATTN_PF_SMEM_DEFAULT;
+            if let (Some(dev_attr), Some(fn_attr)) = (lib.device_get_attribute, lib.func_set_attribute) {
+                let mut optin: c_int = 0;
+                if (dev_attr)(&mut optin, CU_DEV_ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, dev) == 0
+                    && optin as usize > attn_pf_dyn_smem
+                    && (fn_attr)(f_attn_pf, CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES, optin) == 0
+                {
+                    attn_pf_dyn_smem = optin as usize;
+                }
+            }
+            ATTN_PF_DYN_SMEM.store(attn_pf_dyn_smem, std::sync::atomic::Ordering::Relaxed);
             let mut f_rope: CUfunction = std::ptr::null_mut();
             check(
                 (lib.module_get_function)(&mut f_rope, module_elem, b"dno_rope_qkv\0".as_ptr() as *const c_char),
@@ -491,6 +530,7 @@ impl CudaCtx {
                 f_expf,
                 f_attn,
                 f_attn_pf,
+                attn_pf_dyn_smem,
                 f_rope,
                 f_rope_pf,
                 f_rope_b,
@@ -505,7 +545,14 @@ impl CudaCtx {
 
     /// "NVIDIA GeForce RTX 5090 (sm_120, driver 13010)" 形式の情報
     pub fn info(&self) -> String {
-        format!("{} (sm_{}{}, driver {})", self.name, self.cc.0, self.cc.1, self.driver_ver)
+        format!(
+            "{} (sm_{}{}, driver {}, attn_pf dyn smem {}KB)",
+            self.name,
+            self.cc.0,
+            self.cc.1,
+            self.driver_ver,
+            self.attn_pf_dyn_smem / 1024
+        )
     }
 
     pub fn device(&self) -> c_int {
@@ -1587,6 +1634,37 @@ const CH_SLOTS: usize = 10;
 const ATTN_PF_BQ: usize = 64;
 const ATTN_PF_BK: usize = 8;
 
+// s48 (C1-a): dno_attention_prefill の動的 smem。カーネル側は extern __shared__
+// の静的宣言が無く launch 時の sharedMemBytes をそのまま使うため、48KB 既定上限は
+// ホスト側ゲートだけの制約だった。qwen35 (dh=256) は 1 ブロック 84.8KB を要求し
+// 48KB を超えるため、モジュールロード時に cuFuncSetAttribute
+// (CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES) で opt-in して引き上げる。
+// 実機で opt-in 不可 (デバイスの opt-in 上限 < 必要量・古い driver でシンボル無し等)
+// の場合も致命的ではない: 上限は 48KB のまま = qwen35 prefill attention は
+// attn_prefill_gpu_supported ゲートで静かに CPU へフォールバックし、llama (dh=128
+// = 43.8KB) は従来どおり発動する。.cu / PTX は無変更 (C1-b のタイル縮小が必要に
+// なった場合のみ .cu 変更 + PTX 再生成が発生する)。
+const ATTN_PF_SMEM_DEFAULT: usize = 48 * 1024;
+/// CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+const CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
+/// CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN
+const CU_DEV_ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: c_int = 97;
+static ATTN_PF_DYN_SMEM: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(ATTN_PF_SMEM_DEFAULT);
+
+/// dno_attention_prefill が許容する動的 smem の上限 (bytes)。既定 48KB・
+/// CudaCtx 生成時の opt-in (cuFuncSetAttribute) 成功時はデバイスの opt-in 上限。
+pub fn attn_pf_dynamic_smem_limit() -> usize {
+    ATTN_PF_DYN_SMEM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// dno_attention_prefill の動的 smem 必要量 (float 数)。
+/// q_sm [BQ][dh+1] + k_sm [BK][dh+1] + v_sm [BK][dh+1] + s_sm [BQ*BK]
+/// + corr_sm [BQ] + mnew_sm [BQ] (kernels_elem.cu と同期すること)。
+fn attn_pf_sh_f(dh: usize) -> usize {
+    (ATTN_PF_BQ + 2 * ATTN_PF_BK) * (dh + 1) + ATTN_PF_BQ * ATTN_PF_BK + 2 * ATTN_PF_BQ
+}
+
 struct ChainScratch {
     bufs: Vec<Option<DevBuffer>>,
     pin_x: Option<PinMem>,  // x / att アップロード用 (使用間に必ず sync が挟まる)
@@ -1712,10 +1790,42 @@ pub fn prefill_chain_gpu_supported(e: usize, dh: usize, t_total: usize) -> bool 
     if dh < ATTN_PF_BQ || dh > 1024 || t_total == 0 || t_total > 65535 {
         return false;
     }
-    let sh_f = (ATTN_PF_BQ + 2 * ATTN_PF_BK) * (dh + 1)
-        + ATTN_PF_BQ * ATTN_PF_BK
-        + 2 * ATTN_PF_BQ;
-    if sh_f * 4 > 48 * 1024 {
+    // s48 (C1-a): 48KB 固定 → opt-in 済み上限 (既定は 48KB・llama dh=128 は不変)
+    if attn_pf_sh_f(dh) * 4 > attn_pf_dynamic_smem_limit() {
+        return false;
+    }
+    true
+}
+
+/// s48 (C1): qwen35 prefill の full attention を GPU バッチ (dno_attention_prefill
+/// 1 発) にしてよいかの事前ゲート。構造的に確実に失敗する形状を開始前に弾き、
+/// GPU_BROKEN ラッチの無駄な発火を防ぐ (llama B1 の prefill_chain_gpu_supported
+/// と同一の趣旨)。qwen35 forward_prefill の Full 分岐から呼ばれる。
+/// - 発動ゲート: `n >= gemm_min_m()` (既定 256) — 短文 (1b 含む m≤255) は CPU
+///   attend のまま bit 不変 (アンカー温存・`maybe_gpu_linear` の GEMM 発動帯域と
+///   一致させる設計)
+/// - `DENNO_GPU_ATTN=0` で全経路現行に戻る (escape hatch 流用・新 env は作らない)
+/// - 動的 smem: dh=256 は 84.8KB で 48KB 既定上限を超える → CudaCtx 生成時の
+///   cuFuncSetAttribute opt-in が成功している場合だけ true (失敗なら false =
+///   CPU attend フォールバック・llama は影響を受けない)
+pub fn attn_prefill_gpu_supported(n: usize, dh: usize, t_total: usize) -> bool {
+    if !cuda_enabled() || !gpu_attention_enabled() {
+        return false;
+    }
+    if n == 0 || t_total == 0 || n < gemm_min_m() {
+        return false;
+    }
+    if dh < ATTN_PF_BQ || dh > 1024 {
+        return false;
+    }
+    if attn_pf_sh_f(dh) * 4 > attn_pf_dynamic_smem_limit() {
+        return false;
+    }
+    // opt-in の結果 (ATTN_PF_DYN_SMEM) は CudaCtx 生成時に確定する。ここまで到達
+    // したということは cuda 有効なので、未初期化ならここで生成する (直後の
+    // chain_attention_prefill 内部でも生成されるため前倒しで生成するだけ = 新規
+    // の副作用は無い)。生成失敗なら CPU フォールバック (GPU_BROKEN にはしない)。
+    if shared_ctx().is_none() {
         return false;
     }
     true
@@ -2307,14 +2417,12 @@ pub fn chain_attention_prefill(
         return None;
     }
     // カーネル制約: block = dh スレッドが PF_BQ 行 owner + 出力次元 d=tid を
-    // 担当するため dh >= PF_BQ、smem <= 48KB。
+    // 担当するため dh >= PF_BQ。動的 smem は 48KB 既定上限を opt-in 済み上限
+    // (s48 C1-a: qwen35 dh=256 = 84.8KB は cuFuncSetAttribute で通す) に引き上げ。
     if dh < ATTN_PF_BQ || dh > 1024 {
         return None;
     }
-    let sh_f = (ATTN_PF_BQ + 2 * ATTN_PF_BK) * (dh + 1)
-        + ATTN_PF_BQ * ATTN_PF_BK
-        + 2 * ATTN_PF_BQ;
-    if sh_f * 4 > 48 * 1024 {
+    if attn_pf_sh_f(dh) * 4 > attn_pf_dynamic_smem_limit() {
         return None;
     }
     let heads = q.len() / (n * dh);
@@ -2390,7 +2498,7 @@ pub fn chain_attention_prefill(
                 // K/V を同時実行ブロック間で共有し L2 ヒット率を上げる
                 (n.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1),
                 (dh as u32, 1, 1),
-                (sh_f * 4) as u32,
+                (attn_pf_sh_f(dh) * 4) as u32,
                 &mut args,
             )
         })
@@ -3297,14 +3405,11 @@ pub fn chain_attention_prefill_dev(
     if n == 0 || t_total == 0 || group == 0 || t_total > 65535 {
         return None;
     }
-    // カーネル制約: chain_attention_prefill と同一
+    // カーネル制約: chain_attention_prefill と同一 (s48 C1-a: smem 上限は opt-in 済み)
     if dh < ATTN_PF_BQ || dh > 1024 {
         return None;
     }
-    let sh_f = (ATTN_PF_BQ + 2 * ATTN_PF_BK) * (dh + 1)
-        + ATTN_PF_BQ * ATTN_PF_BK
-        + 2 * ATTN_PF_BQ;
-    if sh_f * 4 > 48 * 1024 {
+    if attn_pf_sh_f(dh) * 4 > attn_pf_dynamic_smem_limit() {
         return None;
     }
     let qn = heads.checked_mul(dh)?;
@@ -3351,7 +3456,7 @@ pub fn chain_attention_prefill_dev(
                 // K/V を同時実行ブロック間で共有し L2 ヒット率を上げる
                 (n.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1),
                 (dh as u32, 1, 1),
-                (sh_f * 4) as u32,
+                (attn_pf_sh_f(dh) * 4) as u32,
                 &mut args,
             )
         })
@@ -4838,6 +4943,93 @@ mod tests {
         let got2 = run_gpu(&kc, &vc);
         assert_eq!(got, got2, "prefill attention (n={n}) が非決定論的");
         println!("prefill attention large n=({n}) determinism OK");
+    }
+
+    /// s48 (C1): qwen35 形状 (dh=256・heads=16・kv_heads=4・group=4 = 実 9B の
+    /// full attention) での prefill attention GPU バッチ経路。動的 smem が 84.8KB
+    /// (既定 48KB 上限超え) であるため C1-a の opt-in (CudaCtx 生成時の
+    /// cuFuncSetAttribute) が必須 — opt-in が実機で不可の場合、上限が 48KB のまま
+    /// 残り本テストは fail する (C1-b タイル縮小 + .cu 変更/PTX 再生成への切替判断
+    /// 材料)。CPU 参照との近似一致 (maxabs<1e-3・attention 緩和枠) + 決定論
+    /// (同一入力の 2 回起動でビット一致) + ゲートの発動条件 (n>=gemm_min_m) を検証。
+    #[test]
+    #[ignore] // GPU が必要: cargo test --release --features cuda -- --ignored
+    fn cuda_attention_prefill_qwen35_shape_vs_cpu_reference() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let (heads, kv_heads, dh) = (16usize, 4usize, 256usize); // qwen35 9B (e=4096)
+        let group = heads / kv_heads;
+        let kv_dim = kv_heads * dh;
+        let sh = attn_pf_sh_f(dh) * 4;
+        let ctx = CudaCtx::new().unwrap();
+        println!("device: {}", ctx.info());
+        println!(
+            "dno_attention_prefill dh={dh}: dynamic smem = {sh} bytes (opt-in limit = {})",
+            attn_pf_dynamic_smem_limit()
+        );
+        // C1-a: opt-in 成功で 84.8KB が通ること (失敗なら C1-b への切替が必要)
+        assert!(
+            attn_pf_dynamic_smem_limit() >= sh,
+            "動的 smem の opt-in が失敗している (limit={} < 必要量 {sh}) — C1-b (タイル縮小 + .cu 変更/PTX 再生成) への切替が必要",
+            attn_pf_dynamic_smem_limit()
+        );
+        // ゲート: n >= gemm_min_m() (既定 256) で発動・未満は不発 (短文は CPU のまま)
+        let (pos0, n) = (5usize, 276usize); // BQ=64 の行ブロック境界をまたぐ
+        assert!(attn_prefill_gpu_supported(n, dh, pos0 + n));
+        assert!(
+            !attn_prefill_gpu_supported(gemm_min_m() - 1, dh, pos0 + n),
+            "n < gemm_min_m() は不発のはず (短文は CPU attend を維持)"
+        );
+        let t_total = pos0 + n;
+        let scale = 1.0 / (dh as f32).sqrt();
+        let q = pseudo_random(n * heads * dh, 31);
+        let kc = pseudo_random(t_total * kv_dim, 32);
+        let vc = pseudo_random(t_total * kv_dim, 33);
+
+        let att_ref =
+            prefill_attention_cpu(&q, &kc, &vc, heads, kv_heads, dh, n, pos0, t_total, scale);
+
+        let run_gpu = |kc: &[f32], vc: &[f32]| -> Vec<f32> {
+            let mut cache = crate::kv_cache::KvCache::new(1, kv_dim, t_total + 64);
+            {
+                let (kbuf, vbuf) = cache.kv_bufs(0, t_total);
+                kbuf[..t_total * kv_dim].copy_from_slice(kc);
+                vbuf[..t_total * kv_dim].copy_from_slice(vc);
+            }
+            assert!(
+                chain_attention_prefill(
+                    cache.kv_id(),
+                    0,
+                    1,
+                    &q,
+                    &cache,
+                    pos0,
+                    n,
+                    t_total,
+                    group,
+                    dh,
+                    kv_dim,
+                    scale,
+                )
+                .is_some(),
+                "prefill attention kernel が発動すべき (dh={dh})"
+            );
+            chain_download(CH_ATT, n * heads * dh).unwrap()
+        };
+
+        let got = run_gpu(&kc, &vc);
+        let maxd = got
+            .iter()
+            .zip(att_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("prefill attention (qwen35 shape dh={dh}) maxabs diff vs cpu: {maxd}");
+        assert!(maxd < 1e-3, "prefill attention (dh={dh}) maxabs diff {maxd}");
+
+        // 決定論: 同一入力の 2 回目はビット一致
+        let got2 = run_gpu(&kc, &vc);
+        assert_eq!(got, got2, "prefill attention (dh={dh}) が非決定論的");
+        println!("prefill attention qwen35 shape (dh={dh}) determinism OK");
     }
 
     /// GPU の量子化が CPU (`tensor::quantize_row_i8`) とビット一致するか
