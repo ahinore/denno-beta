@@ -1142,6 +1142,36 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 `cargo test --workspace` **253 passed / 0 failed / 18 ignored** (s47 と同一 = CPU 経路無変更の裏取り)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・cuda.rs の 3 件は挿入行による行番号シフトのみ・新規警告ゼロ)。期待効果 (推定・REPORT_NEXT19 §3.1): n≈2.5k の prefill で 33.6s → 16-22s — 実機での opt-in 確認・wall 計測・アンカー再取得は人間対応
 
+### fp32 lm_head の GPU 化 — dno_matvec_f32 流用 + block=(1,1,1) (s49) ✅ (2026-10-17)
+
+> 第49セッション。serve 既定の fp32 モード (`--quant fp32`) で decode の lm_head だけが Linear::F32 の CPU matvec (`tensor::matvec_bt`) のまま残っていた (int8 モードの lm_head は既に GPU 化済み) のを GPU 化した。`.cu` / PTX は無変更 (C4 chain の `dno_matvec_f32` をそのまま流用・PTX 再生成不要)。
+
+**背景と調査**:
+
+- int8 モードの lm_head は既に GPU 化済み: P17b (`apply_bt` の Q8 分岐 → `maybe_gpu_linear`) と C4 decode chain (`chain_linear_grouped`) の両経路で GPU・ビット一致。本節で触れるのは fp32 のみ
+- `denno-cli serve` の `--quant` は**既定 fp32** (`denno-cli/src/main.rs`・`default_value = "fp32"`) — つまり実運用の serve は fp32 モードで動いており、fp32 モードでは decode chain (int8 専用・`q35_chain_compatible` が lm_head の quant8 を要求) も `maybe_gpu_linear` (Q8 専用) も発動せず、lm_head (untied: output.weight / tied: embed) が CPU matvec のまま残る (vocab 151936 × e 4096 ≈ 2.4GB の重み読みが毎ステップ発生)
+- s45 実機計測 (前セッションの実装コメントに記録された値) では decode の lm_head バケットが 46.3% = 19.6ms/step と計上されていたが、旧計上では decode chain 経路の lm_head バケットが最終 `chain_download` (全 staged async D2H + ステップ全体の GPU 実行の完了待ち sync を吸収する) を含んでおり**sync 待ち込みの過大帰属**だった → 本節で prof に D2H op を分離し、今後の実機プロファイルで正しい帰属が取れるようになった (観測のみの変更・数値経路不変)。fp32 モードの decode ms/step 実測は人間対応
+
+**実装**:
+
+- `cuda.rs`: `maybe_gpu_matvec_f32(key, w, a, k, n)` 新設 (pub) — fp32 matvec (m==1) を GPU で実行する。戻り値 None = CPU パスを使うこと (無効/PTX 未収録/実行時エラー)
+  - カーネルは C4 chain の制御投影用 `dno_matvec_f32` を**そのまま流用** (`kernels_elem.cu` 無変更・3931b70 済み PTX に収録済み): 出力 j = blockIdx.x ごとに d 昇順で `s = __fadd_rn(s, __fmul_rn(h[d], row[d]))` と累積 = `tensor::matvec_bt` の `s += a[d] * row[d]` (積と加算の丸め分離・d 逐次) と**ビット一致**
+  - 起動は **block=(1,1,1)・grid=(n,1,1)** — カーネルは block 内の全スレッドが同一計算をする実装のため、chain 側の block=(128) 規約 (n=数十前提) を vocab 規模 (n=151936) で使うと 128 倍の冗長演算になる。grid.x は 2^31-1 まで合法なので n>65535 もそのまま扱える (65535 ガードは chain 側呼び出し規約のみでハードウェア限界ではない)
+  - 重みはモデルロード毎に一意な key (qwen35 の `mid` 由来・untied と tied で別値: mid*2 / mid*2+1) でグローバル登録し 1 回だけ同期 H2D (fp32 9B untied で ~2.4GB・初回 1 回のみ。以後は h 16KB の H2D + logits 0.6MB の D2H + sync ×1/ステップ。eviction 無し = P17b 重みレジストリと同一方針)
+  - 失敗時は本経路のみのスコープドラッチ `LMV32_BROKEN` で恒久 CPU フォールバック (**GPU_BROKEN にはしない** = int8 経路への影響ゼロ)。PTX 未収録 (`dno_matvec_f32` 無し) は `q35_fns` と同一の None キャッシュ規約 (ラッチ無し・次回プロセス起動まで不発動)。数値はどちらの経路でも同一 (bit 一致) のためフォールバックは出力を変えない
+  - 実行パイプラインは `linear_pinned` と同一 (SCRATCH スレッドローカル pinned: H2D(h) async → カーネル → D2H(out) async → sync ×1)
+- `qwen35.rs`: `logits()` を `prof::LM_HEAD` 計上付きラッパに変更し (cuda ビルドで fp32 のみ GPU 試行 → 不発/失敗時は従来経路へ)、従来経路は `lm_logits()` に分離 (**中身は現行どおり bit 不変**・untied: `apply_bt` / tied: embed 直 matvec)。Q8 の lm_head は GPU hook 済み (`maybe_gpu_linear`) のため従来経路のまま。計上は `prof::LM_HEAD` (decode 1 トークンと prefill 最終 logits の両方 = llama per-op と同一)
+- `prof.rs`: D2H op (`d2h_state`・id 14) を新設し N_OPS 14→15 — decode chain 経路の logits download (`chain_download`) と staged 状態フラッシュ (`chain_q35_kv_stage_flush` / `chain_q35_gdn_stage_flush`) を lm_head バケットから分離して D2H バケットへ計上 (**観測のみ・数値経路不変**)
+- `denno-view/src/index.html`: OP_NAMES に `d2h_state` を追加 (prof.rs と同一対応)
+
+**数値影響**: なし (bit 一致契約) — GPU 経路は CPU (`tensor::matvec_bt` / tied は embed 直 matvec) と**全ビット一致** (積と加算の丸め分離・d 逐次・1 block = 1 出力) で、不発/失敗時のフォールバック先も従来経路そのもの。したがって CPU 経路 (`feea9444` / `da0b1f57`)・1b GPU アンカー (`3fb48936`)・2b GPU アンカー (`d46ab41f`) は全て不変 (s48 の attention 緩和による 2b 変化可能性は本節とは無関係に従来どおり)。非 cuda ビルドは cfg ブロックごと消えるため完全に現行経路。決定論 (単一スレッド逐次・原子操作なし)。prof 計上変更も観測のみ
+
+**テスト** (新規 1 件・`#[ignore]` = 実機 GPU で実行):
+
+- `cuda.rs`: `cuda_matvec_f32_lmhead_bit_exact_vs_cpu` — ①lm_head 実形状相当 (k=4096) で `tensor::matvec_bt` との bit 一致 ②n > 65535 (131089 = vocab 規模超) でも grid.x が正しく機能する ③決定論 (同一入力 2 回起動でビット一致) ④小さい k (k=8 n=1) と端数 n (511) の境界でも一致 ⑤形状不正 (w.len() != k*n) は None (CPU フォールバック)。PTX 未再生成 (`dno_matvec_f32` 未収録) の環境では GPU 経路が不発するため最初の呼び出しで fail する (PTX 再生成後の再実行が前提の設計)
+
+`cargo test --workspace` **253 passed / 0 failed / 18 ignored** (s48 と同一 = CPU 経路無変更の裏取り)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・新規警告ゼロ)・`cargo test --features cuda --no-run` 通過 (新規 ignored テストのコンパイル確認・B3 の慣行どおり)。期待効果 (推定): fp32 serve (既定) の decode から lm_head の ~2.4GB/ステップの重み読み + matvec が消え (初回 1 回の 2.4GB H2D 以後は h 16KB + logits 0.6MB の転送/ステップ)、fp32 decode ms/step の大幅短縮が見込まれる — 実機での再計測は人間対応
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
@@ -1164,6 +1194,7 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - [x] ~~**C4: qwen35 デバイス常駐 decode chain (GDN 状態 GPU ミラー)**~~ → **実装完了・CPU 検証まで (2026-10-16)**: decode (n==1) を「埋め込み 1 回 H2D → 全層 GPU 内連結 → 最終 logits 1 回 sync+D2H」にする solo chain (llama P17h と同一骨格・GDN 状態は ping-pong GPU ミラー + staged D2H でホスト正保・失敗時は advance 前 None で従来 per-op 経路にフォールバック)。新カーネル 3 種 (dno_matvec_f32 / dno_qknorm_rope_pi / dno_attn_gate_mul・いずれもビット一致契約)。**kernels_elem.ptx 再生成 + GPU 実機 E2E は人間対応** — 未再生成の間は chain 不発動 (lazy fetch が None をキャッシュ・GPU_BROKEN にならない) で既存経路のまま。§3「C4」節参照。**GPU 実機検証で発覚した segfault は修正済み (2026-10-16・§3「C4 GPU segfault の修正」節参照・実機再検証は人間対応)**: GDN staged D2H の pinned 1 層分確保 (2 層目以降が領域外書き → libcuda 内 SIGSEGV) + full attention k 経路の src_off/ストライド誤り (k セクション外読み・ミラー行外書き)。**segfault 修正後の実機検証で発覚した出力非決定論 (4 リクエスト全別テキスト) も修正済み (2026-10-16・§3「C4 出力非決定論の修正」節参照・実機再検証は人間対応)**: ステップ中途の grow 再確保 (CH_QKV/aq/CH_ATT) が grouped GEMV 等の in-flight バッファを解放し dno_gdn_scan が未初期化 VRAM を読む競合 → ステップ開始時の一括事前確保 (kv_stage/gdn_stage と同一規約・数値経路は無変更)
 - [x] ~~**2b (283tok prefill) 出力 2 値分岐の解明と修正**~~ → **完了 (2026-10-16 第41〜42セッション)**: 根因は GPU KV ミラーが同一 kv_id (スロット) 再利用時に前会話の行 [0..have) を正規行として再利用すること (短→長の切替直後の 1 リクエストのみ発現・スロット割当の揺れで 2 値に分岐・分岐 md5 `3a1fbabe`/`d46ab41f` はミラー行再利用の証拠)。KvCache にコンテンツ世代 (epoch) を導入し with_mirror_ext で検証・全層無効化。§3「GPU KV ミラーのコンテンツ世代 (epoch) 検証」節参照。実機での分岐消滅確認 (1b→2b シーケンス再実行) は人間対応
 - [x] ~~**qwen35 prefill full attention の GPU バッチ化 (案 C・C1 最小構成・REPORT_NEXT19 §3.1)**~~ → **実装完了・CPU 検証まで (2026-10-17・s48)**: §3「qwen35 prefill full attention の GPU バッチ化」節参照。`dno_attention_prefill` 流用 (モデル非依存・`.cu`/PTX 無変更) + 動的 smem の `cuFuncSetAttribute` opt-in (C1-a)。発動ゲート n≥gemm_min_m() (既定 256) で 1b/CPU 経路の bit 温存・`DENNO_GPU_ATTN=0` escape hatch 流用。実機での opt-in 確認・2b アンカー再取得・wall 計測は人間対応
+- [x] ~~**fp32 lm_head の GPU 化 (serve 既定 fp32 モードの decode 律速・REPORT_NEXT23)**~~ → **実装完了・CPU 検証まで (2026-10-17・s49)**: §3「fp32 lm_head の GPU 化」節参照。C4 chain の `dno_matvec_f32` 流用 (`.cu`/PTX 無変更・block=(1,1,1) 起動で vocab 規模の grid.x を直接扱う) + **bit 一致契約** (CPU 経路・1b/2b GPU アンカー不変) + スコープドラッチ `LMV32_BROKEN` (GPU_BROKEN に触れない = int8 経路への影響ゼロ)。prof に D2H op (`d2h_state`) 新設 (decode chain の lm_head バケットからの sync 待ち分離・観測のみ)。実機での ignored テスト実行・fp32 decode ms/step 再計測・cuda バイナリ再ビルド/8095 再配備は人間対応
 
 ### 運用・周辺
 

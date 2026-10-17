@@ -872,7 +872,37 @@ impl Qwen35 {
     }
 
     /// logits (tied fp32 は embed 直接 matvec・rayon 並列)。
+    /// s49: fp32 の lm_head (untied: output.weight / tied: embed) は cuda 有効時
+    /// dno_matvec_f32 (tensor::matvec_bt とビット一致・積と加算の丸め分離・d 逐次)
+    /// で GPU 試行し、不発/失敗時は従来 CPU 経路 (bit 不変) に落ちる。
+    /// int8 モードの lm_head (Q8) は apply_bt 内の P17b hook が既存で対応。
+    /// 計上は prof::LM_HEAD (prefill 最終 logits も含む = llama per-op と同一)。
     fn logits(&self, h: &[f32]) -> Vec<f32> {
+        crate::prof::time(crate::prof::LM_HEAD, || {
+            #[cfg(feature = "cuda")]
+            {
+                // untied と tied で重みキャッシュの key を分ける (mid はロード毎に
+                // 一意なので mid*2 / mid*2+1 で衝突しない)。
+                let (w, k, n, key) = if let Some(lm) = &self.lm_head {
+                    match lm {
+                        crate::quant::Linear::F32 { w, k, n } => (w, *k, *n, self.mid * 2),
+                        // Q8 は GPU hook 済み (maybe_gpu_linear) → 従来経路へ
+                        _ => return self.lm_logits(h),
+                    }
+                } else {
+                    let n_rows = self.embed.len() / self.e;
+                    (&self.embed, self.e, n_rows, self.mid * 2 + 1)
+                };
+                if let Some(out) = crate::cuda::maybe_gpu_matvec_f32(key, w, h, k, n) {
+                    return out;
+                }
+            }
+            self.lm_logits(h)
+        })
+    }
+
+    /// logits の従来 CPU 経路 (bit 不変・untied: apply_bt / tied: embed 直 matvec)。
+    fn lm_logits(&self, h: &[f32]) -> Vec<f32> {
         if let Some(lm) = &self.lm_head {
             return lm.apply_bt(h, 1);
         }
@@ -1533,16 +1563,23 @@ impl Qwen35 {
             crate::telemetry_layer_flush();
         }
 
-        // 最終 norm + lm_head → logits (この download の sync で全 staged D2H 完了)
-        let logits = crate::prof::time(crate::prof::LM_HEAD, || -> Option<Vec<f32>> {
+        // 最終 norm + lm_head (s49: logits download を D2H バケットに分離 — この
+        // download の sync が全 staged D2H + ステップ全体の GPU 実行の完了待ちを
+        // 吸収するため、lm_head 計算だけのバケットに分けないと実機プロファイルの
+        // 「lm_head」が sync 待ち込みで過大帰属になる。観測のみで数値経路不変)
+        crate::prof::time(crate::prof::LM_HEAD, || -> Option<()> {
             chain_rmsnorm(&self.norm_w, eps, pending, CH_H, e, 1, n_layers * 3)?;
             let lmq = self.lm_head.as_ref().unwrap().quant8()?;
-            chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)?;
+            chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)
+        })?;
+        let logits = crate::prof::time(crate::prof::D2H, || {
             chain_download(CH_LOGITS, self.vocab)
         })?;
         // ホスト反映: Full 層 k/v 行 (GDN 層はステージしないため skip) + GDN 状態
-        chain_q35_kv_stage_flush(cache, n_layers, kv_dim, pos0, &gdn_layers)?;
-        chain_q35_gdn_stage_flush(cache)?;
+        crate::prof::time(crate::prof::D2H, || -> Option<()> {
+            chain_q35_kv_stage_flush(cache, n_layers, kv_dim, pos0, &gdn_layers)?;
+            chain_q35_gdn_stage_flush(cache)
+        })?;
         cache.advance(1);
         Some(logits)
     }
