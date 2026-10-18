@@ -229,3 +229,71 @@ pub fn summary() -> String {
     s.push_str(&format!("  TOTAL {:.1} ms\n", total as f64 / 1e6));
     s
 }
+
+#[cfg(test)]
+mod tests {
+    //! s55: d2h 細分 id の整合 (生 id 不変・細分は N_OPS の外・summary が 3 行を出す)。
+    //! 時刻値は環境依存なので検証しない — 検証するのは id の算術と集約だけ。
+    use super::*;
+
+    /// 生 id と telemetry のバイト表現に触れていないこと (細分を足しても不変)。
+    #[test]
+    fn d2h_subsplit_ids_are_outside_raw_range() {
+        assert_eq!(D2H, 14);
+        assert_eq!(N_OPS, 15);
+        let ids = [
+            D2H_LOGITS,
+            D2H_KV_STAGE,
+            D2H_KV_FLUSH,
+            D2H_GDN_FLUSH,
+            D2H_KV_DELAYED_FLUSH,
+            D2H_ATTN_PF,
+            D2H_LOGITS_WAIT,
+            D2H_LOGITS_COPY,
+            D2H_LOGITS_PF_HELD,
+        ];
+        assert_eq!(ids.len(), D2H_N, "D2H_N は細分 id の総数と一致");
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(id, D2H_LOGITS + i, "細分 id は連番 (10*D2H + i)");
+            assert!(id >= N_OPS, "細分 id は生 id の範囲外: {id}");
+        }
+    }
+
+    /// s55: logits の 3 分割が summary に 3 行 (呼び出し回数の内訳) として出ること。
+    /// `enabled()` は環境変数依存でテスト間競合するため、累積と summary 整形を
+    /// 直接叩く (整形はコード上 enabled() と無関係)。
+    #[test]
+    fn logits_split_is_summarized_per_bucket() {
+        for (op, calls) in [
+            (D2H_LOGITS_WAIT, 3u64),
+            (D2H_LOGITS_COPY, 3),
+            (D2H_LOGITS_PF_HELD, 1),
+        ] {
+            D2H_SUB_NS[op - D2H_LOGITS].fetch_add(1000, Ordering::Relaxed);
+            D2H_SUB_CALLS[op - D2H_LOGITS].fetch_add(calls, Ordering::Relaxed);
+        }
+        NS[D2H].fetch_add(7000, Ordering::Relaxed);
+        CALLS[D2H].fetch_add(7, Ordering::Relaxed);
+        let s = summary();
+        for (name, calls) in [
+            ("d2h_logits_wait", "3"),
+            ("d2h_logits_copy", "3"),
+            ("d2h_logits_pfhold", "1"),
+        ] {
+            let cols: Vec<&str> = s
+                .lines()
+                .find(|l| l.trim_start().starts_with(name))
+                .unwrap_or_else(|| panic!("summary に行が無い: {name}\n{s}"))
+                .split_whitespace()
+                .collect();
+            assert_eq!(cols.len(), 4, "op/ms/calls/cum% の 4 列: {name}\n{s}");
+            assert_eq!(cols[2], calls, "呼び出し回数: {name}\n{s}");
+        }
+        // 従来の単独行 (d2h_logits) は COPY への置換後は出ない
+        assert!(
+            !s.lines()
+                .any(|l| l.split_whitespace().next() == Some("d2h_logits")),
+            "旧 d2h_logits 単独行が出ている\n{s}"
+        );
+    }
+}
