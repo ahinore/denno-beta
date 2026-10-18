@@ -1300,6 +1300,15 @@ raw logits → ① repetition_penalty → ② frequency_penalty → ③ presence
 
 **Tests**: `cargo test --workspace` **290 passed / 0 failed / 18 ignored** (baseline 264, +26)
 
+### T3 (prefix partial reuse) closed out — unreachable with a single-boundary store (s58/s59) ⛔ (2026-10-19)
+
+> Sessions 58/59. As a lever to shorten the ~140 s cold prefill we evaluated **partial reuse** of the prefix cache (restore KV+state as deep as reachable even when a prompt does not reach the stored boundary). It turned out to be **unreachable by construction in the current store**, so the line was closed.
+
+- **Why**: snapshots are saved at a **single boundary** only — the position just before `add_generation_prompt` (the two `engine.rs` save sites, split and non-split, both target that one boundary). A candidate prompt therefore has only two outcomes: LCP ≥ boundary → restored by the existing `best_full_match`, or LCP < boundary → unrestorable full prefill. There is no third state in which a partial match could mean anything
+- **Measured**: the s58 probe showed the store **collapsing to a single entry**, with `cand=None` for a forked prompt; enabling `DENNO_PREFIX_PARTIAL` did not reduce forwarded tokens
+- **Disposition**: the implementation diff (engine.rs +409 / prefix_cache.rs +202, unverified and containing debug residue) was **not committed** but parked in `git stash` (`s58-wip-t3-prefix-partial-unfirable`). **No code change — default behaviour is byte-identical to before**
+- **Next**: whether to (A) extend the store to keep multiple boundaries (a larger design change with extra memory) or (B) drop this lever in favour of a stable system prompt / an independent reusable prefix boundary is a **human decision**. Splitting the 140 s into weight-load vs prefill-compute first is the sensible input to that call
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
