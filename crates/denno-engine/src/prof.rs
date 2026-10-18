@@ -45,7 +45,16 @@ pub const D2H_KV_FLUSH: usize = 10 * D2H + 2; // ステップ末尾の staged �
 pub const D2H_GDN_FLUSH: usize = 10 * D2H + 3; // 遅延 GDN 状態の回復 (prefill 冒頭)
 pub const D2H_KV_DELAYED_FLUSH: usize = 10 * D2H + 4; // 遅延 KV 行の回復 (将来用)
 pub const D2H_ATTN_PF: usize = 10 * D2H + 5; // prefill attention 出力の D2H
-pub const D2H_N: usize = 6; // 細分バケット数 (D2H_LOGITS .. D2H_ATTN_PF)
+pub const D2H_N: usize = 9; // 細分バケット数 (D2H_LOGITS .. D2H_ATTN_PF_HELD)
+/// s55 (T1 step2): `d2h_logits` (= 従来 D2H_LOGITS 1 本) を「待ち」と「コピー」に
+/// 分離するための id。decode 経路で logits の D2H を発行する直前に追加 sync を
+/// 1 回だけ打ち (prof 有効時のみ)、その所要を WAIT に積む。従来の D2H_LOGITS
+/// (連続区間) は COPY に置き換える — WAIT + COPY = 従来の D2H_LOGITS と一致する。
+/// 最初のステップだけは logits D2H の前に既存 sync (lm_head 側) が無い状態から
+/// 測ってしまうため、その 1 点は `HELD` に別計上する (WAIT の平均を汚さない)。
+pub const D2H_LOGITS_WAIT: usize = 10 * D2H + 6; // 追加 sync のみ (GPU 側未完了処理の待ち)
+pub const D2H_LOGITS_COPY: usize = 10 * D2H + 7; // 従来 D2H_LOGITS 区間 (従来計測)
+pub const D2H_LOGITS_PF_HELD: usize = 10 * D2H + 8; // prefill 後 1 点目の WAIT (集計から除外)
 pub const N_OPS: usize = 15;
 
 const NAMES: [&str; N_OPS] = [
@@ -61,6 +70,10 @@ const D2H_NAMES: [&str; D2H_N] = [
     "d2h_gdn_flush",
     "d2h_kv_dflush",
     "d2h_attn_pf",
+    // s55: d2h_logits を「待ち」と「コピー」に分離 (合計は従来 d2h_logits と一致)
+    "d2h_logits_wait",
+    "d2h_logits_copy",
+    "d2h_logits_pfhold",
 ];
 
 static NS: [AtomicU64; N_OPS] = {

@@ -1647,7 +1647,25 @@ impl Qwen35 {
             let lmq = self.lm_head.as_ref().unwrap().quant8()?;
             chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)
         })?;
-        let logits = crate::prof::time(crate::prof::D2H_LOGITS, || {
+        // s55 (T1 step2・観測のみ): 従来 `D2H_LOGITS` 1 本だった区間を
+        //   WAIT = logits D2H を発行する直前に打つ追加 sync の所要
+        //        (= GPU 側の未完了処理待ち。転送は含まない)
+        //   COPY = 従来区間そのもの (chain_download の発行 + 既存 sync + pin コピー)
+        // に分離する。**追加 sync は `prof::enabled()` が真のときだけ**打つ —
+        // 非 prof 経路は if の else 側に落ち、追加の GPU 同期は 1 回も入らない
+        // (数値経路・既定挙動は不変)。WAIT + COPY は従来の D2H_LOGITS と一致する。
+        // 最初のステップ (prefill 直後) は logits D2H の手前に既存 sync が無く、
+        // WAIT が「prefill 全体の完了待ち」を含むため平均を汚す — 1 点目のみ
+        // D2H_LOGITS_PF_HELD に退避する (2 点目以降が decode の定常値)。
+        if crate::prof::enabled() {
+            let op = if cache.len() > pos0 {
+                crate::prof::D2H_LOGITS_WAIT
+            } else {
+                crate::prof::D2H_LOGITS_PF_HELD
+            };
+            crate::prof::time(op, || crate::cuda::chain_sync_pending())?;
+        }
+        let logits = crate::prof::time_if_on(crate::prof::D2H_LOGITS_COPY, || {
             chain_download(CH_LOGITS, self.vocab)
         })?;
         // ホスト反映: Full 層 k/v 行のみ (s50: GDN 状態はステップ毎に戻さず
