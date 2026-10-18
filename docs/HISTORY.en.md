@@ -1272,6 +1272,34 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 
 **Tests**: `cargo test --workspace` **261 passed / 0 failed / 18 ignored** (same as s53, confirming the numeric path is untouched). Measuring the breakdown on real hardware (GPU) is a human task
 
+### Three opt-in anti-repetition knobs — no_repeat_ngram / frequency / presence (s56/s57) ✅ (2026-10-19)
+
+> Sessions 56/57. A2.5's `repetition_penalty` alone cannot suppress long-form repetition collapse, so we added OpenAI-compatible `frequency_penalty` / `presence_penalty` and llama.cpp / HF-compatible `no_repeat_ngram_size` as **extra opt-in** controls. **All default to disabled and output stays bit-identical to before** (the existing A2.5 path keeps its meaning and position).
+
+**Implementation**:
+
+- `sampler.rs`: `FreqPresencePenalty { frequency, presence }` / `context_counts()` / `apply_freq_presence_penalty()` / `apply_no_repeat_ngram()` / `AntiRepetition { apply() }`. `AntiRepetition::is_noop()` decides "all four disabled"; callers use it to **skip even building the context and the counts array** (so the default path's cost is unchanged too)
+- `engine.rs`: three new `GenParams` fields (`no_repeat_ngram_size` / `frequency_penalty` / `presence_penalty`). `ChatSession`'s `repetition_penalty: Option<f32>` became `anti_rep: AntiRepetition`, and `apply_session_penalty` is now the **single shared entry point for both sequential (`step_chat`) and batch (`step_chat_batch`) decode** (never one path only)
+- `denno-server`: three new `MessagesRequest` fields + validation in `parse_anti_repetition()` (NaN/inf → 400; `no_repeat_ngram_size` must be 2..=1024; `0.0` normalizes to `None`)
+- `denno-cli`: three flags with the same validation; the `--raw` path also goes through the same `AntiRepetition::apply`
+
+**Application order** (changing it breaks the bit contract):
+
+```text
+raw logits → ① repetition_penalty → ② frequency_penalty → ③ presence_penalty
+           → ④ no_repeat_ngram_size (-inf) → temperature → top-k → top-p → sample
+```
+
+**How the default no-op is guaranteed**: tests pin that logits stay bit-identical for `AntiRepetition::default()` and for every combination of explicit disabled values (`1.0` / `0.0` / `-0.0` / `n<=1`). On the engine side, both decode paths produce identical output when the disabled values are passed explicitly.
+
+**Where the order is NOT observable (honest note)**: the **internal** order of `frequency` vs `presence` is observable in f32 (separate subtractions round differently), so a test kills those order mutants. By contrast, **placing ④ no_repeat_ngram before or after ②③ is unobservable in f32** (the −inf mask overwrites whatever the earlier steps produced) — mutation testing confirmed the mutant survives. So "apply last" is guaranteed by **code structure and this document, not by a test** (intent: the mask is always definitive and never depends on the preceding numbers).
+
+**Licensing**: `frequency`/`presence` follow OpenAI's public API parameter semantics (own implementation); `no_repeat_ngram` is an original reimplementation inspired by HF transformers' `NoRepeatNGramLogitsProcessor` (Apache-2.0) and llama.cpp (MIT). No verbatim copying.
+
+**Not done / known limits**: judging by GPU hardware whether repetition collapse is actually suppressed is **impossible here = human task**. CUDA build/run is also a human task. Interaction with int8/fp32 quantization is unevaluated.
+
+**Tests**: `cargo test --workspace` **290 passed / 0 failed / 18 ignored** (baseline 264, +26)
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)

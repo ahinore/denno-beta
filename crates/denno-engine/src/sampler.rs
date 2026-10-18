@@ -54,6 +54,181 @@ pub fn apply_repetition_penalty(logits: &mut [f32], context: &[u32], penalty: f3
     }
 }
 
+/// s56 (T2): frequency / presence penalty の係数を組にする (OpenAI 互換)。
+///
+/// - `frequency_penalty` f: 文脈中の**出現回数** × f を logit から減算する
+/// - `presence_penalty` p: 文脈中に**1 回以上**現れたトークンから p を 1 回減算する
+///
+/// いずれも A2.5 の `repetition_penalty` (正負で除算/乗算を切り替える HF 規則)
+/// とは**独立・別物**で、単純減算のみ。適用順は
+/// 「生 logits → repetition_penalty → frequency → presence → no_repeat_ngram
+///  → temperature → top-k → top-p → sample」(docs/api.md にも明記)。
+///
+/// 既定 (`0.0`) は両方とも完全な no-op (加算もしない = ビット不変)。
+/// RNG 不使用。語彙外の id は無視する。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FreqPresencePenalty {
+    pub frequency: f32,
+    pub presence: f32,
+}
+
+impl FreqPresencePenalty {
+    /// 指定値から作る。None は 0.0 扱い。どちらも 0.0 なら no-op 経路。
+    pub fn new(frequency: Option<f32>, presence: Option<f32>) -> Self {
+        Self {
+            frequency: frequency.unwrap_or(0.0),
+            presence: presence.unwrap_or(0.0),
+        }
+    }
+
+    /// 両方 0.0 (= 無効) か。呼び出し側はこれで適用自体を省ける。
+    #[inline]
+    pub fn is_noop(&self) -> bool {
+        self.frequency == 0.0 && self.presence == 0.0
+    }
+}
+
+/// frequency / presence penalty を適用する (s56)。係数 0 はビット完全 no-op。
+///
+/// `counts[t]` = 文脈中の t の出現回数。`logits[t] -= f * counts[t] + p * (counts[t] > 0)`。
+/// 減算は 32bit float の素の減算で、係数が 0 の項は `+=`/`-=` を一切行わない
+/// (0 を引いても -0.0 の符号が変わり得るため、無効時に触らないことを保証する)。
+pub fn apply_freq_presence_penalty(logits: &mut [f32], counts: &[u32], p: &FreqPresencePenalty) {
+    if p.is_noop() {
+        return;
+    }
+    let n = logits.len().min(counts.len());
+    for (l, &c) in logits.iter_mut().zip(counts.iter()).take(n) {
+        if c == 0 {
+            continue;
+        }
+        let mut sub = 0.0f32;
+        if p.frequency != 0.0 {
+            sub += p.frequency * c as f32;
+        }
+        if p.presence != 0.0 {
+            sub += p.presence;
+        }
+        *l -= sub;
+    }
+}
+
+/// 文脈の出現回数表を作る (語彙サイズ `vocab`。語彙外 id は数えない)。
+pub fn context_counts(context: &[u32], vocab: usize) -> Vec<u32> {
+    let mut counts = vec![0u32; vocab];
+    for &t in context {
+        let t = t as usize;
+        if t < vocab {
+            counts[t] += 1;
+        }
+    }
+    counts
+}
+
+/// no_repeat_ngram (s56): 直近文脈に既出の n-gram について、その続き (= 最終
+/// トークン) を禁止する (-inf)。llama.cpp / HF `NoRepeatNGramLogitsProcessor` 準拠。
+///
+/// - 文脈長 < n なら no-op (n-gram が 1 つも取れない)
+/// - `n <= 1` も no-op (`n == 1` の「長さ 1 の n-gram の続き」は直前トークン自身を
+///   禁じる意味になるが、HF 実装も `n <= 1` では生成しない。ここでは「n-gram の
+///   接頭辞が空で常に一致する」という退化を避けるため明示的に no-op とする)
+/// - 禁止するのは「既出の (n-1)-gram 接頭辞に一致する文脈末尾」に対する続きの
+///   トークンのみ (文脈全体を走査し、末尾 (n-1) トークンのパターンに一致する
+///   各位置の次トークンを集める)
+/// - `-inf` を書くので softmax で確率 0 になる (temperature/top-k/top-p の前に適用)
+/// - RNG 不使用
+///
+/// 文脈 (prompt + 生成済み) をそのまま渡す。語彙外の id は無視する。
+pub fn apply_no_repeat_ngram(logits: &mut [f32], context: &[u32], n: usize) {
+    if n <= 1 || context.len() < n {
+        return;
+    }
+    // 接頭辞 = context[len-n+1 .. len] (長さ n-1) に一致する全位置の続きを禁止。
+    let prefix = &context[context.len() - (n - 1)..];
+    let mut banned: Vec<usize> = Vec::new();
+    // i は接頭辞の開始位置。続きは context[i + n - 1]。
+    let last_start = context.len() - n; // [i, i+n) が文脈に収まる最大 i
+    for i in 0..=last_start {
+        if &context[i..i + n - 1] == prefix {
+            let follow = context[i + n - 1] as usize;
+            if follow < logits.len() {
+                banned.push(follow);
+            }
+        }
+    }
+    for t in banned {
+        logits[t] = f32::NEG_INFINITY;
+    }
+}
+
+/// s56 (T2): 反復抑止 3 種 + 既存 repetition_penalty を **1 か所で固定順**に適用する。
+///
+/// 適用順 (docs/api.md と同一。変えるとビット契約が壊れる):
+/// ```text
+/// 生 logits
+///   → ① repetition_penalty   (A2.5 の既存処理・意味/位置は不変)
+///   → ② frequency_penalty    (出現回数 × 係数の減算)
+///   → ③ presence_penalty     (出現有無につき係数を 1 回減算)
+///   → ④ no_repeat_ngram_size (既出 n-gram の続きを -inf)
+///   → temperature → top-k → top-p → sample
+/// ```
+///
+/// ①〜④ がすべて無効 (None / 0 / n<=1) のときは logits に一切触らない
+/// = 呼ぶ前と 1 bit も変わらない。逐次 decode (`step_chat`) とバッチ decode
+/// (`step_chat_batch`) は **この関数だけ**を通す (片経路だけに入れない)。
+/// RNG を一切使わない (決定論契約は不変)。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AntiRepetition {
+    pub repetition_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub no_repeat_ngram_size: Option<usize>,
+}
+
+impl AntiRepetition {
+    /// 4 つすべて無効なら true。呼び出し側は適用自体を省ける
+    /// (context の構築・counts の確保すらしない = 既定経路のコストも不変)。
+    #[inline]
+    pub fn is_noop(&self) -> bool {
+        self.repetition_penalty.map_or(true, |p| p == 1.0)
+            && self.frequency_penalty.map_or(true, |f| f == 0.0)
+            && self.presence_penalty.map_or(true, |p| p == 0.0)
+            && self.no_repeat_ngram_size.map_or(true, |n| n <= 1)
+    }
+
+    /// `logits` (生・語彙長) と文脈 (prompt_ids + generated) に対して固定順に適用する。
+    pub fn apply(&self, logits: &mut [f32], context: &[u32]) {
+        if self.is_noop() {
+            return;
+        }
+        // ① 既存 repetition_penalty (意味・位置を変えない — HF 互換の除算/乗算)
+        if let Some(p) = self.repetition_penalty {
+            apply_repetition_penalty(logits, context, p);
+        }
+        // ②③ frequency → presence
+        let fp = FreqPresencePenalty::new(self.frequency_penalty, self.presence_penalty);
+        if !fp.is_noop() {
+            let counts = context_counts(context, logits.len());
+            apply_freq_presence_penalty(logits, &counts, &fp);
+        }
+        // ④ no_repeat_ngram (-inf マスクは最後 = 前段の減算結果に依存しない)
+        if let Some(n) = self.no_repeat_ngram_size {
+            apply_no_repeat_ngram(logits, context, n);
+        }
+    }
+
+    /// `n <= 1` の no_repeat_ngram_size は「無効」として正規化する
+    /// (受理時点の検証は server 側。ここは内部の防御)。
+    pub fn normalized(mut self) -> Self {
+        if let Some(n) = self.no_repeat_ngram_size {
+            if n <= 1 {
+                self.no_repeat_ngram_size = None;
+            }
+        }
+        self
+    }
+}
+
 pub struct Sampler {
     temperature: f32,
     top_k: Option<usize>,
@@ -526,5 +701,402 @@ mod tests {
         let mut c = logits.clone();
         apply_repetition_penalty(&mut c, &ctx, 2.0);
         assert_eq!(c, b);
+    }
+
+    // ---------- s56 (T2): frequency / presence / no_repeat_ngram ----------
+
+    fn bits_of(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// 代表的な「厄介な」logits: 0.0 / -0.0 / 負 / 非正規化 / 大きな正負。
+    fn tricky_logits(n: usize) -> Vec<f32> {
+        let mut v: Vec<f32> = (0..n)
+            .map(|i| match i % 6 {
+                0 => 0.0,
+                1 => -0.0,
+                2 => -(i as f32) * 0.125,
+                3 => f32::MIN_POSITIVE / 4.0,
+                4 => i as f32 * 0.37,
+                _ => 1e30_f32.recip() * -1.0,
+            })
+            .collect();
+        if n > 3 {
+            v[3] = f32::NEG_INFINITY;
+        }
+        if n > 4 {
+            v[4] = f32::INFINITY;
+        }
+        v
+    }
+
+    /// `is_noop()` の契約: 「None / 1.0 / 0.0 / n<=1」の任意の組み合わせで 4 つとも
+    /// 無効と判定し、1 つでも有効な値があれば false。呼び出し側 (engine / CLI) は
+    /// これを見て **文脈構築・counts 確保を完全に省く** ので、既定経路のコストと
+    /// ビットの両方を守るのはこの判定。
+    ///
+    /// なお `apply()` 内の同じガードは「備え」で、仮に外しても下位の各関数が
+    /// 値 0 / 1.0 / n<=1 で何もしないためビットは変わらない (変異テストで確認済み)。
+    #[test]
+    fn anti_repetition_is_noop_covers_every_disabled_combination() {
+        let dis = |p: Option<f32>| p.map_or(true, |v| v == 0.0);
+        let dis_rep = |p: Option<f32>| p.map_or(true, |v| v == 1.0);
+        // 全 2^4 通りの「無効値」組み合わせで no-op と判定されること
+        for bits in 0u32..16 {
+            let pick = |b: u32, on: Option<f32>, off: Option<f32>| if bits & b != 0 { on } else { off };
+            let a = AntiRepetition {
+                repetition_penalty: pick(1, Some(1.0), None),
+                frequency_penalty: pick(2, Some(0.0), None),
+                presence_penalty: pick(4, Some(-0.0), None),
+                no_repeat_ngram_size: if bits & 8 != 0 { Some(1) } else { None },
+            };
+            assert!(a.is_noop(), "無効値の組み合わせが no-op でない: bits={bits} {a:?}");
+            assert!(dis(a.frequency_penalty) && dis(a.presence_penalty) && dis_rep(a.repetition_penalty));
+        }
+        // どれか 1 つでも有効値なら no-op ではない
+        for a in [
+            AntiRepetition { repetition_penalty: Some(1.1), ..Default::default() },
+            AntiRepetition { frequency_penalty: Some(0.01), ..Default::default() },
+            AntiRepetition { frequency_penalty: Some(-0.01), ..Default::default() },
+            AntiRepetition { presence_penalty: Some(0.01), ..Default::default() },
+            AntiRepetition { no_repeat_ngram_size: Some(2), ..Default::default() },
+        ] {
+            assert!(!a.is_noop(), "有効値なのに no-op 扱い: {a:?}");
+        }
+    }
+    #[test]
+    fn anti_repetition_default_is_bit_identical_noop() {
+        let base = tricky_logits(64);
+        // 文脈は語彙内の全 id を 2 回ずつ (負のゼロを含む -0.0 の位置も必ず入る)
+        let ctx: Vec<u32> = (0..64u32).chain(0..64).collect();
+        assert!(
+            base.iter().any(|x| x.to_bits() == (-0.0f32).to_bits()),
+            "前提: テスト logits に -0.0 が含まれる (符号反転を検出可能にする)"
+        );
+        let a = AntiRepetition::default();
+        assert!(a.is_noop(), "既定は no-op と認識されること");
+        let mut x = base.clone();
+        a.apply(&mut x, &ctx);
+        assert_eq!(bits_of(&x), bits_of(&base), "既定で logits のビットが変わった");
+    }
+
+    /// 明示的な 0.0 / 1.0 / n<=1 も「無効」= ビット完全 no-op (既定と同じ)。
+    #[test]
+    fn anti_repetition_explicit_zeros_are_bit_identical_noop() {
+        let base = tricky_logits(64);
+        let ctx: Vec<u32> = (0..64u32).chain(0..64).collect(); // 重複あり
+        for a in [
+            AntiRepetition { repetition_penalty: Some(1.0), frequency_penalty: Some(0.0), presence_penalty: Some(-0.0), no_repeat_ngram_size: None },
+            AntiRepetition { repetition_penalty: None, frequency_penalty: Some(0.0), presence_penalty: Some(0.0), no_repeat_ngram_size: Some(1) },
+            AntiRepetition { repetition_penalty: Some(1.0), frequency_penalty: None, presence_penalty: None, no_repeat_ngram_size: Some(0) },
+        ] {
+            assert!(a.is_noop(), "無効値の組が no-op と認識されない: {a:?}");
+            let mut x = base.clone();
+            a.apply(&mut x, &ctx);
+            assert_eq!(bits_of(&x), bits_of(&base), "無効値でビットが変わった: {a:?}");
+        }
+    }
+
+    /// 既定の逐次サンプリング (seed 固定) は AntiRepetition を挟んでも同一系列
+    /// (greedy / temperature / top-k / top-p の全経路)。
+    #[test]
+    fn anti_repetition_default_keeps_sampling_sequence() {
+        let logits: Vec<f32> = (0..300).map(|i| ((i * 37) % 101) as f32 * 0.03 - 1.0).collect();
+        for (t, k, p) in [
+            (Some(0.0), None, None),           // greedy
+            (Some(1.0), None, None),           // plain
+            (Some(0.7), Some(20), None),       // top-k
+            (Some(0.9), None, Some(0.95)),     // top-p
+            (Some(0.8), Some(50), Some(0.9)),  // top-k + top-p
+        ] {
+            let mut a = sampler(t, k, p, Some(42));
+            let mut b = sampler(t, k, p, Some(42));
+            let anti = AntiRepetition::default();
+            let seq_a: Vec<usize> = (0..30).map(|_| a.sample(&logits)).collect();
+            let seq_b: Vec<usize> = (0..30)
+                .map(|_| {
+                    let mut l = logits.clone();
+                    anti.apply(&mut l, &[1, 2, 3]);
+                    b.sample(&l)
+                })
+                .collect();
+            assert_eq!(seq_a, seq_b, "既定 no-op で系列が変わった: t={t:?} k={k:?} p={p:?}");
+        }
+    }
+
+    /// frequency: 出現回数 × 係数を減算 (手計算値)。重複は回数として数える。
+    #[test]
+    fn frequency_penalty_arithmetic() {
+        let mut logits = vec![1.0f32, 2.0, 3.0, 4.0];
+        // 文脈: t0 が 3 回・t2 が 1 回 (t1/t3 は未出)
+        let ctx = [0u32, 0, 0, 2];
+        let counts = context_counts(&ctx, logits.len());
+        assert_eq!(counts, vec![3, 0, 1, 0]);
+        apply_freq_presence_penalty(
+            &mut logits,
+            &counts,
+            &FreqPresencePenalty { frequency: 0.5, presence: 0.0 },
+        );
+        assert_eq!(logits, vec![1.0 - 1.5, 2.0, 3.0 - 0.5, 4.0], "3回×0.5 / 1回×0.5");
+    }
+
+    /// presence: 出現有無につき 1 回だけ減算 (回数に依存しない)。
+    #[test]
+    fn presence_penalty_arithmetic() {
+        let mut logits = vec![1.0f32, 2.0, 3.0];
+        let ctx = [0u32, 0, 0, 0, 0]; // t0 は 5 回出現
+        let counts = context_counts(&ctx, logits.len());
+        apply_freq_presence_penalty(
+            &mut logits,
+            &counts,
+            &FreqPresencePenalty { frequency: 0.0, presence: 0.25 },
+        );
+        assert_eq!(logits, vec![0.75, 2.0, 3.0], "5 回でも減算は 1 回だけ");
+    }
+
+    /// frequency + presence 併用: -(f*count + p) を一度に減算 (同一トークン)。
+    /// 負の係数もそのまま (加算方向)。
+    #[test]
+    fn frequency_and_presence_combine_and_allow_negative() {
+        let mut logits = vec![0.0f32, 0.0];
+        let counts = context_counts(&[1u32, 1, 1], 2); // t1: 3 回
+        apply_freq_presence_penalty(
+            &mut logits,
+            &counts,
+            &FreqPresencePenalty { frequency: 0.1, presence: 0.3 },
+        );
+        // -(0.1*3 + 0.3) = -0.6。0.1*3.0 = 0.30000001192... の f32 加算後の減算値。
+        let expect = 0.0f32 - (0.1f32 * 3.0f32 + 0.3f32);
+        assert_eq!(logits[1].to_bits(), expect.to_bits(), "0.0-(0.1*3+0.3)");
+        assert_eq!(logits[0], 0.0, "未出トークンは不変");
+        let mut l2 = vec![0.0f32];
+        apply_freq_presence_penalty(&mut l2, &counts[1..2], &FreqPresencePenalty { frequency: 0.0, presence: -0.5 });
+        assert_eq!(l2[0], 0.5, "負の presence は加算");
+    }
+
+    /// 語彙外 id は counts に入らず、logits も触らない (u32::MAX でも安全)。
+    #[test]
+    fn freq_presence_out_of_vocab_ignored() {
+        let mut logits = vec![5.0f32, 6.0];
+        let counts = context_counts(&[7u32, u32::MAX], 2);
+        assert_eq!(counts, vec![0, 0]);
+        apply_freq_presence_penalty(&mut logits, &counts, &FreqPresencePenalty { frequency: 1.0, presence: 1.0 });
+        assert_eq!(logits, vec![5.0, 6.0]);
+    }
+
+    /// no_repeat_ngram: 既出 n-gram の続きだけが -inf になり、他は不変。
+    #[test]
+    fn no_repeat_ngram_bans_seen_continuation() {
+        // 文脈 [1,2,3, 5, 1,2,3, 5, 1,2,3] / n=3 → 末尾接頭辞 = (2,3)
+        //   i=1: (2,3,5) ✓ 続き 5
+        //   i=5: (2,3,5) ✓ 続き 5
+        //   i=7: (2,3) は末尾そのもの (i + n > len) → 続きを作らない
+        // → 5 だけ禁止。1/2/3/4 は不変。
+        let mut logits = vec![0.0f32; 6];
+        let ctx = [1u32, 2, 3, 5, 1, 2, 3, 5, 1, 2, 3];
+        apply_no_repeat_ngram(&mut logits, &ctx, 3);
+        assert_eq!(logits[5], f32::NEG_INFINITY, "(2,3) の続き 5 を禁止");
+        for (i, &l) in logits.iter().enumerate() {
+            if i != 5 {
+                assert_eq!(l, 0.0, "禁止対象外 {i} は不変");
+            }
+        }
+        // 禁止対象が無い文脈は完全 no-op (境界: 末尾 n-gram は過去の接頭辞と
+        // 一致しない)
+        let mut x = vec![0.0f32; 6];
+        let base = x.clone();
+        apply_no_repeat_ngram(&mut x, &[1u32, 2, 3, 1, 2, 4], 3);
+        assert_eq!(bits_of(&x), bits_of(&base), "末尾接頭辞 (2,4) に続きは無い");
+    }
+
+    /// 複数の続きが禁止される (接頭辞が 2 回以上・続きが異なる場合)。
+    #[test]
+    fn no_repeat_ngram_bans_all_seen_continuations() {
+        // 文脈 [1,2,3, 5, 1,2,4, 1,2] (末尾接頭辞 = (1,2))
+        // (1,2) の続き = 3 と 4 → 両方禁止。末尾自身は続きを持たない (文脈外)。
+        let mut logits = vec![0.0f32; 8];
+        let ctx = [1u32, 2, 3, 5, 1, 2, 4, 1, 2];
+        apply_no_repeat_ngram(&mut logits, &ctx, 3);
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+        assert_eq!(logits[4], f32::NEG_INFINITY);
+        assert_eq!(logits[1], 0.0);
+        assert_eq!(logits[2], 0.0);
+    }
+
+    /// 文脈長 < n は no-op / n <= 1 は no-op (退化を禁止)。
+    #[test]
+    fn no_repeat_ngram_short_context_and_small_n_are_noop() {
+        let base = tricky_logits(16);
+        for n in [0usize, 1] {
+            let mut x = base.clone();
+            apply_no_repeat_ngram(&mut x, &[1, 2, 3, 1, 2], n);
+            assert_eq!(bits_of(&x), bits_of(&base), "n={n} は no-op");
+        }
+        // 文脈 2 トークン・n=3 → no-op
+        let mut x = base.clone();
+        apply_no_repeat_ngram(&mut x, &[1, 2], 3);
+        assert_eq!(bits_of(&x), bits_of(&base), "文脈長 < n は no-op");
+        // ちょうど文脈長 == n: 1 個の n-gram しか取れず、その接頭辞は文脈内に
+        // 「続きを持つ位置」として現れない (末尾自身) → no-op
+        let mut x = base.clone();
+        apply_no_repeat_ngram(&mut x, &[1, 2, 3], 3);
+        assert_eq!(bits_of(&x), bits_of(&base), "文脈長 == n は no-op");
+    }
+
+    /// 文脈末尾境界: 直前 1 トークンだけで決まる n=2 の挙動
+    /// (「直前トークン a の次に来たトークン」を全部禁止)。
+    #[test]
+    fn no_repeat_ngram_boundary_n2() {
+        let mut logits = vec![0.0f32; 6];
+        // 4 の続き: 位置 1 の次は 5、位置 3 は末尾そのもの → 5 を禁止
+        let ctx = [7u32, 4, 5, 4];
+        apply_no_repeat_ngram(&mut logits, &ctx, 2);
+        assert_eq!(logits[5], f32::NEG_INFINITY, "4 の次の 5 を禁止");
+        for (i, &l) in logits.iter().enumerate() {
+            if i != 5 {
+                assert_eq!(l, 0.0, "禁止対象外 {i} は不変");
+            }
+        }
+        assert_eq!(logits[4], 0.0, "token 4 自体 (直前トークン) は禁止しない");
+        // 別の文脈 [1,2,3]: 末尾トークン 3 は 1 回しか現れず続きが無い → no-op。
+        // 一方 [1,2,1]: 末尾 1 の過去の続きは 2 → 2 を禁止 (直前トークンの
+        // 出現位置そのものが末尾だけ = 続き無し、の境界)。
+        let mut x = vec![0.0f32; 5];
+        let xb = x.clone();
+        apply_no_repeat_ngram(&mut x, &[1, 2, 3], 2);
+        assert_eq!(bits_of(&x), bits_of(&xb), "末尾トークンの続きは存在しない");
+        let mut y = vec![0.0f32; 5];
+        apply_no_repeat_ngram(&mut y, &[1, 2, 1], 2);
+        assert_eq!(y[2], f32::NEG_INFINITY, "末尾 1 の過去の続き 2 を禁止");
+        assert_eq!(y[1], 0.0);
+    }
+
+    /// 適用順: repetition_penalty → frequency → presence → no_repeat_ngram。
+    /// 順序を入れ替えると値が変わる入力で、固定順の結果を手計算で固定する。
+    #[test]
+    fn anti_repetition_applies_in_fixed_order() {
+        // 文脈 [1, 1, 2] / logits: t0=1.0 t1=4.0 t2=2.0 t3=0.5
+        // ① repetition 2.0: t1(4.0>0)→2.0, t2(2.0>0)→1.0 (t0 未出)
+        // ② frequency 0.5: t1 は 2 回 → -1.0 → 1.0 / t2 は 1 回 → -0.5 → 0.5
+        // ③ presence 0.25: t1 → 0.75 / t2 → 0.25
+        // ④ n_repeat 3: 接頭辞 (1,2) の過去の続きは無い → 何も禁止しない
+        let mut logits = vec![1.0f32, 4.0, 2.0, 0.5];
+        let ctx = [1u32, 1, 2];
+        let anti = AntiRepetition {
+            repetition_penalty: Some(2.0),
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.25),
+            no_repeat_ngram_size: Some(3),
+        };
+        anti.apply(&mut logits, &ctx);
+        assert_eq!(logits[0], 1.0, "文脈外は不変");
+        assert_eq!(logits[1], 0.75, "4/2 - 2*0.5 - 0.25");
+        assert_eq!(logits[2], 0.25, "2/2 - 1*0.5 - 0.25");
+        assert_eq!(logits[3], 0.5, "文脈外は不変");
+        // 逆順 (frequency/presence → repetition) では別の値になること:
+        // (4 - 1.25)/2 = 1.375 ≠ 0.75 → 順序が結果に効いている裏取り。
+        let mut swapped = vec![1.0f32, 4.0, 2.0, 0.5];
+        apply_freq_presence_penalty(
+            &mut swapped,
+            &context_counts(&ctx, 4),
+            &FreqPresencePenalty { frequency: 0.5, presence: 0.25 },
+        );
+        apply_repetition_penalty(&mut swapped, &ctx, 2.0);
+        assert_eq!(swapped[1], (4.0f32 - 1.25) / 2.0);
+        assert_ne!(swapped[1], logits[1], "順序を変えても同じ値 = テストが順序を検証していない");
+    }
+
+    /// 適用順 (② frequency → ③ presence) を固定する。f32 では減算の順序が
+    /// 結果のビットを変える入力が実在するため、順序を入れ替えるとこのテストが落ちる。
+    ///
+    /// logit 0.3 / frequency 0.01 (count 1) / presence 0.05 のとき:
+    ///   frequency → presence (2 段階): (0.3 - 0.01) - 0.05 = 0x1.ed999e...p-3
+    ///   presence → frequency (2 段階): (0.3 - 0.05) - 0.01 = 0x1.eb851e...p-3
+    ///   (どちらとも異なる)
+    /// 現実装は「合計を 1 回だけ減算」する: 0.3 - (0.01 + 0.05)。
+    #[test]
+    fn frequency_and_presence_order_is_observable_in_f32() {
+        let counts = [1u32]; // t0 は 1 回出現
+        let mut x = [0.3f32];
+        apply_freq_presence_penalty(
+            &mut x,
+            &counts,
+            &FreqPresencePenalty { frequency: 0.01, presence: 0.05 },
+        );
+        let freq_then_presence = (0.3f32 - 0.01f32) - 0.05f32;
+        let presence_then_freq = (0.3f32 - 0.05f32) - 0.01f32;
+        let one_subtraction = 0.3f32 - (0.01f32 + 0.05f32);
+        // 前提: 3 つが互いに異なるビットであること (そうでなければ順序を検出できない)
+        assert_ne!(freq_then_presence.to_bits(), presence_then_freq.to_bits());
+        assert_ne!(one_subtraction.to_bits(), freq_then_presence.to_bits());
+        assert_ne!(one_subtraction.to_bits(), presence_then_freq.to_bits());
+        // 実装は合計 1 回減算 (② の減算 → ③ の減算を別々にやらない)
+        assert_eq!(x[0].to_bits(), one_subtraction.to_bits(), "合計 1 回の減算になっていない");
+        assert_ne!(x[0].to_bits(), presence_then_freq.to_bits(), "presence が先に適用されている");
+    }
+
+    /// no_repeat_ngram は前段の減算結果を上書きする (-inf は最後)。
+    /// 文脈 [1,2,3,1,2] n=3 → 接頭辞 (1,2) の続き 3 を禁止。
+    #[test]
+    fn no_repeat_ngram_masks_after_penalties() {
+        let mut logits = vec![0.0f32, 0.0, 0.0, 5.0];
+        let ctx = [1u32, 2, 3, 1, 2];
+        let anti = AntiRepetition {
+            repetition_penalty: Some(1.5),
+            frequency_penalty: Some(0.1),
+            presence_penalty: Some(0.1),
+            no_repeat_ngram_size: Some(3),
+        };
+        anti.apply(&mut logits, &ctx);
+        assert_eq!(logits[3], f32::NEG_INFINITY, "penalty 適用後に -inf で確定");
+        assert!(logits[1] < 0.0, "t1 は repetition で 0/1.5=0 → freq/presence で負");
+    }
+
+    /// 決定論: 同一入力 2 回で同一ビット・RNG 不関与 (呼んでもサンプラ列が変わらない)。
+    #[test]
+    fn anti_repetition_is_deterministic_and_rng_free() {
+        let base = tricky_logits(32);
+        let ctx: Vec<u32> = (0..40u32).map(|i| (i * 7) % 32).collect();
+        let anti = AntiRepetition {
+            repetition_penalty: Some(1.2),
+            frequency_penalty: Some(0.3),
+            presence_penalty: Some(0.2),
+            no_repeat_ngram_size: Some(4),
+        };
+        let mut a = base.clone();
+        let mut b = base.clone();
+        anti.apply(&mut a, &ctx);
+        anti.apply(&mut b, &ctx);
+        assert_eq!(bits_of(&a), bits_of(&b), "2 回で不一致");
+
+        // RNG 不関与: 同じ seed のサンプラで penalty 適用の有無が RNG 消費に
+        // 影響しない (適用後の logits をそのまま与えた場合と、適用してから
+        // 与えた場合で系列が一致する = 次の RNG 状態が同じ)。
+        let logits: Vec<f32> = (0..200).map(|i| ((i * 13) % 71) as f32 * 0.05).collect();
+        let mut s1 = sampler(Some(1.0), None, None, Some(7));
+        let mut s2 = sampler(Some(1.0), None, None, Some(7));
+        let mut l = logits.clone();
+        anti.apply(&mut l, &ctx);
+        let seq1: Vec<usize> = (0..20).map(|_| s1.sample(&l)).collect();
+        let seq2: Vec<usize> = (0..20)
+            .map(|_| {
+                let mut x = logits.clone();
+                anti.apply(&mut x, &ctx);
+                s2.sample(&x)
+            })
+            .collect();
+        assert_eq!(seq1, seq2, "penalty 適用が RNG 消費を変えた");
+    }
+
+    /// normalized(): n<=1 を無効に落とす (内部防御)。
+    #[test]
+    fn anti_repetition_normalized_drops_small_n() {
+        for n in [0usize, 1] {
+            let a = AntiRepetition { no_repeat_ngram_size: Some(n), ..Default::default() };
+            assert_eq!(a.normalized().no_repeat_ngram_size, None);
+        }
+        let a = AntiRepetition { no_repeat_ngram_size: Some(2), ..Default::default() };
+        assert_eq!(a.normalized().no_repeat_ngram_size, Some(2));
+        assert!(!a.is_noop());
     }
 }

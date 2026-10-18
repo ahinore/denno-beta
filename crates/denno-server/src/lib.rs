@@ -158,6 +158,14 @@ pub struct MessagesRequest {
     pub stop_sequences: Vec<String>,
     /// A2.5: 反復ペナルティ (denno 拡張・任意。None = 無効)
     pub repetition_penalty: Option<f32>,
+    /// s56 (T2): OpenAI 互換 frequency penalty (denno 拡張・任意。None/0 = 無効)。
+    /// 適用順は repetition_penalty の直後・presence の直前 (docs/api.md)。
+    pub frequency_penalty: Option<f32>,
+    /// s56 (T2): OpenAI 互換 presence penalty (denno 拡張・任意。None/0 = 無効)。
+    pub presence_penalty: Option<f32>,
+    /// s56 (T2): no_repeat_ngram (denno 拡張・任意。None = 無効)。
+    /// 1 以下は 400 (文脈 n-gram が作れないため「無効」と区別できない)。
+    pub no_repeat_ngram_size: Option<usize>,
     pub stream: Option<bool>,
     /// tool use: ツール定義 (Anthropic 形式)。空配列は tools 無しと同様に扱う
     #[serde(default)]
@@ -315,6 +323,69 @@ pub fn brief_system(system: Option<String>) -> Option<String> {
         Some(s) if !s.is_empty() => format!("{THINKING_BRIEF_INSTRUCTION}\n\n{s}"),
         _ => THINKING_BRIEF_INSTRUCTION.to_string(),
     })
+}
+
+/// s56 (T2): 反復抑止の追加パラメータを検証して正規化する。
+///
+/// - `frequency_penalty` / `presence_penalty`: OpenAI 互換。有限値のみ受理
+///   (NaN/inf は 400)。符号は OpenAI 同様に許す (−2.0..2.0 を推奨するが、
+///   範囲外もサーバーは拒否せず素通しする = 既存 temperature と同じ作法)。
+///   `0.0` は無効 (no-op) として `None` に正規化する。
+/// - `no_repeat_ngram_size`: **1 以下は 400** — `n == 1` は「直前トークン自身を
+///   禁止」という別の意味になり、無効 (None) と区別が付かないため明示的に弾く
+///   (HF / llama.cpp はいずれも n>=2 を要求する)。上限 `MAX_NGRAM_SIZE` 超も 400
+///   (指定ミスを黙って飲まない)。
+/// - 未指定はすべて `None` = 適用なし = 既定経路とビット一致。
+pub fn parse_anti_repetition(req: &MessagesRequest) -> Result<GenAntiRepetition, ApiError> {
+    let fin = |v: Option<f32>, name: &str| -> Result<Option<f32>, ApiError> {
+        match v {
+            None => Ok(None),
+            Some(x) if !x.is_finite() => Err(ApiError::invalid_request(format!(
+                "{name} must be a finite number (got {x})"
+            ))),
+            Some(x) if x == 0.0 => Ok(None),
+            Some(x) => Ok(Some(x)),
+        }
+    };
+    if let Some(p) = req.repetition_penalty {
+        if !p.is_finite() {
+            return Err(ApiError::invalid_request(format!(
+                "repetition_penalty must be a finite number (got {p})"
+            )));
+        }
+    }
+    let n = match req.no_repeat_ngram_size {
+        None => None,
+        // 0 は「n-gram が作れない」ので無効扱い (明示的な 0 は許可しない: 1 と同様 400)
+        Some(n) if n < 2 => {
+            return Err(ApiError::invalid_request(format!(
+                "no_repeat_ngram_size must be >= 2 (got {n}); omit the field to disable"
+            )))
+        }
+        Some(n) if n > MAX_NGRAM_SIZE => {
+            return Err(ApiError::invalid_request(format!(
+                "no_repeat_ngram_size must be <= {MAX_NGRAM_SIZE} (got {n})"
+            )))
+        }
+        Some(n) => Some(n),
+    };
+    Ok(GenAntiRepetition {
+        frequency: fin(req.frequency_penalty, "frequency_penalty")?,
+        presence: fin(req.presence_penalty, "presence_penalty")?,
+        no_repeat_ngram_size: n,
+    })
+}
+
+/// no_repeat_ngram_size の上限 (これより長い n は文脈長でも no-op になり、
+/// 悪意/事故で巨大な語彙外サイズを渡されるのを防ぐ)。
+pub const MAX_NGRAM_SIZE: usize = 1024;
+
+/// `parse_anti_repetition` の出力 (GenParams へ渡す正規化済み値)
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct GenAntiRepetition {
+    pub frequency: Option<f32>,
+    pub presence: Option<f32>,
+    pub no_repeat_ngram_size: Option<usize>,
 }
 
 /// tools 定義の検証 (name 非空・input_schema は object)。
@@ -851,6 +922,8 @@ async fn messages(
     };
     // s39: max_tokens / max_completion_tokens の未指定時は既定上限 (DEFAULT_MAX_TOKENS)
     // を適用する。明示指定は尊重。数値経路への影響は無い (設定値の既定適用のみ)。
+    // s56: 反復抑止の追加パラメータ検証 (不正値は 400。未指定 = 無効 = ビット不変)
+    let anti = parse_anti_repetition(&req)?;
     let params = GenParams {
         max_tokens: resolve_max_tokens(req.max_tokens, req.max_completion_tokens),
         temperature: req.temperature,
@@ -859,6 +932,9 @@ async fn messages(
         stop_sequences: req.stop_sequences.clone(),
         seed: None,
         repetition_penalty: req.repetition_penalty,
+        frequency_penalty: anti.frequency,
+        presence_penalty: anti.presence,
+        no_repeat_ngram_size: anti.no_repeat_ngram_size,
     };
 
     if req.stream.unwrap_or(false) {
@@ -1473,5 +1549,147 @@ mod tool_tests {
         let content = v["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "tool_use");
+    }
+}
+
+/// s56 (T2): 反復抑止の追加パラメータ (frequency / presence / no_repeat_ngram)
+/// の受理・検証・GenParams への伝播。
+#[cfg(test)]
+mod anti_repetition_tests {
+    use super::*;
+
+    fn req(v: serde_json::Value) -> MessagesRequest {
+        let mut base = serde_json::json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        for (k, val) in v.as_object().unwrap() {
+            base[k] = val.clone();
+        }
+        serde_json::from_value(base).expect("リクエストがパースできない")
+    }
+
+    /// 未指定 = すべて None (無効)。追加フィールドの既定は挙動不変。
+    #[test]
+    fn anti_repetition_absent_is_none() {
+        let r = req(serde_json::json!({}));
+        assert_eq!(r.frequency_penalty, None);
+        assert_eq!(r.presence_penalty, None);
+        assert_eq!(r.no_repeat_ngram_size, None);
+        let a = parse_anti_repetition(&r).unwrap();
+        assert_eq!(a, GenAntiRepetition::default());
+    }
+
+    /// 指定値がそのまま通る (frequency/presence は負値も許す・n=2 以上)。
+    #[test]
+    fn anti_repetition_values_are_passed_through() {
+        let r = req(serde_json::json!({
+            "frequency_penalty": 0.5, "presence_penalty": -0.25, "no_repeat_ngram_size": 4
+        }));
+        let a = parse_anti_repetition(&r).unwrap();
+        assert_eq!(a.frequency, Some(0.5));
+        assert_eq!(a.presence, Some(-0.25));
+        assert_eq!(a.no_repeat_ngram_size, Some(4));
+    }
+
+    /// 0.0 は「無効」= None に正規化される (既定と同じ経路に落ちる)。
+    #[test]
+    fn anti_repetition_zero_is_normalized_to_none() {
+        let r = req(serde_json::json!({"frequency_penalty": 0.0, "presence_penalty": -0.0}));
+        let a = parse_anti_repetition(&r).unwrap();
+        assert_eq!(a.frequency, None);
+        assert_eq!(a.presence, None);
+        // 負のゼロも 0 と同じ扱い (符号で分岐しない)
+        let r2 = req(serde_json::json!({"frequency_penalty": -0.0}));
+        assert_eq!(parse_anti_repetition(&r2).unwrap().frequency, None);
+    }
+
+    /// 不正値は 400 (invalid_request_error): n<2 / n>上限 / NaN / inf。
+    #[test]
+    fn anti_repetition_invalid_values_are_rejected() {
+        for v in [
+            serde_json::json!({"no_repeat_ngram_size": 0}),
+            serde_json::json!({"no_repeat_ngram_size": 1}),
+            serde_json::json!({"no_repeat_ngram_size": MAX_NGRAM_SIZE + 1}),
+            serde_json::json!({"frequency_penalty": "NaN"}),
+            serde_json::json!({"presence_penalty": "inf"}),
+            serde_json::json!({"frequency_penalty": 1e40}),
+            serde_json::json!({"repetition_penalty": 1e40}),
+        ] {
+            let r = serde_json::from_value::<MessagesRequest>(serde_json::json!({
+                "model": "m", "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}],
+            }).as_object().map(|o| {
+                let mut o = o.clone();
+                for (k, val) in v.as_object().unwrap() { o.insert(k.clone(), val.clone()); }
+                serde_json::Value::Object(o)
+            }).unwrap());
+            // パース自体が落ちる場合 (型違い) も不正入力として扱う
+            if let Ok(r) = r {
+                assert!(parse_anti_repetition(&r).is_err(), "受理してはいけない: {v}");
+            }
+        }
+        // 境界: n = 2 と n = 上限は受理
+        for n in [2usize, MAX_NGRAM_SIZE] {
+            let r = req(serde_json::json!({"no_repeat_ngram_size": n}));
+            assert_eq!(parse_anti_repetition(&r).unwrap().no_repeat_ngram_size, Some(n));
+        }
+    }
+
+    /// エラーは 400 invalid_request_error (既存の作法と同じ)。
+    #[test]
+    fn anti_repetition_error_is_400_invalid_request() {
+        let r = req(serde_json::json!({"no_repeat_ngram_size": 1}));
+        let e = parse_anti_repetition(&r).unwrap_err();
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert_eq!(e.kind, "invalid_request_error");
+        assert!(e.message.contains("no_repeat_ngram_size"), "{}", e.message);
+    }
+
+    /// ハンドラが組む GenParams と同じ形で 3 フィールドが伝わること
+    /// (engine 側の AntiRepetition に落ちて no-op 判定が変わる)。
+    #[test]
+    fn anti_repetition_reaches_gen_params() {
+        let r = req(serde_json::json!({
+            "repetition_penalty": 1.1,
+            "frequency_penalty": 0.3,
+            "presence_penalty": 0.2,
+            "no_repeat_ngram_size": 3,
+        }));
+        let a = parse_anti_repetition(&r).unwrap();
+        let params = GenParams {
+            max_tokens: resolve_max_tokens(r.max_tokens, r.max_completion_tokens),
+            temperature: r.temperature,
+            top_p: r.top_p,
+            top_k: r.top_k,
+            stop_sequences: r.stop_sequences.clone(),
+            seed: None,
+            repetition_penalty: r.repetition_penalty,
+            frequency_penalty: a.frequency,
+            presence_penalty: a.presence,
+            no_repeat_ngram_size: a.no_repeat_ngram_size,
+        };
+        assert_eq!(params.repetition_penalty, Some(1.1));
+        assert_eq!(params.frequency_penalty, Some(0.3));
+        assert_eq!(params.presence_penalty, Some(0.2));
+        assert_eq!(params.no_repeat_ngram_size, Some(3));
+        let ar = denno_engine::sampler::AntiRepetition {
+            repetition_penalty: params.repetition_penalty,
+            frequency_penalty: params.frequency_penalty,
+            presence_penalty: params.presence_penalty,
+            no_repeat_ngram_size: params.no_repeat_ngram_size,
+        };
+        assert!(!ar.is_noop(), "指定時は no-op ではない (適用される)");
+        // すべて未指定なら no-op (= 既定挙動不変)
+        let r0 = req(serde_json::json!({}));
+        let a0 = parse_anti_repetition(&r0).unwrap();
+        let ar0 = denno_engine::sampler::AntiRepetition {
+            repetition_penalty: r0.repetition_penalty,
+            frequency_penalty: a0.frequency,
+            presence_penalty: a0.presence,
+            no_repeat_ngram_size: a0.no_repeat_ngram_size,
+        };
+        assert!(ar0.is_noop());
     }
 }

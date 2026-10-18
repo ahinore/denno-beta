@@ -48,6 +48,15 @@ pub struct GenParams {
     /// 抑える (詳細は `sampler::apply_repetition_penalty`)。RNG 不関与のため
     /// greedy は完全決定論・seed 固定時の出力系列も bit 再現可能。
     pub repetition_penalty: Option<f32>,
+    /// s56 (T2): OpenAI 互換 frequency penalty (None / 0.0 = 無効・既定)。
+    /// 文脈中の出現回数 × 係数を logit から減算する。repetition_penalty とは独立。
+    pub frequency_penalty: Option<f32>,
+    /// s56 (T2): OpenAI 互換 presence penalty (None / 0.0 = 無効・既定)。
+    /// 文脈に 1 回以上現れたトークンから係数を 1 回減算する。
+    pub presence_penalty: Option<f32>,
+    /// s56 (T2): no_repeat_ngram (None / n<=1 = 無効・既定)。文脈に既出の
+    /// n-gram の続きを -inf で禁止する (llama.cpp / HF 準拠)。
+    pub no_repeat_ngram_size: Option<usize>,
 }
 
 impl Default for GenParams {
@@ -60,6 +69,9 @@ impl Default for GenParams {
             stop_sequences: Vec::new(),
             seed: None,
             repetition_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            no_repeat_ngram_size: None,
         }
     }
 }
@@ -214,8 +226,9 @@ pub struct ChatSession {
     /// 占有中の KV キャッシュスロット (None = 未 install / release 済み)
     slot: Option<usize>,
     input_tokens: usize,
-    /// A2.5: 反復ペナルティ (None = 無効)
-    repetition_penalty: Option<f32>,
+    /// A2.5/s56: 反復抑止 (repetition_penalty + frequency/presence/no_repeat_ngram)。
+    /// すべて無効なら `is_noop()` が真で、適用自体を省く (既定は挙動不変)。
+    anti_rep: crate::sampler::AntiRepetition,
     /// A5/s46: 末尾 generation prompt のトークン境界 (prompt_ids[..境界] が
     /// 「base」= 次ターンにも現れる履歴部分)。テンプレート描画から検出できた
     /// 場合のみ Some (非 recurrent モデル・fallback テンプレート・base が
@@ -703,23 +716,32 @@ impl Engine {
             stop_reason: StopReason::MaxTokens,
             stop_sequence: None,
             slot: None,
-            repetition_penalty: params.repetition_penalty,
+            anti_rep: crate::sampler::AntiRepetition {
+                repetition_penalty: params.repetition_penalty,
+                frequency_penalty: params.frequency_penalty,
+                presence_penalty: params.presence_penalty,
+                no_repeat_ngram_size: params.no_repeat_ngram_size,
+            }
+            .normalized(),
             gen_prompt_start,
             tool_mask,
             id: telem::next_session_id(),
         })
     }
 
-    /// A2.5: repetition_penalty をセッションの logits に適用する (サンプル直前)。
-    /// 適用対象は prompt_ids + generated (ユニーク id・1 回だけ)。penalty 無効
-    /// (None) なら何もしない = 従来経路とビット一致。
+    /// A2.5/s56: 反復抑止をセッションの logits に適用する (サンプル直前)。
+    /// 適用対象は prompt_ids + generated。順序は
+    /// repetition_penalty → frequency → presence → no_repeat_ngram で固定
+    /// (`sampler::AntiRepetition::apply`)。4 つすべて無効なら logits に触らない
+    /// = 従来経路とビット一致。逐次・バッチ両 decode がこの関数だけを通る。
     fn apply_session_penalty(sess: &mut ChatSession) {
-        if let Some(p) = sess.repetition_penalty {
-            let mut ctx = Vec::with_capacity(sess.prompt_ids.len() + sess.generated.len());
-            ctx.extend_from_slice(&sess.prompt_ids);
-            ctx.extend_from_slice(&sess.generated);
-            crate::sampler::apply_repetition_penalty(&mut sess.logits, &ctx, p);
+        if sess.anti_rep.is_noop() {
+            return;
         }
+        let mut ctx = Vec::with_capacity(sess.prompt_ids.len() + sess.generated.len());
+        ctx.extend_from_slice(&sess.prompt_ids);
+        ctx.extend_from_slice(&sess.generated);
+        sess.anti_rep.apply(&mut sess.logits, &ctx);
     }
 
     /// P4 ステッパ: 生成を 1 forward 進める (prefill 全体 or decode 1 トークン)。
@@ -2169,6 +2191,147 @@ mod tests {
         assert!(done_any, "短い側がバッチ途中で完了していること");
         assert_eq!(s0.into_output(), ref_s);
         assert_eq!(s1.into_output(), ref_l);
+    }
+
+    // ---------- s56 (T2): 反復抑止の追加分が両 decode 経路で効くこと ----------
+
+    /// 反復抑止のパラメータ違いの GenParams (greedy = temperature 0 で決定論)。
+    fn anti_params(max_tokens: usize, f: Option<f32>, pr: Option<f32>, n: Option<usize>) -> GenParams {
+        GenParams {
+            max_tokens,
+            temperature: Some(0.0),
+            frequency_penalty: f,
+            presence_penalty: pr,
+            no_repeat_ngram_size: n,
+            ..Default::default()
+        }
+    }
+
+    /// 既定 (未指定) の出力は従来とビット同一 — 逐次 (step_chat) と バッチ
+    /// (step_chat_batch) の両経路で、no-op の適用関数を挟んでも変わらない。
+    #[test]
+    fn anti_repetition_default_is_bit_identical_in_both_decode_paths() {
+        use crate::testutil::dummy_engine;
+        let base = params(20);
+
+        // 逐次経路 (chat = begin_chat + step_chat)
+        let mut a = dummy_engine("m", Some(9)).unwrap();
+        let out_a = a.chat(None, &msgs("t0"), &base, |_| {}).unwrap();
+        let mut b = dummy_engine("m", Some(9)).unwrap();
+        let p_off = GenParams {
+            frequency_penalty: Some(0.0),
+            presence_penalty: Some(0.0),
+            no_repeat_ngram_size: None,
+            repetition_penalty: Some(1.0),
+            ..base.clone()
+        };
+        let out_b = b.chat(None, &msgs("t0"), &p_off, |_| {}).unwrap();
+        assert_eq!(out_a, out_b, "無効値指定で逐次経路の出力が変わった");
+        assert_eq!(out_a.text, EXPECTED_GREEDY_TEXT);
+
+        // バッチ経路 (step_chat_batch)
+        let mut e1 = dummy_engine("m", Some(9)).unwrap();
+        let mut e2 = dummy_engine("m", Some(9)).unwrap();
+        // バッチ経路は「install → 逐次 step で prefill → step_chat_batch で decode」
+        // (scheduler と同じ手順。prefill を batch に入れると logits が無い)
+        let run_batch = |e: &mut Engine, p: &GenParams| -> ChatOutput {
+            let mut s = e.begin_chat(None, &msgs("t0"), p).unwrap();
+            e.install_session(&mut s).unwrap();
+            e.step_chat(&mut s, &mut |_| {}).unwrap();
+            for _ in 0..40 {
+                let mut cbs: Vec<Box<dyn FnMut(&str)>> =
+                    vec![Box::new(|_: &str| {}) as Box<dyn FnMut(&str)>];
+                let mut batch: Vec<&mut ChatSession> = vec![&mut s];
+                let done = e.step_chat_batch(&mut batch, &mut cbs).unwrap();
+                if done[0] {
+                    break;
+                }
+            }
+            e.release_session(&mut s);
+            s.into_output()
+        };
+        let ob1 = run_batch(&mut e1, &base);
+        let ob2 = run_batch(&mut e2, &p_off);
+        assert_eq!(ob1, ob2, "無効値指定でバッチ経路の出力が変わった");
+        assert_eq!(ob1, out_a, "バッチと逐次で既定出力が一致しない");
+    }
+
+    /// no_repeat_ngram が **両方の decode 経路** で効くこと (片経路だけに入れていない)。
+    ///
+    /// ScriptModel のスクリプト [5,6,5,6,...]・n=2 の step ごとの文脈
+    /// (プロンプト末尾は [UNK]=13):
+    ///   step0 ctx=[13]        禁止なし → 5
+    ///   step1 ctx=[13,5]      禁止なし → 6
+    ///   step2 ctx=[13,5,6]    接頭辞 (5,6) の過去の続きなし → 5
+    ///   step3 ctx=[13,5,6,5]  接頭辞 (6,5) は step0-1 に在り続き 6 → 6 を禁止
+    ///                         → fallback 7 (準ピーク)
+    /// つまり「n=2 が無いと 5,6,5,6 だが、有ると 5,6,5,7」。
+    #[test]
+    fn no_repeat_ngram_applies_in_both_decode_paths() {
+        use crate::testutil::tool_script_engine;
+        let script = vec![5u32, 6, 5, 6, 5, 6, 5, 6];
+        // ベースライン (n 無し): 5,6,5,6,... がそのまま出る
+        let mut e0 = tool_script_engine("m", None, script.clone(), 7).unwrap();
+        let out0 = e0
+            .chat(None, &msgs("t0"), &anti_params(4, None, None, None), |_| {})
+            .unwrap();
+        assert_eq!(out0.text, "t5t6t5t6", "ベースライン (n 無し)");
+
+        // 逐次
+        let mut e1 = tool_script_engine("m", None, script.clone(), 7).unwrap();
+        let out1 = e1
+            .chat(None, &msgs("t0"), &anti_params(4, None, None, Some(2)), |_| {})
+            .unwrap();
+        assert_eq!(out1.text, "t5t6t5t7", "逐次経路で n=2 が効いていない");
+
+        // バッチ (スクリプトモデルは単一セッション専用 → 1 本でバッチ経路を通す)
+        let mut e2 = tool_script_engine("m", None, script, 7).unwrap();
+        let p = anti_params(4, None, None, Some(2));
+        let mut s = e2.begin_chat(None, &msgs("t0"), &p).unwrap();
+        e2.install_session(&mut s).unwrap();
+        e2.step_chat(&mut s, &mut |_| {}).unwrap(); // prefill
+        for _ in 0..20 {
+            let mut cbs: Vec<Box<dyn FnMut(&str)>> = vec![Box::new(|_: &str| {})];
+            let mut batch: Vec<&mut ChatSession> = vec![&mut s];
+            if e2.step_chat_batch(&mut batch, &mut cbs).unwrap()[0] {
+                break;
+            }
+        }
+        e2.release_session(&mut s);
+        let out2 = s.into_output();
+        assert_eq!(out2.text, out1.text, "バッチ経路だけ n=2 が効いていない");
+    }
+
+    /// GenParams の 3 フィールドがセッションに伝わる (正規化込み)。
+    #[test]
+    fn gen_params_anti_repetition_reach_session() {
+        use crate::testutil::dummy_engine;
+        let mut e = dummy_engine("m", None).unwrap();
+        let p = GenParams {
+            max_tokens: 4,
+            repetition_penalty: Some(1.1),
+            frequency_penalty: Some(0.25),
+            presence_penalty: Some(0.5),
+            no_repeat_ngram_size: Some(3),
+            ..Default::default()
+        };
+        let s = e.begin_chat(None, &msgs("t0"), &p).unwrap();
+        assert_eq!(
+            s.anti_rep,
+            crate::sampler::AntiRepetition {
+                repetition_penalty: Some(1.1),
+                frequency_penalty: Some(0.25),
+                presence_penalty: Some(0.5),
+                no_repeat_ngram_size: Some(3),
+            }
+        );
+        // n<=1 は無効に正規化される (内部防御)
+        let p2 = GenParams { no_repeat_ngram_size: Some(1), ..p.clone() };
+        let s2 = e.begin_chat(None, &msgs("t0"), &p2).unwrap();
+        assert_eq!(s2.anti_rep.no_repeat_ngram_size, None);
+        // 既定は no-op と認識される
+        let s3 = e.begin_chat(None, &msgs("t0"), &GenParams::default()).unwrap();
+        assert!(s3.anti_rep.is_noop());
     }
 
     #[test]

@@ -31,6 +31,12 @@ enum Commands {
         #[arg(long)] seed: Option<u64>,
         /// A2.5: 反復ペナルティ (例: 1.1。未指定 = 無効)
         #[arg(long)] repetition_penalty: Option<f32>,
+        /// s56: frequency penalty (OpenAI 互換。出現回数 × 係数を減算。未指定/0 = 無効)
+        #[arg(long)] frequency_penalty: Option<f32>,
+        /// s56: presence penalty (OpenAI 互換。出現したトークンから係数を 1 回減算)
+        #[arg(long)] presence_penalty: Option<f32>,
+        /// s56: no_repeat_ngram (既出 n-gram の続きを禁止。2 以上。未指定 = 無効)
+        #[arg(long)] no_repeat_ngram_size: Option<usize>,
         /// 重みの量子化モード (fp32 / int8)。int8 は決定論を維持するが
         /// fp32 と同一出力にはならない
         #[arg(long, default_value = "fp32")] quant: String,
@@ -145,7 +151,18 @@ fn main() -> Result<()> {
                 println!("weights:   {:.1} MB", bytes as f64 / 1e6);
             }
         }
-        Commands::Generate { repo, prompt, system, max_tokens, temperature, seed, repetition_penalty, quant, raw } => {
+        Commands::Generate { repo, prompt, system, max_tokens, temperature, seed, repetition_penalty, frequency_penalty, presence_penalty, no_repeat_ngram_size, quant, raw } => {
+            // s56: 引数の検証 (サーバー 400 と同じ規則。失敗は引数エラーで止める)
+            if let Some(p) = frequency_penalty {
+                if !p.is_finite() { bail!("--frequency-penalty は有限値 (got {p})"); }
+            }
+            if let Some(p) = presence_penalty {
+                if !p.is_finite() { bail!("--presence-penalty は有限値 (got {p})"); }
+            }
+            if let Some(n) = no_repeat_ngram_size {
+                if n < 2 { bail!("--no-repeat-ngram-size は 2 以上 (got {n})"); }
+                if n > 1024 { bail!("--no-repeat-ngram-size は 1024 以下 (got {n})"); }
+            }
             let dir = model_dir(&repo);
             if !dir.exists() {
                 bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
@@ -156,8 +173,19 @@ fn main() -> Result<()> {
                 max_tokens,
                 temperature,
                 repetition_penalty,
+                frequency_penalty,
+                presence_penalty,
+                no_repeat_ngram_size,
                 ..Default::default()
             };
+            // s56: raw 経路も chat 経路と同じ順序/関数を通す
+            let anti = denno_engine::sampler::AntiRepetition {
+                repetition_penalty,
+                frequency_penalty,
+                presence_penalty,
+                no_repeat_ngram_size,
+            }
+            .normalized();
             let out = if raw {
                 // 生プロンプトで生成
                 let ids = engine.tok.encode(&prompt)?;
@@ -167,12 +195,13 @@ fn main() -> Result<()> {
                 let mut sampler = Sampler::new(temperature, None, None, seed);
                 let mut generated = Vec::new();
                 for _ in 0..max_tokens {
-                    // A2.5: penalty 指定時のみ既出トークンを抑制 (無効時はビット不変)
-                    if let Some(p) = repetition_penalty {
+                    // A2.5/s56: 反復抑止は chat 経路と同じ関数・同じ順序で適用
+                    // (4 つすべて無効なら logits に触らない = 既定はビット不変)
+                    if !anti.is_noop() {
                         let mut ctx = Vec::with_capacity(ids.len() + generated.len());
                         ctx.extend_from_slice(&ids);
                         ctx.extend_from_slice(&generated);
-                        denno_engine::sampler::apply_repetition_penalty(&mut logits, &ctx, p);
+                        anti.apply(&mut logits, &ctx);
                     }
                     let t = sampler.sample(&logits) as u32;
                     if engine.model.eos_ids().contains(&t) { break; }
