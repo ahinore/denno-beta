@@ -1257,6 +1257,21 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 `cargo test --workspace` **261 passed / 0 failed / 18 ignored** (旧 256 + 5)。GPU 実機での偽ターン再現確認・cuda バイナリ再ビルド/8095 再配備・push は人間対応
 
+### d2h_state の細分計測 — logits / kv_flush / gdn_flush / attn_pf に分離 (s54) ✅ (2026-10-19)
+
+> 第54セッション。s50 でデルタ化した後に残った `d2h_state` バケット (= 生 id 14) を、実測で内訳を読めるように細分する。**計測のみ・挙動不変** (数値経路にも D2H 転送順序にも触れない)。目的は decode のステップ毎 D2H 内訳の特定 (削減の可否を「d2h_logits と d2h_kv_flush の比率」で判断するため)。
+
+**実装**:
+
+- `prof.rs`: 生 id は変更しない。細分は `D2H_LOGITS` / `D2H_KV_STAGE` / `D2H_KV_FLUSH` / `D2H_GDN_FLUSH` / `D2H_KV_DELAYED_FLUSH` / `D2H_ATTN_PF` (`10*D2H + i` = 140..145) の 6 本。`time()` は細分 id を従来どおり `D2H` バケットにも積み、`summary()` が `d2h_state` の直下にインデント行として内訳 (ms / calls / cum%) を出す。`reset()` は細分累積もクリア
+- `qwen35.rs`: 呼び出し側の id を差し替え — decode の logits download → `D2H_LOGITS`・`chain_q35_kv_stage_flush` → `D2H_KV_FLUSH`・prefill attention 出力の `chain_download(CH_ATT)` → `D2H_ATTN_PF`。`D2H_KV_STAGE` / `D2H_GDN_FLUSH` / `D2H_KV_DELAYED_FLUSH` は将来の段 (遅延 KV フラッシュ) 用に予約した枠で、現時点では未使用 (summary には出ない)
+
+**コードリーディングで確定した構造** (実測で裏取りする対象): decode chain で `d2h_state` はステップあたり **2 call** — ①`chain_download(CH_LOGITS, vocab)` (この `ctx.sync()` が in-flight DMA = 層ごとの staged async D2H の完了待ちを吸収する) ②`chain_q35_kv_stage_flush` (full 層 k/v 行のホスト反映)。full 層の `cuMemcpyDtoHAsync` (k/v) は非同期発行のみで同期点を持たないため、転送時間の計上は ①に集まる。9B では 16 層 × 2 × kv_dim(1024) × 4B = 128KB/step
+
+**数値影響**: なし — prof 無効時は従来どおり `time()` 冒頭の 1 分岐で素通し。telemetry の生 id・バイト表現は不変 (細分 id も記録時に `D2H` へ丸める)。CPU 経路・既存アンカーは不変
+
+**テスト**: `cargo test --workspace` **261 passed / 0 failed / 18 ignored** (s53 と同一 = 数値経路無変更の裏取り)。実機の内訳計測 (GPU) は人間対応
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)

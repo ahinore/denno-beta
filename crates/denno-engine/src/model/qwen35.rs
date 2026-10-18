@@ -744,7 +744,9 @@ impl Qwen35 {
         {
             return false;
         }
-        let mut ga = match crate::cuda::chain_download(crate::cuda::CH_ATT, n * heads * dh) {
+        let mut ga = match crate::prof::time(crate::prof::D2H_ATTN_PF, || {
+            crate::cuda::chain_download(crate::cuda::CH_ATT, n * heads * dh)
+        }) {
             Some(v) => v,
             None => return false,
         };
@@ -1645,14 +1647,14 @@ impl Qwen35 {
             let lmq = self.lm_head.as_ref().unwrap().quant8()?;
             chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)
         })?;
-        let logits = crate::prof::time(crate::prof::D2H, || {
+        let logits = crate::prof::time(crate::prof::D2H_LOGITS, || {
             chain_download(CH_LOGITS, self.vocab)
         })?;
         // ホスト反映: Full 層 k/v 行のみ (s50: GDN 状態はステップ毎に戻さず
         // GPU ミラーを権威のままにする — 次の prefill 冒頭 / CPU フォールバック時に
         // chain_q35_gdn_flush_pending が回復する。ステップ毎 D2H ~75MB/step が
         // decode の支配項だったため)
-        crate::prof::time(crate::prof::D2H, || {
+        crate::prof::time(crate::prof::D2H_KV_FLUSH, || {
             chain_q35_kv_stage_flush(cache, n_layers, kv_dim, pos0, &gdn_layers)
         })?;
         cache.advance(1);

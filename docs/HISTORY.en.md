@@ -1257,6 +1257,21 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 
 `cargo test --workspace` **261 passed / 0 failed / 18 ignored** (was 256 + 5). Reproducing the false-turn case on the real GPU, the cuda binary rebuild/8095 redeploy, and push are human tasks
 
+### Breaking down the d2h_state bucket — logits / kv_flush / gdn_flush / attn_pf (s54) ✅ (2026-10-19)
+
+> Session 54. Splits the `d2h_state` bucket (raw id 14) left after the s50 deltization so that measurements show its breakdown. **Instrumentation only, no behavior change** (it touches neither the numeric path nor the D2H transfer order). The goal is to identify the per-step D2H breakdown during decode, because whether it can be reduced depends on the ratio of `d2h_logits` to `d2h_kv_flush`.
+
+**Implementation**:
+
+- `prof.rs`: raw ids are unchanged. The sub-ids are `D2H_LOGITS` / `D2H_KV_STAGE` / `D2H_KV_FLUSH` / `D2H_GDN_FLUSH` / `D2H_KV_DELAYED_FLUSH` / `D2H_ATTN_PF` (`10*D2H + i` = 140..145). `time()` still accumulates sub-ids into the `D2H` bucket as before, and `summary()` prints the breakdown (ms / calls / cum%) as indented rows directly under `d2h_state`. `reset()` clears the sub-bucket counters too
+- `qwen35.rs`: call sites switched to the sub-ids — decode logits download → `D2H_LOGITS`, `chain_q35_kv_stage_flush` → `D2H_KV_FLUSH`, prefill attention output download (`chain_download(CH_ATT)`) → `D2H_ATTN_PF`. `D2H_KV_STAGE` / `D2H_GDN_FLUSH` / `D2H_KV_DELAYED_FLUSH` are reserved for the next stage (deferred KV flush) and are currently unused (they never appear in `summary()`)
+
+**Structure established by code reading** (to be confirmed by measurement): in the decode chain, `d2h_state` is **2 calls per step** — ① `chain_download(CH_LOGITS, vocab)` (its `ctx.sync()` absorbs completion of all in-flight DMA, i.e. the per-layer staged async D2H) and ② `chain_q35_kv_stage_flush` (reflects the full-layer k/v rows into the host cache). The full-layer `cuMemcpyDtoHAsync` calls (k/v) are issued asynchronously and carry no sync point themselves, so their transfer time lands in ①. For the 9B model that is 16 layers × 2 × kv_dim(1024) × 4B = **128KB/step**
+
+**Numeric impact**: none — with profiling disabled, `time()` still returns through its single leading branch as before. Telemetry raw ids and byte encoding are unchanged (sub-ids are folded back to `D2H` at record time). The CPU path and existing anchors are unchanged
+
+**Tests**: `cargo test --workspace` **261 passed / 0 failed / 18 ignored** (same as s53, confirming the numeric path is untouched). Measuring the breakdown on real hardware (GPU) is a human task
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
