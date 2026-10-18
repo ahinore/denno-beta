@@ -256,8 +256,9 @@ fn parse_tool_choice_str(s: &str) -> Result<ToolChoice, ApiError> {
 ///
 /// - `Off`: chat template に `enable_thinking=false` を渡す (実モデルでは空の
 ///   think block が generation prompt に入り、思考せず即答する)
-/// - `Brief` (既定): 思考 ON のまま、system 冒頭に短答誘導文を注入する
-///   (**ハード制御ではない** — モデルの生成を強制しないソフトな誘導)
+/// - `Brief` (既定): s53c で **Off と同じく思考を無効化**し、system 冒頭に
+///   「回答は簡潔に」という短答誘導文を注入する (実測: 思考 ON + 誘導文では
+///   9B が "Thinking Process:" のメタ分析を延々と書き回答に到達しなかったため)
 /// - `Full`: 従来経路のまま (注入なし・`enable_thinking` 変数も渡さない =
 ///   prompt はビット同一)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,16 +270,17 @@ pub enum Thinking {
 
 /// thinking=brief のとき system 冒頭へ注入する誘導文 (決定的・固定文字列。
 /// 同一入力→同一出力の契約のため、内容はコードに固定する)。
-pub const THINKING_BRIEF_INSTRUCTION: &str = "思考は短く数文で済ませ、すぐに回答を書いてください。";
+pub const THINKING_BRIEF_INSTRUCTION: &str = "回答は簡潔に、数文でまとめてください。";
 
 /// thinking をパースする (未指定 = Brief。不正値は 400 invalid_request_error —
 /// tool_choice のバリデーション慣習と同一)。
 ///
 /// s52: 2 形式を受理する。
 /// - 文字列 (s47 からの現行): "off" | "brief" | "full"
-/// - Anthropic マップ (Hermes 互換): `{"type":"enabled", ...}` = brief 扱い
-///   (`budget_tokens` 等は無視・決定的) / `{"type":"disabled"}` = off 扱い /
-///   未知の type (欠落・非文字列含む) は 400。文字列/オブジェクト以外も 400。
+/// - Anthropic マップ (Hermes 互換): `{"type":"enabled", ...}` = **off 扱い**
+///   (s53c: 実行時は思考無効 + 簡潔指示。`budget_tokens` 等は無視・決定的) /
+///   `{"type":"disabled"}` = off 扱い / 未知の type (欠落・非文字列含む) は 400。
+///   文字列/オブジェクト以外も 400。
 pub fn parse_thinking(v: &Option<serde_json::Value>) -> Result<Thinking, ApiError> {
     match v {
         None => Ok(Thinking::Brief),
@@ -292,7 +294,7 @@ pub fn parse_thinking(v: &Option<serde_json::Value>) -> Result<Thinking, ApiErro
             ))),
         },
         Some(serde_json::Value::Object(m)) => match m.get("type").and_then(|t| t.as_str()) {
-            Some("enabled") => Ok(Thinking::Brief),
+            Some("enabled") => Ok(Thinking::Off),
             Some("disabled") => Ok(Thinking::Off),
             other => Err(ApiError::invalid_request(format!(
                 "thinking.type: unsupported value {:?} (enabled/disabled)",
@@ -835,17 +837,17 @@ async fn messages(
         });
     }
     let system = system_to_text(&req.system)?;
-    // s47: thinking 制御。brief (既定) は system 冒頭に短答誘導文を注入
-    // (off/full は注入なし)。off は chat template の enable_thinking 変数で
-    // 制御する (Some(false)・brief/full は変数無し = 従来経路と同一)。
+    // s47/s53c: thinking 制御。brief (既定) は system 冒頭に短答誘導文を注入し、
+    // 併せて enable_thinking=false で思考を無効化する (実測: 思考 ON では 9B が
+    // "Thinking Process:" を延々と書き回答に到達しない)。off も同じく無効化。
     let thinking = parse_thinking(&req.thinking)?;
     let system = match thinking {
         Thinking::Brief => brief_system(system),
         Thinking::Off | Thinking::Full => system,
     };
     let enable_thinking = match thinking {
-        Thinking::Off => Some(false),
-        Thinking::Brief | Thinking::Full => None,
+        Thinking::Off | Thinking::Brief => Some(false),
+        Thinking::Full => None,
     };
     // s39: max_tokens / max_completion_tokens の未指定時は既定上限 (DEFAULT_MAX_TOKENS)
     // を適用する。明示指定は尊重。数値経路への影響は無い (設定値の既定適用のみ)。

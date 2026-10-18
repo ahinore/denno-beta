@@ -116,7 +116,7 @@ fn sse_text(body: &str) -> String {
 // ---------- lib 層: parse_thinking / brief_system ----------
 
 /// thinking のモード判定 (未指定 = brief・off/brief/full・不正値はエラー)
-/// s52: Anthropic マップ形式も受理 (enabled = brief 扱い / disabled = off 扱い /
+/// s52/s53c: Anthropic マップ形式も受理 (enabled = off 扱い / disabled = off 扱い /
 /// 未知の type・type 欠落・非文字列 type・文字列/オブジェクト以外はエラー)
 #[test]
 fn parse_thinking_maps_all_modes_and_defaults_to_brief() {
@@ -128,13 +128,13 @@ fn parse_thinking_maps_all_modes_and_defaults_to_brief() {
     for bad in ["OFF", "Brief", "FULL", "", "on", "true", "none"] {
         assert!(parse_thinking(&Some(json!(bad))).is_err(), "{bad} は拒否されるべき");
     }
-    // s52: Anthropic マップ形式 (enabled = brief 扱い・disabled = off 扱い。
+    // s52/s53c: Anthropic マップ形式 (enabled = off 扱い・disabled = off 扱い。
     // budget_tokens は無視・決定的)
     assert_eq!(
         parse_thinking(&Some(json!({"type": "enabled", "budget_tokens": 8000}))).unwrap(),
-        Thinking::Brief
+        Thinking::Off
     );
-    assert_eq!(parse_thinking(&Some(json!({"type": "enabled"}))).unwrap(), Thinking::Brief);
+    assert_eq!(parse_thinking(&Some(json!({"type": "enabled"}))).unwrap(), Thinking::Off);
     assert_eq!(parse_thinking(&Some(json!({"type": "disabled"}))).unwrap(), Thinking::Off);
     // マップの不正 type / type 欠落 / 非文字列 type / マップ以外の値型は拒否
     for bad in [
@@ -167,11 +167,12 @@ fn brief_system_prepends_fixed_instruction_deterministically() {
 
 // ---------- wire 層: off / brief (既定) / full ----------
 
-/// thinking=off は空の think block で閉じた prompt になるため ThinkingSimModel が
-/// 即 EOS を出す (output_tokens = 1・テキスト空)。brief (既定) / full は開いた
+/// thinking=off と brief (既定) は空の think block で閉じた prompt になるため
+/// ThinkingSimModel が即 EOS を出す (output_tokens = 1・テキスト空)。full は開いた
 /// think block から思考フィラ 3 トークン + EOS (output_tokens = 4)。
+/// s53c: brief は enable_thinking=false + 簡潔指示のため off と同じ即答になる。
 #[tokio::test]
-async fn thinking_off_short_circuits_and_brief_full_think() {
+async fn thinking_off_and_brief_short_circuit_and_full_thinks() {
     let app = test_app_with(thinking_sim_engine("think-sim").unwrap(), 8);
 
     let (status, body) = post(&app, request_body("t0", 20, false, Some("off"))).await;
@@ -180,18 +181,25 @@ async fn thinking_off_short_circuits_and_brief_full_think() {
     assert_eq!(body["content"][0]["text"], "", "off は EOS のみでテキスト空");
     assert_eq!(body["stop_reason"], "end_turn");
 
-    // 未指定 = brief (既定)・"brief"・"full" はすべて思考経路 (フィラ 3 + EOS)
-    for thinking in [None, Some("brief"), Some("full")] {
+    // s53c: 未指定 = brief (既定)・"brief" は off と同じ即答になる
+    for thinking in [None, Some("brief")] {
         let (status, body) = post(&app, request_body("t0", 20, false, thinking)).await;
         assert_eq!(status, StatusCode::OK, "thinking={thinking:?} body = {body}");
         assert_eq!(
             body["usage"]["output_tokens"],
-            json!(4),
-            "thinking={thinking:?} は思考してから答える"
+            json!(1),
+            "thinking={thinking:?} は思考無効で即 EOS"
         );
-        assert_eq!(body["content"][0]["text"], "t13 t14 t15", "thinking={thinking:?}");
+        assert_eq!(body["content"][0]["text"], "", "thinking={thinking:?}");
         assert_eq!(body["stop_reason"], "end_turn", "thinking={thinking:?}");
     }
+
+    // full のみ思考経路 (フィラ 3 + EOS)
+    let (status, body) = post(&app, request_body("t0", 20, false, Some("full"))).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(body["usage"]["output_tokens"], json!(4), "full は思考してから答える");
+    assert_eq!(body["content"][0]["text"], "t13 t14 t15");
+    assert_eq!(body["stop_reason"], "end_turn");
 }
 
 /// brief (既定) の system 注入と full の無注入は RecurStateModel (全 prompt トークン
@@ -253,14 +261,14 @@ async fn thinking_off_streams_immediately_and_full_streams_thinking() {
 
 // ---------- s52: Anthropic マップ形式 (Hermes 互換) ----------
 
-/// マップ形式は enabled = brief 扱い (誘導文注入つきの思考経路・文字列 brief と
-/// 同一出力) / disabled = off 扱い (即 EOS・1 トークン)。budget_tokens は無視
-/// (決定的・s47 の決定的誘導文注入と同一経路)。
+/// マップ形式は enabled = off 扱い (思考無効・即答) / disabled = off 扱い。
+/// budget_tokens は無視 (決定的)。s53c: 実測で brief (思考 ON + 誘導文) が
+/// 短い system で破綻したため、Hermes が送る enabled は off に写像する。
 #[tokio::test]
-async fn thinking_map_enabled_is_brief_and_disabled_is_off() {
+async fn thinking_map_enabled_maps_to_off_and_disabled_is_off() {
     let app = test_app_with(thinking_sim_engine("think-sim").unwrap(), 8);
 
-    // enabled (Hermes が送る形状・budget_tokens 付き) は brief 扱い
+    // enabled (Hermes が送る形状・budget_tokens 付き) は off 扱い
     let (status, enabled) = post(
         &app,
         request_body_thinking_value("t0", 20, false, json!({"type": "enabled", "budget_tokens": 8000})),
@@ -269,16 +277,16 @@ async fn thinking_map_enabled_is_brief_and_disabled_is_off() {
     assert_eq!(status, StatusCode::OK, "body = {enabled}");
     assert_eq!(
         enabled["usage"]["output_tokens"],
-        json!(4),
-        "enabled は brief 扱いで思考してから答える"
+        json!(1),
+        "enabled は off 扱いで即答"
     );
-    assert_eq!(enabled["content"][0]["text"], "t13 t14 t15");
+    assert_eq!(enabled["content"][0]["text"], "");
 
-    // 文字列 "brief" と同一出力 (同一経路 = 決定的誘導文注入)
-    let (_, brief) = post(&app, request_body("t0", 20, false, Some("brief"))).await;
+    // 文字列 "off" と同一出力 (同一経路・決定的)
+    let (_, off) = post(&app, request_body("t0", 20, false, Some("off"))).await;
     assert_eq!(
-        enabled["content"][0]["text"], brief["content"][0]["text"],
-        "マップ enabled は文字列 brief と同一経路であるべき"
+        enabled["content"][0]["text"], off["content"][0]["text"],
+        "マップ enabled は文字列 off と同一経路であるべき"
     );
 
     // disabled は off 扱い (即 EOS・1 トークン)
@@ -312,9 +320,10 @@ async fn thinking_map_unknown_type_is_rejected_with_400() {
     }
 }
 
-/// s52 E2E: Hermes デスクトップが送る同一形状の本文 (thinking マップ +
+/// s52/s53c E2E: Hermes デスクトップが送る同一形状の本文 (thinking マップ +
 /// system/message を text block 配列 + cache_control 付き) で 200 を確認する
-/// (CPU 経路・実エンジン注入なしの wire テスト)。
+/// (CPU 経路・実エンジン注入なしの wire テスト)。enabled は off 写像のため
+/// 即答 (テキスト空) になる。
 #[tokio::test]
 async fn thinking_hermes_shaped_request_returns_200() {
     let app = test_app_with(thinking_sim_engine("think-sim").unwrap(), 8);
@@ -335,7 +344,7 @@ async fn thinking_hermes_shaped_request_returns_200() {
     assert_eq!(resp["type"], "message");
     assert_eq!(resp["stop_reason"], "end_turn");
     assert_eq!(
-        resp["content"][0]["text"], "t13 t14 t15",
-        "thinking マップは brief 扱い (思考フィラ + 完答)"
+        resp["content"][0]["text"], "",
+        "thinking マップ enabled は off 扱い (即答)"
     );
 }
