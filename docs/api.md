@@ -13,6 +13,10 @@ Anthropic Messages API 互換。対応フィールド:
 | `temperature` | 0 で greedy |
 | `top_p`, `top_k` | 対応 |
 | `stop_sequences` | 生成テキスト中の最も早い出現で打ち切り |
+| `repetition_penalty` | A2.5: HF 互換の反復ペナルティ (任意。未指定/1.0 = 無効) |
+| `frequency_penalty` | s56: OpenAI 互換。文脈中の出現回数 × 係数を減算 (任意。未指定/0 = 無効)。詳細は §反復抑止 |
+| `presence_penalty` | s56: OpenAI 互換。文脈に 1 回以上現れたトークンから係数を 1 回減算 (任意。未指定/0 = 無効)。詳細は §反復抑止 |
+| `no_repeat_ngram_size` | s56: 既出 n-gram の続きを禁止 (任意。2〜1024。未指定 = 無効)。詳細は §反復抑止 |
 | `stream` | true で SSE |
 | `tools` | tool use 対応 (下記 §tool use)。空配列は tools 無しと同一 |
 | `tool_choice` | `"auto"` / `"none"` / `"any"` / `{"type":"tool","name":"..."}`。既定 auto。tools 無しでの指定は 400 |
@@ -120,6 +124,39 @@ denno 拡張のトップレベル任意フィールド (s47・未指定 = `brief
 - 文字列 / オブジェクト以外 (数値・真偽値・配列等) も 400
 
 不正値の 400 は `tool_choice` と同一のバリデーション慣習 (エラー形式は §エラー形式)。
+
+## 反復抑止 (repetition_penalty / frequency_penalty / presence_penalty / no_repeat_ngram_size)
+
+denno 拡張のトップレベル任意フィールド (s56)。A2.5 の `repetition_penalty` に 3 種を追加した。
+**すべて未指定 (または無効値) なら従来経路とビット完全一致** — 数値経路は no-op で、適用自体を省略する。
+
+| フィールド | 範囲 | 無効値 | 意味 |
+| --- | --- | --- | --- |
+| `repetition_penalty` | 有限値 (1.0 で無効) | 未指定 / `1.0` | HF 互換。正の logit は除算・負は乗算 (A2.5・既存仕様) |
+| `frequency_penalty` | 有限値 (推奨 −2.0〜2.0) | 未指定 / `0.0` | 文脈中の**出現回数 × 係数**を logit から減算 |
+| `presence_penalty` | 有限値 (推奨 −2.0〜2.0) | 未指定 / `0.0` | 文脈に**1 回以上**現れたトークンから係数を **1 回だけ**減算 |
+| `no_repeat_ngram_size` | 整数 `2..=1024` | 未指定 | 文脈に既出の n-gram の**続き**を `-inf` で禁止 (llama.cpp / HF 準拠) |
+
+- `frequency_penalty` / `presence_penalty` は OpenAI 互換の意味で、**`repetition_penalty` とは独立・別物** (前者は単純減算のみ)。負値は加算方向に働く。範囲外も拒否しない (既存 `temperature` と同じ作法)
+- `no_repeat_ngram_size` が **1 以下または 1024 超なら 400** (`n == 1` は「直前トークン自身を禁止」という別の意味になり、無効と区別できないため明示的に弾く。無効化はフィールドを省略する)
+- NaN / inf (JSON の `1e40` 等) は 400 invalid_request_error。`0.0` / `-0.0` は `None` に正規化する
+
+**適用順** (この順序はビット契約の一部で、変えてはならない):
+
+```text
+生 logits
+  → ① repetition_penalty     (A2.5 の既存処理・位置/意味は不変)
+  → ② frequency_penalty      (出現回数 × 係数の減算)
+  → ③ presence_penalty       (出現有無につき 1 回の減算)
+  → ④ no_repeat_ngram_size   (既出 n-gram の続きを -inf)
+  → temperature → top-k → top-p → sample
+```
+
+- 逐次 decode とバッチ decode は同じ関数 (`AntiRepetition::apply`) を通るため、バッチ構成は出力に影響しない (RNG 不使用・決定論契約は不変)
+- ①〜④ がすべて無効のとき `logits` には一切触らない (0 の減算すらしない = `-0.0` の符号も変わらない)
+- 順序についての正直な注記: ②③ の内部順序は f32 で観測可能だが、④ を ②③ の前後どちらに置いても `-inf` マスクが支配するため f32 では観測できない (変異テストで生存を確認)。「最後に置く」はコード構造とこの仕様で担保する
+
+参考実装: HF transformers `NoRepeatNGramLogitsProcessor` (Apache-2.0) / llama.cpp (MIT) の着想による独自実装 (逐語コピー無し)。
 
 ## SSE イベント列 (stream: true)
 

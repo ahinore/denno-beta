@@ -1272,6 +1272,34 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 **テスト**: `cargo test --workspace` **261 passed / 0 failed / 18 ignored** (s53 と同一 = 数値経路無変更の裏取り)。実機の内訳計測 (GPU) は人間対応
 
+### 反復抑止の opt-in 3 種 — no_repeat_ngram / frequency / presence (s56/s57) ✅ (2026-10-19)
+
+> 第56/57セッション。A2.5 の `repetition_penalty` だけでは長文の反復崩れを抑えきれないため、OpenAI 互換の `frequency_penalty` / `presence_penalty` と、llama.cpp / HF 互換の `no_repeat_ngram_size` を**追加の opt-in**として足した。**既定はすべて無効で、出力は従来とビット完全一致**(既存の A2.5 経路も意味・適用位置を変えない)。
+
+**実装**:
+
+- `sampler.rs`: `FreqPresencePenalty { frequency, presence }` / `context_counts()` / `apply_freq_presence_penalty()` / `apply_no_repeat_ngram()` / `AntiRepetition { apply() }`。`AntiRepetition::is_noop()` が「4 つすべて無効」を判定し、呼び出し側はこれで**文脈構築も counts 確保も省く**(既定経路のコストまで不変)
+- `engine.rs`: `GenParams` に 3 フィールド追加 (`no_repeat_ngram_size` / `frequency_penalty` / `presence_penalty`)。`ChatSession` の `repetition_penalty: Option<f32>` を `anti_rep: AntiRepetition` に置換し、`apply_session_penalty` を**逐次 (`step_chat`)・バッチ (`step_chat_batch`) の共通入口**にした (片経路だけに入れない)
+- `denno-server`: `MessagesRequest` に 3 フィールド + `parse_anti_repetition()` の検証 (NaN/inf は 400・`no_repeat_ngram_size` は 2 以上 1024 以下・`0.0` は `None` に正規化)
+- `denno-cli`: 3 フラグ + 同じ検証。`--raw` 経路も chat 経路と同じ `AntiRepetition::apply` を通す
+
+**適用順** (変えるとビット契約が壊れる):
+
+```text
+生 logits → ① repetition_penalty → ② frequency_penalty → ③ presence_penalty
+          → ④ no_repeat_ngram_size (-inf) → temperature → top-k → top-p → sample
+```
+
+**既定 no-op の担保**: `AntiRepetition::default()` と、明示的な無効値 (`1.0` / `0.0` / `-0.0` / `n<=1`) の全組み合わせで logits がビット不変であることをテストで固定。エンジン側は逐次・バッチ両経路の出力が無効値指定で一致することまで確認している
+
+**順序が観測できない箇所 (正直な注記)**: `frequency` と `presence` の**内部**順序は f32 で観測可能 (別々に減算すると丸めが変わる) ため、テストで順序を殺している。一方 **④ no_repeat_ngram を ②③ の前後どちらに置いても f32 では観測不能** (−inf マスクが前段の減算結果を上書きするため) — 変異テストでも生存を確認済み。よって「最後に置く」ことは**テストではなくコード構造と本ドキュメントで担保**する (意図: マスクは常に確定で、前段の数値に依存させない)
+
+**ライセンス**: `frequency`/`presence` は OpenAI の API 仕様 (公開パラメータ仕様) に合わせた独自実装、`no_repeat_ngram` は HF transformers `NoRepeatNGramLogitsProcessor` (Apache-2.0) と llama.cpp (MIT) の着想による独自再実装。逐語コピーは無し
+
+**未実施・既知の制限**: 反復崩れが実際に抑えられるかの**品質評価は GPU 実機なしでは不可 = 人間対応**。CUDA ビルド/実行も人間対応。int8/fp32 量子化との相互作用は未評価
+
+**テスト**: `cargo test --workspace` **290 passed / 0 failed / 18 ignored** (ベースライン 264 から +26)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
