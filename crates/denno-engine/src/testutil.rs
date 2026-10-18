@@ -123,8 +123,25 @@ pub const TOOL_VOCAB: &[(&str, u32)] = &[
 
 /// tool use E2E テスト用トークナイザ (ByteLevel decoder + TOOL_VOCAB)。
 pub fn tool_tokenizer() -> Result<DennoTokenizer> {
+    tool_tokenizer_with(&[])
+}
+
+/// s53: TOOL_VOCAB に追加語彙を足したトークナイザ (ByteLevel decoder)。
+///
+/// WordLevel + 空白 pre-tokenizer のため、**1 語として現れる**追加 piece だけが
+/// 追加語彙に一致する。id は 40 以降を重複順に割り当てる (決定的)。
+pub fn tool_tokenizer_with(extra: &[&str]) -> Result<DennoTokenizer> {
+    let mut vocab: Vec<(&str, u32)> = TOOL_VOCAB.to_vec();
+    let mut next = 40u32;
+    for &e in extra {
+        if vocab.iter().any(|(t, _)| *t == e) {
+            continue;
+        }
+        vocab.push((e, next));
+        next += 1;
+    }
     DennoTokenizer::testutil_vocab_tokenizer(
-        TOOL_VOCAB,
+        &vocab,
         Some(serde_json::json!({
             "type": "ByteLevel", "add_prefix_space": false,
             "trim_offsets": true, "use_regex": true

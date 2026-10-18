@@ -200,6 +200,12 @@ pub struct ChatSession {
     logits: Vec<f32>,
     generated: Vec<u32>,
     text: String,
+    /// s53: ストリームへ送出済みのバイト数 (sent_len)。
+    /// 不変条件: `text[..sent_len]` = 送出済み、`text[sent_len..]` = holdback 中
+    /// (未送出)。holdback は「ロールラベル停止マーカーの prefix になり得る」
+    /// 末尾のみで、生成終了時 (flush_stream 後) は必ず `sent_len == text.len()`
+    /// になる (通常応答の最終テキスト不変)。
+    sent_len: usize,
     max_tokens: usize,
     stop_sequences: Vec<String>,
     sampler: Sampler,
@@ -690,6 +696,7 @@ impl Engine {
             logits: Vec::new(),
             generated: Vec::new(),
             text: String::new(),
+            sent_len: 0,
             max_tokens,
             stop_sequences: params.stop_sequences.clone(),
             sampler,
@@ -885,11 +892,16 @@ impl Engine {
         Ok(true)
     }
 
-    /// 生成終了時のフラッシュ: emit で保留中のトークン (末尾がマルチバイト
-    /// 文字の途中で終わるバイト列) を最終 decode で確定させて流す。
-    /// EOS / max_tokens で打ち切られたステップでは通常の emit が行われない
-    /// (または保留が起きる) ため、完了時に必ず呼ぶ。
-    /// `exclude_last` は decode から除外する末尾トークン数 (EOS 分 = 1)。
+    /// 生成終了時のフラッシュ: decode の保留分 (末尾がマルチバイト文字の
+    /// 途中で終わるトークン) と s53 の holdback (`sess.text[sess.sent_len..]`)
+    /// をまとめて確定させて流す。
+    /// EOS / max_tokens / stop sequence / ロールラベル停止で打ち切られた
+    /// ステップでは通常の emit が行われない (または保留が起きる) ため、
+    /// 完了時に必ず呼ぶ。`exclude_last` は decode から除外する末尾トークン数
+    /// (EOS 分 = 1)。
+    ///
+    /// 不変条件: 送出すべきは `text[sent_len..]` のみ (既送出分は再送しない)。
+    /// 呼び出し後 `sent_len == text.len()`。
     fn flush_stream(
         &self,
         sess: &mut ChatSession,
@@ -897,18 +909,36 @@ impl Engine {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<()> {
         let n = sess.generated.len().saturating_sub(exclude_last);
-        let full = self.tok.decode(&sess.generated[..n])?; // lossy (不正バイトは U+FFFD)
-        if full.len() > sess.text.len() && full.is_char_boundary(sess.text.len()) {
-            let delta = &full[sess.text.len()..];
-            on_delta(delta);
-            sess.text.push_str(delta);
+        let full = match self.tok.decode(&sess.generated[..n]) {
+            Ok(t) => t, // lossy (不正バイトは U+FFFD)
+            // decode 失敗時も holdback は必ず解放する (送出は確定済み分のみ)
+            Err(e) => {
+                if sess.sent_len < sess.text.len() {
+                    let start = sess.sent_len;
+                    sess.sent_len = sess.text.len();
+                    on_delta(&sess.text[start..]);
+                }
+                return Err(e);
+            }
+        };
+        // 既に確定済みの text (holdback 分も含む) に続きがあれば text へ取り込み
+        let confirmed = sess.sent_len;
+        if full.len() > confirmed && full.is_char_boundary(confirmed) {
+            sess.text.truncate(confirmed);
+            sess.text.push_str(&full[confirmed..]);
+        }
+        if sess.sent_len < sess.text.len() {
+            let start = sess.sent_len;
+            sess.sent_len = sess.text.len();
+            on_delta(&sess.text[start..]);
         }
         Ok(())
     }
 
-    /// decode 1 ステップの共通後処理: 差分ストリーミング + stop_sequences チェック。
-    /// stop_sequence で打ち切るときは sess の stop_reason/stop_sequence を設定し
-    /// true を返す。step_chat / step_chat_batch の両方から使う。
+    /// decode 1 ステップの共通後処理: 差分ストリーミング (s53 holdback 付き) +
+    /// stop_sequences / ロールラベル停止のチェック。
+    /// 打ち切るときは sess の stop_reason/stop_sequence を設定し true を返す。
+    /// step_chat / step_chat_batch の両方から使う。
     fn emit_delta_and_check_stop(
         &self,
         sess: &mut ChatSession,
@@ -929,28 +959,77 @@ impl Engine {
             }
             Ok(full)
         })?;
-        if full.len() > sess.text.len() && full.is_char_boundary(sess.text.len()) {
-            let delta = &full[sess.text.len()..];
-            on_delta(delta);
-            sess.text.push_str(delta);
+        // 確定済み分 (送出于定の範囲) に新しい差分を追記する。
+        // 不変条件: sent_len は追記後に変えない (= 送出済み境界は固定)。
+        let confirmed = sess.sent_len;
+        if full.len() > confirmed && full.is_char_boundary(confirmed) {
+            sess.text.truncate(confirmed);
+            sess.text.push_str(&full[confirmed..]);
+        }
+        // s53: 生成テキストにロールラベル (チャットテンプレート由来の
+        // `user` / `assistant` / `system` 行・特殊トークン) が現れたら、
+        // マーカー自体を出力せず打ち切る。判定はトークンではなくテキスト列に
+        // 対して行う (決定的)。判定対象は未送出部分 (sent_len 以降)。
+        // マーカー長は最長 12 バイト程度なので、末尾の「マーカーの prefix に
+        // なり得る部分」は holdback で保持し、確定後に送出する。
+        if let Some((idx, marker)) = find_stop_marker(&sess.text[sess.sent_len..]) {
+            let at = sess.sent_len + idx;
+            sess.text.truncate(at);
+            sess.sent_len = sess.text.len();
+            sess.stop_reason = StopReason::StopSequence;
+            sess.stop_sequence = Some(marker);
+            return Ok(true);
         }
 
-        // stop_sequences チェック(生成テキスト中の最も早い出現で打ち切り)
-        if let Some(seq) = sess
+        // stop_sequences チェック(未送出部分の中で最も早い出現で打ち切り)。
+        // s53: クライアント指定 stop は上記ロールラベルと併用し、テキスト上の
+        // 最も早い停止位置で打ち切る (既送出分に打ち切り位置が来ることはない)。
+        if let Some((idx, seq)) = sess
             .stop_sequences
             .iter()
-            .find(|s| !s.is_empty() && sess.text.contains(s.as_str()))
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| sess.text[sess.sent_len..].find(s.as_str()).map(|i| (i, s.clone())))
+            .min_by_key(|(i, _)| *i)
         {
-            let idx = sess
-                .stop_sequences
-                .iter()
-                .filter_map(|s| sess.text.find(s.as_str()))
-                .min()
-                .unwrap_or(sess.text.len());
-            sess.text.truncate(idx);
+            let at = sess.sent_len + idx;
+            sess.text.truncate(at);
+            sess.sent_len = sess.text.len();
             sess.stop_reason = StopReason::StopSequence;
-            sess.stop_sequence = Some(seq.clone());
+            sess.stop_sequence = Some(seq);
             return Ok(true);
+        }
+
+        // s53: 送出タイミング制御。未送出テキストが
+        //   - マーカーに一致したら送出せず打ち切る (生成ループも終了)
+        //   - マーカーを含まず・その prefix にもなり得ないなら全文送出
+        //   - prefix になり得るならその手前まで送出し、末尾は保持
+        let start = sess.sent_len;
+        match overall_stop_status(&sess.text[start..]) {
+            StopStatus::Matched(idx, marker) => {
+                let at = start + idx;
+                sess.text.truncate(at);
+                sess.sent_len = sess.text.len();
+                sess.stop_reason = StopReason::StopSequence;
+                sess.stop_sequence = Some(marker);
+                return Ok(true);
+            }
+            StopStatus::Partial(k) => {
+                // k は text 側の char 境界に丸める (安全弁・通常は境界一致)
+                let mut end = (start + k).min(sess.text.len());
+                while end > start && !sess.text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if end > start {
+                    on_delta(&sess.text[start..end]);
+                }
+                sess.sent_len = end;
+            }
+            StopStatus::Clear => {
+                if start < sess.text.len() {
+                    on_delta(&sess.text[start..]);
+                }
+                sess.sent_len = sess.text.len();
+            }
         }
         Ok(false)
     }
@@ -1134,6 +1213,190 @@ fn pick_caches<'a>(
         result.push(r);
     }
     result
+}
+
+/// s53: ロールラベル停止マーカーの最長バイト長。
+///
+/// 最長は特殊トークン文字列 `<|im_start|>` (12 バイト)。holdback の上限と
+/// 「マーカーが完成し得る末尾」の計算に使う (これより短い prefix だけを保持する)。
+pub const MAX_STOP_MARKER_LEN: usize = 12;
+
+/// s53: 特殊トークン文字列マーカー (出現位置を問わず即停止)。
+const STOP_SPECIAL_MARKERS: [&str; 2] = ["<|im_start|>", "<|im_end|>"];
+
+/// s53: 単独行のロールラベル名 (行頭の空白許容・直後は行末 or `:` / `：` のみ)。
+const STOP_LINE_LABELS: [&str; 3] = ["user", "assistant", "system"];
+
+/// `s[i..]` の先頭で `needle` の途中まで (1 文字以上) 一致している最大長を返す
+/// (完全一致は含まない = 完全一致を「部分」と誤判定しない)。
+fn partial_prefix_len(s: &str, needle: &str) -> usize {
+    let max = s.len().min(needle.len().saturating_sub(1));
+    let mut best = 0usize;
+    for (i, ch) in s.char_indices() {
+        let end = i + ch.len_utf8();
+        if end > max {
+            break;
+        }
+        if needle.is_char_boundary(end) && needle[..end] == s[..end] {
+            best = end;
+        }
+    }
+    best
+}
+
+/// 単独行マーカー (`user` / `assistant` / `system`) がテキスト位置 `i` で
+/// 開始しているかを判定する。成立時はマーカー名を返す。
+///
+/// - 行頭 (テキスト先頭 or 直前が `\n`) + 行頭の空白 (` ` / `\t`) は許容
+/// - 直後は行末 / `\r\n` / `:` / `：` のみ (前後に空白許容)
+fn line_label_at(text: &str, i: usize) -> Option<&'static str> {
+    STOP_LINE_LABELS
+        .iter()
+        .find(|label| tail_is_line_end(&text[i..], label).is_some())
+        .copied()
+}
+
+/// `s` (行頭から始まる文字列) が `label` + 許可される末尾で **確定** して
+/// いるかを判定する。`label` 自体が `s` より長くても、`s` が `label` の
+/// prefix ならば「まだ確定していないが候補」として扱わない (確定のみ判定)。
+fn tail_is_line_end(s: &str, label: &str) -> Option<usize> {
+    let body = s.trim_start_matches([' ', '\t']);
+    let after = body.strip_prefix(label)?;
+    let tail = after.trim_start_matches([' ', '\t']);
+    let end = tail.len();
+    let ok = end == 0
+        || tail == "\n"
+        || tail == "\r\n"
+        || tail.starts_with(":\n")
+        || tail.starts_with(":\r")
+        || tail.starts_with("：\n")
+        || tail.starts_with("：\r");
+    ok.then_some(body.len() - tail.len())
+}
+
+/// `s` が「マーカーの prefix になり得る」場合、保持すべき先頭 (= マーカー候補の
+/// 開始位置) を返す。確定済みのマーカー・無関係なテキストでは `None`。
+///
+/// `s` は「行頭からの suffix」として渡す。マーカー候補の開始は行頭の空白を
+/// 読み飛ばした位置 (= 送出してよい手前) になる。
+fn partial_holdback(s: &str) -> Option<usize> {
+    let body_off = s.len() - s.trim_start_matches([' ', '\t']).len();
+    let body = &s[body_off..];
+    if body.is_empty() {
+        return None;
+    }
+    if STOP_SPECIAL_MARKERS
+        .iter()
+        .any(|m| partial_prefix_len(body, m) > 0)
+    {
+        return Some(body_off);
+    }
+    for label in STOP_LINE_LABELS {
+        // ラベル名の途中まで一致
+        if partial_prefix_len(body, label) > 0 {
+            return Some(body_off);
+        }
+        let Some(after) = body.strip_prefix(label) else {
+            continue;
+        };
+        let tail = after.trim_start_matches([' ', '\t']);
+        if tail.is_empty() {
+            // ラベル直後 (行末 / `:` が続くか未確定)
+            return Some(body_off);
+        }
+        if tail == "\r" {
+            // `\r\n` の `\n` が未確定
+            return Some(body_off);
+        }
+        // `:` / `：` の途中まで一致 (2 バイト文字の分断を含む)
+        if partial_prefix_len(tail, ":") > 0 || partial_prefix_len(tail, "：") > 0 {
+            return Some(body_off);
+        }
+        // `:` / `：` の直後 (改行が続くか未確定)
+        if tail == ":" || tail == "：" {
+            return Some(body_off);
+        }
+    }
+    None
+}
+
+/// テキスト `text` の中で (まだ確定していない位置 `i` 以降で) 最初に現れる
+/// ロールラベル停止マーカーの (開始バイト位置, マーカー文字列) を返す。
+///
+/// 本関数は **確定済みテキスト全体** を渡す前提。行頭判定が行をまたいで
+/// 正しく効くようにするため、呼び出し側は holdback を含む text 全体を渡す。
+fn find_stop_marker(text: &str) -> Option<(usize, String)> {
+    // 特殊トークン文字列: 出現位置を問わず即停止
+    if let Some((i, m)) = STOP_SPECIAL_MARKERS
+        .iter()
+        .filter_map(|m| text.find(m).map(|i| (i, *m)))
+        .min_by_key(|(i, _)| *i)
+    {
+        return Some((i, m.to_string()));
+    }
+    // 行頭 = テキスト先頭 or `\n` の直後
+    let mut line_start = 0usize;
+    loop {
+        if let Some(label) = line_label_at(text, line_start) {
+            return Some((line_start, label.to_string()));
+        }
+        match text[line_start..].find('\n') {
+            Some(k) => line_start += k + 1,
+            None => break,
+        }
+        if line_start >= text.len() {
+            break;
+        }
+    }
+    None
+}
+
+/// s53: 末尾テキストの停止可能性 (holdback 判定)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StopStatus {
+    /// 位置 `usize` でマーカーが確定した (マーカー文字列付き)。
+    Matched(usize, String),
+    /// 長さ `usize` はマーカーの prefix になり得る → 送出せず保持する。
+    Partial(usize),
+    /// 停止マーカーとは無関係 → 全文送出してよい。
+    Clear,
+}
+
+/// 末尾テキスト `s` (「この suffix が送信済みでない未確定部分」として渡す) の
+/// 停止可能性を判定する。
+///
+/// `s` がマーカーを含む場合はその開始位置 (s 先頭からのバイト位置) を返す。
+/// 含まない場合、`s` の末尾の「マーカーの prefix になり得る部分」の開始
+/// (= 保持すべき部分の開始バイト位置) を返す。どちらでもなければ `Clear`。
+fn overall_stop_status(s: &str) -> StopStatus {
+    // 1) 特殊トークン文字列が既に現れている
+    if let Some((i, m)) = STOP_SPECIAL_MARKERS
+        .iter()
+        .filter_map(|m| s.find(m).map(|i| (i, *m)))
+        .min_by_key(|(i, _)| *i)
+    {
+        return StopStatus::Matched(i, m.to_string());
+    }
+    // 2) 確定した単独行マーカー (行頭ごとに判定)
+    let mut line_starts: Vec<usize> = vec![0];
+    for (i, ch) in s.char_indices() {
+        if ch == '\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    for &st in &line_starts {
+        if st >= s.len() {
+            continue;
+        }
+        if let Some(label) = line_label_at(s, st) {
+            return StopStatus::Matched(st, label.to_string());
+        }
+    }
+    // 3) 最終行 (= まだ伸び得る唯一の行) の末尾がマーカーの prefix か
+    let last_start = *line_starts.last().unwrap();
+    partial_holdback(&s[last_start..])
+        .map(|k| StopStatus::Partial(last_start + k))
+        .unwrap_or(StopStatus::Clear)
 }
 
 #[cfg(test)]
@@ -1954,6 +2217,188 @@ mod tests {
         // 単一リクエストは 予算 / bpt = 98,304 トークンまで (32K prefill は 4GB)
         let need_32k = 32768 * bpt;
         assert_eq!(need_32k, 4 * 1024 * 1024 * 1024);
+    }
+
+    // ---------- s53: 停止条件の強化 (ロールラベル停止・holdback・stop 併用) ----------
+
+    /// スクリプト + トークナイザで生成を回し、送出 delta の列も返す。
+    /// (ScriptModel は 1 セッション専用・決定論的)
+    fn run_script_streamed(
+        script: &[u32],
+        extra_vocab: &[&str],
+        stop_sequences: Vec<String>,
+    ) -> (ChatOutput, Vec<String>) {
+        use std::cell::RefCell;
+        let tok = crate::testutil::tool_tokenizer_with(extra_vocab).unwrap();
+        let model = Box::new(crate::testutil::ScriptModel::new(script.to_vec(), tid("t0")));
+        let mut e = Engine::from_parts(model, tok, "m", None);
+        let deltas = RefCell::new(Vec::<String>::new());
+        let mut p = params(64);
+        p.stop_sequences = stop_sequences;
+        let mut sess = e.begin_chat(None, &msgs("t0"), &p).unwrap();
+        e.install_session(&mut sess).unwrap();
+        while !e
+            .step_chat(&mut sess, &mut |d: &str| deltas.borrow_mut().push(d.to_string()))
+            .unwrap()
+        {}
+        e.release_session(&mut sess);
+        (sess.into_output(), deltas.into_inner())
+    }
+
+    /// s53: 追加語彙 (40 以降) + 固定語彙の piece → id 逆引き。
+    fn vb(pieces: &[&str], piece: &str) -> u32 {
+        if let Some((_, id)) = crate::testutil::TOOL_VOCAB.iter().find(|(p, _)| *p == piece) {
+            return *id;
+        }
+        let mut next = 40u32;
+        for p in pieces {
+            let known = crate::testutil::TOOL_VOCAB.iter().any(|(t, _)| t == p);
+            if known {
+                continue;
+            }
+            if *p == piece {
+                return next;
+            }
+            next += 1;
+        }
+        panic!("vocab missing: {piece}");
+    }
+
+    /// piece 列 + 追加語彙 から (id 列, 追加語彙) を作る (重複順で 40 以降)。
+    fn script_extra<'a>(pieces: &[&'a str]) -> (Vec<u32>, Vec<&'a str>) {
+        let mut extra: Vec<&str> = Vec::new();
+        for p in pieces {
+            if crate::testutil::TOOL_VOCAB.iter().any(|(t, _)| t == p) {
+                continue;
+            }
+            if !extra.contains(p) {
+                extra.push(p);
+            }
+        }
+        let ids = pieces.iter().map(|p| vb(&extra, p)).collect();
+        (ids, extra)
+    }
+
+    #[test]
+    fn role_label_stops_and_excludes_marker() {
+        // 生成中に "\nuser\n" が現れたらマーカーを含めず打ち切る
+        let (ids, extra) = script_extra(&["Hello", "Ċ", "user", "Ċ", "next", "eos"]);
+        let out = run_script_streamed(&ids, &extra, Vec::new()).0;
+        // 直後の改行も「ラベル行の開始 (prefix)」として holdback 中に破棄される
+        assert_eq!(out.text, "Hello\n");
+        assert_eq!(out.stop_reason, StopReason::StopSequence);
+        assert_eq!(out.stop_sequence.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn role_label_stops_on_assistant_colon_and_im_end() {
+        let (ids, extra) = script_extra(&["A", "Ċ", "assistant", ":", "Ċ", "B", "eos"]);
+        let out = run_script_streamed(&ids, &extra, Vec::new()).0;
+        assert_eq!(out.text, "A\n");
+        assert_eq!(out.stop_reason, StopReason::StopSequence);
+        assert_eq!(out.stop_sequence.as_deref(), Some("assistant"));
+
+        // 特殊トークン文字列 <|im_end|> は行頭以外でも即停止
+        let (ids2, extra2) = script_extra(&["AB", "<|im_end|>", "C", "eos"]);
+        let out2 = run_script_streamed(&ids2, &extra2, Vec::new()).0;
+        assert_eq!(out2.text, "AB");
+        assert_eq!(out2.stop_reason, StopReason::StopSequence);
+        assert_eq!(out2.stop_sequence.as_deref(), Some("<|im_end|>"));
+    }
+
+    #[test]
+    fn partial_marker_is_not_streamed_until_confirmed() {
+        // "Hello" → "\n" → "user" (ここで確定 = 打ち切り) の間、
+        // on_delta に "u" / "us" / "use" 等の prefix が漏れない。
+        let (ids, extra) = script_extra(&["Hello", "Ċ", "user", "Ċ", "next", "eos"]);
+        let (out, deltas) = run_script_streamed(&ids, &extra, Vec::new());
+        let streamed: String = deltas.concat();
+        assert_eq!(streamed, out.text);
+        assert_eq!(streamed, "Hello\n");
+        // 不変条件: 終了時 sent_len == text.len() (送出漏れなし)
+        assert!(!streamed.contains('u'), "holdback leaked: {streamed:?}");
+        assert!(!streamed.contains("user"), "marker leaked: {streamed:?}");
+
+        // 打ち切られない通常応答では holdback 分も最終的に全て送出される
+        let (ids2, extra2) = script_extra(&["Hello", "Ċ", "userland", "Ċ", "ok", "eos"]);
+        let (out2, deltas2) = run_script_streamed(&ids2, &extra2, Vec::new());
+        assert_eq!(out2.stop_reason, StopReason::EndTurn);
+        assert_eq!(deltas2.concat(), out2.text);
+        assert_eq!(out2.text, "Hello\nuserland\nok");
+    }
+
+    #[test]
+    fn stop_marker_boundaries_crlf_and_fullwidth_colon() {
+        // MAX_STOP_MARKER_LEN (12) 境界: 11 バイトの prefix は保持・12 バイトで確定
+        assert_eq!(MAX_STOP_MARKER_LEN, 12);
+        // MAX_STOP_MARKER_LEN (12) の保持上限: 11 / 12 バイトは prefix で保持、
+        // 13 バイト目が混ざると prefix でなくなる (= 保持しない)
+        assert_eq!(partial_holdback("<|im_start|"), Some(0)); // 11 バイト
+        assert_eq!(overall_stop_status("<|im_end"), StopStatus::Partial(0)); // 8 バイト
+        // "zzz qqq" は特殊トークン文字列でもラベル prefix でもない → 保持しない
+        assert_eq!(overall_stop_status("zzz qqq"), StopStatus::Clear);
+        // 長さ 13 バイト以上でも「マーカー prefix で始まる最終行」なら保持される
+        assert_eq!(overall_stop_status("abc xyz <|im_"), StopStatus::Partial(0));
+        assert_eq!(overall_stop_status("abc\n<|im_en"), StopStatus::Partial(4));
+        // prefix の判定は「行 (= 最終行) の先頭がマーカー開始か」で行う
+        // (本文の途中から始まるマーカーは対象外・実際の停止判定は
+        //  find_stop_marker / Matched 経路が行う)
+        assert_eq!(partial_holdback("<|im_st"), Some(0));
+                assert_eq!(
+            overall_stop_status("a\nassistant:\n"),
+            StopStatus::Matched(2, "assistant".into())
+        );
+
+        // CRLF 行の "user" (tokenizer の ByteLevel デコーダは "\r" を落とすため
+        // テキスト上は "A\nuser\n..." になる)。判定は find_stop_marker 単体でも確認。
+        assert_eq!(
+            find_stop_marker("A\n   user:\r\nB"),
+            Some((2, "user".to_string()))
+        );
+        let (ids, extra) = script_extra(&["A", "Ċ", "user\r", "Ċ", "B", "eos"]);
+        let out = run_script_streamed(&ids, &extra, Vec::new()).0;
+        assert_eq!(out.text, "A\n");
+        assert_eq!(out.stop_sequence.as_deref(), Some("user"));
+
+        // 全角コロン "："
+        let (ids2, extra2) = script_extra(&["A", "Ċ", "system：", "Ċ", "B", "eos"]);
+        let out2 = run_script_streamed(&ids2, &extra2, Vec::new()).0;
+        assert_eq!(out2.text, "A\n");
+        assert_eq!(out2.stop_sequence.as_deref(), Some("system"));
+
+        // 行頭でない "user" は停止しない (行末でない "user" も確定しない)
+        let (ids3, extra3) = script_extra(&["trustee", "Ċ", "trusting", "eos"]);
+        let out3 = run_script_streamed(&ids3, &extra3, Vec::new()).0;
+        assert_eq!(out3.stop_reason, StopReason::EndTurn);
+        assert_eq!(out3.text, "trustee\ntrusting");
+    }
+
+    #[test]
+    fn client_stop_combines_with_role_label_earliest_wins() {
+        // クライアント stop が先に現れる → そちらで打ち切る
+        let (ids, extra) = script_extra(&["He", "llo", "Ċ", "user", "Ċ", "eos"]);
+        let out = run_script_streamed(&ids, &extra, vec!["llo".into()]).0;
+        assert_eq!(out.text, "He");
+        assert_eq!(out.stop_reason, StopReason::StopSequence);
+        assert_eq!(out.stop_sequence.as_deref(), Some("llo"));
+
+        // ロールラベルが先に現れる → そちらで打ち切る
+        let (ids2, extra2) = script_extra(&["Hi", "Ċ", "user", "Ċ", "llo", "eos"]);
+        let out2 = run_script_streamed(&ids2, &extra2, vec!["llo".into()]).0;
+        assert_eq!(out2.text, "Hi\n");
+        assert_eq!(out2.stop_reason, StopReason::StopSequence);
+        assert_eq!(out2.stop_sequence.as_deref(), Some("user"));
+
+        // 空文字列 stop は無視する (即停止・無限ループにならない)
+        let (ids3, extra3) = script_extra(&["Hello", "eos"]);
+        let out3 = run_script_streamed(&ids3, &extra3, vec!["".into()]).0;
+        assert_eq!(out3.text, "Hello");
+        assert_eq!(out3.stop_reason, StopReason::EndTurn);
+
+        // 複数 stop は最早一致
+        let (ids4, extra4) = script_extra(&["abc def", "eos"]);
+        let out4 = run_script_streamed(&ids4, &extra4, vec!["def".into(), "c d".into()]).0;
+        assert_eq!(out4.stop_sequence.as_deref(), Some("c d"));
     }
 
     // ---------- 第21: tool_choice 拘束デコード (engine 経路) ----------

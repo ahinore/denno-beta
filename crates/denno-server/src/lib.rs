@@ -113,16 +113,30 @@ impl IntoResponse for ApiError {
 /// 検知はクライアント切断時のみ有効) の対策として、未指定リクエストに上限を
 /// 保証する。Anthropic API 仕様上 max_tokens は必須だが、本サーバーは学習用
 /// ツールのため未指定を 400 にせず既定上限で受理する。
-pub const DEFAULT_MAX_TOKENS: usize = 4096;
+///
+/// s53: 4096 → **1024**。8095 運用で未指定リクエストが 4096 まで走り
+/// 単一ワーカーを長時間占有するケースが残ったため、既定を 1/4 に下げる。
+/// 明示指定は尊重する (clamp 上限 4096 は `MAX_TOKENS_CLAMP` 側で不変)。
+pub const DEFAULT_MAX_TOKENS: usize = 1024;
+
+/// s53: 明示指定時の上限 (clamp)。既定 (1024) とは独立。
+pub const MAX_TOKENS_CLAMP: usize = 4096;
 
 /// chat 経路の実効 max_tokens を決める (未指定 → `DEFAULT_MAX_TOKENS`)。
 /// `max_tokens` を優先し、無ければ OpenAI chat completions 互換の別名
-/// `max_completion_tokens` を使う。明示指定 (0 含む) はそのまま尊重する。
+/// `max_completion_tokens` を使う。
+///
+/// s53: 明示指定は `MAX_TOKENS_CLAMP` (4096) で clamp する。未指定時の既定は
+/// 1024 (単一ワーカーの長時間占有を防ぐ)。0 は「prefill のみ」の明示指定として
+/// 0 のまま尊重する (clamp は上限側のみ)。
 pub fn resolve_max_tokens(
     max_tokens: Option<usize>,
     max_completion_tokens: Option<usize>,
 ) -> usize {
-    max_tokens.or(max_completion_tokens).unwrap_or(DEFAULT_MAX_TOKENS)
+    max_tokens
+        .or(max_completion_tokens)
+        .unwrap_or(DEFAULT_MAX_TOKENS)
+        .min(MAX_TOKENS_CLAMP)
 }
 
 #[derive(Deserialize)]

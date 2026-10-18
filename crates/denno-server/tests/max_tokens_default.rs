@@ -7,11 +7,12 @@
 //! usage.output_tokens / stop_reason で実効 max_tokens を直接観測できる。
 //!
 //! カバー項目:
-//! - resolve_max_tokens の単体テスト (未指定 → 既定 4096・明示 → 尊重・別名・優先順位)
-//! - max_tokens 未指定 (非ストリーム) → DEFAULT_MAX_TOKENS で打ち切られ
+//! - resolve_max_tokens の単体テスト (未指定 → 既定 1024・明示 → 尊重・別名・優先順位)
+//! - max_tokens 未指定 (非ストリーム) → DEFAULT_MAX_TOKENS (1024) で打ち切られ
 //!   stop_reason = "max_tokens" (旧コードでは未指定は必須フィールド欠落で 400)
 //! - max_tokens 未指定 (stream=true) → SSE の message_delta で同一の打ち切り
-//! - 明示指定 (max_tokens=5) は尊重される (4096 に引き上げられない)
+//! - 明示指定 (max_tokens=5 / 2048) は尊重される (既定 1024 に切り下げられない)
+//! - 明示が上限 4096 を超える場合は 4096 に clamp される (s53)
 //! - OpenAI 互換別名 max_completion_tokens のみの指定も実効値になる
 //! - 両方指定時は max_tokens 優先 (Anthropic 形式のネイティブ名優先)
 //! - 明示 0 も 0 として尊重する (既定へフォールバックしない)
@@ -25,12 +26,14 @@ use denno_engine::kv_cache::KvCache;
 use denno_engine::model::Model;
 use denno_engine::testutil::{dummy_tokenizer, DUMMY_EOS, DUMMY_VOCAB};
 use denno_engine::Engine;
-use denno_server::{resolve_max_tokens, AppState, Scheduler, DEFAULT_MAX_TOKENS};
+use denno_server::{
+    resolve_max_tokens, AppState, Scheduler, DEFAULT_MAX_TOKENS, MAX_TOKENS_CLAMP,
+};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-/// テスト用モデルのコンテキスト長 (既定上限 4096 + プロンプトが収まる大きさ)
+/// テスト用モデルのコンテキスト長 (clamp 上限 4096 + プロンプトが収まる大きさ)
 const TEST_CONTEXT: usize = 8192;
 
 /// EOS を決して出力しない決定論的ダミーモデル (peak = 直前トークン + 1、
@@ -98,13 +101,18 @@ async fn post(app: &Router, body: Value) -> (StatusCode, Value) {
 
 #[test]
 fn resolve_max_tokens_applies_default_only_when_unspecified() {
-    // 未指定 → 既定上限
+    // 未指定 → 既定上限 (s53: 1024)
     assert_eq!(resolve_max_tokens(None, None), DEFAULT_MAX_TOKENS);
-    assert_eq!(DEFAULT_MAX_TOKENS, 4096);
-    // 明示指定は尊重 (0・巨大値含む)
+    assert_eq!(DEFAULT_MAX_TOKENS, 1024);
+    // 明示指定は尊重 (0・既定超え・上限まで)
     assert_eq!(resolve_max_tokens(Some(5), None), 5);
     assert_eq!(resolve_max_tokens(Some(0), None), 0);
-    assert_eq!(resolve_max_tokens(Some(100_000), None), 100_000);
+    assert_eq!(resolve_max_tokens(Some(2048), None), 2048);
+    assert_eq!(resolve_max_tokens(Some(MAX_TOKENS_CLAMP), None), MAX_TOKENS_CLAMP);
+    // s53: 上限 4096 を超える明示は clamp される (未指定の既定 1024 とは独立)
+    assert_eq!(MAX_TOKENS_CLAMP, 4096);
+    assert_eq!(resolve_max_tokens(Some(100_000), None), MAX_TOKENS_CLAMP);
+    assert_eq!(resolve_max_tokens(None, Some(100_000)), MAX_TOKENS_CLAMP);
     // OpenAI 互換別名のみ → 別名を採用
     assert_eq!(resolve_max_tokens(None, Some(7)), 7);
     // 両方 → max_tokens 優先
