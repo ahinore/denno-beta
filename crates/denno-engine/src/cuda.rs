@@ -6584,12 +6584,13 @@ mod tests {
         enable_for_tests();
         let _ctx = CudaCtx::new().unwrap();
         // 番兵キー (MIRROR_TEST_KEY = u64::MAX-1 / 別テストの u64::MAX-3 と衝突しない)
-        let key = u64::MAX - 5;
+        // flush は cache.kv_id() で検索するため、テストのミラーキーは cache の自動採番 id を使う
         let (nk, nv, dk, dv, d_conv) = (2usize, 4, 8, 8, 4);
         let conv_len = (2 * nk * dk + nv * dv) * (d_conv - 1); // 192
         let ssm_len = nv * dk * dv; // 256
         let mut cache = crate::kv_cache::KvCache::new(1, 64, 256);
         cache.attach_gdn_slot(0, conv_len, ssm_len);
+        let key = cache.kv_id(); // プロセス内で一意 = chain_q35_gdn_flush_pending の検索キーと一致
 
         // 面に既知パターンを書く: face0 = A (state at target)、face1 = B (state at target+1)
         let conv_a = pseudo_random(conv_len, 81);
@@ -6627,7 +6628,7 @@ mod tests {
         };
         let mirror_pending = || {
             let mirrors = KV_MIRRORS.get().unwrap();
-            let ms = mirrors.lock().unwrap();
+            let mut ms = mirrors.lock().unwrap();
             let idx = ms.iter().position(|(k, _, _)| *k == key).unwrap();
             ms[idx].1.gdn_pending
         };
@@ -6706,12 +6707,16 @@ mod tests {
 
         // ③ epoch 不一致 (reset = ホストが正) → pending 破棄の no-op
         cache.reset(); // GDN スロットは 0 埋め・epoch +1
-        with_mirror_ext(key, 0, 1, 4, 0, cache.epoch(), false, |m, _| {
-            m.gdn_pos[0] = Some(9);
-            m.gdn_pending = Some(9);
-            Some(())
-        })
-        .unwrap();
+        // with_mirror_ext は epoch を同期してしまうため使わない。直接ロックで
+        // 旧世代 (reset 前の epoch) のミラーに pending を設定し、epoch 不一致の
+        // 状態を再現する。
+        {
+            let mirrors = KV_MIRRORS.get().unwrap();
+            let mut ms = mirrors.lock().unwrap();
+            let idx = ms.iter().position(|(k, _, _)| *k == key).unwrap();
+            ms[idx].1.gdn_pos[0] = Some(9);
+            ms[idx].1.gdn_pending = Some(9);
+        }
         assert_eq!(chain_q35_gdn_flush_pending(&mut cache), Some(()));
         assert_eq!(mirror_pending(), None, "③epoch 不一致で pending は破棄");
         let (hc, hs) = host(&mut cache);
