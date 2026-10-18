@@ -972,8 +972,7 @@ impl Engine {
         // 対して行う (決定的)。判定対象は未送出部分 (sent_len 以降)。
         // マーカー長は最長 12 バイト程度なので、末尾の「マーカーの prefix に
         // なり得る部分」は holdback で保持し、確定後に送出する。
-        if let Some((idx, marker)) = find_stop_marker(&sess.text[sess.sent_len..]) {
-            let at = sess.sent_len + idx;
+        if let Some((at, marker)) = find_stop_marker(&sess.text, sess.sent_len) {
             sess.text.truncate(at);
             sess.sent_len = sess.text.len();
             sess.stop_reason = StopReason::StopSequence;
@@ -1004,7 +1003,8 @@ impl Engine {
         //   - マーカーを含まず・その prefix にもなり得ないなら全文送出
         //   - prefix になり得るならその手前まで送出し、末尾は保持
         let start = sess.sent_len;
-        match overall_stop_status(&sess.text[start..]) {
+        let at_line_start = start == 0 || sess.text[..start].ends_with('\n');
+        match overall_stop_status(&sess.text[start..], at_line_start) {
             StopStatus::Matched(idx, marker) => {
                 let at = start + idx;
                 sess.text.truncate(at);
@@ -1325,20 +1325,28 @@ fn partial_holdback(s: &str) -> Option<usize> {
 ///
 /// 本関数は **確定済みテキスト全体** を渡す前提。行頭判定が行をまたいで
 /// 正しく効くようにするため、呼び出し側は holdback を含む text 全体を渡す。
-fn find_stop_marker(text: &str) -> Option<(usize, String)> {
-    // 特殊トークン文字列: 出現位置を問わず即停止
+fn find_stop_marker(text: &str, start: usize) -> Option<(usize, String)> {
+    if start > text.len() {
+        return None;
+    }
+    // 特殊トークン文字列: 出現位置を問わず即停止 (絶対位置で返す)
     if let Some((i, m)) = STOP_SPECIAL_MARKERS
         .iter()
-        .filter_map(|m| text.find(m).map(|i| (i, *m)))
+        .filter_map(|m| text[start..].find(m).map(|i| (start + i, *m)))
         .min_by_key(|(i, _)| *i)
     {
         return Some((i, m.to_string()));
     }
-    // 行頭 = テキスト先頭 or `\n` の直後
-    let mut line_start = 0usize;
+    // 行頭 = テキスト先頭 or `\n` の直後 (text 全体基準)。
+    // s53b: `start` はチャンク境界で単語の途中に落ち得るため、`start` を含む行
+    // から走査し、`start` より前の行頭は判定しない (旧実装は
+    // `&text[sent_len..]` を渡して本文中の "system" を誤検知していた)。
+    let mut line_start = text[..start].rfind('\n').map(|p| p + 1).unwrap_or(0);
     loop {
-        if let Some(label) = line_label_at(text, line_start) {
-            return Some((line_start, label.to_string()));
+        if line_start >= start {
+            if let Some(label) = line_label_at(text, line_start) {
+                return Some((line_start, label.to_string()));
+            }
         }
         match text[line_start..].find('\n') {
             Some(k) => line_start += k + 1,
@@ -1368,7 +1376,12 @@ enum StopStatus {
 /// `s` がマーカーを含む場合はその開始位置 (s 先頭からのバイト位置) を返す。
 /// 含まない場合、`s` の末尾の「マーカーの prefix になり得る部分」の開始
 /// (= 保持すべき部分の開始バイト位置) を返す。どちらでもなければ `Clear`。
-fn overall_stop_status(s: &str) -> StopStatus {
+///
+/// s53b: `at_line_start` は `s` がテキスト全体の真の行頭から始まるかを示す。
+/// `s` はチャンク境界 (sent_len) から切り出されるため単語の途中から始まり得る。
+/// その場合に単独行ラベルの Matched を返すと本文中の "system" 等を誤検知する
+/// ため、行頭からのときのみラベル判定を行う。
+fn overall_stop_status(s: &str, at_line_start: bool) -> StopStatus {
     // 1) 特殊トークン文字列が既に現れている
     if let Some((i, m)) = STOP_SPECIAL_MARKERS
         .iter()
@@ -1377,8 +1390,8 @@ fn overall_stop_status(s: &str) -> StopStatus {
     {
         return StopStatus::Matched(i, m.to_string());
     }
-    // 2) 確定した単独行マーカー (行頭ごとに判定)
-    let mut line_starts: Vec<usize> = vec![0];
+    // 2) 確定した単独行マーカー (行頭ごとに判定・真の行頭からのみ)
+    let mut line_starts: Vec<usize> = if at_line_start { vec![0] } else { Vec::new() };
     for (i, ch) in s.char_indices() {
         if ch == '\n' {
             line_starts.push(i + 1);
@@ -1393,7 +1406,8 @@ fn overall_stop_status(s: &str) -> StopStatus {
         }
     }
     // 3) 最終行 (= まだ伸び得る唯一の行) の末尾がマーカーの prefix か
-    let last_start = *line_starts.last().unwrap();
+    // s53b: at_line_start=false かつ改行無しのチャンクでは空 (先頭行扱い)。
+    let last_start = line_starts.last().copied().unwrap_or(0);
     partial_holdback(&s[last_start..])
         .map(|k| StopStatus::Partial(last_start + k))
         .unwrap_or(StopStatus::Clear)
@@ -2334,27 +2348,43 @@ mod tests {
         // MAX_STOP_MARKER_LEN (12) の保持上限: 11 / 12 バイトは prefix で保持、
         // 13 バイト目が混ざると prefix でなくなる (= 保持しない)
         assert_eq!(partial_holdback("<|im_start|"), Some(0)); // 11 バイト
-        assert_eq!(overall_stop_status("<|im_end"), StopStatus::Partial(0)); // 8 バイト
+        assert_eq!(overall_stop_status("<|im_end", true), StopStatus::Partial(0)); // 8 バイト
         // "zzz qqq" は特殊トークン文字列でもラベル prefix でもない → 保持しない
-        assert_eq!(overall_stop_status("zzz qqq"), StopStatus::Clear);
+        assert_eq!(overall_stop_status("zzz qqq", true), StopStatus::Clear);
         // 長さ 13 バイト以上でも「マーカー prefix で始まる最終行」なら保持される
-        assert_eq!(overall_stop_status("abc xyz <|im_"), StopStatus::Partial(0));
-        assert_eq!(overall_stop_status("abc\n<|im_en"), StopStatus::Partial(4));
+        assert_eq!(overall_stop_status("abc xyz <|im_", true), StopStatus::Partial(0));
+        assert_eq!(overall_stop_status("abc\n<|im_en", true), StopStatus::Partial(4));
         // prefix の判定は「行 (= 最終行) の先頭がマーカー開始か」で行う
         // (本文の途中から始まるマーカーは対象外・実際の停止判定は
         //  find_stop_marker / Matched 経路が行う)
         assert_eq!(partial_holdback("<|im_st"), Some(0));
                 assert_eq!(
-            overall_stop_status("a\nassistant:\n"),
+            overall_stop_status("a\nassistant:\n", true),
             StopStatus::Matched(2, "assistant".into())
         );
 
         // CRLF 行の "user" (tokenizer の ByteLevel デコーダは "\r" を落とすため
         // テキスト上は "A\nuser\n..." になる)。判定は find_stop_marker 単体でも確認。
         assert_eq!(
-            find_stop_marker("A\n   user:\r\nB"),
+            find_stop_marker("A\n   user:\r\nB", 0),
             Some((2, "user".to_string()))
         );
+        // s53b 回帰: 未送出境界 (start) が単語の途中にある場合、その語を行頭
+        // ラベルと誤認しない (s53 の誤爆: "system" で 23-44 トークン切断)。
+        assert_eq!(
+            find_stop_marker("Constraint (from the system prompt)", 20),
+            None
+        );
+        assert_eq!(find_stop_marker("abc\nsystem prompt)", 4), None);
+        // 真の行頭 (start より後) に現れるラベル行は従来どおり停止する。
+        assert_eq!(
+            find_stop_marker("abc\nsystem\n", 4),
+            Some((4, "system".to_string()))
+        );
+        // 行頭でも「ラベル行」でないもの (後続に本文が続く) は停止しない。
+        assert_eq!(find_stop_marker("abc\nsystem\nnext", 4), None);
+        // start より前の行にあるラベルは再判定されない (二重停止の防止)。
+        assert_eq!(find_stop_marker("user:hello\nworld", 5), None);
         let (ids, extra) = script_extra(&["A", "Ċ", "user\r", "Ċ", "B", "eos"]);
         let out = run_script_streamed(&ids, &extra, Vec::new()).0;
         assert_eq!(out.text, "A\n");
