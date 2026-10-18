@@ -57,6 +57,36 @@ pub const D2H_LOGITS_COPY: usize = 10 * D2H + 7; // 従来 D2H_LOGITS 区間 (�
 pub const D2H_LOGITS_PF_HELD: usize = 10 * D2H + 8; // prefill 後 1 点目の WAIT (集計から除外)
 pub const N_OPS: usize = 15;
 
+/// s56 (T2 項目0): decode chain の logits D2H 直前に打つ追加 sync を、どちらの
+/// 細分バケットに計上するか決める純関数 (GPU 不要・テスト可能)。
+///
+/// 従来は `cache.len() > pos0` で判定していたが、この chain は decode 1 トークン
+/// だけを受け (`forward` の先頭で `tokens.len() > 1` は prefill へ分岐)、成功時に
+/// `cache.advance(1)` するため **`pos0 + 1 == cache.len()` が常に成り立つ**。
+/// つまり従来条件は decode では常に false になり、待ち時間が集計外の
+/// `D2H_LOGITS_PF_HELD` に全部入って `d2h_logits_wait` 行が 1 度も出なかった
+/// (T1 step2 の実測で判明)。
+///
+/// 正しい判定: 1 点目 = 「直前が prefill で、ここより前に GPU 同期点が無い」点。
+/// chain に入る時点の `pos0` は直前の prefill で kv 長が進んだ後の値 = プロンプト長
+/// (= キャッシュ起点が 0) か、multi-turn の prefix 再利用時は `pos0 - base_len`
+/// (base ≤ プロンプト長)。どちらも `pos0 > 0` で、2 点目以降は前ステップの
+/// logits D2H (COPY) が同期点になっている。よって「cache が空から進んだ (= pos0 == 0)
+/// のでない限り 1 点目」= `pos0 > 0` かつ「cache が pos0 より先へ進んでいない」
+/// (`cache.len() <= pos0 + 1`) を PF_HELD、それ以外 (2 点目以降、または cache が
+/// 既に pos0 を超えて進んでいる) を WAIT とする。
+///
+/// なお `pos0 == 0` は chain では起きない (prefill が最低 1 トークン消費する) が、
+/// 起きた場合は「同期点が無い」ので PF_HELD 側に倒す (平均を汚さない安全側)。
+#[inline]
+pub fn d2h_logits_split_op(pos0: usize, cache_len: usize) -> usize {
+    if pos0 == 0 || cache_len <= pos0 + 1 {
+        D2H_LOGITS_PF_HELD
+    } else {
+        D2H_LOGITS_WAIT
+    }
+}
+
 const NAMES: [&str; N_OPS] = [
     "embed", "rmsnorm", "rope", "qkv_proj", "attn_core", "o_proj", "gate_up_proj", "swiglu",
     "down_proj", "final_norm", "lm_head", "sampler", "detok", "qk_norm", "d2h_state",
@@ -259,8 +289,47 @@ mod tests {
         }
     }
 
+    /// s56 (T2 項目0): decode chain のラベル分岐の算術。
+    ///
+    /// chain は decode 1 トークンのみを受け、成功時に `cache.advance(1)` するので
+    /// 入口では常に `pos0 + 1 == cache.len()`。従来の `cache.len() > pos0` は
+    /// この不変条件により **常に false** となり、追加 sync の待ちが全部
+    /// 集計外の pfhold に落ちていた (= wait 行が 1 度も出ない)。
+    /// ここでは chain の呼び出し位置 (1 点目 / 2 点目以降) を引数に持たせず
+    /// `(pos0, cache_len)` だけで判定が成立することを固定する:
+    /// - chain 入口の不変条件 (len == pos0 + 1) では pfhold (集計外 = 1 点目扱い)
+    /// - cache が pos0 より先へ進んでいる (= prefill 直後ではない) なら wait
+    /// - pos0 == 0 (chain では起きない) も同期点が無いので pfhold 側
+    #[test]
+    fn d2h_logits_split_op_marks_first_decode_step_only() {
+        // 通常: prompt 512 トークン prefill 後の 1 点目 (pos0 = 512, len = 513)
+        assert_eq!(d2h_logits_split_op(512, 513), D2H_LOGITS_PF_HELD);
+        // chain 入口の不変条件 (advance 前): 常に pfhold 側 (= 1 点目)
+        for &p in &[1usize, 2, 511, 512, 4095] {
+            assert_eq!(
+                d2h_logits_split_op(p, p + 1),
+                D2H_LOGITS_PF_HELD,
+                "chain 入口 (len == pos0+1) は 1 点目扱い: pos0={p}"
+            );
+        }
+        // 従来条件 `len > pos0` が真になる状況: cache が pos0 を超えて先行
+        // = 前ステップの sync が既にある → wait に計上
+        assert_eq!(d2h_logits_split_op(512, 514), D2H_LOGITS_WAIT);
+        assert_eq!(d2h_logits_split_op(512, 600), D2H_LOGITS_WAIT);
+        // 空キャッシュ (chain では起きない) は同期点が無いので pfhold 側
+        assert_eq!(d2h_logits_split_op(0, 1), D2H_LOGITS_PF_HELD);
+        assert_eq!(d2h_logits_split_op(0, 0), D2H_LOGITS_PF_HELD);
+        // 返す id は必ず logits 細分 3 本のどれかで、生 id (N_OPS 未満) を汚さない
+        for &(p, l) in &[(1usize, 2usize), (7, 7), (7, 8), (7, 9), (4096, 5000)] {
+            let op = d2h_logits_split_op(p, l);
+            assert!(
+                [D2H_LOGITS_WAIT, D2H_LOGITS_COPY, D2H_LOGITS_PF_HELD].contains(&op),
+                "細分 id 以外を返した: {op}"
+            );
+            assert!(op >= N_OPS, "生 id の範囲外であること: {op}");
+        }
+    }
     /// s55: logits の 3 分割が summary に 3 行 (呼び出し回数の内訳) として出ること。
-    /// `enabled()` は環境変数依存でテスト間競合するため、累積と summary 整形を
     /// 直接叩く (整形はコード上 enabled() と無関係)。
     #[test]
     fn logits_split_is_summarized_per_bucket() {
