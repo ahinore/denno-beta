@@ -2067,6 +2067,17 @@ pub fn chain_upload(slot: usize, data: &[f32], cols: usize, m: usize) -> Option<
     })
 }
 
+/// s55 (T1 step2・計測専用): デフォルトストリームの同期を 1 回打つだけの関数。
+/// `chain_download` が内部で行う `ctx.sync()` と**同一の API 呼び出し**
+/// (`cuCtxSynchronize`) を、本番 D2H を発行する前に別計測点として観測するための
+/// 入口。同期以外の副作用は無く (バッファ確保・転送の発行をしない)、呼んでも
+/// 数値経路には触れない。呼び出し側 (qwen35 decode) は `prof::enabled()` が真の
+/// ときだけこれを呼ぶ — 本番経路 (非 prof) からは決して到達しない。
+pub fn chain_sync_pending() -> Option<()> {
+    let ctx = chain_ctx()?;
+    ok(ctx.sync())
+}
+
 /// スロットからホストへダウンロード (D2H + 同期)。
 pub fn chain_download(slot: usize, len: usize) -> Option<Vec<f32>> {
     let ctx = chain_ctx()?;
