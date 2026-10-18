@@ -1224,6 +1224,39 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 `cargo test --workspace` **256 passed / 0 failed / 18 ignored** (旧 253 + 3)。実機での Hermes E2E 再確認・cuda バイナリ再ビルド/8095 再配備・push は人間対応
 
+### 停止条件の強化 — ロールラベル停止・既定 max_tokens 1024 (s53) ✅ (2026-10-19)
+
+> 第53セッション。生成テキストに「次の発話者ヘッダ」が現れたら生成を止める (llama.cpp の reverse prompt 相当 — MIT ライセンスの実装を参考にした独自実装)・既定 `max_tokens` を 4096 → 1024 に下げる、の 2 点。数値経路 (logits 計算) には触れない。
+
+**ロールラベル停止 (holdback)**:
+
+- 生成テキスト中に以下のマーカーが現れたら、**マーカー自体を出力に含めず**打ち切り、`stop_reason = "stop_sequence"` / `stop_sequence = <検出したマーカー名>` を返す
+  - 特殊トークン文字列 `<|im_start|>` / `<|im_end|>` — 出現位置を問わず即停止
+  - 単独行のロールラベル `user` / `assistant` / `system` — 行頭 (テキスト先頭 or 直前が改行) + 行頭の空白 (` ` / `\t`) 許容・直後は行末 / `\r\n` / `:` / `：` (全角コロン) のみ
+- 部分マーカーは **holdback**: 末尾が「マーカーの prefix になり得る」間は送出せず、確定 (一致 = 打ち切り / 不一致 = 通常テキストとして送出) してから流す。これにより SSE の delta に `u` / `us` / `use` のような途中文字列が漏れない
+- **不変条件**: `sent_len` = 送出済みバイト数。`text[..sent_len]` は送出済み・`text[sent_len..]` は holdback 中 (未送出)。生成終了時 (`flush_stream` 後) は必ず `sent_len == text.len()` になり、通常応答の最終テキストは従来と同一
+- マーカーの最長バイト長は `MAX_STOP_MARKER_LEN = 12` (`<|im_start|>`)。holdback 上限と「マーカーが完成し得る末尾」の計算に使う
+- クライアント指定 `stop_sequences` はロールラベル停止と併用し、テキスト上の**最も早い停止位置**で打ち切る (既送出分に打ち切り位置が来ることはない)。空文字列 stop は無視 (即停止・無限ループの回避)
+
+**実装** (`crates/denno-engine/src/engine.rs`):
+
+- `ChatSession` に `sent_len: usize` を新設 (送出済み境界)。`emit_delta_and_check_stop` は「確定済み分に差分を追記 → `find_stop_marker` で確定マーカー判定 → stop_sequences 判定 (未送出部分のみ) → `overall_stop_status` で送出/holdback を決定」の順
+- `StopStatus` (`Matched(idx, marker)` / `Partial(k)` / `Clear`) と `overall_stop_status` を新設 — 特殊トークン一致 → 確定行ラベル一致 → 最終行末尾がマーカー prefix か、の 3 段で判定
+- `find_stop_marker` / `line_label_at` / `tail_is_line_end` / `partial_holdback` / `partial_prefix_len` を新設 (すべて純関数・テキスト列に対する決定的判定。トークン id は見ない)
+- `flush_stream` を holdback 解放対応に変更 (decode 失敗時も holdback 分は送出してからエラーを返す)
+- `crates/denno-server/src/lib.rs`: `DEFAULT_MAX_TOKENS` 4096 → **1024**。`MAX_TOKENS_CLAMP = 4096` を新設し、`resolve_max_tokens` が明示指定を上限 4096 で clamp する。`0` は「prefill のみ」の明示指定として従来どおり尊重 (clamp は上限側のみ)。`max_completion_tokens` 別名も同じ扱い
+
+**既知の制限**:
+
+- ラベル一致は `find_stop_marker` 側で語境界を見るが、`overall_stop_status` の prefix 経路は見ないため、改行後の `userland` でも (一時的に holdback したうえで) 停止し得る (s53 の semantics — 安全側)
+- `partial_holdback` は最終行の先頭のみを見るため、過剰に hold する場合がある (送出が遅れるだけで内容は失われない = 安全側)
+
+**数値影響**: なし — ロールラベル停止 / holdback はテキスト列の後処理のみで logits 計算には触れない。通常応答は最終テキストが従来と同一 (`sent_len == text.len()` で全量送出)。`max_tokens` の既定変更は「未指定リクエストの生成長」だけを変える (明示指定・greedy 経路の数値は不変)。決定論 (テキスト列に対する純関数的判定・時刻/乱数/グローバル状態を使わない)
+
+**テスト** (engine 新規 5 件 + server wire テスト更新): `role_label_stops_and_excludes_marker` / `role_label_stops_on_assistant_colon_and_im_end` / `partial_marker_is_not_streamed_until_confirmed` (holdback 漏れなし・`userland` は非停止) / `stop_marker_boundaries_crlf_and_fullwidth_colon` (12 バイト境界・CRLF・全角コロン・行頭以外は非停止) / `client_stop_combines_with_role_label_earliest_wins` / `denno-server/tests/max_tokens_default.rs` (既定 1024・明示 clamp 4096・別名・0 尊重・stream/非 stream)
+
+`cargo test --workspace` **261 passed / 0 failed / 18 ignored** (旧 256 + 5)。GPU 実機での偽ターン再現確認・cuda バイナリ再ビルド/8095 再配備・push は人間対応
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)

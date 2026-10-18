@@ -7,7 +7,7 @@ Anthropic Messages API 互換。対応フィールド:
 | フィールド | 対応 |
 | --- | --- |
 | `model` (必須) | serve 時の `--name` と一致が必要(不一致は 404 not_found_error) |
-| `max_tokens` (必須) | 生成上限。prompt+max_tokens が context 超過なら 400 |
+| `max_tokens` (任意) | 生成上限。未指定時 1024 / 明示時は上限 4096 で clamp (s53)。prompt+max_tokens が context 超過なら 400 |
 | `messages` (必須) | role は user/assistant。content は文字列 or `[{type:"text",...}]` |
 | `system` | 文字列 or textブロック配列 |
 | `temperature` | 0 で greedy |
