@@ -1654,15 +1654,16 @@ impl Qwen35 {
         // に分離する。**追加 sync は `prof::enabled()` が真のときだけ**打つ —
         // 非 prof 経路は if の else 側に落ち、追加の GPU 同期は 1 回も入らない
         // (数値経路・既定挙動は不変)。WAIT + COPY は従来の D2H_LOGITS と一致する。
-        // 最初のステップ (prefill 直後) は logits D2H の手前に既存 sync が無く、
+        // 最初のステップ (prefill 直後の 1 点目) は logits D2H の手前に既存 sync が無く、
         // WAIT が「prefill 全体の完了待ち」を含むため平均を汚す — 1 点目のみ
         // D2H_LOGITS_PF_HELD に退避する (2 点目以降が decode の定常値)。
+        // 1 点目の判定 = プロンプト長 p = pos0 (この chain は decode 1 トークンのみを
+        // 受けるので pos0 は常にプロンプト末尾 = 直前の prefill 後に sync 済みの長さ)。
+        // 各ステップ成功時に cache.advance(1) するため pos0 + 1 == cache.len() が常に
+        // 成り立ち、従来の `cache.len() > pos0` は decode では常に false だった
+        // (= 待ち時間が全部 pfhold = 集計外に入り wait 行が 1 度も出ない)。
         if crate::prof::enabled() {
-            let op = if cache.len() > pos0 {
-                crate::prof::D2H_LOGITS_WAIT
-            } else {
-                crate::prof::D2H_LOGITS_PF_HELD
-            };
+            let op = crate::prof::d2h_logits_split_op(pos0, cache.len());
             crate::prof::time(op, || crate::cuda::chain_sync_pending())?;
         }
         let logits = crate::prof::time_if_on(crate::prof::D2H_LOGITS_COPY, || {
