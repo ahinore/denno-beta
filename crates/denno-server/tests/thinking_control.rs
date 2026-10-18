@@ -50,6 +50,24 @@ fn request_body(content: &str, max_tokens: usize, stream: bool, thinking: Option
     v.to_string()
 }
 
+/// s52: thinking を任意の JSON 値で指定する本文 (マップ形式 = Hermes と同一形状)
+fn request_body_thinking_value(
+    content: &str,
+    max_tokens: usize,
+    stream: bool,
+    thinking: Value,
+) -> String {
+    let mut v = json!({
+        "model": "denno-test",
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "stream": stream,
+        "messages": [{"role": "user", "content": content}]
+    });
+    v["thinking"] = thinking;
+    v.to_string()
+}
+
 async fn post(app: &Router, body: String) -> (StatusCode, Value) {
     let req = Request::builder()
         .method("POST")
@@ -98,15 +116,36 @@ fn sse_text(body: &str) -> String {
 // ---------- lib 層: parse_thinking / brief_system ----------
 
 /// thinking のモード判定 (未指定 = brief・off/brief/full・不正値はエラー)
+/// s52: Anthropic マップ形式も受理 (enabled = brief 扱い / disabled = off 扱い /
+/// 未知の type・type 欠落・非文字列 type・文字列/オブジェクト以外はエラー)
 #[test]
 fn parse_thinking_maps_all_modes_and_defaults_to_brief() {
     assert_eq!(parse_thinking(&None).unwrap(), Thinking::Brief);
-    assert_eq!(parse_thinking(&Some("off".into())).unwrap(), Thinking::Off);
-    assert_eq!(parse_thinking(&Some("brief".into())).unwrap(), Thinking::Brief);
-    assert_eq!(parse_thinking(&Some("full".into())).unwrap(), Thinking::Full);
+    assert_eq!(parse_thinking(&Some(json!("off"))).unwrap(), Thinking::Off);
+    assert_eq!(parse_thinking(&Some(json!("brief"))).unwrap(), Thinking::Brief);
+    assert_eq!(parse_thinking(&Some(json!("full"))).unwrap(), Thinking::Full);
     // 大文字小文字を含む未知値は拒否 (tool_choice と同一の厳密一致)
     for bad in ["OFF", "Brief", "FULL", "", "on", "true", "none"] {
-        assert!(parse_thinking(&Some(bad.to_string())).is_err(), "{bad} は拒否されるべき");
+        assert!(parse_thinking(&Some(json!(bad))).is_err(), "{bad} は拒否されるべき");
+    }
+    // s52: Anthropic マップ形式 (enabled = brief 扱い・disabled = off 扱い。
+    // budget_tokens は無視・決定的)
+    assert_eq!(
+        parse_thinking(&Some(json!({"type": "enabled", "budget_tokens": 8000}))).unwrap(),
+        Thinking::Brief
+    );
+    assert_eq!(parse_thinking(&Some(json!({"type": "enabled"}))).unwrap(), Thinking::Brief);
+    assert_eq!(parse_thinking(&Some(json!({"type": "disabled"}))).unwrap(), Thinking::Off);
+    // マップの不正 type / type 欠落 / 非文字列 type / マップ以外の値型は拒否
+    for bad in [
+        json!({"type": "bogus"}),
+        json!({}),
+        json!({"type": 1}),
+        json!(1),
+        json!(true),
+        json!(["off"]),
+    ] {
+        assert!(parse_thinking(&Some(bad.clone())).is_err(), "{bad} は拒否されるべき");
     }
 }
 
@@ -210,4 +249,93 @@ async fn thinking_off_streams_immediately_and_full_streams_thinking() {
     let (status, body) = post_raw(&app, request_body("t0", 20, true, Some("full"))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(sse_text(&body), "t13 t14 t15", "full は思考フィラを流す");
+}
+
+// ---------- s52: Anthropic マップ形式 (Hermes 互換) ----------
+
+/// マップ形式は enabled = brief 扱い (誘導文注入つきの思考経路・文字列 brief と
+/// 同一出力) / disabled = off 扱い (即 EOS・1 トークン)。budget_tokens は無視
+/// (決定的・s47 の決定的誘導文注入と同一経路)。
+#[tokio::test]
+async fn thinking_map_enabled_is_brief_and_disabled_is_off() {
+    let app = test_app_with(thinking_sim_engine("think-sim").unwrap(), 8);
+
+    // enabled (Hermes が送る形状・budget_tokens 付き) は brief 扱い
+    let (status, enabled) = post(
+        &app,
+        request_body_thinking_value("t0", 20, false, json!({"type": "enabled", "budget_tokens": 8000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {enabled}");
+    assert_eq!(
+        enabled["usage"]["output_tokens"],
+        json!(4),
+        "enabled は brief 扱いで思考してから答える"
+    );
+    assert_eq!(enabled["content"][0]["text"], "t13 t14 t15");
+
+    // 文字列 "brief" と同一出力 (同一経路 = 決定的誘導文注入)
+    let (_, brief) = post(&app, request_body("t0", 20, false, Some("brief"))).await;
+    assert_eq!(
+        enabled["content"][0]["text"], brief["content"][0]["text"],
+        "マップ enabled は文字列 brief と同一経路であるべき"
+    );
+
+    // disabled は off 扱い (即 EOS・1 トークン)
+    let (status, disabled) = post(
+        &app,
+        request_body_thinking_value("t0", 20, false, json!({"type": "disabled"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {disabled}");
+    assert_eq!(
+        disabled["usage"]["output_tokens"],
+        json!(1),
+        "disabled は off 扱いで即答"
+    );
+    assert_eq!(disabled["content"][0]["text"], "", "disabled は EOS のみでテキスト空");
+}
+
+/// マップ形式の不正 type (未知 type・type 欠落・非文字列 type) とマップ以外の
+/// 値型は 400 invalid_request_error (tool_choice のバリデーション慣習と同一)
+#[tokio::test]
+async fn thinking_map_unknown_type_is_rejected_with_400() {
+    let app = test_app_with(thinking_sim_engine("think-sim").unwrap(), 8);
+    for bad in [json!({"type": "bogus"}), json!({}), json!({"type": 1}), json!(1)] {
+        let (status, body) =
+            post(&app, request_body_thinking_value("t0", 4, false, bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "thinking={bad} body={body}");
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("thinking"), "message={msg}");
+    }
+}
+
+/// s52 E2E: Hermes デスクトップが送る同一形状の本文 (thinking マップ +
+/// system/message を text block 配列 + cache_control 付き) で 200 を確認する
+/// (CPU 経路・実エンジン注入なしの wire テスト)。
+#[tokio::test]
+async fn thinking_hermes_shaped_request_returns_200() {
+    let app = test_app_with(thinking_sim_engine("think-sim").unwrap(), 8);
+    let body = json!({
+        "model": "denno-test",
+        "max_tokens": 1024,
+        "temperature": 0.0,
+        "system": [{"type": "text", "text": "You are a helpful assistant.", "cache_control": {"type": "ephemeral"}}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "t0", "cache_control": {"type": "ephemeral"}}]}
+        ],
+        "thinking": {"type": "enabled", "budget_tokens": 8000},
+        "stream": false
+    })
+    .to_string();
+    let (status, resp) = post(&app, body).await;
+    assert_eq!(status, StatusCode::OK, "body = {resp}");
+    assert_eq!(resp["type"], "message");
+    assert_eq!(resp["stop_reason"], "end_turn");
+    assert_eq!(
+        resp["content"][0]["text"], "t13 t14 t15",
+        "thinking マップは brief 扱い (思考フィラ + 完答)"
+    );
 }

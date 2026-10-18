@@ -16,6 +16,7 @@ Anthropic Messages API 互換。対応フィールド:
 | `stream` | true で SSE |
 | `tools` | tool use 対応 (下記 §tool use)。空配列は tools 無しと同一 |
 | `tool_choice` | `"auto"` / `"none"` / `"any"` / `{"type":"tool","name":"..."}`。既定 auto。tools 無しでの指定は 400 |
+| `thinking` | s47/s52: `"off"` / `"brief"` / `"full"` の文字列、または Anthropic マップ `{"type":"enabled",...}`(= brief 扱い・`budget_tokens` は無視)/ `{"type":"disabled"}`(= off 扱い)。既定 brief。未知の type や文字列/マップ以外は 400 (下記 §thinking 制御) |
 | `metadata` 他 | 受け流す(パースのみ) |
 
 レスポンス例(非ストリーミング):
@@ -100,6 +101,23 @@ Anthropic 形式の `tool_use` block として返す。
 - パースに失敗した / 閉じていない `<tool_call>` block は除去せずテキストとして残す
   (モデルが形式例を本文に出した場合への防御)
 - tool_call が 1 件も無い場合は従来どおり text block + 元の stop_reason
+
+## thinking 制御 (thinking)
+
+denno 拡張のトップレベル任意フィールド (s47・未指定 = `brief`)。s52 から 2 形式を受理する:
+
+- 文字列形式: `"off"` / `"brief"` / `"full"`
+  - `off`: chat template に `enable_thinking=false` を渡す (思考せず即答)
+  - `brief` (既定): 思考 ON のまま、system 冒頭に決定的な短答誘導文を注入
+    (ソフトな誘導 = ハード制御ではない。既存 system は保持)
+  - `full`: 従来経路のまま (注入なし・prompt はビット同一)
+- Anthropic マップ形式 (s52・Hermes 互換):
+  - `{"type":"enabled", ...}` は `brief` 扱い。`budget_tokens` 等の他フィールドは無視 (決定的)
+  - `{"type":"disabled"}` は `off` 扱い
+  - 未知の `type` (欠落・非文字列含む) は 400 invalid_request_error
+- 文字列 / オブジェクト以外 (数値・真偽値・配列等) も 400
+
+不正値の 400 は `tool_choice` と同一のバリデーション慣習 (エラー形式は §エラー形式)。
 
 ## SSE イベント列 (stream: true)
 

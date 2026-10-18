@@ -152,11 +152,15 @@ pub struct MessagesRequest {
     /// 既定は auto。`any`/`tool` (強制) は拘束デコード (第21) が有効:
     /// モデル生成を tool_call block (公式テンプレート形式) へ強制する。
     pub tool_choice: Option<serde_json::Value>,
-    /// s47: thinking 制御 ("off" | "brief" | "full")。既定は "brief"。
-    /// denno 拡張のトップレベル任意フィールド (文字列。Anthropic API には無い)。
+    /// s47: thinking 制御。既定は "brief" 相当。
+    /// s52: 2 形式を受理する (denno 拡張のトップレベル任意フィールド):
+    /// - 文字列: "off" | "brief" | "full"
+    /// - Anthropic マップ (Hermes 互換): {"type":"enabled", ...} = brief 扱い /
+    ///   {"type":"disabled"} = off 扱い (budget_tokens 等は無視・決定的)。
+    ///   未知の type は 400。
     /// 未指定のリクエストは brief が適用される (prompt に短答誘導文が注入される
     /// 意図的変更)。未知フィールドを拒否しない現行パーサの挙動は維持。
-    pub thinking: Option<String>,
+    pub thinking: Option<serde_json::Value>,
 }
 
 /// tool use: ツール定義 1 件 (Anthropic 形式。type フィールドは受け流す)
@@ -234,7 +238,7 @@ fn parse_tool_choice_str(s: &str) -> Result<ToolChoice, ApiError> {
 
 // ---------- s47: thinking 制御 ----------
 
-/// s47: thinking 制御のモード (`thinking` トップレベル任意フィールド・文字列)。
+/// s47: thinking 制御のモード (`thinking` トップレベル任意フィールド)。
 ///
 /// - `Off`: chat template に `enable_thinking=false` を渡す (実モデルでは空の
 ///   think block が generation prompt に入り、思考せず即答する)
@@ -255,14 +259,34 @@ pub const THINKING_BRIEF_INSTRUCTION: &str = "思考は短く数文で済ませ�
 
 /// thinking をパースする (未指定 = Brief。不正値は 400 invalid_request_error —
 /// tool_choice のバリデーション慣習と同一)。
-pub fn parse_thinking(v: &Option<String>) -> Result<Thinking, ApiError> {
-    match v.as_deref() {
+///
+/// s52: 2 形式を受理する。
+/// - 文字列 (s47 からの現行): "off" | "brief" | "full"
+/// - Anthropic マップ (Hermes 互換): `{"type":"enabled", ...}` = brief 扱い
+///   (`budget_tokens` 等は無視・決定的) / `{"type":"disabled"}` = off 扱い /
+///   未知の type (欠落・非文字列含む) は 400。文字列/オブジェクト以外も 400。
+pub fn parse_thinking(v: &Option<serde_json::Value>) -> Result<Thinking, ApiError> {
+    match v {
         None => Ok(Thinking::Brief),
-        Some("off") => Ok(Thinking::Off),
-        Some("brief") => Ok(Thinking::Brief),
-        Some("full") => Ok(Thinking::Full),
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "off" => Ok(Thinking::Off),
+            "brief" => Ok(Thinking::Brief),
+            "full" => Ok(Thinking::Full),
+            other => Err(ApiError::invalid_request(format!(
+                "thinking: unsupported value {:?} (off/brief/full)",
+                other
+            ))),
+        },
+        Some(serde_json::Value::Object(m)) => match m.get("type").and_then(|t| t.as_str()) {
+            Some("enabled") => Ok(Thinking::Brief),
+            Some("disabled") => Ok(Thinking::Off),
+            other => Err(ApiError::invalid_request(format!(
+                "thinking.type: unsupported value {:?} (enabled/disabled)",
+                other
+            ))),
+        },
         Some(other) => Err(ApiError::invalid_request(format!(
-            "thinking: unsupported value {:?} (off/brief/full)",
+            "thinking must be a string (off/brief/full) or an object with a string \"type\" (enabled/disabled), got {:?}",
             other
         ))),
     }
