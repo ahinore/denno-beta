@@ -1199,6 +1199,31 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 
 `cargo test --workspace` **253 passed / 0 failed / 18 ignored** (same as s49 = evidence the CPU path is unchanged)·`cargo check --features cuda --lib` passes (all 12 warnings identical to HEAD·the 3 in cuda.rs are line-number shifts from inserted lines·no new warnings)·`cargo test --features cuda --no-run` passes (compile check of the 2 new ignored tests). Expected effect (estimate): the per-step ~75MB/step (9B) decode D2H disappears, leaving the logits (0.6MB) plus a one-time GDN state copy at prefill boundaries — a large decode ms/step reduction is expected. Running the ignored tests on the device, re-measuring decode, the cuda binary rebuild/8095 redeploy, and push are human tasks
 
+### Accepting the thinking map form — Anthropic thinking map for Hermes compatibility (s52) ✅ (2026-10-18)
+
+> Session 52. The Hermes desktop sends thinking as a map `{"type":"enabled","budget_tokens":8000}`, but the s47 parser accepted strings only, so the request became a 400 and the E2E from Hermes failed (thinking was the only blocker). The string form stays as-is and the map form is now accepted additionally. The numeric path is untouched (map `enabled` follows the exact same path as brief = s47's deterministic instruction injection; `budget_tokens` is ignored, keeping it deterministic).
+
+**Spec** (two accepted forms):
+
+- String (as-is from s47): `"off"` | `"brief"` | `"full"` (absent = brief)
+- Anthropic map (Hermes-compatible): `{"type":"enabled", ...}` is treated as brief / `{"type":"disabled"}` is treated as off. Other fields such as `budget_tokens` are ignored (deterministic — never read). An unknown `type` (missing or non-string included) and anything other than a string/object (number·boolean·array etc.) is a 400 invalid_request_error (same validation convention as tool_choice)
+
+**Implementation**:
+
+- `denno-server/lib.rs`: `MessagesRequest.thinking` changed from `Option<String>` to `Option<serde_json::Value>`. `parse_thinking` now inspects the whole `Option<Value>` (String = unchanged / Object = branch on the `type` field: `enabled`→Brief·`disabled`→Off·unknown→Err / anything else→Err). The call site (the `/v1/messages` handler) stays unchanged and signature-compatible via `parse_thinking(&req.thinking)` — everything downstream (the brief injection / `enable_thinking` variable path) is exactly as in s47 (the same deterministic instruction-injection path)
+- `docs/api.md`: added a `thinking` row to the field table + a new "§thinking control" section (both forms·ignored `budget_tokens`·400 conditions)
+
+**Tests** (3 new + 1 updated·`denno-server/tests/thinking_control.rs`):
+
+- `parse_thinking_maps_all_modes_and_defaults_to_brief` (updated): values converted to `Value`, adding map enabled (with/without `budget_tokens`) = Brief·disabled = Off·rejection of a bad type / missing type / non-string type / non-map values (number·boolean·array)
+- `thinking_map_enabled_is_brief_and_disabled_is_off` (wire): map enabled (the exact shape Hermes sends) produces the same output as string brief (same path)·disabled behaves as off (immediate EOS·1 token)
+- `thinking_map_unknown_type_is_rejected_with_400` (wire): unknown type / missing type / non-string type / number → 400 invalid_request_error (message contains "thinking")
+- `thinking_hermes_shaped_request_returns_200` (wire·E2E): confirms 200 with a body shaped exactly like Hermes' (thinking map + system/messages as text block arrays with cache_control) (CPU path)
+
+**Numeric impact**: none — the string form is interpreted exactly as before·map enabled uses the identical effective system as brief (deterministic fixed sentence) / disabled uses the identical `enable_thinking` variable as off. The premise paths of existing anchors/CPU reference md5s are unchanged
+
+`cargo test --workspace` **256 passed / 0 failed / 18 ignored** (was 253 + 3). Re-verifying the Hermes E2E on the device, the cuda binary rebuild/8095 redeploy, and push are human tasks
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)

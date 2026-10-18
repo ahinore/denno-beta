@@ -1199,6 +1199,31 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 `cargo test --workspace` **253 passed / 0 failed / 18 ignored** (s49 と同一 = CPU 経路無変更の裏取り)・`cargo check --features cuda --lib` 通過 (警告 12 本とも HEAD と同一・cuda.rs の 3 件は挿入行による行番号シフトのみ・新規警告ゼロ)・`cargo test --features cuda --no-run` 通過 (新規 ignored テスト 2 件のコンパイル確認)。期待効果 (推定): decode のステップ毎 D2H ~75MB/step (9B) が消え、D2H は logits (0.6MB) + prefill 境界時の GDN 状態 1 回のみ — decode ms/step の大幅短縮が見込まれる。実機での ignored テスト実行・decode 再計測・cuda バイナリ再ビルド/8095 再配備・push は人間対応
 
+### thinking マップ形式の受理 — Anthropic thinking マップを Hermes 互換で受ける (s52) ✅ (2026-10-18)
+
+> 第52セッション。Hermes デスクトップが thinking をマップ形式 `{"type":"enabled","budget_tokens":8000}` で送信する一方、s47 パーサは文字列のみ受理のため 400 になり Hermes からの E2E が失敗していた (thinking のみが blocker)。文字列形式は現行どおり・マップ形式を追加受理する。数値経路には触れない (マップ enabled は brief と同一経路 = s47 の決定的誘導文注入・budget_tokens は無視で決定的)。
+
+**仕様** (2 形式を受理):
+
+- 文字列 (s47 からの現行): `"off"` | `"brief"` | `"full"` (未指定 = brief)
+- Anthropic マップ (Hermes 互換): `{"type":"enabled", ...}` = brief 扱い / `{"type":"disabled"}` = off 扱い。`budget_tokens` 等の他フィールドは無視 (決定的・読まない)。未知の type (欠落・非文字列含む) と文字列/オブジェクト以外 (数値・真偽値・配列等) は 400 invalid_request_error (tool_choice のバリデーション慣習と同一)
+
+**実装**:
+
+- `denno-server/lib.rs`: `MessagesRequest.thinking` を `Option<String>` から `Option<serde_json::Value>` に変更。`parse_thinking` を Option<Value> 全体を見る方式に (String = 従来どおり / Object = type フィールドで分岐 `enabled`→Brief・`disabled`→Off・未知→Err / それ以外→Err)。呼び出し側 (`/v1/messages` ハンドラ) は `parse_thinking(&req.thinking)` のまま署名互換で無変更 — 以降の brief 注入 / `enable_thinking` 変数の経路は s47 から完全に同一 (決定的誘導文注入と同一経路)
+- `docs/api.md`: フィールド表に `thinking` 行を追加 + 「§thinking 制御」節を新設 (両形式・無視される `budget_tokens`・400 の条件)
+
+**テスト** (新規 3 件 + 既存 1 件更新・`denno-server/tests/thinking_control.rs`):
+
+- `parse_thinking_maps_all_modes_and_defaults_to_brief` (更新): 値を Value 化し、マップ enabled (`budget_tokens` 付き/無し) = Brief・disabled = Off・不正 type / type 欠落 / 非文字列 type / マップ以外 (数値・真偽値・配列) の拒否を追加
+- `thinking_map_enabled_is_brief_and_disabled_is_off` (wire 層): マップ enabled (Hermes が送る形状) は文字列 brief と同一出力 (同一経路)・disabled は off 扱い (即 EOS・1 トークン)
+- `thinking_map_unknown_type_is_rejected_with_400` (wire 層): 未知 type / type 欠落 / 非文字列 type / 数値が 400 invalid_request_error ("thinking" を含むメッセージ)
+- `thinking_hermes_shaped_request_returns_200` (wire 層・E2E): Hermes と同一形状の本文 (thinking マップ + system/message を text block 配列 + cache_control 付き) で 200 を確認 (CPU 経路)
+
+**数値経路への影響**: 無し — 文字列形式の解釈は全く同じ・マップ enabled は brief と同一の実効 system (決定的固定文) / disabled は off と同一の `enable_thinking` 変数。既存アンカー/CPU 参照 md5 の前提経路は不変
+
+`cargo test --workspace` **256 passed / 0 failed / 18 ignored** (旧 253 + 3)。実機での Hermes E2E 再確認・cuda バイナリ再ビルド/8095 再配備・push は人間対応
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
