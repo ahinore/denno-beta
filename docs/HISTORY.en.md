@@ -1224,6 +1224,39 @@ Through A3, recurrent models (Qwen3.5 GDN) never used prefix-cache entry restora
 
 `cargo test --workspace` **256 passed / 0 failed / 18 ignored** (was 253 + 3). Re-verifying the Hermes E2E on the device, the cuda binary rebuild/8095 redeploy, and push are human tasks
 
+### Stronger stop conditions — role-label stop with holdback + default max_tokens 1024 (s53) ✅ (2026-10-19)
+
+> Session 53. Two changes: stop generating when a "next speaker header" appears in the generated text (equivalent to llama.cpp's reverse prompt — an independent implementation, with the MIT-licensed reference only as a pointer), and lower the default `max_tokens` from 4096 to 1024. The numeric path (logits computation) is untouched.
+
+**Role-label stop (holdback)**:
+
+- When one of the following markers appears in the generated text, generation stops **without emitting the marker itself**, returning `stop_reason = "stop_sequence"` / `stop_sequence = <the detected marker>`
+  - Special-token strings `<|im_start|>` / `<|im_end|>` — stop immediately wherever they appear
+  - Standalone-line role labels `user` / `assistant` / `system` — line start (beginning of text or right after a newline), leading spaces (` ` / `\t`) allowed, followed only by end of line / `\r\n` / `:` / `：` (full-width colon)
+- Partial markers are **held back**: while the tail can still become a marker prefix it is not emitted; once it is decided (match = stop / mismatch = ordinary text) it is emitted. This keeps `u` / `us` / `use`-style fragments out of the SSE deltas
+- **Invariant**: `sent_len` = number of bytes already emitted. `text[..sent_len]` has been emitted·`text[sent_len..]` is held back (not yet emitted). At the end of generation (after `flush_stream`) `sent_len == text.len()` always holds, so the final text of a normal response is identical to before
+- The longest marker is `MAX_STOP_MARKER_LEN = 12` (`<|im_start|>`); it bounds the holdback and the "tail that could still complete a marker" calculation
+- Client-supplied `stop_sequences` are combined with the role-label stop and the **earliest** stop position in the text wins (a stop position can never land in already-emitted text). An empty stop string is ignored (avoids an immediate stop / infinite loop)
+
+**Implementation** (`crates/denno-engine/src/engine.rs`):
+
+- New `sent_len: usize` on `ChatSession` (the emitted boundary). `emit_delta_and_check_stop` now runs: append the new diff onto the confirmed part → `find_stop_marker` for a confirmed marker → `stop_sequences` check (unemitted part only) → decide emit/holdback via `overall_stop_status`
+- New `StopStatus` (`Matched(idx, marker)` / `Partial(k)` / `Clear`) and `overall_stop_status` — three stages: special-token match → confirmed line-label match → does the last line's tail form a marker prefix
+- New `find_stop_marker` / `line_label_at` / `tail_is_line_end` / `partial_holdback` / `partial_prefix_len` (all pure functions, deterministic over the text stream; token ids are never inspected)
+- `flush_stream` now releases the holdback (on a decode error it emits the held-back part before returning the error)
+- `crates/denno-server/src/lib.rs`: `DEFAULT_MAX_TOKENS` 4096 → **1024**. New `MAX_TOKENS_CLAMP = 4096`; `resolve_max_tokens` clamps an explicit value to that upper bound. `0` is still honored as "prefill only" (the clamp is upper-bound only). The `max_completion_tokens` alias is treated identically
+
+**Known limitations**:
+
+- Label matching looks at word boundaries in `find_stop_marker`, but the prefix path in `overall_stop_status` does not, so `userland` after a newline can still stop (the s53 semantics — the safe side)
+- `partial_holdback` only inspects the head of the final line, so it may hold back more than strictly necessary (emission is only delayed, nothing is lost = the safe side)
+
+**Numeric impact**: none — the role-label stop / holdback is pure post-processing of the text stream and never touches logits. A normal response keeps an identical final text (everything is emitted once `sent_len == text.len()`). The `max_tokens` default change only alters the generated length of requests that omit it (explicit values and the greedy numeric path are unchanged). Determinism holds (pure functions over the text stream; no clock, RNG, or global state)
+
+**Tests** (5 new in the engine + updated server wire tests): `role_label_stops_and_excludes_marker` / `role_label_stops_on_assistant_colon_and_im_end` / `partial_marker_is_not_streamed_until_confirmed` (no holdback leak·`userland` does not stop) / `stop_marker_boundaries_crlf_and_fullwidth_colon` (12-byte boundary·CRLF·full-width colon·no stop off line start) / `client_stop_combines_with_role_label_earliest_wins` / `denno-server/tests/max_tokens_default.rs` (default 1024·explicit clamp 4096·alias·`0` honored·stream and non-stream)
+
+`cargo test --workspace` **261 passed / 0 failed / 18 ignored** (was 256 + 5). Reproducing the false-turn case on the real GPU, the cuda binary rebuild/8095 redeploy, and push are human tasks
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
