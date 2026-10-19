@@ -1384,6 +1384,30 @@ fn weights_for_group(
     Ok(unsafe { std::mem::transmute::<&GpuW, &'static GpuW>(e.as_ref()) })
 }
 
+// s57 (T4): PROFILE の実行先ラベル用に「直近の GPU 線形呼び出しが実際に GPU で
+// 走ったか」を記録する thread-local。**計測のみ** — `maybe_gpu_linear` が結果を
+// 返す直前に書くだけで、数値・分岐・GPU 状態には触れない。値は次の線形呼び出し
+// まで古いまま (呼び出し側は同じ区間の計測にしか使わない)。
+#[cfg(feature = "cuda")]
+thread_local! {
+    static LINEAR_RAN_ON_GPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 直近の `maybe_gpu_linear` が GPU で走りきったか (PROFILE の実行先ラベル用)。
+/// PROFILE 無効時はプロファイラ側が参照しないため、この記録は無害な no-op に
+/// 近い (Cell 書き込み 1 回)。
+#[cfg(feature = "cuda")]
+#[inline]
+pub fn last_linear_ran_on_gpu() -> bool {
+    LINEAR_RAN_ON_GPU.with(|c| c.get())
+}
+
+#[cfg(feature = "cuda")]
+#[inline]
+fn set_last_linear_ran_on_gpu(v: bool) {
+    LINEAR_RAN_ON_GPU.with(|c| c.set(v));
+}
+
 /// P17b 統合エントリ: int8 線形層を GPU で実行するかどうかを判定し、
 /// 実行するなら結果 (CPU カーネルとビット一致) を返す。
 /// 戻り値 None = CPU パスを使うこと (無効/初期化失敗/実行時エラー/m>閾値)。
@@ -1396,6 +1420,9 @@ pub fn maybe_gpu_linear(
     n: usize,
     m: usize,
 ) -> Option<Vec<f32>> {
+    // s57 (T4): 実行先ラベルの初期値 — この呼び出しが None で抜けたとき
+    // 直前の true が残らないよう毎回 false から始める (計測のみ)
+    set_last_linear_ran_on_gpu(false);
     if !cuda_enabled() {
         return None;
     }
@@ -1427,7 +1454,11 @@ pub fn maybe_gpu_linear(
         linear_pinned(ctx, a, gw, m, k, n)
     };
     match r {
-        Ok(out) => Some(out),
+        Ok(out) => {
+            // s57 (T4): 実行先ラベルの記録 (計測のみ・戻り値/演算には無関係)
+            set_last_linear_ran_on_gpu(true);
+            Some(out)
+        }
         Err(e) => {
             // 実行時エラーは再試行せず恒久的に CPU へ (数値は同一仕様なので不変)
             tracing::error!("CUDA linear failed, falling back to CPU permanently: {e:#}");

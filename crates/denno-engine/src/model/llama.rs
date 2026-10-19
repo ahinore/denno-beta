@@ -369,18 +369,18 @@ impl LlamaQwen2 {
 
         for (li, layer) in self.layers.iter().enumerate() {
             crate::telemetry_layer_begin(li as u16);
-            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+            crate::prof::time_full(crate::prof::RMSNORM, 1, true, || {
                 chain_rmsnorm(&layer.ln1_w, self.eps, pending, CH_H, e, 1, li * 3)
             })?;
             // qkv: デバイス内で完結 (download なし — P17h で層あたりの sync を廃止)
-            crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
+            crate::prof::time_full(crate::prof::QKV, 1, true, || -> Option<()> {
                 let qw = layer.q_w.quant8()?;
                 let kw = layer.k_w.quant8()?;
                 let vw = layer.v_w.quant8()?;
                 chain_linear_grouped(&[qw, kw, vw], CH_H, CH_QKV, 1)
             })?;
             // bias 加算 + rope (GPU・CPU add_bias→rope_row とビット一致)
-            crate::prof::time_layer(crate::prof::ROPE, li, || {
+            crate::prof::time_full(crate::prof::ROPE, 1, true, || {
                 chain_rope_qkv(
                     layer.q_b.as_deref(),
                     layer.k_b.as_deref(),
@@ -399,7 +399,7 @@ impl LlamaQwen2 {
             //     ビット一致維持。
             let t_total = pos0 + 1;
             let scale = 1.0 / (dh as f32).sqrt();
-            crate::prof::time_layer(crate::prof::ATTN, li, || {
+            crate::prof::time_full(crate::prof::ATTN, 1, true, || {
                 chain_attention_dev(
                     cache.kv_id(),
                     li,
@@ -416,22 +416,22 @@ impl LlamaQwen2 {
             })?;
 
             // --- o_proj → residual+rmsnorm → gate/up → swiglu → down (全てデバイス内) ---
-            crate::prof::time_layer(crate::prof::OPROJ, li, || -> Option<()> {
+            crate::prof::time_full(crate::prof::OPROJ, 1, true, || -> Option<()> {
                 let ow = layer.o_w.quant8()?;
                 chain_linear_grouped(&[ow], CH_ATT, CH_O, 1)
             })?;
-            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+            crate::prof::time_full(crate::prof::RMSNORM, 1, true, || {
                 chain_rmsnorm(&layer.ln2_w, self.eps, Some(CH_O), CH_H, e, 1, li * 3 + 1)
             })?;
-            crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
+            crate::prof::time_full(crate::prof::GATE_UP, 1, true, || -> Option<()> {
                 let gw = layer.gate_w.quant8()?;
                 let uw = layer.up_w.quant8()?;
                 chain_linear_grouped(&[gw, uw], CH_H, CH_GA, 1)
             })?;
-            crate::prof::time_layer(crate::prof::SWIGLU, li, || {
+            crate::prof::time_full(crate::prof::SWIGLU, 1, true, || {
                 chain_swiglu(CH_GA, CH_ACT, self.ff, 1)
             })?;
-            crate::prof::time_layer(crate::prof::DOWN, li, || -> Option<()> {
+            crate::prof::time_full(crate::prof::DOWN, 1, true, || -> Option<()> {
                 let dw = layer.down_w.quant8()?;
                 chain_linear_grouped(&[dw], CH_ACT, CH_DOWN, 1)
             })?;
@@ -439,7 +439,7 @@ impl LlamaQwen2 {
             crate::telemetry_layer_flush();
         }
 
-        let logits = crate::prof::time(crate::prof::LM_HEAD, || -> Option<Vec<f32>> {
+        let logits = crate::prof::time_full(crate::prof::LM_HEAD, 1, true, || -> Option<Vec<f32>> {
             chain_rmsnorm(&self.norm_w, self.eps, pending, CH_H, e, 1, n_layers * 3)?;
             let lmq = self.lm_head.as_ref().unwrap().quant8()?;
             chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)?;
@@ -537,10 +537,13 @@ impl LlamaQwen2 {
         let key = cache.kv_id();
         let mut pending: Option<usize> = None;
 
+        // s57 (T4): prefill 経路の各 op は n 行ぶんを 1 call で処理する
+        // (tok/call = n)。集計のみで演算列は不変。
+
         for (li, layer) in self.layers.iter().enumerate() {
             crate::telemetry_layer_begin(li as u16);
             // --- rmsnorm #1 (デバイス: 前層 down との residual 加算も融合) ---
-            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+            crate::prof::time_n(crate::prof::RMSNORM, n, || {
                 chain_rmsnorm(&layer.ln1_w, self.eps, pending, CH_H, e, n, li * 3)
             })?;
             // --- qkv GEMM (デバイス h 直読み) → rope → K/V ミラー書き込み + D2H ---
@@ -554,27 +557,31 @@ impl LlamaQwen2 {
                 }
                 _ => None,
             };
-            chain_qkv_rope_prefill(
-                layer.q_w.quant8()?,
-                layer.k_w.quant8()?,
-                layer.v_w.quant8()?,
-                &[],
-                cache,
-                key,
-                li,
-                n_layers,
-                pos0,
-                n,
-                t_total,
-                heads,
-                kv_heads,
-                dh,
-                self.theta,
-                bias.as_deref().unwrap_or(&[]),
-                Some(CH_H),
-            )?;
+            // s57 (T4): chain_qkv_rope_prefill は qkv GEMM + rope + KV ミラー書き込みの
+            // 融合 1 call なので、従来どおり QKV に計上する (実行先は GPU 固定)。
+            crate::prof::time_full(crate::prof::QKV, n, true, || -> Option<()> {
+                chain_qkv_rope_prefill(
+                    layer.q_w.quant8()?,
+                    layer.k_w.quant8()?,
+                    layer.v_w.quant8()?,
+                    &[],
+                    cache,
+                    key,
+                    li,
+                    n_layers,
+                    pos0,
+                    n,
+                    t_total,
+                    heads,
+                    kv_heads,
+                    dh,
+                    self.theta,
+                    bias.as_deref().unwrap_or(&[]),
+                    Some(CH_H),
+                )
+            })?;
             // --- GPU attention (q はデバイス常駐・att は CH_ATT) ---
-            crate::prof::time_layer(crate::prof::ATTN, li, || {
+            crate::prof::time_full(crate::prof::ATTN, n, true, || {
                 chain_attention_prefill_dev(
                     key,
                     li,
@@ -591,32 +598,39 @@ impl LlamaQwen2 {
                 )
             })?;
             // --- o_proj (デバイス常駐 → CH_O) ---
-            maybe_gpu_oproj_dev(layer.o_w.quant8()?, n, heads * dh, li)?;
+            crate::prof::time_full(crate::prof::OPROJ, n, true, || {
+                maybe_gpu_oproj_dev(layer.o_w.quant8()?, n, heads * dh, li)
+            })?;
             // --- residual + rmsnorm #2 (デバイス: x += o_proj 出力も融合) ---
-            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+            crate::prof::time_n(crate::prof::RMSNORM, n, || {
                 chain_rmsnorm(&layer.ln2_w, self.eps, Some(CH_O), CH_H, e, n, li * 3 + 1)
             })?;
             // --- FFN (デバイス常駐 → CH_DOWN) ---
-            maybe_gpu_ffn_dev(
-                layer.gate_w.quant8()?,
-                layer.up_w.quant8()?,
-                layer.down_w.quant8()?,
-                CH_H,
-                n,
-                self.ff,
-                li,
-            )?;
+            // s57 (T4): maybe_gpu_ffn_dev は gate/up GEMM → swiglu → down GEMM の
+            // 融合 1 call。従来は無計測だったためここで GATE_UP に計上する
+            // (内部の swiglu 分は分離できない — GPU 側の 1 ディスパッチ)。
+            crate::prof::time_full(crate::prof::GATE_UP, n, true, || {
+                maybe_gpu_ffn_dev(
+                    layer.gate_w.quant8()?,
+                    layer.up_w.quant8()?,
+                    layer.down_w.quant8()?,
+                    CH_H,
+                    n,
+                    self.ff,
+                    li,
+                )
+            })?;
             crate::telemetry_layer_flush();
             pending = Some(CH_DOWN);
         }
 
         // --- 最終 residual + norm (m=n 全行: x += down もデバイスで完結) ---
-        crate::prof::time(crate::prof::FINAL_NORM, || {
+        crate::prof::time_n(crate::prof::FINAL_NORM, n, || {
             chain_rmsnorm(&self.norm_w, self.eps, pending, CH_H, e, n, n_layers * 3)
         })?;
         // 最終行の hn だけ D2H (logits に不要な [n-1, e] は転送しない)。
-        // lm_head は従来経路と同一コード (m=1 matvec)。
-        let logits = crate::prof::time(crate::prof::LM_HEAD, || -> Option<Vec<f32>> {
+        // lm_head は従来経路と同一コード (m=1 matvec) — 行数は常に 1。
+        let logits = crate::prof::time_full(crate::prof::LM_HEAD, 1, false, || -> Option<Vec<f32>> {
             let hn = chain_download_at(CH_H, (n - 1) * e, e)?;
             Some(match &self.lm_head {
                 Some(w) => lin(&hn, w, 1),
@@ -654,6 +668,20 @@ impl Model for LlamaQwen2 {
         let pos0 = cache.len();
         let n = tokens.len();
 
+        // s57 (T4): 計測フェーズを入口で確定する。llama の forward は
+        // `tokens.len() > 1` なら prefill、それ以外 (n==1) は decode。
+        // 従来は thread-local 既定値 (Decode) のまま prefill を走らせていたため、
+        // 入力 6k トークンの prefill が decode 側の表に積まれていた。
+        // PROFILE 無効時は set すら行わない (完全 no-op)。
+        let prof_phase = if n > 1 {
+            crate::prof::Phase::Prefill
+        } else {
+            crate::prof::Phase::Decode
+        };
+        if crate::prof::enabled() {
+            crate::prof::set_phase(prof_phase);
+        }
+
         // P17d: solo decode (n==1) はデバイス常駐チェーンで実行
         // (GPU 無効/非対応構造/実行時エラー → None → 従来経路でやり直し)
         #[cfg(feature = "cuda")]
@@ -675,7 +703,8 @@ impl Model for LlamaQwen2 {
         }
 
         let mut x = vec![0.0f32; n * e];
-        crate::prof::time(crate::prof::EMBED, || {
+        // s57 (T4): 埋め込みは n 行のルックアップ (tok/call = n)
+        crate::prof::time_n(crate::prof::EMBED, n, || {
             for (i, &t) in tokens.iter().enumerate() {
                 let emb = &self.embed[t as usize * e..][..e];
                 x[i * e..][..e].copy_from_slice(emb);
@@ -685,7 +714,7 @@ impl Model for LlamaQwen2 {
         for (li, layer) in self.layers.iter().enumerate() {
             crate::telemetry_layer_begin(li as u16);
             // --- attention ---
-            let h = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+            let h = crate::prof::time_n(crate::prof::RMSNORM, n, || {
                 rmsnorm(&x, &layer.ln1_w, e, self.eps)
             });
             // P17k ステップ 5: qkv GEMM → rope → K/V キャッシュ書き込みまでを
@@ -739,7 +768,7 @@ impl Model for LlamaQwen2 {
             #[cfg(not(feature = "cuda"))]
             let dev_qkv = false;
             let (mut q, mut k, mut v) = if !dev_qkv {
-                crate::prof::time_layer(crate::prof::QKV, li, || {
+                crate::prof::time_n(crate::prof::QKV, n, || {
                     // P17c: q/k/v は同一入力 → 1 回の GPU 呼び出しに融合
                     // (GPU 無効/エラー時は従来の 3 分割呼び出しにフォールバック)
                     #[cfg(feature = "cuda")]
@@ -770,7 +799,7 @@ impl Model for LlamaQwen2 {
                 // Qwen3 QK-Norm: q/k を head_dim 単位で RMSNorm する (RoPE の前)。
                 // 行/ヘッド単位で独立 → バッチ/単独でビット一致
                 if layer.q_norm_w.is_some() || layer.k_norm_w.is_some() {
-                    crate::prof::time_layer(crate::prof::QKNORM, li, || {
+                    crate::prof::time_n(crate::prof::QKNORM, n, || {
                         if let Some(w) = &layer.q_norm_w {
                             crate::tensor::qknorm_rows_inplace(&mut q, n, heads, dh, w, self.eps);
                         }
@@ -780,7 +809,7 @@ impl Model for LlamaQwen2 {
                     });
                 }
 
-                crate::prof::time_layer(crate::prof::ROPE, li, || {
+                crate::prof::time_n(crate::prof::ROPE, n, || {
                     rope_rows(&mut q, n, heads, dh, pos0, self.theta);
                     rope_rows(&mut k, n, kv_heads, dh, pos0, self.theta);
                 });
@@ -801,7 +830,7 @@ impl Model for LlamaQwen2 {
             // o_proj まで実行。クロージャの外で受け取る)
             #[cfg(feature = "cuda")]
             let mut gpu_oproj: Option<Vec<f32>> = None;
-            crate::prof::time_layer(crate::prof::ATTN, li, || {
+            crate::prof::time_n(crate::prof::ATTN, n, || {
                 let (kc, vc) = cache.kv_bufs_ref(li);
                 let t_total = pos0 + n;
                 let scale = 1.0 / (dh as f32).sqrt();
@@ -990,16 +1019,16 @@ impl Model for LlamaQwen2 {
             let proj = if let Some(p) = gpu_oproj {
                 p
             } else {
-                crate::prof::time_layer(crate::prof::OPROJ, li, || lin(&att, &layer.o_w, n))
+                crate::prof::time_n(crate::prof::OPROJ, n, || lin(&att, &layer.o_w, n))
             };
             #[cfg(not(feature = "cuda"))]
-            let proj = crate::prof::time_layer(crate::prof::OPROJ, li, || lin(&att, &layer.o_w, n));
+            let proj = crate::prof::time_n(crate::prof::OPROJ, n, || lin(&att, &layer.o_w, n));
             for i in 0..n * e {
                 x[i] += proj[i];
             }
 
             // --- mlp (SwiGLU) ---
-            let h2 = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+            let h2 = crate::prof::time_n(crate::prof::RMSNORM, n, || {
                 rmsnorm(&x, &layer.ln2_w, e, self.eps)
             });
             // P17k: FFN 線形ブロック (gate_up → swiglu → down) をデバイス常駐で
@@ -1022,7 +1051,7 @@ impl Model for LlamaQwen2 {
                     }
                 }
             }
-            let (mut gate, up) = crate::prof::time_layer(crate::prof::GATE_UP, li, || {
+            let (mut gate, up) = crate::prof::time_n(crate::prof::GATE_UP, n, || {
                 // P17c: gate/up は同一入力 → 1 回の GPU 呼び出しに融合
                 #[cfg(feature = "cuda")]
                 if let Some((gate, up)) = lin_gateup_gpu(layer, &h2, n, self.ff) {
@@ -1030,13 +1059,13 @@ impl Model for LlamaQwen2 {
                 }
                 (lin(&h2, &layer.gate_w, n), lin(&h2, &layer.up_w, n))
             });
-            crate::prof::time_layer(crate::prof::SWIGLU, li, || {
+            crate::prof::time_n(crate::prof::SWIGLU, n, || {
                 silu_inplace(&mut gate);
                 for i in 0..n * self.ff {
                     gate[i] *= up[i];
                 }
             });
-            let down = crate::prof::time_layer(crate::prof::DOWN, li, || lin(&gate, &layer.down_w, n));
+            let down = crate::prof::time_n(crate::prof::DOWN, n, || lin(&gate, &layer.down_w, n));
             for i in 0..n * e {
                 x[i] += down[i];
             }
@@ -1044,10 +1073,12 @@ impl Model for LlamaQwen2 {
         }
 
         let last = &x[(n - 1) * e..];
-        let hn = crate::prof::time(crate::prof::FINAL_NORM, || {
+        // s57 (T4): 最終 norm と lm_head は最終行 1 行だけ → tok/call = 1
+        // (prefill でも n 行ではない)。
+        let hn = crate::prof::time_n(crate::prof::FINAL_NORM, 1, || {
             rmsnorm(last, &self.norm_w, e, self.eps)
         });
-        let logits = crate::prof::time(crate::prof::LM_HEAD, || match &self.lm_head {
+        let logits = crate::prof::time_full(crate::prof::LM_HEAD, 1, false, || match &self.lm_head {
             Some(w) => lin(&hn, w, 1),
             // tied (fp32 モード): embed を [vocab, e] のまま転置使用
             None => crate::tensor::matvec_bt(&hn, &self.embed, e, self.vocab),
@@ -1070,6 +1101,13 @@ impl Model for LlamaQwen2 {
     ) -> Result<Vec<Vec<f32>>> {
         debug_assert_eq!(toks.len(), caches.len());
         let b = toks.len();
+
+        // s57 (T4): forward_batch は「各セッション 1 トークンの decode ステップ」。
+        // llama の forward_batch は自身の forward を呼ばない (独自経路) ため、
+        // フェーズをここで明示する。PROFILE 無効時は set しない (no-op)。
+        if crate::prof::enabled() {
+            crate::prof::set_phase(crate::prof::Phase::Decode);
+        }
 
         // P17h: b==1 は solo decode chain (rope GPU 化+qkv デバイス常駐・ステップ内
         // の sync 廃止) に委譲する。GPU 無効/非対応構造/実行時エラー → None →
@@ -1099,7 +1137,7 @@ impl Model for LlamaQwen2 {
 
         // --- embed (セッションごとに lookup、行間の相互作用なし) ---
         let mut x = vec![0.0f32; b * e];
-        crate::prof::time(crate::prof::EMBED, || {
+        crate::prof::time_n(crate::prof::EMBED, b, || {
             for (i, &t) in toks.iter().enumerate() {
                 let emb = &self.embed[t as usize * e..][..e];
                 x[i * e..][..e].copy_from_slice(emb);
@@ -1110,10 +1148,10 @@ impl Model for LlamaQwen2 {
             crate::telemetry_layer_begin(li as u16);
             // --- attention ---
             // rmsnorm は行独立なので [b, e] にまとめて適用できる (行ごとに同一演算)
-            let h = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+            let h = crate::prof::time_n(crate::prof::RMSNORM, b, || {
                 rmsnorm(&x, &layer.ln1_w, e, self.eps)
             });
-            let (mut q, mut k, mut v) = crate::prof::time_layer(crate::prof::QKV, li, || {
+            let (mut q, mut k, mut v) = crate::prof::time_n(crate::prof::QKV, b, || {
                 // P17c: q/k/v は同一入力 → 1 回の GPU 呼び出しに融合
                 #[cfg(feature = "cuda")]
                 if let Some((q, k, v)) = lin_qkv_gpu(layer, &h, b, heads * dh, kv_dim) {
@@ -1137,7 +1175,7 @@ impl Model for LlamaQwen2 {
             // Qwen3 QK-Norm: q/k を head_dim 単位で RMSNorm する (RoPE の前)。
             // forward() と同一の行/ヘッド単位演算 → 単独 decode とビット一致
             if layer.q_norm_w.is_some() || layer.k_norm_w.is_some() {
-                crate::prof::time_layer(crate::prof::QKNORM, li, || {
+                crate::prof::time_n(crate::prof::QKNORM, b, || {
                     if let Some(w) = &layer.q_norm_w {
                         crate::tensor::qknorm_rows_inplace(&mut q, b, heads, dh, w, self.eps);
                     }
@@ -1152,7 +1190,7 @@ impl Model for LlamaQwen2 {
             // B3: b>1 も rope を GPU へ (P17 系 rope カーネルと同一演算列・CPU と
             // ビット一致・rope は緩和対象外)。失敗時は q/k 不変で false →
             // 従来の CPU rope でやり直し (混合なし)。
-            crate::prof::time_layer(crate::prof::ROPE, li, || {
+            crate::prof::time_n(crate::prof::ROPE, b, || {
                 #[cfg(feature = "cuda")]
                 {
                     let poss: Vec<usize> = (0..b).map(|i| caches[i].len()).collect();
@@ -1208,7 +1246,7 @@ impl Model for LlamaQwen2 {
             // 注意: GPU attention は加算済み q/k/v を受けるだけで bias/QK-Norm と
             // 無関係 → chain_compatible (solo chain の条件) に依存させない。
             let mut att = vec![0.0f32; b * heads * dh];
-            crate::prof::time_layer(crate::prof::ATTN, li, || {
+            crate::prof::time_n(crate::prof::ATTN, b, || {
                 let scale = 1.0 / (dh as f32).sqrt();
                 #[cfg(feature = "cuda")]
                 {
@@ -1257,16 +1295,16 @@ impl Model for LlamaQwen2 {
                 }
             });
 
-            let proj = crate::prof::time_layer(crate::prof::OPROJ, li, || lin_b(&att, &layer.o_w, b));
+            let proj = crate::prof::time_n(crate::prof::OPROJ, b, || lin_b(&att, &layer.o_w, b));
             for i in 0..b * e {
                 x[i] += proj[i];
             }
 
             // --- mlp (SwiGLU) ---
-            let h2 = crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+            let h2 = crate::prof::time_n(crate::prof::RMSNORM, b, || {
                 rmsnorm(&x, &layer.ln2_w, e, self.eps)
             });
-            let (mut gate, up) = crate::prof::time_layer(crate::prof::GATE_UP, li, || {
+            let (mut gate, up) = crate::prof::time_n(crate::prof::GATE_UP, b, || {
                 // P17c: gate/up は同一入力 → 1 回の GPU 呼び出しに融合
                 #[cfg(feature = "cuda")]
                 if let Some((gate, up)) = lin_gateup_gpu(layer, &h2, b, self.ff) {
@@ -1274,14 +1312,14 @@ impl Model for LlamaQwen2 {
                 }
                 (lin_b(&h2, &layer.gate_w, b), lin_b(&h2, &layer.up_w, b))
             });
-            crate::prof::time_layer(crate::prof::SWIGLU, li, || {
+            crate::prof::time_n(crate::prof::SWIGLU, b, || {
                 silu_inplace(&mut gate);
                 for i in 0..b * self.ff {
                     gate[i] *= up[i];
                 }
             });
             let down =
-                crate::prof::time_layer(crate::prof::DOWN, li, || lin_b(&gate, &layer.down_w, b));
+                crate::prof::time_n(crate::prof::DOWN, b, || lin_b(&gate, &layer.down_w, b));
             for i in 0..b * e {
                 x[i] += down[i];
             }
@@ -1290,13 +1328,13 @@ impl Model for LlamaQwen2 {
 
         // --- final norm (行独立) + lm_head (バッチ) ---
         let mut hn = vec![0.0f32; b * e];
-        crate::prof::time(crate::prof::FINAL_NORM, || {
+        crate::prof::time_n(crate::prof::FINAL_NORM, b, || {
             for i in 0..b {
                 let r = rmsnorm(&x[i * e..][..e], &self.norm_w, e, self.eps);
                 hn[i * e..][..e].copy_from_slice(&r);
             }
         });
-        let logits = crate::prof::time(crate::prof::LM_HEAD, || match &self.lm_head {
+        let logits = crate::prof::time_n(crate::prof::LM_HEAD, b, || match &self.lm_head {
             Some(w) => lin_b(&hn, w, b),
             // tied (fp32 モード): embed を [vocab, e] のまま転置使用
             None => crate::tensor::matvec_rows_bt(&hn, &self.embed, e, self.vocab, b),
