@@ -121,6 +121,7 @@ async fn frozen_log_consumer_does_not_wedge_the_server() {
         model_name: "denno-test".to_string(),
         model_id: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
         default_repetition_penalty: None,
+        temperature_cap: None,
     });
 
     let app: Router = denno_server::router(state.clone());

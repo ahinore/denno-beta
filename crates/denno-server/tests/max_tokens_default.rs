@@ -80,6 +80,7 @@ fn test_app() -> Router {
         model_name: "denno-test".to_string(),
         model_id: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
         default_repetition_penalty: None,
+        temperature_cap: None,
     });
     denno_server::router(state)
 }

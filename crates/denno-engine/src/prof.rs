@@ -104,6 +104,18 @@ pub const D2H_SRC_LINEAR: usize = 10 * D2H + 16;
 pub const D2H_SRC_LOGITS: usize = 10 * D2H + 17;
 pub const D2H_SRC_OTHER: usize = 10 * D2H + 18;
 pub const D2H_SRC_FIRST: usize = 10 * D2H + 13;
+/// s78 (T7 計測のみ): prefill の `gdn_proj` (beta/alpha 投影) 1 call ぶんの内訳。
+/// 呼び出し側は beta と alpha を別々の `time_n_ev(ATT_GDN_PROJ)` に載せているので、
+/// その**内側**を 4 区間 (H2D / カーネル実行 / 同期 / D2H) に分割すると
+/// 「数学 / 転送 / 待ち」のどれが支配的かが分かる。`D2H_GDN_PF_*` と同じ規約:
+/// **表示専用**テーブルで、どの生 id にも合算しない (二重計上しない)。
+/// GPU 経路が不発 (CPU フォールバック) の call はどれも積まれない。
+pub const D2H_GDN_PROJ_H2D: usize = 10 * D2H + 19; // 活性化 [m,e] の H2D 発行
+pub const D2H_GDN_PROJ_KERNEL: usize = 10 * D2H + 20; // カーネル launch 発行
+pub const D2H_GDN_PROJ_SYNC: usize = 10 * D2H + 21; // cuCtxSynchronize (完了待ち = 実行)
+pub const D2H_GDN_PROJ_D2H: usize = 10 * D2H + 22; // 出力 [m,nv] の D2H + ホスト反映
+pub const D2H_GDN_PROJ_N: usize = 4;
+pub const D2H_GDN_PROJ_FIRST: usize = 10 * D2H + 19;
 /// s57 (T4): `attn_core` の層種別分離 (倍率 100)。**ATNN 生 id (= 4) の集計は従来どおり**
 /// — これは summary のテキスト出力だけに掛ける細分 (D2H 細分と同じ規約)。
 ///
@@ -242,6 +254,14 @@ const D2H_GDN_PF_NAMES: [&str; D2H_GDN_PF_N] = [
     "gdn_pf_d2h",
 ];
 
+/// s78 (T7): `gdn_proj` 1 call の内訳の表示名 (id は 10*D2H + 19 + i)。
+const D2H_GDN_PROJ_NAMES: [&str; D2H_GDN_PROJ_N] = [
+    "gdnp_h2d",
+    "gdnp_kernel",
+    "gdnp_sync",
+    "gdnp_d2h",
+];
+
 /// s65: `d2h_state` 発行元の表示名 (id は 10*D2H + 13 + i)。
 /// **件数の分類**であり、時間は持たない (docs/コメント参照)。
 const D2H_SRC_NAMES: [&str; D2H_SRC_N] = [
@@ -313,6 +333,10 @@ static GDN_PF_CALLS: [[AtomicU64; D2H_GDN_PF_N]; Phase::N] = mk_counters::<D2H_G
 /// s65: `d2h_state` 発行元の**件数**の分類。**表示専用** — 時間は
 /// 持たない (発行点の内側で計ると sync 待ちが二重計上されるため)。
 static D2H_SRC_CALLS: [[AtomicU64; D2H_SRC_N]; Phase::N] = mk_counters::<D2H_SRC_N>();
+/// s78 (T7): `gdn_proj` 1 call の内訳 (`gdnp_*`) 累積。**表示専用** —
+/// `attn_gdn` / `gdn_proj` のどのバケットにも合算しない (二重計上防止)。
+static GDN_PROJ_NS: [[AtomicU64; D2H_GDN_PROJ_N]; Phase::N] = mk_counters::<D2H_GDN_PROJ_N>();
+static GDN_PROJ_CALLS: [[AtomicU64; D2H_GDN_PROJ_N]; Phase::N] = mk_counters::<D2H_GDN_PROJ_N>();
 /// s57 (T4): attn_core の細分 (id は 100*ATTN + i → 添字 i)。フェーズ別。
 static ATT_SUB_NS: [[AtomicU64; ATT_CLS_N]; Phase::N] = mk_counters::<ATT_CLS_N>();
 static ATT_SUB_CALLS: [[AtomicU64; ATT_CLS_N]; Phase::N] = mk_counters::<ATT_CLS_N>();
@@ -580,6 +604,15 @@ pub(crate) fn add_sample(
         GDN_PF_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
         GDN_PF_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
     }
+    // s78 (T7): `gdn_proj` 内訳 (gdnp_*) も **ここでしか積まない** (表示専用)。
+    if (D2H_GDN_PROJ_FIRST..D2H_GDN_PROJ_FIRST + D2H_GDN_PROJ_N).contains(&op) {
+        let k = op - D2H_GDN_PROJ_FIRST;
+        GDN_PROJ_NS[pi][k].fetch_add(ns, Ordering::Relaxed);
+        GDN_PROJ_NS[Phase::Both.idx()][k].fetch_add(ns, Ordering::Relaxed);
+        GDN_PROJ_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
+        GDN_PROJ_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
+        return;
+    }
     // s65: `d2h_state` 発行元 (d2h_src_*) も **ここでしか積まない** (表示専用)。
     // `mark_d2h_src` はこの経路を使うので、生 id へ落ちないよう明示的に弾く。
     if (D2H_SRC_FIRST..D2H_SRC_FIRST + D2H_SRC_N).contains(&op) {
@@ -743,6 +776,10 @@ pub fn reset() {
         for i in 0..D2H_SRC_N {
             D2H_SRC_CALLS[p][i].store(0, Ordering::Relaxed);
         }
+        for i in 0..D2H_GDN_PROJ_N {
+            GDN_PROJ_NS[p][i].store(0, Ordering::Relaxed);
+            GDN_PROJ_CALLS[p][i].store(0, Ordering::Relaxed);
+        }
         for i in 0..ATT_CLS_N {
             ATT_SUB_NS[p][i].store(0, Ordering::Relaxed);
             ATT_SUB_CALLS[p][i].store(0, Ordering::Relaxed);
@@ -843,6 +880,10 @@ fn phase_table(phase: Phase, s: &mut String) {
                     "-",
                     ""
                 ));
+                if k == 2 {
+                    // s78 (T7): gdn_proj の直下にその内訳 (H2D / kernel / sync / D2H)
+                    push_gdn_proj_rows(p, total, "        ", s);
+                }
                 if k == 3 {
                     // s64: gdn_scan の直下にその内訳 (確保 / launch / sync / D2H) を出す
                     push_gdn_pf_rows(p, total, "        ", s);
@@ -887,6 +928,29 @@ fn push_d2h_src_rows(p: usize, indent: &str, s: &mut String) {
         s.push_str(&format!(
             "{indent}{:<12} {:>10} {:>8} {:>6} {:>8} {:>6}\n",
             D2H_SRC_NAMES[k], "-", sc, "-", "-", ""
+        ));
+    }
+}
+
+/// s78 (T7): `gdn_proj` (beta/alpha 投影) 1 call の内訳 (`gdnp_h2d/kernel/sync/d2h`)
+/// を `indent` 付きで 1 行ずつ積む。**表示専用** — 4 区間の和は 2 call
+/// (beta + alpha) ぶんの GPU 区間になるが、値はどのバケットにも合算されない
+/// (`gdn_proj` 行の値は呼び出し側の外側計時が持つ)。
+fn push_gdn_proj_rows(p: usize, total: u64, indent: &str, s: &mut String) {
+    for k in 0..D2H_GDN_PROJ_N {
+        let sns = GDN_PROJ_NS[p][k].load(Ordering::Relaxed);
+        let sc = GDN_PROJ_CALLS[p][k].load(Ordering::Relaxed);
+        if sns == 0 && sc == 0 {
+            continue;
+        }
+        s.push_str(&format!(
+            "{indent}{:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
+            D2H_GDN_PROJ_NAMES[k],
+            sns as f64 / 1e6,
+            sc,
+            sns as f64 / total.max(1) as f64 * 100.0,
+            "-",
+            ""
         ));
     }
 }
@@ -1087,6 +1151,28 @@ mod tests {
         }
         // D2H 細分 (i < 9)・GDN_PF (9..12) と交差しない
         assert!(D2H_SRC_KV_ROW > D2H_LOGITS_PF_HELD + 3);
+    }
+
+    /// s78 (T7): `gdn_proj` 内訳 (gdnp_*) の id が連番で、既存の細分
+    /// (D2H 細分 0..9 / GDN_PF 9..13 / D2H_SRC 13..19) と交差せず、
+    /// かつ 10*D2H ブロック内 (生 id の D2H スロットへ落ちない領域) に
+    /// 収まることを固定する。
+    #[test]
+    fn gdn_proj_split_ids_are_outside_existing_ranges() {
+        let ids = [
+            D2H_GDN_PROJ_H2D,
+            D2H_GDN_PROJ_KERNEL,
+            D2H_GDN_PROJ_SYNC,
+            D2H_GDN_PROJ_D2H,
+        ];
+        assert_eq!(ids.len(), D2H_GDN_PROJ_N);
+        assert_eq!(D2H_GDN_PROJ_NAMES.len(), D2H_GDN_PROJ_N);
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(id, D2H_GDN_PROJ_FIRST + i);
+            assert!(id >= N_OPS, "raw id range violated: {id}");
+        }
+        // 既存細分の末尾 (d2h_src_other) の直後から始まる
+        assert_eq!(D2H_GDN_PROJ_FIRST, D2H_SRC_FIRST + D2H_SRC_N);
     }
 
     /// s57 (T4): attn_core の層種別細分 id が生 id の範囲外で連番であること。
