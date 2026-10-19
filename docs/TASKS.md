@@ -51,16 +51,6 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 - Idea: raise occupancy (smaller BK, more blocks), check L2 reuse of K/V across heads.
 - Estimated: not yet re-derived from a per-kernel profile; 942 ms is the ceiling for the
   whole bucket. Risk: medium; the attention contract allows 1e-3 abs (R3).
-- Status: **one implementation candidate landed in s112, awaiting GPU measurement.** Candidate
-  picked is the bit-exact class (s112 ⑦): `__ldg` on the K/V global reads in
-  `dno_attention_prefill` only. No tile, no accumulation order and no shared-memory layout
-  changed, so the output is expected to be bit-identical to the current kernel. The two
-  `PF_BQ` candidates were rejected from code inspection alone: shrinking `PF_BQ` to 32 halves
-  per-block shared memory (84.8 -> 50.6 KB at dh=256) but that only raises the smem-resident
-  blocks per SM from 2 to 4 while doubling K/V re-read traffic, which is exactly the axis
-  T7b-2 showed to be fatal. The `dh=128` (llama) path is already at 42.8 KB / 5 blocks per SM,
-  so the same tile change buys it nothing structurally, and both paths would still pay the
-  extra re-read. Measurement (cold A/B) and `.ptx` regeneration are the supervisor's step.
 
 ### P1-3: d2h_state / sync reduction
 - Where: `cuda.rs` chains, `prof.rs` `d2h_state`.
