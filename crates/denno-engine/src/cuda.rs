@@ -317,6 +317,13 @@ pub struct CudaCtx {
     f_mv: CUfunction,
     // P17i: prefill 用 tiled GEMM (dno_gemm_i8)
     f_gemm: CUfunction,
+    /// s114 (P1-4 候補 1): GEMM の epilogue に swiglu を畳み込んだ prefill gate/up 専用版
+    /// (dno_gemm_i8 の数値・レイアウトは不変。この関数だけが別カーネル)。
+    /// PTX 未再生成のビルドでは null のまま (= 従来の 2 段経路に落ちる)。
+    f_gemm_swiglu: CUfunction,
+    /// s114: 融合カーネルの**動的** smem (gate 重み 1 枚) をこのデバイス/関数で
+    /// 受け付けられるか。false なら融合を使わない (2 段経路へ)。
+    gemm_swiglu_dyn: bool,
     // P17d: 要素演算モジュール (swiglu / add+rmsnorm / expf probe)
     #[allow(dead_code)]
     module_elem: CUmodule,
@@ -418,6 +425,47 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_gemm, module, b"dno_gemm_i8\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_gemm_i8)",
             )?;
+            // s114 (P1-4 候補 1): gate/up の GEMM + swiglu 融合版 (同じ int8 モジュール)。
+            // PTX 未再生成のビルド (dno_gemm_i8_swiglu がまだ入っていない .ptx) で
+            // ここが失敗して shared_ctx 全体が立たなくなるのを避けるため、取得失敗は
+            // **致命的にしない**: null のままにし、呼び出し側 (chain_gemm_swiglu_pf) が
+            // null を見て従来の 2 段経路へ落ちる (数値・挙動は完全に不変)。
+            let mut f_gemm_swiglu: CUfunction = std::ptr::null_mut();
+            if check(
+                (lib.module_get_function)(&mut f_gemm_swiglu, module, b"dno_gemm_i8_swiglu\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_gemm_i8_swiglu)",
+            )
+            .is_err()
+            {
+                tracing::info!(
+                    "CUDA: dno_gemm_i8_swiglu が PTX に無いため融合 GEMM+swiglu を無効化 \
+                     (PTX 再生成で有効化・数値は 2 段経路と同一)"
+                );
+                f_gemm_swiglu = std::ptr::null_mut();
+            }
+            // s114: 融合カーネルは gate 重み 1 枚 (9,216B) を**動的** smem に置く。
+            // 既定 48KB の枠内なので opt-in は必須ではないが、明示的に確保して
+            // 将来タイルを大きくしても通るようにする。失敗しても既定枠内なら起動できる
+            // ので、必要量が 48KB 以下である限り dyn=true のまま続行する。
+            let gemm_swiglu_dyn = if f_gemm_swiglu.is_null() {
+                false
+            } else {
+                let want = gemm_swiglu_dyn_smem();
+                let ok = match lib.func_set_attribute {
+                    Some(set_attr) => {
+                        (set_attr)(f_gemm_swiglu, CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES, want as c_int) == 0
+                    }
+                    None => false,
+                };
+                if !ok {
+                    tracing::warn!(
+                        "CUDA: dno_gemm_i8_swiglu の動的 smem opt-in に失敗 ({}B)。\
+                         既定 48KB 枠内なら起動できるため融合は継続",
+                        want
+                    );
+                }
+                ok || want <= GEMM_SWIGLU_STATIC_SMEM_BUDGET
+            };
 
             // P17d: 要素演算モジュール (-fmad=false でコンパイル済み。FMA 縮約は
             // CPU とビット一致しないため禁止)
@@ -546,6 +594,8 @@ impl CudaCtx {
                 f_quant,
                 f_mv,
                 f_gemm,
+                f_gemm_swiglu,
+                gemm_swiglu_dyn,
                 module_elem,
                 f_swiglu,
                 f_swiglu_int,
@@ -1213,6 +1263,40 @@ const GEMM_TILE_N: usize = 256;
 /// 食い違い、残り 96 行が未書き込みのまま返っていた)。
 const GEMM_BX: u32 = 16;
 const GEMM_BY: u32 = 16;
+/// s114: 融合 GEMM+swiglu カーネルの k タイル (kernels_int8.cu の GEMM_TK) と
+/// 共有メモリの行ストライド (GEMM_SP = GEMM_TK + 4。4 の倍数かつ 32 の倍数でない
+/// 値にして bank conflict を避ける)。
+const GEMM_TK: usize = 32;
+const GEMM_SP: usize = GEMM_TK + 4;
+/// s114: 動的 smem の opt-in ができないデバイスでも融合を続けてよい上限 (bytes)。
+/// 48KB は opt-in 無しで使える既定枠。カーネルの必要量 (9,216B) はこの内側。
+const GEMM_SWIGLU_STATIC_SMEM_BUDGET: usize = 48 * 1024;
+
+/// s114: 融合 GEMM+swiglu カーネル (`dno_gemm_i8_swiglu`) の**動的**共有メモリ量
+/// (bytes) = gate 重み 1 枚 = GEMM_TILE_N * GEMM_SP = 256 * 36 = 9,216B。
+/// カーネル側は `extern __shared__ signed char sGflat[]` を
+/// `signed char (*)[GEMM_SP]` にキャストして GEMM_TILE_N 行として使う。
+fn gemm_swiglu_dyn_smem() -> usize {
+    GEMM_TILE_N * GEMM_SP
+}
+
+/// s114: 融合経路の起動グリッド。出力タイルは act の [128 行, 256 列] なので
+/// grid.x = ceil(m / 128) / grid.y = ceil(ff / 256) (行列とも端はカーネル側で
+/// 打ち切る)。**ff の倍数性は要求しない** (ff が 256 の倍数でなくても、末尾
+/// タイルの f >= ff の列は epilogue と重みロードで捨てられるだけ)。
+fn gemm_swiglu_launch_grid(m: usize, ff: usize) -> (u32, u32) {
+    let gmx = m.div_ceil(GEMM_TILE) as u32;
+    let gmy = ff.div_ceil(GEMM_TILE_N) as u32;
+    (gmx, gmy)
+}
+
+/// s114: 融合経路を実際に起動してよいか (純関数。GPU 無しでテストする)。
+///   `have_fn`: PTX から `dno_gemm_i8_swiglu` が取れたか (未再生成のビルドでは false)
+///   `dyn_ok`:   動的 smem (gate 重み 1 枚) を受け付けられるか
+/// どちらかが false なら 2 段経路 (chain_gemm_grouped_pf + chain_swiglu_rows) へ。
+fn gemm_swiglu_fused_ready(have_fn: bool, dyn_ok: bool, m: usize, gate_up_n: usize) -> bool {
+    have_fn && dyn_ok && m > 0 && gate_up_n % 2 == 0 && gate_up_n / 2 > 0
+}
 
 /// s74 (T6 候補 1): dno_gemm_i8 の j 方向タイル (256) に合わせた重み行の切り上げ。
 /// 旧 128 タイル版は端をカーネル側で 0 埋めしていたが、新カーネルは A 行を
@@ -2911,6 +2995,91 @@ fn chain_gemm_grouped_pf(
     })
 }
 
+/// s114 (P1-4 候補 1): prefill の gate/up を **1 本の** int8 GEMM + swiglu
+/// (epilogue 融合) で計算し、act [m, ff] を `act_slot` に書く (デバイス常駐)。
+///
+/// 置き換える 2 段経路 (chain_mlp_prefill 内):
+///   1) chain_gemm_grouped_pf(&[gate_up_w], in_slot, CH_GA, m)  → [m, 2ff]
+///   2) chain_swiglu_rows(CH_GA, act_slot, ff, m)               → [m, ff]
+/// と**同じ量子化・同じ整数累積・同じスケール順・同じ swiglu 演算列**で、CH_GA
+/// (m*2ff*4B) への書き出しと読み直しだけを省く。
+///
+/// None を返す (呼び出し側は 2 段経路へ落ちる) 条件:
+/// - 融合カーネルが PTX に無い (f_gemm_swiglu が null = PTX 未再生成のビルド)
+/// - 動的 smem を受け付けない (gemm_swiglu_dyn が false)
+/// - 形状不整合 (n = 2ff が偶数でない / m = 0)
+///
+/// ff の倍数性は要求しない (1 ブロックが gate と up を同じ (u,v) で持つため、
+/// タイル境界とパート境界 ff の整合は不要)。`chain_swiglu_rows` /
+/// `chain_gemm_grouped_pf` / `dno_gemm_i8` は一切変更しない。
+fn chain_gemm_swiglu_pf(
+    gate_up_w: &crate::quant::Quant8Linear,
+    in_slot: usize,
+    act_slot: usize,
+    m: usize,
+) -> Option<()> {
+    let ctx = chain_ctx()?;
+    if !gemm_swiglu_fused_ready(!ctx.f_gemm_swiglu.is_null(), ctx.gemm_swiglu_dyn, m, gate_up_w.n) {
+        return None;
+    }
+    let ff = gate_up_w.n / 2;
+    let k = gate_up_w.k;
+    let n = gate_up_w.n;
+    let gw = ok(weights_for_group(&[gate_up_w.uid], &[gate_up_w], k, n))?;
+    ok(chain_ensure_buf(in_slot, m.checked_mul(k)?.checked_mul(4)?))?;
+    ok(chain_ensure_buf(act_slot, m.checked_mul(ff)?.checked_mul(4)?))?;
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure(&mut s.aq, m * k))?;
+        let iptr = s.bufs[in_slot].as_ref()?.ptr();
+        let actptr = s.bufs[act_slot].as_ref()?.ptr();
+        let aq = s.aq.as_ref()?.ptr();
+        SCRATCH.with(|c2| -> Option<()> {
+            let mut s2 = c2.borrow_mut();
+            ok(Scratch::ensure(&mut s2.asc, m * 4))?;
+            let asc = s2.asc.as_ref()?.ptr();
+            // 1) 量子化 (2 段経路と同一カーネル・同一入力 in_slot・同一 asc)
+            let (mut px, mut paq, mut pasc) = (iptr, aq, asc);
+            let (mut mc, mut kc) = (m as c_int, k as c_int);
+            let mut args = [
+                &mut px as *mut _ as *mut c_void,
+                &mut paq as *mut _ as *mut c_void,
+                &mut pasc as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+            ];
+            ok(unsafe { ctx.launch_async(ctx.f_quant, (m as u32, 1, 1), (256, 1, 1), 256 * 4, &mut args) })?;
+            // 2) 融合 GEMM + swiglu: act の [128, 256] タイルごとに 1 ブロック。
+            //    引数は (m, k, n = 2ff, ff) の 4 本 + 動的 smem (gate 重み 1 枚)。
+            let (mut paqi, mut pasci, mut pw, mut psc, mut pact) =
+                (aq, asc, gw.w.ptr(), gw.sc.ptr(), actptr);
+            let (mut mc, mut kc, mut nc, mut ffc) =
+                (m as c_int, k as c_int, n as c_int, ff as c_int);
+            let mut args = [
+                &mut paqi as *mut _ as *mut c_void,
+                &mut pasci as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut psc as *mut _ as *mut c_void,
+                &mut pact as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+                &mut ffc as *mut _ as *mut c_void,
+            ];
+            let (gmx, gmy) = gemm_swiglu_launch_grid(m, ff);
+            ok(unsafe {
+                ctx.launch_async(
+                    ctx.f_gemm_swiglu,
+                    (gmx, gmy, 1),
+                    (GEMM_BX, GEMM_BY, 1),
+                    gemm_swiglu_dyn_smem() as u32,
+                    &mut args,
+                )
+            })
+        })
+    })
+}
+
 /// s70: 行内 [gate|up] 連結レイアウト (width = 2*ff) の swiglu。m > 1 でも
 /// 使えるのは `dno_swiglu_int` 側 (`dno_swiglu` は gate/up がブロック分離の
 /// 前提なので m=1 専用)。演算列は CPU の `gv / (1+exp(-gv)) * uv` と同一。
@@ -2993,20 +3162,37 @@ pub fn chain_mlp_prefill(
     })?;
     // 2) gate/up → 3) swiglu  → 4) down (全て非同期・最後に 1 回だけ同期)
     // 計測時のみ段ごとに同期して内訳を取る (同期は数値に影響しない)。
-    crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
-        chain_gemm_grouped_pf(&[gate_up_w], CH_PFH, CH_GA, m)?;
+    //
+    // s114 (P1-4 候補 1): gate/up + swiglu を 1 ディスパッチにする。融合版は
+    // GEMM の epilogue で swiglu まで済ませて CH_ACT に直接書くので、CH_GA
+    // (m*2ff*4B) の書き出し + 読み直しが消える。数値は 2 段経路と同一 (同じ
+    // 量子化・同じ整数累積・同じスケール順・同じ swiglu 演算列)。融合版が使えない
+    // ビルド/形状 (PTX 未再生成・動的 smem 不可・n が奇数) では従来の 2 段へ落ちる。
+    // PROFILE では従来どおり「gate_up」→「swiglu」の 2 バケットに分けて計上する
+    // (時間は切り分けられないので融合 1 回分を gate_up 側に入れ、swiglu は 0 近傍)。
+    let fused = crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<bool> {
+        Some(chain_gemm_swiglu_pf(gate_up_w, CH_PFH, CH_ACT, m).is_some())
+    })?;
+    if fused {
         if crate::prof::enabled() {
             ok(ctx.sync())?;
         }
-        Some(())
-    })?;
-    crate::prof::time_layer(crate::prof::SWIGLU, li, || -> Option<()> {
-        chain_swiglu_rows(CH_GA, CH_ACT, ff, m)?;
-        if crate::prof::enabled() {
-            ok(ctx.sync())?;
-        }
-        Some(())
-    })?;
+    } else {
+        crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
+            chain_gemm_grouped_pf(&[gate_up_w], CH_PFH, CH_GA, m)?;
+            if crate::prof::enabled() {
+                ok(ctx.sync())?;
+            }
+            Some(())
+        })?;
+        crate::prof::time_layer(crate::prof::SWIGLU, li, || -> Option<()> {
+            chain_swiglu_rows(CH_GA, CH_ACT, ff, m)?;
+            if crate::prof::enabled() {
+                ok(ctx.sync())?;
+            }
+            Some(())
+        })?;
+    }
     crate::prof::time_layer(crate::prof::DOWN, li, || -> Option<()> {
         chain_gemm_grouped_pf(&[down_w], CH_ACT, CH_DOWN, m)
     })?;
@@ -8189,4 +8375,390 @@ fn gdn_scan_chunked_impl(
     ssm_st.copy_from_slice(&ssm_new);
     q.end();
     Ok(y)
+}
+
+// ===========================================================================
+// s114 (P1-4 候補 1): 融合 GEMM+swiglu (prefill gate/up) のテスト。
+//
+// GPU が無い環境でも契約を固定できるよう、2 層に分ける:
+//  1. **CPU 参照テスト** (cfg(test)・GPU 不要): カーネルと 2 段経路の
+//     *ドキュメント通りの* CPU 実装を突き合わせ、添字・レイアウト・スケール
+//     適用位置・タイル被覆を固定する。ff = 256 (タイル境界と一致) と
+//     ff = 384 (境界を跨ぐ = 末尾タイルが 128 列で半端) の両方を通す。
+//  2. **GPU 実機テスト** (#[ignore]): 融合カーネル vs 2 段経路
+//     (dno_gemm_i8 + dno_swiglu_int) のビット一致と決定論。supervisor が実行。
+//
+// s113 の失敗 (`ok 0 bad 256` = 全滅) は「gate と up が別 block に落ちる」設計
+// だったため。下のテストは *同じ (行, 列) の gate/up が同じ thread に載る* ことと、
+// **ff が 256 の倍数でない形でも全列が 1 回ずつ被覆される**ことを固定する。
+// ===========================================================================
+#[cfg(test)]
+mod fused_swiglu_tests {
+    use super::*;
+
+    /// 決定的な擬似乱数 (LCG)。外部 crate を使わず 2 回実行で同一列。
+    fn lcg_i8(len: usize, seed: u64) -> Vec<i8> {
+        let mut x = seed;
+        let mut v = Vec::with_capacity(len);
+        for _ in 0..len {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            v.push((((x >> 33) % 255) as i32 - 127) as i8);
+        }
+        v
+    }
+
+    fn lcg_f32(len: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed;
+        let mut v = Vec::with_capacity(len);
+        for _ in 0..len {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            // [0.0005, 0.0025) 程度のスケール (実モデルの重みスケールに近い桁)
+            v.push(0.0005 + ((x >> 40) % 1000) as f32 * 0.000002);
+        }
+        v
+    }
+
+    /// 2 段経路 (`dno_gemm_i8` → `dno_swiglu_int`) の CPU 参照。
+    /// gate_up は行内 [gate | up] (width = 2ff)、重みは行順 [gate 全行 | up 全行]。
+    ///   ga[r*2ff + j] = ((float)dot(aq[r], w[j])) * ascale[r] * scale[j]
+    ///   act[r*ff + f] = silu(ga[r*2ff + f]) * ga[r*2ff + ff + f]
+    fn two_stage_reference(
+        aq: &[i8],
+        ascale: &[f32],
+        w: &[i8],
+        scale: &[f32],
+        m: usize,
+        k: usize,
+        ff: usize,
+    ) -> Vec<f32> {
+        let width = 2 * ff;
+        let mut ga = vec![0f32; m * width];
+        for r in 0..m {
+            for j in 0..width {
+                let mut acc: i32 = 0;
+                for d in 0..k {
+                    // カーネルと同じ行オーダー: 出力 j は重みの j 行目 (= w[j*k + d])
+                    acc = acc.wrapping_add(aq[r * k + d] as i32 * w[j * k + d] as i32);
+                }
+                let o = (acc as f32) * ascale[r];
+                ga[r * width + j] = o * scale[j];
+            }
+        }
+        let mut act = vec![0f32; m * ff];
+        for r in 0..m {
+            for f in 0..ff {
+                let g = ga[r * width + f];
+                let u = ga[r * width + ff + f];
+                // dno_swiglu_int と同じ順序 (g / (1 + exp(-g))) * u
+                act[r * ff + f] = (g / (1.0 + (-g).exp())) * u;
+            }
+        }
+        act
+    }
+
+    /// 融合カーネル (`dno_gemm_i8_swiglu`) の CPU 参照。
+    ///
+    /// カーネルの**タイル分割・スレッド分担・shared メモリの段取りをそのまま**
+    /// 再現する (添字式をカーネルと揃える = 実機の不具合をここで落とす)。
+    /// gate/up の組が同じ (u,v) に載ること、端のタイルが正しく 0 埋めされることを
+    /// 含めて検証できるようにするため、単なる数式ではなくループ構造を写す。
+    #[allow(clippy::too_many_arguments)]
+    fn fused_reference(
+        aq: &[i8],
+        ascale: &[f32],
+        w: &[i8],
+        scale: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        ff: usize,
+    ) -> Vec<f32> {
+        let (gmx, gmy) = gemm_swiglu_launch_grid(m, ff);
+        let mut act = vec![0f32; m * ff];
+        for bx in 0..gmx as usize {
+            for by in 0..gmy as usize {
+                // 1 ブロック = 1 thread あたり 8 行 x 16 列 (block 16x16)。
+                // アキュムレータはカーネルと同じく **行 u ごとに独立** に持つ
+                // (u を共有すると 8 行分が同じスロットに足し込まれて全滅する —
+                //  このテストで実際に踏んだので式の形もカーネルに合わせる)。
+                let mut acc_u = [[[0i32; 16]; 8]; 256];
+                let mut acc_g = [[[0i32; 16]; 8]; 256];
+                let i0 = bx * GEMM_TILE;
+                let j0 = by * GEMM_TILE_N;
+                for tid in 0..(GEMM_BX * GEMM_BY) as usize {
+                    let (tx, ty) = (tid % GEMM_BX as usize, tid / GEMM_BX as usize);
+                    for kb in (0..k).step_by(GEMM_TK) {
+                        // --- 共有メモリの内容をその場で作る ---
+                        // sA[r][c] = aq[i0+r][kb+c] (端は 0)
+                        let mut sa = vec![0i8; GEMM_TILE * GEMM_SP];
+                        for r in 0..GEMM_TILE {
+                            let gi = i0 + r;
+                            for c in 0..GEMM_TK {
+                                let gk = kb + c;
+                                if gi < m && gk < k {
+                                    sa[r * GEMM_SP + c] = aq[gi * k + gk];
+                                }
+                            }
+                        }
+                        // sB[r][c] = up 重み (実列 ff+j0+r) / sG[r][c] = gate 重み (実列 j0+r)
+                        let mut sb = vec![0i8; GEMM_TILE_N * GEMM_SP];
+                        let mut sg = vec![0i8; GEMM_TILE_N * GEMM_SP];
+                        for r in 0..GEMM_TILE_N {
+                            let gu = ff + j0 + r;
+                            let gf = j0 + r;
+                            for c in 0..GEMM_TK {
+                                let gk = kb + c;
+                                if gu < n && gk < k {
+                                    sb[r * GEMM_SP + c] = w[gu * k + gk];
+                                }
+                                if gf < ff && gk < k {
+                                    sg[r * GEMM_SP + c] = w[gf * k + gk];
+                                }
+                            }
+                        }
+                        // --- 積和 (カーネルと同じ 8 行 x 16 列 = 2 グループ) ---
+                        for c0 in (0..GEMM_TK).step_by(4) {
+                            let mut a4 = [0i32; 8];
+                            for (u, a) in a4.iter_mut().enumerate() {
+                                *a = dp4a_of(&sa, (ty * 8 + u) * GEMM_SP + c0);
+                            }
+                            for t in 0..2 {
+                                for v in 0..8 {
+                                    let row = t * GEMM_TILE + tx * 8 + v;
+                                    let bu = dp4a_of(&sb, row * GEMM_SP + c0);
+                                    let bg = dp4a_of(&sg, row * GEMM_SP + c0);
+                                    for u in 0..8 {
+                                        acc_u[tid][u][t * 8 + v] =
+                                            acc_u[tid][u][t * 8 + v].wrapping_add(dp4a(a4[u], bu));
+                                        acc_g[tid][u][t * 8 + v] =
+                                            acc_g[tid][u][t * 8 + v].wrapping_add(dp4a(a4[u], bg));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // --- epilogue (カーネルと同じ式・同じ順序) ---
+                for tid in 0..(GEMM_BX * GEMM_BY) as usize {
+                    let (tx, ty) = (tid % GEMM_BX as usize, tid / GEMM_BX as usize);
+                    for u in 0..8 {
+                        let gi = i0 + ty * 8 + u;
+                        if gi < m {
+                            let a_s = ascale[gi];
+                            for v in 0..16 {
+                                let f = j0 + (if v < 8 { 0 } else { GEMM_TILE }) + tx * 8 + (v & 7);
+                                if f < ff {
+                                    let g = (acc_g[tid][u][v] as f32) * a_s * scale[f];
+                                    let uv = (acc_u[tid][u][v] as f32) * a_s * scale[ff + f];
+                                    let e = (-g).exp();
+                                    let s = g / (1.0 + e);
+                                    act[gi * ff + f] = s * uv;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        act
+    }
+
+    fn dp4a_of(buf: &[i8], off: usize) -> i32 {
+        ((buf[off] as i32) & 0xff)
+            | (((buf[off + 1] as i32) & 0xff) << 8)
+            | (((buf[off + 2] as i32) & 0xff) << 16)
+            | (((buf[off + 3] as i32) & 0xff) << 24)
+    }
+
+    fn dp4a(a: i32, b: i32) -> i32 {
+        let mut r = 0i32;
+        for e in 0..4 {
+            let av = ((a >> (8 * e)) & 0xff) as u8 as i8 as i32;
+            let bv = ((b >> (8 * e)) & 0xff) as u8 as i8 as i32;
+            r = r.wrapping_add(av * bv);
+        }
+        r
+    }
+
+    /// 融合カーネルの CPU 参照と 2 段経路の CPU 参照が **同じ値** になること。
+    ///
+    /// ff = 256 はタイル幅 (256) と一致し、ff = 384 は**末尾タイルが 128 列の
+    /// 半端** (境界を跨ぐ) になる。s113 の `ok 0 bad 256` はまさにこの跨ぎで
+    /// 全滅したので、ff = 384 を必須ケースにしている。m も 128 の倍数 (128) と
+    /// 半端 (33) の両方を通す。
+    ///
+    /// 比較は exp() を CPU の同一実装で計算しているため丸めまで一致するはずで、
+    /// ビット一致を要求する (不一致なら演算列・添字のどちらかが違う)。
+    #[test]
+    fn fused_matches_two_stage_cpu_reference_incl_cross_tile_ff() {
+        for &(m, k, ff) in &[
+            (33usize, 64usize, 256usize), // ff = タイル幅 / m は端数
+            (128, 64, 256),               // ff = タイル幅 / m は 1 タイル丁度
+            (33, 64, 384),                // **跨ぎ** (末尾タイル 128 列) / m 端数
+            (128, 64, 384),               // **跨ぎ** / m 1 タイル丁度
+            (33, 37, 384),                // k が 4 の倍数でない (GEMM_TK 端の 0 埋め)
+            (7, 33, 100),                 // 小さな非倍数 ff (1 タイル内で端)
+        ] {
+            let n = 2 * ff;
+            let aq = lcg_i8(m * k, 0x9E37_79B9_7F4A_7C15);
+            let ascale = lcg_f32(m, 0x1234_5678_9ABC_DEF1);
+            let w = lcg_i8(n * k, 0xDEAD_BEEF_CAFE_1234);
+            let scale = lcg_f32(n, 0x0BAD_F00D_1234_5678);
+            let two = two_stage_reference(&aq, &ascale, &w, &scale, m, k, ff);
+            let fused = fused_reference(&aq, &ascale, &w, &scale, m, k, n, ff);
+            assert_eq!(fused.len(), m * ff);
+            let mut bad = 0usize;
+            let mut first = String::new();
+            for i in 0..m * ff {
+                if fused[i].to_bits() != two[i].to_bits() {
+                    bad += 1;
+                    if first.is_empty() {
+                        first = format!(
+                            "i={i} (r={} f={}): fused={:e} two={:e}",
+                            i / ff,
+                            i % ff,
+                            fused[i],
+                            two[i]
+                        );
+                    }
+                }
+            }
+            assert_eq!(bad, 0, "m={m} k={k} ff={ff}: ok {} bad {bad}: {first}", m * ff - bad);
+        }
+    }
+
+    /// 出力の被覆: act の全要素 (m*ff) が **ちょうど 1 回** 書かれ、誰も書かない
+    /// 列・重複して書かれる列が無いこと。ff = 256 の倍数でない形 (100 / 384 /
+    /// 500) で、末尾タイルの半端な列まで覆えることを固定する (s113 の再発防止)。
+    #[test]
+    fn fused_launch_grid_covers_act_exactly() {
+        for &(m, ff) in &[
+            (1usize, 1usize),
+            (128, 256),
+            (33, 384),
+            (128, 384),
+            (129, 500),
+            (2843, 6144),
+            (5686, 8960),
+        ] {
+            let (gmx, gmy) = gemm_swiglu_launch_grid(m, ff);
+            assert_eq!(gmx as usize, m.div_ceil(GEMM_TILE), "m={m}");
+            assert_eq!(gmy as usize, ff.div_ceil(GEMM_TILE_N), "ff={ff}");
+            let mut count = vec![0u32; m * ff];
+            for bx in 0..gmx as usize {
+                for by in 0..gmy as usize {
+                    let i0 = bx * GEMM_TILE;
+                    let j0 = by * GEMM_TILE_N;
+                    for tid in 0..(GEMM_BX * GEMM_BY) as usize {
+                        let (tx, ty) = (tid % GEMM_BX as usize, tid / GEMM_BX as usize);
+                        for u in 0..8 {
+                            let gi = i0 + ty * 8 + u;
+                            if gi < m {
+                                for v in 0..16 {
+                                    let f = j0 + (if v < 8 { 0 } else { GEMM_TILE }) + tx * 8 + (v & 7);
+                                    if f < ff {
+                                        count[gi * ff + f] += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(count.iter().all(|&c| c == 1), "m={m} ff={ff}: 被覆が 1 回でない");
+        }
+    }
+
+    /// 融合経路の有効条件 (純関数)。PTX シンボルが無い / 動的 smem 不可 のときは
+    /// 必ず 2 段経路へ落ちる (commit 単体で既存挙動を壊さないためのゲート)。
+    #[test]
+    fn fused_ready_gate_conditions() {
+        for ff in [1usize, 100, 255, 256, 257, 384, 8960, 12288, 6144] {
+            assert!(gemm_swiglu_fused_ready(true, true, 1, 2 * ff), "ff={ff} m=1");
+            assert!(gemm_swiglu_fused_ready(true, true, 33, 2 * ff), "ff={ff} m=33");
+            assert!(gemm_swiglu_fused_ready(true, true, 5686, 2 * ff), "ff={ff}");
+        }
+        // PTX に関数が無い (未再生成ビルド) -> 2 段経路
+        assert!(!gemm_swiglu_fused_ready(false, true, 8, 2 * 8960));
+        // 動的 smem を受け付けない -> 2 段経路
+        assert!(!gemm_swiglu_fused_ready(true, false, 8, 2 * 8960));
+        // m = 0
+        assert!(!gemm_swiglu_fused_ready(true, true, 0, 2 * 8960));
+        // n が奇数 (= 2ff でない)
+        assert!(!gemm_swiglu_fused_ready(true, true, 8, 3));
+        // ff = 0
+        assert!(!gemm_swiglu_fused_ready(true, true, 8, 0));
+    }
+
+    /// カーネルの smem 予算: 静的 2 枚 (sA + sB) + 動的 1 枚 (sG) の合計が
+    /// opt-in 無しの既定枠 48KB に収まること。起動側が渡す動的量が .cu の
+    /// GEMM_TILE_N * GEMM_SP と一致すること (食い違うと起動失敗 or 未初期化)。
+    #[test]
+    fn fused_smem_budget_and_dyn_size() {
+        let dyn_bytes = gemm_swiglu_dyn_smem();
+        assert_eq!(dyn_bytes, 256 * (32 + 4));
+        assert_eq!(dyn_bytes, 9_216);
+        let total = (GEMM_TILE + 2 * GEMM_TILE_N) * GEMM_SP;
+        assert_eq!(total, (128 + 512) * 36);
+        assert_eq!(total, 23_040);
+        assert!(total <= GEMM_SWIGLU_STATIC_SMEM_BUDGET);
+        assert!(total <= 48 * 1024, "opt-in 不可のデバイスでも入る範囲に保つ");
+        // 静的部 (sA + sB) だけで 48KB を超えてはいけない (旧 s113 WIP の落とし穴:
+        // sG を静的 3 枚目にすると 34,880B + 9,216B で溢れる形があった)
+        assert!((GEMM_TILE + GEMM_TILE_N) * GEMM_SP + dyn_bytes == total);
+    }
+
+    /// Rust 側のミラー定数 (GEMM_TK / GEMM_SP / 動的 smem) が .cu のテキストと
+    /// 一致し続けることを固定する (片方だけ変えると静かに壊れるため)。
+    #[test]
+    fn fused_constants_match_kernel_source() {
+        let src = include_str!("../kernels/kernels_int8.cu");
+        assert!(src.contains(&format!("#define GEMM_TILE {GEMM_TILE}\n")), "GEMM_TILE");
+        assert!(src.contains(&format!("#define GEMM_TILE_N {GEMM_TILE_N}\n")), "GEMM_TILE_N");
+        assert!(src.contains(&format!("#define GEMM_TK {GEMM_TK}\n")), "GEMM_TK");
+        assert!(src.contains("#define GEMM_SP (GEMM_TK + 4)\n"), "GEMM_SP");
+        assert!(src.contains(&format!("#define GEMM_BX {GEMM_BX}\n")), "GEMM_BX");
+        assert!(src.contains(&format!("#define GEMM_BY {GEMM_BY}\n")), "GEMM_BY");
+        assert!(
+            src.contains("extern \"C\" __global__ void dno_gemm_i8_swiglu("),
+            "融合カーネルのシンボル名"
+        );
+        assert!(src.contains("#define GEMM_SWIGLU_DYN_SMEM (GEMM_TILE_N * GEMM_SP)\n"));
+        // カーネルの引数リスト (m, k, n, ff) が起動側の 4 本と一致すること
+        let sig_start = src.find("extern \"C\" __global__ void dno_gemm_i8_swiglu(").unwrap();
+        // 署名の終端 = パラメータリストの閉じ括弧 "int ff)" まで (途中の ')' は
+        // コメント中にも現れるため、引数名つきの末尾で切る)。
+        // 終端は「パラメータリストの閉じ括弧 + 直後の '{'」まで (int ff) は
+        // 引数の最後の 1 個だけなので、それだけを探すと m/k/n が範囲外になる)。
+        let sig_end = src[sig_start..].find("int ff)\n{").unwrap() + sig_start + "int ff)".len();
+        let head = &src[sig_start..sig_end];
+        for name in ["int m", "int k", "int n", "int ff"] {
+            assert!(head.contains(name), "引数 {name} がカーネル署名に無い");
+        }
+        // dno_gemm_i8 は不変 (純追加) であること: 融合版の前に定義されている
+        // 注意: "dno_gemm_i8(" は "dno_gemm_i8_swiglu(" の接頭辞なので、閉じ括弧まで
+        // 含めて探す (そうしないと融合版自身に一致して常に真になる)。
+        let plain = src.find("extern \"C\" __global__ void dno_gemm_i8(\n").unwrap();
+        assert!(plain < sig_start, "dno_gemm_i8 は融合版より前 (既存カーネルは不変)");
+    }
+
+    /// dno_expf の逐語コピーが kernels_elem.cu と 1 バイトも違わないこと。
+    /// (コピーがドリフトすると 2 段経路とのビット一致が壊れる)
+    #[test]
+    fn fused_swiglu_expf_copy_matches_elem_source() {
+        let elem = include_str!("../kernels/kernels_elem.cu");
+        let int8 = include_str!("../kernels/kernels_int8.cu");
+        let take = |s: &str| -> String {
+            let a = s.find("#define N_TABLE 32").expect("N_TABLE");
+            // コピー範囲の終端 = elem 側は "/// SiLU ..."、int8 側は終端マーカー
+            let end = s[a..]
+                .find("/// SiLU + up multiply")
+                .or_else(|| s[a..].find("// --- ここまで逐語コピー"))
+                .unwrap()
+                + a;
+            s[a..end].trim_end().to_string()
+        };
+        assert_eq!(take(elem), take(int8), "dno_expf のコピーがドリフトしている");
+        assert!(!take(int8).is_empty());
+    }
 }
