@@ -204,6 +204,40 @@ The kernel alone achieves **3.9–5.9×** vs 4 standalone matvecs (0.5B shapes, 
 
 Enabled with `DENNO_PROFILE=1`. On request completion, logs accumulated time per phase (embed/rmsnorm/rope/qkv/attn/oproj/gate_up/swiglu/down/lm_head/sampler/detok). Zero overhead when disabled, never touches the numeric path. Measurement data: P7.5 section of the [Development History](HISTORY.en.md).
 
+#### prefill / decode split and the attn_core breakdown (s57)
+
+A single cumulative table used to hide the prefill breakdown behind decode (which accumulates once per step). We now print **three tables** in this order:
+
+1. `[prefill]` — samples recorded by `tokens.len() > 1` forwards
+2. `[decode]` — samples from single-token forwards (solo chain / per-op path) and batched decode
+3. `[cumulative]` — the legacy table. Each op = prefill + decode and TOTAL is unchanged (kept for compatibility)
+
+Phase switching is one thread-local (`prof::set_phase` / `with_phase`). Each model fixes its own phase at the forward entry point (llama: prefill when `n>1`; qwen35: the dedicated prefill function vs. everything else). When PROFILE is off, `set_phase` is never called, so it is a complete no-op.
+
+`attn_core` now accumulates **GDN (linear attention) and full attention into separate buckets** (`attn_gdn` / `attn_full`); the raw `attn_core` row still shows their **sum**, with the breakdown as indented rows directly beneath it (table structure unchanged).
+
+```
+  [prefill] total 32724.0 ms
+  op                     ms    calls   share tok/call    via
+  attn_core          18120.0      704   55.4%    256.0  mixed
+    attn_gdn         12000.0      608   36.7%        -       
+    attn_full         6120.0       96   18.7%        -       
+```
+
+Column meanings:
+
+| Column | Meaning |
+| --- | --- |
+| `ms` | accumulated time for the op |
+| `calls` | number of samples folded into the bucket |
+| `share` | fraction of that phase's total (the cumulative table shows `cum%`, the descending running total) |
+| `tok/call` | mean tokens per call (**batch width**): ≈ input length for prefill GEMMs, 1 for the decode chain, always 1 for `lm_head` |
+| `via` | where it actually ran: `gpu` = every call took the GPU path / `cpu` = the GPU path never engaged / `mixed` = both / `cpu*` = no GPU option exists for that op (CPU elementwise work or a memory copy) |
+
+Reading guide: `tok/call == 1` with `via=gpu` means "one token per GPU dispatch" (batching headroom); a large `tok/call` with `via=cpu` means "CPU does the whole GEMM" (GPU-ization headroom).
+
+`d2h_state` still prints its sub-rows (`d2h_logits_wait` / `d2h_logits_copy` / `d2h_logits_pfhold`, …) directly beneath it. **Note**: llama's prefill device chain (`forward_prefill_gpu`) fuses the qkv GEMM + rope and the FFN (gate/up + swiglu + down) into one dispatch each, so they are attributed to `qkv_proj` and `gate_up_proj` respectively (the inner `swiglu` / `down_proj` cannot be separated). GPT-2 has a distinct architecture (bias / LayerNorm / GELU) and is not profiled at this time.
+
 ## 6. HTTP Server (denno-server)
 
 axum + tokio. Anthropic Messages API compatible.

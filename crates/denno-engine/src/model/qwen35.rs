@@ -985,7 +985,11 @@ impl Model for Qwen35 {
         // 順序不変のため m==1 (matvec) と行単位でビット一致 → 出力はトークン
         // 逐次経路と bit-exact。
         if tokens.len() > 1 {
-            return self.forward_prefill(tokens, cache);
+            // s57 (T4): 計測フェーズを prefill に切り替える (PROFILE 無効時は
+            // set/get すら行わない = 完全 no-op・数値経路不変)
+            return crate::prof::with_phase(crate::prof::Phase::Prefill, || {
+                self.forward_prefill(tokens, cache)
+            });
         }
         // C4: solo decode (n==1) はデバイス常駐チェーンで実行 (GDN 状態 GPU ミラー)。
         // GPU 無効/非対応構造/形状非対応/kernels_elem.ptx に新カーネルが無い/
@@ -1003,6 +1007,11 @@ impl Model for Qwen35 {
             crate::cuda::chain_q35_gdn_flush_pending(cache).ok_or_else(|| {
                 anyhow::anyhow!("deferred GDN state flush failed; cannot fall back to CPU path")
             })?;
+        }
+        // s57 (T4): ここから先は decode (n==1 の per-op 経路 or token 逐次ループ)。
+        // 計測フェーズを明示する。PROFILE 無効時は set すら行わない (完全 no-op)。
+        if crate::prof::enabled() {
+            crate::prof::set_phase(crate::prof::Phase::Decode);
         }
         let mut logits = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
@@ -1084,7 +1093,7 @@ impl Qwen35 {
             // --- attention: rmsnorm を行単位で一括計算 (s42: 行独立 → 行並列。
             // 各要素の演算列は不変のため bit-exact・スレッド数非依存) ---
             let mut h = vec![0.0f32; n * e];
-            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+            crate::prof::time_n(crate::prof::RMSNORM, n, || {
                 h.par_chunks_exact_mut(e)
                     .zip(x.par_chunks_exact(e))
                     .for_each(|(h_row, x_row)| {
@@ -1098,62 +1107,80 @@ impl Qwen35 {
                     // と同一の QKV バケット・beta/alpha は chain の dno_gdn_scan 頭部
                     // matvec と同一の ATTN バケットに計上 (prefill と decode chain の
                     // プロファイル比較可能性維持)。
+                    // s57 (T4): attn_core は層種別で別バケット (ATT_GDN) に分離し、
+                    // バッチ幅 n を計測に載せる (`time_full` は集計のみで演算列に
+                    // 触れない)。実行先ラベルは区間内の GPU 線形呼び出しの実測で
+                    // 決まる (cuda 統計) ため、ここでは主張しない。
                     let (kqkv, _) = g.qkv_w.dims();
                     debug_assert_eq!(kqkv, e);
-                    let qkv = crate::prof::time_layer(crate::prof::QKV, li, || {
+                    let qkv = crate::prof::time_n(crate::prof::QKV, n, || {
                         g.qkv_w.apply_bt_rows(&h, n)
                     });
-                    let z =
-                        crate::prof::time_layer(crate::prof::QKV, li, || g.gate_w.apply_bt_rows(&h, n));
-                    let beta_raw = crate::prof::time_layer(crate::prof::ATTN, li, || {
+                    let z = crate::prof::time_n(crate::prof::QKV, n, || g.gate_w.apply_bt_rows(&h, n));
+                    let beta_raw = crate::prof::time_n(crate::prof::ATT_GDN, n, || {
                         g.beta_w.apply_bt_rows(&h, n)
                     });
-                    let alpha = crate::prof::time_layer(crate::prof::ATTN, li, || {
+                    let alpha = crate::prof::time_n(crate::prof::ATT_GDN, n, || {
                         g.alpha_w.apply_bt_rows(&h, n)
                     });
                     // スキャン: GPU カーネル 1 発 (P19-A1・cuda 有効時)。GDN は
                     // bit 一致不要のため GPU/CPU で数値は僅かに異なる (決定論は維持)。
                     // GPU 無効時はトークン逐次 (再帰状態) にフォールバック。
                     let dy = g.out_w.dims().0; // value_dim
+                    // s57 (T4): GDN スキャンは attn_core の最大寄与。GPU カーネルが
+                    // 実際に走ったか (Some/None) を実行先ラベルとして計測に載せる —
+                    // ラベルは戻り値から得るので数値経路・分岐は不変。
                     #[cfg(feature = "cuda")]
-                    let ys: Vec<f32> = crate::prof::time_layer(crate::prof::ATTN, li, || {
-                        let p = &self.gdn_p;
-                        if n > 1 && p.head_k_dim == p.head_v_dim {
-                            let (conv, ssm) = cache
-                                .gdn_state_mut(li)
-                                .expect("GDN state slot が未初期化");
-                            match crate::cuda::gdn_scan_batch(
-                                &qkv,
-                                &z,
-                                &beta_raw,
-                                &alpha,
-                                conv,
-                                ssm,
-                                &g.conv1d,
-                                &g.ssm_a,
-                                &g.ssm_dt,
-                                &g.ssm_norm,
-                                n,
-                                p.n_k_heads,
-                                p.n_v_heads,
-                                p.head_k_dim,
-                                p.head_v_dim,
-                                p.d_conv,
-                                p.eps,
-                                1.0 / (p.head_k_dim as f32).sqrt(),
-                            ) {
-                                Some(y) => y,
-                                None => self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy),
+                    let (ys, scan_on_gpu): (Vec<f32>, bool) =
+                        crate::prof::time_layer_n_ev(crate::prof::ATT_GDN, li, n, || {
+                            let p = &self.gdn_p;
+                            if n > 1 && p.head_k_dim == p.head_v_dim {
+                                let (conv, ssm) = cache
+                                    .gdn_state_mut(li)
+                                    .expect("GDN state slot が未初期化");
+                                match crate::cuda::gdn_scan_batch(
+                                    &qkv,
+                                    &z,
+                                    &beta_raw,
+                                    &alpha,
+                                    conv,
+                                    ssm,
+                                    &g.conv1d,
+                                    &g.ssm_a,
+                                    &g.ssm_dt,
+                                    &g.ssm_norm,
+                                    n,
+                                    p.n_k_heads,
+                                    p.n_v_heads,
+                                    p.head_k_dim,
+                                    p.head_v_dim,
+                                    p.d_conv,
+                                    p.eps,
+                                    1.0 / (p.head_k_dim as f32).sqrt(),
+                                ) {
+                                    Some(y) => (y, true),
+                                    None => (
+                                        self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy),
+                                        false,
+                                    ),
+                                }
+                            } else {
+                                (
+                                    self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy),
+                                    false,
+                                )
                             }
-                        } else {
-                            self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy)
-                        }
-                    });
+                        });
                     #[cfg(not(feature = "cuda"))]
-                    let ys: Vec<f32> = crate::prof::time_layer(crate::prof::ATTN, li, || {
-                        self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy)
-                    });
-                    let out = crate::prof::time_layer(crate::prof::OPROJ, li, || {
+                    let (ys, scan_on_gpu): (Vec<f32>, bool) =
+                        crate::prof::time_layer_n_ev(crate::prof::ATT_GDN, li, n, || {
+                            (
+                                self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy),
+                                false,
+                            )
+                        });
+                    let _ = scan_on_gpu;
+                    let out = crate::prof::time_n(crate::prof::OPROJ, n, || {
                         g.out_w.apply_bt_rows(&ys, n)
                     });
                     if crate::gdn::gdn_dbg_enabled_for(li as i64) {
@@ -1172,7 +1199,7 @@ impl Qwen35 {
                         });
                 }
                 AttnKind::Full(fl) => {
-                    let (qg, k, v) = crate::prof::time_layer(crate::prof::QKV, li, || {
+                    let (qg, k, v) = crate::prof::time_n(crate::prof::QKV, n, || {
                         (
                             fl.q_w.apply_bt_rows(&h, n), // [n, heads*2*dh]
                             fl.k_w.apply_bt_rows(&h, n), // [n, kv_dim]
@@ -1212,7 +1239,11 @@ impl Qwen35 {
                     // 書き込み済み = 冪等) で、chain 失敗時は下の既存 rayon attend に
                     // 落ちる (数値は現行どおり bit 一致・発動ゲート n>=gemm_min_m()
                     // で短文は CPU のまま・`DENNO_GPU_ATTN=0` で全経路現行に戻る)。
-                    crate::prof::time_layer(crate::prof::ATTN, li, || {
+                    // s57 (T4): full attention は attn_core の別バケット (ATT_FULL) に
+                    // 分離。GPU バッチ (dno_attention_prefill) が実際に走ったかを
+                    // 実行先ラベルとして計測に載せる (`att_done` をそのまま返すだけ =
+                    // 分岐・演算列は不変)。
+                    crate::prof::time_layer_n_ev(crate::prof::ATT_FULL, li, n, || {
                         #[cfg(feature = "cuda")]
                         let att_done =
                             self.full_attn_attend_gpu(&qg, &q, cache, li, pos0, n, &mut att);
@@ -1243,8 +1274,9 @@ impl Qwen35 {
                                     );
                                 });
                         }
+                        (att_done, att_done)
                     });
-                    let out = crate::prof::time_layer(crate::prof::OPROJ, li, || {
+                    let out = crate::prof::time_n(crate::prof::OPROJ, n, || {
                         fl.o_w.apply_bt_rows(&att, n)
                     });
                     // s42: 残差加算は行独立 → 行並列 (bit-exact)
@@ -1259,9 +1291,11 @@ impl Qwen35 {
             }
             lchk(&format!("L{li:02} attn"), &x[(n - 1) * e..]); // 恒久診断 (env ゲート・未指定時 no-op)
             // --- FFN: SwiGLU をバッチ一括 ---
+            // s57 (T4): prefill 内の全 op に 1 call あたりのバッチ幅 (n) を載せる
+            // (decode 側は chain の 1 行 = 1）。集計のみで演算列は不変。
             let mut h2 = vec![0.0f32; n * e];
             // s42: rmsnorm は行独立 → 行並列 (bit-exact)
-            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+            crate::prof::time_n(crate::prof::RMSNORM, n, || {
                 h2.par_chunks_exact_mut(e)
                     .zip(x.par_chunks_exact(e))
                     .for_each(|(h2_row, x_row)| {
@@ -1269,12 +1303,12 @@ impl Qwen35 {
                         h2_row.copy_from_slice(&r);
                     });
             });
-            let (gate, up) = crate::prof::time_layer(crate::prof::GATE_UP, li, || {
+            let (gate, up) = crate::prof::time_n(crate::prof::GATE_UP, n, || {
                 (layer.gate_w.apply_bt_rows(&h2, n), layer.up_w.apply_bt_rows(&h2, n))
             });
             let mut hh = vec![0.0f32; n * ff];
             // s42: SwiGLU は行独立 → 行並列 (bit-exact)
-            crate::prof::time_layer(crate::prof::SWIGLU, li, || {
+            crate::prof::time_n(crate::prof::SWIGLU, n, || {
                 hh.par_chunks_exact_mut(ff)
                     .zip(gate.par_chunks_exact(ff).zip(up.par_chunks_exact(ff)))
                     .for_each(|(hh_row, (gate_row, up_row))| {
@@ -1287,7 +1321,7 @@ impl Qwen35 {
                         }
                     });
             });
-            let down = crate::prof::time_layer(crate::prof::DOWN, li, || {
+            let down = crate::prof::time_n(crate::prof::DOWN, n, || {
                 layer.down_w.apply_bt_rows(&hh, n)
             });
             // s42: 残差加算は行独立 → 行並列 (bit-exact)
@@ -1535,21 +1569,23 @@ impl Qwen35 {
 
         for (li, layer) in self.layers.iter().enumerate() {
             crate::telemetry_layer_begin(li as u16);
-            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+            crate::prof::time_full(crate::prof::RMSNORM, 1, true, || {
                 chain_rmsnorm(layer.attn_ln1(), eps, pending, CH_H, e, 1, li * 3)
             })?;
             match &layer.attn {
                 AttnKind::Gdn(g) => {
                     gdn_layers.push(li);
                     // qkv + z 投影: CH_QKV = [qkv (2nk*dk+nv*dv) | z (nv)]
-                    crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
+                    crate::prof::time_full(crate::prof::QKV, 1, true, || -> Option<()> {
                         let qkv = g.qkv_w.quant8()?;
                         let zw = g.gate_w.quant8()?;
                         chain_linear_grouped(&[qkv, zw], CH_H, CH_QKV, 1)
                     })?;
                     // beta/alpha (fp32 matvec・CH_QKV テール) → dno_gdn_scan
                     // (y → CH_ATT・新状態は staged async D2H・ping-pong 面 交換)
-                    crate::prof::time_layer(crate::prof::ATTN, li, || -> Option<()> {
+                    // s57 (T4): decode chain は全 op がデバイス常駐で走るため
+                    // 実行先ラベルは gpu 固定。attn_core は GDN バケットに分離。
+                    crate::prof::time_full(crate::prof::ATT_GDN, 1, true, || -> Option<()> {
                         let (bw, aw) = match (&g.beta_w, &g.alpha_w) {
                             (Linear::F32 { w: bw, .. }, Linear::F32 { w: aw, .. }) => (bw, aw),
                             _ => return None, // q35_chain_compatible で除外済み
@@ -1578,14 +1614,14 @@ impl Qwen35 {
                         )
                     })?;
                     // out_proj: y (CH_ATT) → e (CH_O)
-                    crate::prof::time_layer(crate::prof::OPROJ, li, || -> Option<()> {
+                    crate::prof::time_full(crate::prof::OPROJ, 1, true, || -> Option<()> {
                         let ow = g.out_w.quant8()?;
                         chain_linear_grouped(&[ow], CH_ATT, CH_O, 1)
                     })?;
                 }
                 AttnKind::Full(f) => {
                     // qkv 投影: CH_QKV = [qg (heads*2dh) | k (kv_dim) | v (kv_dim)]
-                    crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
+                    crate::prof::time_full(crate::prof::QKV, 1, true, || -> Option<()> {
                         let qw = f.q_w.quant8()?;
                         let kw = f.k_w.quant8()?;
                         let vw = f.v_w.quant8()?;
@@ -1593,7 +1629,8 @@ impl Qwen35 {
                     })?;
                     // QK-Norm + partial rope (q → CH_Q35_Q・k → KV ミラー pos0 行直書き)
                     // → GQA attention → sigmoid 出力ゲート (k/v 行は staged async D2H)
-                    crate::prof::time_layer(crate::prof::ATTN, li, || {
+                    // s57 (T4): full attention バケット (ATT_FULL)・devices chain 上で走る。
+                    crate::prof::time_full(crate::prof::ATT_FULL, 1, true, || {
                         chain_q35_fullattn(
                             mid,
                             key,
@@ -1611,7 +1648,7 @@ impl Qwen35 {
                         )
                     })?;
                     // o_proj: att (CH_ATT) → e (CH_O)
-                    crate::prof::time_layer(crate::prof::OPROJ, li, || -> Option<()> {
+                    crate::prof::time_full(crate::prof::OPROJ, 1, true, || -> Option<()> {
                         let ow = f.o_w.quant8()?;
                         chain_linear_grouped(&[ow], CH_ATT, CH_O, 1)
                     })?;
@@ -1619,18 +1656,18 @@ impl Qwen35 {
             }
             pending = Some(CH_O);
             // --- FFN (llama chain と同一): residual+rmsnorm → gate/up → swiglu → down
-            crate::prof::time_layer(crate::prof::RMSNORM, li, || {
+            crate::prof::time_full(crate::prof::RMSNORM, 1, true, || {
                 chain_rmsnorm(&layer.ln2_w, eps, pending, CH_H, e, 1, li * 3 + 1)
             })?;
-            crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
+            crate::prof::time_full(crate::prof::GATE_UP, 1, true, || -> Option<()> {
                 let gw = layer.gate_w.quant8()?;
                 let uw = layer.up_w.quant8()?;
                 chain_linear_grouped(&[gw, uw], CH_H, CH_GA, 1)
             })?;
-            crate::prof::time_layer(crate::prof::SWIGLU, li, || {
+            crate::prof::time_full(crate::prof::SWIGLU, 1, true, || {
                 chain_swiglu(CH_GA, CH_ACT, self.ff, 1)
             })?;
-            crate::prof::time_layer(crate::prof::DOWN, li, || -> Option<()> {
+            crate::prof::time_full(crate::prof::DOWN, 1, true, || -> Option<()> {
                 let dw = layer.down_w.quant8()?;
                 chain_linear_grouped(&[dw], CH_ACT, CH_DOWN, 1)
             })?;
@@ -1642,7 +1679,7 @@ impl Qwen35 {
         // download の sync がステップ全体の GPU 実行の完了待ちを吸収するため、
         // lm_head 計算だけのバケットに分けないと実機プロファイルの
         // 「lm_head」が sync 待ち込みで過大帰属になる。観測のみで数値経路不変)
-        crate::prof::time(crate::prof::LM_HEAD, || -> Option<()> {
+        crate::prof::time_full(crate::prof::LM_HEAD, 1, true, || -> Option<()> {
             chain_rmsnorm(&self.norm_w, eps, pending, CH_H, e, 1, n_layers * 3)?;
             let lmq = self.lm_head.as_ref().unwrap().quant8()?;
             chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)
@@ -1673,7 +1710,7 @@ impl Qwen35 {
         // GPU ミラーを権威のままにする — 次の prefill 冒頭 / CPU フォールバック時に
         // chain_q35_gdn_flush_pending が回復する。ステップ毎 D2H ~75MB/step が
         // decode の支配項だったため)
-        crate::prof::time(crate::prof::D2H_KV_FLUSH, || {
+        crate::prof::time_full(crate::prof::D2H_KV_FLUSH, 1, true, || {
             chain_q35_kv_stage_flush(cache, n_layers, kv_dim, pos0, &gdn_layers)
         })?;
         cache.advance(1);

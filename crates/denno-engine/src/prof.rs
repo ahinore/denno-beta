@@ -6,6 +6,11 @@
 //! exactness (ビット一致) は完全不変。
 //!
 //! リクエスト完了時に server 側から `summary()` を INFO ログ出力する。
+//!
+//! s57 (T4): **prefill / decode を別テーブルに分離**し、`attn_core` を
+//! GDN (linear attention) と full attention の別バケットに割り、各 op の
+//! 「1 call あたり平均トークン数 (batch 幅)」と実行先 (CPU / GPU) を併記する。
+//! 集計はすべて観測のみ — 数値経路には触れない (PROFILE off は完全 no-op)。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -55,7 +60,74 @@ pub const D2H_N: usize = 9; // 細分バケット数 (D2H_LOGITS .. D2H_ATTN_PF_
 pub const D2H_LOGITS_WAIT: usize = 10 * D2H + 6; // 追加 sync のみ (GPU 側未完了処理の待ち)
 pub const D2H_LOGITS_COPY: usize = 10 * D2H + 7; // 従来 D2H_LOGITS 区間 (従来計測)
 pub const D2H_LOGITS_PF_HELD: usize = 10 * D2H + 8; // prefill 後 1 点目の WAIT (集計から除外)
+/// s57 (T4): `attn_core` の層種別分離 (倍率 100)。**ATNN 生 id (= 4) の集計は従来どおり**
+/// — これは summary のテキスト出力だけに掛ける細分 (D2H 細分と同じ規約)。
+///
+/// 動機: prefill の PROFILE で `attn_core` が 44.7% を占めたが、これは
+/// **GDN (linear attention) のスキャンと full attention の attend が同一バケットに
+/// 混ざった**値で、どちらを GPU バッチ化すべきか判断できなかった。呼び出し側が
+/// 層種別を引数で与え、別バケットに積む。`ATNN` 生 id の合計は従来の
+/// `attn_core` と一致する (GDN + FULL = ATNN)。
+pub const ATT_CLS_N: usize = 2;
+pub const ATT_GDN: usize = 100 * ATTN; // GDN (linear attention) スキャン・beta/alpha 投影
+pub const ATT_FULL: usize = 100 * ATTN + 1; // full attention (GQA attend / full_attn_core)
 pub const N_OPS: usize = 15;
+
+/// s57 (T4): 計測フェーズ。prefill (n>1 の forward) と decode (n==1) を
+/// **別テーブル**に集計する。`Both` は従来の cumulative テーブル (双方の合計)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Phase {
+    Prefill,
+    Decode,
+    Both,
+}
+
+impl Phase {
+    pub const N: usize = 3;
+    pub const NAMES: [&'static str; 3] = ["prefill", "decode", "cumulative"];
+
+    #[inline]
+    pub fn idx(self) -> usize {
+        match self {
+            Phase::Prefill => 0,
+            Phase::Decode => 1,
+            Phase::Both => 2,
+        }
+    }
+}
+
+/// s57 (T4): op の実行先ラベル。既存の GPU 呼び出し有無 (実測された経路) を
+/// 集計して表示するだけで、分岐には一切使わない。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Exec {
+    /// GPU 経路で走った call がある
+    Gpu,
+    /// GPU call が 1 度も無く CPU のみ
+    Cpu,
+    /// 判定不能 (GPU 選択が無い op = 一部要素演算など)
+    CpuFixed,
+}
+
+impl Exec {
+    pub const N: usize = 3;
+
+    #[inline]
+    pub fn idx(self) -> usize {
+        match self {
+            Exec::Gpu => 0,
+            Exec::Cpu => 1,
+            Exec::CpuFixed => 2,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Exec::Gpu => "gpu",
+            Exec::Cpu => "cpu",
+            Exec::CpuFixed => "cpu*",
+        }
+    }
+}
 
 /// s56 (T2 項目0): decode chain の logits D2H 直前に打つ追加 sync を、どちらの
 /// 細分バケットに計上するか決める純関数 (GPU 不要・テスト可能)。
@@ -106,32 +178,222 @@ const D2H_NAMES: [&str; D2H_N] = [
     "d2h_logits_pfhold",
 ];
 
-static NS: [AtomicU64; N_OPS] = {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z; N_OPS]
-};
-static CALLS: [AtomicU64; N_OPS] = {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z; N_OPS]
-};
-/// s54: d2h_state の細分累積 (id は 10*D2H + i → 添字 i)。
-static D2H_SUB_NS: [AtomicU64; D2H_N] = {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z; D2H_N]
-};
-static D2H_SUB_CALLS: [AtomicU64; D2H_N] = {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z; D2H_N]
-};
+/// s57 (T4): attn_core の層種別細分名 (id は 100*ATTN + i)。
+const ATT_CLS_NAMES: [&str; ATT_CLS_N] = ["attn_gdn", "attn_full"];
+
+/// s57 (T4): op ごとの実行先ラベル分類 (表示専用)。
+/// `None` は「実行先が固定 (GPU 選択が無い CPU 要素演算)」を表す `cpu*`。
+/// ここに載る op は同一 op 内でも条件により GPU/CPU が混在し得るため、
+/// 実際の GPU 発動回数 (exec_ns が exec_call と同数か) で表示を決める。
+const HAS_GPU_PATH: [bool; N_OPS] = [
+    false, // embed: ホストのメモリコピー (GPU 選択なし)
+    false, // rmsnorm: chain では GPU だが per-op は CPU (op 内混在)
+    false, // rope: chain では GPU だが per-op は CPU (op 内混在)
+    true,  // qkv_proj: maybe_gpu_linear / linear_grouped
+    true,  // attn_core: full attention GPU バッチ / GDN スキャン GPU
+    true,  // o_proj: maybe_gpu_oproj / chain
+    true,  // gate_up_proj: maybe_gpu_ffn / linear_grouped
+    true,  // swiglu: chain_swiglu (GPU カーネル)
+    true,  // down_proj: chain_linear_grouped
+    false, // final_norm: CPU rmsnorm
+    true,  // lm_head: maybe_gpu_matvec_f32 / Quant8 hook
+    false, // sampler
+    false, // detok
+    false, // qk_norm: chain では GPU、per-op は CPU
+    true,  // d2h_state: 転送そのもの
+];
+
+/// s57 (T4): フェーズ × op の 2 次元カウンタ配列の const 初期化
+/// (`[[Z; N_OPS]; Phase::N]` は AtomicU64 が Copy でないため const 文脈では
+/// 組めない — const fn で組む)。
+const fn mk_counters<const N: usize>() -> [[AtomicU64; N]; Phase::N] {
+    // 内側・外側とも inline const で要素ごとに独立した Atomic を作る
+    // ([inner; N] は Copy を要求するため使えない)
+    [const { [const { AtomicU64::new(0) }; N] }; Phase::N]
+}
+
+static NS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
+static CALLS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
+/// s57 (T4): バケットに渡されたトークン (行) 数の総和。平均 = TOKS / CALLS。
+static TOKS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
+/// s57 (T4): GPU 経路で走った call 数 (実行先ラベルの根拠)。
+static EXEC_CALLS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
+/// s54: d2h_state の細分累積 (id は 10*D2H + i → 添字 i)。フェーズ別。
+static D2H_SUB_NS: [[AtomicU64; D2H_N]; Phase::N] = mk_counters::<D2H_N>();
+static D2H_SUB_CALLS: [[AtomicU64; D2H_N]; Phase::N] = mk_counters::<D2H_N>();
+/// s57 (T4): attn_core の細分 (id は 100*ATTN + i → 添字 i)。フェーズ別。
+static ATT_SUB_NS: [[AtomicU64; ATT_CLS_N]; Phase::N] = mk_counters::<ATT_CLS_N>();
+static ATT_SUB_CALLS: [[AtomicU64; ATT_CLS_N]; Phase::N] = mk_counters::<ATT_CLS_N>();
 
 static ON: OnceLock<bool> = OnceLock::new();
+// s57 (T4): 現在の計測フェーズ (thread-local)。数値経路には影響しない。
+thread_local! {
+    /// 現在の計測フェーズ (thread-local)。forward の入口で set_phase する。
+    /// 既定は decode (単発 forward の既定 = 1 トークン)。
+    static PHASE: std::cell::Cell<Phase> = const { std::cell::Cell::new(Phase::Decode) };
+}
 
 pub fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("DENNO_PROFILE").map(|v| v != "0").unwrap_or(false))
+}
+
+// ---------------------------------------------------------------------------
+// s57 (T4): フェーズ (prefill / decode) の切り替え
+// ---------------------------------------------------------------------------
+
+/// 以降の計測を `p` に集計する (thread-local)。`time` / `time_layer` は
+/// 呼び出し時点のフェーズを読むだけなので、数値経路には一切影響しない。
+#[inline]
+pub fn set_phase(p: Phase) {
+    PHASE.with(|c| c.set(p));
+}
+
+/// 現在のフェーズ (テスト・デバッグ用)。
+#[inline]
+pub fn phase() -> Phase {
+    PHASE.with(|c| c.get())
+}
+
+/// `f` をフェーズ `p` で実行し、終了時に元のフェーズへ戻す (RAII 不要版)。
+/// PROFILE 無効時は set/get も行わず素通しする (完全 no-op)。
+#[inline]
+pub fn with_phase<T>(p: Phase, f: impl FnOnce() -> T) -> T {
+    if !enabled() {
+        return f();
+    }
+    let prev = PHASE.with(|c| c.replace(p));
+    let r = f();
+    PHASE.with(|c| c.set(prev));
+    r
+}
+
+// ---------------------------------------------------------------------------
+// 計測
+// ---------------------------------------------------------------------------
+
+/// s57 (T4): 直近の int8 線形呼び出しが実際に GPU で走ったか (実行先ラベル用)。
+/// cuda 無効ビルドでは常に false (= CPU 表示)。PROFILE 無効時は summary 自体が
+/// 出ないため、この関数の値は誰も読まない (数値経路には触れない)。
+#[inline]
+pub fn linear_ran_on_gpu() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        crate::cuda::last_linear_ran_on_gpu()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
+/// フェーズ・トークン数・実行先を明示する計測。`rows` はバケットに渡った
+/// バッチ幅 (行数 = トークン数)、`on_gpu` はこの call が GPU 経路で走ったか。
+/// 集計のみで数値経路には触れない。
+pub fn time_full<T>(op: usize, rows: usize, on_gpu: bool, f: impl FnOnce() -> T) -> T {
+    let prof_on = enabled();
+    let tel_on = crate::telemetry_on();
+    if !prof_on && !tel_on {
+        return f();
+    }
+    let t = Instant::now();
+    let r = f();
+    let ns = t.elapsed().as_nanos() as u64;
+    if prof_on {
+        add_sample(phase(), op, ns, 1, rows, on_gpu);
+    }
+    if tel_on {
+        crate::telemetry_add_op(if op < N_OPS { op } else { D2H }, ns);
+    }
+    r
+}
+
+/// `time` のバッチ幅付き版 (現行フェーズに集計)。実行先は GPU 選択が無い op として
+/// 扱う (`DENNO_PROFILE` の素の呼び出し — 従来の `time` と同じ計上先)。
+pub fn time_n<T>(op: usize, rows: usize, f: impl FnOnce() -> T) -> T {
+    time_full(op, rows, false, f)
+}
+
+/// `time_layer` のバッチ幅付き版 (現行フェーズに集計)。
+pub fn time_layer_n<T>(op: usize, _layer: usize, rows: usize, f: impl FnOnce() -> T) -> T {
+    time_layer_n_ev(op, _layer, rows, || (f(), false)).0
+}
+
+/// s57 (T4): `time_layer` のバッチ幅 + 実行先ラベル付き版。`f` は
+/// `(値, GPU で走ったか)` を返す。ラベルはクロージャの戻り値から得るので
+/// 数値経路の分岐には一切影響しない。PROFILE 無効時は素通し (完全 no-op)。
+pub fn time_layer_n_ev<T>(
+    op: usize,
+    _layer: usize,
+    rows: usize,
+    f: impl FnOnce() -> (T, bool),
+) -> (T, bool) {
+    let prof_on = enabled();
+    let tel_on = crate::telemetry_on();
+    if !prof_on && !tel_on {
+        return f();
+    }
+    let t = Instant::now();
+    let (r, on_gpu) = f();
+    let ns = t.elapsed().as_nanos() as u64;
+    if prof_on {
+        add_sample(phase(), op, ns, 1, rows, on_gpu);
+    }
+    if tel_on {
+        crate::telemetry_add_op(if op < N_OPS { op } else { D2H }, ns);
+        denno_telemetry::record_layer_op(op, ns);
+    }
+    (r, on_gpu)
+}
+
+/// 1 サンプルをフェーズ別テーブルへ積む。生 id (N_OPS 未満)、D2H 細分、
+/// attn_core 層種別細分の 3 系統を一度に処理する。
+fn add_sample(phase: Phase, op: usize, ns: u64, calls: u64, rows: usize, on_gpu: bool) {
+    let pi = phase.idx();
+    let slot = if op < N_OPS { op } else { D2H };
+    NS[pi][slot].fetch_add(ns, Ordering::Relaxed);
+    NS[Phase::Both.idx()][slot].fetch_add(ns, Ordering::Relaxed);
+    CALLS[pi][slot].fetch_add(calls, Ordering::Relaxed);
+    CALLS[Phase::Both.idx()][slot].fetch_add(calls, Ordering::Relaxed);
+    if rows > 0 {
+        TOKS[pi][slot].fetch_add(rows as u64 * calls, Ordering::Relaxed);
+        TOKS[Phase::Both.idx()][slot].fetch_add(rows as u64 * calls, Ordering::Relaxed);
+    }
+    if on_gpu {
+        EXEC_CALLS[pi][slot].fetch_add(calls, Ordering::Relaxed);
+        EXEC_CALLS[Phase::Both.idx()][slot].fetch_add(calls, Ordering::Relaxed);
+    }
+    // s57 (T4): attn_core の層種別細分 (ATT_GDN / ATT_FULL)。生 id (attn_core) の
+    // 合計はこの 2 バケットの和になる — 呼び出し側は必ず層種別付きで計上する
+    // ので、ここで合算して従来の attn_core バケットを保つ (バケットの意味を変えない)。
+    // D2H 細分とは違い、細分側の加算が生 id の値を決める点に注意。
+    if op >= ATT_GDN && op < ATT_GDN + ATT_CLS_N {
+        let k = op - ATT_GDN;
+        ATT_SUB_NS[pi][k].fetch_add(ns, Ordering::Relaxed);
+        ATT_SUB_NS[Phase::Both.idx()][k].fetch_add(ns, Ordering::Relaxed);
+        ATT_SUB_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
+        ATT_SUB_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
+        NS[pi][ATTN].fetch_add(ns, Ordering::Relaxed);
+        NS[Phase::Both.idx()][ATTN].fetch_add(ns, Ordering::Relaxed);
+        CALLS[pi][ATTN].fetch_add(calls, Ordering::Relaxed);
+        CALLS[Phase::Both.idx()][ATTN].fetch_add(calls, Ordering::Relaxed);
+        if rows > 0 {
+            TOKS[pi][ATTN].fetch_add(rows as u64 * calls, Ordering::Relaxed);
+            TOKS[Phase::Both.idx()][ATTN].fetch_add(rows as u64 * calls, Ordering::Relaxed);
+        }
+        if on_gpu {
+            EXEC_CALLS[pi][ATTN].fetch_add(calls, Ordering::Relaxed);
+            EXEC_CALLS[Phase::Both.idx()][ATTN].fetch_add(calls, Ordering::Relaxed);
+        }
+    }
+    // s54: d2h_state の細分 (細分先が別 id なので生 id へは積まない — 呼び出し側が
+    // D2H 本体も別途計上する)。
+    if op >= D2H_LOGITS && op <= D2H_LOGITS_PF_HELD {
+        let k = op - D2H_LOGITS;
+        D2H_SUB_NS[pi][k].fetch_add(ns, Ordering::Relaxed);
+        D2H_SUB_NS[Phase::Both.idx()][k].fetch_add(ns, Ordering::Relaxed);
+        D2H_SUB_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
+        D2H_SUB_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
+    }
 }
 
 /// `f` の実行時間を op に計上して結果を返す。
@@ -148,13 +410,7 @@ pub fn time<T>(op: usize, f: impl FnOnce() -> T) -> T {
     let ns = t.elapsed().as_nanos() as u64;
     if prof_on {
         // s54: d2h の細分 id は NS の範囲外 — 生 id で受ける (下の summary が集約)
-        let slot = if op < N_OPS { op } else { D2H };
-        NS[slot].fetch_add(ns, Ordering::Relaxed);
-        CALLS[slot].fetch_add(1, Ordering::Relaxed);
-        if op >= N_OPS {
-            D2H_SUB_NS[op - D2H_LOGITS].fetch_add(ns, Ordering::Relaxed);
-            D2H_SUB_CALLS[op - D2H_LOGITS].fetch_add(1, Ordering::Relaxed);
-        }
+        add_sample(phase(), op, ns, 1, 0, false);
     }
     if tel_on {
         crate::telemetry_add_op(if op < N_OPS { op } else { D2H }, ns);
@@ -176,11 +432,10 @@ pub fn time_layer<T>(op: usize, _layer: usize, f: impl FnOnce() -> T) -> T {
     let r = f();
     let ns = t.elapsed().as_nanos() as u64;
     if prof_on {
-        NS[op].fetch_add(ns, Ordering::Relaxed);
-        CALLS[op].fetch_add(1, Ordering::Relaxed);
+        add_sample(phase(), op, ns, 1, 0, false);
     }
     if tel_on {
-        crate::telemetry_add_op(op, ns);
+        crate::telemetry_add_op(if op < N_OPS { op } else { D2H }, ns);
         denno_telemetry::record_layer_op(op, ns);
     }
     r
@@ -202,56 +457,225 @@ pub fn time_if_on<T>(op: usize, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-pub fn reset() {
-    for i in 0..N_OPS {
-        NS[i].store(0, Ordering::Relaxed);
-        CALLS[i].store(0, Ordering::Relaxed);
+/// s57 (T4): バッチ幅付きの層 op 計測ゲート。`op_on()` が偽なら素通し。
+#[inline]
+pub fn time_if_on_n<T>(op: usize, rows: usize, f: impl FnOnce() -> T) -> T {
+    if op_on() {
+        return time_full(op, rows, false, f);
     }
-    for i in 0..D2H_N {
-        D2H_SUB_NS[i].store(0, Ordering::Relaxed);
-        D2H_SUB_CALLS[i].store(0, Ordering::Relaxed);
+    f()
+}
+
+pub fn reset() {
+    for p in 0..Phase::N {
+        for i in 0..N_OPS {
+            NS[p][i].store(0, Ordering::Relaxed);
+            CALLS[p][i].store(0, Ordering::Relaxed);
+            TOKS[p][i].store(0, Ordering::Relaxed);
+            EXEC_CALLS[p][i].store(0, Ordering::Relaxed);
+        }
+        for i in 0..D2H_N {
+            D2H_SUB_NS[p][i].store(0, Ordering::Relaxed);
+            D2H_SUB_CALLS[p][i].store(0, Ordering::Relaxed);
+        }
+        for i in 0..ATT_CLS_N {
+            ATT_SUB_NS[p][i].store(0, Ordering::Relaxed);
+            ATT_SUB_CALLS[p][i].store(0, Ordering::Relaxed);
+        }
     }
 }
 
-/// 整形済みサマリ (合計時間降順、累積%) を返す。
-/// s54: d2h_state の直後にその細分行をインデントして出す (呼び出し回数の内訳が
-/// 「毎ステップ 2 call」の正体を特定するための実測値)。
-pub fn summary() -> String {
-    let rows: Vec<(usize, u64, u64)> = (0..N_OPS)
-        .map(|i| (i, NS[i].load(Ordering::Relaxed), CALLS[i].load(Ordering::Relaxed)))
-        .filter(|(_, ns, _)| *ns > 0)
+/// s57 (T4): 実行先ラベルの決定 (純関数・テスト可能)。
+/// `has_gpu_path && gpu_calls == calls && calls > 0` → "gpu"
+/// `has_gpu_path && gpu_calls == 0 && calls > 0` → "cpu"
+/// 混在 (一部だけ GPU) → "mixed"
+/// GPU 選択の無い op → "cpu*"
+pub fn exec_label(has_gpu_path: bool, calls: u64, gpu_calls: u64) -> &'static str {
+    if calls == 0 {
+        return "-";
+    }
+    if !has_gpu_path {
+        return "cpu*";
+    }
+    if gpu_calls == 0 {
+        "cpu"
+    } else if gpu_calls >= calls {
+        "gpu"
+    } else {
+        "mixed"
+    }
+}
+
+/// 1 フェーズ分のテーブルを整形する。`cum` はこのフェーズの合計。
+fn phase_table(phase: Phase, s: &mut String) {
+    let p = phase.idx();
+    let rows: Vec<(usize, u64, u64, u64, u64)> = (0..N_OPS)
+        .map(|i| {
+            (
+                i,
+                NS[p][i].load(Ordering::Relaxed),
+                CALLS[p][i].load(Ordering::Relaxed),
+                TOKS[p][i].load(Ordering::Relaxed),
+                EXEC_CALLS[p][i].load(Ordering::Relaxed),
+            )
+        })
+        .filter(|(_, ns, _, _, _)| *ns > 0)
         .collect();
-    let total: u64 = rows.iter().map(|(_, ns, _)| ns).sum();
+    let total: u64 = rows.iter().map(|(_, ns, _, _, _)| ns).sum();
+    if rows.is_empty() {
+        s.push_str(&format!("  [{}] (no calls)\n", Phase::NAMES[p]));
+        return;
+    }
     let mut sorted = rows;
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
-    let mut s = String::from("PROFILE (cumulative, decode+prefill):\n");
     s.push_str(&format!(
-        "  {:<14} {:>10} {:>8} {:>7}\n",
-        "op", "ms", "calls", "cum%"
+        "  [{}] total {:.1} ms\n",
+        Phase::NAMES[p],
+        total as f64 / 1e6
     ));
-    let mut acc = 0u64;
-    for (i, ns, calls) in sorted {
-        acc += ns;
+    s.push_str(&format!(
+        "  {:<14} {:>10} {:>8} {:>7} {:>8} {:>6}\n",
+        "op", "ms", "calls", "share", "tok/call", "via"
+    ));
+    for (i, ns, calls, toks, gpu_calls) in sorted {
+        let mean_tok = if calls > 0 {
+            toks as f64 / calls as f64
+        } else {
+            0.0
+        };
         s.push_str(&format!(
-            "  {:<14} {:>10.1} {:>8} {:>6.1}%\n",
+            "  {:<14} {:>10.1} {:>8} {:>6.1}% {:>8.1} {:>6}\n",
             NAMES[i],
             ns as f64 / 1e6,
             calls,
-            acc as f64 / total.max(1) as f64 * 100.0
+            ns as f64 / total.max(1) as f64 * 100.0,
+            mean_tok,
+            exec_label(HAS_GPU_PATH[i], calls, gpu_calls)
         ));
-        if i == D2H {
-            for k in 0..D2H_N {
-                let sns = D2H_SUB_NS[k].load(Ordering::Relaxed);
-                let sc = D2H_SUB_CALLS[k].load(Ordering::Relaxed);
+        // attn_core: GDN (linear attention) と full attention の内訳を直下に出す
+        if i == ATTN {
+            for k in 0..ATT_CLS_N {
+                let sns = ATT_SUB_NS[p][k].load(Ordering::Relaxed);
+                let sc = ATT_SUB_CALLS[p][k].load(Ordering::Relaxed);
                 if sns == 0 && sc == 0 {
                     continue;
                 }
                 s.push_str(&format!(
-                    "    {:<12} {:>10.1} {:>8} {:>6.1}%\n",
+                    "    {:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
+                    ATT_CLS_NAMES[k],
+                    sns as f64 / 1e6,
+                    sc,
+                    sns as f64 / total.max(1) as f64 * 100.0,
+                    "-",
+                    ""
+                ));
+            }
+        }
+        if i == D2H {
+            for k in 0..D2H_N {
+                let sns = D2H_SUB_NS[p][k].load(Ordering::Relaxed);
+                let sc = D2H_SUB_CALLS[p][k].load(Ordering::Relaxed);
+                if sns == 0 && sc == 0 {
+                    continue;
+                }
+                s.push_str(&format!(
+                    "    {:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
                     D2H_NAMES[k],
                     sns as f64 / 1e6,
                     sc,
-                    sns as f64 / total.max(1) as f64 * 100.0
+                    sns as f64 / total.max(1) as f64 * 100.0,
+                    "-",
+                    ""
+                ));
+            }
+        }
+    }
+}
+
+/// 整形済みサマリ (prefill / decode / cumulative の 3 テーブル) を返す。
+///
+/// s57 (T4): 従来は decode+prefill の累積 1 表だった — prefill のホットスポットを
+/// 確定するには decode の寄与 (step 数ぶん積み上がる) が混ざると読めないため、
+/// フェーズ別を先に出し、互換・合計確認用に cumulative を最後に残す
+/// (`cumulative` の各 op = prefill + decode、TOTAL も従来と同値)。
+/// d2h_state / attn_core の直後には細分行をインデントして出す。
+pub fn summary() -> String {
+    let mut s = String::from("PROFILE (prefill/decode split; tok/call = mean batch width):\n");
+    for ph in [Phase::Prefill, Phase::Decode] {
+        phase_table(ph, &mut s);
+    }
+    s.push_str("  [cumulative]\n");
+    // cumulative は従来どおり「合計時間降順・累積%」で出す (既存の読み方と互換)
+    let p = Phase::Both.idx();
+    let rows: Vec<(usize, u64, u64, u64, u64)> = (0..N_OPS)
+        .map(|i| {
+            (
+                i,
+                NS[p][i].load(Ordering::Relaxed),
+                CALLS[p][i].load(Ordering::Relaxed),
+                TOKS[p][i].load(Ordering::Relaxed),
+                EXEC_CALLS[p][i].load(Ordering::Relaxed),
+            )
+        })
+        .filter(|(_, ns, _, _, _)| *ns > 0)
+        .collect();
+    let total: u64 = rows.iter().map(|(_, ns, _, _, _)| ns).sum();
+    let mut sorted = rows;
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    s.push_str(&format!(
+        "  {:<14} {:>10} {:>8} {:>7} {:>8} {:>6}\n",
+        "op", "ms", "calls", "cum%", "tok/call", "via"
+    ));
+    let mut acc = 0u64;
+    for (i, ns, calls, toks, gpu_calls) in sorted {
+        acc += ns;
+        let mean_tok = if calls > 0 {
+            toks as f64 / calls as f64
+        } else {
+            0.0
+        };
+        s.push_str(&format!(
+            "  {:<14} {:>10.1} {:>8} {:>6.1}% {:>8.1} {:>6}\n",
+            NAMES[i],
+            ns as f64 / 1e6,
+            calls,
+            acc as f64 / total.max(1) as f64 * 100.0,
+            mean_tok,
+            exec_label(HAS_GPU_PATH[i], calls, gpu_calls)
+        ));
+        if i == ATTN {
+            for k in 0..ATT_CLS_N {
+                let sns = ATT_SUB_NS[p][k].load(Ordering::Relaxed);
+                let sc = ATT_SUB_CALLS[p][k].load(Ordering::Relaxed);
+                if sns == 0 && sc == 0 {
+                    continue;
+                }
+                s.push_str(&format!(
+                    "    {:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
+                    ATT_CLS_NAMES[k],
+                    sns as f64 / 1e6,
+                    sc,
+                    sns as f64 / total.max(1) as f64 * 100.0,
+                    "-",
+                    ""
+                ));
+            }
+        }
+        if i == D2H {
+            for k in 0..D2H_N {
+                let sns = D2H_SUB_NS[p][k].load(Ordering::Relaxed);
+                let sc = D2H_SUB_CALLS[p][k].load(Ordering::Relaxed);
+                if sns == 0 && sc == 0 {
+                    continue;
+                }
+                s.push_str(&format!(
+                    "    {:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
+                    D2H_NAMES[k],
+                    sns as f64 / 1e6,
+                    sc,
+                    sns as f64 / total.max(1) as f64 * 100.0,
+                    "-",
+                    ""
                 ));
             }
         }
@@ -263,6 +687,7 @@ pub fn summary() -> String {
 #[cfg(test)]
 mod tests {
     //! s55: d2h 細分 id の整合 (生 id 不変・細分は N_OPS の外・summary が 3 行を出す)。
+    //! s57 (T4): フェーズ分離 (prefill/decode) と attn_core の層種別分離、平均 tok/call。
     //! 時刻値は環境依存なので検証しない — 検証するのは id の算術と集約だけ。
     use super::*;
 
@@ -287,6 +712,20 @@ mod tests {
             assert_eq!(id, D2H_LOGITS + i, "細分 id は連番 (10*D2H + i)");
             assert!(id >= N_OPS, "細分 id は生 id の範囲外: {id}");
         }
+    }
+
+    /// s57 (T4): attn_core の層種別細分 id が生 id の範囲外で連番であること。
+    #[test]
+    fn attn_split_ids_are_outside_raw_range() {
+        assert_eq!(ATT_GDN, 100 * ATTN);
+        assert_eq!(ATT_FULL, 100 * ATTN + 1);
+        assert_eq!(ATT_CLS_NAMES.len(), ATT_CLS_N);
+        for (i, &id) in [ATT_GDN, ATT_FULL].iter().enumerate() {
+            assert_eq!(id, ATT_GDN + i);
+            assert!(id >= N_OPS, "細分 id は生 id の範囲外: {id}");
+        }
+        // D2H 細分 (10*D2H + i, i < 9) と範囲が交差しないこと
+        assert!(ATT_GDN > D2H_LOGITS_PF_HELD);
     }
 
     /// s56 (T2 項目0): decode chain のラベル分岐の算術。
@@ -331,18 +770,22 @@ mod tests {
     }
     /// s55: logits の 3 分割が summary に 3 行 (呼び出し回数の内訳) として出ること。
     /// 直接叩く (整形はコード上 enabled() と無関係)。
+    ///
+    /// s57 (T4): 行の書式が 6 列に変わった (op/ms/calls/share or cum%/tok-call/via)
+    /// ので、列数を固定せず「2 列目 = calls」で検証する (cumulative 行に reset() を
+    /// 挟んでいた s55 の書き方も廃止 — 末尾の 1 回だけにする)。
     #[test]
     fn logits_split_is_summarized_per_bucket() {
+        reset();
         for (op, calls) in [
             (D2H_LOGITS_WAIT, 3u64),
             (D2H_LOGITS_COPY, 3),
             (D2H_LOGITS_PF_HELD, 1),
         ] {
-            D2H_SUB_NS[op - D2H_LOGITS].fetch_add(1000, Ordering::Relaxed);
-            D2H_SUB_CALLS[op - D2H_LOGITS].fetch_add(calls, Ordering::Relaxed);
+            add_sample(Phase::Decode, op, 1000, calls, 0, false);
         }
-        NS[D2H].fetch_add(7000, Ordering::Relaxed);
-        CALLS[D2H].fetch_add(7, Ordering::Relaxed);
+        // 生 id 側は呼び出し側 (time) が積む — ここでは d2h_state 本体のみ
+        add_sample(Phase::Decode, D2H, 7000, 7, 0, false);
         let s = summary();
         for (name, calls) in [
             ("d2h_logits_wait", "3"),
@@ -355,7 +798,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("summary に行が無い: {name}\n{s}"))
                 .split_whitespace()
                 .collect();
-            assert_eq!(cols.len(), 4, "op/ms/calls/cum% の 4 列: {name}\n{s}");
+            assert!(cols.len() >= 3, "op/ms/calls は常に先頭 3 列: {name}\n{s}");
+            assert_eq!(cols[1], "0.0", "ms: {name}\n{s}");
             assert_eq!(cols[2], calls, "呼び出し回数: {name}\n{s}");
         }
         // 従来の単独行 (d2h_logits) は COPY への置換後は出ない
@@ -364,5 +808,122 @@ mod tests {
                 .any(|l| l.split_whitespace().next() == Some("d2h_logits")),
             "旧 d2h_logits 単独行が出ている\n{s}"
         );
+        reset();
+    }
+
+    /// s57 (T4): prefill と decode が別テーブルに入り、cumulative は両者の和で
+    /// あること (従来の累積値と一致する読み方)。
+    #[test]
+    fn phases_are_aggregated_separately_and_summed_into_cumulative() {
+        reset();
+        add_sample(Phase::Prefill, QKV, 5_000_000, 8, 256, true);
+        add_sample(Phase::Decode, QKV, 1_000_000, 100, 1, true);
+        add_sample(Phase::Prefill, RMSNORM, 2_000_000, 16, 256, false);
+
+        let ns = |p: Phase, op: usize| NS[p.idx()][op].load(Ordering::Relaxed);
+        assert_eq!(ns(Phase::Prefill, QKV), 5_000_000);
+        assert_eq!(ns(Phase::Decode, QKV), 1_000_000);
+        assert_eq!(
+            ns(Phase::Both, QKV),
+            6_000_000,
+            "cumulative = prefill + decode (従来の読み方と一致)"
+        );
+        assert_eq!(CALLS[Phase::Prefill.idx()][QKV].load(Ordering::Relaxed), 8);
+        assert_eq!(CALLS[Phase::Decode.idx()][QKV].load(Ordering::Relaxed), 100);
+        assert_eq!(CALLS[Phase::Both.idx()][QKV].load(Ordering::Relaxed), 108);
+        // 平均バッチ幅 = トークン総和 / call 数
+        assert_eq!(TOKS[Phase::Prefill.idx()][QKV].load(Ordering::Relaxed), 8 * 256);
+        assert_eq!(TOKS[Phase::Decode.idx()][QKV].load(Ordering::Relaxed), 100);
+
+        let s = summary();
+        for ph in ["prefill", "decode", "cumulative"] {
+            assert!(s.contains(&format!("[{ph}]")), "{ph} 節が無い\n{s}");
+        }
+        reset();
+    }
+
+    /// s57 (T4): attn_core の集計は GDN + full の別行になり、生 id (attn_core) の
+    /// 値は従来どおり両者の合計であること。
+    ///
+    /// 設計 (承認済み): 生 id の行はそのまま「GDN + full の和」を出し、内訳は
+    /// 直下のネスト行 (attn_gdn / attn_full) で示す — 表の構造は変えない。
+    #[test]
+    fn attn_core_is_split_into_gdn_and_full_rows() {
+        reset();
+        // GDN: 30 call × 3.0 ms / full: 16 call × 2.0 ms
+        for _ in 0..30 {
+            add_sample(Phase::Prefill, ATT_GDN, 100_000, 1, 256, true);
+        }
+        for _ in 0..16 {
+            add_sample(Phase::Prefill, ATT_FULL, 125_000, 1, 256, false);
+        }
+        let s = summary();
+        // 生 id (attn_core) の合計 = GDN + full (バケットの意味を変えない)
+        assert_eq!(
+            NS[Phase::Both.idx()][ATTN].load(Ordering::Relaxed),
+            5_000_000,
+            "attn_core = attn_gdn + attn_full"
+        );
+        assert_eq!(
+            CALLS[Phase::Both.idx()][ATTN].load(Ordering::Relaxed),
+            46,
+            "attn_core の call 数 = GDN 30 + full 16"
+        );
+        // 細分バケットも各自の値を持つ
+        assert_eq!(ATT_SUB_NS[Phase::Prefill.idx()][0].load(Ordering::Relaxed), 3_000_000);
+        assert_eq!(ATT_SUB_NS[Phase::Prefill.idx()][1].load(Ordering::Relaxed), 2_000_000);
+
+        for name in ["attn_gdn", "attn_full", "attn_core"] {
+            let line = s
+                .lines()
+                .find(|l| l.trim_start().starts_with(name))
+                .unwrap_or_else(|| panic!("summary に行が無い: {name}\n{s}"));
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(cols[0], name);
+        }
+        // prefill 節の attn_core 行は GDN と full の和 (3.0 + 2.0 = 5.0 ms)
+        let prefill = s.split("[prefill]").nth(1).unwrap();
+        let core = prefill
+            .lines()
+            .find(|l| l.trim_start().starts_with("attn_core"))
+            .unwrap();
+        let cols: Vec<&str> = core.split_whitespace().collect();
+        assert_eq!(cols[1], "5.0", "GDN 3.0 + full 2.0 ms: {core}");
+        assert_eq!(cols[2], "46", "GDN 30 + full 16 call: {core}");
+        // 生 id 行は「合算」なので tok/call も 46 call 平均 (= 256)
+        assert_eq!(cols[4], "256.0", "tok/call = 46 call の平均: {core}");
+        // ネスト行はインデントされて出る (表の構造を変えない)
+        assert!(
+            prefill
+                .lines()
+                .any(|l| l.starts_with("    attn_gdn")),
+            "attn_gdn はインデントされた内訳行: {prefill}"
+        );
+        reset();
+    }
+
+    /// s57 (T4): 実行先ラベル (cpu/gpu/mixed/cpu*) の決定。
+    #[test]
+    fn exec_label_reports_gpu_cpu_and_mixed() {
+        assert_eq!(exec_label(true, 10, 10), "gpu");
+        assert_eq!(exec_label(true, 10, 0), "cpu");
+        assert_eq!(exec_label(true, 10, 4), "mixed");
+        assert_eq!(exec_label(false, 10, 0), "cpu*");
+        assert_eq!(exec_label(true, 0, 0), "-");
+    }
+
+    /// s57 (T4): `with_phase` は PROFILE off では既存のフェーズ設定に触れない
+    /// (= 完全 no-op)。on のときもネスト終了で元のフェーズへ戻る。
+    #[test]
+    fn with_phase_is_noop_and_restores() {
+        let prev = phase();
+        let r = with_phase(Phase::Prefill, || 42);
+        assert_eq!(r, 42);
+        if !enabled() {
+            assert_eq!(phase(), prev, "PROFILE off ではフェーズを変えない");
+        } else {
+            assert_eq!(phase(), prev, "ネスト終了で元へ戻る");
+        }
+        set_phase(prev);
     }
 }

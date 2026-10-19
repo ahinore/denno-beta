@@ -204,6 +204,40 @@ P9のfp32カーネルの構造:
 
 `DENNO_PROFILE=1` で有効化。リクエスト完了時に各フェーズ(embed/rmsnorm/rope/qkv/attn/oproj/gate_up/swiglu/down/lm_head/sampler/detok)の累積時間をログ出力。無効時はオーバーヘッドゼロ、数値経路に触れない。計測データは [開発履歴](HISTORY.ja.md) のP7.5節参照。
 
+#### prefill / decode の分離と attn_core の内訳 (s57)
+
+従来は 1 本の累積表だったため、decode (ステップ数ぶん積み上がる) の寄与が prefill の内訳を隠していた。現在は **3 表**をこの順に出す。
+
+1. `[prefill]` — `tokens.len() > 1` の forward で計上された分
+2. `[decode]` — 1 トークン forward (solo chain / per-op 経路) とバッチ decode で計上された分
+3. `[cumulative]` — 従来表。各 op = prefill + decode、TOTAL も従来と同値 (互換用)
+
+フェーズ切替は thread-local 1 個 (`prof::set_phase` / `with_phase`)。モデルは forward 入口で自分のフェーズを確定する (llama: `n>1` なら prefill、qwen35: prefill 専用関数とそれ以外)。PROFILE 無効時は `set_phase` を呼ばないので完全 no-op。
+
+`attn_core` は **GDN (linear attention) と full attention を別バケット** (`attn_gdn` / `attn_full`) に積み、生の `attn_core` 行はその**合計**のまま出す (表構造は不変・内訳は直下のインデント行)。
+
+```
+  [prefill] total 32724.0 ms
+  op                     ms    calls   share tok/call    via
+  attn_core          18120.0      704   55.4%    256.0  mixed
+    attn_gdn         12000.0      608   36.7%        -       
+    attn_full         6120.0       96   18.7%        -       
+```
+
+列の意味:
+
+| 列 | 意味 |
+| --- | --- |
+| `ms` | その op の累積時間 |
+| `calls` | バケットへの計上回数 |
+| `share` | フェーズ内合計に対する比率 (cumulative 表は `cum%` = 降順累積比率) |
+| `tok/call` | 1 call あたりの平均トークン数 (**バッチ幅**)。prefill の GEMM なら ≈ 入力長、decode chain なら 1、`lm_head` は常に 1 |
+| `via` | 実際に走った先: `gpu` = 全 call が GPU 経路 / `cpu` = GPU 経路が 1 度も発動せず / `mixed` = 両方 / `cpu*` = その op に GPU 選択肢が無い (CPU 要素演算・メモリコピー) |
+
+`tok/call` が 1 なのに `via=gpu` なら「GPU に 1 トークンずつ投げている」= バッチ化の余地、`tok/call` が大きく `via=cpu` なら「CPU で一括 GEMM」= GPU 化の余地、という読み方をする。
+
+`d2h_state` は従来どおり細分行 (`d2h_logits_wait` / `d2h_logits_copy` / `d2h_logits_pfhold` 等) を直下に出す。**注**: llama の prefill デバイスチェーン (`forward_prefill_gpu`) は qkv GEMM+rope と FFN (gate/up+swiglu+down) をそれぞれ 1 ディスパッチに融合しているため、前者は `qkv_proj`、後者は `gate_up_proj` に計上される (内部の `swiglu` / `down_proj` は分離できない)。GPT-2 は独自アーキテクチャ (bias/LayerNorm/GELU) のため現状プロファイル非対応。
+
 ## 6. HTTPサーバー (denno-server)
 
 axum + tokio。Anthropic Messages API互換。

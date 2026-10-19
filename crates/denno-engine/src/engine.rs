@@ -1163,7 +1163,11 @@ impl Engine {
             let model = &mut *self.model;
             let caches = &mut *self.caches;
             let mut cache_refs = pick_caches(caches, &slots, &order);
-            let outs = model.forward_batch(&sorted_toks, &mut cache_refs)?;
+            // s57 (T4): バッチ decode の計測フェーズを明示 (PROFILE 無効時 no-op)。
+            // 各モデルの forward も入口で自身のフェーズを設定する (両方一致)。
+            let outs = crate::prof::with_phase(crate::prof::Phase::Decode, || {
+                model.forward_batch(&sorted_toks, &mut cache_refs)
+            })?;
             if let Some(t0) = t0 {
                 telem::emit(Frame::Step {
                     width: need_fwd.len() as u32,
