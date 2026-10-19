@@ -214,8 +214,12 @@ const fn mk_counters<const N: usize>() -> [[AtomicU64; N]; Phase::N] {
 
 static NS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
 static CALLS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
-/// s57 (T4): バケットに渡されたトークン (行) 数の総和。平均 = TOKS / CALLS。
+/// s57 (T4): バケットに渡されたトークン (行) 数の総和。平均 = TOKS / CALLS_ROWS。
 static TOKS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
+/// s61 (T5a 撤回): `tok/call` の分母 — 行数 (rows>0) を渡した sample の call 数。
+/// 行数を持たないサンプル (d2h・time 等の rows=0) を分母から外し、
+/// 平均を実バッチ幅にする。
+static CALLS_ROWS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
 /// s57 (T4): GPU 経路で走った call 数 (実行先ラベルの根拠)。
 static EXEC_CALLS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
 /// s54: d2h_state の細分累積 (id は 10*D2H + i → 添字 i)。フェーズ別。
@@ -307,10 +311,67 @@ pub fn time_full<T>(op: usize, rows: usize, on_gpu: bool, f: impl FnOnce() -> T)
     r
 }
 
-/// `time` のバッチ幅付き版 (現行フェーズに集計)。実行先は GPU 選択が無い op として
-/// 扱う (`DENNO_PROFILE` の素の呼び出し — 従来の `time` と同じ計上先)。
+/// `time` のバッチ幅付き版 (現行フェーズに集計)。実行先ラベルは持たないため
+/// `via` 列は常に `cpu` になる (セクションに GPU 選択が無い op 用)。
+/// **線形層のバケット (QKV / OPROJ / GATE_UP / DOWN) や GDN 投影は `time_n_ev`
+/// を使うこと** — T4 の誤診はここで `via=cpu` 固定になっていたことが原因。
 pub fn time_n<T>(op: usize, rows: usize, f: impl FnOnce() -> T) -> T {
     time_full(op, rows, false, f)
+}
+
+/// cuda 無効ビルド用の no-op スコープ (cuda 側の同名と API を揃える)。
+#[cfg(not(feature = "cuda"))]
+struct Probe;
+
+#[cfg(not(feature = "cuda"))]
+impl Probe {
+    #[inline]
+    fn begin() -> Self {
+        Probe
+    }
+
+    #[inline]
+    fn any_on_gpu(&self) -> bool {
+        false
+    }
+}
+
+/// s61 (T5a 撤回): `time_n` の **実行先ラベル付き** 版。`f` を実行したあとで
+/// 「その区間中に GPU 線形呼び出しが 1 回でも走ったか」を cuda 側の実測
+/// (`cuda::Probe`) から読んで `via` 列に渡す。
+///
+/// T4 の誤診の原因は 2 つ:
+///   1. `time_n` は `time_full(..., on_gpu = false, ...)` を渡しており、
+///      prefill の per-op 計測が **常に `via=cpu`** と表示されていた。
+///   2. 修正の第一案 (`last_linear_ran_on_gpu()`) も **直近 1 回** の線形しか
+///      見ないため、1 区間で複数の線形を呼ぶバケット (qkv = q/k/v、
+///      gate_up = gate/up) では最後の 1 本でラベルが決まってしまっていた。
+/// ここでは区間内の **いずれか** が GPU で走ったか (`Probe::any_on_gpu`) を
+/// 使う。ラベルは model 側の主張ではなく計測区間の実測から取る。
+///
+/// **計測専用** — 戻り値の型・数値経路は `time_n` と完全に同一 (PROFILE 無効時は
+/// `Probe` の Cell 操作以外は素通し)。
+pub fn time_n_ev<T>(op: usize, rows: usize, f: impl FnOnce() -> T) -> T {
+    let prof_on = enabled();
+    let tel_on = crate::telemetry_on();
+    if !prof_on && !tel_on {
+        return f();
+    }
+    #[cfg(feature = "cuda")]
+    let probe = crate::cuda::Probe::begin();
+    #[cfg(not(feature = "cuda"))]
+    let probe = Probe::begin();
+    let t = Instant::now();
+    let r = f();
+    let ns = t.elapsed().as_nanos() as u64;
+    let on_gpu = probe.any_on_gpu();
+    if prof_on {
+        add_sample(phase(), op, ns, 1, rows, on_gpu);
+    }
+    if tel_on {
+        crate::telemetry_add_op(if op < N_OPS { op } else { D2H }, ns);
+    }
+    r
 }
 
 /// `time_layer` のバッチ幅付き版 (現行フェーズに集計)。
@@ -347,7 +408,18 @@ pub fn time_layer_n_ev<T>(
 
 /// 1 サンプルをフェーズ別テーブルへ積む。生 id (N_OPS 未満)、D2H 細分、
 /// attn_core 層種別細分の 3 系統を一度に処理する。
-fn add_sample(phase: Phase, op: usize, ns: u64, calls: u64, rows: usize, on_gpu: bool) {
+///
+/// s61: `crate::quant` の回帰テスト (既定経路が `maybe_gpu_linear` を通るか) が
+/// 同じ会計を叩けるよう `pub` にした。外部クレートへは公開していない
+/// (`pub(crate)` 相当)。
+pub(crate) fn add_sample(
+    phase: Phase,
+    op: usize,
+    ns: u64,
+    calls: u64,
+    rows: usize,
+    on_gpu: bool,
+) {
     let pi = phase.idx();
     let slot = if op < N_OPS { op } else { D2H };
     NS[pi][slot].fetch_add(ns, Ordering::Relaxed);
@@ -357,6 +429,11 @@ fn add_sample(phase: Phase, op: usize, ns: u64, calls: u64, rows: usize, on_gpu:
     if rows > 0 {
         TOKS[pi][slot].fetch_add(rows as u64 * calls, Ordering::Relaxed);
         TOKS[Phase::Both.idx()][slot].fetch_add(rows as u64 * calls, Ordering::Relaxed);
+        // s61: 行数を渡したサンプルだけを「バッチ幅の平均」の分母にする。
+        // 従来は TOKS / CALLS で割っていたため、行数を持たない呼び出し
+        // (d2h 等の rows=0) が分母に入り tok/call が実バッチ幅より小さく出ていた。
+        CALLS_ROWS[pi][slot].fetch_add(calls, Ordering::Relaxed);
+        CALLS_ROWS[Phase::Both.idx()][slot].fetch_add(calls, Ordering::Relaxed);
     }
     if on_gpu {
         EXEC_CALLS[pi][slot].fetch_add(calls, Ordering::Relaxed);
@@ -379,6 +456,9 @@ fn add_sample(phase: Phase, op: usize, ns: u64, calls: u64, rows: usize, on_gpu:
         if rows > 0 {
             TOKS[pi][ATTN].fetch_add(rows as u64 * calls, Ordering::Relaxed);
             TOKS[Phase::Both.idx()][ATTN].fetch_add(rows as u64 * calls, Ordering::Relaxed);
+            // s61: 生 id (attn_core) の tok/call の分母も細分側と同じ規則で数える
+            CALLS_ROWS[pi][ATTN].fetch_add(calls, Ordering::Relaxed);
+            CALLS_ROWS[Phase::Both.idx()][ATTN].fetch_add(calls, Ordering::Relaxed);
         }
         if on_gpu {
             EXEC_CALLS[pi][ATTN].fetch_add(calls, Ordering::Relaxed);
@@ -472,6 +552,7 @@ pub fn reset() {
             NS[p][i].store(0, Ordering::Relaxed);
             CALLS[p][i].store(0, Ordering::Relaxed);
             TOKS[p][i].store(0, Ordering::Relaxed);
+            CALLS_ROWS[p][i].store(0, Ordering::Relaxed);
             EXEC_CALLS[p][i].store(0, Ordering::Relaxed);
         }
         for i in 0..D2H_N {
@@ -509,7 +590,7 @@ pub fn exec_label(has_gpu_path: bool, calls: u64, gpu_calls: u64) -> &'static st
 /// 1 フェーズ分のテーブルを整形する。`cum` はこのフェーズの合計。
 fn phase_table(phase: Phase, s: &mut String) {
     let p = phase.idx();
-    let rows: Vec<(usize, u64, u64, u64, u64)> = (0..N_OPS)
+    let rows: Vec<(usize, u64, u64, u64, u64, u64)> = (0..N_OPS)
         .map(|i| {
             (
                 i,
@@ -517,11 +598,12 @@ fn phase_table(phase: Phase, s: &mut String) {
                 CALLS[p][i].load(Ordering::Relaxed),
                 TOKS[p][i].load(Ordering::Relaxed),
                 EXEC_CALLS[p][i].load(Ordering::Relaxed),
+                CALLS_ROWS[p][i].load(Ordering::Relaxed),
             )
         })
-        .filter(|(_, ns, _, _, _)| *ns > 0)
+        .filter(|(_, ns, _, _, _, _)| *ns > 0)
         .collect();
-    let total: u64 = rows.iter().map(|(_, ns, _, _, _)| ns).sum();
+    let total: u64 = rows.iter().map(|(_, ns, _, _, _, _)| ns).sum();
     if rows.is_empty() {
         s.push_str(&format!("  [{}] (no calls)\n", Phase::NAMES[p]));
         return;
@@ -537,9 +619,10 @@ fn phase_table(phase: Phase, s: &mut String) {
         "  {:<14} {:>10} {:>8} {:>7} {:>8} {:>6}\n",
         "op", "ms", "calls", "share", "tok/call", "via"
     ));
-    for (i, ns, calls, toks, gpu_calls) in sorted {
-        let mean_tok = if calls > 0 {
-            toks as f64 / calls as f64
+    for (i, ns, calls, toks, gpu_calls, calls_rows) in sorted {
+        // s61: 分母は行数を渡したサンプルだけ (実バッチ幅)。
+        let mean_tok = if calls_rows > 0 {
+            toks as f64 / calls_rows as f64
         } else {
             0.0
         };
@@ -607,7 +690,7 @@ pub fn summary() -> String {
     s.push_str("  [cumulative]\n");
     // cumulative は従来どおり「合計時間降順・累積%」で出す (既存の読み方と互換)
     let p = Phase::Both.idx();
-    let rows: Vec<(usize, u64, u64, u64, u64)> = (0..N_OPS)
+    let rows: Vec<(usize, u64, u64, u64, u64, u64)> = (0..N_OPS)
         .map(|i| {
             (
                 i,
@@ -615,11 +698,12 @@ pub fn summary() -> String {
                 CALLS[p][i].load(Ordering::Relaxed),
                 TOKS[p][i].load(Ordering::Relaxed),
                 EXEC_CALLS[p][i].load(Ordering::Relaxed),
+                CALLS_ROWS[p][i].load(Ordering::Relaxed),
             )
         })
-        .filter(|(_, ns, _, _, _)| *ns > 0)
+        .filter(|(_, ns, _, _, _, _)| *ns > 0)
         .collect();
-    let total: u64 = rows.iter().map(|(_, ns, _, _, _)| ns).sum();
+    let total: u64 = rows.iter().map(|(_, ns, _, _, _, _)| ns).sum();
     let mut sorted = rows;
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
     s.push_str(&format!(
@@ -627,10 +711,11 @@ pub fn summary() -> String {
         "op", "ms", "calls", "cum%", "tok/call", "via"
     ));
     let mut acc = 0u64;
-    for (i, ns, calls, toks, gpu_calls) in sorted {
+    for (i, ns, calls, toks, gpu_calls, calls_rows) in sorted {
         acc += ns;
-        let mean_tok = if calls > 0 {
-            toks as f64 / calls as f64
+        // s61: 分母は行数を渡したサンプルだけ (実バッチ幅)。
+        let mean_tok = if calls_rows > 0 {
+            toks as f64 / calls_rows as f64
         } else {
             0.0
         };
@@ -910,6 +995,48 @@ mod tests {
         assert_eq!(exec_label(true, 10, 4), "mixed");
         assert_eq!(exec_label(false, 10, 0), "cpu*");
         assert_eq!(exec_label(true, 0, 0), "-");
+    }
+
+    /// s61 (T5a 撤回): `tok/call` の分母は **行数を渡したサンプルだけ**。
+    /// 行数 0 の呼び出し (d2h 等) が混ざっても平均バッチ幅が歪まないこと
+    /// (T4 は TOKS / CALLS で割っていた)。
+    #[test]
+    fn tok_per_call_excludes_samples_without_rows() {
+        reset();
+        set_phase(Phase::Prefill);
+        // 行数を渡した 2 call (各 256 行) + 行数 0 の 8 call
+        add_sample(Phase::Prefill, QKV, 1_000_000, 2, 256, false);
+        add_sample(Phase::Prefill, QKV, 1_000_000, 8, 0, false);
+        let s = summary();
+        let line = s
+            .lines()
+            .find(|l| l.trim_start().starts_with("qkv_proj"))
+            .unwrap_or_else(|| panic!("summary に qkv_proj 行が無い\n{s}"));
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(cols[2], "10", "calls は従来どおり全 call を数える: {line}");
+        assert_eq!(
+            cols[4], "256.0",
+            "tok/call の分母から rows=0 を外す (T4 は 512/10 = 51.2 と出ていた): {line}"
+        );
+        reset();
+    }
+
+    /// s61: `time_n_ev` は計測ラベルを付けるだけで、戻り値と数値経路を
+    /// `time_n` と完全に同一に保つ (誤診の再発防止の前提)。
+    #[test]
+    fn time_n_ev_passes_through_value_and_side_effects() {
+        let v = time_n(QKV, 4, || vec![1.0f32, 2.0, 3.0]);
+        let w = time_n_ev(QKV, 4, || vec![1.0f32, 2.0, 3.0]);
+        assert_eq!(v, w, "time_n_ev は戻り値を変えない");
+        // クロージャの副作用 (状態更新) も 1 回だけ通ること
+        let mut hits = 0;
+        let _ = time_n_ev(QKV, 4, || {
+            hits += 1;
+        });
+        assert_eq!(hits, 1, "クロージャは 1 回だけ実行される");
+        // 戻り値の型は何でも通る (タプル含む)
+        let (a, b) = time_n_ev(QKV, 4, || (1u8, "x"));
+        assert_eq!((a, b), (1u8, "x"));
     }
 
     /// s57 (T4): `with_phase` は PROFILE off では既存のフェーズ設定に触れない

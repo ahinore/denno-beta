@@ -121,6 +121,21 @@ pub enum Linear {
     Q8(Quant8Linear),
 }
 
+/// s61 (T5a 撤回): GPU 線形層の唯一の入口は `cuda::maybe_gpu_linear`。
+/// cuda 無効ビルドにはそのモジュール自体が無いため、回帰テスト用の
+/// 「入口に到達したか」の計数だけをここに集約する。
+pub(crate) mod seam {
+    #[cfg(feature = "cuda")]
+    pub use crate::cuda::linear_seam_calls;
+
+    /// cuda 無効ビルド: GPU 入口が存在しないので常に 0
+    /// (このとき CPU カーネル直呼びが正しい既定)。
+    #[cfg(not(feature = "cuda"))]
+    pub fn linear_seam_calls() -> u64 {
+        0
+    }
+}
+
 impl Linear {
     /// int8 (Q8) なら内部の Quant8Linear を返す (P17c 融合呼び出し用)。
     /// fp32 モードでは None (融合は int8 のみ — ビット一致のため)。
@@ -521,5 +536,87 @@ mod tests {
         let q8_lin = Linear::new(pseudo_random(k * n, 21), k, n, QuantMode::Int8);
         assert_eq!(f32_lin.weight_bytes(), k * n * 4);
         assert!(q8_lin.weight_bytes() < k * n * 4 / 4 + n * 4 + 16);
+    }
+
+    // ------------------------------------------------------------------
+    // s61 (T5a 撤回): prefill 経路が `maybe_gpu_linear` を迂回しないこと。
+    //
+    // s60 (T5a) は prefill の投影を `apply_bt_rows_maybe_gpu` に差し替えたが、
+    // ゲート未指定時は `tensor::matmul_bt_i8` を直接呼んでいたため、GPU 線形層の
+    // 唯一の入口 (`cuda::maybe_gpu_linear`) を **静かに迂回** し、既定構成で
+    // prefill が 2.85x 遅くなった。同時に proj のプロファイルが `via=cpu` と
+    // 出ていた (迂回の目撃証拠)。
+    //
+    // この退行は「数値が合っているのに遅い」形なので、正確性テストでは捕まらない。
+    // 捕まえるには **入口に到達したか** を見るしかない。以下のテストは GPU 実機
+    // 不要 (入口到達の計数 + CPU カーネルとのビット一致で判定する)。
+    // ------------------------------------------------------------------
+
+    /// 既定の prefill 経路 (`apply_bt_rows`) は結果が CPU カーネルとビット一致し、
+    /// かつ cuda 有効ビルドでは GPU 線形の入口 (`maybe_gpu_linear`) に **必ず**
+    /// 到達する。
+    ///
+    /// 083218d の形 (ゲート未指定で `matmul_bt_i8` 直呼び) に戻すと入口呼び出しが
+    /// 増えないので、cuda 有効ビルドでこのテストが落ちる。
+    #[test]
+    fn prefill_apply_bt_rows_goes_through_gpu_seam() {
+        // m=64 は既定の GEMV 上限 (~16) 超・GEMM 閾値 (256) 未満 = prefill の典型
+        let (k, n, m) = (64usize, 32usize, 64usize);
+        let w = pseudo_random(k * n, 23);
+        let a = pseudo_random(m * k, 24);
+        let lin = Linear::new(w, k, n, QuantMode::Int8);
+
+        let calls_before = seam::linear_seam_calls();
+        let want = linear_cpu_rows_i8(&a, lin.quant8().unwrap(), m);
+        let got = crate::prof::time_n_ev(crate::prof::QKV, m, || lin.apply_bt_rows(&a, m));
+        let calls_after = seam::linear_seam_calls();
+
+        assert_eq!(
+            got, want,
+            "prefill の既定経路は CPU カーネルとビット一致 (GPU 無効時 = 純 CPU)"
+        );
+        // 入口到達の計数は cuda 有効ビルドでしか意味を持たない (無効ビルドは
+        // 入口そのものが存在せず、CPU 直呼びが正しい既定)。
+        #[cfg(feature = "cuda")]
+        assert!(
+            calls_after > calls_before,
+            "apply_bt_rows (m={m}) が cuda::maybe_gpu_linear に到達していない: \
+             prefill の投影は GPU 入口を迂回してはならない (T5a の退行)"
+        );
+        #[cfg(not(feature = "cuda"))]
+        assert_eq!(calls_after, calls_before, "cuda 無効ビルドに GPU 入口は無い");
+    }
+
+    /// `apply_bt` / `apply_bt_rows` / `apply` / `apply_batch_bt` の **全 Q8 経路** が
+    /// 同じ入口を通ること (入口を 1 つに保つ = 迂回を作らない)。
+    #[test]
+    fn all_q8_linear_paths_share_the_gpu_seam() {
+        let (k, n, m) = (32usize, 16usize, 64usize);
+        let w = pseudo_random(k * n, 25);
+        let a = pseudo_random(m * k, 26);
+        let lin = Linear::new(w, k, n, QuantMode::Int8);
+        let paths: [(&str, fn(&Linear, &[f32], usize) -> Vec<f32>); 4] = [
+            ("apply_bt", |l, a, m| l.apply_bt(a, m)),
+            ("apply_bt_rows", |l, a, m| l.apply_bt_rows(a, m)),
+            ("apply", |l, a, m| l.apply(a, m)),
+            ("apply_batch_bt", |l, a, m| l.apply_batch_bt(a, m)),
+        ];
+        for (name, f) in paths {
+            let before = seam::linear_seam_calls();
+            let _ = f(&lin, &a, m);
+            let after = seam::linear_seam_calls();
+            #[cfg(feature = "cuda")]
+            assert!(
+                after > before,
+                "{name} が cuda::maybe_gpu_linear を迂回している (GPU 入口は 1 つに保つ)"
+            );
+            #[cfg(not(feature = "cuda"))]
+            let _ = (name, after, before);
+        }
+    }
+
+    /// Q8 の CPU 行並列カーネル (参考実装: `apply_bt` の CPU 分岐と同一)。
+    fn linear_cpu_rows_i8(a: &[f32], q: &Quant8Linear, m: usize) -> Vec<f32> {
+        crate::tensor::matmul_bt_i8(a, &q.w, &q.scale, m, q.k, q.n)
     }
 }

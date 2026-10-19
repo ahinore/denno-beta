@@ -1009,7 +1009,12 @@ pub fn maybe_gpu_linear_grouped(parts: &[&Quant8Linear], a: &[f32], m: usize) ->
         linear_pinned(ctx, a, gw, m, k, n)
     };
     match r {
-        Ok(out) => Some(out),
+        Ok(out) => {
+            // s61: 融合経路も実行先ラベルに計上する (PROFILE の via 列用)。
+            // これが無いと llama の qkv/gate_up 融合 call が `via=cpu` と誤記される。
+            set_last_linear_ran_on_gpu(true);
+            Some(out)
+        }
         Err(e) => {
             tracing::error!("CUDA grouped linear failed, falling back to CPU permanently: {e:#}");
             GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1391,6 +1396,10 @@ fn weights_for_group(
 #[cfg(feature = "cuda")]
 thread_local! {
     static LINEAR_RAN_ON_GPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// s61: 区間内で「一度でも GPU 線形が走ったか」の集積フラグ。ネストした
+    /// `Probe` を許すため深さも持つ (最深の scope が閉じたときに外側へ引き継ぐ)。
+    static LINEAR_SCOPE: (std::cell::Cell<u32>, std::cell::Cell<bool>) =
+        const { (std::cell::Cell::new(0), std::cell::Cell::new(false)) };
 }
 
 /// 直近の `maybe_gpu_linear` が GPU で走りきったか (PROFILE の実行先ラベル用)。
@@ -1406,6 +1415,83 @@ pub fn last_linear_ran_on_gpu() -> bool {
 #[inline]
 fn set_last_linear_ran_on_gpu(v: bool) {
     LINEAR_RAN_ON_GPU.with(|c| c.set(v));
+    // s61: 開いている区間 (Probe) があれば OR で集積する (計測のみ)
+    if v {
+        LINEAR_SCOPE.with(|(depth, any)| {
+            if depth.get() > 0 {
+                any.set(true);
+            }
+        });
+    }
+}
+
+/// s61 (T5a 撤回の知見): 区間の実行先ラベルを「区間内の **いずれか** の線形
+/// 呼び出しが GPU で走ったか」で取るためのスコープ。
+///
+/// `last_linear_ran_on_gpu()` は **直近 1 回** の `maybe_gpu_linear` しか
+/// 見ないため、1 区間で複数の線形を呼ぶバケット (qkv = q/k/v の 3 本、
+/// gate_up = gate + up) では最後の 1 本の結果に引きずられる (v が GEMV で
+/// GPU、k が CPU のような場合に cb が誤る)。`Probe` は区間中に
+/// `maybe_gpu_linear` が **OR で** 記録した値を読み、`Drop` で必ず閉じる。
+///
+/// **計測のみ** — 記録するのは `Cell<bool>` だけで、分岐・数値・GPU 状態には
+/// 一切触れない。PROFILE 無効時も呼ばれるが cost は Cell 2 回。
+#[cfg(feature = "cuda")]
+pub struct Probe {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(feature = "cuda")]
+impl Probe {
+    #[inline]
+    pub fn begin() -> Self {
+        LINEAR_SCOPE.with(|(depth, any)| {
+            if depth.get() == 0 {
+                any.set(false);
+            }
+            depth.set(depth.get() + 1);
+        });
+        Probe { _not_send: std::marker::PhantomData }
+    }
+
+    /// この区間中に GPU 線形が 1 回でも走ったか。
+    #[inline]
+    pub fn any_on_gpu(&self) -> bool {
+        LINEAR_SCOPE.with(|(_, any)| any.get())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for Probe {
+    #[inline]
+    fn drop(&mut self) {
+        LINEAR_SCOPE.with(|(depth, any)| {
+            let d = depth.get().saturating_sub(1);
+            depth.set(d);
+            // 最深 scope が閉じた時点でフラグは外側 scope の集積に残る
+            // (外側 scope がまだ open ならその値に OR 済み)。
+            if d == 0 {
+                // 最外を閉じたら次回 begin() が false から始める
+                any.set(false);
+            }
+        });
+    }
+}
+
+/// s61 (T5a 撤回): GPU 線形層の入口 (`maybe_gpu_linear`) が呼ばれた回数の
+/// **診断用カウンタ**。既定経路が入口を迂回していないことを GPU 無し環境でも
+/// 検査できるようにする (083218d はゲート未指定で `matmul_bt_i8` を直呼びし、
+/// この入口に一度も到達しなかった)。
+///
+/// 値の読み書きは Relaxed の加算 1 回のみで、分岐・戻り値・数値経路には触れない。
+static LINEAR_SEAM_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// s61: `maybe_gpu_linear` の入口に到達した累計回数 (回帰テスト用)。
+#[cfg(feature = "cuda")]
+#[inline]
+pub fn linear_seam_calls() -> u64 {
+    LINEAR_SEAM_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// P17b 統合エントリ: int8 線形層を GPU で実行するかどうかを判定し、
@@ -1423,6 +1509,8 @@ pub fn maybe_gpu_linear(
     // s57 (T4): 実行先ラベルの初期値 — この呼び出しが None で抜けたとき
     // 直前の true が残らないよう毎回 false から始める (計測のみ)
     set_last_linear_ran_on_gpu(false);
+    // s61: 入口到達の記録 (回帰テスト用・Relaxed 加算のみ)
+    LINEAR_SEAM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !cuda_enabled() {
         return None;
     }

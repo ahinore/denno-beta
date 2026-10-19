@@ -1113,14 +1113,14 @@ impl Qwen35 {
                     // 決まる (cuda 統計) ため、ここでは主張しない。
                     let (kqkv, _) = g.qkv_w.dims();
                     debug_assert_eq!(kqkv, e);
-                    let qkv = crate::prof::time_n(crate::prof::QKV, n, || {
+                    let qkv = crate::prof::time_n_ev(crate::prof::QKV, n, || {
                         g.qkv_w.apply_bt_rows(&h, n)
                     });
-                    let z = crate::prof::time_n(crate::prof::QKV, n, || g.gate_w.apply_bt_rows(&h, n));
-                    let beta_raw = crate::prof::time_n(crate::prof::ATT_GDN, n, || {
+                    let z = crate::prof::time_n_ev(crate::prof::QKV, n, || g.gate_w.apply_bt_rows(&h, n));
+                    let beta_raw = crate::prof::time_n_ev(crate::prof::ATT_GDN, n, || {
                         g.beta_w.apply_bt_rows(&h, n)
                     });
-                    let alpha = crate::prof::time_n(crate::prof::ATT_GDN, n, || {
+                    let alpha = crate::prof::time_n_ev(crate::prof::ATT_GDN, n, || {
                         g.alpha_w.apply_bt_rows(&h, n)
                     });
                     // スキャン: GPU カーネル 1 発 (P19-A1・cuda 有効時)。GDN は
@@ -1180,7 +1180,7 @@ impl Qwen35 {
                             )
                         });
                     let _ = scan_on_gpu;
-                    let out = crate::prof::time_n(crate::prof::OPROJ, n, || {
+                    let out = crate::prof::time_n_ev(crate::prof::OPROJ, n, || {
                         g.out_w.apply_bt_rows(&ys, n)
                     });
                     if crate::gdn::gdn_dbg_enabled_for(li as i64) {
@@ -1199,7 +1199,7 @@ impl Qwen35 {
                         });
                 }
                 AttnKind::Full(fl) => {
-                    let (qg, k, v) = crate::prof::time_n(crate::prof::QKV, n, || {
+                    let (qg, k, v) = crate::prof::time_n_ev(crate::prof::QKV, n, || {
                         (
                             fl.q_w.apply_bt_rows(&h, n), // [n, heads*2*dh]
                             fl.k_w.apply_bt_rows(&h, n), // [n, kv_dim]
@@ -1276,7 +1276,7 @@ impl Qwen35 {
                         }
                         (att_done, att_done)
                     });
-                    let out = crate::prof::time_n(crate::prof::OPROJ, n, || {
+                    let out = crate::prof::time_n_ev(crate::prof::OPROJ, n, || {
                         fl.o_w.apply_bt_rows(&att, n)
                     });
                     // s42: 残差加算は行独立 → 行並列 (bit-exact)
@@ -1303,7 +1303,7 @@ impl Qwen35 {
                         h2_row.copy_from_slice(&r);
                     });
             });
-            let (gate, up) = crate::prof::time_n(crate::prof::GATE_UP, n, || {
+            let (gate, up) = crate::prof::time_n_ev(crate::prof::GATE_UP, n, || {
                 (layer.gate_w.apply_bt_rows(&h2, n), layer.up_w.apply_bt_rows(&h2, n))
             });
             let mut hh = vec![0.0f32; n * ff];
@@ -1321,7 +1321,7 @@ impl Qwen35 {
                         }
                     });
             });
-            let down = crate::prof::time_n(crate::prof::DOWN, n, || {
+            let down = crate::prof::time_n_ev(crate::prof::DOWN, n, || {
                 layer.down_w.apply_bt_rows(&hh, n)
             });
             // s42: 残差加算は行独立 → 行並列 (bit-exact)
