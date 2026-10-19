@@ -1719,6 +1719,77 @@ GPU 無しの環境で契約を固定するため、`gemm_pad_preserves_dot_and_
 ことによる FFN GEMM (`gate_up` 27 ms/call × 128 ≒ 3.5 s) の短縮。
 **実測は supervisor の PF_BENCH / GPU_VERIFY 待ち (このセッションでは測っていない)**。
 
+### dno_gemm_i8 の共有メモリ アラインメントと行カバレッジの修正 (2026-10-19, s75 / T6 候補 1 attempt 2) — GPU 実測済
+
+> s74 のカーネルは **GPU 実機で即死**した: 最初の int8 GEMM で
+> `CUDA cuMemcpyDtoHAsync が失敗: error 716` → 恒久 CPU フォールバック
+> (PF wall 171.68s / 33.1 tok/s、ベースライン 9.65s / 589 tok/s の 17.8 倍遅い)。
+> compute-sanitizer の確定診断は `Invalid __shared__ write of size 4 bytes /
+> Access at 0x421 is misaligned`。**CPU テストは緑のまま**で、このクラスの欠陥は
+> GPU か静的検査でしか捕まらない。
+
+**原因 (2 件・独立)**:
+
+1. **共有ステージの行ストライドが 4 バイト境界に揃っていない**。
+   s74 は `GEMM_SP = GEMM_TK + 1` (= 33、奇数) にしたが、カーネルは
+   `*(int*)&sA[tid][c]` / `*(const int*)&sA[..][c0]` / `*(int*)&sB[r][c]` と
+   **4 バイトのポインタキャスト**でアクセスしていた。行 r が進むたびに実アドレスが
+   33 の倍数だけずれ、`float`/`int` の 4 バイト書き込みが未アラインになる。
+   sticky な error 716 になるため、以降の全 D2H / sync が失敗し恒久フォールバック。
+   旧カーネル (ストライド 4 の倍数) では成立していた。
+2. **ブロック形状がタイル寸法と食い違っていた** (アラインメントを直しても壊れたまま)。
+   s74 は block を `(16,16)` = 256 thread から `(16,4)` = **64 thread** に落としたが、
+   `GEMM_TILE` は 128 行のままだった。1 thread 8 行 × block.y 4 = 32 行しか
+   覆えず、`gridDim.x = m.div_ceil(128)` は 1 ブロックで 128 行を進めるため、
+   **各タイルの 32..127 行が誰にも書かれない** (出力の約 75% が未初期化)。
+   A ステージも 64 thread が 64 行しか埋めず、計算側が読む 0..31 行以外は未初期化だった。
+
+**変更** (`kernels/kernels_int8.cu` の `dno_gemm_i8` と `cuda.rs`):
+
+- `GEMM_SP` を **36** (`GEMM_TK + 4`) に。4 の倍数であり、かつ 32 の倍数でないので
+  隣接 thread の 8 行差 = 288B = 72 words、72 mod 32 = 8 で bank が 8 個ずつずれ
+  conflict しない (32 のままだと 64 words、64 mod 32 = 0 で全行同一 bank)。
+- `static_assert` を追加: `GEMM_SP % 4 == 0` / `GEMM_TK % 4 == 0` /
+  `(8*GEMM_SP/4) % 32 != 0` / `GEMM_BX*16 == GEMM_TILE_N` /
+  `GEMM_BY*8 == GEMM_TILE` / block ≤ 1024 thread。
+- block を **`(16,16)` = 256 thread** に戻し、`GEMM_BX` / `GEMM_BY` を導入。
+  タイル 128x256 を過不足なく覆う (1 thread 8 行 x 16 列のままなので s74 の
+  dp4a/B ロード比 16 は維持)。A ステージは `tid < GEMM_TILE` の 128 thread が
+  1 行ずつ、B ステージは全 256 thread が 1 行ずつロードする形に整理。
+- ホストの launch 形状 10 箇所をリテラル `(16,16,1)` ではなく **`(GEMM_BX, GEMM_BY, 1)`**
+  に統一 (片方だけ直すと静かに食い違うため、定数経由にしてテストで突き合わせる)。
+
+**数値**: 変更は共有メモリのレイアウトとブロック形状のみ。i32 の int8 積和は
+結合則が成立するので dot はタイル形状に依存せず、f32 側は
+`((float)dot * ascale) * scale[j]` の順を維持。**ビット一致**が期待値
+(s74 と同じく R2。R2 で許容される 1e-4 の差も出ない見込み)。
+s74 の未初期化行バグは「値が違う」ではなく「書かれない」なので、
+仮に GPU がエラーを出さなければ**静かに壊れた出力**を返していた。
+
+**GPU 無しの再発防止テスト** (`kernel_source_shared_stride_and_block_shape_are_consistent`):
+`include_str!` で `kernels_int8.cu` を取り込み、`#define` を簡易評価して
+①`GEMM_SP % 4 == 0` かつ `% 32 != 0` ②`GEMM_BX*16 == GEMM_TILE_N` かつ
+`GEMM_BY*8 == GEMM_TILE` ③Rust 側ミラー定数 (`GEMM_TILE` / `GEMM_TILE_N` /
+`GEMM_BX` / `GEMM_BY`) との一致 ④共有メモリ量 ≤ 48KiB ⑤共有配列への `(int*)`
+アクセスの列オフセットが **全ループ反復で** 4 の倍数、を検査する。
+変異テストで有効性を確認済み: `GEMM_SP = GEMM_TK + 1`、`GEMM_BY = 4`、
+`GEMM_SP = GEMM_TK`、`sA[tid][x*3]` のいずれもテストが落ちる。
+
+**GPU 実測 (2026-10-19, s75)**:
+
+`kernels_int8.ptx` を nvcc 12.9 で再生成 (`-ptx -arch=compute_75 -fmad=false -O3`、
+md5 b5c926ea → fe254249)。`GPU_VERIFY.sh` は **PASS**、アンカーは
+v6_1b=`c61ad85b` / v6_2b=`9e17d563` / v6_1b_full=`af6eb6ab` の **3 本とも一致**。
+`PF_BENCH` のウォーム 2 回目で **PF wall 8.71 s / 653 tok/s**
+(s73 の 9.65 s / 589 tok/s から -9.7%)。CPU テストは 233 passed。
+
+**副次的発見 (T9 に直結)**: s73 で観測していた短アンカー 2 本のドリフト
+(`c61ad85b`→`47df93d7` / `9e17d563`→`9b20de09`) は、このビルドでは**再現せず旧基準値に戻った**。
+`data/verify/anchors_baseline.txt` は `anchors_baseline.prev.txt` (旧 3 本) から復元した。
+つまり s73 のドリフトは「R1 として恒久化すべき差」ではなく、**1 ulp 級の摂動が
+サンプリングのニアタイでトークンを反転させた**ものと解釈するのが自然である。
+s73 の並列 prepare が未初期化領域を読んでいる可能性は依然として未検証で、T9 として残す。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)

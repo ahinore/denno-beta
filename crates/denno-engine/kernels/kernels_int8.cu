@@ -140,10 +140,40 @@ extern "C" __global__ void dno_matvec_rows_bt_i8(
 //   1 thread あたり 16 列連続。いずれも f32 の演算列 ((float)dot * ascale * scale[j])
 //   と整数累積を変えないので、**CPU の同じ整数 dot からの結果と同じビット**になる
 //   (gemm_pad_apply を純粋関数にして Rust 側でテストする)。
+// s75 (不具合修正): 共有ステージの行ストライドは **4 バイト境界に揃える**。
+// s74 の `GEMM_SP = GEMM_TK + 1` (= 33) は奇数で、下記のロード/参照が
+//   *(int*)&sA[tid][c] / *(const int*)&sA[..][c0] / *(int*)&sB[r][c]
+// と 4 バイトのポインタキャストをしているため、行 r が進むごとに実アドレスが
+// 33 の倍数だけずれて未アラインになり、`Invalid __shared__ write` →
+// sticky な CUDA error 716 (恒久 CPU フォールバック) を起こした。
+// 32 のまま (パディング無し) でもアラインはするが、隣接 thread が 8 行差
+// (8*32B = 256B = 64 words、64 mod 32 = 0) で全行が同一 bank に衝突する。
+// 36B (= 9 words) なら 8 行差 = 288B = 72 words、72 mod 32 = 8 で bank が
+// 8 個ずつずれて 8 行の並列読み出しで衝突しない。したがって
+// **4 の倍数かつ 32 の倍数でない** 値として GEMM_TK + 4 を採る。
 #define GEMM_TILE 128
 #define GEMM_TILE_N 256
 #define GEMM_TK 32
-#define GEMM_SP (GEMM_TK + 1)
+// s75: block 形状と 1 thread の出力タイル。block = (GEMM_BX, GEMM_BY) =
+// (16,16) = 256 thread。1 thread 8 行 x 16 列なので
+//   GEMM_BY * 8  = 128 = GEMM_TILE   (i 方向を過不足なく覆う)
+//   GEMM_BX * 16 = 256 = GEMM_TILE_N (j 方向を過不足なく覆う)
+// s74 は block を (16,4) = 64 thread に落としたが、これは 4*8 = 32 行しか
+// 覆わず GEMM_TILE (128) と食い違っていた (gridDim.x = m.div_ceil(128) で
+// 1 ブロック 128 行を進めるため、タイル内 32..127 行が誰にも書かれない)。
+#define GEMM_BX 16
+#define GEMM_BY 16
+#define GEMM_SP (GEMM_TK + 4)
+// 共有配列への i32 アクセスはすべて 4 バイト境界を前提にする (ホスト側の
+// `*(int*)&sA[..]` と等価な PTX を保つ)。
+static_assert(GEMM_SP % 4 == 0, "shared stride must be 4-byte aligned");
+static_assert(GEMM_TK % 4 == 0, "k tile must be a multiple of 4 (dp4a pack)");
+// bank conflict 回避の根拠 (8 行差が 32 words の倍数にならないこと) も固定する。
+static_assert((8 * GEMM_SP / 4) % 32 != 0, "8-row stride must not alias one bank");
+// s75: block 形状とタイル寸法の整合 (上記の行カバレッジ不具合の再発防止)。
+static_assert(GEMM_BX * 16 == GEMM_TILE_N, "block.x * per-thread cols != j tile");
+static_assert(GEMM_BY * 8 == GEMM_TILE, "block.y * per-thread rows != i tile");
+static_assert(GEMM_BX * GEMM_BY <= 1024, "block too large");
 extern "C" __global__ void dno_gemm_i8(
     const signed char* __restrict__ aq,   // [m,k]
     const float* __restrict__ ascale,     // [m]
@@ -152,9 +182,9 @@ extern "C" __global__ void dno_gemm_i8(
     float* __restrict__ out,              // [m,n] row-major
     int m, int k, int n)
 {
-    const int tx = threadIdx.x; // 0..15 → j 方向 16 列ずつ
-    const int ty = threadIdx.y; // 0..3  → i 方向 8 行ずつ
-    const int tid = ty * 16 + tx;
+    const int tx = threadIdx.x; // 0..15 → j 方向 16 列ずつ (16*16 = 256 = GEMM_TILE_N)
+    const int ty = threadIdx.y; // 0..15 → i 方向 8 行ずつ (16*8  = 128 = GEMM_TILE)
+    const int tid = ty * GEMM_BX + tx;
     const int i0 = blockIdx.x * GEMM_TILE;
     const int j0 = blockIdx.y * GEMM_TILE_N;
 
@@ -173,10 +203,12 @@ extern "C" __global__ void dno_gemm_i8(
     __shared__ signed char sB[GEMM_TILE_N][GEMM_SP];
 
     for (int kb = 0; kb < k; kb += GEMM_TK) {
-        // A (128x32 = 4096B) と B (256x32 = 8192B) を 64 thread で協調ロード。
-        // 1 thread あたり A 64 + B 128 バイト = u32 のベクトルロード 16+32 回。
-        // 端 (gi>=m / gk>=k) は 0 埋め (= 積に寄与しない)。
-        {
+        // A (128x32 = 4608B) と B (256x32 = 9216B) を 256 thread で協調ロード。
+        // A は tid < GEMM_TILE (128) の thread が 1 行ずつ、B は全 thread が
+        // 1 行ずつ (256 行 / 256 thread)。端 (gi>=m / gk>=k) は 0 埋め
+        // (= 積に寄与しない)。行ストライド GEMM_SP は 4 の倍数なので u32 の
+        // 境界アクセスは常にアラインされる (static_assert で強制)。
+        if (tid < GEMM_TILE) {
             const int gi = i0 + tid;
             if (gi < m) {
                 const signed char* src = aq + (size_t)gi * (size_t)k + kb;
@@ -200,9 +232,8 @@ extern "C" __global__ void dno_gemm_i8(
                 for (int x = 0; x < 8; x++) *(int*)&sA[tid][x * 4] = 0;
             }
         }
-        #pragma unroll
-        for (int half = 0; half < 2; half++) {
-            const int r = half * GEMM_TILE + tid;
+        {
+            const int r = tid;                        // 0..255
             const int gj = j0 + r;
             if (gj < n) {
                 const signed char* src = w + (size_t)gj * (size_t)k + kb;
