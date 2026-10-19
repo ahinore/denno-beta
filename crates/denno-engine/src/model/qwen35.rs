@@ -1089,12 +1089,36 @@ impl Qwen35 {
         let kv_dim = kv_heads * dh;
         let ff = self.ff;
 
+        // s63: 層をまたいで再利用する作業バッファ (prefill 経路のみ)。
+        // 旧実装は層ごとに `apply_bt_rows` が m*n*4B の Vec を**新規確保**して
+        // 返していた (ff の gate/up は n=5692 で 279MB、qkv/down/o_proj は 93MB)。
+        // prefill 1 回あたり線形層 200 呼び出し・確保と初回タッチのページフォルト
+        // だけで 46.2s のうち 21.8s を消費していた (s63 実測・実効 1.48 GB/s)。
+        // 形状は層種別で固定なので最大長で 1 回だけ確保して使い回す。
+        // 各バッファは使用前に全要素が書き込まれる (ゼロ初期化の値には依存しない)。
+        let mut buf_h = vec![0.0f32; n * e];
+        let mut buf_h2 = vec![0.0f32; n * e];
+        let mut buf_out = vec![0.0f32; n * e];
+        let mut buf_down = vec![0.0f32; n * e];
+        let mut buf_gate = vec![0.0f32; n * ff];
+        let mut buf_up = vec![0.0f32; n * ff];
+        let mut buf_hh = vec![0.0f32; n * ff];
+        let mut buf_qkv: Vec<f32> = Vec::new();
+        let mut buf_z: Vec<f32> = Vec::new();
+        let mut buf_beta: Vec<f32> = Vec::new();
+        let mut buf_alpha: Vec<f32> = Vec::new();
+        let mut buf_qg: Vec<f32> = Vec::new();
+        let mut buf_k: Vec<f32> = Vec::new();
+        let mut buf_v: Vec<f32> = Vec::new();
+        let mut buf_q: Vec<f32> = Vec::new();
+        let mut buf_att: Vec<f32> = Vec::new();
+
         for (li, layer) in self.layers.iter().enumerate() {
             // --- attention: rmsnorm を行単位で一括計算 (s42: 行独立 → 行並列。
             // 各要素の演算列は不変のため bit-exact・スレッド数非依存) ---
-            let mut h = vec![0.0f32; n * e];
             crate::prof::time_n(crate::prof::RMSNORM, n, || {
-                h.par_chunks_exact_mut(e)
+                buf_h
+                    .par_chunks_exact_mut(e)
                     .zip(x.par_chunks_exact(e))
                     .for_each(|(h_row, x_row)| {
                         let r = rmsnorm(x_row, layer.attn_ln1(), e, self.eps);
@@ -1111,20 +1135,26 @@ impl Qwen35 {
                     // バッチ幅 n を計測に載せる (`time_full` は集計のみで演算列に
                     // 触れない)。実行先ラベルは区間内の GPU 線形呼び出しの実測で
                     // 決まる (cuda 統計) ため、ここでは主張しない。
-                    let (kqkv, _) = g.qkv_w.dims();
+                    let (kqkv, nqkv) = g.qkv_w.dims();
                     debug_assert_eq!(kqkv, e);
-                    let qkv = crate::prof::time_n_ev(crate::prof::QKV, n, || {
-                        g.qkv_w.apply_bt_rows(&h, n)
+                    fit_prefill_buf(&mut buf_qkv, n * nqkv);
+                    fit_prefill_buf(&mut buf_z, n * g.gate_w.dims().1);
+                    fit_prefill_buf(&mut buf_beta, n * g.beta_w.dims().1);
+                    fit_prefill_buf(&mut buf_alpha, n * g.alpha_w.dims().1);
+                    crate::prof::time_n_ev(crate::prof::QKV, n, || {
+                        g.qkv_w.apply_bt_rows_into(&buf_h, n, &mut buf_qkv)
                     });
-                    let z = crate::prof::time_n_ev(crate::prof::QKV, n, || g.gate_w.apply_bt_rows(&h, n));
+                    crate::prof::time_n_ev(crate::prof::QKV, n, || {
+                        g.gate_w.apply_bt_rows_into(&buf_h, n, &mut buf_z)
+                    });
                     // s61c (T5b 計測のみ): beta/alpha は「投影」、下のスキャンは「スキャン」
                     // に分けて計上する。attn_gdn の合計は両者の和で従来と同値
                     // (add_sample が ATT_GDN へ合算する)。数値経路・分岐は不変。
-                    let beta_raw = crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                        g.beta_w.apply_bt_rows(&h, n)
+                    crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
+                        g.beta_w.apply_bt_rows_into(&buf_h, n, &mut buf_beta)
                     });
-                    let alpha = crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                        g.alpha_w.apply_bt_rows(&h, n)
+                    crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
+                        g.alpha_w.apply_bt_rows_into(&buf_h, n, &mut buf_alpha)
                     });
                     // スキャン: GPU カーネル 1 発 (P19-A1・cuda 有効時)。GDN は
                     // bit 一致不要のため GPU/CPU で数値は僅かに異なる (決定論は維持)。
@@ -1142,10 +1172,10 @@ impl Qwen35 {
                                     .gdn_state_mut(li)
                                     .expect("GDN state slot が未初期化");
                                 match crate::cuda::gdn_scan_batch(
-                                    &qkv,
-                                    &z,
-                                    &beta_raw,
-                                    &alpha,
+                                    &buf_qkv,
+                                    &buf_z,
+                                    &buf_beta,
+                                    &buf_alpha,
                                     conv,
                                     ssm,
                                     &g.conv1d,
@@ -1163,13 +1193,18 @@ impl Qwen35 {
                                 ) {
                                     Some(y) => (y, true),
                                     None => (
-                                        self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy),
+                                        self.gdn_scan_rows(
+                                            g, &buf_qkv, &buf_z, &buf_beta, &buf_alpha, cache, li, n,
+                                            dy,
+                                        ),
                                         false,
                                     ),
                                 }
                             } else {
                                 (
-                                    self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy),
+                                    self.gdn_scan_rows(
+                                        g, &buf_qkv, &buf_z, &buf_beta, &buf_alpha, cache, li, n, dy,
+                                    ),
                                     false,
                                 )
                             }
@@ -1178,23 +1213,25 @@ impl Qwen35 {
                     let (ys, scan_on_gpu): (Vec<f32>, bool) =
                         crate::prof::time_layer_n_ev(crate::prof::ATT_GDN_SCAN, li, n, || {
                             (
-                                self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy),
+                                self.gdn_scan_rows(
+                                    g, &buf_qkv, &buf_z, &buf_beta, &buf_alpha, cache, li, n, dy,
+                                ),
                                 false,
                             )
                         });
                     let _ = scan_on_gpu;
-                    let out = crate::prof::time_n_ev(crate::prof::OPROJ, n, || {
-                        g.out_w.apply_bt_rows(&ys, n)
+                    crate::prof::time_n_ev(crate::prof::OPROJ, n, || {
+                        g.out_w.apply_bt_rows_into(&ys, n, &mut buf_out)
                     });
                     if crate::gdn::gdn_dbg_enabled_for(li as i64) {
                         // 恒久診断 (env ゲート・未指定時 no-op): 出力投影後 (llama.cpp linear_attn_out 相当)
                         for i in 0..n {
-                            crate::gdn::gdn_dbg_pub("attnout", &out[i * e..(i + 1) * e]);
+                            crate::gdn::gdn_dbg_pub("attnout", &buf_out[i * e..(i + 1) * e]);
                         }
                     }
                     // s42: 残差加算は行独立 → 行並列 (bit-exact)
                     x.par_chunks_exact_mut(e)
-                        .zip(out.par_chunks_exact(e))
+                        .zip(buf_out.par_chunks_exact(e))
                         .for_each(|(x_row, out_row)| {
                             for (xi, ai) in x_row.iter_mut().zip(out_row.iter()) {
                                 *xi += ai;
@@ -1202,14 +1239,21 @@ impl Qwen35 {
                         });
                 }
                 AttnKind::Full(fl) => {
-                    let (qg, k, v) = crate::prof::time_n_ev(crate::prof::QKV, n, || {
-                        (
-                            fl.q_w.apply_bt_rows(&h, n), // [n, heads*2*dh]
-                            fl.k_w.apply_bt_rows(&h, n), // [n, kv_dim]
-                            fl.v_w.apply_bt_rows(&h, n), // [n, kv_dim]
-                        )
+                    fit_prefill_buf(&mut buf_qg, n * fl.q_w.dims().1); // [n, heads*2*dh]
+                    fit_prefill_buf(&mut buf_k, n * fl.k_w.dims().1); // [n, kv_dim]
+                    fit_prefill_buf(&mut buf_v, n * fl.v_w.dims().1); // [n, kv_dim]
+                    crate::prof::time_n_ev(crate::prof::QKV, n, || {
+                        fl.q_w.apply_bt_rows_into(&buf_h, n, &mut buf_qg); // [n, heads*2*dh]
+                        fl.k_w.apply_bt_rows_into(&buf_h, n, &mut buf_k); // [n, kv_dim]
+                        fl.v_w.apply_bt_rows_into(&buf_h, n, &mut buf_v); // [n, kv_dim]
                     });
-                    let mut att = vec![0.0f32; n * heads * dh];
+                    fit_prefill_buf(&mut buf_att, n * heads * dh);
+                    // s63: `full_attn_attend_head` は att_head に **加算** する
+                    // (`*a += pv * b`・k 昇順の逐次累積が bit 一致の根拠) ため、
+                    // 層をまたいで領域を再利用するときは毎層ゼロで初期化する。
+                    // 旧実装は層ごとに vec![0.0] を確保していたのと同じ状態になる。
+                    // 並列 fill なので数値・順序には影響しない。
+                    buf_att.par_chunks_exact_mut(dh).for_each(|c| c.fill(0.0));
                     // s42 (Plan B): prepare (KV 書き込み + QK-Norm + RoPE) をトークン順
                     // に逐次実行 (トークン逐次経路と同一の演算列・decode 経路の
                     // full_attn_core と共用)。attend は読み取り専用のため全トークンの
@@ -1217,14 +1261,14 @@ impl Qwen35 {
                     // (s50: prof は QKNORM / ROPE バケットに分割計上 — 演算列は
                     // full_attn_prepare 1 回呼び出しと同一 (順序不変) = bit-exact。
                     // KV 書き込みは llama prefill と同様に個別計上しない)
-                    let mut q = vec![0.0f32; n * heads * dh];
+                    fit_prefill_buf(&mut buf_q, n * heads * dh);
                     for i in 0..n {
-                        let q_r = &mut q[i * heads * dh..(i + 1) * heads * dh];
+                        let q_r = &mut buf_q[i * heads * dh..(i + 1) * heads * dh];
                         let mut kn = crate::prof::time_layer(crate::prof::QKNORM, li, || {
                             self.full_attn_qknorm(
                                 fl,
-                                &qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
-                                &k[i * kv_dim..(i + 1) * kv_dim],
+                                &buf_qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
+                                &buf_k[i * kv_dim..(i + 1) * kv_dim],
                                 q_r,
                             )
                         });
@@ -1234,7 +1278,7 @@ impl Qwen35 {
                         let (kc, vc) = cache.kv_bufs(li, 1);
                         kc[(pos0 + i) * kv_dim..][..kv_dim].copy_from_slice(&kn);
                         vc[(pos0 + i) * kv_dim..][..kv_dim]
-                            .copy_from_slice(&v[i * kv_dim..(i + 1) * kv_dim]);
+                            .copy_from_slice(&buf_v[i * kv_dim..(i + 1) * kv_dim]);
                     }
                     // s48 (C1): cuda ビルドでは attend を GPU バッチ (dno_attention_prefill
                     // 1 発 + D2H 後のホスト sigmoid ゲート) に置き換えて試行する。
@@ -1249,7 +1293,7 @@ impl Qwen35 {
                     crate::prof::time_layer_n_ev(crate::prof::ATT_FULL, li, n, || {
                         #[cfg(feature = "cuda")]
                         let att_done =
-                            self.full_attn_attend_gpu(&qg, &q, cache, li, pos0, n, &mut att);
+                            self.full_attn_attend_gpu(&buf_qg, &buf_q, cache, li, pos0, n, &mut buf_att);
                         #[cfg(not(feature = "cuda"))]
                         let att_done = false;
                         if !att_done {
@@ -1261,14 +1305,15 @@ impl Qwen35 {
                             // タスクローカル (共有スクラッチなし・書き込み先は各タスク専属の
                             // att チャンクのみ)。
                             let (kcr, vcr) = cache.kv_bufs_ref(li);
-                            att.par_chunks_exact_mut(dh)
+                            buf_att
+                                .par_chunks_exact_mut(dh)
                                 .enumerate()
                                 .for_each(|(t, att_head)| {
                                     let i = t / heads;
                                     let hh = t % heads;
                                     self.full_attn_attend_head(
-                                        &qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
-                                        &q[i * heads * dh..(i + 1) * heads * dh],
+                                        &buf_qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
+                                        &buf_q[i * heads * dh..(i + 1) * heads * dh],
                                         kcr,
                                         vcr,
                                         pos0 + i + 1,
@@ -1279,12 +1324,12 @@ impl Qwen35 {
                         }
                         (att_done, att_done)
                     });
-                    let out = crate::prof::time_n_ev(crate::prof::OPROJ, n, || {
-                        fl.o_w.apply_bt_rows(&att, n)
+                    crate::prof::time_n_ev(crate::prof::OPROJ, n, || {
+                        fl.o_w.apply_bt_rows_into(&buf_att, n, &mut buf_out)
                     });
                     // s42: 残差加算は行独立 → 行並列 (bit-exact)
                     x.par_chunks_exact_mut(e)
-                        .zip(out.par_chunks_exact(e))
+                        .zip(buf_out.par_chunks_exact(e))
                         .for_each(|(x_row, out_row)| {
                             for (xi, ai) in x_row.iter_mut().zip(out_row.iter()) {
                                 *xi += ai;
@@ -1296,24 +1341,25 @@ impl Qwen35 {
             // --- FFN: SwiGLU をバッチ一括 ---
             // s57 (T4): prefill 内の全 op に 1 call あたりのバッチ幅 (n) を載せる
             // (decode 側は chain の 1 行 = 1）。集計のみで演算列は不変。
-            let mut h2 = vec![0.0f32; n * e];
             // s42: rmsnorm は行独立 → 行並列 (bit-exact)
             crate::prof::time_n(crate::prof::RMSNORM, n, || {
-                h2.par_chunks_exact_mut(e)
+                buf_h2
+                    .par_chunks_exact_mut(e)
                     .zip(x.par_chunks_exact(e))
                     .for_each(|(h2_row, x_row)| {
                         let r = rmsnorm(x_row, &layer.ln2_w, e, self.eps);
                         h2_row.copy_from_slice(&r);
                     });
             });
-            let (gate, up) = crate::prof::time_n_ev(crate::prof::GATE_UP, n, || {
-                (layer.gate_w.apply_bt_rows(&h2, n), layer.up_w.apply_bt_rows(&h2, n))
+            crate::prof::time_n_ev(crate::prof::GATE_UP, n, || {
+                layer.gate_w.apply_bt_rows_into(&buf_h2, n, &mut buf_gate);
+                layer.up_w.apply_bt_rows_into(&buf_h2, n, &mut buf_up);
             });
-            let mut hh = vec![0.0f32; n * ff];
             // s42: SwiGLU は行独立 → 行並列 (bit-exact)
             crate::prof::time_n(crate::prof::SWIGLU, n, || {
-                hh.par_chunks_exact_mut(ff)
-                    .zip(gate.par_chunks_exact(ff).zip(up.par_chunks_exact(ff)))
+                buf_hh
+                    .par_chunks_exact_mut(ff)
+                    .zip(buf_gate.par_chunks_exact(ff).zip(buf_up.par_chunks_exact(ff)))
                     .for_each(|(hh_row, (gate_row, up_row))| {
                         for ((gv, uv), hhv) in gate_row
                             .iter()
@@ -1324,12 +1370,12 @@ impl Qwen35 {
                         }
                     });
             });
-            let down = crate::prof::time_n_ev(crate::prof::DOWN, n, || {
-                layer.down_w.apply_bt_rows(&hh, n)
+            crate::prof::time_n_ev(crate::prof::DOWN, n, || {
+                layer.down_w.apply_bt_rows_into(&buf_hh, n, &mut buf_down)
             });
             // s42: 残差加算は行独立 → 行並列 (bit-exact)
             x.par_chunks_exact_mut(e)
-                .zip(down.par_chunks_exact(e))
+                .zip(buf_down.par_chunks_exact(e))
                 .for_each(|(x_row, down_row)| {
                     for (xi, di) in x_row.iter_mut().zip(down_row.iter()) {
                         *xi += di;
@@ -1349,6 +1395,16 @@ impl Qwen35 {
         lchk_argmax("final logits", &logits); // 恒久診断 (env ゲート・未指定時 no-op)
         cache.advance(n);
         Ok(logits)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// s63: prefill の作業バッファを必要長に合わせる。長さが一致していれば再確保も
+// ゼロ埋めもしない (形状はモデルで固定なので層をまたいで同じ長さになる)。
+fn fit_prefill_buf(v: &mut Vec<f32>, len: usize) {
+    if v.len() != len {
+        v.clear();
+        v.resize(len, 0.0);
     }
 }
 

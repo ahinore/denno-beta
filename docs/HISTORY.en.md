@@ -1364,6 +1364,62 @@ raw logits → ① repetition_penalty → ② frequency_penalty → ③ presence
 - **Test count**: 300 → 301 passed / 0 failed / 18 ignored (`cargo test --workspace`)
 - **Lesson**: an iterator that silently yields **nothing** is the most expensive kind of boundary bug — always cover the region *below* the block size, not just fractional multiples above it. Also: `apply_bt_rows` sounding like "the batched GPU path" does not mean it is one; the dtype decides
 
+### The prefill bottleneck was not the GPU — it was the result copy (`to_vec` removal + per-layer buffer reuse) ✅ (2026-10-19, s63)
+
+> The request was "profile the whole program → visualise → pin down the bottleneck". T5a/T5b had been tuning the GPU side (kernels, paths, parallelism), but **measurement showed only 5.9 s (12.7%) of the 46.2 s prefill was actual GPU work**. The single largest item was the return-value copy in `linear_gemm` (`to_vec`) at 21.8 s (47%). Removing it cost no numerics and bought **−17 s**.
+
+**How it was measured** (the container has no ptrace, so neither `perf` nor `gdb` works; four independent sources were cross-checked):
+
+- `DENNO_PROFILE=1` bucket totals (printed by `scheduler.rs` when a request completes)
+- a **temporary instrumentation patch** inside `linear_gemm` / `maybe_gpu_linear` splitting prep / H2D / quant / gemm / D2H / result copy, timing **all 400 calls individually** over one 5,686-token prefill plus decode and aggregating by `n` (reverted with `git checkout --` afterwards)
+- `nvidia-smi` sampling at 0.5 s (SM utilisation 11.6%)
+- `/proc/<pid>/stat` utime+stime (process CPU 88.3 s vs 45.5 s wall = **1.94 cores**)
+
+**Measured breakdown** (one 5,686-token cache-miss prefill, warm):
+
+| Segment | Total | Per call | Note |
+|---|---|---|---|
+| Result copy `to_vec()` | **21.8 s** | 188 ms (n=12288) | **fresh Vec of 279 MB** + copy, 1.48 GB/s effective, 68k page faults/call |
+| Real GPU work (GEMM + D2H + sync) | 5.9 s | 39 ms | 78.5 TFLOP at 13.4 TFLOP/s |
+| Input copy (into existing pinned) | 1.7 s | 6.8 ms | **13.7 GB/s** — the same code reaches 1.48 GB/s at 279 MB, so the cost is allocation + first touch |
+| H2D / quantise / launches | 0.018 s | — | 400 calls combined; launch overhead is innocent |
+
+**Root cause**: the tail of `cuda.rs::linear_gemm`, `Ok(ho.as_slice::<f32>()[..m * n].to_vec())`. Every call **allocated a brand-new Vec** from the pinned `ho`. During prefill m×n reaches 5,692×12,288 (279 MB), so allocation + page faults alone cost 168 ms per call — and because the shapes are fixed per model, the same-size region was thrown away and re-created on every layer.
+
+**Fix (thread `_into` through three layers and hoist the prefill scratch buffers out of the layer loop)**:
+
+- `tensor.rs` (T5c): `matvec_rows_bt_into` / `matvec_bt_into` / `matvec_bt_i8_into` / `matvec_rows_bt_i8_into` / `matmul_bt_i8_into` — the old API becomes a thin "allocate + `_into`" wrapper. The SIMD bodies write straight into `out`; loop structure, accumulation order and lane layout are untouched (**bit-identical**)
+- `cuda.rs`: `linear_gemm_into` (copies `dst` after the D2H) and `maybe_gpu_linear_into` (returns `bool`; dispatch, weight cache and `GPU_BROKEN` latch rules identical to the old function). `maybe_gpu_linear` is now allocate + `_into`
+- `quant.rs`: `Linear::apply_bt_rows_into` (GPU first, then CPU — both write into the caller's region)
+- `qwen35.rs` prefill: the 16 buffers (`h`, `h2`, `qkv`, `z`, `beta`, `alpha`, `out`, `qg`, `k`, `v`, `q`, `att`, `gate`, `up`, `hh`, `down`) are allocated **once outside the layer loop** (`fit_prefill_buf` is a no-op when the length already matches)
+
+**Trap hit along the way (important)**: `full_attn_attend_head` **accumulates** into its output (`*a += pv * b`; the ascending-k sequential accumulation is what makes it bit-exact). The old code created a fresh `vec![0.0]` per layer, so it was implicitly zeroed; reusing the region leaves the previous layer's values behind. `qwen38_27b_shape_prefill_batch_bit_exact` failed, and **reverting buffers one at a time (six builds)** isolated `att`. The fix is an explicit parallel fill (`par_chunks_exact_mut(dh).for_each(|c| c.fill(0.0))`), reproducing exactly the state the old allocation produced (no effect on numerics or order). **Anywhere the code implicitly relies on "a new Vec is zero", switching to reuse will break it.**
+
+**Result** (5,686-token cache-miss prefill, warm):
+
+- prefill **46.2 s → 28.1 s (−38%)**, **123 → 202 tok/s**
+- decode 300 tokens: 10.05 s (33.6 ms/token) — **unchanged**, as expected (decode never goes through `_into`)
+- result copy 21.8 s → ~2.5 s (plain memcpy only)
+- `cargo test --workspace`: all green (0 failures). GPU anchors (default/brief 1b, 2b, full 1b) unchanged
+
+**Breakdown after the fix** (`DENNO_PROFILE`, one prefill request):
+
+| Item | ms | share |
+|---|---|---|
+| d2h_state | 10,604 | 28.0% |
+| gate_up_proj | 7,227 | 19.1% |
+| gdn_proj (β/α) | 5,438 | 14.4% |
+| qkv_proj | 4,064 | 10.7% |
+| gdn_scan | 3,159 | 8.3% |
+| down_proj | 2,713 | 7.2% |
+| o_proj | 1,482 | 3.9% |
+| swiglu | 847 | 2.2% |
+| rmsnorm / qk_norm / rope | 410 / 340 / 245 | 2.6% |
+
+(Buckets are counted in both parent and child, so 37.9 s > 33.6 s wall; `d2h_state` overlaps `attn_core`.)
+
+**Next**: the largest item is now **`d2h_state` at 10.6 s (168 calls — the GDN state is downloaded per layer during prefill)**. That is exactly T5b's main lever, L1 (`GdnDev` residency). After that: `gdn_proj` 5.4 s (the n=32 F32 projections) and `gate_up_proj` 7.2 s (75 ms of GPU work plus the copy).
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)

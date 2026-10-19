@@ -1506,52 +1506,79 @@ pub fn maybe_gpu_linear(
     n: usize,
     m: usize,
 ) -> Option<Vec<f32>> {
-    // s57 (T4): 実行先ラベルの初期値 — この呼び出しが None で抜けたとき
+    // s63: 確保 + 書き込みの薄いラッパ (decode など呼び出し側が再利用率の低い
+    // 用途向け)。prefill のホットパスは `maybe_gpu_linear_into` を使う。
+    let mut out = vec![0.0f32; m * n];
+    if maybe_gpu_linear_into(uid, a, qw, scale, k, n, m, &mut out) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// s63: `maybe_gpu_linear` の書き込み先指定版。
+/// true = GPU が計算して `out` を埋めた / false = 呼び出し側が CPU パスを使うこと。
+/// 判定・重みキャッシュ・フォールバック (恒久ラッチ) の規約は `maybe_gpu_linear`
+/// と完全に同一で、数値経路も同一 (D2H 後に `ho` から `out` へコピーするだけ)。
+pub fn maybe_gpu_linear_into(
+    uid: u64,
+    a: &[f32],
+    qw: &[i8],
+    scale: &[f32],
+    k: usize,
+    n: usize,
+    m: usize,
+    out: &mut [f32],
+) -> bool {
+    debug_assert_eq!(out.len(), m * n);
+    // s57 (T4): 実行先ラベルの初期値 — この呼び出しが false で抜けたとき
     // 直前の true が残らないよう毎回 false から始める (計測のみ)
     set_last_linear_ran_on_gpu(false);
     // s61: 入口到達の記録 (回帰テスト用・Relaxed 加算のみ)
     LINEAR_SEAM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !cuda_enabled() {
-        return None;
+        return false;
     }
     let use_gemm = m > max_m() && m >= gemm_min_m() && gemm_enabled();
     // m が GEMV 経路の上限を超えて GEMM も発動しないなら CPU へ
     if m > max_m() && !use_gemm {
-        return None;
+        return false;
     }
-    let ctx = shared_ctx()?;
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
     if let Err(e) = ctx.make_current() {
         tracing::error!("CUDA cuCtxSetCurrent failed, using CPU int8: {e:#}");
         GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
-        return None;
+        return false;
     }
     let gw = match weights_for(uid, qw, scale, k, n) {
         Ok(g) => g,
         Err(e) => {
             tracing::error!("CUDA weight upload failed, using CPU int8: {e:#}");
             GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
-            return None;
+            return false;
         }
     };
     // P17i: m が大きい (prefill) ときは tiled GEMM、小さい (decode/batch) ときは
     // GEMV 型カーネル (固定オーバーヘッドが小さい) を使い分ける。どちらも CPU と
     // ビット一致。
     let r = if use_gemm {
-        linear_gemm(ctx, a, gw, m, k, n)
+        linear_gemm_into(ctx, a, gw, m, k, n, out)
     } else {
-        linear_pinned(ctx, a, gw, m, k, n)
+        linear_pinned(ctx, a, gw, m, k, n).map(|v| out.copy_from_slice(&v))
     };
     match r {
-        Ok(out) => {
+        Ok(()) => {
             // s57 (T4): 実行先ラベルの記録 (計測のみ・戻り値/演算には無関係)
             set_last_linear_ran_on_gpu(true);
-            Some(out)
+            true
         }
         Err(e) => {
             // 実行時エラーは再試行せず恒久的に CPU へ (数値は同一仕様なので不変)
             tracing::error!("CUDA linear failed, falling back to CPU permanently: {e:#}");
             GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
-            None
+            false
         }
     }
 }
@@ -1645,7 +1672,30 @@ fn linear_gemm(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>> {
+    let mut out = vec![0.0f32; m * n];
+    linear_gemm_into(ctx, a, gw, m, k, n, &mut out)?;
+    Ok(out)
+}
+
+/// s63: `linear_gemm` の書き込み先指定版 (数値経路は完全に同一)。
+///
+/// 旧実装は pinned ホストバッファ `ho` から `to_vec()` で **呼び出し毎に
+/// m*n*4B の Vec を新規確保**して返していた。prefill では m*n が最大
+/// 12288*4096 = 201MB (gate/up は 279MB) に達し、確保 + 初回タッチの
+/// ページフォルトが 1 呼び出しあたり 168ms を消費していた (実測 21.8s /
+/// prefill 46.2s)。呼び出し側が層をまたいで再利用するバッファを渡す形に
+/// することで、確保そのものを無くす (D2H 先は従来どおり pinned `ho`)。
+fn linear_gemm_into(
+    ctx: &CudaCtx,
+    a: &[f32],
+    gw: &GpuW,
+    m: usize,
+    k: usize,
+    n: usize,
+    dst: &mut [f32],
+) -> Result<()> {
     debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(dst.len(), m * n);
     let lib = lib()?;
     ctx.make_current()?;
     SCRATCH.with(|cell| {
@@ -1707,7 +1757,10 @@ fn linear_gemm(
             )?;
         }
         ctx.sync()?;
-        Ok(ho.as_slice::<f32>()[..m * n].to_vec())
+        // 注意: SCRATCH の分解束縛が同名 `out` (デバイス出力) を作るため、
+        // 書き込み先は `dst` で受ける。
+        dst.copy_from_slice(&ho.as_slice::<f32>()[..m * n]);
+        Ok(())
     })
 }
 

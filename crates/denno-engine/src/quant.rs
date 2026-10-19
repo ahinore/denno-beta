@@ -162,9 +162,37 @@ impl Linear {
     /// - F32: matvec_rows_bt (P9 順序保存レーン並列・k 方向は逐次) — matmul_bt
     ///   (sgemm) は累積順が異なり一致しないため使わない
     pub fn apply_bt_rows(&self, a: &[f32], m: usize) -> Vec<f32> {
+        // s63: 実装を `apply_bt_rows_into` に一本化 (確保だけを行う薄いラッパ)。
+        let mut out = vec![0.0f32; m * self.dims().1];
+        self.apply_bt_rows_into(a, m, &mut out);
+        out
+    }
+
+    /// s63: `apply_bt_rows` の書き込み先指定版 (prefill ホットパス用)。
+    ///
+    /// 呼び出し側が層をまたいで再利用するバッファを渡す前提で、ここでは
+    /// 出力の確保を行わない (GPU 経路は D2H 後に直接コピー・CPU 経路は
+    /// 一時 Vec からコピー)。演算列・丸め・分岐条件は `apply_bt_rows` と
+    /// 完全に同一なので数値は不変。
+    pub fn apply_bt_rows_into(&self, a: &[f32], m: usize, out: &mut [f32]) {
+        debug_assert_eq!(out.len(), m * self.dims().1);
         match self {
-            Linear::F32 { w, k, n } => crate::tensor::matvec_rows_bt(a, w, *k, *n, m),
-            Linear::Q8(_) => self.apply_bt(a, m),
+            Linear::F32 { w, k, n } => {
+                crate::tensor::matvec_rows_bt_into(a, w, *k, *n, m, out);
+            }
+            Linear::Q8(q) => {
+                // GPU が計算できたら out は埋まっている (確保なし)
+                #[cfg(feature = "cuda")]
+                if crate::cuda::maybe_gpu_linear_into(q.uid, a, &q.w, &q.scale, q.k, q.n, m, out) {
+                    return;
+                }
+                // CPU 経路も呼び出し側の領域へ直接書く (T5c の *_into を利用)
+                if m == 1 {
+                    crate::tensor::matvec_bt_i8_into(a, &q.w, &q.scale, q.k, q.n, out);
+                } else {
+                    crate::tensor::matmul_bt_i8_into(a, &q.w, &q.scale, m, q.k, q.n, out);
+                }
+            }
         }
     }
 
