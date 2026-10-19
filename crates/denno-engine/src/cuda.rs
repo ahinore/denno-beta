@@ -2158,7 +2158,9 @@ pub const CH_LOGITS: usize = 8; // lm_head 出力 [m*vocab]
 // llama chain と異なり qkv 出力が head ごと [q|gate] 融合のため、attention へ渡す
 // q は別スロットに分離して書く (chain_q35_qknorm_rope)。
 pub const CH_Q35_Q: usize = 9;
-const CH_SLOTS: usize = 10;
+/// s70: prefill FFN チェーンの入力 (CH_H は attention/decode が使うため分ける)
+pub const CH_PFH: usize = 10;
+const CH_SLOTS: usize = 11;
 
 // P17j: prefill attention カーネルのタイル定数 (kernels_elem.cu の PF_BQ/PF_BK
 // と同期すること)。BQ=行タイル・BK=key タイル。
@@ -2429,29 +2431,22 @@ pub fn chain_download(slot: usize, len: usize) -> Option<Vec<f32>> {
     let bytes = len.checked_mul(4)?;
     ok(chain_ensure_buf(slot, bytes))?;
     CHAIN.with(|cell| -> Option<Vec<f32>> {
-        let buf = cell.borrow().bufs[slot].as_ref()?.ptr();
-        // s69: pinned `pin_dn` に落としてから `to_vec` すると同じ領域を 2 度
-        // 書くことになる (93MB で約 20ms)。出力 Vec の未初期化領域へ直接
-        // D2H し、全要素をコピーが埋めてから set_len する。
-        let mut out: Vec<f32> = Vec::with_capacity(len);
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure_pin(&mut s.pin_dn, bytes))?;
+        let buf = s.bufs[slot].as_ref().unwrap().ptr();
+        let pin = s.pin_dn.as_mut().unwrap();
         {
             let lib = ok(lib())?;
             unsafe {
                 ok(check(
-                    (lib.memcpy_dtoh_async)(
-                        out.as_mut_ptr() as *mut c_void,
-                        buf,
-                        bytes,
-                        std::ptr::null_mut(),
-                    ),
+                    (lib.memcpy_dtoh_async)(pin.ptr as *mut c_void, buf, bytes, std::ptr::null_mut()),
                     "cuMemcpyDtoHAsync (chain)",
                 ))?;
             }
         }
         crate::prof::mark_d2h_src(crate::prof::D2H_SRC_OTHER);
         ok(ctx.sync())?;
-        unsafe { out.set_len(len) };
-        Some(out)
+        Some(pin.as_slice::<f32>()[..len].to_vec())
     })
 }
 
@@ -2472,27 +2467,22 @@ pub fn chain_download_at(slot: usize, elem_off: usize, len: usize) -> Option<Vec
         return None;
     }
     CHAIN.with(|cell| -> Option<Vec<f32>> {
-        let buf = cell.borrow().bufs[slot].as_ref()?.ptr() + (elem_off * 4) as CUdeviceptr;
-        // s69: chain_download と同じ理由で出力 Vec へ直接 D2H する。
-        let mut out: Vec<f32> = Vec::with_capacity(len);
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure_pin(&mut s.pin_dn, bytes))?;
+        let buf = s.bufs[slot].as_ref().unwrap().ptr() + (elem_off * 4) as CUdeviceptr;
+        let pin = s.pin_dn.as_mut().unwrap();
         {
             let lib = ok(lib())?;
             unsafe {
                 ok(check(
-                    (lib.memcpy_dtoh_async)(
-                        out.as_mut_ptr() as *mut c_void,
-                        buf,
-                        bytes,
-                        std::ptr::null_mut(),
-                    ),
+                    (lib.memcpy_dtoh_async)(pin.ptr as *mut c_void, buf, bytes, std::ptr::null_mut()),
                     "cuMemcpyDtoHAsync (chain download at)",
                 ))?;
             }
         }
         crate::prof::mark_d2h_src(crate::prof::D2H_SRC_OTHER);
         ok(ctx.sync())?;
-        unsafe { out.set_len(len) };
-        Some(out)
+        Some(pin.as_slice::<f32>()[..len].to_vec())
     })
 }
 
@@ -2638,6 +2628,177 @@ pub fn chain_swiglu(ga_slot: usize, act_slot: usize, ff: usize, m: usize) -> Opt
         let grid = ((m * ff) as u32).div_ceil(256);
         ok(unsafe { ctx.launch_async(ctx.f_swiglu, (grid, 1, 1), (256, 1, 1), 0, &mut args) })
     })
+}
+
+/// s70: prefill 用の grouped int8 GEMM。`chain_linear_grouped` は decode 用に
+/// `m > max_m()` で諦めて GEMV カーネルを起動するが、prefill は m が大きく
+/// 128x128 タイルの GEMM を使う必要がある。数値は同じカーネル・同じ整数累積
+/// なので CPU 経路とビット一致。
+fn chain_gemm_grouped_pf(
+    parts: &[&crate::quant::Quant8Linear],
+    in_slot: usize,
+    out_slot: usize,
+    m: usize,
+) -> Option<()> {
+    let ctx = chain_ctx()?;
+    if parts.is_empty() || m == 0 {
+        return None;
+    }
+    let k = parts[0].k;
+    let n: usize = parts.iter().map(|p| p.n).sum();
+    let uids: Vec<u64> = parts.iter().map(|p| p.uid).collect();
+    let gw = ok(weights_for_group(&uids, parts, k, n))?;
+    ok(chain_ensure_buf(in_slot, m.checked_mul(k)?.checked_mul(4)?))?;
+    ok(chain_ensure_buf(out_slot, m.checked_mul(n)?.checked_mul(4)?))?;
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure(&mut s.aq, m * k))?;
+        let iptr = s.bufs[in_slot].as_ref().unwrap().ptr();
+        let optr = s.bufs[out_slot].as_ref().unwrap().ptr();
+        let aq = s.aq.as_ref().unwrap().ptr();
+        SCRATCH.with(|c2| -> Option<()> {
+            let mut s2 = c2.borrow_mut();
+            ok(Scratch::ensure(&mut s2.asc, m * 4))?;
+            let asc = s2.asc.as_ref().unwrap().ptr();
+            let (mut px, mut paq, mut pasc) = (iptr, aq, asc);
+            let (mut mc, mut kc) = (m as c_int, k as c_int);
+            let mut args = [
+                &mut px as *mut _ as *mut c_void,
+                &mut paq as *mut _ as *mut c_void,
+                &mut pasc as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+            ];
+            ok(unsafe { ctx.launch_async(ctx.f_quant, (m as u32, 1, 1), (256, 1, 1), 256 * 4, &mut args) })?;
+            let (mut paqi, mut pasci, mut pw, mut psc, mut po) =
+                (aq, asc, gw.w.ptr(), gw.sc.ptr(), optr);
+            let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, n as c_int);
+            let mut args = [
+                &mut paqi as *mut _ as *mut c_void,
+                &mut pasci as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut psc as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            let gmx = m.div_ceil(128) as u32;
+            let gmy = n.div_ceil(128) as u32;
+            ok(unsafe { ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args) })
+        })
+    })
+}
+
+/// s70: 行内 [gate|up] 連結レイアウト (width = 2*ff) の swiglu。m > 1 でも
+/// 使えるのは `dno_swiglu_int` 側 (`dno_swiglu` は gate/up がブロック分離の
+/// 前提なので m=1 専用)。演算列は CPU の `gv / (1+exp(-gv)) * uv` と同一。
+pub fn chain_swiglu_rows(ga_slot: usize, act_slot: usize, ff: usize, m: usize) -> Option<()> {
+    let ctx = chain_ctx()?;
+    if ff == 0 || m == 0 {
+        return None;
+    }
+    ok(chain_ensure_buf(act_slot, m.checked_mul(ff)?.checked_mul(4)?))?;
+    CHAIN.with(|cell| -> Option<()> {
+        let s = cell.borrow();
+        let gaptr = s.bufs[ga_slot].as_ref()?.ptr();
+        let optr = s.bufs[act_slot].as_ref()?.ptr();
+        let (mut pg, mut po) = (gaptr, optr);
+        let mut ffc = ff as c_int;
+        let mut width = (2 * ff) as c_int;
+        let mut tc = (m * ff) as i64;
+        let mut args = [
+            &mut pg as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut ffc as *mut _ as *mut c_void,
+            &mut width as *mut _ as *mut c_void,
+            &mut tc as *mut _ as *mut c_void,
+        ];
+        let grid = ((m * ff) as u64).div_ceil(256) as u32;
+        ok(unsafe { ctx.launch_async(ctx.f_swiglu_int, (grid, 1, 1), (256, 1, 1), 0, &mut args) })
+    })
+}
+
+/// s70: prefill の FFN (rmsnorm 済み x → gate/up → swiglu → down → ホスト) を
+/// デバイス常駐で通す。活性化の往復が
+///   旧: H2D 47MB + D2H 140MB + H2D 47MB + D2H 47MB
+///   新: H2D 47MB + D2H 47MB
+/// になる (m=2843, e=4096, ff=6144 の場合)。GEMM/swiglu は CPU 経路と
+/// ビット一致 (同一カーネル・同一整数累積・同一 f32 演算列)。
+pub fn chain_mlp_prefill(
+    gate_w: &crate::quant::Quant8Linear,
+    up_w: &crate::quant::Quant8Linear,
+    down_w: &crate::quant::Quant8Linear,
+    x: &[f32],
+    m: usize,
+    li: usize,
+    out: &mut [f32],
+) -> Option<()> {
+    if !cuda_enabled() || !gemm_enabled() || m < gemm_min_m() || GPU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let e = down_w.n;
+    let ff = gate_w.n;
+    if m == 0 || x.len() < m * e || out.len() < m * e {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+    let _ = li;
+    // 1) rmsnorm 済み x を H2D (pinned staging を挟まず直接)
+    ok(chain_ensure_buf(CH_PFH, m.checked_mul(e)?.checked_mul(4)?))?;
+    CHAIN.with(|cell| -> Option<()> {
+        let buf = cell.borrow().bufs[CH_PFH].as_ref()?.ptr();
+        let lib = lib().ok()?;
+        unsafe {
+            ok(check(
+                (lib.memcpy_htod_async)(
+                    buf,
+                    x.as_ptr() as *const c_void,
+                    m * e * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyHtoDAsync (mlp prefill)",
+            ))
+        }
+    })?;
+    // 2) gate/up → 3) swiglu  → 4) down (全て非同期・最後に 1 回だけ同期)
+    // 計測時のみ段ごとに同期して内訳を取る (同期は数値に影響しない)。
+    crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
+        chain_gemm_grouped_pf(&[gate_w, up_w], CH_PFH, CH_GA, m)?;
+        if crate::prof::enabled() {
+            ok(ctx.sync())?;
+        }
+        Some(())
+    })?;
+    crate::prof::time_layer(crate::prof::SWIGLU, li, || -> Option<()> {
+        chain_swiglu_rows(CH_GA, CH_ACT, ff, m)?;
+        if crate::prof::enabled() {
+            ok(ctx.sync())?;
+        }
+        Some(())
+    })?;
+    crate::prof::time_layer(crate::prof::DOWN, li, || -> Option<()> {
+        chain_gemm_grouped_pf(&[down_w], CH_ACT, CH_DOWN, m)
+    })?;
+    // 5) D2H は呼び出し元のバッファへ直接
+    CHAIN.with(|cell| -> Option<()> {
+        let buf = cell.borrow().bufs[CH_DOWN].as_ref()?.ptr();
+        let lib = lib().ok()?;
+        unsafe {
+            ok(check(
+                (lib.memcpy_dtoh_async)(
+                    out.as_mut_ptr() as *mut c_void,
+                    buf,
+                    m * e * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (mlp prefill)",
+            ))
+        }
+    })?;
+    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+    ok(ctx.sync())?;
+    Some(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3125,13 +3286,13 @@ pub fn maybe_gpu_oproj(o: &Quant8Linear, m: usize, k: usize, li: usize) -> Optio
     })?;
     let r = SCRATCH.with(|cell| -> Result<Vec<f32>> {
         let mut s = cell.borrow_mut();
-        let Scratch { aq, asc, out, .. } = &mut *s;
+        let Scratch { aq, asc, out, ho, .. } = &mut *s;
         Scratch::ensure(aq, m * k)?;
         Scratch::ensure(asc, m * 4)?;
         Scratch::ensure(out, m * e * 4)?;
+        Scratch::ensure_pin(ho, m * e * 4)?;
         let (daq, dasc, dout) = (aq.as_ref().unwrap(), asc.as_ref().unwrap(), out.as_ref().unwrap());
-        // s69: pinned `ho` + `to_vec` をやめ、出力 Vec へ直接 D2H する。
-        let mut res: Vec<f32> = Vec::with_capacity(m * e);
+        let ho = ho.as_mut().unwrap();
         unsafe {
             crate::prof::time_layer(crate::prof::OPROJ, li, || -> Result<()> {
                 // 1) att (CH_ATT) をデバイス上で量子化
@@ -3164,12 +3325,7 @@ pub fn maybe_gpu_oproj(o: &Quant8Linear, m: usize, k: usize, li: usize) -> Optio
                 ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args)?;
                 // 3) D2H + 同期 (attention カーネルは同一ストリームの先行発行なので完結済み)
                 check(
-                    (lib.memcpy_dtoh_async)(
-                        res.as_mut_ptr() as *mut c_void,
-                        dout.ptr(),
-                        m * e * 4,
-                        std::ptr::null_mut(),
-                    ),
+                    (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), m * e * 4, std::ptr::null_mut()),
                     "cuMemcpyDtoHAsync",
                 )?;
                 // s65: 発行元の件数分類 (表示専用・時間は d2h_state バケット側)
@@ -3178,8 +3334,7 @@ pub fn maybe_gpu_oproj(o: &Quant8Linear, m: usize, k: usize, li: usize) -> Optio
                 Ok(())
             })?;
         }
-        unsafe { res.set_len(m * e) };
-        Ok(res)
+        Ok(ho.as_slice::<f32>()[..m * e].to_vec())
     });
     match r {
         Ok(out) => Some(out),

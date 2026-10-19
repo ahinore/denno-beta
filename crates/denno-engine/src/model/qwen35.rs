@@ -1357,28 +1357,52 @@ impl Qwen35 {
                         h2_row.copy_from_slice(&r);
                     });
             });
-            crate::prof::time_n_ev(crate::prof::GATE_UP, n, || {
-                layer.gate_w.apply_bt_rows_into(&buf_h2, n, &mut buf_gate);
-                layer.up_w.apply_bt_rows_into(&buf_h2, n, &mut buf_up);
-            });
-            // s42: SwiGLU は行独立 → 行並列 (bit-exact)
-            crate::prof::time_n(crate::prof::SWIGLU, n, || {
-                buf_hh
-                    .par_chunks_exact_mut(ff)
-                    .zip(buf_gate.par_chunks_exact(ff).zip(buf_up.par_chunks_exact(ff)))
-                    .for_each(|(hh_row, (gate_row, up_row))| {
-                        for ((gv, uv), hhv) in gate_row
-                            .iter()
-                            .zip(up_row.iter())
-                            .zip(hh_row.iter_mut())
-                        {
-                            *hhv = gv / (1.0 + (-gv).exp()) * uv;
-                        }
-                    });
-            });
-            crate::prof::time_n_ev(crate::prof::DOWN, n, || {
-                layer.down_w.apply_bt_rows_into(&buf_hh, n, &mut buf_down)
-            });
+            // s70: FFN をデバイス常駐チェーンで通す (x → gate/up → swiglu →
+            // down → ホスト)。活性化の往復が
+            //   旧: H2D 47MB + D2H 140MB + H2D 47MB + D2H 47MB (m=2843 の 1 層)
+            //   新: H2D 47MB + D2H 47MB
+            // に減る。GEMM も swiglu も CPU 経路と同一の整数累積・同一 f32 演算列
+            // なので出力はビット一致 (アンカーで検証)。条件を満たさない/失敗時は
+            // 下の従来経路へそのまま落ちる。
+            #[cfg(feature = "cuda")]
+            let ffn_done = match (layer.gate_w.quant8(), layer.up_w.quant8(), layer.down_w.quant8())
+            {
+                (Some(g), Some(u), Some(d)) => crate::cuda::chain_mlp_prefill(
+                    g, u, d,
+                    &buf_h2,
+                    n,
+                    li,
+                    &mut buf_down,
+                )
+                .is_some(),
+                _ => false,
+            };
+            #[cfg(not(feature = "cuda"))]
+            let ffn_done = false;
+            if !ffn_done {
+                crate::prof::time_n_ev(crate::prof::GATE_UP, n, || {
+                    layer.gate_w.apply_bt_rows_into(&buf_h2, n, &mut buf_gate);
+                    layer.up_w.apply_bt_rows_into(&buf_h2, n, &mut buf_up);
+                });
+                // s42: SwiGLU は行独立 → 行並列 (bit-exact)
+                crate::prof::time_n(crate::prof::SWIGLU, n, || {
+                    buf_hh
+                        .par_chunks_exact_mut(ff)
+                        .zip(buf_gate.par_chunks_exact(ff).zip(buf_up.par_chunks_exact(ff)))
+                        .for_each(|(hh_row, (gate_row, up_row))| {
+                            for ((gv, uv), hhv) in gate_row
+                                .iter()
+                                .zip(up_row.iter())
+                                .zip(hh_row.iter_mut())
+                            {
+                                *hhv = gv / (1.0 + (-gv).exp()) * uv;
+                            }
+                        });
+                });
+                crate::prof::time_n_ev(crate::prof::DOWN, n, || {
+                    layer.down_w.apply_bt_rows_into(&buf_hh, n, &mut buf_down)
+                });
+            }
             // s42: 残差加算は行独立 → 行並列 (bit-exact)
             x.par_chunks_exact_mut(e)
                 .zip(buf_down.par_chunks_exact(e))
