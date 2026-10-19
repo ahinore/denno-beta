@@ -1320,23 +1320,33 @@ impl Qwen35 {
                     // full_attn_prepare 1 回呼び出しと同一 (順序不変) = bit-exact。
                     // KV 書き込みは llama prefill と同様に個別計上しない)
                     fit_prefill_buf(&mut buf_q, n * heads * dh);
-                    for i in 0..n {
-                        let q_r = &mut buf_q[i * heads * dh..(i + 1) * heads * dh];
-                        let mut kn = crate::prof::time_layer(crate::prof::QKNORM, li, || {
-                            self.full_attn_qknorm(
-                                fl,
-                                &buf_qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
-                                &buf_k[i * kv_dim..(i + 1) * kv_dim],
-                                q_r,
-                            )
-                        });
-                        crate::prof::time_layer(crate::prof::ROPE, li, || {
-                            self.full_attn_rope(q_r, &mut kn, pos0 + i)
-                        });
+                    // s73: prepare (QK-Norm → RoPE → KV 行書き込み) は**行ごとに独立**
+                    // (q の行・KV キャッシュの pos 行はどれも互いに素) なので行並列で
+                    // 実行する。1 行分の演算列はトークン逐次経路と完全に同一・書き込み先も
+                    // 行専属なので bit-exact (rayon スレッド数にも依存しない)。
+                    // prof は QKNORM バケットに一括計上する (内訳の合算と同値)。
+                    {
                         let (kc, vc) = cache.kv_bufs(li, 1);
-                        kc[(pos0 + i) * kv_dim..][..kv_dim].copy_from_slice(&kn);
-                        vc[(pos0 + i) * kv_dim..][..kv_dim]
-                            .copy_from_slice(&buf_v[i * kv_dim..(i + 1) * kv_dim]);
+                        let krows = &mut kc[pos0 * kv_dim..(pos0 + n) * kv_dim];
+                        let vrows = &mut vc[pos0 * kv_dim..(pos0 + n) * kv_dim];
+                        crate::prof::time_n_ev(crate::prof::QKNORM, n, || {
+                            buf_q
+                                .par_chunks_exact_mut(heads * dh)
+                                .zip(buf_qg.par_chunks_exact(heads * 2 * dh))
+                                .zip(buf_k.par_chunks_exact(kv_dim))
+                                .zip(buf_v.par_chunks_exact(kv_dim))
+                                .zip(krows.par_chunks_exact_mut(kv_dim))
+                                .zip(vrows.par_chunks_exact_mut(kv_dim))
+                                .enumerate()
+                                .for_each(
+                                    |(i, (((((q_r, qg_i), k_i), v_i), k_row), v_row))| {
+                                        let mut kn = self.full_attn_qknorm(fl, qg_i, k_i, q_r);
+                                        self.full_attn_rope(q_r, &mut kn, pos0 + i);
+                                        k_row.copy_from_slice(&kn);
+                                        v_row.copy_from_slice(v_i);
+                                    },
+                                );
+                        });
                     }
                     // s48 (C1): cuda ビルドでは attend を GPU バッチ (dno_attention_prefill
                     // 1 発 + D2H 後のホスト sigmoid ゲート) に置き換えて試行する。
