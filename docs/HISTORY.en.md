@@ -1810,6 +1810,63 @@ performed.
 **Next step (T7b-2, not started)**: apply the same argument to the attention side — fusing
 `qkv + z` (GDN) and `beta + alpha`. Both stay bit-exact under plain row concatenation.
 
+### Measuring rmsnorm — the "0.4 s" bucket was the whole block, and the norm itself cannot be seen from the host (2026-10-19, s84 / T8) ⛔ closed without optimization
+
+> T8's outcome is "do not optimize". The normalization's real cost does not reach the 0.25 s
+> decision line. The reason is not that the bucket was small, though: the bucket was pointing at
+> the **whole layer block**, and the instrument itself turned out to be defective.
+
+**What was added** (`66698f6`, non-numeric): `prof.rs` gains an `Ambient` scope (a thread-local
+parent bucket; inner samples are added to the parent **and** kept in their own bucket), row-level
+hooks `norm_rows(rows)` / `norm_rows_end()` (one `Instant` read per layer, not per token), and
+display-only `norm` / `norm_other` / `block` / `block_rest` rows. Default-off is a true no-op with
+zero clock reads. `qwen35.rs` wraps each layer's attention block and FFN block in prefill, plus the
+per-layer block and the final norm in the decode chain, and fires an event after each norm call.
+
+**Measured on the GPU** (`66698f6`, 8095, `DENNO_PROFILE=1`, 5,686 tokens in one request,
+PF wall 13.733 s / 414 tok/s):
+
+| row | ms | calls | share |
+|---|---|---|---|
+| `rmsnorm` (parent scope) | 11,761.8 | 1,633 | 43.3% |
+| └ `norm` (the normalization itself) | **0.0** | **0** | 0.0% |
+| └ `norm_other` (parent − direct children) | 10,521.6 | 128 | 38.7% |
+| └ `block_rest` | 1,240.2 | - | 4.6% |
+| `final_norm` | 0.0 | 2 | 0.0% |
+| `qk_norm` | 107.2 | 16 | 0.4% |
+
+Three things to read out of it:
+
+1. **The `rmsnorm` row is the layer block, not the norm.** The parent scope encloses the whole
+   attention block and FFN block, so the `attn_core` / `gate_up_proj` / `qkv_proj` / `down_proj` /
+   `o_proj` samples inside it are **double counted** in this row.
+2. **The `norm` counter never fired** (calls = 0). The int8 prefill path runs as a device-resident
+   chain, so the normalization never appears as a host-side call. "0.0 ms" therefore does not mean
+   "the norm is free" — it means "the host cannot see it".
+3. Double counting makes the table non-additive: `TOTAL 37,922.7 ms` > `[prefill] total
+   27,182.8 ms` > the measured wall of 13.733 s. The earlier "rmsnorm 0.4 s" figure came from the
+   same parent-scope slicing and was not the norm's cost either.
+
+**Why it is still closed without optimization** (a bound, not a measurement): the norm is an
+elementwise pass over one hidden-state row per layer — 5,866 tokens × 4,096 dims × 16 layers =
+1.54 GB, about 3.1 GB with the read and the write. At 1 TB/s that is ~3 ms; even at 100 GB/s it is
+~31 ms, i.e. 0.25 % or less of a 13.2 s prefill. **It misses the 0.25 s decision line by an order
+of magnitude**, so T8 step 2 (fusing the residual add, batching across tokens) is not done.
+
+**Lessons**:
+- Never wrap a whole block in an `Ambient` parent scope. Overlapping shares destroy the table's
+  additivity and hide which op is actually expensive. Use parents only for the breakdown of the
+  same work.
+- Show counters that never fired (calls = 0) in the table as they are. That is how the misnomer
+  was caught here.
+- Always compare the profile total against the measured wall. A total above the wall means the
+  accounting rule is wrong.
+
+**Verification**: `cargo test -p denno-engine --lib` = 232 passed / 1 ignored (unchanged),
+`cargo check -p denno-engine --features cuda --all-targets` clean, and `GPU_VERIFY` (`66698f6`) =
+PASS with all three anchors MATCH (`c61ad85b` / `9e17d563` / `af6eb6ab`), decode gen2 3.2733 s /
+200 tokens = 16.37 ms/token unchanged — the instrument is numerically a no-op.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
