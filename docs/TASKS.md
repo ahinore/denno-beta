@@ -181,7 +181,7 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 
 ## Suggested order
 
-1. P1-3 d2h/sync (largest separable gain: 1.6 s of the 6.15 s bucket) -> P1-2 attention -> P1-4 swiglu fusion.
-   (P1-1 is closed as of s91; its remaining scan cost sits in P1-3's bucket.)
+1. P1-2 attention (942 ms bucket) -> P1-4 swiglu fusion. P1-3 is closed: the s92 inventory found no separable lever.
+   (P1-1 and P1-3 are closed as of s91/s92: neither has a lever left in the cold path.)
 2. In parallel on the CPU-only agent: P3-1 (delete the dead kernel), P3-3, P4-1, P4-4.
 3. P2-1 decode once P1 has plateaued; P3-4 the moment a second A/B is needed by hand.
