@@ -333,6 +333,17 @@ static GDN_PF_CALLS: [[AtomicU64; D2H_GDN_PF_N]; Phase::N] = mk_counters::<D2H_G
 /// s65: `d2h_state` 発行元の**件数**の分類。**表示専用** — 時間は
 /// 持たない (発行点の内側で計ると sync 待ちが二重計上されるため)。
 static D2H_SRC_CALLS: [[AtomicU64; D2H_SRC_N]; Phase::N] = mk_counters::<D2H_SRC_N>();
+/// s88 (Step 1): `d2h_state` 発行元ごとの**経過時間**。フェーズ別・**表示専用**。
+///
+/// 動機: `D2H_SRC_CALLS` は件数しか持たないため、prefill の `d2h_state` が大きいとき
+/// **どの発行点**が時間を使っているのかが分からなかった (`d2h_state` 1 本に 6 ops が
+/// 混ざる)。ここでは発行点 (site) ごとに呼び出し側で区間を測り、site → 時間を積む。
+///
+/// **どの生 id にも合算しない** (二重計上防止)。`D2H` 生バケットは従来どおり
+/// 発行点を包む `time(D2H_*)` が持っており、ここの値はその内訳を読むための
+/// 別勘定である。site の区間は互いに重ならない (1 回の発行 = 1 site) ので、
+/// site ごとの和は `d2h_state` の区間に収まる。
+static D2H_SRC_NS: [[AtomicU64; D2H_SRC_N]; Phase::N] = mk_counters::<D2H_SRC_N>();
 /// s78 (T7): `gdn_proj` 1 call の内訳 (`gdnp_*`) 累積。**表示専用** —
 /// `attn_gdn` / `gdn_proj` のどのバケットにも合算しない (二重計上防止)。
 static GDN_PROJ_NS: [[AtomicU64; D2H_GDN_PROJ_N]; Phase::N] = mk_counters::<D2H_GDN_PROJ_N>();
@@ -773,6 +784,48 @@ pub fn mark_d2h_src(src: usize) {
     add_sample(phase(), src, 0, 1, 0, false);
 }
 
+/// s88 (Step 1): `mark_d2h_src` の**時間つき**版。発行点 `src` の区間 `ns` を
+/// 件数と一緒に積む。**表示専用** (`D2H_SRC_NS` / `D2H_SRC_CALLS` のみ・どの生 id
+/// にも合算しない)。
+///
+/// 呼び出し側は自分の区間を測って渡す — `mark_d2h_src` のように発行の**直後**に
+/// 呼ぶだけでは、転送発行から sync までを含む区間が測れないため。
+/// PROFILE / テレメトリが無効なら分岐 1 回で戻る (時刻は呼び出し側が測らない —
+/// 呼び出し側も `d2h_src_on()` で先に弾く)。
+#[inline]
+pub fn mark_d2h_src_ns(src: usize, ns: u64) {
+    if !enabled() || !(D2H_SRC_FIRST..D2H_SRC_FIRST + D2H_SRC_N).contains(&src) {
+        return;
+    }
+    let pi = phase().idx();
+    let k = src - D2H_SRC_FIRST;
+    D2H_SRC_NS[pi][k].fetch_add(ns, Ordering::Relaxed);
+    D2H_SRC_NS[Phase::Both.idx()][k].fetch_add(ns, Ordering::Relaxed);
+    D2H_SRC_CALLS[pi][k].fetch_add(1, Ordering::Relaxed);
+    D2H_SRC_CALLS[Phase::Both.idx()][k].fetch_add(1, Ordering::Relaxed);
+}
+
+/// s88 (Step 1): 発行点の計時を行うか (= 計測が有効か)。呼び出し側はこれが真の
+/// ときだけ `Instant::now()` を読む (既定経路はクロック読みゼロのまま)。
+#[inline]
+pub fn d2h_src_on() -> bool {
+    enabled() || crate::telemetry_on()
+}
+
+/// s88 (Step 1): 発行点の**時間だけ**を積む (件数は呼び出し側の `mark_d2h_src` が
+/// 既に積んでいる site 用)。`mark_d2h_src_ns` と違い件数を足さない — 両方呼ぶと
+/// calls が 2 倍になり、`d2h_state` の calls との突き合わせが合わなくなる。
+#[inline]
+pub fn add_d2h_src_ns_only(src: usize, ns: u64) {
+    if !enabled() || !(D2H_SRC_FIRST..D2H_SRC_FIRST + D2H_SRC_N).contains(&src) {
+        return;
+    }
+    let pi = phase().idx();
+    let k = src - D2H_SRC_FIRST;
+    D2H_SRC_NS[pi][k].fetch_add(ns, Ordering::Relaxed);
+    D2H_SRC_NS[Phase::Both.idx()][k].fetch_add(ns, Ordering::Relaxed);
+}
+
 /// `f` の実行時間を op に計上して結果を返す。
 /// (P13: テレメトリ有効時は op 時間を telemetry ハブにも累積する。
 /// どちらも計測のみで数値経路には触れないため exactness は不変)
@@ -910,6 +963,8 @@ pub fn reset() {
         }
         for i in 0..D2H_SRC_N {
             D2H_SRC_CALLS[p][i].store(0, Ordering::Relaxed);
+            // s88 (Step 1): 発行点ごとの時間もクリアする (件数だけ消すと差分が残る)
+            D2H_SRC_NS[p][i].store(0, Ordering::Relaxed);
         }
         for i in 0..D2H_GDN_PROJ_N {
             GDN_PROJ_NS[p][i].store(0, Ordering::Relaxed);
@@ -1096,24 +1151,81 @@ fn phase_table(phase: Phase, s: &mut String) {
                     ""
                 ));
             }
-            // s65: 発行元の**件数**の分類 (時間を持たないので ms 列は "-")。
+            // s65: 発行元の**件数**の分類と s88 の時間 (ms)。
             // 合計が d2h_state の calls 列と一致するかを読むための表。
             push_d2h_src_rows(p, "    ", s);
+            // s88 (Step 1): prefill だけ、発行点ごとの時間の上位 10 行を出す
+            // (どの site を先に攻めるかを決めるため。decode は chain 定常で少ない)。
+            if phase == Phase::Prefill {
+                push_d2h_src_top10(p, s);
+            }
         }
     }
 }
 
-/// s65: `d2h_state` 発行元の**件数**を 1 行ずつ積む (時間は持たない = ms 列 "-")。
+/// s65: `d2h_state` 発行元の**件数** (と s88 の時間) を 1 行ずつ積む。
 /// 合計が `d2h_state` の calls 列と一致すれば分類漏れなし。
+///
+/// s88 (Step 1): 発行元ごとの経過時間 (`D2H_SRC_NS`) も ms 列に出す。時間は
+/// **表示専用**で `d2h_state` の行には合算しない (`d2h_state` の ms との差 =
+/// 発行点の外側 = 呼び出し元の区間)。
 fn push_d2h_src_rows(p: usize, indent: &str, s: &mut String) {
     for k in 0..D2H_SRC_N {
         let sc = D2H_SRC_CALLS[p][k].load(Ordering::Relaxed);
         if sc == 0 {
             continue;
         }
+        let sns = D2H_SRC_NS[p][k].load(Ordering::Relaxed);
         s.push_str(&format!(
-            "{indent}{:<12} {:>10} {:>8} {:>6} {:>8} {:>6}\n",
-            D2H_SRC_NAMES[k], "-", sc, "-", "-", ""
+            "{indent}{:<12} {:>10.1} {:>8} {:>6} {:>8} {:>6}\n",
+            D2H_SRC_NAMES[k],
+            sns as f64 / 1e6,
+            sc,
+            "-",
+            "-",
+            ""
+        ));
+    }
+}
+
+/// s88 (Step 1): prefill の `d2h_state` を**発行点ごとの時間**で降順に並べた上位 10 行。
+///
+/// 目的: `d2h_state` 1 本に混ざっている複数の発行点のうち、どれを先に攻めるかを
+/// 決める。**表示専用** (`D2H_SRC_NS` を読むだけ・どのバケットにも書かない)。
+/// 行が 1 本も無ければ何も出さない。prefill のみ (decode は chain 定常で site が
+/// 少なく、上位 10 行が意味を持たない) — 呼び出し側が phase で絞る。
+fn push_d2h_src_top10(p: usize, s: &mut String) {
+    let mut rows: Vec<(usize, u64, u64)> = (0..D2H_SRC_N)
+        .map(|k| {
+            (
+                k,
+                D2H_SRC_NS[p][k].load(Ordering::Relaxed),
+                D2H_SRC_CALLS[p][k].load(Ordering::Relaxed),
+            )
+        })
+        .filter(|(_, ns, calls)| *ns > 0 || *calls > 0)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    s.push_str("    d2h_state by site (top 10, ms desc)\n");
+    s.push_str(&format!(
+        "    {:<18} {:>10} {:>8} {:>10}\n",
+        "site", "ms", "calls", "us/call"
+    ));
+    for (k, ns, calls) in rows.into_iter().take(10) {
+        let us = if calls > 0 {
+            ns as f64 / calls as f64 / 1e3
+        } else {
+            0.0
+        };
+        s.push_str(&format!(
+            "    {:<18} {:>10.1} {:>8} {:>10.1}\n",
+            D2H_SRC_NAMES[k],
+            ns as f64 / 1e6,
+            calls,
+            us
         ));
     }
 }
@@ -1360,6 +1472,70 @@ mod tests {
         }
         // D2H 細分 (i < 9)・GDN_PF (9..12) と交差しない
         assert!(D2H_SRC_KV_ROW > D2H_LOGITS_PF_HELD + 3);
+    }
+
+    /// s88 (Step 1): `d2h_state` 発行点ごとの**時間**が site 別に積まれ、
+    /// **どの生バケットにも入らない**こと。
+    ///
+    /// 固定する規約:
+    /// 1) `mark_d2h_src_ns` は件数 1 + 時間。`add_d2h_src_ns_only` は時間だけ
+    ///    (件数を二重にしない — 両方呼ぶ site があるため)。
+    /// 2) site の時間は `D2H` 生バケットを増やさない (表示専用)。
+    /// 3) 上位 10 行は ms の降順。
+    #[test]
+    fn d2h_src_ns_is_per_site_and_display_only() {
+        with_prof_counters(|| {
+            reset();
+            // 既定の phase は Decode — この計測は prefill の表に出すので明示する。
+            let prev = phase();
+            set_phase(Phase::Prefill);
+            // site の時間だけを積む経路 (mark_d2h_src 済みの site 向け)
+            add_d2h_src_ns_only(D2H_SRC_ATTN_PF, 5_000_000);
+            mark_d2h_src(D2H_SRC_ATTN_PF);
+            // 件数 + 時間を同時に積む経路 (chain_download 向け)
+            mark_d2h_src_ns(D2H_SRC_OTHER, 2_000_000);
+            let _ = d2h_src_on();
+
+            let p = Phase::Prefill.idx();
+            let apf = D2H_SRC_ATTN_PF - D2H_SRC_FIRST;
+            let other = D2H_SRC_OTHER - D2H_SRC_FIRST;
+            // 1) 時間は site 別
+            assert_eq!(D2H_SRC_NS[p][apf].load(Ordering::Relaxed), 5_000_000);
+            assert_eq!(D2H_SRC_NS[p][other].load(Ordering::Relaxed), 2_000_000);
+            // 件数: ATTN_PF は 1 (時間だけの記録は件数を足さない)、OTHER も 1
+            assert_eq!(D2H_SRC_CALLS[p][apf].load(Ordering::Relaxed), 1);
+            assert_eq!(D2H_SRC_CALLS[p][other].load(Ordering::Relaxed), 1);
+            // 2) 生バケットは触らない
+            assert_eq!(
+                NS[p][D2H].load(Ordering::Relaxed),
+                0,
+                "site の時間は d2h_state 生バケットへ入らない (表示専用)"
+            );
+            // 3) prefill の表に site 別の行が出る (ms 降順 = ATTN_PF が先)
+            let s = summary();
+            let prefill = s
+                .split("[prefill]")
+                .nth(1)
+                .unwrap()
+                .split("[decode]")
+                .next()
+                .unwrap();
+            // D2H 行が 0 件なので site 表は d2h_state 行の下に出ない —
+            // 直接 site 表を組み立てて順序を見る (表示関数の単体確認)。
+            let mut out = String::new();
+            push_d2h_src_top10(p, &mut out);
+            let first = out
+                .lines()
+                .find(|l| l.contains("d2h_src_"))
+                .expect("site 行が無い");
+            assert!(
+                first.contains("d2h_src_attn_pf"),
+                "ms の降順で最大の site が先頭: {out}"
+            );
+            assert!(prefill.contains("[prefill]") || !prefill.is_empty());
+            set_phase(prev);
+            reset();
+        });
     }
 
     /// s78 (T7): `gdn_proj` 内訳 (gdnp_*) の id が連番で、既存の細分

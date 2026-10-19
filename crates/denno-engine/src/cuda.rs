@@ -2816,6 +2816,27 @@ pub fn chain_sync_pending() -> Option<()> {
 
 /// スロットからホストへダウンロード (D2H + 同期)。
 pub fn chain_download(slot: usize, len: usize) -> Option<Vec<f32>> {
+    // s88 (Step 1): 発行点ごとの時間 (表示専用)。計測 OFF では時刻を読まない。
+    // ここで件数も一緒に積むので、内側では `mark_d2h_src` を呼ばない
+    // (呼ぶと calls が 2 倍になる)。
+    let t_site = if crate::prof::d2h_src_on() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let r = chain_download_inner(slot, len);
+    match t_site {
+        Some(t) => crate::prof::mark_d2h_src_ns(
+            crate::prof::D2H_SRC_OTHER,
+            t.elapsed().as_nanos() as u64,
+        ),
+        // 計測 OFF: 従来どおり件数だけ (実際は `mark_d2h_src` 側も no-op)。
+        None => crate::prof::mark_d2h_src(crate::prof::D2H_SRC_OTHER),
+    }
+    r
+}
+
+fn chain_download_inner(slot: usize, len: usize) -> Option<Vec<f32>> {
     let ctx = chain_ctx()?;
     let bytes = len.checked_mul(4)?;
     ok(chain_ensure_buf(slot, bytes))?;
@@ -2839,9 +2860,8 @@ pub fn chain_download(slot: usize, len: usize) -> Option<Vec<f32>> {
                 ))?;
             }
         }
-        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_OTHER);
         ok(ctx.sync())?;
-        unsafe { out.set_len(len) };
+        unsafe { out.set_len(len) }
         Some(out)
     })
 }
@@ -2851,6 +2871,24 @@ pub fn chain_download(slot: usize, len: usize) -> Option<Vec<f32>> {
 /// 取得用 — [n, e] 全行の D2H を避ける。呼び出し時点でスロットには
 /// (elem_off + len) 個分のデータが存在することを前提とする (不足時は None)。
 pub fn chain_download_at(slot: usize, elem_off: usize, len: usize) -> Option<Vec<f32>> {
+    // s88 (Step 1): 発行点ごとの時間 (表示専用・計測 OFF はクロック読みなし)。
+    let t_site = if crate::prof::d2h_src_on() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let r = chain_download_at_inner(slot, elem_off, len);
+    match t_site {
+        Some(t) => crate::prof::mark_d2h_src_ns(
+            crate::prof::D2H_SRC_OTHER,
+            t.elapsed().as_nanos() as u64,
+        ),
+        None => crate::prof::mark_d2h_src(crate::prof::D2H_SRC_OTHER),
+    }
+    r
+}
+
+fn chain_download_at_inner(slot: usize, elem_off: usize, len: usize) -> Option<Vec<f32>> {
     let ctx = chain_ctx()?;
     let bytes = len.checked_mul(4)?;
     let need = elem_off.checked_mul(4)?.checked_add(bytes)?;
@@ -2880,9 +2918,8 @@ pub fn chain_download_at(slot: usize, elem_off: usize, len: usize) -> Option<Vec
                 ))?;
             }
         }
-        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_OTHER);
         ok(ctx.sync())?;
-        unsafe { out.set_len(len) };
+        unsafe { out.set_len(len) }
         Some(out)
     })
 }
@@ -5578,10 +5615,23 @@ pub fn chain_q35_gdn_flush_pending(cache: &mut crate::kv_cache::KvCache) -> Opti
             return None;
         };
         // s65: 発行元の件数分類 (GDN 状態の回復 = conv + ssm の 2 本)
+        // s88 (Step 1): この層の conv + ssm の回復区間を site の時間としても積む
+        // (表示専用)。件数は従来どおり 2 件 (conv / ssm の 2 本)。
+        let t_site = if crate::prof::d2h_src_on() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
         crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
         let conv = ok(cb.to_vec::<f32>(cb.bytes() / 4))?;
         let ssm = ok(sb.to_vec::<f32>(sb.bytes() / 4))?;
+        if let Some(t) = t_site {
+            crate::prof::add_d2h_src_ns_only(
+                crate::prof::D2H_SRC_GDN_STATE,
+                t.elapsed().as_nanos() as u64,
+            );
+        }
         let (conv_h, ssm_h) = cache.gdn_state_mut(li)?;
         if conv_h.len() < conv.len() || ssm_h.len() < ssm.len() {
             m.gdn_pending = None;
