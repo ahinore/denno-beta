@@ -63,6 +63,24 @@ struct GdnLayer {
     gate_w: Linear,  // [e, value_dim] (attn_gate → z)
     beta_w: Linear,  // [e, n_v_heads]
     alpha_w: Linear, // [e, n_v_heads]
+    /// s83 (T7b-2): `qkv_w` と `gate_w` の**行連結**コピー [e, nqkv+nz]
+    /// (行順は [qkv 全行 | z 全行])。ロード時に 1 回だけ作り、prefill はこれ 1 本で
+    /// qkv+z を計算する (投影呼び出し 2 -> 1・層あたりの重み走査 2 -> 1)。
+    ///
+    /// **レイアウト契約**: 1 回の呼び出しの出力は [m, nqkv+nz] の疎でない行列で、
+    /// トークン i の qkv 部分は `out[i*(nqkv+nz) .. +nqkv]` にある。平坦な
+    /// `split_at_mut(n*nqkv)` で切り出すのは m == 1 のときだけ正しい
+    /// (s82 はここを取り違えて「カーネル経路が違う」と誤診した)。
+    /// テスト: tensor::tests::t7b2_* と qwen35::tests::t7b2_*。
+    ///
+    /// int8 のスケールは行ごと・整数ドットは行ごとに独立なので、行を連結しても
+    /// 各行の量子化値・累積順は変わらない = 出力は**ビット一致**。
+    qkv_gate_w: Linear,
+    /// s83 (T7b-2): `beta_w` と `alpha_w` の行連結コピー [e, 2*nv]
+    /// (行順は [beta 全行 | alpha 全行])。同じレイアウト契約 (ストライド切り出し)。
+    /// fp32 の matvec_rows_bt は (i, j) ごとに累積が閉じているので、n が
+    /// JB(64) 境界をまたいでも各要素の和の項順は変わらない = ビット一致。
+    beta_alpha_w: Linear,
     conv1d: Vec<f32>,
     ssm_a: Vec<f32>,
     ssm_dt: Vec<f32>,
@@ -392,28 +410,39 @@ impl Qwen35 {
 
             let attn = if f.tensor(&format!("{p}ssm_a")).is_some() {
                 // GDN (linear_attention) 層
+                let qkv_w = lin(
+                    dt_shaped(&format!("{p}attn_qkv.weight"), &[eu, qkv_dim as u64])?,
+                    e,
+                    qkv_dim,
+                );
+                let g_z = lin(
+                    dt_shaped(&format!("{p}attn_gate.weight"), &[eu, vd as u64])?,
+                    e,
+                    vd,
+                );
+                let beta_w = lin_ctl(
+                    dt_shaped(&format!("{p}ssm_beta.weight"), &[eu, gdn_p.n_v_heads as u64])?,
+                    e,
+                    gdn_p.n_v_heads,
+                );
+                let alpha_w = lin_ctl(
+                    dt_shaped(&format!("{p}ssm_alpha.weight"), &[eu, gdn_p.n_v_heads as u64])?,
+                    e,
+                    gdn_p.n_v_heads,
+                );
+                // s83 (T7b-2): qkv+z / beta+alpha の行連結を**ここで 1 回だけ**作る。
+                // 行順は下の prefill のストライド切り出し ([qkv 全行 | z 全行] /
+                // [beta 全行 | alpha 全行]) と一致させる。
+                let qkv_gate_w = concat_rows(&qkv_w, &g_z, "qkv+z")?;
+                let beta_alpha_w = concat_rows(&beta_w, &alpha_w, "beta+alpha")?;
                 AttnKind::Gdn(GdnLayer {
                     ln1_w,
-                    qkv_w: lin(
-                        dt_shaped(&format!("{p}attn_qkv.weight"), &[eu, qkv_dim as u64])?,
-                        e,
-                        qkv_dim,
-                    ),
-                    gate_w: lin(
-                        dt_shaped(&format!("{p}attn_gate.weight"), &[eu, vd as u64])?,
-                        e,
-                        vd,
-                    ),
-                    beta_w: lin_ctl(
-                        dt_shaped(&format!("{p}ssm_beta.weight"), &[eu, gdn_p.n_v_heads as u64])?,
-                        e,
-                        gdn_p.n_v_heads,
-                    ),
-                    alpha_w: lin_ctl(
-                        dt_shaped(&format!("{p}ssm_alpha.weight"), &[eu, gdn_p.n_v_heads as u64])?,
-                        e,
-                        gdn_p.n_v_heads,
-                    ),
+                    qkv_w,
+                    gate_w: g_z,
+                    beta_w,
+                    alpha_w,
+                    qkv_gate_w,
+                    beta_alpha_w,
                     conv1d: dt_shaped(
                         &format!("{p}ssm_conv1d.weight"),
                         &[gdn_p.d_conv as u64, qkv_dim as u64],
@@ -1185,6 +1214,9 @@ impl Qwen35 {
         let mut buf_z: Vec<f32> = Vec::new();
         let mut buf_beta: Vec<f32> = Vec::new();
         let mut buf_alpha: Vec<f32> = Vec::new();
+        // s83 (T7b-2): 連結投影の出力先 (stride = 連結幅)。層をまたいで再利用する。
+        let mut buf_qkvz: Vec<f32> = Vec::new();
+        let mut buf_ba: Vec<f32> = Vec::new();
         let mut buf_qg: Vec<f32> = Vec::new();
         let mut buf_k: Vec<f32> = Vec::new();
         let mut buf_v: Vec<f32> = Vec::new();
@@ -1215,15 +1247,26 @@ impl Qwen35 {
                     // 決まる (cuda 統計) ため、ここでは主張しない。
                     let (kqkv, nqkv) = g.qkv_w.dims();
                     debug_assert_eq!(kqkv, e);
+                    let (_, nz) = g.gate_w.dims();
+                    let (_, nb) = g.beta_w.dims();
+                    let (_, na) = g.alpha_w.dims();
                     fit_prefill_buf(&mut buf_qkv, n * nqkv);
-                    fit_prefill_buf(&mut buf_z, n * g.gate_w.dims().1);
-                    fit_prefill_buf(&mut buf_beta, n * g.beta_w.dims().1);
-                    fit_prefill_buf(&mut buf_alpha, n * g.alpha_w.dims().1);
+                    fit_prefill_buf(&mut buf_z, n * nz);
+                    fit_prefill_buf(&mut buf_beta, n * nb);
+                    fit_prefill_buf(&mut buf_alpha, n * na);
+                    // s83 (T7b-2): qkv+z は連結重み 1 本で 1 回だけ投影する。
+                    // 戻りは [n, nqkv+nz] の 1 本の密行列なので、**トークン単位で
+                    // ストライド切り出し**して既存の連続バッファへ写す
+                    // (平坦な split_at_mut は m==1 でしか正しくない)。
+                    fit_prefill_buf(&mut buf_qkvz, n * (nqkv + nz));
                     crate::prof::time_n_ev(crate::prof::QKV, n, || {
-                        g.qkv_w.apply_bt_rows_into(&buf_h, n, &mut buf_qkv)
-                    });
-                    crate::prof::time_n_ev(crate::prof::QKV, n, || {
-                        g.gate_w.apply_bt_rows_into(&buf_h, n, &mut buf_z)
+                        g.qkv_gate_w.apply_bt_rows_into(&buf_h, n, &mut buf_qkvz);
+                        unpack_strided_dst(
+                            &buf_qkvz,
+                            n,
+                            nqkv + nz,
+                            &mut [&mut buf_qkv, &mut buf_z],
+                        );
                     });
                     // s61c (T5b 計測のみ): beta/alpha は「投影」、下のスキャンは「スキャン」
                     // に分けて計上する。attn_gdn の合計は両者の和で従来と同値
@@ -1235,18 +1278,29 @@ impl Qwen35 {
                     #[cfg(feature = "cuda")]
                     let gp_key = self.mid * 1024 + (li as u64) * 2;
                     crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
+                        // s83 (T7b-2): Fp32 は beta+alpha を連結 1 回で投影する
+                        // (呼び出し 2 -> 1・重み走査 2 -> 1)。出力は [n, 2*nv] の
+                        // 1 本なのでトークン単位でストライド切り出しする。
+                        // Q8 モード (テスト経路) は s78 の 2 呼び + GPU 経路のまま
+                        // (このレイアウトでは gdn_proj_into_gpu は前提を満たさない)。
+                        if g.beta_alpha_w.quant8().is_none() {
+                            fit_prefill_buf(&mut buf_ba, n * (nb + na));
+                            g.beta_alpha_w.apply_bt_rows_into(&buf_h, n, &mut buf_ba);
+                            unpack_strided_dst(
+                                &buf_ba,
+                                n,
+                                nb + na,
+                                &mut [&mut buf_beta, &mut buf_alpha],
+                            );
+                            return;
+                        }
                         #[cfg(feature = "cuda")]
                         if gdn_proj_into_gpu(gp_key, &g.beta_w, &buf_h, n, &mut buf_beta) {
+                            gdn_proj_into_gpu(gp_key + 1, &g.alpha_w, &buf_h, n, &mut buf_alpha);
                             return;
                         }
-                        g.beta_w.apply_bt_rows_into(&buf_h, n, &mut buf_beta)
-                    });
-                    crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                        #[cfg(feature = "cuda")]
-                        if gdn_proj_into_gpu(gp_key + 1, &g.alpha_w, &buf_h, n, &mut buf_alpha) {
-                            return;
-                        }
-                        g.alpha_w.apply_bt_rows_into(&buf_h, n, &mut buf_alpha)
+                        g.beta_w.apply_bt_rows_into(&buf_h, n, &mut buf_beta);
+                        g.alpha_w.apply_bt_rows_into(&buf_h, n, &mut buf_alpha);
                     });
                     // スキャン: GPU カーネル 1 発 (P19-A1・cuda 有効時)。GDN は
                     // bit 一致不要のため GPU/CPU で数値は僅かに異なる (決定論は維持)。
@@ -1616,9 +1670,30 @@ fn fit_prefill_buf(v: &mut Vec<f32>, len: usize) {
     }
 }
 
+/// s83 (T7b-2): 連結投影の出力 `c` ([m, stride] row-major) を、**トークン単位で**
+/// 各パートの連続バッファへ写す。`widths = [na, nb, ..]` は行内の連結順で、
+/// 合計が stride に一致する。
+///
+/// 契約: `c[i*stride + off .. i*stride + off + w]` → `dsts[k][i*w .. (i+1)*w]`。
+/// 平坦な `c[..m*na]` を dst とみなすのは **m == 1 だけ**正しい (s82 の誤り)。
+/// 下流のシグネチャ・累積順は変えない (単なる行コピー)。
+fn unpack_strided_dst(c: &[f32], m: usize, stride: usize, dsts: &mut [&mut Vec<f32>]) {
+    let sum: usize = dsts.iter().map(|d| d.len()).sum();
+    debug_assert_eq!(sum, m * stride, "連結投影: パート幅の合計が stride*m と不一致");
+    let mut off = 0usize;
+    for dst in dsts.iter_mut() {
+        let w = dst.len() / m.max(1);
+        debug_assert_eq!(dst.len(), m * w);
+        for i in 0..m {
+            dst[i * w..(i + 1) * w].copy_from_slice(&c[i * stride + off..i * stride + off + w]);
+        }
+        off += w;
+    }
+    debug_assert_eq!(off, stride);
+}
+
 /// s80 (T7b-1): 同じ入力次元 k を持つ 2 本の線形層の重みを**行方向に連結**した
 /// 1 本の線形層を作る (`[gate 全行 | up 全行]`)。モデルロード時に 1 回だけ呼ぶ。
-///
 /// 数値契約 (**ビット一致**): int8 の量子化スケールは行ごと・`matvec_bt_i8` /
 /// `matmul_bt_i8` / `dno_gemm_i8` の累積は行 (出力チャネル) ごとに独立なので、
 /// 行を連結しても各行の量子化値・累積順は変わらない。fp32 側は
@@ -3283,6 +3358,19 @@ mod tests {
     /// leaving every other stage identical to the fused path. Used to prove
     /// that fusing gate+up changed nothing numerically.
     fn forward_prefill_legacy_ffn(m: &Qwen35, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        forward_prefill_legacy(m, tokens, cache, true)
+    }
+
+    /// s83 (T7b-2): 上の一般化。`split_gdn` = true なら GDN の qkv+z /
+    /// beta+alpha も **2 回呼び**の旧経路で計算する (T7b-2 の旧経路参照)、
+    /// false なら forward と同じ連結経路。どちらも FFN は連結経路 (T7b-1 の
+    /// 被験対象は GDN だけ) で、残りのステージは forward と完全に同一。
+    fn forward_prefill_legacy(
+        m: &Qwen35,
+        tokens: &[u32],
+        cache: &mut KvCache,
+        split_gdn: bool,
+    ) -> Vec<f32> {
         let e = m.e;
         let n = tokens.len();
         let mut x = vec![0.0f32; n * e];
@@ -3306,10 +3394,44 @@ mod tests {
                     let nz = g.gate_w.dims().1;
                     let nb = g.beta_w.dims().1;
                     let na = g.alpha_w.dims().1;
-                    let qkv = g.qkv_w.apply_bt_rows(&h, n);
-                    let z = g.gate_w.apply_bt_rows(&h, n);
-                    let beta = g.beta_w.apply_bt_rows(&h, n);
-                    let alpha = g.alpha_w.apply_bt_rows(&h, n);
+                    let (qkv, z) = if split_gdn {
+                        // 旧経路: 2 回呼び (pre-T7b-2 の呼び出し列)
+                        (
+                            g.qkv_w.apply_bt_rows(&h, n),
+                            g.gate_w.apply_bt_rows(&h, n),
+                        )
+                    } else {
+                        // 連結経路: 1 回呼び + トークン単位のストライド切り出し
+                        let c = g.qkv_gate_w.apply_bt_rows(&h, n);
+                        let stride = nqkv + nz;
+                        let mut q = vec![0.0f32; n * nqkv];
+                        let mut z = vec![0.0f32; n * nz];
+                        for i in 0..n {
+                            q[i * nqkv..(i + 1) * nqkv]
+                                .copy_from_slice(&c[i * stride..i * stride + nqkv]);
+                            z[i * nz..(i + 1) * nz]
+                                .copy_from_slice(&c[i * stride + nqkv..(i + 1) * stride]);
+                        }
+                        (q, z)
+                    };
+                    let (beta, alpha) = if split_gdn {
+                        (
+                            g.beta_w.apply_bt_rows(&h, n),
+                            g.alpha_w.apply_bt_rows(&h, n),
+                        )
+                    } else {
+                        let c = g.beta_alpha_w.apply_bt_rows(&h, n);
+                        let stride = nb + na;
+                        let mut b = vec![0.0f32; n * nb];
+                        let mut al = vec![0.0f32; n * na];
+                        for i in 0..n {
+                            b[i * nb..(i + 1) * nb]
+                                .copy_from_slice(&c[i * stride..i * stride + nb]);
+                            al[i * na..(i + 1) * na]
+                                .copy_from_slice(&c[i * stride + nb..(i + 1) * stride]);
+                        }
+                        (b, al)
+                    };
                     let dy = g.out_w.dims().0;
                     let mut ys = vec![0.0f32; n * dy];
                     for i in 0..n {
@@ -3401,5 +3523,199 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // s83 (T7b-2): GDN qkv+z / beta+alpha の load-time 行連結 (prefill)。
+    //
+    // 連結投影の出力は [m, na+nb] の 1 本の密行列なので、パートの切り出しは
+    // **トークン単位** (c[i*(na+nb) + off]) でなければならない。s82 は平坦な
+    // split_at_mut で切り出し、m>1 で不一致を出した (カーネルは無罪)。
+    // カーネル水準の裏付け: tensor::tests::t7b2_*。
+    // -----------------------------------------------------------------------
+
+    /// 連結重み 1 回 + ストライド切り出し == 2 回呼び。
+    /// int8 / fp32、m=1 (decode GEMV) と m=5 (prefill GEMM)、
+    /// qkv+z と beta+alpha (n が JB=64 境界をまたぐ組み合わせを含む)。
+    #[test]
+    fn t7b2_gdn_fused_projection_is_bit_exact_vs_two_calls() {
+        let dir = build_dir("t7b2concat", true, NK, NV);
+        let cfg: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap()).unwrap();
+        for mode in [QuantMode::Int8, QuantMode::Fp32] {
+            let m = Qwen35::load(&dir, &cfg, mode).unwrap();
+            let k = m.e;
+            let a: Vec<f32> = (0..5 * k).map(|i| 0.25 + (i % 23) as f32 * 0.01).collect();
+            let mut n_gdn = 0usize;
+            for (li, layer) in m.layers.iter().enumerate() {
+                let AttnKind::Gdn(g) = &layer.attn else { continue };
+                n_gdn += 1;
+                let (_, nqkv) = g.qkv_w.dims();
+                let (_, nz) = g.gate_w.dims();
+                let (_, nb) = g.beta_w.dims();
+                let (_, na) = g.alpha_w.dims();
+                assert_eq!(g.qkv_gate_w.dims(), (k, nqkv + nz), "{mode:?} layer {li}: qkv+z dims");
+                assert_eq!(g.beta_alpha_w.dims(), (k, nb + na), "{mode:?} layer {li}: beta+alpha dims");
+
+                for mm in [1usize, 5] {
+                    let a_in = &a[..mm * k];
+                    // --- qkv+z ---
+                    let fused = g.qkv_gate_w.apply_bt_rows(a_in, mm);
+                    let qkv = g.qkv_w.apply_bt_rows(a_in, mm);
+                    let z = g.gate_w.apply_bt_rows(a_in, mm);
+                    let stride = nqkv + nz;
+                    for i in 0..mm {
+                        assert_eq!(
+                            bits(&fused[i * stride..i * stride + nqkv]),
+                            bits(&qkv[i * nqkv..(i + 1) * nqkv]),
+                            "{mode:?} layer {li} row {i}: qkv part differs (m={mm})"
+                        );
+                        assert_eq!(
+                            bits(&fused[i * stride + nqkv..(i + 1) * stride]),
+                            bits(&z[i * nz..(i + 1) * nz]),
+                            "{mode:?} layer {li} row {i}: z part differs (m={mm})"
+                        );
+                    }
+
+                    // --- beta+alpha ---
+                    let fused = g.beta_alpha_w.apply_bt_rows(a_in, mm);
+                    let beta = g.beta_w.apply_bt_rows(a_in, mm);
+                    let alpha = g.alpha_w.apply_bt_rows(a_in, mm);
+                    let stride = nb + na;
+                    for i in 0..mm {
+                        assert_eq!(
+                            bits(&fused[i * stride..i * stride + nb]),
+                            bits(&beta[i * nb..(i + 1) * nb]),
+                            "{mode:?} layer {li} row {i}: beta part differs (m={mm})"
+                        );
+                        assert_eq!(
+                            bits(&fused[i * stride + nb..(i + 1) * stride]),
+                            bits(&alpha[i * na..(i + 1) * na]),
+                            "{mode:?} layer {li} row {i}: alpha part differs (m={mm})"
+                        );
+                    }
+                }
+            }
+            assert!(n_gdn > 0, "{mode:?}: GDN 層が無い (テスト前提が崩れている)");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 連結は行の**逐語コピー**でなければならない (再量子化しない)。さらに
+    /// 連結重みは新しい uid を持つ (GPU デバイスキャッシュのキー衝突防止)。
+    #[test]
+    fn t7b2_gdn_concat_copies_rows_and_takes_fresh_uid() {
+        let dir = build_dir("t7b2rows", true, NK, NV);
+        let m = load_int8(&dir);
+        let mut checked = 0usize;
+        for layer in m.layers.iter() {
+            let AttnKind::Gdn(g) = &layer.attn else { continue };
+            checked += 1;
+
+            let f = g.qkv_gate_w.quant8().expect("qkv+z 連結は int8 のまま");
+            let q = g.qkv_w.quant8().unwrap();
+            let z = g.gate_w.quant8().unwrap();
+            assert_eq!((f.k, f.n), (q.k, q.n + z.n));
+            assert_eq!(f.w[..q.n * q.k], q.w[..], "qkv 行は逐語コピー");
+            assert_eq!(f.w[q.n * q.k..], z.w[..], "z 行は逐語コピー");
+            assert_eq!(f.scale[..q.n], q.scale[..], "qkv スケールは逐語コピー");
+            assert_eq!(f.scale[q.n..], z.scale[..], "z スケールは逐語コピー");
+            for (what, other) in [("qkv", q.uid), ("z", z.uid)] {
+                assert_ne!(f.uid, other, "qkv+z 連結が {what} の uid を流用している");
+            }
+
+            // beta/alpha は `lin_ctl` により **常に Fp32** (decode chain の前提)。
+            // したがってここでは fp32 の逐語コピーと「int8 化されていないこと」を
+            // 確認する。
+            let (Linear::F32 { w: fw, .. }, Linear::F32 { w: bw, .. }, Linear::F32 { w: aw, .. }) =
+                (&g.beta_alpha_w, &g.beta_w, &g.alpha_w)
+            else {
+                panic!("beta/alpha は fp32 (lin_ctl) のはず");
+            };
+            assert_eq!(g.beta_alpha_w.dims(), (g.beta_w.dims().0, bw.len() / g.beta_w.dims().0 * 2));
+            assert_eq!(fw[..bw.len()], bw[..], "beta 行は逐語コピー");
+            assert_eq!(fw[bw.len()..], aw[..], "alpha 行は逐語コピー");
+            assert!(g.beta_alpha_w.quant8().is_none(), "beta+alpha 連結が int8 化されている");
+        }
+        assert!(checked > 0, "GDN 層が無い");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// s83 (T7b-2): prefill 全体で、GDN の qkv+z / beta+alpha を 2 回呼びに戻した
+    /// 旧経路と、連結 1 回 + ストライド切り出しの新経路が **bit 一致**すること
+    /// (logits と GDN 状態の両方)。FFN は両方とも T7b-1 の連結経路。
+    #[test]
+    fn t7b2_fused_prefill_matches_legacy_gdn_bitexact() {
+        let dir = build_dir("t7b2pf", true, NK, NV);
+        let mut m = load_int8(&dir);
+        let toks: Vec<u32> = (0..11u32).map(|i| (i * 31 + 7) % VOCAB as u32).collect();
+
+        let mut cl = m.new_cache();
+        let lp = forward_prefill_legacy(&m, &toks, &mut cl, true);
+        let gl = cl.gdn_snapshot();
+
+        let mut cf = m.new_cache();
+        let lf = m.forward(&toks, &mut cf).unwrap();
+        let gf = cf.gdn_snapshot();
+
+        assert_eq!(bits(&lp), bits(&lf), "prefill logits differ (fused vs legacy GDN projections)");
+        assert_eq!(gl.len(), gf.len(), "GDN snapshot layer count differs");
+        let mut n_gdn = 0usize;
+        for (li, (a, b)) in gl.iter().zip(gf.iter()).enumerate() {
+            match (a, b) {
+                (None, None) => {}
+                (Some((ac, as_)), Some((bc, bs))) => {
+                    n_gdn += 1;
+                    assert_eq!(bits(ac), bits(bc), "layer {li}: conv state differs");
+                    assert_eq!(bits(as_), bits(bs), "layer {li}: ssm state differs");
+                }
+                _ => panic!("layer {li}: GDN slot presence differs (fused vs legacy)"),
+            }
+        }
+        assert!(n_gdn > 0, "GDN 状態が 1 層も比較されていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 連結経路どうしの一致 (split_gdn=false の参照 == forward)。上のテストが
+    /// 「参照の作り方」に依存していないことの確認で、T7b-1 の FFN 参照が
+    /// 引き続き通ることも同時に担保する。
+    #[test]
+    fn t7b2_fused_prefill_reference_selfconsistency() {
+        let dir = build_dir("t7b2pfself", true, NK, NV);
+        let mut m = load_int8(&dir);
+        let toks: Vec<u32> = (0..9u32).map(|i| (i * 17 + 5) % VOCAB as u32).collect();
+        let mut ca = m.new_cache();
+        let la = forward_prefill_legacy(&m, &toks, &mut ca, false);
+        let mut cb = m.new_cache();
+        let lb = m.forward(&toks, &mut cb).unwrap();
+        assert_eq!(bits(&la), bits(&lb), "連結経路の参照と forward が不一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ストライド切り出しヘルパの単体検査 (m>1 で平坦と一致しないことの記録)。
+    #[test]
+    fn t7b2_unpack_strided_dst_extracts_per_token() {
+        let (m, na, nb) = (3usize, 4usize, 2usize);
+        let stride = na + nb;
+        // 行 i = [i*10+1, .., i*10+6]
+        let c: Vec<f32> = (0..m)
+            .flat_map(|i| (0..stride).map(move |j| (i * 10 + j + 1) as f32))
+            .collect();
+        let (mut da, mut db) = (vec![0.0f32; m * na], vec![0.0f32; m * nb]);
+        unpack_strided_dst(&c, m, stride, &mut [&mut da, &mut db]);
+        for i in 0..m {
+            for j in 0..na {
+                assert_eq!(da[i * na + j], (i * 10 + j + 1) as f32, "a 行 {i} 列 {j}");
+            }
+            for j in 0..nb {
+                assert_eq!(db[i * nb + j], (i * 10 + na + j + 1) as f32, "b 行 {i} 列 {j}");
+            }
+        }
+        // 平坦読み (c[..m*na] を [m,na] とみなす) は一致しない = 再導入禁止の記録
+        let flat = unpack_strided_dst;
+        let (mut df, mut dummy) = (vec![0.0f32; m * na], vec![0.0f32; 0]);
+        flat(&c[..m * na], m, na, &mut [&mut df, &mut dummy]);
+        let same = (0..m * na).all(|i| df[i].to_bits() == da[i].to_bits());
+        assert!(!same, "平坦読みが一致してしまった (このテストの前提が崩れている)");
     }
 }
