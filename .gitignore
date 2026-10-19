@@ -21,3 +21,5 @@ data/
 /diag_*.patch
 # 開発用ヘルパ (セッション限り・commit しない)
 /t5_*.sh
+/ANCHOR_REBASE.sh
+/RAYON_CHECK.sh
