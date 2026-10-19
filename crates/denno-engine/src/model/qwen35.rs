@@ -1117,10 +1117,13 @@ impl Qwen35 {
                         g.qkv_w.apply_bt_rows(&h, n)
                     });
                     let z = crate::prof::time_n_ev(crate::prof::QKV, n, || g.gate_w.apply_bt_rows(&h, n));
-                    let beta_raw = crate::prof::time_n_ev(crate::prof::ATT_GDN, n, || {
+                    // s61c (T5b 計測のみ): beta/alpha は「投影」、下のスキャンは「スキャン」
+                    // に分けて計上する。attn_gdn の合計は両者の和で従来と同値
+                    // (add_sample が ATT_GDN へ合算する)。数値経路・分岐は不変。
+                    let beta_raw = crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
                         g.beta_w.apply_bt_rows(&h, n)
                     });
-                    let alpha = crate::prof::time_n_ev(crate::prof::ATT_GDN, n, || {
+                    let alpha = crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
                         g.alpha_w.apply_bt_rows(&h, n)
                     });
                     // スキャン: GPU カーネル 1 発 (P19-A1・cuda 有効時)。GDN は
@@ -1132,7 +1135,7 @@ impl Qwen35 {
                     // ラベルは戻り値から得るので数値経路・分岐は不変。
                     #[cfg(feature = "cuda")]
                     let (ys, scan_on_gpu): (Vec<f32>, bool) =
-                        crate::prof::time_layer_n_ev(crate::prof::ATT_GDN, li, n, || {
+                        crate::prof::time_layer_n_ev(crate::prof::ATT_GDN_SCAN, li, n, || {
                             let p = &self.gdn_p;
                             if n > 1 && p.head_k_dim == p.head_v_dim {
                                 let (conv, ssm) = cache
@@ -1173,7 +1176,7 @@ impl Qwen35 {
                         });
                     #[cfg(not(feature = "cuda"))]
                     let (ys, scan_on_gpu): (Vec<f32>, bool) =
-                        crate::prof::time_layer_n_ev(crate::prof::ATT_GDN, li, n, || {
+                        crate::prof::time_layer_n_ev(crate::prof::ATT_GDN_SCAN, li, n, || {
                             (
                                 self.gdn_scan_rows(g, &qkv, &z, &beta_raw, &alpha, cache, li, n, dy),
                                 false,
