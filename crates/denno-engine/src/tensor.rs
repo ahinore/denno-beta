@@ -203,7 +203,14 @@ pub fn sgemm_scores_kvstrided(
 /// b: [n,k] row-major (nn.Linear 形状)。
 pub fn matvec_bt(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
     let mut c = vec![0.0f32; n];
-    c.par_iter_mut()
+    matvec_bt_into(a, b, k, n, &mut c);
+    c
+}
+
+/// s63 (T5c): `matvec_bt` の書き込み先指定版 (out: [n]・長さ n)。数値は同一。
+pub fn matvec_bt_into(a: &[f32], b: &[f32], k: usize, n: usize, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), n);
+    out.par_iter_mut()
         .enumerate()
         .with_min_len(64)
         .for_each(|(j, cj)| {
@@ -214,7 +221,6 @@ pub fn matvec_bt(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
             }
             *cj = s;
         });
-    c
 }
 
 /// c[i][j] = Σ_d a[i*k+d] * b[j*k+d] を計算するバッチ decode 用 matvec (P6/P9)。
@@ -233,10 +239,25 @@ pub fn matvec_bt(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
 /// 重み行 b[j] は 1 回の読み込みで m 入力分のドットに再利用されるため、
 /// 線形層の重み帯域が実質 1/m のまま、演算は 4 レーン同時になる。
 pub fn matvec_rows_bt(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    matvec_rows_bt_into(a, b, k, n, m, &mut c);
+    c
+}
+
+/// s63 (T5c): `matvec_rows_bt` の書き込み先指定版 (out: [m,n] row-major・長さ m*n)。
+///
+/// 数値は `matvec_rows_bt` と**完全に同一**: 本体 (`matvec_rows_bt_impl`) は
+/// 上書き専用化しただけでループ構成・累積順・SIMD レーン配置・rayon 分割は
+/// 一切変えていない (上書きなら旧値の読み取りが無いので同じ)。したがって
+/// 呼び出し側が領域を使い回しても出力ビットは変わらない。
+/// 旧 API の `vec![0.0; m*n]` を毎回確保する代わりに再利用バッファへ書ける。
+pub fn matvec_rows_bt_into(a: &[f32], b: &[f32], k: usize, n: usize, m: usize, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), m * n);
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(b.len(), k * n);
     if m == 1 {
-        return matvec_bt(a, b, k, n);
+        matvec_bt_into(a, b, k, n, out);
+        return;
     }
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {
@@ -244,14 +265,14 @@ pub fn matvec_rows_bt(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec
         // 一度も走らず全チャネルが単スレッドの端数経路に落ちる (GDN の beta/alpha
         // = Fp32・n=32 が該当し、prefill の gdn_proj の大半を占めていた)。
         if n < JB {
-            matvec_rows_bt_small_n(a, b, k, n, m)
+            matvec_rows_bt_small_n_impl(a, b, k, n, m, out)
         } else {
-            matvec_rows_bt_vec(a, b, k, n, m)
+            matvec_rows_bt_vec_impl(a, b, k, n, m, out)
         }
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        matvec_rows_bt_scalar(a, b, k, n, m)
+        matvec_rows_bt_scalar_impl(a, b, k, n, m, out)
     }
 }
 
@@ -263,7 +284,7 @@ const JB: usize = 64;
 /// SIMD 版本体 (P9)。レーン構成: 4 出力チャネル × 4 バッチセッション。
 /// k 累積はチャネル毎・セッション毎に独立した逐次チェーン (ビット一致の核心)。
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn matvec_rows_bt_vec(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec<f32> {
+fn matvec_rows_bt_vec_impl(a: &[f32], b: &[f32], k: usize, n: usize, m: usize, out: &mut [f32]) {
     const LANES: usize = 4; // バッチ (i) 方向のレーン数 = SIMD 幅
     const JG: usize = 4; // 同時に処理する出力チャネル数 (ILP 用、順序には無関係)
 
@@ -277,12 +298,13 @@ fn matvec_rows_bt_vec(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec
             at[d * mp + i] = src[d];
         }
     }
-    let mut c = vec![0.0f32; m * n];
-    let cp = SendPtr(c.as_mut_ptr());
+    // s63 (T5c): 呼び出し側の領域へ直接書く (旧実装はここで vec![0.0; m*n] を
+    // 確保していた)。書き込みは従来どおり生成 (i,j) 全てに行うため数値不変。
+    let cp = SendPtr(out.as_mut_ptr());
     let n_groups = mp / LANES;
     b.par_chunks_exact(k * JB)
         .enumerate()
-        .for_each(|(bi, bw)| {
+        .for_each(|(bi, _bw)| {
             let j0 = bi * JB;
             for jj in (0..JB).step_by(JG) {
                 let rows: [&[f32]; JG] = std::array::from_fn(|t| {
@@ -305,8 +327,7 @@ fn matvec_rows_bt_vec(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec
             }
         });
     // 端数ブロック (n が JB の倍数でない場合) — 逐次スカラーのまま (行数が少ない)。
-    matvec_rows_bt_rem_scalar(a, b, k, n, m, (n / JB) * JB, &mut c);
-    c
+    matvec_rows_bt_rem_scalar(a, b, k, n, m, (n / JB) * JB, out);
 }
 
 /// s62 (T5b): **小 n 投影** (n < JB) 専用の本体。
@@ -325,7 +346,7 @@ fn matvec_rows_bt_vec(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec
 /// `__fadd_rn(__fmul_rn(...))` のため、**出力は従来経路とビット一致**する
 /// (テスト: `matvec_rows_bt_small_n_matches_rem_scalar_path`)。
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn matvec_rows_bt_small_n(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec<f32> {
+fn matvec_rows_bt_small_n_impl(a: &[f32], b: &[f32], k: usize, n: usize, m: usize, out: &mut [f32]) {
     use rayon::prelude::*;
     const MB: usize = 8; // バッチ (i) 方向のレーン数
     const JG: usize = 2; // 1 タスクが同時に走査する出力チャネル数
@@ -370,16 +391,16 @@ fn matvec_rows_bt_small_n(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) ->
             (j0, cols, o)
         })
         .collect();
-    let mut c = vec![0.0f32; m * n];
+    // s63 (T5c): 呼び出し側の領域へ転置して書く (旧実装はここで m*n を確保)。
+    // 全 (i,j) を上書きするため数値不変。
     for (j0, cols, o) in groups.iter() {
         for t in 0..*cols {
             let col = &o[t * m..][..m];
             for (i, v) in col.iter().enumerate() {
-                c[i * n + j0 + t] = *v;
+                out[i * n + j0 + t] = *v;
             }
         }
     }
-    c
 }
 
 /// JG=4 本の重み行 × 4 バッチレーンのドットを同時に計算する。
@@ -450,10 +471,9 @@ fn matvec_rows_bt_rem_scalar(
 
 /// SIMD 非対応ターゲット向けの逐次スカラー版 (旧 P6 実装そのまま)。
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-fn matvec_rows_bt_scalar(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec<f32> {
-    let mut c = vec![0.0f32; m * n];
+fn matvec_rows_bt_scalar_impl(a: &[f32], b: &[f32], k: usize, n: usize, m: usize, out: &mut [f32]) {
     const JB: usize = 64;
-    let cp = SendPtr(c.as_mut_ptr());
+    let cp = SendPtr(out.as_mut_ptr());
     b.par_chunks_exact(k * JB)
         .enumerate()
         .for_each(|(bi, bw)| {
@@ -470,8 +490,7 @@ fn matvec_rows_bt_scalar(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> 
                 }
             }
         });
-    matvec_rows_bt_rem_scalar_generic(a, b, k, n, m, (n / JB) * JB, &mut c);
-    c
+    matvec_rows_bt_rem_scalar_generic(a, b, k, n, m, (n / JB) * JB, out);
 }
 
 /// 上のスカラー版用端数処理 (cfg を分けるため別名)。
@@ -662,12 +681,19 @@ pub fn i8_dot(a: &[i8], b: &[i8]) -> i32 {
 /// しない (アクティベーション量子化誤差を追加する)。int8 モードの仕様
 /// 「fp32 と同一出力ではない / 決定論は維持」は不変。fp32 モードは影響を受けない。
 pub fn matvec_bt_i8(a: &[f32], q: &[i8], scale: &[f32], k: usize, n: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; n];
+    matvec_bt_i8_into(a, q, scale, k, n, &mut c);
+    c
+}
+
+/// s63 (T5c): `matvec_bt_i8` の書き込み先指定版 (out: [n])。数値は同一。
+pub fn matvec_bt_i8_into(a: &[f32], q: &[i8], scale: &[f32], k: usize, n: usize, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), n);
     debug_assert_eq!(q.len(), k * n);
     debug_assert_eq!(scale.len(), n);
     let (aq, ascale) = quantize_row_i8(a);
     debug_assert_eq!(aq.len(), k);
-    let mut c = vec![0.0f32; n];
-    c.par_iter_mut()
+    out.par_iter_mut()
         .enumerate()
         .with_min_len(64)
         .for_each(|(j, cj)| {
@@ -675,7 +701,6 @@ pub fn matvec_bt_i8(a: &[f32], q: &[i8], scale: &[f32], k: usize, n: usize) -> V
             let dot = i8_dot(&aq, row);
             *cj = dot as f32 * ascale * scale[j];
         });
-    c
 }
 
 /// c[i][j] = (Σ_d aq_i[d] * q[j*k+d]) as f32 * ascale_i * scale[j]
@@ -693,10 +718,28 @@ pub fn matvec_rows_bt_i8(
     n: usize,
     m: usize,
 ) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    matvec_rows_bt_i8_into(a, q, scale, k, n, m, &mut c);
+    c
+}
+
+/// s63 (T5c): `matvec_rows_bt_i8` の書き込み先指定版 (out: [m,n])。数値は同一
+/// (量子化・整数ドット・j ブロック並列・端数処理のループ構成は不変)。
+pub fn matvec_rows_bt_i8_into(
+    a: &[f32],
+    q: &[i8],
+    scale: &[f32],
+    k: usize,
+    n: usize,
+    m: usize,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(out.len(), m * n);
     debug_assert_eq!(q.len(), k * n);
     debug_assert_eq!(scale.len(), n);
     if m == 1 {
-        return matvec_bt_i8(a, q, scale, k, n);
+        matvec_bt_i8_into(a, q, scale, k, n, out);
+        return;
     }
     // 各トークンを動的量子化 (decode と同一規則 → 行単位でビット一致)
     let mut aq = vec![0i8; m * k];
@@ -706,9 +749,8 @@ pub fn matvec_rows_bt_i8(
         aq[i * k..][..k].copy_from_slice(&qi);
         asc[i] = si;
     }
-    let mut c = vec![0.0f32; m * n];
     const JB: usize = 64;
-    let cp = SendPtr(c.as_mut_ptr());
+    let cp = SendPtr(out.as_mut_ptr());
     q.par_chunks_exact(k * JB)
         .zip(scale.par_chunks(JB))
         .enumerate()
@@ -731,11 +773,10 @@ pub fn matvec_rows_bt_i8(
             let sj = scale[j];
             for i in 0..m {
                 let dot = i8_dot(&aq[i * k..][..k], wrow);
-                c[i * n + j] = dot as f32 * asc[i] * sj;
+                out[i * n + j] = dot as f32 * asc[i] * sj;
             }
         }
     }
-    c
 }
 
 /// c[i][j] = (Σ_d aq_i[d] * q[j*k+d]) as f32 * ascale_i * scale[j]
@@ -759,6 +800,23 @@ pub fn matvec_rows_bt_i8(
 /// 演算列 (量子化 → i32 ドット → f32 変換 × asc × scale) は並列化前と同一の
 /// ためビット一致・スレッド数非依存。量子化 (行独立) も行並列にする。
 pub fn matmul_bt_i8(a: &[f32], q: &[i8], scale: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    matmul_bt_i8_into(a, q, scale, m, k, n, &mut c);
+    c
+}
+
+/// s63 (T5c): `matmul_bt_i8` の書き込み先指定版 (out: [m,n])。数値は同一
+/// (per-token 量子化・整数ドット・j ブロック並列・端数処理のループ構成は不変)。
+pub fn matmul_bt_i8_into(
+    a: &[f32],
+    q: &[i8],
+    scale: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(out.len(), m * n);
     debug_assert_eq!(q.len(), k * n);
     debug_assert_eq!(scale.len(), n);
     // 各トークンを動的量子化 (decode と同一規則 → 行単位でビット一致)。
@@ -773,10 +831,9 @@ pub fn matmul_bt_i8(a: &[f32], q: &[i8], scale: &[f32], m: usize, k: usize, n: u
             aq_row.copy_from_slice(&qi);
             *asc_row = si;
         });
-    let mut c = vec![0.0f32; m * n];
     // j を 32 チャネルずつのブロックで並列化 (false sharing を避ける)
     const JB: usize = 32;
-    let cp = SendPtr(c.as_mut_ptr());
+    let cp = SendPtr(out.as_mut_ptr());
     q.par_chunks_exact(k * JB)
         .zip(scale.par_chunks(JB))
         .enumerate()
@@ -787,7 +844,7 @@ pub fn matmul_bt_i8(a: &[f32], q: &[i8], scale: &[f32], m: usize, k: usize, n: u
                 let wrow = &qw[jj * k..][..k];
                 for i in 0..m {
                     let dot = i8_dot(&aq[i * k..][..k], wrow);
-                    unsafe { cp.write(i * n + j, dot as f32 * asc[i] * sj) };
+                    unsafe { cp.write(i * n + j, dot as f32 * asc[i] * sj) }
                 }
             }
         });
@@ -799,11 +856,10 @@ pub fn matmul_bt_i8(a: &[f32], q: &[i8], scale: &[f32], m: usize, k: usize, n: u
             let sj = scale[j];
             for i in 0..m {
                 let dot = i8_dot(&aq[i * k..][..k], wrow);
-                c[i * n + j] = dot as f32 * asc[i] * sj;
+                out[i * n + j] = dot as f32 * asc[i] * sj;
             }
         }
     }
-    c
 }
 
 /// 各行にバイアスを加算 (x: row-major [rows, cols])
@@ -1566,6 +1622,120 @@ mod tests {
             let pool = rayon::ThreadPoolBuilder::new().num_threads(th).build().unwrap();
             let c = pool.install(|| matmul_bt_i8(&a, &q, &scale, m, k, n));
             check(&c);
+        }
+    }
+
+    // =====================================================================
+    // s63 (T5c): `*_into` (書き込み先指定) API のビット一致テスト
+    //
+    // これらは prefill 線形層の「呼び出しごとの出力 Vec 確保」を廃止するために
+    // 追加した。呼び出し側が領域を使い回すため、**前回の中身が残っている
+    // バッファ**へ書いても旧 API (新規 vec! 確保) とビット一致することを
+    // 固定する (上書き漏れがあれば旧値が残って必ず落ちる)。
+    // =====================================================================
+
+    /// 旧値で埋めた再利用バッファを渡しても旧 API とビット一致すること。
+    fn check_into_matches(
+        name: &str,
+        len: usize,
+        f_old: impl Fn() -> Vec<f32>,
+        f_into: impl Fn(&mut [f32]),
+    ) {
+        let want = f_old();
+        let mut buf = vec![f32::from_bits(0x7fc0_1234); len]; // NaN パターンで事前充填
+        f_into(&mut buf);
+        assert_eq!(buf.len(), want.len(), "{name}: 長さ不一致");
+        for i in 0..want.len() {
+            assert_eq!(buf[i].to_bits(), want[i].to_bits(), "{name}: [{i}] ビット不一致");
+        }
+    }
+
+    #[test]
+    fn matvec_into_variants_match_legacy_bit_exact() {
+        let (k, n) = (128usize, 96usize); // n >= JB(64): vec 経路 + 端数 (96 = 64+32)
+        let m = 13usize;
+        let a = pseudo_random(m * k, 201);
+        let b = pseudo_random(k * n, 202);
+        let q = pseudo_random_i8(k * n, 203);
+        let scale: Vec<f32> = pseudo_random(n, 204).iter().map(|v| 0.01 + v.abs() * 0.02).collect();
+
+        for mm in [1usize, 2, m] {
+            check_into_matches(
+                &format!("matvec_rows_bt_into m={mm}"),
+                mm * n,
+                || matvec_rows_bt(&a[..mm * k], &b, k, n, mm),
+                |out| matvec_rows_bt_into(&a[..mm * k], &b, k, n, mm, out),
+            );
+            check_into_matches(
+                &format!("matvec_rows_bt_i8_into m={mm}"),
+                mm * n,
+                || matvec_rows_bt_i8(&a[..mm * k], &q, &scale, k, n, mm),
+                |out| matvec_rows_bt_i8_into(&a[..mm * k], &q, &scale, k, n, mm, out),
+            );
+            check_into_matches(
+                &format!("matmul_bt_i8_into m={mm}"),
+                mm * n,
+                || matmul_bt_i8(&a[..mm * k], &q, &scale, mm, k, n),
+                |out| matmul_bt_i8_into(&a[..mm * k], &q, &scale, mm, k, n, out),
+            );
+        }
+        check_into_matches(
+            "matvec_bt_into",
+            n,
+            || matvec_bt(&a[..k], &b, k, n),
+            |out| matvec_bt_into(&a[..k], &b, k, n, out),
+        );
+        check_into_matches(
+            "matvec_bt_i8_into",
+            n,
+            || matvec_bt_i8(&a[..k], &q, &scale, k, n),
+            |out| matvec_bt_i8_into(&a[..k], &q, &scale, k, n, out),
+        );
+    }
+
+    /// 小 n (< JB=64) の専用経路 (T5b) も `_into` でビット一致すること。
+    #[test]
+    fn matvec_rows_bt_into_small_n_matches_legacy() {
+        let (k, m) = (96usize, 11usize);
+        let a = pseudo_random(m * k, 211);
+        for n in [1usize, 3, 32, 63] {
+            let b = pseudo_random(k * n, 212 + n as u32);
+            check_into_matches(
+                &format!("matvec_rows_bt_into small n={n}"),
+                m * n,
+                || matvec_rows_bt(&a, &b, k, n, m),
+                |out| matvec_rows_bt_into(&a, &b, k, n, m, out),
+            );
+        }
+    }
+
+    // s63 TEMP-DIAG (commit 前に削除): 実形状で全要素が書かれるかを NaN 事前充填で確認。
+    #[test]
+    fn tmp_diag_into_covers_all_elements() {
+        for (k, n, m) in [
+            (96usize, 192usize, 5usize), // Full q_proj (heads*2*dh)
+            (96, 32, 5),                 // Full k/v (kv_heads*dh)
+            (96, 96, 5),                 // o_proj / down
+            (96, 128, 5),                // gate/up
+            (48, 96, 5),                 // GDN out_w (value_dim -> e)
+            (96, 48, 5),                 // GDN qkv?
+        ] {
+            let a = pseudo_random(m * k, 301);
+            let b = pseudo_random(k * n, 302);
+            let mut buf = vec![f32::from_bits(0x7fc0_1234); m * n];
+            matvec_rows_bt_into(&a, &b, k, n, m, &mut buf);
+            let stale = buf.iter().filter(|v| v.to_bits() == 0x7fc0_1234).count();
+            assert_eq!(stale, 0, "matvec_rows_bt_into k={k} n={n} m={m}: {stale} 個が未書き込み");
+            let q = pseudo_random_i8(k * n, 303);
+            let scale: Vec<f32> = pseudo_random(n, 304).iter().map(|v| 0.01 + v.abs() * 0.02).collect();
+            let mut buf2 = vec![f32::from_bits(0x7fc0_1234); m * n];
+            matvec_rows_bt_i8_into(&a, &q, &scale, k, n, m, &mut buf2);
+            let stale2 = buf2.iter().filter(|v| v.to_bits() == 0x7fc0_1234).count();
+            assert_eq!(stale2, 0, "matvec_rows_bt_i8_into k={k} n={n} m={m}: {stale2} 個が未書き込み");
+            let mut buf3 = vec![f32::from_bits(0x7fc0_1234); m * n];
+            matmul_bt_i8_into(&a, &q, &scale, m, k, n, &mut buf3);
+            let stale3 = buf3.iter().filter(|v| v.to_bits() == 0x7fc0_1234).count();
+            assert_eq!(stale3, 0, "matmul_bt_i8_into k={k} n={n} m={m}: {stale3} 個が未書き込み");
         }
     }
 }
