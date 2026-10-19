@@ -2957,7 +2957,7 @@ mod tests {
                 2,
                 &mut probe_out
             ),
-            "cuda 無効ビルドでは gdn_proj_into_gpu が false を返すこと"
+            "既定 (DENNO_GPU_GDN_PROJ 未設定) では gdn_proj_into_gpu が false を返すこと"
         );
         assert!(
             probe_out.iter().all(|v| v.is_nan()),
