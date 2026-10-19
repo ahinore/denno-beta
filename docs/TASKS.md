@@ -144,10 +144,25 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   (this container has no GPU).
 
 ### P3-3: extend the GPU-less kernel invariant tests
-- Status: s75 added a test that parses `kernels_int8.cu` `#define`s and checks stride and
-  block-shape invariants. `gdn.cu` and the elem kernels have the same class of risk
-  (4-byte casts on shared memory, block vs tile coverage).
-- Acceptance: the same static checks exist for every kernel that does smem casts.
+- Status: **implemented (s104/s105) — closed.** `tests/kernel_invariants.rs` now carries a
+  smem-cast scanner over every kernel file. It builds a shared-memory table from
+  `__shared__` / `extern __shared__` declarations plus the alias chain
+  (`float *s_sm = v_sm + ..`; dynamic region -> cap = i64::MAX), then classifies every
+  4-byte cast (`*(int*)&sA[r][c]` and `reinterpret_cast<const float2*>(&s_sm[..])`) as
+  numeric-ok / symbolic-row-ok / known-bad / unresolved, plus a 2-D reference pass
+  (row-stride times column alignment, out-of-declaration rows panic).
+  Self-check: deliberately broken defines (stride 35, column 9, tail past the array) must
+  still be reported, so a regex that matches nothing cannot stay green.
+- Acceptance: the same static checks exist for every kernel that does smem casts -> met for
+  `kernels_int8.cu` (6 casts), `kernels_elem.cu` (float2 casts), `gdn.cu`.
+- Known limits (recorded, not fixed): the row bound of a symbolic row is not checked (only
+  the column); row-alias form `const int *row = &sA[r];` does not exist in the tree and its
+  assertion is pinned to 0; float2 casts through a dynamic alias with a symbolic column stay
+  `unresolved` (alignment cannot be judged statically) — they are covered by
+  `elem_float2_casts_are_aligned` instead; the scanner is text-based, so a cast written
+  through an intermediate pointer variable is invisible.
+- `NO .cu/.ptx change`: the task was tests only, and any real violation found must be
+  reported to the main session (a .cu edit needs PTX regeneration + GPU_VERIFY).
 
 ### P3-4: fold the cold A/B into GPU_VERIFY
 - Status: **implemented (s102) — one command prints old/new medians and the delta %**.
