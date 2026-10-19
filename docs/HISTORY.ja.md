@@ -2068,6 +2068,160 @@ s79 以降も `gdn_proj_into_gpu` が常に false を返しており、beta/alph
 作業として残す (カーネルは他経路と共有していないが、PTX と .cu を同時に消さないと
 ビルド規約が崩れる)。Rust 側からの参照はもう無い。
 
+### GPU なしで回せる回帰チェッカー一式 — needle 想起と 10 ターン会話 (2026-10-19, s98 / s100 / s103 / s107) ✅
+
+> 「崩れる」系の不具合には、これまで再現手順が無かった。長文脈の needle 想起 (s73 の
+> 4,671 token の一発試験) と 10 ターン会話の崩壊 (s97 の調査) を、GPU 機で 1 コマンドで
+> 回せる台本に固定した。判定ロジックはすべて CPU 上で証明でき、実サーバを叩く部分は
+> 人間の手順として残す。数値経路には一切触れていない。
+
+**`scripts/needle_check.py` (s98 / P4-4)**: `scripts/needle_fixture.json` から
+**決定的な filler + needle** を組み立て、`/v1/chat/completions` を投げて 404 なら
+`/v1/messages` に落ちる (denno serve に chat 互換の口は無いので実質は必ず fallback)。
+filler は fixture に固定した LCG と 6 つの語表から作るため、同じ fixture からは
+バイト同一の payload が出る (子プロセス 2 本の実リクエスト本文を突き合わせて固定)。
+needle は filler とは無関係な話題 (倉庫・事務の作業) の英文に置くので、答えが局所文脈から
+出ることはない。判定は語境界つきで、`QX-44715` のような**紛らわしい近傍は想起成功と
+みなさない** (単純な部分一致なら通ってしまう)。終了コードは **0 = 想起 OK / 1 = 想起失敗
+(回帰) / 2 = 通信・解釈の失敗** で、2 を 1 と混ぜない (「測れなかった」を「壊れた」と
+誤報しないため)。トークン数はサーバが返す `usage` だけを採り、返らなければ「未計測」と
+書いて数字を作らない。
+
+**s100 の filler 補正**: s99 の実測 (chars/token = 5.1785) に合わせ、`filler_chars` を
+21,400 → **24,000** に一度だけ補正した。payload は 21,501 → **24,113 chars**
+(filler 24,073)、推定 **約 4,656 token**。**推定であって実測ではない**ので、実 8095 で
+`usage.input_tokens` を読んで 4,400〜5,000 に入っているかを確かめるのは人間対応。
+`scripts/needle_selftest.py` は偽サーバを立てて 25 tests (正常 / 誤答 / 近傍 / 省略 /
+HTTP 500 / 未接続 / 非 JSON / 404 fallback / 決定論 / 標準ライブラリのみ) を通す。
+
+**`scripts/long_conversation_check.py` (s97 で試作 → s103 で作り直し / P4-1)**:
+フィクスチャ `scripts/fixtures/long_conversation_turns.json` の 10 ターンを
+`/v1/messages` に流し、**返答を追記して会話を実際に伸ばす** (ターン N は 2N-1 メッセージ)。
+検出器は 7 種 — `repeat_line` (24 文字以上の同一行が 3 回連続)、`repeat_sentence`
+(末尾文の 3 回連続)、`long_line` (400 文字以上の返答で 1 行が 60% 以上)、
+`template_marker` (行頭に単独の `user` / `assistant` / `<|im_start|>` 等)、
+`fake_turn` (空行のあとに偽の `user` ブロック)、`empty`、`max_tokens`
+(`stop_reason` が max_tokens。**報告のみで失敗にしない**)。
+しきい値の境界は両側から固定した (23 文字は発火しない / 24 文字は発火する)。
+終了コードは **0 = 崩壊なし / 2 = 崩壊 (ターン・フラグ・根拠の表を出す) / 3 = 基盤の失敗**。
+ポート 8080 (serve 既定) と 8090 (本番) は接続前に拒否する。`--dry-run` と
+`--self-test` はソケットを 1 本も開かない (ソケット関数を差し替えて確認)。
+温度は**既定では送らない** — cap は serve 側の設定なので、こちらから上書きすると
+cap の回帰を検出できなくなる。そのため回帰検出は `--temperature 1.0 --expect-cap 0.7`
+の明示指定で行い、受理温度が cap を超えたら exit 2 にする (下記 s107)。
+`--out` の記録を `--replay` で読み直すと同じ判定になる (**サンプル文は決定的でないが、
+判定は記録に対して決定的**)。
+
+**s107 の整理**: s97 の `longconv_check.py` / `longconv_selftest.py` / `longconv_fixture.json`
+を廃止した。消す前に s97 側の `--expect-cap` (温度 cap の回帰検出) を
+`long_conversation_check.py` に移植している (P4-1 の受入条件そのものなので落とさない)。
+s97 の残りの機能 (OpenAI 互換の口・404 fallback・`--json-out`) は `needle_check.py` に
+既にある。あわせて `scripts/README.md` を新設し、スクリプトごとの目的・自己テスト・
+終了コード・GPU 機が要るか・対応する TASKS 項目を 1 表にした。ディレクトリ全体の規約は
+2 つ — **8080 / 8090 は拒否**、**スクリプトは報告だけをする (サーバの起動・停止はしない)**。
+
+**テスト (CPU のみ)**: `needle_selftest.py` 25 tests OK / `--help` OK、
+`test_long_conversation_check.py` 54 tests OK (s103 時点。s107 の cap 移植後は 67)、
+`long_conversation_check.py --self-test` = PASSED、`--dry-run` = 10 リクエスト本文を
+印字して終了 0。標準ライブラリのみ (`ast` で全 import を照合)。
+
+**人間対応 (測っていないこと)**: 実 8095 に対する needle の想起と実トークン数、実モデル
+での 10 ターン実行、`GPU_VERIFY` への組み込み。チェッカーが証明できるのは「検出器が
+決められた文字列で正しく発火する」ことと「偽サーバに対して正しく動く」ことまでで、
+**モデルの実際の挙動は未計測**。実測はまだ 1 つも無い。
+
+### カーネル不変条件を GPU なしの静的テストにする (2026-10-19, s100 / s105 / P3-3) ✅
+
+> s75 の共有メモリ整合テストは `src/cuda.rs` の `#[cfg(all(test, feature = "cuda"))]`
+> の中にあったため、**既定ビルド (cuda feature 無し) では原理的に走らなかった**。
+> これを feature ゲートの無い統合テストへ移し、同じ検査を全カーネルへ広げた。
+> `.cu` は `include_str!` でテキストとして読むだけで、GPU も cuda feature も要らない。
+
+**移設と横展開 (s100)**: `crates/denno-engine/tests/kernel_invariants.rs` (feature ゲート
+無し) に移した。カーネルのソースから**共有メモリ宣言表**を作り、ホスト側のミラー定数
+(Rust 側は `cuda.rs` のソーステキストから読む。feature 無しでは型として参照できない) と
+突き合わせる。対象は `kernels_int8.cu` (tile 128x256 / tk=32 / sp=36 / block 16x16 /
+smem 13,824 B / 共有 int アクセス 6 箇所)、`gdn.cu` (共有 float レイアウトと
+ホストの `(3*dk+dv+5)*4` の一致・pass-1 の `(2*dk+3)*4`・列配列 [256] と dk <= 256
+ゲート・conv のチャネル index の全チャネル被覆)、`kernels_elem.cu`
+(`PF_BQ`/`PF_BK` と `ATTN_PF_BQ`/`ATTN_PF_BK` の一致・smem 43,840 B (dh=128) /
+84,800 B (dh=256)・float2 のアラインメント・行ストライド `(dh+1)`・
+`extern __shared__` と `static __shared__` の排他)。
+
+**共有メモリのキャスト走査器 (s105)**: 宣言表から**別名チェーン**
+(`float *s_sm = v_sm + ..;`、動的領域は上限を `i64::MAX` とする) を作り、すべての
+4 バイトキャスト (`*(int*)&sA[r][c]`、`reinterpret_cast<const float2*>(&s_sm[..])`) を
+numeric-ok / symbolic-row-ok (行がループ添字や `blockIdx` のときは列のアンカーで整列を
+判定) / known-bad / unresolved に分類する。2 次元参照の走査は行ストライド×列の整列で
+行い、宣言行数を超えたときだけ panic する。
+
+**自己検証**: わざと壊した定義 (ストライド 35 / 列 9 / 配列の末尾越え) を必ず報告させる
+ので、何にも一致しない正規表現のまま緑になることはない。既知違反表は載せた箇所だけを
+抑制し、**表に無い違反が 1 件でも残れば赤になる**ことも別に断言している。
+s105 で 3 つの原因 (2 次元容量 / 記号行の列判定 / 閾値) を直し、最後の 3 断言を確定させた。
+とくに既知違反表の期待オフセットは旧パーサのバグを写した **11** だったので、実際の
+**113** (行 3 × ストライド 35 + 列 8) に直した。
+
+**テスト**: `cargo test -p denno-engine --test kernel_invariants` = **11 passed / 0 failed**
+(cuda feature 無し・3 カーネル分 11 本)。`cargo test -p denno-engine --lib` 240 passed /
+1 ignored、`cargo test -p denno-server` 77 passed で基準と一致。ミューテーション検査
+(`ATTN_PF_BQ=48` と gdn smem 式の改変) で 2 件 fail することを確認しており、
+ホスト/カーネルの乖離を実際に検出する。
+
+**これは静的な不変条件の網であって数値テストではない**: 演算結果は 1 ビットも見ていない。
+`.cu` / `.ptx` は無変更。走査器が未修正の実欠陥として固定している
+`dno_attention` の共有メモリ範囲外読みは、`.cu` 編集 + PTX 再生成 + `GPU_VERIFY` が要る
+ためメインセッション案件 (`elem_decode_attention_reduction_reads_past_smem_known_issue`
+が現状を固定しており、直した瞬間に赤になる)。
+
+### cold A/B ドライバと受入判定での役割 (2026-10-19, s102 / s103 / P3-4) ✅
+
+> prefill の受入は「cold 単発で 0.3 s 以上速い」だが、測定は毎回手作業で、しかも
+> 古い数字を新しい数字と混ぜて比較していた (8.71 s という水増しの原因)。
+> 交互 cold A/B の手順を 1 本のスクリプトに固定した。**判定はしない。報告だけする。**
+
+**`scripts/cold_ab.py` (s102)**: payload は PF_BENCH.sh と同じ決定的なもの
+(`docs/ARCHITECTURE.en.md` の先頭 20,000 バイトを filler にし、固定の system 行 +
+「東京の観光地を3つ教えて」・`max_tokens` 32・temperature 0・thinking off)。
+`json.dumps` で組み立て、PF_BENCH.sh の `printf`/`awk` と復号後の payload が一致する
+ことをテストで固定している。payload sha256 は
+`dead4c91a95296e76c43ba2f18111fc32869e48c1e4aff5bc0d290f01e4796f0`、20,664 バイト
+(system 20,050 バイト = 固定行 50 + filler)。`usage.input_tokens` が
+`--expect-input-tokens` (既定 5,686) と違えば **exit 2 で即中断**する
+(黙って payload が変わったら数字を信用しない)。
+
+**交互 cold 単発**: ラウンド 1 は old → new、ラウンド 2 は new → old と向きを交互にし、
+各測定はサーバを止める → 起動する (`DENNO_CUDA=1 DENNO_PROFILE=1 ... --seed 42 --quant int8`)
+→ `/health` を待つ (80 s) → **リクエストはちょうど 1 本** → wall と input/output tokens を
+記録 → 止めてポートが空くまで待つ。old/new それぞれの中央値と
+`delta = (new - old) / old * 100` (小数 1 桁) を出す。停止処理は `/proc/<pid>/exe` の
+realpath 照合に加えて、**自分が起動した PID を明示的に渡す** (スクリプト経由の子は
+`/proc/<pid>/exe` にバイナリのパスが出ないため。開発中に 1 ラウンド 30 s の待ちが出た
+実例があり、直したあと 30.02 s → 0.20 s)。
+
+**安全弁**: `--port 8080` / `--port 8090` を拒否、`--old` と `--new` が同一 (同じパス・
+symlink 経由の同じ realpath・同じ sha256) なら拒否、両方が実在する実行可能な通常ファイルで
+あることを要求。2 つの 9B を同時に走らせない。終了コードは **0 = 完走 / 1 = ラウンド失敗 /
+2 = payload ガード / 3 = 引数・安全弁**。`--dry-run` は payload sha256・ラウンド計画・
+コマンド行を出すだけで何も起動しない。`--self-test` は GPU・サーバ・cargo を使わない。
+
+**`--timeout-s` (s103)**: リクエストのタイムアウト (既定 600 s) と health 待ち
+(`max(--timeout-s, --health-timeout)`) に同じ値を使う。health の既定 80 s は据え置きなので
+既定の挙動と出力行は不変 (既定のときは timeout 行を出さない)。`--timeout-s <= 0` は
+他の安全弁と同じく exit 3。
+
+**役割の線引き**: スクリプトは数値を出すだけで、**「0.3 s 以上」の受入判定は監督役が
+中央値に対して行う**。`GPU_VERIFY` (gitignore 済み・運用側の持ち物) への組み込みは
+人間対応。テストは `python3 scripts/test_cold_ab.py` (s102 で 32 → s103 で 37 tests)。
+`TestEndToEnd` は偽 `denno` バイナリ (標準ライブラリの `http.server`) を**実際に子プロセスで
+起動**し、old → new → new → old の順序・起動ごとに 1 リクエスト・サーバに届いた payload・
+中央値と delta の印字・payload ガードの中断 (exit 2)・終了後にポートが空くことまで見る。
+
+**人間対応 (測っていないこと)**: 実 GPU 機での cold prefill の wall は 1 つも測っていない。
+テストに出る 0.011 s / 0.051 s は偽サーバの sleep 値であって denno の数字ではない。
+`input_tokens == 5,686` も実機で成立するかは未確認で、最初の実行が exit 2 になったら
+まず payload とトークナイザを疑う (ガードの目的は「静かな変化を大声にする」こと)。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)

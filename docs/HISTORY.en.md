@@ -2006,6 +2006,171 @@ are untouched. Regenerating PTX needs a GPU (nvcc), so deleting the .cu/.ptx pai
 task for the GPU machine (no other path shares the kernel, but .cu and .ptx must go together
 to keep the build convention intact). Nothing in Rust references it any more.
 
+### A set of regression checkers that run without a GPU — needle recall and the 10-turn conversation (2026-10-19, s98 / s100 / s103 / s107) ✅
+
+> Failures of the "it falls apart" kind had no reproduction steps. The long-context needle
+> (the one-off 4,671-token test of s73) and the 10-turn conversation collapse (the s97
+> investigation) are now a scripted fixture that runs as one command on a GPU host. Every
+> judging rule is provable on CPU; the part that talks to a real server stays a human step.
+> Nothing here touches the numeric path.
+
+**`scripts/needle_check.py` (s98 / P4-4)**: builds a **deterministic filler + needle** from
+`scripts/needle_fixture.json`, POSTs to `/v1/chat/completions` and falls back to
+`/v1/messages` on 404 (`denno serve` has no chat-compatible route, so in practice the fallback
+always fires). The filler comes from an LCG and six word tables fixed in the fixture, so the
+same fixture yields a byte-identical payload (pinned by comparing the real request bodies of
+two child processes). The needle sits in English prose whose topic (warehouse and office
+chores) is unrelated to the filler, so the answer cannot come from local context. Matching is
+word-boundary aware and a **confusable near miss such as `QX-44715` does not count as recall**
+(plain substring matching would have accepted it). Exit **0 = recall ok / 1 = recall failed
+(regression) / 2 = transport or parse failure**; 2 is never merged with 1, so "could not
+measure" is not reported as "broken". The only token number recorded is the server's own
+`usage`; without it the line says "unmeasured" rather than inventing a figure.
+
+**The s100 filler correction**: following the s99 measurement (chars/token = 5.1785),
+`filler_chars` was raised once, 21,400 → **24,000**. The payload went 21,501 →
+**24,113 chars** (filler 24,073), an estimated **~4,656 tokens** — **an estimate, not a
+measurement**, so reading `usage.input_tokens` on the real 8095 and checking the 4,400-5,000
+band is a human step. `scripts/needle_selftest.py` stands up a fake server and runs 25 tests
+(correct / wrong / near miss / omitted / HTTP 500 / connection refused / non-JSON / the 404
+fallback / determinism / stdlib only).
+
+**`scripts/long_conversation_check.py` (prototyped in s97, rebuilt in s103 / P4-1)**: drives
+the 10 turns of `scripts/fixtures/long_conversation_turns.json` against `/v1/messages`,
+**appending each reply so the conversation really grows** (turn N sends 2N-1 messages). Seven
+detectors: `repeat_line` (the same line of 24+ characters three times in a row),
+`repeat_sentence` (the same trailing sentence three times), `long_line` (one line covering 60 %
+or more of a reply longer than 400 characters), `template_marker` (a lone `user` / `assistant`
+/ `<|im_start|>` etc. at line start), `fake_turn` (a fabricated `user` block after a blank
+line), `empty`, and `max_tokens` (`stop_reason`, **reported only, never a failure**). The
+threshold boundaries are pinned from both sides (23 characters do not fire, 24 do). Exit
+**0 = clean / 2 = collapse (prints a turn/flag/evidence table) / 3 = infrastructure**.
+Ports 8080 (serve default) and 8090 (production) are refused before any connection.
+`--dry-run` and `--self-test` open zero sockets (verified by wrapping the socket functions).
+Temperature is **not sent by default** — the cap is a serve-side setting, and overriding it
+from here would make a cap regression undetectable; the regression check is therefore the
+explicit `--temperature 1.0 --expect-cap 0.7`, which exits 2 when the accepted temperature
+exceeds the cap (see s107 below). `--replay` re-judges an `--out` transcript to the same
+verdict (**the sampled text is not deterministic, the verdict on a transcript is**).
+
+**The s107 cleanup**: the s97 files `longconv_check.py` / `longconv_selftest.py` /
+`longconv_fixture.json` were retired. Before deleting, s97's `--expect-cap` (temperature-cap
+regression detection) was ported onto `long_conversation_check.py` — it *is* P4-1's acceptance
+criterion, so it was not dropped. The rest of s97 (the OpenAI-compatible endpoint, the 404
+fallback, `--json-out`) already lives in `needle_check.py`. `scripts/README.md` was added as
+one table of purpose, self-test command, exit codes, whether a GPU host is needed, and the
+TASKS item per script. Two rules hold for the whole directory: **8080 / 8090 are refused**, and
+**the scripts report only — they never start or stop a server**.
+
+**Tests (CPU only)**: `needle_selftest.py` 25 tests OK and `--help` OK,
+`test_long_conversation_check.py` 54 tests OK (as of s103; 67 after the s107 cap port), the
+checker's own `--self-test` PASSED, `--dry-run` printing 10 request bodies and exiting 0.
+Standard library only (every import checked with `ast`).
+
+**Human steps (what is not measured)**: needle recall and the real token count against a live
+8095, the 10-turn run against the real model, and wiring either checker into `GPU_VERIFY`. The
+checkers prove that the detectors fire on fixed strings and that everything behaves against a
+fake server; **the model's actual behaviour is unmeasured**. There is no real measurement yet.
+
+### Kernel invariants as a GPU-free static test (2026-10-19, s100 / s105 / P3-3) ✅
+
+> s75's shared-memory consistency test lived inside
+> `#[cfg(all(test, feature = "cuda"))]` in `src/cuda.rs`, so it **could not run at all in the
+> default build (no cuda feature)**. It moved to an integration test without a feature gate and
+> the same checks were extended to every kernel. `.cu` is read as text through `include_str!`:
+> no GPU and no cuda feature are involved.
+
+**Move and extension (s100)**: the tests now live in
+`crates/denno-engine/tests/kernel_invariants.rs` (no feature gate). A **shared-memory
+declaration table** is built from each kernel source and compared against the host-side mirror
+constants (the Rust side is read out of the `cuda.rs` source text, because without the feature
+the types cannot be referenced). Covered: `kernels_int8.cu` (tile 128x256 / tk=32 / sp=36 /
+block 16x16 / smem 13,824 B / 6 shared-int accesses), `gdn.cu` (the shared float layout against
+the host `(3*dk+dv+5)*4`, pass-1 `(2*dk+3)*4`, the `[256]` column arrays with the dk <= 256
+gate, and full channel coverage of the conv index), and `kernels_elem.cu` (`PF_BQ`/`PF_BK`
+against `ATTN_PF_BQ`/`ATTN_PF_BK`, smem 43,840 B at dh=128 and 84,800 B at dh=256, float2
+alignment, the `(dh+1)` row stride, and the exclusivity of `extern __shared__` versus
+`static __shared__`).
+
+**The shared-memory cast scanner (s105)**: from the declaration table it builds an **alias
+chain** (`float *s_sm = v_sm + ..;`; a dynamic region is capped at `i64::MAX`) and classifies
+every 4-byte cast (`*(int*)&sA[r][c]`, `reinterpret_cast<const float2*>(&s_sm[..])`) as
+numeric-ok / symbolic-row-ok (when the row is a loop index or `blockIdx`, the column anchor
+decides the alignment) / known-bad / unresolved. A second pass walks 2-D references by row
+stride times column alignment and panics only when a reference exceeds the declared rows.
+
+**Self-check**: deliberately broken definitions (stride 35, column 9, a tail past the array)
+must still be reported, so a regex that matches nothing cannot stay green. The known-violation
+table suppresses only the sites it lists, and a separate assertion requires **that at least one
+unlisted violation still fails the test**. s105 fixed the last three causes (2-D capacity, the
+column decision on a symbolic row, and a threshold) and settled the final three assertions. In
+particular the expected offset of the known violation was **11**, a value copied from an old
+parser bug, and is now the real **113** (row 3 x stride 35 + column 8).
+
+**Tests**: `cargo test -p denno-engine --test kernel_invariants` = **11 passed / 0 failed**
+(no cuda feature; 11 across the three kernels). `cargo test -p denno-engine --lib` 240 passed /
+1 ignored and `cargo test -p denno-server` 77 passed, matching the baseline. A mutation check
+(`ATTN_PF_BQ=48` and an edit to the gdn smem expression) fails two tests, so host/kernel drift
+is genuinely detected.
+
+**This is a static invariant net, not a numeric test**: not a single bit of a result is
+inspected. `.cu` / `.ptx` are unchanged. The `dno_attention` shared-memory out-of-bounds read
+that the scanner pins as a real, unfixed defect needs a `.cu` edit, PTX regeneration and
+`GPU_VERIFY`, so it stays with the main session
+(`elem_decode_attention_reduction_reads_past_smem_known_issue` freezes the current state and
+turns red the moment it is fixed).
+
+### The cold A/B driver and its role in acceptance (2026-10-19, s102 / s103 / P3-4) ✅
+
+> Prefill acceptance is "at least 0.3 s faster, cold single shot", but every measurement was
+> done by hand and old numbers were compared against new ones (the source of the inflated
+> 8.71 s figure). The alternating cold A/B protocol is now one script. **It does not decide
+> acceptance; it reports.**
+
+**`scripts/cold_ab.py` (s102)**: the payload is PF_BENCH.sh's deterministic one (the first
+20,000 bytes of `docs/ARCHITECTURE.en.md` as filler, a fixed system line, the message
+"東京の観光地を3つ教えて", `max_tokens` 32, temperature 0, thinking off), assembled with
+`json.dumps`; a test runs PF_BENCH.sh's own `printf`/`awk` block and asserts the decoded
+payloads are equal. Payload sha256 =
+`dead4c91a95296e76c43ba2f18111fc32869e48c1e4aff5bc0d290f01e4796f0`, 20,664 bytes (system
+20,050 = a fixed 50-byte line + the filler). If `usage.input_tokens` differs from
+`--expect-input-tokens` (default 5,686) the run **aborts immediately with exit 2** (a silently
+changed payload must not produce a number anyone trusts).
+
+**Alternating cold single shot**: round 1 runs old → new, round 2 new → old, and so on. Each
+measurement stops any server, starts the binary (`DENNO_CUDA=1 DENNO_PROFILE=1 ... --seed 42
+--quant int8`), waits for `/health` (80 s), issues **exactly one request**, records wall time
+and input/output tokens, then stops the server and waits for the port to be free. It prints the
+per-binary medians and `delta = (new - old) / old * 100` to one decimal. Stopping matches
+`/proc/<pid>/exe`'s realpath and **also takes the PIDs the script started explicitly**, because a
+child launched through the script does not show the binary path in `/proc/<pid>/exe` (a real
+30 s-per-round stall during development, 30.02 s → 0.20 s once fixed).
+
+**Guards**: `--port 8080` and `--port 8090` are refused; identical `--old`/`--new` (same path,
+same realpath through a symlink, or same sha256) is refused; both must be existing executable
+regular files. Two 9B instances are never run at once. Exit codes: **0 = completed / 1 = a round
+failed / 2 = payload guard / 3 = argument or safety error**. `--dry-run` prints the payload
+sha256, the round plan and the command lines and starts nothing; `--self-test` needs no GPU, no
+server and no cargo.
+
+**`--timeout-s` (s103)**: one value for the request timeout (default 600 s) and the health wait
+(`max(--timeout-s, --health-timeout)`). The health default stays 80 s, so default behaviour and
+the existing output lines are unchanged (no timeout line is printed at the default).
+`--timeout-s <= 0` exits 3 like the other guards.
+
+**Where the line is drawn**: the script produces numbers only; **the ">= 0.3 s" acceptance
+rule is applied by the supervisor** to the medians. Wiring it into `GPU_VERIFY` (gitignored,
+operator-owned) is a human step. Tests: `python3 scripts/test_cold_ab.py` (32 in s102, 37 after
+s103). `TestEndToEnd` starts the fake `denno` binaries (stdlib `http.server`) **as real child
+processes** and checks the old → new → new → old order, exactly one request per server start,
+the payload that reaches the server, the printed medians and delta, the payload guard aborting
+with exit 2, and the port being free afterwards.
+
+**Human steps (what is not measured)**: no cold prefill wall time has been measured on a GPU
+host. The 0.011 s / 0.051 s in the test output are fake-server sleeps, not denno numbers.
+Whether `input_tokens == 5,686` holds on the real build is unconfirmed; if the first run exits 2,
+suspect the payload and the tokenizer first (the guard exists to make a silent change loud).
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
