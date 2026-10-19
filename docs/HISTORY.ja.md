@@ -1364,6 +1364,62 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **テスト数**: 300 → 301 passed / 0 failed / 18 ignored (`cargo test --workspace`)
 - **教訓**: **何も生成しないイテレータ**は最も高くつく境界バグ — ブロックサイズの上側の端数だけでなく、ブロックサイズ**未満**の領域も必ずテストで覆う。また `apply_bt_rows` という名前が「バッチ版 GPU 経路」を意味するわけではなく、**dtype が経路を決める**
 
+### prefill の律速は GPU ではなく「結果コピー」だった — `to_vec` 廃止と層バッファ再利用 ✅ (2026-10-19, s63)
+
+> 依頼は「プログラム全体のプロファイル → 可視化 → ボトルネックの正確な特定」。T5a/T5b は GPU 側 (カーネル・経路・並列度) を触ってきたが、**計測してみると prefill 46.2 s のうち GPU 演算は 5.9 s (12.7%) しかなかった**。最大の項目は `linear_gemm` の戻り値コピー (`to_vec`) で、これが 21.8 s (47%) を占めていた。数値に一切触らずに **−17 s** 出た。
+
+**計測方法** (コンテナは ptrace 不可 = `perf`/`gdb` とも不可。4 系統を突き合わせ):
+
+- `DENNO_PROFILE=1` のバケット集計 (`scheduler.rs` のリクエスト完了時出力)
+- `linear_gemm` / `maybe_gpu_linear` への**一時計測パッチ** (prep / H2D / quant / gemm / D2H / 結果コピーを 6 分割。5,686 token の prefill 1 回 + decode で **全 400 呼び出しを 1 回ずつ**計時し、`n` 別に集計。計測後 `git checkout --` で撤去)
+- `nvidia-smi` の 0.5 s サンプリング (SM 稼働率 11.6%)
+- `/proc/<pid>/stat` の utime+stime (プロセス CPU 88.3 s / wall 45.5 s = **1.94 コア**)
+
+**実測内訳** (5,686 token cache-miss prefill 1 回・warm):
+
+| 区間 | 合計 | 1 呼び出し | 備考 |
+|---|---|---|---|
+| 結果コピー `to_vec()` | **21.8 s** | 188 ms (n=12288) | 279 MB の**新規 Vec 確保 + コピー**・実効 1.48 GB/s・page fault 68k/呼び出し |
+| GPU 実働 (GEMM + D2H + sync) | 5.9 s | 39 ms | 78.5 TFLOP / 13.4 TFLOP/s |
+| 入力コピー (既存 pinned へ) | 1.7 s | 6.8 ms | **13.7 GB/s** (同じコードが 279 MB では 1.48 GB/s = 差は確保と初回タッチ) |
+| H2D / 量子化 / 起動 / D2H 起動 | 0.018 s | — | 400 呼び出し合計。起動オーバーヘッドは無罪 |
+
+**原因**: `cuda.rs::linear_gemm` の末尾 `Ok(ho.as_slice::<f32>()[..m * n].to_vec())`。pinned `ho` から**呼び出しごとに新しい Vec を確保**して返していた。prefill は層ごとに m×n が最大 5,692×12,288 (279 MB) になり、確保 + 初回タッチのページフォルトだけで 1 呼び出し 168 ms。形状はモデルで固定なので、層をまたいで同じ大きさの領域を毎層捨てて作り直していたことになる。
+
+**修正 (3 層に `_into` を貫通させ、prefill の作業バッファを層ループの外へ出す)**:
+
+- `tensor.rs` (T5c): `matvec_rows_bt_into` / `matvec_bt_into` / `matvec_bt_i8_into` / `matvec_rows_bt_i8_into` / `matmul_bt_i8_into` — 旧 API は「確保 + `_into`」の薄いラッパに。SIMD 本体は `out` へ直接書く (ループ構成・累積順・レーン配置は不変 = **bit 一致**)
+- `cuda.rs`: `linear_gemm_into` (D2H 後に `dst` へコピー) と `maybe_gpu_linear_into` (`bool` 返し。判定・重みキャッシュ・`GPU_BROKEN` ラッチの規約は旧関数と同一)。`maybe_gpu_linear` は確保 + `_into` のラッパに
+- `quant.rs`: `Linear::apply_bt_rows_into` (GPU → CPU の順で、どちらも呼び出し側の領域へ直接書く)
+- `qwen35.rs` prefill: `h` / `h2` / `qkv` / `z` / `beta` / `alpha` / `out` / `qg` / `k` / `v` / `q` / `att` / `gate` / `up` / `hh` / `down` の 16 本を**層ループの外で 1 回だけ確保** (`fit_prefill_buf` は長さ一致なら no-op)
+
+**踏んだ罠 (重要)**: `full_attn_attend_head` は出力を **`*a += pv * b` で加算**する (k 昇順の逐次累積が bit 一致の根拠)。旧実装は層ごとに `vec![0.0]` を確保していたので暗黙にゼロ初期化されていたが、領域を使い回すと前層の値が残る。`qwen38_27b_shape_prefill_batch_bit_exact` が落ち、**バッファを 1 本ずつ戻す bisect (6 ビルド)** で `att` が原因と特定。修正は `att` の並列 fill (`par_chunks_exact_mut(dh).for_each(|c| c.fill(0.0))`) で、旧実装と同じ状態を明示的に作る (数値・順序に影響しない)。**「新しい Vec はゼロ」に暗黙依存している箇所は、再利用に変えると必ず壊れる**。
+
+**結果** (5,686 token cache-miss prefill・warm):
+
+- prefill **46.2 s → 28.1 s (−38%)**・**123 → 202 tok/s**
+- decode 300 token: 10.05 s (33.6 ms/token) — **変化なし** (decode は `_into` を通らないため。想定どおり)
+- 結果コピー 21.8 s → 約 2.5 s (純粋な memcpy のみ)
+- `cargo test --workspace`: 全テスト成功 (失敗 0)。GPU アンカー (default/brief 1b・2b・full 1b) は不変
+
+**修正後の内訳** (`DENNO_PROFILE`・prefill 1 リクエスト):
+
+| 項目 | ms | share |
+|---|---|---|
+| d2h_state | 10,604 | 28.0% |
+| gate_up_proj | 7,227 | 19.1% |
+| gdn_proj (β/α) | 5,438 | 14.4% |
+| qkv_proj | 4,064 | 10.7% |
+| gdn_scan | 3,159 | 8.3% |
+| down_proj | 2,713 | 7.2% |
+| o_proj | 1,482 | 3.9% |
+| swiglu | 847 | 2.2% |
+| rmsnorm / qk_norm / rope | 410 / 340 / 245 | 2.6% |
+
+(バケットは親子で二重に計上されるため合計 37.9 s > wall 33.6 s。`d2h_state` は `attn_core` と重なる。)
+
+**次の一手**: 最大項目は **`d2h_state` 10.6 s (168 call・prefill 中に層ごとに GDN 状態を D2H)**。T5b の本命 L1 (`GdnDev` 常駐化) がそのまま効く。次いで `gdn_proj` 5.4 s (n=32 の F32 投影) と `gate_up_proj` 7.2 s (GPU 実働 75 ms + コピー)。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
