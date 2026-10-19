@@ -157,8 +157,9 @@ def parse_cold_ab_payload(payload, name="<payload>"):
     protocol = payload.get("protocol")
     if not isinstance(protocol, dict):
         protocol = {}
-    # era の出どころ: cold_ab.py の JSON には era フィールドが無いので、外部で
-    # 付けた "era" / "label" を優先し、無ければファイル名を使う (HTML にも出す)。
+    # era の出どころ: cold_ab.py --json --era LABEL が "era" を直接書く (s110 以降)。
+    # s110 以前の JSON や手で足した JSON のために "label" も読み、どちらも無ければ
+    # ファイル名を使う (HTML の表にも出すが、それは fallback であることを表す)。
     label = payload.get("era")
     era_source = "era"
     if label is None:
@@ -443,7 +444,8 @@ def render_html(runs, pf_points, pf_name, changes, max_tokens=None):
     pre_markers = marker_indices(pre, changes)
     dec_markers = marker_indices(dec, changes)
 
-    # ヘッダ表 (cold A/B の run ごとの中央値と delta)
+    # ヘッダ表 (cold A/B の run ごとの中央値と delta)。era は JSON の "era" / "label"
+    # が無いときだけファイル名になる (その場合は era_source == "filename")。
     rows = []
     for r in runs:
         rows.append(

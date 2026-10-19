@@ -450,10 +450,69 @@ class TestCli(unittest.TestCase):
             self.assertFalse(cold_ab.tcp_in_use(port), "dry-run must not bind the port")
 
 
+class TestEraFlag(unittest.TestCase):
+    """s110: --era LABEL は --json のメタデータだけ。測定も表示も変えない。"""
+
+    def mk(self, **kw):
+        import argparse
+        base = {"rounds": 1, "port": 8095, "max_tokens": 32,
+                "expect_input_tokens": 5686, "old": "/tmp/a", "new": "/tmp/b",
+                "self_test": False, "dry_run": True,
+                "health_timeout": cold_ab.HEALTH_TIMEOUT_S,
+                "timeout_s": cold_ab.DEFAULT_TIMEOUT_S, "era": None}
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_default_is_none(self):
+        args = cold_ab.build_parser().parse_args(["--old", "/tmp/a", "--new", "/tmp/b"])
+        self.assertIsNone(args.era)
+
+    def test_validate_args_ignores_era(self):
+        # era は測定の前提条件ではないので、validate_args の結果を変えない
+        self.assertEqual(cold_ab.validate_args(self.mk()), [])
+        self.assertEqual(cold_ab.validate_args(self.mk(era="s110")), [])
+        self.assertEqual(cold_ab.validate_args(self.mk(era="s110", port=8090))[0][:7],
+                         "--port ")
+
+    def test_attach_era_only_adds_one_key(self):
+        r = {"payload_sha256": "x", "measurements": [{"wall": 1.0}], "stats": {"k": 1}}
+        self.assertIs(cold_ab.attach_era(r, None), r)
+        out = cold_ab.attach_era(r, "s110")
+        self.assertEqual(out["era"], "s110")
+        self.assertEqual({k: v for k, v in out.items() if k != "era"}, r)
+        self.assertNotIn("era", r, "the result dict must not be mutated")
+        self.assertIs(out["measurements"], r["measurements"])
+
+    def test_cli_rejects_empty_and_control_characters(self):
+        for bad in ("", "   ", "a\tb", "a\nb"):
+            r = subprocess.run([sys.executable, SCRIPT, "--old", "/tmp/a", "--new", "/tmp/b",
+                                "--json", "/tmp/x.json", "--era", bad],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, "argparse usage error for %r: %s"
+                             % (bad, r.stderr))
+            self.assertIn("--era", r.stderr)
+
+    def test_cli_rejects_a_long_label(self):
+        r = subprocess.run([sys.executable, SCRIPT, "--old", "/tmp/a", "--new", "/tmp/b",
+                            "--json", "/tmp/x.json", "--era", "a" * 65],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("at most", r.stderr)
+
+    def test_era_without_json_is_a_noop(self):
+        # 表示にだけ効く他のフラグと同じ扱い: エラーにせず、dry-run の出力も変えない
+        base = [sys.executable, SCRIPT, "--old", "/tmp/a", "--new", "/tmp/b", "--dry-run"]
+        r0 = subprocess.run(base, capture_output=True, text=True)
+        r1 = subprocess.run(base + ["--era", "s110"], capture_output=True, text=True)
+        self.assertEqual(r0.returncode, 0, r0.stderr)
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.assertEqual(r0.stdout, r1.stdout, "--era must not change the report")
+
+
 class TestEndToEnd(unittest.TestCase):
     """偽バイナリを本物の子プロセスで立て、交互ラウンドを通しで確かめる。"""
 
-    def run_ab(self, old_tokens=5686, new_tokens=5686, rounds=2):
+    def run_ab(self, old_tokens=5686, new_tokens=5686, rounds=2, era=None):
         td = tempfile.mkdtemp(prefix="cold_ab_test_")
         log = os.path.join(td, "requests.jsonl")
         port = free_port()
@@ -462,12 +521,14 @@ class TestEndToEnd(unittest.TestCase):
         b = write_fake_binary(os.path.join(td, "new_bin"), "NEW", new_tokens,
                               delay=0.01, log=log)
         out_json = os.path.join(td, "out.json")
-        r = subprocess.run([sys.executable, SCRIPT, "--old", a, "--new", b,
-                            "--port", str(port), "--rounds", str(rounds),
-                            "--expect-input-tokens", "5686",
-                            "--health-timeout", "20", "--log-dir", td,
-                            "--json", out_json],
-                           capture_output=True, text=True, timeout=180)
+        argv = [sys.executable, SCRIPT, "--old", a, "--new", b,
+                "--port", str(port), "--rounds", str(rounds),
+                "--expect-input-tokens", "5686",
+                "--health-timeout", "20", "--log-dir", td,
+                "--json", out_json]
+        if era is not None:
+            argv += ["--era", era]
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=180)
         entries = []
         if os.path.exists(log):
             with open(log, "r", encoding="utf-8") as f:
@@ -520,6 +581,37 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertFalse(cold_ab.tcp_in_use(port), "port must be released")
         self.assertEqual(result["leftover_pids"], [])
+
+    def test_era_is_written_and_measured_nothing_differently(self):
+        # 同じ設定で --era 有り / 無しを回し、差分が "era" キーだけであることを見る
+        r0, entries0, plain, port0, _ = self.run_ab(rounds=1)
+        r1, entries1, tagged, port1, _ = self.run_ab(rounds=1, era="s110")
+        self.assertEqual(r0.returncode, 0, r0.stdout[-2000:])
+        self.assertEqual(r1.returncode, 0, r1.stdout[-2000:])
+        self.assertEqual(tagged.get("era"), "s110")
+        self.assertNotIn("era", plain)
+        # 2 回の実行は別の一時ディレクトリ・別の実測値なので、byte 比較ではなく
+        # キー集合と各セクションのキー集合が同じであることを見る。
+        self.assertEqual(sorted(tagged), sorted(set(plain) | {"era"}))
+        self.assertEqual(sorted(tagged["stats"]), sorted(plain["stats"]))
+        self.assertEqual(sorted(tagged["protocol"]), sorted(plain["protocol"]))
+        for name in ("old", "new"):
+            self.assertEqual(sorted(tagged["stats"][name]), sorted(plain["stats"][name]))
+        self.assertEqual([sorted(m) for m in tagged["measurements"]],
+                         [sorted(m) for m in plain["measurements"]])
+        self.assertEqual({k: v for k, v in tagged["protocol"].items() if k != "port"},
+                         {k: v for k, v in plain["protocol"].items() if k != "port"},
+                         "the protocol is unchanged (only the ephemeral port differs)")
+        # 測定そのもの (ラウンド・payload・token 数) は変わらない
+        self.assertEqual(len(entries0), len(entries1))
+        self.assertEqual([e["tag"] for e in entries0], [e["tag"] for e in entries1])
+        self.assertEqual([e["system_bytes"] for e in entries0],
+                         [e["system_bytes"] for e in entries1])
+        self.assertEqual(tagged["payload_sha256"], plain["payload_sha256"])
+        self.assertEqual(len(tagged["measurements"]), len(plain["measurements"]))
+        # 表示も変わらない (stdout はホスト/ポート依存の部分を除いて同一)
+        self.assertNotIn("era=", r0.stdout)
+        self.assertIn("(era=s110)", r1.stdout)
 
 
 if __name__ == "__main__":

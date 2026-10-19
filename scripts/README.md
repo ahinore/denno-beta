@@ -21,10 +21,10 @@ Two rules that hold everywhere in this directory:
 | `needle_check.py` | Long-context needle recall: builds a filler + needle payload, tries `/v1/chat/completions` and falls back to `/v1/messages` on 404, and checks the answer against the expected passphrase. | `python3 scripts/needle_selftest.py` (separate file); the script itself has no `--self-test` | 0 recall ok / 1 recall failed (= regression) / 2 transport or parse failure (never confused with 1) | Yes, for a real run | P4-4 |
 | `needle_selftest.py` | Self-test for `needle_check.py`: starts a fake server and verifies each exit code, the 404 fallback, and payload determinism. | `python3 scripts/needle_selftest.py -v` | 0 all pass / 1 at least one check fails | No | P4-4 |
 | `needle_fixture.json` | Filler, needle and expected answer for `needle_check.py`. | Read by the script and its self-test | — | — | P4-4 |
-| `cold_ab.py` | Cold single-shot A/B driver: alternates two binaries cold-start, sends one fixed request each, and reports median wall time and delta %. | `python3 scripts/cold_ab.py --self-test`; `--dry-run` prints the payload sha256 and the round plan without starting anything | 0 ok / 2 failure or guard trip / 3 infrastructure | Yes (real measurement) | P3-4 |
-| `test_cold_ab.py` | `unittest` suite for `cold_ab.py`: round plan, median/delta maths, payload determinism, safety guards, and the full path against a fake server. | `python3 scripts/test_cold_ab.py -v` | 0 all pass / 1 at least one test fails | No | P3-4 |
-| `dashboard.py` | P5-1 dashboard: reads every `*.json` from `cold_ab.py --json` in a directory plus an optional `PF_BENCH` log, and writes one self-contained HTML file (inline SVG, no script/CDN/fonts) with **prefill (s)** and **decode (ms/token)** on two separate axes, x = measurement order. `--protocol-change LABEL` draws a vertical marker where that era starts (repeatable); a panel with fewer than 2 points says "not enough points". Decode points come from the PF lines (`wall * 1000 / tokens`, tokens = the line's `output_tokens` else `--max-tokens`); the cold A/B JSON has no decode number, so it never invents one. Output is byte-identical for the same inputs. | `python3 scripts/dashboard.py --self-test` | 0 ok / 1 unusable input (bad JSON, missing dir, no points; no partial `--out` is left) / 2 usage error | No (the chart is CPU-only; the *data* needs a GPU host) | P5-1 |
-| `test_dashboard.py` | `unittest` suite for `dashboard.py`: byte-identical output on two runs, both panels with their own units, marker only when `--protocol-change` matches, the single-point "not enough points" path with no NaN/Inf, malformed JSON naming the file (exit 1), one point per PF line, and `--help`. | `python3 scripts/test_dashboard.py -v` | 0 all pass / 1 at least one test fails | No | P5-1 |
+| `cold_ab.py` | Cold single-shot A/B driver: alternates two binaries cold-start, sends one fixed request each, and reports median wall time and delta %. `--json PATH` writes the machine-readable payload; `--era LABEL` adds a top-level `"era"` key to that payload (metadata only: it does not change the measurement, the payload sha256 or the printed report, and without `--json` it is a no-op). | `python3 scripts/cold_ab.py --self-test`; `--dry-run` prints the payload sha256 and the round plan without starting anything | 0 ok / 2 failure or guard trip / 3 infrastructure (2 also for a bad `--era` value: argparse usage error) | Yes (real measurement) | P3-4 |
+| `test_cold_ab.py` | `unittest` suite for `cold_ab.py`: round plan, median/delta maths, payload determinism, safety guards, `--era` (accepted / validated / written, and nothing else changes), and the full path against a fake server. | `python3 scripts/test_cold_ab.py -v` (44 tests) | 0 all pass / 1 at least one test fails | No | P3-4 |
+| `dashboard.py` | P5-1 dashboard: reads every `*.json` from `cold_ab.py --json` in a directory plus an optional `PF_BENCH` log, and writes one self-contained HTML file (inline SVG, no script/CDN/fonts) with **prefill (s)** and **decode (ms/token)** on two separate axes, x = measurement order. `--protocol-change LABEL` draws a vertical marker where that era starts (repeatable); a panel with fewer than 2 points says "not enough points". The era of a run is its JSON `"era"` key (written by `cold_ab.py --era`), else `"label"`, else the file name; `parse_cold_ab_payload()` returns which one it used in `era_source` (`era` / `label` / `filename`). Decode points come from the PF lines (`wall * 1000 / tokens`, tokens = the line's `output_tokens` else `--max-tokens`); the cold A/B JSON has no decode number, so it never invents one. Output is byte-identical for the same inputs. | `python3 scripts/dashboard.py --self-test` | 0 ok / 1 unusable input (bad JSON, missing dir, no points; no partial `--out` is left) / 2 usage error | No (the chart is CPU-only; the *data* needs a GPU host) | P5-1 |
+| `test_dashboard.py` | `unittest` suite for `dashboard.py`: byte-identical output on two runs, both panels with their own units, marker only when `--protocol-change` matches, the single-point "not enough points" path with no NaN/Inf, malformed JSON naming the file (exit 1), one point per PF line, the `cold_ab.py --era` → dashboard round trip (`era_source == "era"`, plus the `label` and `filename` fallbacks), and `--help`. | `python3 scripts/test_dashboard.py -v` (21 tests) | 0 all pass / 1 at least one test fails | No | P5-1 |
 | `fixtures/long_conversation_turns.json` | The fixed 10 prompts for `long_conversation_check.py`. Do not reorder or renumber; append only, and say why in `docs/TASKS.md`. | Asserted by `test_long_conversation_check.py` | — | — | P4-1 |
 
 ## Running the whole GPU-free gate
@@ -64,6 +64,34 @@ stage plus a final `PASS`/`FAIL`, and exits 0 only if everything passed.
 This covers the CPU half of P4-1, P4-4, P5-1 and the P3-4 / P5-1 driver tests. It
 cannot cover the GPU half (a real 8095 run, the cold A/B measurement); those stay
 human steps.
+
+## Cold A/B → dashboard (P3-4 / P5-1)
+
+`cold_ab.py --json` is the machine-readable source; `--era LABEL` stamps the run so
+the dashboard never has to guess which era a number belongs to.
+
+```sh
+# one JSON per measurement (the human runs this on a GPU host)
+python3 scripts/cold_ab.py --old <old-bin> --new <new-bin> \
+    --json /tmp/cold_ab_runs/s110_<build>.json --era s110
+
+# the dashboard: era comes from "era" (else "label", else the file name)
+python3 scripts/dashboard.py --cold-ab-dir /tmp/cold_ab_runs \
+    --pf-bench-log /tmp/pf_bench_<build>.log --max-tokens 32 \
+    --protocol-change s110 --out /tmp/dashboard.html
+```
+
+- `--era LABEL`: 1–64 characters, no control characters, edges trimmed. It only adds
+  a top-level `"era"` key to the `--json` payload — the measurement, the payload
+  sha256, the round plan and the printed report are unaffected, and `--json` without
+  `--era` writes exactly the bytes it wrote before s110. Without `--json` it is a
+  no-op (no error); `--dry-run` ignores it too.
+- A bad `--era` (empty, too long, control characters) is an argparse usage error:
+  exit 2, nothing is measured.
+- JSONs written before s110 have no `era` key; the dashboard still reads `label`,
+  then the file name, and reports which one it used in `era_source`.
+- The round trip is covered on CPU: `test_cold_ab.py` (cold_ab side) and
+  `test_dashboard.py::TestEraRoundTrip` (dashboard side, `era_source == "era"`).
 
 ## The long-conversation run (P4-1)
 
