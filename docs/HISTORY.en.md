@@ -1545,6 +1545,19 @@ The pinned→heap `memcpy` reaches only **4.7 GB/s**, while a direct D2H into a 
 
 **Remaining split** (per request): `d2h_state` 8.2 s / `attn_core` 4.9 s (`gdn_scan` 2.6 + `gdn_proj` 1.1 + `attn_full` 1.2) / `gate_up` 2.9 s / `qkv` 1.6 s / `down` 1.4 s / `swiglu` 0.83 s / `o_proj` 0.64 s / `rmsnorm` 0.41 s. **D2H is still the target**: `chain_download` (93 MB of attention output) and o_proj's `to_vec` still take the pinned route. The real fix is to keep activations on the device and fold swiglu / rmsnorm / residual on the GPU so the D2H disappears entirely.
 
+### Chain D2H no longer stages through pinned memory ✅ (2026-10-19, s69)
+
+> s68 removed the double copy on the GEMM path, but fetching the attention output (`chain_download`) and the o_proj return value (`maybe_gpu_oproj`) still went "D2H into a pinned buffer, then `to_vec` into the heap" — writing 93 MB twice per call.
+
+**Change** (`cuda.rs`):
+
+- `chain_download` / `chain_download_at`: reserve the result `Vec` with `with_capacity`, issue the D2H straight into that uninitialised storage, and `set_len` once the copy completes. The pinned staging buffer (`pin_dn`) is gone.
+- `maybe_gpu_oproj`: same treatment — no pinned `ho`, D2H directly into the returned `Vec`.
+
+**Numerics**: only the destination changed; contents and arithmetic order are untouched = **bit identical** (all three anchors MATCH).
+
+**Result**: prefill **14.80 s → 14.50 s** (384 → 392 tok/s); 231 tests pass.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
