@@ -318,22 +318,6 @@ pub fn time_layer_n<T>(op: usize, _layer: usize, rows: usize, f: impl FnOnce() -
     time_layer_n_ev(op, _layer, rows, || (f(), false)).0
 }
 
-/// s58 (T5a): `time_n` の実行先ラベル付き版。`f` は「計測区間内の GPU 線形呼び出しが
-/// 実際に走ったか」を返す (呼び出し側は `cuda::last_linear_ran_on_gpu()` の実測を
-/// そのまま渡す — model 側の主張ではなく実測で `via` 列を決める)。
-/// 計測専用で戻り値の型・数値経路には触れない (PROFILE off は素通し)。
-pub fn time_n_ev<T>(op: usize, rows: usize, f: impl FnOnce() -> T) -> T {
-    #[cfg(feature = "cuda")]
-    let on_gpu = || crate::cuda::last_linear_ran_on_gpu();
-    #[cfg(not(feature = "cuda"))]
-    let on_gpu = || false;
-    time_full(op, rows, false, || {
-        let r = f();
-        (r, on_gpu())
-    })
-    .0
-}
-
 /// s57 (T4): `time_layer` のバッチ幅 + 実行先ラベル付き版。`f` は
 /// `(値, GPU で走ったか)` を返す。ラベルはクロージャの戻り値から得るので
 /// 数値経路の分岐には一切影響しない。PROFILE 無効時は素通し (完全 no-op)。
