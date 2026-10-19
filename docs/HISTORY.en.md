@@ -1703,7 +1703,21 @@ Fixes (`kernels/kernels_int8.cu` + `cuda.rs`):
 **Result**: `kernels_int8.ptx` regenerated with nvcc 12.9
 (`nvcc -ptx -arch=compute_75 -fmad=false -O3`, md5 b5c926ea → fe254249). `GPU_VERIFY.sh`
 **PASS** with all three anchors matching (`c61ad85b` / `9e17d563` / `af6eb6ab`), `PF_BENCH`
-warm run **8.71 s / 653 tok/s** (from 9.65 s / 589 tok/s, −9.7%), 233 CPU tests pass.
+warm run **8.71 s / 653 tok/s** (warm-vs-warm: 9.65 s / 589 tok/s for s73, −9.7%),
+233 CPU tests pass.
+
+**Measurement-basis correction (2026-10-19 15:50Z)**: the warm figure is the second request
+against the same server, so the first PTX JIT and page residency flatter it. A cold A/B of s73
+vs s75 (server start → one request, cache off, two alternating rounds):
+
+| binary | cold PF wall (2 rounds) | tok/s |
+|---|---|---|
+| s73 `57405fe` | 14.222 / 14.221 s | 399.8 |
+| s75 `5bca9b7` | 13.407 / 13.429 s | 424.1 / 423.4 |
+
+**s75 is worth −5.7% (0.80 s)**. Within one binary the spread is ~1.5 ms, so the gap is
+reproducible; the warm −9.7% was inflated. Cold single-shot is now the official number, and
+warm runs are only for relative comparisons inside one session.
 
 **Side finding (T9)**: the two short anchors that moved in s73 (`c61ad85b`→`47df93d7`,
 `9e17d563`→`9b20de09`) **did not reproduce on this build** — they returned to the original
