@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 pub const EMBED: usize = 0; // トークン→埋め込み lookup
-pub const RMSNORM: usize = 1; // 各層の RMSNorm (2回/層) + 最終 (FINAL_NORM は別)
+pub const RMSNORM: usize = 1; // 層の norm。s84: prefill では層ブロック全体の包み (内訳は summary に norm= block − 子 で出る)
 pub const ROPE: usize = 2; // RoPE 回転 (q, k)
 pub const QKV: usize = 3; // Q/K/V 投影 (線形層)
 pub const ATTN: usize = 4; // attention 本体 (KV書き込み、scores、softmax、probs@V)
@@ -340,6 +340,21 @@ static GDN_PROJ_CALLS: [[AtomicU64; D2H_GDN_PROJ_N]; Phase::N] = mk_counters::<D
 /// s57 (T4): attn_core の細分 (id は 100*ATTN + i → 添字 i)。フェーズ別。
 static ATT_SUB_NS: [[AtomicU64; ATT_CLS_N]; Phase::N] = mk_counters::<ATT_CLS_N>();
 static ATT_SUB_CALLS: [[AtomicU64; ATT_CLS_N]; Phase::N] = mk_counters::<ATT_CLS_N>();
+/// s84 (T8): prefill の norm を**トークン単位**で数える表示専用テーブル。
+///
+/// 動機: prefill の norm は層あたり 1 回・n トークンを一括で処理する (1 回当たりの
+/// 時間は層のループでは取れない)。かといって行のループ内で計時すると `Instant`
+/// 呼び出しがトークン数ぶん増える。ここでは「norm を 1 回適用した」イベントの
+/// 後に 1 度だけ `Instant` を読み、**その時点までの区間** (前イベントからの
+/// 差分) を RMSNORM へ、それより前の区間 (norm の後処理 + 残差加算) を別バケットへ
+/// 積む — イベント数 = norm の適用回数 (層 × m) で、追加コストは層あたり数回。
+/// `add_sample` 経由なので親バケット (Ambient) の合算も自動で効く。
+static NORM_FILL_NS: [[AtomicU64; 2]; Phase::N] = mk_counters::<2>();
+static NORM_FILL_CALLS: [[AtomicU64; 2]; Phase::N] = mk_counters::<2>();
+// 直近の norm イベントの時刻 (行ごとに時刻を読まないための 1 本の状態)。
+thread_local! {
+    static NORM_LAST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
 
 static ON: OnceLock<bool> = OnceLock::new();
 // s57 (T4): 現在の計測フェーズ (thread-local)。数値経路には影響しない。
@@ -518,6 +533,113 @@ pub fn time_layer_n_ev<T>(
     (r, on_gpu)
 }
 
+/// s84 (T8): 区間の**帰属先バケット**を一時的に差し替える (計測のみ)。
+///
+/// 動機: prefill の norm 呼び出しは、バケットの外にある**無名の残差加算**
+/// (x += out) を内側に含む。計測器の外に置かれた時間はどのバケットにも
+/// 入らないため、norm の実測値を「norm だけ」として読むと過大になる。
+/// ここでは norm 呼び出しを含む層ブロック全体を親バケット (RMSNORM) で包み、
+/// 内側の線形層 (QKV / OPROJ / GATE_UP / DOWN / SWIGLU / ATTN) の値を
+/// **親へ合算したうえで従来の子バケットにも残す** — 親の合計は
+/// 「層ブロック全体」を意味し、norm 単体 = ブロック − 子の和 で求まる。
+///
+/// スコープはスレッドローカル。入れ子の外側が優先される (最も外側が親)。
+/// PROFILE / テレメトリとも無効なら、この構造体は何も持たず `add_sample` も
+/// 従来どおり 1 つのバケットにしか積まない (既定挙動は完全に不変)。
+pub struct Ambient(pub(crate) Option<usize>);
+
+thread_local! {
+    /// 現在有効な親バケット (スコープ外では None = 従来どおり単独計上)。
+    static AMBIENT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+impl Ambient {
+    /// 以降の計測を `op` へも合算する。計測が全て無効なら no-op スコープ。
+    #[inline]
+    pub fn enter(op: usize) -> Self {
+        if !enabled() && !crate::telemetry_on() {
+            return Ambient(None);
+        }
+        let prev = AMBIENT.with(|c| c.replace(Some(op)));
+        Ambient(prev)
+    }
+}
+
+impl Drop for Ambient {
+    /// スコープ終了時に、**そのスコープが設定した**親だけを戻す。
+    /// (無効時は何も設定していないので触らない — 外側の親を消さない)
+    #[inline]
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            AMBIENT.with(|c| c.set(self.0));
+        }
+    }
+}
+
+/// 現在の親バケット (無ければ None)。
+#[inline]
+pub(crate) fn ambient_op() -> Option<usize> {
+    AMBIENT.with(|c| c.get())
+}
+
+// ---------------------------------------------------------------------------
+// s84 (T8): 行単位で走る norm の計測 (イベント駆動)
+// ---------------------------------------------------------------------------
+
+/// s84 (T8): norm を 1 回適用した直後に呼ぶ**計測専用**フック。
+///
+/// 呼び出しは norm を適用した行数 `rows` を受け取り、`rows` 個ぶんの
+/// RMSNORM サンプルと、同じ数ぶんの「norm 以外 (後処理・残差加算)」サンプル
+/// を **1 回の `Instant::now()`** で割り振って積む (行ごとに計時しない)。
+/// PROFILE / テレメトリとも無効なら時刻も読まずに戻る (既定挙動は完全に不変)。
+///
+/// 数値経路には一切触れない: 引数は計測のためだけに使う。
+#[inline]
+pub fn norm_rows(rows: usize) {
+    if rows == 0 || (!enabled() && !crate::telemetry_on()) {
+        return;
+    }
+    let now = Instant::now();
+    let parent = ambient_op();
+    let prev = NORM_LAST.with(|c| c.replace(Some(now)));
+    let pi = phase().idx();
+    let Some(prev) = prev else { return };
+    // 1 パス (norm の行処理) と、その前の区間 (行コピー + 残差加算) は等価とみなす。
+    // 目的は「norm 単体の概算」であり、区間全体の絶対値は外側の層ブロックが持つ。
+    let pass = now.duration_since(prev).as_nanos() as u64;
+    let norm = pass / 2;
+    let other = pass - norm;
+    let _ = parent;
+    add_sample(phase(), RMSNORM, norm, rows as u64, rows, false);
+    add_norm_fill(pi, other, rows as u64);
+}
+
+/// s84 (T8): norm 計測の終端。最後のサンプル (norm 適用後の区間 = 行の後処理と
+/// 残差加算) を積む。層ブロックの切れ目で必ず呼ぶ (呼び忘れると次の層の先頭まで
+/// が 1 本にまとまる)。PROFILE 無効時は何もしない。
+#[inline]
+pub fn norm_rows_end() {
+    if !enabled() && !crate::telemetry_on() {
+        return;
+    }
+    let Some(prev) = NORM_LAST.with(|c| c.take()) else { return };
+    let pi = phase().idx();
+    let other = Instant::now().duration_since(prev).as_nanos() as u64;
+    add_norm_fill(pi, other, 1);
+}
+
+/// s84 (T8): norm 以外の区間 (行の後処理 + 残差加算) を表示専用テーブルへ積む。
+/// 添字 0 = norm 透過 (norm の概算)、1 = norm 以外の区間。時間は生バケットへは
+/// 落とさない (RMSNORM へは `add_sample` の側で入る)。
+#[inline]
+fn add_norm_fill(pi: usize, ns: u64, calls: u64) {
+    let k = if ns == 0 { 0 } else { 1 };
+    NORM_FILL_NS[pi][k].fetch_add(ns, Ordering::Relaxed);
+    NORM_FILL_NS[Phase::Both.idx()][k].fetch_add(ns, Ordering::Relaxed);
+    NORM_FILL_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
+    NORM_FILL_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
+}
+
 /// 1 サンプルをフェーズ別テーブルへ積む。生 id (N_OPS 未満)、D2H 細分、
 /// attn_core 層種別細分の 3 系統を一度に処理する。
 ///
@@ -538,6 +660,18 @@ pub(crate) fn add_sample(
     NS[Phase::Both.idx()][slot].fetch_add(ns, Ordering::Relaxed);
     CALLS[pi][slot].fetch_add(calls, Ordering::Relaxed);
     CALLS[Phase::Both.idx()][slot].fetch_add(calls, Ordering::Relaxed);
+    // s84 (T8): 親バケットが有効なら件数・行数を親へも合算する (時間は末尾で
+    // 1 回だけ足す)。親は D2H 細分より先に処理する — 細分の経路は生 id へ
+    // 落ちないので、ここで別扱いが要る。
+    let parent = ambient_op().filter(|&p| p < N_OPS && p != (if op < N_OPS { op } else { D2H }));
+    if let Some(p) = parent {
+        CALLS[pi][p].fetch_add(calls, Ordering::Relaxed);
+        CALLS[Phase::Both.idx()][p].fetch_add(calls, Ordering::Relaxed);
+        if rows > 0 {
+            TOKS[pi][p].fetch_add(rows as u64 * calls, Ordering::Relaxed);
+            TOKS[Phase::Both.idx()][p].fetch_add(rows as u64 * calls, Ordering::Relaxed);
+        }
+    }
     if rows > 0 {
         TOKS[pi][slot].fetch_add(rows as u64 * calls, Ordering::Relaxed);
         TOKS[Phase::Both.idx()][slot].fetch_add(rows as u64 * calls, Ordering::Relaxed);
@@ -611,6 +745,7 @@ pub(crate) fn add_sample(
         GDN_PROJ_NS[Phase::Both.idx()][k].fetch_add(ns, Ordering::Relaxed);
         GDN_PROJ_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
         GDN_PROJ_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
+        add_parent_ns(pi, parent, ns);
         return;
     }
     // s65: `d2h_state` 発行元 (d2h_src_*) も **ここでしか積まない** (表示専用)。
@@ -619,7 +754,19 @@ pub(crate) fn add_sample(
         let k = op - D2H_SRC_FIRST;
         D2H_SRC_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
         D2H_SRC_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
+        add_parent_ns(pi, parent, ns);
         return;
+    }
+    add_parent_ns(pi, parent, ns);
+}
+
+/// s84 (T8): 親バケット (Ambient) に時間を 1 回だけ足す。`add_sample` の
+/// 3 つの出口 (生 id / gdn_proj 細分 / d2h_src 細分) から共通で呼ぶ。
+#[inline]
+fn add_parent_ns(pi: usize, parent: Option<usize>, ns: u64) {
+    if let Some(p) = parent {
+        NS[pi][p].fetch_add(ns, Ordering::Relaxed);
+        NS[Phase::Both.idx()][p].fetch_add(ns, Ordering::Relaxed);
     }
 }
 
@@ -784,7 +931,13 @@ pub fn reset() {
             ATT_SUB_NS[p][i].store(0, Ordering::Relaxed);
             ATT_SUB_CALLS[p][i].store(0, Ordering::Relaxed);
         }
+        // s84 (T8): 行単位 norm 計測の表示専用テーブル
+        for i in 0..2 {
+            NORM_FILL_NS[p][i].store(0, Ordering::Relaxed);
+            NORM_FILL_CALLS[p][i].store(0, Ordering::Relaxed);
+        }
     }
+    NORM_LAST.with(|c| c.set(None));
 }
 
 /// s57 (T4): 実行先ラベルの決定 (純関数・テスト可能)。
@@ -856,6 +1009,10 @@ fn phase_table(phase: Phase, s: &mut String) {
             mean_tok,
             exec_label(HAS_GPU_PATH[i], calls, gpu_calls)
         ));
+        // s84 (T8): prefill の norm 行計測 (層ブロック + norm 単体の概算) を直下に出す。
+        if i == RMSNORM {
+            s.push_str(&norm_rows_line(p, total, ns));
+        }
         // attn_core: GDN (linear attention) と full attention の内訳を直下に出す
         if i == ATTN {
             for k in 0..ATT_CLS_N {
@@ -955,6 +1112,49 @@ fn push_gdn_proj_rows(p: usize, total: u64, indent: &str, s: &mut String) {
     }
 }
 
+/// s84 (T8): prefill の RMSNORM 行は層ブロックの包み (Ambient の親) なので、
+/// norm 単体の概算と残差加算などの区間をその直下に出す (decode は従来どおり
+/// chain の値)。**表示専用** — どのバケットの値にも影響しない。
+///
+/// 読み方: `norm` = norm 単体の概算、`norm_other` = その前後の区間
+/// (行コピー + 残差加算 + 行後処理)、`block` = 層ブロック全体 (= RMSNORM 行)、
+/// `block_rest` = block − (norm + norm_other) = 計測イベントの入らない区間。
+/// イベントが 1 件も無ければ空文字列 (何も出さない)。
+pub(crate) fn norm_rows_line(p: usize, total: u64, block_ns: u64) -> String {
+    let norm = NORM_FILL_NS[p][0].load(Ordering::Relaxed);
+    let other = NORM_FILL_NS[p][1].load(Ordering::Relaxed);
+    if norm == 0 && other == 0 {
+        return String::new();
+    }
+    let mut s = String::new();
+    for (k, name) in [(0usize, "norm"), (1usize, "norm_other")] {
+        let sns = NORM_FILL_NS[p][k].load(Ordering::Relaxed);
+        let sc = NORM_FILL_CALLS[p][k].load(Ordering::Relaxed);
+        s.push_str(&format!(
+            "    {:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
+            name,
+            sns as f64 / 1e6,
+            sc,
+            sns as f64 / total.max(1) as f64 * 100.0,
+            "-",
+            ""
+        ));
+    }
+    let rest = block_ns.saturating_sub(norm + other);
+    for (name, v) in [("block", block_ns), ("block_rest", rest)] {
+        s.push_str(&format!(
+            "    {:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
+            name,
+            v as f64 / 1e6,
+            "-",
+            v as f64 / total.max(1) as f64 * 100.0,
+            "-",
+            ""
+        ));
+    }
+    s
+}
+
 /// s64: GDN スキャン 1 call の内訳 (`gdn_pf_alloc/launch/sync/d2h`) を
 /// `indent` 付きで 1 行ずつ積む。**表示専用** — total (= 集計対象の合計) に対する
 /// 比を出すが、値はどのバケットにも合算されない。
@@ -1030,6 +1230,10 @@ pub fn summary() -> String {
             mean_tok,
             exec_label(HAS_GPU_PATH[i], calls, gpu_calls)
         ));
+        // s84 (T8): prefill の norm 行計測 (累積表にも同じ内訳を出す)。
+        if i == RMSNORM {
+            s.push_str(&norm_rows_line(p, total, ns));
+        }
         if i == ATTN {
             for k in 0..ATT_CLS_N {
                 let sns = ATT_SUB_NS[p][k].load(Ordering::Relaxed);
