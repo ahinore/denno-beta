@@ -376,6 +376,14 @@ extern "C" __global__ void dno_gdn_chunk_state(
 // 取り出し、`dno_gdn_chunk_scan` (レジスタ列) と `dno_gdn_chunk_scan_hoist`
 // (グラフ常駐列) が共有する。このカーネルは従来と同一の演算列・同一の
 // レジスタ構成 (Scol[256]) を保つ。
+// forward decl (supervisor build fix): dno_gdn_step is defined further down but the
+// chunk-scan body calls it first, so declare it before the kernel that uses it.
+__device__ void dno_gdn_step(
+    const float* __restrict__ q_sh, const float* __restrict__ k_sh,
+    const float* __restrict__ v_sh, float* __restrict__ o_sh,
+    float* __restrict__ sc, float* __restrict__ s_col, float* Sreg,
+    int dk, int dv, float eps);
+
 extern "C" __global__ void dno_gdn_chunk_scan(
     const float* __restrict__ qkv,   // [n, conv_dim]
     const float* __restrict__ z,     // [n, value_dim]
