@@ -1462,6 +1462,24 @@ raw logits → ① repetition_penalty → ② frequency_penalty → ③ presence
 plus a weight residency cache; D (D2H) dominant → batch the state write-back after the layer loop; S (sync)
 dominant → redefine the T5b main lever.
 
+### The small-n projections were slow because of their transpose layout — group-first layout gives 5.0x ✅ (2026-10-19, s66)
+
+> The s63/s64/s65 profiling split the 33.7 s prefill into **gate_up 7.29 s / gdn_proj 5.41 s / qkv 4.09 s / gdn_scan 3.15 s / down 2.71 s / o_proj 1.49 s / attn_full 1.20 s**. `gdn_proj` (the F32 β/α projections, 96 calls) took 56 ms per call for **0.75 GFLOP = 13 GFLOPS** — single-core-class speed even though it uses SIMD.
+
+**Cause**: the transposed activation layout `at[d * mp + i]` in `matvec_rows_bt_small_n_impl` (the small-n path added in s62). Because the batch direction is processed eight lanes at a time, group g reads `at[g*8 + d*mp]` — **eight floats scattered with stride mp (the whole batch length)**. Each group therefore walks the entire `k*mp` array (2843×4096×4 ≈ 46 MB) using only 8 floats per 64 B line, and there are **mp/8 = 356 groups**. This was not a GPU problem at all: it broke CPU caching and prefetching (≈0.8 GB/s effective).
+
+**Fix**: transpose into a **group-first `[g][d][lane]`** layout (`at[(g*k + d)*MB + l] = a[(g*MB + l)*k + d]`). Each group's working set becomes a contiguous `k*MB` = 128 KB region that fits L2, and the 356 groups no longer touch each other's data. The transpose itself is now parallel over groups (disjoint write ranges).
+
+**Numerics**: only the data placement changes. Every `(i, j)` still accumulates over d in ascending order (`acc[l] += av[l] * rv`); not a single instruction changed, so the result is **bit-identical**. `matvec_rows_bt_small_n_matches_rem_scalar_path` and `matvec_rows_bt_matches_matvec_bt_bit_exactly` both pass.
+
+**Result** (5,686-token cache-miss prefill, warm):
+
+- `gdn_proj` **5,405 ms → 1,083 ms (5.0x)**
+- prefill **28.1 s → 23.7 s**, **202 → 240 tok/s** (**−49%** from the 46.2 s this session started at)
+- tests 231 passed / 0 failed; all three GPU anchors MATCH (unchanged)
+
+**What is left**: gate_up 7.38 s (64 calls, 114 ms), qkv 4.06 s, gdn_scan 3.13 s (alloc 1.04 / sync 1.09 / d2h 0.96), down 2.71 s. The `gdn_scan` **alloc 1.04 s is 12 `DevBuffer::from_slice` calls per layer (inputs plus the four weights, re-allocated and re-uploaded every call)**, removable by reusing the regions. `matvec_rows_bt_vec_impl` (the n ≥ 64 path) still uses the `[d][i]` layout, so any large-n F32 projection has the same headroom.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
