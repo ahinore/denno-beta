@@ -1350,6 +1350,20 @@ raw logits → ① repetition_penalty → ② frequency_penalty → ③ presence
 - **Test count**: 299 → 300 passed / 0 failed / 18 ignored (`cargo test --workspace`). `cargo check --workspace --features cuda` also passes (no new warnings)
 - **Lesson**: **never pin absolute values of shared counters in tests** — profile counters are process-global and shift with whatever other tests run in parallel. Pin the **relations** instead, e.g. that the children sum to the parent
 
+### Fixing the small-`n` projection path — `n < 64` silently fell back to a single-threaded kernel ✅ (2026-10-19, s62 / T5b)
+
+> Measurement first (per the T5a lesson): s61c had already shown prefill's `gdn_proj` (beta/alpha projections) at 25.3 s in 96 calls ≈ 263 ms/call on the GPU host, for a k=4096 × n=32 GEMM. That is far too slow to be a tuning issue, so the path was traced before changing anything.
+
+- **What the path actually is**: `beta_w`/`alpha_w` are built with `lin_ctl`, which forces **`QuantMode::Fp32`** (int8 would wreck the delta-rule gate). `Linear::apply_bt_rows` therefore takes the `Fp32` branch → `tensor::matvec_rows_bt` and **never reaches the GPU seam at all**. "The projection already runs on the GPU" was true for qkv/gate/out (Q8), but **not** for beta/alpha
+- **Root cause**: `matvec_rows_bt_vec` splits the output channels into `JB = 64`-wide blocks with `par_chunks_exact`. With `n = 32 < 64` that iterator yields **zero chunks**, so the parallel body never runs and every channel falls through to `matvec_rows_bt_rem_scalar` — single-threaded, j-outer/i-inner, striding through 745 MB of weights. Measured **2.8 GFLOPS**; the whole projection is one core's memory bandwidth
+- **Why this hid for so long**: nothing fails. The output is correct, just slow — the same failure class as T5a (a correct-but-slow silent regression). A micro-benchmark reproduced the 263 ms/call figure exactly before any change, which confirmed the attribution
+- **Fix**: a dedicated small-`n` path (`matvec_rows_bt_small_n`) for `n < JB`, parallelizing **across output channels** with rayon. Each task walks only its own weight rows (`JG = 2`), and the batch (`i`) direction runs as `MB = 8` SIMD lanes. Each `(i,j)` still accumulates over `d` as a strict sequential f32 chain, so the output is **bit-identical** and the default path's numbers (and therefore the anchors) do not move
+- **Why not the GPU**: the only fp32 kernel available (`dno_matvec_f32`) is one block per output row with `block=(1,1,1)`, designed for `m=1`. For `m=2843` rows it would re-launch 2843 times. Getting this onto the GPU properly needs a new fp32 GEMM kernel, which means `.cu` changes and PTX regeneration — proposed, not implemented
+- **Measured (CPU 9B, same shape k=4096 n=32 m=2843)**: `gdn_proj` **263 ms/call → 0.73 ms/call (7.2x)**; PROFILE `gdn_proj` **1514.9 ms / 288 calls → 211.2 ms / 288 calls**. All three anchor md5s (`v6_1b` / `v6_2b` / `v6_1b_full`) are **identical to the pre-change build**, and a repeat run reproduced them — determinism holds
+- **Tests (+1)**: `matvec_rows_bt_small_n_matches_rem_scalar_path` pins bit-exactness against the old serial remainder path at GDN's real shape across `n = 1..63`. `matvec_rows_bt_matches_matvec_bt_bit_exactly` gained `n < 64` shapes — **the pre-existing test only used `n ≥ 16`, and its smallest cases never hit the zero-chunk condition**, which is exactly why the defect survived. The new test was verified to fail when the accumulation order is deliberately perturbed
+- **Test count**: 300 → 301 passed / 0 failed / 18 ignored (`cargo test --workspace`)
+- **Lesson**: an iterator that silently yields **nothing** is the most expensive kind of boundary bug — always cover the region *below* the block size, not just fractional multiples above it. Also: `apply_bt_rows` sounding like "the batched GPU path" does not mean it is one; the dtype decides
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
