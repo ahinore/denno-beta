@@ -1517,6 +1517,34 @@ dominant → redefine the T5b main lever.
 
 **Still open**: the Hermes-side patch (do not attach `temperature: 1` for non-Anthropic endpoints) — the proper fix — is not done. Since a client update could revert it, the server-side cap went in first.
 
+### Pinned staging made the D2H five times costlier than the GEMM itself — copying straight through brings prefill from 23.1 s to 14.8 s ✅ (2026-10-19, s68)
+
+> After s67, the largest prefill item was `gate_up_proj` at 7.38 s (64 calls, 114 ms/call). Reproducing one call end-to-end in a micro-benchmark (`work68/bench2.cu`) showed the **GEMM body takes 12 ms**, quantization 6 ms and H2D 7 ms, while **D2H 20 ms + a host-side memcpy of 60 ms** were riding on top.
+
+**Measurement** (`work68/d2h.cu`, 279 MB = m 5686 × n 12288 × 4 B, average of 3):
+
+| path | ms | effective |
+|---|---|---|
+| D2H → pinned + `memcpy` → heap (old) | 79.8 | 3.5 GB/s |
+| **D2H → pageable direct (new)** | **20.1** | **13.9 GB/s** |
+| D2H → pinned only | 19.5 | 14.3 GB/s |
+
+The pinned→heap `memcpy` reaches only **4.7 GB/s**, while a direct D2H into a pageable buffer takes 20 ms. In other words, the customary "land in pinned memory, then `copy_from_slice` into the Rust buffer" is, on this host, **an extra hop that is four times slower**.
+
+**Change** (`cuda.rs::linear_gemm_into`):
+
+- H2D is issued directly from the caller's `a` slice (the `copy_from_slice` into the pinned `hx` is gone)
+- D2H is issued directly into the caller's `dst` (the pinned `ho` plus `dst.copy_from_slice` is gone)
+- Transferred contents, kernel arguments and arithmetic order are unchanged = **bit identical** (only the transport changed)
+
+**Result** (5,686 token cache-miss prefill, warm):
+
+- `gate_up_proj` **7.38 s → 2.87 s** (114 → 44 ms/call)
+- prefill **23.1 s → 14.8 s**, **246 → 384 tok/s** (**−68% / 3.1×** versus the 46.2 s we started this session from)
+- 231 tests passed / 0 failed; all three GPU anchors MATCH (unchanged)
+
+**Remaining split** (per request): `d2h_state` 8.2 s / `attn_core` 4.9 s (`gdn_scan` 2.6 + `gdn_proj` 1.1 + `attn_full` 1.2) / `gate_up` 2.9 s / `qkv` 1.6 s / `down` 1.4 s / `swiglu` 0.83 s / `o_proj` 0.64 s / `rmsnorm` 0.41 s. **D2H is still the target**: `chain_download` (93 MB of attention output) and o_proj's `to_vec` still take the pinned route. The real fix is to keep activations on the device and fold swiglu / rmsnorm / residual on the GPU so the D2H disappears entirely.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)

@@ -1858,26 +1858,30 @@ fn linear_gemm_into(
     ctx.make_current()?;
     SCRATCH.with(|cell| {
         let mut s = cell.borrow_mut();
-        let Scratch { x, aq, asc, out, hx, ho, .. } = &mut *s;
+        let Scratch { x, aq, asc, out, .. } = &mut *s;
         let bytes_x = m * k * 4;
         let bytes_out = m * n * 4;
         Scratch::ensure(x, bytes_x)?;
         Scratch::ensure(aq, m * k)?;
         Scratch::ensure(asc, m * 4)?;
         Scratch::ensure(out, bytes_out)?;
-        Scratch::ensure_pin(hx, bytes_x)?;
-        Scratch::ensure_pin(ho, bytes_out)?;
         let (dx, daq, dasc, dout) = (
             x.as_ref().unwrap(),
             aq.as_ref().unwrap(),
             asc.as_ref().unwrap(),
             out.as_ref().unwrap(),
         );
-        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
-        hx.as_mut_slice::<f32>()[..m * k].copy_from_slice(a);
         unsafe {
+            // s68: H2D は呼び出し元のスライスから直接発行する。旧実装は pinned
+            // staging へ `copy_from_slice` してから H2D していたため、m=5686,
+            // k=4096 では 93MB のホスト間コピーが毎呼び出し余分に乗っていた。
             check(
-                (lib.memcpy_htod_async)(dx.ptr(), hx.ptr as *const c_void, bytes_x, std::ptr::null_mut()),
+                (lib.memcpy_htod_async)(
+                    dx.ptr(),
+                    a.as_ptr() as *const c_void,
+                    bytes_x,
+                    std::ptr::null_mut(),
+                ),
                 "cuMemcpyHtoDAsync",
             )?;
             let (mut px, mut paq, mut pasc) = (dx.ptr(), daq.ptr(), dasc.ptr());
@@ -1909,17 +1913,23 @@ fn linear_gemm_into(
             let gmy = n.div_ceil(128) as u32;
             ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args)?;
 
+            // s68: D2H も呼び出し元のバッファへ直接書く。旧実装は pinned `ho` に
+            // 落としてから `dst.copy_from_slice` していたが、pinned→heap の
+            // ホスト間コピーが 279MB で 60ms (≒4.7GB/s) かかり GEMM 本体 (12ms)
+            // の 5 倍を占めていた。pageable へ直接 D2H すれば 20ms で済む。
             check(
-                (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
+                (lib.memcpy_dtoh_async)(
+                    dst.as_mut_ptr() as *mut c_void,
+                    dout.ptr(),
+                    bytes_out,
+                    std::ptr::null_mut(),
+                ),
                 "cuMemcpyDtoHAsync",
             )?;
             // s65: 発行元の件数分類 (表示専用・時間は d2h_state バケット側)
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
         ctx.sync()?;
-        // 注意: SCRATCH の分解束縛が同名 `out` (デバイス出力) を作るため、
-        // 書き込み先は `dst` で受ける。
-        dst.copy_from_slice(&ho.as_slice::<f32>()[..m * n]);
         Ok(())
     })
 }
