@@ -76,6 +76,34 @@ pub const D2H_GDN_PF_SYNC: usize = 10 * D2H + 11; // cuCtxSynchronize (完了待
 pub const D2H_GDN_PF_D2H: usize = 10 * D2H + 12; // 出力 y / conv / ssm の D2H + ホスト反映
 pub const D2H_GDN_PF_N: usize = 4; // 上記 4 区間の本数
 pub const D2H_GDN_PF_FIRST: usize = 10 * D2H + 9;
+/// s65 (T5b L1 第 2 段・計測のみ): prefill の `d2h_state` **発行元**の分類。
+///
+/// 動機: s63/s64 後も prefill 最大項目は `d2h_state` (5,686 tok で 13.7 s /
+/// 504 call・33%) で、うち 96 call だけが `gdn_scan` 内と分かっている。残り
+/// ~408 call (= 1 リクエスト ~200 call) の発行元が未特定のままだった。s60 の
+/// 教訓「推測で最適化しない」に従い、**計測だけ**を足して発行元を確定させる。
+///
+/// 分類軸 (cuda.rs の D2H 発行点に注釈する):
+///   `d2h_src_kv_row`   … full 層 k/v 行 (prefill `chain_qkv_rope_prefill` の
+///                        同期 D2H / decode `chain_q35_fullattn` の staged async)
+///   `d2h_src_gdn_state`… GDN 状態 (conv/ssm) の戻し (`gdn_scan` 内・遅延フラッシュ)
+///   `d2h_src_attn_pf`  … prefill attention 出力 (CH_ATT → ホスト)
+///   `d2h_src_linear`   … 線形層の出力 D2H (GEMM/GEMV/matvec の結果戻し)
+///   `d2h_src_logits`   … 最終 logits の戻し
+///   `d2h_src_other`    … 上記以外 (未分類の D2H 発行点)
+///
+/// **表示専用**: 値は必ず `D2H` 生バケット (時間 + 呼び出し) に既に積まれており、
+/// ここへは時間を足さない。積むのは**件数**だけ (`D2H_SRC_CALLS`) — 時間は
+/// 発行点の内側で二重計上される (sync 待ちの帰属が重複する) ため取らない。
+/// 既存の D2H 細分 (0..8)・`d2h_state` バケット・`GDN_PF_*` の値は一切変えない。
+pub const D2H_SRC_N: usize = 6;
+pub const D2H_SRC_KV_ROW: usize = 10 * D2H + 13;
+pub const D2H_SRC_GDN_STATE: usize = 10 * D2H + 14;
+pub const D2H_SRC_ATTN_PF: usize = 10 * D2H + 15;
+pub const D2H_SRC_LINEAR: usize = 10 * D2H + 16;
+pub const D2H_SRC_LOGITS: usize = 10 * D2H + 17;
+pub const D2H_SRC_OTHER: usize = 10 * D2H + 18;
+pub const D2H_SRC_FIRST: usize = 10 * D2H + 13;
 /// s57 (T4): `attn_core` の層種別分離 (倍率 100)。**ATNN 生 id (= 4) の集計は従来どおり**
 /// — これは summary のテキスト出力だけに掛ける細分 (D2H 細分と同じ規約)。
 ///
@@ -214,6 +242,17 @@ const D2H_GDN_PF_NAMES: [&str; D2H_GDN_PF_N] = [
     "gdn_pf_d2h",
 ];
 
+/// s65: `d2h_state` 発行元の表示名 (id は 10*D2H + 13 + i)。
+/// **件数の分類**であり、時間は持たない (docs/コメント参照)。
+const D2H_SRC_NAMES: [&str; D2H_SRC_N] = [
+    "d2h_src_kv_row",
+    "d2h_src_gdn_state",
+    "d2h_src_attn_pf",
+    "d2h_src_linear",
+    "d2h_src_logits",
+    "d2h_src_other",
+];
+
 /// s57 (T4): attn_core の層種別細分名 (id は 100*ATTN + i)。
 const ATT_CLS_NAMES: [&str; ATT_CLS_N] = [
     "attn_gdn",
@@ -271,6 +310,9 @@ static D2H_SUB_CALLS: [[AtomicU64; D2H_N]; Phase::N] = mk_counters::<D2H_N>();
 /// `attn_gdn`・`gdn_scan` のどのバケットにも合算しない (二重計上防止)。
 static GDN_PF_NS: [[AtomicU64; D2H_GDN_PF_N]; Phase::N] = mk_counters::<D2H_GDN_PF_N>();
 static GDN_PF_CALLS: [[AtomicU64; D2H_GDN_PF_N]; Phase::N] = mk_counters::<D2H_GDN_PF_N>();
+/// s65: `d2h_state` 発行元の**件数**の分類。**表示専用** — 時間は
+/// 持たない (発行点の内側で計ると sync 待ちが二重計上されるため)。
+static D2H_SRC_CALLS: [[AtomicU64; D2H_SRC_N]; Phase::N] = mk_counters::<D2H_SRC_N>();
 /// s57 (T4): attn_core の細分 (id は 100*ATTN + i → 添字 i)。フェーズ別。
 static ATT_SUB_NS: [[AtomicU64; ATT_CLS_N]; Phase::N] = mk_counters::<ATT_CLS_N>();
 static ATT_SUB_CALLS: [[AtomicU64; ATT_CLS_N]; Phase::N] = mk_counters::<ATT_CLS_N>();
@@ -538,6 +580,29 @@ pub(crate) fn add_sample(
         GDN_PF_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
         GDN_PF_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
     }
+    // s65: `d2h_state` 発行元 (d2h_src_*) も **ここでしか積まない** (表示専用)。
+    // `mark_d2h_src` はこの経路を使うので、生 id へ落ちないよう明示的に弾く。
+    if (D2H_SRC_FIRST..D2H_SRC_FIRST + D2H_SRC_N).contains(&op) {
+        let k = op - D2H_SRC_FIRST;
+        D2H_SRC_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
+        D2H_SRC_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
+        return;
+    }
+}
+
+/// s65 (T5b L1 第 2 段・計測のみ): `d2h_state` の 1 回の発行を発行元 `src`
+/// (`D2H_SRC_*`) として計上する。**件数のみ** (時間は `d2h_state` バケットが
+/// 持っている)。PROFILE 無効時は分岐 1 回で何もしない (時刻読みなし)。
+///
+/// 呼び出しは D2H を発行する直後 1 箇所だけに置く — D2H の発行点を増やす /
+/// 減らす commit が入ると分類件数が `d2h_state` の件数から外れるので、
+/// そのときはここも同時に直す。
+#[inline]
+pub fn mark_d2h_src(src: usize) {
+    if !enabled() || !(D2H_SRC_FIRST..D2H_SRC_FIRST + D2H_SRC_N).contains(&src) {
+        return;
+    }
+    add_sample(phase(), src, 0, 1, 0, false);
 }
 
 /// `f` の実行時間を op に計上して結果を返す。
@@ -675,6 +740,9 @@ pub fn reset() {
             GDN_PF_NS[p][i].store(0, Ordering::Relaxed);
             GDN_PF_CALLS[p][i].store(0, Ordering::Relaxed);
         }
+        for i in 0..D2H_SRC_N {
+            D2H_SRC_CALLS[p][i].store(0, Ordering::Relaxed);
+        }
         for i in 0..ATT_CLS_N {
             ATT_SUB_NS[p][i].store(0, Ordering::Relaxed);
             ATT_SUB_CALLS[p][i].store(0, Ordering::Relaxed);
@@ -801,7 +869,25 @@ fn phase_table(phase: Phase, s: &mut String) {
                     ""
                 ));
             }
+            // s65: 発行元の**件数**の分類 (時間を持たないので ms 列は "-")。
+            // 合計が d2h_state の calls 列と一致するかを読むための表。
+            push_d2h_src_rows(p, "    ", s);
         }
+    }
+}
+
+/// s65: `d2h_state` 発行元の**件数**を 1 行ずつ積む (時間は持たない = ms 列 "-")。
+/// 合計が `d2h_state` の calls 列と一致すれば分類漏れなし。
+fn push_d2h_src_rows(p: usize, indent: &str, s: &mut String) {
+    for k in 0..D2H_SRC_N {
+        let sc = D2H_SRC_CALLS[p][k].load(Ordering::Relaxed);
+        if sc == 0 {
+            continue;
+        }
+        s.push_str(&format!(
+            "{indent}{:<12} {:>10} {:>8} {:>6} {:>8} {:>6}\n",
+            D2H_SRC_NAMES[k], "-", sc, "-", "-", ""
+        ));
     }
 }
 
@@ -929,6 +1015,8 @@ pub fn summary() -> String {
                     ""
                 ));
             }
+            // s65: 発行元の件数分類。
+            push_d2h_src_rows(p, "    ", &mut s);
         }
     }
     s.push_str(&format!("  TOTAL {:.1} ms\n", total as f64 / 1e6));
@@ -976,6 +1064,29 @@ mod tests {
             assert_eq!(id, D2H_LOGITS + i, "細分 id は連番 (10*D2H + i)");
             assert!(id >= N_OPS, "細分 id は生 id の範囲外: {id}");
         }
+    }
+
+    /// s65: `d2h_state` 発行元の件数分類 id が D2H 細分 / GDN_PF の後ろに連番で
+    /// 並び、生 id と交差しないこと。表示名の本数も一致させる。
+    #[test]
+    fn d2h_src_ids_are_outside_raw_range() {
+        let ids = [
+            D2H_SRC_KV_ROW,
+            D2H_SRC_GDN_STATE,
+            D2H_SRC_ATTN_PF,
+            D2H_SRC_LINEAR,
+            D2H_SRC_LOGITS,
+            D2H_SRC_OTHER,
+        ];
+        assert_eq!(ids.len(), D2H_SRC_N);
+        assert_eq!(D2H_SRC_NAMES.len(), D2H_SRC_N);
+        assert_eq!(D2H_SRC_FIRST, D2H_GDN_PF_FIRST + D2H_GDN_PF_N);
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(id, D2H_SRC_FIRST + i);
+            assert!(id >= N_OPS, "生 id の範囲外: {id}");
+        }
+        // D2H 細分 (i < 9)・GDN_PF (9..12) と交差しない
+        assert!(D2H_SRC_KV_ROW > D2H_LOGITS_PF_HELD + 3);
     }
 
     /// s57 (T4): attn_core の層種別細分 id が生 id の範囲外で連番であること。
