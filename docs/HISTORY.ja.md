@@ -1327,6 +1327,17 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **処置**: `083218d` を revert (`crates/` は `1e51741` と**バイト一致**に戻る)。`via` 列の修正 (実測 `last_linear_ran_on_gpu` の採用・`tok/call` の歪み修正) は**別 commit** で残す — 計測だけの修正で数値経路には触れない
 - **教訓**: **プロファイルの列を根拠に最適化する前に、その列が実測か主張かを確認する**。本件は「計測バグ → 偽のホットスポット → 実在しない最適化」の典型。再発防止として、既定経路が `maybe_gpu_linear` を通ることをテストで固定した
 
+### T5a 撤回の後処理 — `via` 列の実測化と `tok/call` の分母修正 ✅ (2026-10-19, s61)
+
+> revert (`bbe82d7`) で `crates/` は `1e51741` とバイト一致に戻り、既定の数値・性能は T4 と同一。本節は退行の**原因側** (誤診を生んだ計測) を直し、同じ誤診と退行が再発しないようテストで固定したもの。
+
+- **`via` 列の修正 (`prof::time_n_ev`)**: 従来の `time_n` は `time_full(.., on_gpu = false, ..)` を渡しており、線形層のバケットが **常に `via=cpu`** と表示されていた (T4 誤診の直接原因)。`time_n_ev` は区間実行**後**に実行先を実測から取る。**「直近 1 回の GPU 線形」(`last_linear_ran_on_gpu`) をそのまま使うのは不十分** — qkv = q/k/v・gate_up = gate/up のように 1 区間で複数線形を呼ぶバケットでは最後の 1 本でラベルが決まってしまうため、`cuda::Probe` (スコープ + `Cell<bool>` への OR 集積) で **区間中に一度でも GPU で走ったか** を取る。計測のみで数値・分岐には触れない
+- **`tok/call` の分母修正**: 従来は `TOKS / CALLS` で、行数を持たない呼び出し (d2h 等の `rows = 0`) も分母に入り、平均バッチ幅が実体より小さく出ていた。`CALLS_ROWS` (行数を渡したサンプルの call 数) を新設し `TOKS / CALLS_ROWS` に変更。`calls` 列自体は従来どおり全 call を数える (表示の意味は変えない)
+- **適用範囲**: qwen35 の線形バケット 9 箇所 (qkv ×2・GDN の beta/alpha・o_proj ×2・gate_up・down)。`maybe_gpu_linear_grouped` (融合経路) も実行先ラベルに計上するよう修正 (無いと llama の融合 qkv/gate_up が `via=cpu` と誤記される)。**llama の per-op 計測は `time_n` のまま** (同じ誤記が残る) — 現行の主対象は qwen35 であり、計測の意味を変える範囲は T5 では広げない。既知の残件として記録する
+- **再発防止テスト (+4)**: `prefill_apply_bt_rows_goes_through_gpu_seam` は「既定の prefill 経路が `cuda::maybe_gpu_linear` に到達したか」を入口到達カウンタ (`cuda::linear_seam_calls`) で判定する。この退行は**数値が正しいまま遅くなる**形なので正確性テストでは捕まらない — 入口到達を見るしかない。`083218d` の形 (ゲート未指定で `matmul_bt_i8` 直呼び) を一時的に再現して**このテストが実際に落ちる**ことを確認済み。`all_q8_linear_paths_share_the_gpu_seam` は 4 つの Q8 経路 (`apply_bt` / `apply_bt_rows` / `apply` / `apply_batch_bt`) が入口を共有することを固定する (迂回口を増やさない)。他に `time_n_ev` の戻り値透過と `tok/call` 分母のテスト
+- **テスト数**: 295 → 299 passed / 0 failed / 18 ignored (`cargo test --workspace`)。revert 直後 (= `1e51741`) の 295 が基準で、T5a が足した 1 本は revert で消えている
+- **教訓**: **計測のラベルは呼び出し側の主張ではなく実測から取る**。加えて「唯一の入口」を作ったら、入口を通ったことを機械的に検査できるようにする (入口を迂回する第 2 の経路は、性能退行としてのみ現れて静かに残る)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
