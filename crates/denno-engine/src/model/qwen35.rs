@@ -1243,23 +1243,13 @@ impl Qwen35 {
                     // に分けて計上する。attn_gdn の合計は両者の和で従来と同値
                     // (add_sample が ATT_GDN へ合算する)。数値経路・分岐は不変。
                     //
-                    // s78 (T7): key は (モデルロード, 層, beta/alpha) で一意:
-                    //   mid * 1024 + li * 2 (+1)。mid はロード毎に採番される。
-                    // cuda 無効ビルドでは未使用 (gdn_proj_into_gpu の呼び出しが無い)。
-                    #[cfg(feature = "cuda")]
-                    let gp_key = self.mid * 1024 + (li as u64) * 2;
+                    // s78 (T7) の GPU 経路 (`gdn_proj_into_gpu`) は s96 で削除した
+                    // (s79 実測で m>1 の数値が壊れていた・P3-1)。beta/alpha は
+                    // 従来どおり CPU の `apply_bt_rows_into` で計算する。
                     crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                        #[cfg(feature = "cuda")]
-                        if gdn_proj_into_gpu(gp_key, &g.beta_w, &buf_h, n, &mut buf_beta) {
-                            return;
-                        }
                         g.beta_w.apply_bt_rows_into(&buf_h, n, &mut buf_beta)
                     });
                     crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                        #[cfg(feature = "cuda")]
-                        if gdn_proj_into_gpu(gp_key + 1, &g.alpha_w, &buf_h, n, &mut buf_alpha) {
-                            return;
-                        }
                         g.alpha_w.apply_bt_rows_into(&buf_h, n, &mut buf_alpha)
                     });
                     // スキャン: GPU カーネル 1 発 (P19-A1・cuda 有効時)。GDN は
@@ -1675,49 +1665,6 @@ fn concat_rows(a: &Linear, b: &Linear, what: &str) -> Result<Linear> {
     }
 }
 
-/// s78 (T7): prefill の GDN beta/alpha 投影 (Fp32 の `[m,e] x [e,nv]^T`) を
-/// GPU で計算する。戻り値 true = `out` は CPU 経路 (LIN.apply_bt_rows_into) と
-/// **ビット一致**して埋まっている。false = 呼び出し側が従来の CPU 経路で
-/// `out` を上書きすること (この関数は false のとき out に触れない契約)。
-///
-/// ゲート:
-///   - Fp32 の線形のみ (Q8 は apply_bt_rows_into 側の int8 GPU 経路が担当)
-///   - e (入力次元) が `matvec_rows_bt_into` の小 n 経路 (n < JB=64) に対応する
-///     形状であること。nv >= 64 は CPU 側も別実装 (SIMD 版) なので GPU の
-///     ビット一致契約 (小 n 経路の累積順を写したカーネル) の対象外 = CPU へ。
-///   - nv == lin.n / a.len() == n*e / 形状ゲートは cuda 側でも再検査する。
-///
-/// cuda 無効ビルドでは常に false を返す (呼び出し側は CPU 経路 = 旧挙動)。
-/// フォールバック経路もこのビルドでコンパイルされ `cargo test --workspace`
-/// の対象に入る (q35_prefill_gdn_proj_fallback_matches_cpu_path)。
-fn gdn_proj_into_gpu(
-    key: u64,
-    lin: &crate::quant::Linear,
-    a: &[f32],
-    m: usize,
-    out: &mut [f32],
-) -> bool {
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (key, lin, a, m, out);
-        false
-    }
-    #[cfg(feature = "cuda")]
-    {
-        use crate::quant::Linear;
-        let (e, nv) = lin.dims();
-        let w = match lin {
-            Linear::F32 { w, k, n } if *k == e && *n == nv => w.as_slice(),
-            _ => return false,
-        };
-        if nv >= 64 || e == 0 || nv == 0 || m == 0 || a.len() != m * e || out.len() != m * nv {
-            return false;
-        }
-        crate::cuda::gdn_proj_f32_into(key, w, a, e, nv, m, out)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // 恒久診断 (env ゲート・未指定時 no-op): 層別 hidden-state checksum ダンプ
 // (DENNO_DEBUG_LAYER_CHKSUM=1)
 // 27B 出力破綻の初発散層特定用 (HANDOFF_NEXT 第14セッション)。llama.cpp 側の
@@ -2985,54 +2932,26 @@ mod tests {
     /// ある限り異なる (mid, 層, tag) が同じ key になることはない。
     /// これを崩すと別モデル/別層の重みをデバイスキャッシュから誤参照する。
     #[test]
-    fn q35_gdn_proj_key_unique() {
-        let dir = build_dir("c4gpkey", true, NK, NV);
-        let cfg: serde_json::Value =
-            serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap())
-                .unwrap();
-        let m1 = Qwen35::load(&dir, &cfg, QuantMode::Int8).unwrap();
-        let m2 = Qwen35::load(&dir, &cfg, QuantMode::Int8).unwrap();
-        // 層数は key の stride (1024) に対して十分小さい (mid ブロックが重ならない)
-        for (li, layer) in m1.layers.iter().enumerate() {
-            if let AttnKind::Gdn(g) = &layer.attn {
-                // GDN の beta/alpha は Fp32 (delta-rule ゲートの精度要件)
-                assert!(matches!(g.beta_w, crate::quant::Linear::F32 { .. }));
-                assert!(matches!(g.alpha_w, crate::quant::Linear::F32 { .. }));
-            }
-        }
-        assert!(m1.layers.len() < 512, "層数 {} は 512 未満であること", m1.layers.len());
-        let mut keys = std::collections::HashSet::new();
-        for m in [&m1, &m2] {
-            for li in 0..m.layers.len() {
-                let k = m.mid * 1024 + (li as u64) * 2;
-                assert!(keys.insert(k), "beta key 衝突: mid={} li={li}", m.mid);
-                assert!(keys.insert(k + 1), "alpha key 衝突: mid={} li={li}", m.mid);
-            }
-        }
-        // 同じ mid でもロードが違えば別ブロック
-        assert_ne!(m1.mid * 1024, m2.mid * 1024);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// s78 (T7) / s79: GPU 不発時のフォールバックが旧経路と一致すること (CPU で検証)。
     ///
-    /// s78 の版は存在しない `Qwen35::load_with_layer_types` を呼んでいて
-    /// コンパイルできなかった。層種別は GGUF のテンソル名 (`ssm_a` の有無) から
-    /// 決まる仕様なので、ロード関数を増やさず **実在の `Qwen35::load`** に置き換えた。
+    /// s96 (P3-1) で GPU 経路 (`gdn_proj_into_gpu` → `cuda::gdn_proj_f32_into`) を
+    /// 削除したので、このテストは「既定の CPU 経路が従来と同一」の検証だけを残す。
+    /// (旧版は存在しない `Qwen35::load_with_layer_types` を呼んでいてコンパイル
+    /// できなかったため、s79 で実在の `Qwen35::load` に置き換えた経緯がある。)
     /// fixture (`build_dir`) は 3:1 インターバルの本物の混成 (GDN + full attention)
     /// なので、実モデルと同じ層種別判定・同じ prefill コードを通る。
     ///
     /// 検証内容:
-    ///   (a) cuda 無効ビルドでは `gdn_proj_into_gpu` が常に false = beta/alpha は
-    ///       従来の `apply_bt_rows_into` で計算される (旧経路と同一)
-    ///   (b) GDN 層があること (フォールバックを 1 度も通らない fixture では
-    ///       テストが意味を失うため明示)
-    ///   (c) prefill 全体を 2 回走らせて logits がビット一致 (= 経路の差し替えが
-    ///       非決定性を持ち込んでいない)
-    ///   (d) 既定経路 (`apply_bt_rows_into`) の出力が参照
+    ///   (a) GDN 層があること (fixture が空振りするとテストが意味を失うため明示)
+    ///   (b) prefill 全体を 2 回走らせて logits がビット一致 (= 決定論)
+    ///   (c) 既定経路 (`apply_bt_rows_into`) の出力が参照
     ///       `matvec_rows_bt_into` とビット一致
     #[test]
-    fn q35_prefill_gdn_proj_fallback_matches_cpu_path() {
+    fn q35_prefill_gdn_proj_cpu_path_matches_reference() {
+        // cuda 有効ビルドでは prefill が `GPU_FORCE` / `set_gpu_attention_enabled` の
+        // グローバル状態に依存する。他の GPU テストが並列でフラグを差し替えると
+        // このテストが落ちる (P17j の教訓) ので、同じロックを取って直列化する。
+        #[cfg(feature = "cuda")]
+        let _g = crate::cuda::test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = build_dir("c4gpfb", true, NK, NV);
         let cfg: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap())
@@ -3052,28 +2971,10 @@ mod tests {
             AttnKind::Gdn(g) => g,
             _ => unreachable!(),
         };
-        // (a) cuda 無効ビルドの不発契約: false を返し、out に触れない
-        let (k, nv) = g.beta_w.dims();
-        let probe_in = vec![0.5f32; 2 * k];
-        let mut probe_out = vec![f32::NAN; 2 * nv];
-        assert!(
-            !gdn_proj_into_gpu(
-                m.mid * 1024 + (li as u64) * 2,
-                &g.beta_w,
-                &probe_in,
-                2,
-                &mut probe_out
-            ),
-            "既定 (DENNO_GPU_GDN_PROJ 未設定) では gdn_proj_into_gpu が false を返すこと"
-        );
-        assert!(
-            probe_out.iter().all(|v| v.is_nan()),
-            "false のとき out を書き換えない契約"
-        );
-        // (c) prefill 2 回で logits ビット一致
+        // (b) prefill 2 回で logits ビット一致
         // GDN 層だけのビューで prefill を回す (fixture の full attention 層は
         // 合成テンソル幅が config と揃っておらず forward_prefill が落ちる)。
-        // beta/alpha → フォールバック → gdn_scan の本物の経路を通る。
+        // beta/alpha の投影 → gdn_scan の本物の経路を通る。
         let gdnn = m.gdn_only();
         assert!(
             gdnn.layers.iter().all(|l| matches!(l.attn, AttnKind::Gdn(_))),
@@ -3090,7 +2991,8 @@ mod tests {
             "prefill logits が 2 回で不一致 (非決定論)"
         );
         assert!(l1.iter().all(|v| v.is_finite()), "logits が有限");
-        // (d) 既定経路 (apply_bt_rows_into) == matvec_rows_bt_into
+        // (c) 既定経路 (apply_bt_rows_into) == matvec_rows_bt_into
+        let (k, nv) = g.beta_w.dims();
         let w = match &g.beta_w {
             crate::quant::Linear::F32 { w, .. } => w.clone(),
             _ => panic!("beta は Fp32 (delta-rule ゲートの精度要件)"),
