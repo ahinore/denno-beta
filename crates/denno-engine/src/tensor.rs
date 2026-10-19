@@ -352,14 +352,26 @@ fn matvec_rows_bt_small_n_impl(a: &[f32], b: &[f32], k: usize, n: usize, m: usiz
     const JG: usize = 2; // 1 タスクが同時に走査する出力チャネル数
     debug_assert!(n > 0 && n < JB);
     let mp = m.div_ceil(MB) * MB;
-    // アクティベーションを [d][i] に転置 (転置先はレーン方向に連続)。
+    // s65: アクティベーションを **グループ優先** [g][d][lane] に転置する
+    // (`at[(g*k + d)*MB + l] = a[(g*MB + l)*k + d]`)。
+    // 旧レイアウト [d][i] ではグループ g の 8 レーンが `d*mp` 間隔で散らばるため、
+    // 1 グループが k*mp (9B prefill で ≈46MB) 全域を 8 個ずつ拾う形になり、
+    // グループ数 (mp/8 = 356) だけ同じ領域を走査し直していた (実効 ≈0.8 GB/s)。
+    // グループ優先なら 1 グループの作業域が k*MB (≈128KB・L2 に乗る) の連続領域になる。
+    // 数値は不変 — 転置はデータ配置だけで、各 (i,j) の d 昇順逐次累積はそのまま。
+    // 転置自体もグループ単位に rayon で並列化する (書き込み域は互いに素)。
     let mut at = vec![0.0f32; k * mp];
-    for i in 0..m {
-        let src = &a[i * k..][..k];
-        for d in 0..k {
-            at[d * mp + i] = src[d];
-        }
-    }
+    at.par_chunks_mut(k * MB)
+        .enumerate()
+        .for_each(|(g, dst)| {
+            let i0 = g * MB;
+            let nc = MB.min(m - i0);
+            for d in 0..k {
+                for l in 0..nc {
+                    dst[d * MB + l] = a[(i0 + l) * k + d];
+                }
+            }
+        });
     // 出力はブロックローカル [t][i] に書き、最後に [i][j] へ転置する
     // (共有可変スライスを持たない = unsafe 不要)。
     let groups: Vec<(usize, usize, Vec<f32>)> = (0..n)
@@ -372,8 +384,9 @@ fn matvec_rows_bt_small_n_impl(a: &[f32], b: &[f32], k: usize, n: usize, m: usiz
             let mut o = vec![0.0f32; cols * m];
             for g in 0..(mp / MB) {
                 let mut acc = [0.0f32; JG * MB];
+                let gbase = g * k * MB;
                 for d in 0..k {
-                    let av = &at[g * MB + d * mp..][..MB];
+                    let av = &at[gbase + d * MB..][..MB];
                     for t in 0..cols {
                         let rv = rows[t][d];
                         let base = t * MB;

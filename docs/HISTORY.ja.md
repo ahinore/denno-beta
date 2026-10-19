@@ -1458,6 +1458,24 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 再利用 + 重み常駐キャッシュ、D (D2H) 優位なら層ループ後のまとめ戻し、S (sync) 優位なら T5b の本命を
 再定義する。
 
+### 小 n 投影の本体は「転置レイアウトの副作用」だった — グループ優先配置で 5.0 倍 ✅ (2026-10-19, s66)
+
+> s63/s64/s65 の計測で、prefill 33.7 s の内訳は **gate_up 7.29 s / gdn_proj 5.41 s / qkv 4.09 s / gdn_scan 3.15 s / down 2.71 s / o_proj 1.49 s / attn_full 1.20 s** だった。`gdn_proj` (β/α の F32 投影・96 call) は 1 call 56 ms で **0.75 GFLOP = 13 GFLOPS** — SIMD を使っているのに単コア級の速度しか出ていなかった。
+
+**原因**: `matvec_rows_bt_small_n_impl` (s62 で追加した小 n 経路) の転置レイアウト `at[d * mp + i]`。バッチ方向を 8 レーンずつ束ねて処理するため、グループ g が読むのは `at[g*8 + d*mp]` — **d 方向に mp (=バッチ全長) 間隔で散らばる 8 float** になる。1 グループが `k*mp` (2843×4096×4 ≈ 46 MB) 全域を 64 B ラインあたり 8 float だけ使って歩き、それが **mp/8 = 356 グループ** 繰り返される。GPU ではなく CPU のキャッシュ/プリフェッチを壊していた形で、実効 0.8 GB/s 相当。
+
+**修正**: 転置先を **グループ優先 `[g][d][lane]`** (`at[(g*k + d)*MB + l] = a[(g*MB + l)*k + d]`) に変更。1 グループの作業域が `k*MB` = 128 KB の連続領域 (L2 に乗る) になり、356 グループがそれぞれ自分の領域だけを読む。転置自体もグループ単位に rayon で並列化 (書き込み域は互いに素)。
+
+**数値**: 転置はデータ配置だけ、各 (i,j) の d 昇順逐次累積 (`acc[l] += av[l] * rv`) は 1 命令も変えていない = **ビット一致**。`matvec_rows_bt_small_n_matches_rem_scalar_path` / `matvec_rows_bt_matches_matvec_bt_bit_exactly` とも pass。
+
+**結果** (5,686 token cache-miss prefill・warm):
+
+- `gdn_proj` **5,405 ms → 1,083 ms (5.0 倍)**
+- prefill **28.1 s → 23.7 s**・**202 → 240 tok/s** (このセッション開始時の 46.2 s からは **−49%**)
+- テスト 231 passed / 0 failed。GPU アンカー 3 本 MATCH (不変)
+
+**残った最大項目**: gate_up 7.38 s (64 call・114 ms)・qkv 4.06 s・gdn_scan 3.13 s (alloc 1.04 / sync 1.09 / d2h 0.96)・down 2.71 s。`gdn_scan` の **alloc 1.04 s は 12 本の `DevBuffer::from_slice` (入力 + 重み 4 本を層ごとに再確保・再 H2D)** で、領域再利用だけで削れる。`matvec_rows_bt_vec_impl` (n ≥ 64 経路) は同じ `[d][i]` レイアウトのままなので、n の大きい F32 投影を使う経路があれば同様の改善余地がある。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
