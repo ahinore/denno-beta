@@ -62,8 +62,13 @@ class FakeMessages:
     受けたリクエストの (messages 長, model, max_tokens) は self.seen に残す。
     """
 
-    def __init__(self, mode="clean"):
+    def __init__(self, mode="clean", echo_temperature=False, accept_cap=None):
         self.mode = mode
+        # echo_temperature: 応答に temperature を返す実装のふり (cap 判定の経路を通す)
+        self.echo_temperature = echo_temperature
+        # accept_cap: 受理する温度の上限 (エコー時のみ意味を持つ)。
+        # None なら要求された温度をそのまま返す (= cap なしサーバのふり)
+        self.accept_cap = accept_cap
         self.seen = []
         self.requests = 0
         outer = self
@@ -104,7 +109,7 @@ class FakeMessages:
                     reply = "回答です。\nassistant\n次の回答です。"
                 if outer.mode == "max_tokens":
                     stop = "max_tokens"
-                out = json.dumps({
+                response = {
                     "id": "msg_fake",
                     "type": "message",
                     "role": "assistant",
@@ -112,7 +117,17 @@ class FakeMessages:
                     "content": [{"type": "text", "text": reply}],
                     "stop_reason": stop,
                     "usage": {"input_tokens": 10 * turn, "output_tokens": 20},
-                }, ensure_ascii=False).encode("utf-8")
+                }
+                if outer.echo_temperature:
+                    # 要求温度を受け付けるサーバのふり。accept_cap があれば丸める
+                    # (cap が効いているサーバ) が、cap 回帰を模すときは None にして
+                    # 要求値をそのまま返す。
+                    asked = body.get("temperature")
+                    if asked is not None:
+                        if outer.accept_cap is not None:
+                            asked = min(float(asked), outer.accept_cap)
+                        response["temperature"] = asked
+                out = json.dumps(response, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(out)))
@@ -537,6 +552,105 @@ class TestEndToEnd(unittest.TestCase):
             self.assertEqual(fake.requests, 1)
             r = run_script(["--dry-run", "--base-url", fake.base_url])
             self.assertEqual(r.returncode, 0)
+
+
+# ---------------------------------------------------------------------------
+# temperature cap (s107: s97 の longconv_check.py --expect-cap を移植)
+# ---------------------------------------------------------------------------
+
+class TestTemperatureCap(unittest.TestCase):
+    """cap 回帰の検出。崩壊検出とは別経路 (純関数 cap_verdict + CLI の exit code)。"""
+
+    def test_cap_verdict_passes_within_the_cap(self):
+        t = {"temperature": 0.7,
+             "turns": [{"index": 1, "accepted_temperature": 0.7}]}
+        v = lcc.cap_verdict(t, 0.7)
+        self.assertEqual(v["exit_code"], 0)
+        self.assertEqual(v["issues"], [])
+
+    def test_cap_verdict_flags_a_hot_request(self):
+        v = lcc.cap_verdict({"temperature": 1.0, "turns": []}, 0.7)
+        self.assertEqual(v["exit_code"], 2)
+        self.assertTrue(any("exceeds" in i for i in v["issues"]), v["issues"])
+
+    def test_cap_verdict_flags_a_server_that_accepts_above_the_cap(self):
+        t = {"temperature": 1.0,
+             "turns": [{"index": 3, "accepted_temperature": 1.0}]}
+        v = lcc.cap_verdict(t, 0.7)
+        self.assertEqual(v["exit_code"], 2)
+        self.assertTrue(any("accepted" in i for i in v["issues"]), v["issues"])
+
+    def test_cap_verdict_tolerates_a_server_without_a_temperature_echo(self):
+        # 送信温度は記録済み・サーバは温度を返さない -> 判定できる範囲で通す
+        t = {"temperature": 0.7, "turns": [{"index": 1, "accepted_temperature": None}]}
+        v = lcc.cap_verdict(t, 0.7)
+        self.assertEqual(v["exit_code"], 0)
+        self.assertEqual(v["accepted_temperatures"], [])
+
+    def test_cap_verdict_fails_when_no_temperature_was_recorded(self):
+        v = lcc.cap_verdict({"turns": [{"index": 1, "accepted_temperature": 0.5}]}, 0.7)
+        self.assertEqual(v["exit_code"], 2)
+        self.assertTrue(any("no temperature" in i for i in v["issues"]), v["issues"])
+
+    def test_cap_verdict_is_deterministic(self):
+        t = {"temperature": 1.0, "turns": [{"index": 1, "accepted_temperature": 1.0}]}
+        self.assertEqual(lcc.cap_verdict(t, 0.7),
+                         lcc.cap_verdict(json.loads(json.dumps(t)), 0.7))
+
+    def test_expect_cap_without_temperature_is_refused(self):
+        r = run_script(["--expect-cap", "0.7", "--dry-run"])
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("--expect-cap alone", r.stderr)
+
+    def test_temperature_is_sent_when_requested(self):
+        with FakeMessages("clean") as fake:
+            r = run_script(["--base-url", fake.base_url, "--turns", "1",
+                            "--temperature", "0.5"])
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(fake.seen[0]["temperature"], 0.5)
+
+    def test_no_temperature_is_sent_by_default(self):
+        with FakeMessages("clean") as fake:
+            run_script(["--base-url", fake.base_url, "--turns", "1"])
+            self.assertIsNone(fake.seen[0]["temperature"])
+
+    def test_cap_respected_by_the_server_exits_zero(self):
+        # サーバが 0.7 に丸めて返す = cap が効いている
+        with FakeMessages("clean", echo_temperature=True, accept_cap=0.7) as fake:
+            r = run_script(["--base-url", fake.base_url, "--turns", "2",
+                            "--temperature", "0.7", "--expect-cap", "0.7"])
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("cap check:", r.stdout)
+
+    def test_cap_regression_exits_two(self):
+        # サーバが要求温度をそのまま受理して返す = cap が外れた (回帰)
+        with FakeMessages("clean", echo_temperature=True, accept_cap=None) as fake:
+            r = run_script(["--base-url", fake.base_url, "--turns", "2",
+                            "--temperature", "1.0", "--expect-cap", "0.7"])
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("CAP REGRESSION", r.stdout)
+            # 出力は崩壊ではなく cap の失敗であること
+            self.assertIn("RESULT: CLEAN", r.stdout)
+
+    def test_cap_failure_survives_a_replay(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "t.json")
+            with FakeMessages("clean", echo_temperature=True) as fake:
+                run_script(["--base-url", fake.base_url, "--turns", "1",
+                            "--temperature", "1.0", "--out", out])
+            r = run_script(["--replay", out, "--expect-cap", "0.7"])
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("CAP REGRESSION", r.stdout)
+
+    def test_transcript_records_the_sent_temperature(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "t.json")
+            with FakeMessages("clean") as fake:
+                run_script(["--base-url", fake.base_url, "--turns", "1",
+                            "--temperature", "0.7", "--out", out])
+            with open(out, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertEqual(doc["temperature"], 0.7)
 
 
 if __name__ == "__main__":

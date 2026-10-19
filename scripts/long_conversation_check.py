@@ -18,6 +18,15 @@
   # GPU もサーバも無しで、検出器と exit code 対応だけを検算する
   python3 scripts/long_conversation_check.py --self-test
 
+  # serve の --temperature-cap 回帰を検出する (s107: s97 の --expect-cap を移植)
+  python3 scripts/long_conversation_check.py --base-url http://127.0.0.1:8095 \
+      --temperature 1.0 --expect-cap 0.7
+
+  既定では temperature を送らない (cap はサーバ側の設定が持つ。送ると上書きして
+  「cap が効いているか」を測れなくなる)。--temperature を明示したときだけ送り、
+  --expect-cap を併せて指定すると「要求温度が cap を超えていないか」「サーバが
+  受理した温度が cap を超えていないか」を判定して cap 回帰を exit 2 にする。
+
   # stdlib unittest のテスト一式 (偽 HTTP サーバを ephemeral port で立てる)
   python3 scripts/test_long_conversation_check.py -v
 
@@ -46,7 +55,9 @@
 exit code:
   0  全ターンで (max_tokens を除く) フラグが立たなかった
   2  少なくとも 1 ターンでハードな失敗 (repeat_* / long_line / template_marker /
-     fake_turn / empty)。(turn, flag, 根拠の抜粋) の表を出す
+     fake_turn / empty)。(turn, flag, 根拠の抜粋) の表を出す。
+     --expect-cap を指定したときは cap 回帰 (要求温度 または サーバが受理した温度が
+     cap 超え) も 2 になる。
   3  インフラの問題 (接続拒否・HTTP 200 以外・本文が壊れている・fixture が読めない)
 
 標準ライブラリのみ。ネットワークは urllib だけ。eval は使わない。
@@ -288,6 +299,75 @@ def transcript_verdict(transcript):
     }
 
 
+def cap_verdict(transcript, expect_cap):
+    """temperature cap 回帰の判定 (純関数・ネットワーク非依存)。
+
+    s97 の longconv_check.py --expect-cap を移植したもの (s107)。元の不具合は
+    temperature = 1.0 で数ターンで崩壊し、serve の --temperature-cap 0.7 で
+    直った。崩壊検出 (transcript_verdict) は「実際に崩れたか」しか見ないので、
+    cap 設定そのものが外れたことをこちらで押さえる。
+
+    見るものは 3 つ:
+      1. transcript に送った温度が記録されているか (無いと何も測れていない)
+      2. 送った温度が cap を超えていないか
+      3. 応答に温度が返る実装なら、サーバが受理した温度が cap 以下か
+
+    返り値:
+      {"expect_cap": float, "sent_temperature": float | None,
+       "accepted_temperatures": [...], "issues": [str, ...],
+       "exit_code": 0 | 2}
+    issues が 1 つでもあれば exit_code 2 (cap 回帰)。
+    """
+    cap = float(expect_cap)
+    sent = transcript.get("temperature")
+    issues = []
+
+    if sent is None:
+        issues.append("the transcript records no temperature, so the cap cannot be "
+                      "judged (rerun with --temperature)")
+    else:
+        try:
+            sent_f = float(sent)
+        except (TypeError, ValueError):
+            issues.append("transcript temperature is not a number: %r" % (sent,))
+            sent_f = None
+        if sent_f is not None and sent_f > cap + 1e-6:
+            issues.append(
+                "requested temperature %s exceeds --expect-cap %s: the cap cannot "
+                "be measured this way" % (_num(sent_f), _num(cap)))
+
+    accepted = []
+    for turn in transcript.get("turns", []) or []:
+        raw = turn.get("accepted_temperature")
+        if raw is None:
+            continue
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            issues.append("turn %s reported a non-numeric temperature: %r"
+                          % (turn.get("index"), raw))
+            continue
+        accepted.append(v)
+        if v > cap + 1e-6:
+            issues.append("turn %s: server accepted temperature %s above cap %s "
+                          "(cap regression)" % (turn.get("index"), _num(v), _num(cap)))
+
+    return {
+        "expect_cap": cap,
+        "sent_temperature": sent,
+        "accepted_temperatures": accepted,
+        "issues": issues,
+        "exit_code": 0 if not issues else 2,
+    }
+
+
+def _num(x):
+    """数値を短く表示する (1.0 -> 1 / 0.70 -> 0.7)。"""
+    if x is None:
+        return "None"
+    return ("%.3f" % x).rstrip("0").rstrip(".") if isinstance(x, float) else str(x)
+
+
 # ---------------------------------------------------------------------------
 # fixture と計画 (純関数)
 # ---------------------------------------------------------------------------
@@ -347,17 +427,21 @@ def build_messages(history, user_text):
     return msgs
 
 
-def build_request_body(model, messages, max_tokens):
+def build_request_body(model, messages, max_tokens, temperature=None):
     """Anthropic Messages API のリクエスト本文。
 
-    temperature は送らない (cap はサーバ側の serve 設定が持つ。ここで上書きすると
-    「cap が効いているか」を測れなくなる)。
+    既定では temperature を送らない (cap はサーバ側の serve 設定が持つ。ここで
+    上書きすると「cap が効いているか」を測れなくなる)。cap 回帰を測りたいときだけ
+    呼び側が temperature を渡し、--expect-cap と突き合わせる (s107)。
     """
-    return {
+    body = {
         "model": model,
         "max_tokens": max_tokens,
         "messages": messages,
     }
+    if temperature is not None:
+        body["temperature"] = temperature
+    return body
 
 
 def response_text(body):
@@ -409,6 +493,18 @@ def validate_args(args):
         errors.append("--max-tokens must be >= 1 (got %d)" % args.max_tokens)
     if args.timeout_s <= 0:
         errors.append("--timeout-s must be > 0 (got %s)" % args.timeout_s)
+    # temperature / expect_cap は後から足した任意引数。古い呼び側 (属性を持たない
+    # 名前空間) でも落ちないよう getattr で読む。
+    temperature = getattr(args, "temperature", None)
+    expect_cap = getattr(args, "expect_cap", None)
+    if temperature is not None and temperature < 0:
+        errors.append("--temperature must be >= 0 (got %s)" % temperature)
+    if expect_cap is not None and expect_cap < 0:
+        errors.append("--expect-cap must be >= 0 (got %s)" % expect_cap)
+    if expect_cap is not None and temperature is None and not getattr(args, "replay", None):
+        errors.append("--expect-cap alone cannot measure the cap: also pass "
+                      "--temperature (the server applies its own cap only when a "
+                      "temperature is requested)")
     try:
         port = url_port(args.base_url)
     except ValueError as e:
@@ -466,21 +562,25 @@ def post_messages(url, body, timeout_s):
 
 
 def run_conversation(base_url, prompts, model=DEFAULT_MODEL, max_tokens=DEFAULT_MAX_TOKENS,
-                     timeout_s=DEFAULT_TIMEOUT_S, seed_note="", log=None):
+                     timeout_s=DEFAULT_TIMEOUT_S, seed_note="", log=None,
+                     temperature=None):
     """turn 数だけ会話を回し、transcript dict を返す。turn の形:
 
       {"index": 1-based, "user": 送った文, "reply": 本文, "stop_reason": str,
-       "usage": {...} | None, "duration_ms": int}
+       "usage": {...} | None, "duration_ms": int, "accepted_temperature": float | None}
 
     history は assistant の応答を積んで伸びる。したがって turn N の
     messages 長は 2N-1 (user/assistant 交互 + 最後の user)。
+
+    temperature が None なら送らない (既定)。指定したときだけ本文に入れ、
+    応答に温度が返る実装なら accepted_temperature に残して cap 判定に使う。
     """
     url = messages_url(base_url)
     history = []
     turns = []
     for i, text in enumerate(prompts, 1):
         messages = build_messages(history, text)
-        body = build_request_body(model, messages, max_tokens)
+        body = build_request_body(model, messages, max_tokens, temperature)
         if log:
             log("turn %d/%d: %d messages, %d chars of user text"
                 % (i, len(prompts), len(messages), len(text)))
@@ -499,6 +599,7 @@ def run_conversation(base_url, prompts, model=DEFAULT_MODEL, max_tokens=DEFAULT_
             "stop_reason": stop_reason,
             "usage": resp.get("usage") if isinstance(resp.get("usage"), dict) else None,
             "duration_ms": elapsed,
+            "accepted_temperature": resp.get("temperature"),
         })
         history.append(("user", text))
         history.append(("assistant", reply))
@@ -507,6 +608,7 @@ def run_conversation(base_url, prompts, model=DEFAULT_MODEL, max_tokens=DEFAULT_
         "base_url": base_url,
         "model": model,
         "max_tokens": max_tokens,
+        "temperature": temperature,
         "seed_note": seed_note,
         "turn_count": len(turns),
         "turns": turns,
@@ -558,6 +660,17 @@ def print_report(transcript, result, out=sys.stdout):
     else:
         print("RESULT: FAILED (%d hard flag(s) in %d turns)"
               % (len(result["failures"]), result["turn_count"]), file=out)
+
+
+def print_cap_report(cap, out=sys.stdout):
+    """--expect-cap の判定を 1 行 (失敗時は理由も) 出す。"""
+    accepted = cap.get("accepted_temperatures") or []
+    print("cap check: sent=%s expect_cap=%s accepted=%s"
+          % (_num(cap.get("sent_temperature")), _num(cap.get("expect_cap")),
+             ",".join(_num(v) for v in accepted) if accepted else "(not reported)"),
+          file=out)
+    for issue in cap.get("issues") or []:
+        print("CAP REGRESSION: %s" % issue, file=out)
 
 
 def build_transcript(args, prompts):
@@ -736,6 +849,47 @@ def self_test(out=sys.stdout):
     check("messages_url normalises a trailing slash",
           messages_url("http://h:1/") == "http://h:1/v1/messages")
 
+    # 15) temperature cap (s107: s97 の --expect-cap を移植)
+    check("no temperature in the body by default",
+          "temperature" not in build_request_body("m", [], 16))
+    check("an explicit temperature is sent",
+          build_request_body("m", [], 16, 1.0).get("temperature") == 1.0)
+
+    within = {"temperature": 0.7, "turns": [
+        {"index": 1, "reply": clean, "accepted_temperature": 0.7}]}
+    v = cap_verdict(within, 0.7)
+    check("cap: request within cap passes", v["exit_code"] == 0 and not v["issues"],
+          str(v["issues"]))
+
+    hot_req = {"temperature": 1.0, "turns": [{"index": 1, "reply": clean}]}
+    v = cap_verdict(hot_req, 0.7)
+    check("cap: requested temperature above cap fails", v["exit_code"] == 2
+          and any("exceeds" in i for i in v["issues"]), str(v["issues"]))
+
+    hot_srv = {"temperature": 1.0, "turns": [
+        {"index": 2, "reply": clean, "accepted_temperature": 1.0}]}
+    v = cap_verdict(hot_srv, 0.7)
+    check("cap: server-accepted temperature above cap fails", v["exit_code"] == 2
+          and any("accepted" in i for i in v["issues"]), str(v["issues"]))
+
+    no_temp = {"turns": [{"index": 1, "reply": clean,
+                          "accepted_temperature": None}]}
+    v = cap_verdict(no_temp, 0.7)
+    check("cap: a transcript with no recorded temperature is a failure",
+          v["exit_code"] == 2 and any("no temperature" in i for i in v["issues"]),
+          str(v["issues"]))
+
+    check("cap: verdict is deterministic",
+          cap_verdict(hot_srv, 0.7) == cap_verdict(json.loads(json.dumps(hot_srv)), 0.7))
+
+    # --expect-cap without --temperature cannot measure anything: refuse it
+    from types import SimpleNamespace as _NS
+    args = _NS(turns=10, max_tokens=512, timeout_s=300.0,
+               base_url="http://127.0.0.1:8095", temperature=None, expect_cap=0.7)
+    errs = validate_args(args)
+    check("cap: --expect-cap without --temperature is refused",
+          any("expect-cap alone" in e for e in errs), str(errs))
+
     if failures:
         print("SELF-TEST FAILED: %d check(s): %s" % (len(failures), ", ".join(failures)),
               file=out)
@@ -790,6 +944,14 @@ def build_parser():
                     help="per-request timeout in seconds (default %.0f)" % DEFAULT_TIMEOUT_S)
     ap.add_argument("--dry-run", action="store_true",
                     help="print the plan and request bodies; send nothing, start nothing")
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="send this temperature in the request body (default: send "
+                         "none — the serve --temperature-cap stays in control). Use "
+                         "with --expect-cap to detect a cap regression.")
+    ap.add_argument("--expect-cap", type=float, default=None,
+                    help="expected serve --temperature-cap. Fails (exit 2) if the "
+                         "requested temperature or the temperature the server reports "
+                         "back exceeds it.")
     ap.add_argument("--self-test", action="store_true",
                     help="CPU-only self test (no socket, no server, no GPU)")
     ap.add_argument("--json", dest="json_out", action="store_true",
@@ -839,11 +1001,20 @@ def main(argv=None):
                   file=sys.stderr)
             return 3
         result = transcript_verdict(transcript)
+        cap = (cap_verdict(transcript, args.expect_cap)
+               if args.expect_cap is not None else None)
+        if cap is not None:
+            transcript["cap_verdict"] = cap
+        code = result["exit_code"]
+        if cap is not None and cap["exit_code"] != 0:
+            code = 2
         if args.json_out:
             emit_json(transcript, result)
         else:
             print_report(transcript, result)
-        return result["exit_code"]
+            if cap is not None:
+                print_cap_report(cap)
+        return code
 
     try:
         prompts = plan_turns(load_fixture(args.fixture), args.turns)
@@ -859,12 +1030,21 @@ def main(argv=None):
                                       max_tokens=args.max_tokens,
                                       timeout_s=args.timeout_s,
                                       seed_note=args.seed_note,
+                                      temperature=args.temperature,
                                       log=lambda m: print(m, file=sys.stderr))
     except InfraError as e:
         print("INFRA ERROR: %s" % e, file=sys.stderr)
         return 3
 
     result = transcript_verdict(transcript)
+
+    # cap 回帰 (--expect-cap) は崩壊検出とは別の判定。どちらかが失敗なら exit 2。
+    cap = cap_verdict(transcript, args.expect_cap) if args.expect_cap is not None else None
+    if cap is not None:
+        transcript["cap_verdict"] = cap
+    code = result["exit_code"]
+    if cap is not None and cap["exit_code"] != 0:
+        code = 2
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
@@ -875,10 +1055,12 @@ def main(argv=None):
         emit_json(transcript, result)
     else:
         print_report(transcript, result)
+        if cap is not None:
+            print_cap_report(cap)
         if args.out:
             print("transcript written to %s" % args.out)
 
-    return result["exit_code"]
+    return code
 
 
 if __name__ == "__main__":
