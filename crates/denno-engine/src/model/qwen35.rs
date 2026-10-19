@@ -1113,15 +1113,23 @@ impl Qwen35 {
                     // 決まる (cuda 統計) ため、ここでは主張しない。
                     let (kqkv, _) = g.qkv_w.dims();
                     debug_assert_eq!(kqkv, e);
-                    let qkv = crate::prof::time_n(crate::prof::QKV, n, || {
-                        g.qkv_w.apply_bt_rows(&h, n)
+                    // s58 (T5a): 投影 5 本を GPU tiled GEMM の opt-in 経路
+                    // (`apply_bt_rows_maybe_gpu` = `DENNO_GPU_PREFILL_GEMM`) に載せる。
+                    // ゲート未指定 (既定) は同関数が `apply_bt_rows` に素通しするので
+                    // 従来と完全に同一。`via` ラベルは「区間内の GPU 線形呼び出しが
+                    // 実際に走ったか」を cuda の実測 (last_linear_ran_on_gpu) から取る
+                    // (計測のみ・数値経路の分岐は不変)。
+                    let qkv = crate::prof::time_n_ev(crate::prof::QKV, n, || {
+                        g.qkv_w.apply_bt_rows_maybe_gpu(&h, n)
                     });
-                    let z = crate::prof::time_n(crate::prof::QKV, n, || g.gate_w.apply_bt_rows(&h, n));
-                    let beta_raw = crate::prof::time_n(crate::prof::ATT_GDN, n, || {
-                        g.beta_w.apply_bt_rows(&h, n)
+                    let z = crate::prof::time_n_ev(crate::prof::QKV, n, || {
+                        g.gate_w.apply_bt_rows_maybe_gpu(&h, n)
                     });
-                    let alpha = crate::prof::time_n(crate::prof::ATT_GDN, n, || {
-                        g.alpha_w.apply_bt_rows(&h, n)
+                    let beta_raw = crate::prof::time_n_ev(crate::prof::ATT_GDN, n, || {
+                        g.beta_w.apply_bt_rows_maybe_gpu(&h, n)
+                    });
+                    let alpha = crate::prof::time_n_ev(crate::prof::ATT_GDN, n, || {
+                        g.alpha_w.apply_bt_rows_maybe_gpu(&h, n)
                     });
                     // スキャン: GPU カーネル 1 発 (P19-A1・cuda 有効時)。GDN は
                     // bit 一致不要のため GPU/CPU で数値は僅かに異なる (決定論は維持)。
@@ -1180,8 +1188,8 @@ impl Qwen35 {
                             )
                         });
                     let _ = scan_on_gpu;
-                    let out = crate::prof::time_n(crate::prof::OPROJ, n, || {
-                        g.out_w.apply_bt_rows(&ys, n)
+                    let out = crate::prof::time_n_ev(crate::prof::OPROJ, n, || {
+                        g.out_w.apply_bt_rows_maybe_gpu(&ys, n)
                     });
                     if crate::gdn::gdn_dbg_enabled_for(li as i64) {
                         // 恒久診断 (env ゲート・未指定時 no-op): 出力投影後 (llama.cpp linear_attn_out 相当)
@@ -1199,11 +1207,11 @@ impl Qwen35 {
                         });
                 }
                 AttnKind::Full(fl) => {
-                    let (qg, k, v) = crate::prof::time_n(crate::prof::QKV, n, || {
+                    let (qg, k, v) = crate::prof::time_n_ev(crate::prof::QKV, n, || {
                         (
-                            fl.q_w.apply_bt_rows(&h, n), // [n, heads*2*dh]
-                            fl.k_w.apply_bt_rows(&h, n), // [n, kv_dim]
-                            fl.v_w.apply_bt_rows(&h, n), // [n, kv_dim]
+                            fl.q_w.apply_bt_rows_maybe_gpu(&h, n), // [n, heads*2*dh]
+                            fl.k_w.apply_bt_rows_maybe_gpu(&h, n), // [n, kv_dim]
+                            fl.v_w.apply_bt_rows_maybe_gpu(&h, n), // [n, kv_dim]
                         )
                     });
                     let mut att = vec![0.0f32; n * heads * dh];
@@ -1276,8 +1284,8 @@ impl Qwen35 {
                         }
                         (att_done, att_done)
                     });
-                    let out = crate::prof::time_n(crate::prof::OPROJ, n, || {
-                        fl.o_w.apply_bt_rows(&att, n)
+                    let out = crate::prof::time_n_ev(crate::prof::OPROJ, n, || {
+                        fl.o_w.apply_bt_rows_maybe_gpu(&att, n)
                     });
                     // s42: 残差加算は行独立 → 行並列 (bit-exact)
                     x.par_chunks_exact_mut(e)
@@ -1303,8 +1311,11 @@ impl Qwen35 {
                         h2_row.copy_from_slice(&r);
                     });
             });
-            let (gate, up) = crate::prof::time_n(crate::prof::GATE_UP, n, || {
-                (layer.gate_w.apply_bt_rows(&h2, n), layer.up_w.apply_bt_rows(&h2, n))
+            let (gate, up) = crate::prof::time_n_ev(crate::prof::GATE_UP, n, || {
+                (
+                    layer.gate_w.apply_bt_rows_maybe_gpu(&h2, n),
+                    layer.up_w.apply_bt_rows_maybe_gpu(&h2, n),
+                )
             });
             let mut hh = vec![0.0f32; n * ff];
             // s42: SwiGLU は行独立 → 行並列 (bit-exact)
@@ -1321,8 +1332,8 @@ impl Qwen35 {
                         }
                     });
             });
-            let down = crate::prof::time_n(crate::prof::DOWN, n, || {
-                layer.down_w.apply_bt_rows(&hh, n)
+            let down = crate::prof::time_n_ev(crate::prof::DOWN, n, || {
+                layer.down_w.apply_bt_rows_maybe_gpu(&hh, n)
             });
             // s42: 残差加算は行独立 → 行並列 (bit-exact)
             x.par_chunks_exact_mut(e)

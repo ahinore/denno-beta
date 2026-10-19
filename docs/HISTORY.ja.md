@@ -1309,6 +1309,23 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **処置**: 実装差分 (engine.rs +409 / prefix_cache.rs +202、未検証・デバッグ残骸込み) は commit せず `git stash` に退避 (`s58-wip-t3-prefix-partial-unfirable`)。**コード変更なし・既定挙動は従来と完全同一**
 - **次**: 「ストアを複数境界保持へ拡張する (設計変更・メモリ増)」か「system プロンプト安定化/独立 prefix 境界へ方針転換」かは**人間判断**。判断材料として prefill 140 秒の内訳 (重みロード / prefill 計算) の切り分けを先に行うのが妥当
 
+### T5a: qwen35 prefill GEMM の GPU opt-in ゲート — `DENNO_GPU_PREFILL_GEMM` (s60) ✅ (2026-10-19)
+
+> 第60セッション。T4 の prefill プロファイルで **prefill の投影が全て CPU (rayon)** に落ちていることが判明した (gate_up 15.3s / qkv 8.0s / down 4.0s / o_proj 2.8s / swiglu 0.9s = 合計 30.1s・PF_BENCH 5,686 tok)。decode では同じ int8 GEMM が GPU (`via=gpu`) で走っている。原因は `maybe_gpu_linear` の **m 上限 `DENNO_CUDA_MAX_M` (既定 16)** — P17b の実測 (GEMV 型カーネルは m で 0.39x) に基づく既定値が、P17i の tiled GEMM 導入後もそのまま残っていた。**既定を変えるとアンカーが動くため opt-in の env ゲート**にした。
+
+**実装** (`.cu` / PTX 変更なし・新カーネルなし):
+
+- `cuda.rs`: `prefill_gemm_enabled()` (`DENNO_GPU_PREFILL_GEMM=1|true|on`)。`maybe_gpu_linear` を **判定 (`linear_plan`・純関数) → 重み常駐 (`weights_for`) → 実行 (`linear_exec`)** に分割し、新エントリ `maybe_gpu_prefill_linear` と共通化。**既定 off では CUDA コンテキスト生成も重みアップロードも起きない** (従来の `m > max_m() && !use_gemm → None` と同一の早期 return)
+- `quant.rs`: `Linear::apply_bt_rows_maybe_gpu` — `apply_bt_rows` と同じ戻り値で、Q8 のみ GPU を試す (F32 は既存経路)
+- `qwen35.rs` (prefill の per-op 経路): qkv / gate (z) / beta / alpha / o_proj / full の q,k,v / full の o_proj / gate_up / down を同関数に差し替え。**GDN スキャンと full attention 本体は変更なし**
+- `prof.rs`: `time_n_ev` — 計測区間の GPU 実行ラベルを `cuda::last_linear_ran_on_gpu()` の**実測**から取る (`via` 列がゲート on/off で正しく出る)。計測専用
+
+**数値契約**: `dno_gemm_i8` は i8×i8 の i32 累積 (タイル化・warp 分割しても順序不変) + `(f32)dot * ascale * wscale` を左から順に乗算するので CPU `matmul_bt_i8` と**ビット一致**。したがってゲート on でもアンカー 3 本は不変のはず (dev は GPU 非搭載のため **CPU モードで両モードの md5 一致を確認**。CUDA ビルドでの実機確認は人間対応)
+
+**テスト**: `cargo test --workspace` **296 passed / 0 failed / 18 ignored** (T4 の 295 から +1 = `quant::tests::prefill_maybe_gpu_path_is_bit_identical_when_gate_off`、Int8/F32 × m=300 で `apply_bt_rows` と `apply_bt_rows_maybe_gpu` の f32 ビット一致を固定)。`cargo check -p denno-engine --features cuda --all-targets` も通過
+
+**未検証 (人間対応)**: 実 GPU での速度 (PF_BENCH) とアンカー 3 本の MATCH。ゲート on の数値は原理上ビット一致だが、**m=2843 では重み 1 回のアップロード (~8GB) + 層あたり 4 回の同期**が効くため、初回リクエストは重くなる可能性がある (decode 済みなら重みは常駐済み)
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)

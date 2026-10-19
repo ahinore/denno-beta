@@ -511,6 +511,12 @@ flowchart LR
 - scheduler・HTTP(scheduler.rs、lib.rs)— CUDA移植の対象外
 - engine の step_chat ループ本体(ただし中身が kernel launch の連発に変わる)
 - sampler(RNG・top-p ソートは CPU のまま・§5 の決定論契約を維持)
+- **qwen35 prefill の per-op 投影**(既定)。decode の投影は GPU だが、prefill (m>16) は
+  `DENNO_CUDA_MAX_M`(既定 16)で CPU に落ちる — **既定では意図的に CPU のまま**。
+  新規 env ゲート `DENNO_GPU_PREFILL_GEMM=1` で同一カーネル(`dno_gemm_i8`)に載せられる
+  (s58/T5a。`.cu`/PTX の変更なし・CPU とビット一致契約なので既定出力は不変)。
+  既定 off ではこの関数は最初の env 判定で None を返し、CUDA コンテキスト・重み
+  アップロードを含め**一切の GPU 呼び出しが発生しない**(= 既定動作は現行と同一)。
 
 ## 9. 使い方
 
