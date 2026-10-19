@@ -111,12 +111,19 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 
 ## P3 — correctness and debt
 
-### P3-1: remove or fix the rejected GPU gdn_proj kernel
-- Status: `DENNO_GPU_GDN_PROJ` is an opt-in that produces wrong values (max abs diff ~1e2;
-  m=33 gives -17.205 vs -8.410; k=1 latches `LMV32_BROKEN`).
-- Action: delete it (preferred) or fix the grid/index plumbing and `av[n-2]` underflow.
-  Dead code with a known-broken kernel is a trap for the next reader.
-- Acceptance: code gone or fixed + tested; no default-path change.
+### P3-1: remove or fix the rejected GPU gdn_proj kernel — CLOSED (s96)
+- Status: **closed** for the Rust side. The opt-in (`DENNO_GPU_GDN_PROJ`) produced wrong
+  values (max abs diff ~1e2; m=33 gives -17.205 vs -8.410; k=1 latches `LMV32_BROKEN`),
+  so the whole path was deleted in s96: `cuda::gdn_proj_f32_into` and its helpers, the
+  `GdnProjMiss`/`DENNO`-style plumbing, `model/qwen35.rs::gdn_proj_into_gpu` and its
+  prefill branch, and the three tests that covered them.
+- Default path: unchanged (beta/alpha always went through `apply_bt_rows_into` with the
+  gate off; it is now called unconditionally — bit-identical).
+- Remaining (GPU machine only): delete `dno_matvec_rows_f32` from `kernels/kernels_elem.cu`
+  and regenerate `kernels_elem.ptx`. Nothing in Rust references it; PTX regeneration needs
+  nvcc on a GPU host, so it is left as a human step.
+- Profile ids `D2H_GDN_PROJ_*` / `ATT_GDN_PROJ` stayed reserved on purpose (renumbering
+  would break historical profile comparisons).
 
 ### P3-2: T9 — why s73 moved two short anchors
 - Status: open. The drift did not reproduce on the s75 build (anchors back to canonical),

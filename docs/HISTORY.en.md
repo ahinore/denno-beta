@@ -1959,6 +1959,53 @@ whom, read by whom) and its invariant tests stay for whoever implements either r
 (real GPU work) and 520 ms is the activations H2D, so no residency lever is left inside the
 scan. That work is booked under P1-3 (`d2h_state` 6,147 ms = 38.9 % of the wall).
 
+### Removed the rejected GPU gdn_proj path (2026-10-19, s96 / P3-1)
+
+> The GPU path for the prefill GDN beta/alpha projection (opt-in via
+> `DENNO_GPU_GDN_PROJ=1`) prototyped in s78/s79 was **proven numerically broken by the
+> s79 on-device measurements**. It stayed behind as dead code with the gate defaulting off,
+> so it is now deleted everywhere except the kernel itself (.cu/.ptx).
+
+**Why delete it (s79 measurements)**: for k=4096 nv=32 m=33, `out[0]` came out **-17.205
+vs -8.410** (CPU reference), with a max absolute difference around 1e2. A near-2× gap
+cannot be explained by rounding — it is an implementation bug. At k=1 the launch raised a
+runtime error, latched `LMV32_BROKEN`, and dropped every later GPU call to the CPU. The
+relative error also misses R1 (1e-6) of NUMERIC_POLICY. Since it can never be enabled by
+default, there is no value in keeping it as an opt-in.
+
+**Removed (Rust side)**:
+
+- `cuda.rs`: `gdn_proj_f32_into` / `gdn_proj_opt_in` / `gdn_proj_shape_ok` /
+  `gdn_proj_min_row_sqsum` / `gdn_proj_gpu_calls` / `gdn_proj_cpu_denorm_rows` /
+  `gdn_proj_last_miss`, `GdnProjMiss`, `GDN_PROJ_FNS`, `GDN_PROJ_LAST_MISS`,
+  `GDN_PROJ_CPU_DENORM_ROWS`, `GDN_PROJ_SQSUM_MIN`, plus the three tests that covered them
+  (shape gate, CPU overwrite, and the ignored GPU probe).
+- `model/qwen35.rs`: `gdn_proj_into_gpu()` and the prefill call branch. The call site now
+  runs the original CPU path (`apply_bt_rows_into` → `matvec_rows_bt_into`) directly.
+  The GPU-key uniqueness test went away with the keys themselves; the default-path
+  verification test was rewritten without GPU references and kept as
+  `q35_prefill_gdn_proj_cpu_path_matches_reference`.
+- `prof.rs`: **nothing deleted**. The `D2H_GDN_PROJ_*` / `ATT_GDN_PROJ` ids stay reserved —
+  renumbering them would break comparisons against historical profile logs. The rows simply
+  keep printing zero.
+
+**Why the default path is unchanged**: the only thing removed is a branch that `return`ed
+solely when the opt-in was set *and* every GPU gate passed. With the default
+(`DENNO_GPU_GDN_PROJ` unset), s79 onward always returned false from `gdn_proj_into_gpu`, so
+beta/alpha were always computed by `apply_bt_rows_into`. After the deletion that same
+function is simply called unconditionally — same operation order, same rounding, same
+buffers (bit-identical). Setting the env var now has no effect (the gate itself is gone),
+which is the intent.
+
+**Tests**: `cargo check -p denno-engine --features cuda --tests` = exit 0,
+`cargo test -p denno-engine` = 242 passed / 0 failed / 17 ignored,
+`cargo test -p denno-server` = all green.
+
+**Remaining**: `kernels/kernels_elem.cu`'s `dno_matvec_rows_f32` and `kernels_elem.ptx`
+are untouched. Regenerating PTX needs a GPU (nvcc), so deleting the .cu/.ptx pair stays a
+task for the GPU machine (no other path shares the kernel, but .cu and .ptx must go together
+to keep the build convention intact). Nothing in Rust references it any more.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)

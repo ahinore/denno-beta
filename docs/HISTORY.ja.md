@@ -2025,6 +2025,49 @@ NEW `98c83cb` (s90) = 13.345 / 13.377 / 13.375 s → **-0.03 s で利得なし**
 520 ms の活性化 H2D で、スキャンの中に残った常駐レバーは無い。以後この分は P1-3
 （`d2h_state` 6,147 ms = 壁の 38.9%）で扱う。
 
+### 却下済みの GPU gdn_proj 経路を削除した (2026-10-19, s96 / P3-1)
+
+> s78/s79 で試作した prefill の GDN beta/alpha 射影の GPU 経路 (`DENNO_GPU_GDN_PROJ=1` の
+> opt-in) は、**数値が壊れていることが s79 の実機計測で確定していた**。既定 off のまま
+> 死んだコードとして残っていたので、カーネル本体 (.cu/.ptx) を除いて削除した。
+
+**削除した理由 (s79 の測定値)**: k=4096 nv=32 m=33 で `out[0]` が **-17.205 対 -8.410**
+(CPU 参照)、最大絶対差 ~1e2。丸めでは説明できない倍近い差なので実装バグである。
+k=1 の形状では実行時エラーで `LMV32_BROKEN` が立ち、以降の GPU 経路が全部 CPU へ落ちた。
+相対誤差も NUMERIC_POLICY の R1 (1e-6) を満たさない。既定で有効にできない以上、
+opt-in で残す価値は無い。
+
+**削除したもの (Rust 側)**:
+
+- `cuda.rs`: `gdn_proj_f32_into` / `gdn_proj_opt_in` / `gdn_proj_shape_ok` /
+  `gdn_proj_min_row_sqsum` / `gdn_proj_gpu_calls` / `gdn_proj_cpu_denorm_rows` /
+  `gdn_proj_last_miss`、`GdnProjMiss`、`GDN_PROJ_FNS`、`GDN_PROJ_LAST_MISS`、
+  `GDN_PROJ_CPU_DENORM_ROWS`、`GDN_PROJ_SQSUM_MIN`、および対応するテスト 3 本
+  (形状ゲート・CPU 上書き・ignored の GPU プローブ)。
+- `model/qwen35.rs`: `gdn_proj_into_gpu()` と prefill の呼び出し分岐。呼び出し側は
+  従来の CPU 経路 (`apply_bt_rows_into` → `matvec_rows_bt_into`) を直に通す。
+  GPU key (`mid*1024 + li*2`) の一意性テストは、key 自体が消えたので削除。
+  既定経路の検証テストは GPU を参照しない形に書き換えて残した
+  (`q35_prefill_gdn_proj_cpu_path_matches_reference`)。
+- `prof.rs`: **何も消していない**。`D2H_GDN_PROJ_*` / `ATT_GDN_PROJ` の id 予約は残す
+  (番号を詰め直すと過去のプロファイルログとの比較が壊れる)。表は 0 で出続ける。
+
+**既定経路が不変である根拠**: 削除したのは「opt-in が立っていて、かつ GPU ゲートを
+全部通過したときだけ `return` する」分岐だけ。既定 (`DENNO_GPU_GDN_PROJ` 未設定) では
+s79 以降も `gdn_proj_into_gpu` が常に false を返しており、beta/alpha は必ず
+`apply_bt_rows_into` で計算されていた。削除後は同じ関数を無条件で呼ぶ形になるだけで、
+演算順・丸め・バッファは一切変わらない (ビット不変)。env を設定しても効かなくなる
+(ゲート自体が消える) のは意図どおり。
+
+**テスト**: `cargo check -p denno-engine --features cuda --tests` = exit 0、
+`cargo test -p denno-engine` = 242 passed / 0 failed / 17 ignored、
+`cargo test -p denno-server` = 全緑。
+
+**残件**: `kernels/kernels_elem.cu` の `dno_matvec_rows_f32` と `kernels_elem.ptx` は
+触っていない。PTX の再生成には GPU (nvcc) が要るため、.cu/.ptx の削除は GPU 機での
+作業として残す (カーネルは他経路と共有していないが、PTX と .cu を同時に消さないと
+ビルド規約が崩れる)。Rust 側からの参照はもう無い。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
