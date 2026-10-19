@@ -2926,17 +2926,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// s78 (T7): beta/alpha 投影の GPU key が (モデルロード, 層, beta/alpha) で
-    /// 一意であること。key は prefill で `mid * 1024 + li * 2 (+1)` として作る。
-    /// mid はロード毎に 1 起点で採番されるので、層番号 (0..NL) が 512 未満で
-    /// ある限り異なる (mid, 層, tag) が同じ key になることはない。
-    /// これを崩すと別モデル/別層の重みをデバイスキャッシュから誤参照する。
-    #[test]
+    /// s78 (T7) / s79 / s96 (P3-1): beta/alpha 投影の既定経路が参照実装と一致すること。
     ///
-    /// s96 (P3-1) で GPU 経路 (`gdn_proj_into_gpu` → `cuda::gdn_proj_f32_into`) を
-    /// 削除したので、このテストは「既定の CPU 経路が従来と同一」の検証だけを残す。
-    /// (旧版は存在しない `Qwen35::load_with_layer_types` を呼んでいてコンパイル
-    /// できなかったため、s79 で実在の `Qwen35::load` に置き換えた経緯がある。)
+    /// GPU 経路 (`gdn_proj_into_gpu` → `cuda::gdn_proj_f32_into`) は s96 で削除したので、
+    /// 既定経路 = CPU 経路 (`apply_bt_rows_into`) だけが残る。prefill から実際に通るのが
+    /// この CPU 経路なので、CPU 上でのビット一致を確認すれば回帰として足りる
+    /// (GPU 実機もデバイス固有のコードも要らず、GPU 無しの環境でも走る)。
+    ///
     /// fixture (`build_dir`) は 3:1 インターバルの本物の混成 (GDN + full attention)
     /// なので、実モデルと同じ層種別判定・同じ prefill コードを通る。
     ///
