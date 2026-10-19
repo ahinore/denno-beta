@@ -67,6 +67,14 @@ fn next_uid() -> u64 {
     std::sync::atomic::AtomicU64::fetch_add(&NEXT_UID, 1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// s80 (T7b): 既存の重み断片から**連結重み** (`Quant8Linear { .. }` を直接組む)
+/// を作るときの uid 採番。uid は「内容が一意な重み」の識別子として GPU 側の
+/// キャッシュキーに使われるため、連結で新しく作った重みは必ず新しい uid を持つ
+/// 必要がある (元の uid を流用すると別形状の重みが同じキーで衝突する)。
+pub fn next_q8_uid() -> u64 {
+    next_uid()
+}
+
 impl Quant8Linear {
     /// f32 重み (w: [n,k] row-major) を int8 へ量子化する。
     ///
@@ -106,6 +114,24 @@ impl Quant8Linear {
     /// 重みの実メモリ量 (bytes)
     pub fn weight_bytes(&self) -> usize {
         self.w.len() + self.scale.len() * 4
+    }
+}
+
+/// s80 (T7b): int8 重み 1 本に対する `Linear::apply_bt_rows_into` の Q8 分岐と
+/// **同一の経路** (GPU `maybe_gpu_linear_into` 試行 → CPU matvec / matmul)。
+/// ロード時に連結した重み (`Linear` を一度包まずに持つ層ゲート用) を同じ数値で
+/// 計算するための入口で、演算列・丸め・分岐条件は `apply_bt_rows_into` と
+/// 完全に同一 (どちらも同じカーネルを k,n 違いで呼ぶだけ)。
+pub fn q8_apply_bt_rows_into(q: &Quant8Linear, a: &[f32], m: usize, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), m * q.n);
+    #[cfg(feature = "cuda")]
+    if crate::cuda::maybe_gpu_linear_into(q.uid, a, &q.w, &q.scale, q.k, q.n, m, out) {
+        return;
+    }
+    if m == 1 {
+        crate::tensor::matvec_bt_i8_into(a, &q.w, &q.scale, q.k, q.n, out);
+    } else {
+        crate::tensor::matmul_bt_i8_into(a, &q.w, &q.scale, m, q.k, q.n, out);
     }
 }
 
