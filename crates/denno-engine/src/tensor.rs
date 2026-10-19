@@ -240,7 +240,14 @@ pub fn matvec_rows_bt(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec
     }
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {
-        matvec_rows_bt_vec(a, b, k, n, m)
+        // s62 (T5b): n < JB では既存のブロック分割が 0 チャンクになり、本体が
+        // 一度も走らず全チャネルが単スレッドの端数経路に落ちる (GDN の beta/alpha
+        // = Fp32・n=32 が該当し、prefill の gdn_proj の大半を占めていた)。
+        if n < JB {
+            matvec_rows_bt_small_n(a, b, k, n, m)
+        } else {
+            matvec_rows_bt_vec(a, b, k, n, m)
+        }
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
@@ -248,13 +255,17 @@ pub fn matvec_rows_bt(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec
     }
 }
 
+/// s62 (T5b): 出力チャネル方向の rayon ブロック幅 (既存実装と同一値)。
+/// `n < JB` では `par_chunks_exact` が 0 チャンクになるため、小 n 専用経路
+/// (`matvec_rows_bt_small_n`) に切り替える。
+const JB: usize = 64;
+
 /// SIMD 版本体 (P9)。レーン構成: 4 出力チャネル × 4 バッチセッション。
 /// k 累積はチャネル毎・セッション毎に独立した逐次チェーン (ビット一致の核心)。
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn matvec_rows_bt_vec(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec<f32> {
     const LANES: usize = 4; // バッチ (i) 方向のレーン数 = SIMD 幅
     const JG: usize = 4; // 同時に処理する出力チャネル数 (ILP 用、順序には無関係)
-    const JB: usize = 64; // rayon 出力ブロック (既存と同一)
 
     let mp = m.div_ceil(LANES) * LANES;
     // アクティベーションを [k][mp] に転置 + ゼロパディング。
@@ -295,6 +306,79 @@ fn matvec_rows_bt_vec(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec
         });
     // 端数ブロック (n が JB の倍数でない場合) — 逐次スカラーのまま (行数が少ない)。
     matvec_rows_bt_rem_scalar(a, b, k, n, m, (n / JB) * JB, &mut c);
+    c
+}
+
+/// s62 (T5b): **小 n 投影** (n < JB) 専用の本体。
+///
+/// 従来の `matvec_rows_bt_vec` は出力チャネルを `JB`(=64) 本ずつ `par_chunks_exact`
+/// で分けていた。n < 64 のとき `par_chunks_exact` は **0 チャンク** を返すため
+/// 本体ループが一度も走らず、出力チャネル全部が `matvec_rows_bt_rem_scalar`
+/// (単スレッド・j-outer/i-inner/d-inner のアクセス) に落ちていた。
+/// GDN の beta/alpha 投影は `lin_ctl` で **Fp32 固定**・n = n_v_heads (9B で 32)
+/// なので常にこの条件に当たり、prefill の `gdn_proj` が 263 ms/call を費やしていた
+/// (0.75 GFLOP を 2.8 GFLOPS = 単コアで 745MB の重みを走査)。
+///
+/// 修正方針: n が小さいときは **出力チャネル方向を rayon 並列**にする。各タスクは
+/// 自分が担当する重み行 (`JG` 本ずつ束ねる) だけを走査し、バッチ (i) 方向は
+/// `MB` レーンの SIMD で回す。各 (i,j) の累積は d について厳密に逐次
+/// `__fadd_rn(__fmul_rn(...))` のため、**出力は従来経路とビット一致**する
+/// (テスト: `matvec_rows_bt_small_n_matches_rem_scalar_path`)。
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn matvec_rows_bt_small_n(a: &[f32], b: &[f32], k: usize, n: usize, m: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    const MB: usize = 8; // バッチ (i) 方向のレーン数
+    const JG: usize = 2; // 1 タスクが同時に走査する出力チャネル数
+    debug_assert!(n > 0 && n < JB);
+    let mp = m.div_ceil(MB) * MB;
+    // アクティベーションを [d][i] に転置 (転置先はレーン方向に連続)。
+    let mut at = vec![0.0f32; k * mp];
+    for i in 0..m {
+        let src = &a[i * k..][..k];
+        for d in 0..k {
+            at[d * mp + i] = src[d];
+        }
+    }
+    // 出力はブロックローカル [t][i] に書き、最後に [i][j] へ転置する
+    // (共有可変スライスを持たない = unsafe 不要)。
+    let groups: Vec<(usize, usize, Vec<f32>)> = (0..n)
+        .step_by(JG)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|j0| {
+            let cols = (n - j0).min(JG);
+            let rows: Vec<&[f32]> = (0..cols).map(|t| &b[(j0 + t) * k..][..k]).collect();
+            let mut o = vec![0.0f32; cols * m];
+            for g in 0..(mp / MB) {
+                let mut acc = [0.0f32; JG * MB];
+                for d in 0..k {
+                    let av = &at[g * MB + d * mp..][..MB];
+                    for t in 0..cols {
+                        let rv = rows[t][d];
+                        let base = t * MB;
+                        for l in 0..MB {
+                            acc[base + l] += av[l] * rv;
+                        }
+                    }
+                }
+                let i0 = g * MB;
+                let nc = MB.min(m - i0);
+                for t in 0..cols {
+                    o[t * m + i0..t * m + i0 + nc].copy_from_slice(&acc[t * MB..t * MB + nc]);
+                }
+            }
+            (j0, cols, o)
+        })
+        .collect();
+    let mut c = vec![0.0f32; m * n];
+    for (j0, cols, o) in groups.iter() {
+        for t in 0..*cols {
+            let col = &o[t * m..][..m];
+            for (i, v) in col.iter().enumerate() {
+                c[i * n + j0 + t] = *v;
+            }
+        }
+    }
     c
 }
 
@@ -953,6 +1037,14 @@ mod tests {
                 (4usize, 65usize),
                 (65usize, 64usize),
                 (896usize, 192usize),
+                // s62 (T5b): n < JB(64) は小 n 専用経路 (出力チャネル並列) に落ちる。
+                // この領域が従来テストの死角で、`par_chunks_exact` が 0 チャンクに
+                // なることによる「本体が走らず単スレッド端数経路のみ」を見逃していた。
+                (16usize, 1usize),
+                (8usize, 2usize),
+                (37usize, 16usize),
+                (64usize, 32usize),
+                (40usize, 63usize),
             ] {
                 let a = pseudo_random(m * k, 5 + m as u32);
                 let b = pseudo_random(n * k, 6);
@@ -964,6 +1056,35 @@ mod tests {
                         &batched[i * n..][..n],
                         &solo[..],
                         "m={m} k={k} n={n} row={i}: バッチが単独と不一致"
+                    );
+                }
+            }
+        }
+    }
+
+    /// s62 (T5b): 小 n (n < JB) 経路が従来の単スレッド端数経路と**ビット一致**する
+    /// ことを、GDN beta/alpha の実形状 (k=4096, n=n_v_heads) で固定する。
+    ///
+    /// この経路は「n が小さいと従来実装が本体ループを一度も走らせず、全チャネルを
+    /// `matvec_rows_bt_rem_scalar` に落としていた」欠陥の修正。累積順 (d について
+    /// 逐次の f32 加算) を変えないので出力のビットは動かない — これを壊すと
+    /// prefill の既定数値 (= アンカー) が動くため、回帰ガードとして必須。
+    #[test]
+    fn matvec_rows_bt_small_n_matches_rem_scalar_path() {
+        for n in [1usize, 2, 15, 16, 17, 32, 48, 63] {
+            for (k, m) in [(4096usize, 5usize), (64usize, 8), (37usize, 3), (8usize, 9)] {
+                let a = pseudo_random(m * k, 11 + n as u32);
+                let b = pseudo_random(n * k, 12);
+                let got = matvec_rows_bt(&a, &b, k, n, m);
+                // 従来の n < JB での挙動そのもの (本体 0 チャンク + 全チャネル端数)。
+                let mut want = vec![0.0f32; m * n];
+                matvec_rows_bt_rem_scalar(&a, &b, k, n, m, 0, &mut want);
+                assert_eq!(got.len(), m * n);
+                for idx in 0..m * n {
+                    assert_eq!(
+                        got[idx].to_bits(),
+                        want[idx].to_bits(),
+                        "n={n} k={k} m={m} idx={idx}: 小 n 経路がビット不一致"
                     );
                 }
             }
