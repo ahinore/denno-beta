@@ -1590,6 +1590,21 @@ The pinned→heap `memcpy` reaches only **4.7 GB/s**, while a direct D2H into a 
 
 **Prevention**: patch generators must read the file from the repository HEAD, never a working copy parked in scratch.
 
+### Keep the GDN output on the device and run out_proj in the chain ✅ (2026-10-19, s72)
+
+> s70 made the FFN device-resident, but the **GDN attention block kept the same round trip**. The scan copied y (n×4096 = 47 MB) to the host and the immediately following out_proj uploaded the very same y again — 94 MB per layer, **2.2 GB per request** wasted across 24 layers.
+
+**Implementation**:
+
+- `gdn_scan_chunked_impl` gained `y_dst: Option<u64>`. When set, the scan writes y straight into a chain slot (`CH_PFH`) and only the conv/ssm state comes back to the host.
+- `gdn_scan_batch_oproj`: scan → out_proj (int8 GEMM) → a single D2H of the result, as one function. Every precondition (weight upload, slot capacity, ctx) is checked **before** the scan, because the scan advances conv/ssm and a mid-way fallback would advance them twice.
+- `qwen35::forward_prefill`'s GDN branch skips the old path (D2H y → `apply_bt_rows_into`) entirely when that succeeds, and is unchanged otherwise.
+- `DevBuffer::to_vec` no longer zero-fills a `Vec` before overwriting it; it copies into uninitialised storage and then `set_len` (a few ms per 47 MB, and it applies everywhere).
+
+**Numerics**: same `f_quant`, same `f_gemm`, same integer accumulation, so the output is **bit identical** — all three GPU anchors (1b / 2b / full 1b) match.
+
+**Result**: prefill **11.34 s → 10.11 s** (502 → **562 tok/s**), i.e. **−78% / 4.6×** from the 46.2 s we started at.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)

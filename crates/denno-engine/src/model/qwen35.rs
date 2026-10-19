@@ -1169,6 +1169,57 @@ impl Qwen35 {
                     // s57 (T4): GDN スキャンは attn_core の最大寄与。GPU カーネルが
                     // 実際に走ったか (Some/None) を実行先ラベルとして計測に載せる —
                     // ラベルは戻り値から得るので数値経路・分岐は不変。
+                    // s72: y をデバイス上に残したまま out_proj までチェーンで実行し、
+                    // 活性化の往復 (D2H 47MB + H2D 47MB / 層) を消す。数値は従来と同一
+                    // (同じ量子化カーネル + 同一 int8 GEMM)。前提が揃わないときは下の
+                    // 従来経路へそのまま落ちる。
+                    #[cfg(feature = "cuda")]
+                    let dev_ok = {
+                        let p = &self.gdn_p;
+                        match g.out_w.quant8() {
+                            Some(ow) if n > 1 && p.head_k_dim == p.head_v_dim => {
+                                crate::prof::time_layer_n_ev(
+                                    crate::prof::ATT_GDN_SCAN,
+                                    li,
+                                    n,
+                                    || -> (Option<()>, bool) {
+                                        let (conv, ssm) = cache
+                                            .gdn_state_mut(li)
+                                            .expect("GDN state slot が未初期化");
+                                        let r = crate::cuda::gdn_scan_batch_oproj(
+                                            &buf_qkv,
+                                            &buf_z,
+                                            &buf_beta,
+                                            &buf_alpha,
+                                            conv,
+                                            ssm,
+                                            &g.conv1d,
+                                            &g.ssm_a,
+                                            &g.ssm_dt,
+                                            &g.ssm_norm,
+                                            n,
+                                            p.n_k_heads,
+                                            p.n_v_heads,
+                                            p.head_k_dim,
+                                            p.head_v_dim,
+                                            p.d_conv,
+                                            p.eps,
+                                            1.0 / (p.head_k_dim as f32).sqrt(),
+                                            ow,
+                                            &mut buf_out,
+                                        );
+                                        (r, true)
+                                    },
+                                )
+                                .0
+                                .is_some()
+                            }
+                            _ => false,
+                        }
+                    };
+                    #[cfg(not(feature = "cuda"))]
+                    let dev_ok = false;
+                    if !dev_ok {
                     #[cfg(feature = "cuda")]
                     let (ys, scan_on_gpu): (Vec<f32>, bool) =
                         crate::prof::time_layer_n_ev(crate::prof::ATT_GDN_SCAN, li, n, || {
@@ -1229,6 +1280,7 @@ impl Qwen35 {
                     crate::prof::time_n_ev(crate::prof::OPROJ, n, || {
                         g.out_w.apply_bt_rows_into(&ys, n, &mut buf_out)
                     });
+                    }
                     if crate::gdn::gdn_dbg_enabled_for(li as i64) {
                         // 恒久診断 (env ゲート・未指定時 no-op): 出力投影後 (llama.cpp linear_attn_out 相当)
                         for i in 0..n {

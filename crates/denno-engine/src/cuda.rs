@@ -229,16 +229,20 @@ impl DevBuffer {
     pub fn to_vec<T: Copy>(&self, len: usize) -> Result<Vec<T>> {
         let bytes = len * std::mem::size_of::<T>();
         assert!(bytes <= self.bytes, "DevBuffer::to_vec: size overflow");
-        let mut out = vec![unsafe { std::mem::zeroed::<T>() }; len.max(1)];
-        if bytes > 0 {
-            unsafe {
-                check(
-                    (lib()?.memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, self.ptr, bytes),
-                    "cuMemcpyDtoH",
-                )?;
-            }
+        if bytes == 0 {
+            return Ok(Vec::new());
         }
-        out.truncate(len);
+        // s72: ゼロ埋めした Vec を作ってから上書きすると同じ領域を 2 度書く
+        // (47MB で数 ms)。未初期化領域へ直接 D2H し、コピー完了後に set_len する
+        // (cuMemcpyDtoH は同期コピーなので戻った時点で全要素が埋まっている)。
+        let mut out: Vec<T> = Vec::with_capacity(len);
+        unsafe {
+            check(
+                (lib()?.memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, self.ptr, bytes),
+                "cuMemcpyDtoH",
+            )?;
+            out.set_len(len);
+        }
         Ok(out)
     }
 
@@ -7342,7 +7346,7 @@ pub fn gdn_scan_batch(
     let result = if chunked {
         gdn_scan_chunked_impl(
             ctx, qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv,
-            d_conv, eps, q_scale,
+            d_conv, eps, q_scale, None,
         )
     } else {
         gdn_scan_impl(
@@ -7490,6 +7494,85 @@ fn gdn_scan_impl(
 /// chunk 分割は [`crate::gdn::chunk_plan`](n, この閾値, 1024, 16) を CPU 参照と共有。
 pub(crate) const GDN_CHUNK_MIN_TOKENS: usize = 2048;
 
+/// s72: GDN スキャンの y をデバイス上に残したまま out_proj までチェーンで実行し、
+/// 結果だけを host へ落とす。従来は y (n×vd) を D2H し、次の out_proj で再び H2D
+/// していた (1 層あたり 2×47MB)。
+///
+/// 演算は従来と同一 (同じ `f_quant` + `f_gemm`・同一 int8 累積) なので出力は
+/// ビット一致する。conv/ssm 状態の更新はスキャンカーネルが行うため、スキャン開始後に
+/// 失敗するとフォールバックでは状態を巻き戻せない。よって前提条件 (重みのアップロード・
+/// バッファ確保・ctx) はすべてスキャン前に確認し、以降の失敗は GPU 障害として扱う。
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_scan_batch_oproj(
+    qkv: &[f32],
+    z: &[f32],
+    beta: &[f32],
+    alpha: &[f32],
+    conv_st: &mut [f32],
+    ssm_st: &mut [f32],
+    wconv: &[f32],
+    wa: &[f32],
+    wdt: &[f32],
+    wnorm: &[f32],
+    n: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    eps: f32,
+    q_scale: f32,
+    o: &crate::quant::Quant8Linear,
+    out: &mut [f32],
+) -> Option<()> {
+    if !cuda_enabled() || n < GDN_CHUNK_MIN_TOKENS || dk != dv || d_conv != 4 {
+        return None;
+    }
+    let vd = nv.checked_mul(dv)?;
+    if o.k != vd || out.len() != n.checked_mul(o.n)? {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+    if ctx.make_current().is_err() {
+        return None;
+    }
+    ok(chain_ensure_buf(CH_PFH, n.checked_mul(vd)?.checked_mul(4)?))?;
+    ok(chain_ensure_buf(CH_O, n.checked_mul(o.n)?.checked_mul(4)?))?;
+    ok(weights_for_group(&[o.uid], &[o], o.k, o.n))?;
+    let yptr = CHAIN.with(|cell| cell.borrow().bufs[CH_PFH].as_ref().map(|b| b.ptr()))?;
+
+    if let Err(e) = gdn_scan_chunked_impl(
+        ctx, qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv,
+        d_conv, eps, q_scale, Some(yptr),
+    ) {
+        tracing::error!("GDN scan (device y) failed: {e:#}");
+        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    if chain_gemm_grouped_pf(&[o], CH_PFH, CH_O, n).is_none() {
+        tracing::error!("GDN out_proj (chain) failed");
+        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    let bytes = out.len().checked_mul(4)?;
+    let optr = CHAIN.with(|cell| cell.borrow().bufs[CH_O].as_ref().map(|b| b.ptr()))?;
+    let lib = lib().ok()?;
+    unsafe {
+        ok(check(
+            (lib.memcpy_dtoh_async)(
+                out.as_mut_ptr() as *mut c_void,
+                optr,
+                bytes,
+                std::ptr::null_mut(),
+            ),
+            "cuMemcpyDtoHAsync (gdn oproj)",
+        ))?;
+    }
+    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+    ctx.sync().ok()?;
+    Some(())
+}
+
 /// A1-r2: GDN chunked scan 実装 (3 カーネル・長 prefill 用)。
 ///
 /// CPU 参照: [`crate::gdn::scan_chunked_core`]。3-pass 構成:
@@ -7522,6 +7605,7 @@ fn gdn_scan_chunked_impl(
     d_conv: usize,
     eps: f32,
     q_scale: f32,
+    y_dst: Option<u64>,
 ) -> Result<Vec<f32>> {
     let cs = d_conv - 1;
     let conv_dim = 2 * nk * dk + nv * dv;
@@ -7648,7 +7732,8 @@ fn gdn_scan_chunked_impl(
     let (mut pq3, mut pz3, mut pb3, mut pa3) = (dp.q, dp.z, dp.beta, dp.alpha);
     let (mut pci3, mut psinit3) = (dp.conv_in, dp.sinit);
     let (mut pwc3, mut pwa3, mut pwd3, mut pwn3) = (dp.wc, dp.wa, dp.wd, dp.wn);
-    let (mut py, mut pco, mut pso) = (dp.y, dp.conv_out, dp.ssm_out);
+    // s72: y_dst があれば y はチェーンスロットへ直接書く (host へ落とさない)。
+    let (mut py, mut pco, mut pso) = (y_dst.unwrap_or(dp.y), dp.conv_out, dp.ssm_out);
     let (mut ni3, mut cli3) = (n as c_int, chunk_len as c_int);
     let (mut nki3, mut nvi3, mut dki3, mut dvi3) =
         (nk as c_int, nv as c_int, dk as c_int, dv as c_int);
@@ -7694,6 +7779,23 @@ fn gdn_scan_chunked_impl(
     ctx.sync()?;
     q.lap(crate::prof::D2H_GDN_PF_D2H);
 
+    if y_dst.is_some() {
+        // s72: y はデバイス上に残す (呼び出し側がチェーンで消費する)。状態だけ落とす。
+        let (conv_new, ssm_new) =
+            GDN_SCRATCH.with(|cell| -> Result<(Vec<f32>, Vec<f32>)> {
+                let s = cell.borrow();
+                Ok((
+                    s.buf(GdnBuf::ConvOut).to_vec::<f32>(conv_dim * cs)?,
+                    s.buf(GdnBuf::SsmOut).to_vec::<f32>(nv * dk * dv)?,
+                ))
+            })?;
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
+        conv_st.copy_from_slice(&conv_new);
+        ssm_st.copy_from_slice(&ssm_new);
+        q.end();
+        return Ok(Vec::new());
+    }
     let (y, conv_new, ssm_new) =
         GDN_SCRATCH.with(|cell| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
             let s = cell.borrow();
