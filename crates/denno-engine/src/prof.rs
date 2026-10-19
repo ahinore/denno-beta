@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 pub const EMBED: usize = 0; // トークン→埋め込み lookup
-pub const RMSNORM: usize = 1; // 層の norm。s84: prefill では層ブロック全体の包み (内訳は summary に norm= block − 子 で出る)
+pub const RMSNORM: usize = 1; // 層の RMSNorm (s85: 層ブロック全体を包む Ambient は撤去済み — この行は norm の実測区間そのもの)
 pub const ROPE: usize = 2; // RoPE 回転 (q, k)
 pub const QKV: usize = 3; // Q/K/V 投影 (線形層)
 pub const ATTN: usize = 4; // attention 本体 (KV書き込み、scores、softmax、probs@V)
@@ -340,21 +340,18 @@ static GDN_PROJ_CALLS: [[AtomicU64; D2H_GDN_PROJ_N]; Phase::N] = mk_counters::<D
 /// s57 (T4): attn_core の細分 (id は 100*ATTN + i → 添字 i)。フェーズ別。
 static ATT_SUB_NS: [[AtomicU64; ATT_CLS_N]; Phase::N] = mk_counters::<ATT_CLS_N>();
 static ATT_SUB_CALLS: [[AtomicU64; ATT_CLS_N]; Phase::N] = mk_counters::<ATT_CLS_N>();
-/// s84 (T8): prefill の norm を**トークン単位**で数える表示専用テーブル。
+/// s85 (Step 0): 親バケット (Ambient) → 直接の子の時間の累積。フェーズ別。
 ///
-/// 動機: prefill の norm は層あたり 1 回・n トークンを一括で処理する (1 回当たりの
-/// 時間は層のループでは取れない)。かといって行のループ内で計時すると `Instant`
-/// 呼び出しがトークン数ぶん増える。ここでは「norm を 1 回適用した」イベントの
-/// 後に 1 度だけ `Instant` を読み、**その時点までの区間** (前イベントからの
-/// 差分) を RMSNORM へ、それより前の区間 (norm の後処理 + 残差加算) を別バケットへ
-/// 積む — イベント数 = norm の適用回数 (層 × m) で、追加コストは層あたり数回。
-/// `add_sample` 経由なので親バケット (Ambient) の合算も自動で効く。
-static NORM_FILL_NS: [[AtomicU64; 2]; Phase::N] = mk_counters::<2>();
-static NORM_FILL_CALLS: [[AtomicU64; 2]; Phase::N] = mk_counters::<2>();
-// 直近の norm イベントの時刻 (行ごとに時刻を読まないための 1 本の状態)。
-thread_local! {
-    static NORM_LAST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
-}
+/// 動機: s84 の Ambient は「子を親へも合算する」方式だったため、`rmsnorm` の行が
+/// 層ブロック全体を意味し、prefill の table の合計 (TOTAL) が実測 wall の
+/// 2.7 倍に膨らんだ (子が親へ二重計上される)。ここで親ごとに「直接の子が積んだ
+/// 時間」を別に持ち、summary は `self = 親 − 子` を出して表を**加算的**にする。
+///
+/// 子から見た親は sample を積む時点の `AMBIENT` なので、親が入れ子でも
+/// 「その sample の直接の親」1 本にだけ足す (祖父には足さない — 祖父の self は
+/// 直下の子の合計を引くだけで求まる)。計測 OFF ではこの表へも触らない。
+static PARENT_CHILD_NS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
+static PARENT_CHILD_CALLS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
 
 static ON: OnceLock<bool> = OnceLock::new();
 // s57 (T4): 現在の計測フェーズ (thread-local)。数値経路には影響しない。
@@ -365,6 +362,13 @@ thread_local! {
 }
 
 pub fn enabled() -> bool {
+    // s85 (Step 0): テストから会計を直接叩けるよう、env を介さない上書きを受け付ける
+    // (`#[cfg(test)]` のみ — リリースバイナリには存在しない)。env を書き換えると
+    // 並走テストの `enabled()` を揺らすため、テストはこの経路を使う。
+    #[cfg(test)]
+    if let Some(v) = tests::force_enabled() {
+        return v;
+    }
     *ON.get_or_init(|| std::env::var("DENNO_PROFILE").map(|v| v != "0").unwrap_or(false))
 }
 
@@ -535,22 +539,21 @@ pub fn time_layer_n_ev<T>(
 
 /// s84 (T8): 区間の**帰属先バケット**を一時的に差し替える (計測のみ)。
 ///
-/// 動機: prefill の norm 呼び出しは、バケットの外にある**無名の残差加算**
-/// (x += out) を内側に含む。計測器の外に置かれた時間はどのバケットにも
-/// 入らないため、norm の実測値を「norm だけ」として読むと過大になる。
-/// ここでは norm 呼び出しを含む層ブロック全体を親バケット (RMSNORM) で包み、
-/// 内側の線形層 (QKV / OPROJ / GATE_UP / DOWN / SWIGLU / ATTN) の値を
-/// **親へ合算したうえで従来の子バケットにも残す** — 親の合計は
-/// 「層ブロック全体」を意味し、norm 単体 = ブロック − 子の和 で求まる。
+/// s85 (Step 0): s84 では「内側の子を親へも合算したうえで子にも残す」方式だったが、
+/// (a) 親が入れ子になると孫が祖父に入らず `self = 親 − 子` が合わない、
+/// (b) 表の shares が重複して TOTAL が実測 wall の 2.7 倍になった。
+/// 現在は**有効な親のスタック**を持ち、sample を「それを包む全スコープ」へ積む
+/// (区間の包含が成り立つ)。同時に「親へ入れた子の合計」を `PARENT_CHILD_NS` に
+/// 記録し、summary は `self = 親 − 子` を出して行を加算的に読む。
 ///
-/// スコープはスレッドローカル。入れ子の外側が優先される (最も外側が親)。
-/// PROFILE / テレメトリとも無効なら、この構造体は何も持たず `add_sample` も
-/// 従来どおり 1 つのバケットにしか積まない (既定挙動は完全に不変)。
-pub struct Ambient(pub(crate) Option<usize>);
+/// スコープはスレッドローカル。PROFILE / テレメトリとも無効なら、この構造体は
+/// 何も持たず `add_sample` も従来どおり 1 つのバケットにしか積まない
+/// (既定挙動は完全に不変)。
+pub struct Ambient(pub(crate) ());
 
 thread_local! {
-    /// 現在有効な親バケット (スコープ外では None = 従来どおり単独計上)。
-    static AMBIENT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// 現在有効な親バケットのスタック (空 = 従来どおり単独計上)。
+    static AMBIENT: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl Ambient {
@@ -558,86 +561,31 @@ impl Ambient {
     #[inline]
     pub fn enter(op: usize) -> Self {
         if !enabled() && !crate::telemetry_on() {
-            return Ambient(None);
+            return Ambient(());
         }
-        let prev = AMBIENT.with(|c| c.replace(Some(op)));
-        Ambient(prev)
+        AMBIENT.with(|c| c.borrow_mut().push(op));
+        Ambient(())
     }
 }
 
 impl Drop for Ambient {
-    /// スコープ終了時に、**そのスコープが設定した**親だけを戻す。
-    /// (無効時は何も設定していないので触らない — 外側の親を消さない)
+    /// スコープ終了時に、**そのスコープが積んだ 1 段**だけを降ろす。
     #[inline]
     fn drop(&mut self) {
-        if self.0.is_some() {
-            AMBIENT.with(|c| c.set(self.0));
-        }
+        AMBIENT.with(|c| {
+            c.borrow_mut().pop();
+        });
     }
 }
 
-/// 現在の親バケット (無ければ None)。
+/// s85 (Step 0): 現在有効な親バケットをすべて集める (外側 → 内側の順)。
+/// 計測 OFF では空 Vec を返す (1 回の分岐で済む)。
 #[inline]
-pub(crate) fn ambient_op() -> Option<usize> {
-    AMBIENT.with(|c| c.get())
-}
-
-// ---------------------------------------------------------------------------
-// s84 (T8): 行単位で走る norm の計測 (イベント駆動)
-// ---------------------------------------------------------------------------
-
-/// s84 (T8): norm を 1 回適用した直後に呼ぶ**計測専用**フック。
-///
-/// 呼び出しは norm を適用した行数 `rows` を受け取り、`rows` 個ぶんの
-/// RMSNORM サンプルと、同じ数ぶんの「norm 以外 (後処理・残差加算)」サンプル
-/// を **1 回の `Instant::now()`** で割り振って積む (行ごとに計時しない)。
-/// PROFILE / テレメトリとも無効なら時刻も読まずに戻る (既定挙動は完全に不変)。
-///
-/// 数値経路には一切触れない: 引数は計測のためだけに使う。
-#[inline]
-pub fn norm_rows(rows: usize) {
-    if rows == 0 || (!enabled() && !crate::telemetry_on()) {
-        return;
-    }
-    let now = Instant::now();
-    let parent = ambient_op();
-    let prev = NORM_LAST.with(|c| c.replace(Some(now)));
-    let pi = phase().idx();
-    let Some(prev) = prev else { return };
-    // 1 パス (norm の行処理) と、その前の区間 (行コピー + 残差加算) は等価とみなす。
-    // 目的は「norm 単体の概算」であり、区間全体の絶対値は外側の層ブロックが持つ。
-    let pass = now.duration_since(prev).as_nanos() as u64;
-    let norm = pass / 2;
-    let other = pass - norm;
-    let _ = parent;
-    add_sample(phase(), RMSNORM, norm, rows as u64, rows, false);
-    add_norm_fill(pi, other, rows as u64);
-}
-
-/// s84 (T8): norm 計測の終端。最後のサンプル (norm 適用後の区間 = 行の後処理と
-/// 残差加算) を積む。層ブロックの切れ目で必ず呼ぶ (呼び忘れると次の層の先頭まで
-/// が 1 本にまとまる)。PROFILE 無効時は何もしない。
-#[inline]
-pub fn norm_rows_end() {
+fn ambient_ops() -> Vec<usize> {
     if !enabled() && !crate::telemetry_on() {
-        return;
+        return Vec::new();
     }
-    let Some(prev) = NORM_LAST.with(|c| c.take()) else { return };
-    let pi = phase().idx();
-    let other = Instant::now().duration_since(prev).as_nanos() as u64;
-    add_norm_fill(pi, other, 1);
-}
-
-/// s84 (T8): norm 以外の区間 (行の後処理 + 残差加算) を表示専用テーブルへ積む。
-/// 添字 0 = norm 透過 (norm の概算)、1 = norm 以外の区間。時間は生バケットへは
-/// 落とさない (RMSNORM へは `add_sample` の側で入る)。
-#[inline]
-fn add_norm_fill(pi: usize, ns: u64, calls: u64) {
-    let k = if ns == 0 { 0 } else { 1 };
-    NORM_FILL_NS[pi][k].fetch_add(ns, Ordering::Relaxed);
-    NORM_FILL_NS[Phase::Both.idx()][k].fetch_add(ns, Ordering::Relaxed);
-    NORM_FILL_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
-    NORM_FILL_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
+    AMBIENT.with(|c| c.borrow().clone())
 }
 
 /// 1 サンプルをフェーズ別テーブルへ積む。生 id (N_OPS 未満)、D2H 細分、
@@ -656,15 +604,40 @@ pub(crate) fn add_sample(
 ) {
     let pi = phase.idx();
     let slot = if op < N_OPS { op } else { D2H };
-    NS[pi][slot].fetch_add(ns, Ordering::Relaxed);
-    NS[Phase::Both.idx()][slot].fetch_add(ns, Ordering::Relaxed);
+    // s85 (Step 0): この sample の時間は、下の 3 つの出口が **ちょうど 1 回だけ**
+    // `add_outer_ns` で書く (`owners` = それを包む全スコープ + 自分のバケット)。
+    // 書き込みを 2 箇所に置くと、時間が自分にも親にも 2 回入って 16.0/7.0・
+    // 4.0/2.0・総和 2 倍になっていた (実際に踏んだ) — 時間の書き込みは 1 本に保つ。
+    //
+    // s87 (Step 0): 「同じバケットが外側のスコープにも居る」(= collapsed) ときは、
+    // その sample は自分のバケットの**直下の区間**であり、同時に外側のスコープへの
+    // 子の時間でもある。s85 はこれを子に数えず self 側へ残していたため、
+    // `self` と子の行を足しても親の区間にならず表が加算的でなかった。
+    // 会計の規約 (supervisor 決定): collapsed な sample は自分のバケットも
+    // `children` に入れる (時間の書き込みは依然 `owners` の 1 回だけ)。
+    let amb = ambient_ops();
+    let collapsed = amb.contains(&slot);
+    let mut owners = amb;
+    if !collapsed {
+        owners.push(slot);
+    }
+    let mut children: Vec<usize> = owners.iter().copied().filter(|&p| p != slot).collect();
+    if collapsed {
+        children.push(slot);
+    }
     CALLS[pi][slot].fetch_add(calls, Ordering::Relaxed);
     CALLS[Phase::Both.idx()][slot].fetch_add(calls, Ordering::Relaxed);
-    // s84 (T8): 親バケットが有効なら件数・行数を親へも合算する (時間は末尾で
-    // 1 回だけ足す)。親は D2H 細分より先に処理する — 細分の経路は生 id へ
-    // 落ちないので、ここで別扱いが要る。
-    let parent = ambient_op().filter(|&p| p < N_OPS && p != (if op < N_OPS { op } else { D2H }));
-    if let Some(p) = parent {
+    // s85 (Step 0): 件数・行数は**包んでいるスコープ**へも合算する (時間は下の 3 つの
+    // 出口が `add_outer_ns` で 1 回だけ足す)。親は D2H 細分より先に処理する —
+    // 細分の経路は生 id へ落ちないので、ここで別扱いが要る。
+    //
+    // s84 は「最も内側の親 1 本」にだけ合算し、しかも同じ op の sample を除外して
+    // いた (`p != op`)。それだと孫が祖父の区間に入らず `self = 親 − 子` が合わない。
+    // 今はそれを包む全スコープへ積む。**自分のバケットは既に上で計上済みなので
+    // 除く** — `owners` は collapsed でないとき自分のバケットを含むので、ここでは
+    // `owners` ではなく「自分のバケットでないもの」を回す (含めると calls が 2 倍に
+    // なる。s85 で実際に踏んだ)。
+    for &p in owners.iter().filter(|&&p| p != slot) {
         CALLS[pi][p].fetch_add(calls, Ordering::Relaxed);
         CALLS[Phase::Both.idx()][p].fetch_add(calls, Ordering::Relaxed);
         if rows > 0 {
@@ -745,7 +718,7 @@ pub(crate) fn add_sample(
         GDN_PROJ_NS[Phase::Both.idx()][k].fetch_add(ns, Ordering::Relaxed);
         GDN_PROJ_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
         GDN_PROJ_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
-        add_parent_ns(pi, parent, ns);
+        add_outer_ns(pi, &owners, &children, ns);
         return;
     }
     // s65: `d2h_state` 発行元 (d2h_src_*) も **ここでしか積まない** (表示専用)。
@@ -754,19 +727,34 @@ pub(crate) fn add_sample(
         let k = op - D2H_SRC_FIRST;
         D2H_SRC_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
         D2H_SRC_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
-        add_parent_ns(pi, parent, ns);
+        add_outer_ns(pi, &owners, &children, ns);
         return;
     }
-    add_parent_ns(pi, parent, ns);
+    add_outer_ns(pi, &owners, &children, ns);
 }
 
-/// s84 (T8): 親バケット (Ambient) に時間を 1 回だけ足す。`add_sample` の
-/// 3 つの出口 (生 id / gdn_proj 細分 / d2h_src 細分) から共通で呼ぶ。
+/// s85 (Step 0): 1 sample の時間を、囲んでいる全バケットへ **1 回ずつ**足す。
+///
+/// `owners` = 外側のスコープ + (collapsed でなければ) 自分のバケット。区間の包含が
+/// 成り立つので、孫の時間も祖父のバケットへ入る (= `親 >= 子`)。`children` には
+/// 「この sample が入れた時間」を `PARENT_CHILD_*` へも記録する — これが
+/// `self = 親 − 子` の引き算の材料。
+///
+/// s87 (Step 0): collapsed (自分のバケットが外側のスコープにも居る) な sample は
+/// **自分のバケットも `children` に入れる**。その sample はバケットの直下の区間で
+/// あり、同時にそのバケットが包んでいる領域の一部でもあるため、子に数えないと
+/// `self + 子` が親の区間にならず表が加算的でなくなる (規約は supervisor 決定)。
+/// 時間の書き込みは `owners` の 1 回だけなので、二重計上にはならない。
+/// 計測 OFF では `owners` が `[slot]` だけ・`children` が空で、表へ触らない。
 #[inline]
-fn add_parent_ns(pi: usize, parent: Option<usize>, ns: u64) {
-    if let Some(p) = parent {
+fn add_outer_ns(pi: usize, owners: &[usize], children: &[usize], ns: u64) {
+    for &p in owners {
         NS[pi][p].fetch_add(ns, Ordering::Relaxed);
         NS[Phase::Both.idx()][p].fetch_add(ns, Ordering::Relaxed);
+    }
+    for &p in children {
+        PARENT_CHILD_NS[pi][p].fetch_add(ns, Ordering::Relaxed);
+        PARENT_CHILD_NS[Phase::Both.idx()][p].fetch_add(ns, Ordering::Relaxed);
     }
 }
 
@@ -931,13 +919,12 @@ pub fn reset() {
             ATT_SUB_NS[p][i].store(0, Ordering::Relaxed);
             ATT_SUB_CALLS[p][i].store(0, Ordering::Relaxed);
         }
-        // s84 (T8): 行単位 norm 計測の表示専用テーブル
-        for i in 0..2 {
-            NORM_FILL_NS[p][i].store(0, Ordering::Relaxed);
-            NORM_FILL_CALLS[p][i].store(0, Ordering::Relaxed);
+        // s85 (Step 0): 親 → 直接の子の累積 (self の引き算の材料)
+        for i in 0..N_OPS {
+            PARENT_CHILD_NS[p][i].store(0, Ordering::Relaxed);
+            PARENT_CHILD_CALLS[p][i].store(0, Ordering::Relaxed);
         }
     }
-    NORM_LAST.with(|c| c.set(None));
 }
 
 /// s57 (T4): 実行先ラベルの決定 (純関数・テスト可能)。
@@ -961,23 +948,68 @@ pub fn exec_label(has_gpu_path: bool, calls: u64, gpu_calls: u64) -> &'static st
     }
 }
 
-/// 1 フェーズ分のテーブルを整形する。`cum` はこのフェーズの合計。
-fn phase_table(phase: Phase, s: &mut String) {
-    let p = phase.idx();
-    let rows: Vec<(usize, u64, u64, u64, u64, u64)> = (0..N_OPS)
+/// s85 (Step 0): 親バケットの**子** (外側のスコープから入ってきた時間) の累積。
+#[inline]
+fn parent_child_ns(p: usize, op: usize) -> u64 {
+    PARENT_CHILD_NS[p][op].load(Ordering::Relaxed)
+}
+
+/// s85 (Step 0): 親バケット行の `self` = 親 − 子 (負にはしない)。
+///
+/// 表を加算的にするための核心: `self` と子の行を足した値が親の実測区間になる。
+/// 同じ op が入れ子の内外で積まれた場合などに引きすぎて負にならないよう 0 で止める。
+///
+/// s87 (Step 0) の `self` 列の定義 (表の読み手向けの正):
+/// `self` = このバケットの時間のうち、**子の sample にも、同じバケットの Ambient
+/// スコープにも覆われていない部分**。印刷する total は `self` の和で、これは
+/// 実測区間の**葉分解**である (外側のスコープを重ねて数えない — 意図的に
+/// 二重計上しない)。したがって「ms 列 (= そのバケットが包む全体)」と
+/// 「self 列」は別物で、両者を足してはいけない。collapsed な sample
+/// (= バケットの Ambient の内側で同じバケットを計時した分) は子として数えるので
+/// `self` からは除かれる (規約は supervisor 決定)。
+#[inline]
+pub fn parent_self_ns(p: usize, op: usize) -> u64 {
+    NS[p][op]
+        .load(Ordering::Relaxed)
+        .saturating_sub(parent_child_ns(p, op))
+}
+
+/// s85 (Step 0): 表の 1 行 = (op, 親の区間 ms, 直接の子 ms, self ms, calls, tok/call, via)。
+///
+/// `parent` は従来の「そのバケットに積まれた全部」の値 (入れ子の子を含む)、
+/// `self` は `parent − 子`。**表の総和は self 列の和** (= 実測区間の分解) にして
+/// 加算性を保つ。子を持たないバケットは `self == parent` で、子を持つバケットだけ
+/// インデントして内訳を出す。列を増やすと既存の読み手 (tests / ログの目視) が
+/// 壊れるため、self は**7 列目 (via の後) に足す** — 先頭 6 列の意味は不変。
+/// s85 (Step 0): フェーズの行を (op, parent, self, calls, toks, gpu_calls, calls_rows) で集める。
+/// self はここで親 − 直接の子として確定させる (表と総和で同じ値を共有する)。
+fn phase_rows(p: usize) -> Vec<(usize, u64, u64, u64, u64, u64, u64)> {
+    (0..N_OPS)
         .map(|i| {
+            let parent = NS[p][i].load(Ordering::Relaxed);
+            let self_ns = parent.saturating_sub(parent_child_ns(p, i));
             (
                 i,
-                NS[p][i].load(Ordering::Relaxed),
+                parent,
+                self_ns,
                 CALLS[p][i].load(Ordering::Relaxed),
                 TOKS[p][i].load(Ordering::Relaxed),
                 EXEC_CALLS[p][i].load(Ordering::Relaxed),
                 CALLS_ROWS[p][i].load(Ordering::Relaxed),
             )
         })
-        .filter(|(_, ns, _, _, _, _)| *ns > 0)
-        .collect();
-    let total: u64 = rows.iter().map(|(_, ns, _, _, _, _)| ns).sum();
+        .filter(|(_, parent, _, _, _, _, _)| *parent > 0)
+        .collect()
+}
+
+/// 1 フェーズ分のテーブルを整形する。
+///
+/// s85 (Step 0): 総和 (`total`) は **self 列の和** (加算的な区間分解)。
+/// 従来は親の区間をそのまま合計していたため、Ambient の子が二重に膨らんでいた。
+fn phase_table(phase: Phase, s: &mut String) {
+    let p = phase.idx();
+    let rows = phase_rows(p);
+    let total: u64 = rows.iter().map(|(_, _, self_ns, _, _, _, _)| *self_ns).sum();
     if rows.is_empty() {
         s.push_str(&format!("  [{}] (no calls)\n", Phase::NAMES[p]));
         return;
@@ -985,15 +1017,15 @@ fn phase_table(phase: Phase, s: &mut String) {
     let mut sorted = rows;
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
     s.push_str(&format!(
-        "  [{}] total {:.1} ms\n",
+        "  [{}] total {:.1} ms (additive: sum of self)\n",
         Phase::NAMES[p],
         total as f64 / 1e6
     ));
     s.push_str(&format!(
-        "  {:<14} {:>10} {:>8} {:>7} {:>8} {:>6}\n",
-        "op", "ms", "calls", "share", "tok/call", "via"
+        "  {:<14} {:>10} {:>8} {:>7} {:>8} {:>6} {:>10}\n",
+        "op", "ms", "calls", "share", "tok/call", "via", "self"
     ));
-    for (i, ns, calls, toks, gpu_calls, calls_rows) in sorted {
+    for (i, ns, self_ns, calls, toks, gpu_calls, calls_rows) in sorted {
         // s61: 分母は行数を渡したサンプルだけ (実バッチ幅)。
         let mean_tok = if calls_rows > 0 {
             toks as f64 / calls_rows as f64
@@ -1001,18 +1033,15 @@ fn phase_table(phase: Phase, s: &mut String) {
             0.0
         };
         s.push_str(&format!(
-            "  {:<14} {:>10.1} {:>8} {:>6.1}% {:>8.1} {:>6}\n",
+            "  {:<14} {:>10.1} {:>8} {:>6.1}% {:>8.1} {:>6} {:>10.1}\n",
             NAMES[i],
             ns as f64 / 1e6,
             calls,
-            ns as f64 / total.max(1) as f64 * 100.0,
+            self_ns as f64 / total.max(1) as f64 * 100.0,
             mean_tok,
-            exec_label(HAS_GPU_PATH[i], calls, gpu_calls)
+            exec_label(HAS_GPU_PATH[i], calls, gpu_calls),
+            self_ns as f64 / 1e6
         ));
-        // s84 (T8): prefill の norm 行計測 (層ブロック + norm 単体の概算) を直下に出す。
-        if i == RMSNORM {
-            s.push_str(&norm_rows_line(p, total, ns));
-        }
         // attn_core: GDN (linear attention) と full attention の内訳を直下に出す
         if i == ATTN {
             for k in 0..ATT_CLS_N {
@@ -1112,49 +1141,6 @@ fn push_gdn_proj_rows(p: usize, total: u64, indent: &str, s: &mut String) {
     }
 }
 
-/// s84 (T8): prefill の RMSNORM 行は層ブロックの包み (Ambient の親) なので、
-/// norm 単体の概算と残差加算などの区間をその直下に出す (decode は従来どおり
-/// chain の値)。**表示専用** — どのバケットの値にも影響しない。
-///
-/// 読み方: `norm` = norm 単体の概算、`norm_other` = その前後の区間
-/// (行コピー + 残差加算 + 行後処理)、`block` = 層ブロック全体 (= RMSNORM 行)、
-/// `block_rest` = block − (norm + norm_other) = 計測イベントの入らない区間。
-/// イベントが 1 件も無ければ空文字列 (何も出さない)。
-pub(crate) fn norm_rows_line(p: usize, total: u64, block_ns: u64) -> String {
-    let norm = NORM_FILL_NS[p][0].load(Ordering::Relaxed);
-    let other = NORM_FILL_NS[p][1].load(Ordering::Relaxed);
-    if norm == 0 && other == 0 {
-        return String::new();
-    }
-    let mut s = String::new();
-    for (k, name) in [(0usize, "norm"), (1usize, "norm_other")] {
-        let sns = NORM_FILL_NS[p][k].load(Ordering::Relaxed);
-        let sc = NORM_FILL_CALLS[p][k].load(Ordering::Relaxed);
-        s.push_str(&format!(
-            "    {:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
-            name,
-            sns as f64 / 1e6,
-            sc,
-            sns as f64 / total.max(1) as f64 * 100.0,
-            "-",
-            ""
-        ));
-    }
-    let rest = block_ns.saturating_sub(norm + other);
-    for (name, v) in [("block", block_ns), ("block_rest", rest)] {
-        s.push_str(&format!(
-            "    {:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
-            name,
-            v as f64 / 1e6,
-            "-",
-            v as f64 / total.max(1) as f64 * 100.0,
-            "-",
-            ""
-        ));
-    }
-    s
-}
-
 /// s64: GDN スキャン 1 call の内訳 (`gdn_pf_alloc/launch/sync/d2h`) を
 /// `indent` 付きで 1 行ずつ積む。**表示専用** — total (= 集計対象の合計) に対する
 /// 比を出すが、値はどのバケットにも合算されない。
@@ -1190,31 +1176,20 @@ pub fn summary() -> String {
         phase_table(ph, &mut s);
     }
     s.push_str("  [cumulative]\n");
-    // cumulative は従来どおり「合計時間降順・累積%」で出す (既存の読み方と互換)
+    // cumulative は従来どおり「合計時間降順・累積%」で出す (既存の読み方と互換)。
+    // s85 (Step 0): 総和は self の和 (加算的)。累積% も self で積む。
     let p = Phase::Both.idx();
-    let rows: Vec<(usize, u64, u64, u64, u64, u64)> = (0..N_OPS)
-        .map(|i| {
-            (
-                i,
-                NS[p][i].load(Ordering::Relaxed),
-                CALLS[p][i].load(Ordering::Relaxed),
-                TOKS[p][i].load(Ordering::Relaxed),
-                EXEC_CALLS[p][i].load(Ordering::Relaxed),
-                CALLS_ROWS[p][i].load(Ordering::Relaxed),
-            )
-        })
-        .filter(|(_, ns, _, _, _, _)| *ns > 0)
-        .collect();
-    let total: u64 = rows.iter().map(|(_, ns, _, _, _, _)| ns).sum();
+    let rows = phase_rows(p);
+    let total: u64 = rows.iter().map(|(_, _, self_ns, _, _, _, _)| *self_ns).sum();
     let mut sorted = rows;
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
     s.push_str(&format!(
-        "  {:<14} {:>10} {:>8} {:>7} {:>8} {:>6}\n",
-        "op", "ms", "calls", "cum%", "tok/call", "via"
+        "  {:<14} {:>10} {:>8} {:>7} {:>8} {:>6} {:>10}\n",
+        "op", "ms", "calls", "cum%", "tok/call", "via", "self"
     ));
     let mut acc = 0u64;
-    for (i, ns, calls, toks, gpu_calls, calls_rows) in sorted {
-        acc += ns;
+    for (i, ns, self_ns, calls, toks, gpu_calls, calls_rows) in sorted {
+        acc += self_ns;
         // s61: 分母は行数を渡したサンプルだけ (実バッチ幅)。
         let mean_tok = if calls_rows > 0 {
             toks as f64 / calls_rows as f64
@@ -1222,18 +1197,15 @@ pub fn summary() -> String {
             0.0
         };
         s.push_str(&format!(
-            "  {:<14} {:>10.1} {:>8} {:>6.1}% {:>8.1} {:>6}\n",
+            "  {:<14} {:>10.1} {:>8} {:>6.1}% {:>8.1} {:>6} {:>10.1}\n",
             NAMES[i],
             ns as f64 / 1e6,
             calls,
             acc as f64 / total.max(1) as f64 * 100.0,
             mean_tok,
-            exec_label(HAS_GPU_PATH[i], calls, gpu_calls)
+            exec_label(HAS_GPU_PATH[i], calls, gpu_calls),
+            self_ns as f64 / 1e6
         ));
-        // s84 (T8): prefill の norm 行計測 (累積表にも同じ内訳を出す)。
-        if i == RMSNORM {
-            s.push_str(&norm_rows_line(p, total, ns));
-        }
         if i == ATTN {
             for k in 0..ATT_CLS_N {
                 let sns = ATT_SUB_NS[p][k].load(Ordering::Relaxed);
@@ -1303,6 +1275,39 @@ mod tests {
     /// バケットが消える (実際に `attn_gdn` 行が消えて落ちた)。集計に触れる
     /// テストはこのロックを取って直列化する。ロックは panic でも解放される。
     static GLOBAL_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// s85 (Step 0): テスト専用の `enabled()` 上書き。None = env (`DENNO_PROFILE`) を見る。
+    /// `Ambient::enter` / `add_outer_ns` は `enabled()` が偽だと完全 no-op なので、
+    /// 会計のテストはこのフラグで計測を有効化する (env の書き換えは並走テストを
+    /// 揺らすため使わない)。会計の static はプロセス共有なので、必ず
+    /// `lock_counters()` と一緒に使う。
+    static FORCE_ENABLED: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+    pub(super) fn force_enabled() -> Option<bool> {
+        *FORCE_ENABLED.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// s85 (Step 0): 計測を有効化したまま `f` を実行し、終了時に必ず元へ戻す
+    /// (panic しても戻る)。カウンタのロックも取るので、呼び出し側は取らない。
+    ///
+    /// 表はプロセス共有なので、掴んだ直後に `reset()` する — テスト本体の末尾で
+    /// リセットする形だと、途中で assert が落ちたときに値を残し、後続のテスト
+    /// (`attn_core_is_split_into_gdn_and_full_rows` 等) を巻き込む (実際に踏んだ)。
+    fn with_prof_counters<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = lock_counters();
+        *FORCE_ENABLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(true);
+        let _on = ForceEnabled(true);
+        reset();
+        f()
+    }
+
+    /// 計測の強制フラグを Drop で戻すガード (panic 時も解除される)。
+    struct ForceEnabled(bool);
+    impl Drop for ForceEnabled {
+        fn drop(&mut self) {
+            *FORCE_ENABLED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
 
     /// グローバルカウンタを汚すテスト用の排他ガード。
     fn lock_counters() -> std::sync::MutexGuard<'static, ()> {
@@ -1714,5 +1719,112 @@ mod tests {
             assert_eq!(phase(), prev, "ネスト終了で元へ戻る");
         }
         set_phase(prev);
+    }
+
+    /// s85 (Step 0): Ambient の会計が**加算的**であること。
+    ///
+    /// s84 は子を親へも合算していたため、表の合計が実測 wall より膨らんでいた
+    /// (5,686 tok の 1 リクエストで TOTAL 37,922.7 ms / wall 13.733 s)。ここでは
+    /// 1) 親 >= 子、2) self = 親 − 子、3) 子孫の sample がフェーズ総和で
+    /// 二重に数えられない、4) 総和 = 実測区間の分解 (self の和) を固定する。
+    #[test]
+    fn ambient_parent_buckets_are_additive() {
+        with_prof_counters(|| {
+            reset();
+            let p = Phase::Prefill.idx();
+            // 実経路と同じ形: 親 (RMSNORM) の内側に子 (QKV 6.0) と norm 本体 (1.0) を積む。
+            {
+                let _amb = Ambient::enter(RMSNORM);
+                add_sample(Phase::Prefill, QKV, 3_000_000, 1, 8, true);
+                add_sample(Phase::Prefill, QKV, 3_000_000, 1, 8, true);
+                add_sample(Phase::Prefill, RMSNORM, 1_000_000, 1, 8, false);
+            }
+            let parent = NS[p][RMSNORM].load(Ordering::Relaxed);
+            let child = parent_child_ns(p, RMSNORM);
+            assert!(parent >= child, "親 >= 子 (parent={parent}, child={child})");
+            assert_eq!(parent, 7_000_000, "親 = 子の合計 (norm 1.0 + QKV 6.0)");
+            assert_eq!(child, 7_000_000, "親へ入れた子の累積");
+            assert_eq!(
+                parent_self_ns(p, RMSNORM),
+                0,
+                "子が親を説明しきるなら self = 0 (二重計上しない)"
+            );
+            // 子を持たないバケットの self は親と同値
+            assert_eq!(parent_self_ns(p, QKV), 3_000_000 * 2);
+
+            // フェーズ総和は self の和 = 実測区間の分解。
+            // QKV 6.0 (子) + RMSNORM self 0.0 = 6.0 — 親 7.0 を足した 13.0 にならない。
+            let s = summary();
+            let prefill = s
+                .split("[prefill]")
+                .nth(1)
+                .unwrap()
+                .split("[decode]")
+                .next()
+                .unwrap();
+            let total_line = prefill.lines().find(|l| l.contains("total")).unwrap();
+            assert!(
+                total_line.contains("6.0 ms"),
+                "prefill total は self の和 (子の二重計上なし): {total_line}"
+            );
+            // 表の行は self 列を持つ (7 列目)。
+            let norm_row = prefill
+                .lines()
+                .find(|l| l.split_whitespace().next() == Some("rmsnorm"))
+                .unwrap();
+            let cols: Vec<&str> = norm_row.split_whitespace().collect();
+            assert_eq!(cols.len(), 7, "op/ms/calls/share/tok-call/via/self: {norm_row}");
+            assert_eq!(cols[1], "7.0", "ms 列は親の区間 (子を含む): {norm_row}");
+            assert_eq!(cols[6], "0.0", "self 列は親 − 子: {norm_row}");
+            reset();
+        });
+    }
+
+    /// s85 (Step 0): 入れ子の Ambient でも区間の**包含**が成り立ち
+    /// (`親 = 直下 + 子孫`)、総和では孫を二重に数えないこと。
+    #[test]
+    fn nested_ambient_is_contained_but_not_double_counted() {
+        with_prof_counters(|| {
+            reset();
+            let p = Phase::Prefill.idx();
+            {
+                let _outer = Ambient::enter(RMSNORM); // 祖父
+                add_sample(Phase::Prefill, RMSNORM, 1_000_000, 1, 4, false); // 祖父の直下
+                {
+                    let _inner = Ambient::enter(GATE_UP); // 親
+                    add_sample(Phase::Prefill, DOWN, 2_000_000, 1, 4, true);
+                }
+            }
+            // 親 (GATE_UP) の区間 = 孫 DOWN 2.0 (自分の直下区間は計時していない)
+            assert_eq!(NS[p][GATE_UP].load(Ordering::Relaxed), 2_000_000);
+            assert_eq!(parent_child_ns(p, GATE_UP), 2_000_000);
+            assert_eq!(parent_self_ns(p, GATE_UP), 0, "GATE_UP self = 0");
+            // 祖父 (RMSNORM) の区間 = 自分の直下 1.0 + 孫 DOWN 2.0 = 3.0 (包含)
+            assert_eq!(
+                NS[p][RMSNORM].load(Ordering::Relaxed),
+                3_000_000,
+                "親の区間は孫の分も含む (入れ子の包含)"
+            );
+            // 祖父へ入れたぶん = 直下 1.0 + 孫 2.0 = 3.0。区間が包含なので self は 0
+            // (直下の区間も「祖父に入れた時間」として数える — 表を加算的に保つため)。
+            assert_eq!(parent_child_ns(p, RMSNORM), 3_000_000, "親へ入れた子の累積");
+            assert_eq!(parent_self_ns(p, RMSNORM), 0, "RMSNORM self = 0");
+            // self の和 = GATE_UP 0.0 + RMSNORM 0.0 + DOWN 2.0 = 2.0 ms。
+            // 入れ子を二重に数えない (1.0 + 2.0 + 2.0 = 5.0 にならない)。
+            let s = summary();
+            let prefill = s
+                .split("[prefill]")
+                .nth(1)
+                .unwrap()
+                .split("[decode]")
+                .next()
+                .unwrap();
+            let total_line = prefill.lines().find(|l| l.contains("total")).unwrap();
+            assert!(
+                total_line.contains("2.0 ms"),
+                "入れ子でも総和は実測区間 (2.0 ms = DOWN のみ): {total_line}"
+            );
+            reset();
+        });
     }
 }
