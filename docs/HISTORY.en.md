@@ -1750,6 +1750,52 @@ name is historical and no bit-exactness is claimed.
 literally, and handle m>1 and k<3. Until then it stays opt-in. T7 should move on to the other levers
 (gate+up / qkv fusion, GDN scan residency).
 
+### MLP gate+up concatenated at load time into a single GEMM (2026-10-19, s80 / s81 / T7b-1) — not yet measured on the GPU
+
+> The round that moved T7's main lever from the GDN projection to MLP fusion. The numbers are
+> **bit-identical**; what changes is only the number of GEMM launches and GPU round trips. No
+> on-device measurement has been taken yet.
+
+**Motivation**: prefill projected gate, up and down separately, so the GPU path made two round
+trips for gate and up. `dno_gemm_i8` is independent per row (output channel) and merely sweeps n in
+tiles, so concatenating the gate and up weights **along rows** computes both in a single GEMM.
+
+**What was added**:
+
+- `Layer.gate_up_w`: the row concatenation of gate_w and up_w as `[2*ff, e]`, row order
+  `[all gate rows | all up rows]`, built **once** at model load by `concat_rows()`. The concatenated
+  weight gets a fresh `uid` so it cannot collide with the source weights in the GPU device cache.
+- The int8 prefill path calls `q8_apply_bt_rows_into()` once on the concatenated weight; SwiGLU has
+  a branch for the concatenated layout (`[g columns | u columns]`).
+- `chain_mlp_prefill()` now takes a single `gate_up_w` and derives `ff = n/2` (signature change with
+  one call site); the grouped GEMM drops from two uids to one.
+- The decode chain's GATE_UP step also collapses into `chain_linear_grouped(&[gate_up_w], ...)`.
+- The fp32 path still issues two calls and keeps no per-layer concatenated copy.
+
+**Why it is bit-exact**: the int8 quantization scale is **per row** and the integer dot product and
+accumulation are **row-independent**, so concatenating rows changes neither the quantized values nor
+the accumulation order of any row. The fp32 path's `matvec_rows_bt` accumulation is likewise closed
+per (i, j), so row order is irrelevant there too.
+
+**Cost**: resident memory grows by the duplicated gate+up weights (roughly 1GB in int8 and 4GB in
+fp32 at 27B scale), in exchange for dropping the host-side concatenation copy at first GEMM.
+
+**Tests**: `cargo test -p denno-engine --lib` = **232 passed / 0 failed / 1 ignored** (229 passed
+before the change, plus 3 new). The permanent tests live inside the `qwen35.rs` tests module:
+
+- `t7b1_concat_gate_up_is_bit_exact_vs_two_calls`: for both int8 and fp32, splitting the
+  concatenated result back into [gate|up] matches the two individual calls bit for bit (m=1 and m=3).
+- `t7b1_concat_rows_copies_weights_and_takes_fresh_uid`: the concatenation copies rows verbatim
+  (no requantization) and allocates a fresh uid.
+- `t7b1_fused_prefill_matches_legacy_ffn_bitexact`: the fused path and a legacy two-call FFN
+  reference produce identical prefill logits and identical GDN state.
+
+`cargo check --features cuda` also passes, and the cuda-feature tests compile. No GPU execution was
+performed.
+
+**Next step (T7b-2, not started)**: apply the same argument to the attention side — fusing
+`qkv + z` (GDN) and `beta + alpha`. Both stay bit-exact under plain row concatenation.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)

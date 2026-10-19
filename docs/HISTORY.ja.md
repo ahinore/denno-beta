@@ -1829,6 +1829,50 @@ CPU 経路はビット不変)。GPU の診断プローブ `cuda_gdn_proj_f32_bit
 m>1 と k<3 の端数を潰すこと。直るまで opt-in のまま (既定 off) にする。
 T7 の本命は別レバー (gate+up / qkv の融合・GDN スキャンの常駐化) に切り替えてよい。
 
+### MLP の gate+up をロード時に連結して 1 回の GEMM にまとめる (2026-10-19, s80 / s81 / T7b-1) — GPU 未計測
+
+> T7 の本命を GDN 射影から MLP の融合に切り替えた回。数値は**ビット不変**で、
+> 変わるのは GEMM の呼び出し回数と GPU 往復数だけ。ただし実機計測はまだ行っていない。
+
+**動機**: prefill の MLP は gate・up・down の 3 本を別々に投影していたため、
+GPU 経路では gate と up で 2 往復していた。`dno_gemm_i8` は行 (出力チャネル) ごとに
+独立で、n をタイルで舐めるだけなので、gate と up の重みを**行方向に連結**すれば
+1 回の GEMM で両方を計算できる。
+
+**実装したもの**:
+
+- `Layer.gate_up_w`: gate_w と up_w の行連結 `[2*ff, e]` (行順 `[gate 全行 | up 全行]`)。
+  モデルロード時に `concat_rows()` で**1 回だけ**作る。連結重みは新しい `uid` を
+  採番する (GPU のデバイスキャッシュ鍵が重量で衝突しないため)。
+- prefill の int8 経路: `q8_apply_bt_rows_into()` で連結重みを 1 呼び出し。
+  SwiGLU は連結レイアウト ([g 全列 | u 全列]) に合わせた分岐を持つ。
+- `chain_mlp_prefill()` は `gate_up_w` 1 本を受け取り、`ff = n/2` を導出する
+  (シグネチャ変更・呼び出し元は 1 箇所)。grouped GEMM も 2 uid -> 1 uid。
+- decode chain の GATE_UP も `chain_linear_grouped(&[gate_up_w], ...)` に統合。
+- fp32 経路は従来どおり 2 呼び出しのまま (層ごとの連結コピーは持たない)。
+
+**ビット一致の根拠**: int8 の量子化スケールは**行ごと**、整数ドット積と累積は
+**行独立**。したがって行を連結しても各行の量子化値も累積順も変わらない。
+fp32 側も `matvec_rows_bt` の累積が (i, j) ごとに閉じているため行順に依存しない。
+
+**コスト**: 常駐メモリが gate+up の分だけ増える (int8 で約 1GB / fp32 で約 4GB 相当)。
+引き換えに初回 GEMM 時のホスト側連結コピーが不要になる。
+
+**テスト**: `cargo test -p denno-engine --lib` = **232 passed / 0 failed / 1 ignored**
+(着手前 229 passed、新規 3 本)。恒久テストは `qwen35.rs` の tests モジュール内:
+
+- `t7b1_concat_gate_up_is_bit_exact_vs_two_calls`: int8 と fp32 の両方で、
+  連結を [gate|up] に分割した結果が個別 2 呼び出しとビット一致 (m=1 と m=3)。
+- `t7b1_concat_rows_copies_weights_and_takes_fresh_uid`: 連結が行をそのまま複写し
+  (再量子化しない)、uid を新採番すること。
+- `t7b1_fused_prefill_matches_legacy_ffn_bitexact`: 融合経路と「gate/up 2 呼び出し」の
+  従来 FFN 参照で、prefill の logits と GDN 状態がビット一致すること。
+
+`cargo check --features cuda` も通る (CUDA 機能のテストもコンパイル可)。GPU 実行はしていない。
+
+**次の一手 (T7b-2・未着手)**: 同じ理屈で attention 側の `qkv + z` (GDN) と
+`beta + alpha` の融合に進める。どちらも行連結だけでビット一致が保てる形。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
