@@ -160,6 +160,10 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   rounds and prints the delta. Removes the human step and the unit mismatch that produced
   the inflated 8.71 s figure.
 - Acceptance: one command produces "old A/B new, delta %, anchors PASS".
+- s102: implemented as `scripts/cold_ab.py` (stdlib only; `--dry-run`, `--self-test`,
+  `--json`). Tests: `python3 scripts/test_cold_ab.py` (32 tests, CPU only). GPU_VERIFY.sh
+  stays gitignored and is not edited by the dev; wiring it in is a human step
+  (snippet in REPORT_S102.md).
 
 ## P4 — productisation, never validated end to end
 
