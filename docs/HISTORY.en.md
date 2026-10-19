@@ -1712,37 +1712,43 @@ drift is therefore better read as a 1-ulp perturbation flipping a near-tie durin
 not a permanent legitimate shift. Whether s73's parallel prepare reads an uninitialised tail
 is still open and stays tracked as T9.
 
-### Move the prefill GDN beta/alpha projection onto the GPU (2026-10-19, s78 / s79 / T7) — not yet measured on GPU
+### Prefill GDN beta/alpha projection: a GPU kernel was tried and is not adopted (2026-10-19, s78 / s79 / T7) — quarantined behind an opt-in flag
 
 > The last prefill profile put `gdn_proj` at 5.4 s (5,866 tok). s77 tried the same move but the
 > shape check compared `w.len()` against `k*tokens`, so the GPU path always returned false and fell
-> back to the CPU — **dead code**, and its `ATT_GDN_PROJ` timing was a no-op closure (0 ms). s78
-> rebuilt it from the kernel up; s79 got the workspace compiling again.
+> back to the CPU — dead code with a no-op timer. s78 rebuilt it from the kernel up and s79 got the
+> workspace compiling again. **On the real GPU the kernel does not compute the right values, so it
+> stays off by default.**
 
-**Kernel and numeric contract**:
+**What was added**:
 
-- New `dno_matvec_rows_f32` in `kernels_elem.cu` computes `[m,k] x [n,k]^T -> [m,n]` with one block
-  per output element (i,j), grid=(n,m), block=(32,1,1). No shared-memory reduction, no atomics, no
-  warp reduction, so it is **deterministic** and independent of the thread count.
-- To be **bit-exact** with the CPU `matvec_rows_bt_small_n_impl`, the accumulation order is mirrored:
-  split k into TILE=256 slices, accumulate each slice as a tail-chained truncated sum, then add the
-  slice sums in ascending order. `DNO_MVROWS_TILE` must stay equal to the CPU `MVROWS_TILE`.
-- Host-side guards: `gdn_proj_shape_ok` (w=[k,nv] / a=[m,k] / out=[m,nv]) rejects mismatched
-  buffers (CPU path), and inputs that could produce denormals (`gdn_proj_min_row_sqsum`) also fall
-  back to the CPU; the reason is observable via `gdn_proj_last_miss`.
-- One H2D and one D2H per call. PROFILE gained `D2H_GDN_PROJ_{H2D,KERNEL,SYNC,D2H}` (display only).
+- `dno_matvec_rows_f32` in `kernels_elem.cu`: `[m,k] x [n,k]^T -> [m,n]` with one block per output
+  element, no shared-memory reduction, no atomics, no warp reduction (deterministic by construction).
+- Host side: a `gdn_proj_shape_ok` gate (w=[k,nv] / a=[m,k] / out=[m,nv]), a denormal pre-check
+  (`gdn_proj_min_row_sqsum`), one H2D and one D2H per call, and `D2H_GDN_PROJ_{H2D,KERNEL,SYNC,D2H}`
+  in PROFILE.
+- **Opt-in gate `DENNO_GPU_GDN_PROJ=1` (default off)**. The default path is still
+  `apply_bt_rows_into` on the CPU, bit-identical, and the three anchors do not move.
+- Seven files under `crates/denno-server/tests/` never got `AppState.temperature_cap` from s67b and
+  failed to compile with E0063; they now initialise it to `None` (tests only).
 
-**Default path unchanged**: until the `.ptx` is regenerated the call reports `GdnProjMiss::NoKernel`
-and falls back to `apply_bt_rows_into`, so the output is bit-identical to before s79.
+**Defects found by measuring on the GPU (unresolved as of s79)**:
 
-**Side fix (pre-existing breakage)**: seven files under `crates/denno-server/tests/` never followed
-s67b's `AppState.temperature_cap` addition and failed to compile with E0063. Added
-`temperature_cap: None` to their initialisers (tests only, no numeric path).
+1. **The numbers are wrong**: the largest absolute difference against the CPU is ~1.0e2 for the
+   k=4096 nv=32 m=4096 case, far outside any ulp range. Determinism holds (two runs are bit-equal),
+   so the computation itself differs (grid/dimension plumbing or weight placement is suspected).
+2. k=1 raises a runtime error, which latches `LMV32_BROKEN` and sends every later call to the CPU.
+3. The opt-in gate is checked before the denormal pre-check, so with the gate off the miss reason is
+   `Disabled` and `Denorm` is unobservable (diagnostic ordering only).
 
-**Verification**: `cargo test --workspace` = **312 passed / 0 failed / 18 ignored**, including new
-negative cases for the shape gate (transposed, short, zero dims) and a fallback-overwrite unit test.
-The GPU bit-exactness test `cuda_gdn_proj_f32_bit_exact_vs_cpu` stays `#[ignore]` and unrun until the
-supervisor regenerates the PTX.
+**Tests**: `cargo test --workspace` = **312 passed / 0 failed / 18 ignored** (default build, cuda
+off, CPU path bit-identical). The GPU probe `cuda_gdn_proj_f32_bit_exact_vs_cpu` only runs when
+`DENNO_GPU_GDN_PROJ=1` is supplied from outside and just records determinism and the deviation; the
+name is historical and no bit-exactness is claimed.
+
+**Next step**: if the kernel is ever revisited, drop "one block per output", mirror the CPU split
+literally, and handle m>1 and k<3. Until then it stays opt-in. T7 should move on to the other levers
+(gate+up / qkv fusion, GDN scan residency).
 
 ## 4. Candidate List
 

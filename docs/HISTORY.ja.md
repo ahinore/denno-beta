@@ -1790,36 +1790,44 @@ v6_1b=`c61ad85b` / v6_2b=`9e17d563` / v6_1b_full=`af6eb6ab` の **3 本とも一
 サンプリングのニアタイでトークンを反転させた**ものと解釈するのが自然である。
 s73 の並列 prepare が未初期化領域を読んでいる可能性は依然として未検証で、T9 として残す。
 
-### prefill の GDN beta/alpha 射影を GPU 化 (2026-10-19, s78 / s79 / T7) — GPU 未計測
+### prefill の GDN beta/alpha 射影: GPU カーネルを試作したが不採用 (2026-10-19, s78 / s79 / T7) — 既定 off の opt-in に隔離
 
 > 直近のプロファイルで prefill の `gdn_proj` は 5.4 s (5,866 tok)。s77 で一度 GPU 化を試みたが、
 > 形状チェックが `w.len()` を `k*tokens` と比べていたため常に false で CPU へ落ちる**死んだコード**で、
-> 計時も no-op クロージャだった (`ATT_GDN_PROJ` = 0 ms)。s78 でカーネルから作り直し、
-> s79 でビルドを通した。
+> 計時も no-op クロージャだった。s78 でカーネルから作り直し、s79 でビルドを通した。
+> **GPU 実機で測った結果、カーネルは正しくないため既定では使わない。**
 
-**カーネルと数値契約**:
+**実装したもの**:
 
 - 新カーネル `dno_matvec_rows_f32` (kernels_elem.cu)。`[m,k] x [n,k]^T -> [m,n]` を
-  1 ブロック = 1 出力 (i,j)・grid=(n,m)・block=(32,1,1) で計算する。共有メモリ・atomic・
-  warp 縮約を使わないので**決定論** (スレッド数非依存)。
-- CPU の `matvec_rows_bt_small_n_impl` と**ビット一致**させるため、累積順
-  「k を TILE=256 で区切り、区間内は末尾連鎖の打ち切り和、区間和を昇順に加算」を写した。
-  `DNO_MVROWS_TILE` は CPU 側 `MVROWS_TILE` と一致させないと一致が崩れる。
-- ホスト側の防御: `gdn_proj_shape_ok` (w=[k,nv] / a=[m,k] / out=[m,nv]) が false なら CPU 経路。
-  非正規が疑わしい入力 (`gdn_proj_min_row_sqsum`) も CPU へ落とし、`gdn_proj_last_miss` で理由を観測できる。
-- 1 呼び出し = 1 H2D + 1 D2H。PROFILE に `D2H_GDN_PROJ_{H2D,KERNEL,SYNC,D2H}` を追加 (表示のみ)。
+  1 ブロック = 1 出力 (i,j)、共有メモリ・atomic・warp 縮約なしで計算する (決定論の作り)。
+- ホスト側: `gdn_proj_shape_ok` (w=[k,nv] / a=[m,k] / out=[m,nv]) の形状ゲート、
+  非正規の事前検査 (`gdn_proj_min_row_sqsum`)、1 呼び出し = 1 H2D + 1 D2H、
+  `D2H_GDN_PROJ_{H2D,KERNEL,SYNC,D2H}` のプロファイル分割。
+- **opt-in ゲート `DENNO_GPU_GDN_PROJ=1` (既定 off)**。既定経路は従来の
+  `apply_bt_rows_into` (CPU・ビット不変) で、アンカー 3 本は動かない。
 
-**既定経路は不変**: `.ptx` 未再生成の間は `GdnProjMiss::NoKernel` で `apply_bt_rows_into` に
-フォールバックするため、出力は s79 前とビット同一。
+**GPU 実測でわかった不具合 (未解決・s79 時点)**:
+
+1. **数値が合わない**。CPU との絶対差は最大 1.0e2 級 (k=4096 nv=32 m=4096 の最大) で、
+   ulp の範囲ではない。決定論 (同一入力 2 回でビット一致) は成立するので、
+   計算そのものが食い違っている (grid/次元の受け渡し・重みの配置を疑う)。
+2. k=1 の形状で実行時エラー → `LMV32_BROKEN` が立ち、以降の呼び出しが全部 CPU へ落ちる。
+3. 非正規の事前検査より opt-in ゲートの判定が先に来るため、ゲート off では
+   `GdnProjMiss::Disabled` になり `Denorm` の観測ができない (診断の順序)。
+
+**テスト**: `cargo test --workspace` = **312 passed / 0 failed / 18 ignored** (既定 = cuda 無効・
+CPU 経路はビット不変)。GPU の診断プローブ `cuda_gdn_proj_f32_bit_exact_vs_cpu` は
+`DENNO_GPU_GDN_PROJ=1` を外から与えた単独実行でのみ走り、決定論と偏差の記録だけを行う
+(名前は歴史的経緯で残っているが、ビット一致は主張しない)。
 
 **副産物 (既存破損の修復)**: `crates/denno-server/tests/*.rs` の 7 ファイルが s67b の
 `AppState.temperature_cap` 追加に追随しておらず E0063 でコンパイル不能だった。初期化子に
 `temperature_cap: None` を足して修復 (テストのみ・数値経路に無関係)。
 
-**検証**: `cargo test --workspace` = **312 passed / 0 failed / 18 ignored**。
-shape ゲートの負例 (転置・長さ不足・0 次元) とフォールバック上書きの単体テストを追加。
-GPU 実機のビット一致テスト `cuda_gdn_proj_f32_bit_exact_vs_cpu` は ignored のまま未実行
-(`.ptx` 再生成後に supervisor が回す)。
+**次の一手**: カーネルを直すなら「1 ブロック = 1 出力」をやめて CPU と同じ分割を素直に写し、
+m>1 と k<3 の端数を潰すこと。直るまで opt-in のまま (既定 off) にする。
+T7 の本命は別レバー (gate+up / qkv の融合・GDN スキャンの常駐化) に切り替えてよい。
 
 ## 4. 次の実装候補
 
