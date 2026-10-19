@@ -55,7 +55,7 @@ DEFAULTS = {
     "target_input_tokens_max": 5000,
     "orig_input_tokens": 4671,
     "depth_tolerance": 1.0,
-    "filler_chars": 21400,
+    "filler_chars": 24000,
     "min_sentences": 40,
     "opener_ratio": 0.2,
     "seed": 20261019,
