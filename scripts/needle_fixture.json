@@ -62,7 +62,7 @@
     "multiplier": 1103515245,
     "increment": 12345,
     "modulus": 2147483648,
-    "filler_chars": 21400,
+    "filler_chars": 24000,
     "min_sentences": 40,
     "opener_ratio": 0.2,
     "topics": [
