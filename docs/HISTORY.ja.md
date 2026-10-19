@@ -1554,6 +1554,57 @@ pinned→heap の `memcpy` が 60 ms = **4.7 GB/s** しか出ていない。一�
 
 **結果**: prefill **14.80 s → 14.50 s** (384 → 392 tok/s)。テスト 231 passed。
 
+### チェーン D2H の「pinned 経由 + to_vec」を廃止 ✅ (2026-10-19, s69)
+
+> s68 で GEMM 経路の二度手間コピーを消したが、attention 出力の取得 `chain_download` と o_proj の
+> 戻り値 (`maybe_gpu_oproj`) は依然として「pinned バッファへ D2H → `to_vec` でヒープへ複製」のままだった。
+> 93MB の出力で毎回 2 度書きしていた。
+
+**修正** (`cuda.rs`):
+
+- `chain_download` / `chain_download_at`: 出力 `Vec` を `with_capacity` で確保し、その未初期化領域へ直接
+  D2H、コピー完了後に `set_len`。pinned ステージング (`pin_dn`) を経由しない。
+- `maybe_gpu_oproj`: 同じく pinned `ho` をやめ、戻り値の `Vec` へ直接 D2H。
+
+**数値**: 転送先が変わるだけで内容・演算順は不変 = **ビット一致** (アンカー 3 本 MATCH)。
+
+**結果**: prefill **14.80 s → 14.50 s** (384 → 392 tok/s)。テスト 231 passed。
+
+### prefill の FFN をデバイス常駐チェーンに — 活性化の往復を 4 回から 2 回へ ✅ (2026-10-19, s70)
+
+> s68/s69 で「ホスト側の余分なコピー」を消すと、残るコストは**活性化そのものの往復**になった。
+> 1 層あたり (m=2843, e=4096, ff=6144) は
+> H2D 47MB (x) + D2H 140MB (gate/up) + H2D 47MB (swiglu 後) + D2H 47MB (down) = **281MB**。
+> 一方、デバイス常駐チェーン (`chain_linear_grouped` / `chain_swiglu` / CH_* スロット) は
+> decode (m=1) 用にしか配線されておらず、prefill は素通りしていた。
+
+**実装**:
+
+- `chain_gemm_grouped_pf`: prefill 用の grouped int8 GEMM。既存 `chain_linear_grouped` は decode 前提で
+  `m > max_m()` (=16) なら諦めて GEMV カーネルを起動するため、128x128 タイルの `dno_gemm_i8` を
+  起動する版を新設 (量子化 → GEMM → `out_slot` へ書き込み・同期なし)。
+- `chain_swiglu_rows`: `dno_swiglu_int` (行内 `[gate|up]` 連結レイアウト) を m>1 で使う版。既存の
+  `chain_swiglu` は `dno_swiglu` (gate/up ブロック分離) なので m=1 専用だった。
+- `chain_mlp_prefill`: rmsnorm 済み x を H2D → gate/up GEMM → swiglu → down GEMM → 呼び出し元バッファへ
+  直接 D2H。CH_PFH スロットを新設 (CH_H は attention/decode と共用のため分離)。
+- `qwen35::forward_prefill`: FFN 部を上記チェーンに差し替え。`quant8()` でない / m < 256 / 失敗時は
+  従来の CPU・GEMM 経路へそのまま落ちる (演算列は同一なので出力不変)。
+
+**数値**: GEMM は同一カーネル・同一整数累積、swiglu は CPU の `gv / (1.0 + (-gv).exp()) * uv` と
+同一の f32 演算列 (`dno_expf` + `__fdiv_rn` / `__fadd_rn` / `__fmul_rn`)。**ビット一致** を
+GPU アンカー 3 本 (1b / 2b / full 1b) の MATCH で確認。
+
+**結果** (5,686 token cache-miss prefill・warm):
+
+- `gate_up_proj` **5.74 s → 3.52 s**、`down_proj` **2.81 s → 1.01 s**、`swiglu` (CPU 1.66 s) は GPU へ
+- prefill **14.50 s → 11.58 s**・**392 → 491 tok/s**
+- セッション開始時 46.2 s から **−75% / 4.0 倍**
+- 1 層あたりの活性化転送 **281MB → 94MB**
+
+**残った内訳** (1 リクエスト換算): `attn_core` 4.8 s (`gdn_scan` 2.6 / `gdn_proj` 1.1 / `attn_full` 1.2) /
+`gate_up` 1.8 s / `qkv` 1.6 s / `o_proj` 0.6 s / `rmsnorm` 0.4 s。次の標的は **GDN スキャン** (sync 1.1 s +
+d2h 1.0 s + alloc 0.5 s) と **qkv のデバイス常駐化** (同じ手法で往復を消せる)。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)

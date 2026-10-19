@@ -1558,6 +1558,28 @@ The pinned→heap `memcpy` reaches only **4.7 GB/s**, while a direct D2H into a 
 
 **Result**: prefill **14.80 s → 14.50 s** (384 → 392 tok/s); 231 tests pass.
 
+### Prefill FFN now runs as a device-resident chain — activation round trips cut from four to two ✅ (2026-10-19, s70)
+
+> Once s68/s69 removed the redundant host-side copies, what remained was the activations themselves. Per layer (m=2843, e=4096, ff=6144) the old path moved H2D 47 MB (x) + D2H 140 MB (gate/up) + H2D 47 MB (post-swiglu) + D2H 47 MB (down) = **281 MB**. The device-resident chain (`chain_linear_grouped`, `chain_swiglu`, CH_* slots) existed but was only wired up for decode (m=1), so prefill bypassed it.
+
+**Implementation**:
+
+- `chain_gemm_grouped_pf`: a grouped int8 GEMM for prefill. The existing `chain_linear_grouped` assumes decode and bails when `m > max_m()` (=16), launching the GEMV kernel instead; this variant quantises on device and launches the 128x128-tiled `dno_gemm_i8`.
+- `chain_swiglu_rows`: drives `dno_swiglu_int` (row-interleaved `[gate|up]` layout) for m>1. The existing `chain_swiglu` uses `dno_swiglu` (separate gate/up blocks) and is m=1 only.
+- `chain_mlp_prefill`: H2D the rmsnormed x → gate/up GEMM → swiglu → down GEMM → direct D2H into the caller's buffer. New CH_PFH slot (CH_H is shared with attention/decode).
+- `qwen35::forward_prefill`: the FFN block now goes through the chain; when the weights are not int8, m < 256, or anything fails, it falls back to the previous CPU/GEMM path (same arithmetic, so the output is unchanged).
+
+**Numerics**: same GEMM kernel and integer accumulation, and swiglu follows the CPU expression `gv / (1.0 + (-gv).exp()) * uv` with the same f32 operations (`dno_expf` + `__fdiv_rn` / `__fadd_rn` / `__fmul_rn`). **Bit identical**, confirmed by all three GPU anchors (1b / 2b / full 1b) matching.
+
+**Result** (5,686 token cache-miss prefill, warm):
+
+- `gate_up_proj` **5.74 s → 3.52 s**, `down_proj` **2.81 s → 1.01 s**, and the 1.66 s CPU `swiglu` moved to the GPU
+- prefill **14.50 s → 11.58 s**, **392 → 491 tok/s**
+- **−75% / 4.0×** versus the 46.2 s we started this session from
+- activation traffic per layer **281 MB → 94 MB**
+
+**Remaining split** (per request): `attn_core` 4.8 s (`gdn_scan` 2.6 / `gdn_proj` 1.1 / `attn_full` 1.2) / `gate_up` 1.8 s / `qkv` 1.6 s / `o_proj` 0.6 s / `rmsnorm` 0.4 s. Next targets: the **GDN scan** (sync 1.1 s + d2h 1.0 s + alloc 0.5 s) and **making qkv device-resident** with the same technique.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
