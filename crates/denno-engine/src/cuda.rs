@@ -968,89 +968,6 @@ fn gemm_min_m() -> usize {
         .unwrap_or(256)
 }
 
-// ===========================================================================
-// s58 (T5a): prefill GEMM の GPU opt-in ゲート (DENNO_GPU_PREFILL_GEMM)
-// ===========================================================================
-// 動機 (T4 実測・PF_BENCH 5,686 tok): prefill の投影 (gate_up 15.3s / qkv 8.0s /
-// down 4.0s / o_proj 2.8s / swiglu 0.9s = 合計 30.1s) が **すべて CPU (rayon)** で
-// 走っていた。decode では同じ GEMM が GPU (via=gpu) なのに prefill だけ落ちる理由は
-// `maybe_gpu_linear` の m 上限 (`max_m()` = 16) — 「GEMV 型カーネルは m に比例して
-// 重みを読み直すため m が大きいと CPU sgemm に負ける」という P17b の実測
-// (m=128 で 0.39x) が前提で、その後の P17i で tiled GEMM (dno_gemm_i8) が入った後も
-// 既定 m 上限が 16 のままだった。実際にその上限を外すゲートは存在する
-// (DENNO_CUDA_MAX_M を大きくする) が、**アンカー (既定出力) を変える既定変更**には
-// できなかったため、T5 では新規 env ゲートで opt-in にする。
-//
-// 設計:
-// - `DENNO_GPU_PREFILL_GEMM` 未指定 (既定) → 本ゲートは false。`maybe_gpu_linear` は
-//   従来と**完全に同一の分岐**を通る: m>max_m() かつ GEMM 不発なら weights_for より
-//   手前で None を返す = 従来どおり CUDA コンテキストも重みアップロードも発生しない。
-// - `=1` (or true/on) → m>max_m() でも GEMM 経路 (m >= gemm_min_m()) を試す。
-//   重みは従来の GpuW レジストリに常駐 (decode と共有)。数値は **CPU カーネルと
-//   ビット一致** (dno_gemm_i8 は i8×i8 の i32 累積でタイル化しても順序不変。
-//   テスト `cuda_gemm_i8_bit_exact_vs_cpu` が担保) なので、ゲート on でもアンカーは
-//   理論上不変 — 実機での確認は REPORT_T5.md 参照。
-// - `=0` (or false/off) は明示的に無効 (未指定と同じ)。
-fn prefill_gemm_enabled() -> bool {
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| {
-        matches!(
-            std::env::var("DENNO_GPU_PREFILL_GEMM").ok().as_deref(),
-            Some("1") | Some("true") | Some("on")
-        )
-    })
-}
-
-// ===========================================================================
-// s58 (T5a): prefill GEMM の opt-in エントリ
-// ===========================================================================
-/// qwen35 prefill の投影 1 回分 (gate_up / qkv+gate / down / o_proj) を GPU tiled
-/// GEMM (dno_gemm_i8) で試す。`DENNO_GPU_PREFILL_GEMM` **未指定または無効なら
-/// 最初の判定で None を返し、CUDA には一切触れない** (= 呼び出し側の CPU 経路と
-/// 従来動作が完全に同一)。ゲート on でも GPU 非対応/初期化失敗/実行時エラー/
-/// m < gemm_min_m() は None → 呼び出し側が CPU に落ちる。
-///
-/// 数値: dno_gemm_i8 は i8×i8 の i32 累積 (タイル化しても順序不変) + 行ごとの
-/// (f32 × ascale) × wscale × 同一整数 dot なので、CPU `matmul_bt_i8` と
-/// **ビット一致**。したがってゲート on/off でアンカー (テキスト md5) は原理上
-/// 変わらない (実機確認は REPORT_T5.md)。
-///
-/// 計測は呼び出し側で行う (prof の GATE_UP / QKV / DOWN / OPROJ バケットへ
-/// `on_gpu` ラベル付きで積むため、この関数は計測しない)。
-#[cfg(feature = "cuda")]
-pub fn maybe_gpu_prefill_linear(
-    q: &Quant8Linear,
-    a: &[f32],
-    m: usize,
-) -> Option<Vec<f32>> {
-    // ゲート未指定 (既定) はここで即 None — CUDA 呼び出しゼロを保証する
-    if !prefill_gemm_enabled() || !cuda_enabled() {
-        return None;
-    }
-    let (k, n) = (q.k, q.n);
-    // prefill の m が小さいうちは GEMM の固定オーバーヘッドが CPU に負けるため
-    // 従来どおり CPU に任せる (decode 帯域 m<=max_m() も対象外 = 既存経路)
-    if m <= max_m() || m < gemm_min_m() {
-        return None;
-    }
-    let use_gemm = linear_plan(m)?;
-    let ctx = shared_ctx()?;
-    if let Err(e) = ctx.make_current() {
-        tracing::error!("CUDA cuCtxSetCurrent failed, using CPU int8: {e:#}");
-        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
-        return None;
-    }
-    let gw = match weights_for(q.uid, &q.w, &q.scale, k, n) {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::error!("CUDA weight upload failed, using CPU int8: {e:#}");
-            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        }
-    };
-    linear_exec(ctx, a, gw, m, k, n, use_gemm)
-}
-
 /// P17c: 複数の int8 Linear を 1 回の GPU 呼び出しに融合する (QKV / gate+up 用)。
 /// 同じ入力を消費する線形層群の重み行を**パート順に連結**した 1 つのバッファとして
 /// 登録・計算する。各行の演算 (量子化スケール・i32 累積・スケール乗算) は個別
@@ -1494,12 +1411,6 @@ fn set_last_linear_ran_on_gpu(v: bool) {
 /// P17b 統合エントリ: int8 線形層を GPU で実行するかどうかを判定し、
 /// 実行するなら結果 (CPU カーネルとビット一致) を返す。
 /// 戻り値 None = CPU パスを使うこと (無効/初期化失敗/実行時エラー/m>閾値)。
-///
-/// s58 (T5a): 判定 (`linear_plan`) → 重みアップロード (`weights_for`) → 実行
-/// (`linear_exec`) に分割した。`DENNO_GPU_PREFILL_GEMM` の追加だけが目的で、
-/// **既定 (未指定) の分岐順・戻り値・課金される CUDA 呼び出しは従来と同一**
-/// (max_m 超で GEMM 不発なら `linear_plan` が None を返し、weights_for にも
-/// 到達しない — 従来と同じく重みアップロード/コンテキスト生成は起きない)。
 pub fn maybe_gpu_linear(
     uid: u64,
     a: &[f32],
@@ -1512,7 +1423,14 @@ pub fn maybe_gpu_linear(
     // s57 (T4): 実行先ラベルの初期値 — この呼び出しが None で抜けたとき
     // 直前の true が残らないよう毎回 false から始める (計測のみ)
     set_last_linear_ran_on_gpu(false);
-    let use_gemm = linear_plan(m)?;
+    if !cuda_enabled() {
+        return None;
+    }
+    let use_gemm = m > max_m() && m >= gemm_min_m() && gemm_enabled();
+    // m が GEMV 経路の上限を超えて GEMM も発動しないなら CPU へ
+    if m > max_m() && !use_gemm {
+        return None;
+    }
     let ctx = shared_ctx()?;
     if let Err(e) = ctx.make_current() {
         tracing::error!("CUDA cuCtxSetCurrent failed, using CPU int8: {e:#}");
@@ -1527,37 +1445,6 @@ pub fn maybe_gpu_linear(
             return None;
         }
     };
-    linear_exec(ctx, a, gw, m, k, n, use_gemm)
-}
-
-/// P17b + s58 (`DENNO_GPU_PREFILL_GEMM`): m から (実行するか, GEMM か) を決める
-/// 純粋な判定。`None` = CPU パス (CUDA には一切触れない)。
-/// 既定 (ゲート未指定) の判定式は従来の `maybe_gpu_linear` 冒頭と同一。
-fn linear_plan(m: usize) -> Option<bool /* use_gemm */> {
-    if !cuda_enabled() {
-        return None;
-    }
-    let use_gemm = m > max_m()
-        && ((m >= gemm_min_m() && gemm_enabled()) || prefill_gemm_enabled());
-    // m が GEMV 経路の上限を超えて GEMM も発動しないなら CPU へ
-    if m > max_m() && !use_gemm {
-        return None;
-    }
-    Some(use_gemm)
-}
-
-/// 重み常駐済み (GpuW) の int8 線形を実行する共通部分 (P17b と s58 の
-/// prefill 専用エントリ `maybe_gpu_prefill_linear` が共有)。
-#[cfg(feature = "cuda")]
-fn linear_exec(
-    ctx: &CudaCtx,
-    a: &[f32],
-    gw: &GpuW,
-    m: usize,
-    k: usize,
-    n: usize,
-    use_gemm: bool,
-) -> Option<Vec<f32>> {
     // P17i: m が大きい (prefill) ときは tiled GEMM、小さい (decode/batch) ときは
     // GEMV 型カーネル (固定オーバーヘッドが小さい) を使い分ける。どちらも CPU と
     // ビット一致。

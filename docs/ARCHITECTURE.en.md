@@ -511,13 +511,6 @@ The basic structure keeps **weights, the KV mirror, and hidden states resident i
 - scheduler, HTTP (scheduler.rs, lib.rs) — outside CUDA porting
 - the engine's step_chat loop body (though its content becomes a sequence of kernel launches)
 - sampler (RNG and top-p sorting stay on CPU, preserving the §5 determinism contract)
-- **qwen35 prefill per-op projections** (default). Decode projections run on the GPU, but
-  prefill (m>16) falls back to the CPU via `DENNO_CUDA_MAX_M` (default 16) — **by default
-  it deliberately stays on the CPU**. The new env gate `DENNO_GPU_PREFILL_GEMM=1` moves them
-  onto the same kernel (`dno_gemm_i8`) (s58/T5a; no `.cu`/PTX change, bit-identical contract
-  so the default output is unchanged). With the gate off the helper returns `None` at the
-  very first env check, so **no GPU call at all happens** (no CUDA context, no weight upload)
-  — the default behaviour is identical to the previous revision.
 
 ## 9. Usage
 

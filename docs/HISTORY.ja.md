@@ -1309,22 +1309,23 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **処置**: 実装差分 (engine.rs +409 / prefix_cache.rs +202、未検証・デバッグ残骸込み) は commit せず `git stash` に退避 (`s58-wip-t3-prefix-partial-unfirable`)。**コード変更なし・既定挙動は従来と完全同一**
 - **次**: 「ストアを複数境界保持へ拡張する (設計変更・メモリ増)」か「system プロンプト安定化/独立 prefix 境界へ方針転換」かは**人間判断**。判断材料として prefill 140 秒の内訳 (重みロード / prefill 計算) の切り分けを先に行うのが妥当
 
-### T5a: qwen35 prefill GEMM の GPU opt-in ゲート — `DENNO_GPU_PREFILL_GEMM` (s60) ✅ (2026-10-19)
+### T5a の撤回 — prefill GEMM opt-in ゲート (s60) は前提が誤りで既定 2.85x 退行 ⛔ (2026-10-19)
 
-> 第60セッション。T4 の prefill プロファイルで **prefill の投影が全て CPU (rayon)** に落ちていることが判明した (gate_up 15.3s / qkv 8.0s / down 4.0s / o_proj 2.8s / swiglu 0.9s = 合計 30.1s・PF_BENCH 5,686 tok)。decode では同じ int8 GEMM が GPU (`via=gpu`) で走っている。原因は `maybe_gpu_linear` の **m 上限 `DENNO_CUDA_MAX_M` (既定 16)** — P17b の実測 (GEMV 型カーネルは m で 0.39x) に基づく既定値が、P17i の tiled GEMM 導入後もそのまま残っていた。**既定を変えるとアンカーが動くため opt-in の env ゲート**にした。
+> 第60セッション。T4 のプロファイルで「prefill の投影が全部 CPU (30.1 s)」に見えたため `DENNO_GPU_PREFILL_GEMM` ゲートを追加した (commit `083218d`)。しかし**その前提は偽**で、既定 (ゲート未指定) は**2.85x の退行**を起こしていた。本節で `083218d` を revert した。
 
-**実装** (`.cu` / PTX 変更なし・新カーネルなし):
+- **前提が偽だった理由**: T4 の `via` 列が誤っていた。① `time_full` が `on_gpu` を渡さず常に false で記帳 → GPU で走っていても `cpu` と表示。② 実際は `quant.rs::apply_bt` (Q8, m>1) が `cuda::maybe_gpu_linear` を呼び、そこは **`m > max_m() && m >= gemm_min_m()` (= 256) で P17i の tiled GEMM (`dno_gemm_i8`) に既に入っていた** — つまり T4 時点の prefill 投影は**元から GPU** だった (`DENNO_CUDA=1` 前提)
+- **退行の機序**: `083218d` は prefill 呼び出しを `apply_bt_rows_maybe_gpu` に差し替え、ゲート未指定時は `apply_bt_rows` → `apply_bt` → `maybe_gpu_linear` を通す…つもりが、実際には `tensor::matmul_bt_i8` を直接呼ぶ形になり **`maybe_gpu_linear` を迂回 = 本物の CPU フォールバック**になっていた
+- **実測 (GPU 実機・5,6xx tok のキャッシュミス prompt・固定 seed・int8 9B・単一インスタンス)**:
 
-- `cuda.rs`: `prefill_gemm_enabled()` (`DENNO_GPU_PREFILL_GEMM=1|true|on`)。`maybe_gpu_linear` を **判定 (`linear_plan`・純関数) → 重み常駐 (`weights_for`) → 実行 (`linear_exec`)** に分割し、新エントリ `maybe_gpu_prefill_linear` と共通化。**既定 off では CUDA コンテキスト生成も重みアップロードも起きない** (従来の `m > max_m() && !use_gemm → None` と同一の早期 return)
-- `quant.rs`: `Linear::apply_bt_rows_maybe_gpu` — `apply_bt_rows` と同じ戻り値で、Q8 のみ GPU を試す (F32 は既存経路)
-- `qwen35.rs` (prefill の per-op 経路): qkv / gate (z) / beta / alpha / o_proj / full の q,k,v / full の o_proj / gate_up / down を同関数に差し替え。**GDN スキャンと full attention 本体は変更なし**
-- `prof.rs`: `time_n_ev` — 計測区間の GPU 実行ラベルを `cuda::last_linear_ran_on_gpu()` の**実測**から取る (`via` 列がゲート on/off で正しく出る)。計測専用
+  | build | env | prefill wall |
+  |---|---|---|
+  | `083218d` | ゲート未指定 (既定) | 202–203 s (3 回) / PF_BENCH 200.8 s |
+  | `083218d` | `DENNO_GPU_PREFILL_GEMM=1` | 70.7 / 65.3 s / PF_BENCH 71.4 s (79.7 tok/s) |
+  | `1e51741` (T4) | - | PF_BENCH 70.9 s (80.2 tok/s) |
 
-**数値契約**: `dno_gemm_i8` は i8×i8 の i32 累積 (タイル化・warp 分割しても順序不変) + `(f32)dot * ascale * wscale` を左から順に乗算するので CPU `matmul_bt_i8` と**ビット一致**。したがってゲート on でもアンカー 3 本は不変のはず (dev は GPU 非搭載のため **CPU モードで両モードの md5 一致を確認**。CUDA ビルドでの実機確認は人間対応)
-
-**テスト**: `cargo test --workspace` **296 passed / 0 failed / 18 ignored** (T4 の 295 から +1 = `quant::tests::prefill_maybe_gpu_path_is_bit_identical_when_gate_off`、Int8/F32 × m=300 で `apply_bt_rows` と `apply_bt_rows_maybe_gpu` の f32 ビット一致を固定)。`cargo check -p denno-engine --features cuda --all-targets` も通過
-
-**未検証 (人間対応)**: 実 GPU での速度 (PF_BENCH) とアンカー 3 本の MATCH。ゲート on の数値は原理上ビット一致だが、**m=2843 では重み 1 回のアップロード (~8GB) + 層あたり 4 回の同期**が効くため、初回リクエストは重くなる可能性がある (decode 済みなら重みは常駐済み)
+  ゲート on のアンカー (`c61ad85b` / `9e17d563` / `af6eb6ab`) は MATCH = GPU GEMM は本当にビット一致。結論: **ゲート on は旧挙動の再現に過ぎず、既定は純粋な退行**
+- **処置**: `083218d` を revert (`crates/` は `1e51741` と**バイト一致**に戻る)。`via` 列の修正 (実測 `last_linear_ran_on_gpu` の採用・`tok/call` の歪み修正) は**別 commit** で残す — 計測だけの修正で数値経路には触れない
+- **教訓**: **プロファイルの列を根拠に最適化する前に、その列が実測か主張かを確認する**。本件は「計測バグ → 偽のホットスポット → 実在しない最適化」の典型。再発防止として、既定経路が `maybe_gpu_linear` を通ることをテストで固定した
 
 ## 4. 次の実装候補
 

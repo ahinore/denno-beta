@@ -1309,22 +1309,23 @@ raw logits → ① repetition_penalty → ② frequency_penalty → ③ presence
 - **Disposition**: the implementation diff (engine.rs +409 / prefix_cache.rs +202, unverified and containing debug residue) was **not committed** but parked in `git stash` (`s58-wip-t3-prefix-partial-unfirable`). **No code change — default behaviour is byte-identical to before**
 - **Next**: whether to (A) extend the store to keep multiple boundaries (a larger design change with extra memory) or (B) drop this lever in favour of a stable system prompt / an independent reusable prefix boundary is a **human decision**. Splitting the 140 s into weight-load vs prefill-compute first is the sensible input to that call
 
-### T5a: opt-in GPU gate for qwen35 prefill GEMMs — `DENNO_GPU_PREFILL_GEMM` (s60) ✅ (2026-10-19)
+### T5a withdrawn — the prefill GEMM opt-in gate (s60) rested on a false premise and cost a 2.85x default-path regression ⛔ (2026-10-19)
 
-> Session 60. The T4 prefill profile showed that **every prefill projection ran on the CPU (rayon)** (gate_up 15.3s / qkv 8.0s / down 4.0s / o_proj 2.8s / swiglu 0.9s = 30.1s total, PF_BENCH 5,686 tok), while decode runs the same int8 GEMMs on the GPU (`via=gpu`). The cause is the **m cap `DENNO_CUDA_MAX_M` (default 16)** in `maybe_gpu_linear` — a default justified by the P17b measurement (GEMV-style kernel is 0.39x at m=128) that survived the P17i tiled-GEMM introduction unchanged. Changing a default would move the anchors, so this is an **opt-in env gate**.
+> Session 60. The T4 profile made it look as if "all prefill projections fall back to the CPU (30.1 s)", so a `DENNO_GPU_PREFILL_GEMM` gate was added (commit `083218d`). **That premise was false**, and with the gate unset (default) the commit was a **2.85x regression**. This section records its revert.
 
-**Implementation** (no `.cu`/PTX change, no new kernel):
+- **Why the premise was false**: the T4 `via` column lied. ① `time_full` never received `on_gpu`, so it always booked `false` → work that ran on the GPU was printed as `cpu`. ② In fact `quant.rs::apply_bt` (Q8, m>1) calls `cuda::maybe_gpu_linear`, which already routed `m > max_m() && m >= gemm_min_m()` (= 256) into the P17i tiled GEMM (`dno_gemm_i8`) — i.e. at T4 the prefill projections were **already on the GPU** (with `DENNO_CUDA=1`)
+- **Mechanism of the regression**: `083218d` swapped the prefill calls to `apply_bt_rows_maybe_gpu`; with the gate unset the helper was supposed to go through `apply_bt` → `maybe_gpu_linear`, but instead it called `tensor::matmul_bt_i8` directly, **bypassing `maybe_gpu_linear` = a real CPU fallback**
+- **Measured (real GPU · 5,6xx-token cache-miss prompt · fixed seed · int8 9B · single instance)**:
 
-- `cuda.rs`: `prefill_gemm_enabled()` (`DENNO_GPU_PREFILL_GEMM=1|true|on`). `maybe_gpu_linear` split into **plan (`linear_plan`, a pure function) → weight residency (`weights_for`) → execute (`linear_exec`)**, shared with the new entry `maybe_gpu_prefill_linear`. **With the gate off no CUDA context is created and no weight is uploaded** (the same early return as the previous `m > max_m() && !use_gemm → None`)
-- `quant.rs`: `Linear::apply_bt_rows_maybe_gpu` — same result as `apply_bt_rows`; only Q8 takes the GPU attempt (F32 keeps the existing path)
-- `qwen35.rs` (per-op prefill path): qkv / gate (z) / beta / alpha / o_proj / full-attn q,k,v / full-attn o_proj / gate_up / down. **The GDN scan and the full-attention core are untouched**
-- `prof.rs`: `time_n_ev` — takes the GPU label from the **measurement** `cuda::last_linear_ran_on_gpu()` so the `via` column is honest for both gate states. Measurement only
+  | build | env | prefill wall |
+  |---|---|---|
+  | `083218d` | gate unset (default) | 202–203 s (3 runs) / PF_BENCH 200.8 s |
+  | `083218d` | `DENNO_GPU_PREFILL_GEMM=1` | 70.7 / 65.3 s / PF_BENCH 71.4 s (79.7 tok/s) |
+  | `1e51741` (T4) | - | PF_BENCH 70.9 s (80.2 tok/s) |
 
-**Numeric contract**: `dno_gemm_i8` accumulates i8×i8 in i32 (order-independent under tiling/warp split) and multiplies `(f32)dot * ascale * wscale` left to right, so it is **bit-identical** to the CPU `matmul_bt_i8`. The three anchors must therefore stay unchanged with the gate on — verified **in CPU mode** on dev (no GPU here) where both modes produce identical md5; the CUDA build needs human verification.
-
-**Tests**: `cargo test --workspace` **296 passed / 0 failed / 18 ignored** (295 in T4, +1 = `quant::tests::prefill_maybe_gpu_path_is_bit_identical_when_gate_off`, which pins bit-identity between `apply_bt_rows` and `apply_bt_rows_maybe_gpu` for Int8/F32 at m=300). `cargo check -p denno-engine --features cuda --all-targets` passes as well.
-
-**Not verified (human)**: real-GPU speed (PF_BENCH) and MATCH for the three anchors. The gate-on numbers are bit-identical by construction, but at m=2843 the **one-time weight upload (~8GB) plus 4 syncs per layer** can make the first request slower (weights are already resident once decode has run).
+  The anchors under the gate ON (`c61ad85b` / `9e17d563` / `af6eb6ab`) all MATCH, so the GPU GEMM really is bit-identical. Conclusion: **the gate ON only reproduced the old behaviour; the default was a pure regression**
+- **Disposition**: reverted `083218d` (`crates/` is back to **byte-identical** with `1e51741`). The `via`-column fix (use the measured `last_linear_ran_on_gpu`, fix the skewed `tok/call`) is kept in a **separate commit** — measurement only, no touch to the numeric path
+- **Lesson**: **before optimising against a profile column, check whether that column is measured or asserted**. This was the textbook chain of "instrumentation bug → phantom hotspot → optimisation of something that never existed". To stop it recurring, a test now pins that the default path goes through `maybe_gpu_linear`
 
 ## 4. Candidate List
 
