@@ -317,6 +317,9 @@ pub struct CudaCtx {
     f_mv: CUfunction,
     // P17i: prefill 用 tiled GEMM (dno_gemm_i8)
     f_gemm: CUfunction,
+    // s113 (P1-4 候補 1): GEMM epilogue に swiglu を畳み込んだ prefill gate/up 専用版
+    // (dno_gemm_i8 の数値・レイアウトは不変。この関数だけが別カーネル)
+    f_gemm_swiglu: CUfunction,
     // P17d: 要素演算モジュール (swiglu / add+rmsnorm / expf probe)
     #[allow(dead_code)]
     module_elem: CUmodule,
@@ -405,6 +408,7 @@ impl CudaCtx {
             let mut f_quant: CUfunction = std::ptr::null_mut();
             let mut f_mv: CUfunction = std::ptr::null_mut();
             let mut f_gemm: CUfunction = std::ptr::null_mut();
+            let mut f_gemm_swiglu: CUfunction = std::ptr::null_mut();
             check(
                 (lib.module_get_function)(&mut f_quant, module, b"dno_quantize_rows\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_quantize_rows)",
@@ -418,6 +422,23 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_gemm, module, b"dno_gemm_i8\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_gemm_i8)",
             )?;
+            // s113 (P1-4 候補 1): gate/up の GEMM + swiglu 融合版 (同じ int8 モジュール)。
+            // PTX 未再生成のビルド (dno_gemm_i8_swiglu がまだ入っていない .ptx) では
+            // ここで失敗して shared_ctx 全体が立たなくなるのを避けるため、
+            // **取得失敗は致命的にしない**: null のままにし、呼び出し側
+            // (chain_gemm_swiglu_pf) が null を見て従来の 2 段経路へ落ちる。
+            if check(
+                (lib.module_get_function)(&mut f_gemm_swiglu, module, b"dno_gemm_i8_swiglu\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_gemm_i8_swiglu)",
+            )
+            .is_err()
+            {
+                tracing::info!(
+                    "CUDA: dno_gemm_i8_swiglu が PTX に無いため融合 GEMM+swiglu を無効化 \
+                     (PTX 再生成で有効化・数値は 2 段経路と同一)"
+                );
+                f_gemm_swiglu = std::ptr::null_mut();
+            }
 
             // P17d: 要素演算モジュール (-fmad=false でコンパイル済み。FMA 縮約は
             // CPU とビット一致しないため禁止)
@@ -546,6 +567,7 @@ impl CudaCtx {
                 f_quant,
                 f_mv,
                 f_gemm,
+                f_gemm_swiglu,
                 module_elem,
                 f_swiglu,
                 f_swiglu_int,
@@ -2911,6 +2933,116 @@ fn chain_gemm_grouped_pf(
     })
 }
 
+/// s113 (P1-4 候補 1): 融合 GEMM+swiglu の 1 j タイル (256 列) が gate / up の
+/// **どちらか一方のパートに完全に収まる**か。カーネルは up 列 gj の対応 gate 列
+/// gcol = gj - ff を*同じ j タイル内*のレジスタから取るので、これが成り立たない
+/// 形 (ff が 256 の倍数でない) では融合経路を使ってはいけない。
+///
+/// 必要十分: ff % GEMM_TILE_N == 0 (= 各タイルがパート境界 256*k に整合)。
+/// n = 2*ff が GEMM_TILE_N の倍数であることは ff の倍数性から従う。
+fn gemm_swiglu_tiles_fit_parts(ff: usize) -> bool {
+    ff != 0 && ff % GEMM_TILE_N == 0
+}
+
+/// s113: `gemm_swiglu_launch_grid(m, ff)` = (gmx, gmy)。j0 = ff + 256*blockIdx.y
+/// なので、grid の y は up 側のタイル数だけ起動する (gate 側タイルは epilogue が
+/// 書き込みゼロ = 結果に寄与しないので飛ばす。整数 dot を捨てるだけ)。
+fn gemm_swiglu_launch_grid(m: usize, ff: usize) -> (u32, u32) {
+    let gmx = m.div_ceil(GEMM_TILE) as u32;
+    let gmy = (ff / GEMM_TILE_N) as u32;
+    (gmx, gmy)
+}
+
+/// s113: 融合経路を実際に起動してよいか (純関数・GPU 無しでテストする)。
+///   `have_fn`: イントロスペクションで dno_gemm_i8_swiglu の関数ポインタが
+///   取れたか (PTX 再生成済みのビルドか)。null のまま起動すると
+///   cuLaunchKernel が失敗するので、必ずここで弾く。
+fn gemm_swiglu_fused_ready(have_fn: bool, m: usize, gate_up_n: usize) -> bool {
+    have_fn
+        && m > 0
+        && gate_up_n % 2 == 0
+        && gemm_swiglu_tiles_fit_parts(gate_up_n / 2)
+}
+
+/// s113: prefill の gate/up を **1 本の** int8 GEMM + swiglu (epilogue 融合) で
+/// 計算し、act [m, ff] を `act_slot` に書く (デバイス常駐)。
+///
+/// 置き換える 2 段経路 (chain_mlp_prefill 内):
+///   1) chain_gemm_grouped_pf(&[gate_up_w], in_slot, CH_GA, m)  → [m, 2ff]
+///   2) chain_swiglu_rows(CH_GA, act_slot, ff, m)               → [m, ff]
+/// と**同じ整数累積・同じスケール順・同じ swiglu 演算列**で、CH_GA への
+/// 書き出しと読み直しだけを省く。
+///
+/// 使えない条件では None を返す (呼び出し側は 2 段経路へ):
+/// - 融合カーネルが PTX に無い (f_gemm_swiglu が null = PTX 未再生成のビルド)
+/// - ff が GEMM_TILE_N の倍数でない (タイルがパートをまたぐ)
+/// - 形状不整合 (k, n = 2ff, m)
+///
+/// NOTE: `chain_swiglu_rows` / `chain_gemm_grouped_pf` / `dno_gemm_i8` は一切
+/// 変更しない (down_proj・decode・他の GEMM 呼び出し元の数値とレイアウトを
+/// 動かさないため)。
+fn chain_gemm_swiglu_pf(
+    gate_up_w: &crate::quant::Quant8Linear,
+    in_slot: usize,
+    act_slot: usize,
+    m: usize,
+) -> Option<()> {
+    let ctx = chain_ctx()?;
+    if !gemm_swiglu_fused_ready(!ctx.f_gemm_swiglu.is_null(), m, gate_up_w.n) {
+        return None;
+    }
+    let ff = gate_up_w.n / 2;
+    let k = gate_up_w.k;
+    let n = gate_up_w.n;
+    let gw = ok(weights_for_group(&[gate_up_w.uid], &[gate_up_w], k, n))?;
+    ok(chain_ensure_buf(in_slot, m.checked_mul(k)?.checked_mul(4)?))?;
+    ok(chain_ensure_buf(act_slot, m.checked_mul(ff)?.checked_mul(4)?))?;
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure(&mut s.aq, m * k))?;
+        let iptr = s.bufs[in_slot].as_ref()?.ptr();
+        let actptr = s.bufs[act_slot].as_ref()?.ptr();
+        let aq = s.aq.as_ref()?.ptr();
+        SCRATCH.with(|c2| -> Option<()> {
+            let mut s2 = c2.borrow_mut();
+            ok(Scratch::ensure(&mut s2.asc, m * 4))?;
+            let asc = s2.asc.as_ref()?.ptr();
+            // 1) 量子化 (2 段経路と同一カーネル・同一入力 in_slot)
+            let (mut px, mut paq, mut pasc) = (iptr, aq, asc);
+            let (mut mc, mut kc) = (m as c_int, k as c_int);
+            let mut args = [
+                &mut px as *mut _ as *mut c_void,
+                &mut paq as *mut _ as *mut c_void,
+                &mut pasc as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+            ];
+            ok(unsafe { ctx.launch_async(ctx.f_quant, (m as u32, 1, 1), (256, 1, 1), 256 * 4, &mut args) })?;
+            // 2) 融合 GEMM + swiglu (up 側の j タイルだけ)
+            let (mut paqi, mut pasci, mut pw, mut psc, mut pact) =
+                (aq, asc, gw.w.ptr(), gw.sc.ptr(), actptr);
+            let (mut mc, mut kc, mut nc, mut ffc) =
+                (m as c_int, k as c_int, n as c_int, ff as c_int);
+            let mut args = [
+                &mut paqi as *mut _ as *mut c_void,
+                &mut pasci as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut psc as *mut _ as *mut c_void,
+                &mut pact as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+                &mut ffc as *mut _ as *mut c_void,
+            ];
+            let (gmx, gmy) = gemm_swiglu_launch_grid(m, ff);
+            // j0 = ff + 256*blockIdx.y (カーネル側) — gate 側タイルは起動しない。
+            ok(unsafe {
+                ctx.launch_async(ctx.f_gemm_swiglu, (gmx, gmy, 1), (GEMM_BX, GEMM_BY, 1), 0, &mut args)
+            })
+        })
+    })
+}
+
 /// s70: 行内 [gate|up] 連結レイアウト (width = 2*ff) の swiglu。m > 1 でも
 /// 使えるのは `dno_swiglu_int` 側 (`dno_swiglu` は gate/up がブロック分離の
 /// 前提なので m=1 専用)。演算列は CPU の `gv / (1+exp(-gv)) * uv` と同一。
@@ -2993,20 +3125,38 @@ pub fn chain_mlp_prefill(
     })?;
     // 2) gate/up → 3) swiglu  → 4) down (全て非同期・最後に 1 回だけ同期)
     // 計測時のみ段ごとに同期して内訳を取る (同期は数値に影響しない)。
-    crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
-        chain_gemm_grouped_pf(&[gate_up_w], CH_PFH, CH_GA, m)?;
+    //
+    // s113 (P1-4 候補 1): gate/up + swiglu を **1 ディスパッチ**にする。
+    // 融合版は GEMM の epilogue で swiglu まで済ませて CH_ACT に直接書くので、
+    // CH_GA (m*2ff*4B) の書き出し + 読み直しが消える。数値は 2 段経路と同一
+    // (同じ整数累積・同じスケール順・同じ swiglu 演算列)。融合版が使えない
+    // ビルド/形状 (PTX 未再生成・ff が 256 の倍数でない) では従来の 2 段へ落ちる。
+    // 計測 (PROFILE) では従来どおり「gate_up」→「swiglu」の 2 バケットに
+    // 分けて計上する (内訳の比較可能性を保つため。時間は切り分けられないので
+    // 融合 1 回分を gate_up 側に全部入れ、swiglu は 0 近傍になる)。
+    let fused = crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<bool> {
+        Some(chain_gemm_swiglu_pf(gate_up_w, CH_PFH, CH_ACT, m).is_some())
+    })?;
+    if fused {
         if crate::prof::enabled() {
             ok(ctx.sync())?;
         }
-        Some(())
-    })?;
-    crate::prof::time_layer(crate::prof::SWIGLU, li, || -> Option<()> {
-        chain_swiglu_rows(CH_GA, CH_ACT, ff, m)?;
-        if crate::prof::enabled() {
-            ok(ctx.sync())?;
-        }
-        Some(())
-    })?;
+    } else {
+        crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
+            chain_gemm_grouped_pf(&[gate_up_w], CH_PFH, CH_GA, m)?;
+            if crate::prof::enabled() {
+                ok(ctx.sync())?;
+            }
+            Some(())
+        })?;
+        crate::prof::time_layer(crate::prof::SWIGLU, li, || -> Option<()> {
+            chain_swiglu_rows(CH_GA, CH_ACT, ff, m)?;
+            if crate::prof::enabled() {
+                ok(ctx.sync())?;
+            }
+            Some(())
+        })?;
+    }
     crate::prof::time_layer(crate::prof::DOWN, li, || -> Option<()> {
         chain_gemm_grouped_pf(&[down_w], CH_ACT, CH_DOWN, m)
     })?;
