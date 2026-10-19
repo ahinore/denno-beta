@@ -169,6 +169,21 @@ greedy 経路で出力が崩壊する (`.showError warning` 等の混入・偽 `
 
 参考実装: HF transformers `NoRepeatNGramLogitsProcessor` (Apache-2.0) / llama.cpp (MIT) の着想による独自実装 (逐語コピー無し)。
 
+### serve の temperature 上限 (s67b)
+
+`denno serve --temperature-cap <f32>` を付けると、**実効 temperature をこの値で頭打ち**にする
+(`min(要求値, cap)`)。リクエストが `temperature` を省略した場合も sampler 既定の `1.0` を
+`cap` でクランプする。**未指定 (既定 `None`) なら要求値がそのまま渡るので出力は従来とビット完全一致**。
+負値・非有限値は起動時に拒否する。
+
+根拠 (実測): Hermes などのクライアントは thinking を有効にすると Anthropic 互換 API 向けに
+`temperature: 1` を機械的に付ける。denno は s52 の仕様で `thinking: {"type":"enabled"}` を
+**off 扱い**にするため、思考は無効なのに `T=1` だけが残る。Qwen3.5-9B int8 に
+「system 11,949 文字 + tools 26 個 (計 7.6k tok)」を渡すと、`T=1.0` では 2〜3 ターンで
+中国語・ハングル等が混入して崩壊する (`…スケジュール bi` / `프로그래밍` / `Web 欢迎大家阅读`) が、
+`T=0.7` では同一プロンプトで 4 ターンとも正常。運用では `--temperature-cap 0.7` を推奨。
+なお本フラグはサーバー側の安全弁であり、クライアントが送る `temperature` の意味自体は変えない。
+
 ## SSE イベント列 (stream: true)
 
 ```

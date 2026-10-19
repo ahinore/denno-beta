@@ -1496,6 +1496,23 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 **現時点の内訳** (prefill 1 リクエスト): gate_up 7.38 s / qkv 4.09 s / down 2.73 s / gdn_scan 2.59 s (sync 1.09 + d2h 0.97 + alloc 0.53) / o_proj 1.49 s / attn_full 1.22 s / gdn_proj 1.07 s / swiglu 0.85 s。残る最大は **gate_up の GEMM 本体** (64 call・114 ms・GPU 実働 ≈75 ms = 13 TFLOP/s ≒ ピークの 11.6%)。int8 の累積は int32 で順序非依存のため、再タイル化しても数値は変わらない見込み。
 
+### serve に temperature 上限を追加 (`--temperature-cap`) ✅ (2026-10-19, s67b)
+
+> 9B との会話が2〜3ターンで崩壊する件の切り分け。Hermes の履歴 (`state.db`) に残った実セッションを確認すると、turn 2 で中国語の混入 (`私ができること等相关的介绍如下`)、turn 5 で `何かお手allon acar`、別セッションでは `dotyczących niekompletności` / `เกี่ยวกับไม่สมบูรณ์` と多言語の混線が起きていた。
+
+**キャッシュは無実**: キャッシュ有効/無効で 5 ターン・10 ターンの出力がバイト一致、共有プレフィックスの2会話を交互実行しても混線なし（`reuse 1007/1049` で他セッションのエントリから復元）、streaming も非 streaming と同一。GDN 状態はプロンプト境界でのみ復元し、復元できない位置ではフル prefill に落ちる実装で、境界ズレの経路は存在しない。
+
+**原因はサンプリング**: 実セッションの `model_config` は `reasoning_config: {enabled: true}` で、Hermes の Anthropic アダプタは思考を有効にすると `temperature: 1` を必ず付ける（`agent/anthropic_adapter.py` の "required when thinking is enabled"）。一方 denno は s52 の仕様で `thinking: {"type":"enabled"}` を **off 扱い**にするため、**思考は切られているのに T=1 だけが残る**。実セッションの system prompt (11,949 文字) と tools 26 個 (計 7.6k tok) で再現したところ、T=1.0 では同じ崩壊（`…スケジュール bi`、`프로그래밍`、`Web 欢迎大家阅读`）が turn 2〜3 で発生し、T=0.7 では 4 ターン全て正常、T=0.0 も正常だった。
+
+**修正**: `denno serve --temperature-cap <f32>` を追加。Some(c) のとき実効 temperature を `min(要求値, c)` にクランプし、リクエストが temperature を省略した場合も sampler 既定の 1.0 を c で頭打ちにする。None (フラグ未指定) なら要求値をそのまま渡すので**従来とビット同一**（アンカー不変）。
+
+- 妥当性検査: 負値・非有限は起動時に拒否（`--repetition-penalty` と同じ作法）
+- ユニットテスト 4 本（pass-through / クランプ / 未指定時の適用 / 上限が要求値を引き上げない）を追加
+
+**検証**: `--repetition-penalty 1.05 --temperature-cap 0.7` で起動し、T=1.0 を送る 7.6k のプロンプトを再送 → 崩壊せず、T=0.7 を直接指定した場合と同じ応答。フラグ無しの起動では GPU アンカー 3 本 MATCH（1b/2b/full 1b）。`cargo test -p denno-server --lib` = 37 passed。
+
+**残る対策**: Hermes 側で非 Anthropic エンドポイントに `temperature: 1` を付けないパッチ（本来の修正）は未着手。クライアント更新で消え得るため、サーバー側の上限を先に入れた。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)

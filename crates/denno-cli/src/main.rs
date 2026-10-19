@@ -69,6 +69,12 @@ enum Commands {
         /// 未指定なら従来と完全に同一のサンプリング経路 (出力ビット不変)。
         /// Qwen3.5-9B int8 + 長い system + tools の崩壊対策として 1.05 を推奨
         #[arg(long)] repetition_penalty: Option<f32>,
+        /// s67b: temperature の上限。指定すると実効 temperature をこの値で
+        /// 頭打ちにする (未指定リクエストは sampler 既定 1.0 を cap でクランプ)。
+        /// 未指定なら従来と完全に同一 (出力ビット不変)。
+        /// thinking 有効時に temperature=1 を機械的に送るクライアント
+        /// (Hermes 等) で小型モデルが崩壊する対策として 0.7 を推奨
+        #[arg(long)] temperature_cap: Option<f32>,
     },
 }
 
@@ -219,7 +225,7 @@ fn main() -> Result<()> {
             };
             println!("{}", out);
         }
-        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue, repetition_penalty } => {
+        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue, repetition_penalty, temperature_cap } => {
             let dir = model_dir(&repo);
             if !dir.exists() {
                 bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
@@ -238,6 +244,7 @@ fn main() -> Result<()> {
                 quant: quant_mode,
                 max_queue,
                 repetition_penalty,
+                temperature_cap,
             }))?;
         }
     }
