@@ -167,12 +167,25 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 
 ## P4 — productisation, never validated end to end
 
-### P4-1: 9B long-conversation stability
+### P4-1: 9B long-conversation stability — CHECKER DONE (s103), real run is a human step
 - Why: the original complaint ("collapses after a few turns") was traced to
   `temperature = 1.0` and fixed with `--temperature-cap 0.7`, but no multi-turn
   regression exists.
 - Action: script a 10-turn conversation against 8095, check for repetition collapse and
   template fragments; record the transcript as a fixture.
+- What exists now (s103): `scripts/long_conversation_check.py` drives 10 turns against an
+  Anthropic-style `/v1/messages`, appending each assistant reply so the conversation
+  actually grows, with detectors for repetition collapse (`repeat_line`,
+  `repeat_sentence`, `long_line`), chat-template leakage (`template_marker`), fabricated
+  user turns (`fake_turn`), empty replies (`empty`) and truncation (`max_tokens`,
+  reported only). Exit 0 clean / 2 hard failure / 3 infrastructure; ports 8080 and 8090
+  are refused; `--dry-run` and `--self-test` open no socket. Fixed prompts live in
+  `scripts/fixtures/long_conversation_turns.json`; `--out` writes a transcript that
+  `--replay` re-judges to the same verdict (the verdict is deterministic, the sampled
+  text is not). 54 CPU tests in `scripts/test_long_conversation_check.py`.
+- Still open: the real 10-turn run against a serve started with `--temperature-cap 0.7`
+  on a GPU host is a HUMAN STEP (the agent container has no GPU and must not drive
+  servers). Until that transcript exists, the cap itself is unverified end to end.
 - Acceptance: a repeatable check that fails if the cap regresses.
 
 ### P4-2: fp32 serve evaluation
