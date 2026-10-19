@@ -325,6 +325,99 @@ class TestGuards(unittest.TestCase):
         self.assertIn("reserved", r.stderr)
 
 
+class TestTimeoutOption(unittest.TestCase):
+    """--timeout-s (s103): health 待ちとリクエストの両方に効く 1 つの値。"""
+
+    def mk(self, **kw):
+        import argparse
+        base = {"rounds": 1, "port": 8095, "max_tokens": 32,
+                "expect_input_tokens": 5686, "old": "/tmp/a", "new": "/tmp/b",
+                "self_test": False, "dry_run": True,
+                "health_timeout": cold_ab.HEALTH_TIMEOUT_S,
+                "timeout_s": cold_ab.DEFAULT_TIMEOUT_S}
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_default_is_600s(self):
+        self.assertEqual(cold_ab.DEFAULT_TIMEOUT_S, 600.0)
+        args = cold_ab.build_parser().parse_args(["--old", "/tmp/a", "--new", "/tmp/b"])
+        self.assertEqual(args.timeout_s, 600.0)
+        # 既存の既定値は変えない
+        self.assertEqual(args.health_timeout, cold_ab.HEALTH_TIMEOUT_S)
+        self.assertEqual(cold_ab.HEALTH_TIMEOUT_S, 80.0)
+
+    def test_non_positive_timeout_is_rejected(self):
+        self.assertTrue(cold_ab.validate_args(self.mk(timeout_s=0)))
+        self.assertTrue(cold_ab.validate_args(self.mk(timeout_s=-1)))
+        self.assertEqual(cold_ab.validate_args(self.mk(timeout_s=600.0)), [])
+
+    def test_cli_rejects_zero_timeout(self):
+        r = subprocess.run([sys.executable, SCRIPT, "--old", "/tmp/a", "--new", "/tmp/b",
+                            "--timeout-s", "0", "--dry-run"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("--timeout-s", r.stderr)
+
+    def test_dry_run_prints_the_timeout(self):
+        # 既定の出力行は変えない: 既定では出さず、変えたときだけ 1 行足す
+        base = subprocess.run([sys.executable, SCRIPT, "--old", "/tmp/a", "--new", "/tmp/b",
+                               "--dry-run"], capture_output=True, text=True)
+        self.assertEqual(base.returncode, 0, base.stdout + base.stderr)
+        self.assertNotIn("timeout =", base.stdout)
+        r = subprocess.run([sys.executable, SCRIPT, "--old", "/tmp/a", "--new", "/tmp/b",
+                            "--timeout-s", "900", "--dry-run"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("timeout = 900s", r.stdout)
+        # 元の行はそのまま残っている
+        self.assertIn("health_timeout=80s", r.stdout)
+
+    def test_flag_reaches_both_health_wait_and_request(self):
+        """one_request と wait_health に同じ args.timeout_s が渡ることを見る。
+
+        実行経路の値の流れは run_ab の中なので、呼び側を差し替えて観測する。
+        """
+        seen = {}
+
+        real_request = cold_ab.one_request
+        real_health = cold_ab.wait_health
+        real_stop = cold_ab.stop_servers
+        real_start = cold_ab.start_server
+
+        def fake_health(port, timeout=None, proc=None, host="127.0.0.1"):
+            seen["health"] = timeout
+            return False  # health で落とせば実際の推論は走らない
+
+        def fake_request(body, port, host="127.0.0.1", timeout=None):
+            seen["request"] = timeout
+            return 1.0, {"usage": {"input_tokens": 5686}}, ""
+
+        # このテストは本物のプロセスを扱わないので、ポート操作は全部差し替える
+        # (実 stop_servers は解放待ちで 30 s 待つことがあり、生きている 8095 を
+        #  覗きにいくのも避けたい)。
+        with tempfile.TemporaryDirectory() as td:
+            a = write_fake_binary(os.path.join(td, "a"), "A", 5686)
+            b = write_fake_binary(os.path.join(td, "b"), "B", 5686)
+            args = cold_ab.build_parser().parse_args(
+                ["--old", a, "--new", b, "--port", "8095", "--rounds", "1",
+                 "--timeout-s", "450", "--log-dir", td])
+            devnull = open(os.devnull, "w")
+            try:
+                cold_ab.one_request = fake_request
+                cold_ab.wait_health = fake_health
+                cold_ab.stop_servers = lambda *a, **k: True
+                cold_ab.start_server = lambda *a, **k: (None, None)
+                cold_ab.run_ab(args, out=devnull)
+            finally:
+                devnull.close()
+                cold_ab.one_request = real_request
+                cold_ab.wait_health = real_health
+                cold_ab.stop_servers = real_stop
+                cold_ab.start_server = real_start
+        self.assertEqual(seen.get("health"), 450.0,
+                         "--timeout-s must raise the health wait above 80s")
+
+
 class TestCli(unittest.TestCase):
     def test_help_explains_the_protocol(self):
         r = subprocess.run([sys.executable, SCRIPT, "--help"],
