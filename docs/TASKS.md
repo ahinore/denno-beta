@@ -245,10 +245,50 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 
 ## P5 — tooling and ops
 
-### P5-1: dashboard shows cold A/B and decode
+### P5-1: dashboard shows cold A/B and decode — DASHBOARD DONE (s109), GPU run is a human step
 - Why: `pf_best.txt` now holds a cold number but the graph still mixes eras.
 - Action: parse the A/B lines from the progress log, plot prefill and decode on separate
   axes, mark the protocol change with a vertical line.
+- Done in s109: the progress log is free-form prose, so it is NOT parsed. The
+  machine-readable source is `scripts/cold_ab.py --json`, and `scripts/dashboard.py`
+  builds the dashboard from a directory of those JSON files plus an optional `PF_BENCH`
+  log. One self-contained HTML file, inline SVG only (no script, CDN, font or image
+  reference), so it opens offline. Two panels with separate y axes — **prefill (s)** =
+  cold A/B `wall` seconds of the successful measurements plus the `PF wall=<sec>` lines,
+  **decode (ms/token)** = `wall * 1000 / tokens` from the PF lines — and x = measurement
+  order (index). `--protocol-change LABEL` draws a red dashed vertical line where that
+  era/label starts (repeatable), which is what splits the eras. A panel with fewer than
+  2 points prints "not enough points" instead of a line. Output is byte-identical for the
+  same inputs; exit 0 ok / 1 unusable input (bad JSON, missing dir, no points — the file
+  name is always in the message) / 2 usage error, and no partial `--out` is left behind.
+- Shape note (nothing is guessed): `cold_ab.py --json` writes `stats.old.median`,
+  `stats.new.median`, `stats.delta_pct` and the per-round `measurements[*].wall`, and it
+  has **no decode number and no era field**. Decode therefore comes only from the PF
+  lines, and the era is read from an `era` (else `label`) key that a human/other tool
+  adds to the JSON, falling back to the file name. An `era` key is not written by
+  `cold_ab.py` today; adding one (e.g. `--era`/`--json-label`) would remove the
+  fallback, and that is left as a future change rather than done here.
+- CPU half is covered: `python3 scripts/dashboard.py --self-test` (21 checks) and
+  `python3 scripts/test_dashboard.py -v` (17 tests); both run inside
+  `scripts/run_cpu_checks.sh` as stages `dashboard_selftest` / `dashboard_tests`.
+- Still open, and it is a HUMAN STEP: there is no real A/B JSON in the repo and the
+  agent container has no GPU, so no real chart exists yet. On a GPU host, after each
+  cold A/B run, collect the JSON and build the page:
+
+      # one JSON per measurement, e.g. /tmp/cold_ab_runs/s104_<build>.json
+      python3 scripts/cold_ab.py --old <old-bin> --new <new-bin> \
+          --json /tmp/cold_ab_runs/s109_<build>.json
+      PF_BENCH.sh > /tmp/pf_bench_<build>.log
+      python3 scripts/dashboard.py --cold-ab-dir /tmp/cold_ab_runs \
+          --pf-bench-log /tmp/pf_bench_<build>.log --max-tokens 32 \
+          --protocol-change <era-where-the-protocol-changed> \
+          --out /tmp/dashboard.html
+
+  `--max-tokens 32` is the PF_BENCH.sh payload size (`max_tokens=32`). The PF line has
+  no per-line `output_tokens`, so decode is derived from that fixed count; a log line
+  that carries `output_tokens=<n>` is used as-is instead.
+- Acceptance: one HTML page where prefill and decode are on separate axes and the
+  protocol change is a visible vertical line.
 
 ### P5-2: docs sync — DONE (2212c4a, s101)
 - `README.md` and `docs/api.md` still describe pre-s68 behaviour in places
