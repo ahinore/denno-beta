@@ -1790,6 +1790,37 @@ v6_1b=`c61ad85b` / v6_2b=`9e17d563` / v6_1b_full=`af6eb6ab` の **3 本とも一
 サンプリングのニアタイでトークンを反転させた**ものと解釈するのが自然である。
 s73 の並列 prepare が未初期化領域を読んでいる可能性は依然として未検証で、T9 として残す。
 
+### prefill の GDN beta/alpha 射影を GPU 化 (2026-10-19, s78 / s79 / T7) — GPU 未計測
+
+> 直近のプロファイルで prefill の `gdn_proj` は 5.4 s (5,866 tok)。s77 で一度 GPU 化を試みたが、
+> 形状チェックが `w.len()` を `k*tokens` と比べていたため常に false で CPU へ落ちる**死んだコード**で、
+> 計時も no-op クロージャだった (`ATT_GDN_PROJ` = 0 ms)。s78 でカーネルから作り直し、
+> s79 でビルドを通した。
+
+**カーネルと数値契約**:
+
+- 新カーネル `dno_matvec_rows_f32` (kernels_elem.cu)。`[m,k] x [n,k]^T -> [m,n]` を
+  1 ブロック = 1 出力 (i,j)・grid=(n,m)・block=(32,1,1) で計算する。共有メモリ・atomic・
+  warp 縮約を使わないので**決定論** (スレッド数非依存)。
+- CPU の `matvec_rows_bt_small_n_impl` と**ビット一致**させるため、累積順
+  「k を TILE=256 で区切り、区間内は末尾連鎖の打ち切り和、区間和を昇順に加算」を写した。
+  `DNO_MVROWS_TILE` は CPU 側 `MVROWS_TILE` と一致させないと一致が崩れる。
+- ホスト側の防御: `gdn_proj_shape_ok` (w=[k,nv] / a=[m,k] / out=[m,nv]) が false なら CPU 経路。
+  非正規が疑わしい入力 (`gdn_proj_min_row_sqsum`) も CPU へ落とし、`gdn_proj_last_miss` で理由を観測できる。
+- 1 呼び出し = 1 H2D + 1 D2H。PROFILE に `D2H_GDN_PROJ_{H2D,KERNEL,SYNC,D2H}` を追加 (表示のみ)。
+
+**既定経路は不変**: `.ptx` 未再生成の間は `GdnProjMiss::NoKernel` で `apply_bt_rows_into` に
+フォールバックするため、出力は s79 前とビット同一。
+
+**副産物 (既存破損の修復)**: `crates/denno-server/tests/*.rs` の 7 ファイルが s67b の
+`AppState.temperature_cap` 追加に追随しておらず E0063 でコンパイル不能だった。初期化子に
+`temperature_cap: None` を足して修復 (テストのみ・数値経路に無関係)。
+
+**検証**: `cargo test --workspace` = **312 passed / 0 failed / 18 ignored**。
+shape ゲートの負例 (転置・長さ不足・0 次元) とフォールバック上書きの単体テストを追加。
+GPU 実機のビット一致テスト `cuda_gdn_proj_f32_bit_exact_vs_cpu` は ignored のまま未実行
+(`.ptx` 再生成後に supervisor が回す)。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)

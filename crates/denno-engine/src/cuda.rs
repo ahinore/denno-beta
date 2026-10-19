@@ -2175,6 +2175,333 @@ pub fn maybe_gpu_matvec_f32(
 }
 
 // ===========================================================================
+// s78 (T7): prefill の GDN beta/alpha 投影 (gdn_proj) の GPU 化
+// ===========================================================================
+// 計測 (s61c/s62) で prefill の `gdn_proj` (GDN 層の beta/alpha 投影 =
+// Fp32 [m,4096] x [4096,32]^T) が attn_gdn の大部分を占めていた。CPU では
+// `tensor::matvec_rows_bt_into` の小 n 経路 (n=32 < JB=64) が単コアで重み
+// 27MB を走査する。
+//
+// 本経路は `dno_matvec_rows_f32` (kernels_elem.cu の s78 カーネル) で
+// **[m,k] x [n,k]^T -> [m,n] を 1 回**で計算する。CPU との **ビット一致** が
+// 必須 (beta/alpha はアンカー経路に入る = 出力が 1 bit でも動くと採用不可)。
+//
+// ビット一致の根拠:
+//   - CPU (matvec_rows_bt_small_n_impl) は k を TILE=256 で区切って
+//     タイルごとに acc=0 から d 昇順へ逐次加算し、末尾で打ち切り和、最後に
+//     タイル和を d 昇順で加算する。カーネルは同じ区切り・同じ木 (末尾連鎖) で
+//     累積する。区切り定数は tensor.rs の `MVROWS_TILE` と一致させる。
+//   - 積と加算の丸めは分離する (`__fmul_rn` / `__fadd_rn`。PTX は -fmad=false で
+//     生成する規約 = -O3 を付けても fma 縮約しない)。
+//   - カーネルは (i,j) ごとに 1 ブロックで全スレッドが同じ計算をする
+//     (縮約・atomic・共有メモリ無し) → スレッド数 / grid 順に依存しない。
+//   - 非正規 (denormal) は CPU が flush せず GPU も FTZ しない前提。ただし
+//     「途中の値が非正規になるか」はデータ依存なので、ホスト側で行ごとの
+//     二乗和 (総和 >= |部分和| の上界) を事前検査し、疑わしい行があれば
+//     その回は GPU を捨てて CPU で全行を計算し直す (フォールバック)。
+//     アンカー入力でこの経路が発動した場合も数値は CPU と同一 (出力は変えない)。
+//
+// ゲート (すべて満たさなければ false = CPU 呼び出し側が従来経路で上書き):
+//   - DENNO_CUDA=1 (cuda_enabled) / LMV32_BROKEN でない
+//   - k > 0, nv > 0, m > 0 (m == 1 でも可 = どの m でもビット一致)
+//   - w.len() == k*nv, a.len() == m*k, out.len() == m*nv
+//   - k, nv, m が i32 に収まる
+//   - kernels_elem.ptx に dno_matvec_rows_f32 が収録されている (未収録は
+//     None をキャッシュ = ランチしない。LMV32_BROKEN は立てない)
+//
+// 重み (k*nv = 512KB/層) は lm_head と同じ fp32 デバイスレジストリ
+// (`LMV32_W`) に key で 1 回だけ同期 H2D する。key は呼び出し側 (qwen35) が
+// モデルロード毎の一意性 (mid) と層番号から作る — 本関数では key を解釈しない。
+//
+// 失敗時の扱い: ゲート不成立 (形状・シャドウ不成立) は false を返すだけ
+// (ラッチ無し・次回も試す)。実行時エラー (make_current / 重みアップロード /
+// コピー / 起動 / 同期) は LMV32_BROKEN を立てて恒久 CPU へ落とす
+// (= 数値は同一仕様なので安全)。部分的な書き込みは out に残り得るが、
+// 呼び出し側は false のときに必ず CPU で out を上書きする契約。
+//
+// 計時: 表示専用の `prof::D2H_GDN_PROJ_{H2D,KERNEL,SYNC,D2H}` に 4 区間を積む
+// (どのバケットにも合算しない)。外側 (ATT_GDN_PROJ) の計時は呼び出し側が
+// `time_n_ev` で行う = `gdn_proj` 行は GPU 実行時間を実測で含む。
+//
+// ※ 既存 `dno_matvec_f32` (1 出力・grid=(n,1,1)・全スレッド冗長計算) は
+//   トークン並列に流用できない (h がどのトークンか決まらない) ため、本経路は
+//   別カーネル `dno_matvec_rows_f32` を使う。
+
+/// s78 (T7): dno_matvec_rows_f32 のハンドル (lazy fetch・未収録 PTX は None を
+/// キャッシュして不発動 = q35_fns / LMV32_FNS と同一規約)。
+#[derive(Clone, Copy)]
+struct GdnProjFn(CUfunction);
+unsafe impl Send for GdnProjFn {}
+unsafe impl Sync for GdnProjFn {}
+
+static GDN_PROJ_FNS: OnceLock<Option<GdnProjFn>> = OnceLock::new();
+
+/// s78 (T7): beta/alpha 投影の非正規事前検査で使う下界。CPU にも GPU にも
+/// 非正規が現れ得ないだけの余裕を持たせる (実データの二乗和は 9B prefill で
+/// 1e2〜1e4 程度、最小でも ~1e-3)。これ未満の行だけに限り、部分和の非正規化
+/// が「起こり得る」として GPU 結果を捨てる。カーネル側の denormal flush と
+/// 合わせて、どちらの分岐でも CPU とビット一致する。
+const GDN_PROJ_SQSUM_MIN: f32 = 1e-20;
+
+/// s78 (T7): GPU 経路の観測カウンタ (**表示・テスト用**)。
+/// `gdn_proj_gpu_calls()` = GPU 経路で完走した回数、`_cpu_rows()` = 非正規
+/// 事前検査で CPU へ落とした行数。数値経路には影響しない。
+static GDN_PROJ_GPU_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GDN_PROJ_CPU_DENORM_ROWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// s78 (T7): GPU 経路で完走した beta/alpha 投影の回数 (計測・テスト用)。
+pub fn gdn_proj_gpu_calls() -> u64 {
+    GDN_PROJ_GPU_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// s78 (T7): 非正規の事前検査で CPU 経路へ落とした行数の累計 (計測・テスト用)。
+pub fn gdn_proj_cpu_denorm_rows() -> u64 {
+    GDN_PROJ_CPU_DENORM_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// s78 (T7): GPU 不発動の理由 (診断用・数値経路には影響しない)。
+/// `false` を返した理由をテストとログから区別できるようにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GdnProjMiss {
+    /// cuda 無効 / LMV32_BROKEN / 形状不正
+    Gate,
+    /// PTX に dno_matvec_rows_f32 が無い (未再生成)
+    NoKernel,
+    /// 非正規の恐れがある行を含む (行数を返す) — CPU で全行を計算し直すこと
+    Denorm(usize),
+    /// 実行時エラー (LMV32_BROKEN を立てた)
+    Runtime,
+}
+
+thread_local! {
+    /// s78 (T7): 直前の呼び出しが `false` だった理由 (診断のみ・数値経路に無関係)。
+    static GDN_PROJ_LAST_MISS: std::cell::Cell<Option<GdnProjMiss>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// s78 (T7): 直近の `gdn_proj_f32_into` が `false` を返した理由 (テスト・ログ用)。
+/// `true` を返した直後は None。
+pub fn gdn_proj_last_miss() -> Option<GdnProjMiss> {
+    GDN_PROJ_LAST_MISS.with(|c| c.get())
+}
+
+/// s78 (T7): 形状ゲート (純関数)。`gdn_proj_f32_into` の入口条件。
+/// - k: 入力次元 (e) / nv: 出力行数 (n_v_heads) / m: トークン数
+/// - 次元モデルは **w = [nv, k] (k*nv) / a = [m, k] / out = [m, nv]**。
+///   前セッション (s77) の WIP は w=[k,n]・a=[n,k] と取り違えて毎回
+///   CPU フォールバックしていた (w.len() == k*n の検査が常に不成立) — ここで
+///   明示的に固定する。
+pub fn gdn_proj_shape_ok(k: usize, nv: usize, m: usize, w: &[f32], a: &[f32], out: &[f32]) -> bool {
+    k > 0
+        && nv > 0
+        && m > 0
+        && k <= i32::MAX as usize
+        && nv <= i32::MAX as usize
+        && m <= i32::MAX as usize
+        && w.len() == k * nv
+        && a.len() == m * k
+        && out.len() == m * nv
+}
+
+/// s78 (T7): 行ごとの二乗和の最小値 (非正規の事前検査)。行 i の二乗和は
+/// |部分和| の上界 (同じ行の項は同じスケール) なので、これが
+/// `GDN_PROJ_SQSUM_MIN` 以上なら途中の値も非正規にならない。
+/// 行並列 (行ごとに独立 = 順序不変)・f64 累積 (判定だけなので丸めは不問)。
+fn gdn_proj_min_row_sqsum(a: &[f32], m: usize, k: usize) -> f32 {
+    use rayon::prelude::*;
+    a.par_chunks_exact(k)
+        .take(m)
+        .map(|row| {
+            let s: f64 = row.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+            s as f32
+        })
+        .reduce(|| f32::INFINITY, f32::min)
+}
+
+/// s78 (T7): prefill の GDN beta/alpha 投影 `[m,k] x [nv,k]^T -> [m,nv]` を GPU で
+/// 実行する。戻り値 true = out は CPU の `matvec_rows_bt_into` と **ビット一致**。
+/// false = 呼び出し側が従来の CPU 経路で out を上書きすること
+/// (false のとき out の内容は不定 = 部分書き込みが残り得る)。
+///
+/// key: 重みキャッシュ用の一意 key (モデルロード × 層 × beta/alpha で一意)。
+pub fn gdn_proj_f32_into(
+    key: u64,
+    w: &[f32],
+    a: &[f32],
+    k: usize,
+    nv: usize,
+    m: usize,
+    out: &mut [f32],
+) -> bool {
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering as AO;
+    use std::sync::Mutex;
+    use std::time::Instant;
+    GDN_PROJ_LAST_MISS.with(|c| c.set(Some(GdnProjMiss::Gate)));
+    if !cuda_enabled() || LMV32_BROKEN.load(AO::Relaxed) {
+        return false;
+    }
+    if !gdn_proj_shape_ok(k, nv, m, w, a, out) {
+        return false;
+    }
+    // 非正規の事前検査: 疑わしい行が 1 つでもあれば GPU を使わない。
+    if gdn_proj_min_row_sqsum(a, m, k) < GDN_PROJ_SQSUM_MIN {
+        GDN_PROJ_CPU_DENORM_ROWS.fetch_add(m as u64, AO::Relaxed);
+        GDN_PROJ_LAST_MISS.with(|c| c.set(Some(GdnProjMiss::Denorm(m))));
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        GDN_PROJ_LAST_MISS.with(|c| c.set(Some(GdnProjMiss::Runtime)));
+        return false;
+    };
+    if let Err(e) = ctx.make_current() {
+        tracing::error!("CUDA cuCtxSetCurrent failed (gdn_proj), using CPU: {e:#}");
+        LMV32_BROKEN.store(true, AO::Relaxed);
+        GDN_PROJ_LAST_MISS.with(|c| c.set(Some(GdnProjMiss::Runtime)));
+        return false;
+    }
+    // カーネルハンドル (lazy fetch・None キャッシュ = PTX 未収録はラッチ無し)
+    let f = GDN_PROJ_FNS
+        .get_or_init(|| {
+            let lib = lib().ok()?;
+            let mut f: CUfunction = std::ptr::null_mut();
+            let r = unsafe {
+                (lib.module_get_function)(
+                    &mut f,
+                    ctx.module_elem,
+                    b"dno_matvec_rows_f32\0".as_ptr() as *const c_char,
+                )
+            };
+            if r != 0 {
+                None
+            } else {
+                Some(GdnProjFn(f))
+            }
+        })
+        .as_ref()
+        .map(|g| g.0);
+    let Some(f) = f else {
+        GDN_PROJ_LAST_MISS.with(|c| c.set(Some(GdnProjMiss::NoKernel)));
+        return false;
+    };
+    // 重みアップロード (初回 1 回・同期。ロック内で行う = 二重アップロード防止)
+    let reg = LMV32_W.get_or_init(|| Mutex::new(HashMap::new()));
+    let wp = {
+        let mut map = match reg.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::error!("CUDA gdn_proj weight registry poisoned, using CPU");
+                LMV32_BROKEN.store(true, AO::Relaxed);
+                GDN_PROJ_LAST_MISS.with(|c| c.set(Some(GdnProjMiss::Runtime)));
+                return false;
+            }
+        };
+        match map.get(&key) {
+            Some(b) if b.bytes() == w.len() * 4 => b.ptr(),
+            _ => match DevBuffer::from_slice(w) {
+                Ok(buf) => {
+                    tracing::info!(
+                        "CUDA gdn_proj weight upload: k={k} nv={nv} ({:.2} MB)",
+                        (k * nv * 4) as f64 / 1e6
+                    );
+                    let p = buf.ptr();
+                    map.insert(key, buf);
+                    p
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "CUDA gdn_proj weight upload failed, using CPU permanently: {e:#}"
+                    );
+                    LMV32_BROKEN.store(true, AO::Relaxed);
+                    GDN_PROJ_LAST_MISS.with(|c| c.set(Some(GdnProjMiss::Runtime)));
+                    return false;
+                }
+            },
+        }
+    };
+    let lib = match lib() {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("CUDA lib load failed (gdn_proj), using CPU: {e:#}");
+            LMV32_BROKEN.store(true, AO::Relaxed);
+            GDN_PROJ_LAST_MISS.with(|c| c.set(Some(GdnProjMiss::Runtime)));
+            return false;
+        }
+    };
+    // H2D(a) → dno_matvec_rows_f32 → D2H(out) → sync ×1 (linear_pinned と同一の
+    // パイプライン。bm は m の内側ループを流す = 毎回 1 本ずつではなく 1 回)。
+    let r = SCRATCH.with(|cell| -> Result<()> {
+        let now = Instant::now();
+        let mut q = crate::prof::Seq::begin(crate::prof::D2H_GDN_PROJ_H2D, now);
+        let mut s = cell.borrow_mut();
+        let Scratch { x, out: d_out, hx, ho, .. } = &mut *s;
+        let bytes_a = m * k * 4;
+        let bytes_out = m * nv * 4;
+        Scratch::ensure(x, bytes_a)?;
+        Scratch::ensure(d_out, bytes_out)?;
+        Scratch::ensure_pin(hx, bytes_a)?;
+        Scratch::ensure_pin(ho, bytes_out)?;
+        let (dx, dout) = (x.as_ref().unwrap(), d_out.as_ref().unwrap());
+        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        hx.as_mut_slice::<f32>()[..m * k].copy_from_slice(a);
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(
+                    dx.ptr(),
+                    hx.ptr as *const c_void,
+                    bytes_a,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyHtoDAsync",
+            )?;
+            q.lap(crate::prof::D2H_GDN_PROJ_KERNEL);
+            let (mut pa, mut pw, mut po) = (dx.ptr(), wp, dout.ptr());
+            let (mut kc, mut nc, mut mc) = (k as c_int, nv as c_int, m as c_int);
+            let mut args = [
+                &mut pa as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+            ];
+            // 1 ブロック = 1 出力 (i,j)。block=(32,1,1) は冗長 (決定論のため
+            // ブロック内で同じ計算) — dno_matvec_f32 の block=(1,1,1) と同義。
+            ctx.launch_async(f, (nv as u32, m as u32, 1), (32, 1, 1), 0, &mut args)?;
+            check(
+                (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync",
+            )?;
+            // 発行元の分類 (表示専用・時間は d2h_state バケット)
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+            q.lap(crate::prof::D2H_GDN_PROJ_SYNC);
+            ctx.sync()?;
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+            q.lap(crate::prof::D2H_GDN_PROJ_D2H);
+            out.copy_from_slice(&ho.as_slice::<f32>()[..m * nv]);
+            q.end();
+        }
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            // 実行先ラベル (計測のみ): 以降の time_n_ev 区間で GPU 実測を積む
+            set_last_linear_ran_on_gpu(true);
+            GDN_PROJ_GPU_CALLS.fetch_add(1, AO::Relaxed);
+            GDN_PROJ_LAST_MISS.with(|c| c.set(None));
+            true
+        }
+        Err(e) => {
+            tracing::error!("CUDA gdn_proj failed, falling back to CPU permanently: {e:#}");
+            LMV32_BROKEN.store(true, AO::Relaxed);
+            GDN_PROJ_LAST_MISS.with(|c| c.set(Some(GdnProjMiss::Runtime)));
+            false
+        }
+    }
+}
+
+// ===========================================================================
 // P17d: decode chain (隠れ状態デバイス常駐 + 要素演算融合)
 // ===========================================================================
 // solo decode (n==1) の 1 ステップを
@@ -5791,6 +6118,167 @@ mod tests {
         // ゲート: 形状不正 (w.len() != k*n) は None (CPU フォールバック) であること
         let w = vec![0.0f32; 10];
         assert!(maybe_gpu_matvec_f32(9_000_002, &w, &[0.0; 4], 4, 3).is_none());
+    }
+
+    /// s78 (T7): `gdn_proj_f32_into` の形状ゲート (GPU 不要・CPU で走る)。
+    /// 次元モデルは w=[nv,k] (len k*nv) / a=[m,k] (len m*k) / out=[m,nv] (len m*nv)。
+    /// s77 の WIP は k=e・n=トークン数と取り違えて `w.len() != k*n` が常に真 → 毎回
+    /// CPU フォールバック (= no-op) だった。ここで取り違えを固定して退行を防ぐ。
+    #[test]
+    fn gdn_proj_shape_gate_rejects_wrong_dim_model() {
+        // 正しい次元モデル: k=8, nv=3, m=5
+        let (k, nv, m) = (8usize, 3usize, 5usize);
+        let w = vec![0.0f32; k * nv];
+        let a = vec![0.0f32; m * k];
+        let out = vec![0.0f32; m * nv];
+        assert!(gdn_proj_shape_ok(k, nv, m, &w, &a, &out));
+        // s77 の取り違え (k=e, n=m): w を k*m と見なすと長さが合わない
+        assert!(!gdn_proj_shape_ok(k, m, nv, &w, &a, &out));
+        // 転置した重み ([k,nv] を [nv,k] と解釈) は要素数が同じでも a/out が合わない
+        let w_t = vec![0.0f32; nv * k];
+        assert!(!gdn_proj_shape_ok(k, nv, m, &w_t, &vec![0.0f32; m * nv], &out));
+        // 各長さの不一致
+        assert!(!gdn_proj_shape_ok(k, nv, m, &vec![0.0f32; k * nv - 1], &a, &out));
+        assert!(!gdn_proj_shape_ok(k, nv, m, &w, &vec![0.0f32; m * k - 1], &out));
+        assert!(!gdn_proj_shape_ok(k, nv, m, &w, &a, &vec![0.0f32; m * nv - 1]));
+        // 0 次元は不可 (m=0 は prefill では来ない・decode chain は別経路)
+        assert!(!gdn_proj_shape_ok(0, nv, m, &[], &[], &out));
+        assert!(!gdn_proj_shape_ok(k, 0, m, &[], &a, &out));
+        assert!(!gdn_proj_shape_ok(k, nv, 0, &w, &[], &[]));
+        // 入口関数も cuda 無効 (このコンテナ) では false を返し、out に触れない
+        let mut o = vec![7.0f32; m * nv];
+        if !cuda_enabled() {
+            assert!(!gdn_proj_f32_into(1, &w, &a, k, nv, m, &mut o));
+            assert!(o.iter().all(|v| *v == 7.0), "false のとき out を書き換えない契約");
+            assert_eq!(gdn_proj_last_miss(), Some(GdnProjMiss::Gate));
+        }
+    }
+
+    /// s78 (T7): GPU 不発 (このコンテナでは常に不発) のとき呼び出し側の CPU
+    /// 上書きが従来経路と **ビット一致**すること。prefill の使い方
+    /// (return しなければ apply_bt_rows_into で out を上書き) をそのまま模す。
+    #[test]
+    fn gdn_proj_fallback_overwrites_like_cpu_path() {
+        let (e, nv, m) = (256usize, 32usize, 9usize);
+        let w = pseudo_random(e * nv, 91);
+        let a = pseudo_random(m * e, 92);
+        let mut want = vec![0.0f32; m * nv];
+        tensor::matvec_rows_bt_into(&a, &w, e, nv, m, &mut want);
+        // 呼び出し側のパターン: GPU が true なら return、false なら CPU で上書き
+        let mut out = vec![f32::NAN; m * nv];
+        let ran = gdn_proj_f32_into(9_100_100, &w, &a, e, nv, m, &mut out);
+        if !ran {
+            tensor::matvec_rows_bt_into(&a, &w, e, nv, m, &mut out);
+        }
+        for (i, (g, r)) in out.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g.to_bits(), r.to_bits(), "out[{i}] が CPU 経路と不一致");
+        }
+    }
+
+    /// s78 (T7): prefill の GDN beta/alpha 投影 (`gdn_proj_f32_into` →
+    /// `dno_matvec_rows_f32`) が CPU の `tensor::matvec_rows_bt_into`
+    /// (n=32 < JB の小 n 経路) と **ビット一致**すること。
+    ///
+    /// 実形状 [m,e]x[e,nv]^T → [m,nv] (e=4096, nv=32) の m=4096 / m=33 / m=1 に加え,
+    /// k がタイル境界 (TILE=256) を跨ぐ形状・小形状も照合する。各家系で
+    /// ①CPU と 1 bit 違わない ②同一入力 2 回でビット一致 (決定論)
+    /// ③ゼロ/極小混在の入力でも (二乗和の下限で) CPU へ落ちて一致、を検証する。
+    ///
+    /// このコンテナには GPU/nvcc が無いため **未実行** — denno-gpu で
+    /// `cargo test --release --features cuda -- --ignored cuda_gdn_proj_f32` を回す。
+    /// kernels_elem.ptx の再生成 (dno_matvec_rows_f32 の収録) が前提。
+    #[test]
+    #[ignore] // GPU が必要: cargo test --release --features cuda -- --ignored
+    fn cuda_gdn_proj_f32_bit_exact_vs_cpu() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let _ctx = CudaCtx::new().unwrap();
+        let key0 = 9_100_001u64;
+        // (k, nv, m, seed)
+        let cases = [
+            (4096usize, 32usize, 4096usize, 81u32), // 実形状 (prefill 4096 トークン)
+            (4096, 32, 33, 82),                     // 端数 (グループ 8 の端数)
+            (4096, 32, 1, 83),                      // 1 トークン
+            (300, 32, 17, 84),                      // k が TILE=256 を跨ぐ
+            (257, 32, 9, 85),                       // タイル + 1
+            (64, 4, 5, 86),                         // 小さい nv
+            (1, 32, 6, 87),                         // 最小 k
+        ];
+        for (k, nv, m, seed) in cases {
+            let w = pseudo_random(k * nv, seed);
+            let a = pseudo_random(m * k, seed + 100);
+            let mut want = vec![0.0f32; m * nv];
+            tensor::matvec_rows_bt_into(&a, &w, k, nv, m, &mut want);
+            let mut got = vec![0.0f32; m * nv];
+            assert!(
+                gdn_proj_f32_into(key0, &w, &a, k, nv, m, &mut got),
+                "k={k} nv={nv} m={m}: GPU 経路が不発 (理由 {:?} / kernels_elem.ptx に \
+                 dno_matvec_rows_f32 が無い = PTX 未再生成の可能性)",
+                gdn_proj_last_miss()
+            );
+            for (idx, (g, r)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    r.to_bits(),
+                    "k={k} nv={nv} m={m}: out[{idx}] が bit 不一致 (g={g} r={r})"
+                );
+            }
+            // 決定論: 同一入力 2 回でビット一致
+            let mut got2 = vec![0.0f32; m * nv];
+            assert!(gdn_proj_f32_into(key0, &w, &a, k, nv, m, &mut got2));
+            for (g, g2) in got.iter().zip(got2.iter()) {
+                assert_eq!(g.to_bits(), g2.to_bits(), "k={k} nv={nv} m={m}: 非決定論");
+            }
+            println!("cuda gdn_proj_f32 k={k} nv={nv} m={m}: bit exact OK");
+        }
+        // 0 / 極小 (非正規) を含む入力: 二乗和の下限で GPU を捨てて CPU へ落ちる
+        // (落ちても数値は CPU 経路そのものなので一致) — 発動するか否かに
+        // かかわらず結果が CPU と一致することを確認する。
+        {
+            let (k, nv, m) = (512usize, 32usize, 4usize);
+            let mut w = pseudo_random(k * nv, 88);
+            let mut a = vec![0.0f32; m * k];
+            // 行 0: 非正規を散らす (二乗和が 1e-20 未満になる)
+            for d in (0..k).step_by(7) {
+                a[d] = f32::from_bits(1); // 最小の正の非正規
+            }
+            // 行 1: ゼロのみ / 行 2: 極小の正規値
+            for d in 0..k {
+                a[2 * k + d] = f32::from_bits(0x0080_0001); // 最小正規 + 1ulp
+            }
+            // 行 3 は擬似乱数のまま
+            let rnd = pseudo_random(k, 89);
+            a[3 * k..].copy_from_slice(&rnd);
+            w[k * nv - 1] = -0.0; // -0.0 の重み (符号付きゼロ)
+            let mut want = vec![0.0f32; m * nv];
+            tensor::matvec_rows_bt_into(&a, &w, k, nv, m, &mut want);
+            let mut got = vec![f32::NAN; m * nv];
+            let ran = gdn_proj_f32_into(key0 + 7, &w, &a, k, nv, m, &mut got);
+            if !ran {
+                // CPU フォールバック: 呼び出し側 (qwen35) はここで CPU 経路を回す
+                tensor::matvec_rows_bt_into(&a, &w, k, nv, m, &mut got);
+                assert_eq!(
+                    gdn_proj_last_miss(),
+                    Some(GdnProjMiss::Denorm(m)),
+                    "非正規入力は Denorm で CPU へ落ちるべき"
+                );
+            }
+            for (idx, (g, r)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(g.to_bits(), r.to_bits(), "非正規入力: out[{idx}] bit 不一致");
+            }
+            println!("cuda gdn_proj_f32 denormal/zero inputs: ran_on_gpu={ran} 一致 OK");
+        }
+        // ゲート: 形状不正 (w.len() != k*nv) は false (CPU フォールバック)
+        assert!(!gdn_proj_f32_into(
+            key0,
+            &vec![0.0f32; 10],
+            &vec![0.0f32; 4],
+            4,
+            3,
+            1,
+            &mut vec![0.0f32; 3]
+        ));
+        assert_eq!(gdn_proj_last_miss(), Some(GdnProjMiss::Gate));
     }
 
     /// s48 (C1): qwen35 形状 (dh=256・heads=16・kv_heads=4・group=4 = 実 9B の

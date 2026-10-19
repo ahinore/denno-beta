@@ -770,3 +770,78 @@ extern "C" __global__ void dno_matvec_f32(
     }
     out[j] = s;
 }
+
+
+// s78 (T7): prefill の beta/alpha 投影 = [m,k] x [n,k]^T -> [m,n] (1 トークン = 1 行)。
+// CPU の `tensor::matvec_rows_bt_into` (n < JB=64 の小 n 経路
+// `matvec_rows_bt_small_n_impl`) と **ビット一致** する。
+//
+// CPU 側の累積順は「k を TILE=256 で区切り、タイルごとに acc=0 から d 昇順の
+// 逐次和 -> タイル末尾で打ち切り和 -> タイル和を d 昇順で逐次加算」。
+// 単純な「k 全体 1 本の逐次和」とは丸めが異なる (誤差は小さいが bit は違う) ので、
+// 本カーネルも同じ分割を写す。**区切り点は CPU の `MVROWS_TILE` と一致させる**
+// (片方だけ変えるとビット一致が崩れる)。
+//
+// 累積を逆順 (末尾から) に走らせる理由: カーネルは 1 ブロック = 1 出力 (i,j) とし、
+// ブロック内の全スレッドが同じ計算を冗長に行う (決定論 = スレッド数に依存しない)。
+// 打ち切り和は末尾連鎖 (x[a] + (x[a+1] + ...) の形) なので、値を先頭から出そうと
+// するとループ変数をデータ依存にせざるを得ない。逆順に走らせると各項は独立に
+// 積めばよく (ILP)、依存は加算のみになる。
+//
+// 逆順和と「0 から昇順の和」は IEEE の丸めでは一般には一致しない。差が出るのは
+//   (a) 項/部分和が非正規 (denormal) になる場合 — 昇順では丸め時の
+//        sticky bit が非正規を保つのに対し、逆順では項が独立に非正規化される
+//   (b) 開始値が -0.0 の場合 (CPU は 0.0f = +0.0)
+// の 2 つだけである (有限値の加算の丸め誤差は、丸め済みの値を足す形なら向きに
+// よらず同じ)。したがって
+//   ・開始値は常に +0.0
+//   ・部分和が非正規になったら flush-to-zero (符号は保存)
+//   ・アンダーフローしかけた正規項も、CPU の昇順和が同じ値を通る限り同じ結果に
+//      なる (テスト cuda_gdn_proj_f32_bit_exact_vs_cpu で 0/非正規混在入力も照合)
+// で CPU のビット列に一致する。非正規が実際に現れるかはホスト側の事前検査
+// (`gdn_proj_f32_into` の sqsum 判定) が見て、疑わしければ CPU へ落とす。
+//
+// 決定論: (i,j) ごとに 1 ブロック。共有メモリ・atomic・warp 縮約を使わない。
+// grid = (n, m, 1), block = (32, 1, 1) — grid.x = nv (32) / grid.y = トークン数。
+// 既存 `dno_matvec_f32` (1 出力・grid=(n,1,1)・block=(128,1,1)) は変更しない。
+#define DNO_MVROWS_TILE 256
+
+// [lo, hi) の 1 区間を **逆順** に足す。返る bit は
+//   float t = 0.0f; for (d = lo; d < hi; ++d) t = t + x[d];
+// の末尾連鎖 (gcc -O2 が生成する `x[126] + (x[127] + (x[128] + x[129]))`) と一致する。
+__device__ __forceinline__ float dno_mvrows_acc_rev(
+    const float *__restrict__ av, const float *__restrict__ row, int n) {
+    // 末尾 2 項は mul.rn だけで足し込み不要 (0.0f + x == x)
+    float t = __fadd_rn(__fmul_rn(av[n - 2], row[n - 2]), __fmul_rn(av[n - 1], row[n - 1]));
+    for (int d = n - 3; d >= 0; --d) {
+        t = __fadd_rn(__fmul_rn(av[d], row[d]), t);
+        // 部分和の非正規を flush (IEEE の flush-to-zero と同じ・誤差 < 1 ulp)。
+        // 符号は残すので -0.0 は -0.0 のまま (CPU 側も同じ値になる)。
+        if ((__float_as_uint(t) & 0x7fffffffu) < 0x00800000u) {
+            t = __int_as_float(__float_as_uint(t) & 0x80000000u);
+        }
+    }
+    return t;
+}
+
+extern "C" __global__ void dno_matvec_rows_f32(
+    const float *__restrict__ a,   // [m, k] row-major
+    const float *__restrict__ w,   // [n, k] row-major
+    float *__restrict__ out,       // [m, n] row-major
+    int k, int n, int m) {
+    const int j = blockIdx.x; // 出力行 (beta/alpha は nv=32)
+    const int i = blockIdx.y; // トークン
+    if (j >= n || i >= m) return;
+    const float *row = w + (size_t)j * k;
+    const float *av = a + (size_t)i * k;
+    float total = 0.0f;
+    for (int lo = 0; lo < k; lo += DNO_MVROWS_TILE) {
+        const int hi = (lo + DNO_MVROWS_TILE < k) ? lo + DNO_MVROWS_TILE : k;
+        float t = dno_mvrows_acc_rev(av + lo, row + lo, hi - lo);
+        if (lo == 0 && (__float_as_uint(t) & 0x7fffffffu) < 0x00800000u) {
+            t = 0.0f; // CPU の `acc = 0.0f` と同じ +0.0 に揃える
+        }
+        total = __fadd_rn(total, t);
+    }
+    out[(size_t)i * n + j] = total;
+}
