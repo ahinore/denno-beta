@@ -1513,6 +1513,34 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 **残る対策**: Hermes 側で非 Anthropic エンドポイントに `temperature: 1` を付けないパッチ（本来の修正）は未着手。クライアント更新で消え得るため、サーバー側の上限を先に入れた。
 
+### ピン留めステージング経由の D2H が GEMM 本体の 5 倍を食っていた — 直接コピーで prefill 23.1 s → 14.8 s ✅ (2026-10-19, s68)
+
+> s67 の後、prefill 23.1 s の最大項目は `gate_up_proj` 7.38 s (64 call・114 ms/call)。まず s68 用の micro-bench (`work68/bench2.cu`) で 1 call の全段を再現したところ、**GEMM 本体は 12 ms**、量子化 6 ms、H2D 7 ms に対し、**D2H 20 ms + ホスト間コピー 60 ms** が乗っていた。
+
+**計測** (`work68/d2h.cu`・279 MB = m 5686 × n 12288 × 4 B・3 回平均):
+
+| 経路 | ms | 実効 |
+|---|---|---|
+| D2H → pinned + `memcpy` → heap (旧実装) | 79.8 | 3.5 GB/s |
+| **D2H → pageable 直 (新実装)** | **20.1** | **13.9 GB/s** |
+| D2H → pinned のみ | 19.5 | 14.3 GB/s |
+
+pinned→heap の `memcpy` が 60 ms = **4.7 GB/s** しか出ていない。一方、pageable バッファへの直接 D2H は 20 ms。つまり「pinned に落としてから Rust のバッファへ `copy_from_slice`」という常套句が、この環境では**二度手間の上に 4 倍遅い**。
+
+**修正** (`cuda.rs::linear_gemm_into`):
+
+- H2D を呼び出し元の `a` スライスから直接発行 (pinned `hx` への `copy_from_slice` を削除)
+- D2H を呼び出し元の `dst` へ直接発行 (pinned `ho` + `dst.copy_from_slice` を削除)
+- 転送する内容・カーネル引数・演算順は不変 = **ビット一致** (転送経路だけの変更)
+
+**結果** (5,686 token cache-miss prefill・warm):
+
+- `gate_up_proj` **7.38 s → 2.87 s** (114 → 44 ms/call)
+- prefill **23.1 s → 14.8 s**・**246 → 384 tok/s** (このセッション開始時の 46.2 s からは **−68% / 3.1 倍**)
+- テスト 231 passed / 0 failed。GPU アンカー 3 本 MATCH (不変)
+
+**残った内訳** (1 リクエスト換算): `d2h_state` 8.2 s / `attn_core` 4.9 s (`gdn_scan` 2.6 + `gdn_proj` 1.1 + `attn_full` 1.2) / `gate_up` 2.9 s / `qkv` 1.6 s / `down` 1.4 s / `swiglu` 0.83 s / `o_proj` 0.64 s / `rmsnorm` 0.41 s。**次の標的は依然 D2H** で、`chain_download` (attention 出力 93 MB) と o_proj の `to_vec` が同じ pinned 経由のまま残っている。本命は活性化をデバイスに残し、swiglu / rmsnorm / 残差を GPU 上で畳んで D2H 自体を消すこと。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
