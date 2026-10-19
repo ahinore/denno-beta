@@ -31,10 +31,35 @@ Two rules that hold everywhere in this directory:
 scripts/run_cpu_checks.sh
 ```
 
-Runs the kernel invariant tests, the engine lib tests, the server tests and every
-Python self-test in order, stopping at the first failure. It prints one line per
+Runs, in order: the kernel invariant tests, the engine lib tests, the server tests
+and every Python self-test below. It stops at the first failure, prints one line per
 stage plus a final `PASS`/`FAIL`, and exits 0 only if everything passed.
-`CARGO_TARGET_DIR` is honoured (default `/tmp/denno-test-target`).
+
+- Exit: 0 all stages passed / 1 a stage failed / 2 usage or setup problem
+  (no `cargo` or no `python3` in `PATH`).
+- `CARGO_TARGET_DIR` is honoured and defaults to `/tmp/denno-test-target`, because
+  `target/debug` in a bind-mounted checkout can be owned by another user (EACCES).
+- `PYTHON=/path/to/python` selects the interpreter (default `python3`).
+- Stateless: no network, no server start/stop, no process inspection. Per-stage
+  logs go to `$CARGO_TARGET_DIR/run_cpu_checks_logs/<stage>.log`; on failure it
+  prints the last 40 lines of the failing stage.
+- `scripts/run_cpu_checks.sh --list` prints the stages without running anything.
+
+| Stage | Command |
+|---|---|
+| `kernel_invariants` | `cargo test -p denno-engine --test kernel_invariants` |
+| `engine_lib` | `cargo test -p denno-engine --lib` |
+| `server` | `cargo test -p denno-server` |
+| `cold_ab_selftest` | `python3 scripts/cold_ab.py --self-test` |
+| `cold_ab_tests` | `python3 scripts/test_cold_ab.py` |
+| `longconv_selftest` | `python3 scripts/long_conversation_check.py --self-test` |
+| `longconv_tests` | `python3 scripts/test_long_conversation_check.py` |
+| `needle_selftest` | `python3 scripts/needle_selftest.py` |
+| `needle_help` | `python3 scripts/needle_check.py --help` |
+
+This covers the CPU half of P4-1 and P4-4 and the P3-4 driver tests. It cannot
+cover the GPU half (a real 8095 run, the cold A/B measurement); those stay human
+steps.
 
 ## The long-conversation run (P4-1)
 
