@@ -54,13 +54,39 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 
 ### P1-3: d2h_state / sync reduction
 - Where: `cuda.rs` chains, `prof.rs` `d2h_state`.
-- Why: `d2h_state` measures 6,147 ms (38.9 % of the wall), the largest bucket. Children:
-  `gdn_pf_sync` 1,095 ms / 96 calls, `gdn_pf_alloc` 521 ms / 48, `d2h_attn_pf` 491 ms / 8,
-  `d2h_src_other` 491 ms / 8. Each sync serializes CPU and GPU.
-- Idea: count syncs per layer, then batch the remaining D2H into one transfer per block.
-- Estimated: 6.15 s bucket; realistic separable gain is the 1.6 s of transfer/alloc share,
-  not the 1.1 s sync wait (that is real GPU work, see P1-1). Risk: low-medium (transfer
-  only, bit-exact expected).
+- Status: **closed (2026-10-19) - no separable lever in the cold path** (s92 inventory, no
+  code change).
+- Why the bucket is big: `d2h_state` measures 6,147 ms (38.9 % of the wall), the largest
+  bucket. Children: `gdn_pf_sync` 1,095 ms / 96 calls, `gdn_pf_alloc` 521 ms / 48,
+  `d2h_attn_pf` 491 ms / 8, `d2h_src_other` 491 ms / 8. Each sync serializes CPU and GPU.
+- What the inventory found (s92):
+  - `gdn_pf_alloc` 521 ms is *not* per-call device allocation on this path. The cold
+    5,686-token request runs the chunked route (`n >= 2048`), which already reuses
+    `GdnScratch` across layers since s67 (`s.ensure(...)` + `copy_from` only; no
+    `DevBuffer::from_slice` in the per-layer region). What remains inside the bucket is the
+    zero-fill plus the H2D of activations, i.e. real transfer time, so recycling an
+    allocation cannot remove it.
+  - `gdn_pf_sync` 96 calls = chunked 3 passes x 24 GDN layers (72, genuine dependencies
+    pass1->pass2->pass3 and host reads) + the trailing `ctx.sync()` of
+    `gdn_scan_batch_oproj` x 24 (waiting for the asynchronous D2H of `out`).
+  - Batching the D2H per block is rejected: the prefill layer loop is strictly sequential
+    (`qwen35.rs:1208`) and a full layer's attention output is consumed immediately by that
+    layer's o_proj and the residual add, so accumulating several layers' outputs changes
+    the layer inputs and breaks bit-exactness.
+  - The single-token route (`n < 2048`, `gdn_scan_impl`) does build its 13 buffers per layer
+    with `from_slice`. That is a separate task; it does not ride the cold measurement.
+- Why the 1.6 s once looked separable: the s91 estimate treated `gdn_pf_alloc` as allocation
+  cost; the s92 code read disproved it.
+- Test counts corrected to what s92 actually ran (the older 250 / 37 could not be traced to
+  a command, so both figures are kept with their command instead of guessing):
+  - `CARGO_TARGET_DIR=/tmp/denno-target cargo test -p denno-engine` -> 242 passed / 0 failed /
+    18 ignored (default build, no `cuda` feature; the GPU tests are the ignored ones).
+  - `CARGO_TARGET_DIR=/tmp/denno-target cargo test -p denno-server` -> 77 passed / 0 failed /
+    0 ignored.
+  - `CARGO_TARGET_DIR=/tmp/denno-target cargo check -p denno-engine --features cuda --tests`
+    -> exit 0.
+- Remaining from P1-1: `GdnStateCache` (`cuda.rs:954`) has no wired-in call path as of s90.
+  Decide whether to use it or delete it (tracked under P3).
 
 ### P1-4: swiglu / elementwise fusion
 - Where: `dno_swiglu` + the residual/normalization passes.
