@@ -41,6 +41,12 @@ pub struct AppState {
     /// 既定 None (= 従来と完全に同一のサンプリング経路) なので、
     /// フラグを付けない起動では出力ビット不変 (アンカー不変)。
     pub default_repetition_penalty: Option<f32>,
+    /// s67b: temperature の上限。Some(c) のとき、実効 temperature を c 以下に
+    /// クランプする (リクエスト未指定なら sampler 既定の 1.0 を c で頭打ち)。
+    /// 既定 None = クランプ無し = 従来とビット同一。
+    /// 目的: thinking 有効時にクライアントが機械的に temperature=1 を送る実装
+    /// (Hermes 等) に対し、小型モデルの崩壊を運用側で防ぐ。
+    pub temperature_cap: Option<f32>,
 }
 
 /// serve 設定
@@ -66,6 +72,8 @@ pub struct ServeConfig {
     /// Qwen3.5-9B int8 は長い system + tools の greedy 経路で崩壊するため、
     /// 運用では 1.05 を指定する (実測: 崩壊解消・短答化)。
     pub repetition_penalty: Option<f32>,
+    /// s67b: temperature の上限 (None = クランプ無し)。運用では 0.7 程度を指定する。
+    pub temperature_cap: Option<f32>,
 }
 
 // ---------- Anthropic 形式エラー ----------
@@ -331,6 +339,16 @@ pub fn brief_system(system: Option<String>) -> Option<String> {
         Some(s) if !s.is_empty() => format!("{THINKING_BRIEF_INSTRUCTION}\n\n{s}"),
         _ => THINKING_BRIEF_INSTRUCTION.to_string(),
     })
+}
+
+/// s67b: 実効 temperature に serve 側の上限を適用する。
+/// `cap` が None なら要求値をそのまま返す (従来と完全に同一)。
+/// `cap` が Some(c) のときは、未指定 (sampler 既定 1.0) も含めて c で頭打ちにする。
+fn apply_temperature_cap(requested: Option<f32>, cap: Option<f32>) -> Option<f32> {
+    match cap {
+        None => requested,
+        Some(c) => Some(requested.unwrap_or(1.0).min(c)),
+    }
 }
 
 /// s56 (T2): 反復抑止の追加パラメータを検証して正規化する。
@@ -776,6 +794,13 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
         }
         tracing::info!("serve default repetition_penalty = {p}");
     }
+    // s67b: temperature 上限の妥当性検査 (負/非有限は起動時に拒否)。
+    if let Some(c) = cfg.temperature_cap {
+        if !c.is_finite() || c < 0.0 {
+            anyhow::bail!("--temperature-cap must be a finite non-negative number (got {c})");
+        }
+        tracing::info!("serve temperature cap = {c}");
+    }
     tracing::info!(
         "model loaded: {} (context = {}, engine = denno)",
         engine.name,
@@ -792,6 +817,7 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
         model_name,
         model_id,
         default_repetition_penalty: cfg.repetition_penalty,
+        temperature_cap: cfg.temperature_cap,
     });
 
     // P13: テレメトリが有効ならハブ → broadcast への転送タスクを起動する。
@@ -942,7 +968,7 @@ async fn messages(
     let anti = parse_anti_repetition(&req)?;
     let params = GenParams {
         max_tokens: resolve_max_tokens(req.max_tokens, req.max_completion_tokens),
-        temperature: req.temperature,
+        temperature: apply_temperature_cap(req.temperature, state.temperature_cap),
         top_p: req.top_p,
         top_k: req.top_k,
         stop_sequences: req.stop_sequences.clone(),
@@ -1707,5 +1733,37 @@ mod anti_repetition_tests {
             no_repeat_ngram_size: a0.no_repeat_ngram_size,
         };
         assert!(ar0.is_noop());
+    }
+}
+
+#[cfg(test)]
+mod temperature_cap_tests {
+    use super::apply_temperature_cap;
+
+    #[test]
+    fn no_cap_is_passthrough() {
+        // フラグ未指定なら従来と完全に同一 (None は None のまま = sampler 既定)
+        assert_eq!(apply_temperature_cap(None, None), None);
+        assert_eq!(apply_temperature_cap(Some(1.0), None), Some(1.0));
+        assert_eq!(apply_temperature_cap(Some(0.3), None), Some(0.3));
+    }
+
+    #[test]
+    fn cap_clamps_requested_temperature() {
+        assert_eq!(apply_temperature_cap(Some(1.0), Some(0.7)), Some(0.7));
+        assert_eq!(apply_temperature_cap(Some(0.9), Some(0.7)), Some(0.7));
+        assert_eq!(apply_temperature_cap(Some(0.3), Some(0.7)), Some(0.3));
+    }
+
+    #[test]
+    fn cap_applies_to_default_when_omitted() {
+        // sampler の既定は 1.0 なので、リクエスト未指定でも cap で頭打ちにする
+        assert_eq!(apply_temperature_cap(None, Some(0.7)), Some(0.7));
+        assert_eq!(apply_temperature_cap(None, Some(0.0)), Some(0.0));
+    }
+
+    #[test]
+    fn cap_above_request_does_not_raise_it() {
+        assert_eq!(apply_temperature_cap(Some(0.2), Some(2.0)), Some(0.2));
     }
 }

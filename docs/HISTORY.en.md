@@ -1500,6 +1500,23 @@ dominant → redefine the T5b main lever.
 
 **Where we stand** (one prefill request): gate_up 7.38 s / qkv 4.09 s / down 2.73 s / gdn_scan 2.59 s (sync 1.09 + d2h 0.97 + alloc 0.53) / o_proj 1.49 s / attn_full 1.22 s / gdn_proj 1.07 s / swiglu 0.85 s. The largest remaining item is **the gate_up GEMM itself** (64 calls × 114 ms, ≈75 ms of GPU work = 13 TFLOP/s, 11.6% of peak). int8 accumulation is int32 and therefore order-independent, so re-tiling should not change the numbers.
 
+### serve gains a temperature cap (`--temperature-cap`) ✅ (2026-10-19, s67b)
+
+> Triage of the 9B collapsing after 2–3 turns. The real sessions left in the Hermes history (`state.db`) showed Chinese leaking in at turn 2 (`私ができること等相关的介绍如下`), `何かお手allon acar` at turn 5, and in another session `dotyczących niekompletności` / `เกี่ยวกับไม่สมบูรณ์` — multilingual garbage.
+
+**The prefix cache is innocent**: outputs are byte-identical with the cache on and off over 5- and 10-turn conversations, two conversations sharing a prefix and interleaved never contaminate each other (`reuse 1007/1049`, restored from the other session's entry), and streaming matches non-streaming. The GDN state is restored only at prompt boundaries and the path falls back to a full prefill otherwise, so there is no boundary-mismatch route.
+
+**The cause is sampling**: the real session's `model_config` is `reasoning_config: {enabled: true}`, and Hermes' Anthropic adapter always attaches `temperature: 1` when thinking is enabled ("required when thinking is enabled" in `agent/anthropic_adapter.py`). denno maps `thinking: {"type":"enabled"}` to **off** per the s52 spec, so **thinking is disabled while T=1 remains**. Replaying the session's system prompt (11,949 chars) with 26 tools (7.6k tok total) reproduced the same collapse at T=1.0 (`…スケジュール bi`, `프로그래밍`, `Web 欢迎大家阅读`) on turns 2–3, while T=0.7 was clean for all four turns and T=0.0 was clean as well.
+
+**Fix**: new `denno serve --temperature-cap <f32>`. When set, the effective temperature is clamped to `min(requested, c)`, and a request that omits temperature also has the sampler default of 1.0 capped at c. When unset, the requested value passes through unchanged, so behaviour is **bit-identical to before** (anchors unchanged).
+
+- Validation: negative or non-finite values are rejected at startup (same convention as `--repetition-penalty`)
+- Four unit tests added (pass-through, clamping, application when omitted, cap never raising the request)
+
+**Verification**: started with `--repetition-penalty 1.05 --temperature-cap 0.7`, re-sent the 7.6k prompt that asks for T=1.0 → no collapse, same answer as explicitly requesting T=0.7. A startup without the flag keeps all three GPU anchors MATCH (1b/2b/full 1b). `cargo test -p denno-server --lib` = 37 passed.
+
+**Still open**: the Hermes-side patch (do not attach `temperature: 1` for non-Anthropic endpoints) — the proper fix — is not done. Since a client update could revert it, the server-side cap went in first.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
