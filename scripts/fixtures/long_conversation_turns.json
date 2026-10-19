@@ -1,0 +1,56 @@
+{
+  "notes": "Fixed prompts for the P4-1 10-turn conversation check. These are hand-written prompts, NOT measurements. Each turn is one Japanese sentence and each later turn depends on an earlier one (the plan is revised), so the conversation has to grow for later answers to make sense. Do not reorder or renumber: scripts/test_long_conversation_check.py asserts the exact count and order, and a changed fixture makes past transcripts incomparable. Edit only additively (append turns) and record why in docs/TASKS.md.",
+  "version": 1,
+  "turns": [
+    {
+      "index": 1,
+      "role": "user",
+      "text": "来月の三連休に一泊二日で鎌倉へ行きたいので、混雑を避けられる回り方を考えてください。"
+    },
+    {
+      "index": 2,
+      "role": "user",
+      "text": "その回り方で、初日の午前中に必ず入れてほしい場所をひとつ挙げてください。"
+    },
+    {
+      "index": 3,
+      "role": "user",
+      "text": "さっき挙げた場所は土曜だと何時ごろが空いていますか。"
+    },
+    {
+      "index": 4,
+      "role": "user",
+      "text": "その時間に合わせて、初日の昼食の場所を駅から歩ける範囲で提案してください。"
+    },
+    {
+      "index": 5,
+      "role": "user",
+      "text": "午後は雨が降る予報なので、屋内で過ごせる案に差し替えてください。"
+    },
+    {
+      "index": 6,
+      "role": "user",
+      "text": "二日目は朝早く出発して、前日に回れなかった場所を先に片付けたいです。"
+    },
+    {
+      "index": 7,
+      "role": "user",
+      "text": "二日目の帰りの電車は何時発にすると余裕がありますか。"
+    },
+    {
+      "index": 8,
+      "role": "user",
+      "text": "ここまでの予定を、時刻と移動手段が分かる表にまとめてください。"
+    },
+    {
+      "index": 9,
+      "role": "user",
+      "text": "その表のうち、初日の昼食だけ別の候補に変えて、表全体を作り直してください。"
+    },
+    {
+      "index": 10,
+      "role": "user",
+      "text": "最後に、この二日間で一番時間に余裕がない区間を挙げて、その対処を一文で書いてください。"
+    }
+  ]
+}
