@@ -153,6 +153,25 @@ impl Linear {
         }
     }
 
+    /// s58 (T5a): `apply_bt_rows` の GPU opt-in 版 (`DENNO_GPU_PREFILL_GEMM`)。
+    /// ゲート未指定 (既定) は `cuda::maybe_gpu_prefill_linear` が即 None を返すので
+    /// **`apply_bt_rows` と完全に同一の結果・同一の CPU 計算**になる (追加コストは
+    /// env ゲートの bool 判定 1 回のみ)。ゲート on で GPU GEMM が走った場合は
+    /// CPU カーネルとビット一致 (dno_gemm_i8 の i32 累積は順序不変)。
+    /// F32 層は GPU 経路を持たない (Q8 のみ)。
+    pub fn apply_bt_rows_maybe_gpu(&self, a: &[f32], m: usize) -> Vec<f32> {
+        match self {
+            Linear::Q8(q) => {
+                #[cfg(feature = "cuda")]
+                if let Some(out) = crate::cuda::maybe_gpu_prefill_linear(q, a, m) {
+                    return out;
+                }
+                crate::tensor::matmul_bt_i8(a, &q.w, &q.scale, m, q.k, q.n)
+            }
+            _ => self.apply_bt_rows(a, m),
+        }
+    }
+
     /// w: [k,n] row-major (GPT-2 Conv1D 形式) から構築。
     /// Int8 の場合は転置して [n,k] 形で量子化する (fp32 は既存カーネルを
     /// 使えるよう元の形状のまま保持)。
@@ -521,5 +540,36 @@ mod tests {
         let q8_lin = Linear::new(pseudo_random(k * n, 21), k, n, QuantMode::Int8);
         assert_eq!(f32_lin.weight_bytes(), k * n * 4);
         assert!(q8_lin.weight_bytes() < k * n * 4 / 4 + n * 4 + 16);
+    }
+
+    /// s58 (T5a): prefill の opt-in 経路 (`apply_bt_rows_maybe_gpu` =
+    /// `DENNO_GPU_PREFILL_GEMM`) は**ゲート未指定 (既定) で `apply_bt_rows` と
+    /// ビット一致**しなければならない。既定 off の契約 = 現行と同一出力。
+    /// (GPU 実機が無くても検証できる: 既定では cuda 経路に一切入らない。)
+    #[test]
+    fn prefill_maybe_gpu_path_is_bit_identical_when_gate_off() {
+        // ゲートは OnceLock でプロセス内 1 回だけ読むので、このテストは
+        // 未指定 (= false) の状態で走ること前提 (env を汚すテストを足さない)。
+        assert!(
+            std::env::var("DENNO_GPU_PREFILL_GEMM").is_err(),
+            "このテストは DENNO_GPU_PREFILL_GEMM 未指定で実行すること"
+        );
+        let (k, n, m) = (64usize, 48usize, 300usize); // m > max_m・m >= gemm_min_m 相当
+        let a = pseudo_random(m * k, 31);
+        for mode in [QuantMode::Int8, QuantMode::Fp32] {
+            let lin = Linear::new(pseudo_random(k * n, 32), k, n, mode);
+            let base = lin.apply_bt_rows(&a, m);
+            let opt = lin.apply_bt_rows_maybe_gpu(&a, m);
+            assert_eq!(base.len(), opt.len());
+            for (i, (x, y)) in base.iter().zip(opt.iter()).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "{mode:?} m={m} idx={i}: {} != {}",
+                    x,
+                    y
+                );
+            }
+        }
     }
 }
