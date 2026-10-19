@@ -6081,7 +6081,12 @@ mod tests {
     fn gemm_pad_preserves_dot_and_tiling_is_exact() {
         // 1) パディングは実列を保存し、余りは 0
         for &(k, n) in &[(4usize, 100usize), (37, 200), (1536, 17920), (30, 256), (1, 1)] {
-            let qw: Vec<i8> = (0..k * n).map(|i| ((i * 37) % 251) as i32 as i8 - 125).collect();
+            // s76: 剰余を i32 のまま取り出してから i8 へ落とす。s74 の
+            // `((i*37) % 251) as i32 as i8` は剰余 (≤ 250) に先に `as i8`
+            // (≤ 127 で折り返し) を当ててから -125 するため、debug では i8 の
+            // 減算オーバーフロー、release では異なる値になる (テストの決定性が
+            // ビルドプロファイル依存だった)。値のレンジは従来と同じ。
+            let qw: Vec<i8> = (0..k * n).map(|i| (((i * 37) % 251) as i32 - 125) as i8).collect();
             let padded = gemm_pad_apply(&qw, k, n);
             assert_eq!(padded.len(), k * gemm_pad_n(n), "k={k} n={n}");
             assert_eq!(gemm_pad_n(n) % 256, 0);
@@ -6097,7 +6102,7 @@ mod tests {
                 assert!(padded[r * k..(r + 1) * k].iter().all(|&v| v == 0), "pad 行が 0 でない");
             }
             // パディング行の寄与は 0 (dot が不変)
-            let aq: Vec<i8> = (0..k).map(|i| ((i * 11) % 251) as i32 as i8 - 120).collect();
+            let aq: Vec<i8> = (0..k).map(|i| (((i * 11) % 251) as i32 - 120) as i8).collect();
             let dot = |w: &[i8], row: usize| -> i32 {
                 (0..k).map(|d| aq[d] as i32 * w[row * k + d] as i32).sum()
             };
@@ -6122,8 +6127,8 @@ mod tests {
         //    34B の行 (例 k=37) では GEMM_TK の切り上げで k の先にゴミが入るが、
         //    外側ループが `kb < k` で止まるため寄与しない (カーネルと同じ挙動)。
         for &(k, n, m) in &[(37usize, 200usize, 65usize), (30, 197, 65), (1533, 300, 3)] {
-            let qw: Vec<i8> = (0..k * n).map(|i| ((i * 29) % 241) as i32 as i8 - 120).collect();
-            let aq: Vec<i8> = (0..m * k).map(|i| ((i * 17) % 239) as i32 as i8 - 119).collect();
+            let qw: Vec<i8> = (0..k * n).map(|i| (((i * 29) % 241) as i32 - 120) as i8).collect();
+            let aq: Vec<i8> = (0..m * k).map(|i| (((i * 17) % 239) as i32 - 119) as i8).collect();
             let mut padded = gemm_pad_apply(&qw, k, n).into_owned();
             // 行の直後 (k の先) に「本当は範囲外」ダミーを置いておく
             let row_stride = k * gemm_pad_n(n);
@@ -7839,6 +7844,26 @@ mod tests {
         let mut other = other;
         assert_eq!(chain_q35_gdn_flush_pending(&mut other), Some(()));
     }
+
+    /// s76 (T7): 長 prefill の GDN スキャンが「固定 16 分割」から
+    /// 「head 並列度ベースの分割」に切り替わったことを、GPU 無しで固定する。
+    ///
+    /// - 9B (nv=32, sm_75 相当 92 slots) で s76 以前 (6 分割) より粗くならない
+    /// - 従来の `chunk_plan(n, 2048, 1024, 16)` とは値が変わり得る (固定 16 の
+    ///   頭打ちを外した) ことを明示
+    /// - 公開入口 `gdn_chunked_plan_for_tests` が内部値と一致すること
+    #[test]
+    fn gdn_chunked_plan_uses_head_parallelism() {
+        // 5,866 token (PF_BENCH 相当)・9B (nv=32)・sm_75 相当
+        let (nc, cl) = gdn_chunked_plan_for_tests(5_866, 32);
+        assert_eq!((nc, cl), (3, 1956), "s76 の 9B / 5866 token の分割");
+        // s76 以前の固定計画: chunk_plan(n, 2048, 1024, 16) = (6, 978)
+        let legacy = crate::gdn::chunk_plan(5_866, GDN_CHUNK_MIN_TOKENS, 1_024, 16);
+        assert_eq!(legacy, (6, 978));
+        assert_ne!((nc, cl), legacy, "分割が従来と変わっていない");
+        // 分割の全長が n を覆う (最終 chunk 非空) — カーネルの前提
+        assert!(nc * cl >= 5_866 && (nc - 1) * cl < 5_866);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8036,8 +8061,41 @@ fn gdn_scan_impl(
 // ---------------------------------------------------------------------------
 
 /// chunked ルーティングの閾値 (n がこれ以上で 3-pass chunked カーネルを使用)。
-/// chunk 分割は [`crate::gdn::chunk_plan`](n, この閾値, 1024, 16) を CPU 参照と共有。
+/// chunk 分割は [`crate::gdn::chunk_plan_heads`](n, nv, `GDN_RESIDENT_SLOTS`) を
+/// CPU 参照と共有 (s76/T7: 固定 16 分割から head 並列度ベースへ)。
 pub(crate) const GDN_CHUNK_MIN_TOKENS: usize = 2048;
+
+/// s76 (T7): chunked スキャンの同時常駐ブロック数の見積り (SMs × 1 SM あたり)。
+///
+/// 3 カーネルはいずれも `float` の列配列 `Scol[256]` (+ pass 1 は `Wcol`/`Mcol`)
+/// をローカルメモリに持つ。sm_75 は 64 KiB/SM なので、このサイズのブロックは
+/// 1 SM に 2 個しか常駐できない。Turing 系 (46 SM) で 92、Ampere (108 SM) で 216。
+/// 実行時刻の計測はしない (n と GPU 形状だけで決まる値 — 決定論に影響しない)。
+/// `DENNO_GDN_CHUNK_SLOTS` で上書き可 (0 = 従来の 16 分割固定に戻す)。
+pub(crate) const GDN_RESIDENT_SLOTS_TURING: usize = 92;
+
+/// s76 (T7): chunk 計画に使う常駐ブロック数 (env で上書き可・プロセス内で固定)。
+fn gdn_resident_slots() -> usize {
+    static SLOTS: OnceLock<usize> = OnceLock::new();
+    *SLOTS.get_or_init(|| {
+        std::env::var("DENNO_GDN_CHUNK_SLOTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(GDN_RESIDENT_SLOTS_TURING)
+    })
+}
+
+/// s76 (T7): GDN 長 prefill の chunk 計画 (n, nv, slots) を返す — 計測時に
+/// 「どの分割が走るか」をサーバを止めずに確かめるための入口 (純関数・GPU 不要)。
+pub fn gdn_chunked_plan_for_tests(n: usize, nv: usize) -> (usize, usize) {
+    gdn_chunk_plan_for(n, nv)
+}
+
+/// s76 (T7): この呼び出しで使う chunk 計画 (n, nv, slots) を返す。計測の
+/// 1 行表示 (`DENNO_GDN_CHUNK_LOG=1`) とカーネル起動の単一の真実源にする。
+fn gdn_chunk_plan_for(n: usize, nv: usize) -> (usize, usize) {
+    crate::gdn::chunk_plan_heads(n, nv, gdn_resident_slots())
+}
 
 /// s72: GDN スキャンの y をデバイス上に残したまま out_proj までチェーンで実行し、
 /// 結果だけを host へ落とす。従来は y (n×vd) を D2H し、次の out_proj で再び H2D
@@ -8164,7 +8222,17 @@ fn gdn_scan_chunked_impl(
     debug_assert_eq!(dk, dv, "chunked scan は dk == dv 前提");
     debug_assert_eq!(d_conv, 4, "chunked scan は d_conv == 4 前提");
 
-    let (n_chunks, chunk_len) = crate::gdn::chunk_plan(n, GDN_CHUNK_MIN_TOKENS, 1024, 16);
+    // s76 (T7): chunk 数は「head 並列度 × SM 常駐ブロック数」から逆算する
+    // (従来は chunk_plan(n, 2048, 1024, 16) 固定 = 16 分割で頭打ちだった)。
+    let (n_chunks, chunk_len) = gdn_chunk_plan_for(n, nv);
+    // 観測のみ (`DENNO_GDN_CHUNK_LOG=1`): どの分割が走ったかをログ 1 行で残す。
+    // 値はプロファイル / 監視ログにだけ出て、演算には一切関与しない。
+    if std::env::var("DENNO_GDN_CHUNK_LOG").ok().as_deref() == Some("1") {
+        tracing::info!(
+            "gdn chunked scan: n={n} nv={nv} slots={} chunks={n_chunks} chunk_len={chunk_len}",
+            gdn_resident_slots()
+        );
+    }
 
     ctx.make_current()?;
     // s64 (T5b L1 Step 1 計測): `gdn_scan_impl` と同一の 4 区間細分 (表示専用)。

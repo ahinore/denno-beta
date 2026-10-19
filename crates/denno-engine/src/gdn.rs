@@ -503,6 +503,56 @@ pub fn chunk_plan(
     (nc, c)
 }
 
+// ---------------------------------------------------------------------------
+// s76 (T7): 長 prefill の chunk 計画 — head 並列度で chunk 数を決める
+// ---------------------------------------------------------------------------
+//
+// s76 以前の GPU 経路は `chunk_plan(n, 2048, 1024, 16)` 固定で、chunk 数が
+// 16 に張り付いていた。chunked 3 パスの並列度はブロック数で決まる:
+//   pass 1 / pass 3: n_chunks × n_v_heads ブロック (9B は 16 × 32 = 512)
+//   pass 2:          n_v_heads ブロック (32) — ここが直列区間
+// sm_75 は 46 基の SM を持ち、1 ブロックが大サイズのローカルメモリ
+// (S/W/M 列 = 各 1 KiB) を抱えるため 1 SM あたり 2 ブロックしか常駐できない。
+// 516 ブロックでは 12 波になり、波の端数と pass 2 の細さで並列度を使い切れない。
+// そこで **chunk 数 (= n_chunks) を「SM の常駐ブロック容量」から逆算する**:
+//
+//   target = ceil(slots / n_v_heads)  (slots = SMs × blocks/SM)
+//
+// ただし chunk を細かくすると chunk 境界の丸め差が増えるので上限を設ける:
+//   - 1 chunk のトークン数 >= MIN_CHUNK_TOKENS (短い chunk は 1 トークンあたり
+//     の固定費 = sinit のロード/ストアが相対的に重くなる)
+//   - 分割数が `n / MIN_CHUNK_TOKENS` を超えない
+//   - 従来の上限 MAX_CHUNK_SPLITS (16) は超えない
+// どの分割を選んでも数学は同一 (丸め順のみ異なる) ため、決定論はカーネルの
+// launch 構成固定だけで保たれる。
+//
+// CPU 参照 (`scan_chunked_core`) はこの関数の出力をそのまま受け取るだけで、
+// chunk の選び方に依存しない (テスト gdn_chunked_split_invariance)。
+
+/// 1 chunk の最小トークン数 (これ未満には分割しない)。
+pub const GDN_MIN_CHUNK_TOKENS: usize = 1024;
+/// chunk 数の上限 (s76 以前の固定値 — 退行側の安全弁)。
+pub const GDN_MAX_CHUNK_SPLITS: usize = 16;
+
+/// 長 prefill の chunk 計画 (決定的・n と GPU 形状だけの関数)。
+///
+/// `slots` = 同時に常駐できるブロック数の見積り (SMs × 1 SM あたりの常駐数)。
+/// `nv` = v-head 数 (1 chunk あたりの head 並列度)。`slots` が小さい/未知なら
+/// 従来と同値 (最大 16 分割) になる。
+pub fn chunk_plan_heads(n: usize, nv: usize, slots: usize) -> (usize, usize) {
+    if n == 0 {
+        return (1, 0);
+    }
+    let nv = nv.max(1);
+    // 1 chunk の最小長から決まる分割数の上限 (n が小さいときは分割しない)
+    let cap_by_len = (n / GDN_MIN_CHUNK_TOKENS.max(1)).max(1);
+    // head 並列度から決まる目標 chunk 数 (pass 1/3 のブロックを slots に収める)
+    let target = slots.div_ceil(nv).max(1);
+    let nc = target.min(cap_by_len).min(GDN_MAX_CHUNK_SPLITS).max(1);
+    let c = n.div_ceil(nc);
+    (nc, c)
+}
+
 /// conv 入力 (時刻 τ = t − cs + back) の値。τ < 0 は初期 conv 状態
 /// (conv_st[ch*cs + (τ+cs)])、τ >= 0 は qkv のグローバル行。chunk 境界をまたぐ
 /// ウィンドウ (最大 cs トークン分) を chunk 内だけで再構築できるため、
@@ -1250,6 +1300,48 @@ mod tests {
         // 全 chunk 非空 (最終 chunk に端数)
         let (nc, c) = chunk_plan(10, 0, 4, 8);
         assert_eq!((nc, c), (3, 4)); // [0,4) [4,8) [8,10)
+    }
+
+    /// s76 (T7): GPU 用 chunk 計画 (head 並列度から chunk 数を逆算)。
+    /// 決定性・全 chunk 非空・上限の 3 点を境界で固定する。
+    #[test]
+    fn gdn_chunk_plan_heads_boundaries() {
+        // n = 0 は従来同様 (1, 0)
+        assert_eq!(chunk_plan_heads(0, 32, 92), (1, 0));
+        // slots = 0 は「chunk を増やさない」= 1 chunk (target = 0 → 1 に丸める)
+        assert_eq!(chunk_plan_heads(5866, 32, 0), (1, 5866));
+        // nv = 0 でも panic しない (nv は 1 に丸める) → target = cap_by_len = 4
+        assert_eq!(chunk_plan_heads(4096, 0, 92), (4, 1024));
+        // s76 以前の固定計画 (n=5866, 1024/16) の値
+        let legacy = chunk_plan(5866, 2048, 1024, 16);
+        assert_eq!(legacy, (6, 978));
+        // sm_75 (46 SM × 2 ブロック = 92 slots)・9B (nv=32) → target = ceil(92/32) = 3
+        // cap_by_len = 5866 / 1024 = 5 → 3 分割・chunk_len = ceil(5866/3) = 1956
+        assert_eq!(chunk_plan_heads(5866, 32, 92), (3, 1956));
+        // slots を増やすと cap (n / MIN_CHUNK_TOKENS = 5) まで分割が増える
+        assert_eq!(chunk_plan_heads(5866, 32, 100_000), (5, 1174));
+        // nv=16 (0.8B) なら target = ceil(92/16) = 6 → cap の 5 で頭打ち
+        assert_eq!(chunk_plan_heads(5866, 16, 92), (5, 1174));
+        // Ampere 級 (216 slots) でも nv=32 なら 7 → cap の 5
+        assert_eq!(chunk_plan_heads(5866, 32, 216), (5, 1174));
+        assert_eq!(chunk_plan_heads(100_000, 32, 100_000), (16, 6250));
+        // 1 chunk が MIN_CHUNK_TOKENS 未満になる分割はしない
+        assert_eq!(chunk_plan_heads(1023, 4, 92), (1, 1023));
+        assert_eq!(chunk_plan_heads(2048, 4, 92), (2, 1024));
+        // 全 chunk 非空: ceil 分割の最終 chunk が空にならない
+        for &n in &[1usize, 7, 1024, 1025, 2049, 5866, 65_536] {
+            for &nv in &[1usize, 16, 32, 48] {
+                for &slots in &[0usize, 1, 46, 92, 1000] {
+                    let (nc, cl) = chunk_plan_heads(n, nv, slots);
+                    assert!(nc >= 1 && cl >= 1, "n={n} nv={nv} slots={slots}");
+                    assert!((nc - 1) * cl < n, "最終 chunk が空: n={n} nc={nc} cl={cl}");
+                    assert!(nc * cl >= n, "chunk が n を覆わない: n={n} nc={nc} cl={cl}");
+                    assert!(nc <= GDN_MAX_CHUNK_SPLITS);
+                    // 決定性: 同じ入力なら同じ計画
+                    assert_eq!((nc, cl), chunk_plan_heads(n, nv, slots));
+                }
+            }
+        }
     }
 
     /// 単一 chunk (n_chunks == 1) は逐次 AR と bit 一致
