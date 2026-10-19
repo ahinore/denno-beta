@@ -6,8 +6,9 @@ Anthropic Messages API 互換。対応フィールド:
 
 | フィールド | 対応 |
 | --- | --- |
-| `model` (必須) | serve 時の `--name` と一致が必要(不一致は 404 not_found_error) |
-| `max_tokens` (任意) | 生成上限。未指定時 1024 / 明示時は上限 4096 で clamp (s53)。prompt+max_tokens が context 超過なら 400 |
+| `model` (必須) | serve 時の `--name` と一致が必要(不一致は 404 not_found_error)。`--name` 未指定時はモデルの repo 名 (例 `Qwen/Qwen2.5-0.5B-Instruct`) が既定値 |
+| `max_tokens` (任意) | 生成上限。未指定時 1024 (s53) / 明示時は上限 4096 で clamp (s53)。`0` は「prefill のみ」として 0 のまま尊重。prompt+max_tokens が context 超過なら 400 |
+| `max_completion_tokens` | s39: OpenAI chat completions 互換の別名。`max_tokens` 未指定時のみ使う (両方指定時は `max_tokens` 優先)。clamp・既定は同上 |
 | `messages` (必須) | role は user/assistant。content は文字列 or `[{type:"text",...}]` |
 | `system` | 文字列 or textブロック配列 |
 | `temperature` | 0 で greedy |
@@ -20,8 +21,8 @@ Anthropic Messages API 互換。対応フィールド:
 | `stream` | true で SSE |
 | `tools` | tool use 対応 (下記 §tool use)。空配列は tools 無しと同一 |
 | `tool_choice` | `"auto"` / `"none"` / `"any"` / `{"type":"tool","name":"..."}`。既定 auto。tools 無しでの指定は 400 |
-| `thinking` | s47/s52/s53c: `"off"` / `"brief"` / `"full"` の文字列、または Anthropic マップ `{"type":"enabled",...}`(= off 扱い・`budget_tokens` は無視)/ `{"type":"disabled"}`(= off 扱い)。既定 brief (= off + 簡潔指示)。未知の type や文字列/マップ以外は 400 (下記 §thinking 制御) |
-| `metadata` 他 | 受け流す(パースのみ) |
+| `thinking` | s47/s52/s53c: `"off"` / `"brief"` / `"full"` の文字列、または Anthropic マップ `{"type":"enabled",...}` / `{"type":"disabled"}`。**どちらのマップも `off` 扱い** (s53c: 思考無効化のみ。`brief` の簡潔指示は注入されない)。`budget_tokens` 等の他フィールドは無視 (決定的)。**未指定 = `brief`**。未知の type や文字列/マップ以外は 400 (下記 §thinking 制御) |
+| `metadata` 他 | 受け流す(パースのみ)。未知のフィールドは**拒否しない** (serde 既定 = 未知フィールド無視) |
 
 レスポンス例(非ストリーミング):
 
@@ -116,12 +117,21 @@ denno 拡張のトップレベル任意フィールド (s47・未指定 = `brief
     短答誘導文 (`回答は簡潔に、数文でまとめてください。`) を注入する。既存 system は保持。
     s53c の実測: 思考 ON + 誘導文では 9B が短い system で "Thinking Process:" の
     メタ分析を延々と書き回答に到達しなかったため、思考自体を止める方式に変更した。
-  - `full`: 従来経路のまま (注入なし・prompt はビット同一・アンカー不変)
+  - `full`: 従来経路のまま (`enable_thinking` 変数を渡さない = 現行テンプレートでは思考 ON。
+    注入なし・prompt はビット同一・アンカー不変)
 - Anthropic マップ形式 (s52・Hermes 互換):
-  - `{"type":"enabled", ...}` は **`off` 扱い** (思考無効 + 簡潔指示)。`budget_tokens` 等の他フィールドは無視 (決定的)
-  - `{"type":"disabled"}` は `off` 扱い
+  - `{"type":"enabled", ...}` も `{"type":"disabled"}` も **`off` 扱い** (s53c 以降。
+    s52 では enabled は `brief` 扱いだった。思考無効化のみで簡潔指示は注入しない)
+  - `budget_tokens` 等の他フィールドは無視 (決定的)
   - 未知の `type` (欠落・非文字列含む) は 400 invalid_request_error
 - 文字列 / オブジェクト以外 (数値・真偽値・配列等) も 400
+
+**サーバー側の安全弁** (どちらも未指定なら従来とビット完全一致):
+`denno serve --repetition-penalty <f32>` (§serve 既定値) と
+`denno serve --temperature-cap <f32>` (実効 temperature を `min(要求値, cap)` に頭打ち。
+`temperature` 未指定時は sampler 既定の `1.0` をクランプ)。負値・非有限値は起動時に拒否する。
+`--temperature-cap 0.7` は「thinking 有効扱いのクライアントが `temperature: 1` を機械的に送る」
+ケース (Thinking マップ = off 扱いなのに T=1 だけが残る) への対策として推奨。
 
 不正値の 400 は `tool_choice` と同一のバリデーション慣習 (エラー形式は §エラー形式)。
 
@@ -210,9 +220,19 @@ tools + stream の場合、生成中の `<tool_call>` block は block 単位で�
 | invalid_request_error | 400 |
 | authentication_error | 401 |
 | not_found_error | 404 |
+| overloaded_error | 503 (s 番号なし: P4 の `--max-queue` 上限超過時) |
 | api_error | 500 |
 
-認証: `--api-key` 指定時は `x-api-key` ヘッダ(または `Authorization: Bearer`)が必要。
+- リクエスト本文が JSON として不正 / 必須フィールド欠落 (serde エラー) は 400 invalid_request_error
+  (`invalid request body: ...`)。**未知のフィールドはエラーにしない** (無視する)
+- 生成開始後に engine 側で判明したリクエスト不正 (prompt + max_tokens が context / KV スロット上限を
+  超える等) は、メッセージに `invalid_request_error:` を含む場合のみ 400 に写像し、
+  それ以外の実行時失敗は 500 api_error になる (`crates/denno-server/src/lib.rs` の `messages` ハンドラ)
+- キュー溢れ (実行中 1 件に加えて `--max-queue` 件が待ち行列にいる) は 503 overloaded_error
+  (Anthropic の `overloaded_error` と同じ type 名・`server busy: request queue is full ...`)。
+  上表 5 種が s101 時点でコードに存在する全 type
+
+認証: `--api-key` 指定時は `x-api-key` ヘッダ(または `Authorization: Bearer ...`)を検証する。
 `anthropic-version` ヘッダは検証せず受け流す。
 
 ## その他
