@@ -1420,6 +1420,44 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 **次の一手**: 最大項目は **`d2h_state` 10.6 s (168 call・prefill 中に層ごとに GDN 状態を D2H)**。T5b の本命 L1 (`GdnDev` 常駐化) がそのまま効く。次いで `gdn_proj` 5.4 s (n=32 の F32 投影) と `gate_up_proj` 7.2 s (GPU 実働 75 ms + コピー)。
 
+### GDN スキャン 1 call の内訳計測 — `gdn_pf_alloc` / `launch` / `sync` / `d2h` (s64 / T5b L1 第 1 段) ✅ (2026-10-19)
+
+> s63 の後、prefill の残り最大項目は `d2h_state` 10,604 ms / 168 call (28%)。ただし `gdn_scan` 1 call の中に
+> 「バッファ確保 (`cuMemAlloc`) + 入力 H2D → カーネル launch → `cuCtxSynchronize` → D2H + ホスト反映」が
+> 混在しており、どこが重いかは**推測するしかない**状態だった。T5b の次段を当て推量で書かないため、
+> まず内訳を取る計測器だけを入れた (数値経路・既定動作は不変)。
+
+**実装**
+
+- `cuda.rs::gdn_scan_impl` (n < 2048 経路・decode n==1 もここ) と `gdn_scan_chunked_impl` (n ≥ 2048 の
+  3-pass) の内部を 4 区間に分割。区間の経過は次の区間の入口で読むため、細分の合計 ≒ 外側の `gdn_scan`。
+- 新しい `prof::Seq` (`begin` / `lap` / `end`)。**PROFILE 無効時は `Instant::now()` すら呼ばない**素透し。
+- 積む先は専用の `GDN_PF_NS/CALLS` テーブルと `gdn_pf_*` id (10*D2H+9..12) のみ。**既存の生 id・
+  `d2h_state` / `attn_gdn` / `gdn_scan` バケット・D2H 細分 0..8 には一切足さない** (二重計上しない)。
+- 表示は `gdn_scan` 行の直下に 6 段インデントでネスト。合計・share の分母には入らない。
+
+**検証**
+
+- `cargo test --workspace`: 304 passed / 0 failed / 13 ignored。
+- CPU で 1 リクエスト (v6_2b, int8, in=302) を回し、GPU 専用バケット (`attn_gdn` / `gdn_scan` /
+  `d2h_state`) が 0 ms / 0 call、`gdn_pf_*` 行が非出力であることを確認 — 計測器が no-op を正しく保つ。
+  同時に CPU 経路の PROFILE (gate_up / down / qkv / attn_full) が s63 と同一であることも確認。
+- **未了**: 63 ms/call の実測は開発コンテナが GPU 非搭載のため取得できていない (GPU 実機での取得が次段の前提)。
+
+**コードから確定した事実 (実測前でも言えること)**
+
+1. `gdn_scan_batch` の引数に重みのデバイスバッファが無く、`wconv / wa / wdt / wnorm` の 4 本を
+   **呼び出しごとに H2D し直している** (26 層 × 2 リクエスト = 48 call)。
+2. 状態 DevBuffer の「層ループ外への再利用」は prefill では効かない — 層ループは `li` を 1 回ずつ
+   昇順に回るので同じ (li, サイズ) の 2 回目が来ない。実際に再利用できるのは n に比例する
+   サイズ固定のスクラッチ (`dy` のゼロ初期化・chunked の `dw/dm/dsinit`)。
+3. `gdn_scan` は必ず `ctx.sync()` するため、この点で GPU パイプラインが切れ、前段 GEMM の完了待ちを
+   吸い込む構造になっている。
+
+**次の実装内容**: GPU 実機で `gdn_pf_*` の 4 行を取得し、A (確保+H2D) 優位なら層をまたぐ DevBuffer
+再利用 + 重み常駐キャッシュ、D (D2H) 優位なら層ループ後のまとめ戻し、S (sync) 優位なら T5b の本命を
+再定義する。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
