@@ -6355,7 +6355,9 @@ mod tests {
         if !cuda_enabled() {
             assert!(!gdn_proj_f32_into(1, &w, &a, k, nv, m, &mut o));
             assert!(o.iter().all(|v| *v == 7.0), "false のとき out を書き換えない契約");
-            assert_eq!(gdn_proj_last_miss(), Some(GdnProjMiss::Gate));
+            // s79 以降は opt-in ゲートが cuda 判定より前にあるので、既定 off では Disabled で落ちる
+            let want = if gdn_proj_opt_in() { GdnProjMiss::Gate } else { GdnProjMiss::Disabled };
+            assert_eq!(gdn_proj_last_miss(), Some(want));
         }
     }
 
