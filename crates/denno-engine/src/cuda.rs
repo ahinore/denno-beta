@@ -2597,11 +2597,14 @@ pub fn chain_sync_pending() -> Option<()> {
     ok(ctx.sync())
 }
 
-/// スロットからホストへダウンロード (D2H + 同期)。
+/// 最終 logits の戻しは decode 1 ステップ 1 回の最大 D2H。発行元の件数分類は
+/// `prof::chain_download_site` (純関数) がスロットから決める (従来はすべて
+/// `D2H_SRC_OTHER` に落ちていた — s108)。
+/// s88 (Step 1): 発行点ごとの時間 (表示専用)。計測 OFF では時刻を読まない。
+/// ここで件数も一緒に積むので、内側では `mark_d2h_src` を呼ばない
+/// (呼ぶと calls が 2 倍になる)。
 pub fn chain_download(slot: usize, len: usize) -> Option<Vec<f32>> {
-    // s88 (Step 1): 発行点ごとの時間 (表示専用)。計測 OFF では時刻を読まない。
-    // ここで件数も一緒に積むので、内側では `mark_d2h_src` を呼ばない
-    // (呼ぶと calls が 2 倍になる)。
+    let site = crate::prof::chain_download_site(slot);
     let t_site = if crate::prof::d2h_src_on() {
         Some(std::time::Instant::now())
     } else {
@@ -2609,12 +2612,9 @@ pub fn chain_download(slot: usize, len: usize) -> Option<Vec<f32>> {
     };
     let r = chain_download_inner(slot, len);
     match t_site {
-        Some(t) => crate::prof::mark_d2h_src_ns(
-            crate::prof::D2H_SRC_OTHER,
-            t.elapsed().as_nanos() as u64,
-        ),
+        Some(t) => crate::prof::mark_d2h_src_ns(site, t.elapsed().as_nanos() as u64),
         // 計測 OFF: 従来どおり件数だけ (実際は `mark_d2h_src` 側も no-op)。
-        None => crate::prof::mark_d2h_src(crate::prof::D2H_SRC_OTHER),
+        None => crate::prof::mark_d2h_src(site),
     }
     r
 }
@@ -2653,6 +2653,8 @@ fn chain_download_inner(slot: usize, len: usize) -> Option<Vec<f32>> {
 /// (D2H + 同期)。B1: prefill チェーンの最終 norm 出力 (CH_H の最終行のみ)
 /// 取得用 — [n, e] 全行の D2H を避ける。呼び出し時点でスロットには
 /// (elem_off + len) 個分のデータが存在することを前提とする (不足時は None)。
+/// 発行元の件数分類は `prof::chain_download_site` (logits 以外は `D2H_SRC_LINEAR`
+/// — 活性化の一部を戻す点で linear 系の部分コピーと同類)。
 pub fn chain_download_at(slot: usize, elem_off: usize, len: usize) -> Option<Vec<f32>> {
     // s88 (Step 1): 発行点ごとの時間 (表示専用・計測 OFF はクロック読みなし)。
     let t_site = if crate::prof::d2h_src_on() {
@@ -2661,12 +2663,10 @@ pub fn chain_download_at(slot: usize, elem_off: usize, len: usize) -> Option<Vec
         None
     };
     let r = chain_download_at_inner(slot, elem_off, len);
+    let site = crate::prof::chain_download_site(slot);
     match t_site {
-        Some(t) => crate::prof::mark_d2h_src_ns(
-            crate::prof::D2H_SRC_OTHER,
-            t.elapsed().as_nanos() as u64,
-        ),
-        None => crate::prof::mark_d2h_src(crate::prof::D2H_SRC_OTHER),
+        Some(t) => crate::prof::mark_d2h_src_ns(site, t.elapsed().as_nanos() as u64),
+        None => crate::prof::mark_d2h_src(site),
     }
     r
 }

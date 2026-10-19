@@ -769,6 +769,39 @@ fn add_outer_ns(pi: usize, owners: &[usize], children: &[usize], ns: u64) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn d2h_src_calls_for_test(phase: Phase, src: usize) -> u64 {
+    if !(D2H_SRC_FIRST..D2H_SRC_FIRST + D2H_SRC_N).contains(&src) {
+        return 0;
+    }
+    D2H_SRC_CALLS[phase.idx()][src - D2H_SRC_FIRST].load(Ordering::Relaxed)
+}
+
+/// s108: `chain_download` / `chain_download_at` が発行元の件数を積むスロットを
+/// 決める純関数 (GPU 不要・テスト可能)。
+///
+/// 件数を呼び出し側 (slot) から決めるのは、この 2 関数が「スロットをどの用途で
+/// 使っているか」を知っている唯一の場所だから。従来は無条件で
+/// `D2H_SRC_OTHER` に落としていたため、decode 1 ステップ 1 回の最大の D2H
+/// (logits) が未分類側に埋もれ、「どの発行点が重いか」の並びから消えていた。
+///
+/// - CH_LOGITS … 最終 logits (decode chain のステップ末尾・prefill の lm_head 入力)
+/// - それ以外 … `chain_download_at` (活性化の一部行を戻す) を含め `D2H_SRC_LINEAR`
+///   — 線形層の結果、または線形層に渡す活性化の部分コピー
+pub fn chain_download_site(slot: usize) -> usize {
+    // CH_LOGITS は cuda モジュール (feature = "cuda") の定数。非 cuda ビルドでも
+    // この純関数だけをテストできるよう、分岐の相手を `cfg` で分ける。
+    #[cfg(feature = "cuda")]
+    let is_logits = slot == crate::cuda::CH_LOGITS;
+    #[cfg(not(feature = "cuda"))]
+    let is_logits = false;
+    if is_logits {
+        D2H_SRC_LOGITS
+    } else {
+        D2H_SRC_LINEAR
+    }
+}
+
 /// s65 (T5b L1 第 2 段・計測のみ): `d2h_state` の 1 回の発行を発行元 `src`
 /// (`D2H_SRC_*`) として計上する。**件数のみ** (時間は `d2h_state` バケットが
 /// 持っている)。PROFILE 無効時は分岐 1 回で何もしない (時刻読みなし)。
@@ -1472,6 +1505,82 @@ mod tests {
         }
         // D2H 細分 (i < 9)・GDN_PF (9..12) と交差しない
         assert!(D2H_SRC_KV_ROW > D2H_LOGITS_PF_HELD + 3);
+    }
+
+    /// s108: `chain_download_site` が「decode 1 ステップ 1 回の最大 D2H」を
+    /// 未分類側に落とさないことを固定する (GPU 不要の純関数)。
+    ///
+    /// 固定する規約:
+    /// 1) CH_LOGITS は `D2H_SRC_LOGITS` (従来は OTHER に混ざっていた)
+    /// 2) それ以外のスロットは `D2H_SRC_LINEAR`
+    /// 3) どのスロットでも `D2H_SRC_OTHER` は返さない (未分類を増やさない)
+    /// 4) 返す id は `mark_d2h_src_ns` が受理する範囲内 (範囲外だと件数が静かに落ちる)
+    ///
+    /// CH_LOGITS は cuda モジュールの定数なので、このテストは cuda feature のみ。
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn chain_download_site_classifies_logits_apart_from_other_slots() {
+        assert_eq!(chain_download_site(crate::cuda::CH_LOGITS), D2H_SRC_LOGITS);
+        for slot in [
+            crate::cuda::CH_X,
+            crate::cuda::CH_H,
+            crate::cuda::CH_QKV,
+            crate::cuda::CH_ATT,
+            crate::cuda::CH_O,
+            crate::cuda::CH_GA,
+            crate::cuda::CH_ACT,
+            crate::cuda::CH_DOWN,
+        ] {
+            assert_eq!(
+                chain_download_site(slot),
+                D2H_SRC_LINEAR,
+                "slot {slot} は LINEAR 側"
+            );
+        }
+        for slot in 0..16usize {
+            let site = chain_download_site(slot);
+            assert!(
+                (D2H_SRC_FIRST..D2H_SRC_FIRST + D2H_SRC_N).contains(&site),
+                "slot {slot}: site {site} が d2h_src の範囲外"
+            );
+            assert_ne!(site, D2H_SRC_OTHER, "slot {slot} が未分類へ落ちている");
+        }
+    }
+
+    /// s108: `chain_download` が積む件数の**スロット**を固定する。実 GPU 呼び出し
+    /// はせず、件数の積み先 (LOGITS へ +1 / LINEAR・OTHER は不変) だけを確認する。
+    /// GPU 非対応の環境では発行自体が起きない (`chain_ctx` が None) ので、その
+    /// 場合だけ判定をスキップする — GPU ホストと cuda feature のビルドでは走る。
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn chain_download_counts_logits_slot_as_logits() {
+        with_prof_counters(|| {
+            set_phase(Phase::Decode);
+            let before_l = d2h_src_calls_for_test(Phase::Decode, D2H_SRC_LOGITS);
+            let before_i = d2h_src_calls_for_test(Phase::Decode, D2H_SRC_LINEAR);
+            let before_o = d2h_src_calls_for_test(Phase::Decode, D2H_SRC_OTHER);
+            let r = crate::cuda::chain_download(crate::cuda::CH_LOGITS, 4);
+            if r.is_none() {
+                return; // GPU 無し: 発行も件数も起きない (判定不能)
+            }
+            assert_eq!(
+                d2h_src_calls_for_test(Phase::Decode, D2H_SRC_LOGITS),
+                before_l + 1,
+                "logits は D2H_SRC_LOGITS に積む"
+            );
+            assert_eq!(d2h_src_calls_for_test(Phase::Decode, D2H_SRC_LINEAR), before_i);
+            assert_eq!(
+                d2h_src_calls_for_test(Phase::Decode, D2H_SRC_OTHER),
+                before_o,
+                "未分類 (OTHER) には積まない"
+            );
+            // site の件数は生バケット (d2h_state) へ入らない — 表示専用の規約。
+            assert_eq!(
+                NS[Phase::Decode.idx()][D2H].load(Ordering::Relaxed),
+                0,
+                "site の件数は d2h_state 生バケットへ入らない"
+            );
+        });
     }
 
     /// s88 (Step 1): `d2h_state` 発行点ごとの**時間**が site 別に積まれ、

@@ -767,9 +767,10 @@ impl Qwen35 {
             return false;
         }
         // s88 (Step 1): prefill の attention 出力 D2H を、発行点 (site) 名つきで時間も積む。
-        // `chain_download` 自体は `D2H_SRC_OTHER` として 1 件積むので、ここでは
-        // **site だけ**を積む (件数を二重に入れないため `mark_d2h_src_ns` ではなく
-        // 専用の記録関数を使わず、site の sort で ATTN_PF を先頭に出す)。
+        // `chain_download` 自体は件数を 1 件積む (s108 以降 logits 以外は `D2H_SRC_OTHER`)
+        // ので、ここでは ATTN_PF 側を **別件** として積む — この発行点は prefill の
+        // attention 出力専用で site の実体を 2 つ持ち越さないため、件数を
+        // ATTN_PF に寄せれば「どの site が重いか」の並びで OTHER 側に残らない。
         let t_site = if crate::prof::d2h_src_on() {
             Some(std::time::Instant::now())
         } else {
