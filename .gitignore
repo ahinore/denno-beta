@@ -9,3 +9,13 @@ data/
 !crates/denno-engine/tests/data/
 !crates/denno-engine/tests/data/**
 *.replay
+
+# ローカル運用ファイル (push 禁止・個人情報を含む。s56b で誤コミットしたため明示)
+/target-dev/
+/_archive/
+/drift_exp/
+/REPORT_*.md
+/HANDOFF_NEXT.md
+/GPU_VERIFY.sh
+/PF_BENCH.sh
+/diag_*.patch
