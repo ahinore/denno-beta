@@ -20,6 +20,11 @@
   # stdlib unittest のテスト一式
   python3 scripts/test_cold_ab.py -v
 
+  # --json に era ラベルを付ける (メタデータのみ。測定・payload sha256・表示は不変)
+  python3 scripts/cold_ab.py --old ... --new ... \
+      --json /tmp/cold_ab_runs/s110_<build>.json --era s110
+  # --era は --json が無いと何もしない (エラーにしない)。--dry-run でも同じ。
+
 なぜ交互 (alternating) なのか:
   周波数スロットリングや熱の影響で同じバイナリでも時間が流れると遅くなる。毎ラウンドを
   old -> new、次のラウンドを new -> old、と順序を反転させると、ドリフトが両方に均等に
@@ -210,6 +215,19 @@ def summarise(measurements):
 
 def fmt_seconds(v):
     return "n/a" if v is None else "%.3f" % v
+
+
+def attach_era(result, era):
+    """--json に書く dict を返す。era が None なら result をそのまま返す (現状と同一)。
+
+    era を付けるときだけ浅いコピーに 1 キー足す。measurements / stats / protocol は
+    同じオブジェクトのままなので、測定経路にも表示経路にも影響しない。
+    """
+    if era is None:
+        return result
+    out = dict(result)
+    out["era"] = era
+    return out
 
 
 def fmt_delta(v):
@@ -829,6 +847,38 @@ def self_test(out=sys.stdout):
     check("usage missing", extract_usage({"id": "x"}) ==
           {"input_tokens": None, "output_tokens": None})
 
+    # 8) --era (s110): 付けるときだけ 1 キー増える。付けなければ同じ object。
+    base = {"payload_sha256": "x", "measurements": [], "stats": {}}
+    check("era: no label leaves the result untouched",
+          attach_era(base, None) is base)
+    with_era = attach_era(base, "s110")
+    check("era: label is added as a top-level key", with_era.get("era") == "s110")
+    check("era: nothing else changes",
+          {k: v for k, v in with_era.items() if k != "era"} == base)
+    check("era: the input dict is not mutated", "era" not in base)
+    check("era: json round-trip keeps the label and the rest",
+          json.loads(json.dumps(with_era, ensure_ascii=False, indent=2,
+                                sort_keys=True)) == with_era)
+    check("era: label validation accepts a plain era", era_label("s110") == "s110")
+    check("era: label validation trims the edges", era_label("  s110 ") == "s110")
+    check("era: non-ascii label accepted", era_label("第110節") == "第110節")
+    for bad_label in ("", "   ", "a" * (ERA_MAX_LEN + 1), "s110\nx", "s110\tx",
+                      "s110\r", "a\x00b", "a\x7fb"):
+        try:
+            era_label(bad_label)
+            check("era: rejected %r" % bad_label, False)
+        except argparse.ArgumentTypeError:
+            check("era: rejected %r" % (bad_label if len(bad_label) <= 12
+                                        else bad_label[:8] + "..."), True)
+    check("era: max length accepted", era_label("a" * ERA_MAX_LEN) == "a" * ERA_MAX_LEN)
+    ap_era = build_parser()
+    check("era: default is None", ap_era.parse_args(["--old", "/a", "--new", "/b"]).era is None)
+    check("era: parsed with --json",
+          ap_era.parse_args(["--old", "/a", "--new", "/b", "--json", "/tmp/x.json",
+                             "--era", "s110"]).era == "s110")
+    check("era: accepted without --json (no-op)",
+          ap_era.parse_args(["--old", "/a", "--new", "/b", "--era", "s110"]).era == "s110")
+
     print("", file=out)
     if failures:
         print("SELF-TEST FAILED: %d check(s)" % len(failures), file=out)
@@ -845,6 +895,33 @@ def positive_int(s):
     v = int(s)
     if v < 1:
         raise argparse.ArgumentTypeError("must be >= 1")
+    return v
+
+
+# --era の上限。短いラベルのための安全弁で、測定には影響しない。
+ERA_MAX_LEN = 64
+
+
+def era_label(s):
+    """--era の値を検査する (argparse の type=)。メタデータ専用で測定には触らない。
+
+    受け入れるのは 1〜64 文字で、制御文字 (0x00-0x1f, 0x7f) を含まないもの。
+    JSON / HTML には json.dump と dashboard の esc() がそのまま入れるので、
+    改行やタブを混ぜた「見えない era」を作れないようにここで落とす。
+    """
+    if s is None:
+        return None
+    # 制御文字は strip より先に見る (strip は \r \n を末尾から消してしまうので、
+    # 後で見ると "\r" だけのラベルが空文字になって「control character」でなく
+    # 「empty」で落ちる。どちらも拒否だが、理由を正しく出すために順序を固定する)。
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in s):
+        raise argparse.ArgumentTypeError("must not contain control characters")
+    v = s.strip()
+    if not v:
+        raise argparse.ArgumentTypeError("must not be empty")
+    if len(v) > ERA_MAX_LEN:
+        raise argparse.ArgumentTypeError(
+            "must be at most %d characters (got %d)" % (ERA_MAX_LEN, len(v)))
     return v
 
 
@@ -881,6 +958,11 @@ def build_parser():
     ap.add_argument("--json", dest="json_out",
                     help="write the full result (payload sha256, measurements, "
                          "medians, delta) to this path")
+    ap.add_argument("--era", type=era_label, default=None, metavar="LABEL",
+                    help="write a top-level \"era\" key with LABEL into the --json "
+                         "payload (metadata only; it does not change the measurement, "
+                         "the payload sha256 or the printed report; no effect without "
+                         "--json)")
     ap.add_argument("--log-dir", default="/tmp",
                     help="where per-round server logs go (default /tmp)")
     ap.add_argument("--health-timeout", type=float, default=HEALTH_TIMEOUT_S,
@@ -924,10 +1006,13 @@ def main(argv=None):
     print_report(result)
 
     if args.json_out:
+        payload = attach_era(result, args.era)
         with open(args.json_out, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
             f.write("\n")
-        print("json written to %s" % args.json_out)
+        print("json written to %s%s" % (args.json_out,
+                                        " (era=%s)" % payload["era"]
+                                        if "era" in payload else ""))
 
     if result["guard_tripped"]:
         return 2

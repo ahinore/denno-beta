@@ -38,7 +38,8 @@ def cold_ab_payload(era, pairs, delta=None):
     """cold_ab.py --json と同じ形の payload を組む (pairs = [(binary, wall), ...])。
 
     実装の形は scripts/cold_ab.py の run_ab() が返す dict に合わせる。era は
-    cold_ab.py が書かないフィールドで、ここでは外から付ける (s109 の P5-1)。
+    cold_ab.py --era が書くフィールド (s110 以降)。era=None なら キー自体を
+    付けない (s109 以前の JSON / fallback の経路を再現する)。
     """
     measurements = []
     for binary, wall in pairs:
@@ -59,14 +60,16 @@ def cold_ab_payload(era, pairs, delta=None):
             delta = ((stats["new"]["median"] - stats["old"]["median"])
                      / stats["old"]["median"] * 100.0)
     stats["delta_pct"] = delta
-    return {"payload_sha256": "0" * 64, "payload_bytes": 1,
-            "measurements": measurements, "stats": stats,
-            "guard_tripped": False, "leftover_pids": [], "rounds": 1,
-            "binaries": {"old": "/nowhere/old", "new": "/nowhere/new"},
-            "protocol": {"model": "local/qwen35-9b", "quant": "int8", "port": 8095,
-                         "seed": 42, "max_tokens": 32, "expect_input_tokens": 5686,
-                         "source_doc": "docs/ARCHITECTURE.en.md"},
-            "era": era}
+    payload = {"payload_sha256": "0" * 64, "payload_bytes": 1,
+               "measurements": measurements, "stats": stats,
+               "guard_tripped": False, "leftover_pids": [], "rounds": 1,
+               "binaries": {"old": "/nowhere/old", "new": "/nowhere/new"},
+               "protocol": {"model": "local/qwen35-9b", "quant": "int8", "port": 8095,
+                            "seed": 42, "max_tokens": 32, "expect_input_tokens": 5686,
+                            "source_doc": "docs/ARCHITECTURE.en.md"}}
+    if era is not None:
+        payload["era"] = era
+    return payload
 
 
 def write_json(directory, name, payload):
@@ -330,6 +333,100 @@ class TestPfBenchPoints(DashboardCase):
             html = f.read()
         self.assertEqual(re.findall(r"<li>decode\[\d+\]", html), [])
         self.assertIn("no output_tokens", html)
+
+
+class TestEraRoundTrip(unittest.TestCase):
+    """s110: cold_ab.py --era -> JSON -> dashboard.py の往復を CPU だけで通す。
+
+    cold_ab.py は本物を子プロセスで走らせる (偽サーバは test_cold_ab.py と同じ
+    仕組みを借りる)。ネットワークは 127.0.0.1 の使い捨てポートのみ、GPU も
+    本物のサーバも使わない。
+    """
+
+    def setUp(self):
+        import test_cold_ab  # 偽サーバ / 偽バイナリの材料を共有する
+        self.helper = test_cold_ab
+        self._td = tempfile.TemporaryDirectory(prefix="dash_era_")
+        self.td = self._td.name
+        self.runs = os.path.join(self.td, "runs")
+        os.makedirs(self.runs)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def cold_ab_run(self, era=None, name="run_s110.json"):
+        """cold_ab.py --json を本物の子プロセスで 1 ラウンド回し、JSON を返す。"""
+        a = self.helper.write_fake_binary(os.path.join(self.td, "old_bin"), "OLD", 5686,
+                                          delay=0.02)
+        b = self.helper.write_fake_binary(os.path.join(self.td, "new_bin"), "NEW", 5686,
+                                          delay=0.01)
+        out_json = os.path.join(self.runs, name)
+        argv = [sys.executable, self.helper.SCRIPT, "--old", a, "--new", b,
+                "--port", str(self.helper.free_port()), "--rounds", "1",
+                "--expect-input-tokens", "5686", "--health-timeout", "20",
+                "--log-dir", self.td, "--json", out_json]
+        if era is not None:
+            argv += ["--era", era]
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=180)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-2000:])
+        with open(out_json, "r", encoding="utf-8") as f:
+            return json.load(f), r.stdout
+
+    def test_era_survives_into_the_dashboard(self):
+        payload, _ = self.cold_ab_run(era="s110", name="run_s110.json")
+        # cold_ab 側: era が本当に書かれている
+        self.assertEqual(payload.get("era"), "s110")
+        r = run(["--cold-ab-dir", self.runs, "--out", os.path.join(self.td, "o.html")])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        got = dashboard.load_cold_ab_dir(self.runs)
+        self.assertEqual([g["label"] for g in got], ["s110"])
+        self.assertEqual([g["era_source"] for g in got], ["era"],
+                         "an era written by cold_ab.py must not fall back to the file name")
+        # 中央値は JSON の stats と一致する (往復で数字が変わらない)
+        self.assertEqual(got[0]["old_median"], payload["stats"]["old"]["median"])
+        self.assertEqual(got[0]["new_median"], payload["stats"]["new"]["median"])
+        with open(os.path.join(self.td, "o.html"), "r", encoding="utf-8") as f:
+            html = f.read()
+        self.assertIn("<td>run_s110.json</td><td>s110</td>", html)
+
+    def test_era_works_with_protocol_change(self):
+        # 2 つの run はどちらも era=s110 なので、境目は先頭 (index 0) に 1 本だけ。
+        # ファイル名は a_s104 / b_s109 だが、era が実在するので名前は使われない。
+        self.cold_ab_run(era="s110", name="a_s104.json")
+        self.cold_ab_run(era="s110", name="b_s109.json")
+        out = os.path.join(self.td, "o.html")
+        r = run(["--cold-ab-dir", self.runs, "--protocol-change", "s110", "--out", out])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(out, "r", encoding="utf-8") as f:
+            html = f.read()
+        # PF ログを渡していないので decode パネルには点が無く、線は prefill にだけ入る
+        pre_svg, dec_svg = html.split("</svg>", 1)
+        self.assertEqual(len(markers(pre_svg)), 1, "one marker in the prefill panel")
+        self.assertEqual(len(markers(dec_svg)), 0, "no points, no marker in decode")
+        self.assertIn("protocol change marker at era: s110", html)
+        # ファイル名に一致した線ではないこと (名前を era として渡しても引かれない)
+        r2 = run(["--cold-ab-dir", self.runs, "--protocol-change", "a_s104",
+                  "--out", os.path.join(self.td, "o2.html")])
+        self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+        with open(os.path.join(self.td, "o2.html"), "r", encoding="utf-8") as f:
+            self.assertEqual(markers(f.read()), [])
+
+    def test_without_era_the_file_name_is_still_the_fallback(self):
+        payload, stdout = self.cold_ab_run(era=None, name="run_named_s110.json")
+        self.assertNotIn("era", payload)
+        self.assertNotIn("(era=", stdout)
+        got = dashboard.load_cold_ab_dir(self.runs)
+        self.assertEqual([g["label"] for g in got], ["run_named_s110.json"])
+        self.assertEqual([g["era_source"] for g in got], ["filename"])
+
+    def test_label_key_still_wins_over_the_file_name(self):
+        # s110 以前の JSON のために "label" も読む (precedence は era -> label -> 名前)
+        payload = cold_ab_payload(None, [("old", 13.0), ("new", 12.9)])
+        payload["label"] = "hand-added"
+        write_json(self.runs, "x.json", payload)
+        got = dashboard.load_cold_ab_dir(self.runs)
+        self.assertEqual(got[0]["label"], "hand-added")
+        self.assertEqual(got[0]["era_source"], "label")
 
 
 class TestCli(unittest.TestCase):

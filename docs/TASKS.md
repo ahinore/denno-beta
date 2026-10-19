@@ -245,7 +245,7 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 
 ## P5 — tooling and ops
 
-### P5-1: dashboard shows cold A/B and decode — DASHBOARD DONE (s109), GPU run is a human step
+### P5-1: dashboard shows cold A/B and decode — DASHBOARD DONE (s109), era wired in (s110), GPU run is a human step
 - Why: `pf_best.txt` now holds a cold number but the graph still mixes eras.
 - Action: parse the A/B lines from the progress log, plot prefill and decode on separate
   axes, mark the protocol change with a vertical line.
@@ -263,30 +263,41 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   name is always in the message) / 2 usage error, and no partial `--out` is left behind.
 - Shape note (nothing is guessed): `cold_ab.py --json` writes `stats.old.median`,
   `stats.new.median`, `stats.delta_pct` and the per-round `measurements[*].wall`, and it
-  has **no decode number and no era field**. Decode therefore comes only from the PF
-  lines, and the era is read from an `era` (else `label`) key that a human/other tool
-  adds to the JSON, falling back to the file name. An `era` key is not written by
-  `cold_ab.py` today; adding one (e.g. `--era`/`--json-label`) would remove the
-  fallback, and that is left as a future change rather than done here.
+  has **no decode number**. Decode therefore comes only from the PF lines.
+- Era gap CLOSED (s110): `cold_ab.py --era LABEL` now writes a top-level `"era"` key into
+  the `--json` payload, so the dashboard reads a real era instead of guessing from the
+  file name. It is metadata only — rounds, ports, payload sha256 and the printed report
+  are untouched, and `--json` without `--era` writes byte-identical output to HEAD
+  (verified by running both). The label is 1–64 characters with no control characters
+  (edges trimmed); a bad value is an argparse usage error (exit 2, nothing measured).
+  `--era` without `--json` is a no-op, not an error (same as the printing-only flags).
+  The dashboard precedence is unchanged: `era` -> `label` -> file name, and
+  `parse_cold_ab_payload()` still reports which one it used in `era_source`
+  (`era` / `label` / `filename`), so pre-s110 JSONs keep working.
 - CPU half is covered: `python3 scripts/dashboard.py --self-test` (21 checks) and
-  `python3 scripts/test_dashboard.py -v` (17 tests); both run inside
-  `scripts/run_cpu_checks.sh` as stages `dashboard_selftest` / `dashboard_tests`.
+  `python3 scripts/test_dashboard.py -v` (21 tests, including
+  `TestEraRoundTrip`: a real `cold_ab.py --json --era` run against a fake server, read
+  back with `era_source == "era"`); `python3 scripts/test_cold_ab.py -v` (44 tests).
+  Both suites run inside `scripts/run_cpu_checks.sh` as stages
+  `dashboard_selftest` / `dashboard_tests` / `cold_ab_tests` (still 11 stages).
 - Still open, and it is a HUMAN STEP: there is no real A/B JSON in the repo and the
   agent container has no GPU, so no real chart exists yet. On a GPU host, after each
   cold A/B run, collect the JSON and build the page:
 
-      # one JSON per measurement, e.g. /tmp/cold_ab_runs/s104_<build>.json
+      # one JSON per measurement, e.g. /tmp/cold_ab_runs/s110_<build>.json
       python3 scripts/cold_ab.py --old <old-bin> --new <new-bin> \
-          --json /tmp/cold_ab_runs/s109_<build>.json
+          --json /tmp/cold_ab_runs/s110_<build>.json --era s110
       PF_BENCH.sh > /tmp/pf_bench_<build>.log
       python3 scripts/dashboard.py --cold-ab-dir /tmp/cold_ab_runs \
           --pf-bench-log /tmp/pf_bench_<build>.log --max-tokens 32 \
           --protocol-change <era-where-the-protocol-changed> \
           --out /tmp/dashboard.html
 
-  `--max-tokens 32` is the PF_BENCH.sh payload size (`max_tokens=32`). The PF line has
-  no per-line `output_tokens`, so decode is derived from that fixed count; a log line
-  that carries `output_tokens=<n>` is used as-is instead.
+  Pass `--era <label>` on every cold A/B run: `--protocol-change <label>` only draws a
+  line where a run actually carries that era, so a JSON without `--era` puts the label
+  in the file name instead. `--max-tokens 32` is the PF_BENCH.sh payload size
+  (`max_tokens=32`). The PF line has no per-line `output_tokens`, so decode is derived
+  from that fixed count; a log line that carries `output_tokens=<n>` is used as-is.
 - Acceptance: one HTML page where prefill and decode are on separate axes and the
   protocol change is a visible vertical line.
 
