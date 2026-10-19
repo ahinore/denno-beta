@@ -2222,6 +2222,129 @@ symlink 経由の同じ realpath・同じ sha256) なら拒否、両方が実在
 `input_tokens == 5,686` も実機で成立するかは未確認で、最初の実行が exit 2 になったら
 まず payload とトークナイザを疑う (ガードの目的は「静かな変化を大声にする」こと)。
 
+### decode 経路の棚卸しとその結論 — P2-1 の 12 ms/token には Rust だけで届かない (2026-10-19, s101 / s108 / P2-1) ✅ 判定は「届かない」
+
+> decode は 16.4 ms/token で、P2-1 の目標は 12 ms/token。どこで時間が消えているのかは
+> バケット名からしか分からなかった (`d2h_logits` が 13.6 ms/step に見えていた時代がある)。
+> 1 ステップのホスト往復をコードから全部数え上げ、`docs/DECODE_PATH.md` に台帳として
+> 固定した。**測ってはいない。コードとバイト数と s68 の帯域から出した算術である。**
+
+**棚卸しの結論 (s108)**: 9B int8 の C4 デバイス常駐チェーン (`n == 1`) は 1 ステップに
+**同期が 1 回だけ** (最後の logits D2H = `cuMemcpyDtoHAsync` + `cuCtxSynchronize`)、
+層ごとの同期は 0、ステップ内の確保も 0 (4 つの `chain_q35_step_reserve*` が先頭の予約と
+一致するので `Scratch::ensure` は何もしない)、重みのアップロードも 0 (int8 はプロセス共通の
+uid レジストリ、fp32 の GDN/QK-Norm はモデルごとのキャッシュ)。KV ミラーも
+ステップごとには seed し直さない (`have == pos0` になる)。
+
+**バス上の量**: 1 ステップの転送は H2D 1,785,856 B (rope 表 ≤ 256 B + 埋め込み 16,384 B +
+層ごとの norm 重み 3d × 16,384 B) + D2H 73,728 B (full 層の k/v、非同期) + D2H 993,280 B
+(logits) = **2,852,864 B**。s68 の実測帯域 (pinned D2H 14.3 GB/s、H2D 14.2 GB/s、
+`flagAsync` 先が pageable なので控えめに 8.6 GB/s) で **0.199 ms 〜 0.333 ms**。
+つまり **16.4 ms のうち動いているバイトは 2% 以下**で、残りは GPU の計算である。
+したがって `d2h_logits` が 13 ms に見えるのは「そのステップの GPU 仕事が終わるまでの
+待ち」を測っていたからで、PCIe ではない (s51 で KV 行の per-step D2H を消しても
+16.4 対 16.5 ms で変わらなかったのが同じ事実の裏側)。
+
+**レバーと上限 (ms/step、すべて計算値)**: L1 層ごとの norm 重み H2D をやめてデバイス側の
+写しを使う (Rust のみ) ≤ 0.125、L2a logits を pinned 経由にする (Rust のみ・ビット同一)
+≤ 0.05、L2b logits をデバイスに残して top-k だけ落とす (サンプラがビット一致契約なので
+数値変更・top-k には `.cu` が要る) ≤ 0.07、L3 rope 表をデバイスで作る (`.cu`) ≤ 0.05、
+L4 rmsnorm を消費側 GEMM の量子化に融合する (`.cu`) は起動オーバーヘッド次第で最大 ~5%、
+L5 の GDN スキャン / attention / GEMM のカーネル本体が **残りの 98%**。
+
+**判定**: **Rust だけで P2-1 の 12 ms/token に届くレバーは残っていない**。Rust のみで
+最良の組は L1 + L3 で約 **0.18 ms/step (約 1%)**、いずれも 8.6〜14.3 GB/s のバスの
+ノイズ床より小さい。**16.4 ms は GPU 律速**で、P2-1 にはカーネル作業 (`.cu` + PTX 再生成 +
+`GPU_VERIFY`) が要る = 人間対応。**目標の 16.4 → 12 ms/token は達成していない**。
+「速くなった」とはどこにも書かない。
+
+**計測器の副産物**: `chain_download_site(slot)` (純関数) を足し、logits を
+`D2H_SRC_LOGITS`、それ以外を `LINEAR` に分類して `OTHER` に落とさないようにした
+(`prof.rs` の cuda feature テスト 2 本)。表示専用で数値経路には触れない。
+残る会計の穴 (chain_rmsnorm 内の H2D と埋め込みのアップロードが rmsnorm/embed の
+計測ラッパに見えている) も文書に記録した。
+
+**テスト**: `cargo test -p denno-engine --lib` 240 passed / 1 ignored、
+`--test kernel_invariants` 11 passed、`cargo test -p denno-server` 77 passed、
+`cargo check -p denno-engine --features cuda --tests` clean。`.cu` / `.ptx` は差分ゼロ。
+
+**あわせて行った docs 同期 (s101 / P5-2)**: `README.md` と `docs/api.md` を実装に
+合わせた。往復回数の記述と古い「PF wall」基準を直し、P17k の 13,252 token / 395.8 s →
+12.2 s は**過去の測定**として明示したうえで、現行の測定規約 (cold 単発・prefix cache off・
+交互 A/B) と s100 の受入値 (prefill 13.18 s / 431 tok/s、decode 16.4 ms/token、
+アンカー `c61ad85b` / `9e17d563` / `af6eb6ab`) を出典つきで書いた。`docs/api.md` は
+thinking マップ形式が s53c 以降 off であること、`max_completion_tokens` の別名、
+`max_tokens=0`、未知フィールドの無視、`--repetition-penalty` / `--temperature-cap`、
+`overloaded_error` 503、エンジン側の 400/500 対応を載せ、文字化けしていた認証の行も直した。
+
+### 1 コマンドの CPU ゲート、prefill/decode ダッシュボード、era (2026-10-19, s107 / s109 / s110 / P5-1) ✅ 実データは人間対応
+
+> CPU で回せる検査が 4 本のスクリプトに散らばり、どれをどの順で回すかは人の記憶に
+> 依存していた。1 コマンドのゲートにまとめ、prefill と decode を別の軸で並べる
+> ダッシュボードを足し、そのダッシュボードが era を取り違えないように測定側へ
+> era を書かせた。3 段とも CPU だけで完結する。**実データはまだ 1 点も無い。**
+
+**`scripts/run_cpu_checks.sh` (s107)**: CPU だけで回せる関門を 1 コマンドにした。
+**11 ステージ** (`kernel_invariants` → `engine_lib` → `server` → 各 Python の自己テストと
+tests) を順に走らせ、最初の失敗で止まり、1 ステージ 1 行と最後に `RESULT: PASS` を出す。
+終了コードは **0 = 全ステージ通過 / 1 = ステージ失敗 / 2 = 使い方・準備の問題**
+(`cargo` や `python3` が `PATH` に無い)。`CARGO_TARGET_DIR` を尊重し、既定は
+`/tmp/denno-test-target` (バインドマウントされた `target/debug` は他人所有で EACCES に
+なり得るため)。`PYTHON=` で解釈器を選べる。ステージごとのログは
+`$CARGO_TARGET_DIR/run_cpu_checks_logs/<stage>.log` に出し、失敗時はその末尾 40 行を印字する。
+ネットワークもサーバの起動停止もプロセス検査も無い。`--list` は走らせずにステージを出す。
+作る過程で 2 つのバグを**実際に走らせて**見つけて直した (空白入りのコマンドを
+`for line in $STAGES` で分割して `cargo test -p ...` が `test` というステージになった件を
+IFS=newline で修正、最初の案がパイプラインのサブシェルで回っていて最後の PASS/FAIL と
+終了コードが捨てられる件)。
+
+**`scripts/dashboard.py` (s109)**: 進捗ログは自由文なので**解析しない**。
+機械可読なのは `scripts/cold_ab.py --json` で、ディレクトリ内の `*.json` (ファイル名順) と
+任意の `PF_BENCH` ログから、**外部参照ゼロの HTML 1 枚** (インライン SVG のみ。script も
+CDN もフォントも画像参照も無いのでオフラインで開ける) を書く。段は 2 つで y 軸も別 —
+**prefill (s)** = cold A/B の成功した測定の `wall` に `PF wall=<sec>` の行、
+**decode (ms/token)** = PF 行の `wall * 1000 / tokens` — で、x は測定順。
+`--protocol-change LABEL` (繰り返し可) はその era が始まる位置に赤い破線を引く。
+点が 2 つ未満の段は「not enough points」と出して線を描かない。
+**同じ入力に対してバイト同一の出力**になる。終了コードは **0 = OK / 1 = 入力が使えない
+(壊れた JSON・ディレクトリが無い・点が無い。どのファイルかは必ずメッセージに出す) /
+2 = 使い方の誤り**で、途中まで書いた `--out` は残さない。
+`cold_ab.py --json` 側には **decode の数字が無い**ので、decode は PF 行からだけ作る
+(**無い数字は作らない**)。
+
+**era の優先順位と `era_source`**: ある測定の era は JSON の `"era"`、無ければ `"label"`、
+無ければファイル名。`parse_cold_ab_payload()` はどれを使ったかを `era_source`
+(`era` / `label` / `filename`) で返すので、s110 より前に書いた JSON もそのまま読める。
+
+**`cold_ab.py --era LABEL` (s110)**: ダッシュボードがファイル名から era を推測しなくて
+済むよう、測定側が書く。**検証**: 前後の空白を落とし、**1〜64 文字**、制御文字
+(0x00-0x1f, 0x7f) を含まない。制御文字の検査は `strip()` より**前**に行う
+(`strip()` は末尾の `\r` を黙って消してしまうので、`"s110\r"` が素通りした。自己テストが
+これを捕まえて直した)。不正な値は argparse の使い方の誤り = **exit 2** で、何も測らない。
+`--json` と併用したときだけ payload に**トップレベルのキーをちょうど 1 つ** (`"era"`) 足す。
+`attach_era()` はラベルが無ければ **受け取った result そのもの**を返すので、s110 以前の
+書き出し経路は同じコードのまま。**`--era` 無しの `--json` は 1 バイトも変わらない**
+(HEAD の実装と現行を両方走らせて比較)。`--json` 無しの `--era` は**エラーにせず無視**
+(印字専用フラグと同じ扱い)、`--dry-run` もそれを無視する。測定値・payload sha256・
+ラウンド計画・印字されるレポートは一切変わらない (**メタデータのみ**)。
+
+**テスト**: `scripts/test_cold_ab.py` = **44 tests** (s102 の 32 → s103 で 37 → s110 で 44)、
+`scripts/test_dashboard.py` = **21 tests** (s109 の 17 → s110 で 21)。
+`TestEraRoundTrip` は**本物の `cold_ab.py --json --era s110`** を偽サーバに対して
+子プロセスで走らせ、`dashboard.load_cold_ab_dir()` で読み直して `era_source == "era"`・
+中央値が `stats.*.median` と一致・HTML の表の行、まで確かめる。`label` と `filename` の
+fallback、era に見えるファイル名が線を引かないことも固定した (テストは 3 ステージではなく
+既存の `cold_ab_tests` / `dashboard_tests` の中で走る。**11 ステージのまま**)。
+ゲート全体は `bash scripts/run_cpu_checks.sh` = **`RESULT: PASS (all 11 stages)`**、
+その中の数値は `denno-engine --lib` 240 passed / 1 ignored、`denno-server` 77 passed、
+`kernel_invariants` 11 passed で基準と一致。
+
+**人間対応 (測っていないこと)**: リポジトリに実 A/B の JSON が 1 本も無く、この環境には
+GPU が無いので、**実データのダッシュボードはまだ存在しない**。GPU 機で各 cold A/B の後に
+`python3 scripts/cold_ab.py --old <old> --new <new> --json <dir>/s110_<build>.json --era s110`
+と `PF_BENCH.sh > /tmp/pf_bench_<build>.log` を取り、`--protocol-change <era>` を付けて
+ダッシュボードを作るのは人間の手順。**実 cold A/B の数字も未測定。**
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)

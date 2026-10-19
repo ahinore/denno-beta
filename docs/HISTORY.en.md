@@ -2171,6 +2171,132 @@ host. The 0.011 s / 0.051 s in the test output are fake-server sleeps, not denno
 Whether `input_tokens == 5,686` holds on the real build is unconfirmed; if the first run exits 2,
 suspect the payload and the tokenizer first (the guard exists to make a silent change loud).
 
+### Decode path inventory and its verdict — Rust alone cannot reach P2-1's 12 ms/token (2026-10-19, s101 / s108 / P2-1) ✅ verdict: out of reach
+
+> Decode sits at 16.4 ms/token against P2-1's 12 ms/token target, and where the time went
+> could only be guessed from bucket names (there was an era where `d2h_logits` looked like
+> 13.6 ms/step). Every host round trip of one step was counted from the code and frozen as a
+> ledger in `docs/DECODE_PATH.md`. **Nothing here is measured: it is arithmetic from the code,
+> the byte counts and the s68 bandwidth.**
+
+**The inventory's conclusion (s108)**: the 9B int8 C4 device-resident chain (`n == 1`) has
+**exactly one sync per step** (the final logits D2H: `cuMemcpyDtoHAsync` + `cuCtxSynchronize`),
+no per-layer sync, no allocation inside the step (the four `chain_q35_step_reserve*` requests
+match the step-start reservation, so `Scratch::ensure` is a no-op), and no weight upload (int8
+weights live in the process-wide uid registry, fp32 GDN/QK-Norm weights in a per-model cache).
+The KV mirror is not re-seeded per step either (`have == pos0`).
+
+**Traffic on the bus**: one step moves H2D 1,785,856 B (rope table ≤ 256 B + embedding
+16,384 B + per-layer norm weights 3d x 16,384 B) + D2H 73,728 B (full layers' k/v,
+asynchronous) + D2H 993,280 B (logits) = **2,852,864 B**, i.e. **0.199 ms to 0.333 ms** at the
+s68 measured bandwidths (pinned D2H 14.3 GB/s, H2D 14.2 GB/s, and a conservative 8.6 GB/s for
+the pageable `flagAsync` targets). **Under 2 % of the 16.4 ms is bytes moving**; the rest is GPU
+compute. That is why `d2h_logits` once read as 13 ms: it contains the one sync, so it measured
+how long the GPU still needed, not PCIe. s51 removing the per-step KV-row D2H and moving
+nothing (16.4 vs 16.5 ms) is the same statement from the other side.
+
+**Levers and ceilings (ms/step, all computed)**: L1 drop the per-layer norm-weight H2D and keep
+a device copy (Rust only) ≤ 0.125; L2a download the logits through the pinned stage (Rust only,
+bit-identical) ≤ 0.05; L2b keep logits on device and D2H only a top-k (the sampler is
+bit-exactness-bound, so this is a numeric change and a device top-k needs a `.cu`) ≤ 0.07;
+L3 build the rope table on the device (`.cu`) ≤ 0.05; L4 fuse rmsnorm into the consuming GEMM's
+quantize (`.cu`) up to ~5 % depending on launch overhead; L5 the GDN scan / attention / GEMM
+kernels themselves are **the remaining 98 %**.
+
+**Verdict**: **no Rust-only lever remains that reaches P2-1's 12 ms/token.** The best Rust-only
+set is L1 + L3 at about **0.18 ms/step (~1 %)**, below the noise floor of an 8.6-14.3 GB/s bus.
+**The 16.4 ms is GPU-bound**, and P2-1 therefore needs kernel work (`.cu` + PTX regeneration +
+`GPU_VERIFY`) — a human step. **The 16.4 → 12 ms/token target is not reached.** No sentence here
+claims a speed-up.
+
+**Instrumentation side effect**: `chain_download_site(slot)` (a pure function) classifies the
+logits download as `D2H_SRC_LOGITS` and everything else as `LINEAR`, never `OTHER`, with two
+cuda-feature tests in `prof.rs`. Display only; the numeric path is untouched. The remaining
+accounting gap (the H2D inside `chain_rmsnorm` and the embedding upload appear under the
+rmsnorm/embed timing wrappers) is recorded in the document.
+
+**Tests**: `cargo test -p denno-engine --lib` 240 passed / 1 ignored,
+`--test kernel_invariants` 11 passed, `cargo test -p denno-server` 77 passed,
+`cargo check -p denno-engine --features cuda --tests` clean. `.cu` / `.ptx` diff is zero.
+
+**The docs sync done alongside it (s101 / P5-2)**: `README.md` and `docs/api.md` were brought in
+line with the implementation — the round-trip counts and the old "PF wall" basis were corrected,
+and the P17k 13,252-token / 395.8 s → 12.2 s figure is now labelled a **historical measurement**,
+followed by the current protocol (cold single shot, prefix cache off, alternating A/B) and the
+s100 accepted values (prefill 13.18 s / 431 tok/s, decode 16.4 ms/token, anchors `c61ad85b` /
+`9e17d563` / `af6eb6ab`) with their sources. `docs/api.md` now records that the thinking map form
+has been `off` since s53c, the `max_completion_tokens` alias, `max_tokens=0`, unknown fields
+being ignored, `--repetition-penalty` / `--temperature-cap`, the `overloaded_error` 503, and the
+engine-side 400/500 mapping, and repairs a mojibake'd authentication line.
+
+### The one-command CPU gate, the prefill/decode dashboard and the era (2026-10-19, s107 / s109 / s110 / P5-1) ✅ real data is a human step
+
+> The CPU-only checks were spread over four scripts and the order to run them in lived in
+> someone's memory. They are now one gate, a dashboard puts prefill and decode on separate
+> axes, and the measurement side now writes the era so the dashboard cannot get it wrong.
+> All three are CPU-only. **There is not a single real data point yet.**
+
+**`scripts/run_cpu_checks.sh` (s107)**: the whole CPU-only gate as one command. It runs
+**11 stages** (`kernel_invariants` → `engine_lib` → `server` → the Python self-tests and test
+suites) in order, stops at the first failure, prints one line per stage and a final
+`RESULT: PASS`. Exit **0 = every stage passed / 1 = a stage failed / 2 = usage or setup problem**
+(no `cargo` or `python3` on `PATH`). It honours `CARGO_TARGET_DIR` (default
+`/tmp/denno-test-target`, because `target/debug` in a bind-mounted checkout can be owned by
+someone else and return EACCES) and takes `PYTHON=` to choose the interpreter. Per-stage logs go
+to `$CARGO_TARGET_DIR/run_cpu_checks_logs/<stage>.log`, and on failure it prints the last 40
+lines of the failing stage. No network, no server start/stop, no process inspection; `--list`
+prints the stages without running them. Two bugs were found by **running** it rather than
+reading it: `for line in $STAGES` word-split the multi-word commands (so `cargo test -p ...`
+became a stage called `test`) — fixed with `IFS=newline`; and the first draft ran the loop in a
+pipeline subshell, which discarded the final PASS/FAIL and the exit status.
+
+**`scripts/dashboard.py` (s109)**: the progress log is free-form prose, so it is **not parsed**.
+The machine-readable source is `scripts/cold_ab.py --json`: from every `*.json` in a directory
+(in file-name order) plus an optional `PF_BENCH` log it writes **one self-contained HTML file**
+(inline SVG only — no script, CDN, font or image reference, so it opens offline). Two panels with
+separate y axes — **prefill (s)** = the cold A/B `wall` of the successful measurements plus the
+`PF wall=<sec>` lines, **decode (ms/token)** = `wall * 1000 / tokens` from the PF lines — and
+x = measurement order. `--protocol-change LABEL` (repeatable) draws a red dashed line where that
+era starts; a panel with fewer than 2 points says "not enough points" instead of drawing a line.
+**The output is byte-identical for the same inputs.** Exit **0 = ok / 1 = unusable input**
+(bad JSON, missing directory, no points — the offending file is always named) **/ 2 = usage
+error**, and no partial `--out` is left behind. Because the `cold_ab.py --json` payload
+**carries no decode number**, decode comes only from the PF lines (**no number is invented**).
+
+**Era precedence and `era_source`**: a measurement's era is its JSON `"era"` key, else
+`"label"`, else its file name. `parse_cold_ab_payload()` reports which one it used in
+`era_source` (`era` / `label` / `filename`), so JSONs written before s110 keep working.
+
+**`cold_ab.py --era LABEL` (s110)**: the measurement side writes the era so the dashboard never
+has to guess from a file name. **Validation**: edges trimmed, **1-64 characters**, no control
+characters (0x00-0x1f, 0x7f). The control-character check runs **before** `strip()`, because
+`strip()` silently removes a trailing `\r` and let `"s110\r"` through — the self-test caught it
+and it was fixed before the commit. A bad value is an argparse usage error (**exit 2**) and
+nothing is measured. Only with `--json` does it add **exactly one top-level key** (`"era"`) to
+the payload. `attach_era()` returns the **result object itself** when no label is given, so the
+pre-s110 write path is the same code. **`--json` without `--era` writes byte-identical output**
+(verified by running HEAD's module and the current one side by side). `--era` without `--json`
+is a **no-op, not an error** (same treatment as the printing-only flags) and `--dry-run` ignores
+it too. The measurement, the payload sha256, the round plan and the printed report are all
+untouched (**metadata only**).
+
+**Tests**: `scripts/test_cold_ab.py` = **44 tests** (32 in s102 → 37 in s103 → 44 in s110),
+`scripts/test_dashboard.py` = **21 tests** (17 in s109 → 21 in s110). `TestEraRoundTrip` runs
+the **real `cold_ab.py --json --era s110`** as a subprocess against the fake server, reads the
+file back with `dashboard.load_cold_ab_dir()` and asserts `era_source == "era"`, that the
+medians equal `stats.*.median`, and the HTML table row; the `label` and `filename` fallbacks and
+a file name that merely looks like an era (which must not draw a line) are pinned too. These run
+inside the existing `cold_ab_tests` / `dashboard_tests` stages — **still 11 stages**. The whole
+gate is `bash scripts/run_cpu_checks.sh` = **`RESULT: PASS (all 11 stages)`**, with the numbers
+inside matching the baseline: `denno-engine --lib` 240 passed / 1 ignored, `denno-server` 77
+passed, `kernel_invariants` 11 passed.
+
+**Human steps (what is not measured)**: the repository holds no real A/B JSON and this container
+has no GPU, so **no dashboard of real data exists yet**. On a GPU host, after each cold A/B run,
+collect `python3 scripts/cold_ab.py --old <old> --new <new> --json <dir>/s110_<build>.json --era s110`
+and `PF_BENCH.sh > /tmp/pf_bench_<build>.log`, then build the page with
+`--protocol-change <era>`. **The real cold A/B numbers are unmeasured too.**
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
