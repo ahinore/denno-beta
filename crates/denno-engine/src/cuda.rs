@@ -347,6 +347,10 @@ pub struct CudaCtx {
     f_gdn_chunk_pre: CUfunction,
     f_gdn_chunk_state: CUfunction,
     f_gdn_chunk_scan: CUfunction,
+    /// s89 (P1-1): 状態グラフ常駐版の chunk scan (pass 2 を折りたたんだ 2 launch 版)。
+    /// PTX はコミット済みの `kernels_gdn.ptx` に含まれる (再生成済み) 場合のみ
+    /// 取得でき、無ければ None で従来の 3 launch 経路を使う。
+    f_gdn_chunk_scan_hoist: Option<CUfunction>,
 }
 
 const PTX: &[u8] = include_bytes!("../kernels/kernels_int8.ptx");
@@ -517,6 +521,20 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_gdn_chunk_scan, module_gdn, b"dno_gdn_chunk_scan\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_gdn_chunk_scan)",
             )?;
+            // s89 (P1-1): 状態常駐版は「あれば使う」。古い PTX (未再生成) でも
+            // 起動を壊さず 3 launch 経路へ落ちるよう、取得失敗は None として扱う。
+            let mut f_gdn_chunk_scan_hoist: CUfunction = std::ptr::null_mut();
+            let hoist_r = (lib.module_get_function)(
+                &mut f_gdn_chunk_scan_hoist,
+                module_gdn,
+                b"dno_gdn_chunk_scan_hoist\0".as_ptr() as *const c_char,
+            );
+            // (隣接フィールドと同じく CUresult == 0 が成功。非 0 は None)
+            let f_gdn_chunk_scan_hoist = if hoist_r == CUDA_SUCCESS {
+                Some(f_gdn_chunk_scan_hoist)
+            } else {
+                None
+            };
 
             Ok(Self {
                 device: dev,
@@ -544,6 +562,7 @@ impl CudaCtx {
                 f_gdn_chunk_pre,
                 f_gdn_chunk_state,
                 f_gdn_chunk_scan,
+                f_gdn_chunk_scan_hoist,
             })
         }
     }
@@ -907,6 +926,98 @@ enum GdnBuf {
     SsmOut,
 }
 
+// ---------------------------------------------------------------------------
+// s89 (P1-1): GDN スキャンのデバイス常駐状態
+//
+// 動機: s88 の計測で prefill の `d2h_state` が大きいのは GDN 状態の往復
+// (`ssm_out` の D2H + 次層の `ssm_in` の H2D・1 層 2MB ずつ) を含むため。
+// ここでは「層のスキャン状態の正本」をデバイスに置き、ホスト側の
+// `KvCache::gdn` は**実行境界 (forward の切れ目) でだけ**一致させる。
+//
+// s90 の状態 (重要・偽らない):
+//   この構造体は **まだどの経路からも使われていない**。tl の `GDN_STATE` に
+//   確保・seed・無効化の関数は用意してあるが、`gdn_scan_chunked_impl` は
+//   (i) 2 launch 経路が現状の forward では成立しない (→ gdn/scan_schedule.rs)
+//   (ii) y をデバイスに残す oproj 経路 (s72) は 2 層目以降の conv 入力を
+//        ホストから捨てる形になっており、ホスト状態が層ごとにしか確定しない
+//   の 2 点により、従来どおり層ごとに ssm を H2D / D2H している。
+//   `f_gdn_chunk_scan_hoist` のカーネルと Optional 取得は「古い PTX でも起動を
+//   壊さない」性質ごと残してある (Next: 上記 (i)(ii) を解いて配線する)。
+//
+// 無効化の契約 (将来 配線したときに効くもの — 先に用意しておく):
+//   ホストの `KvCache::gdn` を書き換える経路 (セッション reset / エントリ復元 /
+//   デコードチェーンの遅延フラッシュ / CPU フォールバック) は
+//   [`gdn_scan_state_invalidate`] を呼ぶ。呼ばれたら次の実行でホストから
+//   再 seed する (数値不変・余分な H2D が 1 回増えるだけ)。**古い正本を読むと
+//   出力が変わる**ので、新しい書き換え経路を足すときは必ずここを通すこと。
+// ---------------------------------------------------------------------------
+struct GdnStateCache {
+    ssm: Vec<Option<DevBuffer>>, // [layer] ssm [nv, dk, dv] (デバイス正本)
+    valid: Vec<bool>,            // [layer] = ホスト KvCache::gdn と一致している
+    srows: Option<DevBuffer>,    // [n, nv, dk, dv] hoist 経路の境界行
+    srows_n: usize,              // srows がいま表現している n (0 = 未初期化)
+    rows: usize,                 // 行数 (= nk*dk = vd)
+    cols: usize,                 // 列数 (= dk*dv)
+}
+
+impl GdnStateCache {
+    const fn empty() -> Self {
+        Self {
+            ssm: Vec::new(),
+            valid: Vec::new(),
+            srows: None,
+            srows_n: 0,
+            rows: 0,
+            cols: 0,
+        }
+    }
+    fn ensure_layers(&mut self, n_layers: usize) {
+        // `Option<DevBuffer>` は Clone でない (DevBuffer は RAII の所有権型) →
+        // resize_with で伸ばす。縮む場合は末尾を落とす (drop = cuMemFree)。
+        if self.ssm.len() < n_layers {
+            self.ssm.resize_with(n_layers, || None);
+        } else {
+            self.ssm.truncate(n_layers);
+        }
+        self.valid.resize(n_layers, false);
+    }
+    /// 全層を「ホストが正」に戻す (次の実行で再 seed)。ホストの GDN 状態を
+    /// 書き換える経路 (セッション reset / エントリ復元 / デコードチェーンの
+    /// 遅延フラッシュ / CPU フォールバック) は必ずこれを呼ぶ。
+    fn invalidate(&mut self) {
+        for v in self.valid.iter_mut() {
+            *v = false;
+        }
+        self.srows_n = 0;
+    }
+    /// 層 1 本の確保。形が変わったら全層を無効化する (別モデル/別形状)。
+    fn ensure_layer(&mut self, li: usize, rows: usize, cols: usize) -> Result<()> {
+        const F: usize = std::mem::size_of::<f32>();
+        if (self.rows != 0 && (self.rows != rows || self.cols != cols)) || self.rows != rows {
+            self.invalidate();
+            self.srows_n = 0;
+        }
+        self.rows = rows;
+        self.cols = cols;
+        GdnScratch::grow(&mut self.ssm[li], rows * cols * F)?;
+        Ok(())
+    }
+    /// hoist 経路の境界行バッファ [n, nv, dk, dv] を確保 (n が同じなら再利用)。
+    fn ensure_srows(&mut self, n: usize, rows: usize, cols: usize) -> Result<CUdeviceptr> {
+        const F: usize = std::mem::size_of::<f32>();
+        let bytes = n
+            .checked_mul(rows)
+            .and_then(|v| v.checked_mul(cols))
+            .and_then(|v| v.checked_mul(F))
+            .ok_or_else(|| anyhow::anyhow!("srows size overflow"))?;
+        GdnScratch::grow(&mut self.srows, bytes)?;
+        if self.srows_n != n {
+            self.srows_n = n;
+        }
+        Ok(self.srows.as_ref().expect("srows 未確保").ptr())
+    }
+}
+
 impl GdnScratch {
     const fn empty() -> Self {
         Self {
@@ -999,6 +1110,21 @@ impl GdnScratch {
 thread_local! {
     static GDN_SCRATCH: std::cell::RefCell<GdnScratch> =
         std::cell::RefCell::new(GdnScratch::empty());
+    /// s89 (P1-1): GDN スキャン状態のデバイス正本 (scheduler ワーカーは単一
+    /// スレッドなので thread_local で競合しない・`GDN_SCRATCH` と同じ規約)。
+    static GDN_STATE: std::cell::RefCell<GdnStateCache> =
+        std::cell::RefCell::new(GdnStateCache::empty());
+}
+
+/// s89 (P1-1): GDN スキャン状態のデバイス正本を「ホストが正」に戻す。
+///
+/// ホストの `KvCache::gdn` を書き換える経路 (セッション reset / エントリ復元 /
+/// デコードチェーンの遅延フラッシュ / CPU フォールバック) は、その後にこの
+/// 関数を呼ぶ。呼ばれた層は次の prefill でホストから再 seed する (数値不変・
+/// 余分な H2D が 1 回増えるだけ)。**古い正本を読むと出力が変わる**ので、
+/// 新しい書き換え経路を足すときは必ずここを通すこと。
+pub fn gdn_scan_state_invalidate() {
+    GDN_STATE.with(|c| c.borrow_mut().invalidate());
 }
 
 static GPU_CTX: OnceLock<Option<CudaCtx>> = OnceLock::new();
@@ -5588,6 +5714,10 @@ pub fn chain_q35_gdn_flush_pending(cache: &mut crate::kv_cache::KvCache) -> Opti
     let Some(idx) = ms.iter().position(|(k, _, _)| *k == key) else {
         return Some(()); // ミラー未作成 = 遅延も存在し得ない
     };
+    // s90 (P1-1): ホストの GDN 状態をこれから書き換える (遅延分の回復) →
+    // デバイス常駐の正本は古くなるので先に捨てる。早めに捨てても失うものは無い
+    // (次の実行でホストから再 seed するだけ) ので、分岐の前に 1 回で置く。
+    gdn_scan_state_invalidate();
     let m = &mut ms[idx].1;
     if m.gdn_pending.is_none() {
         return Some(()); // 遅延なし
@@ -8642,8 +8772,9 @@ fn gdn_scan_impl(
 // ---------------------------------------------------------------------------
 
 /// chunked ルーティングの閾値 (n がこれ以上で 3-pass chunked カーネルを使用)。
-/// chunk 分割は [`crate::gdn::chunk_plan`](n, この閾値, 1024, 16) を CPU 参照と共有。
-pub(crate) const GDN_CHUNK_MIN_TOKENS: usize = 2048;
+/// 実際の chunk 分割は [`crate::gdn::scan_schedule::plan`] (CPU 参照と共有する
+/// 唯一の定義) が返す。
+pub(crate) const GDN_CHUNK_MIN_TOKENS: usize = crate::gdn::scan_schedule::CHUNK_MIN_TOKENS;
 
 /// s72: GDN スキャンの y をデバイス上に残したまま out_proj までチェーンで実行し、
 /// 結果だけを host へ落とす。従来は y (n×vd) を D2H し、次の out_proj で再び H2D
@@ -8770,7 +8901,27 @@ fn gdn_scan_chunked_impl(
     debug_assert_eq!(dk, dv, "chunked scan は dk == dv 前提");
     debug_assert_eq!(d_conv, 4, "chunked scan は d_conv == 4 前提");
 
-    let (n_chunks, chunk_len) = crate::gdn::chunk_plan(n, GDN_CHUNK_MIN_TOKENS, 1024, 16);
+    let (n_chunks, chunk_len) = crate::gdn::scan_schedule::plan(n);
+
+    // s90 (P1-1): 2 launch 経路 (`f_gdn_chunk_scan_hoist`) の入り口判定は
+    // `crate::gdn::scan_schedule::route_hoist` の 1 か所。この forward は
+    // 「3 launch 経路に対して別 launch の書き手」を保証できない
+    // (gdn/scan_schedule.rs のモジュール冒頭) ので、route_hoist(.., false) = false
+    // が既定 → 下の 3 pass が走る。将来 常駐を実装したときに、ここで
+    // route_hoist(.., true) 側の分岐を足す (今は分岐を持たない = 死んだ
+    // パスを疑似的に走らせない)。
+    if crate::gdn::scan_schedule::route_hoist(n, nv, dk, dv, false) {
+        unreachable!("s90: route_hoist(.., false) は常に偽 (既定は 3 launch)");
+    }
+    // 帳簿の健全性 (debug のみ): 境界行の書き手は読み手より前の chunk であること。
+    // 「別 launch の書き手」になるのはこの条件が満たされたうえで前の launch が
+    // 実際に存在する場合だけなので、ここでは順序関係だけを見る。
+    debug_assert!(
+        crate::gdn::scan_schedule::read_write_conflicts(n, chunk_len, n_chunks)
+            .iter()
+            .all(|(reader, writer, _)| writer < reader),
+        "s90: 境界行の書き手が読み手より後になっている"
+    );
 
     ctx.make_current()?;
     // s64 (T5b L1 Step 1 計測): `gdn_scan_impl` と同一の 4 区間細分 (表示専用)。
