@@ -1239,6 +1239,11 @@ impl Qwen35 {
                                     &g.ssm_a,
                                     &g.ssm_dt,
                                     &g.ssm_norm,
+                                    // s76 (T7): 長 prefill (n >= 2048) は chunk 並列の
+                                    // スキャンが要る。スカラー GEMM 定義 (n==1) を
+                                    // そのまま渡すと n が 1 に戻り単発カーネルに落ちる
+                                    // (層あたり 32 ブロックで直列 = 5,866 token では
+                                    // 実質使えない)。n を明示する。
                                     n,
                                     p.n_k_heads,
                                     p.n_v_heads,
