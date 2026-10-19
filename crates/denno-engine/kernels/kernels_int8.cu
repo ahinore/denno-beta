@@ -298,3 +298,263 @@ extern "C" __global__ void dno_gemm_i8(
         }
     }
 }
+
+//
+// s113 (P1-4 候補 1): int8 GEMM の epilogue に swiglu を畳み込んだ prefill 専用カーネル。
+//
+// 置換対象 (chain_mlp_prefill の 2 ディスパッチ):
+//   1) dno_gemm_i8 で gate/up を CH_GA [m, 2ff] (行内 [gate | up]) に書き出す
+//   2) dno_swiglu_int で CH_GA を読み直して CH_ACT [m, ff] を作る
+// を、GEMM の epilogue で gate 列と up 列を同時に持ったまま 1 本で行う。
+// CH_GA (m*2ff*4B のグローバル書き出し + 読み直し) が丸ごと消える。
+// タイル寸法/ブロック形状/共有メモリ配置は上の dno_gemm_i8 と**同じマクロを共有**
+// する (GEMM_TILE ほかは再定義しない) ので、整数累積の分割は完全に同一。
+//
+// 数値 (ビット一致の根拠 — すべて既存カーネルと同一の演算列):
+// - 整数累積: dno_gemm_i8 と同じタイル/内側ループ/__dp4a (整数は結合則が成立)。
+// - スケール復元: dno_gemm_i8 と同じく `(float)acc * ascale[gi]` の後に
+//   `* scale[gj]`。中間値も各 f32 演算も同一 (順序・丸め位置を変えない)。
+// - swiglu: dno_swiglu_int と同一式・同一順序
+//     e = dno_expf(-g); s = __fdiv_rn(g, __fadd_rn(1.0f, e)); out = __fmul_rn(s, u)
+//   -fmad=false なので独立命令のまま (縮約されない)。FMA 化・近似はしない。
+// - dno_expf は kernels_elem.cu のものを**逐語コピー**している (あちらの定義は
+//   モジュール内で完結し、PTX に外部可視のシンボルが無いため別 TU から共有
+//   できない)。コピーのドリフトは Rust 側のテスト
+//   `fused_swiglu_expf_block_matches_elem_source` がソーステキスト突き合わせで
+//   検出する。
+// - 添字: dno_swiglu_int の `gateup[r*width + f]` / `gateup[r*width + ff + f]` は
+//   width = 2ff なので、flat の out[i] (i = r*ff + f) と対で同一アドレスになる。
+//
+// 対応ペアの制約 (呼び出し側 = chain_gemm_swiglu_pf が保証する):
+//   1 j タイル (256 列) が gate パートまたは up パートの**どちらか一方に完全に
+//   収まること** = **ff が 256 の倍数**。実モデル (Qwen2.5-1.5B ff=8960、
+//   Qwen3 ff=12288/6144 等) はすべて該当する。該当しない形では呼び出し側が
+//   従来の 2 段経路にフォールバックする (このカーネルは呼ばない)。
+//   この条件下で up 列 gj の対応 gate 列 gcol = gj - ff は必ず**同じ j タイル内**
+//   にあり、up の acc と gate の acc が epilogue の同じ時点で同じ thread の
+//   レジスタに揃う (列オフセットは 8 の倍数ずつしか動かないので 8 列内の相対
+//   位置は一致する)。
+
+    #define N_TABLE 32  // EXP2F_TABLE_BITS = 5
+
+    // glibc sysdeps/ieee754/flt-32/e_exp2f_data.c (__exp2f_data)
+    // (constant memory ではなく通常の device メモリ: warp 内でインデックスが
+    //  分岐すると constant cache が直列化されるため。256B なので L1 で十分)
+    __device__ uint64_t DNO_EXP2_TAB[32] = {
+        0x3ff0000000000000ull, 0x3fefd9b0d3158574ull, 0x3fefb5586cf9890full,
+        0x3fef9301d0125b51ull, 0x3fef72b83c7d517bull, 0x3fef54873168b9aaull,
+        0x3fef387a6e756238ull, 0x3fef1e9df51fdee1ull, 0x3fef06fe0a31b715ull,
+        0x3feef1a7373aa9cbull, 0x3feedea64c123422ull, 0x3feece086061892dull,
+        0x3feebfdad5362a27ull, 0x3feeb42b569d4f82ull, 0x3feeab07dd485429ull,
+        0x3feea47eb03a5585ull, 0x3feea09e667f3bcdull, 0x3fee9f75e8ec5f74ull,
+        0x3feea11473eb0187ull, 0x3feea589994cce13ull, 0x3feeace5422aa0dbull,
+        0x3feeb737b0cdc5e5ull, 0x3feec49182a3f090ull, 0x3feed503b23e255dull,
+        0x3feee89f995ad3adull, 0x3feeff76f2fb5e47ull, 0x3fef199bdd85529cull,
+        0x3fef3720dcef9069ull, 0x3fef5818dcfba487ull, 0x3fef7c97337b9b5full,
+        0x3fefa4afa2a490daull, 0x3fefd0765b6e4540ull,
+    };
+    // poly_scaled[i] = poly[i] / N^(3-i), N = 32
+    __device__ double DNO_EXP_POLY[3] = {
+        0x1.c6af84b912394p-5 / 32.0 / 32.0 / 32.0,
+        0x1.ebfce50fac4f3p-3 / 32.0 / 32.0,
+        0x1.62e42ff0c52d6p-1 / 32.0,
+    };
+    __device__ __constant__ double DNO_EXP_INVLN2N = 0x1.71547652b82fep+0 * 32.0;
+    __device__ __constant__ double DNO_EXP_SHIFT = 0x1.8p+52;  // 1.5 * 2^52
+
+    __device__ __forceinline__ uint64_t dno_asuint64(double f) {
+        return __double_as_longlong(f);
+    }
+    __device__ __forceinline__ double dno_asdouble(uint64_t i) {
+        return __longlong_as_double((long long)i);
+    }
+    __device__ __forceinline__ uint32_t dno_asuint(float f) {
+        return __float_as_uint(f);
+    }
+
+    /// glibc expf bit-exact replica (round-to-nearest, WANT_ERRNO semantics —
+    /// overflow -> +inf, underflow -> 0.0f; errno side effects are irrelevant here).
+    __device__ __forceinline__ float dno_expf(float x) {
+        uint32_t abstop = (dno_asuint(x) >> 20) & 0x7ffu;
+        if (abstop >= 0x42bu) {  // top12(88.0f): |x| >= 88 or inf/nan
+            // glibc はここで早期 return せず、以下のいずれにも該当しない場合
+            // ([88.0, 88.72] と [-103.97, -88]) はそのまま通常経路で計算する
+            // (exp(88) は f32 最大値未満、exp(-88) は非正規化数として表現可能)。
+            if (dno_asuint(x) == 0xff800000u) return 0.0f;       // -inf
+            if (abstop >= 0x7f8u) return x + x;                  // inf / nan
+            if (x > 0x1.62e42ep6f) return __uint_as_float(0x7f800000u);  // > log(0x1p128) -> +inf
+            if (x < -0x1.9fe368p6f) return 0.0f;                 // < log(0x1p-150) -> uflow 0
+            // fall through to normal path
+        }
+        double xd = (double)x;
+        // glibc の FMA ビルド (gcc -ffp-contract=fast) は以下を fma に縮約する:
+        //   kd = fma(InvLn2N, xd, SHIFT)  (= z + SHIFT の縮約)
+        //   r  = fma(InvLn2N, xd, -kd)    (= z - kd の縮約)
+        // 多項式 3 ヶ所も同様。実機 (glibc 2.35 + RTX 5090 ホスト) で glibc expf /
+        // Rust f32::exp の返すビットと完全一致することを確認済み
+        // (x=32.564632f: 非縮約版は 1ULP 差 = 0x56fc9f1b vs 正 0x56fc9f1c)。
+        double kd = __fma_rn(DNO_EXP_INVLN2N, xd, DNO_EXP_SHIFT);
+        uint64_t ki = dno_asuint64(kd);
+        kd = __dadd_rn(kd, -DNO_EXP_SHIFT);
+        double r = __fma_rn(DNO_EXP_INVLN2N, xd, -kd);
+        // exp(x) = 2^(k/N) * 2^(r/N) ~= s * (C0*r^3 + C1*r^2 + C2*r + 1)
+        uint64_t t = DNO_EXP2_TAB[ki % 32];
+        t += ki << (52 - 5);
+        double s = dno_asdouble(t);
+        double z2 = __fma_rn(DNO_EXP_POLY[0], r, DNO_EXP_POLY[1]);
+        double r2 = __dmul_rn(r, r);
+        double y = __fma_rn(DNO_EXP_POLY[2], r, 1.0);
+        y = __fma_rn(z2, r2, y);
+        y = __dmul_rn(y, s);
+        return (float)y;
+    }
+
+// タイル寸法の静的検査は上の dno_gemm_i8 と共通 (同じマクロを共有)。
+
+/// gate/up (n = 2*ff・重み行順 [gate 全行 | up 全行]) の int8 GEMM + swiglu。
+///   act[i*ff + f] = swiglu(gate[i,f], up[i,f])
+///     gate[i,j] = ((float)dot(aq[i], w[j]))    * ascale[i] * scale[j]
+///     up  [i,j] = ((float)dot(aq[i], w[ff+j])) * ascale[i] * scale[ff+j]
+/// 8 列グループ単位: up グループ (t,v) から対応する gate グループ (gt,gv) を引く。
+extern "C" __global__ void dno_gemm_i8_swiglu(
+    const signed char* __restrict__ aq,   // [m,k]
+    const float* __restrict__ ascale,     // [m]
+    const signed char* __restrict__ w,    // [2ff,k] row-major (行順 [gate | up]・2ff は 256 の倍数に pad 済み)
+    const float* __restrict__ scale,      // [2ff]
+    float* __restrict__ act,              // [m,ff] row-major
+    int m, int k, int n, int ff)          // n = 2*ff (実列数・パディング前)
+{
+    const int tx = threadIdx.x; // 0..15 → j 方向 16 列ずつ (16*16 = 256 = GEMM_TILE_N)
+    const int ty = threadIdx.y; // 0..15 → i 方向 8 行ずつ (16*8  = 128 = GEMM_TILE)
+    const int tid = ty * GEMM_BX + tx;
+    const int i0 = blockIdx.x * GEMM_TILE;
+    // j 方向は **up パートのタイルだけ**を回す (grid.y = ff / GEMM_TILE_N)。
+    // gate パートのタイルは epilogue が何も書かない (結果に寄与しない) ので
+    // 起動しない。よってこのカーネルの j0 は常に ff 以上で、列 j0..j0+255 は
+    // すべて up 側に属する (ff が GEMM_TILE_N の倍数である前提)。
+    const int j0 = ff + blockIdx.y * GEMM_TILE_N;
+
+    // 1 thread = 8 行 x 16 列 (2 つの 8 列グループ)。
+    int acc[8][16];
+    #pragma unroll
+    for (int u = 0; u < 8; u++) {
+        #pragma unroll
+        for (int v = 0; v < 16; v++) {
+            acc[u][v] = 0;
+        }
+    }
+
+    __shared__ signed char sA[GEMM_TILE][GEMM_SP];
+    __shared__ signed char sB[GEMM_TILE_N][GEMM_SP];
+
+    for (int kb = 0; kb < k; kb += GEMM_TK) {
+        // A (128x32) は tid < 128 の thread が 1 行ずつ、B (256x32) は全 thread が
+        // 1 行ずつ。端 (gi>=m / gk>=k) は 0 埋め = 積に寄与しない (既存と同一)。
+        if (tid < GEMM_TILE) {
+            const int gi = i0 + tid;
+            if (gi < m) {
+                const signed char* src = aq + (size_t)gi * (size_t)k + kb;
+                const int* src4 = (const int*)src;
+                #pragma unroll
+                for (int x = 0; x < 8; x++) {
+                    const int c = x * 4;
+                    int val = 0;
+                    if (kb + c + 3 < k) {
+                        val = __ldg(&src4[x]);
+                    } else {
+                        #pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            if (kb + c + e < k) val |= (int)(unsigned char)src[c + e] << (8 * e);
+                        }
+                    }
+                    *(int*)&sA[tid][c] = val;
+                }
+            } else {
+                #pragma unroll
+                for (int x = 0; x < 8; x++) *(int*)&sA[tid][x * 4] = 0;
+            }
+        }
+        {
+            const int r = tid;                        // 0..255
+            const int gj = j0 + r;
+            if (gj < n) {
+                const signed char* src = w + (size_t)gj * (size_t)k + kb;
+                const int* src4 = (const int*)src;
+                #pragma unroll
+                for (int x = 0; x < 8; x++) {
+                    const int c = x * 4;
+                    int val = 0;
+                    if (kb + c + 3 < k) {
+                        val = __ldg(&src4[x]);
+                    } else {
+                        #pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            if (kb + c + e < k) val |= (int)(unsigned char)src[c + e] << (8 * e);
+                        }
+                    }
+                    *(int*)&sB[r][c] = val;
+                }
+            } else {
+                #pragma unroll
+                for (int x = 0; x < 8; x++) *(int*)&sB[r][x * 4] = 0;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int c0 = 0; c0 < GEMM_TK; c0 += 4) {
+            int a4[8];
+            #pragma unroll
+            for (int u = 0; u < 8; u++) {
+                a4[u] = *(const int*)&sA[ty * 8 + u][c0];
+            }
+            #pragma unroll
+            for (int t = 0; t < 2; t++) {
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    const int b4 = *(const int*)&sB[t * GEMM_TILE + tx * 8 + v][c0];
+                    #pragma unroll
+                    for (int u = 0; u < 8; u++) {
+                        acc[u][t * 8 + v] = __dp4a(a4[u], b4, acc[u][t * 8 + v]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // epilogue: up パートに入っている j タイルだけが書き込みを行う。
+    // 列 gj (>= ff) の対応 gate 列は gcol = gj - ff (ff は 256 の倍数なので同じ j タイル)。
+    // gcol が入るのはタイル内の 2 グループのどちらか (gt) で、8 列内の相対位置 gv は
+    // gj 側の v と一致する (列オフセットが 8 の倍数ずつしか動かないため)。
+    #pragma unroll
+    for (int t = 0; t < 2; t++) {
+        const int jgrp = j0 + t * GEMM_TILE + tx * 8;  // この 8 列グループの先頭実列
+        if (jgrp >= ff) {
+            #pragma unroll
+            for (int u = 0; u < 8; u++) {
+                const int gi = i0 + ty * 8 + u;
+                if (gi < m) {
+                    const float as = ascale[gi];
+                    float* row = act + (size_t)gi * (size_t)ff;
+                    #pragma unroll
+                    for (int v = 0; v < 8; v++) {
+                        const int gj = jgrp + v;                         // up 列 (実列)
+                        const int gcol = gj - ff;                        // 対応する gate 列
+                        const int gt = (gcol >= j0 + GEMM_TILE) ? 1 : 0;  // gcol のグループ
+                        const int gv = gcol - (j0 + gt * GEMM_TILE + tx * 8);
+                        if (gj < n && gcol >= 0 && gv >= 0 && gv < 8) {
+                            // gate: 既存 epilogue と同じ ((float)dot * as) * scale[gcol]
+                            const float g = (float)acc[u][gt * 8 + gv] * as * scale[gcol];
+                            // up: 同じく ((float)dot * as) * scale[gj]
+                            const float uv = (float)acc[u][t * 8 + v] * as * scale[gj];
+                            // dno_swiglu_int と同一の演算列 (順序・丸めとも不変)
+                            const float e = dno_expf(-g);
+                            const float s = __fdiv_rn(g, __fadd_rn(1.0f, e));
+                            row[gcol] = __fmul_rn(s, uv);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
