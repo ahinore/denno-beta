@@ -122,50 +122,109 @@ extern "C" __global__ void dno_matvec_rows_bt_i8(
 // ビット一致: 整数累積は結合則が成立するためタイル化/順序に依存しない。f32 側は
 // GEMV カーネルと同一の ((dot as f32) * ascale) * scale[j] の順。k が 4 の倍数で
 // ない場合もタイル境界の 0 パディングで正しく処理される (0 は積に寄与しない)。
+//
+// s74 (T6 候補 1 / 数値緩和クラス R2): 1 thread の出力を 8x8 → **8x16** に拡大し、
+// 1 ブロック = 128x256 出力・64 thread (block = 16x4・tile を 2 枚並べる)。
+// 旧 128x128・256 thread では 1 回の内積 (dp4a) に対して smem からの B ロードが
+// 1/8 回分しか使い回せていなかった (dp4a 144 = b64 ロード 16 + a32 4・実効
+// 11 TOPS 前後)。B を 16 個使うようにして dp4a/B ロード比を 8 → 16 に上げる。
+// - k 方向 4 要素は i32 にパックしたまま (s32 アキュムレータを直接用いる)。
+// - j 方向の 2 枚目 (sB[128..256]) は**重み側だけ**を pad する: ホストが n を 256 の
+//   倍数に切り上げたラッパ行を確保して 0 埋めする (gemm_pad_apply。i8 の 0 は寄与
+//   しないので dot は厳密に同じ)。a4 を 2 タイルで共有するため、A 側の pad 値
+//   (行方向のゼロ) が偽の寄与を生まない。
+// - アキュムレータが 128 個になるので、旧版で spilling していた他のレジスタ
+//   (a/b パック・アドレス計算・unroll 展開) をすべてロールバックした。この
+//   kernel は次の点で**旧版と命令列が異なる**: 端 (i0+16) の境界を tag 方式で
+//   判定・端行 (if (i0 + 16 < m)) での二重バッファ確保なし・epilogue の書き込みは
+//   1 thread あたり 16 列連続。いずれも f32 の演算列 ((float)dot * ascale * scale[j])
+//   と整数累積を変えないので、**CPU の同じ整数 dot からの結果と同じビット**になる
+//   (gemm_pad_apply を純粋関数にして Rust 側でテストする)。
 #define GEMM_TILE 128
+#define GEMM_TILE_N 256
 #define GEMM_TK 32
 #define GEMM_SP (GEMM_TK + 1)
 extern "C" __global__ void dno_gemm_i8(
     const signed char* __restrict__ aq,   // [m,k]
     const float* __restrict__ ascale,     // [m]
-    const signed char* __restrict__ w,    // [n,k] row-major
+    const signed char* __restrict__ w,    // [n,k] row-major (n は 256 の倍数に pad 済み)
     const float* __restrict__ scale,      // [n]
     float* __restrict__ out,              // [m,n] row-major
     int m, int k, int n)
 {
-    const int tx = threadIdx.x; // 0..15 → j 方向 8 列ずつ
-    const int ty = threadIdx.y; // 0..15 → i 方向 8 行ずつ
+    const int tx = threadIdx.x; // 0..15 → j 方向 16 列ずつ
+    const int ty = threadIdx.y; // 0..3  → i 方向 8 行ずつ
     const int tid = ty * 16 + tx;
     const int i0 = blockIdx.x * GEMM_TILE;
-    const int j0 = blockIdx.y * GEMM_TILE;
+    const int j0 = blockIdx.y * GEMM_TILE_N;
 
-    int acc[8][8];
+    // 1 thread = 8 行 x 16 列。行方向は 8 行連続の各行で独立した i32 アキュムレータ、
+    // 列方向は 2 タイル (8 列ずつ) を各々独立に持つ (整数なので分割は厳密)。
+    int acc[8][16];
     #pragma unroll
     for (int u = 0; u < 8; u++) {
         #pragma unroll
-        for (int v = 0; v < 8; v++) {
+        for (int v = 0; v < 16; v++) {
             acc[u][v] = 0;
         }
     }
 
     __shared__ signed char sA[GEMM_TILE][GEMM_SP];
-    __shared__ signed char sB[GEMM_TILE][GEMM_SP];
+    __shared__ signed char sB[GEMM_TILE_N][GEMM_SP];
 
     for (int kb = 0; kb < k; kb += GEMM_TK) {
-        // A/B タイル (各 128x32 = 4096B) を 256 thread で共有メモリへ
-        for (int t = tid; t < GEMM_TILE * GEMM_TK; t += 256) {
-            const int r = t / GEMM_TK;
-            const int c = t - r * GEMM_TK;
-            const int gi = i0 + r;
-            const int gk = kb + c;
-            sA[r][c] = (gi < m && gk < k) ? aq[(size_t)gi * (size_t)k + gk] : (signed char)0;
+        // A (128x32 = 4096B) と B (256x32 = 8192B) を 64 thread で協調ロード。
+        // 1 thread あたり A 64 + B 128 バイト = u32 のベクトルロード 16+32 回。
+        // 端 (gi>=m / gk>=k) は 0 埋め (= 積に寄与しない)。
+        {
+            const int gi = i0 + tid;
+            if (gi < m) {
+                const signed char* src = aq + (size_t)gi * (size_t)k + kb;
+                const int* src4 = (const int*)src;
+                #pragma unroll
+                for (int x = 0; x < 8; x++) {
+                    const int c = x * 4;
+                    int val = 0;
+                    if (kb + c + 3 < k) {
+                        val = __ldg(&src4[x]);
+                    } else {
+                        #pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            if (kb + c + e < k) val |= (int)(unsigned char)src[c + e] << (8 * e);
+                        }
+                    }
+                    *(int*)&sA[tid][c] = val;
+                }
+            } else {
+                #pragma unroll
+                for (int x = 0; x < 8; x++) *(int*)&sA[tid][x * 4] = 0;
+            }
         }
-        for (int t = tid; t < GEMM_TILE * GEMM_TK; t += 256) {
-            const int r = t / GEMM_TK;
-            const int c = t - r * GEMM_TK;
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            const int r = half * GEMM_TILE + tid;
             const int gj = j0 + r;
-            const int gk = kb + c;
-            sB[r][c] = (gj < n && gk < k) ? w[(size_t)gj * (size_t)k + gk] : (signed char)0;
+            if (gj < n) {
+                const signed char* src = w + (size_t)gj * (size_t)k + kb;
+                const int* src4 = (const int*)src;
+                #pragma unroll
+                for (int x = 0; x < 8; x++) {
+                    const int c = x * 4;
+                    int val = 0;
+                    if (kb + c + 3 < k) {
+                        val = __ldg(&src4[x]);
+                    } else {
+                        #pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            if (kb + c + e < k) val |= (int)(unsigned char)src[c + e] << (8 * e);
+                        }
+                    }
+                    *(int*)&sB[r][c] = val;
+                }
+            } else {
+                #pragma unroll
+                for (int x = 0; x < 8; x++) *(int*)&sB[r][x * 4] = 0;
+            }
         }
         __syncthreads();
         #pragma unroll
@@ -173,33 +232,37 @@ extern "C" __global__ void dno_gemm_i8(
             int a4[8];
             #pragma unroll
             for (int u = 0; u < 8; u++) {
-                const signed char* p = &sA[ty * 8 + u][c0];
-                a4[u] = ((int)(unsigned char)p[0]) | (((int)(unsigned char)p[1]) << 8)
-                      | (((int)(unsigned char)p[2]) << 16) | (((int)(unsigned char)p[3]) << 24);
+                a4[u] = *(const int*)&sA[ty * 8 + u][c0];
             }
             #pragma unroll
-            for (int v = 0; v < 8; v++) {
-                const signed char* p = &sB[tx * 8 + v][c0];
-                const int b4 = ((int)(unsigned char)p[0]) | (((int)(unsigned char)p[1]) << 8)
-                             | (((int)(unsigned char)p[2]) << 16) | (((int)(unsigned char)p[3]) << 24);
+            for (int t = 0; t < 2; t++) {
                 #pragma unroll
-                for (int u = 0; u < 8; u++) {
-                    acc[u][v] = __dp4a(a4[u], b4, acc[u][v]);
+                for (int v = 0; v < 8; v++) {
+                    const int b4 = *(const int*)&sB[t * GEMM_TILE + tx * 8 + v][c0];
+                    #pragma unroll
+                    for (int u = 0; u < 8; u++) {
+                        acc[u][t * 8 + v] = __dp4a(a4[u], b4, acc[u][t * 8 + v]);
+                    }
                 }
             }
         }
         __syncthreads();
     }
 
+    // 列 0..7 は tx*8 + v、列 8..15 は GEMM_TILE + tx*8 + v。
     #pragma unroll
     for (int u = 0; u < 8; u++) {
-        #pragma unroll
-        for (int v = 0; v < 8; v++) {
-            const int gi = i0 + ty * 8 + u;
-            const int gj = j0 + tx * 8 + v;
-            if (gi < m && gj < n) {
-                const float o = (float)acc[u][v] * ascale[gi];
-                out[(size_t)gi * (size_t)n + gj] = o * scale[gj];
+        const int gi = i0 + ty * 8 + u;
+        if (gi < m) {
+            const float as = ascale[gi];
+            float* row = out + (size_t)gi * (size_t)n;
+            #pragma unroll
+            for (int v = 0; v < 16; v++) {
+                const int gj = j0 + (v < 8 ? 0 : GEMM_TILE) + tx * 8 + (v & 7);
+                if (gj < n) {
+                    const float o = (float)acc[u][v] * as;
+                    row[gj] = o * scale[gj];
+                }
             }
         }
     }

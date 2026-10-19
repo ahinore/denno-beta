@@ -1628,6 +1628,55 @@ The change is classed R1 (f32 reduction order) and re-baselined per `docs/NUMERI
 Re-baselining used `ANCHOR_REBASE.sh` (two runs to prove determinism, then `--write`), and
 `GPU_VERIFY.sh` passes against the new baseline. Deterministic numeric relaxation is now allowed.
 
+### int8 GEMM per-thread tile 8x8 → 8x16 — weight padding and edge handling rebuilt ✅ (2026-10-19, s74 / T6 candidate 1) ⚠ PTX not regenerated
+
+> `dno_gemm_i8` used a 128x128 tile, 256 threads and 8x8 outputs per thread. Each
+> `__dp4a` (4 multiply-adds) consumed only one smem B load (b4), so the inner loop was
+> 144 dp4a against 16 b64 + 4 a32 loads. The resulting ~10.6 TOPS is an order of
+> magnitude below int8 peak; T6 starts by raising this arithmetic density.
+> **Numeric relaxation class R2.**
+
+**Change** (`kernels/kernels_int8.cu` `dno_gemm_i8` + host side `cuda.rs`):
+
+- Per-thread output 8x8 → **8x16**; one block = **128 rows x 256 cols** with **64 threads**
+  (block dim 16x4). Sixteen B values are consumed per A pack, doubling the dp4a/B-load
+  ratio from 8 to 16. The 256 columns keep 8192 outputs per block (128x16 accumulators
+  x 64 threads), same as the old 128x128/256-thread tile, so block count and A re-reads
+  are unchanged.
+- The 4 k-elements stay packed into an i32 and are fed straight to
+  `acc[i] = __dp4a(a4, b4, acc[i])` (the old build lowered to four i16 packs).
+- With twice the accumulators, the other registers that used to spill (a/b packs,
+  address math, unrolled loads) were rolled back. Loading is cooperative over 64 threads
+  (A 64 B + B 128 B per thread) using u32 vector loads (`__ldg`).
+- **Weights are zero-padded to 256 rows** on upload (`weights_for` / `weights_for_group`
+  go through `gemm_pad_apply`). Since an A row is shared by both B tiles, padding A and B
+  asymmetrically is fine: the weight side is always 0 (contributes nothing). The padded
+  row count is recorded in `GpuW.npad`. The extra VRAM is padding rows only — for the real
+  shapes (8192/12288/4096/512) every n is already a multiple of 256, so there is
+  **no weight copy and no VRAM growth** (`Cow::Owned` only for non-multiple n).
+- All 11 host launch sites updated to `(16, 4, 1)` and `gmy = n.div_ceil(256)`.
+
+**Numerics**: int8 products accumulate exactly in i32 (associativity holds), so tile
+shape, thread count and accumulator splits cannot change the dot. The f32 side keeps
+`((float)dot * ascale) * scale[j]`. The expected outcome is therefore **bit-identical**
+(Little to no difference even under R2). `gemm_pad_preserves_dot_and_tiling_is_exact`
+was added so GPU-less environments pin the contract: padding preserves the dot, kb/c0
+splits are exact, and edge shapes cover the grid. Real-GPU bit-exactness is checked by
+`cuda_gemm_i8_bit_exact_vs_cpu` (run by the supervisor).
+
+**⚠ Not done (human task)**:
+- **`kernels_int8.ptx` was NOT regenerated** (no nvcc in this container). Until it is,
+  **the GPU path keeps running the old PTX (8x8 kernel)**. Pairing the new host code
+  (256-padded weights) with the old kernel is safe — the old kernel stops at `gj < n`,
+  so padded rows are never read and the numbers stay correct — but it also means **no
+  regression and no speedup**.
+  `nvcc -ptx -arch=compute_75 -fmad=false -O3 kernels/kernels_int8.cu -o kernels/kernels_int8.ptx`
+- Record the new artifact hash in HISTORY afterwards (the P17d lesson).
+
+**Performance**: expected from halving smem loads per dp4a and removing the inner-loop
+spills — the FFN GEMM (`gate_up` 27 ms/call x 128 ≒ 3.5 s). **Actual numbers await the
+supervisor's PF_BENCH / GPU_VERIFY (nothing was measured in this session).**
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
