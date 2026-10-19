@@ -125,15 +125,23 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 - Profile ids `D2H_GDN_PROJ_*` / `ATT_GDN_PROJ` stayed reserved on purpose (renumbering
   would break historical profile comparisons).
 
-### P3-2: T9 — why s73 moved two short anchors
-- Status: open. The drift did not reproduce on the s75 build (anchors back to canonical),
-  so it is not a shipping blocker.
-- Hypothesis: s73's parallel prepare changed the number of `kv_bufs()` calls per layer
-  from n to 1; if that call has a side effect (allocation, mirror invalidation) the
-  prefill path may differ. Also check `full_attn_qknorm`'s returned buffer for
-  uninitialized tail.
-- Acceptance: a definite answer, or a documented "not reproducible" with the experiment
-  list. No code change required if the anchors stay canonical.
+### P3-2: T9 — why s73 moved two short anchors — CLOSED (2026-10-19, s101)
+- Status: **closed (2026-10-19, s101) — not reproducible; cause is the s73 build's int8 GEMM**.
+- Evidence (CPU path, not the GPU anchors): s73 (57405fe) and its parent 4119dce were built
+  in release for the CPU path (GGUF `local/qwen35-9b-cpu`) and served the same anchor
+  payloads; the three anchor text md5s are identical across both revisions
+  (v6_1b 788221d7 / v6_2b f5603b67 / v6_1b_full 0184c481). These are CPU-path values,
+  **not** the GPU anchor values in `data/verify/anchors_baseline.txt`.
+- `DENNO_DEBUG_LAYER_CHKSUM=1` ([LCHK]) gave **136 / 136 identical lines** (emb, L00..L31
+  attn+ffn, final).
+- Hypotheses rejected: `kv_bufs(li, n)` has no side effect (`ensure(len+n)` only, no `len`
+  or epoch advance; n calls == 1 call); `full_attn_qknorm` has no uninitialised tail on the
+  exercised path (`k_row` is fully initialised, `buf_att` explicitly zero-filled since s63).
+- The s73 -> s75 source delta is `kernels_int8.cu` + `cuda.rs` only, and s75 fixes s74's
+  unwritten-row int8 GEMM defect. Conclusion: the drift came from that broken kernel (argmax
+  flips on near-ties), not from the parallelised prepare. No code change needed.
+- Remaining: the GPU-side re-measurement of "not reproducible" is owned by the main session
+  (this container has no GPU).
 
 ### P3-3: extend the GPU-less kernel invariant tests
 - Status: s75 added a test that parses `kernels_int8.cu` `#define`s and checks stride and
@@ -142,8 +150,13 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 - Acceptance: the same static checks exist for every kernel that does smem casts.
 
 ### P3-4: fold the cold A/B into GPU_VERIFY
-- Status: the protocol is documented in HISTORY but run by hand.
-- Action: `GPU_VERIFY.sh` gains a `--ab <old-binary>` mode that does the alternating cold
+- Status: **implemented (s102) — one command prints old/new medians and the delta %**.
+  `scripts/cold_ab.py` runs the alternating cold-single-shot protocol (server start ->
+  one request with a cold prefix cache, old/new in alternating rounds), prints the per-round
+  lines, a table, per-binary medians and `delta = (new - old) / old * 100`, and records the
+  payload sha256 and the server-reported `input_tokens`. It reports only; the supervisor
+  applies the ">= 0.3 s faster" acceptance rule.
+- Action (original): `GPU_VERIFY.sh` gains a `--ab <old-binary>` mode that does the alternating cold
   rounds and prints the delta. Removes the human step and the unit mismatch that produced
   the inflated 8.71 s figure.
 - Acceptance: one command produces "old A/B new, delta %, anchors PASS".
@@ -182,9 +195,10 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 - Action: parse the A/B lines from the progress log, plot prefill and decode on separate
   axes, mark the protocol change with a vertical line.
 
-### P5-2: docs sync
+### P5-2: docs sync — DONE (2212c4a, s101)
 - `README.md` and `docs/api.md` still describe pre-s68 behaviour in places
   (round-trip counts, the old "PF wall" basis).
+- Done in 2212c4a (s101): `README.md` + `docs/api.md` synced with the current implementation.
 
 ## Suggested order
 
