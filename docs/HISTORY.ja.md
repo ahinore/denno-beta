@@ -1541,6 +1541,19 @@ pinned→heap の `memcpy` が 60 ms = **4.7 GB/s** しか出ていない。一�
 
 **残った内訳** (1 リクエスト換算): `d2h_state` 8.2 s / `attn_core` 4.9 s (`gdn_scan` 2.6 + `gdn_proj` 1.1 + `attn_full` 1.2) / `gate_up` 2.9 s / `qkv` 1.6 s / `down` 1.4 s / `swiglu` 0.83 s / `o_proj` 0.64 s / `rmsnorm` 0.41 s。**次の標的は依然 D2H** で、`chain_download` (attention 出力 93 MB) と o_proj の `to_vec` が同じ pinned 経由のまま残っている。本命は活性化をデバイスに残し、swiglu / rmsnorm / 残差を GPU 上で畳んで D2H 自体を消すこと。
 
+### チェーン D2H の「pinned 経由 + to_vec」を廃止 ✅ (2026-10-19, s69)
+
+> s68 で GEMM 経路の二度手間コピーを消したが、attention 出力の取得 `chain_download` と o_proj の戻り値 (`maybe_gpu_oproj`) は依然として「pinned バッファへ D2H → `to_vec` でヒープへ複製」のままだった。93MB の出力を毎回 2 度書きしていた。
+
+**修正** (`cuda.rs`):
+
+- `chain_download` / `chain_download_at`: 出力 `Vec` を `with_capacity` で確保し、その未初期化領域へ直接 D2H、コピー完了後に `set_len`。pinned ステージング (`pin_dn`) を経由しない。
+- `maybe_gpu_oproj`: 同じく pinned `ho` をやめ、戻り値の `Vec` へ直接 D2H。
+
+**数値**: 転送先が変わるだけで内容・演算順は不変 = **ビット一致** (アンカー 3 本 MATCH)。
+
+**結果**: prefill **14.80 s → 14.50 s** (384 → 392 tok/s)。テスト 231 passed。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
