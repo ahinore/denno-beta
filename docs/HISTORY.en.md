@@ -1659,7 +1659,7 @@ Re-baselining used `ANCHOR_REBASE.sh` (two runs to prove determinism, then `--wr
 **Numerics**: int8 products accumulate exactly in i32 (associativity holds), so tile
 shape, thread count and accumulator splits cannot change the dot. The f32 side keeps
 `((float)dot * ascale) * scale[j]`. The expected outcome is therefore **bit-identical**
-(Little to no difference even under R2). `gemm_pad_preserves_dot_and_tiling_is_exact`
+(no difference even under R2). `gemm_pad_preserves_dot_and_tiling_is_exact`
 was added so GPU-less environments pin the contract: padding preserves the dot, kb/c0
 splits are exact, and edge shapes cover the grid. Real-GPU bit-exactness is checked by
 `cuda_gemm_i8_bit_exact_vs_cpu` (run by the supervisor).
