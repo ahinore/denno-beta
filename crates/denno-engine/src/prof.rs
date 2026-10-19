@@ -68,9 +68,19 @@ pub const D2H_LOGITS_PF_HELD: usize = 10 * D2H + 8; // prefill 後 1 点目の W
 /// 混ざった**値で、どちらを GPU バッチ化すべきか判断できなかった。呼び出し側が
 /// 層種別を引数で与え、別バケットに積む。`ATNN` 生 id の合計は従来の
 /// `attn_core` と一致する (GDN + FULL = ATNN)。
-pub const ATT_CLS_N: usize = 2;
+pub const ATT_CLS_N: usize = 4;
 pub const ATT_GDN: usize = 100 * ATTN; // GDN (linear attention) スキャン・beta/alpha 投影
 pub const ATT_FULL: usize = 100 * ATTN + 1; // full attention (GQA attend / full_attn_core)
+/// s61c (T5b 計測のみ): `attn_gdn` を「投影 (beta/alpha)」と「スキャン (GDN コア)」に
+/// 割る細分。**表示専用**で、`ATT_GDN` の集計は従来どおり (この 2 本の和になる)。
+///
+/// 動機: prefill の `attn_gdn` が 28.5 s を占めたが、この値は
+/// **beta/alpha の投影 (`apply_bt_rows` → P17i GEMM) と GDN スキャン
+/// (`gdn_scan_batch`: DevBuffer 確保 + H2D/D2H + sync) が同一バケットに
+/// 混ざった**もの。T5b の第一レバー (スキャンのデバイス常駐化) の効果と、
+/// 投影側が既に GPU で走っているかを切り分けられなかったため分離する。
+pub const ATT_GDN_PROJ: usize = 100 * ATTN + 2; // GDN の beta/alpha 投影のみ
+pub const ATT_GDN_SCAN: usize = 100 * ATTN + 3; // GDN スキャン本体
 pub const N_OPS: usize = 15;
 
 /// s57 (T4): 計測フェーズ。prefill (n>1 の forward) と decode (n==1) を
@@ -179,7 +189,13 @@ const D2H_NAMES: [&str; D2H_N] = [
 ];
 
 /// s57 (T4): attn_core の層種別細分名 (id は 100*ATTN + i)。
-const ATT_CLS_NAMES: [&str; ATT_CLS_N] = ["attn_gdn", "attn_full"];
+const ATT_CLS_NAMES: [&str; ATT_CLS_N] = [
+    "attn_gdn",
+    "attn_full",
+    // s61c: attn_gdn の内訳 (attn_gdn 行の直下にネスト表示・表示専用)
+    "gdn_proj",
+    "gdn_scan",
+];
 
 /// s57 (T4): op ごとの実行先ラベル分類 (表示専用)。
 /// `None` は「実行先が固定 (GPU 選択が無い CPU 要素演算)」を表す `cpu*`。
@@ -449,6 +465,15 @@ pub(crate) fn add_sample(
         ATT_SUB_NS[Phase::Both.idx()][k].fetch_add(ns, Ordering::Relaxed);
         ATT_SUB_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
         ATT_SUB_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
+        // s61c: GDN の内訳 (PROJ / SCAN) は **親 (ATT_GDN) へ合算する**。
+        // 生 id (attn_core) への合算は上の共通ブロックが slot = D2H で
+        // 既に行っているので、ここで触ると二重計上になる (実際に踏んだ)。
+        if k >= 2 {
+            ATT_SUB_NS[pi][0].fetch_add(ns, Ordering::Relaxed);
+            ATT_SUB_NS[Phase::Both.idx()][0].fetch_add(ns, Ordering::Relaxed);
+            ATT_SUB_CALLS[pi][0].fetch_add(calls, Ordering::Relaxed);
+            ATT_SUB_CALLS[Phase::Both.idx()][0].fetch_add(calls, Ordering::Relaxed);
+        }
         NS[pi][ATTN].fetch_add(ns, Ordering::Relaxed);
         NS[Phase::Both.idx()][ATTN].fetch_add(ns, Ordering::Relaxed);
         CALLS[pi][ATTN].fetch_add(calls, Ordering::Relaxed);
@@ -643,9 +668,16 @@ fn phase_table(phase: Phase, s: &mut String) {
                 if sns == 0 && sc == 0 {
                     continue;
                 }
+                // s61c: gdn_proj / gdn_scan は attn_gdn の内訳なので 1 段深く出す。
+                // attn_gdn の値は子分を合算済み (add_sample が親へも積む)。
+                let (indent, name) = if k >= 2 {
+                    ("      ", ATT_CLS_NAMES[k])
+                } else {
+                    ("    ", ATT_CLS_NAMES[k])
+                };
                 s.push_str(&format!(
-                    "    {:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
-                    ATT_CLS_NAMES[k],
+                    "{indent}{:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
+                    name,
                     sns as f64 / 1e6,
                     sc,
                     sns as f64 / total.max(1) as f64 * 100.0,
@@ -735,9 +767,16 @@ pub fn summary() -> String {
                 if sns == 0 && sc == 0 {
                     continue;
                 }
+                // s61c: gdn_proj / gdn_scan は attn_gdn の内訳 (1 段深く出す)。
+                // attn_gdn の値は子分を合算済み (add_sample が親へも積む)。
+                let (indent, name) = if k >= 2 {
+                    ("      ", ATT_CLS_NAMES[k])
+                } else {
+                    ("    ", ATT_CLS_NAMES[k])
+                };
                 s.push_str(&format!(
-                    "    {:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
-                    ATT_CLS_NAMES[k],
+                    "{indent}{:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
+                    name,
                     sns as f64 / 1e6,
                     sc,
                     sns as f64 / total.max(1) as f64 * 100.0,
@@ -776,6 +815,19 @@ mod tests {
     //! 時刻値は環境依存なので検証しない — 検証するのは id の算術と集約だけ。
     use super::*;
 
+    /// s61c: 集計カウンタ (`NS` / `ATT_SUB_*` 等) は**プロセス全体で 1 本**の
+    /// static なので、`reset()` を挟むテストを並走させると他テストの
+    /// バケットが消える (実際に `attn_gdn` 行が消えて落ちた)。集計に触れる
+    /// テストはこのロックを取って直列化する。ロックは panic でも解放される。
+    static GLOBAL_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// グローバルカウンタを汚すテスト用の排他ガード。
+    fn lock_counters() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// 生 id と telemetry のバイト表現に触れていないこと (細分を足しても不変)。
     #[test]
     fn d2h_subsplit_ids_are_outside_raw_range() {
@@ -804,13 +856,91 @@ mod tests {
     fn attn_split_ids_are_outside_raw_range() {
         assert_eq!(ATT_GDN, 100 * ATTN);
         assert_eq!(ATT_FULL, 100 * ATTN + 1);
+        assert_eq!(ATT_GDN_PROJ, 100 * ATTN + 2);
+        assert_eq!(ATT_GDN_SCAN, 100 * ATTN + 3);
         assert_eq!(ATT_CLS_NAMES.len(), ATT_CLS_N);
-        for (i, &id) in [ATT_GDN, ATT_FULL].iter().enumerate() {
+        for (i, &id) in [ATT_GDN, ATT_FULL, ATT_GDN_PROJ, ATT_GDN_SCAN]
+            .iter()
+            .enumerate()
+        {
             assert_eq!(id, ATT_GDN + i);
             assert!(id >= N_OPS, "細分 id は生 id の範囲外: {id}");
         }
         // D2H 細分 (10*D2H + i, i < 9) と範囲が交差しないこと
         assert!(ATT_GDN > D2H_LOGITS_PF_HELD);
+    }
+
+    /// s61c (T5b 計測のみ): `attn_gdn` は GDN 投影 + スキャンの和、`attn_core` は
+    /// さらに full attention との和。細分を足しても生バケットの意味が変わらない
+    /// こと (T4 の不変条件) を固定する。
+    #[test]
+    fn attn_gdn_splits_into_proj_and_scan_without_changing_totals() {
+        let _guard = lock_counters();
+        reset();
+        set_phase(Phase::Prefill);
+        // 2 層分: 投影 (beta/alpha) 2 call + スキャン 1 call
+        for _ in 0..2 {
+            add_sample(Phase::Prefill, ATT_GDN_PROJ, 1_000_000, 1, 512, true);
+            add_sample(Phase::Prefill, ATT_GDN_PROJ, 1_500_000, 1, 512, true);
+            add_sample(Phase::Prefill, ATT_GDN_SCAN, 10_000_000, 1, 512, true);
+        }
+        add_sample(Phase::Prefill, ATT_FULL, 2_000_000, 2, 512, true);
+        let s = summary();
+        let find = |name: &str| -> Vec<String> {
+            s.lines()
+                .find(|l| l.split_whitespace().next() == Some(name))
+                .unwrap_or_else(|| panic!("summary に {name} 行が無い\n{s}"))
+                .split_whitespace()
+                .map(|x| x.to_string())
+                .collect()
+        };
+        let core = find("attn_core");
+        let gdn = find("attn_gdn");
+        let full = find("attn_full");
+        let proj = find("gdn_proj");
+        let scan = find("gdn_scan");
+        // 投影 5.0ms ((1.0 + 1.5) ×2 層) + スキャン 20ms (10 ×2 層) = 25.0
+        assert_eq!(proj[1], "5.0", "投影は beta/alpha の 2 call × 2 層: {proj:?}");
+        assert_eq!(scan[1], "20.0", "スキャンは 1 call × 2 層: {scan:?}");
+        assert_eq!(gdn[1], "25.0", "attn_gdn = proj + scan: {gdn:?}");
+        // attn_core = attn_gdn + attn_full
+        assert_eq!(core[1], "27.0", "attn_core = gdn + full: {core:?}");
+        assert_eq!(full[1], "2.0");
+        // calls は細分側でも独立に数える (attn_gdn は親にも合算される)
+        assert_eq!(proj[2], "4");
+        assert_eq!(scan[2], "2");
+        assert_eq!(gdn[2], "6");
+        assert_eq!(core[2], "8", "attn_core = GDN 6 + full 2");
+        // ネスト: gdn_proj / gdn_scan は attn_gdn より深い位置に出る。
+        // prefill 表は [prefill] の見出し行から [decode] の手前まで (decode は
+        // 空だと "(no calls)" しか出さず総和行が無いので、範囲を切らないと
+        // 下の cumulative 表まで舐めてしまう)。
+        let prefill = s
+            .split("[prefill]")
+            .nth(1)
+            .expect("summary に [prefill] が無い")
+            .split("[decode]")
+            .next()
+            .unwrap();
+        assert!(
+            prefill.lines().any(|l| l.starts_with("    attn_gdn")),
+            "attn_gdn は 4 スペース: {prefill}"
+        );
+        assert!(
+            prefill.lines().any(|l| l.starts_with("      gdn_proj")),
+            "gdn_proj は 6 スペース (attn_gdn の内訳): {prefill}"
+        );
+        // 生バケット (attn_core) は細分を二重計上しない: 27.0 のまま
+        // (細分 25.0 を足した 52.0 にならない)。
+        // 注: prefill 表の総和行 (= attn_core + d2h) は**他のテストの並走**で
+        // 動くため絶対値では固定しない。ここでは細分が生バケットへ
+        // 二重に効いていないことだけを見る。
+        assert_eq!(
+            core[1], "27.0",
+            "attn_core は細分を二重計上しない (27.0 のまま): {core:?}"
+        );
+        assert_eq!(core[2], "8");
+        reset();
     }
 
     /// s56 (T2 項目0): decode chain のラベル分岐の算術。
@@ -861,6 +991,7 @@ mod tests {
     /// 挟んでいた s55 の書き方も廃止 — 末尾の 1 回だけにする)。
     #[test]
     fn logits_split_is_summarized_per_bucket() {
+        let _guard = lock_counters();
         reset();
         for (op, calls) in [
             (D2H_LOGITS_WAIT, 3u64),
@@ -900,6 +1031,7 @@ mod tests {
     /// あること (従来の累積値と一致する読み方)。
     #[test]
     fn phases_are_aggregated_separately_and_summed_into_cumulative() {
+        let _guard = lock_counters();
         reset();
         add_sample(Phase::Prefill, QKV, 5_000_000, 8, 256, true);
         add_sample(Phase::Decode, QKV, 1_000_000, 100, 1, true);
@@ -934,6 +1066,7 @@ mod tests {
     /// 直下のネスト行 (attn_gdn / attn_full) で示す — 表の構造は変えない。
     #[test]
     fn attn_core_is_split_into_gdn_and_full_rows() {
+        let _guard = lock_counters();
         reset();
         // GDN: 30 call × 3.0 ms / full: 16 call × 2.0 ms
         for _ in 0..30 {
@@ -1002,6 +1135,7 @@ mod tests {
     /// (T4 は TOKS / CALLS で割っていた)。
     #[test]
     fn tok_per_call_excludes_samples_without_rows() {
+        let _guard = lock_counters();
         reset();
         set_phase(Phase::Prefill);
         // 行数を渡した 2 call (各 256 行) + 行数 0 の 8 call
