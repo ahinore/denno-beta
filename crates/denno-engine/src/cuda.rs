@@ -846,6 +846,157 @@ impl Scratch {
     }
 }
 
+/// s67: GDN スキャン (chunked) の作業領域。**層をまたいで再利用する** (grow-only)。
+///
+/// 動機 (s64/s66 の計測): prefill の `gdn_scan` 3.15 s のうち **alloc 1.04 s** は
+/// 層ごとに 16 本 (計 ≈180MB) を `DevBuffer::from_slice` で作り直していた分で、
+/// 形はモデルで固定 (n はリクエスト内で一定) なのに毎回 cuMemAlloc/cuMemFree
+/// していた。確保を初回だけにし、以降は `copy_from` で上書きする。
+///
+/// 数値は不変 — バッファの寿命が延びるだけで、書き込む内容・カーネル引数・
+/// 演算順は 1 つも変えない (scheduler ワーカーは単一スレッドなので thread_local
+/// で競合しない・`SCRATCH` と同じ規約)。
+struct GdnScratch {
+    q: Option<DevBuffer>,        // [n, conv_dim]
+    z: Option<DevBuffer>,        // [n, vd]
+    beta: Option<DevBuffer>,     // [n, nv]
+    alpha: Option<DevBuffer>,    // [n, nv]
+    conv_in: Option<DevBuffer>,  // [conv_dim, cs]
+    ssm_in: Option<DevBuffer>,   // [nv, dk, dv]
+    wc: Option<DevBuffer>,       // 重み 4 本 (層ごとに差し替え)
+    wa: Option<DevBuffer>,
+    wd: Option<DevBuffer>,
+    wn: Option<DevBuffer>,
+    w: Option<DevBuffer>,     // [n_chunks, nv, dk, dv] chunk ローカル遷移
+    m: Option<DevBuffer>,     // [n_chunks, nv, dk, dk]
+    sinit: Option<DevBuffer>, // [n_chunks, nv, dk, dv]
+    y: Option<DevBuffer>,     // [n, vd]
+    conv_out: Option<DevBuffer>,
+    ssm_out: Option<DevBuffer>,
+}
+
+/// カーネル引数用の生ポインタ束 (バッファ本体は thread_local が保持し続ける)。
+#[derive(Clone, Copy)]
+struct GdnPtrs {
+    q: CUdeviceptr,
+    z: CUdeviceptr,
+    beta: CUdeviceptr,
+    alpha: CUdeviceptr,
+    conv_in: CUdeviceptr,
+    ssm_in: CUdeviceptr,
+    wc: CUdeviceptr,
+    wa: CUdeviceptr,
+    wd: CUdeviceptr,
+    wn: CUdeviceptr,
+    w: CUdeviceptr,
+    m: CUdeviceptr,
+    sinit: CUdeviceptr,
+    y: CUdeviceptr,
+    conv_out: CUdeviceptr,
+    ssm_out: CUdeviceptr,
+}
+
+#[derive(Clone, Copy)]
+enum GdnBuf {
+    Y,
+    ConvOut,
+    SsmOut,
+}
+
+impl GdnScratch {
+    const fn empty() -> Self {
+        Self {
+            q: None,
+            z: None,
+            beta: None,
+            alpha: None,
+            conv_in: None,
+            ssm_in: None,
+            wc: None,
+            wa: None,
+            wd: None,
+            wn: None,
+            w: None,
+            m: None,
+            sinit: None,
+            y: None,
+            conv_out: None,
+            ssm_out: None,
+        }
+    }
+    fn grow(cap: &mut Option<DevBuffer>, bytes: usize) -> Result<()> {
+        if cap.as_ref().map(|b| b.bytes()).unwrap_or(0) < bytes {
+            *cap = Some(DevBuffer::alloc(bytes.max(1))?);
+        }
+        Ok(())
+    }
+    /// 形が変わらない限り何もしない (prefill の 24 層は全て同じ形)。
+    fn ensure(
+        &mut self,
+        n: usize,
+        conv_dim: usize,
+        vd: usize,
+        nv: usize,
+        dk: usize,
+        dv: usize,
+        cs: usize,
+        n_chunks: usize,
+    ) -> Result<()> {
+        const F: usize = std::mem::size_of::<f32>();
+        Self::grow(&mut self.q, n * conv_dim * F)?;
+        Self::grow(&mut self.z, n * vd * F)?;
+        Self::grow(&mut self.beta, n * nv * F)?;
+        Self::grow(&mut self.alpha, n * nv * F)?;
+        Self::grow(&mut self.conv_in, conv_dim * cs * F)?;
+        Self::grow(&mut self.ssm_in, nv * dk * dv * F)?;
+        Self::grow(&mut self.wc, conv_dim * 4 * F)?; // d_conv == 4 (chunked 前提)
+        Self::grow(&mut self.wa, nv * F)?;
+        Self::grow(&mut self.wd, nv * F)?;
+        Self::grow(&mut self.wn, dv * F)?;
+        Self::grow(&mut self.w, n_chunks * nv * dk * dv * F)?;
+        Self::grow(&mut self.m, n_chunks * nv * dk * dk * F)?;
+        Self::grow(&mut self.sinit, n_chunks * nv * dk * dv * F)?;
+        Self::grow(&mut self.y, n * vd * F)?;
+        Self::grow(&mut self.conv_out, conv_dim * cs * F)?;
+        Self::grow(&mut self.ssm_out, nv * dk * dv * F)?;
+        Ok(())
+    }
+    fn ptrs(&self) -> GdnPtrs {
+        let p = |b: &Option<DevBuffer>| b.as_ref().expect("GdnScratch: 未確保").ptr();
+        GdnPtrs {
+            q: p(&self.q),
+            z: p(&self.z),
+            beta: p(&self.beta),
+            alpha: p(&self.alpha),
+            conv_in: p(&self.conv_in),
+            ssm_in: p(&self.ssm_in),
+            wc: p(&self.wc),
+            wa: p(&self.wa),
+            wd: p(&self.wd),
+            wn: p(&self.wn),
+            w: p(&self.w),
+            m: p(&self.m),
+            sinit: p(&self.sinit),
+            y: p(&self.y),
+            conv_out: p(&self.conv_out),
+            ssm_out: p(&self.ssm_out),
+        }
+    }
+    fn buf(&self, which: GdnBuf) -> &DevBuffer {
+        let b = match which {
+            GdnBuf::Y => &self.y,
+            GdnBuf::ConvOut => &self.conv_out,
+            GdnBuf::SsmOut => &self.ssm_out,
+        };
+        b.as_ref().expect("GdnScratch: 未確保")
+    }
+}
+
+thread_local! {
+    static GDN_SCRATCH: std::cell::RefCell<GdnScratch> =
+        std::cell::RefCell::new(GdnScratch::empty());
+}
+
 static GPU_CTX: OnceLock<Option<CudaCtx>> = OnceLock::new();
 static GPU_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -7189,29 +7340,38 @@ fn gdn_scan_chunked_impl(
     // s64 (T5b L1 Step 1 計測): `gdn_scan_impl` と同一の 4 区間細分 (表示専用)。
     // chunked 経路は pass ごとに sync するため launch/sync は 3 pass 分の合計。
     let mut q = crate::prof::Seq::begin(crate::prof::D2H_GDN_PF_ALLOC, Instant::now());
-    let dq = DevBuffer::from_slice(qkv)?;
-    let dz = DevBuffer::from_slice(z)?;
-    let dbeta = DevBuffer::from_slice(beta)?;
-    let dalpha = DevBuffer::from_slice(alpha)?;
-    let dconv_in = DevBuffer::from_slice(conv_st)?;
-    let dssm_in = DevBuffer::from_slice(ssm_st)?;
-    let dwc = DevBuffer::from_slice(wconv)?;
-    let dwa = DevBuffer::from_slice(wa)?;
-    let dwd = DevBuffer::from_slice(wdt)?;
-    let dwn = DevBuffer::from_slice(wnorm)?;
-    let dw = DevBuffer::from_slice(&vec![0.0f32; n_chunks * nv * dk * dv])?;
-    let dm = DevBuffer::from_slice(&vec![0.0f32; n_chunks * nv * dk * dk])?;
-    let dsinit = DevBuffer::from_slice(&vec![0.0f32; n_chunks * nv * dk * dv])?;
-    let dy = DevBuffer::from_slice(&vec![0.0f32; n * vd])?;
-    // 最終状態は最終 chunk ブロックのみ書き込むためゼロ初期化 (未書込部は未使用)
-    let dconv_out = DevBuffer::from_slice(&vec![0.0f32; conv_dim * cs])?;
-    let dssm_out = DevBuffer::from_slice(&vec![0.0f32; nv * dk * dv])?;
+    // s67: 16 本の作業領域は層をまたいで再利用する (確保は初回のみ・形が同じ間は
+    // 何もしない)。中身は毎回 copy_from で上書きするので従来と同じ状態になる。
+    // w/m/sinit/y は各 pass が全要素を書くためゼロ埋め不要 (旧実装は
+    // `from_slice(&vec![0.0; …])` でゼロを H2D していた — その転送も消える)。
+    // conv_out/ssm_out だけは「最終 chunk ブロックのみ書き込み」なので従来どおり
+    // ゼロで初期化する (未書込部は未使用・挙動を変えない)。
+    let dp = GDN_SCRATCH.with(|cell| -> Result<GdnPtrs> {
+        let mut s = cell.borrow_mut();
+        s.ensure(n, conv_dim, vd, nv, dk, dv, cs, n_chunks)?;
+        let p = s.ptrs();
+        s.buf(GdnBuf::ConvOut)
+            .copy_from(&vec![0.0f32; conv_dim * cs])?;
+        s.buf(GdnBuf::SsmOut)
+            .copy_from(&vec![0.0f32; nv * dk * dv])?;
+        s.q.as_ref().unwrap().copy_from(qkv)?;
+        s.z.as_ref().unwrap().copy_from(z)?;
+        s.beta.as_ref().unwrap().copy_from(beta)?;
+        s.alpha.as_ref().unwrap().copy_from(alpha)?;
+        s.conv_in.as_ref().unwrap().copy_from(conv_st)?;
+        s.ssm_in.as_ref().unwrap().copy_from(ssm_st)?;
+        s.wc.as_ref().unwrap().copy_from(wconv)?;
+        s.wa.as_ref().unwrap().copy_from(wa)?;
+        s.wd.as_ref().unwrap().copy_from(wdt)?;
+        s.wn.as_ref().unwrap().copy_from(wnorm)?;
+        Ok(p)
+    })?;
     q.lap(crate::prof::D2H_GDN_PF_LAUNCH);
 
     // ---- pass 1: chunk 並列でローカル遷移 (W[ci], M[ci]) --------------------
-    let (mut pq, mut pb, mut pa) = (dq.ptr(), dbeta.ptr(), dalpha.ptr());
-    let (mut pci, mut pwc, mut pwa, mut pwd) = (dconv_in.ptr(), dwc.ptr(), dwa.ptr(), dwd.ptr());
-    let (mut pw, mut pm) = (dw.ptr(), dm.ptr());
+    let (mut pq, mut pb, mut pa) = (dp.q, dp.beta, dp.alpha);
+    let (mut pci, mut pwc, mut pwa, mut pwd) = (dp.conv_in, dp.wc, dp.wa, dp.wd);
+    let (mut pw, mut pm) = (dp.w, dp.m);
     let (mut ni, mut cli, mut nki, mut nvi, mut dki, mut dvi) = (
         n as c_int,
         chunk_len as c_int,
@@ -7256,8 +7416,7 @@ fn gdn_scan_chunked_impl(
     q.lap(crate::prof::D2H_GDN_PF_D2H);
 
     // ---- pass 2: chunk 先頭状態 Sinit の直列伝播 ----------------------------
-    let (mut psi, mut pm2, mut pw2, mut psinit) =
-        (dssm_in.ptr(), dm.ptr(), dw.ptr(), dsinit.ptr());
+    let (mut psi, mut pm2, mut pw2, mut psinit) = (dp.ssm_in, dp.m, dp.w, dp.sinit);
     let (mut nc2, mut nv2, mut dk2, mut dv2) =
         (n_chunks as c_int, nv as c_int, dk as c_int, dv as c_int);
     let mut args_state = [
@@ -7285,10 +7444,10 @@ fn gdn_scan_chunked_impl(
     q.lap(crate::prof::D2H_GDN_PF_D2H);
 
     // ---- pass 3: Sinit[ci] からの逐次 AR スキャン (chunk 並列) ---------------
-    let (mut pq3, mut pz3, mut pb3, mut pa3) = (dq.ptr(), dz.ptr(), dbeta.ptr(), dalpha.ptr());
-    let (mut pci3, mut psinit3) = (dconv_in.ptr(), dsinit.ptr());
-    let (mut pwc3, mut pwa3, mut pwd3, mut pwn3) = (dwc.ptr(), dwa.ptr(), dwd.ptr(), dwn.ptr());
-    let (mut py, mut pco, mut pso) = (dy.ptr(), dconv_out.ptr(), dssm_out.ptr());
+    let (mut pq3, mut pz3, mut pb3, mut pa3) = (dp.q, dp.z, dp.beta, dp.alpha);
+    let (mut pci3, mut psinit3) = (dp.conv_in, dp.sinit);
+    let (mut pwc3, mut pwa3, mut pwd3, mut pwn3) = (dp.wc, dp.wa, dp.wd, dp.wn);
+    let (mut py, mut pco, mut pso) = (dp.y, dp.conv_out, dp.ssm_out);
     let (mut ni3, mut cli3) = (n as c_int, chunk_len as c_int);
     let (mut nki3, mut nvi3, mut dki3, mut dvi3) =
         (nk as c_int, nv as c_int, dk as c_int, dv as c_int);
@@ -7334,9 +7493,15 @@ fn gdn_scan_chunked_impl(
     ctx.sync()?;
     q.lap(crate::prof::D2H_GDN_PF_D2H);
 
-    let y = dy.to_vec::<f32>(n * vd)?;
-    let conv_new = dconv_out.to_vec::<f32>(conv_dim * cs)?;
-    let ssm_new = dssm_out.to_vec::<f32>(nv * dk * dv)?;
+    let (y, conv_new, ssm_new) =
+        GDN_SCRATCH.with(|cell| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+            let s = cell.borrow();
+            Ok((
+                s.buf(GdnBuf::Y).to_vec::<f32>(n * vd)?,
+                s.buf(GdnBuf::ConvOut).to_vec::<f32>(conv_dim * cs)?,
+                s.buf(GdnBuf::SsmOut).to_vec::<f32>(nv * dk * dv)?,
+            ))
+        })?;
     // s65: 発行元の件数分類 (y は linear / conv+ssm は GDN 状態)
     crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
     crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
