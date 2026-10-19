@@ -79,6 +79,7 @@ fn test_app() -> Router {
         scheduler,
         model_name: "denno-test".to_string(),
         model_id: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+        default_repetition_penalty: None,
     });
     denno_server::router(state)
 }

@@ -65,6 +65,10 @@ enum Commands {
         /// P4: リクエストキューの上限 (実行中 1 件の他に待ち行列に入れられる数)。
         /// 同時受け付けがこれを超えると 503 (overloaded_error) を返す
         #[arg(long, default_value_t = 32)] max_queue: usize,
+        /// s56b: serve 既定の repetition_penalty (リクエスト未指定時のみ適用)。
+        /// 未指定なら従来と完全に同一のサンプリング経路 (出力ビット不変)。
+        /// Qwen3.5-9B int8 + 長い system + tools の崩壊対策として 1.05 を推奨
+        #[arg(long)] repetition_penalty: Option<f32>,
     },
 }
 
@@ -215,7 +219,7 @@ fn main() -> Result<()> {
             };
             println!("{}", out);
         }
-        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue } => {
+        Commands::Serve { repo, host, port, name, api_key, max_tokens: _max_tokens, seed, prefix_cache_tokens, quant, max_queue, repetition_penalty } => {
             let dir = model_dir(&repo);
             if !dir.exists() {
                 bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
@@ -233,6 +237,7 @@ fn main() -> Result<()> {
                 prefix_cache_tokens,
                 quant: quant_mode,
                 max_queue,
+                repetition_penalty,
             }))?;
         }
     }

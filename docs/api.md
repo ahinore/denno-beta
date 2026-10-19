@@ -141,6 +141,17 @@ denno 拡張のトップレベル任意フィールド (s56)。A2.5 の `repetit
 - `no_repeat_ngram_size` が **1 以下または 1024 超なら 400** (`n == 1` は「直前トークン自身を禁止」という別の意味になり、無効と区別できないため明示的に弾く。無効化はフィールドを省略する)
 - NaN / inf (JSON の `1e40` 等) は 400 invalid_request_error。`0.0` / `-0.0` は `None` に正規化する
 
+### serve 既定値 (s56b)
+
+`denno serve --repetition-penalty <f32>` を付けると、**リクエストが `repetition_penalty` を
+指定しなかった場合のみ**その値が適用される (リクエスト指定が常に優先)。未指定の起動では
+`None` のままなので出力は従来とビット完全一致する。`0` 以下・非有限値は起動時に拒否する。
+
+根拠 (実測): Qwen3.5-9B int8 は「長い system (約 2.6k tok) + tools 9 個 (約 3.6k tok)」の
+greedy 経路で出力が崩壊する (`.showError warning` 等の混入・偽 `user` ターン)。
+同じ 6k 文脈でも tools 無しでは正常、tools があってもスキーマを縮めると正常。
+`--repetition-penalty 1.05` を既定にすると同一プロンプトで正常な短答が得られる。
+
 **適用順** (この順序はビット契約の一部で、変えてはならない):
 
 ```text

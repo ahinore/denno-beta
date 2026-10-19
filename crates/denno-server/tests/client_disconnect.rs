@@ -77,6 +77,7 @@ fn test_app(delay_ms: u64) -> Arc<AppState> {
         scheduler,
         model_name: "denno-test".to_string(),
         model_id: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+        default_repetition_penalty: None,
     })
 }
 

@@ -72,6 +72,7 @@ fn test_app_with(model: Box<dyn Model>, max_queue: usize) -> (Router, Arc<AppSta
         scheduler,
         model_name: "denno-test".to_string(),
         model_id: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+        default_repetition_penalty: None,
     });
     let app = denno_server::router(state.clone());
     (app, state)

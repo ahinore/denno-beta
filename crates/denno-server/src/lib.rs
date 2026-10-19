@@ -37,6 +37,10 @@ pub struct AppState {
     pub model_name: String,
     /// 実行中のモデル ID (例: Qwen/Qwen2.5-0.5B-Instruct)。テレメトリ ServerInfo 用。
     pub model_id: String,
+    /// s56b: serve 既定の repetition_penalty。リクエストが未指定のときだけ適用する。
+    /// 既定 None (= 従来と完全に同一のサンプリング経路) なので、
+    /// フラグを付けない起動では出力ビット不変 (アンカー不変)。
+    pub default_repetition_penalty: Option<f32>,
 }
 
 /// serve 設定
@@ -58,6 +62,10 @@ pub struct ServeConfig {
     /// キューに入ったリクエストは実行開始まで待つ (サーバー側の待ち時間
     /// タイムアウトは無し)。
     pub max_queue: usize,
+    /// s56b: serve 既定の repetition_penalty (None = リクエスト指定のみ)。
+    /// Qwen3.5-9B int8 は長い system + tools の greedy 経路で崩壊するため、
+    /// 運用では 1.05 を指定する (実測: 崩壊解消・短答化)。
+    pub repetition_penalty: Option<f32>,
 }
 
 // ---------- Anthropic 形式エラー ----------
@@ -761,6 +769,13 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
     if let Some(n) = cfg.prefix_cache_tokens {
         engine.set_prefix_cache_max_tokens(n);
     }
+    // s56b: serve 既定 repetition_penalty の妥当性検査 (0 以下/非有限は起動時に拒否)。
+    if let Some(p) = cfg.repetition_penalty {
+        if !p.is_finite() || p <= 0.0 {
+            anyhow::bail!("--repetition-penalty must be a finite positive number (got {p})");
+        }
+        tracing::info!("serve default repetition_penalty = {p}");
+    }
     tracing::info!(
         "model loaded: {} (context = {}, engine = denno)",
         engine.name,
@@ -776,6 +791,7 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
         scheduler: Scheduler::spawn(engine, cfg.max_queue.max(1)),
         model_name,
         model_id,
+        default_repetition_penalty: cfg.repetition_penalty,
     });
 
     // P13: テレメトリが有効ならハブ → broadcast への転送タスクを起動する。
@@ -931,7 +947,7 @@ async fn messages(
         top_k: req.top_k,
         stop_sequences: req.stop_sequences.clone(),
         seed: None,
-        repetition_penalty: req.repetition_penalty,
+        repetition_penalty: req.repetition_penalty.or(state.default_repetition_penalty),
         frequency_penalty: anti.frequency,
         presence_penalty: anti.presence,
         no_repeat_ngram_size: anti.no_repeat_ngram_size,
