@@ -1480,6 +1480,26 @@ dominant → redefine the T5b main lever.
 
 **What is left**: gate_up 7.38 s (64 calls, 114 ms), qkv 4.06 s, gdn_scan 3.13 s (alloc 1.04 / sync 1.09 / d2h 0.96), down 2.71 s. The `gdn_scan` **alloc 1.04 s is 12 `DevBuffer::from_slice` calls per layer (inputs plus the four weights, re-allocated and re-uploaded every call)**, removable by reusing the regions. `matvec_rows_bt_vec_impl` (the n ≥ 64 path) still uses the `[d][i]` layout, so any large-n F32 projection has the same headroom.
 
+### GDN scan scratch buffers are reused across layers ✅ (2026-10-19, s67)
+
+> The s64 split showed `gdn_scan`'s 3.15 s breaking down as **alloc 1.04 s / sync 1.09 s / d2h 0.96 s**. The 1.04 s was 21.7 ms per call across 48 calls — **16 `DevBuffer::from_slice` calls** (6 inputs, 4 weights, 3 chunk buffers, 3 outputs, ≈180 MB total) **allocated with cuMemAlloc and thrown away on every layer**, even though n is constant within a request and the shapes are fixed by the model.
+
+**Fix**: a `GdnScratch` (thread_local, grow-only) holding the chunked scan's 16 buffers; they are allocated once and afterwards only overwritten with `copy_from`, the same convention `SCRATCH` already uses for `maybe_gpu_linear`.
+
+- `w` / `m` / `sinit` / `y` are fully written by the respective pass, so they no longer need zero-filling — this also removes the **≈60 MB per call of zeros the old code uploaded via `from_slice(&vec![0.0; …])`**
+- `conv_out` / `ssm_out` keep their zero initialisation, because only the final chunk block writes them (behaviour unchanged)
+- the four weights differ per layer, so they are refreshed with `copy_from` (a few hundred KB — negligible)
+
+**Numerics**: only the buffer lifetime changes; the contents written, the kernel arguments, the launch configuration and the accumulation order are untouched. 231 tests pass, all three GPU anchors MATCH.
+
+**Result**:
+
+- `gdn_pf_alloc` **1,044 ms → 526 ms** (what remains is the pure H2D transfer, ≈11 ms/call)
+- `gdn_scan` 3,126 → 2,593 ms, `attn_gdn` 4,209 → 3,664 ms
+- prefill **23.7 s → 23.1 s**, **240 → 246 tok/s**
+
+**Where we stand** (one prefill request): gate_up 7.38 s / qkv 4.09 s / down 2.73 s / gdn_scan 2.59 s (sync 1.09 + d2h 0.97 + alloc 0.53) / o_proj 1.49 s / attn_full 1.22 s / gdn_proj 1.07 s / swiglu 0.85 s. The largest remaining item is **the gate_up GEMM itself** (64 calls × 114 ms, ≈75 ms of GPU work = 13 TFLOP/s, 11.6% of peak). int8 accumulation is int32 and therefore order-independent, so re-tiling should not change the numbers.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)

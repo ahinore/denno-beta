@@ -1476,6 +1476,26 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 
 **残った最大項目**: gate_up 7.38 s (64 call・114 ms)・qkv 4.06 s・gdn_scan 3.13 s (alloc 1.04 / sync 1.09 / d2h 0.96)・down 2.71 s。`gdn_scan` の **alloc 1.04 s は 12 本の `DevBuffer::from_slice` (入力 + 重み 4 本を層ごとに再確保・再 H2D)** で、領域再利用だけで削れる。`matvec_rows_bt_vec_impl` (n ≥ 64 経路) は同じ `[d][i]` レイアウトのままなので、n の大きい F32 投影を使う経路があれば同様の改善余地がある。
 
+### GDN スキャンの作業領域を層をまたいで再利用 ✅ (2026-10-19, s67)
+
+> s64 の細分で `gdn_scan` 3.15 s の内訳は **alloc 1.04 s / sync 1.09 s / d2h 0.96 s** だった。alloc の 1.04 s は 48 call で 21.7 ms/call — 中身は **16 本の `DevBuffer::from_slice`** (入力 6 本 + 重み 4 本 + chunk 用 3 本 + 出力 3 本・計 ≈180 MB) を**層ごとに cuMemAlloc して捨てていた**分。n はリクエスト内で一定、形はモデルで固定なのに毎回作り直していた。
+
+**修正**: `GdnScratch` (thread_local・grow-only) を追加し、chunked スキャンの 16 本を初回だけ確保して以後は `copy_from` で上書きする。`SCRATCH` (maybe_gpu_linear 用) と同じ規約。
+
+- `w` / `m` / `sinit` / `y` は各 pass が全要素を書くためゼロ埋め不要 — 旧実装が `from_slice(&vec![0.0; …])` で **ゼロを H2D していた分 (≈60 MB/call) も消えた**
+- `conv_out` / `ssm_out` だけは「最終 chunk ブロックのみ書き込み」の規約があるため、従来どおりゼロで初期化 (挙動不変)
+- 重み 4 本は層ごとに中身が変わるので `copy_from` で差し替え (サイズは数百 KB なので転送は無視できる)
+
+**数値**: バッファの寿命が延びただけで、書き込み内容・カーネル引数・起動構成・演算順は不変。テスト 231 passed / 0 failed、GPU アンカー 3 本 MATCH。
+
+**結果**:
+
+- `gdn_pf_alloc` **1,044 ms → 526 ms** (残りは純粋な H2D 転送 ≈11 ms/call)
+- `gdn_scan` 3,126 → 2,593 ms・`attn_gdn` 4,209 → 3,664 ms
+- prefill **23.7 s → 23.1 s**・**240 → 246 tok/s**
+
+**現時点の内訳** (prefill 1 リクエスト): gate_up 7.38 s / qkv 4.09 s / down 2.73 s / gdn_scan 2.59 s (sync 1.09 + d2h 0.97 + alloc 0.53) / o_proj 1.49 s / attn_full 1.22 s / gdn_proj 1.07 s / swiglu 0.85 s。残る最大は **gate_up の GEMM 本体** (64 call・114 ms・GPU 実働 ≈75 ms = 13 TFLOP/s ≒ ピークの 11.6%)。int8 の累積は int32 で順序非依存のため、再タイル化しても数値は変わらない見込み。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
