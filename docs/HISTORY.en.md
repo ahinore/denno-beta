@@ -1338,6 +1338,18 @@ raw logits → ① repetition_penalty → ② frequency_penalty → ③ presence
 - **Test count**: 295 → 299 passed / 0 failed / 18 ignored (`cargo test --workspace`). 295 (the state right after the revert, i.e. `1e51741`) is the baseline; the one test T5a added went away with the revert
 - **Lesson**: **take measurement labels from measurements, not from what the caller asserts**. And once a "single entry point" exists, make it mechanically checkable that the entry was reached — a second path around it shows up only as a performance regression and then sits there quietly
 
+### Splitting `attn_gdn` into projection and scan (measurement only) ✅ (2026-10-19, s61c)
+
+> The T5 profile showed prefill's `attn_gdn` taking 28.5 s, but that single bucket **mixed the beta/alpha projections (`apply_bt_rows` → P17i GEMM) with the GDN scan itself (`gdn_scan_batch`: DevBuffer allocation + H2D/D2H + sync)**. That made it impossible to separate the effect of T5b's first lever (device-resident scan) from whether the projection side already runs on the GPU, so the accounting alone was split in two. **The numeric path and branches are unchanged.**
+
+- **Bucket design**: `ATT_GDN` stays the **parent bucket as before**; display-only children `ATT_GDN_PROJ` (id `100*ATTN+2`) and `ATT_GDN_SCAN` (`+3`) are added (`ATT_CLS_N` 2 → 4). `add_sample` **folds child samples into the parent `ATT_GDN`**, so the parent's meaning and value are unchanged
+- **The double-counting trap**: folding into the raw id (`attn_core`) is already done by `add_sample`'s shared block (`slot = D2H`), so letting the child→parent accumulation reach the raw id double-counts `attn_core` (hit for real during implementation). **Invariants**: `attn_core == attn_gdn + attn_full` and `attn_gdn == gdn_proj + gdn_scan`, in both time and calls
+- **Display**: children print one level deeper (6 spaces) directly under `attn_gdn`, in both `phase_table` and `summary`. The prefill total line sums raw buckets only, so it never becomes a child-inflated value
+- **Scope**: the 3 prefill-path sites in qwen35 (beta projection, alpha projection → PROJ; scan → SCAN). **The decode chain's `ATT_GDN` is deliberately not split** — there beta/alpha and the scan run in a single fused device call, and separating them would require touching the numeric path, beyond the "measurement only" scope
+- **Tests (+1)**: `attn_gdn_splits_into_proj_and_scan_without_changing_totals` pins the times (`proj 5.0 + scan 20.0 = gdn 25.0`, `core 27.0`), the call counts, the nested display, and the absence of double counting in the raw bucket. The existing `attn_split_ids_are_outside_raw_range` gains checks that the new ids are consecutive
+- **Test count**: 299 → 300 passed / 0 failed / 18 ignored (`cargo test --workspace`). `cargo check --workspace --features cuda` also passes (no new warnings)
+- **Lesson**: **never pin absolute values of shared counters in tests** — profile counters are process-global and shift with whatever other tests run in parallel. Pin the **relations** instead, e.g. that the children sum to the parent
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
