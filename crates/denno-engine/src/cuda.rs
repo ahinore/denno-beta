@@ -689,7 +689,7 @@ impl CudaCtx {
         k: usize,
         n: usize,
     ) -> Result<Vec<f32>> {
-        debug_assert_eq!(w.bytes(), k * n);
+        debug_assert_eq!(w.bytes(), k * gemm_pad_n(n));
         debug_assert_eq!(scale.bytes(), n * 4);
         let (aq, asc) = self.quantize_rows(a, m, k)?;
         self.matvec_rows_bt_i8_dev(&aq, &asc, w, scale, m, k, n)
@@ -722,9 +722,9 @@ impl CudaCtx {
                 &mut kc as *mut _ as *mut c_void,
                 &mut nc as *mut _ as *mut c_void,
             ];
-            let gmx = m.div_ceil(128) as u32;
-            let gmy = n.div_ceil(128) as u32;
-            self.launch_async(self.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args)?;
+            let gmx = m.div_ceil(GEMM_TILE) as u32;
+            let gmy = n.div_ceil(GEMM_TILE_N) as u32;
+            self.launch_async(self.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args)?;
             self.sync()?;
         }
         dev_out.to_vec::<f32>(m * n)
@@ -740,7 +740,7 @@ impl CudaCtx {
         k: usize,
         n: usize,
     ) -> Result<Vec<f32>> {
-        debug_assert_eq!(w.bytes(), k * n);
+        debug_assert_eq!(w.bytes(), k * gemm_pad_n(n));
         debug_assert_eq!(scale.bytes(), n * 4);
         let (aq, asc) = self.quantize_rows(a, m, k)?;
         self.linear_gemm_i8_dev(&aq, &asc, w, scale, m, k, n)
@@ -1068,6 +1068,41 @@ struct GpuW {
     sc: DevBuffer,
     k: usize,
     n: usize,
+    /// s74: `w` の行数 (n を GEMM_PAD_N の倍数に切り上げた値)。dno_gemm_i8 は
+    /// j 方向を 256 列単位で処理するため、重みは 256 行に 0 パディングして渡す。
+    /// カーネル自身は `n` (実列数) で epilogue を打ち切るので `sc` は n 本のまま。
+    npad: usize,
+}
+
+/// s74: `gemm_pad_n(n)` を通した**パディング済み**行数 (`w` の行数)。
+const GEMM_PAD_N: usize = 256;
+/// s74: dno_gemm_i8 のタイル寸法 (kernels_int8.cu の GEMM_TILE / GEMM_TILE_N と
+/// 同期すること)。i 方向 128 行 × j 方向 256 列・block 16x4 (1 thread 8x16 出力)。
+const GEMM_TILE: usize = 128;
+const GEMM_TILE_N: usize = 256;
+
+/// s74 (T6 候補 1): dno_gemm_i8 の j 方向タイル (256) に合わせた重み行の切り上げ。
+/// 旧 128 タイル版は端をカーネル側で 0 埋めしていたが、新カーネルは A 行を
+/// 2 枚の B タイルで共有するため A/B の pad を非対称にできる重み側だけを
+/// ホストで 0 埋めする (i8 の 0 は積に寄与しない → dot は厳密に不変)。
+pub(crate) fn gemm_pad_n(n: usize) -> usize {
+    n.div_ceil(GEMM_PAD_N) * GEMM_PAD_N
+}
+
+/// s74: 重み [n,k] i8 (row-major) を `gemm_pad_n` 行までラッパ行で 0 埋めする。
+/// 既に倍数なら複製しない (VRAM/RAM の余分なコピーを避ける)。
+fn gemm_pad_apply(qw: &[i8], k: usize, n: usize) -> std::borrow::Cow<'_, [i8]> {
+    debug_assert_eq!(qw.len(), k * n);
+    let npad = gemm_pad_n(n);
+    if npad == n {
+        return std::borrow::Cow::Borrowed(qw);
+    }
+    let mut w = vec![0i8; k * npad];
+    // パディング行はブロックごとに連続した全域に置く (行内は k 要素で連続)。
+    for r in 0..n {
+        w[r * k..(r + 1) * k].copy_from_slice(&qw[r * k..(r + 1) * k]);
+    }
+    std::borrow::Cow::Owned(w)
 }
 
 fn weights_for(uid: u64, qw: &[i8], scale: &[f32], k: usize, n: usize) -> Result<&'static GpuW> {
@@ -1077,13 +1112,13 @@ fn weights_for(uid: u64, qw: &[i8], scale: &[f32], k: usize, n: usize) -> Result
     let reg = REG.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = reg.lock().expect("weights registry poisoned");
     if !map.contains_key(&uid) {
-        let w = DevBuffer::from_slice(qw)?;
+        let w = DevBuffer::from_slice(&gemm_pad_apply(qw, k, n))?;
         let sc = DevBuffer::from_slice(scale)?;
         tracing::info!(
             "CUDA weight upload (uid={uid}): k={k} n={n} ({:.1} MB)",
             (k * n + n * 4) as f64 / 1e6
         );
-        map.insert(uid, Box::new(GpuW { w, sc, k, n }));
+        map.insert(uid, Box::new(GpuW { w, sc, k, n, npad: gemm_pad_n(n) }));
     }
     let e = map.get(&uid).expect("just inserted");
     debug_assert_eq!((e.k, e.n), (k, n), "uid 重複: 同一 uid に異なる形状");
@@ -1298,9 +1333,9 @@ pub fn maybe_gpu_ffn(
                     &mut kc as *mut _ as *mut c_void,
                     &mut nc as *mut _ as *mut c_void,
                 ];
-                let gmx = m.div_ceil(128) as u32;
-                let gmy = (2 * ff).div_ceil(128) as u32;
-                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args)?;
+                let gmx = m.div_ceil(GEMM_TILE) as u32;
+                let gmy = (2 * ff).div_ceil(GEMM_TILE_N) as u32;
+                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args)?;
                 Ok(())
             })?;
             // 2) swiglu (interleaved): [m, 2ff] → act [m, ff] (デバイス上に保持)
@@ -1344,9 +1379,9 @@ pub fn maybe_gpu_ffn(
                     &mut kc as *mut _ as *mut c_void,
                     &mut nc as *mut _ as *mut c_void,
                 ];
-                let gmx = m.div_ceil(128) as u32;
-                let gmy = e.div_ceil(128) as u32;
-                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args)?;
+                let gmx = m.div_ceil(GEMM_TILE) as u32;
+                let gmy = e.div_ceil(GEMM_TILE_N) as u32;
+                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args)?;
                 check(
                     (lib.memcpy_dtoh_async)(ho.ptr, dout2.ptr(), m * e * 4, std::ptr::null_mut()),
                     "cuMemcpyDtoHAsync",
@@ -1457,9 +1492,9 @@ pub fn maybe_gpu_ffn_dev(
                         &mut kc as *mut _ as *mut c_void,
                         &mut nc as *mut _ as *mut c_void,
                     ];
-                    let gmx = m.div_ceil(128) as u32;
-                    let gmy = (2 * ff).div_ceil(128) as u32;
-                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args))
+                    let gmx = m.div_ceil(GEMM_TILE) as u32;
+                    let gmy = (2 * ff).div_ceil(GEMM_TILE_N) as u32;
+                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args))
                 })?;
                 // 2) swiglu (interleaved): [m, 2ff] → act [m, ff] (デバイス上に保持)
                 crate::prof::time_layer(crate::prof::SWIGLU, li, || -> Option<()> {
@@ -1500,9 +1535,9 @@ pub fn maybe_gpu_ffn_dev(
                         &mut kc as *mut _ as *mut c_void,
                         &mut nc as *mut _ as *mut c_void,
                     ];
-                    let gmx = m.div_ceil(128) as u32;
-                    let gmy = e.div_ceil(128) as u32;
-                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args))
+                    let gmx = m.div_ceil(GEMM_TILE) as u32;
+                    let gmy = e.div_ceil(GEMM_TILE_N) as u32;
+                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args))
                 })
             }
         })
@@ -1534,7 +1569,7 @@ fn weights_for_group(
             sc.extend_from_slice(&p.scale);
         }
         debug_assert_eq!(w.len(), k * n);
-        let w = DevBuffer::from_slice(&w)?;
+        let w = DevBuffer::from_slice(&gemm_pad_apply(&w, k, n))?;
         let sc = DevBuffer::from_slice(&sc)?;
         tracing::info!(
             "CUDA grouped weight upload ({} parts, uids={}..): k={k} n={n} ({:.1} MB)",
@@ -1542,7 +1577,7 @@ fn weights_for_group(
             uids[0],
             (k * n + n * 4) as f64 / 1e6
         );
-        map.insert(uids.to_vec(), Box::new(GpuW { w, sc, k, n }));
+        map.insert(uids.to_vec(), Box::new(GpuW { w, sc, k, n, npad: gemm_pad_n(n) }));
     }
     let e = map.get(uids).expect("just inserted");
     Ok(unsafe { std::mem::transmute::<&GpuW, &'static GpuW>(e.as_ref()) })
@@ -1912,10 +1947,10 @@ fn linear_gemm_into(
                 &mut kc as *mut _ as *mut c_void,
                 &mut nc as *mut _ as *mut c_void,
             ];
-            // 128x128 タイル × 16x16 thread (1 thread が 8x8 出力)
-            let gmx = m.div_ceil(128) as u32;
-            let gmy = n.div_ceil(128) as u32;
-            ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args)?;
+            // s74: 128x256 タイル × 16x4 thread (1 thread が 8x16 出力)
+            let gmx = m.div_ceil(GEMM_TILE) as u32;
+            let gmy = n.div_ceil(GEMM_TILE_N) as u32;
+            ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args)?;
 
             // s68: D2H も呼び出し元のバッファへ直接書く。旧実装は pinned `ho` に
             // 落としてから `dst.copy_from_slice` していたが、pinned→heap の
@@ -2699,9 +2734,9 @@ fn chain_gemm_grouped_pf(
                 &mut kc as *mut _ as *mut c_void,
                 &mut nc as *mut _ as *mut c_void,
             ];
-            let gmx = m.div_ceil(128) as u32;
-            let gmy = n.div_ceil(128) as u32;
-            ok(unsafe { ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args) })
+            let gmx = m.div_ceil(GEMM_TILE) as u32;
+            let gmy = n.div_ceil(GEMM_TILE_N) as u32;
+            ok(unsafe { ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args) })
         })
     })
 }
@@ -3336,9 +3371,9 @@ pub fn maybe_gpu_oproj(o: &Quant8Linear, m: usize, k: usize, li: usize) -> Optio
                     &mut kc as *mut _ as *mut c_void,
                     &mut nc as *mut _ as *mut c_void,
                 ];
-                let gmx = m.div_ceil(128) as u32;
-                let gmy = e.div_ceil(128) as u32;
-                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args)?;
+                let gmx = m.div_ceil(GEMM_TILE) as u32;
+                let gmy = e.div_ceil(GEMM_TILE_N) as u32;
+                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args)?;
                 // 3) D2H + 同期 (attention カーネルは同一ストリームの先行発行なので完結済み)
                 check(
                     (lib.memcpy_dtoh_async)(
@@ -3439,9 +3474,9 @@ pub fn maybe_gpu_oproj_dev(o: &Quant8Linear, m: usize, k: usize, li: usize) -> O
                         &mut kc as *mut _ as *mut c_void,
                         &mut nc as *mut _ as *mut c_void,
                     ];
-                    let gmx = m.div_ceil(128) as u32;
-                    let gmy = e.div_ceil(128) as u32;
-                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args))
+                    let gmx = m.div_ceil(GEMM_TILE) as u32;
+                    let gmy = e.div_ceil(GEMM_TILE_N) as u32;
+                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args))
                 }
             })
         })
@@ -4046,9 +4081,9 @@ pub fn chain_qkv_rope_prefill(
                 &mut kc_ as *mut _ as *mut c_void,
                 &mut nc as *mut _ as *mut c_void,
             ];
-            let gmx = n.div_ceil(128) as u32;
-            let gmy = width.div_ceil(128) as u32;
-            ok(unsafe { ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 16, 1), 0, &mut args) })
+            let gmx = n.div_ceil(GEMM_TILE) as u32;
+            let gmy = width.div_ceil(GEMM_TILE_N) as u32;
+            ok(unsafe { ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args) })
         })?;
 
         // 2) rope テーブル (行ごと pos0+i・rope_row と同一式) と bias
@@ -5997,7 +6032,9 @@ mod tests {
             let q = pseudo_i8(k * n, 40 + ci as u32);
             let scale = positive_scales(n, 50 + ci as u32);
             let a = pseudo_random(m * k, 60 + ci as u32);
-            let w = ctx.upload_i8(&q).unwrap();
+            // s74: 重みは gemm_pad_n 行に 0 パディングしてアップロードする
+            // (カーネルは j 方向 256 列単位・scale は実列数 n 本)。
+            let w = ctx.upload_i8(&gemm_pad_apply(&q, k, n)).unwrap();
             let sc = ctx.upload_f32(&scale).unwrap();
             // GEMM カーネル vs CPU
             let got = ctx.linear_gemm_i8(&a, &w, &sc, m, k, n).unwrap();
@@ -6020,6 +6057,127 @@ mod tests {
         println!("dno_gemm_i8 bit-exact vs CPU/GEMV OK ({} cases)", cases.len());
     }
 
+    /// s74 (T6 候補 1): dno_gemm_i8 の数値契約を **GPU 無しで** 固定する。
+    ///
+    /// 新カーネル (128x256 タイル・1 thread 8x16・重み 256 行パディング) は
+    /// 旧カーネルと命令列が異なるので、`cuda_gemm_i8_bit_exact_vs_cpu` (要 GPU) が
+    /// 走らない環境でも次の不変条件を検証できるようにする:
+    ///  1. 重みパディング (`gemm_pad_apply`) は実列 n の dot を厳密に保存する
+    ///     (パディング行は 0・実列はビット同一) — j タイル境界での取り違え防止。
+    ///  2. タイル分割 (i 方向 128 / j 方向 256) を模した整数 dot と、分割なしの
+    ///     整数 dot が同一 (i32 累積は結合則が成立 = R2 の根拠)。
+    ///  3. 端処理: m・n・k がタイル / 4 / 32 の倍数でない形状でも、
+    ///     範囲外アクセス無しで実領域だけを書く。
+    ///
+    /// GPU 実機のビット一致は `cuda_gemm_i8_bit_exact_vs_cpu` (supervisor が実行)。
+    #[test]
+    fn gemm_pad_preserves_dot_and_tiling_is_exact() {
+        // 1) パディングは実列を保存し、余りは 0
+        for &(k, n) in &[(4usize, 100usize), (37, 200), (1536, 17920), (30, 256), (1, 1)] {
+            let qw: Vec<i8> = (0..k * n).map(|i| ((i * 37) % 251) as i32 as i8 - 125).collect();
+            let padded = gemm_pad_apply(&qw, k, n);
+            assert_eq!(padded.len(), k * gemm_pad_n(n), "k={k} n={n}");
+            assert_eq!(gemm_pad_n(n) % 256, 0);
+            assert!(gemm_pad_n(n) >= n && gemm_pad_n(n) - n < 256);
+            for r in 0..n {
+                assert_eq!(
+                    &padded[r * k..(r + 1) * k],
+                    &qw[r * k..(r + 1) * k],
+                    "実列が変わった k={k} n={n} r={r}"
+                );
+            }
+            for r in n..gemm_pad_n(n) {
+                assert!(padded[r * k..(r + 1) * k].iter().all(|&v| v == 0), "pad 行が 0 でない");
+            }
+            // パディング行の寄与は 0 (dot が不変)
+            let aq: Vec<i8> = (0..k).map(|i| ((i * 11) % 251) as i32 as i8 - 120).collect();
+            let dot = |w: &[i8], row: usize| -> i32 {
+                (0..k).map(|d| aq[d] as i32 * w[row * k + d] as i32).sum()
+            };
+            for r in 0..gemm_pad_n(n) {
+                let want = if r < n { dot(&qw, r) } else { 0 };
+                assert_eq!(dot(&padded, r), want, "dot 保存 k={k} n={n} r={r}");
+            }
+            // 既に倍数なら複製しない (Cow::Borrowed)
+            if n % 256 == 0 {
+                assert!(matches!(padded, std::borrow::Cow::Borrowed(_)));
+            } else {
+                assert!(matches!(padded, std::borrow::Cow::Owned(_)));
+            }
+        }
+
+        // 2) タイル分割の厳密性 (i32 累積 = 結合則) — カーネルの k パック/タイル
+        //    境界で dot が変わらないことを、k が 4・32 の倍数でない形状も含めて
+        //    **2 種類の分割**で確認する:
+        //      a) GEMM_TK=32 の kb ブロック × c0 4 要素 (実カーネルの内側ループ)
+        //      b) 4 要素ずつ全域 (端ブロックは 4 要素未満に切り詰め = カーネルの
+        //         gk<c+4 分岐と等価)
+        //    34B の行 (例 k=37) では GEMM_TK の切り上げで k の先にゴミが入るが、
+        //    外側ループが `kb < k` で止まるため寄与しない (カーネルと同じ挙動)。
+        for &(k, n, m) in &[(37usize, 200usize, 65usize), (30, 197, 65), (1533, 300, 3)] {
+            let qw: Vec<i8> = (0..k * n).map(|i| ((i * 29) % 241) as i32 as i8 - 120).collect();
+            let aq: Vec<i8> = (0..m * k).map(|i| ((i * 17) % 239) as i32 as i8 - 119).collect();
+            let mut padded = gemm_pad_apply(&qw, k, n).into_owned();
+            // 行の直後 (k の先) に「本当は範囲外」ダミーを置いておく
+            let row_stride = k * gemm_pad_n(n);
+            padded.resize(row_stride + 8, 77);
+            let plain = |i: usize, j: usize| -> i32 {
+                (0..k).map(|d| aq[i * k + d] as i32 * padded[j * k + d] as i32).sum()
+            };
+            // a) kb (32) ブロック × c0 (4) 分割
+            let dot_kb = |i: usize, j: usize| -> i32 {
+                let mut acc = 0i32;
+                let mut kb = 0;
+                while kb < k {
+                    let mut c0 = 0;
+                    while c0 < 32 {
+                        let gk = kb + c0;
+                        if gk >= k {
+                            break;
+                        }
+                        for e in 0..4 {
+                            if gk + e < k {
+                                acc += aq[i * k + gk + e] as i32 * padded[j * k + gk + e] as i32;
+                            }
+                        }
+                        c0 += 4;
+                    }
+                    kb += 32;
+                }
+                acc
+            };
+            // b) 4 要素ずつ全域 (端は切り詰め)
+            let dot4 = |i: usize, j: usize| -> i32 {
+                let mut acc = 0i32;
+                let mut gk = 0;
+                while gk < k {
+                    for e in 0..4 {
+                        if gk + e < k {
+                            acc += aq[i * k + gk + e] as i32 * padded[j * k + gk + e] as i32;
+                        }
+                    }
+                    gk += 4;
+                }
+                acc
+            };
+            for &(i, j) in &[(0usize, 0usize), (m - 1, n - 1), (m / 2, n / 2), (m - 1, 0), (0, n - 1)] {
+                assert_eq!(dot_kb(i, j), plain(i, j), "k={k} m={m} n={n} i={i} j={j}");
+                assert_eq!(dot4(i, j), plain(i, j), "k={k} m={m} n={n} i={i} j={j} (4 分割)");
+            }
+        }
+
+        // 3) 端処理 (タイル境界アドレスが範囲内に収まること) — グリッドの切り上げと
+        //    カーネル側の範囲判定が前提としている関係を、純粋計算で確認。
+        for &(m, n) in &[(1usize, 1usize), (65, 197), (128, 256), (129, 257), (2843, 151936)] {
+            let gmx = m.div_ceil(GEMM_TILE);
+            let gmy = n.div_ceil(GEMM_TILE_N);
+            assert!(gmx * GEMM_TILE >= m && (gmx - 1) * GEMM_TILE < m);
+            assert!(gmy * GEMM_TILE_N >= n && (gmy - 1) * GEMM_TILE_N < n);
+            // 重みは常に gmy タイル分の行を用意できる (pad 済み)
+            assert!(gemm_pad_n(n) >= gmy * GEMM_TILE_N);
+        }
+    }
+
     /// P17k 調査: prefill 実形状での linear_gemm_i8 の内訳計測 (kernel / D2H / to_vec)。
     /// `#[ignore]` — GPU が必要。cargo test --release -p denno-engine --features cuda
     /// cuda_gemm_i8_bench -- --ignored --nocapture
@@ -6039,7 +6197,7 @@ mod tests {
             let q = pseudo_i8(k * n, 77);
             let scale = positive_scales(n, 78);
             let a = pseudo_random(m * k, 79);
-            let w = ctx.upload_i8(&q).unwrap();
+            let w = ctx.upload_i8(&gemm_pad_apply(&q, k, n)).unwrap();
             let sc = ctx.upload_f32(&scale).unwrap();
             // ウォームアップ (JIT + L2)
             let _ = ctx.linear_gemm_i8(&a, &w, &sc, m, k, n).unwrap();
