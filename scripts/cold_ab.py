@@ -55,6 +55,11 @@ exit code:
   3  起動前の安全装置 (--old と --new が同一 / 予約ポート / バイナリが同じ)
      ※ 3 は argparse の引数エラーに合わせた値で、2 や 1 と区別するため。
 
+timeout:
+  --timeout-s (既定 600 s) は 1 リクエストの待ち時間で、health 待ちにも
+  max(--timeout-s, --health-timeout) として効く。既定の health 待ちは従来どおり
+  80 s のまま (遅い機で 300 s を超える応答を切らないために既定を 600 s にしてある)。
+
 標準ライブラリのみ (requests は使わない)。GPU は不要だが、実測には 9B が載る GPU 機が要る。
 """
 
@@ -92,6 +97,7 @@ DEFAULT_ROUNDS = 3
 DEFAULT_EXPECT_INPUT_TOKENS = 5686
 HEALTH_TIMEOUT_S = 80.0
 REQUEST_TIMEOUT_S = 300.0
+DEFAULT_TIMEOUT_S = 600.0
 PORT_FREE_TIMEOUT_S = 30.0
 
 # GPU_VERIFY.sh の kill_servers と同じ判定材料。実体で判定するのは、cmdline を
@@ -437,6 +443,8 @@ def validate_args(args):
         errors.append("--max-tokens must be >= 1")
     if args.expect_input_tokens < 1:
         errors.append("--expect-input-tokens must be >= 1")
+    if getattr(args, "timeout_s", DEFAULT_TIMEOUT_S) <= 0:
+        errors.append("--timeout-s must be > 0 (got %s)" % args.timeout_s)
 
     # 自己テスト / dry-run ではバイナリの存在を要求しない (計画の表示だけ)
     need_files = not (args.self_test or args.dry_run)
@@ -510,6 +518,10 @@ def run_ab(args, out=sys.stdout):
     measurements = []
     guard_tripped = False
     targets = (bins["old"], bins["new"])
+    # --timeout-s は health 待ちとリクエストの両方に効く。既定では health の
+    # 80 s のまま (max を取るので --health-timeout を明示すればそちらが優先)。
+    health_timeout = max(float(getattr(args, "timeout_s", DEFAULT_TIMEOUT_S)),
+                         float(args.health_timeout))
 
     for rnd, order in enumerate(plan, start=1):
         for name in order:
@@ -525,17 +537,17 @@ def run_ab(args, out=sys.stdout):
                 t_start = time.monotonic()
                 proc, logf = start_server(binary, args.model, args.port,
                                           args.quant, log_path)
-                ready = wait_health(args.port, args.health_timeout, proc=proc)
+                ready = wait_health(args.port, health_timeout, proc=proc)
                 rec["boot_s"] = time.monotonic() - t_start
                 if not ready:
                     rec["error"] = ("health timeout (%.0fs) or server exited early"
-                                    % args.health_timeout)
+                                    % health_timeout)
                     say(" [r%d/%d] %s FAIL: %s (log: %s)"
                         % (rnd, args.rounds, name, rec["error"], log_path))
                     measurements.append(rec)
                     continue
 
-                wall, data, err = one_request(body, args.port)
+                wall, data, err = one_request(body, args.port, timeout=args.timeout_s)
                 rec["wall"] = wall
                 usage = extract_usage(data)
                 rec["input_tokens"] = usage.get("input_tokens")
@@ -644,6 +656,10 @@ def run_dry(args, out=sys.stdout):
     say("  expect input_tokens = %d" % args.expect_input_tokens)
     say("  port=%d model=%s quant=%s seed=%d health_timeout=%.0fs"
         % (args.port, args.model, args.quant, args.seed, args.health_timeout))
+    # 従来の行は変えない。--timeout-s を既定から変えたときだけ 1 行足す。
+    if getattr(args, "timeout_s", DEFAULT_TIMEOUT_S) != DEFAULT_TIMEOUT_S:
+        say("  timeout = %.0fs (per request; health wait uses max(timeout, "
+            "health_timeout))" % args.timeout_s)
     say("")
     for name in ("old", "new"):
         p = getattr(args, name)
@@ -869,6 +885,10 @@ def build_parser():
                     help="where per-round server logs go (default /tmp)")
     ap.add_argument("--health-timeout", type=float, default=HEALTH_TIMEOUT_S,
                     help="seconds to wait for /health (default %.0f)" % HEALTH_TIMEOUT_S)
+    ap.add_argument("--timeout-s", type=float, default=DEFAULT_TIMEOUT_S,
+                    help="per-request timeout in seconds, also used for the health "
+                         "wait when it exceeds --health-timeout (default %.0f)"
+                         % DEFAULT_TIMEOUT_S)
     ap.add_argument("--dry-run", action="store_true",
                     help="print payload sha256, round plan and command lines only")
     ap.add_argument("--self-test", action="store_true",
