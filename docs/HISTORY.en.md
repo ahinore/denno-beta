@@ -1605,6 +1605,17 @@ The pinned→heap `memcpy` reaches only **4.7 GB/s**, while a direct D2H into a 
 
 **Result**: prefill **11.34 s → 10.11 s** (502 → **562 tok/s**), i.e. **−78% / 4.6×** from the 46.2 s we started at.
 
+### Run the full-attention prepare in parallel over tokens ✅ (2026-10-19, s73)
+
+> `qk_norm` (650 ms) and `rope` (491 ms) ran **single-threaded on the CPU** (profiled, 5,686 tokens). One row costs ~5 µs, but 5,686 rows × 8 layers adds up to over a second.
+
+**Change** (`qwen35::forward_prefill`, full-attention branch):
+
+- QK-Norm → RoPE → KV cache row write now run **in parallel over rows**. Each row writes only to its own q slice and its own `pos` row of the KV cache, and the arithmetic for one row is identical to the sequential path — **bit exact and independent of thread count**.
+- Profiling folds this into the `qknorm` bucket (same total as the two buckets it replaces).
+
+**Result**: prefill **10.11 s → 9.65 s** (562 → **589 tok/s**). All three anchors match, 231 tests pass.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
