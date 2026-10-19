@@ -1867,6 +1867,68 @@ of magnitude**, so T8 step 2 (fusing the residual add, batching across tokens) i
 PASS with all three anchors MATCH (`c61ad85b` / `9e17d563` / `af6eb6ab`), decode gen2 3.2733 s /
 200 tokens = 16.37 ms/token unchanged — the instrument is numerically a no-op.
 
+### Additive profile accounting and per-issuing-site `d2h_state` measurement (2026-10-19, s87 / s88) ✅
+
+> The s84 `Ambient` was "one parent + children added to it as well", so the table was not
+> additive, and `d2h_state` mixed several issuing sites into one bucket, making "what is
+> expensive" unreadable. Two rounds of rebuilding the instrument. Neither touches the
+> numeric path (default-off reads no clock at all).
+
+**`e547749`: additive parent accounting (s87)** (`prof.rs` +313/-219, `qwen35.rs` -18)
+
+- `AMBIENT` becomes a **stack** (`RefCell<Vec<usize>>`) instead of a single slot. A sample
+  is added once to every scope that encloses it, so `parent >= children` holds at any depth.
+- **One time-write site**: all three exits of `add_sample` (raw id, `gdn_proj` sub-ids,
+  `d2h_src` sub-ids) call `add_outer_ns` exactly once. Previously the time was written from
+  `add_sample_ns` and again from the tail, which alone doubled every sample.
+- **calls / toks double count fixed**: `owners` contains the sample's own bucket, so looping
+  over it doubled the call count (hit in practice). `slot` is now skipped.
+- A **collapsed** sample (its own bucket is also an enclosing scope) is counted as a child as
+  well; that is what makes `self + children = parent`.
+- A **`self` column** (7th) is added, `self = parent - children`. Phase totals and cumulative
+  percentages are computed from the sum of `self`, so the prefill total is a leaf
+  decomposition of the measured intervals. The first six columns are unchanged.
+- The s84 row-level norm hooks (`norm_rows` / `norm_rows_end`) and the whole-block
+  `Ambient(RMSNORM)` wrappers are removed (T8 had already shown the bucket pointed at the block).
+- Test harness: global lock + a `#[cfg(test)]` force-enable flag (no env writes, so parallel
+  tests are not disturbed) + `reset()` on entry, with the flag restored in `Drop`. The run no
+  longer depends on test order. The two accounting tests (additivity / nested containment
+  without double counting) pin the same rule from both sides and agree.
+
+Tests: 234 passed / 1 ignored.
+
+**`26c6b4a`: per-issuing-site `d2h_state` measurement (s88)** (`prof.rs` +174,
+`cuda.rs` +49/-9, `qwen35.rs` +19/-1)
+
+- `D2H_SRC_NS[phase][site]` is added. **Display-only** (added to no raw bucket, so it cannot
+  double count) and cleared in `reset()`.
+- `mark_d2h_src_ns(site, ns)`: one call count + one interval. `chain_download` /
+  `chain_download_at` measure from before the D2H issue to after the sync (the inner
+  `mark_d2h_src` is removed, keeping the count at one).
+- `add_d2h_src_ns_only(site, ns)`: time only, for sites whose count is already recorded (GDN
+  state recovery, the prefill attention output copy). Calling both would double the count.
+- `d2h_src_on()`: true only while measurement is on. Every site tests it before reading
+  `Instant::now()`, so the default path reads no clock.
+- The prefill table gains a **top-10 by site** block (descending ms, `ms / calls / us per call`).
+
+Tests: denno-engine 235 passed / 1 ignored, denno-server 37 passed.
+
+**GPU measurement and its limits**: `26c6b4a` gives `GPU_VERIFY` = PASS with all three
+anchors MATCH (`c61ad85b` / `9e17d563` / `af6eb6ab`) — the instrument is numerically a no-op.
+The per-site **ranking did not exist before this commit**, so the pre-fix figures are the
+`d2h_state` **bucket totals only** (prefill: CPU box 4,832.3 ms / 160 calls, GPU host
+6,165 ms / 1,140 calls). The first real ranking comes from a build at or after `26c6b4a`. The
+verification run confirmed the new buckets populate (one decode profile: `d2h_src_other`
+88.9 ms / 548 calls, `d2h_src_attn_pf` 9.3 ms / 8 calls, `d2h_src_gdn_state` 0.0 ms / 432
+calls, `d2h_src_linear` 0.0 ms / 2,386 calls). That is one decode observation, not a prefill
+ranking.
+
+**Lessons**:
+- Keep the time write in one place. Two places silently double every sample.
+- A display-only table must not be added into raw buckets; that way a breakdown can be added
+  without changing the accounting.
+- When counts and time are split into separate APIs, decide in one place who records the count.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
