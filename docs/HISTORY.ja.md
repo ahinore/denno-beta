@@ -1338,6 +1338,18 @@ A3 まで recurrent モデル (Qwen3.5 GDN) は prefix cache の entry 復元を
 - **テスト数**: 295 → 299 passed / 0 failed / 18 ignored (`cargo test --workspace`)。revert 直後 (= `1e51741`) の 295 が基準で、T5a が足した 1 本は revert で消えている
 - **教訓**: **計測のラベルは呼び出し側の主張ではなく実測から取る**。加えて「唯一の入口」を作ったら、入口を通ったことを機械的に検査できるようにする (入口を迂回する第 2 の経路は、性能退行としてのみ現れて静かに残る)
 
+### `attn_gdn` を投影とスキャンに分離 (計測のみ) ✅ (2026-10-19, s61c)
+
+> T5 のプロファイルで prefill の `attn_gdn` が 28.5 s を占めたが、この 1 バケットに **beta/alpha の投影 (`apply_bt_rows` → P17i GEMM) と GDN スキャン本体 (`gdn_scan_batch`: DevBuffer 確保 + H2D/D2H + sync) が混ざっていた**。T5b の第一レバー (スキャンのデバイス常駐化) の効果と、投影側が既に GPU で走っているかを切り離せないため、計測だけを 2 本に割った。**数値経路・分岐は無変更**。
+
+- **バケット設計**: `ATT_GDN` は**従来どおり親バケット**として残し、表示専用の子 `ATT_GDN_PROJ` (id `100*ATTN+2`) / `ATT_GDN_SCAN` (`+3`) を追加 (`ATT_CLS_N` 2 → 4)。子のサンプルは `add_sample` が **親 `ATT_GDN` へ合算**するので、親の意味・値は従来と同値
+- **二重計上の罠**: 生 id (`attn_core`) への合算は `add_sample` の共通ブロック (`slot = D2H`) が既に行うため、子から親へ積む処理を生 id にも波及させると `attn_core` が二重計上になる (実装中に実際に踏んだ)。**不変条件**: `attn_core == attn_gdn + attn_full`、`attn_gdn == gdn_proj + gdn_scan` (時間・call 数とも)
+- **表示**: 子は `attn_gdn` の直下に 1 段深く (6 スペース) インデントして出す (`phase_table` / `summary` の両方)。prefill の総和行は生バケットのみを数えるので、子を足した値にはならない
+- **適用範囲**: qwen35 の prefill 経路の 3 箇所 (beta 投影・alpha 投影 → PROJ、スキャン → SCAN)。**decode chain の `ATT_GDN` は分割しない** — beta/alpha とスキャンが 1 回の融合デバイス呼び出しで走るため、分けるには数値経路に触る必要があり「計測のみ」の範囲を超える
+- **テスト (+1)**: `attn_gdn_splits_into_proj_and_scan_without_changing_totals` — 時間 (`proj 5.0 + scan 20.0 = gdn 25.0`、`core 27.0`)・call 数・ネスト表示・生バケットの非二重計上を固定。既存の `attn_split_ids_are_outside_raw_range` に新 id の連番検査を追加
+- **テスト数**: 299 → 300 passed / 0 failed / 18 ignored (`cargo test --workspace`)。`cargo check --workspace --features cuda` も通過 (新規警告なし)
+- **教訓**: 総和行のような**共有カウンタの絶対値はテストで固定しない** — プロファイルのカウンタはプロセス全体で共有され、並走する他テストの寄与で値が動く。固定すべきは「細分の和が親と一致する」ような**関係式**のほう
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
