@@ -3126,9 +3126,13 @@ pub fn chain_swiglu_rows(ga_slot: usize, act_slot: usize, ff: usize, m: usize) -
 ///   新: H2D 47MB + D2H 47MB
 /// になる (m=2843, e=4096, ff=6144 の場合)。GEMM/swiglu は CPU 経路と
 /// ビット一致 (同一カーネル・同一整数累積・同一 f32 演算列)。
+///
+/// s80 (T7b-1): 引数の gate/up を 1 本の連結重み (`gate_up_w`, 行順
+/// [gate 全行 | up 全行]) にまとめた。dno_gemm_i8 は行ごとに独立で
+/// n を 256 列タイルで舐めるだけなので、1 呼び出しでも n が 2ff になるだけで
+/// 各出力は 2 回呼び出しと同一 (スケールは行ごと・パート境界 = ff)。
 pub fn chain_mlp_prefill(
-    gate_w: &crate::quant::Quant8Linear,
-    up_w: &crate::quant::Quant8Linear,
+    gate_up_w: &crate::quant::Quant8Linear,
     down_w: &crate::quant::Quant8Linear,
     x: &[f32],
     m: usize,
@@ -3139,8 +3143,13 @@ pub fn chain_mlp_prefill(
         return None;
     }
     let e = down_w.n;
-    let ff = gate_w.n;
-    if m == 0 || x.len() < m * e || out.len() < m * e {
+    // s80 (T7b-1): gate_up はロード時に連結済みの 1 本 (行順 [gate | up])。
+    // ff は連結幅の半分 = パートの境界。
+    if gate_up_w.n % 2 != 0 || gate_up_w.k != e {
+        return None;
+    }
+    let ff = gate_up_w.n / 2;
+    if m == 0 || x.len() < m * e || out.len() < m * e || down_w.k != ff {
         return None;
     }
     let ctx = chain_ctx()?;
@@ -3165,7 +3174,7 @@ pub fn chain_mlp_prefill(
     // 2) gate/up → 3) swiglu  → 4) down (全て非同期・最後に 1 回だけ同期)
     // 計測時のみ段ごとに同期して内訳を取る (同期は数値に影響しない)。
     crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
-        chain_gemm_grouped_pf(&[gate_w, up_w], CH_PFH, CH_GA, m)?;
+        chain_gemm_grouped_pf(&[gate_up_w], CH_PFH, CH_GA, m)?;
         if crate::prof::enabled() {
             ok(ctx.sync())?;
         }
