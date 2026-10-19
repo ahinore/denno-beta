@@ -1628,7 +1628,7 @@ The change is classed R1 (f32 reduction order) and re-baselined per `docs/NUMERI
 Re-baselining used `ANCHOR_REBASE.sh` (two runs to prove determinism, then `--write`), and
 `GPU_VERIFY.sh` passes against the new baseline. Deterministic numeric relaxation is now allowed.
 
-### int8 GEMM per-thread tile 8x8 → 8x16 — weight padding and edge handling rebuilt ✅ (2026-10-19, s74 / T6 candidate 1) ⚠ PTX not regenerated
+### int8 GEMM per-thread tile 8x8 → 8x16 — weight padding and edge handling rebuilt ✅ (2026-10-19, s74 → s75 / T6 candidate 1)
 
 > `dno_gemm_i8` used a 128x128 tile, 256 threads and 8x8 outputs per thread. Each
 > `__dp4a` (4 multiply-adds) consumed only one smem B load (b4), so the inner loop was
@@ -1664,18 +1664,53 @@ was added so GPU-less environments pin the contract: padding preserves the dot, 
 splits are exact, and edge shapes cover the grid. Real-GPU bit-exactness is checked by
 `cuda_gemm_i8_bit_exact_vs_cpu` (run by the supervisor).
 
-**⚠ Not done (human task)**:
-- **`kernels_int8.ptx` was NOT regenerated** (no nvcc in this container). Until it is,
-  **the GPU path keeps running the old PTX (8x8 kernel)**. Pairing the new host code
-  (256-padded weights) with the old kernel is safe — the old kernel stops at `gj < n`,
-  so padded rows are never read and the numbers stay correct — but it also means **no
-  regression and no speedup**.
-  `nvcc -ptx -arch=compute_75 -fmad=false -O3 kernels/kernels_int8.cu -o kernels/kernels_int8.ptx`
-- Record the new artifact hash in HISTORY afterwards (the P17d lesson).
+**GPU verification (2026-10-19, s75 / T6 candidate 1 attempt 2) ✅**
 
-**Performance**: expected from halving smem loads per dp4a and removing the inner-loop
-spills — the FFN GEMM (`gate_up` 27 ms/call x 128 ≒ 3.5 s). **Actual numbers await the
-supervisor's PF_BENCH / GPU_VERIFY (nothing was measured in this session).**
+The s74 kernel **died on the real GPU**: the first int8 GEMM raised
+`CUDA cuMemcpyDtoHAsync failed: error 716` and the engine latched a permanent CPU fallback
+(PF wall 171.68 s / 33.1 tok/s — 17.8x slower than the 9.65 s baseline).
+compute-sanitizer pinned it: `Invalid __shared__ write of size 4 bytes / Access at 0x421 is
+misaligned`. **Every CPU test stayed green** — this class of defect only surfaces on the
+device or under static checks.
+
+Two independent causes:
+
+1. **The shared staging row stride was not 4-byte aligned.** s74 set `GEMM_SP = GEMM_TK + 1`
+   (33, odd) while the kernel accessed the buffers through `*(int*)&sA[..][c]` casts.
+   Advancing a row pushed every 4-byte access off its natural boundary; the fault is sticky,
+   so all later D2H/syncs failed and the engine stayed on the CPU path.
+2. **The block shape no longer matched the tile.** s74 dropped the block from 16x16 (256
+   threads) to 16x4 (64 threads) but kept `GEMM_TILE = 128` rows, so one block covered only
+   32 rows: rows 32..127 of every tile were **never written** (about 75% of the output left
+   uninitialised) and the A stage filled only 64 of the 128 rows it was read from.
+
+Fixes (`kernels/kernels_int8.cu` + `cuda.rs`):
+
+- `GEMM_SP` = **36** (`GEMM_TK + 4`) — a multiple of 4, and not a multiple of 32, so the
+  8-row step (288 B = 72 words, 72 mod 32 = 8) lands on a different bank instead of colliding.
+- Six `static_assert`s pin the invariants: stride % 4 == 0, k tile % 4 == 0,
+  `(8*GEMM_SP/4) % 32 != 0`, `GEMM_BX*16 == GEMM_TILE_N`, `GEMM_BY*8 == GEMM_TILE`, and
+  block <= 1024 threads.
+- Block back to **(16,16) = 256 threads** through `GEMM_BX`/`GEMM_BY`, covering the 128x256
+  tile exactly; the 8x16 per-thread tile (dp4a per B load = 16) is unchanged. All 11 host
+  launch sites now use `(GEMM_BX, GEMM_BY, 1)` instead of the literal, so the two sides
+  cannot drift apart silently.
+- GPU-less regression test `kernel_source_shared_stride_and_block_shape_are_consistent`
+  pulls the `#define`s out of the `.cu` with `include_str!` and checks the stride/shape
+  invariants plus the Rust mirror constants. Mutation-tested: stride 33, block.y = 4,
+  stride 32 and an odd column offset each make it fail.
+
+**Result**: `kernels_int8.ptx` regenerated with nvcc 12.9
+(`nvcc -ptx -arch=compute_75 -fmad=false -O3`, md5 b5c926ea → fe254249). `GPU_VERIFY.sh`
+**PASS** with all three anchors matching (`c61ad85b` / `9e17d563` / `af6eb6ab`), `PF_BENCH`
+warm run **8.71 s / 653 tok/s** (from 9.65 s / 589 tok/s, −9.7%), 233 CPU tests pass.
+
+**Side finding (T9)**: the two short anchors that moved in s73 (`c61ad85b`→`47df93d7`,
+`9e17d563`→`9b20de09`) **did not reproduce on this build** — they returned to the original
+values, so `anchors_baseline.txt` was restored from `anchors_baseline.prev.txt`. The s73
+drift is therefore better read as a 1-ulp perturbation flipping a near-tie during sampling,
+not a permanent legitimate shift. Whether s73's parallel prepare reads an uninitialised tail
+is still open and stays tracked as T9.
 
 ## 4. Candidate List
 

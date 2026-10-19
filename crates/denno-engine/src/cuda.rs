@@ -724,7 +724,7 @@ impl CudaCtx {
             ];
             let gmx = m.div_ceil(GEMM_TILE) as u32;
             let gmy = n.div_ceil(GEMM_TILE_N) as u32;
-            self.launch_async(self.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args)?;
+            self.launch_async(self.f_gemm, (gmx, gmy, 1), (GEMM_BX, GEMM_BY, 1), 0, &mut args)?;
             self.sync()?;
         }
         dev_out.to_vec::<f32>(m * n)
@@ -1077,9 +1077,16 @@ struct GpuW {
 /// s74: `gemm_pad_n(n)` を通した**パディング済み**行数 (`w` の行数)。
 const GEMM_PAD_N: usize = 256;
 /// s74: dno_gemm_i8 のタイル寸法 (kernels_int8.cu の GEMM_TILE / GEMM_TILE_N と
-/// 同期すること)。i 方向 128 行 × j 方向 256 列・block 16x4 (1 thread 8x16 出力)。
+/// 同期すること)。i 方向 128 行 × j 方向 256 列・block 16x16 (1 thread 8x16 出力)。
 const GEMM_TILE: usize = 128;
 const GEMM_TILE_N: usize = 256;
+/// s75: カーネルのブロック形状 (kernels_int8.cu の GEMM_BX / GEMM_BY)。
+/// 1 thread 8 行 x 16 列・block 16x16 = 256 thread なので
+/// `GEMM_BY * 8 == GEMM_TILE` / `GEMM_BX * 16 == GEMM_TILE_N` が成り立つ。
+/// s74 は (16,4) = 64 thread で 32 行しか覆えていなかった (タイル 128 行と
+/// 食い違い、残り 96 行が未書き込みのまま返っていた)。
+const GEMM_BX: u32 = 16;
+const GEMM_BY: u32 = 16;
 
 /// s74 (T6 候補 1): dno_gemm_i8 の j 方向タイル (256) に合わせた重み行の切り上げ。
 /// 旧 128 タイル版は端をカーネル側で 0 埋めしていたが、新カーネルは A 行を
@@ -1335,7 +1342,7 @@ pub fn maybe_gpu_ffn(
                 ];
                 let gmx = m.div_ceil(GEMM_TILE) as u32;
                 let gmy = (2 * ff).div_ceil(GEMM_TILE_N) as u32;
-                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args)?;
+                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (GEMM_BX, GEMM_BY, 1), 0, &mut args)?;
                 Ok(())
             })?;
             // 2) swiglu (interleaved): [m, 2ff] → act [m, ff] (デバイス上に保持)
@@ -1381,7 +1388,7 @@ pub fn maybe_gpu_ffn(
                 ];
                 let gmx = m.div_ceil(GEMM_TILE) as u32;
                 let gmy = e.div_ceil(GEMM_TILE_N) as u32;
-                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args)?;
+                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (GEMM_BX, GEMM_BY, 1), 0, &mut args)?;
                 check(
                     (lib.memcpy_dtoh_async)(ho.ptr, dout2.ptr(), m * e * 4, std::ptr::null_mut()),
                     "cuMemcpyDtoHAsync",
@@ -1494,7 +1501,7 @@ pub fn maybe_gpu_ffn_dev(
                     ];
                     let gmx = m.div_ceil(GEMM_TILE) as u32;
                     let gmy = (2 * ff).div_ceil(GEMM_TILE_N) as u32;
-                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args))
+                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (GEMM_BX, GEMM_BY, 1), 0, &mut args))
                 })?;
                 // 2) swiglu (interleaved): [m, 2ff] → act [m, ff] (デバイス上に保持)
                 crate::prof::time_layer(crate::prof::SWIGLU, li, || -> Option<()> {
@@ -1537,7 +1544,7 @@ pub fn maybe_gpu_ffn_dev(
                     ];
                     let gmx = m.div_ceil(GEMM_TILE) as u32;
                     let gmy = e.div_ceil(GEMM_TILE_N) as u32;
-                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args))
+                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (GEMM_BX, GEMM_BY, 1), 0, &mut args))
                 })
             }
         })
@@ -1950,7 +1957,7 @@ fn linear_gemm_into(
             // s74: 128x256 タイル × 16x4 thread (1 thread が 8x16 出力)
             let gmx = m.div_ceil(GEMM_TILE) as u32;
             let gmy = n.div_ceil(GEMM_TILE_N) as u32;
-            ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args)?;
+            ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (GEMM_BX, GEMM_BY, 1), 0, &mut args)?;
 
             // s68: D2H も呼び出し元のバッファへ直接書く。旧実装は pinned `ho` に
             // 落としてから `dst.copy_from_slice` していたが、pinned→heap の
@@ -2736,7 +2743,7 @@ fn chain_gemm_grouped_pf(
             ];
             let gmx = m.div_ceil(GEMM_TILE) as u32;
             let gmy = n.div_ceil(GEMM_TILE_N) as u32;
-            ok(unsafe { ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args) })
+            ok(unsafe { ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (GEMM_BX, GEMM_BY, 1), 0, &mut args) })
         })
     })
 }
@@ -3373,7 +3380,7 @@ pub fn maybe_gpu_oproj(o: &Quant8Linear, m: usize, k: usize, li: usize) -> Optio
                 ];
                 let gmx = m.div_ceil(GEMM_TILE) as u32;
                 let gmy = e.div_ceil(GEMM_TILE_N) as u32;
-                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args)?;
+                ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (GEMM_BX, GEMM_BY, 1), 0, &mut args)?;
                 // 3) D2H + 同期 (attention カーネルは同一ストリームの先行発行なので完結済み)
                 check(
                     (lib.memcpy_dtoh_async)(
@@ -3476,7 +3483,7 @@ pub fn maybe_gpu_oproj_dev(o: &Quant8Linear, m: usize, k: usize, li: usize) -> O
                     ];
                     let gmx = m.div_ceil(GEMM_TILE) as u32;
                     let gmy = e.div_ceil(GEMM_TILE_N) as u32;
-                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args))
+                    ok(ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (GEMM_BX, GEMM_BY, 1), 0, &mut args))
                 }
             })
         })
@@ -4083,7 +4090,7 @@ pub fn chain_qkv_rope_prefill(
             ];
             let gmx = n.div_ceil(GEMM_TILE) as u32;
             let gmy = width.div_ceil(GEMM_TILE_N) as u32;
-            ok(unsafe { ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (16, 4, 1), 0, &mut args) })
+            ok(unsafe { ctx.launch_async(ctx.f_gemm, (gmx, gmy, 1), (GEMM_BX, GEMM_BY, 1), 0, &mut args) })
         })?;
 
         // 2) rope テーブル (行ごと pos0+i・rope_row と同一式) と bias
@@ -6176,6 +6183,386 @@ mod tests {
             // 重みは常に gmy タイル分の行を用意できる (pad 済み)
             assert!(gemm_pad_n(n) >= gmy * GEMM_TILE_N);
         }
+    }
+
+    /// s75 (不具合修正): `kernels_int8.cu` の共有メモリ / ブロック形状の不変条件を
+    /// **GPU 無しで** 検査する。s74 の 2 つの欠陥はどちらも CPU テストを素通りして
+    /// GPU 実機で初めて露見した (CUDA error 716 / 未書き込み出力) ので、原因を
+    /// ソースの静的解析で固定する。
+    ///
+    ///  1. 共有ステージの行ストライド `GEMM_SP` が 4 の倍数であること
+    ///     (s74 は 33 = 奇数で、`*(int*)&sA[r][c]` が行ごとに未アラインになり
+    ///      `Invalid __shared__ write` → sticky な error 716 を起こした)。
+    ///  2. ブロック形状とタイル寸法が整合すること (s74 は block 16x4 = 64 thread で
+    ///     32 行しか覆えず、タイル 128 行のうち 96 行が未書き込みだった)。
+    ///  3. 共有配列への i32 アクセスのオフセットがすべて 4 の倍数であること。
+    ///
+    /// .cu は `include_str!` で取り込むので、値を変えたらこのテストが落ちる。
+    #[test]
+    fn kernel_source_shared_stride_and_block_shape_are_consistent() {
+        const SRC: &str = include_str!("../kernels/kernels_int8.cu");
+
+        // `#define NAME VALUE` を取り出す (VALUE は他 define を参照し得るので
+        // 依存順に評価する簡易評価器)。
+        fn defines(src: &str) -> std::collections::HashMap<String, String> {
+            let mut map = std::collections::HashMap::new();
+            for line in src.lines() {
+                let line = line.trim_start();
+                let Some(rest) = line.strip_prefix("#define ") else { continue };
+                let rest = rest.trim();
+                let (name, val) = match rest.split_once(char::is_whitespace) {
+                    Some((n, v)) => (n, v.trim()),
+                    None => continue,
+                };
+                map.insert(name.to_string(), val.to_string());
+            }
+            map
+        }
+        let d = defines(SRC);
+        let get_raw = |name: &str| -> &str {
+            d.get(name)
+                .unwrap_or_else(|| panic!("kernels_int8.cu に #define {name} が無い"))
+        };
+        // 数値評価: トークン単位で name → 値 に展開してから式を評価する。
+        fn eval(expr: &str, d: &std::collections::HashMap<String, String>, depth: u32) -> i64 {
+            assert!(depth < 16, "define の循環参照: {expr}");
+            let mut expanded = String::new();
+            let bytes = expr.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                let c = bytes[i] as char;
+                if c.is_ascii_alphabetic() || c == '_' {
+                    let start = i;
+                    while i < bytes.len() {
+                        let ch = bytes[i] as char;
+                        if ch.is_ascii_alphanumeric() || ch == '_' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let ident = &expr[start..i];
+                    let raw = d
+                        .get(ident)
+                        .unwrap_or_else(|| panic!("未定義の識別子 {ident} ({expr})"));
+                    expanded.push_str(&format!("({})", eval(raw, d, depth + 1)));
+                } else {
+                    expanded.push(c);
+                    i += 1;
+                }
+            }
+            eval_int_expr(&expanded)
+        }
+        // 四則演算 + 括弧 + 剰余のみの整数式評価 (テスト用の最小実装)。
+        fn eval_int_expr(s: &str) -> i64 {
+            let cs: Vec<char> = s.chars().filter(|c| !c.is_whitespace()).collect();
+            let mut pos = 0usize;
+            fn parse_sum(cs: &[char], pos: &mut usize) -> i64 {
+                let mut v = parse_prod(cs, pos);
+                while *pos < cs.len() && (cs[*pos] == '+' || cs[*pos] == '-') {
+                    let op = cs[*pos];
+                    *pos += 1;
+                    let r = parse_prod(cs, pos);
+                    v = if op == '+' { v + r } else { v - r };
+                }
+                v
+            }
+            fn parse_prod(cs: &[char], pos: &mut usize) -> i64 {
+                let mut v = parse_atom(cs, pos);
+                while *pos < cs.len() && (cs[*pos] == '*' || cs[*pos] == '/' || cs[*pos] == '%') {
+                    let op = cs[*pos];
+                    *pos += 1;
+                    let r = parse_atom(cs, pos);
+                    v = match op {
+                        '*' => v * r,
+                        '/' => v / r,
+                        _ => v % r,
+                    };
+                }
+                v
+            }
+            fn parse_atom(cs: &[char], pos: &mut usize) -> i64 {
+                if *pos < cs.len() && cs[*pos] == '(' {
+                    *pos += 1;
+                    let v = parse_sum(cs, pos);
+                    assert_eq!(cs.get(*pos), Some(&')'), "括弧が閉じていない");
+                    *pos += 1;
+                    return v;
+                }
+                let start = *pos;
+                while *pos < cs.len() && cs[*pos].is_ascii_digit() {
+                    *pos += 1;
+                }
+                assert!(start != *pos, "数値が期待される位置: {cs:?}");
+                cs[start..*pos].iter().collect::<String>().parse().unwrap()
+            }
+            let v = parse_sum(&cs, &mut pos);
+            assert_eq!(pos, cs.len(), "式を評価しきれない: {s}");
+            v
+        }
+
+        // 列添字の評価。`x * 4` や `c` (ローカルエイリアス) のように **変数** を
+        // 含む式があるので、カーネル内の宣言を解決して取り得る値ごとに評価する。
+        // 取り得る全ての値が 4 の倍数であることを要求する = 任意の反復でアライン。
+        //
+        // 解決規則 (このカーネルで実際に使われている形だけを扱う):
+        //   - `#define` 定数        -> 数値
+        //   - `const int c = <式>;` -> <式> を再帰評価
+        //   - `for (int v = A; v < B; v++)` / `v += S` -> A..B を S 刻みで評価
+        fn eval_col(
+            expr: &str,
+            d: &std::collections::HashMap<String, String>,
+            depth: u32,
+        ) -> i64 {
+            assert!(depth < 8, "列添字の解決が深すぎる (循環?): {expr}");
+            let idents = idents_of(expr);
+            let mut resolved = expr.to_string();
+            let mut const_val = i64::MAX;
+            for ident in &idents {
+                if d.contains_key(ident) {
+                    continue; // #define は eval 側で展開する
+                }
+                let (values, is_loop) = var_values(ident, d, depth);
+                if !is_loop {
+                    // 単一定数: 式へ直接代入する
+                    for v in &values {
+                        resolved = subst_ident(&resolved, ident, *v);
+                    }
+                    continue;
+                }
+                // ループ変数: 全反復で 4 の倍数であることを要求する
+                for v in &values {
+                    let sub = subst_ident(&resolved, ident, *v);
+                    let off = eval(&sub, d, 0);
+                    assert_eq!(
+                        off % 4,
+                        0,
+                        "列添字 {expr} が {ident}={v} のとき {off} で 4 の倍数でない"
+                    );
+                    const_val = off;
+                }
+                resolved = resolved.replace(ident.as_str(), "0"); // 以後は定数扱い
+            }
+            let v = eval(&resolved, d, 0);
+            if const_val != i64::MAX {
+                return const_val;
+            }
+            v
+        }
+
+        // 式に現れる識別子 (出現順・重複なし)
+        fn idents_of(expr: &str) -> Vec<String> {
+            let b = expr.as_bytes();
+            let mut out: Vec<String> = Vec::new();
+            let mut i = 0;
+            while i < b.len() {
+                let c = b[i] as char;
+                if c.is_ascii_alphabetic() || c == '_' {
+                    let s = i;
+                    while i < b.len() {
+                        let ch = b[i] as char;
+                        if ch.is_ascii_alphanumeric() || ch == '_' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let id = expr[s..i].to_string();
+                    if !out.contains(&id) {
+                        out.push(id);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            out
+        }
+        // 識別子を数値に置換 (識別子境界を保つ)
+        fn subst_ident(expr: &str, ident: &str, val: i64) -> String {
+            let mut out = String::new();
+            let b = expr.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                let c = b[i] as char;
+                if c.is_ascii_alphabetic() || c == '_' {
+                    let s = i;
+                    while i < b.len() {
+                        let ch = b[i] as char;
+                        if ch.is_ascii_alphanumeric() || ch == '_' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if &expr[s..i] == ident {
+                        out.push_str(&val.to_string());
+                    } else {
+                        out.push_str(&expr[s..i]);
+                    }
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            out
+        }
+        // 変数の取り得る値。(values, is_loop)
+        //   `const int c = <式>;`          -> (vec![評価値], false)
+        //   `for (int v = A; v < B; v++)`  -> ((A..B の各値), true)
+        fn var_values(
+            var: &str,
+            d: &std::collections::HashMap<String, String>,
+            depth: u32,
+        ) -> (Vec<i64>, bool) {
+            // ループ宣言を優先 (同じ名前が両方あることは無い)
+            let loop_decl = format!("for (int {var} = ");
+            if let Some(pos) = SRC.find(&loop_decl) {
+                let tail = &SRC[pos + loop_decl.len()..];
+                let semi = tail.find(';').expect("for の ; が無い");
+                let from_expr = &tail[..semi];
+                let rest = &tail[semi + 1..];
+                let semi2 = rest.find(';').expect("for 条件の ; が無い");
+                let cond = rest[..semi2].trim();
+                let rest2 = &rest[semi2 + 1..];
+                let inc = &rest2[..rest2.find(')').expect("for 増分の ) が無い")];
+                let from = eval_col(from_expr, d, depth + 1);
+                let lt = format!("{var} <");
+                let to_expr = cond
+                    .strip_prefix(&lt)
+                    .unwrap_or_else(|| panic!("for 条件が `{var} <` でない: {cond:?}"));
+                let to = eval_col(to_expr.trim(), d, depth + 1);
+                let (step, tight) = if inc.trim() == format!("{var}++") {
+                    (1, true)
+                } else if let Some(r) = inc.trim().strip_prefix(&format!("{var} +=")) {
+                    (eval_col(r.trim(), d, depth + 1), false)
+                } else {
+                    panic!("for 増分が未対応: {inc:?}");
+                };
+                let _ = tight;
+                assert!(step > 0, "for 増分が正でない");
+                let mut vals = Vec::new();
+                let mut v = from;
+                while v < to {
+                    vals.push(v);
+                    v += step;
+                }
+                assert!(!vals.is_empty(), "ループ {var} が 1 回も回らない");
+                return (vals, true);
+            }
+            // ローカル定数 `const int c = <式>;` / `int c = <式>;`
+            for prefix in ["const int ", "int "] {
+                let decl = format!("{prefix}{var} = ");
+                if let Some(pos) = SRC.find(&decl) {
+                    let tail = &SRC[pos + decl.len()..];
+                    let semi = tail.find(';').expect("ローカル宣言の ; が無い");
+                    let v = eval_col(&tail[..semi], d, depth + 1);
+                    return (vec![v], false);
+                }
+            }
+            panic!("列添字の変数 {var} の宣言が見つからない");
+        }
+
+        let tile = eval(get_raw("GEMM_TILE"), &d, 0);
+        let tile_n = eval(get_raw("GEMM_TILE_N"), &d, 0);
+        let tk = eval(get_raw("GEMM_TK"), &d, 0);
+        let sp = eval(get_raw("GEMM_SP"), &d, 0);
+        let bx = eval(get_raw("GEMM_BX"), &d, 0);
+        let by = eval(get_raw("GEMM_BY"), &d, 0);
+
+        // (1) 共有ステージの行ストライドは 4 の倍数 (i32 キャストの前提)
+        assert_eq!(
+            sp % 4,
+            0,
+            "GEMM_SP={sp} が 4 の倍数でない: 共有配列への (int*) アクセスが未アラインになり \
+             'Invalid __shared__ write' -> CUDA error 716 を起こす (s74 の 33 がこれ)"
+        );
+        assert_ne!(
+            sp % 32,
+            0,
+            "GEMM_SP={sp} が 32 の倍数だと隣接 thread の 8 行差が同一 bank に並び conflict する"
+        );
+        assert_eq!(tk % 4, 0, "GEMM_TK={tk} は dp4a パックのため 4 の倍数であること");
+
+        // (2) ブロック形状はタイルを過不足なく覆う (s74 の 16x4 がこれに違反した)
+        assert_eq!(
+            bx * 16,
+            tile_n,
+            "GEMM_BX * (1 thread の列数 16) = {} != GEMM_TILE_N {tile_n}",
+            bx * 16
+        );
+        assert_eq!(
+            by * 8,
+            tile,
+            "GEMM_BY * (1 thread の行数 8) = {} != GEMM_TILE {tile}: \
+             ブロックがタイル全域を覆わず、未書き込みの出力行が残る (s74 の不具合)",
+            by * 8
+        );
+        assert!(bx * by <= 1024, "ブロック {} スレッドは上限 1024 を超える", bx * by);
+
+        // Rust 側のミラー定数とカーネルの値が一致すること (片方だけ直す事故の防止)
+        assert_eq!(tile as usize, GEMM_TILE, "GEMM_TILE がカーネルと Rust で不一致");
+        assert_eq!(tile_n as usize, GEMM_TILE_N, "GEMM_TILE_N がカーネルと Rust で不一致");
+        assert_eq!(bx as u32, GEMM_BX, "GEMM_BX がカーネルと Rust で不一致");
+        assert_eq!(by as u32, GEMM_BY, "GEMM_BY がカーネルと Rust で不一致");
+
+        // 共有メモリ量が既定の 48KiB に収まること
+        let smem = (tile + tile_n) * sp;
+        assert!(
+            smem <= 48 * 1024,
+            "共有メモリ {smem}B が既定 48KiB を超える (動的確保か opt-in が必要)"
+        );
+
+        // (3) 共有配列への i32 アクセス: すべて `[行][<4 の倍数>]` であること。
+        //     カーネル本体 (dno_gemm_i8) の範囲だけを見る。
+        let body_start = SRC
+            .find("void dno_gemm_i8")
+            .expect("dno_gemm_i8 が無い");
+        let body = &SRC[body_start..];
+        let mut checked = 0usize;
+        for (lineno, line) in body.lines().enumerate() {
+            // コメント行は除外
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for prefix in ["sA[", "sB["] {
+                let mut search = 0usize;
+                while let Some(off) = line[search..].find(prefix) {
+                    let at = search + off;
+                    // 直前に `(int*)` / `(const int*)` のキャストがあるものだけ対象
+                    // (`*(int*)&sA[..]` のように `&` が挟まるので取り除いて判定する)
+                    let lead = line[..at].trim_end().trim_end_matches('&').trim_end();
+                    let cast = lead.ends_with("(int*)") || lead.ends_with("(const int*)");
+                    if !cast {
+                        search = at + prefix.len();
+                        continue;
+                    }
+                    // `[行][列]` の列部分を取り出す
+                    let rest = &line[at..];
+                    let close = rest.find(']').expect("配列の [ が閉じていない");
+                    let after = &rest[close + 1..];
+                    let col_open = after.find('[').expect("列添字が無い");
+                    let col_close = after.find(']').expect("列添字が閉じていない");
+                    let col_expr = &after[col_open + 1..col_close];
+                    let col = eval_col(col_expr, &d, 0);
+                    assert_eq!(
+                        col % 4,
+                        0,
+                        "line {}: {prefix}..][{col_expr}] = バイトオフセット {col} が 4 の倍数でない \
+                         (行 {lineno}): {}",
+                        lineno + 1,
+                        line.trim()
+                    );
+                    assert!(col + 4 <= tk, "列 {col} が GEMM_TK {tk} を超えて 4 バイト読む");
+                    checked += 1;
+                    search = at + prefix.len();
+                }
+            }
+        }
+        assert!(checked >= 5, "共有配列の i32 アクセスを {checked} 件しか検査していない");
+        println!(
+            "kernels_int8.cu: tile={tile}x{tile_n} tk={tk} sp={sp} block={bx}x{by} smem={smem}B \
+             checked {checked} shared int accesses"
+        );
     }
 
     /// P17k 調査: prefill 実形状での linear_gemm_i8 の内訳計測 (kernel / D2H / to_vec)。
