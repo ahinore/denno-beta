@@ -24,39 +24,54 @@ permitted relaxations.
 
 ## P1 — prefill, ordered by expected gain
 
-Estimates come from the last full profile (s64-era, scaled for s68–s81 changes). T8's
-bucket will refresh part of it; re-measure before committing to any number.
+Estimates below were refreshed at s91 from the last full profile (cold, 5,686 tok,
+`DENNO_PROFILE=1`, prefill wall 13.75 s) and are quoted as measured ms / share of the wall.
+Round-tripping "Estimated" numbers from the s64-era profile are gone.
 
 ### P1-1: GDN scan residency / pass reduction
 - Where: `cuda.rs` (`gdn_scan_chunked_impl`, `gdn_scan_batch_oproj`, `chain_*`), `kernels/gdn.cu`.
-- Why: the scan was ~3.1 s of a 40.9 s profile and still moves state through host memory.
-- Idea: keep the state on device across the whole GDN block; cut the 3-pass chunked scan
-  to 2 or fold the final normalization into the last pass. Heads are independent, so
-  head-parallel splits are numerically free.
-- Estimated: 0.5–1.0 s. Risk: medium (kernel change -> PTX regen -> GPU_VERIFY).
-- Acceptance: cold A/B >= 0.3 s faster, anchors MATCH, decode not worse than 3 %.
+- Status: **closed (2026-10-19) - fold not implementable, measured zero gain** (s90 attempt
+  `ddf7201`, closed in s91).
+- Reason: the 2-launch fold needs the boundary row a chunk reads to be written by a
+  *different* launch, which this forward cannot provide — the GDN layers are non-adjacent,
+  and `cache.advance(n)` after every forward forces the state back to the host per layer.
+  The scan's own cost is 1.99 s = 1.10 s sync wait (real GPU work, not idle) + 0.52 s H2D of
+  activations, so no residency lever is left inside the scan.
+- Measured: cold A/B, 5,686-token payload, 3 alternating rounds — OLD 13.362 / 13.408 /
+  13.404 s vs NEW 13.345 / 13.377 / 13.375 s = **-0.03 s, no gain** (acceptance was
+  >= 0.3 s faster). Anchors MATCH, decode unchanged at 16.4 ms/token.
+- Remaining scan cost (`gdn_scan` 1,987 ms) is booked under P1-3, not here.
 
 ### P1-2: full-attention prefill kernel occupancy
 - Where: `dno_attention_prefill` (kernels), `full_attn_attend_gpu`.
-- Why: attn_core is the largest profiled bucket; attn_full was ~1.2 s. The T7b-2 failure
-  showed this kernel is sensitive to how much data it has to re-read (attn_core went
-  4.0 s -> 10.1 s when the fused layout forced strided extraction).
+- Why: `attn_full` measures 942 ms (16 calls = 8 full-attention layers, two passes each),
+  6.9 % of the wall. The T7b-2 failure showed this kernel is sensitive to how much data it
+  has to re-read (attn_core went 4.0 s -> 10.1 s when the fused layout forced strided
+  extraction).
 - Idea: raise occupancy (smaller BK, more blocks), check L2 reuse of K/V across heads.
-- Estimated: 0.3–0.8 s. Risk: medium; the attention contract allows 1e-3 abs (R3).
+- Estimated: not yet re-derived from a per-kernel profile; 942 ms is the ceiling for the
+  whole bucket. Risk: medium; the attention contract allows 1e-3 abs (R3).
 
 ### P1-3: d2h_state / sync reduction
 - Where: `cuda.rs` chains, `prof.rs` `d2h_state`.
-- Why: after s68–s72 the round trips collapsed, but the profile still shows sync-heavy
-  buckets. Each sync serializes CPU and GPU.
+- Why: `d2h_state` measures 6,147 ms (38.9 % of the wall), the largest bucket. Children:
+  `gdn_pf_sync` 1,095 ms / 96 calls, `gdn_pf_alloc` 521 ms / 48, `d2h_attn_pf` 491 ms / 8,
+  `d2h_src_other` 491 ms / 8. Each sync serializes CPU and GPU.
 - Idea: count syncs per layer, then batch the remaining D2H into one transfer per block.
-- Estimated: 0.3–0.6 s. Risk: low-medium (transfer only, bit-exact expected).
+- Estimated: 6.15 s bucket; realistic separable gain is the 1.6 s of transfer/alloc share,
+  not the 1.1 s sync wait (that is real GPU work, see P1-1). Risk: low-medium (transfer
+  only, bit-exact expected).
 
 ### P1-4: swiglu / elementwise fusion
 - Where: `dno_swiglu` + the residual/normalization passes.
-- Why: swiglu was ~0.85 s; it is a pure elementwise pass over the activation buffer.
+- Why: elementwise work is now `gate_up_proj` 2,283 ms / 14.4 % (64 calls), `qkv_proj`
+  1,534 ms / 9.7 %, `down_proj` 999 ms / 6.3 %, `rmsnorm` 413 ms / 2.6 %, `qk_norm`
+  108 ms / 0.7 %, `o_proj` 175 ms / 1.1 %. Only `rmsnorm` is a pure elementwise pass in
+  that list.
 - Idea: fuse swiglu into the gate+up GEMM epilogue (the fusion already concatenates
   gate and up, so the epilogue has both halves in registers).
-- Estimated: 0.2–0.4 s. Risk: low; bit-exactness needs the same multiply order.
+- Estimated: bounded by `rmsnorm` 413 ms until the projection epilogues are instrumented
+  separately. Risk: low; bit-exactness needs the same multiply order.
 
 ## P2 — decode (separate axis)
 
@@ -140,6 +155,7 @@ bucket will refresh part of it; re-measure before committing to any number.
 
 ## Suggested order
 
-1. T8 (in flight) -> P1-1 GDN scan -> P1-2 attention -> P1-4 swiglu fusion.
+1. T8 (in flight) -> P1-2 attention -> P1-3 d2h/sync -> P1-4 swiglu fusion.
+   (P1-1 is closed as of s91; its remaining scan cost sits in P1-3's bucket.)
 2. In parallel on the CPU-only agent: P3-1 (delete the dead kernel), P3-3, P4-1, P4-4.
 3. P2-1 decode once P1 has plateaued; P3-4 the moment a second A/B is needed by hand.
