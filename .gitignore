@@ -19,3 +19,5 @@ data/
 /GPU_VERIFY.sh
 /PF_BENCH.sh
 /diag_*.patch
+# 開発用ヘルパ (セッション限り・commit しない)
+/t5_*.sh
