@@ -1929,6 +1929,36 @@ ranking.
   without changing the accounting.
 - When counts and time are split into separate APIs, decide in one place who records the count.
 
+### The 2-launch GDN fold cannot hold in the current forward (2026-10-19, s89 / s90 / P1-1) — built, then closed
+
+> The chunked scan is pass 1 (W/M) → pass 2 (serial Sinit propagation) → pass 3 (sequential AR):
+> three launches and three syncs. Folding pass 2 into chunk 0 of pass 3 would make it two.
+> `dno_gdn_chunk_scan_hoist` was implemented, keeping each chunk boundary state in the graph
+> buffer `s_rows[t]`.
+
+**Conclusion: the hoist path must never run in the current forward** (`route_hoist` always
+returns false). Both reasons reduce to the same thing — the writer of the row
+`ci*chunk_len - 1` that a folded chunk `ci >= 1` reads does not exist inside the same launch.
+
+1. **GDN layers are not adjacent.** Full-attention layers sit between them and issue no GDN
+   launch, so when layer i reads `s_rows` there is no launch that wrote those rows.
+2. **Every interval starts at a host boundary.** Each layer scans `[lo, n)` and the host-side
+   `KvCache::gdn` state lines up with the interval boundary on every `cache.advance(n)`, so
+   neighbouring intervals only ever connect through the host.
+
+The three-launch path is therefore the only correct one. The ledger (which row is written by
+whom, read by whom) and its invariant tests stay for whoever implements either route later;
+**a sound ledger is not evidence that the path may run.**
+
+**Measured (cold A/B, 5,686 tokens, three alternating rounds)**: OLD `b502e34` =
+13.362 / 13.408 / 13.404 s, NEW `98c83cb` (s90) = 13.345 / 13.377 / 13.375 s →
+**−0.03 s, no gain** (acceptance was 0.3 s). All three anchors MATCH, decode unchanged at
+16.4 ms/token.
+
+**Where the remaining cost goes**: of the 1,987 ms in `gdn_scan`, 1,100 ms is sync wait
+(real GPU work) and 520 ms is the activations H2D, so no residency lever is left inside the
+scan. That work is booked under P1-3 (`d2h_state` 6,147 ms = 38.9 % of the wall).
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
