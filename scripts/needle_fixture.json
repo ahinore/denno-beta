@@ -1,0 +1,170 @@
+{
+  "_comment": [
+    "P4-4 (s98): 長文 needle recall の回帰テスト用 fixture。scripts/needle_check.py が読む。",
+    "s73 の調査で一度だけ手打ちされた 4,671 token の needle recall (docs/HISTORY.en.md:1621)",
+    "を、毎回同じ payload で再実行できる形に固定したもの。",
+    "",
+    "payload の組み立て (すべて決定論的・実行時の乱数は使わない):",
+    "  1. filler は words の語彙から seed 付き LCG で語を選び、sentence_words 語ごとに",
+    "     文を作って連結する。語彙・seed・語数が同じなら何度作っても同じ文字列になる。",
+    "  2. needle を filler の depth (0.0-1.0) の位置に、独立した段落として差し込む。",
+    "  3. 最後に question を別のユーザー発話として置く。",
+    "",
+    "token 数は文字数から推測しない。実測はサーバ応答の usage.input_tokens を採り、",
+    "JSON 出力の usage.input_tokens に記録する。filler_chars はその実測が",
+    "target_input_tokens_min..max に入るように調整するためのノブ (起動ログや JSON を見て",
+    "人間が 1 回だけ合わせる)。既定値は英語の平文で約 4 文字/token を仮定した初期値。"
+  ],
+  "version": 1,
+  "id": "needle-bay7-v1",
+  "needle": "The access code for bay 7 is QX-4471.",
+  "question": "What is the access code for bay 7? Reply with the code only.",
+  "expected_answer": "QX-4471",
+  "_expected_answer_comment": [
+    "照合は case-insensitive・空白正規化。expected_alternatives はコードの表記ゆれ",
+    "(ハイフン無し) を許すための別表記で、どれか 1 つ一致すれば recall 成立とする。"
+  ],
+  "expected_alternatives": [
+    "QX-4471",
+    "QX4471"
+  ],
+  "_forbidden_comment": [
+    "needle を読まずに当てずっぽうで答えたと分かる値。応答がこれらだけなら recall 失敗",
+    "(exit 1) として扱う。expected_answer が見つかっていれば forbidden の存在は無視する。"
+  ],
+  "forbidden_answers": [
+    "I don't know",
+    "I do not know",
+    "unknown",
+    "not mentioned",
+    "not provided"
+  ],
+  "depth": 0.5,
+  "_depth_comment": "needle を差し込む位置 (filler 文字数に対する割合)。0.0 = 先頭、1.0 = 末尾。",
+  "system_prompt": "You are a precise assistant. Answer the user's question using only the information in the provided text. Do not guess.",
+  "gen": {
+    "_comment": "temperature は --temperature で上書きされる。max_tokens は生成自体の上限。",
+    "max_tokens": 32,
+    "top_p": 1.0
+  },
+  "filler": {
+    "_comment": [
+      "決定的な filler 生成器の仕様。乱数は使わず、seed 付き LCG で",
+      "topics / openers / subjects / verbs / objects / closers を選んで 1 文ずつ組み立てる。",
+      "同じ fixture からは何度組み立てても同じ文字列になる (selftest が 2 回作って照合する)。",
+      "文は英語の平文として読める形にしてある: 語の羅列だと 9B の応答品質が",
+      "tokenizer の偏りに引きずられ、recall ではなく雑音を測ることになるため。",
+      "話題は倉庫・物流・事務の一般的な記述で、needle (bay 7 / access code) とは",
+      "意図的に無関係にしてある (局所文脈からコードを推測できないようにする)。",
+      "filler_chars は目標の文字数。実測 token 数はサーバの usage.input_tokens で確認する。"
+    ],
+    "seed": 20261019,
+    "multiplier": 1103515245,
+    "increment": 12345,
+    "modulus": 2147483648,
+    "filler_chars": 21400,
+    "min_sentences": 40,
+    "opener_ratio": 0.2,
+    "topics": [
+      "the north warehouse",
+      "the east loading dock",
+      "the records office",
+      "the maintenance workshop",
+      "the spare parts store",
+      "the shipping desk",
+      "the inventory team",
+      "the night shift",
+      "the receiving area",
+      "the tool crib",
+      "the packing line",
+      "the dispatch office"
+    ],
+    "openers": [
+      "During the morning review,",
+      "Later that week,",
+      "As noted in the log,",
+      "In a short briefing,",
+      "At the end of the shift,",
+      "Before the audit,",
+      "After the inspection,",
+      "In the weekly report,",
+      "On most afternoons,",
+      "When the schedule allows,",
+      "For the second quarter,",
+      "In practice,"
+    ],
+    "subjects": [
+      "the supervisor",
+      "the clerk on duty",
+      "the team lead",
+      "the inventory controller",
+      "the visiting auditor",
+      "the shift coordinator",
+      "the maintenance crew",
+      "two experienced operators",
+      "the scheduler",
+      "the quality inspector",
+      "the storekeeper",
+      "a newly assigned trainee"
+    ],
+    "verbs": [
+      "checked",
+      "confirmed",
+      "reorganised",
+      "counted",
+      "labelled",
+      "reviewed",
+      "compared",
+      "recorded",
+      "moved",
+      "inspected",
+      "updated",
+      "sorted"
+    ],
+    "objects": [
+      "the delivery schedule",
+      "the shelf labels",
+      "the spare gaskets",
+      "the return forms",
+      "the pallet list",
+      "the door sensors",
+      "the printed manifests",
+      "the handling notes",
+      "the safety checklist",
+      "the temperature log",
+      "the tool inventory",
+      "the bin locations",
+      "the shipping labels",
+      "the maintenance tickets",
+      "the stock printouts"
+    ],
+    "closers": [
+      "before the next handover",
+      "against last week's figures",
+      "to avoid a repeat of the delay",
+      "without stopping the line",
+      "well ahead of the deadline",
+      "and flagged two small gaps",
+      "so the evening crew could start on time",
+      "despite the short notice",
+      "in less time than expected",
+      "and left a short note for the next shift",
+      "after a brief discussion",
+      "while the rest of the floor was quiet"
+    ],
+    "subject_prefix": "at",
+    "_subject_prefix_comment": "topic と subject のつなぎ。\"the north warehouse at the supervisor\" のような壊れた文を避けるため、subject 側に前置詞付きの言い回しを持たせる。"
+  },
+  "thresholds": {
+    "_comment": [
+      "acceptance thresholds。実サーバでの実測を見て人間が調整してよい。",
+      "target_input_tokens_min/max: usage.input_tokens の許容帯 (handoff の 4,400-5,000)。",
+      "orig_input_tokens: s73 の元計測 (4,671)。ドリフトを見るための参照値。",
+      "depth_tolerance: 差し込んだ needle の実位置が要求 depth から外れてよい割合。"
+    ],
+    "target_input_tokens_min": 4400,
+    "target_input_tokens_max": 5000,
+    "orig_input_tokens": 4671,
+    "depth_tolerance": 1.0
+  }
+}
