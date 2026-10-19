@@ -311,6 +311,14 @@ extern "C" __global__ void dno_attention(
 //   実測は実機で cuda_attn_pf_bench を再実行すること。s_sm の行先頭は
 //   PF_BK=8 floats (32B) 刻み・動的 smem ベースは 16B 整列のため float2 (8B)
 //   アクセスの整列は常に成立する (kk は偶数ステップ)。
+// s112 (P1-2): ⑦ K/V のグローバル読みを `__ldg` (read-only data cache) 経由にする。
+//   kc/vc は `const float *__restrict__` でカーネル内から書き込みが無いため、
+//   read-only パス (sm_75 以降の L1/テクスチャ系キャッシュ) を経由しても
+//   **読み値は完全に同一**。演算・加算順・タイル境界は一切変えないので
+//   **数値はビット一致** (決定論も不変)。
+//   これらはタイルごとに `PF_BK` 要素のストリーム読みで、L2 に載る前の初回タッチが
+//   律速になりやすい (T7b-2 で再読みトラフィックに敏感と分かっている箇所)。
+//   実測は実機 (cuda_attn_pf_bench) で行う。
 #define PF_BQ 64
 #define PF_BK 8
 // exp2f ベース softmax 用 (expf(x) = exp2f(x * log2(e)))
@@ -364,8 +372,8 @@ extern "C" __global__ void dno_attention_prefill(
         for (int kk = 0; kk < PF_BK; ++kk) {
             const int j = kk;
             if (j < t_total) {
-                k_next[kk] = kc[(size_t)j * kv_dim + kh_off + tid];
-                v_next[kk] = vc[(size_t)j * kv_dim + kh_off + tid];
+                k_next[kk] = __ldg(&kc[(size_t)j * kv_dim + kh_off + tid]);
+                v_next[kk] = __ldg(&vc[(size_t)j * kv_dim + kh_off + tid]);
             } else {
                 k_next[kk] = 0.0f;
                 v_next[kk] = 0.0f;
@@ -389,8 +397,8 @@ extern "C" __global__ void dno_attention_prefill(
             for (int kk = 0; kk < PF_BK; ++kk) {
                 const int j = jn + kk;
                 if (j < t_total) {
-                    k_next[kk] = kc[(size_t)j * kv_dim + kh_off + tid];
-                    v_next[kk] = vc[(size_t)j * kv_dim + kh_off + tid];
+                    k_next[kk] = __ldg(&kc[(size_t)j * kv_dim + kh_off + tid]);
+                    v_next[kk] = __ldg(&vc[(size_t)j * kv_dim + kh_off + tid]);
                 } else {
                     k_next[kk] = 0.0f;
                     v_next[kk] = 0.0f;
