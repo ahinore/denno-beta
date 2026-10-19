@@ -1377,6 +1377,12 @@ impl Qwen35 {
                             )
                         });
                     let _ = scan_on_gpu;
+                    // s90 (P1-1): CPU でスキャンした = ホストの `KvCache::gdn` が
+                    // 正 (GPU 常駐の正本はこの層で更新されていない) → 捨てる。
+                    #[cfg(feature = "cuda")]
+                    if !scan_on_gpu {
+                        crate::cuda::gdn_scan_state_invalidate();
+                    }
                     crate::prof::time_n_ev(crate::prof::OPROJ, n, || {
                         g.out_w.apply_bt_rows_into(&ys, n, &mut buf_out)
                     });

@@ -95,6 +95,10 @@ impl KvCache {
             g.0.fill(0.0);
             g.1.fill(0.0);
         }
+        // s90 (P1-1): ホストの GDN 状態が正に戻った → デバイス常駐の正本を捨てる
+        // (`cuda` feature が無いときは常駐も無いので何もしない)。
+        #[cfg(feature = "cuda")]
+        crate::cuda::gdn_scan_state_invalidate();
     }
 
     pub fn len(&self) -> usize {
@@ -255,6 +259,10 @@ impl KvCache {
         assert_eq!(v.len(), self.v.len(), "KV cache restore: layer count mismatch");
         self.ensure(n);
         self.bump_epoch();
+        // s90 (P1-1): prefix cache の復元でホスト側が正になる (GPU 常駐の
+        // GDN 正本は前の会話のもの) → 捨てる。
+        #[cfg(feature = "cuda")]
+        crate::cuda::gdn_scan_state_invalidate();
         let take = n * self.kv_dim;
         for (i, (dst, src)) in self.k.iter_mut().zip(k.iter()).enumerate() {
             if src.is_empty() {
@@ -320,6 +328,9 @@ impl KvCache {
             slot.0.copy_from_slice(conv);
             slot.1.copy_from_slice(ssm);
         }
+        // s90 (P1-1): ホストの GDN 状態が正に戻った (エントリ復元) → 常駐の正本を捨てる。
+        #[cfg(feature = "cuda")]
+        crate::cuda::gdn_scan_state_invalidate();
     }
 }
 

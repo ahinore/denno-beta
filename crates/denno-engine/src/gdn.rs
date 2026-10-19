@@ -19,6 +19,9 @@
 //! q,k は事前に L2 正規化 (x/sqrt(Σx²+eps))、q にのみ 1/sqrt(head_k_dim) を掛ける。
 //! 出力は head ごとに gated RMS norm: rmsnorm(o)*w * silu(z)。
 
+/// s90 (P1-1): 2 launch スケジュールの帳簿 (ホスト側・GPU 不要)
+pub mod scan_schedule;
+
 /// GDN ハイパーパラメータ (Qwen3.5 config の linear_* に対応)
 #[derive(Debug, Clone)]
 pub struct GdnParams {
@@ -1411,3 +1414,4 @@ mod tests {
         assert_eq!(bits(&s1.conv), bits(&s2.conv));
     }
 }
+
