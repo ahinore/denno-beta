@@ -745,7 +745,13 @@ impl Qwen35 {
             return false;
         }
         let mut ga = match crate::prof::time(crate::prof::D2H_ATTN_PF, || {
-            crate::cuda::chain_download(crate::cuda::CH_ATT, n * heads * dh)
+            let v = crate::cuda::chain_download(crate::cuda::CH_ATT, n * heads * dh);
+            if v.is_some() {
+                // s65: 発行元タグを d2h_state の細分より具体的に上書きする
+                // (表示専用・件数のみ)。
+                crate::prof::mark_d2h_src(crate::prof::D2H_SRC_ATTN_PF);
+            }
+            v
         }) {
             Some(v) => v,
             None => return false,

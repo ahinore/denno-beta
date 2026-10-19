@@ -1196,10 +1196,13 @@ pub fn maybe_gpu_ffn(
                     (lib.memcpy_dtoh_async)(ho.ptr, dout2.ptr(), m * e * 4, std::ptr::null_mut()),
                     "cuMemcpyDtoHAsync",
                 )?;
+                // s65: 発行元の件数分類 (表示専用・時間は d2h_state バケット側)
+                crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
                 ctx.sync()?;
                 Ok(())
             })?;
         }
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         Ok(ho.as_slice::<f32>()[..m * e].to_vec())
     });
     match r {
@@ -1656,8 +1659,11 @@ fn linear_pinned(
                 (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
                 "cuMemcpyDtoHAsync",
             )?;
+            // s65: 発行元の件数分類 (表示専用・時間は d2h_state バケット側)
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
         ctx.sync()?;
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         Ok(ho.as_slice::<f32>()[..m * n].to_vec())
     })
 }
@@ -1756,6 +1762,8 @@ fn linear_gemm_into(
                 (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
                 "cuMemcpyDtoHAsync",
             )?;
+            // s65: 発行元の件数分類 (表示専用・時間は d2h_state バケット側)
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
         ctx.sync()?;
         // 注意: SCRATCH の分解束縛が同名 `out` (デバイス出力) を作るため、
@@ -1942,8 +1950,11 @@ pub fn maybe_gpu_matvec_f32(
                 (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
                 "cuMemcpyDtoHAsync",
             )?;
+            // s65: 発行元の件数分類 (表示専用・時間は d2h_state バケット側)
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
         ctx.sync()?;
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LOGITS);
         Ok(ho.as_slice::<f32>()[..n].to_vec())
     });
     match r {
@@ -2270,6 +2281,7 @@ pub fn chain_download(slot: usize, len: usize) -> Option<Vec<f32>> {
                 ))?;
             }
         }
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_OTHER);
         ok(ctx.sync())?;
         Some(pin.as_slice::<f32>()[..len].to_vec())
     })
@@ -2305,6 +2317,7 @@ pub fn chain_download_at(slot: usize, elem_off: usize, len: usize) -> Option<Vec
                 ))?;
             }
         }
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_OTHER);
         ok(ctx.sync())?;
         Some(pin.as_slice::<f32>()[..len].to_vec())
     })
@@ -2981,6 +2994,8 @@ pub fn maybe_gpu_oproj(o: &Quant8Linear, m: usize, k: usize, li: usize) -> Optio
                     (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), m * e * 4, std::ptr::null_mut()),
                     "cuMemcpyDtoHAsync",
                 )?;
+                // s65: 発行元の件数分類 (表示専用・時間は d2h_state バケット側)
+                crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
                 ctx.sync()?;
                 Ok(())
             })?;
@@ -3731,6 +3746,9 @@ pub fn chain_qkv_rope_prefill(
         // 4) sync して K/V 現在行をホストキャッシュへ D2H (27MB・~3ms)。
         //    以降ホスト側に q/k/v Vec は存在しない。
         ok(ctx.sync())?;
+        // s65: 発行元の件数分類 (K/V 行 2 本・表示専用)
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_KV_ROW);
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_KV_ROW);
         {
             let kb = cache.k_buf(li, 0);
             ok(unsafe {
@@ -4506,6 +4524,10 @@ pub fn chain_q35_fullattn(
                 ),
                 "cuMemcpyDtoHAsync (q35 v stage)",
             ))?;
+            // s65: 発行元の件数分類 (full 層の K/V 行 2 本。staged async 発行だが
+            // 件数は d2h_state の calls に含まれる — 表示専用)
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_KV_ROW);
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_KV_ROW);
         }
         Some(())
     })?;
@@ -4805,6 +4827,9 @@ pub fn chain_q35_gdn_flush_pending(cache: &mut crate::kv_cache::KvCache) -> Opti
             m.gdn_pending = None;
             return None;
         };
+        // s65: 発行元の件数分類 (GDN 状態の回復 = conv + ssm の 2 本)
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
         let conv = ok(cb.to_vec::<f32>(cb.bytes() / 4))?;
         let ssm = ok(sb.to_vec::<f32>(sb.bytes() / 4))?;
         let (conv_h, ssm_h) = cache.gdn_state_mut(li)?;
@@ -7095,6 +7120,10 @@ fn gdn_scan_impl(
     let y = dy.to_vec::<f32>(n * vd)?;
     let conv_new = dconv_out.to_vec::<f32>(conv_dim * cs)?;
     let ssm_new = dssm_out.to_vec::<f32>(nv * dk * dv)?;
+    // s65: 発行元の件数分類 (y は linear / conv+ssm は GDN 状態)
+    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
+    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
     conv_st.copy_from_slice(&conv_new);
     ssm_st.copy_from_slice(&ssm_new);
     q.end();
@@ -7308,6 +7337,10 @@ fn gdn_scan_chunked_impl(
     let y = dy.to_vec::<f32>(n * vd)?;
     let conv_new = dconv_out.to_vec::<f32>(conv_dim * cs)?;
     let ssm_new = dssm_out.to_vec::<f32>(nv * dk * dv)?;
+    // s65: 発行元の件数分類 (y は linear / conv+ssm は GDN 状態)
+    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
+    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
     conv_st.copy_from_slice(&conv_new);
     ssm_st.copy_from_slice(&ssm_new);
     q.end();
