@@ -38,6 +38,7 @@ use anyhow::{anyhow, bail, Result};
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
 use std::sync::OnceLock;
+use std::time::Instant;
 
 type CUresult = i32;
 type CUdevice = c_int;
@@ -7017,6 +7018,18 @@ fn gdn_scan_impl(
     debug_assert_eq!(ssm_st.len(), nv * dk * dv);
 
     ctx.make_current()?;
+    // s64 (T5b L1 Step 1 計測): この関数の全体は呼び出し側 (qwen35.rs) の
+    // `time_layer_n_ev(ATT_GDN_SCAN)` = `attn_gdn` / `gdn_scan` バケットで計時される。
+    // ここではスキャン 1 call の中身を「確保 + H2D / launch / sync / D2H」の 4 区間に
+    // 割り、既存バケットを壊さずに **表示専用の細分** (`D2H_GDN_PF_ALLOC` ..
+    // `D2H_GDN_PF_D2H`) へ積む。各区間の経過時間は次の区間の入口で読むので、
+    // 細分の合計≒外側バケット値になる。計測器は `prof::Seq` (prof off は素透し
+    // で時刻読みすらしない = 数値経路・実行時間とも不変)。
+    //
+    // 区間の切り方: 確保 + 入力 H2D (重み 4 本を含む) を 1 区間にまとめた理由は、
+    // 重み (`wconv` 等) が層ごとに固定で `gdn_scan_batch` の引数にはバッファが
+    // 無い (= 呼び出しごとに H2D し直している) ことを確定させるため。
+    let mut q = crate::prof::Seq::begin(crate::prof::D2H_GDN_PF_ALLOC, Instant::now());
     let dq = DevBuffer::from_slice(qkv)?;
     let dz = DevBuffer::from_slice(z)?;
     let dbeta = DevBuffer::from_slice(beta)?;
@@ -7030,6 +7043,7 @@ fn gdn_scan_impl(
     let dy = DevBuffer::from_slice(&vec![0.0f32; n * vd])?;
     let dconv_out = DevBuffer::from_slice(&vec![0.0f32; conv_dim * cs])?;
     let dssm_out = DevBuffer::from_slice(&vec![0.0f32; nv * dk * dv])?;
+    q.lap(crate::prof::D2H_GDN_PF_LAUNCH);
 
     let (mut pq, mut pz, mut pb, mut pa) = (
         dq.ptr(),
@@ -7074,13 +7088,16 @@ fn gdn_scan_impl(
     unsafe {
         ctx.launch_async(ctx.f_gdn, (nv as u32, 1, 1), (dk as u32, 1, 1), shmem, &mut args)?;
     }
+    q.lap(crate::prof::D2H_GDN_PF_SYNC);
     ctx.sync()?;
+    q.lap(crate::prof::D2H_GDN_PF_D2H);
 
     let y = dy.to_vec::<f32>(n * vd)?;
     let conv_new = dconv_out.to_vec::<f32>(conv_dim * cs)?;
     let ssm_new = dssm_out.to_vec::<f32>(nv * dk * dv)?;
     conv_st.copy_from_slice(&conv_new);
     ssm_st.copy_from_slice(&ssm_new);
+    q.end();
     Ok(y)
 }
 
@@ -7140,6 +7157,9 @@ fn gdn_scan_chunked_impl(
     let (n_chunks, chunk_len) = crate::gdn::chunk_plan(n, GDN_CHUNK_MIN_TOKENS, 1024, 16);
 
     ctx.make_current()?;
+    // s64 (T5b L1 Step 1 計測): `gdn_scan_impl` と同一の 4 区間細分 (表示専用)。
+    // chunked 経路は pass ごとに sync するため launch/sync は 3 pass 分の合計。
+    let mut q = crate::prof::Seq::begin(crate::prof::D2H_GDN_PF_ALLOC, Instant::now());
     let dq = DevBuffer::from_slice(qkv)?;
     let dz = DevBuffer::from_slice(z)?;
     let dbeta = DevBuffer::from_slice(beta)?;
@@ -7157,6 +7177,7 @@ fn gdn_scan_chunked_impl(
     // 最終状態は最終 chunk ブロックのみ書き込むためゼロ初期化 (未書込部は未使用)
     let dconv_out = DevBuffer::from_slice(&vec![0.0f32; conv_dim * cs])?;
     let dssm_out = DevBuffer::from_slice(&vec![0.0f32; nv * dk * dv])?;
+    q.lap(crate::prof::D2H_GDN_PF_LAUNCH);
 
     // ---- pass 1: chunk 並列でローカル遷移 (W[ci], M[ci]) --------------------
     let (mut pq, mut pb, mut pa) = (dq.ptr(), dbeta.ptr(), dalpha.ptr());
@@ -7201,7 +7222,9 @@ fn gdn_scan_chunked_impl(
             &mut args_pre,
         )?;
     }
+    q.lap(crate::prof::D2H_GDN_PF_SYNC);
     ctx.sync()?;
+    q.lap(crate::prof::D2H_GDN_PF_D2H);
 
     // ---- pass 2: chunk 先頭状態 Sinit の直列伝播 ----------------------------
     let (mut psi, mut pm2, mut pw2, mut psinit) =
@@ -7218,6 +7241,7 @@ fn gdn_scan_chunked_impl(
         &mut dk2 as *mut _ as *mut c_void,
         &mut dv2 as *mut _ as *mut c_void,
     ];
+    q.lap(crate::prof::D2H_GDN_PF_LAUNCH);
     unsafe {
         ctx.launch_async(
             ctx.f_gdn_chunk_state,
@@ -7227,7 +7251,9 @@ fn gdn_scan_chunked_impl(
             &mut args_state,
         )?;
     }
+    q.lap(crate::prof::D2H_GDN_PF_SYNC);
     ctx.sync()?;
+    q.lap(crate::prof::D2H_GDN_PF_D2H);
 
     // ---- pass 3: Sinit[ci] からの逐次 AR スキャン (chunk 並列) ---------------
     let (mut pq3, mut pz3, mut pb3, mut pa3) = (dq.ptr(), dz.ptr(), dbeta.ptr(), dalpha.ptr());
@@ -7265,6 +7291,7 @@ fn gdn_scan_chunked_impl(
         &mut qsi3 as *mut _ as *mut c_void,
     ];
     let shmem_scan = ((3 * dk + dv + 5) * 4) as u32;
+    q.lap(crate::prof::D2H_GDN_PF_LAUNCH);
     unsafe {
         ctx.launch_async(
             ctx.f_gdn_chunk_scan,
@@ -7274,12 +7301,15 @@ fn gdn_scan_chunked_impl(
             &mut args_scan,
         )?;
     }
+    q.lap(crate::prof::D2H_GDN_PF_SYNC);
     ctx.sync()?;
+    q.lap(crate::prof::D2H_GDN_PF_D2H);
 
     let y = dy.to_vec::<f32>(n * vd)?;
     let conv_new = dconv_out.to_vec::<f32>(conv_dim * cs)?;
     let ssm_new = dssm_out.to_vec::<f32>(nv * dk * dv)?;
     conv_st.copy_from_slice(&conv_new);
     ssm_st.copy_from_slice(&ssm_new);
+    q.end();
     Ok(y)
 }

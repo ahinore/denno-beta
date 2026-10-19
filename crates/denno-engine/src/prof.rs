@@ -60,6 +60,22 @@ pub const D2H_N: usize = 9; // 細分バケット数 (D2H_LOGITS .. D2H_ATTN_PF_
 pub const D2H_LOGITS_WAIT: usize = 10 * D2H + 6; // 追加 sync のみ (GPU 側未完了処理の待ち)
 pub const D2H_LOGITS_COPY: usize = 10 * D2H + 7; // 従来 D2H_LOGITS 区間 (従来計測)
 pub const D2H_LOGITS_PF_HELD: usize = 10 * D2H + 8; // prefill 後 1 点目の WAIT (集計から除外)
+/// s64 (T5b L1 Step 1・計測のみ): GDN スキャン 1 call (`gdn_scan_impl` /
+/// `gdn_scan_chunked_impl`) の内訳。**表示専用**で、値はどれも `attn_gdn` /
+/// `gdn_scan` のバケット (呼び出し側の `time_layer_n_ev(ATT_GDN_SCAN)`) に
+/// 既に含まれる — ここへ積むのは「どの区間が重いか」を見るためだけ。
+///
+/// 動機: s63 後の prefill で `gdn_scan` 3,159 ms (48 call = 24 層 × 2 リクエスト) と
+/// `d2h_state` 10,604 ms (168 call) が残った。`gdn_scan` は「DevBuffer 確保 + H2D →
+/// launch → sync → D2H」が 1 関数に混在しており、確保 (cuMemAlloc) と同期待ちの
+/// どちらが支配的かを実測で切り分けられなかった。id は D2H 細分の空き (9..) を
+/// 使う — D2H 細分の既存 id (0..8) は不変なので PROFILE の連続性は保たれる。
+pub const D2H_GDN_PF_ALLOC: usize = 10 * D2H + 9; // バッファ確保 + 入力 H2D (重み 4 本含む)
+pub const D2H_GDN_PF_LAUNCH: usize = 10 * D2H + 10; // カーネル launch 発行
+pub const D2H_GDN_PF_SYNC: usize = 10 * D2H + 11; // cuCtxSynchronize (完了待ち = カーネル実行)
+pub const D2H_GDN_PF_D2H: usize = 10 * D2H + 12; // 出力 y / conv / ssm の D2H + ホスト反映
+pub const D2H_GDN_PF_N: usize = 4; // 上記 4 区間の本数
+pub const D2H_GDN_PF_FIRST: usize = 10 * D2H + 9;
 /// s57 (T4): `attn_core` の層種別分離 (倍率 100)。**ATNN 生 id (= 4) の集計は従来どおり**
 /// — これは summary のテキスト出力だけに掛ける細分 (D2H 細分と同じ規約)。
 ///
@@ -186,6 +202,16 @@ const D2H_NAMES: [&str; D2H_N] = [
     "d2h_logits_wait",
     "d2h_logits_copy",
     "d2h_logits_pfhold",
+    // s64: GDN スキャン 1 call の内訳 -- **D2H 細分ではない** (専用テーブル +
+    // D2H_GDN_PF_* id で持つ)。D2H_N / D2H_SUB_* / 生 id の範囲は s63 のまま。
+];
+
+/// s64: GDN スキャン内訳の表示名 (id は 10*D2H + 9 + i)。
+const D2H_GDN_PF_NAMES: [&str; D2H_GDN_PF_N] = [
+    "gdn_pf_alloc",
+    "gdn_pf_launch",
+    "gdn_pf_sync",
+    "gdn_pf_d2h",
 ];
 
 /// s57 (T4): attn_core の層種別細分名 (id は 100*ATTN + i)。
@@ -241,6 +267,10 @@ static EXEC_CALLS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
 /// s54: d2h_state の細分累積 (id は 10*D2H + i → 添字 i)。フェーズ別。
 static D2H_SUB_NS: [[AtomicU64; D2H_N]; Phase::N] = mk_counters::<D2H_N>();
 static D2H_SUB_CALLS: [[AtomicU64; D2H_N]; Phase::N] = mk_counters::<D2H_N>();
+/// s64: GDN スキャン 1 call の内訳 (`gdn_pf_*`) 累積。**表示専用** — 生 id・
+/// `attn_gdn`・`gdn_scan` のどのバケットにも合算しない (二重計上防止)。
+static GDN_PF_NS: [[AtomicU64; D2H_GDN_PF_N]; Phase::N] = mk_counters::<D2H_GDN_PF_N>();
+static GDN_PF_CALLS: [[AtomicU64; D2H_GDN_PF_N]; Phase::N] = mk_counters::<D2H_GDN_PF_N>();
 /// s57 (T4): attn_core の細分 (id は 100*ATTN + i → 添字 i)。フェーズ別。
 static ATT_SUB_NS: [[AtomicU64; ATT_CLS_N]; Phase::N] = mk_counters::<ATT_CLS_N>();
 static ATT_SUB_CALLS: [[AtomicU64; ATT_CLS_N]; Phase::N] = mk_counters::<ATT_CLS_N>();
@@ -499,6 +529,15 @@ pub(crate) fn add_sample(
         D2H_SUB_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
         D2H_SUB_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
     }
+    // s64: GDN スキャン内訳 (gdn_pf_*) は **ここでしか積まない** — 生 id へ落とす
+    // 共通ブロックにも D2H 細分にも掛けない (表示専用・二重計上しない)。
+    if (D2H_GDN_PF_FIRST..D2H_GDN_PF_FIRST + D2H_GDN_PF_N).contains(&op) {
+        let k = op - D2H_GDN_PF_FIRST;
+        GDN_PF_NS[pi][k].fetch_add(ns, Ordering::Relaxed);
+        GDN_PF_NS[Phase::Both.idx()][k].fetch_add(ns, Ordering::Relaxed);
+        GDN_PF_CALLS[pi][k].fetch_add(calls, Ordering::Relaxed);
+        GDN_PF_CALLS[Phase::Both.idx()][k].fetch_add(calls, Ordering::Relaxed);
+    }
 }
 
 /// `f` の実行時間を op に計上して結果を返す。
@@ -571,6 +610,54 @@ pub fn time_if_on_n<T>(op: usize, rows: usize, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// s64 (T5b L1 Step 1): 1 関数の内部を複数区間に割って計時する計測器。
+///
+/// 用途は「ある関数の所要時間を、確保 / launch / sync / D2H などの区間へ割る」こと。
+/// `begin` で区間 1 の計時を開始し、`lap(next_id)` で「直前の区間の経過」を
+/// `next_id`……ではなく **直前の区間に積み**、次区間の計時を開始する
+/// (`seq.lap(SYNC)` は「今の区間 (LAUNCH) の終わり」と「SYNC の開始」を兼ねる)。
+/// `end` で最後の区間を積む。
+///
+/// PROFILE 無効時は `begin` が `None` を持ち、`lap`/`end` は分岐 1 回で何もしない
+/// (時刻読みもしない = 計測 off の実行時間に影響しない)。**表示専用**の細分に
+/// しか積まないので、既存バケットの値・数値経路は不変。
+pub struct Seq {
+    op: Option<usize>,
+    t: Instant,
+}
+
+impl Seq {
+    #[inline]
+    pub fn begin(op: usize, now: Instant) -> Self {
+        if enabled() {
+            Self {
+                op: Some(op),
+                t: now,
+            }
+        } else {
+            Self { op: None, t: now }
+        }
+    }
+
+    /// 現在の区間を積み、`next` 区間の計時を始める。
+    #[inline]
+    pub fn lap(&mut self, next: usize) {
+        let Some(op) = self.op else { return };
+        let now = Instant::now();
+        add_sample(phase(), op, now.duration_since(self.t).as_nanos() as u64, 1, 0, false);
+        self.op = Some(next);
+        self.t = now;
+    }
+
+    /// 最後の区間を積む。`t` は次回 `begin` で上書きされるため無効化する。
+    #[inline]
+    pub fn end(mut self) {
+        let Some(op) = self.op.take() else { return };
+        let now = Instant::now();
+        add_sample(phase(), op, now.duration_since(self.t).as_nanos() as u64, 1, 0, false);
+    }
+}
+
 pub fn reset() {
     for p in 0..Phase::N {
         for i in 0..N_OPS {
@@ -583,6 +670,10 @@ pub fn reset() {
         for i in 0..D2H_N {
             D2H_SUB_NS[p][i].store(0, Ordering::Relaxed);
             D2H_SUB_CALLS[p][i].store(0, Ordering::Relaxed);
+        }
+        for i in 0..D2H_GDN_PF_N {
+            GDN_PF_NS[p][i].store(0, Ordering::Relaxed);
+            GDN_PF_CALLS[p][i].store(0, Ordering::Relaxed);
         }
         for i in 0..ATT_CLS_N {
             ATT_SUB_NS[p][i].store(0, Ordering::Relaxed);
@@ -684,9 +775,16 @@ fn phase_table(phase: Phase, s: &mut String) {
                     "-",
                     ""
                 ));
+                if k == 3 {
+                    // s64: gdn_scan の直下にその内訳 (確保 / launch / sync / D2H) を出す
+                    push_gdn_pf_rows(p, total, "        ", s);
+                }
             }
         }
         if i == D2H {
+            // s64: GDN スキャン内訳 (gdn_pf_*) は d2h_state の値に含まれない
+            // (表示専用) が、読む側が d2h 由来と誤読しないよう d2h 行の直下に出す。
+            push_gdn_pf_rows(p, total, "    ", s);
             for k in 0..D2H_N {
                 let sns = D2H_SUB_NS[p][k].load(Ordering::Relaxed);
                 let sc = D2H_SUB_CALLS[p][k].load(Ordering::Relaxed);
@@ -704,6 +802,28 @@ fn phase_table(phase: Phase, s: &mut String) {
                 ));
             }
         }
+    }
+}
+
+/// s64: GDN スキャン 1 call の内訳 (`gdn_pf_alloc/launch/sync/d2h`) を
+/// `indent` 付きで 1 行ずつ積む。**表示専用** — total (= 集計対象の合計) に対する
+/// 比を出すが、値はどのバケットにも合算されない。
+fn push_gdn_pf_rows(p: usize, total: u64, indent: &str, s: &mut String) {
+    for k in 0..D2H_GDN_PF_N {
+        let sns = GDN_PF_NS[p][k].load(Ordering::Relaxed);
+        let sc = GDN_PF_CALLS[p][k].load(Ordering::Relaxed);
+        if sns == 0 && sc == 0 {
+            continue;
+        }
+        s.push_str(&format!(
+            "{indent}{:<12} {:>10.1} {:>8} {:>6.1}% {:>8} {:>6}\n",
+            D2H_GDN_PF_NAMES[k],
+            sns as f64 / 1e6,
+            sc,
+            sns as f64 / total.max(1) as f64 * 100.0,
+            "-",
+            ""
+        ));
     }
 }
 
@@ -783,9 +903,16 @@ pub fn summary() -> String {
                     "-",
                     ""
                 ));
+                if k == 3 {
+                    // s64: gdn_scan の直下にその内訳 (確保 / launch / sync / D2H) を出す
+                    push_gdn_pf_rows(p, total, "        ", &mut s);
+                }
             }
         }
         if i == D2H {
+            // s64: GDN スキャン内訳 (gdn_pf_*) は d2h_state の値に含まれない
+            // (表示専用) が、読む側が d2h 由来と誤読しないよう d2h 行の直下に出す。
+            push_gdn_pf_rows(p, total, "    ", &mut s);
             for k in 0..D2H_N {
                 let sns = D2H_SUB_NS[p][k].load(Ordering::Relaxed);
                 let sc = D2H_SUB_CALLS[p][k].load(Ordering::Relaxed);

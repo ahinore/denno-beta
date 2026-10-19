@@ -1420,6 +1420,48 @@ raw logits → ① repetition_penalty → ② frequency_penalty → ③ presence
 
 **Next**: the largest item is now **`d2h_state` at 10.6 s (168 calls — the GDN state is downloaded per layer during prefill)**. That is exactly T5b's main lever, L1 (`GdnDev` residency). After that: `gdn_proj` 5.4 s (the n=32 F32 projections) and `gate_up_proj` 7.2 s (75 ms of GPU work plus the copy).
 
+### Breaking down a single GDN scan call — `gdn_pf_alloc` / `launch` / `sync` / `d2h` (s64 / T5b L1, stage 1) ✅ (2026-10-19)
+
+> After s63 the largest remaining prefill item is `d2h_state` at 10,604 ms / 168 calls (28%). But a single
+> `gdn_scan` call mixes "buffer allocation (`cuMemAlloc`) + input H2D → kernel launch → `cuCtxSynchronize`
+> → D2H + host copy", so which part dominates could only be guessed. To avoid writing the next T5b stage on a
+> guess, this change adds the instrumentation only (no change to the numeric path or default behaviour).
+
+**Implementation**
+
+- The internals of `cuda.rs::gdn_scan_impl` (n < 2048, which also covers decode n == 1) and
+  `gdn_scan_chunked_impl` (n ≥ 2048, three passes) are split into four intervals. Each interval's elapsed
+  time is read at the entry of the next one, so the four sub-intervals sum to the enclosing `gdn_scan` value.
+- New `prof::Seq` (`begin` / `lap` / `end`). With PROFILE disabled it is a pass-through that does not even
+  call `Instant::now()`.
+- Samples go only into a dedicated `GDN_PF_NS/CALLS` table and the `gdn_pf_*` ids (10*D2H+9..12). Nothing is
+  added to the existing raw ids, the `d2h_state` / `attn_gdn` / `gdn_scan` buckets, or D2H sub-buckets 0..8,
+  so nothing is double counted.
+- Rendered nested under the `gdn_scan` row at 6-space indent; excluded from totals and share denominators.
+
+**Verification**
+
+- `cargo test --workspace`: 304 passed / 0 failed / 13 ignored.
+- One CPU request (v6_2b, int8, in=302) shows the GPU-only buckets (`attn_gdn` / `gdn_scan` / `d2h_state`) at
+  0 ms / 0 calls with no `gdn_pf_*` rows, confirming the instrumentation is a true no-op there. The CPU-side
+  PROFILE output (gate_up / down / qkv / attn_full) is identical to s63.
+- **Not done**: the actual 63 ms/call breakdown, because the development container has no GPU. Obtaining it on
+  the real GPU is the precondition for the next stage.
+
+**Facts established from the code (before any measurement)**
+
+1. `gdn_scan_batch` takes no device buffers for weights, so `wconv / wa / wdt / wnorm` are re-uploaded on every
+   call (26 layers × 2 requests = 48 calls).
+2. Hoisting the state `DevBuffer`s out of the layer loop does not help prefill: the loop visits each `li` once,
+   so the same (li, size) pair never comes twice. What can be reused is the n-sized fixed scratch (`dy`
+   zero-fill, chunked `dw/dm/dsinit`).
+3. `gdn_scan` always calls `ctx.sync()`, which breaks the GPU pipeline there and absorbs waits for the preceding
+   GEMMs.
+
+**Next**: measure the four `gdn_pf_*` rows on the GPU. A (alloc + H2D) dominant → cross-layer DevBuffer reuse
+plus a weight residency cache; D (D2H) dominant → batch the state write-back after the layer loop; S (sync)
+dominant → redefine the T5b main lever.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
