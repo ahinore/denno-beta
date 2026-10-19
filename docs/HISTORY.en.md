@@ -1580,6 +1580,16 @@ The pinned→heap `memcpy` reaches only **4.7 GB/s**, while a direct D2H into a 
 
 **Remaining split** (per request): `attn_core` 4.8 s (`gdn_scan` 2.6 / `gdn_proj` 1.1 / `attn_full` 1.2) / `gate_up` 1.8 s / `qkv` 1.6 s / `o_proj` 0.6 s / `rmsnorm` 0.4 s. Next targets: the **GDN scan** (sync 1.1 s + d2h 1.0 s + alloc 0.5 s) and **making qkv device-resident** with the same technique.
 
+### Restored the s69 direct downloads ✅ (2026-10-19, s71)
+
+> The s70 patch was generated from the `cuda.rs` as of **s68**, so it silently reverted s69 (`chain_download` / `chain_download_at` / `maybe_gpu_oproj` writing straight into the returned `Vec`). The commit after s69 therefore undid it, and the 11.58 s measured for s70 was a **no-s69** number.
+
+**Fix**: re-applied the three s69 edits on top of s70 (no more `pin_dn` / `ho` staging).
+
+**Result**: prefill **11.58 s → 11.34 s** (491 → **502 tok/s**). 231 tests pass, all three anchors match.
+
+**Prevention**: patch generators must read the file from the repository HEAD, never a working copy parked in scratch.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
