@@ -766,12 +766,26 @@ impl Qwen35 {
         {
             return false;
         }
+        // s88 (Step 1): prefill の attention 出力 D2H を、発行点 (site) 名つきで時間も積む。
+        // `chain_download` 自体は `D2H_SRC_OTHER` として 1 件積むので、ここでは
+        // **site だけ**を積む (件数を二重に入れないため `mark_d2h_src_ns` ではなく
+        // 専用の記録関数を使わず、site の sort で ATTN_PF を先頭に出す)。
+        let t_site = if crate::prof::d2h_src_on() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let mut ga = match crate::prof::time(crate::prof::D2H_ATTN_PF, || {
             let v = crate::cuda::chain_download(crate::cuda::CH_ATT, n * heads * dh);
-            if v.is_some() {
-                // s65: 発行元タグを d2h_state の細分より具体的に上書きする
-                // (表示専用・件数のみ)。
+            if let Some(t) = t_site {
+                // 発行元タグ (件数) と site の時間。`chain_download` が積む
+                // `D2H_SRC_OTHER` の件数はそのまま残るので、ここは ATTN_PF 側の
+                // 時間だけを足し、件数は既存の `mark_d2h_src` に任せる。
                 crate::prof::mark_d2h_src(crate::prof::D2H_SRC_ATTN_PF);
+                crate::prof::add_d2h_src_ns_only(
+                    crate::prof::D2H_SRC_ATTN_PF,
+                    t.elapsed().as_nanos() as u64,
+                );
             }
             v
         }) {
