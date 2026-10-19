@@ -1192,6 +1192,12 @@ impl Qwen35 {
         let mut buf_att: Vec<f32> = Vec::new();
 
         for (li, layer) in self.layers.iter().enumerate() {
+            // s84 (T8): 計測のみ — この層の attention ブロック (norm → 残差 → 投影 →
+            // attention → out → 残差) を親バケット RMSNORM へ包む。内側の線形/attn は
+            // 従来の子バケットにもそのまま積まれるので、norm 単体の値は
+            // RMSNORM − 子の和 として summary の norm/block 行から読める。
+            // 計測 OFF では no-op (数値経路・既定挙動は不変)。
+            let _amb = crate::prof::Ambient::enter(crate::prof::RMSNORM);
             // --- attention: rmsnorm を行単位で一括計算 (s42: 行独立 → 行並列。
             // 各要素の演算列は不変のため bit-exact・スレッド数非依存) ---
             crate::prof::time_n(crate::prof::RMSNORM, n, || {
@@ -1203,6 +1209,7 @@ impl Qwen35 {
                         h_row.copy_from_slice(&r);
                     });
             });
+            crate::prof::norm_rows(n);
             match &layer.attn {
                 AttnKind::Gdn(g) => {
                     // 投影はバッチ一括 (m=n → GPU tiled GEMM)。qkv+z は decode chain
@@ -1492,9 +1499,12 @@ impl Qwen35 {
                 }
             }
             lchk(&format!("L{li:02} attn"), &x[(n - 1) * e..]); // 恒久診断 (env ゲート・未指定時 no-op)
+            crate::prof::norm_rows_end(); // s84 (T8): attention ブロックの計測終端 (計測のみ)
             // --- FFN: SwiGLU をバッチ一括 ---
             // s57 (T4): prefill 内の全 op に 1 call あたりのバッチ幅 (n) を載せる
             // (decode 側は chain の 1 行 = 1）。集計のみで演算列は不変。
+            // s84 (T8): FFN ブロックも親バケット RMSNORM へ包む (計測のみ・OFF は no-op)。
+            let _amb_ffn = crate::prof::Ambient::enter(crate::prof::RMSNORM);
             // s42: rmsnorm は行独立 → 行並列 (bit-exact)
             crate::prof::time_n(crate::prof::RMSNORM, n, || {
                 buf_h2
@@ -1505,6 +1515,7 @@ impl Qwen35 {
                         h2_row.copy_from_slice(&r);
                     });
             });
+            crate::prof::norm_rows(n);
             // s70: FFN をデバイス常駐チェーンで通す (x → gate/up → swiglu →
             // down → ホスト)。活性化の往復が
             //   旧: H2D 47MB + D2H 140MB + H2D 47MB + D2H 47MB (m=2843 の 1 層)
@@ -1590,6 +1601,7 @@ impl Qwen35 {
                     }
                 });
             lchk(&format!("L{li:02} ffn"), &x[(n - 1) * e..]); // 恒久診断 (env ゲート・未指定時 no-op)
+            crate::prof::norm_rows_end(); // s84 (T8): FFN ブロックの計測終端 (計測のみ)
         }
 
         // 最終 norm + logits は最終トークンのみ (トークン逐次経路の最終値と同一)。
@@ -1917,9 +1929,12 @@ impl Qwen35 {
 
         for (li, layer) in self.layers.iter().enumerate() {
             crate::telemetry_layer_begin(li as u16);
+            // s84 (T8): 計測のみ — 層のブロック全体を RMSNORM へ包む (prefill と同じ規約)。
+            let _amb = crate::prof::Ambient::enter(crate::prof::RMSNORM);
             crate::prof::time_full(crate::prof::RMSNORM, 1, true, || {
                 chain_rmsnorm(layer.attn_ln1(), eps, pending, CH_H, e, 1, li * 3)
             })?;
+            crate::prof::norm_rows(1);
             match &layer.attn {
                 AttnKind::Gdn(g) => {
                     gdn_layers.push(li);
@@ -2007,6 +2022,7 @@ impl Qwen35 {
             crate::prof::time_full(crate::prof::RMSNORM, 1, true, || {
                 chain_rmsnorm(&layer.ln2_w, eps, pending, CH_H, e, 1, li * 3 + 1)
             })?;
+            crate::prof::norm_rows(1);
             crate::prof::time_full(crate::prof::GATE_UP, 1, true, || -> Option<()> {
                 // s80 (T7b-1): 連結重み 1 本 (行順 [gate | up]) を 1 回の grouped
                 // GEMV で計算する (旧: 2 uid のグループ)。行ごとに量子化・累積が
@@ -2022,6 +2038,7 @@ impl Qwen35 {
                 chain_linear_grouped(&[dw], CH_ACT, CH_DOWN, 1)
             })?;
             pending = Some(CH_DOWN);
+            crate::prof::norm_rows_end(); // s84 (T8): 層ブロックの計測終端 (計測のみ)
             crate::telemetry_layer_flush();
         }
 
@@ -2031,6 +2048,7 @@ impl Qwen35 {
         // 「lm_head」が sync 待ち込みで過大帰属になる。観測のみで数値経路不変)
         crate::prof::time_full(crate::prof::LM_HEAD, 1, true, || -> Option<()> {
             chain_rmsnorm(&self.norm_w, eps, pending, CH_H, e, 1, n_layers * 3)?;
+            crate::prof::norm_rows(1); // s84 (T8): 最終 norm の計測 (計測のみ)
             let lmq = self.lm_head.as_ref().unwrap().quant8()?;
             chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)
         })?;
