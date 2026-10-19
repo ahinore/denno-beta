@@ -197,7 +197,14 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   are refused; `--dry-run` and `--self-test` open no socket. Fixed prompts live in
   `scripts/fixtures/long_conversation_turns.json`; `--out` writes a transcript that
   `--replay` re-judges to the same verdict (the verdict is deterministic, the sampled
-  text is not). 54 CPU tests in `scripts/test_long_conversation_check.py`.
+  text is not). 67 CPU tests in `scripts/test_long_conversation_check.py`.
+- Cap regression (s107): the s97 checker (`longconv_check.py`) was retired in s107, but
+  its `--expect-cap` was ported first, because P4-1's whole point is to fail when the cap
+  is removed. Pass `--temperature 1.0 --expect-cap 0.7` to assert the serve clamps to the
+  cap; a request or a server-accepted temperature above the cap exits 2. Nothing is sent
+  when `--temperature` is omitted, so the default run cannot mask a regression.
+- The exact command to run the 10-turn check is in `scripts/README.md`
+  ("The long-conversation run (P4-1)"); `scripts/run_cpu_checks.sh` runs the CPU half.
 - Still open: the real 10-turn run against a serve started with `--temperature-cap 0.7`
   on a GPU host is a HUMAN STEP (the agent container has no GPU and must not drive
   servers). Until that transcript exists, the cap itself is unverified end to end.
@@ -215,9 +222,25 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   where the collapse starts.
 - Acceptance: either a fix or a documented root cause.
 
-### P4-4: long-context regression test
+### P4-4: long-context regression test — CHECKER DONE (s98/s100), GPU_VERIFY wiring is a human step
 - Why: the 4,671-token needle test was a one-off during the s73 investigation.
 - Action: make it a script with a fixed payload and expected answer; run it in GPU_VERIFY.
+- What exists now (s98/s100): `scripts/needle_check.py` builds a deterministic
+  filler + needle payload from `scripts/needle_fixture.json`, tries the OpenAI-compatible
+  `/v1/chat/completions` and falls back to `/v1/messages` on 404, and judges the reply by
+  the expected passphrase. Exit 0 recall ok / 1 recall failed (regression) / 2 transport or
+  parse failure, so an infrastructure problem is never mistaken for a recall failure.
+  `scripts/needle_selftest.py` proves those three codes against a fake server on CPU.
+  See `scripts/README.md` for the table of scripts and their exit codes.
+- Still open, and it is a HUMAN STEP: wiring the checker into `GPU_VERIFY`. `GPU_VERIFY`
+  is gitignored and is not edited by the agent, so the step is to add this line to it and
+  run it on a GPU host:
+
+      python3 scripts/needle_check.py --base-url http://127.0.0.1:8095 \
+          --json-out /tmp/needle_<build>.json || echo "NEEDLE RECALL REGRESSED"
+
+  A non-zero exit must fail the verify run: 1 is a real recall regression, 2 means the
+  check could not run (do not record 2 as a pass).
 - Acceptance: needle recall passes on every verified build.
 
 ## P5 — tooling and ops

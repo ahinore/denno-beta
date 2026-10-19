@@ -271,7 +271,7 @@ def judge(answer, expected, alternatives=(), forbidden=()):
 def _post_json(url, payload, timeout):
     """JSON を POST して (status, body_text) を返す。HTTP エラーも本文を返す。
 
-    longconv_check.py と同じ扱い: 4xx/5xx は例外にせず status で返し、
+    long_conversation_check.py と同じ扱い: 4xx/5xx は例外にせず status で返し、
     接続不能 (URLError/OSError) だけを例外として上げる。
     """
     data = json.dumps(payload).encode("utf-8")
