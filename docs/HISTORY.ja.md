@@ -1940,6 +1940,63 @@ T8 の step 2 (残差加算との融合・トークン方向のバッチ化) は
 GPU_VERIFY(`66698f6`) = PASS、アンカー 3 本 MATCH (`c61ad85b` / `9e17d563` / `af6eb6ab`)、
 decode gen2 3.2733 s / 200 tok = 16.37 ms/token (不変) = 計測器は数値 no-op。
 
+### プロファイル会計の加法化と `d2h_state` の発行点別計測 (2026-10-19, s87 / s88) ✅
+
+> s84 の `Ambient` は「親 1 本 + 子へも合算」だったため表が加算的でなく、`d2h_state` は
+> 1 本に複数の発行点が混ざって「どこが重いか」を読めなかった。計測器の 2 段の作り直し。
+> どちらも数値経路には触れない (既定 off はクロック読みゼロ)。
+
+**`e547749` 親会計の加法化 (s87)** (`prof.rs` +313/-219・`qwen35.rs` -18)
+
+- `AMBIENT` を単一スロットから**スタック** (`RefCell<Vec<usize>>`) へ。sample は自分を包む
+  全スコープへ 1 回ずつ入るため、入れ子でも `親 >= 子` が成り立つ。
+- **時間の書き込みを 1 本化**: `add_sample` の 3 つの出口 (生 id / `gdn_proj` 細分 /
+  `d2h_src` 細分) が `add_outer_ns` をちょうど 1 回呼ぶ。以前は `add_sample_ns` と末尾の
+  2 箇所から書き、それだけで全サンプルが 2 倍になっていた。
+- **calls / toks の二重計上を修正**: `owners` に自分のバケットが含まれるため、そのまま
+  ループすると件数が 2 倍になっていた (実際に踏んだ)。`slot` を除外する。
+- **collapsed** (自分のバケットが外側のスコープにも居る) な sample は子としても数える。
+  これが `self + 子 = 親` を作る。
+- **`self` 列 (7 列目)** を追加。`self = 親 − 子`。フェーズ総和と累積% は `self` の和で
+  計算し、prefill の total は実測区間の葉分解になる。先頭 6 列の意味は不変。
+- s84 の行単位 norm フック (`norm_rows` / `norm_rows_end`) と層ブロック全体の
+  `Ambient(RMSNORM)` 包みを撤去 (T8 で「バケットがブロックを指していた」ことは判明済み)。
+- テストハーネス: グローバルロック + `#[cfg(test)]` の強制フラグ (env を書かないので
+  並走テストを揺らさない) + 入口での `reset()`、フラグは `Drop` で戻す。テスト順に
+  依存しなくなった。2 本の会計テスト (加法性 / 入れ子の包含と非二重計上) は同じ規約を
+  両側から固定し、矛盾しない。
+
+テスト: 234 passed / 1 ignored。
+
+**`26c6b4a` `d2h_state` の発行点別計測 (s88)** (`prof.rs` +174・`cuda.rs` +49/-9・
+`qwen35.rs` +19/-1)
+
+- `D2H_SRC_NS[phase][site]` を追加。**表示専用** (どの生バケットにも合算しないので
+  二重計上が起きない)。`reset()` でクリア。
+- `mark_d2h_src_ns(site, ns)`: 件数 1 + 区間 1。`chain_download` / `chain_download_at` は
+  D2H 発行前から sync 後までを測る (内側の `mark_d2h_src` は削除し件数は 1 のまま)。
+- `add_d2h_src_ns_only(site, ns)`: 時間のみ。件数を既に積んでいる site 用
+  (GDN 状態の回復・prefill attention の出力コピー)。両方呼ぶと件数が 2 倍になる。
+- `d2h_src_on()`: 計測有効時のみ真。各発行点はこれを見てから `Instant::now()` を読むため、
+  既定経路はクロック読みゼロ。
+- prefill の表に発行点別の**上位 10 行** (`ms` 降順・`ms / calls / us per call`) を追加。
+
+テスト: denno-engine 235 passed / 1 ignored・denno-server 37 passed。
+
+**GPU 実測と限界**: `26c6b4a` で GPU_VERIFY = PASS・アンカー 3 本 MATCH
+(`c61ad85b` / `9e17d563` / `af6eb6ab`) = 計測器は数値 no-op。発行点別の**順位付けは
+この commit より前に存在しない**ため、修正前の値は `d2h_state` の**バケット合計だけ**
+(prefill: CPU 機 4,832.3 ms / 160 calls、GPU 機 6,165 ms / 1,140 calls)。最初の実順位は
+`26c6b4a` 以降のビルドでの計測から得る。検証実行で新バケットが動くことは確認済み
+(1 回の decode プロファイル: `d2h_src_other` 88.9 ms / 548 calls・
+`d2h_src_attn_pf` 9.3 ms / 8 calls・`d2h_src_gdn_state` 0.0 ms / 432 calls・
+`d2h_src_linear` 0.0 ms / 2,386 calls)。これは decode 1 回の観測であり prefill の順位ではない。
+
+**教訓**:
+- 時間を書く場所は 1 箇所に保つ。2 箇所あると気づかないまま全サンプルが 2 倍になる。
+- 表示専用の表は生バケットへ合算しない。そうすれば会計を変えずに内訳を足せる。
+- 件数と時間を別 API に分けるときは「件数を誰が積むか」を 1 箇所に決める。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
