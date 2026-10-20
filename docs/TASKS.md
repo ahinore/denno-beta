@@ -475,6 +475,41 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
     type plumbed into `Linear`, and would also skip the 100 GB fp32 expansion at load.
   - The CPU Q4 path is a correctness fallback, not a fast path.
 
+### P4-6: Q4 native path held whole-prompt scratch - DONE (main session, 2026-10-20)
+- Symptom: with 27B on `--quant q4`, a long prompt pushed VRAM from 18,369 MiB to
+  32,073 MiB; it never came back down, and the next request died with
+  `CUDA cuMemAlloc が失敗: error 2` and fell back to CPU (seconds/token).
+  10,821 tokens cost 299 s; a 2,000-token prompt cost 42-106 s.
+- Cause: `q4_dispatch` H2D'd the whole activation tile and ran one GEMV/GEMM with
+  `m = prompt length`. Its buffers live in `SCRATCH`, a thread_local, grow-only set
+  sized `(m*k + m*n)*4 B`. With k=n=17,408 and m=10,821 that is ~1.5 GB per thread
+  set, kept forever. This is a memory shape bug, not a weight leak: the Q4 upload
+  lines are 401 in total and do not repeat per request (counted).
+- Fix: `q4_dispatch` walks `m` in fixed tiles of `Q4_M_TILE = 256` rows and calls a
+  new `q4_dispatch_tile`, so the scratch is bounded by the tile instead of the
+  prompt. Rows are independent and a row's accumulation order is unchanged, so the
+  result is bit-identical to the untiled path; the GPU test
+  `cuda_q4_linear_matches_cpu` covers m = 1/7/16/300 (300 crosses the boundary).
+- Measured (27B q4, 10,820-token prompt, `vram_probe.py`): before 32,073 MiB and
+  the next request failed with cuMemAlloc error 2; after 28,389 MiB in 306 s and
+  the request completes. A 3,020-token prompt: 21,135 MiB in 93 s.
+- Diagnostics kept (env-gated, no effect by default): `DENNO_MEM_DBG=1` logs every
+  `DevBuffer` alloc/free with the free/total MiB and the caller location
+  (`#[track_caller]`), and an alloc failure now reports the requested size and the
+  free MiB. This is how the shape bug was pinned; keep it for the next one.
+- Still open (P4-7): ~0.9 MB/token remains resident after a request, because
+  several n-sized buffers are grow-only thread_locals (`Scratch`, `GdnScratch`,
+  `ChainScratch::qkv_*`). At 11k tokens that leaves only ~3.7 GB free on a 32 GB
+  card. Until that is chunked, `DENNO_MAX_PROMPT_TOKENS` (default 12,288) rejects
+  longer prompts with a 400 instead of OOM-ing into the CPU fallback.
+
+### P4-7: bound the n-sized prefill scratch by chunking - OPEN
+- Target: after a 16k-token prompt, VRAM should be within ~1 GB of the 3k case.
+- Method: the same tiling that fixed the Q4 GEMM has to be applied to the GDN scan
+  and the qkv/rope chain buffers; they are grow-only thread_locals keyed on `n`.
+- Note: these buffers are why 9B long contexts never worked either - it is not a
+  27B-specific problem, only 27B hits the wall first.
+
 ## P5 — tooling and ops
 
 ### P5-1: dashboard shows cold A/B and decode — DASHBOARD DONE (s109), era wired in (s110), GPU run is a human step
