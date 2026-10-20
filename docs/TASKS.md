@@ -547,6 +547,29 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   (round-trip counts, the old "PF wall" basis).
 - Done in 2212c4a (s101): `README.md` + `docs/api.md` synced with the current implementation.
 
+### P5-3: production server on 8095 is 27B (q4) - DONE (main session, 2026-10-20)
+- Why: the Q4_0 native weight path (P4-5) put 27B at 18.4 GB and 180 ms/token, so the
+  production endpoint no longer has to stay on the 9B int8 build for speed.
+- Launch: `bash scripts/prod_serve_27b.sh` (repo-relative, no host paths inside). It stops
+  any running `serve local/qwen35*`, then runs
+  `target/bin_canonical serve local/qwen35-27b --port 8095 --host 0.0.0.0 --seed 42
+  --quant q4 --repetition-penalty 1.05 --temperature-cap 0.7`.
+- Tuning: `DENNO_BATCH_SLOTS=4` and `DENNO_PREFIX_CACHE_MAX_TOKENS=32768`. The default 24
+  slots x 4,096 tokens cost 12.9 GB of KV, which exceeds the 12,288 MB budget and forces
+  the prefix cache down to its 2,048-token floor; with 4 slots the prefix cache holds
+  32,768 tokens (4,295 MB) instead. Measured after one request: 18,367 MiB of 32,607 MiB.
+- 9B and 27B cannot coexist (18.0 + 18.4 > 32.6 GB), so 8095 serves exactly one of them.
+- GPU_VERIFY: it still kills the server, builds, and measures the three anchors on the
+  9B int8 build (unchanged protocol), but its three tail restarts now call a `prod_up`
+  helper that runs `scripts/prod_serve_27b.sh` when it exists and only falls back to
+  `bin_canonical` + 9B args otherwise, so a verify run no longer leaves production on 9B.
+  `GPU_VERIFY.sh` itself stays untracked.
+- Client side: the Hermes desktop provider entry named for 9B was renamed to `denno-27b`
+  (`api http://<gpu-host>:8095/v1`, `transport anthropic_messages`,
+  `default_model local/qwen35-27b`, `context_length 32768`). 32,768 is a deliberate
+  client-side cap: single-request KV at 131 KB/token fits ~98k tokens in the 12 GB budget,
+  but a 32k prefill already costs ~16 minutes at 34 tok/s.
+
 ## Suggested order
 
 1. ~~P1-2 attention (942 ms bucket), candidate 4 = causal key-range truncation~~ → **rejected in
