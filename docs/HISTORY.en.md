@@ -2344,6 +2344,57 @@ collect `python3 scripts/cold_ab.py --old <old> --new <new> --json <dir>/s110_<b
 and `PF_BENCH.sh > /tmp/pf_bench_<build>.log`, then build the page with
 `--protocol-change <era>`. **The real cold A/B numbers are unmeasured too.**
 
+### s119: a speculative-decoding design proposal - plan A (in-place verification) cannot be bit-exact, plan B (n-gram speculation) waits on a measured p (no code)
+
+> Session 119. The P2-1 inventory (s115) closed with "the only sync in decode is the logits D2H,
+> and removing it needs a multi-token forward plus `.cu` work", so this task designs that
+> multi-token forward. **The deliverable is one design document plus this section; `crates/` is
+> unchanged to the byte** (`.cu` / `.ptx` untouched, no server started). Every number is labelled
+> measured / computed (formula + inputs) / estimated (basis).
+
+- Document: `docs/SPEC_DECODE_DESIGN.md` (new). Step 1 = the one-step breakdown (host and GPU
+  stages, the decomposition of 16.4 ms, file:line of every `n == 1` assumption), Step 2 = plans A
+  / A-lite / B with their correctness contract, implementation cost, break-even p and conflicts
+  with existing structure, Step 3 = the comparison table and five operator questions
+- **Step 1 re-check**: of the 16.4 ms, transfers are <= 0.33 ms, there is exactly one sync and
+  GPU compute is ~16.0 ms (98 %) (`docs/DECODE_PATH.md` §3 arithmetic). The only serial
+  dependency is "the sampled token is the next step's input", which is the structure of
+  `engine.rs:871` / `904` itself. Every piece of one step's context is `n == 1`-only: one KV
+  mirror row, one GDN ping-pong step, a one-row rope table, `advance(1)`
+  (`cuda.rs:5005` / `5194` / `qwen35.rs:2033-2034`)
+- **Rollback exists as a mechanism**: `KvCache::truncate` + `bump_epoch()` discards the GPU GDN
+  state (`kv_cache.rs:215` / `256` → `gdn_scan_state_invalidate()`) and `with_mirror` re-seeds
+  when `have > pos0` (`cuda.rs:3303`). Its cost is **computed at 15 ms** (KV 210 MB + GDN 5.8 MB
+  at 14.2 GB/s) and it is paid on every reject
+- **Plan A (in-place verification) cannot be bit-exact**: emitting `k+1` positions in one forward
+  makes row 0's rmsnorm / attention depend on the other tokens sharing the same buffers, so **the
+  thing being compared (row 0's logits) itself shifts away from the sequential result** and there
+  is nothing left to check against. It is the same class of difference s118 rejected
+  (the reach of the online-softmax `acc`), i.e. path-dependent rather than any R1 relaxation.
+  It needs three `.cu` kernels, PTX regeneration and an anchor re-baseline. Even with a
+  optimistic `λ = 1.00` the break-even is `p > 0.48` (including the 15 ms reject)
+- **Plan A-lite (drive the existing `n >= 2` path with 2 tokens) keeps bit-exactness**, but that
+  path is per-op with syncs, so one step is **computed at 18.3 ms** (`λ = 1.115`) and the
+  break-even is **p* = 0.885**. **Rejected for speed.** One measurement is left as a question
+  because it would falsify the (contradictory) prediction that the `n >= 2` path runs at
+  2.6 ms per token
+- **Plan B (n-gram / in-prompt lookup) leaves the one-step structure alone**: draft = an ordinary
+  step, verify = an ordinary step, reject = an ordinary step. **Bit-exact and deterministic under
+  the existing contracts**, no `.cu`, no anchor change, break-even **p* = 0.0006** (the draft is
+  only a host-side search). Whether it pays depends solely on p, the rate at which the preceding
+  12-gram recurs with the same continuation - **and measuring that needs no GPU** (an oracle over
+  the anchor token sequences). p = 0.5 / 0.7 / 0.9 gives 10.9 / 9.7 / 8.6 ms/token
+  (**an assumption table, not a measurement**)
+- **Conclusion**: nothing goes into implementation yet. First run ① the 12-gram oracle (p_1) and
+  ② a one-step measurement of `forward_prefill` at `n == 2`. If p_1 < 0.3, speculation is
+  rejected and the decode axis is left with brute-forcing the attention / GDN kernels
+
+**Human steps (what is not measured)**: `λ` (the step-time ratio of a k-row forward), the
+acceptance rate p, the true reject cost R and the `n == 2` step time are all unmeasured and
+cannot be measured in this container. The document labels each number measured / computed /
+estimated and marks the p table as an assumption. The oracle and the one-step measurement are
+GPU-host work (the supervisor can run them).
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
