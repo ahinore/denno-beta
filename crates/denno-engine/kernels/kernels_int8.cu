@@ -363,6 +363,85 @@ extern "C" __global__ void dno_gemv_q4_0(
     }
 }
 
+// s132 (Task B1): 複数行を 1 block で受ける GEMV。`dno_gemv_q4_0` の grid は
+// (n/8, m) なので、m 行のとき同じ 100 MB の重みを m 回読み直していた (実測
+// m=2 が m=1 のちょうど 2 倍・m=8 がちょうど 8 倍で、いずれも 240 GB/s)。
+// ここでは 1 block が n 方向 8 列 (warp 1 本 = 1 列) **と m 方向 mr 行**を受け、
+// 重みブロックの読み (ws[b] / wn[b]) を 1 回で済ませて mr 行に使い回す。
+// 起動側は grid = (n/8, ceil(m/mr))・mr = min(m, 8)。
+//
+// 数値: 1 block 内の重み読みが 1 回になるだけで、行 i の累積列は
+//   レーンが受持つブロックを昇順に 1 本の鎖で足す → warp 内 shfl 縮約
+// の両方が `dno_gemv_q4_0` と同一なので、出力は行ごとにビット一致する
+// (mr = 1 で比較すると全要素が同じビットになる。CPU 参照の
+// `matvec_rows_bt_q4_into` とも同じ R2 以内のまま)。
+// 積と加算は `__fmul_rn` / `__fadd_rn` を明示し、コンパイル時の FMA 縮約の
+// 有無で足し方が変わらないようにする (`dno_gemv_q4_0` は素の `acc += a * w`)。
+extern "C" __global__ void dno_gemv_q4_0mr(
+    const float* __restrict__ a,    // [m, k]
+    const uint4* __restrict__ nib,  // [n, nb]
+    const float* __restrict__ sc,   // [n, nb]
+    float* __restrict__ out,        // [m, n]
+    int m, int k, int n, int mr)
+{
+    const int nb = k >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;   // 0..7 (blockDim.x = 256)
+    const int gj = blockIdx.x * 8 + warp;
+    const int i0 = blockIdx.y * mr;      // この block の先頭行
+    if (gj >= n || i0 >= m || nb <= 0) return;
+    // mr は起動側の min(m, 8) 由来で 8 以下だが、引数なので明示的に落とす。
+    const int rows = min(mr, m - i0);
+    if (rows <= 0) return;
+
+    const uint4* wn = nib + (size_t)gj * (size_t)nb;
+    const float* ws = sc + (size_t)gj * (size_t)nb;
+
+    // 行ごとの独立アキュムレータ (行 r は out の行 i0 + r)。
+    float acc[8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++) acc[r] = 0.0f;
+
+    for (int b = lane; b < nb; b += 32) {
+        // 重みは 1 回だけ読む (s132 の要点)。
+        const float d = ws[b];
+        const uint4 v = wn[b];
+        const unsigned int words[4] = {v.x, v.y, v.z, v.w};
+        const int base = b << 5;
+        // 実行する行数でループ境界を切る (tail block で余分な A 読みをしない)。
+        // 行ごとの積算は `dno_gemv_q4_0` の `acc` と同じ「レーンが受け持つブロック
+        // を順に足していく 1 本の鎖」にする。ブロックごとの部分和を別に作って
+        // 後から足す形にすると最終和が変わらずとも中間の丸めが変わり、レーンが
+        // 2 ブロック以上を持つ形状 (k >= 2048) でビット一致しなくなるので不可。
+        for (int r = 0; r < rows; r++) {
+            const float* ai = a + (size_t)(i0 + r) * (size_t)k;
+            float s = acc[r];
+            #pragma unroll
+            for (int wi = 0; wi < 4; wi++) {
+                const unsigned int w32 = words[wi];
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int qlo = (int)((w32 >> (8 * e)) & 0xFu) - 8;
+                    const int qhi = (int)((w32 >> (8 * e + 4)) & 0xFu) - 8;
+                    s = __fadd_rn(s, __fmul_rn(ai[base + wi * 4 + e], __fmul_rn(d, (float)qlo)));
+                    s = __fadd_rn(s, __fmul_rn(ai[base + 16 + wi * 4 + e], __fmul_rn(d, (float)qhi)));
+                }
+            }
+            acc[r] = s;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < 8; r++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc[r] = __fadd_rn(acc[r], __shfl_down_sync(0xffffffffu, acc[r], off));
+        }
+        if (lane == 0 && r < rows) {
+            out[(size_t)(i0 + r) * (size_t)n + gj] = acc[r];
+        }
+    }
+}
+
 // prefill / バッチ用のタイル GEMM。block = (16,16) = 256 thread、
 // 1 ブロック = m 方向 64 行 x n 方向 128 列。1 thread は 4 行 x 8 列 (32 個の acc) を
 // 担当する。共有メモリは A タイル (64x32 f32) と B タイル (128x33 f32・展開済み) で
