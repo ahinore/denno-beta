@@ -2860,6 +2860,22 @@ the cause is the n-sized buffers themselves, not the thread count.
   denno-server 37 passed, `cargo check --features cuda` 0 errors. With `DENNO_PROFILE`
   unset the code stays a no-op.
 
+### s156: Task B17 - `denno info` reads dims from text_config (2026-10-21) done
+
+> Qwen3.5's config.json is a multimodal wrapper: the language-model dims live only in the
+> nested `text_config`. Looking at the top level alone reported layers/hidden/vocab/context
+> as 0 and family as the wrapper's `qwen3_5`.
+
+- **Lookup order**: `text_config` / `llm_config` / `language_config` / top level. `family`
+  uses the same order for `model_type`, so it prints `qwen3_5_text`. The flat aliases
+  (`n_layer` / `n_embd` / `n_ctx`) still work.
+- **Directory argument**: if the repo argument is an existing directory, its `config.json`
+  is read directly without going through the hub cache (`denno info data/qwen35-9b`).
+  Otherwise the hub-cache path and the `not cached: ...` message are unchanged.
+- **Verified**: `local/qwen35-27b` = 64 / 5120 / 248320 / 262144,
+  `local/qwen35-9b` = 32 / 4096 / 248320 / 262144 (family `qwen3_5_text` for both).
+  denno-cli 5 passed, denno-engine lib 262 passed / 1 ignored, no regression.
+
 ### Benchmark summary (as of 2026-10-20, this host)
 
 Measurement rule: the official prefill value is cold single-shot (server start -> one request,

@@ -2850,6 +2850,22 @@ s122 のハンドオフはそれを「s118 で設計済み」と読んで再実�
   `step residual: other + siblings`。lib は denno-engine 262 passed / denno-server 37 passed、
   `cargo check --features cuda` 0 error。`DENNO_PROFILE` 未設定は従来どおり no-op。
 
+### s156: Task B17 - `denno info` が text_config から次元を読む (2026-10-21) 完了
+
+> Qwen3.5 の config.json はマルチモーダル wrapper で、言語モデルの次元は入れ子の
+> `text_config` にしか無い。トップレベル参照だけだったため layers/hidden/vocab/context が
+> すべて 0、family は wrapper の `qwen3_5` と表示されていた。
+
+- **探索順**: `text_config` / `llm_config` / `language_config` / トップレベル。
+  `family` も同じ順で `model_type` を引き、`qwen3_5_text` を出す。平の別名 (`n_layer` /
+  `n_embd` / `n_ctx`) は従来どおり。
+- **ディレクトリ引数**: repo 引数が実在のディレクトリなら hub cache を経由せず
+  その `config.json` を直接読む (`denno info data/qwen35-9b`)。それ以外は従来の
+  hub cache 経路と `not cached: ...` の文言をそのまま維持。
+- **検証**: `local/qwen35-27b` = 64 / 5120 / 248320 / 262144、
+  `local/qwen35-9b` = 32 / 4096 / 248320 / 262144 (いずれも family `qwen3_5_text`)。
+  denno-cli 5 passed、denno-engine lib 262 passed / 1 ignored で回帰なし。
+
 ### ベンチマーク一覧 (2026-10-20 時点・このホスト)
 
 測定規則: prefill の正式値は cold 単発 (サーバ起動 -> 1 リクエスト、prefix cache off、
