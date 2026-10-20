@@ -34,3 +34,14 @@ cuda = []
 [dev-dependencies]
 # 統合テスト (tests/) から test-utils (ダミーモデル) を使うための自己参照。
 denno-engine = { path = ".", features = ["test-utils"] }
+
+# scripts/bench_all.sh 用のベンチ例は `denno_engine::cuda` を直接呼ぶので、
+# cuda feature 無しの `cargo test -p denno-engine` でビルドしようとすると
+# 未定義参照で落ちる。required-features で除外し、既定の test を緑に保つ。
+[[example]]
+name = "bench_q4_line"
+required-features = ["cuda"]
+
+[[example]]
+name = "bench_gdn"
+required-features = ["cuda"]
