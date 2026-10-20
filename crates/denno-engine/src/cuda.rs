@@ -420,7 +420,13 @@ pub struct CudaCtx {
     /// コミット済みの `kernels_int8.ptx` に含まれる場合のみ取得でき、無ければ
     /// None で従来の `dno_gemv_q4_0` (1 行 1 block) を使う。古い PTX でも起動を
     /// 壊さないための Option (s89 の `f_gdn_chunk_scan_hoist` と同じ扱い)。
+    /// s133 以降は列ブロック版 (`dno_gemv_q4_0c4` など) があると GEMV 経路は
+    /// そちらへ行くので、本番経路からは呼ばれない (ビット一致の参照とテスト用)。
     f_mv_q4_mr: Option<CUfunction>,
+    /// s133 (Task B1, attempt 2): A の 1 回読みを C 列で使い回す Q4 GEMV。
+    /// C = 2 / 4 / 8 の 3 エントリを PTX に入れてあり、[`Q4_GEMV_C`] で選ぶ。
+    /// 同じ理由で Option (未再生成の PTX でも従来経路で起動できる)。
+    f_mv_q4_c: Option<[CUfunction; 3]>,
     // P17d: 要素演算モジュール (swiglu / add+rmsnorm / expf probe)
     #[allow(dead_code)]
     module_elem: CUmodule,
@@ -547,6 +553,25 @@ impl CudaCtx {
             } else {
                 None
             };
+            // s133 (Task B1, attempt 2): 列ブロック版 GEMV (C = 2 / 4 / 8)。
+            // 3 本そろって初めて Some。1 本でも取れなければ None で従来経路。
+            let mut fc: [CUfunction; 3] = [std::ptr::null_mut(); 3];
+            let mut c_ok = true;
+            for (k, name) in [b"dno_gemv_q4_0c2\0", b"dno_gemv_q4_0c4\0", b"dno_gemv_q4_0c8\0"]
+                .iter()
+                .enumerate()
+            {
+                let r = (lib.module_get_function)(
+                    &mut fc[k],
+                    module,
+                    name.as_ptr() as *const c_char,
+                );
+                if r != CUDA_SUCCESS {
+                    c_ok = false;
+                    break;
+                }
+            }
+            let f_mv_q4_c = if c_ok { Some(fc) } else { None };
 
             // P17d: 要素演算モジュール (-fmad=false でコンパイル済み。FMA 縮約は
             // CPU とビット一致しないため禁止)
@@ -678,6 +703,7 @@ impl CudaCtx {
                 f_mv_q4,
                 f_gemm_q4,
                 f_mv_q4_mr,
+                f_mv_q4_c,
                 module_elem,
                 f_swiglu,
                 f_swiglu_int,
@@ -2320,7 +2346,35 @@ fn q4_dispatch(
 
 /// s132 (Task B1): [`q4_dispatch_tile`] の GEMV が 1 block で受ける最大行数。
 /// `kernels_int8.cu` の `dno_gemv_q4_0mr` (acc[8]) と対で動く。
+/// s133 以降、本番の GEMV 経路は `dno_gemv_q4_0c*` (下の [`Q4_GEMV_C`]) で、
+/// `dno_gemv_q4_0mr` はビット一致の参照 (テスト) として残してある。
 const Q4_MR_MAX: usize = 8;
+
+/// s133 (Task B1, attempt 2): 列ブロック版 Q4 GEMV の C (1 回の A 読みで
+/// 何列の重みを回すか)。`kernels_int8.cu` の `dno_gemv_q4_0c2/c4/c8` と対。
+/// 1 MAC あたりの命令数は 1 + 1/C になる (C=1 の従来形は 2)。
+/// 2 / 8 を試すときはここを変える (PTX には 3 本とも入っている)。
+/// ビルドし直さずに比べるときは `DENNO_Q4_GEMV_C=2|4|8` で上書きする。
+const Q4_GEMV_C: usize = 4;
+
+/// [`Q4_GEMV_C`] の実効値 (env `DENNO_Q4_GEMV_C` があればそちら)。2/4/8 以外は
+/// 既定へ落とす (不正な値で panic させない)。
+fn q4_gemv_c() -> usize {
+    match std::env::var("DENNO_Q4_GEMV_C").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(c @ (2 | 4 | 8)) => c,
+        _ => Q4_GEMV_C,
+    }
+}
+
+/// [`Q4_GEMV_C`] に対応する PTX エントリの index (0 = c2, 1 = c4, 2 = c8)。
+fn q4_gemv_c_index(c: usize) -> usize {
+    match c {
+        2 => 0,
+        4 => 1,
+        8 => 2,
+        _ => panic!("Q4_GEMV_C must be 2, 4 or 8"),
+    }
+}
 
 /// s124: [`q4_dispatch`] の 1 タイル (m <= 256) を実行する。scratch はここで
 /// m <= 256 に固定されるため、プロンプトが何万 token でも増えない。
@@ -2387,10 +2441,22 @@ fn q4_dispatch_tile(
                 // Q4_GM=64 (m 方向) / Q4_GN=128 (n 方向)・block (16,16)
                 let grid = (m.div_ceil(64) as u32, n.div_ceil(128) as u32, 1);
                 ctx.launch_async(ctx.f_gemm_q4, grid, (16, 16, 1), 0, &mut args)?;
+            } else if let Some(fc) = ctx.f_mv_q4_c {
+                // s133 (Task B1, attempt 2): 1 block = 8 warp x C 列 = 8*C 列、
+                // 1 行。1 warp が A の 32 値 (ブロック b) をレジスタに 1 回だけ
+                // 読み、C 列ぶんの重みに使い回す。行ごとの累積順は 1 行 1 block
+                // 経路と同一なので m = 1 もビット一致。
+                // grid.x は 8*C 列を 1 ブロックで受ける形。
+                let c = q4_gemv_c();
+                let f_c = fc[q4_gemv_c_index(c)];
+                let cols = 8 * c;
+                let grid = (n.div_ceil(cols) as u32, m as u32, 1);
+                ctx.launch_async(f_c, grid, (256, 1, 1), 0, &mut args)?;
             } else if let (Some(f_mr), 2..) = (ctx.f_mv_q4_mr, m) {
                 // s132 (Task B1): 1 block = 8 列 (8 warp) x mr 行。重みは 1 回だけ
                 // 読んで mr 行に使い回す (従来は grid.y = m で行ごとに再読み)。
                 // mr = min(m, 8)・端数は最終 block の rows = m - i0 で落とす。
+                // 列ブロック版が PTX に無いときだけここを通る (フォールバック)。
                 let grid = (n.div_ceil(8) as u32, m.div_ceil(mrc as usize) as u32, 1);
                 ctx.launch_async(f_mr, grid, (256, 1, 1), 0, &mut args_mr)?;
             } else {
@@ -6410,6 +6476,121 @@ mod tests {
                 );
             }
             println!("q4 gemv mr bit-exact: m={m} (rows 1/2/3/8)");
+        }
+    }
+
+    /// s133 (Task B1, attempt 2): 列ブロック版 GEMV (`dno_gemv_q4_0c2/c4/c8`) が
+    /// 1 行 1 block 経路 (`dno_gemv_q4_0mr` の rows = 1) と全要素ビット一致する
+    /// ことを検証する。C は 2 / 4 / 8 の 3 通り、n は 8*C の倍数でない値
+    /// (grid.x の端数と `gj >= n` の break を踏む)、m は 1 / 2 / 7 / 17 を踏む。
+    /// 併せて決定論 (同一入力 2 回でビット一致) も見る。
+    #[test]
+    #[ignore] // GPU が必要: cargo test --release --features cuda -- --ignored
+    fn cuda_q4_gemv_cols_matches_single_row() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let ctx = match shared_ctx() {
+            Some(c) => c,
+            None => {
+                println!("CUDA が無いので skip (GPU 実機で --ignored 実行)");
+                return;
+            }
+        };
+        if ctx.f_mv_q4_mr.is_none() {
+            println!("kernels_int8.ptx に dno_gemv_q4_0mr が無い (PTX 再生成前) ので skip");
+            return;
+        }
+        let fc = match ctx.f_mv_q4_c {
+            Some(f) => f,
+            None => {
+                println!("kernels_int8.ptx に dno_gemv_q4_0c* が無い (PTX 再生成前) ので skip");
+                return;
+            }
+        };
+        ctx.make_current().expect("make_current");
+        // n = 103: 8*2=16 / 8*4=32 / 8*8=64 のどれでも割り切れない。
+        let (k, n) = (256usize, 103usize);
+        let w = pseudo_random(k * n, 21);
+        let q = crate::quant::Q4Linear::quantize(&w, k, n);
+        let gw = weights_for_q4(q.uid, &q.blocks, k, n).expect("upload");
+        for m in [1usize, 2, 7, 17] {
+            let a = pseudo_random(m * k, 300 + m as u32);
+            // 参照: 従来経路 (1 行 1 block) と同じ rows = 1。
+            let mut want = vec![f32::NAN; m * n];
+            run_q4_gemv_for_test(ctx, &a, gw, m, k, n, 1, &mut want);
+            for (ci, &c) in [2usize, 4, 8].iter().enumerate() {
+                assert_eq!(ci, q4_gemv_c_index(c), "index の対応がずれている");
+                let mut got = vec![f32::NAN; m * n];
+                run_q4_gemv_cols_for_test(ctx, fc[ci], c, &a, gw, m, k, n, &mut got);
+                for (i, (g, e)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        e.to_bits(),
+                        "m={m} C={c}: row {} col {} がビット不一致 ({g} vs {e})",
+                        i / n,
+                        i % n
+                    );
+                }
+                let mut again = vec![f32::NAN; m * n];
+                run_q4_gemv_cols_for_test(ctx, fc[ci], c, &a, gw, m, k, n, &mut again);
+                assert_eq!(
+                    got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    again.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "m={m} C={c}: 非決定論"
+                );
+                println!("q4 gemv cols bit-exact: m={m} C={c} (n={n})");
+            }
+        }
+        assert_eq!(q4_gemv_c_index(Q4_GEMV_C), q4_gemv_c_index(4));
+        // 本番の選択が 2 / 4 / 8 のどれでも、上のビット一致集合の中にあること。
+        let prod = q4_gemv_c();
+        assert!(
+            [2usize, 4, 8].contains(&prod),
+            "q4_gemv_c() が 2/4/8 以外を返した: {prod}"
+        );
+    }
+
+    /// s133: 列ブロック版 GEMV を c (2/4/8) を明示して 1 回起動する。
+    fn run_q4_gemv_cols_for_test(
+        ctx: &CudaCtx,
+        f: CUfunction,
+        c: usize,
+        a: &[f32],
+        gw: &GpuWq4,
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) {
+        let lib = lib().expect("cuda lib");
+        let (mut pn, mut ps) = (gw.nib.ptr(), gw.sc.ptr());
+        let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, n as c_int);
+        let d_a = DevBuffer::alloc(m * k * 4).expect("alloc a");
+        let d_out = DevBuffer::alloc(m * n * 4).expect("alloc out");
+        let (mut pa, mut po) = (d_a.ptr(), d_out.ptr());
+        unsafe {
+            check(
+                (lib.memcpy_htod)(d_a.ptr(), a.as_ptr() as *const c_void, m * k * 4),
+                "cuMemcpyHtoD",
+            )
+            .expect("H2D");
+            let mut args = [
+                &mut pa as *mut _ as *mut c_void,
+                &mut pn as *mut _ as *mut c_void,
+                &mut ps as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            let grid = (n.div_ceil(8 * c) as u32, m as u32, 1);
+            ctx.launch_async(f, grid, (256, 1, 1), 0, &mut args)
+                .expect("launch");
+            check(
+                (lib.memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, d_out.ptr(), m * n * 4),
+                "cuMemcpyDtoH",
+            )
+            .expect("D2H");
         }
     }
 
