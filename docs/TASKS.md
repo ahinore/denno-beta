@@ -383,6 +383,19 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 - Action: compare against llama.cpp on the same GGUF at the same seed, per-layer, to find
   where the collapse starts.
 - Acceptance: either a fix or a documented root cause.
+- Result (main session, 2026-10-20, GPU): **GPU E2E re-verified — the CPU fix holds on the
+  GPU path too.** No download was needed: the uniform Q4_0 GGUF was already inside the
+  container at `data/.cache/denno/hub/models--local--qwen35-27b/Qwen3.8-27B-Q4_0.gguf`
+  (15 GB, plus tokenizer and config), so `serve local/qwen35-27b --quant int8` resolves
+  directly. Load took 90 s, VRAM 31,977 / 32,607 MiB (co-resident nothing else).
+  Answers: "The capital of France is **Paris**." twice (the two replies are text-identical;
+  the JSON files differ only because they carry per-request timings), and
+  "日本の首都は**東京**です。" followed by a correct explanation that Japan has no explicit
+  statutory capital. That reply stopped at `max_tokens=128` after 85.6 s = 669 ms/token, so
+  27B decode is ~40x the 9B int8 rate and should not be used for chat without a budget.
+- Remaining, and it needs a decision: the 27B GPU anchors were never formally rebased after
+  the GQA fix (`1a4ea71a…` / `b4e58cb3…` predate it), and our standing 3-anchor set is 9B
+  only. Either add a 27B anchor pair or record that 27B is verified by answer only.
 
 ### P4-4: long-context regression test — CHECKER DONE (s98/s100), GPU_VERIFY wiring is a human step
 - Why: the 4,671-token needle test was a one-off during the s73 investigation.
