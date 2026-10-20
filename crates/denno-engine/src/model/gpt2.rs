@@ -89,7 +89,7 @@ impl Gpt2 {
         // fp32 のまま残す)。
         let lm_head = match quant {
             QuantMode::Fp32 => None,
-            QuantMode::Int8 => {
+            QuantMode::Int8 | QuantMode::Q4_0 => {
                 let l = Linear::new(g("wte.weight")?, e, vocab, quant);
                 quant_bytes += l.weight_bytes();
                 Some(l)

@@ -298,3 +298,150 @@ extern "C" __global__ void dno_gemm_i8(
         }
     }
 }
+// ---------------------------------------------------------------------------
+// s123: Q4_0 ネイティブ経路。
+//
+// 目的: GGUF の Q4_0 ブロック (f16 scale 2B + 16B ニブル = 32 要素/18B) を
+// **再量子化せずに** VRAM へ置く。int8 モードは fp32 へ展開してから 8 bit に
+// 詰め直すため、元が 4.5 bit でも常に 1 要素 1 バイト (27B で 25.7 GB) を
+// 積んでいた。ネイティブ経路は 13.7 GB で済む。
+//
+// レイアウト (アップロード時にホストで変換する SOA):
+//   nib[行 j][ブロック b] = uint4 (16B・16B アライン) … 32 要素ぶんのニブル
+//   sc [行 j][ブロック b] = float (元の f16 スケールを f32 へ)
+// ブロック b の要素 c (0..15) は下位ニブル、c+16 は上位ニブル (ggml Q4_0)。
+// デ量子化は y = d * (q - 8) (d は負になり得る)。
+//
+// 数値契約: 累積は f32 の逐次 (上のカーネルは -fmad=false でビルドする)。
+// CPU 経路と同じ順序で足すので決定論的。CPU との差は R2 (相対 1e-4) 以内。
+// ---------------------------------------------------------------------------
+
+// decode / 小さい m 用の GEMV。1 warp = 1 出力行、1 block = 8 行。
+// lane はブロックを 32 個飛ばしで担当し、最後に warp 内で縮約する。
+extern "C" __global__ void dno_gemv_q4_0(
+    const float* __restrict__ a,    // [m, k]
+    const uint4* __restrict__ nib,  // [n, nb]
+    const float* __restrict__ sc,   // [n, nb]
+    float* __restrict__ out,        // [m, n]
+    int m, int k, int n)
+{
+    const int nb = k >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;   // 0..7 (blockDim.x = 256)
+    const int gj = blockIdx.x * 8 + warp;
+    const int i = blockIdx.y;
+    if (gj >= n || i >= m || nb <= 0) return;
+
+    const float* ai = a + (size_t)i * (size_t)k;
+    const uint4* wn = nib + (size_t)gj * (size_t)nb;
+    const float* ws = sc + (size_t)gj * (size_t)nb;
+
+    float acc = 0.0f;
+    for (int b = lane; b < nb; b += 32) {
+        const float d = ws[b];
+        const uint4 v = wn[b];
+        const unsigned int words[4] = {v.x, v.y, v.z, v.w};
+        const int base = b << 5;
+        #pragma unroll
+        for (int wi = 0; wi < 4; wi++) {
+            const unsigned int w32 = words[wi];
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int qlo = (int)((w32 >> (8 * e)) & 0xFu) - 8;
+                const int qhi = (int)((w32 >> (8 * e + 4)) & 0xFu) - 8;
+                acc += ai[base + wi * 4 + e] * (d * (float)qlo);
+                acc += ai[base + 16 + wi * 4 + e] * (d * (float)qhi);
+            }
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        out[(size_t)i * (size_t)n + gj] = acc;
+    }
+}
+
+// prefill / バッチ用のタイル GEMM。block = (16,16) = 256 thread、
+// 1 ブロック = m 方向 16 行 x n 方向 256 列。共有メモリは A タイル (16x32 f32)
+// と B タイル (256x32 f32・展開済み) で 34 KB。
+#define Q4_GM 16
+#define Q4_GN 256
+static_assert(Q4_GM * 32 * 4 + Q4_GN * 32 * 4 <= 48 * 1024,
+              "q4 gemm shared memory must stay under 48KB (no opt-in needed)");
+
+extern "C" __global__ void dno_gemm_q4_0(
+    const float* __restrict__ a,
+    const uint4* __restrict__ nib,
+    const float* __restrict__ sc,
+    float* __restrict__ out,
+    int m, int k, int n)
+{
+    __shared__ float sA[Q4_GM][32];
+    __shared__ float sB[Q4_GN][32];
+    const int nb = k >> 5;
+    const int i0 = blockIdx.x * Q4_GM;
+    const int j0 = blockIdx.y * Q4_GN;
+    const int tx = threadIdx.x;   // 0..15 → 列 16 本
+    const int ty = threadIdx.y;   // 0..15 → 行 1 本
+    const int tid = ty * 16 + tx; // 0..255 → B の 1 行
+
+    float acc[16];
+    #pragma unroll
+    for (int v = 0; v < 16; v++) acc[v] = 0.0f;
+
+    for (int b = 0; b < nb; b++) {
+        // A タイル (16 行 x 32 要素)。範囲外は 0 (積に寄与しない)
+        {
+            const int gi = i0 + ty;
+            if (gi < m) {
+                const float* src = a + (size_t)gi * (size_t)k + (b << 5);
+                sA[ty][tx] = src[tx];
+                sA[ty][tx + 16] = src[tx + 16];
+            } else {
+                sA[ty][tx] = 0.0f;
+                sA[ty][tx + 16] = 0.0f;
+            }
+        }
+        // B タイル (256 行 x 32 要素) をニブルから展開
+        {
+            const int gj = j0 + tid;
+            const bool in = gj < n;
+            const float d = in ? sc[(size_t)gj * (size_t)nb + b] : 0.0f;
+            const uint4 v = in ? nib[(size_t)gj * (size_t)nb + b] : make_uint4(0, 0, 0, 0);
+            const unsigned int words[4] = {v.x, v.y, v.z, v.w};
+            #pragma unroll
+            for (int wi = 0; wi < 4; wi++) {
+                const unsigned int w32 = words[wi];
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int qlo = (int)((w32 >> (8 * e)) & 0xFu) - 8;
+                    const int qhi = (int)((w32 >> (8 * e + 4)) & 0xFu) - 8;
+                    sB[tid][wi * 4 + e] = d * (float)qlo;
+                    sB[tid][16 + wi * 4 + e] = d * (float)qhi;
+                }
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int c = 0; c < 32; c++) {
+            const float av = sA[ty][c];
+            #pragma unroll
+            for (int v = 0; v < 16; v++) {
+                acc[v] += av * sB[tx * 16 + v][c];
+            }
+        }
+        __syncthreads();
+    }
+
+    const int gi = i0 + ty;
+    if (gi < m) {
+        float* row = out + (size_t)gi * (size_t)n;
+        #pragma unroll
+        for (int v = 0; v < 16; v++) {
+            const int gj = j0 + tx * 16 + v;
+            if (gj < n) row[gj] = acc[v];
+        }
+    }
+}

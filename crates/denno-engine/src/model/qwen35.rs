@@ -483,7 +483,7 @@ impl Qwen35 {
         let lm_head = if tied {
             match quant {
                 QuantMode::Fp32 => None,
-                QuantMode::Int8 => {
+                QuantMode::Int8 | QuantMode::Q4_0 => {
                     let l = Linear::new(embed.clone(), e, vocab, quant);
                     quant_bytes.set(quant_bytes.get() + l.weight_bytes());
                     Some(l)
@@ -1552,7 +1552,8 @@ impl Qwen35 {
                         crate::quant::q8_apply_bt_rows_into(gu, &buf_h2, n, &mut buf_gate);
                         gu_layout = true;
                     }
-                    Linear::F32 { .. } => {
+                    // Q4 は連結経路を持たない (int8 専用の融合) ので fp32 と同じ 2 呼び出し。
+                    Linear::F32 { .. } | Linear::Q4(_) => {
                         layer.gate_w.apply_bt_rows_into(&buf_h2, n, &mut buf_gate);
                         layer.up_w.apply_bt_rows_into(&buf_h2, n, &mut buf_up);
                     }
@@ -1660,6 +1661,18 @@ fn concat_rows(a: &Linear, b: &Linear, what: &str) -> Result<Linear> {
             w.extend_from_slice(wa);
             w.extend_from_slice(wb);
             Ok(Linear::F32 { w, k: ka, n })
+        }
+        // s123: Q4_0 同士も行連結できる (ブロックは行ごとに独立・行順 [a|b])
+        (Linear::Q4(qa), Linear::Q4(qb)) => {
+            let mut blocks = Vec::with_capacity(qa.blocks.len() + qb.blocks.len());
+            blocks.extend_from_slice(&qa.blocks);
+            blocks.extend_from_slice(&qb.blocks);
+            Ok(Linear::Q4(crate::quant::Q4Linear {
+                blocks,
+                k: ka,
+                n,
+                uid: next_q8_uid(),
+            }))
         }
         // 混在 (片方だけ int8) は経路が別になるので連結しない
         _ => bail!("{what} 連結: int8 と fp32 の混在は不可"),
@@ -2052,6 +2065,29 @@ mod tests {
 
     use super::*;
     use std::path::PathBuf;
+
+    /// s123: Q4_0 同士の gate+up 行連結は、2 回に分けて適用した結果と一致する
+    /// (行順 [gate 全行 | up 全行]・ブロックは行ごとに独立)。
+    #[test]
+    fn q4_concat_rows_matches_two_applies() {
+        let (k, ff) = (64usize, 32usize);
+        let wg: Vec<f32> = (0..k * ff).map(|i| (i as f32 * 0.013).sin()).collect();
+        let wu: Vec<f32> = (0..k * ff).map(|i| (i as f32 * 0.017).cos()).collect();
+        let gate = Linear::new(wg, k, ff, QuantMode::Q4_0);
+        let up = Linear::new(wu, k, ff, QuantMode::Q4_0);
+        let cat = concat_rows(&gate, &up, "gate+up").expect("Q4 同士は連結できる");
+        assert_eq!(cat.dims(), (k, 2 * ff));
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.05) - 1.0).collect();
+        let mut out = vec![0f32; 2 * ff];
+        cat.apply_bt_rows_into(&x, 1, &mut out);
+        let mut g = vec![0f32; ff];
+        gate.apply_bt_rows_into(&x, 1, &mut g);
+        let mut u = vec![0f32; ff];
+        up.apply_bt_rows_into(&x, 1, &mut u);
+        assert_eq!(&out[..ff], &g[..], "連結の前半が gate と不一致");
+        assert_eq!(&out[ff..], &u[..], "連結の後半が up と不一致");
+    }
+
 
     // ---- 合成 27B シェイプ (実 27B の構造比を保持した小型 dims) ----
     const E: usize = 96; // hidden (実 5120)

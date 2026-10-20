@@ -987,6 +987,52 @@ pub fn rope_rows(x: &mut [f32], rows: usize, heads: usize, dh: usize, pos0: usiz
     }
 }
 
+
+/// s123: Q4_0 (4 bit ブロック) の重みを f32 アクティベーションと掛ける CPU 経路。
+///
+/// c[i][j] = Σ_d a[i][d] * dequant(W[j][d])、a: [m,k]、out: [m,n]。
+/// GPU 不発時のフォールバックと、GPU 経路の参照実装を兼ねる。
+/// 行 (i) 単位で並列化し、行内は添字昇順の逐次累積 — スレッド数に依存せず
+/// 同一入力 → 同一出力 (決定論)。
+pub fn matvec_rows_bt_q4_into(
+    a: &[f32],
+    blocks: &[u8],
+    k: usize,
+    n: usize,
+    m: usize,
+    out: &mut [f32],
+) {
+    use rayon::prelude::*;
+    debug_assert_eq!(out.len(), m * n);
+    assert_eq!(k % 32, 0, "q4: k must be a multiple of 32");
+    let nb = k / 32;
+    let rb = nb * 18;
+    debug_assert_eq!(blocks.len(), n * rb);
+    out.par_chunks_exact_mut(n).enumerate().for_each(|(i, orow)| {
+        let mut w = vec![0f32; k];
+        let arow = &a[i * k..][..k];
+        for (j, o) in orow.iter_mut().enumerate() {
+            let mut acc = 0f32;
+            for b in 0..nb {
+                let blk = &blocks[(j * nb + b) * 18..][..18];
+                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                for e in 0..16 {
+                    let byte = blk[2 + e];
+                    let q0 = ((byte & 0x0f) as i32 - 8) as f32;
+                    let q1 = ((byte >> 4) as i32 - 8) as f32;
+                    let base = b * 32 + e;
+                    w[base] = d * q0;
+                    w[base + 16] = d * q1;
+                }
+            }
+            for dd in 0..k {
+                acc += arow[dd] * w[dd];
+            }
+            *o = acc;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

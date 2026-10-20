@@ -317,6 +317,9 @@ pub struct CudaCtx {
     f_mv: CUfunction,
     // P17i: prefill 用 tiled GEMM (dno_gemm_i8)
     f_gemm: CUfunction,
+    // s123: Q4_0 ネイティブ (GGUF の 4 bit ブロックを再量子化せず積む)
+    f_mv_q4: CUfunction,
+    f_gemm_q4: CUfunction,
     // P17d: 要素演算モジュール (swiglu / add+rmsnorm / expf probe)
     #[allow(dead_code)]
     module_elem: CUmodule,
@@ -417,6 +420,17 @@ impl CudaCtx {
             check(
                 (lib.module_get_function)(&mut f_gemm, module, b"dno_gemm_i8\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_gemm_i8)",
+            )?;
+            // s123: Q4_0 ネイティブ経路 (同じモジュールに同居)
+            let mut f_mv_q4: CUfunction = std::ptr::null_mut();
+            let mut f_gemm_q4: CUfunction = std::ptr::null_mut();
+            check(
+                (lib.module_get_function)(&mut f_mv_q4, module, b"dno_gemv_q4_0\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_gemv_q4_0)",
+            )?;
+            check(
+                (lib.module_get_function)(&mut f_gemm_q4, module, b"dno_gemm_q4_0\0".as_ptr() as *const c_char),
+                "cuModuleGetFunction(dno_gemm_q4_0)",
             )?;
 
             // P17d: 要素演算モジュール (-fmad=false でコンパイル済み。FMA 縮約は
@@ -546,6 +560,8 @@ impl CudaCtx {
                 f_quant,
                 f_mv,
                 f_gemm,
+                f_mv_q4,
+                f_gemm_q4,
                 module_elem,
                 f_swiglu,
                 f_swiglu_int,
@@ -1908,6 +1924,195 @@ pub fn maybe_gpu_linear_into(
             false
         }
     }
+}
+
+/// s123: Q4_0 ネイティブ重みの VRAM レジストリ (キー = `Q4Linear.uid`)。
+///
+/// SOA で 2 本のバッファに分けて置く: `nib` = 1 ブロック 16B (uint4) を
+/// n*nb 個並べたもの、`sc` = 1 ブロック 1 本の f32 スケール。
+/// 1 要素あたり 4.5 bit (int8 経路の半分以下) で済む。
+struct GpuWq4 {
+    nib: DevBuffer,
+    sc: DevBuffer,
+    k: usize,
+    n: usize,
+}
+
+/// s123: [n,k] の Q4_0 ブロック (1 ブロック 18B) を VRAM へ上げる。
+/// ホスト側で SOA (nib 16B アライン / sc f32) に変換してから転送する。
+fn weights_for_q4(uid: u64, blocks: &[u8], k: usize, n: usize) -> Result<&'static GpuWq4> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static REG: OnceLock<Mutex<HashMap<u64, Box<GpuWq4>>>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = reg.lock().expect("q4 weights registry poisoned");
+    if !map.contains_key(&uid) {
+        let nb = k / 32;
+        assert_eq!(blocks.len(), n * nb * 18, "q4: block size mismatch");
+        let mut nib = vec![0u8; n * nb * 16];
+        let mut sc = vec![0f32; n * nb];
+        for j in 0..n {
+            for b in 0..nb {
+                let src = &blocks[(j * nb + b) * 18..][..18];
+                sc[j * nb + b] = half::f16::from_le_bytes([src[0], src[1]]).to_f32();
+                nib[(j * nb + b) * 16..][..16].copy_from_slice(&src[2..18]);
+            }
+        }
+        let nib_dev = DevBuffer::from_slice(&nib)?;
+        let sc_dev = DevBuffer::from_slice(&sc)?;
+        tracing::info!(
+            "CUDA q4 weight upload (uid={uid}): k={k} n={n} ({:.1} MB)",
+            (nib.len() + n * nb * 4) as f64 / 1e6
+        );
+        map.insert(uid, Box::new(GpuWq4 { nib: nib_dev, sc: sc_dev, k, n }));
+    }
+    let e = map.get(&uid).expect("just inserted");
+    debug_assert_eq!((e.k, e.n), (k, n), "uid 重複: 同一 uid に異なる形状 (q4)");
+    Ok(unsafe { std::mem::transmute::<&GpuWq4, &'static GpuWq4>(e.as_ref()) })
+}
+
+/// s123: Q4_0 線形層の結果を Vec で返す版 (`Linear::apply` 系から使う)。
+pub fn maybe_gpu_linear_q4(
+    uid: u64,
+    a: &[f32],
+    blocks: &[u8],
+    k: usize,
+    n: usize,
+    m: usize,
+) -> Option<Vec<f32>> {
+    let mut out = vec![0.0f32; m * n];
+    if maybe_gpu_linear_q4_into(uid, a, blocks, k, n, m, &mut out) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// s123: Q4_0 線形層の書き込み先指定版。
+/// true = GPU が計算して `out` を埋めた / false = 呼び出し側が CPU パスを使うこと。
+/// 判定・フォールバック (恒久ラッチ) の規約は int8 の `maybe_gpu_linear_into` と同一。
+/// 数値は CPU の `matvec_rows_bt_q4_into` と同じ定義 (差は累積順のみ・R2 以内)。
+pub fn maybe_gpu_linear_q4_into(
+    uid: u64,
+    a: &[f32],
+    blocks: &[u8],
+    k: usize,
+    n: usize,
+    m: usize,
+    out: &mut [f32],
+) -> bool {
+    debug_assert_eq!(out.len(), m * n);
+    set_last_linear_ran_on_gpu(false);
+    LINEAR_SEAM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !cuda_enabled() {
+        return false;
+    }
+    if k % 32 != 0 {
+        return false;
+    }
+    // s123: Q4 の CPU フォールバックは単純ループで遅い (27B で秒/token 級)。
+    // int8 の gemm_min_m (既定 256) は「CPU sgemm の方が速い帯域」を避けるための
+    // 閾値なので、Q4 には適用せず GEMV 上限を超えたら常にタイル GEMM を使う。
+    let use_gemm = m > max_m() && gemm_enabled();
+    if m > max_m() && !use_gemm {
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if let Err(e) = ctx.make_current() {
+        tracing::error!("CUDA cuCtxSetCurrent failed, using CPU q4: {e:#}");
+        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    let gw = match weights_for_q4(uid, blocks, k, n) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!("CUDA q4 weight upload failed, using CPU: {e:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+    };
+    match q4_dispatch(ctx, a, gw, m, k, n, use_gemm, out) {
+        Ok(()) => {
+            set_last_linear_ran_on_gpu(true);
+            true
+        }
+        Err(e) => {
+            tracing::error!("CUDA q4 linear failed, falling back to CPU permanently: {e:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+/// s123: Q4_0 の 1 層ぶん。小さい m は GEMV (1 warp = 1 行)、大きい m は
+/// タイル GEMM (1 block = 16 行 x 256 列)。H2D → kernel → D2H → sync ×1。
+fn q4_dispatch(
+    ctx: &CudaCtx,
+    a: &[f32],
+    gw: &GpuWq4,
+    m: usize,
+    k: usize,
+    n: usize,
+    use_gemm: bool,
+    out: &mut [f32],
+) -> Result<()> {
+    let lib = lib()?;
+    ctx.make_current()?;
+    SCRATCH.with(|cell| -> Result<()> {
+        let mut s = cell.borrow_mut();
+        let Scratch { x, out: dout, hx, ho, .. } = &mut *s;
+        let bytes_x = m * k * 4;
+        let bytes_out = m * n * 4;
+        Scratch::ensure(x, bytes_x)?;
+        Scratch::ensure(dout, bytes_out)?;
+        Scratch::ensure_pin(hx, bytes_x)?;
+        Scratch::ensure_pin(ho, bytes_out)?;
+        let (dx, dout) = (x.as_ref().unwrap(), dout.as_ref().unwrap());
+        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        hx.as_mut_slice::<f32>()[..m * k].copy_from_slice(a);
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(
+                    dx.ptr(),
+                    hx.ptr as *const c_void,
+                    bytes_x,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyHtoDAsync",
+            )?;
+            let (mut pa, mut pn, mut ps, mut po) =
+                (dx.ptr(), gw.nib.ptr(), gw.sc.ptr(), dout.ptr());
+            let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, n as c_int);
+            let mut args = [
+                &mut pa as *mut _ as *mut c_void,
+                &mut pn as *mut _ as *mut c_void,
+                &mut ps as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            if use_gemm {
+                // Q4_GM=16 (m 方向) / Q4_GN=256 (n 方向)・block (16,16)
+                let grid = (m.div_ceil(16) as u32, n.div_ceil(256) as u32, 1);
+                ctx.launch_async(ctx.f_gemm_q4, grid, (16, 16, 1), 0, &mut args)?;
+            } else {
+                // 1 block = 8 行 (8 warp)・grid.x = n/8, grid.y = m
+                let grid = (n.div_ceil(8) as u32, m as u32, 1);
+                ctx.launch_async(ctx.f_mv_q4, grid, (256, 1, 1), 0, &mut args)?;
+            }
+            check(
+                (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync",
+            )?;
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+            ctx.sync()?;
+        }
+        out.copy_from_slice(&ho.as_slice::<f32>()[..m * n]);
+        Ok(())
+    })
 }
 
 /// ピン留め + 非同期 1 同期パイプライン:
@@ -5779,6 +5984,46 @@ mod tests {
             assert_eq!(&v_gpu[off..off + kv_dim], wv, "v 行 {i} ビット不一致");
         }
         println!("rope_qkv_pf bit-exact OK (q {n}x{qn}, k/v rows {pos0}..{t_total})");
+    }
+
+    /// s123: Q4_0 ネイティブ経路 (GEMV: m<=16 / GEMM: m>=256) が CPU 実装と
+    /// R2 (相対 1e-4) 以内で一致し、2 回実行でビット一致 (決定論) すること。
+    #[test]
+    #[ignore] // GPU が必要: cargo test --release --features cuda -- --ignored
+    fn cuda_q4_linear_matches_cpu() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let (k, n) = (256usize, 64usize);
+        let w = pseudo_random(k * n, 5);
+        let q = crate::quant::Q4Linear::quantize(&w, k, n);
+        for m in [1usize, 7, 16, 300] {
+            let a = pseudo_random(m * k, 100 + m as u32);
+            let mut want = vec![0f32; m * n];
+            crate::tensor::matvec_rows_bt_q4_into(&a, &q.blocks, k, n, m, &mut want);
+            let mut got = vec![0f32; m * n];
+            assert!(
+                maybe_gpu_linear_q4_into(q.uid, &a, &q.blocks, k, n, m, &mut got),
+                "m={m}: Q4 GPU 経路が発動しなかった"
+            );
+            let mut maxd = 0.0f32;
+            let mut maxv = 0.0f32;
+            for (g, wv) in got.iter().zip(want.iter()) {
+                maxd = maxd.max((g - wv).abs());
+                maxv = maxv.max(wv.abs());
+            }
+            println!("q4 m={m}: maxabs={maxd:e} (max|ref|={maxv:e})");
+            assert!(
+                maxd <= 1e-4 * maxv.max(1.0),
+                "m={m}: Q4 GPU と CPU の差 {maxd} が R2 を超えた"
+            );
+            let mut got2 = vec![0f32; m * n];
+            assert!(maybe_gpu_linear_q4_into(q.uid, &a, &q.blocks, k, n, m, &mut got2));
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                got2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "m={m}: Q4 GPU 経路が非決定論"
+            );
+        }
     }
 
     /// P17j: prefill attention カーネル (dno_attention_prefill) が CPU 参照経路と

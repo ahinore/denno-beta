@@ -24,6 +24,13 @@ pub enum QuantMode {
     /// 線形層の重みを per-channel scale の int8 に量子化 (weight-only)。
     /// 決定論は維持されるが fp32 と同一出力にはならない。
     Int8,
+    /// 線形層の重みを **GGUF Q4_0 の 4 bit ブロックのまま**保持する (s123)。
+    ///
+    /// int8 経路は GGUF を fp32 へ展開してから 1 要素 1 バイトへ詰め直すため、
+    /// 元が 4.5 bit でも常に 8 bit 分の VRAM を積む (27B で 25.7 GB)。
+    /// Q4_0 は元のブロックをそのまま保持するので 4.5 bit (27B で 13.7 GB) で済む。
+    /// 数値は fp32 とも int8 とも一致しない (別の量子化)。決定論は維持される。
+    Q4_0,
 }
 
 impl QuantMode {
@@ -32,7 +39,8 @@ impl QuantMode {
         match s {
             "fp32" | "f32" | "none" => Ok(QuantMode::Fp32),
             "int8" | "i8" | "q8" => Ok(QuantMode::Int8),
-            other => bail!("--quant の値は fp32 または int8 (got: {other})"),
+            "q4" | "q4_0" => Ok(QuantMode::Q4_0),
+            other => bail!("--quant の値は fp32 / int8 / q4 (got: {other})"),
         }
     }
 
@@ -40,6 +48,7 @@ impl QuantMode {
         match self {
             QuantMode::Fp32 => "fp32",
             QuantMode::Int8 => "int8",
+            QuantMode::Q4_0 => "q4",
         }
     }
 }
@@ -117,6 +126,104 @@ impl Quant8Linear {
     }
 }
 
+
+/// Q4_0 (ggml 互換) の重みを**元の 4 bit ブロックのまま**保持する (s123)。
+///
+/// 1 ブロック = 32 要素 = f16 スケール (2B) + ニブル 16B = 18B。
+/// ggml の `quantize_row_q4_0_ref` と同じ規則で量子化するので、Q4_0 の GGUF を
+/// fp32 経由で読み直しても同じ値に戻る。デ量子化は `y = d * (q - 8)`。
+///
+/// `Quant8Linear` との違いは scale の粒度 (行ごと vs 32 要素ごと) と保持形式だけ。
+/// 経路 (GPU 試行 → CPU フォールバック) は同じ規約に従う。
+#[derive(Debug, Clone)]
+pub struct Q4Linear {
+    /// [n, k/32] ブロックの生バイト列 (行ごとに連続・1 ブロック 18B)
+    pub blocks: Vec<u8>,
+    pub k: usize,
+    pub n: usize,
+    /// GPU 重みキャッシュのキー (`Quant8Linear` と同一の採番系)
+    pub uid: u64,
+}
+
+/// Q4_0 の 1 ブロックあたり要素数 (ggml QK4_0)
+pub const Q4_BLOCK_ELEMS: usize = 32;
+/// Q4_0 の 1 ブロックあたりバイト数 (f16 scale 2B + ニブル 16B)
+pub const Q4_BLOCK_BYTES: usize = 18;
+
+impl Q4Linear {
+    /// 1 行あたりのバイト数 (k は 32 の倍数であること)
+    pub fn row_bytes(k: usize) -> usize {
+        (k / Q4_BLOCK_ELEMS) * Q4_BLOCK_BYTES
+    }
+
+    /// f32 重み [n,k] を Q4_0 へ量子化する (ggml quantize_row_q4_0_ref と同規則)。
+    pub fn quantize(w: &[f32], k: usize, n: usize) -> Self {
+        assert_eq!(w.len(), k * n, "q4 quantize: weight size mismatch");
+        assert_eq!(k % Q4_BLOCK_ELEMS, 0, "q4: k must be a multiple of 32");
+        let nb = k / Q4_BLOCK_ELEMS;
+        let mut blocks = vec![0u8; n * nb * Q4_BLOCK_BYTES];
+        for (j, row) in w.chunks_exact(k).enumerate() {
+            for b in 0..nb {
+                let src = &row[b * Q4_BLOCK_ELEMS..][..Q4_BLOCK_ELEMS];
+                // ggml: |x| 最大の要素を符号付きで覚え、d = max / -8 とする。
+                // こうすると max がちょうど ±8 に写り、ニブルは 0..15 に収まる。
+                let mut amax = 0.0f32;
+                let mut max = 0.0f32;
+                for &x in src {
+                    if x.abs() > amax {
+                        amax = x.abs();
+                        max = x;
+                    }
+                }
+                let d = max / -8.0;
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                let out = &mut blocks[(j * nb + b) * Q4_BLOCK_BYTES..][..Q4_BLOCK_BYTES];
+                out[..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                for (i, &x) in src.iter().enumerate() {
+                    // ggml: (int8_t)(x*id + 8.5f) を 15 で頭切り。
+                    // 0.5..16.5 の正値なので floor == 切り捨て。
+                    let q = (x * id + 8.5).floor().clamp(0.0, 15.0) as u8;
+                    if i < 16 {
+                        out[2 + i] |= q;
+                    } else {
+                        out[2 + (i - 16)] |= q << 4;
+                    }
+                }
+            }
+        }
+        Self { blocks, k, n, uid: next_uid() }
+    }
+
+    /// j 行目を f32 へ展開する (out は k 要素)。
+    pub fn dequant_row_into(&self, j: usize, out: &mut [f32]) {
+        let nb = self.k / Q4_BLOCK_ELEMS;
+        debug_assert_eq!(out.len(), self.k);
+        for b in 0..nb {
+            let blk = &self.blocks[(j * nb + b) * Q4_BLOCK_BYTES..][..Q4_BLOCK_BYTES];
+            let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+            for i in 0..16 {
+                let byte = blk[2 + i];
+                out[b * Q4_BLOCK_ELEMS + i] = d * (((byte & 0x0f) as i32 - 8) as f32);
+                out[b * Q4_BLOCK_ELEMS + i + 16] = d * (((byte >> 4) as i32 - 8) as f32);
+            }
+        }
+    }
+
+    /// 全行を f32 へ展開する (テスト・参照用)。
+    pub fn dequantize(&self) -> Vec<f32> {
+        let mut out = vec![0f32; self.k * self.n];
+        for j in 0..self.n {
+            self.dequant_row_into(j, &mut out[j * self.k..][..self.k]);
+        }
+        out
+    }
+
+    /// 重みの実メモリ量 (bytes)
+    pub fn weight_bytes(&self) -> usize {
+        self.blocks.len()
+    }
+}
+
 /// s80 (T7b): int8 重み 1 本に対する `Linear::apply_bt_rows_into` の Q8 分岐と
 /// **同一の経路** (GPU `maybe_gpu_linear_into` 試行 → CPU matvec / matmul)。
 /// ロード時に連結した重み (`Linear` を一度包まずに持つ層ゲート用) を同じ数値で
@@ -145,6 +252,8 @@ pub fn q8_apply_bt_rows_into(q: &Quant8Linear, a: &[f32], m: usize, out: &mut [f
 pub enum Linear {
     F32 { w: Vec<f32>, k: usize, n: usize },
     Q8(Quant8Linear),
+    /// Q4_0 ネイティブ (s123): GGUF の 4 bit ブロックをそのまま保持する。
+    Q4(Q4Linear),
 }
 
 /// s61 (T5a 撤回): GPU 線形層の唯一の入口は `cuda::maybe_gpu_linear`。
@@ -168,7 +277,7 @@ impl Linear {
     pub fn quant8(&self) -> Option<&Quant8Linear> {
         match self {
             Linear::Q8(q) => Some(q),
-            Linear::F32 { .. } => None,
+            Linear::F32 { .. } | Linear::Q4(_) => None,
         }
     }
 
@@ -178,6 +287,7 @@ impl Linear {
         match mode {
             QuantMode::Fp32 => Linear::F32 { w, k, n },
             QuantMode::Int8 => Linear::Q8(Quant8Linear::quantize(&w, k, n)),
+            QuantMode::Q4_0 => Linear::Q4(Q4Linear::quantize(&w, k, n)),
         }
     }
 
@@ -219,6 +329,13 @@ impl Linear {
                     crate::tensor::matmul_bt_i8_into(a, &q.w, &q.scale, m, q.k, q.n, out);
                 }
             }
+            Linear::Q4(q) => {
+                #[cfg(feature = "cuda")]
+                if crate::cuda::maybe_gpu_linear_q4_into(q.uid, a, &q.blocks, q.k, q.n, m, out) {
+                    return;
+                }
+                crate::tensor::matvec_rows_bt_q4_into(a, &q.blocks, q.k, q.n, m, out);
+            }
         }
     }
 
@@ -236,6 +353,15 @@ impl Linear {
                     }
                 }
                 Linear::Q8(Quant8Linear::quantize(&wt, k, n))
+            }
+            QuantMode::Q4_0 => {
+                let mut wt = vec![0f32; k * n];
+                for d in 0..k {
+                    for j in 0..n {
+                        wt[j * k + d] = w[d * n + j];
+                    }
+                }
+                Linear::Q4(Q4Linear::quantize(&wt, k, n))
             }
         }
     }
@@ -267,6 +393,17 @@ impl Linear {
                     crate::tensor::matmul_bt_i8(a, &q.w, &q.scale, m, q.k, q.n)
                 }
             }
+            Linear::Q4(q) => {
+                #[cfg(feature = "cuda")]
+                if let Some(out) =
+                    crate::cuda::maybe_gpu_linear_q4(q.uid, a, &q.blocks, q.k, q.n, m)
+                {
+                    return out;
+                }
+                let mut out = vec![0.0f32; m * q.n];
+                crate::tensor::matvec_rows_bt_q4_into(a, &q.blocks, q.k, q.n, m, &mut out);
+                out
+            }
         }
     }
 
@@ -287,6 +424,17 @@ impl Linear {
                 }
                 crate::tensor::matvec_rows_bt_i8(a, &q.w, &q.scale, q.k, q.n, m)
             }
+            Linear::Q4(q) => {
+                #[cfg(feature = "cuda")]
+                if let Some(out) =
+                    crate::cuda::maybe_gpu_linear_q4(q.uid, a, &q.blocks, q.k, q.n, m)
+                {
+                    return out;
+                }
+                let mut out = vec![0.0f32; m * q.n];
+                crate::tensor::matvec_rows_bt_q4_into(a, &q.blocks, q.k, q.n, m, &mut out);
+                out
+            }
         }
     }
 
@@ -305,6 +453,17 @@ impl Linear {
                 }
                 crate::tensor::matmul_bt_i8(a, &q.w, &q.scale, m, q.k, q.n)
             }
+            Linear::Q4(q) => {
+                #[cfg(feature = "cuda")]
+                if let Some(out) =
+                    crate::cuda::maybe_gpu_linear_q4(q.uid, a, &q.blocks, q.k, q.n, m)
+                {
+                    return out;
+                }
+                let mut out = vec![0.0f32; m * q.n];
+                crate::tensor::matvec_rows_bt_q4_into(a, &q.blocks, q.k, q.n, m, &mut out);
+                out
+            }
         }
     }
 
@@ -313,6 +472,7 @@ impl Linear {
         match self {
             Linear::F32 { k, n, .. } => (*k, *n),
             Linear::Q8(q) => (q.k, q.n),
+            Linear::Q4(q) => (q.k, q.n),
         }
     }
 
@@ -321,6 +481,7 @@ impl Linear {
         match self {
             Linear::F32 { w, .. } => w.len() * 4,
             Linear::Q8(q) => q.weight_bytes(),
+            Linear::Q4(q) => q.weight_bytes(),
         }
     }
 }
@@ -328,6 +489,121 @@ impl Linear {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// s123: 飽和しない値域では、Q4_0 の量子化は
+    /// (1) 誤差がブロックスケールの 1/2 以下、(2) デ量子化 → 再量子化で同一バイト列。
+    #[test]
+    fn q4_quantize_is_idempotent() {
+        let (k, n) = (64usize, 2usize);
+        // 絶対値最大が負側 (-1.0) で、正側は +0.75 までに抑える。
+        // d = +0.125 になり、どの要素も 15 に飽和しない値域。
+        let mut w = Vec::with_capacity(k * n);
+        for _ in 0..n {
+            for i in 0..k {
+                w.push(-1.0 + (i % 15) as f32 * 0.125);
+            }
+        }
+        let q = Q4Linear::quantize(&w, k, n);
+        assert_eq!(q.blocks.len(), n * (k / Q4_BLOCK_ELEMS) * Q4_BLOCK_BYTES);
+        let dq = q.dequantize();
+        let q2 = Q4Linear::quantize(&dq, k, n);
+        assert_eq!(q.blocks, q2.blocks, "dequant -> quant でバイト列が変わった");
+        for j in 0..n {
+            for b in 0..k / Q4_BLOCK_ELEMS {
+                let blk =
+                    &q.blocks[(j * (k / Q4_BLOCK_ELEMS) + b) * Q4_BLOCK_BYTES..][..Q4_BLOCK_BYTES];
+                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32().abs();
+                for i in 0..Q4_BLOCK_ELEMS {
+                    let idx = j * k + b * Q4_BLOCK_ELEMS + i;
+                    assert!(
+                        (w[idx] - dq[idx]).abs() <= d * 0.5 + 1e-6,
+                        "誤差超過 idx={idx} err={} d={d}",
+                        (w[idx] - dq[idx]).abs()
+                    );
+                }
+            }
+        }
+    }
+
+    /// s123: 既知の 1 ブロックで、レイアウト (low/high ニブルの位置) と
+    /// 量子化規則をバイト列で固定する。
+    ///
+    /// w[i] = -1.0 + 0.0625*i (i=0..31) なので |max| = 1.0 (負) → d = 0.125。
+    /// q_i = min(15, floor(-8 + 0.5*i + 8.5)) = min(15, floor(0.5 + 0.5*i))。
+    /// i = 0,1,2,3 → 0,1,1,2 / i = 30,31 → 15 (飽和), 15 (飽和)。
+    #[test]
+    fn q4_known_block_bytes() {
+        let w: Vec<f32> = (0..32).map(|i| -1.0 + 0.0625 * i as f32).collect();
+        let q = Q4Linear::quantize(&w, 32, 1);
+        assert_eq!(q.blocks.len(), 18);
+        // f16(0.125) = 0x3000 (LE: 00 30)
+        assert_eq!(&q.blocks[..2], &[0x00, 0x30], "scale が f16 0.125 でない");
+        // byte = q_i | q_{i+16} << 4
+        assert_eq!(q.blocks[2], 0x80); // i=0 q=0, i=16 q=8
+        assert_eq!(q.blocks[3], 0x91); // i=1 q=1, i=17 q=9
+        assert_eq!(q.blocks[4], 0x91); // i=2 q=1, i=18 q=9
+        assert_eq!(q.blocks[5], 0xA2); // i=3 q=2, i=19 q=10
+        assert_eq!(q.blocks[17], 0xF8); // i=15 q=8, i=31 q=15 (飽和)
+        // 飽和した要素の誤差は最大でブロックスケール 1 個分 (ggml と同じ挙動)
+        let dq = q.dequantize();
+        let d = 0.125f32;
+        for i in 0..32 {
+            let e = (w[i] - dq[i]).abs();
+            assert!(e <= d + 1e-6, "i={i} err={e}");
+        }
+        // 非飽和の要素は 1/2 スケール以内
+        for i in 0..30 {
+            assert!((w[i] - dq[i]).abs() <= d * 0.5 + 1e-6, "i={i}");
+        }
+    }
+
+    /// s123: Q4 の CPU 経路は「デ量子化した重みの fp32 行列積」と一致する
+    /// (丸めのみの差なので 1e-6 級)。
+    #[test]
+    fn q4_matvec_matches_fp32_on_dequantized_weights() {
+        let (k, n, m) = (128usize, 5usize, 2usize);
+        let w = pseudo_random(k * n, 999);
+        let a = pseudo_random(k * m, 777);
+        let q = Q4Linear::quantize(&w, k, n);
+        let dq = q.dequantize();
+        let mut got = vec![0f32; m * n];
+        crate::tensor::matvec_rows_bt_q4_into(&a, &q.blocks, k, n, m, &mut got);
+        let want = crate::tensor::matmul_bt(&a, &dq, m, k, n);
+        for i in 0..m * n {
+            assert!((got[i] - want[i]).abs() <= 1e-5 * want[i].abs().max(1.0), "idx={i} {} vs {}", got[i], want[i]);
+        }
+    }
+
+    /// s123: Q4 経路は 2 回実行で同一ビット (決定論)。
+    #[test]
+    fn q4_matvec_is_deterministic() {
+        let (k, n, m) = (64usize, 7usize, 3usize);
+        let w = pseudo_random(k * n, 4242);
+        let a = pseudo_random(k * m, 2424);
+        let q = Q4Linear::quantize(&w, k, n);
+        let mut c1 = vec![0f32; m * n];
+        let mut c2 = vec![0f32; m * n];
+        crate::tensor::matvec_rows_bt_q4_into(&a, &q.blocks, k, n, m, &mut c1);
+        crate::tensor::matvec_rows_bt_q4_into(&a, &q.blocks, k, n, m, &mut c2);
+        assert_eq!(
+            c1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            c2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "Q4 matvec が非決定論"
+        );
+    }
+
+    /// s123: Q4_0 モードの Linear は dims / weight_bytes が 4.5 bit 相当になる。
+    #[test]
+    fn q4_linear_dims_and_bytes() {
+        let (k, n) = (256usize, 8usize);
+        let w = pseudo_random(k * n, 1);
+        let l = Linear::new(w, k, n, QuantMode::Q4_0);
+        assert_eq!(l.dims(), (k, n));
+        assert_eq!(l.weight_bytes(), n * (k / Q4_BLOCK_ELEMS) * Q4_BLOCK_BYTES);
+        assert!(l.weight_bytes() < k * n); // 1 バイト/要素より小さい
+        assert!(l.quant8().is_none(), "Q4 は融合経路 (quant8) に載らない");
+    }
+
 
     /// 決定論的な疑似乱数 (LCG) でテスト用行列を作る (tensor.rs と同じ方式)
     fn pseudo_random(len: usize, seed: u32) -> Vec<f32> {
