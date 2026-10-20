@@ -5,8 +5,8 @@
 >
 > **追記フォーマット**: `### Pn: 機能名 (日付, commit)` の下に **実装** / **テスト** / **プロファイル** / **次の実装内容** を記載する。完了した項目は「次の実装内容」を候補リストへ反映する。
 
-**更新**: 2026-10-15(P19-A2 完了・`9183e7e`)
-**リポジトリ**: https://github.com/ahinore/denno-beta (main, `9183e7e` 同期済み)
+**更新**: 2026-10-20(P4-7 完了・`42fbf3b`、本番 8095 は 27B q4)
+**リポジトリ**: https://github.com/ahinore/denno-beta (main, `42fbf3b` 同期済み)
 
 ---
 
@@ -2621,6 +2621,142 @@ s122 のハンドオフはそれを「s118 で設計済み」と読んで再実�
 (`c61ad85b` / `9e17d563` / `af6eb6ab`) はいずれも**実施していないし、この課題では不要**。
 `.ptx` は再生成していない (ソースが変わっていないので不要)。P1-2 はこれで全候補 (1-4) が
 数字付きで棄却され、**prefill の未着手レバーは無くなった**。
+
+### s123: Q4_0 ネイティブ経路で 27B が 18.4 GB / 180 ms/token で動く (2026-10-20, `c51d6a3` / P4-5) 完了
+
+> 27B は int8 経路だと VRAM 31,977 MiB・decode 669 ms/token で実用にならなかった。
+> GGUF の 4 bit ブロックを fp32 に展開して int8 に詰め直す二度手間をやめ、
+> Q4_0 ブロックのまま重みを持って GEMV/GEMM を専用カーネルで回す経路を足した。
+
+**実装**:
+
+- `Linear::Q4` と `Q4Linear`。ブロックは 32 要素 = f16 scale 2 B + ニブル 16 B = 18 B。
+  要素 c (0..15) が下位ニブル、c+16 が上位、`y = d*(q-8)`、`d` は負になり得る
+  (`ggml quantize_row_q4_0_ref` と同じ規則)。
+- CPU 参照 `matvec_rows_bt_q4_into`、GPU は `dno_gemv_q4_0` / `dno_gemm_q4_0`
+  (`kernels/kernels_int8.cu`)。レイアウトは SOA (`nib` = uint4 16 B アライン、`sc` = f32)、
+  f32 逐次累積なので決定論。
+- `cuda::maybe_gpu_linear_q4{,_into}` と Q4 専用の重みレジストリ。`concat_rows` に Q4 分岐を
+  足して gate+up 融合を維持。
+- m > 16 は常にタイル GEMM を通す。Q4 の CPU フォールバックは素のループなので
+  `gemm_min_m` は適用しない。
+
+**数値契約**: CPU 参照との差は GEMV maxabs 9.5e-6 (R2 の相対 1e-4 以内)、GEMM 0 (bit 一致)。
+決定論は 3 連続一致。
+
+**実測 (27B, seed 42)**:
+
+| 経路 | VRAM | decode | prefill |
+|---|---|---|---|
+| int8 | 31,977 MiB | 669 ms/token | — |
+| Q4_0 ネイティブ | **18,369 MiB** | **178-186 ms/token** | 34 tok/s |
+
+**テスト**: lib 246 本 + `cuda_q4_linear_matches_cpu` (m=1/7/16/300、`--ignored`)、
+`GPU_VERIFY.sh` アンカー 3/3 MATCH。
+
+**残 (P4-5 に記載)**: TQ1_0 (型 29) / IQ1_M (型 24) のデコードが未対応で UD-IQ2_XXS は
+ロードできない。GGUF ブロックを展開せずに渡す経路も未実装 (fp32 展開 -> Q4 詰め直しで
+一時展開が残る)。
+
+### s124: 本番 8095 を 27B q4 に切り替え、起動をスクリプト化 (2026-10-20, `0dee7e2` / `f0ae240` / `44c54b7`) 完了
+
+- `scripts/prod_serve_27b.sh` を repo に置いた (ホスト固有パスを書かない)。内容は
+  `serve local/qwen35-27b --port 8095 --host 0.0.0.0 --seed 42 --quant q4
+  --repetition-penalty 1.05 --temperature-cap 0.7` に `DENNO_KV_BUDGET_MB=10240` と
+  prefix cache 8,192 token を足したもの。
+- 9B int8 (このホストで 1 インスタンスのみ) と 27B は VRAM が足りず同居できない。8095 は
+  常にどちらか一方。
+- Hermes desktop 側は provider `denno-27b` (anthropic_messages、`local/qwen35-27b`、
+  `context_length` 65,536)。`f0ae240` はその修正で、32,768 を宣言すると
+  `agent_init.py: _enforce_minimum_context` が `MINIMUM_CONTEXT_LENGTH = 64_000` を
+  下回ると判断して起動時に落ちる (実際に落ちた)。デスクトップ本体の頭脳は外部 API のままで、
+  9B/27B は provider としてのみ登録。
+- `44c54b7` で KV 予算を 12,288 -> 10,240 MB、prefix cache を 8,192 token に詰めた
+  (`DENNO_BATCH_SLOTS=4` と合わせて予算内に収めるため)。
+
+### s125: 27B の VRAM がリクエストごとに積み上がる - 計装と内訳 (2026-10-20, 診断 / P4-6・P4-7 の前提)
+
+> 「GPU 使用率が高止まりしている」という報告から。二つの状態が混ざっていた。
+> (1) prefill 中は 80-90% で正常 (11k token で約 300 s)。
+> (2) `cuMemAlloc error 2` で `cuda chain failed (falling back to CPU)` に落ちたリクエストは
+> GPU 0% / CPU 63% のまま 13 分以上走り、KV スロットも掴んだまま残る。正体は (2)。
+
+**計装 (すべて env ゲート・既定無効のまま commit 済み)**: `DENNO_MEM_DBG` は
+`cuMemGetInfo` を呼んで alloc/free ごとに空き VRAM を `tracing` で出す。`DENNO_MEM_BT` は
+1 MiB 以上の確保で呼び出し 6 フレームを 1 行にし、`#[track_caller]` で `at=file:line` を付ける。
+次のメモリ形状バグをすぐ追えるようにするため、診断コードは消さずに残した。
+
+**内訳の取り方**: 確保サイズ別に `alloc 合計 - free 合計` を取る。grow-only の thread_local
+スクラッチは free されないので、これがそのまま保持量になる。3,020 token のリクエスト後で
+合計約 25 GB、うち重みが約 16.7 GB、最大の非重み項が **64 MiB x 128 本 = 8,192 MB**。
+
+**切り分け**: `RAYON_NUM_THREADS=1` でも残留量は変わらない (3,020 token で 21,135 MiB)。
+スレッド数ではなく n 比例のバッファそのものが原因。
+
+### s126: P4-6 - `q4_dispatch` を 256 行タイルに分割して prefill の作業領域を固定 (2026-10-20, `76f2437`) 完了
+
+- 原因: `q4_dispatch` が `m = prompt 長` で `SCRATCH` (thread_local・grow-only) を確保し、
+  `(m*k + m*n)*4 B` がスレッド数分だけプロセス寿命まで残っていた。
+- 修正: `const Q4_M_TILE: usize = 256` の行タイルに分け、`q4_dispatch_tile` を新設。
+  行は独立で 1 行の演算順も変わらないので bit 一致。
+- 併せて上限ガード `DENNO_MAX_PROMPT_TOKENS` (当時 12,288) を入れた。OOM でエンジンを
+  落とす前に 400 で明示拒否する。
+- 実測 (27B q4, `vram_probe.py`):
+
+| prompt | 修正前 | 修正後 |
+|---|---|---|
+| 70 | 18,377 MiB | 18,377 MiB |
+| 3,020 | 21,505 MiB | 21,135 MiB (`RAYON_NUM_THREADS=1` でも同じ) |
+| 10,820 | 32,073 MiB -> 次リクエストが `cuMemAlloc error 2` で CPU フォールバック | 28,387 MiB、2 連続 315.6 s / 306.1 s で増加なし |
+
+- テスト: lib 246 本 + `cuda_q4_linear_matches_cpu` (m=1/7/16/300)、アンカー 3/3 MATCH。
+- 残: 約 0.9 MB/token がまだ残る -> P4-7。
+
+### s127: P4-7 - KV ミラーを「使う層だけ」確保して 10,820 token で 6.8 GB 回収 (2026-10-20, `42fbf3b`) 完了
+
+> 残っていた 0.9 MB/token の主因は GDN スキャンではなかった。`with_mirror_ext` は cap を
+> 伸ばすとき **全 n_layers 分**の K/V ミラーを確保しており、27B (64 層 = 48 GDN + 16 full) では
+> KV を書かない 48 層分まで常駐していた。さらに cap の切り上げが `next_power_of_two` で、
+> 10,880 必要に対して 16,384 行 (1.51 倍) を確保していた。
+
+- 修正 1: cap 成長時は全層の `len` を 0 に戻すだけにし、各層のバッファはその層を使うときに
+  ensure する (grow-only)。
+- 修正 2: `kv_mirror_cap` を 1,024 行刻みの切り上げに変更。必要量を超えるときは一気に
+  必要量まで上げ、リクエスト内で再成長しないようにする。
+- 修正 3: バッファを伸ばした層は `len` を 0 に戻す。ensure は新規確保なので行内容が失われ、
+  古い len のままだと部分シードで古い内容を使う。
+- 実測 (27B q4):
+
+| prompt | P4-6 後 | P4-7 後 |
+|---|---|---|
+| 70 | 18,377 MiB | 18,377 MiB |
+| 3,020 | 21,135 MiB | 19,471 MiB |
+| 10,820 | 28,387 MiB | **21,603 MiB** |
+| 21,620 | 未測定 | **24,497 MiB / 623.5 s・正常応答** |
+
+- 上限を 12,288 -> **32,768** に上げた。40,035 token のリクエストは 400
+  (`prompt (40035 tokens) が上限 32768 を超えます`) で弾かれ、直後のリクエストは 200 で
+  `fox` を返した (エンジンは生存)。
+- 残りは約 0.27 MB/token (GDN スキャン約 0.11、qkv/rope チェーン約 0.07、KV ミラー 16 層分)。
+  32,768 token で約 27.5 GB の見込み。64k を狙うなら GDN スキャンとチェーンバッファの
+  チャンク化が次の一手 (64k は概算 40 GB で届かない)。
+- テスト: lib 246 本、アンカー 3/3 MATCH (KV ミラーは 9B のアンカー経路も通るため必須)。
+
+### ベンチマーク一覧 (2026-10-20 時点・このホスト)
+
+測定規則: prefill の正式値は cold 単発 (サーバ起動 -> 1 リクエスト、prefix cache off、
+交互 A/B)。暖機後の 2 回目は同一セッション内の相対比較にのみ使う。
+
+| モデル / 経路 | prefill | decode | VRAM | 備考 |
+|---|---|---|---|---|
+| 9B int8 (本番相当) | 13.18 s / 5,686 token = 431 tok/s (公式値)、13.61 s (このホスト) | 16.4 ms/token | — | アンカー 3 本の基準 |
+| 27B int8 | — | 669 ms/token | 31,977 MiB | 実用外 |
+| 27B q4 (3,020 token) | 87.1 s = 34.7 tok/s | 178-186 ms/token | 19,471 MiB | P4-7 後 |
+| 27B q4 (10,820 token) | 306.0 s = 35.4 tok/s | 同上 | 21,603 MiB | P4-7 後 |
+| 27B q4 (21,620 token) | 623.5 s = 34.7 tok/s | 同上 | 24,497 MiB | P4-7 後・上限近傍 |
+
+数値契約: attention のみ maxabs < 1e-3 を承認済み。GDN は bit 一致不要。Q4_0 は CPU 経路と
+R2 (相対 1e-4) 以内で、実測は GEMV 9.5e-6 / GEMM 0。決定論は全経路で必須。
 
 ## 4. 次の実装候補
 

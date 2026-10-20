@@ -5,8 +5,8 @@
 >
 > **Entry format**: under `### Pn: Feature (date, commit)`, record **Implementation** / **Tests** / **Profile** / **Next up**. Completed items are reflected in the candidate list under "Next up".
 
-**Updated**: 2026-10-15
-**Repository**: https://github.com/ahinore/denno-beta (main, `9183e7e` synced)
+**Updated**: 2026-10-20 (P4-7 done, `42fbf3b`; production 8095 runs 27B q4)
+**Repository**: https://github.com/ahinore/denno-beta (main, `42fbf3b` synced)
 
 ---
 
@@ -2611,6 +2611,148 @@ the `.cu`** (the design ships the `.ptx` as bytes), so it is not evidence the ke
 (`c61ad85b` / `9e17d563` / `af6eb6ab`) - none were run and **none are needed** for this task. The
 `.ptx` was not regenerated (the source did not change). P1-2 is now closed with all four
 candidates rejected with numbers, and **no untouched prefill lever remains**.
+
+### s123: Q4_0 native weight path - 27B in 18.4 GB at 180 ms/token (2026-10-20, `c51d6a3` / P4-5) done
+
+> 27B on the int8 path was 31,977 MiB of VRAM and 669 ms/token, i.e. not usable. Instead of
+> expanding the GGUF 4-bit blocks to fp32 and re-quantising them to int8, the weights now stay
+> as Q4_0 blocks and dedicated kernels run the GEMV/GEMM.
+
+**Implementation**:
+
+- `Linear::Q4` and `Q4Linear`. A block is 32 values = f16 scale 2 B + 16 B of nibbles = 18 B.
+  Element c (0..15) is the low nibble, c+16 the high one, `y = d*(q-8)`, and `d` may be negative
+  (the `ggml quantize_row_q4_0_ref` rules).
+- CPU reference `matvec_rows_bt_q4_into`; GPU `dno_gemv_q4_0` / `dno_gemm_q4_0` in
+  `kernels/kernels_int8.cu`. The layout is SOA (`nib` = uint4, 16 B aligned, `sc` = f32) and the
+  accumulation is sequential f32, so it stays deterministic.
+- `cuda::maybe_gpu_linear_q4{,_into}` with its own Q4 weight registry. `concat_rows` gained a Q4
+  arm so the gate+up fusion still applies.
+- m > 16 always takes the tiled GEMM: the Q4 CPU fallback is a plain loop, so `gemm_min_m` is
+  not applied.
+
+**Numeric contract**: against the CPU reference the GEMV maxabs is 9.5e-6 (inside R2, relative
+1e-4) and the GEMM difference is 0 (bit-exact). Three consecutive runs are identical.
+
+**Measured (27B, seed 42)**:
+
+| path | VRAM | decode | prefill |
+|---|---|---|---|
+| int8 | 31,977 MiB | 669 ms/token | — |
+| Q4_0 native | **18,369 MiB** | **178-186 ms/token** | 34 tok/s |
+
+**Tests**: 246 lib tests + `cuda_q4_linear_matches_cpu` (m = 1/7/16/300, `--ignored`), and
+`GPU_VERIFY.sh` with 3/3 anchors MATCH.
+
+**Open (recorded under P4-5)**: TQ1_0 (type 29) and IQ1_M (type 24) are not decoded, so
+UD-IQ2_XXS cannot be loaded. There is also no path that hands GGUF blocks straight to the GPU
+(the fp32 expansion -> Q4 repack leaves a large temporary expansion).
+
+### s124: production 8095 moved to 27B q4, startup scripted (2026-10-20, `0dee7e2` / `f0ae240` / `44c54b7`) done
+
+- `scripts/prod_serve_27b.sh` now lives in the repo and carries no host-specific paths. It runs
+  `serve local/qwen35-27b --port 8095 --host 0.0.0.0 --seed 42 --quant q4
+  --repetition-penalty 1.05 --temperature-cap 0.7` with `DENNO_KV_BUDGET_MB=10240` and an
+  8,192-token prefix cache.
+- 9B int8 (a single instance on this host) and 27B do not fit together, so 8095 always serves one
+  of them.
+- Hermes desktop uses provider `denno-27b` (anthropic_messages, `local/qwen35-27b`,
+  `context_length` 65,536). `f0ae240` fixes that: declaring 32,768 makes
+  `agent_init.py: _enforce_minimum_context` reject the model against
+  `MINIMUM_CONTEXT_LENGTH = 64_000` at startup (it did fail in practice). The desktop agent's
+  own model stays the external API; the 9B/27B models are registered as providers only.
+- `44c54b7` trimmed the KV budget from 12,288 to 10,240 MB and the prefix cache to 8,192 tokens
+  so that everything (including `DENNO_BATCH_SLOTS=4`) fits the budget.
+
+### s125: 27B VRAM grew request over request - instrumentation and breakdown (2026-10-20, diagnosis behind P4-6/P4-7)
+
+> Triggered by an operator report that GPU utilisation stayed pinned. Two different states were
+> mixed together. (1) During prefill 80-90% is normal (about 300 s for 11k tokens). (2) A request
+> that fell into `cuda chain failed (falling back to CPU)` after `cuMemAlloc error 2` kept running
+> at GPU 0% / CPU 63% for over 13 minutes and held its KV slot. The report was (2).
+
+**Instrumentation (all behind env gates, disabled by default, and committed)**: `DENNO_MEM_DBG`
+calls `cuMemGetInfo` and logs free VRAM on every alloc/free through `tracing`; `DENNO_MEM_BT`
+emits the six caller frames for allocations of 1 MiB or more; `#[track_caller]` adds
+`at=file:line`. The diagnostic code was kept on purpose so the next memory-shape bug can be
+chased immediately.
+
+**Getting the breakdown**: sum `alloc - free` per allocation size. Grow-only thread-local scratch
+is never freed, so that difference is exactly the resident amount. After a 3,020-token request it
+came to about 25 GB, of which about 16.7 GB is weights; the largest non-weight term was
+**128 allocations of 64 MiB = 8,192 MB**.
+
+**Isolation**: `RAYON_NUM_THREADS=1` does not change the residue (21,135 MiB at 3,020 tokens), so
+the cause is the n-sized buffers themselves, not the thread count.
+
+### s126: P4-6 - tile `q4_dispatch` over 256 rows so prefill workspace is bounded (2026-10-20, `76f2437`) done
+
+- Cause: `q4_dispatch` sized its `SCRATCH` (thread-local, grow-only) by `m = prompt length`, so
+  `(m*k + m*n)*4 B` stayed resident per thread for the life of the process.
+- Fix: split it into row tiles of `const Q4_M_TILE: usize = 256` with a new `q4_dispatch_tile`.
+  Rows are independent and the per-row operation order is unchanged, so the result is bit-exact.
+- A prompt guard `DENNO_MAX_PROMPT_TOKENS` (12,288 at the time) was added in the same change: it
+  rejects with a 400 instead of OOM-ing the engine into the CPU fallback.
+- Measured (27B q4, `vram_probe.py`):
+
+| prompt | before | after |
+|---|---|---|
+| 70 | 18,377 MiB | 18,377 MiB |
+| 3,020 | 21,505 MiB | 21,135 MiB (same with `RAYON_NUM_THREADS=1`) |
+| 10,820 | 32,073 MiB -> next request hit `cuMemAlloc error 2` and fell back to CPU | 28,387 MiB, two consecutive runs at 315.6 s / 306.1 s with no growth |
+
+- Tests: 246 lib tests + `cuda_q4_linear_matches_cpu` (m = 1/7/16/300), 3/3 anchors MATCH.
+- Open: about 0.9 MB/token still remained -> P4-7.
+
+### s127: P4-7 - allocate the GPU KV mirror per layer, recovering 6.8 GB at 10,820 tokens (2026-10-20, `42fbf3b`) done
+
+> The remaining 0.9 MB/token was not the GDN scan. `with_mirror_ext` allocated K/V mirror buffers
+> for **all** `n_layers` whenever the cap grew, so on 27B (64 layers = 48 GDN + 16 full) it kept
+> buffers for 48 layers that never write KV. The cap also rounded up with `next_power_of_two`,
+> reserving 16,384 rows for 10,880 tokens (1.51x).
+
+- Fix 1: growing the cap now only resets every layer's `len`; each layer's buffers are ensured
+  when that layer is used (grow-only).
+- Fix 2: `kv_mirror_cap` rounds up in 1,024-row steps, jumping straight to the requirement so a
+  single request never grows twice.
+- Fix 3: a layer whose buffer had to be re-allocated drops its `len` to 0, because `ensure`
+  allocates a new buffer and the old rows are gone (otherwise a stale `len` would seed only part
+  of the rows).
+- Measured (27B q4):
+
+| prompt | after P4-6 | after P4-7 |
+|---|---|---|
+| 70 | 18,377 MiB | 18,377 MiB |
+| 3,020 | 21,135 MiB | 19,471 MiB |
+| 10,820 | 28,387 MiB | **21,603 MiB** |
+| 21,620 | not measured | **24,497 MiB, 623.5 s, normal answer** |
+
+- The cap went from 12,288 to **32,768**. A 40,035-token request is rejected with a 400
+  (`prompt (40035 tokens) exceeds the 32768 limit`) and the next request returns 200 with `fox`,
+  so the engine survives.
+- What is left is about 0.27 MB/token (GDN scan ~0.11, qkv/rope chain ~0.07, the 16 full layers of
+  KV mirror). 32,768 tokens projects to about 27.5 GB. Reaching 64k needs the GDN scan and the
+  chain buffers chunked as well (64k is roughly 40 GB and does not fit).
+- Tests: 246 lib tests, 3/3 anchors MATCH (the KV mirror is also on the 9B anchor path, so this
+  check is mandatory).
+
+### Benchmark summary (as of 2026-10-20, this host)
+
+Measurement rule: the official prefill value is cold single-shot (server start -> one request,
+prefix cache off, alternating A/B). A warm second run is only used for relative comparison inside
+one session.
+
+| model / path | prefill | decode | VRAM | note |
+|---|---|---|---|---|
+| 9B int8 (production equivalent) | 13.18 s / 5,686 tokens = 431 tok/s (official), 13.61 s on this host | 16.4 ms/token | — | basis for the three anchors |
+| 27B int8 | — | 669 ms/token | 31,977 MiB | not usable |
+| 27B q4 (3,020 tokens) | 87.1 s = 34.7 tok/s | 178-186 ms/token | 19,471 MiB | after P4-7 |
+| 27B q4 (10,820 tokens) | 306.0 s = 35.4 tok/s | same | 21,603 MiB | after P4-7 |
+| 27B q4 (21,620 tokens) | 623.5 s = 34.7 tok/s | same | 24,497 MiB | after P4-7, near the cap |
+
+Numeric contract: only attention has an approved maxabs < 1e-3. GDN does not need bit-exactness.
+Q4_0 stays within R2 (relative 1e-4) of the CPU path - measured GEMV 9.5e-6, GEMM 0. Determinism
+is mandatory on every path.
 
 ## 4. Candidate List
 
