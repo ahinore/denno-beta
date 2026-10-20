@@ -222,9 +222,9 @@ pub const SPLIT_TABLES: usize = 3;
 /// 0 = decode chain (表 A) / 1 = prefill の線形ラッパ (表 B) / 2 = serve (q4) 経路 (表 C)
 pub const SPLIT_CHAIN_TABLE: usize = 0;
 pub const SPLIT_Q4_TABLE: usize = 1;
-/// s148: serve (q4) 経路の表 C。行数は `SPLIT_SERVE_N` (一番多い 16 行)。
+/// s148: serve (q4) 経路の表 C。行数は `SPLIT_SERVE_N` (s154 で 16 → 32 行)。
 pub const SPLIT_SERVE_TABLE: usize = 2;
-/// 表 1 本の行数の最大値 (表 C = 16 行 / 表 A = 9 行 / 表 B = 8 行)。積算器はこの本数で持つ。
+/// 表 1 本の行数の最大値 (表 C = 32 行 / 表 A = 9 行 / 表 B = 8 行)。積算器はこの本数で持つ。
 pub const SPLIT_ROWS: usize = SPLIT_SERVE_N;
 /// 積算器 (`split_flush_step` の `acc`) の本数 = 一番多い表の行数。
 /// s138 後半: 表 A が `chain_kernel` の 1 行を得て 9 行になったため、
@@ -517,7 +517,7 @@ const SPLIT_Q4_NAMES: [&str; SPLIT_Q4_N] = [
 /// (または call) の壁時計になる。`sl_other` は「上記のどれにも当たらなかった
 /// 残余」で、必ず実測残余 (全体 − 既知段の和) を入れる — 何も測っていない穴が
 /// 0 ms として静かに通らないようにするため。
-pub const SPLIT_SERVE_N: usize = 16;
+pub const SPLIT_SERVE_N: usize = 40;
 /// 表 C の開始は表 B の末尾 (詰め直しをしない — 過去ログとの位置関係を保つ)。
 pub const SPLIT_SERVE_FIRST: usize = SPLIT_Q4_FIRST + SPLIT_Q4_N;
 /// decode 1 ステップの全体 (engine の step 入口 → forward 戻り)。サーバは
@@ -555,6 +555,59 @@ pub const SL_STEP_SAMPLER: usize = SPLIT_SERVE_FIRST + 13;
 pub const SL_STEP_DETOK: usize = SPLIT_SERVE_FIRST + 14;
 /// ステップの残余 (上記のどれにも当たらない時間 = 未帰属)。
 pub const SL_STEP_OTHER: usize = SPLIT_SERVE_FIRST + 15;
+/// s154 (Task B15・計測のみ): `sl_step_lay_other` (層ループの投影以外) の内訳。
+/// 層あたり 1 回しか起きない段 (`rmsnorm` ×2 / `gdn_proj` / `gdn_scan` /
+/// `full_attn` ×4) は `calls` が steps × 層数 になるため、**表示は転記のみ**で
+/// COVERAGE の断言 (samples == steps) は per-step の段にだけ置く。
+///
+///   sl_lay_embed     ステップ入口の embed 行の複製 (1 step 1 回)
+///   sl_lay_norm_in   層頭の入力 rmsnorm (per layer)
+///   sl_lay_gdn_proj  GDN の 4 射影 (qkv / gate / beta / alpha を 1 区間)
+///   sl_lay_gdn_scan  GDN スキャン (conv + SSM・ここは**トークン逐次**の関数)
+///   sl_lay_full_qk   full 層の q/k/v 射影 (q4 GEMV)
+///   sl_lay_full_core full attention コア (qknorm + rope + KV 書き込み + attend)
+///   sl_lay_full_oproj full 層の o_proj
+///   sl_lay_ffn_gate  FFN の gate/up 射影
+///   sl_lay_swiglu    swiglu (ホスト f32)
+///   sl_lay_ffn_down  FFN の down 射影
+///   sl_lay_norm_post 層尾の post rmsnorm (= 次層の入力 norm)
+///   sl_lay_residual  残差加算 (attn 後 / FFN 後・ホスト f32)
+///   sl_lay_other     上記のどれにも入らない層ループの時間 (≈ 0 を期待する穴)
+///
+/// そして `sl_step_other` (59.0%) の名前:
+///
+///   sl_so_lin_sum     この step の間に `sl_lin` が積んだ分 (転記)
+///   sl_so_lin_d2h     ↑のうち D2H 段 (カーネルの完了待ちを吸収している)
+///   sl_so_sample_pen  サンプラ前の penalty + tool マスク (1 step 1 回)
+///   sl_so_stream      detok 後の delta / flush / stop 判定 (1 step 1 回)
+///   sl_so_logits     logits のホスト反映 (`lm_head` 終端 → 戻り値・1 step 1 回)
+///   sl_so_gap_fwd    forward 呼び出しの残り (1 step 1 回)
+///   sl_so_end        最後の forward の戻り → `step_end` (1 step 1 回)
+///   sl_so_resid      残余 = `sl_step_other` 全体 − 上の child の和 (1 step 1 回)
+pub const SL_LAY_EMBED: usize = SPLIT_SERVE_FIRST + 16;
+pub const SL_LAY_NORM_IN: usize = SPLIT_SERVE_FIRST + 17;
+pub const SL_LAY_GDN_PROJ: usize = SPLIT_SERVE_FIRST + 18;
+pub const SL_LAY_GDN_SCAN: usize = SPLIT_SERVE_FIRST + 19;
+pub const SL_LAY_FULL_QK: usize = SPLIT_SERVE_FIRST + 20;
+pub const SL_LAY_FULL_CORE: usize = SPLIT_SERVE_FIRST + 21;
+pub const SL_LAY_FULL_OPROJ: usize = SPLIT_SERVE_FIRST + 22;
+pub const SL_LAY_FFN_GATE: usize = SPLIT_SERVE_FIRST + 23;
+pub const SL_LAY_SWIGLU: usize = SPLIT_SERVE_FIRST + 24;
+pub const SL_LAY_FFN_DOWN: usize = SPLIT_SERVE_FIRST + 25;
+pub const SL_LAY_NORM_POST: usize = SPLIT_SERVE_FIRST + 26;
+pub const SL_LAY_RESIDUAL: usize = SPLIT_SERVE_FIRST + 27;
+pub const SL_LAY_OTHER: usize = SPLIT_SERVE_FIRST + 28;
+pub const SL_SO_LIN_SUM: usize = SPLIT_SERVE_FIRST + 29;
+pub const SL_SO_LIN_D2H: usize = SPLIT_SERVE_FIRST + 30;
+pub const SL_SO_SAMPLE_PEN: usize = SPLIT_SERVE_FIRST + 31;
+pub const SL_SO_STREAM: usize = SPLIT_SERVE_FIRST + 32;
+pub const SL_SO_LOGITS: usize = SPLIT_SERVE_FIRST + 33;
+pub const SL_SO_GAP_FWD: usize = SPLIT_SERVE_FIRST + 34;
+pub const SL_SO_END: usize = SPLIT_SERVE_FIRST + 35;
+pub const SL_SO_RESID: usize = SPLIT_SERVE_FIRST + 36;
+/// s154 (B15): 最終 norm + lm_head の**転記** (`sl_step_final` と同じ区間を
+/// 違う行に積む — `sl_step_final` の値は 1 bit も動かさない)。
+pub const SL_LAY_FINAL: usize = SPLIT_SERVE_FIRST + 37;
 
 /// 表 C の行名 (`SPLIT_SERVE_FIRST + i`)。並びは id の並びと一致させる。
 const SPLIT_SERVE_NAMES: [&str; SPLIT_SERVE_N] = [
@@ -574,6 +627,32 @@ const SPLIT_SERVE_NAMES: [&str; SPLIT_SERVE_N] = [
     "sl_step_sampler",
     "sl_step_detok",
     "sl_step_other",
+    // s154 (B15): 層ループの内訳 (calls = steps × 層の数)
+    "sl_lay_embed",
+    "sl_lay_norm_in",
+    "sl_lay_gdn_proj",
+    "sl_lay_gdn_scan",
+    "sl_lay_full_qk",
+    "sl_lay_full_core",
+    "sl_lay_full_oproj",
+    "sl_lay_ffn_gate",
+    "sl_lay_swiglu",
+    "sl_lay_ffn_down",
+    "sl_lay_norm_post",
+    "sl_lay_residual",
+    "sl_lay_other",
+    // s154 (B15): sl_step_other の内訳 (per step)
+    "sl_so_lin_sum",
+    "sl_so_lin_d2h",
+    "sl_so_sample_pen",
+    "sl_so_stream",
+    "sl_so_logits",
+    "sl_so_gap_fwd",
+    "sl_so_end",
+    "sl_so_resid",
+    "sl_lay_final",
+    "rsv_a",
+    "rsv_b",
 ];
 
 /// s148: 表 C の「全体」行と「内訳」行 (排他な内訳の和が全体になる組)。
@@ -1328,6 +1407,11 @@ pub fn push(op: usize, ns: u64, calls: u64) {
 /// COVERAGE の samples はこちらを読む (SPLIT_CALLS は全体行だと子の回数が混ざる)。
 static SL_TICKS: [[AtomicU64; SPLIT_SERVE_N]; Phase::N] = mk_counters::<SPLIT_SERVE_N>();
 
+/// s154 (Task B15): 表 C の段ごとの**閉じた号数** (`span_end` が `Some` を受けて
+/// 閉じた回数)。`sl_lay_embed` のように ns が 0 になりうる段でも「アダプタが
+/// 閉じたか」を判定できるように、ns の会計とは別に持つ (ns には足さない)。
+static SPLIT_END: [[[AtomicU64; SPLIT_ROWS]; SPLIT_TABLES]; Phase::N] = mk_counters2();
+
 #[cfg(test)]
 thread_local! {
     /// s151 (B12): 表 C のステップ入口 (`step_begin`) を開いたが `step_end` で
@@ -1352,7 +1436,18 @@ pub fn span_begin() -> Option<Instant> {
 #[inline]
 pub fn span_end(t: Option<Instant>, op: usize) {
     if let Some(t0) = t {
-        push(op, t0.elapsed().as_nanos() as u64, 1);
+        let ns = t0.elapsed().as_nanos() as u64;
+        push(op, ns, 1);
+        // s154 (Task B15): 区間を**閉じた**ことの号数。ns とは別に数える — 実機の
+        // 1 区間は数十 ns より長いが、合成時刻を使うテストでは 0 ns になりうる。
+        // COVERAGE が「アダプタが閉じたか」を ns で判定すると 0 ns の step で
+        // MISS になるので、閉じた号数をこちらで持つ (ns の会計には足さない)。
+        if serve_on() {
+            let Some((SPLIT_SERVE_TABLE, r)) = split_slot(op) else {
+                return;
+            };
+            SPLIT_END[phase().idx()][SPLIT_SERVE_TABLE][r].fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1369,10 +1464,61 @@ pub fn span_end_ns(ns: u64, op: usize) {
     push(op, ns, 1);
 }
 
-/// s148: 1 ステップ分の開始 (表 C の `sl_step` の tick)。戻り値の 2 番目は
-/// 「その時点で積まれていた内訳の和」— サーバは複数セッションを交互に 1 歩ずつ
-/// 進めるため、あるステップの壁時計には別セッションの区間が重なる。終端で
-/// 「自分が積んだ分」だけを引くための基準として使う。計測 OFF は `None`。
+/// s154 (Task B15): `SL_LIN` の累積 ns (フェーズ `p`)。`sl_so_lin_sum` の素材。
+#[inline]
+fn lin_sum_ns(p: usize) -> u64 {
+    serve_row_ns(p, SL_LIN)
+}
+
+/// s154 (Task B15): `sl_so_lin_sum` = **この step の間に sl_lin が積んだ分**。
+/// `step_begin` の控え (`SO_SNAP`) の `sl_lin` 入口値を引く。サーバは複数セッションを
+/// 交互に 1 歩ずつ進めるので、`sl_lin` の前 step までの累積をそのまま積むと
+/// 「この step の other」より転記行が大きくなりうる (恒等式が壊れて見える)。
+/// 控えが無い (step の外) ときは 0 を返す — 帰属先の step が無いので転記しない。
+#[inline]
+pub fn so_lin_sum_ns() -> u64 {
+    if !serve_on() {
+        return 0;
+    }
+    let p = phase().idx();
+    match SO_SNAP.with(|c| c.get()) {
+        Some(s) => lin_sum_ns(p).saturating_sub(s.lin0),
+        None => 0,
+    }
+}
+
+/// s154 (B15): `step_begin` の控え。`kids0` は実測の子 (`SL_SO_MEASURED`) 5 本の
+/// 累積 ns、`lin0` は `sl_lin` の累積 ns — どちらも「この step の間に増えた分」を
+/// 出すために引く。
+#[derive(Clone, Copy)]
+struct SoSnap {
+    kids0: u64,
+    lin0: u64,
+}
+
+thread_local! {
+    /// s154 (B15): この step の入口で控えた値 (子 5 本の累積と `sl_lin` の累積)。
+    static SO_SNAP: std::cell::Cell<Option<SoSnap>> = const { std::cell::Cell::new(None) };
+}
+
+/// s154 (Task B15): child 5 本の累積 ns (フェーズ `p`)。
+#[inline]
+fn so_measured_ns(p: usize) -> u64 {
+    SL_SO_MEASURED
+        .iter()
+        .map(|&op| serve_row_ns(p, op))
+        .sum()
+}
+
+/// s154 (Task B15): 1 ステップ分の開始 (表 C の `sl_step` の tick)。戻り値の 2 番目は
+/// 「その時点で積まれていた表 C の各行の和」— サーバは複数セッションを交互に 1 歩
+/// ずつ進めるため、あるステップの壁時計には別セッションの区間が重なる。終端で
+/// 「自分が積んだ分」だけを引くための基準として使う (s154 で `sl_step_other` の
+/// child も同じ 1 個の値に畳んだ)。計測 OFF は `None`。
+///
+/// s154 (Task B15): 併せて入口で child 5 本の累積を控える (`SO_SNAP`) — 実測の子は
+/// `step_end` の後にも 1 本 (`sl_so_end`) 来るので、入口の全体累積だけを基準にすると
+/// その 1 本が次の step の差分に紛れ込む。子ごとに 1 本なので控えとの差が正しい。
 #[inline]
 pub fn step_begin() -> Option<(Instant, u64)> {
     if !serve_on() {
@@ -1382,11 +1528,20 @@ pub fn step_begin() -> Option<(Instant, u64)> {
     SL_OPEN.with(|c| c.set(c.get() + 1));
     split_step_begin();
     let now = Instant::now();
-    let payload = SL_GROUPS[0]
-        .1
-        .iter()
-        .map(|&op| serve_row_ns(phase().idx(), op))
-        .sum();
+    // 表 C の全 40 行の ns の和 (既存の内訳 + s154 の層内 / other 内訳)。
+    let p = phase().idx();
+    let mut payload = 0u64;
+    for r in 0..SPLIT_SERVE_N {
+        payload += SPLIT_NS[p][SPLIT_SERVE_TABLE][r].load(Ordering::Relaxed);
+    }
+    // s154 (B15): この step の間の実測の子 (`SL_SO_MEASURED`) と `sl_lin` の増分を
+    // 切り分けるための控え。
+    SO_SNAP.with(|c| {
+        c.set(Some(SoSnap {
+            kids0: so_measured_ns(p),
+            lin0: lin_sum_ns(p),
+        }))
+    });
     Some((now, payload))
 }
 
@@ -1398,9 +1553,40 @@ fn step_open_count() -> i64 {
     SL_OPEN.with(|c| c.get())
 }
 
+/// s154 (Task B15): `sl_so_resid` (`sl_step_other` の実測残余) を出す段。これらは
+/// **実測の子**で、号数も `steps` と突き合わせる。`sl_so_lin_d2h` は転記 (線形呼び出し
+/// の中の D2H) なのでこの一覧には入れない — 転記行の号数は線形呼び出し数で決まり、
+/// step 数とは一致しない (実装は `SL_SO_MEASURED` を参照)。
+pub const SL_SO_MEASURED: [usize; 5] = [
+    SL_SO_SAMPLE_PEN,
+    SL_SO_STREAM,
+    SL_SO_LOGITS,
+    SL_SO_GAP_FWD,
+    SL_SO_END,
+];
+
+/// s154 (Task B15): `sl_step_other` の child 行 (残余 `sl_so_resid` を除く)。
+/// この step の間に child が積んだ ns = 末尾の和 − 入口の和 (`step_begin` の
+/// payload が入口の和で、`step_end` がその差を引く)。
+/// 線形段 (`sl_lin_launch` / `h2d` / `d2h` /
+/// `outalloc`) は `step_begin` の payload (表 C 全 40 行の和) に**既に含まれて
+/// いる**ので、末尾との差分は恒等的に 0 になる (入れても二重計上にはならないが、
+/// 会計に何も足さない)。`sl_so_lin_sum` は「この step で sl_lin が積んだ分」を
+/// そのまま積む転記行で、残余は「other 全体 − 下の 5 本」で出す。
+pub const SL_SO_CHILD_ROWS: [usize; 5] = [
+    SL_SO_SAMPLE_PEN,
+    SL_SO_STREAM,
+    SL_SO_LOGITS,
+    SL_SO_GAP_FWD,
+    SL_SO_END,
+];
+
 /// s148: 1 ステップ分の終了。`sl_step` に 1 サンプル積み、内訳で説明できなかった
 /// 分を `sl_step_other` へ**必ず**入れる (未帰属が 0 ms として静かに通らない)。
 /// `None` は素通し (計測 OFF は時刻も読まない)。
+///
+/// s154 (B15): `sl_step_other` の中を child に割ったので、残余
+/// (`sl_so_resid`) は「other 全体 − この step で child が積んだ分」で出す。
 #[inline]
 pub fn step_end(st: Option<(Instant, u64)>) {
     let Some((t0, payload0)) = st else { return };
@@ -1415,7 +1601,19 @@ pub fn step_end(st: Option<(Instant, u64)>) {
         .map(|&op| serve_row_ns(p, op))
         .sum();
     let own = payload1.saturating_sub(payload0);
-    push(SL_STEP_OTHER, ns.saturating_sub(own), 1);
+    let other = ns.saturating_sub(own);
+    push(SL_STEP_OTHER, other, 1);
+    // s154 (B15): 残余 = other 全体 − **この step の内側で来た実測の子**。
+    // 実測の子は 1 step 1 本で、`step_end` の後に来る `sl_so_end` は控えとの
+    // 差に現れない (次の step の入口で控え直す) — つまり `sl_so_end` は常に
+    // 前の step の `sl_step_other` に帰属し、その step の残余からは引かれない。
+    // 単調性 (`kids <= other`) は saturating で保つ。
+    let snap = SO_SNAP.with(|c| c.replace(None));
+    let kids_own = match snap {
+        Some(s) => so_measured_ns(p).saturating_sub(s.kids0),
+        None => 0,
+    };
+    push(SL_SO_RESID, other.saturating_sub(kids_own), 1);
 }
 
 /// s148: 表 C の `whole` 行と、その内訳の和との差 (ns)。負 (内訳が全体を超える =
@@ -1465,6 +1663,24 @@ pub fn serve_row_ticks(p: usize, op: usize) -> u64 {
         Some((SPLIT_SERVE_TABLE, r)) => SL_TICKS[p][r].load(Ordering::Relaxed),
         _ => 0,
     }
+}
+
+/// s154 (Task B15): 表 C の段が `span_end` で**閉じられた**号数 (フェーズ `p`)。
+/// ns とは独立なので、合成時刻テスト (0 ns) でも「アダプタが置いたか」が判る。
+#[inline]
+pub fn serve_row_ends(p: usize, op: usize) -> u64 {
+    match split_slot(op) {
+        Some((SPLIT_SERVE_TABLE, r)) => SPLIT_END[p][SPLIT_SERVE_TABLE][r].load(Ordering::Relaxed),
+        _ => 0,
+    }
+}
+
+/// s154 (Task B15): 表 C の「全体行」の実測号数 (steps / lin calls の分母)。
+/// `serve_expected` と `step_end` の残余計算が同じ量を読むために切り出した
+/// (s151 から `serve_expected` の内側にあった式そのもの)。
+#[inline]
+pub fn serve_ticks_for(p: usize) -> u64 {
+    serve_row_ticks(p, SL_STEP)
 }
 
 /// s148: 1 ステップ分の区間分けを開いた回数 (COVERAGE の「何 step の内訳を
@@ -1671,7 +1887,7 @@ pub fn lin_dispatch_calls(phase: Phase) -> u64 {
 ///   (3) `sl_lin` は **`sl_lin_other` と同じ期待** (= 線形呼び出し数) しか持たないため
 ///       per-row の MISS は出さない (両者は同じ push を共有する)。
 pub fn serve_expected(p: usize) -> Vec<(usize, usize, u64, &'static str)> {
-    let steps = serve_ticks(p);
+    let steps = serve_ticks_for(p);
     let lin = lin_dispatch_calls(phase_for(p));
     let is_decode = p == Phase::Decode.idx();
     let prep = if is_decode { 0 } else { serve_row_ticks(p, SL_STEP_PREP) };
@@ -1977,6 +2193,8 @@ pub fn reset() {
         // s151 (B12): 表 C の実測号数と線形の other 号数もフェーズごとにクリアする
         for r in 0..SPLIT_SERVE_N {
             SL_TICKS[p][r].store(0, Ordering::Relaxed);
+            // s154 (B15): `span_end` で閉じた号数 (COVERAGE の samples) も同じく。
+            SPLIT_END[p][SPLIT_SERVE_TABLE][r].store(0, Ordering::Relaxed);
         }
         LIN_OTHER_CALLS[p][0].store(0, Ordering::Relaxed);
         if p == Phase::Prefill.idx() {
@@ -2636,6 +2854,168 @@ fn push_coverage_for(p: usize, s: &mut String) {
             pct_of(serve_row_ns(p, row))
         ));
     }
+    // s154 (B15): `sl_step_lay_other` (層ループの投影以外) の内訳。ここが
+    // 40.3% の無名部分だった。層ごとの段は `expected` を `steps × layers` で出す
+    // (層数を出さないので "-" ではなく倍率だけを表示する)。
+    let lay_rows: [(usize, &'static str); 13] = [
+        (SL_LAY_EMBED, "step"),
+        (SL_LAY_NORM_IN, "layer"),
+        (SL_LAY_GDN_PROJ, "layer"),
+        (SL_LAY_GDN_SCAN, "layer"),
+        (SL_LAY_FULL_QK, "layer"),
+        (SL_LAY_FULL_CORE, "layer"),
+        (SL_LAY_FULL_OPROJ, "layer"),
+        (SL_LAY_FFN_GATE, "layer"),
+        (SL_LAY_SWIGLU, "layer"),
+        (SL_LAY_FFN_DOWN, "layer"),
+        (SL_LAY_NORM_POST, "layer"),
+        (SL_LAY_RESIDUAL, "layer"),
+        (SL_LAY_OTHER, "step"),
+    ];
+    let lay_sum: u64 = lay_rows
+        .iter()
+        .map(|&(op, _)| serve_row_ns(p, op))
+        .sum::<u64>()
+        + serve_row_ns(p, SL_LAY_FINAL);
+    let lay_other_ns = serve_row_ns(p, SL_STEP_LAYERS_OTHER);
+    // s154 (B15): 2 本はアダプタでは埋まらない — `sl_lay_embed` (実経路は
+    // forward ごとに 1 回で、サーバの step の外 = prefill / 補助 forward もある) と
+    // `sl_lay_other` (層ループの child の外 = 実測上 0 を期待する穴)。この 2 本は
+    // 「アダプタが閉じたか」だけを見る (号数の縛りを置かない)。
+    let adapter_only = [SL_LAY_EMBED, SL_LAY_OTHER];
+    for (op, unit) in lay_rows {
+        let name = split_row_name(SPLIT_SERVE_TABLE, op - SPLIT_SERVE_FIRST).unwrap_or("?");
+        // 層あたりの段は表示のみ (層数・層種別は呼び出し側が知らない。full 層が
+        // 0 本の step もあるので `steps × 層数` を期待値にはしない)。per-step の段
+        // (`sl_lay_final` のような 1 step 1 回) は `steps` と突き合わせる。
+        let exp = if unit == "step" { steps } else { 0 };
+        if exp > 0 && !adapter_only.contains(&op) {
+            // s154 (B15): 号数ではなく「`span_end` で閉じられたか」で判定する
+            // (合成時刻テストでは 1 区間が 0 ns になり、ns は 0 のまま)。
+            let ends = serve_row_ends(p, op);
+            if ends < exp {
+                misses.push(name);
+            }
+        }
+        s.push_str(&format!(
+            "  COVERAGE {:<18} {:>9} {:>9} {:>7} {:>10.1} {:>8.1}%\n",
+            name,
+            // s154 (B15): 閉じた号数 (ns が 0 でも区間は置かれている)。ns を積んだ
+            // 号数 (`serve_row_ticks`) と食い違うときは `ticks` として添える。
+            serve_row_ends(p, op),
+            if unit == "step" {
+                if adapter_only.contains(&op) {
+                    "-".to_string()
+                } else {
+                    exp.to_string()
+                }
+            } else {
+                format!("{steps}x{}", "layers")
+            },
+            if unit == "step" { "steps" } else { "layer" },
+            serve_row_ns(p, op) as f64 / 1e6,
+            pct_of(serve_row_ns(p, op))
+        ));
+    }
+    s.push_str(&format!(
+        "  COVERAGE {:<18} {:>9} {:>9} {:>7} {:>10.1} {:>8.1}%\n",
+        "sl_lay_final",
+        serve_row_ticks(p, SL_LAY_FINAL),
+        steps,
+        "steps",
+        serve_row_ns(p, SL_LAY_FINAL) as f64 / 1e6,
+        pct_of(serve_row_ns(p, SL_LAY_FINAL))
+    ));
+    // 層内の内訳の和 vs 親 (`sl_step_lay_other`)。s154 の計測点は層ループの
+    // 内側を全部覆うので、差は「層ループのうち child の外側」(≈ 0) だけになる。
+    s.push_str(&format!(
+        "  COVERAGE layer residual: children {} / lay_other {} ns over {} steps ({} ms/step, {:.1}%)\n",
+        lay_sum,
+        lay_other_ns,
+        steps,
+        if steps > 0 {
+            lay_other_ns as f64 / steps as f64 / 1e6
+        } else {
+            0.0
+        },
+        if lay_other_ns > 0 {
+            lay_sum as f64 / lay_other_ns as f64 * 100.0
+        } else {
+            0.0
+        }
+    ));
+    // s154 (B15): `sl_step_other` の child。**実測の子 5 本**は 1 step 1 回なので
+    // `steps` と突き合わせる (ここは弱めない)。`sl_so_resid` も 1 step 1 回だが、
+    // これは `step_end` の内側で `push` されるため、同じ関数から読む
+    // `serve_row_ends` では自分の step の終端より後に来る保証が無く
+    // 「ends >= steps」を満たせない — 号数は `serve_row_calls` (push の回数) で
+    // 見る。転記の 2 本 (`sl_so_lin_sum` / `sl_so_lin_d2h`) は線形呼び出しに比例
+    // するので期待値を置かず、値だけ出す (転記行の号数は step 数ではない)。
+    let step_other = serve_row_ns(p, SL_STEP_OTHER);
+    for (name, op) in [
+        ("sl_so_sample_pen", SL_SO_SAMPLE_PEN),
+        ("sl_so_stream", SL_SO_STREAM),
+        ("sl_so_logits", SL_SO_LOGITS),
+        ("sl_so_gap_fwd", SL_SO_GAP_FWD),
+        ("sl_so_end", SL_SO_END),
+    ] {
+        let ends = serve_row_ends(p, op);
+        if ends < steps {
+            misses.push(name);
+        }
+        s.push_str(&format!(
+            "  COVERAGE {:<18} {:>9} {:>9} {:>7} {:>10.1} {:>8.1}%\n",
+            name,
+            ends,
+            steps,
+            "steps",
+            serve_row_ns(p, op) as f64 / 1e6,
+            pct_of(serve_row_ns(p, op))
+        ));
+    }
+    // s154 (B15): `sl_so_resid` は `step_end` の中で `push` する残余行なので、
+    // 「閉じた号数」ではなく **積んだ号数** (`serve_row_calls`) を `steps` と比べる。
+    {
+        let calls = serve_row_calls(p, SL_SO_RESID);
+        if calls < steps {
+            misses.push("sl_so_resid");
+        }
+        s.push_str(&format!(
+            "  COVERAGE {:<18} {:>9} {:>9} {:>7} {:>10.1} {:>8.1}%\n",
+            "sl_so_resid",
+            calls,
+            steps,
+            "steps",
+            serve_row_ns(p, SL_SO_RESID) as f64 / 1e6,
+            pct_of(serve_row_ns(p, SL_SO_RESID))
+        ));
+    }
+    // 残余行 (`sl_so_resid`) と `sl_step_other` の恒等式: 残余 + 実測の子
+    // + 転記行 (lin_sum) が other に一致する。**ここは 0 許容で出す** — 実測の子は
+    // `step_end` の後に 1 本 (`sl_so_end`) 来るので、その分だけ other 側に先に
+    // 入っている step で差が出る (差の合計は steps のぶんだけ残る = 穴ではない)。
+    let resid_ns = serve_row_ns(p, SL_SO_RESID);
+    let kids_ns: u64 = SL_SO_MEASURED
+        .iter()
+        .map(|&op| serve_row_ns(p, op))
+        .sum();
+    let lin_sum = serve_row_ns(p, SL_SO_LIN_SUM);
+    s.push_str(&format!(
+        "  COVERAGE other residual: resid {} + kids {} + lin_sum {} = {} / other {} ns \
+         over {} steps ({} ms/step, diff {})\n",
+        resid_ns,
+        kids_ns,
+        lin_sum,
+        resid_ns + kids_ns + lin_sum,
+        step_other,
+        steps,
+        if steps > 0 {
+            resid_ns as f64 / steps as f64 / 1e6
+        } else {
+            0.0
+        },
+        (resid_ns + kids_ns + lin_sum) as i64 - step_other as i64
+    ));
     // 残余 (どの段にも入らなかった ms) と、全体 − 内訳の差
     let step_ns = serve_row_ns(p, SL_STEP);
     let step_other = serve_row_ns(p, SL_STEP_OTHER);
@@ -2946,6 +3326,35 @@ fn push_serve_section(phase: Phase, s: &mut String) {
             0.0
         }
     ));
+    // s154 (B15): `sl_step_other` (無名の 59%) の内訳を 4 スペース深く出す。
+    // 転記行 (lin_sum / lin_d2h) と実測行 (sample_pen / stream / logits / gap_fwd /
+    // end) と残余 (`sl_so_resid`) の和が `sl_step_other` に一致する。
+    let kid_rows: [(&str, usize); 8] = [
+        ("sl_so_lin_sum", SL_SO_LIN_SUM),
+        ("sl_so_lin_d2h", SL_SO_LIN_D2H),
+        ("sl_so_sample_pen", SL_SO_SAMPLE_PEN),
+        ("sl_so_stream", SL_SO_STREAM),
+        ("sl_so_logits", SL_SO_LOGITS),
+        ("sl_so_gap_fwd", SL_SO_GAP_FWD),
+        ("sl_so_end", SL_SO_END),
+        ("sl_so_resid", SL_SO_RESID),
+    ];
+    let step_other_ns = serve_row_ns(p, SL_STEP_OTHER);
+    for (name, op) in kid_rows {
+        let ns = serve_row_ns(p, op);
+        s.push_str(&format!(
+            "    {:<14} {:>10.1} {:>8} {:>7} {:>12.3}\n",
+            name,
+            ns as f64 / 1e6,
+            serve_row_ticks(p, op),
+            if step_other_ns > 0 {
+                format!("{:.1}%", ns as f64 / step_other_ns as f64 * 100.0)
+            } else {
+                "-".to_string()
+            },
+            per(ns)
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -4158,6 +4567,17 @@ mod tests {
             span_end(s, SL_STEP_SAMPLER);
             let d = span_begin();
             span_end(d, SL_STEP_DETOK);
+            // s154 (B15): `sl_step_other` の child (実経路は 1 step 1 回)。
+            for op in [
+                SL_SO_SAMPLE_PEN,
+                SL_SO_STREAM,
+                SL_SO_LOGITS,
+                SL_SO_GAP_FWD,
+                SL_SO_END,
+            ] {
+                let k = span_begin();
+                span_end(k, op);
+            }
             step_end(st);
         }
     }
@@ -4331,6 +4751,10 @@ mod tests {
             assert!(span_begin().is_none(), "計測 OFF なのに span_begin が時刻を読んだ");
             step_end(st);
             span_end(None, SL_STEP_SAMPLER);
+            // s154 (B15): 追加した段も OFF では行に 1 ns も入らない。
+            for op in [SL_LAY_GDN_SCAN, SL_LAY_FINAL, SL_SO_LIN_SUM, SL_SO_END] {
+                span_end(span_begin(), op);
+            }
             push(SL_STEP, 1_000, 1);
             count_lin_dispatch();
             add_request_wall(1_000);
@@ -4377,17 +4801,40 @@ mod tests {
         // decode
         set_phase(Phase::Decode);
         for _ in 0..steps {
+            // s154 (B15): 実経路の形を保つ — step 入口で embed と (前 step の lin を)
+            // 控え、内側に `sl_lin` / 層内の実測の子 / final を積み、`step_end` の
+            // **後**に `sl_so_end` を置く (エンジンは `step_end` で締めてから戻る)。
             let st = step_begin();
+            let emb = span_begin();
+            span_end(emb, SL_LAY_EMBED);
             serve_fixture_linear_call();
+            let v = span_begin();
+            span_end(v, SL_SO_LIN_SUM);
             let l = span_begin();
             span_end(l, SL_STEP_LAYERS_OTHER);
+            let ln = span_begin();
+            span_end(ln, SL_LAY_NORM_IN);
             let f = span_begin();
             span_end(f, SL_STEP_FINAL);
+            let ff = span_begin();
+            span_end(ff, SL_LAY_FINAL);
             let s = span_begin();
             span_end(s, SL_STEP_SAMPLER);
+            let sp = span_begin();
+            span_end(sp, SL_SO_SAMPLE_PEN);
             let d = span_begin();
             span_end(d, SL_STEP_DETOK);
+            // s154 (B15): 実経路の detok / delta / stop 判定 (`sl_so_stream`) と
+            // ホスト側の logits 反映 (`sl_so_logits`) も 1 step 1 本。
+            let ss = span_begin();
+            span_end(ss, SL_SO_STREAM);
+            let sl = span_begin();
+            span_end(sl, SL_SO_LOGITS);
+            let sg = span_begin();
+            span_end(sg, SL_SO_GAP_FWD);
             step_end(st);
+            let se = span_begin();
+            span_end(se, SL_SO_END);
         }
     }
 
@@ -4629,7 +5076,10 @@ mod tests {
                 .rev()
                 .find(|l| l.trim_start().starts_with("COVERAGE status:"))
                 .unwrap_or_else(|| panic!("COVERAGE status 行が無い\n{s}"));
-            let rel = s.lines().find(|l| l.contains("lin residual")).unwrap_or("NO RESIDUAL LINE");
+            let rel = s
+                .lines()
+                .find(|l| l.contains("layer residual"))
+                .unwrap_or("NO LAYER RESIDUAL LINE");
             assert!(
                 st.contains("all buckets have samples"),
                 "COVERAGE status が MISS のまま: {st}\nREL {rel}\n{s}"

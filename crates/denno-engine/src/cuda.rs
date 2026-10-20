@@ -2449,7 +2449,12 @@ pub fn chain_step_end() {
 /// 「どの sync からも取れなかった待ち」(`CHAIN_RESID`) は**待ち行**へ入れる —
 /// sync 区間の理解できない残余は発行ではなく待ちだから (排他の和は動かない)。
 fn chain_step_flush() {
-    let rows = CHAIN_ACC.with(|a| std::mem::take(&mut *a.borrow_mut()));
+    let rows = CHAIN_ACC.with(|a| {
+        let acc = &mut *a.borrow_mut();
+        let rows = *acc;
+        *acc = [0.0; crate::prof::SPLIT_ROWS];
+        rows
+    });
     let mut acc = rows;
     let resid = CHAIN_RESID.with(|c| c.replace(0.0));
     if resid > 0.0 {

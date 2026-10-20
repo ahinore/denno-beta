@@ -2808,6 +2808,39 @@ the cause is the n-sized buffers themselves, not the thread count.
   + other 22.7` holds. Per decode step (8.16-10.8 q4 linear calls/step) that is
   **about 2.1-2.8 ms/step** - the rest of the step sits in `sl_step_lay_other`.
 
+### s154: Task B15 - name the `sl_step_other` / `sl_step_lay_other` buckets (2026-10-21) done
+
+> By B14 the `sl_step` breakdown closed, but the largest unnamed buckets remained:
+> `sl_step_other` at 59.0%, and `sl_step_lay_other` at 40.3% inside it. B15 splits
+> both into children and adds 8 table-C rows plus 13 in-layer rows, as
+> **residual = parent minus measured children**.
+
+- **Table C (40 rows), layer residual children <= `sl_lay_other`**: everything in
+  the layer loop except the projections is split into
+  `sl_lay_norm_in` / `gdn_proj` / `gdn_scan` / `full_qk` / `full_core` / `full_oproj` /
+  `ffn_gate` / `swiglu` / `ffn_down` / `norm_post` / `residual`, and one COVERAGE line
+  (`layer residual: children ... / lay_other ... ns`) checks the per-layer sum does
+  not exceed the parent. Exceeding it means the spans are cut wrong.
+- **`sl_so_resid` = other minus measured children**: `step_end` pushes exactly one
+  sample of `other - (sample_pen + stream + logits + gap_fwd + end)`. The measured
+  children are the 5 rows in `SL_SO_MEASURED`, each once per step.
+- **Sample-count judgement**: the 5 children are checked by spans actually closed
+  (`serve_row_ends`) against `steps`. The residual row is pushed **inside**
+  `step_end`, so reading "closed spans" from the same function cannot guarantee it
+  lands after its own step's end and `ends >= steps` is unsatisfiable - so only the
+  residual is judged by push count (`serve_row_calls`). No new semantics added.
+- **Measurement sites**: `sl_so_logits` covers the q4 chain from the D2H return to
+  the logits return value (right after `D2H_LOGITS_COPY` in `model/qwen35.rs`);
+  `sl_so_stream` covers detok / delta emission / stop decisions in
+  `step_chat_batch_inner` (all three `continue` exits close it too). KV flush stays
+  measured by `D2H_KV_FLUSH` and is not double-counted into the children.
+- **Measurement only**: one branch at entry when `DENNO_PROFILE` is unset. No
+  `.cu` / `.ptx`, constant, or numeric-path change. lib: denno-engine 261 passed /
+  denno-server 37 passed, `cargo check --features cuda` 0 errors.
+- The 27B q4 decode numbers are left to the next GPU window. The split of
+  `sl_step_other` / `sl_step_lay_other` is **predicted-and-unmeasured** (the values
+  live in the commit message).
+
 ### Benchmark summary (as of 2026-10-20, this host)
 
 Measurement rule: the official prefill value is cold single-shot (server start -> one request,
