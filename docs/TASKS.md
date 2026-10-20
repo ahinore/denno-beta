@@ -393,9 +393,12 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   "日本の首都は**東京**です。" followed by a correct explanation that Japan has no explicit
   statutory capital. That reply stopped at `max_tokens=128` after 85.6 s = 669 ms/token, so
   27B decode is ~40x the 9B int8 rate and should not be used for chat without a budget.
-- Remaining, and it needs a decision: the 27B GPU anchors were never formally rebased after
-  the GQA fix (`1a4ea71a…` / `b4e58cb3…` predate it), and our standing 3-anchor set is 9B
-  only. Either add a 27B anchor pair or record that 27B is verified by answer only.
+- Anchors: **27B stays verified by answer only** (decided 2026-10-20). The two historical 27B
+  md5s (`1a4ea71a…` / `b4e58cb3…`) predate the GQA fix and are dropped rather than rebased:
+  the standing 3-anchor set is the 9B production model, GPU_VERIFY switches to it on a bare
+  launch, and adding a 27B arm would mean a second anchor protocol for a model that is not
+  the production target. Reproduce the 27B check with `p43_27b.sh` in the operator tools
+  directory if the GPU path needs re-confirming.
 
 ### P4-4: long-context regression test — CHECKER DONE (s98/s100), GPU_VERIFY wiring is a human step
 - Why: the 4,671-token needle test was a one-off during the s73 investigation.
