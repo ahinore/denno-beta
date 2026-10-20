@@ -159,6 +159,12 @@ impl Scheduler {
         self.in_flight.load(Ordering::SeqCst)
     }
 
+    /// s146 (B8-3): テスト用に「同時実行上限」の値を公開する (分類メッセージと
+    /// アサートの出所を 1 箇所にするため。値は不変)。
+    pub fn max_active_sessions() -> usize {
+        MAX_ACTIVE_SESSIONS
+    }
+
     /// 非ストリーミング生成をキューに入れる。満杯なら `QueueFull`。
     pub fn submit_chat(
         &self,
@@ -406,7 +412,9 @@ fn admit_job(
 ) {
     in_flight.fetch_add(1, Ordering::SeqCst);
     let mut run = build_run(engine, job);
-    if let Err(e) = admit(engine, &mut run) {
+    // s146: このジョブより先に KV を握っているセッション数 (分類の入力)
+    let live = active.len();
+    if let Err(e) = admit(engine, &mut run, live) {
         in_flight.fetch_sub(1, Ordering::SeqCst);
         if run.client_gone() {
             abort_disconnected(engine, run);
@@ -439,15 +447,176 @@ fn abort_disconnected(engine: &Arc<Mutex<Engine>>, mut run: Run) {
     tracing::info!("client disconnected; generation aborted");
 }
 
+/// s146 (B8-3 / P4-9): `install_session` 失敗のクライアント向け分類。
+///
+/// 旧コードは全失敗を文脈文字列 1 本 ("KVキャッシュスロットの取得に失敗") で
+/// 包んでいたため、クライアントは「容量不足 (待てば通る)」と「設定上限」
+/// 「内部異常」を区別できなかった。ここでは原因 (エンジン側メッセージ) を
+/// 見て 3 種に分ける:
+///
+/// | 分類 | 条件 | クライアントの取るべき行動 |
+/// |---|---|---|
+/// | `SlotsBusy` | engine の "no free KV cache slot (N slots)" | 実行中が終わるのを待って再試行 |
+/// | `SessionLimit` | 同時実行が MAX_ACTIVE_SESSIONS に達した (防御) | 実行中が終わるのを待って再試行 |
+/// | `Internal` | それ以外 (モデル未ロード・予算超過・未知のエラー) | 設定/ログを確認 (再試行で解決しない) |
+///
+/// 分類は既に Err で返ってきた失敗に対する **読み取りのみ** で、エンジンの
+/// 状態・数値経路には触れない。`install_session` は Err 時にスロットを
+/// 取得しないため、この時点の slot_busy 計数は「他リクエストが握っている数」
+/// と等しい。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitKind {
+    /// (a) 全 KV スロットが実行中リクエストに占有されている — 一時的な容量不足
+    SlotsBusy,
+    /// (b) 同時実行数が [`MAX_ACTIVE_SESSIONS`] に達した
+    SessionLimit,
+    /// (c) モデル未ロード・KV 予算超過など内部要因
+    Internal,
+}
+
+impl AdmitKind {
+    /// Anthropic Messages API の `error.type` に対応する文字列。
+    /// 容量系は 429/503 の rate limit 系、内部は api_error。
+    pub fn error_type(self) -> &'static str {
+        match self {
+            AdmitKind::SlotsBusy | AdmitKind::SessionLimit => "rate_limit_error",
+            AdmitKind::Internal => "api_error",
+        }
+    }
+}
+
+/// クライアントに返す分類済みの失敗。`Display` = クライアント向け本文、
+/// `source` = エンジン側の元エラー (tracing の原因連鎖で保持する)。
+///
+/// `anyhow::Error` として `send_error` まで運ばれるが、ハンドラは
+/// [`ApiError::from_anyhow`] で `downcast_ref` して HTTP ステータスと
+/// `error.type` を決める — 文字列マッチでステータスを決めない。
+#[derive(Debug)]
+pub struct AdmitFailure {
+    kind: AdmitKind,
+    message: String,
+    cause: anyhow::Error,
+}
+
+impl AdmitFailure {
+    fn new(kind: AdmitKind, message: String, cause: anyhow::Error) -> Self {
+        Self { kind, message, cause }
+    }
+
+    /// 分類する。`install_session` が返したエラー `e` を読み、エンジンの
+    /// 計数 (スロット数 / 使用中スロット数) を添えて本文を作る。
+    ///
+    /// `live` は「このワーカーが今 KV を握っているセッション数」— スケジューラの
+    /// `active.len()`。`slot_busy` は install 失敗時点ではまだ立っていないため
+    /// (エンジンは Err のときスロットを取らない)、busy 計数だけでは
+    /// 同時実行上限の判定ができない。呼び出し側 (worker) は自分の active 長を
+    /// 知っているのでそれを渡す。
+    pub fn classify(e: anyhow::Error, engine: &Engine, live: usize) -> Self {
+        let text = format!("{e:#}");
+        let slots = engine.slot_count();
+        // 報告用の使用中数: live (ワーカーが把握している常駐数) と
+        // エンジンの busy 計数の大きい方 (防御的に両方の観測を反映する)
+        let busy = engine.slot_busy_count().max(live).min(slots);
+        // engine.rs の枯渇エラーは "no free KV cache slot (N slots)"。
+        // 文字列はエンジン側の公開文言 (テスト slot_leak.rs も同じ語で判定)。
+        if text.contains("no free KV cache slot") {
+            return Self::new(
+                AdmitKind::SlotsBusy,
+                format!(
+                    "capacity: all {slots} KV cache slots are busy ({busy}/{slots} in use); \
+                     this request was not started. action: retry after an in-flight \
+                     request finishes, or raise the slot count (`{}={}`) and restart",
+                    denno_engine::engine::BATCH_SLOTS_ENV,
+                    slots
+                ),
+                e,
+            );
+        }
+        // 防御: ハンドラとワーカーの間で状態がずれた場合 (スロットが空いていても
+        // 同時実行上限に達している)。枯渇文言以外の失敗でも、常駐数が上限に
+        // 達していればクライアントの取るべき行動は「待って再試行」で同じ。
+        if live >= MAX_ACTIVE_SESSIONS {
+            return Self::new(
+                AdmitKind::SessionLimit,
+                format!(
+                    "capacity: concurrent request limit reached \
+                     (MAX_ACTIVE_SESSIONS = {MAX_ACTIVE_SESSIONS}, {busy}/{slots} slots in use); \
+                     this request was not started. action: retry after an in-flight \
+                     request finishes, or raise the slot count (`{}={}`) and restart",
+                    denno_engine::engine::BATCH_SLOTS_ENV,
+                    slots
+                ),
+                e,
+            );
+        }
+        let cause_text = text;
+        Self::new(
+            AdmitKind::Internal,
+            format!(
+                "internal: request could not be admitted (model loaded = true, \
+                 {busy}/{slots} KV slots in use); retrying will not help. \
+                 action: check the server log and the KV/session settings \
+                 (cause: {cause_text})"
+            ),
+            e,
+        )
+    }
+
+    pub fn kind(&self) -> AdmitKind {
+        self.kind
+    }
+
+    /// クライアントに返す 1 行本文。
+    pub fn client_message(&self) -> &str {
+        &self.message
+    }
+
+    /// `anyhow::Error` へ戻す (スケジューラ / ハンドラと同じ運び方をするため)。
+    /// downcast で分類 (kind) を取り出せる状態を保つ。
+    pub fn into_anyhow(self) -> anyhow::Error {
+        anyhow::Error::new(self)
+    }
+
+    /// 元のエラー (エンジン側の原因) の全文。ログ用。`send_error` が
+    /// `{e:#}` で記録する内容と同じ連鎖を、分類器の単体テストからも読める。
+    pub fn cause_chain(&self) -> String {
+        format!("{:#}", self.cause)
+    }
+}
+
+impl std::fmt::Display for AdmitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AdmitFailure {
+    /// 原因 (エンジン側エラー) を **そのまま** 返す。`self.cause.source()` を
+    /// 返すと、原因自身が source を持たない場合に連鎖が丸ごと消える
+    /// (`{e:#}` にエンジン原文が残らなくなる — s146 で実測)。
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
 /// セッションを live にする (install) + 初回なら SSE プリアンブルを送る。
-fn admit(engine: &Arc<Mutex<Engine>>, run: &mut Run) -> Result<()> {
+fn admit(engine: &Arc<Mutex<Engine>>, run: &mut Run, live: usize) -> Result<()> {
     if let Some(e) = run.error.take() {
         return Err(e);
     }
     {
         let mut g = engine.lock().unwrap();
-        g.install_session(run.sess.as_mut().unwrap())
-            .map_err(|e| e.context("KVキャッシュスロットの取得に失敗"))?;
+        let sess = run.sess.as_mut().unwrap();
+        if let Err(e) = g.install_session(sess) {
+            // s146 (B8-3): install_session の失敗を **分類してから** 返す。
+            // 旧コードはここで `e.context("KVキャッシュスロットの取得に失敗")` を
+            // 付けていたため、クライアントが見る先頭文字列が汎用プレフィクスになり、
+            // 本来の原因 (engine.rs の "no free KV cache slot (N slots)") が
+            // その後ろに埋もれていた。分類は計数用の再計算のみで、エンジンの
+            // 状態・数値には一切触れない (install_session は Err 時に slot を取らない)。
+            // `live` はこの時点の active 長 (= 今 KV を握っているセッション数)。
+            return Err(AdmitFailure::classify(e, &g, live).into());
+        }
     }
     if run.events.is_some() && !run.started {
         run.started = true;
@@ -525,15 +694,22 @@ fn finish_run(run: Run) {
 }
 
 /// セッションをエラーで終わらせる (respond or SSE error イベント)。
+///
+/// s146 (B8-3): クライアント向け本文 (`{e}`) とログ用の全文 (`{e:#}`) を
+/// 分ける。`AdmitFailure` の `Display` は分類済みの 1 行だけを返すため、
+/// ログ側は `{e:#}` (cause 連鎖 — エンジン原文 "no free KV cache slot
+/// (N slots)" 等) を必ず別途記録し、診断情報を落とさない。
 fn send_error(run: &mut Run, e: anyhow::Error) {
-    tracing::error!("chat failed: {e:#}");
+    let detail = format!("{e:#}");
+    let client_msg = format!("{e}");
+    tracing::error!("chat failed: {detail}");
     if let Some(respond) = run.respond.take() {
         let _ = respond.send(Err(e));
     } else if let Some(events) = run.events.take() {
         // エラーは error イベントで通知して閉じる
         let _ = events.blocking_send(Ok(to_event(&json!({
             "type": "error",
-            "error": {"type": "api_error", "message": format!("{e:#}")}
+            "error": {"type": "api_error", "message": client_msg}
         }))));
     }
 }
