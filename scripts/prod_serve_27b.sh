@@ -20,10 +20,16 @@ sleep 2
 
 export HOME=/work/denno-beta/data DENNO_CUDA=1
 unset DENNO_PROFILE
-# 単独利用のデスクトップ用途なので同時セッションは 4 本に絞り、
-# 余った KV 予算を prefix cache (32k token = 4.3 GB) に回す。
+# メモリ配分 (32,607 MiB のカード): 重み 16.7 GB + 基礎 1.7 GB + KV 10.0 GB +
+# prefix cache 1.05 GB = 29.5 GB で、prefill の一時バッファ用に約 3 GB を残す。
+# 12,288 MB の既定予算 + 32k token の prefix cache だと 32,073 MiB まで膨らみ、
+# 続くリクエストが cuMemAlloc error 2 で CPU フォールバックに落ちた (2026-10-20 実測)。
+export DENNO_KV_BUDGET_MB=10240
+export DENNO_PREFIX_CACHE_MAX_TOKENS=8192
+# クライアント都合の中断 (curl -m / アプリ側キャンセル) でスロットが busy のまま
+# 残ることがあるため、単独利用でも 4 本持っておく。2 本だと中断 2 回で
+# "no free KV cache slot" になる。
 export DENNO_BATCH_SLOTS=4
-export DENNO_PREFIX_CACHE_MAX_TOKENS=32768
 
 exec ./target/bin_canonical serve local/qwen35-27b --port 8095 --host 0.0.0.0 \
   --seed 42 --quant q4 --repetition-penalty 1.05 --temperature-cap 0.7
