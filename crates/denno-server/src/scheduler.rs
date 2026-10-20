@@ -411,6 +411,16 @@ fn admit_job(
         if run.client_gone() {
             abort_disconnected(engine, run);
         } else {
+            // s144 (B8-1): `admit` は install (スロット取得) の **後** にも失敗しうる
+            // (SSE プリアンブルの送信失敗など)。旧コードはこの経路で send_error だけを
+            // 行い、取得済みスロットの busy フラグを立てたまま返していた。そのため
+            // 中断されたリクエストが数回続くと全スロットが busy で残り、健全なサーバでも
+            // 以後の全リクエストが "no free KV cache slot" で失敗した
+            // (DENNO_BATCH_SLOTS=4 が回避策として効いたのはこれが理由)。
+            // `release_session` は slot 未取得なら no-op なので、全経路で呼んでよい。
+            if let Some(sess) = run.sess.as_mut() {
+                engine.lock().unwrap().release_session(sess);
+            }
             send_error(&mut run, e);
         }
     } else {
