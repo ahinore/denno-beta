@@ -558,6 +558,45 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   device-resident state (`GDN_STATE`, the s89 scaffolding, still unused) and a GEMV
   rewrite, not more tuning of the current kernels.
 
+### P4-11: GDN state stays on the device - DONE (main session, 2026-10-20)
+- Scope: the biggest decode item left over from P4-10. `gdn_scan_impl` and
+  `gdn_scan_chunked_impl` uploaded the conv / ssm state from the host and downloaded
+  the result back for every layer of every token: 647 KB each way, six synchronous
+  copies per layer, 50.8 ms/token on 27B q4.
+- `GdnStateCache` (the s89 scaffolding) is now the authoritative copy:
+  - `gdn_state_begin(kv, li, ...)` returns the device pointers for the layer and seeds
+    them from `KvCache::gdn` only once, when the layer is not known to be in sync.
+  - `gdn_state_commit(li, ...)` copies `conv_out` / `ssm_out` back with
+    `cuMemcpyDtoDAsync`; nothing crosses the bus in the steady state.
+  - `gdn_state_take(kv, li)` brings one layer back to the host (snapshot, reset,
+    CPU fallback) and invalidates it, so the next scan re-seeds from the host.
+  - The cache is keyed by the KV-cache id as well as the layer. Slots are reused and
+    the first id is 0, so the key is `Option<u64>`, not `u64` with 0 as "unused".
+  - Layer vectors resize on first use (`touch_layer`): the layer count is only known
+    when the first GDN layer runs.
+- Three bugs surfaced while landing it, each caught by the anchor suite:
+  1. Chunked pass 3 still read the scratch `conv_in`, which the device-resident path no
+     longer fills, so the last chunk's conv history was stale. It now reads the state
+     buffer.
+  2. The decode chain (`chain_q35_gdn_scan`) seeds its own mirror from the *host* state
+     when its position jumps. With the host no longer updated by the scan, that seed
+     read a stale value and every anchor text changed (deterministically, so it looked
+     like a contract violation rather than a race). It now seeds through
+     `gdn_state_take`, falling back to the host only when the device has no valid copy.
+  3. `attach_gdn_slot` replaced host state without invalidating the device copy.
+- `DENNO_GDN_DEVSTATE=0` restores the old host round-trip for bisecting; the default is
+  the device-resident path. With it set, the three anchors reproduce the s130 hashes
+  exactly, which is what proved the plumbing itself is numerically neutral.
+- Measured (27B q4, `DENNO_PROFILE=1`, prefix cache off, `bin_canonical` = candidate):
+  | stage | prefill 3,020 tok | decode, 128 tok |
+  |---|---|---|
+  | P4-10 (48b3a2b) | 36.9 s (82 tok/s) | 152.7 ms/token |
+  | P4-11 device state | 36.3 s (83 tok/s) | 126.7-126.8 ms/token |
+  Anchor suite 3/3 MATCH. VRAM after one request 19,669 MiB (19,473 before), i.e. the
+  48-layer state costs about 200 MiB including allocation granularity.
+- Next decode lever is unchanged: `gate_up_proj` runs at about 2.4 GB/s effective and
+  needs a GEMV rewrite; with 126.7 ms/token it is now a larger share of the step.
+
 ## P5 — tooling and ops
 
 ### P5-1: dashboard shows cold A/B and decode — DASHBOARD DONE (s109), era wired in (s110), GPU run is a human step

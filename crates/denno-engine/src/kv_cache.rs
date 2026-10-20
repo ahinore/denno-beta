@@ -60,9 +60,33 @@ impl KvCache {
     pub fn attach_gdn_slot(&mut self, layer: usize, conv_len: usize, ssm_len: usize) {
         assert!(layer < self.n_layers);
         self.gdn[layer] = Some((vec![0.0; conv_len], vec![0.0; ssm_len]));
+        // s131: ホストの状態を差し替えた → デバイス正本は捨てる
+        #[cfg(feature = "cuda")]
+        crate::cuda::gdn_scan_state_invalidate();
     }
 
     /// GDN 層の状態 (conv バッファ, SSM 行列) への可変参照。
+    /// s131: デバイス正本の GDN 状態をホストへ戻す。ホストの `gdn` を読む
+    /// (スナップショット / reset / CPU フォールバック) 直前に必ず呼ぶ。
+    pub fn flush_gdn_device_state(&mut self) {
+        #[cfg(feature = "cuda")]
+        {
+            for i in 0..self.gdn.len() {
+                if self.gdn[i].is_none() {
+                    continue;
+                }
+                if let Some((conv, ssm)) = crate::cuda::gdn_state_take(self.kv_id(), i) {
+                    if let Some((hc, hs)) = self.gdn[i].as_mut() {
+                        if hc.len() == conv.len() && hs.len() == ssm.len() {
+                            hc.copy_from_slice(&conv);
+                            hs.copy_from_slice(&ssm);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn gdn_state_mut(&mut self, layer: usize) -> Option<(&mut [f32], &mut [f32])> {
         match &mut self.gdn[layer] {
             Some((c, s)) => Some((c.as_mut_slice(), s.as_mut_slice())),
@@ -91,6 +115,7 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.len = 0;
         self.bump_epoch();
+        self.flush_gdn_device_state();
         for g in self.gdn.iter_mut().flatten() {
             g.0.fill(0.0);
             g.1.fill(0.0);
