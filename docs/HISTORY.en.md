@@ -2291,6 +2291,53 @@ gate is `bash scripts/run_cpu_checks.sh` = **`RESULT: PASS (all 11 stages)`**, w
 inside matching the baseline: `denno-engine --lib` 240 passed / 1 ignored, `denno-server` 77
 passed, `kernel_invariants` 11 passed.
 
+### s118: why the P1-2 candidate 4 key-range truncation is **not** numerically invariant (no commit)
+
+The idea was to start `dno_attention_prefill`'s tile loop at `jstart = floor((pos0+i0)/PF_BK)*PF_BK`
+instead of 0, since every row of block `b` should only need keys `j <= pos0+i`. Reading the kernel
+showed that assumption is false for this kernel: **`jend = min(t_total, pos0+i0+PF_BQ)` does not
+depend on `n`, while the scores still read the K/V mirror for every `j < t_total`** (`:407-408`,
+`:425-426`). Whenever `t_total` exceeds `pos0+i0+PF_BQ` — the tail block of any prefill where more
+keys exist after this block — the kernel deliberately computes a `PF_BQ x PF_BQ` screen **past the
+block's causal frontier**. (Both call sites use `t_total = pos0 + n`, one block per 64 rows, so for
+a single request the screen only exists in the tail block; the structure is still general enough
+that any caller passing a longer `t_total` — the prefix-cache shape — would rely on it even more.)
+
+Those pairs are masked to `-INFINITY`
+so they cannot change a row's output — nor this tile's `m`, which `fmaxf` takes over all
+`PF_BQ*PF_BK` scores. What they **do** decide is the representability of `acc`, the online-softmax
+accumulator: over their preceding tiles a row accumulates `acc = sum_j exp(s_j - m_run)` with all
+`exp <= 1` (32 masked columns -> ~32), and the FMA rounding unit left afterwards is `2^-23 * acc`.
+Because `m_run` never exceeds the row's true max, every later tile adds terms `exp(s - m_new) <= 1`,
+so a front-loaded `acc` keeps those small terms instead of losing them to the smallest bit.
+Per row (not per run): when `pos0+i0` is not a multiple of 8, the truncated kernel's first tile is
+a *partial* diagonal tile, so a row whose frontier falls in it sees fewer valid columns before its
+max. Example `pos0=0, i0=64` (`jstart=64`), row 64: HEAD's first processed tile is `[0,8)` with 8
+valid columns (the row's own 64,67,70,... arrive later); truncated, the first tile is `[64,72)`
+where only `j=64` is valid, so the pre-max column count drops from 8 to 1 - a different `l`
+summation. With `pos0+i0` a multiple of 8 (the entire `pos0=0` cold payload, `i0 = 64b`) the
+structure is identical.
+This is the *only* separation, so it is worth stating exactly how large it is: it needs `d=255` (one
+specific output column) to be a **cancelling dot product** whose accumulated ~`32*(639/640) ~ 32`
+reduces to an O(1) quotient, which then shows up on that row at ~`2^-23` relative. Measured scale:
+a verdict-flipping effect would need to clear the `1e-3` R3 threshold on the attention output, so
+R3 cannot see this; the 1e-7-relaxed `GPU_VERIFY` anchor md5 can, but only if a magnitude-32
+intermediate cancels to near zero first. Because that cancellation is a property of the weights,
+not something derivable by static analysis, **the honest summary is that the change may be
+numerically identical in practice but cannot be proven invariant in the container** — and the
+handler's rule is "if the mask path returning exactly 0 cannot be shown in code, stop with numbers".
+The mask path itself is proven (see `REPORT_NEXT.md`), but "masked column contributes exactly
+`+0.0f`" is one step short of "its absence gives the same bits".
+
+Tail row `r=63` (`n=2843`, `t_total=2843`) is the worst case: 8 rows per pass see a frontier tile
+holding exactly 1 valid column, and their `l_run` changes from "9 columns before the max" to "2".
+That moves the summation order of the 2843-term `l`, i.e. it changes `l_run` itself — not only `acc`.
+No kernel, PTX, host or test change was made; `kernels_elem.cu` is identical to HEAD.
+
+On the same reading, the s117 "45 blocks" figure for the 5,686-token payload is wrong: `n=5686`
+with `PF_BQ=64` is **89 blocks** (10 padding rows). The tile count is recomputed in
+`REPORT_NEXT.md` for the record.
+
 **Human steps (what is not measured)**: the repository holds no real A/B JSON and this container
 has no GPU, so **no dashboard of real data exists yet**. On a GPU host, after each cold A/B run,
 collect `python3 scripts/cold_ab.py --old <old> --new <new> --json <dir>/s110_<build>.json --era s110`
