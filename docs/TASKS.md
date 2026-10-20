@@ -526,6 +526,38 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 - Note: this is why 9B long contexts never worked either - the wasted mirror was sized
   by layer count, not by prompt.
 
+### P4-10: Q4 prefill GEMM micro-tile and GDN state reuse - DONE (main session, 2026-10-20)
+- Scope: 27B q4 is the production model on 8095. Prefill sat at 34 tok/s and decode at
+  178-186 ms/token, which is what made a long Hermes turn feel slow.
+- `dno_gemm_q4_0` (`kernels_int8.cu`) had one thread per (row, 16-column group): 32 FMA
+  per 20 shared loads, and its `sB[Q4_GN][32]` staging row was 32 floats wide, so every
+  lane of a warp touched the same shared bank (32-way conflict).
+- Two changes, both order preserving:
+  1. `sB[Q4_GN][33]` (+1 pad) with the column assignment `col = tx + 16 * v`, so the
+     shared address spreads over banks instead of repeating `c mod 32`.
+  2. A 4-row x 8-column micro-tile per thread: 256 threads cover 64 rows x 128 columns
+     per block, 12 loads per 32 FMA (0.375 against 0.625 before). Shared memory 25 KB.
+- The accumulation order is untouched (ascending `b`, then `c` inside each 32-element
+  block), so the GPU GEMM stays bit-identical to the CPU reference: the ignored GPU test
+  reports `q4 m=300: maxabs=0e0` while the GEMV sizes stay at 4.8e-6 / 7.6e-6 / 9.5e-6.
+- Decode: `gdn_scan_impl` allocated 13 device buffers for every layer of every token.
+  It now borrows the thread-local `GDN_SCRATCH` that the chunked path already used, and
+  the `conv_out` / `ssm_out` zero fill moved from a host `Vec` upload to
+  `cuMemsetD32Async` (`DevBuffer::fill_zero`).
+- Measured (27B q4, cold single request, prefix cache off, `vram_probe.py 300`):
+  | stage | prefill 3,020 tok | decode, 128 tok warm |
+  |---|---|---|
+  | baseline (c51d6a3) | 93.3 s (32 tok/s) | 186 ms/token |
+  | bank padding + micro-tile | 43.4 s cold / 36.7 s warm (82 tok/s) | - |
+  | + GDN buffer reuse | 36.9 s | 169.9 ms/token |
+  | + device zero fill | 36.9 s | 152.7 ms/token |
+- Next decode levers, from the same profile: `d2h_state` is still 50.8 ms/token because
+  the GDN state round-trips host and device for every layer of every token (647 KB each
+  way, six synchronous copies per layer), and `gate_up_proj` is 41 ms/token at about
+  2.4 GB/s effective, i.e. latency bound rather than bandwidth bound. Both need the
+  device-resident state (`GDN_STATE`, the s89 scaffolding, still unused) and a GEMV
+  rewrite, not more tuning of the current kernels.
+
 ## P5 — tooling and ops
 
 ### P5-1: dashboard shows cold A/B and decode — DASHBOARD DONE (s109), era wired in (s110), GPU run is a human step
