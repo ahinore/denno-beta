@@ -78,6 +78,76 @@ enum Commands {
     },
 }
 
+/// s156: `denno info` の設定解決結果 (テスト可能にするため main から切り出し)
+struct ModelInfo {
+    family: String,
+    layers: u64,
+    hidden: u64,
+    vocab: u64,
+    context: u64,
+}
+
+/// s156: マルチモーダル wrapper の config.json では言語モデルの次元が
+/// 入れ子の "text_config" 等に入っている。探索順は text_config / llm_config /
+/// language_config / トップレベル。u64 以外 (欠落・0 以外の型) は次へ送る。
+const NESTED_CONFIG_KEYS: [&str; 3] = ["text_config", "llm_config", "language_config"];
+
+fn info_lookup_u64(cfg: &serde_json::Value, key: &str) -> Option<u64> {
+    NESTED_CONFIG_KEYS
+        .iter()
+        .filter_map(|k| cfg.get(*k))
+        .chain(std::iter::once(cfg))
+        .find_map(|obj| obj.get(key).and_then(|v| v.as_u64()))
+}
+
+fn info_lookup_str<'a>(cfg: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    NESTED_CONFIG_KEYS
+        .iter()
+        .filter_map(|k| cfg.get(*k))
+        .chain(std::iter::once(cfg))
+        .find_map(|obj| obj.get(key).and_then(|v| v.as_str()))
+}
+
+/// 既存のフラットな別名 (n_layer / n_embd / n_ctx) も維持する
+fn info_dims(cfg: &serde_json::Value) -> ModelInfo {
+    ModelInfo {
+        family: info_lookup_str(cfg, "model_type").unwrap_or("?").to_string(),
+        layers: info_lookup_u64(cfg, "num_hidden_layers")
+            .or_else(|| info_lookup_u64(cfg, "n_layer"))
+            .unwrap_or(0),
+        hidden: info_lookup_u64(cfg, "hidden_size")
+            .or_else(|| info_lookup_u64(cfg, "n_embd"))
+            .unwrap_or(0),
+        vocab: info_lookup_u64(cfg, "vocab_size").unwrap_or(0),
+        context: info_lookup_u64(cfg, "max_position_embeddings")
+            .or_else(|| info_lookup_u64(cfg, "n_ctx"))
+            .unwrap_or(0),
+    }
+}
+
+/// s156: repo 引数が実在のディレクトリならそこを直接見る (hub cache 不要)。
+/// そうでなければ従来どおりの hub cache 経路 (エラー文言も従来どおり)。
+fn resolve_model_dir(repo: &str) -> Result<PathBuf> {
+    let direct = PathBuf::from(repo);
+    if direct.is_dir() {
+        return Ok(direct);
+    }
+    let dir = model_dir(repo);
+    if !dir.exists() {
+        bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
+    }
+    Ok(dir)
+}
+
+/// s156: `<dir>/config.json` を読む。無い/壊れている場合は panic せず clean な Err。
+fn read_config(dir: &std::path::Path) -> Result<serde_json::Value> {
+    let cfg_path = dir.join("config.json");
+    let file = std::fs::File::open(&cfg_path)
+        .with_context(|| format!("config.json を開けません: {}", cfg_path.display()))?;
+    serde_json::from_reader(file)
+        .with_context(|| format!("config.json を解釈できません: {}", cfg_path.display()))
+}
+
 pub fn cache_root() -> PathBuf {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
@@ -123,18 +193,15 @@ fn main() -> Result<()> {
             }
         }
         Commands::Info { repo } => {
-            let dir = model_dir(&repo);
-            if !dir.exists() {
-                bail!("not cached: {} (run `denno pull {}` first)", dir.display(), repo);
-            }
-            let cfg: serde_json::Value = serde_json::from_reader(std::fs::File::open(dir.join("config.json"))?)?;
+            let dir = resolve_model_dir(&repo)?;
+            let cfg = read_config(&dir)?;
+            let info = info_dims(&cfg);
             println!("repo:      {}", repo);
-            println!("family:    {}", cfg["model_type"].as_str().unwrap_or("?"));
-            println!("layers:    {}", cfg["num_hidden_layers"].as_u64().unwrap_or(cfg["n_layer"].as_u64().unwrap_or(0)));
-            println!("hidden:    {}", cfg["hidden_size"].as_u64().unwrap_or(cfg["n_embd"].as_u64().unwrap_or(0)));
-            println!("vocab:     {}", cfg["vocab_size"].as_u64().unwrap_or(0));
-            let ctx = cfg["max_position_embeddings"].as_u64().unwrap_or(cfg["n_ctx"].as_u64().unwrap_or(0));
-            println!("context:   {}", ctx);
+            println!("family:    {}", info.family);
+            println!("layers:    {}", info.layers);
+            println!("hidden:    {}", info.hidden);
+            println!("vocab:     {}", info.vocab);
+            println!("context:   {}", info.context);
             let index_path = dir.join("model.safetensors.index.json");
             let st_path = dir.join("model.safetensors");
             if index_path.exists() {
@@ -249,4 +316,150 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// temp_dir 配下に一意なディレクトリを作る (drop で削除)
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "denno_cli_info_{}_{}_{}",
+                tag,
+                std::process::id(),
+                nanos
+            ));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            TempDir { path }
+        }
+
+        fn write_config(&self, body: &str) -> PathBuf {
+            let p = self.path.join("config.json");
+            let mut f = std::fs::File::create(&p).expect("create config.json");
+            f.write_all(body.as_bytes()).expect("write config.json");
+            p
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    const QWEN3_5_WRAPPER: &str = r#"{
+        "model_type": "qwen3_5",
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "image_token_id": 248056,
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "num_hidden_layers": 64,
+            "hidden_size": 5120,
+            "vocab_size": 248320,
+            "max_position_embeddings": 262144
+        },
+        "vision_config": {"depth": 27, "hidden_size": 1152}
+    }"#;
+
+    const FLAT_LLAMA: &str = r#"{
+        "model_type": "llama",
+        "num_hidden_layers": 32,
+        "hidden_size": 4096,
+        "vocab_size": 128256,
+        "max_position_embeddings": 131072
+    }"#;
+
+    // a. 入れ子の qwen3_5 形式
+    #[test]
+    fn nested_text_config_dims() {
+        let cfg: serde_json::Value = serde_json::from_str(QWEN3_5_WRAPPER).unwrap();
+        let info = info_dims(&cfg);
+        assert_eq!(info.family, "qwen3_5_text");
+        assert_eq!(info.layers, 64);
+        assert_eq!(info.hidden, 5120);
+        assert_eq!(info.vocab, 248320);
+        assert_eq!(info.context, 262144);
+    }
+
+    // b. フラットな llama 形式は従来どおり (別名 n_layer/n_embd/n_ctx も同じ)
+    #[test]
+    fn flat_llama_dims_unchanged() {
+        let cfg: serde_json::Value = serde_json::from_str(FLAT_LLAMA).unwrap();
+        let info = info_dims(&cfg);
+        assert_eq!(info.family, "llama");
+        assert_eq!(info.layers, 32);
+        assert_eq!(info.hidden, 4096);
+        assert_eq!(info.vocab, 128256);
+        assert_eq!(info.context, 131072);
+
+        let alias: serde_json::Value = serde_json::from_str(
+            r#"{"model_type":"gpt2","n_layer":12,"n_embd":768,"n_ctx":1024}"#,
+        )
+        .unwrap();
+        let info = info_dims(&alias);
+        assert_eq!(info.layers, 12);
+        assert_eq!(info.hidden, 768);
+        assert_eq!(info.vocab, 0);
+        assert_eq!(info.context, 1024);
+    }
+
+    // 探索順: text_config が先、無ければ llm_config / language_config、最後にトップレベル
+    #[test]
+    fn nested_lookup_order() {
+        let cfg: serde_json::Value = serde_json::from_str(
+            r#"{
+                "llm_config": {"model_type": "llm_x", "num_hidden_layers": 7},
+                "language_config": {"model_type": "lang_y", "num_hidden_layers": 9,
+                                    "hidden_size": 2048}
+            }"#,
+        )
+        .unwrap();
+        let info = info_dims(&cfg);
+        assert_eq!(info.family, "llm_x");
+        assert_eq!(info.layers, 7);
+        assert_eq!(info.hidden, 2048);
+
+        let top: serde_json::Value =
+            serde_json::from_str(r#"{"model_type":"top_z","vocab_size":32000}"#).unwrap();
+        let info = info_dims(&top);
+        assert_eq!(info.family, "top_z");
+        assert_eq!(info.vocab, 32000);
+    }
+
+    // c. config.json の無いディレクトリ -> clean な Err (panic しない)
+    #[test]
+    fn dir_without_config_is_err_not_panic() {
+        let td = TempDir::new("no_cfg");
+        let dir = resolve_model_dir(td.path.to_str().unwrap()).expect("dir must resolve");
+        assert_eq!(dir, td.path);
+        let err = read_config(&dir).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("config.json"), "unexpected message: {msg}");
+    }
+
+    // d. ディレクトリ引数で同じ値が出る (hub cache 不要)。解決自体は resolve_model_dir で確認
+    #[test]
+    fn directory_argument_resolves_same_values() {
+        let td = TempDir::new("dirarg");
+        td.write_config(QWEN3_5_WRAPPER);
+        let dir = resolve_model_dir(td.path.to_str().unwrap()).expect("dir must resolve");
+        let cfg = read_config(&dir).expect("config must parse");
+        let info = info_dims(&cfg);
+        assert_eq!(info.family, "qwen3_5_text");
+        assert_eq!(
+            (info.layers, info.hidden, info.vocab, info.context),
+            (64, 5120, 248320, 262144)
+        );
+    }
 }
