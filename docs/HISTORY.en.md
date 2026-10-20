@@ -2559,6 +2559,59 @@ with the standalone one. This is not what blocks the change; the byte count is.
 published PROFILE row, and its own provenance could not be matched to a HISTORY capture. No cold
 A/B was run and none is planned for a closed task.
 
+### s122: refuted P1-2 candidate 4 (causal key-range truncation) with executable evidence and closed it (CPU only, `.cu` / `.ptx` untouched)
+
+> The s122 handoff asked for a one-file `.cu` edit: start the tile loop at
+> `jstart = ((pos0+i0)/PF_BK)*PF_BK` and call it numerically identical. Checking the premise
+> before writing the commit showed the premise is **false** - merged as specified it corrupts the
+> attention output of every prefill. Not one byte of `.cu` was changed (sha256 `5334024a...`
+> before and after; `.ptx` also unchanged at `7abee571...`). What landed instead is a
+> **regression test that makes the false premise impossible to derive again**.
+
+**Why the premise is false**: the kernel's causal bound is **per row**, not per block.
+`jend = min(t_total, pos0 + i0 + PF_BQ)` (`kernels_elem.cu:342`) is sized for the **worst-case
+row** of the block; how far each row actually reads is decided by the mask `ja <= pos0 + ia`
+(`:449-452`, `ia = i0 + r0`), i.e. row r reads `j <= pos0 + i0 + r`. So `pos0 + i0` is row 0's
+*upper* bound, not the block's *lower* bound: the keys below `pos0 + i0` are exactly the ones the
+early rows of the block must attend to.
+
+Furthermore, under a causal mask the tiles that are fully masked for every row can only ever be a
+**suffix**. A change to the loop *start* therefore cannot express them.
+
+**Measured (all CPU, the 5 tests in `crates/denno-engine/tests/attn_prefill_jstart.rs`)**:
+
+- The kernel's mask matches the CPU reference (`full_attn_attend_head` called with
+  `t_total = pos0+i+1`) on 499,095 (row, key) pairs - this is fixed first, so the rest is not an
+  artefact of the model.
+- Cold shape (`n = 5,686`, `pos0 = 0`), block `i0 = 64` (`jstart = 64`): **4,032** (row, key)
+  pairs inside the skipped range `[0, 64)` are **not** masked (i.e. are keys that must be reached).
+  Over all 89 blocks **15,983,616** live pairs would be dropped. Scanning 291 blocks found **0**
+  fully-masked tiles (and 0 such runs starting at the front), so a `jstart`-shaped truncation does
+  not exist.
+- Magnitude: a `dh = 8` fp32 toy gives max |att_full - att_truncated| = **0.466**, i.e. 466x the
+  R3 bound (1e-3) - nowhere near bit-identical, and outside the relaxation too.
+
+**Relation to s118**: s118 reached the same conclusion by static reading and did not commit (the
+section below). But the P1-2 candidate 4 text in `docs/TASKS.md` still carried the wrong premise
+("everything below `pos0 + i0` is fully masked"), and the s122 handoff read that text as "designed
+in s118" and tried to re-run it. s122 replaces the TASKS.md text with the refutation and turns it
+into an executed guard.
+
+**Difference from the effect s118 flagged (the `acc` rounding unit)**: s118 estimated the
+truncation as "a difference R3 cannot see", but that was on the (false) assumption that the
+dropped range is fully masked. In fact it drops keys that must be reached, which is a different
+order of magnitude. The 0.466 above is that measurement.
+
+**Measurement gate (what was run)**: `cargo test -p denno-engine` = lib 240 passed / 0 failed
+(1 ignored) + 5 passed for this test, `cargo test -p denno-server` = 77 passed / 0 failed,
+`cargo check -p denno-engine --features cuda --tests` = passes. **The last one does not compile
+the `.cu`** (the design ships the `.ptx` as bytes), so it is not evidence the kernel was built.
+
+**Human steps (what is not measured)**: no GPU measurement, no PTX regen, no cold A/B, no anchors
+(`c61ad85b` / `9e17d563` / `af6eb6ab`) - none were run and **none are needed** for this task. The
+`.ptx` was not regenerated (the source did not change). P1-2 is now closed with all four
+candidates rejected with numbers, and **no untouched prefill lever remains**.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
