@@ -71,15 +71,19 @@ impl KvCache {
     pub fn flush_gdn_device_state(&mut self) {
         #[cfg(feature = "cuda")]
         {
+            // s141 (Task B7): 受け皿は層ループの**外**で 1 回だけ作り、層ごとに
+            // 使い回す (grow-only)。従来は層ごとに `to_vec` で 2 本確保していた。
+            let mut stage = crate::cuda::GdnHostStage::new();
             for i in 0..self.gdn.len() {
                 if self.gdn[i].is_none() {
                     continue;
                 }
-                if let Some((conv, ssm)) = crate::cuda::gdn_state_take(self.kv_id(), i) {
+                if let Some((conv, ssm)) = crate::cuda::gdn_state_take(self.kv_id(), i, &mut stage)
+                {
                     if let Some((hc, hs)) = self.gdn[i].as_mut() {
                         if hc.len() == conv.len() && hs.len() == ssm.len() {
-                            hc.copy_from_slice(&conv);
-                            hs.copy_from_slice(&ssm);
+                            hc.copy_from_slice(conv);
+                            hs.copy_from_slice(ssm);
                         }
                     }
                 }

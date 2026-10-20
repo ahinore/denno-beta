@@ -1396,18 +1396,86 @@ fn gdn_state_commit(
 /// s131: デバイス正本をホストへ戻す (層指定)。戻した層は無効化するので、
 /// 次にその層を使うときはホストから 1 回 seed し直す。
 /// ホストの `KvCache::gdn` を読む前に必ず通すこと。
-pub fn gdn_state_take(kv: u64, li: usize) -> Option<(Vec<f32>, Vec<f32>)> {
-    GDN_STATE.with(|cell| -> Option<(Vec<f32>, Vec<f32>)> {
-        let mut c = cell.borrow_mut();
-        if c.cur_kv != Some(kv) || li >= c.valid.len() || !c.valid[li] {
+///
+/// s141 (Task B7): 返す 2 本は **thread_local のホスト一時領域の借り物**。
+/// 従来は層ごとに `to_vec` (= `Vec::with_capacity`) で 2 本確保していたため、
+/// 27B q4 の decode 1 ステップで 48 層 x 2 本 = 96 本 / 564 KiB の確保と解放を
+/// 毎回払っていた。転送・内容は同一 (同じ D2H を同じ長さで 1 回) で、変わるのは
+/// 「毎回確保するか、伸ばすだけの 1 本を使い回すか」だけ。
+/// 借り物なので、**次の呼び出しで中身が変わる** — 呼び出し側はその場で読み終わること
+/// (`KvCache::flush_gdn_device_state` はその場で copy_from_slice する)。
+pub fn gdn_state_take<'a>(kv: u64, li: usize, reuse: &'a mut GdnHostStage) -> Option<(&'a [f32], &'a [f32])> {
+    let (pc, ps, conv_len, ssm_len) =
+        GDN_STATE.with(|cell| -> Option<(CUdeviceptr, CUdeviceptr, usize, usize)> {
+            let mut c = cell.borrow_mut();
+            if c.cur_kv != Some(kv) || li >= c.valid.len() || !c.valid[li] {
+                return None;
+            }
+            let (conv_len, rows, cols) = (c.conv_len, c.rows, c.cols);
+            let pc = c.conv[li].as_ref()?.ptr();
+            let ps = c.ssm[li].as_ref()?.ptr();
+            // 戻した層は無効化 (従来どおり・成功時のみ)。
+            c.valid[li] = false;
+            Some((pc, ps, conv_len, rows * cols))
+        })?;
+    // 借り物を 2 本同時に返すので、転送は 2 回とも先に済ませる。
+    // conv / ssm は別々の領域なので、2 本の借用は同時に成立する。
+    let conv = d2h_raw(&mut reuse.conv, pc, conv_len)?;
+    let ssm = d2h_raw(&mut reuse.ssm, ps, ssm_len)?;
+    Some((conv, ssm))
+}
+
+/// s141 (Task B7): `gdn_state_take` に渡す呼び出し側所有の受け皿 1 組。
+/// 呼び出し元のループの外で 1 回だけ作り、層ごとに使い回す (grow-only)。
+/// 中身は「前の層の値」なので、**返り値をその場で読み終えること**。
+pub struct GdnHostStage {
+    conv: Vec<f32>,
+    ssm: Vec<f32>,
+}
+
+impl GdnHostStage {
+    /// 空の受け皿 (初回の D2H で必要な分だけ伸びる)。
+    pub fn new() -> Self {
+        Self { conv: Vec::new(), ssm: Vec::new() }
+    }
+    /// 確保済みの要素数 (テストが「ステップ数に対して増えない」ことを見る口)。
+    pub fn capacities(&self) -> (usize, usize) {
+        (self.conv.capacity(), self.ssm.capacity())
+    }
+}
+
+impl Default for GdnHostStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// s141: 再利用領域 `dst` の先頭 `len` 要素へ D2H し、その部分を**借りて**返す。
+/// `DevBuffer::to_vec` と転送は同一 (同じ `cuMemcpyDtoH` を同じ長さで 1 回) で、
+/// 違いは「確保しない」ことだけ。容量が足りないときだけ `reserve_exact` で伸ばす
+/// (`mem::take` のように領域を奪い返さない = 次の層でも同じ領域を使う)。
+fn d2h_raw<'a>(dst: &'a mut Vec<f32>, ptr: CUdeviceptr, len: usize) -> Option<&'a [f32]> {
+    unsafe {
+        reserve_exact_grow(dst, len);
+        let p = dst.as_mut_ptr() as *mut c_void;
+        let lib = lib().ok()?;
+        if check((lib.memcpy_dtoh)(p, ptr, len * 4), "cuMemcpyDtoH").is_err() {
             return None;
         }
-        let (conv_len, rows, cols) = (c.conv_len, c.rows, c.cols);
-        let conv = c.conv[li].as_ref()?.to_vec::<f32>(conv_len).ok()?;
-        let ssm = c.ssm[li].as_ref()?.to_vec::<f32>(rows * cols).ok()?;
-        c.valid[li] = false;
-        Some((conv, ssm))
-    })
+        dst.set_len(len);
+    }
+    Some(&dst[..])
+}
+
+/// s141 (Task B7): `dst` を「長さ `len` を書ける」状態にする。**伸ばすだけ** —
+/// 容量が足りていれば確保しない (これが「層ごとに確保しない」の実体)。
+/// 実転送 (`d2h_raw`) とテストが同じ関数を通るので、テストは写しではなく
+/// 本物の確保規則を検証している。
+fn reserve_exact_grow(dst: &mut Vec<f32>, len: usize) {
+    dst.clear();
+    if len > dst.capacity() {
+        dst.reserve_exact(len - dst.len());
+    }
 }
 
 static GPU_CTX: OnceLock<Option<CudaCtx>> = OnceLock::new();
@@ -6182,6 +6250,10 @@ pub fn chain_q35_gdn_scan(
     chain_q35_ctl_f32(mid, li, Q35_TAG_ALPHA, alpha_w, e, nv, conv_dim + vd + nv)?;
 
     // GDN 状態ミラー: 取得/seed (ポインタはロック解放前に抽出)
+    // s141 (Task B7): seed D2H の受け皿 (grow-only)。この関数は層ごとに 1 回
+    // 呼ばれるが、seed は `gdn_pos` がずれたときだけなので、受け皿もここで
+    // 1 回作って使い回す (以前は seed のたびに 2 本確保していた)。
+    let mut stage = GdnHostStage::new();
     let (conv_in, ssm_in, conv_out, ssm_out) =
         with_mirror_ext(key, li, n_layers, t_total, 0, cache.epoch(), false, |m, _| {
             if m.gdn[li].is_none() {
@@ -6203,9 +6275,9 @@ pub fn chain_q35_gdn_scan(
                 // (ホストは境界まで古いことがある)。取り出した層は無効化されるので
                 // 以後の scan 経路はホストから seed し直す = 取り違えが起きない。
                 let kv_id = cache.kv_id();
-                if let Some((cv, sm)) = gdn_state_take(kv_id, li) {
-                    ok(gd.conv[0].as_ref().unwrap().copy_from(&cv))?;
-                    ok(gd.ssm[0].as_ref().unwrap().copy_from(&sm))?;
+                if let Some((cv, sm)) = gdn_state_take(kv_id, li, &mut stage) {
+                    ok(gd.conv[0].as_ref().unwrap().copy_from(cv))?;
+                    ok(gd.ssm[0].as_ref().unwrap().copy_from(sm))?;
                 } else {
                     let (conv_h, ssm_h) = cache.gdn_state_mut(li)?;
                     ok(gd.conv[0].as_ref().unwrap().copy_from(conv_h))?;
@@ -6356,6 +6428,9 @@ pub fn chain_q35_gdn_flush_pending(cache: &mut crate::kv_cache::KvCache) -> Opti
     // デバイス常駐の正本は古くなるので先に捨てる。早めに捨てても失うものは無い
     // (次の実行でホストから再 seed するだけ) ので、分岐の前に 1 回で置く。
     gdn_scan_state_invalidate();
+    // s141 (Task B7): D2H の受け皿は層ループの**外**で 1 回だけ作り、層ごとに
+    // 使い回す (grow-only)。従来は層ごとに `to_vec` で 2 本確保していた。
+    let mut stage = GdnHostStage::new();
     let m = &mut ms[idx].1;
     if m.gdn_pending.is_none() {
         return Some(()); // 遅延なし
@@ -6392,8 +6467,20 @@ pub fn chain_q35_gdn_flush_pending(cache: &mut crate::kv_cache::KvCache) -> Opti
         };
         crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
         crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
-        let conv = ok(cb.to_vec::<f32>(cb.bytes() / 4))?;
-        let ssm = ok(sb.to_vec::<f32>(sb.bytes() / 4))?;
+        let conv = match d2h_raw(&mut stage.conv, cb.ptr(), cb.bytes() / 4) {
+            Some(v) => v,
+            None => {
+                m.gdn_pending = None;
+                return None;
+            }
+        };
+        let ssm = match d2h_raw(&mut stage.ssm, sb.ptr(), sb.bytes() / 4) {
+            Some(v) => v,
+            None => {
+                m.gdn_pending = None;
+                return None;
+            }
+        };
         if let Some(t) = t_site {
             crate::prof::add_d2h_src_ns_only(
                 crate::prof::D2H_SRC_GDN_STATE,
@@ -6405,8 +6492,8 @@ pub fn chain_q35_gdn_flush_pending(cache: &mut crate::kv_cache::KvCache) -> Opti
             m.gdn_pending = None;
             return None;
         }
-        conv_h[..conv.len()].copy_from_slice(&conv);
-        ssm_h[..ssm.len()].copy_from_slice(&ssm);
+        conv_h[..conv.len()].copy_from_slice(conv);
+        ssm_h[..ssm.len()].copy_from_slice(ssm);
     }
     m.gdn_pending = None;
     Some(())
@@ -9436,4 +9523,80 @@ fn gdn_scan_chunked_impl(
     crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
     q.end();
     Ok(y)
+}
+
+
+// ===========================================================================
+#[cfg(test)]
+mod b7_stage_tests {
+    //! s141 (Task B7): GDN 状態のホスト受け皿が**再利用**されることの検証。
+    //!
+    //! 背景 (s140 の計測): decode の `gdn_pf_alloc` が 98 us/call・4.7 ms/token
+    //! あり、中身は層ごとの `to_vec` (`Vec::with_capacity` を 2 本 x 48 層) だった。
+    //! 実転送 (D2H) は GPU が要るので、ここでは**確保の規則そのもの**
+    //! (`reserve_exact_grow` — `d2h_raw` が実際に呼ぶ関数) を回して、
+    //! 確保回数が層・ステップ数に比例して増えないことを確かめる。
+    use super::*;
+
+    /// Vec の再確保を数える (これが 0 件 = 確保していない)。
+    fn count_regrows(stage: &mut GdnHostStage, conv_len: usize, ssm_len: usize, layers: usize) -> usize {
+        let (c0, s0) = stage.capacities();
+        for _ in 0..layers {
+            reserve_exact_grow(&mut stage.conv, conv_len);
+            reserve_exact_grow(&mut stage.ssm, ssm_len);
+        }
+        let (c1, s1) = stage.capacities();
+        usize::from(c1 != c0) + usize::from(s1 != s0)
+    }
+
+    #[test]
+    fn gdn_host_stage_is_reused_across_layers_and_steps() {
+        // 27B q4 の実形状: conv = conv_dim*cs = 8448、ssm = nv*dk*dv = 786432 要素。
+        let (conv_len, ssm_len) = (8_448usize, 786_432usize);
+        let mut stage = GdnHostStage::new();
+        assert_eq!(stage.capacities(), (0, 0), "作りたては未確保");
+
+        // 1 ステップ目は伸びてよい (= 初回だけ確保する)。
+        let first = count_regrows(&mut stage, conv_len, ssm_len, 48);
+        assert_eq!(first, 2, "初回は conv/ssm の 2 本だけ確保する (実際 {first})");
+        assert_eq!(stage.capacities(), (conv_len, ssm_len));
+
+        // 2 ステップ目以降は 48 層回しても 1 本も確保しない (ここが本題)。
+        for step in 1..8 {
+            let regrown = count_regrows(&mut stage, conv_len, ssm_len, 48);
+            assert_eq!(
+                regrown, 0,
+                "step={step}: 容量が層ループで再確保された (再利用できていない)"
+            );
+            assert_eq!(
+                stage.capacities(),
+                (conv_len, ssm_len),
+                "step={step}: 容量がステップ数で増えた"
+            );
+        }
+    }
+
+    #[test]
+    fn gdn_host_stage_grows_only_when_shape_grows() {
+        // 形が大きくなったときだけ伸びる (grow-only)。縮んでも手放さない。
+        let mut stage = GdnHostStage::new();
+        reserve_exact_grow(&mut stage.conv, 100);
+        assert_eq!(stage.capacities().0, 100);
+        reserve_exact_grow(&mut stage.conv, 50); // 縮小 → 何もしない
+        assert_eq!(stage.capacities().0, 100, "縮小で解放しない (grow-only)");
+        reserve_exact_grow(&mut stage.conv, 8_448); // 拡大 → 伸ばす
+        assert_eq!(stage.capacities().0, 8_448);
+    }
+
+    #[test]
+    fn reserve_grow_reuses_pointer_so_no_per_layer_allocation() {
+        // 同じ長さを繰り返しても**同じ領域**を使う (アドレスが変わらない = 再確保なし)。
+        let mut stage = GdnHostStage::new();
+        reserve_exact_grow(&mut stage.ssm, 786_432);
+        let p0 = stage.ssm.as_ptr();
+        for _ in 0..480 {
+            reserve_exact_grow(&mut stage.ssm, 786_432);
+            assert_eq!(stage.ssm.as_ptr(), p0, "同じ長さで確保し直している");
+        }
+    }
 }
