@@ -51,6 +51,32 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 - Idea: raise occupancy (smaller BK, more blocks), check L2 reuse of K/V across heads.
 - Estimated: not yet re-derived from a per-kernel profile; 942 ms is the ceiling for the
   whole bucket. Risk: medium; the attention contract allows 1e-3 abs (R3).
+- Status (2026-10-20): **candidates 1 and 2 closed with numbers; candidate 3 is a kernel
+  rewrite and is being taken as design-only.**
+  - Candidate 1 (`__ldg` on the K/V reads, s112 `b5f1f37` + `78e7d08`): **-0.9 %, reverted**
+    (`ac73729`); the bucket is not DRAM-bound, so a cache hint cannot pay.
+  - Candidate 2 (tile/holding variants of the existing kernel, s116, no code change):
+    a traffic + smem/occupancy model over (BQ 64, BK 16), (BQ 128, BK 8), (BQ 128, BK 16),
+    (BQ 32, BK 16), plus BQ 256 and a one-block-per-kv-head loop. **No variant reaches the
+    0.3 s acceptance.**
+    - Geometry: 16 query heads / 4 kv heads / group 4 / dh 256, 8 full-attention layers;
+      `dno_attention_prefill` runs grid `(n/64, heads)`, 256 threads, 84,800 B smem =
+      2 blocks/SM, 58.9 ms/call.
+    - K/V reads for one 5,686-token request = 273.2 GB against 186 MB of real K/V
+      = 1,466x duplication, but measured throughput is only 147 GB/s (pass 1) and
+      433 GB/s (pass 2) of a ~1.79 TB/s peak, i.e. **not DRAM-bound**.
+    - One kv head's whole range is 22.2 MB (pass 1) / 44.4 MB (pass 2) and fits the 126 MB
+      L2, so the duplicated bytes are mostly L2 hits and the DRAM floor is ~0.3 ms.
+    - BK 16/32 remove no bytes at all (1.000x) and BK 32 drops occupancy to 1 block/SM;
+      (BQ 128, BK 8) halves the bytes (0.522x) but halves the warps hiding the latency
+      (149.6 KiB, 1 block/SM) for tens of ms of gain; (BQ 128, BK 16) is worse than that;
+      BQ 256 (283.1 KiB) and the kv-head loop (282-538 KiB, and 256 floats/thread spills
+      past the 255-register limit) exceed the 227 KiB smem cap or spill.
+  - Candidate 3 (open, s117 as design-only): the only direction the model leaves is a
+    **kernel rewrite** — K/V shared per kv head via a transposed tile, or online softmax
+    moved onto an MMA/flash-style tile. Both need `.cu` work, a PTX regen and a real cold
+    A/B, so the dev must first prove the resource budget (smem <= 227 KiB, registers <= 255,
+    occupancy >= 2 blocks/SM) and may answer "not feasible" with numbers and no commit.
 
 ### P1-3: d2h_state / sync reduction
 - Where: `cuda.rs` chains, `prof.rs` `d2h_state`.
