@@ -472,6 +472,10 @@ const SPLIT_WAIT_ROW: [usize; SPLIT_TABLES] = [
     Q4P_SYNC_WAIT - SPLIT_Q4_FIRST,
 ];
 /// s138: 分割表 A (decode chain) の行名 (`SPLIT_CHAIN_FIRST + i`)。
+/// s140: `chain_cpu` / `chain_sync_resid` は 1 ステップ内で 1 か所からしか
+/// 積まれない (CPU 区間は per-op 経路の 1 ループ・残余はステップ末尾) ので、
+/// 積算器でまとめて足すと tick を打った瞬間の経過が落ちて排他の和が縮む。
+/// この 2 行は `split_sample` (積んだ時点の時刻で直接加算) で積む。
 const SPLIT_CHAIN_NAMES: [&str; SPLIT_CHAIN_ROWS] = [
     "chain_launch",
     "chain_d2h_logits",
@@ -1233,6 +1237,14 @@ pub fn reset() {
                 SPLIT_CALLS[p][t][i].store(0, Ordering::Relaxed);
             }
         }
+        // s140 (Task B6b): カバレッジの分母・tick の件数もクリアする
+        for op in 0..N_OPS {
+            LIN_STAGE_CALLS[p][op].store(0, Ordering::Relaxed);
+            LIN_STAGE_NS[p][op].store(0, Ordering::Relaxed);
+        }
+        for t in 0..TICK_CALLS.len() {
+            TICK_CALLS[t].store(0, Ordering::Relaxed);
+        }
         for i in 0..D2H_N {
             D2H_SUB_NS[p][i].store(0, Ordering::Relaxed);
             D2H_SUB_CALLS[p][i].store(0, Ordering::Relaxed);
@@ -1627,6 +1639,73 @@ pub fn split_rows(table: usize) -> usize {
     }
 }
 
+/// s140 (Task B6b): 線形ステージのバケット呼び出し数 (分岐できなかった線形呼び出し
+/// も件数だけは数える — 表 B のカバレッジ率の分母)。**表示専用**。
+static LIN_STAGE_CALLS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
+
+/// s140 (Task B6b): 線形ステージのバケット ns (表 B のカバレッジ率の分母)。
+/// バケット値そのものは書き換えない (`add_sample` が本体を積む)。
+static LIN_STAGE_NS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
+
+/// s140 (Task B6b): 表 B の分母を更新する。**表示専用** — 生 id・分割表には
+/// 書かない。`on=false` (計測 OFF) は分岐 1 回で戻る。
+#[inline]
+pub fn count_linear_stage(op: usize, ns: u64, calls: u64, on: bool) {
+    if !on || op >= N_OPS {
+        return;
+    }
+    let pi = phase().idx();
+    LIN_STAGE_CALLS[pi][op].fetch_add(calls, Ordering::Relaxed);
+    LIN_STAGE_NS[pi][op].fetch_add(ns, Ordering::Relaxed);
+}
+
+/// s140 (Task B6b): (線形呼び出し数, 線形 ms) — 表 B のカバレッジ率の分母。
+/// `phase` = Prefill / Decode のどちらか (Both は数えていない)。
+pub fn linear_stage_total(phase: Phase) -> (u64, u64) {
+    let p = phase.idx();
+    let mut calls = 0u64;
+    let mut ns = 0u64;
+    for op in 0..N_OPS {
+        calls += LIN_STAGE_CALLS[p][op].load(Ordering::Relaxed);
+        ns += LIN_STAGE_NS[p][op].load(Ordering::Relaxed);
+    }
+    (calls, ns)
+}
+
+/// s140 (Task B6b): 分割表のサンプル数 (全段の calls の和) と駆動件数 (split_on のまま
+/// 走っている線形呼び出し数 = `TICK_CALLS`)。「何 call のうち何 call を分割できたか」。
+static TICK_CALLS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// s140 (Task B6b): 分割 tick を打った線形呼び出し数を 1 つ数える (**表示専用**)。
+/// 1 呼び出しが 2 タイル以上に割れたときは fragment ぶん数える (tick の回数と
+/// 一致させる = 「分割できた割合」が 100% を超えない)。
+#[inline]
+pub fn split_tick_call(table: usize) {
+    if table < 2 {
+        TICK_CALLS[table].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// s140 (Task B6b): 分割 tick を打った回数 (分母)。
+pub fn split_tick_count(table: usize) -> u64 {
+    if table < 2 {
+        TICK_CALLS[table].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// s140 (Task B6b): 分割表のサンプル数 = 全行の calls の和。
+pub fn split_sample_count(phase: Phase, table: usize) -> u64 {
+    if table >= SPLIT_TABLES {
+        return 0;
+    }
+    let p = phase.idx();
+    (0..split_rows(table))
+        .map(|i| SPLIT_CALLS[p][table][i].load(Ordering::Relaxed))
+        .sum()
+}
+
 /// s138 (Task B6): 分割表の**待ち合計** (1 行)。summary の先頭ヘッダで
 /// 「プロファイルが捕まえた時間」と「捕まえていない時間」を並べるために使う。
 /// 行が無ければ 0。
@@ -1644,7 +1723,8 @@ fn split_wait_ns(p: usize, table: usize) -> u64 {
 ///   decode steps        … decode の行が積まれたステップ数 (= 応答トークン数 − 1 程度)
 ///   chain split / sum   … ステップ分割 (表 A) を閉じた回数とその和 (待ち込み)
 ///   chain wait          … そのうち sync で待った時間
-///   lin calls / split   … 線形ラッパ (表 B) の呼び出し数 / 分割を閉じた回数
+///   lin calls / split   … 線形ステージの呼び出し数 / 分割 tick を打った回数
+///                         (= 表 B の排他の和が覆う call 数。s140)
 ///   lin sum / sync wait … その和と、そのうち sync で待った時間
 ///
 /// 注: `chain split` < `decode steps` は「decode の行は積まれたが分割されていない
@@ -1656,32 +1736,42 @@ fn push_sample_header(p: usize, s: &mut String) {
     for i in 0..N_OPS {
         decode_steps = decode_steps.max(CALLS[p][i].load(Ordering::Relaxed));
     }
-    let chain_splits = SPLIT_CALLS[p][SPLIT_CHAIN_TABLE][CHAIN_LAUNCH - SPLIT_CHAIN_FIRST]
-        .load(Ordering::Relaxed)
-        .max(
-            SPLIT_CALLS[p][SPLIT_CHAIN_TABLE][CHAIN_SYNC_WAIT - SPLIT_CHAIN_FIRST]
-                .load(Ordering::Relaxed),
-        );
+    // s140 (Task B6b): chain のサンプル数は「ステップ分割を開いた回数」= tick の数。
+    // s138 は launch 段 / sync_wait 段の calls を代用していたが、両方とも
+    // 「その段が起きたステップ数」であって「分割できたステップ数」ではない
+    // (段が 1 つも積まれないステップを見落とす)。
+    let chain_splits = split_tick_count(SPLIT_CHAIN_TABLE);
     let mut chain_sum = 0u64;
     for i in 0..SPLIT_CHAIN_ROWS {
         chain_sum += SPLIT_NS[p][SPLIT_CHAIN_TABLE][i].load(Ordering::Relaxed);
     }
-    // 線形ラッパの分母: 出力確保の段は GPU 判定のどの経路でも起きる (CPU フォール
-    // バックでも通る) ので、`maybe_gpu_linear_*` の呼び出し数に近い。
-    let lin_calls = SPLIT_CALLS[p][SPLIT_Q4_TABLE][Q4P_OUT_ALLOC - SPLIT_Q4_FIRST]
-        .load(Ordering::Relaxed)
-        .max(
-            SPLIT_CALLS[p][SPLIT_Q4_TABLE][Q4P_KERNEL_LAUNCH - SPLIT_Q4_FIRST]
-                .load(Ordering::Relaxed),
-        );
-    let lin_splits =
-        SPLIT_CALLS[p][SPLIT_Q4_TABLE][Q4P_SYNC_WAIT - SPLIT_Q4_FIRST].load(Ordering::Relaxed);
+    // s140 (Task B6b): 線形の分母 = 線形ステージのバケット件数 (同じ呼び出しが
+    // `lin_stage` で数えたもの)、分割できた数 = tick を打った呼び出し数。
+    // s138 は「出力確保の段の calls」を call 数の代用にしていたため、tile 分割で
+    // 1 呼び出しが複数サンプルになっても気づけなかった (608 call に 802 サンプル)。
+    let (lin_bucket_calls0, _) = linear_stage_total(Phase::Prefill);
+    let lin_calls = lin_bucket_calls0.max(split_tick_count(SPLIT_Q4_TABLE));
+    let lin_splits = split_tick_count(SPLIT_Q4_TABLE);
     let mut q4_sum = 0u64;
     for i in 0..SPLIT_Q4_N {
         q4_sum += SPLIT_NS[p][SPLIT_Q4_TABLE][i].load(Ordering::Relaxed);
     }
     let chain_wait = split_wait_ns(p, SPLIT_CHAIN_TABLE);
     let q4_wait = split_wait_ns(p, SPLIT_Q4_TABLE);
+    // s140 (Task B6b): カバレッジ。分母は同じ呼び出しが積んだバケット側の件数・ns で、
+    // 分割表のサンプル数と突き合わせる (split calls < 分母 = 付け漏れ)。
+    let (lin_bucket_calls, lin_bucket_ns) = linear_stage_total(Phase::Prefill);
+    let lin_pct = if lin_bucket_ns > 0 {
+        q4_sum as f64 / lin_bucket_ns as f64 * 100.0
+    } else {
+        0.0
+    };
+    let (_chain_bucket_calls, chain_bucket_ns) = linear_stage_total(Phase::Decode);
+    let chain_pct = if chain_bucket_ns > 0 {
+        chain_sum as f64 / chain_bucket_ns as f64 * 100.0
+    } else {
+        0.0
+    };
     s.push_str(&format!(
         "  samples: decode steps {} / chain split {} (sum {:.1} ms, wait {:.1} ms) | \
          lin calls {} / split {} (sum {:.1} ms, sync wait {:.1} ms)\n",
@@ -1693,6 +1783,26 @@ fn push_sample_header(p: usize, s: &mut String) {
         lin_splits,
         q4_sum as f64 / 1e6,
         q4_wait as f64 / 1e6,
+    ));
+    // s140 (Task B6b): カバレッジ行 — 分割表の和がバケットの何割を掴んだか。
+    //   lin  … prefill の線形ステージ (QKV/GATE_UP/DOWN/OPROJ) の件数・ms に対する比
+    //   chain … decode の線形ステージの ms に対する比 (件数は 1 step 1 回の分割済み
+    //           呼び出しが駆動件数を超えるため出さない)
+    //   samples … 分割表のサンプル数の和 / tick を打った回数
+    s.push_str(&format!(
+        "  coverage: lin {} calls split {} / bucket {} calls {:.1} ms ({:.1} pct of linear ms) | \
+         chain {:.1} pct of decode linear ms | samples chain {} / {} ticks, \
+         lin {} / {} ticks\n",
+        lin_calls,
+        lin_splits,
+        lin_bucket_calls,
+        lin_bucket_ns as f64 / 1e6,
+        lin_pct,
+        chain_pct,
+        split_sample_count(Phase::Decode, SPLIT_CHAIN_TABLE),
+        split_tick_count(SPLIT_CHAIN_TABLE),
+        split_sample_count(Phase::Prefill, SPLIT_Q4_TABLE),
+        split_tick_count(SPLIT_Q4_TABLE),
     ));
 }
 
@@ -2320,6 +2430,101 @@ mod tests {
                     .load(Ordering::Relaxed),
                 0
             );
+            reset();
+        });
+    }
+
+    /// s140 (Task B6b): 分割 tick の件数・サンプル数・カバレッジ分母が
+    /// 1 call = 1 tick で対応し、ヘッダにカバレッジ行が出る。
+    /// 「サンプル数 = tick 数」「分割の和 = バケット ms」を数で確かめる
+    /// (s138 は tick の分母を持たず、608 call のバケットに 802 サンプルを
+    /// 積んでいた = 件数が食い違ったまま表を見ていた)。
+    #[test]
+    fn lin_split_covers_every_call_once_and_header_prints_coverage() {
+        with_prof_counters(|| {
+            reset();
+            set_phase(Phase::Prefill);
+            // 3 call の線形ステージ: バケット 10 ms / 分割の和 10 ms
+            for _ in 0..3 {
+                count_linear_stage(GATE_UP, 10_000_000, 1, true);
+                split_tick_call(SPLIT_Q4_TABLE);
+                split_sample(GATE_UP, 10_000_000, 0);
+                split_sample(Q4P_SYNC_WAIT, 10_000_000, 1);
+            }
+            // 分割できなかった 1 call (バケットだけ 4 ms) — 分母には入る
+            count_linear_stage(QKV, 4_000_000, 1, true);
+            let (calls, ns) = linear_stage_total(Phase::Prefill);
+            assert_eq!(calls, 4, "分母は線形呼び出し数");
+            assert_eq!(ns, 34_000_000, "分母は線形バケットの ns");
+            assert_eq!(split_tick_count(SPLIT_Q4_TABLE), 3, "tick は分割できた call 数");
+            // サンプル数 = 表 B の calls の和 (1 call で sync 段 1 + 総和段 1 は
+            // 「段の回数」なので、ここでは tick と一致するかを検査する)
+            // ここは「段の回数」の和 (calls 列 = バケット状の段の発生数)
+            assert_eq!(split_sample_count(Phase::Prefill, SPLIT_Q4_TABLE), 3);
+            let s = summary();
+            let cov = s
+                .lines()
+                .find(|l| l.contains("coverage: lin "))
+                .unwrap_or_else(|| panic!("カバレッジ行が無い\n{s}"));
+            assert!(cov.contains("pct of linear ms"), "{cov}");
+            assert!(cov.contains("ticks"), "{cov}");
+            // 表 B の和 / 分母 = 30 / 34 ms = 88.2%
+            assert!(cov.contains("88.2 pct"), "{cov}");
+            assert!(cov.contains("lin 4 calls split 3"), "{cov}");
+            // ヘッダの従来の形も壊れていない
+            let head = s
+                .lines()
+                .find(|l| l.contains("samples: decode steps"))
+                .expect("samples ヘッダ");
+            assert!(head.contains("lin calls 4 / split 3"), "{head}");
+            // 分母 4 call のうち tick したのは 3 call (4 本目は分割されていない)
+            assert!(cov.contains("lin 4 calls split 3"), "{cov}");
+            reset();
+        });
+    }
+
+    /// s140 (Task B6b): chain の様相 — stage を x ms、sync 待ちを y ms に積む。
+    fn chain_fixture_steps(steps: usize, stage: f64, wait: f64) {
+        set_phase(Phase::Decode);
+        for _ in 0..steps {
+            // 1 ステップ = 1 サンプル (cuda::chain_step_entered と同じ数え方)
+            split_tick_call(SPLIT_CHAIN_TABLE);
+            let mut acc = [0.0; SPLIT_ROWS];
+            acc[CHAIN_LAUNCH - SPLIT_CHAIN_FIRST] = stage;
+            acc[CHAIN_SYNC_WAIT - SPLIT_CHAIN_FIRST] = wait;
+            split_flush_step(SPLIT_CHAIN_TABLE, &acc, 1, None);
+        }
+    }
+
+    /// s140 (Task B6b): chain の排他の和 = ステップ数 x (段 + 待ち) で、
+    /// サンプル数 (tick) がステップ数と一致する。tick を打たないステップ
+    /// (表に積まない) があれば分母とサンプル数がずれる = 付け漏れが見える。
+    #[test]
+    fn chain_exclusive_sum_matches_steps_and_sample_count() {
+        with_prof_counters(|| {
+            reset();
+            chain_fixture_steps(4, 0.002, 0.030);
+            let p = Phase::Decode.idx();
+            let sum: u64 = (0..SPLIT_CHAIN_ROWS)
+                .map(|i| SPLIT_NS[p][SPLIT_CHAIN_TABLE][i].load(Ordering::Relaxed))
+                .sum();
+            // 1 ステップ = 32 ms (段 2 + 待ち 30) x 4 = 128 ms
+            assert_eq!(sum, 128_000_000, "排他の和がサンプルの壁時計の和にならない");
+            assert_eq!(split_tick_count(SPLIT_CHAIN_TABLE), 4);
+            // 表 A のサンプル数も 4 ステップ分 (launch / wait の 2 段)
+            assert_eq!(split_sample_count(Phase::Decode, SPLIT_CHAIN_TABLE), 8);
+            let s = summary();
+            let head = s
+                .lines()
+                .find(|l| l.contains("samples: decode steps"))
+                .expect("samples ヘッダ");
+            // chain split は launch 段の calls (= 4) — 集計行の意味は s138 のまま
+            assert!(head.contains("chain split 4"), "{head}");
+            let cov = s
+                .lines()
+                .find(|l| l.contains("coverage: lin "))
+                .expect("カバレッジ行");
+            assert!(cov.contains("samples chain 8 / 4 ticks"), "{cov}");
             reset();
         });
     }

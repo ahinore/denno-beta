@@ -2164,6 +2164,37 @@ pub fn chain_seg(op: usize) {
     }
 }
 
+/// 直前の段 (`op`) を締めて、**同じ段**の tick を打ち直す。
+/// ステップ内で同じ段が続く区間 (発行の合間) の区切りに使う。計測 OFF は分岐 1 回。
+#[inline]
+pub fn chain_seg_mark(op: usize) {
+    if !crate::prof::split_on() {
+        return;
+    }
+    let cur = CHAIN_SEG.with(|c| c.get());
+    if cur == 0 || cur != op || chain_row(op).is_none() {
+        return;
+    }
+    let now = Instant::now();
+    let prev = CHAIN_TICK.with(|c| c.replace(Some(now)));
+    if let Some(t0) = prev {
+        chain_charge(now.duration_since(t0).as_secs_f64());
+    }
+}
+
+/// s140: 「このステップは chain 本体まで到達した」ことを表 A のサンプル数に数える。
+/// 1 ステップ 1 回 (`forward_decode_chain` が段の切り替えを始める直前)。
+#[inline]
+pub fn chain_step_entered() {
+    if !crate::prof::split_on() {
+        return;
+    }
+    if CHAIN_SEG.with(|c| c.get()) == 0 {
+        return;
+    }
+    crate::prof::split_tick_call(crate::prof::SPLIT_CHAIN_TABLE);
+}
+
 /// `op` の区間だけを測る (段を切り替えずに、その間の時間を `op` へ引く)。
 ///
 /// 使いどころは「sync の中に入った 1 本のカーネル実行」— decode では
@@ -2544,6 +2575,80 @@ pub fn maybe_gpu_linear_q4_into(
 // 計測 OFF (`split_on()` が偽) は tick が None で、どれも分岐 1 回で戻る —
 // 既定経路はクロック読みも確保もしない (挙動・数値は完全に不変)。
 // ---------------------------------------------------------------------------
+
+/// s140 (Task B6b): 線形ステージ 1 呼び出しを計測器に通す。
+///
+/// s138 は線形ラッパ (`linear_pinned` / `q4_dispatch_tile`) の中だけを分割して
+/// いたが、serve の prefill は **GEMM 経路 (`linear_gemm_into`) と Q4 GEMV
+/// (`q4_dispatch` のマルチタイル) を通る**ため、段の区間が呼び出し全体を覆って
+/// いなかった (実測: 608 call / 7846 ms のバケットに対し 802 サンプル / 445.8 ms)。
+/// ここでは呼び出しの**手前**で tick を打ち、戻ってきた時点の経過をバケット件数へ
+/// 数える。これでタイル分割・GEMM 経路であるかに関係なく 1 call = 1 tick になり、
+/// 排他の和が呼び出し全体の壁時計に一致する。
+///
+/// 計測 OFF (`op_on()` が偽) は分岐 1 回で `f` を素通しする (クロック読み・
+/// 表への書き込みなし = 既定経路の挙動不変)。`split_on()` (テレメトリのみ) の
+/// ときは表だけ積み、バケット件数は数えない (バケットは prof 専用のため)。
+#[inline]
+fn lin_stage<T>(op: usize, f: impl FnOnce() -> T) -> T {
+    if !crate::prof::op_on() {
+        return f();
+    }
+    let t0 = Instant::now();
+    let split = crate::prof::split_on();
+    if split {
+        crate::prof::split_tick_call(crate::prof::SPLIT_Q4_TABLE);
+    }
+    let r = f();
+    lin_stage_close(op, t0);
+    r
+}
+
+/// s140 (Task B6b): 実行先ラベル (on_gpu) つきの `lin_stage`。`time_n_ev` が
+/// 返すのと同じ `(値, GPU で走ったか)` を返すので、呼び出し側は
+/// `let (r, _) = lin_stage_ev(op, || ...);` と書ける (戻り値・数値経路は不変)。
+#[inline]
+fn lin_stage_ev<T>(op: usize, f: impl FnOnce() -> (T, bool)) -> (T, bool) {
+    if !crate::prof::op_on() {
+        return f();
+    }
+    let t0 = Instant::now();
+    let split = crate::prof::split_on();
+    if split {
+        crate::prof::split_tick_call(crate::prof::SPLIT_Q4_TABLE);
+    }
+    let (r, on_gpu) = f();
+    lin_stage_close(op, t0);
+    (r, on_gpu)
+}
+
+/// s140 (Task B6b): 線形呼び出し 1 回を `lin_stage` で包み、**バケットは呼び出し側が
+/// 従来どおり** `prof::time_full` 等で積む形 (chain の段は per-op バケットを
+/// 別の `time_full` で積んでいるため、こちらはバケットを二重に積まない)。
+/// 戻り値は `f` のまま (数値経路は不変)。
+#[inline]
+pub fn lin_stage_tagged<T>(op: usize, f: impl FnOnce() -> T) -> T {
+    if !crate::prof::op_on() {
+        return f();
+    }
+    let t0 = Instant::now();
+    let r = f();
+    lin_stage_close(op, t0);
+    r
+}
+
+/// `lin_stage_tagged` の締め: 分割表 1 サンプル + バケット件数 1。
+#[inline]
+fn lin_stage_close(op: usize, t0: Instant) {
+    if crate::prof::split_on() {
+        crate::prof::split_tick_call(crate::prof::SPLIT_Q4_TABLE);
+    }
+    let ns = t0.elapsed().as_nanos() as u64;
+    if crate::prof::enabled() {
+        crate::prof::count_linear_stage(op, ns, 1, true);
+    }
+    crate::prof::split_sample(op, ns, 0);
+}
 
 /// 段割りの開始 tick (計測 OFF は None)。
 #[inline]
