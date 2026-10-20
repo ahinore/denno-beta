@@ -1160,6 +1160,16 @@ impl Model for Qwen35 {
             // 測り、以降は段ごとに閉じる。内訳の和は呼び出し側 (engine) の
             // `sl_step` (step 全体) に一致する — 計測 OFF は tick が None。
             let mut st = crate::prof::span_begin();
+            // s155 (Task B16): `sl_so_logits` / `sl_so_gap_fwd` は **この decode 1 歩の
+            // 直下を 2 分する排他な区間**なので、食い違うことなく `step_end` の
+            // 残余から引ける (どちらも step の兄弟)。
+            //   sl_so_gap_fwd = forward 入口 → 層ループ末尾 (embed + 全層 + 中間)
+            //   sl_so_logits  = 最終 norm + lm_head → logits が戻り値になった点
+            // **このサイトは cuda feature 非依存**でなければならない: q4 serve は
+            // cuda feature 無しのビルドでも走り、chain 側のサイト
+            // (`forward_decode_chain`) は `#[cfg(feature = "cuda")]` の内側なので
+            // そのビルドでは 1 度も実行されない (B15 実測 sl_so_logits 0 call)。
+            let gap_t = crate::prof::span_begin();
             let l_embed = crate::prof::span_begin();
             let mut x: Vec<f32> = self.embed[tok as usize * e..][..e].to_vec();
             crate::prof::span_end(l_embed, crate::prof::SL_LAY_EMBED);
@@ -1184,15 +1194,24 @@ impl Model for Qwen35 {
             // 層ループ (投影以外も含む) をここで締める。投影の時間は q4 ディスパッチ
             // 入口 (`sl_lin`) が別に積んでいる (層ループの段は「投影以外」)。
             crate::prof::span_end(st.take(), crate::prof::SL_STEP_LAYERS_OTHER);
+            // s155 (B16): 層ループ末尾で `sl_so_gap_fwd` を閉じる (embed + 全層)。
+            crate::prof::span_end(gap_t, crate::prof::SL_SO_GAP_FWD);
             // s148: 最終 norm + lm_head を表 C の 1 段として測る (内訳の和を step 全体に
             // 一致させる)。計測 OFF は `time` が素通しする。
             st = crate::prof::span_begin();
 
             let hf = rmsnorm(&x, &self.norm_w, e, self.eps);
+            // s155 (B16): `sl_so_logits` = 最終 norm + lm_head → logits が戻り値。
+            // s154 (B15) は chain 側 (`forward_decode_chain`) にだけ置いていたが、
+            // あちらは `#[cfg(feature = "cuda")]` の内側で、q4 serve の実ビルド
+            // (cuda feature 無し) では到達しない — 実測 0 call の原因。
+            let logits_t = crate::prof::span_begin();
             // s154 (Task B15): `sl_step_final` に同じ区間を転記する (転記のみ)。
             let l_final = crate::prof::span_begin();
             logits = self.logits_prof(crate::prof::SL_STEP_FINAL, || self.logits(&hf));
             crate::prof::span_end(l_final, crate::prof::SL_LAY_FINAL);
+            // s155 (B16): `sl_so_logits` の終端 (logits が戻り値になった点)。
+            crate::prof::span_end(logits_t, crate::prof::SL_SO_LOGITS);
             crate::prof::span_end(st, crate::prof::SL_STEP_FINAL);
             self.chain_step_end();
         }
@@ -1994,10 +2013,13 @@ impl Qwen35 {
         // KV 容量 (forward 側で kv_bufs(0, 1) 済みだが単独呼び出しでも安全なように)
         let _ = cache.kv_bufs(0, 1);
 
-        // s154 (Task B15・計測のみ): chain 入口の時点。ステップ口 (`step_begin`) から
-        // ここまで = forward 呼び出しの残り (`sl_so_gap_fwd` の一部)。計測 OFF は None。
+        // s155 (Task B16): `sl_so_gap_fwd` = **forward 入口 → 層ループ末尾**。
+        // s154 (B15) はこの 2 つの `span_begin`/`span_end` を隣接させて置いたため
+        // 計ったのは自分の呼び出し 1 往復 (数十 ns) だけで、実測も 0.0 ms だった。
+        // ここでは入口で開き、層ループ末尾 (launch 締めの直前) で閉じる —
+        // embed / rope 表 / バッファ確保 / 全層を含む step の直下兄弟になり、
+        // `step_end` の残余から引ける (`sl_so_logits` と排他・重ならない)。
         let t_chain_in = crate::prof::span_begin();
-        crate::prof::span_end(t_chain_in, crate::prof::SL_SO_GAP_FWD);
 
         // rope テーブル (pos 依存・1 ステップ 1 回。CPU rope_partial_interleaved と
         // 同一式 → dno_qknorm_rope_pi の QK-Norm+rope を bit-exact にする)
@@ -2186,6 +2208,9 @@ impl Qwen35 {
         // `sl_step_final` の値は 1 bit も動かさない)。ここから後のホスト側の
         // 処理 (host 戻り / logits 反映) は `sl_so_logits` が測る。
         crate::prof::span_end(l_final, crate::prof::SL_LAY_FINAL);
+        // s155 (B16): 層ループ + lm_head の発行が終わった点で `sl_so_gap_fwd` を閉じる
+        // (forward 入口 → 層ループ末尾。`sl_so_logits` とは重ならない兄弟)。
+        crate::prof::span_end(t_chain_in, crate::prof::SL_SO_GAP_FWD);
         // s140: 層ループ + lm_head の発行を締めた時点で launch 段を切り直す
         // (ここから下の sync 待ちを launch と混ぜない。計測 OFF は分岐 1 回)。
         crate::cuda::chain_seg_mark(crate::prof::CHAIN_LAUNCH);
@@ -2226,15 +2251,13 @@ impl Qwen35 {
             t_launch_done.map(|t| t.elapsed().as_secs_f64()),
         );
         chain_seg(crate::prof::CHAIN_D2H_LOGITS);
-        let logits_t = crate::prof::span_begin();
         let logits = crate::prof::time_if_on(crate::prof::D2H_LOGITS_COPY, || {
             chain_download(CH_LOGITS, self.vocab)
         })?;
-        // s154 (Task B15): `sl_step_other` の child `sl_so_logits` = ホスト側の
-        // logits 反映 (D2H の戻り → 戻り値の `Some(logits)`)。区間の切り方は
-        // child の合計が `sl_step_other` を超えないよう「実測の 1 本」に閉じる。
-        // 計測 OFF は `span_begin` が None を返し、`span_end` は素通し
-        // (数値経路・既定挙動は不変)。
+        // s155 (B16): ここに `sl_so_logits` を置くのをやめた。この地点の D2H は
+        // `sl_lin_d2h` が既に測っており (転記)、ホスト側の logits 反映は
+        // cuda feature 無しの per-op 経路 (`[cfg(feature = "cuda")]` の外) の
+        // サイトが測る — B15 ではこの内側にだけ置いたため実機で 0 call だった。
         // ホスト反映: Full 層 k/v 行のみ (s50: GDN 状態はステップ毎に戻さず
         // GPU ミラーを権威のままにする — 次の prefill 冒頭 / CPU フォールバック時に
         // chain_q35_gdn_flush_pending が回復する。ステップ毎 D2H ~75MB/step が
@@ -2244,10 +2267,6 @@ impl Qwen35 {
             chain_q35_kv_stage_flush(cache, n_layers, kv_dim, pos0, &gdn_layers)
         })?;
         cache.advance(1);
-        // s154 (Task B15): `sl_so_logits` の終端。ここまで (D2H の戻り → logits の
-        // 戻り値化) が「host 側の logits 反映」で、KV flush は従来どおり
-        // `D2H_KV_FLUSH` が測る (二重に child へ入れない)。
-        crate::prof::span_end(logits_t, crate::prof::SL_SO_LOGITS);
         // ステップ末尾: 最後の段を締めて 1 ステップ分を表 A へ流し込む。
         chain_step_end();
         Some(logits)

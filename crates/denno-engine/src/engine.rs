@@ -1146,6 +1146,10 @@ impl Engine {
         let st = crate::prof::step_begin();
         let r = self.step_chat_batch_inner(batch, on_deltas);
         crate::prof::step_end(st);
+        // s155 (Task B16): `sl_step_other` の確定は **forward の戻りの後**。
+        // `sl_step` の内訳 (`sl_step_lay_other` / `sl_so_*` / 次の `sl_lin`) は
+        // step の後半で閉じるので、`step_end` の時点では揃っていない。
+        crate::prof::step_end_tail();
         r
     }
 
@@ -1168,6 +1172,12 @@ impl Engine {
                 done[i] = true;
                 continue;
             }
+            // s155 (Task B16): `sl_so_sample_pen` = サンプラ前の前処理 (penalty + 拘束マスク)。
+            // s154 (B15) は行だけ作ってサイトを置いていなかった (実測 0 call は
+            // 空振りではなく未計装)。両方とも条件付き (penalty 指定時 / tool_choice
+            // 指定時) なので、**区間は条件の外側に必ず 1 本**置く — 何もしなかった
+            // 区間は (ほぼ) 0 ns として積まれ、step 数と号数が一致する。
+            let pen_t = crate::prof::span_begin();
             // A2.5: penalty 指定時のみ既出トークンを抑制 (無効時はビット不変)
             Self::apply_session_penalty(sess);
             // 第21: tool_choice 拘束 (Some のとき sample 直前に許容集合マスク)。
@@ -1179,6 +1189,7 @@ impl Engine {
                     .unwrap()
                     .apply(&mut sess.logits, &self.tok, &eos);
             }
+            crate::prof::span_end(pen_t, crate::prof::SL_SO_SAMPLE_PEN);
             // s148: 表 C の `sl_step_sampler` (1 セッション 1 サンプル)。
             let samp_t = crate::prof::span_begin();
             let next = crate::prof::time(crate::prof::SAMPLER, || {
