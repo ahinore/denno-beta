@@ -637,6 +637,17 @@ impl Engine {
         self.slot_reserved[slot] = 0;
     }
 
+    /// s146 (B8-3): クライアント向けエラー分類のために KV スロット数を読む
+    /// (読み取り専用。数値経路には触れない)。
+    pub fn slot_count(&self) -> usize {
+        self.caches.len()
+    }
+
+    /// s146 (B8-3): 実行中 (busy) のスロット数。分類メッセージ用の読み取りのみ。
+    pub fn slot_busy_count(&self) -> usize {
+        self.slot_busy.iter().filter(|b| **b).count()
+    }
+
     /// P4 ステッパ: リクエスト状態を準備する (トークン化 + max_tokens クランプ +
     /// サンプラ構築)。KV キャッシュには触れない。
     /// 以後 `install_session` → `step_chat` (true が返るまで) の順に進める。

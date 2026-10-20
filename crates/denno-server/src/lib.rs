@@ -24,7 +24,7 @@ mod logging;
 mod scheduler;
 mod stream_asm;
 pub use logging::{init_serve_logging, NonBlockingStdout};
-pub use scheduler::{Job, MAX_ACTIVE_SESSIONS, QueueFull, Scheduler};
+pub use scheduler::{AdmitFailure, AdmitKind, Job, MAX_ACTIVE_SESSIONS, QueueFull, Scheduler};
 
 pub struct AppState {
     pub engine: Arc<Mutex<Engine>>,
@@ -105,6 +105,44 @@ impl ApiError {
     fn api(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "api_error", message)
     }
+    /// s146 (B8-3 / P4-9): admit 失敗 (KV スロット枯渇など) の分類済みエラー。
+    ///
+    /// ステータスの選択 (ルート・他のエラー経路は不変):
+    /// - `SlotsBusy` → **429 Too Many Requests**。全スロットが実行中リクエストに
+    ///   占有されている状態は **一時的な容量不足** で、待てば必ず通る。
+    ///   429 は「後で再試行」を意味する標準的な信号 (Retry-After なしでも可)。
+    ///   `error.type` は Anthropic 互換の `rate_limit_error` — クライアントの
+    ///   再試行判定はこの型で行われる想定。
+    /// - `SessionLimit` (防御経路: 同時実行上限) → 503 overloaded_error。
+    ///   これは同じファイルのキュー満杯 (`queue_full_error`) と同じ「過負荷」の
+    ///   意味論なので、既存の 503 overloaded_error に揃える。
+    /// - `Internal` → 500 api_error。再試行で解決しない内部要因。
+    fn from_admit_failure(f: &scheduler::AdmitFailure) -> Self {
+        use scheduler::AdmitKind;
+        match f.kind() {
+            AdmitKind::SlotsBusy => Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                AdmitKind::SlotsBusy.error_type(),
+                f.client_message(),
+            ),
+            AdmitKind::SessionLimit => Self::overloaded(f.client_message()),
+            AdmitKind::Internal => Self::api(f.client_message()),
+        }
+    }
+    /// スケジューラから返った `anyhow::Error` を HTTP エラーへ変換する。
+    /// 分類済みの [`scheduler::AdmitFailure`] は種類で、それ以外は従来どおり
+    /// 文字列でステータスを決める (既存挙動を変えない)。
+    pub(crate) fn from_anyhow(e: anyhow::Error) -> Self {
+        if let Some(f) = e.downcast_ref::<scheduler::AdmitFailure>() {
+            return Self::from_admit_failure(f);
+        }
+        let msg = format!("{e:#}");
+        if msg.contains("invalid_request_error") {
+            Self::invalid_request(msg)
+        } else {
+            Self::api(msg)
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -115,6 +153,19 @@ impl IntoResponse for ApiError {
         });
         (self.status, Json(body)).into_response()
     }
+}
+
+/// s146: スケジューラ経由の `anyhow::Error` を HTTP エラーへ変換する
+/// (ハンドラが使うのと同じ関数。統合テストから admit 失敗のマッピングを
+/// 直接検証できるように公開する)。
+pub fn error_from_anyhow(e: anyhow::Error) -> ApiError {
+    ApiError::from_anyhow(e)
+}
+
+/// s146: `ApiError` の中身 (status, error.type, message) をテスト用に取り出す。
+/// サーバー挙動には影響しない (読み取りのみ)。
+pub fn debug_api_error(e: ApiError) -> (u16, &'static str, String) {
+    (e.status.as_u16(), e.kind, e.message)
 }
 
 // ---------- リクエストDTO ----------
@@ -1015,14 +1066,7 @@ async fn messages(
             .await
             .map_err(|e| anyhow::anyhow!("scheduler dropped: {e}"))
             .and_then(|r| r)
-            .map_err(|e| {
-                let msg = format!("{e:#}");
-                if msg.contains("invalid_request_error") {
-                    ApiError::invalid_request(msg)
-                } else {
-                    ApiError::api(msg)
-                }
-            })?;
+            .map_err(ApiError::from_anyhow)?;
         // tool use: モデル出力から tool_call block を抽出し content blocks を組む
         let mut calls = Vec::new();
         if tools_active {
