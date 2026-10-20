@@ -429,6 +429,52 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   (3.10.12) — the line above now runs as written; the remaining step is only adding it to
   the gitignored `GPU_VERIFY` script.
 
+### P4-5: Q4_0 native weight path — DONE (s123)
+- Why: int8 mode expands every GGUF to fp32 and re-quantises to one byte per element, so a
+  4.5-bit source still costs 8 bits in VRAM (27B: 25,709 MB, only 5.3 GB left on a 32,607 MiB
+  card). UD-IQ2_XXS cannot even load (TQ1_0 / IQ1_M are not decoded in `kquant.rs`), and it
+  would not have helped in int8 mode anyway. The lever was to keep the GGUF 4-bit blocks as
+  they are.
+- What was implemented (opt-in, `--quant q4` / `--quant q4_0`; 9B int8 and the anchors are
+  untouched):
+  - `Linear::Q4(Q4Linear)` holds the Q4_0 blocks verbatim: 32 elements = f16 scale (2B) +
+    16B nibbles = 18B, dequantised as `y = d * (q - 8)` with `d` allowed to be negative.
+    `Q4Linear::quantize` follows ggml's `quantize_row_q4_0_ref` (including its saturation at
+    15 when the block extreme is negative, which caps the error at one block scale there).
+  - CPU path `tensor::matvec_rows_bt_q4_into` (rayon over rows, in-order f32 accumulation).
+  - Two kernels in `kernels_int8.cu`: `dno_gemv_q4_0` (1 warp = 1 output row, 1 block = 8 rows)
+    and `dno_gemm_q4_0` (1 block = 16 rows x 256 cols, 34 KB smem). Both read an SOA layout
+    built at upload time: `nib` = one uint4 per block (16B aligned), `sc` = one f32 per block.
+  - `cuda::maybe_gpu_linear_q4{,_into}` mirrors the int8 seam (weight registry keyed by
+    `Q4Linear.uid`, permanent latch on error). `m > 16` goes to the tiled GEMM; the int8
+    `gemm_min_m` (256) is deliberately not applied because the Q4 CPU fallback is a plain
+    loop, so GPU GEMM wins even at m=17. Prefill at m=17..255 was measured at seconds/token
+    before that change and milliseconds after.
+  - `concat_rows` gained a Q4 arm so the gate+up fusion (s80) still applies.
+- Numbers (27B, uniform Q4_0 source, GPU, 2026-10-20):
+  - VRAM **18,369 MiB** (int8: 31,977) — about 16.7 GB of weights, so ~13 GB stays free.
+  - decode **178-186 ms/token** (80 tokens, prefix cached, three runs 16.30 / 14.89 / 14.23 s);
+    int8 was 669 ms/token, so 3.6x. Three runs produced identical text (deterministic).
+  - prefill **34 tok/s** (1,240 tokens in 36.38 s).
+  - short prompts: "The capital of France is" -> `Paris` (4 tokens, 1.14 s once warm),
+    "Name three colours." -> 14 tokens 4.45 s, Japanese capital -> `日本の首都は東京です。` 9
+    tokens 3.73 s. First request after launch pays the 16.7 GB upload (10.9 s) on top.
+  - correctness contract: CPU vs GPU maxabs 9.5e-6 (GEMV) and **0 (GEMM, bit-exact)** at
+    k=256 n=64 for m=1/7/16/300; Q4 vs fp32-on-dequantised-weights <= 1e-5; 2nd run bit-identical.
+- Tests: 246 CPU lib tests pass (5 new Q4 unit tests + 1 concat test), plus the ignored GPU test
+  `cuda::tests::cuda_q4_linear_matches_cpu`. GPU_VERIFY on the same tree: 3/3 anchors MATCH,
+  RESULT: PASS, 9B decode unchanged at 16.4 ms/token.
+- Reproduce: `p44_q4.sh` (launch + VRAM), `p44b_q4_ask.sh` (answers), `p44c_q4_dec.sh`
+  (decode timing + determinism), `p44d_q4_prefill.sh` (prefill) in the operator tools directory.
+- Still open:
+  - `kquant.rs` has no TQ1_0 (type 29) or IQ1_M (type 24) decoder, so IQ2-class files still
+    cannot be loaded. With the native path in place that is now the only thing between the
+    6.8 GB UD-IQ2_XXS and a 24 GB headroom, and it is a separate piece of work.
+  - Blocks are re-quantised from fp32 today (GGUF -> fp32 -> Q4_0), which is within one block
+    scale of the file's own blocks. Passing the file's blocks straight through needs the tensor
+    type plumbed into `Linear`, and would also skip the 100 GB fp32 expansion at load.
+  - The CPU Q4 path is a correctness fallback, not a fast path.
+
 ## P5 — tooling and ops
 
 ### P5-1: dashboard shows cold A/B and decode — DASHBOARD DONE (s109), era wired in (s110), GPU run is a human step

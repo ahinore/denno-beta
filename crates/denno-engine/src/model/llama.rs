@@ -125,7 +125,7 @@ impl LlamaQwen2 {
         let lm_head = if tied {
             match quant {
                 QuantMode::Fp32 => None,
-                QuantMode::Int8 => {
+                QuantMode::Int8 | QuantMode::Q4_0 => {
                     let l = Linear::new(g("model.embed_tokens.weight")?, e, vocab, quant);
                     quant_bytes += l.weight_bytes();
                     Some(l)
@@ -1411,7 +1411,7 @@ mod tests {
         }
         let lm_head = match mode {
             QuantMode::Fp32 => None,
-            QuantMode::Int8 => Some(mk(prng(vocab * e, 9999), e, vocab)),
+            QuantMode::Int8 | QuantMode::Q4_0 => Some(mk(prng(vocab * e, 9999), e, vocab)),
         };
         LlamaQwen2 {
             e,
