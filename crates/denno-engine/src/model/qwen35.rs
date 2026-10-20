@@ -550,6 +550,16 @@ impl Qwen35 {
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     #[inline]
     fn lin<T>(&self, op: usize, f: impl FnOnce() -> T) -> T {
+        let l = crate::prof::span_begin();
+        let r = self.lin_inner(op, f);
+        crate::prof::span_end(l, crate::prof::SL_SO_LIN_SUM);
+        r
+    }
+
+    /// [`lin`] の本体 (s154: `sl_so_lin_sum` の区間を外に出しただけ。数値経路は不変)。
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    #[inline]
+    fn lin_inner<T>(&self, op: usize, f: impl FnOnce() -> T) -> T {
         #[cfg(feature = "cuda")]
         {
             crate::cuda::lin_stage_tagged(op, f)
@@ -1150,7 +1160,9 @@ impl Model for Qwen35 {
             // 測り、以降は段ごとに閉じる。内訳の和は呼び出し側 (engine) の
             // `sl_step` (step 全体) に一致する — 計測 OFF は tick が None。
             let mut st = crate::prof::span_begin();
+            let l_embed = crate::prof::span_begin();
             let mut x: Vec<f32> = self.embed[tok as usize * e..][..e].to_vec();
+            crate::prof::span_end(l_embed, crate::prof::SL_LAY_EMBED);
 
             for (li, layer) in self.layers.iter().enumerate() {
                 // --- attention ---
@@ -1177,7 +1189,10 @@ impl Model for Qwen35 {
             st = crate::prof::span_begin();
 
             let hf = rmsnorm(&x, &self.norm_w, e, self.eps);
+            // s154 (Task B15): `sl_step_final` に同じ区間を転記する (転記のみ)。
+            let l_final = crate::prof::span_begin();
             logits = self.logits_prof(crate::prof::SL_STEP_FINAL, || self.logits(&hf));
+            crate::prof::span_end(l_final, crate::prof::SL_LAY_FINAL);
             crate::prof::span_end(st, crate::prof::SL_STEP_FINAL);
             self.chain_step_end();
         }
@@ -1979,6 +1994,11 @@ impl Qwen35 {
         // KV 容量 (forward 側で kv_bufs(0, 1) 済みだが単独呼び出しでも安全なように)
         let _ = cache.kv_bufs(0, 1);
 
+        // s154 (Task B15・計測のみ): chain 入口の時点。ステップ口 (`step_begin`) から
+        // ここまで = forward 呼び出しの残り (`sl_so_gap_fwd` の一部)。計測 OFF は None。
+        let t_chain_in = crate::prof::span_begin();
+        crate::prof::span_end(t_chain_in, crate::prof::SL_SO_GAP_FWD);
+
         // rope テーブル (pos 依存・1 ステップ 1 回。CPU rope_partial_interleaved と
         // 同一式 → dno_qknorm_rope_pi の QK-Norm+rope を bit-exact にする)
         let tab = q35_rope_pi_table(pos0, self.n_rot, self.theta);
@@ -2005,7 +2025,9 @@ impl Qwen35 {
 
         // 埋め込み 1 行 → residual stream デバイス常駐開始
         chain_seg(crate::prof::CHAIN_HOST_API);
+        let l_embed = crate::prof::span_begin();
         chain_upload(CH_X, &self.embed[token as usize * e..][..e], e, 1)?;
+        crate::prof::span_end(l_embed, crate::prof::SL_LAY_EMBED);
 
         // s140 (Task B6b): chain 本体に入った時点で「chain が実際に走った」ことを
         // 記録する (段は下の launch / D2H / sync が乗っ取る)。外側 (embedding 用意・
@@ -2021,12 +2043,15 @@ impl Qwen35 {
         chain_seg(crate::prof::CHAIN_LAUNCH);
         for (li, layer) in self.layers.iter().enumerate() {
             crate::telemetry_layer_begin(li as u16);
+            let l_norm = crate::prof::span_begin();
             crate::prof::time_full(crate::prof::RMSNORM, 1, true, || {
                 chain_rmsnorm(layer.attn_ln1(), eps, pending, CH_H, e, 1, li * 3)
             })?;
+            crate::prof::span_end(l_norm, crate::prof::SL_LAY_NORM_IN);
             match &layer.attn {
                 AttnKind::Gdn(g) => {
                     gdn_layers.push(li);
+                    let l_proj = crate::prof::span_begin();
                     // qkv + z 投影: CH_QKV = [qkv (2nk*dk+nv*dv) | z (nv)]
                     crate::cuda::lin_stage_tagged(crate::prof::QKV, || -> Option<()> {
                         let qkv = g.qkv_w.quant8()?;
@@ -2037,6 +2062,8 @@ impl Qwen35 {
                     // (y → CH_ATT・新状態は staged async D2H・ping-pong 面 交換)
                     // s57 (T4): decode chain は全 op がデバイス常駐で走るため
                     // 実行先ラベルは gpu 固定。attn_core は GDN バケットに分離。
+                    crate::prof::span_end(l_proj, crate::prof::SL_LAY_GDN_PROJ);
+                    let l_scan = crate::prof::span_begin();
                     crate::prof::time_full(crate::prof::ATT_GDN, 1, true, || -> Option<()> {
                         let (bw, aw) = match (&g.beta_w, &g.alpha_w) {
                             (Linear::F32 { w: bw, .. }, Linear::F32 { w: aw, .. }) => (bw, aw),
@@ -2065,6 +2092,7 @@ impl Qwen35 {
                             e,
                         )
                     })?;
+                    crate::prof::span_end(l_scan, crate::prof::SL_LAY_GDN_SCAN);
                     // out_proj: y (CH_ATT) → e (CH_O)
                     crate::cuda::lin_stage_tagged(crate::prof::OPROJ, || -> Option<()> {
                         let ow = g.out_w.quant8()?;
@@ -2073,15 +2101,18 @@ impl Qwen35 {
                 }
                 AttnKind::Full(f) => {
                     // qkv 投影: CH_QKV = [qg (heads*2dh) | k (kv_dim) | v (kv_dim)]
+                    let l_qk = crate::prof::span_begin();
                     crate::cuda::lin_stage_tagged(crate::prof::QKV, || -> Option<()> {
                         let qw = f.q_w.quant8()?;
                         let kw = f.k_w.quant8()?;
                         let vw = f.v_w.quant8()?;
                         chain_linear_grouped(&[qw, kw, vw], CH_H, CH_QKV, 1)
                     })?;
+                    crate::prof::span_end(l_qk, crate::prof::SL_LAY_FULL_QK);
                     // QK-Norm + partial rope (q → CH_Q35_Q・k → KV ミラー pos0 行直書き)
                     // → GQA attention → sigmoid 出力ゲート (k/v 行は staged async D2H)
                     // s57 (T4): full attention バケット (ATT_FULL)・devices chain 上で走る。
+                    let l_core = crate::prof::span_begin();
                     crate::prof::time_full(crate::prof::ATT_FULL, 1, true, || {
                         chain_q35_fullattn(
                             mid,
@@ -2099,18 +2130,24 @@ impl Qwen35 {
                             &f.k_norm_w,
                         )
                     })?;
+                    crate::prof::span_end(l_core, crate::prof::SL_LAY_FULL_CORE);
                     // o_proj: att (CH_ATT) → e (CH_O)
+                    let l_op = crate::prof::span_begin();
                     crate::cuda::lin_stage_tagged(crate::prof::OPROJ, || -> Option<()> {
                         let ow = f.o_w.quant8()?;
                         chain_linear_grouped(&[ow], CH_ATT, CH_O, 1)
                     })?;
+                    crate::prof::span_end(l_op, crate::prof::SL_LAY_FULL_OPROJ);
                 }
             }
             pending = Some(CH_O);
             // --- FFN (llama chain と同一): residual+rmsnorm → gate/up → swiglu → down
+            let l_norm2 = crate::prof::span_begin();
             crate::prof::time_full(crate::prof::RMSNORM, 1, true, || {
                 chain_rmsnorm(&layer.ln2_w, eps, pending, CH_H, e, 1, li * 3 + 1)
             })?;
+            crate::prof::span_end(l_norm2, crate::prof::SL_LAY_NORM_POST);
+            let l_gu = crate::prof::span_begin();
             crate::cuda::lin_stage_tagged(crate::prof::GATE_UP, || -> Option<()> {
                 // s80 (T7b-1): 連結重み 1 本 (行順 [gate | up]) を 1 回の grouped
                 // GEMV で計算する (旧: 2 uid のグループ)。行ごとに量子化・累積が
@@ -2118,13 +2155,18 @@ impl Qwen35 {
                 let gw = layer.gate_up_w.quant8()?;
                 chain_linear_grouped(&[gw], CH_H, CH_GA, 1)
             })?;
+            crate::prof::span_end(l_gu, crate::prof::SL_LAY_FFN_GATE);
+            let l_sw = crate::prof::span_begin();
             crate::prof::time_full(crate::prof::SWIGLU, 1, true, || {
                 chain_swiglu(CH_GA, CH_ACT, self.ff, 1)
             })?;
+            crate::prof::span_end(l_sw, crate::prof::SL_LAY_SWIGLU);
+            let l_dn = crate::prof::span_begin();
             crate::cuda::lin_stage_tagged(crate::prof::DOWN, || -> Option<()> {
                 let dw = layer.down_w.quant8()?;
                 chain_linear_grouped(&[dw], CH_ACT, CH_DOWN, 1)
             })?;
+            crate::prof::span_end(l_dn, crate::prof::SL_LAY_FFN_DOWN);
             pending = Some(CH_DOWN);
             crate::telemetry_layer_flush();
         }
@@ -2134,11 +2176,16 @@ impl Qwen35 {
         // lm_head 計算だけのバケットに分けないと実機プロファイルの
         // 「lm_head」が sync 待ち込みで過大帰属になる。観測のみで数値経路不変)
         chain_seg(crate::prof::CHAIN_LAUNCH);
+        let l_final = crate::prof::span_begin();
         crate::prof::time_full(crate::prof::LM_HEAD, 1, true, || -> Option<()> {
             chain_rmsnorm(&self.norm_w, eps, pending, CH_H, e, 1, n_layers * 3)?;
             let lmq = self.lm_head.as_ref().unwrap().quant8()?;
             chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)
         })?;
+        // s154 (Task B15): `sl_step_final` に同じ区間を転記する (転記のみ・
+        // `sl_step_final` の値は 1 bit も動かさない)。ここから後のホスト側の
+        // 処理 (host 戻り / logits 反映) は `sl_so_logits` が測る。
+        crate::prof::span_end(l_final, crate::prof::SL_LAY_FINAL);
         // s140: 層ループ + lm_head の発行を締めた時点で launch 段を切り直す
         // (ここから下の sync 待ちを launch と混ぜない。計測 OFF は分岐 1 回)。
         crate::cuda::chain_seg_mark(crate::prof::CHAIN_LAUNCH);
@@ -2179,9 +2226,15 @@ impl Qwen35 {
             t_launch_done.map(|t| t.elapsed().as_secs_f64()),
         );
         chain_seg(crate::prof::CHAIN_D2H_LOGITS);
+        let logits_t = crate::prof::span_begin();
         let logits = crate::prof::time_if_on(crate::prof::D2H_LOGITS_COPY, || {
             chain_download(CH_LOGITS, self.vocab)
         })?;
+        // s154 (Task B15): `sl_step_other` の child `sl_so_logits` = ホスト側の
+        // logits 反映 (D2H の戻り → 戻り値の `Some(logits)`)。区間の切り方は
+        // child の合計が `sl_step_other` を超えないよう「実測の 1 本」に閉じる。
+        // 計測 OFF は `span_begin` が None を返し、`span_end` は素通し
+        // (数値経路・既定挙動は不変)。
         // ホスト反映: Full 層 k/v 行のみ (s50: GDN 状態はステップ毎に戻さず
         // GPU ミラーを権威のままにする — 次の prefill 冒頭 / CPU フォールバック時に
         // chain_q35_gdn_flush_pending が回復する。ステップ毎 D2H ~75MB/step が
@@ -2191,6 +2244,10 @@ impl Qwen35 {
             chain_q35_kv_stage_flush(cache, n_layers, kv_dim, pos0, &gdn_layers)
         })?;
         cache.advance(1);
+        // s154 (Task B15): `sl_so_logits` の終端。ここまで (D2H の戻り → logits の
+        // 戻り値化) が「host 側の logits 反映」で、KV flush は従来どおり
+        // `D2H_KV_FLUSH` が測る (二重に child へ入れない)。
+        crate::prof::span_end(logits_t, crate::prof::SL_SO_LOGITS);
         // ステップ末尾: 最後の段を締めて 1 ステップ分を表 A へ流し込む。
         chain_step_end();
         Some(logits)

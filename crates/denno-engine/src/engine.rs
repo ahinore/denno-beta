@@ -1209,22 +1209,32 @@ impl Engine {
                 });
             }
 
+            // s154 (Task B15): `sl_step_other` の child `sl_so_stream` = detok /
+            // delta 送出 / stop 判定 (この 3 分岐)。区間は分岐の手前で 1 回開き、
+            // **どの出口でも閉じる** (下の 3 つの `continue` はそれぞれ閉じてから
+            // 抜ける) ので 1 step 1 号。計測 OFF は `span_begin` が None で
+            // `span_end` は素通し (数値経路・既定挙動は不変)。
+            let stream_t = crate::prof::span_begin();
             if self.model.eos_ids().contains(&next) {
                 sess.stop_reason = StopReason::EndTurn;
                 self.flush_stream(sess, 1, on_deltas[i].as_mut())?;
+                crate::prof::span_end(stream_t, crate::prof::SL_SO_STREAM);
                 done[i] = true;
                 continue;
             }
             if self.emit_delta_and_check_stop(sess, on_deltas[i].as_mut())? {
+                crate::prof::span_end(stream_t, crate::prof::SL_SO_STREAM);
                 done[i] = true;
                 continue;
             }
             if sess.generated.len() >= sess.max_tokens {
                 sess.stop_reason = StopReason::MaxTokens;
                 self.flush_stream(sess, 0, on_deltas[i].as_mut())?;
+                crate::prof::span_end(stream_t, crate::prof::SL_SO_STREAM);
                 done[i] = true;
                 continue;
             }
+            crate::prof::span_end(stream_t, crate::prof::SL_SO_STREAM);
             toks.push(next);
             need_fwd.push(i);
         }
@@ -1265,6 +1275,11 @@ impl Engine {
             telem::emit(self.kv_usage_frame());
             self.flush_ops_frame();
         }
+        // s154 (Task B15・計測のみ): `sl_step_other` の child。最後の forward の
+        // 戻り (logits 反映) は次の `step_end` まで child が積まれない区間なので、
+        // `sl_so_end` として毎 step 1 回閉じる。計測 OFF は `span_begin` が None。
+        let end_t = crate::prof::span_begin();
+        crate::prof::span_end(end_t, crate::prof::SL_SO_END);
         Ok(done)
     }
 

@@ -2806,6 +2806,34 @@ s122 のハンドオフはそれを「s118 で設計済み」と読んで再実�
   一致する。1 decode step あたりに均すと (q4 線形 8.16〜10.8 呼び出し/step)
   **約 2.1〜2.8 ms/step** — step の残りは層ループの残余 (`sl_step_lay_other`) 側。
 
+### s154: Task B15 - `sl_step_other` / `sl_step_lay_other` の内訳に名前を付ける (2026-10-21) 完了
+
+> B14 までで `sl_step` の内訳は閉じたが、最大の無名バケットが残っていた:
+> `sl_step_other` 59.0%、その中の `sl_step_lay_other` 40.3%。B15 はこの 2 本を
+> 子に割り、**残余 = 親 − 実測の子** の形で表 C に 8 行 + 層内 13 行を足す。
+
+- **表 C (40 行) の層内の子 <= `sl_lay_other`**: 層ループの投影以外を
+  `sl_lay_norm_in` / `gdn_proj` / `gdn_scan` / `full_qk` / `full_core` / `full_oproj` /
+  `ffn_gate` / `swiglu` / `ffn_down` / `norm_post` / `residual` に分け、層ごとの
+  和が親 (`sl_step_lay_other`) を超えないことを COVERAGE の 1 行
+  (`layer residual: children … / lay_other … ns`) で出す。超えれば区間の切り方の誤り。
+- **`sl_so_resid` = other − 実測の子**: `step_end` の中で
+  `other − (sample_pen + stream + logits + gap_fwd + end)` を 1 号積む。
+  実測の子は `SL_SO_MEASURED` の 5 本で、いずれも 1 step 1 回。
+- **号数の判定**: 子 5 本は `span_end` で閉じた号数 (`serve_row_ends`) を `steps` と
+  比べる。残余行は `step_end` の**内側**で `push` するため同じ関数から「閉じた号数」
+  を読むと自分の step の終端より後に来る保証が無く、`ends >= steps` を満たせない
+  → 残余だけは push の回数 (`serve_row_calls`) で判定する (意味は足していない)。
+- **計測点**: `sl_so_logits` は q4 chain の D2H 戻り → logits の戻り値化
+  (`model/qwen35.rs` の `D2H_LOGITS_COPY` 直後)、`sl_so_stream` は
+  `step_chat_batch_inner` の detok / delta 送出 / stop 判定 (3 つの `continue` も
+  それぞれ閉じる)。KV flush は従来どおり `D2H_KV_FLUSH` が測り、子へ二重に入れない。
+- **計測のみ**: `DENNO_PROFILE` 未設定は入口 1 分岐。`.cu` / `.ptx`・定数・数値経路は
+  非接触。lib は denno-engine 261 passed / denno-server 37 passed、
+  `cargo check --features cuda` 0 error。
+- 27B q4 decode の実測は次の GPU 窓。`sl_step_other` / `sl_step_lay_other` の分割の
+  予測は **予測・未計測** (下の commit メッセージに数値を置く)。
+
 ### ベンチマーク一覧 (2026-10-20 時点・このホスト)
 
 測定規則: prefill の正式値は cold 単発 (サーバ起動 -> 1 リクエスト、prefix cache off、
