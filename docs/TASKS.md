@@ -492,7 +492,7 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   machine that measures ~3% slower than yesterday. The JSON was rendered with
   `python3 scripts/dashboard.py --cold-ab-dir <dir> --out p51_real.html`
   (4,729 bytes, inline SVG only, real values 13.60-13.63 s). The JSON and the page are
-  kept outside the repo (`C:\Users\ahino\denno-tools\`), because the `--json` payload
+  kept outside the repo (an operator-side tools directory), because the `--json` payload
   records host-specific binary paths. Still open: no decode point on the chart, since a
   cold A/B carries no decode number and the only decode source is a `PF_BENCH` line.
 
