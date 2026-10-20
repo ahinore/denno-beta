@@ -698,6 +698,32 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   about 2.8 GB of headroom left. Keep desktop sessions short and start a new chat instead
   of letting the history grow.
 
+### P5-4: single-layer Q4 bench instead of the 6-minute serve loop - DONE (main session, 2026-10-20)
+- Full-model measurement (start 27B, send 3,020 tokens, read the profile) costs about
+  six minutes per data point, which is too slow to iterate on a kernel.
+- `crates/denno-engine/examples/bench_q4_line.rs` times one linear layer in isolation:
+  `cargo run --release -p denno-engine --features cuda --example bench_q4_line`.
+  Defaults are the real 27B `gate_up` shape (k 5120, n 34816, 64 layers). Weights are
+  synthetic but quantized into the same Q4_0 block layout, so the kernel sees the same
+  bytes per row and the same working set; only the values differ.
+- Every run also checks rows 0-3 against the CPU dequant, so a wrong answer shows up as
+  text instead of a silently fast number.
+- First measurement (100.3 MB of Q4 weights, 30 iterations, `--layers 64`):
+  | m | ms/call | effective GB/s | x 64 layers |
+  |---|---|---|---|
+  | 1 (decode GEMV) | 0.416 | 240.9 | 26.6 ms/token |
+  | 2 | 0.807 | 124.2 | 51.7 ms/token |
+  | 8 | 3.216 | 31.2 | 205.8 ms/token |
+  | 64 | 2.944 | 34.1 | 188.4 ms/token |
+  | 300 (prefill GEMM) | 16.877 | 5.9 | n/a |
+- Two anomalies to keep in mind for the GEMV rewrite: the cost is linear in `m` up to 8
+  (every extra row re-reads the whole matrix), and `m=8` is slower than `m=64`, so a
+  threshold between them changes strategy.
+- Iteration cost is now about 12 s of build plus 5 s of run, with no server and no long
+  prompt. The same pattern works for the other bottlenecks (one GDN layer at
+  nv/dk/dv = 16/128/128 with conv 4, or `lm_head`), which is the cheap way to test a
+  kernel before paying for a full-model run.
+
 ## Suggested order
 
 1. ~~P1-2 attention (942 ms bucket), candidate 4 = causal key-range truncation~~ → **rejected in
