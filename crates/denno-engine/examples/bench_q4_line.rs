@@ -7,10 +7,12 @@
 //!
 //! 使い方:
 //!   cargo run --release -p denno-engine --features cuda --example bench_q4_line
-//!   cargo run --release -p denno-engine --features cuda --example bench_q4_line -- --k 5120 --n 34816 --layers 64 --iters 50
+//!   ... --example bench_q4_line -- --k 17408 --n 5120          # down_proj
+//!   ... --example bench_q4_line -- --n 248320 --layers 1 --raw  # lm_head
 //!
 //! 出力の見方: m=1 が decode の GEMV、m=300 が prefill のタイル GEMM。
 //! `layers` を掛けた値が 1 token あたりの見積り (プロファイルの bucket と比較する)。
+//! `--raw` は f32 の重みを作らずブロックを直接埋める (巨大な層用。CPU 比較は省く)。
 
 use std::time::Instant;
 
@@ -36,42 +38,57 @@ fn main() {
     let n = arg_u(&args, "--n", 34816); // 2 * ff  (27B: 2 * 17408)
     let layers = arg_u(&args, "--layers", 64);
     let iters = arg_u(&args, "--iters", 30);
+    let raw = args.iter().any(|a| a == "--raw");
     assert_eq!(k % 32, 0, "k must be a multiple of 32");
     std::env::set_var("DENNO_CUDA", "1");
 
     let row_bytes = Q4Linear::row_bytes(k);
     let bytes = row_bytes * n;
     println!(
-        "shape k={k} n={n}  Q4 weights {:.1} MB ({} B/row)  layers={layers} iters={iters}",
+        "shape k={k} n={n}  Q4 weights {:.1} MB ({} B/row)  layers={layers} iters={iters}{}",
         bytes as f64 / 1e6,
-        row_bytes
+        row_bytes,
+        if raw { "  [raw]" } else { "" }
     );
 
-    // 合成重み (決定論的)。Q4_0 へ量子化してからベンチに使う。
-    let mut w = vec![0f32; k * n];
-    for (i, v) in w.iter_mut().enumerate() {
-        *v = (((i * 7) % 251) as f32 / 125.0) - 1.0;
-    }
-    let t = Instant::now();
-    let q4 = Q4Linear::quantize(&w, k, n);
-    drop(w);
-    println!("quantize: {:.2} s", t.elapsed().as_secs_f64());
+    // 合成重み。既定は f32 を作ってから量子化するので CPU 参照と比較できる。
+    let q4 = if raw {
+        let nb = k / 32;
+        let mut blocks = vec![0u8; n * nb * 18];
+        for (bi, b) in blocks.chunks_exact_mut(18).enumerate() {
+            // f16 の 0.0625 を little-endian で入れる (scale 0 だと縮退する)
+            b[0] = 0x00;
+            b[1] = 0x2C;
+            for (i, x) in b[2..].iter_mut().enumerate() {
+                *x = ((bi * 31 + i * 17) % 251) as u8;
+            }
+        }
+        Q4Linear {
+            blocks,
+            k,
+            n,
+            uid: next_q8_uid(),
+        }
+    } else {
+        let mut w = vec![0f32; k * n];
+        for (i, v) in w.iter_mut().enumerate() {
+            *v = (((i * 7) % 251) as f32 / 125.0) - 1.0;
+        }
+        let t = Instant::now();
+        let q = Q4Linear::quantize(&w, k, n);
+        drop(w);
+        println!("quantize: {:.2} s", t.elapsed().as_secs_f64());
+        q
+    };
 
-    let uid = next_q8_uid();
+    let uid = q4.uid;
     let mut worst = 0.0f64;
     for &m in &[1usize, 2, 8, 64, 300] {
         let a: Vec<f32> = (0..m * k).map(|i| (((i % 17) as f32) / 9.0) - 0.5).collect();
         let mut out = vec![0f32; m * n];
         let t = Instant::now();
-        let ok = denno_engine::cuda::maybe_gpu_linear_q4_into(
-            uid,
-            &a,
-            &q4.blocks,
-            k,
-            n,
-            m,
-            &mut out,
-        );
+        let ok =
+            denno_engine::cuda::maybe_gpu_linear_q4_into(uid, &a, &q4.blocks, k, n, m, &mut out);
         let first = t.elapsed().as_secs_f64();
         if !ok {
             println!("m={m:>4}: GPU path not taken (CPU fallback)");
@@ -79,44 +96,37 @@ fn main() {
         }
         let t = Instant::now();
         for _ in 0..iters {
-            let ok = denno_engine::cuda::maybe_gpu_linear_q4_into(
-                uid,
-                &a,
-                &q4.blocks,
-                k,
-                n,
-                m,
-                &mut out,
-            );
+            let ok =
+                denno_engine::cuda::maybe_gpu_linear_q4_into(uid, &a, &q4.blocks, k, n, m, &mut out);
             assert!(ok, "GPU path dropped out on iteration");
         }
         let per = t.elapsed().as_secs_f64() / iters as f64;
-        let gbs = if m == 1 {
-            bytes as f64 / per / 1e9
-        } else {
-            // prefill は重みを 1 回読むだけなので参考値
-            bytes as f64 / per / 1e9
-        };
+        // m=1 は重み 1 回読みなので GB/s、m>1 は同じ重みを使い回すので GFLOP/s で見る。
+        let gbs = bytes as f64 / per / 1e9;
+        let gflops = 2.0 * (m * n * k) as f64 / per / 1e9;
         println!(
-            "m={m:>4}  {:.3} ms/call  {:.1} GB/s  first {:.3} s  x{layers} layers = {:.1} ms/token",
+            "m={m:>4}  {:.3} ms/call  {:.1} GB/s  {:.1} GFLOP/s  first {:.3} s  x{layers} layers = {:.1} ms/token",
             per * 1e3,
             gbs,
+            gflops,
             first,
             per * 1e3 * layers as f64
         );
         // 先頭 4 行だけ CPU 参照と突き合わせる (回帰の検出用)
-        let mut row = vec![0f32; k];
-        let mut mx = 0.0f64;
-        for j in 0..4 {
-            q4.dequant_row_into(j, &mut row);
-            let d: f32 = row.iter().zip(&a[..k]).map(|(x, y)| x * y).sum();
-            let e = (out[j] - d).abs() as f64;
-            if e > mx {
-                mx = e;
+        if !raw {
+            let mut row = vec![0f32; k];
+            let mut mx = 0.0f64;
+            for j in 0..4 {
+                q4.dequant_row_into(j, &mut row);
+                let d: f32 = row.iter().zip(&a[..k]).map(|(x, y)| x * y).sum();
+                let e = (out[j] - d).abs() as f64;
+                if e > mx {
+                    mx = e;
+                }
             }
+            worst = worst.max(mx);
+            println!("      maxabs vs CPU (rows 0-3) = {mx:.2e}");
         }
-        worst = worst.max(mx);
-        println!("      maxabs vs CPU (rows 0-3) = {mx:.2e}");
     }
     if worst > 1e-3 {
         println!("WARN: deviation {worst:.2e} exceeds the R3 budget");

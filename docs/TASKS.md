@@ -698,31 +698,36 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   about 2.8 GB of headroom left. Keep desktop sessions short and start a new chat instead
   of letting the history grow.
 
-### P5-4: single-layer Q4 bench instead of the 6-minute serve loop - DONE (main session, 2026-10-20)
+### P5-4: per-layer benches instead of the 6-minute serve loop - DONE (main session, 2026-10-20)
 - Full-model measurement (start 27B, send 3,020 tokens, read the profile) costs about
-  six minutes per data point, which is too slow to iterate on a kernel.
-- `crates/denno-engine/examples/bench_q4_line.rs` times one linear layer in isolation:
-  `cargo run --release -p denno-engine --features cuda --example bench_q4_line`.
-  Defaults are the real 27B `gate_up` shape (k 5120, n 34816, 64 layers). Weights are
-  synthetic but quantized into the same Q4_0 block layout, so the kernel sees the same
-  bytes per row and the same working set; only the values differ.
-- Every run also checks rows 0-3 against the CPU dequant, so a wrong answer shows up as
-  text instead of a silently fast number.
-- First measurement (100.3 MB of Q4 weights, 30 iterations, `--layers 64`):
-  | m | ms/call | effective GB/s | x 64 layers |
-  |---|---|---|---|
-  | 1 (decode GEMV) | 0.416 | 240.9 | 26.6 ms/token |
-  | 2 | 0.807 | 124.2 | 51.7 ms/token |
-  | 8 | 3.216 | 31.2 | 205.8 ms/token |
-  | 64 | 2.944 | 34.1 | 188.4 ms/token |
-  | 300 (prefill GEMM) | 16.877 | 5.9 | n/a |
-- Two anomalies to keep in mind for the GEMV rewrite: the cost is linear in `m` up to 8
-  (every extra row re-reads the whole matrix), and `m=8` is slower than `m=64`, so a
-  threshold between them changes strategy.
-- Iteration cost is now about 12 s of build plus 5 s of run, with no server and no long
-  prompt. The same pattern works for the other bottlenecks (one GDN layer at
-  nv/dk/dv = 16/128/128 with conv 4, or `lm_head`), which is the cheap way to test a
-  kernel before paying for a full-model run.
+  six minutes per data point, which is too slow to iterate on a kernel. Each bottleneck
+  is now measured in isolation at its real 27B shape, with synthetic weights in the same
+  Q4_0 block layout: `docker exec denno-gpu bash /work/denno-beta/scripts/bench_all.sh`
+  builds the two examples and prints the whole table in about 20 s. It leaves 8095 alone.
+- `crates/denno-engine/examples/bench_q4_line.rs` - one Q4 linear layer.
+  `--k/--n/--layers/--iters`, `--raw` skips the f32 stage (needed for `lm_head`, whose
+  715 MB of Q4 weights would otherwise cost 5 GB of temporary f32).
+- `crates/denno-engine/examples/bench_gdn.rs` - one GDN scan at nk 16 / nv 48 / dk dv 128
+  / conv 4, for n = 1, 8, 32, 300. Checks determinism (same input twice, bit equal) and
+  compares against `gdn::forward_token_core`.
+- Both print a CPU-reference `maxabs`, so a fast-but-wrong kernel shows up as text.
+- Baseline (27B q4, one A/B-free run, `--iters 30`):
+  | layer | m or n | ms/call | rate | x layers |
+  |---|---|---|---|---|
+  | gate_up | m=1 | 0.416 | 240.9 GB/s | 26.6 ms/token (x64) |
+  | gate_up | m=8 | 3.216 | 898 GFLOP/s | 205.8 ms/token |
+  | gate_up | m=300 | 16.877 | 6.3 TFLOP/s | n/a |
+  | down_proj | m=1 | 0.235 | 213.2 GB/s | 15.0 ms/token (x64) |
+  | lm_head | m=1 | 2.815 | 254.1 GB/s | 2.8 ms/token (x1) |
+  | GDN scan | n=1 | 0.143 | - | 6.9 ms/token (x48) |
+- What the split shows: the four measured bottlenecks add up to about 51 ms of the
+  126.7 ms/token, and every m=1 GEMV already runs at 210-254 GB/s, i.e. near the ceiling
+  of this kernel style. The losses are (a) m=2 doubling the cost (weights re-read per
+  row) and m=8 being worse than m=64, and (b) the prefill GEMM at 6.3 TFLOP/s, which is
+  occupancy bound rather than bandwidth bound. Those two are what the next kernels should
+  attack; the plain m=1 GEMV has little left.
+- Iteration cost is 12 s of build plus 5-20 s of run, with no server restart and no long
+  prompt. A full-model run plus `GPU_VERIFY` stays the acceptance step, not the inner loop.
 
 ## Suggested order
 
