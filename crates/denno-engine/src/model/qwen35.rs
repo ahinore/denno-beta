@@ -842,6 +842,7 @@ impl Qwen35 {
     ) -> Vec<f32> {
         #[cfg(feature = "cuda")]
         if self.gdn_p.head_k_dim == self.gdn_p.head_v_dim {
+            let kv_id = cache.kv_id();
             let (conv, ssm) = cache
                 .gdn_state_mut(li)
                 .expect("GDN state slot が未初期化");
@@ -864,10 +865,15 @@ impl Qwen35 {
                 self.gdn_p.d_conv,
                 self.gdn_p.eps,
                 1.0 / (self.gdn_p.head_k_dim as f32).sqrt(),
+                li,
+                kv_id,
             ) {
                 return y;
             }
         }
+        // s131: CPU に落ちる = ホストの状態を読む前に正本を戻す。
+        #[cfg(feature = "cuda")]
+        cache.flush_gdn_device_state();
         let (conv, ssm) = cache
             .gdn_state_mut(li)
             .expect("GDN state slot が未初期化");
@@ -906,6 +912,9 @@ impl Qwen35 {
         n: usize,
         dy: usize,
     ) -> Vec<f32> {
+        // s131: ホストの GDN 状態を読む前にデバイス正本を戻す。
+        #[cfg(feature = "cuda")]
+        cache.flush_gdn_device_state();
         let nqkv = g.qkv_w.dims().1;
         let nz = g.gate_w.dims().1;
         let nb = g.beta_w.dims().1;
@@ -1274,6 +1283,7 @@ impl Qwen35 {
                                     li,
                                     n,
                                     || -> (Option<()>, bool) {
+                                        let kv_id = cache.kv_id();
                                         let (conv, ssm) = cache
                                             .gdn_state_mut(li)
                                             .expect("GDN state slot が未初期化");
@@ -1298,6 +1308,8 @@ impl Qwen35 {
                                             1.0 / (p.head_k_dim as f32).sqrt(),
                                             ow,
                                             &mut buf_out,
+                                            li,
+                                            kv_id,
                                         );
                                         (r, true)
                                     },
@@ -1316,6 +1328,7 @@ impl Qwen35 {
                         crate::prof::time_layer_n_ev(crate::prof::ATT_GDN_SCAN, li, n, || {
                             let p = &self.gdn_p;
                             if n > 1 && p.head_k_dim == p.head_v_dim {
+                                let kv_id = cache.kv_id();
                                 let (conv, ssm) = cache
                                     .gdn_state_mut(li)
                                     .expect("GDN state slot が未初期化");
@@ -1338,6 +1351,8 @@ impl Qwen35 {
                                     p.d_conv,
                                     p.eps,
                                     1.0 / (p.head_k_dim as f32).sqrt(),
+                                    li,
+                                    kv_id,
                                 ) {
                                     Some(y) => (y, true),
                                     None => (

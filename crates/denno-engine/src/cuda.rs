@@ -1064,6 +1064,9 @@ enum GdnBuf {
 //   出力が変わる**ので、新しい書き換え経路を足すときは必ずここを通すこと。
 // ---------------------------------------------------------------------------
 struct GdnStateCache {
+    conv: Vec<Option<DevBuffer>>, // [layer] conv [conv_dim, cs] (デバイス正本)
+    conv_len: usize,              // conv の要素数
+    cur_kv: Option<u64>,          // この正本が属する KV キャッシュ ID (None = 未使用)
     ssm: Vec<Option<DevBuffer>>, // [layer] ssm [nv, dk, dv] (デバイス正本)
     valid: Vec<bool>,            // [layer] = ホスト KvCache::gdn と一致している
     srows: Option<DevBuffer>,    // [n, nv, dk, dv] hoist 経路の境界行
@@ -1075,6 +1078,9 @@ struct GdnStateCache {
 impl GdnStateCache {
     const fn empty() -> Self {
         Self {
+            conv: Vec::new(),
+            conv_len: 0,
+            cur_kv: None,
             ssm: Vec::new(),
             valid: Vec::new(),
             srows: None,
@@ -1088,8 +1094,10 @@ impl GdnStateCache {
         // resize_with で伸ばす。縮む場合は末尾を落とす (drop = cuMemFree)。
         if self.ssm.len() < n_layers {
             self.ssm.resize_with(n_layers, || None);
+            self.conv.resize_with(n_layers, || None);
         } else {
             self.ssm.truncate(n_layers);
+            self.conv.truncate(n_layers);
         }
         self.valid.resize(n_layers, false);
     }
@@ -1102,9 +1110,19 @@ impl GdnStateCache {
         }
         self.srows_n = 0;
     }
+    /// 層ベクタを `li` まで伸ばす (層数は初回利用時に確定する)。
+    fn touch_layer(&mut self, li: usize) {
+        if self.ssm.len() <= li {
+            let n = li + 1;
+            self.ssm.resize_with(n, || None);
+            self.conv.resize_with(n, || None);
+            self.valid.resize(n, false);
+        }
+    }
     /// 層 1 本の確保。形が変わったら全層を無効化する (別モデル/別形状)。
     fn ensure_layer(&mut self, li: usize, rows: usize, cols: usize) -> Result<()> {
         const F: usize = std::mem::size_of::<f32>();
+        self.touch_layer(li);
         if (self.rows != 0 && (self.rows != rows || self.cols != cols)) || self.rows != rows {
             self.invalidate();
             self.srows_n = 0;
@@ -1112,6 +1130,14 @@ impl GdnStateCache {
         self.rows = rows;
         self.cols = cols;
         GdnScratch::grow(&mut self.ssm[li], rows * cols * F)?;
+        Ok(())
+    }
+    /// 層 1 本の conv 状態を確保。
+    fn ensure_conv(&mut self, li: usize, len: usize) -> Result<()> {
+        const F: usize = std::mem::size_of::<f32>();
+        self.touch_layer(li);
+        GdnScratch::grow(&mut self.conv[li], len * F)?;
+        self.conv_len = len;
         Ok(())
     }
     /// hoist 経路の境界行バッファ [n, nv, dk, dv] を確保 (n が同じなら再利用)。
@@ -1237,6 +1263,105 @@ thread_local! {
 /// 新しい書き換え経路を足すときは必ずここを通すこと。
 pub fn gdn_scan_state_invalidate() {
     GDN_STATE.with(|c| c.borrow_mut().invalidate());
+}
+
+// s131: デバイス正本を使うか。`DENNO_GDN_DEVSTATE=0` で従来動作 (毎回ホストと
+// 往復) に戻す。切り分け用で、既定は有効。
+fn gdn_devstate() -> bool {
+    !matches!(
+        std::env::var("DENNO_GDN_DEVSTATE").ok().as_deref(),
+        Some("0")
+    )
+}
+
+// 従来動作のホスト書き戻し (デバイス正本を使わないときだけ)。
+fn gdn_host_writeback(conv_st: &mut [f32], ssm_st: &mut [f32]) -> Result<()> {
+    GDN_SCRATCH.with(|cell| -> Result<()> {
+        let s = cell.borrow();
+        let cv = s.buf(GdnBuf::ConvOut).to_vec::<f32>(conv_st.len())?;
+        let sm = s.buf(GdnBuf::SsmOut).to_vec::<f32>(ssm_st.len())?;
+        conv_st.copy_from_slice(&cv);
+        ssm_st.copy_from_slice(&sm);
+        Ok(())
+    })
+}
+
+// s131: デバイス正本の入り口。層の状態が未確定ならホストから 1 回だけ seed し、
+// 以後はデバイスの値をそのままカーネルへ渡す。
+fn gdn_state_begin(
+    kv: u64,
+    li: usize,
+    conv: &[f32],
+    ssm: &[f32],
+    conv_len: usize,
+    rows: usize,
+    cols: usize,
+) -> Result<(CUdeviceptr, CUdeviceptr)> {
+    GDN_STATE.with(|cell| -> Result<(CUdeviceptr, CUdeviceptr)> {
+        let mut c = cell.borrow_mut();
+        // 別スロット/別セッションの状態を混ぜない (層番号だけでは足りない)。
+        if c.cur_kv != Some(kv) {
+            c.invalidate();
+            c.cur_kv = Some(kv);
+        }
+        let devstate = gdn_devstate();
+        c.ensure_layer(li, rows, cols)?;
+        c.ensure_conv(li, conv_len)?;
+        if !c.valid[li] || !devstate {
+            c.conv[li].as_ref().unwrap().copy_from(conv)?;
+            c.ssm[li].as_ref().unwrap().copy_from(ssm)?;
+            c.valid[li] = devstate;
+        }
+        let pc = c.conv[li].as_ref().unwrap().ptr();
+        let ps = c.ssm[li].as_ref().unwrap().ptr();
+        Ok((pc, ps))
+    })
+}
+
+// s131: スキャン結果をデバイス正本へ D2D で戻す (ホストへは落とさない)。
+fn gdn_state_commit(
+    li: usize,
+    conv_out: CUdeviceptr,
+    ssm_out: CUdeviceptr,
+    conv_len: usize,
+    rows: usize,
+    cols: usize,
+) -> Result<()> {
+    let (pc, ps) = GDN_STATE
+        .with(|cell| -> Option<(CUdeviceptr, CUdeviceptr)> {
+            let c = cell.borrow();
+            Some((c.conv.get(li)?.as_ref()?.ptr(), c.ssm.get(li)?.as_ref()?.ptr()))
+        })
+        .ok_or_else(|| anyhow::anyhow!("gdn_state_commit: 状態バッファ未確保 (layer {li})"))?;
+    let lib = lib()?;
+    unsafe {
+        check(
+            (lib.memcpy_dtod_async)(pc, conv_out, conv_len * 4, std::ptr::null_mut()),
+            "cuMemcpyDtoDAsync (gdn conv)",
+        )?;
+        check(
+            (lib.memcpy_dtod_async)(ps, ssm_out, rows * cols * 4, std::ptr::null_mut()),
+            "cuMemcpyDtoDAsync (gdn ssm)",
+        )?;
+    }
+    Ok(())
+}
+
+/// s131: デバイス正本をホストへ戻す (層指定)。戻した層は無効化するので、
+/// 次にその層を使うときはホストから 1 回 seed し直す。
+/// ホストの `KvCache::gdn` を読む前に必ず通すこと。
+pub fn gdn_state_take(kv: u64, li: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+    GDN_STATE.with(|cell| -> Option<(Vec<f32>, Vec<f32>)> {
+        let mut c = cell.borrow_mut();
+        if c.cur_kv != Some(kv) || li >= c.valid.len() || !c.valid[li] {
+            return None;
+        }
+        let (conv_len, rows, cols) = (c.conv_len, c.rows, c.cols);
+        let conv = c.conv[li].as_ref()?.to_vec::<f32>(conv_len).ok()?;
+        let ssm = c.ssm[li].as_ref()?.to_vec::<f32>(rows * cols).ok()?;
+        c.valid[li] = false;
+        Some((conv, ssm))
+    })
 }
 
 static GPU_CTX: OnceLock<Option<CudaCtx>> = OnceLock::new();
@@ -5573,9 +5698,18 @@ pub fn chain_q35_gdn_scan(
             let gd = m.gdn[li].as_mut().unwrap();
             // seed: この層のミラーが pos0 に同期していなければホスト状態を H2D
             if m.gdn_pos[li] != Some(pos0) {
-                let (conv_h, ssm_h) = cache.gdn_state_mut(li)?;
-                ok(gd.conv[0].as_ref().unwrap().copy_from(conv_h))?;
-                ok(gd.ssm[0].as_ref().unwrap().copy_from(ssm_h))?;
+                // s131: GDN 状態の正本はデバイス。ミラーへの seed もそこから取る
+                // (ホストは境界まで古いことがある)。取り出した層は無効化されるので
+                // 以後の scan 経路はホストから seed し直す = 取り違えが起きない。
+                let kv_id = cache.kv_id();
+                if let Some((cv, sm)) = gdn_state_take(kv_id, li) {
+                    ok(gd.conv[0].as_ref().unwrap().copy_from(&cv))?;
+                    ok(gd.ssm[0].as_ref().unwrap().copy_from(&sm))?;
+                } else {
+                    let (conv_h, ssm_h) = cache.gdn_state_mut(li)?;
+                    ok(gd.conv[0].as_ref().unwrap().copy_from(conv_h))?;
+                    ok(gd.ssm[0].as_ref().unwrap().copy_from(ssm_h))?;
+                }
                 gd.cur = 0;
             }
             let cur = gd.cur;
@@ -8071,6 +8205,8 @@ pub fn gdn_scan_batch(
     d_conv: usize,
     eps: f32,
     q_scale: f32,
+    li: usize,
+    kv: u64,
 ) -> Option<Vec<f32>> {
     if !cuda_enabled() {
         return None;
@@ -8087,12 +8223,12 @@ pub fn gdn_scan_batch(
     let result = if chunked {
         gdn_scan_chunked_impl(
             ctx, qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv,
-            d_conv, eps, q_scale, None,
+            d_conv, eps, q_scale, None, li, kv,
         )
     } else {
         gdn_scan_impl(
             ctx, qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv,
-            d_conv, eps, q_scale,
+            d_conv, eps, q_scale, li, kv,
         )
     };
     match result {
@@ -8128,6 +8264,8 @@ fn gdn_scan_impl(
     d_conv: usize,
     eps: f32,
     q_scale: f32,
+    li: usize,
+    kv: u64,
 ) -> Result<Vec<f32>> {
     let cs = d_conv - 1;
     let conv_dim = 2 * nk * dk + nv * dv;
@@ -8166,18 +8304,19 @@ fn gdn_scan_impl(
         s.z.as_ref().unwrap().copy_from(z)?;
         s.beta.as_ref().unwrap().copy_from(beta)?;
         s.alpha.as_ref().unwrap().copy_from(alpha)?;
-        s.conv_in.as_ref().unwrap().copy_from(conv_st)?;
-        s.ssm_in.as_ref().unwrap().copy_from(ssm_st)?;
         s.wc.as_ref().unwrap().copy_from(wconv)?;
         s.wa.as_ref().unwrap().copy_from(wa)?;
         s.wd.as_ref().unwrap().copy_from(wdt)?;
         s.wn.as_ref().unwrap().copy_from(wnorm)?;
         Ok(s.ptrs())
     })?;
+    // s131: conv / ssm の正本はデバイス。未確定のときだけホストから 1 回 seed。
+    let (pst_conv, pst_ssm) =
+        gdn_state_begin(kv, li, conv_st, ssm_st, conv_dim * cs, nv, dk * dv)?;
     q.lap(crate::prof::D2H_GDN_PF_LAUNCH);
 
     let (mut pq, mut pz, mut pb, mut pa) = (dp.q, dp.z, dp.beta, dp.alpha);
-    let (mut pci, mut psi) = (dp.conv_in, dp.ssm_in);
+    let (mut pci, mut psi) = (pst_conv, pst_ssm);
     let (mut pwc, mut pwa, mut pwd, mut pwn) = (dp.wc, dp.wa, dp.wd, dp.wn);
     let (mut py, mut pco, mut pso) = (dp.y, dp.conv_out, dp.ssm_out);
     let (mut ni, mut nki, mut nvi, mut dki, mut dvi) = (
@@ -8218,21 +8357,16 @@ fn gdn_scan_impl(
     ctx.sync()?;
     q.lap(crate::prof::D2H_GDN_PF_D2H);
 
-    let (y, conv_new, ssm_new) =
-        GDN_SCRATCH.with(|cell| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-            let s = cell.borrow();
-            Ok((
-                s.buf(GdnBuf::Y).to_vec::<f32>(n * vd)?,
-                s.buf(GdnBuf::ConvOut).to_vec::<f32>(conv_dim * cs)?,
-                s.buf(GdnBuf::SsmOut).to_vec::<f32>(nv * dk * dv)?,
-            ))
-        })?;
-    // s65: 発行元の件数分類 (y は linear / conv+ssm は GDN 状態)
+    let y = GDN_SCRATCH.with(|cell| -> Result<Vec<f32>> {
+        let s = cell.borrow();
+        s.buf(GdnBuf::Y).to_vec::<f32>(n * vd)
+    })?;
+    // s131: 状態はホストへ落とさずデバイス正本へ D2D で戻す。
+    gdn_state_commit(li, dp.conv_out, dp.ssm_out, conv_dim * cs, nv, dk * dv)?;
+    if !gdn_devstate() {
+        gdn_host_writeback(conv_st, ssm_st)?;
+    }
     crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
-    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
-    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
-    conv_st.copy_from_slice(&conv_new);
-    ssm_st.copy_from_slice(&ssm_new);
     q.end();
     Ok(y)
 }
@@ -8276,6 +8410,8 @@ pub fn gdn_scan_batch_oproj(
     q_scale: f32,
     o: &crate::quant::Quant8Linear,
     out: &mut [f32],
+    li: usize,
+    kv: u64,
 ) -> Option<()> {
     if !cuda_enabled() || n < GDN_CHUNK_MIN_TOKENS || dk != dv || d_conv != 4 {
         return None;
@@ -8295,7 +8431,7 @@ pub fn gdn_scan_batch_oproj(
 
     if let Err(e) = gdn_scan_chunked_impl(
         ctx, qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv,
-        d_conv, eps, q_scale, Some(yptr),
+        d_conv, eps, q_scale, Some(yptr), li, kv,
     ) {
         tracing::error!("GDN scan (device y) failed: {e:#}");
         GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -8357,7 +8493,9 @@ fn gdn_scan_chunked_impl(
     d_conv: usize,
     eps: f32,
     q_scale: f32,
-    y_dst: Option<u64>,
+    y_dst: Option<CUdeviceptr>,
+    li: usize,
+    kv: u64,
 ) -> Result<Vec<f32>> {
     let cs = d_conv - 1;
     let conv_dim = 2 * nk * dk + nv * dv;
@@ -8413,8 +8551,6 @@ fn gdn_scan_chunked_impl(
         s.z.as_ref().unwrap().copy_from(z)?;
         s.beta.as_ref().unwrap().copy_from(beta)?;
         s.alpha.as_ref().unwrap().copy_from(alpha)?;
-        s.conv_in.as_ref().unwrap().copy_from(conv_st)?;
-        s.ssm_in.as_ref().unwrap().copy_from(ssm_st)?;
         s.wc.as_ref().unwrap().copy_from(wconv)?;
         s.wa.as_ref().unwrap().copy_from(wa)?;
         s.wd.as_ref().unwrap().copy_from(wdt)?;
@@ -8424,8 +8560,10 @@ fn gdn_scan_chunked_impl(
     q.lap(crate::prof::D2H_GDN_PF_LAUNCH);
 
     // ---- pass 1: chunk 並列でローカル遷移 (W[ci], M[ci]) --------------------
+    let (pst_conv, pst_ssm) =
+        gdn_state_begin(kv, li, conv_st, ssm_st, conv_dim * cs, nv, dk * dv)?;
     let (mut pq, mut pb, mut pa) = (dp.q, dp.beta, dp.alpha);
-    let (mut pci, mut pwc, mut pwa, mut pwd) = (dp.conv_in, dp.wc, dp.wa, dp.wd);
+    let (mut pci, mut pwc, mut pwa, mut pwd) = (pst_conv, dp.wc, dp.wa, dp.wd);
     let (mut pw, mut pm) = (dp.w, dp.m);
     let (mut ni, mut cli, mut nki, mut nvi, mut dki, mut dvi) = (
         n as c_int,
@@ -8471,7 +8609,7 @@ fn gdn_scan_chunked_impl(
     q.lap(crate::prof::D2H_GDN_PF_D2H);
 
     // ---- pass 2: chunk 先頭状態 Sinit の直列伝播 ----------------------------
-    let (mut psi, mut pm2, mut pw2, mut psinit) = (dp.ssm_in, dp.m, dp.w, dp.sinit);
+    let (mut psi, mut pm2, mut pw2, mut psinit) = (pst_ssm, dp.m, dp.w, dp.sinit);
     let (mut nc2, mut nv2, mut dk2, mut dv2) =
         (n_chunks as c_int, nv as c_int, dk as c_int, dv as c_int);
     let mut args_state = [
@@ -8500,7 +8638,8 @@ fn gdn_scan_chunked_impl(
 
     // ---- pass 3: Sinit[ci] からの逐次 AR スキャン (chunk 並列) ---------------
     let (mut pq3, mut pz3, mut pb3, mut pa3) = (dp.q, dp.z, dp.beta, dp.alpha);
-    let (mut pci3, mut psinit3) = (dp.conv_in, dp.sinit);
+    // s131: pass 3 の conv 入力もデバイス正本 (スクラッチの conv_in はもう書かない)。
+    let (mut pci3, mut psinit3) = (pci, dp.sinit);
     let (mut pwc3, mut pwa3, mut pwd3, mut pwn3) = (dp.wc, dp.wa, dp.wd, dp.wn);
     // s72: y_dst があれば y はチェーンスロットへ直接書く (host へ落とさない)。
     let (mut py, mut pco, mut pso) = (y_dst.unwrap_or(dp.y), dp.conv_out, dp.ssm_out);
@@ -8550,37 +8689,19 @@ fn gdn_scan_chunked_impl(
     q.lap(crate::prof::D2H_GDN_PF_D2H);
 
     if y_dst.is_some() {
-        // s72: y はデバイス上に残す (呼び出し側がチェーンで消費する)。状態だけ落とす。
-        let (conv_new, ssm_new) =
-            GDN_SCRATCH.with(|cell| -> Result<(Vec<f32>, Vec<f32>)> {
-                let s = cell.borrow();
-                Ok((
-                    s.buf(GdnBuf::ConvOut).to_vec::<f32>(conv_dim * cs)?,
-                    s.buf(GdnBuf::SsmOut).to_vec::<f32>(nv * dk * dv)?,
-                ))
-            })?;
-        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
-        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
-        conv_st.copy_from_slice(&conv_new);
-        ssm_st.copy_from_slice(&ssm_new);
+        // s72: y はデバイス上に残す (呼び出し側がチェーンで消費する)。
+        // s131: 状態もデバイス正本へ D2D で戻す (ホストへは落とさない)。
+        gdn_state_commit(li, dp.conv_out, dp.ssm_out, conv_dim * cs, nv, dk * dv)?;
         q.end();
         return Ok(Vec::new());
     }
-    let (y, conv_new, ssm_new) =
-        GDN_SCRATCH.with(|cell| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-            let s = cell.borrow();
-            Ok((
-                s.buf(GdnBuf::Y).to_vec::<f32>(n * vd)?,
-                s.buf(GdnBuf::ConvOut).to_vec::<f32>(conv_dim * cs)?,
-                s.buf(GdnBuf::SsmOut).to_vec::<f32>(nv * dk * dv)?,
-            ))
-        })?;
-    // s65: 発行元の件数分類 (y は linear / conv+ssm は GDN 状態)
+    let y = GDN_SCRATCH.with(|cell| -> Result<Vec<f32>> {
+        let s = cell.borrow();
+        s.buf(GdnBuf::Y).to_vec::<f32>(n * vd)
+    })?;
+    // s131: 状態はホストへ落とさずデバイス正本へ D2D で戻す。
+    gdn_state_commit(li, dp.conv_out, dp.ssm_out, conv_dim * cs, nv, dk * dv)?;
     crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
-    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
-    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
-    conv_st.copy_from_slice(&conv_new);
-    ssm_st.copy_from_slice(&ssm_new);
     q.end();
     Ok(y)
 }

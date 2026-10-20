@@ -817,10 +817,10 @@ impl Engine {
                 debug_assert_eq!(self.caches[slot].len(), b);
                 {
                     let kv_len = self.caches[slot].len();
-                    let gdn = self
-                        .model
-                        .is_recurrent()
-                        .then(|| self.caches[slot].gdn_snapshot());
+                    let gdn = self.model.is_recurrent().then(|| {
+                        self.caches[slot].flush_gdn_device_state();
+                        self.caches[slot].gdn_snapshot()
+                    });
                     let (k, v) = self.caches[slot].snapshot(kv_len);
                     self.prefix_cache.insert_snapshot(
                         sess.prompt_ids[..b].to_vec(),
@@ -861,10 +861,10 @@ impl Engine {
                 debug_assert_eq!(self.caches[slot].len(), sess.prompt_ids.len());
                 {
                     let kv_len = self.caches[slot].len();
-                    let gdn = self
-                        .model
-                        .is_recurrent()
-                        .then(|| self.caches[slot].gdn_snapshot());
+                    let gdn = self.model.is_recurrent().then(|| {
+                        self.caches[slot].flush_gdn_device_state();
+                        self.caches[slot].gdn_snapshot()
+                    });
                     let (k, v) = self.caches[slot].snapshot(kv_len);
                     self.prefix_cache
                         .insert_snapshot(sess.prompt_ids.clone(), k, v, kv_len, gdn);
