@@ -1839,8 +1839,9 @@ impl Qwen35 {
         use crate::cuda::{
             chain_download, chain_linear_grouped, chain_q35_fullattn, chain_q35_gdn_scan,
             chain_q35_kv_stage_begin, chain_q35_kv_stage_flush, chain_q35_rope_pi_upload,
-            chain_q35_step_reserve, chain_q35_step_reserve_aq, chain_rmsnorm, chain_swiglu,
-            chain_upload, gpu_attention_enabled, q35_chain_shapes_ok, q35_ch_att_bytes,
+            chain_q35_step_reserve, chain_q35_step_reserve_aq, chain_rmsnorm, chain_seg, chain_step_begin,
+            chain_step_end, chain_swiglu, chain_upload,
+            gpu_attention_enabled, q35_chain_shapes_ok, q35_ch_att_bytes,
             q35_ch_qkv_bytes, q35_fns_available, q35_kv_stage_bytes, CH_ACT, CH_ATT, CH_DOWN,
             CH_GA, CH_H, CH_LOGITS, CH_O, CH_QKV, CH_X,
         };
@@ -1877,6 +1878,11 @@ impl Qwen35 {
             return None;
         }
 
+        // s138 (Task B6・計測のみ): ここから先を 1 ステップの分割 (表 A) として
+        // 計測する。計測 OFF は分岐 1 回で何もしない (クロックも読まない)。
+        // 対応する `chain_step_end` はステップ末尾 (`Some(logits)` の直前) の 1 か所。
+        chain_step_begin();
+
         let key = cache.kv_id();
         let mid = self.mid;
         // KV 容量 (forward 側で kv_bufs(0, 1) 済みだが単独呼び出しでも安全なように)
@@ -1885,6 +1891,7 @@ impl Qwen35 {
         // rope テーブル (pos 依存・1 ステップ 1 回。CPU rope_partial_interleaved と
         // 同一式 → dno_qknorm_rope_pi の QK-Norm+rope を bit-exact にする)
         let tab = q35_rope_pi_table(pos0, self.n_rot, self.theta);
+        chain_seg(crate::prof::CHAIN_HOST_API);
         chain_q35_rope_pi_upload(&tab)?;
 
         // CH_QKV / CH_ATT / aq / kv_stage をステップ開始時に一括確保
@@ -1896,6 +1903,7 @@ impl Qwen35 {
         // 再確保が直前 GEMV の in-flight 読み出し元を解放するのを避ける。
         // (s50: GDN 状態のステージは廃止 — 新状態は GPU ミラーに留める。pinned
         // ステージの事前確保は kv_stage のみ残る。)
+        chain_seg(crate::prof::CHAIN_HOST_API);
         chain_q35_step_reserve(
             CH_QKV,
             q35_ch_qkv_bytes(heads, dh, kv_heads, nk, nv, dk, dv),
@@ -1905,12 +1913,17 @@ impl Qwen35 {
         chain_q35_kv_stage_begin(q35_kv_stage_bytes(n_layers, kv_dim))?;
 
         // 埋め込み 1 行 → residual stream デバイス常駐開始
+        chain_seg(crate::prof::CHAIN_HOST_API);
         chain_upload(CH_X, &self.embed[token as usize * e..][..e], e, 1)?;
 
         let mut pending: Option<usize> = None;
         // GDN 層の層番号 (昇順) — KV ステージフラッシュの skip リスト
         let mut gdn_layers: Vec<usize> = Vec::new();
 
+        // 層ループ内はすべてカーネル発行 (launch) — sync は層ループの中に無い
+        // (D2H の待ちはステップ末尾の logits / kv flush に寄る) ので、ここから
+        // 末尾の D2H までを 1 つの launch 段として積む。
+        chain_seg(crate::prof::CHAIN_LAUNCH);
         for (li, layer) in self.layers.iter().enumerate() {
             crate::telemetry_layer_begin(li as u16);
             crate::prof::time_full(crate::prof::RMSNORM, 1, true, || {
@@ -2025,11 +2038,16 @@ impl Qwen35 {
         // download の sync がステップ全体の GPU 実行の完了待ちを吸収するため、
         // lm_head 計算だけのバケットに分けないと実機プロファイルの
         // 「lm_head」が sync 待ち込みで過大帰属になる。観測のみで数値経路不変)
+        chain_seg(crate::prof::CHAIN_LAUNCH);
         crate::prof::time_full(crate::prof::LM_HEAD, 1, true, || -> Option<()> {
             chain_rmsnorm(&self.norm_w, eps, pending, CH_H, e, 1, n_layers * 3)?;
             let lmq = self.lm_head.as_ref().unwrap().quant8()?;
             chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)
         })?;
+        // 層ループ + lm_head の発行が終わった時点。次の `chain_sync_pending` は
+        // ここまでに発行したカーネルの完了待ちなので、その待ちを `chain_kernel`
+        // に移せるよう tick を打つ (計測 OFF は None = 何もしない)。
+        let t_launch_done = crate::cuda::chain_tick();
         // s55 (T1 step2・観測のみ): 従来 `D2H_LOGITS` 1 本だった区間を
         //   WAIT = logits D2H を発行する直前に打つ追加 sync の所要
         //        (= GPU 側の未完了処理待ち。転送は含まない)
@@ -2045,10 +2063,24 @@ impl Qwen35 {
         // 各ステップ成功時に cache.advance(1) するため pos0 + 1 == cache.len() が常に
         // 成り立ち、従来の `cache.len() > pos0` は decode では常に false だった
         // (= 待ち時間が全部 pfhold = 集計外に入り wait 行が 1 度も出ない)。
+        let mut sync_secs: Option<f64> = None;
         if crate::prof::enabled() {
             let op = crate::prof::d2h_logits_split_op(pos0, cache.len());
+            let t_sync = std::time::Instant::now();
             crate::prof::time(op, || crate::cuda::chain_sync_pending())?;
+            // s138 (Task B6): この sync の所要を分割表 (表 A) の待ち内訳へ。
+            // `time` のバケット (D2H_LOGITS_WAIT / PF_HELD) はそのまま — 分割表は
+            // 表示専用で、生 id には 1 サンプルも足さない。
+            sync_secs = Some(t_sync.elapsed().as_secs_f64());
         }
+        // s138 (Task B6): 打った sync の所要と「発行したカーネルの実行時間」を
+        // 分割表へ移す。`chain_sig` は上の sync の実測 (enabled でないとき None) を
+        // そのまま持ち、ここで 1 回だけ読む。計測 OFF は全部 None = 何もしない。
+        crate::cuda::chain_sync_observed(
+            sync_secs.unwrap_or(0.0),
+            t_launch_done.map(|t| t.elapsed().as_secs_f64()),
+        );
+        chain_seg(crate::prof::CHAIN_D2H_LOGITS);
         let logits = crate::prof::time_if_on(crate::prof::D2H_LOGITS_COPY, || {
             chain_download(CH_LOGITS, self.vocab)
         })?;
@@ -2056,10 +2088,13 @@ impl Qwen35 {
         // GPU ミラーを権威のままにする — 次の prefill 冒頭 / CPU フォールバック時に
         // chain_q35_gdn_flush_pending が回復する。ステップ毎 D2H ~75MB/step が
         // decode の支配項だったため)
+        chain_seg(crate::prof::CHAIN_D2H_ARRAY);
         crate::prof::time_full(crate::prof::D2H_KV_FLUSH, 1, true, || {
             chain_q35_kv_stage_flush(cache, n_layers, kv_dim, pos0, &gdn_layers)
         })?;
         cache.advance(1);
+        // ステップ末尾: 最後の段を締めて 1 ステップ分を表 A へ流し込む。
+        chain_step_end();
         Some(logits)
     }
 }

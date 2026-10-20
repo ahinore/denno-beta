@@ -2104,6 +2104,231 @@ pub fn linear_seam_calls() -> u64 {
     LINEAR_SEAM_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// s138 (Task B6・計測のみ): decode chain のステップ分割 (表 A) と、線形ラッパの
+// 分割 (表 B) のための小道具。**表示専用** (prof.rs の SPLIT_* にしか積まない)。
+//
+// 前提: chain (CUDA 部分) は 1 ステップで使う GPU 資源が 1 本の stream に直列で、
+// 呼び出しスレッドも 1 本。したがって「段」は thread-local の 1 個の状態で足りる
+// (BF/多セッションの chain はスレッドごとに別 state = 混ざらない)。
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// 現在走っている chain の段 (prof.rs の CHAIN_*)。0 = 計測していない。
+    static CHAIN_SEG: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 1 ステップ分の積算 (秒)。`take` で取り出す。
+    static CHAIN_ACC: std::cell::RefCell<[f64; crate::prof::SPLIT_ROWS]> =
+        const { std::cell::RefCell::new([0.0; crate::prof::SPLIT_ROWS]) };
+    /// 段の切り替え時刻。
+    static CHAIN_TICK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    /// どの段からも取れなかった sync の残余 (秒)。ステップ終端で待ち行へ入れる。
+    static CHAIN_RESID: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+/// 段の id を (表, 行) へ畳む。chain 用の id かどうかだけ見ればよい。
+#[inline]
+fn chain_row(op: usize) -> Option<usize> {
+    match crate::prof::split_slot(op) {
+        Some((t, i)) if t == crate::prof::SPLIT_CHAIN_TABLE => Some(i),
+        _ => None,
+    }
+}
+
+/// 現在の段に `secs` を足す (段が 0 = 計測していないなら何もしない)。
+#[inline]
+fn chain_charge(secs: f64) {
+    let cur = CHAIN_SEG.with(|c| c.get());
+    if cur == 0 {
+        return;
+    }
+    if let Some(i) = chain_row(cur) {
+        CHAIN_ACC.with(|a| a.borrow_mut()[i] += secs);
+    }
+}
+
+/// 段を `op` へ切り替える。計測していない (段 0) ときは何もしない —
+/// 呼び出し側は `chain_step_begin` を打ったステップの中でだけ切り替える。
+#[inline]
+pub fn chain_seg(op: usize) {
+    if !crate::prof::split_on() {
+        return;
+    }
+    let cur = CHAIN_SEG.with(|c| c.get());
+    if cur == 0 || chain_row(op).is_none() {
+        return;
+    }
+    let now = Instant::now();
+    let prev = CHAIN_TICK.with(|c| c.replace(Some(now)));
+    if let Some(t0) = prev {
+        chain_charge(now.duration_since(t0).as_secs_f64());
+    }
+}
+
+/// `op` の区間だけを測る (段を切り替えずに、その間の時間を `op` へ引く)。
+///
+/// 使いどころは「sync の中に入った 1 本のカーネル実行」— decode では
+/// `cuCtxSynchronize` が直前に発行したカーネルの完了を待つ時間が支配的なので、
+/// 発行直後と sync 直後に同じ tick を読み、その差を `kernel_wait` として
+/// 待ち行から分離する (待ちの合計は動かない)。計測 OFF はクロック読みゼロ。
+#[inline]
+fn chain_mark_span(op: usize, t0: Instant) {
+    if !crate::prof::split_on() {
+        return;
+    }
+    if CHAIN_SEG.with(|c| c.get()) == 0 {
+        return;
+    }
+    if let Some(i) = chain_row(op) {
+        CHAIN_ACC.with(|a| a.borrow_mut()[i] += t0.elapsed().as_secs_f64());
+    }
+}
+
+/// 計測するなら今の時刻 (呼び出し側はこれが None なら何もしない)。
+/// 公開しているのは「発行したカーネルの完了待ち」を `chain_kernel` へ移すため —
+/// 呼び出し側 (decode chain) が発行の直後と sync の直後に 1 回ずつ読む。
+#[inline]
+pub fn chain_tick() -> Option<Instant> {
+    if crate::prof::split_on() {
+        Some(Instant::now())
+    } else {
+        None
+    }
+}
+
+thread_local! {
+    /// 直近の `chain_sync_observed` が観測した (sync の所要秒, 直前に発行した
+    /// カーネルの実行秒)。計測 OFF では None のまま = 呼び出し側は何もしない。
+    static CHAIN_SIG: std::cell::Cell<Option<(f64, f64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// chain の sync を分割表の観点で観測する (`chain_sync_pending` の直後に 1 回)。
+///
+/// `secs` = sync の所要、`kernel_secs` = 直前に発行したカーネルの tick からの経過。
+/// 両方が揃っているときだけ「カーネル実行 = sync 所要のうち tick からの経過」を
+/// `chain_kernel` へ移し、待ち行から同じ秒数を引く (待ちの合計は動かない)。
+/// `chain_step_begin` していない (段 0) や計測 OFF では何もしない。
+///
+/// ここで観測した値は `chain_sig` が 1 回だけ返す (表へは呼び出し側が流す)。
+pub fn chain_sync_observed(secs: f64, kernel_secs: Option<f64>) {
+    if !crate::prof::split_on() {
+        return;
+    }
+    if CHAIN_SEG.with(|c| c.get()) == 0 {
+        return;
+    }
+    // カーネル実行は待ちを超えない (tick は sync の直前に打つので、超えるのは
+    // 時計の粒度か別スレッドの割り込み) — 超えた分は待ち側に残す。
+    let sig = match kernel_secs {
+        Some(k) if k > 0.0 && secs > 0.0 => (secs, k.min(secs)),
+        _ => (secs, 0.0),
+    };
+    CHAIN_SIG.with(|c| c.set(Some(sig)));
+}
+
+/// `chain_sync_observed` が観測した (sync 秒, カーネル実行秒) を 1 回だけ返す。
+/// 計測 OFF / 未観測は None (呼び出し側は何もしない)。
+#[inline]
+pub fn chain_sig() -> Option<(f64, f64)> {
+    CHAIN_SIG.with(|c| c.replace(None))
+}
+
+/// ステップ先頭: chain の計測を開き、最初の段を `CHAIN_OUTER` (embedding 用意・
+/// reserve など chain の外側) にする。呼び出しは decode chain の入口 1 か所だけで、
+/// 対応する `chain_step_end` がステップ末尾に 1 か所ある (失敗して途中で抜ける
+/// ステップはそこまでが積まれ、以後のステップで上書きされる)。
+///
+/// 計測 OFF は分岐 1 回 (クロックも読まない)。
+pub fn chain_step_begin() {
+    if !crate::prof::split_on() {
+        return;
+    }
+    CHAIN_ACC.with(|a| *a.borrow_mut() = [0.0; crate::prof::SPLIT_ROWS]);
+    CHAIN_RESID.with(|c| c.set(0.0));
+    CHAIN_TICK.with(|c| c.set(Some(Instant::now())));
+    CHAIN_SEG.with(|c| c.set(crate::prof::CHAIN_OUTER));
+}
+
+/// ステップ末尾: 最後の段を締め、1 ステップ分を表 A へ流し込む。呼び出しは
+/// `chain_step_begin` と対で 1 か所。計測 OFF は分岐 1 回。
+pub fn chain_step_end() {
+    if !crate::prof::split_on() {
+        return;
+    }
+    if CHAIN_SEG.with(|c| c.get()) == 0 {
+        return; // begin していない (別の経路) — 何も積まない
+    }
+    // 最後の段をここで締める (tick はこの 1 回だけ)
+    if let Some(t0) = CHAIN_TICK.with(|c| c.replace(None)) {
+        chain_charge(Instant::now().duration_since(t0).as_secs_f64());
+    }
+    CHAIN_SEG.with(|c| c.set(0));
+    chain_step_flush();
+}
+
+/// ステップ末尾: 最後の段の区間を締めて、1 ステップ分を表 A へ流し込む。
+/// 締めの tick は `chain_step_end` (呼び出し側の 1 行) の側で読む。
+///
+/// 「どの sync からも取れなかった待ち」(`CHAIN_RESID`) は**待ち行**へ入れる —
+/// sync 区間の理解できない残余は発行ではなく待ちだから (排他の和は動かない)。
+fn chain_step_flush() {
+    let rows = CHAIN_ACC.with(|a| std::mem::take(&mut *a.borrow_mut()));
+    let mut acc = rows;
+    let resid = CHAIN_RESID.with(|c| c.replace(0.0));
+    if resid > 0.0 {
+        // どの sync からも取れなかった待ちは残余行 (= `CHAIN_SYNC_RESIDUAL`) へ。
+        // 待ちの合計は動かない (残余も待ちとして数える)。
+        acc[crate::prof::CHAIN_SYNC_RESIDUAL - crate::prof::SPLIT_CHAIN_FIRST] += resid;
+    }
+    crate::prof::split_flush_step(crate::prof::SPLIT_CHAIN_TABLE, &acc, 1, None);
+}
+
+/// chain の sync (`cuCtxSynchronize`) を「段」の観点で観測する。
+///
+/// sync の所要 `secs` と、sync の直前まで走っていた段 `prev` が分かるとき、
+/// その待ちの帰属は 1 つに決まる:
+///   - prev が launch 系 (`chain_launch`) … 直前に発行したカーネルの完了待ち。
+///     `chain_kernel` として積み、待ち行 (`prev`) からは **同じ秒数を引く**
+///     (待ちの合計は動かない = 排他の和が保たれる)。
+///   - prev が既に待ち (`chain_sync_wait` / `chain_sync_resid`) … 前の sync で
+///     取り切れなかった分。`chain_sync_wait` に積む。
+///   - それ以外 … 待ち行へ (残余はステップ末尾でまとめて待ち行に寄せる)。
+///
+/// `kernel` は直前に発行した 1 本のカーネルの実行時間 (発行直後と sync 直後の
+/// tick の差)。計測 OFF なら `secs` / `kernel` は読まれない (呼び出し側が None)。
+#[inline]
+fn chain_observe_sync(secs: f64, kernel: Option<f64>) {
+    if !crate::prof::split_on() {
+        return;
+    }
+    let prev = CHAIN_SEG.with(|c| c.get());
+    if prev == 0 {
+        return;
+    }
+    let wait_row = crate::prof::CHAIN_SYNC_WAIT - crate::prof::SPLIT_CHAIN_FIRST;
+    let launch_row = crate::prof::CHAIN_LAUNCH - crate::prof::SPLIT_CHAIN_FIRST;
+    let kern_row = crate::prof::CHAIN_KERNEL_WAIT - crate::prof::SPLIT_CHAIN_FIRST;
+    match (prev == crate::prof::CHAIN_LAUNCH, kernel) {
+        // launch 直後の sync: カーネル実行 = 待ちの本体
+        (true, Some(k)) if k > 0.0 => {
+            CHAIN_ACC.with(|a| {
+                let mut a = a.borrow_mut();
+                a[kern_row] += k;
+                // 待ちの合計を二重にしないため、帰属元の launch から引く
+                a[launch_row] -= k;
+                if secs > k {
+                    a[wait_row] += secs - k;
+                }
+            });
+        }
+        // launch 以外からの sync は待ち行へ (残余は末尾で待ち行に寄せる)
+        _ => {
+            if secs > 0.0 {
+                CHAIN_ACC.with(|a| a.borrow_mut()[wait_row] += secs);
+            }
+        }
+    }
+}
+
 /// P17b 統合エントリ: int8 線形層を GPU で実行するかどうかを判定し、
 /// 実行するなら結果 (CPU カーネルとビット一致) を返す。
 /// 戻り値 None = CPU パスを使うこと (無効/初期化失敗/実行時エラー/m>閾値)。
@@ -2313,6 +2538,44 @@ pub fn maybe_gpu_linear_q4_into(
     }
 }
 
+// ---------------------------------------------------------------------------
+// s138 (Task B6・計測のみ): 線形ラッパ 1 call の段割り (表 B) の小道具。
+// `split_stage` で tick を取り、段の切れ目で `split_mark`、最後に `split_flush`。
+// 計測 OFF (`split_on()` が偽) は tick が None で、どれも分岐 1 回で戻る —
+// 既定経路はクロック読みも確保もしない (挙動・数値は完全に不変)。
+// ---------------------------------------------------------------------------
+
+/// 段割りの開始 tick (計測 OFF は None)。
+#[inline]
+fn split_stage() -> Option<Instant> {
+    if crate::prof::split_on() {
+        Some(Instant::now())
+    } else {
+        None
+    }
+}
+
+/// 直前の段 (`op`) の所要を表 B へ積み、次の段の tick を打ち直す。
+/// `op` は「いま終わった段」— 呼び出しは段の切れ目 (確保 / copy / launch / sync
+/// の直後) に置く。calls は 1 (その段が起きたら 1 回、起きなかった段は積まない)。
+#[inline]
+fn split_mark(t: &mut Option<Instant>, op: usize) {
+    let Some(t0) = *t else { return };
+    let now = Instant::now();
+    let ns = now.duration_since(t0).as_nanos() as u64;
+    crate::prof::split_sample(op, ns, 1);
+    *t = Some(now);
+}
+
+/// 1 call 分の段割りを閉じる (残りの段の tick は捨てる)。
+/// 段の値は `split_mark` が `split_sample` で直接積んでいるので、ここで表へ
+/// 流し込むものは無い (時間の丸めを段ごとに 1 回で済ませるため、8〜9 段の
+/// 積算器は持たない — `secs` でまとめて足すと段の数だけ丸め誤差が乗る)。
+#[inline]
+fn split_flush(t: &mut Option<Instant>) {
+    *t = None;
+}
+
 /// s123: Q4_0 の 1 層ぶん。小さい m は GEMV (1 warp = 1 行)、大きい m は
 /// タイル GEMM (1 block = 16 行 x 256 列)。H2D → kernel → D2H → sync ×1。
 fn q4_dispatch(
@@ -2390,6 +2653,9 @@ fn q4_dispatch_tile(
     out: &mut [f32],
 ) -> Result<()> {
     ctx.make_current()?;
+    // s138 (Task B6・計測のみ): 段ごとの tick。計測 OFF はすべて None = クロック
+    // 読みゼロ・(表への) 書き込みゼロで、既定経路の挙動は 1 命令も変わらない。
+    let mut t = split_stage();
     SCRATCH.with(|cell| -> Result<()> {
         let mut s = cell.borrow_mut();
         let Scratch { x, out: dout, hx, ho, .. } = &mut *s;
@@ -2397,11 +2663,14 @@ fn q4_dispatch_tile(
         let bytes_out = m * n * 4;
         Scratch::ensure(x, bytes_x)?;
         Scratch::ensure(dout, bytes_out)?;
+        split_mark(&mut t, crate::prof::Q4P_OUT_ALLOC);
         Scratch::ensure_pin(hx, bytes_x)?;
         Scratch::ensure_pin(ho, bytes_out)?;
+        split_mark(&mut t, crate::prof::Q4P_PIN_ALLOC);
         let (dx, dout) = (x.as_ref().unwrap(), dout.as_ref().unwrap());
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
         hx.as_mut_slice::<f32>()[..m * k].copy_from_slice(a);
+        split_mark(&mut t, crate::prof::Q4P_H2D_STAGE);
         unsafe {
             check(
                 (lib.memcpy_htod_async)(
@@ -2412,6 +2681,7 @@ fn q4_dispatch_tile(
                 ),
                 "cuMemcpyHtoDAsync",
             )?;
+            split_mark(&mut t, crate::prof::Q4P_H2D_ISSUE);
             let (mut pa, mut pn, mut ps, mut po) =
                 (dx.ptr(), gw.nib.ptr(), gw.sc.ptr(), dout.ptr());
             let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, n as c_int);
@@ -2464,14 +2734,18 @@ fn q4_dispatch_tile(
                 let grid = (n.div_ceil(8) as u32, m as u32, 1);
                 ctx.launch_async(ctx.f_mv_q4, grid, (256, 1, 1), 0, &mut args)?;
             }
+            split_mark(&mut t, crate::prof::Q4P_KERNEL_LAUNCH);
             check(
                 (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
                 "cuMemcpyDtoHAsync",
             )?;
+            split_mark(&mut t, crate::prof::Q4P_D2H_ISSUE);
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
             ctx.sync()?;
+            split_mark(&mut t, crate::prof::Q4P_SYNC_WAIT);
         }
         out.copy_from_slice(&ho.as_slice::<f32>()[..m * n]);
+        split_flush(&mut t);
         Ok(())
     })
 }
@@ -2490,6 +2764,8 @@ fn linear_pinned(
     let lib = lib()?;
     // current context はスレッドローカル → 毎回張り直す (冪端・軽量)
     ctx.make_current()?;
+    // s138 (Task B6・計測のみ): 段ごとの tick (計測 OFF は None)。
+    let mut t = split_stage();
     SCRATCH.with(|cell| {
         let mut s = cell.borrow_mut();
         // デストラクチャしてフィールド単位の借用にする (RefMut 経由の
@@ -2501,8 +2777,10 @@ fn linear_pinned(
         Scratch::ensure(aq, m * k)?;
         Scratch::ensure(asc, m * 4)?;
         Scratch::ensure(out, bytes_out)?;
+        split_mark(&mut t, crate::prof::Q4P_OUT_ALLOC);
         Scratch::ensure_pin(hx, bytes_x)?;
         Scratch::ensure_pin(ho, bytes_out)?;
+        split_mark(&mut t, crate::prof::Q4P_PIN_ALLOC);
         let (dx, daq, dasc, dout) = (
             x.as_ref().unwrap(),
             aq.as_ref().unwrap(),
@@ -2511,11 +2789,13 @@ fn linear_pinned(
         );
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
         hx.as_mut_slice::<f32>()[..m * k].copy_from_slice(a);
+        split_mark(&mut t, crate::prof::Q4P_H2D_STAGE);
         unsafe {
             check(
                 (lib.memcpy_htod_async)(dx.ptr(), hx.ptr as *const c_void, bytes_x, std::ptr::null_mut()),
                 "cuMemcpyHtoDAsync",
             )?;
+            split_mark(&mut t, crate::prof::Q4P_H2D_ISSUE);
             let (mut px, mut paq, mut pasc) = (dx.ptr(), daq.ptr(), dasc.ptr());
             let (mut mc, mut kc) = (m as c_int, k as c_int);
             let mut args = [
@@ -2543,17 +2823,24 @@ fn linear_pinned(
             let total = (m * n) as u64;
             let blocks = total.div_ceil(8) as u32;
             ctx.launch_async(ctx.f_mv, (blocks, 1, 1), (256, 1, 1), 0, &mut args)?;
+            split_mark(&mut t, crate::prof::Q4P_KERNEL_LAUNCH);
 
             check(
                 (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
                 "cuMemcpyDtoHAsync",
             )?;
+            split_mark(&mut t, crate::prof::Q4P_D2H_ISSUE);
             // s65: 発行元の件数分類 (表示専用・時間は d2h_state バケット側)
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
         ctx.sync()?;
+        split_mark(&mut t, crate::prof::Q4P_SYNC_WAIT);
+        // s138: ピン留め → 呼び出し側 Vec のコピー (sync の後・表示専用)
+        let v = ho.as_slice::<f32>()[..m * n].to_vec();
+        split_mark(&mut t, crate::prof::Q4P_HOST_COPY);
         crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
-        Ok(ho.as_slice::<f32>()[..m * n].to_vec())
+        split_flush(&mut t);
+        Ok(v)
     })
 }
 
