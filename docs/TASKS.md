@@ -711,23 +711,91 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   / conv 4, for n = 1, 8, 32, 300. Checks determinism (same input twice, bit equal) and
   compares against `gdn::forward_token_core`.
 - Both print a CPU-reference `maxabs`, so a fast-but-wrong kernel shows up as text.
-- Baseline (27B q4, one A/B-free run, `--iters 30`):
+- Baseline (27B q4, HEAD `db47d2a`, one A/B-free run, `--iters` default):
   | layer | m or n | ms/call | rate | x layers |
   |---|---|---|---|---|
-  | gate_up | m=1 | 0.416 | 240.9 GB/s | 26.6 ms/token (x64) |
-  | gate_up | m=8 | 3.216 | 898 GFLOP/s | 205.8 ms/token |
-  | gate_up | m=300 | 16.877 | 6.3 TFLOP/s | n/a |
-  | down_proj | m=1 | 0.235 | 213.2 GB/s | 15.0 ms/token (x64) |
-  | lm_head | m=1 | 2.815 | 254.1 GB/s | 2.8 ms/token (x1) |
-  | GDN scan | n=1 | 0.143 | - | 6.9 ms/token (x48) |
-- What the split shows: the four measured bottlenecks add up to about 51 ms of the
-  126.7 ms/token, and every m=1 GEMV already runs at 210-254 GB/s, i.e. near the ceiling
-  of this kernel style. The losses are (a) m=2 doubling the cost (weights re-read per
-  row) and m=8 being worse than m=64, and (b) the prefill GEMM at 6.3 TFLOP/s, which is
-  occupancy bound rather than bandwidth bound. Those two are what the next kernels should
-  attack; the plain m=1 GEMV has little left.
+  | gate_up | m=1 | 0.103 | not measured | 6.6 ms/token (x64) |
+  | gate_up | m=2 | 0.141 | not measured | 9.0 ms/token (x64) |
+  | gate_up | m=8 | 0.511 | not measured | 32.7 ms/token (x64) |
+  | gate_up | m=64 | 2.349 | not measured | n/a |
+  | gate_up | m=300 | 16.976 | not measured | n/a |
+  | down_proj | m=1 | 0.069 | not measured | 4.4 ms/token (x64) |
+  | down_proj | m=8 | 0.088 | not measured | 5.6 ms/token (x64) |
+  | down_proj | m=64 | 2.222 | not measured | n/a |
+  | down_proj | m=300 | 6.912 | not measured | n/a |
+  | lm_head | m=1 | 0.659 | not measured | 0.7 ms/token (x1) |
+  | GDN scan | n=1 | 0.147 | not measured | 7.1 ms/token (x48) |
+  | GDN scan | n=8 | 0.306 | not measured | n/a |
+  | GDN scan | n=32 | 0.815 | not measured | n/a |
+  | GDN scan | n=300 | 5.745 | not measured | n/a |
+  - Shapes: gate_up k5120 n34816; down_proj k17408 n5120, both x64 layers;
+    lm_head k5120 n248320 x1 with `--raw`; GDN scan nk16 nv48 dk/dv128 conv4 x48 layers.
+  - Reproduce with `bash scripts/bench_all.sh` on a GPU host (the script builds the two
+    examples with `--features cuda` and prints the same table).
+  - `down_proj m=300` is noisy: repeated runs were observed between 5.72 and 6.912.
+    Treat 6.912 as the top of that range, not a stable value.
+- Rate columns are **not measured** on this run: `bench_all.sh` without `--iters`
+  prints ms/call, and GB/s / GFLOP/s were not recorded for `db47d2a`. Do not quote the
+  old 240.9 / 213.2 / 254.1 GB/s figures with the new ms/call.
+- Effect on the real model (27B q4 on 8095): decode went from 105.3 to **58.5 ms/token**.
+  The gain is in the small-m GEMV path (B1), not in the GEMM rows: m=1/m=2/m=8 improved
+  by roughly 4x / 5.7x / 6.3x while m=64 and m=300 stayed at 2.349 / 16.976 ms.
+- Superseded baseline (**do not use**): the row set 0.416 / 0.807 / 3.216 / 2.596 /
+  16.877 / 0.235 / 2.815 / 0.143 / 5.746, measured at `d949195`. It was replaced by B1
+  (commit `59e9ce9`, PTX `0f0f4ae1`). It is kept only as history: the old table's
+  reading ("m=2 doubles the cost", "m=8 worse than m=64") no longer describes the code.
+- What the split shows now: the plain m=1 GEMV is no longer the loss (0.103 ms), and
+  m=2 / m=8 scale roughly linearly (0.141 / 0.511). The prefill GEMM at m=300
+  (16.976 ms) is unchanged by B1 and stays the open prefill item (B2, and the B3 note
+  below); do not attribute the decode gain to it.
 - Iteration cost is 12 s of build plus 5-20 s of run, with no server restart and no long
   prompt. A full-model run plus `GPU_VERIFY` stays the acceptance step, not the inner loop.
+
+### P5-5: GDN chunk parallelism (Task B3) - CLOSED, target dropped, no speedup
+- Status: **closed (s136, no code change).** The n=300 GDN row (5.745 ms/call) is **not**
+  improved; the target ("n=300 about 4 ms") is dropped. Nothing was committed for B3
+  attempt 1, and the two B2 attempts that followed were reverted (`2ab333d`, `db47d2a`).
+- Reason 1 - there is no chunk to parallelise at n=300:
+  - `GDN_CHUNK_MIN_TOKENS = 2048` (`scan_schedule::CHUNK_MIN_TOKENS`), so the routing is
+    `n >= 2048` -> chunked path, otherwise -> single-shot `dno_gdn_scan`.
+  - `chunk_plan(n, 2048, 1024, 16)` gives **n_chunks = 1** for n = 1 / 8 / 32 / 300, i.e.
+    those four rows all run the single-shot kernel. Splitting the head across chunks or
+    splitting work per chunk cannot help a kernel that has exactly one chunk.
+- Reason 2 - the single-shot kernel is SM-starved and packing makes it worse:
+  - `dno_gdn_scan` uses **1,120 B of local memory per thread** (`Scol[256]` is an
+    indexed array, so it is spilled to local, not kept in registers), 66 regs/thread,
+    1 barrier. One 128-thread block therefore wants ~143 KB of local, so residency is
+    **one block per SM**.
+  - The launch is 48 blocks (one per head) = **48 of ~170 SMs**; roughly 72% of the chip
+    is idle for the whole scan.
+  - Packing several heads into one block lowers the block count, which is the wrong
+    direction: pack 2 -> 24 blocks, **pack 4 -> 12 blocks**. Fewer SMs with work, plus
+    more register-heavy heads per SM. This was prototyped and discarded on the occupancy
+    arithmetic, before any measurement.
+- Reason 3 - no bit-exact route to more blocks:
+  - Splitting `dv` across blocks keeps each column's accumulation order but also splits
+    the `o_inv` 128-term sum and the `q_inv` / `k_inv` dk-term sums, which the kernel
+    keeps as a single ascending sequential sum in thread 0 to match the CPU reference.
+    That moves GDN output, i.e. the three 9B anchors would need re-baselining.
+  - Lowering the chunk threshold so n=300 runs as 2 chunks raises the block count to 96,
+    but multi-chunk routes through `W` / `M` (`Sinit[ci+1] = M[ci]*Sinit[ci] + W[ci]`),
+    which is a different rounding order: the repo's own
+    `gdn::tests::gdn_chunked_matches_ar_relaxed` asserts only `maxabs < 1e-3`, not bit
+    equality. It is also a numerics change for every request at n >= 300, not a
+    speed-only change.
+- Why the target is dropped rather than re-specified for the production shape:
+  - Production 3,020-token prefill already takes the **chunked** path: **3 chunks**
+    (1,007 each), **144 blocks** on pass 1 / pass 3 and **48 blocks** on pass 2. The
+    n=300 gate row is a bench shape, not a production shape.
+  - So the bench row measures a kernel path that production 3,020 does not use, and the
+    chunked path is already spread over 144 blocks. There is no bit-exact route from 48
+    blocks to ~144 blocks inside the single-shot kernel.
+- Not measured: the split of the GPU's extra ~17 us/token at n=300 between the 4-pass
+  S-column walk in local memory and the two 128-term scalar sums. A CPU-reference
+  stand-in was measured (release, `scan_chunked_core`, nc=1): n=1 69.3 ms, n=8 81.7 ms,
+  n=32 128.2 ms, n=300 657.0 ms (2.19 ms/token), but that is a CPU model, not the GPU
+  kernel breakdown.
+- Explicitly **no speedup is claimed** for B3, and none was measured.
 
 ## Suggested order
 
