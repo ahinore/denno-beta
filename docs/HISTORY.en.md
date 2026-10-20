@@ -2446,6 +2446,119 @@ operator work (this container forbids seeking personal data or fetching over the
 `(2S + C_d)/(1 + p)` inequality above does not depend on p's value, so the verdict is not
 expected to change.
 
+### s121: swiglu epilogue fusion (P1-4) upper bound is 90 ms - **closed**, not implemented (CPU only, `.cu` / `.ptx` / `crates/` untouched)
+
+> P1-4 asks to fuse swiglu into the gate+up GEMM epilogue, with its ceiling quoted as `rmsnorm`
+> 413 ms and acceptance at ">= 0.3 s faster on a cold A/B". This session asked the prior
+> question: **can the upper bound clear 0.3 s at all?** It read the code, re-derived the profile
+> row P1-4 was estimated from, and did the byte arithmetic. No CUDA was built, no server was
+> started, nothing under `crates/` or `kernels/` changed.
+
+**The path, as it actually is** (`crates/denno-engine/src/`, 9B int8, 5,686-token cold request):
+
+1. `qwen35::forward_prefill` (`model/qwen35.rs:1528`) calls `cuda::chain_mlp_prefill`
+   (`cuda.rs:2954`) whenever the FFN weights are int8. That is the cold prefill path;
+   `maybe_gpu_ffn` (`cuda.rs:1360`) is the older per-layer FFN entry and does not run here.
+2. `chain_mlp_prefill` = H2D of the normed x -> gate_up GEMM (`chain_gemm_grouped_pf`,
+   `cuda.rs:2858`, which launches `dno_gemm_i8`, `kernels/kernels_int8.cu:177`) -> swiglu
+   (`chain_swiglu_rows`, `cuda.rs:2917`, which launches `dno_swiglu_int`,
+   `kernels/kernels_elem.cu:108`) -> down GEMM -> one D2H of the layer output.
+3. Layout and dtype: the gate_up output is `[m, 2ff]` **f32** in chain slot `CH_GA`, row
+   interleaved `[gate(0..ff) | up(0..ff)]`; the activation is `[m, ff]` **f32** in `CH_ACT`
+   (`ff` = 12,288). `dno_swiglu_int` reads `CH_GA`, writes `CH_ACT`; the down GEMM reads
+   `CH_ACT`. The activation never leaves the device.
+4. Where swiglu runs: once per layer, i.e. **32 launches per request** (32 layers all have an
+   FFN; 24 GDN + 8 full attention is an attention-side split only).
+5. Residual add and norm: `rmsnorm` for the FFN (`model/qwen35.rs:1510`) runs **on the host** in
+   rayon before the chain, and the residual `+=` after the down GEMM is a host loop
+   (`model/qwen35.rs:1595-1601`). Neither is inside the gate_up GEMM epilogue, on either side.
+6. Sync structure: `chain_mlp_prefill` ends with a single `ctx.sync()` (`cuda.rs:3030`). The
+   inner `ctx.sync()` calls at `cuda.rs:2999` and `cuda.rs:3005` are guarded by
+   `prof::enabled()`, so they exist only while PROFILE is on. **A fused epilogue would remove no
+   kernel launch and no sync**: swiglu is one launch in an already asynchronous stream, and the
+   stream's only wait is after the down GEMM, which the fusion does not touch.
+
+**Geometry** (`data/.cache/denno/hub/models--local--qwen35-9b/config.json`, read not guessed):
+hidden e = 4,096, intermediate ff = 12,288, 32 layers (24 `linear_attention`, 8
+`full_attention`), 16 query / 4 kv heads, head_dim 256, vocab 248,320.
+
+**Why P1-4's own ceiling was wrong**
+
+- The `rmsnorm` 413 ms bound does not apply. It predates s85, which deleted the `Ambient` parent
+  scope that had been counting the whole layer block into the `rmsnorm` row (`prof.rs:20`, s84/T8
+  section of this file). The norm is 5,686 host rows per layer, it is not on the GPU at all, and
+  no GEMM epilogue can remove it.
+- The row behind the estimate (`gate_up_proj` 2,283 ms / 64 calls / 14.4 %, added in `e9947be`)
+  has no matching capture in any `DENNO_PROFILE` record in this file, and it is a factor 1.65
+  above the s70 reading of the same bucket. It is used here only **as a published bound**: the
+  arithmetic below is a ratio of this row, so the verdict survives any value of it.
+
+**Traffic of the pass, per request** (5,686 rows x 12,288 f32 = 279.5 MB per layer):
+
+| item | per layer | 32 layers |
+|---|---|---|
+| gate_up output written by the GEMM (whole row) | 559.0 MB | 17.887 GB |
+| gate_up re-read by the standalone swiglu | 559.0 MB | 17.887 GB |
+| activation written by swiglu | 279.5 MB | 8.943 GB |
+| activation read by the down GEMM (unavoidable, both sides) | 279.5 MB | 8.943 GB |
+
+- The standalone swiglu touches **read 17.887 GB + write 8.943 GB = 26.830 GB**, measured at
+  2,283 ms for 64 calls = 35.7 ms per layer pair = 35.7 ms per 26.830/32 = 0.838 GB, i.e. an
+  **issue rate of 11.75 GB/s**. That is not DRAM speed; it is what one `[m, ff]` elementwise
+  launch achieves here (2.71 ns per element, 3.92 GB/s of pure writes).
+- **What a fused epilogue can remove** is the re-read of gate_up (17.887 GB) and, if the
+  activation is written into the gate stripes in place (legal: ff divides 2ff and the 128x256
+  tile never crosses a row), the separate write of the activation (8.943 GB). **The activation
+  read by the down GEMM stays.** Best case, per request: 26.830 - 8.943 = 17.887 GB removed.
+- A stripe-fused epilogue that keeps `dno_gemm_i8`'s 256-column block rows needs the odd strip
+  read back, adding 0.279 GB per request: it saves 17.608 GB instead of 17.887 (-1 %).
+  `BM` = 64 / 128 / 256 change nothing here; read-once/write-once is a floor.
+
+**Arithmetic and the one number**
+
+1. Removed bytes at the measured issue rate: **17.887 / 26.830 x 2,283 ms = 1,522 ms** in the
+   best case (gate_up re-read + activation write both gone), or 17.608 / 26.830 x 2,283 =
+   1,498 ms for the block-row variant. That is the *whole-pass* bound and it is not physical:
+   the fusion still writes 8.943 GB through the same epilogue, so this number assumes the fused
+   epilogue costs nothing.
+2. What is left is a bandwidth question, so take it at the FLOOR bandwidth, not the issue rate.
+   The only bytes any fusion of this pass can still remove, independently of bandwidth, are the
+   re-read of gate_up: **17.887 GB**. At the machine's peak of ~1.79 TB/s that is **10 ms**, and
+   at a pessimistic 100 GB/s it is 179 ms.
+3. Removing the activation *write* is not a byte saving at all unless the fused epilogue also
+   absorbs the down GEMM: the down GEMM has to read those 8.943 GB from somewhere, and the only
+   thing that would avoid the write is keeping the activation in registers/smem, which a
+   12,288-wide row (48 KB of f32) does not fit next to the 128x256 tile. Without that, moving the
+   write into the epilogue saves the *launch*, not the bytes.
+4. Upper bound therefore: **X = 90 ms** = the 17.887 GB of removable bytes at ~200 GB/s
+   (17.887 / 0.200 = 89 ms); that is the figure quoted in `docs/TASKS.md`. Expressed instead as
+   a share of the pass it would be 17.887 / 26.830 x 2,283 ms = 1,522 ms, but that ratio assumes
+   the fused epilogue is free. The bandwidth view brackets the honest figure: 10 ms at peak
+   bandwidth, 179 ms at a pessimistic 100 GB/s. Even the impossible "the fused epilogue is free" figure
+   (1,522 ms) cannot be claimed as a saving, because it assumes zero cost for the 8.943 GB the
+   epilogue still writes. **Every version of the bound is under the 300 ms acceptance, and the
+   honest one is 90 ms.**
+
+**Verdict: closed, upper bound 90 ms < 300 ms.** Nothing in the fusion of swiglu into the
+gate_up epilogue can move the cold prefill by 0.3 s, because the pass's cost is dominated by
+bytes that the fusion cannot remove (the activation read by the next GEMM) and the removable
+part is 17.9 GB against a 5,686-token request that already spends 13.2-13.4 s.
+
+**What P1-4 mis-read in the first place**: the activation round trips that would have made this
+worth a kernel were already removed by s70. Before s70 the MLP moved H2D x + D2H gate_up + H2D
+activation + D2H down = 281 MB per layer; `chain_mlp_prefill` cut that to H2D x + D2H down =
+94 MB per layer, and the remaining activation traffic is device-side and is exactly what a fused
+epilogue would also produce. There is no host round trip left for the fusion to delete.
+
+**Numeric class**: R1 (fusing two f32 passes, rel 1e-6) if the multiply order is kept, which it
+can be: the expression is `g / (1 + exp(-g)) * u` with `dno_expf` + `__fdiv_rn` / `__fadd_rn` /
+`__fmul_rn`, the same order `dno_swiglu_int` already uses, so the fused form is **bit-exact**
+with the standalone one. This is not what blocks the change; the byte count is.
+
+**Human steps (what is not measured)**: nothing here was measured on a GPU. The 2,283 ms is the
+published PROFILE row, and its own provenance could not be matched to a HISTORY capture. No cold
+A/B was run and none is planned for a closed task.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)
