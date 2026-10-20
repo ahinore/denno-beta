@@ -43,6 +43,7 @@ fn main() {
     let n = arg_u(&args, "--n", 34816); // 2 * ff  (27B: 2 * 17408)
     let layers = arg_u(&args, "--layers", 64);
     let iters = arg_u(&args, "--iters", 30);
+    let copies = arg_u(&args, "--copies", 1).max(1);
     let raw = args.iter().any(|a| a == "--raw");
     assert_eq!(k % 32, 0, "k must be a multiple of 32");
     std::env::set_var("DENNO_CUDA", "1");
@@ -86,7 +87,28 @@ fn main() {
         q
     };
 
-    let uid = q4.uid;
+    // `--copies N` は同じ重みを N 部デバイスに置き、反復ごとに別の部を使う。
+    // 重みが L2 (96 MB) に残ると m=1 が見かけ上 3-4 倍速く出るため、実機の
+    // decode (16.7 GB を毎 token 冷えた状態で読む) に近づけるには 2 以上で測る。
+    let mut copies_v: Vec<Q4Linear> = Vec::with_capacity(copies);
+    copies_v.push(Q4Linear {
+        blocks: q4.blocks.clone(),
+        k,
+        n,
+        uid: q4.uid,
+    });
+    for _ in 1..copies {
+        copies_v.push(Q4Linear {
+            blocks: q4.blocks.clone(),
+            k,
+            n,
+            uid: next_q8_uid(),
+        });
+    }
+    if copies > 1 {
+        println!("weight copies on device: {copies} x {:.1} MB (L2 eviction)", bytes as f64 / 1e6);
+    }
+    let _ = uid;
     let mut worst = 0.0f64;
     for &m in &[1usize, 2, 8, 64, 300] {
         let a: Vec<f32> = (0..m * k).map(|i| (((i % 17) as f32) / 9.0) - 0.5).collect();
@@ -100,9 +122,9 @@ fn main() {
             continue;
         }
         let t = Instant::now();
-        for _ in 0..iters {
-            let ok =
-                denno_engine::cuda::maybe_gpu_linear_q4_into(uid, &a, &q4.blocks, k, n, m, &mut out);
+        for i in 0..iters {
+            let c = &copies_v[i % copies_v.len()];
+            let ok = denno_engine::cuda::maybe_gpu_linear_q4_into(c.uid, &a, &c.blocks, k, n, m, &mut out);
             assert!(ok, "GPU path dropped out on iteration");
         }
         let per = t.elapsed().as_secs_f64() / iters as f64;
