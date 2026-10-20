@@ -51,8 +51,8 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 - Idea: raise occupancy (smaller BK, more blocks), check L2 reuse of K/V across heads.
 - Estimated: not yet re-derived from a per-kernel profile; 942 ms is the ceiling for the
   whole bucket. Risk: medium; the attention contract allows 1e-3 abs (R3).
-- Status (2026-10-20): **candidates 1 and 2 closed with numbers; candidate 3 is a kernel
-  rewrite and is being taken as design-only.**
+- Status (2026-10-20): **candidates 1-3 closed with numbers; candidate 4 (causal key-range
+  truncation) is open and is the running task (s118).**
   - Candidate 1 (`__ldg` on the K/V reads, s112 `b5f1f37` + `78e7d08`): **-0.9 %, reverted**
     (`ac73729`); the bucket is not DRAM-bound, so a cache hint cannot pay.
   - Candidate 2 (tile/holding variants of the existing kernel, s116, no code change):
@@ -77,6 +77,21 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
     moved onto an MMA/flash-style tile. Both need `.cu` work, a PTX regen and a real cold
     A/B, so the dev must first prove the resource budget (smem <= 227 KiB, registers <= 255,
     occupancy >= 2 blocks/SM) and may answer "not feasible" with numbers and no commit.
+    - Result (s117): both variants answer **not feasible for the 0.3 s acceptance**. (a) needs
+      283.1 KiB smem and 256 floats/thread (caps: 227 KiB, 255 regs). (b) fits the budget
+      (124.5 KiB, ~64 regs) but is bounded at 14.3-45.3 ms = 1.5-4.8 % of the 942 ms bucket,
+      because the whole kernel issues only 606.6 M lane-ops (0.50 ms at 1 instr/scheduler/cycle)
+      while it measures 942 ms = 1,900x that ceiling; the cost is L2 latency with too few warps,
+      which mma does not fix. The committed PTX also targets `sm_75`, where mma is unavailable.
+  - Candidate 4 (open, s118): **causal key-range truncation** in the existing kernel. Row r of
+    block b only needs keys `j <= pos0 + i0 + r`, so every tile whose upper bound is below
+    `pos0 + i0` is fully masked for the whole block (s117: 52.8 % of all sm-tiles, the rest
+    half-masked on average, ~75 % of pass-1 key work). Starting the tile loop plus the register
+    prologue at `jstart = (pos0 + i0) / PF_BK * PF_BK` (aligned down) removes that work and is
+    numerically identical: a fully masked tile adds exactly 0 to `acc`, and leaves `m_run` /
+    `l_run` unchanged. One `.cu` edit, PTX regen + cold A/B by the supervisor.
+    BK 32 stays rejected: `(64 + 2*32)*257 + 64*32 + 128 = 35,072 floats = 140,288 B` per block,
+    so two blocks/SM would need 274 KiB against the 227 KiB cap.
 
 ### P1-3: d2h_state / sync reduction
 - Where: `cuda.rs` chains, `prof.rs` `d2h_state`.
