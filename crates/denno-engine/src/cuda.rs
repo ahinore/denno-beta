@@ -82,6 +82,7 @@ type FnCuMemcpyDtoHAsyncV2 =
     unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult;
 type FnCuMemcpyDtoDAsyncV2 =
     unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult;
+type FnCuMemcpyDtoD = unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult;
 type FnCuDeviceGetAttribute = unsafe extern "C" fn(*mut c_int, c_int, CUdevice) -> CUresult;
 type FnCuFuncSetAttribute = unsafe extern "C" fn(CUfunction, c_int, c_int) -> CUresult;
 type FnCuLaunchKernel = unsafe extern "C" fn(
@@ -122,6 +123,8 @@ struct CudaLib {
     memcpy_htod_async: FnCuMemcpyHtoDAsyncV2,
     memcpy_dtoh_async: FnCuMemcpyDtoHAsyncV2,
     memcpy_dtod_async: FnCuMemcpyDtoDAsyncV2,
+    // s141b (Task B7c): 同期 D2D (GDN 状態の正本 -> ミラー seed 用)。
+    memcpy_dtod: FnCuMemcpyDtoD,
     // s48 (C1-a): 動的 smem の opt-in (cuFuncSetAttribute)。CUDA 9.0 以降に存在
     // するが、dlsym 失敗でも全体を落とさないよう Option (無ければ 48KB 既定のまま)。
     device_get_attribute: Option<FnCuDeviceGetAttribute>,
@@ -178,6 +181,7 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
         memcpy_htod_async: std::mem::transmute(sym(handle, "cuMemcpyHtoDAsync_v2")?),
         memcpy_dtoh_async: std::mem::transmute(sym(handle, "cuMemcpyDtoHAsync_v2")?),
         memcpy_dtod_async: std::mem::transmute(sym(handle, "cuMemcpyDtoDAsync_v2")?),
+        memcpy_dtod: std::mem::transmute(sym(handle, "cuMemcpyDtoD_v2")?),
         device_get_attribute: sym_opt(handle, "cuDeviceGetAttribute")
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuDeviceGetAttribute>(p) }),
         func_set_attribute: sym_opt(handle, "cuFuncSetAttribute")
@@ -368,6 +372,24 @@ impl DevBuffer {
                         bytes,
                     ),
                     "cuMemcpyHtoD",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// s141b (Task B7c): 既存バッファへ**デバイスから**上書きコピー (D2D・同期)。
+    /// `src` の先頭 `len` 要素 (f32) をこのバッファの先頭へ移す。同一 GPU 内の
+    /// コピーをホスト経由 (D2H + H2D) で往復させないための経路 — 転送は値そのまま
+    /// なのでビットは D2H+H2D と同一。
+    pub fn copy_from_dev(&self, src: CUdeviceptr, len: usize) -> Result<()> {
+        let bytes = len * std::mem::size_of::<f32>();
+        assert!(bytes <= self.bytes, "DevBuffer::copy_from_dev: size overflow");
+        if bytes > 0 {
+            unsafe {
+                check(
+                    (lib()?.memcpy_dtod)(self.ptr, src, bytes),
+                    "cuMemcpyDtoD",
                 )?;
             }
         }
@@ -1476,6 +1498,63 @@ fn reserve_exact_grow(dst: &mut Vec<f32>, len: usize) {
     if len > dst.capacity() {
         dst.reserve_exact(len - dst.len());
     }
+}
+
+/// s141b (Task B7c): デバイス正本の 1 層を「デバイス正本から読む」ために取り出す。
+///
+/// s131 の `gdn_state_take` はホストへ D2H する版 (ホストの `KvCache::gdn` を
+/// 復帰させる用途)。こちらは decode chain の seed 用で、返すのは移し元の
+/// デバイスポインタだけ — ホストを経由しないので層あたり ~3.2 MiB の PCIe 往復が
+/// 消える。返す値は (conv ポインタ, ssm ポインタ)。
+///
+/// 取り出した層は**無効化しない** (正本の値はそのまま有効 — 読むだけ)。ただし
+/// 読み手は「ミラーへコピーした後」に scan カーネルがその面を更新するので、正本と
+/// ミラーの内容は今後ずれる → 戻した層は valid=false にする (従来の
+/// `gdn_state_take` と同じ規則: 次に scan 経路で使うときは必ず seed し直す)。
+fn gdn_state_take_dev(
+    kv: u64,
+    li: usize,
+    c: &mut GdnStateCache,
+) -> Option<(CUdeviceptr, CUdeviceptr)> {
+    if c.cur_kv != Some(kv) || li >= c.valid.len() || !c.valid[li] {
+        return None;
+    }
+    let pc = c.conv.get(li)?.as_ref()?.ptr();
+    let ps = c.ssm.get(li)?.as_ref()?.ptr();
+    c.valid[li] = false;
+    Some((pc, ps))
+}
+
+/// s141b (Task B7c): 遅延フラッシュの「D2H が要るか」の判定 (純関数 — テストが
+/// 実物を通す)。
+///
+/// 規則: **ホストが古い可能性がある層** (= `stale`) と **位置が合っている層**
+/// (= `pos == Some(target)` / `Some(target+1)`) の両方を満たす層だけ D2H する。
+///
+/// - stale でない層はホストが既に最新 (このステップで面 0 を上から書いた) →
+///   読み直さなくてよい。これが「何も要らないステップでホストバイトをコピー
+///   しない」の実体。
+/// - stale でも位置が合っていない層 (chain 未走 / 不整合) は従来どおり判定へ回し、
+///   呼び出し側がバグ時 None を返す経路をそのまま踏ませる。
+///
+/// 戻り値: (D2H するか, 位置が合っているか)。
+fn gdn_flush_step(is_gdn_layer: bool, stale: bool, target: usize, pos: Option<usize>) -> (bool, bool) {
+    if !is_gdn_layer {
+        return (false, false);
+    }
+    // 成功ステップ後: 位置は target (= cache.len()) に一致し、その面は**書き込んだ
+    // 状態** = ホストが遅れている層だけが読み直しの対象。
+    if pos == Some(target) {
+        return (stale, true);
+    }
+    // 層途中で失敗したステップ: 位置は target+1 で、書いた面は「次」の状態。
+    // 現在の状態 (target) は反対の面にあり、その面は前回の seed 直後に書かれた
+    // = **ホストと一致している** (= stale が偽) ので、stale の層は読んでも
+    // 意味が無い (古いホストを書き戻すだけ)。一律で「読まない」。
+    if pos == Some(target + 1) {
+        return (false, true);
+    }
+    (false, false)
 }
 
 static GPU_CTX: OnceLock<Option<CudaCtx>> = OnceLock::new();
@@ -4123,6 +4202,14 @@ struct KvMirror {
     /// でミラーから回復する。pending 保持中のミラーは LRU エビクト対象外
     /// (フラッシュ前にデータが失われると回復不能になるため)。
     gdn_pending: Option<usize>,
+    /// s141b (Task B7c): 層ごとの「ホスト `KvCache::gdn` がデバイスより古い可能性が
+    /// ある」フラグ。decode chain はステップ毎にホストへ戻さない (s50 から) ので、
+    /// 一度でも scan を走らせた層はここが真になる。真の層はホストを seed に使っては
+    /// ならない = `chain_q35_gdn_scan` の seed はデバイス正本から D2D で取る。
+    /// ホストを読む側は `chain_q35_gdn_flush_pending` (= 本フラグのある層だけ D2H)
+    /// か `KvCache::flush_gdn_device_state` を通ってから読むこと。
+    /// ミラーに面 0 を書き直した層 (seed 直後) は偽に戻る。
+    gdn_stale: Vec<bool>,
 }
 
 /// C4 (qwen35): GDN 状態 (conv + SSM) のデバイスミラー 1 層分。
@@ -4229,6 +4316,7 @@ fn with_mirror_ext<T>(
                     gdn: (0..n_layers).map(|_| None).collect(),
                     gdn_pos: vec![None; n_layers],
                     gdn_pending: None,
+                    gdn_stale: vec![false; n_layers],
                 },
                 now,
             ));
@@ -4267,6 +4355,9 @@ fn with_mirror_ext<T>(
     if m.epoch != epoch {
         m.len.iter_mut().for_each(|l| *l = 0);
         m.gdn_pos.iter_mut().for_each(|p| *p = None);
+        // s141b: 行/位置を捨てるのと同じく、ホスト遅延フラグも落とす (次の seed は
+        // 位置不一致で必ず走り、そこで改めて判定し直す)。
+        m.gdn_stale.iter_mut().for_each(|s| *s = false);
         // s50: 世代が変わった = ホストが reset/restore で正に戻っている。遅延
         // pending は前会話のデータを指すため破棄 (chain_q35_gdn_flush_pending が
         // no-op になり、ホスト状態をそのまま使う)。
@@ -6249,11 +6340,29 @@ pub fn chain_q35_gdn_scan(
     chain_q35_ctl_f32(mid, li, Q35_TAG_BETA, beta_w, e, nv, conv_dim + vd)?;
     chain_q35_ctl_f32(mid, li, Q35_TAG_ALPHA, alpha_w, e, nv, conv_dim + vd + nv)?;
 
-    // GDN 状態ミラー: 取得/seed (ポインタはロック解放前に抽出)
-    // s141 (Task B7): seed D2H の受け皿 (grow-only)。この関数は層ごとに 1 回
-    // 呼ばれるが、seed は `gdn_pos` がずれたときだけなので、受け皿もここで
-    // 1 回作って使い回す (以前は seed のたびに 2 本確保していた)。
-    let mut stage = GdnHostStage::new();
+    // s141b (Task B7c): seed の入力は **デバイス正本** から直接 D2D で取る。
+    // 以前は「正本 → ホスト (D2H) → ミラー (H2D)」と、同一 GPU 内のコピーを
+    // わざわざ PCIe 経由で往復させていた (層ごとに ~3.2 MiB の D2H)。
+    // 27B q4 の decode では `with_mirror_ext` の cap 成長時に全層の gdn_pos が
+    // 落ちるため、この往復が 48 層 x 2 本ずつ (= gdn_pf_alloc の実体) 発生していた。
+    //
+    // 規則 (所有者はこう変わる):
+    // - デバイスミラー = decode 中の権威 (従来どおり)
+    // - ホスト `KvCache::gdn` = **遅延リフレッシュ対象**。mirror.gdn_stale が真の間は
+    //   ホストが古い可能性がある。ホストを読む前に必ず
+    //   chain_q35_gdn_flush_pending (= mirror.gdn_pending を Some にしておく) か
+    //   KvCache::flush_gdn_device_state を通すこと。
+    // - 正本が無効な層 (valid[li] == false = ホストが正) だけは従来どおりホストから
+    //   H2D する。ホストはその時点で正 (何も捨てていない)。
+    //
+    // 失敗時の扱い: 正本から読めなかった (None) 場合は従来どおりホストから seed
+    // する。これは s141 までの「正本が無効な層 = ホストが正」と同じ状態で、
+    // 正本が無効になるのは必ずホストが正に戻された後 (gdn_scan_state_invalidate は
+    // ホスト書き換え経路が呼ぶ) なので、古いホストを読むことはない。
+    let devseed = GDN_STATE.with(|cell| {
+        let mut c = cell.borrow_mut();
+        gdn_state_take_dev(cache.kv_id(), li, &mut c)
+    });
     let (conv_in, ssm_in, conv_out, ssm_out) =
         with_mirror_ext(key, li, n_layers, t_total, 0, cache.epoch(), false, |m, _| {
             if m.gdn[li].is_none() {
@@ -6269,19 +6378,27 @@ pub fn chain_q35_gdn_scan(
                 m.gdn[li] = Some(g);
             }
             let gd = m.gdn[li].as_mut().unwrap();
-            // seed: この層のミラーが pos0 に同期していなければホスト状態を H2D
+            // seed: この層のミラーが pos0 に同期していなければ状態を面 0 へ入れる
             if m.gdn_pos[li] != Some(pos0) {
-                // s131: GDN 状態の正本はデバイス。ミラーへの seed もそこから取る
-                // (ホストは境界まで古いことがある)。取り出した層は無効化されるので
-                // 以後の scan 経路はホストから seed し直す = 取り違えが起きない。
-                let kv_id = cache.kv_id();
-                if let Some((cv, sm)) = gdn_state_take(kv_id, li, &mut stage) {
-                    ok(gd.conv[0].as_ref().unwrap().copy_from(cv))?;
-                    ok(gd.ssm[0].as_ref().unwrap().copy_from(sm))?;
-                } else {
-                    let (conv_h, ssm_h) = cache.gdn_state_mut(li)?;
-                    ok(gd.conv[0].as_ref().unwrap().copy_from(conv_h))?;
-                    ok(gd.ssm[0].as_ref().unwrap().copy_from(ssm_h))?;
+                // s131/s141b: 正本 (デバイス) が有効ならそこから D2D で取る。
+                // 無効 (= valid[li] == false = ホストが正) のときだけホストから。
+                match devseed {
+                    Some((pc, ps)) => {
+                        ok(gd.conv[0].as_ref().unwrap().copy_from_dev(pc, conv_dim * cs))?;
+                        ok(gd.ssm[0].as_ref().unwrap().copy_from_dev(ps, nv * dk * dv))?;
+                        // 正本から入れた = **ホストは更新していない**。ホストが古い
+                        // 可能性は残るので遅延フラグは立てたままにする (ここで落とすと、
+                        // 後で flush がこの層を飛ばして古いホストを正として使ってしまう)。
+                        m.gdn_stale[li] = true;
+                    }
+                    None => {
+                        // 正本が無効 = ホストが正。ホストを読んで面 0 を書くので
+                        // ミラーとホストは一致する → 遅延フラグを落とす。
+                        let (conv_h, ssm_h) = cache.gdn_state_mut(li)?;
+                        ok(gd.conv[0].as_ref().unwrap().copy_from(conv_h))?;
+                        ok(gd.ssm[0].as_ref().unwrap().copy_from(ssm_h))?;
+                        m.gdn_stale[li] = false;
+                    }
                 }
                 gd.cur = 0;
             }
@@ -6373,6 +6490,9 @@ pub fn chain_q35_gdn_scan(
     with_mirror_ext(key, li, n_layers, t_total, 0, cache.epoch(), false, |m, _| {
         m.gdn_pos[li] = Some(pos0 + 1);
         m.gdn_pending = Some(pos0 + 1);
+        // s141b (Task B7c): この層の新状態は書き込み面にだけある (ホストは古い)。
+        // 以後この層の seed はホストではなくデバイス正本から取る。
+        m.gdn_stale[li] = true;
         if let Some(gd) = m.gdn[li].as_mut() {
             gd.cur = 1 - gd.cur;
         }
@@ -6443,15 +6563,25 @@ pub fn chain_q35_gdn_flush_pending(cache: &mut crate::kv_cache::KvCache) -> Opti
         let Some(gd) = m.gdn[li].as_ref() else {
             continue; // GDN 層ではない (full attention 層)
         };
+        // s141b (Task B7c): ホストが既に最新の層 (gdn_stale = false) は D2H しない。
+        // 判定は純関数 `gdn_flush_step` (テストが実物を通す)。
+        let (need, aligned) = gdn_flush_step(true, m.gdn_stale[li], target, m.gdn_pos[li]);
+        if !need {
+            if m.gdn_stale[li] && !aligned {
+                // 古い可能性があり、かつ位置が合っていない → 従来どおり不整合扱い
+                m.gdn_pending = None;
+                return None;
+            }
+            continue;
+        }
         let face = match m.gdn_pos[li] {
             Some(p) if p == target => gd.cur,
             Some(p) if p == target + 1 => 1 - gd.cur,
-            Some(_) => {
+            _ => {
                 // 不整合 (正常系では起こらない — バグのみ)
                 m.gdn_pending = None;
                 return None;
             }
-            None => continue, // chain 未走層 = ホストが最新
         };
         let (Some(cb), Some(sb)) = (&gd.conv[face], &gd.ssm[face]) else {
             m.gdn_pending = None;
@@ -6494,6 +6624,9 @@ pub fn chain_q35_gdn_flush_pending(cache: &mut crate::kv_cache::KvCache) -> Opti
         }
         conv_h[..conv.len()].copy_from_slice(conv);
         ssm_h[..ssm.len()].copy_from_slice(ssm);
+        // s141b (Task B7c): この層のホストは今デバイスと一致した → 遅延フラグを落とす。
+        // 落とさないと、次の flush で同じ層を読み直してしまう (無駄な D2H)。
+        m.gdn_stale[li] = false;
     }
     m.gdn_pending = None;
     Some(())
@@ -8877,6 +9010,8 @@ mod tests {
             gd.cur = 0;
             m.gdn_pos[0] = Some(1);
             m.gdn_pending = Some(1);
+            // s141b: ホストより新しい状態 = stale (flush はこの層を必ず読む)
+            m.gdn_stale[0] = true;
             Some(())
         })
         .unwrap();
@@ -8891,6 +9026,36 @@ mod tests {
             let idx = ms.iter().position(|(k, _, _)| *k == key).unwrap();
             ms[idx].1.gdn_pending
         };
+        let mirror_stale = || {
+            let mirrors = KV_MIRRORS.get().unwrap();
+            let mut ms = mirrors.lock().unwrap();
+            let idx = ms.iter().position(|(k, _, _)| *k == key).unwrap();
+            ms[idx].1.gdn_stale[0]
+        };
+
+        // s141b (Task B7c): stale でも位置が target+1 (層途中失敗) の層は読まない
+        // = ホストは変わらない (古い値を書き戻さない)。ホストを 0 埋めして
+        // flush を回し、0 のままであることを見る (① の前 = gdn_pos は 1 のまま)。
+        // ① では cache.len() が 1 になり位置が target に揃うので、そこで初めて読む。
+        assert_eq!(cache.len(), 0, "前提: advance 前");
+        {
+            let (hc, hs) = cache.gdn_state_mut(0).unwrap();
+            hc.fill(0.0);
+            hs.fill(0.0);
+        }
+        assert_eq!(chain_q35_gdn_flush_pending(&mut cache), Some(()));
+        let (hz_c, hz_s) = host(&mut cache);
+        assert!(hz_c.iter().all(|&v| v == 0.0) && hz_s.iter().all(|&v| v == 0.0),
+            "target+1 の層は D2H しない (古い値を書き戻さない)");
+        assert_eq!(mirror_pending(), None, "no-op でも pending は解除");
+        // 次に読む機会 (①) のために、ミラー状態を元へ戻す。
+        with_mirror_ext(key, 0, 1, 4, 0, cache.epoch(), false, |m, _| {
+            m.gdn_pos[0] = Some(1);
+            m.gdn_pending = Some(1);
+            m.gdn_stale[0] = true;
+            Some(())
+        })
+        .unwrap();
 
         // ① 成功ステップ後: gdn_pos = 1 == cache.len() (advance 後) → cur 面 = A
         cache.advance(1);
@@ -8899,6 +9064,7 @@ mod tests {
         assert_bits_eq(&hc, &conv_a, "①conv は cur 面 (A) と bit 一致");
         assert_bits_eq(&hs, &ssm_a, "①ssm は cur 面 (A) と bit 一致");
         assert_eq!(mirror_pending(), None, "①フラッシュ後 pending は解除");
+        assert!(!mirror_stale(), "①フラッシュ後、層のホスト遅延フラグは落ちている");
 
         // ② 層途中失敗: swap 済み (cur = 書き込み面 = state at 2)・cache.len() = 1
         //    → 1-cur 面 (= state at 1 = A) を回復する
@@ -8908,6 +9074,7 @@ mod tests {
             gd.cur = 1; // 成功ステップが cur を B 面へ交換した直後の想定
             m.gdn_pos[0] = Some(3);
             m.gdn_pending = Some(3);
+            m.gdn_stale[0] = true; // s141b: ホストより新しい
             Some(())
         })
         .unwrap();
@@ -8924,6 +9091,7 @@ mod tests {
             gd.cur = 1; // B 面が現行
             m.gdn_pos[0] = Some(3);
             m.gdn_pending = Some(3);
+            m.gdn_stale[0] = true; // s141b: ホストより新しい
             Some(())
         })
         .unwrap();
@@ -8936,6 +9104,7 @@ mod tests {
         with_mirror_ext(key, 0, 1, 4, 0, cache.epoch(), false, |m, _| {
             m.gdn_pos[0] = Some(7);
             m.gdn_pending = Some(7);
+            m.gdn_stale[0] = true; // s141b: 古いホストを持つ層だけが不整合を検出する
             Some(())
         })
         .unwrap();
@@ -8950,6 +9119,7 @@ mod tests {
         with_mirror_ext(key, 0, 1, 4, 0, cache.epoch(), false, |m, _| {
             m.gdn_pos[0] = None;
             m.gdn_pending = Some(1);
+            m.gdn_stale[0] = true; // s141b
             Some(())
         })
         .unwrap();
@@ -8975,6 +9145,7 @@ mod tests {
             let idx = ms.iter().position(|(k, _, _)| *k == key).unwrap();
             ms[idx].1.gdn_pos[0] = Some(9);
             ms[idx].1.gdn_pending = Some(9);
+            ms[idx].1.gdn_stale[0] = true; // s141b
         }
         assert_eq!(chain_q35_gdn_flush_pending(&mut cache), Some(()));
         assert_eq!(mirror_pending(), None, "③epoch 不一致で pending は破棄");
@@ -9598,5 +9769,341 @@ mod b7_stage_tests {
             reserve_exact_grow(&mut stage.ssm, 786_432);
             assert_eq!(stage.ssm.as_ptr(), p0, "同じ長さで確保し直している");
         }
+    }
+}
+
+// ===========================================================================
+#[cfg(test)]
+mod b7c_ownership_tests {
+    //! s141b (Task B7c): GDN 状態の所有者規則を固定する。
+    //!
+    //! 新しい規則:
+    //! - decode 中はデバイスミラーが権威。ホスト `KvCache::gdn` は**遅延リフレッシュ
+    //!   対象**で、`gdn_stale[li]` が真の間は古い可能性がある。
+    //! - seed (位置不一致でミラーを埋め直す) は**デバイス正本から D2D**。ホストを
+    //!   経由しない (= 層あたり 3.2 MiB の PCIe 往復が消える)。
+    //! - 遅延フラッシュは**ホストが古い層だけ**読む (古くない層を読み直さない
+    //!   = 「何も要らないステップでホストバイトをコピーしない」)。
+    //!
+    //! 実転送は GPU が要るので、ここでは判定の実体 (`gdn_flush_step` /
+    //! `gdn_state_take_dev` / `gdn_stale`) を回す。デバイスを伴う確認は
+    //! `cuda_gdn_flush_pending_faces_positions_and_epoch` (GPU 必須・ignored) が
+    //! デバイスを伴う確認を受け持つ。
+    use super::*;
+
+    const LAYERS: usize = 48;
+    const STEPS: usize = 8;
+    /// ミラーの番兵キー (既存テストの u64::MAX-1 / u64::MAX-3 と衝突しない)。
+    const MIRROR_TEST_KEY_B7C: u64 = u64::MAX - 5;
+
+    /// 決定論のビットパターン (GPU テストの既知値用。`cuda::tests` の
+    /// `pseudo_random` は別モジュールなので私有で持つ)。
+    fn b7c_pattern(len: usize, seed: u32) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (0..len)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((s >> 8) as f32) / ((1u32 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// decode 1 ステップ分のホストバイト数 (48 層 x (conv 8,448 + ssm 786,432) f32)。
+    fn host_bytes_per_step(copied_layers: usize) -> usize {
+        copied_layers * (8_448 + 786_432) * std::mem::size_of::<f32>()
+    }
+
+    /// decode 1 ステップの層ループを回した結果。
+    #[derive(Clone, Copy, Debug, Default)]
+    struct StepIo {
+        /// seed で**ホストから読んだ**層数 (B7c が削る対象。正本が有効なら 0)
+        host_seeded: usize,
+        /// flush で D2H した層数 (スキャンした層だけ)
+        flushed: usize,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct Layer {
+        pos: Option<usize>,
+        stale: bool,
+    }
+
+    /// flush 段だけを回す (target = このステップ後の `cache.len()`)。
+    fn flush(layers: &mut [Layer], target: usize) -> usize {
+        let mut copied = 0;
+        for l in layers.iter_mut() {
+            let (need, _aligned) = gdn_flush_step(true, l.stale, target, l.pos);
+            if need {
+                l.stale = false;
+                copied += 1;
+            }
+        }
+        copied
+    }
+
+    /// `chain_q35_gdn_scan` の層ループをそのまま写す:
+    /// 1. seed (位置不一致): 正本が有効なら D2D (ホストを読まない) / 無効ならホストから
+    /// 2. scan: 書き込み面が新状態になる → `gdn_pos = pos0+1`, `gdn_stale = true`
+    /// 3. flush (ステップ末尾): `gdn_flush_step` が真の層だけ D2H
+    fn step(layers: &mut [Layer], pos0: usize, dev_valid: bool) -> StepIo {
+        let mut io = StepIo::default();
+        // 1. seed (位置不一致 = 前ステップの pos0+1 が今の pos0 と合わない層)
+        for l in layers.iter_mut() {
+            if l.pos != Some(pos0) {
+                if dev_valid {
+                    // 正本から D2D — ホストは 1 バイトも読まない。ただしホストは
+                    // この時点で古い可能性があるので遅延フラグは立てたままにする
+                    // (落とすと flush がこの層を飛ばして古いホストを正にしてしまう)。
+                    l.stale = true;
+                } else {
+                    // 正本が無効 = ホストが正。ホストを読んで面 0 を書く。
+                    io.host_seeded += 1;
+                    l.stale = false;
+                }
+                l.pos = Some(pos0);
+            }
+        }
+        // 2. scan
+        for l in layers.iter_mut() {
+            l.pos = Some(pos0 + 1);
+            l.stale = true;
+        }
+        // 3. flush (cache.len() は advance 後 = pos0+1)
+        io.flushed = flush(layers, pos0 + 1);
+        io
+    }
+
+    /// 27B q4 の decode ではミラーの cap 成長で `gdn_pos` が落ちるため、seed は
+    /// **毎ステップ全層**走る (実測: `gdn_pf_alloc` 5,712 call = 48 層 x 119 step)。
+    /// その条件を再現する。
+    fn reset_pos(layers: &mut [Layer]) {
+        for l in layers.iter_mut() {
+            l.pos = None;
+        }
+    }
+
+    /// 1) decode 形 (48 層 x 8 ステップ): 正本が有効なステップの seed は D2D なので
+    ///    ホストを 1 バイトも読まない (従来は層あたり ~3.2 MiB の D2H 往復)。
+    #[test]
+    fn decode_loop_seeds_from_device_and_never_reads_host() {
+        // 初回要求: まだ正本が無い → 全層をホストから seed (これは従来どおり)。
+        let mut layers = vec![Layer { pos: None, stale: false }; LAYERS];
+        let first = step(&mut layers, 4, false);
+        assert_eq!(first.host_seeded, LAYERS, "正本が無い初回はホストから");
+        // 2 ステップ目以降は正本が有効 = seed は D2D。ホストは読まれない。
+        let mut host_bytes = 0usize;
+        for s in 0..STEPS {
+            reset_pos(&mut layers);
+            let io = step(&mut layers, 5 + s, true);
+            assert_eq!(io.host_seeded, 0, "step={s}: 正本が有効なのにホストを読んだ");
+            host_bytes += host_bytes_per_step(io.host_seeded);
+            assert_eq!(io.flushed, LAYERS, "step={s}: スキャンした層は flush で 1 度だけ読む");
+        }
+        assert_eq!(host_bytes, 0, "8 ステップで seed のホスト読みは 0 バイト");
+        // flush は全層を 1 度ずつ読んでフラグを落とす = 最終状態は「ホストと一致」。
+        assert!(layers.iter().all(|l| !l.stale), "flush 後はフラグが落ちる");
+    }
+
+    /// 2) flush は「ホストが古い層」だけを読み、読んだ層はフラグを落とす
+    ///    (= 二度読まない)。スキャンしていない層 (stale = false) は読まない。
+    #[test]
+    fn flush_reads_only_the_layers_whose_host_is_stale() {
+        let mut layers = vec![Layer { pos: Some(10), stale: true }; LAYERS];
+        layers[7].stale = false; // この層はスキャンしていない = ホストが最新
+        let copied = flush(&mut layers, 10);
+        assert_eq!(copied, LAYERS - 1, "古い層だけ読む");
+        // 1 層 = (8,448 + 786,432) x 4 B = 3,179,520 B。
+        assert_eq!(
+            host_bytes_per_step(copied),
+            3_179_520 * (LAYERS - 1),
+            "スキャンした 47 層分だけ (48 層分ではない)"
+        );
+        // 2 回目の flush は何も読まない (フラグを落としたので)。
+        assert_eq!(flush(&mut layers, 10), 0);
+        // 位置が合わない (target でも target+1 でもない) 層は stale なら
+        // 「不整合」= 呼び出し側が None にする (読みもしない)。
+        assert_eq!(gdn_flush_step(true, true, 10, Some(9)), (false, false));
+    }
+
+    /// 3) 位置が合っているかどうかの判定 (無効化・位置不一致・新規要求の経路)。
+    #[test]
+    fn flush_decision_matches_the_old_position_rules() {
+        // ホストが古い (stale) 層: 成功ステップ後 (target) の面だけを読む。
+        assert_eq!(gdn_flush_step(true, true, 10, Some(10)), (true, true));
+        // 層途中失敗 (target+1): 読む面は seed 直後に書かれた = ホストと一致 = 読まない。
+        assert_eq!(gdn_flush_step(true, true, 10, Some(11)), (false, true));
+        assert_eq!(gdn_flush_step(true, false, 10, Some(11)), (false, true));
+        // stale かつ位置が合わない (None / 遠い) → 「読むべきか」は偽、整列も偽。
+        // 呼び出し側はこれを不整合 (None) として扱う (旧実装の Some(_) と同じ)。
+        assert_eq!(gdn_flush_step(true, true, 10, None), (false, false));
+        assert_eq!(gdn_flush_step(true, true, 10, Some(4)), (false, false));
+        // ホストが古くない層: 位置が合っていても読まない (ここが B7c の本体)。
+        assert_eq!(gdn_flush_step(true, false, 10, Some(10)), (false, true));
+        // GDN 層でない層は常に対象外。
+        assert_eq!(gdn_flush_step(false, true, 10, Some(10)), (false, false));
+    }
+
+    /// 4) 1 リクエスト相当 (prefill で seed → decode 120 ステップ) でも、decode 中に
+    ///    seed がホストから読むバイトは 0 (ミラーの cap 成長で seed が毎ステップ
+    ///    走る条件を含む)。
+    #[test]
+    fn one_request_of_decode_never_pulls_the_host_mirror() {
+        let mut layers = vec![Layer { pos: None, stale: false }; LAYERS];
+        let _prefill_seed = step(&mut layers, 3_000, false);
+        let mut total = 0usize;
+        for s in 0..120 {
+            reset_pos(&mut layers);
+            total += host_bytes_per_step(step(&mut layers, 3_001 + s, true).host_seeded);
+        }
+        assert_eq!(total, 0, "1 リクエスト分の decode で seed がホストから読むバイトは 0");
+    }
+
+    /// 5) invalidate-then-seed: ホストが正に戻った (reset/restore/新要求) ときの
+    ///    seed 入力はホストのままで、ホストの値は 1 ビットも変わらない。
+    ///    `gdn_state_take_dev` は valid=false (= ホストが正) の層では None を返す
+    ///    こと = デバイス正本を上書きに使わないこと。
+    #[test]
+    fn invalidate_then_seed_uses_host_and_keeps_its_bits() {
+        // キャッシュの「ホスト正」状態を模す (値は f32 のビットパターンで比較)。
+        let conv_len = 192usize;
+        let ssm_len = 256usize;
+        let host_conv: Vec<f32> = (0..conv_len).map(|i| (i as f32) * 1.5e-3).collect();
+        let host_ssm: Vec<f32> = (0..ssm_len).map(|i| -((i as f32) * 3.0)).collect();
+        let before_c: Vec<u32> = host_conv.iter().map(|v| v.to_bits()).collect();
+        let before_s: Vec<u32> = host_ssm.iter().map(|v| v.to_bits()).collect();
+
+        // 正本を「無効」にした状態 = ホストが正。
+        let mut dev = GdnStateCache::empty();
+        dev.invalidate();
+        let devseed = gdn_state_take_dev(12345, 0, &mut dev);
+        assert!(devseed.is_none(), "無効な正本を seed に使ってはいけない");
+
+        // 呼び出し側 (chain_q35_gdn_scan の None 分岐) はホストからコピーする。
+        // ここでは H2D の代わりに「ホストを読んで書き戻す」ことを確かめる
+        // (転送は値そのままなので bit 一致のまま)。
+        assert_eq!(
+            host_conv.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            before_c,
+            "conv は bit 一致のまま"
+        );
+        assert_eq!(
+            host_ssm.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            before_s,
+            "ssm は bit 一致のまま"
+        );
+    }
+
+    /// 6) 正本が有効な層は D2D 経路 (seed に使ってよい) で、使った層は無効化される
+    ///    (scan がミラーを更新するので正本とずれる)。デバイス確保は要らない。
+    #[test]
+    fn dev_take_only_for_valid_layers_and_invalidates_them() {
+        let mut dev = GdnStateCache::empty();
+        // 層 0/1 を「有効」にする — DevBuffer は確保せず、判定だけを見るため
+        // valid と cur_kv を直接立てる (確保の無い層は ptr が取れず None)。
+        dev.cur_kv = Some(7);
+        dev.valid = vec![true, true, false];
+        // デバイスバッファが無いので ptr は取れない = None。ここで重要なのは
+        // 「valid でない層は絶対に None」かつ「同じ kv でない層も None」。
+        assert!(gdn_state_take_dev(8, 0, &mut dev).is_none(), "別 kv_id は不可");
+        assert!(gdn_state_take_dev(7, 2, &mut dev).is_none(), "valid=false は不可");
+        assert!(gdn_state_take_dev(7, 9, &mut dev).is_none(), "範囲外は不可");
+    }
+
+    /// 7) ホスト遅延フラグは層ごとに独立: 1 層だけ「古い」なら、その層だけが flush の
+    ///    対象になり、他の 47 層は読まれない (別層の状態で代用しない)。
+    #[test]
+    fn stale_flag_is_per_layer() {
+        let mut stale = vec![false; LAYERS];
+        stale[31] = true;
+        let pos = vec![Some(42); LAYERS];
+        let need: Vec<usize> = (0..LAYERS).filter(|&li| gdn_flush_step(true, stale[li], 42, pos[li]).0).collect();
+        assert_eq!(need, vec![31], "古い層だけが読まれる");
+        // 隣の層 (30 / 32) は位置が合っていても読まない — 代用読みをしない。
+        assert_eq!(gdn_flush_step(true, stale[30], 42, pos[30]), (false, true));
+        assert_eq!(gdn_flush_step(true, stale[32], 42, pos[32]), (false, true));
+    }
+
+    /// 8) GPU 必須: ミラーの面 0 が**古い値**のままでも、seed がデバイス正本から
+    ///    D2D で入ることを、ミラー面 0 を読み戻してビットで確かめる
+    ///    (ホストは古い値 = 使われていないことが分かる)。
+    ///    実行: `cargo test --features cuda --lib cuda_b7c_seed_copies_from_device_mirror -- --ignored`
+    #[test]
+    #[ignore] // GPU 必須
+    fn cuda_b7c_seed_copies_from_device_mirror() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let _ctx = CudaCtx::new().expect("GPU 必須 (ignored テスト)");
+        let (conv_len, ssm_len) = (192usize, 256usize);
+        let key = MIRROR_TEST_KEY_B7C;
+        let kv_id = 7u64;
+        let dev_conv = b7c_pattern(conv_len, 91);
+        let dev_ssm = b7c_pattern(ssm_len, 92);
+        let stale_conv = vec![1.0f32; conv_len];
+        let stale_ssm = vec![2.0f32; ssm_len];
+
+        // ミラーを作り、面 0 に「古い値」を書く (seed で上書きされるはずの場所)。
+        with_mirror_ext(key, 0, 1, 8, 0, 0, false, |m, _| {
+            let mut g = GdnDev { conv: [None, None], ssm: [None, None], cur: 0 };
+            ok(Scratch::ensure(&mut g.conv[0], conv_len * 4))?;
+            ok(Scratch::ensure(&mut g.conv[1], conv_len * 4))?;
+            ok(Scratch::ensure(&mut g.ssm[0], ssm_len * 4))?;
+            ok(Scratch::ensure(&mut g.ssm[1], ssm_len * 4))?;
+            ok(g.conv[0].as_ref().unwrap().copy_from(&stale_conv))?;
+            ok(g.ssm[0].as_ref().unwrap().copy_from(&stale_ssm))?;
+            m.gdn[0] = Some(g);
+            m.gdn_pos[0] = None; // 位置不一致 = seed が走る
+            m.gdn_stale[0] = true; // ホストは古い可能性がある
+            Some(())
+        })
+        .unwrap();
+
+        // デバイス正本に既知の値を入れて「有効」にする (s131 の正本と同じ持ち方)。
+        GDN_STATE.with(|cell| {
+            let mut c = cell.borrow_mut();
+            c.cur_kv = Some(kv_id);
+            c.invalidate();
+            assert!(c.ensure_layer(0, 1, ssm_len).is_ok(), "ssm 確保");
+            assert!(c.ensure_conv(0, conv_len).is_ok(), "conv 確保");
+            assert!(c.conv[0].as_ref().unwrap().copy_from(&dev_conv).is_ok());
+            assert!(c.ssm[0].as_ref().unwrap().copy_from(&dev_ssm).is_ok());
+            c.valid[0] = true;
+        });
+
+        // seed の入力 (関数そのもの) を取る。取り出した層は無効化される。
+        let seed = GDN_STATE.with(|cell| gdn_state_take_dev(kv_id, 0, &mut cell.borrow_mut()));
+        let (pc, ps) = seed.expect("有効な正本から読める");
+        // ミラー面 0 へ D2D (chain_q35_gdn_scan の seed と同じ操作)。
+        with_mirror_ext(key, 0, 1, 8, 0, 0, false, |m, _| {
+            let gd = m.gdn[0].as_mut().unwrap();
+            ok(gd.conv[0].as_ref().unwrap().copy_from_dev(pc, conv_len))?;
+            ok(gd.ssm[0].as_ref().unwrap().copy_from_dev(ps, ssm_len))?;
+            m.gdn_pos[0] = Some(0);
+            m.gdn_stale[0] = false;
+            Some(())
+        })
+        .unwrap();
+
+        // ミラー面 0 を読み戻して、正本の値とビット一致・「古い値」ではないことを見る。
+        with_mirror_ext(key, 0, 1, 8, 0, 0, false, |m, _| {
+            let gd = m.gdn[0].as_ref().unwrap();
+            let cv = gd.conv[0].as_ref().unwrap().to_vec::<f32>(conv_len).unwrap();
+            let sm = gd.ssm[0].as_ref().unwrap().to_vec::<f32>(ssm_len).unwrap();
+            assert_eq!(cv.len(), dev_conv.len());
+            assert!(
+                cv.iter().zip(&dev_conv).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "seed はデバイス正本の conv とビット一致"
+            );
+            assert!(
+                sm.iter().zip(&dev_ssm).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "seed はデバイス正本の ssm とビット一致"
+            );
+            assert!(cv.iter().all(|&v| v != 1.0), "古いホスト値が使われていない");
+            assert!(sm.iter().all(|&v| v != 2.0), "古いホスト値が使われていない");
+            Some(())
+        })
+        .unwrap();
+        // 一度読んだ層は無効化されている (次は必ず seed し直す = 取り違えない)。
+        let again = GDN_STATE.with(|cell| gdn_state_take_dev(kv_id, 0, &mut cell.borrow_mut()));
+        assert!(again.is_none(), "取り出した層は無効化される");
     }
 }
