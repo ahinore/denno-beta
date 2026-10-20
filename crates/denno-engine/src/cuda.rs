@@ -70,6 +70,7 @@ type FnCuModuleGetFunction =
     unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult;
 type FnCuMemAllocV2 = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
 type FnCuMemFreeV2 = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
+type FnCuMemsetD32Async = unsafe extern "C" fn(CUdeviceptr, u32, usize, CUstream) -> CUresult;
 type FnCuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult;
 type FnCuMemcpyHtoDV2 = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type FnCuMemcpyDtoHV2 = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
@@ -115,6 +116,7 @@ struct CudaLib {
     mem_get_info: Option<FnCuMemGetInfo>,
     memcpy_htod: FnCuMemcpyHtoDV2,
     memcpy_dtoh: FnCuMemcpyDtoHV2,
+    memset_d32_async: FnCuMemsetD32Async,
     mem_host_alloc: FnCuMemHostAlloc,
     mem_host_free: FnCuMemFreeHost,
     memcpy_htod_async: FnCuMemcpyHtoDAsyncV2,
@@ -170,6 +172,7 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuMemGetInfo>(p) }),
         memcpy_htod: std::mem::transmute(sym(handle, "cuMemcpyHtoD_v2")?),
         memcpy_dtoh: std::mem::transmute(sym(handle, "cuMemcpyDtoH_v2")?),
+        memset_d32_async: std::mem::transmute(sym(handle, "cuMemsetD32Async")?),
         mem_host_alloc: std::mem::transmute(sym(handle, "cuMemHostAlloc")?),
         mem_host_free: std::mem::transmute(sym(handle, "cuMemFreeHost")?),
         memcpy_htod_async: std::mem::transmute(sym(handle, "cuMemcpyHtoDAsync_v2")?),
@@ -300,6 +303,20 @@ impl DevBuffer {
     }
 
     /// デバイス → ホスト (len 個の T として読む)
+    /// デバイス側だけで 0 にする (f32 の 0.0 はビット 0 なのでゼロ埋めと同じ)。
+    /// ホスト Vec を作らないため、小さなバッファを毎回 H2D する経路の負担が消える。
+    pub fn fill_zero(&self) -> Result<()> {
+        let words = self.bytes / 4;
+        if words == 0 {
+            return Ok(());
+        }
+        let rc = unsafe { (lib()?.memset_d32_async)(self.ptr, 0, words, std::ptr::null_mut()) };
+        if rc != 0 {
+            bail!("cuMemsetD32Async failed: CUresult {}", rc);
+        }
+        Ok(())
+    }
+
     pub fn to_vec<T: Copy>(&self, len: usize) -> Result<Vec<T>> {
         let bytes = len * std::mem::size_of::<T>();
         assert!(bytes <= self.bytes, "DevBuffer::to_vec: size overflow");
@@ -2205,8 +2222,8 @@ fn q4_dispatch_tile(
                 &mut nc as *mut _ as *mut c_void,
             ];
             if use_gemm {
-                // Q4_GM=16 (m 方向) / Q4_GN=256 (n 方向)・block (16,16)
-                let grid = (m.div_ceil(16) as u32, n.div_ceil(256) as u32, 1);
+                // Q4_GM=64 (m 方向) / Q4_GN=128 (n 方向)・block (16,16)
+                let grid = (m.div_ceil(64) as u32, n.div_ceil(128) as u32, 1);
                 ctx.launch_async(ctx.f_gemm_q4, grid, (16, 16, 1), 0, &mut args)?;
             } else {
                 // 1 block = 8 行 (8 warp)・grid.x = n/8, grid.y = m
@@ -8135,30 +8152,34 @@ fn gdn_scan_impl(
     // 重み (`wconv` 等) が層ごとに固定で `gdn_scan_batch` の引数にはバッファが
     // 無い (= 呼び出しごとに H2D し直している) ことを確定させるため。
     let mut q = crate::prof::Seq::begin(crate::prof::D2H_GDN_PF_ALLOC, Instant::now());
-    let dq = DevBuffer::from_slice(qkv)?;
-    let dz = DevBuffer::from_slice(z)?;
-    let dbeta = DevBuffer::from_slice(beta)?;
-    let dalpha = DevBuffer::from_slice(alpha)?;
-    let dconv_in = DevBuffer::from_slice(conv_st)?;
-    let dssm_in = DevBuffer::from_slice(ssm_st)?;
-    let dwc = DevBuffer::from_slice(wconv)?;
-    let dwa = DevBuffer::from_slice(wa)?;
-    let dwd = DevBuffer::from_slice(wdt)?;
-    let dwn = DevBuffer::from_slice(wnorm)?;
-    let dy = DevBuffer::from_slice(&vec![0.0f32; n * vd])?;
-    let dconv_out = DevBuffer::from_slice(&vec![0.0f32; conv_dim * cs])?;
-    let dssm_out = DevBuffer::from_slice(&vec![0.0f32; nv * dk * dv])?;
+    // s128 (decode): 13 本の作業領域を chunked 経路と同じ thread_local (GDN_SCRATCH)
+    // から借りる。従来は層ごと・token ごとに 13 本を確保して解放しており、
+    // 27B の decode で 1 token あたり約 38 ms (48 層 x 0.80 ms) を捨てていた。
+    // 中身は従来どおり copy_from で全要素を上書きするので状態は同一。
+    let dp = GDN_SCRATCH.with(|cell| -> Result<GdnPtrs> {
+        let mut s = cell.borrow_mut();
+        s.ensure(n, conv_dim, vd, nv, dk, dv, cs, 1)?;
+        // conv_out / ssm_out は「書かれない領域」を残さないため従来どおりゼロで初期化
+        s.buf(GdnBuf::ConvOut).fill_zero()?;
+        s.buf(GdnBuf::SsmOut).fill_zero()?;
+        s.q.as_ref().unwrap().copy_from(qkv)?;
+        s.z.as_ref().unwrap().copy_from(z)?;
+        s.beta.as_ref().unwrap().copy_from(beta)?;
+        s.alpha.as_ref().unwrap().copy_from(alpha)?;
+        s.conv_in.as_ref().unwrap().copy_from(conv_st)?;
+        s.ssm_in.as_ref().unwrap().copy_from(ssm_st)?;
+        s.wc.as_ref().unwrap().copy_from(wconv)?;
+        s.wa.as_ref().unwrap().copy_from(wa)?;
+        s.wd.as_ref().unwrap().copy_from(wdt)?;
+        s.wn.as_ref().unwrap().copy_from(wnorm)?;
+        Ok(s.ptrs())
+    })?;
     q.lap(crate::prof::D2H_GDN_PF_LAUNCH);
 
-    let (mut pq, mut pz, mut pb, mut pa) = (
-        dq.ptr(),
-        dz.ptr(),
-        dbeta.ptr(),
-        dalpha.ptr(),
-    );
-    let (mut pci, mut psi) = (dconv_in.ptr(), dssm_in.ptr());
-    let (mut pwc, mut pwa, mut pwd, mut pwn) = (dwc.ptr(), dwa.ptr(), dwd.ptr(), dwn.ptr());
-    let (mut py, mut pco, mut pso) = (dy.ptr(), dconv_out.ptr(), dssm_out.ptr());
+    let (mut pq, mut pz, mut pb, mut pa) = (dp.q, dp.z, dp.beta, dp.alpha);
+    let (mut pci, mut psi) = (dp.conv_in, dp.ssm_in);
+    let (mut pwc, mut pwa, mut pwd, mut pwn) = (dp.wc, dp.wa, dp.wd, dp.wn);
+    let (mut py, mut pco, mut pso) = (dp.y, dp.conv_out, dp.ssm_out);
     let (mut ni, mut nki, mut nvi, mut dki, mut dvi) = (
         n as c_int, nk as c_int, nv as c_int, dk as c_int, dv as c_int,
     );
@@ -8197,9 +8218,15 @@ fn gdn_scan_impl(
     ctx.sync()?;
     q.lap(crate::prof::D2H_GDN_PF_D2H);
 
-    let y = dy.to_vec::<f32>(n * vd)?;
-    let conv_new = dconv_out.to_vec::<f32>(conv_dim * cs)?;
-    let ssm_new = dssm_out.to_vec::<f32>(nv * dk * dv)?;
+    let (y, conv_new, ssm_new) =
+        GDN_SCRATCH.with(|cell| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+            let s = cell.borrow();
+            Ok((
+                s.buf(GdnBuf::Y).to_vec::<f32>(n * vd)?,
+                s.buf(GdnBuf::ConvOut).to_vec::<f32>(conv_dim * cs)?,
+                s.buf(GdnBuf::SsmOut).to_vec::<f32>(nv * dk * dv)?,
+            ))
+        })?;
     // s65: 発行元の件数分類 (y は linear / conv+ssm は GDN 状態)
     crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
     crate::prof::mark_d2h_src(crate::prof::D2H_SRC_GDN_STATE);
@@ -8380,10 +8407,8 @@ fn gdn_scan_chunked_impl(
         let mut s = cell.borrow_mut();
         s.ensure(n, conv_dim, vd, nv, dk, dv, cs, n_chunks)?;
         let p = s.ptrs();
-        s.buf(GdnBuf::ConvOut)
-            .copy_from(&vec![0.0f32; conv_dim * cs])?;
-        s.buf(GdnBuf::SsmOut)
-            .copy_from(&vec![0.0f32; nv * dk * dv])?;
+        s.buf(GdnBuf::ConvOut).fill_zero()?;
+        s.buf(GdnBuf::SsmOut).fill_zero()?;
         s.q.as_ref().unwrap().copy_from(qkv)?;
         s.z.as_ref().unwrap().copy_from(z)?;
         s.beta.as_ref().unwrap().copy_from(beta)?;
