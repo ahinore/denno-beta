@@ -139,6 +139,15 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   gate and up, so the epilogue has both halves in registers).
 - Estimated: bounded by `rmsnorm` 413 ms until the projection epilogues are instrumented
   separately. Risk: low; bit-exactness needs the same multiply order.
+- Status: **closed (2026-10-20) - the upper bound is 90 ms (the 17.887 GB of bytes any fusion
+  can still remove, at ~200 GB/s; bandwidth bracket 10-179 ms), i.e. below the 0.3 s
+  acceptance, so the fusion is not implemented** (s121, docs only, no code, no `.cu`).
+  Reason: the pass is dominated by bytes a fusion cannot delete (the activation read by the
+  down GEMM; absorbing that write needs the down GEMM in the same launch and a 48 KB f32 row
+  does not fit beside the 128x256 tile), and s70's `chain_mlp_prefill` already removed the
+  host round trips. The `rmsnorm` 413 ms ceiling was a pre-s85 `Ambient` artifact.
+  file:line map, traffic table and arithmetic: `docs/HISTORY.ja.md` / `docs/HISTORY.en.md`,
+  s121 section.
 
 ## P2 — decode (separate axis)
 
@@ -422,7 +431,9 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 
 ## Suggested order
 
-1. P1-2 attention (942 ms bucket) -> P1-4 swiglu fusion. P1-3 is closed: the s92 inventory found no separable lever.
-   (P1-1 and P1-3 are closed as of s91/s92: neither has a lever left in the cold path.)
+1. P1-2 attention (942 ms bucket), candidate 4 = causal key-range truncation (s118 design,
+   `jstart` aligned down; numerically identical, one `.cu` edit + PTX regen). This is the last
+   open prefill lever: P1-1, P1-3 and P1-4 are all closed (s91/s92/s121) and candidates 1-3 of
+   P1-2 are closed with numbers (s116/s117).
 2. In parallel on the CPU-only agent: P3-1 (delete the dead kernel), P3-3, P4-1, P4-4.
 3. P2-1 decode once P1 has plateaued; P3-4 the moment a second A/B is needed by hand.
