@@ -540,7 +540,65 @@ impl Qwen35 {
         })
     }
 
-    /// full_attention 層の 1 トークン attention (pos = 絶対位置) → attn 出力 [e]。
+    /// s140 (Task B6b・計測のみ): 線形ステージ 1 呼び出しの計測ラッパ。
+    ///
+    /// 計測 ON では (a) ステージのバケット (`QKV` / `GATE_UP` / `DOWN` / `OPROJ`)
+    /// と (b) 分割表 B (1 呼び出し = 1 サンプル・排他の和 = 呼び出しの壁時計) を
+    /// **同じ行から**積むので、表 B の和とバケット ms が同じ分母で比べられる。
+    /// 計測 OFF は `cuda::lin_stage_tagged` が分岐 1 回で `f` を素通しする
+    /// (クロック読み・確保・整形なし = 既定経路の挙動不変)。
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    #[inline]
+    fn lin<T>(&self, op: usize, f: impl FnOnce() -> T) -> T {
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda::lin_stage_tagged(op, f)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            crate::prof::time_n_ev(op, 1, f)
+        }
+    }
+
+    /// s138 (Task B6・計測のみ): decode chain のステップ分割 (表 A) を始める。
+    ///
+    /// `forward_decode_chain` (デバイス常駐 chain) と、chain が不発のときの
+    /// 従来 per-op 経路 (`forward` の n==1 ループ) の**どちらでも** 1 ステップ =
+    /// 1 サンプルになるように、`forward` の n==1 の入口 1 か所で開いて末尾で
+    /// 閉じる。計測 OFF は分岐 1 回で何もしない (クロックも読まない)。
+    fn chain_step_begin(&self) {
+        #[cfg(feature = "cuda")]
+        crate::cuda::chain_step_begin();
+    }
+
+    /// ステップ末尾: 最後の段を締め、残余を待ち行へ寄せて表 A へ 1 ステップ分を流す。
+    fn chain_step_end(&self) {
+        #[cfg(feature = "cuda")]
+        crate::cuda::chain_step_end();
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    /// 段を切り替える (chain の中でのみ効く。計測 OFF / ステップ外は何もしない)。
+    fn chain_seg(&self, op: usize) {
+        #[cfg(feature = "cuda")]
+        crate::cuda::chain_seg(op);
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables, dead_code))]
+    /// 直前の段 (`op`) を締めて、同じ段の tick を打ち直す (区間の区切りだけ入れる)。
+    fn chain_seg_mark(&self, op: usize) {
+        #[cfg(feature = "cuda")]
+        crate::cuda::chain_seg_mark(op);
+    }
+
+    /// chain 本体に入った = このステップの表 A は「分割できた」サンプル。
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn chain_step_entered(&self) {
+        #[cfg(feature = "cuda")]
+        crate::cuda::chain_step_entered();
+    }
+
+    /// s138: full_attention 層の 1 トークン attention (pos = 絶対位置) → attn 出力 [e]。
     fn full_attn_token(
         &self,
         lf: &FullLayer,
@@ -1068,6 +1126,11 @@ impl Model for Qwen35 {
         }
         let mut logits = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
+            // s140 (Task B6b・計測のみ): chain 不発時の per-op decode も 1 トークン =
+            // 1 サンプルとして表 A に積む (計測 OFF は分岐 1 回)。段の内訳はすべて
+            // `chain_cpu` — この経路は全演算がホスト (per-op) で走るため。
+            self.chain_step_begin();
+            self.chain_seg(crate::prof::CHAIN_CPU);
             let pos = pos0 + i;
             if pos >= self.ctx {
                 bail!("context overflow: pos={pos} >= {}", self.ctx);
@@ -1097,6 +1160,7 @@ impl Model for Qwen35 {
 
             let hf = rmsnorm(&x, &self.norm_w, e, self.eps);
             logits = self.logits(&hf);
+            self.chain_step_end();
         }
         cache.advance(tokens.len());
         Ok(logits)
@@ -1243,10 +1307,10 @@ impl Qwen35 {
                     fit_prefill_buf(&mut buf_z, n * g.gate_w.dims().1);
                     fit_prefill_buf(&mut buf_beta, n * g.beta_w.dims().1);
                     fit_prefill_buf(&mut buf_alpha, n * g.alpha_w.dims().1);
-                    crate::prof::time_n_ev(crate::prof::QKV, n, || {
+                    self.lin(crate::prof::QKV, || {
                         g.qkv_w.apply_bt_rows_into(&buf_h, n, &mut buf_qkv)
                     });
-                    crate::prof::time_n_ev(crate::prof::QKV, n, || {
+                    self.lin(crate::prof::QKV, || {
                         g.gate_w.apply_bt_rows_into(&buf_h, n, &mut buf_z)
                     });
                     // s61c (T5b 計測のみ): beta/alpha は「投影」、下のスキャンは「スキャン」
@@ -1389,7 +1453,7 @@ impl Qwen35 {
                     if !scan_on_gpu {
                         crate::cuda::gdn_scan_state_invalidate();
                     }
-                    crate::prof::time_n_ev(crate::prof::OPROJ, n, || {
+                    self.lin(crate::prof::OPROJ, || {
                         g.out_w.apply_bt_rows_into(&ys, n, &mut buf_out)
                     });
                     }
@@ -1412,7 +1476,7 @@ impl Qwen35 {
                     fit_prefill_buf(&mut buf_qg, n * fl.q_w.dims().1); // [n, heads*2*dh]
                     fit_prefill_buf(&mut buf_k, n * fl.k_w.dims().1); // [n, kv_dim]
                     fit_prefill_buf(&mut buf_v, n * fl.v_w.dims().1); // [n, kv_dim]
-                    crate::prof::time_n_ev(crate::prof::QKV, n, || {
+                    self.lin(crate::prof::QKV, || {
                         fl.q_w.apply_bt_rows_into(&buf_h, n, &mut buf_qg); // [n, heads*2*dh]
                         fl.k_w.apply_bt_rows_into(&buf_h, n, &mut buf_k); // [n, kv_dim]
                         fl.v_w.apply_bt_rows_into(&buf_h, n, &mut buf_v); // [n, kv_dim]
@@ -1504,7 +1568,7 @@ impl Qwen35 {
                         }
                         (att_done, att_done)
                     });
-                    crate::prof::time_n_ev(crate::prof::OPROJ, n, || {
+                    self.lin(crate::prof::OPROJ, || {
                         fl.o_w.apply_bt_rows_into(&buf_att, n, &mut buf_out)
                     });
                     // s42: 残差加算は行独立 → 行並列 (bit-exact)
@@ -1559,7 +1623,7 @@ impl Qwen35 {
                 // 連結側のレイアウト ([g 全列 | u 全列]) に合わせる。
                 // fp32 は従来どおり 2 呼び出し (層ごとの連結コピーは持たない)。
                 let mut gu_layout = false;
-                crate::prof::time_n_ev(crate::prof::GATE_UP, n, || match &layer.gate_up_w {
+                self.lin(crate::prof::GATE_UP, || match &layer.gate_up_w {
                     Linear::Q8(gu) => {
                         fit_prefill_buf(&mut buf_gate, n * 2 * ff);
                         // Q8 は apply_bt_rows_into と同じ経路 (matmul_bt_i8 /
@@ -1604,7 +1668,7 @@ impl Qwen35 {
                             });
                     }
                 });
-                crate::prof::time_n_ev(crate::prof::DOWN, n, || {
+                self.lin(crate::prof::DOWN, || {
                     layer.down_w.apply_bt_rows_into(&buf_hh, n, &mut buf_down)
                 });
             }
@@ -1878,10 +1942,9 @@ impl Qwen35 {
             return None;
         }
 
-        // s138 (Task B6・計測のみ): ここから先を 1 ステップの分割 (表 A) として
-        // 計測する。計測 OFF は分岐 1 回で何もしない (クロックも読まない)。
-        // 対応する `chain_step_end` はステップ末尾 (`Some(logits)` の直前) の 1 か所。
-        chain_step_begin();
+        // s138/s140: ステップ分割 (表 A) の begin は `forward` の n==1 入口が打つ
+        // (chain と per-op 経路のどちらでも 1 ステップ = 1 サンプル)。ここから先は
+        // 全カーネルを発行し切るまで 1 つの launch 段で、待ちは末尾の sync に寄る。
 
         let key = cache.kv_id();
         let mid = self.mid;
@@ -1916,6 +1979,10 @@ impl Qwen35 {
         chain_seg(crate::prof::CHAIN_HOST_API);
         chain_upload(CH_X, &self.embed[token as usize * e..][..e], e, 1)?;
 
+        // s140 (Task B6b): chain 本体に入った時点で「chain が実際に走った」ことを
+        // 記録する (段は下の launch / D2H / sync が乗っ取る)。外側 (embedding 用意・
+        // バッファ確保・rope テーブル) は `chain_outer` のまま積まれる。
+        crate::cuda::chain_step_entered();
         let mut pending: Option<usize> = None;
         // GDN 層の層番号 (昇順) — KV ステージフラッシュの skip リスト
         let mut gdn_layers: Vec<usize> = Vec::new();
@@ -1933,7 +2000,7 @@ impl Qwen35 {
                 AttnKind::Gdn(g) => {
                     gdn_layers.push(li);
                     // qkv + z 投影: CH_QKV = [qkv (2nk*dk+nv*dv) | z (nv)]
-                    crate::prof::time_full(crate::prof::QKV, 1, true, || -> Option<()> {
+                    crate::cuda::lin_stage_tagged(crate::prof::QKV, || -> Option<()> {
                         let qkv = g.qkv_w.quant8()?;
                         let zw = g.gate_w.quant8()?;
                         chain_linear_grouped(&[qkv, zw], CH_H, CH_QKV, 1)
@@ -1971,14 +2038,14 @@ impl Qwen35 {
                         )
                     })?;
                     // out_proj: y (CH_ATT) → e (CH_O)
-                    crate::prof::time_full(crate::prof::OPROJ, 1, true, || -> Option<()> {
+                    crate::cuda::lin_stage_tagged(crate::prof::OPROJ, || -> Option<()> {
                         let ow = g.out_w.quant8()?;
                         chain_linear_grouped(&[ow], CH_ATT, CH_O, 1)
                     })?;
                 }
                 AttnKind::Full(f) => {
                     // qkv 投影: CH_QKV = [qg (heads*2dh) | k (kv_dim) | v (kv_dim)]
-                    crate::prof::time_full(crate::prof::QKV, 1, true, || -> Option<()> {
+                    crate::cuda::lin_stage_tagged(crate::prof::QKV, || -> Option<()> {
                         let qw = f.q_w.quant8()?;
                         let kw = f.k_w.quant8()?;
                         let vw = f.v_w.quant8()?;
@@ -2005,7 +2072,7 @@ impl Qwen35 {
                         )
                     })?;
                     // o_proj: att (CH_ATT) → e (CH_O)
-                    crate::prof::time_full(crate::prof::OPROJ, 1, true, || -> Option<()> {
+                    crate::cuda::lin_stage_tagged(crate::prof::OPROJ, || -> Option<()> {
                         let ow = f.o_w.quant8()?;
                         chain_linear_grouped(&[ow], CH_ATT, CH_O, 1)
                     })?;
@@ -2016,7 +2083,7 @@ impl Qwen35 {
             crate::prof::time_full(crate::prof::RMSNORM, 1, true, || {
                 chain_rmsnorm(&layer.ln2_w, eps, pending, CH_H, e, 1, li * 3 + 1)
             })?;
-            crate::prof::time_full(crate::prof::GATE_UP, 1, true, || -> Option<()> {
+            crate::cuda::lin_stage_tagged(crate::prof::GATE_UP, || -> Option<()> {
                 // s80 (T7b-1): 連結重み 1 本 (行順 [gate | up]) を 1 回の grouped
                 // GEMV で計算する (旧: 2 uid のグループ)。行ごとに量子化・累積が
                 // 独立なので出力はビット一致・重みのデバイス登録も 1 本で済む。
@@ -2026,7 +2093,7 @@ impl Qwen35 {
             crate::prof::time_full(crate::prof::SWIGLU, 1, true, || {
                 chain_swiglu(CH_GA, CH_ACT, self.ff, 1)
             })?;
-            crate::prof::time_full(crate::prof::DOWN, 1, true, || -> Option<()> {
+            crate::cuda::lin_stage_tagged(crate::prof::DOWN, || -> Option<()> {
                 let dw = layer.down_w.quant8()?;
                 chain_linear_grouped(&[dw], CH_ACT, CH_DOWN, 1)
             })?;
@@ -2044,6 +2111,9 @@ impl Qwen35 {
             let lmq = self.lm_head.as_ref().unwrap().quant8()?;
             chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)
         })?;
+        // s140: 層ループ + lm_head の発行を締めた時点で launch 段を切り直す
+        // (ここから下の sync 待ちを launch と混ぜない。計測 OFF は分岐 1 回)。
+        crate::cuda::chain_seg_mark(crate::prof::CHAIN_LAUNCH);
         // 層ループ + lm_head の発行が終わった時点。次の `chain_sync_pending` は
         // ここまでに発行したカーネルの完了待ちなので、その待ちを `chain_kernel`
         // に移せるよう tick を打つ (計測 OFF は None = 何もしない)。
