@@ -566,9 +566,15 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   `GPU_VERIFY.sh` itself stays untracked.
 - Client side: the Hermes desktop provider entry named for 9B was renamed to `denno-27b`
   (`api http://<gpu-host>:8095/v1`, `transport anthropic_messages`,
-  `default_model local/qwen35-27b`, `context_length 32768`). 32,768 is a deliberate
-  client-side cap: single-request KV at 131 KB/token fits ~98k tokens in the 12 GB budget,
-  but a 32k prefill already costs ~16 minutes at 34 tok/s.
+  `default_model local/qwen35-27b`). The first pin of 32,768 was rejected outright by
+  Hermes Agent, which enforces `MINIMUM_CONTEXT_LENGTH = 64_000`
+  (`agent/agent_init.py:_enforce_minimum_context`) and refused to build the agent, so the
+  entry is pinned at 65,536 - the smallest window Hermes accepts.
+- Practical note: 65,536 is a legality floor, not a comfort zone. Prefill measured
+  34 tok/s and decode 180 ms/token, so a 10.8k-token prompt already costs 5 minutes
+  (observed 4m59s) and VRAM peaks at 29,795 MiB with the transient prefill buffers, i.e.
+  about 2.8 GB of headroom left. Keep desktop sessions short and start a new chat instead
+  of letting the history grow.
 
 ## Suggested order
 
