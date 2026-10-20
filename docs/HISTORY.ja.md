@@ -2742,6 +2742,32 @@ s122 のハンドオフはそれを「s118 で設計済み」と読んで再実�
   チャンク化が次の一手 (64k は概算 40 GB で届かない)。
 - テスト: lib 246 本、アンカー 3/3 MATCH (KV ミラーは 9B のアンカー経路も通るため必須)。
 
+### s151: Task B12 - DENNO_PROFILE の serve 経路会計を閉じる (2026-10-21) 完了
+
+> B10 で表 C を serve 経路に載せたが、実測では decode 131.5 ms/step のうち 76.5 ms (58.2%)
+> がどのバケットにも入らず、検証器自身が `COVERAGE MISS` を出していた。名前の付かない
+> バケットを推測で最適化しないため、会計を先に閉じた (計測のみ・数値経路は不変)。
+
+- **サンプル数と期待 step の一致**: `SL_TICKS` を足し、`push()` が行ごとに実際に刻んだ
+  サンプル数を数える (`serve_row_ticks`)。`decode_steps` は表 C の `sl_step` の
+  ティック数を返すので、「期待 step」と「サンプル」が同じ量になり MISS が構造的に消える。
+  `SL_STEP_PREP` は prefill 側だけの期待にした (decode では刻まないため、旧定義は恒久 MISS)。
+- **リクエストの壁時計**: 同期ハンドラ側の `add_request_wall` は SSE では応答を返した時点で
+  戻るため、生成終了時の壁時計になっていなかった (`requests 0`)。scheduler の `Run` が
+  `request_begin` / `request_end` を持ち、`finish_run` と `abort_disconnected` の双方で
+  1 回だけ閉じる。prefill / decode の位相別 wall に分割し、和は総 wall に一致する。
+- **`sl_lin_other` の 3 重計上を解消**: 36,090 call に対し 108,270 サンプルが積まれていた。
+  `lin_call_begin` / `lin_call_end` + 段の `lin_stage_taken` で、1 call あたり
+  内訳は最大 1 号、子の和は全体を超えない (超える分は切る)。
+- **COVERAGE の表示**: サンプル数をティック数に統一し、全バケットにサンプルがある状態を
+  `ok` として報告する。
+- **no-op の保証**: `DENNO_PROFILE` 未設定では `enabled()` / `serve_on()` の入口 1 分岐だけで、
+  クロックを読まない。数値経路・`.cu` / `.ptx`・アンカーには触れていない。
+- **テスト**: 偽 serve ループ (prefill -> decode) で「サンプル = step」「子の和 = 親」
+  「COVERAGE が ok」「計測 OFF で request wall が no-op」を固定。lib は
+  denno-engine 259 passed / denno-server 37 passed、`cargo check --features cuda` 0 error。
+- 表 C の取り直し (27B q4 実 serve 経路) は次の GPU 窓で行う。
+
 ### ベンチマーク一覧 (2026-10-20 時点・このホスト)
 
 測定規則: prefill の正式値は cold 単発 (サーバ起動 -> 1 リクエスト、prefix cache off、

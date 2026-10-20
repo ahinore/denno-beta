@@ -2736,6 +2736,36 @@ the cause is the n-sized buffers themselves, not the thread count.
 - Tests: 246 lib tests, 3/3 anchors MATCH (the KV mirror is also on the 9B anchor path, so this
   check is mandatory).
 
+### s151: Task B12 - close the DENNO_PROFILE serve-path accounting (2026-10-21) done
+
+> B10 put table C on the serve path, but the measurement left 76.5 of 131.5 ms/step (58.2%)
+> in no bucket at all and the validator itself printed `COVERAGE MISS`. Rather than optimise
+> a bucket nobody can name, close the accounting first (instrumentation only, numeric path
+> untouched).
+
+- **Samples match expected steps**: a new `SL_TICKS` counter records how many samples each
+  table-C row actually ticked (`serve_row_ticks`). `decode_steps` returns the `sl_step`
+  tick count, so "expected steps" and "samples" are the same quantity by construction and
+  the MISS disappears. `SL_STEP_PREP` is now expected on the prefill side only (decode never
+  ticked it, so the old definition produced a permanent MISS).
+- **Request wall**: the synchronous handler's `add_request_wall` returned as soon as the SSE
+  response was handed back, which is not the end of generation (`requests 0`). The scheduler's
+  `Run` now carries an opaque `RequestMarker` opened in `build_run` and closed exactly once in
+  both `finish_run` and `abort_disconnected`, split into prefill / decode phase walls whose sum
+  is the total wall.
+- **`sl_lin_other` triple counting removed**: 108,270 samples for 36,090 calls. With
+  `lin_call_begin` / `lin_call_end` plus `lin_stage_taken`, one call flushes one `sl_lin` sample
+  and at most one `sl_lin_other` sample, and the child sum is clamped to the parent.
+- **COVERAGE output**: samples are reported in one unit (ticks), and a run where every bucket
+  has samples is reported as `ok`.
+- **No-op guarantee**: with `DENNO_PROFILE` unset the only cost is one branch at the
+  `enabled()` / `serve_on()` entry points; no clock is read. No numeric path, no `.cu`/`.ptx`,
+  no anchor change.
+- **Tests**: a fake serve loop (prefill -> decode) pins "samples == steps", "children sum to
+  the parent", "COVERAGE is ok" and "request wall is a no-op when profiling is off".
+  Suites: denno-engine 259 passed, denno-server 37 passed, `cargo check --features cuda` 0 errors.
+- Re-measuring table C on the real 27B q4 serve path is the next GPU window.
+
 ### Benchmark summary (as of 2026-10-20, this host)
 
 Measurement rule: the official prefill value is cold single-shot (server start -> one request,
