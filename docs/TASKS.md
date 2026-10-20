@@ -51,8 +51,8 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 - Idea: raise occupancy (smaller BK, more blocks), check L2 reuse of K/V across heads.
 - Estimated: not yet re-derived from a per-kernel profile; 942 ms is the ceiling for the
   whole bucket. Risk: medium; the attention contract allows 1e-3 abs (R3).
-- Status (2026-10-20): **candidates 1-3 closed with numbers; candidate 4 (causal key-range
-  truncation) is open and is the running task (s118).**
+- Status (2026-10-20): **P1-2 fully closed - candidates 1-4 all rejected with numbers. No
+  `.cu` edit survived; nothing awaits a PTX regen or a cold A/B.**
   - Candidate 1 (`__ldg` on the K/V reads, s112 `b5f1f37` + `78e7d08`): **-0.9 %, reverted**
     (`ac73729`); the bucket is not DRAM-bound, so a cache hint cannot pay.
   - Candidate 2 (tile/holding variants of the existing kernel, s116, no code change):
@@ -90,6 +90,28 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
     prologue at `jstart = (pos0 + i0) / PF_BK * PF_BK` (aligned down) removes that work and is
     numerically identical: a fully masked tile adds exactly 0 to `acc`, and leaves `m_run` /
     `l_run` unchanged. One `.cu` edit, PTX regen + cold A/B by the supervisor.
+    - **Result (s122): rejected - the premise above is false, so the change is not numerically
+      identical.** Row r of block b reads keys `j <= pos0 + i0 + r` *because of the mask*; that
+      is its upper bound, not a lower bound. Keys below `pos0 + i0` are exactly the ones the
+      early rows of the block must attend to, so the proposed `jstart` deletes live work.
+      - `jend = min(t_total, pos0 + i0 + PF_BQ)` (`kernels_elem.cu:342`) spans the **worst-case**
+        row of the block; the mask `ja <= pos0 + ia` / `jb <= pos0 + ia` (`:449-452`) then lets
+        row `i0+r` read up to `pos0 + i0 + r`. There is no "tile below `pos0 + i0` is fully
+        masked" set - for a causal mask the fully-masked tiles are always a **suffix**, so a
+        loop-start change cannot express them at all.
+      - Measured with the CPU model in `crates/denno-engine/tests/attn_prefill_jstart.rs`
+        (cold `n = 5,686`, `pos0 = 0`, block `i0 = 64`, `jstart = 64`): **4,032** (row,key) pairs
+        inside the skipped range `[0,64)` are *not* masked. Across all 89 blocks 15,983,616
+        live pairs would be dropped. Across 291 blocks scanned, **0** tiles were fully masked,
+        hence 0 form a maskable prefix.
+      - The kernel's mask was first confirmed to equal the CPU reference
+        (`full_attn_attend_head` at `t_total = pos0+i+1`) on 499,095 (row,key) pairs, so this is
+        not an artefact of the model.
+      - Magnitude: a `dh = 8` fp32 toy gives max |att_full - att_truncated| = **0.466**, i.e.
+        466x outside the R3 relaxation bound (1e-3), let alone the bit-identical contract.
+      - This matches s118 (`docs/HISTORY.*.md`), which had already reached the same conclusion
+        from a static reading; s122 adds the executed guard so the false premise cannot be
+        re-derived from this file again. No `.cu` change, no PTX regen, no cold A/B needed.
     BK 32 stays rejected: `(64 + 2*32)*257 + 64*32 + 128 = 35,072 floats = 140,288 B` per block,
     so two blocks/SM would need 274 KiB against the 227 KiB cap.
 
@@ -431,9 +453,11 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 
 ## Suggested order
 
-1. P1-2 attention (942 ms bucket), candidate 4 = causal key-range truncation (s118 design,
-   `jstart` aligned down; numerically identical, one `.cu` edit + PTX regen). This is the last
-   open prefill lever: P1-1, P1-3 and P1-4 are all closed (s91/s92/s121) and candidates 1-3 of
-   P1-2 are closed with numbers (s116/s117).
+1. ~~P1-2 attention (942 ms bucket), candidate 4 = causal key-range truncation~~ → **rejected in
+   s122** (and already in s118): the kernel's causal bound is per row, so the "fully masked
+   tiles below `pos0 + i0`" set does not exist. **P1-2 is now fully closed** - candidates 1-4
+   are all rejected with numbers, and P1-1, P1-3, P1-4 were closed in s91/s92/s121. There is no
+   open prefill lever left; the remaining 942 ms would need a per-row key range (the "kernel
+   rewrite" s117 bounded at 1.5-4.8 % of the bucket), so prefill work should stop here.
 2. In parallel on the CPU-only agent: P3-1 (delete the dead kernel), P3-3, P4-1, P4-4.
 3. P2-1 decode once P1 has plateaued; P3-4 the moment a second A/B is needed by hand.
