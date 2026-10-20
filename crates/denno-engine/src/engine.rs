@@ -147,6 +147,22 @@ pub const SESSION_RESERVE_TOKENS: usize = 4096;
 /// スロット数と prefix cache トークン数を絞る。明示的な環境変数
 /// (`DENNO_BATCH_SLOTS` / `DENNO_PREFIX_CACHE_TOKENS`) は予算より優先。
 pub const KV_BUDGET_ENV: &str = "DENNO_KV_BUDGET_MB";
+
+/// 1 リクエストのプロンプト長の上限 (token)。既定 12,288。
+///
+/// s124 (P4-6/P4-7): Q4 GPU 経路の作業領域は「プロンプト長 × 層数」で残るため
+/// (thread_local の grow-only scratch)、27B/32GB では 1 万 token 超で VRAM の
+/// 余裕が 3GB を切る。上限を超えたら cuMemAlloc 失敗 → CPU フォールバック
+/// (秒/token) に落ちる前に、明示的な 400 で拒否する。P4-7 で解消したら上げる。
+pub const MAX_PROMPT_ENV: &str = "DENNO_MAX_PROMPT_TOKENS";
+pub const DEFAULT_MAX_PROMPT_TOKENS: usize = 12288;
+
+fn max_prompt_tokens() -> usize {
+    std::env::var(MAX_PROMPT_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_PROMPT_TOKENS)
+}
 pub const DEFAULT_KV_BUDGET_MB: usize = 12288;
 
 fn kv_budget_bytes() -> usize {
@@ -451,6 +467,17 @@ impl Engine {
     pub fn install_session(&mut self, sess: &mut ChatSession) -> Result<()> {
         if sess.slot.is_some() {
             return Ok(()); // 既に常駐済み
+        }
+        // --- s124: プロンプト長の上限 (作業領域の n 比例分を守る) ---
+        let plen = sess.prompt_ids.len();
+        let cap = max_prompt_tokens();
+        if plen > cap {
+            anyhow::bail!(
+                "invalid_request_error: prompt ({} tokens) が上限 {} を超えます。{} を上げるか入力を短くしてください",
+                plen,
+                cap,
+                MAX_PROMPT_ENV
+            );
         }
         // --- P17e: 予約トークン数 (prompt + max_tokens) のハード保証 ---
         let need = sess.prompt_ids.len() + sess.max_tokens;

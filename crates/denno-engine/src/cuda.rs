@@ -70,6 +70,7 @@ type FnCuModuleGetFunction =
     unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult;
 type FnCuMemAllocV2 = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
 type FnCuMemFreeV2 = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
+type FnCuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult;
 type FnCuMemcpyHtoDV2 = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type FnCuMemcpyDtoHV2 = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
 type FnCuMemHostAlloc = unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> CUresult;
@@ -111,6 +112,7 @@ struct CudaLib {
     module_get_function: FnCuModuleGetFunction,
     mem_alloc: FnCuMemAllocV2,
     mem_free: FnCuMemFreeV2,
+    mem_get_info: Option<FnCuMemGetInfo>,
     memcpy_htod: FnCuMemcpyHtoDV2,
     memcpy_dtoh: FnCuMemcpyDtoHV2,
     mem_host_alloc: FnCuMemHostAlloc,
@@ -164,6 +166,8 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
         module_get_function: std::mem::transmute(sym(handle, "cuModuleGetFunction")?),
         mem_alloc: std::mem::transmute(sym(handle, "cuMemAlloc_v2")?),
         mem_free: std::mem::transmute(sym(handle, "cuMemFree_v2")?),
+        mem_get_info: sym_opt(handle, "cuMemGetInfo_v2")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuMemGetInfo>(p) }),
         memcpy_htod: std::mem::transmute(sym(handle, "cuMemcpyHtoD_v2")?),
         memcpy_dtoh: std::mem::transmute(sym(handle, "cuMemcpyDtoH_v2")?),
         mem_host_alloc: std::mem::transmute(sym(handle, "cuMemHostAlloc")?),
@@ -190,6 +194,53 @@ fn lib() -> Result<&'static CudaLib> {
     Ok(LIB.get().expect("just set"))
 }
 
+/// デバイスの (空き, 総) を MiB で返す。`cuMemGetInfo_v2` が無ければ None。
+/// s124 の診断用 (VRAM が戻らない件の切り分け)。
+pub fn dev_mem_mb() -> Option<(usize, usize)> {
+    let f = lib().ok()?.mem_get_info?;
+    let (mut free, mut total) = (0usize, 0usize);
+    if unsafe { f(&mut free, &mut total) } != CUDA_SUCCESS {
+        return None;
+    }
+    Some((free >> 20, total >> 20))
+}
+
+/// `DENNO_MEM_DBG=1` のときだけ確保/解放をログる (既定は完全に無効)。
+fn mem_dbg() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("DENNO_MEM_DBG").as_deref(), Ok("1")))
+}
+
+/// `DENNO_MEM_BT=1` のときだけ、確保の呼び出し元を 1 行に畳んで返す。
+fn mem_bt() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("DENNO_MEM_BT").as_deref(), Ok("1")))
+}
+
+fn bt_hint() -> String {
+    let bt = std::backtrace::Backtrace::force_capture().to_string();
+    let mut v: Vec<String> = Vec::new();
+    for ln in bt.lines() {
+        let ln = ln.trim();
+        if ln.is_empty() || ln.starts_with("at ") || ln.starts_with("Backtrace") {
+            continue;
+        }
+        // "3: denno_engine::cuda::foo" 形式のフレーム行だけ拾う
+        let name = match ln.split_once(": ") {
+            Some((_, r)) => r,
+            None => continue,
+        };
+        if !name.starts_with("denno") && !name.contains("denno_engine") {
+            continue;
+        }
+        v.push(name.to_string());
+        if v.len() == 6 {
+            break;
+        }
+    }
+    v.join(" < ")
+}
+
 fn check(res: CUresult, what: &str) -> Result<()> {
     if res != CUDA_SUCCESS {
         bail!("CUDA {what} が失敗: error {res}");
@@ -204,13 +255,36 @@ pub struct DevBuffer {
 }
 
 impl DevBuffer {
+    #[track_caller]
     fn alloc(bytes: usize) -> Result<Self> {
         let mut ptr: CUdeviceptr = 0;
-        unsafe { check((lib()?.mem_alloc)(&mut ptr, bytes), "cuMemAlloc")? };
+        let res = unsafe { (lib()?.mem_alloc)(&mut ptr, bytes) };
+        if res != CUDA_SUCCESS {
+            // どの要求が載らなかったかを後から追えるように空き容量を添える。
+            match dev_mem_mb() {
+                Some((f, t)) => bail!(
+                    "CUDA cuMemAlloc が失敗: error {res} (要求 {} MiB / 空き {} MiB / 総 {} MiB)",
+                    bytes >> 20,
+                    f,
+                    t
+                ),
+                None => bail!("CUDA cuMemAlloc が失敗: error {res} (要求 {} MiB)", bytes >> 20),
+            }
+        }
+        if mem_dbg() {
+            if let Some((f, t)) = dev_mem_mb() {
+                if bytes >= (1 << 20) && mem_bt() {
+                    tracing::info!(target: "denno_engine::mem", "alloc {} KiB free={} MiB total={} MiB at={} bt={}", bytes >> 10, f, t, std::panic::Location::caller(), bt_hint());
+                } else {
+                    tracing::info!(target: "denno_engine::mem", "alloc {} KiB free={} MiB total={} MiB at={}", bytes >> 10, f, t, std::panic::Location::caller());
+                }
+            }
+        }
         Ok(Self { ptr, bytes })
     }
 
     /// ホストのスライスをデバイスへコピーして確保
+    #[track_caller]
     pub fn from_slice<T: Copy>(data: &[T]) -> Result<Self> {
         let bytes = std::mem::size_of_val(data);
         let buf = Self::alloc(bytes.max(1))?;
@@ -298,6 +372,11 @@ impl Drop for DevBuffer {
         if self.ptr != 0 {
             unsafe {
                 let _ = (lib().unwrap().mem_free)(self.ptr);
+            }
+            if mem_dbg() {
+                if let Some((f, t)) = dev_mem_mb() {
+                    tracing::info!(target: "denno_engine::mem", "free {} KiB free={} MiB total={} MiB", self.bytes >> 10, f, t);
+                }
             }
         }
     }
@@ -2058,7 +2137,38 @@ fn q4_dispatch(
     use_gemm: bool,
     out: &mut [f32],
 ) -> Result<()> {
+    // s124 (P4-6): m を固定タイルに割る。`SCRATCH` は thread_local かつ grow-only
+    // なので、プロンプト長そのままの m を渡すと (m*k + m*n)*4 B が GPU 経路を
+    // 通ったスレッド数ぶん積み上がる (27B・10.8k token で約 11 GB になり、続く
+    // リクエストが cuMemAlloc error 2 で CPU へ落ちた)。
+    // 行は互いに独立で、1 行の演算順はタイル分割で変わらないため出力は bit 一致する。
+    const Q4_M_TILE: usize = 256;
     let lib = lib()?;
+    ctx.make_current()?;
+    let mut r0 = 0;
+    while r0 < m {
+        let mr = Q4_M_TILE.min(m - r0);
+        let a_t = &a[r0 * k..r0 * k + mr * k];
+        let out_t = &mut out[r0 * n..r0 * n + mr * n];
+        q4_dispatch_tile(ctx, lib, a_t, gw, mr, k, n, use_gemm, out_t)?;
+        r0 += mr;
+    }
+    Ok(())
+}
+
+/// s124: [`q4_dispatch`] の 1 タイル (m <= 256) を実行する。scratch はここで
+/// m <= 256 に固定されるため、プロンプトが何万 token でも増えない。
+fn q4_dispatch_tile(
+    ctx: &CudaCtx,
+    lib: &'static CudaLib,
+    a: &[f32],
+    gw: &GpuWq4,
+    m: usize,
+    k: usize,
+    n: usize,
+    use_gemm: bool,
+    out: &mut [f32],
+) -> Result<()> {
     ctx.make_current()?;
     SCRATCH.with(|cell| -> Result<()> {
         let mut s = cell.borrow_mut();
