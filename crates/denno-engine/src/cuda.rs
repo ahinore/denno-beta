@@ -416,6 +416,11 @@ pub struct CudaCtx {
     // s123: Q4_0 ネイティブ (GGUF の 4 bit ブロックを再量子化せず積む)
     f_mv_q4: CUfunction,
     f_gemm_q4: CUfunction,
+    /// s132 (Task B1): 複数行を 1 block で受ける Q4 GEMV。
+    /// コミット済みの `kernels_int8.ptx` に含まれる場合のみ取得でき、無ければ
+    /// None で従来の `dno_gemv_q4_0` (1 行 1 block) を使う。古い PTX でも起動を
+    /// 壊さないための Option (s89 の `f_gdn_chunk_scan_hoist` と同じ扱い)。
+    f_mv_q4_mr: Option<CUfunction>,
     // P17d: 要素演算モジュール (swiglu / add+rmsnorm / expf probe)
     #[allow(dead_code)]
     module_elem: CUmodule,
@@ -528,6 +533,20 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_gemm_q4, module, b"dno_gemm_q4_0\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_gemm_q4_0)",
             )?;
+            // s132 (Task B1): 複数行 1 block の GEMV は「あれば使う」。古い PTX
+            // (未再生成) でも起動を壊さず 1 行 1 block 経路へ落ちるよう、
+            // 取得失敗は None として扱う。
+            let mut f_mv_q4_mr: CUfunction = std::ptr::null_mut();
+            let mv_mr_r = (lib.module_get_function)(
+                &mut f_mv_q4_mr,
+                module,
+                b"dno_gemv_q4_0mr\0".as_ptr() as *const c_char,
+            );
+            let f_mv_q4_mr = if mv_mr_r == CUDA_SUCCESS {
+                Some(f_mv_q4_mr)
+            } else {
+                None
+            };
 
             // P17d: 要素演算モジュール (-fmad=false でコンパイル済み。FMA 縮約は
             // CPU とビット一致しないため禁止)
@@ -658,6 +677,7 @@ impl CudaCtx {
                 f_gemm,
                 f_mv_q4,
                 f_gemm_q4,
+                f_mv_q4_mr,
                 module_elem,
                 f_swiglu,
                 f_swiglu_int,
@@ -2298,6 +2318,10 @@ fn q4_dispatch(
     Ok(())
 }
 
+/// s132 (Task B1): [`q4_dispatch_tile`] の GEMV が 1 block で受ける最大行数。
+/// `kernels_int8.cu` の `dno_gemv_q4_0mr` (acc[8]) と対で動く。
+const Q4_MR_MAX: usize = 8;
+
 /// s124: [`q4_dispatch`] の 1 タイル (m <= 256) を実行する。scratch はここで
 /// m <= 256 に固定されるため、プロンプトが何万 token でも増えない。
 fn q4_dispatch_tile(
@@ -2337,6 +2361,19 @@ fn q4_dispatch_tile(
             let (mut pa, mut pn, mut ps, mut po) =
                 (dx.ptr(), gw.nib.ptr(), gw.sc.ptr(), dout.ptr());
             let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, n as c_int);
+            // s132: 1 block が受ける行数 (mr)。m = 1 は従来の 1 行 1 block 経路
+            // (dno_gemv_q4_0) をそのまま通すため、mr は 2 以上でだけ使う。
+            let mut mrc = (m.min(Q4_MR_MAX)) as c_int;
+            let mut args_mr = vec![
+                &mut pa as *mut _ as *mut c_void,
+                &mut pn as *mut _ as *mut c_void,
+                &mut ps as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+                &mut mrc as *mut _ as *mut c_void,
+            ];
             let mut args = [
                 &mut pa as *mut _ as *mut c_void,
                 &mut pn as *mut _ as *mut c_void,
@@ -2350,6 +2387,12 @@ fn q4_dispatch_tile(
                 // Q4_GM=64 (m 方向) / Q4_GN=128 (n 方向)・block (16,16)
                 let grid = (m.div_ceil(64) as u32, n.div_ceil(128) as u32, 1);
                 ctx.launch_async(ctx.f_gemm_q4, grid, (16, 16, 1), 0, &mut args)?;
+            } else if let (Some(f_mr), 2..) = (ctx.f_mv_q4_mr, m) {
+                // s132 (Task B1): 1 block = 8 列 (8 warp) x mr 行。重みは 1 回だけ
+                // 読んで mr 行に使い回す (従来は grid.y = m で行ごとに再読み)。
+                // mr = min(m, 8)・端数は最終 block の rows = m - i0 で落とす。
+                let grid = (n.div_ceil(8) as u32, m.div_ceil(mrc as usize) as u32, 1);
+                ctx.launch_async(f_mr, grid, (256, 1, 1), 0, &mut args_mr)?;
             } else {
                 // 1 block = 8 行 (8 warp)・grid.x = n/8, grid.y = m
                 let grid = (n.div_ceil(8) as u32, m as u32, 1);
@@ -6298,6 +6341,122 @@ mod tests {
                 got2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 "m={m}: Q4 GPU 経路が非決定論"
             );
+        }
+    }
+
+    /// s132 (Task B1): 複数行 1 block の GEMV (`dno_gemv_q4_0mr`) が、行あたりの
+    /// 累積順を 1 行 1 block 経路と同じに保っていること (rows = 1/2/3/8 で全要素
+    /// ビット一致) と、2 回実行でビット一致 (決定論) を検証する。
+    /// rows = 1 はカーネル内の行ループを 1 周にしただけで `dno_gemv_q4_0` と
+    /// 同じ演算列、rows > 1 はその行版。境界 m = 1 / 2 / 7 / 9 / 16 / 17 を踏む。
+    #[test]
+    #[ignore] // GPU が必要: cargo test --release --features cuda -- --ignored
+    fn cuda_q4_gemv_mr_matches_single_row() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let ctx = match shared_ctx() {
+            Some(c) => c,
+            None => {
+                println!("CUDA が無いので skip (GPU 実機で --ignored 実行)");
+                return;
+            }
+        };
+        let f_mr = match ctx.f_mv_q4_mr {
+            Some(f) => f,
+            None => {
+                println!("kernels_int8.ptx に dno_gemv_q4_0mr が無い (PTX 再生成前) ので skip");
+                return;
+            }
+        };
+        let _ = f_mr;
+        ctx.make_current().expect("make_current");
+        // 1) カーネル直叩き: 同じ入力で「1 行 1 block (mr=1)」と「mr 行 1 block」を
+        //    比べ、全要素ビット一致を要求する (累積順の契約そのもの)。
+        let (k, n) = (256usize, 40usize); // n は 8 の倍数でない (grid.x の端数も踏む)
+        let w = pseudo_random(k * n, 9);
+        let q = crate::quant::Q4Linear::quantize(&w, k, n);
+        let gw = weights_for_q4(q.uid, &q.blocks, k, n).expect("upload");
+        for m in [1usize, 2, 7, 9, 16, 17] {
+            let a = pseudo_random(m * k, 200 + m as u32);
+            let run = |rows: usize| -> Vec<f32> {
+                let mut out = vec![f32::NAN; m * n];
+                run_q4_gemv_for_test(ctx, &a, gw, m, k, n, rows, &mut out);
+                out
+            };
+            // 参照: mr = 1 (従来経路と同じ「1 行 1 block」) を m 回に分けて回す
+            let mut want = vec![0f32; m * n];
+            {
+                // rows = 1 で 1 行ずつ。カーネルは grid.y = ceil(m/1) で m 行を回る。
+                let got1 = run(1);
+                want.copy_from_slice(&got1);
+            }
+            for &mr in &[2usize, 3, 8] {
+                let got = run(mr);
+                for (i, (g, e)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        e.to_bits(),
+                        "m={m} mr={mr}: row {} col {} がビット不一致 ({g} vs {e})",
+                        i / n,
+                        i % n
+                    );
+                }
+                // 決定論: 同一入力の 2 回目
+                let again = run(mr);
+                assert_eq!(
+                    got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    again.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "m={m} mr={mr}: 非決定論"
+                );
+            }
+            println!("q4 gemv mr bit-exact: m={m} (rows 1/2/3/8)");
+        }
+    }
+
+    /// s132: テストから `dno_gemv_q4_0mr` を直接 1 回起動する (行数 rows を明示)。
+    /// 本番経路は `q4_dispatch_tile` が rows = min(m, Q4_MR_MAX) を選ぶ。
+    fn run_q4_gemv_for_test(
+        ctx: &CudaCtx,
+        a: &[f32],
+        gw: &GpuWq4,
+        m: usize,
+        k: usize,
+        n: usize,
+        rows: usize,
+        out: &mut [f32],
+    ) {
+        let lib = lib().expect("cuda lib");
+        let f = ctx.f_mv_q4_mr.expect("dno_gemv_q4_0mr");
+        let (mut pn, mut ps) = (gw.nib.ptr(), gw.sc.ptr());
+        let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, n as c_int);
+        let mut rc = rows as c_int;
+        let d_a = DevBuffer::alloc(m * k * 4).expect("alloc a");
+        let d_out = DevBuffer::alloc(m * n * 4).expect("alloc out");
+        let (mut pa, mut po) = (d_a.ptr(), d_out.ptr());
+        unsafe {
+            check(
+                (lib.memcpy_htod)(d_a.ptr(), a.as_ptr() as *const c_void, m * k * 4),
+                "cuMemcpyHtoD",
+            )
+            .expect("H2D");
+            let mut args = [
+                &mut pa as *mut _ as *mut c_void,
+                &mut pn as *mut _ as *mut c_void,
+                &mut ps as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+                &mut rc as *mut _ as *mut c_void,
+            ];
+            let grid = (n.div_ceil(8) as u32, m.div_ceil(rows) as u32, 1);
+            ctx.launch_async(f, grid, (256, 1, 1), 0, &mut args)
+                .expect("launch");
+            check(
+                (lib.memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, d_out.ptr(), m * n * 4),
+                "cuMemcpyDtoH",
+            )
+            .expect("D2H");
         }
     }
 
