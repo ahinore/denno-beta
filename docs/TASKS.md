@@ -190,9 +190,15 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   prefill branch, and the three tests that covered them.
 - Default path: unchanged (beta/alpha always went through `apply_bt_rows_into` with the
   gate off; it is now called unconditionally — bit-identical).
-- Remaining (GPU machine only): delete `dno_matvec_rows_f32` from `kernels/kernels_elem.cu`
-  and regenerate `kernels_elem.ptx`. Nothing in Rust references it; PTX regeneration needs
-  nvcc on a GPU host, so it is left as a human step.
+- `.cu`/PTX half: **done (2026-10-20, supervisor)**. `dno_matvec_rows_f32` and its two
+  helpers (`DNO_MVROWS_TILE`, `dno_mvrows_acc_rev`) were deleted from
+  `kernels/kernels_elem.cu` (73 lines, nothing else referenced them) and
+  `kernels_elem.ptx` was regenerated on the GPU host with
+  `nvcc -ptx -arch=compute_75 -fmad=false -O3` (sha256 `cbe5533e` -> `7abee571`; the
+  pre-edit source recompiled to `cbe5533e`, i.e. the committed PTX reproduced exactly
+  before the deletion). `GPU_VERIFY.sh` = RESULT: PASS, anchors c61ad85b / 9e17d563 /
+  af6eb6ab all MATCH, decode gen2 16.4 ms/token unchanged, so the dead kernel was
+  genuinely dead.
 - Profile ids `D2H_GDN_PROJ_*` / `ATT_GDN_PROJ` stayed reserved on purpose (renumbering
   would break historical profile comparisons).
 
