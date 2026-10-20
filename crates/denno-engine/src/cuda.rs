@@ -2973,8 +2973,11 @@ fn q4_dispatch_tile(
         Scratch::ensure(x, bytes_x)?;
         Scratch::ensure(dout, bytes_out)?;
         split_mark(&mut t, crate::prof::Q4P_OUT_ALLOC);
-        crate::prof::span_end(st.take(), crate::prof::SL_LIN_OUTALLOC);
-        crate::prof::lin_stage_taken();
+        // s153 (Task B14): クロック読みは 1 回 (`lin_stage_taken_ns`)。読んだ ns を
+        // そのまま表 C へ積むので、子の和が親 (`sl_lin`) を超えず、
+        // `sl_lin_other = 全体 - 段の和` が成り立つ。
+        let out_ns = crate::prof::lin_stage_taken_ns(st.take());
+        crate::prof::span_end_ns(out_ns, crate::prof::SL_LIN_OUTALLOC);
         // 表 C: staging のピン留め領域の確保 (段の開始はここ)
         st = crate::prof::span_begin();
         Scratch::ensure_pin(hx, bytes_x)?;
@@ -3001,8 +3004,8 @@ fn q4_dispatch_tile(
                 "cuMemcpyHtoDAsync",
             )?;
             split_mark(&mut t, crate::prof::Q4P_H2D_ISSUE);
-            crate::prof::span_end(st.take(), crate::prof::SL_LIN_H2D);
-            crate::prof::lin_stage_taken();
+            let h2d_ns = crate::prof::lin_stage_taken_ns(st.take());
+            crate::prof::span_end_ns(h2d_ns, crate::prof::SL_LIN_H2D);
             // 表 C: 引数の組み立て + カーネル発行 (段の開始 = H2D を閉じた直後)
             st = crate::prof::span_begin();
             let (mut pa, mut pn, mut ps, mut po) =
@@ -3059,8 +3062,8 @@ fn q4_dispatch_tile(
             }
             split_mark(&mut t, crate::prof::Q4P_KERNEL_LAUNCH);
             // 表 C: 発行段の終わり (ここまでが launch、以降は D2H と待ち)
-            crate::prof::span_end(st.take(), crate::prof::SL_LIN_LAUNCH);
-            crate::prof::lin_stage_taken();
+            let launch_ns = crate::prof::lin_stage_taken_ns(st.take());
+            crate::prof::span_end_ns(launch_ns, crate::prof::SL_LIN_LAUNCH);
             // 表 C: 出力 D2H の段は「発行の直前」から開く (sync 完了 + ホストコピーまで)
             st = if st.is_none() { crate::prof::span_begin() } else { st };
             check(
@@ -3078,8 +3081,8 @@ fn q4_dispatch_tile(
         // 待ち (`SL_LIN_SYNC`) は別に取らない — D2H の中に吸収される (排他の和を保つ)。
         // `SL_LIN_SYNC` は表 C の行として予約されているが、q4 タイルでは常に 0 サンプル
         // で、その分はこの行 (D2H) に含まれる (COVERAGE には 0 として出る)。
-        crate::prof::span_end(st, crate::prof::SL_LIN_D2H);
-        crate::prof::lin_stage_taken();
+        let d2h_ns = crate::prof::lin_stage_taken_ns(st);
+        crate::prof::span_end_ns(d2h_ns, crate::prof::SL_LIN_D2H);
         Ok(())
     })
 }

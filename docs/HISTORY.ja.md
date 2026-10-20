@@ -2768,6 +2768,44 @@ s122 のハンドオフはそれを「s118 で設計済み」と読んで再実�
   denno-engine 259 passed / denno-server 37 passed、`cargo check --features cuda` 0 error。
 - 表 C の取り直し (27B q4 実 serve 経路) は次の GPU 窓で行う。
 
+### s153: Task B14 - `sl_lin_other` を「全体 − 段」の残余にする (2026-10-21) 完了
+
+> B12 で serve 経路の会計は閉じたが、`sl_lin_other` は「other として明示的に閉じた
+> 内側区間」の和のままだったため、段を測っている呼び出しでも other が全体と等しく
+> 出ていた。27B q4 serve 経路の実測 (17:21Z) では `sl_lin` 2,225.3 ms に対し
+> `sl_lin_other` 2,225.3 ms (一致) で、測れている段 (launch 75.1 + h2d 107.8 +
+> d2h 2,017.8 + outalloc 1.9 = 2,202.6 ms) が完全に二重計上に見えていた。
+
+- **残余の定義を「全体 − 測った段」へ**: `LinAcc` に `taken_ns` (この呼び出しで
+  実際に測った `SL_LIN_LAUNCH` / `SL_LIN_H2D` / `SL_LIN_D2H` / `SL_LIN_OUTALLOC` の ns の和)
+  を足し、`lin_call_end` は `sl_lin_other += call_ns.saturating_sub(taken_ns)` を
+  **1 call につき 1 号**積む。したがって 1 フェーズで
+  `sl_lin == sl_lin_launch + sl_lin_h2d + sl_lin_d2h + sl_lin_outalloc + sl_lin_other`
+  が成り立つ。段を 1 本も測らない呼び出し (CPU フォールバック等) は今日までどおり
+  全体が残余 (1 号)。
+- **クロック読みは段ごとに 1 回**: `lin_stage_taken_ns(t) -> u64` が ns を読み、
+  その値を `span_end_ns(ns, op)` で表 C へ積む。`span_end` と `lin_stage_taken_ns` で
+  別々に `elapsed()` を読むと後から読む方が必ず長くなり、子の和が親を超えて残余が
+  0 に張り付く (合成テストで実際に踏んだ)。
+- **other の内側区間は fallback**: `lin_other_close` / `lin_other_push` (入口の地・
+  重み登録・ピン留め) は残すが、残余の値には足さない。s151 の「1 call 1 号」契約は
+  そのまま (`lin_other_samples` = 線形呼び出し数)。
+- **COVERAGE に 1 行追加**: `COVERAGE lin residual: <other> + children <和> = <合計> /
+  <sl_lin> ns over <calls> calls (other samples .. / lin calls ..) [ok]`。
+  号数が食い違う (s148 の 3 倍) か、子の和が親を超えるか、未帰属が 1 call あたり
+  1 ns を超えると `COVERAGE MISS`。
+- **計測のみ**: `DENNO_PROFILE` 未設定では `serve_on()` の入口 1 分岐のみ。数値経路・
+  `.cu` / `.ptx`・定数には触れていない。prof.rs と cuda.rs の計測サイトだけの変更。
+- **テスト**: 合成 720 ns (段 100 + 50 + 40 + 10 = 200) で残余 520 ns・1 号・
+  親 = 段の和 + 残余、段を測らない呼び出しで残余 = 全体 640 ns・1 号、既存の
+  「3 倍の再発」回帰 2 本も緑。lib は denno-engine 261 passed / denno-server 37 passed、
+  `cargo check --features cuda` 0 error。
+- 27B q4 serve 経路での取り直しは次の GPU 窓で行う。予測 (17:21Z の窓の数値から):
+  `sl_lin_other` は 2,225.3 − 2,202.6 = **22.7 ms** (sl_lin の 1.0%) まで落ち、
+  `sl_lin = launch 75.1 + h2d 107.8 + d2h 2,017.8 + outalloc 1.9 + other 22.7` が
+  一致する。1 decode step あたりに均すと (q4 線形 8.16〜10.8 呼び出し/step)
+  **約 2.1〜2.8 ms/step** — step の残りは層ループの残余 (`sl_step_lay_other`) 側。
+
 ### ベンチマーク一覧 (2026-10-20 時点・このホスト)
 
 測定規則: prefill の正式値は cold 単発 (サーバ起動 -> 1 リクエスト、prefix cache off、

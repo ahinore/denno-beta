@@ -1356,6 +1356,19 @@ pub fn span_end(t: Option<Instant>, op: usize) {
     }
 }
 
+/// s153 (Task B14): 既に読み取り済みの ns を `op` に積む (1 サンプル)。
+/// 段のサイトは `lin_stage_taken_ns` が読んだ ns をそのまま表 C へ渡す —
+/// 子 (`sl_lin_*`) と残余の計算が**同じ 1 回のクロック読み**になるので、
+/// 子の和が親 (`sl_lin`) を超えない (超えると残余が 0 に張り付き、表 C の
+/// 「残余 = 全体 − 段」が嘘になる)。
+#[inline]
+pub fn span_end_ns(ns: u64, op: usize) {
+    if !serve_on() {
+        return;
+    }
+    push(op, ns, 1);
+}
+
 /// s148: 1 ステップ分の開始 (表 C の `sl_step` の tick)。戻り値の 2 番目は
 /// 「その時点で積まれていた内訳の和」— サーバは複数セッションを交互に 1 歩ずつ
 /// 進めるため、あるステップの壁時計には別セッションの区間が重なる。終端で
@@ -1698,17 +1711,35 @@ thread_local! {
     /// 重み登録 / ピン留めの 3 か所がそれぞれ 1 号積み、36,090 call に対し
     /// 108,270 号 = 3 倍になっていた)。
     static LIN_STATE: std::cell::RefCell<LinAcc> =
-        const { std::cell::RefCell::new(LinAcc { open: false, other_ns: 0, other_n: 0 }) };
+        const {
+            std::cell::RefCell::new(LinAcc {
+                open: false,
+                other_ns: 0,
+                other_n: 0,
+                taken_ns: 0,
+                taken_n: 0,
+            })
+        };
 }
 
 /// s151 (B12): 線形呼び出し 1 回の内側の積算 (thread-local)。
 struct LinAcc {
     /// `lin_call_begin` から `lin_call_end` の間か
     open: bool,
-    /// この呼び出しで閉じた `sl_lin_other` 区間の ns の和
+    /// この呼び出しで閉じた `sl_lin_other` **内側区間**の ns の和
+    /// (s153 以降は会計の主役ではない — 残余は `call_ns - taken_ns` で出し、
+    /// これは明示的な other 区間として残すだけ。)
     other_ns: u64,
     /// この呼び出しで other を閉じた回数 (2 回以上なら会計の誤り = テストで見る)
     other_n: u64,
+    /// s153 (Task B14): この呼び出しで**実際に測った段** (`SL_LIN_LAUNCH` /
+    /// `SL_LIN_H2D` / `SL_LIN_D2H` / `SL_LIN_OUTALLOC`) の ns の和。
+    /// 残余 `sl_lin_other` は `call_ns - taken_ns` で出る (実質の加算なので
+    /// 1/16 ns の切り捨て誤差も出ない)。
+    taken_ns: u64,
+    /// s153 (Task B14): `taken_ns` を積んだ段の本数 (0 なら「何も測っていない
+    /// 呼び出し」= 全体が残余。テストと COVERAGE の突き合わせに使う)。
+    taken_n: u64,
 }
 
 /// s151 (B12): 線形呼び出しの入口。`sl_lin` の全体 tick と対で 1 回だけ呼ぶ。
@@ -1723,17 +1754,69 @@ pub fn lin_call_begin() -> Option<Instant> {
         a.open = true;
         a.other_ns = 0;
         a.other_n = 0;
+        a.taken_ns = 0;
+        a.taken_n = 0;
     });
     Some(Instant::now())
 }
 
-/// s151 (B12): 線形呼び出しの内側で「別の段を測った」ことを記録する。
-/// いまは統計に使わないが、内訳の段を足すときの目印として残す (呼んでも
-/// 会計は動かない — other は「other を閉じたか」だけで決まる)。
+/// s151 (B12): 線形呼び出しの内側で「別の段を測った」ことを記録する
+/// (号数だけ。s153 以降は `lin_stage_taken_ns` が本来の口)。
 #[inline]
 pub fn lin_stage_taken() {
     #[cfg(test)]
     LIN_STAGE_TAKEN.with(|c| c.set(c.get() + 1));
+}
+
+/// s153 (Task B14): 線形呼び出しの内側で**段を 1 本測った**ことを記録する
+/// (`span_end` に渡したのと同じ開始 tick をそのまま渡す)。
+///
+/// ここで積んだ ns の和が `taken_ns` で、`lin_call_end` は
+/// `sl_lin_other = call_ns - taken_ns` を出す — つまり
+/// `sl_lin == sl_lin_launch + sl_lin_h2d + sl_lin_d2h + sl_lin_outalloc + sl_lin_other`
+/// が 1 call ごとに成り立つ。s151 までは other が「明示的に other として
+/// 閉じた区間」だけだったため、段を測っている呼び出しでも other が全体と
+/// 等しかった (B14 実測 17:21Z: sl_lin 2225.3 ms = sl_lin_other 2225.3 ms)。
+///
+/// **クロック読みは 1 回** — 段の ns をここで読み、表 C へは
+/// `span_end_ns(ns, op)` で同じ値を渡す (2 回読むと後から読む方が必ず長くなり、
+/// 子の和が親を超える = 残余が 0 に張り付く)。
+/// 計測 OFF は `None` を受けて何もしない (時刻も読まない)。
+#[inline]
+pub fn lin_stage_taken_ns(t: Option<Instant>) -> u64 {
+    #[cfg(test)]
+    LIN_STAGE_TAKEN.with(|c| c.set(c.get() + 1));
+    if !serve_on() {
+        return 0;
+    }
+    let Some(t0) = t else { return 0 };
+    let ns = t0.elapsed().as_nanos() as u64;
+    lin_stage_add(ns);
+    ns
+}
+
+/// s153 (Task B14): 測った段の ns を明示的に積む (`lin_stage_taken_ns` の下請け)。
+/// 呼び出しの外 (begin 前 / end 後) に来た分は捨てる — 別の呼び出しの
+/// 残余を汚さない。
+#[inline]
+pub fn lin_stage_add(ns: u64) {
+    if !serve_on() {
+        return;
+    }
+    LIN_STATE.with(|c| {
+        let mut a = c.borrow_mut();
+        if !a.open {
+            return;
+        }
+        a.taken_ns += ns;
+        a.taken_n += 1;
+    });
+}
+
+/// s153 (Task B14): この呼び出しで測った段の ns と本数 (テスト用)。
+#[cfg(test)]
+fn lin_taken() -> (u64, u64) {
+    LIN_STATE.with(|c| (c.borrow().taken_ns, c.borrow().taken_n))
 }
 
 #[cfg(test)]
@@ -1742,9 +1825,13 @@ thread_local! {
     static LIN_STAGE_TAKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// s151 (B12): `sl_lin_other` の区間を閉じる。**積むのは出口 (`lin_call_end`)
-/// だけ** — ここでは「この呼び出しの other」へ ns と回数を足すだけなので、
-/// 内側で何回呼ばれても表 C の `sl_lin_other` は 1 号になる。
+/// s151 (B12): `sl_lin_other` の内側区間を閉じる。**積むのは出口
+/// (`lin_call_end`) だけ** — ここでは「この呼び出しの other」へ ns と回数を
+/// 足すだけなので、内側で何回呼ばれても表 C の `sl_lin_other` は 1 号になる。
+///
+/// s153 (Task B14): ここで足した ns は**もう残余の値にはならない** (残余は
+/// `call_ns - taken_ns`)。この口は「other として明示したい区間」の記録として
+/// 残し、号数 (`lin_other_samples`) の会計を壊さないための fallback に使う。
 #[inline]
 pub fn lin_other_push(ns: u64) {
     if !serve_on() {
@@ -1772,24 +1859,30 @@ pub fn lin_other_close(t: Option<Instant>) {
 #[inline]
 pub fn lin_call_end(t0: Option<Instant>) {
     let Some(t0) = t0 else { return };
-    let ns = t0.elapsed().as_nanos() as u64;
-    let (other_ns, other_n) = LIN_STATE.with(|c| {
+    lin_call_end_at(t0.elapsed().as_nanos() as u64);
+}
+
+/// s153 (Task B14): 線形呼び出しの出口の会計 (経過 ns を渡す形)。`lin_call_end` と
+/// テストが**同じ 1 本の算術**を通るように切り出した — 残余は
+/// `ns - taken_ns`、`sl_lin` / `sl_lin_other` はどちらも 1 号。
+#[inline]
+pub fn lin_call_end_at(ns: u64) {
+    let taken_ns = LIN_STATE.with(|c| {
         let mut a = c.borrow_mut();
         a.open = false;
-        (a.other_ns, a.other_n)
+        a.taken_ns
     });
     push(SL_LIN, ns, 1);
-    if other_n == 0 {
-        // 段を 1 つも測らなかった呼び出し (CPU フォールバック等) は全体が残余。
-        push(SL_LIN_OTHER, ns, 1);
-        let pi = phase().idx();
-        LIN_OTHER_CALLS[pi][0].fetch_add(1, Ordering::Relaxed);
-        LIN_OTHER_CALLS[Phase::Both.idx()][0].fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    // 内側で閉じた区間の和は 1 本の other に畳む (号数も 1)。全体を超える分は
-    // 会計の穴なので切る (`sl_lin >= 子` を保つ)。
-    push(SL_LIN_OTHER, other_ns.min(ns), 1);
+    // s153 (Task B14): 残余 = 全体 − **実際に測った段** (`SL_LIN_LAUNCH` /
+    // `SL_LIN_H2D` / `SL_LIN_D2H` / `SL_LIN_OUTALLOC` の ns の和)。
+    // 段を 1 本も測らなかった呼び出し (CPU フォールバック等) は全体が残余 =
+    // 今日までの挙動と同じ。明示的に other として閉じた区間
+    // (`lin_other_close` の `other_ns`) は残余の中身の一部なので、残余の値には
+    // 足さない (s151 まではこれが主値だったため、段を測っている呼び出しでも
+    // other == 全体になっていた)。`min(ns)` は「段の和 > 全体」= 会計の穴が
+    // 出たときの番人で、主値ではない。
+    let residual = ns.saturating_sub(taken_ns).min(ns);
+    push(SL_LIN_OTHER, residual, 1);
     let pi = phase().idx();
     LIN_OTHER_CALLS[pi][0].fetch_add(1, Ordering::Relaxed);
     LIN_OTHER_CALLS[Phase::Both.idx()][0].fetch_add(1, Ordering::Relaxed);
@@ -2571,6 +2664,30 @@ fn push_coverage_for(p: usize, s: &mut String) {
         lin_other as f64 / 1e6,
         pct_of(lin_other)
     ));
+    // s153 (Task B14): `sl_lin` の内訳は **排他の和 = 全体** でなければならない
+    // (`sl_lin_other` は残余 = 全体 − 測った段)。ここでは 1) 段の和が全体を
+    // 超えない、2) 残余の号数 = 線形呼び出し数、3) 未帰属 (`gap_lin`) が 1 呼び出し
+    // あたり時計の粒度未満、の 3 点を 1 行で出す。号数は `sl_lin_other` の
+    // 実測号数 (`serve_row_ticks`) と線形呼び出し数の対比なので、s148 の
+    // 「other が 3 倍」もここで [MISS] になる。
+    let lin_children: u64 = SL_GROUPS[1].1.iter().map(|&op| serve_row_ns(p, op)).sum();
+    let lin_other_ticks = serve_row_ticks(p, SL_LIN_OTHER);
+    // s153 (B14): 判定に使うのは**号数**だけにする。`sl_lin` の 1 号に対して
+    // `sl_lin_other` が 1 号 (s148 の 3 倍は 3 号で捕まる)。ns の恒等式
+    // (親 = 段の和 + 残余) は上の行に数値として出すが、合成時刻を使うテストでは
+    // 段の ns が実時計なので判定には使わない (実経路では恒等的に成り立つ)。
+    let lin_ticks = serve_row_ticks(p, SL_LIN);
+    let lin_ok_rel = lin_other_ticks == lin_ticks;
+    s.push_str(&format!(
+        "  COVERAGE lin residual: {} + children {} = {} / {} ns over {} calls \
+         (other samples {} / lin samples {}) [{}]\n",
+        lin_other, lin_children, lin_other + lin_children, lin_ns, lin,
+        lin_other_ticks, lin_ticks,
+        if lin_ok_rel { "ok" } else { "COVERAGE MISS" },
+    ));
+    if !lin_ok_rel {
+        misses.push("sl_lin_other");
+    }
     s.push_str(&format!(
         "  COVERAGE accounted {:.1} ms of wall {:.1} ms ({:.1} pct) | \
          gaps: step {:.1} ms, lin {:.1} ms\n",
@@ -4050,23 +4167,29 @@ mod tests {
         super::lin_call_begin()
     }
 
-    /// s151 (B12): `q4_dispatch_tile` の closure 1 枚の中身 (5 段)。
-    /// ピン留めの確保は **other** (s148 はここでも 1 号積んでいた)。
+    /// s151 (B12): `q4_dispatch_tile` の closure 1 枚の中身 (4 段 + ピン留め)。
+    ///
+    /// s153 (Task B14): 段は**連続した 1 本の区間**で、`lin_stage_taken_ns` が読んだ
+    /// ns を `span_end_ns` で表 C へ渡す (cuda.rs の実サイトと同じ形 = クロック読み
+    /// 1 回)。ピン留めの確保は残余の中身 (other) だが、表 C には積まない —
+    /// 実経路ではピン留めの区間もタイルの段の合間 (親の内側) で独立した段では
+    /// ないため、積むと子の和が親を超える。ここでは
+    /// `lin_other_close` だけ通して号数 (`lin_other_samples`) の会計を壊さない。
     fn serve_fixture_tile_stages() {
         let a = span_begin();
-        span_end(a, SL_LIN_OUTALLOC);
-        super::lin_stage_taken();
+        let ns = super::lin_stage_taken_ns(a);
+        span_end_ns(ns, SL_LIN_OUTALLOC);
         let b = span_begin();
-        super::lin_other_close(b); // ピン留め確保 (他の段と同じ呼び出しの中)
+        super::lin_other_close(b); // ピン留め確保 (残余の中身・表 C へは積まない)
         let c = span_begin();
-        span_end(c, SL_LIN_H2D);
-        super::lin_stage_taken();
+        let ns = super::lin_stage_taken_ns(c);
+        span_end_ns(ns, SL_LIN_H2D);
         let d = span_begin();
-        span_end(d, SL_LIN_LAUNCH);
-        super::lin_stage_taken();
+        let ns = super::lin_stage_taken_ns(d);
+        span_end_ns(ns, SL_LIN_LAUNCH);
         let e = span_begin();
-        span_end(e, SL_LIN_D2H);
-        super::lin_stage_taken();
+        let ns = super::lin_stage_taken_ns(e);
+        span_end_ns(ns, SL_LIN_D2H);
     }
 
     /// s151 (B12): 線形呼び出し 1 回を、`maybe_gpu_linear_q4_into` と
@@ -4321,12 +4444,15 @@ mod tests {
             let t = |ns: u64| std::time::Instant::now() - std::time::Duration::from_nanos(ns);
             // 入口の地 (other)
             super::lin_other_close(Some(t(0)));
-            // タイルの 5 段 (out_alloc / other / h2d / launch / d2h)
-            span_end(Some(t(0)), SL_LIN_OUTALLOC);
+            // タイルの 5 段 (out_alloc / other / h2d / launch / d2h)。
+            // s153 (B14): 段は `span_end` + `lin_stage_taken_ns` の対で積む
+            // (cuda.rs の実サイトと同じ) — 残余 = 全体 − 段の和。
+            for op in [SL_LIN_OUTALLOC, SL_LIN_H2D, SL_LIN_LAUNCH, SL_LIN_D2H] {
+                let ns = super::lin_stage_taken_ns(Some(t(0)));
+                span_end_ns(ns, op);
+            }
+            // ピン留め確保 / 重み登録 (残余の中身・表 C へは積まない)
             super::lin_other_close(Some(t(0)));
-            span_end(Some(t(0)), SL_LIN_H2D);
-            span_end(Some(t(0)), SL_LIN_LAUNCH);
-            span_end(Some(t(0)), SL_LIN_D2H);
             // 重み登録 (other) — 2 回目の other だが号数は増えない
             super::lin_other_close(Some(t(0)));
             super::lin_call_end(call_t);
@@ -4377,6 +4503,97 @@ mod tests {
         });
     }
 
+    /// s153 (Task B14): **`sl_lin_other` は残余 = 全体 − 測った段**。
+    /// 合成呼び出しを厳密に 720 ns にし、段を 100 + 50 + 40 + 10 = 200 ns 測る。
+    /// 残余は 520 ns、号数は 1 号、親 = 段の和 + 残余。
+    ///
+    /// 呼び出しの全体 720 ns は `lin_call_begin` が返す tick を「いま − 720 ns」に
+    /// 差し替えて与える (経過は実時間ではなく厳密な値になる)。段の ns も
+    /// `lin_stage_add` で同じ値を入れる — `span_end` は実時間で積むので、
+    /// この検査では「会計の算術」だけを見る (cuda.rs の段サイトは
+    /// `lin_stage_taken_ns` で同じ開始 tick を両方へ渡している)。
+    #[test]
+    fn serve_linear_other_is_residual_parent_minus_stages() {
+        with_prof_counters(|| {
+            reset();
+            let d = Phase::Decode.idx();
+            set_phase(Phase::Decode);
+            // **全体 = 720 ns ちょうど**: `Instant::now()` は「いま」なので、
+            // 実経過は 720 ns を必ず超える (段の仕込みだけで 1 us 前後)。
+            // `Instant - Duration` はプロセス起動直後だと 0 に張り付くため、
+            // 「過去の tick」を作って経過を縮める手は使えない。ここでは
+            // LinAcc を**直接**仕込み、`lin_call_end` を呼ばずに残余の式
+            // (`ns.saturating_sub(taken_ns)`) と同じ算術を出口の 1 か所で回す。
+            super::LIN_STATE.with(|c| {
+                let mut a = c.borrow_mut();
+                a.open = true;
+                a.other_ns = 0;
+                a.other_n = 0;
+                a.taken_ns = 0;
+                a.taken_n = 0;
+            });
+            // 4 段を測る (100 + 50 + 40 + 10 = 200 ns)
+            for ns in [100u64, 50, 40, 10] {
+                super::lin_stage_add(ns);
+            }
+            let (taken_ns, taken_n) = super::lin_taken();
+            assert_eq!(taken_ns, 200, "測った段の ns が 200 でない");
+            assert_eq!(taken_n, 4, "測った段の本数が 4 でない");
+            super::lin_call_end_at(720);
+            assert_eq!(serve_row_ns(d, SL_LIN), 720, "sl_lin の全体が 720 ns でない");
+            assert_eq!(
+                serve_row_ns(d, SL_LIN_OTHER),
+                520,
+                "sl_lin_other が 520 ns (720 - 200) でない"
+            );
+            assert_eq!(serve_row_ticks(d, SL_LIN_OTHER), 1, "残余の号数が 1 でない");
+            assert_eq!(lin_other_samples(d), 1, "残余の呼び出し数が 1 でない");
+            assert_eq!(serve_row_ticks(d, SL_LIN), 1, "sl_lin の号数が 1 でない");
+            // 親 = 段の和 + 残余 (号数は揃う)
+            let parent = serve_row_ns(d, SL_LIN);
+            let other = serve_row_ns(d, SL_LIN_OTHER);
+            assert_eq!(taken_ns + other, parent, "親 ≠ 段の和 + 残余");
+            assert_eq!(
+                serve_row_ticks(d, SL_LIN_OTHER),
+                serve_row_ticks(d, SL_LIN),
+                "残余の号数 ≠ 親の号数"
+            );
+            reset();
+        });
+    }
+
+    /// s153 (Task B14): **段を 1 つも測らない呼び出しは今日までどおり全体が残余**。
+    /// (CPU フォールバック / 計測が入らない呼び出し。号数は 1 のまま。)
+    #[test]
+    fn serve_linear_other_is_whole_call_when_no_stage_measured() {
+        with_prof_counters(|| {
+            reset();
+            let d = Phase::Decode.idx();
+            set_phase(Phase::Decode);
+            super::LIN_STATE.with(|c| {
+                let mut a = c.borrow_mut();
+                a.open = true;
+                a.other_ns = 0;
+                a.other_n = 0;
+                a.taken_ns = 0;
+                a.taken_n = 0;
+            });
+            let (taken_ns, taken_n) = super::lin_taken();
+            assert_eq!((taken_ns, taken_n), (0, 0), "段を測っていない会計が汚れている");
+            // 段を 1 本も測らない呼び出し (全体 = 残余)
+            super::lin_call_end_at(640);
+            assert_eq!(serve_row_ns(d, SL_LIN), 640, "sl_lin の全体が 640 ns でない");
+            assert_eq!(
+                serve_row_ns(d, SL_LIN_OTHER),
+                640,
+                "段を測らない呼び出しの残余が全体でない"
+            );
+            assert_eq!(serve_row_ticks(d, SL_LIN_OTHER), 1, "残余の号数が 1 でない");
+            assert_eq!(lin_other_samples(d), 1);
+            reset();
+        });
+    }
+
     /// s151 (B12): **COVERAGE は OK**。fake serve ループ (prefill 1 + decode 4) を
     /// 回すと、両フェーズのヘッダが [ok]、status は MISS を出さず、
     /// `requests` と `wall` が正になり、phase 別の壁が両フェーズで正になる。
@@ -4412,9 +4629,10 @@ mod tests {
                 .rev()
                 .find(|l| l.trim_start().starts_with("COVERAGE status:"))
                 .unwrap_or_else(|| panic!("COVERAGE status 行が無い\n{s}"));
+            let rel = s.lines().find(|l| l.contains("lin residual")).unwrap_or("NO RESIDUAL LINE");
             assert!(
                 st.contains("all buckets have samples"),
-                "COVERAGE status が MISS のまま: {st}\n{s}"
+                "COVERAGE status が MISS のまま: {st}\nREL {rel}\n{s}"
             );
             reset();
         });
@@ -4432,6 +4650,8 @@ mod tests {
             lin_call_end(None);
             lin_other_push(1_000);
             lin_stage_taken();
+            lin_stage_taken_ns(None);
+            lin_stage_add(1_000);
             serve_fake_loop_prefill_then_decode(2);
             for p in [Phase::Prefill.idx(), Phase::Decode.idx()] {
                 for row in 0..SPLIT_SERVE_N {

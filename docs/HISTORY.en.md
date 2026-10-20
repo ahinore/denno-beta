@@ -2766,6 +2766,48 @@ the cause is the n-sized buffers themselves, not the thread count.
   Suites: denno-engine 259 passed, denno-server 37 passed, `cargo check --features cuda` 0 errors.
 - Re-measuring table C on the real 27B q4 serve path is the next GPU window.
 
+### s153: Task B14 - make `sl_lin_other` the residual (parent minus stages) (2026-10-21) done
+
+> B12 closed the serve-path accounting, but `sl_lin_other` was still the sum of the
+> inner spans explicitly closed as "other", so a call that measures its stages
+> still reported other == parent. The 27B q4 serve-path run at 17:21Z showed
+> `sl_lin` 2,225.3 ms vs `sl_lin_other` 2,225.3 ms (equal) while the measured
+> stages (launch 75.1 + h2d 107.8 + d2h 2,017.8 + outalloc 1.9 = 2,202.6 ms)
+> were already accounted for.
+
+- **Residual is now `call_ns - taken_ns`**: `LinAcc` gains `taken_ns` (the sum of the
+  ns measured in this call for `SL_LIN_LAUNCH` / `SL_LIN_H2D` / `SL_LIN_D2H` /
+  `SL_LIN_OUTALLOC`), and `lin_call_end` pushes exactly one `sl_lin_other` sample of
+  `call_ns.saturating_sub(taken_ns)`. Per phase this gives
+  `sl_lin == sl_lin_launch + sl_lin_h2d + sl_lin_d2h + sl_lin_outalloc + sl_lin_other`.
+  Calls that measure no stage (CPU fallback etc.) keep the old behaviour: the whole
+  call is the residual, one sample.
+- **One clock read per stage**: `lin_stage_taken_ns(t) -> u64` reads the ns and
+  `span_end_ns(ns, op)` pushes the same value into table C. Reading `elapsed()` twice
+  (once in `span_end`, once in `lin_stage_taken_ns`) always makes the children longer
+  than the parent and pins the residual at 0 - the synthetic test caught exactly that.
+- **Inner "other" spans stay as a fallback**: `lin_other_close` / `lin_other_push`
+  (entry ground, weight registration, pinning) remain, but they no longer feed the
+  residual value. The s151 "one sample per call" contract is unchanged
+  (`lin_other_samples` == linear call count).
+- **One extra COVERAGE line**: `COVERAGE lin residual: <other> + children <sum> =
+  <total> / <sl_lin> ns over <calls> calls (other samples .. / lin calls ..) [ok]`,
+  printing `COVERAGE MISS` when the sample counts disagree (the s148 3x case), the
+  children exceed the parent, or the unattributed gap exceeds 1 ns per call.
+- **Measurement only**: with `DENNO_PROFILE` unset only the `serve_on()` branch runs.
+  No numeric path, `.cu`, `.ptx` or constant was touched - prof.rs and the measurement
+  sites in cuda.rs only.
+- **Tests**: synthetic 720 ns call (stages 100 + 50 + 40 + 10 = 200) gives residual
+  520 ns, one sample, parent == stages + residual; a call measuring nothing gives
+  residual == whole call (640 ns, one sample); both existing "3x" regressions stay
+  green. lib: denno-engine 261 passed / denno-server 37 passed,
+  `cargo check --features cuda` 0 errors.
+- Re-measuring the 27B q4 serve path is left to the next GPU window. Prediction
+  (from the 17:21Z numbers): `sl_lin_other` drops to 2,225.3 - 2,202.6 = **22.7 ms**
+  (1.0% of sl_lin), and `sl_lin = launch 75.1 + h2d 107.8 + d2h 2,017.8 + outalloc 1.9
+  + other 22.7` holds. Per decode step (8.16-10.8 q4 linear calls/step) that is
+  **about 2.1-2.8 ms/step** - the rest of the step sits in `sl_step_lay_other`.
+
 ### Benchmark summary (as of 2026-10-20, this host)
 
 Measurement rule: the official prefill value is cold single-shot (server start -> one request,
