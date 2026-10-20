@@ -14,6 +14,10 @@
 //! `layers` を掛けた値が 1 token あたりの見積り (プロファイルの bucket と比較する)。
 //! `--raw` は f32 の重みを作らずブロックを直接埋める (巨大な層用。CPU 比較は省く)。
 //!
+//! 注意: 同じ重みバッファを反復で読むので、L2 (この機材は 96 MiB) に収まる層では
+//! キャッシュに当たった値が出る。実モデルの decode は 1 token で全層 16.7 GB を
+//! 冷えた状態で読むため、絶対値ではなく同じ条件どうしの相対比較に使うこと。
+//!
 //! GEMV の列ブロック幅 C (s133) を比べるときは、本体の定数を書き換えずに
 //! `DENNO_Q4_GEMV_C=2|4|8` で切り替える (省略時はビルド既定の C=4)。
 //! 例: `DENNO_Q4_GEMV_C=8 cargo run --release -p denno-engine --features cuda
@@ -43,7 +47,6 @@ fn main() {
     let n = arg_u(&args, "--n", 34816); // 2 * ff  (27B: 2 * 17408)
     let layers = arg_u(&args, "--layers", 64);
     let iters = arg_u(&args, "--iters", 30);
-    let copies = arg_u(&args, "--copies", 1).max(1);
     let raw = args.iter().any(|a| a == "--raw");
     assert_eq!(k % 32, 0, "k must be a multiple of 32");
     std::env::set_var("DENNO_CUDA", "1");
@@ -87,44 +90,22 @@ fn main() {
         q
     };
 
-    // `--copies N` は同じ重みを N 部デバイスに置き、反復ごとに別の部を使う。
-    // 重みが L2 (96 MB) に残ると m=1 が見かけ上 3-4 倍速く出るため、実機の
-    // decode (16.7 GB を毎 token 冷えた状態で読む) に近づけるには 2 以上で測る。
-    let mut copies_v: Vec<Q4Linear> = Vec::with_capacity(copies);
-    copies_v.push(Q4Linear {
-        blocks: q4.blocks.clone(),
-        k,
-        n,
-        uid: q4.uid,
-    });
-    for _ in 1..copies {
-        copies_v.push(Q4Linear {
-            blocks: q4.blocks.clone(),
-            k,
-            n,
-            uid: next_q8_uid(),
-        });
-    }
-    if copies > 1 {
-        println!("weight copies on device: {copies} x {:.1} MB (L2 eviction)", bytes as f64 / 1e6);
-    }
-    let _ = uid;
     let mut worst = 0.0f64;
     for &m in &[1usize, 2, 8, 64, 300] {
         let a: Vec<f32> = (0..m * k).map(|i| (((i % 17) as f32) / 9.0) - 0.5).collect();
         let mut out = vec![0f32; m * n];
         let t = Instant::now();
         let ok =
-            denno_engine::cuda::maybe_gpu_linear_q4_into(uid, &a, &q4.blocks, k, n, m, &mut out);
+            denno_engine::cuda::maybe_gpu_linear_q4_into(q4.uid, &a, &q4.blocks, k, n, m, &mut out);
         let first = t.elapsed().as_secs_f64();
         if !ok {
             println!("m={m:>4}: GPU path not taken (CPU fallback)");
             continue;
         }
         let t = Instant::now();
-        for i in 0..iters {
-            let c = &copies_v[i % copies_v.len()];
-            let ok = denno_engine::cuda::maybe_gpu_linear_q4_into(c.uid, &a, &c.blocks, k, n, m, &mut out);
+        for _ in 0..iters {
+            let ok =
+                denno_engine::cuda::maybe_gpu_linear_q4_into(q4.uid, &a, &q4.blocks, k, n, m, &mut out);
             assert!(ok, "GPU path dropped out on iteration");
         }
         let per = t.elapsed().as_secs_f64() / iters as f64;
