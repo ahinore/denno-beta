@@ -2834,6 +2834,22 @@ s122 のハンドオフはそれを「s118 で設計済み」と読んで再実�
 - 27B q4 decode の実測は次の GPU 窓。`sl_step_other` / `sl_step_lay_other` の分割の
   予測は **予測・未計測** (下の commit メッセージに数値を置く)。
 
+### s155: Task B16 - `sl_step_other` を serve 経路の本当の残余にする (2026-10-21) 完了
+
+> B15 の残余は `own = payload1 - payload0` を**別々の行集合**で引いていたため、
+> `sl_step_other` が `sl_step` と恒等的に等しく、残余として意味を持っていなかった。
+
+- **per-row entry の持ち回り (SoCarry)**: 行ごとの入口値を保持し、
+  `own = sum(end - entry)` を同じ行集合で積む。
+- **計測点**: `step_chat_batch` の forward 戻りの直後に `step_end_tail()` を配線し、
+  **step の残余の兄弟**として `sl_lin` と `sl_step_lay_other` を扱う。
+  フィクスチャ 2 本を実順 (step_end -> sampler -> 次の投影 -> step_end_tail) に直す。
+- **`sl_so_logits` を per-op 経路へ移設** (cuda 無し q4 serve): `sl_so_sample_pen` を追加し、
+  `sl_so_gap_fwd` は per-op forward 入口 → 層ループ終端として測る (残余の子ではない)。
+- **検証**: 新テスト `serve_step_other_is_step_minus_named_siblings`、COVERAGE の 1 行
+  `step residual: other + siblings`。lib は denno-engine 262 passed / denno-server 37 passed、
+  `cargo check --features cuda` 0 error。`DENNO_PROFILE` 未設定は従来どおり no-op。
+
 ### ベンチマーク一覧 (2026-10-20 時点・このホスト)
 
 測定規則: prefill の正式値は cold 単発 (サーバ起動 -> 1 リクエスト、prefix cache off、

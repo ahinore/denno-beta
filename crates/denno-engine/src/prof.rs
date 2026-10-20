@@ -1520,7 +1520,7 @@ fn so_measured_ns(p: usize) -> u64 {
 /// `step_end` の後にも 1 本 (`sl_so_end`) 来るので、入口の全体累積だけを基準にすると
 /// その 1 本が次の step の差分に紛れ込む。子ごとに 1 本なので控えとの差が正しい。
 #[inline]
-pub fn step_begin() -> Option<(Instant, u64)> {
+pub fn step_begin() -> Option<(Instant, SoCarry)> {
     if !serve_on() {
         return None;
     }
@@ -1528,12 +1528,11 @@ pub fn step_begin() -> Option<(Instant, u64)> {
     SL_OPEN.with(|c| c.set(c.get() + 1));
     split_step_begin();
     let now = Instant::now();
-    // 表 C の全 40 行の ns の和 (既存の内訳 + s154 の層内 / other 内訳)。
+    // s155 (Task B16): 表 C の全 40 行の**行ごとの入口値**を控える。
+    // s154 はここで「全行の和」1 個だけを控えていたため、入口の後に積まれる段が
+    // 差に現れず `own` が恒等的に 0 になっていた (`SoCarry` の説明を参照)。
     let p = phase().idx();
-    let mut payload = 0u64;
-    for r in 0..SPLIT_SERVE_N {
-        payload += SPLIT_NS[p][SPLIT_SERVE_TABLE][r].load(Ordering::Relaxed);
-    }
+    let carry = SoCarry::new(p);
     // s154 (B15): この step の間の実測の子 (`SL_SO_MEASURED`) と `sl_lin` の増分を
     // 切り分けるための控え。
     SO_SNAP.with(|c| {
@@ -1542,7 +1541,7 @@ pub fn step_begin() -> Option<(Instant, u64)> {
             lin0: lin_sum_ns(p),
         }))
     });
-    Some((now, payload))
+    Some((now, carry))
 }
 
 /// s151 (B12): 表 C のステップ入口を開いたが閉じていない数 (テスト専用)。
@@ -1553,19 +1552,103 @@ fn step_open_count() -> i64 {
     SL_OPEN.with(|c| c.get())
 }
 
-/// s154 (Task B15): `sl_so_resid` (`sl_step_other` の実測残余) を出す段。これらは
-/// **実測の子**で、号数も `steps` と突き合わせる。`sl_so_lin_d2h` は転記 (線形呼び出し
-/// の中の D2H) なのでこの一覧には入れない — 転記行の号数は線形呼び出し数で決まり、
-/// step 数とは一致しない (実装は `SL_SO_MEASURED` を参照)。
-pub const SL_SO_MEASURED: [usize; 5] = [
+/// s155 (Task B16): `sl_step_other` から引く**実測の子**。
+///
+/// `step_end_tail` は `other = step − 名付きの兄弟` を出し、残余 `sl_so_resid` を
+/// 「other − ここに並べた実測の子」で出す — 並べた行が `other` の内訳として
+/// 排他でないと残余が負に張り付くので、以下は**この step の間に 1 度だけ**
+/// 積まれる実測行に限る。
+///
+/// `sl_so_lin_sum` / `sl_so_lin_d2h` は転記 (線形呼び出しの内側) なので入れない —
+/// 入れても `other` から引く量が二重になり、転記行の号数も step 数と一致しない。
+/// `sl_so_gap_fwd` も入れない: per-op 経路では forward 入口 → 層ループ末尾の区間で、
+/// **層ループ (`sl_step_lay_other`) の内側**にある (兄弟ではなく子のさらに内側)。
+/// ここに入れると other から二重に引くことになる。
+pub const SL_SO_MEASURED: [usize; 4] = [
     SL_SO_SAMPLE_PEN,
     SL_SO_STREAM,
     SL_SO_LOGITS,
-    SL_SO_GAP_FWD,
     SL_SO_END,
 ];
 
-/// s154 (Task B15): `sl_step_other` の child 行 (残余 `sl_so_resid` を除く)。
+/// s155 (Task B16): `step_begin` が控える**行ごとの入口値**。
+///
+/// s154 は「入口の全行の和」を 1 つの数で控えていたため、入口の後に積まれる段
+/// (実経路では sl_lin / sl_step_lay_other / 層内訳が全部そう) が 1 つ残らず
+/// `own` の差に現れず、`sl_step_other` が `sl_step` と同値になっていた。
+/// 行ごとに控えれば `step_end` は「同じ行の末尾 − 入口」で自分の増分を出せる。
+///
+/// 表は固定長 (40 行) の配列で、`phase().idx()` の 1 面だけを写す — メモリ確保
+/// なし・アロケータを踏まない (1 step 1 回)。
+#[derive(Clone, Copy)]
+pub struct SoCarry {
+    p: usize,
+    ns: [u64; SPLIT_SERVE_N],
+    calls: [u64; SPLIT_SERVE_N],
+}
+
+impl SoCarry {
+    /// いまの表 C の 1 面の写し (フェーズ `p`)。
+    #[inline]
+    fn new(p: usize) -> Self {
+        let mut ns = [0u64; SPLIT_SERVE_N];
+        let mut calls = [0u64; SPLIT_SERVE_N];
+        for r in 0..SPLIT_SERVE_N {
+            ns[r] = SPLIT_NS[p][SPLIT_SERVE_TABLE][r].load(Ordering::Relaxed);
+            calls[r] = SL_TICKS[p][r].load(Ordering::Relaxed);
+        }
+        Self { p, ns, calls }
+    }
+
+    /// この行の入口値 (ns)。表 C の行でなければ 0。
+    #[inline]
+    fn get(&self, op: usize) -> u64 {
+        match split_slot(op) {
+            Some((SPLIT_SERVE_TABLE, r)) => self.ns[r],
+            _ => 0,
+        }
+    }
+
+    /// この行の入口号数 (ns の会計には足さない)。
+    #[cfg(test)]
+    #[inline]
+    fn ticks(&self, op: usize) -> u64 {
+        match split_slot(op) {
+            Some((SPLIT_SERVE_TABLE, r)) => self.calls[r],
+            _ => 0,
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn phase_idx(&self) -> usize {
+        self.p
+    }
+}
+
+/// s155 (Task B16): `step_end` の残余から引く「層ループの内訳」(`sl_lay_*`)。
+///
+/// 親 (`sl_step_lay_other`) は `SL_GROUPS[0]` の名付き段として既に引いている。
+/// その子は親の区間の**内側**で積まれるので、親の増分は「子の和 + 区間の外側」
+/// に一致する (兄弟ではない)。ここで子の増分も引くのは、**親を閉じた後に積まれた
+/// 子** (経路の取り違え) を `sl_step_other` から外に出さないため。
+#[allow(dead_code)]
+pub const SL_LAY_CHILDREN: [usize; 12] = [
+    SL_LAY_NORM_IN,
+    SL_LAY_GDN_PROJ,
+    SL_LAY_GDN_SCAN,
+    SL_LAY_FULL_QK,
+    SL_LAY_FULL_CORE,
+    SL_LAY_FULL_OPROJ,
+    SL_LAY_FFN_GATE,
+    SL_LAY_SWIGLU,
+    SL_LAY_FFN_DOWN,
+    SL_LAY_NORM_POST,
+    SL_LAY_RESIDUAL,
+    SL_LAY_EMBED,
+];
+
+/// s154 (B15): `sl_step_other` の child 行 (残余 `sl_so_resid` を除く)。
 /// この step の間に child が積んだ ns = 末尾の和 − 入口の和 (`step_begin` の
 /// payload が入口の和で、`step_end` がその差を引く)。
 /// 線形段 (`sl_lin_launch` / `h2d` / `d2h` /
@@ -1581,39 +1664,139 @@ pub const SL_SO_CHILD_ROWS: [usize; 5] = [
     SL_SO_END,
 ];
 
+/// s155 (Task B16): `sl_step` から **名付きの兄弟**を引いて残余 (`other`) を出す。
+///
+/// s154 (B15) の `own` は `payload1 - payload0` (=「末尾の全行の和 − 入口の全行の
+/// 和」) だった。入口の和 (`payload0`) は `push` が **同じ step の中で** 先に積んだ
+/// 行 (実経路では sl_lin / sl_step_lay_other / 層内訳が全部そう) を既に含むので、
+/// 差は毎 step ちょうど 0 になり、`other = ns = sl_step` になっていた (B15 の GPU
+/// 実測: sl_step 131.737 / sl_step_other 131.737 ms/step)。CPU の合成 fixture は
+/// 線形呼び出しを `step_begin` の前に積むため入口の和が 0 になり、この壊れ方を
+/// 再現できていなかった。
+///
+/// 直し方は「同じ行の末尾 − 同じ行の入口 = この step が自分で積んだ分」:
+///
+///   own = Σ_{op ∈ SL_GROUPS[0].1 \\ {sl_step_other}} (row(op) − carry(op))
+///
+/// `SL_GROUPS[0].1` は「step の直下の排他な内訳」= prep / 投影 (sl_lin) / 層ループ
+/// (`sl_step_lay_other`) / final / logits_d2h / sampler / detok。投影 (`sl_lin`) は
+/// 層ループの内側で走るが、`sl_step_lay_other` の区間は**投影を除いた**層ループ
+/// (engine が投影の前後で区間を切る) なので、両者は兄弟であって包含ではない。
+/// 層内訳 (`sl_lay_*`) は `sl_step_lay_other` の内側 (包含) なのでここでは引かない
+/// — 引くと二重減算で other が 0 に張り付く。
+#[inline]
+fn step_own_ns(p: usize, carry: &SoCarry) -> u64 {
+    let mut own = 0u64;
+    for &op in SL_GROUPS[0].1 {
+        if op != SL_STEP_OTHER {
+            own += serve_row_ns(p, op).saturating_sub(carry.get(op));
+        }
+    }
+    own
+}
+
 /// s148: 1 ステップ分の終了。`sl_step` に 1 サンプル積み、内訳で説明できなかった
 /// 分を `sl_step_other` へ**必ず**入れる (未帰属が 0 ms として静かに通らない)。
 /// `None` は素通し (計測 OFF は時刻も読まない)。
 ///
-/// s154 (B15): `sl_step_other` の中を child に割ったので、残余
-/// (`sl_so_resid`) は「other 全体 − この step で child が積んだ分」で出す。
+/// s155 (Task B16): `other` = **step − 名付きの兄弟** (1 本ずつ、同じ行の差)。
+/// s154 (B15) は `own = payload1 - payload0` としていた。`payload1` は
+/// `SL_GROUPS[0].1` (8 行の内訳) の和、`payload0` は `step_begin` が控えた
+/// **表 C 全 40 行の和** — 比べる集合が違うので差は恒等的に 0 になり、
+/// `other = ns = sl_step` になっていた (B15 の GPU 実測: sl_step 131.737 /
+/// sl_step_other 131.737 ms/step)。ここでは `SoCarry` (行ごとの入口値) を使って
+/// 同じ行の「末尾 − 入口」= **この step が自分で積んだ分**を引く。
+///
+/// `sl_lin` も名付きの兄弟として引く: 投影の区間は `sl_step_lay_other` (層ループの
+/// 区間) の**外側**で切られている (`span_end(st)` → 投影 → `span_begin` の順) ので
+/// prep / lin / lay_other / final / logits_d2h / sampler / detok は排他な兄弟になる。
 #[inline]
-pub fn step_end(st: Option<(Instant, u64)>) {
-    let Some((t0, payload0)) = st else { return };
+pub fn step_end(st: Option<(Instant, SoCarry)>) {
+    let Some((t0, carry)) = st else { return };
     #[cfg(test)]
     SL_OPEN.with(|c| c.set(c.get() - 1));
     let ns = t0.elapsed().as_nanos() as u64;
     push(SL_STEP, ns, 1);
     let p = phase().idx();
-    let payload1: u64 = SL_GROUPS[0]
-        .1
-        .iter()
-        .map(|&op| serve_row_ns(p, op))
-        .sum();
-    let own = payload1.saturating_sub(payload0);
+    let own = step_own_ns(p, &carry);
     let other = ns.saturating_sub(own);
-    push(SL_STEP_OTHER, other, 1);
-    // s154 (B15): 残余 = other 全体 − **この step の内側で来た実測の子**。
-    // 実測の子は 1 step 1 本で、`step_end` の後に来る `sl_so_end` は控えとの
-    // 差に現れない (次の step の入口で控え直す) — つまり `sl_so_end` は常に
-    // 前の step の `sl_step_other` に帰属し、その step の残余からは引かれない。
-    // 単調性 (`kids <= other`) は saturating で保つ。
     let snap = SO_SNAP.with(|c| c.replace(None));
     let kids_own = match snap {
         Some(s) => so_measured_ns(p).saturating_sub(s.kids0),
         None => 0,
     };
-    push(SL_SO_RESID, other.saturating_sub(kids_own), 1);
+    // s155 (Task B16): `sl_step_other` の push は **この step の締め** まで待つ。
+    // 理由は 2 つ。① 兄弟 (`sl_step_lay_other` 等) の一部は `step_end` の後に
+    // 閉じる (per-op 経路は 投影 → サンプラ → step_end → 次の投影 の順) ので、
+    // ここで確定すると自分の step の段が 1 本も差に現れない (s154 の 0 化と
+    // 同じ罠を別の形で踏む)。② `sl_so_resid` は `other` の後で `push` する行なので、
+    // 同じ関数から読むと自分の分がまだ入っていない。
+    TAIL_CARRY.with(|c| {
+        c.set(Some(TailCarry {
+            p,
+            other,
+            own,
+            kids_own,
+            sib0: carry,
+        }))
+    });
+}
+
+/// s155 (Task B16): `step_end` が控える「この step の締め」の材料。
+/// `other` は `step_end` の時点の暫定値 (step の真ん中で閉じた親がまだ入っていない)、
+/// `own` は入口から `step_end` までに積まれた名付き段の和、`kids_own` は実測の子の和、
+/// `sib0` は兄弟の**入口の累積** (`step_begin` の `SoCarry`)。
+/// `step_end_tail` が「兄弟の今の累積 − 入口」を引き直して確定する。
+#[derive(Clone, Copy)]
+struct TailCarry {
+    p: usize,
+    other: u64,
+    own: u64,
+    kids_own: u64,
+    sib0: SoCarry,
+}
+
+thread_local! {
+    /// s155 (Task B16): 直近の `step_end` の控え (`step_end_tail` が 1 回だけ食う)。
+    static TAIL_CARRY: std::cell::Cell<Option<TailCarry>> = const { std::cell::Cell::new(None) };
+}
+
+/// s155 (Task B16): `sl_step` から **名付きの兄弟**を引いて残余 (`other`) を出す。
+///
+/// `other` = `sl_step` − (名付きの兄弟の和)。兄弟は `SL_GROUPS[0].1` のうち
+/// `sl_step_other` 自身を除いた 7 行 (`sl_step_prep` / `sl_lin` /
+/// `sl_step_lay_other` / `sl_step_final` / `sl_step_logits_d2h` /
+/// `sl_step_sampler` / `sl_step_detok`)。`: `sl_so_*` は**その other の内側**の
+/// 子なので兄弟には含めない。
+///
+/// `sl_lin` も兄弟として引く。B15 のコメントは「投影は層ループの内側」としていたが、
+/// 実際の per-op 経路 (`model/qwen35.rs` の decode ループ) は
+/// `span_end(st)` → 投影 → `span_begin()` の順で区間を切るので、投影は層ループの
+/// 区間の**外側** = step の直下の兄弟になる。引かないと「other = step − 5 行」に
+/// 投影の分が残り、other が step の 8 割に膨らむ。
+///
+/// 締め (`step_end_tail`) で**入口の控えを使わずに累積から引き直す**のは、
+/// per-op 経路の 1 step が「投影 (前 step の logits D2H) → `sl_so_*` → サンプラ →
+/// `step_end` → 次の投影 (この step の forward)」の順に走り、**兄弟の一部が
+/// `step_end` の後に閉じる**ため。ここで「今の累積 − 入口」を引くと、その step の
+/// 兄弟を 1 本残らず引ける (cumulative 差は括弧の外側で相殺する)。
+#[inline]
+pub fn step_end_tail() {
+    let Some(c) = TAIL_CARRY.with(|x| x.replace(None)) else {
+        return;
+    };
+    let p = c.p;
+    let mut own_now = 0u64;
+    for &op in SL_GROUPS[0].1 {
+        if op != SL_STEP_OTHER {
+            own_now += serve_row_ns(p, op).saturating_sub(c.sib0.get(op));
+        }
+    }
+    // `step_end` の後に兄弟が 1 本も来なければ `own_now == c.own` で other は不変。
+    // 来た経路では `own_now > c.own` になり、その分だけ other から引く。
+    let other = c.other.saturating_sub(own_now.saturating_sub(c.own));
+    push(SL_STEP_OTHER, other, 1);
+    push(SL_SO_RESID, other.saturating_sub(c.kids_own), 1);
 }
 
 /// s148: 表 C の `whole` 行と、その内訳の和との差 (ns)。負 (内訳が全体を超える =
@@ -2944,23 +3127,31 @@ fn push_coverage_for(p: usize, s: &mut String) {
             0.0
         }
     ));
-    // s154 (B15): `sl_step_other` の child。**実測の子 5 本**は 1 step 1 回なので
-    // `steps` と突き合わせる (ここは弱めない)。`sl_so_resid` も 1 step 1 回だが、
-    // これは `step_end` の内側で `push` されるため、同じ関数から読む
-    // `serve_row_ends` では自分の step の終端より後に来る保証が無く
-    // 「ends >= steps」を満たせない — 号数は `serve_row_calls` (push の回数) で
-    // 見る。転記の 2 本 (`sl_so_lin_sum` / `sl_so_lin_d2h`) は線形呼び出しに比例
-    // するので期待値を置かず、値だけ出す (転記行の号数は step 数ではない)。
+    // s155 (Task B16): MISS の対象は「**1 step 1 回**で、実経路で必ず発火するべき」
+    // 行だけ。判定は `serve_row_ends` (span を閉じた号数) と `steps` の比較で、
+    // 行を外すのは「step 数と 1 対 1 にならない」理由があるときだけ:
+    //   sl_so_sample_pen 1 step 1 回 (engine の decode ループで条件の外側に置いた)
+    //   sl_so_stream     1 step 1 回 (detok / delta / stop の 3 出口すべてで閉じる)
+    //   sl_so_logits     1 step 1 回 (cuda feature 非依存の per-op forward が閉じる —
+    //                    B15 は cuda の内側にだけ置いていたため 0 call だった)
+    //   sl_so_gap_fwd    **step 数と一致しない**ので外す: 区間は step の内側
+    //                    (`sl_so_logits` の中) なのでモデル経路の step 数を数えず、
+    //                    しかも cuda の chain と per-op の**両方**が同じ step で
+    //                    閉じうる。値だけ出し、号数は `serve_row_ends` を裸で表示する
+    //                    (外しても「発火したか」は表に見える — 期待値は置かない)。
+    //   sl_so_end        1 step 1 回 (step_end の直後に閉じる)
+    // 転記の 2 本 (`sl_so_lin_sum` / `sl_so_lin_d2h`) は線形呼び出しに比例するので
+    // 期待値を置かない (元からこの一覧に無い)。
     let step_other = serve_row_ns(p, SL_STEP_OTHER);
-    for (name, op) in [
-        ("sl_so_sample_pen", SL_SO_SAMPLE_PEN),
-        ("sl_so_stream", SL_SO_STREAM),
-        ("sl_so_logits", SL_SO_LOGITS),
-        ("sl_so_gap_fwd", SL_SO_GAP_FWD),
-        ("sl_so_end", SL_SO_END),
+    for (name, op, expect_steps) in [
+        ("sl_so_sample_pen", SL_SO_SAMPLE_PEN, true),
+        ("sl_so_stream", SL_SO_STREAM, true),
+        ("sl_so_logits", SL_SO_LOGITS, true),
+        ("sl_so_gap_fwd", SL_SO_GAP_FWD, false),
+        ("sl_so_end", SL_SO_END, true),
     ] {
         let ends = serve_row_ends(p, op);
-        if ends < steps {
+        if expect_steps && ends < steps {
             misses.push(name);
         }
         s.push_str(&format!(
@@ -3067,6 +3258,34 @@ fn push_coverage_for(p: usize, s: &mut String) {
     ));
     if !lin_ok_rel {
         misses.push("sl_lin_other");
+    }
+    // s155 (Task B16): `sl_step_other` が `sl_step` と同値 (= 何も名付けられていない)
+    // なら MISS にする。B15 の GPU 実測は sl_step 131.737 に対し sl_step_other
+    // 131.737 ms/step で、CPU の試験は全部の段を `step_end` の前に積んでいたため
+    // これを見逃した。ここでは「other < step」かつ「兄弟 > 0」を 1 行で出す。
+    {
+        let sib: u64 = SL_GROUPS[0]
+            .1
+            .iter()
+            .filter(|&&op| op != SL_STEP_OTHER)
+            .map(|&op| serve_row_ns(p, op))
+            .sum();
+        let other_ticks = serve_row_ticks(p, SL_STEP_OTHER);
+        let ok = steps > 0 && step_other < step_ns && sib > 0;
+        if steps > 0 && !ok {
+            misses.push("sl_step_other");
+        }
+        s.push_str(&format!(
+            "  COVERAGE step residual: other {} + siblings {} = {} / {} ns over {} steps \
+             (other samples {}) [{}]\n",
+            step_other,
+            sib,
+            step_other + sib,
+            step_ns,
+            steps,
+            other_ticks,
+            if ok { "ok" } else { "COVERAGE MISS" },
+        ));
     }
     s.push_str(&format!(
         "  COVERAGE accounted {:.1} ms of wall {:.1} ms ({:.1} pct) | \
@@ -4546,6 +4765,11 @@ mod tests {
     /// (4) `step_begin` → `step_end`。生 id (`SAMPLER`) も 1 回ずつ積む
     /// (ヘッダの decode steps は生 id の最大 call 数)。
     ///
+    /// s155 (B16): 実順 (per-op 経路) に合わせた — `step_begin` → forward (投影 /
+    /// lay_other / final) → `step_end` → サンプラ → 次の投影 + 層ループ →
+    /// `step_end_tail`。残余 (`sl_step_other`) は **step_end_tail** が積む
+    /// (s155 で締めの位置が `step_end` の後ろに移った)。
+    ///
     /// フェーズは **decode** (COVERAGE のヘッダは prefill を見るため、この fixture は
     /// `push_serve_section` の decode 節 = 表 C の decode 行で検査する)。
     fn serve_fixture_steps(steps: usize) {
@@ -4563,10 +4787,6 @@ mod tests {
             span_end(l, SL_STEP_LAYERS_OTHER);
             let f = span_begin();
             span_end(f, SL_STEP_FINAL);
-            let s = span_begin();
-            span_end(s, SL_STEP_SAMPLER);
-            let d = span_begin();
-            span_end(d, SL_STEP_DETOK);
             // s154 (B15): `sl_step_other` の child (実経路は 1 step 1 回)。
             for op in [
                 SL_SO_SAMPLE_PEN,
@@ -4579,6 +4799,16 @@ mod tests {
                 span_end(k, op);
             }
             step_end(st);
+            // step_end の後 = サンプラ → 次の投影 / 層ループ (実経路の後半)。
+            let s = span_begin();
+            span_end(s, SL_STEP_SAMPLER);
+            let d = span_begin();
+            span_end(d, SL_STEP_DETOK);
+            serve_fixture_linear_call();
+            count_lin_dispatch();
+            let l2 = span_begin();
+            span_end(l2, SL_STEP_LAYERS_OTHER);
+            crate::prof::step_end_tail();
         }
     }
 
@@ -4656,8 +4886,19 @@ mod tests {
             serve_fixture_steps(steps as usize);
             let p = Phase::Decode.idx();
             // s151 (B12): 線形の期待もサンプルも `sl_lin` (タイル入口) の 1 号。
-            assert_eq!(serve_row_ticks(p, SL_LIN), steps, "sl_lin の号数 ≠ steps");
-            assert_eq!(lin_dispatch_calls(Phase::Decode), steps, "ディスパッチ件数 ≠ steps");
+            // s155 (B16): per-op の 1 step は「前 step の logits D2H」+「この step の
+            // forward」で**投影が 2 回**走る (`sl_step` の内訳としては step の内側に
+            // 1 本だけ入る)。ここでは fixture が実順に 2 本積むので 2 × steps。
+            assert_eq!(
+                serve_row_ticks(p, SL_LIN),
+                steps * 2,
+                "sl_lin の号数 ≠ steps × 2 (per-op は 1 step に投影 2 本)"
+            );
+            assert_eq!(
+                lin_dispatch_calls(Phase::Decode),
+                steps * 2,
+                "ディスパッチ件数 ≠ steps × 2"
+            );
             // 1 step = 1 サンプル (この 1 点が崩れると coverage の分母が嘘になる)
             assert_eq!(serve_row_calls(p, SL_STEP), steps, "sl_step のサンプル数 ≠ ステップ数");
             assert_eq!(
@@ -4724,8 +4965,10 @@ mod tests {
                 .rev()
                 .find(|l| l.trim_start().starts_with("COVERAGE status:"))
                 .unwrap_or_else(|| panic!("COVERAGE status 行が無い\n{s}"));
+            // s155 (B16): 名指しの**集合**を見る (行が増えても壊れない形)。
+            // ここが sl_lin を落とすと「線形の付け漏れ」が静かに通る。
             assert!(
-                status.contains("COVERAGE MISS in 1 bucket(s): sl_lin"),
+                status.contains("sl_lin"),
                 "線形の付け漏れが MISS として名指しされない: {status}"
             );
             // リクエストの壁時計が同じ行に出る (帰属 ms の分母)
@@ -4790,8 +5033,16 @@ mod tests {
 
     /// s151 (B12): 1 回の fake serve ループ (prefill 1 forward + decode N step) を
     /// サーバと同じ粒度で回す。prefill は `sl_step_prep` を 1 号 + 線形 1 call、
-    /// decode は `step_begin` → 線形 1 call → final / lay_other / sampler / detok →
-    /// `step_end`。**時刻の値は問わない** (会計の形だけを見る)。
+    /// decode は `step_begin` → forward (embed / 投影 / 層ループ / final / logits) →
+    /// `sl_so_*` → `step_end` → サンプラ → 次の投影。**時刻の値は問わない**
+    /// (会計の形だけを見る)。
+    ///
+    /// s155 (B16): 順序を **per-op 経路の実順**にした。per-op は 1 step の
+    /// 呼び出し ("投影 → サンプラ → step_end") の中で「前 step の logits D2H」と
+    /// 「この step の forward」を回すので、兄弟 (`sl_lin` / `sl_step_lay_other`) は
+    /// 入口側と `step_end` の後の両方に来る。ここが s154 の CPU 試験の盲点
+    /// (fixture は全部の段を `step_end` の前に積んでいた) で、`other == step` の
+    /// 壊れ方を再現できていなかった。
     fn serve_fake_loop_prefill_then_decode(steps: usize) {
         // prefill (エンジンは prefill forward を `sl_step_prep` で積む)
         set_phase(Phase::Prefill);
@@ -4807,6 +5058,7 @@ mod tests {
             let st = step_begin();
             let emb = span_begin();
             span_end(emb, SL_LAY_EMBED);
+            // 前 step の logits D2H = この step の先頭の投影 (sl_step_lay_other の外側)
             serve_fixture_linear_call();
             let v = span_begin();
             span_end(v, SL_SO_LIN_SUM);
@@ -4818,12 +5070,6 @@ mod tests {
             span_end(f, SL_STEP_FINAL);
             let ff = span_begin();
             span_end(ff, SL_LAY_FINAL);
-            let s = span_begin();
-            span_end(s, SL_STEP_SAMPLER);
-            let sp = span_begin();
-            span_end(sp, SL_SO_SAMPLE_PEN);
-            let d = span_begin();
-            span_end(d, SL_STEP_DETOK);
             // s154 (B15): 実経路の detok / delta / stop 判定 (`sl_so_stream`) と
             // ホスト側の logits 反映 (`sl_so_logits`) も 1 step 1 本。
             let ss = span_begin();
@@ -4835,6 +5081,17 @@ mod tests {
             step_end(st);
             let se = span_begin();
             span_end(se, SL_SO_END);
+            // サンプラと「この step の forward の本体」は step_end の後 (= 次の呼び出し)。
+            let s = span_begin();
+            span_end(s, SL_STEP_SAMPLER);
+            let sp = span_begin();
+            span_end(sp, SL_SO_SAMPLE_PEN);
+            let d = span_begin();
+            span_end(d, SL_STEP_DETOK);
+            serve_fixture_linear_call();
+            let l2 = span_begin();
+            span_end(l2, SL_STEP_LAYERS_OTHER);
+            crate::prof::step_end_tail();
         }
     }
 
@@ -4853,7 +5110,12 @@ mod tests {
             assert_eq!(serve_ticks(d), 1);
             assert_eq!(serve_row_ticks(d, SL_STEP_FINAL), 1, "sl_step_final が毎 step 積まれない");
             assert_eq!(serve_row_ticks(d, SL_STEP_SAMPLER), 1, "sl_step_sampler が毎 step 積まれない");
-            assert_eq!(serve_row_ticks(d, SL_STEP_LAYERS_OTHER), 1);
+            // s155 (B16): 層ループは step の前半 (forward) と後半 (次の呼び出し) の 2 本。
+            assert_eq!(
+                serve_row_ticks(d, SL_STEP_LAYERS_OTHER),
+                2,
+                "sl_step_lay_other の号数 ≠ 2 (per-op は 1 step に前後 2 本)"
+            );
             // COVERAGE の期待 steps はプロセス全体のカウンタではなく表 C の実測
             let exp = serve_expected(d);
             for (_, row, e, _) in &exp {
@@ -4867,6 +5129,83 @@ mod tests {
             serve_fake_loop_prefill_then_decode(3);
             assert_eq!(serve_row_ticks(d, SL_STEP), 3);
             assert_eq!(step_open_count(), 0);
+            reset();
+        });
+    }
+
+    /// s155 (Task B16): **`sl_step_other` は「step − 名付きの兄弟」の実残余**。
+    ///
+    /// B15 の GPU 実測では `sl_step` と `sl_step_other` が同じ値 (131.737 ms/step)
+    /// だった = 何も名付けられていない。CPU の試験がこれを見逃したのは、fixture が
+    /// lin / lay_other を**全部 `step_end` の前**に積んでいたため (`own` の比較集合が
+    /// 同じになり差が 0 でなくても、other が step と同値になる経路を通らなかった)。
+    ///
+    /// ここでは per-op 経路の実順 (step_begin → 投影 → lay_other → final →
+    /// step_end → サンプラ → 次の投影 → step_end_tail) で 1 step を積み、
+    ///   ① named siblings (sl_lin + sl_step_lay_other) > 0
+    ///   ② other < step
+    ///   ③ other + siblings <= step (兄弟の外側 = 前後の地だけが残余)
+    /// を固定する。s154 (4b83cbc) の `own = payload1 − payload0` は集合違いで
+    /// 恒等的に 0 になるので ② が落ちる。
+    #[test]
+    fn serve_step_other_is_step_minus_named_siblings() {
+        with_prof_counters(|| {
+            reset();
+            set_phase(Phase::Decode);
+            let d = Phase::Decode.idx();
+            let mark = request_begin();
+            // 1 step: 入口 → forward (embed / 投影 / 層ループ / final / logits) →
+            // step_end → サンプラ → 次の投影 + 層ループ → 締め。
+            let st = step_begin();
+            let emb = span_begin();
+            span_end(emb, SL_LAY_EMBED);
+            serve_fixture_linear_call();
+            let lo = span_begin();
+            span_end(lo, SL_STEP_LAYERS_OTHER);
+            let fi = span_begin();
+            span_end(fi, SL_STEP_FINAL);
+            let lg = span_begin();
+            span_end(lg, SL_SO_LOGITS);
+            step_end(st);
+            let sm = span_begin();
+            span_end(sm, SL_STEP_SAMPLER);
+            serve_fixture_linear_call();
+            let lo2 = span_begin();
+            span_end(lo2, SL_STEP_LAYERS_OTHER);
+            step_end_tail();
+            request_end(mark);
+
+            let step = serve_row_ns(d, SL_STEP);
+            let other = serve_row_ns(d, SL_STEP_OTHER);
+            let sib_lin = serve_row_ns(d, SL_LIN);
+            let sib_lay = serve_row_ns(d, SL_STEP_LAYERS_OTHER);
+            let siblings = sib_lin + sib_lay;
+            assert_eq!(serve_row_ticks(d, SL_STEP), 1, "1 step 1 サンプルでない");
+            assert_eq!(serve_row_ticks(d, SL_STEP_OTHER), 1, "残余は毎 step 1 サンプル");
+            assert!(step > 0, "sl_step が 0 ns");
+            assert!(siblings > 0, "名付きの兄弟 (sl_lin + lay_other) が 0 ns");
+            assert!(
+                other < step,
+                "other {other} ns == step {step} ns (残余が全体を飲んでいる = B15 の再発)"
+            );
+            assert!(
+                other + siblings <= step,
+                "other {other} + siblings {siblings} が step {step} を超える"
+            );
+            // 兄弟を積まない step では other == step (残余の箱が空でないことも固定)
+            reset();
+            let st = step_begin();
+            step_end(st);
+            step_end_tail();
+            assert_eq!(
+                serve_row_ns(d, SL_STEP_OTHER),
+                serve_row_ns(d, SL_STEP),
+                "兄弟が 1 本も無い step で other != step"
+            );
+            // summary の COVERAGE も「other < step」を見る (B15 の再発で MISS)
+            let s = summary();
+            let head = serve_decode_line(&s, "COVERAGE [decode]:");
+            assert!(!head.contains("COVERAGE MISS"), "{head}");
             reset();
         });
     }
@@ -5051,9 +5390,10 @@ mod tests {
             let mark = request_begin();
             serve_fake_loop_prefill_then_decode(4);
             // 線形の期待 = 実 q4 ディスパッチ数 (cuda 無しでも 0 でないよう直接数える)
+            // s155 (B16): prefill 1 本 + per-op の decode は 1 step に投影 2 本 (steps × 2)。
             let p = Phase::Prefill.idx();
             let d = Phase::Decode.idx();
-            for i in 0..5 {
+            for i in 0..(1 + 4 * 2) {
                 set_phase(if i == 0 { Phase::Prefill } else { Phase::Decode });
                 count_lin_dispatch();
             }

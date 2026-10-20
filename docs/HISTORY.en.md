@@ -2841,6 +2841,25 @@ the cause is the n-sized buffers themselves, not the thread count.
   `sl_step_other` / `sl_step_lay_other` is **predicted-and-unmeasured** (the values
   live in the commit message).
 
+### s155: Task B16 - make `sl_step_other` a real residual on the serve path (2026-10-21) done
+
+> The B15 residual computed `own = payload1 - payload0` over **two different row sets**,
+> so `sl_step_other` was identically equal to `sl_step` and carried no residual meaning.
+
+- **Per-row entry carry (SoCarry)**: the entry value of each row is carried, and
+  `own = sum(end - entry)` is accumulated over the same row set.
+- **Sites**: `step_end_tail()` is wired right after the forward return in
+  `step_chat_batch`, and `sl_lin` / `sl_step_lay_other` are treated as **siblings of the
+  step residual**. Two fixtures were rewired to the real order
+  (step_end -> sampler -> next projection -> step_end_tail).
+- **`sl_so_logits` moved to the per-op path** (cuda-free q4 serve), `sl_so_sample_pen`
+  added, and `sl_so_gap_fwd` measured as per-op forward entry -> layer-loop end
+  (not a residual child).
+- **Verification**: new test `serve_step_other_is_step_minus_named_siblings`, one
+  COVERAGE line `step residual: other + siblings`. lib: denno-engine 262 passed /
+  denno-server 37 passed, `cargo check --features cuda` 0 errors. With `DENNO_PROFILE`
+  unset the code stays a no-op.
+
 ### Benchmark summary (as of 2026-10-20, this host)
 
 Measurement rule: the official prefill value is cold single-shot (server start -> one request,
