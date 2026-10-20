@@ -2339,6 +2339,46 @@ fallback、era に見えるファイル名が線を引かないことも固定�
 その中の数値は `denno-engine --lib` 240 passed / 1 ignored、`denno-server` 77 passed、
 `kernel_invariants` 11 passed で基準と一致。
 
+### s118: P1-2 candidate 4 (causal key 範囲切り詰め) は**数値不変ではない** (commit しない)
+
+`dno_attention_prefill` のタイルループ開始を 0 から
+`jstart = floor((pos0+i0)/PF_BK)*PF_BK` に変える案を検討した。block b の各 row は key
+`j <= pos0+i` しか要らない、という前提がこのカーネルでは成り立たない。**`jend =
+min(t_total, pos0+i0+PF_BQ)` は `n` に依存せず、score は `j < t_total` 全ての K/V を読む**
+(`:407-408`・`:425-426`)。`t_total` が `pos0+i0+PF_BQ` を超えるとき (prefill の末尾 block)、
+カーネルは block の causal 界より先の `PF_BQ` 幅の screen を意図的に計算している (両呼び出し元
+とも `t_total = pos0 + n`・64 行 1 block なので単発リクエストでは末尾 block のみ。prefix cache 形の
+呼び出しならさらに効く)。
+
+その pair は `-INFINITY` マスクで出力にもそのタイルの `m` (`fmaxf` は全 `PF_BQ*PF_BK` の最大) にも
+影響しない。影響するのは online-softmax の累積器 `acc` の**表現可能範囲**。先行タイルで
+`acc = sum_j exp(s_j - m_run)` (各項 `<= 1`) まで貯まっていると、以後に残る FMA の丸め単位は
+`2^-23 * acc` になる。`m_run` は row の真の最大を超えないので後続タイルの項は
+`exp(s - m_new) <= 1`、つまり `acc` が先に大きいほど小さな項が丸めで消えない。切り詰めは
+その先溜めを消す。
+
+**row 単位で差が出る例** (`pos0+i0` が 8 の倍数でないとき): `pos0=0, i0=64` (`jstart=64`) の
+row 64。HEAD は最初のタイルが `[0,8)` で有効列 8 本 (row 64 の 64,67,70,... は後のタイル)、
+切り詰め後は最初のタイルが `[64,72)` で有効列は `j=64` の 1 本だけ。最大に到達するまでの列数が
+8 → 1 になり、`l` の加算列が変わる。`pos0+i0` が 8 の倍数のとき (すなわち `pos0=0` の cold
+payload 全体・`i0 = 64b`) は構造が一致する。
+
+差の大きさ: 分離が起きるのは `d=255` (特定の出力次元 1 本) の dot が打ち消し合って
+`~32*(639/640) ~ 32` が O(1) の商まで落ちる場合だけで、そこで `2^-23` 相対。R3 (絶対 1e-3) では
+見えない。`GPU_VERIFY` のアンカー md5 (1e-7 まで比較) は見えるが、それには重み依存の打ち消しが
+先に起きている必要がある。**静止解析では「数値不変」を証明できないので commit しない**、が結論
+(マスク経路が厳密に `+0.0f` を足すことはコードで確認できる。ただし「その `+0.0f` が無いとき
+同じビット」は別の命題)。
+
+同じ読みから s117 の「45 block」は誤り (5,686 tok は `PF_BQ=64` で **89 block**・端数 10 行)。
+
+将来この切り詰めを入れるなら、先に潰すべき差分: 完全マスクのタイルを block 内の**全 row** が
+踏むと `m_run = -INFINITY` の row で `exp((-inf) - (-inf)) = exp(NaN)` → `l = NaN` → 出力
+`0 * NaN = NaN` になる (`n >= 1` のゲートはこれを防がない)。block 先頭側の row は必ず最初の
+タイルに有効 key を持つ (`jstart <= pos0+i0 <= pos0+i`) ので通常は踏まないが、切り詰めで
+`jstart` の丸めを誤ると踏む。`m_run == -INFINITY` の row を明示的にスキップするガードを先に
+置くのが安全。
+
 **人間対応 (測っていないこと)**: リポジトリに実 A/B の JSON が 1 本も無く、この環境には
 GPU が無いので、**実データのダッシュボードはまだ存在しない**。GPU 機で各 cold A/B の後に
 `python3 scripts/cold_ab.py --old <old> --new <new> --json <dir>/s110_<build>.json --era s110`
