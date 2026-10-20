@@ -2671,6 +2671,32 @@ pub fn maybe_gpu_linear_q4_into(
     m: usize,
     out: &mut [f32],
 ) -> bool {
+    // s148 (Task B10・計測のみ): ここは **q4 で実際に線形層が走る唯一の入口**
+    // (27B q4 の prefill / decode の全投影・lm_head がここを通る)。表 C の
+    // `sl_lin` はこの入口から戻るまでを 1 サンプルとして数える — wrapper
+    // (`lin_stage`) の内側ではなく「本当に呼ばれた回数」と一致させるため。
+    // 計測 OFF は `span_begin` が `None` を返し、`span_end` は分岐 1 回で戻る。
+    let call_t = if crate::prof::serve_on() {
+        crate::prof::count_lin_dispatch();
+        crate::prof::span_begin()
+    } else {
+        None
+    };
+    let r = maybe_gpu_linear_q4_into_inner(uid, a, blocks, k, n, m, out);
+    crate::prof::span_end(call_t, crate::prof::SL_LIN);
+    r
+}
+
+/// s148: [`maybe_gpu_linear_q4_into`] の本体 (計測の包みを外したもの)。
+fn maybe_gpu_linear_q4_into_inner(
+    uid: u64,
+    a: &[f32],
+    blocks: &[u8],
+    k: usize,
+    n: usize,
+    m: usize,
+    out: &mut [f32],
+) -> bool {
     debug_assert_eq!(out.len(), m * n);
     set_last_linear_ran_on_gpu(false);
     LINEAR_SEAM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2687,23 +2713,36 @@ pub fn maybe_gpu_linear_q4_into(
     if m > max_m() && !use_gemm {
         return false;
     }
+    // s148: ここから先の「入口の地のホスト時間」(デバイス取得・コンテキスト・
+    // 重み登録) を `sl_lin_other` として明示する (段の和を入口の壁時計に一致させる)。
+    let entry_st = crate::prof::span_begin();
     let Some(ctx) = shared_ctx() else {
+        crate::prof::span_end(entry_st, crate::prof::SL_LIN_OTHER);
         return false;
     };
     if let Err(e) = ctx.make_current() {
         tracing::error!("CUDA cuCtxSetCurrent failed, using CPU q4: {e:#}");
         GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::prof::span_end(entry_st, crate::prof::SL_LIN_OTHER);
         return false;
     }
+    // s148: 重みのデバイス登録 (初回のみ・数 MB の H2D) とディスパッチの地の
+    // ホスト時間を `sl_lin_other` として明示する (段の和を入口の壁時計に一致させる)。
+    let st = crate::prof::span_begin();
     let gw = match weights_for_q4(uid, blocks, k, n) {
         Ok(g) => g,
         Err(e) => {
             tracing::error!("CUDA q4 weight upload failed, using CPU: {e:#}");
             GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::prof::span_end(st, crate::prof::SL_LIN_OTHER);
+            crate::prof::span_end(entry_st, crate::prof::SL_LIN_OTHER);
             return false;
         }
     };
-    match q4_dispatch(ctx, a, gw, m, k, n, use_gemm, out) {
+    let r = q4_dispatch(ctx, a, gw, m, k, n, use_gemm, out);
+    crate::prof::span_end(st, crate::prof::SL_LIN_OTHER);
+    crate::prof::span_end(entry_st, crate::prof::SL_LIN_OTHER);
+    match r {
         Ok(()) => {
             set_last_linear_ran_on_gpu(true);
             true
@@ -2905,9 +2944,21 @@ fn q4_dispatch_tile(
     out: &mut [f32],
 ) -> Result<()> {
     ctx.make_current()?;
-    // s138 (Task B6・計測のみ): 段ごとの tick。計測 OFF はすべて None = クロック
-    // 読みゼロ・(表への) 書き込みゼロで、既定経路の挙動は 1 命令も変わらない。
+    // s148 (Task B10・計測のみ): serve (q4) 経路の線形呼び出しの中身を段へ割る。
+    // s138 の表 B は wrapper (`lin_stage` / `linear_pinned`) の内側だけを数えて
+    // いたため、本番の GEMM 経路 (`q4_dispatch_tile`) の時間に届いていなかった
+    // (実測: 608 call / 7,846 ms に対し 802 サンプル / 445.8 ms)。ここは本番が
+    // 実際に通るタイル実装の内側で、1 タイル = 1 サンプル。計測 OFF は tick が
+    // `None` で、`split_mark` / `span_end` とも分岐 1 回で戻る (クロック読みなし)。
     let mut t = split_stage();
+    // s148: 表 C の段。1 タイルの中で互いに排他 (確保 / H2D / launch / D2H / sync)。
+    //
+    // `st` は「いま開いている段」で、閉じるたびに**開き直さない** — `span_begin` は
+    // 計測 OFF で `None` を返すので、閉じた後に開き直すと (計測 ON でも) ここで
+    // 落とした区間が二度と閉じられない。各段の開始は必ず次の段を閉じた直後で取る。
+    // こうすると段の和が「タイル入口 → 戻り」の壁時計に一致し、閉じ漏れが
+    // `sl_lin_other` (残余) ではなく**未帰属の穴**として現れない。
+    let mut st = crate::prof::span_begin();
     SCRATCH.with(|cell| -> Result<()> {
         let mut s = cell.borrow_mut();
         let Scratch { x, out: dout, hx, ho, .. } = &mut *s;
@@ -2916,9 +2967,18 @@ fn q4_dispatch_tile(
         Scratch::ensure(x, bytes_x)?;
         Scratch::ensure(dout, bytes_out)?;
         split_mark(&mut t, crate::prof::Q4P_OUT_ALLOC);
+        crate::prof::span_end(st.take(), crate::prof::SL_LIN_OUTALLOC);
+        // 表 C: staging のピン留め領域の確保 (段の開始はここ)
+        st = crate::prof::span_begin();
         Scratch::ensure_pin(hx, bytes_x)?;
         Scratch::ensure_pin(ho, bytes_out)?;
         split_mark(&mut t, crate::prof::Q4P_PIN_ALLOC);
+        // 表 C: ピン留め確保は転送準備の一部なので `sl_lin_other` に寄せる
+        // (`sl_lin_quant` は Q4 では行わない = 0 サンプルのまま)。
+        // (割り当て済みの 2 本目以降は即時なので、ここは実質初回だけの時間。)
+        crate::prof::span_end(st.take(), crate::prof::SL_LIN_OTHER);
+        // 表 C: 活性化の staging コピー (hx ← a) から H2D 発行まで
+        st = crate::prof::span_begin();
         let (dx, dout) = (x.as_ref().unwrap(), dout.as_ref().unwrap());
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
         hx.as_mut_slice::<f32>()[..m * k].copy_from_slice(a);
@@ -2934,6 +2994,9 @@ fn q4_dispatch_tile(
                 "cuMemcpyHtoDAsync",
             )?;
             split_mark(&mut t, crate::prof::Q4P_H2D_ISSUE);
+            crate::prof::span_end(st.take(), crate::prof::SL_LIN_H2D);
+            // 表 C: 引数の組み立て + カーネル発行 (段の開始 = H2D を閉じた直後)
+            st = crate::prof::span_begin();
             let (mut pa, mut pn, mut ps, mut po) =
                 (dx.ptr(), gw.nib.ptr(), gw.sc.ptr(), dout.ptr());
             let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, n as c_int);
@@ -2987,6 +3050,10 @@ fn q4_dispatch_tile(
                 ctx.launch_async(ctx.f_mv_q4, grid, (256, 1, 1), 0, &mut args)?;
             }
             split_mark(&mut t, crate::prof::Q4P_KERNEL_LAUNCH);
+            // 表 C: 発行段の終わり (ここまでが launch、以降は D2H と待ち)
+            crate::prof::span_end(st.take(), crate::prof::SL_LIN_LAUNCH);
+            // 表 C: 出力 D2H の段は「発行の直前」から開く (sync 完了 + ホストコピーまで)
+            st = if st.is_none() { crate::prof::span_begin() } else { st };
             check(
                 (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
                 "cuMemcpyDtoHAsync",
@@ -2998,6 +3065,11 @@ fn q4_dispatch_tile(
         }
         out.copy_from_slice(&ho.as_slice::<f32>()[..m * n]);
         split_flush(&mut t);
+        // 表 C: 出力 D2H = 発行 + sync の完了待ち + ピン留め領域 → out のコピー。
+        // 待ち (`SL_LIN_SYNC`) は別に取らない — D2H の中に吸収される (排他の和を保つ)。
+        // `SL_LIN_SYNC` は表 C の行として予約されているが、q4 タイルでは常に 0 サンプル
+        // で、その分はこの行 (D2H) に含まれる (COVERAGE には 0 として出る)。
+        crate::prof::span_end(st, crate::prof::SL_LIN_D2H);
         Ok(())
     })
 }

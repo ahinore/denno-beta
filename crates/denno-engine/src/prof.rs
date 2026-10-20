@@ -218,12 +218,14 @@ pub const Q4P_HOST_COPY: usize = SPLIT_Q4_FIRST + 7;
 // ---------------------------------------------------------------------------
 /// 分割表の総数 (0 = decode chain, 1 = prefill の線形ラッパ)。
 /// 表を増やすときは `SPLIT_TABLES` の添字と `push_split_rows` の呼び出しを対で足す。
-pub const SPLIT_TABLES: usize = 2;
-/// 0 = decode chain (表 A) / 1 = prefill の線形ラッパ (表 B)
+pub const SPLIT_TABLES: usize = 3;
+/// 0 = decode chain (表 A) / 1 = prefill の線形ラッパ (表 B) / 2 = serve (q4) 経路 (表 C)
 pub const SPLIT_CHAIN_TABLE: usize = 0;
 pub const SPLIT_Q4_TABLE: usize = 1;
-/// 表 1 本の行数の最大値 (表 A = 9 行 / 表 B = 8 行)。積算器はこの本数で持つ。
-pub const SPLIT_ROWS: usize = SPLIT_CHAIN_ROWS;
+/// s148: serve (q4) 経路の表 C。行数は `SPLIT_SERVE_N` (一番多い 16 行)。
+pub const SPLIT_SERVE_TABLE: usize = 2;
+/// 表 1 本の行数の最大値 (表 C = 16 行 / 表 A = 9 行 / 表 B = 8 行)。積算器はこの本数で持つ。
+pub const SPLIT_ROWS: usize = SPLIT_SERVE_N;
 /// 積算器 (`split_flush_step` の `acc`) の本数 = 一番多い表の行数。
 /// s138 後半: 表 A が `chain_kernel` の 1 行を得て 9 行になったため、
 /// 「表ごとに行数が同じ」前提の `SPLIT_N` は廃止した (行数は `split_rows()`)。
@@ -470,6 +472,8 @@ static SPLIT_CALLS: [[[AtomicU64; SPLIT_ROWS]; SPLIT_TABLES]; Phase::N] =
 const SPLIT_WAIT_ROW: [usize; SPLIT_TABLES] = [
     CHAIN_SYNC_WAIT - SPLIT_CHAIN_FIRST,
     Q4P_SYNC_WAIT - SPLIT_Q4_FIRST,
+    // s148: 表 C は「待ち」を `sl_lin_sync` に明示的に積む (flush 経由の残余は無い)。
+    SL_LIN_SYNC - SPLIT_SERVE_FIRST,
 ];
 /// s138: 分割表 A (decode chain) の行名 (`SPLIT_CHAIN_FIRST + i`)。
 /// s140: `chain_cpu` / `chain_sync_resid` は 1 ステップ内で 1 か所からしか
@@ -498,6 +502,108 @@ const SPLIT_Q4_NAMES: [&str; SPLIT_Q4_N] = [
     "lin_d2h",
     "lin_sync_wait",
     "lin_host_copy",
+];
+
+/// s148 (Task B10・計測のみ): **serve (q4) 経路**の 1 ステップ / 1 線形呼び出しを
+/// 排他に割る表 (表 C)。s138 の表 A (`chain_*`) / 表 B (`lin_*`) は「q4 serve が
+/// 実際に通る関数」の内側に無く、27B q4 の実測では
+///   表 A … decode 1,602 step に対し 0 サンプル (chain は q4 で発火しない)
+///   表 B … prefill 608 call / 7,846 ms に対し 802 サンプル / 445.8 ms
+/// だった (どちらも wrapper の外側を数えている)。ここは **表 A / 表 B を置き換えず
+/// に並置する** 追加表で、本番経路の最も内側 (1 step に 1 回 / 1 call に 1 回) から
+/// 積む。既存バケット・既存表の値は 1 bit も動かさない (表示専用)。
+///
+/// 段はすべて「1 step (または 1 call) の中で互いに排他」で、合計がその step
+/// (または call) の壁時計になる。`sl_other` は「上記のどれにも当たらなかった
+/// 残余」で、必ず実測残余 (全体 − 既知段の和) を入れる — 何も測っていない穴が
+/// 0 ms として静かに通らないようにするため。
+pub const SPLIT_SERVE_N: usize = 16;
+/// 表 C の開始は表 B の末尾 (詰め直しをしない — 過去ログとの位置関係を保つ)。
+pub const SPLIT_SERVE_FIRST: usize = SPLIT_Q4_FIRST + SPLIT_Q4_N;
+/// decode 1 ステップの全体 (engine の step 入口 → forward 戻り)。サーバは
+/// `step_chat_batch` を呼ぶので 1 step = 1 サンプル。
+pub const SL_STEP: usize = SPLIT_SERVE_FIRST;
+/// forward 本体 (prompt 準備 = KV 容量確保を含む) のうち embed → 層ループ
+/// (投影 / attention / FFN) だけを除いた残余。
+pub const SL_STEP_PREP: usize = SPLIT_SERVE_FIRST + 1;
+/// 層ループの投影 (線形層) 呼び出し: q4 の GEMM/GEMV ディスパッチ入口から戻るまで。
+/// 内訳は下の `sl_lin_*` (排他)。
+pub const SL_LIN: usize = SPLIT_SERVE_FIRST + 2;
+/// 線形呼び出しのうち行列算カーネルの発行 (実行列算の時間は下の sync に寄る)。
+pub const SL_LIN_LAUNCH: usize = SPLIT_SERVE_FIRST + 3;
+/// 線形呼び出しのうちホスト同期待ち (cuCtxSynchronize = カーネル実行 + 転送完了)。
+pub const SL_LIN_SYNC: usize = SPLIT_SERVE_FIRST + 4;
+/// 線形呼び出しのうち活性化の H2D (ピン留め staging copy + 発行)。
+pub const SL_LIN_H2D: usize = SPLIT_SERVE_FIRST + 5;
+/// 線形呼び出しのうち出力 D2H (発行 + ピン留め領域 → 呼び出し側バッファのコピー)。
+pub const SL_LIN_D2H: usize = SPLIT_SERVE_FIRST + 6;
+/// 線形呼び出しのうち出力領域の確保 (`vec![0.0; m*n]` / scratch の grow)。
+pub const SL_LIN_OUTALLOC: usize = SPLIT_SERVE_FIRST + 7;
+/// 線形呼び出しのうち量子化・準備 (Q4 は量子化しない = ほぼ 0)。
+pub const SL_LIN_QUANT: usize = SPLIT_SERVE_FIRST + 8;
+/// 線形呼び出しのうち残余 (上記のどれにも当たらない時間)。
+pub const SL_LIN_OTHER: usize = SPLIT_SERVE_FIRST + 9;
+/// 層ループの投影以外 (rmsnorm / attention コア / swiglu / GDN スキャン / 残差)。
+pub const SL_STEP_LAYERS_OTHER: usize = SPLIT_SERVE_FIRST + 10;
+/// 最終 norm + lm_head (logits をホストへ戻す前まで)。
+pub const SL_STEP_FINAL: usize = SPLIT_SERVE_FIRST + 11;
+/// ステップ末尾の logits D2H (sync 待ちで GPU の全処理完了を吸収する)。
+pub const SL_STEP_LOGITS_D2H: usize = SPLIT_SERVE_FIRST + 12;
+/// サンプラ (penalty / 拘束マスクを含む sample の呼び出し)。
+pub const SL_STEP_SAMPLER: usize = SPLIT_SERVE_FIRST + 13;
+/// detok (差分テキストの生成。qwen35 は KV/状態の D2H を持たない)。
+pub const SL_STEP_DETOK: usize = SPLIT_SERVE_FIRST + 14;
+/// ステップの残余 (上記のどれにも当たらない時間 = 未帰属)。
+pub const SL_STEP_OTHER: usize = SPLIT_SERVE_FIRST + 15;
+
+/// 表 C の行名 (`SPLIT_SERVE_FIRST + i`)。並びは id の並びと一致させる。
+const SPLIT_SERVE_NAMES: [&str; SPLIT_SERVE_N] = [
+    "sl_step",
+    "sl_step_prep",
+    "sl_lin",
+    "sl_lin_launch",
+    "sl_lin_sync",
+    "sl_lin_h2d",
+    "sl_lin_d2h",
+    "sl_lin_outalloc",
+    "sl_lin_quant",
+    "sl_lin_other",
+    "sl_step_lay_other",
+    "sl_step_final",
+    "sl_step_logits_d2h",
+    "sl_step_sampler",
+    "sl_step_detok",
+    "sl_step_other",
+];
+
+/// s148: 表 C の「全体」行と「内訳」行 (排他な内訳の和が全体になる組)。
+/// `(全体, [内訳…])` — COVERAGE が両者の差を必ず出す。
+const SL_GROUPS: [(usize, &[usize]); 2] = [
+    (
+        SL_STEP,
+        &[
+            SL_STEP_PREP,
+            SL_LIN,
+            SL_STEP_LAYERS_OTHER,
+            SL_STEP_FINAL,
+            SL_STEP_LOGITS_D2H,
+            SL_STEP_SAMPLER,
+            SL_STEP_DETOK,
+            SL_STEP_OTHER,
+        ],
+    ),
+    (
+        SL_LIN,
+        &[
+            SL_LIN_LAUNCH,
+            SL_LIN_SYNC,
+            SL_LIN_H2D,
+            SL_LIN_D2H,
+            SL_LIN_OUTALLOC,
+            SL_LIN_QUANT,
+            SL_LIN_OTHER,
+        ],
+    ),
 ];
 
 static ON: OnceLock<bool> = OnceLock::new();
@@ -1133,6 +1239,8 @@ pub fn split_slot(op: usize) -> Option<(usize, usize)> {
         Some((SPLIT_CHAIN_TABLE, op - SPLIT_CHAIN_FIRST))
     } else if (SPLIT_Q4_FIRST..SPLIT_Q4_FIRST + SPLIT_Q4_N).contains(&op) {
         Some((SPLIT_Q4_TABLE, op - SPLIT_Q4_FIRST))
+    } else if (SPLIT_SERVE_FIRST..SPLIT_SERVE_FIRST + SPLIT_SERVE_N).contains(&op) {
+        Some((SPLIT_SERVE_TABLE, op - SPLIT_SERVE_FIRST))
     } else {
         None
     }
@@ -1167,6 +1275,248 @@ pub fn split_on() -> bool {
     enabled() || crate::telemetry_on()
 }
 
+// ---------------------------------------------------------------------------
+// s148 (Task B10・計測のみ): serve (q4) 経路の表 C の会計
+//
+// 使い方は 3 段。どれも `on` が偽なら時刻を読まず・確保もせず・表にも書かない
+// (`span_begin` は `None` を返し、`span_end` / `push` は 1 分岐で戻る):
+//
+//   1. ステップ全体: `let st = step_begin(); ... ; step_end(st);`
+//      → `sl_step` に 1 サンプル (1 step = 1 サンプル)。
+//   2. ステップ内の区間: `let s = span_begin(SL_...); ...; span_end(s);`
+//      → 閉じた区間を 1 サンプルとして積む (区間は呼び出し側が排他に保つ)。
+//   3. ステップ末尾: `push(SL_STEP_OTHER, 残余 ns)` + `close_table(SPLIT_SERVE_TABLE)`
+//      → 残余を明示し、「内訳の和 ≠ 全体」を `step_gap` で次回以降に見せる。
+//
+// **どの生 id・D2H 細分・attn 細分・表 A / 表 B にも合算しない** (表示専用)。
+// ---------------------------------------------------------------------------
+
+/// s148: 表 C の計時を行うか (表 A / 表 B と同じゲート)。
+#[inline]
+pub fn serve_on() -> bool {
+    enabled() || crate::telemetry_on()
+}
+
+/// s148: 表 C に 1 区間を積む。`calls` は「この区間が起きた回数」(ステップ由来の
+/// 段は 1、線形呼び出し由来の段は 1)。表 C の行でない id は無視する。
+#[inline]
+pub fn push(op: usize, ns: u64, calls: u64) {
+    if !serve_on() {
+        return;
+    }
+    let Some((SPLIT_SERVE_TABLE, r)) = split_slot(op) else {
+        return;
+    };
+    let pi = phase().idx();
+    SPLIT_NS[pi][SPLIT_SERVE_TABLE][r].fetch_add(ns, Ordering::Relaxed);
+    SPLIT_NS[Phase::Both.idx()][SPLIT_SERVE_TABLE][r].fetch_add(ns, Ordering::Relaxed);
+    if calls > 0 {
+        SPLIT_CALLS[pi][SPLIT_SERVE_TABLE][r].fetch_add(calls, Ordering::Relaxed);
+        SPLIT_CALLS[Phase::Both.idx()][SPLIT_SERVE_TABLE][r].fetch_add(calls, Ordering::Relaxed);
+    }
+}
+
+/// s148: 区間の開始 tick (計測 OFF は `None`)。呼び出し側は戻り値をそのまま
+/// `span_end` / `fn_end` に渡す。
+#[inline]
+pub fn span_begin() -> Option<Instant> {
+    if serve_on() {
+        Some(Instant::now())
+    } else {
+        None
+    }
+}
+
+/// s148: 区間の終了を `op` に積む (1 サンプル)。`None` は素通し。
+#[inline]
+pub fn span_end(t: Option<Instant>, op: usize) {
+    if let Some(t0) = t {
+        push(op, t0.elapsed().as_nanos() as u64, 1);
+    }
+}
+
+/// s148: 1 ステップ分の開始 (表 C の `sl_step` の tick)。戻り値の 2 番目は
+/// 「その時点で積まれていた内訳の和」— サーバは複数セッションを交互に 1 歩ずつ
+/// 進めるため、あるステップの壁時計には別セッションの区間が重なる。終端で
+/// 「自分が積んだ分」だけを引くための基準として使う。計測 OFF は `None`。
+#[inline]
+pub fn step_begin() -> Option<(Instant, u64)> {
+    if !serve_on() {
+        return None;
+    }
+    split_step_begin();
+    let now = Instant::now();
+    let payload = SL_GROUPS[0]
+        .1
+        .iter()
+        .map(|&op| serve_row_ns(phase().idx(), op))
+        .sum();
+    Some((now, payload))
+}
+
+/// s148: 1 ステップ分の終了。`sl_step` に 1 サンプル積み、内訳で説明できなかった
+/// 分を `sl_step_other` へ**必ず**入れる (未帰属が 0 ms として静かに通らない)。
+/// `None` は素通し (計測 OFF は時刻も読まない)。
+#[inline]
+pub fn step_end(st: Option<(Instant, u64)>) {
+    let Some((t0, payload0)) = st else { return };
+    let ns = t0.elapsed().as_nanos() as u64;
+    push(SL_STEP, ns, 1);
+    let p = phase().idx();
+    let payload1: u64 = SL_GROUPS[0]
+        .1
+        .iter()
+        .map(|&op| serve_row_ns(p, op))
+        .sum();
+    let own = payload1.saturating_sub(payload0);
+    push(SL_STEP_OTHER, ns.saturating_sub(own), 1);
+}
+
+/// s148: 表 C の `whole` 行と、その内訳の和との差 (ns)。負 (内訳が全体を超える =
+/// 区間の切り方の誤り) は 0 にして「穴」だけを見せる。
+#[inline]
+pub fn step_gap(whole: usize) -> u64 {
+    let p = phase().idx();
+    let total = serve_row_ns(p, whole);
+    let Some((_, parts)) = SL_GROUPS.iter().find(|(w, _)| *w == whole) else {
+        return 0;
+    };
+    let sum: u64 = parts.iter().map(|&op| serve_row_ns(p, op)).sum();
+    total.saturating_sub(sum)
+}
+
+/// s148: 表 C の 1 行の累積 ns (フェーズ別)。
+#[inline]
+pub fn serve_row_ns(p: usize, op: usize) -> u64 {
+    match split_slot(op) {
+        Some((SPLIT_SERVE_TABLE, r)) => SPLIT_NS[p][SPLIT_SERVE_TABLE][r].load(Ordering::Relaxed),
+        _ => 0,
+    }
+}
+
+/// s148: 表 C の 1 行の累積サンプル数 (フェーズ別)。
+#[inline]
+pub fn serve_row_calls(p: usize, op: usize) -> u64 {
+    match split_slot(op) {
+        Some((SPLIT_SERVE_TABLE, r)) => {
+            SPLIT_CALLS[p][SPLIT_SERVE_TABLE][r].load(Ordering::Relaxed)
+        }
+        _ => 0,
+    }
+}
+
+/// s148: 1 ステップ分の区間分けを開いた回数 (COVERAGE の「何 step の内訳を
+/// 実際に分割できたか」)。ステップ全体 (`step_begin`) とは独立に数える —
+/// 分割の付け漏れはここが全体より小さくなるので見える。
+static SL_SPLIT_STEPS: AtomicU64 = AtomicU64::new(0);
+
+/// s148: 分割を開いたステップ数を 1 つ数える (`step_begin` が呼ぶ)。
+#[inline]
+pub fn split_step_begin() {
+    if serve_on() {
+        SL_SPLIT_STEPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// s148: 分割を開いたステップ数。
+pub fn split_step_count() -> u64 {
+    SL_SPLIT_STEPS.load(Ordering::Relaxed)
+}
+
+/// s148: 1 本の HTTP リクエストの壁時計 (ns)。サーバのハンドラが要求の入口から
+/// 出口までを 1 回だけ積む。COVERAGE が「プロファイルの和 / リクエストの壁時計」
+/// を出すための分母で、テレメトリでは数えない (リクエスト単位の観測のみ)。
+static REQ_NS: AtomicU64 = AtomicU64::new(0);
+static REQ_N: AtomicU64 = AtomicU64::new(0);
+
+/// s148: 1 リクエスト分の壁時計を積む。
+#[inline]
+pub fn add_request_wall(ns: u64) {
+    if enabled() {
+        REQ_NS.fetch_add(ns, Ordering::Relaxed);
+        REQ_N.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// s148: (リクエスト本数, 壁時計の和 ns)。
+pub fn request_wall() -> (u64, u64) {
+    (
+        REQ_N.load(Ordering::Relaxed),
+        REQ_NS.load(Ordering::Relaxed),
+    )
+}
+
+/// s148: decode のステップ数 (バケットの最大 call 数 = ヘッダと同じ定義)。
+pub fn decode_steps(p: usize) -> u64 {
+    let mut n = 0u64;
+    for i in 0..N_OPS {
+        n = n.max(CALLS[p][i].load(Ordering::Relaxed));
+    }
+    n
+}
+
+/// s148: 表の添字 → フェーズ (Both は Prefill として扱う = 期待値は prefill 側)。
+fn phase_for(p: usize) -> Phase {
+    if p == Phase::Decode.idx() {
+        Phase::Decode
+    } else {
+        Phase::Prefill
+    }
+}
+
+/// s148: **実 q4 ディスパッチの call 数** (表 C の線形行の分母)。`lin_stage` の
+/// ように wrapper で数えるのではなく、`maybe_gpu_linear_q4_into` の入口
+/// (= 本番サーバが実際に通る唯一の q4 線形入口) で数える。
+///
+/// s148 追記: ここは 1 本のカウンタで、`phase()` が `Both` でも **1 回だけ** 加算する
+/// (`Both` 行が事前に埋まっている状態で `Both` にもう一度足すと、この行だけ 2 倍に
+/// なる — `denno-server` のビルドでは `#[cfg(test)]` の上書きが無く、`Both` は
+/// 実際に `Prefill` / `Decode` から作られる行なので、二重加算は起きない)。
+static LIN_DISPATCH_CALLS: [[AtomicU64; 2]; Phase::N] = mk_counters::<2>();
+
+/// s148: 実 q4 ディスパッチ入口を 1 回通ったことを数える (計測 ON のみ)。
+#[inline]
+pub fn count_lin_dispatch() {
+    if serve_on() {
+        LIN_DISPATCH_CALLS[phase().idx()][0].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// s148: 実 q4 ディスパッチの call 数 (フェーズ別)。`Both` (累積) は
+/// `Prefill` / `Decode` の和として引く (行を二重に持たない)。
+pub fn lin_dispatch_calls(phase: Phase) -> u64 {
+    match phase {
+        Phase::Both => lin_dispatch_calls(Phase::Prefill) + lin_dispatch_calls(Phase::Decode),
+        _ => LIN_DISPATCH_CALLS[phase.idx()][0].load(Ordering::Relaxed),
+    }
+}
+
+/// s148: 表 C の「1 step あたり / 1 call あたりの期待値」(COVERAGE の分母)。
+/// 戻り値は `(表, 行, 期待サンプル数, 期待の名前)`。期待値は **実測の駆動件数**
+/// (decode はステップ数、線形は実 q4 ディスパッチの call 数) で、行が 0 サンプル
+/// なのに期待が 1 以上なら COVERAGE MISS として出す。
+pub fn serve_expected(p: usize) -> Vec<(usize, usize, u64, &'static str)> {
+    let steps = decode_steps(p);
+    let lin = lin_dispatch_calls(phase_for(p));
+    vec![
+        (SPLIT_SERVE_TABLE, SL_STEP, steps, "steps"),
+        (SPLIT_SERVE_TABLE, SL_STEP_PREP, steps, "steps"),
+        (SPLIT_SERVE_TABLE, SL_LIN, lin, "lin calls"),
+        (SPLIT_SERVE_TABLE, SL_STEP_FINAL, steps, "steps"),
+        // `SL_STEP_LOGITS_D2H` はこの一覧に入れない: q4 serve の logits D2H は
+        // `logits()` の内側 (final 段) で起き、独立した区間としては存在しない
+        // (= 行は予約のまま 0 サンプル。予約を消すと過去ログの id がずれる)。
+        (SPLIT_SERVE_TABLE, SL_STEP_SAMPLER, steps, "steps"),
+    ]
+}
+
+/// s148: 表 C の 1 行の表示名 (`SL_` の id から引く)。
+pub fn serve_row_name(op: usize) -> Option<&'static str> {
+    split_row_name(SPLIT_SERVE_TABLE, op - SPLIT_SERVE_FIRST).filter(|_| {
+        (SPLIT_SERVE_FIRST..SPLIT_SERVE_FIRST + SPLIT_SERVE_N).contains(&op)
+    })
+}
+
 /// s138 (Task B6): 1 ステップ分の分割を表へ流し込む。`acc` はそのステップの
 /// 各段の秒数 (呼び出し側の積算器 = cuda.rs の `CHAIN_ACC`)。`steps` は「この分割が何ステップ分か」
 /// (decode は 1)。**表示専用**。
@@ -1188,11 +1538,10 @@ pub fn split_flush_step(
         return;
     }
     let pi = phase().idx();
-    let rows = if table == SPLIT_CHAIN_TABLE {
-        SPLIT_CHAIN_ROWS
-    } else {
-        SPLIT_Q4_N
-    };
+    let rows = split_rows(table);
+    if rows == 0 {
+        return;
+    }
     for (i, &secs) in acc.iter().enumerate().take(rows) {
         if secs <= 0.0 {
             continue;
@@ -1244,6 +1593,13 @@ pub fn reset() {
         }
         for t in 0..TICK_CALLS.len() {
             TICK_CALLS[t].store(0, Ordering::Relaxed);
+        }
+        // s148: 表 C の分母 (実ディスパッチ件数)・分割ステップ数・リクエスト壁時計
+        LIN_DISPATCH_CALLS[p][0].store(0, Ordering::Relaxed);
+        if p == Phase::Prefill.idx() {
+            SL_SPLIT_STEPS.store(0, Ordering::Relaxed);
+            REQ_NS.store(0, Ordering::Relaxed);
+            REQ_N.store(0, Ordering::Relaxed);
         }
         for i in 0..D2H_N {
             D2H_SUB_NS[p][i].store(0, Ordering::Relaxed);
@@ -1575,11 +1931,7 @@ fn push_split_rows(p: usize, table: usize, total: u64, indent: &str, s: &mut Str
     if table >= SPLIT_TABLES {
         return;
     }
-    let n_rows = if table == SPLIT_CHAIN_TABLE {
-        SPLIT_CHAIN_ROWS
-    } else {
-        SPLIT_Q4_N
-    };
+    let n_rows = split_rows(table);
     let mut sum = 0u64;
     for i in 0..n_rows {
         // 行名は表ごとに行数が違うので、行数で switch せず `names()` を引く。
@@ -1621,19 +1973,23 @@ pub fn split_row_name(table: usize, row: usize) -> Option<&'static str> {
         Some(SPLIT_CHAIN_NAMES[row])
     } else if table == SPLIT_Q4_TABLE && row < SPLIT_Q4_N {
         Some(SPLIT_Q4_NAMES[row])
+    } else if table == SPLIT_SERVE_TABLE && row < SPLIT_SERVE_N {
+        Some(SPLIT_SERVE_NAMES[row])
     } else {
         None
     }
 }
 
-/// s138 (Task B6): 表 `table` の行数 (表 A = 9 / 表 B = 8)。表示側とテストが
-/// 「その表に何行あるか」を 1 か所から引くためのもの (行数で分岐を散らかさない)。
+/// s138 (Task B6): 表 `table` の行数 (表 A = 9 / 表 B = 8 / 表 C = 16)。表示側と
+/// テストが「その表に何行あるか」を 1 か所から引くためのもの (行数で分岐を散らかさない)。
 #[inline]
 pub fn split_rows(table: usize) -> usize {
     if table == SPLIT_CHAIN_TABLE {
         SPLIT_CHAIN_ROWS
     } else if table == SPLIT_Q4_TABLE {
         SPLIT_Q4_N
+    } else if table == SPLIT_SERVE_TABLE {
+        SPLIT_SERVE_N
     } else {
         0
     }
@@ -1804,6 +2160,124 @@ fn push_sample_header(p: usize, s: &mut String) {
         split_sample_count(Phase::Prefill, SPLIT_Q4_TABLE),
         split_tick_count(SPLIT_Q4_TABLE),
     ));
+    // s148: COVERAGE は summary の**末尾**に出す (ヘッダに足すと、`[prefill]` /
+    // `[decode]` で節を切って読む既存の読み手・テストが節の切れ目を取り違える)。
+    // ここは分割表の後ろなので、節の見出し行は増えない。
+}
+
+/// s148 (Task B10): 1 行目 (steps / lin calls / リクエスト壁時計) を前置する
+/// COVERAGE 節。`p` のフェーズの表 C の行を見る。
+fn push_coverage(phase: Phase, s: &mut String) {
+    push_coverage_for(phase.idx(), s);
+}
+
+/// s148: **COVERAGE 行**。表 C (serve/q4 経路) の各段について
+/// 「サンプル数 / 期待サンプル数」と「帰属 ms / リクエストの壁時計」を出し、
+/// 期待があるのにサンプルが 0 の段は `COVERAGE MISS` と明示する。
+///
+/// 動機 (27B q4 の実測): decode の表は 120 token で 960.9 ms (= 8.0 ms/token) なのに
+/// リクエストの壁時計は約 108 ms/token で、85% がどの行にも入っていなかった。
+/// しかも `decode steps 1602 / chain split 0` と「0 サンプル」がヘッダに並んで
+/// いたのに、それが計測の穴だとは読めなかった。ここでは
+///   (1) 必ず一致すべき 2 組 (steps = サンプル / 線形 call = サンプル) を 1 行で並べ、
+///   (2) 各段の「サンプル vs 期待」と「ms vs リクエストの壁時計」を出し、
+///   (3) サンプル 0 で期待 > 0 の段を `COVERAGE MISS` として名指しする。
+fn push_coverage_for(p: usize, s: &mut String) {
+    let phase_name = Phase::NAMES[p];
+    let steps = decode_steps(p);
+    // 線形の期待は「そのフェーズで実際に起きた q4 ディスパッチ数」(表 C の
+    // 線形行は同じフェーズに積まれるので、分母もフェーズを揃える)。
+    let lin = lin_dispatch_calls(phase_for(p));
+    let step_samples = serve_row_calls(p, SL_STEP);
+    let lin_samples = serve_row_calls(p, SL_LIN);
+    let (req_n, req_ns) = request_wall();
+    // 必ず一致すべき 2 組 (この 1 行だけで突き合わせられるようにする)
+    let steps_ok = steps == step_samples;
+    let lin_ok = lin == lin_samples;
+    s.push_str(&format!(
+        "  COVERAGE [{phase_name}]: steps {} / samples {} [{}] | lin calls {} / samples {} [{}] | \
+         split steps {} | requests {} wall {:.1} ms\n",
+        steps,
+        step_samples,
+        if steps_ok { "ok" } else { "COVERAGE MISS" },
+        lin,
+        lin_samples,
+        if lin_ok { "ok" } else { "COVERAGE MISS" },
+        split_step_count(),
+        req_n,
+        req_ns as f64 / 1e6,
+    ));
+    // 段ごとのサンプルと帰属 ms。分母は「期待サンプル数」と「リクエストの壁時計」。
+    s.push_str(&format!(
+        "  COVERAGE {:<18} {:>9} {:>9} {:>7} {:>10} {:>9}\n",
+        "bucket", "samples", "expected", "of", "ms", "pct wall"
+    ));
+    let mut misses: Vec<&'static str> = Vec::new();
+    for (_, row, exp, exp_name) in serve_expected(p) {
+        let name = split_row_name(SPLIT_SERVE_TABLE, row - SPLIT_SERVE_FIRST).unwrap_or("?");
+        let op = SPLIT_SERVE_FIRST + row;
+        let n = serve_row_calls(p, op);
+        let ms = serve_row_ns(p, op) as f64 / 1e6;
+        let pct = if req_ns > 0 {
+            serve_row_ns(p, op) as f64 / req_ns as f64 * 100.0
+        } else {
+            0.0
+        };
+        if n == 0 && exp > 0 {
+            misses.push(name);
+        }
+        s.push_str(&format!(
+            "  COVERAGE {:<18} {:>9} {:>9} {:>7} {:>10.1} {:>8.1}%\n",
+            name, n, exp, exp_name, ms, pct
+        ));
+    }
+    // 残余 (どの段にも入らなかった ms) と、全体 − 内訳の差
+    let step_ns = serve_row_ns(p, SL_STEP);
+    let step_other = serve_row_ns(p, SL_STEP_OTHER);
+    let lin_ns = serve_row_ns(p, SL_LIN);
+    let lin_other = serve_row_ns(p, SL_LIN_OTHER);
+    let gap_step = step_gap(SL_STEP);
+    let gap_lin = step_gap(SL_LIN);
+    s.push_str(&format!(
+        "  COVERAGE {:<18} {:>9} {:>9} {:>7} {:>10.1} {:>8.1}%\n",
+        "sl_step_other",
+        serve_row_calls(p, SL_STEP_OTHER),
+        "-",
+        "-",
+        step_other as f64 / 1e6,
+        if req_ns > 0 { step_other as f64 / req_ns as f64 * 100.0 } else { 0.0 }
+    ));
+    s.push_str(&format!(
+        "  COVERAGE {:<18} {:>9} {:>9} {:>7} {:>10.1} {:>8.1}%\n",
+        "sl_lin_other",
+        serve_row_calls(p, SL_LIN_OTHER),
+        "-",
+        "-",
+        lin_other as f64 / 1e6,
+        if req_ns > 0 { lin_other as f64 / req_ns as f64 * 100.0 } else { 0.0 }
+    ));
+    s.push_str(&format!(
+        "  COVERAGE accounted {:.1} ms of wall {:.1} ms ({:.1} pct) | \
+         gaps: step {:.1} ms, lin {:.1} ms\n",
+        (step_ns + lin_ns) as f64 / 1e6,
+        req_ns as f64 / 1e6,
+        if req_ns > 0 {
+            (step_ns + lin_ns) as f64 / req_ns as f64 * 100.0
+        } else {
+            0.0
+        },
+        gap_step as f64 / 1e6,
+        gap_lin as f64 / 1e6,
+    ));
+    if misses.is_empty() {
+        s.push_str("  COVERAGE status: all buckets have samples\n");
+    } else {
+        s.push_str(&format!(
+            "  COVERAGE status: COVERAGE MISS in {} bucket(s): {}\n",
+            misses.len(),
+            misses.join(", ")
+        ));
+    }
 }
 
 /// s138 (Task B6): フェーズ節の最後に置く分割表。prefill は線形ラッパ (表 B)、
@@ -1960,7 +2434,90 @@ pub fn summary() -> String {
     // 読み、「どの段が何 ms か」だけを見る。
     push_split_section(Phase::Prefill, &mut s);
     push_split_section(Phase::Decode, &mut s);
+    // s148 (Task B10): serve (q4) 経路の表 C。段は 1 step / 1 call で排他なので
+    // 合計がその step の壁時計になる。prefill の節に 1 本だけ出す (decode の
+    // step は同じ表の別フェーズに積まれるが、段の意味は共通)。
+    push_serve_section(Phase::Prefill, &mut s);
+    push_serve_section(Phase::Decode, &mut s);
+    // s148: COVERAGE は **両フェーズ** に出す (summary の末尾 = 既存の節の切れ目を
+    // 動かさない位置)。q4 serve の decode step は decode 表に積まれるので、prefill 側
+    // だけ出すと decode の穴がそのまま隠れる (「steps 0 / samples 0 [ok]」だけが
+    // 並んで MISS が見えない状態を実際に踏んだ)。
+    push_coverage(Phase::Prefill, &mut s);
+    push_coverage(Phase::Decode, &mut s);
     s
+}
+
+/// s148 (Task B10): 表 C (serve/q4 経路) の節。`sl_step` (1 step の全体) の
+/// サンプル数と、その内訳 (`sl_lin` = 投影の全体、`sl_step_other` = 残余) を
+/// 「ms / calls / ms per step」で出す。内訳の和が全体に足りない分は
+/// `unattributed` 行として**必ず**出す (0 でも行を消さない — 消すと穴が見えなくなる)。
+fn push_serve_section(phase: Phase, s: &mut String) {
+    let p = phase.idx();
+    let total_calls = serve_row_calls(p, SL_STEP);
+    if total_calls == 0 && serve_row_calls(p, SL_LIN) == 0 {
+        return;
+    }
+    let total_ns = serve_row_ns(p, SL_STEP);
+    let per = |ns: u64| {
+        if total_calls > 0 {
+            ns as f64 / total_calls as f64 / 1e6
+        } else {
+            0.0
+        }
+    };
+    s.push_str(&format!(
+        "  SPLIT SERVE ({}, q4 serve path; calls = steps for sl_step / calls for sl_lin)\n",
+        Phase::NAMES[p]
+    ));
+    s.push_str(&format!(
+        "  {:<18} {:>10} {:>8} {:>7} {:>12}\n",
+        "segment", "ms", "calls", "share", "ms/step"
+    ));
+    for row in 0..SPLIT_SERVE_N {
+        let op = SPLIT_SERVE_FIRST + row;
+        let ns = serve_row_ns(p, op);
+        let calls = serve_row_calls(p, op);
+        if ns == 0 && calls == 0 {
+            continue;
+        }
+        let name = split_row_name(SPLIT_SERVE_TABLE, row).unwrap_or("?");
+        s.push_str(&format!(
+            "  {:<18} {:>10.1} {:>8} {:>6.1}% {:>12.3}\n",
+            name,
+            ns as f64 / 1e6,
+            calls,
+            if total_ns > 0 {
+                ns as f64 / total_ns as f64 * 100.0
+            } else {
+                0.0
+            },
+            per(ns)
+        ));
+    }
+    // 内訳の和が全体に届かない分は「未帰属」として明示する (0 でも出す)。
+    let gap_step = step_gap(SL_STEP);
+    let gap_lin = step_gap(SL_LIN);
+    s.push_str(&format!(
+        "  {:<18} {:>10.1} {:>8} {:>7} {:>12.3}\n",
+        "unattributed step",
+        gap_step as f64 / 1e6,
+        total_calls,
+        "-",
+        per(gap_step)
+    ));
+    s.push_str(&format!(
+        "  {:<18} {:>10.1} {:>8} {:>7} {:>12.3}\n",
+        "unattributed lin",
+        gap_lin as f64 / 1e6,
+        serve_row_calls(p, SL_LIN),
+        "-",
+        if serve_row_calls(p, SL_LIN) > 0 {
+            gap_lin as f64 / serve_row_calls(p, SL_LIN) as f64 / 1e6
+        } else {
+            0.0
+        }
+    ));
 }
 
 #[cfg(test)]
@@ -2242,9 +2799,27 @@ mod tests {
         assert_eq!(SPLIT_CHAIN_ROWS, SPLIT_CHAIN_NAMES.len());
         assert_eq!(SPLIT_Q4_N, SPLIT_Q4_NAMES.len());
         assert_eq!(SPLIT_Q4_FIRST, SPLIT_CHAIN_FIRST + SPLIT_CHAIN_ROWS);
-        // 積算器は一番多い表 (A = 9 行) の本数で確保する
-        assert_eq!(SPLIT_ROWS, SPLIT_CHAIN_ROWS.max(SPLIT_Q4_N));
+        // s148 (Task B10): 表 C (serve/q4 経路) は表 B の末尾に並置する (詰め直しを
+        // しない — 過去ログの id 位置を保つ)。行数は `SPLIT_SERVE_N` 16。
+        assert_eq!(SPLIT_SERVE_FIRST, SPLIT_Q4_FIRST + SPLIT_Q4_N);
+        assert_eq!(SPLIT_SERVE_N, SPLIT_SERVE_NAMES.len());
+        // 積算器は**一番多い表**の本数で確保する (s148: 表 C = 16 行が最大)。
+        // 「表 A の本数」ではなく「3 表の最大」であることが本当の不変条件。
+        assert_eq!(
+            SPLIT_ROWS,
+            SPLIT_CHAIN_ROWS.max(SPLIT_Q4_N).max(SPLIT_SERVE_N),
+            "積算器の本数は 3 表の最大でなければならない"
+        );
         assert!(SPLIT_ROWS >= SPLIT_CHAIN_ROWS && SPLIT_ROWS >= SPLIT_Q4_N);
+        assert!(SPLIT_ROWS >= SPLIT_SERVE_N);
+        // どの表の行数も積算器の本数を超えない (acc の添字が必ず入る)
+        for t in 0..SPLIT_TABLES {
+            assert!(
+                split_rows(t) <= SPLIT_ROWS,
+                "表 {t} の行数 {} が積算器の本数 {SPLIT_ROWS} を超える",
+                split_rows(t)
+            );
+        }
         for i in 0..SPLIT_CHAIN_ROWS {
             let a = SPLIT_CHAIN_FIRST + i;
             assert!(a >= N_OPS, "生 id の範囲外: {a}");
@@ -2257,11 +2832,27 @@ mod tests {
         for i in 0..SPLIT_Q4_N {
             let b = SPLIT_Q4_FIRST + i;
             assert!(b >= N_OPS, "生 id の範囲外: {b}");
+            assert!(b < SPLIT_SERVE_FIRST, "表 B と表 C の範囲が交差: {b}");
             assert_eq!(split_slot(b), Some((SPLIT_Q4_TABLE, i)));
         }
-        // 表 A の末尾の次が表 B の先頭 (間が空かない) / 表 B の次は範囲外
+        // s148: 表 C (serve/q4 経路) の 16 行も (表 C, i) へ畳まれる
+        for i in 0..SPLIT_SERVE_N {
+            let c = SPLIT_SERVE_FIRST + i;
+            assert!(c >= N_OPS, "生 id の範囲外: {c}");
+            assert_eq!(split_slot(c), Some((SPLIT_SERVE_TABLE, i)), "表 C の行 {i} が折れない");
+            assert_eq!(split_row_name(SPLIT_SERVE_TABLE, i), Some(SPLIT_SERVE_NAMES[i]));
+            assert_eq!(split_rows(SPLIT_SERVE_TABLE), SPLIT_SERVE_N);
+        }
+        assert_eq!(split_row_name(SPLIT_SERVE_TABLE, SPLIT_SERVE_N), None);
+        // 表 A / B / C の隣接: 表の末尾の次が次の表の先頭 (間が空かない) /
+        // 一番後ろの表 (C) の次だけが範囲外
         assert_eq!(split_slot(SPLIT_Q4_FIRST - 1), Some((SPLIT_CHAIN_TABLE, SPLIT_CHAIN_ROWS - 1)));
-        assert_eq!(split_slot(SPLIT_Q4_FIRST + SPLIT_Q4_N), None);
+        assert_eq!(split_slot(SPLIT_SERVE_FIRST - 1), Some((SPLIT_Q4_TABLE, SPLIT_Q4_N - 1)));
+        assert_eq!(split_slot(SPLIT_SERVE_FIRST + SPLIT_SERVE_N), None);
+        // 3 表の id 範囲は互いに交差しない (連番で隙間も重なりも無い)
+        assert!(SPLIT_CHAIN_FIRST + SPLIT_CHAIN_ROWS == SPLIT_Q4_FIRST);
+        assert!(SPLIT_Q4_FIRST + SPLIT_Q4_N == SPLIT_SERVE_FIRST);
+        assert!(SPLIT_SERVE_FIRST >= D2H_GDN_PROJ_FIRST + D2H_GDN_PROJ_N);
         // 生 id・D2H 細分・既存細分の id は split_slot の範囲外 (誤って積まない)
         for op in (0..N_OPS).chain([
             D2H_LOGITS,
@@ -2391,8 +2982,19 @@ mod tests {
             // 生 id は分割表に入らない
             split_sample(QKV, 1_000, 1);
             split_sample(GATE_UP, 1_000, 1);
-            // 表 A の終端より先 / 表 B の終端より先
-            split_sample(SPLIT_Q4_FIRST + SPLIT_Q4_N, 1_000, 1);
+            // 表 A の終端より先 (表 A の終端 + 1 = 表 B の先頭だが、次の表の外側の id として追加済み)
+            // s148: 表 C ができたので、表 B の終端 (= 表 C の先頭) は「範囲外」では
+            // なくなった。本当に全表の外にある id で確かめる (表 C の終端 + 1)。
+            let outside = SPLIT_SERVE_FIRST + SPLIT_SERVE_N + 1;
+            assert_eq!(outside, SPLIT_SERVE_FIRST + SPLIT_SERVE_N + 1);
+            assert_eq!(split_slot(outside), None, "probe id がどの表にも入ってはいけない");
+            // 表 C の先頭と終端も表に入る (probe が「表の外」であることの対照)
+            assert_eq!(split_slot(SPLIT_SERVE_FIRST), Some((SPLIT_SERVE_TABLE, 0)));
+            assert_eq!(
+                split_slot(SPLIT_SERVE_FIRST + SPLIT_SERVE_N - 1),
+                Some((SPLIT_SERVE_TABLE, SPLIT_SERVE_N - 1))
+            );
+            split_sample(outside, 1_000, 1);
             for t in 0..SPLIT_TABLES {
                 for i in 0..SPLIT_ROWS {
                     assert_eq!(
@@ -2607,7 +3209,13 @@ mod tests {
             assert!(!pre.contains("chain_launch"));
             // 3) 表示専用: decode の TOTAL は self の和のまま (分割表を足し込まない)。
             //    並走テストの値が混ざるので、TOTAL = 行の self の和 を確かめる。
+            // s148: 末尾に SPLIT SERVE (decode) の節も `[decode]` として現れるので、
+            // 本体の decode 節は「最後の [decode]」ではなく先頭側から取る。
             let decode_section = s.split("[decode]").nth(1).expect("decode 節が無い");
+            let decode_section = decode_section
+                .split("SPLIT ")
+                .next()
+                .unwrap_or(decode_section);
             // 節の見出しは `[decode]` の直後 (節の切れ目で落とした) なので、
             // TOTAL 行は節の先頭そのもの。行の先頭は `" total ..."` になる。
             let dec_total = decode_section
@@ -3085,5 +3693,164 @@ mod tests {
             );
             reset();
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // s148 (Task B10): 表 C (serve/q4 経路) の会計。GPU 無しで検証できる範囲
+    // -----------------------------------------------------------------------
+
+    /// s148: 表 C の最小の段を手で積む合成ステップ (GPU 無し)。
+    /// `step_begin/step_end` は本物を通すため、残余 (`sl_step_other`) の
+    /// 計算まで含めた会計がそのまま検査できる。`steps` 回だけ 1 step ずつ進める。
+    ///
+    /// `sampler::sample` が 1 step に 1 回必ず生 id (`SAMPLER`) を積むのを模して、
+    /// 生 id の `CALLS` も 1 回ずつ進める (COVERAGE の「steps」の分母は生 id の
+    /// 最大 call 数 = ヘッダと同じ定義なので、ここを動かさないと分母だけ 0 になる)。
+    ///
+    /// フェーズは **decode** (COVERAGE のヘッダは prefill を見るため、この fixture は
+    /// `push_serve_section` の decode 節 = 表 C の decode 行で検査する)。
+    fn serve_fixture_steps(steps: usize) {
+        set_phase(Phase::Decode);
+        for _ in 0..steps {
+            // バケットの駆動件数 (decode steps の分母は CALLS の最大値)
+            crate::prof::time(SAMPLER, || {});
+            let st = step_begin();
+            // 2 段だけ実時間で測る (値は問わない — 会計の形だけを見る)
+            let s = span_begin();
+            span_end(s, SL_STEP_SAMPLER);
+            let d = span_begin();
+            span_end(d, SL_STEP_DETOK);
+            step_end(st);
+        }
+    }
+
+    /// s148: 表 C の行を 1 本取り出す。COVERAGE はヘッダ (先頭の `[prefill]` より前)、
+    /// `SPLIT SERVE` の節は末尾にあるので、行頭一致で探す (同名のヘッダ行と
+    /// 取り違えないよう `starts_with` を使う)。
+    fn serve_decode_line(s: &str, needle: &str) -> String {
+        s.lines()
+            .find(|l| l.trim_start().starts_with(needle))
+            .unwrap_or_else(|| panic!("summary に {needle} で始まる行が無い\n{s}"))
+            .to_string()
+    }
+
+    /// s148 (Task B10): **表 C のサンプル数 = ステップ数**。小さな合成ステップ数
+    /// (7) を回し、`sl_step` のサンプル数がステップ数と一致し、内訳の和が全体を
+    /// 超えず、残余 (`sl_step_other`) が「全体 − 内訳」に一致することを固定する
+    /// (GPU 不要・DENNO_PROFILE はテスト内の上書きで有効化)。
+    #[test]
+    fn serve_table_samples_match_steps_without_gpu() {
+        with_prof_counters(|| {
+            reset();
+            let steps = 7u64;
+            serve_fixture_steps(steps as usize);
+            let p = Phase::Decode.idx();
+            // 1 step = 1 サンプル (この 1 点が崩れると coverage の分母が嘘になる)
+            assert_eq!(serve_row_calls(p, SL_STEP), steps, "sl_step のサンプル数 ≠ ステップ数");
+            assert_eq!(
+                serve_row_calls(p, SL_STEP_SAMPLER),
+                steps,
+                "sampler 段が毎 step 積まれていない"
+            );
+            assert_eq!(serve_row_calls(p, SL_STEP_DETOK), steps, "detok 段が毎 step 積まれていない");
+            // 内訳の和は全体を超えない / 残余は「全体 − 内訳」と一致する
+            let whole = serve_row_ns(p, SL_STEP);
+            let other = serve_row_ns(p, SL_STEP_OTHER);
+            assert_eq!(serve_row_calls(p, SL_STEP_OTHER), steps, "残余は毎 step 1 サンプル");
+            assert_eq!(step_gap(SL_STEP), 0, "全体 − 内訳 = 残余 が 0 でない");
+            assert!(other <= whole, "残余 {other} ns が全体 {whole} ns を超える");
+            // 表 C の節に「1 step = 1 サンプル」がそのまま出る
+            let s = summary();
+            let line = serve_decode_line(&s, "SPLIT SERVE (decode");
+            assert!(line.contains("q4 serve path"), "{line}");
+            let row = serve_decode_line(&s, "sl_step  ");
+            assert!(row.contains(&steps.to_string()), "sl_step 行にステップ数が無い: {row}");
+            // COVERAGE の decode 節は「steps = サンプル」で MISS を出さない
+            let head = serve_decode_line(&s, "COVERAGE [decode]: steps");
+            assert!(
+                head.contains(&format!("steps {steps} / samples {steps} [ok]")),
+                "{head}"
+            );
+            assert!(!head.contains("COVERAGE MISS"), "steps が一致しているのに MISS: {head}");
+            reset();
+        });
+    }
+
+    /// s148 (Task B10): COVERAGE の「steps」の期待値は**ヘッダと同じ定義** (生 id の
+    /// 最大 call 数) で、表 C の `sl_step` の実測サンプル数と突き合わせられること。
+    /// 期待だけあってサンプル 0 のときは per-bucket でも MISS として名指しされる。
+    #[test]
+    fn serve_coverage_marks_miss_and_reports_wall_share() {
+        with_prof_counters(|| {
+            reset();
+            let p = Phase::Decode.idx();
+            // 生 id だけ 2 step ぶん積む (ヘッダの steps の分母)
+            for _ in 0..2 {
+                crate::prof::time(SAMPLER, || {});
+            }
+            // 表 C には 1 サンプルも積まない → `sl_step` は期待 2 / サンプル 0 = MISS
+            let exp = serve_expected(p);
+            let step_exp = exp
+                .iter()
+                .find(|(_, row, ..)| *row == SL_STEP)
+                .expect("sl_step の期待");
+            assert_eq!(step_exp.2, 2, "期待が生 id の call 数になっていない");
+            assert_eq!(serve_row_calls(p, SL_STEP), 0);
+            add_request_wall(500_000_000); // 500 ms
+            let s = summary();
+            let head = serve_decode_line(&s, "COVERAGE [decode]: steps");
+            assert!(head.contains("steps 2 / samples 0 [COVERAGE MISS]"), "{head}");
+            let row = serve_decode_line(&s, "COVERAGE sl_step  ");
+            assert!(row.contains("COVERAGE MISS") || s.contains("COVERAGE MISS in"), "{row}\n{s}");
+            // リクエストの壁時計が同じ行に出る (帰属 ms の分母)
+            let head = serve_decode_line(&s, "COVERAGE [decode]: steps");
+            assert!(head.contains("requests 1 wall 500.0 ms"), "壁時計が出ない: {head}");
+            // 実測のステップを積むと期待と一致する (期待 ≠ 捏造)
+            reset();
+            serve_fixture_steps(2);
+            assert_eq!(serve_row_calls(p, SL_STEP), 2);
+            assert_eq!(serve_expected(p)[0].2, serve_row_calls(p, SL_STEP), "期待 ≠ 実測サンプル");
+            reset();
+        });
+    }
+
+    /// s148 (Task B10): 計測 OFF (DENNO_PROFILE 未設定) は表 C に 1 サンプルも積まず、
+    /// 時刻も読まない (`step_begin` / `span_begin` が `None`)。表 C の関数を
+    /// 直に呼んでも会計は 0 のまま — 既定経路が厳密な no-op であることの固定。
+    #[test]
+    fn serve_table_is_strict_noop_when_profiling_off() {
+        with_prof_counters_off(|| {
+            let st = step_begin();
+            assert!(st.is_none(), "計測 OFF なのに step_begin が時刻を読んだ");
+            assert!(span_begin().is_none(), "計測 OFF なのに span_begin が時刻を読んだ");
+            step_end(st);
+            span_end(None, SL_STEP_SAMPLER);
+            push(SL_STEP, 1_000, 1);
+            count_lin_dispatch();
+            add_request_wall(1_000);
+            let p = Phase::Decode.idx();
+            for row in 0..SPLIT_SERVE_N {
+                let op = SPLIT_SERVE_FIRST + row;
+                assert_eq!(serve_row_ns(p, op), 0, "計測 OFF で表 C の行 {row} に ns が入った");
+                assert_eq!(
+                    serve_row_calls(p, op),
+                    0,
+                    "計測 OFF で表 C の row {row} に sample が入った"
+                );
+            }
+            assert_eq!(lin_dispatch_calls(Phase::Prefill), 0);
+            assert_eq!(lin_dispatch_calls(Phase::Decode), 0);
+            assert_eq!(request_wall(), (0, 0));
+        });
+    }
+
+    /// s148: 計測を**明示的に無効にして** `f` を実行するガード (OFF 側の no-op を
+    /// 検査する用)。`with_prof_counters` の対。
+    fn with_prof_counters_off<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = lock_counters();
+        *FORCE_ENABLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(false);
+        let _on = ForceEnabled(false);
+        reset();
+        f()
     }
 }
