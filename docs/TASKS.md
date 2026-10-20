@@ -5,6 +5,13 @@ Prefill (5,686-token payload, cold A/B protocol) = **13.18 s / 431 tok/s**.
 Decode = **16.4 ms/token** (gen2, 200 tokens).
 Anchors: `c61ad85b` / `9e17d563` / `af6eb6ab`.
 
+**Plateau accepted by the operator (2026-10-20).** Prefill stays at ~13.2-13.4 s cold
+(13.61 s measured on this host today, which runs ~3% slower) and decode at 16.4 ms/token.
+Every P1 and P2 candidate is closed with a measurement, so **no new prefill/decode
+performance work is queued**: new work on that axis needs an explicit operator decision
+(it would mean speculative decoding plus an anchor rebase). Priority moves to P4 (product
+questions) and to finishing the human GPU steps recorded under each task.
+
 Measurement rules (see HISTORY "measurement-basis correction"):
 cold single-shot (server start → one request, prefix cache off, alternating A/B) is the
 official prefill number. Warm second runs are only for relative comparison inside one
@@ -359,6 +366,16 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 - Why: the int8 path is measured, the fp32 path is not. The fp32 lm_head GPU work (s49)
   exists but no wall-clock number.
 - Acceptance: cold prefill + decode numbers for fp32 at 9B.
+- Result (main session, 2026-10-20, GPU host): **fp32 at 9B is not viable on this host.**
+  `serve --quant fp32` (the default mode) keeps full f32 weights: 48 GB RSS for the 9B
+  model. The card has 32,607 MiB, so fp32 cannot be GPU-resident here, and the CPU load
+  took 25 s. The 5,686-token prefill did not finish: the client hit its 300 s timeout
+  (19.0 tok/s measured mid-flight) and the request was still running at ~15 min when it
+  was killed, so the decode number behind it never started (one request slot, no
+  preemption on a cold request). Practical conclusion: fp32 prefill at 9B on this CPU is
+  more than 6x slower than int8+GPU before it even completes, so there is no useful
+  wall-clock fp32 number to publish from this host. Measuring it needs either a 48 GB
+  card or a smaller model.
 
 ### P4-3: 27B Q4_0 quality
 - Why: 27B loads and runs deterministically but output quality (greedy collapse) is
@@ -387,6 +404,14 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   A non-zero exit must fail the verify run: 1 is a real recall regression, 2 means the
   check could not run (do not record 2 as a pass).
 - Acceptance: needle recall passes on every verified build.
+- Result (main session, 2026-10-20): run against the canonical build on 8095
+  (`python3 scripts/needle_check.py --base-url http://127.0.0.1:8095`, inside the
+  container): payload 24,113 chars, `usage.input_tokens` 4,640, request 11.57 s,
+  answer `QX-4471`, verdict MATCH, **exit 0**. So the checker works end to end on a real
+  build. `GPU_VERIFY` now also passes with 3/3 anchors on the same build. Note: the
+  `denno-gpu` container had no python3, so the main session installed `python3-minimal`
+  (3.10.12) — the line above now runs as written; the remaining step is only adding it to
+  the gitignored `GPU_VERIFY` script.
 
 ## P5 — tooling and ops
 
@@ -445,6 +470,15 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   from that fixed count; a log line that carries `output_tokens=<n>` is used as-is.
 - Acceptance: one HTML page where prefill and decode are on separate axes and the
   protocol change is a visible vertical line.
+- Result (main session, 2026-10-20): **first real chart.** A 3-round cold A/B
+  (s81 `b502e34` vs HEAD `506b515`, payload sha256 `dead4c91...`, 5,686 input tokens)
+  gave old median 13.633 s vs new 13.610 s = **-0.17%**, i.e. parity since s81 on a
+  machine that measures ~3% slower than yesterday. The JSON was rendered with
+  `python3 scripts/dashboard.py --cold-ab-dir <dir> --out p51_real.html`
+  (4,729 bytes, inline SVG only, real values 13.60-13.63 s). The JSON and the page are
+  kept outside the repo (`C:\Users\ahino\denno-tools\`), because the `--json` payload
+  records host-specific binary paths. Still open: no decode point on the chart, since a
+  cold A/B carries no decode number and the only decode source is a `PF_BENCH` line.
 
 ### P5-2: docs sync — DONE (2212c4a, s101)
 - `README.md` and `docs/api.md` still describe pre-s68 behaviour in places
