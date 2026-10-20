@@ -103,6 +103,11 @@ struct Run {
     /// decode ステップの間のみ取り出して delta コールバックへ渡す
     /// (ステップ完了後に Run へ戻す。finish_run が残りイベントを出す)
     asm: Option<StreamAssembler>,
+    /// s151 (Task B12): リクエストの壁時計の入口票 (計測 OFF は None)。
+    /// admit で `prof::request_begin` を打ち、完了 / 切断 / エラーのどれでも
+    /// `prof::request_end` を 1 回だけ呼ぶ。生成の終わりはここ (Run の終端) で、
+    /// HTTP ハンドラの戻りではない (SSE は即座に戻るため)。
+    req_mark: Option<prof::RequestMarker>,
 }
 
 impl Run {
@@ -396,7 +401,10 @@ fn build_run(engine: &Arc<Mutex<Engine>>, job: Job) -> Run {
         Some(_) => None,
         None => Some(StreamAssembler::new(0)),
     };
-    Run { sess, error, respond, events, started: false, asm }
+    // s151 (B12): リクエストの壁時計はここで開く (セッションの生成区間 = prefill
+    // 開始から完了まで)。計測 OFF は None (クロック読みなし)。
+    let req_mark = prof::request_begin();
+    Run { sess, error, respond, events, started: false, asm, req_mark }
 }
 
 /// 新規ジョブの admit (pull 経路 2 箇所の共通化)。成功なら active へ push する。
@@ -444,6 +452,9 @@ fn abort_disconnected(engine: &Arc<Mutex<Engine>>, mut run: Run) {
     if let Some(sess) = run.sess.as_mut() {
         engine.lock().unwrap().release_session(sess);
     }
+    // s151 (B12): 打ち切られたリクエストも壁時計を 1 本だけ閉じる (未計上で
+    // `requests` と `wall` がずれると COVERAGE の分母が嘘になる)。
+    prof::request_end(run.req_mark.take());
     tracing::info!("client disconnected; generation aborted");
 }
 
@@ -657,7 +668,11 @@ fn admit(engine: &Arc<Mutex<Engine>>, run: &mut Run, live: usize) -> Result<()> 
 }
 
 /// 完了したセッションの後処理 (respond or SSE 後半イベント)。
-fn finish_run(run: Run) {
+fn finish_run(mut run: Run) {
+    // s151 (B12): 生成が終わった点でリクエストの壁時計を閉じる。JSON 応答でも
+    // SSE でも同じ 1 本で、Run の終端は全経路でここ (または abort) を通る。
+    let mark = run.req_mark.take();
+    prof::request_end(mark);
     let Run { sess, respond, events, mut asm, .. } = run;
     let Some(sess) = sess else { return };
     let out = sess.into_output();

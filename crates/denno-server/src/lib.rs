@@ -935,14 +935,13 @@ async fn messages(
 ) -> Result<Response, ApiError> {
     check_auth(&state, &headers)?;
     // s148 (Task B10・計測のみ): リクエストの壁時計。COVERAGE 行の分母
-    // (「帰属 ms / リクエストの壁時計」) になる。計測 OFF は `add_request_wall` の
-    // 入口の分岐 1 回だけで、`Instant::now()` を読まない — ここで測る時刻は
-    // 応答の内容にもログにも影響しない (表示専用)。
-    let req_t = denno_engine::prof::enabled().then(std::time::Instant::now);
+    // (「帰属 ms / リクエストの壁時計」) になる。
+    // s151 (Task B12): このフックは `/v1/messages` の**同期ハンドラ**にあり、
+    // ストリーミング (本番の serve 経路はほぼ SSE) はレスポンス本体を返した時点で
+    // 戻るため、生成が終わった時点の壁時計になっていなかった (`requests 0`)。
+    // 実際の計上は scheduler の Run (prefill 開始 → セッション完了) が
+    // `request_begin` / `request_end` で行う — ここでは二重計上しない。
     let resp = messages_inner(state, headers, body).await;
-    if let Some(t0) = req_t {
-        denno_engine::prof::add_request_wall(t0.elapsed().as_nanos() as u64);
-    }
     resp
 }
 
