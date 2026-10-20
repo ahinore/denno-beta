@@ -1010,8 +1010,15 @@ impl Qwen35 {
     /// で GPU 試行し、不発/失敗時は従来 CPU 経路 (bit 不変) に落ちる。
     /// int8 モードの lm_head (Q8) は apply_bt 内の P17b hook が既存で対応。
     /// 計上は prof::LM_HEAD (prefill 最終 logits も含む = llama per-op と同一)。
+    /// s148 (Task B10・計測のみ): lm_head 区間を**任意の id** で測る名前付き版。
+    /// `logits` は `LM_HEAD`、decode の per-op 経路は `SL_STEP_FINAL` (= 表 C の
+    /// 最終 norm + lm_head) を渡す。計測対象の id が違うだけで数値経路は不変。
+    fn logits_prof<T>(&self, op: usize, f: impl FnOnce() -> T) -> T {
+        crate::prof::time(op, f)
+    }
+
     fn logits(&self, h: &[f32]) -> Vec<f32> {
-        crate::prof::time(crate::prof::LM_HEAD, || {
+        self.logits_prof(crate::prof::LM_HEAD, || {
             #[cfg(feature = "cuda")]
             {
                 // untied と tied で重みキャッシュの key を分ける (mid はロード毎に
@@ -1138,6 +1145,11 @@ impl Model for Qwen35 {
             if tok as usize >= self.vocab {
                 bail!("token id {tok} が vocab ({}) を超過", self.vocab);
             }
+            // s148 (Task B10・計測のみ): **q4 serve の実経路** の 1 step 分割。
+            // forward の入口は前段 (embed・層ループ) までを `sl_step_prep` として
+            // 測り、以降は段ごとに閉じる。内訳の和は呼び出し側 (engine) の
+            // `sl_step` (step 全体) に一致する — 計測 OFF は tick が None。
+            let mut st = crate::prof::span_begin();
             let mut x: Vec<f32> = self.embed[tok as usize * e..][..e].to_vec();
 
             for (li, layer) in self.layers.iter().enumerate() {
@@ -1157,9 +1169,16 @@ impl Model for Qwen35 {
                     *xi += fi;
                 }
             }
+            // 層ループ (投影以外も含む) をここで締める。投影の時間は q4 ディスパッチ
+            // 入口 (`sl_lin`) が別に積んでいる (層ループの段は「投影以外」)。
+            crate::prof::span_end(st.take(), crate::prof::SL_STEP_LAYERS_OTHER);
+            // s148: 最終 norm + lm_head を表 C の 1 段として測る (内訳の和を step 全体に
+            // 一致させる)。計測 OFF は `time` が素通しする。
+            st = crate::prof::span_begin();
 
             let hf = rmsnorm(&x, &self.norm_w, e, self.eps);
-            logits = self.logits(&hf);
+            logits = self.logits_prof(crate::prof::SL_STEP_FINAL, || self.logits(&hf));
+            crate::prof::span_end(st, crate::prof::SL_STEP_FINAL);
             self.chain_step_end();
         }
         cache.advance(tokens.len());
@@ -1278,6 +1297,13 @@ impl Qwen35 {
         let mut buf_v: Vec<f32> = Vec::new();
         let mut buf_q: Vec<f32> = Vec::new();
         let mut buf_att: Vec<f32> = Vec::new();
+
+        // s148 (Task B10・計測のみ): prefill 1 回の全体を表 C に積む。prefill は
+        // 線形層が 1 回だけ通る「大きい m の 1 forward」で、decode の step と同じ
+        // 表に入れると per-step 平均が壊れるため、`sl_step` ではなく
+        // `sl_step_prep` として 1 サンプル (= 1 prefill forward) を積む。
+        // 投影の内訳 (`sl_lin` / `sl_lin_*`) はこの区間の内側に nested で入る。
+        let pf_t = crate::prof::span_begin();
 
         for (li, layer) in self.layers.iter().enumerate() {
             // --- attention: rmsnorm を行単位で一括計算 (s42: 行独立 → 行並列。
@@ -1693,6 +1719,8 @@ impl Qwen35 {
         lchk("final logits", &logits); // 恒久診断 (env ゲート・未指定時 no-op)
         lchk_argmax("final logits", &logits); // 恒久診断 (env ゲート・未指定時 no-op)
         cache.advance(n);
+        // s148: prefill 1 回の区間を閉じる (1 prefill = 1 サンプル)。
+        crate::prof::span_end(pf_t, crate::prof::SL_STEP_PREP);
         Ok(logits)
     }
 }

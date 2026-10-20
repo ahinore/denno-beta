@@ -791,6 +791,22 @@ impl Engine {
         sess: &mut ChatSession,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<bool> {
+        // s148 (Task B10・計測のみ): scheduler は prefill を `step_chat` で、decode を
+        // `step_chat_batch` で 1 歩ずつ進める。片方だけに `sl_step` を置くと
+        // 「steps = サンプル」が片経路で崩れるので、**両方**の入口で 1 サンプル積む
+        // (計測 OFF は `step_begin` が `None` = クロック読みなし)。
+        let st = crate::prof::step_begin();
+        let r = self.step_chat_inner(sess, on_delta);
+        crate::prof::step_end(st);
+        r
+    }
+
+    /// s148: [`step_chat`] の本体 (表 C の step 計測を外したもの)。
+    fn step_chat_inner(
+        &mut self,
+        sess: &mut ChatSession,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<bool> {
         if !sess.prefill_done {
             // prefill: 旧 chat() と同一形状 (残りプロンプトを 1 回の forward で処理)。
             // A5/s46: recurrent モデルで generation prompt 境界が検出できた場合のみ、
@@ -905,8 +921,12 @@ impl Engine {
                 .unwrap()
                 .apply(&mut sess.logits, &self.tok, &eos);
         }
+        // s148: 表 C の `sl_step_sampler` (penalty/拘束マスク適用は含めない — 拘束
+        // マスクは logits 側の処理なのでここでは sample の呼び出しだけを測る)。
+        let samp_t = crate::prof::span_begin();
         let next =
             crate::prof::time(crate::prof::SAMPLER, || sess.sampler.sample(&sess.logits)) as u32;
+        crate::prof::span_end(samp_t, crate::prof::SL_STEP_SAMPLER);
         sess.generated.push(next);
         // 第21: 拘束状態の前進 (サンプル済みトークンの piece で状態遷移)
         if let Some(mask) = sess.tool_mask.as_mut() {
@@ -1010,6 +1030,8 @@ impl Engine {
         // U+FFFD を確定済みテキスト (sess.text) に混入させると以後のバイト
         // 差分がずれて文字が欠落するため、**末尾が U+FFFD になるトークンは
         // 保留**し、文字が完成したステップでまとめて差分として流す。
+        // s148: 表 C の `sl_step_detok` (差分テキスト生成 = detok の全区間)。
+        let detok_t = crate::prof::span_begin();
         let full = crate::prof::time(crate::prof::DETOK, || -> Result<String> {
             let mut n = sess.generated.len();
             let mut full = self.tok.decode(&sess.generated[..n])?;
@@ -1019,6 +1041,7 @@ impl Engine {
             }
             Ok(full)
         })?;
+        crate::prof::span_end(detok_t, crate::prof::SL_STEP_DETOK);
         // 確定済み分 (送出于定の範囲) に新しい差分を追記する。
         // 不変条件: sent_len は追記後に変えない (= 送出済み境界は固定)。
         let confirmed = sess.sent_len;
@@ -1116,6 +1139,22 @@ impl Engine {
         // (Box<dyn FnMut> は既定で 'static 要求になるため明示的に '_ を付ける)
         on_deltas: &mut [Box<dyn FnMut(&str) + '_>],
     ) -> Result<Vec<bool>> {
+        // s148 (Task B10・計測のみ): serve の decode 1 ステップの全体を表 C に積む。
+        // サーバのループはこの関数を 1 回呼ぶごとに 1 トークン進めるので、これが
+        // 「1 step = 1 サンプル」の最も内側の点。計測 OFF は `step_begin` が `None`
+        // を返し、`step_end` は分岐 1 回で戻る (時刻も読まない)。
+        let st = crate::prof::step_begin();
+        let r = self.step_chat_batch_inner(batch, on_deltas);
+        crate::prof::step_end(st);
+        r
+    }
+
+    /// s148: [`step_chat_batch`] の本体 (表 C の step 計測を外したもの)。
+    fn step_chat_batch_inner(
+        &mut self,
+        batch: &mut [&mut ChatSession],
+        on_deltas: &mut [Box<dyn FnMut(&str) + '_>],
+    ) -> Result<Vec<bool>> {
         debug_assert_eq!(batch.len(), on_deltas.len());
         let mut done = vec![false; batch.len()];
         let mut toks: Vec<u32> = Vec::new();
@@ -1140,9 +1179,12 @@ impl Engine {
                     .unwrap()
                     .apply(&mut sess.logits, &self.tok, &eos);
             }
+            // s148: 表 C の `sl_step_sampler` (1 セッション 1 サンプル)。
+            let samp_t = crate::prof::span_begin();
             let next = crate::prof::time(crate::prof::SAMPLER, || {
                 sess.sampler.sample(&sess.logits)
             }) as u32;
+            crate::prof::span_end(samp_t, crate::prof::SL_STEP_SAMPLER);
             sess.generated.push(next);
             // 第21: 拘束状態の前進 (サンプル済みトークンの piece で状態遷移)
             if let Some(mask) = sess.tool_mask.as_mut() {

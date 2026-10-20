@@ -934,7 +934,24 @@ async fn messages(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     check_auth(&state, &headers)?;
+    // s148 (Task B10・計測のみ): リクエストの壁時計。COVERAGE 行の分母
+    // (「帰属 ms / リクエストの壁時計」) になる。計測 OFF は `add_request_wall` の
+    // 入口の分岐 1 回だけで、`Instant::now()` を読まない — ここで測る時刻は
+    // 応答の内容にもログにも影響しない (表示専用)。
+    let req_t = denno_engine::prof::enabled().then(std::time::Instant::now);
+    let resp = messages_inner(state, headers, body).await;
+    if let Some(t0) = req_t {
+        denno_engine::prof::add_request_wall(t0.elapsed().as_nanos() as u64);
+    }
+    resp
+}
 
+/// s148: [`messages`] の本体 (リクエスト壁時計の計測を外したもの)。
+async fn messages_inner(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
     let req: MessagesRequest = serde_json::from_slice(&body).map_err(|e| {
         ApiError::invalid_request(format!("invalid request body: {}", e))
     })?;
