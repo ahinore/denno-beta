@@ -339,7 +339,8 @@ impl LlamaQwen2 {
     ) -> Option<Vec<f32>> {
         use crate::cuda::{
             chain_attention_dev, chain_download, chain_kv_stage_flush, chain_linear_grouped,
-            chain_rope_prepare, chain_rope_qkv, chain_rmsnorm, chain_swiglu, chain_upload,
+            chain_rope_prepare, chain_rope_qkv, chain_rmsnorm, chain_seg, chain_step_begin,
+            chain_step_end, chain_swiglu, chain_upload,
             gpu_attention_enabled, CH_ACT, CH_ATT, CH_DOWN, CH_GA, CH_H, CH_LOGITS, CH_O, CH_QKV,
             CH_X,
         };
@@ -361,12 +362,24 @@ impl LlamaQwen2 {
             return None;
         }
 
+        // s138 (Task B6・計測のみ): ここから先を 1 ステップの分割 (表 A) として
+        // 計測する。計測 OFF は分岐 1 回 (クロックも読まない)。対応する
+        // `chain_step_end` は末尾 (`Some(logits)` の直前) の 1 か所。
+        // llama chain の sync は lm_head の `chain_download` の 1 回だけで、
+        // それは外側の `D2H` バケットが持っている — 分割表では「D2H 発行」段に入れ、
+        // 待ち (`chain_sync_wait`) は下の D2H 段の内訳として読む (表示専用)。
+        chain_step_begin();
+
         // 埋め込み 1 行をアップロード (residual stream 常駐開始)
+        chain_seg(crate::prof::CHAIN_HOST_API);
         chain_upload(CH_X, &self.embed[token as usize * e..][..e], e, 1)?;
         // rope テーブル (1 ステップ 1 回 — CPU rope_row と同一式・ビット一致)
+        chain_seg(crate::prof::CHAIN_CPU);
         chain_rope_prepare(pos0, dh, self.theta)?;
         let mut pending: Option<usize> = None;
 
+        // 層ループはカーネル発行のみ (sync は層の中に無い)
+        chain_seg(crate::prof::CHAIN_LAUNCH);
         for (li, layer) in self.layers.iter().enumerate() {
             crate::telemetry_layer_begin(li as u16);
             crate::prof::time_full(crate::prof::RMSNORM, 1, true, || {
@@ -439,15 +452,28 @@ impl LlamaQwen2 {
             crate::telemetry_layer_flush();
         }
 
+        // lm_head の発行 → 最後の D2H (この sync がステップ全体の完了待ち)
+        chain_seg(crate::prof::CHAIN_LAUNCH);
+        let t_launch_done = crate::cuda::chain_tick();
+        chain_seg(crate::prof::CHAIN_D2H_LOGITS);
         let logits = crate::prof::time_full(crate::prof::LM_HEAD, 1, true, || -> Option<Vec<f32>> {
             chain_rmsnorm(&self.norm_w, self.eps, pending, CH_H, e, 1, n_layers * 3)?;
             let lmq = self.lm_head.as_ref().unwrap().quant8()?;
             chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)?;
             chain_download(CH_LOGITS, self.vocab)
         })?;
+        // 最後の D2H の sync (lm_head の `chain_download` 内) を表 A へ。
+        // `chain_kernel` = 直前に発行したカーネルの実行 = ここから測った経過で、
+        // 待ちの合計は動かさない (表示専用)。
+        crate::cuda::chain_sync_observed(
+            0.0,
+            t_launch_done.map(|t| t.elapsed().as_secs_f64()),
+        );
         // ホストキャッシュへ rope 済み k/v を反映 (logits download の sync で全 D2H 完了)
+        chain_seg(crate::prof::CHAIN_D2H_ARRAY);
         chain_kv_stage_flush(cache, n_layers, kv_dim, pos0)?;
         cache.advance(1);
+        chain_step_end();
         Some(logits)
     }
 

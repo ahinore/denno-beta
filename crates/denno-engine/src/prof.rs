@@ -139,6 +139,94 @@ pub const ATT_GDN_PROJ: usize = 100 * ATTN + 2; // GDN の beta/alpha 投影の�
 pub const ATT_GDN_SCAN: usize = 100 * ATTN + 3; // GDN スキャン本体
 pub const N_OPS: usize = 15;
 
+// ---------------------------------------------------------------------------
+// s138 (Task B6・計測のみ): 「毎ミリ秒がどれか 1 つの行に入る」ための 2 系統の
+// 分割表。**表示専用** — どの生 id (N_OPS 未満) にも D2H 細分にも合算しない
+// (既存バケットの値はこの commit で 1 bit も動かさない)。
+//
+// 動機 (supervisor 実測: 27B q4 serve, DENNO_PROFILE=1, 187 token, wall 19.342 s):
+//   (1) decode のプロファイル合計は 8.7 ms/token だが wall は約 58 ms/token。
+//       残り約 49 ms は「どのバケットにも入っていない」。decode の q4 chain 経路
+//       (chain launch / sync / logits D2H / q4 GEMV launch) には行が無く、
+//       `d2h_src_linear` は 83,514 call で 0.0 ms (= 実際にホストが止まる場所を
+//       指していない) だった。
+//   (2) prefill の gate_up_proj は 26.7 ms/call (tok/call 18.5) で、bench の
+//       m=8 (0.514) / m=64 (2.323) と 5-10 倍食い違う。線形ラッパ 1 call の
+//       中身 (確保 / memset / H2D / 量子化 / launch / D2H / 待ち) が未分化。
+// ---------------------------------------------------------------------------
+
+/// 表 A (decode chain): 1 ステップの区間を **互いに排他** に割る。実装は
+/// cuda.rs 側の網掛け (`chain_step_begin` / `chain_seg`) が `CHAIN_SEG` と
+/// `CHAIN_ACC` で持ち、ステップ終端で `split_flush_step` に流す。
+/// chain 側は 1 ステップで使う GPU 資源が 1 本の stream に直列なので、
+/// 区間ごとに「発行 (host が API から戻るまで)」と「待ち (sync の中)」を
+/// 別の行に分ける — 合計がステップの host 時間になる。
+pub const SPLIT_CHAIN_N: usize = 8;
+/// 開始位置は **`10*D2H` の 23 ブロック (0..22) の直後**にして、以後の追加でも
+/// 番号を詰め直さない (過去のプロファイルログとの比較を壊さないため)。
+pub const SPLIT_CHAIN_FIRST: usize = 10 * D2H + 23;
+/// chain の launch API 発行 (rmsnorm / GEMV / swiglu / attention / q4 GEMM の
+/// cuLaunchKernel など。「発行した」時間で、GPU の実行時間ではない)
+pub const CHAIN_LAUNCH: usize = SPLIT_CHAIN_FIRST;
+/// decode 1 ステップ 1 回の logits D2H 発行 (`chain_download(CH_LOGITS)`)
+pub const CHAIN_D2H_LOGITS: usize = SPLIT_CHAIN_FIRST + 1;
+/// chain のその他の D2H 発行 (full 層 k/v 行の staged async など)
+pub const CHAIN_D2H_ARRAY: usize = SPLIT_CHAIN_FIRST + 2;
+/// chain の sync のうち、**直前の launch に帰属できる** 待ち (ホストに入る cuda 呼び出し)
+pub const CHAIN_SYNC_WAIT: usize = SPLIT_CHAIN_FIRST + 3;
+/// CPU 側の計算・側付け (Vec 確保・ホストコピー・rope 表生成など)
+pub const CHAIN_CPU: usize = SPLIT_CHAIN_FIRST + 4;
+/// ホストで起きる GPU API 呼び出し (cuMemcpy 同期版・Context 切り替え等。
+/// 多くは GPU 側の完了待ちになる)
+pub const CHAIN_HOST_API: usize = SPLIT_CHAIN_FIRST + 5;
+/// (デコード) sync の直前までの区間のうち、どこにも当たらなかった残余。
+/// 実際は「待ち」であって「発行」ではないものが混ざる (sync で締める)
+pub const CHAIN_SYNC_RESIDUAL: usize = SPLIT_CHAIN_FIRST + 6;
+/// (デコード) ステップの前後 (embedding 用意・sampler など chain の外)
+pub const CHAIN_OUTER: usize = SPLIT_CHAIN_FIRST + 7;
+
+/// 表 A の行数は 8 だが、上の 7 段に加えて「直前の launch に帰属できる待ち」
+/// = `chain_kernel` を **待ちの内訳** として 1 本持つため、表 A は 9 行。
+/// (`chain_kernel` は `chain_sync_wait` の内訳 = 待ち行から同じ秒数を引いて
+/// 移すので、待ちの合計も排他の和も動かない。)
+pub const SPLIT_CHAIN_ROWS: usize = 9;
+pub const CHAIN_KERNEL_WAIT: usize = SPLIT_CHAIN_FIRST + 8;
+
+/// 表 B (prefill の線形ラッパ 1 call): `maybe_gpu_linear_*` の内側を排他に割る。
+pub const SPLIT_Q4_N: usize = 8;
+/// 表 B の開始 = 表 A の全行 (8 段 + `chain_kernel` の 1 行) の直後。
+pub const SPLIT_Q4_FIRST: usize = SPLIT_CHAIN_FIRST + SPLIT_CHAIN_ROWS;
+/// `vec![0.0; m*n]` の確保 + ゼロ埋め (GPU 経路でも CPU フォールバックでも通る)
+pub const Q4P_OUT_ALLOC: usize = SPLIT_Q4_FIRST;
+/// 非同期転送用のピン留めホスト側バッファの確保/伸長 (cuMemHostAlloc 相当)
+pub const Q4P_PIN_ALLOC: usize = SPLIT_Q4_FIRST + 1;
+/// ホスト f32 → ピン留め領域への H2D ステージング copy (SIMD memcpy)
+pub const Q4P_H2D_STAGE: usize = SPLIT_Q4_FIRST + 2;
+/// H2D 発行
+pub const Q4P_H2D_ISSUE: usize = SPLIT_Q4_FIRST + 3;
+/// 量子化カーネル (Q4 経路は量子化しないので 0)、GEMV/GEMM カーネル発行
+pub const Q4P_KERNEL_LAUNCH: usize = SPLIT_Q4_FIRST + 4;
+/// 出力 D2H 発行
+pub const Q4P_D2H_ISSUE: usize = SPLIT_Q4_FIRST + 5;
+/// cuCtxSynchronize (= カーネル実行 + 転送の完了待ち)
+pub const Q4P_SYNC_WAIT: usize = SPLIT_Q4_FIRST + 6;
+/// ピン留め領域 → 呼び出し側 `out` のコピー (sync の後)
+pub const Q4P_HOST_COPY: usize = SPLIT_Q4_FIRST + 7;
+
+// ---------------------------------------------------------------------------
+// s138: 汎用の分割表 (表示専用)。上 2 表はこの 1 本の実装を共有する。
+// ---------------------------------------------------------------------------
+/// 分割表の総数 (0 = decode chain, 1 = prefill の線形ラッパ)。
+/// 表を増やすときは `SPLIT_TABLES` の添字と `push_split_rows` の呼び出しを対で足す。
+pub const SPLIT_TABLES: usize = 2;
+/// 0 = decode chain (表 A) / 1 = prefill の線形ラッパ (表 B)
+pub const SPLIT_CHAIN_TABLE: usize = 0;
+pub const SPLIT_Q4_TABLE: usize = 1;
+/// 表 1 本の行数の最大値 (表 A = 9 行 / 表 B = 8 行)。積算器はこの本数で持つ。
+pub const SPLIT_ROWS: usize = SPLIT_CHAIN_ROWS;
+/// 積算器 (`split_flush_step` の `acc`) の本数 = 一番多い表の行数。
+/// s138 後半: 表 A が `chain_kernel` の 1 行を得て 9 行になったため、
+/// 「表ごとに行数が同じ」前提の `SPLIT_N` は廃止した (行数は `split_rows()`)。
 /// s57 (T4): 計測フェーズ。prefill (n>1 の forward) と decode (n==1) を
 /// **別テーブル**に集計する。`Both` は従来の cumulative テーブル (双方の合計)。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -313,6 +401,12 @@ const fn mk_counters<const N: usize>() -> [[AtomicU64; N]; Phase::N] {
     [const { [const { AtomicU64::new(0) }; N] }; Phase::N]
 }
 
+/// s138: 2 次元版 (`[Phase::N]` × 表 × 行)。`[t; N]` は Copy を要求するため
+/// 内側も inline const で要素ごとに独立した Atomic を作る。
+const fn mk_counters2<const R: usize, const T: usize>() -> [[[AtomicU64; R]; T]; Phase::N] {
+    [const { [const { [const { AtomicU64::new(0) }; R] }; T] }; Phase::N]
+}
+
 static NS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
 static CALLS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
 /// s57 (T4): バケットに渡されたトークン (行) 数の総和。平均 = TOKS / CALLS_ROWS。
@@ -363,6 +457,44 @@ static ATT_SUB_CALLS: [[AtomicU64; ATT_CLS_N]; Phase::N] = mk_counters::<ATT_CLS
 /// 直下の子の合計を引くだけで求まる)。計測 OFF ではこの表へも触らない。
 static PARENT_CHILD_NS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
 static PARENT_CHILD_CALLS: [[AtomicU64; N_OPS]; Phase::N] = mk_counters::<N_OPS>();
+/// s138 (Task B6): 分割表 (decode chain / prefill の線形ラッパ) の累積。フェーズ別。
+/// **表示専用** — どの生 id にも D2H 細分にも合算しない (二重計上防止)。
+/// 行は表ごとに違う (表 A = `SPLIT_CHAIN_ROWS` / 表 B = `SPLIT_Q4_N`) が、
+/// 積算器は `SPLIT_ROWS` 本で共通。`split_slot` が表と行を 1 つの id に畳む。
+static SPLIT_NS: [[[AtomicU64; SPLIT_ROWS]; SPLIT_TABLES]; Phase::N] =
+    mk_counters2::<SPLIT_ROWS, SPLIT_TABLES>();
+static SPLIT_CALLS: [[[AtomicU64; SPLIT_ROWS]; SPLIT_TABLES]; Phase::N] =
+    mk_counters2::<SPLIT_ROWS, SPLIT_TABLES>();
+/// s138: 分割表の段のうち「待ち」に当たる行 (呼び出し側の site が無く、
+/// sync 区間の残余をここへ入れる)。表 A = CHAIN_SYNC_WAIT / 表 B = Q4P_SYNC_WAIT。
+const SPLIT_WAIT_ROW: [usize; SPLIT_TABLES] = [
+    CHAIN_SYNC_WAIT - SPLIT_CHAIN_FIRST,
+    Q4P_SYNC_WAIT - SPLIT_Q4_FIRST,
+];
+/// s138: 分割表 A (decode chain) の行名 (`SPLIT_CHAIN_FIRST + i`)。
+const SPLIT_CHAIN_NAMES: [&str; SPLIT_CHAIN_ROWS] = [
+    "chain_launch",
+    "chain_d2h_logits",
+    "chain_d2h_array",
+    "chain_sync_wait",
+    "chain_cpu",
+    "chain_host_api",
+    "chain_sync_resid",
+    "chain_outer",
+    // 待ちの内訳 (sync の直前に発行したカーネルの実行待ち = 待ち行から移す)
+    "chain_kernel",
+];
+/// s138: 分割表 B (prefill の線形ラッパ 1 call) の行名 (`SPLIT_Q4_FIRST + i`)。
+const SPLIT_Q4_NAMES: [&str; SPLIT_Q4_N] = [
+    "lin_out_alloc",
+    "lin_pin_alloc",
+    "lin_h2d_stage",
+    "lin_h2d",
+    "lin_kernel",
+    "lin_d2h",
+    "lin_sync_wait",
+    "lin_host_copy",
+];
 
 static ON: OnceLock<bool> = OnceLock::new();
 // s57 (T4): 現在の計測フェーズ (thread-local)。数値経路には影響しない。
@@ -977,6 +1109,114 @@ impl Seq {
     }
 }
 
+/// s138 (Task B6): 秒 (f64) を ns へ。分割表の加算だけは**秒**で行う —
+/// 行ごとに ns へ丸めて足すと 1 step で 100 回 × 16ns の丸め誤差が積もり、
+/// 排他の和が host 時間からずれる (表 A の各行は 1 ステップで 100 回近く積む)。
+#[inline]
+pub fn secs_to_ns(s: f64) -> u64 {
+    if !(s > 0.0) {
+        return 0;
+    }
+    (s * 1e9).round() as u64
+}
+
+/// s138 (Task B6): 分割表の行 id を (表, 行) へ畳む純関数 (GPU 不要・テスト可能)。
+/// 範囲外は `None` (= 積まない)。表の行 id は `SPLIT_*_FIRST` から表の行数ぶん
+/// 連番 (`SPLIT_CHAIN_ROWS` / `SPLIT_Q4_N`) なので、表どうしの範囲が交差してはならない。
+#[inline]
+pub fn split_slot(op: usize) -> Option<(usize, usize)> {
+    if (SPLIT_CHAIN_FIRST..SPLIT_CHAIN_FIRST + SPLIT_CHAIN_ROWS).contains(&op) {
+        Some((SPLIT_CHAIN_TABLE, op - SPLIT_CHAIN_FIRST))
+    } else if (SPLIT_Q4_FIRST..SPLIT_Q4_FIRST + SPLIT_Q4_N).contains(&op) {
+        Some((SPLIT_Q4_TABLE, op - SPLIT_Q4_FIRST))
+    } else {
+        None
+    }
+}
+
+/// s138 (Task B6): 分割表に 1 区間を積む。**表示専用** — `SPLIT_NS` /
+/// `SPLIT_CALLS` にしか書かない (生 id・D2H 細分・attn 細分には触らない)。
+///
+/// `calls` を渡せるのは「その区間が無条件に 1 call 発生した」段用
+/// (確保 / launch / D2H / sync など)。区間が起きなかった呼び出し (フラグで
+/// 飛ばした段) を分母から外したいときは呼び出し側が 0 を渡す。
+/// PROFILE / テレメトリ無効時は分岐 1 回で戻る (時刻は呼び出し側が測らない)。
+#[inline]
+pub fn split_sample(op: usize, ns: u64, calls: u64) {
+    if !enabled() && !crate::telemetry_on() {
+        return;
+    }
+    let Some((t, i)) = split_slot(op) else { return };
+    let pi = phase().idx();
+    SPLIT_NS[pi][t][i].fetch_add(ns, Ordering::Relaxed);
+    SPLIT_NS[Phase::Both.idx()][t][i].fetch_add(ns, Ordering::Relaxed);
+    if calls > 0 {
+        SPLIT_CALLS[pi][t][i].fetch_add(calls, Ordering::Relaxed);
+        SPLIT_CALLS[Phase::Both.idx()][t][i].fetch_add(calls, Ordering::Relaxed);
+    }
+}
+
+/// s138 (Task B6): 分割表の計時を行うか (呼び出し側はこれが真のときだけ
+/// `Instant::now()` を読む — 既定経路はクロック読みゼロのまま)。
+#[inline]
+pub fn split_on() -> bool {
+    enabled() || crate::telemetry_on()
+}
+
+/// s138 (Task B6): 1 ステップ分の分割を表へ流し込む。`acc` はそのステップの
+/// 各段の秒数 (呼び出し側の積算器 = cuda.rs の `CHAIN_ACC`)。`steps` は「この分割が何ステップ分か」
+/// (decode は 1)。**表示専用**。
+///
+/// 段の呼び出し回数は「その段が起きたステップ数」= `acc[i] > 0` の個数で数える
+/// (launch を 1 回もしなかった段は 0 のまま。「0.0 ms / 0 call」は起きていない、
+/// と読める)。`wait_total` (省略可) は sync 区間の残余 — sync に催促された
+/// 待ちなので、来たら**待ち行**へ入れて sup の残りから引く。
+pub fn split_flush_step(
+    table: usize,
+    acc: &[f64; SPLIT_ROWS],
+    steps: u64,
+    wait_total: Option<(usize, f64)>,
+) {
+    if !enabled() && !crate::telemetry_on() {
+        return;
+    }
+    if table >= SPLIT_TABLES || steps == 0 {
+        return;
+    }
+    let pi = phase().idx();
+    let rows = if table == SPLIT_CHAIN_TABLE {
+        SPLIT_CHAIN_ROWS
+    } else {
+        SPLIT_Q4_N
+    };
+    for (i, &secs) in acc.iter().enumerate().take(rows) {
+        if secs <= 0.0 {
+            continue;
+        }
+        let ns = secs_to_ns(secs);
+        // 段が起きたステップ数を calls として積む (0 なら件数は増えない)
+        SPLIT_NS[pi][table][i].fetch_add(ns, Ordering::Relaxed);
+        SPLIT_NS[Phase::Both.idx()][table][i].fetch_add(ns, Ordering::Relaxed);
+        SPLIT_CALLS[pi][table][i].fetch_add(steps, Ordering::Relaxed);
+        SPLIT_CALLS[Phase::Both.idx()][table][i].fetch_add(steps, Ordering::Relaxed);
+    }
+    if let Some((supp_row, secs)) = wait_total {
+        if secs > 0.0 && supp_row < SPLIT_ROWS {
+            let ns = secs_to_ns(secs);
+            let w = SPLIT_WAIT_ROW[table];
+            SPLIT_NS[pi][table][w].fetch_add(ns, Ordering::Relaxed);
+            SPLIT_NS[Phase::Both.idx()][table][w].fetch_add(ns, Ordering::Relaxed);
+            if supp_row != w {
+                // 残余は sync を待たせた区間の側から引く (排他の和を保つ)
+                let sub = secs_to_ns(secs.max(0.0));
+                SPLIT_NS[pi][table][supp_row].fetch_sub(sub, Ordering::Relaxed);
+                SPLIT_NS[Phase::Both.idx()][table][supp_row]
+                    .fetch_sub(sub, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 pub fn reset() {
     for p in 0..Phase::N {
         for i in 0..N_OPS {
@@ -985,6 +1225,13 @@ pub fn reset() {
             TOKS[p][i].store(0, Ordering::Relaxed);
             CALLS_ROWS[p][i].store(0, Ordering::Relaxed);
             EXEC_CALLS[p][i].store(0, Ordering::Relaxed);
+        }
+        // s138: 分割表 (decode chain / 線形ラッパ) もクリアする
+        for t in 0..SPLIT_TABLES {
+            for i in 0..SPLIT_ROWS {
+                SPLIT_NS[p][t][i].store(0, Ordering::Relaxed);
+                SPLIT_CALLS[p][t][i].store(0, Ordering::Relaxed);
+            }
         }
         for i in 0..D2H_N {
             D2H_SUB_NS[p][i].store(0, Ordering::Relaxed);
@@ -1308,6 +1555,190 @@ fn push_gdn_pf_rows(p: usize, total: u64, indent: &str, s: &mut String) {
     }
 }
 
+/// s138 (Task B6): 分割表 (`table`) の 1 行ずつを `indent` 付きで積む。
+/// 各行 = (名前, 合計 ms, その段が起きた回数, 合計に対する比, 1 回あたり ms)。
+/// **表示専用** — `SPLIT_NS` / `SPLIT_CALLS` を読むだけで、どのバケットにも
+/// 書かないし、`total` にも足さない (分割の和は外側の区間と別勘定)。
+fn push_split_rows(p: usize, table: usize, total: u64, indent: &str, s: &mut String) {
+    if table >= SPLIT_TABLES {
+        return;
+    }
+    let n_rows = if table == SPLIT_CHAIN_TABLE {
+        SPLIT_CHAIN_ROWS
+    } else {
+        SPLIT_Q4_N
+    };
+    let mut sum = 0u64;
+    for i in 0..n_rows {
+        // 行名は表ごとに行数が違うので、行数で switch せず `names()` を引く。
+        let name = split_row_name(table, i).unwrap_or("?");
+        let sns = SPLIT_NS[p][table][i].load(Ordering::Relaxed);
+        if sns == 0 {
+            continue;
+        }
+        let sc = SPLIT_CALLS[p][table][i].load(Ordering::Relaxed);
+        sum += sns;
+        let per = if sc > 0 {
+            sns as f64 / sc as f64 / 1e6
+        } else {
+            0.0
+        };
+        s.push_str(&format!(
+            "{indent}{:<14} {:>10.1} {:>8} {:>6.1}% {:>9.3}\n",
+            name,
+            sns as f64 / 1e6,
+            sc,
+            sns as f64 / total.max(1) as f64 * 100.0,
+            per
+        ));
+    }
+    if sum > 0 {
+        s.push_str(&format!(
+            "{indent}{:<14} {:>10.1}\n",
+            "  = split sum",
+            sum as f64 / 1e6
+        ));
+    }
+}
+
+/// s138 (Task B6): 分割表の 1 行の表示名 (未定義の行は `None`)。
+/// 表ごとに行数が違う (`SPLIT_CHAIN_ROWS` = 9 / `SPLIT_Q4_N` = 8) ので、
+/// 「行数で配列を選ぶ」のではなく行の添字で名前を引く。
+pub fn split_row_name(table: usize, row: usize) -> Option<&'static str> {
+    if table == SPLIT_CHAIN_TABLE && row < SPLIT_CHAIN_ROWS {
+        Some(SPLIT_CHAIN_NAMES[row])
+    } else if table == SPLIT_Q4_TABLE && row < SPLIT_Q4_N {
+        Some(SPLIT_Q4_NAMES[row])
+    } else {
+        None
+    }
+}
+
+/// s138 (Task B6): 表 `table` の行数 (表 A = 9 / 表 B = 8)。表示側とテストが
+/// 「その表に何行あるか」を 1 か所から引くためのもの (行数で分岐を散らかさない)。
+#[inline]
+pub fn split_rows(table: usize) -> usize {
+    if table == SPLIT_CHAIN_TABLE {
+        SPLIT_CHAIN_ROWS
+    } else if table == SPLIT_Q4_TABLE {
+        SPLIT_Q4_N
+    } else {
+        0
+    }
+}
+
+/// s138 (Task B6): 分割表の**待ち合計** (1 行)。summary の先頭ヘッダで
+/// 「プロファイルが捕まえた時間」と「捕まえていない時間」を並べるために使う。
+/// 行が無ければ 0。
+fn split_wait_ns(p: usize, table: usize) -> u64 {
+    if table >= SPLIT_TABLES {
+        return 0;
+    }
+    SPLIT_NS[p][table][SPLIT_WAIT_ROW[table]].load(Ordering::Relaxed)
+}
+
+/// s138 (Task B6): サンプル数のヘッダ (1 行)。**187 token の平均を 1 step の
+/// 値と取り違えないため**、decode の行が何回のサンプルに基づくかを先に出す。
+///
+/// 出す値 (decode は「1 token = 1 サンプル」なので calls = steps):
+///   decode steps        … decode の行が積まれたステップ数 (= 応答トークン数 − 1 程度)
+///   chain split / sum   … ステップ分割 (表 A) を閉じた回数とその和 (待ち込み)
+///   chain wait          … そのうち sync で待った時間
+///   lin calls / split   … 線形ラッパ (表 B) の呼び出し数 / 分割を閉じた回数
+///   lin sum / sync wait … その和と、そのうち sync で待った時間
+///
+/// 注: `chain split` < `decode steps` は「decode の行は積まれたが分割されていない
+/// ステップ」がある = 分割の付け漏れ。数字を突き合わせて気づけるようにする。
+fn push_sample_header(p: usize, s: &mut String) {
+    // decode のステップ数 = 行を積んだ回数の最大値 (どのステップでも通る op を
+    // 1 つ選ぶのは脆いので最大を採る — sampler / detok が無い構成でも動く)
+    let mut decode_steps = 0u64;
+    for i in 0..N_OPS {
+        decode_steps = decode_steps.max(CALLS[p][i].load(Ordering::Relaxed));
+    }
+    let chain_splits = SPLIT_CALLS[p][SPLIT_CHAIN_TABLE][CHAIN_LAUNCH - SPLIT_CHAIN_FIRST]
+        .load(Ordering::Relaxed)
+        .max(
+            SPLIT_CALLS[p][SPLIT_CHAIN_TABLE][CHAIN_SYNC_WAIT - SPLIT_CHAIN_FIRST]
+                .load(Ordering::Relaxed),
+        );
+    let mut chain_sum = 0u64;
+    for i in 0..SPLIT_CHAIN_ROWS {
+        chain_sum += SPLIT_NS[p][SPLIT_CHAIN_TABLE][i].load(Ordering::Relaxed);
+    }
+    // 線形ラッパの分母: 出力確保の段は GPU 判定のどの経路でも起きる (CPU フォール
+    // バックでも通る) ので、`maybe_gpu_linear_*` の呼び出し数に近い。
+    let lin_calls = SPLIT_CALLS[p][SPLIT_Q4_TABLE][Q4P_OUT_ALLOC - SPLIT_Q4_FIRST]
+        .load(Ordering::Relaxed)
+        .max(
+            SPLIT_CALLS[p][SPLIT_Q4_TABLE][Q4P_KERNEL_LAUNCH - SPLIT_Q4_FIRST]
+                .load(Ordering::Relaxed),
+        );
+    let lin_splits =
+        SPLIT_CALLS[p][SPLIT_Q4_TABLE][Q4P_SYNC_WAIT - SPLIT_Q4_FIRST].load(Ordering::Relaxed);
+    let mut q4_sum = 0u64;
+    for i in 0..SPLIT_Q4_N {
+        q4_sum += SPLIT_NS[p][SPLIT_Q4_TABLE][i].load(Ordering::Relaxed);
+    }
+    let chain_wait = split_wait_ns(p, SPLIT_CHAIN_TABLE);
+    let q4_wait = split_wait_ns(p, SPLIT_Q4_TABLE);
+    s.push_str(&format!(
+        "  samples: decode steps {} / chain split {} (sum {:.1} ms, wait {:.1} ms) | \
+         lin calls {} / split {} (sum {:.1} ms, sync wait {:.1} ms)\n",
+        decode_steps,
+        chain_splits,
+        chain_sum as f64 / 1e6,
+        chain_wait as f64 / 1e6,
+        lin_calls,
+        lin_splits,
+        q4_sum as f64 / 1e6,
+        q4_wait as f64 / 1e6,
+    ));
+}
+
+/// s138 (Task B6): フェーズ節の最後に置く分割表。prefill は線形ラッパ (表 B)、
+/// decode は chain (表 A)。どちらも**そのフェーズでしか起きない**ので、表を
+/// 出し分けても読み手の混乱は無い (decode に lin_* は出ない)。
+/// 行が 1 本も無ければ何も出さない (PROFILE off の計測で空の節を出さない)。
+fn push_split_section(phase: Phase, s: &mut String) {
+    let p = phase.idx();
+    let table = match phase {
+        Phase::Prefill => SPLIT_Q4_TABLE,
+        Phase::Decode => SPLIT_CHAIN_TABLE,
+        Phase::Both => return,
+    };
+    let rows = phase_rows(p);
+    let total: u64 = rows.iter().map(|(_, _, self_ns, _, _, _, _)| *self_ns).sum();
+    let n_rows = if table == SPLIT_CHAIN_TABLE {
+        SPLIT_CHAIN_ROWS
+    } else {
+        SPLIT_Q4_N
+    };
+    let any = (0..n_rows).any(|i| SPLIT_NS[p][table][i].load(Ordering::Relaxed) > 0);
+    if !any {
+        return;
+    }
+    // decode は 1 token = 1 サンプル (calls 列 = その段が起きたステップ数)、
+    // prefill は 1 回の線形ラッパ呼び出しが 1 サンプル。
+    let steps = SPLIT_CALLS[p][table][SPLIT_WAIT_ROW[table]].load(Ordering::Relaxed);
+    // 見出しに `[prefill]` / `[decode]` を入れない (節の切れ目と紛れないため)。
+    // 表の種類は名前 (`chain_*` / `lin_*`) で分かる。
+    s.push_str(&format!(
+        "  SPLIT {} (exclusive, display only; {})\n",
+        Phase::NAMES[p].to_uppercase(),
+        if steps > 0 {
+            "calls = samples (decode: steps)"
+        } else {
+            "calls = per-call sites"
+        }
+    ));
+    s.push_str(&format!(
+        "  {:<14} {:>10} {:>8} {:>7} {:>9}\n",
+        "segment", "ms", "calls", "share", "ms/call"
+    ));
+    push_split_rows(p, table, total, "  ", s);
+}
+
 /// 整形済みサマリ (prefill / decode / cumulative の 3 テーブル) を返す。
 ///
 /// s57 (T4): 従来は decode+prefill の累積 1 表だった — prefill のホットスポットを
@@ -1315,8 +1746,16 @@ fn push_gdn_pf_rows(p: usize, total: u64, indent: &str, s: &mut String) {
 /// フェーズ別を先に出し、互換・合計確認用に cumulative を最後に残す
 /// (`cumulative` の各 op = prefill + decode、TOTAL も従来と同値)。
 /// d2h_state / attn_core の直後には細分行をインデントして出す。
+///
+/// s138 (Task B6): 先頭にサンプル数ヘッダ、`prefill` 節の最後に線形ラッパの分割
+/// (lin_*)、`decode` 節の最後に chain の分割 (chain_*) を出す。**どちらも表示専用**
+/// で、TOTAL (= self の和) には入らない。
 pub fn summary() -> String {
-    let mut s = String::from("PROFILE (prefill/decode split; tok/call = mean batch width):\n");
+    let mut s = String::from(
+        "PROFILE (prefill/decode split; tok/call = mean batch width; \
+         ms/calls = per-sample when calls = steps):\n",
+    );
+    push_sample_header(Phase::Prefill.idx(), &mut s);
     for ph in [Phase::Prefill, Phase::Decode] {
         phase_table(ph, &mut s);
     }
@@ -1405,6 +1844,12 @@ pub fn summary() -> String {
         }
     }
     s.push_str(&format!("  TOTAL {:.1} ms\n", total as f64 / 1e6));
+    // s138 (Task B6): 分割表は **最後** (cumulative の後) に置く。節の途中に
+    // 見出し行 (`[prefill]` / `[decode]`) を増やすと、既存の読み手 (ログの
+    // 切り出し・テスト) が節の切れ目を取り違えるため。ここは 1 本の表として
+    // 読み、「どの段が何 ms か」だけを見る。
+    push_split_section(Phase::Prefill, &mut s);
+    push_split_section(Phase::Decode, &mut s);
     s
 }
 
@@ -1671,6 +2116,326 @@ mod tests {
         }
         // 既存細分の末尾 (d2h_src_other) の直後から始まる
         assert_eq!(D2H_GDN_PROJ_FIRST, D2H_SRC_FIRST + D2H_SRC_N);
+    }
+
+    /// s138 (Task B6): 分割表 (decode chain / 線形ラッパ) の id が連番で、
+    /// 既存の細分 (D2H 細分 0..9 / GDN_PF 9..13 / D2H_SRC 13..19 / GDN_PROJ 19..23)
+    /// と交差せず、生 id (N_OPS = 15) の外側に収まること。
+    /// 番号を詰め直すと過去のプロファイルログとの比較が壊れるので、開始位置も固定する。
+    ///
+    /// s138 後半: 表ごとに行数が違う (表 A = `SPLIT_CHAIN_ROWS` 9 / 表 B =
+    /// `SPLIT_Q4_N` 8) ので、「表 A の行数ぶん進んだ所が表 B」という関係だけを固定し、
+    /// 「両表の行数は同じ」という前提は捨てた (`SPLIT_N` 廃止)。
+    #[test]
+    fn split_ids_are_outside_existing_ranges() {
+        assert_eq!(SPLIT_CHAIN_FIRST, 10 * D2H + 23);
+        assert_eq!(SPLIT_CHAIN_ROWS, SPLIT_CHAIN_NAMES.len());
+        assert_eq!(SPLIT_Q4_N, SPLIT_Q4_NAMES.len());
+        assert_eq!(SPLIT_Q4_FIRST, SPLIT_CHAIN_FIRST + SPLIT_CHAIN_ROWS);
+        // 積算器は一番多い表 (A = 9 行) の本数で確保する
+        assert_eq!(SPLIT_ROWS, SPLIT_CHAIN_ROWS.max(SPLIT_Q4_N));
+        assert!(SPLIT_ROWS >= SPLIT_CHAIN_ROWS && SPLIT_ROWS >= SPLIT_Q4_N);
+        for i in 0..SPLIT_CHAIN_ROWS {
+            let a = SPLIT_CHAIN_FIRST + i;
+            assert!(a >= N_OPS, "生 id の範囲外: {a}");
+            assert!(a < SPLIT_Q4_FIRST, "表 A と表 B の範囲が交差: {a}");
+            // 既存の細分 (GDN_PROJ の末尾) と重ならない
+            assert!(a >= D2H_GDN_PROJ_FIRST + D2H_GDN_PROJ_N);
+            // split_slot が (表, 行) へ正しく畳む
+            assert_eq!(split_slot(a), Some((SPLIT_CHAIN_TABLE, i)));
+        }
+        for i in 0..SPLIT_Q4_N {
+            let b = SPLIT_Q4_FIRST + i;
+            assert!(b >= N_OPS, "生 id の範囲外: {b}");
+            assert_eq!(split_slot(b), Some((SPLIT_Q4_TABLE, i)));
+        }
+        // 表 A の末尾の次が表 B の先頭 (間が空かない) / 表 B の次は範囲外
+        assert_eq!(split_slot(SPLIT_Q4_FIRST - 1), Some((SPLIT_CHAIN_TABLE, SPLIT_CHAIN_ROWS - 1)));
+        assert_eq!(split_slot(SPLIT_Q4_FIRST + SPLIT_Q4_N), None);
+        // 生 id・D2H 細分・既存細分の id は split_slot の範囲外 (誤って積まない)
+        for op in (0..N_OPS).chain([
+            D2H_LOGITS,
+            D2H_LOGITS_PF_HELD,
+            D2H_GDN_PF_FIRST,
+            D2H_SRC_FIRST,
+            D2H_GDN_PROJ_FIRST,
+            ATT_GDN,
+            ATT_GDN_SCAN,
+        ]) {
+            assert_eq!(split_slot(op), None, "既存 id {op} が分割表に入る");
+        }
+        // 待ち行はどちらの表でも**その表の行数**の範囲内
+        assert!(SPLIT_WAIT_ROW[SPLIT_CHAIN_TABLE] < SPLIT_CHAIN_ROWS);
+        assert!(SPLIT_WAIT_ROW[SPLIT_Q4_TABLE] < SPLIT_Q4_N);
+        assert_eq!(SPLIT_WAIT_ROW[SPLIT_CHAIN_TABLE], CHAIN_SYNC_WAIT - SPLIT_CHAIN_FIRST);
+        assert_eq!(SPLIT_WAIT_ROW[SPLIT_Q4_TABLE], Q4P_SYNC_WAIT - SPLIT_Q4_FIRST);
+        // 表 B の `lin_*` の id は表 A の行数に依らず `SPLIT_Q4_FIRST + i` で連番
+        assert_eq!(Q4P_OUT_ALLOC, SPLIT_Q4_FIRST);
+        assert_eq!(Q4P_HOST_COPY, SPLIT_Q4_FIRST + SPLIT_Q4_N - 1);
+        // 表 A の `chain_kernel` は 9 行目 (8 段 + 待ちの内訳 1 本)
+        assert_eq!(CHAIN_KERNEL_WAIT, SPLIT_CHAIN_FIRST + SPLIT_CHAIN_ROWS - 1);
+        // 行名は表ごとに引ける (行数を超える添字は None)
+        for i in 0..SPLIT_CHAIN_ROWS {
+            assert_eq!(split_row_name(SPLIT_CHAIN_TABLE, i), Some(SPLIT_CHAIN_NAMES[i]));
+            assert_eq!(split_rows(SPLIT_CHAIN_TABLE), SPLIT_CHAIN_ROWS);
+        }
+        for i in 0..SPLIT_Q4_N {
+            assert_eq!(split_row_name(SPLIT_Q4_TABLE, i), Some(SPLIT_Q4_NAMES[i]));
+            assert_eq!(split_rows(SPLIT_Q4_TABLE), SPLIT_Q4_N);
+        }
+        assert_eq!(split_row_name(SPLIT_CHAIN_TABLE, SPLIT_CHAIN_ROWS), None);
+        assert_eq!(split_row_name(SPLIT_Q4_TABLE, SPLIT_Q4_N), None);
+        // 表 A の 9 行目 (chain_kernel) は表 B には存在しない
+        assert_eq!(split_row_name(SPLIT_Q4_TABLE, SPLIT_CHAIN_ROWS - 1), None);
+        assert_eq!(split_rows(SPLIT_TABLES), 0);
+    }
+
+    /// s138 (Task B6): `split_flush_step` は段を**排他**に割る — 積んだ段の和が
+    /// 1 ステップの host 時間に一致し、段が起きなかった行の calls は増えない。
+    /// `split_sample` (区間を直接 1 本積む版) と同じ会計に入る。PROFILE 無効時は
+    /// 何も積まない。
+    ///
+    /// 表ごとに行数が違うので、表 A は `chain_kernel` (9 行目) まで、
+    /// 表 B は 8 行目 (`lin_host_copy`) までを 1 回ずつ確かめる。
+    #[test]
+    fn split_flush_is_exclusive_and_display_only() {
+        with_prof_counters(|| {
+            reset();
+            set_phase(Phase::Decode);
+            // 有効時: launch → sync → cpu の 3 段に割る (経過時間は測り直さない —
+            // sleep の粒度に依存しないよう、段の値は自分で決める)
+            let mut acc = [0.0; SPLIT_ROWS];
+            acc[CHAIN_LAUNCH - SPLIT_CHAIN_FIRST] = 0.002;
+            acc[CHAIN_SYNC_WAIT - SPLIT_CHAIN_FIRST] = 0.010;
+            acc[CHAIN_CPU - SPLIT_CHAIN_FIRST] = 0.001;
+            let sum: f64 = acc.iter().sum();
+            assert!((sum - 0.013).abs() < 1e-12, "段の和が host 時間に一致しない: {sum}");
+            // 触っていない段は 0 (排他)
+            assert_eq!(acc[CHAIN_D2H_LOGITS - SPLIT_CHAIN_FIRST], 0.0);
+            assert_eq!(acc[CHAIN_OUTER - SPLIT_CHAIN_FIRST], 0.0);
+            assert_eq!(acc[CHAIN_KERNEL_WAIT - SPLIT_CHAIN_FIRST], 0.0);
+            // 表へ流し込む: 行ごとに時間と「起きた回数」が入る
+            split_flush_step(SPLIT_CHAIN_TABLE, &acc, 1, None);
+            let p = Phase::Decode.idx();
+            for row in [CHAIN_LAUNCH, CHAIN_SYNC_WAIT, CHAIN_CPU] {
+                let i = row - SPLIT_CHAIN_FIRST;
+                assert!(SPLIT_NS[p][SPLIT_CHAIN_TABLE][i].load(Ordering::Relaxed) > 0);
+                assert_eq!(SPLIT_CALLS[p][SPLIT_CHAIN_TABLE][i].load(Ordering::Relaxed), 1);
+            }
+            for row in [CHAIN_D2H_LOGITS, CHAIN_OUTER, CHAIN_KERNEL_WAIT] {
+                let i = row - SPLIT_CHAIN_FIRST;
+                assert_eq!(
+                    SPLIT_CALLS[p][SPLIT_CHAIN_TABLE][i].load(Ordering::Relaxed),
+                    0,
+                    "起きていない段の calls は増えない (行 {i})"
+                );
+            }
+            // 表 B (8 行) 側も同じ規約: 最終行 (`lin_host_copy`) まで積める
+            set_phase(Phase::Prefill);
+            let mut accq = [0.0; SPLIT_ROWS];
+            accq[Q4P_OUT_ALLOC - SPLIT_Q4_FIRST] = 0.004;
+            accq[Q4P_HOST_COPY - SPLIT_Q4_FIRST] = 0.003;
+            split_flush_step(SPLIT_Q4_TABLE, &accq, 1, None);
+            let pp = Phase::Prefill.idx();
+            for row in [Q4P_OUT_ALLOC, Q4P_HOST_COPY] {
+                let i = row - SPLIT_Q4_FIRST;
+                assert!(SPLIT_NS[pp][SPLIT_Q4_TABLE][i].load(Ordering::Relaxed) > 0);
+                assert_eq!(SPLIT_CALLS[pp][SPLIT_Q4_TABLE][i].load(Ordering::Relaxed), 1);
+            }
+            // 表 A の 9 行目は表 B の範囲外 — 表 B の flush では 8 行しか見ない
+            // (acc に 9 行目の値が入っていても表 B には積まれない)
+            set_phase(Phase::Decode);
+            // 表示専用: 生 id (N_OPS 未満) には 1 サンプルも入らない。会計の static は
+            // プロセス共有で、`with_prof_counters` のロックを取らない他テストが
+            // 並走して値を積むため、絶対値 0 ではなく「分割の前後で不変」で見る。
+            let snap: Vec<(u64, u64)> = (0..N_OPS)
+                .map(|i| {
+                    (
+                        NS[p][i].load(Ordering::Relaxed),
+                        CALLS[p][i].load(Ordering::Relaxed),
+                    )
+                })
+                .collect();
+            let mut acc2 = [0.0; SPLIT_ROWS];
+            acc2[CHAIN_OUTER - SPLIT_CHAIN_FIRST] = 0.003;
+            split_flush_step(SPLIT_CHAIN_TABLE, &acc2, 1, None);
+            for i in 0..N_OPS {
+                assert_eq!(
+                    (NS[p][i].load(Ordering::Relaxed), CALLS[p][i].load(Ordering::Relaxed)),
+                    snap[i],
+                    "生 id {i} を分割表が汚した"
+                );
+            }
+            reset();
+        });
+    }
+
+    /// s138: 範囲外の id は黙って捨てる (誤って生 id へ落ちない)。
+    /// `split_sample` は id を `split_slot` で畳むので、表の外 (生 id・隣の表の
+    /// 終端より先) は会計に届かない。
+    #[test]
+    fn split_sample_ignores_unknown_ids() {
+        with_prof_counters(|| {
+            reset();
+            set_phase(Phase::Decode);
+            // 生 id は分割表に入らない
+            split_sample(QKV, 1_000, 1);
+            split_sample(GATE_UP, 1_000, 1);
+            // 表 A の終端より先 / 表 B の終端より先
+            split_sample(SPLIT_Q4_FIRST + SPLIT_Q4_N, 1_000, 1);
+            for t in 0..SPLIT_TABLES {
+                for i in 0..SPLIT_ROWS {
+                    assert_eq!(
+                        SPLIT_NS[Phase::Decode.idx()][t][i].load(Ordering::Relaxed),
+                        0,
+                        "範囲外の id が表 {t} の行 {i} に入った"
+                    );
+                    assert_eq!(
+                        SPLIT_CALLS[Phase::Decode.idx()][t][i].load(Ordering::Relaxed),
+                        0
+                    );
+                }
+            }
+            // 表の中の id は入る (上の「入らない」が範囲の取り違えでないことの対照)
+            split_sample(CHAIN_KERNEL_WAIT, 1_000, 1);
+            split_sample(Q4P_HOST_COPY, 2_000, 1);
+            let p = Phase::Decode.idx();
+            assert_eq!(
+                SPLIT_NS[p][SPLIT_CHAIN_TABLE][CHAIN_KERNEL_WAIT - SPLIT_CHAIN_FIRST]
+                    .load(Ordering::Relaxed),
+                1_000
+            );
+            assert_eq!(
+                SPLIT_NS[p][SPLIT_Q4_TABLE][Q4P_HOST_COPY - SPLIT_Q4_FIRST].load(Ordering::Relaxed),
+                2_000
+            );
+            // `calls = 0` は時間だけ積む (起きなかった段を分母から外す用)
+            split_sample(CHAIN_CPU, 500, 0);
+            assert_eq!(
+                SPLIT_NS[p][SPLIT_CHAIN_TABLE][CHAIN_CPU - SPLIT_CHAIN_FIRST].load(Ordering::Relaxed),
+                500
+            );
+            assert_eq!(
+                SPLIT_CALLS[p][SPLIT_CHAIN_TABLE][CHAIN_CPU - SPLIT_CHAIN_FIRST]
+                    .load(Ordering::Relaxed),
+                0
+            );
+            reset();
+        });
+    }
+
+    /// s138: サンプル数のヘッダが decode の steps と chain の分割回数を並べ、
+    /// 分割表の行 (chain_* / lin_*) が summary に出る。TOTAL は従来どおり
+    /// self の和で、分割表を足し込まない (表示専用)。
+    #[test]
+    fn summary_prints_sample_counts_and_split_rows() {
+        with_prof_counters(|| {
+            reset();
+            // decode 2 ステップ (op は 1 行ずつ): 分割は 2 回とも閉じる
+            set_phase(Phase::Decode);
+            for _ in 0..2 {
+                add_sample(Phase::Decode, GATE_UP, 3_000_000, 1, 1, true);
+                let mut acc = [0.0; SPLIT_ROWS];
+                acc[CHAIN_LAUNCH - SPLIT_CHAIN_FIRST] = 0.002;
+                acc[CHAIN_SYNC_WAIT - SPLIT_CHAIN_FIRST] = 0.010;
+                acc[CHAIN_D2H_LOGITS - SPLIT_CHAIN_FIRST] = 0.001;
+                split_flush_step(SPLIT_CHAIN_TABLE, &acc, 1, None);
+            }
+            // prefill: 線形ラッパ 1 call 分 (launch / sync / 確保)
+            set_phase(Phase::Prefill);
+            add_sample(Phase::Prefill, GATE_UP, 20_000_000, 1, 18, true);
+            let mut acc = [0.0; SPLIT_ROWS];
+            acc[Q4P_OUT_ALLOC - SPLIT_Q4_FIRST] = 0.004;
+            acc[Q4P_H2D_STAGE - SPLIT_Q4_FIRST] = 0.001;
+            acc[Q4P_KERNEL_LAUNCH - SPLIT_Q4_FIRST] = 0.002;
+            acc[Q4P_SYNC_WAIT - SPLIT_Q4_FIRST] = 0.013;
+            split_flush_step(SPLIT_Q4_TABLE, &acc, 1, None);
+            set_phase(Phase::Decode);
+
+            // 表はプロセス共有 (並走テストが値を消し得る) なので、このテストは
+            // ロック内で積み終えてから 1 回だけ summary を作る。値の絶対性ではなく
+            // 「ヘッダの形」と「表の出し分け」を見る。
+            let s = summary();
+            // 1) サンプル数のヘッダが 1 行出る (187 token の平均を 1 step と読まないため)
+            let head = s
+                .lines()
+                .find(|l| l.contains("samples: decode steps"))
+                .unwrap_or_else(|| panic!("samples ヘッダが無い\n{s}"));
+            assert!(head.contains("decode steps "), "decode の steps: {head}");
+            assert!(head.contains("chain split "), "chain の分割回数: {head}");
+            assert!(head.contains("lin calls "), "線形ラッパの呼び出し数: {head}");
+            // 2) 分割表 (cumulative の後) に chain_* / lin_* 行が出る。
+            //    表は節の外 (summary の末尾) なので、SPLIT の見出しで切る。
+            let dec = s
+                .split("SPLIT DECODE")
+                .nth(1)
+                .unwrap_or_else(|| panic!("SPLIT DECODE が無い\n{s}"))
+                .to_string();
+            let pre = s
+                .split("SPLIT PREFILL")
+                .nth(1)
+                .unwrap_or_else(|| panic!("SPLIT PREFILL が無い\n{s}"))
+                .split("SPLIT DECODE")
+                .next()
+                .unwrap()
+                .to_string();
+            for name in ["chain_launch", "chain_sync_wait", "chain_d2h_logits"] {
+                let line = dec
+                    .lines()
+                    .find(|l| l.split_whitespace().next() == Some(name))
+                    .unwrap_or_else(|| panic!("decode の分割に {name} 行が無い\n{s}"));
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                let calls: u64 = cols[2].parse().expect("calls は数値");
+                assert!(calls >= 2, "calls はステップ数 (>=2): {line}");
+            }
+            for name in ["lin_out_alloc", "lin_kernel", "lin_sync_wait"] {
+                let line = pre
+                    .lines()
+                    .find(|l| l.split_whitespace().next() == Some(name))
+                    .unwrap_or_else(|| panic!("prefill の分割に {name} 行が無い\n{s}"));
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                let calls: u64 = cols[2].parse().expect("calls は数値");
+                assert!(calls >= 1, "calls は線形ラッパの呼び出し数 (>=1): {line}");
+            }
+            // 表の出し分け: decode 側に lin_* / prefill 側に chain_* は出ない
+            assert!(!dec.contains("lin_kernel"));
+            assert!(!pre.contains("chain_launch"));
+            // 3) 表示専用: decode の TOTAL は self の和のまま (分割表を足し込まない)。
+            //    並走テストの値が混ざるので、TOTAL = 行の self の和 を確かめる。
+            let decode_section = s.split("[decode]").nth(1).expect("decode 節が無い");
+            // 節の見出しは `[decode]` の直後 (節の切れ目で落とした) なので、
+            // TOTAL 行は節の先頭そのもの。行の先頭は `" total ..."` になる。
+            let dec_total = decode_section
+                .lines()
+                .find(|l| l.trim_start().starts_with("total "))
+                .expect("decode TOTAL 行が無い");
+            // `  [decode] total 6.0 ms ...` → "total" の次が ms
+            let total_ms: f64 = dec_total
+                .split_whitespace()
+                .skip_while(|t| *t != "total")
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .expect("decode TOTAL の ms");
+            let mut self_sum = 0.0f64;
+            // TOTAL 行より後ろは次の節 (`[cumulative]`) — 表の行だけを足す
+            for line in decode_section
+                .lines()
+                .skip(2)
+                .take_while(|l| !l.contains("[cumulative]"))
+            {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() == 7 {
+                    if let Ok(v) = cols[6].parse::<f64>() {
+                        self_sum += v;
+                    }
+                }
+            }
+            assert!(
+                (total_ms - self_sum).abs() < 0.2,
+                "decode TOTAL は self の和 (分割表は足さない): total={total_ms} self_sum={self_sum}"
+            );
+            reset();
+        });
     }
 
     /// s57 (T4): attn_core の層種別細分 id が生 id の範囲外で連番であること。
