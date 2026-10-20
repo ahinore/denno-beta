@@ -1,6 +1,6 @@
 #!/bin/sh
 # One-command CPU-only gate: kernels, engine lib, server, then every python self-test
-# and python test suite (cold_ab, long conversation, needle, dashboard).
+# and python test suite (cold_ab, long conversation, needle, dashboard, ngram oracle).
 #
 # Stops at the first failure, prints one line per stage plus a final PASS/FAIL,
 # and exits 0 only if everything passed. No network, no server start/stop, no
@@ -41,6 +41,8 @@ needle_selftest:python3 scripts/needle_selftest.py
 needle_help:python3 scripts/needle_check.py --help
 dashboard_selftest:python3 scripts/dashboard.py --self-test
 dashboard_tests:python3 scripts/test_dashboard.py
+ngram_oracle_selftest:python3 scripts/ngram_oracle.py --self-test
+ngram_oracle_tests:python3 scripts/test_ngram_oracle.py
 '
 
 case "${1:-}" in

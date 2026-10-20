@@ -2395,6 +2395,57 @@ cannot be measured in this container. The document labels each number measured /
 estimated and marks the p table as an assumption. The oracle and the one-step measurement are
 GPU-host work (the supervisor can run them).
 
+### s120: measured the n-gram acceptance rate p and **closed** plan B (CPU only, `.cu` / anchors untouched)
+
+> Session 120. The s119 design doc said plan B's fate rests only on p - the rate at which a
+> 12-gram context recurs with the same continuation - and that measuring it needs no GPU.
+> So the tool was built and the measurement was run. **`crates/` and `kernels/` are unchanged
+> to the byte** (zero `.cu` / `.ptx` diff, no server started).
+
+- Tool: `scripts/ngram_oracle.py` (new, stdlib only, no network, no model weights, randomness
+  only as the synthetic corpus's fixed seed). It scans each position in ascending order once,
+  counts only positions whose context **occurred before** as opportunities, and checks whether
+  the next k tokens match. A position whose previous continuation is shorter than k is not an
+  opportunity (no draft can be built). It uses the **most recent** previous occurrence, matching
+  an implementation that searches the context backwards; using an earlier one would be too
+  generous
+- Two tokenizations are reported: `words` (runs of ASCII alphanumerics / single punctuation /
+  Japanese split at character-class boundaries) and `bytes` (raw UTF-8). **Neither is the model
+  tokenizer** (no weights available)
+- Corpora: (a) proxy = `docs/*.ja.md` + `docs/*.en.md` + `crates/**/*.rs` (58 documents),
+  (b) synthetic tool-call-style text (fixed seed, repeated JSON arguments, the same key names
+  and the same file paths recurring). **No real prompt log was sought**. Both the output and
+  the documents label them PROXY / SYNTHETIC
+- **Measured p (n = 12, with denominators)**:
+  - proxy words: 1,235,606 tokens / 368,831 opportunities. p_1 = 0.2984 (110,072 hits),
+    p_2 = 0.1521, p_3 = 0.1216, p_4 = 0.0970
+  - proxy bytes: 2,667,516 tokens / 955,830 opportunities. p_1 = 0.1265 (120,950 hits),
+    p_2 = 0.0588, p_3 = 0.0428, p_4 = 0.0337
+  - synthetic words: 226,194 tokens / 205,686 opportunities. p_1 = 0.1156 (23,776 hits),
+    p_2 = 0.0286, p_3 = 0.0171, p_4 = 0.0064
+  - a shorter context does not lift it: proxy words n = 2 gives p_1 = 0.3316, p_2 = 0.2134;
+    n = 4 gives p_1 = 0.3400. Synthetic n = 4 gives p_1 = 0.0767, p_4 = 0.0000
+- **Verdict: plan B is closed (measured p).** Against p* = 0.0006 the measured values have
+  190-550x of headroom, but the break-even that binds is the one for a *useful* speed-up and
+  the measurement does not reach it. Plan B pays **two ordinary steps (draft + verify)** for
+  every accepted token, so the effective time is `(2S + C_d)/(1 + p_1)`. With `S` = 16.4 ms
+  (measured) and p_1 = 0.2984 that is **25.3 ms/token = +54 % versus plain decode**, and it only
+  wins at `p_1 > 1 + 2 C_d / S` = **1.00001**, which is impossible for any C_d >= 0. Measuring p
+  therefore cannot change the verdict; only making the draft cheaper than a normal step can,
+  and that is plan A's territory (with its numeric-class cost)
+- `scripts/test_ngram_oracle.py` (new, 29 tests): hand-computable inputs (most recent
+  occurrence, the opportunity cut-off, k > n, overlapping contexts, periodic sequences) /
+  opportunity 0 and empty input give a null p / non-UTF-8 is skipped with exit 0 / two
+  documents add up / the synthetic corpus is deterministic / `--json` is byte-identical across
+  runs / bad arguments exit 2. `scripts/run_cpu_checks.sh` gains two stages at the end
+  (`ngram_oracle_selftest`, `ngram_oracle_tests`); the existing stages are untouched
+
+**Human steps (what is not measured)**: the **real-workload p (model output) is NOT measured**.
+The proxy is repository text, not generated text. Re-measuring n = 2 / n = 12 on a real log is
+operator work (this container forbids seeking personal data or fetching over the network). The
+`(2S + C_d)/(1 + p)` inequality above does not depend on p's value, so the verdict is not
+expected to change.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)

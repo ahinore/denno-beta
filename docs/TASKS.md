@@ -179,6 +179,43 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 - Consequence: decode stays at ~16.4 ms/token (GPU-compute bound). The decode axis is closed
   unless a multi-token speculative decoder is designed as its own task (would need `.cu` +
   anchor re-baseline, i.e. an operator decision).
+- Speculation follow-up (s119 design + s120 measurement): `docs/SPEC_DECODE_DESIGN.md` compares
+  three plans. Plan A (in-place verification) cannot be bit-exact; A-lite (drive the existing
+  `n >= 2` path) breaks even only at p* = 0.885 and is rejected for speed. Plan B (n-gram /
+  in-prompt lookup, host-side draft, one ordinary step per draft/verify/reject) keeps the
+  existing bit-exact and deterministic contracts with **p\* = 0.0006**, so its verdict rests
+  only on p = "the 12-gram context recurs and continues the same way".
+- **Plan B measured (s120, `scripts/ngram_oracle.py`, CPU only, no model weights):**
+  p_1 = 0.2984 (110,072 / 368,831) on the **proxy** corpus (`docs/*.ja.md` + `docs/*.en.md` +
+  `crates/**/*.rs`, 58 files, 1,235,606 tokens, approximate word split) and
+  p_1 = 0.1265 (120,950 / 955,830) with the raw-UTF-8-byte tokenizer (2,667,516 tokens); the
+  **synthetic** tool-call corpus gives p_1 = 0.1156 (23,776 / 205,686). k = 2..4 fall off fast
+  (proxy words 0.1521 / 0.1216 / 0.0970; synthetic 0.0286 / 0.0171 / 0.0064), and shrinking the
+  context does not help (proxy words n = 2: p_1 = 0.3316, p_2 = 0.2134). Both tokenizers are
+  approximations, not the model tokenizer, and **the corpus is a proxy, not model output**;
+  the real-workload p is **not measured**.
+- **Decision (s120): plan B is closed on the measured p.** p* = 0.0006 is not close to being
+  the binding constraint here (every measured p_1 is 190-2,600x above it: 0.1156/0.0006 = 193
+  to 0.3316/0.0006 = 553), but the *useful* break-even is, and the arithmetic from the s119
+  formulas says the measured range cannot reach it:
+  - plan B costs a **draft step + a verify step** per accepted token, so with `S` = 16.4 ms
+    (measured) the effective time is `(2S + C_d) / (1 + p_1)`. At p_1 = 0.2984 that is
+    32.80 / 1.2984 = **25.3 ms/token**, i.e. **+54 % vs plain decode**, not a gain.
+  - it only wins when `p_1 > 1 + 2 C_d / S` = **1.00001**, i.e. **never** for any C_d >= 0.
+    The p at which the 12 ms/token target is met is `(1 + p_1)/32.8 >= 1/12` -> p_1 >= 1.73,
+    which p cannot reach (p <= 1).
+  - the invariant behind both numbers: a draft step that can be rejected buys nothing unless
+    it costs **less than a normal step**. Measuring p cannot change that; only making the draft
+    cheaper than `S` can.
+- Therefore the honest statement is: **n-gram speculation (plan B) is closed (measured p).**
+  The measurement was still worth running - it rules out the one plan that preserved the
+  bit-exact contract, and it says the decode axis has no host-side lever left. Reopening it
+  would need a draft cheaper than `S` (an approximate draft model, or folding draft+verify into
+  one forward), which is plan A's territory and carries the numeric-class cost s119 rejected.
+- Next measurement, only if that changes: a **real response token log** (token ids from the
+  server) at n = 2 and n = 12 to confirm the proxy numbers on model output. Providing that log
+  is an operator task (privacy/network policy forbids fetching one here); the real-workload p
+  is **not measured**.
 
 ## P3 — correctness and debt
 
