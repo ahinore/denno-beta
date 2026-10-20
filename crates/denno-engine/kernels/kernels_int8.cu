@@ -442,6 +442,153 @@ extern "C" __global__ void dno_gemv_q4_0mr(
     }
 }
 
+// ---------------------------------------------------------------------------
+// s133 (Task B1, attempt 2): 列ブロック版 GEMV。
+//
+// s132 の `dno_gemv_q4_0mr` は重みの読みを行で使い回したが、実測では何も速く
+// ならなかった (m=2 も m=8 も 1 行あたり約 0.40 ms のまま)。理由は帯域ではなく
+// 命令発行量で、1 warp = 1 出力列の形では 1 MAC あたり
+//   A のロード 1 + FMA (mul+add) 1
+// の 2 命令が必ず要る (m=1 は 5120 本の依存する加算鎖を 34816 warp が持つ形)。
+// ここでは warp が A の 8 値をレジスタに 1 回だけ読み、その 8 値を C 列ぶんの
+// 重みに使い回す。命令数は 1 MAC あたり 1 + 1/C になる。
+//
+// 形: grid = (ceil(n / (8*C)), m)、block = 256 thread (8 warp)。
+//   warp w は列 8 本 (gj = blockIdx.x * 8C + w*C + c, c = 0..C-1) を受け持つ。
+//   列の持ち方は 1 warp 内で C 本なので、warp 数 (8) は変えない。
+//   1 block の列数は 8*C に広がる (C=4 で 32 列/block)。
+//
+// 数値: 1 列ぶんの累積順は `dno_gemv_q4_0` / `dno_gemv_q4_0mr` と同一。
+//   lane がブロック b (b = lane, lane+32, ... 昇順) を受け持ち、
+//   各ブロック内の 32 要素を「wi 昇順 -> e 昇順 -> 低ニブル, 高ニブル」の順に
+//   1 本の鎖で足し、最後に warp 内 shfl_down (16,8,4,2,1) で縮約する。
+//   積と加算は `__fmul_rn` / `__fadd_rn` を明示する (FMA 縮約をさせない)。
+//   縮約は c ごとに 1 本ずつ回す (同時に C 本回すと順序が c 間で混ざり、
+//   `__shfl_down_sync` の full mask で他の列の値を読むことになるため)。
+//
+// A の読みは `ld.global.nc` (__ldg) で 1 ブロック 8 値 1 回。列方向には
+// 隣の warp と同じ A を読むので L1/L2 で当たる。
+//
+// テンプレートにするのは C ごとに `acc` がレジスタへ載るか (local memory へ
+// spill しないか) が変わるため。s132 の `dno_gemv_q4_0mr` は acc[8] が
+// local memory へ落ちていた (コミット済み PTX に `ld.local` 9 / `st.local` 11
+// があり、行ごとの鎖が毎回メモリ経由になっていた)。ここで生かすのは C 本の
+// アキュムレータ、A の 32 値 (av)、重み 1 ブロックぶんの words[4] だけ。
+template <int C>
+__device__ __forceinline__ void dno_gemv_q4_0_cols(
+    const float* __restrict__ a,    // [m, k]
+    const uint4* __restrict__ nib,  // [n, nb]
+    const float* __restrict__ sc,   // [n, nb]
+    float* __restrict__ out,        // [m, n]
+    int m, int k, int n)
+{
+    const int nb = k >> 5;                  // 1 ブロック = 32 要素
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;      // 0..7 (blockDim.x = 256)
+    const int j0 = blockIdx.x * (8 * C) + warp * C;
+    const int i = blockIdx.y;
+    if (j0 >= n || i >= m || nb <= 0) return;
+
+    const float* ai = a + (size_t)i * (size_t)k;
+
+    // 列ごとの独立アキュムレータ。C 列とも「lane が受持つブロックを昇順に
+    // 1 本の鎖で足す」形を崩さない。
+    float acc[C];
+    #pragma unroll
+    for (int c = 0; c < C; c++) acc[c] = 0.0f;
+
+    for (int b = lane; b < nb; b += 32) {
+        const int base = b << 5;
+        // A の 32 要素は C 列で共通。レジスタへ 1 回だけ読む (これが s133 の
+        // 要点: 従来は列ごとに同じ A を読み直していた)。
+        // lane が持つのはブロック b の先頭 32 要素なので、16 B 読み x8 で
+        // ちょうど 32 値。各 e の反復で使う 4 値が 1 回の ld.global.v4.f32 に
+        // なる並び (av[4t..4t+3]) で置く。
+        float av[32];
+        {
+            const uint4* a4 = (const uint4*)(ai + base);
+            #pragma unroll
+            for (int t = 0; t < 8; t++) {
+                const uint4 v4 = __ldg(&a4[t]);
+                av[t * 4 + 0] = __uint_as_float(v4.x);
+                av[t * 4 + 1] = __uint_as_float(v4.y);
+                av[t * 4 + 2] = __uint_as_float(v4.z);
+                av[t * 4 + 3] = __uint_as_float(v4.w);
+            }
+        }
+
+        // 重みは列ごとに違うので c ループの内側で読む。1 列 = 18 B (16 B
+        // ニブル + f32 スケール) で、C 列でも 1 行あたり nb ブロック 1 回。
+        #pragma unroll
+        for (int c = 0; c < C; c++) {
+            const int gj = j0 + c;
+            if (gj >= n) break;
+            const size_t row = (size_t)gj * (size_t)nb;
+            const float d = sc[row + b];
+            const uint4 v = nib[row + b];
+            const unsigned int words[4] = {v.x, v.y, v.z, v.w};
+            float s = acc[c];
+            #pragma unroll
+            for (int wi = 0; wi < 4; wi++) {
+                const unsigned int w32 = words[wi];
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int qlo = (int)((w32 >> (8 * e)) & 0xFu) - 8;
+                    const int qhi = (int)((w32 >> (8 * e + 4)) & 0xFu) - 8;
+                    s = __fadd_rn(s, __fmul_rn(av[wi * 4 + e], __fmul_rn(d, (float)qlo)));
+                    s = __fadd_rn(s, __fmul_rn(av[16 + wi * 4 + e], __fmul_rn(d, (float)qhi)));
+                }
+            }
+            acc[c] = s;
+        }
+    }
+
+    // warp 内縮約は列ごとに 1 本ずつ。C 列を同時に shfl すると、off 段の
+    // `__shfl_down_sync` が full mask で他の列の値まで読む形になり、
+    // 「列ごとに独立な 16,8,4,2,1 の木」という契約が読みにくくなるため。
+    #pragma unroll
+    for (int c = 0; c < C; c++) {
+        const int gj = j0 + c;
+        if (gj >= n) break;
+        float s = acc[c];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            s = __fadd_rn(s, __shfl_down_sync(0xffffffffu, s, off));
+        }
+        if (lane == 0) {
+            out[(size_t)i * (size_t)n + gj] = s;
+        }
+    }
+}
+
+#define Q4_GEMV_C 4
+// 1 warp が A の 32 値 (18 ブロック分のうち 1 ブロック) をレジスタで持ち、
+// C 列ぶんの重みを回す。acc は C 本 + av 32 本 + words 4 本 = C 付近で
+// 40 本強。ローカルメモリへ落ちると (s132 の acc[8] は ld.local 9 回・
+// st.local 11 回だった) 命令数が増えて狙いが消えるので、ブロック数を
+// 抑えてレジスタを確保する。
+#define Q4_GEMV_LAUNCH_BOUNDS __launch_bounds__(256, 4)
+// C の候補 (2 / 4 / 8) を同じファイルで比較するための入口。
+// 既定は C = Q4_GEMV_C、2 と 8 は DENNO 側の定数を変えて差し替える。
+extern "C" __global__ Q4_GEMV_LAUNCH_BOUNDS void dno_gemv_q4_0c2(
+    const float* __restrict__ a, const uint4* __restrict__ nib,
+    const float* __restrict__ sc, float* __restrict__ out,
+    int m, int k, int n) {
+    dno_gemv_q4_0_cols<2>(a, nib, sc, out, m, k, n);
+}
+extern "C" __global__ Q4_GEMV_LAUNCH_BOUNDS void dno_gemv_q4_0c4(
+    const float* __restrict__ a, const uint4* __restrict__ nib,
+    const float* __restrict__ sc, float* __restrict__ out,
+    int m, int k, int n) {
+    dno_gemv_q4_0_cols<4>(a, nib, sc, out, m, k, n);
+}
+extern "C" __global__ Q4_GEMV_LAUNCH_BOUNDS void dno_gemv_q4_0c8(
+    const float* __restrict__ a, const uint4* __restrict__ nib,
+    const float* __restrict__ sc, float* __restrict__ out,
+    int m, int k, int n) {
+    dno_gemv_q4_0_cols<8>(a, nib, sc, out, m, k, n);
+}
+
 // prefill / バッチ用のタイル GEMM。block = (16,16) = 256 thread、
 // 1 ブロック = m 方向 64 行 x n 方向 128 列。1 thread は 4 行 x 8 列 (32 個の acc) を
 // 担当する。共有メモリは A タイル (64x32 f32) と B タイル (128x33 f32・展開済み) で

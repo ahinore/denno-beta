@@ -13,6 +13,11 @@
 //! 出力の見方: m=1 が decode の GEMV、m=300 が prefill のタイル GEMM。
 //! `layers` を掛けた値が 1 token あたりの見積り (プロファイルの bucket と比較する)。
 //! `--raw` は f32 の重みを作らずブロックを直接埋める (巨大な層用。CPU 比較は省く)。
+//!
+//! GEMV の列ブロック幅 C (s133) を比べるときは、本体の定数を書き換えずに
+//! `DENNO_Q4_GEMV_C=2|4|8` で切り替える (省略時はビルド既定の C=4)。
+//! 例: `DENNO_Q4_GEMV_C=8 cargo run --release -p denno-engine --features cuda
+//!      --example bench_q4_line -- --iters 30`
 
 use std::time::Instant;
 
