@@ -155,7 +155,7 @@ pub const KV_BUDGET_ENV: &str = "DENNO_KV_BUDGET_MB";
 /// 余裕が 3GB を切る。上限を超えたら cuMemAlloc 失敗 → CPU フォールバック
 /// (秒/token) に落ちる前に、明示的な 400 で拒否する。P4-7 で解消したら上げる。
 pub const MAX_PROMPT_ENV: &str = "DENNO_MAX_PROMPT_TOKENS";
-pub const DEFAULT_MAX_PROMPT_TOKENS: usize = 12288;
+pub const DEFAULT_MAX_PROMPT_TOKENS: usize = 32768;
 
 fn max_prompt_tokens() -> usize {
     std::env::var(MAX_PROMPT_ENV)

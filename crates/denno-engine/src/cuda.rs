@@ -3460,8 +3460,12 @@ fn gpu_kv_limit_bytes() -> usize {
 }
 
 fn kv_mirror_cap(t_total: usize, old_cap: usize) -> usize {
-    // 倍々成長 (ホスト KvCache と同じ方針)。下限 1024 行
-    (old_cap.max(1024) * 2).max(t_total.next_power_of_two())
+    // s128 (P4-7): 1,024 行刻みで切り上げる。以前は next_power_of_two だったため
+    // 10,880 token で 16,384 行 (= 必要量の 1.51 倍) を確保していた。
+    // cap 成長は全層の再シードを伴うので、刻みは 1,024 行 (27B で 134 MB) に固定し、
+    // 必要量を超えるときは一気に必要量まで上げる (リクエスト内で再成長しない)。
+    let need = t_total.div_ceil(1024) * 1024;
+    need.max(old_cap + 1024).max(1024)
 }
 
 /// P17g/P17h 共通: KV ミラーの取得/生成 + cap 成長 + LRU エビクト。
@@ -3562,15 +3566,25 @@ fn with_mirror_ext<T>(
     // alloc_kv = false (GDN 専用呼び出し) ではスキップ — cap/len は使わない。
     if alloc_kv && m.cap < t_total {
         let newcap = kv_mirror_cap(t_total, m.cap);
-        let bytes = newcap * kv_dim * 4;
-        for l in m.layers.iter_mut() {
-            l.0 = None;
-            l.1 = None;
-            ok(Scratch::ensure(&mut l.0, bytes))?;
-            ok(Scratch::ensure(&mut l.1, bytes))?;
-        }
+        // s128 (P4-7): ここで全層分を確保しない。以前は 1 層の prefill で
+        // n_layers 本ずつ確保しており、27B では KV を書かない GDN 層 48 本 x K/V
+        // まで常駐していた (10,880 token で 8.1 GB)。
+        // cap が伸びた時点で既存バッファの行内容は捨てる (Scratch::ensure は
+        // 新しいバッファを確保する) ため len は全層 0 に戻し、各層のバッファは
+        // その層を使うときに下の ensure で確保する。
         m.cap = newcap;
         m.len.iter_mut().for_each(|l| *l = 0);
+    }
+    if alloc_kv {
+        // 使う層の分だけ確保する (grow-only・容量は cap 行で固定)
+        let bytes = m.cap * kv_dim * 4;
+        let before = m.layers[li].0.as_ref().map(|b| b.bytes()).unwrap_or(0);
+        ok(Scratch::ensure(&mut m.layers[li].0, bytes))?;
+        ok(Scratch::ensure(&mut m.layers[li].1, bytes))?;
+        if before < bytes {
+            // バッファを伸ばした = 行内容は失われた (ensure は新規確保) → 全再シード
+            m.len[li] = 0;
+        }
     }
     let have = if m.len[li] > t_total { 0 } else { m.len[li] };
     f(m, have)

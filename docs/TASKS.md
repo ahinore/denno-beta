@@ -497,18 +497,34 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   `DevBuffer` alloc/free with the free/total MiB and the caller location
   (`#[track_caller]`), and an alloc failure now reports the requested size and the
   free MiB. This is how the shape bug was pinned; keep it for the next one.
-- Still open (P4-7): ~0.9 MB/token remains resident after a request, because
-  several n-sized buffers are grow-only thread_locals (`Scratch`, `GdnScratch`,
-  `ChainScratch::qkv_*`). At 11k tokens that leaves only ~3.7 GB free on a 32 GB
-  card. Until that is chunked, `DENNO_MAX_PROMPT_TOKENS` (default 12,288) rejects
-  longer prompts with a 400 instead of OOM-ing into the CPU fallback.
+- Follow-up: the 0.9 MB/token that remained at this point was mostly the KV mirror
+  waste, fixed in P4-7 (28,387 -> 21,603 MiB at 10,820 tokens); what is left is
+  ~0.29 MB/token of GDN scan and qkv/rope chain scratch.
 
-### P4-7: bound the n-sized prefill scratch by chunking - OPEN
-- Target: after a 16k-token prompt, VRAM should be within ~1 GB of the 3k case.
-- Method: the same tiling that fixed the Q4 GEMM has to be applied to the GDN scan
-  and the qkv/rope chain buffers; they are grow-only thread_locals keyed on `n`.
-- Note: these buffers are why 9B long contexts never worked either - it is not a
-  27B-specific problem, only 27B hits the wall first.
+### P4-7: bound the n-sized prefill scratch - DONE (main session, 2026-10-20)
+- Target was: after a 16k-token prompt, VRAM should be within ~1 GB of the 3k case.
+- The dominant term was **not** the GDN scan. `with_mirror_ext` allocated the GPU KV
+  mirror for **all** `n_layers` whenever any layer grew the cap, so 27B (64 layers =
+  48 GDN + 16 full) kept K/V buffers for 48 layers that never write KV: 128 buffers
+  x 64 MiB = 8.1 GB at a 10,880-token prompt. The growth also used
+  `next_power_of_two`, allocating 16,384 rows for 10,880 tokens (1.51x).
+- Fix: the cap growth only resets the per-layer cursors; each layer's K/V buffer is
+  now ensured when that layer is actually used (`alloc_kv` calls), and the cap rounds
+  up in 1,024-token steps instead of powers of two. A buffer that is re-allocated
+  drops its `len` so the next use re-seeds from the host (never a partial seed).
+- Measured (27B q4, `vram_probe.py`):
+  | prompt | before P4-6 | after P4-6 | after P4-7 |
+  |---|---|---|---|
+  | 70 | 18,377 MiB | 18,377 MiB | 18,377 MiB |
+  | 3,020 | 21,505 MiB | 21,135 MiB | 19,471 MiB |
+  | 10,820 | 32,073 MiB (next request OOM) | 28,387 MiB | 21,603 MiB |
+- Consequence: `DENNO_MAX_PROMPT_TOKENS` goes from 12,288 to 32,768 (the guard still
+  rejects longer prompts with a 400 instead of OOM-ing into the CPU fallback).
+- Remaining n-proportional terms are ~0.29 MB/token (GDN scan scratch ~0.11, qkv/rope
+  chain ~0.07, KV mirror 16 layers x 2 x 4 KB). A 64k prompt would still need ~40 GB:
+  chunking the GDN scan and the chain buffers is the next lever if that is needed.
+- Note: this is why 9B long contexts never worked either - the wasted mirror was sized
+  by layer count, not by prompt.
 
 ## P5 — tooling and ops
 
