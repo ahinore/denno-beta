@@ -104,10 +104,40 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 ### P2-1: decode 16.4 ms/token -> 12 ms
 - Where: C4 device-resident chain, per-layer syncs, GDN state mirror.
 - Why: decode is now the user-visible latency for chat; 5,686-token prefill is a one-off.
-- Idea: remove the per-layer D2H for the GDN state (the s50 deltization already defers it),
-  keep logits on device until the final token, then measure the true sync count.
-- Estimated: 20–25 % of decode time. Risk: medium — the s50 work showed this area is
-  easy to get subtly wrong (state authority).
+- Status: **closed (2026-10-20) — the only host sync left in decode is the logits D2H, and it
+  cannot be removed without changing the sampled token sequence** (s115 inventory, no commit).
+- What the inventory found (s115, file:line in `crates/denno-engine/src/model/qwen35.rs`):
+  decode 1 token = `forward_decode_chain` (qwen35.rs:1805-2036) and it carries **exactly one**
+  host sync per step:
+  - `chain_download(CH_LOGITS, vocab)` (qwen35.rs:2024-2026) -> `ctx.sync()` at cuda.rs:2646.
+    This is the only sync. It waits for every kernel and every staged D2H issued earlier in the
+    step.
+  - `chain_sync_pending()` (qwen35.rs:2020-2023) adds one more sync **only when
+    `prof::enabled()`** (an observation point, not a numeric path).
+  - `chain_q35_kv_stage_flush` (cuda.rs:5459) and `cache.advance(1)` are pure host work (no
+    sync). The per-layer K/V rows are staged async D2H into a pinned buffer (cuda.rs:5070-5102)
+    and complete under the logits sync.
+  - GDN state already uses the s50 deferred-flush mirror (cuda.rs:5163-5430); the per-step
+    ~75 MB D2H is gone and `chain_q35_gdn_flush_pending` runs only at prefill start or on the
+    CPU fallback. No residency lever is left there.
+  - The per-op syncs (cuda.rs:1524 / 1988 / 2104 / 2289 / 3029 / 3998 ff.) are on paths the
+    decode chain does not take unless it falls back.
+- Why the remaining cut is not implementable: the engine samples on the host after every
+  forward (engine.rs:871 and the unconditional `sess.logits = logits` at engine.rs:904), so the
+  logits must be on the host **before** the next token is appended to the sequence. Keeping
+  logits device-resident and deferring the D2H to the next step does not overlap anything (the
+  next step cannot start without the token), and removing the D2H for non-final tokens requires
+  speculative multi-token forward plus device-side per-position logits plus mid-chain KV/GDN
+  mirror bookkeeping — out of scope for a bit-exact change and it needs `.cu` work.
+- Attempted and rejected in s115: a deferred-logits scheme (`chain_download_deferred`,
+  `chain_wait_deferred_logits`, `pin_logits`, thread-local `decode_tail_last_hint`, returning
+  `Vec::new()` from intermediate `forward_decode_chain` calls). It does not build as a design
+  (an empty return loses `sess.logits` at engine.rs:904) and cannot pay off while sampling
+  stays strictly serial. Work in progress is parked as a patch outside the repo
+  (`~/ai_work/s115_p2-1_wip.patch`); the tree was restored to the pre-s115 state.
+- Consequence: decode stays at ~16.4 ms/token (GPU-compute bound). The decode axis is closed
+  unless a multi-token speculative decoder is designed as its own task (would need `.cu` +
+  anchor re-baseline, i.e. an operator decision).
 
 ## P3 — correctness and debt
 
