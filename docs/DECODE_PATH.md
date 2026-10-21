@@ -156,3 +156,61 @@ buffers) rather than a decode lever.
   not a hidden allocation in the step.
 - `chain_q35_step_reserve*` sizes match the in-chain `ensure` requests, so the step
   body never frees a buffer that an in-flight kernel is writing to.
+
+## 6. The 27B q4 path goes through the same chain (s157, Task B20 stage 1)
+
+> Scope note: sections 1-5 above are the s108 inventory of the **9B int8** path. This
+> section records the s157 change and the supervisor's measured values; it does not
+> replace the inventory, and the numbers in it are measured, not derived.
+
+Before B20 stage 1 the 27B q4 decode ran through the per-op wrapper
+`maybe_gpu_linear_q4_into` (`crates/denno-engine/src/tensor/quant.rs`). That wrapper
+takes host slices, so every linear was one H2D of the activation tile, one kernel and
+one D2H plus sync: **392 linear D2H per step**, and GPU utilization stayed at 40%.
+
+Now the 27B q4 step has the same shape as section 1:
+
+- `chain_linear_q4_device` (`cuda.rs`) enqueues `dno_gemv_q4_0c{C}` against
+  **device-resident buffers only**. The kernel, its argument list, the grid
+  `(n.div_ceil(8*C), m, 1)` and the block `(256,1,1)` are the ones the per-op tile path
+  (`q4_dispatch_tile`) already uses, and the weights come from the `weights_for_q4()`
+  VRAM registry (`nib` / `sc`), so no weight is re-uploaded per step.
+- `chain_linear` is the int8/q4 dispatcher: a group must be all-Q8 or all-Q4, otherwise
+  it returns `None` and the caller keeps the per-op path (slow, never wrong).
+  `q35_chain_compatible()` / `chain_weight_ok()` gate the chain as a whole (Q8 always,
+  Q4 only while `DENNO_GPU_Q4_CHAIN` is not `0`, F32 never). With
+  `DENNO_GPU_Q4_CHAIN=0` the entry gate returns `None` and the legacy per-op path runs
+  exactly as before.
+- Consequently the 27B step is one host round trip at each end, and the only sync is the
+  logits download (row 8 of section 2). Its GDN scan and full attention also run through
+  the device chain entries the 9B uses, which no longer take host slices.
+- Measured (supervisor, GPU gate): 27B q4 decode **75.89 -> 32.42 ms/token** under the
+  fixed protocol in `docs/KPI.md`, 9B int8 **16.24 ms/token** unchanged, anchors
+  **3/3 MATCH** (`c61ad85b` / `9e17d563` / `af6eb6ab`). No `.cu` / `.ptx` change.
+
+### 6.1 The two D2H metrics (supervisor ruling, s157)
+
+Two different counts are in use. They must not be mixed or presented as each other.
+
+**Metric A - in-step per-op linear D2H (the acceptance metric).** The number of host
+round trips issued *inside* a linear call: activation H2D, kernel, output D2H and the
+sync that follows it. This is what "D2H/step" means in P0-3.
+
+| path | metric A per step |
+|---|---|
+| 27B q4, per-op wrapper (baseline) | **392** |
+| 27B q4, chain (`2701cf3`) | **0** - `sl_lin` reports 0 calls/step |
+| target | **< 5** |
+
+On the same PROFILE run (`DENNO_PROFILE=1`, 40 tokens) `d2h_src_linear` reports 898
+calls for **0.0 ms**: those are outside the decode step (the profiled run also covers
+the prefill and other paths), which is why `sl_lin` - the in-step counter - is the
+number that answers the target.
+
+**Metric B - total D2H issued per step (a separate number, not the acceptance metric).**
+Every `cuMemcpyDtoH*` the step issues, whatever its purpose: the full-attention KV rows,
+the logits, and so on. Measured on the 27B q4 chain path: **about 140 per step**. All of
+them are asynchronous and staged, so the host wait they carry is **0 ms**; the step's
+single synchronisation is still the logits download at the end. Metric B is recorded so
+that a small metric A cannot be read as "the step has no D2H at all", and so that a
+future change cannot claim the target by switching which number it reports.

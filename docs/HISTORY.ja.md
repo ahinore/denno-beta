@@ -2911,6 +2911,52 @@ s122 のハンドオフはそれを「s118 で設計済み」と読んで再実�
   **10% 未満**。根拠は「1 step あたりのクロック読みが約 1/16 になり、残る固定費は
   step あたり 1 回の表操作だけ」— 数値は実機で確かめる。
 
+### s157: Task B20 段階 1 - 27B q4 の線形をデバイス常駐 decode chain へ載せ替え (2026-10-21) 完了
+
+> 27B q4 の decode は per-op ラッパー `maybe_gpu_linear_q4_into` を通っていた。ホストスライスを
+> 引数に取るので 1 step に 392 回の線形 D2H と同期が入り、GPU util は 40% 止まりだった。
+> 9B int8 が既に使っている chain と同じ入口に q4 を載せ、per-op の往復を層ループから外した。
+
+- **`chain_linear_q4_device`** (`cuda.rs`): 既存の `dno_gemv_q4_0c{C}` を**デバイス常駐バッファ
+  だけで** enqueue する。カーネル・引数・grid `(n.div_ceil(8*C), m, 1)`・block `(256,1,1)` は
+  per-op 経路の `q4_dispatch_tile()` と同一で、ホストスライスも同期も無い。重みは
+  `weights_for_q4()` の VRAM レジストリ (`nib` / `sc`) から引くので、step ごとの再アップロードは
+  無い。
+- **`chain_linear`** は int8 / q4 の dispatcher。group が all-Q8 か all-Q4 でなければ `None` を
+  返し、呼び側は per-op 経路のまま (= 遅いが誤らない)。`qwen35.rs` の `q35_chain_compatible()` は
+  `quant8()` の代わりに `chain_weight_ok()` で判定する (Q8 は常に、Q4 はフラグ ON のときだけ、
+  F32 は不可)。
+- **`DENNO_GPU_Q4_CHAIN`**: `parse_q4_chain()` は `"0"` のときだけ OFF (未設定 / `""` / `"off"` /
+  `" 0"` は ON のまま) なので、打ち間違いで経路が黙って変わらない。`q4_chain_enabled()` は 1 回だけ
+  読む。`=0` では `q35_chain_compatible()` が Q4 を拒否し、`forward_decode_chain()` が入口で
+  `None` を返して従来の per-op 経路がそのまま走る。
+- **chain ループ 7 箇所の置換** (`qwen35.rs`): GDN の qkv+z、GDN の o_proj、full の qkv、
+  full の o_proj、gate_up、down、lm_head。int8 では分割・順序・uid が変わらないので、9B chain は
+  同一の列を enqueue する。
+- **`.cu` / `.ptx` 変更なし**: `dno_gemv_q4_0c2/c4/c8` は commit 済みの `kernels_int8.ptx` に
+  3 つの `.visible` として既にあり、loader は 3 本揃うか 0 本かで判定する。
+- **テスト** (`b20_stage1_tests`): フラグ解析の境界 (`"0"` / `""` / `"off"` / `" 0"` / 未設定) と、
+  空 group・混在 group の拒否。数値一致の確認は CPU では出せないので supervisor の GPU 関門で行う。
+- **実測** (supervisor・GPU 関門。予測値ではない):
+  - 27B q4 decode **75.89 → 32.42 ms/token** (固定プロトコル `docs/KPI.md`・3 回中央値・
+    temperature 0・max_tokens 200。TTFT 0.205 / 0.202 s、wall 6.689 / 6.685 s / 200 token)。
+  - 9B int8 decode **16.24 ms/token** で不変 (GPU_VERIFY gen2 3.248 s / 200 token)。
+  - アンカー **3/3 MATCH** (`c61ad85b` / `9e17d563` / `af6eb6ab`)、`GPU_VERIFY` = PASS。
+  - PROFILE (`DENNO_PROFILE=1`・40 token): `d2h_src_linear` は **898 call で 0.0 ms**、
+    `sl_lin` は **0 call/step** (旧 392)。step 内の per-op 線形 D2H は消えた。
+  - `bench_all.sh` 非悪化 (gate_up m=1 0.106 / m=2 0.142 / m=8 0.521 / m=64 2.398 / m=300 17.250、
+    down 0.069 / 6.635、lm_head m=1 0.670、GDN n=1 0.143 / n=32 0.806 / n=300 5.734。
+    m=300 gate_up の +15% は既知の変動)。
+  - 回答検証: "What is the capital of France?" → `Paris`、"Name three tourist spots in Tokyo."
+    → `Senso-ji Temple, Shibuya Crossing, and the Tokyo Skytree.` 2 回実行で完全一致 (決定論)。
+- **数値クラス**: 新規緩和なし (R1〜R4 のいずれも使わない)。q4 線形は同じカーネル・同じ入力なので
+  per-op 経路と同じ出力になる。chain に入ることで 27B の GDN scan / attention も 9B が使う
+  デバイス版の関数へ移る (ホストスライスを取らない)。27B は従来どおり回答検証で受入とし、
+  アンカー 3 本 (9B int8) は MATCH のまま。
+- **D2H の 2 指標**: 受入指標は「step 内の per-op 線形 D2H の回数」(chain 経路で 0、基準 392、
+  目標 < 5)。総 D2H 発行数は別指標で、実測 約 140/step (KV 行・logits 等、いずれも非同期で
+  ホスト待ち 0 ms)。定義は `docs/DECODE_PATH.md` の §6.1 に固定した。
+
 ### ベンチマーク一覧 (2026-10-20 時点・このホスト)
 
 測定規則: prefill の正式値は cold 単発 (サーバ起動 -> 1 リクエスト、prefix cache off、
