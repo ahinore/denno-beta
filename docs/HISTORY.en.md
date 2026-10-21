@@ -2977,6 +2977,37 @@ the cause is the n-sized buffers themselves, not the thread count.
   at ~140/step (KV rows, logits, etc.), all asynchronous with 0 ms of host wait. Both definitions
   are pinned in `docs/DECODE_PATH.md` §6.1.
 
+### s157: Task K1 commit 2 - TQ1_0 / IQ1_M decoders in kquant (2026-10-21) done
+
+> IQ2-class and ternary GGUFs can now at least be dequantized on the CPU path. The type numbers in
+> the plan ("TQ1_0 = 29 / IQ1_M = 24") were wrong; this uses llama.cpp's `ggml.h` values, 34 / 29.
+
+- **`block_tq1_0`** (54 B / 256 elements) and **`block_iq1_m`** (56 B / 256 elements) decoders were
+  added to `kquant.rs`. TQ1_0 packs five ternary values into one byte as a base-3 digit
+  (extracted with the same integer trick as ggml, `((u8)(b * 3^n) * 3) >> 8`). IQ1_M reads
+  `scales[8]` as `u16[4]`: the f16 scale is split across the four high nibbles (there is no separate `d`).
+- **Type-number correction**: upstream (`ggml.h` and `gguf-py/gguf/constants.py` agree) has
+  `GGML_TYPE_I8 = 24`, `GGML_TYPE_IQ1_M = 29`, `GGML_TYPE_TQ1_0 = 34`. Implementing the plan's
+  numbers would decode a real IQ1_M tensor as TQ1_0 (silent garbage), so the upstream values are
+  used and a test pins all three. `from_id(24)` stays `None` (I8 is not supported).
+- **Five tests** (`tests/dequant_ref.rs`, CPU only): bit-exact match against a hand-computed
+  reference block (54 / 56 raw bytes plus all 256 expected values), the type ids with block size
+  (256) and type size (54 / 56), degenerate blocks (all-zero, scale 0, f16 NaN / +Inf / -Inf,
+  smallest subnormal) that must not panic, and unsupported ids staying `None`.
+- **Cross-check** (dev, scratch harness outside the repo, not committed): bit-exact against
+  llama.cpp's `dequantize_row_tq1_0` / `dequantize_row_iq1_m` over 16 blocks (4096 elements) each.
+  The existing harness reproduced fixture md5 `36acb59a`, so the toolchain matches.
+- **Not done (the honest remainder)**: loading a real GGUF was not tested (no such file in the
+  container), and `ref/dequant_ref.c` plus `tests/data/dequant_ref.bin` are outside that commit's
+  scope, so a reproducible fixture is left as a follow-up task.
+- **Gates (measured by the supervisor)**: `denno-engine --lib` 269 passed / 0 failed / 1 ignored,
+  `denno-server --lib` 37 passed, `dequant_ref` 5 passed + 1 ignored. `GPU_VERIFY` PASS with
+  anchors 3/3 MATCH (`c61ad85b` / `9e17d563` / `af6eb6ab`), 9B int8 unchanged at 16.24 ms/token,
+  and `bench_all.sh` no regression (gate_up 0.108 / 0.141 / 0.511 / 2.376 / 16.523, down
+  0.069 / 6.640, lm_head m=1 0.660, GDN n=1 0.145 / n=32 0.811 / n=300 5.754). The change is purely
+  additive and touches no GPU path.
+- **Numeric class**: no relaxation (none of R1-R4). No `.cu` / `.ptx` change.
+
 ### Benchmark summary (as of 2026-10-20, this host)
 
 Measurement rule: the official prefill value is cold single-shot (server start -> one request,

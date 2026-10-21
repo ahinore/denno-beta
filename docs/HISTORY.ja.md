@@ -2957,6 +2957,35 @@ s122 のハンドオフはそれを「s118 で設計済み」と読んで再実�
   目標 < 5)。総 D2H 発行数は別指標で、実測 約 140/step (KV 行・logits 等、いずれも非同期で
   ホスト待ち 0 ms)。定義は `docs/DECODE_PATH.md` の §6.1 に固定した。
 
+### s157: Task K1 commit 2 - kquant に TQ1_0 / IQ1_M のデコーダを追加 (2026-10-21) 完了
+
+> IQ2 系と ternary の GGUF を、少なくとも CPU 経路ではデコードできるようにした。型番号は
+> 計画書の "TQ1_0 = 29 / IQ1_M = 24" が誤りで、llama.cpp の `ggml.h` に合わせて 34 / 29 を使う。
+
+- **`block_tq1_0`** (54 B / 256 要素) と **`block_iq1_m`** (56 B / 256 要素) のデコーダを
+  `kquant.rs` に追加した。TQ1_0 は 1 バイトに三値 5 個を base-3 で詰める (ggml の整数トリック
+  `((u8)(b * 3^n) * 3) >> 8` と同じ結果になる桁抽出)。IQ1_M は `scales[8]` を `u16[4]` として読み、
+  f16 スケールを 4 つの上位ニブルに分割して持つ (独立した `d` は無い)。
+- **型番号の訂正**: `GGML_TYPE_I8 = 24` / `GGML_TYPE_IQ1_M = 29` / `GGML_TYPE_TQ1_0 = 34` が
+  upstream (`ggml.h` と `gguf-py/gguf/constants.py` の双方) の値。計画書の番号で実装すると
+  実在の IQ1_M を TQ1_0 として読む (静かに壊れる) ため upstream の値を採用し、テストで 3 つとも固定した。
+  `from_id(24)` は未対応 (I8) のまま `None`。
+- **テスト 5 件** (`tests/dequant_ref.rs`・CPU のみ): 手計算の参照ブロック (54 / 56 生バイトと
+  256 個の期待値) とのビット一致、型番号と block size (256) / type size (54 / 56)、退化ブロック
+  (全ゼロ・スケール 0・f16 NaN / +Inf / -Inf・最小非正規) で panic しないこと、未対応 ID が
+  `None` のままであること。
+- **裏取り** (dev がリポジトリ外のスクラッチで実施・commit 対象外): llama.cpp の
+  `dequantize_row_tq1_0` / `dequantize_row_iq1_m` と 16 ブロック (4096 要素) でビット一致。
+  既存ハーネスの fixture md5 `36acb59a` が再現したので、ツールチェーンも一致している。
+- **未了 (正直な残り)**: 実 GGUF のロードは未実施 (コンテナに該当ファイルが無い)。`ref/dequant_ref.c` と
+  `tests/data/dequant_ref.bin` の更新も範囲外なので、再現可能な fixture は別タスクとして残す。
+- **関門 (supervisor 実測)**: `denno-engine --lib` 269 passed / 0 failed / 1 ignored、
+  `denno-server --lib` 37 passed、`dequant_ref` 5 passed + 1 ignored。`GPU_VERIFY` PASS・
+  アンカー 3/3 MATCH (`c61ad85b` / `9e17d563` / `af6eb6ab`)、9B int8 は 16.24 ms/token で不変、
+  `bench_all.sh` 非悪化 (gate_up 0.108 / 0.141 / 0.511 / 2.376 / 16.523、down 0.069 / 6.640、
+  lm_head m=1 0.660、GDN n=1 0.145 / n=32 0.811 / n=300 5.754)。純加法で GPU 経路に触れない。
+- **数値クラス**: 緩和なし (R1〜R4 のいずれも使わない)。`.cu` / `.ptx` 変更なし。
+
 ### ベンチマーク一覧 (2026-10-20 時点・このホスト)
 
 測定規則: prefill の正式値は cold 単発 (サーバ起動 -> 1 リクエスト、prefix cache off、
