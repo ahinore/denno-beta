@@ -20,12 +20,16 @@ sleep 2
 
 export HOME=/work/denno-beta/data DENNO_CUDA=1
 unset DENNO_PROFILE
-# メモリ配分 (32,607 MiB のカード): 重み 16.7 GB + 基礎 1.7 GB + KV 10.0 GB +
-# prefix cache 1.05 GB = 29.5 GB で、prefill の一時バッファ用に約 3 GB を残す。
+# メモリ配分 (32,607 MiB のカード): 重み 16.7 GB + 基礎 1.7 GB + KV 8.0 GB +
+# prefix cache 3.2 GB = 29.6 GB で、prefill の一時バッファ用に約 3 GB を残す。
 # 12,288 MB の既定予算 + 32k token の prefix cache だと 32,073 MiB まで膨らみ、
 # 続くリクエストが cuMemAlloc error 2 で CPU フォールバックに落ちた (2026-10-20 実測)。
-export DENNO_KV_BUDGET_MB=10240
-export DENNO_PREFIX_CACHE_MAX_TOKENS=8192
+# 2026-10-21: prefix cache を 8,192 → 24,576 token に広げた。デスクトップの 1 ターンは
+# 約 13,000 token で、8,192 の予算ではエントリが 1 つも作れず、毎ターン全 prefill に
+# なっていた (同一プロンプトの再送でも 151.6 s、予算 24,576 では 2.62 s)。KV を
+# 10,240 → 8,192 MB に下げて合計をほぼ据え置き、prefill バッファの余白を維持する。
+export DENNO_KV_BUDGET_MB=8192
+export DENNO_PREFIX_CACHE_MAX_TOKENS=24576
 # クライアント都合の中断 (curl -m / アプリ側キャンセル) でスロットが busy のまま
 # 残ることがあるため、単独利用でも 4 本持っておく。2 本だと中断 2 回で
 # "no free KV cache slot" になる。
