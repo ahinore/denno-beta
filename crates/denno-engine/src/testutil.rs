@@ -17,6 +17,9 @@ pub const DUMMY_VOCAB: usize = 16;
 pub const DUMMY_EOS: u32 = 12;
 /// ダミーモデルのコンテキスト長
 pub const DUMMY_CONTEXT: usize = 64;
+/// P4-4: 長文脈回帰テスト用のコンテキスト長 (本番の 3,020 token prefill を
+/// 覆う長さ。既定ゲートの他テストは DUMMY_CONTEXT のまま)。
+pub const LONG_CONTEXT: usize = 4096;
 
 /// 最小構成の WordLevel トークナイザ。
 /// "t0".."t11" が ID 0..11、"eos" が 12、未知語は "[UNK]" (ID 20)。
@@ -237,11 +240,13 @@ impl KvSensitiveModel {
         Self { delay: std::time::Duration::ZERO }
     }
 
-    fn kv_k(t: u32, pos: usize, d: usize, kv_dim: usize) -> f32 {
+    /// P4-4: 長文脈テストが「モデルが書いた行」を式から再計算して照合できるよう
+    /// crate 内に公開する (挙動の変更ではない)。
+    pub(crate) fn kv_k(t: u32, pos: usize, d: usize, kv_dim: usize) -> f32 {
         (((t as usize + 2 * d + pos) % 11) as f32) / 3.0 + ((t as usize * (d + 1)) % 7) as f32
     }
 
-    fn kv_v(t: u32, pos: usize, d: usize, kv_dim: usize) -> f32 {
+    pub(crate) fn kv_v(t: u32, pos: usize, d: usize, kv_dim: usize) -> f32 {
         (((t as usize + 3 * d + pos) % 13) as f32) / 5.0
     }
 }
@@ -312,6 +317,60 @@ impl Model for KvSensitiveModel {
 pub fn kv_sensitive_engine(name: &str, seed: Option<u64>) -> Result<Engine> {
     let tok = dummy_tokenizer()?;
     Ok(Engine::from_parts(Box::new(KvSensitiveModel::new()), tok, name, seed))
+}
+
+/// P4-4: 長文脈回帰テスト用の KV 依存モデル。
+///
+/// 数値は `KvSensitiveModel` と**同一** (forward を委譲するので、KV 行の式も
+/// logits の組み立ても 1 行も変わらない) で、コンテキスト長だけを
+/// `LONG_CONTEXT` (4096) に広げる。既存ヘルパの挙動を変えないため、
+/// `KvSensitiveModel::new()` は DUMMY_CONTEXT のまま据え置き、
+/// 長文脈はこの型でだけ作る (既定ゲートの他テストは 64 token のまま)。
+///
+/// 用途: kv_cache の容量境界・需要ベース成長・長い prompt での prefix cache
+/// 予算/退避を、本番と同じ「コンテキスト長 >> テスト長」の条件で回帰させる。
+pub struct LongKvSensitiveModel {
+    inner: KvSensitiveModel,
+    context: usize,
+}
+
+impl LongKvSensitiveModel {
+    /// コンテキスト長を指定して構築する (kv_dim は 4 のまま = テストを軽く保つ)。
+    pub fn with_context(context: usize) -> Self {
+        Self { inner: KvSensitiveModel::new(), context }
+    }
+}
+
+impl Model for LongKvSensitiveModel {
+    fn context(&self) -> usize {
+        self.context
+    }
+
+    fn eos_ids(&self) -> &[u32] {
+        self.inner.eos_ids()
+    }
+
+    fn forward(&mut self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>> {
+        // KvSensitiveModel::forward は cache.kv_dim() を使うため、長文脈でも
+        // 行の式・logits は 64 token 版と完全に同じ経路を通る。
+        self.inner.forward(tokens, cache)
+    }
+
+    fn new_cache(&self) -> KvCache {
+        KvCache::new(1, 4, self.context)
+    }
+}
+
+/// P4-4: 長文脈 (LONG_CONTEXT) 用エンジン。kv_dim 4 / 1 層なので
+/// bytes_per_token = 32 B で、4096 token でも KV は 128 KB に収まる。
+pub fn long_context_engine(name: &str, seed: Option<u64>) -> Result<Engine> {
+    let tok = dummy_tokenizer()?;
+    Ok(Engine::from_parts(
+        Box::new(LongKvSensitiveModel::with_context(LONG_CONTEXT)),
+        tok,
+        name,
+        seed,
+    ))
 }
 
 /// int8 量子化パスの生成決定論テスト用ダミーモデル (P3)。

@@ -2799,4 +2799,280 @@ mod tests {
         assert!(out.text.contains("<function=天気>"), "text = {}", out.text);
         assert_eq!(out.stop_reason, StopReason::EndTurn);
     }
+
+    // ===== P4-4: 長文脈 (LONG_CONTEXT = 4096) の回帰 =====
+    //
+    // 既定ゲートの他のテストはすべて testutil::DUMMY_CONTEXT = 64 で回るため、
+    // 「初期容量を超える KV 成長」「長い prompt での prefix cache 予算/退避」
+    // 「コンテキスト容量の境界」は既定ゲートで一度も実行されていなかった。
+    // 本番は 3,020 token の prefill とマルチターン会話を配信している。
+
+    use crate::testutil::{long_context_engine, KvSensitiveModel, LONG_CONTEXT};
+
+    /// 長文脈テスト用のプロンプト本文。fallback テンプレート
+    /// ("user: <content>\n\nassistant:") は content を空白区切りの 1 語 1 token に
+    /// し、"user:" と "assistant:" がそれぞれ [UNK] 2 token になるため、
+    /// プロンプト長 = words + 4 (実測: ids = [20, 20, t1..., 20, 20])。
+    fn long_content(words: usize, word: &str) -> String {
+        let mut s = String::with_capacity(words * 3);
+        for _ in 0..words {
+            s.push_str(word);
+            s.push(' ');
+        }
+        s
+    }
+
+    /// プロンプト長 -> content の語数 (上の式の逆。テストの前提を 1 箇所に固定する)
+    fn long_prompt_words(len: usize) -> usize {
+        assert!(len >= 4, "プロンプト長 {len} は短すぎる");
+        len - 4
+    }
+
+    /// content の語数 -> プロンプト長
+    fn long_prompt_len(words: usize) -> usize {
+        words + 4
+    }
+
+    /// P4-4 (a): 長い prompt でも prefix cache の再利用は数値的に無害。
+    /// 3,000 token の同一 prompt を「cold (full prefill)」と「同一エンジンで
+    /// 2 回目 (prefix cache 再利用)」で実行し、prefill 直後の logits が
+    /// **ビット一致**することを f32 のビット列で比較する (epsilon 比較ではない)。
+    /// 同じ性質は既定ゲートで 64 token 以下でしか見ていなかった。
+    #[test]
+    fn long_context_prefix_cache_reuse_keeps_logits_bit_identical() {
+        let words = long_prompt_words(3000);
+        let content = long_content(words, "t1");
+        let p = params(1);
+        let mut e = long_context_engine("long", None).unwrap();
+
+        // 1 回目 (cold): full prefill。prefill 直後の logits を退避する
+        let mut s1 = e.begin_chat(None, &msgs(&content), &p).unwrap();
+        assert_eq!(s1.input_tokens(), long_prompt_len(words), "前提: プロンプト長");
+        e.install_session(&mut s1).unwrap();
+        assert!(!e.step_chat(&mut s1, &mut |_| {}).unwrap(), "prefill では完了しない");
+        let cold = s1.logits.clone();
+        assert_eq!(e.last_prefix_hit(), PrefixHit::None, "1 回目は full prefill");
+        let slot = s1.slot.expect("install 済み");
+        assert_eq!(e.caches[slot].len(), long_prompt_len(words));
+        while !e.step_chat(&mut s1, &mut |_| {}).unwrap() {}
+        e.release_session(&mut s1);
+
+        // 2 回目 (同一 prompt・同一エンジン): 直前の KV を再利用する
+        let mut s2 = e.begin_chat(None, &msgs(&content), &p).unwrap();
+        e.install_session(&mut s2).unwrap();
+        assert!(
+            matches!(e.last_prefix_hit(), PrefixHit::Live | PrefixHit::Entry),
+            "2 回目は prefix cache 経路であるべき (実際: {:?})",
+            e.last_prefix_hit()
+        );
+        assert!(!e.step_chat(&mut s2, &mut |_| {}).unwrap());
+        let warm = s2.logits.clone();
+        assert_eq!(cold.len(), warm.len());
+        for (i, (a, b)) in cold.iter().zip(warm.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "logits[{i}]: cold {a} vs prefix cache 再利用 {b} (ビット不一致)"
+            );
+        }
+    }
+
+    /// P4-4 (b): 容量境界は panic ではなくきれいなエラー。
+    /// max_len (4096) ちょうどの prefill は受理され (最後の合法な append)、
+    /// その 1 token 超の prompt は `begin_chat` が Err を返す — panic せず、
+    /// 既存スロットの KV も書き換えない。kv_cache.rs の assert
+    /// ("KV cache overflow") は engine が手前で弾くため到達しない。
+    #[test]
+    fn long_context_capacity_boundary_is_a_clean_error_not_a_panic() {
+        let mut e = long_context_engine("long", None).unwrap();
+        let max_len = e.caches[0].max_len();
+        assert_eq!(max_len, LONG_CONTEXT);
+
+        // (1) max_len - 1 token の prompt + 1 token 生成 = 境界の内側
+        let words = long_prompt_words(max_len - 1);
+        let content = long_content(words, "t1");
+        let out = e.chat(None, &msgs(&content), &params(1), |_| {}).unwrap();
+        assert_eq!(out.input_tokens, long_prompt_len(words));
+        assert_eq!(e.caches[0].len(), max_len - 1);
+
+        // (2) max_len ちょうど: 最後の合法な append が受理される
+        //     (max_tokens は begin_chat が context - prompt にクランプする = 0)
+        let words_full = long_prompt_words(max_len);
+        let content_full = long_content(words_full, "t1");
+        let out_full = e.chat(None, &msgs(&content_full), &params(4), |_| {}).unwrap();
+        assert_eq!(out_full.input_tokens, max_len);
+        assert_eq!(out_full.output_tokens, 0, "max_tokens は 0 にクランプされる");
+        assert_eq!(e.caches[0].len(), max_len);
+        assert_eq!(e.caches[0].max_len(), max_len);
+
+        // (3) max_len + 1 token: Err (panic しない)・KV は不変
+        let len_before = e.caches[0].len();
+        let over = long_content(long_prompt_words(max_len + 1), "t1"); // prompt 長 = max_len + 1
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            e.begin_chat(None, &msgs(&over), &params(1))
+        }));
+        let err = match r.expect("容量超過で panic してはならない") {
+            Ok(_) => panic!("容量超過は Err であるべき"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err}").contains("コンテキスト長"),
+            "エラー内容が想定と違う: {err}"
+        );
+        assert_eq!(e.caches[0].len(), len_before, "拒否時に KV を書き換えない");
+        assert_eq!(e.caches[0].max_len(), max_len);
+    }
+
+    /// P4-4 (c): 成長は需要ベースで、既存行を壊さない。
+    /// 3,000 token の prefill 直後は容量がちょうど 3,000 (max_len 4096 を
+    /// 先取りしない) で、モデルが書いた行が式どおり読める。続けて同じ接頭辞を
+    /// 4,000 token に伸ばすと倍々成長 (3000 -> 4096) が起き、realloc 後も
+    /// 先頭 2,999 行がビット一致で残る。
+    #[test]
+    fn long_context_kv_growth_is_demand_driven_and_preserves_rows() {
+        let mut e = long_context_engine("long", None).unwrap();
+        let kv_dim = e.caches[0].kv_dim();
+        let first_words = long_prompt_words(3000);
+        let first = long_content(first_words, "t1");
+        let p0 = params(0); // prefill のみ (decode で行を足さない)
+        let out1 = e.chat(None, &msgs(&first), &p0, |_| {}).unwrap();
+        assert_eq!(out1.input_tokens, long_prompt_len(first_words));
+
+        let prompt1 = e
+            .tok
+            .encode(&e.tok.apply_chat_template(None, &msgs(&first), None, None).unwrap())
+            .unwrap();
+        assert_eq!(prompt1.len(), 3000, "前提: 3,000 token の prompt");
+
+        // (i) 需要ベース: 必要な 3,000 行だけ確保し、max_len を先取りしない
+        assert_eq!(e.caches[0].len(), 3000);
+        assert_eq!(e.caches[0].capacity(), 3000, "必要な行数ちょうどの確保");
+        assert!(
+            e.caches[0].capacity() < e.caches[0].max_len(),
+            "コンテキスト全幅を事前確保してはならない"
+        );
+        // モデルが書いた行 (先頭・中間・末尾) が式どおりであること
+        {
+            let (k, v) = e.caches[0].kv_bufs_ref(0);
+            for &pos in &[0usize, 1, 1000, 2999] {
+                let t = prompt1[pos];
+                for d in 0..kv_dim {
+                    assert_eq!(
+                        k[pos * kv_dim + d].to_bits(),
+                        KvSensitiveModel::kv_k(t, pos, d, kv_dim).to_bits(),
+                        "K 行 {pos} 列 {d}"
+                    );
+                    assert_eq!(
+                        v[pos * kv_dim + d].to_bits(),
+                        KvSensitiveModel::kv_v(t, pos, d, kv_dim).to_bits(),
+                        "V 行 {pos} 列 {d}"
+                    );
+                }
+            }
+        }
+
+        // (ii) 同じ接頭辞を 4,000 token に伸ばす -> 倍々成長 + realloc コピー
+        let extended = format!("{}{}", first, long_content(1000, "t2"));
+        let out2 = e.chat(None, &msgs(&extended), &p0, |_| {}).unwrap();
+        assert_eq!(out2.input_tokens, 4000);
+        assert_eq!(e.caches[0].len(), 4000);
+        assert_eq!(
+            e.caches[0].capacity(),
+            LONG_CONTEXT,
+            "3000 -> 4096 の倍々成長 (需要ベース)"
+        );
+        let prompt2 = e
+            .tok
+            .encode(&e.tok.apply_chat_template(None, &msgs(&extended), None, None).unwrap())
+            .unwrap();
+        assert_eq!(prompt2.len(), 4000);
+        // 共通接頭辞は「先頭 2 token ([UNK][UNK]) + t1 x 2,996」= 2,998。
+        // 3,000 行目以降 (prompt1 の末尾 [UNK][UNK]) は上書きされる。
+        assert_eq!(prompt1[..2998], prompt2[..2998], "前提: 先頭 2,998 token が共通接頭辞");
+        assert_ne!(prompt1[2998], prompt2[2998], "前提: 2,998 行目で分岐する");
+        // 成長前に書かれた行が realloc 後も同じ値で読めること
+        {
+            let (k, v) = e.caches[0].kv_bufs_ref(0);
+            for &pos in &[0usize, 1, 1000, 2997] {
+                let t = prompt1[pos];
+                for d in 0..kv_dim {
+                    assert_eq!(
+                        k[pos * kv_dim + d].to_bits(),
+                        KvSensitiveModel::kv_k(t, pos, d, kv_dim).to_bits(),
+                        "成長後 K 行 {pos} 列 {d}"
+                    );
+                    assert_eq!(
+                        v[pos * kv_dim + d].to_bits(),
+                        KvSensitiveModel::kv_v(t, pos, d, kv_dim).to_bits(),
+                        "成長後 V 行 {pos} 列 {d}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// P4-4 (d): 長い prompt での prefix cache 予算。1 エントリだけが収まる
+    /// 予算で 2 本目の長い prompt を入れると、予算超過ではなく LRU 退避が起きる。
+    /// 退避された prompt を再実行するとエントリ復元は起きず (miss)、logits は
+    /// full prefill と **ビット一致**になる (半端に復元されたキャッシュは無い)。
+    /// prefix_cache.rs の単体テストは同じ算術を短い prompt で見ているが、
+    /// 3,000 token 級 + engine 経路 (スロット残留 KV との競合を含む) は未覆。
+    #[test]
+    fn long_context_prefix_budget_evicts_and_post_eviction_is_a_clean_miss() {
+        let words = long_prompt_words(3000);
+        let prompt_len = long_prompt_len(words); // 3,000
+        let budget = prompt_len + prompt_len / 2; // 1 本は入り 2 本は入らない
+        let p0 = params(0);
+        let a = long_content(words, "t1");
+        let b = long_content(words, "t2");
+
+        let mut e = long_context_engine("long", None).unwrap();
+        e.set_prefix_cache_max_tokens(budget);
+        assert_eq!(e.prefix_cache_max_tokens(), budget);
+
+        let out_a = e.chat(None, &msgs(&a), &p0, |_| {}).unwrap();
+        assert_eq!(e.prefix_cache_entries(), 1);
+        assert_eq!(e.prefix_cache.total_weight(), prompt_len);
+        assert!(e.prefix_cache.total_weight() <= budget);
+
+        // 2 本目: 合計 6,000 > 4,500 -> LRU (A) が退避される
+        let out_b = e.chat(None, &msgs(&b), &p0, |_| {}).unwrap();
+        assert_eq!(e.prefix_cache_entries(), 1, "2 本目で予算超過せず退避する");
+        assert_eq!(e.prefix_cache.total_weight(), prompt_len);
+        assert!(e.prefix_cache.total_weight() <= budget, "予算を超えない");
+        let ids_a = e
+            .tok
+            .encode(&e.tok.apply_chat_template(None, &msgs(&a), None, None).unwrap())
+            .unwrap();
+        assert!(!e.prefix_cache.contains_prompt(&ids_a), "A は退避済み");
+
+        // 退避された A の再実行: エントリ復元は起きず (miss)、数値は full prefill と同一
+        let mut s = e.begin_chat(None, &msgs(&a), &p0).unwrap();
+        e.install_session(&mut s).unwrap();
+        assert_ne!(
+            e.last_prefix_hit(),
+            PrefixHit::Entry,
+            "退避済みエントリからの復元はあり得ない"
+        );
+        assert!(!e.step_chat(&mut s, &mut |_| {}).unwrap());
+        let got = s.logits.clone();
+        e.release_session(&mut s);
+
+        let mut fresh = long_context_engine("long-ref", None).unwrap();
+        let mut r = fresh.begin_chat(None, &msgs(&a), &p0).unwrap();
+        fresh.install_session(&mut r).unwrap();
+        assert_eq!(fresh.last_prefix_hit(), PrefixHit::None);
+        assert!(!fresh.step_chat(&mut r, &mut |_| {}).unwrap());
+        let want = r.logits.clone();
+        assert_eq!(got.len(), want.len());
+        for (i, (x, y)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "logits[{i}]: 退避後 {x} vs full prefill {y} (ビット不一致)"
+            );
+        }
+        assert_eq!(out_a.input_tokens, prompt_len);
+        assert_eq!(out_b.input_tokens, prompt_len);
+    }
 }
