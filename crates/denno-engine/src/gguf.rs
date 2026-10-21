@@ -98,6 +98,14 @@ impl GgufValue {
             _ => None,
         }
     }
+    /// s164 (K5): 配列の要素数。配列以外は None。
+    /// (既存の as_u64 / as_f32 / as_str / as_bool の意味は変えない = additive)
+    pub fn as_array_len(&self) -> Option<usize> {
+        match self {
+            GgufValue::Arr(v) => Some(v.len()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

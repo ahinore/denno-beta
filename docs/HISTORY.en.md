@@ -3416,3 +3416,48 @@ External implementations referenced in P19 and their licensing status (the same 
   `.cu` / `.ptx` change).
 - **Not measured here**: bench / GPU anchors / KPI (structurally unchanged because no
   production line changed, but not measured).
+
+### s164: Task K5 - GGUF fallback for `denno info` dims (2026-10-22) done
+
+> In a GGUF-only directory (no config.json) `denno info` failed with
+> `config.json を開けません` and printed no dims at all (since s158 unknown values print
+> `?`, but when config.json cannot be read the lines are never reached). The dims are now
+> filled from the GGUF metadata. No numeric path and no GPU path changed (CPU only).
+
+- **Implementation**: added `gguf_dims(dir)` and `info_resolve(dir)` in
+  `crates/denno-cli/src/main.rs`.
+  - Reads `general.architecture`, then `<arch>.block_count` -> layers,
+    `<arch>.embedding_length` -> hidden, `<arch>.context_length` -> context. The arch
+    prefix is built from the metadata value (nothing hardcoded).
+  - vocab is the length of `tokenizer.ggml.tokens`, falling back to `<arch>.vocab_size`.
+  - Added `GgufValue::as_array_len()` to `crates/denno-engine/src/gguf.rs` additively (the
+    meaning of the existing `as_u64` / `as_f32` / `as_str` / `as_bool` is unchanged).
+- **Precedence**: config.json wins when present (per-dimension `.or()`, so GGUF only fills
+  the gaps). The `read_config` Err contract is unchanged - only when config.json cannot be
+  read *and* the GGUF yields no dim does the old Err (`config.json を開けません: ...`)
+  come back. Label order, line format, and the `quant:` path are unchanged.
+- **Measured gate**: `cargo test -p denno-cli` = **13 -> 18 passed** (5 new:
+  `gguf_only_dir_fills_dims` / `config_json_wins_over_gguf` / `config_missing_keys_filled_from_gguf` /
+  `gguf_vocab_from_arch_vocab_size` / `no_config_and_no_gguf_metadata_is_err_not_panic`).
+  `cargo test -p denno-engine --lib` = **274 passed / 0 failed / 1 ignored**,
+  `cargo test -p denno-server --lib` = **37 passed**,
+  `cargo test -p denno-engine --test dequant_ref` = **7 passed**.
+  The existing `dir_without_config_is_err_not_panic` / `dir_without_gguf_has_no_quant_line` /
+  `unreadable_gguf_prints_question_mark` are untouched and green.
+- **CPU run (GGUF-only directory)**: a temp dir holding only a symlink to the 27B q4 gguf;
+  `./target/release/denno info <dir>` = `layers: 65` / `hidden: 5120` / `vocab: 248320` /
+  `context: 262144` (`family: ?`; the `quant:` line comes from the unchanged quant path).
+  **Measured caveat**: this file's `qwen35.block_count` is **65** while the same model's
+  config.json says `num_hidden_layers` = **64**. The difference of 1 is
+  `qwen35.nextn_predict_layers = 1` (the MTP layer), which GGUF block_count includes. We
+  print block_count as specified; printing 64 would require an extra "subtract nextn" rule
+  that is outside this task's spec.
+- **CPU run (both sources)**: the production 27B model dir (config.json + gguf) prints
+  `layers: 64` / `hidden: 5120` / `vocab: 248320` / `context: 262144` / `family: qwen3_5_text`
+  - config.json winning is confirmed on the real directory too.
+- **CPU run (neither source)**: an empty dir still gives
+  `Error: config.json を開けません: <dir>/config.json` (exit 1, no panic).
+- **Numeric class**: none (CLI display path plus an additive `gguf.rs` accessor only; the
+  engine numeric path, `.cu` / `.ptx`, and GPU execution are unchanged).
+- **Not measured here**: bench / GPU anchors / KPI (structurally unchanged because no
+  production numeric path changed, but not measured).

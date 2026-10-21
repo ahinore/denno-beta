@@ -3368,3 +3368,44 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
 - **数値クラス**: 該当なし。変更はすべて `#[cfg(test)]` の中 (production 0 行、`.cu` / `.ptx` 無変更)。
 - **測っていないこと**: bench / GPU アンカー / KPI (production の行を 1 行も変えていないため
   構造的に不変だが、測ってはいない)。
+
+### s164: Task K5 - `denno info` の GGUF フォールバック (2026-10-22) 完了
+
+> config.json を持たない GGUF のみのディレクトリでは `denno info` が
+> `config.json を開けません` で失敗し、次元を 1 つも出せなかった (s158 以降は未知を `?` と
+> 表示する設計だが、そもそも config.json が読めないと行自体が出ない)。GGUF のメタデータから
+> layers / hidden / vocab / context を埋めるようにした。数値経路・GPU 経路は無変更 (CPU のみ)。
+
+- **実装**: `crates/denno-cli/src/main.rs` に `gguf_dims(dir)` と `info_resolve(dir)` を追加。
+  - `general.architecture` を読み、`<arch>.block_count` -> layers、`<arch>.embedding_length` -> hidden、
+    `<arch>.context_length` -> context。arch 名はメタデータの値から組み立てる (決め打ちなし)。
+  - vocab は `tokenizer.ggml.tokens` の配列長。無ければ `<arch>.vocab_size`。
+  - `crates/denno-engine/src/gguf.rs` に `GgufValue::as_array_len()` を additive に追加
+    (既存 `as_u64` / `as_f32` / `as_str` / `as_bool` の意味は不変)。
+- **優先順位**: config.json があればそれが勝つ (次元ごとに `.or()` で、GGUF は欠けた分だけ埋める)。
+  `read_config` の Err 契約は不変 — config.json が読めず GGUF からも次元が取れないときだけ
+  従来の Err (`config.json を開けません: ...`) を返す。ラベル順・行書式・`quant:` 行の経路は不変。
+- **実測ゲート**: `cargo test -p denno-cli` = **13 -> 18 passed** (追加 5 本:
+  `gguf_only_dir_fills_dims` / `config_json_wins_over_gguf` / `config_missing_keys_filled_from_gguf` /
+  `gguf_vocab_from_arch_vocab_size` / `no_config_and_no_gguf_metadata_is_err_not_panic`)。
+  `cargo test -p denno-engine --lib` = **274 passed / 0 failed / 1 ignored**、
+  `cargo test -p denno-server --lib` = **37 passed**、
+  `cargo test -p denno-engine --test dequant_ref` = **7 passed**。
+  既存の `dir_without_config_is_err_not_panic` / `dir_without_gguf_has_no_quant_line` /
+  `unreadable_gguf_prints_question_mark` は無変更で緑。
+- **実機 (CPU・GGUF だけのディレクトリ)**: 27B q4 の gguf をシンボリックリンクした一時ディレクトリで
+  `./target/release/denno info <dir>` = `layers: 65` / `hidden: 5120` / `vocab: 248320` /
+  `context: 262144` (`family: ?`、`quant:` 行は従来の quant 経路のまま)。
+  **注意 (実測)**: このファイルの `qwen35.block_count` は **65** で、同じモデルの config.json の
+  `num_hidden_layers` は **64**。差分 1 は `qwen35.nextn_predict_layers = 1` (MTP 層) で、
+  GGUF の block_count はそれを含む。仕様どおり block_count をそのまま layers に出している
+  (64 を出すには nextn を引く規則を足す必要があり、本タスクの仕様外)。
+- **実機 (両方あるディレクトリ)**: 本番 27B のモデルディレクトリ (config.json + gguf) では
+  `layers: 64` / `hidden: 5120` / `vocab: 248320` / `context: 262144` / `family: qwen3_5_text` —
+  config.json が勝つことを実機でも確認。
+- **実機 (どちらも無い)**: 空ディレクトリは従来どおり
+  `Error: config.json を開けません: <dir>/config.json` (exit 1、panic なし)。
+- **数値クラス**: なし (CLI の表示経路と `gguf.rs` の additive アクセサのみ。engine の数値経路・
+  `.cu` / `.ptx` / GPU 実行は無変更)。
+- **測っていないこと**: bench / GPU アンカー / KPI (production の数値経路を 1 行も変えていないため
+  構造的に不変だが、測ってはいない)。

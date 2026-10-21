@@ -82,6 +82,8 @@ enum Commands {
 /// s156: `denno info` の設定解決結果 (テスト可能にするため main から切り出し)
 /// s158 (P2-1): 次元は `Option`。未知は `?` と表示し、`0` を事実として出さない
 /// (未実装値と本物の 0 を区別できないため)。
+/// s164 (K5): `Debug` はテストの `unwrap_err` 用 (表示には使わない)。
+#[derive(Debug)]
 struct ModelInfo {
     family: String,
     layers: Option<u64>,
@@ -400,6 +402,78 @@ fn info_quant_line(dir: &std::path::Path) -> Option<String> {
     find_gguf(dir).map(|p| info_line("quant:", gguf_quant_value(&p)))
 }
 
+/// s164 (K5): GGUF のメタデータから次元を読む (config.json が無い/キーが欠けたとき用)。
+/// arch 名は `general.architecture` の値から組み立てる (`qwen` 等を決め打ちしない)。
+/// 開けない・arch が無い・値が 0 のものは None のまま (事実として 0 を出さない)。
+fn gguf_dims(dir: &std::path::Path) -> ModelInfo {
+    let empty = ModelInfo {
+        family: "?".to_string(),
+        layers: None,
+        hidden: None,
+        vocab: None,
+        context: None,
+    };
+    let Some(path) = find_gguf(dir) else {
+        return empty;
+    };
+    let Ok(f) = denno_engine::gguf::GgufFile::open(&path) else {
+        return empty;
+    };
+    let Some(arch) = f.get("general.architecture").and_then(|v| v.as_str()) else {
+        return empty;
+    };
+    let dim = |suffix: &str| {
+        f.get(&format!("{arch}.{suffix}"))
+            .and_then(|v| v.as_u64())
+            .filter(|n| *n > 0)
+    };
+    ModelInfo {
+        // family は config.json からのみ (GGUF の arch 名は family ではない)
+        family: "?".to_string(),
+        layers: dim("block_count"),
+        hidden: dim("embedding_length"),
+        context: dim("context_length"),
+        // vocab はトークン表の配列長。無ければ `<arch>.vocab_size`
+        vocab: f
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| v.as_array_len())
+            .map(|n| n as u64)
+            .filter(|n| *n > 0)
+            .or_else(|| dim("vocab_size")),
+    }
+}
+
+/// s164 (K5): `denno info` の次元解決。config.json があればそれが優先で、
+/// 欠けている次元だけ GGUF のメタデータで埋める (同じ次元を GGUF で上書きしない)。
+/// config.json が読めず、GGUF からも次元が取れないときは `read_config` の Err を
+/// そのまま返す (Err 契約・文言は従来どおり)。
+fn info_resolve(dir: &std::path::Path) -> Result<(ModelInfo, ModelExtras)> {
+    let gguf = gguf_dims(dir);
+    match read_config(dir) {
+        Ok(cfg) => {
+            let from_cfg = info_dims(&cfg);
+            let merged = ModelInfo {
+                family: from_cfg.family,
+                layers: from_cfg.layers.or(gguf.layers),
+                hidden: from_cfg.hidden.or(gguf.hidden),
+                vocab: from_cfg.vocab.or(gguf.vocab),
+                context: from_cfg.context.or(gguf.context),
+            };
+            Ok((merged, info_extras(&cfg)))
+        }
+        Err(e) => {
+            let any_dim = gguf.layers.is_some()
+                || gguf.hidden.is_some()
+                || gguf.vocab.is_some()
+                || gguf.context.is_some();
+            if !any_dim {
+                return Err(e);
+            }
+            Ok((gguf, ModelExtras::default()))
+        }
+    }
+}
+
 /// s156: repo 引数が実在のディレクトリならそこを直接見る (hub cache 不要)。
 /// そうでなければ従来どおりの hub cache 経路 (エラー文言も従来どおり)。
 fn resolve_model_dir(repo: &str) -> Result<PathBuf> {
@@ -469,9 +543,9 @@ fn main() -> Result<()> {
         }
         Commands::Info { repo } => {
             let dir = resolve_model_dir(&repo)?;
-            let cfg = read_config(&dir)?;
-            let info = info_dims(&cfg);
-            let extras = info_extras(&cfg);
+            // s164 (K5): config.json が無い/次元キーが欠けているときは GGUF の
+            // メタデータで埋める (config.json が優先)。どちらも無ければ従来どおり Err。
+            let (info, extras) = info_resolve(&dir)?;
             for line in info_config_lines(&repo, &info, &extras) {
                 println!("{line}");
             }
@@ -609,6 +683,22 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// s164 (K5): テスト用 GGUF メタデータ値 (最小の書き手用)
+    enum GgufMeta<'a> {
+        Str(&'a str),
+        U32(u32),
+        /// 文字列配列 (`tokenizer.ggml.tokens` 用)
+        ArrStr(&'a [&'a str]),
+    }
+
+    /// GGUF の magic ("GGUF" を LE で読んだ値)
+    const GGUF_MAGIC: u32 = 0x4655_4747;
+
+    fn gguf_push_str(b: &mut Vec<u8>, s: &str) {
+        b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        b.extend_from_slice(s.as_bytes());
+    }
+
     /// temp_dir 配下に一意なディレクトリを作る (drop で削除)
     struct TempDir {
         path: PathBuf,
@@ -643,6 +733,41 @@ mod tests {
             let mut f = std::fs::File::create(&p).expect("create file");
             f.write_all(bytes).expect("write file");
             p
+        }
+
+        /// s164 (K5): メタデータだけの最小 GGUF v3 (テンソル 0 個) を置く。
+        /// データ部が無いので、32 byte 整列のぶんだけ 0 で埋める。
+        fn write_gguf_meta(&self, name: &str, kv: &[(&str, GgufMeta<'_>)]) -> PathBuf {
+            let mut b = Vec::new();
+            b.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+            b.extend_from_slice(&3u32.to_le_bytes()); // version
+            b.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+            b.extend_from_slice(&(kv.len() as u64).to_le_bytes());
+            for (key, val) in kv {
+                gguf_push_str(&mut b, key);
+                match val {
+                    GgufMeta::Str(s) => {
+                        b.extend_from_slice(&8u32.to_le_bytes()); // GT_STRING
+                        gguf_push_str(&mut b, s);
+                    }
+                    GgufMeta::U32(n) => {
+                        b.extend_from_slice(&4u32.to_le_bytes()); // GT_U32
+                        b.extend_from_slice(&n.to_le_bytes());
+                    }
+                    GgufMeta::ArrStr(items) => {
+                        b.extend_from_slice(&9u32.to_le_bytes()); // GT_ARRAY
+                        b.extend_from_slice(&8u32.to_le_bytes()); // elem = string
+                        b.extend_from_slice(&(items.len() as u64).to_le_bytes());
+                        for s in items.iter() {
+                            gguf_push_str(&mut b, s);
+                        }
+                    }
+                }
+            }
+            while b.len() % 32 != 0 {
+                b.push(0);
+            }
+            self.write_file(name, &b)
         }
     }
 
@@ -980,5 +1105,139 @@ mod tests {
         assert_eq!(ggml_type_id(GgmlType::Tq1_0), 34);
         assert_eq!(ggml_type_id(GgmlType::Q4_0), 2);
         assert_eq!(ggml_type_name(GgmlType::Q4_0), "Q4_0");
+    }
+
+    // ---- s164 (K5): GGUF だけのディレクトリから次元を埋める ----
+
+    // e. config.json が無く GGUF しか無いディレクトリでも 4 次元が非 0 で出る
+    #[test]
+    fn gguf_only_dir_fills_dims() {
+        let td = TempDir::new("gguf_only");
+        let tokens: Vec<&str> = vec!["a", "b", "c", "d"];
+        let p = td.write_gguf_meta(
+            "model.gguf",
+            &[
+                ("general.architecture", GgufMeta::Str("qwen3")),
+                ("qwen3.block_count", GgufMeta::U32(64)),
+                ("qwen3.embedding_length", GgufMeta::U32(5120)),
+                ("qwen3.context_length", GgufMeta::U32(262144)),
+                ("tokenizer.ggml.tokens", GgufMeta::ArrStr(&tokens)),
+            ],
+        );
+        assert_eq!(find_gguf(&td.path).as_deref(), Some(p.as_path()));
+        // config.json は無い (read_config の Err 契約はそのまま)
+        assert!(read_config(&td.path).is_err());
+
+        let (info, extras) = info_resolve(&td.path).expect("gguf metadata must fill dims");
+        assert_eq!(info.layers, Some(64));
+        assert_eq!(info.hidden, Some(5120));
+        assert_eq!(info.vocab, Some(4)); // tokenizer.ggml.tokens の配列長
+        assert_eq!(info.context, Some(262144));
+        // family は config.json からのみ (GGUF の arch 名は family ではない)
+        assert_eq!(info.family, "?");
+
+        // 表示行のラベル・書式は従来どおりで、値が非 0
+        let lines = info_config_lines("local/g", &info, &extras);
+        assert_eq!(line_value(&lines, "layers:"), "64");
+        assert_eq!(line_value(&lines, "hidden:"), "5120");
+        assert_eq!(line_value(&lines, "vocab:"), "4");
+        assert_eq!(line_value(&lines, "context:"), "262144");
+        for label in ["layers:", "hidden:", "vocab:", "context:"] {
+            assert_ne!(line_value(&lines, label), "0", "{label} must be non-zero");
+        }
+        // GGUF があるので quant 行は従来どおり出る
+        assert!(info_quant_line(&td.path).is_some());
+    }
+
+    // f. config.json と GGUF の両方があるときは config.json が勝つ
+    #[test]
+    fn config_json_wins_over_gguf() {
+        let td = TempDir::new("both");
+        td.write_config(FLAT_LLAMA); // 32 / 4096 / 128256 / 131072
+        let tokens: Vec<&str> = vec!["a", "b"];
+        td.write_gguf_meta(
+            "model.gguf",
+            &[
+                ("general.architecture", GgufMeta::Str("qwen3")),
+                ("qwen3.block_count", GgufMeta::U32(64)),
+                ("qwen3.embedding_length", GgufMeta::U32(5120)),
+                ("qwen3.context_length", GgufMeta::U32(262144)),
+                ("tokenizer.ggml.tokens", GgufMeta::ArrStr(&tokens)),
+            ],
+        );
+        let (info, _extras) = info_resolve(&td.path).expect("config must parse");
+        assert_eq!(info.family, "llama");
+        assert_eq!(info.layers, Some(32));
+        assert_eq!(info.hidden, Some(4096));
+        assert_eq!(info.vocab, Some(128256));
+        assert_eq!(info.context, Some(131072));
+    }
+
+    // g. config.json にキーが欠けているときは、欠けた次元だけ GGUF で埋める
+    // (同じ次元を GGUF で上書きしない = 出所を混ぜない)
+    #[test]
+    fn config_missing_keys_filled_from_gguf() {
+        let td = TempDir::new("partial");
+        td.write_config(r#"{"model_type":"acme","vocab_size":999}"#);
+        let tokens: Vec<&str> = vec!["a", "b", "c"];
+        td.write_gguf_meta(
+            "m.gguf",
+            &[
+                ("general.architecture", GgufMeta::Str("acme")),
+                ("acme.block_count", GgufMeta::U32(12)),
+                ("acme.embedding_length", GgufMeta::U32(768)),
+                ("acme.context_length", GgufMeta::U32(4096)),
+                ("acme.vocab_size", GgufMeta::U32(32000)),
+                ("tokenizer.ggml.tokens", GgufMeta::ArrStr(&tokens)),
+            ],
+        );
+        let (info, _extras) = info_resolve(&td.path).expect("config must parse");
+        assert_eq!(info.family, "acme");
+        assert_eq!(info.layers, Some(12)); // config に無い -> GGUF
+        assert_eq!(info.hidden, Some(768)); // config に無い -> GGUF
+        assert_eq!(info.context, Some(4096)); // config に無い -> GGUF
+        assert_eq!(info.vocab, Some(999)); // config.json が勝つ (配列長 3 ではない)
+    }
+
+    // h. トークン表が無い GGUF では `<arch>.vocab_size` にフォールバックする
+    // (arch 名はメタデータから組み立てる。決め打ちしない)
+    #[test]
+    fn gguf_vocab_from_arch_vocab_size() {
+        let td = TempDir::new("gguf_vocab");
+        td.write_gguf_meta(
+            "m.gguf",
+            &[
+                ("general.architecture", GgufMeta::Str("acme")),
+                ("acme.vocab_size", GgufMeta::U32(32000)),
+            ],
+        );
+        let (info, _extras) = info_resolve(&td.path).expect("vocab_size is enough");
+        assert_eq!(info.vocab, Some(32000));
+        assert_eq!(info.layers, None);
+        assert_eq!(info.hidden, None);
+        assert_eq!(info.context, None);
+    }
+
+    // i. config.json も GGUF のメタデータも無いときは従来どおり Err (panic しない)
+    #[test]
+    fn no_config_and_no_gguf_metadata_is_err_not_panic() {
+        // 空のディレクトリ
+        let empty = TempDir::new("nothing");
+        let err = info_resolve(&empty.path).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("config.json"), "unexpected message: {msg}");
+
+        // 壊れた GGUF しか無いディレクトリ
+        let broken = TempDir::new("broken_meta");
+        broken.write_file("x.gguf", b"not a gguf");
+        let err = info_resolve(&broken.path).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("config.json"), "unexpected message: {msg}");
+
+        // general.architecture が無い GGUF しか無いディレクトリ
+        let noarch = TempDir::new("no_arch");
+        let none: Vec<&str> = Vec::new();
+        noarch.write_gguf_meta("y.gguf", &[("tokenizer.ggml.tokens", GgufMeta::ArrStr(&none))]);
+        assert!(info_resolve(&noarch.path).is_err());
     }
 }
