@@ -2986,6 +2986,42 @@ s122 のハンドオフはそれを「s118 で設計済み」と読んで再実�
   lm_head m=1 0.660、GDN n=1 0.145 / n=32 0.811 / n=300 5.754)。純加法で GPU 経路に触れない。
 - **数値クラス**: 緩和なし (R1〜R4 のいずれも使わない)。`.cu` / `.ptx` 変更なし。
 
+### s158: Task P2-1 - `denno info` の未知を `?` にし、rope / attention / dtype / 量子化を表示 (2026-10-21) 完了
+
+> 未知の次元を `0` と表示していたため、未実装値と本物の 0 を区別できなかった。
+> config.json 由来の rope / attention / dtype / 量子化を出し、GGUF があればテンソル型の
+> 最頻値も 1 行で出す。値が無いものは `?`、量子化設定そのものが無いときだけ `none`。
+
+- **次元は `Option<u64>`**: `layers` / `hidden` / `vocab` / `context` は未知なら `?`。`0` を事実として
+  出さない。既存 3 テスト (`nested_text_config_dims` / `flat_llama_dims_unchanged` /
+  `nested_lookup_order`) は `Some(..)` / `None` に更新した (意図は不変・表示の厳密化)。
+- **追加表示**: 探索順は既存 `info_lookup_u64` / `info_lookup_str` と同じ
+  (`text_config` / `llm_config` / `language_config` → トップレベル)。
+  `rope_theta`、`rope_scaling` (マップなら `type` と `factor`)、`partial_rotary_factor`、
+  `num_attention_heads`、`num_key_value_heads`、`head_dim`、`torch_dtype`、
+  `quantization_config.quant_method` / `bits`。未知のキーは `?`、`quantization_config` が
+  無いときは `none`。推測した既定値は書かない。
+- **別名 (同じ事実の別の置き場所)**: `rope_scaling` の種別は `type` が無ければ `rope_type` を読む。
+  `rope_theta` は `rope_parameters.rope_theta` も読む (Qwen3.5 の config はこちらに置く)。
+  どちらも値の捏造ではなく、無ければ `?` のまま。
+- **GGUF**: ディレクトリ直下に `*.gguf` があるときだけ `denno_engine::gguf::GgufFile` で開き、
+  テンソル型の最頻値を人間可読名 + 数値 id (`quant:       Q8_0 (8)`) で 1 行。開けない/読めない
+  ときは `?` で panic しない。GGUF が無ければ行自体を出さない。同数のときは ggml type id の
+  小さい方を選ぶ (実行ごとに変わらない)。
+- **実測 (このコンテナ・CPU のみ)**: `denno info data/qwen35-9b` = 32 / 4096 / 248320 / 262144、
+  `rope_theta: 10000000` (`rope_parameters` 由来)、`attn_heads: 16` / `kv_heads: 4` /
+  `head_dim: 256`、`quant: Q8_0 (8)`。`denno info data/qwen35-test` = 24 / 1024 / 248320 / 262144、
+  `attn_heads: 8` / `kv_heads: 2` / `head_dim: 256`、`quant: Q8_0 (8)`。両方とも config に
+  `torch_dtype` と `rope_scaling` が無いので `?` (`?` は「無い」であって 0 ではない)。
+- **テスト**: denno-cli **13 passed** (旧 5)。追加は (a) 入れ子 `text_config` から rope / attention /
+  dtype (b) 未知キーは `?` で 0 ではない (c) `quantization_config` あり / なし / 空 (d) gguf の無い
+  ディレクトリで行が出ない・壊れた gguf で `?` (e) ggml type id 表が `GgmlType::from_id` と往復
+  (f) 最頻値の同数処理。出力全体のスナップショットは取らず、解決と文字列化を関数に切って検証した。
+- **表示の桁**: ラベル幅を 13 に統一した (既存行の値は不変、空白だけの変更)。
+- **数値クラス**: 該当なし (R1-R4 のいずれでもない)。数値経路・`.cu` / `.ptx` は無変更。
+- **測っていないこと**: denno-engine / denno-server のテスト数、GPU アンカー、実機 8095 の挙動。
+  これらは supervisor 側の関門で確認する。
+
 ### ベンチマーク一覧 (2026-10-20 時点・このホスト)
 
 測定規則: prefill の正式値は cold 単発 (サーバ起動 -> 1 リクエスト、prefix cache off、

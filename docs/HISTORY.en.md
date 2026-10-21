@@ -3008,6 +3008,45 @@ the cause is the n-sized buffers themselves, not the thread count.
   additive and touches no GPU path.
 - **Numeric class**: no relaxation (none of R1-R4). No `.cu` / `.ptx` change.
 
+### s158: Task P2-1 - `denno info` prints `?` for unknown values and shows rope / attention / dtype / quantization (2026-10-21) done
+
+> Unknown dimensions used to be printed as `0`, so an unimplemented value was indistinguishable from a
+> real zero. The command now prints the rope / attention / dtype / quantization facts from config.json,
+> plus one line with the most common tensor type when a GGUF sits in the directory. A missing value is
+> `?`; only an absent quantization config is `none`.
+
+- **Dimensions are `Option<u64>`**: `layers` / `hidden` / `vocab` / `context` print `?` when unknown.
+  `0` is never reported as a fact. The three existing tests (`nested_text_config_dims` /
+  `flat_llama_dims_unchanged` / `nested_lookup_order`) were updated to `Some(..)` / `None`; their
+  intent is unchanged (this tightens the display, it does not loosen it).
+- **Additional lines**: same lookup order as the existing `info_lookup_u64` / `info_lookup_str`
+  (`text_config` / `llm_config` / `language_config` -> top level): `rope_theta`, `rope_scaling`
+  (`type` and `factor` when it is a map), `partial_rotary_factor`, `num_attention_heads`,
+  `num_key_value_heads`, `head_dim`, `torch_dtype`, and `quantization_config.quant_method` / `bits`.
+  Unknown keys print `?`; an absent `quantization_config` prints `none`. No default is invented.
+- **Aliases (the same fact under another key)**: the rope scaling kind falls back from `type` to
+  `rope_type`, and `rope_theta` also reads `rope_parameters.rope_theta` (that is where the Qwen3.5
+  config puts it). Neither is a fabricated value: with no such key the line stays `?`.
+- **GGUF**: only when the directory contains a `*.gguf`, the file is opened with
+  `denno_engine::gguf::GgufFile` and the most common tensor type is printed once as a human readable
+  name plus the numeric ggml id (`quant:       Q8_0 (8)`). If it cannot be opened or read the value is
+  `?` and nothing panics. With no GGUF the line is not printed at all. Ties go to the smaller ggml
+  type id, so the output does not change between runs.
+- **Measured here (this container, CPU only)**: `denno info data/qwen35-9b` = 32 / 4096 / 248320 /
+  262144, `rope_theta: 10000000` (from `rope_parameters`), `attn_heads: 16` / `kv_heads: 4` /
+  `head_dim: 256`, `quant: Q8_0 (8)`. `denno info data/qwen35-test` = 24 / 1024 / 248320 / 262144,
+  `attn_heads: 8` / `kv_heads: 2` / `head_dim: 256`, `quant: Q8_0 (8)`. Both configs carry no
+  `torch_dtype` and no `rope_scaling`, so those lines print `?` (which means "absent", not zero).
+- **Tests**: denno-cli **13 passed** (was 5). Added: (a) rope / attention / dtype resolved from a nested
+  `text_config`, (b) unknown keys give `?` and not `0`, (c) `quantization_config` present / absent /
+  empty, (d) a directory without a gguf prints no line and a corrupt gguf prints `?`, (e) the ggml type
+  id table round-trips through `GgmlType::from_id`, (f) the tie-break of the mode. No full stdout
+  snapshot: resolution and formatting were factored into functions and tested directly.
+- **Label width**: unified at 13 columns (values of the existing lines are unchanged; whitespace only).
+- **Numeric class**: none of R1-R4 applies. No numeric path, no `.cu` / `.ptx` change.
+- **Not measured here**: the denno-engine / denno-server test counts, GPU anchors, and the behaviour of
+  the live 8095 server. Those belong to the supervisor's gates.
+
 ### Benchmark summary (as of 2026-10-20, this host)
 
 Measurement rule: the official prefill value is cold single-shot (server start -> one request,
