@@ -2866,6 +2866,51 @@ s122 のハンドオフはそれを「s118 で設計済み」と読んで再実�
   `local/qwen35-9b` = 32 / 4096 / 248320 / 262144 (いずれも family `qwen3_5_text`)。
   denno-cli 5 passed、denno-engine lib 262 passed / 1 ignored で回帰なし。
 
+### s157: Task B19 - `DENNO_PROFILE_SAMPLE` で計測の膨張を抑え、gap_fwd を 7 段に割る (2026-10-21) 完了
+
+> B18 の実測 (表 C・92 step) は instrumented 131.8 ms/step に対し実 KPI が
+> 55.1 ms/token で、**計測そのものが測っている対象を変えていた** (1 step に 392 本の
+> 線形 D2H を個別に計時)。step 単位で間引く環境変数を足し、41% を占めていた
+> `sl_so_gap_fwd` に名前を付けた。
+
+- **`DENNO_PROFILE_SAMPLE=N`** (`prof.rs`): N step に 1 step だけ区間を取る。
+  既定は `1` = 従来挙動と 1 bit も変わらない。未設定 / 空 / `0` / 非数値は `1` に
+  落ちる (「測らない」は `DENNO_PROFILE` の役目なので、ここへ無言で落とさない)。
+  `N` の上限は 1,000,000 (step 番号の飽和よけ)。環境変数は 1 回だけ読む (`OnceLock`)。
+- **間引いた step で何が起きるか**: `span_begin` は `Instant::now()` を**読まず**に
+  `None` を返し、`push` / `split_sample` は ns を 1 ns も積まない。**号数だけ**は積む
+  — 「何 step のうち何 sample 見たか」を表から消さないため。平均の分母は
+  `serve_samples` / `serve_lin_samples` (実際に測った数) で、間引き率を掛けた
+  全 step 相当への換算はしない (かけ算は分布の仮定、号数は事実)。
+- **表示**: 表 C の頭に 1 行 `SPLIT SERVE sampling: N=… | steps seen … | steps measured …
+  | lin calls measured … | spans skipped …` を必ず出す。`spans skipped` は
+  「step の中で区間を開けずに閉じた回数」= 待ち時間が sampled step に寄っている兆候。
+- **`sl_so_gap_fwd` の内訳 (7 段・すべて `sl_gap_*`)**: `sl_gap_embed` /
+  `sl_gap_rmsnorm` (層あたり 2 回) / `sl_gap_gdn` / `sl_gap_attn` / `sl_gap_rope` /
+  `sl_gap_quant` / `sl_gap_ffn`。`sl_gap_rope` は attn の**内数**なので、表示する
+  `sl_gap_attn` は rope を引いた正味 — これで 7 段が排他になり、和 + `sl_gap_resid`
+  が `sl_so_gap_fwd` に一致する (残余は 0 でも行を出す)。
+  `sl_gap_quant` は **q4 経路で構造的に 0**: 重みは事前量子化・活性は f32 のまま
+  GEMV に渡すので、serve 中に活性の量子化が起きない (int8 の活性量子化は
+  `sl_lin_quant` = `sl_lin` の子に乗る)。穴ではなく経路の性質として 0 を出す。
+- **経路差**: 27B q4 の per-op 経路は `sl_gap_*` を直接測る。9B int8 の chain 経路は
+  既存の `sl_lay_*` を測っているので、`sl_gap_*` の号数が 0 のときだけ `sl_lay_*` の
+  和へ落とす (両方を足さない = 二重計上しない)。
+- **step の外では測らない**: 内訳は `span_begin_in_step()` で開く (step が開いていない
+  単体 forward・prefill・モデルのテストでは時刻も読まず行も積まない)。これで
+  `sl_gap_*` の号数が「serve の step 数 × 層数」からずれない。
+- **B16 の恒等式は不変**: `sl_gap_*` は `sl_so_gap_fwd` の**内側**の子なので、
+  `sl_step_other` の兄弟には入れない (`SL_GROUPS[0]` はそのまま)。
+- **テスト** (この差分には `#[test]` が 1 つも無かった): `parse_sample_every` の境界
+  (未設定 / `""` / `"0"` / `"abc"` / `"-3"` / `"1.5"` / `"1"` / `"16"` / 上限超え /
+  u64 桁あふれ)、`sample_hit` の周期性 (N=1/3/16/上限)、間引いた step で `SPLIT_NS` が
+  増えず号数だけ増えること、そして **CPU フィクスチャ** (合成イベント → 内訳表) で
+  「和 + 残余 = gap_fwd」「残余 < 10%」「N=1 と N=16 で行名が同一」「測った値が同一」を
+  固定。GPU 不要。denno-engine lib **262 → 268 passed** / denno-server 37 passed。
+- **予測** (実測は supervisor): `DENNO_PROFILE=1 DENNO_PROFILE_SAMPLE=16` の膨張は
+  **10% 未満**。根拠は「1 step あたりのクロック読みが約 1/16 になり、残る固定費は
+  step あたり 1 回の表操作だけ」— 数値は実機で確かめる。
+
 ### ベンチマーク一覧 (2026-10-20 時点・このホスト)
 
 測定規則: prefill の正式値は cold 単発 (サーバ起動 -> 1 リクエスト、prefix cache off、

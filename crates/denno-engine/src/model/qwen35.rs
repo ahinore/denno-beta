@@ -686,7 +686,12 @@ impl Qwen35 {
         qout: &mut [f32],
     ) {
         let mut k = self.full_attn_qknorm(lf, qg, k_row, qout);
+        // s156 (Task B19): gap_fwd の内訳 `sl_gap_rope` (full 層のみ・attn の内数)。
+        // prefill もこの関数を通るが prefill には gap_fwd が無いので、単独行として
+        // 出るだけで、どこからも二重に引かれない。
+        let l_rope = crate::prof::span_begin_in_step();
         self.full_attn_rope(qout, &mut k, pos);
+        crate::prof::span_end(l_rope, crate::prof::SL_GAP_ROPE);
         // K/V をキャッシュへ
         let kv_dim = self.kv_heads * self.dh;
         let (kc, vc) = cache.kv_bufs(li, 1);
@@ -1171,22 +1176,45 @@ impl Model for Qwen35 {
             // そのビルドでは 1 度も実行されない (B15 実測 sl_so_logits 0 call)。
             let gap_t = crate::prof::span_begin();
             let l_embed = crate::prof::span_begin();
+            // s156 (Task B19): gap_fwd の内訳 `sl_gap_embed` (sl_lay_embed と同じ区間の
+            // 複製)。1 step 1 回なので増えるクロック読みは 1 対だけ。
+            let g_embed = crate::prof::span_begin_in_step();
             let mut x: Vec<f32> = self.embed[tok as usize * e..][..e].to_vec();
+            crate::prof::span_end(g_embed, crate::prof::SL_GAP_EMBED);
             crate::prof::span_end(l_embed, crate::prof::SL_LAY_EMBED);
 
             for (li, layer) in self.layers.iter().enumerate() {
                 // --- attention ---
+                // s156 (Task B19): gap_fwd の内訳 (rmsnorm / gdn / full attn)。
+                // 区間は**排他**に切る (rope だけは full_attn_prepare の内側で
+                // `sl_gap_rope` として別に測り、表示で attn から引く)。
+                let l_norm = crate::prof::span_begin_in_step();
                 let h = rmsnorm(&x, layer.attn_ln1(), e, self.eps);
+                crate::prof::span_end(l_norm, crate::prof::SL_GAP_RMSNORM);
                 let attn_out = match &layer.attn {
-                    AttnKind::Gdn(g) => self.gdn_attn_token(g, &h, cache, li),
-                    AttnKind::Full(fl) => self.full_attn_token(fl, &h, cache, li, pos)?,
+                    AttnKind::Gdn(g) => {
+                        let l_att = crate::prof::span_begin_in_step();
+                        let o = self.gdn_attn_token(g, &h, cache, li);
+                        crate::prof::span_end(l_att, crate::prof::SL_GAP_GDN);
+                        o
+                    }
+                    AttnKind::Full(fl) => {
+                        let l_att = crate::prof::span_begin_in_step();
+                        let o = self.full_attn_token(fl, &h, cache, li, pos)?;
+                        crate::prof::span_end(l_att, crate::prof::SL_GAP_ATTN);
+                        o
+                    }
                 };
                 for (xi, ai) in x.iter_mut().zip(attn_out.iter()) {
                     *xi += ai;
                 }
                 // --- FFN ---
+                let l_norm2 = crate::prof::span_begin_in_step();
                 let h2 = rmsnorm(&x, &layer.ln2_w, e, self.eps);
+                crate::prof::span_end(l_norm2, crate::prof::SL_GAP_RMSNORM);
+                let l_ffn = crate::prof::span_begin_in_step();
                 let ffn_out = self.ffn(layer, &h2);
+                crate::prof::span_end(l_ffn, crate::prof::SL_GAP_FFN);
                 for (xi, fi) in x.iter_mut().zip(ffn_out.iter()) {
                     *xi += fi;
                 }

@@ -517,7 +517,9 @@ const SPLIT_Q4_NAMES: [&str; SPLIT_Q4_N] = [
 /// (または call) の壁時計になる。`sl_other` は「上記のどれにも当たらなかった
 /// 残余」で、必ず実測残余 (全体 − 既知段の和) を入れる — 何も測っていない穴が
 /// 0 ms として静かに通らないようにするため。
-pub const SPLIT_SERVE_N: usize = 40;
+/// s156 (Task B19): 40 → 45 (`rsv_a` / `rsv_b` の 2 行と、後ろの空きを gap_fwd の
+/// 内訳 7 行へ流用)。
+pub const SPLIT_SERVE_N: usize = 45;
 /// 表 C の開始は表 B の末尾 (詰め直しをしない — 過去ログとの位置関係を保つ)。
 pub const SPLIT_SERVE_FIRST: usize = SPLIT_Q4_FIRST + SPLIT_Q4_N;
 /// decode 1 ステップの全体 (engine の step 入口 → forward 戻り)。サーバは
@@ -608,6 +610,32 @@ pub const SL_SO_RESID: usize = SPLIT_SERVE_FIRST + 36;
 /// s154 (B15): 最終 norm + lm_head の**転記** (`sl_step_final` と同じ区間を
 /// 違う行に積む — `sl_step_final` の値は 1 bit も動かさない)。
 pub const SL_LAY_FINAL: usize = SPLIT_SERVE_FIRST + 37;
+/// s156 (Task B19): `sl_so_gap_fwd` (B18 実測 54.158 ms/step = instrumented step の
+/// 41%) の内訳。forward 入口 → 層ループ末尾を**排他な 7 段**に割る。行名はすべて
+/// `sl_gap_*` で揃える:
+///
+///   sl_gap_embed    embed 行の複製 (1 step 1 回。`sl_lay_embed` と同じ区間)
+///   sl_gap_rmsnorm  層あたり 2 回の rmsnorm (attn 前 / FFN 前)
+///   sl_gap_gdn      GDN 層の attn 区間 (4 射影 + スキャン + out_proj)
+///   sl_gap_attn     full 層の attn 区間。**rope を除いた正味**で出す
+///                   (生の区間は rope を含むので、表示と残余計算で rope を引く)
+///   sl_gap_rope     partial interleaved RoPE (full 層のみ・attn の内数)
+///   sl_gap_quant    活性の量子化。q4 経路は活性を量子化しない (重みは事前量子化・
+///                   活性は f32) ので**構造的に 0**。int8 の活性量子化は
+///                   `sl_lin_quant` (`sl_lin` の子) に乗る — 穴ではなく経路の性質。
+///   sl_gap_ffn      FFN 区間 (post norm の後・gate/up + swiglu + down)
+///
+/// `sl_gap_resid` は上の和を `sl_so_gap_fwd` から引いた**残余** (転記行・ns は
+/// 積まない: 表示のたびに計算する)。B16 の恒等式 (`sl_step_other` = step − 名付きの
+/// 兄弟) は動かさない — これらは `sl_so_gap_fwd` の**内側**の子であって、step の
+/// 兄弟ではない。
+pub const SL_GAP_EMBED: usize = SPLIT_SERVE_FIRST + 38;
+pub const SL_GAP_RMSNORM: usize = SPLIT_SERVE_FIRST + 39;
+pub const SL_GAP_GDN: usize = SPLIT_SERVE_FIRST + 40;
+pub const SL_GAP_ATTN: usize = SPLIT_SERVE_FIRST + 41;
+pub const SL_GAP_ROPE: usize = SPLIT_SERVE_FIRST + 42;
+pub const SL_GAP_QUANT: usize = SPLIT_SERVE_FIRST + 43;
+pub const SL_GAP_FFN: usize = SPLIT_SERVE_FIRST + 44;
 
 /// 表 C の行名 (`SPLIT_SERVE_FIRST + i`)。並びは id の並びと一致させる。
 const SPLIT_SERVE_NAMES: [&str; SPLIT_SERVE_N] = [
@@ -651,8 +679,14 @@ const SPLIT_SERVE_NAMES: [&str; SPLIT_SERVE_N] = [
     "sl_so_end",
     "sl_so_resid",
     "sl_lay_final",
-    "rsv_a",
-    "rsv_b",
+    // s156 (Task B19): sl_so_gap_fwd の内訳 (forward 入口 → 層ループ末尾)
+    "sl_gap_embed",
+    "sl_gap_rmsnorm",
+    "sl_gap_gdn",
+    "sl_gap_attn",
+    "sl_gap_rope",
+    "sl_gap_quant",
+    "sl_gap_ffn",
 ];
 
 /// s148: 表 C の「全体」行と「内訳」行 (排他な内訳の和が全体になる組)。
@@ -768,7 +802,8 @@ pub fn time_full<T>(op: usize, rows: usize, on_gpu: bool, f: impl FnOnce() -> T)
     if prof_on {
         add_sample(phase(), op, ns, 1, rows, on_gpu);
     }
-    if tel_on {
+    if tel_on && !step_skipped() {
+        // s156 (Task B19): 間引いた step はテレメトリにも積まない (表 C と同じ間引き)。
         crate::telemetry_add_op(if op < N_OPS { op } else { D2H }, ns);
     }
     r
@@ -831,7 +866,8 @@ pub fn time_n_ev<T>(op: usize, rows: usize, f: impl FnOnce() -> T) -> T {
     if prof_on {
         add_sample(phase(), op, ns, 1, rows, on_gpu);
     }
-    if tel_on {
+    if tel_on && !step_skipped() {
+        // s156 (Task B19): 間引いた step はテレメトリにも積まない。
         crate::telemetry_add_op(if op < N_OPS { op } else { D2H }, ns);
     }
     r
@@ -862,7 +898,8 @@ pub fn time_layer_n_ev<T>(
     if prof_on {
         add_sample(phase(), op, ns, 1, rows, on_gpu);
     }
-    if tel_on {
+    if tel_on && !step_skipped() {
+        // s156 (Task B19): 間引いた step はテレメトリにも積まない。
         crate::telemetry_add_op(if op < N_OPS { op } else { D2H }, ns);
         denno_telemetry::record_layer_op(op, ns);
     }
@@ -1090,6 +1127,134 @@ fn add_outer_ns(pi: usize, owners: &[usize], children: &[usize], ns: u64) {
     }
 }
 
+/// s156 (Task B19): `sl_so_gap_fwd` の内訳 (ns)。`rope` は `attn` の**内数**
+/// なので、`attn` には rope を除いた正味を入れる — これで 7 段が排他になり、
+/// 和が `sl_so_gap_fwd` に一致する (一致しない分は `gap_fwd_residual_ns`)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GapFwdParts {
+    pub embed: u64,
+    pub rmsnorm: u64,
+    pub gdn: u64,
+    pub attn: u64,
+    pub rope: u64,
+    pub quant: u64,
+    pub ffn: u64,
+}
+
+impl GapFwdParts {
+    /// 表示順の行名。**サンプリングの有無・経路の別で変わらない** (CPU フィクスチャが
+    /// 「unsampled でも同じ名前が出る」ことを固定する)。
+    pub const NAMES: [&'static str; 7] = [
+        "sl_gap_embed",
+        "sl_gap_rmsnorm",
+        "sl_gap_gdn",
+        "sl_gap_attn",
+        "sl_gap_rope",
+        "sl_gap_quant",
+        "sl_gap_ffn",
+    ];
+
+    /// 排他な 7 段の和 (= gap_fwd から引く量)。
+    #[inline]
+    pub fn sum(&self) -> u64 {
+        self.embed + self.rmsnorm + self.gdn + self.attn + self.rope + self.quant + self.ffn
+    }
+
+    /// 表示用の (行名, ns) 列。順序は `NAMES` と一致。
+    #[inline]
+    pub fn as_pairs(&self) -> [(&'static str, u64); 7] {
+        [
+            (Self::NAMES[0], self.embed),
+            (Self::NAMES[1], self.rmsnorm),
+            (Self::NAMES[2], self.gdn),
+            (Self::NAMES[3], self.attn),
+            (Self::NAMES[4], self.rope),
+            (Self::NAMES[5], self.quant),
+            (Self::NAMES[6], self.ffn),
+        ]
+    }
+}
+
+/// s156 (Task B19): gap_fwd の 7 段 — (行名, 実測行, 転記元の行)。
+///
+/// 27B q4 の per-op 経路は `sl_gap_*` を直接測る (この経路の層ループは
+/// `sl_lay_*` のスパンを切っていない)。9B int8 の chain 経路は `sl_lay_*` を
+/// 測っているので、`sl_gap_*` の号数が 0 のときだけ `sl_lay_*` の和へ落とす。
+/// **両方を足さない** (同じ区間を二重に数えない) ための「どちらか一方」規則。
+const GAP_ROWS: [(&str, usize, &[usize]); 7] = [
+    ("sl_gap_embed", SL_GAP_EMBED, &[SL_LAY_EMBED]),
+    (
+        "sl_gap_rmsnorm",
+        SL_GAP_RMSNORM,
+        &[SL_LAY_NORM_IN, SL_LAY_NORM_POST],
+    ),
+    ("sl_gap_gdn", SL_GAP_GDN, &[SL_LAY_GDN_PROJ, SL_LAY_GDN_SCAN]),
+    (
+        "sl_gap_attn",
+        SL_GAP_ATTN,
+        &[SL_LAY_FULL_QK, SL_LAY_FULL_CORE, SL_LAY_FULL_OPROJ],
+    ),
+    ("sl_gap_rope", SL_GAP_ROPE, &[]),
+    // q4 経路は活性を量子化しない (構造的に 0)。転記元も無い。
+    ("sl_gap_quant", SL_GAP_QUANT, &[]),
+    (
+        "sl_gap_ffn",
+        SL_GAP_FFN,
+        &[SL_LAY_FFN_GATE, SL_LAY_SWIGLU, SL_LAY_FFN_DOWN],
+    ),
+];
+
+/// s156 (Task B19): 1 段分の (ns, 号数) を「実測行 → 転記元の行」の順で読む。
+#[inline]
+fn gap_row(p: usize, primary: usize, fallback: &[usize]) -> (u64, u64) {
+    if serve_row_ticks(p, primary) > 0 {
+        (serve_row_ns(p, primary), serve_row_ticks(p, primary))
+    } else {
+        let ns = fallback.iter().map(|&op| serve_row_ns(p, op)).sum();
+        let ticks = fallback.iter().map(|&op| serve_row_ticks(p, op)).sum();
+        (ns, ticks)
+    }
+}
+
+/// s156 (Task B19): `sl_so_gap_fwd` の内訳を表 C から読む (転記のみ・ns を積まない)。
+#[inline]
+pub fn gap_fwd_parts(p: usize) -> GapFwdParts {
+    let row = |i: usize| gap_row(p, GAP_ROWS[i].1, GAP_ROWS[i].2).0;
+    // rope は attn の内数 — 排他にするため引く (負なら 0 に張り付ける)。
+    let rope = row(4);
+    GapFwdParts {
+        embed: row(0),
+        rmsnorm: row(1),
+        gdn: row(2),
+        attn: row(3).saturating_sub(rope),
+        rope,
+        quant: row(5),
+        ffn: row(6),
+    }
+}
+
+/// s156 (Task B19): 内訳 7 行の号数 (表示用)。`gap_fwd_parts` と同じ行・同じ
+/// 「実測行 → 転記元」規則で読む (chain 経路でも ms と号数が食い違わない)。
+#[inline]
+pub fn gap_fwd_part_ticks(p: usize) -> [u64; 7] {
+    let mut t = [0u64; 7];
+    for (i, slot) in t.iter_mut().enumerate() {
+        *slot = gap_row(p, GAP_ROWS[i].1, GAP_ROWS[i].2).1;
+    }
+    t
+}
+
+/// s156 (Task B19): `sl_so_gap_fwd` の**残余** = gap_fwd − 内訳 7 段の和 (ns)。
+///
+/// 転記行は ns を積まない (`push` に 0 を渡す) ので、この残余は「表示のたびに
+/// 引き算で出す」— 内訳が gap_fwd を超えた (区間の切り方が壊れた) ときは負に
+/// なるので 0 に張り付ける (`overflow_drops` と同じ規約)。実経路では 0 を
+/// 期待する穴で、**0 でも行を出す** (消すと穴が見えなくなる)。
+#[inline]
+pub fn gap_fwd_residual_ns(p: usize) -> u64 {
+    serve_row_ns(p, SL_SO_GAP_FWD).saturating_sub(gap_fwd_parts(p).sum())
+}
+
 #[cfg(test)]
 pub(crate) fn d2h_src_calls_for_test(phase: Phase, src: usize) -> u64 {
     if !(D2H_SRC_FIRST..D2H_SRC_FIRST + D2H_SRC_N).contains(&src) {
@@ -1163,7 +1328,8 @@ pub fn mark_d2h_src_ns(src: usize, ns: u64) {
 /// ときだけ `Instant::now()` を読む (既定経路はクロック読みゼロのまま)。
 #[inline]
 pub fn d2h_src_on() -> bool {
-    enabled() || crate::telemetry_on()
+    // s156 (Task B19): 間引いた step では読まない (表 C と同じサンプリング)。
+    row_on()
 }
 
 /// s88 (Step 1): 発行点の**時間だけ**を積む (件数は呼び出し側の `mark_d2h_src` が
@@ -1196,7 +1362,8 @@ pub fn time<T>(op: usize, f: impl FnOnce() -> T) -> T {
         // s54: d2h の細分 id は NS の範囲外 — 生 id で受ける (下の summary が集約)
         add_sample(phase(), op, ns, 1, 0, false);
     }
-    if tel_on {
+    if tel_on && !step_skipped() {
+        // s156 (Task B19): 間引いた step はテレメトリにも積まない。
         crate::telemetry_add_op(if op < N_OPS { op } else { D2H }, ns);
     }
     r
@@ -1218,7 +1385,8 @@ pub fn time_layer<T>(op: usize, _layer: usize, f: impl FnOnce() -> T) -> T {
     if prof_on {
         add_sample(phase(), op, ns, 1, 0, false);
     }
-    if tel_on {
+    if tel_on && !step_skipped() {
+        // s156 (Task B19): 間引いた step はテレメトリにも積まない。
         crate::telemetry_add_op(if op < N_OPS { op } else { D2H }, ns);
         denno_telemetry::record_layer_op(op, ns);
     }
@@ -1339,8 +1507,12 @@ pub fn split_sample(op: usize, ns: u64, calls: u64) {
     }
     let Some((t, i)) = split_slot(op) else { return };
     let pi = phase().idx();
-    SPLIT_NS[pi][t][i].fetch_add(ns, Ordering::Relaxed);
-    SPLIT_NS[Phase::Both.idx()][t][i].fetch_add(ns, Ordering::Relaxed);
+    // s156 (Task B19): 間引いた step では表 C / 表 A / 表 B の ns も積まない
+    // (号数だけは積む — 表ごとの「何 sample 見たか」の会計を落とさない)。
+    if !step_skipped() {
+        SPLIT_NS[pi][t][i].fetch_add(ns, Ordering::Relaxed);
+        SPLIT_NS[Phase::Both.idx()][t][i].fetch_add(ns, Ordering::Relaxed);
+    }
     if calls > 0 {
         SPLIT_CALLS[pi][t][i].fetch_add(calls, Ordering::Relaxed);
         SPLIT_CALLS[Phase::Both.idx()][t][i].fetch_add(calls, Ordering::Relaxed);
@@ -1351,7 +1523,9 @@ pub fn split_sample(op: usize, ns: u64, calls: u64) {
 /// `Instant::now()` を読む — 既定経路はクロック読みゼロのまま)。
 #[inline]
 pub fn split_on() -> bool {
-    enabled() || crate::telemetry_on()
+    // s156 (Task B19): 表 C の間引き (`DENNO_PROFILE_SAMPLE`) に合わせる —
+    // 間引いた step ではクロックを読まない (ns は `split_sample` が捨てる)。
+    row_on()
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,6 +1550,147 @@ pub fn serve_on() -> bool {
     enabled() || crate::telemetry_on()
 }
 
+// ---------------------------------------------------------------------------
+// s156 (Task B19): サンプリング (`DENNO_PROFILE_SAMPLE=N`)
+//
+// B18 の実測 (表 C・92 step の serve パス) は 1 step あたり 392 本の線形 D2H を
+// 個別に計時していたため、**計測そのものが測っている対象を変えていた**
+// (instrumented 131.8 ms/step に対し実 KPI は 55.1 ms/token)。
+// ここでは step 単位で間引く: N step に 1 step だけ区間を取る。
+//
+// 約束は 3 つ。
+//   1. `DENNO_PROFILE` 未設定なら今までどおり素通し (環境変数は 1 回だけ読む)。
+//   2. `N == 1` (既定) は今までの挙動と 1 bit も変わらない。
+//   3. 間引いた step では **時刻を読まない**。表 C の行には「その step を通した
+//      こと」(行の号数) だけを積み、ns は 1 ns も積まない。ns と号数は別の
+//      カウンタなので、平均は必ず **実際に測った step / 呼び出し**で割る
+//      (`serve_samples` / `serve_lin_samples`)。間引き率を掛けて全 step 相当に
+//      直すことはしない — かけ算は分布の仮定で、号数は事実。
+//
+// 端数の食い違い (sampled な step で子が親を超える等) で `sl_step_other` が
+// 負に振れないよう、負の残余は 0 に張り付けて**件数として**数える
+// (`overflow_drops`)。0.0 が静かに「穴なし」として通るのを防ぐ。
+// ---------------------------------------------------------------------------
+
+/// s156 (Task B19): サンプリング周期の既定 (1 = 全 step を測る = 従来挙動)。
+pub const SAMPLE_EVERY_DEFAULT: u64 = 1;
+
+/// s156 (Task B19): 上限 (step 番号の飽和よけ。「測らない」状態は作らない)。
+pub const SAMPLE_EVERY_MAX: u64 = 1_000_000;
+
+/// s156 (Task B19): `DENNO_PROFILE_SAMPLE` の文字列を周期に読む (純関数)。
+///
+/// - `None` / 空 / 空白 / `0` / 数値でない → 既定 1 (従来挙動)
+///   「計測しない」は `DENNO_PROFILE` の役目なので、ここへ無言で落とさない。
+/// - `N > SAMPLE_EVERY_MAX` → `SAMPLE_EVERY_MAX`
+pub fn parse_sample_every(raw: Option<&str>) -> u64 {
+    let Some(s) = raw else {
+        return SAMPLE_EVERY_DEFAULT;
+    };
+    match s.trim().parse::<u64>() {
+        Ok(n) if n >= 1 => n.min(SAMPLE_EVERY_MAX),
+        _ => SAMPLE_EVERY_DEFAULT,
+    }
+}
+
+static SAMPLE_EVERY: OnceLock<u64> = OnceLock::new();
+
+/// s156 (Task B19): サンプリング周期 N (1 = 全 step)。環境変数は 1 回だけ読む。
+///
+/// 呼び出し側は必ず `serve_on()` / `row_on()` で先に弾かれるので、`DENNO_PROFILE`
+/// 未設定の実行ではこの関数も環境変数の読みも起きない (既定経路は完全 no-op)。
+#[inline]
+pub fn sample_every() -> u64 {
+    #[cfg(test)]
+    if let Some(n) = tests::force_sample_every() {
+        return n;
+    }
+    *SAMPLE_EVERY
+        .get_or_init(|| parse_sample_every(std::env::var("DENNO_PROFILE_SAMPLE").ok().as_deref()))
+}
+
+/// s156 (Task B19): この step 番号 (0 起点) を測るか。N=1 なら常に真。
+#[inline]
+pub fn sample_hit(step_index: u64) -> bool {
+    step_index % sample_every().max(1) == 0
+}
+
+thread_local! {
+    /// s156 (Task B19): いま開いている step の番号 (0 起点)。
+    /// `None` = step の外 (prefill forward など `step_begin` を通らない区間) で、
+    /// そこでは従来どおり計時する。
+    static STEP_IDX: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// s156 (Task B19): **この区間・この行を計時してよいか**。既存の `serve_on()`
+/// ゲートの後ろに 1 本置くだけで「sampled な step だけを測る」に切り替わる
+/// (N=1 では常に真 = 従来挙動)。
+#[inline]
+pub fn row_on() -> bool {
+    if !serve_on() {
+        return false;
+    }
+    match STEP_IDX.with(|c| c.get()) {
+        Some(i) => sample_hit(i),
+        None => true,
+    }
+}
+
+/// s156 (Task B19): いまの step 番号 (テスト・表示用)。step の外は `None`。
+#[inline]
+pub fn step_index() -> Option<u64> {
+    STEP_IDX.with(|c| c.get())
+}
+
+/// s156 (Task B19): 計測は有効だが、この step は間引かれた (= ns を積まない)。
+#[inline]
+fn step_skipped() -> bool {
+    match STEP_IDX.with(|c| c.get()) {
+        Some(i) => !sample_hit(i),
+        None => false,
+    }
+}
+
+/// s156 (Task B19): 表 C で実際に **ns を測った step 数** (フェーズ `p`)。
+/// 表示の分母はこれ (号数ではない) — 「測った step の平均」を出す。
+#[inline]
+pub fn serve_samples(p: usize) -> u64 {
+    SL_SAMPLED[p].load(Ordering::Relaxed)
+}
+
+/// s156 (Task B19): 表 C で実際に **ns を測った線形呼び出し数** (フェーズ `p`)。
+#[inline]
+pub fn serve_lin_samples(p: usize) -> u64 {
+    LIN_SAMPLED[p].load(Ordering::Relaxed)
+}
+
+/// s156 (Task B19): 区間を開けずに閉じた回数 (= 間引いた step で `span_begin` が
+/// `None` を返した回数)。sampled step の値に待ち時間が寄っている兆候なので表示する。
+#[inline]
+pub fn skipped_spans() -> u64 {
+    SKIPPED_SPANS.load(Ordering::Relaxed)
+}
+
+/// s156 (Task B19): 負の残余を 0 に張り付けた回数 (sampled step の内訳が全体を
+/// 超えた回数)。実経路では恒等的に 0。
+#[inline]
+pub fn overflow_drops() -> u64 {
+    OVERFLOW_DROPS.load(Ordering::Relaxed)
+}
+
+/// s156 (Task B19): 1 行だけのカウンタ表を const で作る。
+const fn mk_counters1<const N: usize>() -> [AtomicU64; N] {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; N]
+}
+
+static SL_SAMPLED: [AtomicU64; Phase::N] = mk_counters1::<{ Phase::N }>();
+static LIN_SAMPLED: [AtomicU64; Phase::N] = mk_counters1::<{ Phase::N }>();
+static STEPS_SEEN: [AtomicU64; Phase::N] = mk_counters1::<{ Phase::N }>();
+static SKIPPED_SPANS: AtomicU64 = AtomicU64::new(0);
+static OVERFLOW_DROPS: AtomicU64 = AtomicU64::new(0);
+
 /// s148: 表 C に 1 区間を積む。`calls` は「この区間が起きた回数」(ステップ由来の
 /// 段は 1、線形呼び出し由来の段は 1)。表 C の行でない id は無視する。
 ///
@@ -1387,15 +1702,21 @@ pub fn serve_on() -> bool {
 /// `sl_lin_other` の calls が線形呼び出しの 3 倍 = 内訳 3 本 × 1 call になっていた)。
 #[inline]
 pub fn push(op: usize, ns: u64, calls: u64) {
+    // s156 (Task B19): 間引いた step では **ns を積まず号数だけ** 積む。号数を
+    // 隠すと「何 step のうち何 sample 見たか」が表から消え、0.0 が「その段が
+    // 0 ms」と読めてしまう。
     if !serve_on() {
         return;
     }
+    let skipped = step_skipped();
     let Some((SPLIT_SERVE_TABLE, r)) = split_slot(op) else {
         return;
     };
     let pi = phase().idx();
-    SPLIT_NS[pi][SPLIT_SERVE_TABLE][r].fetch_add(ns, Ordering::Relaxed);
-    SPLIT_NS[Phase::Both.idx()][SPLIT_SERVE_TABLE][r].fetch_add(ns, Ordering::Relaxed);
+    if !skipped {
+        SPLIT_NS[pi][SPLIT_SERVE_TABLE][r].fetch_add(ns, Ordering::Relaxed);
+        SPLIT_NS[Phase::Both.idx()][SPLIT_SERVE_TABLE][r].fetch_add(ns, Ordering::Relaxed);
+    }
     if calls > 0 {
         SPLIT_CALLS[pi][SPLIT_SERVE_TABLE][r].fetch_add(calls, Ordering::Relaxed);
         SPLIT_CALLS[Phase::Both.idx()][SPLIT_SERVE_TABLE][r].fetch_add(calls, Ordering::Relaxed);
@@ -1423,9 +1744,12 @@ thread_local! {
 
 /// s148: 区間の開始 tick (計測 OFF は `None`)。呼び出し側は戻り値をそのまま
 /// `span_end` / `fn_end` に渡す。
+///
+/// s156 (Task B19): 間引いた step では **時刻を読まず** `None` を返す
+/// (`span_end` が `skipped_spans` を数え、ns は積まない)。
 #[inline]
 pub fn span_begin() -> Option<Instant> {
-    if serve_on() {
+    if row_on() {
         Some(Instant::now())
     } else {
         None
@@ -1433,8 +1757,17 @@ pub fn span_begin() -> Option<Instant> {
 }
 
 /// s148: 区間の終了を `op` に積む (1 サンプル)。`None` は素通し。
+///
+/// s156 (Task B19): 間引いた step では **ns を積まず、号数だけ** 積む (`push` が
+/// ns を捨てる)。`None` (区間を開けなかった) は待ち時間が sampled step に寄って
+/// いる兆候なので 1 つ数える — 静かに落とさない。数えるのは **step の中だけ**
+/// (`step_index()` が `Some`): step の外の `None` は「計測が OFF だった」だけなので、
+/// 数えると `skipped_spans` が「間引きの兆候」でなくなる。
 #[inline]
 pub fn span_end(t: Option<Instant>, op: usize) {
+    if t.is_none() && step_index().is_some() {
+        SKIPPED_SPANS.fetch_add(1, Ordering::Relaxed);
+    }
     if let Some(t0) = t {
         let ns = t0.elapsed().as_nanos() as u64;
         push(op, ns, 1);
@@ -1448,6 +1781,21 @@ pub fn span_end(t: Option<Instant>, op: usize) {
             };
             SPLIT_END[phase().idx()][SPLIT_SERVE_TABLE][r].fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// s156 (Task B19): **step の中だけで**区間を開く (`gap_fwd` の内訳用)。
+///
+/// `gap_fwd` は decode 1 歩の区間なので、その内訳も step の外では意味を持たない
+/// (単体の forward 呼び出し・prefill・モデルのテストは step を開かない)。
+/// ここで `None` を返せば、そういう経路では**時刻も読まず表 C の行も積まない** —
+/// `sl_gap_*` の号数が「serve の step 数 × 層数」からずれない。
+#[inline]
+pub fn span_begin_in_step() -> Option<Instant> {
+    if step_index().is_some() {
+        span_begin()
+    } else {
+        None
     }
 }
 
@@ -1527,11 +1875,19 @@ pub fn step_begin() -> Option<(Instant, SoCarry)> {
     #[cfg(test)]
     SL_OPEN.with(|c| c.set(c.get() + 1));
     split_step_begin();
+    // s156 (Task B19): この step の番号を採り、測るかどうかを決める。間引いた
+    // step では以降の `span_begin` が時刻を読まない (`row_on()` が偽)。
+    let p = phase().idx();
+    let idx = STEPS_SEEN[p].fetch_add(1, Ordering::Relaxed);
+    let sampled = sample_hit(idx);
+    if sampled {
+        SL_SAMPLED[p].fetch_add(1, Ordering::Relaxed);
+    }
+    STEP_IDX.with(|c| c.set(Some(idx)));
     let now = Instant::now();
     // s155 (Task B16): 表 C の全 40 行の**行ごとの入口値**を控える。
     // s154 はここで「全行の和」1 個だけを控えていたため、入口の後に積まれる段が
     // 差に現れず `own` が恒等的に 0 になっていた (`SoCarry` の説明を参照)。
-    let p = phase().idx();
     let carry = SoCarry::new(p);
     // s154 (B15): この step の間の実測の子 (`SL_SO_MEASURED`) と `sl_lin` の増分を
     // 切り分けるための控え。
@@ -1719,7 +2075,12 @@ pub fn step_end(st: Option<(Instant, SoCarry)>) {
     push(SL_STEP, ns, 1);
     let p = phase().idx();
     let own = step_own_ns(p, &carry);
-    let other = ns.saturating_sub(own);
+    // s156 (Task B19): 間引きで子が親を超えたら 0 に張り付けて件数で数える
+    // (0.0 を「穴なし」と読ませない)。
+    let other = ns.checked_sub(own).unwrap_or_else(|| {
+        OVERFLOW_DROPS.fetch_add(1, Ordering::Relaxed);
+        0
+    });
     let snap = SO_SNAP.with(|c| c.replace(None));
     let kids_own = match snap {
         Some(s) => so_measured_ns(p).saturating_sub(s.kids0),
@@ -1795,8 +2156,13 @@ pub fn step_end_tail() {
     // `step_end` の後に兄弟が 1 本も来なければ `own_now == c.own` で other は不変。
     // 来た経路では `own_now > c.own` になり、その分だけ other から引く。
     let other = c.other.saturating_sub(own_now.saturating_sub(c.own));
+    // s156 (Task B19): 残余の push は **`STEP_IDX` を落とす前**に行う — `push` は
+    // 「間引いた step か」を `STEP_IDX` で判定するので、先に落とすと間引いた step の
+    // 残余だけが計時されて内訳が食い違う。
     push(SL_STEP_OTHER, other, 1);
     push(SL_SO_RESID, other.saturating_sub(c.kids_own), 1);
+    // この step は閉じた (外側 = サンプラ / 次の投影 の地は step の外)。
+    STEP_IDX.with(|x| x.set(None));
 }
 
 /// s148: 表 C の `whole` 行と、その内訳の和との差 (ns)。負 (内訳が全体を超える =
@@ -2419,7 +2785,19 @@ pub fn reset() {
             PARENT_CHILD_NS[p][i].store(0, Ordering::Relaxed);
             PARENT_CHILD_CALLS[p][i].store(0, Ordering::Relaxed);
         }
+        // s156 (Task B19): サンプリングの会計 (step 番号・測った step 数・測った線形
+        // 呼び出し数) もフェーズごとにクリアする — クリアしないとテストの期待値が
+        // 前のテストの実行回数に依存する。
+        STEPS_SEEN[p].store(0, Ordering::Relaxed);
+        SL_SAMPLED[p].store(0, Ordering::Relaxed);
+        LIN_SAMPLED[p].store(0, Ordering::Relaxed);
     }
+    // s156 (Task B19): プロセス全体で 1 本のカウンタ (間引き・飽和の兆候)。
+    SKIPPED_SPANS.store(0, Ordering::Relaxed);
+    OVERFLOW_DROPS.store(0, Ordering::Relaxed);
+    // s156 (Task B19): 開いている step の番号も落とす (テストは同じスレッドを
+    // 使い回すので、落とさないと次のテストが「step の途中」から始まる)。
+    STEP_IDX.with(|c| c.set(None));
 }
 
 /// s57 (T4): 実行先ラベルの決定 (純関数・テスト可能)。
@@ -3486,9 +3864,19 @@ fn push_serve_section(phase: Phase, s: &mut String) {
         return;
     }
     let total_ns = serve_row_ns(p, SL_STEP);
+    // s156 (Task B19): 平均の分母は **実際に測った step 数** (`DENNO_PROFILE_SAMPLE`
+    // で間引いても嘘にならない)。0 のときは号数へ落とす (合成テストの互換)。
+    let measured = {
+        let n = serve_samples(p);
+        if n > 0 {
+            n
+        } else {
+            total_calls
+        }
+    };
     let per = |ns: u64| {
-        if total_calls > 0 {
-            ns as f64 / total_calls as f64 / 1e6
+        if measured > 0 {
+            ns as f64 / measured as f64 / 1e6
         } else {
             0.0
         }
@@ -3496,6 +3884,17 @@ fn push_serve_section(phase: Phase, s: &mut String) {
     s.push_str(&format!(
         "  SPLIT SERVE ({}, q4 serve path; calls = steps for sl_step / calls for sl_lin)\n",
         Phase::NAMES[p]
+    ));
+    // s156 (Task B19): 間引きの状態を必ず 1 行で出す — 何 step のうち何 step を
+    // 測ったか (N=1 でも「N=1 / 全部測った」として出る)。推測値は書かない。
+    s.push_str(&format!(
+        "  SPLIT SERVE sampling: N={} (DENNO_PROFILE_SAMPLE) | steps seen {} | steps measured {} \
+         | lin calls measured {} | spans skipped {}\n",
+        sample_every(),
+        measured,
+        serve_samples(p),
+        serve_lin_samples(p),
+        skipped_spans()
     ));
     s.push_str(&format!(
         "  {:<18} {:>10} {:>8} {:>7} {:>12}\n",
@@ -3574,6 +3973,60 @@ fn push_serve_section(phase: Phase, s: &mut String) {
             per(ns)
         ));
     }
+    // s156 (Task B19): `sl_so_gap_fwd` (B18 実測 54.158 ms/step = instrumented
+    // step の 41%) の内訳 (7 段・すべて `sl_gap_*`)。6 スペース深く出す。
+    // 和 + 残余 = gap_fwd が**表示のたびに**確かめられる形で並べる (残余は 0 でも行を出す)。
+    // `sl_gap_attn` は rope を除いた正味 — 表示値の和が gap_fwd に一致する。
+    let gap_fwd_ns = serve_row_ns(p, SL_SO_GAP_FWD);
+    let gap_parts = gap_fwd_parts(p);
+    let gap_ticks = gap_fwd_part_ticks(p);
+    if gap_fwd_ns > 0 || gap_parts.sum() > 0 {
+        s.push_str(&format!(
+            "      {:<20} {:>10} {:>8} {:>7} {:>12}\n",
+            "sl_gap_* (gap_fwd)", "ms", "calls", "share", "ms/step"
+        ));
+        let mut sum = 0u64;
+        for (i, (name, ns)) in gap_parts.as_pairs().iter().enumerate() {
+            sum += *ns;
+            s.push_str(&format!(
+                "      {:<20} {:>10.1} {:>8} {:>7} {:>12.3}\n",
+                name,
+                *ns as f64 / 1e6,
+                gap_ticks[i],
+                if gap_fwd_ns > 0 {
+                    format!("{:.1}%", *ns as f64 / gap_fwd_ns as f64 * 100.0)
+                } else {
+                    "-".to_string()
+                },
+                per(*ns)
+            ));
+        }
+        let resid = gap_fwd_residual_ns(p);
+        s.push_str(&format!(
+            "      {:<20} {:>10.1} {:>8} {:>7} {:>12.3}\n",
+            "sl_gap_resid",
+            resid as f64 / 1e6,
+            "-",
+            if gap_fwd_ns > 0 {
+                format!("{:.1}%", resid as f64 / gap_fwd_ns as f64 * 100.0)
+            } else {
+                "-".to_string()
+            },
+            per(resid)
+        ));
+        s.push_str(&format!(
+            "      {:<20} {:>10.1} {:>8} {:>7} {:>12.3}  (parts {} + resid {} = {} / gap_fwd {})\n",
+            "= gap_fwd",
+            gap_fwd_ns as f64 / 1e6,
+            "",
+            "",
+            per(gap_fwd_ns),
+            sum,
+            resid,
+            sum + resid,
+            gap_fwd_ns
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -3598,6 +4051,32 @@ mod tests {
 
     pub(super) fn force_enabled() -> Option<bool> {
         *FORCE_ENABLED.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// s156 (Task B19): テスト専用のサンプリング周期の上書き (None = env を見る)。
+    /// `DENNO_PROFILE_SAMPLE` を書き換えると並走テストを揺らすので、テストはこの
+    /// 経路を使う (`force_enabled` と同じ理由)。
+    static FORCE_SAMPLE_EVERY: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+    pub(super) fn force_sample_every() -> Option<u64> {
+        *FORCE_SAMPLE_EVERY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// s156 (Task B19): サンプリング周期を上書きして `f` を実行し、必ず戻す。
+    fn with_sample_every<T>(n: u64, f: impl FnOnce() -> T) -> T {
+        struct G;
+        impl Drop for G {
+            fn drop(&mut self) {
+                *FORCE_SAMPLE_EVERY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+        *FORCE_SAMPLE_EVERY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(n);
+        let _g = G;
+        f()
     }
 
     /// s85 (Step 0): 計測を有効化したまま `f` を実行し、終了時に必ず元へ戻す
@@ -5456,5 +5935,249 @@ mod tests {
             }
             assert_eq!(request_wall(), (0, 0));
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // s156 (Task B19): サンプリング (`DENNO_PROFILE_SAMPLE`) と gap_fwd の内訳
+    // -----------------------------------------------------------------------
+
+    /// 境界: 未設定 / 空 / 空白 / "0" / 数値でない → 既定 1 (従来挙動)。
+    /// 「測らない」は `DENNO_PROFILE` の役目なので、ここへ無言で落とさない。
+    #[test]
+    fn parse_sample_every_falls_back_to_one_on_garbage() {
+        for raw in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("0"),
+            Some("00"),
+            Some("abc"),
+            Some("-3"),
+            Some("1.5"),
+            Some("16 steps"),
+        ] {
+            assert_eq!(
+                parse_sample_every(raw),
+                SAMPLE_EVERY_DEFAULT,
+                "raw={raw:?} は既定 1 に落ちる"
+            );
+        }
+        assert_eq!(SAMPLE_EVERY_DEFAULT, 1);
+    }
+
+    /// 境界: "1" / "16" はそのまま、上限超えは丸める、u64 桁あふれは既定に落ちる。
+    #[test]
+    fn parse_sample_every_accepts_positive_integers_and_saturates() {
+        assert_eq!(parse_sample_every(Some("1")), 1);
+        assert_eq!(parse_sample_every(Some("16")), 16);
+        assert_eq!(parse_sample_every(Some(" 16 ")), 16);
+        assert_eq!(parse_sample_every(Some("1000000")), SAMPLE_EVERY_MAX);
+        assert_eq!(parse_sample_every(Some("999999999")), SAMPLE_EVERY_MAX);
+        // u64 を超える値は parse が失敗する → 既定 (飽和させない: 桁あふれは入力ミス)
+        assert_eq!(
+            parse_sample_every(Some("18446744073709551616")),
+            SAMPLE_EVERY_DEFAULT
+        );
+        assert!(SAMPLE_EVERY_MAX > 0);
+    }
+
+    /// 周期性: N step に 1 回だけ真。N=1 は全 step、N=16 は 0/16/32、上限は 0 だけ。
+    #[test]
+    fn sample_hit_is_periodic_and_one_hits_every_step() {
+        let _guard = lock_counters();
+        let hits = |n: u64| -> Vec<u64> {
+            with_sample_every(n, || (0..40u64).filter(|&i| sample_hit(i)).collect())
+        };
+        assert_eq!(hits(1), (0..40u64).collect::<Vec<_>>());
+        assert_eq!(hits(16), vec![0, 16, 32]);
+        assert_eq!(hits(3), vec![0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39]);
+        assert_eq!(hits(SAMPLE_EVERY_MAX), vec![0]);
+    }
+
+    /// 間引いた step では **ns が 1 ns も増えず号数だけ**が増える
+    /// (`SPLIT_NS` が間引きで膨らまないことの直接の検査)。
+    #[test]
+    fn skipped_steps_accumulate_ticks_but_no_ns() {
+        with_prof_counters(|| {
+            set_phase(Phase::Decode);
+            with_sample_every(4, || {
+                // `skipped_spans` はプロセス全体で 1 本のカウンタ (`NS` と同じ) なので、
+                // このテストが積んだ分だけを差で見る。
+                let skip0 = skipped_spans();
+                for i in 0..8u64 {
+                    let st = step_begin();
+                    assert_eq!(step_index(), Some(i), "step 番号が 0 起点で進んでいない");
+                    // 区間は sampled な step だけ開く (間引いた step は時刻を読まない)。
+                    let t = span_begin();
+                    assert_eq!(t.is_some(), sample_hit(i), "step {i} の span_begin が食い違う");
+                    span_end(t, SL_SO_GAP_FWD);
+                    // 直接 push しても、間引いた step の ns は捨てられる (号数は残る)。
+                    push(SL_GAP_GDN, 2_000_000, 1);
+                    step_end(st);
+                    step_end_tail();
+                }
+                assert_eq!(step_index(), None, "step を閉じた後に番号が残っている");
+                let p = Phase::Decode.idx();
+                // 8 step のうち測ったのは 0 と 4 の 2 本。
+                assert_eq!(serve_samples(p), 2);
+                // ns は「測った 2 step × 2 ms」だけ — 8 step 分 (16 ms) は入らない。
+                assert_eq!(serve_row_ns(p, SL_GAP_GDN), 2 * 2_000_000);
+                // 号数は 8 step 全部 (間引いても「何 step 見たか」は落とさない)。
+                assert_eq!(serve_row_ticks(p, SL_GAP_GDN), 8);
+                // 区間を開けずに閉じた回数 = 間引いた 6 step。
+                assert_eq!(skipped_spans() - skip0, 6);
+                // 残余は張り付いていない (子が親を超えていない)。
+                assert_eq!(overflow_drops(), 0);
+            });
+        });
+    }
+
+    /// 52 ms/step の gap と同じ**比率**の合成イベント。値は比率だけを写した合成値で、
+    /// 実測値ではない (`sl_gap_rope` は attn の**内数**なので gap に足さない)。
+    /// 戻り値は (gap_fwd の合成値, 内訳)。
+    fn gap_fixture_events() -> (u64, GapFwdParts) {
+        const LAYERS: u64 = 8;
+        let mut gap = 0u64;
+        let mut ev = |op: usize, ns: u64| {
+            push(op, ns, 1);
+            gap += ns;
+        };
+        ev(SL_GAP_EMBED, 40_000);
+        for _ in 0..LAYERS {
+            ev(SL_GAP_RMSNORM, 60_000);
+            ev(SL_GAP_GDN, 1_800_000);
+            ev(SL_GAP_RMSNORM, 60_000);
+            ev(SL_GAP_ATTN, 2_400_000); // rope を含む総計
+            push(SL_GAP_ROPE, 250_000, 1); // attn の内数 (gap には足さない)
+            ev(SL_GAP_FFN, 3_000_000);
+        }
+        // 名付けた 7 段に入らない「層間の地」(残差加算など) — 残余として出る。
+        ev(SL_LAY_RESIDUAL, 300_000);
+        push(SL_SO_GAP_FWD, gap, 1);
+        (gap, gap_fwd_parts(Phase::Decode.idx()))
+    }
+
+    /// CPU フィクスチャ: 合成イベント → 内訳表。内訳の和 + 残余 = gap_fwd、残余は
+    /// 10% 未満。**サンプリングの有無で行名が変わらない**ことも同じテストで固定する。
+    #[test]
+    fn gap_fwd_buckets_sum_to_the_gap_and_names_are_sampling_independent() {
+        let run = |n: u64| -> (u64, GapFwdParts, u64, [u64; 7]) {
+            with_prof_counters(|| {
+                set_phase(Phase::Decode);
+                with_sample_every(n, || {
+                    let mut last = (0u64, GapFwdParts::default());
+                    // 2 周期ぶん回す (N=16 なら 32 step 中 2 step だけ測る)。
+                    for _ in 0..(2 * n.max(1)) {
+                        let st = step_begin();
+                        last = gap_fixture_events();
+                        step_end(st);
+                        step_end_tail();
+                    }
+                    let p = Phase::Decode.idx();
+                    (
+                        // 2 周期ぶん回すので、測った step は必ず 2 本 = 累積は 2 倍。
+                        2 * last.0,
+                        last.1,
+                        gap_fwd_residual_ns(p),
+                        gap_fwd_part_ticks(p),
+                    )
+                })
+            })
+        };
+        let (gap_all, parts_all, resid_all, ticks_all) = run(1);
+        let (gap_s16, parts_s16, resid_s16, ticks_s16) = run(16);
+        // 和 + 残余 = gap_fwd (どちらのサンプリングでも同じ恒等式)。
+        assert_eq!(parts_all.sum() + resid_all, gap_all, "N=1 で内訳が gap_fwd に一致しない");
+        assert_eq!(parts_s16.sum() + resid_s16, gap_s16, "N=16 で内訳が gap_fwd に一致しない");
+        // 残余は 10% 未満 (= 名付けが足りている)。合成値なので比で見る。
+        assert!(
+            resid_all * 10 < gap_all,
+            "残余が大きすぎる: resid={resid_all} gap={gap_all}"
+        );
+        assert!(
+            resid_s16 * 10 < gap_s16,
+            "残余が大きすぎる (N=16): resid={resid_s16} gap={gap_s16}"
+        );
+        // サンプリングしても **同じ 7 行が同じ順で出る** (名前は周期に依存しない)。
+        assert_eq!(GapFwdParts::NAMES, GAP_ROWS.map(|r| r.0));
+        // 号数: 実測した 6 行は >0、`sl_gap_quant` だけは構造的に 0
+        // (q4 は活性を量子化しない — 行は出るが号数は付かない)。
+        for (i, &t) in ticks_all.iter().enumerate() {
+            if i == 5 {
+                assert_eq!(t, 0, "sl_gap_quant は q4 経路で 0 のはず");
+            } else {
+                assert!(t > 0, "行 {} の号数が 0", GapFwdParts::NAMES[i]);
+            }
+        }
+        assert_eq!(ticks_all, ticks_s16.map(|t| t / 16), "号数が step 数に比例していない");
+        // ns は**測った step だけ**を積むので、周期を変えても同じ値になる
+        // (N=1 で 2 step 測った分と、N=16 で 2 step 測った分が一致する)。
+        assert_eq!(parts_all, parts_s16, "サンプリングで測った値が変わった");
+        // 内訳の形: rope は attn の内数として独立行に出て、attn からは引かれている。
+        // (測った step は 2 本なので、合成値は 1 step 分の 2 倍。)
+        const K: u64 = 2;
+        assert_eq!(parts_all.rope, K * 8 * 250_000);
+        assert_eq!(parts_all.attn, K * 8 * (2_400_000 - 250_000));
+        assert_eq!(parts_all.rmsnorm, K * 8 * 120_000);
+        assert_eq!(parts_all.gdn, K * 8 * 1_800_000);
+        assert_eq!(parts_all.ffn, K * 8 * 3_000_000);
+        assert_eq!(parts_all.embed, K * 40_000);
+        // q4 経路は活性を量子化しない = 構造的に 0 (穴ではなく経路の性質)。
+        assert_eq!(parts_all.quant, 0);
+        // gdn + attn + ffn が gap の主成分 (52 ms の形)。
+        assert!(parts_all.gdn + parts_all.attn + parts_all.ffn > gap_all / 2);
+    }
+
+    /// 表示: 内訳 7 行・残余行・「= gap_fwd」の合計行・サンプリング行が実際に出る
+    /// (GPU 不要・整形の退行を拾う)。
+    #[test]
+    fn summary_prints_gap_fwd_breakdown_and_sampling_line() {
+        with_prof_counters(|| {
+            set_phase(Phase::Decode);
+            // 表 C の節は `sl_step` / `sl_lin` の号数が 0 だと出ないので、1 step 回す。
+            let st = step_begin();
+            let _ = gap_fixture_events();
+            step_end(st);
+            step_end_tail();
+            let s = summary();
+            for name in GapFwdParts::NAMES {
+                assert!(s.contains(name), "summary に {name} が無い");
+            }
+            assert!(s.contains("sl_gap_resid"), "残余行が出ていない");
+            assert!(s.contains("= gap_fwd"), "合計行が出ていない");
+            assert!(
+                s.contains("SPLIT SERVE sampling: N="),
+                "サンプリング行が出ていない"
+            );
+        });
+    }
+
+    /// 表 C の末尾 7 行が `sl_gap_*` と 1 対 1 で並んでいる (id と名前の取り違え防止)。
+    #[test]
+    fn gap_fwd_row_ids_and_names_line_up() {
+        let ids = [
+            SL_GAP_EMBED,
+            SL_GAP_RMSNORM,
+            SL_GAP_GDN,
+            SL_GAP_ATTN,
+            SL_GAP_ROPE,
+            SL_GAP_QUANT,
+            SL_GAP_FFN,
+        ];
+        assert_eq!(SPLIT_SERVE_N, 45);
+        for (i, &op) in ids.iter().enumerate() {
+            assert_eq!(GAP_ROWS[i].0, GapFwdParts::NAMES[i], "行 {i} の名前が食い違う");
+            assert_eq!(GAP_ROWS[i].1, op, "行 {i} の id が食い違う");
+            assert_eq!(
+                split_row_name(SPLIT_SERVE_TABLE, op - SPLIT_SERVE_FIRST),
+                Some(GapFwdParts::NAMES[i])
+            );
+            // すべて表 C の行であること (push が黙って捨てない)。
+            assert!(split_slot(op).is_some(), "行 {i} が表 C の外にある");
+        }
+        // gap_fwd の内訳は step の兄弟ではない (B16 の恒等式を動かさない)。
+        for &op in ids.iter() {
+            assert!(!SL_GROUPS[0].1.contains(&op), "sl_gap_* を step の兄弟に入れない");
+        }
     }
 }
