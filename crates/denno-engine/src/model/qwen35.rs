@@ -2640,6 +2640,8 @@ mod tests {
     /// (3+1 == 4 bit 一致)・decode 継続。
     #[test]
     fn qwen38_27b_shape_forward_determinism_and_continuity() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let dir = build_dir("fwd", true, NK, NV);
         let mut m = load_int8(&dir);
         let toks: Vec<u32> = [7u32, 33, 100, 64].to_vec();
@@ -2675,6 +2677,8 @@ mod tests {
     /// bit-exact (i32 累積の順序不変 + F32 は apply_bt_rows の順序保存)。
     #[test]
     fn qwen38_27b_shape_prefill_batch_bit_exact() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let dir = build_dir("prefill", true, NK, NV);
         let mut m = load_int8(&dir);
         let toks: Vec<u32> = [5u32, 41, 97, 12, 78].to_vec();
@@ -2705,6 +2709,8 @@ mod tests {
     /// を比較し、分割後の decode 継続も一致させる。
     #[test]
     fn qwen38_27b_shape_split_prefill_bit_exact() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let dir = build_dir("split", true, NK, NV);
         let mut m = load_int8(&dir);
         let base = [5u32, 41, 97, 12, 78, 33, 100];
@@ -2771,6 +2777,8 @@ mod tests {
     #[test]
     #[ignore]
     fn qwen38_27b_shape_chain_gdn_deferred_flush_bit_exact() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         fn argmax(v: &[f32]) -> u32 {
             v.iter()
                 .enumerate()
@@ -2860,6 +2868,8 @@ mod tests {
     /// (実 GPU が無い環境では GDN/projection は全て CPU 経路で走る)
     #[test]
     fn qwen38_27b_shape_prefill_thread_count_bit_exact() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let dir = build_dir("rayon", true, NK, NV);
         let toks: Vec<u32> = (0..24u32).map(|i| (i * 5 + 3) % VOCAB as u32).collect();
 
@@ -2901,6 +2911,8 @@ mod tests {
     /// の実機 E2E が担保)。
     #[test]
     fn qwen38_27b_shape_int8_vs_fp32_close() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let dir = build_dir("quant", true, NK, NV);
         let cfg: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap()).unwrap();
@@ -2922,6 +2934,8 @@ mod tests {
     /// 提供された場合の保険。実 27B はラッパ形式を想定)。
     #[test]
     fn qwen38_27b_shape_plain_config_loads() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let dir = build_dir("plain", false, NK, NV);
         let mut m = load_int8(&dir);
         let mut c = m.new_cache();
@@ -2935,6 +2949,8 @@ mod tests {
     /// 読み飛ばされる — blk.NL を通常層としては読まない)。
     #[test]
     fn qwen38_27b_shape_mtp_nextn_layer_skipped() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let dir = build_dir_x("mtp", true, NK, NV, true, |_| {});
         let mut m = load_int8(&dir);
         assert_eq!(
@@ -3044,6 +3060,8 @@ mod tests {
     /// なる (キャッシュ連続性 3+1==4 と同じ性質を、キャッシュをまたいで成立させる)。
     #[test]
     fn qwen38_27b_shape_gdn_snapshot_restore_bit_exact() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let dir = build_dir("snap", true, NK, NV);
         let mut m = load_int8(&dir);
         let p: Vec<u32> = [7u32, 33, 100, 64].to_vec();
@@ -3106,6 +3124,8 @@ mod tests {
     /// こちらは実 Qwen35 実装 (GDN 層 + full attention 層の混在) での検証。
     #[test]
     fn qwen38_27b_shape_engine_multi_turn_entry_restore() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         use crate::engine::{ChatMessage, Engine, GenParams, PrefixHit};
         use crate::testutil::dummy_tokenizer;
 
@@ -3596,6 +3616,8 @@ mod tests {
     /// `gate_w`/`up_w`, so only the [gate+up] fusion is under test here.
     #[test]
     fn t7b1_fused_prefill_matches_legacy_ffn_bitexact() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let dir = build_dir("t7b1pf", true, NK, NV);
         let mut m = load_int8(&dir);
         let toks: Vec<u32> = (0..11u32).map(|i| (i * 29 + 3) % VOCAB as u32).collect();

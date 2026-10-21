@@ -3333,3 +3333,38 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
   prefix cache (長文脈テストモデルは非再帰)、server のスケジューラ / HTTP 層、
   メモリ使用量、GPU アンカー・bench・KPI (production の行を 1 行も変えていないため
   構造的に不変だが、測ってはいない)。
+
+### s163: Task K4 - 既定ゲートのテスト隔離を入れた (2026-10-22) 完了 (実装変更 0 行)
+
+- **欠陥 (再現)**: 既定の並列ゲート `cargo test -p denno-engine --lib` が稀に落ちた
+  (監督実測: 7 回中 1 回、273 passed / 1 failed、`prof::tests::attn_core_is_split_into_gdn_and_full_rows`。
+  単独実行は ok)。本 task の計測では HEAD (`5931c7a`) の並列 10 回で 2 回 (同じ
+  `attn_core_is_split_into_gdn_and_full_rows` 1 回 + `serve_step_other_is_step_minus_named_siblings` 1 回)、
+  `--test-threads=1` では `serve_step_other_is_step_minus_named_siblings` が 3 回中 3 回落ちた。
+- **原因 (コードで確認)**: `prof::tests::lock_counters()` の排他 `GLOBAL_COUNTER_LOCK` が
+  `mod tests` の内側に閉じていて prof 以外のテストが参加できず、`FORCE_ENABLED = Some(true)` の
+  窓の間に別スレッドの forward が同じ `NS` / `CALLS` へ sample を積んでいた。`time_full` は
+  入口で `enabled()` を 1 回だけ読み、sample は区間の終わりに積むので、窓の外で積む経路が
+  残る — prof 側のロックだけでは足りない。
+- **直し方**: `crates/denno-engine/src/prof.rs` のモジュール直下 (`#[cfg(test)]`) に
+  `pub(crate) fn counters_guard() -> std::sync::MutexGuard<'static, ()>` を置き、ロックの実体を
+  `GLOBAL_COUNTER_LOCK` **1 本**に保った (`mod tests` の `lock_counters()` はその薄いラッパ)。
+  既定ゲートで forward を回す **59 本**のテストが本体の先頭で同じガードを保持する
+  (engine.rs 41 / model/qwen35.rs 11 / model/llama.rs 4 / testutil.rs 2 / quant.rs 1)。
+  内訳: `long_context_*` 4 本、`run_script_streamed` 経由 4 本、`prof::time_n_ev` を直接呼ぶ
+  quant 1 本、残りは `chat` / `step_chat` / `forward` を回すもの。cuda feature 限定 +
+  `#[ignore]` の 4 本は既定ゲートで走らないため対象外。比較式・`#[ignore]`・テスト本数は不変。
+- **同じ class の残り (競合ではない)**: `serve_step_other_is_step_minus_named_siblings` は、
+  `step_end` の後に閉じる tail の兄弟 (投影 1 本) が step 内の非兄弟時間を上回ると
+  `other` が 0 に張り付き `other + siblings <= step` が反転する (隔離後 20 回中 7 回。
+  HEAD でも並列 10 回中 1 回・`--test-threads=1` で 3 回中 3 回)。実経路の 1 step は投影を
+  数百本ふくむので、fixture の step 内投影を 1 本 -> 16 本にした (比較式は不変)。16 本での
+  実測 (一時 `eprintln!`、commit 前に削除) は step 9,080-18,210 ns / other 1,210-1,790 ns /
+  siblings 7,760-16,360 ns で、40 回連続 0 落ち。
+- **実測ゲート**: `cargo test -p denno-engine --lib` = **274 passed / 0 failed / 1 ignored** を
+  **40 回連続** (20 + 20、各 0.96-1.44 s)。`cargo test -p denno-server --lib` = **37 passed**。
+  `cargo test -p denno-engine --test dequant_ref` = **7 passed**。`long_context_*` 4 本だけの
+  実行 = **0.02 s** (wall 0.09 s・debug ビルド)。
+- **数値クラス**: 該当なし。変更はすべて `#[cfg(test)]` の中 (production 0 行、`.cu` / `.ptx` 無変更)。
+- **測っていないこと**: bench / GPU アンカー / KPI (production の行を 1 行も変えていないため
+  構造的に不変だが、測ってはいない)。

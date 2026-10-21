@@ -890,6 +890,9 @@ mod tests {
     /// 増えないので、cuda 有効ビルドでこのテストが落ちる。
     #[test]
     fn prefill_apply_bt_rows_goes_through_gpu_seam() {
+        // s163 (K4): このテストは `prof::time_n_ev` を直接呼ぶ (1 サンプル) ので、
+        // prof の厳密比較の窓と排他する (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         // m=64 は既定の GEMV 上限 (~16) 超・GEMM 閾値 (256) 未満 = prefill の典型
         let (k, n, m) = (64usize, 32usize, 64usize);
         let w = pseudo_random(k * n, 23);

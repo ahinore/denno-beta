@@ -689,6 +689,8 @@ mod tests {
     /// (prefix cache ヒット経路含む) でも完全に同一の出力になる。
     #[test]
     fn quant_dummy_generation_is_deterministic_in_int8_mode() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut a = quant_dummy_engine("a", Some(42), QuantMode::Int8).unwrap();
         let mut b = quant_dummy_engine("b", Some(42), QuantMode::Int8).unwrap();
 
@@ -713,6 +715,8 @@ mod tests {
     /// ただし誤差は小さく、greedy の選択 (argmax) はこのダミーでは変わらない。
     #[test]
     fn quant_dummy_int8_logits_differ_from_fp32_but_stay_close() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut f = QuantMatModel::new(QuantMode::Fp32);
         let mut q = QuantMatModel::new(QuantMode::Int8);
         let mut cf = f.new_cache();

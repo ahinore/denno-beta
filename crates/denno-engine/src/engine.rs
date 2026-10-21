@@ -1572,6 +1572,8 @@ mod tests {
 
     #[test]
     fn greedy_decoding_is_deterministic_across_engines() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut a = dummy_engine("m", None).unwrap();
         let mut b = dummy_engine("m", None).unwrap();
         let out_a = a.chat(None, &msgs("t0"), &params(20), |_| {}).unwrap();
@@ -1585,6 +1587,8 @@ mod tests {
 
     #[test]
     fn seeded_sampling_is_deterministic_within_and_across_engines() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut p = params(30);
         p.temperature = Some(1.0);
         p.seed = Some(42);
@@ -1601,6 +1605,8 @@ mod tests {
 
     #[test]
     fn prefix_cache_reuses_prompt_and_keeps_exact_output() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = dummy_engine("m", None).unwrap();
         let out1 = e.chat(None, &msgs("t0"), &params(20), |_| {}).unwrap();
 
@@ -1628,6 +1634,8 @@ mod tests {
     /// 別セッションとして扱える。
     #[test]
     fn multi_session_alternation_restores_entries_and_keeps_exact_output() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = dummy_engine("m", None).unwrap();
 
         // 基準出力 (キャッシュ無しの新規エンジン)
@@ -1663,6 +1671,8 @@ mod tests {
 
     #[test]
     fn prefix_cache_budget_is_configurable_and_evicts() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = dummy_engine("m", None).unwrap();
         assert_eq!(e.prefix_cache_max_tokens(), DUMMY_CONTEXT);
 
@@ -1684,6 +1694,8 @@ mod tests {
 
     #[test]
     fn prefix_cache_hit_via_live_after_entry_restore() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = dummy_engine("m", None).unwrap();
         e.chat(None, &msgs("t0"), &params(20), |_| {}).unwrap();
         e.chat(None, &msgs("t15"), &params(20), |_| {}).unwrap();
@@ -1716,6 +1728,8 @@ mod tests {
     /// どちらかの復元が欠けると生成列が一致しなくなる。
     #[test]
     fn recurrent_entry_restore_matches_full_prefill() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = recurrent_engine("recur", None).unwrap();
         let mut ref2 = recurrent_engine("recur-ref2", None).unwrap();
         let mut ref3 = recurrent_engine("recur-ref3", None).unwrap();
@@ -1755,6 +1769,8 @@ mod tests {
     /// (KV のみ復元して静かに出力を変える経路は存在しない)。
     #[test]
     fn recurrent_partial_prefix_falls_back_to_full_prefill() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = recurrent_engine("recur", None).unwrap();
         let mut r = recurrent_engine("recur-ref", None).unwrap();
         e.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
@@ -1771,6 +1787,8 @@ mod tests {
     /// 出力はフル prefill と完全一致する (状態の整合は保たれる)。
     #[test]
     fn recurrent_identical_prompt_falls_back_to_full_prefill() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = recurrent_engine("recur", None).unwrap();
         let mut r = recurrent_engine("recur-ref", None).unwrap();
         let out1 = e.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
@@ -1794,6 +1812,8 @@ mod tests {
     /// 次ターン以降で復元される。出力はフル prefill の参照エンジンと完全一致。
     #[test]
     fn recurrent_qwen_style_template_hits_entry_on_multiturn() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = recurrent_qwen_style_engine("qwen-style", None).unwrap();
         let mut ref2 = recurrent_qwen_style_engine("qwen-style-ref2", None).unwrap();
         let mut ref3 = recurrent_qwen_style_engine("qwen-style-ref3", None).unwrap();
@@ -1873,6 +1893,8 @@ mod tests {
     /// (fallback は境界不明 = 従来経路のまま)。
     #[test]
     fn recurrent_qwen_style_template_identical_resend_hits_entry() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = recurrent_qwen_style_engine("qwen-style", None).unwrap();
         let out1 = e.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
         assert_eq!(e.last_prefix_hit(), PrefixHit::None);
@@ -1890,6 +1912,8 @@ mod tests {
     /// フォールバックする (安全側経路の維持確認)。
     #[test]
     fn recurrent_qwen_style_template_partial_prefix_still_falls_back() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = recurrent_qwen_style_engine("qwen-style", None).unwrap();
         let mut r = recurrent_qwen_style_engine("qwen-style-ref", None).unwrap();
         e.chat(None, &msgs("t0"), &params(3), |_| {}).unwrap();
@@ -1962,6 +1986,8 @@ mod tests {
     /// ThinkingSimModel が実モデルの「思考する/しない」をトークンレベルで模倣する。
     #[test]
     fn thinking_off_short_circuits_generation_and_full_thinks() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = thinking_sim_engine("think-sim").unwrap();
         let m = msgs("t0");
 
@@ -1979,6 +2005,8 @@ mod tests {
     /// off のマルチターンでも PrefixHit::Entry になり出力はフル prefill と一致する。
     #[test]
     fn thinking_off_keeps_recurrent_base_split() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = recurrent_qwen_style_engine("qwen-style", None).unwrap();
         let mut r = recurrent_qwen_style_engine("qwen-style-ref", None).unwrap();
 
@@ -1995,6 +2023,8 @@ mod tests {
 
     #[test]
     fn stop_sequence_truncates_at_first_occurrence() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = dummy_engine("m", None).unwrap();
         let full = e.chat(None, &msgs("t0"), &params(20), |_| {}).unwrap();
 
@@ -2018,6 +2048,8 @@ mod tests {
 
     #[test]
     fn max_tokens_is_clamped_to_fit_context() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = dummy_engine("m", None).unwrap();
         // コンテキスト (64) を大きく超える max_tokens はクランプされて続行する
         let out = e.chat(None, &msgs("t0"), &params(10_000), |_| {}).unwrap();
@@ -2027,6 +2059,8 @@ mod tests {
 
     #[test]
     fn max_tokens_limit_stops_generation() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = dummy_engine("m", None).unwrap();
         // EOS に届く前に打ち切る
         let out = e.chat(None, &msgs("t0"), &params(2), |_| {}).unwrap();
@@ -2037,6 +2071,8 @@ mod tests {
 
     #[test]
     fn on_delta_receives_the_same_text_as_result() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = dummy_engine("m", None).unwrap();
         let mut streamed = String::new();
         let out = e
@@ -2047,12 +2083,16 @@ mod tests {
 
     #[test]
     fn empty_messages_is_an_error() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = dummy_engine("m", None).unwrap();
         assert!(e.chat(None, &[], &params(4), |_| {}).is_err());
     }
 
     #[test]
     fn system_prompt_is_included_in_prompt_tokens() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let mut e = dummy_engine("m", None).unwrap();
         let with_sys = e.chat(Some("sys"), &msgs("t0"), &params(20), |_| {}).unwrap();
         assert_eq!(with_sys.text, EXPECTED_GREEDY_TEXT);
@@ -2074,6 +2114,8 @@ mod tests {
     /// DummyModel は KV を参照しないため、KV 依存の KvSensitiveModel を使う。
     #[test]
     fn interleaved_sessions_match_standalone_outputs() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let p = params(6);
         // 単独実行の基準 (それぞれ独立したエンジンで full prefill)
         let mut ra = kv_sensitive_engine("a", None).unwrap();
@@ -2127,6 +2169,8 @@ mod tests {
     /// 単独実行と一致することを固定する。
     #[test]
     fn short_then_long_conversation_matches_standalone_outputs() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let p = params(6);
         let short = "t0";
         let long = "t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t13 t14 t15 t0 t1 t2 t3";
@@ -2164,6 +2208,8 @@ mod tests {
     /// 全て単独実行と完全一致。P6 では全員が同時にスロットに常駐する。
     #[test]
     fn round_robin_stepping_matches_standalone_outputs() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         let prompts = ["t0", "t15", "t0", "t13"];
         let p = params(6);
         // 単独実行の基準
@@ -2213,6 +2259,8 @@ mod tests {
     /// 各セッションの出力は単独実行と完全一致 (fp32 バッチカーネルの契約)。
     #[test]
     fn batch_decode_matches_standalone_outputs() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         use crate::testutil::dummy_engine;
         let prompts = ["t0", "t15", "t0", "t13"];
         let p = params(6);
@@ -2265,6 +2313,8 @@ mod tests {
     /// 出力は変わらない (完了セッションは forward から外れる)。
     #[test]
     fn batch_decode_handles_uneven_completion() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         use crate::testutil::dummy_engine;
         let p = params(2); // t0 は 2 トークンで打ち切り (EOS 届く前)
         let p_long = params(6);
@@ -2321,6 +2371,8 @@ mod tests {
     /// (step_chat_batch) の両経路で、no-op の適用関数を挟んでも変わらない。
     #[test]
     fn anti_repetition_default_is_bit_identical_in_both_decode_paths() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         use crate::testutil::dummy_engine;
         let base = params(20);
 
@@ -2378,6 +2430,8 @@ mod tests {
     /// つまり「n=2 が無いと 5,6,5,6 だが、有ると 5,6,5,7」。
     #[test]
     fn no_repeat_ngram_applies_in_both_decode_paths() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         use crate::testutil::tool_script_engine;
         let script = vec![5u32, 6, 5, 6, 5, 6, 5, 6];
         // ベースライン (n 無し): 5,6,5,6,... がそのまま出る
@@ -2415,6 +2469,8 @@ mod tests {
     /// GenParams の 3 フィールドがセッションに伝わる (正規化込み)。
     #[test]
     fn gen_params_anti_repetition_reach_session() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         use crate::testutil::dummy_engine;
         let mut e = dummy_engine("m", None).unwrap();
         let p = GenParams {
@@ -2568,6 +2624,8 @@ mod tests {
 
     #[test]
     fn role_label_stops_and_excludes_marker() {
+        // s163 (K4): run_script_streamed 経由で forward を回す (カウンタ窓と排他)。
+        let _g = crate::prof::counters_guard();
         // 生成中に "\nuser\n" が現れたらマーカーを含めず打ち切る
         let (ids, extra) = script_extra(&["Hello", "Ċ", "user", "Ċ", "next", "eos"]);
         let out = run_script_streamed(&ids, &extra, Vec::new()).0;
@@ -2579,6 +2637,8 @@ mod tests {
 
     #[test]
     fn role_label_stops_on_assistant_colon_and_im_end() {
+        // s163 (K4): run_script_streamed 経由で forward を回す (カウンタ窓と排他)。
+        let _g = crate::prof::counters_guard();
         let (ids, extra) = script_extra(&["A", "Ċ", "assistant", ":", "Ċ", "B", "eos"]);
         let out = run_script_streamed(&ids, &extra, Vec::new()).0;
         assert_eq!(out.text, "A\n");
@@ -2595,6 +2655,8 @@ mod tests {
 
     #[test]
     fn partial_marker_is_not_streamed_until_confirmed() {
+        // s163 (K4): run_script_streamed 経由で forward を回す (カウンタ窓と排他)。
+        let _g = crate::prof::counters_guard();
         // "Hello" → "\n" → "user" (ここで確定 = 打ち切り) の間、
         // on_delta に "u" / "us" / "use" 等の prefix が漏れない。
         let (ids, extra) = script_extra(&["Hello", "Ċ", "user", "Ċ", "next", "eos"]);
@@ -2616,6 +2678,8 @@ mod tests {
 
     #[test]
     fn stop_marker_boundaries_crlf_and_fullwidth_colon() {
+        // s163 (K4): run_script_streamed 経由で forward を回す (カウンタ窓と排他)。
+        let _g = crate::prof::counters_guard();
         // MAX_STOP_MARKER_LEN (12) 境界: 11 バイトの prefix は保持・12 バイトで確定
         assert_eq!(MAX_STOP_MARKER_LEN, 12);
         // MAX_STOP_MARKER_LEN (12) の保持上限: 11 / 12 バイトは prefix で保持、
@@ -2678,6 +2742,8 @@ mod tests {
 
     #[test]
     fn client_stop_combines_with_role_label_earliest_wins() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         // クライアント stop が先に現れる → そちらで打ち切る
         let (ids, extra) = script_extra(&["He", "llo", "Ċ", "user", "Ċ", "eos"]);
         let out = run_script_streamed(&ids, &extra, vec!["llo".into()]).0;
@@ -2748,6 +2814,8 @@ mod tests {
 
     #[test]
     fn tool_mask_off_matches_plain_generation() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         // 拘束なし = スクリプトをそのまま再生
         let out = run_script(&block_script("run_tool"), tid("city"), None);
         assert!(out.text.contains("<function=run_tool>"), "text = {}", out.text);
@@ -2756,6 +2824,8 @@ mod tests {
 
     #[test]
     fn tool_mask_any_is_bit_identical_when_compliant() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         // スクリプトが許容集合に完全準拠なら拘束ありでも無しと同一出力
         let a = run_script(&block_script("get_weather"), tid("city"), None);
         let b = run_script(
@@ -2771,6 +2841,8 @@ mod tests {
 
     #[test]
     fn tool_mask_named_forces_allowed_tool_name() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         // モデルが指定外ツール名 (run_tool) をピークに出しても、
         // 拘束により許容名 (get_weather) へ強制される
         let forced = run_script(
@@ -2785,6 +2857,8 @@ mod tests {
 
     #[test]
     fn tool_mask_multibyte_name_split_tokens_pass() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         // マルチバイト名 (天気) を 1 文字ずつのトークン (天/気) で構築しても
         // byte-level 前提の許容計算で通る
         let script = vec![
@@ -2840,6 +2914,9 @@ mod tests {
     /// 同じ性質は既定ゲートで 64 token 以下でしか見ていなかった。
     #[test]
     fn long_context_prefix_cache_reuse_keeps_logits_bit_identical() {
+        // s163 (Task K4): 3,000 token の forward は prof の厳密比較の窓を広げるため、
+        // prof::tests と同じ 1 本のロックを取って双方向に排他する。
+        let _g = crate::prof::counters_guard();
         let words = long_prompt_words(3000);
         let content = long_content(words, "t1");
         let p = params(1);
@@ -2884,6 +2961,8 @@ mod tests {
     /// ("KV cache overflow") は engine が手前で弾くため到達しない。
     #[test]
     fn long_context_capacity_boundary_is_a_clean_error_not_a_panic() {
+        // s163 (Task K4): prof のカウンタ窓と排他 (詳細は 1 本目のテスト)。
+        let _g = crate::prof::counters_guard();
         let mut e = long_context_engine("long", None).unwrap();
         let max_len = e.caches[0].max_len();
         assert_eq!(max_len, LONG_CONTEXT);
@@ -2930,6 +3009,8 @@ mod tests {
     /// 先頭 2,999 行がビット一致で残る。
     #[test]
     fn long_context_kv_growth_is_demand_driven_and_preserves_rows() {
+        // s163 (Task K4): prof のカウンタ窓と排他 (詳細は 1 本目のテスト)。
+        let _g = crate::prof::counters_guard();
         let mut e = long_context_engine("long", None).unwrap();
         let kv_dim = e.caches[0].kv_dim();
         let first_words = long_prompt_words(3000);
@@ -3019,6 +3100,8 @@ mod tests {
     /// 3,000 token 級 + engine 経路 (スロット残留 KV との競合を含む) は未覆。
     #[test]
     fn long_context_prefix_budget_evicts_and_post_eviction_is_a_clean_miss() {
+        // s163 (Task K4): prof のカウンタ窓と排他 (詳細は 1 本目のテスト)。
+        let _g = crate::prof::counters_guard();
         let words = long_prompt_words(3000);
         let prompt_len = long_prompt_len(words); // 3,000
         let budget = prompt_len + prompt_len / 2; // 1 本は入り 2 本は入らない
