@@ -4024,6 +4024,118 @@ pub fn chain_linear_grouped(
     })
 }
 
+/// s157 (Task B20 段階 1): Q4_0 重みの grouped GEMV を**デバイス常駐バッファ同士**で
+/// 発行する (enqueue のみ・同期なし・ホストスライスなし)。
+///
+/// `chain_linear_grouped` (int8) と対になる入口。重みは `weights_for_q4` の VRAM
+/// レジストリ (nib / sc) をそのまま使い、カーネルは per-op 経路
+/// (`q4_dispatch_tile`) と**同一の `dno_gemv_q4_0c{C}`・同一引数・同一グリッド**で
+/// 起動する — 変わるのは「いつ同期するか」だけで、数値経路は 1 bit も変えない。
+///
+/// 出力は `parts` の順に連結する (`chain_linear_grouped` の重み連結と同じ並び)。
+/// `parts` は k が揃っていること・k が Q4 ブロック (32) の倍数であることが前提。
+pub fn chain_linear_q4_device(
+    parts: &[&crate::quant::Q4Linear],
+    in_slot: usize,
+    out_slot: usize,
+    m: usize,
+) -> Option<()> {
+    let ctx = chain_ctx()?;
+    if parts.is_empty() || m > max_m() {
+        return None;
+    }
+    let k = parts[0].k;
+    if parts.iter().any(|p| p.k != k) || k % 32 != 0 {
+        return None;
+    }
+    let n_tot: usize = parts.iter().map(|p| p.n).sum();
+    // 重みは初回だけ転送する (以降はレジストリから引く = ホスト側の確保なし)。
+    let mut gws = Vec::with_capacity(parts.len());
+    for p in parts {
+        gws.push(ok(weights_for_q4(p.uid, &p.blocks, p.k, p.n))?);
+    }
+    ok(chain_ensure_buf(in_slot, m * k * 4))?;
+    ok(chain_ensure_buf(out_slot, m * n_tot * 4))?;
+    // per-op 経路と同じ列ブロック版 (m = 1 の decode も同じカーネル)。
+    // `q4_gemv_c()` は env を毎回読む — per-op 経路は 1 step に数回だが、chain は
+    // 層ループの中で 1 step に数百回呼ばれるので、ここで 1 回だけ読んで使い回す。
+    static C: OnceLock<usize> = OnceLock::new();
+    let c = *C.get_or_init(q4_gemv_c);
+    let f_c = ctx.f_mv_q4_c?[q4_gemv_c_index(c)];
+    CHAIN.with(|cell| -> Option<()> {
+        let s = cell.borrow();
+        let iptr = s.bufs[in_slot].as_ref()?.ptr();
+        let optr = s.bufs[out_slot].as_ref()?.ptr();
+        let mut off = 0usize;
+        for (p, gw) in parts.iter().zip(gws.iter()) {
+            let (mut pa, mut pn, mut ps, mut po) =
+                (iptr, gw.nib.ptr(), gw.sc.ptr(), optr + (off * 4) as u64);
+            let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, p.n as c_int);
+            let mut args = [
+                &mut pa as *mut _ as *mut c_void,
+                &mut pn as *mut _ as *mut c_void,
+                &mut ps as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut mc as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            let grid = (p.n.div_ceil(8 * c) as u32, m as u32, 1);
+            ok(unsafe { ctx.launch_async(f_c, grid, (256, 1, 1), 0, &mut args) })?;
+            off += p.n;
+        }
+        Some(())
+    })
+}
+
+/// s157 (Task B20 段階 1): 27B q4 の decode を chain 経路で回すか。
+/// `DENNO_GPU_Q4_CHAIN=0` で従来の per-op 経路 (1 step に約 392 回の D2H) に戻せる。
+/// 既定は chain (デバイス常駐・同期は step 末尾の logits 1 回)。
+pub fn q4_chain_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_q4_chain(std::env::var("DENNO_GPU_Q4_CHAIN").ok().as_deref()))
+}
+
+/// s157 (Task B20 段階 1): `DENNO_GPU_Q4_CHAIN` の解釈 (純関数・テスト可能)。
+/// **`"0"` だけが off** — 未設定・空・その他の値は既定の on (従来の per-op 経路へ
+/// 戻すのは明示的な 0 だけ。タイポで静かに経路が変わるのを避ける)。
+pub fn parse_q4_chain(raw: Option<&str>) -> bool {
+    raw != Some("0")
+}
+
+/// s157 (Task B20 段階 1): chain 経路の線形呼び出し (**int8 / q4 の両対応**)。
+///
+/// 1 グループは全部 int8 か全部 q4 のどちらか (混在は受けない → `None` を返して
+/// 呼び出し側が per-op 経路へ委譲する)。どちらの経路も enqueue のみで同期しない。
+pub fn chain_linear(
+    parts: &[&crate::quant::Linear],
+    in_slot: usize,
+    out_slot: usize,
+    m: usize,
+) -> Option<()> {
+    if parts.is_empty() {
+        return None;
+    }
+    if parts.iter().all(|p| p.quant8().is_some()) {
+        let q: Vec<&Quant8Linear> = parts.iter().filter_map(|p| p.quant8()).collect();
+        return chain_linear_grouped(&q, in_slot, out_slot, m);
+    }
+    if parts
+        .iter()
+        .all(|p| matches!(p, crate::quant::Linear::Q4(_)))
+    {
+        let q: Vec<&crate::quant::Q4Linear> = parts
+            .iter()
+            .map(|p| match p {
+                crate::quant::Linear::Q4(x) => x,
+                _ => unreachable!("all() で Q4 のみ確認済み"),
+            })
+            .collect();
+        return chain_linear_q4_device(&q, in_slot, out_slot, m);
+    }
+    None
+}
+
 /// swiglu: ga スロットの [gate|up] から act = (g/(1+exp(-g)))*u を計算
 /// (デバイス内完結)。CPU silu_inplace + gate[i] *= up[i] とビット一致。
 pub fn chain_swiglu(ga_slot: usize, act_slot: usize, ff: usize, m: usize) -> Option<()> {
@@ -10195,5 +10307,41 @@ mod b7c_ownership_tests {
         // 一度読んだ層は無効化されている (次は必ず seed し直す = 取り違えない)。
         let again = GDN_STATE.with(|cell| gdn_state_take_dev(kv_id, 0, &mut cell.borrow_mut()));
         assert!(again.is_none(), "取り出した層は無効化される");
+    }
+}
+
+#[cfg(test)]
+mod b20_stage1_tests {
+    //! s157 (Task B20 段階 1): q4 線形を chain に載せる入口の**判定だけ**を固定する。
+    //! 実カーネルは GPU が要るので、ここでは (a) `DENNO_GPU_Q4_CHAIN` の解釈、
+    //! (b) `chain_linear` が空・混在グループを**受けない**こと (= per-op 経路へ
+    //! 静かに委譲する) を確かめる。数値の一致は実機 (supervisor) の担当。
+    use super::*;
+
+    /// `DENNO_GPU_Q4_CHAIN` は **"0" だけ**が off。未設定・空・"off" などは on。
+    #[test]
+    fn q4_chain_flag_is_off_only_for_explicit_zero() {
+        assert!(!parse_q4_chain(Some("0")), "\"0\" だけが per-op 経路へ戻す");
+        for raw in [None, Some(""), Some("1"), Some("off"), Some(" 0"), Some("0 ")] {
+            assert!(parse_q4_chain(raw), "raw={raw:?} は on (既定) のはず");
+        }
+    }
+
+    /// `chain_linear` は空グループ・int8/q4 混在グループを受けない (None → per-op)。
+    #[test]
+    fn chain_linear_rejects_empty_and_mixed_groups() {
+        assert_eq!(chain_linear(&[], CH_H, CH_O, 1), None, "空グループは受けない");
+        let w = vec![0.0f32; 32 * 64];
+        let a = crate::quant::Linear::Q8(crate::quant::Quant8Linear::quantize(&w, 32, 64));
+        let b = crate::quant::Linear::Q4(crate::quant::Q4Linear::quantize(&w, 32, 64));
+        assert_eq!(
+            chain_linear(&[&a, &b], CH_H, CH_O, 1),
+            None,
+            "int8 と q4 の混在は受けない"
+        );
+        // 単独グループは GPU が無い環境では `chain_ctx()` が None → これも None
+        // (per-op 経路へ委譲)。**panic しないこと**がここの主眼。
+        assert_eq!(chain_linear(&[&b], CH_H, CH_O, 1), None);
+        assert_eq!(chain_linear(&[&a], CH_H, CH_O, 1), None);
     }
 }

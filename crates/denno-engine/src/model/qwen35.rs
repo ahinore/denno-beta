@@ -1935,21 +1935,43 @@ fn q35_rope_pi_table(pos: usize, n_rot: usize, theta: f32) -> Vec<f32> {
     tab
 }
 
-/// C4: decode chain が使える構造か (全 int8 線形 + lm_head 量子化 +
+/// s157 (Task B20 段階 1): chain 経路が扱える重みか (int8 / q4)。
+///
+/// q4 は `DENNO_GPU_Q4_CHAIN=0` で chain から外す (従来の per-op 経路へ戻す)。
+/// cuda feature 無しのビルドでは chain 自体が無いので int8 だけを「扱える」とする
+/// (`q35_chain_compatible` は cuda 無しでもコンパイルされるため、ここで分ける)。
+#[cfg(feature = "cuda")]
+fn chain_weight_ok(w: &Linear) -> bool {
+    match w {
+        Linear::Q8(_) => true,
+        Linear::Q4(_) => crate::cuda::q4_chain_enabled(),
+        Linear::F32 { .. } => false,
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn chain_weight_ok(w: &Linear) -> bool {
+    matches!(w, Linear::Q8(_))
+}
+
+/// C4: decode chain が使える構造か (全 int8/q4 線形 + lm_head 量子化 +
 /// beta/alpha は Fp32)。beta/alpha は dno_matvec_f32 が fp32 重みの生スライスを
 /// 受ける (Linear::F32 に uid は無いため q35_w_dev は (model_id, layer, tag) キー
 /// でキャッシュ) — Q8 化されているモデルは chain 不発動 (現ローダは lin_ctl で
 /// 常に Fp32 を維持するため実モデルは常にこの条件を満たす)。
+///
+/// s157 (Task B20 段階 1): Q4_0 重みも chain の線形 (`chain_linear_q4_device`) で
+/// 回せるようになったので、`quant8()` ではなく `chain_weight_ok` で判定する。
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn q35_chain_compatible(m: &Qwen35) -> bool {
-    if m.lm_head.as_ref().map_or(true, |l| l.quant8().is_none()) {
+    if m.lm_head.as_ref().map_or(true, |l| !chain_weight_ok(l)) {
         return false;
     }
     for layer in &m.layers {
         match &layer.attn {
             AttnKind::Gdn(g) => {
                 for w in [&g.qkv_w, &g.gate_w, &g.out_w] {
-                    if w.quant8().is_none() {
+                    if !chain_weight_ok(w) {
                         return false;
                     }
                 }
@@ -1961,14 +1983,14 @@ fn q35_chain_compatible(m: &Qwen35) -> bool {
             }
             AttnKind::Full(f) => {
                 for w in [&f.q_w, &f.k_w, &f.v_w, &f.o_w] {
-                    if w.quant8().is_none() {
+                    if !chain_weight_ok(w) {
                         return false;
                     }
                 }
             }
         }
         for w in [&layer.gate_w, &layer.up_w, &layer.down_w] {
-            if w.quant8().is_none() {
+            if !chain_weight_ok(w) {
                 return false;
             }
         }
@@ -1991,7 +2013,7 @@ impl Qwen35 {
         pos0: usize,
     ) -> Option<Vec<f32>> {
         use crate::cuda::{
-            chain_download, chain_linear_grouped, chain_q35_fullattn, chain_q35_gdn_scan,
+            chain_download, chain_linear, chain_q35_fullattn, chain_q35_gdn_scan,
             chain_q35_kv_stage_begin, chain_q35_kv_stage_flush, chain_q35_rope_pi_upload,
             chain_q35_step_reserve, chain_q35_step_reserve_aq, chain_rmsnorm, chain_seg, chain_step_begin,
             chain_step_end, chain_swiglu, chain_upload,
@@ -2104,9 +2126,8 @@ impl Qwen35 {
                     let l_proj = crate::prof::span_begin();
                     // qkv + z 投影: CH_QKV = [qkv (2nk*dk+nv*dv) | z (nv)]
                     crate::cuda::lin_stage_tagged(crate::prof::QKV, || -> Option<()> {
-                        let qkv = g.qkv_w.quant8()?;
-                        let zw = g.gate_w.quant8()?;
-                        chain_linear_grouped(&[qkv, zw], CH_H, CH_QKV, 1)
+                        // s157 (Task B20 段階 1): int8 / q4 のどちらでも同じ入口。
+                        chain_linear(&[&g.qkv_w, &g.gate_w], CH_H, CH_QKV, 1)
                     })?;
                     // beta/alpha (fp32 matvec・CH_QKV テール) → dno_gdn_scan
                     // (y → CH_ATT・新状態は staged async D2H・ping-pong 面 交換)
@@ -2145,18 +2166,14 @@ impl Qwen35 {
                     crate::prof::span_end(l_scan, crate::prof::SL_LAY_GDN_SCAN);
                     // out_proj: y (CH_ATT) → e (CH_O)
                     crate::cuda::lin_stage_tagged(crate::prof::OPROJ, || -> Option<()> {
-                        let ow = g.out_w.quant8()?;
-                        chain_linear_grouped(&[ow], CH_ATT, CH_O, 1)
+                        chain_linear(&[&g.out_w], CH_ATT, CH_O, 1)
                     })?;
                 }
                 AttnKind::Full(f) => {
                     // qkv 投影: CH_QKV = [qg (heads*2dh) | k (kv_dim) | v (kv_dim)]
                     let l_qk = crate::prof::span_begin();
                     crate::cuda::lin_stage_tagged(crate::prof::QKV, || -> Option<()> {
-                        let qw = f.q_w.quant8()?;
-                        let kw = f.k_w.quant8()?;
-                        let vw = f.v_w.quant8()?;
-                        chain_linear_grouped(&[qw, kw, vw], CH_H, CH_QKV, 1)
+                        chain_linear(&[&f.q_w, &f.k_w, &f.v_w], CH_H, CH_QKV, 1)
                     })?;
                     crate::prof::span_end(l_qk, crate::prof::SL_LAY_FULL_QK);
                     // QK-Norm + partial rope (q → CH_Q35_Q・k → KV ミラー pos0 行直書き)
@@ -2184,8 +2201,7 @@ impl Qwen35 {
                     // o_proj: att (CH_ATT) → e (CH_O)
                     let l_op = crate::prof::span_begin();
                     crate::cuda::lin_stage_tagged(crate::prof::OPROJ, || -> Option<()> {
-                        let ow = f.o_w.quant8()?;
-                        chain_linear_grouped(&[ow], CH_ATT, CH_O, 1)
+                        chain_linear(&[&f.o_w], CH_ATT, CH_O, 1)
                     })?;
                     crate::prof::span_end(l_op, crate::prof::SL_LAY_FULL_OPROJ);
                 }
@@ -2202,8 +2218,7 @@ impl Qwen35 {
                 // s80 (T7b-1): 連結重み 1 本 (行順 [gate | up]) を 1 回の grouped
                 // GEMV で計算する (旧: 2 uid のグループ)。行ごとに量子化・累積が
                 // 独立なので出力はビット一致・重みのデバイス登録も 1 本で済む。
-                let gw = layer.gate_up_w.quant8()?;
-                chain_linear_grouped(&[gw], CH_H, CH_GA, 1)
+                chain_linear(&[&layer.gate_up_w], CH_H, CH_GA, 1)
             })?;
             crate::prof::span_end(l_gu, crate::prof::SL_LAY_FFN_GATE);
             let l_sw = crate::prof::span_begin();
@@ -2213,8 +2228,7 @@ impl Qwen35 {
             crate::prof::span_end(l_sw, crate::prof::SL_LAY_SWIGLU);
             let l_dn = crate::prof::span_begin();
             crate::cuda::lin_stage_tagged(crate::prof::DOWN, || -> Option<()> {
-                let dw = layer.down_w.quant8()?;
-                chain_linear_grouped(&[dw], CH_ACT, CH_DOWN, 1)
+                chain_linear(&[&layer.down_w], CH_ACT, CH_DOWN, 1)
             })?;
             crate::prof::span_end(l_dn, crate::prof::SL_LAY_FFN_DOWN);
             pending = Some(CH_DOWN);
@@ -2229,8 +2243,7 @@ impl Qwen35 {
         let l_final = crate::prof::span_begin();
         crate::prof::time_full(crate::prof::LM_HEAD, 1, true, || -> Option<()> {
             chain_rmsnorm(&self.norm_w, eps, pending, CH_H, e, 1, n_layers * 3)?;
-            let lmq = self.lm_head.as_ref().unwrap().quant8()?;
-            chain_linear_grouped(&[lmq], CH_H, CH_LOGITS, 1)
+            chain_linear(&[self.lm_head.as_ref().unwrap()], CH_H, CH_LOGITS, 1)
         })?;
         // s154 (Task B15): `sl_step_final` に同じ区間を転記する (転記のみ・
         // `sl_step_final` の値は 1 bit も動かさない)。ここから後のホスト側の
