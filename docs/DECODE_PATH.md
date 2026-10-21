@@ -214,3 +214,41 @@ them are asynchronous and staged, so the host wait they carry is **0 ms**; the s
 single synchronisation is still the logits download at the end. Metric B is recorded so
 that a small metric A cannot be read as "the step has no D2H at all", and so that a
 future change cannot claim the target by switching which number it reports.
+
+### 6.2 `sl_lay_ffn_gate` on the chain path is not a fixed-cost measurement (s160, Task G1)
+
+The `sl_lay_ffn_gate` span (`model/qwen35.rs:2216-2223`) wraps
+`chain_linear(&[&layer.gate_up_w], CH_H, CH_GA, 1)` on the chain path. What it contains there:
+
+| stage | chain path |
+|---|---|
+| (a) buffer alloc / reuse | `chain_ensure_buf` (`cuda.rs:3752`), grow-only, 0 calls in the steady state |
+| (b) activation quantize | none - the q4 GEMV reads f32 activations (`q4_dispatch`, `cuda.rs:2883`) |
+| (c) H2D | none - CH_H is device-resident; only the first-touch weight upload (`cuda.rs:4055`) |
+| (d) kernel launch | one `cuLaunchKernel` (`cuda.rs:4084`), grid `(n/32, m, 1)` |
+| (e) sync wait | none - the step's only sync is the logits download (`model/qwen35.rs:2295`) |
+| (f) copy-out | none - the output stays in CH_GA for `chain_swiglu` |
+
+The remaining host work is one `cuCtxSetCurrent` (`chain_ctx`, `cuda.rs:3740`), one
+`Mutex<HashMap>` lookup (`weights_for_q4`, `cuda.rs:2618`), two no-op `ensure` calls, argument
+marshalling and the launch - tens of microseconds, not hundreds.
+
+A large share in that row therefore cannot be read as per-call host overhead. Two explanations
+remain, and only a measurement separates them:
+
+1. **First-touch weight uploads inside the span.** For the 27B, one gate_up layer is 111.4 MB in
+   VRAM (178,257,920 parameters at 5 bit/param) and 64 layers are 7.13 GB. Amortised over a 41-step
+   profile that is 174 MB/step, i.e. about 14.5 ms/step at 12 GB/s. This is a property of profiling
+   a process whose registry is still cold, not of a decode token.
+2. **The launch blocking because the device is behind.** The span then carries GPU execution time.
+   The rest of the step's GPU time lands in the single sync at `model/qwen35.rs:2295` (section 3).
+
+The historical "gate_up costs 29.5 ms/call at m=21.5, 89% in `lin_sync_wait`" number predates
+`2701cf3` (B20 stage 1) and describes the per-op wrapper at prefill-shaped m. It cannot describe the
+chain path: 64 calls per token at 29.5 ms would be 1,888 ms/token against the measured 32.42.
+`lin_sync_wait` is the `cuCtxSynchronize` at `cuda.rs:3080`, i.e. it waits for the kernel - kernel
+time, not fixed cost.
+
+Display note: `lin_stage_close` (`cuda.rs:2839-2847`) ticks table B for chain linear calls as well,
+but table B samples only come from the per-op tile path (`cuda.rs:2980-3081`), so on a chain-path
+profile table B's coverage denominator is inflated. Display only.
