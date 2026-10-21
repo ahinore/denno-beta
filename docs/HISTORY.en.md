@@ -3461,3 +3461,46 @@ External implementations referenced in P19 and their licensing status (the same 
   engine numeric path, `.cu` / `.ptx`, and GPU execution are unchanged).
 - **Not measured here**: bench / GPU anchors / KPI (structurally unchanged because no
   production numeric path changed, but not measured).
+
+### s165: Task K6 - the measurement baseline in `docs/KPI.md` is brought up to date (2026-10-22) done (0 lines of code)
+
+> `docs/KPI.md` still carried the values as of `2701cf3`: the measured values for the K5-time
+> HEAD `8a0525b` and the operating rules settled on 2026-10-21 (how a triple is discarded, how
+> bench runs are judged, the VRAM conflict, health 000) were missing. This run touched docs
+> only. The **definition** of the numbers (protocol, formula, meaning of the discard rule) is
+> unchanged.
+
+- **Current values**: two rows for `8a0525b` added to the §2 table (the existing rows are kept
+  as history).
+  - 27B q4 = **32.43 ms/token** (2026-10-21T17:58Z, median of 3, util 0 pct, raw 32.43 / 32.43 / 32.43).
+  - 9B int8 = **16.24-16.28 ms/token** (GPU_VERIFY gen2).
+- **§3.1 (new)**: the rule is written down that right after a GPU_VERIFY redeploy the first
+  triple is discarded and the median of the *second* triple is the official value. Examples:
+  17:35Z (run1 TTFT 7.6 s -> 49.94, run2 / run3 32.43, median 32.43) and 16:28Z (leftover of
+  the cold weight upload, run2 42.83 became the median). The text states that this is a
+  different granularity from §1's "discard run1 inside a triple"; the formula and the request
+  conditions stay as in §1.
+- **§3.2 (new)**: the per-row variance ranges of `bench_all.sh` (gate_up m=1 0.101-0.109 /
+  m=2 0.137-0.147 / m=8 0.503-0.528 / m=64 2.316-2.504 / m=300 17.05-17.23, down_proj
+  m=1 0.054-0.069 / m=2 0.080-0.089 / m=8 0.248-0.256 / m=64 2.19-2.35 / m=300 6.55-7.20,
+  lm_head m=1 0.657-0.664, GDN n=1 0.143-0.146 / n=8 0.303-0.311 / n=32 0.806-0.824 /
+  n=300 5.72-5.83 (det=OK, maxabs 2.44e-4)) plus the judging rule: a single run more than 3 pct
+  off is not a regression, measure 3 times on the same commit, compare inside the same window
+  (util 0-5 pct, clocks 2835-2887 MHz), m=1 is L2-relative, and the m=64 / m=300 down_proj rows
+  span 6.55 to 7.20 so no verdict rests on those rows alone.
+- **§3.3 (new)**: the VRAM conflict between `bench_all.sh` and 8095 (2026-10-21T17:30Z: with
+  the 27B weights resident at about 25.5 GB / 32.6 GB, running bench kills the serve). Run it
+  in a window where 8095 is lazy (1692 MiB, no compute app), check health immediately
+  afterwards, and recover with `scripts/prod_serve_27b.sh` if it went down (the script's
+  arguments and values are not changed).
+- **§3.4 (new)**: the first step when health returns 000: look at `ps aux | grep prod_serve`
+  first (a restart in progress is not a fault; the same appearance was recorded at 16:45Z and
+  17:47Z), then judge with `nvidia-smi` compute apps and VRAM alongside, and only then use the
+  §3.3 recovery.
+- **Section numbers**: 未了 moved from §3 to §4 (content unchanged; nothing outside this repo
+  references `docs/KPI.md` §3).
+- **Untouched**: code, `scripts/`, `GPU_VERIFY.sh`, `docs/NUMERIC_POLICY.*.md`, `docs/TASKS.md`.
+  `git diff --stat` shows the three docs files only.
+- **Not measured here**: no GPU was used at all (no bench, no GPU_VERIFY, no KPI run). Every
+  number quoted is a 2026-10-21 measurement; nothing was measured fresh in this task. 8095 was
+  not touched either.
