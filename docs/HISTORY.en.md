@@ -2927,6 +2927,56 @@ the cause is the n-sized buffers themselves, not the thread count.
   drop to ~1/16 and the remaining fixed cost is one table update per step — to be
   confirmed on hardware.
 
+### s157: Task B20 stage 1 - the 27B q4 linears move onto the device-resident decode chain (2026-10-21) done
+
+> The 27B q4 decode went through the per-op wrapper `maybe_gpu_linear_q4_into`. It takes a host
+> slice, so every step carried 392 linear D2H calls plus their syncs, and GPU utilization stayed at
+> 40%. This puts q4 on the same entry point the 9B int8 path already uses, so the per-op round trip
+> leaves the layer loop.
+
+- **`chain_linear_q4_device`** (`cuda.rs`): enqueues the existing `dno_gemv_q4_0c{C}` against
+  **device-resident buffers only**. Kernel, argument list, grid `(n.div_ceil(8*C), m, 1)` and block
+  `(256,1,1)` are the ones `q4_dispatch_tile()` uses on the per-op path; no host slice, no sync.
+  Weights come from the `weights_for_q4()` VRAM registry (`nib` / `sc`), so nothing is re-uploaded
+  per step.
+- **`chain_linear`** is the int8/q4 dispatcher. A group must be all-Q8 or all-Q4; anything else
+  returns `None` and the caller keeps the per-op path (a slow answer, never a wrong one).
+  `q35_chain_compatible()` in `qwen35.rs` decides with `chain_weight_ok()` instead of `quant8()`
+  (Q8 always, Q4 only when the flag is on, F32 never).
+- **`DENNO_GPU_Q4_CHAIN`**: `parse_q4_chain()` treats exactly `"0"` as off (unset, `""`, `"off"`,
+  `" 0"` stay on), so a typo cannot silently switch paths. `q4_chain_enabled()` reads it once. With
+  `=0`, `q35_chain_compatible()` rejects Q4, `forward_decode_chain()` returns `None` at its entry
+  gate and the legacy per-op path runs exactly as before.
+- **7 chain call sites replaced** (`qwen35.rs`): gdn qkv+z, gdn o_proj, full qkv, full o_proj,
+  gate_up, down, lm_head. For int8 the parts, their order and their uids are unchanged, so the 9B
+  chain enqueues the identical sequence.
+- **No `.cu` / `.ptx` change**: `dno_gemv_q4_0c2/c4/c8` are already in the committed
+  `kernels_int8.ptx` (3 `.visible` entries) and the loader takes all three or none.
+- **Tests** (`b20_stage1_tests`): flag parsing boundaries (`"0"` / `""` / `"off"` / `" 0"` / unset)
+  and rejection of empty and mixed groups. The numeric match cannot be produced on CPU, so it is the
+  supervisor's GPU gate.
+- **Measured** (supervisor, GPU gate - these are measurements, not predictions):
+  - 27B q4 decode **75.89 -> 32.42 ms/token** (fixed protocol in `docs/KPI.md`, median of 3,
+    temperature 0, max_tokens 200; TTFT 0.205 / 0.202 s, wall 6.689 / 6.685 s for 200 tokens).
+  - 9B int8 decode **16.24 ms/token**, unchanged (GPU_VERIFY gen2 3.248 s / 200 tokens).
+  - Anchors **3/3 MATCH** (`c61ad85b` / `9e17d563` / `af6eb6ab`), `GPU_VERIFY` = PASS.
+  - PROFILE (`DENNO_PROFILE=1`, 40 tokens): `d2h_src_linear` is **898 calls for 0.0 ms**, `sl_lin`
+    is **0 calls/step** (was 392). The in-step per-op linear D2H is gone.
+  - `bench_all.sh` no regression (gate_up m=1 0.106 / m=2 0.142 / m=8 0.521 / m=64 2.398 / m=300
+    17.250, down 0.069 / 6.635, lm_head m=1 0.670, GDN n=1 0.143 / n=32 0.806 / n=300 5.734; the
+    +15% on m=300 gate_up is the known variation).
+  - Answer check: "What is the capital of France?" -> `Paris`, "Name three tourist spots in Tokyo."
+    -> `Senso-ji Temple, Shibuya Crossing, and the Tokyo Skytree.` Two runs, text-identical
+    (deterministic).
+- **Numeric class**: no new relaxation (none of R1-R4 is used). The q4 linear is the same kernel on
+  the same input, so its output matches the per-op path. Entering the chain does move the 27B's GDN
+  scan / attention onto the device-chain functions the 9B already uses (they no longer take host
+  slices). The 27B stays accepted by answer check, and the three anchors (9B int8) stay MATCH.
+- **The two D2H metrics**: the acceptance metric is "the number of in-step per-op linear D2H calls"
+  (0 on the chain path; baseline 392, target < 5). Total issued D2H is a separate metric, measured
+  at ~140/step (KV rows, logits, etc.), all asynchronous with 0 ms of host wait. Both definitions
+  are pinned in `docs/DECODE_PATH.md` §6.1.
+
 ### Benchmark summary (as of 2026-10-20, this host)
 
 Measurement rule: the official prefill value is cold single-shot (server start -> one request,
