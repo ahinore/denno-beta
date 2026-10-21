@@ -37,7 +37,9 @@ pub enum GgmlType {
     IQ3S,    // 21
     IQ2S,    // 22
     IQ4Xs,   // 23
+    Iq1M,    // 29
     Bf16,    // 30
+    Tq1_0,   // 34
     Mxfp4,   // 39
 }
 
@@ -64,7 +66,12 @@ impl GgmlType {
             21 => GgmlType::IQ3S,
             22 => GgmlType::IQ2S,
             23 => GgmlType::IQ4Xs,
+            // IQ1_M = 29 / TQ1_0 = 34 は ggml.h の enum と gguf-py の
+            // constants.py で一致を確認した値 (2026-10-21)。type 24 は I8、
+            // 29 は IQ1_M であって TQ1_0 ではない。番号を入れ替えないこと。
+            29 => GgmlType::Iq1M,
             30 => GgmlType::Bf16,
+            34 => GgmlType::Tq1_0,
             39 => GgmlType::Mxfp4,
             _ => return None,
         })
@@ -76,10 +83,11 @@ impl GgmlType {
             GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => 1,
             GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1
             | GgmlType::Q8_0 | GgmlType::IQ4Nl | GgmlType::Mxfp4 => 32,
-            // K 系・IQ 系スーパーブロック
+            // K 系・IQ 系・TQ 系スーパーブロック
             GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K
             | GgmlType::IQ2Xxs | GgmlType::IQ2Xs | GgmlType::IQ3Xxs | GgmlType::IQ1S
-            | GgmlType::IQ3S | GgmlType::IQ2S | GgmlType::IQ4Xs => 256,
+            | GgmlType::IQ3S | GgmlType::IQ2S | GgmlType::IQ4Xs | GgmlType::Iq1M
+            | GgmlType::Tq1_0 => 256,
         }
     }
 
@@ -105,6 +113,10 @@ impl GgmlType {
             GgmlType::IQ3S => 110,
             GgmlType::IQ2S => 82,
             GgmlType::IQ4Xs => 136,
+            // block_iq1_m = qs[32] + qh[16] + scales[8] = 56 (d は scales に分散)
+            GgmlType::Iq1M => 56,
+            // block_tq1_0 = qs[48] + qh[4] + d(f16) = 54
+            GgmlType::Tq1_0 => 54,
         }
     }
 }
@@ -565,6 +577,90 @@ fn dequant_block(ty: GgmlType, x: &[u8], y: &mut [f32]) {
                     yi += 8;
                 }
             }
+        }
+
+        // ---- TQ1_0: qs[48] + qh[4] + d (f16) --------------------------------------
+        //
+        // 形式は llama.cpp ggml-common.h / ggml-quants.c (MIT) 準拠・実装は独自。
+        // 1 バイトに三値 (-1/0/+1) を 5 つ詰める。バイトは 0..242 の三進数を
+        // 0..256 へ切り上げで写したもので、値は byte/256 の三進小数の桁
+        // (最上位が桁 0) を -1/0/+1 に戻したもの。ggml は割り算を避けて
+        //   xi = ((u8)(byte * 3^n) * 3) >> 8
+        // で桁を取り出す。ここも同じ整数手順を使う (ビット一致のため)。
+        // 要素順: qs の先頭 32 バイト x 5 桁 -> 残り 16 バイト x 5 桁 -> qh 4 x 4 桁。
+        GgmlType::Tq1_0 => {
+            const POW3: [u32; 5] = [1, 3, 9, 27, 81];
+            let d = f16_to_f32(&x[52..54]);
+            let mut yi = 0usize;
+            for (start, count) in [(0usize, 32usize), (32, 16)] {
+                for n in 0..5 {
+                    for m in 0..count {
+                        // C: uint8_t q = qs * pow3[n]; (int で乗じて u8 へ切り詰め)
+                        let q = (x[start + m] as u32 * POW3[n]) as u8;
+                        let xi = ((q as u16 * 3) >> 8) as i32;
+                        y[yi] = (xi - 1) as f32 * d;
+                        yi += 1;
+                    }
+                }
+            }
+            for n in 0..4 {
+                for j in 0..4 {
+                    let q = (x[48 + j] as u32 * POW3[n]) as u8;
+                    let xi = ((q as u16 * 3) >> 8) as i32;
+                    y[yi] = (xi - 1) as f32 * d;
+                    yi += 1;
+                }
+            }
+            debug_assert_eq!(yi, QK_K);
+        }
+
+        // ---- IQ1_M: qs[32] + qh[16] + scales[8] -----------------------------------
+        //
+        // 形式は llama.cpp ggml-common.h / ggml-quants.c (MIT) 準拠・実装は独自。
+        // ブロックに d は無く、scales[8] を u16[4] (LE) として読んだ上位ニブルに
+        // f16 の d が 4 分割で入っている。32 要素ごとに 2 つの 3bit scale
+        // (2*s+1 倍)、8 要素グリッド iq1s_grid (2048 エントリ) の 11bit
+        // インデックス、±0.125 のデルタで値を組み立てる。
+        GgmlType::Iq1M => {
+            let qs = &x[0..32];
+            let qh = &x[32..48];
+            let sc = [rd_u16(x, 48), rd_u16(x, 50), rd_u16(x, 52), rd_u16(x, 54)];
+            // d は 4 ワードの上位ニブルに分散している (iq1m_scale_t の組み立てと同一)
+            let d_bits = (sc[0] >> 12)
+                | ((sc[1] >> 8) & 0x00f0)
+                | ((sc[2] >> 4) & 0x0f00)
+                | (sc[3] & 0xf000);
+            let d = half::f16::from_bits(d_bits).to_f32();
+            let mut yi = 0usize;
+            for ib in 0..QK_K / 32 {
+                let s = sc[ib / 2];
+                let shift = 6 * (ib % 2);
+                let dl1 = d * ((2 * ((s >> shift) & 7) + 1) as f32);
+                let dl2 = d * ((2 * ((s >> (shift + 3)) & 7) + 1) as f32);
+                let (h0, h1) = (qh[2 * ib], qh[2 * ib + 1]);
+                // 11bit グリッド番号: qs の 8bit + qh の 3bit (上位 / 中位)
+                let idx = [
+                    qs[4 * ib] as usize | (((h0 as usize) << 8) & 0x700),
+                    qs[4 * ib + 1] as usize | (((h0 as usize) << 4) & 0x700),
+                    qs[4 * ib + 2] as usize | (((h1 as usize) << 8) & 0x700),
+                    qs[4 * ib + 3] as usize | (((h1 as usize) << 4) & 0x700),
+                ];
+                let delta = [
+                    if h0 & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
+                    if h0 & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
+                    if h1 & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
+                    if h1 & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
+                ];
+                for l in 0..4 {
+                    let dl = if l < 2 { dl1 } else { dl2 };
+                    let grid = IQ1S_GRID[idx[l]].to_le_bytes();
+                    for j in 0..8 {
+                        y[yi + j] = dl * ((grid[j] as i8 as f32) + delta[l]);
+                    }
+                    yi += 8;
+                }
+            }
+            debug_assert_eq!(yi, QK_K);
         }
 
         // ---- IQ4_NL: d + qs[16] (32 要素) ------------------------------------------
