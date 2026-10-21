@@ -3047,6 +3047,46 @@ the cause is the n-sized buffers themselves, not the thread count.
 - **Not measured here**: the denno-engine / denno-server test counts, GPU anchors, and the behaviour of
   the live 8095 server. Those belong to the supervisor's gates.
 
+### s159: Task K2 - TQ1_0 / IQ1_M pinned bit-for-bit against the llama.cpp reference, and the bitexact test moved into the default gate (2026-10-22) done
+
+> The two types added in K1 (`2344f67`) had never been compared against the reference implementation,
+> because the fixture did not carry them. `dequant_ref.bin` is now regenerated with 20 types and the
+> `#[ignore]` is gone. All 20 types are BIT-EXACT.
+
+- **Generator (`ref/dequant_ref.c`)**: TQ1_0 (ggml type 34) and IQ1_M (type 29) sections are appended
+  **after** the existing 18. The expected values are the output of llama.cpp's `dequantize_row_tq1_0` /
+  `dequantize_row_iq1_m` **linked and called directly** - nothing was hand-computed. The block structs
+  are `block_tq1_0` (54 B) / `block_iq1_m` (56 B) from `ggml-common.h` via `sizeof`, and the
+  `iq1s_grid` table IQ1_M indexes comes in through ggml-quants.c's `GGML_COMMON_IMPL_C` include
+  (no extra table init and no extra stub was needed).
+- **Build (measured)**: `gcc -O2 -I<llama.cpp>/ggml/include -I<llama.cpp>/ggml/src -o dequant_ref
+  ref/dequant_ref.c <llama.cpp>/ggml/src/ggml-quants.c -lm` works. llama.cpp used:
+  `/work/llama.cpp` HEAD `59d5fad`.
+- **Pipeline check**: regenerating with the pre-K2 generator reproduced the old fixture exactly,
+  md5 `36acb59aefdb6fd10d2a0fbcaf532fac` (the 232815 bytes after the section-count u32 are identical).
+  After adding the two types the existing 18 sections are still byte-identical.
+- **New fixture**: 20 sections / **267381 bytes** (under the 300 KB limit) /
+  md5 `fe45c5bfee2d0678a5da1f70b86d258e`. No existing type was dropped.
+- **Test**: `#[ignore]` removed from `kquant_dequant_bitexact_vs_llama_cpp`.
+  `cargo test -p denno-engine --release --test dequant_ref` gives **6 passed / 0 failed / 0 ignored**:
+  all 20 types print `BIT-EXACT` (TQ1_0 / IQ1_M at 4096 elements each) plus the 5 self-contained K1
+  tests. The `DEQUANT_REF` override is kept for regeneration.
+- **Failure messages**: (a) missing fixture -> path, cwd and the regeneration pointer; (b) section
+  count != 20 -> says explicitly that an old fixture may be in use; (c) 20 sections but no TQ1_0 /
+  IQ1_M -> prints the section names and fails; (d) truncated fixture -> fails with the offset. (a) and
+  (b) were triggered for real to confirm the wording.
+- **Optimisation-level dependence (measured)**: a `-O0` build produces different f32 output for
+  IQ3_XXS than `-O2` (divergence from byte 168337: 0x7f vs 0xff). The committed fixture is `-O2`, so
+  regeneration must use `-O2`. TQ1_0 / IQ1_M were identical between `-O0` and `-O2`. This is noted in
+  `ref/README.md`.
+- **License**: the new `ref/README.md` documents the regeneration steps and attribution. Reference is
+  llama.cpp `ggml-quants.c` / `ggml-common.h`, **MIT** (Copyright (c) 2023-2026 The ggml authors); this
+  repo is **MIT OR Apache-2.0**. The generator only links and calls the functions (no code taken in)
+  and the fixture is output data. No GPL code.
+- **Numeric class**: none of R1-R4 applies. No `.cu` / `.ptx` and no numeric path change.
+- **Not measured here**: GPU anchors, the live 8095 behaviour, the denno-server test count. Those
+  belong to the supervisor's gates.
+
 ### Benchmark summary (as of 2026-10-20, this host)
 
 Measurement rule: the official prefill value is cold single-shot (server start -> one request,
