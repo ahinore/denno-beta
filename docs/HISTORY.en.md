@@ -2876,6 +2876,57 @@ the cause is the n-sized buffers themselves, not the thread count.
   `local/qwen35-9b` = 32 / 4096 / 248320 / 262144 (family `qwen3_5_text` for both).
   denno-cli 5 passed, denno-engine lib 262 passed / 1 ignored, no regression.
 
+### s157: Task B19 - `DENNO_PROFILE_SAMPLE` cuts measurement inflation, and gap_fwd gets 7 named stages (2026-10-21) done
+
+> B18's measurement (table C, 92 steps) read 131.8 ms/step instrumented while the real KPI
+> was 55.1 ms/token: **the measurement was changing what it measured** (392 linear D2H
+> calls per step, each timed individually). This adds a step-level sampling env var and
+> names the stages inside `sl_so_gap_fwd`, which held 41% of the instrumented step.
+
+- **`DENNO_PROFILE_SAMPLE=N`** (`prof.rs`): take spans on 1 step out of N. The default is
+  `1`, which is bit-for-bit the old behaviour. Unset / empty / `0` / non-numeric fall back
+  to `1` ("don't measure" is `DENNO_PROFILE`'s job, so we don't silently land there).
+  `N` is capped at 1,000,000 (step-index saturation). The env var is read once (`OnceLock`).
+- **What a skipped step does**: `span_begin` returns `None` **without reading
+  `Instant::now()`**, and `push` / `split_sample` accumulate zero ns. Only the **tick
+  count** is accumulated — the table must still say "how many steps of how many were
+  sampled". Averages divide by `serve_samples` / `serve_lin_samples` (what was actually
+  measured); we never scale up to all steps (multiplication is a distribution assumption,
+  the tick count is a fact).
+- **Display**: one line at the top of table C —
+  `SPLIT SERVE sampling: N=… | steps seen … | steps measured … | lin calls measured … |
+  spans skipped …`. `spans skipped` counts spans closed without being opened **inside a
+  step**, i.e. the symptom that wait time is concentrating in sampled steps.
+- **`sl_so_gap_fwd` breakdown (7 stages, all `sl_gap_*`)**: `sl_gap_embed` /
+  `sl_gap_rmsnorm` (twice per layer) / `sl_gap_gdn` / `sl_gap_attn` / `sl_gap_rope` /
+  `sl_gap_quant` / `sl_gap_ffn`. `sl_gap_rope` is **contained in** attn, so the displayed
+  `sl_gap_attn` is net of rope — that makes the 7 stages exclusive, and their sum plus
+  `sl_gap_resid` equals `sl_so_gap_fwd` (the residual row is printed even when it is 0).
+  `sl_gap_quant` is **structurally 0 on the q4 path**: weights are pre-quantized and
+  activations stay f32 into the GEMV, so nothing quantizes during serve (int8 activation
+  quantization lands in `sl_lin_quant`, a child of `sl_lin`). It is printed as 0 as a
+  property of the path, not as a hole.
+- **Path difference**: the 27B q4 per-op path measures `sl_gap_*` directly. The 9B int8
+  chain path already measures `sl_lay_*`, so we fall back to their sum only when the
+  `sl_gap_*` tick count is 0 (never adding both — no double counting).
+- **Nothing is measured outside a step**: the stages are opened with
+  `span_begin_in_step()` (a standalone forward, prefill, or a model unit test has no open
+  step, so it reads no clock and pushes no row). This keeps `sl_gap_*` ticks at
+  "serve steps × layers".
+- **B16's identity is untouched**: `sl_gap_*` are children *inside* `sl_so_gap_fwd`, so
+  they are not siblings of `sl_step_other` (`SL_GROUPS[0]` is unchanged).
+- **Tests** (the diff had zero `#[test]` before): `parse_sample_every` boundaries (unset /
+  `""` / `"0"` / `"abc"` / `"-3"` / `"1.5"` / `"1"` / `"16"` / above the cap / u64
+  overflow), `sample_hit` periodicity (N=1/3/16/cap), skipped steps growing ticks but not
+  `SPLIT_NS`, and a **CPU fixture** (synthetic events in, bucket table out) pinning
+  "sum + residual = gap_fwd", "residual < 10%", "identical row names for N=1 and N=16" and
+  "identical measured values". No GPU. denno-engine lib **262 → 268 passed** /
+  denno-server 37 passed.
+- **Prediction** (hardware measurement is the supervisor's): the inflation at
+  `DENNO_PROFILE=1 DENNO_PROFILE_SAMPLE=16` is **under 10%**, because clock reads per step
+  drop to ~1/16 and the remaining fixed cost is one table update per step — to be
+  confirmed on hardware.
+
 ### Benchmark summary (as of 2026-10-20, this host)
 
 Measurement rule: the official prefill value is cold single-shot (server start -> one request,
