@@ -3062,6 +3062,58 @@ s122 のハンドオフはそれを「s118 で設計済み」と読んで再実�
 - **測っていないこと**: GPU アンカー、8095 の実機挙動、`denno-server` のテスト数。
   これらは supervisor 側の関門で確認する。
 
+### s161: Task K3 - Q4_0 (ggml type 2) のエッジブロックを参照実装とビット一致で固定し、CPU gemv の累積順を固定した (2026-10-22) 完了
+
+> 27B 本番の重みは Q4_0 (ggml type 2)。K2 の fixture には擬似乱数の `Q4_0` セクションが
+> 既にあり、`kquant_dequant_bitexact_vs_llama_cpp` はそれも突き合わせていた
+> (「Q4_0 のセクションが無い」という前提は誤りだった)。ただし乱数 16 ブロックは
+> 負の d・全ゼロのニブル・最大ニブルを必ず含む保証が無い。そこで決定論的な
+> エッジ列を**別セクション**として足し、専用テストと CPU gemv の累積順の固定を入れた。
+> 数値経路 (実装) は無変更。
+
+- **生成器 (`ref/dequant_ref.c`)**: `emit_q4_0_edge()` を追加し、既存 20 セクションの
+  **後ろ**に `Q4_0_EDGE` を 1 つ足した (合計 21)。ブロックは `ggml-common.h` の
+  `block_q4_0` (`ggml_half d; uint8_t qs[16]`、18 B) をそのまま使い、期待値は
+  llama.cpp の `dequantize_row_q4_0` を直接リンクして呼んだ出力そのもの
+  (手計算・近似は無し)。6 ブロックの内訳: (0) d = -1.5 / 下位ニブル 0..15、
+  (1) d = +0.5 で qs 全 0x00 (全ニブル 0 → q = -8)、(2) d = +0.5 で qs 全 0xFF
+  (全ニブル 15 → q = +7)、(3) d = -0.75 で qs 全 0xFF、(4) d = +2.0 で上下別パターン、
+  (5) d = +0.0 (積が -0.0 になる)。d はすべて f16 で厳密な値
+  (0xBE00 / 0x3800 / 0xBA00 / 0x4000 / 0x0000)。
+- **パイプラインの検証**: K3 前の生成器で再生成すると commit 済み 20 セクション fixture と
+  md5 `fe45c5bfee2d0678a5da1f70b86d258e` で**完全一致**。追加後も既存 20 セクションの
+  生バイトと f32 出力は 1 バイトも変わっていない (全セクションを比較して確認)。
+- **新しい fixture**: 21 セクション / **268278 バイト** (300 KB 上限内) /
+  md5 `eeff5cb0c11a73db7972e264fae5c2b4`。Q4_0_EDGE は 108 生バイト + 192 f32。
+- **テスト 1 (既定ゲート)**: `q4_0_dequant_bitexact_vs_llama_cpp_edge_blocks` を追加。
+  `Q4_0_EDGE` の 192 要素を **デコード後の f32 バイト (`to_bits`)** で比較し、
+  さらにセクションが「負の d」「全ゼロのニブル」「最大ニブル」を実際に含むこと、
+  全ゼロが -8*d = -4.0、最大ニブルが +7*d = 3.5、d = +0.0 の上位ニブルが -0.0 に
+  なることを検査する。`kquant_dequant_bitexact_vs_llama_cpp` は 21 セクション期待に
+  更新し、`Q4_0` / `Q4_0_EDGE` を必須型に加えた。
+- **テスト 2 (累積順の固定)**: `q4_gemv_accumulation_order_is_sequential_in_block_order`
+  (lib)。`tensor::matvec_rows_bt_q4_into` の f32 内積が **ブロック 0..nb-1 の順、
+  各ブロック内は要素 0..31 の順**の逐次 1 アキュムレータであることを、
+  k = 96 (3 ブロック) の 1 出力を `0xca7b15f7` に固定して検査する。同じ項列の
+  pairwise 和 (`0xca7b15f9`)・2 アキュムレータ和 (`0xca7b15fa`)・逆順 (`0xca7b15f9`)・
+  単一丸め (fma 相当、`0xca7b15f5`) が**すべて別の値**になることも同時に確認するので、
+  順序・融合が変われば必ず落ちる。実装は読んだ結果すでに文書化された順序で、
+  変更は不要だった (実装側の変更は 0 行)。
+- **ゲート (実測)**: `cargo test -p denno-engine --lib` = **270 passed / 0 failed /
+  1 ignored** (K3 前は 269 passed。最初の 1 回だけ `prof::tests::
+  attn_core_is_split_into_gdn_and_full_rows` が落ちたが、単独実行と再実行で pass
+  — 既知の大域カウンタ共有による flaky)。`--test dequant_ref` (release) =
+  **7 passed / 0 failed / 0 ignored**。`cargo test -p denno-server --lib` =
+  **37 passed / 0 failed**。
+- **ライセンス**: 参照元は llama.cpp `ggml/src/ggml-quants.c` (MIT, Copyright (c)
+  2023-2026 The ggml authors)、本リポジトリは **MIT OR Apache-2.0**。生成器は関数を
+  リンクして呼ぶだけで取り込み無し、fixture は出力データ。GPL のコードは無し。
+- **数値クラス**: 該当なし (R1-R4 のいずれでもない)。数値経路・`.cu` / `.ptx` は無変更
+  (追加したのはテストと fixture と文書のみ)。
+- **測っていないこと**: GPU 側の Q4_0 経路 (`cuda.rs` の gemv / GEMM、デバイス上の
+  デ量子化) の累積順とビット一致、GPU アンカー、KPI、8095 の実機挙動。
+  Q4_0 以外の型 (Q4_1 / Q5_0 など) の再検証もしていない (fixture は不変)。
+
 ### ベンチマーク一覧 (2026-10-20 時点・このホスト)
 
 測定規則: prefill の正式値は cold 単発 (サーバ起動 -> 1 リクエスト、prefix cache off、

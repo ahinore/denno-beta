@@ -3087,6 +3087,62 @@ the cause is the n-sized buffers themselves, not the thread count.
 - **Not measured here**: GPU anchors, the live 8095 behaviour, the denno-server test count. Those
   belong to the supervisor's gates.
 
+### s161: Task K3 - Q4_0 (ggml type 2) edge blocks pinned bit-for-bit against the reference, CPU gemv accumulation order pinned (2026-10-22) done
+
+> The 27B production weights are Q4_0 (ggml type 2). The K2 fixture already carried a
+> pseudo-random `Q4_0` section, and `kquant_dequant_bitexact_vs_llama_cpp` was already
+> comparing it (the premise "there is no Q4_0 section" was wrong). But 16 random blocks do
+> not guarantee a negative d, all-zero nibbles or the maximum nibble. So a deterministic
+> edge sequence was added as a **separate section**, together with a dedicated test and a
+> pin on the CPU gemv accumulation order. No numeric path (implementation) change.
+
+- **Generator (`ref/dequant_ref.c`)**: added `emit_q4_0_edge()`, appending one `Q4_0_EDGE`
+  section **after** the existing 20 (21 total). Blocks use `block_q4_0` from
+  `ggml-common.h` (`ggml_half d; uint8_t qs[16]`, 18 B) as-is, and the expected values are
+  the output of llama.cpp's `dequantize_row_q4_0` linked and called directly (nothing
+  hand-computed or approximated). The 6 blocks: (0) d = -1.5 / low nibbles 0..15,
+  (1) d = +0.5 with qs all 0x00 (all nibbles 0 -> q = -8), (2) d = +0.5 with qs all 0xFF
+  (all nibbles 15 -> q = +7), (3) d = -0.75 with qs all 0xFF, (4) d = +2.0 with distinct
+  upper/lower patterns, (5) d = +0.0 (products become -0.0). Every d is exactly
+  representable in f16 (0xBE00 / 0x3800 / 0xBA00 / 0x4000 / 0x0000).
+- **Pipeline check**: regenerating with the pre-K3 generator reproduces the committed
+  20-section fixture exactly, md5 `fe45c5bfee2d0678a5da1f70b86d258e`. After the addition the
+  raw bytes and f32 output of all existing 20 sections are unchanged (every section
+  compared).
+- **New fixture**: 21 sections / **268278 bytes** (under the 300 KB limit) /
+  md5 `eeff5cb0c11a73db7972e264fae5c2b4`. Q4_0_EDGE is 108 raw bytes + 192 f32.
+- **Test 1 (default gate)**: added `q4_0_dequant_bitexact_vs_llama_cpp_edge_blocks`.
+  It compares the 192 elements of `Q4_0_EDGE` on the **dequantized f32 bytes (`to_bits`)**,
+  and also checks that the section really contains a negative d, all-zero nibbles and the
+  maximum nibble, that all-zero decodes to -8*d = -4.0, the maximum nibble to +7*d = 3.5,
+  and the upper nibbles of the d = +0.0 block to -0.0.
+  `kquant_dequant_bitexact_vs_llama_cpp` now expects 21 sections and requires
+  `Q4_0` / `Q4_0_EDGE`.
+- **Test 2 (accumulation order)**: `q4_gemv_accumulation_order_is_sequential_in_block_order`
+  (lib). It pins the f32 dot product of `tensor::matvec_rows_bt_q4_into` to **block 0..nb-1
+  in order, elements 0..31 within each block**, one sequential accumulator, by fixing one
+  output at k = 96 (3 blocks) to `0xca7b15f7`. It also checks that a pairwise sum
+  (`0xca7b15f9`), a two-accumulator sum (`0xca7b15fa`), the reverse order (`0xca7b15f9`) and
+  a single-rounding (fma-like) accumulation (`0xca7b15f5`) of the same terms are **all
+  different values**, so any reordering or fusion fails the test. Reading the
+  implementation showed it already follows the documented order, so no change was needed
+  (0 lines changed in the implementation).
+- **Gates (measured)**: `cargo test -p denno-engine --lib` = **270 passed / 0 failed /
+  1 ignored** (269 passed before K3; the very first run failed once in
+  `prof::tests::attn_core_is_split_into_gdn_and_full_rows`, which passes standalone and on
+  rerun - the known flaky test that shares global counters). `--test dequant_ref` (release)
+  = **7 passed / 0 failed / 0 ignored**. `cargo test -p denno-server --lib` =
+  **37 passed / 0 failed**.
+- **License**: reference is llama.cpp `ggml/src/ggml-quants.c` (MIT, Copyright (c)
+  2023-2026 The ggml authors); this repo is **MIT OR Apache-2.0**. The generator only links
+  and calls the functions (no code taken in) and the fixture is output data. No GPL code.
+- **Numeric class**: none of R1-R4 applies. No numeric path and no `.cu` / `.ptx` change
+  (only tests, the fixture and docs were added).
+- **Not measured here**: the GPU Q4_0 path (`cuda.rs` gemv / GEMM, on-device dequant) and
+  its accumulation order / bit-identity, GPU anchors, KPI, the live 8095 behaviour. Types
+  other than Q4_0 (Q4_1 / Q5_0 etc.) were not re-verified either (their fixture bytes are
+  unchanged).
+
 ### Benchmark summary (as of 2026-10-20, this host)
 
 Measurement rule: the official prefill value is cold single-shot (server start -> one request,

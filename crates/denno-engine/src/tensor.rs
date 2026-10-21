@@ -1263,6 +1263,126 @@ mod tests {
         }
     }
 
+    /// s123 の Q4_0 CPU GEMV (`tensor::matvec_rows_bt_q4_into`) の **累積順** を固定する (Task K3)。
+    ///
+    /// 固定する契約: f32 の内積は **ブロック 0..nb-1 の順、各ブロック内は要素 0..31 の順**
+    /// で、逐次 1 本のアキュムレータに足す (`for dd in 0..k { acc += a[dd] * w[dd] }`)。
+    /// 並べ替え・pairwise 和・FMA (積と和を 1 回の丸めで行う) のいずれも不可で、
+    /// 各項は `d*q` (Q4_0 のデ量子化) と `a*w` の 2 回の丸めを経る。
+    ///
+    /// `PINNED` は実装を読んだうえで同じ演算列を書き下して得た値 (実装の出力と
+    /// ビット一致を確認済み)。桁が 1e-6〜1e6 に散らばり途中で大きな打ち消しが
+    /// 起きる入力を選んであるので、順序を変えると必ず別の値になる。よって
+    /// 下の 4 つの対照 (pairwise / 2 アキュムレータ / 単一丸め / 逆順) と
+    /// すべて異なることも同時に検査する。
+    #[test]
+    fn q4_gemv_accumulation_order_is_sequential_in_block_order() {
+        // k = 96 = 3 ブロック。d は f16 で厳密な 0.5 / -0.75 / 0.5 (0x3800 / 0xBA00)。
+        let k = 96usize;
+        let ds = [0.5f32, -0.75f32, 0.5f32];
+        let mut blocks = vec![0u8; 3 * 18];
+        let mut w = vec![0f32; k];
+        for b in 0..3usize {
+            let d_bits: u16 = if ds[b] > 0.0 { 0x3800 } else { 0xBA00 };
+            blocks[b * 18..b * 18 + 2].copy_from_slice(&d_bits.to_le_bytes());
+            for j in 0..16usize {
+                let byte = ((j * 13 + 5 + b * 37) & 0xff) as u8;
+                blocks[b * 18 + 2 + j] = byte;
+                let q0 = ((byte & 0x0f) as i32 - 8) as f32;
+                let q1 = ((byte >> 4) as i32 - 8) as f32;
+                w[b * 32 + j] = ds[b] * q0;
+                w[b * 32 + 16 + j] = ds[b] * q1;
+            }
+        }
+
+        // a は桁を広く散らす (決定論的 LCG・シード 1)。丸めの順序に敏感な入力。
+        const POW10: [f32; 13] = [
+            1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6,
+        ];
+        let mut s = 1u32;
+        let mut a = vec![0f32; k];
+        for x in a.iter_mut() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let u = ((s >> 8) as f32) / ((1u32 << 24) as f32);
+            *x = (u * 2.0 - 1.0) * POW10[((s >> 3) % 13) as usize];
+        }
+
+        const PINNED: u32 = 0xca7b_15f7;
+        let mut got = [0f32; 1];
+        matvec_rows_bt_q4_into(&a, &blocks, k, 1, 1, &mut got);
+
+        // 逐次 (ブロック順・ブロック内 0..31 昇順) の書き下し
+        let mut want = 0f32;
+        for dd in 0..k {
+            want += a[dd] * w[dd];
+        }
+        assert_eq!(
+            want.to_bits(),
+            PINNED,
+            "テスト側の書き下しが固定値と違う (式か丸めが変わった)"
+        );
+        assert_eq!(
+            got[0].to_bits(),
+            PINNED,
+            "Q4_0 gemv の累積順が変わった: got={}({:#x}) sequential={}",
+            got[0],
+            got[0].to_bits(),
+            want
+        );
+
+        // --- 対照: どれも PINNED と違う値になること (入力が順序に敏感である証明) ---
+        fn pairwise(t: &[f32]) -> f32 {
+            if t.len() <= 2 {
+                let mut s = 0f32;
+                for v in t {
+                    s += *v;
+                }
+                s
+            } else {
+                let m = t.len() / 2;
+                pairwise(&t[..m]) + pairwise(&t[m..])
+            }
+        }
+        let terms: Vec<f32> = (0..k).map(|dd| a[dd] * w[dd]).collect();
+        assert_ne!(
+            pairwise(&terms).to_bits(),
+            PINNED,
+            "pairwise 和が逐次と同じ値 (この入力では順序を検査できない)"
+        );
+        let (mut e0, mut e1) = (0f32, 0f32);
+        for (i, t) in terms.iter().enumerate() {
+            if i % 2 == 0 {
+                e0 += *t;
+            } else {
+                e1 += *t;
+            }
+        }
+        assert_ne!(
+            (e0 + e1).to_bits(),
+            PINNED,
+            "2 アキュムレータ和が逐次と同じ値 (この入力では順序を検査できない)"
+        );
+        let mut rev = 0f32;
+        for dd in (0..k).rev() {
+            rev += a[dd] * w[dd];
+        }
+        assert_ne!(
+            rev.to_bits(),
+            PINNED,
+            "逆順の和が逐次と同じ値 (この入力では順序を検査できない)"
+        );
+        // 単一丸め (fma 相当。f64 で積和を 1 回だけ f32 へ丸める近似) でも別の値。
+        let mut fma = 0f32;
+        for dd in 0..k {
+            fma = (fma as f64 + a[dd] as f64 * w[dd] as f64) as f32;
+        }
+        assert_ne!(
+            fma.to_bits(),
+            PINNED,
+            "単一丸めの和が逐次と同じ値 (fma 化を検出できない)"
+        );
+    }
+
     #[test]
     fn rope_row_matches_rope_rows_single_position() {
         // rope_row は rope_rows の 1 行処理と完全同一 (リファクタリングの保証)

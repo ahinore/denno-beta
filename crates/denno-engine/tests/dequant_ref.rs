@@ -3,7 +3,7 @@
 //! `ref/dequant_ref.c` (ggml-quants.c を直接リンク) が生成した擬似ランダム
 //! ブロック列とその f32 出力を突き合わせる。**1 bit も違わないこと**が契約。
 //! 既定の `cargo test -p denno-engine --release --test dequant_ref` で走る
-//! (fixture は `tests/data/dequant_ref.bin` に commit 済み・20 型)。
+//! (fixture は `tests/data/dequant_ref.bin` に commit 済み・21 セクション)。
 //!
 //! 再生成するときだけ `DEQUANT_REF=<path>` で別の fixture を指せる。
 //! 生成手順は `ref/README.md` を参照。
@@ -12,16 +12,19 @@ use std::env;
 
 use denno_engine::kquant::{dequant_row, GgmlType};
 
-/// fixture が持つべきセクション数 (18 型 + K2 の TQ1_0 / IQ1_M)。
-const N_SECTIONS: usize = 20;
+/// fixture が持つべきセクション数 (18 型 + K2 の TQ1_0 / IQ1_M + K3 の Q4_0_EDGE)。
+const N_SECTIONS: usize = 21;
 /// このテストが必ず通す型。fixture が古くて欠けていたら明示的に落とす。
-const REQUIRED: [&str; 2] = ["TQ1_0", "IQ1_M"];
+/// Q4_0 は 27B 本番が実際に serving している形式 (ggml type 2)。
+const REQUIRED: [&str; 4] = ["Q4_0", "Q4_0_EDGE", "TQ1_0", "IQ1_M"];
 const DEFAULT_FIXTURE: &str = "tests/data/dequant_ref.bin";
 
 fn type_from_name(name: &str) -> GgmlType {
     match name {
         "Q8_0" => GgmlType::Q8_0,
         "Q4_0" => GgmlType::Q4_0,
+        // K3: Q4_0 のエッジブロック列も同じ型 (type 2) のデコーダで読む
+        "Q4_0_EDGE" => GgmlType::Q4_0,
         "Q4_1" => GgmlType::Q4_1,
         "Q5_0" => GgmlType::Q5_0,
         "Q5_1" => GgmlType::Q5_1,
@@ -126,6 +129,109 @@ fn kquant_dequant_bitexact_vs_llama_cpp() {
              K2 で追加した型を検証できないので、ref/README.md の手順で再生成する"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Q4_0 (ggml type 2): 27B 本番が serving している形式の参照突き合わせ (Task K3)
+// ---------------------------------------------------------------------------
+
+/// fixture から 1 セクションだけ取り出す。無い / 壊れていれば理由付きで落とす。
+fn fixture_section(want: &str) -> (Vec<u8>, Vec<f32>) {
+    let path = env::var("DEQUANT_REF").unwrap_or_else(|_| DEFAULT_FIXTURE.into());
+    let data = std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("リファレンス {path} を読めない: {e} (再生成は ref/README.md)"));
+    let mut p = 0usize;
+    let rd_u32 = |p: &mut usize| -> u32 {
+        assert!(*p + 4 <= data.len(), "リファレンス {path} が途中で切れている");
+        let v = u32::from_le_bytes(data[*p..*p + 4].try_into().unwrap());
+        *p += 4;
+        v
+    };
+    let n_secs = rd_u32(&mut p) as usize;
+    for _ in 0..n_secs {
+        let nl = rd_u32(&mut p) as usize;
+        assert!(p + nl <= data.len(), "リファレンス {path}: 型名が切れている");
+        let name = String::from_utf8(data[p..p + nl].to_vec()).unwrap();
+        p += nl;
+        let nb = rd_u32(&mut p) as usize;
+        assert!(p + nb <= data.len(), "リファレンス {path}: {name} の生バイトが切れている");
+        let raw = data[p..p + nb].to_vec();
+        p += nb;
+        let nf = rd_u32(&mut p) as usize;
+        assert!(p + 4 * nf <= data.len(), "リファレンス {path}: {name} の f32 出力が切れている");
+        let mut y = vec![0f32; nf];
+        for w in y.iter_mut() {
+            *w = f32::from_le_bytes(data[p..p + 4].try_into().unwrap());
+            p += 4;
+        }
+        if name == want {
+            return (raw, y);
+        }
+    }
+    panic!("fixture {path} に {want} セクションが無い (ref/README.md の手順で再生成する)");
+}
+
+/// Q4_0 (ggml type 2) のデ量子化を参照実装と **f32 バイト単位で** 突き合わせる。
+///
+/// 27B 本番の重みは Q4_0 なので、実際に serving している形式を llama.cpp の
+/// `dequantize_row_q4_0` と比較するのがこのテストの目的。比較対象は
+/// デコード後の f32 (`to_bits`) で、生バイトの一致ではない。
+///
+/// セクション `Q4_0_EDGE` は `ref/dequant_ref.c` の `emit_q4_0_edge` が
+/// 6 ブロックを明示的に作ったもの (期待値は参照実装の出力そのもの):
+/// 負の d / 全ゼロのニブル / 最大ニブル / 負の d + 最大ニブル / 上下で別パターン /
+/// d = +0.0。擬似乱数の `Q4_0` セクションだけでは踏めない符号と +8 オフセットを
+/// ここで確実に通す。
+#[test]
+fn q4_0_dequant_bitexact_vs_llama_cpp_edge_blocks() {
+    let (raw, want) = fixture_section("Q4_0_EDGE");
+    assert_eq!(raw.len(), 6 * 18, "Q4_0_EDGE は 6 ブロック (18 バイト/ブロック)");
+    assert_eq!(want.len(), 6 * 32);
+
+    // 前提: セクションが「負の d」「全ゼロのニブル」「最大ニブル」を実際に含むこと。
+    // 含まなければこのテストは符号と +8 オフセットを踏めていない (fixture の退行)。
+    let blocks: Vec<&[u8]> = raw.chunks_exact(18).collect();
+    assert!(
+        blocks.iter().any(|b| b[1] & 0x80 != 0),
+        "負の d のブロックが無い"
+    );
+    assert!(
+        blocks.iter().any(|b| b[2..].iter().all(|q| *q == 0x00)),
+        "全ゼロのニブルのブロックが無い"
+    );
+    assert!(
+        blocks.iter().any(|b| b[2..].iter().all(|q| *q == 0xff)),
+        "最大ニブルのブロックが無い"
+    );
+
+    let got = dequant_row(GgmlType::Q4_0, &raw, want.len());
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            w.to_bits(),
+            "Q4_0_EDGE[{i}]: got {g:.6}({:#x}) want {w:.6}({:#x})",
+            g.to_bits(),
+            w.to_bits()
+        );
+    }
+
+    // +8 オフセットの向き: 全ゼロのニブルは q = -8、最大ニブルは q = +7。
+    // この 2 ブロックの d は 0.5 (f16 0x3800) で厳密なので -4.0 / +3.5 も厳密。
+    assert!(
+        want[32..64].iter().all(|v| v.to_bits() == (-4.0f32).to_bits()),
+        "全ゼロのニブルが -8*d になっていない"
+    );
+    assert!(
+        want[64..96].iter().all(|v| v.to_bits() == 3.5f32.to_bits()),
+        "最大ニブルが +7*d になっていない"
+    );
+    // 符号付きゼロ: d = +0.0 のブロックの上位ニブル (q = -3) は -0.0 になる。
+    assert!(
+        want[5 * 32 + 16..6 * 32]
+            .iter()
+            .all(|v| v.to_bits() == (-0.0f32).to_bits()),
+        "d = +0.0 で -0.0 になっていない"
+    );
 }
 
 // ---------------------------------------------------------------------------
