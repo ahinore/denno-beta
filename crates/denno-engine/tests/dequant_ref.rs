@@ -1,14 +1,22 @@
-//! kquant dequant の llama.cpp ビット一致検証 (P19)。
+//! kquant dequant の llama.cpp ビット一致検証 (P19 / K2)。
 //!
 //! `ref/dequant_ref.c` (ggml-quants.c を直接リンク) が生成した擬似ランダム
 //! ブロック列とその f32 出力を突き合わせる。**1 bit も違わないこと**が契約。
+//! 既定の `cargo test -p denno-engine --release --test dequant_ref` で走る
+//! (fixture は `tests/data/dequant_ref.bin` に commit 済み・20 型)。
 //!
-//! 実行: fixture を生成してから
-//!   DEQUANT_REF=<path> cargo test -p denno-engine --release --lib dequant_ref -- --ignored --nocapture
+//! 再生成するときだけ `DEQUANT_REF=<path>` で別の fixture を指せる。
+//! 生成手順は `ref/README.md` を参照。
 
 use std::env;
 
 use denno_engine::kquant::{dequant_row, GgmlType};
+
+/// fixture が持つべきセクション数 (18 型 + K2 の TQ1_0 / IQ1_M)。
+const N_SECTIONS: usize = 20;
+/// このテストが必ず通す型。fixture が古くて欠けていたら明示的に落とす。
+const REQUIRED: [&str; 2] = ["TQ1_0", "IQ1_M"];
+const DEFAULT_FIXTURE: &str = "tests/data/dequant_ref.bin";
 
 fn type_from_name(name: &str) -> GgmlType {
     match name {
@@ -32,34 +40,60 @@ fn type_from_name(name: &str) -> GgmlType {
         "IQ4_XS" => GgmlType::IQ4Xs,
         "IQ1_M" => GgmlType::Iq1M,
         "TQ1_0" => GgmlType::Tq1_0,
-        other => panic!("未知のセクション {other}"),
+        other => panic!("未知のセクション {other} (fixture とテストの型名がずれている)"),
     }
 }
 
 #[test]
-#[ignore]
 fn kquant_dequant_bitexact_vs_llama_cpp() {
-    let path = env::var("DEQUANT_REF").unwrap_or_else(|_| "tests/data/dequant_ref.bin".into());
-    let data = std::fs::read(&path).unwrap_or_else(|e| panic!("リファレンス {path} を読めない: {e}"));
+    let path = env::var("DEQUANT_REF").unwrap_or_else(|_| DEFAULT_FIXTURE.into());
+    let data = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "リファレンス {path} を読めない: {e}\n\
+             (cwd={:?}) fixture は commit 済みのはず。再生成は ref/README.md の手順で行い、\n\
+             `DEQUANT_REF=<生成した .bin>` でこのテストを再実行してから差し替える。",
+            env::current_dir().ok()
+        )
+    });
+    assert!(
+        data.len() >= 8,
+        "リファレンス {path} が小さすぎる ({} bytes)。壊れた fixture か、別ファイルを指している",
+        data.len()
+    );
     let mut p = 0usize;
     let rd_u32 = |p: &mut usize| {
+        assert!(
+            *p + 4 <= data.len(),
+            "リファレンス {path} が途中で切れている (offset {p})"
+        );
         let v = u32::from_le_bytes(data[*p..*p + 4].try_into().unwrap());
         *p += 4;
         v
     };
     let n_secs = rd_u32(&mut p) as usize;
-    assert!(n_secs >= 15, "セクション数 {n_secs} が少なすぎる");
+    assert_eq!(
+        n_secs, N_SECTIONS,
+        "リファレンス {path} のセクション数が {n_secs} (期待 {N_SECTIONS})。\
+         古い fixture を読んでいる可能性がある — TQ1_0 / IQ1_M を含む 20 型に再生成する手順は ref/README.md"
+    );
     let mut checked = 0usize;
-    for s in 0..n_secs {
+    let mut names: Vec<String> = Vec::new();
+    for _s in 0..n_secs {
         let nl = rd_u32(&mut p) as usize;
+        assert!(p + nl <= data.len(), "リファレンス {path}: 型名が切れている");
         let name = String::from_utf8(data[p..p + nl].to_vec()).unwrap();
         p += nl;
         let nb = rd_u32(&mut p) as usize;
+        assert!(p + nb <= data.len(), "リファレンス {path}: {name} の生バイトが切れている");
         let raw = data[p..p + nb].to_vec();
         p += nb;
         let nf = rd_u32(&mut p) as usize;
+        assert!(
+            p + 4 * nf <= data.len(),
+            "リファレンス {path}: {name} の f32 出力が切れている"
+        );
         let mut want = vec![0f32; nf];
-        for (i, w) in want.iter_mut().enumerate() {
+        for w in want.iter_mut() {
             *w = f32::from_le_bytes(data[p..p + 4].try_into().unwrap());
             p += 4;
         }
@@ -80,10 +114,18 @@ fn kquant_dequant_bitexact_vs_llama_cpp() {
                 w.to_bits()
             ),
         }
+        names.push(name);
         checked += 1;
     }
-    assert_eq!(p, data.len(), "余分なデータがある");
-    assert!(checked >= 15);
+    assert_eq!(p, data.len(), "余分なデータがある ({p} / {} bytes)", data.len());
+    assert_eq!(checked, N_SECTIONS);
+    for req in REQUIRED {
+        assert!(
+            names.iter().any(|n| n == req),
+            "fixture {path} に {req} が無い (セクション: {names:?})。\
+             K2 で追加した型を検証できないので、ref/README.md の手順で再生成する"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

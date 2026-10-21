@@ -3022,6 +3022,46 @@ s122 のハンドオフはそれを「s118 で設計済み」と読んで再実�
 - **測っていないこと**: denno-engine / denno-server のテスト数、GPU アンカー、実機 8095 の挙動。
   これらは supervisor 側の関門で確認する。
 
+### s159: Task K2 - TQ1_0 / IQ1_M を llama.cpp 参照実装とビット一致で固定し、bitexact テストを既定ゲートに入れた (2026-10-22) 完了
+
+> K1 (`2344f67`) で入れた 2 型は、fixture に載っていないため一度も参照実装と
+> 突き合わされていなかった。`dequant_ref.bin` を 20 型に作り直し、`#[ignore]` を外した。
+> 20 型すべて BIT-EXACT。
+
+- **生成器 (`ref/dequant_ref.c`)**: TQ1_0 (ggml type 34) と IQ1_M (type 29) のセクションを
+  既存 18 型の**後ろに追加**した。期待値は llama.cpp の `dequantize_row_tq1_0` /
+  `dequantize_row_iq1_m` を**直接リンクして呼んだ出力**そのもの。ブロック構造体は
+  `ggml-common.h` の `block_tq1_0` (54 B) / `block_iq1_m` (56 B) を `sizeof` で使い、
+  IQ1_M が参照する `iq1s_grid` は ggml-quants.c が `GGML_COMMON_IMPL_C` で取り込む
+  テーブルがそのまま効く (追加のテーブル初期化も追加スタブも不要だった)。
+- **ビルド (実測)**: `gcc -O2 -I<llama.cpp>/ggml/include -I<llama.cpp>/ggml/src
+  -o dequant_ref ref/dequant_ref.c <llama.cpp>/ggml/src/ggml-quants.c -lm` が通る。
+  使用した llama.cpp は `/work/llama.cpp` HEAD `59d5fad`。
+- **生成パイプラインの検証**: 2 型を足す前の生成器で旧 fixture を再生成したところ
+  md5 `36acb59aefdb6fd10d2a0fbcaf532fac` で**完全一致** (セクション数 u32 を除く
+  232815 バイトが同一)。型を足した後も既存 18 セクションのバイト列は不変。
+- **新しい fixture**: 20 セクション / **267381 バイト** (300 KB 上限内) /
+  md5 `fe45c5bfee2d0678a5da1f70b86d258e`。既存 18 型は削っていない。
+- **テスト**: `kquant_dequant_bitexact_vs_llama_cpp` の `#[ignore]` を外した。
+  `cargo test -p denno-engine --release --test dequant_ref` で **6 passed / 0 failed /
+  0 ignored**、内訳は 20 型すべて `BIT-EXACT` (TQ1_0 / IQ1_M は各 4096 要素) と K1 の
+  自己完結テスト 5 件。`DEQUANT_REF` の上書きは再生成用に維持。
+- **失敗時のメッセージ**: (a) fixture が無い → パスと cwd と再生成手順を出す
+  (b) セクション数が 20 でない → 「古い fixture を読んでいる可能性」と明示
+  (c) 20 型あるが TQ1_0 / IQ1_M が欠けている → 型名一覧を出して落とす
+  (d) 途中で切れた fixture → offset 付きで落ちる。実測で (a)(b) の発火を確認した。
+- **最適化レベル依存 (実測)**: `-O0` で生成すると IQ3_XXS の f32 出力が `-O2` と
+  一致しない (byte 168337 以降が 0x7f / 0xff で食い違う)。commit 済み fixture は
+  `-O2` 生成なので、再生成は必ず `-O2`。TQ1_0 / IQ1_M は `-O0` と `-O2` で同一だった。
+  この注意は `ref/README.md` に書いた。
+- **ライセンス**: `ref/README.md` (新規) に再生成手順と帰属を明記。参照元は
+  llama.cpp `ggml-quants.c` / `ggml-common.h` で **MIT** (Copyright (c) 2023-2026
+  The ggml authors)、本リポジトリは **MIT OR Apache-2.0**。生成器は関数をリンクして
+  呼ぶだけで取り込み無し、fixture は出力データ。GPL のコードは無し。
+- **数値クラス**: 該当なし (R1-R4 のいずれでもない)。`.cu` / `.ptx`・数値経路は無変更。
+- **測っていないこと**: GPU アンカー、8095 の実機挙動、`denno-server` のテスト数。
+  これらは supervisor 側の関門で確認する。
+
 ### ベンチマーク一覧 (2026-10-20 時点・このホスト)
 
 測定規則: prefill の正式値は cold 単発 (サーバ起動 -> 1 リクエスト、prefix cache off、

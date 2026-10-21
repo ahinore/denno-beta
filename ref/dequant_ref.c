@@ -9,8 +9,12 @@
  *     u32 n_bytes, raw bytes
  *     u32 n_f32, f32 LE * n_f32
  *
- * ビルド:
- *   gcc -O2 -I<ggml>/include -I<ggml>/src -o dequant_ref dequant_ref.c <ggml>/src/ggml-quants.c -lm
+ * ビルド (実測で通るコマンド。llama.cpp 側は -O2 のままだと
+ * dequantize_row_tq1_0 / iq1_m の演算が変わらないことを確認済み):
+ *   gcc -O2 -I<llama.cpp>/ggml/include -I<llama.cpp>/ggml/src \
+ *       -o dequant_ref ref/dequant_ref.c <llama.cpp>/ggml/src/ggml-quants.c -lm
+ *
+ * 詳細と再生成手順は ref/README.md を参照。
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +58,8 @@ const char *ggml_type_name(enum ggml_type type) {
         case GGML_TYPE_IQ1_S: return "iq1_s";
         case GGML_TYPE_IQ4_NL: return "iq4_nl";
         case GGML_TYPE_IQ4_XS: return "iq4_xs";
+        case GGML_TYPE_TQ1_0: return "tq1_0";
+        case GGML_TYPE_IQ1_M: return "iq1_m";
         default: return "?";
     }
 }
@@ -80,6 +86,8 @@ static size_t ggml_type_size_impl(enum ggml_type type) {
         case GGML_TYPE_IQ3_S: return 110;
         case GGML_TYPE_IQ1_S: return 50;
         case GGML_TYPE_IQ4_XS: return 136;
+        case GGML_TYPE_TQ1_0: return 54;  /* qs[48] + qh[4] + d(f16) */
+        case GGML_TYPE_IQ1_M: return 56;  /* qs[32] + qh[16] + scales[8] */
         default: return 0;
     }
 }
@@ -137,6 +145,12 @@ int main(int argc, char **argv) {
         { "IQ1_S",   sizeof(block_iq1_s),   QK_K,     (void *)dequantize_row_iq1_s },
         { "IQ4_NL",  sizeof(block_iq4_nl),  QK4_NL,   (void *)dequantize_row_iq4_nl },
         { "IQ4_XS",  sizeof(block_iq4_xs),  QK_K,     (void *)dequantize_row_iq4_xs },
+        /* Task K2: K1 で追加した 2 型。llama.cpp の dequantize_row_* をそのまま使う
+         * (TQ1_0 は pow3 展開、IQ1_M は iq1s_grid 参照。iq1s_grid は ggml-quants.c が
+         *  GGML_COMMON_IMPL_C で include する ggml-common.h の static const テーブル)。
+         * 既存 18 型の後ろに追記する (先頭セクションのバイト列を変えないため)。 */
+        { "TQ1_0",   sizeof(block_tq1_0),   QK_K,     (void *)dequantize_row_tq1_0 },
+        { "IQ1_M",   sizeof(block_iq1_m),   QK_K,     (void *)dequantize_row_iq1_m },
     };
     const int n_secs = (int)(sizeof(secs) / sizeof(secs[0]));
     wr_u32(f, (uint32_t)n_secs);
