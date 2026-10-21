@@ -1473,6 +1473,8 @@ mod tests {
 
     #[test]
     fn forward_batch_matches_solo_decode_bit_exactly() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         // P6 の中核検証: 複数セッションをバッチ decode しても、各セッションの
         // logits は単独 decode とビット一致する (fp32 / int8 両モード)。
         for mode in [QuantMode::Fp32, QuantMode::Int8] {
@@ -1540,6 +1542,8 @@ mod tests {
 
     #[test]
     fn forward_batch_single_session_matches_solo() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         // バッチサイズ 1 でも経路が単独 decode とビット一致すること
         let mut solo = tiny(QuantMode::Fp32);
         let mut c1 = solo.new_cache();
@@ -1557,6 +1561,8 @@ mod tests {
 
     #[test]
     fn qk_norm_batch_matches_solo_decode_bit_exactly() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         // Qwen3 (QK-Norm あり) でもバッチ decode が単独 decode とビット一致する。
         // また QK-Norm が適用されていること (無効化した場合と出力が変わる) を確認。
         for mode in [QuantMode::Fp32, QuantMode::Int8] {
@@ -1885,6 +1891,8 @@ mod tests {
 
     #[test]
     fn debug_batch_layer0() {
+        // s163 (K4): prof のカウンタ窓と排他 (同じグローバルカウンタを汚し得る)。
+        let _g = crate::prof::counters_guard();
         // デバッグ用: レイヤー0の各段階でバッチと単独を比較する
         let mode = QuantMode::Fp32;
         let prompts: Vec<Vec<u32>> = vec![vec![5, 11, 23], vec![1, 2, 3, 4, 5], vec![7, 9]];

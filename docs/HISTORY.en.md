@@ -3378,3 +3378,41 @@ External implementations referenced in P19 and their licensing status (the same 
   long-context prefix cache (the long test model is non-recurrent), the server scheduler /
   HTTP layer, memory footprint, and GPU anchors / bench / KPI (structurally unchanged
   because no production line changed, but not measured).
+
+### s163: Task K4 - default-gate test isolation (2026-10-22) done (0 implementation lines)
+
+- **Defect (reproduced)**: the default parallel gate `cargo test -p denno-engine --lib` failed
+  rarely (supervisor: 1 of 7 runs, 273 passed / 1 failed,
+  `prof::tests::attn_core_is_split_into_gdn_and_full_rows`; passes standalone). Measured here:
+  at HEAD (`5931c7a`) 2 of 10 parallel runs failed (the same `attn_core_...` once plus
+  `serve_step_other_is_step_minus_named_siblings` once), and with `--test-threads=1`
+  `serve_step_other_is_step_minus_named_siblings` failed 3 of 3.
+- **Cause (checked in code)**: the exclusion in `prof::tests::lock_counters()` was
+  `GLOBAL_COUNTER_LOCK`, private to `mod tests`, so no other test could join it. While a prof
+  test held `FORCE_ENABLED = Some(true)`, forwards on other threads added samples to the same
+  `NS` / `CALLS`. `time_full` reads `enabled()` once at entry and adds the sample at the end of
+  the region, so samples also land outside the window - the prof-side lock alone cannot fix it.
+- **Fix**: a module-level `#[cfg(test)] pub(crate) fn counters_guard() ->
+  std::sync::MutexGuard<'static, ()>` in `crates/denno-engine/src/prof.rs`, keeping exactly
+  **one** mutex (`GLOBAL_COUNTER_LOCK`); `mod tests::lock_counters()` is now a thin wrapper.
+  **59** tests that drive a forward in the default gate hold the same guard for their whole
+  body (engine.rs 41 / model/qwen35.rs 11 / model/llama.rs 4 / testutil.rs 2 / quant.rs 1):
+  the 4 `long_context_*`, 4 that drive forwards via `run_script_streamed`, 1 quant test that
+  calls `prof::time_n_ev` directly, and the rest that call `chat` / `step_chat` / `forward`.
+  The 4 cuda-feature-only `#[ignore]` tests are out of scope (they do not run in this gate).
+  No comparison, no `#[ignore]`, and no test count changed.
+- **Same class, not a race**: `serve_step_other_is_step_minus_named_siblings` fails when the
+  tail sibling closed after `step_end` (one projection) exceeds the in-step non-sibling time,
+  which pins `other` to 0 and flips `other + siblings <= step` (7 of 20 after isolation; also
+  1 of 10 parallel and 3 of 3 serial at HEAD). A real step contains hundreds of projections, so
+  the fixture's in-step projections went from 1 to 16 (the comparisons are unchanged).
+  Measured with a temporary `eprintln!` (deleted before the commit): step 9,080-18,210 ns /
+  other 1,210-1,790 ns / siblings 7,760-16,360 ns, 0 failures in 40 runs.
+- **Measured gate**: `cargo test -p denno-engine --lib` = **274 passed / 0 failed / 1 ignored**
+  in **40 consecutive runs** (20 + 20, 0.96-1.44 s each). `cargo test -p denno-server --lib` =
+  **37 passed**. `cargo test -p denno-engine --test dequant_ref` = **7 passed**. The 4
+  `long_context_*` tests alone = **0.02 s** (0.09 s wall, debug build).
+- **Numeric class**: none. Every change is inside `#[cfg(test)]` (0 production lines, no
+  `.cu` / `.ptx` change).
+- **Not measured here**: bench / GPU anchors / KPI (structurally unchanged because no
+  production line changed, but not measured).

@@ -4030,17 +4030,30 @@ fn push_serve_section(phase: Phase, s: &mut String) {
 }
 
 #[cfg(test)]
+static GLOBAL_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// s163 (Task K4): グローバルカウンタ (`NS` / `CALLS` 等) を汚し得るテストの
+/// 排他ガード (crate 内テスト専用)。ロックの実体は `GLOBAL_COUNTER_LOCK` 1 本で、
+/// `prof::tests::lock_counters()` もこれを通る (別 Mutex は作らない)。
+///
+/// 集計の static はプロセス全体で 1 本なので、`FORCE_ENABLED = Some(true)` の
+/// 窓の間に別スレッドの forward が sample を積むと、厳密比較 (`CALLS[ATTN] == 46`
+/// 等) が崩れる。prof 側のテストは `lock_counters()` で、長い forward を回す
+/// テストはこの関数で同じロックを取る — 双方向に排他にして窓を消す。
+/// ロックは panic でも解放される。
+#[cfg(test)]
+pub(crate) fn counters_guard() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_COUNTER_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
 mod tests {
     //! s55: d2h 細分 id の整合 (生 id 不変・細分は N_OPS の外・summary が 3 行を出す)。
     //! s57 (T4): フェーズ分離 (prefill/decode) と attn_core の層種別分離、平均 tok/call。
     //! 時刻値は環境依存なので検証しない — 検証するのは id の算術と集約だけ。
     use super::*;
-
-    /// s61c: 集計カウンタ (`NS` / `ATT_SUB_*` 等) は**プロセス全体で 1 本**の
-    /// static なので、`reset()` を挟むテストを並走させると他テストの
-    /// バケットが消える (実際に `attn_gdn` 行が消えて落ちた)。集計に触れる
-    /// テストはこのロックを取って直列化する。ロックは panic でも解放される。
-    static GLOBAL_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// s85 (Step 0): テスト専用の `enabled()` 上書き。None = env (`DENNO_PROFILE`) を見る。
     /// `Ambient::enter` / `add_outer_ns` は `enabled()` が偽だと完全 no-op なので、
@@ -4102,10 +4115,12 @@ mod tests {
     }
 
     /// グローバルカウンタを汚すテスト用の排他ガード。
+    ///
+    /// s163 (Task K4): ロックの実体は `crate::prof::counters_guard()` に移した
+    /// (prof 以外のテスト — 長文脈 forward 等 — も同じ 1 本を取れるようにする)。
+    /// ここは名前を保つだけの薄いラッパで、**別 Mutex は作らない**。
     fn lock_counters() -> std::sync::MutexGuard<'static, ()> {
-        GLOBAL_COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        counters_guard()
     }
 
     /// 生 id と telemetry のバイト表現に触れていないこと (細分を足しても不変)。
@@ -5639,6 +5654,14 @@ mod tests {
             let emb = span_begin();
             span_end(emb, SL_LAY_EMBED);
             serve_fixture_linear_call();
+            // s163 (K4): 実経路の 1 step は投影を数百本ふくむ (tail は 1 本) ので、
+            // 合成 fixture でも step の内側の投影を tail より十分に厚くする。ns スケールで
+            // 「step 内の兄弟」と「step_end の後に閉じる兄弟」が同程度だと、
+            // `other + siblings <= step` が実測ノイズで反転する (1 本のときは 20 回中
+            // 7 回落ちた)。比較式は緩めず、本数だけを実経路の比に寄せる。
+            for _ in 0..15 {
+                serve_fixture_linear_call();
+            }
             let lo = span_begin();
             span_end(lo, SL_STEP_LAYERS_OTHER);
             let fi = span_begin();
