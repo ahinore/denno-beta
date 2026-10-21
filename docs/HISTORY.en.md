@@ -3105,6 +3105,62 @@ Numeric contract: only attention has an approved maxabs < 1e-3. GDN does not nee
 Q4_0 stays within R2 (relative 1e-4) of the CPU path - measured GEMV 9.5e-6, GEMM 0. Determinism
 is mandatory on every path.
 
+### s160: Task G1 - the 27B q4 decode "gate_up fixed cost" is rejected by a static audit (2026-10-22) done (0 lines of code changed)
+
+> G1's premise was "one gate_up call on the serve path carries about 29.5 ms of fixed cost (alloc,
+> activation quantize, H2D, sync, copy-out) and that is the main term in the 32.42 ms/token decode".
+> The static audit says the premise is **stale**: that fixed cost was already removed by B20 stage 1
+> (`2701cf3`), and five of the six stages do not exist at all on the current decode path. What is
+> left is the weight stream (GPU) or first-touch weight uploads inside the span; neither can be
+> removed from Rust. Stopped per rule 3 of the handoff and left the evidence in `REPORT_G1.md`
+> (gitignored).
+
+- **Path identification (static)**: `forward` with n==1 tries `forward_decode_chain`
+  (`model/qwen35.rs:1133`) first. The FFN is `chain_linear` (`cuda.rs:4110`) ->
+  `chain_linear_q4_device` (`cuda.rs:4037`) and issues **exactly one kernel** (`cuda.rs:4084`).
+  `maybe_gpu_linear_q4_into` (`cuda.rs:2670`) is reached only from the per-op path
+  (`quant.rs:334` / `cuda.rs:2659`), from unit tests and from the bench; the decode chain never
+  calls it.
+- **The profile's own bucket name proves the path**: `sl_lay_ffn_gate` exists only inside
+  `forward_decode_chain` (`model/qwen35.rs:2223`); the per-op path measures `sl_gap_*`. A profile
+  that reports that row is a chain-path profile, and on that path the per-op wrapper never runs.
+- **The six stages (static)**: (a) alloc = `chain_ensure_buf` (`cuda.rs:3752`) is grow-only, 0 calls
+  in the steady state (the step-start `chain_q35_step_reserve*` reserves the maximum first).
+  (b) activation quantize = the q4 GEMV reads f32 activations, so structurally 0. (c) H2D = CH_H is
+  device-resident, 0 calls (only the first-touch weight upload). (d) launch = 1.
+  (e) sync = 0 (the step's only sync is the logits D2H at the end, `model/qwen35.rs:2295`).
+  (f) copy-out = 0 (the output stays in CH_GA and `chain_swiglu` reads it on the device).
+  All four preferred fixes in the handoff - (i) buffer reuse, (ii) skip re-quantizing,
+  (iii) one sync per layer, (iv) keep the stream - are already in the tree as of `2701cf3`.
+- **"29.5 ms/call" cannot describe the current path (arithmetic)**: gate_up runs once per layer, so
+  64 calls per token. At 29.5 ms/call that is 1,888 ms/token against the measured 32.42 ms/token -
+  a factor of 58. The m=21.5 in that record is a prefill average (decode is m=1). The 89% in
+  `lin_sync_wait` is the `cuCtxSynchronize` that waits for the kernel in `q4_dispatch_tile`
+  (`cuda.rs:3074-3081`; the comment at `cuda.rs:3085-3088` says the same thing) - kernel time, not
+  fixed cost.
+- **Comparison with the weight byte share (arithmetic)**: the 27B gate_up is 178,257,920 parameters
+  per layer (2 x 17408 x 5120). In VRAM a block is 20 B per 32 parameters = 5 bit/param, so one layer
+  is 111.4 MB and 64 layers are 7.13 GB. Against the 16.7 GB of weights on the card (allocation
+  comment in `scripts/prod_serve_27b.sh`) that is **42.7%**, while the measured share is 28.4% -
+  **below** the byte share, i.e. gate_up streams faster than the step average and carries no
+  visible fixed-cost surcharge.
+- **Two candidate explanations for the 28.4%, same conclusion**: (E1) first-touch weight H2D lands
+  inside the span (`cuda.rs:4055` is inside `model/qwen35.rs:2216-2223`); 7.13 GB over 41 steps is
+  174 MB/step, i.e. 14.5 ms/step at 12 GB/s. (E2) the launch blocks because the device is behind,
+  so the span absorbs GPU execution time. E1 is a profiling artifact that a warm-up removes; E2 is
+  .cu territory. Neither leaves removable Rust-side fixed cost. How to tell them apart is in
+  `REPORT_G1.md` section 5.
+- **Display-only note**: `lin_stage_close` (`cuda.rs:2839-2847`) ticks table B for chain linear calls
+  too, but table B samples only come from the per-op tile implementation. On a chain-path profile
+  the table B coverage denominator is therefore inflated - a property of the display, not of the
+  numeric path.
+- **Not touched**: `.cu` / `.ptx` / `nvcc` / GPU execution / `scripts/prod_serve_27b.sh` /
+  `docs/NUMERIC_POLICY.ja.md` / `GPU_VERIFY.sh` / 8095. Zero lines of code, zero tests. The
+  measurement spans were deliberately not added: five of the six stages are structurally zero, and
+  adding rows to table C would rewrite `SPLIT_SERVE_N` (`prof.rs:522`), the exclusive-sum invariant
+  in `SL_GROUPS` and the COVERAGE assertions, which the handoff's "do not redesign" forbids. If the
+  six-way split is still wanted it needs its own task starting from how the tick is carried.
+
 ## 4. Candidate List
 
 ### Qwen3.5 main line (final goal: Qwen3.8-27B running — uniform Q4_0 for now since UD-IQ2_XXS needs unsupported IQ1_M)

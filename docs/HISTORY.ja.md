@@ -3078,6 +3078,55 @@ s122 のハンドオフはそれを「s118 で設計済み」と読んで再実�
 数値契約: attention のみ maxabs < 1e-3 を承認済み。GDN は bit 一致不要。Q4_0 は CPU 経路と
 R2 (相対 1e-4) 以内で、実測は GEMV 9.5e-6 / GEMM 0。決定論は全経路で必須。
 
+### s160: Task G1 - 27B q4 decode の gate_up「固定費」を静的監査で却下 (2026-10-22) 完了 (コード変更 0 行)
+
+> G1 の前提は「serve の gate_up 1 呼び出しに約 29.5 ms の固定費 (確保・活性量子化・H2D・同期・
+> コピーアウト) があり、それが decode 32.42 ms/token の主因」だった。静的監査の結論は
+> **前提が古い**: その固定費は B20 段階 1 (`2701cf3`) で既に消えており、現在の decode 経路には
+> 6 段のうち 5 段が構造的に存在しない。残りは重みストリーム (GPU) か初回タッチの重み upload の
+> 混入で、どちらも Rust 側では消せない。HANDOFF のルール 3 に従って停止し、根拠を
+> `REPORT_G1.md` (gitignore 済み) に残した。
+
+- **経路の同定 (静的)**: `forward` の n==1 はまず `forward_decode_chain` (`model/qwen35.rs:1133`)。
+  FFN は `chain_linear` (`cuda.rs:4110`) -> `chain_linear_q4_device` (`cuda.rs:4037`) で、
+  発行は **1 カーネルだけ** (`cuda.rs:4084`)。`maybe_gpu_linear_q4_into` (`cuda.rs:2670`) を
+  呼ぶのは per-op 経路 (`quant.rs:334` / `cuda.rs:2659`)、単体テスト、bench だけで、
+  decode の chain からは到達しない。
+- **profile の bucket 名が経路の証拠**: 監督 profile の `sl_lay_ffn_gate` は
+  `forward_decode_chain` の中 (`model/qwen35.rs:2223`) にしか存在しない (per-op 経路は
+  `sl_gap_*` を測る)。その行がある時点で profile は chain 経路のもので、そこでは
+  per-op wrapper は 1 度も走っていない。
+- **6 段の割り (静的)**: (a) 確保 = `chain_ensure_buf` (`cuda.rs:3752`) は grow-only で定常 0 回
+  (step 冒頭の `chain_q35_step_reserve*` が最大を先に取る)。(b) 活性の量子化 = q4 GEMV は活性を
+  f32 のまま読むので構造的に 0。(c) H2D = CH_H はデバイス常駐で 0 回 (初回の重み upload のみ)。
+  (d) 発行 = 1 回。(e) 同期 = 0 回 (step 唯一の同期は末尾の logits D2H、`model/qwen35.rs:2295`)。
+  (f) コピーアウト = 0 回 (出力は CH_GA に残り `chain_swiglu` が読む)。
+  HANDOFF の優先順 (i) buffer reuse / (ii) 量子化のスキップ / (iii) 1 層 1 sync / (iv) stream 維持は
+  4 つとも `2701cf3` で実装済み。
+- **29.5 ms/call が現在の経路を説明しない (算術)**: gate_up は 64 層 = 1 token あたり 64 呼び出し。
+  29.5 ms/call なら 1,888 ms/token で、実測 32.42 ms/token と 58 倍食い違う。記録の m=21.5 は
+  prefill の平均 m (decode は m=1)。`lin_sync_wait` 89% は `cuCtxSynchronize` の待ちで、
+  per-op の `q4_dispatch_tile` では**カーネル実行そのもの**を待っている (`cuda.rs:3074-3081`。
+  `cuda.rs:3085-3088` のコメントも同じことを書いている) — 固定費ではなくカーネル時間。
+- **重みバイト share との比較 (算術)**: 27B の gate_up は 1 層 178,257,920 パラメータ
+  (2 x 17408 x 5120)。VRAM は 1 ブロック 20 B / 32 パラメータ = 5 bit/param なので 1 層 111.4 MB、
+  64 層で 7.13 GB。カード上の重み 16.7 GB (`scripts/prod_serve_27b.sh` の配分コメント) に対して
+  **42.7%**。実測 share 28.4% はバイト share より**小さい** (gate_up はステップ平均より速く流れて
+  いる) ので、固定費の上乗せは見えない。
+- **28.4% の候補は 2 つ、結論は同じ**: (E1) 初回タッチの重み H2D が span の内側に入る
+  (`cuda.rs:4055` は `model/qwen35.rs:2216-2223` の内側)。7.13 GB / 41 step = 174 MB/step で
+  H2D 12 GB/s なら 14.5 ms/step。(E2) 発行がデバイスの詰まりでブロックし、span が GPU 実行時間を
+  吸う。E1 なら warm-up で消える計測 artifact、E2 なら .cu の領域で、どちらも Rust 側に
+  消せる固定費は無い。判別手順は `REPORT_G1.md` §5。
+- **表示のみの注意**: chain の線形呼び出しも `lin_stage_close` (`cuda.rs:2839-2847`) が表 B の tick を
+  +1 するが、表 B のサンプルは per-op のタイル実装しか出さない。chain 経路の profile では表 B の
+  coverage 分母だけが膨らむ (計測の表示上の性質で、数値経路には無関係)。
+- **触っていないもの**: `.cu` / `.ptx` / `nvcc` / GPU 実行 / `scripts/prod_serve_27b.sh` /
+  `docs/NUMERIC_POLICY.ja.md` / `GPU_VERIFY.sh` / 8095。コード変更 0 行、テスト追加 0 件。
+  計測用 span の追加は見送った — 6 段のうち 5 段が構造的に 0 で、表 C に行を足すと
+  `SPLIT_SERVE_N` (`prof.rs:522`) と `SL_GROUPS` の排他の和、COVERAGE の断言を書き換えることになり、
+  HANDOFF の「再設計しない」に反する。6 段の実測が要るなら別タスクで tick の持ち方から設計する。
+
 ## 4. 次の実装候補
 
 ### Qwen3.5 主線(最終目標: Qwen3.8-27B 動作 — UD-IQ2_XXS は IQ1_M 未対応のため当面は均一 Q4_0)
