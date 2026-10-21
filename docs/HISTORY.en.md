@@ -3304,3 +3304,77 @@ External implementations referenced in P19 and their licensing status (the same 
 | Qwen3.5 model (config values, weights) | Apache-2.0 | Config values referenced, GGUF weights loaded | OK — attribution in the `qwen35.rs` header |
 
 **Conclusion**: all compatible with this repository's license (MIT OR Apache-2.0). MIT-derived parts (kquant ports, table extraction) keep the upstream copyright notice in the relevant files per MIT's notice requirement. No GPL or other contamination. When new reference implementations are adopted, append to this table and the file headers.
+
+### s162: Task P4-4 - long-context regression moved into the default CPU gate (2026-10-22) done (0 implementation lines)
+
+> The whole default gate runs with `testutil::DUMMY_CONTEXT = 64`, so the paths that only
+> appear at real context lengths were never executed in CI: kv_cache growth past its
+> initial capacity, prefix-cache budget and eviction on a long prompt, and the exact
+> context-capacity boundary. Production serves 3,020-token prefills and multi-turn chats.
+> Added a test-only long-context model and 4 default-gate tests. No implementation change
+> (no line of the numeric path in `src/`).
+
+- **Test model**: added `testutil::LongKvSensitiveModel::with_context(n)` (context 4096,
+  1 layer, kv_dim 4, bytes_per_token 32 B). `forward` delegates to
+  `KvSensitiveModel::forward`, so the KV row formula and the logits assembly run exactly
+  the same code as the 64-token model. `KvSensitiveModel::new()` still uses DUMMY_CONTEXT
+  and its struct fields are unchanged (so the struct literal in
+  `denno-server/tests/scheduler.rs` keeps compiling). Added
+  `long_context_engine(name, seed)` next to the existing helpers. `KvSensitiveModel::kv_k`
+  / `kv_v` only became `pub(crate)` (no behaviour change).
+- **4 new tests (all in the default gate, no `#[ignore]`)**:
+  - `long_context_prefix_cache_reuse_keeps_logits_bit_identical` (a): runs the same
+    3,000-token prompt as a cold prefill and as a second run on the same engine (prefix
+    cache reuse) and checks that the post-prefill logits are **bit-identical on the f32
+    bit pattern** (not an epsilon comparison).
+  - `long_context_capacity_boundary_is_a_clean_error_not_a_panic` (b): a 4,095-token
+    prompt + 1 generated token works, a 4,096-token (= max_len) prefill is accepted
+    (max_tokens is clamped to 0), and a 4,097-token prompt makes `begin_chat` return
+    `Err`. The call sits inside `catch_unwind`, so a panic fails the test. It also checks
+    that `caches[0].len()` and `max_len()` are unchanged across the rejection.
+  - `long_context_kv_growth_is_demand_driven_and_preserves_rows` (c): right after a
+    3,000-token prefill, `capacity() == 3,000 < max_len() == 4,096` (the full context is
+    not pre-allocated). Extending the same prefix to 4,000 tokens doubles the buffer
+    3,000 -> 4,096, and rows written earlier (0, 1, 1,000, 2,997) still read back
+    bit-identical to `kv_k` / `kv_v`.
+  - `long_context_prefix_budget_evicts_and_post_eviction_is_a_clean_miss` (d): with a
+    budget of 4,500 (only one 3,000-token entry fits), inserting a second long prompt
+    evicts instead of going over budget, `total_weight() == 3,000 <= 4,500`. Re-running
+    the evicted prompt reports no `Entry` hit, and its logits are bit-identical to a full
+    prefill on a fresh engine (no half-restored cache).
+- **Already covered vs new**: (a) - `engine::tests::prefix_cache_reuses_prompt_and_keeps_exact_output`
+  compared text and token counts at <= 64 tokens (bit-level logits and 3,000 tokens are
+  new). (b) - `kv_cache::tests::advance_overflow_panics` / `kv_bufs_overflow_panics`
+  covered the primitive's assert at a tiny max_len (the engine-level clamp, the `Err` and
+  a real context length are new). (c) - `kv_cache::tests::kv_bufs_grows_on_demand_and_preserves_rows`
+  covered 1 -> 2 tokens (3,000 -> 4,096 plus row-formula verification is new). (d) -
+  `prefix_cache::tests::evicts_least_recently_used_to_fit_budget` /
+  `evict_keeps_newest_entries_until_budget_fits` / `insert_skips_entry_larger_than_limit`
+  covered the arithmetic with 1-5 token entries (3,000-token entries, the engine path and
+  post-eviction numeric equality are new). Nothing duplicates an existing test.
+- **Measured gates**: `cargo test -p denno-engine --lib` = **274 passed / 0 failed /
+  1 ignored** (**0.27-0.29 s** over 3 runs; before P4-4 it was 270 passed / 0.28 s, the
+  delta is exactly the 4 new tests). The 4 new tests alone = **0.01 s**.
+  `cargo test -p denno-server --lib` = **37 passed**.
+  `cargo test --release -p denno-engine --test dequant_ref` = **7 passed**.
+  No length had to be shrunk (kv_dim 4 keeps the KV at 128 KB even at 4,096 tokens).
+  Repeating the full lib gate 45 times, a `prof::tests` test failed in 8 of the runs (9
+  failures total, 4 distinct tests observed:
+  `attn_core_is_split_into_gdn_and_full_rows`,
+  `skipped_steps_accumulate_ticks_but_no_ns`,
+  `split_flush_is_exclusive_and_display_only`,
+  `serve_step_other_is_step_minus_named_siblings`; `prof.rs` is untouched by this commit and
+  each passes standalone - the global-counter flake class recorded in s161). There were 0
+  failures outside `prof::tests`, and the 4 new tests failed in 0 of the 45 runs and 0 of 10
+  filtered repetitions.
+- **Measured premise**: the fallback template renders `"user: <content>\n\nassistant:"`
+  and the dummy WordLevel tokenizer emits `[20, 20, t1..., 20, 20]` (prompt length =
+  words + 4). This was measured with a throwaway probe test that was deleted before the
+  commit.
+- **Numeric class**: none of R1-R4 applies. Tests and docs only; no numeric path and no
+  `.cu` / `.ptx` change.
+- **Not measured here**: real models (27B q4 / 9B int8) at long context, contexts beyond
+  4,096 (production serves 10,820 / 21,620-token prefills), the recurrent (GDN)
+  long-context prefix cache (the long test model is non-recurrent), the server scheduler /
+  HTTP layer, memory footprint, and GPU anchors / bench / KPI (structurally unchanged
+  because no production line changed, but not measured).

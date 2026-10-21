@@ -3267,3 +3267,69 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
 | Qwen3.5 モデル(設定値・重み) | Apache-2.0 | 設定値参照・GGUF 重みをロード | OK — `qwen35.rs` ヘッダに出典表示 |
 
 **結論**: 本リポジトリのライセンス (MIT OR Apache-2.0) とすべて両立。MIT 由来部分(kquant 移植・テーブル抽出)は MIT の表示義務に従い upstream の著作権表示を該当ファイルに保持。GPL 等の汚染は無し。新規に参照実装を取り込む場合はこの表とファイルヘッダに追記する運用とする。
+
+### s162: Task P4-4 - 長文脈の回帰を既定 CPU ゲートに入れた (2026-10-22) 完了 (実装変更 0 行)
+
+> 既定ゲートは全て `testutil::DUMMY_CONTEXT = 64` で回っており、本番が配信している
+> 3,020 token の prefill とマルチターン会話でしか現れない経路 (kv_cache が初期容量を
+> 超えて成長する経路、長い prompt での prefix cache 予算と退避、コンテキスト容量の境界)
+> は既定ゲートで一度も実行されていなかった。テスト専用の長文脈モデルと 4 本の
+> 既定ゲートテストを追加した。実装 (`src/` の数値経路) は無変更。
+
+- **テスト用モデル**: `testutil::LongKvSensitiveModel::with_context(n)` を追加
+  (context 4096・1 層・kv_dim 4・bytes_per_token 32 B)。`forward` は
+  `KvSensitiveModel::forward` に委譲するので、KV 行の式も logits の組み立ても 64 token 版と
+  同一コードを通る。`KvSensitiveModel::new()` は DUMMY_CONTEXT のままで、構造体の
+  フィールドも変えていない (`denno-server/tests/scheduler.rs` の構造体リテラルが
+  壊れない)。`long_context_engine(name, seed)` を既存ヘルパの隣に追加。
+  `KvSensitiveModel::kv_k` / `kv_v` は `pub(crate)` にしただけ (挙動不変)。
+- **新規テスト 4 本 (全て既定ゲート・`#[ignore]` 無し)**:
+  - `long_context_prefix_cache_reuse_keeps_logits_bit_identical` (a): 3,000 token の
+    同一 prompt を cold prefill と 2 回目 (prefix cache 再利用) で実行し、prefill 直後の
+    logits が **f32 のビット列で一致**することを確認 (epsilon 比較ではない)。
+  - `long_context_capacity_boundary_is_a_clean_error_not_a_panic` (b): 4,095 token の
+    prompt + 1 token 生成が通り、4,096 (= max_len) の prefill が受理され
+    (max_tokens は 0 にクランプ)、4,097 token は `begin_chat` が `Err` を返す。
+    `catch_unwind` の内側で呼ぶので panic すればテストが落ちる。拒否の前後で
+    `caches[0].len()` と `max_len()` が不変であることも確認。
+  - `long_context_kv_growth_is_demand_driven_and_preserves_rows` (c): 3,000 token の
+    prefill 直後は `capacity() == 3,000 < max_len() == 4,096` (コンテキスト全幅を
+    先取りしない)。同じ接頭辞を 4,000 token に伸ばすと 3,000 -> 4,096 の倍々成長が起き、
+    先に書いた行 (0, 1, 1,000, 2,997) が `kv_k` / `kv_v` とビット一致のまま読める。
+  - `long_context_prefix_budget_evicts_and_post_eviction_is_a_clean_miss` (d): 予算
+    4,500 (3,000 token のエントリ 1 本だけが入る) で 2 本目の長い prompt を入れると
+    予算超過ではなく LRU 退避が起き、`total_weight() == 3,000 <= 4,500`。退避された
+    prompt の再実行は `Entry` ヒットを報告せず、logits は新しいエンジンの full prefill と
+    ビット一致 (半端に復元されたキャッシュが無い)。
+- **既覆と新規の切り分け**: (a) は `engine::tests::prefix_cache_reuses_prompt_and_keeps_exact_output`
+  が 64 token 以下でテキストとトークン数の一致だけを見ていた (logits のビット比較と
+  3,000 token は新規)。(b) は `kv_cache::tests::advance_overflow_panics` /
+  `kv_bufs_overflow_panics` が原始 API の assert を極小 max_len で見ていた
+  (engine 経路のクランプ + `Err` + 実コンテキスト長は新規)。(c) は
+  `kv_cache::tests::kv_bufs_grows_on_demand_and_preserves_rows` が 1 -> 2 token で
+  見ていた (3,000 -> 4,096 と行の式による照合は新規)。(d) は
+  `prefix_cache::tests::evicts_least_recently_used_to_fit_budget` /
+  `evict_keeps_newest_entries_until_budget_fits` / `insert_skips_entry_larger_than_limit`
+  が 1〜5 token のエントリで算術を見ていた (3,000 token 級 + engine 経路 + 退避後の
+  数値一致は新規)。既存テストの複製は無い。
+- **実測ゲート**: `cargo test -p denno-engine --lib` = **274 passed / 0 failed / 1 ignored**
+  (**0.27-0.29 s** を 3 回計測。P4-4 前は 270 passed / 0.28 s で、差分はちょうど追加した 4 本)。
+  追加 4 本だけの実行 = **0.01 s**。`cargo test -p denno-server --lib` = **37 passed**。
+  `cargo test --release -p denno-engine --test dequant_ref` = **7 passed**。
+  長さを縮める必要は無かった (kv_dim 4 なので 4,096 token でも KV は 128 KB)。
+  lib 全体を 45 回反復したうち 8 回で `prof::tests` のテストが 1 本落ちた (計 9 件。観測した
+  のは `attn_core_is_split_into_gdn_and_full_rows` / `skipped_steps_accumulate_ticks_but_no_ns` /
+  `split_flush_is_exclusive_and_display_only` / `serve_step_other_is_step_minus_named_siblings`
+  の 4 種で、`prof.rs` は本 commit で無変更・単独実行は pass = s161 で記録済みの大域カウンタ
+  共有による flaky と同じ class)。`prof::tests` 以外の失敗は 0 件で、追加した 4 本は 45 回中
+  0 回 (単独 10 回反復でも 0 回) 落ちていない。
+- **前提の実測**: fallback テンプレートの描画は `"user: <content>\n\nassistant:"` で、
+  ダミー WordLevel トークナイザは `[20, 20, t1..., 20, 20]` を返す (プロンプト長 =
+  語数 + 4)。これは使い捨ての probe テストで測り、commit 前に削除した。
+- **数値クラス**: 該当なし (R1-R4 のいずれでもない)。テストと文書のみで、数値経路・
+  `.cu` / `.ptx` は無変更。
+- **測っていないこと**: 実モデル (27B q4 / 9B int8) の長文脈、4,096 超のコンテキスト
+  (本番は 10,820 / 21,620 token の prefill を配信)、再帰モデル (GDN) の長文脈
+  prefix cache (長文脈テストモデルは非再帰)、server のスケジューラ / HTTP 層、
+  メモリ使用量、GPU アンカー・bench・KPI (production の行を 1 行も変えていないため
+  構造的に不変だが、測ってはいない)。
