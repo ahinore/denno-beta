@@ -119,6 +119,58 @@ static void wr(FILE *f, const void *p, size_t n) {
 }
 static void wr_u32(FILE *f, uint32_t v) { wr(f, &v, 4); }
 
+/* Task K3: Q4_0 (ggml type 2) のエッジブロック列。
+ *
+ * 既存の "Q4_0" セクションは LCG の擬似乱数 16 ブロックなので、負の d・
+ * 全ゼロのニブル・最大ニブルが必ず入る保証が無い。ここでは 6 ブロックを
+ * 明示的に作り、符号処理と +8 オフセットを確実に踏む:
+ *   [0] d = -1.5 (f16 0xBE00)  負のスケール / qs[j] = j (下位ニブル 0..15)
+ *   [1] d = +0.5 (0x3800)      qs 全 0x00 → 全ニブル 0 → q = -8 (全要素 -4.0)
+ *   [2] d = +0.5               qs 全 0xFF → 全ニブル 15 → q = +7 (全要素 +3.5)
+ *   [3] d = -0.75 (0xBA00)     qs 全 0xFF → 負の d と最大ニブルの組合せ
+ *   [4] d = +2.0 (0x4000)      qs[j] = 0xF0 | (15 - j) 上位/下位で別パターン
+ *   [5] d = +0.0 (0x0000)      qs[j] = 0x5A → 積が -0.0 になる (符号付きゼロ)
+ *
+ * 期待値は必ず dequantize_row_q4_0 の出力から取る (手計算しない)。
+ * ブロックのレイアウトは ggml-common.h の block_q4_0
+ * (ggml_half d; uint8_t qs[QK4_0/2]) そのもの。
+ */
+static void emit_q4_0_edge(FILE *f) {
+    enum { NB = 6 };
+    static const uint16_t d_bits[NB] = { 0xBE00, 0x3800, 0x3800, 0xBA00, 0x4000, 0x0000 };
+    block_q4_0 blk[NB];
+    float y[NB * QK4_0];
+    uint8_t *raw = (uint8_t *)blk; /* バイト列として埋める (f16 は LE 固定) */
+
+    for (int b = 0; b < NB; b++) {
+        uint8_t *p = &raw[b * sizeof(block_q4_0)];
+        p[0] = (uint8_t)(d_bits[b] & 0xff);
+        p[1] = (uint8_t)(d_bits[b] >> 8);
+        for (int j = 0; j < QK4_0 / 2; j++) {
+            uint8_t q;
+            switch (b) {
+                case 0:  q = (uint8_t)j; break;
+                case 1:  q = 0x00; break;
+                case 2:  q = 0xFF; break;
+                case 3:  q = 0xFF; break;
+                case 4:  q = (uint8_t)(0xF0 | (QK4_0 / 2 - 1 - j)); break;
+                default: q = 0x5A; break;
+            }
+            p[2 + j] = q;
+        }
+    }
+
+    dequantize_row_q4_0(blk, y, NB * QK4_0);
+
+    const char *name = "Q4_0_EDGE";
+    uint32_t nl = (uint32_t)strlen(name);
+    wr_u32(f, nl); wr(f, name, nl);
+    wr_u32(f, (uint32_t)sizeof(blk)); wr(f, raw, sizeof(blk));
+    wr_u32(f, (uint32_t)(NB * QK4_0));
+    wr(f, y, sizeof(y));
+    fprintf(stderr, "%s: ok (%zu bytes, %d elems)\n", name, sizeof(blk), NB * QK4_0);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) { fprintf(stderr, "usage: %s out.bin\n", argv[0]); return 1; }
     FILE *f = fopen(argv[1], "wb");
@@ -153,7 +205,9 @@ int main(int argc, char **argv) {
         { "IQ1_M",   sizeof(block_iq1_m),   QK_K,     (void *)dequantize_row_iq1_m },
     };
     const int n_secs = (int)(sizeof(secs) / sizeof(secs[0]));
-    wr_u32(f, (uint32_t)n_secs);
+    /* Task K3: 既存 20 型の後ろに Q4_0_EDGE (type 2 のエッジ列) を 1 つ足す。
+     * 既存セクションの順序・バイト列は変えない (LCG の消費も増やさない)。 */
+    wr_u32(f, (uint32_t)(n_secs + 1));
 
     /* Q8_0 だけは qs が int8 なので専用生成 (他の型は符号ビットも使う) */
     for (int s = 0; s < n_secs; s++) {
@@ -176,6 +230,7 @@ int main(int argc, char **argv) {
         free(raw); free(y);
         fprintf(stderr, "%s: ok (%zu bytes, %d elems)\n", secs[s].name, nb, N_BLOCKS * blck);
     }
+    emit_q4_0_edge(f);
     fclose(f);
     return 0;
 }
