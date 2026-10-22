@@ -341,6 +341,19 @@ enum AttnPlace {
     GpuDev,
 }
 
+/// s175 (P17b): 投影済みの q/k/v (行-major・[rows, cols])。
+///
+/// `full_attn_host_side` は `qkv_precomputed = true` のときだけこれを読む。
+/// 残差常駐経路は、デバイスで投影した [q|k|v] 連続領域を 1 発の pinned D2H で
+/// 受けた [`crate::cuda::PfQkvHostView`] の 3 ビューをそのまま渡す
+/// (Vec への写しをしない = P17 の主眼)。ホスト経路 (`qkv_precomputed = false`)
+/// は空スライスを渡し、関数の中で `buf_h` から投影する。
+struct QkvPre<'a> {
+    qg: &'a [f32],
+    k: &'a [f32],
+    v: &'a [f32],
+}
+
 impl Qwen35 {
     pub fn load(dir: &Path, cfg: &serde_json::Value, quant: QuantMode) -> Result<Self> {
         // text_config を優先 (0.8B は VLM ラッパ形式)
@@ -969,6 +982,13 @@ impl Qwen35 {
     /// 戻り値は「ゲート済み att がどこにあるか」([`AttnPlace`]) — `GpuDev` の
     /// ときだけデバイスの `CH_ATT` に確定しており、呼び出し側はアップロードを
     /// 省く (s172/P12)。
+    ///
+    /// s175 (P17b): q/k/v の**出どころ**だけを差し替えられるようにした
+    /// (`qkv_precomputed = true` のとき `qkv_pre` の 3 本を使い、投影も fit もしない)。
+    /// 残差常駐経路は、デバイスで投影した [q|k|v] 連続領域を 1 発の pinned D2H で
+    /// 受けた [`crate::cuda::PfQkvHostView`] の 3 ビューをそのまま渡す — Vec への
+    /// 写しも分割コピーも無い。値・演算順・prof バケットは P12 のまま不変
+    /// (バイト列も従来の 3 発 D2H と同一 → attention の緩和枠は未使用)。
     #[allow(clippy::too_many_arguments)]
     fn full_attn_host_side(
         &self,
@@ -981,6 +1001,8 @@ impl Qwen35 {
         buf_qg: &mut Vec<f32>,
         buf_k: &mut Vec<f32>,
         buf_v: &mut Vec<f32>,
+        // s175 (P17b): 投影済みの q/k/v — `qkv_precomputed = true` のときだけ読む。
+        qkv_pre: QkvPre<'_>,
         buf_q: &mut Vec<f32>,
         buf_att: &mut Vec<f32>,
         // s171 (P11): リクエスト先頭で 1 回だけ作った cos/sin 表
@@ -996,19 +1018,27 @@ impl Qwen35 {
         let heads = self.heads;
         let dh = self.dh;
         let kv_dim = self.kv_heads * dh;
-        fit_prefill_buf(buf_qg, n * fl.q_w.dims().1); // [n, heads*2*dh]
-        fit_prefill_buf(buf_k, n * fl.k_w.dims().1); // [n, kv_dim]
-        fit_prefill_buf(buf_v, n * fl.v_w.dims().1); // [n, kv_dim]
-        // s165 (P2): 残差常駐経路は q/k/v をデバイス (CH_PFH) から直接 GEMM して
-        // 出力だけを戻す (chain_qkv_prefill_q4_dev)。その場合はここで投影しない
-        // (バッファ長は上で合わせてあるので fit は no-op)。
-        if !qkv_precomputed {
+        // s175 (P17b): q/k/v の出どころ (P12 の `qkv_precomputed` の意味は不変)。
+        //   - false: ここで `buf_h` から 3 投影する (従来の forward_prefill 経路)。
+        //   - true:  呼び出し側が投影済み。残差常駐経路は pinned 連続領域の
+        //            3 ビューをそのまま渡すので、`buf_qg`/`buf_k`/`buf_v` は
+        //            fit も投影もせず触らない (値は D2H で入っている)。
+        let (qg, k, v): (&[f32], &[f32], &[f32]) = if qkv_precomputed {
+            debug_assert_eq!(qkv_pre.qg.len(), n * fl.q_w.dims().1);
+            debug_assert_eq!(qkv_pre.k.len(), n * fl.k_w.dims().1);
+            debug_assert_eq!(qkv_pre.v.len(), n * fl.v_w.dims().1);
+            (qkv_pre.qg, qkv_pre.k, qkv_pre.v)
+        } else {
+            fit_prefill_buf(buf_qg, n * fl.q_w.dims().1); // [n, heads*2*dh]
+            fit_prefill_buf(buf_k, n * fl.k_w.dims().1); // [n, kv_dim]
+            fit_prefill_buf(buf_v, n * fl.v_w.dims().1); // [n, kv_dim]
             self.lin(crate::prof::QKV, || {
                 fl.q_w.apply_bt_rows_into(buf_h, n, buf_qg); // [n, heads*2*dh]
                 fl.k_w.apply_bt_rows_into(buf_h, n, buf_k); // [n, kv_dim]
                 fl.v_w.apply_bt_rows_into(buf_h, n, buf_v); // [n, kv_dim]
             });
-        }
+            (&buf_qg[..], &buf_k[..], &buf_v[..])
+        };
         fit_prefill_buf(buf_att, n * heads * dh);
         // s63: `full_attn_attend_head` は att_head に **加算** する
         // (`*a += pv * b`・k 昇順の逐次累積が bit 一致の根拠) ため、
@@ -1041,9 +1071,9 @@ impl Qwen35 {
             crate::prof::time_n_ev(crate::prof::QKNORM, n, || {
                 buf_q
                     .par_chunks_exact_mut(heads * dh)
-                    .zip(buf_qg.par_chunks_exact(heads * 2 * dh))
-                    .zip(buf_k.par_chunks_exact(kv_dim))
-                    .zip(buf_v.par_chunks_exact(kv_dim))
+                    .zip(qg.par_chunks_exact(heads * 2 * dh))
+                    .zip(k.par_chunks_exact(kv_dim))
+                    .zip(v.par_chunks_exact(kv_dim))
                     .zip(krows.par_chunks_exact_mut(kv_dim))
                     .zip(vrows.par_chunks_exact_mut(kv_dim))
                     .enumerate()
@@ -1084,7 +1114,7 @@ impl Qwen35 {
         let (place, _att_done) = crate::prof::time_layer_n_ev(crate::prof::ATT_FULL, li, n, || {
             #[cfg(feature = "cuda")]
             let place = self.full_attn_attend_gpu(
-                buf_qg,
+                qg,
                 buf_q,
                 cache,
                 li,
@@ -1115,7 +1145,7 @@ impl Qwen35 {
                         let i = t / heads;
                         let hh = t % heads;
                         self.full_attn_attend_head(
-                            &buf_qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
+                            &qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
                             &buf_q[i * heads * dh..(i + 1) * heads * dh],
                             kcr,
                             vcr,
@@ -2118,6 +2148,9 @@ impl Qwen35 {
                         &mut buf_qg,
                         &mut buf_k,
                         &mut buf_v,
+                        // s175 (P17b): ホスト経路はこの関数の中で投影する
+                        // (`qkv_precomputed = false` なので読まれない)。
+                        QkvPre { qg: &[], k: &[], v: &[] },
                         &mut buf_q,
                         &mut buf_att,
                         rope_tab_ref,
@@ -2544,9 +2577,9 @@ impl Qwen35 {
                 // q/k/v はデバイス (CH_PFH) から直接 GEMM し、**値だけ**をホストへ
                 // 戻す (KV キャッシュはホストが正・prepare はホスト)。h2 の H2D は
                 // 発生しない (per-op 経路の 3 回の h2 H2D が消える)。
-                fit_prefill_buf(buf_qg, n * fl.q_w.dims().1);
-                fit_prefill_buf(buf_k, n * fl.k_w.dims().1);
-                fit_prefill_buf(buf_v, n * fl.v_w.dims().1);
+                // s175 (P17b): 戻しは [q|k|v] 連続領域の **1 発の D2H** (pinned)。
+                // ホストは同じ連続領域を 3 ビューで読むので、Vec への写しも
+                // 分割コピーも無い (値は従来とバイト一致)。
                 // s166 (P5): q|k|v の連結重みを先に割り当てる (parts が個別に
                 // VRAM へ載る前 = VRAM は増えない)。
                 if cuda::q4_chain_enabled() {
@@ -2554,15 +2587,38 @@ impl Qwen35 {
                         cuda::q4_register_row_alias(f, &[&fl.q_w, &fl.k_w, &fl.v_w]);
                     }
                 }
-                cuda::chain_qkv_prefill_q4_dev(
-                    &fl.q_w, &fl.k_w, &fl.v_w, n, li, buf_qg, buf_k, buf_v,
+                cuda::chain_qkv_prefill_q4_dev(&fl.q_w, &fl.k_w, &fl.v_w, n, li)
+                    .ok_or_else(|| anyhow::anyhow!("prefill residual chain: qkv chain failed"))?;
+                let qkv_host = cuda::chain_pf_qkv_host_view(
+                    n,
+                    fl.q_w.dims().1,
+                    fl.k_w.dims().1,
+                    fl.v_w.dims().1,
                 )
-                .ok_or_else(|| anyhow::anyhow!("prefill residual chain: qkv chain failed"))?;
+                .ok_or_else(|| anyhow::anyhow!("prefill residual chain: qkv host view failed"))?;
                 // s169 (P8): ここから attention のホスト側 (prepare + attend) と
                 // att の H2D までが full_core の区間 (GPU は遊ぶ = 区間に入る)。
                 cuda::pf_phase(cuda::PF_PH_FULL_CORE);
                 let att_place = self.full_attn_host_side(
-                    fl, cache, li, pos0, n, &[], buf_qg, buf_k, buf_v, buf_q, buf_att, rope_tab,
+                    fl,
+                    cache,
+                    li,
+                    pos0,
+                    n,
+                    &[],
+                    // s175 (P17b): qkv_precomputed = true では buf_qg/k/v は
+                    // fit も投影もされない (層の作業域として持ち回っているだけ)。
+                    buf_qg,
+                    buf_k,
+                    buf_v,
+                    QkvPre {
+                        qg: qkv_host.q(),
+                        k: qkv_host.k(),
+                        v: qkv_host.v(),
+                    },
+                    buf_q,
+                    buf_att,
+                    rope_tab,
                     true,
                     // s172 (P12): 直後の o_proj はデバイス。ゲート済み att が既に
                     // CH_ATT にあるなら H2D を省く (GpuDev)。
