@@ -1748,16 +1748,32 @@ impl Qwen35 {
                 )
                 .is_some(),
                 // s163: Q4 (27B 本番) も同じ 2 往復のデバイス常駐 FFN を通す。
-                _ => crate::cuda::chain_mlp_prefill_q4(
-                    &layer.gate_w,
-                    &layer.up_w,
-                    &layer.down_w,
-                    &buf_h2,
-                    n,
-                    li,
-                    &mut buf_down,
-                )
-                .is_some(),
+                // s165: gate_w / up_w は**連結重み gate_up_w の行範囲**として
+                // デバイスに載せる (decode chain が使う 1 本を共有する)。これで
+                // 同じ 2×ff×e パラメータを VRAM へ 2 度上げない (27B で 7.1 GB、
+                // H2D も 7.1 GB の節約)。登録に失敗したら従来どおり個別転送
+                // (q4_register_row_alias は前提不一致で false を返す = fail closed)。
+                _ => {
+                    // s165: 連結重みを共有するのは decode chain が有効なときだけ
+                    // (`DENNO_GPU_Q4_CHAIN=0` の per-op 経路は gate_up_w を使わない
+                    // ので、登録すると逆に無駄な転送になる)。
+                    if crate::cuda::q4_chain_enabled() {
+                        crate::cuda::q4_register_row_alias(
+                            &layer.gate_up_w,
+                            &[&layer.gate_w, &layer.up_w],
+                        );
+                    }
+                    crate::cuda::chain_mlp_prefill_q4(
+                        &layer.gate_w,
+                        &layer.up_w,
+                        &layer.down_w,
+                        &buf_h2,
+                        n,
+                        li,
+                        &mut buf_down,
+                    )
+                    .is_some()
+                }
             };
             #[cfg(not(feature = "cuda"))]
             let ffn_done = false;
@@ -2072,7 +2088,8 @@ impl Qwen35 {
         use crate::cuda::{
             chain_download, chain_linear, chain_q35_fullattn, chain_q35_gdn_scan,
             chain_q35_kv_stage_begin, chain_q35_kv_stage_flush, chain_q35_rope_pi_upload,
-            chain_q35_step_reserve, chain_q35_step_reserve_aq, chain_rmsnorm, chain_seg, chain_step_begin,
+            chain_q35_step_reserve, chain_q35_step_reserve_aq, chain_rmsnorm_cached, chain_seg,
+            chain_step_begin,
             chain_step_end, chain_swiglu, chain_upload,
             gpu_attention_enabled, q35_chain_shapes_ok, q35_ch_att_bytes,
             q35_ch_qkv_bytes, q35_fns_available, q35_kv_stage_bytes, CH_ACT, CH_ATT, CH_DOWN,
@@ -2174,7 +2191,7 @@ impl Qwen35 {
             crate::telemetry_layer_begin(li as u16);
             let l_norm = crate::prof::span_begin();
             crate::prof::time_full(crate::prof::RMSNORM, 1, true, || {
-                chain_rmsnorm(layer.attn_ln1(), eps, pending, CH_H, e, 1, li * 3)
+                chain_rmsnorm_cached(layer.attn_ln1(), eps, pending, CH_H, e, 1, li * 3, mid)
             })?;
             crate::prof::span_end(l_norm, crate::prof::SL_LAY_NORM_IN);
             match &layer.attn {
@@ -2267,7 +2284,7 @@ impl Qwen35 {
             // --- FFN (llama chain と同一): residual+rmsnorm → gate/up → swiglu → down
             let l_norm2 = crate::prof::span_begin();
             crate::prof::time_full(crate::prof::RMSNORM, 1, true, || {
-                chain_rmsnorm(&layer.ln2_w, eps, pending, CH_H, e, 1, li * 3 + 1)
+                chain_rmsnorm_cached(&layer.ln2_w, eps, pending, CH_H, e, 1, li * 3 + 1, mid)
             })?;
             crate::prof::span_end(l_norm2, crate::prof::SL_LAY_NORM_POST);
             let l_gu = crate::prof::span_begin();
@@ -2299,7 +2316,7 @@ impl Qwen35 {
         chain_seg(crate::prof::CHAIN_LAUNCH);
         let l_final = crate::prof::span_begin();
         crate::prof::time_full(crate::prof::LM_HEAD, 1, true, || -> Option<()> {
-            chain_rmsnorm(&self.norm_w, eps, pending, CH_H, e, 1, n_layers * 3)?;
+            chain_rmsnorm_cached(&self.norm_w, eps, pending, CH_H, e, 1, n_layers * 3, mid)?;
             chain_linear(&[self.lm_head.as_ref().unwrap()], CH_H, CH_LOGITS, 1)
         })?;
         // s154 (Task B15): `sl_step_final` に同じ区間を転記する (転記のみ・
