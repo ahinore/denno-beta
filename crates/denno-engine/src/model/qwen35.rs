@@ -1700,7 +1700,17 @@ impl Qwen35 {
                     &mut buf_down,
                 )
                 .is_some(),
-                _ => false,
+                // s163: Q4 (27B 本番) も同じ 2 往復のデバイス常駐 FFN を通す。
+                _ => crate::cuda::chain_mlp_prefill_q4(
+                    &layer.gate_w,
+                    &layer.up_w,
+                    &layer.down_w,
+                    &buf_h2,
+                    n,
+                    li,
+                    &mut buf_down,
+                )
+                .is_some(),
             };
             #[cfg(not(feature = "cuda"))]
             let ffn_done = false;

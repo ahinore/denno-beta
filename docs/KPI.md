@@ -97,5 +97,19 @@
 
 - `64c1163` のバイナリを同プロトコルで測る比較（別 worktree のビルドが要る。dev の CPU と
   競合するので dev 停止窓で実施）。これで「55.1 がコード差か測定差か」が確定する。
-- prefill の正式値は「サーバ停止 → 起動 → 1 リクエスト」の cold 単発・交互 A/B
-  （`docs/HISTORY.ja.md` の計測基準の訂正を参照）。
+
+## 4. prefill (27B q4・cold)
+
+計測は `scripts/prefill_bench.py`（毎回ユニークな前置きを付けて prefix cache を外す）。
+3 回の中央値、起動直後の 1 回は捨てる。**同じプロンプトの再送は cache に当たるので
+cold 計測に使えない**（旧手順の `cache_probe.py` turn1 はこの理由でばらついた）。
+
+| 条件 | `95f3cd8` | `125117c` | 倍率 |
+|---|---|---|---|
+| 3,161 token (16,000 chars) | 40.10 s | **24.21 s** | 1.66x |
+| 12,850 token (65,000 chars) | 162.3 s | **96.9〜109.1 s** | 1.5〜1.7x |
+
+- 内訳（`95f3cd8`・PROFILE・13k token）: prefill 161.4 s のうち `sl_lin` 113.5 s (70%)、
+  802 呼び出し = 141 ms/回。カーネルは 3,161 token の nsys で 7.9 s / 47.7 s のみ。
+- 一致: `temperature 0` の生成 3 問が旧バイナリと 176 バイト完全一致。
+- 詳細は `docs/PREFILL_PATH.md`。
