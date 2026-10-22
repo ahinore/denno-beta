@@ -83,6 +83,13 @@ struct Layer {
     /// メモリは int8 モードで約 1GB (fp32 なら 4GB) 増える代わりに、初回 GEMM の
     /// ホスト連結コピー (重みアップロード時) が不要になる。
     gate_up_w: Linear,
+    /// s166 (P5): qkv グループ (`Gdn` は [qkv | z]、`Full` は [q | k | v]) の
+    /// **行連結コピー**。Q4 のときだけ作る (int8 は grouped GEMV が既に 1 発・
+    /// fp32 は per-part のまま)。decode chain がこれ 1 本で 1 発の GEMV を投げる
+    /// ので、decode 1 ステップの GEMV 発数が 337 -> 257 になる (48 GDN × 5 +
+    /// 16 full × 6 + 1 = 337 の内訳のうち、qkv が 3/2 発に割れている分を畳む)。
+    /// 行ごとに独立なカーネルなので出力はビット一致。`None` = 従来の per-part。
+    qkv_fused: Option<Linear>,
     down_w: Linear, // mlp.down_proj
 }
 
@@ -462,12 +469,30 @@ impl Qwen35 {
                     ),
                 })
             };
+            // s166 (P5): qkv グループの行連結 (Q4 のときだけ)。decode chain が
+            // 1 発の GEMV で qkv を計算するための重みで、失敗したら None のまま
+            // (従来の per-part 経路 = 数値同一) にする。
+            let qkv_fused: Option<Linear> = (|| {
+                let parts: Vec<&Linear> = match &attn {
+                    AttnKind::Gdn(g) => vec![&g.qkv_w, &g.gate_w],
+                    AttnKind::Full(f) => vec![&f.q_w, &f.k_w, &f.v_w],
+                };
+                if parts.len() < 2 || !parts.iter().all(|p| matches!(p, Linear::Q4(_))) {
+                    return None;
+                }
+                let mut cat = concat_rows(parts[0], parts[1], "qkv").ok()?;
+                for p in &parts[2..] {
+                    cat = concat_rows(&cat, p, "qkv").ok()?;
+                }
+                Some(cat)
+            })();
             layers.push(Layer {
                 attn,
                 ln2_w,
                 gate_w,
                 up_w,
                 gate_up_w,
+                qkv_fused,
                 down_w,
             });
         }
@@ -1411,6 +1436,7 @@ impl Qwen35 {
                     gate_w: l.gate_w.clone(),
                     up_w: l.up_w.clone(),
                     gate_up_w: l.gate_up_w.clone(),
+                    qkv_fused: l.qkv_fused.clone(),
                     down_w: l.down_w.clone(),
                 })
                 .collect(),
@@ -1595,6 +1621,13 @@ impl Qwen35 {
                     // 経路へそのまま落ちる。GDN スキャンは n を分割しないので数値不変。
                     #[cfg(feature = "cuda")]
                     let gdn_chained = {
+                        // s166 (P5): qkv+z の連結重みを parts の行範囲として先に
+                        // 割り当てる (個別に VRAM へ載る前に行う = VRAM は増えない)。
+                        if crate::cuda::q4_chain_enabled() {
+                            if let Some(f) = layer.qkv_fused.as_ref() {
+                                crate::cuda::q4_register_row_alias(f, &[&g.qkv_w, &g.gate_w]);
+                            }
+                        }
                         let p = &self.gdn_p;
                         let kv_id = cache.kv_id();
                         let (conv, ssm) = cache
@@ -2114,26 +2147,28 @@ impl Qwen35 {
 
         match &layer.attn {
             AttnKind::Gdn(g) => {
-                // beta/alpha は従来どおりホストで計算する (h2 を 1 回だけ戻す)
-                let h2 = cuda::chain_download_at(cuda::CH_PFH, 0, n * e).ok_or_else(|| {
-                    anyhow::anyhow!("prefill residual chain: h2 download failed")
-                })?;
-                fit_prefill_buf(buf_h, n * e);
-                buf_h.copy_from_slice(&h2);
+                // beta/alpha は従来どおりホストで計算する (h2 を 1 回だけ戻す)。
+                // s167 (P6): h2 の D2H を専用コピーストリームで qkv/z GEMM と重ねる
+                // 経路を cuda 側が選ぶ (`DENNO_PF_OVERLAP=1` のときだけ。OFF・準備
+                // 失敗は従来と同一の順序 = 同期 D2H → beta/alpha → GEMM/scan/o_proj)。
+                // beta/alpha の関数・引数・順序、h2 の値、カーネル列は不変。
                 fit_prefill_buf(buf_beta, n * g.beta_w.dims().1);
                 fit_prefill_buf(buf_alpha, n * g.alpha_w.dims().1);
-                crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                    g.beta_w.apply_bt_rows_into(&buf_h[..], n, buf_beta)
-                });
-                crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                    g.alpha_w.apply_bt_rows_into(&buf_h[..], n, buf_alpha)
-                });
                 let p = &self.gdn_p;
                 let kv_id = cache.kv_id();
                 let (conv, ssm) = cache.gdn_state_mut(li).ok_or_else(|| {
                     anyhow::anyhow!("GDN state slot が未初期化 (prefill residual chain)")
                 })?;
-                cuda::chain_gdn_prefill_q4_dev(
+
+                // s166 (P5): qkv+z の連結重みを先に割り当てる (parts が個別に
+                // VRAM へ載る前 = VRAM は増えない)。
+                if cuda::q4_chain_enabled() {
+                    if let Some(f) = layer.qkv_fused.as_ref() {
+                        cuda::q4_register_row_alias(f, &[&g.qkv_w, &g.gate_w]);
+                    }
+                }
+                cuda::chain_gdn_prefill_q4_dev_ovl(
+
                     &g.qkv_w,
                     &g.gate_w,
                     &g.out_w,
@@ -2155,6 +2190,20 @@ impl Qwen35 {
                     ssm,
                     li,
                     kv_id,
+                    |h2, beta, alpha| {
+                        // 従来と同じ作業バッファへ写してから計算する (フラグ OFF の
+                        // 実行経路を今日と 1 命令も変えないため。ON 経路ではこの写しも
+                        // qkv/z GEMM の裏で走るので直列コストにならない)。
+                        fit_prefill_buf(buf_h, n * e);
+                        buf_h.copy_from_slice(h2);
+                        crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
+                            g.beta_w.apply_bt_rows_into(&buf_h[..], n, beta)
+                        });
+                        crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
+                            g.alpha_w.apply_bt_rows_into(&buf_h[..], n, alpha)
+                        });
+                        Some(())
+                    },
                 )
                 .ok_or_else(|| anyhow::anyhow!("prefill residual chain: GDN chain failed"))?;
             }
@@ -2165,6 +2214,13 @@ impl Qwen35 {
                 fit_prefill_buf(buf_qg, n * fl.q_w.dims().1);
                 fit_prefill_buf(buf_k, n * fl.k_w.dims().1);
                 fit_prefill_buf(buf_v, n * fl.v_w.dims().1);
+                // s166 (P5): q|k|v の連結重みを先に割り当てる (parts が個別に
+                // VRAM へ載る前 = VRAM は増えない)。
+                if cuda::q4_chain_enabled() {
+                    if let Some(f) = layer.qkv_fused.as_ref() {
+                        cuda::q4_register_row_alias(f, &[&fl.q_w, &fl.k_w, &fl.v_w]);
+                    }
+                }
                 cuda::chain_qkv_prefill_q4_dev(
                     &fl.q_w, &fl.k_w, &fl.v_w, n, li, buf_qg, buf_k, buf_v,
                 )
@@ -2548,7 +2604,18 @@ impl Qwen35 {
                     // qkv + z 投影: CH_QKV = [qkv (2nk*dk+nv*dv) | z (nv)]
                     crate::cuda::lin_stage_tagged(crate::prof::QKV, || -> Option<()> {
                         // s157 (Task B20 段階 1): int8 / q4 のどちらでも同じ入口。
-                        chain_linear(&[&g.qkv_w, &g.gate_w], CH_H, CH_QKV, 1)
+                        // s166 (P5): Q4 は [qkv|z] の**連結重み 1 本**で 1 発
+                        // (`chain_linear_q4_fused` は使えなければ per-part に落ちる)。
+                        let fused = match layer.qkv_fused.as_ref() {
+                            Some(Linear::Q4(f)) => Some(f),
+                            _ => None,
+                        };
+                        match (fused, &g.qkv_w, &g.gate_w) {
+                            (Some(f), Linear::Q4(a), Linear::Q4(b)) => {
+                                crate::cuda::chain_linear_q4_fused(f, &[a, b], CH_H, CH_QKV, 1)
+                            }
+                            _ => chain_linear(&[&g.qkv_w, &g.gate_w], CH_H, CH_QKV, 1),
+                        }
                     })?;
                     // beta/alpha (fp32 matvec・CH_QKV テール) → dno_gdn_scan
                     // (y → CH_ATT・新状態は staged async D2H・ping-pong 面 交換)
@@ -2594,7 +2661,18 @@ impl Qwen35 {
                     // qkv 投影: CH_QKV = [qg (heads*2dh) | k (kv_dim) | v (kv_dim)]
                     let l_qk = crate::prof::span_begin();
                     crate::cuda::lin_stage_tagged(crate::prof::QKV, || -> Option<()> {
-                        chain_linear(&[&f.q_w, &f.k_w, &f.v_w], CH_H, CH_QKV, 1)
+                        // s166 (P5): Q4 は [q|k|v] の連結重み 1 本で 1 発
+                        // (使えなければ per-part = 従来どおり 3 発・数値同一)。
+                        let fused = match layer.qkv_fused.as_ref() {
+                            Some(Linear::Q4(f)) => Some(f),
+                            _ => None,
+                        };
+                        match (fused, &f.q_w, &f.k_w, &f.v_w) {
+                            (Some(f), Linear::Q4(a), Linear::Q4(b), Linear::Q4(c)) => {
+                                crate::cuda::chain_linear_q4_fused(f, &[a, b, c], CH_H, CH_QKV, 1)
+                            }
+                            _ => chain_linear(&[&f.q_w, &f.k_w, &f.v_w], CH_H, CH_QKV, 1),
+                        }
                     })?;
                     crate::prof::span_end(l_qk, crate::prof::SL_LAY_FULL_QK);
                     // QK-Norm + partial rope (q → CH_Q35_Q・k → KV ミラー pos0 行直書き)
@@ -2772,6 +2850,44 @@ mod tests {
         up.apply_bt_rows_into(&x, 1, &mut u);
         assert_eq!(&out[..ff], &g[..], "連結の前半が gate と不一致");
         assert_eq!(&out[ff..], &u[..], "連結の後半が up と不一致");
+    }
+
+    /// s166 (P5): qkv の行連結 (`Layer::qkv_fused` = decode chain が 1 発で回す
+    /// 重み) は、part ごとに適用した結果と行単位で一致する。
+    /// 行順は [q | k | v] (full) / [qkv | z] (GDN) で、どちらも 2 本以上の連結。
+    #[test]
+    fn q4_qkv_fused_rows_match_parts() {
+        let k = 64usize;
+        let (nq, nk_, nv_) = (48usize, 8usize, 8usize);
+        let mk = |n: usize, s: f32| -> Linear {
+            let w: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.011 * s).sin()).collect();
+            Linear::new(w, k, n, QuantMode::Q4_0)
+        };
+        let (q, kk, v) = (mk(nq, 1.0), mk(nk_, 1.7), mk(nv_, 2.3));
+        // 2 本 (GDN: [qkv|z]) と 3 本 (full: [q|k|v]) の両方の作り方を通す
+        let cat2 = concat_rows(&q, &kk, "qkv").expect("Q4 同士は連結できる");
+        assert_eq!(cat2.dims(), (k, nq + nk_), "2 本連結の形状");
+        let cat3 = concat_rows(&cat2, &v, "qkv").expect("Q4 同士は連結できる");
+        assert_eq!(cat3.dims(), (k, nq + nk_ + nv_), "3 本連結の形状");
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.031) - 0.9).collect();
+        let mut all = vec![0f32; nq + nk_ + nv_];
+        cat3.apply_bt_rows_into(&x, 1, &mut all);
+        let mut parts = vec![0f32; nq + nk_ + nv_];
+        q.apply_bt_rows_into(&x, 1, &mut parts[..nq]);
+        kk.apply_bt_rows_into(&x, 1, &mut parts[nq..nq + nk_]);
+        v.apply_bt_rows_into(&x, 1, &mut parts[nq + nk_..]);
+        assert_eq!(bits(&all), bits(&parts), "連結 3 本の出力が per-part と bit 不一致");
+        // ブロック列も行順の連結そのもの (1 発で同じビット列になる根拠)
+        match (&cat3, &q, &kk, &v) {
+            (Linear::Q4(c), Linear::Q4(a), Linear::Q4(b), Linear::Q4(d)) => {
+                let mut want = Vec::new();
+                want.extend_from_slice(&a.blocks);
+                want.extend_from_slice(&b.blocks);
+                want.extend_from_slice(&d.blocks);
+                assert_eq!(c.blocks, want, "連結ブロック列が part の連結と不一致");
+            }
+            _ => panic!("Q4 の連結は Q4 のまま"),
+        }
     }
 
 
