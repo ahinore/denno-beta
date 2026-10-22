@@ -304,6 +304,51 @@ impl Linear {
         out
     }
 
+    /// s172 (P13): **2 本の小 n 投影 (GDN の beta/alpha) を 1 回の走査で**まとめて
+    /// 計算する。`self.apply_bt_rows_into` と `other.apply_bt_rows_into` を順に
+    /// 呼ぶのと**ビット一致**する (各 (i,j) の d 昇順逐次累積は不変で、変わるのは
+    /// 処理順だけ)。
+    ///
+    /// 速い経路は「両方が F32・同じ k」のときだけ。Q8/Q4 が混ざる形・形の不一致・
+    /// 出力長の不足は**従来の 2 回呼び出しへ落ちる** (fail-closed・数値は同一)。
+    pub fn apply_bt_rows_pair_into(
+        &self,
+        other: &Self,
+        a: &[f32],
+        m: usize,
+        out1: &mut [f32],
+        out2: &mut [f32],
+    ) {
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        if let (
+            Linear::F32 { w: w1, k: k1, n: n1 },
+            Linear::F32 { w: w2, k: k2, n: n2 },
+        ) = (self, other)
+        {
+            if k1 == k2
+                && *k1 > 0
+                && a.len() >= m * *k1
+                && out1.len() >= m * *n1
+                && out2.len() >= m * *n2
+            {
+                crate::tensor::matvec_rows_bt_pair_into(
+                    &a[..m * *k1],
+                    &w1[..*n1 * *k1],
+                    &w2[..*n2 * *k2],
+                    *k1,
+                    *n1,
+                    *n2,
+                    m,
+                    &mut out1[..m * *n1],
+                    &mut out2[..m * *n2],
+                );
+                return;
+            }
+        }
+        self.apply_bt_rows_into(a, m, out1);
+        other.apply_bt_rows_into(a, m, out2);
+    }
+
     /// s63: `apply_bt_rows` の書き込み先指定版 (prefill ホットパス用)。
     ///
     /// 呼び出し側が層をまたいで再利用するバッファを渡す前提で、ここでは
@@ -781,6 +826,51 @@ mod tests {
                         bound = bound
                     );
                 }
+            }
+        }
+    }
+
+    /// s172 (P13): `apply_bt_rows_pair_into` は「両方 F32」以外では従来の 2 回
+    /// 呼び出しへ落ちる (fail-closed)。落ちた場合も値は 2 回呼び出しと同一で
+    /// あることを Q8 混在・形の不一致で固定する。
+    #[test]
+    fn apply_bt_rows_pair_falls_back_outside_f32_pair() {
+        let (m, k, n) = (5usize, 64usize, 3usize);
+        let a = pseudo_random(m * k, 31);
+        let w1 = pseudo_random(k * n, 32);
+        let w2 = pseudo_random(k * n, 33);
+        let f32_a = Linear::new(w1.clone(), k, n, QuantMode::Fp32);
+        let f32_b = Linear::new(w2.clone(), k, n, QuantMode::Fp32);
+        let q8_a = Linear::new(w1.clone(), k, n, QuantMode::Int8);
+        // (1) F32 + F32: 速い経路 (値は 2 回呼び出しと同一)
+        // (2) Q8 + F32: フォールバック (Q8 は GPU 入口 / CPU matmul_bt_i8 を通る)
+        let cases: [(Linear, Linear); 2] = [
+            (f32_a.clone(), f32_b.clone()),
+            (q8_a, f32_b.clone()),
+        ];
+        for (i, (l1, l2)) in cases.iter().enumerate() {
+            let n1 = l1.dims().1;
+            let n2 = l2.dims().1;
+            let mut got1 = vec![0.0f32; m * n1];
+            let mut got2 = vec![0.0f32; m * n2];
+            l1.apply_bt_rows_pair_into(l2, &a, m, &mut got1, &mut got2);
+            let mut want1 = vec![0.0f32; m * n1];
+            let mut want2 = vec![0.0f32; m * n2];
+            l1.apply_bt_rows_into(&a, m, &mut want1);
+            l2.apply_bt_rows_into(&a, m, &mut want2);
+            for idx in 0..m * n1 {
+                assert_eq!(
+                    got1[idx].to_bits(),
+                    want1[idx].to_bits(),
+                    "case={i} idx={idx}: 1 本目が 2 回呼び出しと不一致"
+                );
+            }
+            for idx in 0..m * n2 {
+                assert_eq!(
+                    got2[idx].to_bits(),
+                    want2[idx].to_bits(),
+                    "case={i} idx={idx}: 2 本目が 2 回呼び出しと不一致"
+                );
             }
         }
     }
