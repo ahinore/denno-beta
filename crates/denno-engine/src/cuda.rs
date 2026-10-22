@@ -3402,6 +3402,175 @@ fn split_flush(t: &mut Option<Instant>) {
     *t = None;
 }
 
+/// s168 (P7): prefill の q4 GEMM 行タイル (**実測ノブ**)。1 タイル = 1 回の
+/// `dno_gemm_q4_0` launch で、grid は (mr.div_ceil(64), n.div_ceil(128))。
+/// 既定は s124 以来の 1024。`DENNO_Q4_M_TILE` で 64..=8192 の 64 の倍数を
+/// 指定できる (再ビルド無しで 512 / 1024 / 2048 / 4096 を A/B するための入口)。
+///
+/// 中間バッファは 1 タイルあたり (行) x (列) x 4 B で、行数は端数併合を含めて
+/// 最大 `tile + q4_tail_merge_below()` (既定 1024 + 16 = 1040 行)。
+/// 27B (e=5120, ff=17408) の MLP で 1040 行 = CH_GA 138 MiB / CH_ACT 69 MiB /
+/// CH_PFH・CH_DOWN 各 20 MiB。4096 行なら 546 MiB / 273 MiB / 80 MiB、
+/// 8192 行なら 1090 MiB / 545 MiB / 160 MiB。
+const Q4_M_TILE: usize = 1024;
+
+/// [`Q4_M_TILE`] の上限。中間バッファがタイル行数に比例するので 8192 行で止める
+/// (27B MLP の CH_GA は約 1.1 GiB — 13k 行を一度に置く 2.7 GiB には届かない)。
+const Q4_M_TILE_MAX: usize = 8192;
+
+/// タイル幅の刻み。`dno_gemm_q4_0` の行ブロック (Q4_GM = 64) に揃える — 途中の
+/// タイルはすべて 64 の倍数行になり、grid.x が端数ブロックを出さない。
+const Q4_M_TILE_STEP: usize = 64;
+
+/// `DENNO_Q4_M_TILE` の解釈 (純粋関数)。範囲外・非数・刻み外は既定へ落とす
+/// (不正な env で panic させない — `q4_gemv_c()` と同じ規約)。
+fn parse_q4_m_tile(v: Option<&str>) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(t) if (Q4_M_TILE_STEP..=Q4_M_TILE_MAX).contains(&t) && t % Q4_M_TILE_STEP == 0 => t,
+        _ => Q4_M_TILE,
+    }
+}
+
+/// [`Q4_M_TILE`] の実効値 (env `DENNO_Q4_M_TILE` があればそちら)。プロセス内で
+/// 1 回だけ読む (serve の起動時に env を決める運用なので、途中変更は見ない)。
+fn q4_m_tile() -> usize {
+    static TILE: OnceLock<usize> = OnceLock::new();
+    *TILE.get_or_init(|| {
+        let v = std::env::var("DENNO_Q4_M_TILE").ok();
+        parse_q4_m_tile(v.as_deref())
+    })
+}
+
+/// s168 (P7): 端数タイルを直前のタイルへ併合する閾値 (行)。
+///
+/// `max_m()` は「GEMV が GEMM より速い帯域」の上限 (既定 16) で、ファイル中の
+/// 他の dispatch はこの行数以下を GEMV に回す。prefill の GEMM は 64 行ブロック
+/// 単位なので、これ未満の端数を単独タイルにすると 1 launch がほぼ空回りする
+/// (しかも sync 付きの経路では待ち時間が丸ごと乗る)。端数がこれ未満なら
+/// 直前のタイルに足して 1 回で流す。`DENNO_CUDA_MAX_M=0` にすると併合しない
+/// (併合そのものの A/B 用)。
+fn q4_tail_merge_below() -> usize {
+    max_m()
+}
+
+/// s168 (P7): 1 タイルが受ける最大行数 (端数併合を含む)。中間バッファはこの
+/// 行数で**ループの前に**確保する — 途中で grow させると、先行 launch が読んで
+/// いるバッファを解放しうる (`Scratch::ensure` は grow-only の入れ替え)。
+fn q4_tile_max_rows(tile: usize) -> usize {
+    tile.saturating_add(q4_tail_merge_below())
+}
+
+/// s168 (P7): `r0` から始まる次の行グループの行数 (純粋関数)。
+/// 端数が [`q4_tail_merge_below`] 以下なら、その端数もこのグループに含める
+/// (返り値 <= tile + tail)。行は互いに独立で 1 行の累積順は変わらないため、
+/// 行のまとめ方は出力のビットを変えない (カーネル・引数・grid の作り方は同一)。
+///
+/// 閾値は `<=` にして [`pf_res_gate`] / [`gdn_prefill_q4_geom`] の
+/// 「端数 <= max_m() は受けない」と揃えてある — ゲートが受けた n に対しては、
+/// 端数タイルが単独で launch されることが無い。
+fn q4_group_rows(r0: usize, m: usize, tile: usize) -> usize {
+    let left = m - r0;
+    let mr = tile.min(left);
+    let rem = left - mr;
+    if rem > 0 && rem <= q4_tail_merge_below() {
+        left
+    } else {
+        mr
+    }
+}
+
+/// s168 (Task P7): 行タイルのノブと端数併合の契約 (純粋関数・GPU 不要)。
+#[cfg(test)]
+mod p7_tile_tests {
+    use super::*;
+
+    /// `DENNO_Q4_M_TILE` の解釈: 既定は従来値、範囲外・刻み外・非数は既定へ。
+    #[test]
+    fn env_tile_parse() {
+        assert_eq!(Q4_M_TILE, 1024, "既定は s124 以来の 1024 のまま");
+        assert_eq!(parse_q4_m_tile(None), 1024);
+        assert_eq!(parse_q4_m_tile(Some("")), 1024);
+        assert_eq!(parse_q4_m_tile(Some("abc")), 1024);
+        assert_eq!(parse_q4_m_tile(Some("-512")), 1024);
+        assert_eq!(parse_q4_m_tile(Some("0")), 1024);
+        assert_eq!(parse_q4_m_tile(Some("32")), 1024, "64 行未満は受けない");
+        assert_eq!(parse_q4_m_tile(Some("96")), 1024, "64 の倍数でない");
+        assert_eq!(parse_q4_m_tile(Some("999999")), 1024, "上限超え");
+        assert_eq!(parse_q4_m_tile(Some(" 2048 ")), 2048, "前後の空白は許す");
+        for t in [64usize, 512, 1024, 2048, 4096, 8192] {
+            assert_eq!(parse_q4_m_tile(Some(&t.to_string())), t, "t={t}");
+        }
+        // 本番の実効値も必ず受理域に入る (panic も 0 行タイルも作らない)
+        let eff = q4_m_tile();
+        assert!(eff % Q4_M_TILE_STEP == 0 && eff >= Q4_M_TILE_STEP && eff <= Q4_M_TILE_MAX);
+    }
+
+    /// 行グループの契約: 重複・欠落なしで m 行を覆い、1 グループは cap 行以下。
+    /// 途中のグループは必ず tile 行ちょうど (併合は最終グループだけ)、
+    /// 端数 (<= tail) が単独タイルとして launch されることは無い。
+    #[test]
+    fn row_groups_cover_rows_exactly() {
+        let tail = q4_tail_merge_below();
+        for tile in [64usize, 128, 512, 1024, 2048, 4096] {
+            let cap = q4_tile_max_rows(tile);
+            assert_eq!(cap, tile + tail, "tile={tile}");
+            for m in 1..=3000usize {
+                let (mut r0, mut groups) = (0usize, 0usize);
+                while r0 < m {
+                    let mr = q4_group_rows(r0, m, tile);
+                    assert!(mr > 0, "tile={tile} m={m} r0={r0}: 空グループ");
+                    assert!(mr <= cap, "tile={tile} m={m}: {mr} 行 > cap {cap}");
+                    if r0 + mr < m {
+                        assert_eq!(mr, tile, "tile={tile} m={m} r0={r0}: 途中が {mr} 行");
+                    } else if r0 > 0 {
+                        // 最終グループ: tile ちょうど or 併合 (tile 超) or tail 超の端数
+                        assert!(
+                            mr >= tile || mr > tail,
+                            "tile={tile} m={m}: 端数 {mr} 行 (tail {tail}) を単独 launch している"
+                        );
+                    }
+                    r0 += mr;
+                    groups += 1;
+                    assert!(groups <= m, "tile={tile} m={m}: グループ数が行数を超えた");
+                }
+                assert_eq!(r0, m, "tile={tile} m={m}: 行が覆われていない");
+            }
+        }
+    }
+
+    /// 13k token の実形 (27B の prefill) で、タイル幅ごとの launch 回数と
+    /// 端数併合の有無を固定する (REPORT_P7.md の表と同じ計算)。
+    #[test]
+    fn row_groups_at_13k_tokens() {
+        let tail = q4_tail_merge_below();
+        // (tile, 13,000 行のグループ数) — 端数 712 行はどの tile でも tail 超
+        for (tile, want) in [(512usize, 26usize), (1024, 13), (2048, 7), (4096, 4)] {
+            let mut r0 = 0usize;
+            let mut n = 0usize;
+            while r0 < 13_000 {
+                r0 += q4_group_rows(r0, 13_000, tile);
+                n += 1;
+            }
+            assert_eq!(n, want, "tile={tile} 13,000 行の launch 回数");
+        }
+        // 端数が tail 以下の形は直前のタイルへ併合され、グループ数が 1 減る
+        let m = 1024 * 3 + 4;
+        let mut r0 = 0usize;
+        let (mut n, mut last) = (0usize, 0usize);
+        while r0 < m {
+            last = q4_group_rows(r0, m, 1024);
+            r0 += last;
+            n += 1;
+        }
+        if tail >= 4 {
+            assert_eq!(n, 3, "端数 4 行は 3 番目のタイルへ併合 (2,048+ 行)");
+            assert_eq!(last, 1024 + 4, "併合後の最終タイル行数");
+        } else {
+            assert_eq!(n, 4, "併合 OFF (DENNO_CUDA_MAX_M=0) では 4 グループ");
+        }
+    }
+}
+
 /// s123: Q4_0 の 1 層ぶん。小さい m は GEMV (1 warp = 1 行)、大きい m は
 /// タイル GEMM (1 block = 16 行 x 256 列)。H2D → kernel → D2H → sync ×1。
 fn q4_dispatch(
@@ -3419,12 +3588,13 @@ fn q4_dispatch(
     // 通ったスレッド数ぶん積み上がる (27B・10.8k token で約 11 GB になり、続く
     // リクエストが cuMemAlloc error 2 で CPU へ落ちた)。
     // 行は互いに独立で、1 行の演算順はタイル分割で変わらないため出力は bit 一致する。
-    const Q4_M_TILE: usize = 1024;
+    // s168 (P7): タイル幅は `DENNO_Q4_M_TILE` の実効値、端数は直前のタイルへ併合する。
+    let tile = q4_m_tile();
     let lib = lib()?;
     ctx.make_current()?;
     let mut r0 = 0;
     while r0 < m {
-        let mr = Q4_M_TILE.min(m - r0);
+        let mr = q4_group_rows(r0, m, tile);
         let a_t = &a[r0 * k..r0 * k + mr * k];
         let out_t = &mut out[r0 * n..r0 * n + mr * n];
         q4_dispatch_tile(ctx, lib, a_t, gw, mr, k, n, use_gemm, out_t)?;
@@ -5064,19 +5234,25 @@ fn chain_mlp_prefill_q4_impl(
     let gw2 = weights_for_q4(uu.uid, &uu.blocks, uu.k, uu.n).ok()?;
     let gw3 = weights_for_q4(du.uid, &du.blocks, du.k, du.n).ok()?;
     // Slot 出力は CH_DOWN の行オフセットへ書くので、全行ぶんの領域を要求する
-    // (タイルごとの ensure は mr 行ぶんしか保証しない)。
+    // (タイルごとの ensure は 1 タイル分しか保証しない)。
     if matches!(sink, PfSink::Slot) {
         ok(chain_ensure_buf(CH_DOWN, m.checked_mul(e)?.checked_mul(4)?))?;
     }
-    const TILE: usize = 1024;
+    // s168 (P7): タイル幅は `DENNO_Q4_M_TILE` の実効値、端数は直前のタイルへ併合。
+    // 中間バッファは 1 タイルの**最大**行数 (`q4_tile_max_rows`) でループの前に
+    // 確保する — 併合されるのは最終タイルだけなので、ループ内で grow させると
+    // 先行 launch が読んでいるバッファを解放しうる。
+    let tile = q4_m_tile();
+    let cap = q4_tile_max_rows(tile).min(m);
+    ok(chain_ensure_buf(CH_PFH, cap * e * 4))?;
+    ok(chain_ensure_buf(CH_GA, cap * 2 * ff * 4))?;
+    ok(chain_ensure_buf(CH_ACT, cap * ff * 4))?;
+    ok(chain_ensure_buf(CH_DOWN, cap * e * 4))?;
     let _ = li;
     let mut r0 = 0usize;
     while r0 < m {
-        let mr = TILE.min(m - r0);
-        ok(chain_ensure_buf(CH_PFH, mr * e * 4))?;
-        ok(chain_ensure_buf(CH_GA, mr * 2 * ff * 4))?;
-        ok(chain_ensure_buf(CH_ACT, mr * ff * 4))?;
-        ok(chain_ensure_buf(CH_DOWN, mr * e * 4))?;
+        let mr = q4_group_rows(r0, m, tile);
+        debug_assert!(mr <= cap, "tile group {mr} > cap {cap}");
         // 出力先 (Host のときだけ D2H する)。生ポインタで持って CHAIN の
         // クロージャに渡す (Vec の再借用を避ける)。
         let dst: Option<*mut f32> = match &mut sink {
@@ -10642,6 +10818,12 @@ pub fn gdn_scan_batch_oproj(
 }
 
 /// per-op 経路の行タイル (この単位で H2D + GEMM を回す)。
+///
+/// s168 (P7): 実際の dispatch は `DENNO_Q4_M_TILE` の実効値 ([`q4_m_tile`]) を使う。
+/// この定数は**入口ゲート** ([`gdn_prefill_q4_geom`] / [`pf_res_gate`]) が前提にする
+/// 歴史的なタイル幅 (1024) で、ゲートは端数タイルの帯域だけを見る保守的な判定
+/// なので、実効タイルがこれと違っても「受けない」側にしか倒れない
+/// (受けた場合は [`q4_group_rows`] が端数を直前のタイルへ併合する)。
 const GDN_PREFILL_TILE: usize = 1024;
 
 /// `chain_gdn_prefill_q4` が使う寸法 (入口条件を通ったときだけ作られる)。
@@ -10840,7 +11022,10 @@ fn chain_gdn_prefill_q4_impl(
     let g = gdn_prefill_q4_geom(qkv_w, z_w, o_w, n, nk, nv, dk, dv, d_conv)?;
     let (qw, zw, ow) = (g.qw, g.zw, g.ow);
     let (e, conv_dim, vd, cs) = (g.e, g.conv_dim, g.vd, g.cs);
-    const TILE: usize = GDN_PREFILL_TILE;
+    // s168 (P7): 行タイルは `DENNO_Q4_M_TILE` の実効値。端数は直前のタイルへ併合
+    // するので、CH_PFH (入力のステージ) は 1 タイルの最大行数で確保する。
+    let tile = q4_m_tile();
+    let cap = q4_tile_max_rows(tile).min(n);
     let nv_tot = n.checked_mul(nv)?;
     if beta.len() < nv_tot || alpha.len() < nv_tot {
         return None;
@@ -10897,10 +11082,11 @@ fn chain_gdn_prefill_q4_impl(
                 s.alpha.as_ref()?.ptr(),
             ))
         })?;
-    ok(chain_ensure_buf(CH_PFH, TILE.min(n).checked_mul(e)?.checked_mul(4)?))?;
+    ok(chain_ensure_buf(CH_PFH, cap.checked_mul(e)?.checked_mul(4)?))?;
     ok(chain_ensure_buf(CH_O, n.checked_mul(e)?.checked_mul(4)?))?;
 
-    // 1) qkv / z 投影: 入力を 1024 行ずつ用意し、GEMM は出力の行オフセットへ書く
+    // 1) qkv / z 投影: 入力を 1 タイル (`DENNO_Q4_M_TILE`・端数は直前へ併合) ずつ
+    //    用意し、GEMM は出力の行オフセットへ書く
     //    (per-op 経路の 1024 行タイルと同じ形。H2D と GEMM は同一ストリームで
     //    順序が保たれるので、タイル間の sync は要らない)。Host はタイルごとに
     //    H2D、Slot (残差常駐経路) は CH_PFH の該当行をそのまま読む — 転送だけが
@@ -10910,7 +11096,8 @@ fn chain_gdn_prefill_q4_impl(
     if phase != PfGdnPhase::Rest {
         let mut r0 = 0usize;
         while r0 < n {
-            let mr = TILE.min(n - r0);
+            let mr = q4_group_rows(r0, n, tile);
+            debug_assert!(mr <= cap, "tile group {mr} > cap {cap}");
             CHAIN.with(|cell| -> Option<()> {
                 let s = cell.borrow();
                 let pbuf = s.bufs[CH_PFH].as_ref()?.ptr();
