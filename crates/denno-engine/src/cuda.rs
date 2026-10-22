@@ -11384,14 +11384,21 @@ fn chain_gdn_prefill_q4_impl(
 // なので数値は 1 つも変わらない。コピーと GEMM は互いに独立 (どちらも CH_PFH を
 // 読むだけ) で、書き込み先も別。
 //
-// 発動条件は `DENNO_PF_OVERLAP=1` (既定 OFF)。OFF・driver に必要な API が無い・
-// stream/event/pinned の作成に失敗、のいずれでも従来と同一の同期経路を通る。
+// 発動条件は `DENNO_PF_OVERLAP` (s172/P13 で**既定 ON**。`=0` で従来の直列経路)。
+// 明示 OFF・driver に必要な API が無い・stream/event/pinned の作成に失敗、
+// のいずれでも従来と同一の同期経路を通る。
 // ---------------------------------------------------------------------------
 
-/// s167 (P6): `DENNO_PF_OVERLAP` の解釈 (純粋関数)。**"1"/"true"/"on" だけが有効**で、
-/// 未設定・空・"0" などは OFF (既定 OFF = 従来と同一経路)。
+/// s167 (P6): `DENNO_PF_OVERLAP` の解釈 (純粋関数)。
+///
+/// s172 (P13): **既定を ON にした** (OFF に戻すのは `DENNO_PF_OVERLAP=0` の
+/// 明示指定だけ)。根拠は gdn_proj の実測内訳 (12,850 で 18.0 s) —
+/// 「h2 の D2H ≈0.7 s + ホスト beta/alpha 8.1 s + qkv/z GEMM ≈9.2 s」で、
+/// ホスト仕事は GEMM の裏に隠れる (隠せるのは min(コピー+ホスト, GEMM))。
+/// 数値は経路によらず同一: 同じバイト列を同じバッファから戻すだけで、
+/// ホスト計算・カーネル・引数・順序は変わらない。
 pub fn parse_pf_overlap(raw: Option<&str>) -> bool {
-    matches!(raw, Some("1") | Some("true") | Some("on"))
+    !matches!(raw, Some("0") | Some("false") | Some("off"))
 }
 
 /// 実行時の env 実効値 (初回だけ読む)。
@@ -13673,20 +13680,21 @@ mod p6_overlap_tests {
     //! テスト)。数値の一致・速度は実機の担当。
     //!
     //! ここで固定する契約:
-    //!   - フラグは明示的な "1"/"true"/"on" だけが ON (既定 OFF = 従来と同一経路)
+    //!   - フラグは既定 ON (s172/P13)。明示的な "0"/"off"/"false" だけが OFF
+    //!     (= 従来の直列経路)
     //!   - stream/event/pinned の準備に失敗したら必ず従来の同期 D2H (`SyncD2h`)
     //!   - 形が不正・桁あふれ・0 バイトでも従来経路 (コピーを発行しない)
     use super::*;
 
-    /// `DENNO_PF_OVERLAP` は既定 OFF。明示的な真値だけが ON。
+    /// s172 (P13): `DENNO_PF_OVERLAP` は**既定 ON**。明示的な偽値だけが OFF。
     #[test]
-    fn pf_overlap_flag_defaults_off() {
-        assert!(!parse_pf_overlap(None), "未設定は OFF (従来と同一経路)");
-        for raw in ["", "0", "off", "false", " 1", "1 ", "TRUE", "yes"] {
-            assert!(!parse_pf_overlap(Some(raw)), "raw={raw:?} は OFF のはず");
-        }
-        for raw in ["1", "true", "on"] {
+    fn pf_overlap_flag_defaults_on() {
+        assert!(parse_pf_overlap(None), "未設定は ON (gdn_proj のホスト仕事を GEMM の裏に隠す)");
+        for raw in ["", "1", "true", "on", "yes", " 1", "TRUE"] {
             assert!(parse_pf_overlap(Some(raw)), "raw={raw:?} は ON のはず");
+        }
+        for raw in ["0", "off", "false"] {
+            assert!(!parse_pf_overlap(Some(raw)), "raw={raw:?} は OFF (従来と同一経路) のはず");
         }
     }
 
