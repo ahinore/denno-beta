@@ -8106,7 +8106,7 @@ mod tests {
     fn gemm_pad_preserves_dot_and_tiling_is_exact() {
         // 1) パディングは実列を保存し、余りは 0
         for &(k, n) in &[(4usize, 100usize), (37, 200), (1536, 17920), (30, 256), (1, 1)] {
-            let qw: Vec<i8> = (0..k * n).map(|i| ((i * 37) % 251) as i32 as i8 - 125).collect();
+            let qw: Vec<i8> = (0..k * n).map(|i| (((i * 37) % 251) as i32 - 125) as i8).collect();
             let padded = gemm_pad_apply(&qw, k, n);
             assert_eq!(padded.len(), k * gemm_pad_n(n), "k={k} n={n}");
             assert_eq!(gemm_pad_n(n) % 256, 0);
@@ -8122,7 +8122,7 @@ mod tests {
                 assert!(padded[r * k..(r + 1) * k].iter().all(|&v| v == 0), "pad 行が 0 でない");
             }
             // パディング行の寄与は 0 (dot が不変)
-            let aq: Vec<i8> = (0..k).map(|i| ((i * 11) % 251) as i32 as i8 - 120).collect();
+            let aq: Vec<i8> = (0..k).map(|i| (((i * 11) % 251) as i32 - 120) as i8).collect();
             let dot = |w: &[i8], row: usize| -> i32 {
                 (0..k).map(|d| aq[d] as i32 * w[row * k + d] as i32).sum()
             };
@@ -8147,8 +8147,8 @@ mod tests {
         //    34B の行 (例 k=37) では GEMM_TK の切り上げで k の先にゴミが入るが、
         //    外側ループが `kb < k` で止まるため寄与しない (カーネルと同じ挙動)。
         for &(k, n, m) in &[(37usize, 200usize, 65usize), (30, 197, 65), (1533, 300, 3)] {
-            let qw: Vec<i8> = (0..k * n).map(|i| ((i * 29) % 241) as i32 as i8 - 120).collect();
-            let aq: Vec<i8> = (0..m * k).map(|i| ((i * 17) % 239) as i32 as i8 - 119).collect();
+            let qw: Vec<i8> = (0..k * n).map(|i| (((i * 29) % 241) as i32 - 120) as i8).collect();
+            let aq: Vec<i8> = (0..m * k).map(|i| (((i * 17) % 239) as i32 - 119) as i8).collect();
             let mut padded = gemm_pad_apply(&qw, k, n).into_owned();
             // 行の直後 (k の先) に「本当は範囲外」ダミーを置いておく
             let row_stride = k * gemm_pad_n(n);
@@ -9576,8 +9576,25 @@ pub fn gdn_scan_batch(
     let chunked = n >= GDN_CHUNK_MIN_TOKENS && dk == dv && d_conv == 4;
     let result = if chunked {
         gdn_scan_chunked_impl(
-            ctx, qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv,
-            d_conv, eps, q_scale, None, li, kv,
+            ctx,
+            GdnScanSrc::Host { qkv, z, beta, alpha },
+            conv_st,
+            ssm_st,
+            wconv,
+            wa,
+            wdt,
+            wnorm,
+            n,
+            nk,
+            nv,
+            dk,
+            dv,
+            d_conv,
+            eps,
+            q_scale,
+            None,
+            li,
+            kv,
         )
     } else {
         gdn_scan_impl(
@@ -9784,8 +9801,25 @@ pub fn gdn_scan_batch_oproj(
     let yptr = CHAIN.with(|cell| cell.borrow().bufs[CH_PFH].as_ref().map(|b| b.ptr()))?;
 
     if let Err(e) = gdn_scan_chunked_impl(
-        ctx, qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv,
-        d_conv, eps, q_scale, Some(yptr), li, kv,
+        ctx,
+        GdnScanSrc::Host { qkv, z, beta, alpha },
+        conv_st,
+        ssm_st,
+        wconv,
+        wa,
+        wdt,
+        wnorm,
+        n,
+        nk,
+        nv,
+        dk,
+        dv,
+        d_conv,
+        eps,
+        q_scale,
+        Some(yptr),
+        li,
+        kv,
     ) {
         tracing::error!("GDN scan (device y) failed: {e:#}");
         GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -9815,6 +9849,248 @@ pub fn gdn_scan_batch_oproj(
     Some(())
 }
 
+/// s164 (P1): GDN 層の prefill を **q4 重みで** デバイス常駐に通す。
+///
+/// 旧経路 (q4・`forward_prefill` の GDN 分岐) は 1 層あたり
+///   qkv: D2H n*conv_dim*4 → H2D 同量 / z: D2H n*vd*4 → H2D 同量 /
+///   y: D2H n*vd*4 → H2D 同量 / o_proj: D2H n*e*4
+/// を往復していた (27B・n=13000 で 1 層 約 2.0 GB)。新経路は
+///   H2D x (n*e*4) + H2D beta/alpha (n*nv*4 x2) + D2H o (n*e*4)
+/// だけで、qkv / z / y はデバイス上に留まる。
+///
+/// ビット一致の根拠:
+/// - qkv / z / o の投影は per-op 経路 (`q4_dispatch_tile`) と同一カーネル
+///   (`dno_gemm_q4_0`)・同一引数。行ブロック (64 行) は互いに独立で、1 要素の
+///   i32 累積順は k 昇順のまま変わらないため、grid の行ブロック数が増えても
+///   出力は 1 要素ずつ同一。x のアップロードを 1024 行タイルに割るのも同じ理由で
+///   数値を変えない。
+///   (per-op 経路は m <= max_m() のタイルを GEMV で回すため、その帯域に
+///   入る端数行がある n では発動しない → None)
+/// - GDN スキャンは **n を分割しない**。chunk 分割 `plan(n)`・grid・引数・
+///   カーネルとも従来の `gdn_scan_batch` と同一で、変わるのは入力 4 本の
+///   出所 (`GdnScanSrc::Dev`) だけ。chunk 境界は状態の持ち越しで決まるので
+///   行タイルに割ると plan が変わり数値が変わる — ここは触らない。
+/// - beta / alpha は従来どおり呼び出し側がホストで計算した値をそのまま使う
+///   (値も契約も不変)。
+///
+/// 状態 (conv/ssm) の契約は従来と同じ: `gdn_scan_chunked_impl` が
+/// `gdn_state_begin` / `gdn_state_commit` / (devstate 無効時のみ)
+/// `gdn_host_writeback` を通す。スキャン開始後に失敗すると状態を巻き戻せない
+/// ため、前提条件はすべてスキャン前に確認する (失敗は GPU 障害として扱う)。
+#[allow(clippy::too_many_arguments)]
+pub fn chain_gdn_prefill_q4(
+    qkv_w: &crate::quant::Linear,
+    z_w: &crate::quant::Linear,
+    o_w: &crate::quant::Linear,
+    beta: &[f32],
+    alpha: &[f32],
+    wconv: &[f32],
+    wa: &[f32],
+    wdt: &[f32],
+    wnorm: &[f32],
+    x: &[f32],
+    n: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    eps: f32,
+    q_scale: f32,
+    conv_st: &mut [f32],
+    ssm_st: &mut [f32],
+    out: &mut [f32],
+    li: usize,
+    kv: u64,
+) -> Option<()> {
+    use crate::quant::Linear;
+    if !cuda_enabled()
+        || !gemm_enabled()
+        || GPU_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    let (qw, zw, ow) = match (qkv_w, z_w, o_w) {
+        (Linear::Q4(a), Linear::Q4(b), Linear::Q4(c)) => (a, b, c),
+        _ => return None,
+    };
+    // チャンク経路の前提 (gdn_scan_batch と同じ) + 形状。
+    if n < GDN_CHUNK_MIN_TOKENS || nk == 0 || nv == 0 || dk == 0 || dv == 0 {
+        return None;
+    }
+    if dk != dv || d_conv != 4 {
+        return None;
+    }
+    let cs = d_conv - 1;
+    let e = qw.k;
+    let conv_dim = nk.checked_mul(dk)?.checked_mul(2)?.checked_add(nv.checked_mul(dv)?)?;
+    let vd = nv.checked_mul(dv)?;
+    // Q4 GEMM の入口条件 (maybe_gpu_linear_q4_into と同じ k%32==0) と重み形状。
+    if e == 0 || e % 32 != 0 || vd % 32 != 0 {
+        return None;
+    }
+    if qw.n != conv_dim || zw.k != e || zw.n != vd || ow.k != vd || ow.n != e {
+        return None;
+    }
+    let nv_tot = n.checked_mul(nv)?;
+    if beta.len() < nv_tot || alpha.len() < nv_tot {
+        return None;
+    }
+    if wconv.len() != conv_dim.checked_mul(d_conv)? || wa.len() != nv || wdt.len() != nv {
+        return None;
+    }
+    if wnorm.len() != dv {
+        return None;
+    }
+    if x.len() < n.checked_mul(e)? || out.len() < n.checked_mul(e)? {
+        return None;
+    }
+    if conv_st.len() != conv_dim.checked_mul(cs)? || ssm_st.len() != nv.checked_mul(dk)?.checked_mul(dv)? {
+        return None;
+    }
+    // per-op 経路は 1024 行タイルで、端数タイルが m <= max_m() だと GEMV になる。
+    // そこだけ演算列が変わるので、その形では発動しない (従来経路へ落とす)。
+    const TILE: usize = 1024;
+    let rem = n % TILE;
+    if rem != 0 && rem <= max_m() {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+    let gw_qkv = weights_for_q4(qw.uid, &qw.blocks, qw.k, qw.n).ok()?;
+    let gw_z = weights_for_q4(zw.uid, &zw.blocks, zw.k, zw.n).ok()?;
+    let gw_o = weights_for_q4(ow.uid, &ow.blocks, ow.k, ow.n).ok()?;
+    let (n_chunks, _) = crate::gdn::scan_schedule::plan(n);
+    // GDN スクラッチを先に確保し、qkv / z の GEMM 出力を**そのまま**スキャンの
+    // 入力にする (中間バッファを増やさない)。impl 側の ensure は同形なので no-op。
+    ok(GDN_SCRATCH.with(|cell| {
+        cell.borrow_mut().ensure(n, conv_dim, vd, nv, dk, dv, cs, n_chunks)
+    }))?;
+    let (pq, pz, py, pb, pa) =
+        GDN_SCRATCH.with(|cell| -> Option<(CUdeviceptr, CUdeviceptr, CUdeviceptr, CUdeviceptr, CUdeviceptr)> {
+            let s = cell.borrow();
+            Some((
+                s.q.as_ref()?.ptr(),
+                s.z.as_ref()?.ptr(),
+                s.y.as_ref()?.ptr(),
+                s.beta.as_ref()?.ptr(),
+                s.alpha.as_ref()?.ptr(),
+            ))
+        })?;
+    ok(chain_ensure_buf(CH_PFH, TILE.min(n).checked_mul(e)?.checked_mul(4)?))?;
+    ok(chain_ensure_buf(CH_O, n.checked_mul(e)?.checked_mul(4)?))?;
+
+    // 1) qkv / z 投影: x を 1024 行ずつ H2D し、GEMM は出力の行オフセットへ書く
+    //    (per-op 経路の 1024 行タイルと同じ形。H2D と GEMM は同一ストリームで
+    //    順序が保たれるので、タイル間の sync は要らない)。
+    let mut r0 = 0usize;
+    while r0 < n {
+        let mr = TILE.min(n - r0);
+        CHAIN.with(|cell| -> Option<()> {
+            let s = cell.borrow();
+            let pin = s.bufs[CH_PFH].as_ref()?.ptr();
+            let lib = lib().ok()?;
+            // H2D x タイル → 同一ストリームの GEMM (順序はストリームが保証する)
+            unsafe {
+                ok(check(
+                    (lib.memcpy_htod_async)(
+                        pin,
+                        x[r0 * e..].as_ptr() as *const c_void,
+                        mr * e * 4,
+                        std::ptr::null_mut(),
+                    ),
+                    "cuMemcpyHtoDAsync (gdn prefill q4 x)",
+                ))?;
+            }
+            crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
+                chain_gemm_q4_pf(gw_qkv, pin, pq + (r0 * conv_dim * 4) as u64, mr, e, conv_dim)?;
+                chain_gemm_q4_pf(gw_z, pin, pz + (r0 * vd * 4) as u64, mr, e, vd)
+            })
+        })?;
+        r0 += mr;
+    }
+
+    // 2) beta / alpha (ホストで計算済み・従来と同じ値) をデバイスへ。
+    //    2*n*nv*4 は 27B/13k でも 5 MB なので、ここは往復を消さない。
+    GDN_SCRATCH.with(|cell| -> Option<()> {
+        let s = cell.borrow();
+        ok(s.beta.as_ref()?.copy_from(&beta[..nv_tot]))?;
+        ok(s.alpha.as_ref()?.copy_from(&alpha[..nv_tot]))?;
+        Some(())
+    })?;
+
+    // 3) GDN chunk scan (3 launch・入力はすべてデバイス、y もデバイスに残す)。
+    crate::prof::time_layer(crate::prof::ATT_GDN_SCAN, li, || -> Option<()> {
+        ok(gdn_scan_chunked_impl(
+            ctx,
+            GdnScanSrc::Dev { qkv: pq, z: pz, beta: pb, alpha: pa },
+            conv_st,
+            ssm_st,
+            wconv,
+            wa,
+            wdt,
+            wnorm,
+            n,
+            nk,
+            nv,
+            dk,
+            dv,
+            d_conv,
+            eps,
+            q_scale,
+            Some(py),
+            li,
+            kv,
+        )
+        .map(|_| ()))
+    })?;
+
+    // 4) o_proj (y はデバイス上) → 5) D2H は最後の 1 回だけ。
+    let po = CHAIN.with(|cell| cell.borrow().bufs[CH_O].as_ref().map(|b| b.ptr()))?;
+    crate::prof::time_layer(crate::prof::OPROJ, li, || -> Option<()> {
+        chain_gemm_q4_pf(gw_o, py, po, n, vd, e)
+    })?;
+    CHAIN.with(|cell| -> Option<()> {
+        let buf = cell.borrow().bufs[CH_O].as_ref()?.ptr();
+        let lib = lib().ok()?;
+        unsafe {
+            ok(check(
+                (lib.memcpy_dtoh_async)(
+                    out.as_mut_ptr() as *mut c_void,
+                    buf,
+                    n * e * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (gdn prefill q4 o)",
+            ))
+        }
+    })?;
+    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+    ok(ctx.sync())?;
+    Some(())
+}
+
+/// chunked scan の入力 4 本 (qkv / z / beta / alpha) の出所。
+///
+/// s164 (P1): 従来は必ずホスト slice で、`GDN_SCRATCH` へ H2D してから
+/// カーネルへ渡していた。`Dev` は「既にデバイスに居る」場合にそのポインタを
+/// そのまま使う — カーネルの引数・grid・演算列は 1 つも変わらず、消えるのは
+/// 転送だけ (q4 prefill チェーン `chain_gdn_prefill_q4` が使う)。
+#[derive(Clone, Copy)]
+enum GdnScanSrc<'a> {
+    Host {
+        qkv: &'a [f32],
+        z: &'a [f32],
+        beta: &'a [f32],
+        alpha: &'a [f32],
+    },
+    Dev {
+        qkv: CUdeviceptr,
+        z: CUdeviceptr,
+        beta: CUdeviceptr,
+        alpha: CUdeviceptr,
+    },
+}
+
 /// A1-r2: GDN chunked scan 実装 (3 カーネル・長 prefill 用)。
 ///
 /// CPU 参照: [`crate::gdn::scan_chunked_core`]。3-pass 構成:
@@ -9829,10 +10105,7 @@ pub fn gdn_scan_batch_oproj(
 #[allow(clippy::too_many_arguments)]
 fn gdn_scan_chunked_impl(
     ctx: &CudaCtx,
-    qkv: &[f32],
-    z: &[f32],
-    beta: &[f32],
-    alpha: &[f32],
+    src: GdnScanSrc<'_>,
     conv_st: &mut [f32],
     ssm_st: &mut [f32],
     wconv: &[f32],
@@ -9854,10 +10127,12 @@ fn gdn_scan_chunked_impl(
     let cs = d_conv - 1;
     let conv_dim = 2 * nk * dk + nv * dv;
     let vd = nv * dv;
-    debug_assert_eq!(qkv.len(), n * conv_dim);
-    debug_assert_eq!(z.len(), n * vd);
-    debug_assert_eq!(beta.len(), n * nv);
-    debug_assert_eq!(alpha.len(), n * nv);
+    if let GdnScanSrc::Host { qkv, z, beta, alpha } = &src {
+        debug_assert_eq!(qkv.len(), n * conv_dim);
+        debug_assert_eq!(z.len(), n * vd);
+        debug_assert_eq!(beta.len(), n * nv);
+        debug_assert_eq!(alpha.len(), n * nv);
+    }
     debug_assert_eq!(conv_st.len(), conv_dim * cs);
     debug_assert_eq!(ssm_st.len(), nv * dk * dv);
     debug_assert_eq!(dk, dv, "chunked scan は dk == dv 前提");
@@ -9901,16 +10176,24 @@ fn gdn_scan_chunked_impl(
         let p = s.ptrs();
         s.buf(GdnBuf::ConvOut).fill_zero()?;
         s.buf(GdnBuf::SsmOut).fill_zero()?;
-        s.q.as_ref().unwrap().copy_from(qkv)?;
-        s.z.as_ref().unwrap().copy_from(z)?;
-        s.beta.as_ref().unwrap().copy_from(beta)?;
-        s.alpha.as_ref().unwrap().copy_from(alpha)?;
+        // s164: ホスト入力のときだけ H2D する (Dev は呼び出し側が既に置いている)。
+        if let GdnScanSrc::Host { qkv, z, beta, alpha } = &src {
+            s.q.as_ref().unwrap().copy_from(qkv)?;
+            s.z.as_ref().unwrap().copy_from(z)?;
+            s.beta.as_ref().unwrap().copy_from(beta)?;
+            s.alpha.as_ref().unwrap().copy_from(alpha)?;
+        }
         s.wc.as_ref().unwrap().copy_from(wconv)?;
         s.wa.as_ref().unwrap().copy_from(wa)?;
         s.wd.as_ref().unwrap().copy_from(wdt)?;
         s.wn.as_ref().unwrap().copy_from(wnorm)?;
         Ok(p)
     })?;
+    // Dev のときは入力 4 本のポインタだけ差し替える (他はスクラッチのまま)。
+    let dp = match src {
+        GdnScanSrc::Dev { qkv, z, beta, alpha } => GdnPtrs { q: qkv, z, beta, alpha, ..dp },
+        GdnScanSrc::Host { .. } => dp,
+    };
     q.lap(crate::prof::D2H_GDN_PF_LAUNCH);
 
     // ---- pass 1: chunk 並列でローカル遷移 (W[ci], M[ci]) --------------------
