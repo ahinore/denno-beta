@@ -437,3 +437,84 @@ DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 2
 なら driver が `cuStreamCreate` を提供していない (静かに従来経路) か、GEMM が
 コピー+ホストより短い。アンカーは ①② とも完全一致するはず (ズレたら即 revert)。
 
+## s173 (P14): FFN の gate|up を 1 回の GEMM に畳む (launch 4 -> 3 / タイル)
+
+実測 (main session・27B q4・n=14,043・`DENNO_PF_DBG=1`) では
+`sl_lay_ffn_gate` **10,042.6 ms (15.9 %)** + `sl_lay_ffn_down` **11,100.0 ms
+(17.6 %)** = 21.1 s = prefill の **33.5 %**。gate は ≈32 TFLOP/s でカーネル天井
+に近く、P13 と同じく「MAC 数は動かない・launch 数だけが動く」領域。
+
+### launch の内訳 (コードから静的に確定。nsys ではない)
+
+1 タイル (= `DENNO_Q4_M_TILE` 既定 1024 行) あたり、従来は **4 発**:
+
+| # | launch | カーネル | 出力 |
+|---|---|---|---|
+| 1 | gate GEMM | `dno_gemm_q4_0` (n=ff) | `CH_GA` 前半 |
+| 2 | up GEMM | `dno_gemm_q4_0` (n=ff) | `CH_GA` 後半 |
+| 3 | swiglu | `dno_swiglu` (gate / up が別領域) | `CH_ACT` |
+| 4 | down GEMM | `dno_gemm_q4_0` | `CH_DOWN` |
+
+転送は **0 回** (残差常駐経路は `CH_PFH` -> `CH_DOWN` の Slot/Slot で、H2D/D2H も
+sync も無い)。n=14,043 は 1024 行 × 13 + 731 行 = **14 タイル**なので
+
+- **before: 56 launch/層** (14 × 4) = 3,584/リクエスト (64 層)
+- **after: 42 launch/層** (14 × 3) = 2,688/リクエスト (**−896**)
+
+swiglu は既に同じチェーンの中にあり、`chain_mlp_prefill_q4_impl` のタイルループで
+gate/up の直後に走る (別関数だが同じ発行グループ・途中に sync は無い)。したがって
+P14 で消せるのは **gate と up の 2 発 -> 1 発**だけで、swiglu は「既に畳まれている」
+(新カーネルを作らない制約では down の epilogue に移せない)。
+
+### 入れたもの (`.cu` / PTX 不変・数値不変)
+
+`gate_up_w` (= [gate 全行 | up 全行] の行連結 1 本・ロード時に作られる decode chain
+用の重み) を **1 本のまま** `weights_for_q4` で引き、`dno_gemm_q4_0` を
+**n = 2*ff で 1 回**起動して `CH_GA` へ**行内 [gate|up]** で書く。続く swiglu は
+行内レイアウト用の `dno_swiglu_int` (`chain_swiglu_int_at`)。
+
+- 入口: `cuda::chain_mlp_prefill_q4_dev_fused` (残差常駐) /
+  `cuda::chain_mlp_prefill_q4_fused` (ホスト入出力の従来経路)。
+- 前提は `cuda::pf_ffn_fused_ready` (すべて Q4・形の整合・**gate/up が連結側の
+  行範囲として登録済み**)。満たさなければ従来の 2 回呼び出しへ落ちる = fail closed。
+- 重みの登録は `prefill_layer_dev` の**先頭** (個別の gate/up が VRAM へ載る前) で
+  `q4_register_row_alias`。decode chain と同じ 1 本を共有するので **VRAM/H2D は
+  増えない** (従来も gate/up で同じ 2*ff*e を上げていた)。
+
+### ビット一致の根拠
+
+- `dno_gemm_q4_0` の出力は `out[(size_t)gi * n + gj]` で、`gj = j0 + tx + 16*j`
+  (`j0 = blockIdx.y * 128`)。**n は行ストライドと境界判定にしか使われず、累積は
+  b = 0..nb の k 方向だけ**。したがって n=2ff の 1 回呼び出しは、n=ff の 2 回
+  呼び出しと各要素**同一の値**を、行内 [gate|up] の並びで書く。
+- `dno_swiglu_int` は `gateup[r*width + f]` と `gateup[r*width + ff + f]` を読み、
+  演算は `dno_expf` + `__fdiv_rn` + `__fadd_rn` + `__fmul_rn` で `dno_swiglu` と
+  **同一の演算列** (CPU の `silu(g)*u` とビット一致する既存契約のまま)。
+- タイル幅・行のまとめ方 (`q4_group_rows`)・引数・grid の作り方は不変。
+
+### 予測 (実機未計測・このコンテナは GPU 非搭載)
+
+| prof バケット | before | 予測 after | 差分 |
+|---|---|---|---|
+| `sl_lay_ffn_gate` | 10,042.6 ms | **≈10,040 ms** | −2 ms (≈0 %) |
+| `sl_lay_swiglu` | 210.4 ms | 210.4 ms | 0 |
+| `sl_lay_ffn_down` | 11,100.0 ms | 11,100.0 ms | 0 |
+
+総 MAC・総ブロック数・タイル幅は不変で、消えるのは launch 896 発/リクエストだけ。
+P13 が同じ形の連結 (qkv/z の 28 -> 14 発/層) で「全体で µs 級」と実測しているので、
+**ms の利得はほぼ 0 と予測する**。1 発 ≈ 3〜6 µs × 896 ≈ 3〜5 ms。ここが実測で
+数十 ms 以上動いたら、それは launch ではなく**波の端数 (tail) の減少**が理由
+(1 カーネルの j タイルが 136 -> 272 になり、最後の波の埋まりが良くなる)。
+
+### 実機 A/B
+
+```
+# cold・同一プロンプト・3 回中央値 (毎回 nonce 付き = prefix cache miss)
+DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 3
+# 従来の 2 回呼び出しに戻す A/B (数値は不変・launch だけが 3 -> 4 に戻る)
+DENNO_PF_FFN_FUSED=0 DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 3
+```
+`sl_lay_ffn_gate` / `sl_lay_ffn_down` のラベルは経路が変わっても同じ位相に積む
+(消えない)。8 問 × 150 token greedy の出力は 2 回で md5 一致・基準アンカーとも
+一致するはず (ズレたら即 revert)。
+

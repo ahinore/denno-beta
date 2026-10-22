@@ -2164,16 +2164,34 @@ impl Qwen35 {
                             &[&layer.gate_w, &layer.up_w],
                         );
                     }
-                    crate::cuda::chain_mlp_prefill_q4(
+                    // s173 (P14): 連結重みが使えるなら gate|up を 1 回の GEMM で
+                    // (タイルあたり 4 -> 3 launch)。使えなければ従来の 2 回。
+                    let ffn = if crate::cuda::pf_ffn_fused_ready(
+                        &layer.gate_up_w,
                         &layer.gate_w,
                         &layer.up_w,
                         &layer.down_w,
-                        &buf_h2,
-                        n,
-                        li,
-                        &mut buf_down,
-                    )
-                    .is_some()
+                    ) {
+                        crate::cuda::chain_mlp_prefill_q4_fused(
+                            &layer.gate_up_w,
+                            &layer.down_w,
+                            &buf_h2,
+                            n,
+                            li,
+                            &mut buf_down,
+                        )
+                    } else {
+                        crate::cuda::chain_mlp_prefill_q4(
+                            &layer.gate_w,
+                            &layer.up_w,
+                            &layer.down_w,
+                            &buf_h2,
+                            n,
+                            li,
+                            &mut buf_down,
+                        )
+                    };
+                    ffn.is_some()
                 }
             };
             #[cfg(not(feature = "cuda"))]
@@ -2393,6 +2411,13 @@ impl Qwen35 {
             return Ok(None);
         }
         // バッファ確保と重み登録も残差を更新する前に済ませる
+        // s173 (P14): FFN の gate/up を連結重み `gate_up_w` の行範囲として
+        // **先に**登録する (個別の gate/up が VRAM へ載る前 = VRAM は増えない)。
+        // これが通ったときだけ FFN は 1 回の gate|up GEMM で回る
+        // (`pf_ffn_fused_ready` が同じ条件を見る = fail closed)。
+        if cuda::q4_chain_enabled() {
+            cuda::q4_register_row_alias(&layer.gate_up_w, &[&layer.gate_w, &layer.up_w]);
+        }
         if cuda::chain_pf_reserve(n, e).is_none()
             || cuda::pf_layer_dev_register(&attn_w, &layer.gate_w, &layer.up_w, &layer.down_w).is_none()
         {
@@ -2554,8 +2579,21 @@ impl Qwen35 {
             return Err(anyhow::anyhow!("prefill residual chain: ffn rmsnorm failed"));
         }
         // FFN: CH_PFH → CH_DOWN (デバイス常駐)
-        cuda::chain_mlp_prefill_q4_dev(&layer.gate_w, &layer.up_w, &layer.down_w, n, li)
-            .ok_or_else(|| anyhow::anyhow!("prefill residual chain: FFN chain failed"))?;
+        // s173 (P14): gate/up が連結重みの行範囲として登録済みなら、gate|up を
+        // **1 回の GEMM**で書く (1 タイル 4 -> 3 launch)。未登録 (int8/fp32・
+        // 形状不一致・`DENNO_GPU_Q4_CHAIN=0`) なら従来の 2 回呼び出しのまま。
+        // どちらの経路もカーネル・累積順・タイル幅は同一 = 出力はビット一致。
+        let ffn = if cuda::pf_ffn_fused_ready(
+            &layer.gate_up_w,
+            &layer.gate_w,
+            &layer.up_w,
+            &layer.down_w,
+        ) {
+            cuda::chain_mlp_prefill_q4_dev_fused(&layer.gate_up_w, &layer.down_w, n, li)
+        } else {
+            cuda::chain_mlp_prefill_q4_dev(&layer.gate_w, &layer.up_w, &layer.down_w, n, li)
+        };
+        ffn.ok_or_else(|| anyhow::anyhow!("prefill residual chain: FFN chain failed"))?;
         Ok(Some(cuda::CH_DOWN))
     }
 }
@@ -2586,8 +2624,10 @@ fn fit_prefill_buf(v: &mut Vec<f32>, len: usize) {
 /// 行を連結しても各行の量子化値・累積順は変わらない。fp32 側は
 /// `matvec_rows_bt` の累積が (i, j) ごとに閉じているため、行の並びが変わっても
 /// 各要素の和の項順は同じ (j ブロックは 64 行単位で独立に回る) — これも bit 一致。
-/// ただし連結版を使うのは **int8 の prefill / decode chain 経路だけ**で、
+/// ただし連結版を使うのは **int8 / Q4 の prefill・decode chain 経路**だけで、
 /// fp32 の計算は従来どおり 2 呼び出しのまま (`ffn()` と prefill の CPU 経路)。
+/// s173 (P14): Q4 prefill も `gate_up_w` 1 本で gate|up を 1 回の GEMM に畳む
+/// (`cuda::chain_mlp_prefill_q4_dev_fused` / `cuda::pf_ffn_fused_ready`)。
 fn concat_rows(a: &Linear, b: &Linear, what: &str) -> Result<Linear> {
     let (ka, na) = a.dims();
     let (kb, nb) = b.dims();
