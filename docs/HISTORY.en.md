@@ -3540,3 +3540,55 @@ External implementations referenced in P19 and their licensing status (the same 
   GPU execution are unchanged).
 - **Not measured here**: bench / GPU anchors / KPI (structurally unchanged because no numeric
   path changed, but not measured). 8095 was not touched either.
+
+### s174: Task P16 - the GDN beta|alpha fp32 matvec is folded into one launch (2026-10-23) done
+
+> One decode token issues `dno_gemv_q4_0c4` 257 times and `dno_add_rmsnorm` 129 times.
+> Determining "merge adjacent same-shape gemvs inside a layer into one launch" statically from
+> the code showed that **the q4 GEMVs cannot be merged** (see below). Exactly one pair can be
+> merged: the GDN layer's beta|alpha (`dno_matvec_f32`, 2 launches).
+
+- **Static count (27B q4, 64 layers = 48 GDN + 16 full, decode chain path)**:
+  - Per GDN layer = rmsnorm 1 + qkv|z gemv 1 + beta/alpha matvec 2 + gdn_scan 1 + o gemv 1
+    + rmsnorm 1 + gate_up gemv 1 + swiglu 1 + down gemv 1 = **10 launches**.
+    Per full layer = rmsnorm 1 + q|k|v gemv 1 + qknorm_rope 2 + attn 1 + gate 1 + o gemv 1
+    + rmsnorm 1 + gate_up gemv 1 + swiglu 1 + down gemv 1 = **11 launches**.
+  - Per token = 48x10 + 16x11 + 2 (final norm + lm_head) = **658 launches**, of which
+    `dno_gemv_q4_0c4` = 48x4+16x4+1 = **257** and `dno_add_rmsnorm` = 48x2+16x2+1 = **129** -
+    matching the supervisor's measurement, which cross-checks this enumeration.
+  - Per request (150 tokens) = 658x150 = 98,700 launches.
+- **Why the q4 GEMVs cannot be merged**: a layer's four launches (qkv -> o -> gate_up -> down)
+  are a **serial** residual-stream chain, and every adjacent pair has a dependent kernel in
+  between (qkv|o = scan/attn, o|gate_up = the residual add inside `dno_add_rmsnorm`,
+  gate_up|down = swiglu, down(layer i)|qkv(layer i+1) = `dno_add_rmsnorm`). The kernel takes a
+  single input pointer, so only pairs with "the same input slot and the same k" can share a
+  launch. Inside a layer only qkv and gate_up qualify, and gate_up's input CH_H is the rmsnorm
+  of CH_H plus o's residual, so they are serial too = no shared launch. The q|k|v example is
+  already a single launch since s166 (P5) (337 -> 257). o|gate|up differ in both shape and
+  input (o: k=vd, in=CH_ATT / gate_up: k=e, in=CH_H). Going below 257 needs a fused
+  residual-add+rmsnorm+gemv kernel (a `.cu` change), which is out of scope here.
+- **Implementation (the one mergeable pair)**: `GdnLayer::ba_w` holds a row-concatenated
+  [2*nv, e] copy built once at load time (row order [all beta rows | all alpha rows],
+  `concat_rows`), and `cuda.rs` gained `Q35_TAG_BA` and `chain_q35_ctl_f32_ba`: the same
+  `dno_matvec_f32`, the same argument order, the same block size (128, or 256 under
+  `DENNO_FAST_REDUCE=1`), only grid.x doubled (n -> 2n). `chain_q35_gdn_scan` uses one launch
+  when `ba_w` is present and the shape matches, and the previous two launches otherwise
+  (fail closed). The concatenation is not built in Fp32 mode (the chain never runs there).
+- **Launches before -> after (one decode token)**: `dno_matvec_f32` **96 -> 48** (2 -> 1 per
+  layer), all kernels **658 -> 610** (-48, -7.3%), per request 98,700 -> 91,500.
+  `dno_gemv_q4_0c4` 257 -> 257 and `dno_add_rmsnorm` 129 -> 129 (unchanged).
+- **Numerics**: `dno_matvec_f32` reduces sequentially per row (`j = blockIdx.x`,
+  `row = w + (size_t)j*k`, `out[j] = s`), independent of the other rows, so concatenating the
+  row order leaves each row's accumulation order untouched = **bit identical**. VRAM is
+  **unchanged** (the separate beta/alpha device buffers are no longer created); the host pays
+  +2*nv*e*4 B per layer for the concatenated copy (27B: 1.97 MB x 48 layers = 94 MB).
+- **Predicted ms**: 48 launches saved x 1-2 us = 0.05-0.10 ms/token. As with P14/P15 the step
+  is GPU-execution bound and host enqueue overlaps execution, so the measured value should be
+  0.00-0.10 ms (17.49-17.51 -> 17.45-17.51 ms/token, <=0.6%). **Not measured on the GPU.**
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (320 -> +1:
+  `f32_beta_alpha_concat_rows_match_parts`, pinning that the merged 1-launch output is bit
+  identical to the 2-launch output on the CPU side).
+- **Not measured here**: GPU execution, the three anchors (`c61ad85b` / `9e17d563` / `af6eb6ab`),
+  ms/token, nsys. This container has no GPU, so the on-device verification steps are written in
+  the work report (uncommitted, `REPORT_P16.md`). `.cu` / `.ptx` / 8095 were not touched.

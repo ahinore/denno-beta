@@ -63,6 +63,14 @@ struct GdnLayer {
     gate_w: Linear,  // [e, value_dim] (attn_gate → z)
     beta_w: Linear,  // [e, n_v_heads]
     alpha_w: Linear, // [e, n_v_heads]
+    /// s174 (P16): `beta_w` と `alpha_w` の**行連結**コピー [2*n_v_heads, e]
+    /// (行順 [beta 全行 | alpha 全行])。decode chain は beta/alpha を同じ入力
+    /// (CH_H)・同じ形状・隣接発行の fp32 matvec 2 発で計算しているので、これ 1 本で
+    /// **1 発**にする (GDN 層あたり 2 -> 1・decode 1 token で 96 -> 48 発)。
+    /// `dno_matvec_f32` は 1 行 = 1 block の行独立な逐次縮約なので、連結しても
+    /// 各行の累積順は変わらない = 出力は**ビット一致**。CPU / prefill 経路は
+    /// 従来どおり個別の 2 本を使う。`None` = 連結できなかった (従来の 2 発)。
+    ba_w: Option<Linear>,
     conv1d: Vec<f32>,
     ssm_a: Vec<f32>,
     ssm_dt: Vec<f32>,
@@ -514,6 +522,27 @@ impl Qwen35 {
 
             let attn = if f.tensor(&format!("{p}ssm_a")).is_some() {
                 // GDN (linear_attention) 層
+                // s174 (P16): beta/alpha の行連結 [2*nv, e] をロード時に 1 回だけ
+                // 作る (decode chain が fp32 matvec 2 発を 1 発に畳むため)。
+                // decode chain は fp32 重みでは起動しない (`q35_chain_compatible` の
+                // `chain_weight_ok`) ので、Fp32 モードでは作らない (約 2*nv*e*4 B x
+                // GDN 層の常駐を避ける)。
+                let beta_w = lin_ctl(
+                    dt_shaped(&format!("{p}ssm_beta.weight"), &[eu, gdn_p.n_v_heads as u64])?,
+                    e,
+                    gdn_p.n_v_heads,
+                );
+                let alpha_w = lin_ctl(
+                    dt_shaped(&format!("{p}ssm_alpha.weight"), &[eu, gdn_p.n_v_heads as u64])?,
+                    e,
+                    gdn_p.n_v_heads,
+                );
+                let ba_w = match quant {
+                    QuantMode::Fp32 => None,
+                    QuantMode::Int8 | QuantMode::Q4_0 => {
+                        concat_rows(&beta_w, &alpha_w, "beta+alpha").ok()
+                    }
+                };
                 AttnKind::Gdn(GdnLayer {
                     ln1_w,
                     qkv_w: lin(
@@ -526,16 +555,9 @@ impl Qwen35 {
                         e,
                         vd,
                     ),
-                    beta_w: lin_ctl(
-                        dt_shaped(&format!("{p}ssm_beta.weight"), &[eu, gdn_p.n_v_heads as u64])?,
-                        e,
-                        gdn_p.n_v_heads,
-                    ),
-                    alpha_w: lin_ctl(
-                        dt_shaped(&format!("{p}ssm_alpha.weight"), &[eu, gdn_p.n_v_heads as u64])?,
-                        e,
-                        gdn_p.n_v_heads,
-                    ),
+                    beta_w,
+                    alpha_w,
+                    ba_w,
                     conv1d: dt_shaped(
                         &format!("{p}ssm_conv1d.weight"),
                         &[gdn_p.d_conv as u64, qkv_dim as u64],
@@ -2973,6 +2995,14 @@ impl Qwen35 {
                             (Linear::F32 { w: bw, .. }, Linear::F32 { w: aw, .. }) => (bw, aw),
                             _ => return None, // q35_chain_compatible で除外済み
                         };
+                        // s174 (P16): [beta | alpha] の行連結があれば beta/alpha の
+                        // fp32 matvec を 1 発に畳む (無ければ従来の 2 発)。
+                        let ba = match g.ba_w.as_ref() {
+                            Some(Linear::F32 { w, k, n }) if *k == e && *n == 2 * nv => {
+                                Some(&w[..])
+                            }
+                            _ => None,
+                        };
                         chain_q35_gdn_scan(
                             mid,
                             key,
@@ -2993,6 +3023,7 @@ impl Qwen35 {
                             &g.ssm_norm,
                             bw,
                             aw,
+                            ba,
                             e,
                         )
                     })?;
@@ -3423,6 +3454,33 @@ mod tests {
             }
             _ => panic!("Q4 の連結は Q4 のまま"),
         }
+    }
+
+    /// s174 (P16): beta|alpha の行連結 (`GdnLayer::ba_w` = decode chain が fp32
+    /// matvec 1 発で回す重み) は、2 発に分けた結果と行単位でビット一致する。
+    /// `dno_matvec_f32` は 1 行 = 1 block・行ごとの逐次縮約 (`w + j*k`, `out[j]`)
+    /// なので、連結しても各行の累積順は変わらない — これが「2 発 -> 1 発」の根拠。
+    #[test]
+    fn f32_beta_alpha_concat_rows_match_parts() {
+        let (k, nv) = (64usize, 6usize);
+        let mk = |s: f32| -> Linear {
+            let w: Vec<f32> = (0..k * nv)
+                .map(|i| ((i as f32) * 0.019 * s).sin())
+                .collect();
+            Linear::new(w, k, nv, QuantMode::Fp32)
+        };
+        let (beta, alpha) = (mk(1.0), mk(2.7));
+        let ba = concat_rows(&beta, &alpha, "beta+alpha").expect("fp32 同士は連結できる");
+        assert_eq!(ba.dims(), (k, 2 * nv), "連結形状は [2*nv, e]");
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.043) - 1.3).collect();
+        // 1 発 (行 0..2nv を連続して書く)
+        let mut one = vec![0f32; 2 * nv];
+        ba.apply_bt_rows_into(&x, 1, &mut one);
+        // 2 発 (beta -> [0..nv], alpha -> [nv..2nv])
+        let mut two = vec![0f32; 2 * nv];
+        beta.apply_bt_rows_into(&x, 1, &mut two[..nv]);
+        alpha.apply_bt_rows_into(&x, 1, &mut two[nv..]);
+        assert_eq!(bits(&one), bits(&two), "連結 1 発の出力が 2 発と bit 不一致");
     }
 
 
