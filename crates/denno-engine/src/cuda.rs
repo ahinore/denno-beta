@@ -11528,6 +11528,7 @@ fn chain_gdn_prefill_q4_impl(
     })?;
 
     // 3) GDN chunk scan (3 launch・入力はすべてデバイス、y もデバイスに残す)。
+    //    s173 (P15): pass 間のホスト待ちは無い (同期は最後の 1 回だけ)。
     pf_phase(PF_PH_GDN_SCAN);
     crate::prof::time_layer(crate::prof::ATT_GDN_SCAN, li, || -> Option<()> {
         ok(gdn_scan_chunked_impl(
@@ -12818,6 +12819,19 @@ enum GdnScanSrc<'a> {
 /// 決定論: 各カーネルとも launch 構成固定・昇順逐次和・atomic/ワープ縮約不使用
 /// (gdn.cu の方針どおり)。演算は単発カーネル `dno_gdn_scan` と同一で、chunk
 /// 境界でのみ状態を持ち越す。前提: dk == dv・d_conv == 4 (呼び出し側で保証)。
+///
+/// s173 (P15): **pass 間でホストを止めない**。3 pass はすべて既定ストリームへ
+/// 発行するので、pass 2 が pass 1 の W/M を読み、pass 3 が pass 2 の Sinit を
+/// 読む順序はストリームが保証する (同一ストリーム上の発行は FIFO 実行)。
+/// したがって同期点は「ホストが結果を読む 1 点」だけにした:
+/// - デバイス出力 (`y_dst = Some`・prefill 残差常駐) でも 1 回残す — この 1 回は
+///   数値のためではなく、`DENNO_PROFILE` の細分 (`D2H_GDN_PF_*`) が 3 pass の
+///   実行時間を「sync」として写し続けるため (表示専用の区間が 0 になると
+///   scan がタダに見える)。
+/// - ホスト出力 (`y_dst = None`) は `to_vec` の `cuMemcpyDtoH` (同期) が同じ
+///   待ちを含むが、細分の意味を揃えるため同じ 1 回を通す。
+/// 1 層あたり: launch 3 (不変) / 同期 1 (従来 3)。カーネル・引数・grid・chunk
+/// 分割・発行順は 1 つも変えないので出力ビットは不変。
 #[allow(clippy::too_many_arguments)]
 fn gdn_scan_chunked_impl(
     ctx: &CudaCtx,
@@ -12878,7 +12892,9 @@ fn gdn_scan_chunked_impl(
 
     ctx.make_current()?;
     // s64 (T5b L1 Step 1 計測): `gdn_scan_impl` と同一の 4 区間細分 (表示専用)。
-    // chunked 経路は pass ごとに sync するため launch/sync は 3 pass 分の合計。
+    // s173 (P15): 区間は「確保/アップロード (alloc) → 3 pass の発行 (launch) →
+    // 同期 1 回の待ち (sync) → 状態の書き戻し・y の読み出し (d2h)」の 4 つ。
+    // pass 間で待たないので、3 pass の実行時間は最後の sync にまとめて乗る。
     let mut q = crate::prof::Seq::begin(crate::prof::D2H_GDN_PF_ALLOC, Instant::now());
     // s67: 16 本の作業領域は層をまたいで再利用する (確保は初回のみ・形が同じ間は
     // 何もしない)。中身は毎回 copy_from で上書きするので従来と同じ状態になる。
@@ -12957,9 +12973,10 @@ fn gdn_scan_chunked_impl(
             &mut args_pre,
         )?;
     }
-    q.lap(crate::prof::D2H_GDN_PF_SYNC);
-    ctx.sync()?;
-    q.lap(crate::prof::D2H_GDN_PF_D2H);
+    // s173 (P15): pass 1 → pass 2 は同一ストリームの発行順で足りる (pass 2 は
+    // pass 1 が書いた W/M を読むが、既定ストリームは FIFO なので待つ必要が無い)。
+    // 従来ここにあった `ctx.sync()` (cuCtxSynchronize = デバイス全体の drain) は
+    // 削除した — 数値・発行順は不変で、消えたのはホストの待ちだけ。
 
     // ---- pass 2: chunk 先頭状態 Sinit の直列伝播 ----------------------------
     let (mut psi, mut pm2, mut pw2, mut psinit) = (pst_ssm, dp.m, dp.w, dp.sinit);
@@ -12975,7 +12992,6 @@ fn gdn_scan_chunked_impl(
         &mut dk2 as *mut _ as *mut c_void,
         &mut dv2 as *mut _ as *mut c_void,
     ];
-    q.lap(crate::prof::D2H_GDN_PF_LAUNCH);
     unsafe {
         ctx.launch_async(
             ctx.f_gdn_chunk_state,
@@ -12985,9 +13001,8 @@ fn gdn_scan_chunked_impl(
             &mut args_state,
         )?;
     }
-    q.lap(crate::prof::D2H_GDN_PF_SYNC);
-    ctx.sync()?;
-    q.lap(crate::prof::D2H_GDN_PF_D2H);
+    // s173 (P15): pass 2 → pass 3 も同じ理由で待たない (pass 3 は pass 2 の
+    // Sinit を読むが、発行順で足りる)。
 
     // ---- pass 3: Sinit[ci] からの逐次 AR スキャン (chunk 並列) ---------------
     let (mut pq3, mut pz3, mut pb3, mut pa3) = (dp.q, dp.z, dp.beta, dp.alpha);
@@ -13027,7 +13042,6 @@ fn gdn_scan_chunked_impl(
         &mut qsi3 as *mut _ as *mut c_void,
     ];
     let shmem_scan = ((3 * dk + dv + 5) * 4) as u32;
-    q.lap(crate::prof::D2H_GDN_PF_LAUNCH);
     unsafe {
         ctx.launch_async(
             ctx.f_gdn_chunk_scan,
@@ -13037,6 +13051,9 @@ fn gdn_scan_chunked_impl(
             &mut args_scan,
         )?;
     }
+    // s173 (P15): 3 pass を発行し終えてから 1 回だけ待つ (この時点で GPU 上には
+    // pass 1/2/3 がこの順で並んでおり、待ちは「3 つ全部の完了」= 従来の 3 回の
+    // 待ちと同じ完了点。違うのはホストが pass 間で止まらないことだけ)。
     q.lap(crate::prof::D2H_GDN_PF_SYNC);
     ctx.sync()?;
     q.lap(crate::prof::D2H_GDN_PF_D2H);
