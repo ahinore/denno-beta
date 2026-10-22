@@ -55,6 +55,23 @@ grow-only のため、プロンプト長そのままの m を渡すと VRAM が�
 - GDN スキャンは **n を分割しない** (chunk 分割は状態の持ち越しで決まるため、
   行タイルに割ると `plan(n)` が変わって数値が変わる)。
 
+## 変更 (s165・残差ストリームの常駐 / P2)
+
+- 残差 `h` を `CH_PF_RES` (デバイス) に置いたまま層を通す
+  (`Qwen35::forward_prefill` → `prefill_layer_dev`)。層の中は
+  `rmsnorm (デバイス) → 投影 (デバイス) → 残差加算 (次の rmsnorm の proj 引数)`。
+- ホストが契約上必要とする転送だけが残る:
+  GDN 層 = h2 の D2H 1 回 (beta/alpha のホスト計算) / full attention 層 =
+  h2 の D2H 1 回 (q/k/v はホスト計算・KV はホストが正) + attention 出力の H2D 1 回 /
+  FFN = 0 回。q/k/v/o の per-op 往復 (full 層) と FFN の 2 往復が消える。
+- 単独の残差 add カーネルは PTX に無いので、加算は `dno_add_rmsnorm` の
+  `proj` 引数に融合し、層末の加算を次の rmsnorm へ繰り延べる (追加カーネル 0)。
+- `chain_attention_prefill` の `CH_ATT` は sigmoid ゲート前なので、o_proj の
+  デバイス実行には**ホストでゲート済みの att** を 1 回だけ上げる。
+- 発動条件は q4 全層 + `n > max_m()` + `e%32==0` + 端数タイル + 診断 OFF。
+  詳しい契約・ビット一致の根拠・未計測の期待値は `REPORT_P2.md`。
+- **未計測** (main が `scripts/prefill_bench.py` で測る)。アンカー一致も未確認。
+
 ## 計測プロトコル (prefill)
 
 **同じプロンプトの再送は prefix cache に当たるため、cold 計測には使えない。**
