@@ -416,6 +416,130 @@ fn matvec_rows_bt_small_n_impl(a: &[f32], b: &[f32], k: usize, n: usize, m: usiz
     }
 }
 
+/// s172 (P13): **2 本の小 n 投影 (GDN の beta/alpha) を h2 の 1 回の走査で**
+/// まとめて計算する。`matvec_rows_bt_into` を 2 回呼ぶのと**ビット一致**。
+///
+/// 動機 (このコンテナ実測・12,850×5,120×48):
+/// - 従来は 1 call あたり `vec![0.0f32; k * mp]` (= m*k*4 = **263 MB**) を作り、
+///   転置で全要素を書き、さらに**出力チャネル方向に並列**なので各タスクが
+///   転置済み h2 全体を読み直していた (n/JG = 24 タスク × 263 MB = 6.3 GB)。
+/// - 263 MB の新規確保は glibc が mmap/munmap するため、初回タッチの
+///   ページフォルトだけで **≈78 ms** かかる (実測: 確保+全書き 90 ms、
+///   使い回しなら 12 ms)。beta/alpha は 1 層 2 call なので、この確保だけで
+///   **1 リクエスト ≈7.5 s** を払っていた (P9 の 84 ms/call の大半がこれ)。
+///
+/// ここでは大きな作業域を**作らない**: 行ブロック (32 行) ごとに
+/// スレッドローカルの転置タイル (32×k×4 = 655 KB・L2 に載る) を作り、
+/// そのタイルを beta/alpha の全チャネルで舐める。h2 の読みは 1 回、
+/// 重み (2×n×k×4 ≈ 2 MB) は L3 に残るので、コストは演算だけになる。
+///
+/// ビット一致の根拠: 各 (i,j) の累積は「0 から始めて d 昇順に
+/// `acc += av * rv`」のままで、変わるのは (i,j) を処理する**順序**だけ。
+/// 行ブロック・チャネルは互いに独立なので、どの順に回しても各要素の
+/// 加算列は同一 (`matvec_rows_bt_pair_matches_two_calls` が全要素一致を固定)。
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub fn matvec_rows_bt_pair_into(
+    a: &[f32],
+    b1: &[f32],
+    b2: &[f32],
+    k: usize,
+    n1: usize,
+    n2: usize,
+    m: usize,
+    out1: &mut [f32],
+    out2: &mut [f32],
+) {
+    const MB: usize = 8; // 行方向のレーン数 (SIMD 幅)
+    const JG: usize = 4; // 同時に走査する出力チャネル数 (累積順には無関係)
+    const GB: usize = 4; // 1 ブロックのグループ数 (= 32 行)
+    debug_assert!(a.len() >= m * k && b1.len() >= n1 * k && b2.len() >= n2 * k);
+    debug_assert!(out1.len() >= m * n1 && out2.len() >= m * n2);
+    if m == 0 || k == 0 {
+        return;
+    }
+    if n1 == 0 && n2 == 0 {
+        return;
+    }
+    // 退化形 (片方が 0 チャネル) は従来経路に任せる (ビット一致は自明)。
+    if n1 == 0 || n2 == 0 {
+        matvec_rows_bt_into(a, b1, k, n1, m, out1);
+        matvec_rows_bt_into(a, b2, k, n2, m, out2);
+        return;
+    }
+    let a = &a[..m * k];
+    let rows = GB * MB;
+    let nblocks = m.div_ceil(rows);
+    let cp1 = SendPtr(out1.as_mut_ptr());
+    let cp2 = SendPtr(out2.as_mut_ptr());
+    (0..nblocks).into_par_iter().for_each(|bi| {
+        let i0 = bi * rows;
+        let nr = rows.min(m - i0);
+        let ng = nr.div_ceil(MB);
+        // 転置タイルはスレッドごとに grow-only で使い回す (確保のたびに
+        // ページフォルトを払わない)。中身は毎回全要素を書く。
+        PAIR_TILE.with(|cell| {
+            let mut tile = cell.borrow_mut();
+            let need = ng * k * MB;
+            if tile.len() < need {
+                tile.resize(need, 0.0);
+            }
+            let tile = &mut tile[..need];
+            for g in 0..ng {
+                let base = i0 + g * MB;
+                let nc = MB.min(m - base);
+                let dst = &mut tile[g * k * MB..][..k * MB];
+                for d in 0..k {
+                    for l in 0..nc {
+                        dst[d * MB + l] = a[(base + l) * k + d];
+                    }
+                    // 端数グループのパディングレーンは 0 (前回の値を持ち越さない)。
+                    for l in nc..MB {
+                        dst[d * MB + l] = 0.0;
+                    }
+                }
+            }
+            let tile = &tile[..need];
+            for (b, n, cp) in [(b1, n1, cp1), (b2, n2, cp2)] {
+                let mut j0 = 0usize;
+                while j0 < n {
+                    let cols = JG.min(n - j0);
+                    let mut acc = [[[0.0f32; MB]; JG]; GB];
+                    for g in 0..ng {
+                        let tbase = g * k * MB;
+                        for d in 0..k {
+                            let av = &tile[tbase + d * MB..][..MB];
+                            for t in 0..cols {
+                                let rv = b[(j0 + t) * k + d];
+                                let ac = &mut acc[g][t];
+                                for l in 0..MB {
+                                    ac[l] += av[l] * rv;
+                                }
+                            }
+                        }
+                    }
+                    for g in 0..ng {
+                        let base = i0 + g * MB;
+                        let nc = MB.min(m - base);
+                        for t in 0..cols {
+                            let j = j0 + t;
+                            for l in 0..nc {
+                                unsafe { cp.write((base + l) * n + j, acc[g][t][l]) };
+                            }
+                        }
+                    }
+                    j0 += cols;
+                }
+            }
+        });
+    });
+}
+
+/// [`matvec_rows_bt_pair_into`] の転置タイル (スレッドごと・grow-only)。
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+thread_local! {
+    static PAIR_TILE: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+}
+
 /// JG=4 本の重み行 × 4 バッチレーンのドットを同時に計算する。
 /// 各 (j, lane) の累積は d について厳密に逐次 — ビット一致の不変条件。
 /// レーンロードは転置済みアクティベーション `at[d*stride + g*4 ..]` から連続 4 個。
@@ -1076,6 +1200,54 @@ mod tests {
                 ((x >> 16) % 2000) as f32 / 1000.0 - 1.0 // [-1, 1)
             })
             .collect()
+    }
+
+    /// s172 (P13): beta/alpha の 1 パス化 ([`matvec_rows_bt_pair_into`]) が
+    /// **2 回呼び出しと全要素ビット一致**すること。行ブロック (32 行) の端数・
+    /// チャネル端数 (n が JG=4 の倍数でない)・n1 != n2・m=1 を跨ぐ形を固定する。
+    /// 2 回目の呼び出しも同じ値になること (スレッドローカルの転置タイルを
+    /// 使い回すため、前回の値が混ざらないことの確認) を含める。
+    #[test]
+    fn matvec_rows_bt_pair_matches_two_calls() {
+        let shapes = [
+            (1usize, 8usize, 1usize, 1usize),
+            (7, 37, 5, 7),
+            (32, 64, 48, 48),
+            (33, 96, 48, 3),
+            (65, 128, 3, 5),
+            (96, 32, 48, 48),
+            // n >= JB(64): 参照側は `matvec_rows_bt_vec_impl` (JB ブロック + 端数スカラー)
+            // を通る。1 要素の累積順は同じなので pair とビット一致するはず。
+            (96, 32, 96, 96),
+        ];
+        for (m, k, n1, n2) in shapes {
+            let a = pseudo_random(m * k, 21 + m as u32);
+            let b1 = pseudo_random(n1 * k, 22);
+            let b2 = pseudo_random(n2 * k, 23);
+            let mut want1 = vec![0.0f32; m * n1];
+            let mut want2 = vec![0.0f32; m * n2];
+            matvec_rows_bt_into(&a, &b1, k, n1, m, &mut want1);
+            matvec_rows_bt_into(&a, &b2, k, n2, m, &mut want2);
+            for rep in 0..2 {
+                let mut got1 = vec![f32::NAN; m * n1];
+                let mut got2 = vec![f32::NAN; m * n2];
+                matvec_rows_bt_pair_into(&a, &b1, &b2, k, n1, n2, m, &mut got1, &mut got2);
+                for idx in 0..m * n1 {
+                    assert_eq!(
+                        got1[idx].to_bits(),
+                        want1[idx].to_bits(),
+                        "rep={rep} m={m} k={k} n1={n1} idx={idx}: beta がビット不一致"
+                    );
+                }
+                for idx in 0..m * n2 {
+                    assert_eq!(
+                        got2[idx].to_bits(),
+                        want2[idx].to_bits(),
+                        "rep={rep} m={m} k={k} n2={n2} idx={idx}: alpha がビット不一致"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
