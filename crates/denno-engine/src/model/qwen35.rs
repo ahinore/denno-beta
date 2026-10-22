@@ -1833,6 +1833,23 @@ impl Qwen35 {
                     // s165 (P2): q/k/v 投影 → QK-Norm/RoPE/KV 書き込み → attend は
                     // `full_attn_host_side` に切り出した (中身は従来のこの分岐そのもの・
                     // 演算順も不変)。残差常駐経路も同じコードを通す。
+                    // s169 (P10): q|k|v の連結重みを parts の行範囲として**先に**
+                    // 割り当てる。ホスト経路の q/k/v 投影は `apply_bt_rows_into` の
+                    // per-op GPU 経路 (maybe_gpu_linear_q4_into) を通りうるので、
+                    // 登録が無いと q/k/v が**個別に** VRAM へ載り、以降 decode chain は
+                    // 連結重みを使えない (実測: full 16 層が 3 発ずつのまま = 289 発)。
+                    // 個別に載っている場合は登録しない (VRAM を 2 重にしない)。
+                    #[cfg(feature = "cuda")]
+                    if crate::cuda::q4_chain_enabled() {
+                        if let Some(f) = layer.qkv_fused.as_ref() {
+                            if !crate::cuda::q4_any_resident(&[&fl.q_w, &fl.k_w, &fl.v_w]) {
+                                crate::cuda::q4_register_row_alias(
+                                    f,
+                                    &[&fl.q_w, &fl.k_w, &fl.v_w],
+                                );
+                            }
+                        }
+                    }
                     let _att_done = self.full_attn_host_side(
                         fl,
                         cache,
