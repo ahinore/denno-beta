@@ -4280,7 +4280,7 @@ pub const CH_H: usize = 1; // rmsnorm 出力 [m*e]
 pub const CH_QKV: usize = 2; // qkv 連結出力 [m*(qn+2*kvn)] (q|k|v の列ブロック)
 pub const CH_ATT: usize = 3; // attention 出力 (o_proj 入力) [m*(heads*dh)]
 pub const CH_O: usize = 4; // o_proj 出力 [m*(heads*dh)]
-pub const CH_GA: usize = 5; // gate/up 連結出力 [m*2ff] (gate が前半)
+pub const CH_GA: usize = 5; // gate/up 出力 [m*2ff] (2 回 GEMM = gate 前半/up 後半・1 回 GEMM = 行内 [gate|up])
 pub const CH_ACT: usize = 6; // swiglu 出力 [m*ff]
 pub const CH_DOWN: usize = 7; // down 出力 [m*e]
 pub const CH_LOGITS: usize = 8; // lm_head 出力 [m*vocab]
@@ -5295,7 +5295,45 @@ pub fn chain_mlp_prefill_q4(
     if x.len() < m.checked_mul(e)? || out.len() < m.checked_mul(e)? {
         return None;
     }
-    chain_mlp_prefill_q4_impl(gate, up, down, PfSrc::Host(x), PfSink::Host(out), m, li)
+    chain_mlp_prefill_q4_impl(
+        PfGu::Split(gate, up),
+        down,
+        PfSrc::Host(x),
+        PfSink::Host(out),
+        m,
+        li,
+    )
+}
+
+/// s173 (P14): [`chain_mlp_prefill_q4`] の**連結重み**版 (ホスト入出力)。
+///
+/// `gate_up` は `Layer::gate_up_w` = [gate 全行 | up 全行] の行連結 1 本。
+/// 1 タイルあたりの launch は「gate|up の 1 回の GEMM + swiglu + down」の
+/// 3 発になる (従来は gate / up が別で 4 発)。
+///
+/// 前提 (すべて Q4・形の整合・`gate_up` が gate/up の行範囲として登録済み) は
+/// [`pf_ffn_fused_ready`] で確認する。満たさないときは `None` を返す =
+/// 呼び出し側は 2 回呼び出しの [`chain_mlp_prefill_q4`] へ落ちる (fail closed)。
+pub fn chain_mlp_prefill_q4_fused(
+    gate_up: &crate::quant::Linear,
+    down: &crate::quant::Linear,
+    x: &[f32],
+    m: usize,
+    li: usize,
+    out: &mut [f32],
+) -> Option<()> {
+    let e = down_dims_out(down)?;
+    if x.len() < m.checked_mul(e)? || out.len() < m.checked_mul(e)? {
+        return None;
+    }
+    chain_mlp_prefill_q4_impl(
+        PfGu::Fused(gate_up),
+        down,
+        PfSrc::Host(x),
+        PfSink::Host(out),
+        m,
+        li,
+    )
 }
 
 /// s165 (P2): FFN チェーンの入出力をデバイス常駐で回す版。入力は `CH_PFH`
@@ -5309,7 +5347,41 @@ pub fn chain_mlp_prefill_q4_dev(
     m: usize,
     li: usize,
 ) -> Option<()> {
-    chain_mlp_prefill_q4_impl(gate, up, down, PfSrc::Slot, PfSink::Slot, m, li)
+    chain_mlp_prefill_q4_impl(
+        PfGu::Split(gate, up),
+        down,
+        PfSrc::Slot,
+        PfSink::Slot,
+        m,
+        li,
+    )
+}
+
+/// s173 (P14): [`chain_mlp_prefill_q4_dev`] の**連結重み**版。
+///
+/// 入力は `CH_PFH`・出力は `CH_DOWN` のまま (転送 0 回) で、違うのは
+/// 「gate と up を 1 回の GEMM で `CH_GA` の行内連結 [gate|up] へ書く」点だけ。
+/// 続く swiglu は行内レイアウト用の `dno_swiglu_int` になる (演算列は
+/// `dno_swiglu` と同一 = CPU の `silu(g)*u` とビット一致)。
+///
+/// ビット一致の根拠: `dno_gemm_q4_0` の出力 `out[i*n + j]` は k 方向の
+/// 累積だけで決まり、n は行ストライドと境界判定にしか使われない
+/// (`j0 = blockIdx.y * 128`)。したがって n=2ff の 1 回呼び出しは、
+/// n=ff の 2 回呼び出しと**同じ値**を、行内 [gate|up] の並びで書く。
+pub fn chain_mlp_prefill_q4_dev_fused(
+    gate_up: &crate::quant::Linear,
+    down: &crate::quant::Linear,
+    m: usize,
+    li: usize,
+) -> Option<()> {
+    chain_mlp_prefill_q4_impl(
+        PfGu::Fused(gate_up),
+        down,
+        PfSrc::Slot,
+        PfSink::Slot,
+        m,
+        li,
+    )
 }
 
 /// [`chain_mlp_prefill_q4`] の入力次元 (k)。Q4 以外は None。
@@ -5318,6 +5390,88 @@ fn gate_dims_in(w: &crate::quant::Linear) -> Option<usize> {
         crate::quant::Linear::Q4(q) => Some(q.k),
         _ => None,
     }
+}
+
+/// [`chain_mlp_prefill_q4_fused`] の出力次元 (e = down.n)。Q4 以外は None。
+fn down_dims_out(w: &crate::quant::Linear) -> Option<usize> {
+    match w {
+        crate::quant::Linear::Q4(q) => Some(q.n),
+        _ => None,
+    }
+}
+
+/// s173 (P14): FFN を **1 回の gate|up GEMM** で通せるか (GPU を触らない事前検査)。
+///
+/// 条件: gate_up / gate / up / down がすべて Q4・形の整合 (`gate_up` が
+/// [gate 全行 | up 全行]・k = e・n = 2*ff)・**gate/up が連結側の行範囲として
+/// 登録済み** ([`q4_register_row_alias`])。
+///
+/// 最後の条件は VRAM/H2D を増やさないためのもの: 未登録のまま連結重みを使うと
+/// 2*ff*e を別途転送することになる (登録済みなら `weights_for_q4` は連結側の
+/// 既存デバイス領域を指すビューを返す)。満たさないときは呼び出し側は従来の
+/// 2 回呼び出し経路のまま = fail closed。
+pub fn pf_ffn_fused_ready(
+    gate_up: &crate::quant::Linear,
+    gate: &crate::quant::Linear,
+    up: &crate::quant::Linear,
+    down: &crate::quant::Linear,
+) -> bool {
+    if !pf_ffn_fused_enabled() {
+        return false;
+    }
+    let (Some(c), Some(g), Some(u), Some(d)) =
+        (q4_of(gate_up), q4_of(gate), q4_of(up), q4_of(down))
+    else {
+        return false;
+    };
+    if !ffn_fused_shape_ok(c, g, u, d) {
+        return false;
+    }
+    q4_fused_ready(c.uid, &[g, u])
+}
+
+/// s173 (P14): FFN の gate|up を 1 回の GEMM に畳むか (既定 ON)。
+///
+/// `DENNO_PF_FFN_FUSED=0` で従来の 2 回呼び出しへ戻す — A/B 用のスイッチで、
+/// **数値は経路によらず同一** (カーネル・累積順・タイル幅は不変)。
+fn pf_ffn_fused_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_pf_ffn_fused(std::env::var("DENNO_PF_FFN_FUSED").ok().as_deref()))
+}
+
+/// s173 (P14): `DENNO_PF_FFN_FUSED` の解釈 (純関数・テスト可能)。
+/// `parse_q4_chain` と同じ規約で、**`"0"` だけが off** (未設定・空・その他は on)。
+fn parse_pf_ffn_fused(raw: Option<&str>) -> bool {
+    raw != Some("0")
+}
+
+/// s173 (P14): [`pf_ffn_fused_ready`] の**形状だけ**の契約 (純粋関数・GPU と
+/// エイリアス表に触らない)。
+///
+/// `gate_up` = [gate 全行 | up 全行]・k = e・n = 2*ff・`down` = [ff, e]。
+/// ここが崩れると連結重みの行範囲が別の重みを指す (数値が変わる) ので、
+/// 満たさない入力はすべて false (= 従来の 2 回呼び出しへフォールバック)。
+fn ffn_fused_shape_ok(
+    c: &crate::quant::Q4Linear,
+    g: &crate::quant::Q4Linear,
+    u: &crate::quant::Q4Linear,
+    d: &crate::quant::Q4Linear,
+) -> bool {
+    if c.k != g.k || c.k != u.k || c.n != g.n + u.n {
+        return false;
+    }
+    // ff = g.n = u.n = down.k、e = c.k = down.n、連結幅 = 2*ff
+    d.k == g.n && d.n == c.k && c.n == 2 * d.k
+}
+
+/// s173 (P14): FFN の gate/up の与え方。
+///
+/// `Split` は従来どおり別々の重みで 2 回の GEMM (`CH_GA` の前半/後半へ)、
+/// `Fused` は [gate 全行 | up 全行] の連結重み 1 本で 1 回の GEMM
+/// (`CH_GA` へ行内 [gate|up] で書く)。GEMM の k 方向累積順は両者で同一。
+enum PfGu<'a> {
+    Split(&'a crate::quant::Linear, &'a crate::quant::Linear),
+    Fused(&'a crate::quant::Linear),
 }
 
 /// s165 (P2): prefill チェーンの入力の出所。
@@ -5337,10 +5491,9 @@ enum PfSink<'a> {
     Slot,
 }
 
-/// [`chain_mlp_prefill_q4`] の本体 (入出力の出所だけを差し替える)。
+/// [`chain_mlp_prefill_q4`] の本体 (gate/up の与え方と入出力の出所を差し替える)。
 fn chain_mlp_prefill_q4_impl(
-    gate: &crate::quant::Linear,
-    up: &crate::quant::Linear,
+    gu_src: PfGu<'_>,
     down: &crate::quant::Linear,
     src: PfSrc<'_>,
     mut sink: PfSink<'_>,
@@ -5355,15 +5508,43 @@ fn chain_mlp_prefill_q4_impl(
     {
         return None;
     }
-    let (gu, uu, du) = match (gate, up, down) {
-        (Linear::Q4(a), Linear::Q4(b), Linear::Q4(c)) => (a, b, c),
+    let ctx = chain_ctx()?;
+    let du = match down {
+        Linear::Q4(c) => c,
         _ => return None,
     };
-    let e = gu.k;
-    let ff = gu.n;
-    if uu.k != e || uu.n != ff || du.k != ff || du.n != e {
-        return None;
-    }
+    // s173 (P14): gate/up の重みとレイアウト。`Fused` では 1 本の連結重みで
+    // gate|up を 1 回の GEMM にまとめる (ff は down.k、e は down.n から取る)。
+    let (e, ff, gw1, gw2) = match gu_src {
+        PfGu::Split(gate, up) => {
+            let (gu, uu) = match (gate, up) {
+                (Linear::Q4(a), Linear::Q4(b)) => (a, b),
+                _ => return None,
+            };
+            let e = gu.k;
+            let ff = gu.n;
+            if uu.k != e || uu.n != ff || du.k != ff || du.n != e {
+                return None;
+            }
+            let gw1 = weights_for_q4(gu.uid, &gu.blocks, gu.k, gu.n).ok()?;
+            let gw2 = weights_for_q4(uu.uid, &uu.blocks, uu.k, uu.n).ok()?;
+            (e, ff, gw1, Some(gw2))
+        }
+        PfGu::Fused(gate_up) => {
+            let c = match gate_up {
+                Linear::Q4(x) => x,
+                _ => return None,
+            };
+            let e = du.n;
+            let ff = du.k;
+            if c.k != e || ff == 0 || c.n != 2 * ff {
+                return None;
+            }
+            let gw1 = weights_for_q4(c.uid, &c.blocks, c.k, c.n).ok()?;
+            (e, ff, gw1, None)
+        }
+    };
+    let gw3 = weights_for_q4(du.uid, &du.blocks, du.k, du.n).ok()?;
     if m == 0 {
         return None;
     }
@@ -5377,10 +5558,6 @@ fn chain_mlp_prefill_q4_impl(
             return None;
         }
     }
-    let ctx = chain_ctx()?;
-    let gw1 = weights_for_q4(gu.uid, &gu.blocks, gu.k, gu.n).ok()?;
-    let gw2 = weights_for_q4(uu.uid, &uu.blocks, uu.k, uu.n).ok()?;
-    let gw3 = weights_for_q4(du.uid, &du.blocks, du.k, du.n).ok()?;
     // Slot 出力は CH_DOWN の行オフセットへ書くので、全行ぶんの領域を要求する
     // (タイルごとの ensure は 1 タイル分しか保証しない)。
     if matches!(sink, PfSink::Slot) {
@@ -5439,14 +5616,25 @@ fn chain_mlp_prefill_q4_impl(
                 PfSrc::Slot => s.bufs[CH_PFH].as_ref()?.ptr() + (r0 * e * 4) as u64,
             };
             // 2) gate → CH_GA 前半 / up → CH_GA 後半 / 3) swiglu / 4) down
+            // s173 (P14): 連結重みがあるときは gate|up を**1 回の GEMM**で
+            // CH_GA へ行内 [gate|up] で書く (launch 4 -> 3)。続く swiglu は
+            // 行内レイアウト用の `dno_swiglu_int` (演算列は `dno_swiglu` と同一)。
             pf_phase(PF_PH_FFN_GATE);
             crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
-                chain_gemm_q4_pf(gw1, pin, pga, mr, e, ff)?;
-                chain_gemm_q4_pf(gw2, pin, pga + up_off, mr, e, ff)
+                match gw2 {
+                    Some(gw_up) => {
+                        chain_gemm_q4_pf(gw1, pin, pga, mr, e, ff)?;
+                        chain_gemm_q4_pf(gw_up, pin, pga + up_off, mr, e, ff)
+                    }
+                    None => chain_gemm_q4_pf(gw1, pin, pga, mr, e, 2 * ff),
+                }
             })?;
             pf_phase(PF_PH_SWIGLU);
             crate::prof::time_layer(crate::prof::SWIGLU, li, || -> Option<()> {
-                chain_swiglu_split(pga, pga + up_off, pact, mr * ff)
+                match gw2 {
+                    Some(_) => chain_swiglu_split(pga, pga + up_off, pact, mr * ff),
+                    None => chain_swiglu_int_at(pga, pact, ff, mr * ff),
+                }
             })?;
             pf_phase(PF_PH_FFN_DOWN);
             crate::prof::time_layer(crate::prof::DOWN, li, || -> Option<()> {
@@ -5519,6 +5707,33 @@ fn chain_swiglu_split(gate: u64, up: u64, out: u64, total: usize) -> Option<()> 
         ];
         let grid = (total as u64).div_ceil(256) as u32;
         ok(ctx.launch_async(ctx.f_swiglu, (grid, 1, 1), (256, 1, 1), 0, &mut args))
+    }
+}
+
+/// s173 (P14): 行内 [gate|up] レイアウト (`width = 2*ff`) の swiglu を生ポインタで
+/// 起動する (`dno_swiglu_int`)。[`chain_swiglu_rows`] のスロット版と同じカーネル・
+/// 同じ引数で、CHAIN を借りている最中 (タイルループ内) から呼べるようにしたもの。
+/// 演算列は `dno_swiglu` と同一 (`dno_expf` + `__fdiv_rn` + `__fadd_rn` +
+/// `__fmul_rn`) なので、CPU の `silu(g)*u` とビット一致。
+fn chain_swiglu_int_at(ga: u64, out: u64, ff: usize, total: usize) -> Option<()> {
+    let ctx = chain_ctx()?;
+    if ff == 0 || total == 0 {
+        return None;
+    }
+    unsafe {
+        let (mut pg, mut po) = (ga, out);
+        let mut ffc = ff as c_int;
+        let mut width = (2 * ff) as c_int;
+        let mut tc = total as i64;
+        let mut args = [
+            &mut pg as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut ffc as *mut _ as *mut c_void,
+            &mut width as *mut _ as *mut c_void,
+            &mut tc as *mut _ as *mut c_void,
+        ];
+        let grid = (total as u64).div_ceil(256) as u32;
+        ok(ctx.launch_async(ctx.f_swiglu_int, (grid, 1, 1), (256, 1, 1), 0, &mut args))
     }
 }
 
@@ -13375,6 +13590,83 @@ mod b20_stage1_tests {
 
         // 7) 桁あふれは checked_mul で None
         assert!(!sup(&w, n_ok, (usize::MAX, nv, dk, dv, dc)), "conv_dim の桁あふれは受けない");
+    }
+}
+
+#[cfg(test)]
+mod p14_ffn_fused_tests {
+    //! s173 (Task P14): prefill FFN の **gate|up 1 回 GEMM** の前提契約を固定する。
+    //!
+    //! `pf_ffn_fused_ready` が true のときだけ 1 回の GEMM 経路 (n = 2*ff を
+    //! `CH_GA` へ行内 [gate|up] で書く) に入る。条件を 1 つでも落とすと
+    //! 連結重みの行範囲が別の重みを指しうる (数値が変わる) ので、
+    //! `ffn_fused_shape_ok` の false 側を全部固定する。
+    //! GPU が無い環境でも走る (形状だけの純粋関数・エイリアス表に触らない)。
+    use super::*;
+    use crate::quant::{Linear, Q4Linear};
+
+    fn q4(k: usize, n: usize, uid: u64) -> Q4Linear {
+        // 形状だけを見るので blocks は空でよい (weights_for_q4 は呼ばない)。
+        Q4Linear { blocks: Vec::new(), k, n, uid }
+    }
+
+    #[test]
+    fn ffn_fused_shape_accepts_gate_up_concat() {
+        // 27B: e = 5120, ff = 17408 → gate_up は [2*ff, e]、down は [ff, e]
+        let (e, ff) = (5120usize, 17408usize);
+        let c = q4(e, 2 * ff, 1);
+        let g = q4(e, ff, 2);
+        let u = q4(e, ff, 3);
+        let d = q4(ff, e, 4);
+        assert!(ffn_fused_shape_ok(&c, &g, &u, &d));
+    }
+
+    #[test]
+    fn ffn_fused_shape_fail_closed() {
+        let (e, ff) = (5120usize, 17408usize);
+        let c = q4(e, 2 * ff, 1);
+        let g = q4(e, ff, 2);
+        let u = q4(e, ff, 3);
+        let d = q4(ff, e, 4);
+        // 連結幅が 2*ff でない (短い / 長い)
+        assert!(!ffn_fused_shape_ok(&q4(e, 2 * ff - 1, 1), &g, &u, &d));
+        assert!(!ffn_fused_shape_ok(&q4(e, 2 * ff + 1, 1), &g, &u, &d));
+        // gate と up の行数が違う (和だけ合っていても駄目)
+        assert!(!ffn_fused_shape_ok(&c, &q4(e, ff - 32, 2), &q4(e, ff + 32, 3), &d));
+        // k が食い違う
+        assert!(!ffn_fused_shape_ok(&q4(e + 32, 2 * ff, 1), &g, &u, &d));
+        assert!(!ffn_fused_shape_ok(&c, &q4(e + 32, ff, 2), &u, &d));
+        assert!(!ffn_fused_shape_ok(&c, &g, &q4(e + 32, ff, 3), &d));
+        // down の形が [ff, e] でない
+        assert!(!ffn_fused_shape_ok(&c, &g, &u, &q4(ff + 32, e, 4)));
+        assert!(!ffn_fused_shape_ok(&c, &g, &u, &q4(ff, e + 32, 4)));
+    }
+
+    /// Q4 以外が混ざったら (int8 / fp32 のモデル) 1 回 GEMM 経路には入らない。
+    /// エイリアス表は空のままなので `q4_fused_ready` も false を返す。
+    #[test]
+    fn ffn_fused_ready_requires_all_q4() {
+        let (e, ff) = (5120usize, 17408usize);
+        let c = Linear::Q4(q4(e, 2 * ff, 1));
+        let g = Linear::Q4(q4(e, ff, 2));
+        let u = Linear::Q4(q4(e, ff, 3));
+        let d = Linear::Q4(q4(ff, e, 4));
+        // 全部 Q4 だがエイリアス未登録 (GPU 無し / 登録失敗) → 従来経路
+        assert!(!pf_ffn_fused_ready(&c, &g, &u, &d));
+        // 1 本でも Q4 でなければ false
+        let f32w = Linear::F32 { w: Vec::new(), k: ff, n: e };
+        assert!(!pf_ffn_fused_ready(&c, &g, &u, &f32w));
+        assert!(!pf_ffn_fused_ready(&f32w, &g, &u, &d));
+    }
+
+    /// A/B スイッチの解釈: `"0"` だけが off (タイポで静かに経路が変わるのを避ける)。
+    #[test]
+    fn env_switch_only_zero_is_off() {
+        assert!(parse_pf_ffn_fused(None));
+        assert!(parse_pf_ffn_fused(Some("")));
+        assert!(parse_pf_ffn_fused(Some("1")));
+        assert!(parse_pf_ffn_fused(Some("off")));
+        assert!(!parse_pf_ffn_fused(Some("0")));
     }
 }
 
