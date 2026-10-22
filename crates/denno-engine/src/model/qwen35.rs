@@ -256,6 +256,83 @@ fn rope_partial_interleaved_tab(x: &mut [f32], heads: usize, dh: usize, n_rot: u
     }
 }
 
+/// s172 (P12): prefill の prepare (QK-Norm → RoPE → KV 行書き込み) を **1 行分**
+/// 実行する。s171 までの `full_attn_host_side` の内側の本文をそのまま関数へ
+/// 切り出したもの (演算列・確保の回数・書き込み順は同一)。
+///
+/// 切り出した理由は計測: `p12_prepare_bench` がこの関数を 27B の実シェイプ・
+/// n=14,043 で回し、prepare のコストを実測できるようにするため
+/// (行ごとの `Vec` 確保をやめる版も試したが **-1.6 ms/層 = 0.03 s/request** しか
+/// 動かず、実装を 2 本持つ価値が無いので採らなかった — REPORT_P12.md)。
+#[allow(clippy::too_many_arguments)]
+fn pf_prepare_row(
+    qg_i: &[f32],      // [heads*2*dh] q 投影 + ゲート
+    k_i: &[f32],       // [kv_heads*dh]
+    v_i: &[f32],       // [kv_heads*dh]
+    q_r: &mut [f32],   // [heads*dh] 出力 (norm + rope 済み q)
+    k_row: &mut [f32], // [kv_heads*dh] 出力 (KV キャッシュの行)
+    v_row: &mut [f32], // [kv_heads*dh]
+    q_norm_w: &[f32],
+    k_norm_w: &[f32],
+    heads: usize,
+    kv_heads: usize,
+    dh: usize,
+    n_rot: usize,
+    eps: f32,
+    theta: f32,
+    rope_tab: Option<&[f32]>,
+    pos: usize,
+) {
+    let kv_dim = kv_heads * dh;
+    let mut k = k_i.to_vec();
+    for hh in 0..heads {
+        let src = &qg_i[hh * 2 * dh..hh * 2 * dh + dh];
+        let wq = rmsnorm(src, q_norm_w, dh, eps);
+        q_r[hh * dh..(hh + 1) * dh].copy_from_slice(&wq);
+    }
+    for kvh in 0..kv_heads {
+        let seg = &mut k[kvh * dh..(kvh + 1) * dh];
+        let wn = rmsnorm(seg, k_norm_w, dh, eps);
+        seg.copy_from_slice(&wn);
+    }
+    match rope_tab {
+        Some(t) => {
+            rope_partial_interleaved_tab(q_r, heads, dh, n_rot, t);
+            rope_partial_interleaved_tab(&mut k, kv_heads, dh, n_rot, t);
+        }
+        None => {
+            rope_partial_interleaved(q_r, heads, dh, n_rot, pos, theta);
+            rope_partial_interleaved(&mut k, kv_heads, dh, n_rot, pos, theta);
+        }
+    }
+    k_row[..kv_dim].copy_from_slice(&k);
+    v_row[..kv_dim].copy_from_slice(v_i);
+}
+
+/// s172 (P12): attention 出力の「pinned へ直接 D2H → その場でゲート → H2D」を
+/// 使うか (既定 ON・`DENNO_PF_ATT_INPLACE=0` で従来の
+/// D2H → ゲート → `buf_att` → アップロードに戻る)。値は両者でビット一致なので、
+/// このスイッチは**速度だけ**を切り替える。
+fn pf_att_inplace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DENNO_PF_ATT_INPLACE").ok().as_deref() != Some("0"))
+}
+
+/// s172 (P12): prefill の full attention (attend) をどこで確定したか。
+///
+/// 呼び出し側の後続が変わる: [`AttnPlace::GpuDev`] のときだけ「ゲート済み att が
+/// デバイスの `CH_ATT` にある」= ホストからの H2D (`chain_pf_upload_att`) を
+/// 省ける。他 2 つは `buf_att` (ホスト) にゲート済みの結果がある。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttnPlace {
+    /// CPU attend (rayon)。
+    Cpu,
+    /// GPU カーネル → D2H → ホストでゲート → `buf_att`。
+    GpuHost,
+    /// GPU カーネル → D2H (pinned) → その場でゲート → H2D 済み (`CH_ATT`)。
+    GpuDev,
+}
+
 impl Qwen35 {
     pub fn load(dir: &Path, cfg: &serde_json::Value, quant: QuantMode) -> Result<Self> {
         // text_config を優先 (0.8B は VLM ラッパ形式)
@@ -802,6 +879,11 @@ impl Qwen35 {
     /// s171 (P11): [`Self::full_attn_rope`] の表引き版。`tab` は 1 行
     /// `[cos(n_rot/2) | sin(n_rot/2)]` (`rope_pi_tab_rows` の pos 行)。
     /// 値・演算列は同一なので出力はビット一致。
+    ///
+    /// s172 (P12): prefill の prepare は自由関数 [`pf_prepare_row`] を通るように
+    /// なったので、この method の実運用の呼び出しは無い (テスト
+    /// `rope_pi_tab_rows_bit_exact` が on-the-fly 版との一致を固定している)。
+    #[cfg_attr(not(test), allow(dead_code))]
     fn full_attn_rope_tab(&self, qout: &mut [f32], k: &mut [f32], tab: &[f32]) {
         let dh = self.dh;
         rope_partial_interleaved_tab(qout, self.heads, dh, self.n_rot, tab);
@@ -862,7 +944,9 @@ impl Qwen35 {
     /// → attend) を 1 つの関数にまとめたもの。中身は従来 `forward_prefill` の Full
     /// 分岐そのままで、数値・演算順・prof バケットは不変 (残差常駐経路からも同じ
     /// コードを通すために切り出した)。`buf_h` は rmsnorm 済み入力 [n, e]。
-    /// 戻り値は GPU attend (dno_attention_prefill) が走ったか。
+    /// 戻り値は「ゲート済み att がどこにあるか」([`AttnPlace`]) — `GpuDev` の
+    /// ときだけデバイスの `CH_ATT` に確定しており、呼び出し側はアップロードを
+    /// 省く (s172/P12)。
     #[allow(clippy::too_many_arguments)]
     fn full_attn_host_side(
         &self,
@@ -882,7 +966,11 @@ impl Qwen35 {
         // 値は同一 (ビット一致) なので、Some でも数値経路は変わらない。
         rope_tab: Option<&[f32]>,
         qkv_precomputed: bool,
-    ) -> bool {
+        // s172 (P12): `true` = 呼び出し側が直後に `buf_att` (ホスト) を読む
+        // (従来の forward_prefill 経路)。`false` = 直後に o_proj をデバイスで
+        // 回す残差常駐経路で、ゲート済み att をデバイスに残せれば H2D を省ける。
+        host_att_needed: bool,
+    ) -> AttnPlace {
         let heads = self.heads;
         let dh = self.dh;
         let kv_dim = self.kv_heads * dh;
@@ -905,7 +993,11 @@ impl Qwen35 {
         // 層をまたいで領域を再利用するときは毎層ゼロで初期化する。
         // 旧実装は層ごとに vec![0.0] を確保していたのと同じ状態になる。
         // 並列 fill なので数値・順序には影響しない。
-        buf_att.par_chunks_exact_mut(dh).for_each(|c| c.fill(0.0));
+        //
+        // s172 (P12): ゼロ埋めは **CPU attend のときだけ** 必要 (GPU attend は
+        // `att` の全要素を D2H で上書きする)。27B n=14,043 では 1 層 345 MB ×
+        // 16 層 = 5.5 GB/request の無駄な書き込みだったので、下の
+        // `if !att_done` の中へ移した (値・順序は不変)。
         // s42 (Plan B): prepare (KV 書き込み + QK-Norm + RoPE) をトークン順
         // に逐次実行 (トークン逐次経路と同一の演算列・decode 経路の
         // full_attn_core と共用)。attend は読み取り専用のため全トークンの
@@ -923,6 +1015,7 @@ impl Qwen35 {
             let (kc, vc) = cache.kv_bufs(li, 1);
             let krows = &mut kc[pos0 * kv_dim..(pos0 + n) * kv_dim];
             let vrows = &mut vc[pos0 * kv_dim..(pos0 + n) * kv_dim];
+            // s172 (P12): 1 行分の本文は `pf_prepare_row` (計測用に切り出し)。
             crate::prof::time_n_ev(crate::prof::QKNORM, n, || {
                 buf_q
                     .par_chunks_exact_mut(heads * dh)
@@ -933,19 +1026,26 @@ impl Qwen35 {
                     .zip(vrows.par_chunks_exact_mut(kv_dim))
                     .enumerate()
                     .for_each(|(i, (((((q_r, qg_i), k_i), v_i), k_row), v_row))| {
-                        let mut kn = self.full_attn_qknorm(fl, qg_i, k_i, q_r);
-                        // s171 (P11): cos/sin は (pos, d) だけで決まるので、表が
-                        // あれば表引きにする (値・演算列は on-the-fly と同一)。
-                        match rope_tab {
-                            Some(t) => self.full_attn_rope_tab(
-                                q_r,
-                                &mut kn,
-                                &t[i * self.n_rot..(i + 1) * self.n_rot],
-                            ),
-                            None => self.full_attn_rope(q_r, &mut kn, pos0 + i),
-                        }
-                        k_row.copy_from_slice(&kn);
-                        v_row.copy_from_slice(v_i);
+                        // s172 (P12): 本文は `pf_prepare_row` に切り出した
+                        // (計測用・演算列と確保の回数は s171 までと同一)。
+                        pf_prepare_row(
+                            qg_i,
+                            k_i,
+                            v_i,
+                            q_r,
+                            k_row,
+                            v_row,
+                            &fl.q_norm_w,
+                            &fl.k_norm_w,
+                            heads,
+                            self.kv_heads,
+                            dh,
+                            self.n_rot,
+                            self.eps,
+                            self.theta,
+                            rope_tab.map(|t| &t[i * self.n_rot..(i + 1) * self.n_rot]),
+                            pos0 + i,
+                        );
                     });
             });
         }
@@ -957,14 +1057,27 @@ impl Qwen35 {
         // で短文は CPU のまま・`DENNO_GPU_ATTN=0` で全経路現行に戻る)。
         // s57 (T4): full attention は attn_core の別バケット (ATT_FULL) に
         // 分離。GPU バッチ (dno_attention_prefill) が実際に走ったかを
-        // 実行先ラベルとして計測に載せる (`att_done` をそのまま返すだけ =
+        // 実行先ラベルとして計測に載せる (`place != Cpu` をそのまま返すだけ =
         // 分岐・演算列は不変)。
-        let (att_done, _) = crate::prof::time_layer_n_ev(crate::prof::ATT_FULL, li, n, || {
+        let (place, _att_done) = crate::prof::time_layer_n_ev(crate::prof::ATT_FULL, li, n, || {
             #[cfg(feature = "cuda")]
-            let att_done = self.full_attn_attend_gpu(buf_qg, buf_q, cache, li, pos0, n, buf_att);
+            let place = self.full_attn_attend_gpu(
+                buf_qg,
+                buf_q,
+                cache,
+                li,
+                pos0,
+                n,
+                buf_att,
+                !host_att_needed,
+            );
             #[cfg(not(feature = "cuda"))]
-            let att_done = false;
+            let place = AttnPlace::Cpu;
+            let att_done = place != AttnPlace::Cpu;
             if !att_done {
+                // s172 (P12): CPU attend は `att_head` へ**加算**するので、層間で
+                // 再利用する `buf_att` をここでゼロ埋めする (s63 の要件)。
+                buf_att.par_chunks_exact_mut(dh).for_each(|c| c.fill(0.0));
                 // s42: attend を (i, head) 並列で実行 (旧実装はトークン逐次 —
                 // O(n²) の単スレッド部分が長 prefill の律速)。1 head 分の
                 // scores → softmax → probs@V → gate はトークン逐次経路と同一の
@@ -990,9 +1103,9 @@ impl Qwen35 {
                         );
                     });
             }
-            (att_done, att_done)
+            (place, att_done)
         });
-        att_done
+        place
     }
 
     /// s48 (C1): full attention prefill の attend を GPU カーネル 1 発
@@ -1010,6 +1123,13 @@ impl Qwen35 {
     /// sigmoid 出力ゲートはカーネル外: 既存の dno_attn_gate_mul は 1 トークン専用
     /// (grid=(heads)) なため、D2H 後にホストで要素ごとに適用する (行独立 = 決定論
     /// 維持・C3 でデバイス連結する際に n トークン版カーネルを追加する)。
+    ///
+    /// s172 (P12): `allow_dev` (残差常駐経路のみ true) のときは
+    /// [`crate::cuda::chain_pf_att_inplace`] で **D2H の宛先をアップロード用の
+    /// pinned バッファにし、ゲートもそこで掛けて H2D する** — ホストへ 345 MB を
+    /// 落として別バッファへ写し、また pinned へ写す 3 回の memcpy が 1 回の
+    /// 転送往復になる (値は同一)。失敗時は下の従来経路 (D2H → ゲート →
+    /// `att` へコピー) に落ち、それも失敗すれば `AttnPlace::Cpu` = CPU attend。
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     fn full_attn_attend_gpu(
@@ -1021,14 +1141,15 @@ impl Qwen35 {
         pos0: usize,
         n: usize,
         att: &mut [f32],
-    ) -> bool {
+        allow_dev: bool,
+    ) -> AttnPlace {
         let heads = self.heads;
         let dh = self.dh;
         let kv_dim = self.kv_heads * dh;
         let group = heads / self.kv_heads;
         let t_total = pos0 + n;
         if !crate::cuda::attn_prefill_gpu_supported(n, dh, t_total) {
-            return false;
+            return AttnPlace::Cpu;
         }
         if crate::cuda::chain_attention_prefill(
             cache.kv_id(),
@@ -1046,7 +1167,42 @@ impl Qwen35 {
         )
         .is_none()
         {
-            return false;
+            return AttnPlace::Cpu;
+        }
+        // s172 (P12): 残差常駐経路はゲート済み att をデバイスに残せる (H2D を省く)。
+        // 失敗しても従来経路が下にあるので fail-closed (転送はやり直しになるだけ)。
+        if allow_dev && pf_att_inplace_enabled() {
+            let t_site = if crate::prof::d2h_src_on() {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let ok = crate::prof::time(crate::prof::D2H_ATTN_PF, || {
+                let v = crate::cuda::chain_pf_att_inplace(li, heads * dh, n, |v| {
+                    // sigmoid 出力ゲート (従来経路と同一の式・同一の行並列)
+                    v.par_chunks_exact_mut(dh)
+                        .enumerate()
+                        .for_each(|(t, att_head)| {
+                            let i = t / heads;
+                            let hh = t % heads;
+                            let gate = &qg[i * heads * 2 * dh + hh * 2 * dh + dh..][..dh];
+                            for (d, av) in att_head.iter_mut().enumerate() {
+                                *av /= 1.0 + (-gate[d]).exp();
+                            }
+                        });
+                });
+                if let Some(t) = t_site {
+                    crate::prof::mark_d2h_src(crate::prof::D2H_SRC_ATTN_PF);
+                    crate::prof::add_d2h_src_ns_only(
+                        crate::prof::D2H_SRC_ATTN_PF,
+                        t.elapsed().as_nanos() as u64,
+                    );
+                }
+                v
+            });
+            if ok.is_some() {
+                return AttnPlace::GpuDev;
+            }
         }
         // s88 (Step 1): prefill の attention 出力 D2H を、発行点 (site) 名つきで時間も積む。
         // `chain_download` 自体は件数を 1 件積む (s108 以降 logits 以外は `D2H_SRC_OTHER`)
@@ -1073,7 +1229,7 @@ impl Qwen35 {
             v
         }) {
             Some(v) => v,
-            None => return false,
+            None => return AttnPlace::Cpu,
         };
         // sigmoid 出力ゲート: att[t] /= 1+exp(-gate[t]) — CPU attend
         // (full_attn_attend_head) と同一の要素ごと演算 (行独立 → 行並列・
@@ -1089,7 +1245,7 @@ impl Qwen35 {
                 }
             });
         att.copy_from_slice(&ga);
-        true
+        AttnPlace::GpuHost
     }
 
     /// GDN 層の 1 トークン forward → attn 出力 [e]。
@@ -1941,6 +2097,9 @@ impl Qwen35 {
                         &mut buf_att,
                         rope_tab_ref,
                         false,
+                        // s172 (P12): 直後にホストの buf_att で o_proj する
+                        // 従来経路なので、att は必ずホストへ戻す。
+                        true,
                     );
                     self.lin(crate::prof::OPROJ, || {
                         fl.o_w.apply_bt_rows_into(&buf_att, n, &mut buf_out)
@@ -2347,16 +2506,22 @@ impl Qwen35 {
                 // s169 (P8): ここから attention のホスト側 (prepare + attend) と
                 // att の H2D までが full_core の区間 (GPU は遊ぶ = 区間に入る)。
                 cuda::pf_phase(cuda::PF_PH_FULL_CORE);
-                let _att_done = self.full_attn_host_side(
+                let att_place = self.full_attn_host_side(
                     fl, cache, li, pos0, n, &[], buf_qg, buf_k, buf_v, buf_q, buf_att, rope_tab,
                     true,
+                    // s172 (P12): 直後の o_proj はデバイス。ゲート済み att が既に
+                    // CH_ATT にあるなら H2D を省く (GpuDev)。
+                    false,
                 );
                 // attention 出力 (sigmoid ゲート済み・CH_ATT の生値ではない) を
                 // 1 回だけアップロードして、o_proj をデバイスで回す
-                let att_cols = self.heads * self.dh;
-                cuda::chain_pf_upload_att(buf_att, att_cols, n, li).ok_or_else(|| {
-                    anyhow::anyhow!("prefill residual chain: att upload failed")
-                })?;
+                // (s172: GpuDev のときはアップロード済み = 発行しない)
+                if att_place != AttnPlace::GpuDev {
+                    let att_cols = self.heads * self.dh;
+                    cuda::chain_pf_upload_att(buf_att, att_cols, n, li).ok_or_else(|| {
+                        anyhow::anyhow!("prefill residual chain: att upload failed")
+                    })?;
+                }
                 cuda::chain_oproj_prefill_q4(&fl.o_w, n, li).ok_or_else(|| {
                     anyhow::anyhow!("prefill residual chain: o_proj failed")
                 })?;
@@ -3011,6 +3176,121 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// s172 (P12): `sl_lay_full_core` のホスト側コストの実測 (CPU・`--ignored`)。
+    /// `cargo test -p denno-engine --lib --release p12_prepare_bench -- --ignored --nocapture`
+    ///
+    /// 27B の実シェイプ (heads=24 / kv_heads=4 / dh=256 / n_rot=64)・n=14,043 で
+    /// 1 層分を測る:
+    ///   1. prepare (QK-Norm + RoPE + KV 書き込み)  = `pf_prepare_row` × n
+    ///   2. att のゼロ埋め (CPU attend 用・345 MB)
+    ///   3. att のホスト memcpy (345 MB・1 スレッド) = 従来の `ga` → `buf_att`
+    ///   4. sigmoid ゲート (345 MB 読み書き + qg のゲート半分成分)
+    /// 数値はこのコンテナの CPU と rayon スレッド数のもので、GPU ホストの値ではない。
+    #[test]
+    #[ignore]
+    fn p12_prepare_bench() {
+        let (heads, kv_heads, dh, n_rot) = (24usize, 4usize, 256usize, 64usize);
+        let (eps, theta) = (1e-6f32, 5_000_000.0f32);
+        let kv_dim = kv_heads * dh;
+        let n = 14_043usize;
+        let q_norm_w: Vec<f32> = (0..dh).map(|i| 0.5 + (i as f32 * 0.011).sin() * 0.25).collect();
+        let k_norm_w: Vec<f32> = (0..dh).map(|i| 0.75 + (i as f32 * 0.007).cos() * 0.2).collect();
+        let qg: Vec<f32> = (0..n * heads * 2 * dh)
+            .map(|i| ((i as f32) * 0.000_37).sin() * 2.0)
+            .collect();
+        let k_i: Vec<f32> = (0..n * kv_dim).map(|i| ((i as f32) * 0.000_71).cos()).collect();
+        let v_i: Vec<f32> = (0..n * kv_dim).map(|i| ((i as f32) * 0.000_53).sin()).collect();
+        let mut q = vec![0.0f32; n * heads * dh];
+        let mut k_rows = vec![0.0f32; n * kv_dim];
+        let mut v_rows = vec![0.0f32; n * kv_dim];
+        let mut att = vec![0.0f32; n * heads * dh];
+        let ga = vec![0.5f32; n * heads * dh];
+        let tab = rope_pi_tab_rows(0, n, n_rot, theta);
+        println!(
+            "P12 full_core host bench: n={n} heads={heads} kv_heads={kv_heads} dh={dh} \
+             threads={} att={:.0} MB qg={:.0} MB",
+            rayon::current_num_threads(),
+            (att.len() * 4) as f64 / 1e6,
+            (qg.len() * 4) as f64 / 1e6
+        );
+        let mut best = [f64::MAX; 4];
+        for round in 0..4 {
+            // 1) prepare
+            let t = std::time::Instant::now();
+            q.par_chunks_exact_mut(heads * dh)
+                .zip(qg.par_chunks_exact(heads * 2 * dh))
+                .zip(k_i.par_chunks_exact(kv_dim))
+                .zip(v_i.par_chunks_exact(kv_dim))
+                .zip(k_rows.par_chunks_exact_mut(kv_dim))
+                .zip(v_rows.par_chunks_exact_mut(kv_dim))
+                .enumerate()
+                .for_each(|(i, (((((q_r, qg_i), ki), vi), k_row), v_row))| {
+                    pf_prepare_row(
+                        qg_i,
+                        ki,
+                        vi,
+                        q_r,
+                        k_row,
+                        v_row,
+                        &q_norm_w,
+                        &k_norm_w,
+                        heads,
+                        kv_heads,
+                        dh,
+                        n_rot,
+                        eps,
+                        theta,
+                        Some(&tab[i * n_rot..(i + 1) * n_rot]),
+                        i,
+                    );
+                });
+            let ms_prep = t.elapsed().as_secs_f64() * 1e3;
+            // 2) ゼロ埋め (CPU attend のときだけ必要)
+            let t = std::time::Instant::now();
+            att.par_chunks_exact_mut(dh).for_each(|c| c.fill(0.0));
+            let ms_fill = t.elapsed().as_secs_f64() * 1e3;
+            // 3) ホスト memcpy (従来の ga → buf_att)
+            let t = std::time::Instant::now();
+            att.copy_from_slice(&ga);
+            let ms_copy = t.elapsed().as_secs_f64() * 1e3;
+            // 4) sigmoid ゲート (行並列)
+            let t = std::time::Instant::now();
+            att.par_chunks_exact_mut(dh)
+                .enumerate()
+                .for_each(|(t_i, att_head)| {
+                    let i = t_i / heads;
+                    let hh = t_i % heads;
+                    let gate = &qg[i * heads * 2 * dh + hh * 2 * dh + dh..][..dh];
+                    for (d, av) in att_head.iter_mut().enumerate() {
+                        *av /= 1.0 + (-gate[d]).exp();
+                    }
+                });
+            let ms_gate = t.elapsed().as_secs_f64() * 1e3;
+            if round > 0 {
+                for (slot, v) in best.iter_mut().zip([ms_prep, ms_fill, ms_copy, ms_gate]) {
+                    *slot = slot.min(v);
+                }
+            }
+            println!(
+                "  round {round}: prepare {ms_prep:7.1} ms / fill {ms_fill:6.1} ms / \
+                 memcpy {ms_copy:7.1} ms / gate {ms_gate:7.1} ms (per layer)"
+            );
+        }
+        println!(
+            "  best/layer: prepare {:.1} / fill {:.1} / memcpy {:.1} / gate {:.1} ms",
+            best[0], best[1], best[2], best[3]
+        );
+        println!(
+            "  x16 layers: prepare {:.2} s / fill {:.2} s / memcpy {:.2} s / gate {:.2} s \
+             (合計 {:.2} s)",
+            best[0] * 16.0 / 1e3,
+            best[1] * 16.0 / 1e3,
+            best[2] * 16.0 / 1e3,
+            best[3] * 16.0 / 1e3,
+            (best[0] + best[1] + best[2] + best[3]) * 16.0 / 1e3
+        );
     }
 
     /// s171 (P11): モデル実体の heads / kv_heads / dh / n_rot / theta で、
