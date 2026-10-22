@@ -3592,3 +3592,43 @@ External implementations referenced in P19 and their licensing status (the same 
 - **Not measured here**: GPU execution, the three anchors (`c61ad85b` / `9e17d563` / `af6eb6ab`),
   ms/token, nsys. This container has no GPU, so the on-device verification steps are written in
   the work report (uncommitted, `REPORT_P16.md`). `.cu` / `.ptx` / 8095 were not touched.
+
+### s175: Task P19 - layer count in `denno info` now matches the inference trunk for GGUF-only repos (2026-10-23) done
+
+> Starting with a re-check of the premise: HEAD (`8a0525b` = s164) already filled
+> layers/hidden/vocab/context from GGUF metadata. A GGUF-only directory
+> (`/tmp/k7` -> `/work/models/Qwen3.8-27B-Q4_0.gguf`, no config.json) measures
+> `layers: 65 / hidden: 5120 / vocab: 248320 / context: 262144`, not `0`. The "prints 0"
+> observation predates s164; the current HEAD has no path that prints 0
+> (`info_fmt_u64(None)` is `?`). The one real remaining bug was **the layer count**.
+
+- **Bug**: the 27B GGUF has `qwen35.block_count=65` (= inference trunk 64 + MTP/nextn 1).
+  The engine takes `num_hidden_layers` from config.json as authoritative and skips the extra
+  `blk.64` as a nextn layer (the layer-count consistency check in `model/qwen35.rs`), so it
+  actually runs **64** layers. `denno info` printed 65 (a display-only mismatch; the numeric
+  path always ran 64 layers).
+- **Implementation (only `gguf_dims` in `crates/denno-cli/src/main.rs`)**: when config.json is
+  absent (or lacks the layers key), the GGUF-derived layer count is now
+  `<arch>.block_count - <arch>.nextn_predict_layers` (block_count as-is when the
+  `nextn_predict_layers` key is absent). A subtraction that lands at 0 or below is treated as
+  unknown = `?` (never print 0 as a fact). hidden comes from `<arch>.embedding_length` and
+  vocab from the `tokenizer.ggml.tokens` array length with the `<arch>.vocab_size` fallback -
+  **the existing keys and the existing loader (`denno_engine::gguf::GgufFile`)**, no second
+  loader was written. config.json still wins when present (per-dimension `.or()`).
+- **Display-spec question (operator call)**: `layers:` now reports "the inference trunk the
+  engine runs" = 64. Showing the raw `block_count` = 65 would belong on a separate line
+  (e.g. `mtp: 1`); that is out of scope here and was left untouched.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (unchanged). `cargo test --release -p denno-cli
+  --features denno-engine/cuda` = **25 passed / 0 failed** (23 -> +2:
+  `gguf_only_mtp_layer_count_matches_engine` = 65/1 -> 64 plus the display lines,
+  `gguf_nextn_edges_and_config_precedence` = nextn == block_count yields `?`, no nextn key
+  means no subtraction, config.json wins). `cargo build --release -p denno-cli
+  --features denno-engine/cuda` succeeds.
+- **Real files (CPU)**: `/tmp/k7` (GGUF only) `layers: 65` -> `layers: 64` (hidden / vocab /
+  context / quant lines unchanged), `data/qwen35-9b` (with config.json) stays `layers: 32`,
+  `/tmp/denno_a3_mtp_1775133` (config.json + MTP GGUF) stays at config's 64.
+- **Numeric class**: none (CLI display path only; the engine's numeric path, `.cu` / `.ptx`,
+  GPU execution and 8095 are untouched).
+- **Not measured here**: GPU anchors, ms/token, nsys (structurally unchanged because no numeric
+  path changed, but not measured). The work report is the uncommitted `REPORT_P19.md`.
