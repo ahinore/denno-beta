@@ -259,6 +259,9 @@ fn check(res: CUresult, what: &str) -> Result<()> {
 pub struct DevBuffer {
     ptr: CUdeviceptr,
     bytes: usize,
+    /// s165: false = 他のバッファの一部を指す**非所有**ビュー。drop で解放しない
+    /// (所有者は元のバッファ)。重みレジストリの行範囲エイリアス専用。
+    owned: bool,
 }
 
 impl DevBuffer {
@@ -287,7 +290,15 @@ impl DevBuffer {
                 }
             }
         }
-        Ok(Self { ptr, bytes })
+        Ok(Self { ptr, bytes, owned: true })
+    }
+
+    /// s165: 既存のデバイス領域の一部を指す**非所有**ビュー。連結重み
+    /// (`gate_up_w` など) の行範囲を、元の独立した重みとして見せるために使う
+    /// (同じ重みを VRAM へ 2 度上げない)。drop では解放しない。
+    /// `bytes` はビュー自身の長さ (所有側の範囲内であることは呼び出し側が保証)。
+    fn view(ptr: CUdeviceptr, bytes: usize) -> Self {
+        Self { ptr, bytes, owned: false }
     }
 
     /// ホストのスライスをデバイスへコピーして確保
@@ -408,7 +419,8 @@ impl DevBuffer {
 
 impl Drop for DevBuffer {
     fn drop(&mut self) {
-        if self.ptr != 0 {
+        // s165: ビュー (owned=false) は他バッファの一部なので解放しない
+        if self.owned && self.ptr != 0 {
             unsafe {
                 let _ = (lib().unwrap().mem_free)(self.ptr);
             }
@@ -2613,14 +2625,170 @@ struct GpuWq4 {
     n: usize,
 }
 
+/// s165: 連結重み (`gate_up_w` = [gate 全行 | up 全行]) の行範囲を、元の独立した
+/// 重み uid のデバイス表現として扱うためのエイリアス表。
+///
+/// 背景 (nsys・2026-10-22): 27B q4 の FFN は **decode chain が連結 1 本
+/// (`gate_up_w`)**、**prefill の Q4 経路 (`chain_mlp_prefill_q4`) が gate_w / up_w
+/// の 2 本**を使うため、同じ 2×ff×e パラメータが VRAM に 2 度載っていた
+/// (1 層 111.4 MB × 64 層 = 7.1 GB、H2D も同じ 7.1 GB)。ここに行範囲
+/// (uid → (連結 uid, 行オフセット)) を登録すると、`weights_for_q4` は個別の
+/// 重みを転送せず連結側のデバイス領域を指すビューを返す。
+///
+/// 数値は不変: 連結側の nib / sc は行単位で連続しており (1 行 = nb ブロック)、
+/// 行オフセット ff の位置は up_w の先頭行そのもの。カーネル・引数・グリッドは
+/// 従来と同一で、重みの置き場所だけが変わる。
+static Q4_ALIAS: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, (u64, usize)>>> =
+    OnceLock::new();
+
+fn q4_alias_table() -> &'static std::sync::Mutex<std::collections::HashMap<u64, (u64, usize)>> {
+    Q4_ALIAS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// s165: `Linear` から Q4 本体を取り出す (連結エイリアスの前提検査用)。
+fn q4_of(l: &crate::quant::Linear) -> Option<&crate::quant::Q4Linear> {
+    match l {
+        crate::quant::Linear::Q4(x) => Some(x),
+        _ => None,
+    }
+}
+
+/// s165: 連結重みの行範囲割り当て (純粋関数・GPU 不要)。
+///
+/// `concat_k` / `concat_n` は連結側の形状、`parts` は各行範囲の (k, n)。
+/// 「すべての part の k が concat_k と一致し、n の和が concat_n」のときだけ
+/// 各行の先頭行オフセットを返す (満たさなければ `None` = 呼び出し側は
+/// エイリアスを登録せず従来の個別転送に落ちる = fail closed)。
+pub fn q4_row_alias_offsets(
+    concat_k: usize,
+    concat_n: usize,
+    parts: &[(usize, usize)],
+) -> Option<Vec<usize>> {
+    if parts.is_empty() || concat_k == 0 || concat_k % 32 != 0 || concat_n == 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(parts.len());
+    let mut off = 0usize;
+    for &(k, n) in parts {
+        if k != concat_k || n == 0 {
+            return None;
+        }
+        out.push(off);
+        off = off.checked_add(n)?;
+    }
+    if off != concat_n {
+        return None;
+    }
+    Some(out)
+}
+
+/// s165: `concat` (行連結済みの 1 本) の行範囲を `parts` の各 uid に割り当てる。
+/// 呼び出し側は「parts の k がすべて concat.k と一致し、行数の和が concat.n」を
+/// 満たすときだけ呼ぶ。**前提を満たさない・Q4 でない・転送に失敗した場合は
+/// 何も登録せず false を返す** → 呼び出し側は従来どおり個別転送にフォールバック
+/// する (fail closed)。登録済み (既に個別に VRAM へ載っている) uid は、in-flight
+/// のカーネルが読みうるため置き換えない (その層は節約なし・数値は不変)。
+pub fn q4_register_row_alias(concat: &crate::quant::Linear, parts: &[&crate::quant::Linear]) -> bool {
+    let Some(c) = q4_of(concat) else { return false };
+    if parts.is_empty() {
+        return false;
+    }
+    // 形状契約: parts はすべて Q4・k は concat と一致・行数の和が concat.n。
+    let mut geom = Vec::with_capacity(parts.len());
+    let mut uids = Vec::with_capacity(parts.len());
+    for p in parts {
+        let Some(p) = q4_of(p) else { return false };
+        geom.push((p.k, p.n));
+        uids.push(p.uid);
+    }
+    let Some(rows) = q4_row_alias_offsets(c.k, c.n, &geom) else {
+        return false;
+    };
+    let offs: Vec<(u64, usize)> = uids.into_iter().zip(rows).collect();
+    // 連結側を先にレジストリへ載せる (エイリアスの参照先が存在する状態にする)。
+    if weights_for_q4(c.uid, &c.blocks, c.k, c.n).is_err() {
+        return false;
+    }
+    let table = q4_alias_table();
+    let mut t = match table.lock() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    for (uid, row_off) in offs {
+        if uid == c.uid {
+            return false;
+        }
+        t.entry(uid).or_insert((c.uid, row_off));
+    }
+    true
+}
+
+/// s165: `uid` にエイリアスが登録されていれば、連結側のデバイス領域を指す
+/// ビューを `map` に登録して返す。形状・サイズが 1 つでも食い違えば `None`
+/// (呼び出し側は通常の転送へ落ちる = fail closed)。
+fn q4_alias_view(
+    uid: u64,
+    k: usize,
+    n: usize,
+    map: &mut std::collections::HashMap<u64, Box<GpuWq4>>,
+) -> Option<&'static GpuWq4> {
+    if map.contains_key(&uid) {
+        return None;
+    }
+    let (tgt, row_off) = {
+        let t = q4_alias_table().lock().ok()?;
+        *t.get(&uid)?
+    };
+    if k == 0 || k % 32 != 0 || row_off.checked_add(n)? > usize::MAX / 4 {
+        return None;
+    }
+    let nb = k / 32;
+    // 参照先 (連結側) がまだ転送されていなければ何もしない。
+    let (nib_ptr, sc_ptr, tn, tk) = {
+        let e = map.get(&tgt)?;
+        (e.nib.ptr(), e.sc.ptr(), e.n, e.k)
+    };
+    if tk != k || row_off + n != tn {
+        return None;
+    }
+    if nib_ptr == 0 || sc_ptr == 0 {
+        return None;
+    }
+    let nib_off = row_off.checked_mul(nb)?.checked_mul(16)?;
+    let sc_off = row_off.checked_mul(nb)?.checked_mul(4)?;
+    let nib_bytes = n.checked_mul(nb)?.checked_mul(16)?;
+    let sc_bytes = n.checked_mul(nb)?.checked_mul(4)?;
+    // 範囲が連結側バッファ内に収まることを確認 (収まらなければ fail closed)。
+    {
+        let e = map.get(&tgt)?;
+        if nib_off + nib_bytes > e.nib.bytes() || sc_off + sc_bytes > e.sc.bytes() {
+            return None;
+        }
+    }
+    let v = GpuWq4 {
+        nib: DevBuffer::view(nib_ptr + nib_off as u64, nib_bytes),
+        sc: DevBuffer::view(sc_ptr + sc_off as u64, sc_bytes),
+        k,
+        n,
+    };
+    map.insert(uid, Box::new(v));
+    let e = map.get(&uid).expect("just inserted");
+    Some(unsafe { std::mem::transmute::<&GpuWq4, &'static GpuWq4>(e.as_ref()) })
+}
+
 /// s123: [n,k] の Q4_0 ブロック (1 ブロック 18B) を VRAM へ上げる。
 /// ホスト側で SOA (nib 16B アライン / sc f32) に変換してから転送する。
+/// s165: 連結重みの行範囲エイリアス (登録済み) があれば転送せずビューを返す。
 fn weights_for_q4(uid: u64, blocks: &[u8], k: usize, n: usize) -> Result<&'static GpuWq4> {
     use std::collections::HashMap;
     use std::sync::Mutex;
     static REG: OnceLock<Mutex<HashMap<u64, Box<GpuWq4>>>> = OnceLock::new();
     let reg = REG.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = reg.lock().expect("q4 weights registry poisoned");
+    // s165: 連結重みの行範囲エイリアスが登録済みなら転送しない (数値は不変)。
+    if let Some(v) = q4_alias_view(uid, k, n, &mut map) {
+        return Ok(v);
+    }
     if !map.contains_key(&uid) {
         let nb = k / 32;
         assert_eq!(blocks.len(), n * nb * 18, "q4: block size mismatch");
@@ -3614,6 +3782,10 @@ struct ChainScratch {
     /// する。model_id はロード毎に採番されるため、モデル再ロードで誤キャッシュに
     /// なることはない。
     q35_w_cache: std::collections::HashMap<(u64, usize, u8), DevBuffer>,
+    /// s165: rmsnorm 重みのデバイス常駐キャッシュ (`chain_rmsnorm_cached`)。
+    /// キーは (model_id, pin_id = 層×用途)。decode chain が 1 ステップに 129 回
+    /// 同じ重みを上げ直していた分を初回 1 回にする。
+    rms_w: std::collections::HashMap<(u64, usize), DevBuffer>,
 }
 
 thread_local! {
@@ -3650,6 +3822,7 @@ thread_local! {
         q35_tab: None,
         q35_pin_tab: None,
         q35_w_cache: std::collections::HashMap::new(),
+        rms_w: std::collections::HashMap::new(),
     });
 }
 
@@ -3951,6 +4124,71 @@ pub fn chain_rmsnorm(
                 "cuMemcpyHtoDAsync (chain rmsnorm w)",
             ))?;
         }
+        let (mut px, mut pp, mut pw, mut po) = (xptr, pptr, wdev, optr);
+        let (mut mc, mut ec) = (cols as c_int, eps);
+        let mut args = [
+            &mut px as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut pw as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut mc as *mut _ as *mut c_void,
+            &mut ec as *mut _ as *mut c_void,
+        ];
+        ok(unsafe {
+            ctx.launch_async(ctx.f_addnorm, (m as u32, 1, 1), (256, 1, 1), cols as u32 * 4, &mut args)
+        })
+    })
+}
+
+/// s165: [`chain_rmsnorm`] の**重み常駐**版 (decode chain 専用)。
+///
+/// `chain_rmsnorm` は呼び出しごとに `w` (e×4 = 20,480 B) を pinned から
+/// 非同期 H2D する。decode chain は 1 ステップに 2×64+1 = 129 回呼ぶので、
+/// 同じ重みを毎ステップ 129 回 (2.6 MB) 上げ直していた — nsys の
+/// 「20,480 B × 25,872」がこれで、重みが変化しない以上まったくの無駄。
+///
+/// ここでは `(key, pin_id)` でデバイス常駐させ、**初回だけ**転送する
+/// (`q35_w_dev` の (model_id, layer, tag) と同じ方針)。`key` はモデル
+/// ロード毎に一意な `mid`、`pin_id` は呼び出し側が層×用途で一意に採番する
+/// (P17h 規約) ので、ヒット = 同じ重み。サイズが変わったら作り直す。
+///
+/// 数値は `chain_rmsnorm` と同一: 同じカーネル (`dno_add_rmsnorm`)、同じ引数、
+/// 同じ重みバイト列で、変わるのは重みの置き場所だけ。重みの転送は
+/// `DevBuffer::from_slice` (同期 H2D) で行うが、これは (key, pin_id) ごとに
+/// 1 回だけで、以降のステップは 0 回。
+pub fn chain_rmsnorm_cached(
+    w: &[f32],
+    eps: f32,
+    add_slot: Option<usize>,
+    out_slot: usize,
+    cols: usize,
+    m: usize,
+    pin_id: usize,
+    key: u64,
+) -> Option<()> {
+    let ctx = chain_ctx()?;
+    if w.len() != cols {
+        return chain_fail(anyhow::anyhow!("chain_rmsnorm_cached: w size mismatch"));
+    }
+    let wb = cols * 4;
+    ok(chain_ensure_buf(out_slot, m.checked_mul(cols)?.checked_mul(4)?))?;
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        let stale = match s.rms_w.get(&(key, pin_id)) {
+            Some(b) => b.bytes() != wb,
+            None => true,
+        };
+        if stale {
+            let buf = ok(DevBuffer::from_slice(w))?;
+            s.rms_w.insert((key, pin_id), buf);
+        }
+        let wdev = s.rms_w.get(&(key, pin_id))?.ptr();
+        let xptr = s.bufs[CH_X].as_ref()?.ptr();
+        let pptr = match add_slot {
+            Some(sl) => s.bufs.get(sl)?.as_ref()?.ptr(),
+            None => 0, // NULL → 単純 rmsnorm
+        };
+        let optr = s.bufs.get(out_slot)?.as_ref()?.ptr();
         let (mut px, mut pp, mut pw, mut po) = (xptr, pptr, wdev, optr);
         let (mut mc, mut ec) = (cols as c_int, eps);
         let mut args = [
@@ -10914,5 +11152,73 @@ mod b20_stage1_tests {
 
         // 7) 桁あふれは checked_mul で None
         assert!(!sup(&w, n_ok, (usize::MAX, nv, dk, dv, dc)), "conv_dim の桁あふれは受けない");
+    }
+}
+
+#[cfg(test)]
+mod p3_alias_tests {
+    //! s165 (Task P3): 連結重みの行範囲エイリアスの**形状契約**を固定する。
+    //!
+    //! 27B q4 の FFN は decode chain が `gate_up_w` (連結 1 本)、Q4 prefill が
+    //! `gate_w` / `up_w` (2 本) を使うため、同じ 2×ff×e パラメータが VRAM に
+    //! 2 度載っていた。`q4_row_alias_offsets` が「parts の行数の和 = 連結側の
+    //! 行数・k は全部同じ」を満たすときだけ行オフセットを返すことを固定する。
+    //! ここが崩れると別の重みを読む (数値が変わる) ので、満たさない入力は
+    //! すべて None (= 従来の個別転送へフォールバック) であることを確かめる。
+    use super::*;
+
+    #[test]
+    fn alias_offsets_gate_up_layout() {
+        // 27B: e = 5120, ff = 17408 → 連結は [gate(17408 行) | up(17408 行)]
+        let k = 5120;
+        let ff = 17408;
+        assert_eq!(
+            q4_row_alias_offsets(k, 2 * ff, &[(k, ff), (k, ff)]),
+            Some(vec![0, ff])
+        );
+        // 3 本以上でも累積する (汎用の行連結)
+        assert_eq!(
+            q4_row_alias_offsets(k, 3 * ff, &[(k, ff), (k, ff), (k, ff)]),
+            Some(vec![0, ff, 2 * ff])
+        );
+    }
+
+    #[test]
+    fn alias_offsets_fail_closed() {
+        let k = 5120;
+        let ff = 17408;
+        // 行数の和が合わない (連結側が短い/長い)
+        assert_eq!(q4_row_alias_offsets(k, 2 * ff - 1, &[(k, ff), (k, ff)]), None);
+        assert_eq!(q4_row_alias_offsets(k, 2 * ff + 1, &[(k, ff), (k, ff)]), None);
+        // k が食い違う
+        assert_eq!(q4_row_alias_offsets(k, 2 * ff, &[(k, ff), (k + 32, ff)]), None);
+        // 空・0 行・0 列・32 の倍数でない k
+        assert_eq!(q4_row_alias_offsets(k, 2 * ff, &[]), None);
+        assert_eq!(q4_row_alias_offsets(k, ff, &[(k, 0)]), None);
+        assert_eq!(q4_row_alias_offsets(k, 0, &[(k, ff)]), None);
+        assert_eq!(q4_row_alias_offsets(0, ff, &[(0, ff)]), None);
+        assert_eq!(q4_row_alias_offsets(k + 8, ff, &[(k + 8, ff)]), None);
+        // 桁あふれ
+        assert_eq!(
+            q4_row_alias_offsets(k, usize::MAX, &[(k, usize::MAX / 2), (k, usize::MAX / 2 + 2)]),
+            None
+        );
+    }
+
+    /// 行オフセットは「1 行 = nb ブロック = nib 16B / sc 4B」の連続領域を指す。
+    /// 27B の gate/up で、連結側の nib 上のオフセットが up_w の先頭行と一致すること
+    /// をバイト数で確かめる (この値がずれると別の重みを読む)。
+    #[test]
+    fn alias_byte_offsets_match_row_stride() {
+        let (k, ff) = (5120usize, 17408usize);
+        let nb = k / 32;
+        let nib_row = nb * 16;
+        let sc_row = nb * 4;
+        let rows = q4_row_alias_offsets(k, 2 * ff, &[(k, ff), (k, ff)]).expect("layout");
+        assert_eq!(rows[0] * nib_row, 0);
+        assert_eq!(rows[1] * nib_row, ff * nib_row);
+        assert_eq!(rows[1] * sc_row, ff * sc_row);
+        // up_w の nib は連結側の後半 (全 nib のちょうど半分) から始まる
+        assert_eq!(ff * nib_row, (2 * ff * nb * 16) / 2);
     }
 }
