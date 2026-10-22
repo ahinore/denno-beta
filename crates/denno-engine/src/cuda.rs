@@ -7121,9 +7121,22 @@ pub fn chain_expf_probe(inp: &[f32]) -> Option<Vec<f32>> {
 /// kernels_elem.ptx に未収録 (PTX 未再生成) の場合は None をキャッシュして
 /// chain を恒久不発動にする。GPU_BROKEN にはしない (既存 llama 経路を壊さない。
 /// PTX 再生成は人間対応・再生成後の次回プロセス起動から発動)。
+/// s169: dno_matvec_f32 の並列リダクション版を使うか (既定 OFF)。
+/// 丸め順が逐次版と変わるため、有効化すると出力は bit 一致しなくなる。
+fn fast_reduce_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("DENNO_FAST_REDUCE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 #[derive(Clone, Copy)]
 struct Q35Fns {
     f_matvec_f32: CUfunction,
+    // s169: 並列リダクション版 (DENNO_FAST_REDUCE=1 のときだけ使う。PTX 未収録なら None)
+    f_matvec_f32_r: Option<CUfunction>,
     f_qknorm_rope: CUfunction,
     f_gate: CUfunction,
 }
@@ -7157,6 +7170,7 @@ fn q35_fns() -> Option<&'static Q35Fns> {
             };
             Some(Q35Fns {
                 f_matvec_f32: get(b"dno_matvec_f32\0")?,
+                f_matvec_f32_r: get(b"dno_matvec_f32_r\0"),
                 f_qknorm_rope: get(b"dno_qknorm_rope_pi\0")?,
                 f_gate: get(b"dno_attn_gate_mul\0")?,
             })
@@ -7349,9 +7363,13 @@ fn chain_q35_ctl_f32(
             &mut kc as *mut _ as *mut c_void,
             &mut nc as *mut _ as *mut c_void,
         ];
-        ok(unsafe {
-            ctx.launch_async(fns.f_matvec_f32, (n as u32, 1, 1), (128, 1, 1), 0, &mut args)
-        })
+        // s169: DENNO_FAST_REDUCE=1 なら固定の木で縮約する並列版 (block 256)。
+        // 丸め順が変わるため既定は逐次版 (bit 一致を守る)。
+        let (func, thr) = match (fns.f_matvec_f32_r, fast_reduce_enabled()) {
+            (Some(fr), true) => (fr, 256u32),
+            _ => (fns.f_matvec_f32, 128u32),
+        };
+        ok(unsafe { ctx.launch_async(func, (n as u32, 1, 1), (thr, 1, 1), 0, &mut args) })
     })
 }
 
