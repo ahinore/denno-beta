@@ -313,6 +313,8 @@ impl DevBuffer {
                     "cuMemcpyHtoD",
                 )?;
             }
+            // s166 (P5): 観測のみ (初回アップロード = 定常ステップでは 0 回)
+            dbg_htod(bytes);
         }
         Ok(buf)
     }
@@ -786,6 +788,8 @@ impl CudaCtx {
         args: &mut [*mut c_void],
     ) -> Result<()> {
         let lib = lib()?;
+        // s166 (P5): decode 1 ステップの launch 件数 (DENNO_DECODE_DBG=1・既定 OFF)
+        dbg_launch(f);
         check(
             (lib.launch)(
                 f,
@@ -2284,6 +2288,235 @@ thread_local! {
     static CHAIN_RESID: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
+// ---------------------------------------------------------------------------
+// s166 (P5): decode 1 ステップの launch / copy 件数 (DENNO_DECODE_DBG=1)
+//
+// nsys を使わずに「1 ステップに何発カーネルを投げ、何回・何バイト転送したか」を
+// 数える。既定は OFF (`DENNO_DECODE_DBG` 未設定) で、各サイトに分岐 1 回が
+// 増えるだけ。数値経路・発行順・引数には一切触れない (観測のみ)。
+//
+// 使い方: `DENNO_DECODE_DBG=1` で serve を起動すると、decode 1 ステップごとに
+//   [DECODE_DBG] step=3 launch=337 h2d=2 d2h=33
+//     launch=[dno_gemv_q4_0c4=337,dno_add_rmsnorm=129,...]
+//     h2d=[20480x1,512x1] d2h=[2048x32,606208x1]
+// を stderr に 1 行 (続けて内訳 2 行) 出す。件数は「その step の begin〜end」で
+// 数えるので、prefill で積んだ分は次の begin で捨てる (decode の数字に混ぜない)。
+// ---------------------------------------------------------------------------
+fn decode_dbg_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DENNO_DECODE_DBG").ok().as_deref() == Some("1"))
+}
+
+/// (キー, 件数) の集計。キーは CUfunction かバイト数。種類は 20 程度なので
+/// 線形走査で足りる (1 ステップ 500 件程度)。
+type DbgTally = Vec<(usize, u64)>;
+
+fn dbg_bump(t: &mut DbgTally, key: usize) {
+    for e in t.iter_mut() {
+        if e.0 == key {
+            e.1 += 1;
+            return;
+        }
+    }
+    t.push((key, 1));
+}
+
+#[derive(Default)]
+struct DecodeDbg {
+    steps: u64,
+    launches: DbgTally,
+    h2d: DbgTally,
+    d2h: DbgTally,
+}
+
+thread_local! {
+    static DECODE_DBG: std::cell::RefCell<DecodeDbg> =
+        std::cell::RefCell::new(DecodeDbg { steps: 0, launches: Vec::new(), h2d: Vec::new(), d2h: Vec::new() });
+}
+
+/// カーネル 1 発を数える (`CudaCtx::launch_async` の入口から)。
+#[inline]
+fn dbg_launch(f: CUfunction) {
+    if decode_dbg_on() {
+        DECODE_DBG.with(|d| dbg_bump(&mut d.borrow_mut().launches, f as usize));
+    }
+}
+
+/// H2D 1 回を数える (バイト数で分類)。decode 経路の転送サイトから呼ぶ。
+#[inline]
+pub fn dbg_htod(bytes: usize) {
+    if decode_dbg_on() {
+        DECODE_DBG.with(|d| dbg_bump(&mut d.borrow_mut().h2d, bytes));
+    }
+}
+
+/// D2H 1 回を数える。
+#[inline]
+pub fn dbg_d2h(bytes: usize) {
+    if decode_dbg_on() {
+        DECODE_DBG.with(|d| dbg_bump(&mut d.borrow_mut().d2h, bytes));
+    }
+}
+
+/// CUfunction → カーネル名 (既知のものだけ・未知は "unknown")。
+fn dbg_kernel_name(p: CUfunction) -> &'static str {
+    let Some(ctx) = chain_ctx() else {
+        return "unknown";
+    };
+    if p == ctx.f_quant {
+        return "dno_quant_i8";
+    }
+    if p == ctx.f_mv {
+        return "dno_gemv_i8";
+    }
+    if p == ctx.f_gemm {
+        return "dno_gemm_i8";
+    }
+    if p == ctx.f_mv_q4 {
+        return "dno_gemv_q4_0";
+    }
+    if p == ctx.f_gemm_q4 {
+        return "dno_gemm_q4_0";
+    }
+    if let Some(f) = ctx.f_mv_q4_mr {
+        if p == f {
+            return "dno_gemv_q4_0mr";
+        }
+    }
+    if let Some(fs) = ctx.f_mv_q4_c {
+        const NAMES: [&str; 3] = ["dno_gemv_q4_0c2", "dno_gemv_q4_0c4", "dno_gemv_q4_0c8"];
+        for (i, n) in NAMES.iter().enumerate() {
+            if p == fs[i] {
+                return n;
+            }
+        }
+    }
+    if p == ctx.f_swiglu {
+        return "dno_swiglu";
+    }
+    if p == ctx.f_swiglu_int {
+        return "dno_swiglu_int";
+    }
+    if p == ctx.f_addnorm {
+        return "dno_add_rmsnorm";
+    }
+    if p == ctx.f_expf {
+        return "dno_expf";
+    }
+    if p == ctx.f_attn {
+        return "dno_attention";
+    }
+    if p == ctx.f_attn_pf {
+        return "dno_attention_prefill";
+    }
+    if p == ctx.f_rope {
+        return "dno_rope";
+    }
+    if p == ctx.f_rope_pf {
+        return "dno_rope_pf";
+    }
+    if p == ctx.f_rope_b {
+        return "dno_rope_b";
+    }
+    if p == ctx.f_gdn {
+        return "dno_gdn_scan";
+    }
+    if p == ctx.f_gdn_chunk_pre {
+        return "dno_gdn_chunk_pre";
+    }
+    if p == ctx.f_gdn_chunk_state {
+        return "dno_gdn_chunk_state";
+    }
+    if p == ctx.f_gdn_chunk_scan {
+        return "dno_gdn_chunk_scan";
+    }
+    if let Some(f) = ctx.f_gdn_chunk_scan_hoist {
+        if p == f {
+            return "dno_gdn_chunk_scan_hoist";
+        }
+    }
+    if let Some(q) = q35_fns() {
+        if p == q.f_matvec_f32 {
+            return "dno_matvec_f32";
+        }
+        if p == q.f_qknorm_rope {
+            return "dno_qknorm_rope_pi";
+        }
+        if p == q.f_gate {
+            return "dno_attn_gate_mul";
+        }
+    }
+    "unknown"
+}
+
+/// 件数の多い順に `name=count` を並べた文字列 (内訳表示用)。
+fn dbg_fmt_launch(t: &DbgTally) -> String {
+    let mut v: Vec<(&'static str, u64)> = t
+        .iter()
+        .map(|&(f, c)| (dbg_kernel_name(f as CUfunction), c))
+        .collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    v.iter()
+        .map(|(n, c)| format!("{n}={c}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `bytes×count` をバイト数の大きい順に並べた文字列。
+fn dbg_fmt_bytes(t: &DbgTally) -> String {
+    let mut v: Vec<(usize, u64)> = t.to_vec();
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v.iter()
+        .map(|(b, c)| format!("{b}x{c}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// ステップ開始: 前のステップ (や prefill) で積んだ分を捨てる。
+fn decode_dbg_reset() {
+    if !decode_dbg_on() {
+        return;
+    }
+    DECODE_DBG.with(|d| {
+        let mut d = d.borrow_mut();
+        d.launches.clear();
+        d.h2d.clear();
+        d.d2h.clear();
+    });
+}
+
+/// ステップ末尾: 1 行 (＋内訳 2 行) を stderr に出す。観測のみ。
+fn decode_dbg_flush() {
+    if !decode_dbg_on() {
+        return;
+    }
+    DECODE_DBG.with(|d| {
+        let mut d = d.borrow_mut();
+        if d.launches.is_empty() && d.h2d.is_empty() && d.d2h.is_empty() {
+            return; // このステップは 1 発も投げていない (CPU 経路) — 出さない
+        }
+        d.steps += 1;
+        let n_l: u64 = d.launches.iter().map(|e| e.1).sum();
+        let n_h: u64 = d.h2d.iter().map(|e| e.1).sum();
+        let n_d: u64 = d.d2h.iter().map(|e| e.1).sum();
+        let lb = d.h2d.iter().map(|e| e.0 as u64 * e.1).sum::<u64>();
+        let db = d.d2h.iter().map(|e| e.0 as u64 * e.1).sum::<u64>();
+        eprintln!(
+            "[DECODE_DBG] step={} launch={} h2d={} ({} B) d2h={} ({} B)",
+            d.steps, n_l, n_h, lb, n_d, db
+        );
+        eprintln!("[DECODE_DBG]   launch=[{}]", dbg_fmt_launch(&d.launches));
+        eprintln!(
+            "[DECODE_DBG]   h2d=[{}] d2h=[{}]",
+            dbg_fmt_bytes(&d.h2d),
+            dbg_fmt_bytes(&d.d2h)
+        );
+        d.launches.clear();
+        d.h2d.clear();
+        d.d2h.clear();
+    });
+}
+
 /// 段の id を (表, 行) へ畳む。chain 用の id かどうかだけ見ればよい。
 #[inline]
 fn chain_row(op: usize) -> Option<usize> {
@@ -2429,6 +2662,9 @@ pub fn chain_sig() -> Option<(f64, f64)> {
 ///
 /// 計測 OFF は分岐 1 回 (クロックも読まない)。
 pub fn chain_step_begin() {
+    // s166 (P5): 観測カウンタのリセット (env OFF は分岐 1 回) — prefill で積んだ
+    // 分を decode の数字に混ぜない。
+    decode_dbg_reset();
     if !crate::prof::split_on() {
         return;
     }
@@ -2441,6 +2677,8 @@ pub fn chain_step_begin() {
 /// ステップ末尾: 最後の段を締め、1 ステップ分を表 A へ流し込む。呼び出しは
 /// `chain_step_begin` と対で 1 か所。計測 OFF は分岐 1 回。
 pub fn chain_step_end() {
+    // s166 (P5): 1 ステップ分の launch / copy 件数を stderr へ (env OFF は分岐 1 回)。
+    decode_dbg_flush();
     if !crate::prof::split_on() {
         return;
     }
@@ -2693,11 +2931,26 @@ pub fn q4_register_row_alias(concat: &crate::quant::Linear, parts: &[&crate::qua
     if parts.is_empty() {
         return false;
     }
+    let mut qs: Vec<&crate::quant::Q4Linear> = Vec::with_capacity(parts.len());
+    for p in parts {
+        let Some(p) = q4_of(p) else { return false };
+        qs.push(p);
+    }
+    q4_register_row_alias_q4(c, &qs)
+}
+
+/// s166 (P5): [`q4_register_row_alias`] の Q4 版 (decode chain の qkv 連結用)。
+fn q4_register_row_alias_q4(
+    c: &crate::quant::Q4Linear,
+    parts: &[&crate::quant::Q4Linear],
+) -> bool {
+    if parts.is_empty() {
+        return false;
+    }
     // 形状契約: parts はすべて Q4・k は concat と一致・行数の和が concat.n。
     let mut geom = Vec::with_capacity(parts.len());
     let mut uids = Vec::with_capacity(parts.len());
     for p in parts {
-        let Some(p) = q4_of(p) else { return false };
         geom.push((p.k, p.n));
         uids.push(p.uid);
     }
@@ -2719,6 +2972,24 @@ pub fn q4_register_row_alias(concat: &crate::quant::Linear, parts: &[&crate::qua
             return false;
         }
         t.entry(uid).or_insert((c.uid, row_off));
+    }
+    true
+}
+
+/// s166 (P5): 連結重み `fused_uid` の行範囲が `parts` に割り当て済みか
+/// (行オフセットが [0, n0, n0+n1, ...] と一致するか) を照会する。
+fn q4_fused_ready(fused_uid: u64, parts: &[&crate::quant::Q4Linear]) -> bool {
+    let t = match q4_alias_table().lock() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let mut off = 0usize;
+    for p in parts {
+        match t.get(&p.uid) {
+            Some(&(tgt, ro)) if tgt == fused_uid && ro == off => {}
+            _ => return false,
+        }
+        off += p.n;
     }
     true
 }
@@ -2776,14 +3047,30 @@ fn q4_alias_view(
     Some(unsafe { std::mem::transmute::<&GpuWq4, &'static GpuWq4>(e.as_ref()) })
 }
 
+/// s123: Q4_0 重みのデバイスレジストリ (uid → nib/sc)。s166 (P5) で関数内
+/// static から出した (`q4_resident` が同じ表を照会するため)。
+fn q4_registry() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Box<GpuWq4>>> {
+    static REG: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Box<GpuWq4>>>> =
+        OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// s166 (P5): `uid` が既にデバイスへ載っているか (**照会のみ・転送しない**)。
+/// 連結重みを上げる前に「parts が個別に載っていないか」を確かめるために使う
+/// (載っているのに連結側も上げると VRAM が 2 重になる)。ロックが毒されていたら
+/// `true` = 「載っている」とみなして連結側を上げない (安全側)。
+fn q4_resident(uid: u64) -> bool {
+    match q4_registry().lock() {
+        Ok(m) => m.contains_key(&uid),
+        Err(_) => true,
+    }
+}
+
 /// s123: [n,k] の Q4_0 ブロック (1 ブロック 18B) を VRAM へ上げる。
 /// ホスト側で SOA (nib 16B アライン / sc f32) に変換してから転送する。
 /// s165: 連結重みの行範囲エイリアス (登録済み) があれば転送せずビューを返す。
 fn weights_for_q4(uid: u64, blocks: &[u8], k: usize, n: usize) -> Result<&'static GpuWq4> {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static REG: OnceLock<Mutex<HashMap<u64, Box<GpuWq4>>>> = OnceLock::new();
-    let reg = REG.get_or_init(|| Mutex::new(HashMap::new()));
+    let reg = q4_registry();
     let mut map = reg.lock().expect("q4 weights registry poisoned");
     // s165: 連結重みの行範囲エイリアスが登録済みなら転送しない (数値は不変)。
     if let Some(v) = q4_alias_view(uid, k, n, &mut map) {
@@ -3955,7 +4242,10 @@ pub fn chain_upload(slot: usize, data: &[f32], cols: usize, m: usize) -> Option<
                 (lib.memcpy_htod_async)(buf, pin.ptr as *const c_void, bytes, std::ptr::null_mut()),
                 "cuMemcpyHtoDAsync (chain)",
             ))
-        }
+        }?;
+        // s166 (P5): 観測のみ
+        dbg_htod(bytes);
+        Some(())
     })
 }
 
@@ -4018,6 +4308,8 @@ fn chain_download_inner(slot: usize, len: usize) -> Option<Vec<f32>> {
         }
         ok(ctx.sync())?;
         unsafe { out.set_len(len) }
+        // s166 (P5): 観測のみ
+        dbg_d2h(bytes);
         Some(out)
     })
 }
@@ -4076,6 +4368,8 @@ fn chain_download_at_inner(slot: usize, elem_off: usize, len: usize) -> Option<V
         }
         ok(ctx.sync())?;
         unsafe { out.set_len(len) }
+        // s166 (P5): 観測のみ
+        dbg_d2h(bytes);
         Some(out)
     })
 }
@@ -4146,6 +4440,8 @@ pub fn chain_rmsnorm_slot(
                 "cuMemcpyHtoDAsync (chain rmsnorm w)",
             ))?;
         }
+        // s166 (P5): 観測のみ (この経路は decode chain では使わない — 0 回が期待値)
+        dbg_htod(wb);
         let (mut px, mut pp, mut pw, mut po) = (xptr, pptr, wdev, optr);
         let (mut mc, mut ec) = (cols as c_int, eps);
         let mut args = [
@@ -4346,6 +4642,65 @@ pub fn chain_linear_q4_device(
         }
         Some(())
     })
+}
+
+/// s166 (P5): qkv (+z) 投影を**連結重み 1 本**の GEMV 1 回で回す。
+///
+/// 背景 (nsys・2026-10-22 の decode 1 ステップ): `dno_gemv_q4_0c4` は 337 発で、
+/// 内訳は 48 GDN 層 × 5 + 16 full 層 × 6 + lm_head 1 = 337 (実測 336)。
+/// 1 層あたり 5/6 発になるのは **qkv グループが part ごとに別 launch** だから
+/// (full: q|k|v の 3 発、GDN: qkv|z の 2 発)。FFN の gate/up は P3 で 1 本の
+/// 連結重みにまとまって 1 発なので、同じ扱いを qkv にも広げると 337 -> 257 発。
+///
+/// 数値は不変: `dno_gemv_q4_0c{C}` は出力 32 列を 1 block が受ける形で、列
+/// (= 出力行) ごとに独立。行の並びが [q|k|v] のまま変わらないので、1 回の
+/// launch で計算しても part ごとの launch と同じビット列になる (gate_up と
+/// 同じ論法)。カーネル・引数・グリッドの形も [`chain_linear_q4_device`] と同一。
+///
+/// メモリ: 連結重みの行範囲は [`q4_register_row_alias`] で parts に割り当てる
+/// (parts は連結側のビューになる = VRAM は増えない)。**parts が既に個別に
+/// VRAM へ載っている場合は連結側を上げない** (2 重になるため)。前提が崩れたら
+/// per-part の従来経路にそのまま落ちる (fail closed・数値は同一)。
+pub fn chain_linear_q4_fused(
+    fused: &crate::quant::Q4Linear,
+    parts: &[&crate::quant::Q4Linear],
+    in_slot: usize,
+    out_slot: usize,
+    m: usize,
+) -> Option<()> {
+    // 形状契約 (満たさなければ従来の per-part 経路 = 数値は同一)
+    let mut ok_shape = !parts.is_empty() && fused.k != 0 && fused.k % 32 == 0 && fused.n != 0;
+    let mut sum = 0usize;
+    if ok_shape {
+        for p in parts {
+            if p.k != fused.k {
+                ok_shape = false;
+                break;
+            }
+            match sum.checked_add(p.n) {
+                Some(s) => sum = s,
+                None => {
+                    ok_shape = false;
+                    break;
+                }
+            }
+        }
+        ok_shape = ok_shape && sum == fused.n;
+    }
+    if !ok_shape {
+        return chain_linear_q4_device(parts, in_slot, out_slot, m);
+    }
+    if !q4_fused_ready(fused.uid, parts) {
+        // まだ割り当てていない: parts が個別に載っていなければ連結側を上げて割り当てる。
+        // 載っているなら諦める (連結側を上げると VRAM が 2 重になる)。
+        if parts.iter().any(|p| q4_resident(p.uid)) {
+            return chain_linear_q4_device(parts, in_slot, out_slot, m);
+        }
+        if !q4_register_row_alias_q4(fused, parts) || !q4_fused_ready(fused.uid, parts) {
+            return chain_linear_q4_device(parts, in_slot, out_slot, m);
+        }
+    }
+    chain_linear_q4_device(&[fused], in_slot, out_slot, m)
 }
 
 /// s157 (Task B20 段階 1): 27B q4 の decode を chain 経路で回すか。
@@ -6692,7 +7047,10 @@ pub fn chain_q35_rope_pi_upload(tab: &[f32]) -> Option<()> {
                 (lib.memcpy_htod_async)(dev, pin.ptr as *const c_void, bytes, std::ptr::null_mut()),
                 "cuMemcpyHtoDAsync (q35 rope tab)",
             ))
-        }
+        }?;
+        // s166 (P5): 観測のみ (1 ステップ 1 回・pos 依存なので削れない)
+        dbg_htod(bytes);
+        Some(())
     })
 }
 
@@ -6938,6 +7296,9 @@ pub fn chain_q35_fullattn(
             // 件数は d2h_state の calls に含まれる — 表示専用)
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_KV_ROW);
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_KV_ROW);
+            // s166 (P5): 観測のみ (full 層 1 つあたり k/v 2 本・ホスト KV キャッシュ契約)
+            dbg_d2h(kv_dim * 4);
+            dbg_d2h(kv_dim * 4);
         }
         Some(())
     })?;
@@ -11869,6 +12230,31 @@ mod p3_alias_tests {
         assert_eq!(rows[1] * sc_row, ff * sc_row);
         // up_w の nib は連結側の後半 (全 nib のちょうど半分) から始まる
         assert_eq!(ff * nib_row, (2 * ff * nb * 16) / 2);
+    }
+
+    /// s166 (P5): qkv 連結 GEMV の入口は、前提が崩れたら per-part 経路へ落ちる
+    /// (fail closed・panic しない)。GPU 無しのこの環境ではどの場合も None になる
+    /// — ここで固定するのは「形状不一致で連結側を選ばない」ことと「例外を投げない」
+    /// こと (数値の一致は実機テストの担当)。
+    #[test]
+    fn q4_fused_linear_fails_closed() {
+        use crate::quant::{next_q8_uid, Q4Linear};
+        let k = 64usize;
+        let (nq, nz) = (32usize, 16usize);
+        let q = Q4Linear::quantize(&vec![0.01f32; k * nq], k, nq);
+        let z = Q4Linear::quantize(&vec![0.02f32; k * nz], k, nz);
+        let mut blocks = Vec::new();
+        blocks.extend_from_slice(&q.blocks);
+        blocks.extend_from_slice(&z.blocks);
+        let fused = Q4Linear { blocks, k, n: nq + nz, uid: next_q8_uid() };
+        // 行数の和が合わない連結 (前提不一致) → per-part (GPU 無しなので None)
+        let short = Q4Linear { blocks: q.blocks.clone(), k, n: nq, uid: next_q8_uid() };
+        assert!(chain_linear_q4_fused(&short, &[&q, &z], 0, 1, 1).is_none());
+        // part の k が食い違う → per-part
+        let other_k = Q4Linear::quantize(&vec![0.03f32; 32 * nz], 32, nz);
+        assert!(chain_linear_q4_fused(&fused, &[&q, &other_k], 0, 1, 1).is_none());
+        // 正しい形でも GPU が無ければ None (panic しない)
+        assert!(chain_linear_q4_fused(&fused, &[&q, &z], 0, 1, 1).is_none());
     }
 }
 
