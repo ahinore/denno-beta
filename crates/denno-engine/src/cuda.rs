@@ -673,10 +673,22 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_swiglu_int, module_elem, b"dno_swiglu_int\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_swiglu_int)",
             )?;
-            check(
-                (lib.module_get_function)(&mut f_addnorm, module_elem, b"dno_add_rmsnorm\0".as_ptr() as *const c_char),
-                "cuModuleGetFunction(dno_add_rmsnorm)",
-            )?;
+            // s170: DENNO_FAST_REDUCE=1 なら二乗和を固定木で並列縮約する版を使う
+            // (引数・動的 smem は同一。丸め順だけが変わる)。PTX に無ければ逐次版へ戻す。
+            if fast_reduce_enabled()
+                && (lib.module_get_function)(
+                    &mut f_addnorm,
+                    module_elem,
+                    b"dno_add_rmsnorm_r\0".as_ptr() as *const c_char,
+                ) == 0
+            {
+                // 並列版を取得できた
+            } else {
+                check(
+                    (lib.module_get_function)(&mut f_addnorm, module_elem, b"dno_add_rmsnorm\0".as_ptr() as *const c_char),
+                    "cuModuleGetFunction(dno_add_rmsnorm)",
+                )?;
+            }
             check(
                 (lib.module_get_function)(&mut f_expf, module_elem, b"dno_expf_probe\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_expf_probe)",
