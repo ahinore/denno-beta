@@ -150,6 +150,23 @@ cold 計測に使えない**（旧手順の `cache_probe.py` turn1 はこの理�
 - 一致: `temperature 0` の生成 3 問が `95f3cd8` のバイナリと 176 バイト完全一致
   (`ea1fcdd1…`)。decode は 33.50 → 32.49 ms/token。
 
+世代を重ねた現在値（すべて同じプロトコル・cold・nonce・中央値）:
+
+| ビルド | 3,161 token | 12,850 token |
+|---|---|---|
+| `95f3cd8`（出発点） | 40.10 s | 162.3 s |
+| `125117c` | 24.21 s | 96.9〜109.1 s |
+| `56c326d` | 16.41 s | 65.86〜68.33 s |
+| `b3a8838` | 13.87 s | 56.93〜62.00 s |
+| `81ca995`（rmsnorm 並列化まで） | 13.55 s | 55.23〜60.47 s |
+| `1fde630`（P12+P13） | **9.59 s** | **39.0〜41.8 s** |
+
+- `1fde630` = P12（full attention の att 往復を pinned 直送りにし、GPU attend 時の
+  `buf_att` ゼロ埋め 345 MB/層を廃止）＋ P13（GDN の beta/alpha を h2 の 1 回の走査に統合、
+  `DENNO_PF_OVERLAP` を既定 ON）。decode は 17.44〜17.46 ms/token で変化なし。
+- 3,161 token で 40.10 → 9.59 s（**4.18x**）、12,850 token で 162.3 → 39.0 s（**4.16x**）。
+  アンカー 3/3 MATCH・lib テスト 316 passed・temp 0 の 8 問 × 150 token が全段階で完全一致。
+
 - 内訳（`95f3cd8`・PROFILE・13k token）: prefill 161.4 s のうち `sl_lin` 113.5 s (70%)、
   802 呼び出し = 141 ms/回。カーネルは 3,161 token の nsys で 7.9 s / 47.7 s のみ。
 - 一致: `temperature 0` の生成 3 問が旧バイナリと 176 バイト完全一致。
