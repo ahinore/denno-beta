@@ -122,6 +122,148 @@ rmsnorm → { D2H h2 (専用コピーストリーム)  ||  qkv/z GEMM (既定ス
   速いと隠し切れない。**未計測** (実機の A/B は main が行う)。
 - 契約テスト: `cuda::p6_overlap_tests` (GPU 不要)。
 
+## s170 (P9): 残っているホスト往復の棚卸しと次の常駐段の設計 (**設計のみ・未実装**)
+
+27B q4 (e=5120, ff=17408, 64 層 = 48 GDN + 16 full, heads/kv/dh = 24/4/256,
+att=6144, q 出力幅 12288, kv_dim=1024, vocab 248,320 — `config.json` を読んだ値) で、
+残差常駐経路 (`res_dev`) に**まだ残っている**転送を全部数え、次の段の候補を 3 つに絞った。
+**コード・`.cu`・`.ptx` は 1 バイトも変えていない。** 詳細な算術は `REPORT_P9.md`。
+
+### 残っている往復 (12,850 token / 1 リクエスト)
+
+| 層 | サイト | 向き | B/token/層 |
+|---|---|---|---|
+| GDN ×48 | `qwen35.rs:2105` → `cuda.rs:11101` `chain_download_at(CH_PFH)` (+`cuda.rs:3993` sync) | D2H | 20,480 |
+| GDN ×48 | `cuda.rs:10361-10362` beta/alpha `copy_from` (pageable sync) | H2D | 384 |
+| full ×16 | `cuda.rs:11473/11481/11490` q (fused gate 込み) / k / v | D2H | 49,152 + 4,096 + 4,096 |
+| full ×16 | `cuda.rs:5111/5112` KV ミラー k / v (`copy_from_at`) | H2D | 8,192 |
+| full ×16 | `cuda.rs:5133` q (norm+rope 後) | H2D | 24,576 |
+| full ×16 | `qwen35.rs:977` → `cuda.rs:3925/3935` att (+sync) | D2H | 24,576 |
+| full ×16 | `qwen35.rs:2195` → `cuda.rs:11400` att (ゲート後) | H2D | 24,576 |
+| 全体 | `qwen35.rs:1493` → `cuda.rs:11356` embed | H2D | 20,480 (req 全体) |
+| 末尾 | `qwen35.rs:1954/1957` 残差最終行 + pending、`qwen35.rs:1975` logits | D2H/H2D | 計 ≈1 MB (req 全体) |
+
+合計 **41.8 GB @12,850 / 10.3 GB @3,161** (ESTIMATED — 形状からの算術)。
+PCIe 12〜25 GB/s で **1.7〜3.5 s / 0.4〜0.9 s** = wall (56.3〜61.8 s / 13.86 s) の **2.7〜6.2 %**。
+同期点は 1 リクエスト **227** (往復由来 83 + GDN chunk scan の 3 pass 由来 144)。
+
+向きべつでは **D2H 29.5 GB / H2D 12.3 GB @12,850** (D2H が 71 %。3,161 では 7.25 / 3.02 GB)。
+コピー発行数は **1 層あたり GDN 5** (h2 D2H 1 + beta/alpha H2D 2 + norm w H2D 2)、
+**full 10** (qkv D2H 3 + ミラー H2D 2 + q H2D 1 + att D2H 1 + att H2D 1 + norm w H2D 2)、
+**リクエスト全体で 403** (P2 前の 802 chain call の半分)。norm w の H2D は 20,480 B/call・
+2 call/層 = 2.6 MB/req で合計には入れていない (無視できる)。
+
+### 壁の 3 分解 (12,850, ESTIMATED)
+
+```
+wall 56.3 s (MEASURED) − PCIe 3.5 s (@12GB/s) − ホスト計算 8.9 s = カーネル 43.9 s
+カーネル仕事量 24.33 GMAC/token → 312.6 GMAC = 625 TFLOP → 14.2 TFLOPS 実効
+```
+
+つまり **往復のバイトはもう壁ではない (≤6 %)**。残り 16 % は往復が強制している
+**ホスト計算**で、その 91 % が 1 本 — GDN の beta/alpha 制御投影
+(`matvec_rows_bt_into`, F32, k=5120, n=48)。**実測 84 ms/call × 96 call = 8.06 s @12,850**
+(この開発コンテナの CPU。P4 の「ホスト proj 0.6 s」は再現しない = 13 倍の過小評価)。
+
+### 消せない往復 (KV がホスト正)
+
+`KvCache` (ホスト) が full 層 K/V の唯一の正で、decode / prefix snapshot / CPU attend が読む。
+`with_mirror` (`cuda.rs:5105`) のミラーは**ホストの写し**。よって:
+
+- **full 層の k/v D2H (post-RoPE) は消せない** — 8,192 B/token/層 = 1.68 GB (0.07〜0.14 s)。
+  ホストで prepare するなら k/v 投影出力 57,344 B/token を戻すことになり、もっと高い。
+- embed H2D 263 MB (埋め込み表がホスト RAM 5.1 GB)、末尾の残差最終行 40 KB + sync、
+  logits D2H 993 KB も残る。**下限 1.94 GB = 0.08〜0.16 s。**
+
+**q / o / att の往復は KV 権威と無関係** — q は KV に触らず、o_proj の出力は
+デバイス常駐の残差に落ちるだけ。ホストに降ろしている理由は
+「prepare (QK-Norm+RoPE) がホスト」「sigmoid 出力ゲートがホスト (`dno_attn_gate_mul` は
+1 token 専用)」の 2 つだけなので、**KV 権威をデバイスへ移さずに消せる**:
+
+- (a) q の prepare をデバイスへ (k/v はホストのまま) → q はデバイスから出ない。
+  KV の向き・権威・`with_mirror` の意味は完全不変。**リスク最小**。
+- (b) att ゲートをデバイスへ → att はデバイスから出ない。
+- (c) prepare 全体をデバイスへ → ミラーが「prefill の producer」になり、ホストは
+  ミラーから k/v 行を D2H して自分の KV に書く (権威はホストのまま・向きが逆)。
+  **この場合だけ `have` / `epoch` の帳簿を「D2H 完了まで valid にしない」に変える必要**
+  (途中失敗で欠けた行を valid と思うと次の decode が古い K/V を読む)。権威の移動ではない。
+
+### 候補 (12,850 の期待秒 / リスク 順)
+
+**① GDN の beta/alpha をデバイスで計算する (行バッチ版カーネル) — ≈8.4〜9.4 s (15〜17 %), リスク中**
+
+- 継ぎ目: `cuda.rs:10951` の `host_ctrl` (`cuda.rs:11041` / `11102`) を
+  `chain_gdn_ctrl_dev` に差し替え、`qwen35.rs:2158-2171` の closure (buf_h 写し + 2 回の
+  `apply_bt_rows_into`) を丸ごと落とす。h2 の D2H・`pin_h2`・join も不要になる。
+- 内訳: ホスト計算 8.06 s (MEASURED 単価) + D2H 12.87 GB (0.51〜1.07 s) + buf_h 写し 0.30 s
+  + 48 sync。
+- カーネル: `dno_matvec_f32` の行バッチ版を `kernels_elem.cu` に 1 本追加
+  (1 出力 = 1 スレッド、`d` 昇順逐次 f32 和、`out[r*nv+j]`、grid=(nv, ceil(n/BLK)))。
+- **ビット一致**: (i,j) ごとの `d` 昇順逐次和は `matvec_rows_bt_small_n_impl` と同一で、
+  `-fmad=false` なら積と和が別丸め。既存 `dno_matvec_f32` はまさにその契約で
+  `cuda_matvec_f32_lmhead_bit_exact_vs_cpu` が CPU 完全一致を固定している。行バッチ版は
+  **添字だけ**変えるので 96 call 全部がビット一致。
+- **VRAM +0** (入力は既存 `CH_PFH` 263 MB、出力は既存 `GDN_SCRATCH.beta/.alpha` 各 2.5 MB。
+  どちらも最初の launch より前に ensure 済み)。重みを転置して上げる場合だけ +47 MB。
+- 失敗モード: PTX 未再生成 → `None` を返して**今日の経路**へ落ちる (安全側)。
+  n サイズの新バッファは 1 本も作らない (P4-6/P4-7 の教訓: 層ループ内の grow は
+  発行済み launch の読み先を解放しうる)。副作用として P6 の 2 位相分割は q4 経路で
+  死にコードになる (フラグを残すか撤去するかは operator 判断)。
+
+**② att の sigmoid ゲートをデバイスで行う (n 行版) — ≈0.7〜1.2 s (1.2〜2.1 %), リスク低〜中**
+
+- 継ぎ目: `qwen35.rs:2189-2197`。`full_attn_host_side` が `att_done` を返したときだけ
+  D2H + ホストゲート + `chain_pf_upload_att` を飛ばし、`chain_pf_gate_att` 1 発 →
+  `chain_oproj_prefill_q4`。`att_done == false` (CPU attend) は今日の経路のまま。
+- カーネル: `kernels_elem.cu:742` の `dno_attn_gate_mul` の n 行版。式は既存そのまま
+  `__fdiv_rn(*av, __fadd_rn(1.0f, dno_expf(-g)))`、添字だけ
+  att = `CH_ATT + r*att + h*dh + d` / gate = `CH_QKV + r*qcols + h*2*dh + dh + d`。
+  これは新規の発想ではなく、`qwen35.rs:925-927` のコメントが
+  「`dno_attn_gate_mul` は 1 トークン専用なので D2H 後にホストで掛ける (C3 でデバイス連結する
+  際に n トークン版カーネルを追加する)」と既に予告している作業そのもの。
+- **ビット一致**: `dno_expf` は glibc `e_expf.c` の忠実な再実装で、ホストの `f32::exp` と
+  ビット一致することが実機確認済み (`kernels_elem.cu:6-13`)。ホスト式は
+  `*av /= 1.0 + (-gate[d]).exp()` (`qwen35.rs:1003`) = `div.rn(av, add.rn(1, exp))` で、
+  既存カーネルの `__fdiv_rn` + `__fadd_rn` と同一。行を増やすだけなので 1 要素の演算列は不変。
+  **`__fdividef` や逆数乗算に置き換えない** (丸めが変わる)。
+- **VRAM +0** (`CH_ATT` を in-place。ゲートは `CH_QKV` の q 領域後半を読むだけで、
+  そこは `chain_qkv_prefill_q4_dev` 以降だれも書かない)。
+- 失敗モード: PTX 未生成 → **ゲート未適用のまま o_proj が走ると静かに壊れる**ので、
+  `None` は必ず「D2H + ホストゲート + H2D」に落とす。`dno_expf` の |x|≥88 分岐を端折らない。
+  なお att の D2H は `cuda.rs:3920` で 316 MB の Vec を層ごとに新規確保する形なので、
+  実コストはバイト見積りより上。
+
+**③ q の QK-Norm + RoPE をデバイスで行う — ≈0.6〜1.3 s (1.1〜2.2 %), リスク中**
+
+- 継ぎ目: `cuda.rs:11473` の q D2H を落とし、`cuda.rs:5133` の q H2D を
+  「デバイスの q を指す」に変える (カーネル・引数は同一、ポインタだけ差し替え)。
+- カーネル: head 単位 rmsnorm (1 head = 1 block、和は `d` 昇順逐次 = `dno_add_rmsnorm` と
+  同じ契約) + RoPE。**cos/sin 表はホストで 1 回作って上げる** (3.3 MB @12,850) ので、
+  デバイス側は `x1*c - x2*s` / `x1*s + x2*c` の 2 回丸めだけ。
+- **ビット一致**: 中〜強。rmsnorm は和の順序と `sqrt.rn`+`div.rn` をホストと同一にすれば一致
+  (`rsqrt.approx` 不可)。RoPE は表をホストから持つので超越関数の一致問題が消える。
+  危険は「q の rmsnorm が head 単位 (cols=256) で、既存 `dno_add_rmsnorm` が行単位
+  (cols=e)」の点 — cols=256 で呼べるか (shmem/block) を先に確認する。
+- **VRAM**: q 専用バッファなら **+316 MB** (@12,850)。`CH_QKV` に in-place で書くなら +0 だが
+  attention カーネルに「q の head ストライド = 2·dh」を渡す引数追加が要る。
+- 失敗モード: 表を層ごとに上げると 16 × 3.3 MB の無駄 → リクエスト先頭で 1 回。
+  q_dev を層ループ内で grow させない。切り分けは `DENNO_DEBUG_LAYER_CHKSUM=1` の `L?? attn` 行。
+
+**同時に拾える小物 (候補ではない)**: 末尾の `chain_download_at` 2 回 (`qwen35.rs:1954/1957`)
+= sync 2 回を 1 回に。RoPE の `theta.powf(-2d/n_rot)` を (pos,d) ごとに計算し直している
+(`qwen35.rs:204`、head ループの内側) ので表を 1 回作る (0.10 s @12,850, ESTIMATED。`.cu` 不要)。
+
+### 前提の確かめ方 (この順序は「beta/alpha が 8 s」に依存している)
+
+```
+DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 2 2>&1 | grep -E "PF_DBG|sl_lay"
+```
+
+`sl_lay_gdn_proj` (`REPORT_P8.md:45`) は「h2 の D2H/join + ホスト beta/alpha + qkv/z GEMM」を
+含むので、**候補①の上限がそのままこの行に出る**。予測 (このコンテナの CPU なら) は
+168 ms/層。60 ms 前後なら P4 の 0.6 s が正しく、候補①は ≈1.2 s に縮むので ②③ を先にする。
+`sl_lay_full_core` が 100 ms/層を超えるならホスト prepare が主因 → ③を先にする。
+
 ## 計測プロトコル (prefill)
 
 **同じプロンプトの再送は prefix cache に当たるため、cold 計測には使えない。**
@@ -145,6 +287,9 @@ python3 scripts/prefill_bench.py 65000 2   # 12,850 token 相当
 `temperature 0` の生成 3 問は旧バイナリと 176 バイト完全一致。
 
 ## 残り
+
+> s170 (P9) で下の 1・2 を定量化した (上の s170 節)。往復バイトは wall の 2.7〜6.2 % で、
+> 残る 16 % は beta/alpha のホスト計算。次の一手は候補① (GDN 制御投影のデバイス化)。
 
 1. ~~qkv / o_proj / GDN 投影 (`qkv_w` / `o_w` / `gate_w`(GDN) / `beta_w` /
    `alpha_w`) はまだ 1 回ごとに往復している。~~ s164 で q4 の GDN 層
