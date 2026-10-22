@@ -135,7 +135,7 @@ att=6144, q 出力幅 12288, kv_dim=1024, vocab 248,320 — `config.json` を読
 |---|---|---|---|
 | GDN ×48 | `qwen35.rs:2105` → `cuda.rs:11101` `chain_download_at(CH_PFH)` (+`cuda.rs:3993` sync) | D2H | 20,480 |
 | GDN ×48 | `cuda.rs:10361-10362` beta/alpha `copy_from` (pageable sync) | H2D | 384 |
-| full ×16 | `cuda.rs:11473/11481/11490` q (fused gate 込み) / k / v | D2H | 49,152 + 4,096 + 4,096 |
+| full ×16 | `cuda.rs:11473/11482/11491` q (fused gate 込み) / k / v | D2H | 49,152 + 4,096 + 4,096 |
 | full ×16 | `cuda.rs:5111/5112` KV ミラー k / v (`copy_from_at`) | H2D | 8,192 |
 | full ×16 | `cuda.rs:5133` q (norm+rope 後) | H2D | 24,576 |
 | full ×16 | `qwen35.rs:977` → `cuda.rs:3925/3935` att (+sync) | D2H | 24,576 |
@@ -168,7 +168,7 @@ wall 56.3 s (MEASURED) − PCIe 3.5 s (@12GB/s) − ホスト計算 8.9 s = カ�
 ### 消せない往復 (KV がホスト正)
 
 `KvCache` (ホスト) が full 層 K/V の唯一の正で、decode / prefix snapshot / CPU attend が読む。
-`with_mirror` (`cuda.rs:5105`) のミラーは**ホストの写し**。よって:
+`with_mirror` (`cuda.rs:5106`) のミラーは**ホストの写し**。よって:
 
 - **full 層の k/v D2H (post-RoPE) は消せない** — 8,192 B/token/層 = 1.68 GB (0.07〜0.14 s)。
   ホストで prepare するなら k/v 投影出力 57,344 B/token を戻すことになり、もっと高い。
