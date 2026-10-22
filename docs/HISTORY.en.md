@@ -3504,3 +3504,39 @@ External implementations referenced in P19 and their licensing status (the same 
 - **Not measured here**: no GPU was used at all (no bench, no GPU_VERIFY, no KPI run). Every
   number quoted is a 2026-10-21 measurement; nothing was measured fresh in this task. 8095 was
   not touched either.
+
+### s168: Task Q1 - `denno info` now reports the quantised type on the `quant:` line (2026-10-22) done
+
+> A 27B q4 GGUF printed `quant: F32 (0)`. F32 is the storage type for rmsnorm / bias and
+> outnumbers the quantised weights in the real file (Qwen3.8-27B-Q4_0.gguf: F32 456 / Q4_0 352 /
+> Q5K 48 / Q4_1 8 / Q6K 1 / Q8_0 1), so a mode over all tensors picked F32. The line asks for
+> the quantisation, so F32 is dropped from the vote whenever at least one non-F32 type exists
+> (CPU only).
+
+- **Implementation**: added `dominant_tensor_type()` in `crates/denno-cli/src/main.rs` and
+  switched the vote in `gguf_common_type()` from `most_common_type()` to it.
+  - The meaning of `most_common_type()` (mode, ties broken towards the smaller ggml type id =
+    deterministic) is unchanged.
+  - The format (`<name> (<id>)`) and the path of `gguf_quant_value()` / `info_quant_line()`
+    are unchanged.
+  - An F32-only GGUF still reports F32 (the vote is never emptied); zero tensors is None -> `?`.
+  - `layers` (65 vs 64) and `family: ?` are **deliberately unchanged** (pending an operator
+    decision).
+- **Measured gate**: `cargo test -p denno-cli` = **18 -> 23 passed / 0 failed / 0 ignored**
+  (5 new: `dominant_type_ignores_f32_when_quantised_type_exists` /
+  `dominant_type_keeps_f32_for_f32_only_file` / `dominant_type_matches_mode_without_f32` /
+  `dominant_type_empty_is_none` / `gguf_quant_value_skips_f32_storage_tensors`).
+  `cargo test -p denno-engine --lib` = **275 passed / 0 failed / 1 ignored** (unchanged).
+- **Proof the tests fail without the change (measured)**: reverting the call in
+  `gguf_common_type()` to `most_common_type()` makes
+  `gguf_quant_value_skips_f32_storage_tensors` fail with `left: "F32 (0)"` /
+  `right: "Q4_0 (2)"` (**22 passed / 1 failed**). Putting the same tests on HEAD, which has no
+  `dominant_tensor_type`, does not compile: E0425
+  (`cannot find function dominant_tensor_type`).
+- **CPU run (real file)**: a directory whose only GGUF is `/work/models/Qwen3.8-27B-Q4_0.gguf`,
+  `./target/debug/denno info <dir>` - before `quant:       F32 (0)`, after
+  `quant:       Q4_0 (2)` (every other line unchanged).
+- **Numeric class**: none (CLI display path only; the engine numeric path, `.cu` / `.ptx`, and
+  GPU execution are unchanged).
+- **Not measured here**: bench / GPU anchors / KPI (structurally unchanged because no numeric
+  path changed, but not measured). 8095 was not touched either.

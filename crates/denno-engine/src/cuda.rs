@@ -95,6 +95,8 @@ type FnCuEventCreate = unsafe extern "C" fn(*mut CUevent, u32) -> CUresult;
 type FnCuEventDestroy = unsafe extern "C" fn(CUevent) -> CUresult;
 type FnCuEventRecord = unsafe extern "C" fn(CUevent, CUstream) -> CUresult;
 type FnCuEventSynchronize = unsafe extern "C" fn(CUevent) -> CUresult;
+// s169 (P8): prefill 位相計測 — ストリーム上の 2 点間の経過 (ms) を読む。
+type FnCuEventElapsedTime = unsafe extern "C" fn(*mut f32, CUevent, CUevent) -> CUresult;
 type FnCuLaunchKernel = unsafe extern "C" fn(
     CUfunction,
     u32,
@@ -148,6 +150,8 @@ struct CudaLib {
     event_destroy: Option<FnCuEventDestroy>,
     event_record: Option<FnCuEventRecord>,
     event_sync: Option<FnCuEventSynchronize>,
+    // s169 (P8): 位相計測 (cuEventElapsedTime)。無ければ計測は静かに OFF。
+    event_elapsed_time: Option<FnCuEventElapsedTime>,
     launch: FnCuLaunchKernel,
 }
 
@@ -222,6 +226,9 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuEventRecord>(p) }),
         event_sync: sym_opt(handle, "cuEventSynchronize")
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuEventSynchronize>(p) }),
+        // s169 (P8): 位相計測用 (無い driver では計測だけが OFF になる)。
+        event_elapsed_time: sym_opt(handle, "cuEventElapsedTime")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuEventElapsedTime>(p) }),
         launch: std::mem::transmute(sym(handle, "cuLaunchKernel")?),
     })
 }
@@ -3402,6 +3409,175 @@ fn split_flush(t: &mut Option<Instant>) {
     *t = None;
 }
 
+/// s168 (P7): prefill の q4 GEMM 行タイル (**実測ノブ**)。1 タイル = 1 回の
+/// `dno_gemm_q4_0` launch で、grid は (mr.div_ceil(64), n.div_ceil(128))。
+/// 既定は s124 以来の 1024。`DENNO_Q4_M_TILE` で 64..=8192 の 64 の倍数を
+/// 指定できる (再ビルド無しで 512 / 1024 / 2048 / 4096 を A/B するための入口)。
+///
+/// 中間バッファは 1 タイルあたり (行) x (列) x 4 B で、行数は端数併合を含めて
+/// 最大 `tile + q4_tail_merge_below()` (既定 1024 + 16 = 1040 行)。
+/// 27B (e=5120, ff=17408) の MLP で 1040 行 = CH_GA 138 MiB / CH_ACT 69 MiB /
+/// CH_PFH・CH_DOWN 各 20 MiB。4096 行なら 546 MiB / 273 MiB / 80 MiB、
+/// 8192 行なら 1090 MiB / 545 MiB / 160 MiB。
+const Q4_M_TILE: usize = 1024;
+
+/// [`Q4_M_TILE`] の上限。中間バッファがタイル行数に比例するので 8192 行で止める
+/// (27B MLP の CH_GA は約 1.1 GiB — 13k 行を一度に置く 2.7 GiB には届かない)。
+const Q4_M_TILE_MAX: usize = 8192;
+
+/// タイル幅の刻み。`dno_gemm_q4_0` の行ブロック (Q4_GM = 64) に揃える — 途中の
+/// タイルはすべて 64 の倍数行になり、grid.x が端数ブロックを出さない。
+const Q4_M_TILE_STEP: usize = 64;
+
+/// `DENNO_Q4_M_TILE` の解釈 (純粋関数)。範囲外・非数・刻み外は既定へ落とす
+/// (不正な env で panic させない — `q4_gemv_c()` と同じ規約)。
+fn parse_q4_m_tile(v: Option<&str>) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(t) if (Q4_M_TILE_STEP..=Q4_M_TILE_MAX).contains(&t) && t % Q4_M_TILE_STEP == 0 => t,
+        _ => Q4_M_TILE,
+    }
+}
+
+/// [`Q4_M_TILE`] の実効値 (env `DENNO_Q4_M_TILE` があればそちら)。プロセス内で
+/// 1 回だけ読む (serve の起動時に env を決める運用なので、途中変更は見ない)。
+fn q4_m_tile() -> usize {
+    static TILE: OnceLock<usize> = OnceLock::new();
+    *TILE.get_or_init(|| {
+        let v = std::env::var("DENNO_Q4_M_TILE").ok();
+        parse_q4_m_tile(v.as_deref())
+    })
+}
+
+/// s168 (P7): 端数タイルを直前のタイルへ併合する閾値 (行)。
+///
+/// `max_m()` は「GEMV が GEMM より速い帯域」の上限 (既定 16) で、ファイル中の
+/// 他の dispatch はこの行数以下を GEMV に回す。prefill の GEMM は 64 行ブロック
+/// 単位なので、これ未満の端数を単独タイルにすると 1 launch がほぼ空回りする
+/// (しかも sync 付きの経路では待ち時間が丸ごと乗る)。端数がこれ未満なら
+/// 直前のタイルに足して 1 回で流す。`DENNO_CUDA_MAX_M=0` にすると併合しない
+/// (併合そのものの A/B 用)。
+fn q4_tail_merge_below() -> usize {
+    max_m()
+}
+
+/// s168 (P7): 1 タイルが受ける最大行数 (端数併合を含む)。中間バッファはこの
+/// 行数で**ループの前に**確保する — 途中で grow させると、先行 launch が読んで
+/// いるバッファを解放しうる (`Scratch::ensure` は grow-only の入れ替え)。
+fn q4_tile_max_rows(tile: usize) -> usize {
+    tile.saturating_add(q4_tail_merge_below())
+}
+
+/// s168 (P7): `r0` から始まる次の行グループの行数 (純粋関数)。
+/// 端数が [`q4_tail_merge_below`] 以下なら、その端数もこのグループに含める
+/// (返り値 <= tile + tail)。行は互いに独立で 1 行の累積順は変わらないため、
+/// 行のまとめ方は出力のビットを変えない (カーネル・引数・grid の作り方は同一)。
+///
+/// 閾値は `<=` にして [`pf_res_gate`] / [`gdn_prefill_q4_geom`] の
+/// 「端数 <= max_m() は受けない」と揃えてある — ゲートが受けた n に対しては、
+/// 端数タイルが単独で launch されることが無い。
+fn q4_group_rows(r0: usize, m: usize, tile: usize) -> usize {
+    let left = m - r0;
+    let mr = tile.min(left);
+    let rem = left - mr;
+    if rem > 0 && rem <= q4_tail_merge_below() {
+        left
+    } else {
+        mr
+    }
+}
+
+/// s168 (Task P7): 行タイルのノブと端数併合の契約 (純粋関数・GPU 不要)。
+#[cfg(test)]
+mod p7_tile_tests {
+    use super::*;
+
+    /// `DENNO_Q4_M_TILE` の解釈: 既定は従来値、範囲外・刻み外・非数は既定へ。
+    #[test]
+    fn env_tile_parse() {
+        assert_eq!(Q4_M_TILE, 1024, "既定は s124 以来の 1024 のまま");
+        assert_eq!(parse_q4_m_tile(None), 1024);
+        assert_eq!(parse_q4_m_tile(Some("")), 1024);
+        assert_eq!(parse_q4_m_tile(Some("abc")), 1024);
+        assert_eq!(parse_q4_m_tile(Some("-512")), 1024);
+        assert_eq!(parse_q4_m_tile(Some("0")), 1024);
+        assert_eq!(parse_q4_m_tile(Some("32")), 1024, "64 行未満は受けない");
+        assert_eq!(parse_q4_m_tile(Some("96")), 1024, "64 の倍数でない");
+        assert_eq!(parse_q4_m_tile(Some("999999")), 1024, "上限超え");
+        assert_eq!(parse_q4_m_tile(Some(" 2048 ")), 2048, "前後の空白は許す");
+        for t in [64usize, 512, 1024, 2048, 4096, 8192] {
+            assert_eq!(parse_q4_m_tile(Some(&t.to_string())), t, "t={t}");
+        }
+        // 本番の実効値も必ず受理域に入る (panic も 0 行タイルも作らない)
+        let eff = q4_m_tile();
+        assert!(eff % Q4_M_TILE_STEP == 0 && eff >= Q4_M_TILE_STEP && eff <= Q4_M_TILE_MAX);
+    }
+
+    /// 行グループの契約: 重複・欠落なしで m 行を覆い、1 グループは cap 行以下。
+    /// 途中のグループは必ず tile 行ちょうど (併合は最終グループだけ)、
+    /// 端数 (<= tail) が単独タイルとして launch されることは無い。
+    #[test]
+    fn row_groups_cover_rows_exactly() {
+        let tail = q4_tail_merge_below();
+        for tile in [64usize, 128, 512, 1024, 2048, 4096] {
+            let cap = q4_tile_max_rows(tile);
+            assert_eq!(cap, tile + tail, "tile={tile}");
+            for m in 1..=3000usize {
+                let (mut r0, mut groups) = (0usize, 0usize);
+                while r0 < m {
+                    let mr = q4_group_rows(r0, m, tile);
+                    assert!(mr > 0, "tile={tile} m={m} r0={r0}: 空グループ");
+                    assert!(mr <= cap, "tile={tile} m={m}: {mr} 行 > cap {cap}");
+                    if r0 + mr < m {
+                        assert_eq!(mr, tile, "tile={tile} m={m} r0={r0}: 途中が {mr} 行");
+                    } else if r0 > 0 {
+                        // 最終グループ: tile ちょうど or 併合 (tile 超) or tail 超の端数
+                        assert!(
+                            mr >= tile || mr > tail,
+                            "tile={tile} m={m}: 端数 {mr} 行 (tail {tail}) を単独 launch している"
+                        );
+                    }
+                    r0 += mr;
+                    groups += 1;
+                    assert!(groups <= m, "tile={tile} m={m}: グループ数が行数を超えた");
+                }
+                assert_eq!(r0, m, "tile={tile} m={m}: 行が覆われていない");
+            }
+        }
+    }
+
+    /// 13k token の実形 (27B の prefill) で、タイル幅ごとの launch 回数と
+    /// 端数併合の有無を固定する (REPORT_P7.md の表と同じ計算)。
+    #[test]
+    fn row_groups_at_13k_tokens() {
+        let tail = q4_tail_merge_below();
+        // (tile, 13,000 行のグループ数) — 端数 712 行はどの tile でも tail 超
+        for (tile, want) in [(512usize, 26usize), (1024, 13), (2048, 7), (4096, 4)] {
+            let mut r0 = 0usize;
+            let mut n = 0usize;
+            while r0 < 13_000 {
+                r0 += q4_group_rows(r0, 13_000, tile);
+                n += 1;
+            }
+            assert_eq!(n, want, "tile={tile} 13,000 行の launch 回数");
+        }
+        // 端数が tail 以下の形は直前のタイルへ併合され、グループ数が 1 減る
+        let m = 1024 * 3 + 4;
+        let mut r0 = 0usize;
+        let (mut n, mut last) = (0usize, 0usize);
+        while r0 < m {
+            last = q4_group_rows(r0, m, 1024);
+            r0 += last;
+            n += 1;
+        }
+        if tail >= 4 {
+            assert_eq!(n, 3, "端数 4 行は 3 番目のタイルへ併合 (2,048+ 行)");
+            assert_eq!(last, 1024 + 4, "併合後の最終タイル行数");
+        } else {
+            assert_eq!(n, 4, "併合 OFF (DENNO_CUDA_MAX_M=0) では 4 グループ");
+        }
+    }
+}
+
 /// s123: Q4_0 の 1 層ぶん。小さい m は GEMV (1 warp = 1 行)、大きい m は
 /// タイル GEMM (1 block = 16 行 x 256 列)。H2D → kernel → D2H → sync ×1。
 fn q4_dispatch(
@@ -3419,12 +3595,13 @@ fn q4_dispatch(
     // 通ったスレッド数ぶん積み上がる (27B・10.8k token で約 11 GB になり、続く
     // リクエストが cuMemAlloc error 2 で CPU へ落ちた)。
     // 行は互いに独立で、1 行の演算順はタイル分割で変わらないため出力は bit 一致する。
-    const Q4_M_TILE: usize = 1024;
+    // s168 (P7): タイル幅は `DENNO_Q4_M_TILE` の実効値、端数は直前のタイルへ併合する。
+    let tile = q4_m_tile();
     let lib = lib()?;
     ctx.make_current()?;
     let mut r0 = 0;
     while r0 < m {
-        let mr = Q4_M_TILE.min(m - r0);
+        let mr = q4_group_rows(r0, m, tile);
         let a_t = &a[r0 * k..r0 * k + mr * k];
         let out_t = &mut out[r0 * n..r0 * n + mr * n];
         q4_dispatch_tile(ctx, lib, a_t, gw, mr, k, n, use_gemm, out_t)?;
@@ -5064,19 +5241,25 @@ fn chain_mlp_prefill_q4_impl(
     let gw2 = weights_for_q4(uu.uid, &uu.blocks, uu.k, uu.n).ok()?;
     let gw3 = weights_for_q4(du.uid, &du.blocks, du.k, du.n).ok()?;
     // Slot 出力は CH_DOWN の行オフセットへ書くので、全行ぶんの領域を要求する
-    // (タイルごとの ensure は mr 行ぶんしか保証しない)。
+    // (タイルごとの ensure は 1 タイル分しか保証しない)。
     if matches!(sink, PfSink::Slot) {
         ok(chain_ensure_buf(CH_DOWN, m.checked_mul(e)?.checked_mul(4)?))?;
     }
-    const TILE: usize = 1024;
+    // s168 (P7): タイル幅は `DENNO_Q4_M_TILE` の実効値、端数は直前のタイルへ併合。
+    // 中間バッファは 1 タイルの**最大**行数 (`q4_tile_max_rows`) でループの前に
+    // 確保する — 併合されるのは最終タイルだけなので、ループ内で grow させると
+    // 先行 launch が読んでいるバッファを解放しうる。
+    let tile = q4_m_tile();
+    let cap = q4_tile_max_rows(tile).min(m);
+    ok(chain_ensure_buf(CH_PFH, cap * e * 4))?;
+    ok(chain_ensure_buf(CH_GA, cap * 2 * ff * 4))?;
+    ok(chain_ensure_buf(CH_ACT, cap * ff * 4))?;
+    ok(chain_ensure_buf(CH_DOWN, cap * e * 4))?;
     let _ = li;
     let mut r0 = 0usize;
     while r0 < m {
-        let mr = TILE.min(m - r0);
-        ok(chain_ensure_buf(CH_PFH, mr * e * 4))?;
-        ok(chain_ensure_buf(CH_GA, mr * 2 * ff * 4))?;
-        ok(chain_ensure_buf(CH_ACT, mr * ff * 4))?;
-        ok(chain_ensure_buf(CH_DOWN, mr * e * 4))?;
+        let mr = q4_group_rows(r0, m, tile);
+        debug_assert!(mr <= cap, "tile group {mr} > cap {cap}");
         // 出力先 (Host のときだけ D2H する)。生ポインタで持って CHAIN の
         // クロージャに渡す (Vec の再借用を避ける)。
         let dst: Option<*mut f32> = match &mut sink {
@@ -5115,13 +5298,16 @@ fn chain_mlp_prefill_q4_impl(
                 PfSrc::Slot => s.bufs[CH_PFH].as_ref()?.ptr() + (r0 * e * 4) as u64,
             };
             // 2) gate → CH_GA 前半 / up → CH_GA 後半 / 3) swiglu / 4) down
+            pf_phase(PF_PH_FFN_GATE);
             crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
                 chain_gemm_q4_pf(gw1, pin, pga, mr, e, ff)?;
                 chain_gemm_q4_pf(gw2, pin, pga + up_off, mr, e, ff)
             })?;
+            pf_phase(PF_PH_SWIGLU);
             crate::prof::time_layer(crate::prof::SWIGLU, li, || -> Option<()> {
                 chain_swiglu_split(pga, pga + up_off, pact, mr * ff)
             })?;
+            pf_phase(PF_PH_FFN_DOWN);
             crate::prof::time_layer(crate::prof::DOWN, li, || -> Option<()> {
                 chain_gemm_q4_pf(gw3, pact, pdown, mr, ff, e)
             })?;
@@ -10660,6 +10846,12 @@ pub fn gdn_scan_batch_oproj(
 }
 
 /// per-op 経路の行タイル (この単位で H2D + GEMM を回す)。
+///
+/// s168 (P7): 実際の dispatch は `DENNO_Q4_M_TILE` の実効値 ([`q4_m_tile`]) を使う。
+/// この定数は**入口ゲート** ([`gdn_prefill_q4_geom`] / [`pf_res_gate`]) が前提にする
+/// 歴史的なタイル幅 (1024) で、ゲートは端数タイルの帯域だけを見る保守的な判定
+/// なので、実効タイルがこれと違っても「受けない」側にしか倒れない
+/// (受けた場合は [`q4_group_rows`] が端数を直前のタイルへ併合する)。
 const GDN_PREFILL_TILE: usize = 1024;
 
 /// `chain_gdn_prefill_q4` が使う寸法 (入口条件を通ったときだけ作られる)。
@@ -10858,7 +11050,10 @@ fn chain_gdn_prefill_q4_impl(
     let g = gdn_prefill_q4_geom(qkv_w, z_w, o_w, n, nk, nv, dk, dv, d_conv)?;
     let (qw, zw, ow) = (g.qw, g.zw, g.ow);
     let (e, conv_dim, vd, cs) = (g.e, g.conv_dim, g.vd, g.cs);
-    const TILE: usize = GDN_PREFILL_TILE;
+    // s168 (P7): 行タイルは `DENNO_Q4_M_TILE` の実効値。端数は直前のタイルへ併合
+    // するので、CH_PFH (入力のステージ) は 1 タイルの最大行数で確保する。
+    let tile = q4_m_tile();
+    let cap = q4_tile_max_rows(tile).min(n);
     let nv_tot = n.checked_mul(nv)?;
     if beta.len() < nv_tot || alpha.len() < nv_tot {
         return None;
@@ -10915,10 +11110,11 @@ fn chain_gdn_prefill_q4_impl(
                 s.alpha.as_ref()?.ptr(),
             ))
         })?;
-    ok(chain_ensure_buf(CH_PFH, TILE.min(n).checked_mul(e)?.checked_mul(4)?))?;
+    ok(chain_ensure_buf(CH_PFH, cap.checked_mul(e)?.checked_mul(4)?))?;
     ok(chain_ensure_buf(CH_O, n.checked_mul(e)?.checked_mul(4)?))?;
 
-    // 1) qkv / z 投影: 入力を 1024 行ずつ用意し、GEMM は出力の行オフセットへ書く
+    // 1) qkv / z 投影: 入力を 1 タイル (`DENNO_Q4_M_TILE`・端数は直前へ併合) ずつ
+    //    用意し、GEMM は出力の行オフセットへ書く
     //    (per-op 経路の 1024 行タイルと同じ形。H2D と GEMM は同一ストリームで
     //    順序が保たれるので、タイル間の sync は要らない)。Host はタイルごとに
     //    H2D、Slot (残差常駐経路) は CH_PFH の該当行をそのまま読む — 転送だけが
@@ -10928,7 +11124,8 @@ fn chain_gdn_prefill_q4_impl(
     if phase != PfGdnPhase::Rest {
         let mut r0 = 0usize;
         while r0 < n {
-            let mr = TILE.min(n - r0);
+            let mr = q4_group_rows(r0, n, tile);
+            debug_assert!(mr <= cap, "tile group {mr} > cap {cap}");
             CHAIN.with(|cell| -> Option<()> {
                 let s = cell.borrow();
                 let pbuf = s.bufs[CH_PFH].as_ref()?.ptr();
@@ -10975,6 +11172,7 @@ fn chain_gdn_prefill_q4_impl(
     })?;
 
     // 3) GDN chunk scan (3 launch・入力はすべてデバイス、y もデバイスに残す)。
+    pf_phase(PF_PH_GDN_SCAN);
     crate::prof::time_layer(crate::prof::ATT_GDN_SCAN, li, || -> Option<()> {
         ok(gdn_scan_chunked_impl(
             ctx,
@@ -11001,6 +11199,7 @@ fn chain_gdn_prefill_q4_impl(
     })?;
 
     // 4) o_proj (y はデバイス上) → 5) D2H は Host 出力のときだけ最後の 1 回。
+    pf_phase(PF_PH_GDN_OPROJ);
     let po = CHAIN.with(|cell| cell.borrow().bufs[CH_O].as_ref().map(|b| b.ptr()))?;
     crate::prof::time_layer(crate::prof::OPROJ, li, || -> Option<()> {
         chain_gemm_q4_pf(gw_o, py, po, n, vd, e)
@@ -11201,6 +11400,354 @@ fn chain_pf_h2_join() -> Option<()> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// s169 (P8): prefill 残差常駐経路の**位相計測** (表 C の `sl_lay_*` / DENNO_PF_DBG)
+//
+// なぜホスト span では駄目か: 残差常駐チェーンは層の中のカーネルを**発行する
+// だけ**で待たない。`Instant` で区間を挟んでも写るのは発行の往復 (数十 ns) だけで、
+// 実際 decode chain の `sl_lay_*` は 0.0 ms と出ていた。ここでは既定ストリームに
+// **イベントを打つだけ**で位相を区切り、prefill 末尾に既にある同期 D2H が済んだ
+// 後に `cuEventElapsedTime` で区間を読む:
+//
+//   - イベントは発行順にストリーム上で実行されるので、区間の経過 = 「その区間で
+//     発行したカーネルの実行 + ホストが詰まっていた遊び」。待ちを足さない。
+//   - **同期は 1 回も足さない** (層ループの中も外も)。読むのは prefill 最後の
+//     既存の同期 D2H の後だけ。発行順・引数・カーネルは 1 つも変えない。
+//   - `DENNO_PROFILE` も `DENNO_PF_DBG` も未設定なら、各サイトは分岐 1 回で戻る
+//     (クロックも読まない・イベントも作らない)。プロファイラ build は要らない
+//     (`DENNO_PF_DBG=1` だけで動く)。
+//
+// 位相の区切りは**発行グループの先頭**に置く (`pf_phase(PF_PH_*)`)。区間
+// [イベント k, イベント k+1) はイベント k の時点で指定された位相に積まれる。
+// 残差加算は `dno_add_rmsnorm` の `proj` 引数に融合しているので、ホスト経路の
+// `sl_lay_residual` に相当する独立区間は**構造的に存在しない** (加算は
+// norm_in / norm_post の区間に含まれる)。
+// ---------------------------------------------------------------------------
+
+/// 位相 id (表示順)。`PF_PH_NONE` は「位相の外」(prefill 入口 → 最初の位相 /
+/// 層ループ末尾 → 最終 norm)。
+pub const PF_PH_NONE: u8 = 0xFF;
+pub const PF_PH_NORM_IN: usize = 0;
+pub const PF_PH_GDN_PROJ: usize = 1;
+pub const PF_PH_GDN_SCAN: usize = 2;
+pub const PF_PH_GDN_OPROJ: usize = 3;
+pub const PF_PH_FULL_QK: usize = 4;
+pub const PF_PH_FULL_CORE: usize = 5;
+pub const PF_PH_FULL_OPROJ: usize = 6;
+pub const PF_PH_NORM_POST: usize = 7;
+pub const PF_PH_FFN_GATE: usize = 8;
+pub const PF_PH_SWIGLU: usize = 9;
+pub const PF_PH_FFN_DOWN: usize = 10;
+pub const PF_PH_N: usize = 11;
+
+/// 表示名。`sl_lay_*` は表 C の行名と揃え、GDN の o_proj だけは表 C に行が無い
+/// (decode chain と同じ扱い = 名前付きバケットを持たない) ので DBG 専用の名前。
+pub const PF_PH_NAMES: [&str; PF_PH_N] = [
+    "sl_lay_norm_in",
+    "sl_lay_gdn_proj",
+    "sl_lay_gdn_scan",
+    "sl_lay_gdn_oproj",
+    "sl_lay_full_qk",
+    "sl_lay_full_core",
+    "sl_lay_full_oproj",
+    "sl_lay_norm_post",
+    "sl_lay_ffn_gate",
+    "sl_lay_swiglu",
+    "sl_lay_ffn_down",
+];
+
+/// 位相 → 表 C の行 (None = 表 C に行を持たない = DBG 表示のみ)。
+const PF_PH_BUCKETS: [Option<usize>; PF_PH_N] = [
+    Some(crate::prof::SL_LAY_NORM_IN),
+    Some(crate::prof::SL_LAY_GDN_PROJ),
+    Some(crate::prof::SL_LAY_GDN_SCAN),
+    None, // GDN o_proj (decode chain も名前付きバケットを持たない)
+    Some(crate::prof::SL_LAY_FULL_QK),
+    Some(crate::prof::SL_LAY_FULL_CORE),
+    Some(crate::prof::SL_LAY_FULL_OPROJ),
+    Some(crate::prof::SL_LAY_NORM_POST),
+    Some(crate::prof::SL_LAY_FFN_GATE),
+    Some(crate::prof::SL_LAY_SWIGLU),
+    Some(crate::prof::SL_LAY_FFN_DOWN),
+];
+
+/// `DENNO_PF_DBG=1`: prefill 1 回ごとに位相の内訳を stderr へ 1 回出す
+/// (プロファイラ build 不要・既定 OFF)。
+fn pf_dbg_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DENNO_PF_DBG").ok().as_deref() == Some("1"))
+}
+
+/// 位相計測を回すか (`DENNO_PROFILE` か `DENNO_PF_DBG`)。未設定は分岐 1 回。
+#[inline]
+fn pf_timing_on() -> bool {
+    crate::prof::enabled() || pf_dbg_on()
+}
+
+/// 1 prefill 分の位相計測の状態 (スレッドローカル・リクエストごとに使い回す)。
+struct PfTiming {
+    /// 計測中 (begin 済みで read/abort 前)。
+    active: bool,
+    /// 層ループ末尾の境界を打った = 次の `pf_timing_read` で読む。
+    pending: bool,
+    /// イベントのプール (grow-only。初回の prefill で層数ぶん作る)。
+    evs: Vec<CUevent>,
+    /// このリクエストで打ったイベント数。
+    used: usize,
+    /// 区間 k (= イベント k → k+1) の位相。
+    phase_of: Vec<u8>,
+    /// 位相ごとの積算 (秒)。
+    acc: [f64; PF_PH_N],
+    /// 層数 (表 C の calls = サンプル数)。
+    layers: usize,
+    /// トークン数 (ms/token の分母)。
+    tokens: usize,
+    /// prefill 入口の時刻 (壁時計の基準)。
+    t0: Option<Instant>,
+    /// prefill の通し番号 (DBG 表示)。
+    req: u64,
+}
+
+impl Default for PfTiming {
+    fn default() -> Self {
+        Self {
+            active: false,
+            pending: false,
+            evs: Vec::new(),
+            used: 0,
+            phase_of: Vec::new(),
+            acc: [0.0; PF_PH_N],
+            layers: 0,
+            tokens: 0,
+            t0: None,
+            req: 0,
+        }
+    }
+}
+
+thread_local! {
+    static PF_TIMING: std::cell::RefCell<PfTiming> =
+        std::cell::RefCell::new(PfTiming::default());
+}
+
+/// イベントを `need` 個そろえる (grow-only・初回だけ作る)。
+fn pf_ensure_events(t: &mut PfTiming, need: usize) -> bool {
+    if t.evs.len() >= need {
+        return true;
+    }
+    let Some(create) = lib().ok().and_then(|l| l.event_create) else {
+        return false;
+    };
+    while t.evs.len() < need {
+        let mut ev: CUevent = std::ptr::null_mut();
+        // CU_EVENT_DEFAULT (0) = 計時有効。作れなければ計測を諦める (fail closed)。
+        if unsafe { create(&mut ev, 0) } != CUDA_SUCCESS || ev.is_null() {
+            return false;
+        }
+        t.evs.push(ev);
+    }
+    true
+}
+
+/// 既定ストリームに境界イベントを 1 つ打ち、そこから始まる区間の位相を控える。
+///
+/// プールが尽きたら**その場で足す** (FFN は 1024 行タイルごとに 3 境界を打つので、
+/// 層あたりの境界数は n に依存する — `begin` で見積もらずに grow で吸収する)。
+fn pf_record(t: &mut PfTiming, phase: u8) -> bool {
+    let Some(rec) = lib().ok().and_then(|l| l.event_record) else {
+        return false;
+    };
+    if t.used >= t.evs.len() {
+        let want = t.evs.len().saturating_add(64);
+        if !pf_ensure_events(t, want) {
+            return false;
+        }
+    }
+    let ev = t.evs[t.used];
+    if unsafe { rec(ev, std::ptr::null_mut()) } != CUDA_SUCCESS {
+        return false;
+    }
+    t.used += 1;
+    t.phase_of.push(phase);
+    true
+}
+
+/// prefill 入口: 位相計測を開く (層ループの直前で 1 回)。
+pub fn pf_timing_begin(tokens: usize, layers: usize) {
+    if !pf_timing_on() {
+        return;
+    }
+    PF_TIMING.with(|c| {
+        let mut t = c.borrow_mut();
+        t.active = false;
+        t.pending = false;
+        t.used = 0;
+        t.phase_of.clear();
+        t.acc = [0.0; PF_PH_N];
+        t.layers = layers;
+        t.tokens = tokens;
+        t.t0 = Some(Instant::now());
+        t.req += 1;
+        // 1 層あたりの境界は高々 PF_PH_N 個 + 入口 + 末尾。
+        let need = layers.saturating_mul(PF_PH_N).saturating_add(2);
+        if !pf_ensure_events(&mut t, need) {
+            return;
+        }
+        if !pf_record(&mut t, PF_PH_NONE) {
+            return;
+        }
+        t.active = true;
+    });
+}
+
+/// 位相の先頭で境界を打つ (発行グループの先頭に置く)。計測していなければ
+/// 分岐 1 回で戻る — 数値経路・発行順には触れない。
+#[inline]
+pub fn pf_phase(ph: usize) {
+    if !pf_timing_on() {
+        return;
+    }
+    PF_TIMING.with(|c| {
+        let mut t = c.borrow_mut();
+        if !t.active {
+            return;
+        }
+        if !pf_record(&mut t, ph as u8) {
+            t.active = false;
+        }
+    });
+}
+
+/// 層ループ末尾: 最後の位相の終端を打つ (ここまでに打ったイベントは、この後の
+/// **既存の**同期 D2H で必ず完了する)。`pf_timing_read` と対で 1 回ずつ。
+pub fn pf_timing_end() {
+    if !pf_timing_on() {
+        return;
+    }
+    PF_TIMING.with(|c| {
+        let mut t = c.borrow_mut();
+        if !t.active {
+            return;
+        }
+        if !pf_record(&mut t, PF_PH_NONE) {
+            t.active = false;
+            return;
+        }
+        t.pending = true;
+    });
+}
+
+/// 残差常駐経路を途中で諦めた (Ok(None) → ホスト経路でやり直す) ときに捨てる。
+/// 打ったイベントはストリーム上で勝手に完了するので、そのまま放置してよい。
+pub fn pf_timing_abort() {
+    if !pf_timing_on() {
+        return;
+    }
+    PF_TIMING.with(|c| {
+        let mut t = c.borrow_mut();
+        t.active = false;
+        t.pending = false;
+    });
+}
+
+/// prefill 末尾 (**既存の**同期 D2H の後): 区間を読み、表 C の `sl_lay_*` へ
+/// 1 位相 1 行で積み、`DENNO_PF_DBG=1` なら内訳を 1 回だけ stderr へ出す。
+pub fn pf_timing_read() {
+    if !pf_timing_on() {
+        return;
+    }
+    PF_TIMING.with(|c| {
+        let mut t = c.borrow_mut();
+        if !t.pending {
+            return;
+        }
+        t.pending = false;
+        t.active = false;
+        let n_iv = t.phase_of.len().saturating_sub(1);
+        let Some(elapsed) = lib().ok().and_then(|l| l.event_elapsed_time) else {
+            return;
+        };
+        let mut acc = [0.0f64; PF_PH_N];
+        let mut bad = false;
+        for k in 0..n_iv {
+            let mut ms: f32 = 0.0;
+            let rc = unsafe { elapsed(&mut ms, t.evs[k], t.evs[k + 1]) };
+            // 未完了 (NOT_READY) や負値は「読めなかった」として全体を捨てる
+            // (半端な数字を表へ積むと、以後の判断が全部その数字に引きずられる)。
+            if rc != CUDA_SUCCESS || !ms.is_finite() || ms < 0.0 {
+                bad = true;
+                break;
+            }
+            let ph = t.phase_of[k] as usize;
+            if ph < PF_PH_N {
+                acc[ph] += ms as f64 / 1e3;
+            }
+        }
+        if bad {
+            if pf_dbg_on() {
+                eprintln!(
+                    "[PF_DBG] unavailable (event elapsed failed; n={} layers={})",
+                    t.tokens, t.layers
+                );
+            }
+            return;
+        }
+        // 表 C: 1 位相 1 行・calls = 層数 (= 層あたり 1 サンプル)。
+        let layers = t.layers.max(1) as u64;
+        for ph in 0..PF_PH_N {
+            let Some(op) = PF_PH_BUCKETS[ph] else {
+                continue;
+            };
+            let ns = (acc[ph] * 1e6).round() as u64;
+            if ns > 0 {
+                crate::prof::span_end_ns_calls(ns, op, layers);
+            }
+        }
+        if pf_dbg_on() {
+            pf_dbg_print(&t, &acc);
+        }
+    });
+}
+
+/// `DENNO_PF_DBG=1` の内訳 (1 prefill = 1 回)。wall / 位相の和 / 末尾 (最終 norm +
+/// logits + 最終行 D2H) を並べるので、「位相の和が wall に届かない分」が必ず見える。
+fn pf_dbg_print(t: &PfTiming, acc: &[f64; PF_PH_N]) {
+    let wall = t.t0.map(|t0| t0.elapsed().as_secs_f64()).unwrap_or(0.0);
+    let sum: f64 = acc.iter().sum();
+    let tok = t.tokens.max(1) as f64;
+    let per_tok = |secs: f64| secs * 1e3 / tok;
+    let pct = |secs: f64| if wall > 0.0 { secs / wall * 100.0 } else { 0.0 };
+    eprintln!(
+        "[PF_DBG] prefill req={} n={} layers={} wall={:.1} ms | phases {:.1} ms ({:.1}%) | \
+         {:.3} ms/token",
+        t.req,
+        t.tokens,
+        t.layers,
+        wall * 1e3,
+        sum * 1e3,
+        pct(sum),
+        per_tok(wall)
+    );
+    for ph in 0..PF_PH_N {
+        eprintln!(
+            "[PF_DBG]   {:<18} {:>10.1} ms {:>6.1}% {:>9.3} ms/tok",
+            PF_PH_NAMES[ph],
+            acc[ph] * 1e3,
+            pct(acc[ph]),
+            per_tok(acc[ph])
+        );
+    }
+    // 末尾 = 最終 norm + 最終行 D2H + lm_head。位相の外なので差で出す。
+    let tail = (wall - sum).max(0.0);
+    eprintln!(
+        "[PF_DBG]   {:<18} {:>10.1} ms {:>6.1}% {:>9.3} ms/tok",
+        "tail(final+logits)",
+        tail * 1e3,
+        pct(tail),
+        per_tok(tail)
+    );
+}
+
 /// s167 (P6): GDN 層の prefill を、h2 の D2H と qkv/z GEMM の**オーバーラップ付き**
 /// で通す版。`DENNO_PF_OVERLAP=1` かつデバイス準備が成功したときだけ
 ///   位相 Gemm → join → `host_ctrl` (beta/alpha) → 位相 Rest
@@ -11241,6 +11788,9 @@ where
     let g = gdn_prefill_q4_geom(qkv_w, z_w, o_w, n, nk, nv, dk, dv, d_conv)?;
     let e = g.e;
     let n_e = n.checked_mul(e)?;
+    // s169 (P8): 位相の境界は**発行グループの先頭**。ここから「h2 の D2H (同期 or
+    // join) → ホストの beta/alpha → qkv/z GEMM」までが gdn_proj の区間になる。
+    pf_phase(PF_PH_GDN_PROJ);
     let want = pf_overlap_flag();
     let begun = want && chain_pf_h2_begin(CH_PFH, 0, n_e).is_some();
     if pf_h2_path(want, n, e, begun) == PfH2Path::CopyStream {
@@ -11714,6 +12264,8 @@ pub fn chain_qkv_prefill_q4_dev(
     })?;
     let q_off = (rows * qcols * 4) as u64;
     let k_off = (rows * (qcols + kcols) * 4) as u64;
+    // s169 (P8): qkv GEMM + 3 発の D2H + 既存の sync までが full_qk の区間。
+    pf_phase(PF_PH_FULL_QK);
     crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
         chain_gemm_q4_pf(gwq, pin, pqkv, rows, qn, qcols)?;
         chain_gemm_q4_pf(gwk, pin, pqkv + q_off, rows, kn, kcols)?;
@@ -11788,6 +12340,8 @@ pub fn chain_oproj_prefill_q4(o_w: &crate::quant::Linear, rows: usize, li: usize
         Some((a.ptr(), s.bufs[CH_O].as_ref()?.ptr()))
     })?;
     let _ = ctx;
+    // s169 (P8): att の H2D は呼び出し側、ここは o_proj GEMM だけの区間。
+    pf_phase(PF_PH_FULL_OPROJ);
     crate::prof::time_layer(crate::prof::OPROJ, li, || chain_gemm_q4_pf(gw, pa, po, rows, ow.k, ow.n))
 }
 
@@ -12692,6 +13246,44 @@ mod p3_alias_tests {
     }
 }
 
+#[cfg(test)]
+mod p8_phase_tests {
+    //! s169 (Task P8): prefill 残差常駐経路の位相計測の**表との対応**を固定する。
+    //! GPU は使わない (イベントの実測は実機の担当) — ここで守るのは
+    //! 「位相の名前 = 表 C の行名」「1 行を 2 つの位相が共有しない (二重計上しない)」
+    //! 「残差加算は独立した行を持たない (融合している)」の 3 点。
+    use super::*;
+
+    #[test]
+    fn pf_phase_buckets_match_serve_rows() {
+        let mut seen: Vec<usize> = Vec::new();
+        for ph in 0..PF_PH_N {
+            let Some(op) = PF_PH_BUCKETS[ph] else {
+                continue;
+            };
+            assert!(
+                (crate::prof::SPLIT_SERVE_FIRST..crate::prof::SPLIT_SERVE_FIRST + crate::prof::SPLIT_SERVE_N)
+                    .contains(&op),
+                "位相 {ph} の bucket が表 C の範囲外"
+            );
+            let row = op - crate::prof::SPLIT_SERVE_FIRST;
+            let name = crate::prof::split_row_name(crate::prof::SPLIT_SERVE_TABLE, row)
+                .expect("位相の bucket は表 C の行");
+            assert_eq!(name, PF_PH_NAMES[ph], "位相 {ph} の名前が表 C の行名と違う");
+            assert!(!seen.contains(&op), "表 C の行を 2 つの位相が共有している: {name}");
+            seen.push(op);
+        }
+        // GDN の o_proj だけは表 C に行を持たない (decode chain と同じ扱い)。
+        assert_eq!(PF_PH_BUCKETS[PF_PH_GDN_OPROJ], None);
+        assert_eq!(seen.len(), PF_PH_N - 1);
+        // 残差加算は `dno_add_rmsnorm` に融合しているので独立した位相を持たない
+        // (ホスト経路の `sl_lay_residual` に相当する区間は残差常駐経路に無い)。
+        assert!(!seen.contains(&crate::prof::SL_LAY_RESIDUAL));
+        assert!(PF_PH_NAMES.iter().all(|n| !n.contains("residual")));
+    }
+}
+
+#[cfg(test)]
 mod p2_residual_tests {
     //! s165 (Task P2): prefill の残差ストリームをデバイス常駐させる経路の**入口条件**
     //! だけを固定する。GPU は使わない (純粋関数の契約テスト) — 数値の一致と速度は
