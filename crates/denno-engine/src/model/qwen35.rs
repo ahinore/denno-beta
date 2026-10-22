@@ -786,6 +786,130 @@ impl Qwen35 {
         }
     }
 
+    /// s165 (P2): full attention 層のホスト側 (q/k/v 投影 → QK-Norm/RoPE/KV 書き込み
+    /// → attend) を 1 つの関数にまとめたもの。中身は従来 `forward_prefill` の Full
+    /// 分岐そのままで、数値・演算順・prof バケットは不変 (残差常駐経路からも同じ
+    /// コードを通すために切り出した)。`buf_h` は rmsnorm 済み入力 [n, e]。
+    /// 戻り値は GPU attend (dno_attention_prefill) が走ったか。
+    #[allow(clippy::too_many_arguments)]
+    fn full_attn_host_side(
+        &self,
+        fl: &FullLayer,
+        cache: &mut KvCache,
+        li: usize,
+        pos0: usize,
+        n: usize,
+        buf_h: &[f32],
+        buf_qg: &mut Vec<f32>,
+        buf_k: &mut Vec<f32>,
+        buf_v: &mut Vec<f32>,
+        buf_q: &mut Vec<f32>,
+        buf_att: &mut Vec<f32>,
+        qkv_precomputed: bool,
+    ) -> bool {
+        let heads = self.heads;
+        let dh = self.dh;
+        let kv_dim = self.kv_heads * dh;
+        fit_prefill_buf(buf_qg, n * fl.q_w.dims().1); // [n, heads*2*dh]
+        fit_prefill_buf(buf_k, n * fl.k_w.dims().1); // [n, kv_dim]
+        fit_prefill_buf(buf_v, n * fl.v_w.dims().1); // [n, kv_dim]
+        // s165 (P2): 残差常駐経路は q/k/v をデバイス (CH_PFH) から直接 GEMM して
+        // 出力だけを戻す (chain_qkv_prefill_q4_dev)。その場合はここで投影しない
+        // (バッファ長は上で合わせてあるので fit は no-op)。
+        if !qkv_precomputed {
+            self.lin(crate::prof::QKV, || {
+                fl.q_w.apply_bt_rows_into(buf_h, n, buf_qg); // [n, heads*2*dh]
+                fl.k_w.apply_bt_rows_into(buf_h, n, buf_k); // [n, kv_dim]
+                fl.v_w.apply_bt_rows_into(buf_h, n, buf_v); // [n, kv_dim]
+            });
+        }
+        fit_prefill_buf(buf_att, n * heads * dh);
+        // s63: `full_attn_attend_head` は att_head に **加算** する
+        // (`*a += pv * b`・k 昇順の逐次累積が bit 一致の根拠) ため、
+        // 層をまたいで領域を再利用するときは毎層ゼロで初期化する。
+        // 旧実装は層ごとに vec![0.0] を確保していたのと同じ状態になる。
+        // 並列 fill なので数値・順序には影響しない。
+        buf_att.par_chunks_exact_mut(dh).for_each(|c| c.fill(0.0));
+        // s42 (Plan B): prepare (KV 書き込み + QK-Norm + RoPE) をトークン順
+        // に逐次実行 (トークン逐次経路と同一の演算列・decode 経路の
+        // full_attn_core と共用)。attend は読み取り専用のため全トークンの
+        // prepare 完了後に並列実行しても結果は同一 (bit-exact)。
+        // (s50: prof は QKNORM / ROPE バケットに分割計上 — 演算列は
+        // full_attn_prepare 1 回呼び出しと同一 (順序不変) = bit-exact。
+        // KV 書き込みは llama prefill と同様に個別計上しない)
+        fit_prefill_buf(buf_q, n * heads * dh);
+        // s73: prepare (QK-Norm → RoPE → KV 行書き込み) は**行ごとに独立**
+        // (q の行・KV キャッシュの pos 行はどれも互いに素) なので行並列で
+        // 実行する。1 行分の演算列はトークン逐次経路と完全に同一・書き込み先も
+        // 行専属なので bit-exact (rayon スレッド数にも依存しない)。
+        // prof は QKNORM バケットに一括計上する (内訳の合算と同値)。
+        {
+            let (kc, vc) = cache.kv_bufs(li, 1);
+            let krows = &mut kc[pos0 * kv_dim..(pos0 + n) * kv_dim];
+            let vrows = &mut vc[pos0 * kv_dim..(pos0 + n) * kv_dim];
+            crate::prof::time_n_ev(crate::prof::QKNORM, n, || {
+                buf_q
+                    .par_chunks_exact_mut(heads * dh)
+                    .zip(buf_qg.par_chunks_exact(heads * 2 * dh))
+                    .zip(buf_k.par_chunks_exact(kv_dim))
+                    .zip(buf_v.par_chunks_exact(kv_dim))
+                    .zip(krows.par_chunks_exact_mut(kv_dim))
+                    .zip(vrows.par_chunks_exact_mut(kv_dim))
+                    .enumerate()
+                    .for_each(|(i, (((((q_r, qg_i), k_i), v_i), k_row), v_row))| {
+                        let mut kn = self.full_attn_qknorm(fl, qg_i, k_i, q_r);
+                        self.full_attn_rope(q_r, &mut kn, pos0 + i);
+                        k_row.copy_from_slice(&kn);
+                        v_row.copy_from_slice(v_i);
+                    });
+            });
+        }
+        // s48 (C1): cuda ビルドでは attend を GPU バッチ (dno_attention_prefill
+        // 1 発 + D2H 後のホスト sigmoid ゲート) に置き換えて試行する。
+        // prepare は上記のとおりトークン逐次のまま (KV はホスト cache に
+        // 書き込み済み = 冪等) で、chain 失敗時は下の既存 rayon attend に
+        // 落ちる (数値は現行どおり bit 一致・発動ゲート n>=gemm_min_m()
+        // で短文は CPU のまま・`DENNO_GPU_ATTN=0` で全経路現行に戻る)。
+        // s57 (T4): full attention は attn_core の別バケット (ATT_FULL) に
+        // 分離。GPU バッチ (dno_attention_prefill) が実際に走ったかを
+        // 実行先ラベルとして計測に載せる (`att_done` をそのまま返すだけ =
+        // 分岐・演算列は不変)。
+        let (att_done, _) = crate::prof::time_layer_n_ev(crate::prof::ATT_FULL, li, n, || {
+            #[cfg(feature = "cuda")]
+            let att_done = self.full_attn_attend_gpu(buf_qg, buf_q, cache, li, pos0, n, buf_att);
+            #[cfg(not(feature = "cuda"))]
+            let att_done = false;
+            if !att_done {
+                // s42: attend を (i, head) 並列で実行 (旧実装はトークン逐次 —
+                // O(n²) の単スレッド部分が長 prefill の律速)。1 head 分の
+                // scores → softmax → probs@V → gate はトークン逐次経路と同一の
+                // 演算列のため bit-exact・rayon スレッド数非依存 (決定論検証:
+                // qwen38_27b_shape_prefill_thread_count_bit_exact)。scores は
+                // タスクローカル (共有スクラッチなし・書き込み先は各タスク専属の
+                // att チャンクのみ)。
+                let (kcr, vcr) = cache.kv_bufs_ref(li);
+                buf_att
+                    .par_chunks_exact_mut(dh)
+                    .enumerate()
+                    .for_each(|(t, att_head)| {
+                        let i = t / heads;
+                        let hh = t % heads;
+                        self.full_attn_attend_head(
+                            &buf_qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
+                            &buf_q[i * heads * dh..(i + 1) * heads * dh],
+                            kcr,
+                            vcr,
+                            pos0 + i + 1,
+                            hh,
+                            att_head,
+                        );
+                    });
+            }
+            (att_done, att_done)
+        });
+        att_done
+    }
+
     /// s48 (C1): full attention prefill の attend を GPU カーネル 1 発
     /// (dno_attention_prefill) で実行する。prepare (KV 書き込み + QK-Norm + RoPE)
     /// は呼び出し側がトークン逐次で完了済みの前提 (KV はホスト cache に書き込み
@@ -1330,10 +1454,9 @@ impl Qwen35 {
             }
         });
         lchk("prefill emb", &x[(n - 1) * e..]); // 恒久診断 (env ゲート・未指定時 no-op)
-        let heads = self.heads;
-        let kv_heads = self.kv_heads;
-        let dh = self.dh;
-        let kv_dim = kv_heads * dh;
+        // s165 (P2): heads / kv_heads / dh / kv_dim は full attention のホスト側
+        // (`full_attn_host_side`) と残差常駐チェーンが self から読むため、ここでは
+        // 持たない。
         let ff = self.ff;
 
         // s63: 層をまたいで再利用する作業バッファ (prefill 経路のみ)。
@@ -1360,6 +1483,17 @@ impl Qwen35 {
         let mut buf_q: Vec<f32> = Vec::new();
         let mut buf_att: Vec<f32> = Vec::new();
 
+        // s165 (P2): 残差ストリーム (h) を層の間ずっとデバイスに置く経路。
+        // 前提 (全層 q4・形・n の帯域・層別診断 OFF) が揃い、CH_PF_RES への
+        // アップロードに成功したときだけ発動する。`pending` は「まだ残差に足して
+        // いない投影出力のスロット」で、次の rmsnorm の add 引数として消費される
+        // (単独の add カーネルは PTX に無い — dno_add_rmsnorm の proj が担う)。
+        #[cfg(feature = "cuda")]
+        let mut res_dev = crate::cuda::pf_res_gate_now(n, e, self.all_prefill_q4(), lchk_enabled())
+            && crate::cuda::chain_pf_res_upload(&x, n, e).is_some();
+        #[cfg(feature = "cuda")]
+        let mut pending: Option<usize> = None;
+
         // s148 (Task B10・計測のみ): prefill 1 回の全体を表 C に積む。prefill は
         // 線形層が 1 回だけ通る「大きい m の 1 forward」で、decode の step と同じ
         // 表に入れると per-step 平均が壊れるため、`sl_step` ではなく
@@ -1368,6 +1502,50 @@ impl Qwen35 {
         let pf_t = crate::prof::span_begin();
 
         for (li, layer) in self.layers.iter().enumerate() {
+            // s165 (P2): 残差常駐経路 — 層 1 枚をデバイス上で通す。往復は
+            // 「ホストの契約が本当に必要とするもの」だけ (GDN: beta/alpha 用の h2 の
+            // D2H 1 回 / full attention: h2 の D2H 1 回 + att の H2D 1 回 / FFN: 0 回)。
+            // `Ok(None)` は前提不一致 (残差は未変更) → ホスト経路でこの層をやり直す。
+            #[cfg(feature = "cuda")]
+            if res_dev {
+                match self.prefill_layer_dev(
+                    layer,
+                    cache,
+                    li,
+                    pos0,
+                    n,
+                    pending,
+                    &mut buf_h,
+                    &mut buf_qg,
+                    &mut buf_k,
+                    &mut buf_v,
+                    &mut buf_q,
+                    &mut buf_att,
+                    &mut buf_beta,
+                    &mut buf_alpha,
+                ) {
+                    Ok(Some(next)) => {
+                        pending = Some(next);
+                        continue;
+                    }
+                    Ok(None) => {
+                        // 残差 (CH_PF_RES) + 未加算の投影出力をホストへ戻してから
+                        // 従来経路でこの層をやり直す (以降の層もホスト経路)。
+                        res_dev = false;
+                        if crate::cuda::chain_pf_res_download(n, e, &mut x).is_none() {
+                            bail!("prefill residual restore failed");
+                        }
+                        if let Some(sl) = pending.take() {
+                            let v = crate::cuda::chain_download(sl, n * e)
+                                .ok_or_else(|| anyhow::anyhow!("prefill residual pending download failed"))?;
+                            for (xi, vi) in x.iter_mut().zip(v.iter()) {
+                                *xi += *vi;
+                            }
+                        }
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
             // --- attention: rmsnorm を行単位で一括計算 (s42: 行独立 → 行並列。
             // 各要素の演算列は不変のため bit-exact・スレッド数非依存) ---
             crate::prof::time_n(crate::prof::RMSNORM, n, || {
@@ -1608,101 +1786,23 @@ impl Qwen35 {
                         });
                 }
                 AttnKind::Full(fl) => {
-                    fit_prefill_buf(&mut buf_qg, n * fl.q_w.dims().1); // [n, heads*2*dh]
-                    fit_prefill_buf(&mut buf_k, n * fl.k_w.dims().1); // [n, kv_dim]
-                    fit_prefill_buf(&mut buf_v, n * fl.v_w.dims().1); // [n, kv_dim]
-                    self.lin(crate::prof::QKV, || {
-                        fl.q_w.apply_bt_rows_into(&buf_h, n, &mut buf_qg); // [n, heads*2*dh]
-                        fl.k_w.apply_bt_rows_into(&buf_h, n, &mut buf_k); // [n, kv_dim]
-                        fl.v_w.apply_bt_rows_into(&buf_h, n, &mut buf_v); // [n, kv_dim]
-                    });
-                    fit_prefill_buf(&mut buf_att, n * heads * dh);
-                    // s63: `full_attn_attend_head` は att_head に **加算** する
-                    // (`*a += pv * b`・k 昇順の逐次累積が bit 一致の根拠) ため、
-                    // 層をまたいで領域を再利用するときは毎層ゼロで初期化する。
-                    // 旧実装は層ごとに vec![0.0] を確保していたのと同じ状態になる。
-                    // 並列 fill なので数値・順序には影響しない。
-                    buf_att.par_chunks_exact_mut(dh).for_each(|c| c.fill(0.0));
-                    // s42 (Plan B): prepare (KV 書き込み + QK-Norm + RoPE) をトークン順
-                    // に逐次実行 (トークン逐次経路と同一の演算列・decode 経路の
-                    // full_attn_core と共用)。attend は読み取り専用のため全トークンの
-                    // prepare 完了後に並列実行しても結果は同一 (bit-exact)。
-                    // (s50: prof は QKNORM / ROPE バケットに分割計上 — 演算列は
-                    // full_attn_prepare 1 回呼び出しと同一 (順序不変) = bit-exact。
-                    // KV 書き込みは llama prefill と同様に個別計上しない)
-                    fit_prefill_buf(&mut buf_q, n * heads * dh);
-                    // s73: prepare (QK-Norm → RoPE → KV 行書き込み) は**行ごとに独立**
-                    // (q の行・KV キャッシュの pos 行はどれも互いに素) なので行並列で
-                    // 実行する。1 行分の演算列はトークン逐次経路と完全に同一・書き込み先も
-                    // 行専属なので bit-exact (rayon スレッド数にも依存しない)。
-                    // prof は QKNORM バケットに一括計上する (内訳の合算と同値)。
-                    {
-                        let (kc, vc) = cache.kv_bufs(li, 1);
-                        let krows = &mut kc[pos0 * kv_dim..(pos0 + n) * kv_dim];
-                        let vrows = &mut vc[pos0 * kv_dim..(pos0 + n) * kv_dim];
-                        crate::prof::time_n_ev(crate::prof::QKNORM, n, || {
-                            buf_q
-                                .par_chunks_exact_mut(heads * dh)
-                                .zip(buf_qg.par_chunks_exact(heads * 2 * dh))
-                                .zip(buf_k.par_chunks_exact(kv_dim))
-                                .zip(buf_v.par_chunks_exact(kv_dim))
-                                .zip(krows.par_chunks_exact_mut(kv_dim))
-                                .zip(vrows.par_chunks_exact_mut(kv_dim))
-                                .enumerate()
-                                .for_each(
-                                    |(i, (((((q_r, qg_i), k_i), v_i), k_row), v_row))| {
-                                        let mut kn = self.full_attn_qknorm(fl, qg_i, k_i, q_r);
-                                        self.full_attn_rope(q_r, &mut kn, pos0 + i);
-                                        k_row.copy_from_slice(&kn);
-                                        v_row.copy_from_slice(v_i);
-                                    },
-                                );
-                        });
-                    }
-                    // s48 (C1): cuda ビルドでは attend を GPU バッチ (dno_attention_prefill
-                    // 1 発 + D2H 後のホスト sigmoid ゲート) に置き換えて試行する。
-                    // prepare は上記のとおりトークン逐次のまま (KV はホスト cache に
-                    // 書き込み済み = 冪等) で、chain 失敗時は下の既存 rayon attend に
-                    // 落ちる (数値は現行どおり bit 一致・発動ゲート n>=gemm_min_m()
-                    // で短文は CPU のまま・`DENNO_GPU_ATTN=0` で全経路現行に戻る)。
-                    // s57 (T4): full attention は attn_core の別バケット (ATT_FULL) に
-                    // 分離。GPU バッチ (dno_attention_prefill) が実際に走ったかを
-                    // 実行先ラベルとして計測に載せる (`att_done` をそのまま返すだけ =
-                    // 分岐・演算列は不変)。
-                    crate::prof::time_layer_n_ev(crate::prof::ATT_FULL, li, n, || {
-                        #[cfg(feature = "cuda")]
-                        let att_done =
-                            self.full_attn_attend_gpu(&buf_qg, &buf_q, cache, li, pos0, n, &mut buf_att);
-                        #[cfg(not(feature = "cuda"))]
-                        let att_done = false;
-                        if !att_done {
-                            // s42: attend を (i, head) 並列で実行 (旧実装はトークン逐次 —
-                            // O(n²) の単スレッド部分が長 prefill の律速)。1 head 分の
-                            // scores → softmax → probs@V → gate はトークン逐次経路と同一の
-                            // 演算列のため bit-exact・rayon スレッド数非依存 (決定論検証:
-                            // qwen38_27b_shape_prefill_thread_count_bit_exact)。scores は
-                            // タスクローカル (共有スクラッチなし・書き込み先は各タスク専属の
-                            // att チャンクのみ)。
-                            let (kcr, vcr) = cache.kv_bufs_ref(li);
-                            buf_att
-                                .par_chunks_exact_mut(dh)
-                                .enumerate()
-                                .for_each(|(t, att_head)| {
-                                    let i = t / heads;
-                                    let hh = t % heads;
-                                    self.full_attn_attend_head(
-                                        &buf_qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
-                                        &buf_q[i * heads * dh..(i + 1) * heads * dh],
-                                        kcr,
-                                        vcr,
-                                        pos0 + i + 1,
-                                        hh,
-                                        att_head,
-                                    );
-                                });
-                        }
-                        (att_done, att_done)
-                    });
+                    // s165 (P2): q/k/v 投影 → QK-Norm/RoPE/KV 書き込み → attend は
+                    // `full_attn_host_side` に切り出した (中身は従来のこの分岐そのもの・
+                    // 演算順も不変)。残差常駐経路も同じコードを通す。
+                    let _att_done = self.full_attn_host_side(
+                        fl,
+                        cache,
+                        li,
+                        pos0,
+                        n,
+                        &buf_h,
+                        &mut buf_qg,
+                        &mut buf_k,
+                        &mut buf_v,
+                        &mut buf_q,
+                        &mut buf_att,
+                        false,
+                    );
                     self.lin(crate::prof::OPROJ, || {
                         fl.o_w.apply_bt_rows_into(&buf_att, n, &mut buf_out)
                     });
@@ -1830,6 +1930,29 @@ impl Qwen35 {
 
         // 最終 norm + logits は最終トークンのみ (トークン逐次経路の最終値と同一)。
         // FINAL_NORM を個別計上 (LM_HEAD は s49 の logits() ラッパで計上済み)
+        #[cfg(feature = "cuda")]
+        let hf = if res_dev {
+            // 残差常駐: h の最終行だけを戻し、ホストで「加算 → rmsnorm」を従来と
+            // 同一の演算列で行う (全行の D2H はしない)。
+            let off = (n - 1) * e;
+            let mut hrow = crate::cuda::chain_download_at(crate::cuda::CH_PF_RES, off, e)
+                .ok_or_else(|| anyhow::anyhow!("prefill residual final row download failed"))?;
+            if let Some(sl) = pending {
+                let v = crate::cuda::chain_download_at(sl, off, e)
+                    .ok_or_else(|| anyhow::anyhow!("prefill residual final pending download failed"))?;
+                for (a, b) in hrow.iter_mut().zip(v.iter()) {
+                    *a += *b;
+                }
+            }
+            crate::prof::time(crate::prof::FINAL_NORM, || {
+                rmsnorm(&hrow, &self.norm_w, e, self.eps)
+            })
+        } else {
+            crate::prof::time(crate::prof::FINAL_NORM, || {
+                rmsnorm(&x[(n - 1) * e..], &self.norm_w, e, self.eps)
+            })
+        };
+        #[cfg(not(feature = "cuda"))]
         let hf = crate::prof::time(crate::prof::FINAL_NORM, || {
             rmsnorm(&x[(n - 1) * e..], &self.norm_w, e, self.eps)
         });
@@ -1841,6 +1964,230 @@ impl Qwen35 {
         // s148: prefill 1 回の区間を閉じる (1 prefill = 1 サンプル)。
         crate::prof::span_end(pf_t, crate::prof::SL_STEP_PREP);
         Ok(logits)
+    }
+
+    /// s165 (P2): 全層の attention / FFN 投影が q4 か (残差常駐経路のグローバル前提)。
+    /// 残差 h をデバイスに置いたままにできるのは、層の中の投影がすべて
+    /// デバイス常駐チェーンで通せるときだけ (1 本でもホスト経路が挟まると h が
+    /// ホストに要る)。
+    #[cfg(feature = "cuda")]
+    fn all_prefill_q4(&self) -> bool {
+        self.layers.iter().all(|l| {
+            let attn_ok = match &l.attn {
+                AttnKind::Gdn(g) => {
+                    matches!(g.qkv_w, Linear::Q4(_))
+                        && matches!(g.gate_w, Linear::Q4(_))
+                        && matches!(g.out_w, Linear::Q4(_))
+                }
+                AttnKind::Full(f) => {
+                    matches!(f.q_w, Linear::Q4(_))
+                        && matches!(f.k_w, Linear::Q4(_))
+                        && matches!(f.v_w, Linear::Q4(_))
+                        && matches!(f.o_w, Linear::Q4(_))
+                }
+            };
+            attn_ok
+                && matches!(l.gate_w, Linear::Q4(_))
+                && matches!(l.up_w, Linear::Q4(_))
+                && matches!(l.down_w, Linear::Q4(_))
+        })
+    }
+
+    /// s165 (P2): 層 1 枚を残差常駐で通す (q4 prefill)。
+    ///
+    /// 流れ (すべて同一ストリーム・途中で sync しない):
+    ///   1. `CH_PF_RES` (+ 前層の未加算出力) を rmsnorm → `CH_PFH` (デバイス)
+    ///   2. GDN 層: beta/alpha 用に h2 を 1 回だけ D2H → ホストで制御投影 →
+    ///      qkv/z → chunk scan → o_proj をデバイス常駐で `CH_O` へ
+    ///      full attention 層: h2 を 1 回 D2H → ホストで q/k/v + prepare + attend →
+    ///      att を 1 回だけ H2D → o_proj をデバイスで `CH_O` へ
+    ///   3. `CH_PF_RES += CH_O` と ln2 を 1 カーネルで (`dno_add_rmsnorm`) → `CH_PFH`
+    ///   4. FFN (gate/up → swiglu → down) をデバイス常駐で `CH_DOWN` へ
+    ///
+    /// 戻り値:
+    /// - `Ok(Some(slot))` 完走。`slot` は次の rmsnorm が残差に足す投影出力
+    /// - `Ok(None)` 前提不一致。**残差バッファは触っていない**ので呼び出し側は
+    ///   そのままホスト経路でこの層をやり直せる
+    /// - `Err` 残差を更新した後のデバイス障害 (GPU_BROKEN ラッチ済み)。残差と
+    ///   GDN/KV 状態の整合を保証できないため要求を落とす (既存チェーンと同じ規約)
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_layer_dev(
+        &self,
+        layer: &Layer,
+        cache: &mut KvCache,
+        li: usize,
+        pos0: usize,
+        n: usize,
+        pending: Option<usize>,
+        buf_h: &mut Vec<f32>,
+        buf_qg: &mut Vec<f32>,
+        buf_k: &mut Vec<f32>,
+        buf_v: &mut Vec<f32>,
+        buf_q: &mut Vec<f32>,
+        buf_att: &mut Vec<f32>,
+        buf_beta: &mut Vec<f32>,
+        buf_alpha: &mut Vec<f32>,
+    ) -> Result<Option<usize>> {
+        use crate::cuda;
+        let e = self.e;
+        let attn_w = match &layer.attn {
+            AttnKind::Gdn(g) => cuda::PfAttnW::Gdn {
+                qkv: &g.qkv_w,
+                z: &g.gate_w,
+                o: &g.out_w,
+            },
+            AttnKind::Full(f) => cuda::PfAttnW::Full {
+                q: &f.q_w,
+                k: &f.k_w,
+                v: &f.v_w,
+                o: &f.o_w,
+            },
+        };
+        // --- 1) 前提検査 (デバイス状態も残差も変えない) ---
+        let dims = cuda::PfDims {
+            n,
+            e,
+            heads: self.heads,
+            kv_heads: self.kv_heads,
+            dh: self.dh,
+            nk: self.gdn_p.n_k_heads,
+            nv: self.gdn_p.n_v_heads,
+            dk: self.gdn_p.head_k_dim,
+            dv: self.gdn_p.head_v_dim,
+            d_conv: self.gdn_p.d_conv,
+        };
+        if cuda::pf_layer_geom_now(&attn_w, &layer.gate_w, &layer.up_w, &layer.down_w, &dims).is_none()
+        {
+            return Ok(None);
+        }
+        // 層別診断 (env ゲート) は buf_out (ホスト) を読むので、有効ならホスト経路へ
+        if crate::gdn::gdn_dbg_enabled_for(li as i64) {
+            return Ok(None);
+        }
+        // バッファ確保と重み登録も残差を更新する前に済ませる
+        if cuda::chain_pf_reserve(n, e).is_none()
+            || cuda::pf_layer_dev_register(&attn_w, &layer.gate_w, &layer.up_w, &layer.down_w).is_none()
+        {
+            return Ok(None);
+        }
+        if matches!(layer.attn, AttnKind::Gdn(_)) && cache.gdn_state_mut(li).is_none() {
+            return Ok(None);
+        }
+
+        // --- 2) ここから残差 (CH_PF_RES) を更新しうる → 失敗は Err ---
+        // ln1 (+ 前層の未加算出力) → CH_PFH
+        let ln1 = layer.attn_ln1();
+        if !crate::prof::time_n(crate::prof::RMSNORM, n, || {
+            cuda::chain_rmsnorm_slot(
+                cuda::CH_PF_RES,
+                ln1,
+                self.eps,
+                pending,
+                cuda::CH_PFH,
+                e,
+                n,
+                li * 3,
+            )
+            .is_some()
+        }) {
+            return Err(anyhow::anyhow!(
+                "prefill residual chain: attn rmsnorm failed (residual already updated)"
+            ));
+        }
+
+        match &layer.attn {
+            AttnKind::Gdn(g) => {
+                // beta/alpha は従来どおりホストで計算する (h2 を 1 回だけ戻す)
+                let h2 = cuda::chain_download_at(cuda::CH_PFH, 0, n * e).ok_or_else(|| {
+                    anyhow::anyhow!("prefill residual chain: h2 download failed")
+                })?;
+                fit_prefill_buf(buf_h, n * e);
+                buf_h.copy_from_slice(&h2);
+                fit_prefill_buf(buf_beta, n * g.beta_w.dims().1);
+                fit_prefill_buf(buf_alpha, n * g.alpha_w.dims().1);
+                crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
+                    g.beta_w.apply_bt_rows_into(&buf_h[..], n, buf_beta)
+                });
+                crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
+                    g.alpha_w.apply_bt_rows_into(&buf_h[..], n, buf_alpha)
+                });
+                let p = &self.gdn_p;
+                let kv_id = cache.kv_id();
+                let (conv, ssm) = cache.gdn_state_mut(li).ok_or_else(|| {
+                    anyhow::anyhow!("GDN state slot が未初期化 (prefill residual chain)")
+                })?;
+                cuda::chain_gdn_prefill_q4_dev(
+                    &g.qkv_w,
+                    &g.gate_w,
+                    &g.out_w,
+                    buf_beta,
+                    buf_alpha,
+                    &g.conv1d,
+                    &g.ssm_a,
+                    &g.ssm_dt,
+                    &g.ssm_norm,
+                    n,
+                    p.n_k_heads,
+                    p.n_v_heads,
+                    p.head_k_dim,
+                    p.head_v_dim,
+                    p.d_conv,
+                    p.eps,
+                    1.0 / (p.head_k_dim as f32).sqrt(),
+                    conv,
+                    ssm,
+                    li,
+                    kv_id,
+                )
+                .ok_or_else(|| anyhow::anyhow!("prefill residual chain: GDN chain failed"))?;
+            }
+            AttnKind::Full(fl) => {
+                // q/k/v はデバイス (CH_PFH) から直接 GEMM し、**値だけ**をホストへ
+                // 戻す (KV キャッシュはホストが正・prepare はホスト)。h2 の H2D は
+                // 発生しない (per-op 経路の 3 回の h2 H2D が消える)。
+                fit_prefill_buf(buf_qg, n * fl.q_w.dims().1);
+                fit_prefill_buf(buf_k, n * fl.k_w.dims().1);
+                fit_prefill_buf(buf_v, n * fl.v_w.dims().1);
+                cuda::chain_qkv_prefill_q4_dev(
+                    &fl.q_w, &fl.k_w, &fl.v_w, n, li, buf_qg, buf_k, buf_v,
+                )
+                .ok_or_else(|| anyhow::anyhow!("prefill residual chain: qkv chain failed"))?;
+                let _att_done = self.full_attn_host_side(
+                    fl, cache, li, pos0, n, &[], buf_qg, buf_k, buf_v, buf_q, buf_att, true,
+                );
+                // attention 出力 (sigmoid ゲート済み・CH_ATT の生値ではない) を
+                // 1 回だけアップロードして、o_proj をデバイスで回す
+                let att_cols = self.heads * self.dh;
+                cuda::chain_pf_upload_att(buf_att, att_cols, n, li).ok_or_else(|| {
+                    anyhow::anyhow!("prefill residual chain: att upload failed")
+                })?;
+                cuda::chain_oproj_prefill_q4(&fl.o_w, n, li).ok_or_else(|| {
+                    anyhow::anyhow!("prefill residual chain: o_proj failed")
+                })?;
+            }
+        }
+
+        // ln2 (+ attn 出力の残差加算) → CH_PFH
+        if !crate::prof::time_n(crate::prof::RMSNORM, n, || {
+            cuda::chain_rmsnorm_slot(
+                cuda::CH_PF_RES,
+                &layer.ln2_w,
+                self.eps,
+                Some(cuda::CH_O),
+                cuda::CH_PFH,
+                e,
+                n,
+                li * 3 + 1,
+            )
+            .is_some()
+        }) {
+            return Err(anyhow::anyhow!("prefill residual chain: ffn rmsnorm failed"));
+        }
+        // FFN: CH_PFH → CH_DOWN (デバイス常駐)
+        cuda::chain_mlp_prefill_q4_dev(&layer.gate_w, &layer.up_w, &layer.down_w, n, li)
+            .ok_or_else(|| anyhow::anyhow!("prefill residual chain: FFN chain failed"))?;
+        Ok(Some(cuda::CH_DOWN))
     }
 }
 
