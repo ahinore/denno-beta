@@ -1812,6 +1812,23 @@ pub fn span_end_ns(ns: u64, op: usize) {
     push(op, ns, 1);
 }
 
+/// s169 (P8): 既に読めている ns を `calls` 回ぶんまとめて積む (1 区間 = 1 サンプル)。
+///
+/// `span_end` と同じく「閉じた号数」(`SPLIT_END`) も `calls` だけ進めるので、
+/// COVERAGE の samples 列 (閉じた号数) と ms が食い違わない。prefill の位相
+/// 計測は 1 リクエスト分をまとめて読む (層あたり 1 サンプル = `calls` = 層数)。
+#[inline]
+pub fn span_end_ns_calls(ns: u64, op: usize, calls: u64) {
+    if calls == 0 || !serve_on() {
+        return;
+    }
+    push(op, ns, calls);
+    let Some((SPLIT_SERVE_TABLE, r)) = split_slot(op) else {
+        return;
+    };
+    SPLIT_END[phase().idx()][SPLIT_SERVE_TABLE][r].fetch_add(calls, Ordering::Relaxed);
+}
+
 /// s154 (Task B15): `SL_LIN` の累積 ns (フェーズ `p`)。`sl_so_lin_sum` の素材。
 #[inline]
 fn lin_sum_ns(p: usize) -> u64 {
@@ -3450,6 +3467,14 @@ fn push_coverage_for(p: usize, s: &mut String) {
         // 0 本の step もあるので `steps × 層数` を期待値にはしない)。per-step の段
         // (`sl_lay_final` のような 1 step 1 回) は `steps` と突き合わせる。
         let exp = if unit == "step" { steps } else { 0 };
+        // s169 (P8): prefill は step を開かない (`sl_step` が 0) ので、層あたりの
+        // 段の期待値は「prefill の回数 × layers」で出す。以前は "0xlayers" と出て
+        // いて、サンプル 0 と倍率 0 の区別が付かなかった。step があれば従来どおり。
+        let layer_mult = if steps > 0 {
+            steps
+        } else {
+            serve_row_ends(p, SL_STEP_PREP)
+        };
         if exp > 0 && !adapter_only.contains(&op) {
             // s154 (B15): 号数ではなく「`span_end` で閉じられたか」で判定する
             // (合成時刻テストでは 1 区間が 0 ns になり、ns は 0 のまま)。
@@ -3471,7 +3496,7 @@ fn push_coverage_for(p: usize, s: &mut String) {
                     exp.to_string()
                 }
             } else {
-                format!("{steps}x{}", "layers")
+                format!("{layer_mult}x{}", "layers")
             },
             if unit == "step" { "steps" } else { "layer" },
             serve_row_ns(p, op) as f64 / 1e6,

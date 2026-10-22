@@ -379,6 +379,23 @@ fn most_common_type(types: impl Iterator<Item = GgmlType>) -> Option<(GgmlType, 
         .max_by_key(|(ty, n)| (*n, std::cmp::Reverse(ggml_type_id(*ty))))
 }
 
+/// s168 (P7): テンソル型の「支配的な型」。
+///
+/// F32 は量子化されない置き場 (rmsnorm / bias) で、実ファイルでは本数が量子化された
+/// 重みを上回る。Qwen3.8-27B-Q4_0.gguf の実測 (ヘッダを独立に読んだ本数) は
+/// F32 456 / Q4_0 352 / Q5K 48 / Q4_1 8 / Q6K 1 / Q8_0 1 で、全テンソルを投票すると
+/// 「F32 (0)」になる。量子化の種類を聞かれている行なので、F32 以外が 1 本でもあれば
+/// F32 を投票から外す。F32 しか無いファイル (本当に F32 の GGUF) は F32 を返す。
+fn dominant_tensor_type(types: impl Iterator<Item = GgmlType>) -> Option<(GgmlType, usize)> {
+    let all: Vec<GgmlType> = types.collect();
+    let voted: Vec<GgmlType> = if all.iter().any(|t| *t != GgmlType::F32) {
+        all.into_iter().filter(|t| *t != GgmlType::F32).collect()
+    } else {
+        all
+    };
+    most_common_type(voted.into_iter())
+}
+
 /// gguf を開いてテンソル型の最頻値を返す。開けない・テンソル無しは None。
 fn gguf_common_type(path: &std::path::Path) -> Option<(GgmlType, usize)> {
     let f = denno_engine::gguf::GgufFile::open(path).ok()?;
@@ -386,7 +403,7 @@ fn gguf_common_type(path: &std::path::Path) -> Option<(GgmlType, usize)> {
         .tensor_order
         .iter()
         .filter_map(|n| f.tensors.get(n).map(|t| t.ty));
-    most_common_type(types)
+    dominant_tensor_type(types)
 }
 
 /// `quant:` の値。開けない/読めないときは `?` (panic しない)。
@@ -699,6 +716,31 @@ mod tests {
         b.extend_from_slice(s.as_bytes());
     }
 
+    /// s168 (P7): メタデータの key/value 列を GGUF v3 形式で書き出す
+    fn gguf_push_kv(b: &mut Vec<u8>, kv: &[(&str, GgufMeta<'_>)]) {
+        for (key, val) in kv {
+            gguf_push_str(b, key);
+            match val {
+                GgufMeta::Str(s) => {
+                    b.extend_from_slice(&8u32.to_le_bytes()); // GT_STRING
+                    gguf_push_str(b, s);
+                }
+                GgufMeta::U32(n) => {
+                    b.extend_from_slice(&4u32.to_le_bytes()); // GT_U32
+                    b.extend_from_slice(&n.to_le_bytes());
+                }
+                GgufMeta::ArrStr(items) => {
+                    b.extend_from_slice(&9u32.to_le_bytes()); // GT_ARRAY
+                    b.extend_from_slice(&8u32.to_le_bytes()); // elem = string
+                    b.extend_from_slice(&(items.len() as u64).to_le_bytes());
+                    for s in items.iter() {
+                        gguf_push_str(b, s);
+                    }
+                }
+            }
+        }
+    }
+
     /// temp_dir 配下に一意なディレクトリを作る (drop で削除)
     struct TempDir {
         path: PathBuf,
@@ -743,26 +785,33 @@ mod tests {
             b.extend_from_slice(&3u32.to_le_bytes()); // version
             b.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
             b.extend_from_slice(&(kv.len() as u64).to_le_bytes());
-            for (key, val) in kv {
-                gguf_push_str(&mut b, key);
-                match val {
-                    GgufMeta::Str(s) => {
-                        b.extend_from_slice(&8u32.to_le_bytes()); // GT_STRING
-                        gguf_push_str(&mut b, s);
-                    }
-                    GgufMeta::U32(n) => {
-                        b.extend_from_slice(&4u32.to_le_bytes()); // GT_U32
-                        b.extend_from_slice(&n.to_le_bytes());
-                    }
-                    GgufMeta::ArrStr(items) => {
-                        b.extend_from_slice(&9u32.to_le_bytes()); // GT_ARRAY
-                        b.extend_from_slice(&8u32.to_le_bytes()); // elem = string
-                        b.extend_from_slice(&(items.len() as u64).to_le_bytes());
-                        for s in items.iter() {
-                            gguf_push_str(&mut b, s);
-                        }
-                    }
-                }
+            gguf_push_kv(&mut b, kv);
+            while b.len() % 32 != 0 {
+                b.push(0);
+            }
+            self.write_file(name, &b)
+        }
+
+        /// s168 (P7): テンソルを数本だけ持つ最小 GGUF v3。データ部は置かない
+        /// (open はヘッダの整列だけを見るので、32 byte 詰めで通る)。
+        fn write_gguf_tensors(
+            &self,
+            name: &str,
+            kv: &[(&str, GgufMeta<'_>)],
+            tensors: &[(&str, GgmlType)],
+        ) -> PathBuf {
+            let mut b = Vec::new();
+            b.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+            b.extend_from_slice(&3u32.to_le_bytes()); // version
+            b.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+            b.extend_from_slice(&(kv.len() as u64).to_le_bytes());
+            gguf_push_kv(&mut b, kv);
+            for (tname, ty) in tensors {
+                gguf_push_str(&mut b, tname);
+                b.extend_from_slice(&1u32.to_le_bytes()); // n_dims
+                b.extend_from_slice(&1u64.to_le_bytes()); // ne[0] = 1
+                b.extend_from_slice(&ggml_type_id(*ty).to_le_bytes());
+                b.extend_from_slice(&0u64.to_le_bytes()); // offset
             }
             while b.len() % 32 != 0 {
                 b.push(0);
@@ -1065,6 +1114,82 @@ mod tests {
         assert_eq!(most_common_type(vec![Q8_0, Q4_0].into_iter()), Some((Q4_0, 1)));
         assert_eq!(most_common_type(Vec::<GgmlType>::new().into_iter()), None);
         assert_eq!(most_common_type(vec![F16, Q4K, Q4K].into_iter()), Some((Q4K, 2)));
+    }
+
+    // s168 (P7): F32 は量子化されない置き場 (rmsnorm / bias) で本数が量子化された重みを
+    // 上回る (実ファイル Qwen3.8-27B-Q4_0.gguf は F32 456 / Q4_0 352)。量子化の種類を
+    // 出す行なので、F32 以外が 1 本でもあれば F32 を投票から外す。
+    #[test]
+    fn dominant_type_ignores_f32_when_quantised_type_exists() {
+        use GgmlType::{F32, Q4_0};
+        let mut types = vec![F32; 5];
+        types.extend(vec![Q4_0; 2]);
+        // 素の最頻値は F32 (5) で、これが「quant: F32 (0)」の原因だった
+        assert_eq!(most_common_type(types.iter().copied()), Some((F32, 5)));
+        assert_eq!(dominant_tensor_type(types.into_iter()), Some((Q4_0, 2)));
+        // 量子化型が 1 本だけでも F32 は負けない (実ファイルの F32 456 本でも同じ)
+        let mut one = vec![F32; 456];
+        one.push(Q4_0);
+        assert_eq!(dominant_tensor_type(one.into_iter()), Some((Q4_0, 1)));
+    }
+
+    // s168 (P7): 本当に F32 だけの GGUF は従来どおり F32 を返す (空投票にしない)
+    #[test]
+    fn dominant_type_keeps_f32_for_f32_only_file() {
+        use GgmlType::F32;
+        assert_eq!(dominant_tensor_type(vec![F32, F32, F32].into_iter()), Some((F32, 3)));
+        assert_eq!(dominant_tensor_type(vec![F32].into_iter()), Some((F32, 1)));
+    }
+
+    // s168 (P7): F32 が無いファイルの答えは素の最頻値と一致する (挙動不変)
+    #[test]
+    fn dominant_type_matches_mode_without_f32() {
+        use GgmlType::{Q4K, Q5K, Q8_0};
+        let types = vec![Q8_0, Q4K, Q4K, Q5K];
+        assert_eq!(
+            dominant_tensor_type(types.iter().copied()),
+            most_common_type(types.iter().copied())
+        );
+        assert_eq!(dominant_tensor_type(types.into_iter()), Some((Q4K, 2)));
+        // 同数は型 id の小さい方 (決定論) も素の最頻値と同じ -> Q8_0 (8) < Q4K (12)
+        assert_eq!(dominant_tensor_type(vec![Q4K, Q8_0].into_iter()), Some((Q8_0, 1)));
+        assert_eq!(dominant_tensor_type(vec![Q5K, Q5K].into_iter()), Some((Q5K, 2)));
+    }
+
+    // s168 (P7): テンソル 0 本は None (panic しない)。F32 を外して空になる経路は無い
+    #[test]
+    fn dominant_type_empty_is_none() {
+        assert_eq!(dominant_tensor_type(Vec::<GgmlType>::new().into_iter()), None);
+        assert!(dominant_tensor_type(vec![GgmlType::F32].into_iter()).is_some());
+    }
+
+    // s168 (P7): 実ファイル経路 (gguf を開いて tensor_order を投票する) でも同じ答え。
+    // ヘッダだけの最小 GGUF なのでデータ部は無い (open は整列だけを見る)。
+    #[test]
+    fn gguf_quant_value_skips_f32_storage_tensors() {
+        let td = TempDir::new("dominant_gguf");
+        let p = td.write_gguf_tensors(
+            "q.gguf",
+            &[("general.architecture", GgufMeta::Str("qwen3"))],
+            &[
+                ("blk.0.attn_norm.weight", GgmlType::F32),
+                ("blk.0.ffn_norm.weight", GgmlType::F32),
+                ("output_norm.weight", GgmlType::F32),
+                ("blk.0.attn_q.weight", GgmlType::Q4_0),
+                ("blk.0.ffn_down.weight", GgmlType::Q4_0),
+            ],
+        );
+        // F32 3 本 vs Q4_0 2 本: 全テンソル投票なら F32 (0) になる並び
+        let f = denno_engine::gguf::GgufFile::open(&p).expect("open test gguf");
+        let all = f
+            .tensor_order
+            .iter()
+            .filter_map(|n| f.tensors.get(n).map(|t| t.ty));
+        assert_eq!(most_common_type(all), Some((GgmlType::F32, 3)));
+        // 実際に info が出す値は量子化型
+        assert_eq!(gguf_quant_value(&p), "Q4_0 (2)");
+        let line = info_quant_line(&td.path).expect("gguf exists so the line exists");
+        assert_eq!(line_value(&[line], "quant:"), "Q4_0 (2)");
     }
 
     // 名前と数値 id の表が GgmlType::from_id と一致すること (数値の出所は ggml.h)
