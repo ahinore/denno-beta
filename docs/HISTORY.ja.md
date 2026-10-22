@@ -3521,3 +3521,35 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
 - **測っていないこと**: GPU 実行・アンカー 3 本 (`c61ad85b` / `9e17d563` / `af6eb6ab`)・
   ms/token・nsys。このコンテナは GPU 非搭載なので、実機確認の手順は作業レポート
   (未 commit・`REPORT_P16.md`) に書いた。`.cu` / `.ptx` / 8095 は触っていない。
+
+### s175: Task P17b - P17 (連続 pinned q|k|v D2H) を P12 の上に再適用した (2026-10-23) 完了
+
+> P17 (`023d10e`) は P12 (`a5dea68`) を含まない `c0b19d0` を土台に書かれていたため、そのまま
+> 併合すると P12 (att の pinned 直送り往復・GPU attend 時に CPU attend 用ゼロ埋めをしない規則・
+> `AttnPlace` の戻り値) を巻き戻してしまう。P17b は main (P12 + P14 + P15 + P16) の上に P17 の
+> **意図だけ**を再適用し、P12 の意味は 1 つも変えていない。
+
+- **実装**: `chain_qkv_prefill_q4_dev` の戻しを、pageable な 3 本の `Vec` への D2H 3 発から
+  **`ChainScratch::pin_pf_qkv` (grow-only) への 1 発の pinned D2H** に変え、
+  `chain_pf_qkv_host_view` / `PfQkvHostView` が同じ連続領域を 3 スライスとして見せる。
+  `&mut [f32]` の 3 出力引数は廃止 (API は 1 本・二重実装なし)、唯一の呼び出し元
+  (`prefill_layer_dev`) がビューを消費する。
+- **P12 はそのまま**: `full_attn_host_side` は `qkv_precomputed` + `host_att_needed` を取り
+  `AttnPlace` を返す。`buf_att` のゼロ埋めは `!att_done` (CPU attend) の分岐の中のままで、
+  `chain_pf_att_inplace` / `AttnPlace::GpuDev` による att H2D の省略も不変。変えたのは
+  **q/k/v の出どころだけ**: `qkv_precomputed = true` のときは pinned ビュー (`QkvPre`) を読み、
+  作業バッファの fit も投影もしない。`false` のときは P12 と同一に `buf_h` から投影する
+  (ホスト経路は無変更)。
+- **数値クラス**: **bit 一致** (attention の緩和枠は未使用)。カーネル・grid・引数・GEMM の発行順・
+  D2H のバイト列 (オフセットは従来の 3 発が使っていた値そのもの)・1 層 1 sync は不変。
+- **件数 (1 リクエスト・n=14,043)**: `full_qk` は launch 48 → 48 / H2D 0 → 0 / **D2H 48 → 16** /
+  sync 16 → 16 (6.44 GB・pageable → pinned)。`gdn_oproj` は 1 層あたり launch 1 / H2D 0 / D2H 0 /
+  sync 0 で**不変** (既にデバイス完結 — P17 の結論どおり)。
+- **予測 (実機未計測)**: pinned 18 GB/s・pageable 約半分と置くと 402.6 MB/層 が 45 → 22 ms、
+  16 層で **−0.37 s/request (−0.9 %)**。`full_qk` 1.39 s → 約 1.02 s、wall 42.18 s → 約 41.8 s。
+  pageable が同速なら残るのは「3 発 → 1 発」の構造だけ。
+- **実測ゲート**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (main-merged の基準と同一)・
+  `cargo build --release -p denno-cli --features denno-engine/cuda` 成功。
+- **測っていないこと**: GPU 実行・アンカー・ms/token・nsys・8095 (GPU 非搭載)。
+  作業レポートは未 commit (`REPORT_P17B.md`)。`.cu` / `.ptx` は無変更。
