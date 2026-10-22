@@ -25,12 +25,23 @@
 | 9B int8 | `2701cf3` | **16.24** | GPU_VERIFY の gen2 = 3.248 s / 200 token。gen1 3.874 s は warmup 込み |
 | 27B q4 | `8a0525b`（K5 時点 HEAD） | **32.43** | 2026-10-21T17:58Z・3 回中央値（GPU_VERIFY 再デプロイ後の 2 つ目の triple）・util 0%。生値 32.43 / 32.43 / 32.43 |
 | 9B int8 | `8a0525b`（K5 時点 HEAD） | **16.24〜16.28** | GPU_VERIFY の gen2（同一ビルドの複数回で 16.24〜16.28 の幅） |
+| 27B q4 | `8d2554e`（P7+P8 統合・`DENNO_FAST_REDUCE` 未設定 = 逐次) | **31.83〜32.04** | 2026-10-22T15:40Z・`dec_prof.py 200` の 2 回。ゲート OFF の退行が無いことの確認 |
+| 27B q4 | `8d2554e`（`DENNO_FAST_REDUCE=1`） | **19.15〜19.43** | 2026-10-22T15:55Z・`dec_prof.py 200` の 2 回。逐次版の 1.65〜1.67 倍 |
 
 - 27B q4 の `2701cf3` の生値: TTFT 0.205 / 0.202 s、wall 6.689 / 6.685 s、out 200。
 - 27B q4 の `8a0525b` は `2701cf3` の 32.42 と同水準（差 0.01）。アンカーは 3/3 MATCH
   （`c61ad85b` / `9e17d563` / `af6eb6ab`）。この行の triple の採り方は §3.1 の規則にもとづく。
 - B20 段階 1 の効き方: 27B q4 の per-op 線形 D2H が 0 になった（PROFILE の `d2h_src_linear`
   898 call で 0.0 ms、`sl_lin` 0 call）。アンカー 3 本は MATCH（`c61ad85b` / `9e17d563` / `af6eb6ab`）。
+- **s169 の `dno_matvec_f32` 並列リダクション**（`DENNO_FAST_REDUCE=1`）: beta/alpha の制御投影は
+  1 token あたり 96 回・12.85 ms（decode の 38%）で、1 行の内積を 1 スレッドが逐次に回していた。
+  1 行 1 ブロック・256 スレッド・warp shuffle の固定順（16,8,4,2,1）→ warp 合計を id 昇順、という
+  atomic 無しの固定木に置き換えた（決定論は維持）。逐次版とは丸め順が違うため既定は OFF で、
+  本番スクリプト `scripts/prod_serve_27b.sh` が明示的に ON にする。temp 0 の 3 問（80 token）と
+  8 問 x 150 token の出力が逐次版と完全一致した。アンカーは q4 chain を通らないため不変（3/3 MATCH）。
+- **prefill のタイルは 1024 のまま**（P7 で `DENNO_Q4_M_TILE` を追加）: 2,048 は 16k token で
+  13.81 s（13.87 と同水準）だが、65k token では中間バッファが 274 MiB を要求して
+  `cuMemAlloc error 2`（空き 233 MiB）で落ちた。既定 1,024 を変えない。
 - 参考（測定条件が違うので判定に使わない）: 2026-10-21 の main session 実測は 161 token で
   72〜75、400 token で 87 ms/token。記録値 55.1 は条件が残っておらず再現しない。
 

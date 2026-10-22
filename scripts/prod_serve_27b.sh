@@ -34,6 +34,11 @@ export DENNO_PREFIX_CACHE_MAX_TOKENS=24576
 # 残ることがあるため、単独利用でも 4 本持っておく。2 本だと中断 2 回で
 # "no free KV cache slot" になる。
 export DENNO_BATCH_SLOTS=4
+# s169: beta/alpha の制御投影 (1 token 96 回 = decode の 38%) を固定木の並列縮約で
+# 計算する。atomic を使わないので決定論。逐次版とは丸め順が違うため bit 一致では
+# ないが、temp 0 の 11 問 (3 + 8 x 150 token) が逐次版と完全一致し、200 token の
+# 実測が 32.03 -> 19.15 ms/token (1.67x)。アンカーは q4 chain を通らないので不変。
+export DENNO_FAST_REDUCE=1
 
 exec ./target/bin_canonical serve local/qwen35-27b --port 8095 --host 0.0.0.0 \
   --seed 42 --quant q4 --repetition-penalty 1.05 --temperature-cap 0.7
