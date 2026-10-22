@@ -1395,12 +1395,6 @@ impl Qwen35 {
                     fit_prefill_buf(&mut buf_z, n * g.gate_w.dims().1);
                     fit_prefill_buf(&mut buf_beta, n * g.beta_w.dims().1);
                     fit_prefill_buf(&mut buf_alpha, n * g.alpha_w.dims().1);
-                    self.lin(crate::prof::QKV, || {
-                        g.qkv_w.apply_bt_rows_into(&buf_h, n, &mut buf_qkv)
-                    });
-                    self.lin(crate::prof::QKV, || {
-                        g.gate_w.apply_bt_rows_into(&buf_h, n, &mut buf_z)
-                    });
                     // s61c (T5b 計測のみ): beta/alpha は「投影」、下のスキャンは「スキャン」
                     // に分けて計上する。attn_gdn の合計は両者の和で従来と同値
                     // (add_sample が ATT_GDN へ合算する)。数値経路・分岐は不変。
@@ -1408,12 +1402,63 @@ impl Qwen35 {
                     // s78 (T7) の GPU 経路 (`gdn_proj_into_gpu`) は s96 で削除した
                     // (s79 実測で m>1 の数値が壊れていた・P3-1)。beta/alpha は
                     // 従来どおり CPU の `apply_bt_rows_into` で計算する。
+                    //
+                    // s164 (P1): q4 のデバイス常駐チェーンも**この値**を使うため、
+                    // qkv/z 投影より先に計算する (投影どうしは独立で数値に影響しない)。
                     crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
                         g.beta_w.apply_bt_rows_into(&buf_h, n, &mut buf_beta)
                     });
                     crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
                         g.alpha_w.apply_bt_rows_into(&buf_h, n, &mut buf_alpha)
                     });
+                    // s164 (P1): q4 重みでは qkv/z 投影 → GDN chunk scan → o_proj を
+                    // デバイス常駐で通す (1 層あたり qkv/z/y の往復 約 2.0 GB を消す)。
+                    // 前提 (q4・形・n・max_m 帯域) が揃わないときは None → 下の従来
+                    // 経路へそのまま落ちる。GDN スキャンは n を分割しないので数値不変。
+                    #[cfg(feature = "cuda")]
+                    let gdn_chained = {
+                        let p = &self.gdn_p;
+                        let kv_id = cache.kv_id();
+                        let (conv, ssm) = cache
+                            .gdn_state_mut(li)
+                            .expect("GDN state slot が未初期化");
+                        crate::cuda::chain_gdn_prefill_q4(
+                            &g.qkv_w,
+                            &g.gate_w,
+                            &g.out_w,
+                            &buf_beta,
+                            &buf_alpha,
+                            &g.conv1d,
+                            &g.ssm_a,
+                            &g.ssm_dt,
+                            &g.ssm_norm,
+                            &buf_h,
+                            n,
+                            p.n_k_heads,
+                            p.n_v_heads,
+                            p.head_k_dim,
+                            p.head_v_dim,
+                            p.d_conv,
+                            p.eps,
+                            1.0 / (p.head_k_dim as f32).sqrt(),
+                            conv,
+                            ssm,
+                            &mut buf_out,
+                            li,
+                            kv_id,
+                        )
+                        .is_some()
+                    };
+                    #[cfg(not(feature = "cuda"))]
+                    let gdn_chained = false;
+                    if !gdn_chained {
+                        self.lin(crate::prof::QKV, || {
+                            g.qkv_w.apply_bt_rows_into(&buf_h, n, &mut buf_qkv)
+                        });
+                        self.lin(crate::prof::QKV, || {
+                            g.gate_w.apply_bt_rows_into(&buf_h, n, &mut buf_z)
+                        });
+                    }
                     // スキャン: GPU カーネル 1 発 (P19-A1・cuda 有効時)。GDN は
                     // bit 一致不要のため GPU/CPU で数値は僅かに異なる (決定論は維持)。
                     // GPU 無効時はトークン逐次 (再帰状態) にフォールバック。
@@ -1425,8 +1470,10 @@ impl Qwen35 {
                     // 活性化の往復 (D2H 47MB + H2D 47MB / 層) を消す。数値は従来と同一
                     // (同じ量子化カーネル + 同一 int8 GEMM)。前提が揃わないときは下の
                     // 従来経路へそのまま落ちる。
+                    // s164: `gdn_chained` が真なら buf_out は既にデバイス経路で埋まって
+                    // いるので、スキャンも o_proj も走らせない (`||` の短絡)。
                     #[cfg(feature = "cuda")]
-                    let dev_ok = {
+                    let dev_ok = gdn_chained || {
                         let p = &self.gdn_p;
                         match g.out_w.quant8() {
                             Some(ow) if n > 1 && p.head_k_dim == p.head_v_dim => {

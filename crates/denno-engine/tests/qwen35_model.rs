@@ -249,6 +249,8 @@ fn gdn_gpu_scan_close_to_cpu() {
         d_conv,
         p.eps,
         1.0 / (dk as f32).sqrt(),
+        0, // li (s164: gdn_scan_batch の層番号 — 状態正本のキー)
+        1, // kv (同・KV キャッシュ ID)
     )
     .expect("GPU スキャンが None (GPU 未初期化?)");
 
@@ -366,6 +368,8 @@ fn gdn_gpu_chunked_scan_close_to_cpu() {
             d_conv,
             p.eps,
             1.0 / (dk as f32).sqrt(),
+            0, // li (s164: gdn_scan_batch の層番号 — 状態正本のキー)
+            1, // kv (同・KV キャッシュ ID)
         )
         .expect("GPU スキャンが None (GPU 未初期化?)");
         (ys, conv_g, ssm_g)

@@ -32,10 +32,28 @@ grow-only のため、プロンプト長そのままの m を渡すと VRAM が�
   行タイル 1024 で処理するので中間バッファはタイル分のみ。
 - `Q4_M_TILE` 256 → 1024 (sync 回数が 1/4)。
 
+## 変更 (s164・GDN 層)
+
+- `chain_gdn_prefill_q4` を追加 (`cuda.rs`)。GDN 層を
+  qkv/z 投影 → GDN chunk scan (3 launch) → o_proj までデバイス常駐で通し、
+  D2H は o_proj の 1 回だけにする。qkv/z の GEMM 出力は GDN スクラッチ
+  (`GDN_SCRATCH.q` / `.z`) へ直接書き、y もデバイス上に残す。
+- 入力の出所だけを差し替える `GdnScanSrc` (Host / Dev) を導入。カーネル・
+  grid・引数・chunk 分割 `plan(n)` は従来と同一。
+- beta/alpha は従来どおりホストで計算した値を使う (n*nv*4 x2 = 5 MB なので
+  往復は消していない)。GDN 状態の契約 (`gdn_state_begin` / `commit` /
+  `gdn_host_writeback`) も不変。
+- 発動条件: qkv_w / gate_w / out_w がすべて q4・形が一致・
+  `n >= GDN_CHUNK_MIN_TOKENS` (2048)・`dk == dv`・`d_conv == 4`・
+  端数タイルが `max_m()` 超 (per-op 経路が GEMV に落ちる形では発動しない)。
+  それ以外は None → 従来経路へそのままフォールバック。
+
 ビット一致の根拠:
 - q4 GEMM は per-op 経路と**同一カーネル・同一グリッド・同一引数**
   (`dno_gemm_q4_0`)。行ごとに独立なので m の分割は 1 行の累積順を変えない。
 - swiglu は `dno_swiglu` (CPU の `g/(1+exp(-g))*u` と同一演算列)。
+- GDN スキャンは **n を分割しない** (chunk 分割は状態の持ち越しで決まるため、
+  行タイルに割ると `plan(n)` が変わって数値が変わる)。
 
 ## 計測プロトコル (prefill)
 
@@ -61,9 +79,13 @@ python3 scripts/prefill_bench.py 65000 2   # 12,850 token 相当
 
 ## 残り
 
-1. qkv / o_proj / GDN 投影 (`qkv_w` / `o_w` / `gate_w`(GDN) / `beta_w` /
-   `alpha_w`) はまだ 1 回ごとに往復している。同じ形で繋げば 13k で
-   60〜70 s 台の見込み。残りは約 2/3。
+1. ~~qkv / o_proj / GDN 投影 (`qkv_w` / `o_w` / `gate_w`(GDN) / `beta_w` /
+   `alpha_w`) はまだ 1 回ごとに往復している。~~ s164 で q4 の GDN 層
+   (qkv/z → scan → o_proj) は常駐化した。**未計測** — 期待値は
+   13k prefill 97 s → 70 s 前後 (要 GPU 実測)。残っているのは
+   - full attention 層の q/k/v → attention → o_proj (ホスト経由)
+   - beta/alpha のホスト計算と H2D (5 MB/層)
+   - embed の H2D と logits の D2H
 2. 層の入力 (buf_h) と出力 (buf_out) をデバイスに留めれば、層をまたぐ
    往復も消せる (最終的に残るのは embed の H2D と logits の D2H だけ)。
 3. アンカー (9B int8) は本変更が Q4 重み専用経路のため未実行。
