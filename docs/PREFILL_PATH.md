@@ -323,3 +323,53 @@ prefill が token 数に線形になった今、残るコストは q4 GEMM の�
 - 13k token の launch 回数 (live 経路): 1024 → 3,856 / 2048 → 2,128 /
   4096 → 1,264。発行重み量は 173.5 GB → 54.5 GB (3.2x 減)。**未計測** —
   A/B 手順は `REPORT_P7.md` の 6 節。
+
+## s171 (P11): 往復は減らせない (新カーネル無しでは) — ホスト仕事を 2 つ削る
+
+### 結論: P9 の候補 ①②③ は 3 つとも新カーネル (.cu + PTX) が前提
+
+| 候補 | 消えるもの @12,850 | 期待 | 必要なカーネル |
+|---|---|---|---|
+| ① GDN beta/alpha のデバイス化 | ホスト 8.06 s + D2H 12.6 GB + 48 sync | 8.4〜9.4 s | f32 行バッチ matvec (`dno_matvec_f32` は m=1 専用) |
+| ② att sigmoid ゲートの n 行版 | D2H 4.9 GB + H2D 4.9 GB + 16 sync | 0.7〜1.2 s | `dno_attn_gate_mul` の行版 |
+| ③ q の QK-Norm+RoPE のデバイス化 | D2H 4.75 GB + H2D 4.9 GB | 0.6〜1.3 s | head 単位 rmsnorm + 行版 rope (`dno_qknorm_rope_pi` は 1 token) |
+
+制約 (.cu 不触・PTX 再生成なし) では 3 つとも入れられない。**しかもこの開発
+コンテナには nvcc/ptxas が無い**ので、PTX を新規生成する手段自体が無い。
+カーネル本体・継ぎ目・PTX 再生成コマンド・VRAM 見積りは `REPORT_P11.md` §4 に
+確定させた (次セッションは .cu 1 本 + PTX 再生成 1 回で入る。PTX が古い間は
+`module_get_function` 失敗 → `None` で今日の経路 = fail-closed)。
+
+### 入れたもの (既存 PTX のみ・数値不変)
+
+1. **RoPE の cos/sin 表をリクエスト先頭で 1 回だけ作る** (`rope_pi_tab_rows` /
+   `rope_partial_interleaved_tab` / `full_attn_rope_tab`)。角度は (pos, d) だけで
+   決まり head に依存しないので、27B では 1 token・1 full 層あたり
+   `(24+4) × 32 = 896` 回の powf/cos/sin のうち **28 倍が重複**していた。
+   このコンテナ実測 8.86 µs/token/層 → **1.82 s の CPU 仕事**が消える
+   (prepare は行並列なので wall は 1/N・表の生成は 4 ms / 3.3 MB)。
+   `DENNO_PF_ROPE_TAB=0` で従来に戻る (**既定 ON**・表の値は on-the-fly と
+   ビット一致なので速度だけのスイッチ)。テスト 2 本が bit 一致を固定。
+2. **GDN の h2 → beta/alpha の重複 memcpy を削除**。`apply_bt_rows_into` は
+   読み取り専用なので、chain が D2H したスライスを直接渡す。12.6 GB/req の
+   ホスト memcpy (≈0.30 s) が消える。旧コメントの「GEMM の裏で走る」は
+   `DENNO_PF_OVERLAP=1` のときだけで、既定 (OFF) では直列だった。
+
+### 往復バイトで消せる残り (新カーネル不要・未実装)
+
+- full 層の **v ミラー H2D → D2D**。v は prepare で変換されないのに
+  「D2H → ホスト KV → ミラー H2D」と往復している (4,096 B/token/層 =
+  **843 MB @12,850 / 16 コピー**)。`CH_QKV` の v 領域 = `buf_v` なので、
+  `with_mirror` の v 行アップロードを D2D に置き換えれば消える
+  (`have`/`len` 帳簿に触るので専用 variant が安全)。
+- norm w の層ごと H2D 2 回 → デバイス常駐 (2.6 MB / 128 コピー/req)。
+- 末尾の `chain_download_at` 2 回 → 1 sync。
+
+### PF_DBG の読み方 (どの位相が最大か・ESTIMATED)
+
+形状から見た MAC 数は FFN が全体の 70 % (gate+up だけで 47 %) なので、
+**`sl_lay_ffn_gate` が最大**、次が `sl_lay_gdn_proj` (h2 D2H + ホスト beta/alpha +
+qkv/z GEMM を含む唯一の「ホスト待ち込み」バケット)、その次が `sl_lay_ffn_down`。
+`sl_lay_gdn_proj` が 300 ms/層超なら候補①が最大 (8.4〜9.4 s)、60 ms/層前後なら
+P4 の見積りが正しく ②③ を先にする。RoPE 表の効果は `sl_lay_full_core` の
+`DENNO_PF_ROPE_TAB=1` / `=0` 比較で読める。詳細は `REPORT_P11.md` §3。

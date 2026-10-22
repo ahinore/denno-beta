@@ -218,6 +218,44 @@ fn rope_partial_interleaved(
     }
 }
 
+/// s171 (P11): prefill 用の cos/sin 表 (1 リクエストで 1 回だけ作る)。
+///
+/// `rope_partial_interleaved` は (head, d) ごとに `theta.powf(-2d/n_rot)` と
+/// cos/sin を計算し直す。角度は **(pos, d) だけで決まり head に依存しない** ので、
+/// 27B (heads=24 + kv_heads=4, n_rot=64) では 1 token・1 層あたり 28 × 32 = 896 回の
+/// 超越関数呼び出しのうち **28 倍が重複**している。この開発コンテナの実測で
+/// q+k の rope は 8.86 µs/token/層 → 16 full 層 × 12,850 token で 1.82 s の CPU 仕事
+/// (prefill の prepare は rayon で行並列なので wall はその 1/N)。
+///
+/// 表は行 i = `pos0 + i` の `[cos(n_rot/2) | sin(n_rot/2)]` で、値は
+/// [`q35_rope_pi_table`] と同一式・同一順 (f32) で作る。**表引きは on-the-fly と
+/// ビット一致**する (テスト `rope_pi_tab_rows_bit_exact` が全 d・複数 pos で固定)。
+fn rope_pi_tab_rows(pos0: usize, n: usize, n_rot: usize, theta: f32) -> Vec<f32> {
+    let mut tab = vec![0.0f32; n * n_rot];
+    for i in 0..n {
+        tab[i * n_rot..(i + 1) * n_rot].copy_from_slice(&q35_rope_pi_table(pos0 + i, n_rot, theta));
+    }
+    tab
+}
+
+/// s171 (P11): [`rope_partial_interleaved`] の表引き版。回転の演算列 (mul/sub のみ・
+/// 左から順) は同一で、cos/sin を表から読むだけ — 値が同じなのでビット一致。
+/// `tab` は 1 行 `n_rot` 要素 (`[cos | sin]`)。
+fn rope_partial_interleaved_tab(x: &mut [f32], heads: usize, dh: usize, n_rot: usize, tab: &[f32]) {
+    let half = n_rot / 2;
+    for h in 0..heads {
+        let base = h * dh;
+        for d in 0..half {
+            let c = tab[d];
+            let s = tab[half + d];
+            let x1 = x[base + 2 * d];
+            let x2 = x[base + 2 * d + 1];
+            x[base + 2 * d] = x1 * c - x2 * s;
+            x[base + 2 * d + 1] = x1 * s + x2 * c;
+        }
+    }
+}
+
 impl Qwen35 {
     pub fn load(dir: &Path, cfg: &serde_json::Value, quant: QuantMode) -> Result<Self> {
         // text_config を優先 (0.8B は VLM ラッパ形式)
@@ -761,6 +799,15 @@ impl Qwen35 {
         rope_partial_interleaved(k, self.kv_heads, dh, self.n_rot, pos, self.theta);
     }
 
+    /// s171 (P11): [`Self::full_attn_rope`] の表引き版。`tab` は 1 行
+    /// `[cos(n_rot/2) | sin(n_rot/2)]` (`rope_pi_tab_rows` の pos 行)。
+    /// 値・演算列は同一なので出力はビット一致。
+    fn full_attn_rope_tab(&self, qout: &mut [f32], k: &mut [f32], tab: &[f32]) {
+        let dh = self.dh;
+        rope_partial_interleaved_tab(qout, self.heads, dh, self.n_rot, tab);
+        rope_partial_interleaved_tab(k, self.kv_heads, dh, self.n_rot, tab);
+    }
+
     /// full attention の 1 head 分: scores (QK ドット・k 昇順の逐次累積) → softmax
     /// → probs@V (d 昇順の逐次累積) → sigmoid 出力ゲート。読み取り専用 (kcr/vcr は
     /// キャッシュ KV 行・q は prepare 済・qg はゲート部参照) で結果を att_head [dh]
@@ -830,6 +877,10 @@ impl Qwen35 {
         buf_v: &mut Vec<f32>,
         buf_q: &mut Vec<f32>,
         buf_att: &mut Vec<f32>,
+        // s171 (P11): リクエスト先頭で 1 回だけ作った cos/sin 表
+        // (`rope_pi_tab_rows`・行 i = pos0+i)。None なら従来の on-the-fly rope。
+        // 値は同一 (ビット一致) なので、Some でも数値経路は変わらない。
+        rope_tab: Option<&[f32]>,
         qkv_precomputed: bool,
     ) -> bool {
         let heads = self.heads;
@@ -883,7 +934,16 @@ impl Qwen35 {
                     .enumerate()
                     .for_each(|(i, (((((q_r, qg_i), k_i), v_i), k_row), v_row))| {
                         let mut kn = self.full_attn_qknorm(fl, qg_i, k_i, q_r);
-                        self.full_attn_rope(q_r, &mut kn, pos0 + i);
+                        // s171 (P11): cos/sin は (pos, d) だけで決まるので、表が
+                        // あれば表引きにする (値・演算列は on-the-fly と同一)。
+                        match rope_tab {
+                            Some(t) => self.full_attn_rope_tab(
+                                q_r,
+                                &mut kn,
+                                &t[i * self.n_rot..(i + 1) * self.n_rot],
+                            ),
+                            None => self.full_attn_rope(q_r, &mut kn, pos0 + i),
+                        }
                         k_row.copy_from_slice(&kn);
                         v_row.copy_from_slice(v_i);
                     });
@@ -1485,6 +1545,23 @@ impl Qwen35 {
         // 持たない。
         let ff = self.ff;
 
+        // s171 (P11): full 層の RoPE 用 cos/sin 表を**リクエスト先頭で 1 回だけ**作る。
+        // 角度は (pos, d) だけで決まり head にも層にも依存しないので、層ループの
+        // 中で (head, d) ごとに powf/cos/sin を回す必要はない。値は
+        // `q35_rope_pi_table` と同一式・同一順なので表引きはビット一致。
+        // `DENNO_PF_ROPE_TAB=0` で従来の on-the-fly 計算に戻る (既定 ON)。
+        let rope_tab: Vec<f32> = if rope_tab_enabled() {
+            rope_pi_tab_rows(pos0, n, self.n_rot, self.theta)
+        } else {
+            Vec::new()
+        };
+        // 形が合わない (n=0・n_rot=0 など) ときは表を使わない = 従来経路。
+        let rope_tab_ref: Option<&[f32]> = if n > 0 && rope_tab.len() == n * self.n_rot {
+            Some(&rope_tab)
+        } else {
+            None
+        };
+
         // s63: 層をまたいで再利用する作業バッファ (prefill 経路のみ)。
         // 旧実装は層ごとに `apply_bt_rows` が m*n*4B の Vec を**新規確保**して
         // 返していた (ff の gate/up は n=5692 で 279MB、qkv/down/o_proj は 93MB)。
@@ -1549,7 +1626,6 @@ impl Qwen35 {
                     pos0,
                     n,
                     pending,
-                    &mut buf_h,
                     &mut buf_qg,
                     &mut buf_k,
                     &mut buf_v,
@@ -1557,6 +1633,7 @@ impl Qwen35 {
                     &mut buf_att,
                     &mut buf_beta,
                     &mut buf_alpha,
+                    rope_tab_ref,
                 ) {
                     Ok(Some(next)) => {
                         pending = Some(next);
@@ -1833,6 +1910,23 @@ impl Qwen35 {
                     // s165 (P2): q/k/v 投影 → QK-Norm/RoPE/KV 書き込み → attend は
                     // `full_attn_host_side` に切り出した (中身は従来のこの分岐そのもの・
                     // 演算順も不変)。残差常駐経路も同じコードを通す。
+                    // s169 (P10): q|k|v の連結重みを parts の行範囲として**先に**
+                    // 割り当てる。ホスト経路の q/k/v 投影は `apply_bt_rows_into` の
+                    // per-op GPU 経路 (maybe_gpu_linear_q4_into) を通りうるので、
+                    // 登録が無いと q/k/v が**個別に** VRAM へ載り、以降 decode chain は
+                    // 連結重みを使えない (実測: full 16 層が 3 発ずつのまま = 289 発)。
+                    // 個別に載っている場合は登録しない (VRAM を 2 重にしない)。
+                    #[cfg(feature = "cuda")]
+                    if crate::cuda::q4_chain_enabled() {
+                        if let Some(f) = layer.qkv_fused.as_ref() {
+                            if !crate::cuda::q4_any_resident(&[&fl.q_w, &fl.k_w, &fl.v_w]) {
+                                crate::cuda::q4_register_row_alias(
+                                    f,
+                                    &[&fl.q_w, &fl.k_w, &fl.v_w],
+                                );
+                            }
+                        }
+                    }
                     let _att_done = self.full_attn_host_side(
                         fl,
                         cache,
@@ -1845,6 +1939,7 @@ impl Qwen35 {
                         &mut buf_v,
                         &mut buf_q,
                         &mut buf_att,
+                        rope_tab_ref,
                         false,
                     );
                     self.lin(crate::prof::OPROJ, || {
@@ -2089,7 +2184,6 @@ impl Qwen35 {
         pos0: usize,
         n: usize,
         pending: Option<usize>,
-        buf_h: &mut Vec<f32>,
         buf_qg: &mut Vec<f32>,
         buf_k: &mut Vec<f32>,
         buf_v: &mut Vec<f32>,
@@ -2097,6 +2191,8 @@ impl Qwen35 {
         buf_att: &mut Vec<f32>,
         buf_beta: &mut Vec<f32>,
         buf_alpha: &mut Vec<f32>,
+        // s171 (P11): full 層の RoPE 用 cos/sin 表 (行 i = pos0+i・None なら従来)。
+        rope_tab: Option<&[f32]>,
     ) -> Result<Option<usize>> {
         use crate::cuda;
         let e = self.e;
@@ -2214,16 +2310,16 @@ impl Qwen35 {
                     li,
                     kv_id,
                     |h2, beta, alpha| {
-                        // 従来と同じ作業バッファへ写してから計算する (フラグ OFF の
-                        // 実行経路を今日と 1 命令も変えないため。ON 経路ではこの写しも
-                        // qkv/z GEMM の裏で走るので直列コストにならない)。
-                        fit_prefill_buf(buf_h, n * e);
-                        buf_h.copy_from_slice(h2);
+                        // s171 (P11): h2 は chain が D2H したスライスそのもの。
+                        // 従来は同じ内容を `buf_h` へ写してから投影していたが、写しは
+                        // 数値に寄与しない (`apply_bt_rows_into` は読み取りのみ) ので
+                        // 直接渡す。12,850 token × 48 層 × 5120 × 4B = 12.6 GB/req の
+                        // ホスト memcpy が消える (P9 の実測単価で ≈0.30 s)。
                         crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                            g.beta_w.apply_bt_rows_into(&buf_h[..], n, beta)
+                            g.beta_w.apply_bt_rows_into(h2, n, beta)
                         });
                         crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                            g.alpha_w.apply_bt_rows_into(&buf_h[..], n, alpha)
+                            g.alpha_w.apply_bt_rows_into(h2, n, alpha)
                         });
                         Some(())
                     },
@@ -2252,7 +2348,8 @@ impl Qwen35 {
                 // att の H2D までが full_core の区間 (GPU は遊ぶ = 区間に入る)。
                 cuda::pf_phase(cuda::PF_PH_FULL_CORE);
                 let _att_done = self.full_attn_host_side(
-                    fl, cache, li, pos0, n, &[], buf_qg, buf_k, buf_v, buf_q, buf_att, true,
+                    fl, cache, li, pos0, n, &[], buf_qg, buf_k, buf_v, buf_q, buf_att, rope_tab,
+                    true,
                 );
                 // attention 出力 (sigmoid ゲート済み・CH_ATT の生値ではない) を
                 // 1 回だけアップロードして、o_proj をデバイスで回す
@@ -2291,6 +2388,14 @@ impl Qwen35 {
 }
 
 // ---------------------------------------------------------------------------
+/// s171 (P11): prefill の RoPE cos/sin 表を共有するか (既定 ON)。
+/// `DENNO_PF_ROPE_TAB=0` で従来の on-the-fly 計算に戻る。表の値は on-the-fly と
+/// 同一 (ビット一致) なので、このスイッチは**速度だけ**を切り替える。
+fn rope_tab_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DENNO_PF_ROPE_TAB").ok().as_deref() != Some("0"))
+}
+
 /// s63: prefill の作業バッファを必要長に合わせる。長さが一致していれば再確保も
 /// ゼロ埋めもしない (形状はモデルで固定なので層をまたいで同じ長さになる)。
 fn fit_prefill_buf(v: &mut Vec<f32>, len: usize) {
@@ -2856,6 +2961,81 @@ mod tests {
 
     use super::*;
     use std::path::PathBuf;
+
+    /// s171 (P11): prefill の RoPE 表 (`rope_pi_tab_rows` +
+    /// `rope_partial_interleaved_tab`) が on-the-fly と **ビット一致**すること。
+    /// 角度は (pos, d) だけで決まる (head に依存しない) ので、表引きにしても
+    /// 値は変わらない — これを全 d・複数 pos で固定する。
+    #[test]
+    fn rope_pi_tab_rows_bit_exact() {
+        let (dh, n_rot, theta) = (256usize, 64usize, 5_000_000.0f32);
+        let (heads, kv_heads) = (24usize, 4usize);
+        // 1) 表の行は q35_rope_pi_table (= GPU decode 経路が使う表) と同一
+        for &pos0 in &[0usize, 1, 7, 1_023, 12_849] {
+            let tab = rope_pi_tab_rows(pos0, 3, n_rot, theta);
+            for i in 0..3 {
+                assert_eq!(
+                    &tab[i * n_rot..(i + 1) * n_rot],
+                    &q35_rope_pi_table(pos0 + i, n_rot, theta)[..],
+                    "pos {} の表が q35_rope_pi_table と不一致",
+                    pos0 + i
+                );
+            }
+        }
+        // 2) 回転結果が on-the-fly と bit 一致 (q/k の全 head・全 d)
+        for &pos in &[0usize, 1, 3, 511, 4_096, 12_849] {
+            let mut q0: Vec<f32> = (0..heads * dh)
+                .map(|i| (i as f32 * 0.017).sin() * 0.5 + 0.25)
+                .collect();
+            let mut k0: Vec<f32> = (0..kv_heads * dh)
+                .map(|i| (i as f32 * 0.031).cos() * 0.5 - 0.125)
+                .collect();
+            let (mut q1, mut k1) = (q0.clone(), k0.clone());
+            let (q_orig, k_orig) = (q0.clone(), k0.clone());
+            rope_partial_interleaved(&mut q0, heads, dh, n_rot, pos, theta);
+            rope_partial_interleaved(&mut k0, kv_heads, dh, n_rot, pos, theta);
+            let tab = rope_pi_tab_rows(pos, 1, n_rot, theta);
+            rope_partial_interleaved_tab(&mut q1, heads, dh, n_rot, &tab);
+            rope_partial_interleaved_tab(&mut k1, kv_heads, dh, n_rot, &tab);
+            assert_eq!(bits(&q0), bits(&q1), "pos {pos}: q の rope が不一致");
+            assert_eq!(bits(&k0), bits(&k1), "pos {pos}: k の rope が不一致");
+            // 3) 契約の再確認: d >= n_rot は無回転 (表引きでも同じ)
+            for h in 0..heads {
+                for d in n_rot..dh {
+                    assert_eq!(q0[h * dh + d].to_bits(), q_orig[h * dh + d].to_bits());
+                }
+            }
+            for h in 0..kv_heads {
+                for d in n_rot..dh {
+                    assert_eq!(k0[h * dh + d].to_bits(), k_orig[h * dh + d].to_bits());
+                }
+            }
+        }
+    }
+
+    /// s171 (P11): モデル実体の heads / kv_heads / dh / n_rot / theta で、
+    /// `full_attn_rope` (on-the-fly) と `full_attn_rope_tab` (表引き) が一致すること。
+    #[test]
+    fn qwen38_27b_shape_full_attn_rope_tab_bit_exact() {
+        let dir = build_dir("ropetab", true, NK, NV);
+        let m = load_int8(&dir);
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / 16_777_216.0 - 0.5
+        };
+        for &pos in &[0usize, 5, 257, 3_000] {
+            let mut q0: Vec<f32> = (0..m.heads * m.dh).map(|_| rnd()).collect();
+            let mut k0: Vec<f32> = (0..m.kv_heads * m.dh).map(|_| rnd()).collect();
+            let (mut q1, mut k1) = (q0.clone(), k0.clone());
+            m.full_attn_rope(&mut q0, &mut k0, pos);
+            let tab = rope_pi_tab_rows(pos, 1, m.n_rot, m.theta);
+            m.full_attn_rope_tab(&mut q1, &mut k1, &tab);
+            assert_eq!(bits(&q0), bits(&q1), "pos {pos}: q が不一致");
+            assert_eq!(bits(&k0), bits(&k1), "pos {pos}: k が不一致");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// s123: Q4_0 同士の gate+up 行連結は、2 回に分けて適用した結果と一致する
     /// (行順 [gate 全行 | up 全行]・ブロックは行ごとに独立)。

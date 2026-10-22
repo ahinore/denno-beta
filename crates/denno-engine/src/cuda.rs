@@ -673,10 +673,22 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_swiglu_int, module_elem, b"dno_swiglu_int\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_swiglu_int)",
             )?;
-            check(
-                (lib.module_get_function)(&mut f_addnorm, module_elem, b"dno_add_rmsnorm\0".as_ptr() as *const c_char),
-                "cuModuleGetFunction(dno_add_rmsnorm)",
-            )?;
+            // s170: DENNO_FAST_REDUCE=1 なら二乗和を固定木で並列縮約する版を使う
+            // (引数・動的 smem は同一。丸め順だけが変わる)。PTX に無ければ逐次版へ戻す。
+            if fast_reduce_enabled()
+                && (lib.module_get_function)(
+                    &mut f_addnorm,
+                    module_elem,
+                    b"dno_add_rmsnorm_r\0".as_ptr() as *const c_char,
+                ) == 0
+            {
+                // 並列版を取得できた
+            } else {
+                check(
+                    (lib.module_get_function)(&mut f_addnorm, module_elem, b"dno_add_rmsnorm\0".as_ptr() as *const c_char),
+                    "cuModuleGetFunction(dno_add_rmsnorm)",
+                )?;
+            }
             check(
                 (lib.module_get_function)(&mut f_expf, module_elem, b"dno_expf_probe\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_expf_probe)",
@@ -707,6 +719,14 @@ impl CudaCtx {
                 }
             }
             ATTN_PF_DYN_SMEM.store(attn_pf_dyn_smem, std::sync::atomic::Ordering::Relaxed);
+            // s169 (P10): SM 数を 1 回だけ取る (GEMV の launch 形状を n から選ぶ
+            // ためだけに使う。取れなければ 0 のまま = 形状選択は従来の固定 C)。
+            if let Some(dev_attr) = lib.device_get_attribute {
+                let mut sms: c_int = 0;
+                if (dev_attr)(&mut sms, CU_DEV_ATTR_MULTIPROCESSOR_COUNT, dev) == 0 && sms > 0 {
+                    GEMV_SM_COUNT.store(sms as usize, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             let mut f_rope: CUfunction = std::ptr::null_mut();
             check(
                 (lib.module_get_function)(&mut f_rope, module_elem, b"dno_rope_qkv\0".as_ptr() as *const c_char),
@@ -2403,11 +2423,19 @@ struct DecodeDbg {
     launches: DbgTally,
     h2d: DbgTally,
     d2h: DbgTally,
+    /// s169 (P10): Q4 GEMV の (n, C) 別の件数。key = (n << 4) | C。
+    gemv: DbgTally,
 }
 
 thread_local! {
     static DECODE_DBG: std::cell::RefCell<DecodeDbg> =
-        std::cell::RefCell::new(DecodeDbg { steps: 0, launches: Vec::new(), h2d: Vec::new(), d2h: Vec::new() });
+        std::cell::RefCell::new(DecodeDbg {
+            steps: 0,
+            launches: Vec::new(),
+            h2d: Vec::new(),
+            d2h: Vec::new(),
+            gemv: Vec::new(),
+        });
 }
 
 /// カーネル 1 発を数える (`CudaCtx::launch_async` の入口から)。
@@ -2415,6 +2443,16 @@ thread_local! {
 fn dbg_launch(f: CUfunction) {
     if decode_dbg_on() {
         DECODE_DBG.with(|d| dbg_bump(&mut d.borrow_mut().launches, f as usize));
+    }
+}
+
+/// s169 (P10): Q4 GEMV 1 発の (出力行数 n, 列ブロック幅 C) を数える。
+/// launch 形状の選択 (`DENNO_GEMV_SHAPE`) がどの投影に効いたかを、GPU 無しでも
+/// 実機の stderr から読めるようにするための観測のみ (OFF は分岐 1 回)。
+#[inline]
+fn dbg_gemv_shape(n: usize, c: usize) {
+    if decode_dbg_on() {
+        DECODE_DBG.with(|d| dbg_bump(&mut d.borrow_mut().gemv, (n << 4) | (c & 0xf)));
     }
 }
 
@@ -2548,6 +2586,16 @@ fn dbg_fmt_bytes(t: &DbgTally) -> String {
         .join(",")
 }
 
+/// s169 (P10): `n/C × count` を n の大きい順に並べた文字列 (Q4 GEMV の形状内訳)。
+fn dbg_fmt_gemv(t: &DbgTally) -> String {
+    let mut v: Vec<(usize, u64)> = t.to_vec();
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v.iter()
+        .map(|(k, c)| format!("{}/c{}x{}", k >> 4, k & 0xf, c))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// ステップ開始: 前のステップ (や prefill) で積んだ分を捨てる。
 fn decode_dbg_reset() {
     if !decode_dbg_on() {
@@ -2558,6 +2606,7 @@ fn decode_dbg_reset() {
         d.launches.clear();
         d.h2d.clear();
         d.d2h.clear();
+        d.gemv.clear();
     });
 }
 
@@ -2587,9 +2636,14 @@ fn decode_dbg_flush() {
             dbg_fmt_bytes(&d.h2d),
             dbg_fmt_bytes(&d.d2h)
         );
+        // s169 (P10): Q4 GEMV の (n, C) 内訳。形状選択が効いた投影がここで判る。
+        if !d.gemv.is_empty() {
+            eprintln!("[DECODE_DBG]   gemv=[{}]", dbg_fmt_gemv(&d.gemv));
+        }
         d.launches.clear();
         d.h2d.clear();
         d.d2h.clear();
+        d.gemv.clear();
     });
 }
 
@@ -3140,6 +3194,13 @@ fn q4_resident(uid: u64) -> bool {
         Ok(m) => m.contains_key(&uid),
         Err(_) => true,
     }
+}
+
+/// s169 (P10): `parts` のどれかが既に VRAM へ載っているか (**照会のみ・転送しない**)。
+/// ホスト prefill 経路の q|k|v 連結エイリアス登録で「載る前に登録する」順序を
+/// 守るために使う (載っているなら登録しない = VRAM を 2 重にしない)。
+pub fn q4_any_resident(parts: &[&crate::quant::Linear]) -> bool {
+    parts.iter().filter_map(|p| q4_of(p)).any(|p| q4_resident(p.uid))
 }
 
 /// s123: [n,k] の Q4_0 ブロック (1 ブロック 18B) を VRAM へ上げる。
@@ -3749,7 +3810,8 @@ fn q4_dispatch_tile(
                 // 読み、C 列ぶんの重みに使い回す。行ごとの累積順は 1 行 1 block
                 // 経路と同一なので m = 1 もビット一致。
                 // grid.x は 8*C 列を 1 ブロックで受ける形。
-                let c = q4_gemv_c();
+                // s169 (P10): C は n から選ぶ (`DENNO_GEMV_SHAPE`。既定 0 = 従来)。
+                let c = gemv_c_for_n(n, gemv_sm_count(), gemv_shape_mode(), q4_gemv_c());
                 let f_c = fc[q4_gemv_c_index(c)];
                 let cols = 8 * c;
                 let grid = (n.div_ceil(cols) as u32, m as u32, 1);
@@ -4262,6 +4324,74 @@ const CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
 const CU_DEV_ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: c_int = 97;
 static ATTN_PF_DYN_SMEM: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(ATTN_PF_SMEM_DEFAULT);
+
+/// s169 (P10): デバイスの SM 数 (GEMV の launch 形状を n から選ぶため)。
+/// CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT。取得できなければ 0 のまま =
+/// 形状選択は従来どおりの固定 C に落ちる (数値・発行順は不変)。
+const CU_DEV_ATTR_MULTIPROCESSOR_COUNT: c_int = 16;
+static GEMV_SM_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// s169 (P10): SM 数 (0 = 不明)。`DENNO_GEMV_SHAPE` の形状選択だけが読む。
+pub fn gemv_sm_count() -> usize {
+    GEMV_SM_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// s169 (P10): GEMV の列ブロック幅 C の選び方 (`DENNO_GEMV_SHAPE`)。
+///   0 (既定) = 従来どおり `q4_gemv_c()` の固定 C
+///   1 = n が小さい投影 (block 数が SM 数に対して足りない) だけ C=2
+///   2 = 常に C=2
+///   3 = 小さい投影は C=2 / 大きい投影は C=8 / 中間は固定 C
+/// どの値でも**列 (出力行) ごとの k 方向の縮約順は不変** — C は 1 block が
+/// 何列をまとめて受けるかだけを変える (既存テスト
+/// `cuda_q4_gemv_cols_matches_single_row` が c2/c4/c8 の bit 一致を検証している)。
+fn gemv_shape_mode() -> u32 {
+    static MODE: OnceLock<u32> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("DENNO_GEMV_SHAPE").ok().and_then(|v| v.parse::<u32>().ok()) {
+            Some(m @ (1 | 2 | 3)) => m,
+            _ => 0,
+        }
+    })
+}
+
+/// s169 (P10): 純関数 — n 行の Q4 GEMV を blocks = ceil(n / (8*C)) で割るときの
+/// C を選ぶ。`sm` は SM 数 (0 = 不明 → 常に `base`)。
+///
+/// 根拠: `dno_gemv_q4_0c{C}` は blockDim = 256 固定 (8 warp が 8*C 列を受ける)
+/// なので、並列度は block 数 = ceil(n / (8*C)) だけで決まる。RTX 5090
+/// (170 SM) では n = 5120 の投影が 160 block = 0.94 block/SM になり、1 SM
+/// あたり 8 warp (= 64 スロットの 12.5%) しか埋まらない。C=2 にすると同じ
+/// 重みバイト数を 2 倍の block で読む (総 DRAM バイト数は不変・列ごとの縮約順も
+/// 不変) ので、この帯だけ並列度を上げる。
+fn gemv_c_for_n(n: usize, sm: usize, mode: u32, base: usize) -> usize {
+    if sm == 0 || n == 0 {
+        return base;
+    }
+    // C=4 で 2 block/SM を割れない大きさ = 並列度が足りない帯
+    let small = 64 * sm;
+    // C=4 で 8 block/SM を超える大きさ = 十分に詰まっている帯
+    let large = 128 * sm;
+    match mode {
+        1 => {
+            if n < small {
+                2
+            } else {
+                base
+            }
+        }
+        2 => 2,
+        3 => {
+            if n < small {
+                2
+            } else if n >= large {
+                8
+            } else {
+                base
+            }
+        }
+        _ => base,
+    }
+}
 
 /// dno_attention_prefill が許容する動的 smem の上限 (bytes)。既定 48KB・
 /// CudaCtx 生成時の opt-in (cuFuncSetAttribute) 成功時はデバイスの opt-in 上限。
@@ -4879,8 +5009,15 @@ pub fn chain_linear_q4_device(
     // `q4_gemv_c()` は env を毎回読む — per-op 経路は 1 step に数回だが、chain は
     // 層ループの中で 1 step に数百回呼ばれるので、ここで 1 回だけ読んで使い回す。
     static C: OnceLock<usize> = OnceLock::new();
-    let c = *C.get_or_init(q4_gemv_c);
-    let f_c = ctx.f_mv_q4_c?[q4_gemv_c_index(c)];
+    let base_c = *C.get_or_init(q4_gemv_c);
+    // s169 (P10): 列ブロック幅 C は**投影ごと**に選ぶ (`DENNO_GEMV_SHAPE`)。
+    // 既定 0 は従来どおり全投影で同じ C = 挙動不変。C は 1 block が受ける列数
+    // だけを変えるので、列ごとの k 方向の縮約順 (lane が受けるブロック昇順 ->
+    // shfl 木) は C に依存しない = どの C でもビット一致 (c2/c4/c8 の一致は
+    // 既存テスト `cuda_q4_gemv_cols_matches_single_row` が見ている)。
+    let shape = gemv_shape_mode();
+    let sm = gemv_sm_count();
+    let fc_all = ctx.f_mv_q4_c?;
     CHAIN.with(|cell| -> Option<()> {
         let s = cell.borrow();
         let iptr = s.bufs[in_slot].as_ref()?.ptr();
@@ -4899,8 +5036,12 @@ pub fn chain_linear_q4_device(
                 &mut kc as *mut _ as *mut c_void,
                 &mut nc as *mut _ as *mut c_void,
             ];
+            // s169 (P10): 投影ごとに C を選ぶ (既定 0 は base_c = 従来と同一)。
+            let c = gemv_c_for_n(p.n, sm, shape, base_c);
+            let f_c = fc_all[q4_gemv_c_index(c)];
             let grid = (p.n.div_ceil(8 * c) as u32, m as u32, 1);
             ok(unsafe { ctx.launch_async(f_c, grid, (256, 1, 1), 0, &mut args) })?;
+            dbg_gemv_shape(p.n, c);
             off += p.n;
         }
         Some(())
@@ -13243,6 +13384,60 @@ mod p3_alias_tests {
         assert!(chain_linear_q4_fused(&fused, &[&q, &other_k], 0, 1, 1).is_none());
         // 正しい形でも GPU が無ければ None (panic しない)
         assert!(chain_linear_q4_fused(&fused, &[&q, &z], 0, 1, 1).is_none());
+    }
+
+    /// s169 (P10): GEMV の列ブロック幅 C を n から選ぶ純関数の契約。
+    /// C は「1 block が何列を受けるか」だけを変えるので、どの C でも列ごとの
+    /// k 方向の縮約順は不変 (数値は動かない)。ここで固定するのは
+    /// 「既定 (mode 0) は必ず従来の base」「SM 数不明でも base」
+    /// 「mode 1/3 の小さい投影だけ C=2」「mode 3 の大きい投影は C=8」の 3 点。
+    #[test]
+    fn gemv_shape_c_by_rows() {
+        // RTX 5090 = 170 SM (27B 本番)。small = 64*170 = 10880, large = 128*170 = 21760
+        let sm = 170usize;
+        // 27B q4 の投影行数 (実形状)
+        let rows = [1024usize, 5120, 14336, 16384, 34816, 151936];
+        // mode 0 (既定) は常に base = 従来と同一の launch 形状
+        for n in rows {
+            assert_eq!(gemv_c_for_n(n, sm, 0, 4), 4, "mode 0 は base 固定: n={n}");
+            assert_eq!(gemv_c_for_n(n, sm, 9, 4), 4, "未知 mode も base: n={n}");
+        }
+        // SM 数が取れない (0) ときは形状を変えない (fail closed)
+        assert_eq!(gemv_c_for_n(5120, 0, 1, 4), 4);
+        assert_eq!(gemv_c_for_n(5120, 0, 3, 4), 4);
+        assert_eq!(gemv_c_for_n(0, sm, 1, 4), 4, "n=0 は何もしない");
+        // mode 1: block 数が 2*SM を割る投影だけ C=2 (160 block -> 320 block)
+        assert_eq!(gemv_c_for_n(1024, sm, 1, 4), 2);
+        assert_eq!(gemv_c_for_n(5120, sm, 1, 4), 2);
+        assert_eq!(gemv_c_for_n(10880, sm, 1, 4), 4, "境界は base のまま");
+        assert_eq!(gemv_c_for_n(16384, sm, 1, 4), 4);
+        assert_eq!(gemv_c_for_n(34816, sm, 1, 4), 4);
+        // mode 2 は常に 2
+        for n in rows {
+            assert_eq!(gemv_c_for_n(n, sm, 2, 4), 2, "mode 2 は常に C=2: n={n}");
+        }
+        // mode 3 は小 2 / 中 base / 大 8
+        assert_eq!(gemv_c_for_n(5120, sm, 3, 4), 2);
+        assert_eq!(gemv_c_for_n(16384, sm, 3, 4), 4);
+        assert_eq!(gemv_c_for_n(21760, sm, 3, 4), 8);
+        assert_eq!(gemv_c_for_n(34816, sm, 3, 4), 8);
+        assert_eq!(gemv_c_for_n(151936, sm, 3, 4), 8);
+        // 選ばれた C は必ず PTX にある 3 本 (2/4/8) のどれか
+        for mode in 0..=3u32 {
+            for n in rows {
+                let c = gemv_c_for_n(n, sm, mode, 4);
+                assert!([2usize, 4, 8].contains(&c), "C={c} に対応する PTX が無い");
+                // 列を落とさない (grid.x * 8*C >= n)
+                assert!((8 * c) * n.div_ceil(8 * c) >= n);
+            }
+        }
+    }
+
+    /// s169 (P10): `DENNO_DECODE_DBG=1` の形状内訳の書式 (観測のみ)。
+    #[test]
+    fn gemv_dbg_format_lists_rows_and_c() {
+        let t: DbgTally = vec![((34816usize << 4) | 4, 64u64), ((5120usize << 4) | 2, 128u64)];
+        assert_eq!(dbg_fmt_gemv(&t), "34816/c4x64,5120/c2x128");
     }
 }
 
