@@ -7560,6 +7560,9 @@ pub const Q35_TAG_CONV: u8 = 4; // conv1d.weight [conv_dim, d_conv]
 pub const Q35_TAG_WA: u8 = 5; // ssm_a [nv]
 pub const Q35_TAG_WDT: u8 = 6; // ssm_dt.bias [nv]
 pub const Q35_TAG_WNORM: u8 = 7; // ssm_norm.weight [dv]
+/// s174 (P16): ssm_beta|ssm_alpha の**行連結** [2*nv, e] (行順 [beta | alpha])。
+/// decode chain が beta/alpha の fp32 matvec を 1 発で回すためだけのタグ。
+pub const Q35_TAG_BA: u8 = 8;
 
 /// C4: full_attention 層の CH_QKV 内 k セクション先頭 (要素オフセット)。
 /// レイアウトは [qg (heads*2dh) | k (kv_heads*dh) | v (kv_heads*dh)] —
@@ -7736,6 +7739,62 @@ fn chain_q35_ctl_f32(
             _ => (fns.f_matvec_f32, 128u32),
         };
         ok(unsafe { ctx.launch_async(func, (n as u32, 1, 1), (thr, 1, 1), 0, &mut args) })
+    })
+}
+
+/// s174 (P16): beta|alpha 制御投影を **1 発**の fp32 matvec で計算する
+/// (decode chain 専用・[`chain_q35_ctl_f32`] の 2 発を 1 発に畳んだ版)。
+///
+/// 背景: decode 1 ステップの `dno_matvec_f32` は GDN 層あたり 2 発 (beta・alpha)。
+/// 両者は**同じ入力 (CH_H)・同じ形状 (k=e, n=nv)・隣接した発行**で、出力も
+/// CH_QKV テールの連続領域 ([beta | alpha]) なので、行連結した重み 1 本
+/// ([2*nv, e] row-major) と grid=(2*nv) の 1 発で置き換えられる
+/// (48 層 x 2 発 = 96 -> 48 発/token)。
+///
+/// 数値は不変: `dno_matvec_f32` は 1 行 = 1 block で `j = blockIdx.x`・
+/// `row = w + (size_t)j*k`・`out[j] = s`、行 j の逐次縮約は他の行にも n の値にも
+/// 依存しない。行順を [beta 全行 | alpha 全行] にしても、各行の入力ベクトル・
+/// 重み行・累積順は 2 発のときと同一 = ビット一致。カーネル・引数の並び・
+/// block 数・縮約順は 1 つも変えない (grid.x の行数だけが 2 倍)。
+///
+/// `None` は「この経路を使えない」(形状不一致) — 呼び出し側が従来の 2 発に落ちる。
+/// 発行そのものの失敗も `None` で、chain 全体が失敗する (数値経路は従来と同じ
+/// fail closed)。
+fn chain_q35_ctl_f32_ba(
+    mid: u64,
+    li: usize,
+    w: &[f32],
+    k: usize,
+    n: usize,
+    out_off: usize,
+) -> Option<()> {
+    let ctx = chain_ctx()?;
+    let fns = q35_fns()?;
+    let rows = n.checked_mul(2)?;
+    if w.len() != k * rows || n == 0 || rows > 65535 {
+        return None;
+    }
+    ok(chain_ensure_buf(CH_QKV, (out_off + rows) * 4))?;
+    let wptr = q35_w_dev(mid, li, Q35_TAG_BA, w)?;
+    CHAIN.with(|cell| -> Option<()> {
+        let s = cell.borrow();
+        let hptr = s.bufs[CH_H].as_ref()?.ptr();
+        let optr = s.bufs[CH_QKV].as_ref()?.ptr() + (out_off * 4) as u64;
+        let (mut ph, mut pw, mut po) = (hptr, wptr, optr);
+        let (mut kc, mut nc) = (k as c_int, rows as c_int);
+        let mut args = [
+            &mut ph as *mut _ as *mut c_void,
+            &mut pw as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut kc as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+        ];
+        // 逐次版 / 並列版の選択は chain_q35_ctl_f32 と同一 (既定は逐次版 = bit 一致)。
+        let (func, thr) = match (fns.f_matvec_f32_r, fast_reduce_enabled()) {
+            (Some(fr), true) => (fr, 256u32),
+            _ => (fns.f_matvec_f32, 128u32),
+        };
+        ok(unsafe { ctx.launch_async(func, (rows as u32, 1, 1), (thr, 1, 1), 0, &mut args) })
     })
 }
 
@@ -8027,6 +8086,9 @@ pub fn chain_q35_gdn_scan(
     wnorm: &[f32],
     beta_w: &[f32],
     alpha_w: &[f32],
+    // s174 (P16): [beta | alpha] の行連結 [2*nv, e] (行順 [beta 全行 | alpha 全行])。
+    // `Some` かつ形状が合うときだけ beta/alpha を 1 発に畳む (`None` は従来の 2 発)。
+    ba_w: Option<&[f32]>,
     e: usize,
 ) -> Option<()> {
     let ctx = chain_ctx()?;
@@ -8053,8 +8115,18 @@ pub fn chain_q35_gdn_scan(
     ok(chain_ensure_buf(CH_ATT, vd * 4))?;
 
     // beta/alpha 制御投影 (fp32 matvec・CH_QKV テールへ)
-    chain_q35_ctl_f32(mid, li, Q35_TAG_BETA, beta_w, e, nv, conv_dim + vd)?;
-    chain_q35_ctl_f32(mid, li, Q35_TAG_ALPHA, alpha_w, e, nv, conv_dim + vd + nv)?;
+    // s174 (P16): 連結重み [beta | alpha] があれば **1 発** (grid=(2*nv))。
+    // 同じ入力 CH_H・同じ形状・隣接発行で、出力もテールの連続領域なので
+    // 1 発に畳める (行独立な逐次縮約 = ビット一致)。無ければ従来の 2 発。
+    match ba_w {
+        Some(w) if w.len() == e * 2 * nv && 2 * nv <= 65535 => {
+            chain_q35_ctl_f32_ba(mid, li, w, e, nv, conv_dim + vd)?
+        }
+        _ => {
+            chain_q35_ctl_f32(mid, li, Q35_TAG_BETA, beta_w, e, nv, conv_dim + vd)?;
+            chain_q35_ctl_f32(mid, li, Q35_TAG_ALPHA, alpha_w, e, nv, conv_dim + vd + nv)?;
+        }
+    }
 
     // s141b (Task B7c): seed の入力は **デバイス正本** から直接 D2D で取る。
     // 以前は「正本 → ホスト (D2H) → ミラー (H2D)」と、同一 GPU 内のコピーを

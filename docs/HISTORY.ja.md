@@ -3472,3 +3472,52 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
 - **数値クラス**: なし (CLI の表示経路のみ。engine の数値経路・`.cu` / `.ptx` / GPU 実行は無変更)。
 - **測っていないこと**: bench / GPU アンカー / KPI (数値経路を 1 行も変えていないため構造的に
   不変だが、測ってはいない)。8095 も触っていない。
+
+### s174: Task P16 - decode の beta|alpha fp32 matvec を 1 発に畳んだ (2026-10-23) 完了
+
+> decode 1 token の launch は `dno_gemv_q4_0c4` 257 発・`dno_add_rmsnorm` 129 発。
+> 「層内で隣接する同一形状の gemv を 1 launch にまとめる」をコードから静的に確定した結果、
+> **q4 GEMV は畳めない** (理由は下記)。畳める組は 1 つだけで、それは GDN 層の
+> beta|alpha (`dno_matvec_f32` 2 発) だった。
+
+- **静的確定 (27B q4・64 層 = 48 GDN + 16 full・decode chain 経路)**:
+  - 層あたり GDN = rmsnorm 1 + qkv|z gemv 1 + beta/alpha matvec 2 + gdn_scan 1 + o gemv 1
+    + rmsnorm 1 + gate_up gemv 1 + swiglu 1 + down gemv 1 = **10 発**。
+    full = rmsnorm 1 + q|k|v gemv 1 + qknorm_rope 2 + attn 1 + gate 1 + o gemv 1 + rmsnorm 1
+    + gate_up gemv 1 + swiglu 1 + down gemv 1 = **11 発**。
+  - token あたり = 48×10 + 16×11 + 2 (最終 norm + lm_head) = **658 発**。内訳は
+    `dno_gemv_q4_0c4` = 48×4+16×4+1 = **257**、`dno_add_rmsnorm` = 48×2+16×2+1 = **129** で、
+    監督の実測値と一致する (この数え方が正しいことの裏取り)。
+  - リクエストあたり (150 token) = 658×150 = 98,700 発。
+- **q4 GEMV を畳めない理由**: 1 層の 4 発 (qkv → o → gate_up → down) は残差ストリームの
+  **直列**で、隣り合う 2 発の間には必ず依存カーネルが 1 つ入る (qkv|o の間 = scan/attn、
+  o|gate_up の間 = `dno_add_rmsnorm` の残差加算、gate_up|down の間 = swiglu、
+  down(層 i)|qkv(層 i+1) の間 = `dno_add_rmsnorm`)。カーネルは入力ポインタ 1 本を受けるので
+  1 発にできるのは「同じ入力スロット・同じ k」の組だけ。層内で該当するのは qkv と gate_up
+  だけで、gate_up の入力 CH_H は o の残差を足した rmsnorm 出力なので直列 = 同一 launch 不可。
+  例示の q|k|v は s166 (P5) で既に 1 発 (337 → 257)。o|gate|up は形状も入力も違う
+  (o: k=vd・in=CH_ATT / gate_up: k=e・in=CH_H)。257 をさらに減らすには
+  残差加算+rmsnorm+gemv の融合 (.cu 変更) が必要で、本タスクの範囲外。
+- **実装 (畳める組 = GDN の beta|alpha)**: `GdnLayer::ba_w` にロード時 1 回だけ作る行連結
+  [2*nv, e] (行順 [beta 全行 | alpha 全行]) を持たせ (`concat_rows`)、`cuda.rs` に
+  `Q35_TAG_BA` と `chain_q35_ctl_f32_ba` を追加。同じ `dno_matvec_f32`・同じ引数の並び・
+  同じ block (128 / `DENNO_FAST_REDUCE=1` なら 256) で、grid.x だけ n → 2n。
+  `chain_q35_gdn_scan` は ba_w があり形状が合えば 1 発、無ければ従来の 2 発 (fail closed)。
+  Fp32 モードでは連結を作らない (chain は fp32 で起動しない)。
+- **launch 数 before → after (decode 1 token)**: `dno_matvec_f32` **96 → 48** (層 2 → 1)、
+  全カーネル **658 → 610** (−48・−7.3%)、リクエスト 98,700 → 91,500。
+  `dno_gemv_q4_0c4` 257 → 257・`dno_add_rmsnorm` 129 → 129 (変更なし)。
+- **数値**: `dno_matvec_f32` は `j = blockIdx.x`・`row = w + (size_t)j*k`・`out[j] = s` の
+  行独立な逐次縮約なので、行順を連結しても各行の累積順は不変 = **ビット一致**。
+  VRAM は個別の beta/alpha バッファを作らなくなるので**増減なし**、ホストは連結コピー分
+  +2*nv*e*4 B/層 (27B: 1.97 MB × 48 層 = 94 MB)。
+- **予測 ms**: 48 発減 × 1〜2 us = 0.05〜0.10 ms/token。P14/P15 と同じく GPU 実行律速で
+  ホスト enqueue は実行と重なるため、実測は 0.00〜0.10 ms (17.49〜17.51 → 17.45〜17.51
+  ms/token・≤0.6%) と予測。**実機では未測定**。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (320 → +1:
+  `f32_beta_alpha_concat_rows_match_parts` — 連結 1 発と 2 発の出力が bit 一致することを
+  CPU 側で固定)。
+- **測っていないこと**: GPU 実行・アンカー 3 本 (`c61ad85b` / `9e17d563` / `af6eb6ab`)・
+  ms/token・nsys。このコンテナは GPU 非搭載なので、実機確認の手順は作業レポート
+  (未 commit・`REPORT_P16.md`) に書いた。`.cu` / `.ptx` / 8095 は触っていない。
