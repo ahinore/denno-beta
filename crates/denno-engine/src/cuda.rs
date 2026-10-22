@@ -2895,7 +2895,7 @@ fn q4_dispatch(
     // 通ったスレッド数ぶん積み上がる (27B・10.8k token で約 11 GB になり、続く
     // リクエストが cuMemAlloc error 2 で CPU へ落ちた)。
     // 行は互いに独立で、1 行の演算順はタイル分割で変わらないため出力は bit 一致する。
-    const Q4_M_TILE: usize = 256;
+    const Q4_M_TILE: usize = 1024;
     let lib = lib()?;
     ctx.make_current()?;
     let mut r0 = 0;
@@ -4245,6 +4245,168 @@ pub fn chain_swiglu_rows(ga_slot: usize, act_slot: usize, ff: usize, m: usize) -
         let grid = ((m * ff) as u64).div_ceil(256) as u32;
         ok(unsafe { ctx.launch_async(ctx.f_swiglu_int, (grid, 1, 1), (256, 1, 1), 0, &mut args) })
     })
+}
+
+
+/// s163: prefill の FFN を **Q4 重みでも** デバイス常駐で通す
+/// (`chain_mlp_prefill` の Q4 版)。旧経路は 1 層あたり
+///   H2D h2 (m*e*4) + D2H gate (m*ff*4) + D2H up (m*ff*4)
+///   + H2D hh (m*ff*4) + D2H down (m*e*4)
+/// の 5 往復 (m=13000, e=5120, ff=17408 で 1 層 約 5.4 GB) していた。
+/// 新経路は H2D h2 + D2H down の 2 往復だけで、中間の gate/up/act は
+/// デバイス上に留まる。
+///
+/// ビット一致: q4 GEMM は per-op 経路と同一カーネル (`dno_gemm_q4_0`)・同一
+/// グリッド・同一引数で、行ごとに独立 (m の分割は 1 行の累積順を変えない)。
+/// swiglu は `dno_swiglu` (CPU の `g/(1+exp(-g))*u` と同一演算列)。
+/// したがってタイル分割しても出力は従来経路とビット一致する。
+///
+/// メモリ: 行タイル `CH_MLP_TILE_Q4` ごとに処理するので、チェーンバッファは
+/// タイル分だけで済む (13000 行を一度に置くと ff 中間 3 枚で 2.7 GB になる)。
+pub fn chain_mlp_prefill_q4(
+    gate: &crate::quant::Linear,
+    up: &crate::quant::Linear,
+    down: &crate::quant::Linear,
+    x: &[f32],
+    m: usize,
+    li: usize,
+    out: &mut [f32],
+) -> Option<()> {
+    use crate::quant::Linear;
+    if !cuda_enabled()
+        || !gemm_enabled()
+        || m < gemm_min_m()
+        || GPU_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    let (gu, uu, du) = match (gate, up, down) {
+        (Linear::Q4(a), Linear::Q4(b), Linear::Q4(c)) => (a, b, c),
+        _ => return None,
+    };
+    let e = gu.k;
+    let ff = gu.n;
+    if uu.k != e || uu.n != ff || du.k != ff || du.n != e {
+        return None;
+    }
+    if m == 0 || x.len() < m * e || out.len() < m * e {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+    let gw1 = weights_for_q4(gu.uid, &gu.blocks, gu.k, gu.n).ok()?;
+    let gw2 = weights_for_q4(uu.uid, &uu.blocks, uu.k, uu.n).ok()?;
+    let gw3 = weights_for_q4(du.uid, &du.blocks, du.k, du.n).ok()?;
+    const TILE: usize = 1024;
+    let _ = li;
+    let mut r0 = 0usize;
+    while r0 < m {
+        let mr = TILE.min(m - r0);
+        ok(chain_ensure_buf(CH_PFH, mr * e * 4))?;
+        ok(chain_ensure_buf(CH_GA, mr * 2 * ff * 4))?;
+        ok(chain_ensure_buf(CH_ACT, mr * ff * 4))?;
+        ok(chain_ensure_buf(CH_DOWN, mr * e * 4))?;
+        // 1) rmsnorm 済み x のタイルを H2D
+        CHAIN.with(|cell| -> Option<()> {
+            let buf = cell.borrow().bufs[CH_PFH].as_ref()?.ptr();
+            let lib = lib().ok()?;
+            unsafe {
+                ok(check(
+                    (lib.memcpy_htod_async)(
+                        buf,
+                        x[r0 * e..].as_ptr() as *const c_void,
+                        mr * e * 4,
+                        std::ptr::null_mut(),
+                    ),
+                    "cuMemcpyHtoDAsync (mlp prefill q4)",
+                ))
+            }
+        })?;
+        // 2) gate → CH_GA 前半 / up → CH_GA 後半 / 3) swiglu / 4) down
+        CHAIN.with(|cell| -> Option<()> {
+            let s = cell.borrow();
+            let pin = s.bufs[CH_PFH].as_ref()?.ptr();
+            let pga = s.bufs[CH_GA].as_ref()?.ptr();
+            let pact = s.bufs[CH_ACT].as_ref()?.ptr();
+            let pdown = s.bufs[CH_DOWN].as_ref()?.ptr();
+            let up_off = (mr * ff * 4) as u64;
+            crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
+                chain_gemm_q4_pf(gw1, pin, pga, mr, e, ff)?;
+                chain_gemm_q4_pf(gw2, pin, pga + up_off, mr, e, ff)
+            })?;
+            crate::prof::time_layer(crate::prof::SWIGLU, li, || -> Option<()> {
+                chain_swiglu_split(pga, pga + up_off, pact, mr * ff)
+            })?;
+            crate::prof::time_layer(crate::prof::DOWN, li, || -> Option<()> {
+                chain_gemm_q4_pf(gw3, pact, pdown, mr, ff, e)
+            })?;
+            Some(())
+        })?;
+        // 5) down のタイルだけ D2H (呼び出し元バッファへ直接)
+        CHAIN.with(|cell| -> Option<()> {
+            let buf = cell.borrow().bufs[CH_DOWN].as_ref()?.ptr();
+            let lib = lib().ok()?;
+            unsafe {
+                ok(check(
+                    (lib.memcpy_dtoh_async)(
+                        out[r0 * e..].as_mut_ptr() as *mut c_void,
+                        buf,
+                        mr * e * 4,
+                        std::ptr::null_mut(),
+                    ),
+                    "cuMemcpyDtoHAsync (mlp prefill q4)",
+                ))
+            }
+        })?;
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        ok(ctx.sync())?;
+        r0 += mr;
+    }
+    Some(())
+}
+
+/// [`chain_mlp_prefill_q4`] の 1 タイル分 GEMM (per-op 経路と同一カーネル・
+/// 同一グリッド・同一引数)。a/out はデバイスポインタ。
+fn chain_gemm_q4_pf(
+    gw: &GpuWq4,
+    a: u64,
+    out: u64,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Option<()> {
+    let ctx = chain_ctx()?;
+    unsafe {
+        let (mut pa, mut pn, mut ps, mut po) = (a, gw.nib.ptr(), gw.sc.ptr(), out);
+        let (mut mc, mut kc, mut nc) = (m as c_int, k as c_int, n as c_int);
+        let mut args = [
+            &mut pa as *mut _ as *mut c_void,
+            &mut pn as *mut _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut mc as *mut _ as *mut c_void,
+            &mut kc as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+        ];
+        let grid = (m.div_ceil(64) as u32, n.div_ceil(128) as u32, 1);
+        ok(ctx.launch_async(ctx.f_gemm_q4, grid, (16, 16, 1), 0, &mut args))
+    }
+}
+
+/// gate / up が別バッファにある swiglu (`dno_swiglu`)。
+fn chain_swiglu_split(gate: u64, up: u64, out: u64, total: usize) -> Option<()> {
+    let ctx = chain_ctx()?;
+    unsafe {
+        let (mut pg, mut pu, mut po) = (gate, up, out);
+        let mut tc = total as c_int;
+        let mut args = [
+            &mut pg as *mut _ as *mut c_void,
+            &mut pu as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut tc as *mut _ as *mut c_void,
+        ];
+        let grid = (total as u64).div_ceil(256) as u32;
+        ok(ctx.launch_async(ctx.f_swiglu, (grid, 1, 1), (256, 1, 1), 0, &mut args))
+    }
 }
 
 /// s70: prefill の FFN (rmsnorm 済み x → gate/up → swiglu → down → ホスト) を
