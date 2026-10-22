@@ -9849,6 +9849,68 @@ pub fn gdn_scan_batch_oproj(
     Some(())
 }
 
+/// per-op 経路の行タイル (この単位で H2D + GEMM を回す)。
+const GDN_PREFILL_TILE: usize = 1024;
+
+/// `chain_gdn_prefill_q4` が使う寸法 (入口条件を通ったときだけ作られる)。
+struct GdnPrefillQ4Geom<'a> {
+    qw: &'a crate::quant::Q4Linear,
+    zw: &'a crate::quant::Q4Linear,
+    ow: &'a crate::quant::Q4Linear,
+    e: usize,
+    conv_dim: usize,
+    vd: usize,
+    cs: usize,
+}
+
+/// `chain_gdn_prefill_q4` の入口条件 (重み種別・形・寸法・端数タイル) を判定し、
+/// 以降で使う寸法を返す。**純粋関数** — CUDA もグローバル状態も触らないので、
+/// フォールバック契約 (None になる条件) を GPU 無しのホストでテストできる。
+/// 本番経路はこの戻り値だけを見て判断する (条件の写しを持たない)。
+#[allow(clippy::too_many_arguments)]
+fn gdn_prefill_q4_geom<'a>(
+    qkv_w: &'a crate::quant::Linear,
+    z_w: &'a crate::quant::Linear,
+    o_w: &'a crate::quant::Linear,
+    n: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+) -> Option<GdnPrefillQ4Geom<'a>> {
+    use crate::quant::Linear;
+    let (qw, zw, ow) = match (qkv_w, z_w, o_w) {
+        (Linear::Q4(a), Linear::Q4(b), Linear::Q4(c)) => (a, b, c),
+        _ => return None,
+    };
+    // チャンク経路の前提 (gdn_scan_batch と同じ) + 形状。
+    if n < GDN_CHUNK_MIN_TOKENS || nk == 0 || nv == 0 || dk == 0 || dv == 0 {
+        return None;
+    }
+    if dk != dv || d_conv != 4 {
+        return None;
+    }
+    let cs = d_conv - 1;
+    let e = qw.k;
+    let conv_dim = nk.checked_mul(dk)?.checked_mul(2)?.checked_add(nv.checked_mul(dv)?)?;
+    let vd = nv.checked_mul(dv)?;
+    // Q4 GEMM の入口条件 (maybe_gpu_linear_q4_into と同じ k%32==0) と重み形状。
+    if e == 0 || e % 32 != 0 || vd % 32 != 0 {
+        return None;
+    }
+    if qw.n != conv_dim || zw.k != e || zw.n != vd || ow.k != vd || ow.n != e {
+        return None;
+    }
+    // per-op 経路は 1024 行タイルで、端数タイルが m <= max_m() だと GEMV になる。
+    // そこだけ演算列が変わるので、その形では発動しない (従来経路へ落とす)。
+    let rem = n % GDN_PREFILL_TILE;
+    if rem != 0 && rem <= max_m() {
+        return None;
+    }
+    Some(GdnPrefillQ4Geom { qw, zw, ow, e, conv_dim, vd, cs })
+}
+
 /// s164 (P1): GDN 層の prefill を **q4 重みで** デバイス常駐に通す。
 ///
 /// 旧経路 (q4・`forward_prefill` の GDN 分岐) は 1 層あたり
@@ -9903,35 +9965,13 @@ pub fn chain_gdn_prefill_q4(
     li: usize,
     kv: u64,
 ) -> Option<()> {
-    use crate::quant::Linear;
-    if !cuda_enabled()
-        || !gemm_enabled()
-        || GPU_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return None;
-    }
-    let (qw, zw, ow) = match (qkv_w, z_w, o_w) {
-        (Linear::Q4(a), Linear::Q4(b), Linear::Q4(c)) => (a, b, c),
-        _ => return None,
-    };
-    // チャンク経路の前提 (gdn_scan_batch と同じ) + 形状。
-    if n < GDN_CHUNK_MIN_TOKENS || nk == 0 || nv == 0 || dk == 0 || dv == 0 {
-        return None;
-    }
-    if dk != dv || d_conv != 4 {
-        return None;
-    }
-    let cs = d_conv - 1;
-    let e = qw.k;
-    let conv_dim = nk.checked_mul(dk)?.checked_mul(2)?.checked_add(nv.checked_mul(dv)?)?;
-    let vd = nv.checked_mul(dv)?;
-    // Q4 GEMM の入口条件 (maybe_gpu_linear_q4_into と同じ k%32==0) と重み形状。
-    if e == 0 || e % 32 != 0 || vd % 32 != 0 {
-        return None;
-    }
-    if qw.n != conv_dim || zw.k != e || zw.n != vd || ow.k != vd || ow.n != e {
-        return None;
-    }
+    // 形・重み種別の検査は gdn_prefill_q4_geom (純粋・GPU 不要) に集約してある。
+    // フォールバック契約は tests::b20_stage1_tests::gdn_prefill_q4_geom_contract で固定する。
+    // デバイスの準備 (cuda_enabled 等) は形が合ってから。
+    let g = gdn_prefill_q4_geom(qkv_w, z_w, o_w, n, nk, nv, dk, dv, d_conv)?;
+    let (qw, zw, ow) = (g.qw, g.zw, g.ow);
+    let (e, conv_dim, vd, cs) = (g.e, g.conv_dim, g.vd, g.cs);
+    const TILE: usize = GDN_PREFILL_TILE;
     let nv_tot = n.checked_mul(nv)?;
     if beta.len() < nv_tot || alpha.len() < nv_tot {
         return None;
@@ -9948,11 +9988,11 @@ pub fn chain_gdn_prefill_q4(
     if conv_st.len() != conv_dim.checked_mul(cs)? || ssm_st.len() != nv.checked_mul(dk)?.checked_mul(dv)? {
         return None;
     }
-    // per-op 経路は 1024 行タイルで、端数タイルが m <= max_m() だと GEMV になる。
-    // そこだけ演算列が変わるので、その形では発動しない (従来経路へ落とす)。
-    const TILE: usize = 1024;
-    let rem = n % TILE;
-    if rem != 0 && rem <= max_m() {
+    // ここまでで「形が合っている」ことが確定した → デバイスの準備に入る。
+    if !cuda_enabled()
+        || !gemm_enabled()
+        || GPU_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+    {
         return None;
     }
     let ctx = chain_ctx()?;
@@ -10788,5 +10828,91 @@ mod b20_stage1_tests {
         // (per-op 経路へ委譲)。**panic しないこと**がここの主眼。
         assert_eq!(chain_linear(&[&b], CH_H, CH_O, 1), None);
         assert_eq!(chain_linear(&[&a], CH_H, CH_O, 1), None);
+    }
+
+    /// P1c: `chain_gdn_prefill_q4` の入口条件 (フォールバック契約) を GPU 無しで固定する。
+    /// 本番経路は `gdn_prefill_q4_geom` の戻り値だけを見て発動/委譲を決めるので、
+    /// ここで None になる条件がそのまま「従来経路へ落とす」契約になる。
+    /// CUDA は一切呼ばない (デバイス不要)。
+    #[test]
+    fn gdn_prefill_q4_geom_contract() {
+        use crate::quant::{Linear, Q4Linear};
+        let q4 = |k: usize, n: usize| {
+            Linear::Q4(Q4Linear { blocks: Vec::new(), k, n, uid: 0 })
+        };
+        // 成立する形: nk=2, nv=2, dk=dv=64, d_conv=4, e=64
+        //   conv_dim = nk*dk*2 + nv*dv = 384, vd = nv*dv = 128
+        let (nk, nv, dk, dv, dc) = (2usize, 2usize, 64usize, 64usize, 4usize);
+        let (e, conv_dim, vd) = (64usize, 384usize, 128usize);
+        let n_ok = GDN_CHUNK_MIN_TOKENS; // 2048 (1024 の倍数なので端数タイル無し)
+        let base = || (q4(e, conv_dim), q4(e, vd), q4(vd, e));
+        let dims = (nk, nv, dk, dv, dc);
+        let sup = |w: &(Linear, Linear, Linear), n: usize, d: (usize, usize, usize, usize, usize)| {
+            gdn_prefill_q4_geom(&w.0, &w.1, &w.2, n, d.0, d.1, d.2, d.3, d.4).is_some()
+        };
+
+        // 0) 基準形は通り、寸法が正しく返る
+        let w = base();
+        let g = gdn_prefill_q4_geom(&w.0, &w.1, &w.2, n_ok, nk, nv, dk, dv, dc)
+            .expect("基準形は発動してよい");
+        assert_eq!((g.e, g.conv_dim, g.vd, g.cs), (e, conv_dim, vd, dc - 1));
+
+        // 1) 3 本のどれかが Q4 でない → 受けない
+        let f32w = |k: usize, n: usize| Linear::F32 { w: Vec::new(), k, n };
+        let bad = (f32w(e, conv_dim), w.1.clone(), w.2.clone());
+        assert!(!sup(&bad, n_ok, dims), "qkv が Q4 でなければ受けない");
+        let bad = (w.0.clone(), f32w(e, vd), w.2.clone());
+        assert!(!sup(&bad, n_ok, dims), "z が Q4 でなければ受けない");
+        let bad = (w.0.clone(), w.1.clone(), f32w(vd, e));
+        assert!(!sup(&bad, n_ok, dims), "o が Q4 でなければ受けない");
+
+        // 2) 重み形状の不一致 (各辺 1 つずつ)
+        let bad = (q4(e, conv_dim + 32), w.1.clone(), w.2.clone());
+        assert!(!sup(&bad, n_ok, dims), "qkv.n != conv_dim は受けない");
+        let bad = (w.0.clone(), q4(e + 32, vd), w.2.clone());
+        assert!(!sup(&bad, n_ok, dims), "z.k != e は受けない");
+        let bad = (w.0.clone(), q4(e, vd + 32), w.2.clone());
+        assert!(!sup(&bad, n_ok, dims), "z.n != vd は受けない");
+        let bad = (w.0.clone(), w.1.clone(), q4(vd + 32, e));
+        assert!(!sup(&bad, n_ok, dims), "o.k != vd は受けない");
+        let bad = (w.0.clone(), w.1.clone(), q4(vd, e + 32));
+        assert!(!sup(&bad, n_ok, dims), "o.n != e は受けない");
+
+        // 3) n が閾値未満 → 受けない (閾値ちょうどは通る)
+        assert!(
+            !sup(&w, GDN_CHUNK_MIN_TOKENS - 1, dims),
+            "n < GDN_CHUNK_MIN_TOKENS は受けない"
+        );
+
+        // 4) dk != dv / d_conv != 4 → 受けない
+        assert!(!sup(&w, n_ok, (nk, nv, dk, dv / 2, dc)), "dk != dv は受けない");
+        assert!(!sup(&w, n_ok, (nk, nv, dk, dv, 3)), "d_conv != 4 は受けない");
+
+        // 5) 次元 0 / 32 の倍数でない k / vd → 受けない
+        assert!(!sup(&w, n_ok, (0, nv, dk, dv, dc)), "nk == 0 は受けない");
+        assert!(!sup(&w, n_ok, (nk, 0, dk, dv, dc)), "nv == 0 は受けない");
+        assert!(!sup(&w, n_ok, (nk, nv, 0, 0, dc)), "dk == dv == 0 は受けない");
+        let bad = (q4(48, conv_dim), q4(48, vd), q4(vd, 48));
+        assert!(!sup(&bad, n_ok, dims), "e % 32 != 0 は受けない");
+        let bad = (q4(0, conv_dim), q4(0, vd), q4(vd, 0));
+        assert!(!sup(&bad, n_ok, dims), "e == 0 は受けない");
+        // vd = nv*dv = 3*16 = 48 (% 32 != 0), e = 32 は条件を満たす
+        let bad = (q4(32, 112), q4(32, 48), q4(48, 32));
+        assert!(!sup(&bad, n_ok, (2, 3, 16, 16, dc)), "vd % 32 != 0 は受けない");
+
+        // 6) 端数タイルが m <= max_m() → 受けない (per-op 経路が GEMV になる帯域)
+        let rem_small = GDN_PREFILL_TILE * 2 + max_m();
+        assert!(
+            !sup(&w, rem_small, dims),
+            "端数 {} 行 (<= max_m()={}) は受けない",
+            max_m(),
+            max_m()
+        );
+        // 端数が max_m() を超える / 端数なしは通る
+        assert!(sup(&w, rem_small + 1, dims), "端数 max_m()+1 は通る");
+        assert!(sup(&w, GDN_PREFILL_TILE * 2, dims), "端数なしは通る");
+
+        // 7) 桁あふれは checked_mul で None
+        assert!(!sup(&w, n_ok, (usize::MAX, nv, dk, dv, dc)), "conv_dim の桁あふれは受けない");
     }
 }
