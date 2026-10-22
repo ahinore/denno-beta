@@ -422,6 +422,13 @@ fn info_quant_line(dir: &std::path::Path) -> Option<String> {
 /// s164 (K5): GGUF のメタデータから次元を読む (config.json が無い/キーが欠けたとき用)。
 /// arch 名は `general.architecture` の値から組み立てる (`qwen` 等を決め打ちしない)。
 /// 開けない・arch が無い・値が 0 のものは None のまま (事実として 0 を出さない)。
+///
+/// s169 (P19): layers は推論トランクの層数にする。GGUF の `<arch>.block_count` は
+/// MTP (nextn) 層を含み得る (27B: block_count=65 = trunk 64 + nextn 1)。エンジンは
+/// config の `num_hidden_layers` を正として超過分の blk.{n_layer}.. を nextn 層として
+/// 読み飛ばす (model/qwen35.rs の層数整合確認) ので、config.json が無いときの表示も
+/// 同じ層数 = `block_count - nextn_predict_layers` にする。キーが無ければ block_count
+/// そのまま。差し引きが 0 以下になる異常値は None (`?`) にする (0 を事実にしない)。
 fn gguf_dims(dir: &std::path::Path) -> ModelInfo {
     let empty = ModelInfo {
         family: "?".to_string(),
@@ -444,10 +451,17 @@ fn gguf_dims(dir: &std::path::Path) -> ModelInfo {
             .and_then(|v| v.as_u64())
             .filter(|n| *n > 0)
     };
+    let layers = dim("block_count").and_then(|block_count| {
+        let nextn = f
+            .get(&format!("{arch}.nextn_predict_layers"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        block_count.checked_sub(nextn).filter(|n| *n > 0)
+    });
     ModelInfo {
         // family は config.json からのみ (GGUF の arch 名は family ではない)
         family: "?".to_string(),
-        layers: dim("block_count"),
+        layers,
         hidden: dim("embedding_length"),
         context: dim("context_length"),
         // vocab はトークン表の配列長。無ければ `<arch>.vocab_size`
@@ -1272,6 +1286,90 @@ mod tests {
         }
         // GGUF があるので quant 行は従来どおり出る
         assert!(info_quant_line(&td.path).is_some());
+    }
+
+    // s169 (P19): GGUF だけの 27B は block_count=65 (= trunk 64 + MTP 1) なので、
+    // エンジンが実際に走らせる層数 (config の num_hidden_layers = 64) と一致させる
+    // ため `<arch>.nextn_predict_layers` を差し引く。hidden / vocab は従来のキー。
+    #[test]
+    fn gguf_only_mtp_layer_count_matches_engine() {
+        let td = TempDir::new("gguf_mtp");
+        let tokens: Vec<&str> = vec!["a", "b", "c", "d"];
+        td.write_gguf_meta(
+            "model.gguf",
+            &[
+                ("general.architecture", GgufMeta::Str("qwen35")),
+                ("qwen35.block_count", GgufMeta::U32(65)),
+                ("qwen35.nextn_predict_layers", GgufMeta::U32(1)),
+                ("qwen35.embedding_length", GgufMeta::U32(5120)),
+                ("qwen35.context_length", GgufMeta::U32(262144)),
+                ("tokenizer.ggml.tokens", GgufMeta::ArrStr(&tokens)),
+            ],
+        );
+        assert!(read_config(&td.path).is_err(), "GGUF だけのディレクトリ");
+        let (info, extras) = info_resolve(&td.path).expect("gguf metadata must fill dims");
+        // 65 - 1 = 64 (block_count をそのまま出さない)
+        assert_eq!(info.layers, Some(64));
+        assert_eq!(info.hidden, Some(5120));
+        assert_eq!(info.vocab, Some(4));
+        assert_eq!(info.context, Some(262144));
+
+        let lines = info_config_lines("local/mtp", &info, &extras);
+        assert_eq!(line_value(&lines, "layers:"), "64");
+        assert_eq!(line_value(&lines, "hidden:"), "5120");
+        assert_eq!(line_value(&lines, "vocab:"), "4");
+        for label in ["layers:", "hidden:", "vocab:", "context:"] {
+            assert_ne!(line_value(&lines, label), "0", "{label} must be non-zero");
+        }
+    }
+
+    // s169 (P19): nextn の差し引きの境界と、config.json 優先の確認。
+    #[test]
+    fn gguf_nextn_edges_and_config_precedence() {
+        // (a) nextn == block_count のような異常値は 0 を出さず `?`
+        let bad = TempDir::new("gguf_nextn_bad");
+        bad.write_gguf_meta(
+            "m.gguf",
+            &[
+                ("general.architecture", GgufMeta::Str("acme")),
+                ("acme.block_count", GgufMeta::U32(2)),
+                ("acme.nextn_predict_layers", GgufMeta::U32(2)),
+                // 層数以外の次元はあるので GGUF 経路は成立する (layers だけ `?`)
+                ("acme.embedding_length", GgufMeta::U32(1024)),
+            ],
+        );
+        let (info, _extras) = info_resolve(&bad.path).expect("block_count is enough");
+        assert_eq!(info.layers, None);
+        assert_eq!(info.hidden, Some(1024));
+        let lines = info_config_lines("local/bad", &info, &ModelExtras::default());
+        assert_eq!(line_value(&lines, "layers:"), "?");
+        assert_eq!(line_value(&lines, "hidden:"), "1024");
+
+        // (b) nextn キーが無ければ block_count そのまま (差し引かない)
+        let plain = TempDir::new("gguf_no_nextn");
+        plain.write_gguf_meta(
+            "m.gguf",
+            &[
+                ("general.architecture", GgufMeta::Str("acme")),
+                ("acme.block_count", GgufMeta::U32(12)),
+            ],
+        );
+        let (info, _extras) = info_resolve(&plain.path).expect("block_count is enough");
+        assert_eq!(info.layers, Some(12));
+
+        // (c) config.json があればそちらが勝つ (GGUF の 65/1 で上書きしない)
+        let both = TempDir::new("cfg_vs_mtp");
+        both.write_config(r#"{"model_type":"qwen3_5_text","num_hidden_layers":60}"#);
+        both.write_gguf_meta(
+            "m.gguf",
+            &[
+                ("general.architecture", GgufMeta::Str("qwen35")),
+                ("qwen35.block_count", GgufMeta::U32(65)),
+                ("qwen35.nextn_predict_layers", GgufMeta::U32(1)),
+            ],
+        );
+        let (info, _extras) = info_resolve(&both.path).expect("config must parse");
+        assert_eq!(info.layers, Some(60));
     }
 
     // f. config.json と GGUF の両方があるときは config.json が勝つ
