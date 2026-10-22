@@ -2098,26 +2098,19 @@ impl Qwen35 {
 
         match &layer.attn {
             AttnKind::Gdn(g) => {
-                // beta/alpha は従来どおりホストで計算する (h2 を 1 回だけ戻す)
-                let h2 = cuda::chain_download_at(cuda::CH_PFH, 0, n * e).ok_or_else(|| {
-                    anyhow::anyhow!("prefill residual chain: h2 download failed")
-                })?;
-                fit_prefill_buf(buf_h, n * e);
-                buf_h.copy_from_slice(&h2);
+                // beta/alpha は従来どおりホストで計算する (h2 を 1 回だけ戻す)。
+                // s167 (P6): h2 の D2H を専用コピーストリームで qkv/z GEMM と重ねる
+                // 経路を cuda 側が選ぶ (`DENNO_PF_OVERLAP=1` のときだけ。OFF・準備
+                // 失敗は従来と同一の順序 = 同期 D2H → beta/alpha → GEMM/scan/o_proj)。
+                // beta/alpha の関数・引数・順序、h2 の値、カーネル列は不変。
                 fit_prefill_buf(buf_beta, n * g.beta_w.dims().1);
                 fit_prefill_buf(buf_alpha, n * g.alpha_w.dims().1);
-                crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                    g.beta_w.apply_bt_rows_into(&buf_h[..], n, buf_beta)
-                });
-                crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                    g.alpha_w.apply_bt_rows_into(&buf_h[..], n, buf_alpha)
-                });
                 let p = &self.gdn_p;
                 let kv_id = cache.kv_id();
                 let (conv, ssm) = cache.gdn_state_mut(li).ok_or_else(|| {
                     anyhow::anyhow!("GDN state slot が未初期化 (prefill residual chain)")
                 })?;
-                cuda::chain_gdn_prefill_q4_dev(
+                cuda::chain_gdn_prefill_q4_dev_ovl(
                     &g.qkv_w,
                     &g.gate_w,
                     &g.out_w,
@@ -2139,6 +2132,20 @@ impl Qwen35 {
                     ssm,
                     li,
                     kv_id,
+                    |h2, beta, alpha| {
+                        // 従来と同じ作業バッファへ写してから計算する (フラグ OFF の
+                        // 実行経路を今日と 1 命令も変えないため。ON 経路ではこの写しも
+                        // qkv/z GEMM の裏で走るので直列コストにならない)。
+                        fit_prefill_buf(buf_h, n * e);
+                        buf_h.copy_from_slice(h2);
+                        crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
+                            g.beta_w.apply_bt_rows_into(&buf_h[..], n, beta)
+                        });
+                        crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
+                            g.alpha_w.apply_bt_rows_into(&buf_h[..], n, alpha)
+                        });
+                        Some(())
+                    },
                 )
                 .ok_or_else(|| anyhow::anyhow!("prefill residual chain: GDN chain failed"))?;
             }

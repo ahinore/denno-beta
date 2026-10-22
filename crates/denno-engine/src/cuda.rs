@@ -85,6 +85,16 @@ type FnCuMemcpyDtoDAsyncV2 =
 type FnCuMemcpyDtoD = unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult;
 type FnCuDeviceGetAttribute = unsafe extern "C" fn(*mut c_int, c_int, CUdevice) -> CUresult;
 type FnCuFuncSetAttribute = unsafe extern "C" fn(CUfunction, c_int, c_int) -> CUresult;
+// s167 (P6): h2 の D2H を専用コピーストリームへ載せるための driver API。
+// すべて Option で持つ — 古い driver で dlsym に失敗しても全体を落とさず、
+// 呼び出し側が従来の同期 D2H へフォールバックする (fail closed)。
+type FnCuStreamCreate = unsafe extern "C" fn(*mut CUstream, u32) -> CUresult;
+type FnCuStreamDestroy = unsafe extern "C" fn(CUstream) -> CUresult;
+type FnCuStreamWaitEvent = unsafe extern "C" fn(CUstream, CUevent, u32) -> CUresult;
+type FnCuEventCreate = unsafe extern "C" fn(*mut CUevent, u32) -> CUresult;
+type FnCuEventDestroy = unsafe extern "C" fn(CUevent) -> CUresult;
+type FnCuEventRecord = unsafe extern "C" fn(CUevent, CUstream) -> CUresult;
+type FnCuEventSynchronize = unsafe extern "C" fn(CUevent) -> CUresult;
 type FnCuLaunchKernel = unsafe extern "C" fn(
     CUfunction,
     u32,
@@ -99,6 +109,7 @@ type FnCuLaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> CUresult;
 type CUstream = *mut c_void;
+type CUevent = *mut c_void;
 
 /// Driver API の関数ポインタ群 (dlsym は1度だけ行う)
 struct CudaLib {
@@ -129,6 +140,14 @@ struct CudaLib {
     // するが、dlsym 失敗でも全体を落とさないよう Option (無ければ 48KB 既定のまま)。
     device_get_attribute: Option<FnCuDeviceGetAttribute>,
     func_set_attribute: Option<FnCuFuncSetAttribute>,
+    // s167 (P6): 専用コピーストリーム (h2 の D2H を qkv/z GEMM と重ねる)。
+    stream_create: Option<FnCuStreamCreate>,
+    stream_destroy: Option<FnCuStreamDestroy>,
+    stream_wait_event: Option<FnCuStreamWaitEvent>,
+    event_create: Option<FnCuEventCreate>,
+    event_destroy: Option<FnCuEventDestroy>,
+    event_record: Option<FnCuEventRecord>,
+    event_sync: Option<FnCuEventSynchronize>,
     launch: FnCuLaunchKernel,
 }
 
@@ -186,6 +205,23 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuDeviceGetAttribute>(p) }),
         func_set_attribute: sym_opt(handle, "cuFuncSetAttribute")
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuFuncSetAttribute>(p) }),
+        stream_create: sym_opt(handle, "cuStreamCreate")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuStreamCreate>(p) }),
+        // driver は v2 名で公開する (CUDA 3.2 以降)。無ければ無印を試す。
+        stream_destroy: sym_opt(handle, "cuStreamDestroy_v2")
+            .or_else(|| sym_opt(handle, "cuStreamDestroy"))
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuStreamDestroy>(p) }),
+        stream_wait_event: sym_opt(handle, "cuStreamWaitEvent")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuStreamWaitEvent>(p) }),
+        event_create: sym_opt(handle, "cuEventCreate")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuEventCreate>(p) }),
+        event_destroy: sym_opt(handle, "cuEventDestroy_v2")
+            .or_else(|| sym_opt(handle, "cuEventDestroy"))
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuEventDestroy>(p) }),
+        event_record: sym_opt(handle, "cuEventRecord")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuEventRecord>(p) }),
+        event_sync: sym_opt(handle, "cuEventSynchronize")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuEventSynchronize>(p) }),
         launch: std::mem::transmute(sym(handle, "cuLaunchKernel")?),
     })
 }
@@ -1006,6 +1042,39 @@ impl Drop for PinMem {
     fn drop(&mut self) {
         unsafe {
             let _ = (lib().unwrap().mem_host_free)(self.ptr);
+        }
+    }
+}
+
+/// s167 (P6): 専用コピーストリーム (h2 の D2H を qkv/z GEMM と重ねる)。
+/// driver オブジェクトはコンテキストに属するので Drop で明示的に破棄する
+/// (スレッド終了時に解放。`stream_destroy` が無い driver ではリークするだけで、
+/// コンテキスト破棄時に回収される)。
+struct CopyStream(CUstream);
+
+impl Drop for CopyStream {
+    fn drop(&mut self) {
+        if let Ok(l) = lib() {
+            if let Some(f) = l.stream_destroy {
+                unsafe {
+                    let _ = f(self.0);
+                }
+            }
+        }
+    }
+}
+
+/// s167 (P6): コピーストリームの順序付け/完了待ちに使うイベント (RAII)。
+struct CopyEvent(CUevent);
+
+impl Drop for CopyEvent {
+    fn drop(&mut self) {
+        if let Ok(l) = lib() {
+            if let Some(f) = l.event_destroy {
+                unsafe {
+                    let _ = f(self.0);
+                }
+            }
         }
     }
 }
@@ -3619,6 +3688,14 @@ struct ChainScratch {
     /// する。model_id はロード毎に採番されるため、モデル再ロードで誤キャッシュに
     /// なることはない。
     q35_w_cache: std::collections::HashMap<(u64, usize, u8), DevBuffer>,
+    // s167 (P6): GDN prefill の h2 D2H を qkv/z GEMM と重ねるための一式。
+    // `DENNO_PF_OVERLAP=1` のときだけ作られる (フラグ OFF では None のまま =
+    // 従来の同期 D2H と同一経路・未使用ストリームを残さない)。
+    h2_stream: Option<CopyStream>,  // 非ブロッキングの専用コピーストリーム
+    h2_ev_ready: Option<CopyEvent>, // main stream の rmsnorm 完了 (発行前の順序付け)
+    h2_ev_done: Option<CopyEvent>,  // コピーストリームの D2H 完了 (join)
+    pin_h2: Option<PinMem>,         // D2H の宛先 (pinned・grow-only)
+    h2_pending: bool,               // 発行済みで未 join の D2H があるか
 }
 
 thread_local! {
@@ -3655,6 +3732,11 @@ thread_local! {
         q35_tab: None,
         q35_pin_tab: None,
         q35_w_cache: std::collections::HashMap::new(),
+        h2_stream: None,
+        h2_ev_ready: None,
+        h2_ev_done: None,
+        pin_h2: None,
+        h2_pending: false,
     });
 }
 
@@ -10100,62 +10182,25 @@ pub fn chain_gdn_prefill_q4(
         ssm_st,
         li,
         kv,
+        PfGdnPhase::All,
     )
 }
 
-/// s165 (P2): GDN 層の prefill を**デバイス常駐の入出力**で通す版。入力は
-/// `CH_PFH` (rmsnorm 出力・先頭から n 行)、出力は `CH_O`。消えるのは
-/// x の H2D と o_proj の D2H だけで、GEMM / スキャン / 状態契約は
-/// [`chain_gdn_prefill_q4`] と同一 (カーネル・grid・引数・chunk 分割すべて不変)。
-#[allow(clippy::too_many_arguments)]
-pub fn chain_gdn_prefill_q4_dev(
-    qkv_w: &crate::quant::Linear,
-    z_w: &crate::quant::Linear,
-    o_w: &crate::quant::Linear,
-    beta: &[f32],
-    alpha: &[f32],
-    wconv: &[f32],
-    wa: &[f32],
-    wdt: &[f32],
-    wnorm: &[f32],
-    n: usize,
-    nk: usize,
-    nv: usize,
-    dk: usize,
-    dv: usize,
-    d_conv: usize,
-    eps: f32,
-    q_scale: f32,
-    conv_st: &mut [f32],
-    ssm_st: &mut [f32],
-    li: usize,
-    kv: u64,
-) -> Option<()> {
-    chain_gdn_prefill_q4_impl(
-        qkv_w,
-        z_w,
-        o_w,
-        beta,
-        alpha,
-        wconv,
-        wa,
-        wdt,
-        wnorm,
-        PfSrc::Slot,
-        PfSink::Slot,
-        n,
-        nk,
-        nv,
-        dk,
-        dv,
-        d_conv,
-        eps,
-        q_scale,
-        conv_st,
-        ssm_st,
-        li,
-        kv,
-    )
+/// s167 (P6): [`chain_gdn_prefill_q4_impl`] の実行位相。
+///
+/// GDN 層の prefill は「qkv/z GEMM (h2 だけに依存)」→「beta/alpha H2D → chunk
+/// scan → o_proj (beta/alpha にも依存)」の 2 段に分かれており、beta/alpha は
+/// ホストが h2 から計算する。h2 の D2H を専用コピーストリームに載せるとき、
+/// 前段 (Gemm) だけを先に流してその間にコピーを進め、join 後に後段 (Rest) を
+/// 流す。`All` は従来どおり 1 回で通す (フラグ OFF の経路はこれ)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PfGdnPhase {
+    /// 従来どおり全段 (qkv/z GEMM → beta/alpha H2D → scan → o_proj → D2H)
+    All,
+    /// qkv/z GEMM だけ (beta/alpha を待たない)
+    Gemm,
+    /// beta/alpha H2D → scan → o_proj (と Host 出力の D2H)
+    Rest,
 }
 
 /// [`chain_gdn_prefill_q4`] の本体 (入出力の出所だけを差し替える)。
@@ -10184,6 +10229,7 @@ fn chain_gdn_prefill_q4_impl(
     ssm_st: &mut [f32],
     li: usize,
     kv: u64,
+    phase: PfGdnPhase,
 ) -> Option<()> {
     // 形・重み種別の検査は gdn_prefill_q4_geom (純粋・GPU 不要) に集約してある。
     // フォールバック契約は tests::b20_stage1_tests::gdn_prefill_q4_geom_contract で固定する。
@@ -10256,37 +10302,46 @@ fn chain_gdn_prefill_q4_impl(
     //    順序が保たれるので、タイル間の sync は要らない)。Host はタイルごとに
     //    H2D、Slot (残差常駐経路) は CH_PFH の該当行をそのまま読む — 転送だけが
     //    消え、カーネル・引数は同一。
-    let mut r0 = 0usize;
-    while r0 < n {
-        let mr = TILE.min(n - r0);
-        CHAIN.with(|cell| -> Option<()> {
-            let s = cell.borrow();
-            let pbuf = s.bufs[CH_PFH].as_ref()?.ptr();
-            let pin = match &src {
-                PfSrc::Host(x) => {
-                    let lib = lib().ok()?;
-                    // H2D x タイル → 同一ストリームの GEMM (順序はストリームが保証する)
-                    unsafe {
-                        ok(check(
-                            (lib.memcpy_htod_async)(
-                                pbuf,
-                                x[r0 * e..].as_ptr() as *const c_void,
-                                mr * e * 4,
-                                std::ptr::null_mut(),
-                            ),
-                            "cuMemcpyHtoDAsync (gdn prefill q4 x)",
-                        ))?;
+    //    s167 (P6): 位相 Rest では再実行しない (位相 Gemm の呼び出しが済ませている。
+    //    q/z は GDN_SCRATCH に残っており、間に GDN_SCRATCH を触る処理は無い)。
+    if phase != PfGdnPhase::Rest {
+        let mut r0 = 0usize;
+        while r0 < n {
+            let mr = TILE.min(n - r0);
+            CHAIN.with(|cell| -> Option<()> {
+                let s = cell.borrow();
+                let pbuf = s.bufs[CH_PFH].as_ref()?.ptr();
+                let pin = match &src {
+                    PfSrc::Host(x) => {
+                        let lib = lib().ok()?;
+                        // H2D x タイル → 同一ストリームの GEMM (順序はストリームが保証する)
+                        unsafe {
+                            ok(check(
+                                (lib.memcpy_htod_async)(
+                                    pbuf,
+                                    x[r0 * e..].as_ptr() as *const c_void,
+                                    mr * e * 4,
+                                    std::ptr::null_mut(),
+                                ),
+                                "cuMemcpyHtoDAsync (gdn prefill q4 x)",
+                            ))?;
+                        }
+                        pbuf
                     }
-                    pbuf
-                }
-                PfSrc::Slot => pbuf + (r0 * e * 4) as u64,
-            };
-            crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
-                chain_gemm_q4_pf(gw_qkv, pin, pq + (r0 * conv_dim * 4) as u64, mr, e, conv_dim)?;
-                chain_gemm_q4_pf(gw_z, pin, pz + (r0 * vd * 4) as u64, mr, e, vd)
-            })
-        })?;
-        r0 += mr;
+                    PfSrc::Slot => pbuf + (r0 * e * 4) as u64,
+                };
+                crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
+                    chain_gemm_q4_pf(gw_qkv, pin, pq + (r0 * conv_dim * 4) as u64, mr, e, conv_dim)?;
+                    chain_gemm_q4_pf(gw_z, pin, pz + (r0 * vd * 4) as u64, mr, e, vd)
+                })
+            })?;
+            r0 += mr;
+        }
+    }
+    // s167 (P6): 位相 Gemm はここで終わる (呼び出し側が h2 のコピーを join してから
+    // 位相 Rest を呼ぶ)。beta/alpha の H2D もスキャンも o_proj も走らせない。
+    if phase == PfGdnPhase::Gemm {
+        return Some(());
     }
 
     // 2) beta / alpha (ホストで計算済み・従来と同じ値) をデバイスへ。
@@ -10351,6 +10406,363 @@ fn chain_gdn_prefill_q4_impl(
         ok(ctx.sync())?;
     }
     Some(())
+}
+
+// ---------------------------------------------------------------------------
+// s167 (P6): GDN prefill の h2 D2H を専用コピーストリームで qkv/z GEMM と重ねる。
+//
+// GDN 層は 1 層あたり h2 (n*e*4 = 13k token で約 210MB) をホストへ戻し、beta/alpha
+// をホストで計算する。従来はこれを既定 (legacy) ストリームで**同期** D2H して
+// いたので、コピー時間がまるごと直列に乗っていた。beta/alpha が要るのは chunk
+// scan からで、その手前の qkv/z GEMM は h2 (デバイス) だけに依存する — したがって
+//   rmsnorm → { D2H h2 (コピーストリーム) || qkv/z GEMM (既定ストリーム) }
+// の形にできる。同期点は「ホストが h2 を読む直前の join」1 つだけで、
+//   - 同じバイト列を同じバッファから戻す (pinned 宛先が違うだけ)
+//   - ホスト計算 (beta/alpha) の関数・引数・順序は不変
+//   - カーネル・grid・引数・chunk 分割・状態契約は不変
+// なので数値は 1 つも変わらない。コピーと GEMM は互いに独立 (どちらも CH_PFH を
+// 読むだけ) で、書き込み先も別。
+//
+// 発動条件は `DENNO_PF_OVERLAP=1` (既定 OFF)。OFF・driver に必要な API が無い・
+// stream/event/pinned の作成に失敗、のいずれでも従来と同一の同期経路を通る。
+// ---------------------------------------------------------------------------
+
+/// s167 (P6): `DENNO_PF_OVERLAP` の解釈 (純粋関数)。**"1"/"true"/"on" だけが有効**で、
+/// 未設定・空・"0" などは OFF (既定 OFF = 従来と同一経路)。
+pub fn parse_pf_overlap(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1") | Some("true") | Some("on"))
+}
+
+/// 実行時の env 実効値 (初回だけ読む)。
+fn pf_overlap_flag() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_pf_overlap(std::env::var("DENNO_PF_OVERLAP").ok().as_deref()))
+}
+
+/// s167 (P6): h2 の D2H をどの経路で発行するか。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PfH2Path {
+    /// 専用 (非ブロッキング) コピーストリームで発行し、qkv/z GEMM と重ねる
+    CopyStream,
+    /// 従来の同期 D2H (フラグ OFF・デバイス準備失敗・形の不整合)
+    SyncD2h,
+}
+
+/// s167 (P6): 経路決定 (純粋関数・GPU 非依存)。
+/// `dev_ready` は「コピーストリーム・イベント・pinned 宛先が揃った」ことを表す
+/// (呼び出し側が実際に作って渡す)。ここが false なら**必ず**従来経路に落ちる。
+/// 桁あふれ・0 バイトも従来経路 (コピーする意味が無い)。
+pub fn pf_h2_path(flag_on: bool, n: usize, e: usize, dev_ready: bool) -> PfH2Path {
+    if !flag_on || !dev_ready {
+        return PfH2Path::SyncD2h;
+    }
+    match n.checked_mul(e).and_then(|v| v.checked_mul(4)) {
+        Some(bytes) if bytes > 0 => PfH2Path::CopyStream,
+        _ => PfH2Path::SyncD2h,
+    }
+}
+
+/// s167 (P6): h2 の D2H を専用コピーストリームへ**発行するだけ** (同期しない)。
+/// `CH_PFH` の `elem_off` 要素目から `len` 個を pinned の `pin_h2` へ落とす。
+/// 呼び出し時点で `CH_PFH` の当該範囲が既定ストリーム上で確定している前提
+/// (rmsnorm の直後に呼ぶ) で、イベントで既定ストリーム → コピーストリームの
+/// 順序を作る。完了は [`chain_pf_h2_join`] で待つ。
+///
+/// 失敗はすべて `None` で、**GPU_BROKEN は立てない**: フラグ OFF・driver API
+/// 欠落・stream/event/pinned の作成失敗は「従来の同期 D2H でよい」種類の失敗
+/// なので、呼び出し側は静かに従来経路へ落ちる。
+fn chain_pf_h2_begin(slot: usize, elem_off: usize, len: usize) -> Option<()> {
+    let _ctx = chain_ctx()?;
+    let bytes = len.checked_mul(4)?;
+    if bytes == 0 {
+        return None;
+    }
+    let need = elem_off.checked_mul(4)?.checked_add(bytes)?;
+    let lib = lib().ok()?;
+    let (stream_create, event_create, event_record, stream_wait_event) = (
+        lib.stream_create?,
+        lib.event_create?,
+        lib.event_record?,
+        lib.stream_wait_event?,
+    );
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        // 未 join のコピーが残っている状態で発行し直すと宛先 (pin_h2) を取り合う。
+        // 呼び出し規約違反なので受けない (join が必ず h2_pending を落とす)。
+        if s.h2_pending {
+            return None;
+        }
+        // 1) コピーストリーム一式を初回だけ作る。
+        if s.h2_stream.is_none() {
+            // 非ブロッキング必須: legacy (既定) ストリームは blocking ストリームと
+            // 暗黙に同期するため、blocking で作ると GEMM がコピー完了を待ってしまい
+            // 1 バイトも重ならない。
+            const CU_STREAM_NON_BLOCKING: u32 = 0x01;
+            const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
+            let mut st: CUstream = std::ptr::null_mut();
+            if unsafe { stream_create(&mut st, CU_STREAM_NON_BLOCKING) } != CUDA_SUCCESS {
+                return None;
+            }
+            let st = CopyStream(st);
+            let mut ev_ready: CUevent = std::ptr::null_mut();
+            if unsafe { event_create(&mut ev_ready, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+                return None;
+            }
+            let ev_ready = CopyEvent(ev_ready);
+            let mut ev_done: CUevent = std::ptr::null_mut();
+            if unsafe { event_create(&mut ev_done, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+                return None;
+            }
+            let ev_done = CopyEvent(ev_done);
+            s.h2_stream = Some(st);
+            s.h2_ev_ready = Some(ev_ready);
+            s.h2_ev_done = Some(ev_done);
+        }
+        // 2) 宛先 (pinned) と転送元を用意する。pinned の確保失敗も従来経路へ
+        //    (ページロック上限などは致命的でないので GPU_BROKEN は立てない)。
+        if Scratch::ensure_pin(&mut s.pin_h2, bytes).is_err() {
+            return None;
+        }
+        let dst = match s.pin_h2.as_ref() {
+            Some(p) if p.bytes >= bytes => p.ptr,
+            _ => return None,
+        };
+        let src = match s.bufs.get(slot).and_then(|b| b.as_ref()) {
+            Some(b) if b.bytes() >= need => b.ptr(),
+            _ => return None,
+        };
+        let (st, ev_ready, ev_done) = (
+            s.h2_stream.as_ref()?.0,
+            s.h2_ev_ready.as_ref()?.0,
+            s.h2_ev_done.as_ref()?.0,
+        );
+        // 3) 既定ストリーム (null) の rmsnorm 完了をイベントで受けてから発行する。
+        if unsafe { event_record(ev_ready, std::ptr::null_mut()) } != CUDA_SUCCESS {
+            return None;
+        }
+        if unsafe { stream_wait_event(st, ev_ready, 0) } != CUDA_SUCCESS {
+            return None;
+        }
+        if unsafe { (lib.memcpy_dtoh_async)(dst, src + (elem_off * 4) as CUdeviceptr, bytes, st) }
+            != CUDA_SUCCESS
+        {
+            return None;
+        }
+        // 4) 完了イベントをコピーストリームに打つ (join はこれだけを待つ)。
+        if unsafe { event_record(ev_done, st) } != CUDA_SUCCESS {
+            return None;
+        }
+        s.h2_pending = true;
+        Some(())
+    })
+}
+
+/// s167 (P6): 発行済みの h2 D2H を join する (完了イベントを待つ)。ここから先で
+/// ホストが `pin_h2` を読める。`h2_pending` が無い (発行していない) なら None。
+///
+/// 待ちに失敗しても `h2_pending` は落とす — 以後の層は従来の同期 D2H に戻る
+/// (同じストリームに残った古いコピーは、次のコピーの完了イベントより前に
+/// 必ず終わるので、宛先の取り合いにはならない)。
+fn chain_pf_h2_join() -> Option<()> {
+    let _ctx = chain_ctx()?;
+    let event_sync = lib().ok()?.event_sync?;
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        if !s.h2_pending {
+            return None;
+        }
+        let ev = s.h2_ev_done.as_ref()?.0;
+        s.h2_pending = false;
+        if unsafe { event_sync(ev) } != CUDA_SUCCESS {
+            return None;
+        }
+        Some(())
+    })
+}
+
+/// s167 (P6): GDN 層の prefill を、h2 の D2H と qkv/z GEMM の**オーバーラップ付き**
+/// で通す版。`DENNO_PF_OVERLAP=1` かつデバイス準備が成功したときだけ
+///   位相 Gemm → join → `host_ctrl` (beta/alpha) → 位相 Rest
+/// の順で流し、それ以外は従来と**同一の順序**
+///   同期 D2H → `host_ctrl` → (GEMM → beta/alpha H2D → scan → o_proj)
+/// を通す。`host_ctrl` は h2 を受け取って beta/alpha を書くホスト区間で、呼び出し
+/// 側は従来と同じ関数 (`apply_bt_rows_into`) を同じ引数で呼ぶ。
+#[allow(clippy::too_many_arguments)]
+pub fn chain_gdn_prefill_q4_dev_ovl<F>(
+    qkv_w: &crate::quant::Linear,
+    z_w: &crate::quant::Linear,
+    o_w: &crate::quant::Linear,
+    beta: &mut [f32],
+    alpha: &mut [f32],
+    wconv: &[f32],
+    wa: &[f32],
+    wdt: &[f32],
+    wnorm: &[f32],
+    n: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    eps: f32,
+    q_scale: f32,
+    conv_st: &mut [f32],
+    ssm_st: &mut [f32],
+    li: usize,
+    kv: u64,
+    host_ctrl: F,
+) -> Option<()>
+where
+    F: FnOnce(&[f32], &mut [f32], &mut [f32]) -> Option<()>,
+{
+    // 前提 (形・重み種別・n の帯域) はコピーを発行する前に確定させる — ここで
+    // 落ちる形ではコピーを 1 バイトも発行しない (未 join のコピーを残さない)。
+    let g = gdn_prefill_q4_geom(qkv_w, z_w, o_w, n, nk, nv, dk, dv, d_conv)?;
+    let e = g.e;
+    let n_e = n.checked_mul(e)?;
+    let want = pf_overlap_flag();
+    let begun = want && chain_pf_h2_begin(CH_PFH, 0, n_e).is_some();
+    if pf_h2_path(want, n, e, begun) == PfH2Path::CopyStream {
+        // 位相 Gemm を先に流す (h2 を待たない)。この間コピーストリームが h2 を運ぶ。
+        // 既定ストリームは非ブロッキングのコピーストリームと暗黙同期しないので、
+        // GEMM がコピーを待つことはない。
+        if chain_gdn_prefill_q4_impl(
+            qkv_w,
+            z_w,
+            o_w,
+            beta,
+            alpha,
+            wconv,
+            wa,
+            wdt,
+            wnorm,
+            PfSrc::Slot,
+            PfSink::Slot,
+            n,
+            nk,
+            nv,
+            dk,
+            dv,
+            d_conv,
+            eps,
+            q_scale,
+            conv_st,
+            ssm_st,
+            li,
+            kv,
+            PfGdnPhase::Gemm,
+        )
+        .is_none()
+        {
+            // 位相 Gemm の失敗 = デバイス障害 (従来のチェーン失敗と同じ扱い)。
+            // 未 join のコピーは残さない。
+            let _ = chain_pf_h2_join();
+            return None;
+        }
+        // join: ホストが h2 を読む直前の唯一の同期点。
+        if chain_pf_h2_join().is_some() {
+            // pinned の h2 をそのまま渡す (Vec への写しをしない)。安全性: pin_h2 は
+            // thread_local の grow-only バッファで、join 済み = 全要素がコピーで
+            // 埋まっている。CHAIN の借用は保持しない (保持したままホスト区間を走ら
+            // せると、内側の CHAIN アクセスが RefCell で panic する)。
+            let (p, cap) = CHAIN.with(|cell| {
+                cell.borrow()
+                    .pin_h2
+                    .as_ref()
+                    .map(|p| (p.ptr as *const f32, p.bytes / std::mem::size_of::<f32>()))
+            })?;
+            if cap < n_e {
+                return None;
+            }
+            let h2: &[f32] = unsafe { std::slice::from_raw_parts(p, n_e) };
+            host_ctrl(h2, beta, alpha)?;
+            return chain_gdn_prefill_q4_impl(
+                qkv_w,
+                z_w,
+                o_w,
+                beta,
+                alpha,
+                wconv,
+                wa,
+                wdt,
+                wnorm,
+                PfSrc::Slot,
+                PfSink::Slot,
+                n,
+                nk,
+                nv,
+                dk,
+                dv,
+                d_conv,
+                eps,
+                q_scale,
+                conv_st,
+                ssm_st,
+                li,
+                kv,
+                PfGdnPhase::Rest,
+            );
+        }
+        // join だけ失敗した (driver 障害)。q/z は既にデバイスにあるので、h2 を
+        // 従来の同期 D2H で取り直して残りを流す — 値は同一。
+        let h2 = chain_download_at(CH_PFH, 0, n_e)?;
+        host_ctrl(&h2, beta, alpha)?;
+        return chain_gdn_prefill_q4_impl(
+            qkv_w,
+            z_w,
+            o_w,
+            beta,
+            alpha,
+            wconv,
+            wa,
+            wdt,
+            wnorm,
+            PfSrc::Slot,
+            PfSink::Slot,
+            n,
+            nk,
+            nv,
+            dk,
+            dv,
+            d_conv,
+            eps,
+            q_scale,
+            conv_st,
+            ssm_st,
+            li,
+            kv,
+            PfGdnPhase::Rest,
+        );
+    }
+    // 従来と同一の順序: 同期 D2H → ホスト計算 → GEMM → beta/alpha H2D → scan → o_proj
+    let h2 = chain_download_at(CH_PFH, 0, n_e)?;
+    host_ctrl(&h2, beta, alpha)?;
+    chain_gdn_prefill_q4_impl(
+        qkv_w,
+        z_w,
+        o_w,
+        beta,
+        alpha,
+        wconv,
+        wa,
+        wdt,
+        wnorm,
+        PfSrc::Slot,
+        PfSink::Slot,
+        n,
+        nk,
+        nv,
+        dk,
+        dv,
+        d_conv,
+        eps,
+        q_scale,
+        conv_st,
+        ssm_st,
+        li,
+        kv,
+        PfGdnPhase::All,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -11673,5 +12085,59 @@ mod p2_residual_tests {
         ];
         assert!(!used.contains(&CH_PF_RES), "CH_PF_RES は既存スロットと別");
         assert!(CH_PF_RES < CH_SLOTS);
+    }
+}
+
+#[cfg(test)]
+mod p6_overlap_tests {
+    //! s167 (Task P6): GDN prefill の h2 D2H を専用コピーストリームで qkv/z GEMM と
+    //! 重ねる経路の**入口条件とフォールバック**だけを固定する (GPU 非依存の契約
+    //! テスト)。数値の一致・速度は実機の担当。
+    //!
+    //! ここで固定する契約:
+    //!   - フラグは明示的な "1"/"true"/"on" だけが ON (既定 OFF = 従来と同一経路)
+    //!   - stream/event/pinned の準備に失敗したら必ず従来の同期 D2H (`SyncD2h`)
+    //!   - 形が不正・桁あふれ・0 バイトでも従来経路 (コピーを発行しない)
+    use super::*;
+
+    /// `DENNO_PF_OVERLAP` は既定 OFF。明示的な真値だけが ON。
+    #[test]
+    fn pf_overlap_flag_defaults_off() {
+        assert!(!parse_pf_overlap(None), "未設定は OFF (従来と同一経路)");
+        for raw in ["", "0", "off", "false", " 1", "1 ", "TRUE", "yes"] {
+            assert!(!parse_pf_overlap(Some(raw)), "raw={raw:?} は OFF のはず");
+        }
+        for raw in ["1", "true", "on"] {
+            assert!(parse_pf_overlap(Some(raw)), "raw={raw:?} は ON のはず");
+        }
+    }
+
+    /// 経路決定: OFF とデバイス準備失敗は**必ず**従来の同期 D2H。
+    #[test]
+    fn pf_h2_path_falls_back_to_sync() {
+        let (n, e) = (12850usize, 4096usize);
+        // フラグ OFF: dev_ready が真でも従来経路
+        assert_eq!(pf_h2_path(false, n, e, true), PfH2Path::SyncD2h);
+        assert_eq!(pf_h2_path(false, n, e, false), PfH2Path::SyncD2h);
+        // フラグ ON でも準備失敗 (stream/event/pinned) なら従来経路
+        assert_eq!(pf_h2_path(true, n, e, false), PfH2Path::SyncD2h);
+        // フラグ ON + 準備成功 + 妥当な形 → コピーストリーム
+        assert_eq!(pf_h2_path(true, n, e, true), PfH2Path::CopyStream);
+    }
+
+    /// 形が不正 (0・桁あふれ) なら従来経路 — コピーを発行しない。
+    #[test]
+    fn pf_h2_path_rejects_bad_shape() {
+        assert_eq!(pf_h2_path(true, 0, 4096, true), PfH2Path::SyncD2h);
+        assert_eq!(pf_h2_path(true, 12850, 0, true), PfH2Path::SyncD2h);
+        assert_eq!(pf_h2_path(true, 0, 0, true), PfH2Path::SyncD2h);
+        // n*e は通るが *4 で桁あふれ → 従来経路 (checked_mul)
+        assert_eq!(
+            pf_h2_path(true, usize::MAX / 2, 2, true),
+            PfH2Path::SyncD2h
+        );
+        assert_eq!(pf_h2_path(true, usize::MAX, 2, true), PfH2Path::SyncD2h);
+        // 1 行だけでも (実経路では n >= 2048 だが) 判定としてはコピー経路
+        assert_eq!(pf_h2_path(true, 1, 1, true), PfH2Path::CopyStream);
     }
 }
