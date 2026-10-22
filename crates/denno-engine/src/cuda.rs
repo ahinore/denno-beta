@@ -3695,7 +3695,12 @@ pub const CH_LOGITS: usize = 8; // lm_head 出力 [m*vocab]
 pub const CH_Q35_Q: usize = 9;
 /// s70: prefill FFN チェーンの入力 (CH_H は attention/decode が使うため分ける)
 pub const CH_PFH: usize = 10;
-const CH_SLOTS: usize = 11;
+/// s165 (P2): prefill の残差ストリーム (h) を層の間ずっと保持するスロット。
+/// `dno_add_rmsnorm` の x そのもので、残差加算は**次の rmsnorm の proj 引数**に
+/// 融合される (PTX に単独の add カーネルは無い)。層をまたいで内容が変わるのは
+/// rmsnorm の add と、prefill 開始時の H2D / フォールバック時の D2H だけ。
+pub const CH_PF_RES: usize = 11;
+const CH_SLOTS: usize = 12;
 
 // P17j: prefill attention カーネルのタイル定数 (kernels_elem.cu の PF_BQ/PF_BK
 // と同期すること)。BQ=行タイル・BK=key タイル。
@@ -4089,6 +4094,23 @@ pub fn chain_rmsnorm(
     m: usize,
     pin_id: usize,
 ) -> Option<()> {
+    chain_rmsnorm_slot(CH_X, w, eps, add_slot, out_slot, cols, m, pin_id)
+}
+
+/// s165 (P2): 入力スロットを指定できる rmsnorm。カーネル (`dno_add_rmsnorm`)・
+/// grid・block・動的 shmem・引数の並びは [`chain_rmsnorm`] と 1 つも変わらず、
+/// 違うのは x のポインタだけ — したがって出力は `chain_rmsnorm` とビット一致する
+/// (prefill の残差常駐経路が `CH_PF_RES` を読むために使う)。
+pub fn chain_rmsnorm_slot(
+    x_slot: usize,
+    w: &[f32],
+    eps: f32,
+    add_slot: Option<usize>,
+    out_slot: usize,
+    cols: usize,
+    m: usize,
+    pin_id: usize,
+) -> Option<()> {
     let ctx = chain_ctx()?;
     if w.len() != cols {
         return chain_fail(anyhow::anyhow!("chain_rmsnorm: w size mismatch"));
@@ -4111,7 +4133,7 @@ pub fn chain_rmsnorm(
         };
         let out_buf = s.bufs[out_slot].as_ref().unwrap();
         let wdev = out_buf.ptr() + (m * cols * 4) as u64; // バッファ末尾に置く
-        let xptr = s.bufs[CH_X].as_ref().unwrap().ptr();
+        let xptr = s.bufs[x_slot].as_ref()?.ptr();
         let pptr = match add_slot {
             Some(sl) => s.bufs[sl].as_ref().unwrap().ptr(),
             None => 0, // NULL → 単純 rmsnorm
@@ -4510,6 +4532,62 @@ pub fn chain_mlp_prefill_q4(
     li: usize,
     out: &mut [f32],
 ) -> Option<()> {
+    let e = gate_dims_in(gate)?;
+    if x.len() < m.checked_mul(e)? || out.len() < m.checked_mul(e)? {
+        return None;
+    }
+    chain_mlp_prefill_q4_impl(gate, up, down, PfSrc::Host(x), PfSink::Host(out), m, li)
+}
+
+/// s165 (P2): FFN チェーンの入出力をデバイス常駐で回す版。入力は `CH_PFH`
+/// (rmsnorm 出力・先頭から m 行)、出力は `CH_DOWN` — 転送も同期も 0 回で、
+/// 後続の残差加算 (次の rmsnorm の proj) が同じストリームで読む。
+/// カーネル・タイル幅・引数は [`chain_mlp_prefill_q4`] と同一 (数値不変)。
+pub fn chain_mlp_prefill_q4_dev(
+    gate: &crate::quant::Linear,
+    up: &crate::quant::Linear,
+    down: &crate::quant::Linear,
+    m: usize,
+    li: usize,
+) -> Option<()> {
+    chain_mlp_prefill_q4_impl(gate, up, down, PfSrc::Slot, PfSink::Slot, m, li)
+}
+
+/// [`chain_mlp_prefill_q4`] の入力次元 (k)。Q4 以外は None。
+fn gate_dims_in(w: &crate::quant::Linear) -> Option<usize> {
+    match w {
+        crate::quant::Linear::Q4(q) => Some(q.k),
+        _ => None,
+    }
+}
+
+/// s165 (P2): prefill チェーンの入力の出所。
+/// `Host` は従来どおりホスト slice をタイルごとに H2D、`Slot` は
+/// 「既にデバイスに居る」ことを表す — 消えるのは転送だけで、カーネル・grid・
+/// 引数・演算列は 1 つも変わらない (行ごとに独立なので bit 一致)。
+enum PfSrc<'a> {
+    Host(&'a [f32]),
+    /// `CH_PFH` の先頭から m 行 (rmsnorm 出力) をそのまま読む
+    Slot,
+}
+
+/// s165 (P2): prefill チェーンの出力先。`Slot` はデバイス常駐バッファ
+/// (`CH_DOWN` / `CH_O`) に書き、D2H と同期を行わない。
+enum PfSink<'a> {
+    Host(&'a mut [f32]),
+    Slot,
+}
+
+/// [`chain_mlp_prefill_q4`] の本体 (入出力の出所だけを差し替える)。
+fn chain_mlp_prefill_q4_impl(
+    gate: &crate::quant::Linear,
+    up: &crate::quant::Linear,
+    down: &crate::quant::Linear,
+    src: PfSrc<'_>,
+    mut sink: PfSink<'_>,
+    m: usize,
+    li: usize,
+) -> Option<()> {
     use crate::quant::Linear;
     if !cuda_enabled()
         || !gemm_enabled()
@@ -4527,13 +4605,28 @@ pub fn chain_mlp_prefill_q4(
     if uu.k != e || uu.n != ff || du.k != ff || du.n != e {
         return None;
     }
-    if m == 0 || x.len() < m * e || out.len() < m * e {
+    if m == 0 {
         return None;
+    }
+    if let PfSrc::Host(x) = src {
+        if x.len() < m * e {
+            return None;
+        }
+    }
+    if let PfSink::Host(out) = &sink {
+        if out.len() < m * e {
+            return None;
+        }
     }
     let ctx = chain_ctx()?;
     let gw1 = weights_for_q4(gu.uid, &gu.blocks, gu.k, gu.n).ok()?;
     let gw2 = weights_for_q4(uu.uid, &uu.blocks, uu.k, uu.n).ok()?;
     let gw3 = weights_for_q4(du.uid, &du.blocks, du.k, du.n).ok()?;
+    // Slot 出力は CH_DOWN の行オフセットへ書くので、全行ぶんの領域を要求する
+    // (タイルごとの ensure は mr 行ぶんしか保証しない)。
+    if matches!(sink, PfSink::Slot) {
+        ok(chain_ensure_buf(CH_DOWN, m.checked_mul(e)?.checked_mul(4)?))?;
+    }
     const TILE: usize = 1024;
     let _ = li;
     let mut r0 = 0usize;
@@ -4543,30 +4636,44 @@ pub fn chain_mlp_prefill_q4(
         ok(chain_ensure_buf(CH_GA, mr * 2 * ff * 4))?;
         ok(chain_ensure_buf(CH_ACT, mr * ff * 4))?;
         ok(chain_ensure_buf(CH_DOWN, mr * e * 4))?;
-        // 1) rmsnorm 済み x のタイルを H2D
-        CHAIN.with(|cell| -> Option<()> {
-            let buf = cell.borrow().bufs[CH_PFH].as_ref()?.ptr();
-            let lib = lib().ok()?;
-            unsafe {
-                ok(check(
-                    (lib.memcpy_htod_async)(
-                        buf,
-                        x[r0 * e..].as_ptr() as *const c_void,
-                        mr * e * 4,
-                        std::ptr::null_mut(),
-                    ),
-                    "cuMemcpyHtoDAsync (mlp prefill q4)",
-                ))
-            }
-        })?;
-        // 2) gate → CH_GA 前半 / up → CH_GA 後半 / 3) swiglu / 4) down
+        // 出力先 (Host のときだけ D2H する)。生ポインタで持って CHAIN の
+        // クロージャに渡す (Vec の再借用を避ける)。
+        let dst: Option<*mut f32> = match &mut sink {
+            PfSink::Host(out) => Some(out[r0 * e..].as_mut_ptr()),
+            PfSink::Slot => None,
+        };
         CHAIN.with(|cell| -> Option<()> {
             let s = cell.borrow();
-            let pin = s.bufs[CH_PFH].as_ref()?.ptr();
             let pga = s.bufs[CH_GA].as_ref()?.ptr();
             let pact = s.bufs[CH_ACT].as_ref()?.ptr();
-            let pdown = s.bufs[CH_DOWN].as_ref()?.ptr();
+            // 出力の書き先: Host はタイル先頭 (D2H で呼び出し元の行へ)、
+            // Slot は CH_DOWN の該当行 (デバイス常駐・行オフセットへ書く)。
+            let pdown = match &sink {
+                PfSink::Host(_) => s.bufs[CH_DOWN].as_ref()?.ptr(),
+                PfSink::Slot => s.bufs[CH_DOWN].as_ref()?.ptr() + (r0 * e * 4) as u64,
+            };
             let up_off = (mr * ff * 4) as u64;
+            // 1) 入力: Host ならタイルを H2D、Slot なら CH_PFH の該当行を直接読む
+            let pin = match &src {
+                PfSrc::Host(x) => {
+                    let buf = s.bufs[CH_PFH].as_ref()?.ptr();
+                    let lib = lib().ok()?;
+                    unsafe {
+                        ok(check(
+                            (lib.memcpy_htod_async)(
+                                buf,
+                                x[r0 * e..].as_ptr() as *const c_void,
+                                mr * e * 4,
+                                std::ptr::null_mut(),
+                            ),
+                            "cuMemcpyHtoDAsync (mlp prefill q4)",
+                        ))?
+                    }
+                    buf
+                }
+                PfSrc::Slot => s.bufs[CH_PFH].as_ref()?.ptr() + (r0 * e * 4) as u64,
+            };
+            // 2) gate → CH_GA 前半 / up → CH_GA 後半 / 3) swiglu / 4) down
             crate::prof::time_layer(crate::prof::GATE_UP, li, || -> Option<()> {
                 chain_gemm_q4_pf(gw1, pin, pga, mr, e, ff)?;
                 chain_gemm_q4_pf(gw2, pin, pga + up_off, mr, e, ff)
@@ -4577,26 +4684,26 @@ pub fn chain_mlp_prefill_q4(
             crate::prof::time_layer(crate::prof::DOWN, li, || -> Option<()> {
                 chain_gemm_q4_pf(gw3, pact, pdown, mr, ff, e)
             })?;
+            // 5) down のタイルだけ D2H (呼び出し元バッファへ直接)。
+            //    Slot 出力では CH_DOWN に残したまま次段 (rmsnorm の add) に渡す。
+            if let Some(dstp) = dst {
+                let lib = lib().ok()?;
+                unsafe {
+                    ok(check(
+                        (lib.memcpy_dtoh_async)(
+                            dstp as *mut c_void,
+                            pdown,
+                            mr * e * 4,
+                            std::ptr::null_mut(),
+                        ),
+                        "cuMemcpyDtoHAsync (mlp prefill q4)",
+                    ))?
+                }
+                crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+                ok(ctx.sync())?;
+            }
             Some(())
         })?;
-        // 5) down のタイルだけ D2H (呼び出し元バッファへ直接)
-        CHAIN.with(|cell| -> Option<()> {
-            let buf = cell.borrow().bufs[CH_DOWN].as_ref()?.ptr();
-            let lib = lib().ok()?;
-            unsafe {
-                ok(check(
-                    (lib.memcpy_dtoh_async)(
-                        out[r0 * e..].as_mut_ptr() as *mut c_void,
-                        buf,
-                        mr * e * 4,
-                        std::ptr::null_mut(),
-                    ),
-                    "cuMemcpyDtoHAsync (mlp prefill q4)",
-                ))
-            }
-        })?;
-        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
-        ok(ctx.sync())?;
         r0 += mr;
     }
     Some(())
@@ -10203,6 +10310,119 @@ pub fn chain_gdn_prefill_q4(
     li: usize,
     kv: u64,
 ) -> Option<()> {
+    let e = gate_dims_in(qkv_w)?;
+    if x.len() < n.checked_mul(e)? || out.len() < n.checked_mul(e)? {
+        return None;
+    }
+    chain_gdn_prefill_q4_impl(
+        qkv_w,
+        z_w,
+        o_w,
+        beta,
+        alpha,
+        wconv,
+        wa,
+        wdt,
+        wnorm,
+        PfSrc::Host(x),
+        PfSink::Host(out),
+        n,
+        nk,
+        nv,
+        dk,
+        dv,
+        d_conv,
+        eps,
+        q_scale,
+        conv_st,
+        ssm_st,
+        li,
+        kv,
+    )
+}
+
+/// s165 (P2): GDN 層の prefill を**デバイス常駐の入出力**で通す版。入力は
+/// `CH_PFH` (rmsnorm 出力・先頭から n 行)、出力は `CH_O`。消えるのは
+/// x の H2D と o_proj の D2H だけで、GEMM / スキャン / 状態契約は
+/// [`chain_gdn_prefill_q4`] と同一 (カーネル・grid・引数・chunk 分割すべて不変)。
+#[allow(clippy::too_many_arguments)]
+pub fn chain_gdn_prefill_q4_dev(
+    qkv_w: &crate::quant::Linear,
+    z_w: &crate::quant::Linear,
+    o_w: &crate::quant::Linear,
+    beta: &[f32],
+    alpha: &[f32],
+    wconv: &[f32],
+    wa: &[f32],
+    wdt: &[f32],
+    wnorm: &[f32],
+    n: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    eps: f32,
+    q_scale: f32,
+    conv_st: &mut [f32],
+    ssm_st: &mut [f32],
+    li: usize,
+    kv: u64,
+) -> Option<()> {
+    chain_gdn_prefill_q4_impl(
+        qkv_w,
+        z_w,
+        o_w,
+        beta,
+        alpha,
+        wconv,
+        wa,
+        wdt,
+        wnorm,
+        PfSrc::Slot,
+        PfSink::Slot,
+        n,
+        nk,
+        nv,
+        dk,
+        dv,
+        d_conv,
+        eps,
+        q_scale,
+        conv_st,
+        ssm_st,
+        li,
+        kv,
+    )
+}
+
+/// [`chain_gdn_prefill_q4`] の本体 (入出力の出所だけを差し替える)。
+#[allow(clippy::too_many_arguments)]
+fn chain_gdn_prefill_q4_impl(
+    qkv_w: &crate::quant::Linear,
+    z_w: &crate::quant::Linear,
+    o_w: &crate::quant::Linear,
+    beta: &[f32],
+    alpha: &[f32],
+    wconv: &[f32],
+    wa: &[f32],
+    wdt: &[f32],
+    wnorm: &[f32],
+    src: PfSrc<'_>,
+    mut sink: PfSink<'_>,
+    n: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    eps: f32,
+    q_scale: f32,
+    conv_st: &mut [f32],
+    ssm_st: &mut [f32],
+    li: usize,
+    kv: u64,
+) -> Option<()> {
     // 形・重み種別の検査は gdn_prefill_q4_geom (純粋・GPU 不要) に集約してある。
     // フォールバック契約は tests::b20_stage1_tests::gdn_prefill_q4_geom_contract で固定する。
     // デバイスの準備 (cuda_enabled 等) は形が合ってから。
@@ -10220,11 +10440,23 @@ pub fn chain_gdn_prefill_q4(
     if wnorm.len() != dv {
         return None;
     }
-    if x.len() < n.checked_mul(e)? || out.len() < n.checked_mul(e)? {
-        return None;
+    if let PfSrc::Host(x) = src {
+        if x.len() < n.checked_mul(e)? {
+            return None;
+        }
+    }
+    if let PfSink::Host(out) = &sink {
+        if out.len() < n.checked_mul(e)? {
+            return None;
+        }
     }
     if conv_st.len() != conv_dim.checked_mul(cs)? || ssm_st.len() != nv.checked_mul(dk)?.checked_mul(dv)? {
         return None;
+    }
+    // Slot 入力は CH_PFH の先頭 n 行をそのまま読むので、行数ぶんの領域を要求する
+    // (rmsnorm が ensure 済みなら no-op。足りなければ None → 呼び出し側がフォールバック)。
+    if matches!(src, PfSrc::Slot) {
+        ok(chain_ensure_buf(CH_PFH, n.checked_mul(e)?.checked_mul(4)?))?;
     }
     // ここまでで「形が合っている」ことが確定した → デバイスの準備に入る。
     if !cuda_enabled()
@@ -10257,28 +10489,36 @@ pub fn chain_gdn_prefill_q4(
     ok(chain_ensure_buf(CH_PFH, TILE.min(n).checked_mul(e)?.checked_mul(4)?))?;
     ok(chain_ensure_buf(CH_O, n.checked_mul(e)?.checked_mul(4)?))?;
 
-    // 1) qkv / z 投影: x を 1024 行ずつ H2D し、GEMM は出力の行オフセットへ書く
+    // 1) qkv / z 投影: 入力を 1024 行ずつ用意し、GEMM は出力の行オフセットへ書く
     //    (per-op 経路の 1024 行タイルと同じ形。H2D と GEMM は同一ストリームで
-    //    順序が保たれるので、タイル間の sync は要らない)。
+    //    順序が保たれるので、タイル間の sync は要らない)。Host はタイルごとに
+    //    H2D、Slot (残差常駐経路) は CH_PFH の該当行をそのまま読む — 転送だけが
+    //    消え、カーネル・引数は同一。
     let mut r0 = 0usize;
     while r0 < n {
         let mr = TILE.min(n - r0);
         CHAIN.with(|cell| -> Option<()> {
             let s = cell.borrow();
-            let pin = s.bufs[CH_PFH].as_ref()?.ptr();
-            let lib = lib().ok()?;
-            // H2D x タイル → 同一ストリームの GEMM (順序はストリームが保証する)
-            unsafe {
-                ok(check(
-                    (lib.memcpy_htod_async)(
-                        pin,
-                        x[r0 * e..].as_ptr() as *const c_void,
-                        mr * e * 4,
-                        std::ptr::null_mut(),
-                    ),
-                    "cuMemcpyHtoDAsync (gdn prefill q4 x)",
-                ))?;
-            }
+            let pbuf = s.bufs[CH_PFH].as_ref()?.ptr();
+            let pin = match &src {
+                PfSrc::Host(x) => {
+                    let lib = lib().ok()?;
+                    // H2D x タイル → 同一ストリームの GEMM (順序はストリームが保証する)
+                    unsafe {
+                        ok(check(
+                            (lib.memcpy_htod_async)(
+                                pbuf,
+                                x[r0 * e..].as_ptr() as *const c_void,
+                                mr * e * 4,
+                                std::ptr::null_mut(),
+                            ),
+                            "cuMemcpyHtoDAsync (gdn prefill q4 x)",
+                        ))?;
+                    }
+                    pbuf
+                }
+                PfSrc::Slot => pbuf + (r0 * e * 4) as u64,
+            };
             crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
                 chain_gemm_q4_pf(gw_qkv, pin, pq + (r0 * conv_dim * 4) as u64, mr, e, conv_dim)?;
                 chain_gemm_q4_pf(gw_z, pin, pz + (r0 * vd * 4) as u64, mr, e, vd)
@@ -10322,29 +10562,438 @@ pub fn chain_gdn_prefill_q4(
         .map(|_| ()))
     })?;
 
-    // 4) o_proj (y はデバイス上) → 5) D2H は最後の 1 回だけ。
+    // 4) o_proj (y はデバイス上) → 5) D2H は Host 出力のときだけ最後の 1 回。
     let po = CHAIN.with(|cell| cell.borrow().bufs[CH_O].as_ref().map(|b| b.ptr()))?;
     crate::prof::time_layer(crate::prof::OPROJ, li, || -> Option<()> {
         chain_gemm_q4_pf(gw_o, py, po, n, vd, e)
     })?;
+    // Slot 出力 (残差常駐経路) は CH_O に残したまま、次の rmsnorm の proj 引数として
+    // 読ませる — D2H も sync もしない (同じストリームなので順序は保たれる)。
+    if let PfSink::Host(out) = &mut sink {
+        CHAIN.with(|cell| -> Option<()> {
+            let buf = cell.borrow().bufs[CH_O].as_ref()?.ptr();
+            let lib = lib().ok()?;
+            unsafe {
+                ok(check(
+                    (lib.memcpy_dtoh_async)(
+                        out.as_mut_ptr() as *mut c_void,
+                        buf,
+                        n * e * 4,
+                        std::ptr::null_mut(),
+                    ),
+                    "cuMemcpyDtoHAsync (gdn prefill q4 o)",
+                ))
+            }
+        })?;
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        ok(ctx.sync())?;
+    }
+    Some(())
+}
+
+// ---------------------------------------------------------------------------
+// s165 (P2): prefill の残差ストリーム (h) をデバイス常駐させる経路の小道具。
+//
+// 従来の prefill は層ごとに「rmsnorm(h) をホストで計算 → h2 を H2D → 投影 →
+// 出力を D2H → 残差加算をホスト」を繰り返していた (1 層 2 往復 + ホスト 2 パス)。
+// P2 では h を `CH_PF_RES` に置いたまま、層の中で
+//   rmsnorm (デバイス) → 投影 (デバイス) → 残差加算 (次の rmsnorm の proj 引数)
+// を通す。ホストが本当に必要とするものだけが往復する:
+//   - GDN 層: beta/alpha を計算するための h2 の D2H 1 回 (状態契約は従来どおり)
+//   - full attention 層: q/k/v はホスト計算なので h2 の D2H 1 回 + att の H2D 1 回
+//   - FFN: 往復なし
+//
+// 残差加算に専用カーネルは要らない (PTX に単独の add は無い) — `dno_add_rmsnorm`
+// の `proj` 引数が「x += proj」と「rmsnorm(x)」を 1 回で行うので、層の最後の
+// 投影出力を**次の rmsnorm の add_slot** として渡す。演算順はホスト経路と同一
+// (ホストも `x += proj` してから `rmsnorm(x)` を計算する)。
+// ---------------------------------------------------------------------------
+
+/// 層 1 枚ぶんの attention 投影の重み (事前検査・重み登録で使う)。
+pub enum PfAttnW<'a> {
+    Gdn {
+        qkv: &'a crate::quant::Linear,
+        z: &'a crate::quant::Linear,
+        o: &'a crate::quant::Linear,
+    },
+    Full {
+        q: &'a crate::quant::Linear,
+        k: &'a crate::quant::Linear,
+        v: &'a crate::quant::Linear,
+        o: &'a crate::quant::Linear,
+    },
+}
+
+/// 残差常駐経路の判定に使うモデル寸法。
+pub struct PfDims {
+    pub n: usize,
+    pub e: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub dh: usize,
+    pub nk: usize,
+    pub nv: usize,
+    pub dk: usize,
+    pub dv: usize,
+    pub d_conv: usize,
+}
+
+/// Q4 線形の (k, n)。Q4 以外は None。
+fn q4_dims(w: &crate::quant::Linear) -> Option<(usize, usize)> {
+    match w {
+        crate::quant::Linear::Q4(q) => Some((q.k, q.n)),
+        _ => None,
+    }
+}
+
+/// Q4 線形の (uid, blocks, k, n)。Q4 以外は None。
+fn q4_parts(w: &crate::quant::Linear) -> Option<(u64, &[u8], usize, usize)> {
+    match w {
+        crate::quant::Linear::Q4(q) => Some((q.uid, &q.blocks, q.k, q.n)),
+        _ => None,
+    }
+}
+
+/// s165 (P2): 残差常駐経路の**グローバル**入口条件 (純粋関数・GPU 非依存)。
+/// `all_q4` は「全層の attn/FFN 投影が q4」、`diag` は層別診断 (lchk) の有無。
+/// 診断中はホストの `x` が層ごとに更新される前提なので発動しない。
+/// `gemm_min` / `max_m` は env 実効値 (`gemm_min_m()` / `max_m()`) を渡す。
+pub fn pf_res_gate(
+    n: usize,
+    e: usize,
+    all_q4: bool,
+    diag: bool,
+    gemm_min: usize,
+    max_m: usize,
+) -> bool {
+    if !all_q4 || diag {
+        return false;
+    }
+    if n == 0 || e == 0 || n < gemm_min || n <= max_m {
+        return false;
+    }
+    // dno_add_rmsnorm の動的 shmem = e*4 (≤48KB)
+    if e % 32 != 0 || e.saturating_mul(4) > 48 * 1024 {
+        return false;
+    }
+    // 端数タイルが GEMV 帯域に入る形では per-op 経路と演算列が変わる
+    let rem = n % GDN_PREFILL_TILE;
+    if rem != 0 && rem <= max_m {
+        return false;
+    }
+    true
+}
+
+/// 実行時の env 実効値で [`pf_res_gate`] を評価する。
+pub fn pf_res_gate_now(n: usize, e: usize, all_q4: bool, diag: bool) -> bool {
+    pf_res_gate(n, e, all_q4, diag, gemm_min_m(), max_m())
+}
+
+/// 実行時の env 実効値で [`pf_layer_geom`] を評価する。
+pub fn pf_layer_geom_now(
+    attn: &PfAttnW<'_>,
+    gate: &crate::quant::Linear,
+    up: &crate::quant::Linear,
+    down: &crate::quant::Linear,
+    d: &PfDims,
+) -> Option<()> {
+    pf_layer_geom(attn, gate, up, down, d, gemm_min_m(), max_m())
+}
+
+/// s165 (P2): 層 1 枚を残差常駐で通せるかの事前検査 (純粋関数・GPU 非依存)。
+/// `None` なら呼び出し側はこの層を従来のホスト経路で通す (残差は触らない)。
+pub fn pf_layer_geom(
+    attn: &PfAttnW<'_>,
+    gate: &crate::quant::Linear,
+    up: &crate::quant::Linear,
+    down: &crate::quant::Linear,
+    d: &PfDims,
+    gemm_min: usize,
+    max_m: usize,
+) -> Option<()> {
+    let (n, e) = (d.n, d.e);
+    if !pf_res_gate(n, e, true, false, gemm_min, max_m) {
+        return None;
+    }
+    // FFN: q4・形・k/n の整合
+    let (gk, gn) = q4_dims(gate)?;
+    let (uk, un) = q4_dims(up)?;
+    let (dkn, dn) = q4_dims(down)?;
+    if gk != e || uk != e || gn != un || dkn != gn || dn != e {
+        return None;
+    }
+    if gn == 0 || gn % 32 != 0 {
+        return None;
+    }
+    match attn {
+        PfAttnW::Gdn { qkv, z, o } => {
+            // 形状・dk==dv・d_conv==4・n の帯域は gdn_prefill_q4_geom と同一契約
+            gdn_prefill_q4_geom(qkv, z, o, n, d.nk, d.nv, d.dk, d.dv, d.d_conv)?;
+        }
+        PfAttnW::Full { q, k, v, o } => {
+            let (qk, qn) = q4_dims(q)?;
+            let (kk, kn) = q4_dims(k)?;
+            let (vk, vn) = q4_dims(v)?;
+            let (okn, on) = q4_dims(o)?;
+            if d.heads == 0 || d.dh == 0 || d.kv_heads == 0 {
+                return None;
+            }
+            let att = d.heads.checked_mul(d.dh)?;
+            let kv_dim = d.kv_heads.checked_mul(d.dh)?;
+            if qk != e || qn != att.checked_mul(2)? || kk != e || kn != kv_dim {
+                return None;
+            }
+            if vk != e || vn != kv_dim || okn != att || on != e {
+                return None;
+            }
+            if att % 32 != 0 || kv_dim % 32 != 0 {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
+/// s165 (P2): 残差常駐経路が使うスロットを事前に確保する (rmsnorm の前に呼ぶ)。
+/// ここで失敗すれば残差はまだ触っていないので、呼び出し側は安全にフォールバックできる。
+pub fn chain_pf_reserve(n: usize, e: usize) -> Option<()> {
+    let _ = chain_ctx()?;
+    let rows = n.checked_mul(e)?.checked_mul(4)?;
+    ok(chain_ensure_buf(CH_PF_RES, rows))?;
+    ok(chain_ensure_buf(CH_PFH, rows.checked_add(e.checked_mul(4)?)?))?;
+    ok(chain_ensure_buf(CH_O, rows))?;
+    ok(chain_ensure_buf(CH_DOWN, rows))?;
+    Some(())
+}
+
+/// s165 (P2): 層の q4 重みをデバイスへ事前登録する。登録失敗 (確保失敗) を
+/// 残差を更新する前に確定させるためのもの (チェーン内の登録はキャッシュヒット)。
+pub fn pf_layer_dev_register(
+    attn: &PfAttnW<'_>,
+    gate: &crate::quant::Linear,
+    up: &crate::quant::Linear,
+    down: &crate::quant::Linear,
+) -> Option<()> {
+    let _ = chain_ctx()?;
+    let reg = |w: &crate::quant::Linear| -> Option<()> {
+        let q = match w {
+            crate::quant::Linear::Q4(q) => q,
+            _ => return None,
+        };
+        weights_for_q4(q.uid, &q.blocks, q.k, q.n).ok()?;
+        Some(())
+    };
+    match attn {
+        PfAttnW::Gdn { qkv, z, o } => {
+            reg(qkv)?;
+            reg(z)?;
+            reg(o)?;
+        }
+        PfAttnW::Full { q, k, v, o } => {
+            reg(q)?;
+            reg(k)?;
+            reg(v)?;
+            reg(o)?;
+        }
+    }
+    reg(gate)?;
+    reg(up)?;
+    reg(down)
+}
+
+/// s165 (P2): 残差ストリーム (h) を `CH_PF_RES` へ 1 回だけアップロードする
+/// (非同期・同期なし)。prefill の開始時に 1 回だけ呼ぶ。
+pub fn chain_pf_res_upload(h: &[f32], m: usize, e: usize) -> Option<()> {
+    let _ = chain_ctx()?;
+    let n_elems = m.checked_mul(e)?;
+    let bytes = n_elems.checked_mul(4)?;
+    if n_elems == 0 || h.len() < n_elems {
+        return None;
+    }
+    ok(chain_ensure_buf(CH_PF_RES, bytes))?;
     CHAIN.with(|cell| -> Option<()> {
-        let buf = cell.borrow().bufs[CH_O].as_ref()?.ptr();
+        let buf = cell.borrow().bufs[CH_PF_RES].as_ref()?.ptr();
+        let lib = lib().ok()?;
+        unsafe {
+            ok(check(
+                (lib.memcpy_htod_async)(buf, h.as_ptr() as *const c_void, bytes, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync (pf residual)",
+            ))
+        }
+    })
+}
+
+/// s165 (P2): `CH_PF_RES` の内容をホストへ戻す (フォールバック時の復元・同期あり)。
+pub fn chain_pf_res_download(m: usize, e: usize, out: &mut [f32]) -> Option<()> {
+    let n_elems = m.checked_mul(e)?;
+    if n_elems == 0 || out.len() < n_elems {
+        return None;
+    }
+    let v = chain_download_at(CH_PF_RES, 0, n_elems)?;
+    out[..n_elems].copy_from_slice(&v);
+    Some(())
+}
+
+/// s165 (P2): ホストで計算した attention 出力 (sigmoid ゲート適用済み) を
+/// `CH_ATT` へ 1 回だけアップロードする。pinned は層ごとに専用 (li*3+2) —
+/// 非同期 H2D の完了前に次の層が同じ領域を上書きしないため
+/// (`chain_rmsnorm` の pin と同じ規約)。
+pub fn chain_pf_upload_att(att: &[f32], cols: usize, m: usize, li: usize) -> Option<()> {
+    let _ = chain_ctx()?;
+    let n_elems = m.checked_mul(cols)?;
+    let bytes = n_elems.checked_mul(4)?;
+    if n_elems == 0 || att.len() < n_elems {
+        return None;
+    }
+    ok(chain_ensure_buf(CH_ATT, bytes))?;
+    let pin_id = li.checked_mul(3)?.checked_add(2)?;
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        while s.pins.len() <= pin_id {
+            s.pins.push(None);
+        }
+        ok(Scratch::ensure_pin(&mut s.pins[pin_id], bytes))?;
+        let pin = s.pins[pin_id].as_mut().unwrap();
+        pin.as_mut_slice::<f32>()[..n_elems].copy_from_slice(&att[..n_elems]);
+        let src = pin.ptr as *const c_void;
+        let buf = s.bufs[CH_ATT].as_ref()?.ptr();
+        let lib = lib().ok()?;
+        unsafe {
+            ok(check(
+                (lib.memcpy_htod_async)(buf, src, bytes, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync (pf att)",
+            ))
+        }
+    })
+}
+
+/// s165 (P2): full attention 層の q/k/v 投影を**デバイス常駐の入力** (`CH_PFH`,
+/// rmsnorm 出力・先頭から `rows` 行) から回し、**出力だけ**をホストへ戻す。
+/// KV キャッシュはホストが正で q/k/v の値はホストの prepare が要るので、
+/// 値は必ず戻す (戻す量は q/k/v の幅で、h2 の H2D 3 回より小さい)。
+/// 3 本の GEMM は `CH_QKV` の連続領域 (q|k|v) に行オフセットで書き、
+/// D2H 3 発 + sync 1 回で呼び出し元のバッファへ直接落とす。
+/// カーネル・grid・引数は per-op 経路と同一 (行ごとに独立 → bit 一致)。
+pub fn chain_qkv_prefill_q4_dev(
+    q_w: &crate::quant::Linear,
+    k_w: &crate::quant::Linear,
+    v_w: &crate::quant::Linear,
+    rows: usize,
+    li: usize,
+    out_qg: &mut [f32],
+    out_k: &mut [f32],
+    out_v: &mut [f32],
+) -> Option<()> {
+    if !cuda_enabled() || !gemm_enabled() || GPU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let (qn, qcols) = q4_dims(q_w)?;
+    let (kn, kcols) = q4_dims(k_w)?;
+    let (vn, vcols) = q4_dims(v_w)?;
+    if qn != kn || qn != vn || qn == 0 || qn % 32 != 0 {
+        return None;
+    }
+    if qcols % 32 != 0 || kcols % 32 != 0 || vcols % 32 != 0 {
+        return None;
+    }
+    if rows < gemm_min_m() || rows <= max_m() {
+        return None;
+    }
+    if out_qg.len() < rows * qcols || out_k.len() < rows * kcols || out_v.len() < rows * vcols {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+    let (q_uid, q_blk, _, _) = q4_parts(q_w)?;
+    let (k_uid, k_blk, _, _) = q4_parts(k_w)?;
+    let (v_uid, v_blk, _, _) = q4_parts(v_w)?;
+    let gwq = weights_for_q4(q_uid, q_blk, qn, qcols).ok()?;
+    let gwk = weights_for_q4(k_uid, k_blk, kn, kcols).ok()?;
+    let gwv = weights_for_q4(v_uid, v_blk, vn, vcols).ok()?;
+    let total = rows.checked_mul(qcols.checked_add(kcols)?.checked_add(vcols)?)?;
+    ok(chain_ensure_buf(CH_QKV, total.checked_mul(4)?))?;
+    // 入力は CH_PFH の先頭 rows 行 (rmsnorm 出力) — 行数ぶんの領域を要求
+    ok(chain_ensure_buf(CH_PFH, rows.checked_mul(qn)?.checked_mul(4)?))?;
+    let (pin, pqkv) = CHAIN.with(|cell| -> Option<(u64, u64)> {
+        let s = cell.borrow();
+        Some((s.bufs[CH_PFH].as_ref()?.ptr(), s.bufs[CH_QKV].as_ref()?.ptr()))
+    })?;
+    let q_off = (rows * qcols * 4) as u64;
+    let k_off = (rows * (qcols + kcols) * 4) as u64;
+    crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
+        chain_gemm_q4_pf(gwq, pin, pqkv, rows, qn, qcols)?;
+        chain_gemm_q4_pf(gwk, pin, pqkv + q_off, rows, kn, kcols)?;
+        chain_gemm_q4_pf(gwv, pin, pqkv + k_off, rows, vn, vcols)
+    })?;
+    // D2H 3 発 (async) → sync 1 回
+    CHAIN.with(|cell| -> Option<()> {
+        let s = cell.borrow();
+        let base = s.bufs[CH_QKV].as_ref()?.ptr();
         let lib = lib().ok()?;
         unsafe {
             ok(check(
                 (lib.memcpy_dtoh_async)(
-                    out.as_mut_ptr() as *mut c_void,
-                    buf,
-                    n * e * 4,
+                    out_qg.as_mut_ptr() as *mut c_void,
+                    base,
+                    rows * qcols * 4,
                     std::ptr::null_mut(),
                 ),
-                "cuMemcpyDtoHAsync (gdn prefill q4 o)",
+                "cuMemcpyDtoHAsync (pf qkv q)",
+            ))?;
+            ok(check(
+                (lib.memcpy_dtoh_async)(
+                    out_k.as_mut_ptr() as *mut c_void,
+                    base + q_off,
+                    rows * kcols * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (pf qkv k)",
+            ))?;
+            ok(check(
+                (lib.memcpy_dtoh_async)(
+                    out_v.as_mut_ptr() as *mut c_void,
+                    base + k_off,
+                    rows * vcols * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (pf qkv v)",
             ))
         }
     })?;
     crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
     ok(ctx.sync())?;
     Some(())
+}
+
+/// s165 (P2): attention 出力 (`CH_ATT`) → o_proj (q4) → `CH_O` (デバイス常駐・
+/// 同期なし)。per-op 経路 (`maybe_gpu_linear_q4_into`) と同一カーネル・同一引数。
+/// m を 1 回で渡すのは、行ごとに独立で 1 行の i32 累積順が変わらないため
+/// (`chain_gdn_prefill_q4` の o_proj と同じ根拠)。
+pub fn chain_oproj_prefill_q4(o_w: &crate::quant::Linear, rows: usize, li: usize) -> Option<()> {
+    let ow = match o_w {
+        crate::quant::Linear::Q4(q) => q,
+        _ => return None,
+    };
+    if !cuda_enabled() || !gemm_enabled() || GPU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    if rows < gemm_min_m() || rows <= max_m() || ow.k == 0 || ow.n == 0 || ow.k % 32 != 0 {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+    let gw = weights_for_q4(ow.uid, &ow.blocks, ow.k, ow.n).ok()?;
+    let out_bytes = rows.checked_mul(ow.n)?.checked_mul(4)?;
+    let att_bytes = rows.checked_mul(ow.k)?.checked_mul(4)?;
+    ok(chain_ensure_buf(CH_O, out_bytes))?;
+    let (pa, po) = CHAIN.with(|cell| -> Option<(u64, u64)> {
+        let s = cell.borrow();
+        let a = s.bufs[CH_ATT].as_ref()?;
+        if a.bytes() < att_bytes {
+            return None;
+        }
+        Some((a.ptr(), s.bufs[CH_O].as_ref()?.ptr()))
+    })?;
+    let _ = ctx;
+    crate::prof::time_layer(crate::prof::OPROJ, li, || chain_gemm_q4_pf(gw, pa, po, rows, ow.k, ow.n))
 }
 
 /// chunked scan の入力 4 本 (qkv / z / beta / alpha) の出所。
@@ -11220,5 +11869,115 @@ mod p3_alias_tests {
         assert_eq!(rows[1] * sc_row, ff * sc_row);
         // up_w の nib は連結側の後半 (全 nib のちょうど半分) から始まる
         assert_eq!(ff * nib_row, (2 * ff * nb * 16) / 2);
+    }
+}
+
+mod p2_residual_tests {
+    //! s165 (Task P2): prefill の残差ストリームをデバイス常駐させる経路の**入口条件**
+    //! だけを固定する。GPU は使わない (純粋関数の契約テスト) — 数値の一致と速度は
+    //! 実機 (main セッション) の担当。ここで None になる条件がそのまま
+    //! 「この層は従来のホスト経路で通す」契約になる。
+    use super::*;
+
+    fn q4(k: usize, n: usize) -> crate::quant::Linear {
+        crate::quant::Linear::Q4(crate::quant::Q4Linear { blocks: Vec::new(), k, n, uid: 0 })
+    }
+    fn f32w(k: usize, n: usize) -> crate::quant::Linear {
+        crate::quant::Linear::F32 { w: vec![0.0; k * n], k, n }
+    }
+
+    /// グローバルゲート: q4 以外・診断中・GEMV 帯域・端数タイル・smem 超過で発動しない。
+    #[test]
+    fn pf_res_gate_contract() {
+        let (gm, mm) = (256usize, 16usize);
+        // 基準: 2048 token・e=5120 (端数タイル無し)
+        assert!(pf_res_gate(2048, 5120, true, false, gm, mm));
+        // q4 でない層が 1 本でもあれば発動しない
+        assert!(!pf_res_gate(2048, 5120, false, false, gm, mm));
+        // 層別診断 (lchk) 中はホストの x を層ごとに更新する前提 → 発動しない
+        assert!(!pf_res_gate(2048, 5120, true, true, gm, mm));
+        // GEMM 帯域の外 (m <= max_m() / m < gemm_min_m()) は発動しない
+        assert!(!pf_res_gate(16, 5120, true, false, gm, mm));
+        assert!(!pf_res_gate(128, 5120, true, false, gm, mm));
+        assert!(!pf_res_gate(0, 5120, true, false, gm, mm));
+        // dno_add_rmsnorm の動的 shmem (e*4 <= 48KB) と e % 32 == 0
+        assert!(!pf_res_gate(2048, 16384, true, false, gm, mm), "e=16384 は smem 48KB 超");
+        assert!(!pf_res_gate(2048, 5000, true, false, gm, mm), "e % 32 != 0");
+        // 端数タイルが GEMV 帯域 (<= max_m()) に入る形は受けない
+        let rem_small = GDN_PREFILL_TILE * 2 + mm;
+        assert!(!pf_res_gate(rem_small, 5120, true, false, gm, mm));
+        assert!(pf_res_gate(rem_small + 1, 5120, true, false, gm, mm));
+        assert!(pf_res_gate(GDN_PREFILL_TILE * 2, 5120, true, false, gm, mm));
+    }
+
+    /// 層ゲート: FFN / full attention / GDN の形が揃ったときだけ Some。
+    #[test]
+    fn pf_layer_geom_contract() {
+        let (gm, mm) = (256usize, 16usize);
+        let n = 2048usize;
+        let e = 64usize;
+        let ff = 128usize;
+        // full attention: heads=2, kv_heads=1, dh=32 → att=64, kv_dim=32
+        let (heads, kv_heads, dh) = (2usize, 1usize, 32usize);
+        let (att, kv_dim) = (heads * dh, kv_heads * dh);
+        let gate = q4(e, ff);
+        let up = q4(e, ff);
+        let down = q4(ff, e);
+        let d = PfDims {
+            n,
+            e,
+            heads,
+            kv_heads,
+            dh,
+            nk: 1,
+            nv: 1,
+            dk: 32,
+            dv: 32,
+            d_conv: 4,
+        };
+        let (q, k, v, o) = (q4(e, att * 2), q4(e, kv_dim), q4(e, kv_dim), q4(att, e));
+        let full = PfAttnW::Full { q: &q, k: &k, v: &v, o: &o };
+        assert!(pf_layer_geom(&full, &gate, &up, &down, &d, gm, mm).is_some(), "基準形は通る");
+
+        // FFN が q4 でない / 形が合わない → 受けない
+        assert!(pf_layer_geom(&full, &f32w(e, ff), &up, &down, &d, gm, mm).is_none());
+        assert!(pf_layer_geom(&full, &gate, &up, &q4(e, ff + 32), &d, gm, mm).is_none());
+        assert!(pf_layer_geom(&full, &gate, &up, &q4(ff, e + 32), &d, gm, mm).is_none());
+
+        // o_proj の k が heads*dh でない / q の n が 2*heads*dh でない → 受けない
+        let bad_o = q4(att + 32, e);
+        let full_bad = PfAttnW::Full { q: &q, k: &k, v: &v, o: &bad_o };
+        assert!(pf_layer_geom(&full_bad, &gate, &up, &down, &d, gm, mm).is_none());
+        let bad_q = q4(e, att);
+        let full_bad = PfAttnW::Full { q: &bad_q, k: &k, v: &v, o: &o };
+        assert!(pf_layer_geom(&full_bad, &gate, &up, &down, &d, gm, mm).is_none());
+
+        // GDN 層: qkv/z/o の形が揃えば通り、dk != dv では受けない
+        //   conv_dim = nk*dk*2 + nv*dv = 64 + 32 = 96, vd = 32
+        let gqkv = q4(e, 96);
+        let gz = q4(e, 32);
+        let go = q4(32, e);
+        let gdn = PfAttnW::Gdn { qkv: &gqkv, z: &gz, o: &go };
+        assert!(pf_layer_geom(&gdn, &gate, &up, &down, &d, gm, mm).is_some());
+        let mut d2 = PfDims { n, e, heads, kv_heads, dh, nk: 1, nv: 1, dk: 32, dv: 32, d_conv: 4 };
+        d2.dv = 16;
+        assert!(pf_layer_geom(&gdn, &gate, &up, &down, &d2, gm, mm).is_none(), "dk != dv は受けない");
+
+        // n が GEMV 帯域 → 層としても受けない
+        let mut d3 = PfDims { n: mm, e, heads, kv_heads, dh, nk: 1, nv: 1, dk: 32, dv: 32, d_conv: 4 };
+        assert!(pf_layer_geom(&full, &gate, &up, &down, &d3, gm, mm).is_none());
+        d3.n = n;
+        assert!(pf_layer_geom(&full, &gate, &up, &down, &d3, gm, mm).is_some());
+    }
+
+    /// 新スロットは既存と衝突せず、チェーン本数に収まる。
+    #[test]
+    fn pf_res_slot_is_distinct() {
+        let used = [
+            CH_X, CH_H, CH_QKV, CH_ATT, CH_O, CH_GA, CH_ACT, CH_DOWN, CH_LOGITS, CH_Q35_Q, CH_PFH,
+        ];
+        assert!(!used.contains(&CH_PF_RES), "CH_PF_RES は既存スロットと別");
+        assert!(CH_PF_RES < CH_SLOTS);
+
     }
 }
