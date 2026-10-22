@@ -1697,11 +1697,14 @@ impl Qwen35 {
                     //
                     // s164 (P1): q4 のデバイス常駐チェーンも**この値**を使うため、
                     // qkv/z 投影より先に計算する (投影どうしは独立で数値に影響しない)。
+                    // s172 (P13): beta と alpha を **h2 の 1 回の走査**でまとめて計算する
+                    // (`apply_bt_rows_pair_into` は 2 回呼び出しとビット一致)。
+                    // 従来は 2 call がそれぞれ m*k*4 (12,850 で 263 MB) の転置作業域を
+                    // 確保しており、確保+初回タッチのページフォルトだけで 1 リクエスト
+                    // 約 7.5 s を払っていた (このコンテナ実測 186 → 70 ms/層)。
                     crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                        g.beta_w.apply_bt_rows_into(&buf_h, n, &mut buf_beta)
-                    });
-                    crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                        g.alpha_w.apply_bt_rows_into(&buf_h, n, &mut buf_alpha)
+                        g.beta_w
+                            .apply_bt_rows_pair_into(&g.alpha_w, &buf_h, n, &mut buf_beta, &mut buf_alpha)
                     });
                     // s164 (P1): q4 重みでは qkv/z 投影 → GDN chunk scan → o_proj を
                     // デバイス常駐で通す (1 層あたり qkv/z/y の往復 約 2.0 GB を消す)。
@@ -2268,8 +2271,8 @@ impl Qwen35 {
             AttnKind::Gdn(g) => {
                 // beta/alpha は従来どおりホストで計算する (h2 を 1 回だけ戻す)。
                 // s167 (P6): h2 の D2H を専用コピーストリームで qkv/z GEMM と重ねる
-                // 経路を cuda 側が選ぶ (`DENNO_PF_OVERLAP=1` のときだけ。OFF・準備
-                // 失敗は従来と同一の順序 = 同期 D2H → beta/alpha → GEMM/scan/o_proj)。
+                // 経路を cuda 側が選ぶ (s172/P13 で**既定 ON**。`DENNO_PF_OVERLAP=0`
+                // で従来の順序 = 同期 D2H → beta/alpha → GEMM/scan/o_proj)。
                 // beta/alpha の関数・引数・順序、h2 の値、カーネル列は不変。
                 fit_prefill_buf(buf_beta, n * g.beta_w.dims().1);
                 fit_prefill_buf(buf_alpha, n * g.alpha_w.dims().1);
@@ -2315,11 +2318,16 @@ impl Qwen35 {
                         // 数値に寄与しない (`apply_bt_rows_into` は読み取りのみ) ので
                         // 直接渡す。12,850 token × 48 層 × 5120 × 4B = 12.6 GB/req の
                         // ホスト memcpy が消える (P9 の実測単価で ≈0.30 s)。
+                        // s172 (P13): beta と alpha を h2 の 1 回の走査でまとめて計算する
+                        // (2 回呼び出しとビット一致・`apply_bt_rows_pair_into`)。
                         crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                            g.beta_w.apply_bt_rows_into(h2, n, beta)
-                        });
-                        crate::prof::time_n_ev(crate::prof::ATT_GDN_PROJ, n, || {
-                            g.alpha_w.apply_bt_rows_into(h2, n, alpha)
+                            g.beta_w.apply_bt_rows_pair_into(
+                                &g.alpha_w,
+                                h2,
+                                n,
+                                beta,
+                                alpha,
+                            )
                         });
                         Some(())
                     },
