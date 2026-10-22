@@ -3442,3 +3442,33 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
   `docs/TASKS.md` は無変更。`git diff --stat` は docs 3 ファイルのみ。
 - **測っていないこと**: GPU は一切使っていない (bench / GPU_VERIFY / KPI を回していない)。引用した
   数値はすべて 2026-10-21 の実測値で、本タスクで新規に測った値は無い。8095 も触っていない。
+
+### s168: Task Q1 - `denno info` の `quant:` が量子化型を出すようにした (2026-10-22) 完了
+
+> 27B q4 の GGUF で `quant: F32 (0)` と出ていた。F32 は rmsnorm / bias の置き場で、実ファイル
+> では本数が量子化された重みを上回る (Qwen3.8-27B-Q4_0.gguf は F32 456 / Q4_0 352 / Q5K 48 /
+> Q4_1 8 / Q6K 1 / Q8_0 1) ため、全テンソルの最頻値を取ると F32 が勝っていた。量子化の種類を
+> 聞かれている行なので、F32 以外が 1 本でもあれば F32 を投票から外すようにした (CPU のみ)。
+
+- **実装**: `crates/denno-cli/src/main.rs` に `dominant_tensor_type()` を追加し、
+  `gguf_common_type()` の投票を `most_common_type()` から `dominant_tensor_type()` に差し替え。
+  - `most_common_type()` の意味 (最頻値・同数は ggml type id の小さい方 = 決定論) は不変。
+  - `gguf_quant_value()` / `info_quant_line()` の書式 (`<name> (<id>)`) と経路も不変。
+  - F32 しか無い GGUF は従来どおり F32 (空投票にしない)。テンソル 0 本は None -> `?`。
+  - `layers` (65 vs 64) と `family: ?` は**意図的に無変更** (運用判断待ち)。
+- **実測ゲート**: `cargo test -p denno-cli` = **18 -> 23 passed / 0 failed / 0 ignored**
+  (追加 5 本: `dominant_type_ignores_f32_when_quantised_type_exists` /
+  `dominant_type_keeps_f32_for_f32_only_file` / `dominant_type_matches_mode_without_f32` /
+  `dominant_type_empty_is_none` / `gguf_quant_value_skips_f32_storage_tensors`)。
+  `cargo test -p denno-engine --lib` = **275 passed / 0 failed / 1 ignored** (無変更)。
+- **変更前の挙動に戻すと落ちること (実測)**: `gguf_common_type()` の呼び出しを
+  `most_common_type()` に戻すと `gguf_quant_value_skips_f32_storage_tensors` が
+  `left: "F32 (0)"` / `right: "Q4_0 (2)"` で失敗 (**22 passed / 1 failed**)。
+  `dominant_tensor_type` を持たない HEAD に同じテストを載せると E0425
+  (`cannot find function dominant_tensor_type`) でコンパイル不能。
+- **実機 (CPU・実ファイル)**: `/work/models/Qwen3.8-27B-Q4_0.gguf` を唯一の GGUF とする
+  ディレクトリで `./target/debug/denno info <dir>` —
+  変更前 `quant:       F32 (0)` -> 変更後 `quant:       Q4_0 (2)` (他の行は無変更)。
+- **数値クラス**: なし (CLI の表示経路のみ。engine の数値経路・`.cu` / `.ptx` / GPU 実行は無変更)。
+- **測っていないこと**: bench / GPU アンカー / KPI (数値経路を 1 行も変えていないため構造的に
+  不変だが、測ってはいない)。8095 も触っていない。
