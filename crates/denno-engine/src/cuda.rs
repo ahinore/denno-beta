@@ -12353,6 +12353,83 @@ pub fn chain_pf_upload_att(att: &[f32], cols: usize, m: usize, li: usize) -> Opt
     })
 }
 
+/// s172 (P12): prefill attention の出力を **pinned ステージングへ直接** D2H し、
+/// 呼び出し側のクロージャでその場を書き換えてから同じバッファで H2D する
+/// (`DENNO_PF_ATT_INPLACE=0` で従来の
+/// `chain_download` → ホストで変換 → `chain_pf_upload_att` に戻る)。
+///
+/// 従来経路の無駄 (27B n=14,043 で 1 層あたり):
+///   1. `chain_download` が **pageable な新しい `Vec`** (345 MB) を確保して D2H
+///      → 毎層 345 MB の page fault + driver の内部ステージング経由。
+///   2. 呼び出し側がゲートを掛けたあと `att.copy_from_slice(&ga)` で
+///      ホスト・ホストの 345 MB コピー (読み + 書き = 690 MB)。
+///   3. `chain_pf_upload_att` が pinned へもう一度 345 MB コピー (690 MB)。
+/// ここでは D2H の宛先を 3 の pinned バッファそのものにして、変換もそこで行い、
+/// そのまま H2D する — 転送量は同じ (345 MB 下り + 345 MB 上り) で、
+/// 余計な 1.4 GB/層 のホスト memcpy と 345 MB/層 の確保が消える。
+///
+/// 安全性: D2H は `ctx.sync()` で完了を待ってから書き換える。pinned バッファは
+/// 層ごと (`chain_pf_upload_att` と同一の `li*3+2`) なので、次の層が同じ領域を
+/// 使うのは次の層の qkv chain の同期より後 = この H2D は既に完了している。
+/// カーネル・引数・転送バイト数は従来と同一で、値も 1 ビットも変わらない。
+pub fn chain_pf_att_inplace<F>(li: usize, cols: usize, m: usize, gate: F) -> Option<()>
+where
+    F: FnOnce(&mut [f32]),
+{
+    if cols == 0 || m == 0 {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+    let n_elems = m.checked_mul(cols)?;
+    let bytes = n_elems.checked_mul(4)?;
+    ok(chain_ensure_buf(CH_ATT, bytes))?;
+    let pin_id = li.checked_mul(3)?.checked_add(2)?;
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        while s.pins.len() <= pin_id {
+            s.pins.push(None);
+        }
+        ok(Scratch::ensure_pin(&mut s.pins[pin_id], bytes))?;
+        // 1) CH_ATT → pinned (宛先が pinned なので pageable 経路の内部ステージングが無い)
+        {
+            let buf = s.bufs[CH_ATT].as_ref()?.ptr();
+            let pin = s.pins[pin_id].as_mut().unwrap();
+            let lib = lib().ok()?;
+            unsafe {
+                ok(check(
+                    (lib.memcpy_dtoh_async)(
+                        pin.ptr,
+                        buf,
+                        bytes,
+                        std::ptr::null_mut(),
+                    ),
+                    "cuMemcpyDtoHAsync (pf att pin)",
+                ))?;
+            }
+        }
+        ok(ctx.sync())?;
+        // 2) pinned の上で変換 (数値は呼び出し側のクロージャ = 従来と同じ式)
+        {
+            let pin = s.pins[pin_id].as_mut().unwrap();
+            let v = pin.as_mut_slice::<f32>();
+            gate(&mut v[..n_elems]);
+        }
+        // 3) pinned → CH_ATT (async H2D。同一ストリームの後続 GEMM が順序で待つ)
+        {
+            let buf = s.bufs[CH_ATT].as_ref()?.ptr();
+            let pin = s.pins[pin_id].as_ref().unwrap();
+            let lib = lib().ok()?;
+            unsafe {
+                ok(check(
+                    (lib.memcpy_htod_async)(buf, pin.ptr as *const c_void, bytes, std::ptr::null_mut()),
+                    "cuMemcpyHtoDAsync (pf att gate)",
+                ))?;
+            }
+        }
+        Some(())
+    })
+}
+
 /// s165 (P2): full attention 層の q/k/v 投影を**デバイス常駐の入力** (`CH_PFH`,
 /// rmsnorm 出力・先頭から `rows` 行) から回し、**出力だけ**をホストへ戻す。
 /// KV キャッシュはホストが正で q/k/v の値はホストの prepare が要るので、
