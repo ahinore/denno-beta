@@ -1501,6 +1501,14 @@ impl Qwen35 {
         // 投影の内訳 (`sl_lin` / `sl_lin_*`) はこの区間の内側に nested で入る。
         let pf_t = crate::prof::span_begin();
 
+        // s169 (P8): 残差常駐経路の位相計測を開く (DENNO_PROFILE / DENNO_PF_DBG の
+        // どちらかが立っているときだけ・未設定は分岐 1 回)。イベントを打つだけで
+        // 同期は足さない — 読むのは末尾の既存の同期 D2H の後 (pf_timing_read)。
+        #[cfg(feature = "cuda")]
+        if res_dev {
+            crate::cuda::pf_timing_begin(n, self.layers.len());
+        }
+
         for (li, layer) in self.layers.iter().enumerate() {
             // s165 (P2): 残差常駐経路 — 層 1 枚をデバイス上で通す。往復は
             // 「ホストの契約が本当に必要とするもの」だけ (GDN: beta/alpha 用の h2 の
@@ -1532,6 +1540,9 @@ impl Qwen35 {
                         // 残差 (CH_PF_RES) + 未加算の投影出力をホストへ戻してから
                         // 従来経路でこの層をやり直す (以降の層もホスト経路)。
                         res_dev = false;
+                        // s169 (P8): 途中で諦めた位相計測は捨てる (半端な内訳を
+                        // 表 C へ積まない — 打ったイベントは勝手に完了する)。
+                        crate::cuda::pf_timing_abort();
                         if crate::cuda::chain_pf_res_download(n, e, &mut x).is_none() {
                             bail!("prefill residual restore failed");
                         }
@@ -1928,6 +1939,11 @@ impl Qwen35 {
             lchk(&format!("L{li:02} ffn"), &x[(n - 1) * e..]); // 恒久診断 (env ゲート・未指定時 no-op)
         }
 
+        // s169 (P8): 層ループ末尾の境界を打つ (最後の位相の終端)。ここまでに
+        // 打ったイベントは、下の最終行 D2H (既存の同期) で必ず完了する。
+        #[cfg(feature = "cuda")]
+        crate::cuda::pf_timing_end();
+
         // 最終 norm + logits は最終トークンのみ (トークン逐次経路の最終値と同一)。
         // FINAL_NORM を個別計上 (LM_HEAD は s49 の logits() ラッパで計上済み)
         #[cfg(feature = "cuda")]
@@ -1957,6 +1973,10 @@ impl Qwen35 {
             rmsnorm(&x[(n - 1) * e..], &self.norm_w, e, self.eps)
         });
         let logits = self.logits(&hf);
+        // s169 (P8): 位相の区間を読む (直前の最終行 D2H = 既存の同期で全イベントが
+        // 完了している)。`DENNO_PF_DBG=1` なら wall と位相の内訳を 1 回だけ出す。
+        #[cfg(feature = "cuda")]
+        crate::cuda::pf_timing_read();
         lchk("final hf", &hf); // 恒久診断 (env ゲート・未指定時 no-op)
         lchk("final logits", &logits); // 恒久診断 (env ゲート・未指定時 no-op)
         lchk_argmax("final logits", &logits); // 恒久診断 (env ゲート・未指定時 no-op)
@@ -2078,6 +2098,9 @@ impl Qwen35 {
         // --- 2) ここから残差 (CH_PF_RES) を更新しうる → 失敗は Err ---
         // ln1 (+ 前層の未加算出力) → CH_PFH
         let ln1 = layer.attn_ln1();
+        // s169 (P8): 位相の境界 (発行グループの先頭)。norm_in の区間は
+        // 「dno_add_rmsnorm (= 残差加算 + rmsnorm) の実行」= 加算もここに含まれる。
+        cuda::pf_phase(cuda::PF_PH_NORM_IN);
         if !crate::prof::time_n(crate::prof::RMSNORM, n, || {
             cuda::chain_rmsnorm_slot(
                 cuda::CH_PF_RES,
@@ -2160,6 +2183,9 @@ impl Qwen35 {
                     &fl.q_w, &fl.k_w, &fl.v_w, n, li, buf_qg, buf_k, buf_v,
                 )
                 .ok_or_else(|| anyhow::anyhow!("prefill residual chain: qkv chain failed"))?;
+                // s169 (P8): ここから attention のホスト側 (prepare + attend) と
+                // att の H2D までが full_core の区間 (GPU は遊ぶ = 区間に入る)。
+                cuda::pf_phase(cuda::PF_PH_FULL_CORE);
                 let _att_done = self.full_attn_host_side(
                     fl, cache, li, pos0, n, &[], buf_qg, buf_k, buf_v, buf_q, buf_att, true,
                 );
@@ -2176,6 +2202,7 @@ impl Qwen35 {
         }
 
         // ln2 (+ attn 出力の残差加算) → CH_PFH
+        cuda::pf_phase(cuda::PF_PH_NORM_POST);
         if !crate::prof::time_n(crate::prof::RMSNORM, n, || {
             cuda::chain_rmsnorm_slot(
                 cuda::CH_PF_RES,
