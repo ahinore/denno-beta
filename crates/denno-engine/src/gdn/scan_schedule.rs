@@ -2,7 +2,9 @@
 //
 // 背景:
 //   chunked 経路は pass 1 (W/M) → pass 2 (Sinit の直列伝播) → pass 3 (逐次 AR)
-//   の 3 launch + 3 sync。s89 は pass 2 を pass 3 の chunk 0 ブロックへ折り畳む
+//   の 3 launch + 1 sync (s173/P15 で pass 間の sync を削除。3 pass は同一
+//   ストリームへ発行するので順序はストリームが保証する — 待つのは最後の 1 回だけ)。
+//   s89 は pass 2 を pass 3 の chunk 0 ブロックへ折り畳む
 //   カーネル (`dno_gdn_chunk_scan_hoist`) を足し、chunk 境界の状態をグラフメモリ
 //   `s_rows[t]` に置いて跨ごうとした。**しかし折り畳みの前提は常駐の連続性**で、
 //   今のモデル forward にはそれが無い (下の「s90 の結論」)。

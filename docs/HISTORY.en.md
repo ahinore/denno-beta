@@ -3540,3 +3540,95 @@ External implementations referenced in P19 and their licensing status (the same 
   GPU execution are unchanged).
 - **Not measured here**: bench / GPU anchors / KPI (structurally unchanged because no numeric
   path changed, but not measured). 8095 was not touched either.
+
+### s174: Task P16 - the GDN beta|alpha fp32 matvec is folded into one launch (2026-10-23) done
+
+> One decode token issues `dno_gemv_q4_0c4` 257 times and `dno_add_rmsnorm` 129 times.
+> Determining "merge adjacent same-shape gemvs inside a layer into one launch" statically from
+> the code showed that **the q4 GEMVs cannot be merged** (see below). Exactly one pair can be
+> merged: the GDN layer's beta|alpha (`dno_matvec_f32`, 2 launches).
+
+- **Static count (27B q4, 64 layers = 48 GDN + 16 full, decode chain path)**:
+  - Per GDN layer = rmsnorm 1 + qkv|z gemv 1 + beta/alpha matvec 2 + gdn_scan 1 + o gemv 1
+    + rmsnorm 1 + gate_up gemv 1 + swiglu 1 + down gemv 1 = **10 launches**.
+    Per full layer = rmsnorm 1 + q|k|v gemv 1 + qknorm_rope 2 + attn 1 + gate 1 + o gemv 1
+    + rmsnorm 1 + gate_up gemv 1 + swiglu 1 + down gemv 1 = **11 launches**.
+  - Per token = 48x10 + 16x11 + 2 (final norm + lm_head) = **658 launches**, of which
+    `dno_gemv_q4_0c4` = 48x4+16x4+1 = **257** and `dno_add_rmsnorm` = 48x2+16x2+1 = **129** -
+    matching the supervisor's measurement, which cross-checks this enumeration.
+  - Per request (150 tokens) = 658x150 = 98,700 launches.
+- **Why the q4 GEMVs cannot be merged**: a layer's four launches (qkv -> o -> gate_up -> down)
+  are a **serial** residual-stream chain, and every adjacent pair has a dependent kernel in
+  between (qkv|o = scan/attn, o|gate_up = the residual add inside `dno_add_rmsnorm`,
+  gate_up|down = swiglu, down(layer i)|qkv(layer i+1) = `dno_add_rmsnorm`). The kernel takes a
+  single input pointer, so only pairs with "the same input slot and the same k" can share a
+  launch. Inside a layer only qkv and gate_up qualify, and gate_up's input CH_H is the rmsnorm
+  of CH_H plus o's residual, so they are serial too = no shared launch. The q|k|v example is
+  already a single launch since s166 (P5) (337 -> 257). o|gate|up differ in both shape and
+  input (o: k=vd, in=CH_ATT / gate_up: k=e, in=CH_H). Going below 257 needs a fused
+  residual-add+rmsnorm+gemv kernel (a `.cu` change), which is out of scope here.
+- **Implementation (the one mergeable pair)**: `GdnLayer::ba_w` holds a row-concatenated
+  [2*nv, e] copy built once at load time (row order [all beta rows | all alpha rows],
+  `concat_rows`), and `cuda.rs` gained `Q35_TAG_BA` and `chain_q35_ctl_f32_ba`: the same
+  `dno_matvec_f32`, the same argument order, the same block size (128, or 256 under
+  `DENNO_FAST_REDUCE=1`), only grid.x doubled (n -> 2n). `chain_q35_gdn_scan` uses one launch
+  when `ba_w` is present and the shape matches, and the previous two launches otherwise
+  (fail closed). The concatenation is not built in Fp32 mode (the chain never runs there).
+- **Launches before -> after (one decode token)**: `dno_matvec_f32` **96 -> 48** (2 -> 1 per
+  layer), all kernels **658 -> 610** (-48, -7.3%), per request 98,700 -> 91,500.
+  `dno_gemv_q4_0c4` 257 -> 257 and `dno_add_rmsnorm` 129 -> 129 (unchanged).
+- **Numerics**: `dno_matvec_f32` reduces sequentially per row (`j = blockIdx.x`,
+  `row = w + (size_t)j*k`, `out[j] = s`), independent of the other rows, so concatenating the
+  row order leaves each row's accumulation order untouched = **bit identical**. VRAM is
+  **unchanged** (the separate beta/alpha device buffers are no longer created); the host pays
+  +2*nv*e*4 B per layer for the concatenated copy (27B: 1.97 MB x 48 layers = 94 MB).
+- **Predicted ms**: 48 launches saved x 1-2 us = 0.05-0.10 ms/token. As with P14/P15 the step
+  is GPU-execution bound and host enqueue overlaps execution, so the measured value should be
+  0.00-0.10 ms (17.49-17.51 -> 17.45-17.51 ms/token, <=0.6%). **Not measured on the GPU.**
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (320 -> +1:
+  `f32_beta_alpha_concat_rows_match_parts`, pinning that the merged 1-launch output is bit
+  identical to the 2-launch output on the CPU side).
+- **Not measured here**: GPU execution, the three anchors (`c61ad85b` / `9e17d563` / `af6eb6ab`),
+  ms/token, nsys. This container has no GPU, so the on-device verification steps are written in
+  the work report (uncommitted, `REPORT_P16.md`). `.cu` / `.ptx` / 8095 were not touched.
+
+### s175: Task P19 - layer count in `denno info` now matches the inference trunk for GGUF-only repos (2026-10-23) done
+
+> Starting with a re-check of the premise: HEAD (`8a0525b` = s164) already filled
+> layers/hidden/vocab/context from GGUF metadata. A GGUF-only directory
+> (`/tmp/k7` -> `/work/models/Qwen3.8-27B-Q4_0.gguf`, no config.json) measures
+> `layers: 65 / hidden: 5120 / vocab: 248320 / context: 262144`, not `0`. The "prints 0"
+> observation predates s164; the current HEAD has no path that prints 0
+> (`info_fmt_u64(None)` is `?`). The one real remaining bug was **the layer count**.
+
+- **Bug**: the 27B GGUF has `qwen35.block_count=65` (= inference trunk 64 + MTP/nextn 1).
+  The engine takes `num_hidden_layers` from config.json as authoritative and skips the extra
+  `blk.64` as a nextn layer (the layer-count consistency check in `model/qwen35.rs`), so it
+  actually runs **64** layers. `denno info` printed 65 (a display-only mismatch; the numeric
+  path always ran 64 layers).
+- **Implementation (only `gguf_dims` in `crates/denno-cli/src/main.rs`)**: when config.json is
+  absent (or lacks the layers key), the GGUF-derived layer count is now
+  `<arch>.block_count - <arch>.nextn_predict_layers` (block_count as-is when the
+  `nextn_predict_layers` key is absent). A subtraction that lands at 0 or below is treated as
+  unknown = `?` (never print 0 as a fact). hidden comes from `<arch>.embedding_length` and
+  vocab from the `tokenizer.ggml.tokens` array length with the `<arch>.vocab_size` fallback -
+  **the existing keys and the existing loader (`denno_engine::gguf::GgufFile`)**, no second
+  loader was written. config.json still wins when present (per-dimension `.or()`).
+- **Display-spec question (operator call)**: `layers:` now reports "the inference trunk the
+  engine runs" = 64. Showing the raw `block_count` = 65 would belong on a separate line
+  (e.g. `mtp: 1`); that is out of scope here and was left untouched.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (unchanged). `cargo test --release -p denno-cli
+  --features denno-engine/cuda` = **25 passed / 0 failed** (23 -> +2:
+  `gguf_only_mtp_layer_count_matches_engine` = 65/1 -> 64 plus the display lines,
+  `gguf_nextn_edges_and_config_precedence` = nextn == block_count yields `?`, no nextn key
+  means no subtraction, config.json wins). `cargo build --release -p denno-cli
+  --features denno-engine/cuda` succeeds.
+- **Real files (CPU)**: `/tmp/k7` (GGUF only) `layers: 65` -> `layers: 64` (hidden / vocab /
+  context / quant lines unchanged), `data/qwen35-9b` (with config.json) stays `layers: 32`,
+  `/tmp/denno_a3_mtp_1775133` (config.json + MTP GGUF) stays at config's 64.
+- **Numeric class**: none (CLI display path only; the engine's numeric path, `.cu` / `.ptx`,
+  GPU execution and 8095 are untouched).
+- **Not measured here**: GPU anchors, ms/token, nsys (structurally unchanged because no numeric
+  path changed, but not measured). The work report is the uncommitted `REPORT_P19.md`.
