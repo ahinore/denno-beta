@@ -161,6 +161,60 @@ extern "C" __global__ void dno_add_rmsnorm(
     }
 }
 
+// s170: dno_add_rmsnorm の二乗和を並列に縮約する版。
+// 逐次版は thread 0 だけが cols (5,120) 個を順に足しており、129 回/token で
+// 2.65 ms (decode の 13%) を占めていた。ここでは各スレッドが stride で部分和を
+// 作り、warp shuffle の固定順 (16,8,4,2,1) -> warp 合計を warp id 昇順、という
+// **固定の木** で縮約する (atomic 無し = 決定論)。逐次版とは丸め順が違うため
+// 出力は bit 一致しない -> DENNO_FAST_REDUCE=1 のときだけ使う。
+// 引数・動的共有メモリ (cols*4) は逐次版と同一。残差加算と出力の式も同一。
+extern "C" __global__ void dno_add_rmsnorm_r(
+    float *x, const float *proj, const float *w, float *out,
+    int cols, float eps) {
+    extern __shared__ float sh[];
+    int row = blockIdx.x;
+    float *xr = x + (size_t)row * cols;
+    if (proj != nullptr) {
+        const float *pr = proj + (size_t)row * cols;
+        for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+            float v = __fadd_rn(xr[i], pr[i]);
+            xr[i] = v;
+            sh[i] = v;
+        }
+    } else {
+        for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+            sh[i] = xr[i];
+        }
+    }
+    __syncthreads();
+    // 2) ss = sum(x_i^2) / cols — 固定木の並列縮約
+    float part = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        part = __fadd_rn(part, __fmul_rn(sh[i], sh[i]));
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        part = __fadd_rn(part, __shfl_down_sync(0xffffffffu, part, o));
+    }
+    __shared__ float swarp[32];
+    const int wid = threadIdx.x >> 5;
+    if ((threadIdx.x & 31) == 0) swarp[wid] = part;
+    __syncthreads();
+    __shared__ float s_inv;
+    if (threadIdx.x == 0) {
+        float ss = swarp[0];
+        for (int i = 1; i < (blockDim.x >> 5); ++i) ss = __fadd_rn(ss, swarp[i]);
+        ss = __fdiv_rn(ss, (float)cols);
+        s_inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(ss, eps)));
+    }
+    __syncthreads();
+    // 3) out[i] = x[i] * inv * w[i] (左結合の乗算列 — 逐次版と同一)
+    float inv = s_inv;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        out[(size_t)row * cols + i] = __fmul_rn(__fmul_rn(xr[i], inv), w[i]);
+    }
+}
+
 /// テスト用: dno_expf を要素ごとに適用する
 extern "C" __global__ void dno_expf_probe(
     const float *in, float *out, int total) {
