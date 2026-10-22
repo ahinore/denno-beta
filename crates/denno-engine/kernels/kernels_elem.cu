@@ -771,3 +771,39 @@ extern "C" __global__ void dno_matvec_f32(
     out[j] = s;
 }
 
+// s169: dno_matvec_f32 の並列リダクション版 (beta/alpha 制御投影用)。
+// 1 行 = 1 ブロック・blockDim.x スレッドで k を分割し、warp shuffle の固定順
+// (o = 16,8,4,2,1) -> warp 合計を warp id 昇順に加算、という **固定の木** で
+// 縮約する。atomic を使わないので実行ごとに同一結果 (決定論)。ただし逐次版
+// dno_matvec_f32 とは丸め順が違うため bit 一致はしない -> 既定 OFF
+// (DENNO_FAST_REDUCE=1 で有効)。積と加算の丸めは __fmul_rn / __fadd_rn で分離。
+// grid = (n, 1, 1), block = (256, 1, 1)。
+extern "C" __global__ void dno_matvec_f32_r(
+    const float *__restrict__ h,   // [k]
+    const float *__restrict__ w,   // [n, k] row-major
+    float *__restrict__ out,       // [n]
+    int k, int n) {
+    const int j = blockIdx.x;
+    if (j >= n) return;
+    const float *row = w + (size_t)j * k;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    float s = 0.0f;
+    for (int d = tid; d < k; d += nt) {
+        s = __fadd_rn(s, __fmul_rn(h[d], row[d]));
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        s = __fadd_rn(s, __shfl_down_sync(0xffffffffu, s, o));
+    }
+    __shared__ float sh[32];
+    const int wid = tid >> 5;
+    if ((tid & 31) == 0) sh[wid] = s;
+    __syncthreads();
+    if (tid == 0) {
+        float t = sh[0];
+        for (int i = 1; i < (nt >> 5); ++i) t = __fadd_rn(t, sh[i]);
+        out[j] = t;
+    }
+}
+
