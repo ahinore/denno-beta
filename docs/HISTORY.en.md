@@ -3686,3 +3686,56 @@ External implementations referenced in P19 and their licensing status (the same 
 - **Not measured**: GPU execution, the anchors, ms/token (no GPU in this container). No new `.cu`
   violation was found (`KNOWN_BAD_4B_CASTS` stays empty). The work report is uncommitted
   (`REPORT_P34.md`).
+
+
+### s178: Task P36 - the P3-3 scanner imports the host launch block shape (2026-10-23) done
+
+- **Implementation**: none (tests only). The last recorded limit of the P3-3 shared-memory cast
+  scanner (see the P34 entry) is closed: symbolic rows now get a bound from the **host launch
+  block** in `src/cuda.rs`. No `.cu` / `.ptx` / product code / `cuda.rs` changes.
+- **Launch-site map**: `launch_map_from_cuda` masks comments/string literals (length-preserving,
+  line-preserving), pairs `module_get_function)(&mut f_xxx, .., b"dno_yyy\0")` into a
+  field -> kernel-name map, and parses every `.launch_async(..)` call site into
+  `kernel -> [(cuda.rs line, (block.x, block.y, block.z))]`. Constants are resolved through
+  `const NAME: u32|usize|i32|i64 = EXPR;` (with `as` casts stripped). Result on the current tree:
+  61 call sites, 18 kernels, 10 call sites that cannot be resolved to a kernel name (bare
+  function pointers such as `f`, `f_c`, `func`, and `fns.f_gate` / `fns.f_qknorm_rope`, whose
+  fields are not in the module_get_function map).
+- **Sound rule**: a kernel's shape is `Resolved` only when every launch site agrees on a fully
+  static block; a symbolic dimension (`(dh as u32, 1, 1)`), disagreeing sites
+  (`dno_matvec_rows_bt_i8`: 256 vs 128 at cuda.rs:952/4980) or a missing site makes the kernel
+  `Unresolved`. For a cast whose row is symbolic, `symbolic_row_bound` evaluates the row
+  expression with interval arithmetic over `threadIdx.[xyz]` (0 .. block-1), `blockDim.[xyz]`,
+  `#define` constants, proven loop bounds (`for (int u = 0; u < 8; u++)`) and enclosing
+  `if (X < N)` guards, and requires `max(row) < declared rows`. The site is only reported as a
+  violation when `max` is reachable (affine expression, no repeated identifier, single
+  declaration); otherwise it lands in `row_bound_unresolved` with a reason and is **not** green.
+  `blockIdx.*` is never bounded (the grid is not read).
+- **Two scanner defects found while doing this** (fixed, existing assertions kept): (1) the smem
+  name table was built per **file**, so `dno_gemm_q4_0`'s `sA[64][32]` overwrote `dno_gemm_i8`'s
+  `sA[128][36]` and the row count looked like 64; tables are now per kernel body. (2) The column
+  anchors were resolved against the whole file, so another kernel's `for (int c = 0; c < C; c++)`
+  turned the anchor of `const int c = x * 4;` into 1; `col_anchor`/`local_anchor` now search the
+  kernel body, and local bindings use the **last declaration before the cast** (C scoping).
+- **Result on the real kernels**: `row_bound_checked == 0` (numeric rows) is unchanged, and the 6
+  `kernels_int8.cu` casts are now decided from the launch block: `sA[tid][..]` and
+  `sA[tid][x*4]` via the enclosing `if (tid < GEMM_TILE)` (0..127 < 128), `sB[r][..]` (0..255 <
+  256), `sA[ty * 8 + u][..]` (0..127 < 128), `sB[t * GEMM_TILE + tx * 8 + v][..]` (0..255 < 256).
+  Counts: 9 casts / 9 symbolic-ok / **6 row bounds from the launch block / 0 undecided / 0 bad**.
+  `dno_attention_prefill`'s three float2 casts stay column-only (dynamic smem, block `dh`).
+- **Self-check**: one new test (the 17th) fixes the map (61 calls / 18 kernels / `dno_gemm_i8` =
+  (16,16,1) at 10 sites), the 6 decided rows, and asserts that a deliberately broken fixture is
+  reported: block.y = 17 -> max 135 >= 128, `u < 9` -> max 128, disagreeing launch sites ->
+  unresolved (not green), a variable block -> unresolved, no `if (tid < TILE)` guard -> max 255,
+  and the `else` branch does not use the negated guard. An empty map and a classified kernel that
+  is missing from the map both panic.
+- **Mutation checks**: using the hardware limit 1024 instead of the launch block reproduces the
+  false positive P34 predicted (`ty * 8 + u` max 8191, `r` max 17391); dropping the guards gives
+  `tid` max 255; tolerating disagreeing sites turns the fixture green; reverting to the file-level
+  smem table reports the real kernels as violations. All four fail the test.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` = **321 passed /
+  0 failed / 37 ignored** (identical to the baseline), `--test kernel_invariants` =
+  **17 passed / 0 failed** (16 existing + 1 new).
+- **Not measured**: GPU execution, anchors, ms/token (no GPU in this container). No `.cu`
+  violation was found (`KNOWN_BAD_4B_CASTS` stays empty). The work report is uncommitted
+  (`REPORT_P36.md`).
