@@ -4464,6 +4464,13 @@ struct ChainScratch {
     pin_h2: Option<PinMem>,         // D2H の宛先 (pinned・grow-only)
     h2_pending: bool,               // 発行済みで未 join の D2H があるか
 
+    // s175 (P17b): full 層の q|k|v を **1 本の連続 D2H** で受ける pinned ステージング。
+    // 従来は 3 本の pageable D2H (Vec の未初期化領域へ直接) だった — 連続領域を
+    // 1 回で落とすと、ドライバの内部ステージング往復が 1 回で済む (値は同一)。
+    pin_pf_qkv: Option<PinMem>,
+    /// 直前の `chain_qkv_prefill_q4_dev` が落とした要素数 (q, k, v)。
+    /// ビューの健全性検査 (寸法が変わったら読ませない) に使う。
+    pf_qkv_geom: Option<(usize, usize, usize)>,
 }
 
 thread_local! {
@@ -4507,6 +4514,8 @@ thread_local! {
         h2_ev_done: None,
         pin_h2: None,
         h2_pending: false,
+        pin_pf_qkv: None,
+        pf_qkv_geom: None,
 
     });
 }
@@ -12730,17 +12739,26 @@ where
 /// KV キャッシュはホストが正で q/k/v の値はホストの prepare が要るので、
 /// 値は必ず戻す (戻す量は q/k/v の幅で、h2 の H2D 3 回より小さい)。
 /// 3 本の GEMM は `CH_QKV` の連続領域 (q|k|v) に行オフセットで書き、
-/// D2H 3 発 + sync 1 回で呼び出し元のバッファへ直接落とす。
 /// カーネル・grid・引数は per-op 経路と同一 (行ごとに独立 → bit 一致)。
+///
+/// s175 (P17b): 戻しは **1 発の連続 pinned D2H** にした (従来は pageable な
+/// ホスト Vec 3 本へ `cuMemcpyDtoHAsync` 3 発)。
+/// - 従来: q / k / v を別々のホスト Vec (pageable・未初期化領域へ直接) へ
+///   `cuMemcpyDtoHAsync` **3 発**。pageable 宛先はドライバが内部 pinned
+///   ステージングを経由するので、1 バイトにつき「GPU→ステージング→宛先」の
+///   2 回のコピーになり、しかも 3 発に分かれている。
+/// - 現在: `CH_QKV` の [q|k|v] 連続領域を **pinned** (`pin_pf_qkv`) へ 1 発で落とし、
+///   ホストは同じ連続領域を要素オフセットで 3 つのスライスとして読む
+///   ([`chain_pf_qkv_host_view`])。分割コピーが無いので**値は 1 ビットも変わらない**
+///   (同じバイト列を同じ順に並べるだけ)。
+/// - 同期は従来どおり 1 回 (`ctx.sync()`)。ホストが読む前に完了が要る点は不変。
+/// - 1 層あたり: D2H 3 → 1、launch 3 (不変)、sync 1 (不変)。
 pub fn chain_qkv_prefill_q4_dev(
     q_w: &crate::quant::Linear,
     k_w: &crate::quant::Linear,
     v_w: &crate::quant::Linear,
     rows: usize,
     li: usize,
-    out_qg: &mut [f32],
-    out_k: &mut [f32],
-    out_v: &mut [f32],
 ) -> Option<()> {
     if !cuda_enabled() || !gemm_enabled() || GPU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
@@ -12757,9 +12775,6 @@ pub fn chain_qkv_prefill_q4_dev(
     if rows < gemm_min_m() || rows <= max_m() {
         return None;
     }
-    if out_qg.len() < rows * qcols || out_k.len() < rows * kcols || out_v.len() < rows * vcols {
-        return None;
-    }
     let ctx = chain_ctx()?;
     let (q_uid, q_blk, _, _) = q4_parts(q_w)?;
     let (k_uid, k_blk, _, _) = q4_parts(k_w)?;
@@ -12768,60 +12783,102 @@ pub fn chain_qkv_prefill_q4_dev(
     let gwk = weights_for_q4(k_uid, k_blk, kn, kcols).ok()?;
     let gwv = weights_for_q4(v_uid, v_blk, vn, vcols).ok()?;
     let total = rows.checked_mul(qcols.checked_add(kcols)?.checked_add(vcols)?)?;
-    ok(chain_ensure_buf(CH_QKV, total.checked_mul(4)?))?;
+    let total_bytes = total.checked_mul(4)?;
+    ok(chain_ensure_buf(CH_QKV, total_bytes))?;
     // 入力は CH_PFH の先頭 rows 行 (rmsnorm 出力) — 行数ぶんの領域を要求
     ok(chain_ensure_buf(CH_PFH, rows.checked_mul(qn)?.checked_mul(4)?))?;
+    // 宛先 (pinned・grow-only) を先に確保し、幾何もここで確定する
+    // (確保に失敗したらコピーを 1 バイトも発行しない。pinned の確保失敗は
+    //  ページロック上限など致命的でないので GPU_BROKEN は立てない — `pin_h2` と同じ)。
     let (pin, pqkv) = CHAIN.with(|cell| -> Option<(u64, u64)> {
-        let s = cell.borrow();
-        Some((s.bufs[CH_PFH].as_ref()?.ptr(), s.bufs[CH_QKV].as_ref()?.ptr()))
+        let mut s = cell.borrow_mut();
+        if Scratch::ensure_pin(&mut s.pin_pf_qkv, total_bytes).is_err() {
+            return None;
+        }
+        let dst = s.pin_pf_qkv.as_ref()?.ptr as u64;
+        let src = s.bufs[CH_QKV].as_ref()?.ptr();
+        s.pf_qkv_geom = Some((rows * qcols, rows * kcols, rows * vcols));
+        Some((dst, src))
     })?;
     let q_off = (rows * qcols * 4) as u64;
     let k_off = (rows * (qcols + kcols) * 4) as u64;
-    // s169 (P8): qkv GEMM + 3 発の D2H + 既存の sync までが full_qk の区間。
+    // s169 (P8): qkv GEMM + 1 発の D2H + 既存の sync までが full_qk の区間。
     pf_phase(PF_PH_FULL_QK);
     crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
         chain_gemm_q4_pf(gwq, pin, pqkv, rows, qn, qcols)?;
         chain_gemm_q4_pf(gwk, pin, pqkv + q_off, rows, kn, kcols)?;
         chain_gemm_q4_pf(gwv, pin, pqkv + k_off, rows, vn, vcols)
     })?;
-    // D2H 3 発 (async) → sync 1 回
+    // D2H 1 発 ([q|k|v] 連続) → sync 1 回
     CHAIN.with(|cell| -> Option<()> {
         let s = cell.borrow();
         let base = s.bufs[CH_QKV].as_ref()?.ptr();
+        let dst = s.pin_pf_qkv.as_ref()?.ptr as *mut c_void;
         let lib = lib().ok()?;
         unsafe {
             ok(check(
-                (lib.memcpy_dtoh_async)(
-                    out_qg.as_mut_ptr() as *mut c_void,
-                    base,
-                    rows * qcols * 4,
-                    std::ptr::null_mut(),
-                ),
-                "cuMemcpyDtoHAsync (pf qkv q)",
-            ))?;
-            ok(check(
-                (lib.memcpy_dtoh_async)(
-                    out_k.as_mut_ptr() as *mut c_void,
-                    base + q_off,
-                    rows * kcols * 4,
-                    std::ptr::null_mut(),
-                ),
-                "cuMemcpyDtoHAsync (pf qkv k)",
-            ))?;
-            ok(check(
-                (lib.memcpy_dtoh_async)(
-                    out_v.as_mut_ptr() as *mut c_void,
-                    base + k_off,
-                    rows * vcols * 4,
-                    std::ptr::null_mut(),
-                ),
-                "cuMemcpyDtoHAsync (pf qkv v)",
+                (lib.memcpy_dtoh_async)(dst, base, total_bytes, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync (pf qkv q|k|v)",
             ))
         }
     })?;
     crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
     ok(ctx.sync())?;
     Some(())
+}
+
+/// s175 (P17b): [`chain_qkv_prefill_q4_dev`] が落としたホスト側の q|k|v
+/// (pinned 連続領域の 3 ビュー)。値は 3 本の Vec に分けず、[q|k|v] のまま
+/// 要素オフセットで切る — 従来の 3 発 D2H とバイト列が同一。
+///
+/// 有効期間: 同じスレッドで次の `chain_qkv_prefill_q4_dev` が走る (= ステージングを
+/// 上書きする) まで。層ループは「qkv チェーン → ホスト prepare/attend」を 1 層ずつ
+/// 直列に回すので、1 層の中で使い切る限り競合しない (`pin_h2` と同じ規約)。
+pub struct PfQkvHostView {
+    ptr: *const f32,
+    q: usize,
+    k: usize,
+    v: usize,
+}
+
+impl PfQkvHostView {
+    /// q 投影出力 [rows, qcols] (attn_output_gate の gate 半分を含む)。
+    pub fn q(&self) -> &[f32] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.q) }
+    }
+    /// k 投影出力 [rows, kcols]。
+    pub fn k(&self) -> &[f32] {
+        unsafe { std::slice::from_raw_parts(self.ptr.add(self.q), self.k) }
+    }
+    /// v 投影出力 [rows, vcols]。
+    pub fn v(&self) -> &[f32] {
+        unsafe { std::slice::from_raw_parts(self.ptr.add(self.q + self.k), self.v) }
+    }
+}
+
+/// s175 (P17b): 直前の [`chain_qkv_prefill_q4_dev`] の結果を読むビュー。
+/// 要求した寸法が「実際に落とした寸法」と一致しないときは None
+/// (寸法を取り違えた呼び出しで領域外を読ませない)。
+pub fn chain_pf_qkv_host_view(
+    rows: usize,
+    qcols: usize,
+    kcols: usize,
+    vcols: usize,
+) -> Option<PfQkvHostView> {
+    let q = rows.checked_mul(qcols)?;
+    let k = rows.checked_mul(kcols)?;
+    let v = rows.checked_mul(vcols)?;
+    CHAIN.with(|cell| {
+        let s = cell.borrow();
+        if s.pf_qkv_geom != Some((q, k, v)) {
+            return None;
+        }
+        let p = s.pin_pf_qkv.as_ref()?;
+        if p.bytes < q.checked_add(k)?.checked_add(v)?.checked_mul(4)? {
+            return None;
+        }
+        Some(PfQkvHostView { ptr: p.ptr as *const f32, q, k, v })
+    })
 }
 
 /// s165 (P2): attention 出力 (`CH_ATT`) → o_proj (q4) → `CH_O` (デバイス常駐・
