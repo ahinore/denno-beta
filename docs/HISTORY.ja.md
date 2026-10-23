@@ -3708,3 +3708,46 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
   `--test kernel_invariants` = **16 passed / 0 failed** (既存 15 + 新規 1)。
 - **測っていないこと**: GPU 実行・アンカー・ms/token (GPU 非搭載)。`.cu` の新規違反は
   検出なし (`KNOWN_BAD_4B_CASTS` は空のまま)。作業レポートは未 commit (`REPORT_P34.md`)。
+
+### P37: 大きな 2-D 重みのロード時 fp32 一時領域を上限つきにした (行チャンク量子化・バイト一致) (2026-10-23) 完了 (既定 ON)
+
+- **課題 (P35 の残件)**: `token_embd.weight` (27B で 1.271 G 要素) のロードは
+  テンソル全体の f32 (5.086 GB) を作り、tied lm_head 用に `embed.clone()` で
+  **もう 1 部** (さらに 5.086 GB) を作ってから量子化していた。このテンソルだけで
+  ピーク約 10.9 GB。60 GB ホストが 8095 サーバ常駐時に OOM-kill された主因で、
+  数値ではなく**ロード時メモリ**の問題 (P35 §6 の item 3)。
+- **変更**: `quant.rs` に `Q4Linear::zeros` / `quantize_rows_into`、
+  `Quant8Linear::zeros` / `quantize_rows_into` を足し、既存の `quantize` は
+  「`zeros` して `quantize_rows_into(0, ..)` を 1 回呼ぶ」形へ**本体を切り出した**
+  (新旧で同じコードを通す = バイト一致が構造的に保証される)。その上に行チャンク
+  駆動の `gguf_rows_quantized_chunked` (+ チャンクの f32 を覗ける `_with_sink`)、
+  `ChunkedQuantStats`、env ゲート `DENNO_GGUF_CHUNKED_QUANT` (**既定 ON**・
+  `0`/`false`/`no`/`off` で従来経路に戻る)、`chunk_rows_for` を追加。
+  チャンク幅は「1 チャンクの f32 が 16 MiB (4 M 要素)」になる行数
+  (k=5120 → 819 行, 6144 → 682 行, 17408 → 240 行)。`gguf.rs` に
+  `GgufFile::linear_chunked` / `embed_and_linear_chunked` (mmap 済みスライスを
+  行チャンクで切り、形・型・バイト数が想定外なら `None` の fail-closed)、
+  proof test。`qwen35.rs` は `lin_g` (ffn gate/up/down・attn q/k/v/qkv/output・
+  ssm_out・untied output.weight) と `token_embd.weight` + tied lm_head を新経路へ。
+- **境界規則**: 行単位 (行 = k 要素) に切る。行は GGUF 上で連続 (dim0=k が最内)
+  なので行境界 = ブロック境界 (`k % blck_size == 0` を検証、満たさなければ従来経路)。
+  Q4_0 の 32 要素ブロックも K 系の 256 要素スーパーブロックも行内で閉じる。
+- **実測 (proof test `gguf::tests::q4_chunked_matches_whole_tensor_real_gguf`・
+  `#[ignore]`・CPU)**: `/work/models/Qwen3.8-27B-Q4_0.gguf` を **mmap せず**
+  (`GgufHeader` + seek/read_exact)、10 本を比較 → **10/10 バイト一致**
+  (token_embd Q4_0・output Q6K・ffn_up Q4_0・ffn_gate Q4_0・ffn_down Q4_1・
+  attn_q Q4_0・attn_qkv Q4_0・attn_v Q4_0・attn_output Q4_0・ssm_out Q5K)。
+  int8 の副次比較も 5 本すべて一致。ピーク f32 一時領域 (計算値) は
+  chunked **20.21 MB** / 全体 **5085.59 MB** (252 倍)。23.5 s。
+- **予測効果 (PREDICTED・未計測)**: `token_embd` のロード時ピークは
+  10.887 GB (f32 5.086 + clone 5.086 + Q4 0.715) → 5.820 GB
+  (常駐 f32 表 5.086 + Q4 0.715 + 一時 0.019) で **約 5.07 GB 減**。
+  ffn/attn は 1 本あたり最大 356.5 MB → 19.1 MB。実機のロード時間・RSS は
+  本セッションの計測対象外。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **327 passed / 0 failed / 39 ignored** (基準 323 / 38 + 新規 unit 4 + ignored 1)。
+  `-- --ignored q4_chunked_matches_whole_tensor_real_gguf` = 1 passed。非 cuda
+  `cargo test -p denno-engine --lib` = 286 passed / 0 failed / 4 ignored。
+- **触っていないもの**: `.cu` / `.ptx` / GPU / サーバ / docker / 量子化規則 /
+  fp16・f32 の丸め / どのテンソルがどの quant モードか / `docs/NUMERIC_POLICY.ja.md` /
+  push / `git add -A`。作業レポートは未 commit の `REPORT_P37.md`。

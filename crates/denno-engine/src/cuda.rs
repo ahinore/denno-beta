@@ -534,6 +534,9 @@ pub struct CudaCtx {
     f_gdn: CUfunction,
     // A1-r2: GDN chunked scan 3 カーネル (長 prefill 用・CPU 参照 gdn::scan_chunked_core)
     f_gdn_chunk_pre: CUfunction,
+    /// s239 (P36): pass 1 の 4 レーン版 (DK=128 専用)。PTX に含まれる場合のみ取得し、
+    /// `DENNO_GDN_LANES=4` のときだけ使う (既定は旧カーネル)。
+    f_gdn_chunk_pre_l4: Option<CUfunction>,
     f_gdn_chunk_state: CUfunction,
     f_gdn_chunk_scan: CUfunction,
     /// s89 (P1-1): 状態グラフ常駐版の chunk scan (pass 2 を折りたたんだ 2 launch 版)。
@@ -789,6 +792,19 @@ impl CudaCtx {
                 None
             };
 
+            // s239 (P36): 4 レーン版 pass 1 も「あれば使う」(同じ理由)。
+            let mut f_gdn_chunk_pre_l4: CUfunction = std::ptr::null_mut();
+            let l4_r = (lib.module_get_function)(
+                &mut f_gdn_chunk_pre_l4,
+                module_gdn,
+                b"dno_gdn_chunk_pre_l4\0".as_ptr() as *const c_char,
+            );
+            let f_gdn_chunk_pre_l4 = if l4_r == CUDA_SUCCESS {
+                Some(f_gdn_chunk_pre_l4)
+            } else {
+                None
+            };
+
             Ok(Self {
                 device: dev,
                 name,
@@ -817,6 +833,7 @@ impl CudaCtx {
                 module_gdn,
                 f_gdn,
                 f_gdn_chunk_pre,
+                f_gdn_chunk_pre_l4,
                 f_gdn_chunk_state,
                 f_gdn_chunk_scan,
                 f_gdn_chunk_scan_hoist,
@@ -3683,6 +3700,22 @@ const Q4_MR_MAX: usize = 8;
 /// 2 / 8 を試すときはここを変える (PTX には 3 本とも入っている)。
 /// ビルドし直さずに比べるときは `DENNO_Q4_GEMV_C=2|4|8` で上書きする。
 const Q4_GEMV_C: usize = 4;
+
+/// s239 (P36): GDN pass 1 を 4 レーン版で回すか (`DENNO_GDN_LANES=4` で有効)。
+///
+/// 4 レーン版は W/M をレジスタ常駐にしてローカルアクセス命令を 1/4 にするが、
+/// 内積が 4 部分和の木縮約になるため **旧版と bit 一致しない** (GDN は bit 一致
+/// 不要契約・決定論のみ)。アンカー v6_* は GDN 層を通るので、既定にする際は
+/// 再基準化が必要。よって既定は旧カーネル (off) とし、A/B 用の入口だけ用意する。
+fn gdn_lanes4() -> bool {
+    static L4: OnceLock<bool> = OnceLock::new();
+    *L4.get_or_init(|| {
+        std::env::var("DENNO_GDN_LANES")
+            .ok()
+            .map(|v| v.trim() == "4")
+            .unwrap_or(false)
+    })
+}
 
 /// [`Q4_GEMV_C`] の実効値 (env `DENNO_Q4_GEMV_C` があればそちら)。2/4/8 以外は
 /// 既定へ落とす (不正な値で panic させない)。
@@ -13137,11 +13170,17 @@ fn gdn_scan_chunked_impl(
         &mut epsi as *mut _ as *mut c_void,
     ];
     let shmem_pre = ((2 * dk + 3) * 4) as u32;
+    // s239 (P36): 4 レーン版 (DK=128 専用) は `DENNO_GDN_LANES=4` のときだけ。
+    // block は列 dk × 4 レーン。数値は旧版と bit 一致しない (木縮約)。
+    let (f_pre, blk_pre) = match (gdn_lanes4(), ctx.f_gdn_chunk_pre_l4) {
+        (true, Some(f)) if dk == 128 && dv == 128 => (f, (dk as u32) * 4),
+        _ => (ctx.f_gdn_chunk_pre, dk as u32),
+    };
     unsafe {
         ctx.launch_async(
-            ctx.f_gdn_chunk_pre,
+            f_pre,
             (n_chunks as u32, nv as u32, 1),
-            (dk as u32, 1, 1),
+            (blk_pre, 1, 1),
             shmem_pre,
             &mut args_pre,
         )?;
