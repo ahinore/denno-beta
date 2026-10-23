@@ -296,25 +296,25 @@ extern "C" __global__ void dno_gdn_chunk_pre(
         const float eg = sc[1];
         const float b = sc[2];
         float skv = 0.0f;
-#pragma unroll 4
+#pragma unroll 8
         for (int i = 0; i < dk; ++i) {
             Wcol[i] *= eg;
             skv += k_sh[i] * Wcol[i];
         }
         const float dlt = b * (v_sh[c] - skv);
-#pragma unroll 4
+#pragma unroll 8
         for (int i = 0; i < dk; ++i) {
             Wcol[i] += k_sh[i] * dlt;
         }
         // ---- M ステップ (列 c): decay → 内積 → 更新 (m_step_col と同一順序) --
         // s241: 同じく M の decay と内積も 1 パスに融合する (順序・丸めは不変)。
         float mk = 0.0f;
-#pragma unroll 4
+#pragma unroll 8
         for (int i = 0; i < dk; ++i) {
             Mcol[i] *= eg;
             mk += k_sh[i] * Mcol[i];
         }
-#pragma unroll 4
+#pragma unroll 8
         for (int i = 0; i < dk; ++i) {
             Mcol[i] -= b * k_sh[i] * mk;
         }
