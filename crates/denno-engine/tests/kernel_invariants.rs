@@ -5860,5 +5860,51 @@ fn gdn_kprof_line_is_wired_at_prefill_end_without_sync() {
         "出力点の先頭に env 分岐 (既定 OFF) が無い"
     );
 }
+/// s245 (P45): GDN chunked 3 pass の**デバイス出力経路** (`y_dst = Some`) に
+/// ホスト同期が無いこと。
+///
+/// 3 pass は同一ストリーム (既定 = legacy NULL stream) へ発行順に並ぶので、
+/// pass 3 の完了は後続の o_proj / 次の層が同じストリームで待つ (FIFO)。状態の
+/// D2D 書き戻しも同じストリームの非同期コピー。したがって同期は「ホストが y を
+/// 読む経路 (`y_dst = None`)」の 1 箇所だけに残す。
+#[test]
+fn gdn_chunked_scan_device_output_path_has_no_host_sync() {
+    let f = fn_body(CUDA_RS, "fn gdn_scan_chunked_impl(");
+    // 呼び出し形 (`?` 付き) で数える — コメント中の `ctx.sync()` を拾わない。
+    assert_eq!(
+        f.matches("ctx.sync()?").count(),
+        1,
+        "gdn_scan_chunked_impl の ctx.sync() が 1 箇所でない \
+         (デバイス出力経路にホスト同期が残っている / ホスト出力経路の 1 回が消えた)"
+    );
+    let dev = f
+        .find("if y_dst.is_some() {")
+        .expect("デバイス出力 (y_dst = Some) の分岐が無い");
+    let ret = dev
+        + f[dev..]
+            .find("return Ok(Vec::new());")
+            .expect("デバイス出力経路の早期 return が無い");
+    let sync = f.find("ctx.sync()?").expect("ctx.sync() が無い");
+    assert!(
+        sync > ret,
+        "ctx.sync() がデバイス出力経路の早期 return より前にある \
+         (3 pass 後の待ちが戻っている)"
+    );
+}
 
-
+/// s245 (P45): 保留した `[GDN_KPROF]` 区間を prefill 末尾で読むこと。
+///
+/// 3 pass 後の同期を外したので、区間の読み出しは次の既存の同期へ回す。
+/// prefill 末尾 (`pf_timing_read` = 最終行の既存 D2H の後) が最後の読み出し点で、
+/// 集計行より前に読まないと最後の層の区間が捨てられる。
+#[test]
+fn gdn_kprof_pending_read_happens_before_prefill_end_report() {
+    let read = fn_body(CUDA_RS, "pub fn pf_timing_read(");
+    let p = read
+        .find("kprof_read_pending()")
+        .expect("pf_timing_read に保留区間の読み出しが無い (P45 の遅延読みが捨てられる)");
+    let r = read
+        .find("gdn_kprof_report_at_prefill_end()")
+        .expect("prefill 末尾の [GDN_KPROF] 出力点が無い");
+    assert!(p < r, "保留区間の読み出しが集計より後にある");
+}
