@@ -3743,3 +3743,30 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
 - **触っていないもの**: `.cu` / `.ptx` / GPU / サーバ / docker / 量子化規則 / 数値経路 /
   `qwen35.rs` / テスト以外の `gguf.rs` / push / `git add -A`。作業レポートは未 commit の
   `REPORT_P38.md` (P37 §8 の該当文の誤りはそこで訂正)。
+
+### P40: GDN chunked 3 カーネルの実時間をホスト側 CUDA イベントで切り分ける計測を入れた (2026-10-23) 完了 (計測専用・既定 OFF)
+
+- **課題**: 27B q4・65,000 chars prefill の `sl_lay_gdn_scan` 相 = 6,965 ms (19.4%) の内訳が
+  `DENNO_PROFILE` の `gdn_pf_*` では `sync` (13,774.9 ms / 2 リクエスト) までしか割れず、
+  pass 1/2/3 の配分と「上流 gdn_proj GEMM の残りを sync が吸っている」可能性 (P27 の位相帰属)
+  が未計測のままだった。
+- **実装**: `cuda.rs` の `gdn_scan_chunked_impl` に `DENNO_GDN_KPROF=1` のときだけ 4 本の
+  イベント (`CU_EVENT_DEFAULT` = 計時有効) を打ち、既存の同期 (3 pass 後の 1 回) が済んだ
+  直後に `cuEventElapsedTime` で 3 区間を読んで static な `AtomicU64` に ns で積算する。
+  出力は dump 時 (`prof::summary`) と終了時に 1 行:
+  `[GDN_KPROF] pre=<ms> state=<ms> scan=<ms> calls=<n> total=<ms>`。**計測専用**で、
+  launch の関数・引数・grid/block・発行順・同期位置は 1 つも変えず、積算は表示用 static に
+  しか書かない (数値経路・アンカー値には流れない)。`DENNO_GDN_KPROF` 未設定なら
+  `kprof_begin()` が None を返すだけでイベント生成も計測も起きない (各サイト分岐 1 回)。
+  既存の `DENNO_PROFILE` / `DENNO_PF_DBG` の出力は env 未設定時に不変。
+- **テスト**: `cargo test -p denno-engine --features cuda --lib` = 330 passed / 0 failed /
+  40 ignored (基準 327 + 計測 3 本)、`cargo test -p denno-engine --test kernel_invariants` =
+  11 passed、非 cuda `--lib` = 286 passed。`kernel_invariants` の
+  `gdn_kernel_shared_layout_matches_host_smem` は P36 が pass 1 の 4 レーン版
+  (`dno_gdn_chunk_pre_l4`) を足した時点で赤だった (同じ `sc[]` 割り当てを持つカーネルが
+  2 本になった) — 期待値 1 → 2 に更新して緑に戻した (`.cu` は触っていない)。
+- **未検証**: 実機の数字 (pre/state/scan の ms 配分)。このコンテナは GPU 非搭載なので、
+  実測はオペレータの 8095 / prefill_bench 実行で行う。区間は「カーネル実行 + 発行の隙間」で
+  あり、pass 間のホスト側の詰まりも含む。
+- **次の実装内容**: 実測で支配的な pass が判明したら、その pass のレーン/チャンク分割を狙う
+  (P36 の 4 レーン版は pass 1 を狙って効果なしと確定済み = 支配が pass 1 でない可能性)。

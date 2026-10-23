@@ -38,6 +38,7 @@ use anyhow::{anyhow, bail, Result};
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 type CUresult = i32;
@@ -13014,6 +13015,329 @@ enum GdnScanSrc<'a> {
     },
 }
 
+// ---------------------------------------------------------------------------
+// s240 (P40): GDN chunked 3 カーネルの実時間 (`DENNO_GDN_KPROF=1`・既定 OFF)
+//
+// 背景: 27B q4 prefill の `sl_lay_gdn_scan` 相は 6,965 ms (19.4%) だが、
+// `DENNO_PROFILE` の `gdn_pf_*` では `sync` (13,774.9 ms / 2 リクエスト) まで
+// しか割れず、「pass 1/2/3 のどれが実行時間を持っているか」は未計測だった。
+// ここでは 3 pass の発行位置にだけイベントを打ち、既存の同期 (3 pass 後の
+// 1 回) が済んだ直後に `cuEventElapsedTime` で 3 区間を読む。
+//
+// 数値経路を触らない根拠:
+// - 追加するのは `cuEventRecord` / `cuEventElapsedTime` の 2 API だけで、
+//   launch の関数・引数・grid/block・発行順・同期の位置は 1 つも変えない
+//   (イベントは 3 カーネルと同じ既定ストリームに打つので、ストリームに
+//    挿入されるのは「時刻を記録するだけの操作」)。
+// - 積算は表示専用の static にしか書かない (forward の戻り値・状態・
+//   アンカー値には一切流れない)。
+// - `DENNO_GDN_KPROF` が未設定なら `kprof_begin()` が None を返すだけで、
+//   イベント生成も計測も起きない (各サイト分岐 1 回)。`DENNO_PROFILE` /
+//   `DENNO_PF_DBG` の出力は env 未設定時に 1 バイトも変わらない。
+// - 区間の意味は「カーネル実行 + 前のカーネルとの発行の隙間」。pass 間で
+//   ホストが待たないので隙間は小さいが 0 ではない (数字はそのまま出す)。
+// ---------------------------------------------------------------------------
+
+/// `DENNO_GDN_KPROF=1` のときだけ 3 カーネルの実時間を測る (既定 OFF)。
+fn gdn_kprof_on() -> bool {
+    // テストから env を介さずに切り替える (`prof::enabled` と同じ流儀)。
+    #[cfg(test)]
+    if let Some(v) = kprof_tests::force_on() {
+        return v;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DENNO_GDN_KPROF").ok().as_deref() == Some("1"))
+}
+
+/// カーネル別の積算 (ns) と call 数。**表示専用** (数値経路からは読まない)。
+static KPROF_PRE_NS: AtomicU64 = AtomicU64::new(0);
+static KPROF_STATE_NS: AtomicU64 = AtomicU64::new(0);
+static KPROF_SCAN_NS: AtomicU64 = AtomicU64::new(0);
+/// 3 区間すべて読めた call 数。
+static KPROF_CALLS: AtomicU64 = AtomicU64::new(0);
+/// 区間を読めなかった (未完了・負値・イベント欠け) call 数。半端な数字は積まない。
+static KPROF_MISS: AtomicU64 = AtomicU64::new(0);
+
+/// 積算の読み出し結果 (整形・テスト用の値型)。
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct KprofAcc {
+    pub pre_ns: u64,
+    pub state_ns: u64,
+    pub scan_ns: u64,
+    pub calls: u64,
+}
+
+impl KprofAcc {
+    /// 表示行。1 度も測っていない (`calls == 0`) なら None = 行を出さない
+    /// (0 の行を出すと「測って 0 ms だった」と読めてしまう)。
+    fn line(&self) -> Option<String> {
+        if self.calls == 0 {
+            return None;
+        }
+        let ms = |ns: u64| ns as f64 / 1e6;
+        Some(format!(
+            "[GDN_KPROF] pre={:.3} state={:.3} scan={:.3} calls={} total={:.3}",
+            ms(self.pre_ns),
+            ms(self.state_ns),
+            ms(self.scan_ns),
+            self.calls,
+            ms(self.pre_ns + self.state_ns + self.scan_ns)
+        ))
+    }
+}
+
+/// 積算を読む。
+fn kprof_acc() -> KprofAcc {
+    KprofAcc {
+        pre_ns: KPROF_PRE_NS.load(Ordering::Relaxed),
+        state_ns: KPROF_STATE_NS.load(Ordering::Relaxed),
+        scan_ns: KPROF_SCAN_NS.load(Ordering::Relaxed),
+        calls: KPROF_CALLS.load(Ordering::Relaxed),
+    }
+}
+
+/// 3 区間 (ms) を積算する。`KprofCall::finish` の算術だけを切り出したもの
+/// (GPU 無しで試せるようにするため)。
+fn kprof_add_ms(pre_ms: f32, state_ms: f32, scan_ms: f32) {
+    let ns = |x: f32| (x as f64 * 1e6).round() as u64;
+    KPROF_PRE_NS.fetch_add(ns(pre_ms), Ordering::Relaxed);
+    KPROF_STATE_NS.fetch_add(ns(state_ms), Ordering::Relaxed);
+    KPROF_SCAN_NS.fetch_add(ns(scan_ms), Ordering::Relaxed);
+    KPROF_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 積算の表示行 (`DENNO_GDN_KPROF` 未設定・未計測なら None)。
+/// dump (`prof::summary`) と終了時の 1 行がこれを使う。
+pub fn gdn_kprof_line() -> Option<String> {
+    if !gdn_kprof_on() {
+        return None;
+    }
+    kprof_acc().line()
+}
+
+/// 区間を読めずに捨てた call 数 (診断用。表示行には入れない)。
+pub fn gdn_kprof_miss() -> u64 {
+    KPROF_MISS.load(Ordering::Relaxed)
+}
+
+/// 積算を stderr へ 1 行だけ出す (未設定・未計測なら何もしない)。
+pub fn gdn_kprof_report() {
+    if let Some(l) = gdn_kprof_line() {
+        eprintln!("{l}");
+    }
+}
+
+/// 終了フック: 計測を開いたスレッドが終わるときに 1 行だけ出す (dump 経路
+/// (`DENNO_PROFILE`) を通らない使い方のための保険)。読むのは static の積算だけ
+/// なので CUDA は呼ばない = コンテキスト破棄後でも安全。
+struct KprofExitGuard;
+
+impl Drop for KprofExitGuard {
+    fn drop(&mut self) {
+        gdn_kprof_report();
+    }
+}
+
+thread_local! {
+    /// 計測を開いたスレッドに 1 個だけ置く (env OFF なら作られない)。
+    static KPROF_EXIT_GUARD: KprofExitGuard = KprofExitGuard;
+}
+
+/// 終了フックを置く (初回だけ)。計測していないスレッドには作らない。
+fn kprof_arm_exit_guard() {
+    KPROF_EXIT_GUARD.with(|_| ());
+}
+
+/// 4 本のイベント (e0=開始 / e1=pass1 後 / e2=pass2 後 / e3=pass3 後)。
+/// CUevent は `*mut c_void` (Send でない) ので static に置くためのラッパを挟む。
+/// ハンドルは不変で、触るのは record / elapsed_time だけ。
+struct KprofEvents([CUevent; 4]);
+
+// SAFETY: 保持するのは CUDA の不透明ハンドルだけで、アクセスは下の Mutex で
+// 直列化する (実際には multi-slot 同時実行は無いが、念のため排他する)。
+unsafe impl Send for KprofEvents {}
+
+/// イベントの置き場 (初回だけ生成・grow しない)。作れなければ None = 計測しない。
+static KPROF_EV: OnceLock<Option<std::sync::Mutex<KprofEvents>>> = OnceLock::new();
+
+fn kprof_events() -> Option<&'static std::sync::Mutex<KprofEvents>> {
+    KPROF_EV
+        .get_or_init(|| {
+            let create = lib().ok()?.event_create?;
+            let mut evs: [CUevent; 4] = [std::ptr::null_mut(); 4];
+            for slot in evs.iter_mut() {
+                let mut ev: CUevent = std::ptr::null_mut();
+                // CU_EVENT_DEFAULT (0) = 計時有効。作れなければ計測を諦める
+                // (fail closed。途中まで作った分はプロセス終了まで保持する)。
+                if unsafe { create(&mut ev, 0) } != CUDA_SUCCESS || ev.is_null() {
+                    return None;
+                }
+                *slot = ev;
+            }
+            Some(std::sync::Mutex::new(KprofEvents(evs)))
+        })
+        .as_ref()
+}
+
+/// 1 call 分の計測ハンドル (イベントを排他で握る)。
+struct KprofCall {
+    lock: std::sync::MutexGuard<'static, KprofEvents>,
+    /// 打てたイベントのビット (bit i = e_i)。4 本そろわなければ積算しない。
+    marks: u32,
+}
+
+impl KprofCall {
+    /// 既定ストリームに境界イベントを 1 本打つ (`idx` 0..=3)。
+    fn mark(&mut self, idx: usize) {
+        let Some(rec) = lib().ok().and_then(|l| l.event_record) else {
+            return;
+        };
+        if unsafe { rec((self.lock.0)[idx], std::ptr::null_mut()) } == CUDA_SUCCESS {
+            self.marks |= 1 << idx;
+        }
+    }
+
+    /// 既存の同期が済んだ後に 3 区間を読んで積算する。
+    fn finish(self) {
+        let Some(elapsed) = lib().ok().and_then(|l| l.event_elapsed_time) else {
+            KPROF_MISS.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if self.marks != 0b1111 {
+            // 4 本そろっていない = 区間の意味が無い。半端な数字は積まない。
+            KPROF_MISS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let e = &self.lock.0;
+        let mut ms = [0f32; 3];
+        for k in 0..3 {
+            let mut v: f32 = 0.0;
+            let rc = unsafe { elapsed(&mut v, e[k], e[k + 1]) };
+            // 未完了 (NOT_READY)・非有限・負値は「読めなかった」としてこの
+            // call を丸ごと捨てる (半端な数字を積むと以後の判断が全部その
+            // 数字に引きずられる)。
+            if rc != CUDA_SUCCESS || !v.is_finite() || v < 0.0 {
+                KPROF_MISS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            ms[k] = v;
+        }
+        kprof_add_ms(ms[0], ms[1], ms[2]);
+    }
+}
+
+/// 計測を開く。`DENNO_GDN_KPROF` 未設定なら分岐 1 回で None (イベントも作らない)。
+fn kprof_begin() -> Option<KprofCall> {
+    if !gdn_kprof_on() {
+        return None;
+    }
+    let ev = kprof_events()?;
+    kprof_arm_exit_guard();
+    // poison しても中身はハンドルだけなので続ける。
+    let lock = ev.lock().unwrap_or_else(|e| e.into_inner());
+    Some(KprofCall { lock, marks: 0 })
+}
+
+/// `kprof_begin()` の結果に 1 本打つ (計測していなければ分岐 1 回で何もしない)。
+#[inline]
+fn kprof_mark(kp: &mut Option<KprofCall>, idx: usize) {
+    if let Some(k) = kp.as_mut() {
+        k.mark(idx);
+    }
+}
+
+#[cfg(test)]
+mod kprof_tests {
+    //! s240 (P40): 計測コードが「既定で no-op」「ON でカーネル別に積算される」
+    //! ことの GPU 不要な検証。実測はオペレータの GPU 実行で行う (ここでは
+    //! `cuEventCreate` すら呼ばない = イベント生成が env 依存であることも見る)。
+    use super::*;
+
+    /// テスト専用の env 上書き (env を書き換えると並走テストを揺らすため)。
+    static FORCE_ON: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+    pub(super) fn force_on() -> Option<bool> {
+        *FORCE_ON.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 強制の窓 (drop で元に戻す)。assert が落ちても他テストを汚さない。
+    struct Force(Option<bool>);
+
+    impl Force {
+        fn set(v: Option<bool>) -> Self {
+            let prev = *FORCE_ON.lock().unwrap_or_else(|e| e.into_inner());
+            *FORCE_ON.lock().unwrap_or_else(|e| e.into_inner()) = v;
+            Force(prev)
+        }
+    }
+
+    impl Drop for Force {
+        fn drop(&mut self) {
+            *FORCE_ON.lock().unwrap_or_else(|e| e.into_inner()) = self.0;
+        }
+    }
+
+    fn reset_acc() {
+        KPROF_PRE_NS.store(0, Ordering::Relaxed);
+        KPROF_STATE_NS.store(0, Ordering::Relaxed);
+        KPROF_SCAN_NS.store(0, Ordering::Relaxed);
+        KPROF_CALLS.store(0, Ordering::Relaxed);
+        KPROF_MISS.store(0, Ordering::Relaxed);
+    }
+
+    /// env 未設定 (強制 OFF) では計測の入口が no-op であること。
+    #[test]
+    fn kprof_off_is_noop() {
+        let _g = crate::prof::counters_guard();
+        let _f = Force::set(Some(false));
+        assert!(!gdn_kprof_on());
+        assert!(kprof_begin().is_none(), "OFF ではイベントを作らない");
+        assert!(gdn_kprof_line().is_none(), "OFF では行を出さない");
+    }
+
+    /// ON のとき、積算がカーネル別に初期化され、表示行が仕様どおりになること。
+    #[test]
+    fn kprof_on_accumulates_per_kernel() {
+        let _g = crate::prof::counters_guard();
+        let _f = Force::set(Some(true));
+        reset_acc();
+        assert!(gdn_kprof_line().is_none(), "未計測 (calls=0) は行を出さない");
+        kprof_add_ms(1.5, 0.25, 2.0);
+        kprof_add_ms(0.5, 0.75, 1.0);
+        let acc = kprof_acc();
+        assert_eq!(
+            (acc.pre_ns, acc.state_ns, acc.scan_ns, acc.calls),
+            (2_000_000, 1_000_000, 3_000_000, 2),
+            "カーネル別に ns で積算されない"
+        );
+        assert_eq!(
+            gdn_kprof_line().as_deref(),
+            Some("[GDN_KPROF] pre=2.000 state=1.000 scan=3.000 calls=2 total=6.000")
+        );
+        assert_eq!(gdn_kprof_miss(), 0, "成功した call を miss に数えている");
+        reset_acc();
+    }
+
+    /// 表示行の書式 (ms 3 桁・calls・total = 3 区間の和)。GPU 不要。
+    #[test]
+    fn kprof_line_format_is_stable() {
+        let acc = KprofAcc {
+            pre_ns: 1_234_567_000,
+            state_ns: 2_500_000,
+            scan_ns: 3_000_000,
+            calls: 7,
+        };
+        assert_eq!(
+            acc.line().as_deref(),
+            Some("[GDN_KPROF] pre=1234.567 state=2.500 scan=3.000 calls=7 total=1240.067")
+        );
+        assert!(
+            KprofAcc::default().line().is_none(),
+            "未計測の既定値が行を出している"
+        );
+    }
+}
+
 /// A1-r2: GDN chunked scan 実装 (3 カーネル・長 prefill 用)。
 ///
 /// CPU 参照: [`crate::gdn::scan_chunked_core`]。3-pass 構成:
@@ -13176,6 +13500,9 @@ fn gdn_scan_chunked_impl(
         (true, Some(f)) if dk == 128 && dv == 128 => (f, (dk as u32) * 4),
         _ => (ctx.f_gdn_chunk_pre, dk as u32),
     };
+    // s240 (P40): pass 1 の実時間 (`DENNO_GDN_KPROF=1` のときだけ・既定 OFF)。
+    let mut kp = kprof_begin();
+    kprof_mark(&mut kp, 0);
     unsafe {
         ctx.launch_async(
             f_pre,
@@ -13185,6 +13512,7 @@ fn gdn_scan_chunked_impl(
             &mut args_pre,
         )?;
     }
+    kprof_mark(&mut kp, 1);
     // s173 (P15): pass 1 → pass 2 は同一ストリームの発行順で足りる (pass 2 は
     // pass 1 が書いた W/M を読むが、既定ストリームは FIFO なので待つ必要が無い)。
     // 従来ここにあった `ctx.sync()` (cuCtxSynchronize = デバイス全体の drain) は
@@ -13213,6 +13541,7 @@ fn gdn_scan_chunked_impl(
             &mut args_state,
         )?;
     }
+    kprof_mark(&mut kp, 2);
     // s173 (P15): pass 2 → pass 3 も同じ理由で待たない (pass 3 は pass 2 の
     // Sinit を読むが、発行順で足りる)。
 
@@ -13263,12 +13592,19 @@ fn gdn_scan_chunked_impl(
             &mut args_scan,
         )?;
     }
+    kprof_mark(&mut kp, 3);
     // s173 (P15): 3 pass を発行し終えてから 1 回だけ待つ (この時点で GPU 上には
     // pass 1/2/3 がこの順で並んでおり、待ちは「3 つ全部の完了」= 従来の 3 回の
     // 待ちと同じ完了点。違うのはホストが pass 間で止まらないことだけ)。
     q.lap(crate::prof::D2H_GDN_PF_SYNC);
     ctx.sync()?;
     q.lap(crate::prof::D2H_GDN_PF_D2H);
+    // s240 (P40): 既存の同期が済んだ直後に 3 区間を読む (待ちは足さない)。
+    // `q.lap(D2H)` の後に置くのは、3 回の `cuEventElapsedTime` (数 µs) を
+    // 既存の `gdn_pf_sync` の数字に混ぜないため (d2h は表示専用の細分)。
+    if let Some(k) = kp.take() {
+        k.finish();
+    }
 
     if y_dst.is_some() {
         // s72: y はデバイス上に残す (呼び出し側がチェーンで消費する)。
