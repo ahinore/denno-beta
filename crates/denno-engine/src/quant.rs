@@ -15,6 +15,8 @@
 
 use anyhow::{bail, Result};
 
+use crate::kquant::GgmlType;
+
 /// 量子化モード。デフォルトは Fp32 (従来動作を完全維持)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QuantMode {
@@ -222,6 +224,61 @@ impl Q4Linear {
     pub fn weight_bytes(&self) -> usize {
         self.blocks.len()
     }
+
+    /// P35: GGUF の Q4_0 生ブロックを**再量子化せずに**保持する。
+    ///
+    /// engine の `Q4Linear` ブロックは ggml の `block_q4_0` と同一レイアウト
+    /// (f16 scale 2B + 16B ニブル、低位ニブル = 先頭 16 要素・高位 = 後半 16 要素)
+    /// なので、GGUF 側の型が Q4_0 のテンソルは fp32 へ展開せずそのまま積める。
+    /// 1 行 k 要素 × n 行のバイト数が `n * row_bytes(k)` と一致することを検証し、
+    /// 合わなければ `None` を返す (**fail-closed**: 呼び出し側は従来の fp32
+    /// 経路へ落ちる)。型が Q4_0 であることの判定は呼び出し側の責務。
+    pub fn from_gguf_blocks(blocks: &[u8], k: usize, n: usize) -> Option<Self> {
+        if k == 0 || k % Q4_BLOCK_ELEMS != 0 {
+            return None;
+        }
+        let want = n.checked_mul(Self::row_bytes(k))?;
+        if blocks.len() != want {
+            return None;
+        }
+        Some(Self { blocks: blocks.to_vec(), k, n, uid: next_uid() })
+    }
+}
+
+/// P35: GGUF の生ブロックを再量子化せずに積む経路の env ゲート名。
+///
+/// 未設定・空・"0" (および "1"/"true"/"yes"/"on" 以外の値) は**無効** =
+/// 従来経路 (GGUF → fp32 → 再量子化) と 1 バイトも変わらない。
+pub const GGUF_PASSTHROUGH_ENV: &str = "DENNO_GGUF_PASSTHROUGH";
+
+/// P35: env 値の解釈 (純関数・テスト可能)。有効化は明示的な真値のみ。
+pub fn gguf_passthrough_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        None => false,
+    }
+}
+
+/// P35: 現在の env 設定で passthrough が有効か (ロード開始時に 1 回だけ呼ぶ)。
+pub fn gguf_passthrough_enabled() -> bool {
+    let v = std::env::var(GGUF_PASSTHROUGH_ENV).ok();
+    gguf_passthrough_from_value(v.as_deref())
+}
+
+/// P35: passthrough を**許可する** GGUF 型。proof test でビット一致を確認した型
+/// だけを入れる (現在は空 = ゲートを ON にしても fp32 経路のまま)。
+///
+/// 2026-10-23 の実測 (`gguf::tests::q4_verbatim_matches_requant_real_gguf`,
+/// /work/models/Qwen3.8-27B-Q4_0.gguf): **Q4_0 は一致しない**。このファイルの
+/// Q4_0 ブロックは ggml の `quantize_row_q4_0_ref` (d = max/-8) ではなく
+/// imatrix 重み付きのスケールで量子化されているため、デ量子化 → 再量子化すると
+/// ブロックの f16 スケールが変わる (最初の不一致 = `blk.60.ffn_up.weight` の
+/// byte 0、ニブルは一致)。よって Q4_0 は許可しない = 従来の fp32 経路を維持。
+/// d = max/-8 で量子化し直したファイルで proof test が一致を報告したときに
+/// だけ、ここへ `GgmlType::Q4_0` を足す (数値が変わる変更なので実機アンカー
+/// の再取得が必要)。
+pub fn gguf_passthrough_allows(_ty: GgmlType) -> bool {
+    false
 }
 
 /// s80 (T7b): int8 重み 1 本に対する `Linear::apply_bt_rows_into` の Q8 分岐と
@@ -945,6 +1002,40 @@ mod tests {
         assert_eq!(QuantMode::parse("fp32").unwrap(), QuantMode::Fp32);
         assert!(QuantMode::parse("int4").is_err());
         assert_eq!(QuantMode::Int8.label(), "int8");
+    }
+
+    /// P35: `DENNO_GGUF_PASSTHROUGH` の解釈。未設定・空・"0"・未知値は無効
+    /// (= 従来経路)、明示的な真値のみ有効。
+    #[test]
+    fn gguf_passthrough_gate_parsing() {
+        assert!(!gguf_passthrough_from_value(None));
+        assert!(!gguf_passthrough_from_value(Some("")));
+        assert!(!gguf_passthrough_from_value(Some("0")));
+        assert!(!gguf_passthrough_from_value(Some(" 0 ")));
+        assert!(!gguf_passthrough_from_value(Some("2")));
+        assert!(!gguf_passthrough_from_value(Some("off")));
+        assert!(gguf_passthrough_from_value(Some("1")));
+        assert!(gguf_passthrough_from_value(Some("true")));
+        assert!(gguf_passthrough_from_value(Some("ON")));
+    }
+
+    /// P35: GGUF の Q4_0 生ブロックは engine の `Q4Linear` ブロックと同一
+    /// レイアウトなので、再量子化したバイト列と一致する。形が合わない入力は
+    /// None (fail-closed = 呼び出し側は従来の fp32 経路へ落ちる)。
+    #[test]
+    fn q4_from_gguf_blocks_matches_requantize() {
+        let (k, n) = (64usize, 3usize);
+        let w = pseudo_random(k * n, 31);
+        let q = Q4Linear::quantize(&w, k, n);
+        let verbatim = Q4Linear::from_gguf_blocks(&q.blocks, k, n).expect("形は一致するはず");
+        assert_eq!(verbatim.blocks, q.blocks, "生ブロックは再量子化バイト列と同一");
+        assert_eq!((verbatim.k, verbatim.n), (k, n));
+        assert_eq!(verbatim.weight_bytes(), q.weight_bytes());
+        // 形の不一致は None
+        assert!(Q4Linear::from_gguf_blocks(&q.blocks[..q.blocks.len() - 1], k, n).is_none());
+        assert!(Q4Linear::from_gguf_blocks(&q.blocks, k + 1, n).is_none()); // k が 32 の倍数でない
+        assert!(Q4Linear::from_gguf_blocks(&q.blocks, k, n + 1).is_none());
+        assert!(Q4Linear::from_gguf_blocks(&q.blocks, 0, 0).is_none());
     }
 
     #[test]

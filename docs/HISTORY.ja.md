@@ -3561,3 +3561,96 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
   8095 は無変更)。
 - **測っていないこと**: GPU アンカー・ms/token・nsys (数値経路を 1 行も変えていないため
   構造的に不変だが、測ってはいない)。作業レポートは未 commit の `REPORT_P19.md`。
+
+### s179: Task P28 - `sl_lay_full_core` のホスト側を先に測った (2026-10-23) 完了
+
+> 指示書の「まず測る」に従って位相の launch / 転送 / ホスト費用を表にした。位相は
+> **device bound** (attention カーネル ~400 ms/層 ≈ 位相の 60 %、転送 1.15 GB/層) で、
+> ホスト側は prepare 44.9 ms + sigmoid ゲート 45.4 ms = **90.3 ms/層**
+> (n=14,043・16 full 層で **1.45 s/リクエスト** = 位相の ~13 %・wall の ~3.4 %)。
+> この 2 つはどちらも「必要なデータ移動」で、消すにはゲートのデバイス化 (`.cu`) が要る。
+> 位相の中に残っていた**読まれないバッファの確保**だけを 1 本消した。
+
+- **実測 (このコンテナ・GPU 不要・リポジトリ外 `/tmp/p28probe`・`rustc -O`)**:
+  `pf_prepare_row` × n 行 (行並列) と `chain_pf_att_inplace` のゲート (式は同一) を
+  27B 実シェイプで回した。n=14,043 で prepare **44.9 ms/層** (3,198 ns/token)、
+  ゲート **45.4 ms/層** (3,233 ns/token。うち exp 12.1 ms、残りは 690 MB の読み書き
+  = 21 GB/s)。n=12,850 で 38.2 + 43.1 = 81.2 ms/層、n=3,161 で 11.1 + 11.2 =
+  22.2 ms/層。帯域の校正は同じ 345 MB のコピーで r+w 41 GB/s。
+- **live 経路の確定**: `DENNO_GPU_ATTN` 既定 ON (`cuda.rs:5849` / `5854`) +
+  `attn_prefill_gpu_supported` (`cuda.rs:4568`。`n >= gemm_min_m()` = 既定 256 を
+  `cuda.rs:4572` で判定、dh=256 は smem 84,800 B を opt-in 済み) → n=14,043 は GPU attend。
+  残差常駐経路は `host_att_needed=false` (`qwen35.rs:2704-2713`) なので
+  `chain_pf_att_inplace` (`cuda.rs:12771`) が走る `AttnPlace::GpuDev` = P12 の
+  pinned 直送り経路のまま。`buf_att` のゼロ埋めは `if !att_done` の中だけ
+  (`qwen35.rs:1215-1216`) = P12 の削除は保たれている。
+- **変更 (1 本・`qwen35.rs` のみ・+24/-3)**: 位相の中で毎リクエスト
+  `fit_prefill_buf(buf_q)` と `fit_prefill_buf(buf_att)` が 2 × 345 MB を
+  mmap + ゼロ埋めしていたが、GpuDev 経路はこの 2 本を**一度も読まない**
+  (>128 KB の確保は malloc のアリーナを通らないので、ページフォルトを毎回払う)。
+  確保を使用点 (`!q_in_pin` の prepare 前 / CPU attend のゼロ埋め前 / GpuHost の
+  `copy_from_slice` 前) へ移した。`fit_prefill_buf` 自体・ゼロ埋めの規則・演算列・
+  転送バイト数・発行順は不変 = 値は 1 ビットも変わらない (使う経路はどれも
+  使用直前に全要素を書く)。`full_attn_attend_gpu` の `att` 引数は
+  `&mut [f32]` → `&mut Vec<f32>` (使用点で確保するため)。
+- **予測効果 (実測単価 × 2 本)**: **-0.24 s/request @14,043** (237〜254 ms)、
+  **-0.25 s @12,850** (247 ms)、**-0.06 s @3,161** (61 ms)。full_core の 2〜3 %、
+  wall (38.79〜40.35 s @12,850) の 0.6 %。**実機の cold A/B は未計測**
+  (このコンテナは GPU 非搭載)。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (不変)。非 cuda lib = 280 passed /
+  0 failed / 2 ignored。`--features cuda` の統合テストも 5 / 7 / 11 / 1 本すべて緑。
+  `cargo build --release -p denno-cli --features denno-engine/cuda` 成功。
+- **触っていないもの**: `.cu` / `.ptx` / nvcc / GPU ビルド / GPU 実行 / D2H の連結
+  (P17b・実測 2.2x 悪化で revert 済み) / リダクション順 / 新しい env ゲート /
+  8095 / push / rebase / `git add -A`。作業レポートは未 commit の `REPORT_P28.md`。
+
+### P35: GGUF Q4_0 の生ブロック passthrough を実データで判定した (2026-10-23) 完了 (既定 OFF・許可型 0)
+
+> P4-5 の残件「GGUF → fp32 → Q4_0 の再量子化をやめて生ブロックをそのまま積む」に
+> ついて、まず**ビット一致するか**を実ファイルで確かめた。結論は
+> **Q4_0 は一致しない** (サンプル 16 本中 14 本が不一致・最初の不一致は
+> `blk.60.ffn_up.weight` の byte 0 = ブロックの f16 スケール)。よって
+> passthrough は実装したが**許可型リストは空**のまま = ゲートを ON にしても
+> 従来の fp32 経路で、数値は 1 ビットも変わらない。
+
+- **実測 (`gguf::tests::q4_verbatim_matches_requant_real_gguf`・`#[ignore]`・CPU)**:
+  `/work/models/Qwen3.8-27B-Q4_0.gguf` を **mmap せず**、先頭 16 MiB から
+  ヘッダ (10,996,700 B) だけを `GgufHeader` で解析し、テンソルは pread で
+  行境界 4 MB ずつ読んで `dequant_row` → `Q4Linear::quantize` とバイト比較した
+  (ピーク数十 MB・全体 5.1 s)。型別判定: **Q4_0 = NOT identical**
+  (352 本 / 12.441 GiB、サンプル 16 本、一致 2 本 = `token_embd.weight` と
+  `blk.64.ffn_up.weight`)。F32 456 本・Q4_1 8 本・Q5K 48 本・Q6K 1 本・
+  Q8_0 1 本は Q4_0 レイアウトでないため対象外 (従来経路のまま)。
+- **不一致の機序 (実ブロックを 1 個ダンプして確認)**: ファイル側ブロックは
+  `d = 4.543304e-3`・ニブル範囲 1..12 で **max|q-8| = 7**。ggml の
+  `quantize_row_q4_0_ref` は最大絶対値の要素を必ずニブル 0 (|q-8| = 8) に写すので、
+  このブロックは ref 規則で作られていない。そのため再量子化の `d'` は
+  `max|y|/-8 = d*7/8` になり、比は 14 本すべてで実測 **1.1426〜1.1433
+  (= 8/7 = 1.142857、f16 丸めの幅)**。スケールが変わればニブルも変わる
+  (両方不一致)。比が一定なのは「ref の `d = max/-8` ではなく `d ≈ amax/7` 系の
+  規則で量子化されている」ことと整合する (ファイルは ref 経路の産物ではない)。
+  → このファイルでは往復は「純粋なコスト」ではなく**値が変わる変換**。
+- **変更**: `quant.rs` に `Q4Linear::from_gguf_blocks` (生ブロックの検証付き
+  コピー・形が合わなければ `None` の fail-closed)・`GGUF_PASSTHROUGH_ENV` /
+  `gguf_passthrough_from_value` / `gguf_passthrough_enabled` /
+  `gguf_passthrough_allows` (許可型 = 現在 0 個)。`gguf.rs` に `GgufHeader`
+  (mmap 無しのヘッダビュー。`GgufFile` と共通の `parse_fields` を通すので
+  解析規則は 1 本) と上記 proof test。`qwen35.rs` の 2D 線形重み 10 本 +
+  untied `output.weight` を `lin_g` (ゲート時のみ passthrough を試し、
+  失敗したら従来の `dt → lin`) 経由にした。**既定 (env 未設定 / `0`) は
+  従来と同一の呼び出し列** (同じ関数を同じ順で呼ぶ)。
+- **予測効果 (PREDICTED・未計測)**: Q4_0 を許可した場合に省ける fp32 展開は
+  **88.47 GiB** (12.441 GiB × 4 B/elem ÷ 0.5625 B/elem = 7.111 倍。テンソル
+  ごとの一時確保で同時常駐ではない。最大は `token_embd.weight` の 5.086 GB)。
+  proof test の実測レート (0.77 GiB / 5.1 s) からロードの CPU 側は約 82 s
+  減る見込み。ただし**許可型 0 個なので実際の節約は 0**。実機のロード時間は
+  本セッションの計測対象外。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **323 passed / 0 failed / 38 ignored** (基準 321 + 新規 unit 2 + ignored 1)。
+  `-- --ignored q4_verbatim_matches_requant_real_gguf` = 1 passed。非 cuda
+  `cargo test -p denno-engine --lib` = 282 passed / 0 failed / 3 ignored。
+- **触っていないもの**: `.cu` / `.ptx` / GPU / サーバ / docker /
+  `docs/NUMERIC_POLICY.ja.md` / `GPU_VERIFY.sh` / `scripts/prod_serve_27b.sh` /
+  GGUF の型ゲートが受ける型集合 / push / `git add -A`。作業レポートは
+  未 commit の `REPORT_P35.md`。
