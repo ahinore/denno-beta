@@ -1068,7 +1068,6 @@ impl Qwen35 {
                 fl.v_w.apply_bt_rows_into(buf_h, n, buf_v); // [n, kv_dim]
             });
         }
-        fit_prefill_buf(buf_att, n * heads * dh);
         // s63: `full_attn_attend_head` は att_head に **加算** する
         // (`*a += pv * b`・k 昇順の逐次累積が bit 一致の根拠) ため、
         // 層をまたいで領域を再利用するときは毎層ゼロで初期化する。
@@ -1079,6 +1078,15 @@ impl Qwen35 {
         // `att` の全要素を D2H で上書きする)。27B n=14,043 では 1 層 345 MB ×
         // 16 層 = 5.5 GB/request の無駄な書き込みだったので、下の
         // `if !att_done` の中へ移した (値・順序は不変)。
+        //
+        // s177 (P28): `buf_att` の **確保も** 使用点へ移した。残差常駐経路の
+        // GPU attend (GpuDev / GpuHost) は `buf_att` を読まない (GpuDev は
+        // pinned 上で確定、GpuHost は `att.copy_from_slice(&ga)` で全要素を
+        // 上書きする) のに、ここで `fit_prefill_buf` を通すと空の Vec から
+        // 345 MB を mmap + ゼロ埋めすることになる (このコンテナ実測 119 ms。
+        // >128 KB の確保は malloc のアリーナを通らないので**リクエストごとに
+        // ページフォルトを払い直す**)。値は 1 ビットも変わらない — 使う 2 経路
+        // (CPU attend / GpuHost) はどちらも使用直前に全要素を書く。
         // s42 (Plan B): prepare (KV 書き込み + QK-Norm + RoPE) をトークン順
         // に逐次実行 (トークン逐次経路と同一の演算列・decode 経路の
         // full_attn_core と共用)。attend は読み取り専用のため全トークンの
@@ -1086,7 +1094,9 @@ impl Qwen35 {
         // (s50: prof は QKNORM / ROPE バケットに分割計上 — 演算列は
         // full_attn_prepare 1 回呼び出しと同一 (順序不変) = bit-exact。
         // KV 書き込みは llama prefill と同様に個別計上しない)
-        fit_prefill_buf(buf_q, n * heads * dh);
+        // s177 (P28): `buf_q` の確保も使用点 (`!q_in_pin` = ホストへ書く経路) へ
+        // 移した。残差常駐経路は prepare の出力を pinned に書くので `buf_q` を
+        // 読まない (CPU attend へ落ちたときだけ下で改めて fit + 再 prepare する)。
         // s73: prepare (QK-Norm → RoPE → KV 行書き込み) は**行ごとに独立**
         // (q の行・KV キャッシュの pos 行はどれも互いに素) なので行並列で
         // 実行する。1 行分の演算列はトークン逐次経路と完全に同一・書き込み先も
@@ -1129,6 +1139,9 @@ impl Qwen35 {
         #[cfg(not(feature = "cuda"))]
         let q_in_pin = false;
         if !q_in_pin {
+            // s177 (P28): ホスト `buf_q` に書く経路 (per-op / cuda 無し /
+            // pinned を貸せなかったとき) でのみ確保する。
+            fit_prefill_buf(buf_q, n * heads * dh);
             let (kc, vc) = cache.kv_bufs(li, 1);
             let krows = &mut kc[pos0 * kv_dim..(pos0 + n) * kv_dim];
             let vrows = &mut vc[pos0 * kv_dim..(pos0 + n) * kv_dim];
@@ -1197,6 +1210,9 @@ impl Qwen35 {
                 }
                 // s172 (P12): CPU attend は `att_head` へ**加算**するので、層間で
                 // 再利用する `buf_att` をここでゼロ埋めする (s63 の要件)。
+                // s177 (P28): 確保もここ (使用点) で行う — 加算の前に全要素を
+                // 0 で書くので、確保時のゼロ初期化に依存しない。
+                fit_prefill_buf(buf_att, n * heads * dh);
                 buf_att.par_chunks_exact_mut(dh).for_each(|c| c.fill(0.0));
                 // s42: attend を (i, head) 並列で実行 (旧実装はトークン逐次 —
                 // O(n²) の単スレッド部分が長 prefill の律速)。1 head 分の
@@ -1260,7 +1276,9 @@ impl Qwen35 {
         li: usize,
         pos0: usize,
         n: usize,
-        att: &mut [f32],
+        // s177 (P28): `Vec` を受けて、GpuHost 経路で書く直前にだけ確保する
+        // (GpuDev 経路は `att` を読まないので 345 MB の mmap + ゼロ埋めをしない)。
+        att: &mut Vec<f32>,
         allow_dev: bool,
         // s176 (P20): `q` は既に attention の pinned ステージングに書かれている
         // (`chain_pf_q_pin_fill`)。その場合 `q` スライスは読まない。
@@ -1385,6 +1403,9 @@ impl Qwen35 {
                     *av /= 1.0 + (-gate[d]).exp();
                 }
             });
+        // s177 (P28): GpuHost 経路は全要素を上書きするので、ここで確保する
+        // (残差常駐経路の live 分岐 = GpuDev では `att` を一度も触らない)。
+        fit_prefill_buf(att, n * heads * dh);
         att.copy_from_slice(&ga);
         AttnPlace::GpuHost
     }
