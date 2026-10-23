@@ -3950,6 +3950,30 @@ External implementations referenced in P19 and their licensing status (the same 
   3.09 us used for the prediction, so the prediction is the conservative bound. Anchor md5s
   were not re-taken.
 
+### P43: why `[GDN_KPROF]` printed nothing on the real box (its print site depended on the dump path), and making it print one line per prefill (2026-10-23) DONE (measurement only, default OFF)
+
+- **Symptom**: on the 27B q4 65k run with `DENNO_PROFILE=1 DENNO_GDN_KPROF=1 DENNO_FC_KPROF=1`,
+  `[FC_KPROF]` appeared twice and `[GDN_KPROF]` zero times.
+- **Cause (P40's "the sync after pass 3 is gone -> NOT_READY" hypothesis is disproved)**: the
+  `ctx.sync()` after the 3 passes (in `gdn_scan_chunked_impl`, right after
+  `q.lap(D2H_GDN_PF_SYNC)`) is still there after s173/P15, so `finish()` reads completed events.
+  The real cause is the **print site**: P40 emitted the line only from `prof::summary()` and the
+  thread-exit hook, and `scripts/prod_serve_27b.sh` runs `unset DENNO_PROFILE`, so
+  `prof::enabled()` is false -> no dump, and the 8095 worker thread never exits -> no exit hook.
+  `[FC_KPROF]` prints with `eprintln!` from inside the prefill, which is why it showed up with a
+  single env var (that asymmetry is the whole observation).
+- **Fix**: `pf_timing_read()` (end of prefill, after the existing final-row D2H) now calls
+  `gdn_kprof_report_at_prefill_end()`. It reads only display-only statics, so it adds **no sync,
+  no launch and no event creation**. When the dump path (`DENNO_PROFILE`) is live, `summary()`
+  already prints the same line, so the prefill site stays quiet (no duplicate). The line is now
+  `[GDN_KPROF] pre=<ms> state=<ms> scan=<ms> calls=<n> miss=<n> total=<ms>`, where `miss=<n>` is
+  the number of calls dropped (not ready / negative / missing mark / event creation failure).
+  With the env on, the line is printed even when `calls=0`, so a silent no-op cannot happen.
+- **Tests**: `--features cuda --lib` = 337 passed (kprof_tests 3 -> 5: miss format, miss-only
+  line, prefill-site decision), `--lib` = 291 passed, `--test kernel_invariants` = 19 passed (source-level check that
+  the prefill tail is wired and that the print site calls no sync/launch/memcpy).
+- **Not verified**: the real pre/state/scan ms and miss values (this container has no GPU).
+
 ### s178: Task P36 - the P3-3 scanner imports the host launch block shape (2026-10-23) done
 
 - **Implementation**: none (tests only). The last recorded limit of the P3-3 shared-memory cast
