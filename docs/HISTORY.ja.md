@@ -3857,6 +3857,29 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
   製品経路の 1 行復元は CPU 実測 1.95 µs/row (常駐ブロック・pread 無し) で、
   予測に使った 3.09 µs より小さい = 予測は保守側。アンカー md5 の再取得は未実施。
 
+### P43: `[GDN_KPROF]` が実機で 1 行も出なかった原因 (出力点が dump 依存) を潰し、prefill 終了時に必ず 1 行出すようにした (2026-10-23) 完了 (計測専用・既定 OFF)
+
+- **課題**: 27B q4・65k の実機で `DENNO_PROFILE=1 DENNO_GDN_KPROF=1 DENNO_FC_KPROF=1` を付けたのに
+  `[FC_KPROF]` は 2 回出て `[GDN_KPROF]` は 0 回だった。
+- **原因 (P40 の仮説「pass 3 後の同期が無く NOT_READY」は否定)**: 3 pass 後の `ctx.sync()`
+  (`cuda.rs` の `gdn_scan_chunked_impl`・`q.lap(D2H_GDN_PF_SYNC)` の直後) は s173/P15 後も
+  **残っている**ので `finish()` の読み出しは完了後。実際の原因は**出力点**で、P40 は
+  `prof::summary()` とスレッド終了フックにしか行を出しておらず、
+  `scripts/prod_serve_27b.sh` が `unset DENNO_PROFILE` するため `prof::enabled()` が偽 →
+  dump が出ず、8095 のワーカースレッドも終了しないので終了フックも走らない。`[FC_KPROF]` は
+  `eprintln!` で prefill 内から直接出すので env 1 本で出ていた (この差が観測の非対称)。
+- **実装**: `pf_timing_read()` (prefill 末尾・最終行 D2H の後) から
+  `gdn_kprof_report_at_prefill_end()` を呼ぶ。読むのは表示専用 static だけなので
+  **同期・launch・イベント生成を 1 つも足さない**。dump 経路 (`DENNO_PROFILE`) が生きている
+  ときは summary 側が同じ行を出すので prefill 側では出さない (二重行の回避)。行は
+  `[GDN_KPROF] pre=<ms> state=<ms> scan=<ms> calls=<n> miss=<n> total=<ms>` に拡張し、
+  `miss=<n>` = 区間を読めずに捨てた call 数 (未完了・負値・イベント欠け・イベント生成失敗)。
+  env ON なら `calls=0` でも行が出るので「静かに何も出ない」は起こらない。
+- **テスト**: `--features cuda --lib` = 337 passed (kprof_tests 3 本 → 5 本: miss 書式・
+  miss のみで行が出ること・prefill 出力点の判定)、`--lib` = 291 passed、`--test kernel_invariants` = 19 passed
+  (prefill 末尾への配線と「出力点が sync/launch/memcpy を呼ばない」をソースで固定)。
+- **未検証**: 実機の pre/state/scan ms と miss の実値 (このコンテナは GPU 非搭載)。
+
 ### s178: Task P36 - P3-3 走査器がホスト起動ブロック形状を取り込む (2026-10-23) 完了
 
 - **実装**: なし (テストのみ)。P3-3 smem キャスト走査器の最後の記録済み限界 (P34 の項を参照) を

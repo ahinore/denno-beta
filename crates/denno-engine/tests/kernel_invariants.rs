@@ -5831,4 +5831,34 @@ fn prefill_phase_markers_cover_each_layer_once_in_order() {
     }
 }
 
+/// s240 (P43): `[GDN_KPROF]` の行は **prefill 終了時** (`pf_timing_read`) に
+/// 出ていること。
+///
+/// P40 は出力点を dump (`prof::summary`) とスレッド終了フックにしか持っておらず、
+/// 本番起動 (`scripts/prod_serve_27b.sh` が `DENNO_PROFILE` を unset する) では
+/// どちらも走らないため、実機で 1 行も出なかった (計測できていても見えない)。
+/// ここでは「サーバ経路の出力点が prefill 末尾に繋がっている」ことと、
+/// 「その出力点が同期も launch も増やさない」ことをソースで固定する。
+#[test]
+fn gdn_kprof_line_is_wired_at_prefill_end_without_sync() {
+    let read = fn_body(CUDA_RS, "pub fn pf_timing_read(");
+    assert!(
+        read.contains("gdn_kprof_report_at_prefill_end()"),
+        "prefill 終了時 (pf_timing_read) に [GDN_KPROF] の出力点が無い \
+         (DENNO_PROFILE を unset する本番起動では行が消える)"
+    );
+    let site = fn_body(CUDA_RS, "pub fn gdn_kprof_report_at_prefill_end(");
+    for bad in ["sync(", "launch_async", "memcpy", "event_record", "event_create"] {
+        assert!(
+            !site.contains(bad),
+            "gdn_kprof_report_at_prefill_end が {bad} を呼んでいる \
+             (表示専用の行が同期・発行・イベント生成に触れる)"
+        );
+    }
+    assert!(
+        site.contains("if !gdn_kprof_on()"),
+        "出力点の先頭に env 分岐 (既定 OFF) が無い"
+    );
+}
+
 
