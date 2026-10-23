@@ -3561,3 +3561,46 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
   8095 は無変更)。
 - **測っていないこと**: GPU アンカー・ms/token・nsys (数値経路を 1 行も変えていないため
   構造的に不変だが、測ってはいない)。作業レポートは未 commit の `REPORT_P19.md`。
+
+### s179: Task P28 - `sl_lay_full_core` のホスト側を先に測った (2026-10-23) 完了
+
+> 指示書の「まず測る」に従って位相の launch / 転送 / ホスト費用を表にした。位相は
+> **device bound** (attention カーネル ~400 ms/層 ≈ 位相の 60 %、転送 1.15 GB/層) で、
+> ホスト側は prepare 44.9 ms + sigmoid ゲート 45.4 ms = **90.3 ms/層**
+> (n=14,043・16 full 層で **1.45 s/リクエスト** = 位相の ~13 %・wall の ~3.4 %)。
+> この 2 つはどちらも「必要なデータ移動」で、消すにはゲートのデバイス化 (`.cu`) が要る。
+> 位相の中に残っていた**読まれないバッファの確保**だけを 1 本消した。
+
+- **実測 (このコンテナ・GPU 不要・リポジトリ外 `/tmp/p28probe`・`rustc -O`)**:
+  `pf_prepare_row` × n 行 (行並列) と `chain_pf_att_inplace` のゲート (式は同一) を
+  27B 実シェイプで回した。n=14,043 で prepare **44.9 ms/層** (3,198 ns/token)、
+  ゲート **45.4 ms/層** (3,233 ns/token。うち exp 12.1 ms、残りは 690 MB の読み書き
+  = 21 GB/s)。n=12,850 で 38.2 + 43.1 = 81.2 ms/層、n=3,161 で 11.1 + 11.2 =
+  22.2 ms/層。帯域の校正は同じ 345 MB のコピーで r+w 41 GB/s。
+- **live 経路の確定**: `DENNO_GPU_ATTN` 既定 ON (`cuda.rs:5849` / `5854`) +
+  `attn_prefill_gpu_supported` (`cuda.rs:4568`。`n >= gemm_min_m()` = 既定 256 を
+  `cuda.rs:4572` で判定、dh=256 は smem 84,800 B を opt-in 済み) → n=14,043 は GPU attend。
+  残差常駐経路は `host_att_needed=false` (`qwen35.rs:2704-2713`) なので
+  `chain_pf_att_inplace` (`cuda.rs:12771`) が走る `AttnPlace::GpuDev` = P12 の
+  pinned 直送り経路のまま。`buf_att` のゼロ埋めは `if !att_done` の中だけ
+  (`qwen35.rs:1215-1216`) = P12 の削除は保たれている。
+- **変更 (1 本・`qwen35.rs` のみ・+24/-3)**: 位相の中で毎リクエスト
+  `fit_prefill_buf(buf_q)` と `fit_prefill_buf(buf_att)` が 2 × 345 MB を
+  mmap + ゼロ埋めしていたが、GpuDev 経路はこの 2 本を**一度も読まない**
+  (>128 KB の確保は malloc のアリーナを通らないので、ページフォルトを毎回払う)。
+  確保を使用点 (`!q_in_pin` の prepare 前 / CPU attend のゼロ埋め前 / GpuHost の
+  `copy_from_slice` 前) へ移した。`fit_prefill_buf` 自体・ゼロ埋めの規則・演算列・
+  転送バイト数・発行順は不変 = 値は 1 ビットも変わらない (使う経路はどれも
+  使用直前に全要素を書く)。`full_attn_attend_gpu` の `att` 引数は
+  `&mut [f32]` → `&mut Vec<f32>` (使用点で確保するため)。
+- **予測効果 (実測単価 × 2 本)**: **-0.24 s/request @14,043** (237〜254 ms)、
+  **-0.25 s @12,850** (247 ms)、**-0.06 s @3,161** (61 ms)。full_core の 2〜3 %、
+  wall (38.79〜40.35 s @12,850) の 0.6 %。**実機の cold A/B は未計測**
+  (このコンテナは GPU 非搭載)。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (不変)。非 cuda lib = 280 passed /
+  0 failed / 2 ignored。`--features cuda` の統合テストも 5 / 7 / 11 / 1 本すべて緑。
+  `cargo build --release -p denno-cli --features denno-engine/cuda` 成功。
+- **触っていないもの**: `.cu` / `.ptx` / nvcc / GPU ビルド / GPU 実行 / D2H の連結
+  (P17b・実測 2.2x 悪化で revert 済み) / リダクション順 / 新しい env ゲート /
+  8095 / push / rebase / `git add -A`。作業レポートは未 commit の `REPORT_P28.md`。

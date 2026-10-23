@@ -3632,3 +3632,47 @@ External implementations referenced in P19 and their licensing status (the same 
   GPU execution and 8095 are untouched).
 - **Not measured here**: GPU anchors, ms/token, nsys (structurally unchanged because no numeric
   path changed, but not measured). The work report is the uncommitted `REPORT_P19.md`.
+
+### s179: Task P28 - the host side of `sl_lay_full_core` measured first (2026-10-23) done
+
+> Following the "measure first" instruction, the phase's launches / transfers / host cost
+> were tabulated. The phase is **device bound** (attention kernel ~400 ms/layer = ~60 % of
+> the phase, transfers 1.15 GB/layer); the host side is prepare 44.9 ms + sigmoid gate
+> 45.4 ms = **90.3 ms/layer** (**1.45 s/request** at n=14,043 over 16 full layers = ~13 %
+> of the phase, ~3.4 % of the wall). Both are necessary data movement; removing them needs
+> a device-side gate (`.cu`). Only the **allocation of buffers the live path never reads**
+> was removed (one change).
+
+- **Measured here (no GPU, outside the repo: `/tmp/p28probe`, `rustc -O`)**: `pf_prepare_row`
+  x n rows (row-parallel) and the `chain_pf_att_inplace` gate (same expression) at the 27B
+  shape. At n=14,043: prepare **44.9 ms/layer** (3,198 ns/token), gate **45.4 ms/layer**
+  (3,233 ns/token; 12.1 ms of that is `exp`, the rest is 690 MB of traffic = 21 GB/s).
+  At n=12,850: 38.2 + 43.1 = 81.2 ms/layer; at n=3,161: 11.1 + 11.2 = 22.2 ms/layer.
+  Bandwidth calibration with the same 345 MB copy: r+w 41 GB/s.
+- **Live path pinned down**: `DENNO_GPU_ATTN` defaults ON (`cuda.rs:5849` / `5854`) and
+  `attn_prefill_gpu_supported` (`cuda.rs:4568`; `n >= gemm_min_m()` = default 256 checked at
+  `cuda.rs:4572`, dh=256's 84,800 B smem already opted in) => GPU attend at n=14,043. The
+  residual-resident path passes `host_att_needed=false` (`qwen35.rs:2704-2713`), so
+  `chain_pf_att_inplace` (`cuda.rs:12771`) runs and returns `AttnPlace::GpuDev` = P12's
+  pinned direct path is still live. The `buf_att` zero-fill still lives only inside
+  `if !att_done` (`qwen35.rs:1215-1216`) = P12's removal is intact.
+- **Change (one file, `qwen35.rs` only, +24/-3)**: inside the phase,
+  `fit_prefill_buf(buf_q)` and `fit_prefill_buf(buf_att)` were mmap-ing + zero-filling
+  2 x 345 MB on every request, but the GpuDev path never reads either buffer (allocations
+  above 128 KB bypass the malloc arena, so the page faults are paid again each request).
+  The allocations moved to their points of use (before the `!q_in_pin` prepare / before the
+  CPU-attend zero-fill / before the GpuHost `copy_from_slice`). `fit_prefill_buf` itself,
+  the zero-fill rule, the arithmetic columns, transfer bytes and issue order are unchanged,
+  so the values are bit-identical (every path that uses them writes all elements first).
+  `full_attn_attend_gpu`'s `att` argument changed from `&mut [f32]` to `&mut Vec<f32>`.
+- **Predicted effect (measured unit cost x 2 buffers)**: **-0.24 s/request @14,043**
+  (237-254 ms), **-0.25 s @12,850** (247 ms), **-0.06 s @3,161** (61 ms): 2-3 % of
+  full_core, 0.6 % of the 38.79-40.35 s wall at 12,850. **No cold A/B on real hardware**
+  (this container has no GPU).
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (unchanged). Non-cuda lib = 280 passed / 0 failed /
+  2 ignored. The `--features cuda` integration tests (5 / 7 / 11 / 1) are all green.
+  `cargo build --release -p denno-cli --features denno-engine/cuda` succeeds.
+- **Untouched**: `.cu` / `.ptx` / nvcc / GPU builds / GPU runs / merging the D2H transfers
+  (P17b, measured 2.2x worse and reverted) / reduction order / any new env gate / 8095 /
+  push / rebase / `git add -A`. The work report is the uncommitted `REPORT_P28.md`.
