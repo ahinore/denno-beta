@@ -4497,6 +4497,9 @@ struct ChainScratch {
     h2_ev_done: Option<CopyEvent>,  // コピーストリームの D2H 完了 (join)
     pin_h2: Option<PinMem>,         // D2H の宛先 (pinned・grow-only)
     h2_pending: bool,               // 発行済みで未 join の D2H があるか
+    // s246 (P46): full 層 att の D2H/H2D と sigmoid ゲートを重ねるための
+    // チャンク完了イベント (既定ストリーム・grow-only・層をまたいで再利用)。
+    pipe_ev: Vec<CopyEvent>,
 
 }
 
@@ -4541,6 +4544,7 @@ thread_local! {
         h2_ev_done: None,
         pin_h2: None,
         h2_pending: false,
+        pipe_ev: Vec::new(),
 
     });
 }
@@ -13081,9 +13085,19 @@ pub fn chain_pf_upload_att(att: &[f32], cols: usize, m: usize, li: usize) -> Opt
 /// 層ごと (`chain_pf_upload_att` と同一の `li*3+2`) なので、次の層が同じ領域を
 /// 使うのは次の層の qkv chain の同期より後 = この H2D は既に完了している。
 /// カーネル・引数・転送バイト数は従来と同一で、値も 1 ビットも変わらない。
-pub fn chain_pf_att_inplace<F>(li: usize, cols: usize, m: usize, gate: F) -> Option<()>
+///
+/// s246 (P46): `gate` を `FnMut(行オフセット, 行ブロック)` に変え、転送を
+/// **行ブロック単位のチャンク**に割って「D2H(k) 完了 → gate(k) → H2D(k)」を
+/// 重ねる (`DENNO_PF_ATT_PIPE`・既定 ON)。従来は
+/// `D2H 全体 → ctx.sync() → gate 全体 → H2D 全体` で、ホストは D2H の完了
+/// (= PCIe 1 往復ぶん) を待ち終えてからゲートを始め、ゲートが終わるまで H2D を
+/// 発行できなかった (FC_KPROF 65k・16 層: d2h=394 ms / tail=1014 ms)。
+/// チャンク化しても転送バイト数・宛先オフセット・ゲートの式・`CH_ATT` の最終内容は
+/// 1 ビットも変わらない — 各要素は同じ式で 1 回だけゲートされ、同じオフセットへ
+/// 同じバイト列が戻る。変わるのは「いつ発行するか」だけ。
+pub fn chain_pf_att_inplace<F>(li: usize, cols: usize, m: usize, mut gate: F) -> Option<()>
 where
-    F: FnOnce(&mut [f32]),
+    F: FnMut(usize, &mut [f32]),
 {
     if cols == 0 || m == 0 {
         return None;
@@ -13099,22 +13113,29 @@ where
             s.pins.push(None);
         }
         ok(Scratch::ensure_pin(&mut s.pins[pin_id], bytes))?;
-        // 1) CH_ATT → pinned (宛先が pinned なので pageable 経路の内部ステージングが無い)
-        {
+        let lib = lib().ok()?;
+        let (buf, pin_ptr) = {
             let buf = s.bufs[CH_ATT].as_ref()?.ptr();
-            let pin = s.pins[pin_id].as_mut().unwrap();
-            let lib = lib().ok()?;
-            unsafe {
-                ok(check(
-                    (lib.memcpy_dtoh_async)(
-                        pin.ptr,
-                        buf,
-                        bytes,
-                        std::ptr::null_mut(),
-                    ),
-                    "cuMemcpyDtoHAsync (pf att pin)",
-                ))?;
+            let pin = s.pins[pin_id].as_ref()?;
+            if pin.bytes < bytes {
+                return None;
             }
+            (buf, pin.ptr)
+        };
+        // s246 (P46): チャンク数 (1 = 従来の 1 発往復)。イベントを作れない環境・
+        // 小さい転送・フラグ OFF では 1 = 従来経路そのものに落ちる。
+        let (rows_per, nch) = pf_att_chunk_rows(m, pf_att_pipe_chunks(bytes, m));
+        if nch >= 2 && pf_att_ensure_events(&mut s, nch) {
+            return pf_att_inplace_piped(
+                &mut s, lib, ctx, buf, pin_ptr, pin_id, cols, m, bytes, rows_per, nch, &mut gate,
+            );
+        }
+        // 1) CH_ATT → pinned (宛先が pinned なので pageable 経路の内部ステージングが無い)
+        unsafe {
+            ok(check(
+                (lib.memcpy_dtoh_async)(pin_ptr, buf, bytes, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync (pf att pin)",
+            ))?;
         }
         // s180 (P41): att の D2H 発行点 = full_core の区間 [d2h] の終端
         // (イベントはストリーム順。sync はこの直後の既存の 1 回だけ)。
@@ -13124,22 +13145,195 @@ where
         {
             let pin = s.pins[pin_id].as_mut().unwrap();
             let v = pin.as_mut_slice::<f32>();
-            gate(&mut v[..n_elems]);
+            gate(0, &mut v[..n_elems]);
         }
         // 3) pinned → CH_ATT (async H2D。同一ストリームの後続 GEMM が順序で待つ)
-        {
-            let buf = s.bufs[CH_ATT].as_ref()?.ptr();
-            let pin = s.pins[pin_id].as_ref().unwrap();
-            let lib = lib().ok()?;
-            unsafe {
-                ok(check(
-                    (lib.memcpy_htod_async)(buf, pin.ptr as *const c_void, bytes, std::ptr::null_mut()),
-                    "cuMemcpyHtoDAsync (pf att gate)",
-                ))?;
-            }
+        unsafe {
+            ok(check(
+                (lib.memcpy_htod_async)(buf, pin_ptr as *const c_void, bytes, std::ptr::null_mut()),
+                "cuMemcpyHtoDAsync (pf att gate)",
+            ))?;
         }
         Some(())
     })
+}
+
+/// s246 (P46): att の D2H/H2D とゲートを重ねる経路のチャンク数。
+///
+/// 1 = 従来の 1 発往復。`DENNO_PF_ATT_PIPE=0` で常に 1、`=N` で上限 N
+/// (未設定は既定の上限)。転送が小さいときは重ねる意味が無いので 1。
+fn pf_att_pipe_chunks(bytes: usize, m: usize) -> usize {
+    pf_att_pipe_chunks_with(bytes, m, pf_att_pipe_max())
+}
+
+/// s246 (P46): 既定の上限 (env `DENNO_PF_ATT_PIPE`・起動時に 1 回だけ読む)。
+fn pf_att_pipe_max() -> usize {
+    /// 既定の上限。チャンクあたりの API 呼び出しは 4 回 (D2H / record / sync /
+    /// H2D) なので、増やすと 1 層あたり数十 µs の固定費が乗る。
+    const MAX_CHUNKS: usize = 8;
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| match std::env::var("DENNO_PF_ATT_PIPE") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(n) => n,
+            // 数値でない値 (空文字・"on" 等) は既定の上限として扱う。
+            Err(_) => MAX_CHUNKS,
+        },
+        Err(_) => MAX_CHUNKS,
+    })
+}
+
+/// s246 (P46): `pf_att_pipe_chunks` の純関数部分 (env を読まない = テスト可能)。
+fn pf_att_pipe_chunks_with(bytes: usize, m: usize, max: usize) -> usize {
+    /// 1 チャンクの目標バイト数。これ以下なら 1 発 (PCIe の立上がりを払う方が高い)。
+    const CHUNK_BYTES: usize = 128 << 20;
+    if max < 2 || bytes < CHUNK_BYTES || m < 2 {
+        return 1;
+    }
+    bytes.div_ceil(CHUNK_BYTES).clamp(2, max).min(m)
+}
+
+/// s246 (P46): `m` 行を高々 `nch` 個の行ブロックに割る。戻り値は
+/// `(rows_per, 実際のチャンク数)`。行ブロックは `[0, m)` を重複なく覆い、
+/// 最終チャンクだけ短くなる (端数行を捨てない)。`nch < 2` は 1 を返す
+/// (= 従来の 1 発往復)。
+fn pf_att_chunk_rows(m: usize, nch: usize) -> (usize, usize) {
+    if m == 0 || nch < 2 {
+        return (m, 1);
+    }
+    let rows_per = m.div_ceil(nch.min(m));
+    (rows_per, m.div_ceil(rows_per))
+}
+
+/// s246 (P46): チャンク `k` の行範囲 `[r0, r1)`。`pf_att_chunk_rows` の
+/// `(rows_per, nch)` に対して全チャンクが `[0, m)` を隙間なく覆う。
+fn pf_att_chunk_bounds(k: usize, rows_per: usize, m: usize) -> (usize, usize) {
+    let r0 = k.saturating_mul(rows_per).min(m);
+    let r1 = r0.saturating_add(rows_per).min(m);
+    (r0, r1)
+}
+
+/// s246 (P46): パイプライン用の完了イベントを `n` 個そろえる (grow-only)。
+/// 作れなければ false (呼び出し側は従来の 1 発往復に落ちる)。
+fn pf_att_ensure_events(s: &mut ChainScratch, n: usize) -> bool {
+    if s.pipe_ev.len() >= n {
+        return true;
+    }
+    let Some(create) = lib().ok().and_then(|l| l.event_create) else {
+        return false;
+    };
+    const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
+    while s.pipe_ev.len() < n {
+        let mut ev: CUevent = std::ptr::null_mut();
+        if unsafe { create(&mut ev, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS || ev.is_null() {
+            return false;
+        }
+        s.pipe_ev.push(CopyEvent(ev));
+    }
+    true
+}
+
+/// s246 (P46): `chain_pf_att_inplace` の重ねる版。呼び出し規約と数値の契約は
+/// あちらと同じで、違いは「D2H をチャンクに割り、チャンクが着いた順に
+/// ゲートして H2D する」ことだけ。
+///
+/// 失敗時の安全性 (呼び出し側は `None` で `chain_download` 経路へ落ちる):
+///   - D2H のどれかが失敗した時点では `CH_ATT` を 1 バイトも書いていないので、
+///     そのまま `None` を返してよい (従来の 1 発 D2H 失敗と同一)。
+///   - H2D が途中で失敗した場合は `CH_ATT` が**部分更新**になる。そのまま
+///     抜けると呼び出し側のフォールバックがゲート済みの行をもう一度ゲートして
+///     しまうので、残りのチャンクをゲートし終えてから**全体を 1 発の同期 H2D**
+///     で戻す (pinned はその時点で完成形 = `CH_ATT` は従来と同じ内容になる)。
+#[allow(clippy::too_many_arguments)]
+fn pf_att_inplace_piped<F>(
+    s: &mut ChainScratch,
+    lib: &'static CudaLib,
+    ctx: &'static CudaCtx,
+    buf: CUdeviceptr,
+    pin_ptr: *mut c_void,
+    pin_id: usize,
+    cols: usize,
+    m: usize,
+    bytes: usize,
+    rows_per: usize,
+    nch: usize,
+    gate: &mut F,
+) -> Option<()>
+where
+    F: FnMut(usize, &mut [f32]),
+{
+    let (rec, ev_sync) = (lib.event_record?, lib.event_sync?);
+    let pin_base = pin_ptr as usize;
+    // 1) 全チャンクの D2H を発行し、チャンクごとに完了イベントを打つ
+    //    (既定 = null ストリーム。イベントはストリーム順に乗るだけ)。
+    for k in 0..nch {
+        let (r0, r1) = pf_att_chunk_bounds(k, rows_per, m);
+        let off = r0.checked_mul(cols)?.checked_mul(4)?;
+        let len = r1.checked_sub(r0)?.checked_mul(cols)?.checked_mul(4)?;
+        let ev = s.pipe_ev.get(k)?.0;
+        unsafe {
+            ok(check(
+                (lib.memcpy_dtoh_async)(
+                    (pin_base + off) as *mut c_void,
+                    buf + off as u64,
+                    len,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (pf att pin chunk)",
+            ))?;
+            if rec(ev, std::ptr::null_mut()) != CUDA_SUCCESS {
+                // イベントを打てない = 完了を待てない。CH_ATT は未変更なので
+                // 従来の 1 発経路へ戻す (呼び出し側のフォールバックも安全)。
+                return None;
+            }
+        }
+    }
+    // s180 (P41): att の D2H 発行点 = full_core の区間 [d2h] の終端
+    // (最後のチャンクの完了がこの位置に乗る。従来の 1 発と同じ意味)。
+    fc_kprof_mark(3);
+    // 2) チャンクごとに「完了待ち → ゲート → H2D」。ゲートはチャンクの完了前に
+    //    触ってはいけない (未転送の領域を 0 で割る) ので、必ずイベントを待つ。
+    let mut h2d_failed = false;
+    for k in 0..nch {
+        let (r0, r1) = pf_att_chunk_bounds(k, rows_per, m);
+        let ev = s.pipe_ev.get(k)?.0;
+        if unsafe { ev_sync(ev) } != CUDA_SUCCESS {
+            // イベント待ちが使えない: 全ストリーム同期で代替する (安全側)。
+            ok(ctx.sync())?;
+        }
+        {
+            let pin = s.pins.get_mut(pin_id)?.as_mut()?;
+            let v = pin.as_mut_slice::<f32>();
+            gate(r0, &mut v[r0 * cols..r1 * cols]);
+        }
+        if h2d_failed {
+            continue;
+        }
+        let off = r0 * cols * 4;
+        let len = (r1 - r0) * cols * 4;
+        let rc = unsafe {
+            (lib.memcpy_htod_async)(
+                buf + off as u64,
+                (pin_base + off) as *const c_void,
+                len,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != CUDA_SUCCESS {
+            h2d_failed = true;
+        }
+    }
+    if h2d_failed {
+        // 全チャンクがゲート済み = pinned は完成形。部分更新のまま抜けると
+        // フォールバックが二重ゲートするので、全体を 1 発で戻す。
+        unsafe {
+            ok(check(
+                (lib.memcpy_htod)(buf, pin_ptr as *const c_void, bytes),
+                "cuMemcpyHtoD (pf att gate fallback)",
+            ))?;
+        }
+        ok(ctx.sync())?;
+    }
+    Some(())
 }
 
 /// s165 (P2): full attention 層の q/k/v 投影を**デバイス常駐の入力** (`CH_PFH`,
@@ -15034,5 +15228,117 @@ mod p6_overlap_tests {
         assert_eq!(pf_h2_path(true, usize::MAX, 2, true), PfH2Path::SyncD2h);
         // 1 行だけでも (実経路では n >= 2048 だが) 判定としてはコピー経路
         assert_eq!(pf_h2_path(true, 1, 1, true), PfH2Path::CopyStream);
+    }
+}
+
+/// s246 (P46): full 層 att の「チャンク化しても数値が動かない」契約を固定する。
+///
+/// GPU は使わない (転送そのものは実機の担当)。ここで守るのは
+///   1. チャンク境界が `[0, m)` を隙間なく・重複なく覆う (端数行を捨てない)
+///   2. チャンク数を増やしても**ゲート後の配列がビット一致**する
+///      (= `gate(row0, ブロック)` の行オフセット算術が正しい)
+///   3. 小さい転送・フラグ OFF ではチャンク数 1 = 従来の 1 発往復
+/// の 3 点。2 が崩れると「チャンクを跨いだ行で qg の別の head のゲートを読む」
+/// という静かな誤りになるので、行数 × チャンク数の格子で全部見る。
+#[cfg(test)]
+mod p46_att_pipe_tests {
+    use super::*;
+    use rayon::prelude::*;
+
+    /// 本番のクロージャ (`full_attn_att_inplace` の呼び出し側) と同一の式。
+    fn gate_rows(row0: usize, v: &mut [f32], qg: &[f32], heads: usize, dh: usize) {
+        v.par_chunks_exact_mut(dh)
+            .enumerate()
+            .for_each(|(t, att_head)| {
+                let tt = row0 * heads + t;
+                let i = tt / heads;
+                let hh = tt % heads;
+                let gate = &qg[i * heads * 2 * dh + hh * 2 * dh + dh..][..dh];
+                for (d, av) in att_head.iter_mut().enumerate() {
+                    *av /= 1.0 + (-gate[d]).exp();
+                }
+            });
+    }
+
+    /// 1. 境界の被覆性 (端数行を含めて [0, m) を 1 回ずつ)。
+    #[test]
+    fn att_pipe_chunk_bounds_cover_rows_once() {
+        for m in [1usize, 2, 3, 7, 8, 9, 1000, 6251, 25000, 65000] {
+            for want in [1usize, 2, 3, 4, 5, 8, 16] {
+                let (rows_per, nch) = pf_att_chunk_rows(m, want);
+                assert!(nch >= 1, "m={m} want={want}");
+                assert!(rows_per >= 1, "m={m} want={want}: rows_per=0");
+                if want >= 2 && m >= 2 {
+                    assert!(nch >= 2, "m={m} want={want}: 1 発に落ちた");
+                    assert!(nch <= want, "m={m} want={want}: 上限を超えた nch={nch}");
+                } else {
+                    assert_eq!(nch, 1, "m={m} want={want}: 1 発のはず");
+                }
+                // 全チャンクを並べると [0, m) を隙間なく 1 回ずつ覆う
+                let mut next = 0usize;
+                for k in 0..nch {
+                    let (r0, r1) = pf_att_chunk_bounds(k, rows_per, m);
+                    assert_eq!(r0, next, "m={m} want={want} k={k}: 隙間/重複");
+                    assert!(r1 > r0, "m={m} want={want} k={k}: 空チャンク");
+                    next = r1;
+                }
+                assert_eq!(next, m, "m={m} want={want}: 端数行が落ちた");
+            }
+        }
+    }
+
+    /// 2. チャンク数が変わってもゲート結果はビット一致。
+    #[test]
+    fn att_pipe_gate_is_bit_exact_across_chunk_counts() {
+        // 実シェイプの縮小版 (heads=4 / dh=8)。行数は端数が出るものを含める。
+        let (heads, dh) = (4usize, 8usize);
+        let cols = heads * dh;
+        for n in [1usize, 2, 3, 5, 8, 13] {
+            let qg: Vec<f32> = (0..n * heads * 2 * dh)
+                .map(|i| ((i as f32) * 0.017).sin() * 3.0)
+                .collect();
+            let att0: Vec<f32> = (0..n * cols)
+                .map(|i| ((i as f32) * 0.031).cos() * 1.5)
+                .collect();
+            // 従来 (1 発 = 全体を 1 回)
+            let mut want = att0.clone();
+            gate_rows(0, &mut want[..], &qg, heads, dh);
+            // チャンク版 (2..=n の全分割)
+            for want_nch in 1..=n.max(1) {
+                let (rows_per, nch) = pf_att_chunk_rows(n, want_nch);
+                let mut got = att0.clone();
+                for k in 0..nch {
+                    let (r0, r1) = pf_att_chunk_bounds(k, rows_per, n);
+                    gate_rows(r0, &mut got[r0 * cols..r1 * cols], &qg, heads, dh);
+                }
+                for (idx, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "n={n} nch={nch} rows_per={rows_per}: 要素 {idx} が不一致"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 3. 小さい転送・フラグ OFF・1 行は従来の 1 発往復。
+    #[test]
+    fn att_pipe_chunks_off_for_small_or_disabled() {
+        // 128 MiB 未満は 1 発 (PCIe の立上がりを払う方が高い)
+        assert_eq!(pf_att_pipe_chunks_with(64 << 20, 25000, 8), 1);
+        assert_eq!(pf_att_pipe_chunks_with((128 << 20) - 4, 25000, 8), 1);
+        // フラグ OFF (= 上限 1) は常に 1 発
+        assert_eq!(pf_att_pipe_chunks_with(615 << 20, 25000, 1), 1);
+        assert_eq!(pf_att_pipe_chunks_with(615 << 20, 25000, 0), 1);
+        // 1 行では割れない
+        assert_eq!(pf_att_pipe_chunks_with(615 << 20, 1, 8), 1);
+        // 65k (att = n*heads*dh*4 = 1597 MB) は上限 8 に張り付く
+        assert_eq!(pf_att_pipe_chunks_with(1597 << 20, 65000, 8), 8);
+        // 615 MB (n≈25k) は 5 チャンク
+        assert_eq!(pf_att_pipe_chunks_with(615 << 20, 25000, 8), 5);
+        // 上限を下げれば従う
+        assert_eq!(pf_att_pipe_chunks_with(1597 << 20, 65000, 4), 4);
+        assert_eq!(pf_att_pipe_chunks_with(1597 << 20, 65000, 2), 2);
     }
 }
