@@ -531,16 +531,40 @@ impl Qwen35 {
             l
         };
 
+        // P37: 大きな 2-D 線形重みは**行チャンクで量子化**する (テンソル全体の
+        // f32 を作らない)。既定 ON・`DENNO_GGUF_CHUNKED_QUANT=0` で従来経路。
+        // 生成される量子化バイト列は従来経路と同一 (proof test + 単体テスト)。
+        let chunked = quant != QuantMode::Fp32 && crate::quant::gguf_chunked_enabled();
+        if chunked {
+            tracing::info!(
+                "行チャンク量子化: 2-D 線形重みを {} 要素/チャンクで量子化 (fp32 全体を作らない)",
+                crate::quant::CHUNK_TARGET_ELEMS
+            );
+        }
+
         let vd = gdn_p.value_dim();
         let qkv_dim = gdn_p.qkv_dim();
 
         let eu = e as u64;
         // P35: 2D 線形重みのロード。passthrough 有効かつ GGUF の型が Q4_0 で
         // 形も一致するときだけ fp32 を経由しない (それ以外は従来の dt → lin)。
+        // P37: passthrough が無いときは行チャンク量子化を試す (同じバイト列・
+        // ピーク一時領域は 1 チャンク分)。どちらも成立しなければ従来経路。
         let lin_g = |name: &str, ne: &[u64], k: usize, n: usize| -> Result<Linear> {
             if passthrough {
                 expect_ne(&f, name, ne).with_context(|| format!("tensor {name}"))?;
                 if let Some(l) = q4_verbatim_linear(&f, name, k, n)? {
+                    quant_bytes.set(quant_bytes.get() + l.weight_bytes());
+                    return Ok(l);
+                }
+            }
+            if chunked {
+                expect_ne(&f, name, ne).with_context(|| format!("tensor {name}"))?;
+                let rows = crate::quant::chunk_rows_for(k);
+                if let Some((l, _st)) = f
+                    .linear_chunked(name, k, n, quant, rows)
+                    .with_context(|| format!("tensor {name}"))?
+                {
                     quant_bytes.set(quant_bytes.get() + l.weight_bytes());
                     return Ok(l);
                 }
@@ -666,18 +690,49 @@ impl Qwen35 {
             .as_bool()
             .or_else(|| cfg["tie_word_embeddings"].as_bool())
             .unwrap_or(true);
-        let embed = dt_shaped("token_embd.weight", &[eu, vocab as u64])?;
-        let lm_head = if tied {
-            match quant {
-                QuantMode::Fp32 => None,
-                QuantMode::Int8 | QuantMode::Q4_0 => {
-                    let l = Linear::new(embed.clone(), e, vocab, quant);
-                    quant_bytes.set(quant_bytes.get() + l.weight_bytes());
-                    Some(l)
-                }
+        // P37: `token_embd.weight` は 27B で 1.271 G 要素 (f32 5.09 GB) の最大
+        // テンソル。従来経路は (1) 全体を f32 へ展開 → (2) tied lm_head 用に
+        // `embed.clone()` でもう 1 部 → (3) 量子化、で f32 が 2 部 (約 10.2 GB)
+        // 同時に生きていた。行チャンクなら常駐 f32 表と量子化コピーを同じ
+        // チャンクで埋めるので、経由する f32 は 1 チャンク分 (~19 MB) だけ。
+        // 生成される表と量子化バイト列は従来経路と同一。
+        let mut embed_chunked: Option<(Vec<f32>, Linear)> = None;
+        if tied && chunked {
+            expect_ne(&f, "token_embd.weight", &[eu, vocab as u64])
+                .with_context(|| "tensor token_embd.weight".to_string())?;
+            let rows = crate::quant::chunk_rows_for(e);
+            if let Some((table, l, st)) =
+                f.embed_and_linear_chunked("token_embd.weight", e, vocab, quant, rows)?
+            {
+                tracing::info!(
+                    "token_embd.weight: 行チャンク {} 行 x {} 回で f32 表 + {:?} コピーを作成 (ピーク一時 {:.1} MB)",
+                    st.chunk_rows,
+                    st.chunks,
+                    quant,
+                    st.peak_bytes() as f64 / 1e6
+                );
+                quant_bytes.set(quant_bytes.get() + l.weight_bytes());
+                embed_chunked = Some((table, l));
             }
-        } else {
-            Some(lin_g("output.weight", &[eu, vocab as u64], e, vocab)?)
+        }
+        let (embed, lm_head) = match embed_chunked {
+            Some((table, l)) => (table, Some(l)),
+            None => {
+                let embed = dt_shaped("token_embd.weight", &[eu, vocab as u64])?;
+                let lm_head = if tied {
+                    match quant {
+                        QuantMode::Fp32 => None,
+                        QuantMode::Int8 | QuantMode::Q4_0 => {
+                            let l = Linear::new(embed.clone(), e, vocab, quant);
+                            quant_bytes.set(quant_bytes.get() + l.weight_bytes());
+                            Some(l)
+                        }
+                    }
+                } else {
+                    Some(lin_g("output.weight", &[eu, vocab as u64], e, vocab)?)
+                };
+                (embed, lm_head)
+            }
         };
         let norm_w = match f.tensor("output_norm.weight") {
             Some(_) => dt_shaped("output_norm.weight", &[eu])?,

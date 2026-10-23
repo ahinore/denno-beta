@@ -3726,3 +3726,47 @@ External implementations referenced in P19 and their licensing status (the same 
 - **Untouched**: `.cu` / `.ptx` / GPU / server / docker / `docs/NUMERIC_POLICY.ja.md` /
   `GPU_VERIFY.sh` / `scripts/prod_serve_27b.sh` / the accepted set of the GGUF tensor
   type gate / push / `git add -A`. The work report is the uncommitted `REPORT_P35.md`.
+
+### P37: capped the load-time fp32 transient of large 2-D weights (row-chunked quantisation, byte-identical) (2026-10-23) DONE (default ON)
+
+- **Problem (the leftover from P35)**: loading `token_embd.weight` (1.271 G elements
+  on the 27B) materialised the whole tensor in f32 (5.086 GB) and then made **a second
+  copy** for the tied lm_head via `embed.clone()` (another 5.086 GB) before quantising.
+  That one tensor peaked at ~10.9 GB; it is the main reason a 60 GB host got OOM-killed
+  with the 8095 server resident. This is a load-time memory task, not a numeric one.
+- **Change**: `quant.rs` gained `Q4Linear::zeros` / `quantize_rows_into` and
+  `Quant8Linear::zeros` / `quantize_rows_into`, with the existing `quantize` refactored
+  to "`zeros` then one `quantize_rows_into(0, ..)`" - **the body was moved, not copied**,
+  so old and new paths run the same code (byte identity is structural). On top of that:
+  the row-chunk driver `gguf_rows_quantized_chunked` (plus `_with_sink`, which can see
+  each chunk's f32), `ChunkedQuantStats`, the env gate `DENNO_GGUF_CHUNKED_QUANT`
+  (**default ON**; `0`/`false`/`no`/`off` restores the old path) and `chunk_rows_for`.
+  The chunk width is "however many rows make one chunk's f32 16 MiB (4 M elements)"
+  (k=5120 -> 819 rows, 6144 -> 682, 17408 -> 240). `gguf.rs` gained
+  `GgufFile::linear_chunked` / `embed_and_linear_chunked` (slice the already-mmap-ed
+  bytes per row chunk; anything unexpected in shape/type/byte count returns `None`,
+  fail-closed) and the proof test. `qwen35.rs` routes `lin_g` (ffn gate/up/down, attn
+  q/k/v/qkv/output, ssm_out, untied output.weight) and `token_embd.weight` + the tied
+  lm_head through the new path.
+- **Boundary rule**: chunk on rows (a row is k elements). Rows are contiguous in the
+  GGUF layout (dim0 = k is innermost), so a row boundary is a block boundary; the code
+  verifies `k % blck_size == 0` and otherwise stays on the old path. Both the 32-element
+  Q4_0 blocks and the 256-element K-quant super-blocks close inside a row.
+- **Measured (proof test `gguf::tests::q4_chunked_matches_whole_tensor_real_gguf`,
+  `#[ignore]`, CPU)**: `/work/models/Qwen3.8-27B-Q4_0.gguf` **without mmap**
+  (`GgufHeader` + seek/read_exact), 10 tensors compared -> **10/10 byte-identical**
+  (token_embd Q4_0, output Q6K, ffn_up Q4_0, ffn_gate Q4_0, ffn_down Q4_1, attn_q Q4_0,
+  attn_qkv Q4_0, attn_v Q4_0, attn_output Q4_0, ssm_out Q5K). The secondary int8
+  comparison is identical for all 5 tensors it covers. Peak f32 transient (computed):
+  chunked **20.21 MB** vs whole-tensor **5085.59 MB** (252x). 23.5 s.
+- **Predicted effect (PREDICTED, NOT MEASURED)**: the `token_embd` load peak goes from
+  10.887 GB (f32 5.086 + clone 5.086 + Q4 0.715) to 5.820 GB (resident f32 table 5.086 +
+  Q4 0.715 + 0.019 transient), i.e. **~5.07 GB less**. Per-tensor ffn/attn weights go
+  from up to 356.5 MB to 19.1 MB. Real load timing / RSS on the 8095 is out of scope.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **327 passed / 0 failed / 39 ignored** (baseline 323 / 38 + 4 new unit tests + 1
+  ignored). `-- --ignored q4_chunked_matches_whole_tensor_real_gguf` = 1 passed. Non-cuda
+  `cargo test -p denno-engine --lib` = 286 passed / 0 failed / 4 ignored.
+- **Untouched**: `.cu` / `.ptx` / GPU / server / docker / the quantisation rules /
+  fp16-f32 rounding / which tensor uses which quant mode / `docs/NUMERIC_POLICY.ja.md` /
+  push / `git add -A`. The work report is the uncommitted `REPORT_P37.md`.
