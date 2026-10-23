@@ -1194,4 +1194,492 @@ mod tests {
              チャンク経路を有効にしてはいけない (上の表と first_diff を参照)"
         );
     }
+
+    // =====================================================================
+    // P38: token_embd.weight の f32 gather 表 (27B Q4_0 で 5.086 GB 常駐) を
+    // 「行単位のオンデマンド・デ量子化」で置き換えられるかの証明テスト。
+    //
+    // 表はローダがファイルの Q4_0 ブロックを **デ量子化するだけ** で作られる
+    // (再量子化ではない) ので、同じブロックから 1 行だけデ量子化すれば
+    // ビット一致するはず — それを実測で確かめる。数値経路は一切変更しない。
+    // =====================================================================
+
+    /// P38: 1 行分の判定。
+    #[derive(Debug, Clone)]
+    struct P38Row {
+        row: usize,
+        /// 行が属するローダのチャンク先頭行
+        chunk_r0: usize,
+        /// (a) 1 行だけ pread → dequant と (b) 表の同じ行がビット一致したか
+        identical: bool,
+        /// 最初の不一致要素 (None = 全一致)
+        first_diff: Option<usize>,
+        a_bits: u32,
+        b_bits: u32,
+    }
+
+    fn p38_push(v: &mut Vec<usize>, n: usize, r: usize) {
+        if r < n && !v.contains(&r) {
+            v.push(r);
+        }
+    }
+
+    /// P38 のサンプル行: 行 0・最終行・チャンク境界の前後・等間隔の散らし。
+    fn p38_sample_rows(n: usize, chunk_rows: usize, want: usize) -> Vec<usize> {
+        let mut v: Vec<usize> = Vec::new();
+        p38_push(&mut v, n, 0);
+        p38_push(&mut v, n, 1);
+        p38_push(&mut v, n, 2);
+        p38_push(&mut v, n, n - 1);
+        p38_push(&mut v, n, n - 2);
+        for c in 0..3usize {
+            let b = c * chunk_rows;
+            p38_push(&mut v, n, b.saturating_sub(1));
+            p38_push(&mut v, n, b);
+            p38_push(&mut v, n, b + 1);
+        }
+        let step = (n / want.max(1)).max(1);
+        let mut r = 3usize;
+        while v.len() < want && r < n - 1 {
+            p38_push(&mut v, n, r);
+            r += step;
+        }
+        let mut r = n / 2;
+        while v.len() < want && r < n - 1 {
+            p38_push(&mut v, n, r);
+            r += 1;
+        }
+        v.sort_unstable();
+        v
+    }
+
+    /// P38: ファイルの [off, off + rows*row_bytes) を pread する (mmap しない)。
+    fn p38_read_rows(
+        file: &mut std::fs::File,
+        off: u64,
+        row_bytes: usize,
+        rows: usize,
+    ) -> Vec<u8> {
+        let len = rows * row_bytes;
+        let mut buf = vec![0u8; len];
+        file.seek(SeekFrom::Start(off)).expect("seek rows");
+        file.read_exact(&mut buf).expect("read rows");
+        buf
+    }
+
+    /// P38 の受け入れ条件テスト。
+    ///
+    /// 実行:
+    ///   GGUF_PATH=/work/models/Qwen3.8-27B-Q4_0.gguf \
+    ///   CARGO_TARGET_DIR=/tmp/p38-target \
+    ///   cargo test --release -p denno-engine --features cuda --lib -- --ignored \
+    ///     --nocapture q4_row_dequant_matches_embed_table_real_gguf
+    ///
+    /// 環境変数:
+    ///   DENNO_P38_SWEEP=0 で全行スイープ (248,320 行) を省略する (既定は実行)。
+    #[test]
+    #[ignore]
+    fn q4_row_dequant_matches_embed_table_real_gguf() {
+        let path = match std::env::var("GGUF_PATH") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                let d = std::path::PathBuf::from("/work/models/Qwen3.8-27B-Q4_0.gguf");
+                if !d.exists() {
+                    eprintln!("skip: GGUF_PATH 未設定かつ /work/models に既定モデルが無い");
+                    return;
+                }
+                d
+            }
+        };
+
+        // メモリ規律: 8 GiB 未満なら走らせない (ホストが OOM 寸前のことがある)
+        let avail_gib = mem_available_gib();
+        match avail_gib {
+            Some(g) if g < 8.0 => {
+                panic!("MemAvailable {g:.1} GiB < 8 GiB — 走らせない (`free -g` を確認してから再実行)")
+            }
+            Some(g) => println!("[p38] MemAvailable {g:.2} GiB"),
+            None => println!("[p38] MemAvailable 不明 (/proc/meminfo 無し) — 続行"),
+        }
+
+        let mut file = std::fs::File::open(&path).expect("GGUF を開けない");
+        let file_len = file.metadata().expect("metadata").len();
+        println!(
+            "[p38] file {} ({:.2} GiB)",
+            path.display(),
+            file_len as f64 / (1u64 << 30) as f64
+        );
+        let hdr = read_header(&mut file, file_len);
+        let t = hdr
+            .tensor("token_embd.weight")
+            .expect("token_embd.weight が無い")
+            .clone();
+        assert!(t.dims.len() >= 2, "token_embd.weight が 2-D でない: {:?}", t.dims);
+        let k = t.dims[0] as usize; // 5120 (= e, 行の最内)
+        // 行数は dim1 以降の積 (GGUF は末尾に 1 を詰めるので dims.len() は 4 になり得る)
+        let n: usize = t.dims[1..].iter().product::<u64>() as usize; // 248320 (= vocab)
+        let elems = k * n;
+        let bs = t.ty.blck_size();
+        assert!(bs > 0 && k % bs == 0, "1 行 {k} 要素がブロック {bs} の倍数でない");
+        let row_bytes = (k / bs) * t.ty.type_size();
+        assert_eq!(
+            t.nbytes as usize,
+            n * row_bytes,
+            "nbytes と 行数×行長 の不一致 (行が連続でない)"
+        );
+        let (start, end) = hdr.tensor_range("token_embd.weight").expect("range");
+        assert_eq!(end - start, t.nbytes, "tensor_range と nbytes の不一致");
+        let table_bytes = elems * 4;
+        let raw_bytes = t.nbytes as usize;
+        println!(
+            "[p38] tensor {:?} k={k} n={n} blocks/row={} row_bytes={row_bytes} \
+             raw={:.1} MB  f32 table={:.1} MB ({:.3} GiB)  file+{start}",
+            t.ty,
+            k / bs,
+            raw_bytes as f64 / 1e6,
+            table_bytes as f64 / 1e6,
+            table_bytes as f64 / (1u64 << 30) as f64
+        );
+
+        let chunk_rows = crate::quant::chunk_rows_for(k).clamp(1, n);
+        println!(
+            "[p38] loader chunk = {chunk_rows} rows ({} elems, f32 {:.1} MB, raw {:.1} MB) — \
+             P37 の embed_and_linear_chunked と同じ粒度",
+            chunk_rows * k,
+            (chunk_rows * k * 4) as f64 / 1e6,
+            (chunk_rows * row_bytes) as f64 / 1e6
+        );
+
+        // ---- サンプル行 (受け入れ条件: 32 行以上・行 0・最終行・散らし) ----
+        let want = 40usize;
+        let rows = p38_sample_rows(n, chunk_rows, want);
+        assert!(
+            rows.len() >= 32,
+            "サンプル行が 32 未満 ({} 行) — 受け入れ条件を満たさない",
+            rows.len()
+        );
+        println!("[p38] sampling {} rows", rows.len());
+
+        // ---- (a) 1 行だけ pread → dequant_row  /  (b) ローダのチャンクの同じ行 ----
+        // (b) は `gguf_rows_quantized_chunked_with_sink` が表へ書く値そのもの
+        //     (quant.rs の `dequant_row(ty, &buf, rows * k)` → sink → table コピー)。
+        let mut verdicts: Vec<P38Row> = Vec::new();
+        let mut chunk_cache: std::collections::BTreeMap<usize, Vec<f32>> =
+            std::collections::BTreeMap::new();
+        let mut per_row_peak = 0usize;
+        reset_peak_rss();
+        let base_rss = rss_now_bytes();
+        for &r in &rows {
+            let r0 = (r / chunk_rows) * chunk_rows;
+            if !chunk_cache.contains_key(&r0) {
+                // 直前のチャンクだけ保持する (全チャンクを溜めない)
+                chunk_cache.clear();
+                let crows = (n - r0).min(chunk_rows);
+                let buf = p38_read_rows(
+                    &mut file,
+                    start + (r0 * row_bytes) as u64,
+                    row_bytes,
+                    crows,
+                );
+                let w = dequant_row(t.ty, &buf, crows * k);
+                chunk_cache.insert(r0, w);
+            }
+            let table = chunk_cache.get(&r0).expect("chunk");
+
+            // (a) この行のブロックだけを pread してデ量子化する
+            let a = dequant_row(
+                t.ty,
+                &p38_read_rows(&mut file, start + (r * row_bytes) as u64, row_bytes, 1),
+                k,
+            );
+            per_row_peak = per_row_peak.max(row_bytes + k * 4);
+
+            // (b) 表の同じ行
+            let b = &table[(r - r0) * k..(r - r0) * k + k];
+            let first_diff = a
+                .iter()
+                .zip(b.iter())
+                .position(|(x, y)| x.to_bits() != y.to_bits());
+            let (a_bits, b_bits) = match first_diff {
+                Some(i) => (a[i].to_bits(), b[i].to_bits()),
+                None => (0, 0),
+            };
+            verdicts.push(P38Row {
+                row: r,
+                chunk_r0: r0,
+                identical: first_diff.is_none(),
+                first_diff,
+                a_bits,
+                b_bits,
+            });
+        }
+        let per_row_rss = delta_mb(peak_rss_bytes(), base_rss);
+
+        println!("\n=== P38 per-row verdict (1 行 dequant vs ローダの表の同じ行) ===");
+        println!(
+            "{:>8} {:>10} {:>10} {:>10}  first_diff",
+            "row", "chunk_r0", "verdict", "elems"
+        );
+        for v in &verdicts {
+            println!(
+                "{:>8} {:>10} {:>10} {:>10}  {}",
+                v.row,
+                v.chunk_r0,
+                if v.identical { "IDENTICAL" } else { "DIFF" },
+                k,
+                match v.first_diff {
+                    None => "-".to_string(),
+                    Some(i) => format!("elem {i}: a={:#010x} b={:#010x}", v.a_bits, v.b_bits),
+                }
+            );
+        }
+        let all_identical = verdicts.iter().all(|v| v.identical);
+        let distinct_chunks = {
+            let mut c: Vec<usize> = verdicts.iter().map(|v| v.chunk_r0).collect();
+            c.sort_unstable();
+            c.dedup();
+            c.len()
+        };
+        println!(
+            "[p38] sampled {} rows over {} loader chunks: {} identical / {} diff",
+            verdicts.len(),
+            distinct_chunks,
+            verdicts.iter().filter(|v| v.identical).count(),
+            verdicts.iter().filter(|v| !v.identical).count()
+        );
+        println!(
+            "[p38] per-row path transient (COMPUTED) = row_bytes {} B + f32 row {} B = {} B ({:.1} KB); \
+             measured rss delta {:.2} MB (chunk cache {:.1} MB を含む)",
+            row_bytes,
+            k * 4,
+            per_row_peak,
+            per_row_peak as f64 / 1e3,
+            per_row_rss,
+            (chunk_rows * k * 4) as f64 / 1e6
+        );
+
+        // ---- 追加の参照: テンソル全体を 1 回の dequant_row で f32 表にする ----
+        // (メモリ規律: 5.086 GB + 生 715 MB。MemAvailable が 20 GiB 以上のときだけ)
+        let whole_ok = match avail_gib {
+            Some(g) if g >= 20.0 => {
+                let need = table_bytes + raw_bytes + (2usize << 30);
+                let avail = (g * (1u64 << 30) as f64) as usize;
+                if need < avail {
+                    println!(
+                        "[p38] whole-tensor table 参照を実行 (必要 {:.2} GiB < MemAvailable {g:.2} GiB)",
+                        need as f64 / (1u64 << 30) as f64
+                    );
+                    reset_peak_rss();
+                    let wbase = rss_now_bytes();
+                    let raw = p38_read_rows(&mut file, start, row_bytes, n);
+                    let whole = dequant_row(t.ty, &raw, elems);
+                    drop(raw);
+                    let wpeak = peak_rss_bytes();
+                    let mut bad = 0usize;
+                    for &r in &rows {
+                        let a = dequant_row(
+                            t.ty,
+                            &p38_read_rows(
+                                &mut file,
+                                start + (r * row_bytes) as u64,
+                                row_bytes,
+                                1,
+                            ),
+                            k,
+                        );
+                        let b = &whole[r * k..r * k + k];
+                        if a.iter().zip(b.iter()).any(|(x, y)| x.to_bits() != y.to_bits()) {
+                            bad += 1;
+                            println!("[p38] WHOLE-TENSOR DIFF at row {r}");
+                        }
+                    }
+                    println!(
+                        "[p38] whole-tensor table 参照: {} rows compared, {bad} diff, \
+                         measured rss +{:.0} MB (計算値 {:.1} MB)",
+                        rows.len(),
+                        delta_mb(wpeak, wbase),
+                        (table_bytes + raw_bytes) as f64 / 1e6
+                    );
+                    drop(whole);
+                    Some(bad == 0)
+                } else {
+                    println!(
+                        "[p38] whole-tensor table 参照をスキップ (必要 {:.2} GiB + 余裕 2 GiB > \
+                         MemAvailable {g:.2} GiB)",
+                        need as f64 / (1u64 << 30) as f64
+                    );
+                    None
+                }
+            }
+            _ => {
+                println!(
+                    "[p38] whole-tensor table 参照をスキップ (MemAvailable {} GiB < 20 GiB の規律) \
+                     — 代わりに全行スイープでローダのチャンク表の全行と突き合わせる",
+                    avail_gib.map(|g| format!("{g:.2}")).unwrap_or_else(|| "?".to_string())
+                );
+                None
+            }
+        };
+
+        // ---- 全行スイープ (メモリ有界): 全 248,320 行を 1 行 dequant と比較 ----
+        let sweep_on = std::env::var("DENNO_P38_SWEEP")
+            .ok()
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
+            .unwrap_or(true);
+        let (mut swept_rows, mut swept_bad, mut sweep_first_bad) = (0usize, 0usize, None::<usize>);
+        let mut sweep_rss = f64::NAN;
+        if sweep_on {
+            reset_peak_rss();
+            let sbase = rss_now_bytes();
+            let t0 = std::time::Instant::now();
+            let mut r0 = 0usize;
+            while r0 < n {
+                let crows = (n - r0).min(chunk_rows);
+                let buf = p38_read_rows(
+                    &mut file,
+                    start + (r0 * row_bytes) as u64,
+                    row_bytes,
+                    crows,
+                );
+                let w = dequant_row(t.ty, &buf, crows * k);
+                for j in 0..crows {
+                    let per = dequant_row(
+                        t.ty,
+                        &buf[j * row_bytes..(j + 1) * row_bytes],
+                        k,
+                    );
+                    let tab = &w[j * k..(j + 1) * k];
+                    if per
+                        .iter()
+                        .zip(tab.iter())
+                        .any(|(x, y)| x.to_bits() != y.to_bits())
+                    {
+                        swept_bad += 1;
+                        if sweep_first_bad.is_none() {
+                            sweep_first_bad = Some(r0 + j);
+                        }
+                    }
+                }
+                swept_rows += crows;
+                r0 += crows;
+            }
+            sweep_rss = delta_mb(peak_rss_bytes(), sbase);
+            println!(
+                "[p38] FULL SWEEP: {swept_rows} rows / {swept_bad} diff (first {:?}) in {:.2} s, \
+                 peak rss +{:.1} MB (1 チャンクだけ保持)",
+                sweep_first_bad,
+                t0.elapsed().as_secs_f64(),
+                sweep_rss
+            );
+        } else {
+            println!("[p38] FULL SWEEP をスキップ (DENNO_P38_SWEEP=0)");
+        }
+
+        // ---- マイクロベンチ: B 行のオンデマンド・デ量子化 ----
+        // 実経路 = 1 行ずつ seek + read_exact + dequant_row。
+        // 予算 17.3 ms/token (docs/KPI.md: 17.28〜17.32 ms/token) に対する算術。
+        const DECODE_MS_PER_TOKEN: f64 = 17.30;
+        println!("\n=== P38 microbench (B 行/token のオンデマンド・デ量子化) ===");
+        println!(
+            "{:>3} {:>10} {:>12} {:>12} {:>12} {:>12} {:>10}",
+            "B", "reps", "median us", "us/row", "mean us", "pure-dq us/row", "% of 17.30ms"
+        );
+        for &b in &[1usize, 8usize, 32usize] {
+            // 決定的に散らした行 id (重複なし)
+            let ids: Vec<usize> = (0..b).map(|i| (i * 7919 + 13) % n).collect();
+            // ページキャッシュを温める
+            for _ in 0..3 {
+                for &r in &ids {
+                    let _ = dequant_row(
+                        t.ty,
+                        &p38_read_rows(&mut file, start + (r * row_bytes) as u64, row_bytes, 1),
+                        k,
+                    );
+                }
+            }
+            let reps = match b {
+                1 => 300usize,
+                8 => 150,
+                _ => 80,
+            };
+            let mut samples: Vec<f64> = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let t0 = std::time::Instant::now();
+                let mut acc = 0f32;
+                for &r in &ids {
+                    let w = dequant_row(
+                        t.ty,
+                        &p38_read_rows(&mut file, start + (r * row_bytes) as u64, row_bytes, 1),
+                        k,
+                    );
+                    acc += w[0] + w[k - 1];
+                }
+                std::hint::black_box(acc);
+                samples.push(t0.elapsed().as_secs_f64());
+            }
+            samples.sort_by(|x, y| x.partial_cmp(y).expect("finite"));
+            let med = samples[samples.len() / 2];
+            let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+
+            // 純デ量子化 (I/O 無し) の単価: 1 行分のバイト列を 1 回だけ読んで使い回す
+            let rowbuf = p38_read_rows(&mut file, start, row_bytes, 1);
+            let pure_reps = 500usize;
+            let t1 = std::time::Instant::now();
+            for _ in 0..pure_reps {
+                std::hint::black_box(dequant_row(t.ty, &rowbuf, k));
+            }
+            let pure_per_row = t1.elapsed().as_secs_f64() / pure_reps as f64;
+
+            println!(
+                "{:>3} {:>10} {:>12.2} {:>12.2} {:>12.2} {:>12.2} {:>10.4}",
+                b,
+                reps,
+                med * 1e6,
+                med * 1e6 / b as f64,
+                mean * 1e6,
+                pure_per_row * 1e6,
+                med * 1e3 / DECODE_MS_PER_TOKEN * 100.0
+            );
+            println!(
+                "[p38]   B={b}: {:.1} us/token → decode 予算 {DECODE_MS_PER_TOKEN:.2} ms の {:.3} % \
+                 (arithmetic against the KPI, not a GPU measurement)",
+                med * 1e6,
+                med * 1e3 / DECODE_MS_PER_TOKEN * 100.0
+            );
+        }
+
+        // ---- 判定 ----
+        assert!(verdicts.iter().any(|v| v.row == 0), "行 0 がサンプルに無い");
+        assert!(
+            verdicts.iter().any(|v| v.row == n - 1),
+            "最終行 (行 {}) がサンプルに無い",
+            n - 1
+        );
+        assert!(
+            distinct_chunks >= 8,
+            "サンプルが {} チャンクにしか跨っていない (散らし不足)",
+            distinct_chunks
+        );
+        assert!(
+            all_identical,
+            "1 行 dequant がローダの f32 表の同じ行とビット一致しない → 置き換え不可"
+        );
+        if sweep_on {
+            assert_eq!(
+                swept_bad, 0,
+                "全行スイープで {swept_bad} 行が不一致 (最初の行 {:?})",
+                sweep_first_bad
+            );
+        }
+        if let Some(false) = whole_ok {
+            panic!("whole-tensor 表の参照とビット一致しない行がある");
+        }
+        println!("\n[p38] VERDICT: per-row dequant of token_embd.weight is BIT-IDENTICAL to the \
+                  loader's f32 table row ({} sampled rows + {} swept rows)", verdicts.len(), swept_rows);
+    }
 }
