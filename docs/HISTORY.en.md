@@ -3834,3 +3834,118 @@ External implementations referenced in P19 and their licensing status (the same 
 - **Untouched**: `.cu` / `.ptx` / GPU / server / docker / the quantisation rules /
   fp16-f32 rounding / which tensor uses which quant mode / `docs/NUMERIC_POLICY.ja.md` /
   push / `git add -A`. The work report is the uncommitted `REPORT_P37.md`.
+
+### P38: decided with numbers that token_embd's 5.086 GB f32 gather table can be per-row dequantised, bit-identically (2026-10-23) DONE (analysis + proof test, no product change)
+
+- **Question**: P37 §8 left `token_embd.weight` needing its 5.086 GB f32 gather table
+  **resident** (the largest host-RAM item in the loader, on a 60 GB host that has already
+  been OOM-killed twice with the 8095 server up). P35's finding - this file's Q4_0 blocks
+  are not reproducible by re-quantisation (`d' = d*7/8`) - was being read as "the table
+  cannot be replaced".
+- **Finding**: that conflates *re-quantisation* (f32 -> Q4_0 encode) with *dequantisation*.
+  The table is built by dequantising the file's own blocks: `gguf.rs:286` allocates it,
+  `gguf.rs:300-302` copies each chunk's f32 into it, and `quant.rs:473` produces that f32
+  with one `dequant_row(ty, chunk_bytes, rows*k)` per 819-row chunk. `dequant_row`
+  (`kquant.rs:145-190`) is **block-local** (no cross-block state) and
+  `row_bytes = 160*18 = 2880` is an exact multiple of the 32-element block, so a row
+  boundary is a block boundary: per-row dequant runs the same 160 block computations on the
+  same bytes and yields the same f32 bits.
+- **Measured (proof test `gguf::tests::q4_row_dequant_matches_embed_table_real_gguf`,
+  `#[ignore]`, CPU, no mmap, seek+read_exact)**: `token_embd.weight` k=5120 n=248320 Q4_0
+  (raw 715.2 MB, table 5,085.6 MB). 40 sampled rows (0, 1, 2, chunk boundaries
+  818/819/820/1637-1639, an even spread, 248318/248319) over 32 loader chunks ->
+  **40/40 IDENTICAL**. The whole-tensor 5.086 GB table built by a single `dequant_row` call
+  (the loader's non-chunked shape) -> **40/40 IDENTICAL** (measured RSS +5,800 MB). Full
+  sweep of **all 248,320 rows** -> **0 differences** in 3.30 s. All comparisons are on f32
+  **bit patterns**, never an epsilon.
+- **Cost (measured on this CPU, warm page cache)**: 2,880 B pread + `dequant_row` per row =
+  **3.09 us/token at B=1** (0.018 % of the 17.30 ms/token KPI - arithmetic against the KPI,
+  not a GPU measurement), **24.93 us at B=8**, **103.91 us at B=32** (0.60 %); the pure
+  dequant part is 1.9 us/row and the rest is the pread plus allocations. Peak transient
+  **23.4 KB** (2,880 B row buffer + one 20,480 B f32 row) instead of a 5,085.6 MB resident
+  table. A repeat run gave 2.95 / 23.57 / 99.81 us.
+- **Verdict: (a) bit-identical and cheap enough.** Resident relief **5,085.6 MB** when rows
+  are dequantised from the mmap'd file region (page cache, reclaimable), or **4,370.4 MB**
+  when a 715.2 MB verbatim block copy is kept instead. No row cache is needed (a 64-entry
+  one would be 1.31 MB). Sketch, not implemented: `EmbedRows::{F32, Blocks}` in
+  `qwen35.rs`; the three gather sites (`qwen35.rs:1789` decode, `1937` prefill, `3165` GPU
+  chain upload) move to a `Cow<[f32]>` row accessor; a new
+  `GgufFile::embed_blocks_and_linear_chunked` reuses the existing chunk driver so the
+  quantised copy stays byte-identical; gate `DENNO_EMBED_ONDEMAND` (default ON,
+  `0/false/no/off` restores today's table), fail-closed on type/shape/`nbytes`. The tied
+  fp32 `lm_head` path (`qwen35.rs:1648-1687`) stays on the f32 variant and is unreachable
+  when `quant != Fp32`. **The `lm_head` Q4 copy cannot be the source**: it is re-quantised
+  (P35 allow-list still empty), not the file's blocks, so dequantising it would not be
+  bit-identical.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **327 passed / 0 failed / 40 ignored** (baseline 327 / 0 / 39 + this one ignored test).
+  Non-cuda `cargo test -p denno-engine --lib` = 286 passed / 0 failed / 5 ignored.
+  `tests/kernel_invariants.rs::gdn_kernel_shared_layout_matches_host_smem` is red at
+  pristine HEAD `3e288aa` (P36 rewrote `gdn.cu`'s pass-1 `sc[]` layout and the test's
+  expectation was not updated) - pre-existing, unrelated, and not touched here.
+- **Untouched**: `.cu` / `.ptx` / GPU / server / docker / the quantisation rules / the
+  numeric path / `qwen35.rs` / non-test `gguf.rs` / push / `git add -A`. Work report: the
+  uncommitted `REPORT_P38.md`. P37 §8's sentence about this topic is corrected there.
+
+### P40: split the GDN chunked 3-kernel time with host-side CUDA events (2026-10-23) DONE (measurement only, default OFF)
+
+- **Problem**: in the 27B q4 / 65,000-char prefill the `sl_lay_gdn_scan` phase is 6,965 ms
+  (19.4%), but `DENNO_PROFILE`'s `gdn_pf_*` breakdown stops at `sync` (13,774.9 ms over
+  2 requests), so the per-kernel split (pass 1/2/3) and the possibility that `sync` is
+  absorbing the upstream `gdn_proj` GEMM (P27's phase-attribution worry) stayed unmeasured.
+- **Implementation**: in `gdn_scan_chunked_impl` (`cuda.rs`), only when `DENNO_GDN_KPROF=1`,
+  four events (`CU_EVENT_DEFAULT`, timing enabled) bracket the three launches, and the three
+  intervals are read with `cuEventElapsedTime` right after the existing single sync, then
+  accumulated in ns into static `AtomicU64`s. One line at dump time (`prof::summary`) and at
+  exit: `[GDN_KPROF] pre=<ms> state=<ms> scan=<ms> calls=<n> total=<ms>`. **Measurement only**:
+  the launched function, arguments, grid/block, issue order and sync placement are unchanged,
+  and the accumulators are write-only display statics (nothing flows into the numeric path or
+  the anchor values). With `DENNO_GDN_KPROF` unset, `kprof_begin()` returns `None` - no event
+  is created and nothing is timed (one branch per site). `DENNO_PROFILE` / `DENNO_PF_DBG`
+  output is unchanged when the env var is unset.
+- **Tests**: `cargo test -p denno-engine --features cuda --lib` = 330 passed / 0 failed /
+  40 ignored (baseline 327 + the 3 measurement tests), `cargo test -p denno-engine --test
+  kernel_invariants` = 11 passed, non-cuda `--lib` = 286 passed.
+  `gdn_kernel_shared_layout_matches_host_smem` had been red since P36 added the 4-lane pass-1
+  variant (`dno_gdn_chunk_pre_l4`), which made two kernels carry the same `sc[]` assignment -
+  the expectation is now 2 instead of 1 (`.cu` untouched).
+- **Not verified**: the real per-kernel numbers. This container has no GPU, so the measurement
+  is run by the operator on 8095 / prefill_bench. An interval means "kernel execution plus the
+  issue gap", i.e. host stalls between passes are included.
+- **Next up**: once the dominant pass is known from real numbers, target that pass's lane/chunk
+  split (P36's 4-lane variant aimed at pass 1 and showed no effect, so pass 1 may not dominate).
+
+### P42: replaced the resident 5,086 MB f32 `token_embd` table with per-row dequantisation (Option B) (2026-10-23) DONE (host RAM -4,370.4 MB, numbers bit-identical)
+
+- **Problem**: in the 27B q4 serve the gather table for `token_embd.weight` held
+  5,085,593,600 B (5,085.6 MB) of host RSS. That table is nothing but the file's own Q4_0
+  blocks **dequantised** (never re-quantised), so restoring a row from the same blocks on
+  demand gives the same values (P38 proved this on the real file).
+- **Implementation**: `gguf.rs` gained `embed_blocks_and_linear_chunked` (allocates the
+  file's raw blocks, `n*row_bytes`, instead of an f32 table, and still builds the tied
+  lm_head quantised copy from the same row chunks) plus the fail-closed predicate
+  `embed_blocks_eligible` (type is Q4_0, `k % 32 == 0`, `nbytes == n*row_bytes`,
+  `vocab*e == elems`). In `qwen35.rs` the field `embed: Vec<f32>` became
+  `EmbedTable { F32, Q4Rows { blocks, k, n, row_bytes, ty } }` and the readers (decode 1 row
+  / prefill n rows / chain upload 1 row / test helpers) moved to `row()` / `row_into()`.
+  The `F32` variant is byte-identical to today's `&w[i*e..][..e]` and remains the fp32 path
+  (tied fp32 lm_head) and the fail-closed target. Rows are restored with
+  `kquant::dequant_row_into` (new; same body as `dequant_row`), with **no re-quantisation
+  anywhere**. Default ON; `DENNO_EMBED_ONDEMAND=0|false|no|off` restores the f32 table.
+- **Bit-exactness evidence**: on the real 27B Q4_0 (k=5,120 / n=248,320 / row_bytes=2,880)
+  all 248,320 rows of `EmbedTable::Q4Rows` were compared against the loader's chunk-wise
+  dequant: `to_bits()` differences 0 (measured 3.19 s, 715.2 MB resident, pread 0.66 s).
+  The synthetic-block unit test covers row 0, the last row and rows crossing chunk
+  boundaries, and pins the F32 variant to the old slice read. R4/R5 (tied fp32 lm_head, all
+  rows) are unreachable when `quant != Fp32`, so a Q4Rows table hit there panics with a
+  reason instead of silently materialising 5 GB.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` = 335 passed /
+  0 failed / 41 ignored (baseline 330 + 5 new), `--test kernel_invariants` = 11 passed,
+  non-cuda `--lib` = 291 passed. `.cu` / `.ptx` / GPU / scripts / numeric policy untouched.
+- **Not verified (PREDICTED)**: the -4,370.4 MB host-resident saving is the difference in
+  allocated bytes (5,085,593,600 -> 715,161,600 B), not a measured RSS delta. The KPI impact
+  (decode +0.003 ms/token = 0.018 %, prefill +9.8 ms @3,161 / +39.7 ms @12,850 = 0.10 %) is
+  **predicted** from P38's 3.09 us/token and was not measured on the 8095. The product-path
+  row restore costs 1.95 us/row measured on CPU (resident blocks, no pread), i.e. below the
+  3.09 us used for the prediction, so the prediction is the conservative bound. Anchor md5s
+  were not re-taken.

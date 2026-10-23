@@ -569,9 +569,13 @@ let d = defines(GDN_SRC);
         "gdn.cu の sc[] の意味 (index 割り当て) が変わった: \
          dno_gdn_step の sc[2]/sc[3]/sc[4] とホストの順序を確認すること"
     );
+    // s239 (P36) が pass 1 の 4 レーン版 (`dno_gdn_chunk_pre_l4`) を足したので、
+    // 同じ割り当てを持つカーネルは 2 本 (pre / pre_l4)。不変条件は「pass 1 の
+    // sc[] は k_inv / eg / beta の 3 語」であって本数ではないため、期待値を
+    // 2 に更新する (gdn.cu 自体は触っていない)。
     assert_eq!(
         GDN_SRC.matches("sc[0]=k_inv sc[1]=eg sc[2]=beta").count(),
-        1,
+        2,
         "gdn.cu の pass 1 の sc[] 割り当てが変わった"
     );
 
