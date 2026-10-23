@@ -291,27 +291,30 @@ extern "C" __global__ void dno_gdn_chunk_pre(
         __syncthreads();
 
         // ---- W ステップ (列 c): decay → 内積 → 更新 (w_step_col と同一順序) --
+        // s241: decay と内積を 1 パスに融合する。Wcol[i] *= eg してから同じ i を
+        // 読む順序・丸めは不変で、ローカルメモリのパス数だけが 2 → 1 に減る。
         const float eg = sc[1];
         const float b = sc[2];
+        float skv = 0.0f;
+#pragma unroll 4
         for (int i = 0; i < dk; ++i) {
             Wcol[i] *= eg;
-        }
-        float skv = 0.0f;
-        for (int i = 0; i < dk; ++i) {
             skv += k_sh[i] * Wcol[i];
         }
         const float dlt = b * (v_sh[c] - skv);
+#pragma unroll 4
         for (int i = 0; i < dk; ++i) {
             Wcol[i] += k_sh[i] * dlt;
         }
         // ---- M ステップ (列 c): decay → 内積 → 更新 (m_step_col と同一順序) --
+        // s241: 同じく M の decay と内積も 1 パスに融合する (順序・丸めは不変)。
+        float mk = 0.0f;
+#pragma unroll 4
         for (int i = 0; i < dk; ++i) {
             Mcol[i] *= eg;
-        }
-        float mk = 0.0f;
-        for (int i = 0; i < dk; ++i) {
             mk += k_sh[i] * Mcol[i];
         }
+#pragma unroll 4
         for (int i = 0; i < dk; ++i) {
             Mcol[i] -= b * k_sh[i] * mk;
         }
