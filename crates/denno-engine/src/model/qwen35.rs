@@ -407,13 +407,11 @@ fn rope_partial_interleaved_tab(x: &mut [f32], heads: usize, dh: usize, n_rot: u
 /// (行ごとの `Vec` 確保をやめる版も試したが **-1.6 ms/層 = 0.03 s/request** しか
 /// 動かず、実装を 2 本持つ価値が無いので採らなかった — REPORT_P12.md)。
 #[allow(clippy::too_many_arguments)]
-fn pf_prepare_row(
+fn pf_prepare_qk_row(
     qg_i: &[f32],      // [heads*2*dh] q 投影 + ゲート
     k_i: &[f32],       // [kv_heads*dh]
-    v_i: &[f32],       // [kv_heads*dh]
     q_r: &mut [f32],   // [heads*dh] 出力 (norm + rope 済み q)
     k_row: &mut [f32], // [kv_heads*dh] 出力 (KV キャッシュの行)
-    v_row: &mut [f32], // [kv_heads*dh]
     q_norm_w: &[f32],
     k_norm_w: &[f32],
     heads: usize,
@@ -448,6 +446,39 @@ fn pf_prepare_row(
         }
     }
     k_row[..kv_dim].copy_from_slice(&k);
+}
+
+/// s240 (P44): [`pf_prepare_qk_row`] に **v の行コピーだけ**を足したもの。
+///
+/// `v` は prepare で 1 ビットも変換されない (D2H で戻した値を KV キャッシュの行へ
+/// そのまま写すだけ) ので、残差常駐経路では D2H の宛先をキャッシュの行そのものに
+/// してこのコピーを丸ごと消せる ([`Qwen35::pf_prepare_into`] の `v_rows` 引数)。
+/// ホスト経路 (qkv をホストで投影する経路) と `p12_prepare_bench` は従来どおり
+/// この関数を通る = 演算列・確保の回数は s171 までと同一。
+#[allow(clippy::too_many_arguments)]
+fn pf_prepare_row(
+    qg_i: &[f32],      // [heads*2*dh] q 投影 + ゲート
+    k_i: &[f32],       // [kv_heads*dh]
+    v_i: &[f32],       // [kv_heads*dh]
+    q_r: &mut [f32],   // [heads*dh] 出力 (norm + rope 済み q)
+    k_row: &mut [f32], // [kv_heads*dh] 出力 (KV キャッシュの行)
+    v_row: &mut [f32], // [kv_heads*dh]
+    q_norm_w: &[f32],
+    k_norm_w: &[f32],
+    heads: usize,
+    kv_heads: usize,
+    dh: usize,
+    n_rot: usize,
+    eps: f32,
+    theta: f32,
+    rope_tab: Option<&[f32]>,
+    pos: usize,
+) {
+    pf_prepare_qk_row(
+        qg_i, k_i, q_r, k_row, q_norm_w, k_norm_w, heads, kv_heads, dh, n_rot, eps, theta,
+        rope_tab, pos,
+    );
+    let kv_dim = kv_heads * dh;
     v_row[..kv_dim].copy_from_slice(v_i);
 }
 
@@ -1212,9 +1243,12 @@ impl Qwen35 {
         q_out: &mut [f32],
         buf_qg: &[f32],
         buf_k: &[f32],
-        buf_v: &[f32],
+        // s240 (P44): `Some` = v を `v_rows` へコピーする (ホスト経路) /
+        // `None` = v は既に `v_rows` の位置にある (残差常駐経路。D2H の宛先を
+        // キャッシュ行にしたので prepare は v を 1 バイトも触らない)。
+        buf_v: Option<&[f32]>,
         krows: &mut [f32],
-        vrows: &mut [f32],
+        v_rows: Option<&mut [f32]>,
         pos0: usize,
         n: usize,
         rope_tab: Option<&[f32]>,
@@ -1223,37 +1257,67 @@ impl Qwen35 {
         let dh = self.dh;
         let kv_dim = self.kv_heads * dh;
         // s172 (P12): 1 行分の本文は `pf_prepare_row` (計測用に切り出し)。
-        crate::prof::time_n_ev(crate::prof::QKNORM, n, || {
-            q_out
-                .par_chunks_exact_mut(heads * dh)
-                .zip(buf_qg.par_chunks_exact(heads * 2 * dh))
-                .zip(buf_k.par_chunks_exact(kv_dim))
-                .zip(buf_v.par_chunks_exact(kv_dim))
-                .zip(krows.par_chunks_exact_mut(kv_dim))
-                .zip(vrows.par_chunks_exact_mut(kv_dim))
-                .enumerate()
-                .for_each(|(i, (((((q_r, qg_i), k_i), v_i), k_row), v_row))| {
-                    // s172 (P12): 本文は `pf_prepare_row` に切り出した
-                    // (計測用・演算列と確保の回数は s171 までと同一)。
-                    pf_prepare_row(
-                        qg_i,
-                        k_i,
-                        v_i,
-                        q_r,
-                        k_row,
-                        v_row,
-                        &fl.q_norm_w,
-                        &fl.k_norm_w,
-                        heads,
-                        self.kv_heads,
-                        dh,
-                        self.n_rot,
-                        self.eps,
-                        self.theta,
-                        rope_tab.map(|t| &t[i * self.n_rot..(i + 1) * self.n_rot]),
-                        pos0 + i,
-                    );
-                });
+        crate::prof::time_n_ev(crate::prof::QKNORM, n, || match (buf_v, v_rows) {
+            (Some(buf_v), Some(v_rows)) => {
+                q_out
+                    .par_chunks_exact_mut(heads * dh)
+                    .zip(buf_qg.par_chunks_exact(heads * 2 * dh))
+                    .zip(buf_k.par_chunks_exact(kv_dim))
+                    .zip(buf_v.par_chunks_exact(kv_dim))
+                    .zip(krows.par_chunks_exact_mut(kv_dim))
+                    .zip(v_rows.par_chunks_exact_mut(kv_dim))
+                    .enumerate()
+                    .for_each(|(i, (((((q_r, qg_i), k_i), v_i), k_row), v_row))| {
+                        // s172 (P12): 本文は `pf_prepare_row` に切り出した
+                        // (計測用・演算列と確保の回数は s171 までと同一)。
+                        pf_prepare_row(
+                            qg_i,
+                            k_i,
+                            v_i,
+                            q_r,
+                            k_row,
+                            v_row,
+                            &fl.q_norm_w,
+                            &fl.k_norm_w,
+                            heads,
+                            self.kv_heads,
+                            dh,
+                            self.n_rot,
+                            self.eps,
+                            self.theta,
+                            rope_tab.map(|t| &t[i * self.n_rot..(i + 1) * self.n_rot]),
+                            pos0 + i,
+                        );
+                    });
+            }
+            _ => {
+                // s240 (P44): v はキャッシュ行に直接入っているので q/k だけを回す。
+                // 行ごとの演算列は `pf_prepare_row` の q/k 部分と同一 (関数を共有)。
+                q_out
+                    .par_chunks_exact_mut(heads * dh)
+                    .zip(buf_qg.par_chunks_exact(heads * 2 * dh))
+                    .zip(buf_k.par_chunks_exact(kv_dim))
+                    .zip(krows.par_chunks_exact_mut(kv_dim))
+                    .enumerate()
+                    .for_each(|(i, (((q_r, qg_i), k_i), k_row))| {
+                        pf_prepare_qk_row(
+                            qg_i,
+                            k_i,
+                            q_r,
+                            k_row,
+                            &fl.q_norm_w,
+                            &fl.k_norm_w,
+                            heads,
+                            self.kv_heads,
+                            dh,
+                            self.n_rot,
+                            self.eps,
+                            self.theta,
+                            rope_tab.map(|t| &t[i * self.n_rot..(i + 1) * self.n_rot]),
+                            pos0 + i,
+                        );
+                    });
+            }
         });
     }
 
@@ -1293,7 +1357,15 @@ impl Qwen35 {
         let kv_dim = self.kv_heads * dh;
         fit_prefill_buf(buf_qg, n * fl.q_w.dims().1); // [n, heads*2*dh]
         fit_prefill_buf(buf_k, n * fl.k_w.dims().1); // [n, kv_dim]
-        fit_prefill_buf(buf_v, n * fl.v_w.dims().1); // [n, kv_dim]
+        // s240 (P44): 残差常駐経路は V を scratch に戻さない (D2H の宛先が
+        // ホスト KV キャッシュの行そのもの = 下の prepare は v を触らない) ので
+        // `buf_v` は使わない。fit すると n=65k で 266 MB を毎リクエスト
+        // mmap + ゼロ埋めすることになる (P28 と同じ理由)。
+        if !qkv_precomputed {
+            fit_prefill_buf(buf_v, n * fl.v_w.dims().1); // [n, kv_dim]
+        }
+        // s240 (P44): `true` = v は既にキャッシュ行にある (D2H の宛先をそこにした)。
+        let v_in_cache = qkv_precomputed;
         // s165 (P2): 残差常駐経路は q/k/v をデバイス (CH_PFH) から直接 GEMM して
         // 出力だけを戻す (chain_qkv_prefill_q4_dev)。その場合はここで投影しない
         // (バッファ長は上で合わせてあるので fit は no-op)。
@@ -1359,9 +1431,9 @@ impl Qwen35 {
                             q_out,
                             &buf_qg[..],
                             &buf_k[..],
-                            &buf_v[..],
+                            if v_in_cache { None } else { Some(&buf_v[..]) },
                             &mut *krows,
-                            &mut *vrows,
+                            if v_in_cache { None } else { Some(&mut *vrows) },
                             pos0,
                             n,
                             rope_tab,
@@ -1386,9 +1458,9 @@ impl Qwen35 {
                 &mut buf_q[..],
                 &buf_qg[..],
                 &buf_k[..],
-                &buf_v[..],
+                if v_in_cache { None } else { Some(&buf_v[..]) },
                 krows,
-                vrows,
+                if v_in_cache { None } else { Some(vrows) },
                 pos0,
                 n,
                 rope_tab,
@@ -1436,9 +1508,9 @@ impl Qwen35 {
                         &mut buf_q[..],
                         &buf_qg[..],
                         &buf_k[..],
-                        &buf_v[..],
+                        if v_in_cache { None } else { Some(&buf_v[..]) },
                         krows,
-                        vrows,
+                        if v_in_cache { None } else { Some(vrows) },
                         pos0,
                         n,
                         rope_tab,
@@ -2930,7 +3002,21 @@ impl Qwen35 {
                 // 発生しない (per-op 経路の 3 回の h2 H2D が消える)。
                 fit_prefill_buf(buf_qg, n * fl.q_w.dims().1);
                 fit_prefill_buf(buf_k, n * fl.k_w.dims().1);
-                fit_prefill_buf(buf_v, n * fl.v_w.dims().1);
+                // s240 (P44): V は prepare で 1 ビットも変換されない (D2H で戻した
+                // バイト列を KV キャッシュの行へ写すだけ) ので、D2H の宛先を
+                // **ホスト KV キャッシュの行そのもの** にする。従来は scratch
+                // (buf_v) へ戻してから prepare が `v_row.copy_from_slice(v_i)` で
+                // 写しており、n 行 × kv_dim の read + write が毎層まるごと無駄だった
+                // (27B n=65k で 266 MB + 266 MB/層)。転送バイト数・発行順・同期・
+                // カーネル引数は不変で、キャッシュ行に入るバイト列も従来と同一
+                // (コピーを 1 本消しただけ) = 数値は 1 ビットも変わらない。
+                let kv_dim = self.kv_heads * self.dh;
+                let vrows = {
+                    // ensure(len + n) をここで済ませる (この後の prepare の
+                    // `kv_bufs(li, 1)` は no-op = 再確保でスライスが無効化されない)。
+                    let (_kc, vc) = cache.kv_bufs(li, n);
+                    &mut vc[pos0 * kv_dim..(pos0 + n) * kv_dim]
+                };
                 // s166 (P5): q|k|v の連結重みを先に割り当てる (parts が個別に
                 // VRAM へ載る前 = VRAM は増えない)。
                 if cuda::q4_chain_enabled() {
@@ -2939,7 +3025,7 @@ impl Qwen35 {
                     }
                 }
                 cuda::chain_qkv_prefill_q4_dev(
-                    &fl.q_w, &fl.k_w, &fl.v_w, n, li, buf_qg, buf_k, buf_v,
+                    &fl.q_w, &fl.k_w, &fl.v_w, n, li, buf_qg, buf_k, vrows,
                 )
                 .ok_or_else(|| anyhow::anyhow!("prefill residual chain: qkv chain failed"))?;
                 // s169 (P8): ここから attention のホスト側 (prepare + attend) と
@@ -3758,6 +3844,85 @@ mod tests {
             best[3] * 16.0 / 1e3,
             (best[0] + best[1] + best[2] + best[3]) * 16.0 / 1e3
         );
+    }
+
+    /// s240 (P44): 残差常駐経路の prepare は **v をコピーしない** (D2H の宛先を
+    /// ホスト KV キャッシュの行そのものにしたため)。この契約を CPU で固定する:
+    ///   - q/k の出力は v の有無によらずビット一致
+    ///   - `v_rows = None` のとき v の行は 1 要素も書かれない
+    ///   - `v_rows = Some` のとき v の行は入力 v の完全なコピー
+    ///     (= そのコピーを消しても数値が変わらない根拠)
+    #[test]
+    fn pf_prepare_v_in_cache_matches_copy_path_bit_exact() {
+        // prof のグローバルカウンタ窓 (`time_n_ev`) を触るので排他を取る。
+        let _g = crate::prof::counters_guard();
+        let dir = build_dir("p44v", true, NK, NV);
+        let m = load_int8(&dir);
+        let li = m
+            .layers
+            .iter()
+            .position(|l| matches!(l.attn, AttnKind::Full(_)))
+            .expect("full 層が無い");
+        let fl = match &m.layers[li].attn {
+            AttnKind::Full(f) => f,
+            _ => unreachable!(),
+        };
+        let (heads, dh, kv_heads) = (m.heads, m.dh, m.kv_heads);
+        let kv_dim = kv_heads * dh;
+        let (n, pos0) = (7usize, 3usize); // 端数行 + pos0 > 0 (on-the-fly rope 側)
+        let mut seed = 0x2468_ace1u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / 16_777_216.0 - 0.5
+        };
+        let qg: Vec<f32> = (0..n * heads * 2 * dh).map(|_| rnd()).collect();
+        let k_i: Vec<f32> = (0..n * kv_dim).map(|_| rnd()).collect();
+        let v_i: Vec<f32> = (0..n * kv_dim).map(|_| rnd()).collect();
+
+        // 経路 1 = ホスト経路 (v を scratch からコピーする従来の形)。
+        let mut q1 = vec![0.0f32; n * heads * dh];
+        let mut k1 = vec![0.0f32; n * kv_dim];
+        let mut v1 = vec![0.0f32; n * kv_dim];
+        m.pf_prepare_into(
+            fl,
+            &mut q1,
+            &qg,
+            &k_i,
+            Some(&v_i),
+            &mut k1,
+            Some(&mut v1),
+            pos0,
+            n,
+            None,
+        );
+
+        // 経路 2 = 残差常駐経路 (v は既にキャッシュ行にあるので prepare は触らない)。
+        let sentinel = 7.25f32;
+        let mut q2 = vec![0.0f32; n * heads * dh];
+        let mut k2 = vec![0.0f32; n * kv_dim];
+        let mut v2 = vec![sentinel; n * kv_dim];
+        m.pf_prepare_into(
+            fl,
+            &mut q2,
+            &qg,
+            &k_i,
+            None,
+            &mut k2,
+            None,
+            pos0,
+            n,
+            None,
+        );
+
+        assert_eq!(bits(&q1), bits(&q2), "q が経路で変わった");
+        assert_eq!(bits(&k1), bits(&k2), "k が経路で変わった");
+        assert_eq!(bits(&v1), bits(&v_i), "v のコピーが入力 v と不一致");
+        assert_eq!(
+            bits(&v2),
+            bits(&vec![sentinel; n * kv_dim]),
+            "v_rows = None の経路が v の行を書いた"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// s171 (P11): モデル実体の heads / kv_heads / dh / n_rot / theta で、
