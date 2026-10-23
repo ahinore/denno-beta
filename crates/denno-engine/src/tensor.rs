@@ -416,6 +416,17 @@ fn matvec_rows_bt_small_n_impl(a: &[f32], b: &[f32], k: usize, n: usize, m: usiz
     }
 }
 
+/// s251 (P51): pair 経路の行レーン数。x86_64 は AVX2 の 16 レーン (2×`__m256`)、
+/// それ以外は 8 レーン (スカラー配列 = LLVM の自動ベクトル化に任せる)。
+#[cfg(target_arch = "x86_64")]
+const PAIR_MB: usize = 16;
+#[cfg(not(target_arch = "x86_64"))]
+const PAIR_MB: usize = 8;
+
+/// s251 (P51): 1 ブロックの行数。従来と同じ 32 行 (= 転置タイル 655 KB/スレッド)。
+/// レーン数が変わっても行数は変えないので、ブロック数と重みの再読み回数は不変。
+const PAIR_ROWS: usize = 32;
+
 /// s172 (P13): **2 本の小 n 投影 (GDN の beta/alpha) を h2 の 1 回の走査で**
 /// まとめて計算する。`matvec_rows_bt_into` を 2 回呼ぶのと**ビット一致**。
 ///
@@ -437,6 +448,9 @@ fn matvec_rows_bt_small_n_impl(a: &[f32], b: &[f32], k: usize, n: usize, m: usiz
 /// `acc += av * rv`」のままで、変わるのは (i,j) を処理する**順序**だけ。
 /// 行ブロック・チャネルは互いに独立なので、どの順に回しても各要素の
 /// 加算列は同一 (`matvec_rows_bt_pair_matches_two_calls` が全要素一致を固定)。
+///
+/// s251 (P51): 行レーン数を定数化した (x86_64 = AVX2 の 16 レーン、それ以外 = 8)。
+/// 行数 (32 行/ブロック) は従来のまま。内側ループの詳細は [`pair_group_avx2`] 参照。
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub fn matvec_rows_bt_pair_into(
     a: &[f32],
@@ -449,9 +463,9 @@ pub fn matvec_rows_bt_pair_into(
     out1: &mut [f32],
     out2: &mut [f32],
 ) {
-    const MB: usize = 8; // 行方向のレーン数 (SIMD 幅)
+    const MB: usize = PAIR_MB; // 行方向のレーン数 (SIMD 幅)
     const JG: usize = 4; // 同時に走査する出力チャネル数 (累積順には無関係)
-    const GB: usize = 4; // 1 ブロックのグループ数 (= 32 行)
+    const GB: usize = PAIR_ROWS / PAIR_MB; // 1 ブロックのグループ数 (= 32 行)
     debug_assert!(a.len() >= m * k && b1.len() >= n1 * k && b2.len() >= n2 * k);
     debug_assert!(out1.len() >= m * n1 && out2.len() >= m * n2);
     if m == 0 || k == 0 {
@@ -503,6 +517,29 @@ pub fn matvec_rows_bt_pair_into(
                 let mut j0 = 0usize;
                 while j0 < n {
                     let cols = JG.min(n - j0);
+                    #[cfg(target_arch = "x86_64")]
+                    if cols == JG && nr == rows {
+                        // s251 (P51): 高速経路 (全 32 行・4 チャネル)。
+                        // SAFETY: tile の該当グループは k*MB 要素以上、b は
+                        // (j0+JG)*k 要素以上、cp は m*n 要素の領域を指す
+                        // (呼び出し側の debug_assert と n/n1/n2 の契約)。
+                        for g in 0..GB {
+                            unsafe {
+                                pair_group_avx2(
+                                    &tile[g * k * MB..][..k * MB],
+                                    b,
+                                    k,
+                                    j0,
+                                    n,
+                                    i0 + g * MB,
+                                    m,
+                                    cp,
+                                )
+                            };
+                        }
+                        j0 += cols;
+                        continue;
+                    }
                     let mut acc = [[[0.0f32; MB]; JG]; GB];
                     for g in 0..ng {
                         let tbase = g * k * MB;
@@ -532,6 +569,58 @@ pub fn matvec_rows_bt_pair_into(
             }
         });
     });
+}
+
+/// s251 (P51): [`matvec_rows_bt_pair_into`] の**全ブロック高速経路** (1 グループ分)。
+///
+/// 従来の内側ループは `ng` (グループ数) と `cols` (チャネル数) が実行時値だった
+/// ため、累積器 `acc[g][t][l]` の添字が動的になり、1 MAC ごとにスタックの
+/// ロード/ストアが入っていた (このコンテナ実測: 27B 実形 m=14,043 / k=5,120 /
+/// n=48+48 で 84 ms/層 = 164 GFLOP/s)。ここでは 1 グループ (MB 行) だけを
+/// 担当し、`t` (JG) と `l` (MB) のループを**定数範囲**にして累積器を
+/// レジスタへ載せる。タイルの読みは従来と同じ (チャネル群ごとに 1 回)。
+///
+/// 数値は不変: 各 (i,j) の累積は「0 から d 昇順に `ac += av * rv`」のままで、
+/// 変わるのは (i,j) を処理する順序だけ (`matvec_rows_bt_pair_matches_two_calls`)。
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pair_group_avx2(
+    tile_g: &[f32], // [d][l] の転置タイル (このグループの 16 行)
+    b: &[f32],      // [n][k]
+    k: usize,
+    j0: usize,
+    n: usize,
+    i0: usize, // このグループの先頭行
+    m: usize,
+    cp: SendPtr,
+) {
+    use std::arch::x86_64::*;
+    const MB: usize = 16;
+    const JG: usize = 4;
+    debug_assert!(tile_g.len() >= k * MB);
+    // 累積器は 4 チャネル × 2 ベクトル = 8 本 (レジスタに載る)。
+    let mut acc = [[_mm256_setzero_ps(); 2]; JG];
+    for d in 0..k {
+        let av0 = _mm256_loadu_ps(tile_g.as_ptr().add(d * MB));
+        let av1 = _mm256_loadu_ps(tile_g.as_ptr().add(d * MB + 8));
+        for t in 0..JG {
+            // 積と和は別命令 (mul + add) のまま — 融合しない = 丸めは従来と同じ。
+            let rv = _mm256_set1_ps(*b.get_unchecked((j0 + t) * k + d));
+            acc[t][0] = _mm256_add_ps(acc[t][0], _mm256_mul_ps(av0, rv));
+            acc[t][1] = _mm256_add_ps(acc[t][1], _mm256_mul_ps(av1, rv));
+        }
+    }
+    let nc = MB.min(m - i0);
+    let mut buf = [0.0f32; MB];
+    for t in 0..JG {
+        _mm256_storeu_ps(buf.as_mut_ptr(), acc[t][0]);
+        _mm256_storeu_ps(buf.as_mut_ptr().add(8), acc[t][1]);
+        let j = j0 + t;
+        for (l, v) in buf[..nc].iter().enumerate() {
+            cp.write((i0 + l) * n + j, *v);
+        }
+    }
 }
 
 /// [`matvec_rows_bt_pair_into`] の転置タイル (スレッドごと・grow-only)。
@@ -1219,6 +1308,11 @@ mod tests {
             // n >= JB(64): 参照側は `matvec_rows_bt_vec_impl` (JB ブロック + 端数スカラー)
             // を通る。1 要素の累積順は同じなので pair とビット一致するはず。
             (96, 32, 96, 96),
+            // s251 (P51): 高速経路 (全ブロック + 4 チャネル) とチャネル端数の混在、
+            // および k が大きい形 (AVX2 16 レーン × 2 グループ = 32 行ブロック)。
+            (32, 512, 50, 48),
+            (97, 256, 48, 48),
+            (128, 640, 48, 48),
         ];
         for (m, k, n1, n2) in shapes {
             let a = pseudo_random(m * k, 21 + m as u32);
