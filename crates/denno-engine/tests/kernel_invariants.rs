@@ -998,6 +998,19 @@ struct SmemObj {
     /// 要素 = 4 バイトなので、`4 の倍数の要素境界` を判定する係数 4 を持つ。
     /// これが無いと `(float*)&sh[1]` (要素 4 番 = 整列済み) を未アラインと誤判定する。
     stride: i64,
+    /// この名前の基点が「宣言そのものの先頭」から何バイトずれているかを 8 で割った
+    /// 剰余。宣言そのものは `Some(0)`。別名 (`float *s_sm = v_sm + EXPR;`) では
+    /// `EXPR * stride` の剰余を親から積む。`EXPR` が記号でも **modulus で 0 に落ちる**
+    /// なら `Some(0)` になる (`PF_BK * (dh + 1)` は PF_BK=8 なので mod 8 で 0)。
+    /// s177/P34: これが無いと動的 smem の別名越しのキャストは、列の錨だけを見て
+    /// **別名の基点ずれを無視**していた (基点が奇数要素ずれていても緑になった)。
+    /// `None` は剰余が静的に決まらない (= 整列を主張しない) ことを表す。
+    pre8: Option<i64>,
+    /// 基点が `extern __shared__` (動的領域) 由来か。CUDA は動的 smem の基点を
+    /// 16 バイト整列で返すので、8 バイト型 (float2) の整列まで主張できる。
+    /// 静的 `__shared__ float` 配列の整列は要素幅 (4) しか保証されないため、
+    /// 8 バイト型のキャストはそこでは「判定不能」にする (s177/P34)。
+    dyn_base: bool,
 }
 
 /// 1 つの 4 バイトキャスト。
@@ -1051,6 +1064,14 @@ struct Scan {
     rows_checked: usize,
     /// 検査した 4 バイトキャストの総数
     casts_seen: usize,
+    /// 間接キャスト (`int *p = (int*)&sA[..]`) として検出した件数
+    /// (s177/P34: 直接形と分けて数える — 実カーネルには無いので 0 が正しい値)
+    indirect_seen: usize,
+    /// 間接キャストのうち整列・範囲内と確認できたもの
+    indirect_sites: Vec<SmemCast>,
+    /// 行が数値に解決できた [`Flat::SymbolicRow`] のうち、行の上限まで
+    /// 検査した件数 (s177/P34: 旧版は row_known を表示にしか使っていなかった)
+    row_bound_checked: usize,
     /// 2 次元宣言から作った行別名 (`a4` / `b4` 相当) の数
     aliases: usize,
 }
@@ -1171,6 +1192,19 @@ fn norm_ty(raw: &str) -> String {
     ty.trim().to_string()
 }
 
+/// キャスト先の型の幅 (バイト)。`float2` は **8 バイト** なので 8 バイト整列が要る。
+///
+/// s177/P34: 旧版は float2 も 4 バイト型と同じ `% 4` で判定していた。4 バイト
+/// 整列しか成り立たない番地 (例 `&s_sm[kk]` の kk 奇数) を「整列済み」と
+/// 判定してしまうので、幅を型から決めて modulus を切り替える。
+fn cast_width(ty: &str) -> i64 {
+    if ty == "float2" {
+        8
+    } else {
+        4
+    }
+}
+
 /// C 形式 (`*(int*)&..`) の 4 バイトキャスト。
 fn c_style_casts4(line: &str) -> Vec<CastSite> {
     const TYS: [&str; 6] = ["float2", "int", "unsigned int", "unsigned", "float", "uint"];
@@ -1197,16 +1231,14 @@ fn c_style_casts4(line: &str) -> Vec<CastSite> {
         if !TYS.contains(&ty.as_str()) {
             continue;
         }
-        // `&名前[..]` / `(名前 + ..)` のどちらか
+        // `&名前[..]` / `(名前 + ..)` / 裸の `名前` (ポインタ変数越し, s177/P34)
         let mut body = &rest[close + 2..];
         body = body.trim_start();
         if let Some(amp) = body.strip_prefix('&') {
             body = amp.trim_start();
         } else if body.starts_with('(') {
             body = body[1..].trim_start();
-        } else {
-            continue;
-        }
+        };
         let name_len = body
             .char_indices()
             .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
@@ -1228,10 +1260,97 @@ fn c_style_casts4(line: &str) -> Vec<CastSite> {
                 Some(c) => format!("{name} {}", &after[..c]),
                 None => continue,
             }
+        } else if after.is_empty()
+            || after.starts_with('=')
+            || after.starts_with(';')
+            || after.starts_with(',')
+            || after.starts_with(')')
+            || after.starts_with(']')
+        {
+            // `*(int*)p` — **ポインタ変数越し** のキャスト (s177/P34)。`p` が smem を
+            // 指すと分かっている (別名表にある) ときだけ呼び出し側が判定する。
+            // オフセットは p の基点からの 0。
+            "+0".to_string()
         } else {
             continue;
         };
         let _ = b;
+        out.push(CastSite {
+            ty,
+            obj: name.to_string(),
+            idx,
+        });
+    }
+    out
+}
+
+/// `(T*)&smem[..]` / `(T*)(smem + ..)` の **間接キャスト**。
+///
+/// 直接形 (`*(int*)&sA[..]`) は [`c_style_casts4`] が見るが、キャストの結果を
+/// ポインタ変数に入れる形 (`int *p = (int*)&sA[r][c];`) や引数に渡す形は
+/// 先頭に `*` が無いため、s104 の走査器からは **丸ごと見えなかった**
+/// (P3-3 の既知の限界 3)。ここでは同じ 4/8 バイト型の `(T*)` を拾い、
+/// 宛先の式を直接形と同じ形 (obj + idx) で返す。smem 由来かどうかは
+/// 呼び出し側が別名表で判定する。
+fn indirect_casts4(line: &str) -> Vec<CastSite> {
+    const TYS: [&str; 6] = ["float2", "int", "unsigned int", "unsigned", "float", "uint"];
+    let mut out = Vec::new();
+    let mut search = 0usize;
+    while let Some(off) = line[search..].find('(') {
+        let at = search + off;
+        search = at + 1;
+        // `*(int*)..` の直接形は c_style_casts4 の担当 (二重計上しない)
+        if line[..at].trim_end().ends_with('*') {
+            continue;
+        }
+        let rest = &line[at + 1..];
+        let Some(close) = rest.find("*)") else {
+            continue;
+        };
+        let ty = norm_ty(&rest[..close]);
+        if !TYS.contains(&ty.as_str()) {
+            continue;
+        }
+        let mut body = rest[close + 2..].trim_start();
+        if let Some(amp) = body.strip_prefix('&') {
+            body = amp.trim_start();
+        } else if body.starts_with('(') {
+            body = body[1..].trim_start();
+        } else {
+            continue;
+        }
+        let name_len = body
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        if name_len == 0 {
+            continue;
+        }
+        let name = &body[..name_len];
+        let after = body[name_len..].trim_start();
+        let after_at = line.len() - after.len();
+        let idx = if after.starts_with('[') {
+            match read_index(line, after_at) {
+                Some(x) => x,
+                None => continue,
+            }
+        } else if after.starts_with('+') {
+            // `(T*)p + k` は括弧が無いので、区切り (`;` `,` `)`) までを式とする。
+            let end = after
+                .find([';', ',', ')'])
+                .unwrap_or(after.len());
+            format!("{name} {}", after[..end].trim_end())
+        } else if after.is_empty()
+            || after.starts_with('=')
+            || after.starts_with(';')
+            || after.starts_with(',')
+            || after.starts_with(')')
+            || after.starts_with(']')
+        {
+            "+0".to_string()
+        } else {
+            continue;
+        };
         out.push(CastSite {
             ty,
             obj: name.to_string(),
@@ -1288,6 +1407,15 @@ fn reinterpret_casts4(line: &str) -> Vec<CastSite> {
                 Some(c) => format!("{name} {}", &after[..c]),
                 None => continue,
             }
+        } else if after.is_empty()
+            || after.starts_with('=')
+            || after.starts_with(';')
+            || after.starts_with(',')
+            || after.starts_with(')')
+            || after.starts_with(']')
+        {
+            // `reinterpret_cast<const float2*>(p)` — ポインタ変数越し (s177/P34)。
+            "+0".to_string()
         } else {
             continue;
         };
@@ -1356,6 +1484,8 @@ fn parse_smem_decl(line: &str, dynamic: bool, d: &HashMap<String, String>) -> Op
             cap: if dynamic || !dims.is_empty() { i64::MAX } else { 1 },
             inner: None,
             stride,
+            pre8: Some(0),
+            dyn_base: dynamic,
         });
     }
     let outer = eval(&dims[0], d)?;
@@ -1372,6 +1502,8 @@ fn parse_smem_decl(line: &str, dynamic: bool, d: &HashMap<String, String>) -> Op
         cap,
         inner,
         stride,
+        pre8: Some(0),
+        dyn_base: false,
     })
 }
 
@@ -1415,7 +1547,138 @@ fn eval(expr: &str, d: &HashMap<String, String>) -> Option<i64> {
     }
 }
 
+/// [`eval_mod`] の値。`Unknown` は「識別子の値いかんで変わる」ことを表す。
+#[derive(Debug, Clone, Copy)]
+enum ModVal {
+    Known(i64),
+    Unknown,
+}
+
+/// 式を modulus `m` で評価し、**値が m で一意に決まるときだけ** 剰余を返す。
+///
+/// 未知の識別子 (カーネル引数 `dh`・`threadIdx.x` 等) は「任意の整数」として扱い、
+/// 0 を掛けられている項だけ 0 に落とす。これが無いと、動的 smem の別名
+/// (`float *s_sm = v_sm + PF_BK * (dh + 1);`) の基点オフセットが記号のままで
+/// 「アラインメント不明」になり、float2 荷載を静的判定できない。
+/// PF_BK=8 なら `8 * (dh + 1) ≡ 0 (mod 8)` なので 8 バイト整列は **dh に依らず**
+/// 成り立つ — これは推測ではなく modular arithmetic の結論。
+///
+/// soundness: `Some(r)` を返すのは「識別子が何であっても剰余が r」と言える場合だけ。
+/// 割り算・剰余は両辺が数値のときだけ畳む (未知を含む式は `Unknown`)。
+fn eval_mod(expr: &str, d: &HashMap<String, String>, m: i64) -> Option<i64> {
+    if m <= 0 {
+        return None;
+    }
+    let cs: Vec<char> = expr.chars().filter(|c| !c.is_whitespace()).collect();
+    if cs.is_empty() {
+        return Some(0); // 空式 = 0 (別名の `float *p = sh;` の右辺)
+    }
+    let mut pos = 0usize;
+    match mod_sum(&cs, &mut pos, d, m)? {
+        ModVal::Known(v) if pos == cs.len() => Some(v),
+        _ => None,
+    }
+}
+
+fn mod_add(a: ModVal, b: ModVal, sign: i64, m: i64) -> ModVal {
+    match (a, b) {
+        (ModVal::Known(x), ModVal::Known(y)) => ModVal::Known((x + sign * y).rem_euclid(m)),
+        // 0 + 未知 = 未知 (0 に落とせるのは **掛け算** の 0 だけ)
+        _ => ModVal::Unknown,
+    }
+}
+
+fn mod_mul(a: ModVal, b: ModVal, m: i64) -> ModVal {
+    match (a, b) {
+        (ModVal::Known(x), ModVal::Known(y)) => ModVal::Known((x * y).rem_euclid(m)),
+        // 0 * 未知 = 0: ここだけが「未知を含んでも剰余が決まる」ケース。
+        (ModVal::Known(0), ModVal::Unknown) | (ModVal::Unknown, ModVal::Known(0)) => {
+            ModVal::Known(0)
+        }
+        _ => ModVal::Unknown,
+    }
+}
+
+fn mod_sum(cs: &[char], pos: &mut usize, d: &HashMap<String, String>, m: i64) -> Option<ModVal> {
+    let mut v = mod_prod(cs, pos, d, m)?;
+    while *pos < cs.len() && (cs[*pos] == '+' || cs[*pos] == '-') {
+        let sign = if cs[*pos] == '+' { 1 } else { -1 };
+        *pos += 1;
+        let r = mod_prod(cs, pos, d, m)?;
+        v = mod_add(v, r, sign, m);
+    }
+    Some(v)
+}
+
+fn mod_prod(cs: &[char], pos: &mut usize, d: &HashMap<String, String>, m: i64) -> Option<ModVal> {
+    let mut v = mod_atom(cs, pos, d, m)?;
+    while *pos < cs.len() && matches!(cs[*pos], '*' | '/' | '%') {
+        let op = cs[*pos];
+        *pos += 1;
+        let r = mod_atom(cs, pos, d, m)?;
+        v = match (op, v, r) {
+            ('*', a, b) => mod_mul(a, b, m),
+            ('/', ModVal::Known(x), ModVal::Known(y)) if y != 0 => ModVal::Known(x / y),
+            ('%', ModVal::Known(x), ModVal::Known(y)) if y != 0 => ModVal::Known(x % y),
+            ('%', ModVal::Known(0), ModVal::Unknown) => ModVal::Known(0),
+            _ => ModVal::Unknown,
+        };
+    }
+    Some(v)
+}
+
+fn mod_atom(cs: &[char], pos: &mut usize, d: &HashMap<String, String>, m: i64) -> Option<ModVal> {
+    if *pos >= cs.len() {
+        return None;
+    }
+    match cs[*pos] {
+        '+' => {
+            *pos += 1;
+            mod_atom(cs, pos, d, m)
+        }
+        '-' => {
+            *pos += 1;
+            match mod_atom(cs, pos, d, m)? {
+                ModVal::Known(v) => Some(ModVal::Known((-v).rem_euclid(m))),
+                ModVal::Unknown => Some(ModVal::Unknown),
+            }
+        }
+        '(' => {
+            *pos += 1;
+            let v = mod_sum(cs, pos, d, m)?;
+            if *pos >= cs.len() || cs[*pos] != ')' {
+                return None;
+            }
+            *pos += 1;
+            Some(v)
+        }
+        c if c.is_ascii_digit() => {
+            let s = *pos;
+            while *pos < cs.len() && cs[*pos].is_ascii_digit() {
+                *pos += 1;
+            }
+            let digits: String = cs[s..*pos].iter().collect();
+            Some(ModVal::Known(
+                digits.parse::<i64>().ok()?.rem_euclid(m),
+            ))
+        }
+        c if c.is_ascii_alphabetic() || c == '_' => {
+            let s = *pos;
+            while *pos < cs.len() && (cs[*pos].is_ascii_alphanumeric() || cs[*pos] == '_') {
+                *pos += 1;
+            }
+            let ident: String = cs[s..*pos].iter().collect();
+            match d.get(&ident) {
+                Some(raw) => eval_mod(raw, d, m).map(ModVal::Known),
+                None => Some(ModVal::Unknown),
+            }
+        }
+        _ => None, // キャスト・関数呼び出し・添字などは扱わない (呼び出し側で Unknown 扱い)
+    }
+}
+
 /// `(int*)&sA[r][c]` の平坦化。2 次元宣言では `r * inner + c`。
+///
 /// 行と列は**別々に**解決する (行が記号でも列が数値ならアラインメントは列だけで決まる)。
 ///
 /// 列が丸ごと数値に解決できなくても、列の式の中で**解決できる部分式**が
@@ -1722,6 +1985,8 @@ fn smem_table(
                             cap: inner,
                             inner: None,
                             stride: parent.stride,
+                            pre8: parent.pre8,
+                            dyn_base: parent.dyn_base,
                         },
                     );
                     *aliases += 1;
@@ -1760,6 +2025,14 @@ fn smem_table(
         } else {
             eval(tail.trim_start_matches('+').trim(), d)
         };
+        // s177/P34: 記号オフセットでも **8 で割った剰余** は決まることがある
+        // (`PF_BK * (dh + 1)` は PF_BK=8 なので 0)。これを積まないと、別名の基点が
+        // 奇数要素ずれていても列の錨だけで「整列」と判定してしまう。
+        let off_expr = tail.trim_start_matches('+').trim();
+        let pre8 = base_obj.pre8.and_then(|p| {
+            eval_mod(off_expr, d, 8)
+                .map(|r| (p + r.saturating_mul(base_obj.stride)).rem_euclid(8))
+        });
         let cap = match off {
             Some(off) if is_dyn => i64::MAX,
             Some(off) => (base_obj.cap - off).max(0),
@@ -1774,6 +2047,57 @@ fn smem_table(
                 cap,
                 inner: None,
                 stride: base_obj.stride,
+                pre8,
+                dyn_base: base_obj.dyn_base,
+            },
+        );
+    }
+
+    // ---- 2 パス目: 間接キャストの宛先ポインタ (`int *p = (int*)&sA[r][c];`) ----
+    // 1 パス目は右辺が名前 (または `&名前[..]`) で始まる別名しか拾わないため、
+    // 「キャストの結果をポインタ変数に入れる」形は表に入らず、以降の `*(int*)p` が
+    // smem 由来と判定されなかった (P3-3 の既知の限界 3)。ここで登録すると、
+    // キャストそのもの (間接形) と、そのポインタ越しのキャストの両方が同じ
+    // 整列・境界判定に乗る。オフセットが記号で上限を切れない静的配列は登録しない
+    // (1 パス目と同じ方針 = 上限を主張できないものは主張しない)。
+    for line in src.lines() {
+        let Some(eq) = line.find('=') else {
+            continue;
+        };
+        let Some(ptr) = ptr_name_before_eq(line, eq) else {
+            continue;
+        };
+        if table.contains_key(&ptr) {
+            continue;
+        }
+        let rhs = line[eq + 1..].trim().trim_end_matches(';').trim();
+        let Some(c) = indirect_casts4(rhs).into_iter().next() else {
+            continue;
+        };
+        let Some(parent) = table.get(&c.obj).cloned() else {
+            continue;
+        };
+        let off = match flatten(&parent, &c.idx, d, src) {
+            Flat::Resolved(v) => v,
+            _ => continue,
+        };
+        let cap = if parent.dyn_base {
+            i64::MAX
+        } else {
+            (parent.cap - off).max(0)
+        };
+        let pre8 = parent
+            .pre8
+            .map(|p| (p + off.saturating_mul(parent.stride)).rem_euclid(8));
+        table.insert(
+            ptr,
+            SmemObj {
+                name: parent.name.clone(),
+                cap,
+                inner: None,
+                stride: parent.stride,
+                pre8,
+                dyn_base: parent.dyn_base,
             },
         );
     }
@@ -1840,84 +2164,164 @@ fn scan_kernels(sources: &[(String, String)]) -> Scan {
         }
 
         // ---- 4 バイトキャストの列挙 ----
+        // 直接形 (`*(int*)&..`) と間接形 (`int *p = (int*)&..`) を同じ判定に通す
+        // (s177/P34: 間接形は旧版の走査器から丸ごと見えていなかった)。
         for (i, line) in src.lines().enumerate() {
             let ln = i + 1;
             for c in find_casts4(line) {
-                let Some(obj) = table.get(&c.obj) else {
-                    continue; // smem 由来でない (引数・グローバル配列・レジスタ)
-                };
-                sc.casts_seen += 1;
-                let site = |off: i64| SmemCast {
-                    file: file.clone(),
-                    ty: c.ty.clone(),
-                    obj: obj.name.clone(),
-                    off,
-                };
-                // バイトオフセット = 平坦化要素番号 * 要素幅 (char=1 / それ以外=4)
-                match flatten(obj, &c.idx, &d, &src) {
-                    Flat::Resolved(off) => {
-                        if obj.inner.is_some() {
-                            sc.rows_checked += 1; // 数値行の 2 次元参照も検査済みに数える
-                        }
-                        let bytes = off.saturating_mul(obj.stride);
-                        let aligned = bytes % 4 == 0 && bytes >= 0;
-                        let inbounds = off >= 0 && off + 4 <= obj.cap;
-                        if aligned && inbounds {
-                            sc.ok_casts.push(site(off));
-                        } else {
-                            sc.bad_casts.push((site(off), ln, line.trim().to_string()));
-                        }
-                    }
-                    // 行が記号 (ループ変数・blockIdx 由来) でも、行ストライドが 4 の倍数なら
-                    // 平坦化オフセットの 4 バイト整列は列だけで決まる。
-                    // 条件: 行ストライドが 4 の倍数 / 列の錨 + 4 が行幅以内 /
-                    //       列の錨のバイト位置が 4 の倍数。
-                    // 行の上限は検査しない (ループ上下限はカーネルごとの別の不変条件。
-                    // ここで見るのはアラインメントと列方向の境界だけ。REPORT に残件として記載)。
-                    Flat::SymbolicRow { col, row_known } => {
-                        sc.rows_checked += 1;
-                        let col_bytes = col.saturating_mul(obj.stride);
-                        let col_aligned = col >= 0 && col_bytes % 4 == 0;
-                        // 2 次元なら行ストライドと列方向の境界も検査する。1 次元
-                        // (動的 smem の別名など) は行の概念が無いのでアラインメントだけ。
-                        let (row_ok, col_inbounds, why) = match obj.inner {
-                            Some(inner) => (
-                                (inner * obj.stride) % 4 == 0,
-                                col + 4 <= inner,
-                                format!(
-                                    "行 {:?} / 行ストライド {} 要素 * {}B = {}B / 行幅 {inner}",
-                                    row_known,
-                                    inner,
-                                    obj.stride,
-                                    inner * obj.stride
-                                ),
-                            ),
-                            None => (
-                                true,
-                                true,
-                                "1 次元 (上限はホストが渡すバイト数なのでアラインのみ検査)"
-                                    .to_string(),
-                            ),
-                        };
-                        if row_ok && col_aligned && col_inbounds {
-                            sc.symbolic_ok += 1;
-                            sc.symbolic_sites.push(site(col_bytes));
-                        } else {
-                            sc.bad_casts.push((
-                                site(col_bytes),
-                                ln,
-                                format!("{} [錨 {col} ({}B) / {why}]", line.trim(), col_bytes),
-                            ));
-                        }
-                    }
-                    Flat::Unresolved => sc
-                        .unresolved_casts
-                        .push((file.clone(), ln, line.trim().to_string())),
-                }
+                classify_cast(file, ln, line, &c, &table, &d, &src, &mut sc, false);
+            }
+            for c in indirect_casts4(line) {
+                classify_cast(file, ln, line, &c, &table, &d, &src, &mut sc, true);
             }
         }
     }
     sc
+}
+
+/// 1 件の 4/8 バイトキャストを分類して [`Scan`] に積む。
+///
+/// 判定は 3 つ:
+///   - **整列**: 宛先バイト位置 (別名の基点ずれ `pre8` + 平坦化オフセット * 要素幅) が
+///     キャスト先の幅で割り切れるか。`float2` (8B) は 8 で割る。
+///   - **範囲**: 平坦化オフセット + 幅 が宣言の総要素数以内か。
+///   - **行の上限** (s177/P34): 行が数値に解決できたときは、行が宣言行数以内で
+///     平坦端も総要素数以内か。行が記号のままなら検査しない (残件)。
+///
+/// 整列を **主張できない** ものは `unresolved` に積む (0 とみなして緑にしない):
+///   - 別名の基点剰余が静的に決まらない (`pre8 == None`)
+///   - 8 バイト型なのに基点が静的配列 (要素幅 4 しか保証されない)
+fn classify_cast(
+    file: &str,
+    ln: usize,
+    line: &str,
+    c: &CastSite,
+    table: &HashMap<String, SmemObj>,
+    d: &HashMap<String, String>,
+    body: &str,
+    sc: &mut Scan,
+    indirect: bool,
+) {
+    let Some(obj) = table.get(&c.obj) else {
+        return; // smem 由来でない (引数・グローバル配列・レジスタ)
+    };
+    if indirect {
+        sc.indirect_seen += 1;
+    } else {
+        sc.casts_seen += 1;
+    }
+    let width = cast_width(&c.ty);
+    let site = |off: i64| SmemCast {
+        file: file.to_string(),
+        ty: c.ty.clone(),
+        obj: obj.name.clone(),
+        off,
+    };
+    let judgeable = obj.pre8.is_some() && (width == 4 || obj.dyn_base);
+    let base = obj.pre8.unwrap_or(0);
+    match flatten(obj, &c.idx, d, body) {
+        Flat::Resolved(off) => {
+            if obj.inner.is_some() {
+                sc.rows_checked += 1; // 数値行の 2 次元参照も検査済みに数える
+            }
+            if !judgeable {
+                sc.unresolved_casts
+                    .push((file.to_string(), ln, line.trim().to_string()));
+                return;
+            }
+            let bytes = base.saturating_add(off.saturating_mul(obj.stride));
+            let aligned = off >= 0 && bytes.rem_euclid(8) % width == 0;
+            let inbounds = off >= 0 && off + width <= obj.cap;
+            if aligned && inbounds {
+                if indirect {
+                    sc.indirect_sites.push(site(off));
+                } else {
+                    sc.ok_casts.push(site(off));
+                }
+            } else {
+                sc.bad_casts.push((
+                    site(off),
+                    ln,
+                    format!("{} [先頭 {bytes}B / 幅 {width}B]", line.trim()),
+                ));
+            }
+        }
+        // 行が記号 (ループ変数・blockIdx 由来) でも、行ストライドが幅の倍数なら
+        // 平坦化オフセットの整列は列だけで決まる。
+        Flat::SymbolicRow { col, row_known } => {
+            sc.rows_checked += 1;
+            // 列方向に必要な要素数。4 バイト型は旧版の `col + 4` をそのまま維持し
+            // (これまでの検査を弱めない)、8 バイト型は幅 / 要素幅で数える。
+            let need = if width == 4 {
+                4
+            } else {
+                (width + obj.stride - 1) / obj.stride
+            };
+            let col_bytes = base.saturating_add(col.saturating_mul(obj.stride));
+            let col_aligned = col >= 0 && col_bytes.rem_euclid(8) % width == 0;
+            let (row_ok, col_inbounds, why) = match obj.inner {
+                Some(inner) => (
+                    inner.saturating_mul(obj.stride) % width == 0,
+                    col + need <= inner,
+                    format!(
+                        "行 {row_known:?} / 行ストライド {} 要素 * {}B = {}B / 行幅 {inner} / \
+                         幅 {width}B",
+                        inner,
+                        obj.stride,
+                        inner.saturating_mul(obj.stride)
+                    ),
+                ),
+                None => (
+                    true,
+                    true,
+                    "1 次元 (上限はホストが渡すバイト数なのでアラインのみ検査)".to_string(),
+                ),
+            };
+            // s177/P34: 行が数値に解決できたら **行の上限** も検査する。旧版は
+            // `row_known` を失敗メッセージに出すだけで、行が宣言外でも緑だった。
+            //
+            // 残件 (限界 1 の残り): 行が記号のときは検査しない。実カーネルの行は
+            // `sA[ty * 8 + u][c0]` (ty = threadIdx.y) のように **threadIdx / blockIdx
+            // 由来** で、`.cu` の中に静的な上限が無い (上限は cuda.rs の起動ブロック
+            // (16,16,1) が唯一の根拠)。ハード上限 1024 で代替すると ty*8+u <= 8191 と
+            // なり 128 行の宣言に対して常に「越える」= 偽陽性になるので、ここでは
+            // 判定しない。起動ブロックを import する拡張は REPORT_P34.md の残件。
+            let mut row_bad: Option<String> = None;
+            if let (Some(r), Some(inner)) = (row_known, obj.inner) {
+                sc.row_bound_checked += 1;
+                let rows = obj.cap / inner.max(1);
+                let flat_end = r
+                    .saturating_mul(inner)
+                    .saturating_add(col)
+                    .saturating_add(need);
+                if !(r >= 0 && r < rows && flat_end <= obj.cap) {
+                    row_bad = Some(format!(
+                        "行 {r} が宣言 {rows} 行 / 平坦端 {flat_end} が総要素 {} を越える",
+                        obj.cap
+                    ));
+                }
+            }
+            if let Some(m) = row_bad {
+                sc.bad_casts
+                    .push((site(col_bytes), ln, format!("{} [{m}]", line.trim())));
+            } else if !judgeable {
+                sc.unresolved_casts
+                    .push((file.to_string(), ln, line.trim().to_string()));
+            } else if row_ok && col_aligned && col_inbounds {
+                sc.symbolic_ok += 1;
+                sc.symbolic_sites.push(site(col_bytes));
+            } else {
+                sc.bad_casts.push((
+                    site(col_bytes),
+                    ln,
+                    format!("{} [錨 {col} ({}B) / {why}]", line.trim(), col_bytes),
+                ));
+            }
+        }
+        Flat::Unresolved => sc
+            .unresolved_casts
+            .push((file.to_string(), ln, line.trim().to_string())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2088,15 +2492,51 @@ fn kernel_source_4byte_smem_casts_are_aligned_on_all_kernels() {
             .join("\n")
     );
 
+    // ---- s177/P34: float2 は **8 バイト幅** として判定されていること ----
+    // 旧版は float2 も 4 バイト型と同じ `% 4` で見ていた。ここでは
+    // 「3 件とも動的 smem の別名越しに解決できている」ことと、「錨が 8 バイト
+    // 単位 (corr_sm[rc*2] = 8B / s_sm[.. PF_BK] = 32B)」であることを固定する。
+    // どちらかが崩れると、列が奇数のとき 4 バイト整列しか無い番地を緑と判定する。
+    let f2: Vec<&SmemCast> = sc
+        .symbolic_sites
+        .iter()
+        .filter(|c| c.file == "kernels_elem.cu" && c.ty == "float2")
+        .collect();
+    assert_eq!(
+        f2.len(),
+        3,
+        "kernels_elem.cu の float2 荷載 3 件 (corr_sm + s_sm 2 件) を判定できていない: {f2:?}"
+    );
+    assert!(
+        f2.iter().any(|c| c.off == 8),
+        "corr_sm[rc * 2] の 8 バイト錨 (8B) が記録されていない: {f2:?}"
+    );
+    assert_eq!(
+        f2.iter().filter(|c| c.off == 32).count(),
+        2,
+        "s_sm[r0 * PF_BK + kk] の 8 バイト錨 (32B) が 2 件記録されていない: {f2:?}"
+    );
+    // 実カーネルに「間接キャスト」は無い (増えたら判定を通すこと)。
+    assert_eq!(
+        sc.indirect_seen, 0,
+        "smem への間接キャスト (`int *p = (int*)&sA[..]`) を {} 件検出した: 判定は \
+         classify_cast が行うので、期待値を更新して緑を確認すること",
+        sc.indirect_seen
+    );
+
     println!(
         "smem 4-byte casts: {} seen ({} numeric-ok, {} symbolic-row-ok, {} known-bad, \
-         {} unresolved); {} double-index refs checked; {} row aliases",
+         {} unresolved); {} indirect ({} ok); {} double-index refs checked; \
+         {} row bounds checked; {} row aliases",
         sc.casts_seen,
         sc.ok_casts.len(),
         sc.symbolic_ok,
         known.len(),
         sc.unresolved_casts.len(),
+        sc.indirect_seen,
+        sc.indirect_sites.len(),
         sc.rows_checked,
+        sc.row_bound_checked,
         sc.aliases
     );
     }
@@ -2279,6 +2719,188 @@ extern "C" __global__ void fake_good(const signed char *src) {
     let empty = scan_kernels(&[]);
     assert_eq!(empty.casts_seen, 0);
     assert!(empty.bad_casts.is_empty());
+}
+
+/// s177 (P34): 追加した 3 つの判定の自己検証。
+///
+/// P3-3 の既知の限界のうち、静的に決められるものを実際に検査する:
+///  1. **float2 の 8 バイト整列** (旧版は `% 4` で判定していた): 動的 smem の別名を
+///     通る記号列でも、列の刻みが偶数かどうかで整列が決まる。`kk += 2` は緑、
+///     `kk += 1` は **報告** されること。
+///  2. **別名の基点ずれ** (`float *s_sm = sh + 1;`): 列が 0 でも基点が 4 バイト
+///     ずれていれば float2 は未アライン。旧版は列だけを見て緑にしていた。
+///  3. **間接キャスト / ポインタ変数越しのキャスト** (`int *p = (int*)&sA[r][c];`):
+///     旧版の走査器は `*(T*)` の形しか見ないので 1 件も拾えなかった。
+///  4. **記号列を持つキャストの行の上限** (行が数値に解決できる場合): 宣言行数外の
+///     行は報告されること。
+///
+/// どれも「壊した側が赤・正しい側が緑」の対で確かめる (片方だけだと
+/// 「常に赤」の検査でも通ってしまう)。
+#[test]
+fn kernel_cast_scanner_checks_float2_alias_indirect_and_row_bound() {
+    // ---- (1) float2 は 8 バイト整列 (列の刻みが偶数なら緑) ----
+    let f2 = |step: &str| {
+        format!(
+            r#"
+#define PF_BK 8
+#define PF_BQ 64
+extern "C" __global__ void fake_f2(float *o, int dh) {{
+    extern __shared__ float sh[];
+    float *v_sm = sh + PF_BQ * (dh + 1);
+    float *s_sm = v_sm + PF_BK * (dh + 1);
+    for (int kk = 0; kk < PF_BK; kk += {step}) {{
+        const float2 p = *reinterpret_cast<const float2 *>(&s_sm[kk]);
+        o[kk] = p.x;
+    }}
+}}
+"#
+        )
+    };
+    let sc = scan_kernels(&[("fake_f2_good.cu".to_string(), f2("2"))]);
+    assert!(
+        sc.bad_casts.is_empty(),
+        "kk += 2 (8B 整列) の float2 荷載が違反扱いされた: {:?}",
+        sc.bad_casts
+    );
+    assert_eq!(
+        sc.symbolic_ok, 1,
+        "動的 smem の別名越しの float2 を 1 件も判定できていない: {sc:?}"
+    );
+    assert!(sc.unresolved_casts.is_empty(), "{:?}", sc.unresolved_casts);
+
+    // 刻みを 1 にすると列の錨が 1 要素 = 4 バイトになり、float2 (8B) は未アライン。
+    // 旧版の `% 4` 判定ではここが緑のままだった (これが限界 2 の中身)。
+    let sc = scan_kernels(&[("fake_f2_bad.cu".to_string(), f2("1"))]);
+    assert!(
+        sc.bad_casts
+            .iter()
+            .any(|(s, _, t)| s.ty == "float2" && s.off == 4 && t.contains("錨 1")),
+        "kk += 1 の float2 (4B 整列のみ) を検出できない: {:?}",
+        sc.bad_casts
+    );
+
+    // ---- (2) 別名の基点が 4 バイトずれている場合 ----
+    let alias_off = |off: &str| {
+        format!(
+            r#"
+extern "C" __global__ void fake_alias(float *o, int dh) {{
+    extern __shared__ float sh[];
+    float *s_sm = sh + {off};
+    const float2 p = *reinterpret_cast<const float2 *>(&s_sm[0]);
+    o[0] = p.x;
+}}
+"#
+        )
+    };
+    let sc = scan_kernels(&[("fake_alias_odd.cu".to_string(), alias_off("1"))]);
+    assert!(
+        sc.bad_casts
+            .iter()
+            .any(|(s, _, t)| s.ty == "float2" && t.contains("先頭 4B")),
+        "基点が 1 要素 (4B) ずれた別名越しの float2 を検出できない \
+         (別名オフセットを整列判定に積んでいない): {:?}",
+        sc.bad_casts
+    );
+    // 偶数要素ずれ (8B) なら緑 — 「常に赤」の検査ではないことの確認。
+    let sc = scan_kernels(&[("fake_alias_even.cu".to_string(), alias_off("2"))]);
+    assert!(
+        sc.bad_casts.is_empty(),
+        "8B ずれの別名越しの float2 が違反扱いされた: {:?}",
+        sc.bad_casts
+    );
+
+    // ---- (3) 間接キャスト / ポインタ変数越しのキャスト ----
+    let indirect = |col: &str| {
+        format!(
+            r#"
+#define SP 36
+#define TILE 8
+#define R 3
+#define C 8
+extern "C" __global__ void fake_indirect(const signed char *src) {{
+    __shared__ signed char sA[TILE][SP];
+    int *p = (int*)&sA[R][{col}];
+    *(int*)p = 0;
+}}
+"#
+        )
+    };
+    // 正しい側: 列 8 (4 の倍数) なら間接キャストも p 越しのキャストも緑。
+    let sc = scan_kernels(&[("fake_indirect_good.cu".to_string(), indirect("C"))]);
+    assert!(
+        sc.bad_casts.is_empty(),
+        "整列した間接キャストが違反扱いされた: {:?}",
+        sc.bad_casts
+    );
+    assert_eq!(
+        sc.indirect_seen, 1,
+        "間接キャスト `int *p = (int*)&sA[R][C];` を検出できていない: {sc:?}"
+    );
+    assert_eq!(
+        sc.indirect_sites.len(),
+        1,
+        "間接キャストが整列・範囲内と判定されていない: {sc:?}"
+    );
+    // ポインタ変数越し (`*(int*)p`) も smem 由来として判定されていること。
+    assert!(
+        sc.ok_casts.iter().any(|c| c.obj == "sA" && c.ty == "int"),
+        "`*(int*)p` が smem 由来のキャストとして判定されていない: {sc:?}"
+    );
+
+    // 壊した側: 列 9 (奇数) なら、キャストそのものと p 越しの両方が報告される。
+    let sc = scan_kernels(&[("fake_indirect_bad.cu".to_string(), indirect("C + 1"))]);
+    assert!(
+        sc.indirect_seen >= 1,
+        "壊した間接キャストを検出できていない: {sc:?}"
+    );
+    let bad = sc
+        .bad_casts
+        .iter()
+        .filter(|(s, _, _)| s.obj == "sA")
+        .count();
+    assert!(
+        bad >= 2,
+        "奇数 col の間接キャストが 2 件 (キャスト本体 + p 越し) 報告されていない: {:?}",
+        sc.bad_casts
+    );
+
+    // ---- (4) 記号列を持つキャストの行の上限 ----
+    let row = |r: &str| {
+        format!(
+            r#"
+#define SP 36
+#define TILE 8
+extern "C" __global__ void fake_row(const signed char *src) {{
+    __shared__ signed char sA[TILE][SP];
+    for (int c = 0; c < SP; c += 4) {{
+        *(int*)&sA[{r}][c] = 0;
+    }}
+}}
+"#
+        )
+    };
+    let sc = scan_kernels(&[("fake_row_good.cu".to_string(), row("TILE - 1"))]);
+    assert!(
+        sc.bad_casts.is_empty(),
+        "最終行 (行 7) のキャストが違反扱いされた: {:?}",
+        sc.bad_casts
+    );
+    assert_eq!(
+        sc.row_bound_checked, 1,
+        "行が数値に解決できたキャストの行上限を検査していない: {sc:?}"
+    );
+    let sc = scan_kernels(&[("fake_row_bad.cu".to_string(), row("9"))]);
+    assert_eq!(
+        sc.row_bound_checked, 1,
+        "行上限の検査が走っていない: {sc:?}"
+    );
+    assert!(
+        sc.bad_casts
+            .iter()
+            .any(|(_, _, t)| t.contains("行 9") && t.contains("宣言 8 行")),
+        "宣言 8 行の配列に対する行 9 のキャストを検出できない (限界 1): {:?}",
+        sc.bad_casts
+    );
 }
 /// s100 (P3-3) 既知の潜在不具合 (未修正・このテストでは固定しない): `dno_attention`
 /// (decode 用) の block 間 reduction が共有メモリ `dh` floats に対して

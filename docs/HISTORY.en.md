@@ -3651,3 +3651,38 @@ External implementations referenced in P19 and their licensing status (the same 
   cuda.rs / qwen35.rs and restoring) were caught by the new tests.
 - **Not measured**: GPU execution, the anchors, ms/token (no GPU in this container). The work
   report is uncommitted (`REPORT_P31.md`).
+
+### s177: Task P34 - extending the P3-3 shared-memory cast scanner (2026-10-23) done
+
+- **Implementation**: none (tests only). The P3-3 scanner in
+  `crates/denno-engine/tests/kernel_invariants.rs` (s104/s105) was extended so the limits that
+  can be decided statically are now actually checked. No `.cu` / `.ptx` / product code / `cuda.rs`
+  changes.
+- **Limit 2 (float2 alignment)**: the old scanner treated `float2` as a 4-byte type (`% 4`) and
+  ignored the alias base offset. `SmemObj` now carries `pre8` (the base byte offset mod 8) and
+  `dyn_base`, and `eval_mod` (modular arithmetic: an unknown identifier only folds to 0 when it is
+  multiplied by 0) resolves the residue of symbolic offsets such as `PF_BK * (dh + 1)`. The
+  modulus comes from `cast_width` (`float2` = 8 B); 8-byte types are only claimed when the base is
+  dynamic shared memory (16-byte aligned). The three real casts (`corr_sm[rc * 2]`, two `s_sm`)
+  are green with 8-byte anchors (8 B / 32 B).
+- **Limit 3 (casts through an intermediate pointer)**: new `indirect_casts4` sees
+  `int *p = (int*)&sA[r][c];` (the old scanner only matched `*(T*)`, so it saw none) and a second
+  pass in `smem_table` registers the pointer variable, so `*(int*)p` is judged by the same
+  alignment/bounds rules.
+- **Limit 1 (row bound)**: for a `Flat::SymbolicRow` whose row resolves numerically, the row is now
+  checked against the declared row count and the flat end against the total element count (the old
+  code only printed `row_known`). Rows derived from `threadIdx` / `blockIdx` remain unchecked: the
+  `.cu` has no static bound, and substituting the hardware limit 1024 makes `ty * 8 + u <= 8191`
+  always exceed a 128-row declaration (false positive). Counterexample:
+  `*(const int*)&sA[ty * 8 + u][c0]`.
+- **Self-check**: one new test (the 16th) feeds four deliberately broken fixtures - float2 column
+  step `kk += 1`, alias base `sh + 1`, an odd-column indirect cast (both the cast itself and the
+  dereference through `p`), and row 9 of an 8-row declaration - and requires each to be reported
+  while the correct variants (`kk += 2`, `sh + 2`, column 8, row 7) stay green. Real-kernel counts
+  are unchanged: 9 casts / 9 symbolic-row-ok / 0 unresolved.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` = **321 passed /
+  0 failed / 37 ignored** (identical to the baseline), `--test kernel_invariants` =
+  **16 passed / 0 failed** (15 existing + 1 new).
+- **Not measured**: GPU execution, the anchors, ms/token (no GPU in this container). No new `.cu`
+  violation was found (`KNOWN_BAD_4B_CASTS` stays empty). The work report is uncommitted
+  (`REPORT_P34.md`).
