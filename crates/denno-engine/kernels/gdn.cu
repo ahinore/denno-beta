@@ -325,6 +325,190 @@ extern "C" __global__ void dno_gdn_chunk_pre(
     }
 }
 
+// ---------------------------------------------------------------------------
+// s239 (P36): pass 1 の 4 レーン版 (DK=128 専用)。
+//
+// 旧版は「スレッド = 列」で W/M の 1 列 (128 float × 2 = 2,080 B) をローカル
+// メモリに置いていた。実測でこのカーネルは gdn_scan 相 (65k で 6.92 s・18.9%)
+// の主成分で、容量ではなく **ローカルアクセス命令数** が律速だった (配列を
+// 2,080 → 1,056 B に半減しても 9.75 → 9.77 s で不変・レジスタ化すると 32
+// スレッド/block まで並列度が落ちて 11.02 s)。
+//
+// そこで列 c を 4 レーンで分担し、1 レーンあたり 32 行だけを持つ:
+//   threadIdx.x = c * 4 + lane,  r0 = lane * 32
+// W/M はレジスタ常駐 (ローカル 0 B) になり、ローカルアクセス命令は 1/4。
+// 内積 (skv / mk) は 4 レーンの木縮約 (shfl_xor 1 → 2)。
+//
+// 数値: 旧版は 128 項の昇順逐次和、こちらは 4 つの部分和の木縮約なので
+// **丸め順が変わり bit 一致しない**。GDN は bit 一致不要契約 (決定論のみ) だが、
+// アンカー v6_1b/v6_2b/v6_1b_full は GDN 層を通るため、本カーネルを既定に
+// する際はアンカーの再基準化が必要。既定は旧カーネル (ホスト側 env で切替)。
+// ---------------------------------------------------------------------------
+#define DNO_GDN_PRE_LANES 4
+
+template <int DK>
+__device__ __forceinline__ void dno_gdn_pre_l4_body(
+    const float* __restrict__ qkv,        // [n, conv_dim]
+    const float* __restrict__ beta,       // [n, nv]
+    const float* __restrict__ alpha,      // [n, nv]
+    const float* __restrict__ conv_st_in, // [conv_dim, cs]
+    const float* __restrict__ wconv,      // [conv_dim, d_conv]
+    const float* __restrict__ wa,         // [nv]
+    const float* __restrict__ wdt,        // [nv]
+    float* __restrict__ w_out,            // [n_chunks, nv, dk, dv]
+    float* __restrict__ m_out,            // [n_chunks, nv, dk, dk]
+    int n, int chunk_len, int nk, int nv, int conv_dim, int cs, float eps,
+    int ci, int h)
+{
+    constexpr int NL = DNO_GDN_PRE_LANES;
+    constexpr int NR = DK / NL; // 1 レーンあたりの行数
+    const int kh = h % nk;      // タイル repeat 規約 (gdn.rs と同一)
+    const int kd_total = nk * DK;
+    const int tid = threadIdx.x;
+    const int c = tid / NL;   // 列 (0..DK-1)
+    const int lane = tid % NL; // レーン (0..NL-1)
+    const int r0 = lane * NR;
+    const int t0 = ci * chunk_len;
+    const int t1 = min(n, t0 + chunk_len);
+
+    extern __shared__ float sh[];
+    float* k_sh = sh;        // [DK]
+    float* v_sh = sh + DK;   // [DK]
+    float* sc = sh + 2 * DK; // sc[0]=k_inv sc[1]=eg sc[2]=beta
+
+    // ---- 列ローカル: W 列の担当 32 行 (S=0 起点) と M 列 (恒等行列) ---------
+    float Wl[NR];
+    float Ml[NR];
+#pragma unroll
+    for (int i = 0; i < NR; ++i) {
+        Wl[i] = 0.0f;
+        Ml[i] = ((r0 + i) == c) ? 1.0f : 0.0f;
+    }
+
+    // ---- conv 重み + chunk 開始時点のウィンドウ (レーン 0 のみが使う) --------
+    const int kch = kd_total + kh * DK + c;
+    const int vch = 2 * kd_total + h * DK + c;
+    float wk[4], wv[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        wk[j] = wconv[kch * 4 + j];
+        wv[j] = wconv[vch * 4 + j];
+    }
+    float ink[3], inv[3];
+    for (int j = 0; j < cs; ++j) {
+        ink[j] = dno_gdn_conv_input(qkv, conv_st_in, kch, t0, j, conv_dim, cs);
+        inv[j] = dno_gdn_conv_input(qkv, conv_st_in, vch, t0, j, conv_dim, cs);
+    }
+
+    for (int t = t0; t < t1; ++t) {
+        __syncthreads();
+        if (lane == 0) {
+            const long long row = (long long)t * conv_dim;
+            const float xk = qkv[row + kch];
+            const float xv = qkv[row + vch];
+            const float acck = wk[0] * ink[0] + wk[1] * ink[1] + wk[2] * ink[2] + wk[3] * xk;
+            const float accv = wv[0] * inv[0] + wv[1] * inv[1] + wv[2] * inv[2] + wv[3] * xv;
+            ink[0] = ink[1]; ink[1] = ink[2]; ink[2] = xk;
+            inv[0] = inv[1]; inv[1] = inv[2]; inv[2] = xv;
+            k_sh[c] = acck / (1.0f + expf(-acck)); // silu
+            v_sh[c] = accv / (1.0f + expf(-accv));
+        }
+        __syncthreads();
+
+        // ---- k L2 正規化スケール + ゲート (旧版と同じく単一スレッド逐次和) ---
+        if (tid == 0) {
+            float s = 0.0f;
+            for (int i = 0; i < DK; ++i) {
+                s += k_sh[i] * k_sh[i];
+            }
+            sc[0] = 1.0f / sqrtf(s + eps);
+            const float a = alpha[(long long)t * nv + h] + wdt[h];
+            const float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
+            sc[1] = expf(wa[h] * sp);
+            const float bt = beta[(long long)t * nv + h];
+            sc[2] = 1.0f / (1.0f + expf(-bt));
+        }
+        __syncthreads();
+        if (lane == 0) {
+            k_sh[c] *= sc[0];
+        }
+        __syncthreads();
+
+        const float eg = sc[1];
+        const float b = sc[2];
+
+        // ---- W ステップ: 担当 32 行の decay → 部分内積 → 木縮約 → 更新 -------
+#pragma unroll
+        for (int i = 0; i < NR; ++i) {
+            Wl[i] *= eg;
+        }
+        float skv = 0.0f;
+#pragma unroll
+        for (int i = 0; i < NR; ++i) {
+            skv += k_sh[r0 + i] * Wl[i];
+        }
+        skv += __shfl_xor_sync(0xffffffffu, skv, 1);
+        skv += __shfl_xor_sync(0xffffffffu, skv, 2);
+        const float dlt = b * (v_sh[c] - skv);
+#pragma unroll
+        for (int i = 0; i < NR; ++i) {
+            Wl[i] += k_sh[r0 + i] * dlt;
+        }
+
+        // ---- M ステップ: 同型 --------------------------------------------------
+#pragma unroll
+        for (int i = 0; i < NR; ++i) {
+            Ml[i] *= eg;
+        }
+        float mk = 0.0f;
+#pragma unroll
+        for (int i = 0; i < NR; ++i) {
+            mk += k_sh[r0 + i] * Ml[i];
+        }
+        mk += __shfl_xor_sync(0xffffffffu, mk, 1);
+        mk += __shfl_xor_sync(0xffffffffu, mk, 2);
+#pragma unroll
+        for (int i = 0; i < NR; ++i) {
+            Ml[i] -= b * k_sh[r0 + i] * mk;
+        }
+    }
+
+    // ---- 書き戻し ([ci][h][r][c] 行優先・レーンが担当行を書く) --------------
+    const long long base = ((long long)(ci * nv + h)) * DK;
+#pragma unroll
+    for (int i = 0; i < NR; ++i) {
+        w_out[(base + r0 + i) * DK + c] = Wl[i];
+        m_out[(base + r0 + i) * DK + c] = Ml[i];
+    }
+}
+
+// 引数は旧 dno_gdn_chunk_pre と完全に同一 (ホストの args 配列を共有する)。
+// dk / dv は DK=128 固定なので未使用 (ホストが dk==dv==128 を確認して選ぶ)。
+extern "C" __global__ void
+// 4 レーン版は 512 スレッド/block (128 列 × 4)。素で組むと 137 regs になり
+// 512 × 137 > 65,536 で launch 自体が失敗するため、128 regs に上限を切る
+// (数 reg の spill は出るが、旧版の 2,080 B ローカルとは桁が違う)。
+__launch_bounds__(512, 1) dno_gdn_chunk_pre_l4(
+    const float* __restrict__ qkv,
+    const float* __restrict__ beta,
+    const float* __restrict__ alpha,
+    const float* __restrict__ conv_st_in,
+    const float* __restrict__ wconv,
+    const float* __restrict__ wa,
+    const float* __restrict__ wdt,
+    float* __restrict__ w_out,
+    float* __restrict__ m_out,
+    int n, int chunk_len, int nk, int nv, int dk, int dv, int conv_dim, int cs,
+    float eps)
+{
+    (void)dk;
+    (void)dv;
+    const int ci = blockIdx.x; // chunk
+    const int h = blockIdx.y;  // v-head
+    dno_gdn_pre_l4_body<128>(qkv, beta, alpha, conv_st_in, wconv, wa, wdt, w_out,
+                             m_out, n, chunk_len, nk, nv, conv_dim, cs, eps, ci, h);
+}
+
 // pass 2: chunk 先頭状態 Sinit の直列伝播 (grid=nv・block=dk、chunk ループは
 // ブロック内直列)。スレッド c が S の c 列を保持: Scol ← M[ci]·Scol + W[ci]
 // (j 昇順の内積 — gdn.rs pass 2 と同一順序)。Sinit[0] = S_in。
