@@ -1351,12 +1351,15 @@ impl Qwen35 {
         // (従来の forward_prefill 経路)。`false` = 直後に o_proj をデバイスで
         // 回す残差常駐経路で、ゲート済み att をデバイスに残せれば H2D を省ける。
         host_att_needed: bool,
+        // s247 (P47): `Some((q, k))` = q/k は既に pinned ステージングへ D2H 済み
+        // (`chain_qkv_prefill_q4_dev` の戻り値 `PfQkView`)。その場合 `buf_qg` /
+        // `buf_k` は**読まないし確保もしない** (747 MB の mmap をしない)。
+        // ホスト memcpy を挟まず同じバイト列を読むので値はビット同一。
+        pre_qk: Option<(&[f32], &[f32])>,
     ) -> AttnPlace {
         let heads = self.heads;
         let dh = self.dh;
         let kv_dim = self.kv_heads * dh;
-        fit_prefill_buf(buf_qg, n * fl.q_w.dims().1); // [n, heads*2*dh]
-        fit_prefill_buf(buf_k, n * fl.k_w.dims().1); // [n, kv_dim]
         // s240 (P44): 残差常駐経路は V を scratch に戻さない (D2H の宛先が
         // ホスト KV キャッシュの行そのもの = 下の prepare は v を触らない) ので
         // `buf_v` は使わない。fit すると n=65k で 266 MB を毎リクエスト
@@ -1367,15 +1370,38 @@ impl Qwen35 {
         // s240 (P44): `true` = v は既にキャッシュ行にある (D2H の宛先をそこにした)。
         let v_in_cache = qkv_precomputed;
         // s165 (P2): 残差常駐経路は q/k/v をデバイス (CH_PFH) から直接 GEMM して
-        // 出力だけを戻す (chain_qkv_prefill_q4_dev)。その場合はここで投影しない
-        // (バッファ長は上で合わせてあるので fit は no-op)。
+        // 出力だけを戻す (chain_qkv_prefill_q4_dev)。その場合はここで投影しない。
+        // s247 (P47): 確保 (fit) も投影と同じ条件の中に置く — `pre_qk` がある層では
+        // `buf_qg` / `buf_k` を 1 バイトも触らない (747 MB の mmap をしない)。
         if !qkv_precomputed {
+            fit_prefill_buf(buf_qg, n * fl.q_w.dims().1); // [n, heads*2*dh]
+            fit_prefill_buf(buf_k, n * fl.k_w.dims().1); // [n, kv_dim]
             self.lin(crate::prof::QKV, || {
                 fl.q_w.apply_bt_rows_into(buf_h, n, buf_qg); // [n, heads*2*dh]
                 fl.k_w.apply_bt_rows_into(buf_h, n, buf_k); // [n, kv_dim]
                 fl.v_w.apply_bt_rows_into(buf_h, n, buf_v); // [n, kv_dim]
             });
         }
+        // s247 (P47): q/k の読み出し元を決める (投影の後 = ここから先は読み取りだけ)。
+        // 残差常駐経路では D2H の宛先 (pinned ステージング) のスライスをそのまま
+        // 読む — ホスト memcpy を挟まないので値は同じバイト列。寸法が合わない
+        // ビューは使わない (デバッグビルドで検出)。
+        let (qg_src, k_src): (&[f32], &[f32]) = match pre_qk {
+            Some((q, k)) => {
+                debug_assert_eq!(
+                    q.len(),
+                    n * fl.q_w.dims().1,
+                    "qkv ビューの q が [n, qcols] でない"
+                );
+                debug_assert_eq!(
+                    k.len(),
+                    n * fl.k_w.dims().1,
+                    "qkv ビューの k が [n, kv_dim] でない"
+                );
+                (q, k)
+            }
+            None => (&buf_qg[..], &buf_k[..]),
+        };
         // s63: `full_attn_attend_head` は att_head に **加算** する
         // (`*a += pv * b`・k 昇順の逐次累積が bit 一致の根拠) ため、
         // 層をまたいで領域を再利用するときは毎層ゼロで初期化する。
@@ -1429,8 +1455,8 @@ impl Qwen35 {
                         self.pf_prepare_into(
                             fl,
                             q_out,
-                            &buf_qg[..],
-                            &buf_k[..],
+                            qg_src,
+                            k_src,
                             if v_in_cache { None } else { Some(&buf_v[..]) },
                             &mut *krows,
                             if v_in_cache { None } else { Some(&mut *vrows) },
@@ -1456,8 +1482,8 @@ impl Qwen35 {
             self.pf_prepare_into(
                 fl,
                 &mut buf_q[..],
-                &buf_qg[..],
-                &buf_k[..],
+                qg_src,
+                k_src,
                 if v_in_cache { None } else { Some(&buf_v[..]) },
                 krows,
                 if v_in_cache { None } else { Some(vrows) },
@@ -1479,7 +1505,7 @@ impl Qwen35 {
         let (place, _att_done) = crate::prof::time_layer_n_ev(crate::prof::ATT_FULL, li, n, || {
             #[cfg(feature = "cuda")]
             let place = self.full_attn_attend_gpu(
-                buf_qg,
+                qg_src,
                 buf_q,
                 cache,
                 li,
@@ -1506,8 +1532,8 @@ impl Qwen35 {
                     self.pf_prepare_into(
                         fl,
                         &mut buf_q[..],
-                        &buf_qg[..],
-                        &buf_k[..],
+                        qg_src,
+                        k_src,
                         if v_in_cache { None } else { Some(&buf_v[..]) },
                         krows,
                         if v_in_cache { None } else { Some(vrows) },
@@ -1537,7 +1563,7 @@ impl Qwen35 {
                         let i = t / heads;
                         let hh = t % heads;
                         self.full_attn_attend_head(
-                            &buf_qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
+                            &qg_src[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
                             &buf_q[i * heads * dh..(i + 1) * heads * dh],
                             kcr,
                             vcr,
@@ -2590,6 +2616,8 @@ impl Qwen35 {
                         // s172 (P12): 直後にホストの buf_att で o_proj する
                         // 従来経路なので、att は必ずホストへ戻す。
                         true,
+                        // s247 (P47): この経路は q/k を自分で投影する (`pre_qk` 無し)。
+                        None,
                     );
                     self.lin(crate::prof::OPROJ, || {
                         fl.o_w.apply_bt_rows_into(&buf_att, n, &mut buf_out)
@@ -3009,8 +3037,11 @@ impl Qwen35 {
                 // q/k/v はデバイス (CH_PFH) から直接 GEMM し、**値だけ**をホストへ
                 // 戻す (KV キャッシュはホストが正・prepare はホスト)。h2 の H2D は
                 // 発生しない (per-op 経路の 3 回の h2 H2D が消える)。
-                fit_prefill_buf(buf_qg, n * fl.q_w.dims().1);
-                fit_prefill_buf(buf_k, n * fl.k_w.dims().1);
+                //
+                // s247 (P47): q/k の D2H 宛先は chain が決める (pinned ステージング。
+                // ページロックできなければこの Vec へ直接)。ここで fit すると pinned が
+                // 効く層でも 747 MB を mmap + ゼロ埋めすることになるので、確保は chain
+                // に任せる (`buf_qg` / `buf_k` は空のまま = 読まれない)。
                 // s240 (P44): V は prepare で 1 ビットも変換されない (D2H で戻した
                 // バイト列を KV キャッシュの行へ写すだけ) ので、D2H の宛先を
                 // **ホスト KV キャッシュの行そのもの** にする。従来は scratch
@@ -3033,7 +3064,10 @@ impl Qwen35 {
                         cuda::q4_register_row_alias(f, &[&fl.q_w, &fl.k_w, &fl.v_w]);
                     }
                 }
-                cuda::chain_qkv_prefill_q4_dev(
+                // s247 (P47): 戻り値は D2H の宛先そのもの (pinned ステージング or
+                // フォールバックの Vec) を q/k の 2 スライスで見たビュー。
+                // 次の qkv チェーンまで有効 (この層の中で使い切る)。
+                let qkv = cuda::chain_qkv_prefill_q4_dev(
                     &fl.q_w, &fl.k_w, &fl.v_w, n, li, buf_qg, buf_k, vrows,
                 )
                 .ok_or_else(|| anyhow::anyhow!("prefill residual chain: qkv chain failed"))?;
@@ -3046,6 +3080,9 @@ impl Qwen35 {
                     // s172 (P12): 直後の o_proj はデバイス。ゲート済み att が既に
                     // CH_ATT にあるなら H2D を省く (GpuDev)。
                     false,
+                    // s247 (P47): q/k は直前の chain が pinned へ戻したスライスを
+                    // そのまま読む (ホスト memcpy 0・値は同一のバイト列)。
+                    Some((qkv.q(), qkv.k())),
                 );
                 // attention 出力 (sigmoid ゲート済み・CH_ATT の生値ではない) を
                 // 1 回だけアップロードして、o_proj をデバイスで回す
