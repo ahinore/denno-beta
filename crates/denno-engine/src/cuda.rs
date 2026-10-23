@@ -6172,6 +6172,36 @@ pub fn chain_attention(
     })
 }
 
+/// s176 (P20): full 層 attention の q ステージング (pinned) を **prepare の出力先**
+/// として貸し出す。`f` に渡すスライスに書いた内容を、直後の
+/// [`chain_attention_prefill_pinned`] がそのまま H2D する。
+///
+/// 従来は prepare がホスト `Vec` (`buf_q`) に書き、`chain_attention_prefill` が
+/// それを pinned へ `copy_from_slice` してから H2D していた (27B n=14,043 で
+/// 345 MB/層・このコンテナの実測 21.1 ms/層 = 0.34 s/request)。ここでは書き込み先を
+/// pinned そのものにするので、**転送バイト数・カーネル・発行順は不変**で
+/// ホスト memcpy 1 回だけが消える (値は 1 ビットも変わらない)。
+///
+/// 安全条件 (呼び出し側が守る): 次に同じ pin を上書きするのは次の層の prepare で、
+/// その前に次層の qkv chain の `sync` が入る (この H2D は既に完了している)。
+pub fn chain_pf_q_pin_fill<F>(n_elems: usize, f: F) -> Option<()>
+where
+    F: FnOnce(&mut [f32]),
+{
+    let _ = chain_ctx()?;
+    let bytes = n_elems.checked_mul(4)?;
+    if n_elems == 0 {
+        return None;
+    }
+    CHAIN.with(|cell| -> Option<()> {
+        let mut s = cell.borrow_mut();
+        ok(Scratch::ensure_pin(&mut s.pin_pf, bytes))?;
+        let pin = s.pin_pf.as_mut()?;
+        f(&mut pin.as_mut_slice::<f32>()[..n_elems]);
+        Some(())
+    })
+}
+
 /// P17j: prefill (n > 1) 用 GPU attention (dno_attention_prefill・flash 風
 /// online softmax)。q ([n, heads*dh]、rope/QK-Norm 加算済み) とホスト KvCache
 /// (現在レイヤの行 [pos0..t_total) は呼び出し側が書き込み済み) を受け取り、
@@ -6198,6 +6228,70 @@ pub fn chain_attention_prefill(
     kv_dim: usize,
     scale: f32,
 ) -> Option<()> {
+    if n == 0 || dh == 0 {
+        return None;
+    }
+    let heads = q.len() / (n * dh);
+    if heads == 0 || n.checked_mul(dh).map(|x| x * heads) != Some(q.len()) {
+        return None;
+    }
+    chain_attention_prefill_impl(
+        key,
+        li,
+        n_layers,
+        Some(q),
+        heads,
+        cache,
+        pos0,
+        n,
+        t_total,
+        group,
+        dh,
+        kv_dim,
+        scale,
+    )
+}
+
+/// s176 (P20): q が **pinned ステージングに既に書かれている**前提の起動
+/// ([`chain_pf_q_pin_fill`] の直後に呼ぶ)。カーネル・grid・block・引数・発行順は
+/// [`chain_attention_prefill`] と同一で、消えるのは「ホスト q → pinned」の
+/// memcpy 1 回だけ。
+#[allow(clippy::too_many_arguments)]
+pub fn chain_attention_prefill_pinned(
+    key: u64,
+    li: usize,
+    n_layers: usize,
+    heads: usize,
+    cache: &crate::kv_cache::KvCache,
+    pos0: usize,
+    n: usize,
+    t_total: usize,
+    group: usize,
+    dh: usize,
+    kv_dim: usize,
+    scale: f32,
+) -> Option<()> {
+    chain_attention_prefill_impl(
+        key, li, n_layers, None, heads, cache, pos0, n, t_total, group, dh, kv_dim, scale,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chain_attention_prefill_impl(
+    key: u64,
+    li: usize,
+    n_layers: usize,
+    q: Option<&[f32]>,
+    heads: usize,
+    cache: &crate::kv_cache::KvCache,
+    pos0: usize,
+    n: usize,
+    t_total: usize,
+    group: usize,
+    dh: usize,
+    kv_dim: usize,
+    scale: f32,
+) -> Option<()> {
     if !gpu_attention_enabled() {
         return None;
     }
@@ -6213,9 +6307,12 @@ pub fn chain_attention_prefill(
     if attn_pf_sh_f(dh) * 4 > attn_pf_dynamic_smem_limit() {
         return None;
     }
-    let heads = q.len() / (n * dh);
-    if heads == 0 || n.checked_mul(dh).map(|x| x * heads) != Some(q.len()) {
-        return None;
+    // q の要素数 (Some/None どちらでも同じ — ステージングの大きさを決める)
+    let q_elems = n.checked_mul(heads)?.checked_mul(dh)?;
+    if let Some(q) = q {
+        if q.len() != q_elems {
+            return None;
+        }
     }
     let ctx = chain_ctx()?;
 
@@ -6249,17 +6346,21 @@ pub fn chain_attention_prefill(
 
     CHAIN.with(|cell| -> Option<()> {
         let mut s = cell.borrow_mut();
-        ok(Scratch::ensure(&mut s.attn_pf_q, q.len() * 4))?;
+        ok(Scratch::ensure(&mut s.attn_pf_q, q_elems * 4))?;
         // P17k: pinned ステージング + async H2D (同期 pageable copy_from より高速)。
         // DMA 完了は同一ストリーム順序でカーネルが待つため sync 不要。pin_pf の
         // 次回上書きは次層の attention で、その前に oproj/download の sync が挟まる。
-        ok(Scratch::ensure_pin(&mut s.pin_pf, q.len() * 4))?;
+        ok(Scratch::ensure_pin(&mut s.pin_pf, q_elems * 4))?;
         let buf = s.attn_pf_q.as_ref().unwrap().ptr();
-        s.pin_pf.as_mut().unwrap().as_mut_slice::<f32>()[..q.len()].copy_from_slice(q);
+        // s176 (P20): q が None = 呼び出し側 (`chain_pf_q_pin_fill`) が既にこの
+        // pinned へ書いている。その場合はコピーしない (345 MB/層の memcpy が消える)。
+        if let Some(q) = q {
+            s.pin_pf.as_mut().unwrap().as_mut_slice::<f32>()[..q_elems].copy_from_slice(q);
+        }
         let lib = ok(lib())?;
         unsafe {
             ok(check(
-                (lib.memcpy_htod_async)(buf, s.pin_pf.as_ref().unwrap().ptr as *const c_void, q.len() * 4, std::ptr::null_mut()),
+                (lib.memcpy_htod_async)(buf, s.pin_pf.as_ref().unwrap().ptr as *const c_void, q_elems * 4, std::ptr::null_mut()),
                 "cuMemcpyHtoDAsync (attn_pf_q)",
             ))?;
         }
