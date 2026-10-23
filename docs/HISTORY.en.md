@@ -3676,3 +3676,53 @@ External implementations referenced in P19 and their licensing status (the same 
 - **Untouched**: `.cu` / `.ptx` / nvcc / GPU builds / GPU runs / merging the D2H transfers
   (P17b, measured 2.2x worse and reverted) / reduction order / any new env gate / 8095 /
   push / rebase / `git add -A`. The work report is the uncommitted `REPORT_P28.md`.
+
+### P35: decided the GGUF Q4_0 verbatim pass-through from real data (2026-10-23) DONE (default OFF, 0 types allowed)
+
+> The residue under P4-5 was "stop re-quantising GGUF -> fp32 -> Q4_0 and take the
+> file's blocks as they are". The first question was whether that is **bit-identical**,
+> and on the real file it is not: **Q4_0 does not match** (14 of 16 sampled tensors
+> differ; the first difference is byte 0 of `blk.60.ffn_up.weight`, i.e. the block's
+> f16 scale). The pass-through is therefore implemented but its **allow-list is empty**,
+> so even with the gate ON the loader runs the fp32 path and no value changes.
+
+- **Measurement (`gguf::tests::q4_verbatim_matches_requant_real_gguf`, `#[ignore]`, CPU)**:
+  `/work/models/Qwen3.8-27B-Q4_0.gguf` is **not mmap-ed**: the 10,996,700 B header is
+  parsed out of a 16 MiB prefix (`GgufHeader`), then each sampled tensor is pread in
+  row-aligned 4 MB chunks and compared byte for byte against
+  `dequant_row` -> `Q4Linear::quantize` (peak tens of MB, 5.1 s total). Per type:
+  **Q4_0 = NOT identical** (352 tensors / 12.441 GiB, 16 sampled, 2 identical =
+  `token_embd.weight` and `blk.64.ffn_up.weight`). F32 456 / Q4_1 8 / Q5K 48 / Q6K 1 /
+  Q8_0 1 are not Q4_0 layout and stay on the fp32 path by construction.
+- **Why it differs (one real block dumped)**: the file's block has
+  `d = 4.543304e-3`, nibble range 1..12 and **max|q-8| = 7**. ggml's
+  `quantize_row_q4_0_ref` always maps the largest-magnitude element to nibble 0
+  (|q-8| = 8), so this block was not produced by the reference rule. Re-quantising it
+  therefore yields `d' = max|y|/-8 = d*7/8`, and the measured ratio is
+  **1.1426-1.1433 for all 14 differing tensors (= 8/7 = 1.142857, the f16 rounding
+  band)**; a different scale means different nibbles too. A constant ratio is
+  consistent with a scale rule around `d = amax/7` instead of the reference
+  `d = max/-8` (the file is not a product of the reference path). For this file the
+  round trip is not "pure cost", it is a value-changing transform.
+- **Change**: `quant.rs` gained `Q4Linear::from_gguf_blocks` (validated verbatim copy,
+  fail-closed `None` on a shape mismatch), `GGUF_PASSTHROUGH_ENV`,
+  `gguf_passthrough_from_value`, `gguf_passthrough_enabled` and
+  `gguf_passthrough_allows` (0 types allowed today). `gguf.rs` gained `GgufHeader`
+  (an mmap-free header view that shares `parse_fields` with `GgufFile`, so there is
+  still one parser) plus the proof test above. `qwen35.rs` routes its 10 2-D linear
+  weights + untied `output.weight` through `lin_g`, which tries the pass-through only
+  when the gate is on and falls back to the old `dt -> lin`. **The default (env unset
+  or `0`) issues the same calls in the same order as before.**
+- **Predicted effect (PREDICTED, NOT MEASURED)**: allowing Q4_0 would avoid
+  **88.47 GiB** of fp32 expansion (12.441 GiB x 4 B/elem / 0.5625 B/elem = 7.111x;
+  per-tensor transient, not resident at once; the largest single one is
+  `token_embd.weight` at 5.086 GB). At the proof test's measured rate (0.77 GiB in
+  5.1 s) that is roughly 82 s of load-time CPU. With **0 types allowed the real saving
+  is 0**. Real load timing is out of scope for this session.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **323 passed / 0 failed / 38 ignored** (baseline 321 + 2 new unit tests + 1 ignored).
+  `-- --ignored q4_verbatim_matches_requant_real_gguf` = 1 passed. Non-cuda
+  `cargo test -p denno-engine --lib` = 282 passed / 0 failed / 3 ignored.
+- **Untouched**: `.cu` / `.ptx` / GPU / server / docker / `docs/NUMERIC_POLICY.ja.md` /
+  `GPU_VERIFY.sh` / `scripts/prod_serve_27b.sh` / the accepted set of the GGUF tensor
+  type gate / push / `git add -A`. The work report is the uncommitted `REPORT_P35.md`.
