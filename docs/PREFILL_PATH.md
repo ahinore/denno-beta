@@ -1,4 +1,4 @@
-# prefill 経路の構造と高速化 (s163 時点)
+# prefill 経路の構造と高速化 (s163-s175)
 
 ## 結論
 
@@ -344,8 +344,27 @@ wall 56.3 s (MEASURED) − PCIe 3.5 s (@12GB/s) − ホスト計算 8.9 s = カ�
 
 ### 前提の確かめ方 (この順序は「beta/alpha が 8 s」に依存している)
 
+**env はサーバ側で 1 回だけ読まれます (OnceLock)。** `DENNO_PF_DBG` / `DENNO_Q4_M_TILE` /
+`DENNO_PF_OVERLAP` は serve プロセスが起動時に読むので、python クライアントに付けた env は
+届きません (P27 §5.0 の罠 1)。切り替えるには **serve を立て直します**。根拠は次の 3 箇所です。
+
+| env | 読み出し (serve 起動時に 1 回・`OnceLock`) |
+|---|---|
+| `DENNO_PF_DBG` | `crates/denno-engine/src/cuda.rs:11921-11924` (`pf_dbg_on`) |
+| `DENNO_Q4_M_TILE` | `crates/denno-engine/src/cuda.rs:3504-3510` (`q4_m_tile`) |
+| `DENNO_PF_OVERLAP` | `crates/denno-engine/src/cuda.rs:11702-11705` (`pf_overlap_flag`) |
+
+`[PF_DBG]` の行は**サーバの stderr** に出るので、bench の出力ではなくサーバのログを読みます。
+`scripts/prod_serve_27b.sh` は既存の serve を落としてから `exec` で前面に残る
+(`scripts/prod_serve_27b.sh:13-19` と `:43-44`) ため、`&` で起動して health を待ちます。
+この形は、この文書の他の 2 箇所 (s172 / s173 の実機 A/B) でも同じです。
+
 ```
-DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 2 2>&1 | grep -E "PF_DBG|sl_lay"
+# env はサーバ起動側に付ける (python 側では効きません)
+DENNO_PF_DBG=1 bash scripts/prod_serve_27b.sh > /tmp/pf_dbg.log 2>&1 &
+for i in $(seq 1 120); do curl -sf http://127.0.0.1:8095/health >/dev/null && break; sleep 1; done
+python3 scripts/prefill_bench.py 65000 2
+grep -E "PF_DBG|sl_lay" /tmp/pf_dbg.log
 ```
 
 `sl_lay_gdn_proj` (`REPORT_P8.md:45`) は「h2 の D2H/join + ホスト beta/alpha + qkv/z GEMM」を
@@ -527,11 +546,21 @@ P4 の見積りが正しく ②③ を先にする。RoPE 表の効果は `sl_la
 
 ### 実機 A/B (cold・同一プロンプト・3 回中央値)
 
+env はサーバ起動時 (OnceLock) なので、① と ② は**それぞれ serve を立て直して**測ります
+(`DENNO_PF_OVERLAP` の読み出しは `crates/denno-engine/src/cuda.rs:11702-11705`)。
+`scripts/prod_serve_27b.sh` は起動時に既存の serve を落とすので、② の行が ① を止めてから
+立ちます。
+
 ```
 # ① ホスト投影の 1 パス化だけを見る (GEMM は直列のまま)
-DENNO_PF_OVERLAP=0 DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 2
-# ② 重ね合わせも入れる (既定)
-DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 2
+DENNO_PF_OVERLAP=0 DENNO_PF_DBG=1 bash scripts/prod_serve_27b.sh > /tmp/pf_a.log 2>&1 &
+for i in $(seq 1 120); do curl -sf http://127.0.0.1:8095/health >/dev/null && break; sleep 1; done
+python3 scripts/prefill_bench.py 65000 2
+# ② 重ね合わせも入れる (既定) — ① の serve を落として env 無しで立て直す
+DENNO_PF_DBG=1 bash scripts/prod_serve_27b.sh > /tmp/pf_b.log 2>&1 &
+for i in $(seq 1 120); do curl -sf http://127.0.0.1:8095/health >/dev/null && break; sleep 1; done
+python3 scripts/prefill_bench.py 65000 2
+grep -E "PF_DBG|sl_lay" /tmp/pf_a.log /tmp/pf_b.log
 ```
 `sl_lay_gdn_proj` の期待: ① ≈14.6 s (18.0 − 3.4)、② ≈10 s。②で ① より縮まない
 なら driver が `cuStreamCreate` を提供していない (静かに従来経路) か、GEMM が
@@ -618,11 +647,21 @@ P13 が同じ形の連結 (qkv/z の 28 -> 14 発/層) で「全体で µs 級�
 
 ### 実機 A/B
 
+`DENNO_PF_FFN_FUSED` も `DENNO_PF_DBG` と同じくサーバ起動時に 1 回だけ読まれる
+(`crates/denno-engine/src/cuda.rs:5446-5449` / `:11921-11924`) ので、A/B は**それぞれ
+serve を立て直して**測ります。
+
 ```
+# env はサーバ起動側に付ける (python 側では効きません)
 # cold・同一プロンプト・3 回中央値 (毎回 nonce 付き = prefix cache miss)
-DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 3
+DENNO_PF_DBG=1 bash scripts/prod_serve_27b.sh > /tmp/pf_fused.log 2>&1 &
+for i in $(seq 1 120); do curl -sf http://127.0.0.1:8095/health >/dev/null && break; sleep 1; done
+python3 scripts/prefill_bench.py 65000 3
 # 従来の 2 回呼び出しに戻す A/B (数値は不変・launch だけが 3 -> 4 に戻る)
-DENNO_PF_FFN_FUSED=0 DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 3
+DENNO_PF_FFN_FUSED=0 DENNO_PF_DBG=1 bash scripts/prod_serve_27b.sh > /tmp/pf_ffn2.log 2>&1 &
+for i in $(seq 1 120); do curl -sf http://127.0.0.1:8095/health >/dev/null && break; sleep 1; done
+python3 scripts/prefill_bench.py 65000 3
+grep -E "PF_DBG|sl_lay" /tmp/pf_fused.log /tmp/pf_ffn2.log
 ```
 `sl_lay_ffn_gate` / `sl_lay_ffn_down` のラベルは経路が変わっても同じ位相に積む
 (消えない)。8 問 × 150 token greedy の出力は 2 回で md5 一致・基準アンカーとも
