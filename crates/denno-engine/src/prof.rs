@@ -3875,6 +3875,14 @@ pub fn summary() -> String {
     // 並んで MISS が見えない状態を実際に踏んだ)。
     push_coverage(Phase::Prefill, &mut s);
     push_coverage(Phase::Decode, &mut s);
+    // s240 (P40): GDN chunked 3 カーネルの実時間 (`DENNO_GDN_KPROF=1` のときだけ)。
+    // 計測専用の 1 行で、上の表の値には一切混ぜない (`DENNO_GDN_KPROF` が未設定
+    // なら `gdn_kprof_line()` が None = このブロックは 1 バイトも足さない)。
+    #[cfg(feature = "cuda")]
+    if let Some(line) = crate::cuda::gdn_kprof_line() {
+        s.push_str(&line);
+        s.push('\n');
+    }
     s
 }
 
