@@ -4500,7 +4500,10 @@ struct ChainScratch {
     // s246 (P46): full 層 att の D2H/H2D と sigmoid ゲートを重ねるための
     // チャンク完了イベント (既定ストリーム・grow-only・層をまたいで再利用)。
     pipe_ev: Vec<CopyEvent>,
-
+    // s247 (P47): full_qk (q/k 射影) の D2H 宛先 = pinned staging (grow-only)。
+    // 1 本のプールを q/k の 2 スライスに割り、層をまたいで使い回す (確保は
+    // リクエスト最初の full 層で 1 回だけ)。寿命の契約は `PfQkView` を参照。
+    pin_pf_qkv: Option<PinMem>,
 }
 
 thread_local! {
@@ -4545,6 +4548,7 @@ thread_local! {
         pin_h2: None,
         h2_pending: false,
         pipe_ev: Vec::new(),
+        pin_pf_qkv: None,
 
     });
 }
@@ -13336,23 +13340,128 @@ where
     Some(())
 }
 
+/// s247 (P47): full_qk (q/k 射影) の D2H 宛先を返すビュー。
+///
+/// [`chain_qkv_prefill_q4_dev`] が D2H した先 — pinned ステージング
+/// (`pin_pf_qkv` の 2 スライス)、またはフォールバック時の呼び出し側 `Vec` —
+/// を q/k の 2 スライスとして見せる。**ホスト memcpy は挟まない** (pinned →
+/// heap の写しはこのホストで 4.7 GB/s しか出ず、12.88 GB/request なら +2.7 s
+/// の新規費用になる)。値は D2H で戻したバイト列そのもの。
+///
+/// **寿命の契約**: 同じスレッドで次の [`chain_qkv_prefill_q4_dev`] が走るまで
+/// 有効 (`pin_h2` / `pins[]` のステージングと同じ規約)。層ループは 1 層ずつ
+/// 「qkv チェーン → ホスト prepare/attend」を直列に回すので、1 層の中で使い切る
+/// 限り競合しない。破ると**読む前に上書きされる**ので、デバッグビルドでは
+/// 世代 (`PFQK_GEN`) の不一致で panic する。
+pub struct PfQkView {
+    q: *const f32,
+    k: *const f32,
+    q_len: usize,
+    k_len: usize,
+    pinned: bool,
+    gen: u64,
+}
+
+impl PfQkView {
+    /// q 投影出力 `[rows, qcols]` (pinned ステージング or フォールバックの Vec)。
+    pub fn q(&self) -> &[f32] {
+        debug_assert_eq!(
+            self.gen,
+            pf_qkv_gen(),
+            "PfQkView が次の qkv チェーンで無効化された (寿命の契約違反)"
+        );
+        unsafe { std::slice::from_raw_parts(self.q, self.q_len) }
+    }
+
+    /// k 投影出力 `[rows, kcols]`。
+    pub fn k(&self) -> &[f32] {
+        debug_assert_eq!(
+            self.gen,
+            pf_qkv_gen(),
+            "PfQkView が次の qkv チェーンで無効化された (寿命の契約違反)"
+        );
+        unsafe { std::slice::from_raw_parts(self.k, self.k_len) }
+    }
+
+    /// D2H の宛先が pinned ステージングだったか (計測・切り分け用)。
+    pub fn pinned(&self) -> bool {
+        self.pinned
+    }
+}
+
+thread_local! {
+    /// s247 (P47): `PfQkView` の世代。チェーンが走るたびに進む
+    /// (古いビューの読み出しをデバッグビルドで検出するためだけのもの)。
+    static PFQK_GEN: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+
+fn pf_qkv_gen() -> u64 {
+    PFQK_GEN.with(|c| c.get())
+}
+
+/// s247 (P47): full_qk の pinned ステージング (q + k) の上限バイト数。
+/// 既定 1 GiB (`docs/FULL_QK_D2H_PINNED.md` §5/§6 の「プール上限 1.0 GB」)。
+///
+/// この上限を超える n ではプールを**1 バイトも確保せず**に従来の pageable
+/// 経路へ落ちる (fail-closed)。65k (n=14,043) の q+k は 747.8 MB なので既定では
+/// 収まる。256 MiB (268,435,456 B) に絞ると n ≤ 5,041 行でしか発動しない
+/// (q+k = n×13,312×4 B = 53,248 B/行) — q の 1 発が 690 MB あるので、それ以上の
+/// n を 256 MiB に収めるには D2H の分割が必要で、それは設計メモ §3 (3 発・同順を
+/// 保つ) と両立しない。
+fn pf_qkv_pin_max() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("DENNO_PF_QKV_PIN_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1 << 30)
+    })
+}
+
+/// ページロック失敗の報告は 1 回だけ (層ごとに 16 回出さない)。
+static PFQK_PIN_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// s247 (P47): pinned 経路が初めて効いたことを 1 回だけ報告するためのフラグ。
+    static PFQK_PIN_USED: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// s247 (P47): `DENNO_PF_QKV_PIN_DBG=1` のとき、pinned ステージングが初めて
+/// 効いた層で 1 行だけ出す (cold A/B の前に「どちらの経路か」を確定させるため)。
+fn pf_qkv_pin_dbg() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DENNO_PF_QKV_PIN_DBG").ok().as_deref() == Some("1"))
+}
+
 /// s165 (P2): full attention 層の q/k/v 投影を**デバイス常駐の入力** (`CH_PFH`,
 /// rmsnorm 出力・先頭から `rows` 行) から回し、**出力だけ**をホストへ戻す。
 /// KV キャッシュはホストが正で q/k/v の値はホストの prepare が要るので、
 /// 値は必ず戻す (戻す量は q/k/v の幅で、h2 の H2D 3 回より小さい)。
 /// 3 本の GEMM は `CH_QKV` の連続領域 (q|k|v) に行オフセットで書き、
-/// D2H 3 発 + sync 1 回で呼び出し元のバッファへ直接落とす。
+/// D2H 3 発 + sync 1 回で落とす。
 /// カーネル・grid・引数は per-op 経路と同一 (行ごとに独立 → bit 一致)。
+///
+/// s247 (P47): D2H の宛先 (q/k) を **pinned ステージング** (`pin_pf_qkv`) にし、
+/// 戻り値の [`PfQkView`] でそのスライスをそのまま呼び出し側へ渡す。
+/// 発行回数 (3 発)・発行順 (q → k → v)・転送バイト数・`ctx.sync()` 1 回は従来と
+/// 同一で、変わるのは「同じバイト列をどこへ置くか」だけ = 数値は不変。
+/// v の宛先は従来どおり呼び出し側のバッファ (s240/P44: ホスト KV キャッシュの行
+/// そのもの = prepare が v を 1 バイトも触らない)。pinned を確保できないときは
+/// 呼び出し側の `Vec` へ直接 D2H する従来経路に落ちる (fail-closed・数値不変)。
 pub fn chain_qkv_prefill_q4_dev(
     q_w: &crate::quant::Linear,
     k_w: &crate::quant::Linear,
     v_w: &crate::quant::Linear,
     rows: usize,
     li: usize,
-    out_qg: &mut [f32],
-    out_k: &mut [f32],
+    // s247 (P47): q/k の D2H 宛先。pinned ステージングを確保できた層では
+    // **読まれない** (pageable フォールバックの宛先としてだけ使い、そのときだけ
+    // 長さを合わせる) — pinned が効く層で 747 MB の mmap をしないため。
+    out_qg: &mut Vec<f32>,
+    out_k: &mut Vec<f32>,
     out_v: &mut [f32],
-) -> Option<()> {
+) -> Option<PfQkView> {
     if !cuda_enabled() || !gemm_enabled() || GPU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
@@ -13368,7 +13477,7 @@ pub fn chain_qkv_prefill_q4_dev(
     if rows < gemm_min_m() || rows <= max_m() {
         return None;
     }
-    if out_qg.len() < rows * qcols || out_k.len() < rows * kcols || out_v.len() < rows * vcols {
+    if out_v.len() < rows * vcols {
         return None;
     }
     let ctx = chain_ctx()?;
@@ -13395,26 +13504,75 @@ pub fn chain_qkv_prefill_q4_dev(
         chain_gemm_q4_pf(gwk, pin, pqkv + q_off, rows, kn, kcols)?;
         chain_gemm_q4_pf(gwv, pin, pqkv + k_off, rows, vn, vcols)
     })?;
-    // D2H 3 発 (async) → sync 1 回
+    // ---- s247 (P47): D2H の宛先 (q/k) を pinned ステージングにする ----
+    // プールは 1 本 (`pin_pf_qkv`) を q/k の 2 スライスに割り、grow-only で層を
+    // またいで使い回す (ページロックは最初の full 層の 1 回だけ)。上限超過・
+    // ページロック失敗は従来の pageable 経路へ落ちる (fail-closed)。
+    let q_elems = rows.checked_mul(qcols)?;
+    let k_elems = rows.checked_mul(kcols)?;
+    let q_bytes = q_elems.checked_mul(4)?;
+    let k_bytes = k_elems.checked_mul(4)?;
+    let stage_bytes = q_bytes.checked_add(k_bytes)?;
+    let mut dst_q: *mut c_void = std::ptr::null_mut();
+    let mut dst_k: *mut c_void = std::ptr::null_mut();
+    let mut pinned = false;
+    if stage_bytes <= pf_qkv_pin_max() {
+        CHAIN.with(|cell| {
+            let mut s = cell.borrow_mut();
+            if Scratch::ensure_pin(&mut s.pin_pf_qkv, stage_bytes).is_err() {
+                // pinned の失敗は致命的でない (`pin_h2` と同じ扱い = GPU_BROKEN を
+                // 立てない)。理由だけ 1 回出す。
+                if !PFQK_PIN_FAILED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "full_qk pinned staging: cuMemHostAlloc({stage_bytes} B) に失敗 → pageable 経路"
+                    );
+                }
+                return;
+            }
+            if let Some(p) = s.pin_pf_qkv.as_ref() {
+                if p.bytes >= stage_bytes {
+                    dst_q = p.ptr;
+                    // q と k は同じプールの連続した 2 スライス (q_off=0, k_off=q_bytes)
+                    dst_k = unsafe { (p.ptr as *mut u8).add(q_bytes) as *mut c_void };
+                    pinned = true;
+                }
+            }
+        });
+        if pinned && pf_qkv_pin_dbg() && !PFQK_PIN_USED.with(|c| c.replace(true)) {
+            eprintln!(
+                "full_qk pinned staging: {stage_bytes} B (q {q_bytes} + k {k_bytes}, n={rows}) — D2H 宛先 = pinned"
+            );
+        }
+    }
+    if !pinned {
+        // フォールバック = 現行経路そのもの (呼び出し側の Vec へ直接 D2H)。
+        // 長さはここで合わせる: pinned が効く層では 747 MB の確保をしない。
+        if out_qg.len() < q_elems {
+            out_qg.clear();
+            out_qg.resize(q_elems, 0.0);
+        }
+        if out_k.len() < k_elems {
+            out_k.clear();
+            out_k.resize(k_elems, 0.0);
+        }
+        dst_q = out_qg.as_mut_ptr() as *mut c_void;
+        dst_k = out_k.as_mut_ptr() as *mut c_void;
+    }
+    // D2H 3 発 (async) → sync 1 回 — 発行回数・発行順は従来と同一 (連結しない)
     CHAIN.with(|cell| -> Option<()> {
         let s = cell.borrow();
         let base = s.bufs[CH_QKV].as_ref()?.ptr();
         let lib = lib().ok()?;
         unsafe {
             ok(check(
-                (lib.memcpy_dtoh_async)(
-                    out_qg.as_mut_ptr() as *mut c_void,
-                    base,
-                    rows * qcols * 4,
-                    std::ptr::null_mut(),
-                ),
+                (lib.memcpy_dtoh_async)(dst_q, base, q_bytes, std::ptr::null_mut()),
                 "cuMemcpyDtoHAsync (pf qkv q)",
             ))?;
             ok(check(
                 (lib.memcpy_dtoh_async)(
-                    out_k.as_mut_ptr() as *mut c_void,
+                    dst_k,
                     base + q_off,
-                    rows * kcols * 4,
+                    k_bytes,
                     std::ptr::null_mut(),
                 ),
                 "cuMemcpyDtoHAsync (pf qkv k)",
@@ -13432,7 +13590,21 @@ pub fn chain_qkv_prefill_q4_dev(
     })?;
     crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
     ok(ctx.sync())?;
-    Some(())
+    // ここまでで D2H は完了している (sync 1 回)。ビューの世代を進めて
+    // 前のビューを無効化する。
+    let gen = PFQK_GEN.with(|c| {
+        let g = c.get().wrapping_add(1);
+        c.set(g);
+        g
+    });
+    Some(PfQkView {
+        q: dst_q as *const f32,
+        k: dst_k as *const f32,
+        q_len: q_elems,
+        k_len: k_elems,
+        pinned,
+        gen,
+    })
 }
 
 /// s165 (P2): attention 出力 (`CH_ATT`) → o_proj (q4) → `CH_O` (デバイス常駐・
