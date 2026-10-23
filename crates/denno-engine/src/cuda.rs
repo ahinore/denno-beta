@@ -12239,6 +12239,10 @@ pub fn pf_timing_read() {
     // s180 (P41): full_core の内訳は DENNO_PF_DBG / DENNO_PROFILE と独立に出す
     // (こちらは DENNO_FC_KPROF だけで動く)。既存の出力には触れない。
     fc_kprof_read();
+    // s240 (P43): GDN chunked 3 カーネルの積算行。ここは prefill 末尾 (= 最終行の
+    // 既存 D2H の後) なので、読むのは static だけで同期は足さない。
+    // `DENNO_GDN_KPROF` 未設定なら分岐 1 回で戻る。
+    gdn_kprof_report_at_prefill_end();
     if !pf_timing_on() {
         return;
     }
@@ -13297,7 +13301,15 @@ enum GdnScanSrc<'a> {
 // `DENNO_PROFILE` の `gdn_pf_*` では `sync` (13,774.9 ms / 2 リクエスト) まで
 // しか割れず、「pass 1/2/3 のどれが実行時間を持っているか」は未計測だった。
 // ここでは 3 pass の発行位置にだけイベントを打ち、既存の同期 (3 pass 後の
-// 1 回) が済んだ直後に `cuEventElapsedTime` で 3 区間を読む。
+// 1 回・`cuda.rs` の `ctx.sync()`) が済んだ直後に `cuEventElapsedTime` で
+// 3 区間を読む。
+//
+// s240 (P43): 出力点は **prefill 終了時** (`pf_timing_read`) が本線。
+// P40 は dump (`prof::summary`) とスレッド終了フックにしか出しておらず、
+// `scripts/prod_serve_27b.sh` が `unset DENNO_PROFILE` する本番構成では
+// そのどちらも走らないため、計測できていても 1 行も見えなかった。
+// 行には `miss=<n>` (捨てた call 数) を必ず出し、env ON なら
+// calls=0 でも行が出る (静かな no-op を構造的に禁止)。
 //
 // 数値経路を触らない根拠:
 // - 追加するのは `cuEventRecord` / `cuEventElapsedTime` の 2 API だけで、
@@ -13340,24 +13352,34 @@ pub(crate) struct KprofAcc {
     pub state_ns: u64,
     pub scan_ns: u64,
     pub calls: u64,
+    /// 区間を読めずに捨てた call 数 (未完了・負値・イベント欠け・イベント生成失敗)。
+    pub miss: u64,
 }
 
 impl KprofAcc {
-    /// 表示行。1 度も測っていない (`calls == 0`) なら None = 行を出さない
-    /// (0 の行を出すと「測って 0 ms だった」と読めてしまう)。
+    /// 表示行 (`calls == 0 && miss == 0` なら None = 行を出さない)。
+    /// 捨てた call があるときは calls=0 でも行を出す — 黙って消えると
+    /// 「測れていない」ことが見えなくなるため (P43)。
     fn line(&self) -> Option<String> {
-        if self.calls == 0 {
+        if self.calls == 0 && self.miss == 0 {
             return None;
         }
+        Some(self.render())
+    }
+
+    /// 行そのもの。pre/state/scan = 3 カーネルの積算 ms、calls = 3 区間すべて
+    /// 読めた call 数、miss = 捨てた call 数、total = 3 区間の和。
+    fn render(&self) -> String {
         let ms = |ns: u64| ns as f64 / 1e6;
-        Some(format!(
-            "[GDN_KPROF] pre={:.3} state={:.3} scan={:.3} calls={} total={:.3}",
+        format!(
+            "[GDN_KPROF] pre={:.3} state={:.3} scan={:.3} calls={} miss={} total={:.3}",
             ms(self.pre_ns),
             ms(self.state_ns),
             ms(self.scan_ns),
             self.calls,
+            self.miss,
             ms(self.pre_ns + self.state_ns + self.scan_ns)
-        ))
+        )
     }
 }
 
@@ -13368,6 +13390,7 @@ fn kprof_acc() -> KprofAcc {
         state_ns: KPROF_STATE_NS.load(Ordering::Relaxed),
         scan_ns: KPROF_SCAN_NS.load(Ordering::Relaxed),
         calls: KPROF_CALLS.load(Ordering::Relaxed),
+        miss: KPROF_MISS.load(Ordering::Relaxed),
     }
 }
 
@@ -13400,6 +13423,40 @@ pub fn gdn_kprof_report() {
     if let Some(l) = gdn_kprof_line() {
         eprintln!("{l}");
     }
+}
+
+/// prefill 終了時の 1 行 (s240/P43)。**サーバ経路の唯一の観測点**。
+///
+/// P40 は dump (`prof::summary()`) と終了フックにしか行を出していなかったため、
+/// `scripts/prod_serve_27b.sh` が `unset DENNO_PROFILE` する本番構成では
+/// `prof::enabled()` が偽 → `prof::summary()` が呼ばれず、ワーカースレッドも
+/// 終了しないので **1 行も出なかった** (計測できていても見えない)。
+/// ここは `pf_timing_read()` (prefill 末尾・最終行 D2H の後) から呼ぶ:
+/// 読むのは表示専用の static だけなので**同期は 1 つも足さない**。
+///
+/// dump 経路 (`DENNO_PROFILE`) が生きているときは `prof::summary()` が同じ行を
+/// 出すので、ここでは出さない (二重行の回避)。`DENNO_GDN_KPROF` 未設定なら
+/// 先頭の分岐 1 回で戻る (イベント生成も出力も無し)。
+pub fn gdn_kprof_report_at_prefill_end() {
+    if !gdn_kprof_on() {
+        return;
+    }
+    if let Some(l) = kprof_prefill_line(&kprof_acc(), crate::prof::enabled()) {
+        eprintln!("{l}");
+    }
+}
+
+/// prefill 終了時に出す行を決める (整形・テスト用の純関数)。
+///
+/// - dump 経路が生きている → None (summary 側が同じ行を出す)
+/// - それ以外 → **必ず** 1 行 (`calls == 0 && miss == 0` でも出す)。
+///   env ON なのに走査サイトへ 1 度も入らなかった場合、`calls=0 miss=0` の行が
+///   出るので「静かに何も出ない」が構造的に起こらない (P43 の要件)。
+fn kprof_prefill_line(acc: &KprofAcc, dump_path_live: bool) -> Option<String> {
+    if dump_path_live {
+        return None;
+    }
+    Some(acc.render())
 }
 
 /// 終了フック: 計測を開いたスレッドが終わるときに 1 行だけ出す (dump 経路
@@ -13506,7 +13563,12 @@ fn kprof_begin() -> Option<KprofCall> {
     if !gdn_kprof_on() {
         return None;
     }
-    let ev = kprof_events()?;
+    let Some(ev) = kprof_events() else {
+        // env ON なのにイベントを作れない = 計測不能。黙って 0 行にせず miss に
+        // 数える (表示行に miss=<n> が出るので「静かに no-op」にならない)。
+        KPROF_MISS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
     kprof_arm_exit_guard();
     // poison しても中身はハンドルだけなので続ける。
     let lock = ev.lock().unwrap_or_else(|e| e.into_inner());
@@ -13576,7 +13638,7 @@ mod kprof_tests {
         let _g = crate::prof::counters_guard();
         let _f = Force::set(Some(true));
         reset_acc();
-        assert!(gdn_kprof_line().is_none(), "未計測 (calls=0) は行を出さない");
+        assert!(gdn_kprof_line().is_none(), "未計測 (calls=0 miss=0) は行を出さない");
         kprof_add_ms(1.5, 0.25, 2.0);
         kprof_add_ms(0.5, 0.75, 1.0);
         let acc = kprof_acc();
@@ -13587,13 +13649,13 @@ mod kprof_tests {
         );
         assert_eq!(
             gdn_kprof_line().as_deref(),
-            Some("[GDN_KPROF] pre=2.000 state=1.000 scan=3.000 calls=2 total=6.000")
+            Some("[GDN_KPROF] pre=2.000 state=1.000 scan=3.000 calls=2 miss=0 total=6.000")
         );
         assert_eq!(gdn_kprof_miss(), 0, "成功した call を miss に数えている");
         reset_acc();
     }
 
-    /// 表示行の書式 (ms 3 桁・calls・total = 3 区間の和)。GPU 不要。
+    /// 表示行の書式 (ms 3 桁・calls・miss・total = 3 区間の和)。GPU 不要。
     #[test]
     fn kprof_line_format_is_stable() {
         let acc = KprofAcc {
@@ -13601,14 +13663,66 @@ mod kprof_tests {
             state_ns: 2_500_000,
             scan_ns: 3_000_000,
             calls: 7,
+            miss: 0,
         };
         assert_eq!(
             acc.line().as_deref(),
-            Some("[GDN_KPROF] pre=1234.567 state=2.500 scan=3.000 calls=7 total=1240.067")
+            Some("[GDN_KPROF] pre=1234.567 state=2.500 scan=3.000 calls=7 miss=0 total=1240.067")
         );
         assert!(
             KprofAcc::default().line().is_none(),
             "未計測の既定値が行を出している"
+        );
+    }
+
+    /// `miss=` の書式と「calls=0 でも捨てた call があれば行を出す」こと。
+    /// これが P43 の本題 (実機で 1 行も出なかった = 静かな no-op の再発防止)。
+    #[test]
+    fn kprof_miss_is_printed_even_with_zero_calls() {
+        let _g = crate::prof::counters_guard();
+        let _f = Force::set(Some(true));
+        reset_acc();
+        // 全部捨てた状態: 行は出るが calls=0 / miss=n。
+        KPROF_MISS.store(16, Ordering::Relaxed);
+        assert_eq!(
+            gdn_kprof_line().as_deref(),
+            Some("[GDN_KPROF] pre=0.000 state=0.000 scan=0.000 calls=0 miss=16 total=0.000"),
+            "捨てた call があるのに黙っている (miss= が効いていない)"
+        );
+        // 一部だけ読めた状態: calls と miss が併記される。
+        kprof_add_ms(2.0, 1.0, 3.0);
+        assert_eq!(
+            gdn_kprof_line().as_deref(),
+            Some("[GDN_KPROF] pre=2.000 state=1.000 scan=3.000 calls=1 miss=16 total=6.000")
+        );
+        reset_acc();
+    }
+
+    /// prefill 終了時の 1 行 (サーバ経路の観測点) の判定。
+    /// - dump 経路 (`DENNO_PROFILE`) が生きている → 出さない (summary と二重にしない)
+    /// - それ以外 → **未計測でも必ず出す** (静かに何も出ないを構造的に禁止)
+    #[test]
+    fn kprof_prefill_end_line_is_always_emitted_without_dump_path() {
+        let measured = KprofAcc {
+            pre_ns: 3_000_000,
+            state_ns: 1_000_000,
+            scan_ns: 2_000_000,
+            calls: 4,
+            miss: 1,
+        };
+        assert_eq!(
+            kprof_prefill_line(&measured, false).as_deref(),
+            Some("[GDN_KPROF] pre=3.000 state=1.000 scan=2.000 calls=4 miss=1 total=6.000")
+        );
+        assert!(
+            kprof_prefill_line(&measured, true).is_none(),
+            "dump 経路が生きているのに prefill 側でも出している (二重行)"
+        );
+        // 走査サイトに 1 度も入らなかった場合でも行は出る (calls=0 miss=0)。
+        assert_eq!(
+            kprof_prefill_line(&KprofAcc::default(), false).as_deref(),
+            Some("[GDN_KPROF] pre=0.000 state=0.000 scan=0.000 calls=0 miss=0 total=0.000"),
+            "env ON なのに 1 行も出ない経路が残っている"
         );
     }
 }
