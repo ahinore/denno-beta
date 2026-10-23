@@ -3822,3 +3822,31 @@ External implementations referenced in P19 and their licensing status (the same 
 - **Untouched**: `.cu` / `.ptx` / GPU / server / docker / the quantisation rules / the
   numeric path / `qwen35.rs` / non-test `gguf.rs` / push / `git add -A`. Work report: the
   uncommitted `REPORT_P38.md`. P37 §8's sentence about this topic is corrected there.
+
+### P40: split the GDN chunked 3-kernel time with host-side CUDA events (2026-10-23) DONE (measurement only, default OFF)
+
+- **Problem**: in the 27B q4 / 65,000-char prefill the `sl_lay_gdn_scan` phase is 6,965 ms
+  (19.4%), but `DENNO_PROFILE`'s `gdn_pf_*` breakdown stops at `sync` (13,774.9 ms over
+  2 requests), so the per-kernel split (pass 1/2/3) and the possibility that `sync` is
+  absorbing the upstream `gdn_proj` GEMM (P27's phase-attribution worry) stayed unmeasured.
+- **Implementation**: in `gdn_scan_chunked_impl` (`cuda.rs`), only when `DENNO_GDN_KPROF=1`,
+  four events (`CU_EVENT_DEFAULT`, timing enabled) bracket the three launches, and the three
+  intervals are read with `cuEventElapsedTime` right after the existing single sync, then
+  accumulated in ns into static `AtomicU64`s. One line at dump time (`prof::summary`) and at
+  exit: `[GDN_KPROF] pre=<ms> state=<ms> scan=<ms> calls=<n> total=<ms>`. **Measurement only**:
+  the launched function, arguments, grid/block, issue order and sync placement are unchanged,
+  and the accumulators are write-only display statics (nothing flows into the numeric path or
+  the anchor values). With `DENNO_GDN_KPROF` unset, `kprof_begin()` returns `None` - no event
+  is created and nothing is timed (one branch per site). `DENNO_PROFILE` / `DENNO_PF_DBG`
+  output is unchanged when the env var is unset.
+- **Tests**: `cargo test -p denno-engine --features cuda --lib` = 330 passed / 0 failed /
+  40 ignored (baseline 327 + the 3 measurement tests), `cargo test -p denno-engine --test
+  kernel_invariants` = 11 passed, non-cuda `--lib` = 286 passed.
+  `gdn_kernel_shared_layout_matches_host_smem` had been red since P36 added the 4-lane pass-1
+  variant (`dno_gdn_chunk_pre_l4`), which made two kernels carry the same `sc[]` assignment -
+  the expectation is now 2 instead of 1 (`.cu` untouched).
+- **Not verified**: the real per-kernel numbers. This container has no GPU, so the measurement
+  is run by the operator on 8095 / prefill_bench. An interval means "kernel execution plus the
+  issue gap", i.e. host stalls between passes are included.
+- **Next up**: once the dominant pass is known from real numbers, target that pass's lane/chunk
+  split (P36's 4-lane variant aimed at pass 1 and showed no effect, so pass 1 may not dominate).
