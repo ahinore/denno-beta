@@ -5908,3 +5908,83 @@ fn gdn_kprof_pending_read_happens_before_prefill_end_report() {
         .expect("prefill 末尾の [GDN_KPROF] 出力点が無い");
     assert!(p < r, "保留区間の読み出しが集計より後にある");
 }
+
+/// s247 (P47): full_qk の D2H は **3 発のまま** pinned ステージングへ落ち、
+/// 消費者はそのスライスを直接読む (ホスト memcpy を挟まない)。
+///
+/// - 3 発を 1 発に連結すると P17b (実測 +772 ms/層・revert 済み) に戻る。
+/// - q/k の宛先が `pin_pf_qkv` でないと pinned にならない (pageable のまま =
+///   P47 の狙いが消える)。
+/// - 消費者が `Vec` へ写すと 12.88 GB/request のホスト memcpy が復活する
+///   (このホストの実測 4.7 GB/s で +2.7 s 相当)。
+/// - v の宛先は P44 のまま (ホスト KV キャッシュの行 = prepare が触らない)。
+#[test]
+fn prefill_full_qk_d2h_lands_in_pinned_staging() {
+    let qkv = fn_body(CUDA_RS, "fn chain_qkv_prefill_q4_dev(");
+    // 3 発 (q/k/v) のまま。連結 (1〜2 発) も分割 (4 発以上) もしない。
+    assert_eq!(
+        qkv.matches("memcpy_dtoh_async").count(),
+        3,
+        "full_qk の D2H が 3 発でない (P17b の連結・分割は禁止)"
+    );
+    assert!(
+        qkv.contains("(lib.memcpy_dtoh_async)(dst_q, base, q_bytes,"),
+        "q の D2H 宛先が dst_q (pinned ステージング) でない"
+    );
+    assert!(
+        qkv.contains("dst_k,") && qkv.contains("base + q_off,"),
+        "k の D2H が CH_QKV の k オフセットから dst_k へ向いていない"
+    );
+    assert!(
+        qkv.contains("out_v.as_mut_ptr() as *mut c_void,"),
+        "v の D2H 宛先が呼び出し側のバッファ (P44 の KV キャッシュ行) でない"
+    );
+    // 宛先は 1 本のプールの 2 スライス (q_off = 0, k_off = q_bytes)。
+    assert!(
+        qkv.contains("Scratch::ensure_pin(&mut s.pin_pf_qkv, stage_bytes)"),
+        "pinned プール (pin_pf_qkv) の grow-only 確保が無い"
+    );
+    assert!(
+        qkv.contains("(p.ptr as *mut u8).add(q_bytes)"),
+        "k のスライスが q の直後 (q_bytes) に無い"
+    );
+    // 上限超過・確保失敗は pageable 経路へ (fail-closed)。GPU_BROKEN は立てない。
+    assert!(
+        qkv.contains("if stage_bytes <= pf_qkv_pin_max()"),
+        "pinned プールの上限判定が無い (大きい n で無制限にページロックする)"
+    );
+    assert!(
+        qkv.contains("out_qg.as_mut_ptr() as *mut c_void")
+            && qkv.contains("out_k.as_mut_ptr() as *mut c_void"),
+        "フォールバック (呼び出し側の Vec へ直接 D2H) が無い"
+    );
+    assert!(
+        !qkv.contains("GPU_BROKEN.store"),
+        "pinned の失敗で GPU_BROKEN を立てている (致命的でない失敗で CPU へ落ちる)"
+    );
+    // 同期は従来どおり 1 回 (3 発の後)。
+    assert_eq!(
+        qkv.matches("ctx.sync()").count(),
+        1,
+        "full_qk の ctx.sync() が 1 回でない"
+    );
+    assert!(
+        qkv.contains("Some(PfQkView {"),
+        "D2H の宛先を呼び出し側へ返していない (消費者が同じバイト列を読めない)"
+    );
+
+    // 消費者 (qwen35) はビューを直接読む。Vec へ写すとホスト memcpy が復活する。
+    let layer = fn_body(QWEN35_RS, "fn prefill_layer_dev(");
+    assert!(
+        layer.contains("Some((qkv.q(), qkv.k()))"),
+        "残差常駐経路が qkv ビューを full_attn_host_side へ渡していない"
+    );
+    for pat in ["qkv.q().to_vec()", "qkv.k().to_vec()", "copy_from_slice(qkv"] {
+        assert!(!layer.contains(pat), "qkv ビューをホストへ写している: {pat}");
+    }
+    let host_side = fn_body(QWEN35_RS, "fn full_attn_host_side(");
+    assert!(
+        host_side.contains("Some((q, k)) =>"),
+        "full_attn_host_side が pre_qk (pinned スライス) を読んでいない"
+    );
+}
