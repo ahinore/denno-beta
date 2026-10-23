@@ -1645,13 +1645,22 @@ impl Qwen35 {
                 None
             };
             let ok = crate::prof::time(crate::prof::D2H_ATTN_PF, || {
-                let v = crate::cuda::chain_pf_att_inplace(li, heads * dh, n, |v| {
+                let v = crate::cuda::chain_pf_att_inplace(li, heads * dh, n, |row0, v| {
                     // sigmoid 出力ゲート (従来経路と同一の式・同一の行並列)
+                    //
+                    // s246 (P46): chain は転送を**行ブロック単位のチャンク**に割り、
+                    // チャンクが着いた順にこのクロージャを呼ぶ (D2H と重ねるため)。
+                    // `row0` はこのブロックの先頭行なので、行内のチャンク添字 `t`
+                    // (0 起点) は全体では `row0 * heads + t` になる。1 行 = `heads`
+                    // 個の dh チャンクという前提は呼び出し側 (cols = heads*dh) が
+                    // 保証している。要素ごとの式・行並列の分割・演算順は 1 つも
+                    // 変えていない (チャンク境界が変わっても値はビット一致)。
                     v.par_chunks_exact_mut(dh)
                         .enumerate()
                         .for_each(|(t, att_head)| {
-                            let i = t / heads;
-                            let hh = t % heads;
+                            let tt = row0 * heads + t;
+                            let i = tt / heads;
+                            let hh = tt % heads;
                             let gate = &qg[i * heads * 2 * dh + hh * 2 * dh + dh..][..dh];
                             for (d, av) in att_head.iter_mut().enumerate() {
                                 *av /= 1.0 + (-gate[d]).exp();
