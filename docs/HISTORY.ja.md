@@ -3553,3 +3553,25 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
   `cargo build --release -p denno-cli --features denno-engine/cuda` 成功。
 - **測っていないこと**: GPU 実行・アンカー・ms/token・nsys・8095 (GPU 非搭載)。
   作業レポートは未 commit (`REPORT_P17B.md`)。`.cu` / `.ptx` は無変更。
+
+### s176: Task P31 - prefill チェーンの静的不変条件テストを GPU 無しで固定 (2026-10-23) 完了
+
+- **実装**: なし (テストのみ)。`crates/denno-engine/tests/kernel_invariants.rs` に
+  `chain_mlp_prefill_q4` / `chain_gdn_prefill_q4` / 残差常駐 (`CH_PF_RES`) / PF 位相
+  マーカーの静的不変条件を 4 本追加 (2312 → 3251 行・純追加 939 行・assert 呼び出し
+  95 箇所)。`.cu` / `.ptx` / プロダクトコード / 8095 は無変更。
+- **捕まえる間違い**: (a) `Q4_M_TILE` と `Q4_GM` の不一致・中間バッファをプロンプト
+  全体 (m) で確保する退行 (13k 行で 2.7 GiB)・`cap` から端数併合 tail を落とす退行、
+  (b) chain と per-op の起動引数の取り違え (nib/sc・dk/dv) と block/grid の片側変更、
+  (c) 残差を書く前の読み・`Some(CH_O)` の残差加算落ち・次層へ渡すスロットの取り違え・
+  前提検査の後置 (二重加算)、(d) 位相マーカーの二重押し/欠落/順序の入れ替え。
+- **前提の訂正**: FFN の 3 位相は 1024 行タイルごとに押される (層 1 回ではない —
+  `pf_record` の doc どおり)。テストは「押す場所が 1 箇所」「FFN はタイルループの
+  中」「GDN はループの外」「層 1 枚の位相列が id 昇順」を固定した。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (基準と同一)、
+  `cargo test --release -p denno-engine --features cuda --test kernel_invariants` =
+  **15 passed / 0 failed** (既存 11 + 新規 4)。新規 4 本は変異試験 11 通り
+  (cuda.rs / qwen35.rs を一時的に壊して戻す) をすべて検出。
+- **測っていないこと**: GPU 実行・アンカー・ms/token (GPU 非搭載)。作業レポートは
+  未 commit (`REPORT_P31.md`)。
