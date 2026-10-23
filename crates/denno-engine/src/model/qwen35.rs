@@ -962,6 +962,65 @@ impl Qwen35 {
         }
     }
 
+    /// s172 (P12): prepare (QK-Norm → RoPE → KV 行書き込み) の本体。
+    ///
+    /// s176 (P20): 出力先 `q_out` を引数にしただけで、**演算列・書き込み順・確保の
+    /// 回数は s171 までと同一**。`q_out` はホスト `Vec` (`buf_q`) でも、attention の
+    /// pinned ステージングでもよい (後者なら prepare → H2D の間のホスト memcpy が
+    /// 無くなる)。KV 行への書き込みは行専属の `copy_from_slice` なので、同じ内容で
+    /// 2 回呼んでも冪等 (CPU attend フォールバック時の再実行がそれ)。
+    #[allow(clippy::too_many_arguments)]
+    fn pf_prepare_into(
+        &self,
+        fl: &FullLayer,
+        q_out: &mut [f32],
+        buf_qg: &[f32],
+        buf_k: &[f32],
+        buf_v: &[f32],
+        krows: &mut [f32],
+        vrows: &mut [f32],
+        pos0: usize,
+        n: usize,
+        rope_tab: Option<&[f32]>,
+    ) {
+        let heads = self.heads;
+        let dh = self.dh;
+        let kv_dim = self.kv_heads * dh;
+        // s172 (P12): 1 行分の本文は `pf_prepare_row` (計測用に切り出し)。
+        crate::prof::time_n_ev(crate::prof::QKNORM, n, || {
+            q_out
+                .par_chunks_exact_mut(heads * dh)
+                .zip(buf_qg.par_chunks_exact(heads * 2 * dh))
+                .zip(buf_k.par_chunks_exact(kv_dim))
+                .zip(buf_v.par_chunks_exact(kv_dim))
+                .zip(krows.par_chunks_exact_mut(kv_dim))
+                .zip(vrows.par_chunks_exact_mut(kv_dim))
+                .enumerate()
+                .for_each(|(i, (((((q_r, qg_i), k_i), v_i), k_row), v_row))| {
+                    // s172 (P12): 本文は `pf_prepare_row` に切り出した
+                    // (計測用・演算列と確保の回数は s171 までと同一)。
+                    pf_prepare_row(
+                        qg_i,
+                        k_i,
+                        v_i,
+                        q_r,
+                        k_row,
+                        v_row,
+                        &fl.q_norm_w,
+                        &fl.k_norm_w,
+                        heads,
+                        self.kv_heads,
+                        dh,
+                        self.n_rot,
+                        self.eps,
+                        self.theta,
+                        rope_tab.map(|t| &t[i * self.n_rot..(i + 1) * self.n_rot]),
+                        pos0 + i,
+                    );
+                });
+        });
+    }
+
     /// s165 (P2): full attention 層のホスト側 (q/k/v 投影 → QK-Norm/RoPE/KV 書き込み
     /// → attend) を 1 つの関数にまとめたもの。中身は従来 `forward_prefill` の Full
     /// 分岐そのままで、数値・演算順・prof バケットは不変 (残差常駐経路からも同じ
@@ -1033,43 +1092,58 @@ impl Qwen35 {
         // 実行する。1 行分の演算列はトークン逐次経路と完全に同一・書き込み先も
         // 行専属なので bit-exact (rayon スレッド数にも依存しない)。
         // prof は QKNORM バケットに一括計上する (内訳の合算と同値)。
-        {
+        //
+        // s176 (P20): 残差常駐経路 (`qkv_precomputed`) では prepare の q 出力を
+        // attention の **pinned ステージングへ直接**書く — 直後の
+        // `chain_attention_prefill_pinned` がそれをそのまま H2D するので、従来
+        // 挟まっていたホスト memcpy (27B n=14,043 で 345 MB/層・実測 21.1 ms/層)
+        // が消える。転送バイト数・カーネル・発行順は不変 = 値はビット同一。
+        // pinned を貸せないときは従来どおり `buf_q` へ書く。
+        #[cfg(feature = "cuda")]
+        let q_in_pin = {
+            let mut filled = false;
+            {
+                let (kc, vc) = cache.kv_bufs(li, 1);
+                let krows = &mut kc[pos0 * kv_dim..(pos0 + n) * kv_dim];
+                let vrows = &mut vc[pos0 * kv_dim..(pos0 + n) * kv_dim];
+                if qkv_precomputed {
+                    filled = crate::cuda::chain_pf_q_pin_fill(n * heads * dh, |q_out| {
+                        self.pf_prepare_into(
+                            fl,
+                            q_out,
+                            &buf_qg[..],
+                            &buf_k[..],
+                            &buf_v[..],
+                            &mut *krows,
+                            &mut *vrows,
+                            pos0,
+                            n,
+                            rope_tab,
+                        )
+                    })
+                    .is_some();
+                }
+            }
+            filled
+        };
+        #[cfg(not(feature = "cuda"))]
+        let q_in_pin = false;
+        if !q_in_pin {
             let (kc, vc) = cache.kv_bufs(li, 1);
             let krows = &mut kc[pos0 * kv_dim..(pos0 + n) * kv_dim];
             let vrows = &mut vc[pos0 * kv_dim..(pos0 + n) * kv_dim];
-            // s172 (P12): 1 行分の本文は `pf_prepare_row` (計測用に切り出し)。
-            crate::prof::time_n_ev(crate::prof::QKNORM, n, || {
-                buf_q
-                    .par_chunks_exact_mut(heads * dh)
-                    .zip(buf_qg.par_chunks_exact(heads * 2 * dh))
-                    .zip(buf_k.par_chunks_exact(kv_dim))
-                    .zip(buf_v.par_chunks_exact(kv_dim))
-                    .zip(krows.par_chunks_exact_mut(kv_dim))
-                    .zip(vrows.par_chunks_exact_mut(kv_dim))
-                    .enumerate()
-                    .for_each(|(i, (((((q_r, qg_i), k_i), v_i), k_row), v_row))| {
-                        // s172 (P12): 本文は `pf_prepare_row` に切り出した
-                        // (計測用・演算列と確保の回数は s171 までと同一)。
-                        pf_prepare_row(
-                            qg_i,
-                            k_i,
-                            v_i,
-                            q_r,
-                            k_row,
-                            v_row,
-                            &fl.q_norm_w,
-                            &fl.k_norm_w,
-                            heads,
-                            self.kv_heads,
-                            dh,
-                            self.n_rot,
-                            self.eps,
-                            self.theta,
-                            rope_tab.map(|t| &t[i * self.n_rot..(i + 1) * self.n_rot]),
-                            pos0 + i,
-                        );
-                    });
-            });
+            self.pf_prepare_into(
+                fl,
+                &mut buf_q[..],
+                &buf_qg[..],
+                &buf_k[..],
+                &buf_v[..],
+                krows,
+                vrows,
+                pos0,
+                n,
+                rope_tab,
+            );
         }
         // s48 (C1): cuda ビルドでは attend を GPU バッチ (dno_attention_prefill
         // 1 発 + D2H 後のホスト sigmoid ゲート) に置き換えて試行する。
@@ -1092,11 +1166,35 @@ impl Qwen35 {
                 n,
                 buf_att,
                 !host_att_needed,
+                // s176 (P20): q は pinned ステージングに書かれている
+                q_in_pin,
             );
             #[cfg(not(feature = "cuda"))]
             let place = AttnPlace::Cpu;
             let att_done = place != AttnPlace::Cpu;
             if !att_done {
+                // s176 (P20): q を pinned に書いた場合、CPU attend はホストの q を
+                // 読むので prepare をもう一度 `buf_q` へ流す (KV 行は同一値の上書き
+                // = 冪等・行ごとの演算列も同一。GPU attention が落ちたときだけの
+                // 経路で、QKNORM バケットには 2 回分が乗る)。
+                if q_in_pin {
+                    fit_prefill_buf(buf_q, n * heads * dh);
+                    let (kc, vc) = cache.kv_bufs(li, 1);
+                    let krows = &mut kc[pos0 * kv_dim..(pos0 + n) * kv_dim];
+                    let vrows = &mut vc[pos0 * kv_dim..(pos0 + n) * kv_dim];
+                    self.pf_prepare_into(
+                        fl,
+                        &mut buf_q[..],
+                        &buf_qg[..],
+                        &buf_k[..],
+                        &buf_v[..],
+                        krows,
+                        vrows,
+                        pos0,
+                        n,
+                        rope_tab,
+                    );
+                }
                 // s172 (P12): CPU attend は `att_head` へ**加算**するので、層間で
                 // 再利用する `buf_att` をここでゼロ埋めする (s63 の要件)。
                 buf_att.par_chunks_exact_mut(dh).for_each(|c| c.fill(0.0));
@@ -1164,6 +1262,9 @@ impl Qwen35 {
         n: usize,
         att: &mut [f32],
         allow_dev: bool,
+        // s176 (P20): `q` は既に attention の pinned ステージングに書かれている
+        // (`chain_pf_q_pin_fill`)。その場合 `q` スライスは読まない。
+        q_pinned: bool,
     ) -> AttnPlace {
         let heads = self.heads;
         let dh = self.dh;
@@ -1173,22 +1274,40 @@ impl Qwen35 {
         if !crate::cuda::attn_prefill_gpu_supported(n, dh, t_total) {
             return AttnPlace::Cpu;
         }
-        if crate::cuda::chain_attention_prefill(
-            cache.kv_id(),
-            li,
-            self.layers.len(),
-            q,
-            cache,
-            pos0,
-            n,
-            t_total,
-            group,
-            dh,
-            kv_dim,
-            1.0 / (dh as f32).sqrt(),
-        )
-        .is_none()
-        {
+        // s176 (P20): カーネル・grid・block・引数・発行順は両分岐で同一。違いは
+        // 「ホスト q → pinned の memcpy を行うか (行わない)」だけ。
+        let launched = if q_pinned {
+            crate::cuda::chain_attention_prefill_pinned(
+                cache.kv_id(),
+                li,
+                self.layers.len(),
+                heads,
+                cache,
+                pos0,
+                n,
+                t_total,
+                group,
+                dh,
+                kv_dim,
+                1.0 / (dh as f32).sqrt(),
+            )
+        } else {
+            crate::cuda::chain_attention_prefill(
+                cache.kv_id(),
+                li,
+                self.layers.len(),
+                q,
+                cache,
+                pos0,
+                n,
+                t_total,
+                group,
+                dh,
+                kv_dim,
+                1.0 / (dh as f32).sqrt(),
+            )
+        };
+        if launched.is_none() {
             return AttnPlace::Cpu;
         }
         // s172 (P12): 残差常駐経路はゲート済み att をデバイスに残せる (H2D を省く)。
