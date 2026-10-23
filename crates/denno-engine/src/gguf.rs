@@ -309,6 +309,121 @@ impl GgufFile {
             }
         }
     }
+
+    /// P42: `token_embd.weight` を **ファイル自身の生ブロックのまま**常駐させ、
+    /// tied lm_head 用の量子化コピーを同じ行チャンクから作る。
+    ///
+    /// 従来の [`GgufFile::embed_and_linear_chunked`] は gather 用に `k*n` 個の
+    /// f32 (27B Q4_0 で 5,085.6 MB) を常駐させる。ここではその代わりに
+    /// `n*row_bytes` (同じ 27B で 715.2 MB) の生ブロックを確保するだけで、
+    /// 行は呼び出し側が `kquant::dequant_row(_into)` で必要分だけ復元する
+    /// (**再量子化はしない** — 復元値は f32 表の同じ行とビット一致。P38 が実
+    /// 27B の全 248,320 行で `to_bits()` 差分 0 を実測)。
+    ///
+    /// `fill` は従来と同じチャンク読み出しなので、`blocks` は
+    /// `tensor_bytes(name)` とバイト一致し、`Linear` は
+    /// `embed_and_linear_chunked` が返すものとバイト一致する (同じ
+    /// `gguf_rows_quantized_chunked_with_sink` を同じ順で通る)。
+    ///
+    /// 形・型・バイト数が想定外なら `Ok(None)` (呼び出し側は従来経路 = fail-closed)。
+    pub fn embed_blocks_and_linear_chunked(
+        &self,
+        name: &str,
+        k: usize,
+        n: usize,
+        mode: crate::quant::QuantMode,
+        chunk_rows: usize,
+    ) -> Result<Option<(EmbedBlocks, Linear, ChunkedQuantStats)>, GgufError> {
+        let Some((bytes, row_bytes, ty)) = self.chunked_rows(name, k, n)? else {
+            return Ok(None);
+        };
+        // P42 v1 は Q4_0 のみ (行境界 = ブロック境界が保証される型)。
+        if ty != GgmlType::Q4_0 {
+            return Ok(None);
+        }
+        let Some(total) = n.checked_mul(row_bytes) else {
+            return Ok(None);
+        };
+        let mut blocks = vec![0u8; total];
+        let res = crate::quant::gguf_rows_quantized_chunked_with_sink(
+            ty,
+            mode,
+            k,
+            n,
+            chunk_rows,
+            |r0, rows, buf| {
+                let off = r0 * row_bytes;
+                let len = rows * row_bytes;
+                buf.clear();
+                buf.extend_from_slice(&bytes[off..off + len]);
+                // 同じチャンクを生ブロックの常駐先へも書く (ピークを増やさない)。
+                blocks[off..off + len].copy_from_slice(&buf[..]);
+                Ok(())
+            },
+            |_, _| {},
+        );
+        match res {
+            Ok((l, st)) => Ok(Some((
+                EmbedBlocks {
+                    blocks,
+                    k,
+                    n,
+                    row_bytes,
+                    ty,
+                },
+                l,
+                st,
+            ))),
+            Err(e) => {
+                tracing::warn!("{name}: 生ブロック常駐を中止して従来経路へ ({e})");
+                Ok(None)
+            }
+        }
+    }
+
+    /// P42: [`GgufFile::embed_blocks_and_linear_chunked`] の前提判定 (ヘッダのみ)。
+    ///
+    /// `tied && chunked` は呼び出し側 (モデルローダ) の条件なのでここには無い。
+    /// 1 つでも崩れたら `false` = 従来の f32 表経路。
+    pub fn embed_blocks_eligible(&self, name: &str, k: usize, n: usize) -> bool {
+        let Some(t) = self.tensor(name) else {
+            return false;
+        };
+        embed_blocks_eligible(Some(t.ty), k, n, t.nbytes)
+    }
+}
+
+/// P42: `token_embd` を生ブロック常駐 + 行デ量子化で扱えるかの **純関数**。
+///
+/// 前提 (どれか 1 つでも崩れたら従来の f32 表):
+/// - ファイル型が Q4_0 (行境界 = ブロック境界)、
+/// - `k` がブロックサイズ (32) の倍数、
+/// - `nbytes == n * (k/32)*18` (= 行が隙間なく並ぶ)。
+///
+/// `vocab * e == elems` は `chunked_rows` が dims から検証済み。
+pub fn embed_blocks_eligible(ty: Option<GgmlType>, k: usize, n: usize, nbytes: u64) -> bool {
+    let bs = GgmlType::Q4_0.blck_size();
+    if ty != Some(GgmlType::Q4_0) || k == 0 || n == 0 || bs == 0 || k % bs != 0 {
+        return false;
+    }
+    let row_bytes = (k / bs) * GgmlType::Q4_0.type_size();
+    nbytes == (n as u64) * (row_bytes as u64)
+}
+
+/// P42: `token_embd.weight` の生ブロック常駐 (Option B) の戻り値。
+///
+/// `blocks` はファイルの `n*row_bytes` バイトそのもの (再量子化なし)。
+/// 行 `r` は `blocks[r*row_bytes .. (r+1)*row_bytes]` を `ty` でデ量子化する。
+#[derive(Debug, Clone)]
+pub struct EmbedBlocks {
+    pub blocks: Vec<u8>,
+    /// 1 行の要素数
+    pub k: usize,
+    /// 行数
+    pub n: usize,
+    /// 1 行のバイト数
+    pub row_bytes: usize,
+    pub ty: GgmlType,
 }
 
 /// P35: ヘッダ (メタデータ + テンソル情報) だけを保持する mmap 無しのビュー。
@@ -1681,5 +1796,355 @@ mod tests {
         }
         println!("\n[p38] VERDICT: per-row dequant of token_embd.weight is BIT-IDENTICAL to the \
                   loader's f32 table row ({} sampled rows + {} swept rows)", verdicts.len(), swept_rows);
+    }
+
+    // =====================================================================
+    // P42: 常駐 f32 表 (5,086 MB) を「ファイル自身の Q4_0 生ブロック +
+    // 行オンデマンド復元」(Option B) へ置き換える経路の証明。
+    //
+    //  (1) 前提判定 (純関数) が想定外の形を必ず弾く
+    //  (2) `embed_blocks_and_linear_chunked` の生ブロックがテンソルのバイト列と
+    //      一致し、lm_head コピーが従来経路とバイト一致する (合成 GGUF)
+    //  (3) 実 27B で `EmbedTable::Q4Rows` の行がローダの f32 表の同じ行と
+    //      全行ビット一致する (#[ignore]・mmap しない・MemAvailable ガード)
+    // =====================================================================
+
+    /// 合成 Q4_0 ブロック列 (`n` 行 × `k` 要素・k は 32 の倍数)。
+    /// スケールは f16 の実在値 (有限・負値 = 実ファイルと同じ符号)、
+    /// ニブルは決定的な擬似乱数。
+    fn p42_synth_blocks(k: usize, n: usize) -> (Vec<u8>, usize) {
+        assert!(k % 32 == 0, "k={k} が 32 の倍数でない");
+        let row_bytes = (k / 32) * 18;
+        let mut blocks = vec![0u8; n * row_bytes];
+        const SCALES: [u16; 6] = [0x9c00, 0xa400, 0x8e66, 0xb1c3, 0x9400, 0x9d55];
+        let mut s = 0x1234_5678u32;
+        let mut next = |s: &mut u32| -> u32 {
+            *s ^= *s << 13;
+            *s ^= *s >> 17;
+            *s ^= *s << 5;
+            *s
+        };
+        for r in 0..n {
+            for b in 0..(k / 32) {
+                let off = r * row_bytes + b * 18;
+                let sc = SCALES[(next(&mut s) as usize) % SCALES.len()];
+                blocks[off..off + 2].copy_from_slice(&sc.to_le_bytes());
+                for j in 0..16 {
+                    blocks[off + 2 + j] = (next(&mut s) & 0xff) as u8;
+                }
+            }
+        }
+        (blocks, row_bytes)
+    }
+
+    /// 合成 Q4_0 GGUF (1 テンソル・v3・alignment 32) を書く。
+    /// ヘッダ配置は実ファイルと同じ規則 (データ部は 32 B 整列)。
+    fn p42_write_gguf_q4(path: &std::path::Path, name: &str, k: usize, n: usize, blocks: &[u8]) {
+        const ALIGN: usize = 32;
+        fn u32b(v: &mut Vec<u8>, x: u32) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        fn u64b(v: &mut Vec<u8>, x: u64) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        fn strb(v: &mut Vec<u8>, s: &str) {
+            u64b(v, s.len() as u64);
+            v.extend_from_slice(s.as_bytes());
+        }
+        let mut b = Vec::new();
+        u32b(&mut b, 0x4655_4747); // magic
+        u32b(&mut b, 3); // version
+        u64b(&mut b, 1); // tensor_count
+        u64b(&mut b, 1); // kv_count
+        strb(&mut b, "general.architecture");
+        u32b(&mut b, 8); // GT_STRING
+        strb(&mut b, "qwen3_5");
+        strb(&mut b, name);
+        u32b(&mut b, 2); // n_dims
+        u64b(&mut b, k as u64);
+        u64b(&mut b, n as u64);
+        u32b(&mut b, 2); // GGML_TYPE Q4_0
+        u64b(&mut b, 0); // offset
+        while b.len() % ALIGN != 0 {
+            b.push(0);
+        }
+        b.extend_from_slice(blocks);
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// P42: 前提判定の表 (陽性 1 + 陰性 5)。
+    #[test]
+    fn embed_blocks_eligible_rejects_unexpected_geometry() {
+        let k = 128usize; // 4 ブロック/行
+        let n = 7usize;
+        let row_bytes = (k / 32) * 18;
+        let nbytes = (n * row_bytes) as u64;
+        // 陽性: Q4_0・k は 32 の倍数・nbytes == n*row_bytes
+        assert!(embed_blocks_eligible(Some(GgmlType::Q4_0), k, n, nbytes));
+        // 陰性 1: 型が Q4_0 でない
+        assert!(!embed_blocks_eligible(Some(GgmlType::F16), k, n, nbytes));
+        assert!(!embed_blocks_eligible(Some(GgmlType::Q8_0), k, n, nbytes));
+        // 陰性 2: テンソルが無い
+        assert!(!embed_blocks_eligible(None, k, n, nbytes));
+        // 陰性 3: 1 行がブロック境界に載らない
+        assert!(!embed_blocks_eligible(Some(GgmlType::Q4_0), k + 1, n, nbytes));
+        // 陰性 4: nbytes が行数×行長でない (行が隙間なく並ばない)
+        assert!(!embed_blocks_eligible(Some(GgmlType::Q4_0), k, n, nbytes - 1));
+        assert!(!embed_blocks_eligible(
+            Some(GgmlType::Q4_0),
+            k,
+            n,
+            nbytes + row_bytes as u64
+        ));
+        // 陰性 5: 行数 0 / 行長 0
+        assert!(!embed_blocks_eligible(Some(GgmlType::Q4_0), k, 0, 0));
+        assert!(!embed_blocks_eligible(Some(GgmlType::Q4_0), 0, n, 0));
+    }
+
+    /// P42: 生ブロック経路が (a) テンソルのバイト列そのもの・(b) lm_head コピーが
+    /// 従来経路とバイト一致・(c) 行復元が f32 表の同じ行とビット一致、を合成
+    /// GGUF で確かめる。
+    #[test]
+    fn embed_blocks_and_linear_chunked_matches_f32_table_path() {
+        use crate::model::qwen35::EmbedTable;
+        let k = 128usize;
+        let n = 7usize;
+        let chunk_rows = 3usize; // 端数チャンクを作る (7 = 3+3+1)
+        let (blocks, row_bytes) = p42_synth_blocks(k, n);
+        assert_eq!(blocks.len(), n * row_bytes);
+
+        let dir = std::env::temp_dir().join(format!("denno_p42_gguf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.gguf");
+        p42_write_gguf_q4(&path, "token_embd.weight", k, n, &blocks);
+
+        let f = GgufFile::open(&path).expect("合成 GGUF を開けない");
+        let t = f.tensor("token_embd.weight").expect("tensor").clone();
+        assert_eq!(t.ty, GgmlType::Q4_0);
+        assert_eq!(t.nbytes as usize, n * row_bytes);
+        assert!(f.embed_blocks_eligible("token_embd.weight", k, n));
+
+        // (a) 生ブロック == テンソルのバイト列
+        let (bl, l_blocks, st) = f
+            .embed_blocks_and_linear_chunked(
+                "token_embd.weight",
+                k,
+                n,
+                QuantMode::Q4_0,
+                chunk_rows,
+            )
+            .expect("生ブロック経路がエラー")
+            .expect("生ブロック経路が None");
+        assert_eq!(bl.blocks.as_slice(), f.tensor_bytes("token_embd.weight").unwrap());
+        assert_eq!(bl.blocks.as_slice(), &blocks[..]);
+        assert_eq!((bl.k, bl.n, bl.row_bytes), (k, n, row_bytes));
+        assert_eq!(bl.ty, GgmlType::Q4_0);
+        assert_eq!(st.chunks, 3, "端数チャンクを含む 3 チャンク");
+
+        // (b) lm_head コピーは従来 (f32 表) 経路とバイト一致
+        let (table, l_table, _) = f
+            .embed_and_linear_chunked("token_embd.weight", k, n, QuantMode::Q4_0, chunk_rows)
+            .expect("f32 表経路がエラー")
+            .expect("f32 表経路が None");
+        match (&l_blocks, &l_table) {
+            (Linear::Q4(a), Linear::Q4(b)) => {
+                assert_eq!(a.blocks, b.blocks, "lm_head の Q4 コピーが従来経路と不一致");
+            }
+            _ => panic!("Q4_0 モードで Q4Linear が返らない"),
+        }
+        assert_eq!(l_blocks.weight_bytes(), l_table.weight_bytes());
+
+        // (c) 行復元 (EmbedTable::Q4Rows) == f32 表の同じ行 (ビット一致)
+        let emb = EmbedTable::Q4Rows {
+            blocks: bl.blocks,
+            k,
+            n,
+            row_bytes,
+            ty: GgmlType::Q4_0 as u16,
+        };
+        let mut buf = vec![0.0f32; k];
+        for r in 0..n {
+            emb.row_into(r, &mut buf);
+            let want = &table[r * k..(r + 1) * k];
+            for (i, (a, b)) in buf.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "row {r} elem {i}: 生ブロック復元 {a} != f32 表 {b}"
+                );
+            }
+            assert_eq!(emb.row(r, k).as_ref(), want, "row {r} (row()) が不一致");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P42: 実 27B Q4_0 で、生ブロック常駐 + 行復元 (`EmbedTable::Q4Rows`) が
+    /// ローダのチャンク dequant (= f32 表の作り方) と **全行ビット一致**する
+    /// ことを確かめる。
+    ///
+    /// 実行:
+    ///   GGUF_PATH=/work/models/Qwen3.8-27B-Q4_0.gguf \
+    ///   CARGO_TARGET_DIR=/tmp/p42-target \
+    ///   cargo test --release -p denno-engine --features cuda --lib -- --ignored \
+    ///     --nocapture q4_embed_rows_ondemand_matches_loader_real_gguf
+    ///
+    /// 環境変数: `DENNO_P42_SWEEP=0` で全行スイープを省略 (既定は実行)。
+    /// mmap しない (ヘッダ + pread のみ)。常駐は Option B と同じ 715.2 MB +
+    /// 1 チャンク (16.8 MB)。
+    #[test]
+    #[ignore]
+    fn q4_embed_rows_ondemand_matches_loader_real_gguf() {
+        use crate::model::qwen35::EmbedTable;
+        let path = match std::env::var("GGUF_PATH") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                let d = std::path::PathBuf::from("/work/models/Qwen3.8-27B-Q4_0.gguf");
+                if !d.exists() {
+                    eprintln!("skip: GGUF_PATH 未設定かつ /work/models に既定モデルが無い");
+                    return;
+                }
+                d
+            }
+        };
+        // メモリ規律: 8 GiB 未満なら走らせない
+        match mem_available_gib() {
+            Some(g) if g < 8.0 => {
+                panic!("MemAvailable {g:.1} GiB < 8 GiB — 走らせない (`free -g` を確認)")
+            }
+            Some(g) => println!("[p42] MemAvailable {g:.2} GiB"),
+            None => println!("[p42] MemAvailable 不明 (/proc/meminfo 無し) — 続行"),
+        }
+
+        let mut file = std::fs::File::open(&path).expect("GGUF を開けない");
+        let file_len = file.metadata().expect("metadata").len();
+        let hdr = read_header(&mut file, file_len);
+        let t = hdr
+            .tensor("token_embd.weight")
+            .expect("token_embd.weight が無い")
+            .clone();
+        let k = t.dims[0] as usize;
+        let n: usize = t.dims[1..].iter().product::<u64>() as usize;
+        assert_eq!(t.ty, GgmlType::Q4_0, "P42 v1 は Q4_0 のみ");
+        assert!(
+            embed_blocks_eligible(Some(t.ty), k, n, t.nbytes),
+            "前提判定が false (k={k} n={n} nbytes={})",
+            t.nbytes
+        );
+        let row_bytes = (k / 32) * 18;
+        let (start, end) = hdr.tensor_range("token_embd.weight").expect("range");
+        assert_eq!(end - start, t.nbytes);
+        println!(
+            "[p42] k={k} n={n} row_bytes={row_bytes} raw={:.1} MB f32 table={:.1} MB",
+            t.nbytes as f64 / 1e6,
+            (k * n * 4) as f64 / 1e6
+        );
+
+        // 生ブロックを pread で読む (全体 map しない)。読みは行境界に整列。
+        reset_peak_rss();
+        let base_rss = rss_now_bytes();
+        let t_read = std::time::Instant::now();
+        let mut blocks = vec![0u8; n * row_bytes];
+        let rows_per_read = ((64usize << 20) / row_bytes).max(1);
+        let mut r0 = 0usize;
+        while r0 < n {
+            let rows = (n - r0).min(rows_per_read);
+            let buf = p38_read_rows(
+                &mut file,
+                start + (r0 * row_bytes) as u64,
+                row_bytes,
+                rows,
+            );
+            blocks[r0 * row_bytes..(r0 + rows) * row_bytes].copy_from_slice(&buf);
+            r0 += rows;
+        }
+        println!(
+            "[p42] raw blocks resident {:.1} MB (pread {:.2} s, peak RSS +{:.1} MB)",
+            blocks.len() as f64 / 1e6,
+            t_read.elapsed().as_secs_f64(),
+            delta_mb(peak_rss_bytes(), base_rss)
+        );
+        let emb = EmbedTable::Q4Rows {
+            blocks,
+            k,
+            n,
+            row_bytes,
+            ty: t.ty as u16,
+        };
+        // 参照側でも同じ生ブロックを読む (コピーを作らない)。
+        let raw: &[u8] = match &emb {
+            EmbedTable::Q4Rows { blocks, .. } => blocks,
+            EmbedTable::F32(_) => unreachable!(),
+        };
+
+        // 参照: ローダ (gguf_rows_quantized_chunked_with_sink) と同じチャンクで
+        // dequant した f32 表の同じ行。
+        let chunk_rows = crate::quant::chunk_rows_for(k).clamp(1, n);
+        let sweep_on = std::env::var("DENNO_P42_SWEEP").map(|v| v.trim() != "0").unwrap_or(true);
+        let sample = p38_sample_rows(n, chunk_rows, 40);
+        let t_cmp = std::time::Instant::now();
+        let mut buf = vec![0.0f32; k];
+        let mut checked = 0usize;
+        let mut bad = 0usize;
+        let mut first_bad: Option<(usize, usize, u32, u32)> = None;
+        let mut c0 = 0usize;
+        while c0 < n {
+            let rows = (n - c0).min(chunk_rows);
+            let w = dequant_row(
+                t.ty,
+                &raw[c0 * row_bytes..(c0 + rows) * row_bytes],
+                rows * k,
+            );
+            let row_list: Vec<usize> = if sweep_on {
+                (0..rows).collect()
+            } else {
+                sample
+                    .iter()
+                    .filter(|&&r| r >= c0 && r < c0 + rows)
+                    .map(|&r| r - c0)
+                    .collect()
+            };
+            for rr in row_list {
+                emb.row_into(c0 + rr, &mut buf);
+                let want = &w[rr * k..(rr + 1) * k];
+                checked += 1;
+                for (i, (a, b)) in buf.iter().zip(want.iter()).enumerate() {
+                    if a.to_bits() != b.to_bits() {
+                        bad += 1;
+                        if first_bad.is_none() {
+                            first_bad = Some((c0 + rr, i, a.to_bits(), b.to_bits()));
+                        }
+                        break;
+                    }
+                }
+            }
+            c0 += rows;
+        }
+        println!(
+            "[p42] compared {checked} rows (sweep={sweep_on}, chunk_rows={chunk_rows}) in {:.2} s",
+            t_cmp.elapsed().as_secs_f64()
+        );
+        assert_eq!(
+            bad, 0,
+            "行復元がローダの f32 表とビット不一致 ({bad} 行・最初 {first_bad:?})"
+        );
+        assert_eq!(checked, if sweep_on { n } else { sample.len() });
+
+        // P42: 製品経路 (常駐ブロック + row_into・pread 無し) の 1 行コストを
+        // CPU で実測する。GPU の KPI (ms/token) はここでは測らない。
+        const BENCH_ROWS: usize = 20_000;
+        let t_bench = std::time::Instant::now();
+        let mut acc = 0.0f64;
+        for i in 0..BENCH_ROWS {
+            let r = (i * 7919) % n; // 行を散らす (キャッシュに載り切らない)
+            emb.row_into(r, &mut buf);
+            acc += buf[0] as f64;
+        }
+        let per_row_us = t_bench.elapsed().as_secs_f64() * 1e6 / BENCH_ROWS as f64;
+        println!(
+            "[p42] product-path row_into: {per_row_us:.3} us/row over {BENCH_ROWS} rows \
+             (resident blocks, no pread; checksum {acc:.3})"
+        );
+        println!("[p42] VERDICT: EmbedTable::Q4Rows is BIT-IDENTICAL to the loader's f32 table ({checked} rows)");
     }
 }

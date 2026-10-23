@@ -361,6 +361,28 @@ pub fn gguf_chunked_enabled() -> bool {
     gguf_chunked_from_value(v.as_deref())
 }
 
+/// P42: `token_embd.weight` を「生ブロック常駐 + 行オンデマンド復元」で持つか。
+///
+/// **既定は有効**。`0` / `false` / `no` / `off` を明示したときだけ従来の常駐
+/// f32 表 (27B Q4_0 で 5,085.6 MB) に戻る。復元値は f32 表の同じ行と
+/// ビット一致するので、どちらの経路でも数値は変わらない (P38 の実ファイル証明)。
+pub const EMBED_ONDEMAND_ENV: &str = "DENNO_EMBED_ONDEMAND";
+
+/// P42: env 値の解釈 (純関数・テスト可能)。未設定・空は既定 = 有効。
+pub fn embed_ondemand_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None => true,
+        Some(s) if s.is_empty() => true,
+        Some(s) => !matches!(s.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+    }
+}
+
+/// P42: 現在の env 設定で行オンデマンド復元が有効か (ロード開始時に 1 回だけ呼ぶ)。
+pub fn embed_ondemand_enabled() -> bool {
+    let v = std::env::var(EMBED_ONDEMAND_ENV).ok();
+    embed_ondemand_from_value(v.as_deref())
+}
+
 /// P37: 行チャンク量子化の実測/計算値 (レポート・テスト用)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChunkedQuantStats {
@@ -1256,6 +1278,21 @@ mod tests {
         assert!(!gguf_chunked_from_value(Some("off")));
         assert!(!gguf_chunked_from_value(Some("false")));
         assert!(!gguf_chunked_from_value(Some("NO")));
+    }
+
+    /// P42: token_embd の行オンデマンド復元の env ゲート。**未設定・空は既定 =
+    /// 有効** (新経路)、明示的な偽値だけが従来の常駐 f32 表に戻す。
+    #[test]
+    fn embed_ondemand_gate_parsing() {
+        assert!(embed_ondemand_from_value(None), "未設定は既定 (有効)");
+        assert!(embed_ondemand_from_value(Some("")), "空は既定 (有効)");
+        assert!(embed_ondemand_from_value(Some("1")));
+        assert!(embed_ondemand_from_value(Some("on")));
+        assert!(!embed_ondemand_from_value(Some("0")));
+        assert!(!embed_ondemand_from_value(Some(" 0 ")));
+        assert!(!embed_ondemand_from_value(Some("off")));
+        assert!(!embed_ondemand_from_value(Some("false")));
+        assert!(!embed_ondemand_from_value(Some("NO")));
     }
 
     /// P37: 行チャンク数は `k` から決まり、f32 一時領域が

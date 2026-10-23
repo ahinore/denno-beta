@@ -3770,3 +3770,35 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
   あり、pass 間のホスト側の詰まりも含む。
 - **次の実装内容**: 実測で支配的な pass が判明したら、その pass のレーン/チャンク分割を狙う
   (P36 の 4 レーン版は pass 1 を狙って効果なしと確定済み = 支配が pass 1 でない可能性)。
+
+### P42: `token_embd` の常駐 5,086 MB f32 表を行単位デ量子化 (Option B) へ置き換えた (2026-10-23) 完了 (ホスト RAM -4,370.4 MB・数値はビット不変)
+
+- **課題**: 27B q4 serve のホスト RSS のうち `token_embd.weight` の gather 用 f32 表が
+  5,085,593,600 B (5,085.6 MB) を占めていた。これは**ファイルの Q4_0 ブロックを
+  デ量子化しただけ**の表 (再量子化ではない) なので、行が要るときに同じブロックから
+  復元すれば同じ値になる (P38 が実ファイルで証明済み)。
+- **実装**: `gguf.rs` に `embed_blocks_and_linear_chunked` (f32 表の代わりにファイル自身の
+  生ブロック `n*row_bytes` を確保し、tied lm_head 用の量子化コピーは従来と同じ行チャンクで
+  作る) と前提判定 `embed_blocks_eligible` (型が Q4_0・`k % 32 == 0`・
+  `nbytes == n*row_bytes`・`vocab*e == elems`) を追加。`qwen35.rs` の `embed: Vec<f32>` を
+  `EmbedTable { F32, Q4Rows { blocks, k, n, row_bytes, ty } }` に置き換え、読者
+  (decode 1 行 / prefill n 行 / chain upload 1 行 / テスト補助) を `row()` / `row_into()`
+  へ移した。`F32` variant は現行の `&w[i*e..][..e]` とバイト同一で、Fp32 経路 (tied fp32
+  lm_head) と前提が崩れたときの fail-closed 先。復元は `kquant::dequant_row_into`
+  (新設・`dequant_row` と同一本体) で行い、**再量子化は一切しない**。
+  既定 ON・`DENNO_EMBED_ONDEMAND=0|false|no|off` で従来の f32 表に戻る。
+- **ビット一致の根拠**: 27B Q4_0 (k=5,120 / n=248,320 / row_bytes=2,880) で
+  `EmbedTable::Q4Rows` の全 248,320 行をローダのチャンク dequant と比較し
+  `to_bits()` 差分 0 (実測 3.19 s・常駐 715.2 MB・pread 0.66 s)。合成ブロックの単体テストは
+  行 0・最終行・チャンク境界を跨ぐ行を含み、F32 variant との一致も固定。
+  R4/R5 (tied fp32 lm_head・全行 matvec) は `quant != Fp32` では到達しないため、
+  Q4Rows で呼ばれたら理由付き panic にする (黙って 5 GB を確保しない)。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` = 335 passed /
+  0 failed / 41 ignored (基準 330 + 新規 5)、`--test kernel_invariants` = 11 passed、
+  非 cuda `--lib` = 291 passed。`.cu` / `.ptx` / GPU / スクリプト / 数値方針は未変更。
+- **未検証 (PREDICTED)**: ホスト常駐の削減量 -4,370.4 MB は確保バイト数の差
+  (5,085,593,600 → 715,161,600 B) であって RSS 実測ではない。KPI への影響
+  (decode +0.003 ms/token = 0.018 %、prefill +9.8 ms @3,161 / +39.7 ms @12,850 =
+  0.10 %) は P38 の 3.09 µs/token から**予測**した値で、実機 (8095) では未計測。
+  製品経路の 1 行復元は CPU 実測 1.95 µs/row (常駐ブロック・pread 無し) で、
+  予測に使った 3.09 µs より小さい = 予測は保守側。アンカー md5 の再取得は未実施。

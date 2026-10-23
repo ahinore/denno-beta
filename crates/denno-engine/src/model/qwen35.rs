@@ -31,6 +31,7 @@
 
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::path::Path;
 
 use crate::gguf::GgufFile;
@@ -118,6 +119,119 @@ enum AttnKind {
     Full(FullLayer),
 }
 
+/// P42: `token_embd.weight` の gather 表。
+///
+/// - `F32`: 従来の常駐 f32 表 `[vocab, e]`。Fp32 モード (tied lm_head が
+///   `embed` を直接 matvec する) と、`Q4Rows` の前提が崩れたときの fail-closed 先。
+///   読み出しは現行と byte-for-byte 同一 (`&w[i*e..][..e]` のコピーだけ)。
+/// - `Q4Rows`: ファイル自身の Q4_0 生ブロック (`n*row_bytes` B) を常駐させ、
+///   行が要るときだけ `kquant::dequant_row_into` で復元する。**再量子化はしない**
+///   (P38 が実 27B の全 248,320 行で `to_bits()` 差分 0 を実測)。27B Q4_0 で
+///   常駐が 5,085.6 MB → 715.2 MB。
+///
+/// 行の復元はブロック内で閉じており、行境界 = ブロック境界 (`k % 32 == 0`) なので
+/// 1 行だけ復元した値は表の同じ行とビット一致する。
+#[derive(Clone)]
+pub(crate) enum EmbedTable {
+    F32(Vec<f32>),
+    Q4Rows {
+        /// ファイルの生ブロックそのもの (`n * row_bytes` バイト)
+        blocks: Vec<u8>,
+        /// 1 行の要素数 (= e)
+        k: usize,
+        /// 行数 (= vocab)
+        n: usize,
+        /// 1 行のバイト数 (Q4_0 は (k/32)*18)
+        row_bytes: usize,
+        /// ggml 型 id (v1 は Q4_0 = 2 のみ)
+        ty: u16,
+    },
+}
+
+impl EmbedTable {
+    /// 行数。`e` は 1 行の要素数 (F32 は要素数から導出する)。
+    pub(crate) fn rows(&self, e: usize) -> usize {
+        match self {
+            EmbedTable::F32(w) => {
+                if e == 0 {
+                    0
+                } else {
+                    w.len() / e
+                }
+            }
+            EmbedTable::Q4Rows { n, .. } => *n,
+        }
+    }
+
+    /// 1 行を借りる。F32 はスライスをそのまま返し (コピーなし)、Q4Rows は
+    /// 復元した `Vec` を返す (`Cow::Owned`)。1 回だけ使う読み手向け。
+    pub(crate) fn row(&self, i: usize, e: usize) -> Cow<'_, [f32]> {
+        match self {
+            EmbedTable::F32(w) => Cow::Borrowed(&w[i * e..i * e + e]),
+            EmbedTable::Q4Rows { .. } => {
+                let mut v = vec![0.0f32; e];
+                self.row_into(i, &mut v);
+                Cow::Owned(v)
+            }
+        }
+    }
+
+    /// 1 行を `out` (長さ = e) へ書く。**確保しない** (Q4Rows は行バッファを
+    /// 使い回せる)。F32 は `copy_from_slice` だけなので従来の
+    /// `x.copy_from_slice(&self.embed[i*e..][..e])` とバイト同一。
+    pub(crate) fn row_into(&self, i: usize, out: &mut [f32]) {
+        match self {
+            EmbedTable::F32(w) => {
+                let e = out.len();
+                out.copy_from_slice(&w[i * e..i * e + e]);
+            }
+            EmbedTable::Q4Rows {
+                blocks,
+                k,
+                row_bytes,
+                ty,
+                ..
+            } => {
+                assert_eq!(
+                    out.len(),
+                    *k,
+                    "EmbedTable::Q4Rows: 行長 {} が k {k} と不一致",
+                    out.len()
+                );
+                let ty = GgmlType::from_id(*ty as u32)
+                    .unwrap_or_else(|| panic!("EmbedTable::Q4Rows: 未知の ggml 型 id {ty}"));
+                let off = i * row_bytes;
+                crate::kquant::dequant_row_into(ty, &blocks[off..off + row_bytes], out);
+            }
+        }
+    }
+
+    /// f32 表そのもの (tied fp32 lm_head の R4/R5 専用)。Q4Rows では `None`。
+    pub(crate) fn as_f32(&self) -> Option<&[f32]> {
+        match self {
+            EmbedTable::F32(w) => Some(w),
+            EmbedTable::Q4Rows { .. } => None,
+        }
+    }
+
+    /// R4/R5 (tied fp32 lm_head) 用の取り出し。`quant != Fp32` では `lm_head` が
+    /// 必ず `Some(量子化コピー)` なのでこの経路は**到達しない**。
+    ///
+    /// 到達した場合は黙って全行 f32 化 (27B で 5 GB 確保 + 未検証の数値) せず、
+    /// 理由の分かる panic にする (`logits` は `Vec<f32>` を返すので `Result` へ
+    /// 変えると全呼び出し元へ波及するため)。
+    pub(crate) fn f32_table_or_panic(&self, site: &str) -> &[f32] {
+        self.as_f32().unwrap_or_else(|| {
+            panic!(
+                "{site}: tied fp32 lm_head が Q4Rows の embed を f32 表として読もうとした。\
+                 この経路は quant != Fp32 では到達しない (tied なら lm_head は量子化コピー、\
+                 Fp32 なら embed は F32 表)。全行 f32 化は 27B で 5 GB を確保するため\
+                 フォールバックしない。"
+            )
+        })
+    }
+}
+
 pub struct Qwen35 {
     e: usize,
     heads: usize,
@@ -130,7 +244,8 @@ pub struct Qwen35 {
     eps: f32,
     theta: f32,
     eos_ids: Vec<u32>,
-    embed: Vec<f32>,         // [vocab, e] (gather 用 fp32)
+    /// P42: gather 表 (F32 = 従来の常駐 f32 表 / Q4Rows = ファイルの Q4_0 生ブロック)
+    embed: EmbedTable,
     norm_w: Vec<f32>,
     lm_head: Option<Linear>, // tied: Int8 モードのみ量子化コピー / Fp32 は None
     gdn_p: GdnParams,
@@ -696,23 +811,64 @@ impl Qwen35 {
         // 同時に生きていた。行チャンクなら常駐 f32 表と量子化コピーを同じ
         // チャンクで埋めるので、経由する f32 は 1 チャンク分 (~19 MB) だけ。
         // 生成される表と量子化バイト列は従来経路と同一。
-        let mut embed_chunked: Option<(Vec<f32>, Linear)> = None;
+        let mut embed_chunked: Option<(EmbedTable, Linear)> = None;
         if tied && chunked {
             expect_ne(&f, "token_embd.weight", &[eu, vocab as u64])
                 .with_context(|| "tensor token_embd.weight".to_string())?;
             let rows = crate::quant::chunk_rows_for(e);
-            if let Some((table, l, st)) =
-                f.embed_and_linear_chunked("token_embd.weight", e, vocab, quant, rows)?
+            // P42 (Option B): gather 表を f32 で常駐させず、**ファイル自身の
+            // Q4_0 生ブロック** (27B で 715.2 MB) だけを持ち、行は必要時に
+            // `kquant::dequant_row_into` で復元する。復元値は f32 表の同じ行と
+            // ビット一致 (P38 実ファイル証明)。前提が崩れたら従来経路へ。
+            // 既定 ON・`DENNO_EMBED_ONDEMAND=0` で従来の f32 表。
+            let mut done = false;
+            if crate::quant::embed_ondemand_enabled()
+                && f.embed_blocks_eligible("token_embd.weight", e, vocab)
             {
-                tracing::info!(
-                    "token_embd.weight: 行チャンク {} 行 x {} 回で f32 表 + {:?} コピーを作成 (ピーク一時 {:.1} MB)",
-                    st.chunk_rows,
-                    st.chunks,
-                    quant,
-                    st.peak_bytes() as f64 / 1e6
-                );
-                quant_bytes.set(quant_bytes.get() + l.weight_bytes());
-                embed_chunked = Some((table, l));
+                if let Some((bl, l, st)) =
+                    f.embed_blocks_and_linear_chunked("token_embd.weight", e, vocab, quant, rows)?
+                {
+                    tracing::info!(
+                        "token_embd.weight: 生 Q4_0 ブロック常駐 {:.1} MB ({:?} / 1 行 {} B / {} 行) \
+                         + {:?} コピーを行チャンク {} 行 x {} 回で作成 (ピーク一時 {:.1} MB) \
+                         — 行は必要時に復元 (再量子化なし)",
+                        bl.blocks.len() as f64 / 1e6,
+                        bl.ty,
+                        bl.row_bytes,
+                        bl.n,
+                        quant,
+                        st.chunk_rows,
+                        st.chunks,
+                        st.peak_bytes() as f64 / 1e6
+                    );
+                    quant_bytes.set(quant_bytes.get() + l.weight_bytes());
+                    embed_chunked = Some((
+                        EmbedTable::Q4Rows {
+                            blocks: bl.blocks,
+                            k: bl.k,
+                            n: bl.n,
+                            row_bytes: bl.row_bytes,
+                            ty: bl.ty as u16,
+                        },
+                        l,
+                    ));
+                    done = true;
+                }
+            }
+            if !done {
+                if let Some((table, l, st)) =
+                    f.embed_and_linear_chunked("token_embd.weight", e, vocab, quant, rows)?
+                {
+                    tracing::info!(
+                        "token_embd.weight: 行チャンク {} 行 x {} 回で f32 表 + {:?} コピーを作成 (ピーク一時 {:.1} MB)",
+                        st.chunk_rows,
+                        st.chunks,
+                        quant,
+                        st.peak_bytes() as f64 / 1e6
+                    );
+                    quant_bytes.set(quant_bytes.get() + l.weight_bytes());
+                    embed_chunked = Some((EmbedTable::F32(table), l));
+                }
             }
         }
         let (embed, lm_head) = match embed_chunked {
@@ -731,7 +887,7 @@ impl Qwen35 {
                 } else {
                     Some(lin_g("output.weight", &[eu, vocab as u64], e, vocab)?)
                 };
-                (embed, lm_head)
+                (EmbedTable::F32(embed), lm_head)
             }
         };
         let norm_w = match f.tensor("output_norm.weight") {
@@ -1647,13 +1803,15 @@ impl Qwen35 {
                 // 一意なので mid*2 / mid*2+1 で衝突しない)。
                 let (w, k, n, key) = if let Some(lm) = &self.lm_head {
                     match lm {
-                        crate::quant::Linear::F32 { w, k, n } => (w, *k, *n, self.mid * 2),
+                        crate::quant::Linear::F32 { w, k, n } => (w.as_slice(), *k, *n, self.mid * 2),
                         // Q8 は GPU hook 済み (maybe_gpu_linear) → 従来経路へ
                         _ => return self.lm_logits(h),
                     }
                 } else {
-                    let n_rows = self.embed.len() / self.e;
-                    (&self.embed, self.e, n_rows, self.mid * 2 + 1)
+                    // P42: tied fp32 lm_head。`quant != Fp32` では lm_head が
+                    // 必ず Some なのでここには来ない (Q4Rows なら理由付きで panic)。
+                    let n_rows = self.embed.rows(self.e);
+                    (self.embed.f32_table_or_panic("logits"), self.e, n_rows, self.mid * 2 + 1)
                 };
                 if let Some(out) = crate::cuda::maybe_gpu_matvec_f32(key, w, h, k, n) {
                     return out;
@@ -1669,14 +1827,17 @@ impl Qwen35 {
             return lm.apply_bt(h, 1);
         }
         let e = self.e;
-        let n_rows = self.embed.len() / e;
+        let n_rows = self.embed.rows(e);
+        // P42: tied fp32 lm_head 専用 (quant != Fp32 では lm_head が Some なので
+        // ここには来ない。Q4Rows で来たら理由付き panic)。
+        let table = self.embed.f32_table_or_panic("lm_logits");
         let mut out = vec![0.0f32; n_rows];
         out.par_chunks_mut(4096)
             .enumerate()
             .for_each(|(ci, dst)| {
                 let row0 = ci * 4096;
                 for (r, dst_r) in dst.iter_mut().enumerate() {
-                    let row = &self.embed[(row0 + r) * e..][..e];
+                    let row = &table[(row0 + r) * e..][..e];
                     let mut acc = 0.0f32;
                     for (a, b) in row.iter().zip(h.iter()) {
                         acc += a * b;
@@ -1786,7 +1947,9 @@ impl Model for Qwen35 {
             // s156 (Task B19): gap_fwd の内訳 `sl_gap_embed` (sl_lay_embed と同じ区間の
             // 複製)。1 step 1 回なので増えるクロック読みは 1 対だけ。
             let g_embed = crate::prof::span_begin_in_step();
-            let mut x: Vec<f32> = self.embed[tok as usize * e..][..e].to_vec();
+            // P42: 1 行を gather (Q4Rows はここで復元。行バッファは x をそのまま使う)
+            let mut x: Vec<f32> = vec![0.0f32; e];
+            self.embed.row_into(tok as usize, &mut x);
             crate::prof::span_end(g_embed, crate::prof::SL_GAP_EMBED);
             crate::prof::span_end(l_embed, crate::prof::SL_LAY_EMBED);
 
@@ -1934,7 +2097,8 @@ impl Qwen35 {
         // ラッパで計上済み・prof 無効時は分岐 1 回で演算不変 = bit-exact)
         crate::prof::time(crate::prof::EMBED, || {
             for (i, &tok) in tokens.iter().enumerate() {
-                x[i * e..(i + 1) * e].copy_from_slice(&self.embed[tok as usize * e..][..e]);
+                // P42: 行ごとに gather (Q4Rows は復元・F32 はコピーのみ)
+                self.embed.row_into(tok as usize, &mut x[i * e..(i + 1) * e]);
             }
         });
         lchk("prefill emb", &x[(n - 1) * e..]); // 恒久診断 (env ゲート・未指定時 no-op)
@@ -3162,7 +3326,11 @@ impl Qwen35 {
         // 埋め込み 1 行 → residual stream デバイス常駐開始
         chain_seg(crate::prof::CHAIN_HOST_API);
         let l_embed = crate::prof::span_begin();
-        chain_upload(CH_X, &self.embed[token as usize * e..][..e], e, 1)?;
+        // P42: 1 行を gather。F32 は借用 (コピーなし)・Q4Rows は復元した Vec。
+        // `chain_upload` は同期で pinned staging へコピーする (cuda.rs) ので、
+        // ここで作った一時は呼び出しの間だけ生きればよい。
+        let xrow = self.embed.row(token as usize, e);
+        chain_upload(CH_X, xrow.as_ref(), e, 1)?;
         crate::prof::span_end(l_embed, crate::prof::SL_LAY_EMBED);
 
         // s140 (Task B6b): chain 本体に入った時点で「chain が実際に走った」ことを
@@ -4877,7 +5045,7 @@ mod tests {
         let n = tokens.len();
         let mut x = vec![0.0f32; n * e];
         for (i, &tok) in tokens.iter().enumerate() {
-            x[i * e..(i + 1) * e].copy_from_slice(&m.embed[tok as usize * e..][..e]);
+            m.embed.row_into(tok as usize, &mut x[i * e..(i + 1) * e]);
         }
         let ff = m.ff;
         // Grow the KV cache the same way the production prefill does (kv_bufs
@@ -4993,5 +5161,129 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- P42: token_embd の行オンデマンド復元 (EmbedTable) ----
+
+    /// 合成 Q4_0 ブロック列 (`n` 行 × `k` 要素)。スケールは f16 の実在値。
+    fn p42_blocks(k: usize, n: usize) -> (Vec<u8>, usize) {
+        assert!(k % 32 == 0);
+        let row_bytes = (k / 32) * 18;
+        let mut blocks = vec![0u8; n * row_bytes];
+        const SCALES: [u16; 6] = [0x9c00, 0xa400, 0x8e66, 0xb1c3, 0x9400, 0x9d55];
+        let mut s = 0x1234_5678u32;
+        let mut next = |s: &mut u32| -> u32 {
+            *s ^= *s << 13;
+            *s ^= *s >> 17;
+            *s ^= *s << 5;
+            *s
+        };
+        for r in 0..n {
+            for b in 0..(k / 32) {
+                let off = r * row_bytes + b * 18;
+                let sc = SCALES[(next(&mut s) as usize) % SCALES.len()];
+                blocks[off..off + 2].copy_from_slice(&sc.to_le_bytes());
+                for j in 0..16 {
+                    blocks[off + 2 + j] = (next(&mut s) & 0xff) as u8;
+                }
+            }
+        }
+        (blocks, row_bytes)
+    }
+
+    /// P42: `EmbedTable::Q4Rows` の行復元が、ローダが作る参照 f32 表と
+    /// **`to_bits()` 一致**する。行 0・最終行・チャンク境界を跨ぐ行を含む。
+    /// F32 variant は従来のスライス読みと byte-for-byte 同一であることも固定する。
+    #[test]
+    fn embed_table_q4rows_rows_match_reference_f32_table() {
+        let k = 512usize; // 16 ブロック/行
+        let n = 11usize; // 最終チャンクが端数になる行数
+        let chunk_rows = 3usize; // 境界を作るためローダより小さいチャンク
+        let (blocks, row_bytes) = p42_blocks(k, n);
+
+        // 参照 f32 表: ローダ (gguf_rows_quantized_chunked_with_sink) と同じく
+        // **行チャンクごとに** dequant して詰める。
+        let mut table = vec![0f32; n * k];
+        let mut r0 = 0usize;
+        while r0 < n {
+            let rows = (n - r0).min(chunk_rows);
+            let w = crate::kquant::dequant_row(
+                GgmlType::Q4_0,
+                &blocks[r0 * row_bytes..(r0 + rows) * row_bytes],
+                rows * k,
+            );
+            table[r0 * k..(r0 + rows) * k].copy_from_slice(&w);
+            r0 += rows;
+        }
+
+        let q4 = EmbedTable::Q4Rows {
+            blocks: blocks.clone(),
+            k,
+            n,
+            row_bytes,
+            ty: GgmlType::Q4_0 as u16,
+        };
+        let f32t = EmbedTable::F32(table.clone());
+        assert_eq!(q4.rows(k), n);
+        assert_eq!(f32t.rows(k), n);
+        assert!(q4.as_f32().is_none(), "Q4Rows が f32 表として読めてしまう");
+        assert_eq!(f32t.as_f32().map(|w| w.len()), Some(n * k));
+
+        // 行 0・最終行・最終行の手前・中央 + 全チャンク境界の前後 (跨ぐ行)
+        let mut rows = vec![0usize, 1, n - 1, n - 2, n / 2];
+        for c in 0..=(n / chunk_rows) {
+            let b = c * chunk_rows;
+            for r in [b.saturating_sub(1), b, b + 1] {
+                if r < n {
+                    rows.push(r);
+                }
+            }
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        assert!(rows.contains(&0) && rows.contains(&(n - 1)));
+        assert!(rows.contains(&chunk_rows) && rows.contains(&(chunk_rows - 1)));
+        assert!(rows.contains(&(2 * chunk_rows)) && rows.contains(&(2 * chunk_rows - 1)));
+
+        let mut buf = vec![0.0f32; k];
+        for &r in &rows {
+            let want = &table[r * k..(r + 1) * k];
+            // row() (Q4Rows は Cow::Owned)
+            let got = q4.row(r, k);
+            assert_eq!(got.len(), k);
+            assert_eq!(bits(got.as_ref()), bits(want), "Q4Rows row({r}) が参照表と不一致");
+            // row_into() (行バッファ再利用・確保なし)
+            buf.iter_mut().for_each(|v| *v = f32::NAN);
+            q4.row_into(r, &mut buf);
+            assert_eq!(bits(&buf), bits(want), "Q4Rows row_into({r}) が参照表と不一致");
+            // F32 variant は従来の `&w[r*k..][..k]` と同一
+            buf.iter_mut().for_each(|v| *v = 0.0);
+            f32t.row_into(r, &mut buf);
+            assert_eq!(bits(&buf), bits(want), "F32 row_into({r}) が従来と不一致");
+            assert_eq!(bits(f32t.row(r, k).as_ref()), bits(want), "F32 row({r}) が従来と不一致");
+        }
+
+        // 参照表そのものの健全性 (全行同一のデータで test が空振りしないこと)
+        assert!(table.iter().all(|v| v.is_finite()));
+        assert_ne!(bits(&table[..k]), bits(&table[k..2 * k]));
+    }
+
+    /// P42: R4/R5 (tied fp32 lm_head) は `quant != Fp32` では到達しない。
+    /// Q4Rows で呼ばれたら**静かに 5 GB を確保せず**、理由の分かる panic にする
+    /// (この判断は REPORT_P42.md に書いた)。
+    #[test]
+    #[should_panic(expected = "tied fp32 lm_head が Q4Rows")]
+    fn embed_table_q4rows_refuses_f32_table_read() {
+        let k = 64usize;
+        let n = 2usize;
+        let (blocks, row_bytes) = p42_blocks(k, n);
+        let q4 = EmbedTable::Q4Rows {
+            blocks,
+            k,
+            n,
+            row_bytes,
+            ty: GgmlType::Q4_0 as u16,
+        };
+        let _ = q4.f32_table_or_panic("lm_logits");
     }
 }

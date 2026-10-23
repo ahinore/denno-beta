@@ -143,10 +143,22 @@ fn rd_u32(b: &[u8], off: usize) -> u32 {
 /// 1 行 (n 要素・n はブロックサイズの倍数) を f32 へデ量子化する。
 /// `blocks` は n / blck_size ブロック分の連続バイト列。
 pub fn dequant_row(ty: GgmlType, blocks: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0f32; n];
+    dequant_row_into(ty, blocks, &mut out);
+    out
+}
+
+/// P42: [`dequant_row`] の「出力先は呼び出し側が持つ」版。行長は `out.len()`。
+///
+/// 本体は 1 つだけ (`dequant_row` はこれに `vec![0f32; n]` を渡すだけ) なので、
+/// 行ごとに `Vec` を確保しない呼び出しでも **`dequant_row` とビット一致**する。
+/// `token_embd` のオンデマンド gather (EmbedTable::Q4Rows) が decode/prefill の
+/// 1 行復元に使う (行バッファを使い回す)。
+pub fn dequant_row_into(ty: GgmlType, blocks: &[u8], out: &mut [f32]) {
+    let n = out.len();
     let bs = ty.blck_size();
     let ts = ty.type_size();
     debug_assert_eq!(blocks.len(), (n / bs) * ts, "dequant_row: size mismatch");
-    let mut out = vec![0f32; n];
     match ty {
         GgmlType::F32 => {
             for (o, c) in out.iter_mut().zip(blocks.chunks_exact(4)) {
@@ -170,7 +182,6 @@ pub fn dequant_row(ty: GgmlType, blocks: &[u8], n: usize) -> Vec<f32> {
             }
         }
     }
-    out
 }
 
 /// 1 ブロックのデ量子化 (llama.cpp のループ本体と 1:1 対応・出力順も同一)。

@@ -3850,3 +3850,38 @@ External implementations referenced in P19 and their licensing status (the same 
   issue gap", i.e. host stalls between passes are included.
 - **Next up**: once the dominant pass is known from real numbers, target that pass's lane/chunk
   split (P36's 4-lane variant aimed at pass 1 and showed no effect, so pass 1 may not dominate).
+
+### P42: replaced the resident 5,086 MB f32 `token_embd` table with per-row dequantisation (Option B) (2026-10-23) DONE (host RAM -4,370.4 MB, numbers bit-identical)
+
+- **Problem**: in the 27B q4 serve the gather table for `token_embd.weight` held
+  5,085,593,600 B (5,085.6 MB) of host RSS. That table is nothing but the file's own Q4_0
+  blocks **dequantised** (never re-quantised), so restoring a row from the same blocks on
+  demand gives the same values (P38 proved this on the real file).
+- **Implementation**: `gguf.rs` gained `embed_blocks_and_linear_chunked` (allocates the
+  file's raw blocks, `n*row_bytes`, instead of an f32 table, and still builds the tied
+  lm_head quantised copy from the same row chunks) plus the fail-closed predicate
+  `embed_blocks_eligible` (type is Q4_0, `k % 32 == 0`, `nbytes == n*row_bytes`,
+  `vocab*e == elems`). In `qwen35.rs` the field `embed: Vec<f32>` became
+  `EmbedTable { F32, Q4Rows { blocks, k, n, row_bytes, ty } }` and the readers (decode 1 row
+  / prefill n rows / chain upload 1 row / test helpers) moved to `row()` / `row_into()`.
+  The `F32` variant is byte-identical to today's `&w[i*e..][..e]` and remains the fp32 path
+  (tied fp32 lm_head) and the fail-closed target. Rows are restored with
+  `kquant::dequant_row_into` (new; same body as `dequant_row`), with **no re-quantisation
+  anywhere**. Default ON; `DENNO_EMBED_ONDEMAND=0|false|no|off` restores the f32 table.
+- **Bit-exactness evidence**: on the real 27B Q4_0 (k=5,120 / n=248,320 / row_bytes=2,880)
+  all 248,320 rows of `EmbedTable::Q4Rows` were compared against the loader's chunk-wise
+  dequant: `to_bits()` differences 0 (measured 3.19 s, 715.2 MB resident, pread 0.66 s).
+  The synthetic-block unit test covers row 0, the last row and rows crossing chunk
+  boundaries, and pins the F32 variant to the old slice read. R4/R5 (tied fp32 lm_head, all
+  rows) are unreachable when `quant != Fp32`, so a Q4Rows table hit there panics with a
+  reason instead of silently materialising 5 GB.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` = 335 passed /
+  0 failed / 41 ignored (baseline 330 + 5 new), `--test kernel_invariants` = 11 passed,
+  non-cuda `--lib` = 291 passed. `.cu` / `.ptx` / GPU / scripts / numeric policy untouched.
+- **Not verified (PREDICTED)**: the -4,370.4 MB host-resident saving is the difference in
+  allocated bytes (5,085,593,600 -> 715,161,600 B), not a measured RSS delta. The KPI impact
+  (decode +0.003 ms/token = 0.018 %, prefill +9.8 ms @3,161 / +39.7 ms @12,850 = 0.10 %) is
+  **predicted** from P38's 3.09 us/token and was not measured on the 8095. The product-path
+  row restore costs 1.95 us/row measured on CPU (resident blocks, no pread), i.e. below the
+  3.09 us used for the prediction, so the prediction is the conservative bound. Anchor md5s
+  were not re-taken.
