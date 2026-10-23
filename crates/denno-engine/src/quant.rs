@@ -93,21 +93,37 @@ impl Quant8Linear {
     /// 丸め誤差は各要素 |w - deq| ≤ scale[j] / 2 に収まる。
     pub fn quantize(w: &[f32], k: usize, n: usize) -> Self {
         assert_eq!(w.len(), k * n, "quantize: weight size mismatch");
-        let mut qw = vec![0i8; k * n];
-        let mut scale = vec![0f32; n];
-        for (j, row) in w.chunks_exact(k).enumerate() {
+        let mut q = Self::zeros(k, n);
+        q.quantize_rows_into(0, w);
+        q
+    }
+
+    /// P37: 空 (全ゼロ) の [n,k] を作る (行チャンク書き込みの受け皿)。
+    pub fn zeros(k: usize, n: usize) -> Self {
+        Self { w: vec![0i8; k * n], scale: vec![0f32; n], k, n, uid: next_uid() }
+    }
+
+    /// P37: 行 `[r0, r0+rows)` を f32 から量子化して書き込む
+    /// (`w.len()` は `k` の倍数)。量子化は行単位で閉じている (scale も行ごと)
+    /// ので、何行ずつ書いても `quantize` の結果と**バイト一致**する。
+    pub fn quantize_rows_into(&mut self, r0: usize, w: &[f32]) {
+        assert_eq!(self.k * self.n, self.w.len(), "q8 quantize_rows: 次元不整合");
+        assert_eq!(w.len() % self.k, 0, "q8 quantize_rows: w が k の倍数でない");
+        let rows = w.len() / self.k;
+        assert!(r0 + rows <= self.n, "q8 quantize_rows: 行範囲が n を超過");
+        for (i, row) in w.chunks_exact(self.k).enumerate() {
+            let j = r0 + i;
             let maxabs = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             // 全行ゼロの場合の 0 除算回避 (scale は任意の値でよい)
             let s = if maxabs > 0.0 { maxabs / 127.0 } else { 1.0 };
-            scale[j] = s;
+            self.scale[j] = s;
             let inv = 1.0 / s;
-            for (q, v) in qw[j * k..][..k].iter_mut().zip(row) {
+            for (q, v) in self.w[j * self.k..][..self.k].iter_mut().zip(row) {
                 // round-half-away-from-zero + 安全側のクランプ (±127 に収める)
                 let qi = (*v * inv).round();
                 *q = qi.clamp(-127.0, 127.0) as i8;
             }
         }
-        Self { w: qw, scale, k: k, n: n, uid: next_uid() }
     }
 
     /// デ量子化して f32 重み [n, k] を返す (テストと prefill 用)。
@@ -161,10 +177,35 @@ impl Q4Linear {
     /// f32 重み [n,k] を Q4_0 へ量子化する (ggml quantize_row_q4_0_ref と同規則)。
     pub fn quantize(w: &[f32], k: usize, n: usize) -> Self {
         assert_eq!(w.len(), k * n, "q4 quantize: weight size mismatch");
+        let mut q = Self::zeros(k, n);
+        q.quantize_rows_into(0, w);
+        q
+    }
+
+    /// P37: 空 (全ゼロ) の [n,k] ブロック列を作る (行チャンク書き込みの受け皿)。
+    pub fn zeros(k: usize, n: usize) -> Self {
         assert_eq!(k % Q4_BLOCK_ELEMS, 0, "q4: k must be a multiple of 32");
         let nb = k / Q4_BLOCK_ELEMS;
-        let mut blocks = vec![0u8; n * nb * Q4_BLOCK_BYTES];
-        for (j, row) in w.chunks_exact(k).enumerate() {
+        Self { blocks: vec![0u8; n * nb * Q4_BLOCK_BYTES], k, n, uid: next_uid() }
+    }
+
+    /// P37: 行 `[r0, r0+rows)` を f32 から量子化して blocks の該当位置へ書く
+    /// (`w.len()` は `k` の倍数)。ブロックは 32 要素 (k 方向) で行をまたがず、
+    /// 量子化はブロック内で閉じているので、何行ずつ書いても `quantize` の
+    /// 結果と**バイト一致**する。
+    pub fn quantize_rows_into(&mut self, r0: usize, w: &[f32]) {
+        assert_eq!(self.k % Q4_BLOCK_ELEMS, 0, "q4: k must be a multiple of 32");
+        assert_eq!(
+            self.blocks.len(),
+            self.n * Self::row_bytes(self.k),
+            "q4 quantize_rows: 次元不整合"
+        );
+        assert_eq!(w.len() % self.k, 0, "q4 quantize_rows: w が k の倍数でない");
+        let rows = w.len() / self.k;
+        assert!(r0 + rows <= self.n, "q4 quantize_rows: 行範囲が n を超過");
+        let nb = self.k / Q4_BLOCK_ELEMS;
+        for (ri, row) in w.chunks_exact(self.k).enumerate() {
+            let j = r0 + ri;
             for b in 0..nb {
                 let src = &row[b * Q4_BLOCK_ELEMS..][..Q4_BLOCK_ELEMS];
                 // ggml: |x| 最大の要素を符号付きで覚え、d = max / -8 とする。
@@ -179,7 +220,7 @@ impl Q4Linear {
                 }
                 let d = max / -8.0;
                 let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-                let out = &mut blocks[(j * nb + b) * Q4_BLOCK_BYTES..][..Q4_BLOCK_BYTES];
+                let out = &mut self.blocks[(j * nb + b) * Q4_BLOCK_BYTES..][..Q4_BLOCK_BYTES];
                 out[..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
                 for (i, &x) in src.iter().enumerate() {
                     // ggml: (int8_t)(x*id + 8.5f) を 15 で頭切り。
@@ -193,7 +234,6 @@ impl Q4Linear {
                 }
             }
         }
-        Self { blocks, k, n, uid: next_uid() }
     }
 
     /// j 行目を f32 へ展開する (out は k 要素)。
@@ -279,6 +319,170 @@ pub fn gguf_passthrough_enabled() -> bool {
 /// の再取得が必要)。
 pub fn gguf_passthrough_allows(_ty: GgmlType) -> bool {
     false
+}
+
+// ---------------------------------------------------------------------------
+// P37: 行チャンク量子化 (大きな 2-D 重みの fp32 一時領域を上限つきにする)
+// ---------------------------------------------------------------------------
+
+/// P37: 1 チャンクの f32 一時領域の目標要素数 (4 M 要素 = 16 MiB)。
+///
+/// 行数は `k` から決める (`chunk_rows_for`)。行を丸ごと単位にするので、
+/// 32 要素ブロック (Q4_0) も K 系スーパーブロック (256) も行内で閉じる。
+pub const CHUNK_TARGET_ELEMS: usize = 4 << 20;
+
+/// P37: `k` 要素の行に対して 1 チャンク何行にするか (最低 1 行)。
+pub fn chunk_rows_for(k: usize) -> usize {
+    if k == 0 {
+        return 1;
+    }
+    (CHUNK_TARGET_ELEMS / k).max(1)
+}
+
+/// P37: 行チャンク量子化の env ゲート名。
+///
+/// **既定は有効** (新経路)。`0` / `false` / `no` / `off` を明示したときだけ
+/// 従来の「テンソル全体を f32 へ展開 → 量子化」経路に戻る。どちらの経路も
+/// 生成される量子化バイト列は同一 (テストで固定)。
+pub const GGUF_CHUNKED_QUANT_ENV: &str = "DENNO_GGUF_CHUNKED_QUANT";
+
+/// P37: env 値の解釈 (純関数・テスト可能)。未設定・空は既定 = 有効。
+pub fn gguf_chunked_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None => true,
+        Some(s) if s.is_empty() => true,
+        Some(s) => !matches!(s.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+    }
+}
+
+/// P37: 現在の env 設定で行チャンク経路が有効か (ロード開始時に 1 回だけ呼ぶ)。
+pub fn gguf_chunked_enabled() -> bool {
+    let v = std::env::var(GGUF_CHUNKED_QUANT_ENV).ok();
+    gguf_chunked_from_value(v.as_deref())
+}
+
+/// P37: 行チャンク量子化の実測/計算値 (レポート・テスト用)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkedQuantStats {
+    /// 1 チャンクの行数
+    pub chunk_rows: usize,
+    /// 実際に処理したチャンク数
+    pub chunks: usize,
+    /// 1 チャンクの最大 f32 要素数 (= 一時領域の要素数)
+    pub chunk_elems: usize,
+    /// 1 チャンクの最大ブロックバイト数 (= 読み取りバッファ)
+    pub chunk_bytes: usize,
+}
+
+impl ChunkedQuantStats {
+    /// 1 チャンクの f32 一時領域 (bytes)。これが新経路のピーク一時領域。
+    pub fn peak_f32_bytes(&self) -> usize {
+        self.chunk_elems * 4
+    }
+
+    /// 1 チャンクの f32 一時領域 + ブロックの読み取りバッファ (bytes)。
+    pub fn peak_bytes(&self) -> usize {
+        self.peak_f32_bytes() + self.chunk_bytes
+    }
+}
+
+/// P37: GGUF の生ブロックを**行チャンク**で量子化済み線形重みへ変換する。
+///
+/// `fill(r0, rows, buf)` は行 `[r0, r0+rows)` のブロックバイト列を `buf` へ
+/// 書く責務を持つ (長さは `rows * row_bytes`)。呼び出し側はファイルから
+/// `seek` + `read_exact` で読んでも、既に mmap したスライスを写してもよい。
+///
+/// # ビット一致の根拠 (証明ではなく実装上の不変条件)
+///
+/// - 行は GGUF 上で連続 (dim0 = k が最内) なので、行境界はブロック境界でもある
+///   (`k % blck_size == 0` を検証。違えば `Err` = 呼び出し側は従来経路へ)。
+/// - `kquant::dequant_row` はブロック単位で閉じている (F32/F16/Bf16 は要素単位)
+///   ので、行チャンクへ切っても各要素の値は全体を一度に展開した場合と同一。
+/// - `Q4Linear` / `Quant8Linear` の量子化は**行単位**で閉じている
+///   (`quantize_rows_into` は `quantize` の本体そのもの) ので、行の集合と順序が
+///   同じなら結果のバイト列も同一。
+///
+/// したがって `n` 行を何行ずつ処理しても出力は `Linear::new(全体 f32)` と
+/// バイト一致する。ピーク一時領域は 1 チャンク分 (`ChunkedQuantStats`)。
+pub fn gguf_rows_quantized_chunked<F>(
+    ty: GgmlType,
+    mode: QuantMode,
+    k: usize,
+    n: usize,
+    chunk_rows: usize,
+    fill: F,
+) -> std::result::Result<(Linear, ChunkedQuantStats), String>
+where
+    F: FnMut(usize, usize, &mut Vec<u8>) -> std::result::Result<(), String>,
+{
+    gguf_rows_quantized_chunked_with_sink(ty, mode, k, n, chunk_rows, fill, |_, _| {})
+}
+
+/// P37: [`gguf_rows_quantized_chunked`] の「チャンクの f32 を覗ける」版。
+///
+/// `sink(r0, w)` は量子化の直前に、そのチャンクの f32 (`rows * k` 要素) を
+/// 受け取る。token_embd.weight のように **f32 の常駐表も必要な**テンソルで、
+/// 展開を 1 回で済ませるために使う (表へのコピーと量子化が同じチャンクで起きる)。
+pub fn gguf_rows_quantized_chunked_with_sink<F, S>(
+    ty: GgmlType,
+    mode: QuantMode,
+    k: usize,
+    n: usize,
+    chunk_rows: usize,
+    mut fill: F,
+    mut sink: S,
+) -> std::result::Result<(Linear, ChunkedQuantStats), String>
+where
+    F: FnMut(usize, usize, &mut Vec<u8>) -> std::result::Result<(), String>,
+    S: FnMut(usize, &[f32]),
+{
+    if k == 0 || n == 0 {
+        return Err(format!("行チャンク量子化: 形状が不正 (k={k}, n={n})"));
+    }
+    let bs = ty.blck_size();
+    let ts = ty.type_size();
+    if k % bs != 0 {
+        return Err(format!("行チャンク量子化: 1 行 {k} 要素がブロックサイズ {bs} の倍数でない"));
+    }
+    let row_bytes = (k / bs) * ts;
+    let mut dst = match mode {
+        QuantMode::Q4_0 => Linear::Q4(Q4Linear::zeros(k, n)),
+        QuantMode::Int8 => Linear::Q8(Quant8Linear::zeros(k, n)),
+        QuantMode::Fp32 => {
+            return Err("行チャンク量子化: fp32 モードは量子化しない (対象外)".to_string())
+        }
+    };
+    let chunk_rows = chunk_rows.clamp(1, n);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut st = ChunkedQuantStats { chunk_rows, ..Default::default() };
+    let mut r0 = 0usize;
+    while r0 < n {
+        let rows = (n - r0).min(chunk_rows);
+        let want = rows * row_bytes;
+        buf.clear();
+        buf.resize(want, 0);
+        fill(r0, rows, &mut buf)?;
+        if buf.len() != want {
+            return Err(format!(
+                "行チャンク量子化: 行 {r0}..{} のバイト数 {} が期待 {want} と不一致",
+                r0 + rows,
+                buf.len()
+            ));
+        }
+        // このチャンクだけを f32 へ展開する (ループ末尾で捨てる)。
+        let w = crate::kquant::dequant_row(ty, &buf, rows * k);
+        sink(r0, &w);
+        match &mut dst {
+            Linear::Q4(q) => q.quantize_rows_into(r0, &w),
+            Linear::Q8(q) => q.quantize_rows_into(r0, &w),
+            Linear::F32 { .. } => unreachable!("fp32 は上で弾いている"),
+        }
+        st.chunks += 1;
+        st.chunk_elems = st.chunk_elems.max(w.len());
+        st.chunk_bytes = st.chunk_bytes.max(buf.len());
+        r0 += rows;
+    }
+    Ok((dst, st))
 }
 
 /// s80 (T7b): int8 重み 1 本に対する `Linear::apply_bt_rows_into` の Q8 分岐と
@@ -1036,6 +1240,127 @@ mod tests {
         assert!(Q4Linear::from_gguf_blocks(&q.blocks, k + 1, n).is_none()); // k が 32 の倍数でない
         assert!(Q4Linear::from_gguf_blocks(&q.blocks, k, n + 1).is_none());
         assert!(Q4Linear::from_gguf_blocks(&q.blocks, 0, 0).is_none());
+    }
+
+    /// P37: env ゲートの解釈。**未設定・空は既定 = 有効** (新経路)、
+    /// 明示的な偽値だけが従来経路に戻す。
+    #[test]
+    fn gguf_chunked_gate_parsing() {
+        assert!(gguf_chunked_from_value(None), "未設定は既定 (有効)");
+        assert!(gguf_chunked_from_value(Some("")), "空は既定 (有効)");
+        assert!(gguf_chunked_from_value(Some("1")));
+        assert!(gguf_chunked_from_value(Some("yes")));
+        assert!(gguf_chunked_from_value(Some("TRUE")));
+        assert!(!gguf_chunked_from_value(Some("0")));
+        assert!(!gguf_chunked_from_value(Some(" 0 ")));
+        assert!(!gguf_chunked_from_value(Some("off")));
+        assert!(!gguf_chunked_from_value(Some("false")));
+        assert!(!gguf_chunked_from_value(Some("NO")));
+    }
+
+    /// P37: 行チャンク数は `k` から決まり、f32 一時領域が
+    /// `CHUNK_TARGET_ELEMS` を超えない (k が大きいほど行数が減る)。
+    #[test]
+    fn chunk_rows_keeps_transient_bounded() {
+        for k in [32usize, 64, 5120, 6144, 17408, 1 << 20] {
+            let rows = chunk_rows_for(k);
+            assert!(rows >= 1, "k={k} で行数 0");
+            assert!(
+                rows * k <= CHUNK_TARGET_ELEMS.max(k),
+                "k={k} rows={rows} で一時領域が上限を超過"
+            );
+        }
+        assert_eq!(chunk_rows_for(0), 1);
+        // 27B の実形状: 5120 → 819 行 (16.0 MiB) / 17408 → 240 行 (16.0 MiB)
+        assert_eq!(chunk_rows_for(5120), 819);
+        assert_eq!(chunk_rows_for(17408), 240);
+    }
+
+    /// P37: 行チャンク量子化は「テンソル全体を f32 へ展開 → 量子化」と
+    /// **バイト一致**する。チャンク幅を 1 行から n 行まで変えても不変。
+    ///
+    /// 入力は GGUF の生ブロック列そのもの (Q4_0 = 18B ブロック, F32 = 4B 要素) で、
+    /// どちらの型でも `dequant_row` がブロック単位で閉じていることを固定する。
+    #[test]
+    fn gguf_chunked_quant_matches_whole_tensor() {
+        let (k, n) = (128usize, 7usize);
+        let w = pseudo_random(k * n, 4242);
+        // Q4_0 の生ブロック (GGUF のバイト列に相当) と F32 のバイト列
+        let q4_src = Q4Linear::quantize(&w, k, n).blocks;
+        let f32_src: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        for (ty, src) in [(GgmlType::Q4_0, &q4_src), (GgmlType::F32, &f32_src)] {
+            let bs = ty.blck_size();
+            let ts = ty.type_size();
+            let row_bytes = (k / bs) * ts;
+            assert_eq!(src.len(), n * row_bytes);
+            // 従来経路: 全体を f32 へ展開してから量子化 (dequant_tensor → Linear::new)
+            let whole = crate::kquant::dequant_row(ty, src, k * n);
+            for mode in [QuantMode::Q4_0, QuantMode::Int8] {
+                let want = Linear::new(whole.clone(), k, n, mode);
+                for chunk in [1usize, 2, 3, n, n + 5] {
+                    let (got, st) = gguf_rows_quantized_chunked(
+                        ty,
+                        mode,
+                        k,
+                        n,
+                        chunk,
+                        |r0, rows, buf| {
+                            buf.clear();
+                            buf.extend_from_slice(&src[r0 * row_bytes..(r0 + rows) * row_bytes]);
+                            Ok(())
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{ty:?}/{mode:?}/chunk={chunk}: {e}"));
+                    assert_eq!(st.chunk_rows, chunk.min(n));
+                    assert_eq!(st.chunks, n.div_ceil(chunk.min(n)));
+                    assert!(st.peak_f32_bytes() <= CHUNK_TARGET_ELEMS.max(k) * 4);
+                    match (&got, &want) {
+                        (Linear::Q4(a), Linear::Q4(b)) => assert_eq!(
+                            a.blocks, b.blocks,
+                            "{ty:?}/Q4_0/chunk={chunk}: ブロック列が一致しない"
+                        ),
+                        (Linear::Q8(a), Linear::Q8(b)) => {
+                            assert_eq!(
+                                a.w, b.w,
+                                "{ty:?}/int8/chunk={chunk}: 量子化バイト列が一致しない"
+                            );
+                            assert_eq!(
+                                a.scale.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                b.scale.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                "{ty:?}/int8/chunk={chunk}: scale が一致しない"
+                            );
+                        }
+                        _ => panic!("量子化モードが違う"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// P37: 行がブロック境界に載らない (k がブロックサイズの倍数でない) 型は
+    /// `Err` = 呼び出し側は従来経路へ落ちる。fp32 モードも対象外。
+    #[test]
+    fn gguf_chunked_quant_rejects_unaligned_rows() {
+        let src = vec![0u8; 100];
+        let e = gguf_rows_quantized_chunked(GgmlType::Q4_0, QuantMode::Q4_0, 33, 1, 1, |_, _, b| {
+            b.clear();
+            b.extend_from_slice(&src);
+            Ok(())
+        })
+        .expect_err("k=33 は 32 の倍数でないので拒否するはず");
+        assert!(e.contains("倍数"), "{e}");
+        let e = gguf_rows_quantized_chunked(GgmlType::F32, QuantMode::Fp32, 32, 1, 1, |_, _, _| Ok(()))
+            .expect_err("fp32 モードは対象外");
+        assert!(e.contains("fp32"), "{e}");
+        // 供給バイト数が足りない場合も Err (静かに短い重みを作らない)
+        let e = gguf_rows_quantized_chunked(GgmlType::F32, QuantMode::Int8, 32, 2, 1, |_, _, b| {
+            b.clear();
+            b.extend_from_slice(&[0u8; 4]);
+            Ok(())
+        })
+        .expect_err("バイト数不足は拒否するはず");
+        assert!(e.contains("不一致"), "{e}");
     }
 
     #[test]

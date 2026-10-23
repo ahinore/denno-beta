@@ -16,6 +16,7 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use crate::kquant::GgmlType;
+use crate::quant::{ChunkedQuantStats, Linear};
 
 #[derive(Debug)]
 pub struct GgufError(pub String);
@@ -186,6 +187,127 @@ impl GgufFile {
             return err(format!("{name}: 要素数 {n} がブロックサイズ {bs} の倍数でない"));
         }
         Ok(crate::kquant::dequant_row(t.ty, bytes, n))
+    }
+
+    /// P37: 行チャンク量子化の前処理。テンソルが `(k, n)` の 2-D として読め、
+    /// 1 行がブロック境界に載っているときだけ
+    /// `(生バイト列, 1 行のバイト数, 型)` を返す。
+    ///
+    /// どれか 1 つでも成り立たなければ `Ok(None)` を返し、呼び出し側は従来の
+    /// `dequant_tensor` → 量子化へ落ちる (**fail-closed**)。
+    fn chunked_rows(
+        &self,
+        name: &str,
+        k: usize,
+        n: usize,
+    ) -> Result<Option<(&[u8], usize, GgmlType)>, GgufError> {
+        let Some(t) = self.tensor(name) else {
+            return Ok(None);
+        };
+        if t.dims.is_empty() || t.dims[0] as usize != k || n == 0 {
+            return Ok(None);
+        }
+        let rows: u64 = t.dims[1..].iter().product();
+        if rows as usize != n {
+            return Ok(None);
+        }
+        let bs = t.ty.blck_size();
+        if bs == 0 || k % bs != 0 {
+            return Ok(None);
+        }
+        let row_bytes = (k / bs) * t.ty.type_size();
+        let bytes = self.tensor_bytes(name)?;
+        if bytes.len() != n * row_bytes {
+            return Ok(None);
+        }
+        Ok(Some((bytes, row_bytes, t.ty)))
+    }
+
+    /// P37: 2-D 線形重みを**行チャンクで**量子化する (テンソル全体の f32 を
+    /// 作らない)。生成される量子化バイト列は従来経路
+    /// (`dequant_tensor` → `Linear::new`) と同一。
+    ///
+    /// 形・型・バイト数のどれかが想定外なら `Ok(None)` (= 呼び出し側は従来経路)。
+    /// ピーク一時領域は 1 チャンク分だけ (`ChunkedQuantStats::peak_bytes`)。
+    pub fn linear_chunked(
+        &self,
+        name: &str,
+        k: usize,
+        n: usize,
+        mode: crate::quant::QuantMode,
+        chunk_rows: usize,
+    ) -> Result<Option<(Linear, ChunkedQuantStats)>, GgufError> {
+        let Some((bytes, row_bytes, ty)) = self.chunked_rows(name, k, n)? else {
+            return Ok(None);
+        };
+        let res = crate::quant::gguf_rows_quantized_chunked(
+            ty,
+            mode,
+            k,
+            n,
+            chunk_rows,
+            |r0, rows, buf| {
+                let off = r0 * row_bytes;
+                let len = rows * row_bytes;
+                buf.clear();
+                buf.extend_from_slice(&bytes[off..off + len]);
+                Ok(())
+            },
+        );
+        match res {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                tracing::warn!("{name}: 行チャンク量子化を中止して従来経路へ ({e})");
+                Ok(None)
+            }
+        }
+    }
+
+    /// P37: `token_embd.weight` 級の巨大 2-D 重みを、**常駐 f32 表** (embedding
+    /// gather 用) と**量子化コピー** (tied lm_head 用) へ同じ行チャンクで埋める。
+    ///
+    /// 従来経路は (1) 全体を f32 へ展開 → (2) `embed.clone()` でもう 1 部 →
+    /// (3) 量子化、で 2 部の f32 が同時に生きていた (27B Q4_0 で約 10.9 GB)。
+    /// ここでは 1 チャンク分の f32 だけを経由する。
+    pub fn embed_and_linear_chunked(
+        &self,
+        name: &str,
+        k: usize,
+        n: usize,
+        mode: crate::quant::QuantMode,
+        chunk_rows: usize,
+    ) -> Result<Option<(Vec<f32>, Linear, ChunkedQuantStats)>, GgufError> {
+        let Some((bytes, row_bytes, ty)) = self.chunked_rows(name, k, n)? else {
+            return Ok(None);
+        };
+        let Some(total) = k.checked_mul(n) else {
+            return Ok(None);
+        };
+        let mut table = vec![0f32; total];
+        let res = crate::quant::gguf_rows_quantized_chunked_with_sink(
+            ty,
+            mode,
+            k,
+            n,
+            chunk_rows,
+            |r0, rows, buf| {
+                let off = r0 * row_bytes;
+                let len = rows * row_bytes;
+                buf.clear();
+                buf.extend_from_slice(&bytes[off..off + len]);
+                Ok(())
+            },
+            |r0, w| {
+                table[r0 * k..r0 * k + w.len()].copy_from_slice(w);
+            },
+        );
+        match res {
+            Ok((l, st)) => Ok(Some((table, l, st))),
+            Err(e) => {
+                tracing::warn!("{name}: 行チャンク量子化を中止して従来経路へ ({e})");
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -424,7 +546,10 @@ mod tests {
 
     use super::*;
     use crate::kquant::{dequant_row, GgmlType};
-    use crate::quant::{Q4Linear, Q4_BLOCK_BYTES, Q4_BLOCK_ELEMS};
+    use crate::quant::{
+        gguf_rows_quantized_chunked, ChunkedQuantStats, Linear, Quant8Linear, QuantMode, Q4Linear,
+        Q4_BLOCK_BYTES, Q4_BLOCK_ELEMS,
+    };
     use std::collections::BTreeMap;
     use std::io::{Read, Seek, SeekFrom};
 
@@ -444,6 +569,65 @@ mod tests {
             }
         }
         None
+    }
+
+    /// ヘッダだけを先頭バッファから解析する (mmap しない)。足りなければ伸ばす。
+    fn read_header(file: &mut std::fs::File, file_len: u64) -> GgufHeader {
+        let mut want = 1usize << 20;
+        loop {
+            let n = want.min(file_len as usize);
+            let mut buf = vec![0u8; n];
+            file.seek(SeekFrom::Start(0)).expect("seek");
+            file.read_exact(&mut buf).expect("read header");
+            match GgufHeader::parse(&buf) {
+                Ok(h) => return h,
+                Err(e) => {
+                    let short = e.0.contains("EOF") || e.0.contains("データ部がファイル終端");
+                    if !short || n >= HEADER_CAP {
+                        panic!("GGUF ヘッダ解析失敗 ({n} B 読み): {e}");
+                    }
+                    want *= 2;
+                }
+            }
+        }
+    }
+
+    /// このプロセスのピーク RSS (VmHWM) を bytes で返す。
+    fn peak_rss_bytes() -> Option<u64> {
+        let s = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
+
+    /// VmHWM を現在の RSS まで戻す (Linux: /proc/self/clear_refs へ "5")。
+    /// これで「直前の区間だけのピーク」を測れる。
+    fn reset_peak_rss() {
+        let _ = std::fs::write("/proc/self/clear_refs", "5");
+    }
+
+    /// 現在の RSS (VmRSS) を bytes で返す (区間の基準値)。
+    fn rss_now_bytes() -> Option<u64> {
+        let s = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
+
+    /// 実測 RSS の増分 (MB)。基準が取れないときは NaN。
+    fn delta_mb(peak: Option<u64>, base: Option<u64>) -> f64 {
+        match (peak, base) {
+            (Some(p), Some(b)) => p.saturating_sub(b) as f64 / 1e6,
+            _ => f64::NAN,
+        }
     }
 
     #[derive(Default)]
@@ -511,25 +695,7 @@ mod tests {
         println!("[p35] file {} ({:.2} GiB)", path.display(), file_len as f64 / (1u64 << 30) as f64);
 
         // ヘッダだけを先頭バッファから解析する (mmap しない)。足りなければ伸ばす。
-        let hdr = {
-            let mut want = 1usize << 20;
-            loop {
-                let n = want.min(file_len as usize);
-                let mut buf = vec![0u8; n];
-                file.seek(SeekFrom::Start(0)).expect("seek");
-                file.read_exact(&mut buf).expect("read header");
-                match GgufHeader::parse(&buf) {
-                    Ok(h) => break h,
-                    Err(e) => {
-                        let short = e.0.contains("EOF") || e.0.contains("データ部がファイル終端");
-                        if !short || n >= HEADER_CAP {
-                            panic!("GGUF ヘッダ解析失敗 ({n} B 読み): {e}");
-                        }
-                        want *= 2;
-                    }
-                }
-            }
-        };
+        let hdr = read_header(&mut file, file_len);
         println!(
             "[p35] version {} / alignment {} / data_start {} / {} tensors",
             hdr.version,
@@ -714,5 +880,318 @@ mod tests {
             }
         }
         let _ = all_identical; // 判定は上の表とレポートに出す (テストの合否ではない)
+    }
+
+    // -----------------------------------------------------------------------
+    // P37: 行チャンク量子化のバイト一致証明 (実 GGUF)
+    // -----------------------------------------------------------------------
+
+    /// サンプルするテンソル数の上限 (メモリと時間を有界にする)
+    const MAX_SAMPLE: usize = 10;
+    /// int8 の副次比較を行う要素数の上限 (token_embd の 1.27 G 要素は除外)
+    const INT8_ELEM_LIMIT: usize = 64 << 20;
+
+    /// 1 テンソル分の判定結果
+    struct ChunkVerdict {
+        name: String,
+        ty: GgmlType,
+        k: usize,
+        n: usize,
+        identical: bool,
+        /// 最初の不一致バイト位置 (テンソル内)
+        first_diff: Option<usize>,
+        /// チャンク経路の統計 (1 チャンクの一時領域 = ピーク)
+        chunk: ChunkedQuantStats,
+        /// チャンク経路の実測ピーク RSS (区間内) と区間開始時の RSS
+        chunk_rss: Option<u64>,
+        chunk_base_rss: Option<u64>,
+        /// 従来経路 (全体 f32) の計算上のピーク f32 一時領域
+        whole_f32_bytes: usize,
+        /// 従来経路の実測ピーク RSS (区間内) と区間開始時の RSS
+        whole_rss: Option<u64>,
+        whole_base_rss: Option<u64>,
+        /// int8 の副次比較 (None = 対象外)
+        int8: Option<bool>,
+    }
+
+    /// P37 の受け入れ条件: 行チャンク量子化が「テンソル全体を f32 へ展開 →
+    /// 量子化」と**バイト一致**することを実 GGUF で示す。
+    ///
+    /// - 比較するのは `Q4Linear` の blocks (engine の `--quant q4` の重みそのもの)。
+    ///   チャンク経路 = `gguf_rows_quantized_chunked` (pread で行チャンクだけ読む)、
+    ///   従来経路 = `dequant_row(全体)` → `Q4Linear::quantize` (= `Linear::new`)。
+    /// - メモリ規律: mmap しない (`GgufHeader` だけ先頭バッファから解析)、
+    ///   テンソルは seek + read_exact、2 部コピーを持たない。
+    ///   `MemAvailable` が 8 GiB 未満なら走らせない。
+    /// - サンプルは 10 本まで (token_embd + output + ffn 3 + attn 4 + ssm_out)。
+    ///
+    /// 実行:
+    ///   GGUF_PATH=/work/models/Qwen3.8-27B-Q4_0.gguf \
+    ///   CARGO_TARGET_DIR=/tmp/p37-target \
+    ///   cargo test --release -p denno-engine --features cuda --lib -- --ignored \
+    ///     --nocapture q4_chunked_matches_whole_tensor_real_gguf
+    #[test]
+    #[ignore]
+    fn q4_chunked_matches_whole_tensor_real_gguf() {
+        let path = match std::env::var("GGUF_PATH") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                let d = std::path::PathBuf::from("/work/models/Qwen3.8-27B-Q4_0.gguf");
+                if !d.exists() {
+                    eprintln!("skip: GGUF_PATH 未設定かつ /work/models に既定モデルが無い");
+                    return;
+                }
+                d
+            }
+        };
+
+        // メモリ規律: 8 GiB 未満なら走らせない (ホストが OOM 寸前のことがある)
+        let avail_gib = mem_available_gib();
+        match avail_gib {
+            Some(g) if g < 8.0 => {
+                panic!("MemAvailable {g:.1} GiB < 8 GiB — 走らせない (`free -g` を確認してから再実行)")
+            }
+            Some(g) => println!("[p37] MemAvailable {g:.1} GiB"),
+            None => println!("[p37] MemAvailable 不明 (/proc/meminfo 無し) — 続行"),
+        }
+
+        let mut file = std::fs::File::open(&path).expect("GGUF を開けない");
+        let file_len = file.metadata().expect("metadata").len();
+        println!(
+            "[p37] file {} ({:.2} GiB)",
+            path.display(),
+            file_len as f64 / (1u64 << 30) as f64
+        );
+        let hdr = read_header(&mut file, file_len);
+        println!("[p37] {} tensors / data_start {}", hdr.tensor_order.len(), hdr.data_start);
+
+        // 代表テンソル: token_embd (最大) → output (K 系) → ffn 3 種 → attn 4 種
+        let mut sampled: Vec<String> = Vec::new();
+        for name in ["token_embd.weight", "output.weight"] {
+            if hdr.tensor(name).is_some() {
+                sampled.push(name.to_string());
+            }
+        }
+        for suf in [
+            ".ffn_up.weight",
+            ".ffn_gate.weight",
+            ".ffn_down.weight",
+            ".attn_q.weight",
+            ".attn_qkv.weight",
+            ".attn_v.weight",
+            ".attn_output.weight",
+            ".ssm_out.weight",
+        ] {
+            if let Some(n) = hdr.tensor_order.iter().find(|n| n.ends_with(suf)) {
+                if !sampled.iter().any(|s| s == n) {
+                    sampled.push(n.clone());
+                }
+            }
+        }
+        sampled.truncate(MAX_SAMPLE);
+        println!("[p37] sampling {} tensors:", sampled.len());
+        for s in &sampled {
+            println!("[p37]   {s}");
+        }
+
+        let mut verdicts: Vec<ChunkVerdict> = Vec::new();
+        for name in &sampled {
+            let t = hdr.tensor(name).expect("sampled name").clone();
+            let k = t.dims[0] as usize;
+            let n: usize = t.dims[1..].iter().product::<u64>() as usize;
+            let bs = t.ty.blck_size();
+            let row_bytes =
+                if bs > 0 && k % bs == 0 { (k / bs) * t.ty.type_size() } else { 0 };
+            if t.dims.len() < 2 || row_bytes == 0 || n == 0 || t.nbytes as usize != n * row_bytes {
+                println!(
+                    "[p37]   {name:<32} n/a (2-D として読めない: dims={:?} k={k} n={n})",
+                    t.dims
+                );
+                continue;
+            }
+            let elems = k * n;
+            let (start, end) = hdr.tensor_range(name).expect("range");
+            assert_eq!(end - start, t.nbytes, "{name}: range と nbytes の不一致");
+
+            // メモリ見積り: 従来経路は生バイトと f32 が同時に生きる。
+            // 足りないのに確保すると abort するので、先に弾く。
+            let need = t.nbytes + 4 * elems as u64;
+            if let Some(g) = avail_gib {
+                let avail = (g * (1u64 << 30) as f64) as u64;
+                assert!(
+                    need + (2u64 << 30) < avail,
+                    "{name}: 従来経路の見積り {:.2} GiB + 余裕 2 GiB が MemAvailable {:.2} GiB を超過 — \
+                     メモリを空けてから再実行",
+                    need as f64 / (1u64 << 30) as f64,
+                    g
+                );
+            }
+
+            // (a) 行チャンク経路を**先に**測る (直前の巨大確保が無い clean な
+            //     RSS 基準で測るため)。必要な行だけ pread して 1 チャンクずつ量子化。
+            reset_peak_rss();
+            let chunk_base_rss = rss_now_bytes();
+            let rows = crate::quant::chunk_rows_for(k);
+            let mut reader = |r0: usize, rows: usize, buf: &mut Vec<u8>| -> Result<(), String> {
+                let off = start + (r0 * row_bytes) as u64;
+                let len = rows * row_bytes;
+                buf.clear();
+                buf.resize(len, 0);
+                file.seek(SeekFrom::Start(off)).map_err(|e| format!("seek {off}: {e}"))?;
+                file.read_exact(buf).map_err(|e| format!("read {len} @{off}: {e}"))
+            };
+            let (a_q4, st) =
+                gguf_rows_quantized_chunked(t.ty, QuantMode::Q4_0, k, n, rows, &mut reader)
+                    .expect("行チャンク量子化 (Q4_0)");
+            let chunk_rss = peak_rss_bytes();
+
+            // (b) 従来経路: テンソル全体を f32 へ展開 → 量子化 (= Linear::new)
+            reset_peak_rss();
+            let whole_base_rss = rss_now_bytes();
+            let mut raw = vec![0u8; t.nbytes as usize];
+            reader(0, n, &mut raw).expect("read whole tensor");
+            let whole = dequant_row(t.ty, &raw, elems);
+            drop(raw);
+            let b_q4 = Q4Linear::quantize(&whole, k, n);
+            let b_q8 = if elems <= INT8_ELEM_LIMIT {
+                Some(Quant8Linear::quantize(&whole, k, n))
+            } else {
+                None
+            };
+            let whole_rss = peak_rss_bytes();
+            drop(whole);
+
+            // int8 の副次比較 (チャンク経路も従来経路も同じ `Quant8Linear`)
+            let a_q8 = if b_q8.is_some() {
+                let (l, _) =
+                    gguf_rows_quantized_chunked(t.ty, QuantMode::Int8, k, n, rows, &mut reader)
+                        .expect("行チャンク量子化 (int8)");
+                Some(l)
+            } else {
+                None
+            };
+
+            // 参照のまま比較する (大きな blocks を clone しない)
+            let (a_blocks, b_blocks) = match &a_q4 {
+                Linear::Q4(a) => (&a.blocks, &b_q4.blocks),
+                _ => panic!("Q4 の線形重みではない"),
+            };
+            let identical = a_blocks == b_blocks;
+            let first_diff = a_blocks.iter().zip(b_blocks.iter()).position(|(x, y)| x != y);
+            let int8 = match (&a_q8, &b_q8) {
+                (Some(Linear::Q8(a)), Some(b)) => {
+                    let bits = |v: &Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    Some(a.w == b.w && bits(&a.scale) == bits(&b.scale))
+                }
+                (None, None) => None,
+                _ => Some(false),
+            };
+            println!(
+                "[p37]   {name:<32} {:?} k={k:<6} n={n:<6} {}  chunks={} x {} rows  \
+                 chunk-peak={:.1} MB (rss {} MB over base {} MB)  whole-f32={:.1} MB (rss {} MB over base {} MB)  int8={}",
+                t.ty,
+                if identical { "IDENTICAL" } else { "DIFF" },
+                st.chunks,
+                st.chunk_rows,
+                st.peak_bytes() as f64 / 1e6,
+                delta_mb(chunk_rss, chunk_base_rss),
+                chunk_base_rss.map(|b| b as f64 / 1e6).unwrap_or(f64::NAN),
+                elems as f64 * 4.0 / 1e6,
+                delta_mb(whole_rss, whole_base_rss),
+                whole_base_rss.map(|b| b as f64 / 1e6).unwrap_or(f64::NAN),
+                match int8 {
+                    Some(true) => "IDENTICAL".to_string(),
+                    Some(false) => "DIFF".to_string(),
+                    None => "n/a (>64Mi elems)".to_string(),
+                }
+            );
+            if let Some(i) = first_diff {
+                let b0 = (i / Q4_BLOCK_BYTES) * Q4_BLOCK_BYTES;
+                println!(
+                    "[p37]     !!! 最初の不一致 byte {i} (ブロック先頭 {b0}, ブロック内 {} B)",
+                    i - b0
+                );
+            }
+            verdicts.push(ChunkVerdict {
+                name: name.clone(),
+                ty: t.ty,
+                k,
+                n,
+                identical,
+                first_diff,
+                chunk: st,
+                chunk_rss,
+                chunk_base_rss,
+                whole_f32_bytes: elems * 4,
+                whole_rss,
+                whole_base_rss,
+                int8,
+            });
+        }
+
+        println!("\n=== P37 per-tensor verdict (行チャンク vs 全体 f32 → 量子化) ===");
+        println!(
+            "{:<32} {:<6} {:>6} {:>7} {:>10} {:>13} {:>13} {:>10} {:>10}  q4/int8",
+            "tensor",
+            "type",
+            "k",
+            "n",
+            "verdict",
+            "chunk peak(MB)",
+            "whole f32(MB)",
+            "rss ch(MB)",
+            "rss wh(MB)"
+        );
+        let mut all_identical = true;
+        let mut max_chunk_peak = 0usize;
+        let mut max_whole_peak = 0usize;
+        for v in &verdicts {
+            all_identical &= v.identical;
+            max_chunk_peak = max_chunk_peak.max(v.chunk.peak_bytes());
+            max_whole_peak = max_whole_peak.max(v.whole_f32_bytes);
+            println!(
+                "{:<32} {:<6} {:>6} {:>7} {:>10} {:>13.2} {:>13.2} {:>10.1} {:>10.1}  {}/{}",
+                v.name,
+                format!("{:?}", v.ty),
+                v.k,
+                v.n,
+                if v.identical { "IDENTICAL" } else { "DIFF" },
+                v.chunk.peak_bytes() as f64 / 1e6,
+                v.whole_f32_bytes as f64 / 1e6,
+                delta_mb(v.chunk_rss, v.chunk_base_rss),
+                delta_mb(v.whole_rss, v.whole_base_rss),
+                if v.identical { "ok" } else { "DIFF" },
+                match v.int8 {
+                    Some(true) => "ok",
+                    Some(false) => "DIFF",
+                    None => "n/a",
+                }
+            );
+        }
+        println!(
+            "[p37] max peak transient (COMPUTED): chunked {:.2} MB / whole-tensor {:.2} MB ({:.0}x)",
+            max_chunk_peak as f64 / 1e6,
+            max_whole_peak as f64 / 1e6,
+            max_whole_peak as f64 / max_chunk_peak.max(1) as f64
+        );
+        for v in &verdicts {
+            if !v.identical {
+                println!(
+                    "[p37] NOT IDENTICAL: {} {:?} k={} n={} first_diff={:?}",
+                    v.name, v.ty, v.k, v.n, v.first_diff
+                );
+            }
+        }
+
+        assert!(!verdicts.is_empty(), "比較したテンソルが 0 本 (対象ファイル/型を確認)");
+        assert!(
+            verdicts.iter().any(|v| v.name == "token_embd.weight"),
+            "token_embd.weight が比較されていない (受け入れ条件)"
+        );
+        assert!(
+            all_identical,
+            "行チャンク量子化が従来経路とバイト一致しないテンソルがある → そのテンソルは \
+             チャンク経路を有効にしてはいけない (上の表と first_diff を参照)"
+        );
     }
 }
