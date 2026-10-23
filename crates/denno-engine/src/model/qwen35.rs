@@ -35,9 +35,10 @@ use std::path::Path;
 
 use crate::gguf::GgufFile;
 use crate::gdn::{forward_token_core, GdnCore, GdnParams};
+use crate::kquant::GgmlType;
 use crate::kv_cache::KvCache;
 use crate::model::{cfg_u64, Model};
-use crate::quant::{next_q8_uid, Linear, Quant8Linear, QuantMode};
+use crate::quant::{next_q8_uid, Linear, Q4Linear, Quant8Linear, QuantMode};
 use crate::tensor::{rmsnorm, softmax};
 
 /// GatedAttention (full_attention) 層
@@ -176,6 +177,24 @@ fn pick_gguf(dir: &Path) -> Result<std::path::PathBuf> {
         }
     }
     Ok(candidates[0].clone())
+}
+
+/// P35: GGUF テンソルが engine の Q4_0 ブロックと**同一レイアウト**なら、
+/// fp32 へ展開せずに生ブロックから線形層を作る (再量子化なし)。
+///
+/// 型が Q4_0 以外・1 行が 32 の倍数でない・バイト数が合わない場合は
+/// `Ok(None)` を返し、呼び出し側は従来の `dequant_tensor` → `Linear::new`
+/// 経路へ落ちる (fail-closed)。`DENNO_GGUF_PASSTHROUGH` が無効なときは
+/// 呼ばれない (既定は従来経路)。
+fn q4_verbatim_linear(f: &GgufFile, name: &str, k: usize, n: usize) -> Result<Option<Linear>> {
+    let Some(t) = f.tensor(name) else {
+        return Ok(None);
+    };
+    if t.ty != GgmlType::Q4_0 || !crate::quant::gguf_passthrough_allows(t.ty) {
+        return Ok(None);
+    }
+    let bytes = f.tensor_bytes(name).with_context(|| format!("tensor {name}"))?;
+    Ok(Q4Linear::from_gguf_blocks(bytes, k, n).map(Linear::Q4))
 }
 
 /// ロード時の構造検証: テンソルを dequant する前に、GGUF ヘッダ上の形状
@@ -438,6 +457,16 @@ impl Qwen35 {
             dt(name)
         };
 
+        // P35: GGUF の Q4_0 ブロックを再量子化せずそのまま積む経路 (既定 OFF)。
+        // `DENNO_GGUF_PASSTHROUGH=1` かつ --quant q4 のときだけ有効。
+        // OFF は従来と完全同一 (dequant → Linear::new の再量子化)。
+        let passthrough = quant == QuantMode::Q4_0 && crate::quant::gguf_passthrough_enabled();
+        if passthrough {
+            tracing::info!(
+                "DENNO_GGUF_PASSTHROUGH=1: Q4_0 テンソルは生ブロックのまま積む (fp32 展開を省略)"
+            );
+        }
+
         let n_layer = cfg_u64(tc, "num_hidden_layers")? as usize;
 
         // 層数の整合確認 (MTP/nextn 除外): GGUF の block_count は MTP (nextn)
@@ -506,19 +535,31 @@ impl Qwen35 {
         let qkv_dim = gdn_p.qkv_dim();
 
         let eu = e as u64;
+        // P35: 2D 線形重みのロード。passthrough 有効かつ GGUF の型が Q4_0 で
+        // 形も一致するときだけ fp32 を経由しない (それ以外は従来の dt → lin)。
+        let lin_g = |name: &str, ne: &[u64], k: usize, n: usize| -> Result<Linear> {
+            if passthrough {
+                expect_ne(&f, name, ne).with_context(|| format!("tensor {name}"))?;
+                if let Some(l) = q4_verbatim_linear(&f, name, k, n)? {
+                    quant_bytes.set(quant_bytes.get() + l.weight_bytes());
+                    return Ok(l);
+                }
+            }
+            Ok(lin(dt_shaped(name, ne)?, k, n))
+        };
         for i in 0..n_layer {
             let p = format!("blk.{i}.");
             let ln1_w = dt_shaped(&format!("{p}attn_norm.weight"), &[eu])?;
             let ln2_w = dt_shaped(&format!("{p}post_attention_norm.weight"), &[eu])?;
-            let gate_w = lin(dt_shaped(&format!("{p}ffn_gate.weight"), &[eu, ff as u64])?, e, ff);
-            let up_w = lin(dt_shaped(&format!("{p}ffn_up.weight"), &[eu, ff as u64])?, e, ff);
+            let gate_w = lin_g(&format!("{p}ffn_gate.weight"), &[eu, ff as u64], e, ff)?;
+            let up_w = lin_g(&format!("{p}ffn_up.weight"), &[eu, ff as u64], e, ff)?;
             // s80 (T7b-1): gate+up の行連結 [2*ff, e] を**ここで 1 回だけ**作る。
             // 層ごとの Vec を毎回確保せず、ロード後に元の gate/up は解放される
             // (int8 モードの常駐量は 1.5 倍・fp32 モードは 1.5 倍)。
             // 行順 [gate 全行 | up 全行] が GPU grouped GEMM のパート順
             // (gate, up) と一致するので、既存のデバイスキャッシュもそのまま使える。
             let gate_up_w = concat_rows(&gate_w, &up_w, "gate+up")?;
-            let down_w = lin(dt_shaped(&format!("{p}ffn_down.weight"), &[ff as u64, eu])?, ff, e);
+            let down_w = lin_g(&format!("{p}ffn_down.weight"), &[ff as u64, eu], ff, e)?;
 
             let attn = if f.tensor(&format!("{p}ssm_a")).is_some() {
                 // GDN (linear_attention) 層
@@ -545,16 +586,8 @@ impl Qwen35 {
                 };
                 AttnKind::Gdn(GdnLayer {
                     ln1_w,
-                    qkv_w: lin(
-                        dt_shaped(&format!("{p}attn_qkv.weight"), &[eu, qkv_dim as u64])?,
-                        e,
-                        qkv_dim,
-                    ),
-                    gate_w: lin(
-                        dt_shaped(&format!("{p}attn_gate.weight"), &[eu, vd as u64])?,
-                        e,
-                        vd,
-                    ),
+                    qkv_w: lin_g(&format!("{p}attn_qkv.weight"), &[eu, qkv_dim as u64], e, qkv_dim)?,
+                    gate_w: lin_g(&format!("{p}attn_gate.weight"), &[eu, vd as u64], e, vd)?,
                     beta_w,
                     alpha_w,
                     ba_w,
@@ -565,11 +598,7 @@ impl Qwen35 {
                     ssm_a: dt_shaped(&format!("{p}ssm_a"), &[gdn_p.n_v_heads as u64])?,
                     ssm_dt: dt_shaped(&format!("{p}ssm_dt.bias"), &[gdn_p.n_v_heads as u64])?,
                     ssm_norm: dt_shaped(&format!("{p}ssm_norm.weight"), &[gdn_p.head_v_dim as u64])?,
-                    out_w: lin(
-                        dt_shaped(&format!("{p}ssm_out.weight"), &[vd as u64, eu])?,
-                        vd,
-                        e,
-                    ),
+                    out_w: lin_g(&format!("{p}ssm_out.weight"), &[vd as u64, eu], vd, e)?,
                 })
             } else {
                 // full_attention 層 (Q+gate 融合: out = heads*[q(dh)|gate(dh)])。
@@ -579,31 +608,27 @@ impl Qwen35 {
                 let q_total = heads * dh * 2;
                 AttnKind::Full(FullLayer {
                     ln1_w,
-                    q_w: lin(
-                        dt_shaped(&format!("{p}attn_q.weight"), &[eu, q_total as u64])?,
-                        e,
-                        q_total,
-                    ),
-                    k_w: lin(
-                        dt_shaped(&format!("{p}attn_k.weight"), &[eu, (kv_heads * dh) as u64])?,
+                    q_w: lin_g(&format!("{p}attn_q.weight"), &[eu, q_total as u64], e, q_total)?,
+                    k_w: lin_g(
+                        &format!("{p}attn_k.weight"),
+                        &[eu, (kv_heads * dh) as u64],
                         e,
                         kv_heads * dh,
-                    ),
-                    v_w: lin(
-                        dt_shaped(&format!("{p}attn_v.weight"), &[eu, (kv_heads * dh) as u64])?,
+                    )?,
+                    v_w: lin_g(
+                        &format!("{p}attn_v.weight"),
+                        &[eu, (kv_heads * dh) as u64],
                         e,
                         kv_heads * dh,
-                    ),
+                    )?,
                     q_norm_w: dt_shaped(&format!("{p}attn_q_norm.weight"), &[dh as u64])?,
                     k_norm_w: dt_shaped(&format!("{p}attn_k_norm.weight"), &[dh as u64])?,
-                    o_w: lin(
-                        dt_shaped(
-                            &format!("{p}attn_output.weight"),
-                            &[(heads * dh) as u64, eu],
-                        )?,
+                    o_w: lin_g(
+                        &format!("{p}attn_output.weight"),
+                        &[(heads * dh) as u64, eu],
                         heads * dh,
                         e,
-                    ),
+                    )?,
                 })
             };
             // s166 (P5): qkv グループの行連結 (Q4 のときだけ)。decode chain が
@@ -652,7 +677,7 @@ impl Qwen35 {
                 }
             }
         } else {
-            Some(lin(dt_shaped("output.weight", &[eu, vocab as u64])?, e, vocab))
+            Some(lin_g("output.weight", &[eu, vocab as u64], e, vocab)?)
         };
         let norm_w = match f.tensor("output_norm.weight") {
             Some(_) => dt_shaped("output_norm.weight", &[eu])?,

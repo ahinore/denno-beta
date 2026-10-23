@@ -3604,3 +3604,53 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
 - **触っていないもの**: `.cu` / `.ptx` / nvcc / GPU ビルド / GPU 実行 / D2H の連結
   (P17b・実測 2.2x 悪化で revert 済み) / リダクション順 / 新しい env ゲート /
   8095 / push / rebase / `git add -A`。作業レポートは未 commit の `REPORT_P28.md`。
+
+### P35: GGUF Q4_0 の生ブロック passthrough を実データで判定した (2026-10-23) 完了 (既定 OFF・許可型 0)
+
+> P4-5 の残件「GGUF → fp32 → Q4_0 の再量子化をやめて生ブロックをそのまま積む」に
+> ついて、まず**ビット一致するか**を実ファイルで確かめた。結論は
+> **Q4_0 は一致しない** (サンプル 16 本中 14 本が不一致・最初の不一致は
+> `blk.60.ffn_up.weight` の byte 0 = ブロックの f16 スケール)。よって
+> passthrough は実装したが**許可型リストは空**のまま = ゲートを ON にしても
+> 従来の fp32 経路で、数値は 1 ビットも変わらない。
+
+- **実測 (`gguf::tests::q4_verbatim_matches_requant_real_gguf`・`#[ignore]`・CPU)**:
+  `/work/models/Qwen3.8-27B-Q4_0.gguf` を **mmap せず**、先頭 16 MiB から
+  ヘッダ (10,996,700 B) だけを `GgufHeader` で解析し、テンソルは pread で
+  行境界 4 MB ずつ読んで `dequant_row` → `Q4Linear::quantize` とバイト比較した
+  (ピーク数十 MB・全体 5.1 s)。型別判定: **Q4_0 = NOT identical**
+  (352 本 / 12.441 GiB、サンプル 16 本、一致 2 本 = `token_embd.weight` と
+  `blk.64.ffn_up.weight`)。F32 456 本・Q4_1 8 本・Q5K 48 本・Q6K 1 本・
+  Q8_0 1 本は Q4_0 レイアウトでないため対象外 (従来経路のまま)。
+- **不一致の機序 (実ブロックを 1 個ダンプして確認)**: ファイル側ブロックは
+  `d = 4.543304e-3`・ニブル範囲 1..12 で **max|q-8| = 7**。ggml の
+  `quantize_row_q4_0_ref` は最大絶対値の要素を必ずニブル 0 (|q-8| = 8) に写すので、
+  このブロックは ref 規則で作られていない。そのため再量子化の `d'` は
+  `max|y|/-8 = d*7/8` になり、比は 14 本すべてで実測 **1.1426〜1.1433
+  (= 8/7 = 1.142857、f16 丸めの幅)**。スケールが変わればニブルも変わる
+  (両方不一致)。比が一定なのは「ref の `d = max/-8` ではなく `d ≈ amax/7` 系の
+  規則で量子化されている」ことと整合する (ファイルは ref 経路の産物ではない)。
+  → このファイルでは往復は「純粋なコスト」ではなく**値が変わる変換**。
+- **変更**: `quant.rs` に `Q4Linear::from_gguf_blocks` (生ブロックの検証付き
+  コピー・形が合わなければ `None` の fail-closed)・`GGUF_PASSTHROUGH_ENV` /
+  `gguf_passthrough_from_value` / `gguf_passthrough_enabled` /
+  `gguf_passthrough_allows` (許可型 = 現在 0 個)。`gguf.rs` に `GgufHeader`
+  (mmap 無しのヘッダビュー。`GgufFile` と共通の `parse_fields` を通すので
+  解析規則は 1 本) と上記 proof test。`qwen35.rs` の 2D 線形重み 10 本 +
+  untied `output.weight` を `lin_g` (ゲート時のみ passthrough を試し、
+  失敗したら従来の `dt → lin`) 経由にした。**既定 (env 未設定 / `0`) は
+  従来と同一の呼び出し列** (同じ関数を同じ順で呼ぶ)。
+- **予測効果 (PREDICTED・未計測)**: Q4_0 を許可した場合に省ける fp32 展開は
+  **88.47 GiB** (12.441 GiB × 4 B/elem ÷ 0.5625 B/elem = 7.111 倍。テンソル
+  ごとの一時確保で同時常駐ではない。最大は `token_embd.weight` の 5.086 GB)。
+  proof test の実測レート (0.77 GiB / 5.1 s) からロードの CPU 側は約 82 s
+  減る見込み。ただし**許可型 0 個なので実際の節約は 0**。実機のロード時間は
+  本セッションの計測対象外。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **323 passed / 0 failed / 38 ignored** (基準 321 + 新規 unit 2 + ignored 1)。
+  `-- --ignored q4_verbatim_matches_requant_real_gguf` = 1 passed。非 cuda
+  `cargo test -p denno-engine --lib` = 282 passed / 0 failed / 3 ignored。
+- **触っていないもの**: `.cu` / `.ptx` / GPU / サーバ / docker /
+  `docs/NUMERIC_POLICY.ja.md` / `GPU_VERIFY.sh` / `scripts/prod_serve_27b.sh` /
+  GGUF の型ゲートが受ける型集合 / push / `git add -A`。作業レポートは
+  未 commit の `REPORT_P35.md`。
