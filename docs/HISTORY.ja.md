@@ -3697,3 +3697,49 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
 - **触っていないもの**: `.cu` / `.ptx` / GPU / サーバ / docker / 量子化規則 /
   fp16・f32 の丸め / どのテンソルがどの quant モードか / `docs/NUMERIC_POLICY.ja.md` /
   push / `git add -A`。作業レポートは未 commit の `REPORT_P37.md`。
+
+### P38: token_embd の 5.086 GB f32 gather 表を行単位のデ量子化で置き換えられるかを数値で判定した (2026-10-23) 完了 (解析 + 証明テスト・製品コード変更なし)
+
+- **課題**: P37 §8 は `token_embd.weight` の f32 gather 表 (5.086 GB) が**常駐**のまま残る、
+  と記録した (ローダ最大のホスト RAM 項目。60 GB ホストは 8095 常駐時に 2 回 OOM-kill 済み)。
+  P35 の「このファイルの Q4_0 ブロックは再量子化で再現できない (`d' = d*7/8`)」を
+  「表は置き換えられない」と読んでいたのが原因。
+- **判明**: それは**再量子化** (f32 → Q4_0 エンコード) と**デ量子化**の混同。表はファイルの
+  ブロックをデ量子化するだけで作られる (`gguf.rs:286` の確保、`gguf.rs:300-302` の sink コピー、
+  `quant.rs:473` の 819 行チャンク 1 回の `dequant_row`)。`dequant_row`
+  (`kquant.rs:145-190`) は**ブロック内で閉じて**いて (ブロック間の状態を持たない)、
+  `row_bytes = 160*18 = 2880` は 32 要素ブロックの整数倍 = 行境界はブロック境界。
+  よって 1 行だけのデ量子化は同じバイトに対する同じ 160 ブロックの計算になり、f32 のビットが一致する。
+- **実測 (proof test `gguf::tests::q4_row_dequant_matches_embed_table_real_gguf`・
+  `#[ignore]`・CPU・mmap せず seek+read_exact)**: `token_embd.weight` k=5120 n=248320 Q4_0
+  (生 715.2 MB・表 5,085.6 MB)。40 行 (0, 1, 2, チャンク境界 818/819/820/1637-1639,
+  等間隔の散らし, 248318/248319) を 32 チャンクに跨って比較 → **40/40 一致**。
+  テンソル全体を 1 回の `dequant_row` で作った 5.086 GB の表 (ローダの非チャンク形) と
+  → **40/40 一致** (実測 RSS +5,800 MB)。**全 248,320 行のスイープ** → **差分 0** (3.30 s)。
+  比較はすべて f32 の**ビットパターン** (epsilon ではない)。
+- **コスト (この CPU・ページキャッシュ warm の実測)**: 1 行 = 2,880 B の pread +
+  `dequant_row` で **B=1 で 3.09 µs/token** (17.30 ms/token の KPI の 0.018 %・
+  KPI に対する算術であり GPU 実測ではない)、**B=8 で 24.93 µs**、**B=32 で 103.91 µs**
+  (0.60 %)。純デ量子化は 1.9 µs/行で、残りは pread とアロケート。ピーク一時領域は
+  **23.4 KB** (行バッファ 2,880 B + f32 1 行 20,480 B) で、常駐 5,085.6 MB の表が不要になる。
+  再実行では 2.95 / 23.57 / 99.81 µs。
+- **判定: (a) ビット一致で、実装する価値がある。** 常駐削減は mmap 済みファイル領域から
+  行をデ量子化するなら **5,085.6 MB** (ページキャッシュ = 回収可能)、715.2 MB の生ブロック
+  コピーを常駐させるなら **4,370.4 MB**。行キャッシュは不要 (64 行でも 1.31 MB)。
+  スケッチ (未実装): `qwen35.rs` に `EmbedRows::{F32, Blocks}`、3 つの gather サイト
+  (`qwen35.rs:1789` decode・`1937` prefill・`3165` GPU chain upload) を `Cow<[f32]>` の
+  行アクセサへ。`GgufFile::embed_blocks_and_linear_chunked` は既存のチャンク駆動を再利用して
+  量子化コピーをバイト不変に保つ。ゲート `DENNO_EMBED_ONDEMAND` (既定 ON・
+  `0/false/no/off` で従来の表)、型/形/`nbytes` 不一致は fail-closed。tied fp32 `lm_head` 経路
+  (`qwen35.rs:1648-1687`) は f32 側に残り、`quant != Fp32` では到達しない。
+  **`lm_head` の Q4 コピーは供給元にできない**: あれは再量子化されたもので (P35 の許可型は
+  空のまま) ファイルのブロックではないため、デ量子化してもビット一致しない。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **327 passed / 0 failed / 40 ignored** (基準 327 / 0 / 39 + このテスト 1 本)。
+  非 cuda `cargo test -p denno-engine --lib` = 286 passed / 0 failed / 5 ignored。
+  `tests/kernel_invariants.rs::gdn_kernel_shared_layout_matches_host_smem` は pristine な
+  HEAD `3e288aa` で赤 (P36 が `gdn.cu` の pass 1 の `sc[]` レイアウトを変え、テストの期待値を
+  更新していない) — 既存・無関係・本タスクでは触っていない。
+- **触っていないもの**: `.cu` / `.ptx` / GPU / サーバ / docker / 量子化規則 / 数値経路 /
+  `qwen35.rs` / テスト以外の `gguf.rs` / push / `git add -A`。作業レポートは未 commit の
+  `REPORT_P38.md` (P37 §8 の該当文の誤りはそこで訂正)。

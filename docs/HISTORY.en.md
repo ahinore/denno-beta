@@ -3770,3 +3770,55 @@ External implementations referenced in P19 and their licensing status (the same 
 - **Untouched**: `.cu` / `.ptx` / GPU / server / docker / the quantisation rules /
   fp16-f32 rounding / which tensor uses which quant mode / `docs/NUMERIC_POLICY.ja.md` /
   push / `git add -A`. The work report is the uncommitted `REPORT_P37.md`.
+
+### P38: decided with numbers that token_embd's 5.086 GB f32 gather table can be per-row dequantised, bit-identically (2026-10-23) DONE (analysis + proof test, no product change)
+
+- **Question**: P37 §8 left `token_embd.weight` needing its 5.086 GB f32 gather table
+  **resident** (the largest host-RAM item in the loader, on a 60 GB host that has already
+  been OOM-killed twice with the 8095 server up). P35's finding - this file's Q4_0 blocks
+  are not reproducible by re-quantisation (`d' = d*7/8`) - was being read as "the table
+  cannot be replaced".
+- **Finding**: that conflates *re-quantisation* (f32 -> Q4_0 encode) with *dequantisation*.
+  The table is built by dequantising the file's own blocks: `gguf.rs:286` allocates it,
+  `gguf.rs:300-302` copies each chunk's f32 into it, and `quant.rs:473` produces that f32
+  with one `dequant_row(ty, chunk_bytes, rows*k)` per 819-row chunk. `dequant_row`
+  (`kquant.rs:145-190`) is **block-local** (no cross-block state) and
+  `row_bytes = 160*18 = 2880` is an exact multiple of the 32-element block, so a row
+  boundary is a block boundary: per-row dequant runs the same 160 block computations on the
+  same bytes and yields the same f32 bits.
+- **Measured (proof test `gguf::tests::q4_row_dequant_matches_embed_table_real_gguf`,
+  `#[ignore]`, CPU, no mmap, seek+read_exact)**: `token_embd.weight` k=5120 n=248320 Q4_0
+  (raw 715.2 MB, table 5,085.6 MB). 40 sampled rows (0, 1, 2, chunk boundaries
+  818/819/820/1637-1639, an even spread, 248318/248319) over 32 loader chunks ->
+  **40/40 IDENTICAL**. The whole-tensor 5.086 GB table built by a single `dequant_row` call
+  (the loader's non-chunked shape) -> **40/40 IDENTICAL** (measured RSS +5,800 MB). Full
+  sweep of **all 248,320 rows** -> **0 differences** in 3.30 s. All comparisons are on f32
+  **bit patterns**, never an epsilon.
+- **Cost (measured on this CPU, warm page cache)**: 2,880 B pread + `dequant_row` per row =
+  **3.09 us/token at B=1** (0.018 % of the 17.30 ms/token KPI - arithmetic against the KPI,
+  not a GPU measurement), **24.93 us at B=8**, **103.91 us at B=32** (0.60 %); the pure
+  dequant part is 1.9 us/row and the rest is the pread plus allocations. Peak transient
+  **23.4 KB** (2,880 B row buffer + one 20,480 B f32 row) instead of a 5,085.6 MB resident
+  table. A repeat run gave 2.95 / 23.57 / 99.81 us.
+- **Verdict: (a) bit-identical and cheap enough.** Resident relief **5,085.6 MB** when rows
+  are dequantised from the mmap'd file region (page cache, reclaimable), or **4,370.4 MB**
+  when a 715.2 MB verbatim block copy is kept instead. No row cache is needed (a 64-entry
+  one would be 1.31 MB). Sketch, not implemented: `EmbedRows::{F32, Blocks}` in
+  `qwen35.rs`; the three gather sites (`qwen35.rs:1789` decode, `1937` prefill, `3165` GPU
+  chain upload) move to a `Cow<[f32]>` row accessor; a new
+  `GgufFile::embed_blocks_and_linear_chunked` reuses the existing chunk driver so the
+  quantised copy stays byte-identical; gate `DENNO_EMBED_ONDEMAND` (default ON,
+  `0/false/no/off` restores today's table), fail-closed on type/shape/`nbytes`. The tied
+  fp32 `lm_head` path (`qwen35.rs:1648-1687`) stays on the f32 variant and is unreachable
+  when `quant != Fp32`. **The `lm_head` Q4 copy cannot be the source**: it is re-quantised
+  (P35 allow-list still empty), not the file's blocks, so dequantising it would not be
+  bit-identical.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **327 passed / 0 failed / 40 ignored** (baseline 327 / 0 / 39 + this one ignored test).
+  Non-cuda `cargo test -p denno-engine --lib` = 286 passed / 0 failed / 5 ignored.
+  `tests/kernel_invariants.rs::gdn_kernel_shared_layout_matches_host_smem` is red at
+  pristine HEAD `3e288aa` (P36 rewrote `gdn.cu`'s pass-1 `sc[]` layout and the test's
+  expectation was not updated) - pre-existing, unrelated, and not touched here.
+- **Untouched**: `.cu` / `.ptx` / GPU / server / docker / the quantisation rules / the
+  numeric path / `qwen35.rs` / non-test `gguf.rs` / push / `git add -A`. Work report: the
+  uncommitted `REPORT_P38.md`. P37 §8's sentence about this topic is corrected there.
