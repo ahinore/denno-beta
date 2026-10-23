@@ -2,6 +2,7 @@
 
 対象期間: 2026-10-12 〜 2026-10-19。サーバー層(`denno-server`)とエンジンのテキスト後処理に入った機能の記録。
 モデル構造の話は巻3、速度とカーネルの話は別巻に分かれている。
+日付は commit の author date を JST で表す。
 
 ## この巻で分かること
 
@@ -20,6 +21,24 @@ chat template(Jinja)によるプロンプト描画。この巻の変更はすべ
 P11(ストリーミング detok)→ tool use → tool_choice 拘束 → streaming tool_use → 切断検知 → max_tokens 既定 →
 非ストリーム切断とログ → thinking(s47 → s52 → s53c)→ 停止条件 → 反復抑止 → temperature 上限、の順。
 thinking の 3 エントリは必ず順に読む(後段が前段の意味を変えている)。
+
+## 対象 phase 一覧
+
+| phase | date | commit | one-line summary |
+|---|---|---|---|
+| P11 | 2026-10-12 | `1a7fee6` | ストリーミング detok の U+FFFD 保留と gpt2 exactness 基準の更新 |
+| tool use | 2026-10-16 | `751dc10` | tools / tool_choice の受理、chat template 変換、`<tool_call>` 抽出 |
+| tool_choice 拘束 | 2026-10-16 | `a16b203` | `any` / `tool` を logits マスクで token-level に強制 |
+| streaming tool_use | 2026-10-16 | `05e5f8f` | SSE アセンブラで delta 境界を跨ぐ `<tool_call>` を組み立てる |
+| 切断検知 | 2026-10-16 | `e7d3e7a` | SSE の `is_closed()` をステップ境界で見て生成を abort |
+| max_tokens 既定 | 2026-10-16 | `9636337` | 未指定時のみ 4096 を適用(`max_completion_tokens` も受理) |
+| s44 非ストリーム切断 | 2026-10-17 | `08e7c9b` | respond の閉鎖判定と、非ブロッキング stdout ログ |
+| s47 thinking 制御 | 2026-10-17 | `4e89c11` | `thinking: off / brief / full` を受理し template 変数へ渡す |
+| s52 thinking マップ | 2026-10-18 | `b9d29f8` | `{"type":"enabled"}` 形式を受理(`budget_tokens` は読まない) |
+| s53c brief の意味変更 | 2026-10-18 | `e7246b8` | brief を「思考無効 + 簡潔指示」へ、マップ `enabled` を off 扱い |
+| s53 停止条件 | 2026-10-19 | `f21a985` | ロールラベル停止の holdback と既定 max_tokens 1024 |
+| s56/s57 反復抑止 | 2026-10-19 | `b3eaf71` | no_repeat_ngram / frequency / presence を opt-in で追加 |
+| temperature 上限 | 2026-10-19 | `47e1928` | `--temperature-cap` で実効 temperature をクランプ |
 
 ---
 
@@ -295,3 +314,30 @@ thinking の 3 エントリは必ず順に読む(後段が前段の意味を変�
   - 残った課題: クライアント側で非 Anthropic エンドポイントに `temperature: 1` を付けないパッチが本来の修正だが未着手。クライアント更新で消え得るため、サーバー側の上限を先に入れた。
 
 - **次に効いたこと**: 「キャッシュを疑う前に、同じペイロードで条件だけを振って再現する」という切り分け手順が定着した。後の 27B の品質調査(巻3)でも、まず CPU で再現し、次に参照実装と比べる同じ順序を使っている。
+
+---
+
+## 棄却カタログ
+
+当時は妥当に見えたが後で捨てた判断。棄却の理由は、そのときに観測できた事実で書く。
+
+### brief を「思考 ON + 短答誘導文」として実装する(s47 `4e89c11` → s53c `e7246b8` で棄却)
+- 採用理由: thinking の意味を変えずに、system 冒頭の誘導文だけで回答に導けると考えた。ハード制御ではないと明記していた。
+- 観測: 実測で 9B が「Thinking Process:」のメタ分析を延々と書き、回答に到達しなかった。誘導文は生成を制約していないので、思考が走れば効かない。
+- 棄却: brief を「思考無効 + 簡潔指示」に変え、マップ `enabled` も off 扱いへ。既定は実質「思考しない」になった。副作用として、思考は明示的に `full` を送らないと走らなくなった。
+
+### 停止マーカーをチャンク先頭オフセット基準で判定する(s53 `f21a985` で棄却)
+- 採用していた形: 供給されたチャンクの先頭からの相対位置でマーカーを探す。
+- 観測: 本文中の `system` / `user` で誤停止する(`userland` のような語)。マーカーがトークン境界をまたぐため `u` / `us` / `use` が delta に漏れる。行ラベル判定と prefix 判定で語境界の見方が揃っていなかった。
+- 棄却: 送出済みバイト数 `sent_len` を不変条件にした holdback へ。prefix 経路が語境界を見ないという限界は残した(安全側として受け入れ)。
+
+### 非ストリームの切断を対象外とする(切断検知 `e7d3e7a` → s44 `08e7c9b` で棄却)
+- 採用理由: 「hyper はレスポンス送信まで接続を観測しない」ので、非ストリームには観測する機会が無いとした。
+- 観測: 前提が誤り。応答 future が pending の間も read 側を見ており、切断時に handler future ごと drop される。実際に切断後も `in_flight` が 1 のまま減らない事例が出た。
+- 棄却: handler が持つ oneshot の `respond.is_closed()` を切断の間接観測に使い、SSE と同一の sweep に乗せた。
+
+### tools + stream を 400 で拒否する(tool use `751dc10` → streaming tool_use `05e5f8f` で棄却)
+- 採用理由: 非ストリーミングの抽出器を delta ストリームへ移植する手段が無く、範囲を絞った。拒否はテスト(`tools_with_stream_is_rejected`)で固定していた。
+- 観測: クライアントはツール会話をストリーミングで使えない。SSE アセンブラを入れれば、任意の分割幅で `extract_tool_calls(全文)` の残テキストと一致させられることが単体テストで示せた。
+- 棄却: 400 を撤去し、`StreamAssembler` で受理。テストを `tools_with_stream_is_accepted` に置換した。
+
