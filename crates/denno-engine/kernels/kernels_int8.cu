@@ -589,10 +589,14 @@ extern "C" __global__ Q4_GEMV_LAUNCH_BOUNDS void dno_gemv_q4_0c8(
     dno_gemv_q4_0_cols<8>(a, nib, sc, out, m, k, n);
 }
 
-// prefill / バッチ用のタイル GEMM。block = (16,16) = 256 thread、
-// 1 ブロック = m 方向 64 行 x n 方向 128 列。1 thread は 4 行 x 8 列 (32 個の acc) を
+// prefill / バッチ用のタイル GEMM。block = (16,8) = 128 thread、
+// 1 ブロック = m 方向 64 行 x n 方向 128 列。1 thread は 8 行 x 8 列 (64 個の acc) を
 // 担当する。共有メモリは A タイル (64x32 f32) と B タイル (128x33 f32・展開済み) で
 // 25 KB。B の行長を 33 にしているのは bank 衝突の回避 (下のコメント参照)。
+//
+// s249 (P52): 1 thread のタイルを 4x8 -> 8x8 に広げる。1 要素あたりの共有メモリ
+// ロード数が 32 FFMA / 12 load から 64 FFMA / 16 load に下がる (2.7 -> 4.0)。
+// **各出力要素の累積順 (b 昇順 -> c 昇順) は不変**なのでビット一致は保たれる。
 #define Q4_GM 64
 #define Q4_GN 128
 static_assert(Q4_GM * 32 * 4 + Q4_GN * 33 * 4 <= 48 * 1024,
@@ -613,34 +617,34 @@ extern "C" __global__ void dno_gemm_q4_0(
     const int i0 = blockIdx.x * Q4_GM;
     const int j0 = blockIdx.y * Q4_GN;
     const int tx = threadIdx.x;   // 0..15 → 列 8 本 (tx + 16*j)
-    const int ty = threadIdx.y;   // 0..15 → 行 4 本 (ty*4 + r)
-    const int tid = ty * 16 + tx; // 0..255 → 展開する B の 1 列 x 16 要素
+    const int ty = threadIdx.y;   // 0..7  → 行 8 本 (ty*8 + r)
+    const int tid = ty * 16 + tx; // 0..127 → 展開する B の 1 列 (32 要素すべて)
 
-    float acc[4][8];
+    float acc[8][8];
     #pragma unroll
-    for (int r = 0; r < 4; r++)
+    for (int r = 0; r < 8; r++)
         #pragma unroll
         for (int v = 0; v < 8; v++) acc[r][v] = 0.0f;
 
     for (int b = 0; b < nb; b++) {
-        // A タイル (64 行 x 32 要素)。thread は 4 行 x 2 要素を読む。
+        // A タイル (64 行 x 32 要素)。thread は 8 行 x 2 要素を読む。
         #pragma unroll
-        for (int r = 0; r < 4; r++) {
-            const int gi = i0 + ty * 4 + r;
+        for (int r = 0; r < 8; r++) {
+            const int gi = i0 + ty * 8 + r;
             if (gi < m) {
                 const float* src = a + (size_t)gi * (size_t)k + (b << 5);
-                sA[ty * 4 + r][tx] = src[tx];
-                sA[ty * 4 + r][tx + 16] = src[tx + 16];
+                sA[ty * 8 + r][tx] = src[tx];
+                sA[ty * 8 + r][tx + 16] = src[tx + 16];
             } else {
-                sA[ty * 4 + r][tx] = 0.0f;
-                sA[ty * 4 + r][tx + 16] = 0.0f;
+                sA[ty * 8 + r][tx] = 0.0f;
+                sA[ty * 8 + r][tx + 16] = 0.0f;
             }
         }
         // B タイル (128 列 x 32 要素) をニブルから展開する。thread は 1 列の
-        // 16 要素を担当 (tid の下位 7 bit が列、最上位 bit が下位/上位ニブルの別)。
+        // 32 要素を担当 (tid がそのまま列)。1 語 = 下位 4 bit 群が要素
+        // wi*4+e、上位 4 bit 群が要素 16+wi*4+e (旧 2 分割版と同じ対応)。
         {
-            const int col = tid & 127;
-            const int half = tid >> 7;   // 0: 要素 0..15, 1: 要素 16..31
+            const int col = tid;
             const int gj = j0 + col;
             const bool in = gj < n;
             const float d = in ? sc[(size_t)gj * (size_t)nb + b] : 0.0f;
@@ -651,23 +655,23 @@ extern "C" __global__ void dno_gemm_q4_0(
                 const unsigned int w32 = words[wi];
                 #pragma unroll
                 for (int e = 0; e < 4; e++) {
-                    const int sh = 8 * e + 4 * half;
-                    const int q = (int)((w32 >> sh) & 0xFu) - 8;
-                    sB[col][half * 16 + wi * 4 + e] = d * (float)q;
+                    sB[col][wi * 4 + e] = d * (float)((int)((w32 >> (8 * e)) & 0xFu) - 8);
+                    sB[col][16 + wi * 4 + e] =
+                        d * (float)((int)((w32 >> (8 * e + 4)) & 0xFu) - 8);
                 }
             }
         }
         __syncthreads();
         #pragma unroll
         for (int c = 0; c < 32; c++) {
-            float av[4];
+            float av[8];
             float bv[8];
             #pragma unroll
-            for (int r = 0; r < 4; r++) av[r] = sA[ty * 4 + r][c];
+            for (int r = 0; r < 8; r++) av[r] = sA[ty * 8 + r][c];
             #pragma unroll
             for (int j = 0; j < 8; j++) bv[j] = sB[tx + 16 * j][c];
             #pragma unroll
-            for (int r = 0; r < 4; r++)
+            for (int r = 0; r < 8; r++)
                 #pragma unroll
                 for (int j = 0; j < 8; j++)
                     acc[r][j] += av[r] * bv[j];
@@ -676,8 +680,8 @@ extern "C" __global__ void dno_gemm_q4_0(
     }
 
     #pragma unroll
-    for (int r = 0; r < 4; r++) {
-        const int gi = i0 + ty * 4 + r;
+    for (int r = 0; r < 8; r++) {
+        const int gi = i0 + ty * 8 + r;
         if (gi >= m) continue;
         float* row = out + (size_t)gi * (size_t)n;
         #pragma unroll
