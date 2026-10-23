@@ -478,6 +478,12 @@ lever: the measurement says the lever is not there.**
 ### P4-3: 27B Q4_0 quality
 - Why: 27B loads and runs deterministically but output quality (greedy collapse) is
   unexplained. UD-IQ2_XXS remains impossible (IQ1_M unsupported).
+  -> corrected (2026-10-23): "IQ1_M unsupported" is stale. IQ1_M (type 29) is decoded —
+  enum `kquant.rs:40`, `from_id` `kquant.rs:72`, decode arm `kquant.rs:624` — implemented
+  in 2344f67 (s157, Task K1 commit 2), with golden-value tests in
+  `tests/dequant_ref.rs` (`iq1_m_matches_hand_computed_block`, `tests/dequant_ref.rs:303`).
+  So IQ1_M is no longer what blocks UD-IQ2_XXS. Whether that 6.8 GB file loads end to end
+  has not been re-verified here (this container holds only the 27B Q4_0 GGUF).
 - Action: compare against llama.cpp on the same GGUF at the same seed, per-layer, to find
   where the collapse starts.
 - Acceptance: either a fix or a documented root cause.
@@ -533,6 +539,14 @@ lever: the measurement says the lever is not there.**
   card). UD-IQ2_XXS cannot even load (TQ1_0 / IQ1_M are not decoded in `kquant.rs`), and it
   would not have helped in int8 mode anyway. The lever was to keep the GGUF 4-bit blocks as
   they are.
+  -> corrected (2026-10-23): the parenthetical is stale. TQ1_0 (type 34) and IQ1_M (type 29)
+  are both decoded in `kquant.rs` — enums `kquant.rs:42` / `kquant.rs:40`, `from_id` arms
+  `kquant.rs:74` / `kquant.rs:72`, decode arms `kquant.rs:591` / `kquant.rs:624` — implemented
+  in 2344f67 (s157), so the loader's type gate accepts both ids (`gguf.rs:178-179`) and the
+  GGUF path dequantises through `kquant::dequant_row` (`gguf.rs:238`). "Cannot even load" was
+  true when this section was written (s123); it is no longer. Loading UD-IQ2_XXS itself is
+  still unverified in this container (no such GGUF here), so read this as "the decoder gap is
+  gone", not "the file is measured".
 - What was implemented (opt-in, `--quant q4` / `--quant q4_0`; 9B int8 and the anchors are
   untouched):
   - `Linear::Q4(Q4Linear)` holds the Q4_0 blocks verbatim: 32 elements = f16 scale (2B) +
@@ -568,6 +582,14 @@ lever: the measurement says the lever is not there.**
   - `kquant.rs` has no TQ1_0 (type 29) or IQ1_M (type 24) decoder, so IQ2-class files still
     cannot be loaded. With the native path in place that is now the only thing between the
     6.8 GB UD-IQ2_XXS and a 24 GB headroom, and it is a separate piece of work.
+    -> corrected (2026-10-23): wrong on both counts. (1) The type IDs are TQ1_0 = 34 and
+    IQ1_M = 29; type 24 is I8 (`kquant.rs:69-74`, and `tests/dequant_ref.rs:358` asserts
+    `from_id(24) == None`). (2) Both decoders exist as of 2344f67 (s157): enums
+    `kquant.rs:42` / `kquant.rs:40`, block size 256 at `kquant.rs:89-90`, type sizes 54 B / 56 B
+    at `kquant.rs:119` / `kquant.rs:117`, decode arms `kquant.rs:591` / `kquant.rs:624`. So
+    "IQ2-class files still cannot be loaded" is no longer true for this reason, and this bullet
+    is closed — the P4-5 residue that remains is the pass-through item below (blocks are
+    re-quantised from fp32 rather than taken verbatim from the file).
   - Blocks are re-quantised from fp32 today (GGUF -> fp32 -> Q4_0), which is within one block
     scale of the file's own blocks. Passing the file's blocks straight through needs the tensor
     type plumbed into `Linear`, and would also skip the 100 GB fp32 expansion at load.
@@ -933,8 +955,10 @@ measured, so the host side is not an open lever for those phases.
   decision"). No agent can take this decision.
 
 **(d) CPU-only work a dev container can do**
-- P4-5 residue: the `TQ1_0` / `IQ1_M` decoders in `kquant.rs` (Rust only; the C reference
-  harness is `ref/dequant_ref.c`, and any new type must be checked against `ggml-quants.c`).
+- P4-5 residue: the GGUF blocks are still re-quantised from fp32 today (GGUF -> fp32 -> Q4_0)
+  instead of being passed through verbatim, so load still pays the fp32 expansion (see the
+  "Still open" bullets under P4-5). The `TQ1_0` / `IQ1_M` decoder item that used to sit here
+  is done — `kquant.rs:591` / `kquant.rs:624`, 2344f67 (s157) — and was removed on 2026-10-23.
 - P3-3 known limits: extend the smem-cast scanner (the row bound of a symbolic row, float2
   casts through a dynamic alias with a symbolic column, casts through an intermediate
   pointer).
