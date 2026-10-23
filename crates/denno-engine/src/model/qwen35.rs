@@ -398,6 +398,21 @@ fn rope_partial_interleaved_tab(x: &mut [f32], heads: usize, dh: usize, n_rot: u
     }
 }
 
+/// s248 (P48): [`rmsnorm`] を **宛先へ直接**書く版 (1 行 = `cols` 要素)。
+///
+/// 演算列は [`rmsnorm`] と同一 — 2 乗和は同じ逐次累積 (`iter().map(|v| v*v).sum()`
+/// をそのまま書くので順序も同じ)、`inv = 1.0 / (ss + eps).sqrt()`、出力は
+/// `x * inv * w` を左から順に。違うのは**中間 `Vec` を確保せず `dst` に直接書く**
+/// ことだけで、1 要素の演算列・丸めは変わらない = 旧経路とビット一致
+/// (テスト `p48_prepare_norm_into_bit_exact_vs_legacy` が旧実装との一致を固定)。
+fn rmsnorm_into(src: &[f32], w: &[f32], dst: &mut [f32], cols: usize, eps: f32) {
+    let ss = src.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+    let inv = 1.0 / (ss + eps).sqrt();
+    for i in 0..cols {
+        dst[i] = src[i] * inv * w[i];
+    }
+}
+
 /// s172 (P12): prefill の prepare (QK-Norm → RoPE → KV 行書き込み) を **1 行分**
 /// 実行する。s171 までの `full_attn_host_side` の内側の本文をそのまま関数へ
 /// 切り出したもの (演算列・確保の回数・書き込み順は同一)。
@@ -406,6 +421,15 @@ fn rope_partial_interleaved_tab(x: &mut [f32], heads: usize, dh: usize, n_rot: u
 /// n=14,043 で回し、prepare のコストを実測できるようにするため
 /// (行ごとの `Vec` 確保をやめる版も試したが **-1.6 ms/層 = 0.03 s/request** しか
 /// 動かず、実装を 2 本持つ価値が無いので採らなかった — REPORT_P12.md)。
+///
+/// s248 (P48): その「確保をやめる」を**確保とコピーの両方**やめる形で入れ直した。
+/// 旧実装は q の head ごとに `rmsnorm` が `Vec` を返し、それを `q_r` へ
+/// `copy_from_slice` していた (k も `k_i.to_vec()` → head ごとの `Vec` → `k` →
+/// `k_row`)。1 行あたり `heads + kv_heads + 1` 回の確保と、同じバイト数の
+/// 書き戻しが純増していたので、`rmsnorm_into` で**宛先 (`q_r` / `k_row`) へ直接**
+/// 書く。演算列・丸め・要素順は不変 (ビット一致) で、消えるのは中間バッファの
+/// write/read と malloc だけ。**RoPE は従来どおり別パス** (融合すると順序の議論が
+/// 要るので踏まない)。
 #[allow(clippy::too_many_arguments)]
 fn pf_prepare_qk_row(
     qg_i: &[f32],      // [heads*2*dh] q 投影 + ゲート
@@ -424,28 +448,29 @@ fn pf_prepare_qk_row(
     pos: usize,
 ) {
     let kv_dim = kv_heads * dh;
-    let mut k = k_i.to_vec();
+    // s248 (P48): q の head ごとに `rmsnorm` の `Vec` を経由せず `q_r` へ直接書く
+    // (2 乗和は同じ逐次累積・同じ `x * inv * w`)。
     for hh in 0..heads {
         let src = &qg_i[hh * 2 * dh..hh * 2 * dh + dh];
-        let wq = rmsnorm(src, q_norm_w, dh, eps);
-        q_r[hh * dh..(hh + 1) * dh].copy_from_slice(&wq);
+        rmsnorm_into(src, q_norm_w, &mut q_r[hh * dh..(hh + 1) * dh], dh, eps);
     }
+    // s248 (P48): 旧実装は `k_i.to_vec()` → head ごとの `Vec` → `k` → `k_row` と
+    // 2 回コピーしていた。`k_i` をそのまま読んで `k_row` の行へ直接書き、
+    // RoPE もその場 (`k_row` の行) で回す — 読む値・書く値は同一。
     for kvh in 0..kv_heads {
-        let seg = &mut k[kvh * dh..(kvh + 1) * dh];
-        let wn = rmsnorm(seg, k_norm_w, dh, eps);
-        seg.copy_from_slice(&wn);
+        let src = &k_i[kvh * dh..(kvh + 1) * dh];
+        rmsnorm_into(src, k_norm_w, &mut k_row[kvh * dh..(kvh + 1) * dh], dh, eps);
     }
     match rope_tab {
         Some(t) => {
             rope_partial_interleaved_tab(q_r, heads, dh, n_rot, t);
-            rope_partial_interleaved_tab(&mut k, kv_heads, dh, n_rot, t);
+            rope_partial_interleaved_tab(&mut k_row[..kv_dim], kv_heads, dh, n_rot, t);
         }
         None => {
             rope_partial_interleaved(q_r, heads, dh, n_rot, pos, theta);
-            rope_partial_interleaved(&mut k, kv_heads, dh, n_rot, pos, theta);
+            rope_partial_interleaved(&mut k_row[..kv_dim], kv_heads, dh, n_rot, pos, theta);
         }
     }
-    k_row[..kv_dim].copy_from_slice(&k);
 }
 
 /// s240 (P44): [`pf_prepare_qk_row`] に **v の行コピーだけ**を足したもの。
@@ -454,7 +479,8 @@ fn pf_prepare_qk_row(
 /// そのまま写すだけ) ので、残差常駐経路では D2H の宛先をキャッシュの行そのものに
 /// してこのコピーを丸ごと消せる ([`Qwen35::pf_prepare_into`] の `v_rows` 引数)。
 /// ホスト経路 (qkv をホストで投影する経路) と `p12_prepare_bench` は従来どおり
-/// この関数を通る = 演算列・確保の回数は s171 までと同一。
+/// この関数を通る。q/k 部分の演算列・確保の回数は [`pf_prepare_qk_row`] と同一
+/// (s248/P48 以降は中間 `Vec` を 1 本も作らない)。
 #[allow(clippy::too_many_arguments)]
 fn pf_prepare_row(
     qg_i: &[f32],      // [heads*2*dh] q 投影 + ゲート
@@ -3852,6 +3878,472 @@ mod tests {
             best[2] * 16.0 / 1e3,
             best[3] * 16.0 / 1e3,
             (best[0] + best[1] + best[2] + best[3]) * 16.0 / 1e3
+        );
+    }
+
+    /// s248 (P48): prepare の**旧実装** (`pf_prepare_qk_row` の s246 時点の本文) を
+    /// テスト専用の参照実装として残したもの。新実装 (`rmsnorm_into` で宛先へ直接
+    /// 書く) が**ビット一致**することを固定するために使う。演算列は s171 以降と同一。
+    #[allow(clippy::too_many_arguments)]
+    fn p48_prepare_qk_row_legacy(
+        qg_i: &[f32],
+        k_i: &[f32],
+        q_r: &mut [f32],
+        k_row: &mut [f32],
+        q_norm_w: &[f32],
+        k_norm_w: &[f32],
+        heads: usize,
+        kv_heads: usize,
+        dh: usize,
+        n_rot: usize,
+        eps: f32,
+        theta: f32,
+        rope_tab: Option<&[f32]>,
+        pos: usize,
+    ) {
+        let kv_dim = kv_heads * dh;
+        let mut k = k_i.to_vec();
+        for hh in 0..heads {
+            let src = &qg_i[hh * 2 * dh..hh * 2 * dh + dh];
+            let wq = rmsnorm(src, q_norm_w, dh, eps);
+            q_r[hh * dh..(hh + 1) * dh].copy_from_slice(&wq);
+        }
+        for kvh in 0..kv_heads {
+            let seg = &mut k[kvh * dh..(kvh + 1) * dh];
+            let wn = rmsnorm(seg, k_norm_w, dh, eps);
+            seg.copy_from_slice(&wn);
+        }
+        match rope_tab {
+            Some(t) => {
+                rope_partial_interleaved_tab(q_r, heads, dh, n_rot, t);
+                rope_partial_interleaved_tab(&mut k, kv_heads, dh, n_rot, t);
+            }
+            None => {
+                rope_partial_interleaved(q_r, heads, dh, n_rot, pos, theta);
+                rope_partial_interleaved(&mut k, kv_heads, dh, n_rot, pos, theta);
+            }
+        }
+        k_row[..kv_dim].copy_from_slice(&k);
+    }
+
+    /// s248 (P48): prepare の QK-Norm を「中間 `Vec` を経由せず宛先へ直接書く」形に
+    /// 変えたので、**旧実装を参照実装として**同じ入力に通し、q と KV 行がビット
+    /// 一致することを固定する (モデル実シェイプ・rope 表あり/なしの両方・pos0 > 0)。
+    #[test]
+    fn p48_prepare_norm_into_bit_exact_vs_legacy() {
+        // prof のグローバルカウンタ窓 (`time_n_ev`) を触るので排他を取る。
+        let _g = crate::prof::counters_guard();
+        let dir = build_dir("p48n", true, NK, NV);
+        let m = load_int8(&dir);
+        let li = m
+            .layers
+            .iter()
+            .position(|l| matches!(l.attn, AttnKind::Full(_)))
+            .expect("full 層が無い");
+        let fl = match &m.layers[li].attn {
+            AttnKind::Full(f) => f,
+            _ => unreachable!(),
+        };
+        let (heads, dh, kv_heads) = (m.heads, m.dh, m.kv_heads);
+        let kv_dim = kv_heads * dh;
+        let (n, pos0) = (5usize, 7usize);
+        let mut seed = 0x5eed_0048u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / 16_777_216.0 - 0.5
+        };
+        let qg: Vec<f32> = (0..n * heads * 2 * dh).map(|_| rnd()).collect();
+        let k_i: Vec<f32> = (0..n * kv_dim).map(|_| rnd()).collect();
+        let tab = rope_pi_tab_rows(pos0, n, m.n_rot, m.theta);
+        for use_tab in [false, true] {
+            let rope_tab: Option<&[f32]> = if use_tab { Some(&tab) } else { None };
+            // 新実装 (残差常駐経路と同じ引数: v は触らない)。
+            let mut q_new = vec![0.0f32; n * heads * dh];
+            let mut k_new = vec![0.0f32; n * kv_dim];
+            m.pf_prepare_into(
+                fl,
+                &mut q_new,
+                &qg,
+                &k_i,
+                None,
+                &mut k_new,
+                None,
+                pos0,
+                n,
+                rope_tab,
+            );
+            // 旧実装 (参照)。
+            let mut q_ref = vec![0.0f32; n * heads * dh];
+            let mut k_ref = vec![0.0f32; n * kv_dim];
+            for i in 0..n {
+                p48_prepare_qk_row_legacy(
+                    &qg[i * heads * 2 * dh..(i + 1) * heads * 2 * dh],
+                    &k_i[i * kv_dim..(i + 1) * kv_dim],
+                    &mut q_ref[i * heads * dh..(i + 1) * heads * dh],
+                    &mut k_ref[i * kv_dim..(i + 1) * kv_dim],
+                    &fl.q_norm_w,
+                    &fl.k_norm_w,
+                    heads,
+                    kv_heads,
+                    dh,
+                    m.n_rot,
+                    m.eps,
+                    m.theta,
+                    rope_tab.map(|t| &t[i * m.n_rot..(i + 1) * m.n_rot]),
+                    pos0 + i,
+                );
+            }
+            assert_eq!(
+                bits(&q_new),
+                bits(&q_ref),
+                "q が旧実装と不一致 (rope_tab={use_tab})"
+            );
+            assert_eq!(
+                bits(&k_new),
+                bits(&k_ref),
+                "k が旧実装と不一致 (rope_tab={use_tab})"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// s248 (P48): prepare を**ステップ別に割る**実測 (`--ignored`・CPU のみ)。
+    /// `cargo test -p denno-engine --lib --release p48_prepare_split_bench -- --ignored --nocapture`
+    ///
+    /// 27B の実シェイプ (heads=24 / kv_heads=4 / dh=256 / n_rot=64)・n=14,043 で、
+    /// 1 層分の prepare を次の 7 つに割って best-of-3 を出す:
+    ///   A 旧 prepare 全体 / B 新 prepare 全体
+    ///   C q の norm だけ (旧: `rmsnorm` の `Vec` 経由) / D q の norm だけ (新: 直接)
+    ///   E q の rope だけ (表引き) / F k の norm+rope+行書き込み (旧) / G 同 (新)
+    /// 数値はこのコンテナの CPU と rayon スレッド数のもので、GPU ホストの値ではない。
+    /// s248 (P48): ベンチ専用の非 temporal store 版 (`_mm256_stream_ps`)。
+    /// 演算列は [`rmsnorm_into`] と同一 ((src*inv)*w を左から順) で、**store 命令だけ**が
+    /// 違う — 宛先の RFO read が消える。`dst` は 32 バイト整列・長さ 8 の倍数が前提。
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    unsafe fn nt_norm(src: &[f32], w: &[f32], dst: &mut [f32], eps: f32) {
+        use std::arch::x86_64::*;
+        let cols = dst.len();
+        let ss = src.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+        let inv = _mm256_set1_ps(1.0 / (ss + eps).sqrt());
+        let mut i = 0usize;
+        unsafe {
+            while i + 8 <= cols {
+                let s = _mm256_loadu_ps(src.as_ptr().add(i));
+                let wv = _mm256_loadu_ps(w.as_ptr().add(i));
+                let v = _mm256_mul_ps(_mm256_mul_ps(s, inv), wv);
+                _mm256_stream_ps(dst.as_mut_ptr().add(i), v);
+                i += 8;
+            }
+            while i < cols {
+                dst[i] = src[i] * (1.0 / (ss + eps).sqrt()) * w[i];
+                i += 1;
+            }
+            _mm_sfence();
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    unsafe fn nt_copy(src: &[f32], dst: &mut [f32]) {
+        use std::arch::x86_64::*;
+        let cols = dst.len();
+        let mut i = 0usize;
+        unsafe {
+            while i + 8 <= cols {
+                let s = _mm256_loadu_ps(src.as_ptr().add(i));
+                _mm256_stream_ps(dst.as_mut_ptr().add(i), s);
+                i += 8;
+            }
+            while i < cols {
+                dst[i] = src[i];
+                i += 1;
+            }
+            _mm_sfence();
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn p48_prepare_split_bench() {
+        let (heads, kv_heads, dh, n_rot) = (24usize, 4usize, 256usize, 64usize);
+        let (eps, theta) = (1e-6f32, 5_000_000.0f32);
+        let kv_dim = kv_heads * dh;
+        let n = 14_043usize;
+        let q_norm_w: Vec<f32> = (0..dh).map(|i| 0.5 + (i as f32 * 0.011).sin() * 0.25).collect();
+        let k_norm_w: Vec<f32> = (0..dh).map(|i| 0.75 + (i as f32 * 0.007).cos() * 0.2).collect();
+        let qg: Vec<f32> = (0..n * heads * 2 * dh)
+            .map(|i| ((i as f32) * 0.000_37).sin() * 2.0)
+            .collect();
+        let k_i: Vec<f32> = (0..n * kv_dim).map(|i| ((i as f32) * 0.000_71).cos()).collect();
+        let mut k_rows = vec![0.0f32; n * kv_dim];
+        // q の出力先は**全スロット共通**で 1 本 (比較を揃える)。NT store の宛先には
+        // 32 バイト整列が要る (行長 6144 float = 24 KiB は 32 の倍数) ので、
+        // 余分に確保して 32 バイト境界までずらしたスライスを使う。
+        // 実経路の宛先 (pinned ステージング / buf_q) もページ境界から始まるので、
+        // この整列は実経路より不利な条件ではない。
+        let mut q_buf = vec![0.0f32; n * heads * dh + 8];
+        let q_off = (32 - (q_buf.as_ptr() as usize % 32)) % 32 / 4;
+        let q_al = &mut q_buf[q_off..q_off + n * heads * dh];
+        let tab = rope_pi_tab_rows(0, n, n_rot, theta);
+        println!(
+            "P48 prepare split bench: n={n} heads={heads} kv_heads={kv_heads} dh={dh} \
+             n_rot={n_rot} threads={}",
+            rayon::current_num_threads()
+        );
+        let mut best = [f64::MAX; 12];
+        let names = [
+            "A old prepare",
+            "B new prepare",
+            "C q norm (Vec)",
+            "D q norm (direct)",
+            "E q rope",
+            "F k old",
+            "G k new",
+            "H copy floor",
+            "I ss read only",
+            "J norm 4-wide",
+            "K norm NT store",
+            "L copy NT floor",
+        ];
+        for round in 0..4 {
+            let mut ms = [0.0f64; 12];
+            // 注: A/B の全体比較は「同じ round で**先に走った方**が ~0.5 ms 有利」という
+            // 順序効果に埋もれる (A と B の順序を入れ替えると差の符号が反転するのを
+            // 確認済み) ので、分解能は ±1 ms。変更の効果は C vs D (同じ round で
+            // 隣り合う 2 ステップ) の差で読む。
+            // A) 旧 prepare 全体
+            let t = std::time::Instant::now();
+            q_al.par_chunks_exact_mut(heads * dh)
+                .zip(qg.par_chunks_exact(heads * 2 * dh))
+                .zip(k_i.par_chunks_exact(kv_dim))
+                .zip(k_rows.par_chunks_exact_mut(kv_dim))
+                .enumerate()
+                .for_each(|(i, (((q_r, qg_i), ki), k_row))| {
+                    p48_prepare_qk_row_legacy(
+                        qg_i,
+                        ki,
+                        q_r,
+                        k_row,
+                        &q_norm_w,
+                        &k_norm_w,
+                        heads,
+                        kv_heads,
+                        dh,
+                        n_rot,
+                        eps,
+                        theta,
+                        Some(&tab[i * n_rot..(i + 1) * n_rot]),
+                        i,
+                    );
+                });
+            ms[0] = t.elapsed().as_secs_f64() * 1e3;
+            // B) 新 prepare 全体
+            let t = std::time::Instant::now();
+            q_al.par_chunks_exact_mut(heads * dh)
+                .zip(qg.par_chunks_exact(heads * 2 * dh))
+                .zip(k_i.par_chunks_exact(kv_dim))
+                .zip(k_rows.par_chunks_exact_mut(kv_dim))
+                .enumerate()
+                .for_each(|(i, (((q_r, qg_i), ki), k_row))| {
+                    pf_prepare_qk_row(
+                        qg_i,
+                        ki,
+                        q_r,
+                        k_row,
+                        &q_norm_w,
+                        &k_norm_w,
+                        heads,
+                        kv_heads,
+                        dh,
+                        n_rot,
+                        eps,
+                        theta,
+                        Some(&tab[i * n_rot..(i + 1) * n_rot]),
+                        i,
+                    );
+                });
+            ms[1] = t.elapsed().as_secs_f64() * 1e3;
+            // C) q の norm だけ (旧: 中間 Vec + copy)
+            let t = std::time::Instant::now();
+            q_al.par_chunks_exact_mut(heads * dh)
+                .zip(qg.par_chunks_exact(heads * 2 * dh))
+                .for_each(|(q_r, qg_i)| {
+                    for hh in 0..heads {
+                        let src = &qg_i[hh * 2 * dh..hh * 2 * dh + dh];
+                        let wq = rmsnorm(src, &q_norm_w, dh, eps);
+                        q_r[hh * dh..(hh + 1) * dh].copy_from_slice(&wq);
+                    }
+                });
+            ms[2] = t.elapsed().as_secs_f64() * 1e3;
+            // D) q の norm だけ (新: 宛先へ直接)
+            let t = std::time::Instant::now();
+            q_al.par_chunks_exact_mut(heads * dh)
+                .zip(qg.par_chunks_exact(heads * 2 * dh))
+                .for_each(|(q_r, qg_i)| {
+                    for hh in 0..heads {
+                        let src = &qg_i[hh * 2 * dh..hh * 2 * dh + dh];
+                        rmsnorm_into(src, &q_norm_w, &mut q_r[hh * dh..(hh + 1) * dh], dh, eps);
+                    }
+                });
+            ms[3] = t.elapsed().as_secs_f64() * 1e3;
+            // E) q の rope だけ (表引き)
+            let t = std::time::Instant::now();
+            q_al.par_chunks_exact_mut(heads * dh)
+                .enumerate()
+                .for_each(|(i, q_r)| {
+                    rope_partial_interleaved_tab(q_r, heads, dh, n_rot, &tab[i * n_rot..(i + 1) * n_rot]);
+                });
+            ms[4] = t.elapsed().as_secs_f64() * 1e3;
+            // F) k の norm + rope + 行書き込み (旧: to_vec → head ごと Vec → copy)
+            let t = std::time::Instant::now();
+            k_i.par_chunks_exact(kv_dim)
+                .zip(k_rows.par_chunks_exact_mut(kv_dim))
+                .enumerate()
+                .for_each(|(i, (ki, k_row))| {
+                    let mut k = ki.to_vec();
+                    for kvh in 0..kv_heads {
+                        let seg = &mut k[kvh * dh..(kvh + 1) * dh];
+                        let wn = rmsnorm(seg, &k_norm_w, dh, eps);
+                        seg.copy_from_slice(&wn);
+                    }
+                    rope_partial_interleaved_tab(&mut k, kv_heads, dh, n_rot, &tab[i * n_rot..(i + 1) * n_rot]);
+                    k_row[..kv_dim].copy_from_slice(&k);
+                });
+            ms[5] = t.elapsed().as_secs_f64() * 1e3;
+            // G) k の norm + rope (新: k_row へ直接)
+            let t = std::time::Instant::now();
+            k_i.par_chunks_exact(kv_dim)
+                .zip(k_rows.par_chunks_exact_mut(kv_dim))
+                .enumerate()
+                .for_each(|(i, (ki, k_row))| {
+                    for kvh in 0..kv_heads {
+                        let src = &ki[kvh * dh..(kvh + 1) * dh];
+                        rmsnorm_into(src, &k_norm_w, &mut k_row[kvh * dh..(kvh + 1) * dh], dh, eps);
+                    }
+                    rope_partial_interleaved_tab(&mut k_row[..kv_dim], kv_heads, dh, n_rot, &tab[i * n_rot..(i + 1) * n_rot]);
+                });
+            ms[6] = t.elapsed().as_secs_f64() * 1e3;
+            // H) 帯域の下限: q の norm と同じバイト数 (qg の q 半分 read → q_r write) を
+            //    算術なしでコピーする。D が H に近ければ norm は**帯域律速**。
+            let t = std::time::Instant::now();
+            q_al.par_chunks_exact_mut(heads * dh)
+                .zip(qg.par_chunks_exact(heads * 2 * dh))
+                .for_each(|(q_r, qg_i)| {
+                    for hh in 0..heads {
+                        let src = &qg_i[hh * 2 * dh..hh * 2 * dh + dh];
+                        q_r[hh * dh..(hh + 1) * dh].copy_from_slice(src);
+                    }
+                });
+            ms[7] = t.elapsed().as_secs_f64() * 1e3;
+            // I) 2 乗和だけ (read only・write なし)。D − I が書き込み側のコスト。
+            let t = std::time::Instant::now();
+            let _ss: f64 = qg
+                .par_chunks_exact(heads * 2 * dh)
+                .map(|qg_i| {
+                    let mut acc = 0.0f32;
+                    for hh in 0..heads {
+                        let src = &qg_i[hh * 2 * dh..hh * 2 * dh + dh];
+                        acc += src.iter().map(|v| v * v).sum::<f32>();
+                    }
+                    acc as f64
+                })
+                .sum();
+            ms[8] = t.elapsed().as_secs_f64() * 1e3;
+            // J) 2 乗和を 4 head まとめて回す (各 head の累積順は不変 = ビット一致のまま
+            //    依存鎖を 4 本並べる)。D との差が「依存鎖の待ち」の取り分。
+            let t = std::time::Instant::now();
+            q_al.par_chunks_exact_mut(heads * dh)
+                .zip(qg.par_chunks_exact(heads * 2 * dh))
+                .for_each(|(q_r, qg_i)| {
+                    let mut hh = 0;
+                    while hh + 4 <= heads {
+                        let (s0, s1, s2, s3) = (
+                            &qg_i[(hh) * 2 * dh..(hh) * 2 * dh + dh],
+                            &qg_i[(hh + 1) * 2 * dh..(hh + 1) * 2 * dh + dh],
+                            &qg_i[(hh + 2) * 2 * dh..(hh + 2) * 2 * dh + dh],
+                            &qg_i[(hh + 3) * 2 * dh..(hh + 3) * 2 * dh + dh],
+                        );
+                        let (mut a0, mut a1, mut a2, mut a3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                        for i in 0..dh {
+                            a0 += s0[i] * s0[i];
+                            a1 += s1[i] * s1[i];
+                            a2 += s2[i] * s2[i];
+                            a3 += s3[i] * s3[i];
+                        }
+                        for (k, (s, a)) in [(s0, a0), (s1, a1), (s2, a2), (s3, a3)]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let inv = 1.0 / (a / dh as f32 + eps).sqrt();
+                            let dst = &mut q_r[(hh + k) * dh..(hh + k + 1) * dh];
+                            for i in 0..dh {
+                                dst[i] = s[i] * inv * q_norm_w[i];
+                            }
+                        }
+                        hh += 4;
+                    }
+                    while hh < heads {
+                        let src = &qg_i[hh * 2 * dh..hh * 2 * dh + dh];
+                        rmsnorm_into(src, &q_norm_w, &mut q_r[hh * dh..(hh + 1) * dh], dh, eps);
+                        hh += 1;
+                    }
+                });
+            ms[9] = t.elapsed().as_secs_f64() * 1e3;
+            // K) q の norm を**非 temporal store** で書く (宛先の RFO read を消す)。
+            //    D との差が「宛先 write の RFO」の取り分。
+            let t = std::time::Instant::now();
+            q_al.par_chunks_exact_mut(heads * dh)
+                .zip(qg.par_chunks_exact(heads * 2 * dh))
+                .for_each(|(q_r, qg_i)| {
+                    for hh in 0..heads {
+                        let src = &qg_i[hh * 2 * dh..hh * 2 * dh + dh];
+                        let dst = &mut q_r[hh * dh..(hh + 1) * dh];
+                        debug_assert_eq!((dst.as_ptr() as usize) % 32, 0);
+                        #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+                        unsafe {
+                            nt_norm(src, &q_norm_w, dst, eps)
+                        };
+                        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx")))]
+                        rmsnorm_into(src, &q_norm_w, dst, dh, eps);
+                    }
+                });
+            ms[10] = t.elapsed().as_secs_f64() * 1e3;
+            // L) 帯域の下限 (非 temporal): 同じバイト数を NT store でコピー。
+            let t = std::time::Instant::now();
+            q_al.par_chunks_exact_mut(heads * dh)
+                .zip(qg.par_chunks_exact(heads * 2 * dh))
+                .for_each(|(q_r, qg_i)| {
+                    for hh in 0..heads {
+                        let src = &qg_i[hh * 2 * dh..hh * 2 * dh + dh];
+                        let dst = &mut q_r[hh * dh..(hh + 1) * dh];
+                        #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+                        unsafe {
+                            nt_copy(src, dst)
+                        };
+                        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx")))]
+                        dst.copy_from_slice(src);
+                    }
+                });
+            ms[11] = t.elapsed().as_secs_f64() * 1e3;
+            if round > 0 {
+                for (slot, v) in best.iter_mut().zip(ms) {
+                    *slot = slot.min(v);
+                }
+            }
+            println!(
+                "  round {round}: A {:.1} / B {:.1} / C {:.1} / D {:.1} / E {:.1} / \
+                 F {:.1} / G {:.1} / H {:.1} / I {:.1} / J {:.1} / K {:.1} / L {:.1} ms",
+                ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], ms[8], ms[9], ms[10],
+                ms[11]
+            );
+        }
+        for (name, v) in names.iter().zip(best) {
+            println!("  best/layer {name:16} {v:7.2} ms  ({:.0} ns/row)", v * 1e6 / n as f64);
+        }
+        println!(
+            "  x16 layers: old prepare {:.2} s / new prepare {:.2} s (差 {:.2} s/request)",
+            best[0] * 16.0 / 1e3,
+            best[1] * 16.0 / 1e3,
+            (best[0] - best[1]) * 16.0 / 1e3
         );
     }
 
