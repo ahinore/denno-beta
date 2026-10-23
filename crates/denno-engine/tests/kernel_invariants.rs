@@ -5317,11 +5317,12 @@ fn prefill_chain_launches_match_per_op_kernel_and_args() {
             g.contains(&format!("n.div_ceil({gn})")),
             "{name} の grid.y が Q4_GN={gn} 列ブロックでない: {g}"
         );
-        // block は (16,16) 固定 — カーネルは tid = ty*16+tx / tid>>7 で
-        // 列を割り当てるので、16x16 以外だと B タイルの列が埋まらない。
+        // block は (16,8) 固定 — カーネルは tid = ty*16+tx (0..127) を B の
+        // 列番号としてそのまま使うので、128 thread 以外だと B タイルの列が
+        // 埋まらない / あふれる。
         assert!(
-            b.contains("ctx.f_gemm_q4, grid, (16, 16, 1)"),
-            "{name} の block が (16,16,1) でない"
+            b.contains("ctx.f_gemm_q4, grid, (16, 8, 1)"),
+            "{name} の block が (16,8,1) でない"
         );
     }
     assert_eq!(
@@ -5330,10 +5331,11 @@ fn prefill_chain_launches_match_per_op_kernel_and_args() {
         "per-op と chain の grid 式が違う"
     );
     let kb = kernel_body(INT8, "extern \"C\" __global__ void dno_gemm_q4_0(");
-    // カーネル側が 16x16 を前提にしていること (Rust の block と対)。
+    // カーネル側が 8x8 / 128 thread を前提にしていること (Rust の block と対)。
     assert!(
-        kb.contains("ty * 16 + tx") && kb.contains("tid >> 7"),
-        "dno_gemm_q4_0 の thread 割り当てが 16x16 前提でなくなった (Rust の block と要同期)"
+        kb.contains("ty * 16 + tx") && kb.contains("const int col = tid;")
+            && kb.contains("acc[8][8]"),
+        "dno_gemm_q4_0 の thread 割り当てが 8x8 / 128 thread 前提でなくなった (Rust の block と要同期)"
     );
     // grid の除数がカーネルの blockIdx 倍率と一致すること (片側だけ変えると
     // 出力の行/列が二重に覆われるか、覆われない行が出る)。
