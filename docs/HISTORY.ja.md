@@ -3697,3 +3697,37 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
   `--test kernel_invariants` = **18 passed / 0 failed** (既存 17 + 新規 1)。
 - **測っていないこと**: GPU 実行・アンカー・ms/token (GPU 非搭載)。`.cu` の新規違反は検出なし
   (`KNOWN_BAD_4B_CASTS` は空のまま)。作業レポートは未 commit (`REPORT_P39.md`)。
+
+### s180: Task P41 - full_core 相の内訳をホスト側イベントで切り分け、full_qk の pinned 化を設計した (2026-10-23) 完了
+
+> `sl_lay_full_core` の位相バケットは「区間内に発行したカーネル + ホストの詰まり」を 1 本に
+> まとめているので、attention 本体 (device) とホスト prepare / ゲート (host) のどちらが重いのか
+> 分からない。`DENNO_FC_KPROF=1` のときだけ、**既存の launch / sync の位置**にイベントを打って
+> full 層 1 枚を prep / attn / d2h / tail の 4 区間に割り、prefill 終了時に 1 行で出す
+> (既定 OFF・未設定は分岐 1 回・イベントも作らない)。full_qk の D2H を pinned にする話は
+> **設計のみ** (`docs/FULL_QK_D2H_PINNED.md`)。
+
+- **区間 (イベントのみ・同期も転送も足さない)**: prep = 位相 FULL_CORE → attn カーネルの発行
+  直前 (ホスト prepare の QK-Norm/RoPE/KV 書き込み + KV ミラーの H2D + q の pinned H2D) /
+  attn = 発行直前 → 発行直後 (`dno_attention_prefill` の実行。QK スコア + softmax + PV が
+  1 launch に融合しているので **qk と av には割れない** — 指示書の「物理的に取れなければ
+  2〜3 区間へ落としてよい」に従い、qk/av の代わりに attn/d2h を立てた) / d2h = 発行直後 →
+  `chain_pf_att_inplace` の `cuMemcpyDtoHAsync` 完了 / tail = D2H 完了 → 位相 FULL_OPROJ
+  (sigmoid ゲート + att の H2D + o_proj の prologue)。
+- **実装 (`cuda.rs` のみ・+276/-1)**: `fc_kprof_*` を 1 節追加 (別イベントプール・別 env)。
+  呼び出しは `pf_phase` / `pf_timing_begin` / `pf_timing_read` から 1 行ずつと、
+  `chain_attention_prefill` の launch 前後・`chain_pf_att_inplace` の D2H 直後。
+  **launch の順序・引数・同期の位置は不変**、`DENNO_PROFILE` / `DENNO_PF_DBG` の出力も不変
+  (別プール・別行)。5 点そろわない呼び出し (CPU attend へ落ちた層など) は区間として読まない。
+- **出力**: `[FC_KPROF] prep=<ms> attn=<ms> d2h=<ms> tail=<ms> calls=<n> total=<ms> (<ms>/token)`。
+- **設計メモの結論**: このツリーの HEAD は 7e9ea37 (P17b の 1 発連続 pinned D2H) で、実機で
+  9.78 → 22.14 s (+772 ms/層) を測って revert された形そのもの。したがって実装は
+  「3 発へ戻す + 宛先を pinned + プールは層ループの外で 1 回だけ確保」で、コピー回数・発行順・
+  GEMM は変えない。削減量は s68 の実測単価 (pageable 13.9 / pinned 14.3 GB/s) なら
+  **−26 ms/request**、PF_DBG のバケットから逆算 (6.5 GB/s) なら **−1.08 s/request** で
+  **両立しない** → 実装後に 2 点計測で確定させる (未検証)。
+- **テスト**: `cargo test --features cuda --lib` = **321 passed / 0 failed / 37 ignored**
+  (基準と同一)、`--test kernel_invariants` = **18 passed / 0 failed**、非 cuda lib =
+  **280 passed / 0 failed / 2 ignored**。`--features cuda` の統合テストも全部緑。
+- **測っていないこと**: GPU 実行・アンカー・ms/token・`[FC_KPROF]` の実出力 (GPU 非搭載)。
+  `.cu` / `.ptx` は無変更。作業レポートは未 commit (`REPORT_P41.md`)。

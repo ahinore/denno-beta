@@ -3790,3 +3790,43 @@ External implementations referenced in P19 and their licensing status (the same 
 - **Not measured**: GPU execution, anchors, ms/token (no GPU in this container). No `.cu`
   violation was found (`KNOWN_BAD_4B_CASTS` stays empty). The work report is uncommitted
   (`REPORT_P39.md`).
+
+### s180: Task P41 - full_core split by host-side events, and the pinned full_qk D2H design (2026-10-23) done
+
+> The `sl_lay_full_core` bucket lumps "the kernels issued inside the interval + the host lag"
+> into one number, so it cannot say whether the attention body (device) or the host prepare /
+> gate (host) dominates. With `DENNO_FC_KPROF=1` only, events are recorded **at the existing
+> launch / sync positions** to split one full layer into prep / attn / d2h / tail and print a
+> single line at the end of the prefill (default OFF; unset is one branch and creates no
+> events). Making the full_qk D2H pinned is **design only** (`docs/FULL_QK_D2H_PINNED.md`).
+
+- **Intervals (events only, no sync and no transfer added)**: prep = phase FULL_CORE to just
+  before the attn kernel launch (host prepare: QK-Norm/RoPE/KV row writes, the KV mirror H2D,
+  the q pinned H2D) / attn = launch to just after the launch (`dno_attention_prefill` itself;
+  QK scores + softmax + PV are fused into one launch, so **qk and av cannot be separated** -
+  following the instruction's "fall back to 2-3 intervals when the split is not physical" we
+  use attn/d2h instead) / d2h = after the launch to completion of the `cuMemcpyDtoHAsync` in
+  `chain_pf_att_inplace` / tail = D2H done to phase FULL_OPROJ (sigmoid gate + att H2D +
+  o_proj prologue).
+- **Implementation (`cuda.rs` only, +276/-1)**: a `fc_kprof_*` section with its own event pool
+  and its own env. One call each from `pf_phase` / `pf_timing_begin` / `pf_timing_read`, plus
+  around the launch in `chain_attention_prefill` and right after the D2H in
+  `chain_pf_att_inplace`. **Launch order, arguments and sync placement are unchanged**, and
+  `DENNO_PROFILE` / `DENNO_PF_DBG` output is unchanged (separate pool, separate line). Calls
+  without all five marks (e.g. a layer that fell back to CPU attend) are not read as intervals.
+- **Output**: `[FC_KPROF] prep=<ms> attn=<ms> d2h=<ms> tail=<ms> calls=<n> total=<ms> (<ms>/token)`.
+- **Design note conclusion**: HEAD of this tree is 7e9ea37 (P17b's single contiguous pinned
+  D2H) - the exact form that measured 9.78 -> 22.14 s (+772 ms/layer) on hardware and was
+  reverted. So the implementation is "back to 3 copies + pinned destinations + one pool
+  allocated outside the layer loop", with the copy count, the issue order and the GEMMs
+  unchanged. The saving is **-26 ms/request** under s68's measured unit prices (pageable 13.9
+  / pinned 14.3 GB/s) but **-1.08 s/request** when reconstructed from the PF_DBG bucket
+  (6.5 GB/s); the two **do not agree**, so it is settled by a 2-point measurement after the
+  implementation (unverified).
+- **Tests**: `cargo test --features cuda --lib` = **321 passed / 0 failed / 37 ignored**
+  (identical to the baseline), `--test kernel_invariants` = **18 passed / 0 failed**, non-cuda
+  lib = **280 passed / 0 failed / 2 ignored**; the `--features cuda` integration tests are all
+  green.
+- **Not measured**: GPU execution, anchors, ms/token, and the `[FC_KPROF]` output itself (no
+  GPU in this container). `.cu` / `.ptx` untouched. The work report is uncommitted
+  (`REPORT_P41.md`).

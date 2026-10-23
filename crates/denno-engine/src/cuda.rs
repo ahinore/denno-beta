@@ -6272,6 +6272,9 @@ pub fn chain_attention_prefill(
                 "cuMemcpyHtoDAsync (attn_pf_q)",
             ))?;
         }
+        // s180 (P41): attention カーネルの発行直前 = full_core の区間 [prep] の
+        // 終端 (ホスト prepare + KV ミラー / q の H2D までが prep)。イベントのみ。
+        fc_kprof_mark(1);
         let mut qptr = s.attn_pf_q.as_ref().unwrap().ptr();
         let mut aptr = s.bufs[CH_ATT].as_ref().unwrap().ptr();
         let mut args: Vec<*mut c_void> = vec![
@@ -6298,7 +6301,11 @@ pub fn chain_attention_prefill(
                 (attn_pf_sh_f(dh) * 4) as u32,
                 &mut args,
             )
-        })
+        })?;
+        // s180 (P41): 発行直後 = full_core の区間 [attn] の終端 (カーネルの完了は
+        // 次の既存 D2H の sync まで待たない — イベントはストリーム順に乗るだけ)。
+        fc_kprof_mark(2);
+        Some(())
     })
 }
 
@@ -12019,6 +12026,8 @@ fn pf_record(t: &mut PfTiming, phase: u8) -> bool {
 
 /// prefill 入口: 位相計測を開く (層ループの直前で 1 回)。
 pub fn pf_timing_begin(tokens: usize, layers: usize) {
+    // s180 (P41): full_core の内訳計測 (別プール・別 env・既定 OFF)。
+    fc_kprof_begin(tokens, layers);
     if !pf_timing_on() {
         return;
     }
@@ -12049,6 +12058,9 @@ pub fn pf_timing_begin(tokens: usize, layers: usize) {
 /// 分岐 1 回で戻る — 数値経路・発行順には触れない。
 #[inline]
 pub fn pf_phase(ph: usize) {
+    // s180 (P41): full_core の内訳 (DENNO_FC_KPROF=1) の区間端もここで打つ
+    // — 位相境界がそのまま full_core の先頭 / o_proj の先頭だから。
+    fc_kprof_phase(ph);
     if !pf_timing_on() {
         return;
     }
@@ -12098,6 +12110,9 @@ pub fn pf_timing_abort() {
 /// prefill 末尾 (**既存の**同期 D2H の後): 区間を読み、表 C の `sl_lay_*` へ
 /// 1 位相 1 行で積み、`DENNO_PF_DBG=1` なら内訳を 1 回だけ stderr へ出す。
 pub fn pf_timing_read() {
+    // s180 (P41): full_core の内訳は DENNO_PF_DBG / DENNO_PROFILE と独立に出す
+    // (こちらは DENNO_FC_KPROF だけで動く)。既存の出力には触れない。
+    fc_kprof_read();
     if !pf_timing_on() {
         return;
     }
@@ -12191,6 +12206,263 @@ fn pf_dbg_print(t: &PfTiming, acc: &[f64; PF_PH_N]) {
         pct(tail),
         per_tok(tail)
     );
+}
+
+// ---------------------------------------------------------------------------
+// s180 (P41): full_core 相の内訳 (DENNO_FC_KPROF=1・既定 OFF)
+//
+// `sl_lay_full_core` の位相バケットは「区間内に発行したカーネル + ホストの詰まり」
+// をまとめて 1 本にしているので、attention カーネル本体 (device) とホスト側の
+// prepare / ゲート (host) のどちらが重いのかが分からない。ここでは**既存の
+// launch / sync の位置**にイベントを打つだけで、full 層 1 枚の full_core 区間を
+// 4 つに割って積算し、prefill の終了時に 1 行で出す:
+//
+//   [FC_KPROF] prep=<ms> attn=<ms> d2h=<ms> tail=<ms> calls=<n> total=<ms> (<ms>/token)
+//
+//   prep = 位相 FULL_CORE の境界 → attention カーネルの発行直前
+//          (ホスト prepare: QK-Norm + RoPE + KV 行書き込み、KV ミラーの H2D、
+//           q の pinned ステージング H2D)
+//   attn = カーネル発行直前 → 発行直後 (`dno_attention_prefill` の実行。QK スコア +
+//          softmax + PV が 1 発に融合しているので **qk と av には割れない**)
+//   d2h  = 発行直後 → att の D2H 完了 (`chain_pf_att_inplace` の `cuMemcpyDtoHAsync`)
+//   tail = D2H 完了 → 位相 FULL_OPROJ の境界 (sigmoid ゲート + att の H2D +
+//          o_proj の prologue)
+//
+// 打つのはイベントだけ: launch の順序・引数・同期の位置は 1 つも変えない。
+// `DENNO_FC_KPROF` 未設定なら各サイトは分岐 1 回で戻り、イベントも作らない
+// (プロファイラ build 不要)。既存の `DENNO_PROFILE` / `DENNO_PF_DBG` の出力は
+// この env を立てても変わらない (別プール・別行)。
+// ---------------------------------------------------------------------------
+
+/// 区間数 (prep / attn / d2h / tail)。
+const FC_IV_N: usize = 4;
+/// full 層 1 枚あたりの境界イベント数 (区間数 + 1)。
+const FC_MARK_N: usize = FC_IV_N + 1;
+/// 区間名 (表示順・REPORT_P41.md の表と同じ)。
+const FC_IV_NAMES: [&str; FC_IV_N] = ["prep", "attn", "d2h", "tail"];
+
+/// `DENNO_FC_KPROF=1` のときだけ full_core の内訳を取る (既定 OFF・分岐 1 回)。
+fn fc_kprof_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DENNO_FC_KPROF").ok().as_deref() == Some("1"))
+}
+
+/// 1 prefill 分の full_core 内訳の状態 (スレッドローカル・リクエストごとに使い回す)。
+struct FcKprof {
+    /// 計測中 (begin 済みで read 前)。
+    active: bool,
+    /// いま記録中の呼び出し (= full 層 1 枚) が先頭の境界から始まっている。
+    open: bool,
+    /// 記録済みの境界 (bit k = スロット k)。
+    have: u8,
+    /// 呼び出し番号 (先頭の境界で 1 増える)。
+    call: u32,
+    /// イベントのプール (grow-only。初回の prefill で層数ぶん作る)。
+    evs: Vec<CUevent>,
+    /// このリクエストで打ったイベント数。
+    used: usize,
+    /// イベント k の (呼び出し番号, スロット)。
+    meta: Vec<(u32, u8)>,
+    /// 5 点そろった呼び出しの数 (= 内訳を読めた層数)。
+    calls: usize,
+    /// トークン数 (ms/token の分母)。
+    tokens: usize,
+}
+
+impl Default for FcKprof {
+    fn default() -> Self {
+        Self {
+            active: false,
+            open: false,
+            have: 0,
+            call: 0,
+            evs: Vec::new(),
+            used: 0,
+            meta: Vec::new(),
+            calls: 0,
+            tokens: 0,
+        }
+    }
+}
+
+thread_local! {
+    static FC_KPROF: std::cell::RefCell<FcKprof> =
+        std::cell::RefCell::new(FcKprof::default());
+}
+
+/// イベントを `need` 個そろえる (grow-only・初回だけ作る)。
+fn fc_ensure_events(t: &mut FcKprof, need: usize) -> bool {
+    if t.evs.len() >= need {
+        return true;
+    }
+    let Some(create) = lib().ok().and_then(|l| l.event_create) else {
+        return false;
+    };
+    while t.evs.len() < need {
+        let mut ev: CUevent = std::ptr::null_mut();
+        // CU_EVENT_DEFAULT (0) = 計時有効。作れなければ計測を諦める (fail closed)。
+        if unsafe { create(&mut ev, 0) } != CUDA_SUCCESS || ev.is_null() {
+            return false;
+        }
+        t.evs.push(ev);
+    }
+    true
+}
+
+/// prefill 入口: full_core の内訳計測を開く (`pf_timing_begin` から 1 回)。
+fn fc_kprof_begin(tokens: usize, layers: usize) {
+    if !fc_kprof_on() {
+        return;
+    }
+    FC_KPROF.with(|c| {
+        let mut t = c.borrow_mut();
+        t.active = false;
+        t.open = false;
+        t.have = 0;
+        t.call = 0;
+        t.used = 0;
+        t.meta.clear();
+        t.calls = 0;
+        t.tokens = tokens;
+        // full 層は高々 layers 枚。イベントは grow-only のプールに 1 回だけ作る
+        // (2 回目以降の prefill はここで何もしない)。
+        let need = layers.saturating_mul(FC_MARK_N).max(FC_MARK_N);
+        if !fc_ensure_events(&mut t, need) {
+            return;
+        }
+        t.active = true;
+    });
+}
+
+/// 位相境界から区間の端を打つ (`pf_phase` から呼ぶ)。FULL_CORE = 先頭、
+/// FULL_OPROJ = 末尾 (o_proj の prologue までが tail に入る)。
+#[inline]
+fn fc_kprof_phase(ph: usize) {
+    if !fc_kprof_on() {
+        return;
+    }
+    if ph == PF_PH_FULL_CORE {
+        fc_kprof_mark(0);
+    } else if ph == PF_PH_FULL_OPROJ {
+        fc_kprof_mark(FC_MARK_N as u8 - 1);
+    }
+}
+
+/// 既定ストリームに境界イベントを 1 つ打つ (イベントのみ・同期も転送もしない)。
+///
+/// 先頭 (slot 0) を打っていない呼び出しの途中スロットは捨てる — ホスト経路や
+/// CPU attend に落ちた層は 5 点そろわないので、区間として読まない。
+fn fc_kprof_mark(slot: u8) {
+    if !fc_kprof_on() {
+        return;
+    }
+    FC_KPROF.with(|c| {
+        let mut t = c.borrow_mut();
+        if !t.active {
+            return;
+        }
+        if slot == 0 {
+            t.open = true;
+            t.have = 1;
+            t.call = t.call.wrapping_add(1);
+        } else if !t.open {
+            return;
+        } else {
+            t.have |= 1u8 << slot;
+        }
+        let Some(rec) = lib().ok().and_then(|l| l.event_record) else {
+            t.active = false;
+            return;
+        };
+        if t.used >= t.evs.len() {
+            let want = t.used.saturating_add(FC_MARK_N * 8);
+            if !fc_ensure_events(&mut t, want) {
+                t.active = false;
+                return;
+            }
+        }
+        let ev = t.evs[t.used];
+        if unsafe { rec(ev, std::ptr::null_mut()) } != CUDA_SUCCESS {
+            t.active = false;
+            return;
+        }
+        t.used += 1;
+        let call = t.call;
+        t.meta.push((call, slot));
+        if slot as usize == FC_MARK_N - 1 {
+            if t.have == (1u8 << FC_MARK_N) - 1 {
+                t.calls += 1;
+            }
+            t.open = false;
+        }
+    });
+}
+
+/// prefill 末尾 (**既存の**同期 D2H の後): 区間を読み、1 行だけ stderr へ出す。
+/// 積算はリクエストごと (次の `fc_kprof_begin` でリセット)。
+fn fc_kprof_read() {
+    if !fc_kprof_on() {
+        return;
+    }
+    FC_KPROF.with(|c| {
+        let mut t = c.borrow_mut();
+        if !t.active {
+            return;
+        }
+        t.active = false;
+        t.open = false;
+        let Some(elapsed) = lib().ok().and_then(|l| l.event_elapsed_time) else {
+            eprintln!("[FC_KPROF] unavailable (no cuEventElapsedTime)");
+            return;
+        };
+        let mut acc = [0.0f64; FC_IV_N];
+        let mut bad = false;
+        for w in 1..t.meta.len() {
+            let (c0, s0) = t.meta[w - 1];
+            let (c1, s1) = t.meta[w];
+            // 同じ呼び出しの隣り合う境界だけを 1 区間として読む (5 点そろわない
+            // 呼び出しは自動的に落ちる)。
+            if c0 != c1 || s1 != s0 + 1 {
+                continue;
+            }
+            let mut ms: f32 = 0.0;
+            if unsafe { elapsed(&mut ms, t.evs[w - 1], t.evs[w]) } != CUDA_SUCCESS
+                || !ms.is_finite()
+                || ms < 0.0
+            {
+                bad = true;
+                break;
+            }
+            acc[s0 as usize] += ms as f64 / 1e3;
+        }
+        if bad {
+            eprintln!(
+                "[FC_KPROF] unavailable (event elapsed failed; n={} calls={})",
+                t.tokens, t.calls
+            );
+            return;
+        }
+        let total: f64 = acc.iter().sum();
+        if t.calls == 0 && total <= 0.0 {
+            eprintln!(
+                "[FC_KPROF] no complete full_core call (n={} marks={})",
+                t.tokens, t.used
+            );
+            return;
+        }
+        let tok = t.tokens.max(1) as f64;
+        let mut line = String::from("[FC_KPROF]");
+        for i in 0..FC_IV_N {
+            line.push_str(&format!(" {}={:.1}", FC_IV_NAMES[i], acc[i] * 1e3));
+        }
+        line.push_str(&format!(
+            " calls={} total={:.1} ({:.3} ms/token)",
+            t.calls,
+            total * 1e3,
+            total * 1e3 / tok
+        ));
+        eprintln!("{line}");
+    });
 }
 
 /// s167 (P6): GDN 層の prefill を、h2 の D2H と qkv/z GEMM の**オーバーラップ付き**
@@ -12711,6 +12983,9 @@ where
                 ))?;
             }
         }
+        // s180 (P41): att の D2H 発行点 = full_core の区間 [d2h] の終端
+        // (イベントはストリーム順。sync はこの直後の既存の 1 回だけ)。
+        fc_kprof_mark(3);
         ok(ctx.sync())?;
         // 2) pinned の上で変換 (数値は呼び出し側のクロージャ = 従来と同じ式)
         {
