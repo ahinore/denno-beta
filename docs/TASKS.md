@@ -178,6 +178,104 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   file:line map, traffic table and arithmetic: `docs/HISTORY.ja.md` / `docs/HISTORY.en.md`,
   s121 section.
 
+### P1-5: the phase-lever queue P24-P28 (2026-10-22/23) - four measurement closures, one implementation
+
+This queue asked, phase by phase, whether the host side of a `DENNO_PF_DBG` interval could be
+removed (P24 asked the same question of the decode launch inventory). P24-P27 were all closed
+with **zero code changes** (measurement only) and P28 is the only commit. Phase names and ms
+are the s170 table (n=14,043, 64 layers, wall ~62.9 s) as quoted in REPORT_P26.md /
+REPORT_P28.md; `[M]` = measured, `[R]` = arithmetic over measured shapes, `[A]` = assumption,
+the same labels REPORT_P27.md uses. **A reader must not re-open any of P24-P27 as a host-side
+lever: the measurement says the lever is not there.**
+
+#### P24 - decode launch inventory (s177, REPORT_P24.md)
+- Status: **CLOSED as measurement-only - no code change, no commit.**
+- Measured: **610 kernel launches/token** = 48 GDN layers x 9 + 16 full layers x 11 + `lm_head`
+  + final rmsnorm; per token 2 H2D (20,736 B), 33 D2H (1,124,352 B), 16 D2D, 0 memset,
+  1 host memcpy. Host fixed cost on the critical path **0.28 ms/token = 1.6 %** of 17.3 ms
+  (greedy argmax 0.149 ms, measured on this container's CPU).
+- Ruled out (**host-side lever absent**): the kernel times sum to ~17.9 ms/token against a
+  **17.28-17.32 ms/token** wall, so the GPU is busy for the whole step and there is no gap to
+  fill. No adjacent same-shape GEMV pair is left (qkv|z, q|k|v, gate_up and beta|alpha are
+  already 1 launch each), the only sync is the logits D2H (removing it changes the sampled
+  sequence), and both H2D are position-dependent. The remaining candidates (rmsnorm parallel
+  reduction, qknorm q/k fusion, pinned logits) need `.cu` or a new numeric contract.
+
+#### P25 - `sl_lay_ffn_down` (dev2 worktree, REPORT_P25.md)
+- Status: **CLOSED as measurement-only - no code change, no commit.**
+- Measured: the phase contains exactly one thing, the down `dno_gemm_q4_0` launch - 14
+  launches/layer (13 x 1,024 rows + 1 x 731, tile 1,024), 896 launches and 160.2 TFLOP per
+  request at n=14,043; H2D 0 B, D2H 0 B, `ctx.sync()` 0, alloc 0, quantize 0. The bucket is
+  **100 % GEMM**.
+- Ruled out (**device-only region**): the "host or copy >= 20 % of the phase" condition is
+  structurally 0, not small - there is no host work inside this phase to remove, and the
+  prologue (`weights_for_q4`, `chain_ensure_buf`) sits before the phase boundary (see P27).
+  What is left is device-side: down runs at **14.4 TFLOP/s** where gate|up is 31.9 and o_proj
+  30.8, so **5.9-6.1 s** of the 11,100 ms bucket is unexplained inside the kernel; wave
+  quantisation (640 blocks/launch) bounds that at 1.5x = ~3.5 s.
+- Consequence: the 11,100 ms is the s170 **host-bound** build, so the current value is a
+  measurement question (best estimate 4.6-6.7 s [R], see P27), not an implementation one.
+
+#### P26 - `sl_lay_full_qk` and `sl_lay_gdn_oproj` (s178, REPORT_P26.md)
+- Status: **CLOSED as measurement-only - no code change, no commit.**
+- Measured: `gdn_oproj` = **1** `dno_gemm_q4_0` launch/layer (m=14,043, k=6,144, n=5,120,
+  grid (220,40,1) = 8,800 blocks), H2D 0, D2H 0, sync 0, host copy 0 - the phase is the o_proj
+  GEMM itself. `full_qk` = 3 launches/layer + 3 **pageable** D2H (805.3 MB/layer, 12.88 GB per
+  request at 14,043) + 1 mandatory `ctx.sync()`; host fixed cost 3-6 us/layer = 0.05-0.1 ms per
+  request.
+- Ruled out (**device-only region** for `gdn_oproj`, **host-side lever absent** for `full_qk`):
+  gdn_oproj is device-complete with nothing to delete; full_qk's only remaining lever is the
+  transfer shape, and folding the 3 D2H into 1 is exactly P17b - measured **9.78 -> 22.14 s**
+  (+772 ms/layer) and reverted - so the 3 pageable copies stay.
+- Caveat recorded, not resolved: s170's phase % and P13's 11 TFLOP/s cannot both be true
+  (`gdn_oproj` at 2.2 % would require 45 TFLOP/s). It changes the priority order, not the
+  verdict.
+
+#### P27 - phase-accounting audit (dev2 worktree, REPORT_P27.md)
+- Status: **CLOSED as measurement-only - no code change, no commit.**
+- Measured: `pf_phase()` only records events on the default stream, so each bucket is
+  "kernels issued in the interval + GPU idle + host lag", **not kernel time**; the 11 buckets
+  do split the wall completely (s170: 9 printed rows sum to 61,999.6 ms = 98.33 %, tail
+  567.4 ms = 0.9 %) but that is not an attribution of the time.
+- Ruled out (**attribution shifted one phase** / **cold-run inflation**): the phase boundary
+  sits at the head of an issue group, so `weights_for_q4`, `chain_ensure_buf` and uploads fall
+  into the *previous* phase (FFN prologue -> `norm_post`, full qkv prologue -> `norm_in`,
+  o_proj prologue and att upload -> `full_core`). Warm runs make that us-level (< 10 ms
+  total); the cold run pays the 13.2 GB first-time weight H2D and inflates `sl_lay_norm_post`
+  by ~0.5-0.6 s [R], which is why `scripts/prefill_bench.py` discards the first request. No
+  accounting defect was found in the host code, hence no commit.
+- Consequence: the s170 table is not a table of the current build. At 3,161 tokens the known
+  floors leave `down <= 1.0-2.6 s`; at 12,850 only the joint bound `down + full_core =
+  14.2-17.0 s` survives. One command settles it: `DENNO_PF_DBG=1 python3
+  scripts/prefill_bench.py 65000 3`.
+
+#### P28 - `sl_lay_full_core`: unused `buf_q` / `buf_att` allocation moved to the use sites
+- Status: **IMPLEMENTED - commit `3c383a7`** (`crates/denno-engine/src/model/qwen35.rs`,
+  +24/-3). Only the *position* of two allocations changed.
+- What changed: `full_attn_host_side` called `fit_prefill_buf(buf_att)` and
+  `fit_prefill_buf(buf_q)` at the top of every request (2 x 345 MB at n=14,043), but the live
+  path - GPU attend = `AttnPlace::GpuDev` - never reads either buffer. The two fits moved to
+  the three places that do read them: before prepare writes `buf_q` (`!q_in_pin`), before the
+  zero fill inside `if !att_done`, and before `copy_from_slice` in `full_attn_attend_gpu`.
+  `fit_prefill_buf` itself, the zero-fill rule, the arithmetic, the transfer bytes, the issue
+  order, the kernel and grid/block/smem are unchanged; every reader writes all elements
+  immediately before use, so the output is bit-identical.
+- Measured (this container, CPU): one `fit_prefill_buf` of 345 MB costs 118.95 / 118.28 ms
+  (n=14,043), 126.19 / 121.21 ms (12,850), 30.45 / 30.46 ms (3,161) = **237.23 / 247.40 /
+  60.91 ms per request** for the pair. The host side of `full_core` itself is prepare
+  44.91 ms/layer + sigmoid gate 45.40 ms/layer = **90.32 ms/layer = 1.445 s/request** at
+  14,043, which is 13.5 % of the **10,695.3 ms** phase; the phase is device bound (attention
+  kernel ~60 %, transfers ~14 %).
+- **PREDICTED / NOT MEASURED**: -0.24 s/request at 14,043, -0.25 s at 12,850, -0.06 s at 3,161
+  (2-3 % of the `full_core` phase, ~0.6 % of the 38.79-40.35 s wall at 12,850), plus ~690 MB
+  less RSS at 14,043. **GPU-only caveat**: the live path is `GpuDev`, which this container
+  cannot execute (`chain_ctx()` returns None), so the cold A/B and the RSS check are still a
+  human step. If the cold A/B does not move, reverting is harmless because the values are
+  identical.
+- The only >= 0.3 s candidate left in `full_core` is an n-token sigmoid gate kernel (`.cu`);
+  the existing `dno_attn_gate_mul` is single-token (14,043 launches). The 45.40 ms/layer host
+  gate and the 690 MB/layer att round trip would go together. That is main-session `.cu` work.
+
 ## P2 — decode (separate axis)
 
 ### P2-1: decode 16.4 ms/token -> 12 ms
@@ -380,6 +478,12 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
 ### P4-3: 27B Q4_0 quality
 - Why: 27B loads and runs deterministically but output quality (greedy collapse) is
   unexplained. UD-IQ2_XXS remains impossible (IQ1_M unsupported).
+  -> corrected (2026-10-23): "IQ1_M unsupported" is stale. IQ1_M (type 29) is decoded —
+  enum `kquant.rs:40`, `from_id` `kquant.rs:72`, decode arm `kquant.rs:624` — implemented
+  in 2344f67 (s157, Task K1 commit 2), with golden-value tests in
+  `tests/dequant_ref.rs` (`iq1_m_matches_hand_computed_block`, `tests/dequant_ref.rs:303`).
+  So IQ1_M is no longer what blocks UD-IQ2_XXS. Whether that 6.8 GB file loads end to end
+  has not been re-verified here (this container holds only the 27B Q4_0 GGUF).
 - Action: compare against llama.cpp on the same GGUF at the same seed, per-layer, to find
   where the collapse starts.
 - Acceptance: either a fix or a documented root cause.
@@ -435,6 +539,14 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   card). UD-IQ2_XXS cannot even load (TQ1_0 / IQ1_M are not decoded in `kquant.rs`), and it
   would not have helped in int8 mode anyway. The lever was to keep the GGUF 4-bit blocks as
   they are.
+  -> corrected (2026-10-23): the parenthetical is stale. TQ1_0 (type 34) and IQ1_M (type 29)
+  are both decoded in `kquant.rs` — enums `kquant.rs:42` / `kquant.rs:40`, `from_id` arms
+  `kquant.rs:74` / `kquant.rs:72`, decode arms `kquant.rs:591` / `kquant.rs:624` — implemented
+  in 2344f67 (s157), so the loader's type gate accepts both ids (`gguf.rs:178-179`) and the
+  GGUF path dequantises through `kquant::dequant_row` (`gguf.rs:238`). "Cannot even load" was
+  true when this section was written (s123); it is no longer. Loading UD-IQ2_XXS itself is
+  still unverified in this container (no such GGUF here), so read this as "the decoder gap is
+  gone", not "the file is measured".
 - What was implemented (opt-in, `--quant q4` / `--quant q4_0`; 9B int8 and the anchors are
   untouched):
   - `Linear::Q4(Q4Linear)` holds the Q4_0 blocks verbatim: 32 elements = f16 scale (2B) +
@@ -470,6 +582,14 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   - `kquant.rs` has no TQ1_0 (type 29) or IQ1_M (type 24) decoder, so IQ2-class files still
     cannot be loaded. With the native path in place that is now the only thing between the
     6.8 GB UD-IQ2_XXS and a 24 GB headroom, and it is a separate piece of work.
+    -> corrected (2026-10-23): wrong on both counts. (1) The type IDs are TQ1_0 = 34 and
+    IQ1_M = 29; type 24 is I8 (`kquant.rs:69-74`, and `tests/dequant_ref.rs:358` asserts
+    `from_id(24) == None`). (2) Both decoders exist as of 2344f67 (s157): enums
+    `kquant.rs:42` / `kquant.rs:40`, block size 256 at `kquant.rs:89-90`, type sizes 54 B / 56 B
+    at `kquant.rs:119` / `kquant.rs:117`, decode arms `kquant.rs:591` / `kquant.rs:624`. So
+    "IQ2-class files still cannot be loaded" is no longer true for this reason, and this bullet
+    is closed — the P4-5 residue that remains is the pass-through item below (blocks are
+    re-quantised from fp32 rather than taken verbatim from the file).
   - Blocks are re-quantised from fp32 today (GGUF -> fp32 -> Q4_0), which is within one block
     scale of the file's own blocks. Passing the file's blocks straight through needs the tensor
     type plumbed into `Linear`, and would also skip the 100 GB fp32 expansion at load.
@@ -796,6 +916,56 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   n=32 128.2 ms, n=300 657.0 ms (2.19 ms/token), but that is a CPU model, not the GPU
   kernel breakdown.
 - Explicitly **no speedup is claimed** for B3, and none was measured.
+
+## Open levers after P24-P28 (2026-10-23)
+
+One question only: what is still open? Nothing new is added here - every line points at a task
+that already exists above. P24-P27 closed the host-side queue for the prefill phases they
+measured, so the host side is not an open lever for those phases.
+
+**(a) Device-side `.cu` work - main session only** (needs a `.cu` edit, PTX regeneration and
+`GPU_VERIFY.sh`)
+- P1-2 candidate 3: the `dno_attention_prefill` kernel rewrite (K/V shared per kv head via a
+  transposed tile, or online softmax on a flash-style tile). Bounded at 1.5-4.8 % of the
+  942 ms bucket, and the committed PTX targets `sm_75`, where mma is unavailable.
+- P28 residue: an n-token sigmoid output-gate kernel - the existing `dno_attn_gate_mul` is
+  single-token. This is the only >= 0.3 s candidate left in `full_core` (the 45.40 ms/layer
+  host gate and the 690 MB/layer att round trip would go together).
+- P25 residue: double buffering the k loop of `dno_gemm_q4_0` - only if the re-read in (b)
+  still reports `sl_lay_ffn_down` at ~10 s. Wave quantisation is the `.cu`-free half of the
+  same question and is the `DENNO_Q4_M_TILE` sweep, i.e. (b).
+
+**(b) GPU measurement - main session only**
+- P27 §5a: `DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 3` (discard req=1). That one
+  command decides whether P25's residue still exists and what `full_core` is now.
+- P25 §5b: the `DENNO_Q4_M_TILE=2048` / `4096` sweep (bit-identical, no rebuild) - only after
+  the line above still reports ~10 s.
+- P26 §6 / P28 §6: one nsys trace (`cuda_gpu_kern_sum,cuda_gpu_mem_time_sum`) to replace the
+  [R]/[A] transfer unit prices with measured GB/s, and to see whether `cuMemHostAlloc` runs
+  once per layer (16 x 345 MB pinned).
+- P28 §6: the cold A/B of `sl_lay_full_core` and the RSS check (the -0.24 s is PREDICTED, not
+  measured), then anchors 3/3 and decode ms/token.
+- The human steps already recorded under P3-2, P4-1, P4-4 and P5-1.
+
+**(c) Operator decision required**
+- P5-5 reason 3: splitting `dv` across blocks (the 4-lane GDN split) keeps each column's
+  accumulation order but splits the `o_inv` / `q_inv` / `k_inv` sums, which moves the GDN
+  output - the anchors would need `ANCHOR_REBASE.sh` plus an approved numeric relaxation.
+  This is the same class as P2-1's speculative decode ("anchor re-baseline, i.e. an operator
+  decision"). No agent can take this decision.
+
+**(d) CPU-only work a dev container can do**
+- P4-5 residue: the GGUF blocks are still re-quantised from fp32 today (GGUF -> fp32 -> Q4_0)
+  instead of being passed through verbatim, so load still pays the fp32 expansion (see the
+  "Still open" bullets under P4-5). The `TQ1_0` / `IQ1_M` decoder item that used to sit here
+  is done — `kquant.rs:591` / `kquant.rs:624`, 2344f67 (s157) — and was removed on 2026-10-23.
+- P3-3 known limits: extend the smem-cast scanner (the row bound of a symbolic row, float2
+  casts through a dynamic alias with a symbolic column, casts through an intermediate
+  pointer).
+- Measurement-only closures of the P24-P27 kind: any further phase that can be settled from
+  code + arithmetic + a CPU microbenchmark, with no `.cu` and no GPU.
+- Docs sync (this item): TASKS.md and KPI.md were the last files out of step with the
+  P24-P28 closures.
 
 ## Suggested order
 
