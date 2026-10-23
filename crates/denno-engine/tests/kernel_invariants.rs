@@ -1072,6 +1072,15 @@ struct Scan {
     /// 行が数値に解決できた [`Flat::SymbolicRow`] のうち、行の上限まで
     /// 検査した件数 (s177/P34: 旧版は row_known を表示にしか使っていなかった)
     row_bound_checked: usize,
+    /// s178/P36: 記号行の上限をホスト起動ブロックから判定した件数
+    /// (決定できたものだけ。違反もここに数える)
+    row_bound_launch_checked: usize,
+    /// s178/P36: 記号行の上限を判定できなかったキャスト (file, line, 理由)。
+    /// 緑にはせず、ここに理由付きで残す (黙って緑にしない)。
+    row_bound_unresolved: Vec<(String, usize, String)>,
+    /// s178/P36: キャストを分類したカーネル名 (重複なし)。起動サイト表との
+    /// 突き合わせに使う。
+    kernels_classified: Vec<String>,
     /// 2 次元宣言から作った行別名 (`a4` / `b4` 相当) の数
     aliases: usize,
 }
@@ -2106,11 +2115,66 @@ fn smem_table(
 
 /// カーネル群を走査する。
 fn scan_kernels(sources: &[(String, String)]) -> Scan {
+    scan_kernels_inner(sources, None)
+}
+
+/// 起動サイト表つきの走査 (s178/P36)。
+///
+/// 表が空なら panic する (正規表現が何にも当たらずに緑になる事故を防ぐ)。
+/// また、キャストを分類したカーネルが表に無ければ panic する
+/// (起動サイトの読み取りが壊れたまま「行の上限は判定できません」で
+///  静かに通り過ぎるのを防ぐ)。
+fn scan_kernels_launched(sources: &[(String, String)], launch: &LaunchMap) -> Scan {
+    assert!(
+        !launch.sites.is_empty(),
+        "起動サイト表が空: cuda.rs の `.launch_async(` / `module_get_function` を \
+         1 件も読めていない (走査器の空回り)"
+    );
+    let sc = scan_kernels_inner(sources, Some(launch));
+    for k in &sc.kernels_classified {
+        assert!(
+            launch.sites.contains_key(k),
+            "キャストを分類したカーネル `{k}` が起動サイト表に無い \
+             (起動サイトを読めていないか、カーネル名の対応が切れている): {:?}",
+            {
+                let mut keys: Vec<&String> = launch.sites.keys().collect();
+                keys.sort();
+                keys
+            }
+        );
+    }
+    sc
+}
+
+fn scan_kernels_inner(sources: &[(String, String)], launch: Option<&LaunchMap>) -> Scan {
     let mut sc = Scan::default();
     for (file, raw) in sources {
         let src = strip_line_comments(raw);
         let d = defines(&src);
-        let table = smem_table(&src, &d, &mut sc.aliases);
+        // s178 (P36): 行 -> カーネル / 行 -> 囲み if 条件 の対応表。文字列と
+        // ブロックコメントを落とした写しで作る (行番号は `src` と一致する)。
+        let masked = mask_literals(&src);
+        let kernels = kernel_spans(&masked);
+        let guards = guard_contexts(&masked);
+        // smem 名表は **カーネルごと** に作る。ファイル単位だと同名配列
+        // (`sA[128][36]` と `sA[64][32]`) が上書きされ、行数・行幅を取り違える。
+        let mut tables: Vec<HashMap<String, SmemObj>> = Vec::with_capacity(kernels.len());
+        for (_, first, last) in &kernels {
+            let start = line_start_offset(&masked, *first);
+            let end = line_start_offset(&masked, *last + 1);
+            tables.push(smem_table(&masked[start..end], &d, &mut sc.aliases));
+        }
+        // `__global__` の外の行むけのフォールバック (別名の数は二重計上しない)
+        let mut dummy_aliases = 0usize;
+        let file_table = smem_table(&src, &d, &mut dummy_aliases);
+        let rowctx = RowBoundCtx {
+            launch,
+            guards: &guards,
+            kernels: &kernels,
+            tables: &tables,
+            file_table: &file_table,
+            masked: &masked,
+        };
 
         // ---- 2 次元参照 (行列形) の列挙 ----
         // 数値に解決できるものだけをここで数える。記号添字の参照
@@ -2123,7 +2187,7 @@ fn scan_kernels(sources: &[(String, String)]) -> Scan {
                 continue; // 宣言行は参照でない
             }
             for (name, a, b) in find_double_index(line) {
-                let Some(obj) = table.get(&name) else {
+                let Some(obj) = rowctx.table_at(ln).get(&name) else {
                     continue;
                 };
                 let Some(inner) = obj.inner else {
@@ -2169,10 +2233,10 @@ fn scan_kernels(sources: &[(String, String)]) -> Scan {
         for (i, line) in src.lines().enumerate() {
             let ln = i + 1;
             for c in find_casts4(line) {
-                classify_cast(file, ln, line, &c, &table, &d, &src, &mut sc, false);
+                classify_cast(file, ln, line, &c, &d, &src, &mut sc, false, &rowctx);
             }
             for c in indirect_casts4(line) {
-                classify_cast(file, ln, line, &c, &table, &d, &src, &mut sc, true);
+                classify_cast(file, ln, line, &c, &d, &src, &mut sc, true, &rowctx);
             }
         }
     }
@@ -2196,13 +2260,13 @@ fn classify_cast(
     ln: usize,
     line: &str,
     c: &CastSite,
-    table: &HashMap<String, SmemObj>,
     d: &HashMap<String, String>,
     body: &str,
     sc: &mut Scan,
     indirect: bool,
+    rowctx: &RowBoundCtx,
 ) {
-    let Some(obj) = table.get(&c.obj) else {
+    let Some(obj) = rowctx.table_at(ln).get(&c.obj) else {
         return; // smem 由来でない (引数・グローバル配列・レジスタ)
     };
     if indirect {
@@ -2210,6 +2274,17 @@ fn classify_cast(
     } else {
         sc.casts_seen += 1;
     }
+    // s178 (P36): どのカーネルに属するキャストかを記録する。起動サイト表との
+    // 突き合わせ (`scan_kernels_launched`) が「表に無いカーネルを分類した」ことを
+    // 検出できるようにするため。
+    if let Some((kname, _, _)) = rowctx.kernel_at(ln) {
+        if !sc.kernels_classified.iter().any(|k| k == kname) {
+            sc.kernels_classified.push(kname.to_string());
+        }
+    }
+    // s178 (P36): 列の錨も **カーネル本体** のスコープで解く (ファイル全体だと
+    // 別カーネルの同名ループ変数を拾う)。
+    let body = rowctx.scope_at(ln).unwrap_or(body);
     let width = cast_width(&c.ty);
     let site = |off: i64| SmemCast {
         file: file.to_string(),
@@ -2280,13 +2355,14 @@ fn classify_cast(
             // s177/P34: 行が数値に解決できたら **行の上限** も検査する。旧版は
             // `row_known` を失敗メッセージに出すだけで、行が宣言外でも緑だった。
             //
-            // 残件 (限界 1 の残り): 行が記号のときは検査しない。実カーネルの行は
-            // `sA[ty * 8 + u][c0]` (ty = threadIdx.y) のように **threadIdx / blockIdx
-            // 由来** で、`.cu` の中に静的な上限が無い (上限は cuda.rs の起動ブロック
-            // (16,16,1) が唯一の根拠)。ハード上限 1024 で代替すると ty*8+u <= 8191 と
-            // なり 128 行の宣言に対して常に「越える」= 偽陽性になるので、ここでは
-            // 判定しない。起動ブロックを import する拡張は REPORT_P34.md の残件。
+            // s178/P36: 行が記号のときは、行式が `threadIdx.*` / `blockIdx.*` /
+            // 証明済みのループ変数・ローカル束縛だけから成るなら、カーネルの
+            // **ホスト起動ブロック** (cuda.rs) を上限として判定する。実カーネルの
+            // `sA[ty * 8 + u][c0]` (ty = threadIdx.y) は block (16,16,1) と
+            // `u < 8` から最大 127 < 128 行と決まる。判定できないものは
+            // `row_bound_unresolved` に理由付きで残し、緑にはしない。
             let mut row_bad: Option<String> = None;
+            let mut row_undecided = false;
             if let (Some(r), Some(inner)) = (row_known, obj.inner) {
                 sc.row_bound_checked += 1;
                 let rows = obj.cap / inner.max(1);
@@ -2300,6 +2376,26 @@ fn classify_cast(
                         obj.cap
                     ));
                 }
+            } else if let (None, Some(inner), Some((row_expr, _))) =
+                (row_known, obj.inner, c.idx.split_once("]["))
+            {
+                if let Some(rb) = rowctx.row_bound(ln, row_expr.trim(), obj, inner, d) {
+                    match rb {
+                        RowBound::InBounds => sc.row_bound_launch_checked += 1,
+                        RowBound::Violated(m) => {
+                            sc.row_bound_launch_checked += 1;
+                            row_bad = Some(m);
+                        }
+                        RowBound::Undecided(m) => {
+                            row_undecided = true;
+                            sc.row_bound_unresolved.push((
+                                file.to_string(),
+                                ln,
+                                format!("{} [{m}]", line.trim()),
+                            ));
+                        }
+                    }
+                }
             }
             if let Some(m) = row_bad {
                 sc.bad_casts
@@ -2308,8 +2404,12 @@ fn classify_cast(
                 sc.unresolved_casts
                     .push((file.to_string(), ln, line.trim().to_string()));
             } else if row_ok && col_aligned && col_inbounds {
-                sc.symbolic_ok += 1;
-                sc.symbolic_sites.push(site(col_bytes));
+                // 行の上限が決まらないものは緑にしない (row_bound_unresolved に
+                // 理由付きで残っている)。
+                if !row_undecided {
+                    sc.symbolic_ok += 1;
+                    sc.symbolic_sites.push(site(col_bytes));
+                }
             } else {
                 sc.bad_casts.push((
                     site(col_bytes),
@@ -2321,6 +2421,1127 @@ fn classify_cast(
         Flat::Unresolved => sc
             .unresolved_casts
             .push((file.to_string(), ln, line.trim().to_string())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// s178 (P36): ホスト側の起動ブロック形状 (cuda.rs) を走査器へ import する
+// ---------------------------------------------------------------------------
+//
+// 記号行 (`sA[ty * 8 + u][c0]` の `ty = threadIdx.y`) の上限は `.cu` の中に無い。
+// 唯一の根拠はホストの起動ブロック (`ctx.launch_async(ctx.f_gemm, .., (GEMM_BX,
+// GEMM_BY, 1), ..)`) なので、cuda.rs をテキストとして読み
+//   kernel 名 -> 起動サイトごとの block 形状
+// の表を作り、行式を区間演算で評価して「宣言行数未満に収まるか」を判定する。
+//
+// soundness の担保:
+//   * 同じカーネルの全起動サイトが同じ block 形状でなければ unresolved (緑にしない)
+//   * block の次元が変数 (例 `dh as u32`) なら unresolved
+//   * 関数ポインタ越しの起動はカーネル名に解決できないので unresolved として記録
+//   * 表に無いカーネルを分類したら panic ([`scan_kernels_launched`])
+//   * 区間の上限が宣言行数以上のときだけ違反。上限が到達可能と言えない
+//     (積の過大評価・宣言が複数) ときは違反ではなく unresolved に落とす
+
+/// 文字列リテラルの中身とコメントを空白に置き換える (行数は変えない)。
+///
+/// cuda.rs の起動引数にはコメントで括弧が書かれている箇所があり
+/// (`// P17k: (行ブロック, heads)`)、素朴な括弧対応だと引数の切れ目を誤る。
+/// 文字列の中身も落とすのは `format!("..(..)..")` の括弧で同じ事故を起こさないため。
+fn mask_literals(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut it = src.chars().peekable();
+    // 0 = code, 1 = line comment, 2 = block comment, 3 = string
+    let mut state = 0u8;
+    while let Some(c) = it.next() {
+        match state {
+            0 => {
+                if c == '"' {
+                    state = 3;
+                    out.push(c);
+                } else if c == '/' && it.peek() == Some(&'/') {
+                    it.next();
+                    state = 1;
+                    out.push(' ');
+                } else if c == '/' && it.peek() == Some(&'*') {
+                    it.next();
+                    state = 2;
+                    out.push(' ');
+                } else {
+                    out.push(c);
+                }
+            }
+            1 => {
+                if c == '\n' {
+                    state = 0;
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+            }
+            2 => {
+                if c == '*' && it.peek() == Some(&'/') {
+                    it.next();
+                    state = 0;
+                    out.push(' ');
+                } else if c == '\n' {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+            }
+            _ => {
+                if c == '\\' {
+                    it.next();
+                    out.push(' ');
+                } else if c == '"' {
+                    state = 0;
+                    out.push(c);
+                } else if c == '\n' {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 1 始まりの行番号 -> その行の先頭バイト位置 (行が無ければ末尾)。
+fn line_start_offset(src: &str, line: usize) -> usize {
+    if line <= 1 {
+        return 0;
+    }
+    let mut seen = 1usize;
+    for (i, ch) in src.char_indices() {
+        if ch == '\n' {
+            seen += 1;
+            if seen == line {
+                return i + 1;
+            }
+        }
+    }
+    src.len()
+}
+
+/// `s[at..]` のバイト位置 `off` -> 1 始まりの行番号。
+fn line_of_offset(src: &str, off: usize) -> usize {
+    src[..off.min(src.len())].matches('\n').count() + 1
+}
+
+/// `s[open]` が `(` のとき、対応する `)` のバイト位置。
+fn matching_paren(s: &str, open: usize) -> Option<usize> {
+    if s.as_bytes().get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, ch) in s[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `s[open]` が `{` のとき、対応する `}` のバイト位置。
+fn matching_brace(s: &str, open: usize) -> Option<usize> {
+    if s.as_bytes().get(open) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, ch) in s[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 先頭 `n` 文字まで (UTF-8 境界を割らない)。
+fn head_chars(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+/// `X as u32` / `X as usize` の cast を落とす (定数式の評価用)。
+fn strip_as_casts(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    loop {
+        match rest.find(" as ") {
+            Some(at) => {
+                out.push_str(&rest[..at]);
+                let tail = &rest[at + 4..];
+                let n = tail
+                    .char_indices()
+                    .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
+                    .count();
+                rest = &tail[n..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// cuda.rs の `const NAME: TYPE = EXPR;` を集める (TYPE は整数型のみ)。
+/// 値は [`eval`] が他の const を再帰展開して数値化する。
+fn rust_const_map(src: &str) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let mut cursor = 0usize;
+    while let Some(off) = src[cursor..].find("const ") {
+        let at = cursor + off;
+        cursor = at + "const ".len();
+        if let Some(p) = src[..at].chars().next_back() {
+            if p.is_ascii_alphanumeric() || p == '_' {
+                continue;
+            }
+        }
+        let rest = &src[cursor..];
+        let Some(colon) = rest.find(':') else { continue };
+        let name = rest[..colon].trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            || !name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        {
+            continue;
+        }
+        let after = &rest[colon + 1..];
+        let Some(eq) = after.find('=') else { continue };
+        let ty = after[..eq].trim();
+        if !matches!(ty, "u32" | "u64" | "usize" | "i32" | "i64") {
+            continue;
+        }
+        let tail = &after[eq + 1..];
+        let Some(semi) = tail.find(';') else { continue };
+        out.insert(name.to_string(), tail[..semi].trim().to_string());
+    }
+    out
+}
+
+/// `module_get_function)(&mut f_xxx, module, b"dno_yyy\0"..)` から
+/// フィールド名 -> カーネル名 の対応を取る。文字列の中身が要るので
+/// マスク前の生ソースを読む。
+fn kernel_fn_map(src: &str) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let mut cursor = 0usize;
+    while let Some(off) = src[cursor..].find("module_get_function") {
+        let at = cursor + off;
+        cursor = at + "module_get_function".len();
+        let tail = &src[cursor..];
+        let win = head_chars(tail, 400);
+        let win = match win.find(';') {
+            Some(p) => &win[..p],
+            None => win,
+        };
+        let Some(field_at) = win.find("&mut ") else {
+            continue;
+        };
+        let after = &win[field_at + 5..];
+        let n = after
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        if n == 0 {
+            continue;
+        }
+        let field = &after[..n];
+        let Some(bq) = win.find("b\"") else { continue };
+        let nt = &win[bq + 2..];
+        let nn = nt
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        if nn == 0 {
+            continue;
+        }
+        out.insert(field.to_string(), nt[..nn].to_string());
+    }
+    out
+}
+
+/// 1 つの起動サイトの block 形状。3 次元すべてが定数に解決できたものだけ `Nums`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlockShape {
+    Nums([i64; 3]),
+    /// 解決できなかった block 式 (そのままのテキスト)
+    Sym(String),
+}
+
+/// カーネル 1 本ぶんの block 形状の判定結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShapeStatus {
+    Resolved([i64; 3]),
+    Unresolved(String),
+}
+
+/// cuda.rs から読んだ「カーネル名 -> 起動サイト」の表。
+#[derive(Debug, Default)]
+struct LaunchMap {
+    /// カーネル名 -> (cuda.rs の行番号, block 形状)
+    sites: HashMap<String, Vec<(usize, BlockShape)>>,
+    /// カーネル名に解決できなかった起動サイト (行番号, 理由)
+    unresolved_sites: Vec<(usize, String)>,
+    /// `.launch_async(` の出現数 (空回り防止の下限に使う)
+    calls_seen: usize,
+}
+
+impl LaunchMap {
+    /// カーネルの block 形状。全起動サイトが一致して静的解決できたときだけ Resolved。
+    fn status(&self, kernel: &str) -> ShapeStatus {
+        let Some(sites) = self.sites.get(kernel) else {
+            return ShapeStatus::Unresolved("cuda.rs に起動サイトが見つからない".to_string());
+        };
+        let mut first: Option<([i64; 3], usize)> = None;
+        for (line, sh) in sites {
+            let dims = match sh {
+                BlockShape::Nums(d) => *d,
+                BlockShape::Sym(t) => {
+                    return ShapeStatus::Unresolved(format!(
+                        "{line} 行目の block {t} が静的に解決できない"
+                    ));
+                }
+            };
+            match first {
+                None => first = Some((dims, *line)),
+                Some((prev, prev_line)) => {
+                    if prev != dims {
+                        return ShapeStatus::Unresolved(format!(
+                            "起動サイトの block が不一致: {prev_line} 行目 ({}, {}, {}) vs \
+                             {line} 行目 ({}, {}, {})",
+                            prev[0], prev[1], prev[2], dims[0], dims[1], dims[2]
+                        ));
+                    }
+                }
+            }
+        }
+        match first {
+            Some((dims, _)) => ShapeStatus::Resolved(dims),
+            None => ShapeStatus::Unresolved("起動サイトが空".to_string()),
+        }
+    }
+
+    fn shape(&self, kernel: &str) -> Option<[i64; 3]> {
+        match self.status(kernel) {
+            ShapeStatus::Resolved(d) => Some(d),
+            ShapeStatus::Unresolved(_) => None,
+        }
+    }
+
+    /// 表の 1 行要約 (テストの println と失敗メッセージ用)。
+    fn summary(&self) -> String {
+        let mut keys: Vec<&String> = self.sites.keys().collect();
+        keys.sort();
+        let mut out = Vec::new();
+        for k in keys {
+            let sites = &self.sites[k];
+            let lines: Vec<String> = sites.iter().map(|(l, _)| l.to_string()).collect();
+            let st = match self.status(k) {
+                ShapeStatus::Resolved(d) => format!("({}, {}, {})", d[0], d[1], d[2]),
+                ShapeStatus::Unresolved(w) => format!("unresolved ({w})"),
+            };
+            out.push(format!("{k} -> {st} @ {}", lines.join(",")));
+        }
+        out.join("; ")
+    }
+}
+
+/// block 引数 `(A, B, C)` を読む。3 次元すべてが定数に解決できなければ `Sym`。
+fn parse_block_shape(arg: &str, consts: &HashMap<String, String>) -> BlockShape {
+    let t = arg.trim();
+    if !(t.starts_with('(') && t.ends_with(')')) {
+        return BlockShape::Sym(t.to_string());
+    }
+    let parts = split_top_args(&t[1..t.len() - 1]);
+    if parts.len() != 3 {
+        return BlockShape::Sym(t.to_string());
+    }
+    let mut dims = [0i64; 3];
+    for (k, p) in parts.iter().enumerate() {
+        match eval(&strip_as_casts(p).trim(), consts) {
+            Some(v) if v > 0 => dims[k] = v,
+            _ => return BlockShape::Sym(t.to_string()),
+        }
+    }
+    BlockShape::Nums(dims)
+}
+
+/// cuda.rs から起動サイト表を作る。
+fn launch_map_from_cuda(src: &str) -> LaunchMap {
+    let masked = mask_literals(src);
+    let consts = rust_const_map(&masked);
+    let fns = kernel_fn_map(src);
+    let mut lm = LaunchMap::default();
+    let mut cursor = 0usize;
+    while let Some(off) = masked[cursor..].find(".launch_async(") {
+        let at = cursor + off;
+        let open = at + ".launch_async".len();
+        cursor = open + 1;
+        let Some(close) = matching_paren(&masked, open) else {
+            continue;
+        };
+        lm.calls_seen += 1;
+        let line = line_of_offset(&masked, at);
+        let args = split_top_args(&masked[open + 1..close]);
+        let Some(callee) = args.first().map(|s| s.trim()) else {
+            lm.unresolved_sites
+                .push((line, "引数が読めない".to_string()));
+            continue;
+        };
+        // `ctx.f_gemm` / `self.f_mv` / `fns.f_gate` の形だけを解決する。
+        // 裸の識別子 (`f`, `func`) は関数ポインタの変数なのでカーネル名を推測しない。
+        let field = ["ctx.", "self.", "fns."]
+            .iter()
+            .find_map(|p| callee.strip_prefix(p));
+        let Some(field) = field else {
+            lm.unresolved_sites.push((
+                line,
+                format!("呼び出し式 `{callee}` は関数ポインタ/変数でカーネル名に解決できない"),
+            ));
+            continue;
+        };
+        let Some(kernel) = fns.get(field) else {
+            lm.unresolved_sites.push((
+                line,
+                format!("`{callee}` のフィールド {field} は module_get_function から解決できない"),
+            ));
+            continue;
+        };
+        let Some(block_arg) = args.get(2) else {
+            lm.unresolved_sites
+                .push((line, format!("`{callee}` の block 引数が読めない")));
+            continue;
+        };
+        let shape = parse_block_shape(block_arg, &consts);
+        lm.sites
+            .entry(kernel.clone())
+            .or_default()
+            .push((line, shape));
+    }
+    lm
+}
+
+/// `__global__` 関数の (名前, 開始行, 終了行)。マスク済みソースを渡す。
+fn kernel_spans(masked: &str) -> Vec<(String, usize, usize)> {
+    let mut out: Vec<(String, usize, usize)> = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(off) = masked[cursor..].find("__global__") {
+        let at = cursor + off;
+        cursor = at + "__global__".len();
+        let Some(paren_off) = masked[cursor..].find('(') else {
+            continue;
+        };
+        let paren = cursor + paren_off;
+        let head = masked[cursor..paren].trim_end();
+        let n = head
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        if n == 0 {
+            continue;
+        }
+        let name = head[head.len() - n..].to_string();
+        let Some(close_paren) = matching_paren(masked, paren) else {
+            continue;
+        };
+        let Some(brace_off) = masked[close_paren..].find('{') else {
+            continue;
+        };
+        let brace = close_paren + brace_off;
+        let Some(close_brace) = matching_brace(masked, brace) else {
+            continue;
+        };
+        out.push((
+            name,
+            line_of_offset(masked, at),
+            line_of_offset(masked, close_brace),
+        ));
+    }
+    out
+}
+
+/// 1 行から `if (COND) {` を読み、(COND, `{` のバイト位置) を返す。
+/// `{` が同じ行に無い形 (`if (..)` 改行 `{`) は扱わない (ガードを主張しない)。
+fn find_if_guard(line: &str) -> Option<(String, usize)> {
+    let b = line.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < b.len() {
+        if b[i] == b'i' && b[i + 1] == b'f' {
+            let prev_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+            let next_ok = i + 2 >= b.len()
+                || !(b[i + 2].is_ascii_alphanumeric() || b[i + 2] == b'_');
+            if prev_ok && next_ok {
+                let after_if = &line[i + 2..];
+                let trimmed = after_if.trim_start();
+                if let Some(stripped) = trimmed.strip_prefix('(') {
+                    let open = line.len() - stripped.len() - 1;
+                    if let Some(close) = matching_paren(line, open) {
+                        let cond = line[open + 1..close].trim().to_string();
+                        let rest = line[close + 1..].trim_start();
+                        if rest.starts_with('{') {
+                            return Some((cond, line.len() - rest.len()));
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 行ごとの「その行を囲む `if (COND) {` の条件」。`else` 側は含めない
+/// (否定された条件を正の上限として使うと unsound になる)。
+fn guard_contexts(masked: &str) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut stack: Vec<(usize, Option<String>)> = Vec::new();
+    let mut depth: usize = 0;
+    for line in masked.lines() {
+        out.push(stack.iter().filter_map(|(_, g)| g.clone()).collect());
+        let found = find_if_guard(line);
+        let is_else = line.trim_start().starts_with("else");
+        let guard_brace = found.as_ref().map(|(_, at)| *at);
+        let guard = found.map(|(c, _)| c);
+        for (i, ch) in line.char_indices() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    let g = if Some(i) == guard_brace && !is_else {
+                        guard.clone()
+                    } else {
+                        None
+                    };
+                    stack.push((depth, g));
+                }
+                '}' => {
+                    while stack.last().is_some_and(|(d, _)| *d == depth) {
+                        stack.pop();
+                    }
+                    depth = depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// `&&` の連言に割る。`||` が外側にあれば「その 1 本からは何も言えない」ので空を返す。
+fn split_conjunctions(cond: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    let cs: Vec<char> = cond.chars().collect();
+    let mut i = 0usize;
+    while i < cs.len() {
+        let c = cs[i];
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            '|' if depth == 0 && i + 1 < cs.len() && cs[i + 1] == '|' => return Vec::new(),
+            '&' if depth == 0 && i + 1 < cs.len() && cs[i + 1] == '&' => {
+                parts.push(cur.clone());
+                cur.clear();
+                i += 1;
+            }
+            _ => cur.push(c),
+        }
+        i += 1;
+    }
+    parts.push(cur);
+    parts
+}
+
+/// `IDENT < N` / `IDENT <= N` / `N > IDENT` / `N >= IDENT` を (識別子, 上限) に読む。
+/// それ以外の形は None (何も主張しない)。
+fn upper_bound_of(conj: &str, d: &HashMap<String, String>) -> Option<(String, i64)> {
+    let t = conj.trim();
+    let t = t
+        .strip_prefix('(')
+        .and_then(|x| x.strip_suffix(')'))
+        .unwrap_or(t)
+        .trim();
+    // 比較演算子を外側の深さで探す
+    let mut depth = 0i32;
+    let cs: Vec<char> = t.chars().collect();
+    let mut ops: Vec<(usize, &'static str)> = Vec::new();
+    let mut i = 0usize;
+    while i < cs.len() {
+        match cs[i] {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '<' | '>' if depth == 0 => {
+                let op = cs[i];
+                if i + 1 < cs.len() && cs[i + 1] == '=' {
+                    ops.push((i, if op == '<' { "<=" } else { ">=" }));
+                    i += 1;
+                } else {
+                    ops.push((i, if op == '<' { "<" } else { ">" }));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if ops.len() != 1 {
+        return None;
+    }
+    let (at, op) = ops[0];
+    let lhs = t[..at].trim();
+    let rhs = t[at + op.len()..].trim();
+    let (ident, val) = match op {
+        "<" | "<=" => {
+            if !is_ident(lhs) {
+                return None;
+            }
+            (lhs.to_string(), eval(&strip_as_casts(rhs), d)?)
+        }
+        _ => {
+            if !is_ident(rhs) {
+                return None;
+            }
+            (rhs.to_string(), eval(&strip_as_casts(lhs), d)?)
+        }
+    };
+    let hi = match op {
+        "<" => val - 1,
+        "<=" => val,
+        ">" => val - 1,
+        _ => val,
+    };
+    Some((ident, hi))
+}
+
+/// 囲みの `if` 条件から識別子ごとの上限を集める (同じ識別子は最小を採る)。
+fn guard_bounds(guards: &[String], d: &HashMap<String, String>) -> HashMap<String, i64> {
+    let mut out: HashMap<String, i64> = HashMap::new();
+    for cond in guards {
+        for conj in split_conjunctions(cond) {
+            if let Some((name, hi)) = upper_bound_of(&conj, d) {
+                out.entry(name)
+                    .and_modify(|v: &mut i64| *v = (*v).min(hi))
+                    .or_insert(hi);
+            }
+        }
+    }
+    out
+}
+
+/// 行式の取り得る範囲 `lo..=hi`。`exact` は「hi が block 範囲内の実際の割り当てで
+/// 到達できる」と言えるか (線形式なら真、積の過大評価や同じ変数の重複で偽)。
+#[derive(Debug, Clone, Copy)]
+struct Iv {
+    lo: i64,
+    hi: i64,
+    exact: bool,
+}
+
+impl Iv {
+    fn point(v: i64) -> Iv {
+        Iv {
+            lo: v,
+            hi: v,
+            exact: true,
+        }
+    }
+}
+
+struct RowEnv<'a> {
+    d: &'a HashMap<String, String>,
+    /// カーネル本体 (ローカル束縛・ループの探索をカーネル内に限る)
+    scope: &'a str,
+    /// キャスト行の `scope` 内バイト位置。宣言は「これより前で最後のもの」を使う
+    /// (C のスコープ規則: 後から宣言された同名の変数が外側を隠す)。
+    line_off: usize,
+    /// 起動ブロック (x, y, z)
+    block: [i64; 3],
+    /// 囲みの `if` から読んだ識別子の上限
+    bounds: &'a HashMap<String, i64>,
+}
+
+/// 式に現れる識別子を出現順に (`.` を含む = `threadIdx.y` を 1 語として数える)。
+/// [`idents_of`] は `.` で切るので `threadIdx.y` と `threadIdx.x` が同じ
+/// `threadIdx` に潰れる。区間の端点が同時に達成できるかの判定にはこちらを使う。
+fn dotted_idents(expr: &str) -> Vec<String> {
+    let cs: Vec<char> = expr.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < cs.len() {
+        if cs[i].is_ascii_alphabetic() || cs[i] == '_' {
+            let s = i;
+            while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_' || cs[i] == '.') {
+                i += 1;
+            }
+            out.push(cs[s..i].iter().collect());
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn iv_of(expr: &str, env: &RowEnv) -> Option<Iv> {
+    iv_of_depth(expr, env, 0)
+}
+
+fn iv_of_depth(expr: &str, env: &RowEnv, depth: u32) -> Option<Iv> {
+    if depth > 12 {
+        return None;
+    }
+    let cs: Vec<char> = expr.chars().filter(|c| !c.is_whitespace()).collect();
+    if cs.is_empty() {
+        return None;
+    }
+    let mut pos = 0usize;
+    let mut v = iv_sum(&cs, &mut pos, env, depth)?;
+    if pos != cs.len() {
+        return None;
+    }
+    // 同じ識別子が 2 回以上現れる式は、区間の端点が同時に達成できるとは限らない
+    // (`tid - tid` の区間は [0, 255] ではなく [0, 0] なので過大評価になる)。
+    let ids = dotted_idents(expr);
+    if ids.iter().any(|id| ids.iter().filter(|x| *x == id).count() > 1) {
+        v.exact = false;
+    }
+    Some(v)
+}
+
+fn iv_sum(cs: &[char], pos: &mut usize, env: &RowEnv, depth: u32) -> Option<Iv> {
+    let mut v = iv_prod(cs, pos, env, depth)?;
+    while *pos < cs.len() && (cs[*pos] == '+' || cs[*pos] == '-') {
+        let op = cs[*pos];
+        *pos += 1;
+        let r = iv_prod(cs, pos, env, depth)?;
+        v = if op == '+' {
+            Iv {
+                lo: v.lo.saturating_add(r.lo),
+                hi: v.hi.saturating_add(r.hi),
+                exact: v.exact && r.exact,
+            }
+        } else {
+            Iv {
+                lo: v.lo.saturating_sub(r.hi),
+                hi: v.hi.saturating_sub(r.lo),
+                exact: v.exact && r.exact,
+            }
+        };
+    }
+    Some(v)
+}
+
+fn iv_mul(a: Iv, b: Iv) -> Iv {
+    if a.lo == a.hi {
+        let k = a.lo;
+        let (lo, hi) = if k >= 0 {
+            (k.saturating_mul(b.lo), k.saturating_mul(b.hi))
+        } else {
+            (k.saturating_mul(b.hi), k.saturating_mul(b.lo))
+        };
+        return Iv {
+            lo,
+            hi,
+            exact: a.exact && b.exact,
+        };
+    }
+    if b.lo == b.hi {
+        return iv_mul(b, a);
+    }
+    let c = [
+        a.lo.saturating_mul(b.lo),
+        a.lo.saturating_mul(b.hi),
+        a.hi.saturating_mul(b.lo),
+        a.hi.saturating_mul(b.hi),
+    ];
+    Iv {
+        lo: *c.iter().min().unwrap_or(&0),
+        hi: *c.iter().max().unwrap_or(&0),
+        exact: false,
+    }
+}
+
+fn iv_prod(cs: &[char], pos: &mut usize, env: &RowEnv, depth: u32) -> Option<Iv> {
+    let mut v = iv_atom(cs, pos, env, depth)?;
+    while *pos < cs.len() && cs[*pos] == '*' {
+        *pos += 1;
+        let r = iv_atom(cs, pos, env, depth)?;
+        v = iv_mul(v, r);
+    }
+    Some(v)
+}
+
+fn iv_atom(cs: &[char], pos: &mut usize, env: &RowEnv, depth: u32) -> Option<Iv> {
+    if *pos >= cs.len() {
+        return None;
+    }
+    match cs[*pos] {
+        '(' => {
+            *pos += 1;
+            let v = iv_sum(cs, pos, env, depth)?;
+            if *pos < cs.len() && cs[*pos] == ')' {
+                *pos += 1;
+                Some(v)
+            } else {
+                None
+            }
+        }
+        '-' => {
+            *pos += 1;
+            let v = iv_atom(cs, pos, env, depth)?;
+            Some(Iv {
+                lo: v.hi.saturating_neg(),
+                hi: v.lo.saturating_neg(),
+                exact: v.exact,
+            })
+        }
+        c if c.is_ascii_digit() => {
+            let s = *pos;
+            while *pos < cs.len() && cs[*pos].is_ascii_digit() {
+                *pos += 1;
+            }
+            let text: String = cs[s..*pos].iter().collect();
+            Some(Iv::point(text.parse::<i64>().ok()?))
+        }
+        c if c.is_ascii_alphabetic() || c == '_' => {
+            let s = *pos;
+            while *pos < cs.len()
+                && (cs[*pos].is_ascii_alphanumeric() || cs[*pos] == '_' || cs[*pos] == '.')
+            {
+                *pos += 1;
+            }
+            let name: String = cs[s..*pos].iter().collect();
+            ident_iv(&name, env, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+fn ident_iv(name: &str, env: &RowEnv, depth: u32) -> Option<Iv> {
+    if depth > 12 {
+        return None;
+    }
+    let mut iv = match name {
+        "threadIdx.x" => Iv {
+            lo: 0,
+            hi: env.block[0] - 1,
+            exact: true,
+        },
+        "threadIdx.y" => Iv {
+            lo: 0,
+            hi: env.block[1] - 1,
+            exact: true,
+        },
+        "threadIdx.z" => Iv {
+            lo: 0,
+            hi: env.block[2] - 1,
+            exact: true,
+        },
+        "blockDim.x" => Iv::point(env.block[0]),
+        "blockDim.y" => Iv::point(env.block[1]),
+        "blockDim.z" => Iv::point(env.block[2]),
+        // grid は静的に決まらない (起動サイトの grid 引数は読んでいない)
+        "blockIdx.x" | "blockIdx.y" | "blockIdx.z" => return None,
+        _ => {
+            if let Some(v) = eval(name, env.d) {
+                Iv::point(v)
+            } else {
+                local_iv(name, env, depth + 1)?
+            }
+        }
+    };
+    if let Some(m) = env.bounds.get(name) {
+        if *m < iv.hi {
+            iv.hi = *m;
+        }
+    }
+    if iv.hi < iv.lo {
+        return None;
+    }
+    Some(iv)
+}
+
+/// `for (int NAME = A; NAME < B; NAME += S)` の範囲。条件が読めなければ None。
+fn loop_iv(name: &str, from: &str, cond: &str, inc: &str, env: &RowEnv, depth: u32) -> Option<Iv> {
+    let start = {
+        let iv = iv_of_depth(from, env, depth)?;
+        if iv.lo != iv.hi {
+            return None;
+        }
+        iv.lo
+    };
+    let cond_c: String = cond.chars().filter(|c| !c.is_whitespace()).collect();
+    let (to_expr, inclusive) = if let Some(r) = cond_c.strip_prefix(&format!("{name}<=")) {
+        (r.to_string(), true)
+    } else if let Some(r) = cond_c.strip_prefix(&format!("{name}<")) {
+        (r.to_string(), false)
+    } else {
+        return None;
+    };
+    let stop = {
+        let iv = iv_of_depth(&to_expr, env, depth)?;
+        if iv.lo != iv.hi {
+            return None;
+        }
+        iv.lo
+    };
+    let inc_c: String = inc.chars().filter(|c| !c.is_whitespace()).collect();
+    let step = if inc_c == format!("{name}++") || inc_c == format!("++{name}") {
+        1
+    } else if inc_c == format!("{name}--") || inc_c == format!("--{name}") {
+        -1
+    } else if let Some(r) = inc_c.strip_prefix(&format!("{name}+=")) {
+        let iv = iv_of_depth(r, env, depth)?;
+        if iv.lo != iv.hi {
+            return None;
+        }
+        iv.lo
+    } else {
+        return None;
+    };
+    if step <= 0 {
+        return None;
+    }
+    let last = if inclusive { stop } else { stop - 1 };
+    if last < start {
+        // 1 回も回らないループ: 本体の参照は実行されない
+        return Some(Iv::point(start));
+    }
+    Some(Iv {
+        lo: start,
+        hi: last,
+        exact: true,
+    })
+}
+
+/// ローカル束縛 (`const int x = ..;`) とループ変数の範囲。カーネル本体内だけを探す。
+fn local_iv(name: &str, env: &RowEnv, depth: u32) -> Option<Iv> {
+    if depth > 12 {
+        return None;
+    }
+    // 宣言は「キャスト行より前で最後のもの」を使う。同じ名前のループが複数ある
+    // (`for (int v = 0; v < 16; ..)` と `for (int v = 0; v < 8; ..)`) カーネルで、
+    // 全部の和を採ると上限が過大になり、内側のループの証明が効かなくなる。
+    let mut best: Option<(usize, Iv)> = None;
+    let mut keep = |at: usize, iv: Option<Iv>, best: &mut Option<(usize, Iv)>| {
+        if at >= env.line_off {
+            return; // 使用位置より後ろの宣言は無関係
+        }
+        if let Some(iv) = iv {
+            if best.as_ref().is_none_or(|(o, _)| at > *o) {
+                *best = Some((at, iv));
+            }
+        }
+    };
+    let loop_head = format!("for (int {name} = ");
+    let mut cursor = 0usize;
+    while let Some(off) = env.scope[cursor..].find(&loop_head) {
+        let at = cursor + off;
+        cursor = at + loop_head.len();
+        let tail = &env.scope[cursor..];
+        let Some(s1) = tail.find(';') else { continue };
+        let from = tail[..s1].trim();
+        let rest = &tail[s1 + 1..];
+        let Some(s2) = rest.find(';') else { continue };
+        let cond = rest[..s2].trim();
+        let rest2 = &rest[s2 + 1..];
+        let Some(cp) = rest2.find(')') else { continue };
+        let inc = rest2[..cp].trim();
+        keep(at, loop_iv(name, from, cond, inc, env, depth + 1), &mut best);
+    }
+    for prefix in ["const int ", "int "] {
+        let decl = format!("{prefix}{name} =");
+        let mut cursor2 = 0usize;
+        while let Some(off) = env.scope[cursor2..].find(&decl) {
+            let at = cursor2 + off;
+            cursor2 = at + decl.len();
+            if env.scope[..at].trim_end().ends_with("for (") {
+                continue; // ループ宣言は上で読んだ
+            }
+            if prefix == "int " && env.scope[..at].trim_end().ends_with("const ") {
+                continue; // `const int X =` は上の prefix で読んだ (二重計上を避ける)
+            }
+            let tail = &env.scope[cursor2..];
+            let Some(semi) = tail.find(';') else { continue };
+            let rhs = tail[..semi].trim();
+            keep(at, iv_of_depth(rhs, env, depth + 1), &mut best);
+        }
+    }
+    best.map(|(_, iv)| iv)
+}
+
+/// 記号行の上限判定の結果。
+#[derive(Debug, Clone)]
+enum RowBound {
+    /// 宣言行数未満に収まる (決定)
+    InBounds,
+    /// 到達し得る行が宣言外 (決定・違反)
+    Violated(String),
+    /// 判定できない (理由)。緑にはしない。
+    Undecided(String),
+}
+
+/// 記号行の上限を起動ブロックから判定する。
+///
+/// 規則 (sound): `max(行式) < 宣言行数` のときだけ InBounds。`max` が到達可能と
+/// 言える (`exact`) ときに限り違反として報告し、それ以外は Undecided に落とす。
+fn symbolic_row_bound(
+    row_expr: &str,
+    obj: &SmemObj,
+    inner: i64,
+    d: &HashMap<String, String>,
+    scope: &str,
+    line_off: usize,
+    guards: &[String],
+    shape: ShapeStatus,
+) -> RowBound {
+    let rows = obj.cap / inner.max(1);
+    let block = match shape {
+        ShapeStatus::Resolved(b) => b,
+        ShapeStatus::Unresolved(why) => return RowBound::Undecided(why),
+    };
+    let bounds = guard_bounds(guards, d);
+    let env = RowEnv {
+        d,
+        scope,
+        line_off,
+        block,
+        bounds: &bounds,
+    };
+    let Some(iv) = iv_of(row_expr, &env) else {
+        return RowBound::Undecided(format!(
+            "行式 `{row_expr}` を区間に落とせない (block {}x{}x{})",
+            block[0], block[1], block[2]
+        ));
+    };
+    if iv.hi < rows && iv.lo >= 0 {
+        return RowBound::InBounds;
+    }
+    if iv.exact && iv.lo >= 0 {
+        return RowBound::Violated(format!(
+            "行 `{row_expr}` の最大 {} が宣言 {rows} 行以上 (block {}x{}x{})",
+            iv.hi, block[0], block[1], block[2]
+        ));
+    }
+    RowBound::Undecided(format!(
+        "行 `{row_expr}` の区間 [{}, {}] が宣言 {rows} 行と交わる (block {}x{}x{})",
+        iv.lo, iv.hi, block[0], block[1], block[2]
+    ))
+}
+
+/// [`classify_cast`] に渡す行上限判定の文脈 (s178/P36)。
+///
+/// 共有メモリ名表は **カーネルごと** に持つ。ファイル単位の表だと、同名の配列を
+/// 別カーネルが宣言した時点で上書きされ (`kernels_int8.cu` は `dno_gemm_i8` の
+/// `sA[128][36]` と `dno_gemm_q4_0` の `sA[Q4_GM][32]` が同名)、行数が 128 では
+/// なく 64 に見える。P36 で行の上限を判定したときに発覚した。
+struct RowBoundCtx<'a> {
+    /// 起動サイト表。None なら従来通り記号行の上限は見ない。
+    launch: Option<&'a LaunchMap>,
+    /// 行ごとの囲み `if` 条件
+    guards: &'a [Vec<String>],
+    /// `__global__` 関数の (名前, 開始行, 終了行)
+    kernels: &'a [(String, usize, usize)],
+    /// カーネルごとの smem 名表 (`kernels` と同じ添字)
+    tables: &'a [HashMap<String, SmemObj>],
+    /// `__global__` の外の行むけのファイル単位の表 (従来動作のフォールバック)
+    file_table: &'a HashMap<String, SmemObj>,
+    /// マスク済みソース (カーネル本体の切り出しに使う)
+    masked: &'a str,
+}
+
+impl RowBoundCtx<'_> {
+    /// その行を含むカーネルの添字。
+    fn kernel_index_at(&self, ln: usize) -> Option<usize> {
+        self.kernels
+            .iter()
+            .position(|(_, first, last)| ln >= *first && ln <= *last)
+    }
+
+    /// その行を含むカーネルの (名前, 本体ソース, 開始行)。
+    fn kernel_at(&self, ln: usize) -> Option<(&str, &str, usize)> {
+        let i = self.kernel_index_at(ln)?;
+        let (name, first, last) = &self.kernels[i];
+        let start = line_start_offset(self.masked, *first);
+        let end = line_start_offset(self.masked, *last + 1);
+        Some((name.as_str(), &self.masked[start..end], *first))
+    }
+
+    /// その行を含むカーネルの本体 (カーネル外なら None)。
+    /// 列の錨 (`col_anchor` / `local_anchor`) のローカル束縛・ループ探索も
+    /// **カーネル内** に限る。ファイル全体を渡すと、別カーネルの
+    /// `for (int c = 0; c < C; c++)` を拾って `const int c = x * 4;` の錨 (4) を
+    /// 1 に取り違える (P36 で発覚)。
+    fn scope_at(&self, ln: usize) -> Option<&str> {
+        self.kernel_at(ln).map(|(_, scope, _)| scope)
+    }
+
+    /// その行の共有メモリ名表 (カーネル内ならそのカーネルのもの)。
+    fn table_at(&self, ln: usize) -> &HashMap<String, SmemObj> {
+        match self.kernel_index_at(ln) {
+            Some(i) if i < self.tables.len() => &self.tables[i],
+            _ => self.file_table,
+        }
+    }
+
+    /// 記号行の上限を判定する。起動サイト表が無いときは None (従来経路)。
+    fn row_bound(
+        &self,
+        ln: usize,
+        row_expr: &str,
+        obj: &SmemObj,
+        inner: i64,
+        d: &HashMap<String, String>,
+    ) -> Option<RowBound> {
+        let launch = self.launch?;
+        let guards = self
+            .guards
+            .get(ln.saturating_sub(1))
+            .cloned()
+            .unwrap_or_default();
+        let Some((kname, scope, first)) = self.kernel_at(ln) else {
+            return Some(RowBound::Undecided(
+                "キャストが __global__ の外にあり起動ブロックを引けない".to_string(),
+            ));
+        };
+        // カーネル本体内でのキャスト行の位置 (宣言の可視範囲を切るのに使う)
+        let line_off = line_start_offset(scope, ln - first + 1);
+        Some(symbolic_row_bound(
+            row_expr,
+            obj,
+            inner,
+            d,
+            scope,
+            line_off,
+            &guards,
+            launch.status(kname),
+        ))
     }
 }
 
@@ -2902,6 +4123,346 @@ extern "C" __global__ void fake_row(const signed char *src) {{
         sc.bad_casts
     );
 }
+/// s178 (P36): ホスト起動ブロック形状を import した記号行の上限検査。
+///
+/// P3-3 の最後の記録済み限界 (REPORT_P34.md) を閉じる検査:
+///   `const int ty = threadIdx.y; *(const int*)&sA[ty * 8 + u][c0]` の
+///   行の上限は `.cu` の中に無く、cuda.rs の起動ブロック (GEMM_BX, GEMM_BY, 1)
+///   だけが根拠。ここでは cuda.rs から
+///     カーネル名 -> 起動サイトごとの block 形状
+///   を読み、行式を区間演算で評価して判定する。
+///
+/// 検証する内容:
+///   1. 実カーネル: 起動サイト表が空でなく、`dno_gemm_i8` の全起動サイトが
+///      (16,16,1) で一致し、int8 の 6 キャストが **行の上限まで** 判定されること
+///      (P34 では `row_bound_checked == 0` だった)。
+///   2. `dno_attention_prefill` は block がカーネル引数 `dh` なので unresolved
+///      として **表には見つかる** こと (見つからないのではなく判定不能)。
+///   3. わざと壊した fixture が報告されること:
+///      - block の y を 17 にすると行の最大が 135 >= 128 で違反
+///      - ループ上限を 9 にすると行の最大が 128 で違反
+///      - 起動サイトの block が食い違うと unresolved (緑にしない)
+///      - block が変数だと unresolved (緑にしない)
+///      - 囲みの `if (tid < TILE)` を外すと違反 (ガードを実際に使っている証拠)
+///      - `else` 側ではガードを使わない (否定条件を上限にしない)
+///   4. 起動サイト表が空 / 分類したカーネルが表に無い、で panic すること。
+#[test]
+fn kernel_launch_block_shapes_bound_symbolic_smem_rows() {
+    // ---- (1) cuda.rs の起動サイト表 ----
+    let map = launch_map_from_cuda(CUDA_RS);
+    println!("launch sites: {} calls, {} kernels, {} unresolved sites", map.calls_seen, map.sites.len(), map.unresolved_sites.len());
+    println!("launch map: {}", map.summary());
+    for (line, why) in &map.unresolved_sites {
+        println!("launch site unresolved: cuda.rs:{line} {why}");
+    }
+    assert!(
+        map.calls_seen >= 50,
+        "`.launch_async(` を {} 件しか見ていない (cuda.rs には 60 件以上ある)",
+        map.calls_seen
+    );
+    assert!(
+        map.sites.len() >= 15,
+        "カーネル名 -> 起動サイトの対応を {} 件しか作れていない: {}",
+        map.sites.len(),
+        map.summary()
+    );
+    assert!(
+        map.unresolved_sites.len() >= 5,
+        "カーネル名に解決できない起動サイトを {} 件しか記録していない (関数ポインタ越しの \
+         起動が実在するので 5 件以上あるはず)",
+        map.unresolved_sites.len()
+    );
+    assert_eq!(
+        map.shape("dno_gemm_i8"),
+        Some([16, 16, 1]),
+        "dno_gemm_i8 の起動ブロックが (GEMM_BX, GEMM_BY, 1) = (16,16,1) と読めていない: {}",
+        map.summary()
+    );
+    let gemm_sites = map
+        .sites
+        .get("dno_gemm_i8")
+        .expect("dno_gemm_i8 が起動サイト表に無い");
+    assert!(
+        gemm_sites.len() >= 5,
+        "dno_gemm_i8 の起動サイトを {} 件しか見ていない (cuda.rs には 10 件ある)",
+        gemm_sites.len()
+    );
+    assert!(
+        gemm_sites
+            .iter()
+            .all(|(_, s)| *s == BlockShape::Nums([16, 16, 1])),
+        "dno_gemm_i8 の起動サイトの block が揃っていない: {gemm_sites:?}"
+    );
+    // block がカーネル引数 (`dh as u32`) のカーネルは「表にあるが判定不能」。
+    match map.status("dno_attention_prefill") {
+        ShapeStatus::Unresolved(w) => assert!(
+            w.contains("解決できない"),
+            "dno_attention_prefill の unresolved 理由が block の静的解決でない: {w}"
+        ),
+        ShapeStatus::Resolved(d) => panic!(
+            "dno_attention_prefill の block が {d:?} と解決された (引数 dh 依存のはず)"
+        ),
+    }
+
+    // ---- (2) 実カーネル走査: 6 件の int8 キャストが行の上限まで判定される ----
+    let sources = kernel_sources();
+    let sc = scan_kernels_launched(&sources, &map);
+    assert!(
+        sc.bad_casts.is_empty(),
+        "起動ブロックから行の上限を判定した結果、実カーネルに違反が出た \
+         (本当に違反なら .cu を直すこと・.cu は編集禁止なので REPORT へ): {:?}",
+        sc.bad_casts
+    );
+    assert!(
+        sc.row_bound_unresolved.is_empty(),
+        "記号行の上限を判定できなかったキャストが {} 件ある:\n{}",
+        sc.row_bound_unresolved.len(),
+        sc.row_bound_unresolved
+            .iter()
+            .map(|(f, l, t)| format!("{f}:{l} {t}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(
+        sc.row_bound_launch_checked, 6,
+        "起動ブロックから行の上限を判定したキャストが 6 件でない (kernels_int8.cu の \
+         `sA[tid][..]` / `sA[ty * 8 + u][..]` / `sB[r][..]` / `sB[t * GEMM_TILE + tx * 8 + v][..]`): {sc:?}"
+    );
+    assert!(
+        sc.symbolic_ok >= 6,
+        "行の上限を判定しても記号行の安全判定が {} 件しかない (6 件あるはず)",
+        sc.symbolic_ok
+    );
+    println!(
+        "smem symbolic rows (launch block): {} decided, {} undecided; {} bad; \
+         {} symbolic-ok; {} casts / {} indirect; {} kernels classified",
+        sc.row_bound_launch_checked,
+        sc.row_bound_unresolved.len(),
+        sc.bad_casts.len(),
+        sc.symbolic_ok,
+        sc.casts_seen,
+        sc.indirect_seen,
+        sc.kernels_classified.len()
+    );
+    // 分類したカーネルはすべて起動サイト表にある (scan_kernels_launched が assert
+    // するが、ここでも実カーネルについて明示的に固定する)。
+    for want in ["dno_gemm_i8", "dno_attention_prefill"] {
+        assert!(
+            sc.kernels_classified.iter().any(|k| k == want),
+            "キャストを分類したカーネルに {want} が無い: {:?}",
+            sc.kernels_classified
+        );
+        assert!(
+            map.sites.contains_key(want),
+            "{want} が起動サイト表に無い: {}",
+            map.summary()
+        );
+    }
+
+    // ---- (3) fixture: 起動ブロックが行の上限を決める ----
+    // フィクスチャの cuda.rs (起動サイトだけを差し替えて使う)
+    let fake_cuda = |sites: &str| -> String {
+        format!(
+            "const BX: u32 = 16;\n\
+             const BY: u32 = 16;\n\
+             (lib.module_get_function)(&mut f_gemm, module, b\"fake_launch\\0\".as_ptr() as *const c_char),\n\
+             {sites}\n"
+        )
+    };
+    let one_site = |block: &str| -> String {
+        fake_cuda(&format!(
+            "ctx.launch_async(ctx.f_gemm, (1, 1, 1), ({block}), 0, &mut args)?;"
+        ))
+    };
+    // 行 = ty * 8 + u (ty = threadIdx.y, u < UB)。block = (BX, BY, 1)。
+    let fake_cu = |ub: &str| -> String {
+        format!(
+            "#define SP 36\n#define TILE 128\n\
+             extern \"C\" __global__ void fake_launch(const signed char *src) {{\n\
+             \x20   __shared__ signed char sA[TILE][SP];\n\
+             \x20   const int ty = threadIdx.y;\n\
+             \x20   for (int u = 0; u < {ub}; u++) {{\n\
+             \x20       *(int*)&sA[ty * 8 + u][0] = 0;\n\
+             \x20   }}\n}}\n"
+        )
+    };
+    let scan1 = |cu: String, cuda: String| -> Scan {
+        let m = launch_map_from_cuda(&cuda);
+        scan_kernels_launched(&[("fake_launch.cu".to_string(), cu)], &m)
+    };
+
+    // 3-1: 境界ぴったり (15 * 8 + 7 = 127 < 128) は緑。
+    let sc = scan1(fake_cu("8"), one_site("BX, BY, 1"));
+    assert!(
+        sc.bad_casts.is_empty(),
+        "block (16,16,1) + u < 8 の正しいキャストが違反扱いされた (偽陽性): {:?}",
+        sc.bad_casts
+    );
+    assert_eq!(
+        sc.row_bound_launch_checked, 1,
+        "起動ブロックからの行上限判定が走っていない: {sc:?}"
+    );
+    assert!(
+        sc.row_bound_unresolved.is_empty(),
+        "判定できるはずの行が unresolved になった: {:?}",
+        sc.row_bound_unresolved
+    );
+
+    // 3-2: block の y を 17 にすると 16 * 8 + 7 = 135 >= 128 で違反。
+    //      (行式とループはそのまま = block 形状だけが根拠であることの証明)
+    let sc = scan1(fake_cu("8"), one_site("BX, 17, 1"));
+    assert_eq!(
+        sc.row_bound_launch_checked, 1,
+        "block を変えたときに判定が走っていない: {sc:?}"
+    );
+    assert!(
+        sc.bad_casts
+            .iter()
+            .any(|(_, _, t)| t.contains("最大 135") && t.contains("宣言 128 行")),
+        "block (16,17,1) で行の最大 135 が宣言 128 行を越えることを検出できない \
+         (起動ブロックを上限に使えていない): {:?}",
+        sc.bad_casts
+    );
+
+    // 3-3: ループ上限を 9 にすると 15 * 8 + 8 = 128 >= 128 で違反。
+    let sc = scan1(fake_cu("9"), one_site("BX, BY, 1"));
+    assert!(
+        sc.bad_casts
+            .iter()
+            .any(|(_, _, t)| t.contains("最大 128") && t.contains("宣言 128 行")),
+        "u < 9 の行 128 が宣言 128 行を越えることを検出できない: {:?}",
+        sc.bad_casts
+    );
+
+    // 3-4: 起動サイトの block が食い違うと unresolved (緑にしない)。
+    let sc = scan1(
+        fake_cu("8"),
+        fake_cuda(
+            "ctx.launch_async(ctx.f_gemm, (1, 1, 1), (BX, BY, 1), 0, &mut args)?;\n\
+             ctx.launch_async(ctx.f_gemm, (1, 1, 1), (BX, 4, 1), 0, &mut args)?;",
+        ),
+    );
+    assert_eq!(
+        sc.row_bound_launch_checked, 0,
+        "起動サイトが食い違うのに判定してしまった: {sc:?}"
+    );
+    assert_eq!(
+        sc.symbolic_ok, 0,
+        "起動サイトが食い違うのに緑と判定した (unresolved のはず): {sc:?}"
+    );
+    assert!(
+        sc.row_bound_unresolved
+            .iter()
+            .any(|(_, _, t)| t.contains("不一致")),
+        "起動サイトの不一致が理由として残っていない: {:?}",
+        sc.row_bound_unresolved
+    );
+
+    // 3-5: block の次元が変数なら unresolved (推測しない)。
+    let sc = scan1(fake_cu("8"), one_site("thr, 1, 1"));
+    assert_eq!(sc.row_bound_launch_checked, 0, "{sc:?}");
+    assert_eq!(sc.symbolic_ok, 0, "変数 block なのに緑と判定した: {sc:?}");
+    assert!(
+        sc.row_bound_unresolved
+            .iter()
+            .any(|(_, _, t)| t.contains("静的に解決できない")),
+        "変数 block の unresolved 理由が残っていない: {:?}",
+        sc.row_bound_unresolved
+    );
+
+    // ---- (4) fixture: 囲みの if を上限に使う (実カーネルの `if (tid < GEMM_TILE)`) ----
+    // 行 = tid = threadIdx.y * 16 + threadIdx.x は block (16,16,1) で 0..255。
+    // `if (tid < TILE)` の中なら 0..127 で緑、外なら違反、`else` 側も違反。
+    let tid_cu = |guard: &str| -> String {
+        format!(
+            "#define SP 36\n#define TILE 128\n\
+             extern \"C\" __global__ void fake_launch(const signed char *src) {{\n\
+             \x20   __shared__ signed char sA[TILE][SP];\n\
+             \x20   const int tid = threadIdx.y * 16 + threadIdx.x;\n\
+             {guard}\n}}\n"
+        )
+    };
+    let cast = "    *(int*)&sA[tid][0] = 0;";
+    let guarded = format!("    if (tid < TILE) {{\n{cast}\n    }}");
+    let sc = scan1(tid_cu(&guarded), one_site("BX, BY, 1"));
+    assert!(
+        sc.bad_casts.is_empty(),
+        "`if (tid < TILE)` で囲まれた正しいキャストが違反扱いされた: {:?}",
+        sc.bad_casts
+    );
+    assert_eq!(
+        sc.row_bound_launch_checked, 1,
+        "ガード付きの行上限判定が走っていない: {sc:?}"
+    );
+    // ガードを外すと 255 >= 128 で違反 (ガードが効いている証拠)
+    let unguarded = format!("{cast}");
+    let sc = scan1(tid_cu(&unguarded), one_site("BX, BY, 1"));
+    assert!(
+        sc.bad_casts
+            .iter()
+            .any(|(_, _, t)| t.contains("最大 255")),
+        "ガードの無い tid (最大 255) が宣言 128 行を越えることを検出できない: {:?}",
+        sc.bad_casts
+    );
+    // `else` 側は否定条件を上限に使わない (tid >= 128 なので違反)
+    let else_side = format!("    if (tid < TILE) {{\n        src[0] = 0;\n    }} else {{\n{cast}\n    }}");
+    let sc = scan1(tid_cu(&else_side), one_site("BX, BY, 1"));
+    assert!(
+        sc.bad_casts
+            .iter()
+            .any(|(_, _, t)| t.contains("最大 255")),
+        "`else` 側でガードを使ってしまっている (否定条件を上限にすると unsound): {:?}",
+        sc.bad_casts
+    );
+
+    // ---- (5) 空回り防止: 表が空 / 分類したカーネルが表に無い → panic ----
+    let empty = LaunchMap::default();
+    let err = std::panic::catch_unwind(|| {
+        let s = kernel_sources();
+        scan_kernels_launched(&s, &empty)
+    })
+    .unwrap_err();
+    let msg = err
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert!(
+        msg.contains("起動サイト表が空"),
+        "起動サイト表が空でも走査が通ってしまう: {msg}"
+    );
+
+    // 表に無いカーネルを分類したら panic (カーネル名の対応が切れた事故)。
+    // 起動サイト表には別名のカーネル (`other_kernel`) だけを載せる。
+    let other = launch_map_from_cuda(
+        &fake_cuda(
+            "ctx.launch_async(ctx.f_gemm, (1, 1, 1), (BX, BY, 1), 0, &mut args)?;",
+        )
+        .replace("fake_launch", "other_kernel"),
+    );
+    assert!(
+        other.sites.contains_key("other_kernel") && !other.sites.contains_key("fake_launch"),
+        "表の差し替えに失敗した: {}",
+        other.summary()
+    );
+    let err = std::panic::catch_unwind(|| {
+        scan_kernels_launched(
+            &[("fake_launch.cu".to_string(), fake_cu("8"))],
+            &other,
+        )
+    })
+    .unwrap_err();
+    let msg = err
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert!(
+        msg.contains("起動サイト表に無い"),
+        "表に無いカーネルを分類しても落ちない: {msg}"
+    );
+}
+
 /// s100 (P3-3) 既知の潜在不具合 (未修正・このテストでは固定しない): `dno_attention`
 /// (decode 用) の block 間 reduction が共有メモリ `dh` floats に対して
 /// `sh[threadIdx.x + off]` を `threadIdx.x < off` で読むため、block = dh では

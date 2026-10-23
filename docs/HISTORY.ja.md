@@ -3604,3 +3604,51 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
   `--test kernel_invariants` = **16 passed / 0 failed** (既存 15 + 新規 1)。
 - **測っていないこと**: GPU 実行・アンカー・ms/token (GPU 非搭載)。`.cu` の新規違反は
   検出なし (`KNOWN_BAD_4B_CASTS` は空のまま)。作業レポートは未 commit (`REPORT_P34.md`)。
+
+
+### s178: Task P36 - P3-3 走査器がホスト起動ブロック形状を取り込む (2026-10-23) 完了
+
+- **実装**: なし (テストのみ)。P3-3 smem キャスト走査器の最後の記録済み限界 (P34 の項を参照) を
+  閉じた。記号行の上限を **cuda.rs の起動ブロック** から取る。`.cu` / `.ptx` / 製品コード /
+  `cuda.rs` の変更なし。
+- **起動サイト表**: `launch_map_from_cuda` がコメントと文字列リテラルを潰し (行数・行番号は
+  不変)、`module_get_function)(&mut f_xxx, .., b"dno_yyy\0")` からフィールド→カーネル名の
+  対応を作り、全 `.launch_async(..)` 呼び出しを `カーネル名 -> [(cuda.rs 行, (block.x,
+  block.y, block.z))]` に落とす。定数は `const NAME: u32|usize|i32|i64 = EXPR;` を `as` cast
+  抜きで評価して解決する。現行ツリーの結果: 61 呼び出し・18 カーネル・10 件がカーネル名に
+  解決できない (`f` / `f_c` / `func` のような関数ポインタ変数と、`fns.f_gate` /
+  `fns.f_qknorm_rope` = module_get_function の対応表に無いフィールド)。
+- **sound な規則**: 全起動サイトが完全に静的な block で一致したときだけ `Resolved`。記号次元
+  (`(dh as u32, 1, 1)`)・サイト間の不一致 (`dno_matvec_rows_bt_i8`: cuda.rs:952 の 256 と
+  4980 の 128)・サイト無しは `Unresolved`。行が記号のキャストは `symbolic_row_bound` が行式を
+  区間演算で評価する (`threadIdx.[xyz]` は 0..block-1、`blockDim.[xyz]`、`#define` 定数、
+  証明済みループ上限 `for (int u = 0; u < 8; u++)`、囲みの `if (X < N)` ガード)。判定は
+  `max(行式) < 宣言行数`。**違反として報告するのは `max` が到達可能と言えるときだけ**
+  (線形式・同一識別子の重複なし・宣言が 1 つ)。それ以外は理由付きで `row_bound_unresolved`
+  に積み、緑にしない。`blockIdx.*` は上限を主張しない (grid は読んでいない)。
+- **副次的に発見した走査器の欠陥 2 件** (修正済み・既存の assert は不変): (1) smem 名表が
+  **ファイル単位**だったため `dno_gemm_q4_0` の `sA[64][32]` が `dno_gemm_i8` の
+  `sA[128][36]` を上書きし、行数が 64 に見えていた → カーネル本体ごとの表にした。
+  (2) 列の錨をファイル全体で解いていたため、別カーネルの `for (int c = 0; c < C; c++)` が
+  `const int c = x * 4;` の錨を 1 に化けさせていた → `col_anchor` / `local_anchor` の探索を
+  カーネル本体に限定し、ローカル束縛は **キャスト行より前で最後の宣言** を使う (C のスコープ)。
+- **実カーネルの結果**: `row_bound_checked == 0` (数値行) は不変で、`kernels_int8.cu` の 6 件が
+  起動ブロックから決まるようになった — `sA[tid][..]` と `sA[tid][x*4]` は囲みの
+  `if (tid < GEMM_TILE)` で 0..127 < 128、`sB[r][..]` は 0..255 < 256、
+  `sA[ty * 8 + u][..]` は 0..127 < 128、`sB[t * GEMM_TILE + tx * 8 + v][..]` は 0..255 < 256。
+  件数: 9 casts / 9 symbolic-ok / **起動ブロックからの行上限 6 件 / 判定不能 0 / 違反 0**。
+  `dno_attention_prefill` の float2 3 件は列のみの判定のまま (動的 smem・block は `dh`)。
+- **自己検証**: 新規テスト 1 本 (17 本目) が表 (61 呼び出し / 18 カーネル / `dno_gemm_i8` は
+  10 サイトで (16,16,1)) と 6 件の判定を固定し、壊した fixture が必ず報告されることを assert
+  する: block.y = 17 → 最大 135 >= 128、`u < 9` → 最大 128、起動サイトの不一致 → unresolved
+  (緑にしない)、変数 block → unresolved、`if (tid < TILE)` ガード無し → 最大 255、`else` 側は
+  否定条件を上限に使わない。空の表と、表に無いカーネルの分類は panic する。
+- **変異チェック**: 起動ブロックの代わりにハード上限 1024 を使うと P34 が予告した偽陽性が再現
+  する (`ty * 8 + u` 最大 8191・`r` 最大 17391)。ガードを外すと `tid` 最大 255。サイト不一致を
+  許すと fixture が緑になる。ファイル単位の smem 表に戻すと実カーネルが違反として報告される。
+  4 つともテストが落ちる。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (基準と同一)、
+  `--test kernel_invariants` = **17 passed / 0 failed** (既存 16 + 新規 1)。
+- **測っていないこと**: GPU 実行・アンカー・ms/token (GPU 非搭載)。`.cu` の新規違反は検出なし
+  (`KNOWN_BAD_4B_CASTS` は空のまま)。作業レポートは未 commit (`REPORT_P36.md`)。
