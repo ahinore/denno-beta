@@ -12242,6 +12242,9 @@ pub fn pf_timing_read() {
     // s240 (P43): GDN chunked 3 カーネルの積算行。ここは prefill 末尾 (= 最終行の
     // 既存 D2H の後) なので、読むのは static だけで同期は足さない。
     // `DENNO_GDN_KPROF` 未設定なら分岐 1 回で戻る。
+    // s245 (P45): デバイス出力経路で保留したままの 3 区間をここで読む (直前の既存
+    // D2H で 3 pass は完了している)。同期は足さない・読むだけ。
+    kprof_read_pending();
     gdn_kprof_report_at_prefill_end();
     if !pf_timing_on() {
         return;
@@ -13558,11 +13561,46 @@ impl KprofCall {
     }
 }
 
+// s245 (P45): 3 pass 後の `ctx.sync()` をデバイス出力経路から外したため、区間の
+// 読み出しを「次の既存の同期」まで遅らせる。その置き場 (スレッドごと)。
+//
+// `KprofCall` はイベントプールの排他 (`MutexGuard`) を握っているので保留中も
+// そのまま保持する — 途中で手放すと他スレッドが同じ 4 本を上書きして区間が壊れる。
+// 読むのは必ず「既存の同期が済んだ後」(次の層の `kprof_begin` / prefill 末尾の
+// `pf_timing_read`) だけで、そこでも未完了なら `finish` が miss に数える (P43)。
+thread_local! {
+    static KPROF_PENDING: std::cell::RefCell<Option<KprofCall>> =
+        std::cell::RefCell::new(None);
+}
+
+/// 1 call 分の区間を「次の既存の同期」まで保留する (P45)。
+fn kprof_defer(k: KprofCall) {
+    // 前の call が残っていれば先に読む (取りこぼさない)。通常は `kprof_begin` が
+    // 読んでいるのでここは空。
+    kprof_read_pending();
+    KPROF_PENDING.with(|c| *c.borrow_mut() = Some(k));
+}
+
+/// 保留した区間を今の時点で読む (**既存の同期が済んだ後**でのみ呼ぶ)。
+/// 同期・launch・イベント生成はしない (読むだけ)。env OFF なら分岐 1 回で戻る。
+fn kprof_read_pending() {
+    if !gdn_kprof_on() {
+        return;
+    }
+    let k = KPROF_PENDING.with(|c| c.borrow_mut().take());
+    if let Some(k) = k {
+        k.finish();
+    }
+}
+
 /// 計測を開く。`DENNO_GDN_KPROF` 未設定なら分岐 1 回で None (イベントも作らない)。
 fn kprof_begin() -> Option<KprofCall> {
     if !gdn_kprof_on() {
         return None;
     }
+    // s245 (P45): 前の層で保留した区間をここで読む (この時点では次の層の h2 join /
+    // 同期 D2H が済んでいる)。読めなければ miss。
+    kprof_read_pending();
     let Some(ev) = kprof_events() else {
         // env ON なのにイベントを作れない = 計測不能。黙って 0 行にせず miss に
         // 数える (表示行に miss=<n> が出るので「静かに no-op」にならない)。
@@ -13630,6 +13668,21 @@ mod kprof_tests {
         assert!(!gdn_kprof_on());
         assert!(kprof_begin().is_none(), "OFF ではイベントを作らない");
         assert!(gdn_kprof_line().is_none(), "OFF では行を出さない");
+    }
+
+    /// s245 (P45): 保留読みは env OFF で完全な no-op (本番経路に CUDA 呼び出しを
+    /// 足さない)。
+    #[test]
+    fn kprof_read_pending_is_noop_when_off() {
+        let _g = crate::prof::counters_guard();
+        let _f = Force::set(Some(false));
+        reset_acc();
+        kprof_read_pending();
+        assert_eq!(
+            (kprof_acc().calls, kprof_acc().miss),
+            (0, 0),
+            "OFF なのに保留読みが積算 / miss を動かした"
+        );
     }
 
     /// ON のとき、積算がカーネル別に初期化され、表示行が仕様どおりになること。
@@ -13742,15 +13795,15 @@ mod kprof_tests {
 /// s173 (P15): **pass 間でホストを止めない**。3 pass はすべて既定ストリームへ
 /// 発行するので、pass 2 が pass 1 の W/M を読み、pass 3 が pass 2 の Sinit を
 /// 読む順序はストリームが保証する (同一ストリーム上の発行は FIFO 実行)。
-/// したがって同期点は「ホストが結果を読む 1 点」だけにした:
-/// - デバイス出力 (`y_dst = Some`・prefill 残差常駐) でも 1 回残す — この 1 回は
-///   数値のためではなく、`DENNO_PROFILE` の細分 (`D2H_GDN_PF_*`) が 3 pass の
-///   実行時間を「sync」として写し続けるため (表示専用の区間が 0 になると
-///   scan がタダに見える)。
-/// - ホスト出力 (`y_dst = None`) は `to_vec` の `cuMemcpyDtoH` (同期) が同じ
-///   待ちを含むが、細分の意味を揃えるため同じ 1 回を通す。
-/// 1 層あたり: launch 3 (不変) / 同期 1 (従来 3)。カーネル・引数・grid・chunk
-/// 分割・発行順は 1 つも変えないので出力ビットは不変。
+/// s245 (P45): 同期点は「ホストが結果を読む経路」だけにした:
+/// - デバイス出力 (`y_dst = Some`・prefill 残差常駐): **待たない**。y は後続の
+///   o_proj が同じストリームで読み、状態の D2D 書き戻しも同じストリームなので
+///   FIFO で足りる。従来の 1 回は「3 pass の実行時間を `DENNO_PROFILE` の
+///   `gdn_pf_sync` に写す」ためだけに残していた (表示専用) — P45 で外した。
+/// - ホスト出力 (`y_dst = None`) は `to_vec` の `cuMemcpyDtoH` (同期) で y を
+///   読むので、その手前で 1 回待つ (従来どおり)。
+/// 1 層あたり: launch 3 (不変) / 同期 0 (デバイス出力) または 1 (ホスト出力)。
+/// カーネル・引数・grid・chunk 分割・発行順は 1 つも変えないので出力ビットは不変。
 #[allow(clippy::too_many_arguments)]
 fn gdn_scan_chunked_impl(
     ctx: &CudaCtx,
@@ -13982,9 +14035,27 @@ fn gdn_scan_chunked_impl(
         )?;
     }
     kprof_mark(&mut kp, 3);
-    // s173 (P15): 3 pass を発行し終えてから 1 回だけ待つ (この時点で GPU 上には
-    // pass 1/2/3 がこの順で並んでおり、待ちは「3 つ全部の完了」= 従来の 3 回の
-    // 待ちと同じ完了点。違うのはホストが pass 間で止まらないことだけ)。
+    // s245 (P45): y をデバイスに残す経路 (`y_dst = Some` = prefill 残差常駐) では
+    // **ホストが結果を読まない**ので待たない。3 pass は同一ストリームへ発行順に並び、
+    // pass 3 が書いた y を後続の o_proj が同じストリームで読み、状態の D2D 書き戻しと
+    // 次の層の beta/alpha H2D (cuMemcpyHtoD = ホスト同期コピー) も同じストリームなので、
+    // バッファ再利用の順序もストリームが保証する (s173/P15 で pass 間の 2 回を外したのと
+    // 同じ根拠)。数値経路・発行順は 1 つも変えない。
+    if y_dst.is_some() {
+        // s72: y はデバイス上に残す (呼び出し側がチェーンで消費する)。
+        // s131: 状態もデバイス正本へ D2D で戻す (ホストへは落とさない)。
+        q.end();
+        // s245 (P45): 3 区間の読み出しは次の既存の同期 (次の層の kprof_begin /
+        // prefill 末尾の pf_timing_read) へ回す。そこで未完了なら finish が miss に
+        // 数える (P43 の規則) — 計測のために同期を足さない。
+        if let Some(k) = kp.take() {
+            kprof_defer(k);
+        }
+        gdn_state_commit(li, dp.conv_out, dp.ssm_out, conv_dim * cs, nv, dk * dv)?;
+        return Ok(Vec::new());
+    }
+    // ホスト出力 (`y_dst = None`) は y を `to_vec` (同期 D2H) で読むので 1 回待つ。
+    // この 1 回は数値のため (従来どおり) で、細分の意味も変えない。
     q.lap(crate::prof::D2H_GDN_PF_SYNC);
     ctx.sync()?;
     q.lap(crate::prof::D2H_GDN_PF_D2H);
@@ -13993,14 +14064,6 @@ fn gdn_scan_chunked_impl(
     // 既存の `gdn_pf_sync` の数字に混ぜないため (d2h は表示専用の細分)。
     if let Some(k) = kp.take() {
         k.finish();
-    }
-
-    if y_dst.is_some() {
-        // s72: y はデバイス上に残す (呼び出し側がチェーンで消費する)。
-        // s131: 状態もデバイス正本へ D2D で戻す (ホストへは落とさない)。
-        gdn_state_commit(li, dp.conv_out, dp.ssm_out, conv_dim * cs, nv, dk * dv)?;
-        q.end();
-        return Ok(Vec::new());
     }
     let y = GDN_SCRATCH.with(|cell| -> Result<Vec<f32>> {
         let s = cell.borrow();
