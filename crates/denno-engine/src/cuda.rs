@@ -3835,9 +3835,9 @@ fn q4_dispatch_tile(
                 &mut nc as *mut _ as *mut c_void,
             ];
             if use_gemm {
-                // Q4_GM=64 (m 方向) / Q4_GN=128 (n 方向)・block (16,16)
+                // Q4_GM=64 (m 方向) / Q4_GN=128 (n 方向)・block (16,8)
                 let grid = (m.div_ceil(64) as u32, n.div_ceil(128) as u32, 1);
-                ctx.launch_async(ctx.f_gemm_q4, grid, (16, 16, 1), 0, &mut args)?;
+                ctx.launch_async(ctx.f_gemm_q4, grid, (16, 8, 1), 0, &mut args)?;
             } else if let Some(fc) = ctx.f_mv_q4_c {
                 // s133 (Task B1, attempt 2): 1 block = 8 warp x C 列 = 8*C 列、
                 // 1 行。1 warp が A の 32 値 (ブロック b) をレジスタに 1 回だけ
@@ -5731,7 +5731,7 @@ fn chain_gemm_q4_pf(
             &mut nc as *mut _ as *mut c_void,
         ];
         let grid = (m.div_ceil(64) as u32, n.div_ceil(128) as u32, 1);
-        ok(ctx.launch_async(ctx.f_gemm_q4, grid, (16, 16, 1), 0, &mut args))
+        ok(ctx.launch_async(ctx.f_gemm_q4, grid, (16, 8, 1), 0, &mut args))
     }
 }
 
