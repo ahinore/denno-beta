@@ -3625,3 +3625,29 @@ External implementations referenced in P19 and their licensing status (the same 
   `cargo build --release -p denno-cli --features denno-engine/cuda` succeeds.
 - **Not measured**: GPU execution, the anchors, ms/token, nsys and 8095 (no GPU in this container);
   the work report is uncommitted (`REPORT_P17B.md`). No `.cu` / `.ptx` changes.
+
+### s176: Task P31 - static invariant suite extended to the prefill chain kernels (2026-10-23) done
+
+- **Implementation**: none (tests only). Four static invariant tests were added to
+  `crates/denno-engine/tests/kernel_invariants.rs` covering `chain_mlp_prefill_q4` /
+  `chain_gdn_prefill_q4` / the device-resident residual stream (`CH_PF_RES`) / the PF phase
+  markers (2312 -> 3251 lines, 939 insertions, 95 assert call sites). No `.cu` / `.ptx` /
+  product code changes; 8095 untouched.
+- **Mistakes caught**: (a) `Q4_M_TILE` drifting from `Q4_GM`, sizing the intermediate buffers
+  for the whole prompt (m) instead of one tile (2.7 GiB at 13k rows), dropping the tail-merge
+  term from `cap`; (b) swapped launch arguments between the chain and the per-op path
+  (nib/sc, dk/dv) and one-sided block/grid changes; (c) reading the residual before writing
+  it, dropping `Some(CH_O)` (the o_proj residual add), returning the wrong slot to the next
+  layer, moving a precondition after the residual update (double add); (d) duplicate / missing
+  / reordered phase markers.
+- **Premise corrected**: the three FFN phases are pushed once per 1024-row tile, not once per
+  layer (as `pf_record`'s own doc says). The test pins "one push site", "FFN markers inside the
+  tile loop", "GDN markers outside it" and "the per-layer phase sequence is strictly increasing
+  in id" instead.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` = **321 passed /
+  0 failed / 37 ignored** (identical to the baseline) and
+  `cargo test --release -p denno-engine --features cuda --test kernel_invariants` =
+  **15 passed / 0 failed** (11 existing + 4 new). All 11 mutation checks (temporarily breaking
+  cuda.rs / qwen35.rs and restoring) were caught by the new tests.
+- **Not measured**: GPU execution, the anchors, ms/token (no GPU in this container). The work
+  report is uncommitted (`REPORT_P31.md`).
