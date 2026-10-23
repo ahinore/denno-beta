@@ -3949,3 +3949,146 @@ External implementations referenced in P19 and their licensing status (the same 
   row restore costs 1.95 us/row measured on CPU (resident blocks, no pread), i.e. below the
   3.09 us used for the prediction, so the prediction is the conservative bound. Anchor md5s
   were not re-taken.
+
+### s178: Task P36 - the P3-3 scanner imports the host launch block shape (2026-10-23) done
+
+- **Implementation**: none (tests only). The last recorded limit of the P3-3 shared-memory cast
+  scanner (see the P34 entry) is closed: symbolic rows now get a bound from the **host launch
+  block** in `src/cuda.rs`. No `.cu` / `.ptx` / product code / `cuda.rs` changes.
+- **Launch-site map**: `launch_map_from_cuda` masks comments/string literals (length-preserving,
+  line-preserving), pairs `module_get_function)(&mut f_xxx, .., b"dno_yyy\0")` into a
+  field -> kernel-name map, and parses every `.launch_async(..)` call site into
+  `kernel -> [(cuda.rs line, (block.x, block.y, block.z))]`. Constants are resolved through
+  `const NAME: u32|usize|i32|i64 = EXPR;` (with `as` casts stripped). Result on the current tree:
+  61 call sites, 18 kernels, 10 call sites that cannot be resolved to a kernel name (bare
+  function pointers such as `f`, `f_c`, `func`, and `fns.f_gate` / `fns.f_qknorm_rope`, whose
+  fields are not in the module_get_function map).
+- **Sound rule**: a kernel's shape is `Resolved` only when every launch site agrees on a fully
+  static block; a symbolic dimension (`(dh as u32, 1, 1)`), disagreeing sites
+  (`dno_matvec_rows_bt_i8`: 256 vs 128 at cuda.rs:952/4980) or a missing site makes the kernel
+  `Unresolved`. For a cast whose row is symbolic, `symbolic_row_bound` evaluates the row
+  expression with interval arithmetic over `threadIdx.[xyz]` (0 .. block-1), `blockDim.[xyz]`,
+  `#define` constants, proven loop bounds (`for (int u = 0; u < 8; u++)`) and enclosing
+  `if (X < N)` guards, and requires `max(row) < declared rows`. The site is only reported as a
+  violation when `max` is reachable (affine expression, no repeated identifier, single
+  declaration); otherwise it lands in `row_bound_unresolved` with a reason and is **not** green.
+  `blockIdx.*` is never bounded (the grid is not read).
+- **Two scanner defects found while doing this** (fixed, existing assertions kept): (1) the smem
+  name table was built per **file**, so `dno_gemm_q4_0`'s `sA[64][32]` overwrote `dno_gemm_i8`'s
+  `sA[128][36]` and the row count looked like 64; tables are now per kernel body. (2) The column
+  anchors were resolved against the whole file, so another kernel's `for (int c = 0; c < C; c++)`
+  turned the anchor of `const int c = x * 4;` into 1; `col_anchor`/`local_anchor` now search the
+  kernel body, and local bindings use the **last declaration before the cast** (C scoping).
+- **Result on the real kernels**: `row_bound_checked == 0` (numeric rows) is unchanged, and the 6
+  `kernels_int8.cu` casts are now decided from the launch block: `sA[tid][..]` and
+  `sA[tid][x*4]` via the enclosing `if (tid < GEMM_TILE)` (0..127 < 128), `sB[r][..]` (0..255 <
+  256), `sA[ty * 8 + u][..]` (0..127 < 128), `sB[t * GEMM_TILE + tx * 8 + v][..]` (0..255 < 256).
+  Counts: 9 casts / 9 symbolic-ok / **6 row bounds from the launch block / 0 undecided / 0 bad**.
+  `dno_attention_prefill`'s three float2 casts stay column-only (dynamic smem, block `dh`).
+- **Self-check**: one new test (the 17th) fixes the map (61 calls / 18 kernels / `dno_gemm_i8` =
+  (16,16,1) at 10 sites), the 6 decided rows, and asserts that a deliberately broken fixture is
+  reported: block.y = 17 -> max 135 >= 128, `u < 9` -> max 128, disagreeing launch sites ->
+  unresolved (not green), a variable block -> unresolved, no `if (tid < TILE)` guard -> max 255,
+  and the `else` branch does not use the negated guard. An empty map and a classified kernel that
+  is missing from the map both panic.
+- **Mutation checks**: using the hardware limit 1024 instead of the launch block reproduces the
+  false positive P34 predicted (`ty * 8 + u` max 8191, `r` max 17391); dropping the guards gives
+  `tid` max 255; tolerating disagreeing sites turns the fixture green; reverting to the file-level
+  smem table reports the real kernels as violations. All four fail the test.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` = **321 passed /
+  0 failed / 37 ignored** (identical to the baseline), `--test kernel_invariants` =
+  **17 passed / 0 failed** (16 existing + 1 new).
+- **Not measured**: GPU execution, anchors, ms/token (no GPU in this container). No `.cu`
+  violation was found (`KNOWN_BAD_4B_CASTS` stays empty). The work report is uncommitted
+  (`REPORT_P36.md`).
+
+
+### s179: Task P39 - the P3-3 scanner imports the host launch grid and decides blockIdx rows (2026-10-23) done
+
+- **Implementation**: none (tests only). Closes the first "residual limit" of P36: a row
+  expression containing `blockIdx.*` never got a bound (the grid argument was not parsed), so
+  such a cast landed in `row_bound_unresolved`. No `.cu` / `.ptx` / product code / `cuda.rs`
+  changes.
+- **Extended launch-site map**: `launch_map_from_cuda` now reads **both** the grid (argument 2)
+  and the block (argument 3) of the same `.launch_async(f, grid, block, shmem, args)` call into
+  `LaunchSite { line, grid, block }`. No new regex family: the same call sites, paren-matched and
+  split at top-level commas. The map itself is unchanged: 61 call sites, 18 kernels, 10 call
+  sites that cannot be resolved to a kernel name. `block_status` / `grid_status` apply the same
+  rule (all sites agree + all three dimensions statically resolved).
+- **Every real kernel's grid is statically unresolvable (18/18)**: `(gmx, gmy, 1)`,
+  `(m as u32, 1, 1)`, `grid`, `(n.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1)`,
+  `(nv as u32, 1, 1)`, ... are variables, kernel arguments or calls. So 0 rows are decided from
+  the grid on today's kernels, and the moment a real cast uses `blockIdx` in its row it becomes
+  unresolved **with a reason naming the grid** (no guessing, no hardware-limit fallback).
+- **Rule**: `max(blockIdx.d) = grid[d] - 1`, `max(threadIdx.d) = block[d] - 1`. A mixed term
+  (`blockIdx.y * BD + threadIdx.y`) is treated as a **sum of independent terms**, so
+  `hi = sum(hi)`: `blockIdx` is the block's index and `threadIdx` is the index inside the block,
+  i.e. different hardware dimensions, so their maxima are simultaneously reachable and the
+  violation can still be claimed (`exact` preserved). **Products** do not get that assumption:
+  variable x variable becomes an endpoint-product over-approximation with `exact = false`, which
+  lands in unresolved rather than a violation. Repeated identifiers keep `exact = false` as before.
+- **Dependency-driven gate**: the grid is required only for row expressions that use `blockIdx`
+  (including dependence through a local binding such as `const int r = blockIdx.y * BD + ...`,
+  detected by a flag set during evaluation). Rows without `blockIdx` are still decided from the
+  block alone when the grid is unresolved - requiring the grid unconditionally would turn the 6
+  green `kernels_int8.cu` casts red. Real-kernel counts are unchanged (9 casts / 9 symbolic-ok /
+  **6** row bounds from the launch block / 0 undecided / 0 bad).
+- **Self-check**: one new test (the 18th) with 9 fixtures: (1) mixed sum at the boundary,
+  grid (1,8,1) + block (1,16,1) -> 127 < 128 green; (2) grid (1,9,1) -> max 143 violation;
+  (3) pure grid term `blockIdx.x * 64 + 63` green at grid (2,1,1) / max 191 at (3,1,1);
+  (4) dynamic grid (`1, gy, 1`) -> unresolved with a reason naming blockIdx and grid;
+  (5) two sites disagreeing on the grid -> unresolved; (6) static grid but variable block ->
+  unresolved; (7) variable x variable product -> interval [0,225] intersects 128 rows so
+  unresolved (not a violation); (8) a `blockIdx`-free row is still decided under a dynamic grid
+  (the dependency gate); (9) 0 resolved grids and the unchanged 6 decided casts on the real tree.
+- **Mutation checks** (5, each fails the test): `blockIdx` always None -> boundary fixture decided
+  0; unresolved grid falling back to the hardware limit 1024 -> false positive max 16383;
+  tolerating grid disagreement -> the disagreement fixture turns green; `hi = grid[d]` (off by
+  one) -> boundary fixture false positive max 143; products marked `exact` -> max 225 reported as
+  a violation.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` = **321 passed /
+  0 failed / 37 ignored** (identical to the baseline), `--test kernel_invariants` =
+  **18 passed / 0 failed** (17 existing + 1 new).
+- **Not measured**: GPU execution, anchors, ms/token (no GPU in this container). No `.cu`
+  violation was found (`KNOWN_BAD_4B_CASTS` stays empty). The work report is uncommitted
+  (`REPORT_P39.md`).
+
+### s180: Task P41 - full_core split by host-side events, and the pinned full_qk D2H design (2026-10-23) done
+
+> The `sl_lay_full_core` bucket lumps "the kernels issued inside the interval + the host lag"
+> into one number, so it cannot say whether the attention body (device) or the host prepare /
+> gate (host) dominates. With `DENNO_FC_KPROF=1` only, events are recorded **at the existing
+> launch / sync positions** to split one full layer into prep / attn / d2h / tail and print a
+> single line at the end of the prefill (default OFF; unset is one branch and creates no
+> events). Making the full_qk D2H pinned is **design only** (`docs/FULL_QK_D2H_PINNED.md`).
+
+- **Intervals (events only, no sync and no transfer added)**: prep = phase FULL_CORE to just
+  before the attn kernel launch (host prepare: QK-Norm/RoPE/KV row writes, the KV mirror H2D,
+  the q pinned H2D) / attn = launch to just after the launch (`dno_attention_prefill` itself;
+  QK scores + softmax + PV are fused into one launch, so **qk and av cannot be separated** -
+  following the instruction's "fall back to 2-3 intervals when the split is not physical" we
+  use attn/d2h instead) / d2h = after the launch to completion of the `cuMemcpyDtoHAsync` in
+  `chain_pf_att_inplace` / tail = D2H done to phase FULL_OPROJ (sigmoid gate + att H2D +
+  o_proj prologue).
+- **Implementation (`cuda.rs` only, +276/-1)**: a `fc_kprof_*` section with its own event pool
+  and its own env. One call each from `pf_phase` / `pf_timing_begin` / `pf_timing_read`, plus
+  around the launch in `chain_attention_prefill` and right after the D2H in
+  `chain_pf_att_inplace`. **Launch order, arguments and sync placement are unchanged**, and
+  `DENNO_PROFILE` / `DENNO_PF_DBG` output is unchanged (separate pool, separate line). Calls
+  without all five marks (e.g. a layer that fell back to CPU attend) are not read as intervals.
+- **Output**: `[FC_KPROF] prep=<ms> attn=<ms> d2h=<ms> tail=<ms> calls=<n> total=<ms> (<ms>/token)`.
+- **Design note conclusion**: HEAD of this tree is 7e9ea37 (P17b's single contiguous pinned
+  D2H) - the exact form that measured 9.78 -> 22.14 s (+772 ms/layer) on hardware and was
+  reverted. So the implementation is "back to 3 copies + pinned destinations + one pool
+  allocated outside the layer loop", with the copy count, the issue order and the GEMMs
+  unchanged. The saving is **-26 ms/request** under s68's measured unit prices (pageable 13.9
+  / pinned 14.3 GB/s) but **-1.08 s/request** when reconstructed from the PF_DBG bucket
+  (6.5 GB/s); the two **do not agree**, so it is settled by a 2-point measurement after the
+  implementation (unverified).
+- **Tests**: `cargo test --features cuda --lib` = **321 passed / 0 failed / 37 ignored**
+  (identical to the baseline), `--test kernel_invariants` = **18 passed / 0 failed**, non-cuda
+  lib = **280 passed / 0 failed / 2 ignored**; the `--features cuda` integration tests are all
+  green.
+- **Not measured**: GPU execution, anchors, ms/token, and the `[FC_KPROF]` output itself (no
+  GPU in this container). `.cu` / `.ptx` untouched. The work report is uncommitted
+  (`REPORT_P41.md`).

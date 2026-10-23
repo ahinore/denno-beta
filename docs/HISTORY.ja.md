@@ -3856,3 +3856,129 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
   0.10 %) は P38 の 3.09 µs/token から**予測**した値で、実機 (8095) では未計測。
   製品経路の 1 行復元は CPU 実測 1.95 µs/row (常駐ブロック・pread 無し) で、
   予測に使った 3.09 µs より小さい = 予測は保守側。アンカー md5 の再取得は未実施。
+
+### s178: Task P36 - P3-3 走査器がホスト起動ブロック形状を取り込む (2026-10-23) 完了
+
+- **実装**: なし (テストのみ)。P3-3 smem キャスト走査器の最後の記録済み限界 (P34 の項を参照) を
+  閉じた。記号行の上限を **cuda.rs の起動ブロック** から取る。`.cu` / `.ptx` / 製品コード /
+  `cuda.rs` の変更なし。
+- **起動サイト表**: `launch_map_from_cuda` がコメントと文字列リテラルを潰し (行数・行番号は
+  不変)、`module_get_function)(&mut f_xxx, .., b"dno_yyy\0")` からフィールド→カーネル名の
+  対応を作り、全 `.launch_async(..)` 呼び出しを `カーネル名 -> [(cuda.rs 行, (block.x,
+  block.y, block.z))]` に落とす。定数は `const NAME: u32|usize|i32|i64 = EXPR;` を `as` cast
+  抜きで評価して解決する。現行ツリーの結果: 61 呼び出し・18 カーネル・10 件がカーネル名に
+  解決できない (`f` / `f_c` / `func` のような関数ポインタ変数と、`fns.f_gate` /
+  `fns.f_qknorm_rope` = module_get_function の対応表に無いフィールド)。
+- **sound な規則**: 全起動サイトが完全に静的な block で一致したときだけ `Resolved`。記号次元
+  (`(dh as u32, 1, 1)`)・サイト間の不一致 (`dno_matvec_rows_bt_i8`: cuda.rs:952 の 256 と
+  4980 の 128)・サイト無しは `Unresolved`。行が記号のキャストは `symbolic_row_bound` が行式を
+  区間演算で評価する (`threadIdx.[xyz]` は 0..block-1、`blockDim.[xyz]`、`#define` 定数、
+  証明済みループ上限 `for (int u = 0; u < 8; u++)`、囲みの `if (X < N)` ガード)。判定は
+  `max(行式) < 宣言行数`。**違反として報告するのは `max` が到達可能と言えるときだけ**
+  (線形式・同一識別子の重複なし・宣言が 1 つ)。それ以外は理由付きで `row_bound_unresolved`
+  に積み、緑にしない。`blockIdx.*` は上限を主張しない (grid は読んでいない)。
+- **副次的に発見した走査器の欠陥 2 件** (修正済み・既存の assert は不変): (1) smem 名表が
+  **ファイル単位**だったため `dno_gemm_q4_0` の `sA[64][32]` が `dno_gemm_i8` の
+  `sA[128][36]` を上書きし、行数が 64 に見えていた → カーネル本体ごとの表にした。
+  (2) 列の錨をファイル全体で解いていたため、別カーネルの `for (int c = 0; c < C; c++)` が
+  `const int c = x * 4;` の錨を 1 に化けさせていた → `col_anchor` / `local_anchor` の探索を
+  カーネル本体に限定し、ローカル束縛は **キャスト行より前で最後の宣言** を使う (C のスコープ)。
+- **実カーネルの結果**: `row_bound_checked == 0` (数値行) は不変で、`kernels_int8.cu` の 6 件が
+  起動ブロックから決まるようになった — `sA[tid][..]` と `sA[tid][x*4]` は囲みの
+  `if (tid < GEMM_TILE)` で 0..127 < 128、`sB[r][..]` は 0..255 < 256、
+  `sA[ty * 8 + u][..]` は 0..127 < 128、`sB[t * GEMM_TILE + tx * 8 + v][..]` は 0..255 < 256。
+  件数: 9 casts / 9 symbolic-ok / **起動ブロックからの行上限 6 件 / 判定不能 0 / 違反 0**。
+  `dno_attention_prefill` の float2 3 件は列のみの判定のまま (動的 smem・block は `dh`)。
+- **自己検証**: 新規テスト 1 本 (17 本目) が表 (61 呼び出し / 18 カーネル / `dno_gemm_i8` は
+  10 サイトで (16,16,1)) と 6 件の判定を固定し、壊した fixture が必ず報告されることを assert
+  する: block.y = 17 → 最大 135 >= 128、`u < 9` → 最大 128、起動サイトの不一致 → unresolved
+  (緑にしない)、変数 block → unresolved、`if (tid < TILE)` ガード無し → 最大 255、`else` 側は
+  否定条件を上限に使わない。空の表と、表に無いカーネルの分類は panic する。
+- **変異チェック**: 起動ブロックの代わりにハード上限 1024 を使うと P34 が予告した偽陽性が再現
+  する (`ty * 8 + u` 最大 8191・`r` 最大 17391)。ガードを外すと `tid` 最大 255。サイト不一致を
+  許すと fixture が緑になる。ファイル単位の smem 表に戻すと実カーネルが違反として報告される。
+  4 つともテストが落ちる。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (基準と同一)、
+  `--test kernel_invariants` = **17 passed / 0 failed** (既存 16 + 新規 1)。
+- **測っていないこと**: GPU 実行・アンカー・ms/token (GPU 非搭載)。`.cu` の新規違反は検出なし
+  (`KNOWN_BAD_4B_CASTS` は空のまま)。作業レポートは未 commit (`REPORT_P36.md`)。
+
+
+### s179: Task P39 - P3-3 走査器がホスト起動 grid を取り込み blockIdx 行を判定する (2026-10-23) 完了
+
+- **実装**: なし (テストのみ)。P36 の「残された限界」の 1 件目 — 「行式の `blockIdx.*` は
+  決して上限を与えない (grid 引数を読んでいない) ので `row_bound_unresolved` に落ちる」—
+  を閉じた。`.cu` / `.ptx` / 製品コード / `cuda.rs` の変更なし。
+- **起動サイト表の拡張**: `launch_map_from_cuda` は同じ `.launch_async(f, grid, block, shmem,
+  args)` 呼び出しから **grid (第 2 引数) と block (第 3 引数)** の両方を読む
+  (`LaunchSite { line, grid, block }`)。新しい正規表現系は足していない。結果は不変で
+  61 呼び出し / 18 カーネル / 10 件がカーネル名に解決できない。
+  `block_status` / `grid_status` は同じ規則 (全サイト一致 + 3 次元とも静的解決) で判定する。
+- **実カーネルの grid は 18/18 が静的解決不能**: `(gmx, gmy, 1)` / `(m as u32, 1, 1)` /
+  `grid` / `(n.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1)` / `(nv as u32, 1, 1)` など、
+  すべて変数・カーネル引数・関数呼び出し。したがって今日の実カーネルで grid から決まる行は
+  0 件で、**blockIdx を使う行が現れた瞬間に「grid が静的に解決できない」という理由付きで
+  unresolved になる** (推測もハード上限へのフォールバックもしない)。
+- **規則**: `max(blockIdx.d) = grid[d] - 1`、`max(threadIdx.d) = block[d] - 1`。
+  混在項 (`blockIdx.y * BD + threadIdx.y`) は **独立項の和** として `hi = Σhi` を採る
+  (blockIdx は block の番号、threadIdx は block 内の番号で別のハードウェア次元なので最大は
+  同時に達成できる → `exact` を保ったまま違反を主張できる)。**積** はこの仮定を置かず、
+  変数同士なら端点積の過大評価 + `exact = false` にして違反ではなく unresolved に落とす。
+  同じ識別子の重複も従来どおり `exact = false`。
+- **依存駆動の門番**: grid を必要とするのは **blockIdx を使う行式だけ** (ローカル束縛
+  `const int r = blockIdx.y * BD + ...` 越しの依存も評価中の印で検出する)。blockIdx を
+  使わない行は grid が未解決でも block だけで判定する — 一律に grid を要求すると今日緑の
+  `kernels_int8.cu` の 6 件が赤になるため。実カーネルの件数は不変
+  (9 casts / 9 symbolic-ok / 起動ブロックからの行上限 **6 件** / 判定不能 0 / 違反 0)。
+- **自己検証**: 新規テスト 1 本 (18 本目)。fixture 9 種 — (1) 混在和の境界
+  grid (1,8,1) + block (1,16,1) → 127 < 128 で緑、(2) grid (1,9,1) → 最大 143 で違反、
+  (3) 純 grid 項 `blockIdx.x * 64 + 63` が grid (2,1,1) で緑 / (3,1,1) で最大 191、
+  (4) 動的 grid (`1, gy, 1`) → unresolved (理由が blockIdx と grid を名指し)、
+  (5) 2 サイトの grid 不一致 → unresolved、(6) grid は決まるが block が変数 → unresolved、
+  (7) 変数同士の積 → 区間 [0,225] が交わるので unresolved (違反ではない)、
+  (8) blockIdx を使わない行は動的 grid でも判定される (依存駆動の門番)、(9) 実カーネルの
+  grid 解決 0 件と 6 件不変。
+- **変異チェック** (5 種・すべてテストが落ちる): blockIdx を常に None にすると境界 fixture が
+  decided 0 になる / grid 未解決をハード上限 1024 に落とすと最大 16383 の偽陽性 /
+  grid の不一致を許すと不一致 fixture が緑 / 上限を `grid[d]` にすると境界 fixture が
+  最大 143 で偽陽性 / 積を `exact` にすると最大 225 を違反として報告する。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (基準と同一)、
+  `--test kernel_invariants` = **18 passed / 0 failed** (既存 17 + 新規 1)。
+- **測っていないこと**: GPU 実行・アンカー・ms/token (GPU 非搭載)。`.cu` の新規違反は検出なし
+  (`KNOWN_BAD_4B_CASTS` は空のまま)。作業レポートは未 commit (`REPORT_P39.md`)。
+
+### s180: Task P41 - full_core 相の内訳をホスト側イベントで切り分け、full_qk の pinned 化を設計した (2026-10-23) 完了
+
+> `sl_lay_full_core` の位相バケットは「区間内に発行したカーネル + ホストの詰まり」を 1 本に
+> まとめているので、attention 本体 (device) とホスト prepare / ゲート (host) のどちらが重いのか
+> 分からない。`DENNO_FC_KPROF=1` のときだけ、**既存の launch / sync の位置**にイベントを打って
+> full 層 1 枚を prep / attn / d2h / tail の 4 区間に割り、prefill 終了時に 1 行で出す
+> (既定 OFF・未設定は分岐 1 回・イベントも作らない)。full_qk の D2H を pinned にする話は
+> **設計のみ** (`docs/FULL_QK_D2H_PINNED.md`)。
+
+- **区間 (イベントのみ・同期も転送も足さない)**: prep = 位相 FULL_CORE → attn カーネルの発行
+  直前 (ホスト prepare の QK-Norm/RoPE/KV 書き込み + KV ミラーの H2D + q の pinned H2D) /
+  attn = 発行直前 → 発行直後 (`dno_attention_prefill` の実行。QK スコア + softmax + PV が
+  1 launch に融合しているので **qk と av には割れない** — 指示書の「物理的に取れなければ
+  2〜3 区間へ落としてよい」に従い、qk/av の代わりに attn/d2h を立てた) / d2h = 発行直後 →
+  `chain_pf_att_inplace` の `cuMemcpyDtoHAsync` 完了 / tail = D2H 完了 → 位相 FULL_OPROJ
+  (sigmoid ゲート + att の H2D + o_proj の prologue)。
+- **実装 (`cuda.rs` のみ・+276/-1)**: `fc_kprof_*` を 1 節追加 (別イベントプール・別 env)。
+  呼び出しは `pf_phase` / `pf_timing_begin` / `pf_timing_read` から 1 行ずつと、
+  `chain_attention_prefill` の launch 前後・`chain_pf_att_inplace` の D2H 直後。
+  **launch の順序・引数・同期の位置は不変**、`DENNO_PROFILE` / `DENNO_PF_DBG` の出力も不変
+  (別プール・別行)。5 点そろわない呼び出し (CPU attend へ落ちた層など) は区間として読まない。
+- **出力**: `[FC_KPROF] prep=<ms> attn=<ms> d2h=<ms> tail=<ms> calls=<n> total=<ms> (<ms>/token)`。
+- **設計メモの結論**: このツリーの HEAD は 7e9ea37 (P17b の 1 発連続 pinned D2H) で、実機で
+  9.78 → 22.14 s (+772 ms/層) を測って revert された形そのもの。したがって実装は
+  「3 発へ戻す + 宛先を pinned + プールは層ループの外で 1 回だけ確保」で、コピー回数・発行順・
+  GEMM は変えない。削減量は s68 の実測単価 (pageable 13.9 / pinned 14.3 GB/s) なら
+  **−26 ms/request**、PF_DBG のバケットから逆算 (6.5 GB/s) なら **−1.08 s/request** で
+  **両立しない** → 実装後に 2 点計測で確定させる (未検証)。
+- **テスト**: `cargo test --features cuda --lib` = **321 passed / 0 failed / 37 ignored**
+  (基準と同一)、`--test kernel_invariants` = **18 passed / 0 failed**、非 cuda lib =
+  **280 passed / 0 failed / 2 ignored**。`--features cuda` の統合テストも全部緑。
+- **測っていないこと**: GPU 実行・アンカー・ms/token・`[FC_KPROF]` の実出力 (GPU 非搭載)。
+  `.cu` / `.ptx` は無変更。作業レポートは未 commit (`REPORT_P41.md`)。
