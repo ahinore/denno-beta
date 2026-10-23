@@ -3652,3 +3652,48 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
   `--test kernel_invariants` = **17 passed / 0 failed** (既存 16 + 新規 1)。
 - **測っていないこと**: GPU 実行・アンカー・ms/token (GPU 非搭載)。`.cu` の新規違反は検出なし
   (`KNOWN_BAD_4B_CASTS` は空のまま)。作業レポートは未 commit (`REPORT_P36.md`)。
+
+
+### s179: Task P39 - P3-3 走査器がホスト起動 grid を取り込み blockIdx 行を判定する (2026-10-23) 完了
+
+- **実装**: なし (テストのみ)。P36 の「残された限界」の 1 件目 — 「行式の `blockIdx.*` は
+  決して上限を与えない (grid 引数を読んでいない) ので `row_bound_unresolved` に落ちる」—
+  を閉じた。`.cu` / `.ptx` / 製品コード / `cuda.rs` の変更なし。
+- **起動サイト表の拡張**: `launch_map_from_cuda` は同じ `.launch_async(f, grid, block, shmem,
+  args)` 呼び出しから **grid (第 2 引数) と block (第 3 引数)** の両方を読む
+  (`LaunchSite { line, grid, block }`)。新しい正規表現系は足していない。結果は不変で
+  61 呼び出し / 18 カーネル / 10 件がカーネル名に解決できない。
+  `block_status` / `grid_status` は同じ規則 (全サイト一致 + 3 次元とも静的解決) で判定する。
+- **実カーネルの grid は 18/18 が静的解決不能**: `(gmx, gmy, 1)` / `(m as u32, 1, 1)` /
+  `grid` / `(n.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1)` / `(nv as u32, 1, 1)` など、
+  すべて変数・カーネル引数・関数呼び出し。したがって今日の実カーネルで grid から決まる行は
+  0 件で、**blockIdx を使う行が現れた瞬間に「grid が静的に解決できない」という理由付きで
+  unresolved になる** (推測もハード上限へのフォールバックもしない)。
+- **規則**: `max(blockIdx.d) = grid[d] - 1`、`max(threadIdx.d) = block[d] - 1`。
+  混在項 (`blockIdx.y * BD + threadIdx.y`) は **独立項の和** として `hi = Σhi` を採る
+  (blockIdx は block の番号、threadIdx は block 内の番号で別のハードウェア次元なので最大は
+  同時に達成できる → `exact` を保ったまま違反を主張できる)。**積** はこの仮定を置かず、
+  変数同士なら端点積の過大評価 + `exact = false` にして違反ではなく unresolved に落とす。
+  同じ識別子の重複も従来どおり `exact = false`。
+- **依存駆動の門番**: grid を必要とするのは **blockIdx を使う行式だけ** (ローカル束縛
+  `const int r = blockIdx.y * BD + ...` 越しの依存も評価中の印で検出する)。blockIdx を
+  使わない行は grid が未解決でも block だけで判定する — 一律に grid を要求すると今日緑の
+  `kernels_int8.cu` の 6 件が赤になるため。実カーネルの件数は不変
+  (9 casts / 9 symbolic-ok / 起動ブロックからの行上限 **6 件** / 判定不能 0 / 違反 0)。
+- **自己検証**: 新規テスト 1 本 (18 本目)。fixture 9 種 — (1) 混在和の境界
+  grid (1,8,1) + block (1,16,1) → 127 < 128 で緑、(2) grid (1,9,1) → 最大 143 で違反、
+  (3) 純 grid 項 `blockIdx.x * 64 + 63` が grid (2,1,1) で緑 / (3,1,1) で最大 191、
+  (4) 動的 grid (`1, gy, 1`) → unresolved (理由が blockIdx と grid を名指し)、
+  (5) 2 サイトの grid 不一致 → unresolved、(6) grid は決まるが block が変数 → unresolved、
+  (7) 変数同士の積 → 区間 [0,225] が交わるので unresolved (違反ではない)、
+  (8) blockIdx を使わない行は動的 grid でも判定される (依存駆動の門番)、(9) 実カーネルの
+  grid 解決 0 件と 6 件不変。
+- **変異チェック** (5 種・すべてテストが落ちる): blockIdx を常に None にすると境界 fixture が
+  decided 0 になる / grid 未解決をハード上限 1024 に落とすと最大 16383 の偽陽性 /
+  grid の不一致を許すと不一致 fixture が緑 / 上限を `grid[d]` にすると境界 fixture が
+  最大 143 で偽陽性 / 積を `exact` にすると最大 225 を違反として報告する。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (基準と同一)、
+  `--test kernel_invariants` = **18 passed / 0 failed** (既存 17 + 新規 1)。
+- **測っていないこと**: GPU 実行・アンカー・ms/token (GPU 非搭載)。`.cu` の新規違反は検出なし
+  (`KNOWN_BAD_4B_CASTS` は空のまま)。作業レポートは未 commit (`REPORT_P39.md`)。

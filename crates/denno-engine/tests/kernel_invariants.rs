@@ -16,6 +16,7 @@
 //!    参照はできないが、ミラーの食い違いを検出したい相手はまさにその定数なので
 //!    ソース文字列を読む (定数名を変えたらこのテストが「見つからない」で落ちる)。
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -2491,8 +2492,18 @@ fn mask_literals(src: &str) -> String {
             }
             _ => {
                 if c == '\\' {
-                    it.next();
-                    out.push(' ');
+                    // エスケープ。**改行継続 (`"..\<改行>.."`) は行を落とさない**:
+                    // 空白に潰すとそれ以降の行番号が 1 ずれ、起動サイトの行番号と
+                    // 囲みガード・カーネル範囲の対応が崩れる (s179/P39 で発覚。
+                    // cuda.rs:12166 の `"[PF_DBG] ... | \\` が原因で、それ以降の
+                    // サイトが 1 行手前に報告されていた)。
+                    if it.peek() == Some(&'\n') {
+                        it.next();
+                        out.push('\n');
+                    } else {
+                        it.next();
+                        out.push(' ');
+                    }
                 } else if c == '"' {
                     state = 0;
                     out.push(c);
@@ -2681,26 +2692,39 @@ fn kernel_fn_map(src: &str) -> HashMap<String, String> {
     out
 }
 
-/// 1 つの起動サイトの block 形状。3 次元すべてが定数に解決できたものだけ `Nums`。
+/// 1 つの起動サイトの次元 (block / grid 共通)。3 次元すべてが定数に解決できた
+/// ものだけ `Nums`。s179 (P39) で block 専用から grid にも使うようになった。
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BlockShape {
+enum DimShape {
     Nums([i64; 3]),
-    /// 解決できなかった block 式 (そのままのテキスト)
+    /// 解決できなかった式 (そのままのテキスト)
     Sym(String),
 }
 
-/// カーネル 1 本ぶんの block 形状の判定結果。
+/// カーネル 1 本ぶんの次元の判定結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ShapeStatus {
     Resolved([i64; 3]),
     Unresolved(String),
 }
 
+/// cuda.rs の 1 起動サイト。s179 (P39) で grid を追加した
+/// (`launch_async(f, grid, block, shmem, args)` の第 2/第 3 引数)。
+#[derive(Debug, Clone)]
+struct LaunchSite {
+    /// cuda.rs の行番号
+    line: usize,
+    /// 第 2 引数 = grid
+    grid: DimShape,
+    /// 第 3 引数 = block
+    block: DimShape,
+}
+
 /// cuda.rs から読んだ「カーネル名 -> 起動サイト」の表。
 #[derive(Debug, Default)]
 struct LaunchMap {
-    /// カーネル名 -> (cuda.rs の行番号, block 形状)
-    sites: HashMap<String, Vec<(usize, BlockShape)>>,
+    /// カーネル名 -> 起動サイト (行番号・grid・block)
+    sites: HashMap<String, Vec<LaunchSite>>,
     /// カーネル名に解決できなかった起動サイト (行番号, 理由)
     unresolved_sites: Vec<(usize, String)>,
     /// `.launch_async(` の出現数 (空回り防止の下限に使う)
@@ -2709,28 +2733,41 @@ struct LaunchMap {
 
 impl LaunchMap {
     /// カーネルの block 形状。全起動サイトが一致して静的解決できたときだけ Resolved。
-    fn status(&self, kernel: &str) -> ShapeStatus {
+    fn block_status(&self, kernel: &str) -> ShapeStatus {
+        self.dim_status(kernel, "block", |s| &s.block)
+    }
+
+    /// カーネルの grid 形状 (s179/P39)。規則は block と同一 (全サイト一致 +
+    /// 静的解決)。1 つでも変数・マクロ・計算式・関数ポインタ越しなら Unresolved。
+    fn grid_status(&self, kernel: &str) -> ShapeStatus {
+        self.dim_status(kernel, "grid", |s| &s.grid)
+    }
+
+    fn dim_status(&self, kernel: &str, what: &str, pick: fn(&LaunchSite) -> &DimShape) -> ShapeStatus {
         let Some(sites) = self.sites.get(kernel) else {
-            return ShapeStatus::Unresolved("cuda.rs に起動サイトが見つからない".to_string());
+            return ShapeStatus::Unresolved(format!(
+                "cuda.rs に起動サイトが見つからない ({what} を引けない)"
+            ));
         };
         let mut first: Option<([i64; 3], usize)> = None;
-        for (line, sh) in sites {
-            let dims = match sh {
-                BlockShape::Nums(d) => *d,
-                BlockShape::Sym(t) => {
+        for site in sites {
+            let dims = match pick(site) {
+                DimShape::Nums(d) => *d,
+                DimShape::Sym(t) => {
                     return ShapeStatus::Unresolved(format!(
-                        "{line} 行目の block {t} が静的に解決できない"
+                        "{} 行目の {what} {t} が静的に解決できない",
+                        site.line
                     ));
                 }
             };
             match first {
-                None => first = Some((dims, *line)),
+                None => first = Some((dims, site.line)),
                 Some((prev, prev_line)) => {
                     if prev != dims {
                         return ShapeStatus::Unresolved(format!(
-                            "起動サイトの block が不一致: {prev_line} 行目 ({}, {}, {}) vs \
-                             {line} 行目 ({}, {}, {})",
-                            prev[0], prev[1], prev[2], dims[0], dims[1], dims[2]
+                            "起動サイトの {what} が不一致: {prev_line} 行目 ({}, {}, {}) vs \
+                             {} 行目 ({}, {}, {})",
+                            prev[0], prev[1], prev[2], site.line, dims[0], dims[1], dims[2]
                         ));
                     }
                 }
@@ -2742,8 +2779,8 @@ impl LaunchMap {
         }
     }
 
-    fn shape(&self, kernel: &str) -> Option<[i64; 3]> {
-        match self.status(kernel) {
+    fn block_shape(&self, kernel: &str) -> Option<[i64; 3]> {
+        match self.block_status(kernel) {
             ShapeStatus::Resolved(d) => Some(d),
             ShapeStatus::Unresolved(_) => None,
         }
@@ -2756,35 +2793,40 @@ impl LaunchMap {
         let mut out = Vec::new();
         for k in keys {
             let sites = &self.sites[k];
-            let lines: Vec<String> = sites.iter().map(|(l, _)| l.to_string()).collect();
-            let st = match self.status(k) {
+            let lines: Vec<String> = sites.iter().map(|s| s.line.to_string()).collect();
+            let txt = |st: ShapeStatus| match st {
                 ShapeStatus::Resolved(d) => format!("({}, {}, {})", d[0], d[1], d[2]),
                 ShapeStatus::Unresolved(w) => format!("unresolved ({w})"),
             };
-            out.push(format!("{k} -> {st} @ {}", lines.join(",")));
+            out.push(format!(
+                "{k} -> block {} / grid {} @ {}",
+                txt(self.block_status(k)),
+                txt(self.grid_status(k)),
+                lines.join(",")
+            ));
         }
         out.join("; ")
     }
 }
 
-/// block 引数 `(A, B, C)` を読む。3 次元すべてが定数に解決できなければ `Sym`。
-fn parse_block_shape(arg: &str, consts: &HashMap<String, String>) -> BlockShape {
+/// block / grid 引数 `(A, B, C)` を読む。3 次元すべてが定数に解決できなければ `Sym`。
+fn parse_dim_shape(arg: &str, consts: &HashMap<String, String>) -> DimShape {
     let t = arg.trim();
     if !(t.starts_with('(') && t.ends_with(')')) {
-        return BlockShape::Sym(t.to_string());
+        return DimShape::Sym(t.to_string());
     }
     let parts = split_top_args(&t[1..t.len() - 1]);
     if parts.len() != 3 {
-        return BlockShape::Sym(t.to_string());
+        return DimShape::Sym(t.to_string());
     }
     let mut dims = [0i64; 3];
     for (k, p) in parts.iter().enumerate() {
         match eval(&strip_as_casts(p).trim(), consts) {
             Some(v) if v > 0 => dims[k] = v,
-            _ => return BlockShape::Sym(t.to_string()),
+            _ => return DimShape::Sym(t.to_string()),
         }
     }
-    BlockShape::Nums(dims)
+    DimShape::Nums(dims)
 }
 
 /// cuda.rs から起動サイト表を作る。
@@ -2833,11 +2875,18 @@ fn launch_map_from_cuda(src: &str) -> LaunchMap {
                 .push((line, format!("`{callee}` の block 引数が読めない")));
             continue;
         };
-        let shape = parse_block_shape(block_arg, &consts);
+        // s179 (P39): grid は同じ起動呼び出しの第 2 引数。読めない/解決できない
+        // ときもサイトは記録する (サイトを落とすと「起動サイトが無い」という別の
+        // 理由になり、grid が動的だという事実が消える)。
+        let grid = match args.get(1) {
+            Some(g) if !g.trim().is_empty() => parse_dim_shape(g, &consts),
+            _ => DimShape::Sym("<grid 引数が読めない>".to_string()),
+        };
+        let block = parse_dim_shape(block_arg, &consts);
         lm.sites
             .entry(kernel.clone())
             .or_default()
-            .push((line, shape));
+            .push(LaunchSite { line, grid, block });
     }
     lm
 }
@@ -3083,6 +3132,12 @@ struct RowEnv<'a> {
     line_off: usize,
     /// 起動ブロック (x, y, z)
     block: [i64; 3],
+    /// 起動 grid (x, y, z)。静的解決できないときは None (s179/P39)。
+    grid: Option<[i64; 3]>,
+    /// `blockIdx.*` を grid 無しで評価しようとしたことを記録する。行式が
+    /// blockIdx に依存しているかは **ローカル束縛越し** にしか分からないので、
+    /// 事前の文字列検査ではなく評価中の印で判定する (P39)。
+    grid_missing: &'a Cell<bool>,
     /// 囲みの `if` から読んだ識別子の上限
     bounds: &'a HashMap<String, i64>,
 }
@@ -3134,6 +3189,15 @@ fn iv_of_depth(expr: &str, env: &RowEnv, depth: u32) -> Option<Iv> {
     Some(v)
 }
 
+/// 和の区間: `hi = a.hi + b.hi`。
+///
+/// s179 (P39) の混在項 (`blockIdx.y * BD + threadIdx.y`) について、この
+/// 「最大値の和 = 和の最大値」は **項が独立なときだけ** 成り立つ。ここでは
+/// `blockIdx.*` (block の番号) と `threadIdx.*` (block 内の番号) が別々の
+/// ハードウェア次元なので独立であり、和の最大は同時に達成できる (だから
+/// `exact` を保ったまま違反を主張できる)。同じ識別子が 2 回出る式は
+/// [`iv_of_depth`] が `exact = false` にする。**積** ではこの仮定を置かない
+/// ([`iv_mul`] を参照)。
 fn iv_sum(cs: &[char], pos: &mut usize, env: &RowEnv, depth: u32) -> Option<Iv> {
     let mut v = iv_prod(cs, pos, env, depth)?;
     while *pos < cs.len() && (cs[*pos] == '+' || cs[*pos] == '-') {
@@ -3157,6 +3221,11 @@ fn iv_sum(cs: &[char], pos: &mut usize, env: &RowEnv, depth: u32) -> Option<Iv> 
     Some(v)
 }
 
+/// 積の区間。片側が定数 (`lo == hi`) なら単純なスケールで `exact` を保つ。
+/// 両側が変数のときは端点の積の min/max を採る **過大評価** で、`exact = false`
+/// にする (s179/P39: 変数同士の積の最大が同時に達成できるとは主張しない →
+/// 違反ではなく unresolved に落ちる)。`blockIdx.y * BD` は片側が定数なので
+/// 混在項の和 (`+ threadIdx.y`) でも `exact` のまま判定できる。
 fn iv_mul(a: Iv, b: Iv) -> Iv {
     if a.lo == a.hi {
         let k = a.lo;
@@ -3266,8 +3335,26 @@ fn ident_iv(name: &str, env: &RowEnv, depth: u32) -> Option<Iv> {
         "blockDim.x" => Iv::point(env.block[0]),
         "blockDim.y" => Iv::point(env.block[1]),
         "blockDim.z" => Iv::point(env.block[2]),
-        // grid は静的に決まらない (起動サイトの grid 引数は読んでいない)
-        "blockIdx.x" | "blockIdx.y" | "blockIdx.z" => return None,
+        // s179 (P39): grid は起動サイトの第 2 引数から読む。静的解決できない
+        // (変数・マクロ・計算式・サイト不一致) ときは **推測しない**:
+        // ハードウェア上限にも落とさず None を返し、呼び出し側が
+        // 「blockIdx を使うが grid が未解決」として unresolved にする。
+        "blockIdx.x" | "blockIdx.y" | "blockIdx.z" => {
+            let Some(g) = env.grid else {
+                env.grid_missing.set(true);
+                return None;
+            };
+            let d = match name {
+                "blockIdx.x" => g[0],
+                "blockIdx.y" => g[1],
+                _ => g[2],
+            };
+            Iv {
+                lo: 0,
+                hi: d - 1,
+                exact: true,
+            }
+        }
         _ => {
             if let Some(v) = eval(name, env.d) {
                 Iv::point(v)
@@ -3407,10 +3494,17 @@ enum RowBound {
     Undecided(String),
 }
 
-/// 記号行の上限を起動ブロックから判定する。
+/// 記号行の上限を起動ブロック / grid から判定する。
 ///
 /// 規則 (sound): `max(行式) < 宣言行数` のときだけ InBounds。`max` が到達可能と
 /// 言える (`exact`) ときに限り違反として報告し、それ以外は Undecided に落とす。
+///
+/// s179 (P39): `blockIdx.*` を含む行式 (ローカル束縛越しの依存も含む) は
+/// grid が静的解決できたときだけ判定する。grid が未解決なら
+/// 「blockIdx を使うが grid が未解決」という理由で Undecided にする
+/// (ハードウェア上限で代用しない)。blockIdx を使わない行式は従来どおり
+/// block だけで判定する — grid を必要としない判定に grid の未解決を
+/// 混ぜると、今日緑の 6 件 (kernels_int8.cu) が赤になってしまう。
 fn symbolic_row_bound(
     row_expr: &str,
     obj: &SmemObj,
@@ -3419,25 +3513,45 @@ fn symbolic_row_bound(
     scope: &str,
     line_off: usize,
     guards: &[String],
-    shape: ShapeStatus,
+    block: ShapeStatus,
+    grid: ShapeStatus,
 ) -> RowBound {
     let rows = obj.cap / inner.max(1);
-    let block = match shape {
+    let block = match block {
         ShapeStatus::Resolved(b) => b,
         ShapeStatus::Unresolved(why) => return RowBound::Undecided(why),
     };
+    let (grid_dims, grid_why) = match grid {
+        ShapeStatus::Resolved(g) => (Some(g), String::new()),
+        ShapeStatus::Unresolved(w) => (None, w),
+    };
+    let shape_txt = match grid_dims {
+        Some(g) => format!(
+            "block {}x{}x{} / grid {}x{}x{}",
+            block[0], block[1], block[2], g[0], g[1], g[2]
+        ),
+        None => format!("block {}x{}x{} / grid 未解決", block[0], block[1], block[2]),
+    };
     let bounds = guard_bounds(guards, d);
+    let grid_missing = Cell::new(false);
     let env = RowEnv {
         d,
         scope,
         line_off,
         block,
+        grid: grid_dims,
+        grid_missing: &grid_missing,
         bounds: &bounds,
     };
     let Some(iv) = iv_of(row_expr, &env) else {
+        if grid_missing.get() {
+            return RowBound::Undecided(format!(
+                "行式 `{row_expr}` は blockIdx を使うが grid が静的に解決できない \
+                 ({grid_why}) [{shape_txt}]"
+            ));
+        }
         return RowBound::Undecided(format!(
-            "行式 `{row_expr}` を区間に落とせない (block {}x{}x{})",
-            block[0], block[1], block[2]
+            "行式 `{row_expr}` を区間に落とせない ({shape_txt})"
         ));
     };
     if iv.hi < rows && iv.lo >= 0 {
@@ -3445,13 +3559,13 @@ fn symbolic_row_bound(
     }
     if iv.exact && iv.lo >= 0 {
         return RowBound::Violated(format!(
-            "行 `{row_expr}` の最大 {} が宣言 {rows} 行以上 (block {}x{}x{})",
-            iv.hi, block[0], block[1], block[2]
+            "行 `{row_expr}` の最大 {} が宣言 {rows} 行以上 ({shape_txt})",
+            iv.hi
         ));
     }
     RowBound::Undecided(format!(
-        "行 `{row_expr}` の区間 [{}, {}] が宣言 {rows} 行と交わる (block {}x{}x{})",
-        iv.lo, iv.hi, block[0], block[1], block[2]
+        "行 `{row_expr}` の区間 [{}, {}] が宣言 {rows} 行と交わる ({shape_txt})",
+        iv.lo, iv.hi
     ))
 }
 
@@ -3540,7 +3654,8 @@ impl RowBoundCtx<'_> {
             scope,
             line_off,
             &guards,
-            launch.status(kname),
+            launch.block_status(kname),
+            launch.grid_status(kname),
         ))
     }
 }
@@ -4173,7 +4288,7 @@ fn kernel_launch_block_shapes_bound_symbolic_smem_rows() {
         map.unresolved_sites.len()
     );
     assert_eq!(
-        map.shape("dno_gemm_i8"),
+        map.block_shape("dno_gemm_i8"),
         Some([16, 16, 1]),
         "dno_gemm_i8 の起動ブロックが (GEMM_BX, GEMM_BY, 1) = (16,16,1) と読めていない: {}",
         map.summary()
@@ -4190,11 +4305,11 @@ fn kernel_launch_block_shapes_bound_symbolic_smem_rows() {
     assert!(
         gemm_sites
             .iter()
-            .all(|(_, s)| *s == BlockShape::Nums([16, 16, 1])),
+            .all(|s| s.block == DimShape::Nums([16, 16, 1])),
         "dno_gemm_i8 の起動サイトの block が揃っていない: {gemm_sites:?}"
     );
     // block がカーネル引数 (`dh as u32`) のカーネルは「表にあるが判定不能」。
-    match map.status("dno_attention_prefill") {
+    match map.block_status("dno_attention_prefill") {
         ShapeStatus::Unresolved(w) => assert!(
             w.contains("解決できない"),
             "dno_attention_prefill の unresolved 理由が block の静的解決でない: {w}"
@@ -4462,6 +4577,287 @@ fn kernel_launch_block_shapes_bound_symbolic_smem_rows() {
         "表に無いカーネルを分類しても落ちない: {msg}"
     );
 }
+
+/// s179 (P39): 起動 **grid** を走査器へ import し、`blockIdx.*` を含む行式を判定する。
+///
+/// P36 の残件 1「`blockIdx.*` は決して上限を与えない (grid 引数を読んでいない)」を
+/// 閉じる。block と同じ起動呼び出し (`launch_async(f, grid, block, shmem, args)`) の
+/// 第 2 引数から grid を読み、
+///
+///   max(blockIdx.d) = grid[d] - 1,  max(threadIdx.d) = block[d] - 1
+///
+/// を **独立項の和** として評価する (混在項の規則は `iv_sum` の doc を参照)。
+/// grid が静的に決まらない / 起動サイトが食い違うときは推測せず unresolved に
+/// する (ハードウェア上限で代用しない)。
+///
+/// 依存駆動の門番: grid は **blockIdx を使う行式のときだけ** 必要とする。
+/// blockIdx を使わない行 (今日緑の kernels_int8.cu の 6 件) は grid が未解決でも
+/// block だけで判定する — ここを一律にすると緑が赤になる (P36 の 6 件)。
+#[test]
+fn kernel_launch_grid_shapes_bound_block_idx_smem_rows() {
+    // ---- (1) 実カーネル: grid は 1 件も静的に解決できない ----
+    let map = launch_map_from_cuda(CUDA_RS);
+    println!("launch map (block / grid): {}", map.summary());
+    // 行番号の自己検査: 各サイトの行が **生の cuda.rs** の `.launch_async(` 行を指すこと。
+    // mask_literals が行を落とすと 1 行ずれ、囲みガードとカーネル範囲の対応も崩れる
+    // (s179/P39 で実際に cuda.rs:12166 の文字列の改行継続が原因で、それ以降のサイトが
+    //  1 行手前に報告されていた)。
+    for (k, sites) in &map.sites {
+        for s in sites {
+            let raw = CUDA_RS.lines().nth(s.line.saturating_sub(1)).unwrap_or("");
+            assert!(
+                raw.contains(".launch_async("),
+                "起動サイト {k} の行番号 {} が実際の `.launch_async(` 行と一致しない \
+                 (mask_literals が行を落としている疑い): {raw}",
+                s.line
+            );
+        }
+    }
+    let n_sites = map.sites.len();
+    let unresolved_grid = map
+        .sites
+        .keys()
+        .filter(|k| !matches!(map.grid_status(k), ShapeStatus::Resolved(_)))
+        .count();
+    assert_eq!(
+        unresolved_grid, n_sites,
+        "grid が静的に解決されたカーネルがある (現状の cuda.rs の grid はすべて変数・\
+         計算式・関数ポインタ越し = 0 件のはず)。判定できるようになったなら期待値を\
+         更新すること: {}",
+        map.summary()
+    );
+    match map.grid_status("dno_gemm_i8") {
+        ShapeStatus::Unresolved(w) => assert!(
+            w.contains("grid") && w.contains("解決できない"),
+            "dno_gemm_i8 の grid の unresolved 理由が grid の静的解決でない: {w}"
+        ),
+        ShapeStatus::Resolved(d) => {
+            panic!("dno_gemm_i8 の grid が {d:?} と解決された (起動は `(gmx, gmy, 1)` = 変数)")
+        }
+    }
+    // 実カーネルは blockIdx を cast の行式に使っていないので、行の判定結果は
+    // P36 のまま (6 件 decided / 0 undecided) でなければならない。
+    let sources = kernel_sources();
+    let sc = scan_kernels_launched(&sources, &map);
+    assert!(
+        sc.row_bound_unresolved.is_empty(),
+        "grid を取り込んだ結果、実カーネルで判定できない記号行が出た: {:?}",
+        sc.row_bound_unresolved
+    );
+    assert_eq!(
+        sc.row_bound_launch_checked, 6,
+        "grid を取り込んだ結果、block だけで判定していた 6 件が変わった: {sc:?}"
+    );
+    println!(
+        "real kernels: {} sites / {} kernels; grid resolved 0; \
+         row bound decided {} (block only), undecided {}",
+        map.calls_seen,
+        n_sites,
+        sc.row_bound_launch_checked,
+        sc.row_bound_unresolved.len()
+    );
+
+    // ---- (2) fixture の起動サイト (grid と block の両方を差し替える) ----
+    let fake_cuda = |sites: &str| -> String {
+        format!(
+            "const BX: u32 = 16;\n\
+             const BD: u32 = 16;\n\
+             (lib.module_get_function)(&mut f_gemm, module, b\"fake_launch\\0\".as_ptr() as *const c_char),\n\
+             {sites}\n"
+        )
+    };
+    let site = |grid: &str, block: &str| -> String {
+        format!("ctx.launch_async(ctx.f_gemm, ({grid}), ({block}), 0, &mut args)?;")
+    };
+    // 行式 `tail` を 1 つだけ持つカーネル。`sA` は 128 行 x 36 要素。
+    let row_cu = |tail: &str| -> String {
+        format!(
+            "#define SP 36\n#define TILE 128\n#define BD 16\n\
+             extern \"C\" __global__ void fake_launch(const signed char *src) {{\n\
+             \x20   __shared__ signed char sA[TILE][SP];\n\
+             \x20   const int r = {tail};\n\
+             \x20   *(int*)&sA[r][0] = 0;\n}}\n"
+        )
+    };
+    let scan1 = |cu: &str, cuda: String| -> Scan {
+        let m = launch_map_from_cuda(&cuda);
+        scan_kernels_launched(&[("fake_launch.cu".to_string(), cu.to_string())], &m)
+    };
+    let mixed = "blockIdx.y * BD + threadIdx.y";
+    // 各 fixture の実測 (REPORT の表はこの出力から採る)
+    let show = |name: &str, sc: &Scan| {
+        println!(
+            "[P39 fixture] {name}: decided {} / undecided {} / bad {} / symbolic-ok {} | {:?}",
+            sc.row_bound_launch_checked,
+            sc.row_bound_unresolved.len(),
+            sc.bad_casts.len(),
+            sc.symbolic_ok,
+            sc.bad_casts
+                .iter()
+                .map(|(_, _, t)| t.clone())
+                .chain(sc.row_bound_unresolved.iter().map(|(_, _, t)| t.clone()))
+                .collect::<Vec<_>>()
+        );
+    };
+
+    // 2-1: 境界ぴったり。max = (8-1)*16 + (16-1) = 127 < 128 で緑。
+    let sc = scan1(&row_cu(mixed), fake_cuda(&site("1, 8, 1", "1, BD, 1")));
+    show("2-1 mixed sum boundary (grid 1x8x1)", &sc);
+    assert!(
+        sc.bad_casts.is_empty(),
+        "grid (1,8,1) + block (1,16,1) の正しい混在行が違反扱いされた (偽陽性): {:?}",
+        sc.bad_casts
+    );
+    assert_eq!(
+        sc.row_bound_launch_checked, 1,
+        "grid を使った行上限判定が走っていない: {sc:?}"
+    );
+    assert_eq!(sc.symbolic_ok, 1, "grid で判定できる行が緑になっていない: {sc:?}");
+    assert!(
+        sc.row_bound_unresolved.is_empty(),
+        "判定できるはずの行が unresolved になった: {:?}",
+        sc.row_bound_unresolved
+    );
+
+    // 2-2: grid の y を 9 にすると (9-1)*16 + 15 = 143 >= 128 で違反。
+    //      (行式も block もそのまま = grid だけが根拠であることの証明)
+    let sc = scan1(&row_cu(mixed), fake_cuda(&site("1, 9, 1", "1, BD, 1")));
+    show("2-2 grid violates (grid 1x9x1)", &sc);
+    assert_eq!(
+        sc.row_bound_launch_checked, 1,
+        "grid を変えたときに判定が走っていない: {sc:?}"
+    );
+    assert!(
+        sc.bad_casts
+            .iter()
+            .any(|(_, _, t)| t.contains("最大 143") && t.contains("宣言 128 行")),
+        "grid (1,9,1) で行の最大 143 が宣言 128 行を越えることを検出できない \
+         (grid を上限に使えていない): {:?}",
+        sc.bad_casts
+    );
+
+    // 2-3: threadIdx を含まない純 grid 項。max = (GX-1)*64 + 63。
+    let sc = scan1(
+        &row_cu("blockIdx.x * 64 + 63"),
+        fake_cuda(&site("2, 1, 1", "1, 1, 1")),
+    );
+    show("2-3 pure grid boundary (grid 2x1x1)", &sc);
+    assert!(
+        sc.bad_casts.is_empty() && sc.row_bound_launch_checked == 1,
+        "grid (2,1,1) の純 grid 行 (max 127 < 128) が緑になっていない: {sc:?}"
+    );
+    let sc = scan1(
+        &row_cu("blockIdx.x * 64 + 63"),
+        fake_cuda(&site("3, 1, 1", "1, 1, 1")),
+    );
+    show("2-3 pure grid violated (grid 3x1x1)", &sc);
+    assert!(
+        sc.bad_casts
+            .iter()
+            .any(|(_, _, t)| t.contains("最大 191") && t.contains("宣言 128 行")),
+        "grid (3,1,1) の純 grid 行 (max 191) を検出できない: {:?}",
+        sc.bad_casts
+    );
+
+    // 2-4: grid が変数 (動的) なら unresolved (推測しない・hw 上限に落とさない)。
+    let sc = scan1(&row_cu(mixed), fake_cuda(&site("1, gy, 1", "1, BD, 1")));
+    show("2-4 dynamic grid", &sc);
+    assert_eq!(
+        sc.row_bound_launch_checked, 0,
+        "動的 grid なのに判定してしまった: {sc:?}"
+    );
+    assert_eq!(
+        sc.symbolic_ok, 0,
+        "動的 grid なのに緑と判定した (unresolved のはず): {sc:?}"
+    );
+    assert!(
+        sc.row_bound_unresolved
+            .iter()
+            .any(|(_, _, t)| t.contains("blockIdx")
+                && t.contains("grid")
+                && t.contains("静的に解決できない")),
+        "動的 grid の unresolved 理由が blockIdx/grid を名指ししていない: {:?}",
+        sc.row_bound_unresolved
+    );
+
+    // 2-5: 同じカーネルの 2 サイトが grid で食い違う → unresolved (緑にしない)。
+    let sc = scan1(
+        &row_cu(mixed),
+        fake_cuda(&format!(
+            "{}\n{}",
+            site("1, 8, 1", "1, BD, 1"),
+            site("1, 9, 1", "1, BD, 1")
+        )),
+    );
+    show("2-5 grid disagreement", &sc);
+    assert_eq!(
+        sc.row_bound_launch_checked, 0,
+        "grid が食い違うのに判定してしまった: {sc:?}"
+    );
+    assert_eq!(
+        sc.symbolic_ok, 0,
+        "grid が食い違うのに緑と判定した (unresolved のはず): {sc:?}"
+    );
+    assert!(
+        sc.row_bound_unresolved
+            .iter()
+            .any(|(_, _, t)| t.contains("grid が不一致")),
+        "grid の不一致が理由として残っていない: {:?}",
+        sc.row_bound_unresolved
+    );
+
+    // 2-6: grid は決まるが block が変数 → block 側の未解決で unresolved。
+    let sc = scan1(&row_cu(mixed), fake_cuda(&site("1, 8, 1", "thr, 1, 1")));
+    show("2-6 dynamic block, static grid", &sc);
+    assert_eq!(sc.row_bound_launch_checked, 0, "{sc:?}");
+    assert_eq!(sc.symbolic_ok, 0, "変数 block なのに緑と判定した: {sc:?}");
+    assert!(
+        sc.row_bound_unresolved
+            .iter()
+            .any(|(_, _, t)| t.contains("block") && t.contains("静的に解決できない")),
+        "変数 block の unresolved 理由が残っていない: {:?}",
+        sc.row_bound_unresolved
+    );
+
+    // 2-7: 変数同士の積 (blockIdx.y * threadIdx.y) は「最大が到達可能」と
+    //      主張しない → 区間 [0, 225] が 128 行と交わるので **unresolved**
+    //      (violation ではない)。混在 **和** との差をここで固定する。
+    let sc = scan1(
+        &row_cu("blockIdx.y * threadIdx.y"),
+        fake_cuda(&site("1, 16, 1", "1, 16, 1")),
+    );
+    show("2-7 variable product", &sc);
+    assert!(
+        sc.bad_casts.is_empty(),
+        "積の過大評価を違反として報告してしまった (到達可能性を主張している): {:?}",
+        sc.bad_casts
+    );
+    assert_eq!(sc.row_bound_launch_checked, 0, "{sc:?}");
+    assert!(
+        sc.row_bound_unresolved
+            .iter()
+            .any(|(_, _, t)| t.contains("区間") && t.contains("交わる")),
+        "積の行が unresolved (区間が交わる) になっていない: {:?}",
+        sc.row_bound_unresolved
+    );
+
+    // 2-8: 依存駆動の門番 — blockIdx を使わない行は grid が未解決でも block だけで
+    //      判定する (これが今日の 6 件を緑に保つ規則)。
+    let sc = scan1(&row_cu("threadIdx.y"), fake_cuda(&site("1, gy, 1", "1, BD, 1")));
+    show("2-8 blockIdx-free row, dynamic grid", &sc);
+    assert!(
+        sc.bad_casts.is_empty(),
+        "blockIdx を使わない行が grid 未解決で違反扱いされた: {:?}",
+        sc.bad_casts
+    );
+    assert_eq!(
+        sc.row_bound_launch_checked, 1,
+        "blockIdx を使わない行が grid 未解決で判定されなくなった (依存駆動の門番が \
+         効いていない): {sc:?}"
+    );
+    assert_eq!(sc.symbolic_ok, 1, "{sc:?}");
+}
+
 
 /// s100 (P3-3) 既知の潜在不具合 (未修正・このテストでは固定しない): `dno_attention`
 /// (decode 用) の block 間 reduction が共有メモリ `dh` floats に対して

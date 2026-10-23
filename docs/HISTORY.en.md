@@ -3739,3 +3739,54 @@ External implementations referenced in P19 and their licensing status (the same 
 - **Not measured**: GPU execution, anchors, ms/token (no GPU in this container). No `.cu`
   violation was found (`KNOWN_BAD_4B_CASTS` stays empty). The work report is uncommitted
   (`REPORT_P36.md`).
+
+
+### s179: Task P39 - the P3-3 scanner imports the host launch grid and decides blockIdx rows (2026-10-23) done
+
+- **Implementation**: none (tests only). Closes the first "residual limit" of P36: a row
+  expression containing `blockIdx.*` never got a bound (the grid argument was not parsed), so
+  such a cast landed in `row_bound_unresolved`. No `.cu` / `.ptx` / product code / `cuda.rs`
+  changes.
+- **Extended launch-site map**: `launch_map_from_cuda` now reads **both** the grid (argument 2)
+  and the block (argument 3) of the same `.launch_async(f, grid, block, shmem, args)` call into
+  `LaunchSite { line, grid, block }`. No new regex family: the same call sites, paren-matched and
+  split at top-level commas. The map itself is unchanged: 61 call sites, 18 kernels, 10 call
+  sites that cannot be resolved to a kernel name. `block_status` / `grid_status` apply the same
+  rule (all sites agree + all three dimensions statically resolved).
+- **Every real kernel's grid is statically unresolvable (18/18)**: `(gmx, gmy, 1)`,
+  `(m as u32, 1, 1)`, `grid`, `(n.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1)`,
+  `(nv as u32, 1, 1)`, ... are variables, kernel arguments or calls. So 0 rows are decided from
+  the grid on today's kernels, and the moment a real cast uses `blockIdx` in its row it becomes
+  unresolved **with a reason naming the grid** (no guessing, no hardware-limit fallback).
+- **Rule**: `max(blockIdx.d) = grid[d] - 1`, `max(threadIdx.d) = block[d] - 1`. A mixed term
+  (`blockIdx.y * BD + threadIdx.y`) is treated as a **sum of independent terms**, so
+  `hi = sum(hi)`: `blockIdx` is the block's index and `threadIdx` is the index inside the block,
+  i.e. different hardware dimensions, so their maxima are simultaneously reachable and the
+  violation can still be claimed (`exact` preserved). **Products** do not get that assumption:
+  variable x variable becomes an endpoint-product over-approximation with `exact = false`, which
+  lands in unresolved rather than a violation. Repeated identifiers keep `exact = false` as before.
+- **Dependency-driven gate**: the grid is required only for row expressions that use `blockIdx`
+  (including dependence through a local binding such as `const int r = blockIdx.y * BD + ...`,
+  detected by a flag set during evaluation). Rows without `blockIdx` are still decided from the
+  block alone when the grid is unresolved - requiring the grid unconditionally would turn the 6
+  green `kernels_int8.cu` casts red. Real-kernel counts are unchanged (9 casts / 9 symbolic-ok /
+  **6** row bounds from the launch block / 0 undecided / 0 bad).
+- **Self-check**: one new test (the 18th) with 9 fixtures: (1) mixed sum at the boundary,
+  grid (1,8,1) + block (1,16,1) -> 127 < 128 green; (2) grid (1,9,1) -> max 143 violation;
+  (3) pure grid term `blockIdx.x * 64 + 63` green at grid (2,1,1) / max 191 at (3,1,1);
+  (4) dynamic grid (`1, gy, 1`) -> unresolved with a reason naming blockIdx and grid;
+  (5) two sites disagreeing on the grid -> unresolved; (6) static grid but variable block ->
+  unresolved; (7) variable x variable product -> interval [0,225] intersects 128 rows so
+  unresolved (not a violation); (8) a `blockIdx`-free row is still decided under a dynamic grid
+  (the dependency gate); (9) 0 resolved grids and the unchanged 6 decided casts on the real tree.
+- **Mutation checks** (5, each fails the test): `blockIdx` always None -> boundary fixture decided
+  0; unresolved grid falling back to the hardware limit 1024 -> false positive max 16383;
+  tolerating grid disagreement -> the disagreement fixture turns green; `hi = grid[d]` (off by
+  one) -> boundary fixture false positive max 143; products marked `exact` -> max 225 reported as
+  a violation.
+- **Tests**: `cargo test --release -p denno-engine --features cuda --lib` = **321 passed /
+  0 failed / 37 ignored** (identical to the baseline), `--test kernel_invariants` =
+  **18 passed / 0 failed** (17 existing + 1 new).
+- **Not measured**: GPU execution, anchors, ms/token (no GPU in this container). No `.cu`
+  violation was found (`KNOWN_BAD_4B_CASTS` stays empty). The work report is uncommitted
+  (`REPORT_P39.md`).
