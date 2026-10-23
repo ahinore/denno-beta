@@ -3654,3 +3654,57 @@ P19 で参照した外部実装とライセンス上の位置づけ(各ソース
   `docs/NUMERIC_POLICY.ja.md` / `GPU_VERIFY.sh` / `scripts/prod_serve_27b.sh` /
   GGUF の型ゲートが受ける型集合 / push / `git add -A`。作業レポートは
   未 commit の `REPORT_P35.md`。
+
+- **測っていないこと**: GPU 実行・アンカー・ms/token・nsys・8095 (GPU 非搭載)。
+  作業レポートは未 commit (`REPORT_P17B.md`)。`.cu` / `.ptx` は無変更。
+
+### s176: Task P31 - prefill チェーンの静的不変条件テストを GPU 無しで固定 (2026-10-23) 完了
+
+- **実装**: なし (テストのみ)。`crates/denno-engine/tests/kernel_invariants.rs` に
+  `chain_mlp_prefill_q4` / `chain_gdn_prefill_q4` / 残差常駐 (`CH_PF_RES`) / PF 位相
+  マーカーの静的不変条件を 4 本追加 (2312 → 3251 行・純追加 939 行・assert 呼び出し
+  95 箇所)。`.cu` / `.ptx` / プロダクトコード / 8095 は無変更。
+- **捕まえる間違い**: (a) `Q4_M_TILE` と `Q4_GM` の不一致・中間バッファをプロンプト
+  全体 (m) で確保する退行 (13k 行で 2.7 GiB)・`cap` から端数併合 tail を落とす退行、
+  (b) chain と per-op の起動引数の取り違え (nib/sc・dk/dv) と block/grid の片側変更、
+  (c) 残差を書く前の読み・`Some(CH_O)` の残差加算落ち・次層へ渡すスロットの取り違え・
+  前提検査の後置 (二重加算)、(d) 位相マーカーの二重押し/欠落/順序の入れ替え。
+- **前提の訂正**: FFN の 3 位相は 1024 行タイルごとに押される (層 1 回ではない —
+  `pf_record` の doc どおり)。テストは「押す場所が 1 箇所」「FFN はタイルループの
+  中」「GDN はループの外」「層 1 枚の位相列が id 昇順」を固定した。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (基準と同一)、
+  `cargo test --release -p denno-engine --features cuda --test kernel_invariants` =
+  **15 passed / 0 failed** (既存 11 + 新規 4)。新規 4 本は変異試験 11 通り
+  (cuda.rs / qwen35.rs を一時的に壊して戻す) をすべて検出。
+- **測っていないこと**: GPU 実行・アンカー・ms/token (GPU 非搭載)。作業レポートは
+  未 commit (`REPORT_P31.md`)。
+
+### s177: Task P34 - P3-3 smem キャスト走査器の既知の限界を拡張 (2026-10-23) 完了
+
+- **実装**: なし (テストのみ)。`crates/denno-engine/tests/kernel_invariants.rs` の P3-3
+  走査器 (s104/s105) を拡張し、既知の限界のうち静的に決められるものを検査化した。
+  `.cu` / `.ptx` / プロダクトコード / `cuda.rs` は無変更。
+- **限界 2 (float2 の整列)**: 旧版は float2 も 4 バイト型として `% 4` で判定し、別名の
+  基点オフセットも無視していた。`SmemObj` に `pre8` (基点のバイト剰余 mod 8) と
+  `dyn_base` を持たせ、`eval_mod` (modular arithmetic — 未知の識別子は 0 倍のときだけ 0)
+  で `PF_BK * (dh + 1)` のような記号オフセットの剰余を求める。幅は `cast_width`
+  (float2 = 8B) で決め、8 バイト型は基点が 16 バイト整列の動的 smem のときだけ主張する。
+  実カーネルの 3 件 (`corr_sm[rc * 2]` / `s_sm` 2 件) は 8 バイト錨 (8B / 32B) として緑。
+- **限界 3 (間接キャスト)**: `indirect_casts4` を追加し、`int *p = (int*)&sA[r][c];` の形
+  (旧版は `*(T*)` しか見ないので 1 件も拾えなかった) と、そのポインタ越しの `*(int*)p`
+  を同じ整列・境界判定に通す (`smem_table` の 2 パス目でポインタ変数を登録)。
+- **限界 1 (行の上限)**: 行が数値に解決できた `Flat::SymbolicRow` で、行 < 宣言行数と
+  平坦端 <= 総要素数を検査する (旧版は `row_known` を表示にしか使っていなかった)。
+  行が threadIdx / blockIdx 由来のときは `.cu` に静的な上限が無く、ハード上限 1024 で
+  代替すると `ty * 8 + u <= 8191` が 128 行の宣言に対して常に「越える」= 偽陽性になる
+  ため **残件** (反例: `*(const int*)&sA[ty * 8 + u][c0]`)。
+- **自己検証**: 新規テスト 1 本 (16 本目) で、壊した fixture 4 種 — float2 の列刻み
+  `kk += 1`・別名基点 `sh + 1`・奇数 col の間接キャスト (本体 + p 越しの 2 件)・宣言外の
+  行 9 — がすべて報告され、正しい側 (`kk += 2` / `sh + 2` / col 8 / 行 7) は緑のままである
+  ことを固定。実カーネルの検出件数は 9 casts / 9 symbolic-ok / 0 unresolved で不変。
+- **テスト**: `cargo test --release -p denno-engine --features cuda --lib` =
+  **321 passed / 0 failed / 37 ignored** (基準と同一)、
+  `--test kernel_invariants` = **16 passed / 0 failed** (既存 15 + 新規 1)。
+- **測っていないこと**: GPU 実行・アンカー・ms/token (GPU 非搭載)。`.cu` の新規違反は
+  検出なし (`KNOWN_BAD_4B_CASTS` は空のまま)。作業レポートは未 commit (`REPORT_P34.md`)。

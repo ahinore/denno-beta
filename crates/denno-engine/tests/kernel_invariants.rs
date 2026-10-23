@@ -998,6 +998,19 @@ struct SmemObj {
     /// 要素 = 4 バイトなので、`4 の倍数の要素境界` を判定する係数 4 を持つ。
     /// これが無いと `(float*)&sh[1]` (要素 4 番 = 整列済み) を未アラインと誤判定する。
     stride: i64,
+    /// この名前の基点が「宣言そのものの先頭」から何バイトずれているかを 8 で割った
+    /// 剰余。宣言そのものは `Some(0)`。別名 (`float *s_sm = v_sm + EXPR;`) では
+    /// `EXPR * stride` の剰余を親から積む。`EXPR` が記号でも **modulus で 0 に落ちる**
+    /// なら `Some(0)` になる (`PF_BK * (dh + 1)` は PF_BK=8 なので mod 8 で 0)。
+    /// s177/P34: これが無いと動的 smem の別名越しのキャストは、列の錨だけを見て
+    /// **別名の基点ずれを無視**していた (基点が奇数要素ずれていても緑になった)。
+    /// `None` は剰余が静的に決まらない (= 整列を主張しない) ことを表す。
+    pre8: Option<i64>,
+    /// 基点が `extern __shared__` (動的領域) 由来か。CUDA は動的 smem の基点を
+    /// 16 バイト整列で返すので、8 バイト型 (float2) の整列まで主張できる。
+    /// 静的 `__shared__ float` 配列の整列は要素幅 (4) しか保証されないため、
+    /// 8 バイト型のキャストはそこでは「判定不能」にする (s177/P34)。
+    dyn_base: bool,
 }
 
 /// 1 つの 4 バイトキャスト。
@@ -1051,6 +1064,14 @@ struct Scan {
     rows_checked: usize,
     /// 検査した 4 バイトキャストの総数
     casts_seen: usize,
+    /// 間接キャスト (`int *p = (int*)&sA[..]`) として検出した件数
+    /// (s177/P34: 直接形と分けて数える — 実カーネルには無いので 0 が正しい値)
+    indirect_seen: usize,
+    /// 間接キャストのうち整列・範囲内と確認できたもの
+    indirect_sites: Vec<SmemCast>,
+    /// 行が数値に解決できた [`Flat::SymbolicRow`] のうち、行の上限まで
+    /// 検査した件数 (s177/P34: 旧版は row_known を表示にしか使っていなかった)
+    row_bound_checked: usize,
     /// 2 次元宣言から作った行別名 (`a4` / `b4` 相当) の数
     aliases: usize,
 }
@@ -1171,6 +1192,19 @@ fn norm_ty(raw: &str) -> String {
     ty.trim().to_string()
 }
 
+/// キャスト先の型の幅 (バイト)。`float2` は **8 バイト** なので 8 バイト整列が要る。
+///
+/// s177/P34: 旧版は float2 も 4 バイト型と同じ `% 4` で判定していた。4 バイト
+/// 整列しか成り立たない番地 (例 `&s_sm[kk]` の kk 奇数) を「整列済み」と
+/// 判定してしまうので、幅を型から決めて modulus を切り替える。
+fn cast_width(ty: &str) -> i64 {
+    if ty == "float2" {
+        8
+    } else {
+        4
+    }
+}
+
 /// C 形式 (`*(int*)&..`) の 4 バイトキャスト。
 fn c_style_casts4(line: &str) -> Vec<CastSite> {
     const TYS: [&str; 6] = ["float2", "int", "unsigned int", "unsigned", "float", "uint"];
@@ -1197,16 +1231,14 @@ fn c_style_casts4(line: &str) -> Vec<CastSite> {
         if !TYS.contains(&ty.as_str()) {
             continue;
         }
-        // `&名前[..]` / `(名前 + ..)` のどちらか
+        // `&名前[..]` / `(名前 + ..)` / 裸の `名前` (ポインタ変数越し, s177/P34)
         let mut body = &rest[close + 2..];
         body = body.trim_start();
         if let Some(amp) = body.strip_prefix('&') {
             body = amp.trim_start();
         } else if body.starts_with('(') {
             body = body[1..].trim_start();
-        } else {
-            continue;
-        }
+        };
         let name_len = body
             .char_indices()
             .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
@@ -1228,10 +1260,97 @@ fn c_style_casts4(line: &str) -> Vec<CastSite> {
                 Some(c) => format!("{name} {}", &after[..c]),
                 None => continue,
             }
+        } else if after.is_empty()
+            || after.starts_with('=')
+            || after.starts_with(';')
+            || after.starts_with(',')
+            || after.starts_with(')')
+            || after.starts_with(']')
+        {
+            // `*(int*)p` — **ポインタ変数越し** のキャスト (s177/P34)。`p` が smem を
+            // 指すと分かっている (別名表にある) ときだけ呼び出し側が判定する。
+            // オフセットは p の基点からの 0。
+            "+0".to_string()
         } else {
             continue;
         };
         let _ = b;
+        out.push(CastSite {
+            ty,
+            obj: name.to_string(),
+            idx,
+        });
+    }
+    out
+}
+
+/// `(T*)&smem[..]` / `(T*)(smem + ..)` の **間接キャスト**。
+///
+/// 直接形 (`*(int*)&sA[..]`) は [`c_style_casts4`] が見るが、キャストの結果を
+/// ポインタ変数に入れる形 (`int *p = (int*)&sA[r][c];`) や引数に渡す形は
+/// 先頭に `*` が無いため、s104 の走査器からは **丸ごと見えなかった**
+/// (P3-3 の既知の限界 3)。ここでは同じ 4/8 バイト型の `(T*)` を拾い、
+/// 宛先の式を直接形と同じ形 (obj + idx) で返す。smem 由来かどうかは
+/// 呼び出し側が別名表で判定する。
+fn indirect_casts4(line: &str) -> Vec<CastSite> {
+    const TYS: [&str; 6] = ["float2", "int", "unsigned int", "unsigned", "float", "uint"];
+    let mut out = Vec::new();
+    let mut search = 0usize;
+    while let Some(off) = line[search..].find('(') {
+        let at = search + off;
+        search = at + 1;
+        // `*(int*)..` の直接形は c_style_casts4 の担当 (二重計上しない)
+        if line[..at].trim_end().ends_with('*') {
+            continue;
+        }
+        let rest = &line[at + 1..];
+        let Some(close) = rest.find("*)") else {
+            continue;
+        };
+        let ty = norm_ty(&rest[..close]);
+        if !TYS.contains(&ty.as_str()) {
+            continue;
+        }
+        let mut body = rest[close + 2..].trim_start();
+        if let Some(amp) = body.strip_prefix('&') {
+            body = amp.trim_start();
+        } else if body.starts_with('(') {
+            body = body[1..].trim_start();
+        } else {
+            continue;
+        }
+        let name_len = body
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        if name_len == 0 {
+            continue;
+        }
+        let name = &body[..name_len];
+        let after = body[name_len..].trim_start();
+        let after_at = line.len() - after.len();
+        let idx = if after.starts_with('[') {
+            match read_index(line, after_at) {
+                Some(x) => x,
+                None => continue,
+            }
+        } else if after.starts_with('+') {
+            // `(T*)p + k` は括弧が無いので、区切り (`;` `,` `)`) までを式とする。
+            let end = after
+                .find([';', ',', ')'])
+                .unwrap_or(after.len());
+            format!("{name} {}", after[..end].trim_end())
+        } else if after.is_empty()
+            || after.starts_with('=')
+            || after.starts_with(';')
+            || after.starts_with(',')
+            || after.starts_with(')')
+            || after.starts_with(']')
+        {
+            "+0".to_string()
+        } else {
+            continue;
+        };
         out.push(CastSite {
             ty,
             obj: name.to_string(),
@@ -1288,6 +1407,15 @@ fn reinterpret_casts4(line: &str) -> Vec<CastSite> {
                 Some(c) => format!("{name} {}", &after[..c]),
                 None => continue,
             }
+        } else if after.is_empty()
+            || after.starts_with('=')
+            || after.starts_with(';')
+            || after.starts_with(',')
+            || after.starts_with(')')
+            || after.starts_with(']')
+        {
+            // `reinterpret_cast<const float2*>(p)` — ポインタ変数越し (s177/P34)。
+            "+0".to_string()
         } else {
             continue;
         };
@@ -1356,6 +1484,8 @@ fn parse_smem_decl(line: &str, dynamic: bool, d: &HashMap<String, String>) -> Op
             cap: if dynamic || !dims.is_empty() { i64::MAX } else { 1 },
             inner: None,
             stride,
+            pre8: Some(0),
+            dyn_base: dynamic,
         });
     }
     let outer = eval(&dims[0], d)?;
@@ -1372,6 +1502,8 @@ fn parse_smem_decl(line: &str, dynamic: bool, d: &HashMap<String, String>) -> Op
         cap,
         inner,
         stride,
+        pre8: Some(0),
+        dyn_base: false,
     })
 }
 
@@ -1415,7 +1547,138 @@ fn eval(expr: &str, d: &HashMap<String, String>) -> Option<i64> {
     }
 }
 
+/// [`eval_mod`] の値。`Unknown` は「識別子の値いかんで変わる」ことを表す。
+#[derive(Debug, Clone, Copy)]
+enum ModVal {
+    Known(i64),
+    Unknown,
+}
+
+/// 式を modulus `m` で評価し、**値が m で一意に決まるときだけ** 剰余を返す。
+///
+/// 未知の識別子 (カーネル引数 `dh`・`threadIdx.x` 等) は「任意の整数」として扱い、
+/// 0 を掛けられている項だけ 0 に落とす。これが無いと、動的 smem の別名
+/// (`float *s_sm = v_sm + PF_BK * (dh + 1);`) の基点オフセットが記号のままで
+/// 「アラインメント不明」になり、float2 荷載を静的判定できない。
+/// PF_BK=8 なら `8 * (dh + 1) ≡ 0 (mod 8)` なので 8 バイト整列は **dh に依らず**
+/// 成り立つ — これは推測ではなく modular arithmetic の結論。
+///
+/// soundness: `Some(r)` を返すのは「識別子が何であっても剰余が r」と言える場合だけ。
+/// 割り算・剰余は両辺が数値のときだけ畳む (未知を含む式は `Unknown`)。
+fn eval_mod(expr: &str, d: &HashMap<String, String>, m: i64) -> Option<i64> {
+    if m <= 0 {
+        return None;
+    }
+    let cs: Vec<char> = expr.chars().filter(|c| !c.is_whitespace()).collect();
+    if cs.is_empty() {
+        return Some(0); // 空式 = 0 (別名の `float *p = sh;` の右辺)
+    }
+    let mut pos = 0usize;
+    match mod_sum(&cs, &mut pos, d, m)? {
+        ModVal::Known(v) if pos == cs.len() => Some(v),
+        _ => None,
+    }
+}
+
+fn mod_add(a: ModVal, b: ModVal, sign: i64, m: i64) -> ModVal {
+    match (a, b) {
+        (ModVal::Known(x), ModVal::Known(y)) => ModVal::Known((x + sign * y).rem_euclid(m)),
+        // 0 + 未知 = 未知 (0 に落とせるのは **掛け算** の 0 だけ)
+        _ => ModVal::Unknown,
+    }
+}
+
+fn mod_mul(a: ModVal, b: ModVal, m: i64) -> ModVal {
+    match (a, b) {
+        (ModVal::Known(x), ModVal::Known(y)) => ModVal::Known((x * y).rem_euclid(m)),
+        // 0 * 未知 = 0: ここだけが「未知を含んでも剰余が決まる」ケース。
+        (ModVal::Known(0), ModVal::Unknown) | (ModVal::Unknown, ModVal::Known(0)) => {
+            ModVal::Known(0)
+        }
+        _ => ModVal::Unknown,
+    }
+}
+
+fn mod_sum(cs: &[char], pos: &mut usize, d: &HashMap<String, String>, m: i64) -> Option<ModVal> {
+    let mut v = mod_prod(cs, pos, d, m)?;
+    while *pos < cs.len() && (cs[*pos] == '+' || cs[*pos] == '-') {
+        let sign = if cs[*pos] == '+' { 1 } else { -1 };
+        *pos += 1;
+        let r = mod_prod(cs, pos, d, m)?;
+        v = mod_add(v, r, sign, m);
+    }
+    Some(v)
+}
+
+fn mod_prod(cs: &[char], pos: &mut usize, d: &HashMap<String, String>, m: i64) -> Option<ModVal> {
+    let mut v = mod_atom(cs, pos, d, m)?;
+    while *pos < cs.len() && matches!(cs[*pos], '*' | '/' | '%') {
+        let op = cs[*pos];
+        *pos += 1;
+        let r = mod_atom(cs, pos, d, m)?;
+        v = match (op, v, r) {
+            ('*', a, b) => mod_mul(a, b, m),
+            ('/', ModVal::Known(x), ModVal::Known(y)) if y != 0 => ModVal::Known(x / y),
+            ('%', ModVal::Known(x), ModVal::Known(y)) if y != 0 => ModVal::Known(x % y),
+            ('%', ModVal::Known(0), ModVal::Unknown) => ModVal::Known(0),
+            _ => ModVal::Unknown,
+        };
+    }
+    Some(v)
+}
+
+fn mod_atom(cs: &[char], pos: &mut usize, d: &HashMap<String, String>, m: i64) -> Option<ModVal> {
+    if *pos >= cs.len() {
+        return None;
+    }
+    match cs[*pos] {
+        '+' => {
+            *pos += 1;
+            mod_atom(cs, pos, d, m)
+        }
+        '-' => {
+            *pos += 1;
+            match mod_atom(cs, pos, d, m)? {
+                ModVal::Known(v) => Some(ModVal::Known((-v).rem_euclid(m))),
+                ModVal::Unknown => Some(ModVal::Unknown),
+            }
+        }
+        '(' => {
+            *pos += 1;
+            let v = mod_sum(cs, pos, d, m)?;
+            if *pos >= cs.len() || cs[*pos] != ')' {
+                return None;
+            }
+            *pos += 1;
+            Some(v)
+        }
+        c if c.is_ascii_digit() => {
+            let s = *pos;
+            while *pos < cs.len() && cs[*pos].is_ascii_digit() {
+                *pos += 1;
+            }
+            let digits: String = cs[s..*pos].iter().collect();
+            Some(ModVal::Known(
+                digits.parse::<i64>().ok()?.rem_euclid(m),
+            ))
+        }
+        c if c.is_ascii_alphabetic() || c == '_' => {
+            let s = *pos;
+            while *pos < cs.len() && (cs[*pos].is_ascii_alphanumeric() || cs[*pos] == '_') {
+                *pos += 1;
+            }
+            let ident: String = cs[s..*pos].iter().collect();
+            match d.get(&ident) {
+                Some(raw) => eval_mod(raw, d, m).map(ModVal::Known),
+                None => Some(ModVal::Unknown),
+            }
+        }
+        _ => None, // キャスト・関数呼び出し・添字などは扱わない (呼び出し側で Unknown 扱い)
+    }
+}
+
 /// `(int*)&sA[r][c]` の平坦化。2 次元宣言では `r * inner + c`。
+///
 /// 行と列は**別々に**解決する (行が記号でも列が数値ならアラインメントは列だけで決まる)。
 ///
 /// 列が丸ごと数値に解決できなくても、列の式の中で**解決できる部分式**が
@@ -1722,6 +1985,8 @@ fn smem_table(
                             cap: inner,
                             inner: None,
                             stride: parent.stride,
+                            pre8: parent.pre8,
+                            dyn_base: parent.dyn_base,
                         },
                     );
                     *aliases += 1;
@@ -1760,6 +2025,14 @@ fn smem_table(
         } else {
             eval(tail.trim_start_matches('+').trim(), d)
         };
+        // s177/P34: 記号オフセットでも **8 で割った剰余** は決まることがある
+        // (`PF_BK * (dh + 1)` は PF_BK=8 なので 0)。これを積まないと、別名の基点が
+        // 奇数要素ずれていても列の錨だけで「整列」と判定してしまう。
+        let off_expr = tail.trim_start_matches('+').trim();
+        let pre8 = base_obj.pre8.and_then(|p| {
+            eval_mod(off_expr, d, 8)
+                .map(|r| (p + r.saturating_mul(base_obj.stride)).rem_euclid(8))
+        });
         let cap = match off {
             Some(off) if is_dyn => i64::MAX,
             Some(off) => (base_obj.cap - off).max(0),
@@ -1774,6 +2047,57 @@ fn smem_table(
                 cap,
                 inner: None,
                 stride: base_obj.stride,
+                pre8,
+                dyn_base: base_obj.dyn_base,
+            },
+        );
+    }
+
+    // ---- 2 パス目: 間接キャストの宛先ポインタ (`int *p = (int*)&sA[r][c];`) ----
+    // 1 パス目は右辺が名前 (または `&名前[..]`) で始まる別名しか拾わないため、
+    // 「キャストの結果をポインタ変数に入れる」形は表に入らず、以降の `*(int*)p` が
+    // smem 由来と判定されなかった (P3-3 の既知の限界 3)。ここで登録すると、
+    // キャストそのもの (間接形) と、そのポインタ越しのキャストの両方が同じ
+    // 整列・境界判定に乗る。オフセットが記号で上限を切れない静的配列は登録しない
+    // (1 パス目と同じ方針 = 上限を主張できないものは主張しない)。
+    for line in src.lines() {
+        let Some(eq) = line.find('=') else {
+            continue;
+        };
+        let Some(ptr) = ptr_name_before_eq(line, eq) else {
+            continue;
+        };
+        if table.contains_key(&ptr) {
+            continue;
+        }
+        let rhs = line[eq + 1..].trim().trim_end_matches(';').trim();
+        let Some(c) = indirect_casts4(rhs).into_iter().next() else {
+            continue;
+        };
+        let Some(parent) = table.get(&c.obj).cloned() else {
+            continue;
+        };
+        let off = match flatten(&parent, &c.idx, d, src) {
+            Flat::Resolved(v) => v,
+            _ => continue,
+        };
+        let cap = if parent.dyn_base {
+            i64::MAX
+        } else {
+            (parent.cap - off).max(0)
+        };
+        let pre8 = parent
+            .pre8
+            .map(|p| (p + off.saturating_mul(parent.stride)).rem_euclid(8));
+        table.insert(
+            ptr,
+            SmemObj {
+                name: parent.name.clone(),
+                cap,
+                inner: None,
+                stride: parent.stride,
+                pre8,
+                dyn_base: parent.dyn_base,
             },
         );
     }
@@ -1840,84 +2164,164 @@ fn scan_kernels(sources: &[(String, String)]) -> Scan {
         }
 
         // ---- 4 バイトキャストの列挙 ----
+        // 直接形 (`*(int*)&..`) と間接形 (`int *p = (int*)&..`) を同じ判定に通す
+        // (s177/P34: 間接形は旧版の走査器から丸ごと見えていなかった)。
         for (i, line) in src.lines().enumerate() {
             let ln = i + 1;
             for c in find_casts4(line) {
-                let Some(obj) = table.get(&c.obj) else {
-                    continue; // smem 由来でない (引数・グローバル配列・レジスタ)
-                };
-                sc.casts_seen += 1;
-                let site = |off: i64| SmemCast {
-                    file: file.clone(),
-                    ty: c.ty.clone(),
-                    obj: obj.name.clone(),
-                    off,
-                };
-                // バイトオフセット = 平坦化要素番号 * 要素幅 (char=1 / それ以外=4)
-                match flatten(obj, &c.idx, &d, &src) {
-                    Flat::Resolved(off) => {
-                        if obj.inner.is_some() {
-                            sc.rows_checked += 1; // 数値行の 2 次元参照も検査済みに数える
-                        }
-                        let bytes = off.saturating_mul(obj.stride);
-                        let aligned = bytes % 4 == 0 && bytes >= 0;
-                        let inbounds = off >= 0 && off + 4 <= obj.cap;
-                        if aligned && inbounds {
-                            sc.ok_casts.push(site(off));
-                        } else {
-                            sc.bad_casts.push((site(off), ln, line.trim().to_string()));
-                        }
-                    }
-                    // 行が記号 (ループ変数・blockIdx 由来) でも、行ストライドが 4 の倍数なら
-                    // 平坦化オフセットの 4 バイト整列は列だけで決まる。
-                    // 条件: 行ストライドが 4 の倍数 / 列の錨 + 4 が行幅以内 /
-                    //       列の錨のバイト位置が 4 の倍数。
-                    // 行の上限は検査しない (ループ上下限はカーネルごとの別の不変条件。
-                    // ここで見るのはアラインメントと列方向の境界だけ。REPORT に残件として記載)。
-                    Flat::SymbolicRow { col, row_known } => {
-                        sc.rows_checked += 1;
-                        let col_bytes = col.saturating_mul(obj.stride);
-                        let col_aligned = col >= 0 && col_bytes % 4 == 0;
-                        // 2 次元なら行ストライドと列方向の境界も検査する。1 次元
-                        // (動的 smem の別名など) は行の概念が無いのでアラインメントだけ。
-                        let (row_ok, col_inbounds, why) = match obj.inner {
-                            Some(inner) => (
-                                (inner * obj.stride) % 4 == 0,
-                                col + 4 <= inner,
-                                format!(
-                                    "行 {:?} / 行ストライド {} 要素 * {}B = {}B / 行幅 {inner}",
-                                    row_known,
-                                    inner,
-                                    obj.stride,
-                                    inner * obj.stride
-                                ),
-                            ),
-                            None => (
-                                true,
-                                true,
-                                "1 次元 (上限はホストが渡すバイト数なのでアラインのみ検査)"
-                                    .to_string(),
-                            ),
-                        };
-                        if row_ok && col_aligned && col_inbounds {
-                            sc.symbolic_ok += 1;
-                            sc.symbolic_sites.push(site(col_bytes));
-                        } else {
-                            sc.bad_casts.push((
-                                site(col_bytes),
-                                ln,
-                                format!("{} [錨 {col} ({}B) / {why}]", line.trim(), col_bytes),
-                            ));
-                        }
-                    }
-                    Flat::Unresolved => sc
-                        .unresolved_casts
-                        .push((file.clone(), ln, line.trim().to_string())),
-                }
+                classify_cast(file, ln, line, &c, &table, &d, &src, &mut sc, false);
+            }
+            for c in indirect_casts4(line) {
+                classify_cast(file, ln, line, &c, &table, &d, &src, &mut sc, true);
             }
         }
     }
     sc
+}
+
+/// 1 件の 4/8 バイトキャストを分類して [`Scan`] に積む。
+///
+/// 判定は 3 つ:
+///   - **整列**: 宛先バイト位置 (別名の基点ずれ `pre8` + 平坦化オフセット * 要素幅) が
+///     キャスト先の幅で割り切れるか。`float2` (8B) は 8 で割る。
+///   - **範囲**: 平坦化オフセット + 幅 が宣言の総要素数以内か。
+///   - **行の上限** (s177/P34): 行が数値に解決できたときは、行が宣言行数以内で
+///     平坦端も総要素数以内か。行が記号のままなら検査しない (残件)。
+///
+/// 整列を **主張できない** ものは `unresolved` に積む (0 とみなして緑にしない):
+///   - 別名の基点剰余が静的に決まらない (`pre8 == None`)
+///   - 8 バイト型なのに基点が静的配列 (要素幅 4 しか保証されない)
+fn classify_cast(
+    file: &str,
+    ln: usize,
+    line: &str,
+    c: &CastSite,
+    table: &HashMap<String, SmemObj>,
+    d: &HashMap<String, String>,
+    body: &str,
+    sc: &mut Scan,
+    indirect: bool,
+) {
+    let Some(obj) = table.get(&c.obj) else {
+        return; // smem 由来でない (引数・グローバル配列・レジスタ)
+    };
+    if indirect {
+        sc.indirect_seen += 1;
+    } else {
+        sc.casts_seen += 1;
+    }
+    let width = cast_width(&c.ty);
+    let site = |off: i64| SmemCast {
+        file: file.to_string(),
+        ty: c.ty.clone(),
+        obj: obj.name.clone(),
+        off,
+    };
+    let judgeable = obj.pre8.is_some() && (width == 4 || obj.dyn_base);
+    let base = obj.pre8.unwrap_or(0);
+    match flatten(obj, &c.idx, d, body) {
+        Flat::Resolved(off) => {
+            if obj.inner.is_some() {
+                sc.rows_checked += 1; // 数値行の 2 次元参照も検査済みに数える
+            }
+            if !judgeable {
+                sc.unresolved_casts
+                    .push((file.to_string(), ln, line.trim().to_string()));
+                return;
+            }
+            let bytes = base.saturating_add(off.saturating_mul(obj.stride));
+            let aligned = off >= 0 && bytes.rem_euclid(8) % width == 0;
+            let inbounds = off >= 0 && off + width <= obj.cap;
+            if aligned && inbounds {
+                if indirect {
+                    sc.indirect_sites.push(site(off));
+                } else {
+                    sc.ok_casts.push(site(off));
+                }
+            } else {
+                sc.bad_casts.push((
+                    site(off),
+                    ln,
+                    format!("{} [先頭 {bytes}B / 幅 {width}B]", line.trim()),
+                ));
+            }
+        }
+        // 行が記号 (ループ変数・blockIdx 由来) でも、行ストライドが幅の倍数なら
+        // 平坦化オフセットの整列は列だけで決まる。
+        Flat::SymbolicRow { col, row_known } => {
+            sc.rows_checked += 1;
+            // 列方向に必要な要素数。4 バイト型は旧版の `col + 4` をそのまま維持し
+            // (これまでの検査を弱めない)、8 バイト型は幅 / 要素幅で数える。
+            let need = if width == 4 {
+                4
+            } else {
+                (width + obj.stride - 1) / obj.stride
+            };
+            let col_bytes = base.saturating_add(col.saturating_mul(obj.stride));
+            let col_aligned = col >= 0 && col_bytes.rem_euclid(8) % width == 0;
+            let (row_ok, col_inbounds, why) = match obj.inner {
+                Some(inner) => (
+                    inner.saturating_mul(obj.stride) % width == 0,
+                    col + need <= inner,
+                    format!(
+                        "行 {row_known:?} / 行ストライド {} 要素 * {}B = {}B / 行幅 {inner} / \
+                         幅 {width}B",
+                        inner,
+                        obj.stride,
+                        inner.saturating_mul(obj.stride)
+                    ),
+                ),
+                None => (
+                    true,
+                    true,
+                    "1 次元 (上限はホストが渡すバイト数なのでアラインのみ検査)".to_string(),
+                ),
+            };
+            // s177/P34: 行が数値に解決できたら **行の上限** も検査する。旧版は
+            // `row_known` を失敗メッセージに出すだけで、行が宣言外でも緑だった。
+            //
+            // 残件 (限界 1 の残り): 行が記号のときは検査しない。実カーネルの行は
+            // `sA[ty * 8 + u][c0]` (ty = threadIdx.y) のように **threadIdx / blockIdx
+            // 由来** で、`.cu` の中に静的な上限が無い (上限は cuda.rs の起動ブロック
+            // (16,16,1) が唯一の根拠)。ハード上限 1024 で代替すると ty*8+u <= 8191 と
+            // なり 128 行の宣言に対して常に「越える」= 偽陽性になるので、ここでは
+            // 判定しない。起動ブロックを import する拡張は REPORT_P34.md の残件。
+            let mut row_bad: Option<String> = None;
+            if let (Some(r), Some(inner)) = (row_known, obj.inner) {
+                sc.row_bound_checked += 1;
+                let rows = obj.cap / inner.max(1);
+                let flat_end = r
+                    .saturating_mul(inner)
+                    .saturating_add(col)
+                    .saturating_add(need);
+                if !(r >= 0 && r < rows && flat_end <= obj.cap) {
+                    row_bad = Some(format!(
+                        "行 {r} が宣言 {rows} 行 / 平坦端 {flat_end} が総要素 {} を越える",
+                        obj.cap
+                    ));
+                }
+            }
+            if let Some(m) = row_bad {
+                sc.bad_casts
+                    .push((site(col_bytes), ln, format!("{} [{m}]", line.trim())));
+            } else if !judgeable {
+                sc.unresolved_casts
+                    .push((file.to_string(), ln, line.trim().to_string()));
+            } else if row_ok && col_aligned && col_inbounds {
+                sc.symbolic_ok += 1;
+                sc.symbolic_sites.push(site(col_bytes));
+            } else {
+                sc.bad_casts.push((
+                    site(col_bytes),
+                    ln,
+                    format!("{} [錨 {col} ({}B) / {why}]", line.trim(), col_bytes),
+                ));
+            }
+        }
+        Flat::Unresolved => sc
+            .unresolved_casts
+            .push((file.to_string(), ln, line.trim().to_string())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2088,15 +2492,51 @@ fn kernel_source_4byte_smem_casts_are_aligned_on_all_kernels() {
             .join("\n")
     );
 
+    // ---- s177/P34: float2 は **8 バイト幅** として判定されていること ----
+    // 旧版は float2 も 4 バイト型と同じ `% 4` で見ていた。ここでは
+    // 「3 件とも動的 smem の別名越しに解決できている」ことと、「錨が 8 バイト
+    // 単位 (corr_sm[rc*2] = 8B / s_sm[.. PF_BK] = 32B)」であることを固定する。
+    // どちらかが崩れると、列が奇数のとき 4 バイト整列しか無い番地を緑と判定する。
+    let f2: Vec<&SmemCast> = sc
+        .symbolic_sites
+        .iter()
+        .filter(|c| c.file == "kernels_elem.cu" && c.ty == "float2")
+        .collect();
+    assert_eq!(
+        f2.len(),
+        3,
+        "kernels_elem.cu の float2 荷載 3 件 (corr_sm + s_sm 2 件) を判定できていない: {f2:?}"
+    );
+    assert!(
+        f2.iter().any(|c| c.off == 8),
+        "corr_sm[rc * 2] の 8 バイト錨 (8B) が記録されていない: {f2:?}"
+    );
+    assert_eq!(
+        f2.iter().filter(|c| c.off == 32).count(),
+        2,
+        "s_sm[r0 * PF_BK + kk] の 8 バイト錨 (32B) が 2 件記録されていない: {f2:?}"
+    );
+    // 実カーネルに「間接キャスト」は無い (増えたら判定を通すこと)。
+    assert_eq!(
+        sc.indirect_seen, 0,
+        "smem への間接キャスト (`int *p = (int*)&sA[..]`) を {} 件検出した: 判定は \
+         classify_cast が行うので、期待値を更新して緑を確認すること",
+        sc.indirect_seen
+    );
+
     println!(
         "smem 4-byte casts: {} seen ({} numeric-ok, {} symbolic-row-ok, {} known-bad, \
-         {} unresolved); {} double-index refs checked; {} row aliases",
+         {} unresolved); {} indirect ({} ok); {} double-index refs checked; \
+         {} row bounds checked; {} row aliases",
         sc.casts_seen,
         sc.ok_casts.len(),
         sc.symbolic_ok,
         known.len(),
         sc.unresolved_casts.len(),
+        sc.indirect_seen,
+        sc.indirect_sites.len(),
         sc.rows_checked,
+        sc.row_bound_checked,
         sc.aliases
     );
     }
@@ -2280,6 +2720,188 @@ extern "C" __global__ void fake_good(const signed char *src) {
     assert_eq!(empty.casts_seen, 0);
     assert!(empty.bad_casts.is_empty());
 }
+
+/// s177 (P34): 追加した 3 つの判定の自己検証。
+///
+/// P3-3 の既知の限界のうち、静的に決められるものを実際に検査する:
+///  1. **float2 の 8 バイト整列** (旧版は `% 4` で判定していた): 動的 smem の別名を
+///     通る記号列でも、列の刻みが偶数かどうかで整列が決まる。`kk += 2` は緑、
+///     `kk += 1` は **報告** されること。
+///  2. **別名の基点ずれ** (`float *s_sm = sh + 1;`): 列が 0 でも基点が 4 バイト
+///     ずれていれば float2 は未アライン。旧版は列だけを見て緑にしていた。
+///  3. **間接キャスト / ポインタ変数越しのキャスト** (`int *p = (int*)&sA[r][c];`):
+///     旧版の走査器は `*(T*)` の形しか見ないので 1 件も拾えなかった。
+///  4. **記号列を持つキャストの行の上限** (行が数値に解決できる場合): 宣言行数外の
+///     行は報告されること。
+///
+/// どれも「壊した側が赤・正しい側が緑」の対で確かめる (片方だけだと
+/// 「常に赤」の検査でも通ってしまう)。
+#[test]
+fn kernel_cast_scanner_checks_float2_alias_indirect_and_row_bound() {
+    // ---- (1) float2 は 8 バイト整列 (列の刻みが偶数なら緑) ----
+    let f2 = |step: &str| {
+        format!(
+            r#"
+#define PF_BK 8
+#define PF_BQ 64
+extern "C" __global__ void fake_f2(float *o, int dh) {{
+    extern __shared__ float sh[];
+    float *v_sm = sh + PF_BQ * (dh + 1);
+    float *s_sm = v_sm + PF_BK * (dh + 1);
+    for (int kk = 0; kk < PF_BK; kk += {step}) {{
+        const float2 p = *reinterpret_cast<const float2 *>(&s_sm[kk]);
+        o[kk] = p.x;
+    }}
+}}
+"#
+        )
+    };
+    let sc = scan_kernels(&[("fake_f2_good.cu".to_string(), f2("2"))]);
+    assert!(
+        sc.bad_casts.is_empty(),
+        "kk += 2 (8B 整列) の float2 荷載が違反扱いされた: {:?}",
+        sc.bad_casts
+    );
+    assert_eq!(
+        sc.symbolic_ok, 1,
+        "動的 smem の別名越しの float2 を 1 件も判定できていない: {sc:?}"
+    );
+    assert!(sc.unresolved_casts.is_empty(), "{:?}", sc.unresolved_casts);
+
+    // 刻みを 1 にすると列の錨が 1 要素 = 4 バイトになり、float2 (8B) は未アライン。
+    // 旧版の `% 4` 判定ではここが緑のままだった (これが限界 2 の中身)。
+    let sc = scan_kernels(&[("fake_f2_bad.cu".to_string(), f2("1"))]);
+    assert!(
+        sc.bad_casts
+            .iter()
+            .any(|(s, _, t)| s.ty == "float2" && s.off == 4 && t.contains("錨 1")),
+        "kk += 1 の float2 (4B 整列のみ) を検出できない: {:?}",
+        sc.bad_casts
+    );
+
+    // ---- (2) 別名の基点が 4 バイトずれている場合 ----
+    let alias_off = |off: &str| {
+        format!(
+            r#"
+extern "C" __global__ void fake_alias(float *o, int dh) {{
+    extern __shared__ float sh[];
+    float *s_sm = sh + {off};
+    const float2 p = *reinterpret_cast<const float2 *>(&s_sm[0]);
+    o[0] = p.x;
+}}
+"#
+        )
+    };
+    let sc = scan_kernels(&[("fake_alias_odd.cu".to_string(), alias_off("1"))]);
+    assert!(
+        sc.bad_casts
+            .iter()
+            .any(|(s, _, t)| s.ty == "float2" && t.contains("先頭 4B")),
+        "基点が 1 要素 (4B) ずれた別名越しの float2 を検出できない \
+         (別名オフセットを整列判定に積んでいない): {:?}",
+        sc.bad_casts
+    );
+    // 偶数要素ずれ (8B) なら緑 — 「常に赤」の検査ではないことの確認。
+    let sc = scan_kernels(&[("fake_alias_even.cu".to_string(), alias_off("2"))]);
+    assert!(
+        sc.bad_casts.is_empty(),
+        "8B ずれの別名越しの float2 が違反扱いされた: {:?}",
+        sc.bad_casts
+    );
+
+    // ---- (3) 間接キャスト / ポインタ変数越しのキャスト ----
+    let indirect = |col: &str| {
+        format!(
+            r#"
+#define SP 36
+#define TILE 8
+#define R 3
+#define C 8
+extern "C" __global__ void fake_indirect(const signed char *src) {{
+    __shared__ signed char sA[TILE][SP];
+    int *p = (int*)&sA[R][{col}];
+    *(int*)p = 0;
+}}
+"#
+        )
+    };
+    // 正しい側: 列 8 (4 の倍数) なら間接キャストも p 越しのキャストも緑。
+    let sc = scan_kernels(&[("fake_indirect_good.cu".to_string(), indirect("C"))]);
+    assert!(
+        sc.bad_casts.is_empty(),
+        "整列した間接キャストが違反扱いされた: {:?}",
+        sc.bad_casts
+    );
+    assert_eq!(
+        sc.indirect_seen, 1,
+        "間接キャスト `int *p = (int*)&sA[R][C];` を検出できていない: {sc:?}"
+    );
+    assert_eq!(
+        sc.indirect_sites.len(),
+        1,
+        "間接キャストが整列・範囲内と判定されていない: {sc:?}"
+    );
+    // ポインタ変数越し (`*(int*)p`) も smem 由来として判定されていること。
+    assert!(
+        sc.ok_casts.iter().any(|c| c.obj == "sA" && c.ty == "int"),
+        "`*(int*)p` が smem 由来のキャストとして判定されていない: {sc:?}"
+    );
+
+    // 壊した側: 列 9 (奇数) なら、キャストそのものと p 越しの両方が報告される。
+    let sc = scan_kernels(&[("fake_indirect_bad.cu".to_string(), indirect("C + 1"))]);
+    assert!(
+        sc.indirect_seen >= 1,
+        "壊した間接キャストを検出できていない: {sc:?}"
+    );
+    let bad = sc
+        .bad_casts
+        .iter()
+        .filter(|(s, _, _)| s.obj == "sA")
+        .count();
+    assert!(
+        bad >= 2,
+        "奇数 col の間接キャストが 2 件 (キャスト本体 + p 越し) 報告されていない: {:?}",
+        sc.bad_casts
+    );
+
+    // ---- (4) 記号列を持つキャストの行の上限 ----
+    let row = |r: &str| {
+        format!(
+            r#"
+#define SP 36
+#define TILE 8
+extern "C" __global__ void fake_row(const signed char *src) {{
+    __shared__ signed char sA[TILE][SP];
+    for (int c = 0; c < SP; c += 4) {{
+        *(int*)&sA[{r}][c] = 0;
+    }}
+}}
+"#
+        )
+    };
+    let sc = scan_kernels(&[("fake_row_good.cu".to_string(), row("TILE - 1"))]);
+    assert!(
+        sc.bad_casts.is_empty(),
+        "最終行 (行 7) のキャストが違反扱いされた: {:?}",
+        sc.bad_casts
+    );
+    assert_eq!(
+        sc.row_bound_checked, 1,
+        "行が数値に解決できたキャストの行上限を検査していない: {sc:?}"
+    );
+    let sc = scan_kernels(&[("fake_row_bad.cu".to_string(), row("9"))]);
+    assert_eq!(
+        sc.row_bound_checked, 1,
+        "行上限の検査が走っていない: {sc:?}"
+    );
+    assert!(
+        sc.bad_casts
+            .iter()
+            .any(|(_, _, t)| t.contains("行 9") && t.contains("宣言 8 行")),
+        "宣言 8 行の配列に対する行 9 のキャストを検出できない (限界 1): {:?}",
+        sc.bad_casts
+    );
+}
 /// s100 (P3-3) 既知の潜在不具合 (未修正・このテストでは固定しない): `dno_attention`
 /// (decode 用) の block 間 reduction が共有メモリ `dh` floats に対して
 /// `sh[threadIdx.x + off]` を `threadIdx.x < off` で読むため、block = dh では
@@ -2309,4 +2931,943 @@ fn elem_decode_attention_reduction_reads_past_smem_known_issue() {
         let _ = (cur, fixed_max);
     }
 }
+
+// ---------------------------------------------------------------------------
+// s176 (P31): prefill チェーン (chain_*_prefill_q4) の静的不変条件
+// ---------------------------------------------------------------------------
+//
+// s163 以降の prefill 短縮は「既存カーネルをホスト側の配線で回す」変更で、
+// タイル幅・中間バッファのバイト数・起動引数・残差ストリームの順序・位相
+// マーカーはすべて Rust 側の定数と式から決まる。片側だけ直すと**GPU 無しでも
+// 落ちる**類の間違いなので、`.cu` と Rust のソーステキストだけを読んで固定する
+// (GPU・カーネル起動・cuda feature は使わない — 既存のテストと同じ方針)。
+//
+// 各 assert の直前のコメントは「その assert が捕まえる実際の間違い」を 1 行で
+// 書いてある。整形や識別子の揺れで落ちる検査は入れない。
+
+/// `src/model/qwen35.rs` (残差ストリームの呼び出し側・位相マーカーの 3 箇所)。
+const QWEN35_RS: &str = include_str!("../src/model/qwen35.rs");
+
+/// `fn` の本体を、その宣言行と同じインデントの閉じ波括弧まで切り出す
+/// (トップレベルはインデント 0・impl 内メソッドは 4)。このリポジトリは
+/// rustfmt 済みで、ブロックの閉じ括弧は必ず宣言と同じインデントに来る。
+fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+    let at = src
+        .find(sig)
+        .unwrap_or_else(|| panic!("{sig} がソースに無い (名前を変えたらこのテストも直す)"));
+    let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let indent: String = src[line_start..]
+        .chars()
+        .take_while(|c| *c == ' ')
+        .collect();
+    let close = format!("\n{indent}}}");
+    let rest = &src[at..];
+    let end = rest
+        .find(&close)
+        .unwrap_or_else(|| panic!("{sig} の本体の閉じ波括弧が無い"));
+    &rest[..end + close.len()]
+}
+
+/// トップレベルのカンマだけで引数文字列を分ける (括弧・角括弧・波括弧の内側は
+/// 分けない)。起動引数の**並び**を比べるためのもの。
+fn split_top_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for ch in s.chars() {
+        match ch {
+            '(' | '[' | '{' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if depth == 0 => {
+                let t = cur.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        out.push(t.to_string());
+    }
+    out
+}
+
+/// `src[at..]` の最初の `(` から対応する `)` までの中身。
+fn call_inner<'a>(src: &'a str, at: usize) -> &'a str {
+    let open = src[at..]
+        .find('(')
+        .unwrap_or_else(|| panic!("( が無い"))
+        + at;
+    let mut depth = 0i32;
+    for (i, ch) in src[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open + 1..open + i];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("閉じ括弧が無い")
+}
+
+/// 関数本体内の `let mut args = [ ... ];` の要素名を宣言順に返す
+/// (`&mut pa as *mut _ as *mut c_void` → `pa`)。CUDA の起動引数は
+/// 「配列の並び = カーネルの仮引数の並び」なので、並びの取り違えを検出できる。
+fn launch_arg_names(body: &str) -> Vec<String> {
+    let head = "let mut args = [";
+    let start = body
+        .find(head)
+        .unwrap_or_else(|| panic!("let mut args = [ が無い"))
+        + head.len();
+    let rest = &body[start..];
+    let end = rest
+        .find("];")
+        .unwrap_or_else(|| panic!("args 配列が閉じていない"));
+    split_top_args(&rest[..end])
+        .iter()
+        .map(|a| {
+            let h = a.split(" as ").next().unwrap_or(a).trim();
+            h.trim_start_matches("&mut ")
+                .trim_start_matches('&')
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+/// 関数本体内の `let grid = (...)` の右辺 (セミコロンまで)。
+fn grid_expr(body: &str) -> String {
+    let head = "let grid = (";
+    let at = body
+        .find(head)
+        .unwrap_or_else(|| panic!("let grid = ( が無い"));
+    let rest = &body[at..];
+    let end = rest.find(';').expect("grid の式が ; で終わっていない");
+    rest[..end].trim().to_string()
+}
+
+/// `.cu` の `__global__ void NAME(` の仮引数名を順に返す
+/// (`const float* __restrict__ a` → `a` / `long long total` → `total`)。
+fn kernel_params(src: &str, name: &str) -> Vec<String> {
+    let sig = format!("__global__ void {name}(");
+    let at = src
+        .find(&sig)
+        .unwrap_or_else(|| panic!("{name} がカーネルソースに無い"));
+    let inner = call_inner(src, at + sig.len() - 1);
+    split_top_args(inner)
+        .iter()
+        .map(|p| {
+            let last = p
+                .split_whitespace()
+                .last()
+                .unwrap_or_else(|| panic!("仮引数が空: {p}"));
+            last.trim_start_matches(['*', '&'])
+                .trim_end_matches("[]")
+                .to_string()
+        })
+        .collect()
+}
+
+/// `#[cfg(test)]` の付いた項目 (テスト mod / fn) を取り除いた「本番コード」。
+/// 本番経路の呼び出し点を数えるとき、テスト内の同名呼び出しを混ぜないためのもの。
+fn prod_source(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut cursor = 0usize;
+    while let Some(off) = src[cursor..].find("#[cfg(test)]") {
+        let at = cursor + off;
+        out.push_str(&src[cursor..at]);
+        let Some(b) = src[at..].find('{') else { break };
+        let brace = at + b;
+        let mut depth = 0i32;
+        let mut end = src.len();
+        for (i, ch) in src[brace..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = brace + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        cursor = end;
+    }
+    out.push_str(&src[cursor..]);
+    out
+}
+
+/// `head` で始まる `let (mut a, mut b, ...) = (...);` の代入式。
+fn tuple_assign<'a>(body: &'a str, head: &str) -> &'a str {
+    let at = body
+        .find(head)
+        .unwrap_or_else(|| panic!("{head} が無い"));
+    let rest = &body[at..];
+    let end = rest.find(';').expect("代入が ; で終わっていない");
+    &rest[..end]
+}
+
+/// 代入式の右辺に、この順で識別子が現れることを確かめる (左辺の並びと右辺の
+/// 対応が崩れていないか = カーネル引数の取り違え)。
+fn assert_tuple_order(body: &str, head: &str, rhs: &[&str]) {
+    let t = tuple_assign(body, head);
+    let mut last = 0usize;
+    for name in rhs {
+        let at = t[last..]
+            .find(name)
+            .unwrap_or_else(|| panic!("{head} の右辺に {name} が無い: {t}"));
+        last += at + name.len();
+    }
+}
+
+/// (a) タイル幅 `Q4_M_TILE` がカーネルの行ブロックと一致し、中間バッファが
+/// **1 タイル分**で確保されていることを固定する。
+#[test]
+fn prefill_q4_tile_and_chain_buffers_are_tile_sized() {
+    const INT8: &str = include_str!("../kernels/kernels_int8.cu");
+    let d = defines(INT8);
+    let gm = eval_define("Q4_GM", &d);
+
+    // タイル幅の刻みがカーネルの行ブロック (Q4_GM) と違うと、grid.x が端数ブロック
+    // を出し、per-op 経路と chain 経路で「同じ grid」の前提が崩れる。
+    let step = rust_const("Q4_M_TILE_STEP");
+    assert_eq!(
+        step, gm,
+        "Q4_M_TILE_STEP={step} が dno_gemm_q4_0 の行ブロック Q4_GM={gm} と違う"
+    );
+
+    // 既定タイルが刻みの倍数でないと、タイル境界のたびに端数ブロックが出る
+    // (parse_q4_m_tile の「刻みの倍数のみ」契約が既定値で破れる)。
+    let tile = rust_const("Q4_M_TILE");
+    let max = rust_const("Q4_M_TILE_MAX");
+    assert_eq!(
+        tile % step,
+        0,
+        "既定の Q4_M_TILE={tile} が刻み {step} の倍数でない"
+    );
+    // 既定が上限の外だと、env で同じ値を指定しても既定へ落ちる (A/B 不能) うえ、
+    // 中間バッファの上限 (Q4_M_TILE_MAX 行) の根拠が崩れる。
+    assert!(
+        (step..=max).contains(&tile),
+        "既定の Q4_M_TILE={tile} が [{step}, {max}] の外"
+    );
+
+    // env の解釈が刻みを捨てると、64 行ブロックに対し 3 行などのタイルを受け、
+    // 1 ブロックがタイルバッファの外まで A を読む (確保は cap 行ぶんしかない)。
+    let parse = fn_body(CUDA_RS, "fn parse_q4_m_tile(");
+    assert!(
+        parse.contains("(Q4_M_TILE_STEP..=Q4_M_TILE_MAX).contains(&t) && t % Q4_M_TILE_STEP == 0"),
+        "parse_q4_m_tile が「刻みの倍数のみ」を受けなくなった"
+    );
+
+    // 1 タイルの最大行数が「tile + 端数併合の閾値」でないと、併合された最終タイル
+    // (tile+tail 行) がタイルバッファをはみ出す。
+    let max_rows = fn_body(CUDA_RS, "fn q4_tile_max_rows(");
+    assert!(
+        max_rows.contains("tile.saturating_add(q4_tail_merge_below())"),
+        "q4_tile_max_rows が tile + q4_tail_merge_below() でない"
+    );
+    // 併合の条件が「閾値以下の端数」でないと、cap が見込んでいない行数が 1 回の
+    // launch に載る (上の cap と食い違う)。
+    let group = fn_body(CUDA_RS, "fn q4_group_rows(");
+    assert!(
+        group.contains("if rem > 0 && rem <= q4_tail_merge_below()"),
+        "q4_group_rows の併合条件が rem <= q4_tail_merge_below() でない"
+    );
+    assert!(
+        group.contains("let mr = tile.min(left);"),
+        "q4_group_rows が 1 グループを tile 行に切っていない"
+    );
+
+    // タイル幅を決める 3 経路はすべて実効値 q4_m_tile() を使い、同じ併合関数で
+    // 行を切る。ここが 1024 の直書きに戻ると、per-op と chain で 1 launch の
+    // 行数が変わり「同じ grid・同じ引数」の根拠が消える。
+    for sig in [
+        "fn q4_dispatch(",
+        "fn chain_mlp_prefill_q4_impl(",
+        "fn chain_gdn_prefill_q4_impl(",
+    ] {
+        let b = fn_body(CUDA_RS, sig);
+        assert!(
+            b.contains("let tile = q4_m_tile();"),
+            "{sig}: タイル幅が実効値 q4_m_tile() でない"
+        );
+        assert!(
+            b.contains("q4_group_rows("),
+            "{sig}: 行グループが q4_group_rows で切られていない"
+        );
+    }
+
+    // ---- FFN チェーンの中間バッファは 1 タイル分 (cap) ----
+    // m (プロンプト全体) で確保すると 13k 行で ff 中間 3 枚が 2.7 GiB になり、
+    // 27B の prefill が cuMemAlloc error 2 で CPU へ落ちる (s124 の実測)。
+    let mlp = fn_body(CUDA_RS, "fn chain_mlp_prefill_q4_impl(");
+    assert!(
+        mlp.contains("let cap = q4_tile_max_rows(tile).min(m);"),
+        "FFN チェーンの cap が「1 タイルの最大行数」でない"
+    );
+    for (slot, expr, why) in [
+        ("CH_PFH", "cap * e * 4", "入力ステージが 1 タイル分でない"),
+        (
+            "CH_GA",
+            "cap * 2 * ff * 4",
+            "gate|up の 2 列ぶんが無い (up の書き先が CH_ACT を壊す)",
+        ),
+        ("CH_ACT", "cap * ff * 4", "swiglu 出力が 1 タイル分でない"),
+        ("CH_DOWN", "cap * e * 4", "down 出力が 1 タイル分でない"),
+    ] {
+        let needle = format!("chain_ensure_buf({slot}, {expr})");
+        assert!(
+            mlp.contains(&needle),
+            "FFN チェーンの {slot} が {expr} で確保されていない: {why}"
+        );
+    }
+    // 併合で cap を超えるグループが出たら、その launch はタイルバッファの外を
+    // 読み書きする。この debug_assert が唯一の実行時ガード。
+    assert_eq!(
+        count_in_code(mlp, "debug_assert!(mr <= cap"),
+        1,
+        "FFN チェーンの「グループ <= cap」ガードが消えた"
+    );
+    // Slot 出力は CH_DOWN の r0*e 行目へ書くので、1 タイル分では足りない
+    // (cap で確保すると 2 タイル目以降が領域外へ書く)。
+    assert!(
+        mlp.contains("chain_ensure_buf(CH_DOWN, m.checked_mul(e)?.checked_mul(4)?)"),
+        "FFN チェーンの Slot 出力 (CH_DOWN) が全行ぶんで確保されていない"
+    );
+    // up は CH_GA の後半 (mr*ff 要素のオフセット) に書く。
+    assert!(
+        mlp.contains("let up_off = (mr * ff * 4) as u64;"),
+        "FFN チェーンの up の書き先オフセットが mr*ff*4 でない"
+    );
+    assert!(
+        mlp.contains("chain_gemm_q4_pf(gw_up, pin, pga + up_off, mr, e, ff)"),
+        "FFN チェーンの up GEMM が CH_GA 後半へ書いていない"
+    );
+
+    // ---- GDN チェーンのバッファ ----
+    let gdn = fn_body(CUDA_RS, "fn chain_gdn_prefill_q4_impl(");
+    assert!(
+        gdn.contains("let cap = q4_tile_max_rows(tile).min(n);"),
+        "GDN チェーンの cap が「1 タイルの最大行数」でない"
+    );
+    // 入力ステージは 1 タイル分でよい (タイルごとに H2D し直す)。
+    assert!(
+        gdn.contains("chain_ensure_buf(CH_PFH, cap.checked_mul(e)?.checked_mul(4)?)"),
+        "GDN チェーンの入力ステージ (CH_PFH) が 1 タイル分でない"
+    );
+    // o_proj は n 行を一度に書く (行 0 から) ので、CH_O は全行ぶんが要る。
+    // cap で確保すると 2 タイル目以降の出力が領域外へ書く。
+    assert!(
+        gdn.contains("chain_ensure_buf(CH_O, n.checked_mul(e)?.checked_mul(4)?)"),
+        "GDN チェーンの o_proj 出力 (CH_O) が全行ぶんで確保されていない"
+    );
+    // Slot 入力は rmsnorm が書いた n 行を読む (1 タイル分では足りない)。
+    assert!(
+        gdn.contains("chain_ensure_buf(CH_PFH, n.checked_mul(e)?.checked_mul(4)?)"),
+        "GDN チェーンの Slot 入力 (CH_PFH) が全行ぶんで確保されていない"
+    );
+    assert_eq!(
+        count_in_code(gdn, "debug_assert!(mr <= cap"),
+        1,
+        "GDN チェーンの「グループ <= cap」ガードが消えた"
+    );
+
+    // ---- 残差ストリームの予約は全行 + rmsnorm の重み作業域 ----
+    let reserve = fn_body(CUDA_RS, "fn chain_pf_reserve(");
+    assert!(
+        reserve.contains("let rows = n.checked_mul(e)?.checked_mul(4)?;"),
+        "chain_pf_reserve の行バイト数が n*e*4 でない"
+    );
+    // chain_rmsnorm_slot は w (e*4 B) を**出力バッファの末尾**に置くので、
+    // CH_PFH は n*e*4 + e*4 必要。+e*4 を落とすと重みの H2D が領域外へ書く。
+    assert!(
+        reserve.contains("chain_ensure_buf(CH_PFH, rows.checked_add(e.checked_mul(4)?)?)"),
+        "chain_pf_reserve の CH_PFH に rmsnorm の重み作業域 (e*4) が無い"
+    );
+    // 残差・o_proj・down は層をまたいで全行を持つ (タイル分では足りない)。
+    for slot in ["CH_PF_RES", "CH_O", "CH_DOWN"] {
+        assert!(
+            reserve.contains(&format!("chain_ensure_buf({slot}, rows)")),
+            "chain_pf_reserve の {slot} が全行ぶんでない"
+        );
+    }
+    let rn = fn_body(CUDA_RS, "pub fn chain_rmsnorm_slot(");
+    assert!(
+        rn.contains("let wb = cols * 4;"),
+        "chain_rmsnorm_slot の重み作業域が cols*4 でない"
+    );
+    // 重みを出力バッファの先頭に置くと出力の 0 行目を上書きする。
+    assert!(
+        rn.contains("chain_ensure_buf(out_slot, m * cols * 4 + wb)"),
+        "chain_rmsnorm_slot が出力 + 重み作業域を確保していない"
+    );
+}
+
+/// (b) chain は per-op 経路と**同じカーネル・同じ引数**で起動する (ビット一致の
+/// 根拠)。Rust の 2 つの起動点と `.cu` の仮引数を突き合わせる。
+#[test]
+fn prefill_chain_launches_match_per_op_kernel_and_args() {
+    const INT8: &str = include_str!("../kernels/kernels_int8.cu");
+    const ELEM: &str = include_str!("../kernels/kernels_elem.cu");
+    let d = defines(INT8);
+    let gm = eval_define("Q4_GM", &d);
+    let gn = eval_define("Q4_GN", &d);
+    let code = prod_source(&strip_line_comments(CUDA_RS));
+
+    let per_op = fn_body(CUDA_RS, "fn q4_dispatch_tile(");
+    let chain = fn_body(CUDA_RS, "fn chain_gemm_q4_pf(");
+
+    // 起動点が 2 箇所でないなら、その経路は「per-op と同じ起動」の保証が無い
+    // (チェーンが別の PTX エントリや別引数で回り始めるとビット一致が崩れる)。
+    assert_eq!(
+        code.matches("ctx.launch_async(ctx.f_gemm_q4,").count(),
+        2,
+        "dno_gemm_q4_0 の起動点が per-op と chain の 2 箇所でない"
+    );
+    for (name, b) in [("per-op", per_op), ("chain", chain)] {
+        assert!(
+            b.contains("ctx.launch_async(ctx.f_gemm_q4,"),
+            "{name} が dno_gemm_q4_0 を起動していない"
+        );
+        // 同じ grid 式でないと 1 launch が覆う行/列が変わる (per-op と chain で
+        // 同じ出力になる根拠が消える)。
+        let g = grid_expr(b);
+        assert!(
+            g.contains(&format!("m.div_ceil({gm})")),
+            "{name} の grid.x が Q4_GM={gm} 行ブロックでない: {g}"
+        );
+        assert!(
+            g.contains(&format!("n.div_ceil({gn})")),
+            "{name} の grid.y が Q4_GN={gn} 列ブロックでない: {g}"
+        );
+        // block は (16,16) 固定 — カーネルは tid = ty*16+tx / tid>>7 で
+        // 列を割り当てるので、16x16 以外だと B タイルの列が埋まらない。
+        assert!(
+            b.contains("ctx.f_gemm_q4, grid, (16, 16, 1)"),
+            "{name} の block が (16,16,1) でない"
+        );
+    }
+    assert_eq!(
+        grid_expr(per_op),
+        grid_expr(chain),
+        "per-op と chain の grid 式が違う"
+    );
+    let kb = kernel_body(INT8, "extern \"C\" __global__ void dno_gemm_q4_0(");
+    // カーネル側が 16x16 を前提にしていること (Rust の block と対)。
+    assert!(
+        kb.contains("ty * 16 + tx") && kb.contains("tid >> 7"),
+        "dno_gemm_q4_0 の thread 割り当てが 16x16 前提でなくなった (Rust の block と要同期)"
+    );
+    // grid の除数がカーネルの blockIdx 倍率と一致すること (片側だけ変えると
+    // 出力の行/列が二重に覆われるか、覆われない行が出る)。
+    assert!(
+        kb.contains("const int i0 = blockIdx.x * Q4_GM;")
+            && kb.contains("const int j0 = blockIdx.y * Q4_GN;"),
+        "dno_gemm_q4_0 の blockIdx 倍率が Q4_GM/Q4_GN でなくなった"
+    );
+
+    // 引数の並びが per-op と chain で同一で、`.cu` の仮引数と個数・順が合うこと。
+    // nib と sc を入れ替える / m と k を入れ替える、が最有力の写し間違い。
+    let a_per_op = launch_arg_names(per_op);
+    let a_chain = launch_arg_names(chain);
+    let params = kernel_params(INT8, "dno_gemm_q4_0");
+    assert_eq!(
+        params,
+        vec!["a", "nib", "sc", "out", "m", "k", "n"],
+        "dno_gemm_q4_0 の仮引数が (a, nib, sc, out, m, k, n) でない"
+    );
+    assert_eq!(
+        a_per_op,
+        vec!["pa", "pn", "ps", "po", "mc", "kc", "nc"],
+        "per-op の q4 GEMM の起動引数の並びが変わった"
+    );
+    assert_eq!(
+        a_chain, a_per_op,
+        "chain の q4 GEMM の起動引数が per-op と違う (個数か順が食い違う)"
+    );
+    assert_eq!(
+        params.len(),
+        a_per_op.len(),
+        "起動引数の個数が dno_gemm_q4_0 の仮引数と違う"
+    );
+    for (name, b) in [("per-op", per_op), ("chain", chain)] {
+        // 左辺 (カーネル引数の順) と右辺 (デバイスポインタ) の対応。nib と sc を
+        // 入れ替えると量子化スケールをニブルとして読み、出力だけ静かに壊れる。
+        assert_tuple_order(b, "(mut pa, mut pn, mut ps, mut po)", &["gw.nib.ptr()", "gw.sc.ptr()"]);
+        // m/k/n の順 (k と n を入れ替えると行数と列数が逆になる)。
+        assert!(
+            b.contains("(mut mc, mut kc, mut nc) = (m as c_int, k as c_int, n as c_int);"),
+            "{name} の m/k/n の対応が (m, k, n) でない"
+        );
+    }
+
+    // ---- swiglu: 2 回呼び出し経路と 1 回 (行内 [gate|up]) 経路 ----
+    let sw = kernel_params(ELEM, "dno_swiglu");
+    assert_eq!(
+        sw,
+        vec!["gate", "up", "out", "total"],
+        "dno_swiglu の仮引数が (gate, up, out, total) でない"
+    );
+    let swi = kernel_params(ELEM, "dno_swiglu_int");
+    assert_eq!(
+        swi,
+        vec!["gateup", "out", "ff", "width", "total"],
+        "dno_swiglu_int の仮引数が (gateup, out, ff, width, total) でない"
+    );
+    let sw_split = fn_body(CUDA_RS, "fn chain_swiglu_split(");
+    let sw_rows = fn_body(CUDA_RS, "fn chain_swiglu_rows(");
+    let sw_int = fn_body(CUDA_RS, "fn chain_swiglu_int_at(");
+    assert_eq!(
+        launch_arg_names(sw_split),
+        vec!["pg", "pu", "po", "tc"],
+        "chain_swiglu_split の起動引数の並びが (gate, up, out, total) でない"
+    );
+    assert_eq!(
+        launch_arg_names(sw_rows),
+        vec!["pg", "po", "ffc", "width", "tc"],
+        "chain_swiglu_rows の起動引数の並びが (gateup, out, ff, width, total) でない"
+    );
+    assert_eq!(
+        launch_arg_names(sw_int),
+        vec!["pg", "po", "ffc", "width", "tc"],
+        "chain_swiglu_int_at の起動引数の並びが (gateup, out, ff, width, total) でない"
+    );
+    assert_eq!(
+        sw.len(),
+        launch_arg_names(sw_split).len(),
+        "chain_swiglu_split の引数個数が dno_swiglu と違う"
+    );
+    assert_eq!(
+        swi.len(),
+        launch_arg_names(sw_int).len(),
+        "chain_swiglu_int_at の引数個数が dno_swiglu_int と違う"
+    );
+    // gate / up / out の対応 (up と out を入れ替えると CH_ACT の外へ書く)。
+    assert_tuple_order(sw_split, "(mut pg, mut pu, mut po)", &["gate", "up", "out"]);
+    assert_tuple_order(sw_int, "(mut pg, mut po)", &["ga", "out"]);
+    // 行内レイアウトの stride は 2*ff (CH_GA の 1 行 = gate|up)。width を ff に
+    // すると 2 行目以降の gate/up が別の行の値になる (数値だけ静かに変わる)。
+    assert!(
+        sw_int.contains("let mut width = (2 * ff) as c_int;"),
+        "chain_swiglu_int_at の width が 2*ff でない"
+    );
+    // total は「行 x ff」— mr*2ff を渡すと CH_ACT の外まで書く。
+    let mlp = fn_body(CUDA_RS, "fn chain_mlp_prefill_q4_impl(");
+    assert!(
+        mlp.contains("chain_swiglu_int_at(pga, pact, ff, mr * ff)"),
+        "FFN チェーンの swiglu (行内) の total が mr*ff でない"
+    );
+    assert!(
+        mlp.contains("chain_swiglu_split(pga, pga + up_off, pact, mr * ff)"),
+        "FFN チェーンの swiglu (分割) の total が mr*ff でない"
+    );
+
+    // ---- GDN スキャン: 3 経路が同じ 19 引数で呼ぶ (src と y の宛先だけが経路差) ----
+    let mut calls = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(off) = code[cursor..].find("gdn_scan_chunked_impl(") {
+        let at = cursor + off;
+        cursor = at + 1;
+        if code[..at].trim_end().ends_with("fn") {
+            continue; // 定義そのもの
+        }
+        calls.push(at);
+    }
+    assert_eq!(
+        calls.len(),
+        3,
+        "gdn_scan_chunked_impl の呼び出しが 3 経路 (per-op / i8 chain / q4 chain) でない"
+    );
+    let lists: Vec<Vec<String>> = calls
+        .iter()
+        .map(|&at| split_top_args(call_inner(&code, at)))
+        .collect();
+    assert_eq!(
+        lists[0].len(),
+        19,
+        "gdn_scan_chunked_impl の引数が 19 個でない: {:?}",
+        lists[0]
+    );
+    for (i, l) in lists.iter().enumerate() {
+        assert_eq!(l.len(), lists[0].len(), "{i} 番目の呼び出しの引数個数が違う");
+        for j in 0..l.len() {
+            // 1 = 入力の出所 (Host/Dev)、16 = y の宛先 (None/Some)。この 2 つだけが
+            // 経路差で、残りが 1 つでも違えば scan の演算・chunk 分割が経路で変わる。
+            if j == 1 || j == 16 {
+                continue;
+            }
+            assert_eq!(
+                l[j], lists[0][j],
+                "gdn_scan_chunked_impl の {j} 番目の引数が経路で違う: {} vs {}",
+                l[j], lists[0][j]
+            );
+        }
+    }
+    assert!(
+        lists.iter().any(|l| l[1].contains("GdnScanSrc::Dev")),
+        "q4 チェーンが scan の入力を Dev (デバイス常駐) で渡していない"
+    );
+}
+
+/// (c) デバイス常駐の残差ストリーム (`CH_PF_RES`) は、同じ forward の中で
+/// 書いてから読む。入口条件は純粋述語 `pf_res_gate` が唯一の判断点。
+#[test]
+fn prefill_residual_stream_is_written_before_read() {
+    let q = QWEN35_RS;
+
+    // 発動条件が純粋述語でない (呼び出し側に条件の写しがある) と、片方だけ直した
+    // ときに「残差は常駐だが層はホスト経路」のような半端な状態になる。
+    let code = prod_source(&strip_line_comments(CUDA_RS));
+    let mut gate_calls = 0usize;
+    for (i, _) in code.match_indices("pf_res_gate(") {
+        if !code[..i].trim_end().ends_with("fn") {
+            gate_calls += 1;
+        }
+    }
+    assert_eq!(
+        gate_calls, 2,
+        "pf_res_gate の呼び出しが pf_res_gate_now と pf_layer_geom の 2 箇所でない (条件の写しが増えた)"
+    );
+    let now = fn_body(CUDA_RS, "pub fn pf_res_gate_now(");
+    assert!(
+        now.contains("pf_res_gate(n, e, all_q4, diag, gemm_min_m(), max_m())"),
+        "pf_res_gate_now が純粋述語 pf_res_gate に env 実効値を渡していない"
+    );
+    let lg = fn_body(CUDA_RS, "pub fn pf_layer_geom(");
+    assert!(
+        lg.contains("pf_res_gate(n, e, true, false, gemm_min, max_m)"),
+        "層ゲートが pf_res_gate を通っていない (全体ゲートと別の条件になる)"
+    );
+
+    // 全体ゲートとアップロードが同じ && で繋がっていること。ゲートが false の形で
+    // アップロードだけ走ると、per-op と演算列が変わる形で残差経路に入る。
+    let gate_at = q
+        .find("pf_res_gate_now(n, e, self.all_prefill_q4(), lchk_enabled())")
+        .expect("forward_prefill が pf_res_gate_now を呼んでいない");
+    let up_at = q
+        .find("chain_pf_res_upload(&x, n, e)")
+        .expect("forward_prefill が残差をアップロードしていない");
+    assert!(
+        q[gate_at..up_at].contains("&&"),
+        "残差のアップロードがゲートの && の外にある"
+    );
+    // アップロードは層ループの前 — 後だと 1 層目が未初期化の残差を読む。
+    // (`for (li, layer)` は forward_decode にもあるので、ゲートより後ろで探す。)
+    let loop_at = gate_at
+        + q[gate_at..]
+            .find("for (li, layer) in self.layers.iter().enumerate()")
+            .expect("層ループが無い");
+    assert!(
+        gate_at < up_at && up_at < loop_at,
+        "残差のアップロードが層ループより後にある"
+    );
+
+    // 層の中: 前提検査 (return Ok(None)) → 残差を書く rmsnorm → attention → ...
+    let layer = fn_body(q, "fn prefill_layer_dev(");
+    let i_rms1 = layer
+        .find("cuda::chain_rmsnorm_slot(")
+        .expect("層が残差の rmsnorm を呼んでいない");
+    // 前提検査が残差を書いた後に来ると、フォールバックで同じ層をやり直すとき
+    // 残差に投影出力が二重に足される。
+    for (i, _) in layer.match_indices("return Ok(None)") {
+        assert!(
+            i < i_rms1,
+            "return Ok(None) が残差を書いた後にある (フォールバックで二重加算になる)"
+        );
+    }
+    // 残差を書く前に CH_PF_RES を読む経路があると、前層の値か未初期化領域を読む。
+    // (コメントを落として見る — この関数の説明コメントは CH_PF_RES に触れる。)
+    assert!(
+        !strip_line_comments(&layer[..i_rms1]).contains("CH_PF_RES"),
+        "残差 (CH_PF_RES) を rmsnorm より前に参照している"
+    );
+    let i_gdn = layer
+        .find("cuda::chain_gdn_prefill_q4_dev_ovl(")
+        .expect("層が GDN チェーンを呼んでいない");
+    let i_qkv = layer
+        .find("cuda::chain_qkv_prefill_q4_dev(")
+        .expect("層が qkv チェーンを呼んでいない");
+    assert!(
+        i_rms1 < i_gdn && i_rms1 < i_qkv,
+        "attention チェーンが rmsnorm より先に走っている (CH_PFH が前層の値)"
+    );
+    // 2 回目の rmsnorm は o_proj 出力 (CH_O) の残差加算を融合している。
+    // Some(CH_O) を落とすと attention 出力が残差に足されない (数値だけ静かに変わる)。
+    let i_rms2 = layer
+        .rfind("cuda::chain_rmsnorm_slot(")
+        .expect("2 回目の rmsnorm が無い");
+    assert!(i_rms1 < i_rms2, "rmsnorm が 1 回しか無い");
+    assert!(
+        layer[i_rms2..].contains("Some(cuda::CH_O)"),
+        "2 回目の rmsnorm に o_proj 出力の残差加算 (Some(CH_O)) が無い"
+    );
+    // 次層へ渡すのは FFN の出力 (CH_DOWN)。CH_O を返すと attention 出力が
+    // もう一度足され、FFN 出力が捨てられる。
+    assert!(
+        layer.contains("Ok(Some(cuda::CH_DOWN))"),
+        "層が次層へ FFN 出力 (CH_DOWN) を渡していない"
+    );
+    // 残差は GEMM の作業域に使わない (上書きすると累積が消える)。
+    for (i, _) in code.match_indices("chain_gemm_q4_pf(") {
+        let end = code[i..].find('\n').map(|e| i + e).unwrap_or(code.len());
+        assert!(
+            !code[i..end].contains("CH_PF_RES"),
+            "残差 (CH_PF_RES) が GEMM の入出力に使われている"
+        );
+    }
+
+    // 残差バッファの確保は常に全行 (タイル分にすると 2 タイル目以降が未初期化)。
+    let mut res_sites = 0usize;
+    for (i, _) in CUDA_RS.match_indices("chain_ensure_buf(CH_PF_RES,") {
+        res_sites += 1;
+        let end = CUDA_RS[i..].find(')').map(|e| i + e).unwrap_or(CUDA_RS.len());
+        let line = &CUDA_RS[i..end];
+        assert!(
+            line.contains("rows") || line.contains("bytes"),
+            "CH_PF_RES の確保が全行ぶんの式でない: {line}"
+        );
+    }
+    assert!(res_sites >= 2, "CH_PF_RES の確保点が 2 箇所未満");
+    let upload = fn_body(CUDA_RS, "pub fn chain_pf_res_upload(");
+    assert!(
+        upload.contains("let bytes = n_elems.checked_mul(4)?;")
+            && upload.contains("chain_ensure_buf(CH_PF_RES, bytes)"),
+        "chain_pf_res_upload が全要素ぶんを確保していない"
+    );
+
+    // 残差加算を担う dno_add_rmsnorm の引数対応。x と proj を入れ替えると
+    // 残差 (CH_PF_RES) ではなく投影出力のバッファを更新し、残差が加算されない。
+    const ELEM: &str = include_str!("../kernels/kernels_elem.cu");
+    let params = kernel_params(ELEM, "dno_add_rmsnorm");
+    assert_eq!(
+        params,
+        vec!["x", "proj", "w", "out", "cols", "eps"],
+        "dno_add_rmsnorm の仮引数が (x, proj, w, out, cols, eps) でない"
+    );
+    let rn = fn_body(CUDA_RS, "pub fn chain_rmsnorm_slot(");
+    assert_eq!(
+        launch_arg_names(rn),
+        vec!["px", "pp", "pw", "po", "mc", "ec"],
+        "chain_rmsnorm_slot の起動引数の並びが (x, proj, w, out, cols, eps) でない"
+    );
+    assert_eq!(
+        params.len(),
+        launch_arg_names(rn).len(),
+        "chain_rmsnorm_slot の引数個数が dno_add_rmsnorm と違う"
+    );
+    assert_tuple_order(rn, "(mut px, mut pp, mut pw, mut po)", &["xptr", "pptr", "wdev", "optr"]);
+    // 3 つのスロットの役割: 読む x = x_slot・加算する proj = add_slot・
+    // 書く out = out_slot。取り違えると残差が更新されないまま次層が読む。
+    assert!(
+        rn.contains("let xptr = s.bufs[x_slot].as_ref()?.ptr();")
+            && rn.contains("Some(sl) => s.bufs[sl].as_ref().unwrap().ptr()"),
+        "chain_rmsnorm_slot の x / proj のスロット対応が崩れている"
+    );
+}
+
+/// (d) 位相マーカー (`PF_PH_*`) が 1 箇所に集約され、文書化された順に押されること。
+///
+/// 注意: 「層 1 枚につき 1 回」が成り立つのは FFN 以外の位相だけ。FFN の 3 つは
+/// 1024 行タイルループの**中**にあり、タイルごとに 1 回押される (pf_record の
+/// 説明にも「FFN は 1024 行タイルごとに 3 境界を打つ」と書いてある — イベント
+/// プールは grow で吸収する)。したがってここで固定するのは「押す場所が 1 箇所」
+/// と「FFN の 3 つはタイルループの中」である。
+#[test]
+fn prefill_phase_markers_cover_each_layer_once_in_order() {
+    let names = [
+        "PF_PH_NORM_IN",
+        "PF_PH_GDN_PROJ",
+        "PF_PH_GDN_SCAN",
+        "PF_PH_GDN_OPROJ",
+        "PF_PH_FULL_QK",
+        "PF_PH_FULL_CORE",
+        "PF_PH_FULL_OPROJ",
+        "PF_PH_NORM_POST",
+        "PF_PH_FFN_GATE",
+        "PF_PH_SWIGLU",
+        "PF_PH_FFN_DOWN",
+    ];
+    let code_c = strip_line_comments(CUDA_RS);
+    let code_q = strip_line_comments(QWEN35_RS);
+
+    // id が表示順の index と違うと、PF_PH_NAMES / PF_PH_BUCKETS の並びと
+    // 押される順が食い違う (表 C の行に別の位相の時間が入る)。
+    for (i, n) in names.iter().enumerate() {
+        assert_eq!(
+            rust_const(n),
+            i as i64,
+            "{n} の id が表示順の index {i} と違う"
+        );
+    }
+    // 位相を足して PF_PH_N を上げ忘れると、最後の位相がバケット配列から溢れる。
+    assert_eq!(
+        rust_const("PF_PH_N"),
+        names.len() as i64,
+        "PF_PH_N が位相の数と違う"
+    );
+    assert!(
+        CUDA_RS.contains("pub const PF_PH_NONE: u8 = 0xFF;"),
+        "PF_PH_NONE が 0xFF でない (位相 id と衝突し得る)"
+    );
+
+    // 各マーカーは押す場所が 1 箇所だけ。2 箇所あると位相が二重に区切られ
+    // (同じ行に 2 区間が積まれ)、0 箇所だとその行が黙って 0 になる。
+    for n in names {
+        let pat = format!("{n})");
+        let hits = code_c.matches(&pat).count() + code_q.matches(&pat).count();
+        assert_eq!(hits, 1, "{n} の pf_phase 呼び出しが 1 箇所でない ({hits} 箇所)");
+    }
+
+    // マーカーは発行グループの**先頭**にある (直後に置くとその launch が
+    // 1 つ前の位相に落ちる — P25 で実測した誤帰属)。
+    let ovl = fn_body(CUDA_RS, "fn chain_gdn_prefill_q4_dev_ovl<F>(");
+    let p = ovl.find("pf_phase(PF_PH_GDN_PROJ)").expect("GDN_PROJ が無い");
+    let c = ovl
+        .find("chain_gdn_prefill_q4_impl(")
+        .expect("GDN 本体の呼び出しが無い");
+    assert!(p < c, "GDN_PROJ が GDN 本体 (h2 の D2H) より後にある");
+
+    let gdn = fn_body(CUDA_RS, "fn chain_gdn_prefill_q4_impl(");
+    let (s, o) = (
+        gdn.find("pf_phase(PF_PH_GDN_SCAN)").expect("GDN_SCAN が無い"),
+        gdn.find("pf_phase(PF_PH_GDN_OPROJ)").expect("GDN_OPROJ が無い"),
+    );
+    assert!(s < o, "GDN_SCAN と GDN_OPROJ の順が逆");
+    assert!(
+        s < gdn.find("gdn_scan_chunked_impl(").expect("scan が無い"),
+        "GDN_SCAN が scan の起動より後にある"
+    );
+    assert!(
+        o < gdn.find("chain_gemm_q4_pf(gw_o").expect("o_proj が無い"),
+        "GDN_OPROJ が o_proj の起動より後にある"
+    );
+
+    let qkv = fn_body(CUDA_RS, "fn chain_qkv_prefill_q4_dev(");
+    assert!(
+        qkv.find("pf_phase(PF_PH_FULL_QK)").expect("FULL_QK が無い")
+            < qkv.find("chain_gemm_q4_pf(gwq").expect("q GEMM が無い"),
+        "FULL_QK が qkv GEMM の起動より後にある"
+    );
+    let oproj = fn_body(CUDA_RS, "fn chain_oproj_prefill_q4(");
+    assert!(
+        oproj
+            .find("pf_phase(PF_PH_FULL_OPROJ)")
+            .expect("FULL_OPROJ が無い")
+            < oproj.find("chain_gemm_q4_pf(gw,").expect("o_proj GEMM が無い"),
+        "FULL_OPROJ が o_proj GEMM の起動より後にある"
+    );
+
+    let mlp = fn_body(CUDA_RS, "fn chain_mlp_prefill_q4_impl(");
+    let (g, sw, dn) = (
+        mlp.find("pf_phase(PF_PH_FFN_GATE)").expect("FFN_GATE が無い"),
+        mlp.find("pf_phase(PF_PH_SWIGLU)").expect("SWIGLU が無い"),
+        mlp.find("pf_phase(PF_PH_FFN_DOWN)").expect("FFN_DOWN が無い"),
+    );
+    assert!(g < sw && sw < dn, "FFN の 3 位相の順が gate/swiglu/down でない");
+    assert!(
+        g < mlp.find("chain_gemm_q4_pf(gw1").expect("gate GEMM が無い"),
+        "FFN_GATE が gate GEMM の起動より後にある"
+    );
+    assert!(
+        sw < mlp.find("chain_swiglu_split(pga").expect("swiglu が無い"),
+        "SWIGLU が swiglu の起動より後にある"
+    );
+    assert!(
+        dn < mlp.find("chain_gemm_q4_pf(gw3").expect("down GEMM が無い"),
+        "FFN_DOWN が down GEMM の起動より後にある"
+    );
+    // FFN の 3 つは行タイルループの中 (タイルごとに 1 回)。ループの外へ出すと
+    // 2 タイル目以降の時間が最後の位相に全部乗る (位相別の内訳が壊れる)。
+    let tile_loop = mlp
+        .find("while r0 < m {")
+        .expect("FFN チェーンの行タイルループが無い");
+    assert!(
+        tile_loop < g && tile_loop < sw && tile_loop < dn,
+        "FFN の位相マーカーが行タイルループの外にある"
+    );
+    // GDN の scan / o_proj は行タイルループの**外** (スキャンは層 1 回・
+    // 行で割らない)。中へ入れると 1 層あたりの区間数がタイル数倍になる。
+    let gdn_loop = gdn
+        .find("while r0 < n {")
+        .expect("GDN チェーンの行タイルループが無い");
+    assert!(
+        gdn_loop < s && gdn_loop < o,
+        "GDN_SCAN / GDN_OPROJ が行タイルループの中にある (層 1 回のスキャンを分割している)"
+    );
+
+    // 層の中の順序 (qwen35 側)。GDN 層は 1,2,3 を、full 層は 4,5,6 を通る。
+    let layer = fn_body(QWEN35_RS, "fn prefill_layer_dev(");
+    let i_norm_in = layer.find("cuda::PF_PH_NORM_IN").expect("NORM_IN が無い");
+    let i_norm_post = layer.find("cuda::PF_PH_NORM_POST").expect("NORM_POST が無い");
+    let i_core = layer.find("cuda::PF_PH_FULL_CORE").expect("FULL_CORE が無い");
+    let i_gdn_call = layer
+        .find("cuda::chain_gdn_prefill_q4_dev_ovl(")
+        .expect("GDN 呼び出しが無い");
+    let i_qkv_call = layer
+        .find("cuda::chain_qkv_prefill_q4_dev(")
+        .expect("qkv 呼び出しが無い");
+    let i_oproj_call = layer
+        .find("cuda::chain_oproj_prefill_q4(")
+        .expect("o_proj 呼び出しが無い");
+    let i_mlp_call = layer
+        .find("cuda::chain_mlp_prefill_q4_dev")
+        .expect("FFN 呼び出しが無い");
+    assert!(i_norm_in < i_gdn_call, "NORM_IN が GDN チェーンより後にある");
+    assert!(i_norm_in < i_qkv_call, "NORM_IN が qkv チェーンより後にある");
+    assert!(
+        i_qkv_call < i_core && i_core < i_oproj_call,
+        "full 層の FULL_QK < FULL_CORE < FULL_OPROJ の順が崩れている"
+    );
+    assert!(
+        i_gdn_call < i_norm_post && i_oproj_call < i_norm_post,
+        "NORM_POST が attention チェーンより前にある"
+    );
+    assert!(
+        i_norm_post < i_mlp_call,
+        "FFN チェーンが NORM_POST より前にある (ln2 前の値を読む)"
+    );
+
+    // 層 1 枚の位相列は id が狭義単調増加 — 文書化された順 (PF_PH_NAMES) と
+    // 押される順が一致していることの直接の検査。両分岐を並べる。
+    let ids: Vec<i64> = names.iter().map(|n| rust_const(n)).collect();
+    let gdn_seq = [0usize, 1, 2, 3, 7, 8, 9, 10];
+    let full_seq = [0usize, 4, 5, 6, 7, 8, 9, 10];
+    for seq in [gdn_seq, full_seq] {
+        for w in seq.windows(2) {
+            assert!(
+                ids[w[0]] < ids[w[1]],
+                "位相 {} の id が位相 {} より大きくない (順序が文書と違う)",
+                names[w[0]],
+                names[w[1]]
+            );
+        }
+    }
+
+    // マーカーは計測専用 — カーネル起動もコピーもしない (数値経路と発行順に
+    // 触れない)。ここに launch/memcpy が入ると、計測 ON のときだけ挙動が変わる。
+    let pf = fn_body(CUDA_RS, "pub fn pf_phase(");
+    for bad in ["launch_async", "memcpy", "sync()"] {
+        assert!(
+            !pf.contains(bad),
+            "pf_phase が {bad} を呼んでいる (位相マーカーが数値経路に触れる)"
+        );
+    }
+}
+
 

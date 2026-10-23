@@ -1,10 +1,99 @@
-# prefill 経路の構造と高速化 (s163 時点)
+# prefill 経路の構造と高速化 (s163-s175)
 
 ## 結論
 
 prefill は **入力トークン全部を 1 回の forward で処理している**
 (`Qwen35::forward` → `tokens.len() > 1` → `forward_prefill`)。遅さの原因は
 バッチ化の欠如ではなく、**線形層 1 呼び出しごとのホスト往復**だった。
+
+## 位相会計の読み方 (P27 で確定。以下の `sl_lay_*` / PF_DBG の数字すべてに適用)
+
+`DENNO_PF_DBG=1` の 11 バケット + `tail` は **wall の完全な分割**であって、
+**カーネル時間への分割ではない**。この 2 つを混同すると、位相の % を
+「そのカーネルが wall の何 % を食っているか」と読んでしまう。以下は P27
+(`REPORT_P27.md`) でコードと実測から確定した読み方で、この文書の
+s170 / s172 / s173 節の数字にも遡って適用される。
+
+数値のラベル: **[M]** 実測 / **[R]** 実測値とコードから確定する形状・launch 表による算術 /
+**[A]** 仮定。
+
+### 1. バケット = wall の分割 (漏れも重複も無い) / カーネル時間ではない
+
+- `pf_phase()` (cuda.rs:12051) は**既定ストリームに CUDA イベントを打つだけ**で、
+  区間の長さは `pf_timing_read()` (cuda.rs:12100) が
+  `cuEventElapsedTime(ev[k], ev[k+1])` で読み、**区間の開始イベントの位相**
+  (`phase_of[k]`) のバケットへ積む (cuda.rs:12117-12129)。したがって各バケットは
+  **「その区間で発行したカーネルの実行 + 区間内の GPU アイドル + ホストの遅れ」**。
+- 11 バケットの和 + `tail` = wall。`tail` は `pf_dbg_print` が `wall - sum` で出す
+  (cuda.rs:12186) ので、**漏れも重複も無い分割**になる。`tail` は「位相の外」
+  (prefill 入口 → 最初の境界、層ループ末尾 → 最終 norm/logits) を集めたもので、
+  GPU アイドルではない。
+- したがって `sl_lay_ffn_down` の 11,100.0 ms が「12.39 ms/launch のカーネル」
+  (11,100.0 ms ÷ 896 launch = 12.39 ms [R]。896 = 14 タイル × 64 層) なのか
+  「カーネル 6 ms + 隙間 6 ms」なのかは **PF_DBG では原理的に決まらない**。
+  決めるのは nsys (カーネル Duration と launch 間隔。`REPORT_P27.md` §5c)。
+- 混在が少ないバケットは限られる: `ffn_gate` / `swiglu` / `ffn_down` (最終タイル以外) /
+  `gdn_oproj` / `full_oproj` は 1 launch・H2D 0・D2H 0・sync 0。残り 6 つは混ざっている。
+  位相の ms を「そのカーネルのコスト」として他の形の実効 TFLOP/s と突き合わせる
+  ときは、必ずこの混在を引いてからにする。
+
+### 2. 帰属は 1 位相ぶんずれる (準備は「1 つ前」のバケットに積まれる)
+
+位相境界は**発行グループの先頭**に置かれている (`pf_phase` の呼び出し位置)。
+ところが重みの引き当て (`weights_for_q4`)・中間バッファの確保 (`chain_ensure_buf`)・
+H2D は**その先頭より前**にあるので、**1 つ前の位相の区間に入る**。
+
+| 位相 (バケット) | 境界マーカ (file:line) | 実際に入っている「隣の位相の準備」 |
+|---|---|---|
+| `sl_lay_norm_in` | qwen35.rs:2490 | full 層の qkv チェーンの prologue 全部 (cuda.rs:12782-12804: `weights_for_q4` ×3 / `CH_QKV` ensure / pinned staging ensure) → **過大** |
+| `sl_lay_gdn_proj` | cuda.rs:12238 | 自分の prologue (境界が wrapper 側にあるので**誤帰属しない**) |
+| `sl_lay_gdn_scan` | cuda.rs:11613 | 重み H2D 4 + memset 2 + D2D 2 + sync 1 (混在) |
+| `sl_lay_gdn_oproj` | cuda.rs:11640 | — (純デバイス) |
+| `sl_lay_full_qk` | cuda.rs:12806 | q/k/v GEMM 3 発 + D2H 1 発 + sync 1 回 (混在) |
+| `sl_lay_full_core` | qwen35.rs:2601 | att の H2D (qwen35.rs:2632) + o_proj の prologue (cuda.rs:12900-12903) → **過大** |
+| `sl_lay_full_oproj` | cuda.rs:12914 | — (純デバイス) |
+| `sl_lay_norm_post` | qwen35.rs:2643 | **FFN チェーンの prologue 全部** (cuda.rs:5538-5584: `weights_for_q4` / `chain_ensure_buf` ×5) → **過大** |
+| `sl_lay_ffn_gate` | cuda.rs:5631 | — (1 launch/タイル) |
+| `sl_lay_swiglu` | cuda.rs:5641 | — (1 launch/タイル) |
+| `sl_lay_ffn_down` | cuda.rs:5648 | 最終タイルの区間だけ**次層の prologue** (区間の終端が次層の qwen35.rs:2490 まで伸びる) → **過大** |
+
+- 向きは一貫して **「準備は 1 つ前の位相に積まれる」**。だから「位相 X が重い」は
+  X の**直後に置かれた準備**の分だけ X を過大評価する。とくに `sl_lay_norm_post` を
+  「ln2 のコスト」として読むのは誤り。
+- 量は warm run では全部 µs 級 (1 リクエスト合計 < 10 ms [R]) で無視できる。
+  **cold run だけは別 (§3)**。
+- マーカの出所: `pf_timing_begin` cuda.rs:12021 / `pf_timing_end` cuda.rs:12068 /
+  `pf_timing_read` cuda.rs:12100 / `pf_dbg_print` cuda.rs:12159 /
+  位相 id と表示名 cuda.rs:11874-11902。
+- 位相境界を動かして「会計を正しくする」のは**やらない**。wall は 1 ms も変わらず、
+  s169 以降の run との比較可能性が壊れるだけ (直すのは読み方のほう)。
+
+### 3. cold run は `sl_lay_norm_post` を ≈0.5〜0.6 s 水増しする — `prefill_bench.py` の 1 回目を捨てる理由
+
+- q4 の重みは 1 値あたり 18/32 = 0.5625 B で、1 リクエスト分 (48 GDN + 16 full) は
+  **13.21 GB** [R]。初回 prefill ではこれが全部 `weights_for_q4` の中で H2D され、
+  **その呼び出し位置の位相**に落ちる (`norm_post` / `norm_in` / `full_core` / `gdn_proj`)。
+  18 GB/s なら ≈0.73 s [R] が「どのカーネルでもない時間」として分散する。
+- 実測では **`sl_lay_norm_post` が cold run で ≈0.5〜0.6 s 水増しされる**
+  (`REPORT_P27.md` §2.3)。ln2 の rmsnorm が遅いのではなく、FFN の重みの初回 H2D が
+  そこに積まれているため (§2)。
+- これが **`scripts/prefill_bench.py` の 1 回目を捨てる理由**。2 回目以降 (warm) の
+  水増しは < 10 ms/リクエスト [R] (レジストリ参照と grow-only の ensure の no-op だけ)。
+- 注意: スクリプト自身は**捨てない**。`scripts/prefill_bench.py` は全 run の中央値を
+  出すだけなので、`runs=2` では中央値が 2 本のうち遅い方 (= cold の 1 回目) になる。
+  捨てるのは運用規則で、`runs>=3` にするか 1 本目を手で外す。
+
+### 4. s170 の位相 % は歴史的な値 (現行 HEAD の share ではない)
+
+- 下の s170 / s172 / s173 節に出てくる `18.0 s (28.6 %)` / `10,042.6 ms (15.9 %)` /
+  `11,100.0 ms (17.6 %)` / `33.5 %` は、**n=14,043・wall 63.05 s の 1 run**
+  (s170 時点の HEAD = P12/P13/P14/P15/P16/P17b が入る前のビルド) の値である。
+- 現行 HEAD の wall は 3,161 token で **9.69 s**、12,850 token で **38.79〜40.35 s** [M]
+  (P27 の再構成が使った 9.74〜9.81 s / 39〜42 s [M] と同水準)。wall 自体が 6 倍以上
+  違うので、**s170 の % を現行 HEAD の share として読んではいけない**
+  (同じ「15.9 %」でも分母が違う)。
+- 現行 HEAD の位相値を知るには `DENNO_PF_DBG=1` で取り直す。env は**サーバ側**で
+  立てる (`REPORT_P27.md` §5a の手順)。
 
 ## 旧経路の往復構造
 
@@ -255,8 +344,27 @@ wall 56.3 s (MEASURED) − PCIe 3.5 s (@12GB/s) − ホスト計算 8.9 s = カ�
 
 ### 前提の確かめ方 (この順序は「beta/alpha が 8 s」に依存している)
 
+**env はサーバ側で 1 回だけ読まれます (OnceLock)。** `DENNO_PF_DBG` / `DENNO_Q4_M_TILE` /
+`DENNO_PF_OVERLAP` は serve プロセスが起動時に読むので、python クライアントに付けた env は
+届きません (P27 §5.0 の罠 1)。切り替えるには **serve を立て直します**。根拠は次の 3 箇所です。
+
+| env | 読み出し (serve 起動時に 1 回・`OnceLock`) |
+|---|---|
+| `DENNO_PF_DBG` | `crates/denno-engine/src/cuda.rs:11921-11924` (`pf_dbg_on`) |
+| `DENNO_Q4_M_TILE` | `crates/denno-engine/src/cuda.rs:3504-3510` (`q4_m_tile`) |
+| `DENNO_PF_OVERLAP` | `crates/denno-engine/src/cuda.rs:11702-11705` (`pf_overlap_flag`) |
+
+`[PF_DBG]` の行は**サーバの stderr** に出るので、bench の出力ではなくサーバのログを読みます。
+`scripts/prod_serve_27b.sh` は既存の serve を落としてから `exec` で前面に残る
+(`scripts/prod_serve_27b.sh:13-19` と `:43-44`) ため、`&` で起動して health を待ちます。
+この形は、この文書の他の 2 箇所 (s172 / s173 の実機 A/B) でも同じです。
+
 ```
-DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 2 2>&1 | grep -E "PF_DBG|sl_lay"
+# env はサーバ起動側に付ける (python 側では効きません)
+DENNO_PF_DBG=1 bash scripts/prod_serve_27b.sh > /tmp/pf_dbg.log 2>&1 &
+for i in $(seq 1 120); do curl -sf http://127.0.0.1:8095/health >/dev/null && break; sleep 1; done
+python3 scripts/prefill_bench.py 65000 2
+grep -E "PF_DBG|sl_lay" /tmp/pf_dbg.log
 ```
 
 `sl_lay_gdn_proj` (`REPORT_P8.md:45`) は「h2 の D2H/join + ホスト beta/alpha + qkv/z GEMM」を
@@ -288,8 +396,9 @@ python3 scripts/prefill_bench.py 65000 2   # 12,850 token 相当
 
 ## 残り
 
-> s170 (P9) で下の 1・2 を定量化した (上の s170 節)。往復バイトは wall の 2.7〜6.2 % で、
-> 残る 16 % は beta/alpha のホスト計算。次の一手は候補① (GDN 制御投影のデバイス化)。
+> s170 (P9) で下の 1・2 を定量化した (上の s170 節。**s170 時点のビルド**の値)。
+> 往復バイトは wall の 2.7〜6.2 % で、残る 16 % は beta/alpha のホスト計算。
+> 次の一手は候補① (GDN 制御投影のデバイス化)。
 
 1. ~~qkv / o_proj / GDN 投影 (`qkv_w` / `o_w` / `gate_w`(GDN) / `beta_w` /
    `alpha_w`) はまだ 1 回ごとに往復している。~~ s164 で q4 の GDN 層
@@ -374,10 +483,20 @@ qkv/z GEMM を含む唯一の「ホスト待ち込み」バケット)、その�
 P4 の見積りが正しく ②③ を先にする。RoPE 表の効果は `sl_lay_full_core` の
 `DENNO_PF_ROPE_TAB=1` / `=0` 比較で読める。詳細は `REPORT_P11.md` §3。
 
+> ここで言う「最大」は**バケット (= wall の分割) の大小**であって、カーネル時間の
+> 大小ではない (冒頭「位相会計の読み方」§1)。この予測は s170 の実測で
+> `sl_lay_ffn_gate` が最大になる形で当たったが、それは「その区間の wall が最大」
+> という意味に留まる。
+
 ## s172 (P13): gdn_proj 18.0 s の内訳を確定させ、ホスト仕事を 2 方向で削る
 
 実測 (main session・8095・`DENNO_PF_DBG=1`・n=14,043・48 GDN 層) の
 `sl_lay_gdn_proj` = **18.0 s (28.6 %)** を、P9 の単価で 3 つに割った:
+
+> **歴史的な値**: この 18.0 s / 28.6 % は **n=14,043・wall 63.05 s の run
+> (s170 時点の HEAD。P12 以降が入る前のビルド)** の share で、現行 HEAD の wall の
+> 28.6 % ではない (冒頭「位相会計の読み方」§4)。またバケットは wall の分割なので、
+> この 18.0 s は「qkv/z GEMM のカーネル時間」ではない (§1)。
 
 | 内訳 | 12,850 換算 | 根拠 |
 |---|---|---|
@@ -427,11 +546,21 @@ P4 の見積りが正しく ②③ を先にする。RoPE 表の効果は `sl_la
 
 ### 実機 A/B (cold・同一プロンプト・3 回中央値)
 
+env はサーバ起動時 (OnceLock) なので、① と ② は**それぞれ serve を立て直して**測ります
+(`DENNO_PF_OVERLAP` の読み出しは `crates/denno-engine/src/cuda.rs:11702-11705`)。
+`scripts/prod_serve_27b.sh` は起動時に既存の serve を落とすので、② の行が ① を止めてから
+立ちます。
+
 ```
 # ① ホスト投影の 1 パス化だけを見る (GEMM は直列のまま)
-DENNO_PF_OVERLAP=0 DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 2
-# ② 重ね合わせも入れる (既定)
-DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 2
+DENNO_PF_OVERLAP=0 DENNO_PF_DBG=1 bash scripts/prod_serve_27b.sh > /tmp/pf_a.log 2>&1 &
+for i in $(seq 1 120); do curl -sf http://127.0.0.1:8095/health >/dev/null && break; sleep 1; done
+python3 scripts/prefill_bench.py 65000 2
+# ② 重ね合わせも入れる (既定) — ① の serve を落として env 無しで立て直す
+DENNO_PF_DBG=1 bash scripts/prod_serve_27b.sh > /tmp/pf_b.log 2>&1 &
+for i in $(seq 1 120); do curl -sf http://127.0.0.1:8095/health >/dev/null && break; sleep 1; done
+python3 scripts/prefill_bench.py 65000 2
+grep -E "PF_DBG|sl_lay" /tmp/pf_a.log /tmp/pf_b.log
 ```
 `sl_lay_gdn_proj` の期待: ① ≈14.6 s (18.0 − 3.4)、② ≈10 s。②で ① より縮まない
 なら driver が `cuStreamCreate` を提供していない (静かに従来経路) か、GEMM が
@@ -443,6 +572,12 @@ DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 2
 `sl_lay_ffn_gate` **10,042.6 ms (15.9 %)** + `sl_lay_ffn_down` **11,100.0 ms
 (17.6 %)** = 21.1 s = prefill の **33.5 %**。gate は ≈32 TFLOP/s でカーネル天井
 に近く、P13 と同じく「MAC 数は動かない・launch 数だけが動く」領域。
+
+> **歴史的な値**: これも **n=14,043・wall 63.05 s の run (s170 時点の HEAD)** の
+> 数字で、現行 HEAD の wall の 15.9 % / 17.6 % ではない (冒頭 §4)。とくに
+> `sl_lay_ffn_down` の 11,100.0 ms は「down カーネルが 11.1 s」を意味しない —
+> 区間内の GPU アイドルとホストの遅れを含む wall の分割である (§1)。
+> P14 の before/after 比較は**同じ run の中の**比較としてのみ読む。
 
 ### launch の内訳 (コードから静的に確定。nsys ではない)
 
@@ -500,6 +635,10 @@ P14 で消せるのは **gate と up の 2 発 -> 1 発**だけで、swiglu は�
 | `sl_lay_swiglu` | 210.4 ms | 210.4 ms | 0 |
 | `sl_lay_ffn_down` | 11,100.0 ms | 11,100.0 ms | 0 |
 
+この表の before は **s170 の run (n=14,043・wall 63.05 s) の値**で、現行 HEAD の実測では
+ない。after は予測 [A] (`REPORT_P27.md` の位相会計の読み方 §1 のとおり、バケットは
+wall の分割なので差分は「その区間の wall が何 ms 動くか」の予測)。
+
 総 MAC・総ブロック数・タイル幅は不変で、消えるのは launch 896 発/リクエストだけ。
 P13 が同じ形の連結 (qkv/z の 28 -> 14 発/層) で「全体で µs 級」と実測しているので、
 **ms の利得はほぼ 0 と予測する**。1 発 ≈ 3〜6 µs × 896 ≈ 3〜5 ms。ここが実測で
@@ -508,11 +647,21 @@ P13 が同じ形の連結 (qkv/z の 28 -> 14 発/層) で「全体で µs 級�
 
 ### 実機 A/B
 
+`DENNO_PF_FFN_FUSED` も `DENNO_PF_DBG` と同じくサーバ起動時に 1 回だけ読まれる
+(`crates/denno-engine/src/cuda.rs:5446-5449` / `:11921-11924`) ので、A/B は**それぞれ
+serve を立て直して**測ります。
+
 ```
+# env はサーバ起動側に付ける (python 側では効きません)
 # cold・同一プロンプト・3 回中央値 (毎回 nonce 付き = prefix cache miss)
-DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 3
+DENNO_PF_DBG=1 bash scripts/prod_serve_27b.sh > /tmp/pf_fused.log 2>&1 &
+for i in $(seq 1 120); do curl -sf http://127.0.0.1:8095/health >/dev/null && break; sleep 1; done
+python3 scripts/prefill_bench.py 65000 3
 # 従来の 2 回呼び出しに戻す A/B (数値は不変・launch だけが 3 -> 4 に戻る)
-DENNO_PF_FFN_FUSED=0 DENNO_PF_DBG=1 python3 scripts/prefill_bench.py 65000 3
+DENNO_PF_FFN_FUSED=0 DENNO_PF_DBG=1 bash scripts/prod_serve_27b.sh > /tmp/pf_ffn2.log 2>&1 &
+for i in $(seq 1 120); do curl -sf http://127.0.0.1:8095/health >/dev/null && break; sleep 1; done
+python3 scripts/prefill_bench.py 65000 3
+grep -E "PF_DBG|sl_lay" /tmp/pf_fused.log /tmp/pf_ffn2.log
 ```
 `sl_lay_ffn_gate` / `sl_lay_ffn_down` のラベルは経路が変わっても同じ位相に積む
 (消えない)。8 問 × 150 token greedy の出力は 2 回で md5 一致・基準アンカーとも
