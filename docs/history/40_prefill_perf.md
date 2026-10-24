@@ -1,6 +1,6 @@
 # 第5巻 prefill の速度改善 — 律速は計算ではなく往復とコピーだった
 
-> [索引](README.md) / 前: [第4巻 decode の速度改善](30_decode_perf.md) / 次: [第6巻 GDN](50_gdn.md)
+> [索引](README.md) / 前: [第4巻 decode の速度改善](30_decode_perf.md) / 次: [第6巻 GDN](50_gdn.md) / [English](en/40_prefill_perf.md)
 
 日付は commit の author date を JST で表す。
 

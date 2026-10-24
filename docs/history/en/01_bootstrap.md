@@ -27,17 +27,17 @@ If you only want the summary of the numbers, the table in `docs/KPI.md` is enoug
 
 | phase | date | commit | one-line summary |
 |---|---|---|---|
-| 初期実装 | 2026-10-11 | `7f85369` | the skeleton of a single binary (cli / engine / server) with Anthropic Messages API compatibility |
-| 実モデル疎通 | 2026-10-11 | `b718e59` | fixed the GEMM stride and the QKV bias of the Qwen2 family; GPT-2 / Qwen2.5-0.5B pass |
-| 最初の速度対策 | 2026-10-11 | `67280c9` | attention moved to sgemm, `target-cpu=native`, SSE event names and ping |
+| Initial implementation | 2026-10-11 | `7f85369` | the skeleton of a single binary (cli / engine / server) with Anthropic Messages API compatibility |
+| Real-model bring-up | 2026-10-11 | `b718e59` | fixed the GEMM stride and the QKV bias of the Qwen2 family; GPT-2 / Qwen2.5-0.5B pass |
+| First speed work | 2026-10-11 | `67280c9` | attention moved to sgemm, `target-cpu=native`, SSE event names and ping |
 | P1 | 2026-10-11 | `831246b` | reuse of the KV cache across requests and a single-entry prefix cache |
-| Docker 配備 | 2026-10-11 | `f1c3bde` | multi-stage build and automatic model fetch at startup |
+| Docker deployment | 2026-10-11 | `f1c3bde` | multi-stage build and automatic model fetch at startup |
 | P2 / CI | 2026-10-11 | `6faf889` | 48 tests, multi-entry LRU prefix cache, CI on push |
-| CI 修正 | 2026-10-11 | `37cc6b0` | pinned `target-cpu` to `x86-64-v3` in response to SIGILL |
+| CI fix | 2026-10-11 | `37cc6b0` | pinned `target-cpu` to `x86-64-v3` in response to SIGILL |
 
 ---
 
-### 初期実装: a single binary and the Anthropic-compatible API (2026-10-11, `7f85369`)
+### Initial implementation: a single binary and the Anthropic-compatible API (2026-10-11, `7f85369`)
 
 - **Intent**: We wanted a "readable" LLM server for learning purposes, self-contained in 1 repository. Since we were not bringing in an existing inference engine and were going to write the forward pass and the sampler ourselves, we narrowed the target architectures to 2 lines, GPT-2 and the Qwen2/Llama family. The client we used at the time spoke the Anthropic Messages API, so we matched the compatible side, and to drive the same engine from both the CLI and the server we split the code into 3 crates (cli / engine / server).
 
@@ -59,7 +59,7 @@ If you only want the summary of the numbers, the table in `docs/KPI.md` is enoug
 
 ---
 
-### 実モデル疎通 — GEMM stride and QKV bias (2026-10-11, `b718e59`)
+### Real-model bring-up — GEMM stride and QKV bias (2026-10-11, `b718e59`)
 
 - **Intent**: The initial implementation was shape only, and running a real model did not produce matching numbers. We first set the goal of getting the 2 models, GPT-2 and Qwen2.5-0.5B, through end to end.
 
@@ -81,7 +81,7 @@ If you only want the summary of the numbers, the table in `docs/KPI.md` is enoug
 
 ---
 
-### 最初の速度対策とクライアント互換 — sgemm attention / native target / SSE (2026-10-11, `67280c9`)
+### First speed work and client compatibility — sgemm attention / native target / SSE (2026-10-11, `67280c9`)
 
 - **Intent**: With a real model running, the next stage was to reach usable speed. Prefill and decode at the time were scalar loops, and waiting for 1 request was painful. At the same time we had to close the problem of clients not being able to connect (SSE).
 
@@ -125,7 +125,7 @@ If you only want the summary of the numbers, the table in `docs/KPI.md` is enoug
 
 ---
 
-### Docker 配備 — multi-stage build and automatic model fetch (2026-10-11, `f1c3bde`)
+### Docker deployment — multi-stage build and automatic model fetch (2026-10-11, `f1c3bde`)
 
 - **Intent**: We wanted to stop carrying around a locally built binary and make the server come up with `docker compose up`. Model fetching was also pulled to startup.
 
@@ -169,7 +169,7 @@ If you only want the summary of the numbers, the table in `docs/KPI.md` is enoug
 
 ---
 
-### CI の SIGILL 修正 — pinning the build target to x86-64-v3 (2026-10-11, `37cc6b0`)
+### CI SIGILL fix — pinning the build target to x86-64-v3 (2026-10-11, `37cc6b0`)
 
 - **Intent**: CI started failing depending on the runner. We wanted to close the cause and get back to the same verdict on every push.
 

@@ -1,6 +1,6 @@
 # 第4巻 decode の速度改善 — SIMD からデバイス常駐 chain、そして算術で閉じた棄却まで
 
-> [索引](README.md) / 前: [第3巻 モデル対応](20_models.md) / 次: [第5巻 prefill の速度改善](40_prefill_perf.md)
+> [索引](README.md) / 前: [第3巻 モデル対応](20_models.md) / 次: [第5巻 prefill の速度改善](40_prefill_perf.md) / [English](en/30_decode_perf.md)
 
 decode (1 トークンずつ生成する経路) を速くするために何を測り、何を入れ、何を捨てたかの記録。
 CPU の SIMD からはじまり、バッチ化、attention の GPU オフロード、デバイス常駐チェーン、
