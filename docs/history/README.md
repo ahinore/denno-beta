@@ -7,6 +7,7 @@
 - 旧 `docs/HISTORY.ja.md` / `docs/HISTORY.en.md`（4,007 行・P41 で停止）は、内容をこの 8 巻へ移して**削除した**。
   commit 単位の生ログを引きたいときは git の履歴から取れる（削除した commit の親を指定する）。
 - 全 137 phase の一覧（日付順・commit つき）は [`90_phase_index.md`](90_phase_index.md)。
+- 英語版は [`en/README.md`](en/README.md)（同じ 8 巻 + 付録の翻訳）。
 
 ## 巻一覧
 
