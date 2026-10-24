@@ -2,7 +2,7 @@
 """P4-4 (s98): 長文 needle recall の回帰チェック。
 
 s73 の調査では 4,671 token の長文 (needle-in-a-haystack) を手で入力して
-「長い文脈の KV 経路が壊れていない」ことを確かめた (docs/HISTORY.en.md:1621)。
+「長い文脈の KV 経路が壊れていない」ことを確かめた (docs/history/60_quality.md, the long-context regression entry)。
 その 1 回きりの確認を、毎回同じ payload で回せる形に固定したものがこのスクリプト。
 
 流れ:

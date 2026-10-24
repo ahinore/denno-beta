@@ -19,7 +19,7 @@
    使い回す・ホストはその pinned スライスを直接読む**。コピー回数・発行順・GEMM は不変。
 3. 削減量は**このホストの実測単価ではほぼゼロ**の可能性が高い:
    s68 の実測は pageable 直 D2H **13.9 GB/s** / pinned **14.3 GB/s** (MEASURED,
-   `docs/HISTORY.ja.md:1524-1528`) で、差は 12.88 GB に対して **26 ms/request** しかない。
+   `docs/history/40_prefill_perf.md` の s68) で、差は 12.88 GB に対して **26 ms/request** しかない。
    一方 PF_DBG の `full_qk` バケット (2,101 ms) から GEMM を引くと D2H は 6.5 GB/s 相当で、
    こちらを信じるなら **−1.08 s/request**。**この 2 つの読みは両立しない (§7)。**
 4. だからこの設計は「速くする」より **「どちらの読みが正しいかを壊さずに測れる形にする」**
@@ -72,9 +72,9 @@ qkv チェーン (層あたり):
   n が増えたときだけ再確保 (grow)。
 - ホスト側に返す型は `&[f32]` 3 本 (または `PfQkvHostView` 相当の 3 スライス struct)。
   **Vec へはコピーしない** — pinned → heap の `memcpy` はこのホストで **4.7 GB/s** (MEASURED,
-  `docs/HISTORY.ja.md:1528`) しか出ず、12.88 GB なら +2.7 s の新規費用になる。
+  `docs/history/40_prefill_perf.md` の s68) しか出ず、12.88 GB なら +2.7 s の新規費用になる。
 - **初回タッチの費用は 1 回だけ**: 新規 pinned は「確保 + 初回タッチ」で 1.48 GB/s まで落ちる
-  (MEASURED, 279 MB の例 `docs/HISTORY.ja.md:1384`)。805 MB なら ≈0.54 s を**最初の 1 層**が
+  (MEASURED, 279 MB の例 `docs/history/40_prefill_perf.md` の s68)。805 MB なら ≈0.54 s を**最初の 1 層**が
   払う。cold A/B では 1 リクエスト目を捨てる (prefill_bench の既定) か、`begin` で
   ダミー H2D を 1 発打って温める。
 
@@ -109,7 +109,7 @@ qkv チェーン (層あたり):
 
 | 読み | R_pageable | R_pinned | D2H 現状 | D2H 後 | 削減 | 出所 |
 |---|---|---|---|---|---|---|
-| (A) マイクロベンチ | **13.9 GB/s** (MEASURED) | **14.3 GB/s** (MEASURED) | 927 ms | 901 ms | **−26 ms** | s68 `HISTORY.ja.md:1524-1528` (345 MB の 1 発) |
+| (A) マイクロベンチ | **13.9 GB/s** (MEASURED) | **14.3 GB/s** (MEASURED) | 927 ms | 901 ms | **−26 ms** | s68 `docs/history/40_prefill_perf.md` (345 MB の 1 発) |
 | (B) PF_DBG バケット | **6.5 GB/s** (RECONSTRUCTED) | 14.3 GB/s (MEASURED) | 1,982 ms | 901 ms | **−1.08 s** | `full_qk` 2,101 ms − GEMM 131 ms (2.06 TFLOP @15.7 TFLOP/s) = 1,970 ms |
 | (C) task の「~6 GB/s 上限」 | 6.0 GB/s (ASSUMED) | 14.3 GB/s (MEASURED) | 2,147 ms | 901 ms | **−1.25 s** | task の一般論。このホストの実測 (A) とは矛盾 |
 | (D) task の「約 1.0 s @65k」 | 12.9 GB/s (ASSUMED) | 14.3 GB/s (MEASURED) | 1,000 ms | 901 ms | **−0.10 s** | task 本文の理論値 |

@@ -4,7 +4,7 @@
 > The goal is to understand how LLMs work (tokenization → forward pass → sampling → decode loop) through code, so the **inference kernel is implemented entirely from scratch** (no existing LLM libraries such as candle).
 > Repository: https://github.com/ahinore/denno-beta
 > Structural reference: ashhart/TensorFold (a similar server written in Zig)
-> Development history and measurement data: see the [Development History](HISTORY.en.md)
+> Development history and measurement data: see the [development history index](history/README.md) (Japanese)
 
 ---
 
@@ -202,7 +202,7 @@ The kernel alone achieves **3.9–5.9×** vs 4 standalone matvecs (0.5B shapes, 
 
 ### Profiler (prof.rs)
 
-Enabled with `DENNO_PROFILE=1`. On request completion, logs accumulated time per phase (embed/rmsnorm/rope/qkv/attn/oproj/gate_up/swiglu/down/lm_head/sampler/detok). Zero overhead when disabled, never touches the numeric path. Measurement data: P7.5 section of the [Development History](HISTORY.en.md).
+Enabled with `DENNO_PROFILE=1`. On request completion, logs accumulated time per phase (embed/rmsnorm/rope/qkv/attn/oproj/gate_up/swiglu/down/lm_head/sampler/detok). Zero overhead when disabled, never touches the numeric path. Measurement data: P7.5 section of [the measurement volume](history/70_infra.md) (Japanese).
 
 #### prefill / decode split and the attn_core breakdown (s57)
 
@@ -502,7 +502,7 @@ The basic structure keeps **weights, the KV mirror, and hidden states resident i
 | attention (decode `dno_attention` / prefill `dno_attention_prefill`) | **Approved relaxation window** (maxabs < 1e-3, cos > 0.999, user-approved) |
 | GDN scan | bit-identity not required (contract is only "same input → same output + determinism"; `expf` etc. allowed) |
 
-- **E2E regression criteria**: models dominated by linear layers are judged by "bit-identical to CPU"; GDN models by "**(a) determinism on GPU (same payload → same output) and (b) validity of the output content**". On near-tie prompts even temperature-0 greedy can flip the argmax through chaotic amplification across 32 layers of a tiny within-contract drift (~4e-7 observed) — see the "8095 GPU E2E regression investigation" section in the [Development History](HISTORY.en.md)
+- **E2E regression criteria**: models dominated by linear layers are judged by "bit-identical to CPU"; GDN models by "**(a) determinism on GPU (same payload → same output) and (b) validity of the output content**". On near-tie prompts even temperature-0 greedy can flip the argmax through chaotic amplification across 32 layers of a tiny within-contract drift (~4e-7 observed) — see the "8095 GPU E2E regression investigation" section in [the prefill volume](history/40_prefill_perf.md) (Japanese)
 - Existing contracts — sequential == batched prefill bit-identity, solo == batch decode — hold on the GPU path too
 
 ### 8.3 What stays on CPU
@@ -550,7 +550,7 @@ Being Anthropic Messages API compatible, it works as-is with the official SDKs a
 - Tool use is supported (tools/tool_choice, tool_use/tool_result history weaving, constrained decoding for `any`/`tool`, streaming tool_use via the SSE assembler)
 - One model per process (multi-model serving is a future candidate). Concurrent decode of multiple sessions is already handled by continuous batching (P6)
 - The viewer is the JS version (WASM port, replay scrubber, and L2 tensor display remain)
-- Large-model download verification and performance are recorded in the [Development History](HISTORY.en.md)
+- Large-model download verification and performance are recorded in [the model-support volume](history/20_models.md) (Japanese)
 
 ## 11. Inference Visualization (denno-trace) — Implemented Architecture (P13/P14)
 
@@ -627,10 +627,10 @@ Three columns. The browser side also uses a playback queue + decimation so it **
 - With telemetry OFF the code path effectively doesn't exist, and **exactness tests and the reference output are unchanged**. Even when ON it's read-only so numbers don't change (though A/B measurements are taken with telemetry OFF)
 
 ---
-Development history, verification data, and future plans: [Development History](HISTORY.en.md)
+Development history, verification data, and future plans: [development history index](history/README.md) (Japanese)
 ## 12. Qwen3.5 hybrid architecture (Gated DeltaNet) and the GGUF loader (P19)
 
-> The third model family, added in P19. On top of the existing safetensors + `model_type` dispatch route, two new elements arrived: a **GGUF loader route** and **layers with recurrent state (Gated DeltaNet)**. Measurement data: [Development History](HISTORY.en.md), P19 section.
+> The third model family, added in P19. On top of the existing safetensors + `model_type` dispatch route, two new elements arrived: a **GGUF loader route** and **layers with recurrent state (Gated DeltaNet)**. Measurement data: [the model-support volume](history/20_models.md) (Japanese).
 
 ### 12.1 Layer layout of Qwen3.5 (3:1 hybrid)
 
@@ -653,7 +653,7 @@ output  = rmsnorm(o) * w * silu(z)                    # gated RMS norm (z from a
 
 - q/k are **L2-normalized** beforehand (x/sqrt(Σx²+eps); q additionally 1/sqrt(head_k_dim))
 - softplus follows the ggml convention (`x > 20 ? x : log(1+exp(x))`)
-- **The GQA head mapping follows the tiled-repeat convention**: when n_v_heads > n_k_heads, the k/q head that v-head h refers to is **`h % n_k_heads`** (cyclic tile, same as GGUF/llama.cpp `ggml_repeat`). This is a **different convention** from HF transformers' `repeat_interleave` (blocked, `h // g`) and follows the GGUF-path semantics (0.8B is nk==nv so they coincide; 9B is 2x, 27B is 3x; non-divisible configurations are rejected at load). The old blocked implementation was the root cause of the 27B output failure (fixed 2026-10-16 — see [development history](HISTORY.en.md), "GDN GQA head mapping fix" section)
+- **The GQA head mapping follows the tiled-repeat convention**: when n_v_heads > n_k_heads, the k/q head that v-head h refers to is **`h % n_k_heads`** (cyclic tile, same as GGUF/llama.cpp `ggml_repeat`). This is a **different convention** from HF transformers' `repeat_interleave` (blocked, `h // g`) and follows the GGUF-path semantics (0.8B is nk==nv so they coincide; 9B is 2x, 27B is 3x; non-divisible configurations are rejected at load). The old blocked implementation was the root cause of the 27B output failure (fixed 2026-10-16 — see [the model-support volume](history/20_models.md) (Japanese), "GDN GQA head mapping" section)
 - The implementation is a 1:1 port of llama.cpp `delta-net-base.cpp`'s `build_delta_net_autoregressive` (sequential AR form). Bit-identity with llama.cpp is not required — only the denno contract (same input → same output + determinism) is guaranteed (the sequential AR form and the chunked form are mathematically equivalent)
 - Code layout: `gdn.rs` has `GdnCore<'a>` (reference views of the tiny f32 tensors: conv1d/ssm_a/ssm_dt/ssm_norm) + `forward_token_core` (math core). Larger matrices (qkv/gate/beta/alpha/out) reuse the existing `Linear` → `model/qwen35.rs` assembles the layers
 

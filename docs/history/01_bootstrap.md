@@ -20,7 +20,7 @@ Rust / Cargo workspace、transformer の forward と KV キャッシュ、Anthro
 ## 読む順序
 
 初期実装 → 実モデル疎通 → 最初の速度対策 → P1(KV/prefix cache)→ Docker → P2 と CI → CI 修正、の順に読む。
-数値の要約だけ見たい場合は `docs/HISTORY.ja.md` §2 の要約表で足りる。この巻はその表の各行を、意図とつまずきまで含めて開いたもの。
+数値の要約だけ見たい場合は `docs/KPI.md` の表で足りる。この巻はその表の各行を、意図とつまずきまで含めて開いたもの。
 
 ## 対象 phase 一覧
 

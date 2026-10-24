@@ -4,7 +4,7 @@
 > LLMの動作原理(トークン化 → forward pass → サンプリング → デコードループ)をコードで理解することを目的に、**推論カーネルを完全自前実装**している(candle等の既存LLMライブラリは不使用)。
 > リポジトリ: https://github.com/ahinore/denno-beta
 > 構成の参考: ashhart/TensorFold (Zig製の同種サーバー)
-> 開発の経緯・計測データは [開発史（巻に分けた読み物）](history/README.md) と [開発履歴（一次記録）](HISTORY.ja.md) へ
+> 開発の経緯・計測データは [開発史（巻に分けた読み物）](history/README.md) へ
 
 ---
 
@@ -202,7 +202,7 @@ P9のfp32カーネルの構造:
 
 ### プロファイラ (prof.rs)
 
-`DENNO_PROFILE=1` で有効化。リクエスト完了時に各フェーズ(embed/rmsnorm/rope/qkv/attn/oproj/gate_up/swiglu/down/lm_head/sampler/detok)の累積時間をログ出力。無効時はオーバーヘッドゼロ、数値経路に触れない。計測データは [開発履歴](HISTORY.ja.md) のP7.5節参照。
+`DENNO_PROFILE=1` で有効化。リクエスト完了時に各フェーズ(embed/rmsnorm/rope/qkv/attn/oproj/gate_up/swiglu/down/lm_head/sampler/detok)の累積時間をログ出力。無効時はオーバーヘッドゼロ、数値経路に触れない。計測データは [計測・検証の巻](history/70_infra.md) の P7.5 の項を参照。
 
 #### prefill / decode の分離と attn_core の内訳 (s57)
 
@@ -502,7 +502,7 @@ flowchart LR
 | attention(decode `dno_attention`/prefill `dno_attention_prefill`) | **数値緩和枠**(maxabs < 1e-3・cos > 0.999・ユーザー承認済み) |
 | GDN スキャン | bit 一致不要(契約は「同一入力→同一出力+決定論」のみ・`expf` 等使用可) |
 
-- **E2E 回帰判定基準**: 線形層中心のモデルは「CPU とのビット一致」、GDN モデルは「**(a) GPU 上の決定論(同一 payload → 同一出力)(b) 出力内容の妥当性**」。near-tie prompt では temperature 0 greedy でも緩和契約内の微小 drift(観測 ~4e-7)が 32 層のカオス的増幅で argmax を反転させ得るため(詳細は [開発履歴](HISTORY.ja.md)「8095 GPU E2E リグレッション調査」節)
+- **E2E 回帰判定基準**: 線形層中心のモデルは「CPU とのビット一致」、GDN モデルは「**(a) GPU 上の決定論(同一 payload → 同一出力)(b) 出力内容の妥当性**」。near-tie prompt では temperature 0 greedy でも緩和契約内の微小 drift(観測 ~4e-7)が 32 層のカオス的増幅で argmax を反転させ得るため(詳細は [prefill の巻](history/40_prefill_perf.md) の「8095 GPU E2E 回帰調査」の項)
 - 逐次とバッチ prefill のビット一致、solo==batch decode などの既存契約は GPU 経路でも維持
 
 ### 8.3 CPU に残すもの
@@ -549,7 +549,7 @@ Anthropic Messages API互換なので、公式SDKやAnthropic互換クライア�
 - tool use (tools/tool_choice・tool_use/tool_result 履歴織り込み・`any`/`tool` の拘束デコード・streaming tool_use の SSE アセンブラ) 対応済み
 - 1プロセス1モデル(マルチモデル同時serveは今後の候補)。複数セッションの同時decodeは連続バッチング(P6)で対応済み
 - ビューアはJS版(WASM移植・リプレイスクラバー・L2テンソル表示は残課題)
-- 大型モデルのDL検証・性能は [開発履歴](HISTORY.ja.md) に記録
+- 大型モデルのDL検証・性能は [モデル対応の巻](history/20_models.md) に記録
 
 ## 11. 推論可視化(denno-trace)— 実装済みの構成(P13/P14)
 
@@ -626,10 +626,10 @@ graph LR
 - テレメトリOFF時はコードパス自体が存在しないに等しく、**exactnessテスト・基準出力は不変**。ON時もread-onlyのため数値は変わらない(ただしA/B計測はテレメトリOFFで行う)
 
 ---
-開発の経緯・検証データ・今後の計画: [開発史（巻に分けた読み物）](history/README.md) / [開発履歴（一次記録）](HISTORY.ja.md)
+開発の経緯・検証データ・今後の計画: [開発史（巻に分けた読み物）](history/README.md)
 ## 12. Qwen3.5 ハイブリッドアーキテクチャ(Gated DeltaNet)と GGUF ローダ(P19)
 
-> P19 で追加された 3 番目のモデルファミリー。従来の safetensors+`model_type` 判定の経路に加え、**GGUF 形式のローダ経路**と**再帰状態を持つ層(Gated DeltaNet)**という新しい要素が入った。計測データは [開発履歴](HISTORY.ja.md) の P19 節。
+> P19 で追加された 3 番目のモデルファミリー。従来の safetensors+`model_type` 判定の経路に加え、**GGUF 形式のローダ経路**と**再帰状態を持つ層(Gated DeltaNet)**という新しい要素が入った。計測データは [モデル対応の巻](history/20_models.md) の P19 の項。
 
 ### 12.1 Qwen3.5 の層構成(3:1 ハイブリッド)
 
@@ -652,7 +652,7 @@ o[c]   = sum_r q[r] * S[r][c]
 
 - q/k は事前に **L2 正規化**(x/sqrt(Σx²+eps)・q のみ追加で 1/sqrt(head_k_dim))
 - softplus は ggml 規約(`x > 20 ? x : log(1+exp(x))`)
-- **GQA head mapping はタイル repeat 規約**: n_v_heads > n_k_heads のとき v-head h が参照する k/q head は **`h % n_k_heads`**(cyclic タイル・GGUF/llama.cpp `ggml_repeat` と同一)。HF transformers の `repeat_interleave`(blocked・`h // g`)とは**異なる規約**で、GGUF 経路の意味論に従う(0.8B は nk==nv で同一・9B 2x・27B 3x。割り切れない構成はロード拒否)。旧実装の blocked は 27B 出力破綻の根因だった(2026-10-16 修正・[開発履歴](HISTORY.ja.md)「GDN GQA head mapping 修正」節)
+- **GQA head mapping はタイル repeat 規約**: n_v_heads > n_k_heads のとき v-head h が参照する k/q head は **`h % n_k_heads`**(cyclic タイル・GGUF/llama.cpp `ggml_repeat` と同一)。HF transformers の `repeat_interleave`(blocked・`h // g`)とは**異なる規約**で、GGUF 経路の意味論に従う(0.8B は nk==nv で同一・9B 2x・27B 3x。割り切れない構成はロード拒否)。旧実装の blocked は 27B 出力破綻の根因だった(2026-10-16 修正・[モデル対応の巻](history/20_models.md) の「GDN GQA head mapping」の項)
 - 実装は llama.cpp `delta-net-base.cpp` の `build_delta_net_autoregressive`(逐次 AR 形式)の 1:1 移植。llama.cpp とのビット一致は要求せず、denno 契約(同一入力→同一出力+決定論)のみを担保(逐次 AR 形式と chunked 形式は数学的に等価)
 - コード構成: `gdn.rs` に `GdnCore<'a>`(極小 f32 テンソル: conv1d/ssm_a/ssm_dt/ssm_norm の参照ビュー)+ `forward_token_core`(数学コア)。大きい行列(qkv/gate/beta/alpha/out)は既存 `Linear` を再利用 → `model/qwen35.rs` が層を組み立てる
 

@@ -380,7 +380,7 @@ passed。残った内訳は `d2h_state`・`attn_core`・`gate_up` で、**次の
 
 **意図** — s68 で GEMM 経路の二度手間を消したが、attention 出力の取得 `chain_download` と o_proj の戻り値
 (`maybe_gpu_oproj`) は「pinned へ D2H → `to_vec` でヒープへ複製」のままだった。93 MB の出力を毎回 2 度書いていた。
-(HISTORY.ja.md ではこの見出しが 2 回重複しているため、本巻では 1 エントリに統合した。)
+(一次記録ではこの見出しが 2 回重複していたため、本巻では 1 エントリに統合した。)
 
 **変えたもの** — `cuda.rs` の `chain_download` / `chain_download_at` は出力 `Vec` を `with_capacity` で確保
 し、その未初期化領域へ直接 D2H して完了後に `set_len`。`maybe_gpu_oproj` も pinned `ho` をやめ、戻り値の
@@ -599,8 +599,7 @@ MAC 数・総ブロック数・タイル幅が不変で消えるのは launch 89
 320 passed / 37 ignored (+4 本)。
 
 **次に効いたこと** — 「launch 数は律速ではない」が同じ巻の中で 2 回確認される。P21 は GEMM 形状を選んでも 27B では 0 ms、
-P51 は 1,344 launch/req の発行を ≈9 ms と見積もっている。i8 側の同種の話 (gate と up を 1 発に) は `docs/HISTORY.ja.md`
-の s80/s81 にある。
+P51 は 1,344 launch/req の発行を ≈9 ms と見積もっている。i8 側の同種の話 (gate と up を 1 発に) は本巻の s80/s81 にある。
 
 ### P20: full 層 attention の q を pinned ステージングへ直接書く (2026-10-23, `5f222949`)
 

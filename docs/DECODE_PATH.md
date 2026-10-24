@@ -4,7 +4,7 @@
 > i.e. `Qwen35::forward_decode_chain` (`crates/denno-engine/src/model/qwen35.rs:1804`).
 > This document is a **code inventory plus arithmetic**, not a measurement. Every
 > number in it is either read out of the source or computed from bytes and the
-> transfer bandwidth measured in s68 (`docs/HISTORY.en.md`, "Pinned staging made the
+> transfer bandwidth measured in s68 (`docs/history/40_prefill_perf.md`, "Pinned staging made the
 > D2H five times costlier"). No GPU was involved in writing it.
 >
 > Status: s108 (measurement and decision document only). No behaviour change; the

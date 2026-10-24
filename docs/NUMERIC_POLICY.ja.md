@@ -39,7 +39,7 @@ dequant の `acc * ascale * scale` をどの順で加算するかだけであり
   （サーバプロセスを再起動して 2 回測る）。
 - **A3**: 性能。対象ワークロードで改善し、decode を 3% 超悪化させない。
 - **A4**: 品質。アンカーの応答テキストが崩壊していない（繰り返し・空応答・言語混在・途中終了がない）。
-- **A5**: 記録。`docs/HISTORY.ja.md` / `.en.md` に緩和クラス、旧 md5 → 新 md5、理由を書く。
+- **A5**: 記録。`docs/history/` の各巻に緩和クラス、旧 md5 → 新 md5、理由を書く。
 
 ## 5. アンカー再基準化の手順
 
@@ -68,4 +68,4 @@ docker exec denno-gpu bash /work/denno-beta/PF_BENCH.sh 8095
 
 - 検証装置: `GPU_VERIFY.sh`（アンカー + decode 速度）、`ANCHOR_REBASE.sh`（決定論 + 再基準化）、
   `PF_BENCH.sh`（prefill 実測）
-- 履歴: `docs/HISTORY.ja.md` の各節（s68 以降は「ビット一致」を明記、緩和を入れた節はクラスを明記）
+- 履歴: `docs/history/` の各巻（索引は [`history/README.md`](history/README.md)）（s68 以降は「ビット一致」を明記、緩和を入れた節はクラスを明記）
