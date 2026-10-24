@@ -4504,6 +4504,11 @@ struct ChainScratch {
     // 1 本のプールを q/k の 2 スライスに割り、層をまたいで使い回す (確保は
     // リクエスト最初の full 層で 1 回だけ)。寿命の契約は `PfQkView` を参照。
     pin_pf_qkv: Option<PinMem>,
+    // s250 (P53): full_qk の q の D2H を k/v の GEMM と重ねるための一式。
+    // h2 の一式 (s167/P6) とは別に持つ — h2 の join 契約 (`h2_pending`) と
+    // 混ぜると、同じストリーム上で h2 のコピーと q のコピーが直列化する。
+    qk_stream: Option<CopyStream>,  // 非ブロッキングの専用コピーストリーム
+    qk_ev_q: Option<CopyEvent>,     // q の GEMM 完了 (発行前の順序付け)
 }
 
 thread_local! {
@@ -4549,6 +4554,8 @@ thread_local! {
         h2_pending: false,
         pipe_ev: Vec::new(),
         pin_pf_qkv: None,
+        qk_stream: None,
+        qk_ev_q: None,
 
     });
 }
@@ -13434,6 +13441,89 @@ fn pf_qkv_pin_dbg() -> bool {
     *ON.get_or_init(|| std::env::var("DENNO_PF_QKV_PIN_DBG").ok().as_deref() == Some("1"))
 }
 
+/// s250 (P53): full_qk の q の D2H を k/v の GEMM と重ねるか (純粋関数・既定 ON)。
+///
+/// `DENNO_PF_QK_OVERLAP=0` で従来の「既定ストリームで 3 発を直列」へ戻す
+/// (cold A/B の腕)。`DENNO_PF_OVERLAP=0` は上位の全停止スイッチで、こちらも
+/// OFF になる ([`pf_qk_overlap_enabled`])。
+pub fn parse_pf_qk_overlap(raw: Option<&str>) -> bool {
+    !matches!(raw, Some("0") | Some("false") | Some("off"))
+}
+
+/// [`parse_pf_qk_overlap`] の実効値 (env が無ければ ON)。上位の
+/// `DENNO_PF_OVERLAP` が OFF ならこちらも OFF (P6 の h2 と同じ停止スイッチ)。
+fn pf_qk_overlap_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_pf_qk_overlap(std::env::var("DENNO_PF_QK_OVERLAP").ok().as_deref())
+            && pf_overlap_flag()
+    })
+}
+
+/// s250 (P53): full_qk の q の D2H を k/v の GEMM と重ねるためのコピーストリームを
+/// 用意し、既定ストリームの**いまこの時点まで**の完了を待たせる。
+///
+/// **呼び出し位置が契約**: q の GEMM を起動した直後・k/v の GEMM を起動する前。
+/// ここでイベントを打つと q の D2H は q の GEMM の完了だけを待って走り出し、
+/// 後続の k/v GEMM (既定ストリーム) と重なる。記録点を k/v の起動より後ろへ
+/// ずらすとイベントが 3 発全部の完了を待ち、1 バイトも重ならない。
+///
+/// 隠れる量 (27B・n=14,043 の 1 層):
+/// - q の D2H = rows*qcols*4 = 690.2 MB。実測単価 14.3 GB/s (s68) で ≈48 ms。
+/// - k/v の GEMM (各 1,024 列・0.147 TFLOP) ≈ 9.8 ms は必ず隠れる。
+/// - k/v の D2H (各 57.5 MB・計 8.0 ms) は q と同じコピーエンジンに並ぶので、
+///   隠れるかは実機の取り合い次第 (隠れれば上限 17.8 ms/層)。
+/// したがって短くなるのは ≈9.8 ms/層 = 16 層で ≈0.16 s/request (推定・下限)。
+/// 上限は ≈0.29 s/request。
+///
+/// 失敗はすべて `None` (フラグ OFF・driver API 欠落・stream/event 作成失敗) で、
+/// **GPU_BROKEN は立てない** — 「既定ストリームで直列に流せばよい」種類の失敗。
+/// 数値はどちらの経路でも同一: 同じバイト列を同じ宛先へ戻し、変わるのは
+/// 「どのストリームで発行するか」だけ (カーネル・引数・宛先・発行順は不変)。
+fn pf_qk_copy_begin() -> Option<CUstream> {
+    let _ctx = chain_ctx()?;
+    if !pf_qk_overlap_enabled() {
+        return None;
+    }
+    let lib = lib().ok()?;
+    let (stream_create, event_create, event_record, stream_wait_event) = (
+        lib.stream_create?,
+        lib.event_create?,
+        lib.event_record?,
+        lib.stream_wait_event?,
+    );
+    CHAIN.with(|cell| -> Option<CUstream> {
+        let mut s = cell.borrow_mut();
+        if s.qk_stream.is_none() {
+            // 非ブロッキング必須: legacy (既定) ストリームは blocking ストリームと
+            // 暗黙に同期するため、blocking で作ると GEMM がコピー完了を待つ。
+            const CU_STREAM_NON_BLOCKING: u32 = 0x01;
+            const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
+            let mut st: CUstream = std::ptr::null_mut();
+            if unsafe { stream_create(&mut st, CU_STREAM_NON_BLOCKING) } != CUDA_SUCCESS {
+                return None;
+            }
+            let st = CopyStream(st);
+            let mut ev: CUevent = std::ptr::null_mut();
+            if unsafe { event_create(&mut ev, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+                return None;
+            }
+            s.qk_stream = Some(st);
+            s.qk_ev_q = Some(CopyEvent(ev));
+        }
+        let st = s.qk_stream.as_ref()?.0;
+        let ev = s.qk_ev_q.as_ref()?.0;
+        // 既定ストリーム (null) に「ここまで」を打ち、コピーストリームを参加させる。
+        if unsafe { event_record(ev, std::ptr::null_mut()) } != CUDA_SUCCESS {
+            return None;
+        }
+        if unsafe { stream_wait_event(st, ev, 0) } != CUDA_SUCCESS {
+            return None;
+        }
+        Some(st)
+    })
+}
+
 /// s165 (P2): full attention 層の q/k/v 投影を**デバイス常駐の入力** (`CH_PFH`,
 /// rmsnorm 出力・先頭から `rows` 行) から回し、**出力だけ**をホストへ戻す。
 /// KV キャッシュはホストが正で q/k/v の値はホストの prepare が要るので、
@@ -13499,8 +13589,16 @@ pub fn chain_qkv_prefill_q4_dev(
     let k_off = (rows * (qcols + kcols) * 4) as u64;
     // s169 (P8): qkv GEMM + 3 発の D2H + 既存の sync までが full_qk の区間。
     pf_phase(PF_PH_FULL_QK);
+    // s250 (P53): q の D2H を発行するストリーム。作れなければ null のまま =
+    // 従来どおり既定ストリームで 3 発を直列に流す (数値は同一)。
+    let mut q_stream: CUstream = std::ptr::null_mut();
     crate::prof::time_layer(crate::prof::QKV, li, || -> Option<()> {
         chain_gemm_q4_pf(gwq, pin, pqkv, rows, qn, qcols)?;
+        // s250 (P53): q の GEMM 完了をここで打ち、コピーストリームを参加させる。
+        // k/v の GEMM は既定ストリームでこの後ろに続くので、q の D2H
+        // (rows*qcols*4 B) がその後ろに隠れる。記録点を k/v の起動より後にすると
+        // イベントが 3 発全部の完了を待ち、1 バイトも重ならない。
+        q_stream = pf_qk_copy_begin().unwrap_or(std::ptr::null_mut());
         chain_gemm_q4_pf(gwk, pin, pqkv + q_off, rows, kn, kcols)?;
         chain_gemm_q4_pf(gwv, pin, pqkv + k_off, rows, vn, vcols)
     })?;
@@ -13565,7 +13663,7 @@ pub fn chain_qkv_prefill_q4_dev(
         let lib = lib().ok()?;
         unsafe {
             ok(check(
-                (lib.memcpy_dtoh_async)(dst_q, base, q_bytes, std::ptr::null_mut()),
+                (lib.memcpy_dtoh_async)(dst_q, base, q_bytes, q_stream),
                 "cuMemcpyDtoHAsync (pf qkv q)",
             ))?;
             ok(check(
@@ -15512,5 +15610,58 @@ mod p46_att_pipe_tests {
         // 上限を下げれば従う
         assert_eq!(pf_att_pipe_chunks_with(1597 << 20, 65000, 4), 4);
         assert_eq!(pf_att_pipe_chunks_with(1597 << 20, 65000, 2), 2);
+    }
+}
+
+#[cfg(test)]
+mod p53_qk_overlap_tests {
+    //! s250 (Task P53): full_qk の q の D2H を専用コピーストリームで k/v の GEMM と
+    //! 重ねる経路の**入口条件**だけを固定する (GPU 非依存)。速度と数値一致は実機の担当。
+    //!
+    //! ここで固定する契約:
+    //!   - `DENNO_PF_QK_OVERLAP` は既定 ON。明示的な "0"/"off"/"false" だけが OFF
+    //!     (= 従来の既定ストリーム直列)
+    //!   - OFF・driver API 欠落・stream/event 作成失敗は `None` を返し、呼び出し側は
+    //!     null ストリーム (= 従来経路) で 3 発を流す
+    use super::*;
+
+    /// 既定 ON・明示的な偽値だけが OFF (P6 の `DENNO_PF_OVERLAP` と同じ規約)。
+    #[test]
+    fn pf_qk_overlap_flag_defaults_on() {
+        assert!(parse_pf_qk_overlap(None), "未設定は ON");
+        for raw in ["", "1", "true", "on", "yes", " 1", "TRUE"] {
+            assert!(parse_pf_qk_overlap(Some(raw)), "raw={raw:?} は ON のはず");
+        }
+        for raw in ["0", "off", "false"] {
+            assert!(
+                !parse_pf_qk_overlap(Some(raw)),
+                "raw={raw:?} は OFF (既定ストリーム直列) のはず"
+            );
+        }
+    }
+
+    /// 65k 級 27B (n=14,043・qcols=12,288・kcols=vcols=1,024) の 1 層あたりの
+    /// D2H バイト数と、隠せる量の算術を固定する。
+    ///
+    /// ここが崩れると REPORT_P53.md の見積り (q の D2H ≈48 ms/層・k/v の
+    /// GEMM ≈9.8 ms/層 → ≈0.16 s/request、上限 0.29 s) の前提が崩れる。
+    #[test]
+    fn pf_qk_d2h_bytes_match_27b_shape() {
+        let (rows, qcols, kcols, vcols) = (14_043usize, 12_288usize, 1_024usize, 1_024usize);
+        let q_bytes = rows * qcols * 4;
+        let k_bytes = rows * kcols * 4;
+        let v_bytes = rows * vcols * 4;
+        // 690.2 MB / 57.5 MB / 57.5 MB
+        assert_eq!(q_bytes, 690_241_536);
+        assert_eq!(k_bytes, 57_520_128);
+        assert_eq!(v_bytes, 57_520_128);
+        assert_eq!(q_bytes + k_bytes, 747_761_664, "P47 の pinned プール (747 MB)");
+        assert_eq!(q_bytes + k_bytes + v_bytes, 805_281_792, "1 層の D2H 合計");
+        // 実測単価 14.3 GB/s (s68) での q のコピー時間 ≈48 ms/層
+        let q_ms = q_bytes as f64 / 14.3e9 * 1e3;
+        assert!((47.0..50.0).contains(&q_ms), "q の D2H が {q_ms} ms/層");
+        // 16 full 層ぶんの q は ≈0.77 s (このうち k/v の GEMM+D2H の分だけが隠れる)
+        let q_all = q_ms * 16.0;
+        assert!((760.0..790.0).contains(&q_all), "q の D2H 合計が {q_all} ms");
     }
 }

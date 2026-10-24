@@ -5911,6 +5911,118 @@ fn gdn_kprof_pending_read_happens_before_prefill_end_report() {
     assert!(p < r, "保留区間の読み出しが集計より後にある");
 }
 
+/// s250 (P53): full_qk の q の D2H は**専用コピーストリーム**で発行し、k/v の
+/// GEMM と重ねる。前提を対で固定する。
+///
+/// - イベントの記録点は q の GEMM 起動の**後**・k/v の GEMM 起動の**前**。
+///   後ろへずらすとイベントが 3 発全部の完了を待ち、1 バイトも重ならない
+///   (「重ねたつもりで直列」の最も出やすい間違い)。
+/// - コピーストリームは非ブロッキングで作る。legacy 既定ストリームは blocking
+///   ストリームと暗黙に同期するので、blocking で作ると GEMM がコピーを待つ。
+/// - q の D2H だけがコピーストリーム。k/v の D2H は既定ストリーム・宛先も
+///   発行順も P44/P47 のまま (v はホスト KV キャッシュの行、k は pinned の
+///   2 スライス目)。
+/// - 発行回数は 3 発・`ctx.sync()` は 1 回のまま (P17b の連結禁止・P47 の
+///   pinned を崩さない)。join は `cuCtxSynchronize` (コンテキスト全体 = 全
+///   ストリーム) に依存する。
+/// - ストリーム/イベントが作れないときは従来経路へ落ち、GPU_BROKEN を立てない。
+#[test]
+fn prefill_full_qk_q_copy_overlaps_kv_gemm() {
+    let qkv = fn_body(CUDA_RS, "fn chain_qkv_prefill_q4_dev(");
+    let begin = fn_body(CUDA_RS, "fn pf_qk_copy_begin(");
+
+    // (1) 記録点の位置 (q GEMM の後・k GEMM の前)。
+    let i_q = qkv.find("chain_gemm_q4_pf(gwq").expect("q GEMM が無い");
+    let i_begin = qkv
+        .find("pf_qk_copy_begin()")
+        .expect("q の D2H 用コピーストリームの参加点が無い (P53 の重ねが消えた)");
+    let i_k = qkv.find("chain_gemm_q4_pf(gwk").expect("k GEMM が無い");
+    assert!(
+        i_q < i_begin && i_begin < i_k,
+        "コピーストリームの参加点が q GEMM の後・k GEMM の前に無い (重ならない)"
+    );
+    // 参加点は GEMM を 1 本流すたびではなく、q の直後に 1 回だけ。
+    assert_eq!(
+        qkv.matches("pf_qk_copy_begin()").count(),
+        1,
+        "コピーストリームの参加点が 1 箇所でない"
+    );
+    // ストリームが取れなかったときは null (= 従来の既定ストリーム) に落ちる。
+    assert!(
+        qkv.contains("pf_qk_copy_begin().unwrap_or(std::ptr::null_mut())"),
+        "ストリーム取得失敗が既定ストリームへ落ちない"
+    );
+
+    // (2) q の D2H だけがコピーストリーム (k/v は既定ストリームのまま)。
+    const Q_COPY: &str = "(lib.memcpy_dtoh_async)(dst_q, base, q_bytes, q_stream)";
+    let q_copy = qkv
+        .find(Q_COPY)
+        .expect("q の D2H がコピーストリームへ向いていない");
+    assert!(
+        qkv[q_copy + Q_COPY.len()..].find("q_stream").is_none(),
+        "q 以外の D2H がコピーストリームを使っている (k/v は既定ストリームの契約)"
+    );
+    assert_eq!(
+        qkv.matches("memcpy_dtoh_async").count(),
+        3,
+        "full_qk の D2H が 3 発でない (P17b の連結・分割は禁止)"
+    );
+    // 宛先・バイト数は P44/P47 から不変 (ストリームだけが変わる)。
+    assert!(
+        qkv.contains("let q_bytes = q_elems.checked_mul(4)?;")
+            && qkv.contains("dst_k,")
+            && qkv.contains("out_v.as_mut_ptr() as *mut c_void,"),
+        "q/k/v の D2H の宛先かバイト数が変わった (P44/P47 の契約)"
+    );
+
+    // (3) join は device 全体の同期 1 回 (コピーストリームもここで終わる)。
+    assert_eq!(
+        qkv.matches("ctx.sync()").count(),
+        1,
+        "full_qk の ctx.sync() が 1 回でない"
+    );
+    let sync = fn_body(CUDA_RS, "pub fn sync(&self)");
+    assert!(
+        sync.contains("(lib.ctx_sync)()"),
+        "sync が cuCtxSynchronize でない (コピーストリームが join されない)"
+    );
+
+    // (4) コピーストリームは非ブロッキング・既定ストリームにイベントを打つ。
+    assert!(
+        begin.contains("stream_create(&mut st, CU_STREAM_NON_BLOCKING)"),
+        "コピーストリームが非ブロッキングで作られていない (legacy 既定ストリームと暗黙同期する)"
+    );
+    assert!(
+        begin.contains("event_record(ev, std::ptr::null_mut())"),
+        "イベントを既定ストリームに打っていない (順序付けの起点が無い)"
+    );
+    assert!(
+        begin.contains("stream_wait_event(st, ev, 0)"),
+        "コピーストリームが既定ストリームの完了を待っていない (q の GEMM 前にコピーが走りうる)"
+    );
+    // フラグ OFF と API 欠落は None (= 従来経路)。GPU_BROKEN は立てない。
+    assert!(
+        begin.contains("if !pf_qk_overlap_enabled()")
+            && begin.contains("lib.stream_create?")
+            && begin.contains("lib.event_record?")
+            && begin.contains("lib.stream_wait_event?"),
+        "コピーストリームの失敗経路が従来経路へ落ちない"
+    );
+    assert!(
+        !begin.contains("GPU_BROKEN.store"),
+        "ストリーム準備の失敗で GPU_BROKEN を立てている (致命的でない失敗で CPU へ落ちる)"
+    );
+    // h2 の一式 (P6) と同居させない — 同じストリームだと h2 のコピーと直列化する。
+    assert!(
+        begin.contains("s.qk_stream") && begin.contains("s.qk_ev_q"),
+        "full_qk 専用のストリーム/イベントが CHAIN スクラッチに無い"
+    );
+    assert!(
+        !begin.contains("h2_stream"),
+        "h2 のコピーストリームを流用している (h2_pending の join 契約と衝突する)"
+    );
+}
+
 /// s247 (P47): full_qk の D2H は **3 発のまま** pinned ステージングへ落ち、
 /// 消費者はそのスライスを直接読む (ホスト memcpy を挟まない)。
 ///
