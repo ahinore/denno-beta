@@ -4,7 +4,7 @@
 > LLMの動作原理(トークン化 → forward pass → サンプリング → デコードループ)をコードで理解することを目的に、**推論カーネルを完全自前実装**している(candle等の既存LLMライブラリは不使用)。
 > リポジトリ: https://github.com/ahinore/denno-beta
 > 構成の参考: ashhart/TensorFold (Zig製の同種サーバー)
-> 開発の経緯・計測データは [開発履歴](HISTORY.ja.md) へ
+> 開発の経緯・計測データは [開発史（巻に分けた読み物）](history/README.md) と [開発履歴（一次記録）](HISTORY.ja.md) へ
 
 ---
 
@@ -626,7 +626,7 @@ graph LR
 - テレメトリOFF時はコードパス自体が存在しないに等しく、**exactnessテスト・基準出力は不変**。ON時もread-onlyのため数値は変わらない(ただしA/B計測はテレメトリOFFで行う)
 
 ---
-開発の経緯・検証データ・今後の計画: [開発履歴](HISTORY.ja.md)
+開発の経緯・検証データ・今後の計画: [開発史（巻に分けた読み物）](history/README.md) / [開発履歴（一次記録）](HISTORY.ja.md)
 ## 12. Qwen3.5 ハイブリッドアーキテクチャ(Gated DeltaNet)と GGUF ローダ(P19)
 
 > P19 で追加された 3 番目のモデルファミリー。従来の safetensors+`model_type` 判定の経路に加え、**GGUF 形式のローダ経路**と**再帰状態を持つ層(Gated DeltaNet)**という新しい要素が入った。計測データは [開発履歴](HISTORY.ja.md) の P19 節。
