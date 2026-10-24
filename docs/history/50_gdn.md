@@ -1,6 +1,6 @@
 # 第6巻 GDN (Gated DeltaNet) — 数式・カーネル・chunked スキャン
 
-> [索引](README.md) / 前: [第5巻 prefill の速度改善](40_prefill_perf.md) / 次: [第7巻 品質](60_quality.md)
+> [索引](README.md) / 前: [第5巻 prefill の速度改善](40_prefill_perf.md) / 次: [第7巻 品質](60_quality.md) / [English](en/50_gdn.md)
 
 GDN は Qwen3.5 系のハイブリッド層 (3:1) の再帰部分で、行列積の塊ではなく「1 トークンずつ状態を更新する」演算である。
 この巻は、その数式をどう写したか、なぜ単発カーネルから chunked 3-pass へ移ったか、そして最終的に律速が

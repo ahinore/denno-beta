@@ -31,17 +31,17 @@ Read the 3 thinking entries strictly in order (the later ones change the meaning
 |---|---|---|---|
 | P11 | 2026-10-12 | `1a7fee6` | hold-back of U+FFFD in streaming detok and an update of the gpt2 exactness criterion |
 | tool use | 2026-10-16 | `751dc10` | accepting tools / tool_choice, chat template conversion, `<tool_call>` extraction |
-| tool_choice 拘束 | 2026-10-16 | `a16b203` | forcing `any` / `tool` at token level with a logits mask |
+| tool_choice constraint | 2026-10-16 | `a16b203` | forcing `any` / `tool` at token level with a logits mask |
 | streaming tool_use | 2026-10-16 | `05e5f8f` | an SSE assembler that assembles `<tool_call>` across delta boundaries |
-| 切断検知 | 2026-10-16 | `e7d3e7a` | watching SSE `is_closed()` at step boundaries and aborting generation |
-| max_tokens 既定 | 2026-10-16 | `9636337` | applying 4096 only when unspecified (`max_completion_tokens` is accepted too) |
-| s44 非ストリーム切断 | 2026-10-17 | `08e7c9b` | the closed check in respond, and non-blocking stdout logging |
-| s47 thinking 制御 | 2026-10-17 | `4e89c11` | accepting `thinking: off / brief / full` and passing it to template variables |
-| s52 thinking マップ | 2026-10-18 | `b9d29f8` | accepting the `{"type":"enabled"}` form (`budget_tokens` is not read) |
-| s53c brief の意味変更 | 2026-10-18 | `e7246b8` | brief becomes "thinking disabled + concise instruction", map `enabled` treated as off |
-| s53 停止条件 | 2026-10-19 | `f21a985` | holdback for the role-label stop and a default max_tokens of 1024 |
-| s56/s57 反復抑止 | 2026-10-19 | `b3eaf71` | no_repeat_ngram / frequency / presence added as opt-in |
-| temperature 上限 | 2026-10-19 | `47e1928` | clamping the effective temperature with `--temperature-cap` |
+| disconnect detection | 2026-10-16 | `e7d3e7a` | watching SSE `is_closed()` at step boundaries and aborting generation |
+| max_tokens default | 2026-10-16 | `9636337` | applying 4096 only when unspecified (`max_completion_tokens` is accepted too) |
+| s44 non-streaming disconnect | 2026-10-17 | `08e7c9b` | the closed check in respond, and non-blocking stdout logging |
+| s47 thinking control | 2026-10-17 | `4e89c11` | accepting `thinking: off / brief / full` and passing it to template variables |
+| s52 thinking map form | 2026-10-18 | `b9d29f8` | accepting the `{"type":"enabled"}` form (`budget_tokens` is not read) |
+| s53c brief meaning changed | 2026-10-18 | `e7246b8` | brief becomes "thinking disabled + concise instruction", map `enabled` treated as off |
+| s53 stop conditions | 2026-10-19 | `f21a985` | holdback for the role-label stop and a default max_tokens of 1024 |
+| s56/s57 repetition controls | 2026-10-19 | `b3eaf71` | no_repeat_ngram / frequency / presence added as opt-in |
+| temperature cap | 2026-10-19 | `47e1928` | clamping the effective temperature with `--temperature-cap` |
 
 ---
 

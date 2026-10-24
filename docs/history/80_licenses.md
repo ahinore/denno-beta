@@ -1,4 +1,4 @@
-> [索引](README.md) / 前: [第8巻 計測・検証・運用](70_infra.md) / 次: [付録A 全 phase 一覧](90_phase_index.md)
+> [索引](README.md) / 前: [第8巻 計測・検証・運用](70_infra.md) / 次: [付録A 全 phase 一覧](90_phase_index.md) / [English](en/80_licenses.md)
 
 # 付録B 参照実装とライセンス帰属
 

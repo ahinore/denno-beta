@@ -1,6 +1,6 @@
 # 第1巻 ブートストラップ — 単一バイナリから CI まで
 
-> [索引](README.md) / 次: [第2巻 API 機能](10_api_features.md)
+> [索引](README.md) / 次: [第2巻 API 機能](10_api_features.md) / [English](en/01_bootstrap.md)
 
 対象期間: 2026-10-11(初期実装)〜 P2 完了。担当範囲のうち最も古い区間で、まだ GPU も量子化も無い。
 日付は commit の author date を JST で表す。

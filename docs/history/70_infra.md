@@ -1,6 +1,6 @@
 # 第8巻 計測・検証・運用 — 数字を信じてよい条件
 
-> [索引](README.md) / 前: [第7巻 品質](60_quality.md) / 付録: [全 phase 一覧](90_phase_index.md)
+> [索引](README.md) / 前: [第7巻 品質](60_quality.md) / 付録: [全 phase 一覧](90_phase_index.md) / [English](en/70_infra.md)
 
 > 素材は開発記録（判断ログ・現在値カード）、`docs/KPI.md`、`docs/NUMERIC_POLICY.ja.md`。
 > 数値は記録にある実測のみ。「推定」と書いた箇所は推定。

@@ -34,19 +34,19 @@ The 3 27B entries (structure verification, quality investigation, GQA fix) are o
 |---|---|---|---|
 | P3 | 2026-10-11 | `ffabb50` | int8 weight-only quantization (memory halved, speed flat) |
 | P7 | 2026-10-12 | `b6c6c5d` | loading split safetensors and untied lm_head |
-| P19 基盤 | 2026-10-14 | `49ac073` | GGUF container reader and decoding of 18 k-quant / IQ types |
+| P19 groundwork | 2026-10-14 | `49ac073` | GGUF container reader and decoding of 18 k-quant / IQ types |
 | P19-B | 2026-10-14 | `0bbfa79` | CPU reference for Gated DeltaNet |
 | P19-B2 | 2026-10-14 | `feab1c8` | Qwen3.5 model integration and E2E |
 | A2 | 2026-10-15 | `9183e7e` | the 9B GDN k-head convention and resolving untied lm_head |
 | A2.5 | 2026-10-15 | `4fada3c` | repetition penalty added HF-compatible and a no-op by default |
 | A3 | 2026-10-15 | `646c22a` | synthetic shape test for the 27B and correcting the KV budget |
 | A4 | 2026-10-15 | `bf2c90b` | GDN state snapshot for the prefix cache |
-| GPU E2E リグレッション調査 | 2026-10-15 | `d409d4f` / `ed09722` / `9dc6fc9` | explaining the 9B GPU prefill breakdown as drift amplification, and writing down the regression criteria |
-| 27B 構造検証 | 2026-10-16 | `203deed` | rejection of the out-gate hypothesis, `expect_ne` and MTP exclusion |
-| 27B 品質調査 | 2026-10-16 | `7b07870` | CPU isolation and comparison against the llama.cpp reference |
-| GQA head mapping 修正 | 2026-10-16 | `e266090` | changing blocked to strided makes the 27B answer correctly |
+| GPU E2E regression investigation | 2026-10-15 | `d409d4f` / `ed09722` / `9dc6fc9` | explaining the 9B GPU prefill breakdown as drift amplification, and writing down the regression criteria |
+| 27B structure check | 2026-10-16 | `203deed` | rejection of the out-gate hypothesis, `expect_ne` and MTP exclusion |
+| 27B quality investigation | 2026-10-16 | `7b07870` | CPU isolation and comparison against the llama.cpp reference |
+| GQA head mapping fix | 2026-10-16 | `e266090` | changing blocked to strided makes the 27B answer correctly |
 | s46 | 2026-10-17 | `262bd85` | prefix cache hits for recurrent models (split prefill) |
-| Q4_0 ネイティブ経路 | 2026-10-20 | `c51d6a3` | the 27B runs at 18.4 GB / 178〜186 ms/token |
+| Q4_0 native path | 2026-10-20 | `c51d6a3` | the 27B runs at 18.4 GB / 178-186 ms/token |
 | s156 | 2026-10-21 | `ca5e44a` | `denno info` reads the dimensions from `text_config` |
 | K1 | 2026-10-21 | `2344f67` | adding TQ1_0 / IQ1_M decoders and correcting the type ids |
 | s158 | 2026-10-22 | `c95b44c` | unknown becomes `?`, and rope / attention / dtype / quantization are displayed |
@@ -368,7 +368,7 @@ The 3 27B entries (structure verification, quality investigation, GQA fix) are o
 
 ---
 
-### Q4_0 native path — the 27B runs at 18.4 GB / 178〜186 ms/token (2026-10-20, `c51d6a3`)
+### Q4_0 native path — the 27B runs at 18.4 GB / 178-186 ms/token (2026-10-20, `c51d6a3`)
 
 - **Intent**: On the int8 path the 27B needed VRAM 31,977 MiB and 669 ms/token of decode, which was not practical. We stop the double work of expanding the GGUF 4-bit blocks to fp32 and repacking them into int8, and instead hold the weights as Q4_0 blocks and run GEMV / GEMM with dedicated kernels.
 
@@ -384,7 +384,7 @@ The 3 27B entries (structure verification, quality investigation, GQA fix) are o
 
 - **What we learned / remaining issues**
   - Numeric contract: the difference from the CPU reference is GEMV maxabs 9.5e-6 (within relative 1e-4), and GEMM 0 (bit-identical). Determinism held over 3 consecutive runs.
-  - Measured (27B, seed 42): int8 is VRAM 31,977 MiB / 669 ms/token, the Q4_0 native is **18,369 MiB / 178〜186 ms/token / prefill 34 tok/s**.
+  - Measured (27B, seed 42): int8 is VRAM 31,977 MiB / 669 ms/token, the Q4_0 native is **18,369 MiB / 178-186 ms/token / prefill 34 tok/s**.
   - Tests are lib 246 plus `cuda_q4_linear_matches_cpu` (m=1/7/16/300, `--ignored`), anchors 3/3 MATCH.
   - Remaining issue: TQ1_0 and IQ1_M decoding are unsupported so UD-IQ2_XXS cannot be loaded. The path that passes GGUF blocks through without expanding them is also unimplemented. Note that the type numbers recorded at this point (TQ1_0 = 29 / IQ1_M = 24) are wrong and are corrected later in K1.
 
