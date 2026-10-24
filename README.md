@@ -71,7 +71,7 @@ VIEW_TOKENIZER=~/.cache/denno/hub/models--Qwen--Qwen2.5-0.5B-Instruct/tokenizer.
 ## Documentation
 
 - [Architecture (English)](docs/ARCHITECTURE.en.md) / [アーキテクチャ解説(日本語)](docs/ARCHITECTURE.ja.md) — design principles, inference flow, KV cache, compute kernels, model differences, visualization architecture, usage
-- [Development history (Japanese)](docs/history/README.md) — the history of this engine split into 8 volumes plus an index: bootstrap, API features, models, decode performance, prefill performance, GDN, output quality, measurement & verification. P1–P52 and the s-series, with measured numbers and the approaches that were rejected. Read the index top-down; each volume links to the next.
+- [Development history](docs/history/en/README.md) (English) / [日本語](docs/history/README.md) — the history of this engine split into 8 volumes plus an index: bootstrap, API features, models, decode performance, prefill performance, GDN, output quality, measurement & verification. P1–P52 and the s-series, with measured numbers and the approaches that were rejected. Read the index top-down; each volume links to the next.
 - [API spec](docs/api.md)
 
 ## License

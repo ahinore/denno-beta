@@ -71,7 +71,7 @@ VIEW_TOKENIZER=~/.cache/denno/hub/models--Qwen--Qwen2.5-0.5B-Instruct/tokenizer.
 ## ドキュメント
 
 - [アーキテクチャ解説(日本語)](docs/ARCHITECTURE.ja.md) / [Architecture (English)](docs/ARCHITECTURE.en.md) — 設計方針・推論フロー・KVキャッシュ・演算カーネル・モデルの違い・可視化の構成・使い方
-- [開発史（索引）](docs/history/README.md) — 巻に分けた読み物の開発史。第1巻 ブートストラップ / 第2巻 API 機能 / 第3巻 モデル対応 / 第4巻 decode の速度 / 第5巻 prefill の速度 / 第6巻 GDN / 第7巻 品質の切り分け / 第8巻 計測・検証・運用 ＋ 全 phase 一覧・ライセンス台帳。P1〜P52 と s シリーズの実測値、棄却した試みも含む
+- [開発史（索引）](docs/history/README.md) / [English](docs/history/en/README.md) — 巻に分けた読み物の開発史。第1巻 ブートストラップ / 第2巻 API 機能 / 第3巻 モデル対応 / 第4巻 decode の速度 / 第5巻 prefill の速度 / 第6巻 GDN / 第7巻 品質の切り分け / 第8巻 計測・検証・運用 ＋ 全 phase 一覧・ライセンス台帳。P1〜P52 と s シリーズの実測値、棄却した試みも含む
 - [API仕様](docs/api.md)
 
 ## ライセンス
