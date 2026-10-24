@@ -538,6 +538,14 @@ pub struct CudaCtx {
     /// s239 (P36): pass 1 の 4 レーン版 (DK=128 専用)。PTX に含まれる場合のみ取得し、
     /// `DENNO_GDN_LANES=4` のときだけ使う (既定は旧カーネル)。
     f_gdn_chunk_pre_l4: Option<CUfunction>,
+    /// P55: pass 1 の状態配列 (W/M) を共有メモリへ置く版 (`dno_gdn_chunk_pre_sm`)。
+    /// 必要 smem が 48 KiB 既定を超えるため、カーネルが PTX にあり、かつ
+    /// cuFuncSetAttribute で opt-in できたときだけ Some。`DENNO_GDN_PRE_SM=1`
+    /// のときだけ使う (既定 off)。数値は旧版とビット同一 (格納先だけが違う)。
+    f_gdn_chunk_pre_sm: Option<CUfunction>,
+    /// P55: 上のカーネルに設定できた動的 smem 上限 (bytes)。opt-in 失敗時は
+    /// 48 KiB 既定 = dk=128 の必要量 129 KiB を満たさないのでゲートで落ちる。
+    gdn_pre_sm_dyn_smem: usize,
     f_gdn_chunk_state: CUfunction,
     f_gdn_chunk_scan: CUfunction,
     /// s89 (P1-1): 状態グラフ常駐版の chunk scan (pass 2 を折りたたんだ 2 launch 版)。
@@ -806,6 +814,33 @@ impl CudaCtx {
                 None
             };
 
+            // P55: pass 1 の状態配列 (W/M) を共有メモリへ置く版 (dk=128 で 129 KiB)。
+            // 「あれば使う」+ 動的 smem の opt-in の 2 段。どちらかが失敗すれば
+            // None / 48 KiB 既定のままになり、ゲート (`gdn_pre_sm_gate`) が
+            // 旧カーネルを選ぶ (fail-closed)。.cu を先に足して PTX を後から
+            // 再生成する運用でも、起動は壊れない。
+            let mut f_gdn_chunk_pre_sm: CUfunction = std::ptr::null_mut();
+            let sm_r = (lib.module_get_function)(
+                &mut f_gdn_chunk_pre_sm,
+                module_gdn,
+                b"dno_gdn_chunk_pre_sm\0".as_ptr() as *const c_char,
+            );
+            let (f_gdn_chunk_pre_sm, gdn_pre_sm_dyn_smem) = if sm_r == CUDA_SUCCESS {
+                let mut limit = GDN_PRE_SM_SMEM_DEFAULT;
+                if let (Some(dev_attr), Some(fn_attr)) = (lib.device_get_attribute, lib.func_set_attribute) {
+                    let mut optin: c_int = 0;
+                    if (dev_attr)(&mut optin, CU_DEV_ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, dev) == 0
+                        && optin as usize > limit
+                        && (fn_attr)(f_gdn_chunk_pre_sm, CU_FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES, optin) == 0
+                    {
+                        limit = optin as usize;
+                    }
+                }
+                (Some(f_gdn_chunk_pre_sm), limit)
+            } else {
+                (None, GDN_PRE_SM_SMEM_DEFAULT)
+            };
+
             Ok(Self {
                 device: dev,
                 name,
@@ -835,6 +870,8 @@ impl CudaCtx {
                 f_gdn,
                 f_gdn_chunk_pre,
                 f_gdn_chunk_pre_l4,
+                f_gdn_chunk_pre_sm,
+                gdn_pre_sm_dyn_smem,
                 f_gdn_chunk_state,
                 f_gdn_chunk_scan,
                 f_gdn_chunk_scan_hoist,
@@ -2556,6 +2593,11 @@ fn dbg_kernel_name(p: CUfunction) -> &'static str {
     if p == ctx.f_gdn_chunk_pre {
         return "dno_gdn_chunk_pre";
     }
+    if let Some(f) = ctx.f_gdn_chunk_pre_sm {
+        if p == f {
+            return "dno_gdn_chunk_pre_sm";
+        }
+    }
     if p == ctx.f_gdn_chunk_state {
         return "dno_gdn_chunk_state";
     }
@@ -3716,6 +3758,61 @@ fn gdn_lanes4() -> bool {
             .map(|v| v.trim() == "4")
             .unwrap_or(false)
     })
+}
+
+/// P55: GDN pass 1 の状態配列 (W/M) を共有メモリへ置く版を使うか
+/// (`DENNO_GDN_PRE_SM=1` で有効・既定 off)。
+///
+/// 数値は旧版と **ビット同一** (格納先がローカルメモリから共有メモリに変わる
+/// だけで、値は f32 のまま・読み書きの順序/回数/丸めは同一)。既定 off の理由は
+/// 数値ではなく occupancy で、dk=128 では 1 ブロックの smem が 129 KiB になり
+/// 1 block/SM まで落ちる。P36 (4 レーン版) が同じ理由で利得を打ち消したので、
+/// 実機の `[GDN_KPROF]` と cold A/B で確かめるまで既定にはしない。
+fn gdn_pre_sm_enabled() -> bool {
+    static SM: OnceLock<bool> = OnceLock::new();
+    *SM.get_or_init(|| {
+        std::env::var("DENNO_GDN_PRE_SM")
+            .ok()
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// P55: 共有メモリ版 pass 1 の動的 smem 既定上限 (48 KiB)。`cuFuncSetAttribute`
+/// による opt-in に失敗した場合の値で、dk=128 の必要量 (129 KiB) を満たさない
+/// ためゲートで旧カーネルへ落ちる。
+const GDN_PRE_SM_SMEM_DEFAULT: usize = 48 * 1024;
+
+/// P55: 共有メモリ版 pass 1 が載る最大 dk。必要量 = (2*dk*dk + 2*dk + 3)*4 B
+/// なので dk=128 で 132,108 B (opt-in 上限 164 KiB / 227 KiB の範囲)、
+/// dk=192 では 296,652 B になり opt-in 上限を超える。27B の GDN は dk=dv=128
+/// (`linear_key_head_dim`・kernel_invariants の実形状表)。dk > 128 の形は
+/// 従来カーネルで回る (このゲートはそのための上限)。
+const GDN_PRE_SM_MAX_DK: usize = 128;
+
+/// P55: 共有メモリ版 pass 1 の動的 smem 必要量 (bytes)。
+/// カーネル側のレイアウト W[dk][dk] | M[dk][dk] | k[dk] | v[dk] | scalars[3] と
+/// 同じ式 (kernel_invariants の `gdn_kernel_shared_layout_matches_host_smem` が
+/// カーネル側の宣言と対で見る)。
+const fn gdn_pre_sm_smem_bytes(dk: usize) -> usize {
+    (2 * dk * dk + 2 * dk + 3) * 4
+}
+
+/// P55: 共有メモリ版 pass 1 を選ぶ条件 (純粋関数・GPU 不要で検証できる)。
+///
+/// `env_on` = `DENNO_GDN_PRE_SM=1` / `has_fn` = PTX からカーネルを取得できたか /
+/// `smem` = 必要量 / `limit` = デバイスの opt-in 上限 (失敗時は 48 KiB)。
+/// 1 つでも欠けたら false = 旧カーネル。カーネル不在・opt-in 失敗・dk 過大の
+/// どれでも「静かに従来経路」になることが契約。
+fn gdn_pre_sm_gate(
+    env_on: bool,
+    has_fn: bool,
+    dk: usize,
+    dv: usize,
+    smem: usize,
+    limit: usize,
+) -> bool {
+    env_on && has_fn && dk == dv && (1..=GDN_PRE_SM_MAX_DK).contains(&dk) && smem <= limit
 }
 
 /// [`Q4_GEMV_C`] の実効値 (env `DENNO_Q4_GEMV_C` があればそちら)。2/4/8 以外は
@@ -14304,9 +14401,29 @@ fn gdn_scan_chunked_impl(
     let shmem_pre = ((2 * dk + 3) * 4) as u32;
     // s239 (P36): 4 レーン版 (DK=128 専用) は `DENNO_GDN_LANES=4` のときだけ。
     // block は列 dk × 4 レーン。数値は旧版と bit 一致しない (木縮約)。
-    let (f_pre, blk_pre) = match (gdn_lanes4(), ctx.f_gdn_chunk_pre_l4) {
-        (true, Some(f)) if dk == 128 && dv == 128 => (f, (dk as u32) * 4),
-        _ => (ctx.f_gdn_chunk_pre, dk as u32),
+    // P55: 共有メモリ版 (`DENNO_GDN_PRE_SM=1`・dk <= 128・opt-in 成功) は
+    // 4 レーン版の**後ろ**に置く。4 レーン版が PTX にあり `DENNO_GDN_LANES=4` が
+    // 立っていればそちらが勝ち、無ければ共有メモリ版のゲートへ進む
+    // (両方 opt-in なので優先順位を明示しておく)。数値経路はどの枝でも
+    // 下の launch 1 本だけで、カーネル・引数・grid・発行順は共通
+    // (block と shmem だけが違う)。
+    let smem_pre_sm = gdn_pre_sm_smem_bytes(dk);
+    let (f_pre, blk_pre, shm_pre) = match (gdn_lanes4(), ctx.f_gdn_chunk_pre_l4) {
+        (true, Some(f)) if dk == 128 && dv == 128 => (f, (dk as u32) * 4, shmem_pre),
+        _ => {
+            let use_sm = gdn_pre_sm_gate(
+                gdn_pre_sm_enabled(),
+                ctx.f_gdn_chunk_pre_sm.is_some(),
+                dk,
+                dv,
+                smem_pre_sm,
+                ctx.gdn_pre_sm_dyn_smem,
+            );
+            match (use_sm, ctx.f_gdn_chunk_pre_sm) {
+                (true, Some(f)) => (f, dk as u32, smem_pre_sm as u32),
+                _ => (ctx.f_gdn_chunk_pre, dk as u32, shmem_pre),
+            }
+        }
     };
     // s240 (P40): pass 1 の実時間 (`DENNO_GDN_KPROF=1` のときだけ・既定 OFF)。
     let mut kp = kprof_begin();
@@ -14316,7 +14433,7 @@ fn gdn_scan_chunked_impl(
             f_pre,
             (n_chunks as u32, nv as u32, 1),
             (blk_pre, 1, 1),
-            shmem_pre,
+            shm_pre,
             &mut args_pre,
         )?;
     }
@@ -15234,6 +15351,71 @@ mod p8_phase_tests {
         // (ホスト経路の `sl_lay_residual` に相当する区間は残差常駐経路に無い)。
         assert!(!seen.contains(&crate::prof::SL_LAY_RESIDUAL));
         assert!(PF_PH_NAMES.iter().all(|n| !n.contains("residual")));
+    }
+}
+
+#[cfg(test)]
+mod p55_gdn_pre_sm_tests {
+    //! P55: pass 1 の状態配列を共有メモリへ置く版 (`dno_gdn_chunk_pre_sm`) を
+    //! **選ぶゲート**の契約テスト (GPU 不要)。守るのは「カーネル不在 (PTX 未再
+    //! 生成) / opt-in 失敗 / dk 過大 / dk != dv / env off のどれでも静かに旧
+    //! カーネルへ落ちる」= fail-closed と、必要 smem が 48 KiB 既定を超えること。
+    //! 数値の一致と速度は実機 (main) の担当。
+    use super::*;
+
+    /// dk=128 (qwen35 の GDN 実形状) の必要量。48 KiB 既定では載らず、
+    /// A100 (164 KiB) / H100 (227 KiB) の opt-in 上限には収まること。
+    #[test]
+    fn gdn_pre_sm_smem_bytes_need_optin() {
+        let need = gdn_pre_sm_smem_bytes(128);
+        assert_eq!(need, (2 * 128 * 128 + 2 * 128 + 3) * 4);
+        assert_eq!(need, 132_108);
+        assert!(need > GDN_PRE_SM_SMEM_DEFAULT, "48 KiB 既定では載らない");
+        assert!(need <= 164 * 1024, "A100 の opt-in 上限を超える");
+        assert!(need <= 227 * 1024, "H100 の opt-in 上限を超える");
+        // dk=64 は 48 KiB 既定に収まる (opt-in 不要の形が存在すること)。
+        assert!(gdn_pre_sm_smem_bytes(64) <= GDN_PRE_SM_SMEM_DEFAULT);
+        // dk=256 は opt-in 上限でも載らない (ゲートで落ちる側)。
+        assert!(gdn_pre_sm_smem_bytes(256) > 227 * 1024);
+    }
+
+    /// ゲートの真理値表: 4 条件 (env / カーネル有無 / 形 / smem 上限) の
+    /// どれか 1 つが欠けたら false = 旧カーネル。
+    #[test]
+    fn gdn_pre_sm_gate_contract() {
+        let (dk, dv) = (128usize, 128usize);
+        let need = gdn_pre_sm_smem_bytes(dk);
+        let optin = 227 * 1024;
+        assert!(gdn_pre_sm_gate(true, true, dk, dv, need, optin));
+        // env off (既定) では常に旧カーネル
+        assert!(!gdn_pre_sm_gate(false, true, dk, dv, need, optin));
+        // PTX にカーネルが無い (未再生成) → 旧カーネル
+        assert!(!gdn_pre_sm_gate(true, false, dk, dv, need, optin));
+        // opt-in 失敗 (上限が 48 KiB 既定のまま) → 旧カーネル
+        assert!(!gdn_pre_sm_gate(true, true, dk, dv, need, GDN_PRE_SM_SMEM_DEFAULT));
+        // dk 過大 (共有メモリに載らない) → 旧カーネル
+        assert!(!gdn_pre_sm_gate(
+            true,
+            true,
+            256,
+            256,
+            gdn_pre_sm_smem_bytes(256),
+            227 * 1024
+        ));
+        assert!(!gdn_pre_sm_gate(true, true, GDN_PRE_SM_MAX_DK + 1, GDN_PRE_SM_MAX_DK + 1, 0, optin));
+        // dk != dv (chunked scan の前提外) → 旧カーネル
+        assert!(!gdn_pre_sm_gate(true, true, 128, 64, need, optin));
+        // dk = 0 は範囲外
+        assert!(!gdn_pre_sm_gate(true, true, 0, 0, 0, optin));
+        // dk=64 は 48 KiB 既定でも true (opt-in 不要の形)
+        assert!(gdn_pre_sm_gate(
+            true,
+            true,
+            64,
+            64,
+            gdn_pre_sm_smem_bytes(64),
+            GDN_PRE_SM_SMEM_DEFAULT
+        ));
     }
 }
 
