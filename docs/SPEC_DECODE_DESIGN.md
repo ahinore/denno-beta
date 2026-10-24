@@ -4,7 +4,7 @@
 > この文書の数字はすべて「既存の実測」「式と入力からの算出」「推定 (根拠)」のいずれかで、
 > 区別を明記する。この環境に GPU は無いので、**新しい計測は 1 つも行っていない**。
 > 引用元: `docs/DECODE_PATH.md` (s108 の在庫)・`docs/TASKS.md` P2-1 (s115 の在庫)・
-> `docs/HISTORY.ja.md` s68 / s50 / s100 / s108 の各節・`crates/` のソース行番号。
+> `docs/history/30_decode_perf.md` / `docs/history/40_prefill_perf.md` の s68 / s50 / s100 / s108 の各項・`crates/` のソース行番号。
 
 ---
 
@@ -242,7 +242,7 @@ step 時間の倍率 (`k=2` で `λ = S2/S`)、`q` = 1 forward が先読みす�
 行単位でビット一致、GDN は逐次、attention は causal)。したがって:
 
 - **出力の 1 行目 (= t2 の logits) は、逐次で t2 を流したときと bit 一致する**
-  (既存の prefill == 逐次の bit 一致契約。`docs/HISTORY.ja.md` A2 節・T4 節の
+  (既存の prefill == 逐次の bit 一致契約。`docs/history/30_decode_perf.md` の A2 節・T4 節の
   「GPU GEMM は本当にビット一致」)。
 - したがって **受理判定は「bit 比較」でできる**。仮決め `t2` が 1 行目の argmax と一致すれば
   受理、食い違えば **`cache.truncate(pos0+1)` + epoch bump して 1 トークン目だけを残す**。
@@ -411,5 +411,5 @@ P2-1 の 12 ms に一番近い可能性がある**。
 - `docs/DECODE_PATH.md` - 1 step の在庫と帯域の算術 (s108)
 - `docs/TASKS.md` P2-1 - 唯一の同期と、それが外せない理由の在庫 (s115)
 - `docs/NUMERIC_POLICY.ja.md` - R1-R4・決定論の絶対性・アンカー再基準化の手順
-- `docs/HISTORY.ja.md` s50 (GDN 遅延フラッシュ)・s46 (prefix cache)・s41 (KV grow)・
+- `docs/history/30_decode_perf.md` s50 (GDN 遅延フラッシュ)・s46 (prefix cache)・s41 (KV grow)・
   s61c (`n ≧ 2` 経路の per-op 内訳)・s108 (decode 内訳)・s118 (causal 切り詰めの否定)

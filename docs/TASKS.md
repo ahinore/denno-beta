@@ -175,8 +175,7 @@ Round-tripping "Estimated" numbers from the s64-era profile are gone.
   down GEMM; absorbing that write needs the down GEMM in the same launch and a 48 KB f32 row
   does not fit beside the 128x256 tile), and s70's `chain_mlp_prefill` already removed the
   host round trips. The `rmsnorm` 413 ms ceiling was a pre-s85 `Ambient` artifact.
-  file:line map, traffic table and arithmetic: `docs/HISTORY.ja.md` / `docs/HISTORY.en.md`,
-  s121 section.
+  file:line map, traffic table and arithmetic: `docs/history/30_decode_perf.md`, s121 section.
 
 ### P1-5: the phase-lever queue P24-P28 (2026-10-22/23) - four measurement closures, one implementation
 

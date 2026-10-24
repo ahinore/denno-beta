@@ -49,7 +49,7 @@ was changed by accident, which is a design bug rather than drift.
 - **A3**: Performance improves on the target workload; decode regresses by no more than 3%.
 - **A4**: Quality. Anchor responses do not degenerate (no looping, empty output, language
   mixing, or truncation).
-- **A5**: Recorded. `docs/HISTORY.ja.md` / `.en.md` state the relaxation class, the old and
+- **A5**: Recorded. `docs/history/` (the volumes) state the relaxation class, the old and
   new md5, and why the change was needed.
 
 ## 5. Re-baselining procedure
@@ -77,4 +77,4 @@ large change in **output token count** points at a logic regression rather than 
 
 - Harness: `GPU_VERIFY.sh` (anchors + decode speed), `ANCHOR_REBASE.sh` (determinism +
   re-baseline), `PF_BENCH.sh` (prefill measurement)
-- History: `docs/HISTORY.ja.md` / `.en.md`
+- History: `docs/history/` — the volumes, indexed by [`history/README.md`](history/README.md)
