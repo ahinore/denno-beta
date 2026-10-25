@@ -1214,6 +1214,342 @@ impl Scratch {
         }
         Ok(())
     }
+
+    /// P58-3: arena から切り出す版の [`Self::ensure`]。既に十分な容量を持つ
+    /// バッファが入っていれば何もしない (arena のビューでも個別確保でも同じ)。
+    /// arena が無効・確保に失敗したときは従来どおり個別に確保する (fail-open)。
+    fn ensure_arena(cap: &mut Option<DevBuffer>, key: u32, bytes: usize) -> Result<()> {
+        if cap.as_ref().map(|b| b.bytes()).unwrap_or(0) >= bytes {
+            return Ok(());
+        }
+        *cap = Some(match arena_alloc(key, bytes) {
+            Some(b) => b,
+            None => DevBuffer::alloc(bytes)?,
+        });
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P58-3: prefill スクラッチの arena 化
+//
+// 背景 (与えられた実測): 本番 serve の OOM は prefill の途中で起きる —
+//   `CUDA cuMemAlloc が失敗: error 2 (要求 779 MiB / 空き 315 MiB / 総 32110 MiB)`
+//   → `chat failed: prefill residual chain: qkv chain failed`
+// 779 MiB は `CH_QKV` (57,344 B/行 = (q 12,288 + k 1,024 + v 1,024) 列 x 4 B、
+// n = 14,245..14,262 で 779 MiB) と一致する (CH_GA は 1,892.8 MiB・CH_ACT は
+// 946.4 MiB なので一致しない = 失敗したのは qkv の出力 1 本)。つまり「直前の
+// リクエストで確保した小さめの領域を解放した直後に、より大きい領域を要求する」
+// 形で、個別の
+// cuMemAlloc / cuMemFree を繰り返すことの (a) 断片化 (b) 失敗経路の解放漏れが
+// 効いている。
+//
+// 方針: prefill の一時バッファを 1 本の arena から切り出す。
+//   - arena は**チャンクのリスト**。チャンクは確保後に移動しない (成長時に
+//     内容をコピーしない) ので、既に配ったポインタは常に有効。
+//   - 予約は (スレッド ID, キー) ごとに保持し、同じキーで同じサイズ以下なら
+//     **同じオフセット**を返す。リクエストごとの cuMemAlloc / cuMemFree が消える。
+//   - 数値は不変: どのバッファに何を書くか・カーネル引数・発行順・丸め順は
+//     1 つも変えない。変わるのは「同じ大きさの領域をどこから取るか」だけ。
+//   - リクエスト境界 (`pf_scratch_begin`) では、中身が全て死んでいることを
+//     利用して**古いチャンクを解放してから**新しいサイズを確保する
+//     (ピークが「旧 + 新」にならない)。前回の 1 行あたり使用量から今回の
+//     必要量を推定するので、プロンプト長が伸びた直後の 1 回もここで吸収できる。
+//   - `DENNO_SCRATCH_ARENA=0` で従来の個別確保へ戻る (比較・切り戻し用)。
+//   - arena の確保に失敗したら `None` を返し、呼び出し側が従来の
+//     `DevBuffer::alloc` を使う (fail-open・数値不変)。
+// ---------------------------------------------------------------------------
+
+/// arena の成長単位 (1,024 MiB)。
+const ARENA_CHUNK: usize = 1 << 30;
+/// チャンク内オフセットのアライン。cuMemAlloc の返す境界 (256 B) に合わせる。
+const ARENA_ALIGN: usize = 256;
+/// 予約キー: デバイス常駐チェーンのスロット (`CH_*`)。
+const ARENA_KEY_CHAIN: u32 = 0x0100_0000;
+/// 予約キー: `q4_dispatch_tile` の入力 staging。
+const ARENA_KEY_Q4_X: u32 = 0x0200_0001;
+/// 予約キー: `q4_dispatch_tile` の出力 staging。
+const ARENA_KEY_Q4_OUT: u32 = 0x0200_0002;
+
+/// [`arena_enabled`] の純粋な判定 (`DENNO_SCRATCH_ARENA`)。未設定 = 有効。
+fn parse_scratch_arena(raw: Option<&str>) -> bool {
+    !matches!(raw.map(|v| v.trim()), Some("0") | Some("false") | Some("off"))
+}
+
+/// arena を使うか (既定 ON・`DENNO_SCRATCH_ARENA=0` で従来の個別確保)。
+fn arena_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_scratch_arena(std::env::var("DENNO_SCRATCH_ARENA").ok().as_deref()))
+}
+
+/// `DENNO_SCRATCH_ARENA_DBG=1` で成長・境界の 1 行ログを出す (恒久診断・
+/// 未指定時 no-op)。
+fn arena_dbg() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DENNO_SCRATCH_ARENA_DBG").ok().as_deref() == Some("1"))
+}
+
+/// arena の確保計画 (GPU を持たない純粋な部分 = ホストだけで検証できる)。
+#[derive(Default)]
+struct ArenaPlan {
+    /// チャンクごとの (容量, 使用済み)。確保順に埋める。
+    chunks: Vec<(usize, usize)>,
+    /// (スレッド ID, キー) → (チャンク index, オフセット, 予約バイト数)。
+    slots: std::collections::HashMap<(u8, u32), (usize, usize, usize)>,
+    /// いまのリクエストで切り出した合計 (推定用)。
+    cur_bytes: usize,
+    /// 過去のリクエストで切り出した合計の最大 (次回の事前確保量の推定用)。
+    high_water: usize,
+}
+
+impl ArenaPlan {
+    /// チャンク内オフセットのアライン。
+    fn align_up(n: usize) -> usize {
+        (n + ARENA_ALIGN - 1) & !(ARENA_ALIGN - 1)
+    }
+
+    /// 予約を取る。既存の予約で足りれば**同じ位置**を返す (再利用)。
+    /// 足りない場合は `Err(必要なチャンクのバイト数)` を返し、**状態は変えない**
+    /// (呼び出し側がチャンクを確保して `add_chunk` してから再試行する)。
+    fn reserve(&mut self, tid: u8, key: u32, bytes: usize) -> std::result::Result<(usize, usize), usize> {
+        if let Some(&(c, off, have)) = self.slots.get(&(tid, key)) {
+            if have >= bytes {
+                return Ok((c, off));
+            }
+        }
+        let need = Self::align_up(bytes.max(1));
+        for li in 0..self.chunks.len() {
+            let (cap, used) = self.chunks[li];
+            if cap - used >= need {
+                let off = used;
+                self.chunks[li].1 = used + need;
+                self.slots.insert((tid, key), (li, off, bytes));
+                self.cur_bytes += need;
+                self.high_water = self.high_water.max(self.cur_bytes);
+                return Ok((li, off));
+            }
+        }
+        // チャンクは 1,024 MiB 単位 (要求が 1 GiB を超えるときはその倍数)。
+        let chunk = need.max(ARENA_CHUNK);
+        Err(chunk.div_ceil(ARENA_CHUNK) * ARENA_CHUNK)
+    }
+
+    /// チャンクを 1 本足す (中身は未初期化 = 呼び出し側が全要素を書く前提)。
+    fn add_chunk(&mut self, bytes: usize) {
+        self.chunks.push((bytes, 0));
+    }
+
+    /// 全チャンクと予約を捨てる (リクエスト境界・中身は全て死んでいる)。
+    fn reset(&mut self) {
+        self.chunks.clear();
+        self.slots.clear();
+        self.cur_bytes = 0;
+    }
+
+    /// チャンクは残したまま使用位置と予約だけ捨てる (同じ容量で足りるとき)。
+    fn reset_keep_chunks(&mut self) {
+        for c in self.chunks.iter_mut() {
+            c.1 = 0;
+        }
+        self.slots.clear();
+        self.cur_bytes = 0;
+    }
+
+    /// チャンクの総容量。
+    fn capacity(&self) -> usize {
+        self.chunks.iter().map(|(c, _)| *c).sum()
+    }
+
+    /// 次のリクエストで事前確保するバイト数の推定 (純関数)。
+    ///
+    /// 前回の「1 行あたり使用量 x 今回の行数 x 1.1」を 1 GiB 単位に切り上げる。
+    /// 前回の実績が無ければ 0 (= 推定なし・最初の切り出しでチャンクを足す)。
+    fn target_for(prev_rows: usize, prev_high: usize, rows: usize) -> usize {
+        if prev_rows == 0 || prev_high == 0 || rows == 0 {
+            return 0;
+        }
+        let per_row = prev_high / prev_rows + 1;
+        let want = per_row.saturating_mul(rows).saturating_mul(11) / 10;
+        want.saturating_add(ARENA_CHUNK - 1) & !(ARENA_CHUNK - 1)
+    }
+}
+
+/// arena の実体 (チャンクの `DevBuffer` と計画)。
+struct ArenaState {
+    plan: ArenaPlan,
+    /// `plan.chunks` と同順。チャンクは移動しない (再確保時にコピーしない)。
+    bufs: Vec<DevBuffer>,
+    /// チャンクを足した回数 (診断)。
+    grows: usize,
+    /// 切り出した回数 (診断)。
+    carves: usize,
+    /// 直近のリクエストの行数 (事前確保量の推定用)。
+    last_rows: usize,
+}
+
+static ARENA: OnceLock<std::sync::Mutex<ArenaState>> = OnceLock::new();
+/// スレッド ID の採番 (thread_local のスロットを (tid, key) で区別するため)。
+static ARENA_TID_NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// このスレッドの arena ID (0..255)。スレッドごとに 1 回だけ採番する。
+fn arena_tid() -> u8 {
+    thread_local! {
+        static TID: u8 = (ARENA_TID_NEXT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xff) as u8;
+    }
+    TID.with(|t| *t)
+}
+
+fn arena_state() -> &'static std::sync::Mutex<ArenaState> {
+    ARENA.get_or_init(|| {
+        std::sync::Mutex::new(ArenaState {
+            plan: ArenaPlan::default(),
+            bufs: Vec::new(),
+            grows: 0,
+            carves: 0,
+            last_rows: 0,
+        })
+    })
+}
+
+/// arena から `bytes` バイトを切り出し、**非所有ビュー**として返す。
+/// `None` = arena 無効・チャンク確保失敗 (呼び出し側は従来の `DevBuffer::alloc`)。
+fn arena_alloc(key: u32, bytes: usize) -> Option<DevBuffer> {
+    if !arena_enabled() {
+        return None;
+    }
+    let tid = arena_tid();
+    let mut g = arena_state().lock().ok()?;
+    let (ci, off) = match g.plan.reserve(tid, key, bytes) {
+        Ok(v) => v,
+        Err(want) => {
+            let want = want.max(ARENA_CHUNK);
+            let buf = match DevBuffer::alloc(want) {
+                Ok(b) => b,
+                Err(e) => {
+                    if arena_dbg() {
+                        eprintln!("scratch arena: チャンク確保に失敗 ({want} B): {e}");
+                    }
+                    return None;
+                }
+            };
+            if arena_dbg() {
+                eprintln!(
+                    "scratch arena: チャンク {want} B を追加 (key=0x{key:08x} 要求 {bytes} B)"
+                );
+            }
+            g.bufs.push(buf);
+            g.plan.add_chunk(want);
+            g.grows += 1;
+            g.plan.reserve(tid, key, bytes).ok()?
+        }
+    };
+    g.carves += 1;
+    let base = g.bufs.get(ci)?.ptr();
+    Some(DevBuffer::view(base + off as u64, bytes))
+}
+
+/// arena のビューを保持している thread_local スロットを落とす。
+///
+/// **呼び出し位置の契約**: [`pf_scratch_begin`] の中だけで呼ぶ。ここで落とす
+/// スロットは「使う直前に必ず `chain_ensure_buf` / `ensure_arena` で確保される」
+/// ものだけで、リクエスト境界の外では内容を保持しない (CH_PF_RES の残差も、
+/// 境界の直後に `chain_pf_res_upload` で入れ直す)。
+fn drop_arena_views() {
+    CHAIN.with(|cell| {
+        let mut s = cell.borrow_mut();
+        for b in s.bufs.iter_mut() {
+            *b = None;
+        }
+    });
+    SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.x = None;
+        s.out = None;
+    });
+}
+
+/// P58-3: prefill のリクエスト境界で arena を切り直す。
+///
+/// 境界では一時領域の中身が全て死んでいる (残差は直後に H2D で入れ直す) ので、
+/// **古いチャンクを解放してから**新しいサイズを確保する。個別確保のままだと
+/// 「旧領域を保持したまま新領域を要求」してピークが 2 倍になり、779 MiB が
+/// 315 MiB の空きに載らない。容量が今回の推定と同程度なら解放せずに
+/// オフセットを 0 に戻すだけ (チャーンを作らない)。
+///
+/// 他スレッドの予約が残っているときは何もしない (並行リクエストのビューを
+/// 壊さない)。数値には触らない。
+pub fn pf_scratch_begin(rows: usize) {
+    if !arena_enabled() {
+        return;
+    }
+    let tid = arena_tid();
+    let arena = match ARENA.get() {
+        Some(a) => a,
+        None => return,
+    };
+    let mut g = match arena.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if g.plan.slots.keys().any(|(t, _)| *t != tid) {
+        return;
+    }
+    // 先にビューを落としてから解放する (dangling を作らない)。
+    drop_arena_views();
+    let prev_rows = g.last_rows;
+    let prev_high = g.plan.high_water;
+    let target = ArenaPlan::target_for(prev_rows, prev_high, rows);
+    let cap = g.plan.capacity();
+    let keep = cap > 0 && target <= cap && target.saturating_mul(2) >= cap;
+    let (freed, alloc) = if keep {
+        g.plan.reset_keep_chunks();
+        (0usize, 0usize)
+    } else {
+        // 解放の前に GPU を止める (前のリクエストの非同期コピーが残っていても
+        // 解放済み領域を読まない)。境界の 1 回だけ・所要は µs 級。
+        if let Some(ctx) = shared_ctx() {
+            if ctx.make_current().is_ok() {
+                let _ = ctx.sync();
+            }
+        }
+        let freed = g.bufs.len();
+        g.bufs.clear(); // 古い方を先に解放する (cuMemFree)
+        g.plan.reset();
+        let alloc = if target > 0 {
+            match DevBuffer::alloc(target) {
+                Ok(b) => {
+                    g.bufs.push(b);
+                    g.plan.add_chunk(target);
+                    g.grows += 1;
+                    target
+                }
+                Err(e) => {
+                    if arena_dbg() {
+                        eprintln!("scratch arena: 事前確保 {target} B に失敗: {e}");
+                    }
+                    0
+                }
+            }
+        } else {
+            0
+        };
+        (freed, alloc)
+    };
+    g.last_rows = rows;
+    if arena_dbg() {
+        eprintln!(
+            "scratch arena: 境界 rows={rows} 解放 {freed} 本 / 事前確保 {alloc} B (推定 {target} B)"
+        );
+    }
+}
+
+/// arena の現在値 (診断・テスト用): (チャンク本数, 総容量, 切り出し回数, 成長回数)。
+pub fn scratch_arena_stats() -> (usize, usize, usize, usize) {
+    match ARENA.get().and_then(|a| a.lock().ok()) {
+        Some(g) => (g.bufs.len(), g.plan.capacity(), g.carves, g.grows),
+        None => (0, 0, 0, 0),
+    }
 }
 
 /// s67: GDN スキャン (chunked) の作業領域。**層をまたいで再利用する** (grow-only)。
@@ -3868,8 +4204,8 @@ fn q4_dispatch_tile(
         let Scratch { x, out: dout, hx, ho, .. } = &mut *s;
         let bytes_x = m * k * 4;
         let bytes_out = m * n * 4;
-        Scratch::ensure(x, bytes_x)?;
-        Scratch::ensure(dout, bytes_out)?;
+        Scratch::ensure_arena(x, ARENA_KEY_Q4_X, bytes_x)?;
+        Scratch::ensure_arena(dout, ARENA_KEY_Q4_OUT, bytes_out)?;
         split_mark(&mut t, crate::prof::Q4P_OUT_ALLOC);
         // s153 (Task B14): クロック読みは 1 回 (`lin_stage_taken_ns`)。読んだ ns を
         // そのまま表 C へ積むので、子の和が親 (`sl_lin`) を超えず、
@@ -4756,7 +5092,12 @@ fn chain_ctx() -> Option<&'static CudaCtx> {
 fn chain_ensure_buf(slot: usize, bytes: usize) -> Result<(), anyhow::Error> {
     CHAIN.with(|cell| {
         let mut s = cell.borrow_mut();
-        Scratch::ensure(&mut s.bufs[slot], bytes).map_err(chain_err)
+        // P58-3: prefill の一時バッファは arena から切り出す。同じキー・同じ
+        // サイズ以下なら同じオフセットが返るので、リクエストごとの
+        // cuMemAlloc / cuMemFree が消える。arena 無効・失敗時は従来の個別確保
+        // (fail-open・数値不変)。
+        Scratch::ensure_arena(&mut s.bufs[slot], ARENA_KEY_CHAIN + slot as u32, bytes)
+            .map_err(chain_err)
     })
 }
 
@@ -15845,5 +16186,184 @@ mod p53_qk_overlap_tests {
         // 16 full 層ぶんの q は ≈0.77 s (このうち k/v の GEMM+D2H の分だけが隠れる)
         let q_all = q_ms * 16.0;
         assert!((760.0..790.0).contains(&q_all), "q の D2H 合計が {q_all} ms");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P58-3: prefill スクラッチ arena の検証 (GPU 不要・ホストだけで回る)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod p58_scratch_arena_tests {
+    use super::*;
+
+    /// 27B q4・n=14,240 の prefill で実際に切り出される 12 スロット
+    /// (`chain_ensure_buf` が要求するバイト数と同じ式)。
+    fn chain_slot_bytes(rows: usize) -> [usize; 12] {
+        let e = 5120usize;
+        let hd = 6144usize; // heads*dh
+        let qcols = 12288usize; // q (attn_output_gate 込み)
+        let kcols = 1024usize;
+        let vcols = 1024usize;
+        let ff = 17408usize;
+        let vocab = 248_320usize;
+        [
+            rows * e * 4,                        // CH_X
+            rows * e * 4,                        // CH_H
+            rows * (qcols + kcols + vcols) * 4,  // CH_QKV
+            rows * hd * 4,                       // CH_ATT
+            rows * hd * 4,                       // CH_O
+            rows * 2 * ff * 4,                   // CH_GA
+            rows * ff * 4,                       // CH_ACT
+            rows * e * 4,                        // CH_DOWN
+            vocab * 4,                           // CH_LOGITS (decode のみ)
+            rows * hd * 4,                       // CH_Q35_Q
+            rows * e * 4,                        // CH_PFH
+            rows * e * 4,                        // CH_PF_RES
+        ]
+    }
+
+    /// 2 回連続の「forward 相当の確保」で 2 回目が同じオフセットを返すこと
+    /// (要求 4)。これが arena 化の本体の契約。
+    #[test]
+    fn arena_plan_second_forward_reuses_same_offsets() {
+        let rows = 14_240usize;
+        let sizes = chain_slot_bytes(rows);
+        let mut plan = ArenaPlan::default();
+        plan.add_chunk(ARENA_CHUNK * 8);
+        let mut first = Vec::new();
+        for (i, b) in sizes.iter().enumerate() {
+            let (c, off) = plan.reserve(0, ARENA_KEY_CHAIN + i as u32, *b).expect("1 回目");
+            first.push((c, off));
+        }
+        let mut second = Vec::new();
+        for (i, b) in sizes.iter().enumerate() {
+            let (c, off) = plan.reserve(0, ARENA_KEY_CHAIN + i as u32, *b).expect("2 回目");
+            second.push((c, off));
+        }
+        assert_eq!(first, second, "2 回目は同じオフセットを返す (再利用)");
+        // 予約は重ならない
+        let mut used: Vec<(usize, usize, usize)> = first
+            .iter()
+            .zip(sizes.iter())
+            .map(|((c, off), b)| (*c, *off, off + ArenaPlan::align_up(*b)))
+            .collect();
+        used.sort();
+        for w in used.windows(2) {
+            assert!(
+                w[0].0 != w[1].0 || w[0].2 <= w[1].1,
+                "チャンク {} で予約が重なった: {:?}",
+                w[0].0,
+                w
+            );
+        }
+    }
+
+    /// 実測の「要求 779 MiB」の正体が CH_QKV であること (n で 1 意に決まる)。
+    /// 57,344 B/行 なので 779 MiB になるのは n = 14,245..14,262 の範囲だけ
+    /// (CH_GA は 1,892 MiB・CH_ACT は 946 MiB で一致しない)。
+    #[test]
+    fn arena_qkv_matches_reported_779_mib() {
+        let rows = 14_252usize;
+        let b = chain_slot_bytes(rows)[CH_QKV];
+        assert_eq!(b, rows * 57_344, "CH_QKV = 行 x (q 12,288 + k/v 各 1,024) x 4 B");
+        assert_eq!(b >> 20, 779, "実測の 779 MiB 要求と一致");
+    }
+
+    /// 同じキーで大きいサイズを要求したら別の位置へ移る (古い領域は再利用しない)。
+    #[test]
+    fn arena_plan_larger_request_moves_to_new_offset() {
+        let mut plan = ArenaPlan::default();
+        plan.add_chunk(ARENA_CHUNK);
+        let (c0, o0) = plan.reserve(0, 7, 1000).unwrap();
+        let (c1, o1) = plan.reserve(0, 7, 4000).unwrap();
+        assert_eq!((c0, o0), (0, 0));
+        assert_eq!((c1, o1), (0, ArenaPlan::align_up(1000)));
+        // 小さいサイズへ戻しても予約は移らない (同じ位置を使い回す)
+        let (c2, o2) = plan.reserve(0, 7, 1000).unwrap();
+        assert_eq!((c2, o2), (c1, o1));
+    }
+
+    /// 足りないときは「必要なチャンクのバイト数」を返し、状態は変えない。
+    #[test]
+    fn arena_plan_reports_chunk_bytes_without_mutating() {
+        let mut plan = ArenaPlan::default();
+        let want = plan.reserve(0, 1, 4096).unwrap_err();
+        assert_eq!(want, ARENA_CHUNK, "チャンクは 1,024 MiB 単位");
+        assert!(plan.chunks.is_empty() && plan.slots.is_empty());
+        plan.add_chunk(want);
+        assert_eq!(plan.reserve(0, 1, 4096).unwrap(), (0, 0));
+        // 1 GiB を超える要求は切り上げたチャンク 1 本で受ける
+        let big = ARENA_CHUNK + 1;
+        assert_eq!(plan.reserve(0, 2, big).unwrap_err(), ARENA_CHUNK * 2);
+    }
+
+    /// オフセットは 256 B に揃える。
+    #[test]
+    fn arena_plan_aligns_offsets() {
+        let mut plan = ArenaPlan::default();
+        plan.add_chunk(ARENA_CHUNK);
+        let (_, a) = plan.reserve(0, 1, 1).unwrap();
+        let (_, b) = plan.reserve(0, 2, 3).unwrap();
+        let (_, c) = plan.reserve(0, 3, 257).unwrap();
+        assert_eq!((a, b, c), (0, 256, 512));
+        for off in [a, b, c] {
+            assert_eq!(off % ARENA_ALIGN, 0);
+        }
+    }
+
+    /// スレッドが違えば同じキーでも別の領域 (thread_local スロットの衝突防止)。
+    #[test]
+    fn arena_plan_separates_threads() {
+        let mut plan = ArenaPlan::default();
+        plan.add_chunk(ARENA_CHUNK);
+        let (_, a) = plan.reserve(0, ARENA_KEY_Q4_X, 4096).unwrap();
+        let (_, b) = plan.reserve(1, ARENA_KEY_Q4_X, 4096).unwrap();
+        assert_ne!(a, b);
+        assert_eq!((a, b), (0, 4096));
+        // 同じスレッドの別キーも別の領域
+        let (_, c) = plan.reserve(0, ARENA_KEY_Q4_OUT, 4096).unwrap();
+        assert_eq!(c, 8192);
+    }
+
+    /// 境界の切り直しでチャンクを残すときは先頭から使い直す。
+    #[test]
+    fn arena_plan_reset_keep_chunks_restarts_at_zero() {
+        let mut plan = ArenaPlan::default();
+        plan.add_chunk(ARENA_CHUNK);
+        plan.reserve(0, 1, 8192).unwrap();
+        plan.reset_keep_chunks();
+        assert_eq!(plan.capacity(), ARENA_CHUNK);
+        assert_eq!(plan.reserve(0, 1, 8192).unwrap(), (0, 0));
+    }
+
+    /// 境界の推定: 前回の 1 行あたり使用量から今回の必要量を出す。
+    #[test]
+    fn arena_target_scales_with_rows() {
+        // 前回 rows=2000 で 800 MiB 使った → 14,240 行なら ≈5.7 GiB (1 GiB 切り上げ)
+        let prev_high = 800usize << 20;
+        let t = ArenaPlan::target_for(2000, prev_high, 14_240);
+        let per_row = prev_high / 2000 + 1;
+        let want = per_row * 14_240 * 11 / 10;
+        assert_eq!(t, want.saturating_add(ARENA_CHUNK - 1) & !(ARENA_CHUNK - 1));
+        assert!(t >= want, "推定は要求以上");
+        assert_eq!(t % ARENA_CHUNK, 0, "1 GiB 単位");
+        // 行数が増えれば単調に増える
+        assert!(ArenaPlan::target_for(2000, prev_high, 28_000) > t);
+        // 実績が無ければ推定しない (0)
+        assert_eq!(ArenaPlan::target_for(0, 0, 14_240), 0);
+        assert_eq!(ArenaPlan::target_for(2000, 0, 14_240), 0);
+        assert_eq!(ArenaPlan::target_for(2000, prev_high, 0), 0);
+    }
+
+    /// `DENNO_SCRATCH_ARENA` の解釈 (未設定 = 有効)。
+    #[test]
+    fn arena_env_gate() {
+        assert!(parse_scratch_arena(None));
+        assert!(parse_scratch_arena(Some("1")));
+        assert!(parse_scratch_arena(Some("true")));
+        assert!(!parse_scratch_arena(Some("0")));
+        assert!(!parse_scratch_arena(Some(" 0 ")));
+        assert!(!parse_scratch_arena(Some("false")));
+        assert!(!parse_scratch_arena(Some("off")));
     }
 }
