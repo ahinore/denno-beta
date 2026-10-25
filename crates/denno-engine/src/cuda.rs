@@ -5982,8 +5982,10 @@ pub fn chain_mlp_prefill(
 // ミラーはホストキャッシュの行 [0..len) と常に同一内容に保たれる
 // (不足行は次回の chain_attention で一括 H2D)。ミラー破損/ロールバック/
 // エビクト時も len 比較で自動再シードされるため、ホストが正・ミラーは従。
-// メモリ上限 `DENNO_GPU_KV_MB` (既定 8192MB) を超えると LRU でエビクト
-// (必要時に再シード)。
+// メモリ上限 `DENNO_GPU_KV_MB` (既定 2048MB — P58-1 で 8192 から引き下げ。
+// 27B 本番で既定のままだとミラーが約 1 GB 常駐し VRAM 枯渇を起こした) を超えると
+// LRU でエビクト (必要時に再シード)。実使用量は起動時と各リクエスト完了時に
+// `gpu kv mirror: N entries, X MB / limit Y MB` として info ログに出る。
 //
 // 注意: attention のみ exactness 契約が緩和されている (CPU と GPU で累積順が
 // 異なり出力ビットは一致しない)。線形層 (int8) / expf / swiglu / rmsnorm は
@@ -6086,13 +6088,89 @@ impl KvMirror {
 static KV_MIRRORS: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, KvMirror, std::time::Instant)>>> =
     std::sync::OnceLock::new();
 
+/// GPU KV ミラーの上限 (MiB) の既定値。P58-1: 8192 → 2048。
+///
+/// 実測 (27B Q4_0・本番 serve): 既定 8192 MiB のままだとミラーが約 1 GB を常駐し、
+/// 18,670 token のリクエスト後に VRAM が 30,932 MiB まで達して `cuMemAlloc` 失敗
+/// (要求 779 MiB / 空き 315 MiB) → CPU フォールバック → サーバ固着を 3 回起こした。
+/// `DENNO_GPU_KV_MB=1024` に下げるだけで 29,918 MiB に収まった (1,014 MB 減)。
+/// ミラーは KV の複製 (ホストが正) なので、上限を下げて evict が増えても出力は
+/// 変わらない — evict されたミラーは次の使用時にホストから再シードされる。
+const DEFAULT_GPU_KV_LIMIT_MB: usize = 2048;
+
+/// `DENNO_GPU_KV_MB` の解釈 (純関数。env を読まないのでテストから直接叩ける)。
+/// 未設定・不正値は [`DEFAULT_GPU_KV_LIMIT_MB`]。
+fn gpu_kv_limit_bytes_from(v: Option<usize>) -> usize {
+    v.unwrap_or(DEFAULT_GPU_KV_LIMIT_MB) * 1024 * 1024
+}
+
 fn gpu_kv_limit_bytes() -> usize {
-    std::env::var("DENNO_GPU_KV_MB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(8192)
-        * 1024
-        * 1024
+    gpu_kv_limit_bytes_from(
+        std::env::var("DENNO_GPU_KV_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok()),
+    )
+}
+
+/// P58-1: ミラー 1 本のエビクト判定用メタデータ (ホスト側の値だけ)。
+/// 実バッファを持たないので、LRU の判定と上限の効き方は GPU 無しでテストできる。
+#[derive(Debug, Clone, Copy)]
+struct MirrorMeta {
+    key: u64,
+    bytes: usize,
+    last: std::time::Instant,
+    /// GDN 遅延フラッシュ pending (エビクト禁止 — 未フラッシュの状態が唯一のコピー)
+    pending: bool,
+}
+
+/// 上限超過分を LRU で落とし、落とした key を古い順に返す (純関数)。
+///
+/// 契約:
+/// - 自分 (`keep_key`) は落とさない (これから使うミラー)。
+/// - `pending` のミラーは落とさない (ホストより新しい GDN 状態の唯一のコピー)。
+/// - 落とせる相手が無ければ止まる (上限超過のまま続くが、データは失わない)。
+/// - ミラーは KV の複製なので、ここで落としても出力は変わらない (再シード)。
+fn lru_evict_keys(entries: &mut Vec<MirrorMeta>, limit: usize, keep_key: u64) -> Vec<u64> {
+    let mut evicted = Vec::new();
+    let mut total: usize = entries.iter().map(|e| e.bytes).sum();
+    while total > limit && entries.len() > 1 {
+        let vic = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.key != keep_key && !e.pending)
+            .min_by_key(|(_, e)| e.last)
+            .map(|(i, _)| i);
+        let Some(vic) = vic else {
+            break;
+        };
+        total -= entries[vic].bytes;
+        evicted.push(entries.swap_remove(vic).key);
+    }
+    evicted
+}
+
+/// P58-1: ミラーの実使用量 (エントリ数, 合計バイト数, 上限バイト数)。
+/// 合計は [`KvMirror::bytes`] (K/V の実バッファ + GDN 状態) の和。
+/// 診断用なのでロックが取れない場合は None (呼び出し側を止めない)。
+pub fn gpu_kv_mirror_stats() -> Option<(usize, usize, usize)> {
+    let mirrors = KV_MIRRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let ms = mirrors.lock().ok()?;
+    let used = ms.iter().map(|(_, m, _)| m.bytes()).sum();
+    Some((ms.len(), used, gpu_kv_limit_bytes()))
+}
+
+/// P58-1: ミラー使用量を 1 行ログる (起動時・各リクエスト完了時)。
+/// MB は切り上げ (使用量が 0 でないのに 0 MB と出るのを避ける)。
+pub fn log_gpu_kv_mirror_usage() {
+    if let Some((entries, used, limit)) = gpu_kv_mirror_stats() {
+        const MB: usize = 1024 * 1024;
+        tracing::info!(
+            "gpu kv mirror: {} entries, {} MB / limit {} MB",
+            entries,
+            used.div_ceil(MB),
+            limit / MB
+        );
+    }
 }
 
 fn kv_mirror_cap(t_total: usize, old_cap: usize) -> usize {
@@ -6138,10 +6216,9 @@ fn with_mirror_ext<T>(
     let mirrors = KV_MIRRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
     let mut ms = ok(mirrors.lock().map_err(|e| anyhow::anyhow!("{e}")))?;
     let now = std::time::Instant::now();
-    let idx = match ms.iter().position(|(k, _, _)| *k == key) {
+    match ms.iter().position(|(k, _, _)| *k == key) {
         Some(i) => {
             ms[i].2 = now;
-            i
         }
         None => {
             ms.push((
@@ -6158,25 +6235,28 @@ fn with_mirror_ext<T>(
                 },
                 now,
             ));
-            ms.len() - 1
         }
     };
     // エビクト: 上限超過で LRU (自分は除外)。s50: GDN 遅延フラッシュ pending 中の
     // ミラーは除外 — エビクトすると未フラッシュの GDN 状態 (ホストより新しい唯一の
     // コピー) が失われ回復不能になる。pending は次の prefill / CPU フォールバックの
     // 冒頭でフラッシュして解除されるため、上限超過は高々 1 リクエスト分の遅延。
-    let limit = gpu_kv_limit_bytes();
-    let mut total: usize = ms.iter().map(|(_, m, _)| m.bytes()).sum();
-    while total > limit && ms.len() > 1 {
-        let vic = (0..ms.len())
-            .filter(|&i| ms[i].0 != key && ms[i].1.gdn_pending.is_none())
-            .min_by_key(|&i| ms[i].2);
-        let Some(vic) = vic else {
-            break;
-        };
-        total -= ms[vic].1.bytes();
-        ms.swap_remove(vic);
+    // P58-1: 判定は純関数 `lru_evict_keys` に切り出した (ホスト側のメタデータだけで
+    // LRU と上限の効き方をテストできる)。ここでは落とす key を ms から除去するだけ。
+    let mut meta: Vec<MirrorMeta> = ms
+        .iter()
+        .map(|(k, m, t)| MirrorMeta {
+            key: *k,
+            bytes: m.bytes(),
+            last: *t,
+            pending: m.gdn_pending.is_some(),
+        })
+        .collect();
+    let evicted = lru_evict_keys(&mut meta, gpu_kv_limit_bytes(), key);
+    if !evicted.is_empty() {
+        ms.retain(|(k, _, _)| !evicted.contains(k));
     }
+    // 除去で添字が動くので引き直す (自分はエビクト対象外なので必ず見つかる)。
     let idx = ms.iter().position(|(k, _, _)| *k == key)?;
     let m = &mut ms[idx].1;
     if li >= m.layers.len() {
@@ -8758,6 +8838,205 @@ mod tests {
             .iter()
             .map(|v| 0.001 + v.abs() * 0.01)
             .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // P58-1: GPU KV ミラーの上限 (既定 2048 MB)・LRU エビクト・使用量ログ。
+    // どれもホスト側のメタデータだけで検証できる (GPU 不要)。
+    // -----------------------------------------------------------------------
+
+    /// エビクト判定用メタデータ (`age_ms` が大きいほど古い = LRU の先頭)。
+    fn mirror_meta(key: u64, bytes: usize, age_ms: u64, pending: bool) -> MirrorMeta {
+        MirrorMeta {
+            key,
+            bytes,
+            last: std::time::Instant::now() - std::time::Duration::from_millis(age_ms),
+            pending,
+        }
+    }
+
+    fn keys_of(entries: &[MirrorMeta]) -> Vec<u64> {
+        entries.iter().map(|m| m.key).collect()
+    }
+
+    /// P58-1: 上限の既定値が 2048 MB であること、`DENNO_GPU_KV_MB` の上書きが
+    /// 維持されていること。`gpu_kv_limit_bytes_from` は env を読まない純関数なので、
+    /// テストの並列実行で環境変数を取り合わない。
+    #[test]
+    fn gpu_kv_limit_defaults_to_2048_mb_and_env_overrides() {
+        const MB: usize = 1024 * 1024;
+        assert_eq!(DEFAULT_GPU_KV_LIMIT_MB, 2048, "既定値 (P58-1 で 8192 → 2048)");
+        assert_eq!(gpu_kv_limit_bytes_from(None), 2048 * MB);
+        // env 上書きは従来どおり効く (実機で 1024 に落として VRAM が 1,014 MB 減った値)
+        assert_eq!(gpu_kv_limit_bytes_from(Some(1024)), 1024 * MB);
+        assert_eq!(gpu_kv_limit_bytes_from(Some(8192)), 8192 * MB);
+        // 実使用される値も同じ規則 (テストプロセスが env を設定している場合は env 優先)
+        match std::env::var("DENNO_GPU_KV_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(v) => assert_eq!(gpu_kv_limit_bytes(), v * MB),
+            None => assert_eq!(gpu_kv_limit_bytes(), 2048 * MB),
+        }
+    }
+
+    /// P58-1: 上限を超えたら LRU (最も古い) から落ち、自分 (使用中) と
+    /// GDN 遅延フラッシュ pending のミラーは落とさないこと。
+    #[test]
+    fn kv_mirror_lru_evicts_oldest_beyond_limit() {
+        // 各 1,000 B・上限 2,500 B: 3 本 (3,000 B) → 2 本 (2,000 B) まで落とす
+        let mut e = vec![
+            mirror_meta(1, 1000, 300, false),
+            mirror_meta(2, 1000, 200, false),
+            mirror_meta(3, 1000, 0, false),
+        ];
+        assert_eq!(lru_evict_keys(&mut e, 2500, 3), vec![1], "最古の 1 本だけ落ちる");
+        assert_eq!(keys_of(&e), vec![3, 2], "使用中の 3 と新しい 2 が残る");
+
+        // 上限 1,000 B: 古い順に 2 本落ちる。自分 3 は落とさない
+        let mut e = vec![
+            mirror_meta(1, 1000, 300, false),
+            mirror_meta(2, 1000, 200, false),
+            mirror_meta(3, 1000, 0, false),
+        ];
+        assert_eq!(lru_evict_keys(&mut e, 1000, 3), vec![1, 2], "古い順に落ちる");
+        assert_eq!(keys_of(&e), vec![3]);
+
+        // 自分が最古でも落とさない (これから使うミラー)
+        let mut e = vec![
+            mirror_meta(1, 1000, 300, false),
+            mirror_meta(2, 1000, 200, false),
+            mirror_meta(3, 1000, 0, false),
+        ];
+        assert_eq!(lru_evict_keys(&mut e, 1000, 1), vec![2, 3]);
+        assert_eq!(keys_of(&e), vec![1]);
+
+        // GDN 遅延フラッシュ pending は最古でも飛ばす (未フラッシュ状態の唯一のコピー)
+        let mut e = vec![
+            mirror_meta(1, 1000, 400, true),
+            mirror_meta(2, 1000, 300, false),
+            mirror_meta(3, 1000, 0, false),
+        ];
+        assert_eq!(lru_evict_keys(&mut e, 1000, 3), vec![2], "pending の 1 は飛ばす");
+        assert_eq!(keys_of(&e), vec![1, 3], "pending の 1 は残る");
+
+        // 落とせる相手が無ければ止まる (上限超過のまま続くがデータは失わない)
+        let mut e = vec![mirror_meta(1, 1000, 0, true), mirror_meta(2, 1000, 0, false)];
+        assert!(lru_evict_keys(&mut e, 100, 2).is_empty(), "自分以外に落とせる相手が無い");
+        assert_eq!(keys_of(&e), vec![1, 2]);
+
+        // 1 本だけなら自分しか居ないので落とさない (ms.len() > 1 条件)
+        let mut e = vec![mirror_meta(1, 10_000, 0, false)];
+        assert!(lru_evict_keys(&mut e, 0, 1).is_empty());
+        assert_eq!(keys_of(&e), vec![1]);
+    }
+
+    /// P58-1: ミラーを落としてもホスト (正) の KV 行は変わらず、再シードで
+    /// ビット一致に戻ること。
+    ///
+    /// ミラーはホスト KV の複製なので、エビクトで失われるのは「デバイス側の
+    /// コピー」だけ。再シードはホスト行のコピー (演算なしの H2D) なので、
+    /// 丸め順序が変わる余地が無くビット一致する — このテストはその契約
+    /// (エビクトがホストを書き換えない・len が 0 に戻って全行コピーになる) を
+    /// ホスト側のデータだけで固定する。
+    #[test]
+    fn kv_mirror_evict_then_reseed_is_bit_identical() {
+        const KV_DIM: usize = 32;
+        const T: usize = 16;
+        const ROWS: usize = T * KV_DIM;
+        let host_a = pseudo_random(ROWS, 101);
+        let host_b = pseudo_random(ROWS, 202);
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        let (host_a_bits, host_b_bits) = (bits(&host_a), bits(&host_b));
+
+        // ミラー = ホスト行の複製 (実装では DevBuffer への H2D)
+        let mut mirror_a = host_a.clone();
+        let mirror_b = host_b.clone();
+        let bytes = ROWS * 4;
+
+        // 上限 = 1 本分。セッション 2 を使う時点でセッション 1 のミラーが落ちる
+        let mut entries = vec![
+            mirror_meta(1, bytes, 200, false),
+            mirror_meta(2, bytes, 0, false),
+        ];
+        assert_eq!(lru_evict_keys(&mut entries, bytes, 2), vec![1]);
+        assert_eq!(keys_of(&entries), vec![2]);
+
+        // 落ちた側のミラーは空になる (実装では ms からの除去 = 次回 have=0)
+        mirror_a.clear();
+        assert!(mirror_a.is_empty());
+
+        // ホスト (正) はエビクトで一切変わらない
+        assert_eq!(bits(&host_a), host_a_bits, "エビクトはホスト A を書き換えない");
+        assert_eq!(bits(&host_b), host_b_bits, "エビクトはホスト B を書き換えない");
+
+        // 再シード = ホスト行 [0..T] のコピー → ビット一致
+        mirror_a.extend_from_slice(&host_a[..ROWS]);
+        assert_eq!(bits(&mirror_a), host_a_bits, "再シードでビット一致に戻る");
+
+        // 生き残った側のミラーも無傷
+        assert_eq!(bits(&mirror_b), host_b_bits, "他セッションのエビクトで壊れない");
+    }
+
+    /// P58-1 (GPU 実機・`#[ignore]`): `DENNO_GPU_KV_MB` を超えると実際に LRU で
+    /// ミラーが落ち、落ちたセッションの次回呼び出しが have=0 (全行再シード) から
+    /// 始まること。実バッファの確保を伴うので既定では回さない。
+    ///
+    /// 注意: エビクトは with_mirror の先頭で走るため、直前のセッションが確保した
+    /// 分だけ上限を一時的に超え得る (超過は次のミラー呼び出しで解消する)。
+    #[test]
+    #[ignore] // GPU が必要: cargo test --release --features cuda -p denno-engine -- --ignored
+    fn cuda_kv_mirror_lru_evicts_over_limit() {
+        let _g = test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let _ctx = CudaCtx::new().unwrap();
+        let prev_env = std::env::var("DENNO_GPU_KV_MB").ok();
+        // 上限 1 MiB。1 セッション = t_total(2048) * kv_dim(64) * 4 B * (k + v) = 1 MiB
+        std::env::set_var("DENNO_GPU_KV_MB", "1");
+        let (kv_dim, t_total) = (64usize, 2048usize);
+        let key_a = u64::MAX - 11;
+        let key_b = u64::MAX - 12;
+        // A を確保 (1 MiB)
+        with_mirror(key_a, 0, 1, t_total, kv_dim, 0, |m, have| {
+            assert_eq!(have, 0, "初回はミラー空");
+            m.len[0] = t_total;
+            Some(())
+        })
+        .unwrap();
+        let (n, used, limit) = gpu_kv_mirror_stats().unwrap();
+        assert_eq!(limit, 1024 * 1024, "env 上書きが効いている");
+        assert!(n >= 1 && used >= 1024 * 1024, "A の確保後: {n} entries / {used} B");
+        // B を確保 (合計 2 MiB > 1 MiB。エビクトは次のミラー呼び出しで走る)
+        with_mirror(key_b, 0, 1, t_total, kv_dim, 0, |_, _| Some(())).unwrap();
+        // B をもう一度使う → 先頭のエビクトで古い A が落ちる
+        with_mirror(key_b, 0, 1, t_total, kv_dim, 0, |_, _| Some(())).unwrap();
+        {
+            let ms = KV_MIRRORS.get().unwrap().lock().unwrap();
+            let keys: Vec<u64> = ms.iter().map(|(k, _, _)| *k).collect();
+            assert!(keys.contains(&key_b), "使用中の B は残る: {keys:?}");
+            assert!(!keys.contains(&key_a), "上限超過で A がエビクトされる: {keys:?}");
+        }
+        // A を再度使う → ミラーは作り直され have=0 (全行再シード) から始まる
+        let mut have_a = None;
+        with_mirror(key_a, 0, 1, t_total, kv_dim, 0, |_, have| {
+            have_a = Some(have);
+            Some(())
+        })
+        .unwrap();
+        assert_eq!(have_a, Some(0), "エビクト後は全行再シード");
+        // 後片付け (テスト用ミラーの除去と env の復元)
+        KV_MIRRORS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .retain(|(k, _, _)| *k != key_a && *k != key_b);
+        match prev_env {
+            Some(v) => std::env::set_var("DENNO_GPU_KV_MB", v),
+            None => std::env::remove_var("DENNO_GPU_KV_MB"),
+        }
     }
 
     /// P17j: prefill attention の CPU 参照 (model/llama.rs forward の prefill
