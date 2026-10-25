@@ -118,6 +118,18 @@ pub struct Engine {
     slot_busy: Vec<bool>,
     /// slot ごとの KV 予約トークン数 (prompt + max_tokens。P17e の予算ハード保証用)
     slot_reserved: Vec<usize>,
+    /// P58-4: slot ごとのリース ID (0 = 空き)。
+    ///
+    /// 予約の解放が「別のセッションが再取得した後の同じスロット」を誤って
+    /// 解放しないための所有者票。`install_session` が単調増加の ID を配り、
+    /// `release_session` / 失敗時の `SlotGuard` は自分の ID がまだ載っている
+    /// ときだけ解放する (二重解放・取り違えが構造的に起きない)。
+    slot_lease: Vec<u64>,
+    /// P58-4: 次に配るリース ID (0 は「空き」を表すので 1 から始める)
+    next_lease: u64,
+    /// P58-4: KV 予算の上書き (バイト)。None = 環境変数 / 既定 (挙動不変)。
+    /// テストがプロセス全体の環境変数を汚さずに予算超過経路を再現するための入口。
+    kv_budget_override: Option<usize>,
     pub name: String,
     pub default_seed: Option<u64>,
     /// 過去会話の KV スナップショット群 (マルチエントリ LRU prefix cache)
@@ -241,6 +253,10 @@ pub struct ChatSession {
     stop_sequence: Option<String>,
     /// 占有中の KV キャッシュスロット (None = 未 install / release 済み)
     slot: Option<usize>,
+    /// P58-4: スロットのリース ID (0 = 未取得)。`install_session` が配る。
+    /// `slot` だけでは「解放済みのスロットを別セッションが再取得した後」を
+    /// 区別できないため、所有者票として併せて持つ。
+    lease: u64,
     input_tokens: usize,
     /// A2.5/s56: 反復抑止 (repetition_penalty + frequency/presence/no_repeat_ngram)。
     /// すべて無効なら `is_noop()` が真で、適用自体を省く (既定は挙動不変)。
@@ -279,6 +295,28 @@ impl ChatSession {
             input_tokens: self.input_tokens,
             output_tokens: self.generated.len(),
         }
+    }
+}
+
+/// P58-4: 失敗したリクエストのスロット後始末を担う RAII ガード。
+///
+/// `Drop` が [`Engine::release_slot`] を `discard_kv = true` で呼ぶ — 予約
+/// (`slot_reserved`) を 0 に戻し、busy を落とし、そのスロットの KV 行
+/// (`cached_prompts` を含む) を破棄する。エラーで関数を抜けても必ず走る。
+///
+/// ガードは `Engine` を可変借用するため、`&mut self` を取るメソッドの実行中は
+/// 保持できない。そのため生成は「失敗が確定した後」に行い、生成と同時に drop
+/// させている (生成箇所は [`Engine::release_slot_on_err`] に集約)。
+struct SlotGuard<'a> {
+    eng: &'a mut Engine,
+    slot: usize,
+    lease: u64,
+    why: &'static str,
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        self.eng.release_slot(self.slot, self.lease, true, self.why);
     }
 }
 
@@ -352,6 +390,9 @@ impl Engine {
             cached_prompts,
             slot_busy,
             slot_reserved,
+            slot_lease: vec![0u64; slots],
+            next_lease: 1,
+            kv_budget_override: None,
             name: name.into(),
             default_seed,
             prefix_cache: PrefixCache::new(max_tokens, kv_bytes_per_token),
@@ -421,12 +462,29 @@ impl Engine {
             cached_prompts,
             slot_busy,
             slot_reserved,
+            slot_lease: vec![0u64; slots],
+            next_lease: 1,
+            kv_budget_override: None,
             name: name.into(),
             default_seed,
             prefix_cache: PrefixCache::new(max_tokens, kv_bytes_per_token),
             last_prefix_hit: PrefixHit::None,
             quant: QuantMode::Fp32,
         }
+    }
+
+    /// P58-4: KV 予算 (バイト) を上書きする。`None` で環境変数 / 既定へ戻す
+    /// (数値経路には触れない。予算判定の入力が変わるだけ)。
+    ///
+    /// 予算は [`KV_BUDGET_ENV`] (MB 単位) なので、テストで「1 本は通るが 2 本は
+    /// 通らない」境目を作るには MB 粒度が粗すぎる。ここではバイト単位で与える。
+    pub fn set_kv_budget_bytes(&mut self, bytes: Option<usize>) {
+        self.kv_budget_override = bytes;
+    }
+
+    /// 現在有効な KV 予算 (バイト)。上書き > 環境変数 > 既定。
+    pub fn kv_budget(&self) -> usize {
+        self.kv_budget_override.unwrap_or_else(kv_budget_bytes)
     }
 
     /// マルチエントリ prefix cache のトークン上限を変更する (env の代わりに引数で指定する用)。
@@ -465,6 +523,21 @@ impl Engine {
     /// 2. 全 busy スロットの予約合計 × bytes_per_token が KV 予算
     ///    (`DENNO_KV_BUDGET_MB`) を超えない
     pub fn install_session(&mut self, sess: &mut ChatSession) -> Result<()> {
+        // P58-4: 予約を取った後に本体が Err を返した場合の後始末を保証する。
+        // (現状の本体は予約より後で失敗しないが、防御として RAII 経路を必ず通す)
+        let had_slot = sess.slot.is_some();
+        let r = self.install_session_inner(sess);
+        if r.is_err() && !had_slot {
+            if let Some(slot) = sess.slot.take() {
+                let lease = sess.lease;
+                sess.lease = 0;
+                let _g = SlotGuard { eng: self, slot, lease, why: "install failed" };
+            }
+        }
+        r
+    }
+
+    fn install_session_inner(&mut self, sess: &mut ChatSession) -> Result<()> {
         if sess.slot.is_some() {
             return Ok(()); // 既に常駐済み
         }
@@ -495,7 +568,7 @@ impl Engine {
             );
         }
         let reserved_total: usize = self.slot_reserved.iter().sum();
-        let budget_bytes = kv_budget_bytes();
+        let budget_bytes = self.kv_budget();
         if (reserved_total + need).saturating_mul(budget.1) > budget_bytes {
             anyhow::bail!(
                 "invalid_request_error: KV 予算超過 (予約 {} + {} tokens × {} B/token > {} MB)。同時リクエストを減らすか {} を上げてください",
@@ -533,6 +606,11 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("no free KV cache slot ({} slots)", self.caches.len()))?;
         self.slot_busy[slot] = true;
         self.slot_reserved[slot] = need;
+        // P58-4: 所有者票 (リース ID) を配る。予約の解放はこの ID が一致する
+        // ときだけ行う (二重解放・別セッションのスロット取り違えを防ぐ)。
+        self.next_lease = self.next_lease.wrapping_add(1).max(1);
+        self.slot_lease[slot] = self.next_lease;
+        sess.lease = self.next_lease;
         sess.slot = Some(slot);
         if telem::enabled() {
             telem::emit(Frame::SessionAdmit {
@@ -633,8 +711,55 @@ impl Engine {
             });
         }
         let Some(slot) = sess.slot.take() else { return };
+        let lease = std::mem::replace(&mut sess.lease, 0);
+        // 通常完了: KV 行と cached_prompts は**残す** (次セッションの live 再利用)。
+        self.release_slot(slot, lease, false, "completed");
+    }
+
+    /// P58-4: スロット会計の解放 (予約・busy・必要なら KV ミラー行の破棄)。
+    ///
+    /// `lease` がスロットの現在のリース ID と一致するときだけ実行する。
+    /// 既に解放済み (二重解放) や、別セッションが同じスロットを取り直した後に
+    /// 古いセッションから呼ばれた場合は no-op になる。
+    ///
+    /// `discard_kv = true` は**失敗したリクエストの後始末**。部分 prefill の
+    /// KV 行と `cached_prompts[slot]` を捨てる。これを残すと、次のセッションが
+    /// 「前のセッションの接頭辞」を live 再利用して壊れた KV 行を読む
+    /// (`cached_prompts` と `caches[slot]` の中身が食い違う)。
+    /// `KvCache::reset` は epoch を進めるので GPU 側ミラー (with_mirror の
+    /// 行・GDN 状態) も同時に無効化される。
+    fn release_slot(&mut self, slot: usize, lease: u64, discard_kv: bool, why: &str) {
+        if lease == 0 || self.slot_lease[slot] != lease {
+            return; // 解放済み or 別セッションが再取得済み
+        }
+        let reserved = std::mem::replace(&mut self.slot_reserved[slot], 0);
+        self.slot_lease[slot] = 0;
         self.slot_busy[slot] = false;
-        self.slot_reserved[slot] = 0;
+        if discard_kv {
+            self.caches[slot].reset();
+            self.cached_prompts[slot].clear();
+            // 実機確認用の 1 行 (DENNO_PROFILE=1 のときだけ)。数値経路には触れない。
+            if crate::prof::enabled() {
+                tracing::info!(
+                    "kv slot {slot} released after failure ({why}): reserved {reserved} tokens cleared, KV mirror rows discarded (epoch {})",
+                    self.caches[slot].epoch()
+                );
+            }
+        }
+    }
+
+    /// P58-4: 失敗時の解放を `SlotGuard` の `Drop` に閉じる。
+    ///
+    /// ガードは可変借用の外側に保持できない (`&mut self` のメソッド呼び出しと
+    /// 両立しない) ため、失敗が確定した時点で生成してその場で drop する。
+    /// 解放の実装は 1 本 (`SlotGuard::drop` → `release_slot`) だけになる。
+    fn release_slot_on_err(&mut self, lease: Option<(usize, u64)>, why: &'static str, failed: bool) {
+        if !failed {
+            return;
+        }
+        if let Some((slot, lease)) = lease {
+            let _g = SlotGuard { eng: self, slot, lease, why };
+        }
     }
 
     /// s146 (B8-3): クライアント向けエラー分類のために KV スロット数を読む
@@ -646,6 +771,17 @@ impl Engine {
     /// s146 (B8-3): 実行中 (busy) のスロット数。分類メッセージ用の読み取りのみ。
     pub fn slot_busy_count(&self) -> usize {
         self.slot_busy.iter().filter(|b| **b).count()
+    }
+
+    /// P58-4: 予約トークンの合計 (P17e の予算判定の入力)。観測用の読み取りのみ。
+    /// 失敗したリクエストの会計が戻っていることをテストとログから確認する。
+    pub fn slot_reserved_total(&self) -> usize {
+        self.slot_reserved.iter().sum()
+    }
+
+    /// P58-4: slot の予約トークン数 (観測用の読み取りのみ)。
+    pub fn slot_reserved(&self, slot: usize) -> usize {
+        self.slot_reserved[slot]
     }
 
     /// P4 ステッパ: リクエスト状態を準備する (トークン化 + max_tokens クランプ +
@@ -754,6 +890,7 @@ impl Engine {
             stop_reason: StopReason::MaxTokens,
             stop_sequence: None,
             slot: None,
+            lease: 0,
             anti_rep: crate::sampler::AntiRepetition {
                 repetition_penalty: params.repetition_penalty,
                 frequency_penalty: params.frequency_penalty,
@@ -796,7 +933,11 @@ impl Engine {
         // 「steps = サンプル」が片経路で崩れるので、**両方**の入口で 1 サンプル積む
         // (計測 OFF は `step_begin` が `None` = クロック読みなし)。
         let st = crate::prof::step_begin();
+        // P58-4: このセッションがスロットを握っているなら、Err で抜けるときに
+        // 予約と KV 行を解放する (ガードは `Drop` で走る)。
+        let lease = sess.slot.map(|s| (s, sess.lease));
         let r = self.step_chat_inner(sess, on_delta);
+        self.release_slot_on_err(lease, "prefill/decode step failed", r.is_err());
         crate::prof::step_end(st);
         r
     }
@@ -1145,6 +1286,16 @@ impl Engine {
         // を返し、`step_end` は分岐 1 回で戻る (時刻も読まない)。
         let st = crate::prof::step_begin();
         let r = self.step_chat_batch_inner(batch, on_deltas);
+        if r.is_err() {
+            // P58-4: バッチ全体が失敗したら、参加している全セッションのスロットを
+            // 解放する (どれが書けたか分からないので全員 KV 破棄)。
+            // ホットパス (成功時) はここを通らないので割り当てを増やさない。
+            for s in batch.iter() {
+                if let Some(slot) = s.slot {
+                    self.release_slot_on_err(Some((slot, s.lease)), "batch step failed", true);
+                }
+            }
+        }
         crate::prof::step_end(st);
         // s155 (Task B16): `sl_step_other` の確定は **forward の戻りの後**。
         // `sl_step` の内訳 (`sl_step_lay_other` / `sl_so_*` / 次の `sl_lin`) は
@@ -1549,8 +1700,8 @@ fn overall_stop_status(s: &str, at_line_start: bool) -> StopStatus {
 mod tests {
     use super::*;
     use crate::testutil::{
-        dummy_engine, recurrent_engine, recurrent_qwen_style_engine, thinking_sim_engine,
-        DUMMY_CONTEXT,
+        dummy_engine, dummy_tokenizer, recurrent_engine, recurrent_qwen_style_engine,
+        thinking_sim_engine, DUMMY_CONTEXT, DUMMY_VOCAB,
     };
 
     fn params(max_tokens: usize) -> GenParams {
@@ -3157,5 +3308,136 @@ mod tests {
         }
         assert_eq!(out_a.input_tokens, prompt_len);
         assert_eq!(out_b.input_tokens, prompt_len);
+    }
+
+    // ---------- P58-4: 失敗したリクエストの後始末 (予約の解放 + KV 破棄) ----------
+
+    /// P58-4: 最初の forward だけ Err を返すモデル (VRAM 枯渇で prefill が
+    /// 落ちる状況の再現)。以後は EOS (12) を出すので 1 トークンで終わる。
+    struct FailOnceModel {
+        ctx: usize,
+        failed: bool,
+    }
+
+    impl Model for FailOnceModel {
+        fn context(&self) -> usize {
+            self.ctx
+        }
+
+        fn eos_ids(&self) -> &[u32] {
+            &[12]
+        }
+
+        fn forward(&mut self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>> {
+            // KV 行を書いて len を進めた**後**に失敗する (実機の「残差チェーン
+            // 失敗」と同じ位置 = 部分 prefill の KV が残る状況を作る)。
+            let _ = cache.kv_bufs(0, tokens.len());
+            cache.advance(tokens.len());
+            if !self.failed {
+                self.failed = true;
+                anyhow::bail!("injected VRAM exhaustion (P58-4 probe)");
+            }
+            let mut logits = vec![0.0f32; DUMMY_VOCAB];
+            logits[12] = 5.0; // EOS
+            Ok(logits)
+        }
+
+        fn new_cache(&self) -> KvCache {
+            KvCache::new(1, 4, self.ctx)
+        }
+    }
+
+    /// P58-4: prefill が失敗したリクエストの KV 予約が 0 に戻り、そのスロットの
+    /// 部分 KV が破棄されること。
+    ///
+    /// 予算は「1 本分ちょうど」に設定する。予約が漏れていれば 2 本目が
+    /// "KV 予算超過 (予約 N + N ...)" で弾かれる — 2026-10-25 の実障害と同じ形。
+    /// 2 本目が通ることと、その出力が「一度も失敗していないエンジン」と
+    /// ビット一致することが、会計と KV の両方が戻っている証拠になる。
+    #[test]
+    fn failed_prefill_releases_kv_reservation_and_discards_kv() {
+        // s163 (Task K4): prof のカウンタ窓と排他
+        let _g = crate::prof::counters_guard();
+        // ctx 4096 / kv_dim 4 / 1 層 → bytes_per_token = 4 * 2 * 4 = 32
+        const CTX: usize = 4096;
+        const BPT: usize = 32;
+        let make = |name: &str, failed: bool| {
+            Engine::from_parts(
+                Box::new(FailOnceModel { ctx: CTX, failed }),
+                dummy_tokenizer().unwrap(),
+                name,
+                None,
+            )
+        };
+        let mut e = make("p58c", false);
+        // need = prompt + max_tokens。max_tokens は ctx - prompt にクランプされる
+        // ので need は常に ctx = 4096 トークン。予算をその 1 本分ちょうどにする。
+        e.set_kv_budget_bytes(Some(CTX * BPT));
+        assert_eq!(e.kv_budget(), CTX * BPT);
+
+        let err = e.chat(None, &msgs("t0"), &params(CTX), |_| {}).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("injected"), "想定外のエラー: {text}");
+
+        // 失敗経路の後始末 (予約・busy・部分 KV)
+        assert_eq!(e.slot_reserved_total(), 0, "失敗したリクエストの予約が残っている");
+        assert_eq!(e.slot_reserved(0), 0);
+        assert_eq!(e.slot_busy_count(), 0, "失敗したリクエストのスロットが busy のまま");
+        assert_eq!(e.caches[0].len(), 0, "部分 prefill の KV 行が残っている");
+        assert!(e.cached_prompts[0].is_empty(), "cached_prompts が残っている");
+
+        // 2 本目: 予算は 1 本分しかない。予約が戻っていれば通る。
+        let out = e.chat(None, &msgs("t0"), &params(CTX), |_| {})
+            .unwrap_or_else(|e| panic!("2 本目が通らない (予約の解放漏れ): {e:#}"));
+        assert_eq!(e.slot_reserved_total(), 0);
+        assert_eq!(e.slot_busy_count(), 0);
+
+        // 参照: 一度も失敗していないエンジンと同じ出力 (KV 破棄で数値が変わらない)
+        let mut r = make("p58c-ref", true);
+        let expect = r.chat(None, &msgs("t0"), &params(CTX), |_| {}).unwrap();
+        assert_eq!(out.text, expect.text, "失敗後の 2 本目の出力が参照と違う");
+        assert_eq!(out.output_tokens, expect.output_tokens);
+        assert_eq!(out.input_tokens, expect.input_tokens);
+    }
+
+    /// P58-4: 解放済みスロットを別セッションが再取得した後、古いセッションの
+    /// `release_session` が呼ばれても新しいセッションの予約を消さない
+    /// (リース ID による所有者検査)。ガードが先に解放し、スケジューラが
+    /// 後から release_session を呼ぶ経路でスロットを取り違えないための不変条件。
+    #[test]
+    fn stale_release_does_not_free_a_reused_slot() {
+        let _g = crate::prof::counters_guard();
+        let mut e = dummy_engine("m", None).unwrap();
+        let mut a = e.begin_chat(None, &msgs("t0"), &params(4)).unwrap();
+        e.install_session(&mut a).unwrap();
+        let slot_a = a.slot.unwrap();
+        let lease_a = a.lease;
+        assert!(lease_a > 0);
+        // 失敗経路と同じ解放 (a.slot は Some のまま残る)
+        e.release_slot(slot_a, lease_a, true, "test");
+        assert_eq!(e.slot_busy_count(), 0);
+
+        // 新しいセッションが同じスロットを取り直す
+        let mut b = e.begin_chat(None, &msgs("t0"), &params(4)).unwrap();
+        e.install_session(&mut b).unwrap();
+        let slot_b = b.slot.unwrap();
+        assert_eq!(slot_b, slot_a, "空きスロットの選択が変わった (前提)");
+        let reserved_b = e.slot_reserved(slot_b);
+        assert!(reserved_b > 0);
+
+        // 古いセッションの解放は no-op でなければならない
+        e.release_session(&mut a);
+        assert_eq!(
+            e.slot_reserved(slot_b),
+            reserved_b,
+            "古いセッションの解放が新しいセッションの予約を消した"
+        );
+        assert_eq!(e.slot_busy_count(), 1, "新しいセッションのスロットが解放された");
+
+        // 新しいセッションはそのまま完走できる
+        while !e.step_chat(&mut b, &mut |_| {}).unwrap() {}
+        e.release_session(&mut b);
+        assert_eq!(e.slot_reserved_total(), 0);
+        assert_eq!(e.slot_busy_count(), 0);
     }
 }
