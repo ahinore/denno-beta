@@ -15,19 +15,19 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use denno_engine::testutil::{recurrent_qwen_style_engine, thinking_sim_engine};
-use denno_server::{
-    brief_system, parse_thinking, AppState, Scheduler, Thinking, THINKING_BRIEF_INSTRUCTION,
-};
+use denno_server::{THINKING_BRIEF_INSTRUCTION, AppState, brief_system, EngineInfo, parse_thinking, Scheduler, Thinking};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 /// テスト用 AppState + Router を構築する (engine を注入できる版)
 fn test_app_with(engine: denno_engine::Engine, max_queue: usize) -> Router {
+    let info = EngineInfo::from_engine(&engine);
     let engine = Arc::new(Mutex::new(engine));
     let scheduler = Scheduler::spawn(engine.clone(), max_queue);
     let state = Arc::new(AppState {
         engine,
+        info,
         api_key: None,
         scheduler,
         model_name: "denno-test".to_string(),

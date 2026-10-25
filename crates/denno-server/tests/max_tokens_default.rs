@@ -26,9 +26,7 @@ use denno_engine::kv_cache::KvCache;
 use denno_engine::model::Model;
 use denno_engine::testutil::{dummy_tokenizer, DUMMY_EOS, DUMMY_VOCAB};
 use denno_engine::Engine;
-use denno_server::{
-    resolve_max_tokens, AppState, Scheduler, DEFAULT_MAX_TOKENS, MAX_TOKENS_CLAMP,
-};
+use denno_server::{DEFAULT_MAX_TOKENS, MAX_TOKENS_CLAMP, AppState, EngineInfo, resolve_max_tokens, Scheduler};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -71,10 +69,12 @@ impl Model for EndlessModel {
 fn test_app() -> Router {
     let tok = dummy_tokenizer().unwrap();
     let engine = Engine::from_parts(Box::new(EndlessModel), tok, "denno-test", None);
+    let info = EngineInfo::from_engine(&engine);
     let engine = Arc::new(Mutex::new(engine));
     let scheduler = Scheduler::spawn(engine.clone(), 8);
     let state = Arc::new(AppState {
         engine,
+        info,
         api_key: None,
         scheduler,
         model_name: "denno-test".to_string(),

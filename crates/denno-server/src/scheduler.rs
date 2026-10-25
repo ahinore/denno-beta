@@ -19,8 +19,15 @@
 //!     (**インターリーブ下でも各リクエストの出力は単独実行と完全一致**)。
 //! - 進行中のリクエスト数は [`MAX_ACTIVE_SESSIONS`] (KV キャッシュスロット数) に
 //!   制限する。
-//! - キューに入ったリクエストは実行開始まで待つ (**サーバー側の待ち時間
-//!   タイムアウトは無し**。タイムアウト制御はクライアント側の責務)。
+//! - キューに入ったリクエストは実行開始まで待つが、**待ちには上限がある**
+//!   ([`Limits`])。P57: 旧実装は上限が無く、GPU チェーン失敗 → CPU フォールバック
+//!   (GPU_BROKEN ラッチ後は毎回) で 1 ステップが数分に伸びた際、後続リクエストが
+//!   永久に無応答になった。今は「キュー待ち + スロット待ち」が [`Limits::admit`] を
+//!   超えたら 500 (api_error) で返してスロットを解放し、無進捗が [`Limits::stall`]
+//!   を超えた Run も同じ経路で打ち切る。SSE イベント送信も [`Limits::send`] で
+//!   打ち切る (読み手が止まったクライアントでワーカーがブロックしない)。
+//!   生成そのものは 1 GPU なので直列化したままだが、**直列化と無応答は別物**である
+//!   (制御プレーン — `/v1/models` 等 — はエンジン Mutex を取らない)。
 //!   SSE リクエストは応答ストリームを即座に開始するため、待ち行列中も
 //!   keep-alive ping (2秒間隔) が流れ続けて接続が切れない。
 //! - s38: クライアント切断の検知。SSE ストリームではクライアントが接続を切ると
@@ -39,13 +46,15 @@
 //!   ワーカー・KV・受付ループへの残留影響は無い。
 
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use axum::response::sse::Event;
 use denno_engine::{prof, ChatMessage, ChatOutput, ChatSession, Engine, GenParams, ToolConstraint};
 use serde_json::json;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::{new_msg_id, to_event};
@@ -54,6 +63,49 @@ use crate::stream_asm::StreamAssembler;
 /// ワーカーが同時に進行できるリクエスト数の上限 (= エンジンの KV キャッシュ
 /// スロット数と一致させる)。キュー (`max_queue`) とは別の上限。
 pub const MAX_ACTIVE_SESSIONS: usize = 4;
+
+/// P57: 待ちに上限を入れるための値。**上限が無いと「1 リクエストの失敗」が
+/// 「サーバ全体の永久無応答」に化ける** (2026-10-25 本番障害: VRAM 枯渇 →
+/// `cuMemAlloc` 失敗 → 残差チェーン失敗 → GPU_BROKEN ラッチ → 以降の prefill は
+/// CPU フォールバックで 1 ステップが数分。ワーカーがエンジン Mutex をほぼ連続
+/// 保持し、`/v1/models` はロック待ちで 200 すら返せなくなった)。
+///
+/// 既定値の根拠 (推定を含む):
+/// - `admit` 300s: 27B の 65k prefill が 1 本 30〜60s 級なので、4 スロット +
+///   キューが埋まっても 300s 以内に必ず順番が回る。超えたら「待たせるより 500」。
+/// - `stall` 900s: 正常な 1 ステップ (prefill 1 回 / decode 1 トークン) の
+///   最悪値の 10 倍以上。これを超えて進まない Run は異常とみなす。
+/// - `send` 30s: SSE の受信バッファ (64 本) が 30s 詰まったクライアントは
+///   読み手として死んでいる。旧実装は `blocking_send` で**エンジン Mutex を
+///   握ったまま**ここで永久ブロックし得た。
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// 受付 (submit) → prefill 開始 (キュー待ち + スロット待ち) の上限
+    pub admit: Duration,
+    /// 最後に進んだステップからの無進捗時間の上限
+    pub stall: Duration,
+    /// SSE イベント 1 本の送信待ちの上限
+    pub send: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            admit: Duration::from_secs(300),
+            stall: Duration::from_secs(900),
+            send: Duration::from_secs(30),
+        }
+    }
+}
+
+/// P57: 上限超過をクライアントへ返す 1 行の原因。`ApiError::from_anyhow` は
+/// 未知の anyhow を 500 (api_error) にするので、追加の型は要らない。
+fn timeout_error(what: &str, limit: Duration) -> anyhow::Error {
+    anyhow::anyhow!(
+        "timeout: {what} exceeded {:.1}s; the request was abandoned and its KV slot released",
+        limit.as_secs_f64()
+    )
+}
 
 /// スケジューラに積むジョブ。検証済みのパラメータのみが入る。
 /// `tools` は chat template の `tools` 変数へ渡す値 (None = tools 無し)。
@@ -108,6 +160,12 @@ struct Run {
     /// `prof::request_end` を 1 回だけ呼ぶ。生成の終わりはここ (Run の終端) で、
     /// HTTP ハンドラの戻りではない (SSE は即座に戻るため)。
     req_mark: Option<prof::RequestMarker>,
+    /// P57: 最後にステップが成功した時刻 (無進捗スイープの入力)。
+    /// 起点は受付時刻 (= prefill 待ちも無進捗として数える)。
+    last_progress: Instant,
+    /// P57: SSE イベント送信が詰まった (読み手が止まっている) ことを
+    /// delta コールバックから Run へ伝えるフラグ。ステップ境界で読む。
+    send_dead: Arc<AtomicBool>,
 }
 
 impl Run {
@@ -135,28 +193,39 @@ impl Run {
 
 /// リクエストスケジューラ。有界キュー + 単一ワーカースレッド。
 pub struct Scheduler {
-    tx: mpsc::SyncSender<Job>,
+    tx: mpsc::SyncSender<(Instant, Job)>,
     /// 現在進行中 (pull 済み未完了) のジョブ数。観測/テスト用
     in_flight: Arc<AtomicUsize>,
     max_queue: usize,
+    limits: Limits,
 }
 
 impl Scheduler {
     /// ワーカースレッドを起動する。
     /// `max_queue` は「実行中 (進行中) の他に待ち行列に入れられる数」。
     pub fn spawn(engine: Arc<Mutex<Engine>>, max_queue: usize) -> Self {
+        Self::spawn_with_limits(engine, max_queue, Limits::default())
+    }
+
+    /// P57: 待ちの上限を指定して起動する (テスト・運用チューニング用)。
+    pub fn spawn_with_limits(engine: Arc<Mutex<Engine>>, max_queue: usize, limits: Limits) -> Self {
         let (tx, rx) = mpsc::sync_channel(max_queue.max(1));
         let in_flight = Arc::new(AtomicUsize::new(0));
         let worker_in_flight = in_flight.clone();
         std::thread::Builder::new()
             .name("denno-scheduler".into())
-            .spawn(move || worker(engine, rx, worker_in_flight))
+            .spawn(move || worker(engine, rx, worker_in_flight, limits))
             .expect("scheduler スレッドの起動に失敗");
-        Self { tx, in_flight, max_queue }
+        Self { tx, in_flight, max_queue, limits }
     }
 
     pub fn max_queue(&self) -> usize {
         self.max_queue
+    }
+
+    /// P57: 実際に使われている上限 (観測/テスト用)。
+    pub fn limits(&self) -> Limits {
+        self.limits
     }
 
     /// 現在進行中のジョブ数 (pull 済み未完了。キュー待ちは含まない)
@@ -182,7 +251,7 @@ impl Scheduler {
     ) -> Result<oneshot::Receiver<Result<ChatOutput>>, QueueFull> {
         let (respond, rx) = oneshot::channel();
         self.tx
-            .try_send(Job::Chat { system, messages, params, tools, constraint, enable_thinking, respond })
+            .try_send((Instant::now(), Job::Chat { system, messages, params, tools, constraint, enable_thinking, respond }))
             .map_err(|_| QueueFull)?;
         Ok(rx)
     }
@@ -199,14 +268,25 @@ impl Scheduler {
         events: tokio_mpsc::Sender<Result<Event, Infallible>>,
     ) -> Result<(), QueueFull> {
         self.tx
-            .try_send(Job::Stream { system, messages, params, tools, constraint, enable_thinking, events })
+            .try_send((Instant::now(), Job::Stream { system, messages, params, tools, constraint, enable_thinking, events }))
             .map_err(|_| QueueFull)
     }
 }
 
 /// ワーカーメインループ。エンジン Mutex を 1 ステップ単位で取得し、
 /// 複数リクエストを並行して進める (decode は 1 forward にバッチ)。
-fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<AtomicUsize>) {
+///
+/// P57: エンジン Mutex を握るのは **このスレッドだけ** (HTTP ハンドラは取らない —
+/// `AppState` の不変情報は起動時にキャッシュする)。それでも 1 ステップが異常に
+/// 長くなることはあり得る (GPU チェーン失敗 → CPU フォールバック) ので、
+/// 握る区間そのものは短くできない代わりに **待ち側に上限**を置く ([`Limits`])。
+/// ステップ境界で期限切れの Run を打ち切り、スロットとロックを解放する。
+fn worker(
+    engine: Arc<Mutex<Engine>>,
+    rx: mpsc::Receiver<(Instant, Job)>,
+    in_flight: Arc<AtomicUsize>,
+    limits: Limits,
+) {
     // 常駐中 (KV スロット占有中) のセッション群
     let mut active: Vec<Run> = Vec::new();
 
@@ -222,13 +302,17 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
         // Disconnected && active.is_empty() と同一)。
         if active.is_empty() {
             match rx.recv() {
-                Ok(job) => admit_job(&engine, job, &in_flight, &mut active),
+                Ok((submitted, job)) => {
+                    admit_job(&engine, job, submitted, &in_flight, &mut active, limits)
+                }
                 Err(_) => return,
             }
         }
         while active.len() < MAX_ACTIVE_SESSIONS {
             match rx.try_recv() {
-                Ok(job) => admit_job(&engine, job, &in_flight, &mut active),
+                Ok((submitted, job)) => {
+                    admit_job(&engine, job, submitted, &in_flight, &mut active, limits)
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if active.is_empty() {
@@ -239,10 +323,13 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
             }
         }
 
-        // --- s38: 切断スイープ (decode / prefill の各ステップ境界で評価) ---
+        // --- s38: 切断スイープ + P57: 上限超過スイープ (各ステップ境界で評価) ---
         // 前ステップ以降にクライアントが切断した Run (SSE 応答ボディの drop →
         // events チャネル閉鎖) を打ち切る。待ち行列 pull 直後〜prefill 前の切断も
         // ここで拾うため、切断済みクライアントの分の無駄な prefill を実行しない。
+        // P57: 併せて「進まない Run」(無進捗が上限超過 / SSE 送信が詰まった) も
+        // ここで打ち切る — ワーカーが 1 本の Run に引きずられて永久に回り続ける
+        // ことを防ぐ (スロットとエンジンロックはこの境界で必ず解放される)。
         let mut i = active.len();
         while i > 0 {
             i -= 1;
@@ -250,6 +337,11 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
                 in_flight.fetch_sub(1, Ordering::SeqCst);
                 let run = active.remove(i);
                 abort_disconnected(&engine, run);
+            } else if let Some(why) = expired(&active[i], limits) {
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let mut run = active.remove(i);
+                release_run(&engine, &mut run);
+                send_error(&mut run, why, limits.send);
             }
         }
         if active.is_empty() {
@@ -267,14 +359,14 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
                 let mut g = engine.lock().unwrap();
                 g.step_chat(active[i].sess.as_mut().unwrap(), &mut |_| {})
             };
-            if let Err(e) = step {
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-                let mut run = active.remove(i);
-                {
-                    let mut g = engine.lock().unwrap();
-                    g.release_session(run.sess.as_mut().unwrap());
+            match step {
+                Ok(_) => active[i].last_progress = Instant::now(),
+                Err(e) => {
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let mut run = active.remove(i);
+                    release_run(&engine, &mut run);
+                    send_error(&mut run, e, limits.send);
                 }
-                send_error(&mut run, e);
             }
             continue;
         }
@@ -289,25 +381,33 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
         // コールバック (asms への &mut 借用を保持する) はこの block 内で drop させる
         // — ステップ完了後に asms を Run へ move し戻す必要があるため、借用と
         // move の区間を重ねない (E0505 対策)
+        let send_timeout = limits.send;
         let step = {
             let mut boxed_cbs: Vec<Box<dyn FnMut(&str) + '_>> = asms
                 .iter_mut()
                 .zip(active.iter())
                 .map(|(asm, run)| -> Box<dyn FnMut(&str) + '_> {
                     let events = run.events.clone();
+                    // P57: 読み手が止まったクライアントで**エンジンロックを握ったまま**
+                    // `blocking_send` が永久ブロックしないよう、有界送信にして
+                    // 詰まったらフラグを立てる (打ち切りはステップ境界で行う)。
+                    let dead = run.send_dead.clone();
                     match asm {
                         Some(asm) => Box::new(move |delta: &str| {
                             // 第27: block 境界検出付きの SSE 組み立て (tool_use block も流す)
                             asm.push_delta(delta);
                             for ev in asm.take_events() {
                                 if let Some(events) = &events {
-                                    let _ = events.blocking_send(Ok(to_event(&ev)));
+                                    if !send_bounded(events, to_event(&ev), send_timeout) {
+                                        dead.store(true, Ordering::Relaxed);
+                                        return;
+                                    }
                                 }
                             }
                         }),
                         None => Box::new(move |_: &str| {
                             // 非ストリーム (Job::Chat) は送信先が無い → no-op
-                            let _ = &events;
+                            let _ = (&events, &dead);
                         }),
                     }
                 })
@@ -320,8 +420,11 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
         match step {
             Ok(done) => {
                 // アセンブラを Run へ戻す (done 判定の添字は active の並びと一致)
+                let now = Instant::now();
                 for (run, asm) in active.iter_mut().zip(asms) {
                     run.asm = asm;
+                    // P57: ステップが 1 つ進んだ = この Run は生きている
+                    run.last_progress = now;
                 }
                 // 完了/切断したセッションを外して後処理 (後ろから外すことで添字を維持)
                 let mut i = done.len();
@@ -330,11 +433,8 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
                     if done[i] {
                         in_flight.fetch_sub(1, Ordering::SeqCst);
                         let mut run = active.remove(i);
-                        {
-                            let mut g = engine.lock().unwrap();
-                            g.release_session(run.sess.as_mut().unwrap());
-                        }
-                        finish_run(run);
+                        release_run(&engine, &mut run);
+                        finish_run(run, limits.send);
                     } else if active[i].client_gone() {
                         // s38/s44: decode ステップ中にクライアントが切断。
                         // Stream: 書き込み失敗 → 応答ボディ drop → チャネル閉鎖。
@@ -360,20 +460,40 @@ fn worker(engine: Arc<Mutex<Engine>>, rx: mpsc::Receiver<Job>, in_flight: Arc<At
                 let mut runs = std::mem::take(&mut active);
                 for run in runs.iter_mut() {
                     in_flight.fetch_sub(1, Ordering::SeqCst);
-                    let mut g = engine.lock().unwrap();
-                    g.release_session(run.sess.as_mut().unwrap());
+                    release_run(&engine, run);
                 }
                 for mut run in runs {
                     let msg = format!("{e:#}");
-                    send_error(&mut run, anyhow::anyhow!(msg));
+                    send_error(&mut run, anyhow::anyhow!(msg), limits.send);
                 }
             }
         }
     }
 }
 
+/// P57: 打ち切り理由 (上限を超えていなければ None)。
+fn expired(run: &Run, limits: Limits) -> Option<anyhow::Error> {
+    if run.send_dead.load(Ordering::Relaxed) {
+        return Some(timeout_error(
+            "SSE event send (client stopped reading)",
+            limits.send,
+        ));
+    }
+    if run.last_progress.elapsed() >= limits.stall {
+        return Some(timeout_error("generation progress", limits.stall));
+    }
+    None
+}
+
+/// セッションをエンジンへ返す (`install_session` 前なら no-op)。
+fn release_run(engine: &Arc<Mutex<Engine>>, run: &mut Run) {
+    if let Some(sess) = run.sess.as_mut() {
+        engine.lock().unwrap().release_session(sess);
+    }
+}
+
 /// ジョブから実行状態を作る (begin_chat まで。KV には触れない)。
-fn build_run(engine: &Arc<Mutex<Engine>>, job: Job) -> Run {
+fn build_run(engine: &Arc<Mutex<Engine>>, job: Job, submitted: Instant) -> Run {
     let (system, messages, params, tools, constraint, enable_thinking, respond, events) = match job {
         Job::Chat { system, messages, params, tools, constraint, enable_thinking, respond } => {
             (system, messages, params, tools, constraint, enable_thinking, Some(respond), None)
@@ -404,7 +524,19 @@ fn build_run(engine: &Arc<Mutex<Engine>>, job: Job) -> Run {
     // s151 (B12): リクエストの壁時計はここで開く (セッションの生成区間 = prefill
     // 開始から完了まで)。計測 OFF は None (クロック読みなし)。
     let req_mark = prof::request_begin();
-    Run { sess, error, respond, events, started: false, asm, req_mark }
+    // P57: 無進捗の起点は「受付時刻」。prefill が始まるまでの待ちもここから測る。
+    let last_progress = submitted;
+    Run {
+        sess,
+        error,
+        respond,
+        events,
+        started: false,
+        asm,
+        req_mark,
+        last_progress,
+        send_dead: Arc::new(AtomicBool::new(false)),
+    }
 }
 
 /// 新規ジョブの admit (pull 経路 2 箇所の共通化)。成功なら active へ push する。
@@ -412,17 +544,34 @@ fn build_run(engine: &Arc<Mutex<Engine>>, job: Job) -> Run {
 /// SSE プリアンブル送信が broken pipe で失敗する等 / s44: respond Receiver drop —
 /// 待ち行列中にクライアントが切断した場合) の場合はエラーではなく
 /// 打ち切りとして扱う (クライアントは既に居ないため送信先が存在しない)。
+///
+/// P57: 受付から [`Limits::admit`] を超えて待たされたジョブは、スロットを
+/// 取らずに 500 (api_error) で返す。「待たせ続ける」より「期限を切って返す」。
 fn admit_job(
     engine: &Arc<Mutex<Engine>>,
     job: Job,
+    submitted: Instant,
     in_flight: &AtomicUsize,
     active: &mut Vec<Run>,
+    limits: Limits,
 ) {
     in_flight.fetch_add(1, Ordering::SeqCst);
-    let mut run = build_run(engine, job);
+    let mut run = build_run(engine, job, submitted);
+    // P57: キュー待ち + スロット待ちの上限。スロットはまだ取っていないので
+    // 解放は不要 (取得済みでも release_run は no-op)。
+    let waited = submitted.elapsed();
+    if waited >= limits.admit {
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+        let why = timeout_error(
+            &format!("queue/slot wait ({:.1}s)", waited.as_secs_f64()),
+            limits.admit,
+        );
+        send_error(&mut run, why, limits.send);
+        return;
+    }
     // s146: このジョブより先に KV を握っているセッション数 (分類の入力)
     let live = active.len();
-    if let Err(e) = admit(engine, &mut run, live) {
+    if let Err(e) = admit(engine, &mut run, live, limits.send) {
         in_flight.fetch_sub(1, Ordering::SeqCst);
         if run.client_gone() {
             abort_disconnected(engine, run);
@@ -434,10 +583,8 @@ fn admit_job(
             // 以後の全リクエストが "no free KV cache slot" で失敗した
             // (DENNO_BATCH_SLOTS=4 が回避策として効いたのはこれが理由)。
             // `release_session` は slot 未取得なら no-op なので、全経路で呼んでよい。
-            if let Some(sess) = run.sess.as_mut() {
-                engine.lock().unwrap().release_session(sess);
-            }
-            send_error(&mut run, e);
+            release_run(engine, &mut run);
+            send_error(&mut run, e, limits.send);
         }
     } else {
         active.push(run);
@@ -449,9 +596,7 @@ fn admit_job(
 /// `release_session` のみで、KV/Scratch 状態は次のセッションからそのまま使える。
 /// install 前 (admit 失敗・未実施) の場合も `release_session` は slot 無しで no-op。
 fn abort_disconnected(engine: &Arc<Mutex<Engine>>, mut run: Run) {
-    if let Some(sess) = run.sess.as_mut() {
-        engine.lock().unwrap().release_session(sess);
-    }
+    release_run(engine, &mut run);
     // s151 (B12): 打ち切られたリクエストも壁時計を 1 本だけ閉じる (未計上で
     // `requests` と `wall` がずれると COVERAGE の分母が嘘になる)。
     prof::request_end(run.req_mark.take());
@@ -611,7 +756,11 @@ impl std::error::Error for AdmitFailure {
 }
 
 /// セッションを live にする (install) + 初回なら SSE プリアンブルを送る。
-fn admit(engine: &Arc<Mutex<Engine>>, run: &mut Run, live: usize) -> Result<()> {
+///
+/// P57: プリアンブル送信は [`send_bounded`] にする。旧実装の `blocking_send` は
+/// 読み手が止まったクライアントで**ワーカースレッドを永久にブロック**し得た
+/// (この時点でエンジンロックは離しているが、ワーカーが止まればサーバ全体が止まる)。
+fn admit(engine: &Arc<Mutex<Engine>>, run: &mut Run, live: usize, send_timeout: Duration) -> Result<()> {
     if let Some(e) = run.error.take() {
         return Err(e);
     }
@@ -635,7 +784,7 @@ fn admit(engine: &Arc<Mutex<Engine>>, run: &mut Run, live: usize) -> Result<()> 
         let model = engine.lock().unwrap().name.clone();
         let input_tokens = run.sess.as_ref().unwrap().input_tokens();
         let send = |v: serde_json::Value| -> bool {
-            events.blocking_send(Ok(to_event(&v))).is_ok()
+            send_bounded(events, to_event(&v), send_timeout)
         };
         // 1. message_start
         if !send(json!({
@@ -668,7 +817,7 @@ fn admit(engine: &Arc<Mutex<Engine>>, run: &mut Run, live: usize) -> Result<()> 
 }
 
 /// 完了したセッションの後処理 (respond or SSE 後半イベント)。
-fn finish_run(mut run: Run) {
+fn finish_run(mut run: Run, send_timeout: Duration) {
     // s151 (B12): 生成が終わった点でリクエストの壁時計を閉じる。JSON 応答でも
     // SSE でも同じ 1 本で、Run の終端は全経路でここ (または abort) を通る。
     let mark = run.req_mark.take();
@@ -681,8 +830,9 @@ fn finish_run(mut run: Run) {
         return;
     }
     if let Some(events) = events {
+        // P57: 読み手が止まったクライアントで永久ブロックしない (有界送信)
         let send = |v: serde_json::Value| -> bool {
-            events.blocking_send(Ok(to_event(&v))).is_ok()
+            send_bounded(&events, to_event(&v), send_timeout)
         };
         // 4. content_block_stop (アセンブラが残りテキストのフラッシュ + open block の
         //    close を行う。tool block を出した場合 stop_reason は "tool_use")
@@ -714,17 +864,59 @@ fn finish_run(mut run: Run) {
 /// 分ける。`AdmitFailure` の `Display` は分類済みの 1 行だけを返すため、
 /// ログ側は `{e:#}` (cause 連鎖 — エンジン原文 "no free KV cache slot
 /// (N slots)" 等) を必ず別途記録し、診断情報を落とさない。
-fn send_error(run: &mut Run, e: anyhow::Error) {
+fn send_error(run: &mut Run, e: anyhow::Error, send_timeout: Duration) {
     let detail = format!("{e:#}");
     let client_msg = format!("{e}");
     tracing::error!("chat failed: {detail}");
+    // s151 (B12): 失敗で終わるリクエストも壁時計を 1 本だけ閉じる
+    // (`request_end` は `take()` 済みなら no-op。完了経路と二重計上しない)。
+    prof::request_end(run.req_mark.take());
     if let Some(respond) = run.respond.take() {
         let _ = respond.send(Err(e));
     } else if let Some(events) = run.events.take() {
-        // エラーは error イベントで通知して閉じる
-        let _ = events.blocking_send(Ok(to_event(&json!({
-            "type": "error",
-            "error": {"type": "api_error", "message": client_msg}
-        }))));
+        // エラーは error イベントで通知して閉じる (読み手が止まっていれば諦める)
+        let _ = send_bounded(
+            &events,
+            to_event(&json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": client_msg}
+            })),
+            send_timeout,
+        );
+    }
+}
+
+/// P57: 有界の SSE 送信。
+///
+/// 旧実装は `blocking_send` だった — 受信バッファ (64 本) が詰まったクライアント
+/// (読み手が止まっている) では**永久にブロック**し、decode の delta コールバックは
+/// エンジン Mutex を握ったまま呼ばれるため、そのままサーバ全体が停止した。
+///
+/// ここでは `try_send` を `timeout` まで **短い sleep を挟んで** 再試行する
+/// (ビジーループにしない・CPU を焼かない)。諦めたら false を返し、呼び出し側が
+/// その Run を打ち切る。
+fn send_bounded(
+    events: &tokio_mpsc::Sender<Result<Event, Infallible>>,
+    ev: Event,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut pending = ev;
+    loop {
+        match events.try_send(Ok(pending)) {
+            Ok(()) => return true,
+            Err(TrySendError::Closed(_)) => return false,
+            Err(TrySendError::Full(back)) => {
+                pending = match back {
+                    Ok(ev) => ev,
+                    Err(_) => return false, // 型上あり得ない (Ok で送っている)
+                };
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                // 1ms 未満の sleep は OS 依存でスピンに近づくため 1ms 固定。
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }

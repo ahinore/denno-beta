@@ -24,7 +24,41 @@ mod logging;
 mod scheduler;
 mod stream_asm;
 pub use logging::{init_serve_logging, NonBlockingStdout};
-pub use scheduler::{AdmitFailure, AdmitKind, Job, MAX_ACTIVE_SESSIONS, QueueFull, Scheduler};
+pub use scheduler::{
+    AdmitFailure, AdmitKind, Job, Limits, MAX_ACTIVE_SESSIONS, QueueFull, Scheduler,
+};
+
+/// P57: エンジンの **不変情報**。起動時に 1 回だけ読み、以降はハンドラが
+/// `engine.lock()` を取らずに応答するために使う。
+///
+/// 背景 (2026-10-25 本番障害): `/v1/models` は名前と context を読むためだけに
+/// エンジン Mutex を取っていた (旧 lib.rs:900)。GPU チェーン失敗 →
+/// CPU フォールバックで 1 ステップが数分に伸びた際、ワーカーが Mutex をほぼ連続
+/// 保持したため `/v1/models` がロック待ちで **200 すら返せず**、サーバ全体が
+/// 無応答に見えた。制御プレーンは生成の直列化に巻き込まない。
+#[derive(Debug, Clone)]
+pub struct EngineInfo {
+    /// コンテキスト長 (トークン)
+    pub context: usize,
+    /// 量子化モードのラベル (`QuantMode::label`)
+    pub quant: String,
+    /// KV キャッシュスロット数
+    pub slots: usize,
+    /// モデルの層数
+    pub layers: usize,
+}
+
+impl EngineInfo {
+    /// エンジンから 1 回だけ読む (起動時 / テストの fixture 構築時)。
+    pub fn from_engine(e: &Engine) -> Self {
+        Self {
+            context: e.context(),
+            quant: e.quant.label().to_string(),
+            slots: e.caches.len(),
+            layers: e.caches.first().map(|c| c.n_layers()).unwrap_or(0),
+        }
+    }
+}
 
 pub struct AppState {
     pub engine: Arc<Mutex<Engine>>,
@@ -37,6 +71,9 @@ pub struct AppState {
     pub model_name: String,
     /// 実行中のモデル ID (例: Qwen/Qwen2.5-0.5B-Instruct)。テレメトリ ServerInfo 用。
     pub model_id: String,
+    /// P57: 生成中でもロックを取らずに応答するための不変情報
+    /// ([`EngineInfo`])。ハンドラは **これを読む** (engine.lock() を取らない)。
+    pub info: EngineInfo,
     /// s56b: serve 既定の repetition_penalty。リクエストが未指定のときだけ適用する。
     /// 既定 None (= 従来と完全に同一のサンプリング経路) なので、
     /// フラグを付けない起動では出力ビット不変 (アンカー不変)。
@@ -65,8 +102,9 @@ pub struct ServeConfig {
     pub quant: QuantMode,
     /// P4: リクエストキューの上限 (実行中 1 件の他に待ち行列に入れられる数)。
     /// 同時受け付けがこれを超えると 503 (overloaded_error) を返す。
-    /// キューに入ったリクエストは実行開始まで待つ (サーバー側の待ち時間
-    /// タイムアウトは無し)。
+    /// キューに入ったリクエストは実行開始まで待つが、待ちには上限がある
+    /// (P57: `scheduler::Limits` — キュー待ち + スロット待ちが 300s を超えたら
+    /// 500 で返してスロットを解放する。旧実装は上限が無かった)。
     pub max_queue: usize,
     /// s56b: serve 既定の repetition_penalty (None = リクエスト指定のみ)。
     /// Qwen3.5-9B int8 は長い system + tools の greedy 経路で崩壊するため、
@@ -185,6 +223,20 @@ pub fn debug_api_error(e: ApiError) -> (u16, &'static str, String) {
 /// 単一ワーカーを長時間占有するケースが残ったため、既定を 1/4 に下げる。
 /// 明示指定は尊重する (clamp 上限 4096 は `MAX_TOKENS_CLAMP` 側で不変)。
 pub const DEFAULT_MAX_TOKENS: usize = 1024;
+
+/// P57: 非ストリーミング (`stream: false`) のハンドラが応答を待つ上限。
+///
+/// 旧実装は `rx.await` を無期限に待っていた。ワーカーが 1 ステップで詰まる
+/// (GPU 失敗 → CPU フォールバック等) と、クライアントは 500 も返らず永久に
+/// 無応答になった。上限を超えたら 500 (api_error) を返し、受信側を drop する
+/// — ワーカーから見るとクライアント切断と同じなので、次のステップ境界で
+/// KV スロットが解放される。
+///
+/// 値の根拠 (推定): 既定 max_tokens = 1024 の 1 リクエストは 27B で数十秒級。
+/// スケジューラ側の `Limits::admit` (300s) と `Limits::stall` (900s) より
+/// 短くすると「キュー待ちで 500」が先に出てしまうため、stall と同値の 900s に
+/// する (無期限より短ければよい、という設計)。
+pub const RESPONSE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// s53: 明示指定時の上限 (clamp)。既定 (1024) とは独立。
 pub const MAX_TOKENS_CLAMP: usize = 4096;
@@ -860,6 +912,8 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
 
     let model_name = engine.name.clone();
     let model_id = cfg.model_id.clone();
+    // P57: 不変情報をここで 1 回だけ読む (ハンドラはエンジンロックを取らない)
+    let info = EngineInfo::from_engine(&engine);
     let engine = Arc::new(Mutex::new(engine));
     let state = Arc::new(AppState {
         engine: engine.clone(),
@@ -867,6 +921,7 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
         scheduler: Scheduler::spawn(engine, cfg.max_queue.max(1)),
         model_name,
         model_id,
+        info,
         default_repetition_penalty: cfg.repetition_penalty,
         temperature_cap: cfg.temperature_cap,
     });
@@ -896,16 +951,15 @@ async fn models(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
-    let (name, ctx) = {
-        let g = state.engine.lock().unwrap();
-        (g.name.clone(), g.context())
-    };
+    // P57: ここで engine.lock() を取らない (旧実装は名前と context のためだけに
+    // 取っており、生成中は 200 すら返せなかった)。値は起動時のキャッシュ。
+    let name = &state.model_name;
     Ok(Json(json!({
         "data": [{
             "id": name,
             "type": "model",
             "display_name": name,
-            "context_length": ctx,
+            "context_length": state.info.context,
         }],
         "has_more": false,
     })))
@@ -1078,11 +1132,26 @@ async fn messages_inner(
             .scheduler
             .submit_chat(system, chat_messages, params, tools_for_prompt, tool_constraint, enable_thinking)
             .map_err(queue_full_error(&state))?;
-        let mut output = rx
-            .await
-            .map_err(|e| anyhow::anyhow!("scheduler dropped: {e}"))
-            .and_then(|r| r)
-            .map_err(ApiError::from_anyhow)?;
+        // P57: 待ちに上限を入れる。旧実装は `rx.await` を無期限に待ったため、
+        // ワーカーが 1 ステップで詰まるとクライアントは永久に無応答だった。
+        // 期限を超えたら 500 を返し、`rx` を落とす (= ワーカーから見て
+        // 「クライアント切断」と同じ扱いになり、次のステップ境界で
+        // KV スロットが解放される)。
+        let waited = tokio::time::timeout(RESPONSE_WAIT_TIMEOUT, rx).await;
+        let mut output = match waited {
+            Ok(Ok(Ok(out))) => out,
+            Ok(Ok(Err(e))) => return Err(ApiError::from_anyhow(e)),
+            Ok(Err(e)) => {
+                return Err(ApiError::api(format!("scheduler dropped: {e}")))
+            }
+            Err(_) => {
+                return Err(ApiError::api(format!(
+                    "timeout: no response from the engine within {:.1}s; \
+                     the request was abandoned (retry later)",
+                    RESPONSE_WAIT_TIMEOUT.as_secs_f64()
+                )))
+            }
+        };
         // tool use: モデル出力から tool_call block を抽出し content blocks を組む
         let mut calls = Vec::new();
         if tools_active {
@@ -1210,17 +1279,16 @@ async fn telemetry_ws(
 
 async fn telemetry_socket(mut socket: WebSocket, state: Arc<AppState>) {
     // 最初に ServerInfo (モデル/モデルID/量子化/スロット数/コンテキスト長/層数)
-    let (model, model_id, quant, slots, context, layers) = {
-        let g = state.engine.lock().unwrap();
-        (
-            g.name.clone(),
-            state.model_id.clone(),
-            g.quant.label().to_string(),
-            g.caches.len() as u32,
-            g.context() as u32,
-            g.caches.first().map(|c| c.n_layers()).unwrap_or(0) as u32,
-        )
-    };
+    // P57: エンジンロックを取らない (生成中でもハンドシェイクが通る)。値は
+    // 起動時のキャッシュ (`EngineInfo`) — モデルは実行中に変わらない。
+    let (model, model_id, quant, slots, context, layers) = (
+        state.model_name.clone(),
+        state.model_id.clone(),
+        state.info.quant.clone(),
+        state.info.slots as u32,
+        state.info.context as u32,
+        state.info.layers as u32,
+    );
     let info = Frame::ServerInfo { model, model_id, quant, slots, context, layers };
     if socket.send(Message::Binary(info.encode())).await.is_err() {
         return;
