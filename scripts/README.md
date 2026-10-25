@@ -26,6 +26,7 @@ Two rules that hold everywhere in this directory:
 | `dashboard.py` | P5-1 dashboard: reads every `*.json` from `cold_ab.py --json` in a directory plus an optional `PF_BENCH` log, and writes one self-contained HTML file (inline SVG, no script/CDN/fonts) with **prefill (s)** and **decode (ms/token)** on two separate axes, x = measurement order. `--protocol-change LABEL` draws a vertical marker where that era starts (repeatable); a panel with fewer than 2 points says "not enough points". The era of a run is its JSON `"era"` key (written by `cold_ab.py --era`), else `"label"`, else the file name; `parse_cold_ab_payload()` returns which one it used in `era_source` (`era` / `label` / `filename`). Decode points come from the PF lines (`wall * 1000 / tokens`, tokens = the line's `output_tokens` else `--max-tokens`); the cold A/B JSON has no decode number, so it never invents one. Output is byte-identical for the same inputs. | `python3 scripts/dashboard.py --self-test` | 0 ok / 1 unusable input (bad JSON, missing dir, no points; no partial `--out` is left) / 2 usage error | No (the chart is CPU-only; the *data* needs a GPU host) | P5-1 |
 | `test_dashboard.py` | `unittest` suite for `dashboard.py`: byte-identical output on two runs, both panels with their own units, marker only when `--protocol-change` matches, the single-point "not enough points" path with no NaN/Inf, malformed JSON naming the file (exit 1), one point per PF line, the `cold_ab.py --era` → dashboard round trip (`era_source == "era"`, plus the `label` and `filename` fallbacks), and `--help`. | `python3 scripts/test_dashboard.py -v` (21 tests) | 0 all pass / 1 at least one test fails | No | P5-1 |
 | `fixtures/long_conversation_turns.json` | The fixed 10 prompts for `long_conversation_check.py`. Do not reorder or renumber; append only, and say why in `docs/TASKS.md`. | Asserted by `test_long_conversation_check.py` | — | — | P4-1 |
+| `check_history_parity.py` | Japanese/English parity check for `docs/history/`: file correspondence, heading count, table rows, code blocks, the set of backticked commit SHAs (missing in en = FAIL), the number of numeric tokens (en more than 10% short = WARN, 30% short = FAIL), the `Japanese original:` back-link in the first 10 lines of each en file, and the `[English](en/...)` link on each ja nav line. Read-only: it never edits `docs/history/`. | `python3 scripts/check_history_parity.py` (nothing to mock: no server, no network) | 0 no FAIL (PASS/WARN only) / 1 at least one FAIL / 2 setup problem (no `history` dir or no `en/`) | No | parity |
 
 ## Running the whole GPU-free gate
 
@@ -114,3 +115,25 @@ python3 scripts/long_conversation_check.py --replay /tmp/lc_cap.json --expect-ca
 `--temperature` is only sent when you pass it. The default sends none, so the
 serve-side cap stays in control and the run can't mask a regression by
 overriding it.
+## The history parity check (parity)
+
+`docs/history/*.md` (Japanese) and `docs/history/en/*.md` (English) are checked
+against each other. It reads files and prints a verdict list; it never edits them,
+so a real divergence is reported, not repaired.
+
+```sh
+python3 scripts/check_history_parity.py                       # the real tree
+python3 scripts/check_history_parity.py --history-dir /tmp/x  # a copy (for trying a break)
+```
+
+- One line per check, `PASS` / `WARN` / `FAIL`, then one `summary:` line.
+  Exit 0 when nothing FAILs (WARNs are allowed), 1 on any FAIL, 2 if the
+  directory or its `en/` is missing.
+- `WARN` is the "translation may be thinning out" band: numeric tokens 10-30%
+  fewer on the English side. Below 70% it is a `FAIL`. `70_infra.md` sits in the
+  WARN band because Japanese counters ("2 回", "2 通り") become "twice", "two ways".
+- The SHA check matches backticked 7-40 hex-digit tokens, so a backticked md5
+  (32 hex) counts too: the rule is "the same identifier appears on both sides",
+  not "this is a commit".
+- The index (`README.md`) has no nav line; its English link is checked as
+  `en/README.md` appearing in the body instead.
