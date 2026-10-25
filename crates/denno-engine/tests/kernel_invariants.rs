@@ -574,10 +574,48 @@ let d = defines(GDN_SRC);
     // 同じ割り当てを持つカーネルは 2 本 (pre / pre_l4)。不変条件は「pass 1 の
     // sc[] は k_inv / eg / beta の 3 語」であって本数ではないため、期待値を
     // 2 に更新する (gdn.cu 自体は触っていない)。
+    // P55 が共有メモリ版 (`dno_gdn_chunk_pre_sm`) を足したので 3 本になった
+    // (期待値だけを更新する。割り当ては 3 本とも同じ)。
     assert_eq!(
         GDN_SRC.matches("sc[0]=k_inv sc[1]=eg sc[2]=beta").count(),
-        2,
+        3,
         "gdn.cu の pass 1 の sc[] 割り当てが変わった"
+    );
+
+    // ---- (2b) P55: pass 1 の共有メモリ版のレイアウト ----------------------
+    // W[dk][dk] | M[dk][dk] | k[dk] | v[dk] | scalars[3] を列優先で置く。
+    // ホスト側 (`gdn_pre_sm_smem_bytes`) の式と 1 対 1 で対応させる。
+    for (decl, why) in [
+        ("float* w_sh = sh;", "w_sh は共有領域の先頭"),
+        ("float* m_sh = sh + dk * dk;", "m_sh は W[dk][dk] の直後"),
+        ("float* k_sh = sh + 2 * dk * dk;", "k_sh は M[dk][dk] の直後"),
+        ("float* v_sh = sh + 2 * dk * dk + dk;", "v_sh は k_sh[dk] の直後"),
+        (
+            "float* sc = sh + 2 * dk * dk + 2 * dk;",
+            "sc は v_sh[dk] の直後 (スカラー 3 語)",
+        ),
+    ] {
+        assert_eq!(
+            GDN_SRC.matches(decl).count(),
+            1,
+            "gdn.cu の共有メモリ版 pass 1 のレイアウト宣言が変わった ({why}): {decl}"
+        );
+    }
+    // ホスト側の必要量 = (2*dk*dk + 2*dk + 3) floats * 4 B (上の 5 宣言の和)。
+    assert!(
+        CUDA_RS.contains("(2 * dk * dk + 2 * dk + 3) * 4"),
+        "cuda.rs の共有メモリ版 pass 1 の smem 式がカーネルのレイアウトと一致しない"
+    );
+    // launch は「選んだカーネル・block・shmem」を 1 組で渡す (shmem だけ旧式が
+    // 残ると共有領域外書きになる — s99 と同じ型の欠陥)。
+    assert!(
+        CUDA_RS.contains("shm_pre,"),
+        "cuda.rs の pass 1 launch が選択結果 (shm_pre) を渡していない"
+    );
+    assert!(
+        CUDA_RS.contains("fn gdn_pre_sm_gate(")
+            && CUDA_RS.contains("ctx.f_gdn_chunk_pre_sm.is_some()"),
+        "cuda.rs の共有メモリ版 pass 1 のゲートが無い (カーネル不在で落ちる)"
     );
 
     // ---- (3) ホスト側の smem 計算がカーネルと一致すること ----
@@ -627,6 +665,73 @@ let d = defines(GDN_SRC);
     assert!(
         GDN_SRC.contains("head_k_dim == head_v_dim"),
         "gdn.cu 先頭の dk == dv 前提コメントが消えた (dv のオフセットが成立しなくなる)"
+    );
+}
+
+/// カーネル本体 (`__global__ void NAME(` から次のカーネル / template まで) を
+/// コメント行抜きの行リストとして返す。P55 の演算列比較だけが使う。
+fn kernel_body_lines(src: &str, name: &str) -> Vec<String> {
+    let pat = format!("__global__ void {name}(");
+    let start = src
+        .find(&pat)
+        .unwrap_or_else(|| panic!("gdn.cu にカーネル {name} が無い"));
+    let rest = &src[start..];
+    let end = rest[1..]
+        .find("__global__")
+        .into_iter()
+        .chain(rest[1..].find("template <"))
+        .map(|i| i + 1)
+        .min()
+        .unwrap_or(rest.len());
+    code_lines(&rest[..end])
+        .map(|(_, l)| l.trim().to_string())
+        .collect()
+}
+
+/// 演算列 (decay / 内積 / 更新) だけを抜き、ストレージ式を正規化する。
+/// 共有領域のポインタ宣言 (`float* sc = sh + ...`) は格納先の違いそのものなので
+/// 比較対象から外す (比べるのは演算の順序と丸めだけ)。
+fn arith_ops(lines: &[String], subst: &[(&str, &str)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for l in lines {
+        if l.starts_with("float*") {
+            continue;
+        }
+        if !(l.contains("eg") || l.contains("skv") || l.contains("mk") || l.contains("dlt")) {
+            continue;
+        }
+        let mut s = l.clone();
+        for (from, to) in subst {
+            s = s.replace(from, to);
+        }
+        out.push(s);
+    }
+    out
+}
+
+/// P55: 共有メモリ版 pass 1 が「旧版と同じ演算を同じ順序で」行うこと。
+///
+/// 変わるのは格納先 (列ローカル配列 → ブロック共有メモリ) だけで、decay →
+/// 内積 → 更新の文の列はストレージ式を除いて一致するはず。ここが崩れると
+/// 丸め順が変わり、「ビット同一」という主張の根拠が消える。GPU 無しでも
+/// ソースの静的比較で固定できる部分を固定する。
+#[test]
+fn gdn_pre_sm_keeps_step_order_of_local_version() {
+    let old = arith_ops(
+        &kernel_body_lines(GDN_SRC, "dno_gdn_chunk_pre"),
+        &[("Wcol[", "X["), ("Mcol[", "X[")],
+    );
+    let new = arith_ops(
+        &kernel_body_lines(GDN_SRC, "dno_gdn_chunk_pre_sm"),
+        &[("w_sh[i * dk + c]", "X[i]"), ("m_sh[i * dk + c]", "X[i]")],
+    );
+    assert!(
+        old.len() >= 6,
+        "旧版の演算列が短すぎる (抽出条件を確認): {old:?}"
+    );
+    assert_eq!(
+        old, new,
+        "共有メモリ版 pass 1 の演算列 (decay/内積/更新の順序) が旧版と違う"
     );
 }
 /// s100 (P3-3): `kernels/gdn.cu` のローカル列配列 (`Scol` / `Wcol` / `Mcol` /
