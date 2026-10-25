@@ -15,6 +15,11 @@
 
 use anyhow::{bail, Result};
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use memmap2::Mmap;
+
 use crate::kquant::GgmlType;
 
 /// 量子化モード。デフォルトは Fp32 (従来動作を完全維持)。
@@ -53,6 +58,230 @@ impl QuantMode {
             QuantMode::Q4_0 => "q4",
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// P58-5: 重みブロックの置き場所 (ヒープ実体化 / mmap スライス)
+// ---------------------------------------------------------------------------
+
+/// P58-5: 重みの生ブロックを「ヒープに実体化する」か「mmap のスライス越しに
+/// 読む」かの入れ物。
+///
+/// `Mapped` は mmap の `[off, off + len)` を共有するだけで**バイト列のコピーを
+/// 持たない** (プロセスの匿名 RSS を増やさない・ページはファイル由来の clean
+/// ページなので回収可能)。読み取り専用で、書き込み口 ([`WeightBlocks::heap_vec_mut`])
+/// は `Heap` のときだけ `Some` を返す。
+///
+/// `Clone` は内容ではなく**置き場所**を複製する: `Heap` は従来どおり Vec を
+/// 深いコピーし (`Linear::clone` の既存の意味を変えない)、`Mapped` は
+/// `Arc<Mmap>` を共有する (コピーなし)。数値には一切影響しない。
+pub enum BlocksSrc {
+    /// ヒープ上の実体 (従来経路)
+    Heap(Vec<u8>),
+    /// 共有 mmap の `[off, off + len)` (新経路・読み取り専用)
+    Mapped { map: Arc<Mmap>, off: usize, len: usize },
+}
+
+/// P58-5: 重みブロック (Q4_0 生バイト列など) の入れ物。
+///
+/// `Deref<Target = [u8]>` なので、`&blocks` / `blocks.len()` / `blocks[i..]` は
+/// 従来の `Vec<u8>` と同じ書き方で使える (呼び出し側のカーネル・GPU アップロード
+/// 経路は無変更)。中身のバイト列は従来経路と同一 — 置き場所だけが違う。
+pub struct WeightBlocks {
+    src: BlocksSrc,
+    /// 確保量の計数 (Drop で減算)。Clone は新しい guard を作る。
+    _mem: MemGuard,
+}
+
+impl WeightBlocks {
+    /// ヒープ実体から作る (従来経路)。
+    pub fn from_vec(v: Vec<u8>) -> Self {
+        let mem = MemGuard::new(v.len(), 0);
+        Self { src: BlocksSrc::Heap(v), _mem: mem }
+    }
+
+    /// 共有 mmap のスライスから作る (新経路)。コピーしない。
+    pub fn mapped(map: Arc<Mmap>, off: usize, len: usize) -> Self {
+        let mem = MemGuard::new(0, len);
+        Self { src: BlocksSrc::Mapped { map, off, len }, _mem: mem }
+    }
+
+    /// 中身 (mmap 経路でもコピーしない)
+    pub fn as_slice(&self) -> &[u8] {
+        match &self.src {
+            BlocksSrc::Heap(v) => v,
+            BlocksSrc::Mapped { map, off, len } => &map[*off..*off + *len],
+        }
+    }
+
+    /// mmap 越しか (ログ・テスト用)
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.src, BlocksSrc::Mapped { .. })
+    }
+
+    /// ヒープ実体のときだけ書き込み口を返す (`Mapped` は読み取り専用)。
+    pub fn heap_vec_mut(&mut self) -> Option<&mut Vec<u8>> {
+        match &mut self.src {
+            BlocksSrc::Heap(v) => Some(v),
+            BlocksSrc::Mapped { .. } => None,
+        }
+    }
+}
+
+impl Clone for WeightBlocks {
+    fn clone(&self) -> Self {
+        match &self.src {
+            // 従来どおり深いコピー (Linear::clone の意味を変えない)
+            BlocksSrc::Heap(v) => Self::from_vec(v.clone()),
+            // mmap はハンドルだけ共有 (バイト列のコピーなし)
+            BlocksSrc::Mapped { map, off, len } => Self::mapped(Arc::clone(map), *off, *len),
+        }
+    }
+}
+
+impl std::ops::Deref for WeightBlocks {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::fmt::Debug for WeightBlocks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 中身 (数百 MB) を出さない
+        f.debug_struct("WeightBlocks")
+            .field("len", &self.as_slice().len())
+            .field("mapped", &self.is_mapped())
+            .finish()
+    }
+}
+
+impl PartialEq for WeightBlocks {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for WeightBlocks {}
+
+impl PartialEq<Vec<u8>> for WeightBlocks {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl PartialEq<WeightBlocks> for Vec<u8> {
+    fn eq(&self, other: &WeightBlocks) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for WeightBlocks {
+    fn from(v: Vec<u8>) -> Self {
+        Self::from_vec(v)
+    }
+}
+
+// --- メモリ計数 (P58-5) ---------------------------------------------------
+//
+// 重み関連の確保を「ヒープ実体」と「mmap スライス」に分けて累積する。
+// mmap 側のバイト数は**論理長** (ファイル由来の clean ページで、匿名 RSS ではない)。
+
+static WEIGHT_HEAP_BYTES: AtomicUsize = AtomicUsize::new(0);
+static WEIGHT_HEAP_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+static WEIGHT_MAPPED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static WEIGHT_MAPPED_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+
+struct MemGuard {
+    heap: usize,
+    mapped: usize,
+}
+
+impl MemGuard {
+    fn new(heap: usize, mapped: usize) -> Self {
+        WEIGHT_HEAP_BYTES.fetch_add(heap, Ordering::Relaxed);
+        WEIGHT_MAPPED_BYTES.fetch_add(mapped, Ordering::Relaxed);
+        if heap > 0 {
+            WEIGHT_HEAP_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        }
+        if mapped > 0 {
+            WEIGHT_MAPPED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        }
+        Self { heap, mapped }
+    }
+}
+
+impl Drop for MemGuard {
+    fn drop(&mut self) {
+        WEIGHT_HEAP_BYTES.fetch_sub(self.heap, Ordering::Relaxed);
+        WEIGHT_MAPPED_BYTES.fetch_sub(self.mapped, Ordering::Relaxed);
+        if self.heap > 0 {
+            WEIGHT_HEAP_BLOCKS.fetch_sub(1, Ordering::Relaxed);
+        }
+        if self.mapped > 0 {
+            WEIGHT_MAPPED_BLOCKS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// P58-5: 重みブロックのメモリ内訳 (プロセス内の生存分の合計)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WeightMemory {
+    /// ヒープに実体化している重みバイト数 (匿名 RSS に載る)
+    pub heap_bytes: usize,
+    pub heap_blocks: usize,
+    /// mmap スライス越しに持っている重みバイト数 (ファイル由来・回収可能)
+    pub mapped_bytes: usize,
+    pub mapped_blocks: usize,
+}
+
+impl WeightMemory {
+    pub fn total_bytes(&self) -> usize {
+        self.heap_bytes + self.mapped_bytes
+    }
+}
+
+/// P58-5: 現在の重みメモリ内訳
+pub fn weight_memory() -> WeightMemory {
+    WeightMemory {
+        heap_bytes: WEIGHT_HEAP_BYTES.load(Ordering::Relaxed),
+        heap_blocks: WEIGHT_HEAP_BLOCKS.load(Ordering::Relaxed),
+        mapped_bytes: WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed),
+        mapped_blocks: WEIGHT_MAPPED_BLOCKS.load(Ordering::Relaxed),
+    }
+}
+
+/// P58-5: 起動直後 / 1 リクエスト後に出す 1 行 (体裁を 2 箇所で揃える)
+pub fn weight_memory_line(tag: &str) -> String {
+    let m = weight_memory();
+    format!(
+        "weights memory [{tag}]: heap {:.1} MB ({} blocks) / mmap {:.1} MB ({} blocks) / total {:.1} MB",
+        m.heap_bytes as f64 / 1e6,
+        m.heap_blocks,
+        m.mapped_bytes as f64 / 1e6,
+        m.mapped_blocks,
+        m.total_bytes() as f64 / 1e6
+    )
+}
+
+/// P58-5: 重みブロックを mmap スライス越しに読む経路の env ゲート名。
+///
+/// 未設定・空・"0" (および "1"/"true"/"yes"/"on" 以外) は**無効** = 従来どおり
+/// ヒープに実体化する (切り戻し用)。
+pub const MMAP_WEIGHTS_ENV: &str = "DENNO_MMAP_WEIGHTS";
+
+/// P58-5: env 値の解釈 (純関数・テスト可能)
+pub fn mmap_weights_from_value(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(s) => matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        None => false,
+    }
+}
+
+/// P58-5: 現在の env 設定で mmap 経路が有効か (ロード開始時に 1 回だけ呼ぶ)
+pub fn mmap_weights_enabled() -> bool {
+    let v = std::env::var(MMAP_WEIGHTS_ENV).ok();
+    mmap_weights_from_value(v.as_deref())
 }
 
 /// per-output-channel 対称 int8 量子化された重み。
@@ -155,8 +384,12 @@ impl Quant8Linear {
 /// 経路 (GPU 試行 → CPU フォールバック) は同じ規約に従う。
 #[derive(Debug, Clone)]
 pub struct Q4Linear {
-    /// [n, k/32] ブロックの生バイト列 (行ごとに連続・1 ブロック 18B)
-    pub blocks: Vec<u8>,
+    /// [n, k/32] ブロックの生バイト列 (行ごとに連続・1 ブロック 18B)。
+    ///
+    /// P58-5: ヒープ実体 (`WeightBlocks::Heap`) と mmap スライス
+    /// (`WeightBlocks::Mapped`) のどちらもあり得る。バイト列は同一で、
+    /// 置き場所だけが違う (`DENNO_MMAP_WEIGHTS=1` で mmap 経路)。
+    pub blocks: WeightBlocks,
     pub k: usize,
     pub n: usize,
     /// GPU 重みキャッシュのキー (`Quant8Linear` と同一の採番系)
@@ -186,7 +419,12 @@ impl Q4Linear {
     pub fn zeros(k: usize, n: usize) -> Self {
         assert_eq!(k % Q4_BLOCK_ELEMS, 0, "q4: k must be a multiple of 32");
         let nb = k / Q4_BLOCK_ELEMS;
-        Self { blocks: vec![0u8; n * nb * Q4_BLOCK_BYTES], k, n, uid: next_uid() }
+        Self {
+            blocks: WeightBlocks::from_vec(vec![0u8; n * nb * Q4_BLOCK_BYTES]),
+            k,
+            n,
+            uid: next_uid(),
+        }
     }
 
     /// P37: 行 `[r0, r0+rows)` を f32 から量子化して blocks の該当位置へ書く
@@ -204,6 +442,10 @@ impl Q4Linear {
         let rows = w.len() / self.k;
         assert!(r0 + rows <= self.n, "q4 quantize_rows: 行範囲が n を超過");
         let nb = self.k / Q4_BLOCK_ELEMS;
+        let dst = self
+            .blocks
+            .heap_vec_mut()
+            .expect("q4 quantize_rows: mmap 済みブロックは書き込み不可 (生成時のみ書き込む)");
         for (ri, row) in w.chunks_exact(self.k).enumerate() {
             let j = r0 + ri;
             for b in 0..nb {
@@ -220,7 +462,7 @@ impl Q4Linear {
                 }
                 let d = max / -8.0;
                 let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-                let out = &mut self.blocks[(j * nb + b) * Q4_BLOCK_BYTES..][..Q4_BLOCK_BYTES];
+                let out = &mut dst[(j * nb + b) * Q4_BLOCK_BYTES..][..Q4_BLOCK_BYTES];
                 out[..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
                 for (i, &x) in src.iter().enumerate() {
                     // ggml: (int8_t)(x*id + 8.5f) を 15 で頭切り。
@@ -281,7 +523,31 @@ impl Q4Linear {
         if blocks.len() != want {
             return None;
         }
-        Some(Self { blocks: blocks.to_vec(), k, n, uid: next_uid() })
+        Some(Self { blocks: WeightBlocks::from_vec(blocks.to_vec()), k, n, uid: next_uid() })
+    }
+
+    /// P58-5: GGUF の mmap を**共有したまま** (コピーせず) 生ブロックを保持する。
+    ///
+    /// `off`/`len` は mmap 内の絶対範囲 (gguf::GgufFile::tensor_mapping が返す値)。
+    /// 1 行 k 要素 × n 行のバイト数が `n * row_bytes(k)` と一致しないときは `None`
+    /// (**fail-closed**: 呼び出し側は従来のヒープ実体化へ落ちる)。
+    ///
+    /// 数値は不変: 読むバイト列は `from_gguf_blocks` と同一で、置き場所だけが違う。
+    pub fn from_mapped_blocks(
+        map: Arc<Mmap>,
+        off: usize,
+        len: usize,
+        k: usize,
+        n: usize,
+    ) -> Option<Self> {
+        if k == 0 || k % Q4_BLOCK_ELEMS != 0 {
+            return None;
+        }
+        let want = n.checked_mul(Self::row_bytes(k))?;
+        if len != want || off.checked_add(len)? > map.len() {
+            return None;
+        }
+        Some(Self { blocks: WeightBlocks::mapped(map, off, len), k, n, uid: next_uid() })
     }
 }
 
@@ -1323,10 +1589,11 @@ mod tests {
         let (k, n) = (128usize, 7usize);
         let w = pseudo_random(k * n, 4242);
         // Q4_0 の生ブロック (GGUF のバイト列に相当) と F32 のバイト列
-        let q4_src = Q4Linear::quantize(&w, k, n).blocks;
+        let q4_owned = Q4Linear::quantize(&w, k, n).blocks;
+        let q4_src: &[u8] = q4_owned.as_slice();
         let f32_src: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
 
-        for (ty, src) in [(GgmlType::Q4_0, &q4_src), (GgmlType::F32, &f32_src)] {
+        for (ty, src) in [(GgmlType::Q4_0, q4_src), (GgmlType::F32, &f32_src[..])] {
             let bs = ty.blck_size();
             let ts = ty.type_size();
             let row_bytes = (k / bs) * ts;
@@ -1494,5 +1761,104 @@ mod tests {
     /// Q8 の CPU 行並列カーネル (参考実装: `apply_bt` の CPU 分岐と同一)。
     fn linear_cpu_rows_i8(a: &[f32], q: &Quant8Linear, m: usize) -> Vec<f32> {
         crate::tensor::matmul_bt_i8(a, &q.w, &q.scale, m, q.k, q.n)
+    }
+
+    // --- P58-5: 重みブロックの mmap 経路 ---------------------------------
+
+    /// 一時ファイルへ書いたバイト列を mmap して `Arc<Mmap>` を返す
+    /// (本番経路は GGUF の mmap を共有するが、ここでは同じ性質の写像を作る)。
+    fn map_temp_bytes(bytes: &[u8], tag: &str) -> Arc<Mmap> {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "denno_p58_{}_{}_{tag}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b.bin");
+        let mut fh = std::fs::File::create(&path).unwrap();
+        fh.write_all(bytes).unwrap();
+        fh.sync_all().unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        let map = unsafe { Mmap::map(&f).unwrap() };
+        // ファイルは消してよい (mmap は開いたまま有効)
+        let _ = std::fs::remove_dir_all(&dir);
+        Arc::new(map)
+    }
+
+    /// P58-5: `DENNO_MMAP_WEIGHTS` の解釈 (明示的な真値のみ有効 = 既定 OFF)
+    #[test]
+    fn mmap_weights_env_truth_table() {
+        assert!(!mmap_weights_from_value(None), "未設定は無効 (従来経路)");
+        for v in ["", "0", "false", "no", "off", "2", "q4", "mmap"] {
+            assert!(!mmap_weights_from_value(Some(v)), "{v:?} が有効になっている");
+        }
+        for v in ["1", "true", "yes", "on", " TRUE ", "On"] {
+            assert!(mmap_weights_from_value(Some(v)), "{v:?} が無効になっている");
+        }
+    }
+
+    /// P58-5: mmap スライス越しの `Q4Linear` は、ヒープ実体の同じブロック列と
+    /// **バイト列・デ量子化・matvec 出力がビット一致**する (置き場所だけが違う)。
+    /// 形が合わないときは `None` (fail-closed)。
+    #[test]
+    fn weight_blocks_mapped_matches_heap_bit_exact() {
+        let (k, n) = (128usize, 5usize);
+        let w = pseudo_random(k * n, 90210);
+        let heap = Q4Linear::quantize(&w, k, n);
+        let raw = heap.blocks.as_slice().to_vec();
+        let map = map_temp_bytes(&raw, "q4");
+
+        let mapped = Q4Linear::from_mapped_blocks(Arc::clone(&map), 0, raw.len(), k, n)
+            .expect("mmap 経路が None を返した");
+        assert!(mapped.blocks.is_mapped(), "mmap 経路が選ばれていない");
+        assert!(!heap.blocks.is_mapped(), "従来経路が mmap になっている");
+        assert_eq!(mapped.blocks.as_slice(), heap.blocks.as_slice(), "バイト列が不一致");
+        assert_eq!(mapped.weight_bytes(), heap.weight_bytes());
+
+        // 前提が崩れたら None (呼び出し側はヒープ実体化へ落ちる)
+        assert!(Q4Linear::from_mapped_blocks(Arc::clone(&map), 0, raw.len() - 1, k, n).is_none());
+        assert!(Q4Linear::from_mapped_blocks(Arc::clone(&map), 1, raw.len(), k, n).is_none());
+        assert!(Q4Linear::from_mapped_blocks(Arc::clone(&map), 0, raw.len(), k, n + 1).is_none());
+        assert!(Q4Linear::from_mapped_blocks(Arc::clone(&map), 0, raw.len(), k + 1, n).is_none());
+
+        // デ量子化 (全行) と matvec (m=1 / m=4) がビット一致
+        let dq_h: Vec<u32> = heap.dequantize().iter().map(|v| v.to_bits()).collect();
+        let dq_m: Vec<u32> = mapped.dequantize().iter().map(|v| v.to_bits()).collect();
+        assert_eq!(dq_h, dq_m, "デ量子化がビット不一致");
+        for m in [1usize, 4] {
+            let a = pseudo_random(m * k, 31 + m as u32);
+            let mut oh = vec![0f32; m * n];
+            let mut om = vec![0f32; m * n];
+            crate::tensor::matvec_rows_bt_q4_into(&a, &heap.blocks, k, n, m, &mut oh);
+            crate::tensor::matvec_rows_bt_q4_into(&a, &mapped.blocks, k, n, m, &mut om);
+            let bh: Vec<u32> = oh.iter().map(|v| v.to_bits()).collect();
+            let bm: Vec<u32> = om.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(bh, bm, "matvec (m={m}) がビット不一致");
+        }
+
+        // mmap ブロックは読み取り専用 (書き込み口が無い) / ヒープは書ける
+        let mut m2 = mapped.clone();
+        assert!(m2.blocks.heap_vec_mut().is_none(), "mmap ブロックに書き込み口がある");
+        assert!(m2.blocks.is_mapped(), "Mapped の Clone がヒープ化している");
+        let mut h2 = Q4Linear::zeros(k, n);
+        assert!(h2.blocks.heap_vec_mut().is_some(), "ヒープブロックに書き込み口が無い");
+    }
+
+    /// P58-5: 重みメモリ計数 (`weight_memory`) は「ヒープ実体」と「mmap スライス」
+    /// を別々に数える実装だが、計数はプロセス全体の累積で **並行テストの生成と
+    /// 破棄で揺れる** ため、厳密な増減を単体テストで固定しない (ゲートを不安定に
+    /// しないことを優先)。ログの体裁だけを固定する。
+    #[test]
+    fn weight_memory_line_reports_both_places() {
+        let line = weight_memory_line("startup");
+        assert!(line.starts_with("weights memory [startup]: heap "), "体裁が変わった: {line}");
+        assert!(line.contains(" MB (") && line.contains("blocks) / mmap "), "体裁が変わった: {line}");
+        assert!(line.contains("total "), "total が無い: {line}");
+        let m = weight_memory();
+        assert_eq!(m.total_bytes(), m.heap_bytes + m.mapped_bytes);
     }
 }

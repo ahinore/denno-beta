@@ -135,8 +135,9 @@ enum AttnKind {
 pub(crate) enum EmbedTable {
     F32(Vec<f32>),
     Q4Rows {
-        /// ファイルの生ブロックそのもの (`n * row_bytes` バイト)
-        blocks: Vec<u8>,
+        /// ファイルの生ブロックそのもの (`n * row_bytes` バイト)。
+        /// P58-5: `DENNO_MMAP_WEIGHTS=1` では mmap のスライス (コピーなし)。
+        blocks: crate::quant::WeightBlocks,
         /// 1 行の要素数 (= e)
         k: usize,
         /// 行数 (= vocab)
@@ -307,6 +308,15 @@ fn q4_verbatim_linear(f: &GgufFile, name: &str, k: usize, n: usize) -> Result<Op
     };
     if t.ty != GgmlType::Q4_0 || !crate::quant::gguf_passthrough_allows(t.ty) {
         return Ok(None);
+    }
+    // P58-5: mmap 経路が有効なら、生ブロックをヒープへ写さずに共有 mmap の
+    // スライスとして持つ (バイト列は同一・置き場所だけが違う)。
+    if crate::quant::mmap_weights_enabled() {
+        if let Some((off, len)) = f.tensor_mapping(name) {
+            if let Some(q) = Q4Linear::from_mapped_blocks(f.mmap_handle(), off, len, k, n) {
+                return Ok(Some(Linear::Q4(q)));
+            }
+        }
     }
     let bytes = f.tensor_bytes(name).with_context(|| format!("tensor {name}"))?;
     Ok(Q4Linear::from_gguf_blocks(bytes, k, n).map(Linear::Q4))
@@ -638,6 +648,17 @@ impl Qwen35 {
                 "DENNO_GGUF_PASSTHROUGH=1: Q4_0 テンソルは生ブロックのまま積む (fp32 展開を省略)"
             );
         }
+        // P58-5: 重みブロックを mmap のスライス越しに持つ経路 (既定 OFF)。
+        // 有効化できるのは「メモリ上のバイト列がファイルのバイト列と同一」な
+        // テンソルだけ (token_embd の生ブロック・passthrough が許可された型)。
+        // 再量子化を経る線形重みはファイルのバイト列と一致しないので対象外。
+        let mmap_w = crate::quant::mmap_weights_enabled();
+        if mmap_w {
+            tracing::info!(
+                "DENNO_MMAP_WEIGHTS=1: ファイルと同一バイト列の重みは mmap スライス越しに保持する \
+                 (ヒープ実体化しない)"
+            );
+        }
 
         let n_layer = cfg_u64(tc, "num_hidden_layers")? as usize;
 
@@ -882,14 +903,40 @@ impl Qwen35 {
             if crate::quant::embed_ondemand_enabled()
                 && f.embed_blocks_eligible("token_embd.weight", e, vocab)
             {
-                if let Some((bl, l, st)) =
-                    f.embed_blocks_and_linear_chunked("token_embd.weight", e, vocab, quant, rows)?
+                // P58-5: mmap 経路なら生ブロックをヒープへ写さない (コピー 0)。
+                // 前提が崩れたら (None / エラー) 従来経路へ落ちる (fail-closed)。
+                let mapped = if mmap_w {
+                    match f.embed_blocks_and_linear_chunked_mapped(
+                        "token_embd.weight",
+                        e,
+                        vocab,
+                        quant,
+                        rows,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                "token_embd.weight: mmap 生ブロック経路に失敗して従来経路へ ({e})"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let got = match mapped {
+                    Some(v) => Some(v),
+                    None => f
+                        .embed_blocks_and_linear_chunked("token_embd.weight", e, vocab, quant, rows)?,
+                };
+                if let Some((bl, l, st)) = got
                 {
                     tracing::info!(
-                        "token_embd.weight: 生 Q4_0 ブロック常駐 {:.1} MB ({:?} / 1 行 {} B / {} 行) \
+                        "token_embd.weight: 生 Q4_0 ブロック常駐 {:.1} MB [{}] ({:?} / 1 行 {} B / {} 行) \
                          + {:?} コピーを行チャンク {} 行 x {} 回で作成 (ピーク一時 {:.1} MB) \
                          — 行は必要時に復元 (再量子化なし)",
                         bl.blocks.len() as f64 / 1e6,
+                        if bl.blocks.is_mapped() { "mmap" } else { "heap" },
                         bl.ty,
                         bl.row_bytes,
                         bl.n,
@@ -971,6 +1018,19 @@ impl Qwen35 {
                 qb as f64 / 1e6,
                 qb as f64 * 4.0 / 1e6
             );
+        }
+
+        // P58-5: mmap 経路では重みがファイルのページを参照し続ける (写像が残る)。
+        // ロード中に触った全ページを RSS に積み上げないよう、読み終わった時点で
+        // 明示的に返す。ページは clean・読み取り専用なので、次に触ったときは
+        // ページキャッシュから再フォルトするだけ (数値・バイト列は不変)。
+        if mmap_w {
+            match f.release_resident_pages() {
+                Ok(()) => tracing::info!(
+                    "DENNO_MMAP_WEIGHTS=1: 読み終わった mmap ページを返した (MADV_DONTNEED)"
+                ),
+                Err(e) => tracing::warn!("mmap ページの解放に失敗 (続行): {e}"),
+            }
         }
 
         Ok(Self {
@@ -3229,7 +3289,7 @@ fn concat_rows(a: &Linear, b: &Linear, what: &str) -> Result<Linear> {
             blocks.extend_from_slice(&qa.blocks);
             blocks.extend_from_slice(&qb.blocks);
             Ok(Linear::Q4(crate::quant::Q4Linear {
-                blocks,
+                blocks: blocks.into(),
                 k: ka,
                 n,
                 uid: next_q8_uid(),
@@ -5927,7 +5987,7 @@ mod tests {
         }
 
         let q4 = EmbedTable::Q4Rows {
-            blocks: blocks.clone(),
+            blocks: blocks.clone().into(),
             k,
             n,
             row_bytes,
@@ -5988,7 +6048,7 @@ mod tests {
         let n = 2usize;
         let (blocks, row_bytes) = p42_blocks(k, n);
         let q4 = EmbedTable::Q4Rows {
-            blocks,
+            blocks: blocks.into(),
             k,
             n,
             row_bytes,

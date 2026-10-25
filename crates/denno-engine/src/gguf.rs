@@ -121,7 +121,10 @@ pub struct GgufTensorInfo {
 }
 
 pub struct GgufFile {
-    mmap: Mmap,
+    /// P58-5: mmap は `Arc` で共有する。重みを mmap スライス越しに保持する
+    /// 経路 (`DENNO_MMAP_WEIGHTS=1`) では、`GgufFile` が落ちた後も重みが
+    /// ファイルのページを参照し続ける必要があるため。
+    mmap: std::sync::Arc<Mmap>,
     pub version: u32,
     pub alignment: u64,
     /// テンソルデータ部のファイル内開始位置
@@ -144,7 +147,7 @@ impl GgufFile {
     fn parse(mmap: Mmap) -> Result<Self, GgufError> {
         let p = parse_fields(&mmap)?;
         Ok(GgufFile {
-            mmap,
+            mmap: std::sync::Arc::new(mmap),
             version: p.version,
             alignment: p.alignment,
             data_start: p.data_start,
@@ -152,6 +155,48 @@ impl GgufFile {
             tensors: p.tensors,
             tensor_order: p.tensor_order,
         })
+    }
+
+    /// P58-5: mmap のハンドル (共有カウンタを 1 つ増やすだけ・コピーなし)
+    pub fn mmap_handle(&self) -> std::sync::Arc<Mmap> {
+        std::sync::Arc::clone(&self.mmap)
+    }
+
+    /// P58-5: テンソルのデータが mmap 内で占める**絶対範囲** `(off, len)`。
+    ///
+    /// `tensor_bytes` と同じ検証 (存在・ファイル終端) を行い、外れたら `None`。
+    pub fn tensor_mapping(&self, name: &str) -> Option<(usize, usize)> {
+        let t = self.tensor(name)?;
+        let start = self.data_start + t.offset;
+        let end = start + t.nbytes;
+        if end > self.mmap.len() as u64 {
+            return None;
+        }
+        Some((start as usize, t.nbytes as usize))
+    }
+
+    /// P58-5: 読み終わったファイルページを手放す (`MADV_DONTNEED`)。
+    ///
+    /// mmap 経路 (`DENNO_MMAP_WEIGHTS=1`) では重みが mmap のスライスを参照し続ける
+    /// ため写像がプロセスに残る。放っておくとロード中に触った全ページが RSS に
+    /// 積み上がるので、ロード完了時に明示的に返す。ページは clean (読み取り専用)
+    /// なので、次に触ったときにページキャッシュから再フォルトするだけで内容は
+    /// 変わらない (数値・バイト列に影響しない)。
+    ///
+    /// memmap2 0.9.11 では `MADV_DONTNEED` は `Advice` ではなく
+    /// `UncheckedAdvice` にあり、`unchecked_advise` (unsafe) でしか呼べない。
+    pub fn release_resident_pages(&self) -> Result<(), GgufError> {
+        // SAFETY: `self.mmap` は `Mmap::map` が作る読み取り専用の共有ファイル写像で、
+        // この写像に対して書き込みを行う経路はプロセス内に存在しない (Mmap は
+        // `Deref<Target = [u8]>` のみで `&mut` を外に出さない)。`MADV_DONTNEED` は
+        // clean なファイルページを捨てるだけで、以降の読み出しは同じファイル内容から
+        // 再フォルトする。よって破棄後も参照先の内容は不変であり、
+        // 「解放済みページへの書き込みで UB」という前提がここでは成立しない。
+        unsafe {
+            self.mmap
+                .unchecked_advise(memmap2::UncheckedAdvice::DontNeed)
+                .map_err(|e| GgufError(format!("madvise(DONTNEED): {e}")))
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<&GgufValue> {
@@ -365,7 +410,7 @@ impl GgufFile {
         match res {
             Ok((l, st)) => Ok(Some((
                 EmbedBlocks {
-                    blocks,
+                    blocks: blocks.into(),
                     k,
                     n,
                     row_bytes,
@@ -376,6 +421,70 @@ impl GgufFile {
             ))),
             Err(e) => {
                 tracing::warn!("{name}: 生ブロック常駐を中止して従来経路へ ({e})");
+                Ok(None)
+            }
+        }
+    }
+
+    /// P58-5: [`GgufFile::embed_blocks_and_linear_chunked`] の **mmap 版**。
+    ///
+    /// `blocks` をヒープへ写さず、GGUF の mmap のスライス (`n * row_bytes` バイト)
+    /// をそのまま持つ。tied lm_head 用の量子化コピーは従来と同じ行チャンクで
+    /// 作る (こちらは再量子化なので mmap できない)。
+    ///
+    /// 数値は不変: 行復元に使うバイト列は従来経路が `bytes[off..off+len]` から
+    /// コピーしていたものと同一範囲・同一内容で、`row_into` のデ量子化規則も
+    /// 同じ。lm_head の量子化コピーも同じ `gguf_rows_quantized_chunked` を
+    /// 同じ行順で通るので、バイト列は従来と一致する。
+    ///
+    /// 形・型・バイト数が想定外なら `Ok(None)` (呼び出し側は従来経路 = fail-closed)。
+    pub fn embed_blocks_and_linear_chunked_mapped(
+        &self,
+        name: &str,
+        k: usize,
+        n: usize,
+        mode: crate::quant::QuantMode,
+        chunk_rows: usize,
+    ) -> Result<Option<(EmbedBlocks, Linear, ChunkedQuantStats)>, GgufError> {
+        let Some((bytes, row_bytes, ty)) = self.chunked_rows(name, k, n)? else {
+            return Ok(None);
+        };
+        if ty != GgmlType::Q4_0 {
+            return Ok(None);
+        }
+        let Some(total) = n.checked_mul(row_bytes) else {
+            return Ok(None);
+        };
+        let Some((off, len)) = self.tensor_mapping(name) else {
+            return Ok(None);
+        };
+        if len != total {
+            return Ok(None);
+        }
+        let blocks = crate::quant::WeightBlocks::mapped(self.mmap_handle(), off, len);
+        // lm_head 用の量子化コピー: ファイルは mmap 越しに読み、コピーを作らない。
+        let res = crate::quant::gguf_rows_quantized_chunked(
+            ty,
+            mode,
+            k,
+            n,
+            chunk_rows,
+            |r0, rows, buf| {
+                let o = r0 * row_bytes;
+                let l = rows * row_bytes;
+                buf.clear();
+                buf.extend_from_slice(&bytes[o..o + l]);
+                Ok(())
+            },
+        );
+        match res {
+            Ok((l, st)) => Ok(Some((
+                EmbedBlocks { blocks, k, n, row_bytes, ty },
+                l,
+                st,
+            ))),
+            Err(e) => {
+                tracing::warn!("{name}: mmap 生ブロック経路を中止して従来経路へ ({e})");
                 Ok(None)
             }
         }
@@ -416,7 +525,9 @@ pub fn embed_blocks_eligible(ty: Option<GgmlType>, k: usize, n: usize, nbytes: u
 /// 行 `r` は `blocks[r*row_bytes .. (r+1)*row_bytes]` を `ty` でデ量子化する。
 #[derive(Debug, Clone)]
 pub struct EmbedBlocks {
-    pub blocks: Vec<u8>,
+    /// ファイルの `n*row_bytes` バイトそのもの (再量子化なし)。
+    /// P58-5: `DENNO_MMAP_WEIGHTS=1` ではヒープに写さず mmap のスライスを持つ。
+    pub blocks: crate::quant::WeightBlocks,
     /// 1 行の要素数
     pub k: usize,
     /// 行数
@@ -1957,7 +2068,7 @@ mod tests {
 
         // (c) 行復元 (EmbedTable::Q4Rows) == f32 表の同じ行 (ビット一致)
         let emb = EmbedTable::Q4Rows {
-            blocks: bl.blocks,
+            blocks: blocks.into(),
             k,
             n,
             row_bytes,
@@ -1977,6 +2088,294 @@ mod tests {
             assert_eq!(emb.row(r, k).as_ref(), want, "row {r} (row()) が不一致");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P58-5: mmap 経路 ([`GgufFile::embed_blocks_and_linear_chunked_mapped`]) が、
+    /// 従来のヒープ実体化経路と**同じ生ブロック・同じ lm_head コピー**を返し、
+    /// 行復元もビット一致することを合成 GGUF で確かめる
+    /// (= 置き場所だけが違い、数値は不変)。
+    #[test]
+    fn embed_blocks_mapped_path_matches_heap_path() {
+        use crate::model::qwen35::EmbedTable;
+        let k = 128usize;
+        let n = 7usize;
+        let chunk_rows = 3usize; // 端数チャンクを作る (7 = 3+3+1)
+        let (blocks, row_bytes) = p42_synth_blocks(k, n);
+        assert_eq!(blocks.len(), n * row_bytes);
+
+        let dir = std::env::temp_dir().join(format!("denno_p58_gguf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.gguf");
+        p42_write_gguf_q4(&path, "token_embd.weight", k, n, &blocks);
+
+        let f = GgufFile::open(&path).expect("合成 GGUF を開けない");
+        // tensor_mapping は tensor_bytes と同じ範囲 (mmap 内の絶対位置) を返す
+        let (off, len) = f.tensor_mapping("token_embd.weight").expect("tensor_mapping");
+        assert_eq!(len, blocks.len());
+        assert_eq!(&f.mmap_handle()[off..off + len], &blocks[..]);
+
+        let (bl_h, l_h, st_h) = f
+            .embed_blocks_and_linear_chunked("token_embd.weight", k, n, QuantMode::Q4_0, chunk_rows)
+            .expect("ヒープ経路がエラー")
+            .expect("ヒープ経路が None");
+        let (bl_m, l_m, st_m) = f
+            .embed_blocks_and_linear_chunked_mapped(
+                "token_embd.weight",
+                k,
+                n,
+                QuantMode::Q4_0,
+                chunk_rows,
+            )
+            .expect("mmap 経路がエラー")
+            .expect("mmap 経路が None");
+
+        assert!(!bl_h.blocks.is_mapped(), "従来経路が mmap になっている");
+        assert!(bl_m.blocks.is_mapped(), "mmap 経路が選ばれていない (分岐が通っていない)");
+        assert_eq!(bl_m.blocks.as_slice(), bl_h.blocks.as_slice(), "生ブロックが不一致");
+        assert_eq!(bl_m.blocks.as_slice(), &blocks[..], "生ブロックがファイルと不一致");
+        assert_eq!(
+            (bl_m.k, bl_m.n, bl_m.row_bytes, bl_m.ty),
+            (bl_h.k, bl_h.n, bl_h.row_bytes, bl_h.ty)
+        );
+        assert_eq!(st_m.chunks, st_h.chunks, "チャンク数が不一致");
+        assert_eq!(st_m.chunk_rows, st_h.chunk_rows);
+        // tied lm_head 用の量子化コピーは従来経路とバイト一致 (数値不変の根拠)
+        match (&l_m, &l_h) {
+            (Linear::Q4(a), Linear::Q4(b)) => {
+                assert_eq!(a.blocks, b.blocks, "lm_head の Q4 コピーが従来経路と不一致");
+                assert_eq!(a.blocks.len(), b.blocks.len());
+            }
+            _ => panic!("Q4_0 モードで Q4Linear が返らない"),
+        }
+
+        // 行復元 (gather) が全行でビット一致
+        let mk = |bl: &EmbedBlocks| EmbedTable::Q4Rows {
+            blocks: bl.blocks.clone(),
+            k: bl.k,
+            n: bl.n,
+            row_bytes: bl.row_bytes,
+            ty: bl.ty as u16,
+        };
+        let (e_h, e_m) = (mk(&bl_h), mk(&bl_m));
+        let (mut b1, mut b2) = (vec![0.0f32; k], vec![0.0f32; k]);
+        for r in 0..n {
+            e_h.row_into(r, &mut b1);
+            e_m.row_into(r, &mut b2);
+            for i in 0..k {
+                assert_eq!(b1[i].to_bits(), b2[i].to_bits(), "row {r} elem {i} が不一致");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P58-5: 実 27B Q4_0 で `tensor_mapping` が `tensor_bytes` と同じ範囲を指し、
+    /// mmap 生ブロック越しの行復元が同じ行のデ量子化とビット一致することを確かめる。
+    ///
+    /// mmap はするが触るのは `token_embd` の数行だけ (常駐は数十 MB)。
+    /// 実行:
+    ///   GGUF_PATH=/work/models/Qwen3.8-27B-Q4_0.gguf \
+    ///   cargo test --release -p denno-engine --features cuda --lib -- --ignored \
+    ///     p58_mmap_embed_blocks_real_gguf
+    #[test]
+    #[ignore]
+    fn p58_mmap_embed_blocks_real_gguf() {
+        let path = match std::env::var("GGUF_PATH") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                let d = std::path::PathBuf::from("/work/models/Qwen3.8-27B-Q4_0.gguf");
+                if !d.exists() {
+                    eprintln!("skip: GGUF_PATH 未設定かつ既定モデルが無い");
+                    return;
+                }
+                d
+            }
+        };
+        let f = GgufFile::open(&path).expect("GGUF を開けない");
+        let name = "token_embd.weight";
+        let t = f.tensor(name).expect("token_embd.weight が無い").clone();
+        assert_eq!(t.ty, GgmlType::Q4_0);
+        let k = t.dims[0] as usize;
+        let n = t.dims[1] as usize;
+        let (off, len) = f.tensor_mapping(name).expect("tensor_mapping");
+        assert_eq!(len, t.nbytes as usize, "mmap 範囲が nbytes と不一致");
+        let bytes = f.tensor_bytes(name).expect("tensor_bytes");
+        assert_eq!(&f.mmap_handle()[off..off + len], bytes, "mmap 範囲が tensor_bytes と不一致");
+        let wb = crate::quant::WeightBlocks::mapped(f.mmap_handle(), off, len);
+        assert!(wb.is_mapped());
+        let row_bytes = (k / 32) * 18;
+        assert_eq!(len, n * row_bytes);
+        for r in [0usize, 1, n / 2, n - 1] {
+            let mut got = vec![0f32; k];
+            crate::kquant::dequant_row_into(
+                GgmlType::Q4_0,
+                &wb[r * row_bytes..(r + 1) * row_bytes],
+                &mut got,
+            );
+            let want = crate::kquant::dequant_row(
+                GgmlType::Q4_0,
+                &bytes[r * row_bytes..(r + 1) * row_bytes],
+                k,
+            );
+            for i in 0..k {
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "行 {r} 要素 {i} が mmap 越しと tensor_bytes で不一致"
+                );
+            }
+        }
+        println!("[p58] mmap 生ブロック {len} B (k={k} n={n}) の行復元が tensor_bytes と一致");
+    }
+
+    /// P58-5: 実 27B Q4_0 の `token_embd` で、従来経路と mmap 経路の
+    /// **重みヒープ実体量**を測る (数値は `quant::weight_memory` の計数 =
+    /// 匿名 RSS に載る分。mmap 分はファイル由来ページ)。
+    ///
+    /// 実行:
+    ///   GGUF_PATH=/work/models/Qwen3.8-27B-Q4_0.gguf \
+    ///   cargo test --release -p denno-engine --features cuda --lib -- --ignored \
+    ///     --nocapture p58_mmap_weights_heap_bytes_real_gguf
+    #[test]
+    #[ignore]
+    fn p58_mmap_weights_heap_bytes_real_gguf() {
+        let path = match std::env::var("GGUF_PATH") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                let d = std::path::PathBuf::from("/work/models/Qwen3.8-27B-Q4_0.gguf");
+                if !d.exists() {
+                    eprintln!("skip: GGUF_PATH 未設定かつ既定モデルが無い");
+                    return;
+                }
+                d
+            }
+        };
+        let k = 5120usize;
+        let n = 248_320usize;
+        let rows = crate::quant::chunk_rows_for(k);
+        let f = GgufFile::open(&path).expect("GGUF を開けない");
+        assert!(f.embed_blocks_eligible("token_embd.weight", k, n));
+
+        // 従来経路: 生ブロックをヒープへ写す
+        let before = crate::quant::weight_memory();
+        let heap_path = f
+            .embed_blocks_and_linear_chunked("token_embd.weight", k, n, QuantMode::Q4_0, rows)
+            .expect("heap path err")
+            .expect("heap path None");
+        let after_heap = crate::quant::weight_memory();
+        let heap_delta = after_heap.heap_bytes.saturating_sub(before.heap_bytes);
+        println!(
+            "[p58] heap path: blocks {} MB (mapped={}) / 重みヒープ増分 {} MB (lm_head コピー込み)",
+            heap_path.0.blocks.len() as f64 / 1e6,
+            heap_path.0.blocks.is_mapped(),
+            heap_delta as f64 / 1e6
+        );
+        assert!(!heap_path.0.blocks.is_mapped());
+        drop(heap_path);
+
+        // mmap 経路: 生ブロックはファイルのスライス (コピーなし)
+        let before2 = crate::quant::weight_memory();
+        let mm = f
+            .embed_blocks_and_linear_chunked_mapped("token_embd.weight", k, n, QuantMode::Q4_0, rows)
+            .expect("mmap path err")
+            .expect("mmap path None");
+        let after_mm = crate::quant::weight_memory();
+        let mm_heap_delta = after_mm.heap_bytes.saturating_sub(before2.heap_bytes);
+        let mm_mapped_delta = after_mm.mapped_bytes.saturating_sub(before2.mapped_bytes);
+        println!(
+            "[p58] mmap path: blocks {} MB (mapped={}) / 重みヒープ増分 {} MB / mmap 増分 {} MB",
+            mm.0.blocks.len() as f64 / 1e6,
+            mm.0.blocks.is_mapped(),
+            mm_heap_delta as f64 / 1e6,
+            mm_mapped_delta as f64 / 1e6
+        );
+        assert!(mm.0.blocks.is_mapped(), "mmap 経路が選ばれていない");
+        assert_eq!(mm.0.blocks.len(), heap_path_len(&mm.0));
+        println!(
+            "[p58] VERDICT: token_embd のヒープ実体が {} MB 減る (数値は同一)",
+            (heap_delta as f64 - mm_heap_delta as f64) / 1e6
+        );
+    }
+
+    /// P58-5: 実 27B Q4_0 で「エンジンがメモリに持つ Q4_0 ブロック」が
+    /// **ファイルのブロックそのものか**を測る (= 層の線形重みを mmap の
+    /// スライスで置き換えられるかの判定)。
+    ///
+    /// 従来経路は `dequant_row` → `Q4Linear::quantize` の**再量子化**を通るので、
+    /// ファイルのブロックと一致しなければ mmap 化は数値変更になる。
+    ///
+    /// 実行:
+    ///   GGUF_PATH=/work/models/Qwen3.8-27B-Q4_0.gguf \
+    ///   cargo test --release -p denno-engine --features cuda --lib -- --ignored \
+    ///     --nocapture p58_file_blocks_differ_from_requant_real_gguf
+    #[test]
+    #[ignore]
+    fn p58_file_blocks_differ_from_requant_real_gguf() {
+        let path = match std::env::var("GGUF_PATH") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                let d = std::path::PathBuf::from("/work/models/Qwen3.8-27B-Q4_0.gguf");
+                if !d.exists() {
+                    eprintln!("skip: GGUF_PATH 未設定かつ既定モデルが無い");
+                    return;
+                }
+                d
+            }
+        };
+        let f = GgufFile::open(&path).expect("GGUF を開けない");
+        // 代表的な Q4_0 線形重み (層 0/3 の注意・FFN)
+        let names = [
+            "blk.0.attn_qkv.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.3.attn_q.weight",
+            "blk.3.ffn_up.weight",
+        ];
+        let mut checked = 0usize;
+        let mut same_all = true;
+        for name in names {
+            let Some(t) = f.tensor(name) else {
+                println!("[p58] {name}: 無い (skip)");
+                continue;
+            };
+            if t.ty != GgmlType::Q4_0 {
+                println!("[p58] {name}: 型 {:?} (Q4_0 でないので対象外)", t.ty);
+                continue;
+            }
+            let k = t.dims[0] as usize;
+            let n: usize = t.dims[1..].iter().product::<u64>() as usize;
+            let row_bytes = (k / 32) * 18;
+            let bytes = f.tensor_bytes(name).expect("tensor_bytes");
+            let rows = 2usize;
+            let src = &bytes[..rows * row_bytes];
+            let w = crate::kquant::dequant_row(t.ty, src, rows * k);
+            // 2 行ぶんだけ量子化する (テンソル全体を作らない)
+            let mut re = Q4Linear::zeros(k, rows);
+            re.quantize_rows_into(0, &w);
+            let re_bytes = re.blocks.as_slice();
+            let diff = src.iter().zip(re_bytes.iter()).filter(|(a, b)| a != b).count();
+            checked += 1;
+            if diff > 0 {
+                same_all = false;
+            }
+            println!(
+                "[p58] {name}: k={k} n={n} 2 行 {} B 中 {} B が再量子化で変化 ({:.1}%)",
+                src.len(),
+                diff,
+                100.0 * diff as f64 / src.len() as f64
+            );
+        }
+        assert!(checked > 0, "Q4_0 テンソルを 1 本も検査していない");
+        if same_all {
+            println!("[p58] VERDICT: ファイルのブロック == 再量子化ブロック (mmap 化しても数値不変)");
+        } else {
+            println!(
+                "[p58] VERDICT: ファイルのブロック != 再量子化ブロック (mmap 化は数値変更になる)"
+            );
+        }
+    }
+
+    fn heap_path_len(bl: &EmbedBlocks) -> usize {
+        bl.blocks.len()
     }
 
     /// P42: 実 27B Q4_0 で、生ブロック常駐 + 行復元 (`EmbedTable::Q4Rows`) が
@@ -2065,11 +2464,11 @@ mod tests {
             delta_mb(peak_rss_bytes(), base_rss)
         );
         let emb = EmbedTable::Q4Rows {
-            blocks,
+            blocks: blocks.into(),
             k,
             n,
             row_bytes,
-            ty: t.ty as u16,
+            ty: GgmlType::Q4_0 as u16,
         };
         // 参照側でも同じ生ブロックを読む (コピーを作らない)。
         let raw: &[u8] = match &emb {
@@ -2146,5 +2545,55 @@ mod tests {
              (resident blocks, no pread; checksum {acc:.3})"
         );
         println!("[p42] VERDICT: EmbedTable::Q4Rows is BIT-IDENTICAL to the loader's f32 table ({checked} rows)");
+    }
+
+    /// P58D-FIX: `release_resident_pages` (`MADV_DONTNEED`) が実行時に成功し、
+    /// 破棄後も同じバイト列が読めることを合成 GGUF で確かめる。
+    ///
+    /// memmap2 0.9.11 では `MADV_DONTNEED` が `Advice` に無く `UncheckedAdvice`
+    /// (unsafe な `unchecked_advise`) 側にしかない。コンパイルが通るだけでは
+    /// 「その syscall が実際に Ok を返す」証拠にならないので、ここで呼ぶ。
+    /// あわせて advise 後の再読み出しが advise 前と 1 バイトも変わらないこと
+    /// (ページキャッシュからの再フォルトで内容が保たれること) を見る。
+    /// RSS は実測値を出すだけ (ページ単位の丸めで数十 KiB 揺れるため合否には
+    /// 使わない)。
+    #[test]
+    fn release_resident_pages_advise_succeeds_and_bytes_survive() {
+        let k = 4096usize;
+        let n = 4096usize; // 4096/32*18*4096 = 9.4 MB を実際に触る
+        let (blocks, _row_bytes) = p42_synth_blocks(k, n);
+        let dir = std::env::temp_dir().join(format!("denno_p58d_madv_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.gguf");
+        p42_write_gguf_q4(&path, "token_embd.weight", k, n, &blocks);
+
+        let f = GgufFile::open(&path).expect("合成 GGUF を開けない");
+        // 全ページを載せる (この時点で RSS に写像のページが乗る)
+        let before = f
+            .tensor_bytes("token_embd.weight")
+            .expect("tensor_bytes")
+            .to_vec();
+        let rss_before = rss_now_bytes();
+        f.release_resident_pages()
+            .expect("madvise(MADV_DONTNEED) が失敗した");
+        let rss_after = rss_now_bytes();
+        // advise 後の再読み出し (ページキャッシュから再フォルト) が同一
+        let after = f.tensor_bytes("token_embd.weight").expect("tensor_bytes");
+        assert_eq!(
+            before.as_slice(),
+            after,
+            "MADV_DONTNEED 後の再読み出しでバイト列が変わった"
+        );
+        if let (Some(b), Some(a)) = (rss_before, rss_after) {
+            println!(
+                "[p58d] touched {:.1} MB / VmRSS before {:.1} MB after {:.1} MB (drop {:.1} MB)",
+                before.len() as f64 / 1e6,
+                b as f64 / 1e6,
+                a as f64 / 1e6,
+                b.saturating_sub(a) as f64 / 1e6
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

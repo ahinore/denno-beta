@@ -388,6 +388,8 @@ impl Engine {
         let slot_reserved = vec![0usize; slots];
         // A4: GDN 状態スナップショットをトークン換算するためのスケール
         let kv_bytes_per_token = caches[0].bytes_per_token();
+        // P58-5: 起動直後の重みメモリ内訳を 1 行 (ヒープ実体 vs mmap スライス)。
+        tracing::info!("{}", crate::quant::weight_memory_line("startup"));
         Ok(Self {
             model,
             tok,
@@ -952,7 +954,21 @@ impl Engine {
         let r = self.step_chat_inner(sess, on_delta);
         self.release_slot_on_err(lease, "prefill/decode step failed", r.is_err());
         crate::prof::step_end(st);
+        if matches!(&r, Ok(true)) {
+            Self::log_weights_after_first_request();
+        }
         r
+    }
+
+    /// P58-5: 最初のリクエストが完了した時点で重みメモリ内訳を 1 回だけ出す
+    /// (起動直後の行と同じ体裁)。1 リクエストで増えた重み関連のヒープ確保が
+    /// 無いこと (= 推論が重みを実体化し直していないこと) をログで確認できる。
+    fn log_weights_after_first_request() {
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        tracing::info!("{}", crate::quant::weight_memory_line("after 1 request"));
     }
 
     /// s148: [`step_chat`] の本体 (表 C の step 計測を外したもの)。
@@ -1310,6 +1326,9 @@ impl Engine {
             }
         }
         crate::prof::step_end(st);
+        if matches!(&r, Ok(v) if v.iter().any(|&d| d)) {
+            Self::log_weights_after_first_request();
+        }
         // s155 (Task B16): `sl_step_other` の確定は **forward の戻りの後**。
         // `sl_step` の内訳 (`sl_step_lay_other` / `sl_so_*` / 次の `sl_lin`) は
         // step の後半で閉じるので、`step_end` の時点では揃っていない。
