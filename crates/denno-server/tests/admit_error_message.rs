@@ -42,7 +42,7 @@ use denno_engine::kv_cache::KvCache;
 use denno_engine::model::Model;
 use denno_engine::testutil::{dummy_tokenizer, DUMMY_VOCAB};
 use denno_engine::{ChatMessage, Engine, GenParams};
-use denno_server::{AdmitFailure, AdmitKind, AppState, Scheduler};
+use denno_server::{AdmitFailure, AdmitKind, AppState, EngineInfo, Scheduler};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -136,10 +136,12 @@ fn force_single_slot() {
 // ---------- AppState / HTTP ----------
 
 fn app_with(engine: Engine, max_queue: usize) -> Arc<AppState> {
+    let info = EngineInfo::from_engine(&engine);
     let engine = Arc::new(Mutex::new(engine));
     let scheduler = Scheduler::spawn(engine.clone(), max_queue);
     Arc::new(AppState {
         engine,
+        info,
         api_key: None,
         scheduler,
         model_name: "denno-test".to_string(),

@@ -35,7 +35,7 @@ use denno_engine::kv_cache::KvCache;
 use denno_engine::model::Model;
 use denno_engine::testutil::{dummy_tokenizer, DUMMY_VOCAB};
 use denno_engine::{ChatMessage, Engine, GenParams};
-use denno_server::{AppState, Scheduler};
+use denno_server::{AppState, EngineInfo, Scheduler};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -84,10 +84,12 @@ impl Model for FailAfterInstallModel {
 fn failing_test_app() -> Arc<AppState> {
     let tok = dummy_tokenizer().unwrap();
     let engine = Engine::from_parts(Box::new(FailAfterInstallModel { ctx: 256 }), tok, "denno-test", None);
+    let info = EngineInfo::from_engine(&engine);
     let engine = Arc::new(Mutex::new(engine));
     let scheduler = Scheduler::spawn(engine.clone(), 8);
     Arc::new(AppState {
         engine,
+        info,
         api_key: None,
         scheduler,
         model_name: "denno-test".to_string(),
@@ -132,10 +134,12 @@ fn test_app(delay_ms: u64) -> Arc<AppState> {
         ctx: 256,
     });
     let engine = Engine::from_parts(model, tok, "denno-test", None);
+    let info = EngineInfo::from_engine(&engine);
     let engine = Arc::new(Mutex::new(engine));
     let scheduler = Scheduler::spawn(engine.clone(), 8);
     Arc::new(AppState {
         engine,
+        info,
         api_key: None,
         scheduler,
         model_name: "denno-test".to_string(),

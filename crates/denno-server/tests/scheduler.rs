@@ -23,7 +23,7 @@ use denno_engine::testutil::{
     dummy_tokenizer, kv_sensitive_engine, KvSensitiveModel, DUMMY_CONTEXT, DUMMY_EOS, DUMMY_VOCAB,
 };
 use denno_engine::{ChatMessage, Engine, GenParams};
-use denno_server::{AppState, Scheduler, THINKING_BRIEF_INSTRUCTION, MAX_ACTIVE_SESSIONS};
+use denno_server::{MAX_ACTIVE_SESSIONS, THINKING_BRIEF_INSTRUCTION, AppState, EngineInfo, Scheduler};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -64,10 +64,12 @@ impl Model for SleepModel {
 fn test_app_with(model: Box<dyn Model>, max_queue: usize) -> (Router, Arc<AppState>) {
     let tok = dummy_tokenizer().unwrap();
     let engine = Engine::from_parts(model, tok, "denno-test", None);
+    let info = EngineInfo::from_engine(&engine);
     let engine = Arc::new(Mutex::new(engine));
     let scheduler = Scheduler::spawn(engine.clone(), max_queue);
     let state = Arc::new(AppState {
         engine,
+        info,
         api_key: None,
         scheduler,
         model_name: "denno-test".to_string(),

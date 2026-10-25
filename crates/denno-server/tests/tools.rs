@@ -22,7 +22,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use denno_engine::testutil::{dummy_tokenizer, DummyModel};
 use denno_engine::Engine;
-use denno_server::{AppState, Scheduler};
+use denno_server::{AppState, EngineInfo, Scheduler};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -30,10 +30,12 @@ use tower::ServiceExt;
 fn test_app() -> Router {
     let tok = dummy_tokenizer().unwrap();
     let engine = Engine::from_parts(Box::new(DummyModel), tok, "denno-test", None);
+    let info = EngineInfo::from_engine(&engine);
     let engine = Arc::new(Mutex::new(engine));
     let scheduler = Scheduler::spawn(engine.clone(), 8);
     let state = Arc::new(AppState {
         engine,
+        info,
         api_key: None,
         scheduler,
         model_name: "denno-test".to_string(),
