@@ -3073,6 +3073,22 @@ fn q4_alias_table() -> &'static std::sync::Mutex<std::collections::HashMap<u64, 
     Q4_ALIAS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// s178 (P59): 連結重みと分割重みの**同居**を避ける (重複排除) か。既定 ON。
+///
+/// `DENNO_Q4_DEDUP=0` で「エイリアスを使わない」= 各 uid を個別に転送する
+/// 従来動作へ戻せる。数値は経路によらず同一 (同じ重み・同じカーネル・同じ
+/// 累積順) で、変わるのは VRAM と H2D の量だけ。
+fn q4_dedup_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_q4_dedup(std::env::var("DENNO_Q4_DEDUP").ok().as_deref()))
+}
+
+/// s178 (P59): `DENNO_Q4_DEDUP` の解釈 (純関数・テスト可能)。
+/// `parse_q4_chain` と同じ規約で **`"0"` だけが off** (未設定・空・その他は on)。
+fn parse_q4_dedup(raw: Option<&str>) -> bool {
+    raw != Some("0")
+}
+
 /// s165: `Linear` から Q4 本体を取り出す (連結エイリアスの前提検査用)。
 fn q4_of(l: &crate::quant::Linear) -> Option<&crate::quant::Q4Linear> {
     match l {
@@ -3134,7 +3150,7 @@ fn q4_register_row_alias_q4(
     c: &crate::quant::Q4Linear,
     parts: &[&crate::quant::Q4Linear],
 ) -> bool {
-    if parts.is_empty() {
+    if parts.is_empty() || !q4_dedup_enabled() {
         return false;
     }
     // 形状契約: parts はすべて Q4・k は concat と一致・行数の和が concat.n。
@@ -3148,6 +3164,17 @@ fn q4_register_row_alias_q4(
         return false;
     };
     let offs: Vec<(u64, usize)> = uids.into_iter().zip(rows).collect();
+    // s178 (P59): 既に「連結側が載っていて parts がその行範囲」なら何もしない。
+    if q4_fused_ready(c.uid, parts) {
+        return true;
+    }
+    // s178 (P59): parts が**自分の実体として**載っているなら連結側を上げない
+    // (上げると同じパラメータが VRAM に 2 重に載る = P59 で削った分が戻る)。
+    // エイリアスビューとして載っている場合は実体ではないので、上の
+    // `q4_fused_ready` が先に true を返してここへは来ない。
+    if parts.iter().any(|p| q4_resident(p.uid)) {
+        return false;
+    }
     // 連結側を先にレジストリへ載せる (エイリアスの参照先が存在する状態にする)。
     if weights_for_q4(c.uid, &c.blocks, c.k, c.n).is_err() {
         return false;
@@ -3184,41 +3211,67 @@ fn q4_fused_ready(fused_uid: u64, parts: &[&crate::quant::Q4Linear]) -> bool {
     true
 }
 
+/// s178 (P59): 連結重み `[tn 行 × tk 列]` の行範囲 `[row_off, row_off+n)` を
+/// `[n 行 × k 列]` のビューとして切り出すための**バイト幾何** (純粋関数・GPU 不要)。
+///
+/// 連結側の nib は 1 行 nb (= k/32) ブロック × 16 B、sc は 1 行 nb 本 × 4 B (f32)。
+/// 行は連結側で連続しているので、行オフセットはそのままバイトオフセットになる。
+///
+/// 契約: `k` が 32 の倍数・`tk == k`・`row_off + n <= tn` (範囲が連結側に収まる)。
+/// **`<=` が要点**: 先頭の part は `row_off = 0` なので `row_off + n != tn` に
+/// なり、旧実装 (`!=`) では末尾の part しかビューにならず先頭の part が VRAM へ
+/// 二重に載っていた (P59 の実測で 465 本 / 22,818.6 MB)。満たさない入力は `None`
+/// = 呼び出し側は通常の転送へ落ちる (fail closed)。
+fn q4_view_geo(
+    k: usize,
+    n: usize,
+    row_off: usize,
+    tk: usize,
+    tn: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    if k == 0 || k % 32 != 0 || n == 0 || tk != k {
+        return None;
+    }
+    if row_off.checked_add(n)? > tn {
+        return None;
+    }
+    let nb = k / 32;
+    let nib_off = row_off.checked_mul(nb)?.checked_mul(16)?;
+    let sc_off = row_off.checked_mul(nb)?.checked_mul(4)?;
+    let nib_bytes = n.checked_mul(nb)?.checked_mul(16)?;
+    let sc_bytes = n.checked_mul(nb)?.checked_mul(4)?;
+    Some((nib_off, nib_bytes, sc_off, sc_bytes))
+}
+
 /// s165: `uid` にエイリアスが登録されていれば、連結側のデバイス領域を指す
 /// ビューを `map` に登録して返す。形状・サイズが 1 つでも食い違えば `None`
 /// (呼び出し側は通常の転送へ落ちる = fail closed)。
+///
+/// s178 (P59): 範囲判定を [`q4_view_geo`] に切り出し、先頭の part (row_off = 0)
+/// もビューになるようにした。`DENNO_Q4_DEDUP=0` では常に `None`
+/// (エイリアスを使わない = 各 uid を個別に転送する従来動作)。
 fn q4_alias_view(
     uid: u64,
     k: usize,
     n: usize,
     map: &mut std::collections::HashMap<u64, Box<GpuWq4>>,
 ) -> Option<&'static GpuWq4> {
-    if map.contains_key(&uid) {
+    if !q4_dedup_enabled() || map.contains_key(&uid) {
         return None;
     }
     let (tgt, row_off) = {
         let t = q4_alias_table().lock().ok()?;
         *t.get(&uid)?
     };
-    if k == 0 || k % 32 != 0 || row_off.checked_add(n)? > usize::MAX / 4 {
-        return None;
-    }
-    let nb = k / 32;
     // 参照先 (連結側) がまだ転送されていなければ何もしない。
     let (nib_ptr, sc_ptr, tn, tk) = {
         let e = map.get(&tgt)?;
         (e.nib.ptr(), e.sc.ptr(), e.n, e.k)
     };
-    if tk != k || row_off + n != tn {
-        return None;
-    }
     if nib_ptr == 0 || sc_ptr == 0 {
         return None;
     }
-    let nib_off = row_off.checked_mul(nb)?.checked_mul(16)?;
-    let sc_off = row_off.checked_mul(nb)?.checked_mul(4)?;
-    let nib_bytes = n.checked_mul(nb)?.checked_mul(16)?;
-    let sc_bytes = n.checked_mul(nb)?.checked_mul(4)?;
+    let (nib_off, nib_bytes, sc_off, sc_bytes) = q4_view_geo(k, n, row_off, tk, tn)?;
     // 範囲が連結側バッファ内に収まることを確認 (収まらなければ fail closed)。
     {
         let e = map.get(&tgt)?;
@@ -15845,5 +15898,98 @@ mod p53_qk_overlap_tests {
         // 16 full 層ぶんの q は ≈0.77 s (このうち k/v の GEMM+D2H の分だけが隠れる)
         let q_all = q_ms * 16.0;
         assert!((760.0..790.0).contains(&q_all), "q の D2H 合計が {q_all} ms");
+    }
+}
+
+#[cfg(test)]
+mod p59_dedup_tests {
+    //! s178 (P59): 連結重みの行範囲ビューの**バイト幾何**と A/B スイッチを固定する。
+    //!
+    //! 27B q4 は decode chain が連結 1 本 (`gate_up_w` / `qkv_fused`)、prefill の
+    //! per-op 経路が分割 (`gate_w` / `up_w` / `q_w` / `k_w` / `v_w`) を使うため、
+    //! 同じパラメータが VRAM に 2 度載っていた (実測 465 本 / 22,818.6 MB)。
+    //! 旧 `q4_alias_view` は `row_off + n != tn` で判定していたため、**先頭の
+    //! part (row_off = 0) だけ**ビューにならず個別転送されていた。
+    //! ここでは GPU を使わずに (純粋関数だけで) 先頭・中間・末尾の part がすべて
+    //! 連結側の行範囲になることを固定し、範囲外・形状不一致は fail closed で
+    //! `None` になることを固定する。
+    use super::*;
+
+    /// 27B: e = 5120, ff = 17408 → gate_up = [gate(17408 行) | up(17408 行)]
+    #[test]
+    fn view_geo_gate_up_all_parts() {
+        let (k, ff) = (5120usize, 17408usize);
+        let nb = k / 32;
+        let tn = 2 * ff;
+        // 先頭 part (gate): 旧実装の `!=` ではここが落ちて個別転送されていた
+        assert_eq!(
+            q4_view_geo(k, ff, 0, k, tn),
+            Some((0, ff * nb * 16, 0, ff * nb * 4)),
+            "gate (row_off = 0) がビューにならない"
+        );
+        // 末尾 part (up)
+        assert_eq!(
+            q4_view_geo(k, ff, ff, k, tn),
+            Some((ff * nb * 16, ff * nb * 16, ff * nb * 4, ff * nb * 4)),
+            "up (row_off = ff) がビューにならない"
+        );
+        // 2 本合わせて連結側のバッファをちょうど覆う (1 バイトの隙間も重なりも無い)
+        let (o1, b1, s1, c1) = q4_view_geo(k, ff, 0, k, tn).unwrap();
+        let (o2, b2, s2, c2) = q4_view_geo(k, ff, ff, k, tn).unwrap();
+        assert_eq!(o1 + b1, o2, "nib の行範囲が連続していない");
+        assert_eq!(s1 + c1, s2, "sc の行範囲が連続していない");
+        assert_eq!(o2 + b2, tn * nb * 16, "nib が連結側の末尾に一致しない");
+        assert_eq!(s2 + c2, tn * nb * 4, "sc が連結側の末尾に一致しない");
+    }
+
+    /// full attention: [q(12288) | k(1024) | v(1024)] = 14336 /
+    /// GDN: [qkv(10240) | z(6144)] = 16384
+    #[test]
+    fn view_geo_qkv_all_parts() {
+        let k = 5120usize;
+        let nb = k / 32;
+        let (nq, nkv) = (12288usize, 1024usize);
+        let tn = nq + 2 * nkv;
+        assert_eq!(q4_view_geo(k, nq, 0, k, tn), Some((0, nq * nb * 16, 0, nq * nb * 4)));
+        assert_eq!(
+            q4_view_geo(k, nkv, nq, k, tn),
+            Some((nq * nb * 16, nkv * nb * 16, nq * nb * 4, nkv * nb * 4))
+        );
+        assert_eq!(
+            q4_view_geo(k, nkv, nq + nkv, k, tn),
+            Some(((nq + nkv) * nb * 16, nkv * nb * 16, (nq + nkv) * nb * 4, nkv * nb * 4))
+        );
+        let (n1, n2) = (10240usize, 6144usize);
+        assert_eq!(q4_view_geo(k, n1, 0, k, n1 + n2), Some((0, n1 * nb * 16, 0, n1 * nb * 4)));
+        assert_eq!(
+            q4_view_geo(k, n2, n1, k, n1 + n2),
+            Some((n1 * nb * 16, n2 * nb * 16, n1 * nb * 4, n2 * nb * 4))
+        );
+    }
+
+    /// 前提が崩れた入力は `None` (= 呼び出し側は通常の転送へ落ちる)。
+    /// ここが `Some` を返すと**別の重みの行**を読む (数値が変わる)。
+    #[test]
+    fn view_geo_fail_closed() {
+        let k = 5120usize;
+        // 範囲が連結側の外へはみ出す (1 行でも超えたら駄目)
+        assert_eq!(q4_view_geo(k, 17408, 17408, k, 2 * 17408 - 1), None);
+        assert_eq!(q4_view_geo(k, 32, 5120, k, 5120), None);
+        // k が食い違う / k が 32 の倍数でない / n = 0
+        assert_eq!(q4_view_geo(k, 1024, 0, k + 32, 1024), None);
+        assert_eq!(q4_view_geo(5104, 1024, 0, 5104, 1024), None);
+        assert_eq!(q4_view_geo(k, 0, 0, k, 1024), None);
+        // オフセット計算のオーバーフロー
+        assert_eq!(q4_view_geo(k, usize::MAX, 0, k, usize::MAX), None);
+    }
+
+    /// A/B スイッチの解釈: `"0"` だけが off (タイポで静かに経路が変わるのを避ける)。
+    #[test]
+    fn dedup_env_only_zero_is_off() {
+        assert!(parse_q4_dedup(None));
+        assert!(parse_q4_dedup(Some("")));
+        assert!(parse_q4_dedup(Some("1")));
+        assert!(parse_q4_dedup(Some("off")));
+        assert!(!parse_q4_dedup(Some("0")));
     }
 }

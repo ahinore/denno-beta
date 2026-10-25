@@ -5989,4 +5989,101 @@ mod tests {
         };
         let _ = q4.f32_table_or_panic("lm_logits");
     }
+
+    /// s178 (P59): 27B シェイプの**全層**で「連結重み = parts の行連結」が成り立ち、
+    /// 行範囲エイリアス (VRAM の重複排除) の前提が満たされることを固定する。
+    ///
+    /// 前提が崩れると GPU は parts を個別に転送する (VRAM が 2 重になる) か、
+    /// 連結側の**別の行**を読む (数値が変わる)。ここでは GPU を使わず、形状と uid
+    /// だけで確かめる (`cuda` feature 時は実装の `q4_row_alias_offsets` とも突き合わせる)。
+    #[test]
+    fn q4_alias_geometry_holds_for_all_layers() {
+        // Q4 ブロックは k が 32 の倍数でないと作れない (`Q4Linear::zeros`)。
+        // 実 27B の GDN は vd = 48 * 128 = 6144 で倍数だが、フィクスチャの
+        // 既定 (nv = 6, DV = 8 → vd = 48) は倍数でないので nv = 4 (vd = 32) を使う。
+        // 層構成 (64 = 48 GDN + 16 full) と FFN/attention の形は変えない。
+        let dir = build_dir("p59_alias", true, NK, 4);
+        let cfg: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap())
+                .unwrap();
+        let m = Qwen35::load(&dir, &cfg, QuantMode::Q4_0).expect("合成 27B モデルのロードに失敗");
+        let (mut n_mlp, mut n_gdn, mut n_full) = (0usize, 0usize, 0usize);
+        for (li, layer) in m.layers.iter().enumerate() {
+            // FFN: gate_up = [gate 全行 | up 全行]
+            let (gu, g, u) = match (&layer.gate_up_w, &layer.gate_w, &layer.up_w) {
+                (Linear::Q4(a), Linear::Q4(b), Linear::Q4(c)) => (a, b, c),
+                _ => panic!("層 {li}: Q4 モードで FFN が Q4 でない"),
+            };
+            assert_ne!(gu.uid, g.uid, "層 {li}: gate_up と gate が同じ uid");
+            assert_ne!(gu.uid, u.uid, "層 {li}: gate_up と up が同じ uid");
+            assert_eq!((g.k, u.k), (gu.k, gu.k), "層 {li}: gate/up の k が連結側と違う");
+            assert_eq!(gu.n, g.n + u.n, "層 {li}: gate_up の行数が parts の和でない");
+            #[cfg(feature = "cuda")]
+            assert_eq!(
+                crate::cuda::q4_row_alias_offsets(gu.k, gu.n, &[(g.k, g.n), (u.k, u.n)]),
+                Some(vec![0, g.n]),
+                "層 {li}: gate_up の行割り当てが成立しない (分割側が VRAM に二重に載る)"
+            );
+            n_mlp += 1;
+
+            // attention: qkv 連結 (Q4 のときだけ作られる)
+            let fused = match layer.qkv_fused.as_ref() {
+                Some(Linear::Q4(f)) => f,
+                Some(_) => panic!("層 {li}: qkv_fused が Q4 でない"),
+                None => panic!("層 {li}: qkv_fused が作られていない (Q4 の全 parts 連結)"),
+            };
+            match &layer.attn {
+                AttnKind::Gdn(gl) => {
+                    let (p1, p2) = match (&gl.qkv_w, &gl.gate_w) {
+                        (Linear::Q4(a), Linear::Q4(b)) => (a, b),
+                        _ => panic!("層 {li}: GDN の qkv/z が Q4 でない"),
+                    };
+                    let (k1, n1) = (p1.k, p1.n);
+                    let (k2, n2) = (p2.k, p2.n);
+                    assert_ne!(fused.uid, p1.uid, "層 {li}: qkv_fused と part が同じ uid");
+                    assert_ne!(fused.uid, p2.uid, "層 {li}: qkv_fused と part が同じ uid");
+                    assert_eq!((k1, k2), (fused.k, fused.k), "層 {li}: qkv/z の k が違う");
+                    assert_eq!(fused.n, n1 + n2, "層 {li}: qkv_fused の行数が和でない");
+                    #[cfg(feature = "cuda")]
+                    assert_eq!(
+                        crate::cuda::q4_row_alias_offsets(fused.k, fused.n, &[(k1, n1), (k2, n2)]),
+                        Some(vec![0, n1]),
+                        "層 {li}: GDN の qkv|z 行割り当てが成立しない"
+                    );
+                    n_gdn += 1;
+                }
+                AttnKind::Full(fl) => {
+                    let (q, k_, v) = match (&fl.q_w, &fl.k_w, &fl.v_w) {
+                        (Linear::Q4(a), Linear::Q4(b), Linear::Q4(c)) => (a, b, c),
+                        _ => panic!("層 {li}: q/k/v が Q4 でない"),
+                    };
+                    let (kq, nq) = (q.k, q.n);
+                    let (kk, nk) = (k_.k, k_.n);
+                    let (kv, nv) = (v.k, v.n);
+                    assert_ne!(fused.uid, q.uid, "層 {li}: qkv_fused と part が同じ uid");
+                    assert_ne!(fused.uid, k_.uid, "層 {li}: qkv_fused と part が同じ uid");
+                    assert_ne!(fused.uid, v.uid, "層 {li}: qkv_fused と part が同じ uid");
+                    assert_eq!(
+                        (kq, kk, kv),
+                        (fused.k, fused.k, fused.k),
+                        "層 {li}: q|k|v の k が違う"
+                    );
+                    assert_eq!(fused.n, nq + nk + nv, "層 {li}: qkv_fused の行数が和でない");
+                    #[cfg(feature = "cuda")]
+                    assert_eq!(
+                        crate::cuda::q4_row_alias_offsets(
+                            fused.k,
+                            fused.n,
+                            &[(kq, nq), (kk, nk), (kv, nv)]
+                        ),
+                        Some(vec![0, nq, nq + nk]),
+                        "層 {li}: full の q|k|v 行割り当てが成立しない"
+                    );
+                    n_full += 1;
+                }
+            }
+        }
+        assert_eq!((n_mlp, n_gdn, n_full), (NL, 48, 16), "層構成 (64 = 48 GDN + 16 full)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
