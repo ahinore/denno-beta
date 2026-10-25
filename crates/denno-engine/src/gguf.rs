@@ -112,6 +112,9 @@ impl GgufValue {
 #[derive(Debug, Clone)]
 pub struct GgufTensorInfo {
     pub name: String,
+    /// split GGUF 内のファイル番号 (単一ファイルなら常に 0)。
+    /// `offset` / `nbytes` は **このファイル** のデータ部先頭からの値。
+    pub file: usize,
     /// 次元 (ne[0] が最速・行)
     pub dims: [u64; 4],
     pub ty: GgmlType,
@@ -120,59 +123,222 @@ pub struct GgufTensorInfo {
     pub nbytes: u64,
 }
 
-pub struct GgufFile {
-    /// P58-5: mmap は `Arc` で共有する。重みを mmap スライス越しに保持する
-    /// 経路 (`DENNO_MMAP_WEIGHTS=1`) では、`GgufFile` が落ちた後も重みが
-    /// ファイルのページを参照し続ける必要があるため。
+/// split GGUF の 1 パート (mmap とそのファイルのデータ部開始位置)。
+struct GgufPart {
     mmap: std::sync::Arc<Mmap>,
+    /// テンソルデータ部の **このファイル内** 開始位置
+    data_start: u64,
+}
+
+impl GgufPart {
+    fn map(path: &Path) -> Result<Self, GgufError> {
+        let file = File::open(path).map_err(|e| GgufError(format!("open {path:?}: {e}")))?;
+        let mmap = unsafe { Mmap::map(&file).map_err(|e| GgufError(format!("mmap {path:?}: {e}")))? };
+        Ok(GgufPart { mmap: std::sync::Arc::new(mmap), data_start: 0 })
+    }
+}
+
+pub struct GgufFile {
+    /// split GGUF の各パート (split.no 昇順)。単一ファイルなら 1 要素。
+    /// テンソルのデータは `GgufTensorInfo::file` が指すパートの mmap にある。
+    parts: Vec<GgufPart>,
     pub version: u32,
     pub alignment: u64,
-    /// テンソルデータ部のファイル内開始位置
+    /// テンソルデータ部のファイル内開始位置 (パート 0 の値)
     pub data_start: u64,
     pub metadata: HashMap<String, GgufValue>,
-    /// (テンソル名 → 情報)
+    /// (テンソル名 → 情報)。split でも 1 つの表にまとめる。
     pub tensors: HashMap<String, GgufTensorInfo>,
-    /// ファイル内順 (dequant の列挙・検証用)
+    /// ファイル内順 (dequant の列挙・検証用)。split では split.no 昇順の連結。
     pub tensor_order: Vec<String>,
 }
 
 impl GgufFile {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, GgufError> {
-        let file = File::open(path.as_ref())
-            .map_err(|e| GgufError(format!("open {:?}: {e}", path.as_ref())))?;
-        let mmap = unsafe { Mmap::map(&file).map_err(|e| GgufError(format!("mmap: {e}")))? };
-        Self::parse(mmap)
+        let mut part = GgufPart::map(path.as_ref())?;
+        let p = parse_fields(&part.mmap)?;
+        part.data_start = p.data_start;
+        Ok(Self::from_parts(vec![part], p))
     }
 
-    fn parse(mmap: Mmap) -> Result<Self, GgufError> {
-        let p = parse_fields(&mmap)?;
+    /// P-MOE-A1: split GGUF (`*-00001-of-00006.gguf` 形式) を 1 つのテンソル表として開く。
+    ///
+    /// - 各パートの `split.count` / `split.no` / `split.tensors.count` を読み、
+    ///   `split.no` 昇順に並べる。
+    /// - `split.no` が 0..count-1 の連番でない (欠番・重複)、`split.count` が
+    ///   渡したパス数と違う、`split.tensors.count` の総和が実際のテンソル数と
+    ///   違う、テンソル名がパート間で重複する — のいずれかならエラー。
+    /// - メタデータは `split.no == 0` のパートを正とし、他パートにしか無いキーだけ
+    ///   補う (上書きはしない)。
+    /// - テンソルの `offset` は各パートのデータ部先頭からの値のまま保持し、
+    ///   `GgufTensorInfo::file` でパートを指す。`tensor_bytes` はパートを跨いで
+    ///   正しいバイト列を返す。
+    pub fn open_split(paths: &[std::path::PathBuf]) -> Result<Self, GgufError> {
+        if paths.is_empty() {
+            return err("open_split: パスが空");
+        }
+        if paths.len() == 1 {
+            return Self::open(&paths[0]);
+        }
+
+        // 1. 全パートを mmap してヘッダを解析する。
+        struct Shard {
+            no: usize,
+            count: usize,
+            tensors_count: Option<u64>,
+            path: std::path::PathBuf,
+            part: GgufPart,
+            parsed: ParsedFields,
+        }
+        let mut shards: Vec<Shard> = Vec::with_capacity(paths.len());
+        for path in paths {
+            let mut part = GgufPart::map(path)?;
+            let parsed = parse_fields(&part.mmap)?;
+            part.data_start = parsed.data_start;
+            let kv = |k: &str| parsed.metadata.get(k).and_then(|v| v.as_u64());
+            let (Some(no), Some(count)) = (kv("split.no"), kv("split.count")) else {
+                return err(format!(
+                    "split GGUF に split.no / split.count が無い: {path:?}"
+                ));
+            };
+            shards.push(Shard {
+                no: no as usize,
+                count: count as usize,
+                tensors_count: kv("split.tensors.count"),
+                path: path.clone(),
+                part,
+                parsed,
+            });
+        }
+
+        // 2. split.no 昇順に並べ、欠番・重複・件数不一致を弾く。
+        shards.sort_by_key(|s| s.no);
+        for (i, s) in shards.iter().enumerate() {
+            if s.no != i {
+                return err(format!(
+                    "split.no が連番でない: 位置 {i} に split.no={} ({:?})",
+                    s.no, s.path
+                ));
+            }
+            if s.count != shards.len() {
+                return err(format!(
+                    "split.count={} が渡したパート数 {} と一致しない ({:?})",
+                    s.count,
+                    shards.len(),
+                    s.path
+                ));
+            }
+        }
+
+        // 3. テンソル表を 1 つにまとめる (名前の重複は破損とみなす)。
+        let mut tensors: HashMap<String, GgufTensorInfo> = HashMap::new();
+        let mut tensor_order: Vec<String> = Vec::new();
+        for (file, s) in shards.iter().enumerate() {
+            for name in &s.parsed.tensor_order {
+                let mut info = s.parsed.tensors[name].clone();
+                info.file = file;
+                if tensors.insert(name.clone(), info).is_some() {
+                    return err(format!("テンソル名が split 間で重複: {name} ({:?})", s.path));
+                }
+                tensor_order.push(name.clone());
+            }
+        }
+
+        // 4. split.tensors.count の総和が実際のテンソル数と一致するか。
+        let declared: Option<u64> = {
+            let mut sum = 0u64;
+            let mut all = true;
+            for s in &shards {
+                match s.tensors_count {
+                    Some(n) => sum += n,
+                    None => all = false,
+                }
+            }
+            all.then_some(sum)
+        };
+        if let Some(declared) = declared {
+            if declared != tensor_order.len() as u64 {
+                return err(format!(
+                    "split.tensors.count の総和 {declared} が実際のテンソル数 {} と一致しない",
+                    tensor_order.len()
+                ));
+            }
+        }
+
+        // 5. メタデータは split.no == 0 を正とし、欠けているキーだけ補う。
+        let mut metadata = shards[0].parsed.metadata.clone();
+        for s in &shards[1..] {
+            for (k, v) in &s.parsed.metadata {
+                metadata.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+
+        let head = shards.remove(0);
+        let mut parts: Vec<GgufPart> = vec![head.part];
+        parts.extend(shards.into_iter().map(|s| s.part));
+
         Ok(GgufFile {
-            mmap: std::sync::Arc::new(mmap),
+            parts,
+            version: head.parsed.version,
+            alignment: head.parsed.alignment,
+            data_start: head.parsed.data_start,
+            metadata,
+            tensors,
+            tensor_order,
+        })
+    }
+
+    fn from_parts(parts: Vec<GgufPart>, p: ParsedFields) -> Self {
+        GgufFile {
+            parts,
             version: p.version,
             alignment: p.alignment,
             data_start: p.data_start,
             metadata: p.metadata,
             tensors: p.tensors,
             tensor_order: p.tensor_order,
-        })
+        }
     }
 
-    /// P58-5: mmap のハンドル (共有カウンタを 1 つ増やすだけ・コピーなし)
+    /// パート数 (単一ファイルなら 1)
+    pub fn part_count(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// P58-5: mmap のハンドル (共有カウンタを 1 つ増やすだけ・コピーなし)。
+    /// 単一ファイル経路の互換のためパート 0 を返す。
     pub fn mmap_handle(&self) -> std::sync::Arc<Mmap> {
-        std::sync::Arc::clone(&self.mmap)
+        std::sync::Arc::clone(&self.parts[0].mmap)
+    }
+
+    /// split GGUF の `file` 番目のパートの mmap ハンドル。
+    pub fn mmap_handle_at(&self, file: usize) -> Option<std::sync::Arc<Mmap>> {
+        self.parts.get(file).map(|p| std::sync::Arc::clone(&p.mmap))
     }
 
     /// P58-5: テンソルのデータが mmap 内で占める**絶対範囲** `(off, len)`。
     ///
     /// `tensor_bytes` と同じ検証 (存在・ファイル終端) を行い、外れたら `None`。
+    /// split GGUF でパート 0 以外にあるテンソルは `None` を返す (呼び出し側は
+    /// `tensor_mapping_parts` を使う)。既存の単一ファイル経路の意味は変えない。
     pub fn tensor_mapping(&self, name: &str) -> Option<(usize, usize)> {
-        let t = self.tensor(name)?;
-        let start = self.data_start + t.offset;
-        let end = start + t.nbytes;
-        if end > self.mmap.len() as u64 {
+        let (file, off, len) = self.tensor_mapping_parts(name)?;
+        if file != 0 {
             return None;
         }
-        Some((start as usize, t.nbytes as usize))
+        Some((off, len))
+    }
+
+    /// P-MOE-A1: `(パート番号, そのパートの mmap 内オフセット, 長さ)`。
+    pub fn tensor_mapping_parts(&self, name: &str) -> Option<(usize, usize, usize)> {
+        let t = self.tensor(name)?;
+        let part = self.parts.get(t.file)?;
+        let start = part.data_start + t.offset;
+        let end = start + t.nbytes;
+        if end > part.mmap.len() as u64 {
+            return None;
+        }
+        Some((t.file, start as usize, t.nbytes as usize))
     }
 
     /// P58-5: 読み終わったファイルページを手放す (`MADV_DONTNEED`)。
@@ -186,17 +352,20 @@ impl GgufFile {
     /// memmap2 0.9.11 では `MADV_DONTNEED` は `Advice` ではなく
     /// `UncheckedAdvice` にあり、`unchecked_advise` (unsafe) でしか呼べない。
     pub fn release_resident_pages(&self) -> Result<(), GgufError> {
-        // SAFETY: `self.mmap` は `Mmap::map` が作る読み取り専用の共有ファイル写像で、
+        // SAFETY: 各パートの mmap は `Mmap::map` が作る読み取り専用の共有ファイル写像で、
         // この写像に対して書き込みを行う経路はプロセス内に存在しない (Mmap は
         // `Deref<Target = [u8]>` のみで `&mut` を外に出さない)。`MADV_DONTNEED` は
         // clean なファイルページを捨てるだけで、以降の読み出しは同じファイル内容から
         // 再フォルトする。よって破棄後も参照先の内容は不変であり、
         // 「解放済みページへの書き込みで UB」という前提がここでは成立しない。
-        unsafe {
-            self.mmap
-                .unchecked_advise(memmap2::UncheckedAdvice::DontNeed)
-                .map_err(|e| GgufError(format!("madvise(DONTNEED): {e}")))
+        for part in &self.parts {
+            unsafe {
+                part.mmap
+                    .unchecked_advise(memmap2::UncheckedAdvice::DontNeed)
+                    .map_err(|e| GgufError(format!("madvise(DONTNEED): {e}")))?;
+            }
         }
+        Ok(())
     }
 
     pub fn get(&self, key: &str) -> Option<&GgufValue> {
@@ -207,17 +376,24 @@ impl GgufFile {
         self.tensors.get(name)
     }
 
-    /// テンソルの生バイト列を返す。
+    /// テンソルの生バイト列を返す。split GGUF ではテンソルが属するパートから読む。
     pub fn tensor_bytes(&self, name: &str) -> Result<&[u8], GgufError> {
         let t = self
             .tensor(name)
             .ok_or_else(|| GgufError(format!("テンソル {name} が無い")))?;
-        let start = self.data_start + t.offset;
+        let part = self
+            .parts
+            .get(t.file)
+            .ok_or_else(|| GgufError(format!("{name}: パート {} が範囲外", t.file)))?;
+        let start = part.data_start + t.offset;
         let end = start + t.nbytes;
-        if end as usize > self.mmap.len() {
-            return err(format!("{name}: データがファイル終端を超過 ({end} > {})", self.mmap.len()));
+        if end as usize > part.mmap.len() {
+            return err(format!(
+                "{name}: データがファイル終端を超過 ({end} > {})",
+                part.mmap.len()
+            ));
         }
-        Ok(&self.mmap[start as usize..end as usize])
+        Ok(&part.mmap[start as usize..end as usize])
     }
 
     /// テンソル全体を f32 へデ量子化して返す (総要素数 = Π dims)。
@@ -643,7 +819,10 @@ fn parse_fields(b: &[u8]) -> Result<ParsedFields, GgufError> {
         let nbytes = ne / blck * ty.type_size() as u64
             + if ne % blck != 0 { ty.type_size() as u64 } else { 0 };
         tensor_order.push(name.clone());
-        tensors.insert(name.clone(), GgufTensorInfo { name, dims, ty, offset, nbytes });
+        tensors.insert(
+            name.clone(),
+            GgufTensorInfo { name, file: 0, dims, ty, offset, nbytes },
+        );
     }
 
     let alignment = metadata
@@ -758,6 +937,178 @@ fn rd_u16(b: &[u8], p: &mut usize) -> Result<u16, GgufError> {
     let v = u16::from_le_bytes([b[*p], b[*p + 1]]);
     *p += 2;
     Ok(v)
+}
+
+// ===== P-MOE-A1: MoE (mixture of experts) レイアウト =====
+//
+// llama.cpp の MoE テンソル名・形状 (llama-model.cpp の create_tensor 呼び出し)
+// に合わせて、GGUF からエキスパート段のテンソルを引く。**読解のみ**で、
+// 推論経路 (エンジン / CUDA / サーバ) にはまだ繋がない。
+//
+// 形状の表記は GGUF の ne 順そのもの (ne[0] が最内 = 行方向)。
+// llama.cpp も `ffn_gate_exps` を `{n_embd, n_ffn, n_expert}` で作るので、
+// 下表と ne 順は一致する (反転しない)。
+
+/// MoE テンソルへの参照。
+///
+/// 既存の [`GgufTensorInfo`] (名前・dims・量子型・オフセット・バイト数) を
+/// そのまま保持し、split GGUF のパート番号を添える。単一ファイルなら
+/// `file == 0` で `info.file` と一致する。
+#[derive(Debug, Clone)]
+pub struct TensorRef {
+    /// split GGUF 内のファイル番号 (単一ファイルなら 0)
+    pub file: usize,
+    pub info: GgufTensorInfo,
+}
+
+impl TensorRef {
+    fn new(t: &GgufTensorInfo) -> Self {
+        TensorRef { file: t.file, info: t.clone() }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.info.name
+    }
+
+    pub fn ty(&self) -> GgmlType {
+        self.info.ty
+    }
+
+    /// データ部先頭からのオフセット (パート内)
+    pub fn offset(&self) -> u64 {
+        self.info.offset
+    }
+
+    pub fn nbytes(&self) -> u64 {
+        self.info.nbytes
+    }
+
+    /// GGUF の ne (ne[0] が最内)。未使用次元の 1 は落とす。
+    pub fn ne(&self) -> Vec<u64> {
+        let mut v = self.info.dims.to_vec();
+        while v.len() > 1 && v.last() == Some(&1) {
+            v.pop();
+        }
+        v
+    }
+
+    /// 要素数 (Π dims)
+    pub fn n_elements(&self) -> u64 {
+        self.info.dims.iter().product()
+    }
+}
+
+/// 1 層分の MoE テンソル。`*_exps` はエキスパート重み、`gate_inp` はルータ。
+#[derive(Debug, Clone)]
+pub struct MoeExpertTensors {
+    /// `blk.N.ffn_gate_exps.weight` — ne = [n_embd, n_ffn, n_expert]
+    pub gate_exps: TensorRef,
+    /// `blk.N.ffn_up_exps.weight` — ne = [n_embd, n_ffn, n_expert]
+    pub up_exps: TensorRef,
+    /// `blk.N.ffn_down_exps.weight` — ne = [n_ffn, n_embd, n_expert]
+    pub down_exps: TensorRef,
+    /// `blk.N.ffn_gate_inp.weight` — ne = [n_embd, n_expert] (ルータ)
+    pub gate_inp: TensorRef,
+    /// `blk.N.ffn_gate_inp.bias` — ne = [n_expert] (任意)
+    pub gate_inp_bias: Option<TensorRef>,
+    /// `blk.N.ffn_gate_shexp.weight` — ne = [n_embd, n_shared_ffn] (任意)
+    pub shexp_gate: Option<TensorRef>,
+    /// `blk.N.ffn_up_shexp.weight` — ne = [n_embd, n_shared_ffn] (任意)
+    pub shexp_up: Option<TensorRef>,
+    /// `blk.N.ffn_down_shexp.weight` — ne = [n_shared_ffn, n_embd] (任意)
+    pub shexp_down: Option<TensorRef>,
+}
+
+/// MoE モデルのメタデータ + 層ごとのテンソル。
+#[derive(Debug, Clone)]
+pub struct MoeLayout {
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub n_ffn: usize,
+    pub n_shared: usize,
+    pub n_shared_ffn: usize,
+    /// index = 層番号。エキスパートテンソルを持たない層 (dense 層) は None。
+    pub per_layer: Vec<Option<MoeExpertTensors>>,
+}
+
+impl GgufFile {
+    /// テンソル名から [`TensorRef`] を引く。
+    pub fn tensor_ref(&self, name: &str) -> Option<TensorRef> {
+        self.tensor(name).map(TensorRef::new)
+    }
+
+    /// 層数を返す。`<arch>.block_count` が無ければテンソル名 `blk.N.*` の
+    /// 最大 N + 1 から推定する (最小構成のテスト GGUF 用の保険)。
+    fn infer_layer_count(&self) -> usize {
+        let mut max = None;
+        for name in self.tensors.keys() {
+            let Some(rest) = name.strip_prefix("blk.") else { continue };
+            let Some((num, _)) = rest.split_once('.') else { continue };
+            if let Ok(n) = num.parse::<usize>() {
+                max = Some(max.map_or(n, |m: usize| m.max(n)));
+            }
+        }
+        max.map_or(0, |m| m + 1)
+    }
+
+    /// P-MOE-A1: MoE メタデータと層ごとのエキスパートテンソルを返す。
+    ///
+    /// 接頭辞は `general.architecture` の値 (`qwen35` など) を使う。仕様は
+    /// `<arch>.expert_count` など。`expert_count` / `expert_used_count` /
+    /// `expert_feed_forward_length` のいずれかが無ければ **dense とみなして
+    /// `None`** を返す (既存 dense 経路の判定を変えない)。
+    ///
+    /// 層ごとのテンソルが 4 本 (`ffn_{gate,up,down}_exps.weight` +
+    /// `ffn_gate_inp.weight`) 揃わない層は `per_layer[i] == None`。
+    /// 形状の妥当性検査 (n_embd / n_ffn / n_expert との一致) はここでは行わない
+    /// — 読解のみのタスクなので、値はそのまま返す。
+    pub fn moe_layout(&self) -> Option<MoeLayout> {
+        let arch = self
+            .metadata
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
+            .unwrap_or("qwen35");
+        let kv = |key: &str| {
+            self.metadata
+                .get(&format!("{arch}.{key}"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+        };
+
+        let n_expert = kv("expert_count").filter(|&n| n > 0)?;
+        let n_expert_used = kv("expert_used_count")?;
+        let n_ffn = kv("expert_feed_forward_length")?;
+        let n_shared = kv("expert_shared_count").unwrap_or(0);
+        let n_shared_ffn = kv("expert_shared_feed_forward_length").unwrap_or(0);
+        let n_layer = kv("block_count").unwrap_or_else(|| self.infer_layer_count());
+
+        let mut per_layer = Vec::with_capacity(n_layer);
+        for i in 0..n_layer {
+            let p = format!("blk.{i}.");
+            let get = |suffix: &str| self.tensor_ref(&format!("{p}{suffix}"));
+            let (Some(gate_exps), Some(up_exps), Some(down_exps), Some(gate_inp)) = (
+                get("ffn_gate_exps.weight"),
+                get("ffn_up_exps.weight"),
+                get("ffn_down_exps.weight"),
+                get("ffn_gate_inp.weight"),
+            ) else {
+                per_layer.push(None);
+                continue;
+            };
+            per_layer.push(Some(MoeExpertTensors {
+                gate_exps,
+                up_exps,
+                down_exps,
+                gate_inp,
+                gate_inp_bias: get("ffn_gate_inp.bias"),
+                shexp_gate: get("ffn_gate_shexp.weight"),
+                shexp_up: get("ffn_up_shexp.weight"),
+                shexp_down: get("ffn_down_shexp.weight"),
+            }));
+        }
+
+        Some(MoeLayout { n_expert, n_expert_used, n_ffn, n_shared, n_shared_ffn, per_layer })
+    }
 }
 
 #[cfg(test)]
