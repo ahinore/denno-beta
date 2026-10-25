@@ -2281,6 +2281,13 @@ impl Qwen35 {
         let mut buf_q: Vec<f32> = Vec::new();
         let mut buf_att: Vec<f32> = Vec::new();
 
+        // P58-3: リクエスト境界でスクラッチ arena を切り直す (prefill の一時
+        // バッファを 1 本の arena から切り出す)。中身は全て死んでいるので
+        // 古いチャンクを先に解放する = ピークが「旧 + 新」にならない。
+        // 数値には触らない (確保する場所だけが変わる)。
+        #[cfg(feature = "cuda")]
+        crate::cuda::pf_scratch_begin(n);
+
         // s165 (P2): 残差ストリーム (h) を層の間ずっとデバイスに置く経路。
         // 前提 (全層 q4・形・n の帯域・層別診断 OFF) が揃い、CH_PF_RES への
         // アップロードに成功したときだけ発動する。`pending` は「まだ残差に足して
