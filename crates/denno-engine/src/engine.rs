@@ -339,6 +339,11 @@ impl Engine {
                 ""
             }
         );
+        // P58-1: GPU KV ミラーの上限と実使用量 (起動時点は通常 0 エントリ) を
+        // 起動ログに 1 行残す。ミラーは初回リクエストで遅延生成されるため、
+        // ここで出るのは「上限 (DENNO_GPU_KV_MB) が実効いくつか」の確定値。
+        #[cfg(feature = "cuda")]
+        crate::cuda::log_gpu_kv_mirror_usage();
         let caches: Vec<KvCache> = (0..slots).map(|_| model.new_cache()).collect();
         let cached_prompts = vec![Vec::new(); slots];
         let slot_busy = vec![false; slots];
@@ -632,9 +637,16 @@ impl Engine {
                 output_tokens: sess.generated.len() as u32,
             });
         }
-        let Some(slot) = sess.slot.take() else { return };
-        self.slot_busy[slot] = false;
-        self.slot_reserved[slot] = 0;
+        if let Some(slot) = sess.slot.take() {
+            self.slot_busy[slot] = false;
+            self.slot_reserved[slot] = 0;
+        }
+        // P58-1: リクエスト完了ごとに GPU KV ミラーの実使用量を 1 行出す
+        // (VRAM 枯渇の再発時に「ミラーが何 MB 常駐していたか」を事後に追えるようにする)。
+        // スロット未取得 (admit 失敗) の経路でも出す — ミラーは既に他セッションが
+        // 保持していることがあり、その時の実使用量こそ知りたい値のため。
+        #[cfg(feature = "cuda")]
+        crate::cuda::log_gpu_kv_mirror_usage();
     }
 
     /// s146 (B8-3): クライアント向けエラー分類のために KV スロット数を読む
