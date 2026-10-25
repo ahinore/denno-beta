@@ -15112,7 +15112,7 @@ mod b20_stage1_tests {
     fn gdn_prefill_q4_geom_contract() {
         use crate::quant::{Linear, Q4Linear};
         let q4 = |k: usize, n: usize| {
-            Linear::Q4(Q4Linear { blocks: Vec::new(), k, n, uid: 0 })
+            Linear::Q4(Q4Linear { blocks: Vec::new().into(), k, n, uid: 0 })
         };
         // 成立する形: nk=2, nv=2, dk=dv=64, d_conv=4, e=64
         //   conv_dim = nk*dk*2 + nv*dv = 384, vd = nv*dv = 128
@@ -15205,7 +15205,7 @@ mod p14_ffn_fused_tests {
 
     fn q4(k: usize, n: usize, uid: u64) -> Q4Linear {
         // 形状だけを見るので blocks は空でよい (weights_for_q4 は呼ばない)。
-        Q4Linear { blocks: Vec::new(), k, n, uid }
+        Q4Linear { blocks: Vec::new().into(), k, n, uid }
     }
 
     #[test]
@@ -15349,7 +15349,7 @@ mod p3_alias_tests {
         let mut blocks = Vec::new();
         blocks.extend_from_slice(&q.blocks);
         blocks.extend_from_slice(&z.blocks);
-        let fused = Q4Linear { blocks, k, n: nq + nz, uid: next_q8_uid() };
+        let fused = Q4Linear { blocks: blocks.into(), k, n: nq + nz, uid: next_q8_uid() };
         // 行数の和が合わない連結 (前提不一致) → per-part (GPU 無しなので None)
         let short = Q4Linear { blocks: q.blocks.clone(), k, n: nq, uid: next_q8_uid() };
         assert!(chain_linear_q4_fused(&short, &[&q, &z], 0, 1, 1).is_none());
@@ -15526,7 +15526,7 @@ mod p2_residual_tests {
     use super::*;
 
     fn q4(k: usize, n: usize) -> crate::quant::Linear {
-        crate::quant::Linear::Q4(crate::quant::Q4Linear { blocks: Vec::new(), k, n, uid: 0 })
+        crate::quant::Linear::Q4(crate::quant::Q4Linear { blocks: Vec::new().into(), k, n, uid: 0 })
     }
     fn f32w(k: usize, n: usize) -> crate::quant::Linear {
         crate::quant::Linear::F32 { w: vec![0.0; k * n], k, n }

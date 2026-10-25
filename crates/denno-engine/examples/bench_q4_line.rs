@@ -73,7 +73,7 @@ fn main() {
             }
         }
         Q4Linear {
-            blocks,
+            blocks: blocks.into(),
             k,
             n,
             uid: next_q8_uid(),
