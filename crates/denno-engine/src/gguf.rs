@@ -182,10 +182,21 @@ impl GgufFile {
     /// 積み上がるので、ロード完了時に明示的に返す。ページは clean (読み取り専用)
     /// なので、次に触ったときにページキャッシュから再フォルトするだけで内容は
     /// 変わらない (数値・バイト列に影響しない)。
+    ///
+    /// memmap2 0.9.11 では `MADV_DONTNEED` は `Advice` ではなく
+    /// `UncheckedAdvice` にあり、`unchecked_advise` (unsafe) でしか呼べない。
     pub fn release_resident_pages(&self) -> Result<(), GgufError> {
-        self.mmap
-            .advise(memmap2::Advice::DontNeed)
-            .map_err(|e| GgufError(format!("madvise(DONTNEED): {e}")))
+        // SAFETY: `self.mmap` は `Mmap::map` が作る読み取り専用の共有ファイル写像で、
+        // この写像に対して書き込みを行う経路はプロセス内に存在しない (Mmap は
+        // `Deref<Target = [u8]>` のみで `&mut` を外に出さない)。`MADV_DONTNEED` は
+        // clean なファイルページを捨てるだけで、以降の読み出しは同じファイル内容から
+        // 再フォルトする。よって破棄後も参照先の内容は不変であり、
+        // 「解放済みページへの書き込みで UB」という前提がここでは成立しない。
+        unsafe {
+            self.mmap
+                .unchecked_advise(memmap2::UncheckedAdvice::DontNeed)
+                .map_err(|e| GgufError(format!("madvise(DONTNEED): {e}")))
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<&GgufValue> {
@@ -2534,5 +2545,55 @@ mod tests {
              (resident blocks, no pread; checksum {acc:.3})"
         );
         println!("[p42] VERDICT: EmbedTable::Q4Rows is BIT-IDENTICAL to the loader's f32 table ({checked} rows)");
+    }
+
+    /// P58D-FIX: `release_resident_pages` (`MADV_DONTNEED`) が実行時に成功し、
+    /// 破棄後も同じバイト列が読めることを合成 GGUF で確かめる。
+    ///
+    /// memmap2 0.9.11 では `MADV_DONTNEED` が `Advice` に無く `UncheckedAdvice`
+    /// (unsafe な `unchecked_advise`) 側にしかない。コンパイルが通るだけでは
+    /// 「その syscall が実際に Ok を返す」証拠にならないので、ここで呼ぶ。
+    /// あわせて advise 後の再読み出しが advise 前と 1 バイトも変わらないこと
+    /// (ページキャッシュからの再フォルトで内容が保たれること) を見る。
+    /// RSS は実測値を出すだけ (ページ単位の丸めで数十 KiB 揺れるため合否には
+    /// 使わない)。
+    #[test]
+    fn release_resident_pages_advise_succeeds_and_bytes_survive() {
+        let k = 4096usize;
+        let n = 4096usize; // 4096/32*18*4096 = 9.4 MB を実際に触る
+        let (blocks, _row_bytes) = p42_synth_blocks(k, n);
+        let dir = std::env::temp_dir().join(format!("denno_p58d_madv_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.gguf");
+        p42_write_gguf_q4(&path, "token_embd.weight", k, n, &blocks);
+
+        let f = GgufFile::open(&path).expect("合成 GGUF を開けない");
+        // 全ページを載せる (この時点で RSS に写像のページが乗る)
+        let before = f
+            .tensor_bytes("token_embd.weight")
+            .expect("tensor_bytes")
+            .to_vec();
+        let rss_before = rss_now_bytes();
+        f.release_resident_pages()
+            .expect("madvise(MADV_DONTNEED) が失敗した");
+        let rss_after = rss_now_bytes();
+        // advise 後の再読み出し (ページキャッシュから再フォルト) が同一
+        let after = f.tensor_bytes("token_embd.weight").expect("tensor_bytes");
+        assert_eq!(
+            before.as_slice(),
+            after,
+            "MADV_DONTNEED 後の再読み出しでバイト列が変わった"
+        );
+        if let (Some(b), Some(a)) = (rss_before, rss_after) {
+            println!(
+                "[p58d] touched {:.1} MB / VmRSS before {:.1} MB after {:.1} MB (drop {:.1} MB)",
+                before.len() as f64 / 1e6,
+                b as f64 / 1e6,
+                a as f64 / 1e6,
+                b.saturating_sub(a) as f64 / 1e6
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
