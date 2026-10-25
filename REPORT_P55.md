@@ -1,6 +1,6 @@
 # REPORT P55 — GDN pass 1 のローカル往復を消す (設計 + 実装)
 
-作業場所: `/work/denno-dev2` / branch `p55` / 親 commit `d4ee7d90`
+作業場所: branch `p55` / 親 commit `d4ee7d90`
 担当: dev2 (実装・CPU テスト・commit)。**GPU 実測・PTX 再生成・push はしていない。**
 
 ---

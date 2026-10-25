@@ -1,6 +1,6 @@
 # REPORT P53 — q4 GEMM の `full_oproj` / `full_qk` が遅い理由
 
-作業: `/work/denno-dev2` / branch `p53` (親 `d4ee7d90` = `sMain`)。
+作業: branch `p53` (親 `d4ee7d90` = `sMain`)。
 `.cu` は 1 行も触っていない (PTX 再生成は不要)。実測は行っていない (GPU 非搭載)。
 
 ## 0. 結論 (先に)

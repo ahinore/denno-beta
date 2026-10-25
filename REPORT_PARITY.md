@@ -55,7 +55,7 @@ CPU のみ・ネットワークなし・docker なし・GPU なし。`docs/histo
 
 ```
 $ python3 scripts/check_history_parity.py; echo EXIT=$?
-history parity: /work/denno-beta/docs/history
+history parity: docs/history
 PASS files                        ja 11 本 / en 11 本 / 11 対
 PASS 01_bootstrap.md headings     見出し 17/17 (ja/en)
 PASS 01_bootstrap.md table        表の行 9/9 (ja/en)
