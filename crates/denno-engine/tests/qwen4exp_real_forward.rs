@@ -379,7 +379,7 @@ fn real_model_dump_layers() {
 
     let prompt: Vec<u32> = vec![16, 10, 16, 14876, 30];
     let e = p.n_embd;
-    let hc = p.hc;
+    let hc = p.n_hc;
     let mut last: Vec<(usize, [f32; 3], Vec<f32>)> = Vec::new();
     for i in 0..prompt.len() {
         let ctx = &prompt[..=i];
