@@ -260,6 +260,33 @@ fn real_model_greedy_short_prompt() {
 }
 
 
+/// 参照実装 (llama.cpp `llama-cli -p "1+1は?" -n 4 --temp 0`) と同じ greedy 列を踏むか。
+///
+/// 2026-10-27 の実測: 参照は改行2つ, <think>, 改行1つ, The の 4 トークン
+/// (id 271, 248068, 198, 760)。PLE の conv 履歴を入れた時点で一致した。
+#[test]
+#[ignore]
+fn real_model_greedy_matches_llamacpp() {
+    let parts = match parts() {
+        Some(p) => p,
+        None => {
+            eprintln!("DENNO_Q4_DIR が無いので skip");
+            return;
+        }
+    };
+    let f = GgufFile::open_split(&parts).expect("分割 GGUF を開けない");
+    let p = Qwen4ExpParams::from_meta(&f).expect("メタデータを読めない");
+    let full = FullAttn::from_gguf(&f, &p, 32).expect("FullAttn");
+    let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
+    let m = Qwen4Exp::with_attn(&f, Box::new(attn)).expect("モデルを組めない");
+
+    let prompt: Vec<u32> = vec![16, 10, 16, 14876, 30];
+    let mut d = Qwen4ExpDecoder::new(m, DecoderConfig::new(32));
+    let out = d.decode_greedy(&prompt, 4).expect("decode が失敗した");
+    eprintln!("GREEDY {out:?}");
+    assert_eq!(out, vec![271u32, 248068, 198, 760]);
+}
+
 /// 実重みで各ステップの top-5 を出す（参照実装の `llama-simple` と突き合わせるため）。
 #[test]
 #[ignore]
