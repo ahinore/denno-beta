@@ -4,6 +4,7 @@ pub mod gpt2;
 pub mod hyper;
 pub mod indexer;
 pub mod llama;
+pub mod linear_gguf;
 pub mod moe;
 pub mod moe_expert;
 pub mod qwen35;
