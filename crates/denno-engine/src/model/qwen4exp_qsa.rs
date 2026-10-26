@@ -567,6 +567,7 @@ fn linear(f: &GgufFile, name: &str, k: usize, n: usize) -> Result<GgufLinear> {
     if let Some((file, off, len)) = f.tensor_mapping_parts(name) {
         if let Some(map) = f.mmap_handle_at(file) {
             return GgufLinear::new(ty, k, n, WeightBlocks::mapped(map, off, len))
+                .map(|l| l.with_fast_q8(true))
                 .with_context(|| format!("{name}: mmap ブロックから GgufLinear を作れない"));
         }
     }

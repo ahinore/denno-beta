@@ -18,7 +18,7 @@
 use anyhow::{bail, Result};
 
 use crate::kquant::{dequant_row_into, GgmlType};
-use crate::model::moe_expert::expert_gemv;
+use crate::model::moe_expert::{expert_gemv, expert_gemv_q8_fast};
 use crate::quant::WeightBlocks;
 
 /// 1 行のバイト数。`moe_expert::row_bytes` は量子型だけを受けるので、
@@ -39,6 +39,11 @@ pub struct GgufLinear {
     k: usize,
     n: usize,
     blocks: WeightBlocks,
+    /// Q8_0 のときだけ、AVX2 融合カーネルを使うか。
+    ///
+    /// 既定は false (27B の Q8_0 テンソル 1 本がビット一致契約の対象なので、
+    /// 明示的に選んだモデルだけ速い経路に載せる)。
+    fast_q8: bool,
 }
 
 impl GgufLinear {
@@ -64,7 +69,14 @@ impl GgufLinear {
             k,
             n,
             blocks,
+            fast_q8: false,
         })
+    }
+
+    /// Q8_0 の AVX2 融合カーネルを有効にする (ビット一致は保証しない)。
+    pub fn with_fast_q8(mut self, on: bool) -> Self {
+        self.fast_q8 = on;
+        self
     }
 
     /// スライスから作る (テスト・小さいテンソル用)。
@@ -119,6 +131,9 @@ impl GgufLinear {
                     ) {
                         return Ok(());
                     }
+                }
+                if self.fast_q8 && self.ty == GgmlType::Q8_0 {
+                    return expert_gemv_q8_fast(self.blocks.as_slice(), self.k, self.n, x, out);
                 }
                 expert_gemv(self.ty, self.blocks.as_slice(), self.k, self.n, x, out)
             }

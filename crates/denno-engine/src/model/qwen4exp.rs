@@ -1513,7 +1513,9 @@ fn linear(f: &GgufFile, name: &str) -> Result<GgufLinear> {
         .mmap_handle_at(file)
         .ok_or_else(|| one(format!("{name}: パート {file} の mmap が無い")))?;
     let blocks = WeightBlocks::mapped(map, off, len);
-    GgufLinear::new(t.ty, k, n, blocks).map_err(|e| one(format!("{name}: {e}")))
+    GgufLinear::new(t.ty, k, n, blocks)
+        .map(|l| l.with_fast_q8(true))
+        .map_err(|e| one(format!("{name}: {e}")))
 }
 
 /// F32 テンソルを f32 の Vec として読む (norm の gamma・conv の重み用)。
@@ -1592,6 +1594,16 @@ impl ExpertW {
             )));
         }
         Ok(&b[s.off..s.end()])
+    }
+
+    /// expert `e` のバイト範囲に先読みを投げる (mmap のページフォルトを先に起こす)。
+    fn prefetch(&self, e: usize) {
+        if let Ok(s) = ExpertSlice::new(self.ty, self.n_in, self.n_out, self.n_expert, e) {
+            let b = self.blocks.as_slice();
+            if s.end() <= b.len() {
+                crate::model::moe_expert::prefetch_range(&b[s.off..s.end()]);
+            }
+        }
     }
 
     /// `out[r] = dot(row_r, x)` を 1 expert ぶん計算する。
@@ -1929,6 +1941,10 @@ impl Qwen4Exp {
         let e = self.p.n_embd;
         let lw = &self.layers[il];
 
+        if q4prof::enabled() {
+            q4prof::N_LAYER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // 3.1 PLE 注入 (層 1 のみ)。res_hc を置き換える。
         if let Some(pw) = &lw.ple {
             let pe = ple_emb.ok_or_else(|| one(format!("層 {il}: PLE の行が無い")))?;
@@ -1941,6 +1957,7 @@ impl Qwen4Exp {
         }
 
         // 3.2-3.4 attention 入口 → attn → 出口
+        let t_mix = std::time::Instant::now();
         let (cur, inject) = hc_mix_quant(
             res,
             &lw.hc_attn_norm,
@@ -1949,9 +1966,12 @@ impl Qwen4Exp {
             Some(&lw.hc_attn_inject),
             hp,
         )?;
+        q4prof::add(&q4prof::MIX, t_mix);
         hook("hc_mixed_attn", il, &cur)?;
         hook("hc_inject_attn", il, &inject)?;
+        let t_attn = std::time::Instant::now();
         let cur = self.attn.forward(il, &cur)?;
+        q4prof::add(&q4prof::ATTN, t_attn);
         if cur.len() != e {
             return Err(one(format!(
                 "層 {il}: attention の出力長 {} が n_embd {e} と違う",
@@ -1963,6 +1983,7 @@ impl Qwen4Exp {
         hook("res_after_attn", il, &res.data)?;
 
         // 3.5-3.7 ffn 入口 → MoE FFN → 出口
+        let t_mix = std::time::Instant::now();
         let (cur, inject) = hc_mix_quant(
             res,
             &lw.hc_ffn_norm,
@@ -1971,8 +1992,11 @@ impl Qwen4Exp {
             Some(&lw.hc_ffn_inject),
             hp,
         )?;
+        q4prof::add(&q4prof::MIX, t_mix);
         hook("hc_mixed_ffn", il, &cur)?;
+        let t_moe = std::time::Instant::now();
         let cur = moe_ffn_quant(&self.p, lw, &cur)?;
+        q4prof::add(&q4prof::MOE, t_moe);
         hook("ffn_out", il, &cur)?;
         *res = hyper::hc_combine(res, &cur, &inject, hp);
         Ok(())
@@ -2185,6 +2209,59 @@ fn ple_inject(
     })
 }
 
+/// 層内フェーズ別の累積時間 (ns)。`DENNO_Q4_PROFILE=1` のときだけ加算する。
+///
+/// 27B の `DENNO_PROFILE` はこのモデルには配線されていないので、Flash-Next 用に
+/// 独立した軽量なカウンタを置く。GEMV の中ではなく層の区切りで測るため、
+/// 有効化しても各フェーズの内訳は見えるが内側の粒度は無い。
+pub mod q4prof {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub static PLE: AtomicU64 = AtomicU64::new(0);
+    pub static MIX: AtomicU64 = AtomicU64::new(0);
+    pub static ATTN: AtomicU64 = AtomicU64::new(0);
+    pub static MOE: AtomicU64 = AtomicU64::new(0);
+    pub static N_LAYER: AtomicU64 = AtomicU64::new(0);
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DENNO_Q4_PROFILE").is_some())
+    }
+
+    #[inline]
+    pub fn enabled() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(on)
+    }
+
+    #[inline]
+    pub fn add(c: &AtomicU64, t: std::time::Instant) {
+        if enabled() {
+            c.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// (ple, mix, attn, moe, 層数) をミリ秒で返す。
+    pub fn dump() -> (f64, f64, f64, f64, u64) {
+        let f = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e6;
+        (
+            f(&PLE),
+            f(&MIX),
+            f(&ATTN),
+            f(&MOE),
+            N_LAYER.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn reset() {
+        for c in [&PLE, &MIX, &ATTN, &MOE] {
+            c.store(0, Ordering::Relaxed);
+        }
+        N_LAYER.store(0, Ordering::Relaxed);
+    }
+}
+
 /// MoE FFN (参照実装 `build_layer_ffn` 1240-1285 行)。
 ///
 /// - ルータ: `ffn_gate_inp @ x` → softmax → top-k (`n_expert_used`) →
@@ -2218,6 +2295,14 @@ fn moe_ffn_quant(p: &Qwen4ExpParams, lw: &LayerW, x: &[f32]) -> Result<Vec<f32>>
     }
     for (t, &i) in sel.iter().enumerate() {
         weights[t] = probs[i] / sum;
+    }
+
+    // 3.5 選択 expert の重みを先に読み始める (I/O と計算を重ねる)。
+    //     1 トークンで 48 層 × 11 行列 × 921 KB を触るので、フォルト待ちが支配的になる。
+    for &ei in &sel {
+        lw.gate_exps.prefetch(ei);
+        lw.up_exps.prefetch(ei);
+        lw.down_exps.prefetch(ei);
     }
 
     // 4. 選択 expert を index 昇順に積む

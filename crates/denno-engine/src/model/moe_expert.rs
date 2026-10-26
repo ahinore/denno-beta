@@ -311,6 +311,42 @@ fn gemv_scalar_body(
     }
 }
 
+/// ページ単位に切り下げた範囲へ `MADV_WILLNEED` を投げる (非同期の先読み依頼)。
+///
+/// expert の重みは mmap 越しなので、初回のタッチはページフォルトになる。
+/// 1 トークンで触る expert の量は 487 MB (48 層 × 11 行列 × 921 KB) あり、
+/// フォルト待ちが forward の 9 割を占めていた (層 4594 ms のうち計算は 1.2 ms/層)。
+/// GEMV を回す前にまとめて投げると、I/O と計算が重なる。
+///
+/// Linux 以外・非 x86_64 では何もしない (戻り値も見ない。失敗しても遅くなるだけ)。
+pub fn prefetch_range(bytes: &[u8]) {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        // libc クレートを足さずに済むよう、必要な 1 本だけ宣言する。
+        extern "C" {
+            fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        const MADV_WILLNEED: i32 = 3; // linux/mman-common.h
+        const PAGE: usize = 4096;
+
+        if bytes.is_empty() {
+            return;
+        }
+        let start = bytes.as_ptr() as usize;
+        let aligned = start & !(PAGE - 1);
+        let len = (start - aligned) + bytes.len();
+        // SAFETY: `aligned` はページ境界で、`len` はその境界から元のスライス末尾まで。
+        // どちらも同じ mmap の読み取り専用写像の内側なので、範囲外を指さない。
+        unsafe {
+            madvise(aligned as *mut core::ffi::c_void, len, MADV_WILLNEED);
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let _ = bytes;
+    }
+}
+
 /// 1 expert ぶんの生バイト (`blocks`) に対する GEMV。`out[r] = dot(row_r, x)`。
 ///
 /// - `blocks` は [`ExpertSlice`] で切り出した 1 expert ぶん (`len` バイトちょうど)。
@@ -342,6 +378,87 @@ pub fn expert_gemv(
 
     gemv_scalar_body(ty, rb, blocks, n_in, n_out, x, out);
     Ok(())
+}
+
+/// Q8_0 (34 バイトブロック = 32 要素) の AVX2+FMA 融合カーネル。
+///
+/// ブロックは `d: f16` (2 バイト) + `qs: [i8; 32]`。行を f32 に開かず、i8 を 8 本ずつ
+/// f32 へ変換して FMA する。累積順が変わるのでスカラー経路とはビット一致しない
+/// (相対 1e-6 程度)。AVX2/FMA の判定は呼び出し側で行う。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_q8_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 34; // d(2) + qs(32)
+    let nb = n_in / 32; // 行あたりのブロック数
+    let rb = nb * BLK; // 行バイト数
+    let xp = x.as_ptr();
+    let bp = blocks.as_ptr();
+
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let dv = _mm256_set1_ps(d);
+            let q = p.add(2);
+            let lo = _mm_loadu_si128(q as *const __m128i);
+            let hi = _mm_loadu_si128(q.add(16) as *const __m128i);
+            let x0 = xp.add(b * 32);
+            let v0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo));
+            let v1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(lo)));
+            let v2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi));
+            let v3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(hi)));
+            a0 = _mm256_fmadd_ps(_mm256_mul_ps(v0, dv), _mm256_loadu_ps(x0), a0);
+            a1 = _mm256_fmadd_ps(_mm256_mul_ps(v1, dv), _mm256_loadu_ps(x0.add(8)), a1);
+            a0 = _mm256_fmadd_ps(_mm256_mul_ps(v2, dv), _mm256_loadu_ps(x0.add(16)), a0);
+            a1 = _mm256_fmadd_ps(_mm256_mul_ps(v3, dv), _mm256_loadu_ps(x0.add(24)), a1);
+        }
+        let s = _mm256_add_ps(a0, a1);
+        let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+        let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+        let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
+        out[r] = _mm_cvtss_f32(h);
+    }
+}
+
+/// Q8_0 の融合カーネルが使えるか (AVX2 + FMA の実行時判定)。
+pub fn q8_0_fused_supported() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Q8_0 専用の入口。融合カーネルが使えなければ [`expert_gemv`] へ落ちる。
+///
+/// [`expert_gemv`] から自動では呼ばない (27B の 1 本の Q8_0 テンソルが
+/// ビット一致契約の対象なので、使うモデル側が明示的に選ぶ)。
+pub fn expert_gemv_q8_fast(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    check_gemv_args(GgmlType::Q8_0, blocks, n_in, n_out, x, out)?;
+    if n_in % 32 == 0 && q8_0_fused_supported() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: 引数は check_gemv_args が検証済み (n_in%32==0 は直前で確認) で、
+            // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
+            unsafe { gemv_q8_0_avx2(blocks, n_in, n_out, x, out) };
+            return Ok(());
+        }
+    }
+    expert_gemv(GgmlType::Q8_0, blocks, n_in, n_out, x, out)
 }
 
 /// スカラー経路そのもの (`dequant_row_into` + [`dot_seq`])。**ビット一致の基準**。
@@ -821,6 +938,67 @@ mod tests {
             );
             // 融合経路はスカラー経路より悪化しない (丸め順が違うだけであることの確認)。
             // 係数 2 は「同じ f32 精度で、レーン分割により誤差が同程度以下」の意味。
+            assert!(
+                d_ft <= 2.0 * d_st + 1e-6,
+                "n_in={}: 融合の真値誤差 {:.3e} がスカラーの {:.3e} より大きすぎる",
+                n_in,
+                d_ft,
+                d_st
+            );
+        }
+    }
+
+    /// Q8_0 の融合カーネル (attention の投影が Q8_0 なので、こちらのほうが効く)。
+    #[test]
+    fn q8_0_fused_matches_scalar_within_tolerance() {
+        if !fused_ready("q8_0_fused_matches_scalar_within_tolerance") {
+            return;
+        }
+        // 256 = 8 ブロック/行、2560 = 実形状 (n_embd) の 80 ブロック/行
+        for (n_in, n_out) in [(256usize, 4usize), (PERF_N_IN, PERF_N_OUT)] {
+            let x = make_x_wide(n_in);
+            let blocks = make_expert(GgmlType::Q8_0, n_in, n_out, 0);
+            let mut fused = vec![0.0f32; n_out];
+            let mut scalar = vec![0.0f32; n_out];
+
+            expert_gemv_q8_fast(&blocks, n_in, n_out, &x, &mut fused).unwrap();
+            expert_gemv_scalar(GgmlType::Q8_0, &blocks, n_in, n_out, &x, &mut scalar).unwrap();
+
+            assert!(
+                scalar.iter().any(|v| *v != 0.0),
+                "n_in={}: スカラー出力が全 0 (比較が無意味)",
+                n_in
+            );
+
+            let rb = row_bytes(GgmlType::Q8_0, n_in).unwrap();
+            let (mut d_fs, mut d_ft, mut d_st) = (0.0f32, 0.0f32, 0.0f32);
+            for r in 0..n_out {
+                let w = dequant_row(GgmlType::Q8_0, &blocks[r * rb..(r + 1) * rb], n_in);
+                let mut acc = 0.0f64;
+                for i in 0..n_in {
+                    acc += w[i] as f64 * x[i] as f64;
+                }
+                let t = acc as f32;
+                let diff = (fused[r] - scalar[r]).abs();
+                d_fs = d_fs.max(diff);
+                d_ft = d_ft.max((fused[r] - t).abs());
+                d_st = d_st.max((scalar[r] - t).abs());
+                let tol = 1e-4 + 1e-5 * scalar[r].abs();
+                assert!(
+                    diff <= tol,
+                    "n_in={} row {}: 融合 {} とスカラー {} の差 {} が許容 {} を超える",
+                    n_in,
+                    r,
+                    fused[r],
+                    scalar[r],
+                    diff,
+                    tol
+                );
+            }
+            eprintln!(
+                "Q8_0 {} 行 x {} 列: 融合vsスカラー 最大絶対差 {:.3e} / f64真値との最大差 融合 {:.3e} スカラー {:.3e}",
+                n_out, n_in, d_fs, d_ft, d_st
+            );
             assert!(
                 d_ft <= 2.0 * d_st + 1e-6,
                 "n_in={}: 融合の真値誤差 {:.3e} がスカラーの {:.3e} より大きすぎる",

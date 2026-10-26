@@ -413,6 +413,19 @@ fn real_model_layer_timings() {
         sum,
         logits.len()
     );
+    // DENNO_Q4_PROFILE=1 のときだけ、層内フェーズの累積が出る。
+    let (ple, mix, attn, moe, n) = denno_engine::model::qwen4exp::q4prof::dump();
+    if n > 0 {
+        let per = |v: f64| v / n as f64;
+        eprintln!(
+            "PHASE ple {:.0} ms / mix {:.0} ms / attn {:.0} ms / moe {:.0} ms ({} 層)",
+            ple, mix, attn, moe, n
+        );
+        eprintln!(
+            "PHASE/層 ple {:.2} / mix {:.2} / attn {:.2} / moe {:.2} ms",
+            per(ple), per(mix), per(attn), per(moe)
+        );
+    }
 }
 
 
