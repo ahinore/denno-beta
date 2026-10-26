@@ -31,12 +31,19 @@
 //! 1 行のバイト列を [`crate::kquant::dequant_row_into`] (中身は
 //! `dequant_block` をブロック順に呼ぶだけ) に渡すと、行ごとの丸め順序は
 //! 表全体を 1 回でデコードした場合と同一になる。式は書き起こしていない。
+//!
+//! # P-MOE-E2: n-gram 索引
+//!
+//! 表引きに渡す行索引は [`PleNgram`] が計算する (参照実装
+//! `qwen4exp.cpp` の `llm_graph_input_qwen4exp_ple::set_input` と同じ規則)。
+//! 索引が 1 つでもずれると 28.80 GB の表から別の行を読むので、
+//! 剰余は u64 で取り、加算の後で i32 に落とす。
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
-use crate::gguf::{GgufFile, TensorRef};
+use crate::gguf::{GgufFile, GgufValue, TensorRef};
 use crate::kquant::{self, GgmlType};
 
 /// 1 回のまとめ読みの上限 (要件: 64 KiB を超えない)。
@@ -337,5 +344,282 @@ impl PleTable {
             i = j;
         }
         Ok(())
+    }
+}
+
+/// PLE 表のテンソル名 (行索引が指す先)。
+pub const PLE_TABLE_NAME: &str = "per_layer_token_embd.weight";
+
+/// n-gram 索引の異常値を弾くための上限。
+///
+/// 実ファイル (Qwen3.5-27B Flash-Next 系) は `n_gram = 3`, `n_heads = 16`。
+/// llama.cpp 側の `LLAMA_MAX_PLE_NGRAM` / `LLAMA_MAX_PLE_HEADS` は参照ツリーに
+/// 無いため、ここでは「明らかに壊れた値で巨大な Vec を確保しない」ための
+/// 独立した上限として置いている (参照実装の規則そのものではない)。
+const MAX_N_GRAM: usize = 32;
+const MAX_N_HEADS: usize = 4096;
+
+/// PLE の n-gram 索引計算 (参照実装 `qwen4exp.cpp` の `build_ple_indices` 相当)。
+///
+/// メタデータだけを保持する。表そのものは [`PleTable`] が持つ。
+#[derive(Debug, Clone)]
+pub struct PleNgram {
+    /// n-gram 長 (実ファイルは 3)
+    n_gram: usize,
+    /// 1 つの n-gram 長あたりのヘッド数 (実ファイルは 8)
+    per_gram: usize,
+    /// 文脈のカットに使う EOS トークン (実ファイルは 248044)
+    eos: u32,
+    /// 層ごとの乗数 (n_gram 個)
+    mult: Vec<u64>,
+    /// ヘッドごとの行オフセット (n_heads 個)
+    head_offsets: Vec<u32>,
+    /// ヘッドごとの語彙サイズ (n_heads 個)
+    head_vocab_sizes: Vec<u32>,
+}
+
+/// メタデータの整数 1 個。
+fn meta_u32(f: &GgufFile, key: &str) -> Result<u32> {
+    let v = match f.get(key) {
+        Some(v) => v,
+        None => return err(format!("{key}: メタデータに無い")),
+    };
+    let x = match v.as_u64() {
+        Some(x) => x,
+        None => return err(format!("{key}: 整数でない ({v:?})")),
+    };
+    u32::try_from(x).map_err(|_| PleError(format!("{key}: {x} が u32 に収まらない")))
+}
+
+/// メタデータの整数配列 (u64 として読む)。
+fn meta_u64_arr(f: &GgufFile, key: &str) -> Result<Vec<u64>> {
+    let v = match f.get(key) {
+        Some(v) => v,
+        None => return err(format!("{key}: メタデータに無い")),
+    };
+    let items = match v {
+        GgufValue::Arr(a) => a,
+        _ => return err(format!("{key}: 配列でない ({v:?})")),
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for (i, e) in items.iter().enumerate() {
+        match e.as_u64() {
+            Some(x) => out.push(x),
+            None => return err(format!("{key}[{i}]: 整数でない ({e:?})")),
+        }
+    }
+    Ok(out)
+}
+
+impl PleNgram {
+    /// GGUF のメタデータから n-gram 索引のパラメータを読む。
+    ///
+    /// キーの前置きは `general.architecture` の値 (実ファイルは `qwen4exp`)。
+    /// 検証する内容:
+    /// - 必須キーが存在し、型が合っていること
+    /// - `layer_multipliers` が `n_gram` 個、`head_offsets` / `head_vocab_sizes` が
+    ///   `n_heads = (n_gram - 1) * heads_per_ngram` 個であること
+    /// - 各ヘッドで `vocab != 0`、`offset + vocab` が i32 に収まること
+    ///   (行 index は i32 で gather に渡る)
+    /// - 表テンソルが同じ GGUF にあれば、`offset + vocab` がその行数以下で、
+    ///   次元が `embedding_length_per_layer_input` と一致すること
+    ///   (参照実装も同じ突き合わせをしている)
+    pub fn from_meta(f: &GgufFile) -> Result<Self> {
+        let arch = match f.get("general.architecture").and_then(|v| v.as_str()) {
+            Some(a) => a.to_string(),
+            None => return err("general.architecture: メタデータに無い"),
+        };
+        let key = |s: &str| format!("{arch}.{s}");
+
+        // PLE 層は 1 つだけ (参照実装も複数層を弾く)。
+        let layers = meta_u64_arr(f, &key("ple.layers"))?;
+        if layers.len() != 1 {
+            return err(format!(
+                "{}.ple.layers: {} 個あるが、対応するのは 1 個だけ",
+                arch,
+                layers.len()
+            ));
+        }
+
+        let n_gram = meta_u32(f, &key("ple.ngram_size"))? as usize;
+        let per_gram = meta_u32(f, &key("ple.heads_per_ngram"))? as usize;
+        let eos = meta_u32(f, &key("ple.eos_token_id"))?;
+        let n_dim = meta_u32(f, &key("embedding_length_per_layer_input"))? as usize;
+
+        if n_gram < 2 {
+            return err(format!("{arch}.ple.ngram_size: {n_gram} は 2 未満"));
+        }
+        if n_gram > MAX_N_GRAM {
+            return err(format!(
+                "{arch}.ple.ngram_size: {n_gram} は上限 {MAX_N_GRAM} を超える"
+            ));
+        }
+        if per_gram == 0 {
+            return err(format!("{arch}.ple.heads_per_ngram: 0 は不可"));
+        }
+        let n_heads = (n_gram - 1)
+            .checked_mul(per_gram)
+            .ok_or_else(|| PleError("n_heads がオーバーフロー".into()))?;
+        if n_heads == 0 || n_heads > MAX_N_HEADS {
+            return err(format!(
+                "{arch}.ple: n_heads = {n_heads} が範囲 [1, {MAX_N_HEADS}] の外"
+            ));
+        }
+        if n_dim == 0 {
+            return err(format!("{arch}.embedding_length_per_layer_input: 0 は不可"));
+        }
+
+        let mult = meta_u64_arr(f, &key("ple.layer_multipliers"))?;
+        let offsets = meta_u64_arr(f, &key("ple.head_offsets"))?;
+        let vocabs = meta_u64_arr(f, &key("ple.head_vocab_sizes"))?;
+        if mult.len() != n_gram {
+            return err(format!(
+                "{arch}.ple.layer_multipliers: {} 個 (n_gram = {n_gram} 個であるべき)",
+                mult.len()
+            ));
+        }
+        if offsets.len() != n_heads {
+            return err(format!(
+                "{arch}.ple.head_offsets: {} 個 (n_heads = {n_heads} 個であるべき)",
+                offsets.len()
+            ));
+        }
+        if vocabs.len() != n_heads {
+            return err(format!(
+                "{arch}.ple.head_vocab_sizes: {} 個 (n_heads = {n_heads} 個であるべき)",
+                vocabs.len()
+            ));
+        }
+
+        // ヘッド範囲 → u32 (i32 の行 index に収まること)。
+        let mut head_offsets = Vec::with_capacity(n_heads);
+        let mut head_vocab_sizes = Vec::with_capacity(n_heads);
+        let mut max_row = 0u64;
+        for h in 0..n_heads {
+            let (o, v) = (offsets[h], vocabs[h]);
+            if v == 0 {
+                return err(format!("{arch}.ple.head_vocab_sizes[{h}]: 0 は不可"));
+            }
+            let end = o
+                .checked_add(v)
+                .ok_or_else(|| PleError(format!("{arch}.ple: ヘッド {h} の offset + vocab がオーバーフロー")))?;
+            if end > i32::MAX as u64 {
+                return err(format!(
+                    "{arch}.ple: ヘッド {h} の範囲 {o}..{end} が i32 の行 index に収まらない"
+                ));
+            }
+            max_row = max_row.max(end);
+            head_offsets.push(o as u32);
+            head_vocab_sizes.push(v as u32);
+        }
+
+        // 表テンソルがあれば行数・次元を突き合わせる (合成 GGUF には無いことがある)。
+        if let Some(t) = f.tensor(PLE_TABLE_NAME) {
+            let rows = t.dims[1];
+            if rows < max_row {
+                return err(format!(
+                    "{PLE_TABLE_NAME}: 行数 {rows} がヘッド範囲の最大 {max_row} より少ない"
+                ));
+            }
+            if t.dims[0] != n_dim as u64 {
+                return err(format!(
+                    "{PLE_TABLE_NAME}: 次元 {} が embedding_length_per_layer_input {n_dim} と一致しない",
+                    t.dims[0]
+                ));
+            }
+        }
+
+        Ok(PleNgram {
+            n_gram,
+            per_gram,
+            eos,
+            mult,
+            head_offsets,
+            head_vocab_sizes,
+        })
+    }
+
+    /// ヘッド数 (n_gram - 1) * per_gram (実ファイルは 16)。
+    pub fn n_heads(&self) -> usize {
+        (self.n_gram - 1) * self.per_gram
+    }
+
+    /// n-gram 長 (実ファイルは 3)。
+    pub fn n_gram(&self) -> usize {
+        self.n_gram
+    }
+
+    /// 文脈カットに使う EOS トークン (実ファイルは 248044)。
+    pub fn eos(&self) -> u32 {
+        self.eos
+    }
+
+    /// `ctx` から行索引を計算する。
+    ///
+    /// `ctx` は **新しい順** (`ctx[0]` = 現在のトークン)。長さが `n_gram` 未満なら
+    /// 足りない古い側は EOS として扱う (参照実装では前トークンが
+    /// `LLAMA_TOKEN_NULL` になる場合に相当)。
+    ///
+    /// - `ctx[0]` は自分自身なのでカットしない (EOS でもカットしない)。
+    /// - `ctx[s]` (s >= 1) が EOS、または履歴に無い場合は s 以降をすべて EOS にする。
+    /// - `n = 2 ..= n_gram` のそれぞれで `mixed` を計算し直す (累積しない)。
+    /// - 戻り値の並びは `n = 2` の `per_gram` 個 → `n = 3` の `per_gram` 個 …
+    pub fn indices(&self, ctx: &[u32]) -> Result<Vec<i32>> {
+        if ctx.is_empty() {
+            return err("ctx が空 (現在のトークンが無い)");
+        }
+        // 実効文脈 (古い側を EOS で埋め、カットを反映したもの)。
+        let mut c = vec![self.eos; self.n_gram];
+        c[0] = ctx[0];
+        let mut cut = false;
+        for s in 1..self.n_gram {
+            let t = if cut {
+                self.eos
+            } else {
+                ctx.get(s).copied().unwrap_or(self.eos)
+            };
+            cut = cut || t == self.eos;
+            c[s] = if cut { self.eos } else { t };
+        }
+
+        let n_heads = self.n_heads();
+        let mut out = vec![0i32; n_heads];
+        for n in 2..=self.n_gram {
+            let mut mixed = (c[0] as u64).wrapping_mul(self.mult[0]);
+            for j in 1..n {
+                mixed ^= (c[j] as u64).wrapping_mul(self.mult[j]);
+            }
+            let base = (n - 2) * self.per_gram;
+            for g in 0..self.per_gram {
+                let h = base + g;
+                // 剰余は u64 で取る。加算の後に i32 へ落とす
+                // (from_meta で offset + vocab <= i32::MAX を検査済み)。
+                let row = mixed % self.head_vocab_sizes[h] as u64 + self.head_offsets[h] as u64;
+                debug_assert!(row <= i32::MAX as u64);
+                out[h] = row as i32;
+            }
+        }
+        Ok(out)
+    }
+
+    /// 索引 → [`PleTable::gather_rows`] → `n_heads * n_dim` の f32。
+    ///
+    /// 表の範囲外を指す索引は `gather_rows` がエラーにする (黙って 0 にしない)。
+    pub fn gather(&self, table: &PleTable, ctx: &[u32]) -> Result<Vec<f32>> {
+        let idx = self.indices(ctx)?;
+        let mut rows = Vec::with_capacity(idx.len());
+        for (h, &r) in idx.iter().enumerate() {
+            if r < 0 {
+                return err(format!("ヘッド {h} の行 index {r} が負"));
+            }
+            rows.push(r as u32);
+        }
+        let want = rows
+            .len()
+            .checked_mul(table.n_dim())
+            .ok_or_else(|| PleError("n_heads * n_dim がオーバーフロー".into()))?;
+        let mut out = vec![0f32; want];
+        table.gather_rows(&rows, &mut out)?;
+        Ok(out)
     }
 }
