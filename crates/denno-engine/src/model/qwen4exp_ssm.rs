@@ -35,6 +35,9 @@ use crate::gdn::{self, GdnCore, GdnParams, GdnState};
 use crate::gguf::GgufFile;
 use crate::kquant::GgmlType;
 use crate::model::linear_gguf::GgufLinear;
+use crate::model::qwen4exp::{
+    one, IdentityAttn, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams,
+};
 use crate::quant::WeightBlocks;
 
 /// ssm 層 1 本ぶんの重みと状態。
@@ -64,9 +67,16 @@ pub struct SsmLayer {
 }
 
 impl SsmLayer {
-    /// `blk.{il}.*` から読む。形状・型・本数の検査を全部ここで行い、欠けたら Err。
+    /// `blk.{il}.*` から読む。ハイパーパラメータは [`GdnParams::qwen4exp`] (実モデル) 固定。
     pub fn from_gguf(f: &GgufFile, il: usize) -> Result<Self> {
-        let p = GdnParams::qwen4exp();
+        Self::from_gguf_with(f, il, GdnParams::qwen4exp())
+    }
+
+    /// ハイパーパラメータを外から与えて `blk.{il}.*` から読む。
+    ///
+    /// 形状・型・本数の検査を全部ここで行い、欠けたら Err。
+    /// 実モデルでは [`gdn_params`] の導出値が [`GdnParams::qwen4exp`] と一致する。
+    pub fn from_gguf_with(f: &GgufFile, il: usize, p: GdnParams) -> Result<Self> {
         let name = |suffix: &str| format!("blk.{il}.{suffix}");
 
         let n_qkv = name("attn_qkv.weight");
@@ -259,4 +269,156 @@ fn dequant_exact(f: &GgufFile, name: &str, want: usize) -> Result<Vec<f32>> {
         bail!("{name}: 要素数 {} が期待 {want} と違う", v.len());
     }
     Ok(v)
+}
+
+// ---------------------------------------------------------------------------
+// P-MOE-F3: ssm 層を `LayerAttn` として層ループに接続する
+// ---------------------------------------------------------------------------
+
+/// [`Qwen4ExpParams`] (GGUF メタデータ) から GDN のハイパーパラメータを導出する。
+///
+/// 対応 (参照実装 `qwen4exp.cpp` の `load_arch_hparams` と同じ読み替え):
+/// - `embedding_length` → `n_embd`
+/// - `ssm.group_count` → `n_k_heads`
+/// - `ssm.time_step_rank` → `n_v_heads`
+/// - `ssm.state_size` → `head_k_dim`
+/// - `ssm.inner_size / ssm.time_step_rank` → `head_v_dim`
+/// - `ssm.conv_kernel` → `d_conv`
+///
+/// 実モデル (2560 / 16 / 48 / 128 / 6144 / 4 / 1e-6) では
+/// [`GdnParams::qwen4exp`] と同じ値になる (`tests/qwen4exp_layers.rs` で固定)。
+pub fn gdn_params(p: &Qwen4ExpParams) -> Result<GdnParams> {
+    if p.ssm_dt_rank == 0 {
+        bail!("qwen4exp.ssm.time_step_rank が 0 (head_v_dim を決められない)");
+    }
+    if p.ssm_d_inner % p.ssm_dt_rank != 0 {
+        bail!(
+            "qwen4exp.ssm.inner_size {} が time_step_rank {} で割り切れない",
+            p.ssm_d_inner,
+            p.ssm_dt_rank
+        );
+    }
+    let g = GdnParams {
+        n_embd: p.n_embd,
+        n_k_heads: p.ssm_n_group,
+        n_v_heads: p.ssm_dt_rank,
+        head_k_dim: p.ssm_d_state,
+        head_v_dim: p.ssm_d_inner / p.ssm_dt_rank,
+        d_conv: p.ssm_d_conv,
+        eps: p.rms_eps,
+    };
+    // 派生値どうしの突き合わせ (メタデータの 3 つの数が同じ次元を指していること)。
+    if g.key_dim() != p.ssm_key_dim() {
+        bail!(
+            "ssm key dim {} が state_size * group_count = {} と違う",
+            g.key_dim(),
+            p.ssm_key_dim()
+        );
+    }
+    if g.value_dim() != p.ssm_value_dim() {
+        bail!(
+            "ssm value dim {} が inner_size = {} と違う",
+            g.value_dim(),
+            p.ssm_value_dim()
+        );
+    }
+    if g.conv_dim() != p.ssm_conv_dim() {
+        bail!(
+            "conv dim {} が 2*key + value = {} と違う",
+            g.conv_dim(),
+            p.ssm_conv_dim()
+        );
+    }
+    Ok(g)
+}
+
+/// ssm 層を [`LayerAttn`] として回す。full attention 層は `full` に委譲する
+/// (F3 の既定は [`IdentityAttn`]。F4 が実装を差し替える)。
+///
+/// `layers[il]` が `Some` なら ssm 層 (`il % interval != interval-1`)、
+/// `None` なら full attention 層。状態 (`conv` / `ssm`) は層ごとに独立で、
+/// `forward` を呼ぶたびに 1 トークンぶん進む。
+pub struct SsmAttn {
+    layers: Vec<Option<SsmLayer>>,
+    full: Box<dyn LayerAttn>,
+}
+
+impl SsmAttn {
+    /// `p.layer_kind(il)` を見て ssm 層だけ [`SsmLayer`] を組む。
+    /// full attention 層は [`IdentityAttn`] に委譲する。
+    pub fn from_gguf(f: &GgufFile, p: &Qwen4ExpParams) -> Result<Self> {
+        Self::with_full(f, p, Box::new(IdentityAttn))
+    }
+
+    /// full attention 層の実装を差し替えて組む (F4 用)。
+    pub fn with_full(
+        f: &GgufFile,
+        p: &Qwen4ExpParams,
+        full: Box<dyn LayerAttn>,
+    ) -> Result<Self> {
+        let g = gdn_params(p)?;
+        let mut layers = Vec::with_capacity(p.n_layer);
+        for il in 0..p.n_layer {
+            let kind = p
+                .layer_kind(il)
+                .map_err(|e| anyhow::anyhow!("層 {il}: {e}"))?;
+            layers.push(match kind {
+                LayerKind::Ssm => Some(
+                    SsmLayer::from_gguf_with(f, il, g.clone())
+                        .with_context(|| format!("層 {il}: ssm 層を組めない"))?,
+                ),
+                LayerKind::FullAttn => None,
+            });
+        }
+        Ok(Self { layers, full })
+    }
+
+    /// 層ごとの種別 (組み上げた結果。テスト・診断用)。
+    pub fn kinds(&self) -> Vec<LayerKind> {
+        self.layers
+            .iter()
+            .map(|l| {
+                if l.is_some() {
+                    LayerKind::Ssm
+                } else {
+                    LayerKind::FullAttn
+                }
+            })
+            .collect()
+    }
+
+    /// ssm 層の本数 (= [`Qwen4ExpParams::n_ssm_layers`])
+    pub fn n_ssm(&self) -> usize {
+        self.layers.iter().filter(|l| l.is_some()).count()
+    }
+
+    /// full attention 層の本数 (= [`Qwen4ExpParams::n_full_attn_layers`])
+    pub fn n_full(&self) -> usize {
+        self.layers.iter().filter(|l| l.is_none()).count()
+    }
+
+    /// ssm 層の状態 (テスト・診断用)。full attention 層は `None`。
+    pub fn ssm_layer(&self, il: usize) -> Option<&SsmLayer> {
+        self.layers.get(il).and_then(|l| l.as_ref())
+    }
+}
+
+impl LayerAttn for SsmAttn {
+    fn forward(
+        &mut self,
+        layer: usize,
+        cur: &[f32],
+    ) -> std::result::Result<Vec<f32>, Qwen4ExpError> {
+        let n = self.layers.len();
+        match self.layers.get_mut(layer) {
+            None => Err(one(format!(
+                "SsmAttn::forward: 層 {layer} は範囲外 (層数 {n})"
+            ))),
+            Some(Some(s)) => s
+                .forward_token(cur)
+                // anyhow の文脈を 1 行に畳む (`{:#}` は "外側: 内側" を連結する)
+                .map_err(|e| Qwen4ExpError(vec![format!("層 {layer}: {e:#}")])),
+            Some(None) => self.full.forward(layer, cur),
+        }
+    }
 }

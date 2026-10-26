@@ -68,7 +68,9 @@ impl std::error::Error for Qwen4ExpError {}
 
 type Result<T> = std::result::Result<T, Qwen4ExpError>;
 
-fn one(msg: impl Into<String>) -> Qwen4ExpError {
+/// 1 件だけのエラー。`model::qwen4exp_ssm` の [`crate::model::qwen4exp::LayerAttn`]
+/// 実装からも使う (`pub(crate)`)。
+pub(crate) fn one(msg: impl Into<String>) -> Qwen4ExpError {
     Qwen4ExpError(vec![msg.into()])
 }
 
