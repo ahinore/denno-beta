@@ -128,13 +128,19 @@ struct GgufPart {
     mmap: std::sync::Arc<Mmap>,
     /// テンソルデータ部の **このファイル内** 開始位置
     data_start: u64,
+    /// このパートのファイルパス (P-MOE-C1: mmap を通さない `pread` 読み用)。
+    path: std::path::PathBuf,
 }
 
 impl GgufPart {
     fn map(path: &Path) -> Result<Self, GgufError> {
         let file = File::open(path).map_err(|e| GgufError(format!("open {path:?}: {e}")))?;
         let mmap = unsafe { Mmap::map(&file).map_err(|e| GgufError(format!("mmap {path:?}: {e}")))? };
-        Ok(GgufPart { mmap: std::sync::Arc::new(mmap), data_start: 0 })
+        Ok(GgufPart {
+            mmap: std::sync::Arc::new(mmap),
+            data_start: 0,
+            path: path.to_path_buf(),
+        })
     }
 }
 
@@ -314,6 +320,15 @@ impl GgufFile {
     /// split GGUF の `file` 番目のパートの mmap ハンドル。
     pub fn mmap_handle_at(&self, file: usize) -> Option<std::sync::Arc<Mmap>> {
         self.parts.get(file).map(|p| std::sync::Arc::clone(&p.mmap))
+    }
+
+    /// P-MOE-C1: `file` 番目のパートのファイルパス。
+    ///
+    /// mmap を通さずに `pread` で行単位の読みだけを行いたい呼び出し
+    /// ([`crate::ple::PleTable`]) 用。パスは `open` / `open_split` に渡したものが
+    /// そのまま入っている。
+    pub fn path_at(&self, file: usize) -> Option<&Path> {
+        self.parts.get(file).map(|p| p.path.as_path())
     }
 
     /// P58-5: テンソルのデータが mmap 内で占める**絶対範囲** `(off, len)`。
