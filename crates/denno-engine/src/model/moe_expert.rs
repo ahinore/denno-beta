@@ -1,5 +1,12 @@
 //! MoE expert のスライス切り出しと GEMV (P-MOE-B1)。
 //!
+//! 出典: expert テンソルの配置 (`ne = [n_in, n_out, n_expert]`) と量子型の使い分けは
+//! llama.cpp `src/models/qwen4exp.cpp` (commit `d854d98`、2026-10-26 取得、
+//! MIT License, Copyright (c) 2023-2026 The ggml authors) を参照した。
+//! 本ファイルは Rust による再実装であり、逐語コピーは含まない。
+//! 行のデコードは本リポジトリの `kquant.rs` (同じく MIT 由来) を再利用している。
+//! ライセンス台帳は `docs/history/80_licenses.md`。
+//!
 //! Flash-Next 系の expert テンソルは GGUF 上で 3 次元 (`ne = [n_in, n_out, n_expert]`、
 //! ne[0] が最内 = 行長) で、1 ファイルに全 expert ぶんが連結されている。
 //! 1 トークンで使うのは各層 top-k 個だけなので、expert 単位でバイト範囲を切り出して

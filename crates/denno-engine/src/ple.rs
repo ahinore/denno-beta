@@ -1,5 +1,12 @@
 //! P-MOE-C1: PLE (n-gram 埋め込み表) の SSD 常駐行 gather。
 //!
+//! 出典: n-gram 索引の数式 (トークン列からのハッシュと行番号の決め方) は
+//! llama.cpp `src/models/qwen4exp.cpp` (commit `d854d98`、2026-10-26 取得、
+//! MIT License, Copyright (c) 2023-2026 The ggml authors) を参照した。
+//! 本ファイルは Rust による再実装であり、逐語コピーは含まない。
+//! 行のデコードは本リポジトリの `kquant.rs` (同じく MIT 由来) を再利用している。
+//! ライセンス台帳は `docs/history/80_licenses.md`。
+//!
 //! Flash-Next の `per_layer_token_embd.weight` は IQ4_NL で 28.80 GB
 //! (`[160, 320001536]` = 3.2 億行 × 160 次元)。VRAM にも RAM にも常駐させず、
 //! 必要な行だけを要求時に読んで f32 へ展開する。

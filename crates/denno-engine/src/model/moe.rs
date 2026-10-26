@@ -1,5 +1,11 @@
 //! MoE (Mixture-of-Experts) の CPU 参照実装 (P-MOE-A2)。
 //!
+//! 出典: ルーティングの演算順序 (softmax -> top-k -> 再正規化 -> shared expert の加算) は
+//! llama.cpp `src/models/qwen4exp.cpp` (commit `d854d98`、2026-10-26 取得、
+//! MIT License, Copyright (c) 2023-2026 The ggml authors) を参照した。
+//! 本ファイルは Rust による再実装であり、逐語コピーは含まない。
+//! ライセンス台帳は `docs/history/80_licenses.md`。
+//!
 //! Qwen3.8-Flash-Next 型 (多数の expert / top-k ルーティング / shared expert) を
 //! **f32 の逐次演算だけ**で計算する参照実装。GPU カーネル側とビット一致させる
 //! 基準になるので、加算順序を固定し、f64 を使わず、並列化もしない
