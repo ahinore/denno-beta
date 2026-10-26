@@ -557,6 +557,9 @@ pub struct FullAttn {
     layers: Vec<Option<AttnLayer>>,
     cache: AttnCache,
     pos: usize,
+    /// full attention 層ごとに「このトークンで既に積んだか」。同じ層を 1 トークンで
+    /// 二度通したときに黙って二重 push しないための番人。全層が揃ったら false に戻す。
+    pushed: Vec<bool>,
 }
 
 impl FullAttn {
@@ -589,11 +592,13 @@ impl FullAttn {
             );
         }
         let cache = AttnCache::new(p.n_layer, p.n_head_kv, p.n_embd_head_k, max_ctx)?;
+        let layers_len = layers.len();
         Ok(Self {
             n_embd: p.n_embd,
             layers,
             cache,
             pos: 0,
+            pushed: vec![false; layers_len],
         })
     }
 
@@ -622,6 +627,7 @@ impl FullAttn {
     pub fn reset(&mut self) {
         self.cache.clear_all();
         self.pos = 0;
+        self.pushed.iter_mut().for_each(|b| *b = false);
     }
 
     /// [`LayerAttn::forward`] の anyhow 版 (テストと F5 の合成から使う)。
@@ -644,20 +650,18 @@ impl FullAttn {
         if len != pos {
             bail!("FullAttn::forward: 層 {layer} のキャッシュ長 {len} が pos {pos} と違う");
         }
+        if self.pushed[layer] {
+            bail!("FullAttn::forward: 層 {layer} はこのトークン (pos {pos}) で既に積んである");
+        }
         let l = self.layers[layer].as_mut().expect("上の is_none で除外済み");
         let out = l.forward_token(cur, &mut self.cache, layer, pos)?;
+        self.pushed[layer] = true;
         // 位置は 1 トークンにつき 1 回だけ進める。full attention 層は 1 トークンで
-        // 12 本ぶん呼ばれるので、全層のキャッシュが pos+1 に揃ったときだけ進める。
-        let next = pos + 1;
-        let mut all = true;
-        for il in 0..self.layers.len() {
-            if self.layers[il].is_some() && self.cache.len(il)? != next {
-                all = false;
-                break;
-            }
-        }
+        // 12 本ぶん呼ばれるので、全層が揃ったときだけ進める。
+        let all = (0..self.layers.len()).all(|il| self.layers[il].is_none() || self.pushed[il]);
         if all {
-            self.pos = next;
+            self.pos = pos + 1;
+            self.pushed.iter_mut().for_each(|b| *b = false);
         }
         Ok(out)
     }
