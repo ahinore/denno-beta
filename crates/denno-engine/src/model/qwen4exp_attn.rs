@@ -646,6 +646,8 @@ impl FullAttn {
             bail!("FullAttn::forward: 層 {layer} は ssm 層で full attention の担当外 (F5 で合成する)");
         }
         let pos = self.pos;
+        // 番人を先に見る。二重 push のときはキャッシュ長が pos+1 になるので、
+        // 長さの検査を先に置くと「既に積んである」が影に隠れてしまう。
         if self.pushed[layer] {
             bail!("FullAttn::forward: 層 {layer} はこのトークン (pos {pos}) で既に積んである");
         }
