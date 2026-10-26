@@ -17,6 +17,7 @@ pub mod prof;
 pub mod quant;
 pub mod sampler;
 pub mod tensor;
+pub mod tok_gguf;
 pub mod tokenizer;
 pub mod toolmask;
 
