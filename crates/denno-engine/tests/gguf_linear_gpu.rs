@@ -14,6 +14,7 @@ mod gpu {
     const F16_0_1: [u8; 2] = [0x66, 0x2E];
     const F16_0_05: [u8; 2] = [0xCD, 0x2C];
 
+    /// (1 ブロックのバイト数, 先頭で f16 を潰すバイト数)。
     fn block_geo(ty: GgmlType) -> (usize, usize) {
         match ty {
             GgmlType::Q8_0 => (34, 2),
@@ -29,6 +30,7 @@ mod gpu {
         let bs = ty.blck_size();
         let ts = ty.type_size();
         assert_eq!(k % bs, 0);
+        assert_eq!(ts, block_geo(ty).0, "ブロックのバイト数が kquant と違う");
         let nb = k / bs;
         let mut s = seed | 1;
         let mut next = move || {
@@ -38,11 +40,12 @@ mod gpu {
             s
         };
         let mut w: Vec<u8> = (0..n * nb * ts).map(|_| (next() >> 24) as u8).collect();
-        let (_, hdr) = block_geo(ty);
+        let (ts_blk, hdr) = block_geo(ty);
         let rb = nb * ts;
         for r in 0..n {
             for b in 0..nb {
-                let o = r * rb + b * bs;
+                // バイト位置は「ブロックのバイト数」で進める (要素数ではない)。
+                let o = r * rb + b * ts_blk;
                 w[o..o + 2].copy_from_slice(&F16_0_1);
                 if hdr == 4 {
                     w[o + 2..o + 4].copy_from_slice(&F16_0_05);
