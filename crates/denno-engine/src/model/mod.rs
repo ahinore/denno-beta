@@ -2,6 +2,7 @@
 
 pub mod gpt2;
 pub mod hyper;
+pub mod indexer;
 pub mod llama;
 pub mod moe;
 pub mod moe_expert;
