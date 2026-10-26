@@ -44,7 +44,7 @@
 //!   LRU の通し番号が競合する)。スレッドごとに 1 個持つこと。
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
@@ -298,4 +298,290 @@ fn read_into(src: &mut dyn PreadAt, off: u64, dst: &mut [u8]) -> Result<usize> {
         );
     }
     Ok(n)
+}
+
+// ---------------------------------------------------------------------------
+// P-MOE-G1: 3 行列ぶんの束 (forward 経路への配線)
+// ---------------------------------------------------------------------------
+
+/// `DENNO_EXPERT_CACHE_MB`: expert キャッシュに使う MB。**既定 0 = 無効**
+/// (このとき forward は今までどおり mmap + `prefetch()` の経路を通る)。
+pub const EXPERT_CACHE_MB_ENV: &str = "DENNO_EXPERT_CACHE_MB";
+
+/// `DENNO_EXPERT_CACHE_STATS=1`: デコーダを落とすときに行列ごとの統計を
+/// stderr へ 1 行ずつ出す。未設定・"0"・その他の値では何も出さない。
+pub const EXPERT_CACHE_STATS_ENV: &str = "DENNO_EXPERT_CACHE_STATS";
+
+/// `DENNO_EXPERT_CACHE_MB` の解釈。未設定・空・"0"・数値でない値は 0 (無効)。
+pub fn mb_from_env() -> usize {
+    parse_mb(std::env::var(EXPERT_CACHE_MB_ENV).ok().as_deref())
+}
+
+/// [`mb_from_env`] の純粋部分 (環境変数を触らないのでテストできる)。
+fn parse_mb(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(s) if !s.is_empty() && s != "0" => s.parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// MB からスロット数を出す (`MB * 1024 * 1024 / slot_bytes` の切り捨て、最低 1)。
+///
+/// `mb == 0` は「無効」なので呼ばない ([`ExpertCacheSet::from_mb`] の前提)。
+/// `slot_bytes == 0` はスロットとして意味を持たないので 1 に寄せる。
+pub fn slots_for_mb(mb: usize, slot_bytes: usize) -> usize {
+    if slot_bytes == 0 {
+        return 1;
+    }
+    (mb.saturating_mul(1024 * 1024) / slot_bytes).max(1)
+}
+
+/// expert 行列の種別 (統計を分けて出す単位)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExpertMatrix {
+    Gate,
+    Up,
+    Down,
+}
+
+impl ExpertMatrix {
+    pub const ALL: [ExpertMatrix; 3] = [ExpertMatrix::Gate, ExpertMatrix::Up, ExpertMatrix::Down];
+
+    /// 統計行に出す名前 (`ffn_gate_exps` の短縮)。
+    pub fn name(self) -> &'static str {
+        match self {
+            ExpertMatrix::Gate => "gate",
+            ExpertMatrix::Up => "up",
+            ExpertMatrix::Down => "down",
+        }
+    }
+
+    /// 配列の添字。
+    pub fn index(self) -> usize {
+        match self {
+            ExpertMatrix::Gate => 0,
+            ExpertMatrix::Up => 1,
+            ExpertMatrix::Down => 2,
+        }
+    }
+}
+
+/// 1 本ぶんのキャッシュ指定。`slot_bytes` は**その行列の最大 expert** の
+/// バイト数 ([`crate::model::moe_expert::ExpertSlice::new`] の `len`)。
+#[derive(Clone, Copy, Debug)]
+pub struct CacheSpec {
+    pub slot_bytes: usize,
+}
+
+/// gate / up / down の 3 本をまとめたキャッシュ (forward 経路から使う口)。
+///
+/// 3 本を別々に持つのは、行列ごとに expert のバイト数が違う (Q4_K の gate/up
+/// 921,600 B、Q5_1 の down 1,228,800 B) ため。`slot_bytes` を共有すると
+/// 小さい行列で無駄が出る。
+///
+/// 鍵は [`ExpertKey`] の `(layer, expert)` なので、層をまたいで 1 本の LRU を
+/// 共有する (同じ expert が同じ層で再要求されたときだけヒットする)。
+///
+/// 読み口は **GGUF のパートごと**に 1 本持つ。split GGUF では層によって
+/// expert テンソルの属するファイルが変わるので、1 本では足りない。
+///
+/// **常駐量は 3 倍**: `DENNO_EXPERT_CACHE_MB` は行列ごとの上限なので、
+/// 3 本あわせた常駐は約 `3 * MB` MiB になる (MB = 1024 なら約 3 GiB)。
+///
+/// [`Drop`] は `DENNO_EXPERT_CACHE_STATS=1` のときだけ 3 行を stderr に出す。
+pub struct ExpertCacheSet {
+    mb: usize,
+    caches: [ExpertCache; 3],
+    readers: Vec<FileReader>,
+}
+
+impl ExpertCacheSet {
+    /// 3 本ぶんのキャッシュを作る。`specs` の順は [`ExpertMatrix::ALL`] と同じ。
+    ///
+    /// スロット数は行列ごとに `MB * 1024 * 1024 / slot_bytes` (切り捨て・最低 1)。
+    /// `slot_bytes` は**その行列の最大 expert** でなければならない
+    /// (小さいと [`ExpertCache::get`] が `len > slot_bytes` で落ちる = 静かに
+    /// 切り詰めない)。`paths` は GGUF のパート 0..n の順。
+    pub fn from_mb(mb: usize, specs: [CacheSpec; 3], paths: &[PathBuf]) -> Result<Self> {
+        let slots = [
+            slots_for_mb(mb, specs[0].slot_bytes),
+            slots_for_mb(mb, specs[1].slot_bytes),
+            slots_for_mb(mb, specs[2].slot_bytes),
+        ];
+        let bytes = [
+            specs[0].slot_bytes,
+            specs[1].slot_bytes,
+            specs[2].slot_bytes,
+        ];
+        Self::new_with_slots(slots, bytes, paths, mb)
+    }
+
+    /// スロット数を直接指定して作る (`slots == 0` も許す = 毎回 pread して
+    /// キャッシュしない動作)。[`ExpertCacheSet::from_mb`] の下請け。
+    pub fn new_with_slots(
+        slots: [usize; 3],
+        slot_bytes: [usize; 3],
+        paths: &[PathBuf],
+        mb: usize,
+    ) -> Result<Self> {
+        if paths.is_empty() {
+            bail!("expert キャッシュ: GGUF のパートが 0 本 (読み口を作れない)");
+        }
+        let mut readers = Vec::with_capacity(paths.len());
+        for p in paths {
+            readers.push(FileReader::open(p)?);
+        }
+        Ok(ExpertCacheSet {
+            mb,
+            caches: [
+                ExpertCache::new(slots[0], slot_bytes[0]),
+                ExpertCache::new(slots[1], slot_bytes[1]),
+                ExpertCache::new(slots[2], slot_bytes[2]),
+            ],
+            readers,
+        })
+    }
+
+    /// 設定された MB (0 は作れない = `from_mb` を呼ばない前提)。
+    pub fn mb(&self) -> usize {
+        self.mb
+    }
+
+    /// 行列ごとのスロット数。
+    pub fn slots(&self, m: ExpertMatrix) -> usize {
+        self.caches[m.index()].slots()
+    }
+
+    /// 行列ごとの 1 スロットのバイト数。
+    pub fn slot_bytes(&self, m: ExpertMatrix) -> usize {
+        self.caches[m.index()].slot_bytes()
+    }
+
+    /// 行列 `m` の expert 生バイトを返す。
+    ///
+    /// `part` は GGUF のパート番号 ([`crate::gguf::GgufFile::tensor_mapping_parts`]
+    /// の 1 番目の戻り値)、`off` は**そのファイル内の絶対オフセット**。
+    pub fn get(
+        &mut self,
+        m: ExpertMatrix,
+        part: usize,
+        key: ExpertKey,
+        off: u64,
+        len: usize,
+    ) -> Result<&[u8]> {
+        let n = self.readers.len();
+        if part >= n {
+            bail!("expert キャッシュ: パート {part} が範囲外 ({n} 本)");
+        }
+        let ExpertCacheSet { caches, readers, .. } = self;
+        caches[m.index()].get(key, off, len, &mut readers[part])
+    }
+
+    /// 行列ごとの統計。
+    pub fn stats(&self, m: ExpertMatrix) -> CacheStats {
+        self.caches[m.index()].stats()
+    }
+
+    /// 行列ごとのヒット率 (要求が 0 件なら 0.0)。
+    pub fn hit_rate(&self, m: ExpertMatrix) -> f64 {
+        let s = self.stats(m);
+        let n = s.hits + s.misses;
+        if n == 0 {
+            0.0
+        } else {
+            s.hits as f64 / n as f64
+        }
+    }
+
+    /// 1 行列ぶんの統計行 (`DENNO_EXPERT_CACHE_STATS=1` の出力そのもの)。
+    pub fn report(&self, m: ExpertMatrix) -> String {
+        let s = self.stats(m);
+        format!(
+            "expert_cache {}: slots={} slot_bytes={} hits={} misses={} hit_rate={:.3} \
+             bytes_read={} evictions={}",
+            m.name(),
+            self.slots(m),
+            self.slot_bytes(m),
+            s.hits,
+            s.misses,
+            self.hit_rate(m),
+            s.bytes_read,
+            s.evictions
+        )
+    }
+}
+
+impl Drop for ExpertCacheSet {
+    fn drop(&mut self) {
+        let on = std::env::var(EXPERT_CACHE_STATS_ENV)
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        if !on {
+            return;
+        }
+        for m in ExpertMatrix::ALL {
+            eprintln!("{}", self.report(m));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mb_accepts_only_positive_integers() {
+        // 未設定・空・"0"・数値でない値は 0 (無効)
+        assert_eq!(parse_mb(None), 0);
+        assert_eq!(parse_mb(Some("")), 0);
+        assert_eq!(parse_mb(Some("  ")), 0);
+        assert_eq!(parse_mb(Some("0")), 0);
+        assert_eq!(parse_mb(Some("off")), 0);
+        assert_eq!(parse_mb(Some("-1")), 0);
+        // 有効値
+        assert_eq!(parse_mb(Some("1")), 1);
+        assert_eq!(parse_mb(Some("4096")), 4096);
+        assert_eq!(parse_mb(Some(" 512 ")), 512);
+    }
+
+    #[test]
+    fn slots_for_mb_floors_and_keeps_at_least_one() {
+        let mb = 1024 * 1024; // 1 MiB
+        assert_eq!(slots_for_mb(1, mb), 1);
+        assert_eq!(slots_for_mb(4, mb), 4);
+        // 端数は切り捨て
+        assert_eq!(slots_for_mb(1, mb / 3), 3);
+        assert_eq!(slots_for_mb(1, mb * 4), 1, "1 スロット未満でも 1 に寄せる");
+        assert_eq!(slots_for_mb(1, 0), 1, "slot_bytes 0 でも 1 に寄せる");
+        // 実モデルの最大 expert (Q5_1 down = 1,228,800 B) で溢れない
+        let down = 1_228_800usize;
+        assert_eq!(slots_for_mb(4096, down), 4096 * 1024 * 1024 / down);
+        // usize を溢れる MB でも panic しない (飽和)
+        assert!(slots_for_mb(usize::MAX, 1) > 0);
+    }
+
+    #[test]
+    fn matrix_names_and_indexes_are_distinct() {
+        assert_eq!(ExpertMatrix::Gate.name(), "gate");
+        assert_eq!(ExpertMatrix::Up.name(), "up");
+        assert_eq!(ExpertMatrix::Down.name(), "down");
+        let mut idx: Vec<usize> = ExpertMatrix::ALL.iter().map(|m| m.index()).collect();
+        idx.sort_unstable();
+        assert_eq!(idx, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn hit_rate_of_empty_cache_is_zero() {
+        // 要求が 0 件でも 0 除算しない
+        let dir = std::env::temp_dir().join("denno_expert_cache_set_empty");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("dummy.bin");
+        std::fs::write(&p, [0u8; 32]).expect("temp file");
+        let set = ExpertCacheSet::new_with_slots([1, 1, 1], [16, 16, 16], &[p], 1).expect("set");
+        assert_eq!(set.hit_rate(ExpertMatrix::Gate), 0.0);
+        assert!(set.report(ExpertMatrix::Gate).contains("hit_rate=0.000"));
+        assert_eq!(set.slots(ExpertMatrix::Down), 1);
+        assert_eq!(set.mb(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
