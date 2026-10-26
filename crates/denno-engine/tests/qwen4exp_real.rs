@@ -1,36 +1,33 @@
 //! Flash-Next の**実データ**で GPU GEMV のビット一致を見る。
 //!
-//! 合成した重みでの一致は `moe_gpu` / `gguf_linear_gpu` が見ている。ここは
-//! 実ファイルの量子化ブロック (Q4_K / Q5_1 / Q8_0) をそのまま使って、
-//! 「量子化の端ケース (符号・最大値・非正規化)」で CPU と GPU が同じ値を返すかを見る。
+//! 合成した重みでの一致は `moe_gpu` / `gguf_linear_gpu` が見ている。ここは実ファイルの
+//! 量子化ブロック (Q4_K / Q5_K / Q5_1 / Q8_0) をそのまま使い、量子化の端 (符号・最大値・
+//! 非正規化) でも CPU と GPU が同じ値を返すかを見る。
+//!
+//! モデル (111 GB) は GPU コンテナに mount されていないため、必要な 1 expert ぶんの
+//! 生バイトを事前に切り出しておく (`q4_probe.py`)。probe ディレクトリの `manifest.tsv` を
+//! 読み、各行 (file, ty, k, n, e) について CPU 参照と GPU のビット一致を確かめる。
 //!
 //! 実行:
-//!   DENNO_Q4_DIR=<分割 GGUF のあるディレクトリ> DENNO_CUDA=1 \
+//!   DENNO_Q4_PROBE=<probe ディレクトリ> DENNO_CUDA=1 \
 //!     cargo test --release --features cuda --test qwen4exp_real -- --ignored --test-threads=1 --nocapture
 //!
-//! ディレクトリが無ければ静かに skip する (CI で落とさない)。
+//! probe が無ければ静かに skip する (CI で落とさない)。
 
 #[cfg(feature = "cuda")]
 mod real {
-    use denno_engine::gguf::GgufFile;
     use denno_engine::kquant::GgmlType;
-    use denno_engine::model::linear_gguf::GgufLinear;
-    use denno_engine::model::moe_expert::{expert_gemv, ExpertSlice};
+    use denno_engine::model::moe_expert::expert_gemv;
     use std::path::PathBuf;
 
-    fn parts() -> Option<Vec<PathBuf>> {
-        let dir = std::env::var("DENNO_Q4_DIR").ok()?;
-        let mut v: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().map(|x| x == "gguf").unwrap_or(false))
-            .collect();
-        if v.is_empty() {
-            return None;
-        }
-        v.sort();
-        Some(v)
+    fn ty_of(name: &str) -> Option<GgmlType> {
+        Some(match name {
+            "Q8_0" => GgmlType::Q8_0,
+            "Q5_1" => GgmlType::Q5_1,
+            "Q4_K" => GgmlType::Q4K,
+            "Q5_K" => GgmlType::Q5K,
+            _ => return None,
+        })
     }
 
     fn xvec(k: usize, seed: u64) -> Vec<f32> {
@@ -45,113 +42,84 @@ mod real {
             .collect()
     }
 
-    /// 名前と expert 番号から安定な uid を作る (FNV-1a)。
+    /// ファイル名と expert 番号から安定な uid を作る (FNV-1a)。
     fn uid_of(name: &str, e: usize) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in name.as_bytes().iter().chain(&[0u8]).chain(&(e as u32).to_le_bytes()) {
-            h ^= *b as u64;
+        for b in name
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain([0u8])
+            .chain((e as u32).to_le_bytes())
+        {
+            h ^= b as u64;
             h = h.wrapping_mul(0x100_0000_01b3);
         }
         h
     }
 
-    fn bits_eq(a: &[f32], b: &[f32]) -> Option<usize> {
+    fn first_diff(a: &[f32], b: &[f32]) -> Option<usize> {
         if a.len() != b.len() {
             return Some(usize::MAX);
         }
         (0..a.len()).find(|&i| a[i].to_bits() != b[i].to_bits())
     }
 
-    fn check_expert(f: &GgufFile, name: &str, n_in: usize, n_out: usize, n_expert: usize, e: usize) {
-        let info = f.tensor(name).expect("テンソルが無い").clone();
-        let ty = info.ty();
-        let all = f.tensor_bytes(name).expect("tensor_bytes");
-        let sl = ExpertSlice::new(ty, n_in, n_out, n_expert, e).expect("ExpertSlice");
-        let bytes = &all[sl.off..sl.end()];
+    #[test]
+    #[ignore]
+    fn real_gguf_gemv_matches_cpu() {
+        let Ok(dir) = std::env::var("DENNO_Q4_PROBE") else {
+            eprintln!("skip: DENNO_Q4_PROBE 未設定");
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let man = dir.join("manifest.tsv");
+        let Ok(text) = std::fs::read_to_string(&man) else {
+            eprintln!("skip: manifest が無い ({})", man.display());
+            return;
+        };
+        let mut n_case = 0usize;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 5, "manifest の列数: {line}");
+            let file = dir.join(f[0]);
+            let Some(ty) = ty_of(f[1]) else {
+                eprintln!("skip: 未対応の型 {}", f[1]);
+                continue;
+            };
+            let k: usize = f[2].parse().expect("k");
+            let n: usize = f[3].parse().expect("n");
+            let e: usize = f[4].parse().expect("e");
+            let bytes = std::fs::read(&file).expect("probe の読み込み");
+            assert_eq!(bytes.len() % n, 0, "{file:?}: 行数で割り切れない");
 
-        let x = xvec(n_in, 0x5d_e1_2b_9c_11_33_77_55);
-        let mut want = vec![0f32; n_out];
-        expert_gemv(ty, bytes, n_in, n_out, &x, &mut want).expect("CPU 参照");
+            let x = xvec(k, 0x5d_e1_2b_9c_11_33_77_55);
+            let mut want = vec![0f32; n];
+            expert_gemv(ty, &bytes, k, n, &x, &mut want).expect("CPU 参照");
 
-        let uid = uid_of(name, e);
-        let mut got = vec![0f32; n_out];
-        let used = denno_engine::cuda::maybe_gpu_gguf_gemv_into(uid, ty, bytes, n_in, n_out, &x, &mut got);
-        assert!(used, "{name} expert {e}: GPU 経路が使われなかった");
-        match bits_eq(&got, &want) {
-            None => eprintln!("{name} expert {e} ({ty:?}): {n_out} 行ビット一致"),
-            Some(i) => panic!(
-                "{name} expert {e} ({ty:?}): 行 {i} で不一致 gpu={} cpu={}",
-                got[i], want[i]
-            ),
+            let uid = uid_of(f[0], e);
+            for pass in 0..2 {
+                let mut got = vec![0f32; n];
+                let used = denno_engine::cuda::maybe_gpu_gguf_gemv_into(
+                    uid, ty, &bytes, k, n, &x, &mut got,
+                );
+                assert!(used, "{}: GPU 経路が使われなかった", f[0]);
+                match first_diff(&got, &want) {
+                    None => {}
+                    Some(i) => panic!(
+                        "{} pass {pass}: 行 {i} で不一致 gpu={} cpu={}",
+                        f[0], got[i], want[i]
+                    ),
+                }
+            }
+            eprintln!("{} ({ty:?}, {k}x{n}): 2 パスとも {n} 行ビット一致", f[0]);
+            n_case += 1;
         }
-        // 2 回目は重みが常駐している (転送なし) 経路
-        let mut got2 = vec![0f32; n_out];
-        assert!(denno_engine::cuda::maybe_gpu_gguf_gemv_into(
-            uid, ty, bytes, n_in, n_out, &x, &mut got2
-        ));
-        assert_eq!(bits_eq(&got2, &want), None, "{name} expert {e}: 2 回目で不一致");
-        eprintln!("{name} expert {e}: 常駐パスも一致");
-    }
-
-    fn check_linear(f: &GgufFile, name: &str, k: usize, n: usize) {
-        let info = f.tensor(name).expect("テンソルが無い").clone();
-        let ty = info.ty();
-        let bytes = f.tensor_bytes(name).expect("tensor_bytes");
-        let lin = GgufLinear::from_slice(ty, k, n, bytes).expect("GgufLinear");
-        let x = xvec(k, 0x1f_2e_3d_4c_5b_6a_79_88);
-        let mut want = vec![0f32; n];
-        lin.gemv(&x, &mut want).expect("CPU 参照");
-        let mut got = vec![0f32; n];
-        let used = denno_engine::cuda::maybe_gpu_gguf_gemv_into(
-            lin.uid(),
-            ty,
-            lin.blocks().as_slice(),
-            k,
-            n,
-            &x,
-            &mut got,
-        );
-        assert!(used, "{name}: GPU 経路が使われなかった");
-        match bits_eq(&got, &want) {
-            None => eprintln!("{name} ({ty:?}): {n} 行ビット一致"),
-            Some(i) => panic!("{name}: 行 {i} で不一致 gpu={} cpu={}", got[i], want[i]),
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn real_expert_q4k_gate_blk0() {
-        let Some(p) = parts() else {
-            eprintln!("skip: DENNO_Q4_DIR が無い");
-            return;
-        };
-        let f = GgufFile::open_split(&p).expect("open_split");
-        // blk.0.ffn_gate_exps: [2560, 640, 512]
-        check_expert(&f, "blk.0.ffn_gate_exps.weight", 2560, 640, 512, 0);
-        check_expert(&f, "blk.0.ffn_gate_exps.weight", 2560, 640, 512, 511);
-    }
-
-    #[test]
-    #[ignore]
-    fn real_expert_q5_1_down_blk0() {
-        let Some(p) = parts() else {
-            eprintln!("skip: DENNO_Q4_DIR が無い");
-            return;
-        };
-        let f = GgufFile::open_split(&p).expect("open_split");
-        // blk.0.ffn_down_exps: [640, 2560, 512]
-        check_expert(&f, "blk.0.ffn_down_exps.weight", 640, 2560, 512, 3);
-    }
-
-    #[test]
-    #[ignore]
-    fn real_linear_q8_0_shexp_blk0() {
-        let Some(p) = parts() else {
-            eprintln!("skip: DENNO_Q4_DIR が無い");
-            return;
-        };
-        let f = GgufFile::open_split(&p).expect("open_split");
-        // blk.0.ffn_up_shexp: [2560, 640] Q8_0
-        check_linear(&f, "blk.0.ffn_up_shexp.weight", 2560, 640);
+        assert!(n_case > 0, "probe のケースが 0 件");
+        eprintln!("{n_case} 件すべて一致");
     }
 }
