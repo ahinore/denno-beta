@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::linear_gguf::GgufLinear;
-use denno_engine::model::qwen4exp::{Qwen4Exp, Qwen4ExpParams};
+use denno_engine::model::qwen4exp::{LayerAttn, Qwen4Exp, Qwen4ExpParams};
 use denno_engine::model::qwen4exp_decode::{DecoderConfig, Qwen4ExpDecoder};
 use denno_engine::model::qwen4exp_attn::FullAttn;
 use denno_engine::model::qwen4exp_ssm::SsmAttn;
