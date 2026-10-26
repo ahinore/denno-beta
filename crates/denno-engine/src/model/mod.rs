@@ -9,6 +9,7 @@ pub mod linear_gguf;
 pub mod moe;
 pub mod moe_expert;
 pub mod qwen35;
+pub mod qwen4exp_ssm;
 
 use anyhow::{bail, Result};
 use std::path::Path;

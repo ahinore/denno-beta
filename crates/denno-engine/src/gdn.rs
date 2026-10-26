@@ -55,6 +55,26 @@ impl GdnParams {
         }
     }
 
+    /// P-MOE-F2: Qwen3.8-Flash-Next (qwen4exp) の ssm 層。
+    ///
+    /// GGUF メタデータで確定済みの値 (flashnext_meta.txt):
+    /// `ssm.state_size=128` → head_k_dim = head_v_dim = 128、
+    /// `ssm.group_count=16` → n_k_heads、`ssm.time_step_rank=48` → n_v_heads、
+    /// `ssm.inner_size=6144` = 48 * 128、`ssm.conv_kernel=4`、
+    /// `attention.layer_norm_rms_epsilon=1e-6`。n_embd は 2560
+    /// (`attn_qkv.weight` の ne1)。
+    pub fn qwen4exp() -> Self {
+        GdnParams {
+            n_embd: 2560,
+            n_k_heads: 16,
+            n_v_heads: 48,
+            head_k_dim: 128,
+            head_v_dim: 128,
+            d_conv: 4,
+            eps: 1e-6,
+        }
+    }
+
     pub fn key_dim(&self) -> usize {
         self.head_k_dim * self.n_k_heads
     }
