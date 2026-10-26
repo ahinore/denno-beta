@@ -30,6 +30,7 @@ const TY_F32: u32 = 0;
 const TY_Q5_1: u32 = 7;
 const TY_Q8_0: u32 = 8;
 const TY_Q4_K: u32 = 12;
+const TY_Q4_0: u32 = 2;
 const TY_IQ4_NL: u32 = 20;
 const TY_BF16: u32 = 30;
 
@@ -113,7 +114,7 @@ fn ts(name: impl Into<String>, dims: Vec<u64>, ty: u32) -> TensorSpec {
 fn blck_size(ty: u32) -> u64 {
     match ty {
         TY_F32 | TY_BF16 => 1,
-        TY_Q5_1 | TY_Q8_0 | TY_IQ4_NL => 32,
+        TY_Q4_0 | TY_Q5_1 | TY_Q8_0 | TY_IQ4_NL => 32,
         TY_Q4_K => 256,
         other => panic!("テストヘルパ未対応の型 {other}"),
     }
@@ -123,6 +124,7 @@ fn type_size(ty: u32) -> u64 {
     match ty {
         TY_F32 => 4,
         TY_BF16 => 2,
+        TY_Q4_0 => 18,
         TY_Q5_1 => 24,
         TY_Q8_0 => 34,
         TY_IQ4_NL => 18,
@@ -929,7 +931,9 @@ fn validate_reports_wrong_quant_type() {
     let mut tensors = synth_tensors(DEFAULT_LAYERS);
     for t in tensors.iter_mut() {
         if t.name == "blk.2.ffn_down_exps.weight" {
-            t.ty = TY_Q8_0; // 期待は Q5_1
+            // expert の 3 本は Q4_K / Q5_K / Q5_1 / Q8_0 を許す (UD 量子化)。
+            // Q4_0 は許さない型なので、ここで落ちること。
+            t.ty = TY_Q4_0;
         }
         if t.name == "blk.3.indexer.q_proj.weight" {
             t.ty = TY_Q8_0; // 期待は BF16
@@ -942,7 +946,7 @@ fn validate_reports_wrong_quant_type() {
     let all = joined(&errs);
     assert_eq!(errs.len(), 2, "{all}");
     assert!(
-        all.contains("blk.2.ffn_down_exps.weight: 型 Q8_0 が期待 Q5_1 と違う"),
+        all.contains("blk.2.ffn_down_exps.weight: 型 Q4_0 が期待 Q5_1 / Q4_K / Q5_K / Q8_0 と違う"),
         "{all}"
     );
     assert!(

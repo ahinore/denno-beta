@@ -828,9 +828,34 @@ pub struct ExpectedTensor {
     /// GGUF の ne 順 (ne[0] が最内)
     pub dims: Vec<u64>,
     pub ty: GgmlType,
+    /// `ty` 以外に許す量子型 (空なら `ty` だけ)。
+    ///
+    /// UD 量子化 (`UD-Q4_K_XL`) は層ごとに型を変える。実モデルでは
+    /// `blk.2` の `ffn_gate_exps` / `ffn_up_exps` が Q5_K、`blk.2 / 4 / 30 / 46 / 47` の
+    /// `ffn_down_exps` が Q8_0 だった。expert の 3 本はエンジンが扱える量子型の
+    /// どれでもよい (`Q4_K` / `Q5_K` / `Q5_1` / `Q8_0`)。形状は厳密に一致させる。
+    pub ty_alt: &'static [GgmlType],
     /// true なら `dims` の末尾は「以上」を要求する
     /// (`per_layer_token_embd` の行数は converter がパディングする)。
     pub min_last_dim: bool,
+}
+
+/// expert の 3 本 (`ffn_{gate,up,down}_exps.weight`) に許す量子型。
+/// E1 / E4 / E5 の GPU 経路と `expert_gemv` が対応済みの 4 型。
+pub const EXPERT_TYS: &[GgmlType] = &[
+    GgmlType::Q4K,
+    GgmlType::Q5K,
+    GgmlType::Q5_1,
+    GgmlType::Q8_0,
+];
+
+/// UD 量子化で型が揺れるテンソルの代替型。名前で決める (表の各行に書かない)。
+fn ty_alternates(name: &str) -> &'static [GgmlType] {
+    if name.ends_with("_exps.weight") {
+        EXPERT_TYS
+    } else {
+        &[]
+    }
 }
 
 impl ExpectedTensor {
@@ -1035,10 +1060,12 @@ const GLOBAL: &[(&str, Shape, GgmlType)] = &[
 
 fn make(name: String, shape: Shape, ty: GgmlType, p: &Qwen4ExpParams) -> ExpectedTensor {
     let (dims, min_last_dim) = shape.dims(p);
+    let ty_alt = ty_alternates(&name);
     ExpectedTensor {
         name,
         dims,
         ty,
+        ty_alt,
         min_last_dim,
     }
 }
@@ -1114,12 +1141,24 @@ fn check_one(e: &ExpectedTensor, t: &GgufTensorInfo, errs: &mut Vec<String>) {
             e.fmt_dims()
         ));
     }
-    if t.ty != e.ty {
+    if t.ty != e.ty && !e.ty_alt.contains(&t.ty) {
+        let allowed = if e.ty_alt.is_empty() {
+            ty_name(e.ty).to_string()
+        } else {
+            let mut v: Vec<&str> = vec![ty_name(e.ty)];
+            for x in e.ty_alt {
+                let n = ty_name(*x);
+                if !v.contains(&n) {
+                    v.push(n);
+                }
+            }
+            v.join(" / ")
+        };
         errs.push(format!(
             "{}: 型 {} が期待 {} と違う",
             e.name,
             ty_name(t.ty),
-            ty_name(e.ty)
+            allowed
         ));
     }
 }
@@ -2124,6 +2163,7 @@ mod tests {
             name: "t".to_string(),
             dims: vec![160, 40],
             ty: GgmlType::IQ4Nl,
+            ty_alt: &[],
             min_last_dim: true,
         };
         assert_eq!(e.fmt_dims(), "[160, 40 以上]");
