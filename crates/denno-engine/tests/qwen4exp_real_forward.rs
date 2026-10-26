@@ -545,3 +545,40 @@ fn real_model_ssm_stage0() {
         eprintln!("TOK {i} out n={} norm={:.5} head {}", out.len(), acc.sqrt(), head.join(" "));
     }
 }
+
+
+/// 層 0 (ssm) のサブステージを `DENNO_DEBUG_GDN_DUMP` に落とすだけの検査。
+/// 参照実装の eval-callback ノードと突き合わせるための材料を作る。
+#[test]
+#[ignore]
+fn real_model_dump_gdn0() {
+    let parts = match parts() {
+        Some(p) => p,
+        None => {
+            eprintln!("DENNO_Q4_DIR が無いので skip");
+            return;
+        }
+    };
+    let f = GgufFile::open_split(&parts).expect("分割 GGUF を開けない");
+    let p = Qwen4ExpParams::from_meta(&f).expect("メタデータを読めない");
+    let full = FullAttn::from_gguf(&f, &p, 32).expect("FullAttn");
+    let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
+    let mut m = Qwen4Exp::with_attn(&f, Box::new(attn)).expect("モデルを組めない");
+
+    // 素の ssm 層に、層 0 の入口を順に食わせる (state を素直に積む)。
+    let prompt: Vec<u32> = vec![16, 10, 16, 14876, 30];
+    let mut fresh = SsmAttn::with_full(&f, &p, Box::new(FullAttn::from_gguf(&f, &p, 32).unwrap()))
+        .expect("SsmAttn (fresh)");
+    for i in 0..prompt.len() {
+        let mut got: Option<Vec<f32>> = None;
+        let mut sink = |name: &str, vals: &[f32]| {
+            if name == "hc_mixed_attn" {
+                got = Some(vals.to_vec());
+            }
+        };
+        m.debug_layer(&prompt[..=i], 0, &mut sink).expect("debug_layer");
+        let x = got.expect("hc_mixed_attn が取れない");
+        let _ = fresh.forward(0, &x).expect("ssm forward");
+    }
+    eprintln!("dumped");
+}

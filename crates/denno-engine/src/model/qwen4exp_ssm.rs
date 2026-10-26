@@ -42,6 +42,8 @@ use crate::quant::WeightBlocks;
 
 /// ssm 層 1 本ぶんの重みと状態。
 pub struct SsmLayer {
+    /// 層番号 (`blk.{il}.*`)。診断ダンプのゲートに使う。
+    pub il: usize,
     /// GDN のハイパーパラメータ (`GdnParams::qwen4exp()`)。
     pub p: GdnParams,
     /// [2560 -> 10240] q/k/v の融合投影 (出力順は [q 2048][k 2048][v 6144])
@@ -117,6 +119,7 @@ impl SsmLayer {
 
         let state = GdnState::new(&p);
         Ok(Self {
+            il,
             p,
             w_qkv,
             w_gate,
@@ -149,6 +152,8 @@ impl SsmLayer {
         let mut alpha = vec![0f32; self.p.n_v_heads];
         self.w_alpha.gemv(cur, &mut alpha)?;
 
+        // 診断ダンプ (DENNO_DEBUG_GDN_DUMP_LAYER) のゲートに層番号を渡す。
+        gdn::gdn_dbg_set_layer(self.il as i64);
         let cw = GdnCore {
             conv1d: &self.conv1d,
             ssm_a: &self.ssm_a,
