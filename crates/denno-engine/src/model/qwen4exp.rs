@@ -1823,87 +1823,12 @@ impl Qwen4Exp {
     where
         F: FnMut(usize, &[f32]) -> Result<()>,
     {
-        let token = match ctx.last() {
-            Some(&t) => t,
-            None => return Err(one("ctx が空 (現在のトークンが無い)")),
-        };
         let hp = self.hp();
-        let e = self.p.n_embd;
-
-        // 1. emb = tok_embd @ [token]
-        let emb = self
-            .tok_embd
-            .dequant_row(token as usize)
-            .map_err(|err| one(format!("token_embd: 行 {token}: {err}")))?;
-        if emb.len() != e {
-            return Err(one(format!(
-                "token_embd: 行の長さ {} が n_embd {e} と違う",
-                emb.len()
-            )));
-        }
-
-        // 2. res_hc = [emb; ...; emb] (hc 本)
-        let mut res = HyperStreams::from_embed(&emb, &hp);
-
-        // PLE の行 gather は 1 トークンにつき 1 回だけ (全層で共有)。
-        //
-        // `PleNgram::indices` は **新しい順** (`ctx[0]` = 現在のトークン) を要求する。
-        // 呼び出し側の `ctx` は古い順なので、末尾から n_gram 個を反転して渡す。
-        // ここを取り違えると n-gram が 2 つずれた窓で引かれる (参照実装の
-        // `ctx[0] = 現在, ctx[s] = s 個前` に合わせる)。
-        let ple_emb = match &self.ple {
-            Some(rt) => {
-                let win = ple_window(ctx, rt.ngram.n_gram());
-                Some(
-                    rt.ngram
-                        .gather(&rt.table, &win)
-                        .map_err(|err| one(format!("PLE 索引: {err}")))?,
-                )
-            }
-            None => None,
-        };
+        let mut res = self.forward_embed(ctx, &hp)?;
+        let ple_emb = self.gather_ple(ctx)?;
 
         for il in 0..self.p.n_layer {
-            let lw = &self.layers[il];
-
-            // 3.1 PLE 注入 (層 1 のみ)。res_hc を置き換える。
-            if let Some(pw) = &lw.ple {
-                let pe = ple_emb
-                    .as_ref()
-                    .ok_or_else(|| one(format!("層 {il}: PLE の行が無い")))?;
-                res = ple_inject(&self.p, pw, pe, &res, &hp)?;
-            }
-
-            // 3.2-3.4 attention 入口 → attn (F1 は恒等) → 出口
-            let (cur, inject) = hc_mix_quant(
-                &res,
-                &lw.hc_attn_norm,
-                &lw.hc_attn_down,
-                &lw.hc_attn_up,
-                Some(&lw.hc_attn_inject),
-                &hp,
-            )?;
-            let cur = self.attn.forward(il, &cur)?;
-            if cur.len() != e {
-                return Err(one(format!(
-                    "層 {il}: attention の出力長 {} が n_embd {e} と違う",
-                    cur.len()
-                )));
-            }
-            res = hyper::hc_combine(&res, &cur, &inject, &hp);
-
-            // 3.5-3.7 ffn 入口 → MoE FFN → 出口
-            let (cur, inject) = hc_mix_quant(
-                &res,
-                &lw.hc_ffn_norm,
-                &lw.hc_ffn_down,
-                &lw.hc_ffn_up,
-                Some(&lw.hc_ffn_inject),
-                &hp,
-            )?;
-            let cur = moe_ffn_quant(&self.p, lw, &cur)?;
-            res = hyper::hc_combine(&res, &cur, &inject, &hp);
-
+            self.run_layer(il, &mut res, ple_emb.as_ref(), &hp, &mut |_, _, _| Ok(()))?;
             on_layer(il, &res.data)?;
         }
 
@@ -1923,6 +1848,133 @@ impl Qwen4Exp {
             .gemv(&cur, &mut logits)
             .map_err(|err| one(format!("output: {err}")))?;
         Ok(logits)
+    }
+
+    /// 1. `emb = tok_embd[token]` と 2. `res_hc = [emb; ...; emb]`。
+    fn forward_embed(&self, ctx: &[u32], hp: &HyperParams) -> Result<HyperStreams> {
+        let token = match ctx.last() {
+            Some(&t) => *t,
+            None => return Err(one("ctx が空 (現在のトークンが無い)")),
+        };
+        let e = self.p.n_embd;
+        let emb = self
+            .tok_embd
+            .dequant_row(token as usize)
+            .map_err(|err| one(format!("token_embd: 行 {token}: {err}")))?;
+        if emb.len() != e {
+            return Err(one(format!(
+                "token_embd: 行の長さ {} が n_embd {e} と違う",
+                emb.len()
+            )));
+        }
+        Ok(HyperStreams::from_embed(&emb, hp))
+    }
+
+    /// PLE の行 gather (1 トークンにつき 1 回、全層で共有)。
+    ///
+    /// `PleNgram::indices` は **新しい順** (`ctx[0]` = 現在のトークン) を要求する。
+    /// 呼び出し側の `ctx` は古い順なので、末尾から n_gram 個を反転して渡す。
+    /// ここを取り違えると n-gram が 2 つずれた窓で引かれる (参照実装の
+    /// `ctx[0] = 現在, ctx[s] = s 個前` に合わせる)。
+    fn gather_ple(&self, ctx: &[u32]) -> Result<Option<Vec<f32>>> {
+        match &self.ple {
+            Some(rt) => {
+                let win = ple_window(ctx, rt.ngram.n_gram());
+                Ok(Some(
+                    rt.ngram
+                        .gather(&rt.table, &win)
+                        .map_err(|err| one(format!("PLE 索引: {err}")))?,
+                ))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 1 層ぶんの本体 (PLE 注入 → attention → MoE FFN)。
+    ///
+    /// `hook(name, il, vals)` は層の中間値の観測用。通常の forward は空のフックを
+    /// 渡すので、この関数を経由しても数値は変わらない (演算順序は同じ)。
+    fn run_layer(
+        &mut self,
+        il: usize,
+        res: &mut HyperStreams,
+        ple_emb: Option<&Vec<f32>>,
+        hp: &HyperParams,
+        hook: &mut dyn FnMut(&str, usize, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        let e = self.p.n_embd;
+        let lw = &self.layers[il];
+
+        // 3.1 PLE 注入 (層 1 のみ)。res_hc を置き換える。
+        if let Some(pw) = &lw.ple {
+            let pe = ple_emb.ok_or_else(|| one(format!("層 {il}: PLE の行が無い")))?;
+            *res = ple_inject(&self.p, pw, pe, res, hp)?;
+            hook("ple_after", il, &res.data)?;
+        }
+
+        // 3.2-3.4 attention 入口 → attn → 出口
+        let (cur, inject) = hc_mix_quant(
+            res,
+            &lw.hc_attn_norm,
+            &lw.hc_attn_down,
+            &lw.hc_attn_up,
+            Some(&lw.hc_attn_inject),
+            hp,
+        )?;
+        hook("hc_mixed_attn", il, &cur)?;
+        hook("hc_inject_attn", il, &inject)?;
+        let cur = self.attn.forward(il, &cur)?;
+        if cur.len() != e {
+            return Err(one(format!(
+                "層 {il}: attention の出力長 {} が n_embd {e} と違う",
+                cur.len()
+            )));
+        }
+        hook("attn_out", il, &cur)?;
+        *res = hyper::hc_combine(res, &cur, &inject, hp);
+        hook("res_after_attn", il, &res.data)?;
+
+        // 3.5-3.7 ffn 入口 → MoE FFN → 出口
+        let (cur, inject) = hc_mix_quant(
+            res,
+            &lw.hc_ffn_norm,
+            &lw.hc_ffn_down,
+            &lw.hc_ffn_up,
+            Some(&lw.hc_ffn_inject),
+            hp,
+        )?;
+        hook("hc_mixed_ffn", il, &cur)?;
+        let cur = moe_ffn_quant(&self.p, lw, &cur)?;
+        hook("ffn_out", il, &cur)?;
+        *res = hyper::hc_combine(res, &cur, &inject, hp);
+        Ok(())
+    }
+
+    /// デバッグ用: `ctx` を 1 個ずつ食わせ、最後のトークンの `layer` 層の中間値を
+    /// `sink(name, vals)` に渡す。**数値は通常の forward と同じ** (同じ関数を通る)。
+    pub fn debug_layer(
+        &mut self,
+        ctx: &[u32],
+        layer: usize,
+        sink: &mut dyn FnMut(&str, &[f32]),
+    ) -> Result<()> {
+        let hp = self.hp();
+        let last = ctx.len().saturating_sub(1);
+        for i in 0..ctx.len() {
+            let is_last = i == last;
+            let mut res = self.forward_embed(&ctx[..=i], &hp)?;
+            let ple_emb = self.gather_ple(&ctx[..=i])?;
+            for il in 0..self.p.n_layer {
+                let mut hook = |name: &str, hil: usize, vals: &[f32]| {
+                    if is_last && hil == layer {
+                        sink(name, vals);
+                    }
+                    Ok(())
+                };
+                self.run_layer(il, &mut res, ple_emb.as_ref(), &hp, &mut hook)?;
+            }
+        }
+        Ok(())
     }
 }
 
