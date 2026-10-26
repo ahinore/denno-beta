@@ -15,11 +15,15 @@ the header of each source file: this is the ledger, the headers are the fulfilme
 | llama.cpp `delta-net-base.cpp` / `qwen35.cpp` (GDN maths) | same | Port of the formulae and operation order (Rust reimplementation, no verbatim copy) | OK — attribution in the `gdn.rs` header |
 | llama.cpp `delta-net-base.cpp` (GDN maths → CUDA kernel) | same | The same formulae ported to CUDA (`kernels/gdn.cu`). GDN is under the no-bit-identity contract, so `expf` etc. are used and only determinism is guaranteed | OK — MIT notice in the `gdn.cu` header |
 | GGUF format specification (`gguf.cpp`) | same | Reference to the format specification only (the parser is our own) | OK — attribution in the `gguf.rs` header |
+| llama.cpp `src/models/qwen4exp.cpp` (commit `d854d98`, fetched 2026-10-26) | MIT (Copyright (c) 2023-2026 The ggml authors) | Reference for the Qwen4-family formulae (the PLE n-gram index, hyper-connections, the QSA indexer, the MoE routing order). Reimplemented in Rust / CUDA; no verbatim copy | OK — attribution in the headers of the port targets (`moe.rs` / `ple.rs` / `hyper.rs` / `indexer.rs`) |
 | Qwen3.5 model (configuration and weights) | Apache-2.0 | Configuration values consulted; GGUF weights loaded | OK — attribution in the `qwen35.rs` header |
+| Qwen3.8-Flash-Next (configuration and weights, `qwen4exp` architecture) | Qwen Community License 1.0 | Configuration values consulted; GGUF weights loaded for local inference only. The weights are not redistributed | OK — the copyright notice is kept in this appendix. Not used to run a Model as a Service |
 
 **Conclusion** — All of it is compatible with this repository's licence (MIT OR Apache-2.0). The MIT-derived
 parts (the kquant port and the table extraction) keep the upstream copyright notice in the relevant files, as
-the MIT notice obligation requires. There is no GPL contamination.
+the MIT notice obligation requires. There is no GPL contamination. The licences of the model weights
+(Apache-2.0 / Qwen Community License 1.0) apply to the weights themselves and do not extend to the code in
+this repository. The weights are not redistributed.
 
 **Practice** — When a new reference implementation is brought in, add it to **both** this table and the header
 of the relevant file. One of the two is not enough as a ledger: fixing only the table and forgetting the header
