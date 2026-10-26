@@ -8,10 +8,15 @@
 //! # 担当範囲
 //!
 //! `(il + 1) % full_attention_interval == 0` の 12 層 (3, 7, ..., 47) を
-//! dense GQA + 出力ゲートで回す。**QSA (indexer による選択) は入れていない**。
-//! 参照実装は `compress_ratios[il] > 0` のときだけ `build_qsa_sel` を通すが、
-//! ここでは常に dense 側 (`build_attn`) を回す。選択を被せるときの継ぎ目は
-//! [`AttnLayer::norm_rope_q`] の後・[`AttnLayer::attend`] の前になる。
+//! dense GQA + 出力ゲートで回す。
+//!
+//! 参照実装は `compress_ratios[il] > 0` のときだけ `build_qsa_sel` を通す。
+//! ここでは既定で dense 側 (`build_attn`) を回し、`DENNO_QSA=1` のときだけ
+//! [`crate::model::qwen4exp_qsa::QsaState`] の選択結果を
+//! [`AttnLayer::attend_visible`] に食わせる (G2)。選択の継ぎ目は
+//! [`AttnLayer::norm_rope_q`] の後・[`AttnLayer::attend`] の前。
+//! `DENNO_QSA` が未設定 / 0 なら indexer のテンソルは読まない (dense 経路そのまま)。
+//!
 //! ssm 層 (`il % 4 != 3`) は [`FullAttn::forward`] が「担当外」を返す
 //! (F2 の [`crate::model::qwen4exp_ssm::SsmLayer`] と組み合わせるのは F5)。
 //!
@@ -53,6 +58,7 @@ use crate::gguf::GgufFile;
 use crate::kquant::GgmlType;
 use crate::model::linear_gguf::GgufLinear;
 use crate::model::qwen4exp::{LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams};
+use crate::model::qwen4exp_qsa::QsaState;
 use crate::quant::WeightBlocks;
 use crate::tensor::{qknorm_rows_inplace, softmax};
 
@@ -441,11 +447,63 @@ impl AttnLayer {
     /// 正規化・rope 済みの q と、層 `layer` のキャッシュ `0..len` で GQA attention。
     /// **見るのは積まれた本数 (`len`) だけ** — 未来の位置はキャッシュに無いので
     /// スコアに入らない (因果性はここで閉じる)。
+    ///
+    /// 実体は [`AttnLayer::attend_impl`] (`cells = None` = 全範囲)。dense 経路の
+    /// 丸め順序 (dot は k 昇順、softmax は max 引きの逐次、出力は j 昇順の逐次加算)
+    /// は G2 以前と同じで、値はビット一致する。
     pub fn attend(&self, q: &[f32], cache: &AttnCache, layer: usize) -> Result<Vec<f32>> {
+        let len = cache.len(layer)?;
+        self.attend_impl(q, cache, layer, None, len)
+    }
+
+    /// 見る cell を `cells` に限定した attention (QSA の選択結果を食わせる口)。
+    ///
+    /// `cells` は **昇順・重複なし・すべて `cache.len(layer)` 未満** でなければ
+    /// エラー (並べ替えて黙って通さない)。softmax の和も出力の積算も `cells` の
+    /// 昇順で回すので、`cells == 0..len` のとき [`AttnLayer::attend`] と
+    /// ビット一致する (テスト A)。
+    pub fn attend_visible(
+        &self,
+        q: &[f32],
+        cache: &AttnCache,
+        layer: usize,
+        cells: &[usize],
+    ) -> Result<Vec<f32>> {
+        let len = cache.len(layer)?;
+        if cells.is_empty() {
+            bail!("attend_visible: 見る cell が空 (層 {layer})");
+        }
+        let mut prev: Option<usize> = None;
+        for &c in cells {
+            if c >= len {
+                bail!("attend_visible: cell {c} が積まれた本数 {len} の範囲外 (層 {layer})");
+            }
+            if let Some(p) = prev {
+                if c <= p {
+                    bail!("attend_visible: cells が昇順でない ({p} の次が {c}、層 {layer})");
+                }
+            }
+            prev = Some(c);
+        }
+        self.attend_impl(q, cache, layer, Some(cells), len)
+    }
+
+    /// `attend` / `attend_visible` の共通本体。
+    ///
+    /// `cells = None` のとき `i -> i` (全範囲)、`Some(c)` のとき `i -> c[i]`。
+    /// どちらも `i` 昇順に同じ式を回すので、`c == 0..len` なら dense と
+    /// ビット一致する。
+    fn attend_impl(
+        &self,
+        q: &[f32],
+        cache: &AttnCache,
+        layer: usize,
+        cells: Option<&[usize]>,
+        len: usize,
+    ) -> Result<Vec<f32>> {
         if q.len() != self.q_dim() {
             bail!("attend: q の長さ {} が n_head * head_dim = {} と違う", q.len(), self.q_dim());
         }
-        let len = cache.len(layer)?;
         let row = cache.row();
         if row != self.kv_dim() {
             bail!("attend: キャッシュの row = {row} が kv_dim = {} と違う", self.kv_dim());
@@ -453,23 +511,33 @@ impl AttnLayer {
         let kb = cache.k(layer)?;
         let vb = cache.v(layer)?;
         let dh = self.head_dim;
+        let n = match cells {
+            Some(c) => c.len(),
+            None => len,
+        };
+        let at = |i: usize| match cells {
+            Some(c) => c[i],
+            None => i,
+        };
         let mut out = vec![0f32; self.q_dim()];
-        let mut scores = vec![0f32; len];
+        let mut scores = vec![0f32; n];
         for h in 0..self.n_head {
             let hk = self.kv_head(h);
-            for j in 0..len {
+            for i in 0..n {
+                let j = at(i);
                 let krow = &kb[j * row + hk * dh..][..dh];
                 let mut acc = 0f32;
                 for d in 0..dh {
                     acc += q[h * dh + d] * krow[d];
                 }
-                scores[j] = acc * self.kq_scale;
+                scores[i] = acc * self.kq_scale;
             }
             // max 引きの f32 逐次 softmax (expf)
             softmax(&mut scores);
-            for j in 0..len {
+            for i in 0..n {
+                let j = at(i);
                 let vrow = &vb[j * row + hk * dh..][..dh];
-                let p = scores[j];
+                let p = scores[i];
                 for d in 0..dh {
                     out[h * dh + d] += p * vrow[d];
                 }
@@ -511,6 +579,31 @@ impl AttnLayer {
         layer: usize,
         pos: usize,
     ) -> Result<Vec<f32>> {
+        self.forward_token_impl(cur, cache, layer, pos, None)
+    }
+
+    /// [`AttnLayer::forward_token`] の「見る cell を限定する」版。
+    /// attention だけ [`AttnLayer::attend_visible`] に差し替える (投影・rope・
+    /// ゲート・`attn_output` は同じ)。
+    pub fn forward_token_visible(
+        &mut self,
+        cur: &[f32],
+        cache: &mut AttnCache,
+        layer: usize,
+        pos: usize,
+        cells: &[usize],
+    ) -> Result<Vec<f32>> {
+        self.forward_token_impl(cur, cache, layer, pos, Some(cells))
+    }
+
+    fn forward_token_impl(
+        &mut self,
+        cur: &[f32],
+        cache: &mut AttnCache,
+        layer: usize,
+        pos: usize,
+        cells: Option<&[usize]>,
+    ) -> Result<Vec<f32>> {
         if cur.len() != self.n_embd {
             bail!(
                 "AttnLayer::forward_token: 入力長 {} が n_embd = {} と違う",
@@ -528,7 +621,10 @@ impl AttnLayer {
 
         // 積んでから全 len に対して attention (参照実装の KV 書き込みと同じ順)。
         cache.push(layer, &k, &v)?;
-        let attn = self.attend(&q, cache, layer)?;
+        let attn = match cells {
+            None => self.attend(&q, cache, layer)?,
+            Some(c) => self.attend_visible(&q, cache, layer, c)?,
+        };
         let gated = self.gate_mul(&attn, &gate)?;
         self.project_out(&gated)
     }
@@ -560,12 +656,34 @@ pub struct FullAttn {
     /// full attention 層ごとに「このトークンで既に積んだか」。同じ層を 1 トークンで
     /// 二度通したときに黙って二重 push しないための番人。全層が揃ったら false に戻す。
     pushed: Vec<bool>,
+    /// QSA (indexer による key 選択)。`DENNO_QSA=1` のときだけ `Some`。
+    /// 既定 (`DENNO_QSA` 未設定 / 0) は `None` で、indexer のテンソルは読まない
+    /// (dense 経路そのまま・追加確保なし)。
+    qsa: Option<QsaState>,
+}
+
+/// `DENNO_QSA=1` のときだけ QSA 選択を有効にする (既定 0 = dense 経路そのまま)。
+/// `"1"` 以外 (`"true"` / `"yes"` など) は無効として扱う (取り違えを増やさない)。
+fn qsa_from_env() -> bool {
+    matches!(std::env::var("DENNO_QSA").as_deref(), Ok("1"))
 }
 
 impl FullAttn {
     /// 実 GGUF から組む。full attention 層のテンソルだけを読む
     /// (ssm 層のテンソルは F2 の担当)。
+    ///
+    /// QSA は環境変数 `DENNO_QSA` で切り替える (`1` のときだけ indexer を組む)。
     pub fn from_gguf(f: &GgufFile, p: &Qwen4ExpParams, max_ctx: usize) -> Result<Self> {
+        Self::from_gguf_with(f, p, max_ctx, qsa_from_env())
+    }
+
+    /// QSA の有無を明示する版 (テストが環境変数に触らずに両経路を比べるため)。
+    pub fn from_gguf_with(
+        f: &GgufFile,
+        p: &Qwen4ExpParams,
+        max_ctx: usize,
+        use_qsa: bool,
+    ) -> Result<Self> {
         if p.full_attn_interval == 0 {
             bail!("FullAttn::from_gguf: full_attention_interval = 0 では層を選べない");
         }
@@ -593,12 +711,19 @@ impl FullAttn {
         }
         let cache = AttnCache::new(p.n_layer, p.n_head_kv, p.n_embd_head_k, max_ctx)?;
         let layers_len = layers.len();
+        // QSA を切っているときは indexer のテンソルに触らない (dense 経路の前提を変えない)。
+        let qsa = if use_qsa {
+            Some(QsaState::from_gguf(f, p, max_ctx).context("FullAttn: QSA を組めない")?)
+        } else {
+            None
+        };
         Ok(Self {
             n_embd: p.n_embd,
             layers,
             cache,
             pos: 0,
             pushed: vec![false; layers_len],
+            qsa,
         })
     }
 
@@ -628,6 +753,20 @@ impl FullAttn {
         self.cache.clear_all();
         self.pos = 0;
         self.pushed.iter_mut().for_each(|b| *b = false);
+        if let Some(q) = self.qsa.as_mut() {
+            q.reset();
+        }
+    }
+
+    /// QSA の状態 (無効なら `None`)。
+    pub fn qsa(&self) -> Option<&QsaState> {
+        self.qsa.as_ref()
+    }
+
+    /// QSA の重みバイト数 (無効なら 0)。呼び出し側が容量を見積もるための値で、
+    /// 生キー / pool の作業域は含まない (それは文脈長に比例する)。
+    pub fn qsa_weight_bytes(&self) -> usize {
+        self.qsa.as_ref().map_or(0, |q| q.weight_bytes())
     }
 
     /// [`LayerAttn::forward`] の anyhow 版 (テストと F5 の合成から使う)。
@@ -656,7 +795,17 @@ impl FullAttn {
             bail!("FullAttn::forward: 層 {layer} のキャッシュ長 {len} が pos {pos} と違う");
         }
         let l = self.layers[layer].as_mut().expect("上の is_none で除外済み");
-        let out = l.forward_token(cur, &mut self.cache, layer, pos)?;
+        // QSA 層なら、このトークンの生キーを indexer に積んで見える cell を貰う。
+        // 積むのは attention の投影より前 (どちらも `cur` だけに依存し、順序は
+        // 数値に影響しない)。QSA 無効時は何も確保しない。
+        let cells = match self.qsa.as_mut() {
+            Some(q) if q.is_qsa(layer) => Some(q.push_token(layer, cur, pos)?),
+            _ => None,
+        };
+        let out = match cells.as_deref() {
+            Some(c) => l.forward_token_visible(cur, &mut self.cache, layer, pos, c)?,
+            None => l.forward_token(cur, &mut self.cache, layer, pos)?,
+        };
         self.pushed[layer] = true;
         // 位置は 1 トークンにつき 1 回だけ進める。full attention 層は 1 トークンで
         // 12 本ぶん呼ばれるので、全層が揃ったときだけ進める。

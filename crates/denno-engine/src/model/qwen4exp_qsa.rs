@@ -10,7 +10,9 @@
 //! full attention 層が「どの cell (= KV 位置) を見るか」を決める indexer を作る。
 //! [`QsaState::push_token`] は 1 トークンぶんの生キーを積み、その時点で見えるべき
 //! cell の添字列 (`0..=pos` の部分集合、昇順・重複なし) を返す。
-//! 選択結果を attention に配線するのは F5c。
+//! 選択結果を attention に配線するのは G2 (呼び出し側
+//! [`crate::model::qwen4exp_attn::FullAttn`] が `DENNO_QSA=1` のとき
+//! [`crate::model::qwen4exp_attn::AttnLayer::attend_visible`] に渡す)。
 //!
 //! # 数値の契約
 //!
