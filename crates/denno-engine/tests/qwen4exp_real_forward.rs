@@ -22,6 +22,7 @@ use std::path::PathBuf;
 
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::qwen4exp::{Qwen4Exp, Qwen4ExpParams};
+use denno_engine::model::qwen4exp_decode::{DecoderConfig, Qwen4ExpDecoder};
 use denno_engine::model::qwen4exp_attn::FullAttn;
 use denno_engine::model::qwen4exp_ssm::SsmAttn;
 
@@ -222,4 +223,37 @@ fn real_model_one_token_forward_with_attention() {
         same < logits.len(),
         "位置を進めたのに全 logit が同じ (キャッシュが効いていない)"
     );
+}
+
+
+/// 実重み + 実 attention で貪欲に 4 トークン伸ばす。
+///
+/// プロンプトは `"1+1は?"` のトークン列（参照実装の `llama-tokenize` で得た
+/// `[16, 10, 16, 14876, 30]`）。生成された id を参照実装の貪欲 decode と突き合わせる。
+/// 文脈が 2048 token 以下なので QSA を入れなくても dense と一致する。
+#[test]
+#[ignore]
+fn real_model_greedy_short_prompt() {
+    let parts = match parts() {
+        Some(p) => p,
+        None => {
+            eprintln!("DENNO_Q4_DIR が無いので skip");
+            return;
+        }
+    };
+    let f = GgufFile::open_split(&parts).expect("分割 GGUF を開けない");
+    let p = Qwen4ExpParams::from_meta(&f).expect("メタデータを読めない");
+    let full = FullAttn::from_gguf(&f, &p, 32).expect("FullAttn");
+    let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
+    let m = Qwen4Exp::with_attn(&f, Box::new(attn)).expect("モデルを組めない");
+
+    let prompt: Vec<u32> = vec![16, 10, 16, 14876, 30];
+    let t0 = std::time::Instant::now();
+    let mut d = Qwen4ExpDecoder::new(m, DecoderConfig::new(32));
+    let out = d.decode_greedy(&prompt, 4).expect("decode が失敗した");
+    let dt = t0.elapsed();
+    eprintln!("GREEDY_IDS {out:?}");
+    eprintln!("GREEDY_tokens={} total_ms={:.0}", d.tokens().len(), dt.as_secs_f64() * 1e3);
+    assert_eq!(out.len(), 4);
+    assert!(d.tokens().len() == prompt.len() + 4);
 }
