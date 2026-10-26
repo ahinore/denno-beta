@@ -1,6 +1,7 @@
 //! モデルファミリー抽象とディスパッチ
 
 pub mod gpt2;
+pub mod hyper;
 pub mod llama;
 pub mod moe;
 pub mod moe_expert;
