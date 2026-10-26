@@ -1853,7 +1853,7 @@ impl Qwen4Exp {
     /// 1. `emb = tok_embd[token]` と 2. `res_hc = [emb; ...; emb]`。
     fn forward_embed(&self, ctx: &[u32], hp: &HyperParams) -> Result<HyperStreams> {
         let token = match ctx.last() {
-            Some(&t) => *t,
+            Some(t) => *t,
             None => return Err(one("ctx が空 (現在のトークンが無い)")),
         };
         let e = self.p.n_embd;
