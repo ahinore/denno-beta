@@ -40,7 +40,7 @@ use crate::kquant::GgmlType;
 use crate::model::hyper::{self, HyperParams, HyperStreams};
 use crate::model::linear_gguf::GgufLinear;
 use crate::model::moe::select_topk;
-use crate::model::moe_expert::{expert_gemv, ExpertSlice};
+use crate::model::moe_expert::{self, expert_gemv, ExpertSlice};
 use crate::ple::{PleNgram, PleTable, PLE_TABLE_NAME};
 use crate::quant::WeightBlocks;
 use crate::tensor::{silu_inplace, softmax};
@@ -1607,9 +1607,19 @@ impl ExpertW {
     }
 
     /// `out[r] = dot(row_r, x)` を 1 expert ぶん計算する。
+    ///
+    /// Flash-Next の expert は型が混在している (`ffn_gate_exps`/`ffn_up_exps` は
+    /// ほぼ Q4_K、`ffn_down_exps` はほぼ Q5_1、一部 Q8_0)。Q5_1 / Q8_0 には
+    /// AVX2 の融合カーネルがあるので、型で振り分ける。
     fn gemv(&self, e: usize, x: &[f32], out: &mut [f32]) -> Result<()> {
-        expert_gemv(self.ty, self.slice(e)?, self.n_in, self.n_out, x, out)
-            .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))
+        let s = self.slice(e)?;
+        let (n_in, n_out) = (self.n_in, self.n_out);
+        match self.ty {
+            GgmlType::Q5_1 => moe_expert::expert_gemv_q5_1_fast(s, n_in, n_out, x, out),
+            GgmlType::Q8_0 => moe_expert::expert_gemv_q8_fast(s, n_in, n_out, x, out),
+            _ => expert_gemv(self.ty, s, n_in, n_out, x, out),
+        }
+        .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))
     }
 }
 

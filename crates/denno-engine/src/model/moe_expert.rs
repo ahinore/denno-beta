@@ -425,6 +425,106 @@ unsafe fn gemv_q8_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
     }
 }
 
+/// Q5_1 (24 バイトブロック = 32 要素) の AVX2+FMA 融合カーネル。
+///
+/// ブロックは `d: f16` + `m: f16` + `qh: u32` (5 ビット目) + `qs: [u8; 16]`
+/// (下位 4 ビット、要素 j と j+16 を 1 バイトに詰める)。`w = d*q + m` なので
+/// `dot(w, x) = d*dot(q, x) + m*sum(x)` に分け、`sum(x)` はブロック位置ごとに
+/// 1 度だけ作る。5 ビットの展開はスカラーで行う (32 要素で 100 命令程度)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_q5_1_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 24;
+    let nb = n_in / 32;
+    let rb = nb * BLK;
+    let xp = x.as_ptr();
+    let bp = blocks.as_ptr();
+
+    // ブロック位置ごとの `sum(x[32])` (行に依らないので先に 1 回だけ)。
+    let mut gsum = vec![0f32; nb];
+    for (b, g) in gsum.iter_mut().enumerate() {
+        let mut acc = 0f32;
+        for j in 0..32 {
+            acc += *xp.add(b * 32 + j);
+        }
+        *g = acc;
+    }
+
+    let mut q = [0f32; 32];
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        let mut macc = 0f32;
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let m = half::f16::from_bits(std::ptr::read_unaligned(p.add(2) as *const u16)).to_f32();
+            let qh = std::ptr::read_unaligned(p.add(4) as *const u32);
+            let qs = p.add(8);
+            for j in 0..16 {
+                let byte = *qs.add(j);
+                let xh0 = (((qh >> j) << 4) & 0x10) as u8 as i32;
+                let xh1 = ((qh >> (j + 12)) & 0x10) as i32;
+                q[j] = (((byte & 0x0f) as i32) | xh0) as f32;
+                q[j + 16] = (((byte >> 4) as i32) | xh1) as f32;
+            }
+            let dv = _mm256_set1_ps(d);
+            let xb = xp.add(b * 32);
+            let qp = q.as_ptr();
+            a0 = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_loadu_ps(qp), dv), _mm256_loadu_ps(xb), a0);
+            a1 = _mm256_fmadd_ps(
+                _mm256_mul_ps(_mm256_loadu_ps(qp.add(8)), dv),
+                _mm256_loadu_ps(xb.add(8)),
+                a1,
+            );
+            a2 = _mm256_fmadd_ps(
+                _mm256_mul_ps(_mm256_loadu_ps(qp.add(16)), dv),
+                _mm256_loadu_ps(xb.add(16)),
+                a2,
+            );
+            a3 = _mm256_fmadd_ps(
+                _mm256_mul_ps(_mm256_loadu_ps(qp.add(24)), dv),
+                _mm256_loadu_ps(xb.add(24)),
+                a3,
+            );
+            macc += m * gsum[b];
+        }
+        let s01 = _mm256_add_ps(a0, a1);
+        let s23 = _mm256_add_ps(a2, a3);
+        let s = _mm256_add_ps(s01, s23);
+        let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+        let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+        let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
+        out[r] = _mm_cvtss_f32(h) + macc;
+    }
+}
+
+/// Q5_1 専用の入口。融合カーネルが使えなければ [`expert_gemv`] へ落ちる。
+pub fn expert_gemv_q5_1_fast(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    check_gemv_args(GgmlType::Q5_1, blocks, n_in, n_out, x, out)?;
+    if n_in % 32 == 0 && q8_0_fused_supported() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: 引数は check_gemv_args が検証済み (n_in%32==0 は直前で確認) で、
+            // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
+            unsafe { gemv_q5_1_avx2(blocks, n_in, n_out, x, out) };
+            return Ok(());
+        }
+    }
+    expert_gemv(GgmlType::Q5_1, blocks, n_in, n_out, x, out)
+}
+
 /// Q8_0 の融合カーネルが使えるか (AVX2 + FMA の実行時判定)。
 pub fn q8_0_fused_supported() -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -997,6 +1097,67 @@ mod tests {
             }
             eprintln!(
                 "Q8_0 {} 行 x {} 列: 融合vsスカラー 最大絶対差 {:.3e} / f64真値との最大差 融合 {:.3e} スカラー {:.3e}",
+                n_out, n_in, d_fs, d_ft, d_st
+            );
+            assert!(
+                d_ft <= 2.0 * d_st + 1e-6,
+                "n_in={}: 融合の真値誤差 {:.3e} がスカラーの {:.3e} より大きすぎる",
+                n_in,
+                d_ft,
+                d_st
+            );
+        }
+    }
+
+    /// Q5_1 の融合カーネル (Flash-Next の `ffn_down_exps` がこの型)。
+    #[test]
+    fn q5_1_fused_matches_scalar_within_tolerance() {
+        if !fused_ready("q5_1_fused_matches_scalar_within_tolerance") {
+            return;
+        }
+        // 640 = 実形状 (expert の列数) の 20 ブロック/行、2560 = 行数側の実形状
+        for (n_in, n_out) in [(256usize, 4usize), (640, 256)] {
+            let x = make_x_wide(n_in);
+            let blocks = make_expert(GgmlType::Q5_1, n_in, n_out, 0);
+            let mut fused = vec![0.0f32; n_out];
+            let mut scalar = vec![0.0f32; n_out];
+
+            expert_gemv_q5_1_fast(&blocks, n_in, n_out, &x, &mut fused).unwrap();
+            expert_gemv_scalar(GgmlType::Q5_1, &blocks, n_in, n_out, &x, &mut scalar).unwrap();
+
+            assert!(
+                scalar.iter().any(|v| *v != 0.0),
+                "n_in={}: スカラー出力が全 0 (比較が無意味)",
+                n_in
+            );
+
+            let rb = row_bytes(GgmlType::Q5_1, n_in).unwrap();
+            let (mut d_fs, mut d_ft, mut d_st) = (0.0f32, 0.0f32, 0.0f32);
+            for r in 0..n_out {
+                let w = dequant_row(GgmlType::Q5_1, &blocks[r * rb..(r + 1) * rb], n_in);
+                let mut acc = 0.0f64;
+                for i in 0..n_in {
+                    acc += w[i] as f64 * x[i] as f64;
+                }
+                let t = acc as f32;
+                let diff = (fused[r] - scalar[r]).abs();
+                d_fs = d_fs.max(diff);
+                d_ft = d_ft.max((fused[r] - t).abs());
+                d_st = d_st.max((scalar[r] - t).abs());
+                let tol = 1e-4 + 1e-5 * scalar[r].abs();
+                assert!(
+                    diff <= tol,
+                    "n_in={} row {}: 融合 {} とスカラー {} の差 {} が許容 {} を超える",
+                    n_in,
+                    r,
+                    fused[r],
+                    scalar[r],
+                    diff,
+                    tol
+                );
+            }
+            eprintln!(
+                "Q5_1 {} 行 x {} 列: 融合vsスカラー 最大絶対差 {:.3e} / f64真値との最大差 融合 {:.3e} スカラー {:.3e}",
                 n_out, n_in, d_fs, d_ft, d_st
             );
             assert!(
