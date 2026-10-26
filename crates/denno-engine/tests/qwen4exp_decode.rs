@@ -995,3 +995,53 @@ fn empty_prompt_and_zero_window_are_errors() {
     assert!(z.tokens().is_empty(), "失敗した step が tokens を残した");
 }
 
+// ---------------------------------------------------------------------------
+// decode_greedy_stop
+// ---------------------------------------------------------------------------
+
+/// 停止 id を出したら、そこで止まって**その id を含めて**返す。
+#[test]
+fn decode_greedy_stop_stops_at_the_stop_token() {
+    let dir = TempDir::new("stop");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    let mut d = make_decoder(&f, 64);
+
+    // まず止めないで伸ばして、2 個目の id を停止語にする
+    let all = d.decode_greedy(&PROMPT, 5).expect("decode_greedy");
+    let stop = all[1];
+
+    let mut d2 = make_decoder(&f, 64);
+    let got = d2
+        .decode_greedy_stop(&PROMPT, 5, &[stop])
+        .expect("decode_greedy_stop");
+    assert_eq!(got, all[..2], "停止語のところで切れていない");
+    assert_eq!(d2.tokens().len(), PROMPT.len() + 2);
+}
+
+/// 停止語が出なければ `n_new` 個そのまま (decode_greedy と同じ列)。
+#[test]
+fn decode_greedy_stop_without_hit_equals_decode_greedy() {
+    let dir = TempDir::new("stop_none");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    let mut a = make_decoder(&f, 64);
+    let all = a.decode_greedy(&PROMPT, 4).expect("decode_greedy");
+    let absent = (0..N_VOCAB as u32)
+        .find(|t| !all.contains(t))
+        .expect("使われていない id が無い");
+    let mut b = make_decoder(&f, 64);
+    let got = b
+        .decode_greedy_stop(&PROMPT, 4, &[absent])
+        .expect("decode_greedy_stop");
+    assert_eq!(got, all);
+}
+
+/// `n_new == 0` は空 (prefill もしない)。
+#[test]
+fn decode_greedy_stop_with_zero_new_is_empty() {
+    let dir = TempDir::new("stop_zero");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    let mut d = make_decoder(&f, 64);
+    let got = d.decode_greedy_stop(&PROMPT, 0, &[0]).expect("stop 0");
+    assert!(got.is_empty());
+    assert_eq!(d.tokens().len(), 0);
+}

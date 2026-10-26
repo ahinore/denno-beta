@@ -26,10 +26,8 @@
 //!
 //! 注意: `ple.rs` の [`crate::ple::PleNgram::indices`] は「`ctx[0]` が現在の
 //! トークン」(新しい順) を前提にしている。`qwen4exp.rs` の `forward_token_with`
-//! は古い順の `ctx` をそのまま `gather` に渡しているので、**PLE 層の索引だけは
-//! 2 つずれた窓で引かれる**。このファイルからは直せない (`qwen4exp.rs` は
-//! F5 の触ってよいファイルに入っていない) ので、REPORT に「F6 の前に
-//! `forward_token_with` 側で末尾 3 個を反転して渡す」と書いた。
+//! は末尾 `n_gram` 個を反転してから `gather` に渡す (P-MOE-F7 で修正済み)。
+//! このモジュールは古い順のまま渡してよい。
 
 use crate::model::qwen4exp::{one, Qwen4Exp, Qwen4ExpError};
 
@@ -151,6 +149,33 @@ impl Qwen4ExpDecoder {
             let id = argmax(&logits)?;
             let id = u32::try_from(id).map_err(|_| one(format!("argmax の {id} が u32 に収まらない")))?;
             out.push(id);
+            logits = self.step(id)?;
+        }
+        Ok(out)
+    }
+
+    /// 貪欲に伸ばし、`stop` に入った id を出したら止める。
+    ///
+    /// 停止トークンも `out` に含める (呼び出し側が detokenize して落とせる)。
+    /// `n_new` に達した場合も止まる。それ以外は [`Self::decode_greedy`] と同じ。
+    pub fn decode_greedy_stop(
+        &mut self,
+        prompt: &[u32],
+        n_new: usize,
+        stop: &[u32],
+    ) -> Result<Vec<u32>> {
+        if n_new == 0 {
+            return Ok(Vec::new());
+        }
+        let mut logits = self.prefill(prompt)?;
+        let mut out = Vec::with_capacity(n_new);
+        for _ in 0..n_new {
+            let id = argmax(&logits)?;
+            let id = u32::try_from(id).map_err(|_| one(format!("argmax の {id} が u32 に収まらない")))?;
+            out.push(id);
+            if stop.contains(&id) {
+                break;
+            }
             logits = self.step(id)?;
         }
         Ok(out)
