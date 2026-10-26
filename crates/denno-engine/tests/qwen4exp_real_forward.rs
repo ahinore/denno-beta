@@ -176,12 +176,47 @@ fn real_model_one_token_forward_with_attention() {
     );
     eprintln!("ATTN_forward_1token_ms={:.1}", dt.as_secs_f64() * 1e3);
 
-    // 決定性 (キャッシュと ssm 状態は 1 トークン目と同じ位置から積み直す)
-    let again = m.forward_token(&ctx).expect("2 回目の forward");
+    // 決定性。状態 (KV / ssm) を持つので、同じモデルを 2 回呼ぶと同じ入力でも
+    // 位置が進んで別の値になる。組み直して同じ位置から回した値と比べる。
+    let (logits2, norms2) = {
+        let full2 = FullAttn::from_gguf(&f, &p, max_ctx).expect("FullAttn (2 回目)");
+        let attn2 = SsmAttn::with_full(&f, &p, Box::new(full2)).expect("SsmAttn (2 回目)");
+        let mut m2 = Qwen4Exp::with_attn(&f, Box::new(attn2)).expect("モデルを組めない (2 回目)");
+        let mut n2: Vec<(usize, f32)> = Vec::new();
+        let l2 = m2
+            .forward_token_with(&ctx, |il, res| {
+                let mut s = 0.0f64;
+                for &x in res {
+                    s += (x as f64) * (x as f64);
+                }
+                n2.push((il, s.sqrt() as f32));
+                Ok(())
+            })
+            .expect("2 回目の forward");
+        (l2, n2)
+    };
     let diff = logits
         .iter()
-        .zip(again.iter())
+        .zip(logits2.iter())
         .filter(|(a, b)| a.to_bits() != b.to_bits())
         .count();
-    assert_eq!(diff, 0, "2 回目で {diff} 個の logit がビット一致しない");
+    assert_eq!(diff, 0, "組み直した 2 回目で {diff} 個の logit がビット一致しない");
+    let ndiff = norms
+        .iter()
+        .zip(norms2.iter())
+        .filter(|(a, b)| a.1.to_bits() != b.1.to_bits())
+        .count();
+    assert_eq!(ndiff, 0, "組み直した 2 回目で {ndiff} 層のノルムがビット一致しない");
+
+    // 同じモデルを続けて回すと位置が進む (状態を持つことの確認)。値は変わるのが正しい。
+    let next = m.forward_token(&ctx).expect("2 トークン目の forward");
+    let same = logits
+        .iter()
+        .zip(next.iter())
+        .filter(|(a, b)| a.to_bits() == b.to_bits())
+        .count();
+    assert!(
+        same < logits.len(),
+        "位置を進めたのに全 logit が同じ (キャッシュが効いていない)"
+    );
 }
