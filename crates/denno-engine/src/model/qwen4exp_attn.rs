@@ -646,12 +646,12 @@ impl FullAttn {
             bail!("FullAttn::forward: 層 {layer} は ssm 層で full attention の担当外 (F5 で合成する)");
         }
         let pos = self.pos;
+        if self.pushed[layer] {
+            bail!("FullAttn::forward: 層 {layer} はこのトークン (pos {pos}) で既に積んである");
+        }
         let len = self.cache.len(layer)?;
         if len != pos {
             bail!("FullAttn::forward: 層 {layer} のキャッシュ長 {len} が pos {pos} と違う");
-        }
-        if self.pushed[layer] {
-            bail!("FullAttn::forward: 層 {layer} はこのトークン (pos {pos}) で既に積んである");
         }
         let l = self.layers[layer].as_mut().expect("上の is_none で除外済み");
         let out = l.forward_token(cur, &mut self.cache, layer, pos)?;
