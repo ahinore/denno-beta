@@ -21,6 +21,7 @@
 use std::path::PathBuf;
 
 use denno_engine::gguf::GgufFile;
+use denno_engine::model::linear_gguf::GgufLinear;
 use denno_engine::model::qwen4exp::{Qwen4Exp, Qwen4ExpParams};
 use denno_engine::model::qwen4exp_decode::{DecoderConfig, Qwen4ExpDecoder};
 use denno_engine::model::qwen4exp_attn::FullAttn;
@@ -410,4 +411,32 @@ fn real_model_dump_layers() {
             ns.join(" ")
         );
     }
+}
+
+
+/// 実重みの `token_embd` の行 30 (プロンプト末尾のトークン) を出し、
+/// 参照実装の `model.input_embed` と突き合わせる。
+#[test]
+#[ignore]
+fn real_model_embedding_row() {
+    let parts = match parts() {
+        Some(p) => p,
+        None => {
+            eprintln!("DENNO_Q4_DIR が無いので skip");
+            return;
+        }
+    };
+    let f = GgufFile::open_split(&parts).expect("分割 GGUF を開けない");
+    let t = f.tensor("token_embd.weight").expect("token_embd が無い");
+    eprintln!("token_embd: ty={:?} dims={:?}", t.ty, t.dims);
+    let (file, off, len) = f.tensor_mapping_parts("token_embd.weight").expect("範囲");
+    let map = f.mmap_handle_at(file).expect("mmap");
+    let blocks = denno_engine::quant::WeightBlocks::mapped(map, off, len);
+    let lin = GgufLinear::new(t.ty, t.dims[0] as usize, t.dims[1] as usize, blocks).expect("GgufLinear");
+    let row = lin.dequant_row(30).expect("dequant_row");
+    let mut acc = 0.0f64;
+    for v in &row {
+        acc += (*v as f64) * (*v as f64);
+    }
+    eprintln!("EMB30 first3 {:?} norm {:.6}", &row[..3], acc.sqrt());
 }
