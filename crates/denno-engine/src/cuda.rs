@@ -552,11 +552,20 @@ pub struct CudaCtx {
     /// PTX はコミット済みの `kernels_gdn.ptx` に含まれる (再生成済み) 場合のみ
     /// 取得でき、無ければ None で従来の 3 launch 経路を使う。
     f_gdn_chunk_scan_hoist: Option<CUfunction>,
+    // P-MOE-E1: Flash-Next の expert GEMV (Q8_0 / Q5_1 / Q4_K / Q5_K) を積んだ
+    // モジュール。PTX の読み込みに失敗しても起動は壊さず `f_moe = None` にして、
+    // 呼び出し側 (`moe_gemv`) が Ok(false) を返して CPU 参照へ落ちる。
+    #[allow(dead_code)]
+    module_moe: CUmodule,
+    f_moe: Option<[CUfunction; 4]>,
 }
 
 const PTX: &[u8] = include_bytes!("../kernels/kernels_int8.ptx");
 const PTX_ELEM: &[u8] = include_bytes!("../kernels/kernels_elem.ptx");
 const PTX_GDN: &[u8] = include_bytes!("../kernels/kernels_gdn.ptx");
+// P-MOE-E1: Flash-Next の expert GEMV (Q8_0 / Q5_1 / Q4_K / Q5_K)。
+// CPU 参照 (`model::moe_expert::expert_gemv`) とビット一致する。
+const PTX_MOE: &[u8] = include_bytes!("../kernels/kernels_moe.ptx");
 
 // 中身は生ハンドル (context / module / function)。CUcontext はスレッドごとに
 // current 設定して使うハンドルであり、所有権の移動は伴わないため Send/Sync を
@@ -841,6 +850,36 @@ impl CudaCtx {
                 (None, GDN_PRE_SM_SMEM_DEFAULT)
             };
 
+            // P-MOE-E1: expert GEMV のモジュール (Q8_0 / Q5_1 / Q4_K / Q5_K)。
+            // 4 本そろって初めて Some。1 本でも欠ければ None (CPU 参照へ落ちる)。
+            let mut module_moe: CUmodule = std::ptr::null_mut();
+            let mut f_moe: Option<[CUfunction; 4]> = None;
+            {
+                let mut image = PTX_MOE.to_vec();
+                image.push(0);
+                if (lib.module_load_data)(&mut module_moe, image.as_ptr() as *const c_void) == CUDA_SUCCESS {
+                    let mut fs: [CUfunction; 4] = [std::ptr::null_mut(); 4];
+                    let names: [&[u8]; 4] = [
+                        b"dno_gemv_q8_0_w\0",
+                        b"dno_gemv_q5_1_w\0",
+                        b"dno_gemv_q4k_w\0",
+                        b"dno_gemv_q5k_w\0",
+                    ];
+                    let mut ok = true;
+                    for (k, n) in names.iter().enumerate() {
+                        if (lib.module_get_function)(&mut fs[k], module_moe, n.as_ptr() as *const c_char)
+                            != CUDA_SUCCESS
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        f_moe = Some(fs);
+                    }
+                }
+            }
+
             Ok(Self {
                 device: dev,
                 name,
@@ -875,6 +914,8 @@ impl CudaCtx {
                 f_gdn_chunk_state,
                 f_gdn_chunk_scan,
                 f_gdn_chunk_scan_hoist,
+                module_moe,
+                f_moe,
             })
         }
     }
@@ -1087,6 +1128,81 @@ impl CudaCtx {
     /// scale などを VRAM へアップロード (起動時に1度)
     pub fn upload_f32(&self, data: &[f32]) -> Result<DevBuffer> {
         DevBuffer::from_slice(data)
+    }
+
+    /// P-MOE-E1: Flash-Next の expert GEMV。CPU 参照
+    /// (`crate::model::moe_expert::expert_gemv`) とビット一致する。
+    ///
+    /// 対象は実ファイルで使う 4 型のみ (Q8_0 / Q5_1 / Q4_K / Q5_K)。未対応の型、
+    /// PTX 不在、カーネル取得失敗では `Ok(false)` を返し、呼び出し側が CPU 経路へ
+    /// 落ちる (fail-closed。別経路の数値を黙って返さない)。
+    ///
+    /// カーネルは 1 block = 4 出力行 (64 スレッド/行)。行の生バイトを共有メモリへ
+    /// コアレスで読み、その後 1 スレッドが i の昇順に f32 で累積する。
+    pub fn moe_gemv(
+        &self,
+        ty: crate::kquant::GgmlType,
+        w: &[u8],
+        x: &[f32],
+        n_in: usize,
+        n_out: usize,
+        out: &mut [f32],
+    ) -> Result<bool> {
+        use crate::kquant::GgmlType as T;
+        let fs = match self.f_moe {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let (f, rb) = match ty {
+            T::Q8_0 => (fs[0], (n_in / 32) * 34),
+            T::Q5_1 => (fs[1], (n_in / 32) * 24),
+            T::Q4K => (fs[2], (n_in / 256) * 144),
+            T::Q5K => (fs[3], (n_in / 256) * 176),
+            _ => return Ok(false),
+        };
+        let bs = ty.blck_size();
+        if n_in == 0 || n_out == 0 || n_in % bs != 0 {
+            bail!("moe_gemv: 形状が不正 (n_in={n_in}, n_out={n_out}, block={bs})");
+        }
+        if w.len() != n_out * rb {
+            bail!(
+                "moe_gemv: w の長さ {} が n_out * row_bytes = {} と違う",
+                w.len(),
+                n_out * rb
+            );
+        }
+        if x.len() != n_in {
+            bail!("moe_gemv: x の長さ {} が n_in={n_in} と違う", x.len());
+        }
+        if out.len() != n_out {
+            bail!("moe_gemv: out の長さ {} が n_out={n_out} と違う", out.len());
+        }
+
+        self.make_current()?;
+        let dev_w = DevBuffer::from_slice(w)?;
+        let dev_x = DevBuffer::from_slice(x)?;
+        let dev_o = DevBuffer::alloc(n_out * 4)?;
+        const MOE_ROWS_PER_BLOCK: usize = 4; // kernels_moe.cu の MOE_ROWS と一致
+        let shmem = (MOE_ROWS_PER_BLOCK * rb) as u32;
+        unsafe {
+            let (mut pw, mut px, mut po) = (dev_w.ptr, dev_x.ptr, dev_o.ptr);
+            let (mut n_in_c, mut n_out_c, mut rb_c) =
+                (n_in as c_int, n_out as c_int, rb as c_int);
+            let mut args = [
+                &mut pw as *mut _ as *mut c_void,
+                &mut px as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut n_in_c as *mut _ as *mut c_void,
+                &mut n_out_c as *mut _ as *mut c_void,
+                &mut rb_c as *mut _ as *mut c_void,
+            ];
+            let grid = ((n_out + MOE_ROWS_PER_BLOCK - 1) / MOE_ROWS_PER_BLOCK) as u32;
+            self.launch_async(f, (grid, 1, 1), (256, 1, 1), shmem, &mut args)?;
+            self.sync()?;
+        }
+        let got: Vec<f32> = dev_o.to_vec(n_out)?;
+        out.copy_from_slice(&got);
+        Ok(true)
     }
 }
 
