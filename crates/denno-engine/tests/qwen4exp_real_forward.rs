@@ -26,6 +26,7 @@ use denno_engine::model::qwen4exp::{LayerAttn, Qwen4Exp, Qwen4ExpParams};
 use denno_engine::model::qwen4exp_decode::{DecoderConfig, Qwen4ExpDecoder};
 use denno_engine::model::qwen4exp_attn::FullAttn;
 use denno_engine::model::qwen4exp_ssm::SsmAttn;
+use denno_engine::tok_gguf::GgufTokenizer;
 
 fn parts() -> Option<Vec<PathBuf>> {
     let dir = PathBuf::from(std::env::var("DENNO_Q4_DIR").ok()?);
@@ -259,6 +260,36 @@ fn real_model_greedy_short_prompt() {
     assert!(d.tokens().len() == prompt.len() + 4);
 }
 
+
+/// 16 トークンまで greedy を伸ばし、生成 ID と復号テキストを出す。
+///
+/// 参照実装 (llama.cpp `llama-simple -p "1+1は?" -n 16`) の出力テキストと
+/// 突き合わせるための素材。数値のずれが伸びるかを見る。
+#[test]
+#[ignore]
+fn real_model_greedy16_text() {
+    let parts = match parts() {
+        Some(p) => p,
+        None => {
+            eprintln!("DENNO_Q4_DIR が無いので skip");
+            return;
+        }
+    };
+    let f = GgufFile::open_split(&parts).expect("分割 GGUF を開けない");
+    let tk = GgufTokenizer::from_gguf(&f).expect("トークナイザを組めない");
+    let p = Qwen4ExpParams::from_meta(&f).expect("メタデータを読めない");
+    let full = FullAttn::from_gguf(&f, &p, 32).expect("FullAttn");
+    let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
+    let m = Qwen4Exp::with_attn(&f, Box::new(attn)).expect("モデルを組めない");
+
+    let prompt: Vec<u32> = vec![16, 10, 16, 14876, 30];
+    let t0 = std::time::Instant::now();
+    let mut d = Qwen4ExpDecoder::new(m, DecoderConfig::new(32));
+    let out = d.decode_greedy(&prompt, 16).expect("decode が失敗した");
+    eprintln!("IDS16 {out:?}");
+    eprintln!("TEXT16 {:?}", tk.decode(&out).unwrap_or_default());
+    eprintln!("MS16 {:.0}", t0.elapsed().as_secs_f64() * 1e3);
+}
 
 /// 参照実装 (llama.cpp `llama-cli -p "1+1は?" -n 4 --temp 0`) と同じ greedy 列を踏むか。
 ///
