@@ -45,6 +45,17 @@ use crate::ple::{PleNgram, PleTable, PLE_TABLE_NAME};
 use crate::quant::WeightBlocks;
 use crate::tensor::{silu_inplace, softmax};
 
+/// PLE の n-gram 索引に渡す窓を作る。
+///
+/// `PleNgram::indices` は **新しい順** (`ctx[0]` = 現在のトークン) を要求する。
+/// 呼び出し側の `ctx` は古い順なので、末尾から `n_gram` 個を取って反転する。
+/// 長さが足りなければ短いまま返す (足りない古い側は `indices` が EOS で埋める)。
+///
+/// ここを取り違えると n-gram が 2 つずれた窓で引かれる (2026-10-26 に実際に踏んだ)。
+pub fn ple_window(ctx: &[u32], n_gram: usize) -> Vec<u32> {
+    ctx.iter().rev().take(n_gram).copied().collect()
+}
+
 /// 検証エラー。**1 行 1 件**で、最初の 1 件で止めずに全部を集める。
 ///
 /// 表示は行を `\n` で連結する (呼び出し側が `for line in e.lines()` で
@@ -1842,8 +1853,7 @@ impl Qwen4Exp {
         // `ctx[0] = 現在, ctx[s] = s 個前` に合わせる)。
         let ple_emb = match &self.ple {
             Some(rt) => {
-                let n_gram = rt.ngram.n_gram();
-                let win: Vec<u32> = ctx.iter().rev().take(n_gram).copied().collect();
+                let win = ple_window(ctx, rt.ngram.n_gram());
                 Some(
                     rt.ngram
                         .gather(&rt.table, &win)

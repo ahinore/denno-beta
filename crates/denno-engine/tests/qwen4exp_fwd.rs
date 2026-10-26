@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::hyper::{self, HyperParams, HyperStreams};
-use denno_engine::model::qwen4exp::{LayerAttn, Qwen4Exp, Qwen4ExpError};
+use denno_engine::model::qwen4exp::{ple_window, LayerAttn, Qwen4Exp, Qwen4ExpError};
 
 const ALIGN: usize = 32;
 
@@ -1100,4 +1100,51 @@ fn split_parts(first: &Path) -> Vec<PathBuf> {
     (1..=n)
         .map(|i| dir.join(format!("{prefix}-{i:05}-of-{n:05}.gguf")))
         .collect()
+}
+
+
+// ---------------------------------------------------------------------------
+// PLE の n-gram 窓
+// ---------------------------------------------------------------------------
+
+/// `ple_window` は末尾から `n_gram` 個を **新しい順** で返す。
+/// `PleNgram::indices` が `ctx[0]` を現在のトークンとして扱うため、ここを
+/// 古い順のまま渡すと n-gram が 2 つずれた窓で引かれる (2026-10-26 に踏んだ)。
+#[test]
+fn ple_window_takes_the_tail_newest_first() {
+    let ctx = [10u32, 11, 12, 13];
+    assert_eq!(ple_window(&ctx, 3), vec![13, 12, 11]);
+    assert_eq!(ple_window(&ctx, 1), vec![13]);
+    assert_eq!(ple_window(&ctx, 8), vec![13, 12, 11, 10]);
+    assert_eq!(ple_window(&[7u32], 3), vec![7]);
+    assert_eq!(ple_window(&[], 3), Vec::<u32>::new());
+}
+
+/// 4 トークンの ctx でも、PLE が見るのは末尾 `n_gram` 個だけ。
+/// 窓より前のトークンを変えても forward の結果は変わらない (窓を丸ごと渡していない証拠)。
+#[test]
+fn ple_only_reads_the_tail_window() {
+    let dir = TempDir::new("ple_window");
+    // 先頭だけ違う 4 トークン。末尾 3 個は同じ。
+    let mut a = open_model(&dir).1;
+    let mut b = open_model(&dir).1;
+    let la = a.forward_token(&[2, 5, 6, 8]).expect("forward a");
+    let lb = b.forward_token(&[4, 5, 6, 8]).expect("forward b");
+    assert_eq!(la.len(), lb.len());
+    let diff = la
+        .iter()
+        .zip(lb.iter())
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count();
+    assert_eq!(diff, 0, "窓の外のトークンで {diff} 個の logit が変わった");
+
+    // 窓の中を変えれば変わる (比較が効いていることの確認)
+    let mut c = open_model(&dir).1;
+    let lc = c.forward_token(&[4, 5, 6, 7]).expect("forward c");
+    let same = la
+        .iter()
+        .zip(lc.iter())
+        .filter(|(x, y)| x.to_bits() == y.to_bits())
+        .count();
+    assert!(same < la.len(), "窓の中を変えても logit が同じ");
 }
