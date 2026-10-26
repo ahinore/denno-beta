@@ -355,3 +355,59 @@ fn real_model_layer_timings() {
         logits.len()
     );
 }
+
+
+/// 実重みで、プロンプト 5 トークンを 1 個ずつ食わせ、最後のトークンでの各層出口の
+/// `res_hc` を出す（参照実装の `l_last-<il>` と突き合わせるため）。
+///
+/// 出すのは層ごとに、ストリーム 0 の先頭 3 要素と、ストリームごとの L2 ノルム。
+#[test]
+#[ignore]
+fn real_model_dump_layers() {
+    let parts = match parts() {
+        Some(p) => p,
+        None => {
+            eprintln!("DENNO_Q4_DIR が無いので skip");
+            return;
+        }
+    };
+    let f = GgufFile::open_split(&parts).expect("分割 GGUF を開けない");
+    let p = Qwen4ExpParams::from_meta(&f).expect("メタデータを読めない");
+    let full = FullAttn::from_gguf(&f, &p, 32).expect("FullAttn");
+    let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
+    let mut m = Qwen4Exp::with_attn(&f, Box::new(attn)).expect("モデルを組めない");
+
+    let prompt: Vec<u32> = vec![16, 10, 16, 14876, 30];
+    let e = p.n_embd;
+    let hc = p.hc;
+    let mut last: Vec<(usize, [f32; 3], Vec<f32>)> = Vec::new();
+    for i in 0..prompt.len() {
+        let ctx = &prompt[..=i];
+        let mut rows: Vec<(usize, [f32; 3], Vec<f32>)> = Vec::new();
+        m.forward_token_with(ctx, |il, res| {
+            let mut norms = Vec::with_capacity(hc);
+            for s in 0..hc {
+                let mut acc = 0.0f64;
+                for d in 0..e {
+                    let v = res[s * e + d] as f64;
+                    acc += v * v;
+                }
+                norms.push(acc.sqrt() as f32);
+            }
+            rows.push((il, [res[0], res[1], res[2]], norms));
+            Ok(())
+        })
+        .expect("forward");
+        last = rows;
+    }
+    for (il, head, norms) in &last {
+        let ns: Vec<String> = norms.iter().map(|v| format!("{v:.4}")).collect();
+        eprintln!(
+            "LL {il:02} s0 {:+.4} {:+.4} {:+.4} norms {}",
+            head[0],
+            head[1],
+            head[2],
+            ns.join(" ")
+        );
+    }
+}
