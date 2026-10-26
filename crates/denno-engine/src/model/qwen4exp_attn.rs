@@ -646,7 +646,19 @@ impl FullAttn {
         }
         let l = self.layers[layer].as_mut().expect("上の is_none で除外済み");
         let out = l.forward_token(cur, &mut self.cache, layer, pos)?;
-        self.pos += 1;
+        // 位置は 1 トークンにつき 1 回だけ進める。full attention 層は 1 トークンで
+        // 12 本ぶん呼ばれるので、全層のキャッシュが pos+1 に揃ったときだけ進める。
+        let next = pos + 1;
+        let mut all = true;
+        for il in 0..self.layers.len() {
+            if self.layers[il].is_some() && self.cache.len(il)? != next {
+                all = false;
+                break;
+            }
+        }
+        if all {
+            self.pos = next;
+        }
         Ok(out)
     }
 }

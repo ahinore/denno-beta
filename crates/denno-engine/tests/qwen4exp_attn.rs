@@ -809,3 +809,50 @@ fn wrong_tensor_shape_is_rejected_at_load() {
     };
     assert!(err.contains("attn_k.weight"), "{err}");
 }
+
+
+// ---- 位置の進み方 (full attention 層が複数ある場合) ----------------------
+
+/// 位置は 1 トークンにつき 1 回だけ進む。full attention 層が 2 本あるモデルで、
+/// 先に片方だけ通した時点では pos が進まず、両方そろって初めて進むことを見る。
+#[test]
+fn pos_advances_once_per_token_across_full_layers() {
+    let dir = TempDir::new("pos_multi");
+    let path = dir.path("pos_multi.gguf");
+    // 層 1 と層 3 を full attention にする (interval 2)。
+    let mut tensors = layer_tensors(2, 1, false);
+    let mut l1: Vec<TensorSpec> = layer_tensors(2, 1, false)
+        .into_iter()
+        .map(|t| TensorSpec {
+            name: t.name.replace(&format!("blk.{ATTN_LAYER}."), "blk.1."),
+            ..t
+        })
+        .collect();
+    tensors.append(&mut l1);
+    write_gguf(&path, &kvs(), &tensors);
+    let f = GgufFile::open(&path).expect("合成 GGUF を開けない");
+    let mut p = params(2, 1);
+    p.full_attn_interval = 2;
+    let mut fa = FullAttn::from_gguf(&f, &p, 4).expect("from_gguf");
+    let full: Vec<usize> = (0..N_LAYER).filter(|&il| fa.is_full(il)).collect();
+    assert_eq!(full, vec![1, ATTN_LAYER]);
+
+    let cur = vec![0.25f32; N_EMBD];
+    fa.forward_token(1, &cur).expect("層 1");
+    assert_eq!(fa.pos(), 0, "片方だけでは進まない");
+    assert_eq!(fa.cache().len(1).unwrap(), 1);
+    assert_eq!(fa.cache().len(ATTN_LAYER).unwrap(), 0);
+    fa.forward_token(ATTN_LAYER, &cur).expect("層 3");
+    assert_eq!(fa.pos(), 1, "2 本そろって 1 回進む");
+    assert_eq!(fa.cache().len(ATTN_LAYER).unwrap(), 1);
+
+    // 2 トークン目も同じ規則で進む
+    fa.forward_token(ATTN_LAYER, &cur).expect("層 3 (2 トークン目)");
+    assert_eq!(fa.pos(), 1, "層 3 だけでは進まない");
+    fa.forward_token(1, &cur).expect("層 1 (2 トークン目)");
+    assert_eq!(fa.pos(), 2);
+
+    // 同じ層を二度通すとキャッシュ長が合わずに落ちる (黙って二重に積まない)
+    let err = format!("{}", fa.forward_token(1, &cur).expect_err("二重 push が通った"));
+    assert!(err.contains("キャッシュ長"), "{err}");
+}
