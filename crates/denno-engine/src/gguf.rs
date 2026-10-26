@@ -172,7 +172,7 @@ impl GgufFile {
     /// - 各パートの `split.count` / `split.no` / `split.tensors.count` を読み、
     ///   `split.no` 昇順に並べる。
     /// - `split.no` が 0..count-1 の連番でない (欠番・重複)、`split.count` が
-    ///   渡したパス数と違う、`split.tensors.count` の総和が実際のテンソル数と
+    ///   渡したパス数と違う、`split.tensors.count` (全体の宣言値) が実際のテンソル数と
     ///   違う、テンソル名がパート間で重複する — のいずれかならエラー。
     /// - メタデータは `split.no == 0` のパートを正とし、他パートにしか無いキーだけ
     ///   補う (上書きはしない)。
@@ -250,22 +250,34 @@ impl GgufFile {
             }
         }
 
-        // 4. split.tensors.count の総和が実際のテンソル数と一致するか。
+        // 4. `split.tensors.count` は **モデル全体のテンソル数** で、全パートに同じ値が
+        //    書かれる (総和ではない)。実モデル (1,224 本 / 4 分割) では各パートが 1,224 を
+        //    宣言するため、総和すると 4,896 になって必ず落ちる。
+        //    全パートが同値を宣言していることを要求し、その値を実数と突き合わせる。
         let declared: Option<u64> = {
-            let mut sum = 0u64;
+            let mut v: Option<u64> = None;
             let mut all = true;
             for s in &shards {
                 match s.tensors_count {
-                    Some(n) => sum += n,
+                    Some(n) => match v {
+                        None => v = Some(n),
+                        Some(prev) if prev == n => {}
+                        Some(prev) => {
+                            return err(format!(
+                                "split.tensors.count がパート間で食い違う: {prev} と {n} ({:?})",
+                                s.path
+                            ))
+                        }
+                    },
                     None => all = false,
                 }
             }
-            all.then_some(sum)
+            all.then_some(v.unwrap_or(0))
         };
         if let Some(declared) = declared {
             if declared != tensor_order.len() as u64 {
                 return err(format!(
-                    "split.tensors.count の総和 {declared} が実際のテンソル数 {} と一致しない",
+                    "split.tensors.count={declared} (全体の宣言値) が実際のテンソル数 {} と一致しない",
                     tensor_order.len()
                 ));
             }

@@ -262,7 +262,7 @@ fn split_two_shards_merge_into_one_table() {
     let mut kv0 = moe_kvs();
     kv0.push(("split.no", Kv::U32(0)));
     kv0.push(("split.count", Kv::U32(2)));
-    kv0.push(("split.tensors.count", Kv::U64(2)));
+    kv0.push(("split.tensors.count", Kv::U64(4)));
     let t0 = vec![
         TensorSpec { name: "blk.0.ffn_gate_exps.weight", dims: vec![N_EMBD, N_FFN, N_EXPERT], ty: TY_Q4_0, fill: 0xAA },
         TensorSpec { name: "blk.0.ffn_up_exps.weight", dims: vec![N_EMBD, N_FFN, N_EXPERT], ty: TY_Q4_0, fill: 0xAA },
@@ -273,7 +273,7 @@ fn split_two_shards_merge_into_one_table() {
         ("general.architecture", Kv::Str("qwen35")),
         ("split.no", Kv::U32(1)),
         ("split.count", Kv::U32(2)),
-        ("split.tensors.count", Kv::U64(2)),
+        ("split.tensors.count", Kv::U64(4)),
     ];
     let t1 = vec![
         TensorSpec { name: "blk.0.ffn_down_exps.weight", dims: vec![N_FFN, N_EMBD, N_EXPERT], ty: TY_Q4_0, fill: 0xBB },
@@ -429,4 +429,47 @@ fn open_split_single_path_is_single_file() {
     assert!(f.moe_layout().is_some());
     let g = GgufFile::open(&path).expect("open");
     assert_eq!(g.tensors.len(), f.tensors.len());
+}
+
+/// 5. `split.tensors.count` は **モデル全体** のテンソル数で、全パートに同じ値が入る。
+///    パート間で食い違ったら開けない (実モデル 1,224 本 / 4 分割で踏んだ穴の再発防止)。
+#[test]
+fn split_tensors_count_must_agree_across_parts() {
+    let dir = TempDir::new("splitcnt");
+    let shard0 = dir.path("model-00001-of-00002.gguf");
+    let shard1 = dir.path("model-00002-of-00002.gguf");
+
+    let mut kv0 = moe_kvs();
+    kv0.push(("split.no", Kv::U32(0)));
+    kv0.push(("split.count", Kv::U32(2)));
+    kv0.push(("split.tensors.count", Kv::U64(2)));
+    let t0 = vec![TensorSpec {
+        name: "blk.0.ffn_gate_exps.weight",
+        dims: vec![N_EMBD, N_FFN, N_EXPERT],
+        ty: TY_Q4_0,
+        fill: 0xAA,
+    }];
+    write_gguf(&shard0, &kv0, &t0);
+
+    let kv1 = vec![
+        ("general.architecture", Kv::Str("qwen35")),
+        ("split.no", Kv::U32(1)),
+        ("split.count", Kv::U32(2)),
+        // ここだけ違う値 (総和 2+1=3 でも実際 2 本なので、旧実装は別の理由で落ちていた)
+        ("split.tensors.count", Kv::U64(1)),
+    ];
+    let t1 = vec![TensorSpec {
+        name: "blk.0.ffn_up_exps.weight",
+        dims: vec![N_EMBD, N_FFN, N_EXPERT],
+        ty: TY_Q4_0,
+        fill: 0xBB,
+    }];
+    write_gguf(&shard1, &kv1, &t1);
+
+    let e = match GgufFile::open_split(&[shard0, shard1]) {
+        Ok(_) => panic!("食い違いはエラーになるはず"),
+        Err(e) => e,
+    };
+    let msg = format!("{e:?}");
+    assert!(msg.contains("食い違う"), "予期したエラーでない: {msg}");
 }

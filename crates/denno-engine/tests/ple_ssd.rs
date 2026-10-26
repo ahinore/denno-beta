@@ -374,7 +374,7 @@ fn gather_from_nonzero_split_part() {
             ("general.architecture", Kv::Str("qwen35next")),
             ("split.no", Kv::U32(0)),
             ("split.count", Kv::U32(2)),
-            ("split.tensors.count", Kv::U64(1)),
+            ("split.tensors.count", Kv::U64(2)),
         ],
         &[TensorSpec {
             name: "blk.0.attn_norm.weight",
@@ -389,7 +389,7 @@ fn gather_from_nonzero_split_part() {
         &[
             ("split.no", Kv::U32(1)),
             ("split.count", Kv::U32(2)),
-            ("split.tensors.count", Kv::U64(1)),
+            ("split.tensors.count", Kv::U64(2)),
         ],
         &[TensorSpec {
             name: PLE_NAME,
