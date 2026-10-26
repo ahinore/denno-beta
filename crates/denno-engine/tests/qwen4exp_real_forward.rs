@@ -18,7 +18,9 @@
 use std::path::PathBuf;
 
 use denno_engine::gguf::GgufFile;
-use denno_engine::model::qwen4exp::Qwen4Exp;
+use denno_engine::model::qwen4exp::{Qwen4Exp, Qwen4ExpParams};
+use denno_engine::model::qwen4exp_attn::FullAttn;
+use denno_engine::model::qwen4exp_ssm::SsmAttn;
 
 fn parts() -> Option<Vec<PathBuf>> {
     let dir = PathBuf::from(std::env::var("DENNO_Q4_DIR").ok()?);
@@ -103,6 +105,78 @@ fn real_model_one_token_forward() {
     eprintln!("forward_1token_ms={:.1}", dt.as_secs_f64() * 1e3);
 
     // 決定性: 同じ ctx でもう 1 回。状態 (KV / ssm) は IdentityAttn なので持たない。
+    let again = m.forward_token(&ctx).expect("2 回目の forward");
+    let diff = logits
+        .iter()
+        .zip(again.iter())
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(diff, 0, "2 回目で {diff} 個の logit がビット一致しない");
+}
+
+
+/// 実重みで attention も本物にして 1 トークン回す。
+///
+/// `real_model_one_token_forward` が attention 恒等で hyper-connection / PLE /
+/// MoE / head を見るのに対し、こちらは ssm 36 層 + full attention 12 層の実経路を
+/// 通す。**llama.cpp との数値一致はまだ取っていない**ので、ここで見るのは
+/// 「落ちない・有限・決定性」までで、値の正しさの証明ではない。
+#[test]
+#[ignore]
+fn real_model_one_token_forward_with_attention() {
+    let parts = match parts() {
+        Some(p) => p,
+        None => {
+            eprintln!("DENNO_Q4_DIR が無いので skip");
+            return;
+        }
+    };
+    let f = GgufFile::open_split(&parts).expect("分割 GGUF を開けない");
+    let p = Qwen4ExpParams::from_meta(&f).expect("メタデータを読めない");
+    let max_ctx = 8usize;
+
+    let t_load = std::time::Instant::now();
+    let full = FullAttn::from_gguf(&f, &p, max_ctx).expect("FullAttn");
+    let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
+    let n_ssm = attn.n_ssm();
+    let n_full = attn.n_full();
+    let mut m = Qwen4Exp::with_attn(&f, Box::new(attn)).expect("モデルを組めない");
+    eprintln!(
+        "LOAD attn_ms={:.1} n_ssm={n_ssm} n_full={n_full}",
+        t_load.elapsed().as_secs_f64() * 1e3
+    );
+
+    let ctx: Vec<u32> = vec![1000, 2000, 3000, 4000];
+    let n_vocab = m.n_vocab();
+    let mut norms: Vec<(usize, f32)> = Vec::new();
+    let t0 = std::time::Instant::now();
+    let logits = m
+        .forward_token_with(&ctx, |il, res| {
+            let mut s = 0.0f64;
+            for &x in res {
+                s += (x as f64) * (x as f64);
+            }
+            norms.push((il, s.sqrt() as f32));
+            Ok(())
+        })
+        .expect("forward が失敗した");
+    let dt = t0.elapsed();
+    assert_eq!(logits.len(), n_vocab);
+    let bad = logits.iter().filter(|x| !x.is_finite()).count();
+    assert_eq!(bad, 0, "logits に非有限が {bad} 個");
+    let nonfinite = norms.iter().filter(|(_, n)| !n.is_finite()).count();
+    assert_eq!(nonfinite, 0, "層出口に非有限が {nonfinite} 個");
+    eprintln!("ATTN_LAYER last norm={:.6}", norms[norms.len() - 1].1);
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal));
+    eprintln!("ATTN_TOP5 {:?}", &idx[..5]);
+    eprintln!(
+        "ATTN_TOP5_LOGITS {:?}",
+        idx[..5].iter().map(|&i| logits[i]).collect::<Vec<f32>>()
+    );
+    eprintln!("ATTN_forward_1token_ms={:.1}", dt.as_secs_f64() * 1e3);
+
+    // 決定性 (キャッシュと ssm 状態は 1 トークン目と同じ位置から積み直す)
     let again = m.forward_token(&ctx).expect("2 回目の forward");
     let diff = logits
         .iter()
