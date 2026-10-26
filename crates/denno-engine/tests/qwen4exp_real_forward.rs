@@ -14,6 +14,9 @@
 //!   cargo test --release --test qwen4exp_real_forward -- --ignored --nocapture
 //!
 //! 1 トークンあたり CPU で数秒〜数十秒かかる（MoE の expert GEMV が支配的）。
+//!
+//! 2026-10-26: `forward_token_with` が PLE の n-gram 窓を古い順のまま渡していたのを
+//! 直した（`PleNgram::indices` は新しい順を要求する）。この修正の前後で下の数値は変わる。
 
 use std::path::PathBuf;
 

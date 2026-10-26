@@ -1835,12 +1835,21 @@ impl Qwen4Exp {
         let mut res = HyperStreams::from_embed(&emb, &hp);
 
         // PLE の行 gather は 1 トークンにつき 1 回だけ (全層で共有)。
+        //
+        // `PleNgram::indices` は **新しい順** (`ctx[0]` = 現在のトークン) を要求する。
+        // 呼び出し側の `ctx` は古い順なので、末尾から n_gram 個を反転して渡す。
+        // ここを取り違えると n-gram が 2 つずれた窓で引かれる (参照実装の
+        // `ctx[0] = 現在, ctx[s] = s 個前` に合わせる)。
         let ple_emb = match &self.ple {
-            Some(rt) => Some(
-                rt.ngram
-                    .gather(&rt.table, ctx)
-                    .map_err(|err| one(format!("PLE 索引: {err}")))?,
-            ),
+            Some(rt) => {
+                let n_gram = rt.ngram.n_gram();
+                let win: Vec<u32> = ctx.iter().rev().take(n_gram).copied().collect();
+                Some(
+                    rt.ngram
+                        .gather(&rt.table, &win)
+                        .map_err(|err| one(format!("PLE 索引: {err}")))?,
+                )
+            }
             None => None,
         };
 
