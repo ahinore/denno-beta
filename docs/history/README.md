@@ -6,7 +6,7 @@
 - 巻の本文が読み物。**数値と経緯の正は各巻**。
 - 旧 `docs/HISTORY.ja.md` / `docs/HISTORY.en.md`（4,007 行・P41 で停止）は、内容をこの 8 巻へ移して**削除した**。
   commit 単位の生ログを引きたいときは git の履歴から取れる（削除した commit の親を指定する）。
-- 全 137 phase の一覧（日付順・commit つき）は [`90_phase_index.md`](90_phase_index.md)。
+- 全 143 phase の一覧（日付順・commit つき）は [`90_phase_index.md`](90_phase_index.md)。
 - 英語版は [`en/README.md`](en/README.md)（同じ 8 巻 + 付録の翻訳）。
 
 ## 巻一覧
@@ -21,7 +21,7 @@
 | 第6巻 [`50_gdn.md`](50_gdn.md) | Gated DeltaNet の数式・カーネル・数値。どこで bit 一致を諦めたか | P19、s61c、s192 ほか |
 | 第7巻 [`60_quality.md`](60_quality.md) | 出力が壊れたときの切り分け実測。偽ターン、反復崩れ、思考モード、停止条件 | s53〜s56b、P4-1/P4-4 |
 | 第8巻 [`70_infra.md`](70_infra.md) | どう測ったか、数字を信じてよい条件。アンカー、cold A/B、計測窓の運用 | P7.5 以降すべて |
-| 付録A [`90_phase_index.md`](90_phase_index.md) | 全 phase の日付順一覧（機械生成の索引） | 137 phase |
+| 付録A [`90_phase_index.md`](90_phase_index.md) | 全 phase の日付順一覧（機械生成の索引） | 143 phase |
 | 付録B [`80_licenses.md`](80_licenses.md) | 参照した外部実装とライセンス帰属の台帳 | P19 |
 
 ## 全体像
@@ -48,14 +48,14 @@ API は Anthropic Messages 互換で、ローカルのデスクトップアプ�
 3. **つまずきのカタログだけ読みたい**: 各巻末尾の `## 棄却カタログ` を順に。ここが一番濃い。
 4. **品質・壊れ方に興味がある**: `60_quality.md`（偽ターン・反復崩れ・思考モード・停止条件）
 5. **どう測ったかの話**: `70_infra.md`（プロファイラ、アンカー、cold A/B、計測窓の運用）
-6. **commit を引きたい**: [`90_phase_index.md`](90_phase_index.md)（全 137 phase を日付順・commit つきで）
+6. **commit を引きたい**: [`90_phase_index.md`](90_phase_index.md)（全 143 phase を日付順・commit つきで）
 
 ## 年表（arc 単位）
 
 大きな流れを 4 期に分け、その期の**代表的な arc** を 1 行ずつ。`効いた数値` は、その arc で
 **動いた KPI** だけを書く。記録が無い欄は `—`。分母（モデル・量子化・トークン数）は各巻の本文にある。
 
-全 137 phase を 1 行ずつ日付順に並べた表は [`90_phase_index.md`](90_phase_index.md) にある。
+全 143 phase を 1 行ずつ日付順に並べた表は [`90_phase_index.md`](90_phase_index.md) にある。
 
 ### 第 1 期: 立ち上げ（CPU → int8 → バッチング）
 
@@ -139,7 +139,7 @@ API は Anthropic Messages 互換で、ローカルのデスクトップアプ�
 | 統合・配備 | 2026-10-24 | P47〜P52 の統合ビルドを本番へ（16k 8.44 s / 65k 34.95 s） | 40 / 70 | 16k 8.44 s・65k 34.95 s |
 
 > この arc 表は**読み物としての骨格**。phase 単位の欠落が無いことは `90_phase_index.md` の
-> 137 行（各巻の `## 対象 phase 一覧` の合計 = 7 + 13 + 27 + 25 + 41 + 16 + 8）で確認できる。
+> 143 行（各巻の `## 対象 phase 一覧` の合計 = 7 + 13 + 27 + 25 + 47 + 16 + 8）で確認できる。
 
 ## 巻の要約
 

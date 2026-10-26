@@ -4,7 +4,7 @@
 > Japanese original: [../90_phase_index.md](../90_phase_index.md)
 
 This document is a **mechanically built index**. It takes the `## Phases covered` table of each volume,
-lines them up and re-sorts them by date (137 rows). **The authoritative content is the body of each volume**;
+lines them up and re-sorts them by date (143 rows). **The authoritative content is the body of each volume**;
 this is a table for looking up "when, in which commit, and in which volume it is written".
 
 - The same phase can appear in two volumes (P11 is API and decode, s53c is the accepted form of the API and the isolation of quality).
@@ -173,3 +173,9 @@ this is a table for looking up "when, in which commit, and in which volume it is
 | 2026-10-24 | P51 | `ec7d4f31` | AVX2 16-lane host projection of GDN beta/alpha | 40 |
 | 2026-10-24 | P52 | `b6e3fa27` | Widened the per-thread tile of the q4 GEMM to 8x8 | 40 |
 | 2026-10-24 | P45 | `d19aa70b` | Removed the sync after the 3 passes from the device output path | 50 |
+| 2026-10-27 | P-MOE-F12 | `b43d66e` | Fused AVX2 GEMV for Q4_K in the MoE expert path | 30 |
+| 2026-10-27 | P-MOE-F13 | `5828846` | Fused GEMV for Q8_0 and in-layer phase profiling | 30 |
+| 2026-10-27 | P-MOE-F14 | `58ccd86` | Fused GEMV for Q5_1 | 30 |
+| 2026-10-27 | P-MOE-F15 | `74e41d3` | Parallelized the GEMV row direction | 30 |
+| 2026-10-27 | P-MOE-F16 | `a42e144` | Parallelized the GDN delta rule over heads | 30 |
+| 2026-10-27 | P-MOE-F17 | `a469224` | Stop-token decode did not append the stop token to `tokens` | 30 |

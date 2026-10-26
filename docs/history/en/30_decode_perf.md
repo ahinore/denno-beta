@@ -63,6 +63,12 @@ reading s160 right after s157 shows that "the same numbers are being denied from
 | s157 / B20 stage 1 | 2026-10-21 | `2701cf3` | Put 27B q4's linear layers on the resident chain and remove 392 round trips/step |
 | s160 | 2026-10-22 | no commit | Refute the premise of a gate_up fixed cost by static audit |
 | s174 / P16 | 2026-10-23 | `c3e53517` | Fold the 2 beta/alpha fp32 matvec launches into 1 |
+| P-MOE-F12 | 2026-10-27 | `b43d66e` | Fused AVX2 GEMV for Q4_K in the MoE expert path |
+| P-MOE-F13 | 2026-10-27 | `5828846` | Fused GEMV for Q8_0 (attention projections and shared expert) |
+| P-MOE-F14 | 2026-10-27 | `58ccd86` | Fused GEMV for Q5_1 (`ffn_down_exps`) |
+| P-MOE-F15 | 2026-10-27 | `74e41d3` | Parallelize the GEMV row direction and expose in-layer phases |
+| P-MOE-F16 | 2026-10-27 | `a42e144` | Parallelize the GDN delta rule over heads |
+| P-MOE-F17 | 2026-10-27 | `a469224` | Stop-token decode did not append the stop token to `tokens` |
 
 ## Gap between the ceiling (theoretical values) and measurements
 
@@ -838,6 +844,55 @@ gemv (a `.cu` change), which is an extension of the direction whose upper bound 
 **Remaining issue**: the hardware ms/token, the 3 anchors and nsys have not been carried out.
 
 ---
+
+### P-MOE-F12..F17: making Flash-Next (MoE) decode 11.8x faster with per-type fused GEMV and parallelization (2026-10-27, `b43d66e`..`a469224`)
+
+**Goal** — The newly supported MoE model (`qwen4exp`, 48 layers, 512 experts, top-10) took
+**6827 ms** for a one-token forward, 17x slower than the 390 ms/token CPU reference
+implementation. Most of it was the MoE expert GEMV, which expanded one row at a time to f32
+and then did a sequential dot product (no SIMD at all).
+
+**What went in (measured at each step)**
+
+| step | commit | change | forward |
+|---|---|---|---|
+| start | — | — | 6827 ms |
+| F12 | `b43d66e` | Fused AVX2+FMA GEMV for Q4_K (FMA straight from the 144 B block) | 5214 ms |
+| F13 | `5828846` | Fused GEMV for Q8_0 + in-layer phase profiling (`DENNO_Q4_PROFILE=1`) | 1755 ms |
+| F14 | `58ccd86` | Fused GEMV for Q5_1 | 1036 ms |
+| F15 | `74e41d3` | Parallelize the GEMV row direction (feature `par`, on by default) | 601 ms |
+| F16 | `a42e144` | Parallelize the GDN delta rule over heads | **579 ms** |
+
+**Why it worked, and why the first step did not**
+
+- The Q4_K kernel alone gave only 1.3x. The reason is that this model's quantization is
+  **mixed**: the attention projections (`attn_qkv` / `attn_gate` / `attn_output`) and the
+  shared expert are **Q8_0**, `ffn_down_exps` is **Q5_1** (43 of 48 layers), and only
+  `ffn_gate_exps` / `ffn_up_exps` are Q4_K. Adding one kernel per type took 3 steps to 6.5x,
+  and parallelization added another 1.8x.
+- The kernel alone went from 2281 to 164 ns/row for Q4_K. Maximum difference from an f64
+  truth was 1.05e-5 for the fused Q8_0 path (6.10e-5 scalar) and 2.38e-7 for the fused Q5_1
+  path (2.15e-6 scalar): the fused versions are **more** accurate. For Q5_1, `w = d*q + m`
+  lets us split `dot(w, x) = d*dot(q, x) + m*sum(x)`.
+- Row parallelism keeps every element's accumulation order (rows are independent), so it
+  stayed bit-identical and gave 1.7x on 16 threads. Head parallelism is the same story
+  (heads are independent). The 4-token greedy sequence `[271, 248068, 198, 760]` never moved.
+- The `MADV_WILLNEED` prefetch had no effect (5197 vs 5214 ms).
+
+**The remaining bottleneck** — After parallelization the per-layer split is attn 3.72 ms
+(gdn 1.29 of it) / **moe 4.63 ms** / mix 1.50 ms. The MoE path reads 10.1 MB per layer at
+2.2 GB/s, which is about the NVMe sequential speed (measured 2.8 GB/s; 26 GB/s for ranges
+already in page cache). The model is 104 GB against 60 GB of RAM, so the page cache cannot
+hold it and reads fall through to disk every time. It is **I/O bound, not compute bound**.
+
+**Side product** — Running `cargo test --release --all-targets` on a clean clone surfaced an
+existing defect: `decode_greedy_stop` did not append the stop token to `tokens` (it also
+failed at `0f5610c`). The stop branch broke out before calling `step()`, so F17 now runs the
+forward and then stops.
+
+**Not verified** — The 27B (Q4_0) wide 8-prompt md5 and the GPU anchors have not been
+re-measured because the production server is down. Row and head parallelism do not change
+accumulation order, so the numbers should be unchanged, but this gets confirmed after restart.
 
 ## Rejected approaches
 

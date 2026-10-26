@@ -10,7 +10,7 @@ order runs "features → models → performance → quality → verification".
 - The old `docs/HISTORY.ja.md` / `docs/HISTORY.en.md` (4,007 lines, stopping at P41) were folded into these
   8 volumes and **deleted**. The raw commit-by-commit log can still be read out of git history (point at the
   parent of the commit that deleted them).
-- All 137 phases, date-ordered with their commits, are in [`90_phase_index.md`](90_phase_index.md).
+- All 143 phases, date-ordered with their commits, are in [`90_phase_index.md`](90_phase_index.md).
 
 ## Volumes
 
@@ -24,7 +24,7 @@ order runs "features → models → performance → quality → verification".
 | 6 [`50_gdn.md`](50_gdn.md) | Gated DeltaNet: the maths, the kernels, the numbers. Where bit-identity was given up | P19, s61c, s192 and others |
 | 7 [`60_quality.md`](60_quality.md) | Measured isolation of broken output. Fake turns, repetition collapse, thinking modes, stop conditions | s53–s56b, P4-1/P4-4 |
 | 8 [`70_infra.md`](70_infra.md) | How it was measured, and when a number can be trusted. Anchors, cold A/B, measurement windows | everything from P7.5 on |
-| Appendix A [`90_phase_index.md`](90_phase_index.md) | Every phase in date order (machine-generated index) | 137 phases |
+| Appendix A [`90_phase_index.md`](90_phase_index.md) | Every phase in date order (machine-generated index) | 143 phases |
 | Appendix B [`80_licenses.md`](80_licenses.md) | Ledger of the external implementations consulted and their licences | P19 |
 
 ## The whole picture
@@ -54,7 +54,7 @@ Only three prerequisites are needed to read this.
 4. **Interested in quality and failure modes**: `60_quality.md` (fake turns, repetition collapse, thinking
    modes, stop conditions).
 5. **How it was measured**: `70_infra.md` (profilers, anchors, cold A/B, running measurement windows).
-6. **Want a commit**: [`90_phase_index.md`](90_phase_index.md) (all 137 phases, date-ordered, with commits).
+6. **Want a commit**: [`90_phase_index.md`](90_phase_index.md) (all 143 phases, date-ordered, with commits).
 
 ## Timeline (by arc)
 
@@ -62,7 +62,7 @@ Four eras, each with its **representative arcs** one line at a time. `Effect` li
 **moved** in that arc. `—` means no recorded number. The denominators (model, quantisation, token count) are
 in the body of each volume.
 
-Every one of the 137 phases, one line each in date order, is in [`90_phase_index.md`](90_phase_index.md).
+Every one of the 143 phases, one line each in date order, is in [`90_phase_index.md`](90_phase_index.md).
 
 ### Era 1: Standing it up (CPU → int8 → batching)
 
@@ -146,7 +146,7 @@ Every one of the 137 phases, one line each in date order, is in [`90_phase_index
 | integration and deployment | 2026-10-24 | The integrated P47–P52 build went to production (16k 8.44 s / 65k 34.95 s) | 40 / 70 | 16k 8.44 s, 65k 34.95 s |
 
 > This arc table is the **skeleton of the story**. That no phase is missing can be checked against the
-> 137 lines of `90_phase_index.md` (sum of each volume's `## Phases covered` = 7 + 13 + 27 + 25 + 41 + 16 + 8).
+> 143 lines of `90_phase_index.md` (sum of each volume's `## Phases covered` = 7 + 13 + 27 + 25 + 47 + 16 + 8).
 
 ## Volume summaries
 
