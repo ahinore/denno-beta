@@ -11,6 +11,7 @@ pub mod moe_expert;
 pub mod qwen35;
 pub mod qwen4exp;
 pub mod qwen4exp_attn;
+pub mod qwen4exp_decode;
 pub mod qwen4exp_ssm;
 
 use anyhow::{bail, Result};
