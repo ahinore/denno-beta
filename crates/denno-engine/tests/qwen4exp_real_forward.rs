@@ -298,3 +298,60 @@ fn real_model_top5_per_step() {
     }
     eprintln!("TOTAL_ms {:.0}", t0.elapsed().as_secs_f64() * 1e3);
 }
+
+
+/// 実重みで 1 トークン forward の層別所要時間を出す（性能の当たりを付けるため）。
+///
+/// 層の出口フックの呼び出し間隔を測る。48 層ぶんの表と、合計を出す。
+#[test]
+#[ignore]
+fn real_model_layer_timings() {
+    let parts = match parts() {
+        Some(p) => p,
+        None => {
+            eprintln!("DENNO_Q4_DIR が無いので skip");
+            return;
+        }
+    };
+    let f = GgufFile::open_split(&parts).expect("分割 GGUF を開けない");
+    let p = Qwen4ExpParams::from_meta(&f).expect("メタデータを読めない");
+    let full = FullAttn::from_gguf(&f, &p, 32).expect("FullAttn");
+    let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
+    let mut m = Qwen4Exp::with_attn(&f, Box::new(attn)).expect("モデルを組めない");
+
+    // warm-up は捨てる（初回は重みのページインを含む）
+    let _ = m.forward_token(&[16, 10, 16]).expect("warm-up");
+
+    let mut marks: Vec<std::time::Instant> = Vec::with_capacity(64);
+    marks.push(std::time::Instant::now());
+    let t0 = std::time::Instant::now();
+    let mut m2 = {
+        let f2 = GgufFile::open_split(&parts).expect("再オープン");
+        let p2 = Qwen4ExpParams::from_meta(&f2).expect("メタ");
+        let full2 = FullAttn::from_gguf(&f2, &p2, 32).expect("FullAttn");
+        let attn2 = SsmAttn::with_full(&f2, &p2, Box::new(full2)).expect("SsmAttn");
+        Qwen4Exp::with_attn(&f2, Box::new(attn2)).expect("モデル")
+    };
+    let logits = m2
+        .forward_token_with(&[16, 10, 16, 14876, 30], |_il, _res| {
+            marks.push(std::time::Instant::now());
+            Ok(())
+        })
+        .expect("forward");
+    let total = t0.elapsed();
+    assert_eq!(marks.len(), p.n_layer + 1);
+    let mut sum = 0.0f64;
+    for il in 0..p.n_layer {
+        let ms = marks[il + 1].duration_since(marks[il]).as_secs_f64() * 1e3;
+        sum += ms;
+        eprintln!("LAYER {il:02} {ms:8.2} ms");
+    }
+    let tail = marks[p.n_layer].duration_since(marks[p.n_layer]).as_secs_f64();
+    let _ = tail;
+    eprintln!(
+        "TOTAL_forward {:.0} ms (layers {:.0} ms, logits {})",
+        total.as_secs_f64() * 1e3,
+        sum,
+        logits.len()
+    );
+}
