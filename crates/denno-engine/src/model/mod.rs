@@ -3,6 +3,7 @@
 pub mod gpt2;
 pub mod llama;
 pub mod moe;
+pub mod moe_expert;
 pub mod qwen35;
 
 use anyhow::{bail, Result};
