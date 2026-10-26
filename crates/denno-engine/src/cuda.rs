@@ -1180,6 +1180,53 @@ impl CudaCtx {
 
         self.make_current()?;
         let dev_w = DevBuffer::from_slice(w)?;
+        let used = self.moe_gemv_dev(ty, &dev_w, x, n_in, n_out, out)?;
+        Ok(used)
+    }
+
+    /// P-MOE-E5: 既に VRAM に載っている重み (`dev_w`) で GEMV する。
+    /// 重みの H2D を含まないので、常駐キャッシュ越しに毎トークン呼べる。
+    /// 引数検査は [`Self::moe_gemv`] と同じ (重みのバイト長は検査できない)。
+    pub fn moe_gemv_dev(
+        &self,
+        ty: crate::kquant::GgmlType,
+        dev_w: &DevBuffer,
+        x: &[f32],
+        n_in: usize,
+        n_out: usize,
+        out: &mut [f32],
+    ) -> Result<bool> {
+        use crate::kquant::GgmlType as T;
+        let fs = match self.f_moe {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let (f, rb) = match ty {
+            T::Q8_0 => (fs[0], (n_in / 32) * 34),
+            T::Q5_1 => (fs[1], (n_in / 32) * 24),
+            T::Q4K => (fs[2], (n_in / 256) * 144),
+            T::Q5K => (fs[3], (n_in / 256) * 176),
+            _ => return Ok(false),
+        };
+        let bs = ty.blck_size();
+        if n_in == 0 || n_out == 0 || n_in % bs != 0 {
+            bail!("moe_gemv_dev: 形状が不正 (n_in={n_in}, n_out={n_out}, block={bs})");
+        }
+        if dev_w.bytes() != n_out * rb {
+            bail!(
+                "moe_gemv_dev: 重みのデバイスバイト数 {} が n_out * row_bytes = {} と違う",
+                dev_w.bytes(),
+                n_out * rb
+            );
+        }
+        if x.len() != n_in {
+            bail!("moe_gemv_dev: x の長さ {} が n_in={n_in} と違う", x.len());
+        }
+        if out.len() != n_out {
+            bail!("moe_gemv_dev: out の長さ {} が n_out={n_out} と違う", out.len());
+        }
+
+        self.make_current()?;
         let dev_x = DevBuffer::from_slice(x)?;
         let dev_o = DevBuffer::alloc(n_out * 4)?;
         const MOE_ROWS_PER_BLOCK: usize = 4; // kernels_moe.cu の MOE_ROWS と一致
@@ -3801,6 +3848,130 @@ fn weights_for_q4(uid: u64, blocks: &[u8], k: usize, n: usize) -> Result<&'stati
     let e = map.get(&uid).expect("just inserted");
     debug_assert_eq!((e.k, e.n), (k, n), "uid 重複: 同一 uid に異なる形状 (q4)");
     Ok(unsafe { std::mem::transmute::<&GpuWq4, &'static GpuWq4>(e.as_ref()) })
+}
+
+/// P-MOE-E5: GGUF の生ブロック (Q8_0 / Q5_1 / Q4_K / Q5_K) を VRAM に常駐させる
+/// レジストリ (uid → デバイスバッファ)。重みは 1 度だけ転送し、以後は GEMV だけ。
+/// 27B の q4 レジストリと同じ形 (uid は `quant::next_q8_uid` で払い出す)。
+struct GpuGgufW {
+    buf: DevBuffer,
+    ty: crate::kquant::GgmlType,
+    k: usize,
+    n: usize,
+}
+
+fn gguf_registry() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Box<GpuGgufW>>> {
+    static REG: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Box<GpuGgufW>>>> =
+        OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// GGUF ブロック 1 行のバイト数。expert GEMV が扱う 4 型だけ `Some`。
+fn gguf_row_bytes(ty: crate::kquant::GgmlType, k: usize) -> Option<usize> {
+    use crate::kquant::GgmlType as T;
+    if k == 0 || k % ty.blck_size() != 0 {
+        return None;
+    }
+    Some(match ty {
+        T::Q8_0 => (k / 32) * 34,
+        T::Q5_1 => (k / 32) * 24,
+        T::Q4K => (k / 256) * 144,
+        T::Q5K => (k / 256) * 176,
+        _ => return None,
+    })
+}
+
+/// 重みを (初回だけ) VRAM へ上げて常駐エントリを返す。`uid` は呼び出し側が
+/// 安定して持つこと (同じ uid に別の形状・型を渡したらエラー)。
+fn weights_for_gguf(
+    uid: u64,
+    ty: crate::kquant::GgmlType,
+    blocks: &[u8],
+    k: usize,
+    n: usize,
+) -> Result<&'static GpuGgufW> {
+    let reg = gguf_registry();
+    let mut map = reg
+        .lock()
+        .map_err(|_| anyhow::anyhow!("gguf weights registry poisoned"))?;
+    if !map.contains_key(&uid) {
+        let rb = gguf_row_bytes(ty, k)
+            .ok_or_else(|| anyhow::anyhow!("gguf: 未対応の型 {ty:?} (k={k})"))?;
+        let want = n
+            .checked_mul(rb)
+            .ok_or_else(|| anyhow::anyhow!("gguf: n * row_bytes が usize を溢れる"))?;
+        if blocks.len() != want {
+            bail!(
+                "gguf: バイト数 {} が n * row_bytes = {} と違う (ty={ty:?}, k={k}, n={n})",
+                blocks.len(),
+                want
+            );
+        }
+        let buf = DevBuffer::from_slice(blocks)?;
+        tracing::info!(
+            "CUDA gguf weight upload (uid={uid}): ty={ty:?} k={k} n={n} ({:.1} MB)",
+            want as f64 / 1e6
+        );
+        map.insert(uid, Box::new(GpuGgufW { buf, ty, k, n }));
+    }
+    let e = map.get(&uid).expect("just inserted");
+    if (e.k, e.n, e.ty) != (k, n, ty) {
+        bail!(
+            "uid 重複: 同一 uid {uid} に別の形状/型 (登録済み k={} n={} ty={:?} / 今回 k={k} n={n} ty={ty:?})",
+            e.k,
+            e.n,
+            e.ty
+        );
+    }
+    Ok(unsafe { std::mem::transmute::<&GpuGgufW, &'static GpuGgufW>(e.as_ref()) })
+}
+
+/// P-MOE-E5: GGUF ブロックのままの線形層 (m=1) を GPU で計算する。
+///
+/// 対象外の型・GPU 無効・CUDA 不調・登録失敗では `false` を返す。呼び出し側は
+/// CPU 参照へ落ちること (fail closed。別経路の数値を黙って返さない)。
+pub fn maybe_gpu_gguf_gemv_into(
+    uid: u64,
+    ty: crate::kquant::GgmlType,
+    blocks: &[u8],
+    k: usize,
+    n: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> bool {
+    set_last_linear_ran_on_gpu(false);
+    if !cuda_enabled() || gguf_row_bytes(ty, k).is_none() {
+        return false;
+    }
+    if x.len() != k || out.len() != n {
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if let Err(e) = ctx.make_current() {
+        tracing::error!("CUDA cuCtxSetCurrent failed, using CPU gguf: {e:#}");
+        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    let w = match weights_for_gguf(uid, ty, blocks, k, n) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!("gguf weight register failed (uid={uid}): {e:#}");
+            return false;
+        }
+    };
+    match ctx.moe_gemv_dev(ty, &w.buf, x, k, n, out) {
+        Ok(true) => {
+            set_last_linear_ran_on_gpu(true);
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            tracing::error!("gguf gemv failed (uid={uid}): {e:#}");
+            false
+        }
+    }
 }
 
 /// s123: Q4_0 線形層の結果を Vec で返す版 (`Linear::apply` 系から使う)。

@@ -104,6 +104,22 @@ impl GgufLinear {
         match self.ty {
             // 量子型は expert GEMV と本体を共有する (1 行ずつデコードして逐次内積)。
             GgmlType::Q8_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K => {
+                // P-MOE-E5: 重みが VRAM に常駐していれば GPU で計算する。
+                // 対象外・GPU 無効・不調では false が返り、下の CPU 参照へ落ちる。
+                #[cfg(feature = "cuda")]
+                {
+                    if crate::cuda::maybe_gpu_gguf_gemv_into(
+                        self.uid,
+                        self.ty,
+                        self.blocks.as_slice(),
+                        self.k,
+                        self.n,
+                        x,
+                        out,
+                    ) {
+                        return Ok(());
+                    }
+                }
                 expert_gemv(self.ty, self.blocks.as_slice(), self.k, self.n, x, out)
             }
             // 無量子型 (F32 / F16 / BF16) は expert GEMV の対象外なので同じ規則で回す。
