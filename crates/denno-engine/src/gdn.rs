@@ -258,6 +258,89 @@ pub fn forward_token_core(
 }
 
 /// [`forward_token_core`] の出力ゲート種別つき版。
+/// デルタルール 1 ヘッドぶん。`s_head` は `[dk][dv]` 行優先のヘッド専用スライス。
+///
+/// ヘッド内は逐次加算のまま (llama.cpp の fused カーネルとの比較対象)。
+#[allow(clippy::too_many_arguments)]
+fn gdn_head(
+    p: &GdnParams,
+    cw: &GdnCore<'_>,
+    q: &[f32],
+    k: &[f32],
+    v_raw: &[f32],
+    beta_raw: &[f32],
+    alpha: &[f32],
+    s_head: &mut [f32],
+    o_head: &mut [f32],
+    h: usize,
+) {
+    let dk = p.head_k_dim;
+    let dv = p.head_v_dim;
+
+    // k/q は n_k_heads と n_v_heads が異なる場合はタイル repeat 規約
+    // (GGUF / llama.cpp ggml_repeat / fused カーネル `iv1 % neq1` = strided:
+    //  v-head h → k/q head h % nk。0.8B は nk==nv で同一・9B は nk=16/nv=32・
+    //  27B は nk=16/nv=48)。HF transformers の repeat_interleave (blocked) と
+    //  は異なる規約であり、第15/16セッションの lchk サブステージ比較で 9B/27B
+    //  とも llama.cpp の o が strided のみ cos≈1 で一致することを確認済み。
+    let kh = h % p.n_k_heads;
+    let qh = &q[kh * dk..kh * dk + dk];
+    let kh_v = &k[kh * dk..kh * dk + dk];
+    let vh = &v_raw[h * dv..h * dv + dv];
+
+    // decay: g = ssm_a * softplus(alpha + dt)
+    let g = cw.ssm_a[h] * softplus(alpha[h] + cw.ssm_dt[h]);
+    let eg = g.exp();
+
+    // S ← S * exp(g)   (S[h] は [dk][dv] 行優先)
+    for r in 0..dk {
+        for c in 0..dv {
+            s_head[r * dv + c] *= eg;
+        }
+    }
+
+    // sk[c] = Σ_r k[r] * S[r][c]
+    let mut sk = vec![0.0f32; dv];
+    for r in 0..dk {
+        let kr = kh_v[r];
+        if kr != 0.0 {
+            let row = &s_head[r * dv..r * dv + dv];
+            for (c, skc) in sk.iter_mut().enumerate() {
+                *skc += kr * row[c];
+            }
+        }
+    }
+
+    // d[c] = beta * (v[c] - sk[c])
+    let b = sigmoid(beta_raw[h]);
+    let mut d = vec![0.0f32; dv];
+    for c in 0..dv {
+        d[c] = b * (vh[c] - sk[c]);
+    }
+
+    // S[r][c] += k[r] * d[c]
+    for r in 0..dk {
+        let kr = kh_v[r];
+        if kr != 0.0 {
+            let row = &mut s_head[r * dv..r * dv + dv];
+            for (c, dc) in d.iter().enumerate() {
+                row[c] += kr * dc;
+            }
+        }
+    }
+
+    // o[c] = Σ_r q[r] * S[r][c]
+    for r in 0..dk {
+        let qr = qh[r];
+        if qr != 0.0 {
+            let row = &s_head[r * dv..r * dv + dv];
+            for (c, oc) in o_head.iter_mut().enumerate() {
+                *oc += qr * row[c];
+            }
+        }
+    }
+}
+
 pub fn forward_token_core_gate(
     p: &GdnParams,
     cw: &GdnCore<'_>,
@@ -351,70 +434,63 @@ pub fn forward_token_core_gate(
     let dk = p.head_k_dim;
     let dv = p.head_v_dim;
     let mut o = vec![0.0f32; vd];
-    for h in 0..p.n_v_heads {
-        // k/q は n_k_heads と n_v_heads が異なる場合はタイル repeat 規約
-        // (GGUF / llama.cpp ggml_repeat / fused カーネル `iv1 % neq1` = strided:
-        //  v-head h → k/q head h % nk。0.8B は nk==nv で同一・9B は nk=16/nv=32・
-        //  27B は nk=16/nv=48)。HF transformers の repeat_interleave (blocked) と
-        //  は異なる規約であり、第15/16セッションの lchk サブステージ比較で 9B/27B
-        //  とも llama.cpp の o が strided のみ cos≈1 で一致することを確認済み。
-        let kh = h % p.n_k_heads;
-        let qh = &q[kh * dk..kh * dk + dk];
-        let kh_v = &k[kh * dk..kh * dk + dk];
-        let vh = &v_raw[h * dv..h * dv + dv];
-
-        // decay: g = ssm_a * softplus(alpha + dt)
-        let g = cw.ssm_a[h] * softplus(alpha[h] + cw.ssm_dt[h]);
-        let eg = g.exp();
-
-        // S ← S * exp(g)   (S[h] は [dk][dv] 行優先)
-        let s_base = h * dk * dv;
-        for r in 0..dk {
-            for c in 0..dv {
-                st.ssm[s_base + r * dv + c] *= eg;
+    // ヘッドは互いに独立 (状態 S[h] と出力 o[h] がヘッド専用のスライス) なので、
+    // どのヘッドをどのスレッドが担当しても各要素の計算順序は変わらない。
+    // 27B の「GDN は CPU/GPU でビット一致」契約はこの性質に依存している。
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        if p.n_v_heads >= 8 {
+            st.ssm
+                .par_chunks_mut(dk * dv)
+                .zip(o.par_chunks_mut(dv))
+                .enumerate()
+                .for_each(|(h, (s_head, o_head))| {
+                    gdn_head(
+                        p,
+                        cw,
+                        &q,
+                        &k,
+                        v_raw,
+                        beta_raw,
+                        alpha,
+                        s_head,
+                        o_head,
+                        h,
+                    );
+                });
+        } else {
+            for h in 0..p.n_v_heads {
+                gdn_head(
+                    p,
+                    cw,
+                    &q,
+                    &k,
+                    v_raw,
+                    beta_raw,
+                    alpha,
+                    &mut st.ssm[h * dk * dv..(h + 1) * dk * dv],
+                    &mut o[h * dv..(h + 1) * dv],
+                    h,
+                );
             }
         }
-
-        // sk[c] = Σ_r k[r] * S[r][c]
-        let mut sk = vec![0.0f32; dv];
-        for r in 0..dk {
-            let kr = kh_v[r];
-            if kr != 0.0 {
-                let row = &st.ssm[s_base + r * dv..s_base + r * dv + dv];
-                for (c, skc) in sk.iter_mut().enumerate() {
-                    *skc += kr * row[c];
-                }
-            }
-        }
-
-        // d[c] = beta * (v[c] - sk[c])
-        let b = sigmoid(beta_raw[h]);
-        let mut d = vec![0.0f32; dv];
-        for c in 0..dv {
-            d[c] = b * (vh[c] - sk[c]);
-        }
-
-        // S[r][c] += k[r] * d[c]
-        for r in 0..dk {
-            let kr = kh_v[r];
-            if kr != 0.0 {
-                let row = &mut st.ssm[s_base + r * dv..s_base + r * dv + dv];
-                for (c, dc) in d.iter().enumerate() {
-                    row[c] += kr * dc;
-                }
-            }
-        }
-
-        // o[c] = Σ_r q[r] * S[r][c]
-        let obase = h * dv;
-        for r in 0..dk {
-            let qr = qh[r];
-            if qr != 0.0 {
-                let row = &st.ssm[s_base + r * dv..s_base + r * dv + dv];
-                for (c, oc) in o[obase..obase + dv].iter_mut().enumerate() {
-                    *oc += qr * row[c];
-                }
-            }
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        for h in 0..p.n_v_heads {
+            gdn_head(
+                p,
+                cw,
+                &q,
+                &k,
+                v_raw,
+                beta_raw,
+                alpha,
+                &mut st.ssm[h * dk * dv..(h + 1) * dk * dv],
+                &mut o[h * dv..(h + 1) * dv],
+                h,
+            );
         }
     }
 
