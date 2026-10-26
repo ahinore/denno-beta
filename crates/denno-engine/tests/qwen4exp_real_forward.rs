@@ -257,3 +257,44 @@ fn real_model_greedy_short_prompt() {
     assert_eq!(out.len(), 4);
     assert!(d.tokens().len() == prompt.len() + 4);
 }
+
+
+/// 実重みで各ステップの top-5 を出す（参照実装の `llama-simple` と突き合わせるため）。
+#[test]
+#[ignore]
+fn real_model_top5_per_step() {
+    let parts = match parts() {
+        Some(p) => p,
+        None => {
+            eprintln!("DENNO_Q4_DIR が無いので skip");
+            return;
+        }
+    };
+    let f = GgufFile::open_split(&parts).expect("分割 GGUF を開けない");
+    let p = Qwen4ExpParams::from_meta(&f).expect("メタデータを読めない");
+    let full = FullAttn::from_gguf(&f, &p, 32).expect("FullAttn");
+    let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
+    let m = Qwen4Exp::with_attn(&f, Box::new(attn)).expect("モデルを組めない");
+
+    let prompt: Vec<u32> = vec![16, 10, 16, 14876, 30];
+    let mut d = Qwen4ExpDecoder::new(m, DecoderConfig::new(32));
+    let t0 = std::time::Instant::now();
+    let mut logits = d.prefill(&prompt).expect("prefill");
+    for step in 0..4 {
+        let mut top: Vec<(usize, f32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, *v))
+            .collect();
+        top.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let line: Vec<String> = top
+            .iter()
+            .take(5)
+            .map(|(i, v)| format!("{i}:{v:.4}"))
+            .collect();
+        eprintln!("STEP {step} top5 {}", line.join(" "));
+        let next = top[0].0 as u32;
+        logits = d.step(next).expect("step");
+    }
+    eprintln!("TOTAL_ms {:.0}", t0.elapsed().as_secs_f64() * 1e3);
+}
