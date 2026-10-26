@@ -1739,6 +1739,9 @@ pub struct Qwen4Exp {
     head: HeadW,
     tok_embd: GgufLinear,
     ple: Option<PleRuntime>,
+    /// PLE の conv 履歴 (層ごと)。`(kern-1) * ngram_size` トークン分の
+    /// `grouped_rms_norm(gated)` を古い順に保持する。層に PLE が無ければ `None`。
+    ple_conv_state: Vec<Option<Vec<f32>>>,
     pub attn: Box<dyn LayerAttn>,
 }
 
@@ -1771,14 +1774,35 @@ impl Qwen4Exp {
             None
         };
 
+        // PLE の conv 履歴スロット (層ごと)。参照実装の `hist = (kern-1)*dil`。
+        let hist_len = p.ple_conv_kernel.saturating_sub(1) * p.ple_ngram_size;
+        let hc_dim = p.n_hc * p.n_embd;
+        let ple_conv_state: Vec<Option<Vec<f32>>> = (0..p.n_layer)
+            .map(|il| {
+                if p.ple_layers.contains(&il) {
+                    Some(vec![0.0f32; hist_len * hc_dim])
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         Ok(Qwen4Exp {
             p,
             layers,
             head,
             tok_embd,
             ple,
+            ple_conv_state,
             attn,
         })
+    }
+
+    /// PLE の conv 履歴を消す (系列の切れ目で呼ぶ)。
+    pub fn reset_ple_conv(&mut self) {
+        for b in self.ple_conv_state.iter_mut().flatten() {
+            b.fill(0.0);
+        }
     }
 
     /// 諸元（読み取り専用）。
@@ -1908,7 +1932,11 @@ impl Qwen4Exp {
         // 3.1 PLE 注入 (層 1 のみ)。res_hc を置き換える。
         if let Some(pw) = &lw.ple {
             let pe = ple_emb.ok_or_else(|| one(format!("層 {il}: PLE の行が無い")))?;
-            *res = ple_inject(&self.p, pw, pe, res, hp)?;
+            let hist_buf = match self.ple_conv_state[il].as_mut() {
+                Some(b) => b,
+                None => return Err(one(format!("層 {il}: PLE の conv 履歴が無い"))),
+            };
+            *res = ple_inject(&self.p, pw, pe, res, hp, hist_buf)?;
             hook("ple_after", il, &res.data)?;
         }
 
@@ -2033,6 +2061,7 @@ fn ple_inject(
     ple_emb: &[f32],
     res: &HyperStreams,
     hp: &HyperParams,
+    hist_buf: &mut Vec<f32>,
 ) -> Result<HyperStreams> {
     let e = p.n_embd;
     let hc = p.n_hc;
@@ -2113,18 +2142,35 @@ fn ple_inject(
         )));
     }
     let dil = p.ple_ngram_size;
+    let hist = (kern - 1) * dil;
+    if hist_buf.len() != hist * hc_dim {
+        return Err(one(format!(
+            "ple_conv_state: 長さ {} が hist({hist}) * hc_dim({hc_dim}) と違う",
+            hist_buf.len()
+        )));
+    }
     let mut conv = vec![0.0f32; hc_dim];
     for c in 0..hc_dim {
         // out[c] = Σ_k w[k][c] * x[c, t - (kern-1-k)*dil]
         // GGUF の ne は [kern, hc_dim] なので、列 c の k 番目は conv1d[c*kern + k]。
+        // 参照実装は履歴を `padded = [hist + n_tokens]` として前置きするので、
+        // `back` トークン前の値は hist_buf の (hist - back) 番目のスロット。
         let mut acc = 0.0f32;
         for k in 0..kern {
-            let delay = (kern - 1 - k) * dil;
-            // F1: 履歴は 0 埋め。t = 0 では delay == 0 の項だけが残る。
-            let v = if delay == 0 { x[c] } else { 0.0f32 };
+            let back = (kern - 1 - k) * dil;
+            let v = if back == 0 {
+                x[c]
+            } else {
+                hist_buf[(hist - back) * hc_dim + c]
+            };
             acc += pw.conv1d[c * kern + k] * v;
         }
         conv[c] = hyper::silu(acc);
+    }
+    // 履歴を 1 トークン進める (古い側を捨て、末尾に今の x を入れる)。
+    if hist > 0 {
+        hist_buf.copy_within(hc_dim.., 0);
+        hist_buf[(hist - 1) * hc_dim..].copy_from_slice(&x);
     }
 
     // 6. res + (gated + conv)
