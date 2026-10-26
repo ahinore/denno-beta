@@ -391,6 +391,11 @@ fn real_model_layer_timings() {
         let attn2 = SsmAttn::with_full(&f2, &p2, Box::new(full2)).expect("SsmAttn");
         Qwen4Exp::with_attn(&f2, Box::new(attn2)).expect("モデル")
     };
+    // 計測用インスタンスも 1 回転がしておく。cuda ビルドでは初回の `gemv` が
+    // 重みの VRAM 転送を行うので、これを計測に含めると GPU 側だけ過大に出る。
+    let _ = m2.forward_token(&[16, 10, 16]).expect("計測用の warm-up");
+    denno_engine::model::qwen4exp::q4prof::reset();
+    let t0 = std::time::Instant::now();
     let logits = m2
         .forward_token_with(&[16, 10, 16, 14876, 30], |_il, _res| {
             marks.push(std::time::Instant::now());
