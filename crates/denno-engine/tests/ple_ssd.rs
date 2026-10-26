@@ -429,7 +429,7 @@ fn gather_from_nonzero_split_part() {
 /// 実ファイルに対する計測 (未実施の環境では何もせず return)。
 ///
 /// 実行:
-///   PLE_GGUF=/home/iegamo/models/qwen38-flash-next/<表を含むパート>.gguf \
+///   PLE_GGUF=<表を含む GGUF パートのパス> \
 ///   cargo test --release -p denno-engine --test ple_ssd -- --ignored --nocapture \
 ///     ple_gather_timing_real_gguf
 ///
@@ -471,9 +471,8 @@ fn ple_gather_timing_real_gguf() {
             }
             Err(_) => {
                 eprintln!(
-                    "skip: PLE_GGUF も PLE_SYNTH_ROWS も未設定。/home/iegamo/models/\
-                     qwen38-flash-next/ はこのコンテナから見えないため実測は未実施 \
-                     (REPORT_MOE_C1.md 参照)"
+                    "skip: PLE_GGUF も PLE_SYNTH_ROWS も未設定。実ファイルはこの \
+                     コンテナから見えないため実測は未実施 (REPORT_MOE_C1.md 参照)"
                 );
                 return;
             }
