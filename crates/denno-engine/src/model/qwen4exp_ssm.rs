@@ -161,7 +161,17 @@ impl SsmLayer {
             ssm_norm: &self.ssm_norm,
         };
         // 数式・演算順序は gdn.rs のものをそのまま使う (この層では書き直さない)。
-        let y = gdn::forward_token_core(&self.p, &cw, &qkv, &z, &beta_raw, &alpha, &mut self.state);
+        // qwen4exp の出力ゲートは **sigmoid** (qwen35 の silu ではない)。
+        let y = gdn::forward_token_core_gate(
+            &self.p,
+            &cw,
+            &qkv,
+            &z,
+            &beta_raw,
+            &alpha,
+            &mut self.state,
+            gdn::GateKind::Sigmoid,
+        );
 
         let mut out = vec![0f32; self.p.n_embd];
         self.w_out.gemv(&y, &mut out)?;

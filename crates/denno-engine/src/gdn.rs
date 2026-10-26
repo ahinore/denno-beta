@@ -17,7 +17,12 @@
 //! 5. S[r][c] += k[r] * d[c]
 //! 6. o[c] = Σ_r q[r] * S[r][c]
 //! q,k は事前に L2 正規化 (x/sqrt(Σx²+eps))、q にのみ 1/sqrt(head_k_dim) を掛ける。
-//! 出力は head ごとに gated RMS norm: rmsnorm(o)*w * silu(z)。
+//! 出力は head ごとに gated RMS norm: rmsnorm(o)*w * g(z)。
+//!
+//! g はモデル系で違う。Qwen3.5 (`qwen35`) は `silu`、Qwen3.8-Flash-Next
+//! (`qwen4exp`) は `sigmoid` (参照実装 `qwen4exp.cpp` の `build_norm_gated` に
+//! "the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu"
+//! と明記がある)。`GateKind` で選ぶ。既定 (`forward_token_core`) は `Silu`。
 
 /// s90 (P1-1): 2 launch スケジュールの帳簿 (ホスト側・GPU 不要)
 pub mod scan_schedule;
@@ -230,6 +235,16 @@ pub struct GdnCore<'a> {
 
 /// コア本体: 投影済み qkv/z/beta/alpha から gated-norm 済み出力 [value_dim] を返す。
 /// forward_token と同じ演算順序 (bit 一致)。
+/// gated RMS norm の出力ゲートの種類。
+///
+/// - `Silu`: Qwen3.5 (`qwen35`) の GDN。
+/// - `Sigmoid`: Qwen3.8-Flash-Next (`qwen4exp`) の GDN。**ここだけが 3.5 と違う**。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GateKind {
+    Silu,
+    Sigmoid,
+}
+
 pub fn forward_token_core(
     p: &GdnParams,
     cw: &GdnCore<'_>,
@@ -238,6 +253,20 @@ pub fn forward_token_core(
     beta_raw: &[f32],
     alpha: &[f32],
     st: &mut GdnState,
+) -> Vec<f32> {
+    forward_token_core_gate(p, cw, qkv, z, beta_raw, alpha, st, GateKind::Silu)
+}
+
+/// [`forward_token_core`] の出力ゲート種別つき版。
+pub fn forward_token_core_gate(
+    p: &GdnParams,
+    cw: &GdnCore<'_>,
+    qkv: &[f32],
+    z: &[f32],
+    beta_raw: &[f32],
+    alpha: &[f32],
+    st: &mut GdnState,
+    gate: GateKind,
 ) -> Vec<f32> {
     // 恒久診断: GDN サブステージ per-token ダンプ (27B 初発散層の stage 内切り
     // 分け用)。DENNO_DEBUG_GDN_DUMP=<file> + DENNO_DEBUG_GDN_DUMP_LAYER=<li> で、
@@ -389,14 +418,20 @@ pub fn forward_token_core(
         }
     }
 
-    // ---- gated RMS norm (head ごと): rmsnorm(o)*w * silu(z) -------------
+    // ---- gated RMS norm (head ごと): rmsnorm(o)*w * g(z) ----------------
+    // g は `GateKind` (qwen35 = silu / qwen4exp = sigmoid)。
     let mut y = vec![0.0f32; vd];
     for h in 0..p.n_v_heads {
         let obase = h * dv;
         let mut seg: Vec<f32> = o[obase..obase + dv].to_vec();
         rms_norm(&mut seg, p.eps);
         for (c, v) in seg.iter_mut().enumerate() {
-            *v *= cw.ssm_norm[c] * silu(z[obase + c]);
+            let zc = z[obase + c];
+            let g = match gate {
+                GateKind::Silu => silu(zc),
+                GateKind::Sigmoid => sigmoid(zc),
+            };
+            *v *= cw.ssm_norm[c] * g;
         }
         y[obase..obase + dv].copy_from_slice(&seg);
     }

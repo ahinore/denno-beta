@@ -12,14 +12,16 @@
 //! - デルタ則の 1 ステップは参照実装の式を手で書き下した閉形式と比べる
 //!   (gdn.rs のコードを呼ばずに済ませるため、テスト内で独立に計算する)。
 //!
-//! 出力ゲートは参照実装が `sigmoid(z)`、`gdn.rs` が `silu(z)` で**違う**
-//! (`build_norm_gated` のコメント参照)。本タスクの指示で `gdn.rs` の数式は
-//! 変えていないので、このテストの期待値も `silu` 側で書く (差分は
-//! REPORT_P_MOE_F2.md に記載)。
+//! 出力ゲートは参照実装が `sigmoid(z)`、Qwen3.5 系 (`gdn.rs` の既定) が
+//! `silu(z)` で**違う** (`build_norm_gated` のコメント参照)。P-MOE-F11 で
+//! `GateKind` を足し、qwen4exp の層は `Sigmoid` を渡すようにした。この
+//! テストの期待値も `sigmoid` 側で書く。
 
 use std::path::{Path, PathBuf};
 
-use denno_engine::gdn::{forward_token_core, GdnCore, GdnParams, GdnState};
+use denno_engine::gdn::{
+    forward_token_core_gate, GateKind, GdnCore, GdnParams, GdnState,
+};
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::qwen4exp_ssm::SsmLayer;
 
@@ -344,8 +346,13 @@ fn qkv_projection_rows_and_split() {
 
 // ---- 2. GQA の繰り返し + デルタ則 1 ステップ (小さい次元・手計算) --------
 
-/// silu (gdn.rs と同一規約)
-fn silu(x: f64) -> f64 {
+/// sigmoid (qwen4exp の出力ゲート)
+fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// silu (conv の活性化。こちらは Qwen3.5 と同じ)
+fn silu_f64(x: f64) -> f64 {
     x / (1.0 + (-x).exp())
 }
 
@@ -397,10 +404,19 @@ fn gqa_repeat_is_strided_and_matches_closed_form_step() {
     let alpha = vec![0.0f32; p.n_v_heads]; // softplus(0+0) = ln 2
 
     let mut st = GdnState::new(&p);
-    let y = forward_token_core(&p, &cw, &qkv, &z, &beta_raw, &alpha, &mut st);
+    let y = forward_token_core_gate(
+        &p,
+        &cw,
+        &qkv,
+        &z,
+        &beta_raw,
+        &alpha,
+        &mut st,
+        GateKind::Sigmoid,
+    );
 
     // ---- 閉形式 (f64) で期待値を作る ----
-    let c: Vec<f64> = qkv.iter().map(|&v| silu(v as f64)).collect();
+    let c: Vec<f64> = qkv.iter().map(|&v| silu_f64(v as f64)).collect();
     let kd = p.head_k_dim;
     let vd = p.head_v_dim;
     let q_scale = 1.0 / (kd as f64).sqrt();
@@ -434,7 +450,7 @@ fn gqa_repeat_is_strided_and_matches_closed_form_step() {
         let mean: f64 = o.iter().map(|x| x * x).sum::<f64>() / vd as f64;
         let inv = 1.0 / (mean + p.eps as f64).sqrt();
         for cc in 0..vd {
-            want[h * vd + cc] = o[cc] * inv * ssm_norm[cc] as f64 * silu(z[h * vd + cc] as f64);
+            want[h * vd + cc] = o[cc] * inv * ssm_norm[cc] as f64 * sigmoid(z[h * vd + cc] as f64);
         }
     }
 
