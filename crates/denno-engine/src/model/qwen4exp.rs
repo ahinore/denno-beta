@@ -2233,6 +2233,13 @@ pub mod q4prof {
     pub static ATTN: AtomicU64 = AtomicU64::new(0);
     pub static MOE: AtomicU64 = AtomicU64::new(0);
     pub static N_LAYER: AtomicU64 = AtomicU64::new(0);
+    /// attention の内訳 (SSM 層: qkv 投影 / gate 投影 / GDN 本体 / 出力投影、
+    /// full attention 層: まとめて FULL)。
+    pub static A_QKV: AtomicU64 = AtomicU64::new(0);
+    pub static A_GATE: AtomicU64 = AtomicU64::new(0);
+    pub static A_GDN: AtomicU64 = AtomicU64::new(0);
+    pub static A_OUT: AtomicU64 = AtomicU64::new(0);
+    pub static A_FULL: AtomicU64 = AtomicU64::new(0);
 
     fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
@@ -2264,8 +2271,14 @@ pub mod q4prof {
         )
     }
 
+    /// attention の内訳をミリ秒で返す (qkv, gate, gdn, out, full)。
+    pub fn dump_attn() -> (f64, f64, f64, f64, f64) {
+        let f = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e6;
+        (f(&A_QKV), f(&A_GATE), f(&A_GDN), f(&A_OUT), f(&A_FULL))
+    }
+
     pub fn reset() {
-        for c in [&PLE, &MIX, &ATTN, &MOE] {
+        for c in [&PLE, &MIX, &ATTN, &MOE, &A_QKV, &A_GATE, &A_GDN, &A_OUT, &A_FULL] {
             c.store(0, Ordering::Relaxed);
         }
         N_LAYER.store(0, Ordering::Relaxed);

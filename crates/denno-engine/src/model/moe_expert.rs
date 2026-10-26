@@ -347,6 +347,42 @@ pub fn prefetch_range(bytes: &[u8]) {
     }
 }
 
+/// 行方向の並列化しきい値。これ未満の行列はスレッドを立てる損のほうが大きい。
+const PAR_MIN_ROWS: usize = 512;
+
+/// `n_out` 行を rayon で分けて `f(chunk_blocks, chunk_out)` を回す。
+///
+/// **行は互いに独立**なので、どの行をどのスレッドが担当しても各要素の計算順序は
+/// 変わらない (ビット一致は保たれる)。`f` は行チャンクぶんの `blocks` と `out` を受ける。
+#[cfg(feature = "par")]
+fn for_each_row_chunk<F>(blocks: &[u8], n_out: usize, rb: usize, out: &mut [f32], f: F)
+where
+    F: Fn(&[u8], &mut [f32]) + Sync + Send,
+{
+    use rayon::prelude::*;
+    if n_out < PAR_MIN_ROWS {
+        f(blocks, out);
+        return;
+    }
+    // 1 スレッドあたり最低 64 行は残す (チャンクが細かすぎるとオーバーヘッドが勝つ)。
+    let threads = rayon::current_num_threads().max(1);
+    let want = n_out.div_ceil(threads).max(64);
+    let rows = want.min(n_out);
+    let bytes = rows * rb;
+    blocks
+        .par_chunks(bytes)
+        .zip(out.par_chunks_mut(rows))
+        .for_each(|(b, o)| f(b, o));
+}
+
+#[cfg(not(feature = "par"))]
+fn for_each_row_chunk<F>(blocks: &[u8], _n_out: usize, _rb: usize, out: &mut [f32], f: F)
+where
+    F: Fn(&[u8], &mut [f32]),
+{
+    f(blocks, out);
+}
+
 /// 1 expert ぶんの生バイト (`blocks`) に対する GEMV。`out[r] = dot(row_r, x)`。
 ///
 /// - `blocks` は [`ExpertSlice`] で切り出した 1 expert ぶん (`len` バイトちょうど)。
@@ -369,7 +405,10 @@ pub fn expert_gemv(
         {
             // SAFETY: check_gemv_args が n_in%256==0・blocks/x/out の長さを検証済みで、
             // q4k_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
-            unsafe { gemv_q4k_avx2(blocks, n_in, n_out, x, out) };
+            // 行は独立なので、チャンク分割しても各要素の計算順序は変わらない。
+            for_each_row_chunk(blocks, n_out, rb, out, |b, o| unsafe {
+                gemv_q4k_avx2(b, n_in, o.len(), x, o)
+            });
             #[cfg(test)]
             FUSED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
@@ -518,7 +557,10 @@ pub fn expert_gemv_q5_1_fast(
         {
             // SAFETY: 引数は check_gemv_args が検証済み (n_in%32==0 は直前で確認) で、
             // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
-            unsafe { gemv_q5_1_avx2(blocks, n_in, n_out, x, out) };
+            let rb = n_in / 32 * 24;
+            for_each_row_chunk(blocks, n_out, rb, out, |b, o| unsafe {
+                gemv_q5_1_avx2(b, n_in, o.len(), x, o)
+            });
             return Ok(());
         }
     }
@@ -554,7 +596,10 @@ pub fn expert_gemv_q8_fast(
         {
             // SAFETY: 引数は check_gemv_args が検証済み (n_in%32==0 は直前で確認) で、
             // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
-            unsafe { gemv_q8_0_avx2(blocks, n_in, n_out, x, out) };
+            let rb = n_in / 32 * 34;
+            for_each_row_chunk(blocks, n_out, rb, out, |b, o| unsafe {
+                gemv_q8_0_avx2(b, n_in, o.len(), x, o)
+            });
             return Ok(());
         }
     }

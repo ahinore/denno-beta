@@ -23,6 +23,10 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 rand = "0.8"
 
 [features]
+# GEMV の行方向を rayon で並列化する (既定で有効)。行は独立なので数値は変わらない。
+# A/B 計測のために切れるようにしてある。
+default = ["par"]
+par = []
 # テスト用ユーティリティ (ダミーモデル/ダミートークナイザ) を公開する。
 # denno-server の統合テストがモデルDLなしで Engine を構築できるようにするためのもの。
 test-utils = []

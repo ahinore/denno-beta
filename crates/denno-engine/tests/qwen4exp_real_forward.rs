@@ -425,6 +425,11 @@ fn real_model_layer_timings() {
             "PHASE/層 ple {:.2} / mix {:.2} / attn {:.2} / moe {:.2} ms",
             per(ple), per(mix), per(attn), per(moe)
         );
+        let (qkv, gate, gdn, out, full) = denno_engine::model::qwen4exp::q4prof::dump_attn();
+        eprintln!(
+            "PHASE/層 attn内訳 qkv {:.2} / gate {:.2} / gdn {:.2} / out {:.2} / full {:.2} ms",
+            per(qkv), per(gate), per(gdn), per(out), per(full)
+        );
     }
 }
 

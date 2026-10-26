@@ -143,7 +143,13 @@ impl SsmLayer {
                 self.p.n_embd
             );
         }
+        let prof = crate::model::qwen4exp::q4prof::enabled();
+        let t = std::time::Instant::now();
         let qkv = self.project_qkv(cur)?;
+        if prof {
+            crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_QKV, t);
+        }
+        let t = std::time::Instant::now();
 
         let mut z = vec![0f32; self.p.value_dim()];
         self.w_gate.gemv(cur, &mut z)?;
@@ -151,6 +157,11 @@ impl SsmLayer {
         self.w_beta.gemv(cur, &mut beta_raw)?;
         let mut alpha = vec![0f32; self.p.n_v_heads];
         self.w_alpha.gemv(cur, &mut alpha)?;
+
+        if prof {
+            crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_GATE, t);
+        }
+        let t = std::time::Instant::now();
 
         // 診断ダンプ (DENNO_DEBUG_GDN_DUMP_LAYER) のゲートに層番号を渡す。
         gdn::gdn_dbg_set_layer(self.il as i64);
@@ -173,8 +184,16 @@ impl SsmLayer {
             gdn::GateKind::Sigmoid,
         );
 
+        if prof {
+            crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_GDN, t);
+        }
+        let t = std::time::Instant::now();
+
         let mut out = vec![0f32; self.p.n_embd];
         self.w_out.gemv(&y, &mut out)?;
+        if prof {
+            crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_OUT, t);
+        }
         Ok(out)
     }
 
