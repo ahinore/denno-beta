@@ -852,10 +852,14 @@ fn pos_advances_once_per_token_across_full_layers() {
     fa.forward_token(1, &cur).expect("層 1 (2 トークン目)");
     assert_eq!(fa.pos(), 2);
 
-    // 同じ層を二度通すと落ちる (黙って二重に積まない)
+    // 3 トークン目: 層 1 を積んだ直後にもう一度層 1 を積むと落ちる (黙って二重に積まない)
+    fa.forward_token(1, &cur).expect("層 1 (3 トークン目)");
     let err = format!("{}", fa.forward_token(1, &cur).expect_err("二重 push が通った"));
     assert!(err.contains("既に積んである"), "{err}");
-    // 落ちても位置は動いていない
+    // 落ちても状態は壊れない (位置もキャッシュ長も動かない)
     assert_eq!(fa.pos(), 2);
-    assert_eq!(fa.cache().len(1).unwrap(), 2);
+    assert_eq!(fa.cache().len(1).unwrap(), 3);
+    // そのあと層 3 を通せば 1 回だけ進む
+    fa.forward_token(ATTN_LAYER, &cur).expect("層 3 (3 トークン目)");
+    assert_eq!(fa.pos(), 3);
 }
