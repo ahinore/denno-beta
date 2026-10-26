@@ -157,6 +157,7 @@ impl Qwen4ExpDecoder {
     /// 貪欲に伸ばし、`stop` に入った id を出したら止める。
     ///
     /// 停止トークンも `out` に含める (呼び出し側が detokenize して落とせる)。
+    /// 停止語も `tokens` に積むため forward する (`tokens` と状態を食い違わせない)。
     /// `n_new` に達した場合も止まる。それ以外は [`Self::decode_greedy`] と同じ。
     pub fn decode_greedy_stop(
         &mut self,
@@ -174,6 +175,9 @@ impl Qwen4ExpDecoder {
             let id = u32::try_from(id).map_err(|_| one(format!("argmax の {id} が u32 に収まらない")))?;
             out.push(id);
             if stop.contains(&id) {
+                // 停止語も forward して `tokens` と状態を食い違わせない
+                // (`decode_greedy` と同じ約束)。戻り値の logits は捨てる。
+                self.step(id)?;
                 break;
             }
             logits = self.step(id)?;
