@@ -2,6 +2,7 @@
 
 pub mod gpt2;
 pub mod llama;
+pub mod moe;
 pub mod qwen35;
 
 use anyhow::{bail, Result};
