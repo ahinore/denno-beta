@@ -1128,8 +1128,8 @@ fn ple_only_reads_the_tail_window() {
     // 先頭だけ違う 4 トークン。末尾 3 個は同じ。
     let mut a = open_model(&dir).1;
     let mut b = open_model(&dir).1;
-    let la = a.forward_token(&[2, 5, 6, 8]).expect("forward a");
-    let lb = b.forward_token(&[4, 5, 6, 8]).expect("forward b");
+    let la = a.forward_token(&[1, 5, 6, 7]).expect("forward a");
+    let lb = b.forward_token(&[3, 5, 6, 7]).expect("forward b");
     assert_eq!(la.len(), lb.len());
     let diff = la
         .iter()
@@ -1140,7 +1140,7 @@ fn ple_only_reads_the_tail_window() {
 
     // 窓の中を変えれば変わる (比較が効いていることの確認)
     let mut c = open_model(&dir).1;
-    let lc = c.forward_token(&[4, 5, 6, 7]).expect("forward c");
+    let lc = c.forward_token(&[3, 5, 6, 2]).expect("forward c");
     let same = la
         .iter()
         .zip(lc.iter())
