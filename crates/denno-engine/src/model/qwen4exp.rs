@@ -1770,6 +1770,21 @@ impl Qwen4Exp {
         })
     }
 
+    /// 諸元（読み取り専用）。
+    pub fn params(&self) -> &Qwen4ExpParams {
+        &self.p
+    }
+
+    /// 語彙数。
+    pub fn n_vocab(&self) -> usize {
+        self.p.n_vocab
+    }
+
+    /// 層数。
+    pub fn n_layer(&self) -> usize {
+        self.p.n_layer
+    }
+
     /// hyper-connection の形状パラメータ。
     pub fn hp(&self) -> HyperParams {
         HyperParams {
