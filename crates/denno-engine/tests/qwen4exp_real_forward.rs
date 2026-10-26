@@ -483,3 +483,65 @@ fn real_model_debug_layer() {
     };
     m.debug_layer(&prompt, layer, &mut sink).expect("debug_layer");
 }
+
+
+/// 層 0 (ssm) の切り分け: 参照実装の `linear_attn_qkv_mixed` / `linear_attn_out`
+/// と、こちらの qkv 投影・層出力をトークンごとに並べる。
+#[test]
+#[ignore]
+fn real_model_ssm_stage0() {
+    let parts = match parts() {
+        Some(p) => p,
+        None => {
+            eprintln!("DENNO_Q4_DIR が無いので skip");
+            return;
+        }
+    };
+    let f = GgufFile::open_split(&parts).expect("分割 GGUF を開けない");
+    let p = Qwen4ExpParams::from_meta(&f).expect("メタデータを読めない");
+    let full = FullAttn::from_gguf(&f, &p, 32).expect("FullAttn");
+    let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
+    let mut m = Qwen4Exp::with_attn(&f, Box::new(attn)).expect("モデルを組めない");
+
+    let prompt: Vec<u32> = vec![16, 10, 16, 14876, 30];
+
+    // 各 prefix について層 0 の入口 (hc_mixed) を取り出す。
+    let mut mixed: Vec<Vec<f32>> = Vec::new();
+    for i in 0..prompt.len() {
+        let mut got: Option<Vec<f32>> = None;
+        let mut sink = |name: &str, vals: &[f32]| {
+            if name == "hc_mixed_attn" {
+                got = Some(vals.to_vec());
+            }
+        };
+        m.debug_layer(&prompt[..=i], 0, &mut sink).expect("debug_layer");
+        mixed.push(got.expect("hc_mixed_attn が取れない"));
+    }
+
+    // まっさらな ssm 層に、その hc_mixed を順に食わせる。
+    let mut fresh = SsmAttn::with_full(&f, &p, Box::new(FullAttn::from_gguf(&f, &p, 32).unwrap()))
+        .expect("SsmAttn (fresh)");
+    let layer = fresh.ssm_layer(0).expect("層 0 は ssm のはず");
+    let (qe, ke, ve) = layer.qkv_split();
+    eprintln!("qkv split q={qe} k={ke} v={ve}");
+    for (i, x) in mixed.iter().enumerate() {
+        let qkv = layer.project_qkv(x).expect("project_qkv");
+        let head: Vec<String> = qkv[..3].iter().map(|v| format!("{v:+.5}")).collect();
+        eprintln!("TOK {i} qkv {}", head.join(" "));
+    }
+    for (i, x) in mixed.iter().enumerate() {
+        let out = match fresh.forward(0, x) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("TOK {i} ssm err {e:?}");
+                continue;
+            }
+        };
+        let mut acc = 0.0f64;
+        for v in &out {
+            acc += (*v as f64) * (*v as f64);
+        }
+        let head: Vec<String> = out[..3].iter().map(|v| format!("{v:+.5}")).collect();
+        eprintln!("TOK {i} out n={} norm={:.5} head {}", out.len(), acc.sqrt(), head.join(" "));
+    }
+}
