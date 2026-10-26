@@ -37,6 +37,13 @@ use std::fmt;
 
 use crate::gguf::{GgufFile, GgufTensorInfo, GgufValue, TensorRef};
 use crate::kquant::GgmlType;
+use crate::model::hyper::{self, HyperParams, HyperStreams};
+use crate::model::linear_gguf::GgufLinear;
+use crate::model::moe::select_topk;
+use crate::model::moe_expert::{expert_gemv, ExpertSlice};
+use crate::ple::{PleNgram, PleTable, PLE_TABLE_NAME};
+use crate::quant::WeightBlocks;
+use crate::tensor::{silu_inplace, softmax};
 
 /// 検証エラー。**1 行 1 件**で、最初の 1 件で止めずに全部を集める。
 ///
@@ -1392,6 +1399,701 @@ impl LayerTensors {
             ple,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// P-MOE-F1: 1 トークン decode の骨格 (attention / ssm 以外)
+// ---------------------------------------------------------------------------
+//
+// 参照実装の層ループは `qwen4exp.cpp` 486-556 行、`build_hc_mix` 344-420 行、
+// `build_hc_combine` 422-460 行、`build_layer_ffn` 1240-1285 行、
+// `build_ple` 1467-1555 行、最終 mixer は 564-575 行。
+//
+// この節が持つのは **形と順序** だけ。attention / ssm の中身は
+// [`LayerAttn`] の差し替え口で、F1 では [`IdentityAttn`] (恒等) が入る。
+// 数値の正しさは F4 で実モデルを回して判定する。
+//
+// 丸め順序の契約:
+// - 行列積はすべて [`GgufLinear::gemv`] (行昇順・内積は列昇順の f32 逐次加算)。
+//   `hyper::hc_mix` の f32 経路と同じ `dot_row` 系の順序なので、重みを
+//   f32 に展開して `hc_mix` に渡した場合とビット一致する。
+// - `hc_mix` の各段 (RMS → lo → gate → mixed) は `hyper` の関数をそのまま呼ぶ
+//   (式をこのファイルに写さない)。
+
+/// 層のトークンミキサー (attention / ssm) の差し替え口。
+///
+/// `hc_mix` の出力 `cur` (`[n_embd]`) を受けて、その層の出力 (`[n_embd]`) を返す。
+pub trait LayerAttn: Send {
+    fn forward(&mut self, layer: usize, cur: &[f32]) -> Result<Vec<f32>>;
+}
+
+/// F1 の恒等実装。`cur` をそのまま返す (attention / ssm は F2 / F3)。
+pub struct IdentityAttn;
+
+impl LayerAttn for IdentityAttn {
+    fn forward(&mut self, _layer: usize, cur: &[f32]) -> Result<Vec<f32>> {
+        Ok(cur.to_vec())
+    }
+}
+
+/// GGUF テンソルから [`GgufLinear`] を作る。**mmap のスライスを共有**し、
+/// バイト列をコピーしない (`WeightBlocks::mapped`)。
+///
+/// `ne[0]` が入力長 (行長)、`ne[1..]` の積が行数。1 次元テンソル
+/// (`ffn_gate_inp_shexp`) は行数 1 の線形層として扱う。
+fn linear(f: &GgufFile, name: &str) -> Result<GgufLinear> {
+    let t = f
+        .tensor(name)
+        .ok_or_else(|| one(format!("{name}: テンソルが無い")))?;
+    let dims = trimmed_dims(t);
+    let k = usize::try_from(dims[0])
+        .map_err(|_| one(format!("{name}: ne[0] {} が usize に収まらない", dims[0])))?;
+    let mut n = 1usize;
+    for d in &dims[1..] {
+        n = n
+            .checked_mul(usize::try_from(*d).unwrap_or(usize::MAX))
+            .ok_or_else(|| one(format!("{name}: 行数が usize を溢れる")))?;
+    }
+    let (file, off, len) = f
+        .tensor_mapping_parts(name)
+        .ok_or_else(|| one(format!("{name}: データ範囲がファイル終端を超過している")))?;
+    let map = f
+        .mmap_handle_at(file)
+        .ok_or_else(|| one(format!("{name}: パート {file} の mmap が無い")))?;
+    let blocks = WeightBlocks::mapped(map, off, len);
+    GgufLinear::new(t.ty, k, n, blocks).map_err(|e| one(format!("{name}: {e}")))
+}
+
+/// F32 テンソルを f32 の Vec として読む (norm の gamma・conv の重み用)。
+fn f32_tensor(f: &GgufFile, name: &str) -> Result<Vec<f32>> {
+    let t = f
+        .tensor(name)
+        .ok_or_else(|| one(format!("{name}: テンソルが無い")))?;
+    if t.ty != GgmlType::F32 {
+        return Err(one(format!(
+            "{name}: 型 {} が期待 F32 と違う",
+            ty_name(t.ty)
+        )));
+    }
+    f.dequant_tensor(name)
+        .map_err(|e| one(format!("{name}: {e}")))
+}
+
+/// expert テンソル (`ne = [n_in, n_out, n_expert]`) の生ブロック。
+///
+/// 1 トークンで使うのは top-k 個だけなので、行列全体を f32 に展開しない
+/// (512 expert × 640 × 2560 を f32 にすると 3.3 GB/本になる)。
+struct ExpertW {
+    name: String,
+    blocks: WeightBlocks,
+    ty: GgmlType,
+    n_in: usize,
+    n_out: usize,
+    n_expert: usize,
+}
+
+impl ExpertW {
+    fn load(f: &GgufFile, name: &str, p: &Qwen4ExpParams) -> Result<Self> {
+        let t = f
+            .tensor(name)
+            .ok_or_else(|| one(format!("{name}: テンソルが無い")))?;
+        let dims = trimmed_dims(t);
+        if dims.len() != 3 {
+            return Err(one(format!("{name}: 次元が 3 でない (ne={dims:?})")));
+        }
+        let (file, off, len) = f
+            .tensor_mapping_parts(name)
+            .ok_or_else(|| one(format!("{name}: データ範囲がファイル終端を超過している")))?;
+        let map = f
+            .mmap_handle_at(file)
+            .ok_or_else(|| one(format!("{name}: パート {file} の mmap が無い")))?;
+        let w = ExpertW {
+            name: name.to_string(),
+            blocks: WeightBlocks::mapped(map, off, len),
+            ty: t.ty,
+            n_in: dims[0] as usize,
+            n_out: dims[1] as usize,
+            n_expert: dims[2] as usize,
+        };
+        // 期待値との突き合わせ (validate 済みだが、ここでも次元の取り違えを落とす)。
+        if w.n_expert != p.n_expert {
+            return Err(one(format!(
+                "{name}: expert 数 {} が期待 {} と違う",
+                w.n_expert, p.n_expert
+            )));
+        }
+        Ok(w)
+    }
+
+    /// expert `e` の 1 本ぶんのバイト範囲。
+    fn slice(&self, e: usize) -> Result<&[u8]> {
+        let s = ExpertSlice::new(self.ty, self.n_in, self.n_out, self.n_expert, e)
+            .map_err(|err| one(format!("{}: {err}", self.name)))?;
+        let b = self.blocks.as_slice();
+        if s.end() > b.len() {
+            return Err(one(format!(
+                "{}: expert {e} の範囲 {}..{} がテンソル長 {} を超える",
+                self.name,
+                s.off,
+                s.end(),
+                b.len()
+            )));
+        }
+        Ok(&b[s.off..s.end()])
+    }
+
+    /// `out[r] = dot(row_r, x)` を 1 expert ぶん計算する。
+    fn gemv(&self, e: usize, x: &[f32], out: &mut [f32]) -> Result<()> {
+        expert_gemv(self.ty, self.slice(e)?, self.n_in, self.n_out, x, out)
+            .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))
+    }
+}
+
+/// PLE 層 1 つぶんの重み。
+struct PleW {
+    /// `ple_key` — in `n_embd` → out `hc_dim`
+    key: GgufLinear,
+    /// `ple_value` — in `n_embd` → out `n_embd`
+    value: GgufLinear,
+    /// `ple_norm_key` — `[hc_dim]`
+    norm_key: Vec<f32>,
+    /// `ple_norm_query` — `[hc_dim]`
+    norm_query: Vec<f32>,
+    /// `ple_norm_conv` — `[hc_dim]`
+    norm_conv: Vec<f32>,
+    /// `ple_conv1d` — GGUF の ne は `[kern, hc_dim]` なので `w[c * kern + k]`
+    conv1d: Vec<f32>,
+    /// conv のカーネル長 (GGUF の `ple.conv_kernel`)
+    kern: usize,
+}
+
+impl PleW {
+    fn load(f: &GgufFile, il: usize, p: &Qwen4ExpParams) -> Result<Self> {
+        let name = |s: &str| format!("blk.{il}.{s}");
+        Ok(PleW {
+            key: linear(f, &name("ple_key.weight"))?,
+            value: linear(f, &name("ple_value.weight"))?,
+            norm_key: f32_tensor(f, &name("ple_norm_key.weight"))?,
+            norm_query: f32_tensor(f, &name("ple_norm_query.weight"))?,
+            norm_conv: f32_tensor(f, &name("ple_norm_conv.weight"))?,
+            conv1d: f32_tensor(f, &name("ple_conv1d.weight"))?,
+            kern: p.ple_conv_kernel,
+        })
+    }
+}
+
+/// 層 1 つぶんの重みハンドル。
+struct LayerW {
+    il: usize,
+    /// `hc_attn_norm` — `[hc_dim]` (変換器が `1 + w` に畳んだ gamma)
+    hc_attn_norm: Vec<f32>,
+    /// `hc_attn_down` — in `hc_dim` → out `hc_lr`
+    hc_attn_down: GgufLinear,
+    /// `hc_attn_up` — in `hc_lr` → out `hc_dim`
+    hc_attn_up: GgufLinear,
+    /// `hc_attn_inject` — in `hc_dim` → out `n_hc`
+    hc_attn_inject: GgufLinear,
+    hc_ffn_norm: Vec<f32>,
+    hc_ffn_down: GgufLinear,
+    hc_ffn_up: GgufLinear,
+    hc_ffn_inject: GgufLinear,
+    /// `ffn_gate_inp` — in `n_embd` → out `n_expert`
+    gate_inp: GgufLinear,
+    /// `ffn_gate_inp_shexp` — in `n_embd` → out 1
+    gate_inp_shexp: GgufLinear,
+    gate_exps: ExpertW,
+    up_exps: ExpertW,
+    down_exps: ExpertW,
+    /// `ffn_gate_shexp` — in `n_embd` → out `n_ff_shexp`
+    gate_shexp: GgufLinear,
+    /// `ffn_up_shexp` — in `n_embd` → out `n_ff_shexp`
+    up_shexp: GgufLinear,
+    /// `ffn_down_shexp` — in `n_ff_shexp` → out `n_embd`
+    down_shexp: GgufLinear,
+    /// PLE 層のみ `Some`
+    ple: Option<PleW>,
+}
+
+impl LayerW {
+    fn load(f: &GgufFile, p: &Qwen4ExpParams, il: usize) -> Result<Self> {
+        let name = |s: &str| format!("blk.{il}.{s}");
+        let ple = if p.is_ple(il) {
+            Some(PleW::load(f, il, p)?)
+        } else {
+            None
+        };
+        Ok(LayerW {
+            il,
+            hc_attn_norm: f32_tensor(f, &name("hc_attn_norm.weight"))?,
+            hc_attn_down: linear(f, &name("hc_attn_down.weight"))?,
+            hc_attn_up: linear(f, &name("hc_attn_up.weight"))?,
+            hc_attn_inject: linear(f, &name("hc_attn_inject.weight"))?,
+            hc_ffn_norm: f32_tensor(f, &name("hc_ffn_norm.weight"))?,
+            hc_ffn_down: linear(f, &name("hc_ffn_down.weight"))?,
+            hc_ffn_up: linear(f, &name("hc_ffn_up.weight"))?,
+            hc_ffn_inject: linear(f, &name("hc_ffn_inject.weight"))?,
+            gate_inp: linear(f, &name("ffn_gate_inp.weight"))?,
+            gate_inp_shexp: linear(f, &name("ffn_gate_inp_shexp.weight"))?,
+            gate_exps: ExpertW::load(f, &name("ffn_gate_exps.weight"), p)?,
+            up_exps: ExpertW::load(f, &name("ffn_up_exps.weight"), p)?,
+            down_exps: ExpertW::load(f, &name("ffn_down_exps.weight"), p)?,
+            gate_shexp: linear(f, &name("ffn_gate_shexp.weight"))?,
+            up_shexp: linear(f, &name("ffn_up_shexp.weight"))?,
+            down_shexp: linear(f, &name("ffn_down_shexp.weight"))?,
+            ple,
+        })
+    }
+}
+
+/// 最終段の重み (参照実装では `output_norm` が無く、head の mixer がそれを担う)。
+///
+/// テンソル名は実ファイルに合わせて `output_hc_*` (タスク文の `hc_head_*` と
+/// 同じもの。`load_arch_tensors` の `LLM_TENSOR_HC_HEAD_*` が `output_hc_*` に
+/// 対応する)。
+struct HeadW {
+    /// `output_hc_norm` — `[hc_dim]`
+    norm: Vec<f32>,
+    /// `output_hc_down` — in `hc_dim` → out `hc_lr`
+    down: GgufLinear,
+    /// `output_hc_up` — in `hc_lr` → out `hc_dim`
+    up: GgufLinear,
+    /// `output` — in `n_embd` → out `n_vocab`
+    output: GgufLinear,
+}
+
+impl HeadW {
+    fn load(f: &GgufFile) -> Result<Self> {
+        Ok(HeadW {
+            norm: f32_tensor(f, "output_hc_norm.weight")?,
+            down: linear(f, "output_hc_down.weight")?,
+            up: linear(f, "output_hc_up.weight")?,
+            output: linear(f, "output.weight")?,
+        })
+    }
+}
+
+/// PLE の表と索引 (層に依らない部分)。
+pub struct PleRuntime {
+    /// `per_layer_token_embd` の SSD 常駐 gather
+    pub table: PleTable,
+    /// n-gram 索引 (`set_input` と同じ規則)
+    pub ngram: PleNgram,
+}
+
+/// 1 トークン decode の骨格。
+pub struct Qwen4Exp {
+    pub p: Qwen4ExpParams,
+    layers: Vec<LayerW>,
+    head: HeadW,
+    tok_embd: GgufLinear,
+    ple: Option<PleRuntime>,
+    pub attn: Box<dyn LayerAttn>,
+}
+
+impl Qwen4Exp {
+    /// 実 GGUF から組む。**全テンソルの存在・形状・量子型を先に検査**して、
+    /// 1 本でも欠けたら `Err` にする (黙って 0 で埋めない)。
+    pub fn new(f: &GgufFile) -> Result<Self> {
+        Self::with_attn(f, Box::new(IdentityAttn))
+    }
+
+    /// attention / ssm の実装を差し替えて組む (F2 / F3 用)。
+    pub fn with_attn(f: &GgufFile, attn: Box<dyn LayerAttn>) -> Result<Self> {
+        let p = validate(f)?;
+
+        let tok_embd = linear(f, "token_embd.weight")?;
+        let head = HeadW::load(f)?;
+        let mut layers = Vec::with_capacity(p.n_layer);
+        for il in 0..p.n_layer {
+            layers.push(LayerW::load(f, &p, il)?);
+        }
+
+        let ple = if p.n_ple_heads() > 0 {
+            let tr = f
+                .tensor_ref(PLE_TABLE_NAME)
+                .ok_or_else(|| one(format!("{PLE_TABLE_NAME}: テンソルが無い")))?;
+            let table = PleTable::open(&tr, f).map_err(|e| one(format!("{PLE_TABLE_NAME}: {e}")))?;
+            let ngram = PleNgram::from_meta(f).map_err(|e| one(format!("PLE 索引: {e}")))?;
+            Some(PleRuntime { table, ngram })
+        } else {
+            None
+        };
+
+        Ok(Qwen4Exp {
+            p,
+            layers,
+            head,
+            tok_embd,
+            ple,
+            attn,
+        })
+    }
+
+    /// hyper-connection の形状パラメータ。
+    pub fn hp(&self) -> HyperParams {
+        HyperParams {
+            hc: self.p.n_hc,
+            n_embd: self.p.n_embd,
+            low_rank: self.p.hc_low_rank,
+            eps: self.p.rms_eps,
+        }
+    }
+
+    /// 1 トークンぶんの logits (`[n_vocab]`)。
+    ///
+    /// `ctx` は **新しい順** ではなく **古い順**で、末尾が現在のトークン
+    /// (`ple.ngram` の窓は末尾 3 個 = 現在 + 直前 2)。PLE が無いモデルでは
+    /// 末尾しか使わない。
+    pub fn forward_token(&mut self, ctx: &[u32]) -> Result<Vec<f32>> {
+        self.forward_token_with(ctx, |_, _| Ok(()))
+    }
+
+    /// [`Qwen4Exp::forward_token`] の層ごとフック付き版。
+    ///
+    /// `on_layer(il, &res_hc)` は各層の **出口** (ffn の `hc_combine` の後) で
+    /// 呼ばれる。実モデルのスモークで `||res_hc||` を出すために使う。
+    pub fn forward_token_with<F>(&mut self, ctx: &[u32], mut on_layer: F) -> Result<Vec<f32>>
+    where
+        F: FnMut(usize, &[f32]) -> Result<()>,
+    {
+        let token = match ctx.last() {
+            Some(&t) => t,
+            None => return Err(one("ctx が空 (現在のトークンが無い)")),
+        };
+        let hp = self.hp();
+        let e = self.p.n_embd;
+
+        // 1. emb = tok_embd @ [token]
+        let emb = self
+            .tok_embd
+            .dequant_row(token as usize)
+            .map_err(|err| one(format!("token_embd: 行 {token}: {err}")))?;
+        if emb.len() != e {
+            return Err(one(format!(
+                "token_embd: 行の長さ {} が n_embd {e} と違う",
+                emb.len()
+            )));
+        }
+
+        // 2. res_hc = [emb; ...; emb] (hc 本)
+        let mut res = HyperStreams::from_embed(&emb, &hp);
+
+        // PLE の行 gather は 1 トークンにつき 1 回だけ (全層で共有)。
+        let ple_emb = match &self.ple {
+            Some(rt) => Some(
+                rt.ngram
+                    .gather(&rt.table, ctx)
+                    .map_err(|err| one(format!("PLE 索引: {err}")))?,
+            ),
+            None => None,
+        };
+
+        for il in 0..self.p.n_layer {
+            let lw = &self.layers[il];
+
+            // 3.1 PLE 注入 (層 1 のみ)。res_hc を置き換える。
+            if let Some(pw) = &lw.ple {
+                let pe = ple_emb
+                    .as_ref()
+                    .ok_or_else(|| one(format!("層 {il}: PLE の行が無い")))?;
+                res = ple_inject(&self.p, pw, pe, &res, &hp)?;
+            }
+
+            // 3.2-3.4 attention 入口 → attn (F1 は恒等) → 出口
+            let (cur, inject) = hc_mix_quant(
+                &res,
+                &lw.hc_attn_norm,
+                &lw.hc_attn_down,
+                &lw.hc_attn_up,
+                Some(&lw.hc_attn_inject),
+                &hp,
+            )?;
+            let cur = self.attn.forward(il, &cur)?;
+            if cur.len() != e {
+                return Err(one(format!(
+                    "層 {il}: attention の出力長 {} が n_embd {e} と違う",
+                    cur.len()
+                )));
+            }
+            res = hyper::hc_combine(&res, &cur, &inject, &hp);
+
+            // 3.5-3.7 ffn 入口 → MoE FFN → 出口
+            let (cur, inject) = hc_mix_quant(
+                &res,
+                &lw.hc_ffn_norm,
+                &lw.hc_ffn_down,
+                &lw.hc_ffn_up,
+                Some(&lw.hc_ffn_inject),
+                &hp,
+            )?;
+            let cur = moe_ffn_quant(&self.p, lw, &cur)?;
+            res = hyper::hc_combine(&res, &cur, &inject, &hp);
+
+            on_layer(il, &res.data)?;
+        }
+
+        // 4. 最終 mixer (output_norm の代わり) + 5. logits
+        let cur = hc_mix_quant(
+            &res,
+            &self.head.norm,
+            &self.head.down,
+            &self.head.up,
+            None,
+            &hp,
+        )?
+        .0;
+        let mut logits = vec![0.0f32; self.head.output.n()];
+        self.head
+            .output
+            .gemv(&cur, &mut logits)
+            .map_err(|err| one(format!("output: {err}")))?;
+        Ok(logits)
+    }
+}
+
+/// `hc_mix` を**量子化重み**で計算する (`hyper::hc_mix` と同じ丸め順序)。
+///
+/// `inject` が `None` なら inject は 0 で返す (head の mixer は inject を
+/// 持たない: 参照実装は `w_inject` / `w_down_inject` とも `nullptr`)。
+fn hc_mix_quant(
+    res: &HyperStreams,
+    norm: &[f32],
+    down: &GgufLinear,
+    up: &GgufLinear,
+    inject: Option<&GgufLinear>,
+    hp: &HyperParams,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let xn = hyper::grouped_rms_norm(res, norm, hp);
+
+    let mut lo = vec![0.0f32; down.n()];
+    down.gemv(&xn, &mut lo)
+        .map_err(|err| one(format!("hc_mix down: {err}")))?;
+    hyper::hc_lo_apply(&mut lo, hp);
+
+    let mut gate = vec![0.0f32; up.n()];
+    up.gemv(&lo, &mut gate)
+        .map_err(|err| one(format!("hc_mix up: {err}")))?;
+    let mixed = hyper::hc_mixed(&xn, &gate, hp);
+
+    let inj = match inject {
+        Some(w) => {
+            let mut v = vec![0.0f32; w.n()];
+            w.gemv(&xn, &mut v)
+                .map_err(|err| one(format!("hc_mix inject: {err}")))?;
+            hyper::hc_inject_apply(&mut v, hp);
+            v
+        }
+        None => vec![0.0f32; hp.hc],
+    };
+    Ok((mixed, inj))
+}
+
+/// PLE 注入 (層 `ple.layers` のみ)。`res_hc` を置き換えて返す。
+///
+/// 参照実装 `build_ple` (1467-1555 行) の順序:
+/// 1. `ple_emb` (16 head × 160 = 2560。head の順に連結) を `ple_key` / `ple_value` に通す
+/// 2. `key` を `ple_norm_key` で、`res_hc` を `ple_norm_query` で grouped RMS
+/// 3. ストリームごとの内積 / sqrt(n_embd) → `sigmoid(sign(s) * sqrt(max(|s|, 1e-6)))`
+/// 4. `gated[s] = value * gate[s]` (value は hc 本へ broadcast)
+/// 5. `gated` を `ple_norm_conv` で grouped RMS → depthwise 因果 conv → silu
+/// 6. `res_hc + (gated + conv_out)` (この足し方の順序も参照実装どおり)
+///
+/// **F1 の制限**: conv の履歴は 0 で埋める。`t = 0` で効くのは遅延 0 の項
+/// (`k = kern - 1`) だけ。履歴バッファは F2 で入れる。
+fn ple_inject(
+    p: &Qwen4ExpParams,
+    pw: &PleW,
+    ple_emb: &[f32],
+    res: &HyperStreams,
+    hp: &HyperParams,
+) -> Result<HyperStreams> {
+    let e = p.n_embd;
+    let hc = p.n_hc;
+    let hc_dim = p.hc_dim();
+
+    // 1. key / value
+    let mut key = vec![0.0f32; pw.key.n()];
+    pw.key
+        .gemv(ple_emb, &mut key)
+        .map_err(|err| one(format!("ple_key: {err}")))?;
+    if key.len() != hc_dim {
+        return Err(one(format!(
+            "ple_key: 出力長 {} が hc_dim {hc_dim} と違う",
+            key.len()
+        )));
+    }
+    let mut value = vec![0.0f32; pw.value.n()];
+    pw.value
+        .gemv(ple_emb, &mut value)
+        .map_err(|err| one(format!("ple_value: {err}")))?;
+    if value.len() != e {
+        return Err(one(format!(
+            "ple_value: 出力長 {} が n_embd {e} と違う",
+            value.len()
+        )));
+    }
+
+    // 2. grouped RMS (key は [hc][n_embd] と見る)
+    let key_streams = HyperStreams {
+        data: key,
+        hc,
+        n_embd: e,
+    };
+    let key_n = hyper::grouped_rms_norm(&key_streams, &pw.norm_key, hp);
+    let query_n = hyper::grouped_rms_norm(res, &pw.norm_query, hp);
+
+    // 3. ストリームごとの内積 → 符号付き平方根 → sigmoid
+    let inv_sqrt_e = 1.0f32 / (e as f32).sqrt();
+    let mut gate = Vec::with_capacity(hc);
+    for s in 0..hc {
+        let mut acc = 0.0f32;
+        for i in 0..e {
+            let j = s * e + i;
+            acc += key_n[j] * query_n[j];
+        }
+        let sv = acc * inv_sqrt_e;
+        let mag = sv.abs().max(1e-6).sqrt();
+        let sign = if sv > 0.0 {
+            1.0f32
+        } else if sv < 0.0 {
+            -1.0f32
+        } else {
+            0.0f32
+        };
+        gate.push(hyper::sigmoid(sign * mag));
+    }
+
+    // 4. gated[s][d] = value[d] * gate[s]
+    let mut gated = vec![0.0f32; hc_dim];
+    for (s, &g) in gate.iter().enumerate() {
+        for d in 0..e {
+            gated[s * e + d] = value[d] * g;
+        }
+    }
+
+    // 5. grouped RMS → depthwise 因果 conv → silu
+    let gated_streams = HyperStreams {
+        data: gated.clone(),
+        hc,
+        n_embd: e,
+    };
+    let x = hyper::grouped_rms_norm(&gated_streams, &pw.norm_conv, hp);
+    let kern = pw.kern;
+    if pw.conv1d.len() != kern * hc_dim {
+        return Err(one(format!(
+            "ple_conv1d: 長さ {} が kern({kern}) * hc_dim({hc_dim}) と違う",
+            pw.conv1d.len()
+        )));
+    }
+    let dil = p.ple_ngram_size;
+    let mut conv = vec![0.0f32; hc_dim];
+    for c in 0..hc_dim {
+        // out[c] = Σ_k w[k][c] * x[c, t - (kern-1-k)*dil]
+        // GGUF の ne は [kern, hc_dim] なので、列 c の k 番目は conv1d[c*kern + k]。
+        let mut acc = 0.0f32;
+        for k in 0..kern {
+            let delay = (kern - 1 - k) * dil;
+            // F1: 履歴は 0 埋め。t = 0 では delay == 0 の項だけが残る。
+            let v = if delay == 0 { x[c] } else { 0.0f32 };
+            acc += pw.conv1d[c * kern + k] * v;
+        }
+        conv[c] = hyper::silu(acc);
+    }
+
+    // 6. res + (gated + conv)
+    let mut out = Vec::with_capacity(hc_dim);
+    for i in 0..hc_dim {
+        out.push(res.data[i] + (gated[i] + conv[i]));
+    }
+    Ok(HyperStreams {
+        data: out,
+        hc,
+        n_embd: e,
+    })
+}
+
+/// MoE FFN (参照実装 `build_layer_ffn` 1240-1285 行)。
+///
+/// - ルータ: `ffn_gate_inp @ x` → softmax → top-k (`n_expert_used`) →
+///   選択分の和で再正規化 (`norm_w = true`)。
+/// - expert: `down( silu(gate(x)) * up(x) )` を選択 index 昇順に
+///   `w_e` を掛けて積む。行列は expert 単位で切って GEMV する。
+/// - shared expert: `sigmoid(ffn_gate_inp_shexp @ x)` を掛けて最後に 1 回加算。
+///
+/// `silu` は dense 経路 (`crate::tensor::silu_inplace`) と同じ式を使う。
+fn moe_ffn_quant(p: &Qwen4ExpParams, lw: &LayerW, x: &[f32]) -> Result<Vec<f32>> {
+    let e = p.n_embd;
+    let ne = p.n_expert;
+    let k = p.n_expert_used;
+    let ff = p.n_ff_exp;
+
+    // 1. ルータ
+    let mut probs = vec![0.0f32; ne];
+    lw.gate_inp
+        .gemv(x, &mut probs)
+        .map_err(|err| one(format!("層 {}: ffn_gate_inp: {err}", lw.il)))?;
+    softmax(&mut probs);
+
+    // 2. top-k (index 昇順で返る)
+    let sel = select_topk(&probs, k);
+
+    // 3. 再正規化 (選択 index 昇順に逐次加算した和で割る)
+    let mut weights = vec![0.0f32; k];
+    let mut sum = 0.0f32;
+    for &i in &sel {
+        sum += probs[i];
+    }
+    for (t, &i) in sel.iter().enumerate() {
+        weights[t] = probs[i] / sum;
+    }
+
+    // 4. 選択 expert を index 昇順に積む
+    let mut out = vec![0.0f32; e];
+    let mut act = vec![0.0f32; ff];
+    let mut up = vec![0.0f32; ff];
+    let mut h = vec![0.0f32; e];
+    for (t, &ei) in sel.iter().enumerate() {
+        lw.gate_exps.gemv(ei, x, &mut act)?;
+        silu_inplace(&mut act);
+        lw.up_exps.gemv(ei, x, &mut up)?;
+        for r in 0..ff {
+            act[r] *= up[r];
+        }
+        lw.down_exps.gemv(ei, &act, &mut h)?;
+        let pe = weights[t];
+        for j in 0..e {
+            out[j] += pe * h[j];
+        }
+    }
+
+    // 5. shared expert (係数は sigmoid(gate_inp_shexp @ x))
+    let sff = lw.gate_shexp.n();
+    let mut sact = vec![0.0f32; sff];
+    lw.gate_shexp
+        .gemv(x, &mut sact)
+        .map_err(|err| one(format!("層 {}: ffn_gate_shexp: {err}", lw.il)))?;
+    silu_inplace(&mut sact);
+    let mut sup = vec![0.0f32; sff];
+    lw.up_shexp
+        .gemv(x, &mut sup)
+        .map_err(|err| one(format!("層 {}: ffn_up_shexp: {err}", lw.il)))?;
+    for r in 0..sff {
+        sact[r] *= sup[r];
+    }
+    let mut sh = vec![0.0f32; e];
+    lw.down_shexp
+        .gemv(&sact, &mut sh)
+        .map_err(|err| one(format!("層 {}: ffn_down_shexp: {err}", lw.il)))?;
+    let mut sg = vec![0.0f32; lw.gate_inp_shexp.n()];
+    lw.gate_inp_shexp
+        .gemv(x, &mut sg)
+        .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp: {err}", lw.il)))?;
+    let sgw = hyper::sigmoid(sg[0]);
+    for j in 0..e {
+        out[j] += sh[j] * sgw;
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]

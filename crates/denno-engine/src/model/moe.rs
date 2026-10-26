@@ -76,7 +76,10 @@ fn dot_row(w: &[f32], x: &[f32]) -> f32 {
 /// 同値のタイブレーク: 走査を index 昇順に行い、`probs[i] > probs[best]` の
 /// 厳密比較で更新するので、同値なら先に見つかった (= 小さい index) が残る。
 /// NaN は比較が常に false なので選ばれない (候補が NaN だけのときのみ選ばれる)。
-fn select_topk(probs: &[f32], k: usize) -> Vec<usize> {
+///
+/// P-MOE-F1: 量子化重みの経路 (`model::qwen4exp`) も同じタイブレーク規則を
+/// 使うので `pub(crate)` にしてある (規則を 2 箇所に書かないため)。
+pub(crate) fn select_topk(probs: &[f32], k: usize) -> Vec<usize> {
     let n = probs.len();
     assert!(k >= 1 && k <= n, "k={} は 1..={} の範囲外", k, n);
     let mut used = vec![false; n];

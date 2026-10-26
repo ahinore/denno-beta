@@ -181,8 +181,6 @@ fn mix_internal(
     // 1-3. ストリームごとの RMSNorm + gamma 乗算 → [hc_dim] に連結
     let xn = normed_streams(x, w_norm, p);
 
-    let inv_hc = 1.0f32 / hc as f32;
-
     // 4-5. lo = silu( (w_down @ xn) * 1/hc )
     //      w_down_inject があるときは行 0..low_rank が lo の行 (分割前の 1 回の matmul)。
     let down_src: &[f32] = match w_down_inject {
@@ -192,8 +190,9 @@ fn mix_internal(
     let mut lo = Vec::with_capacity(lr);
     for r in 0..lr {
         let row = &down_src[r * hc_dim..(r + 1) * hc_dim];
-        lo.push(silu(dot_row(row, &xn) * inv_hc));
+        lo.push(dot_row(row, &xn));
     }
+    hc_lo_apply(&mut lo, p);
 
     // inject: 行 low_rank..low_rank+hc を 1/hc 倍 (silu は掛けない)。
     // w_down_inject が無ければ 0 (呼び出し側が別経路で作る)。
@@ -201,8 +200,9 @@ fn mix_internal(
     if let Some(di) = w_down_inject {
         for r in 0..hc {
             let row = &di[(lr + r) * hc_dim..(lr + r + 1) * hc_dim];
-            inject[r] = dot_row(row, &xn) * inv_hc;
+            inject[r] = dot_row(row, &xn);
         }
+        hc_inject_apply(&mut inject, p);
     }
 
     // 6. gate = w_up @ lo
@@ -213,6 +213,40 @@ fn mix_internal(
 
     // 7. gated[s][d] = xn[s][d] * sigmoid(gate[s][d])
     // 8. mixed[d] = (1/hc) * sum_s gated[s][d]  (s の昇順に加算してから掛ける)
+    let mixed = hc_mixed(&xn, &gate, p);
+
+    (mixed, inject)
+}
+
+/// ストリームごとの RMSNorm + gamma 乗算 (`hc_mix` の手順 1-3)。
+///
+/// 量子化重みの経路 (`GgufLinear`) からも**同じ丸め順序**で使えるように公開して
+/// いる。戻り値は `[hc][n_embd]` の連結 (`[hc_dim]`)。
+pub fn grouped_rms_norm(x: &HyperStreams, w_norm: &[f32], p: &HyperParams) -> Vec<f32> {
+    normed_streams(x, w_norm, p)
+}
+
+/// `hc_mix` の手順 4-5 を in-place で当てる: `lo[r] = silu(lo[r] * (1/hc))`。
+///
+/// 入力は `w_down @ xn` の**生の内積** (量子化重みの GEMV の出力をそのまま渡せる)。
+/// 1/hc は matmul の後に掛ける (掛ける位置が変わると最終ビットが変わる)。
+pub fn hc_lo_apply(lo: &mut [f32], p: &HyperParams) {
+    assert_eq!(lo.len(), p.low_rank, "lo は [low_rank]");
+    let inv_hc = 1.0f32 / p.hc as f32;
+    for v in lo.iter_mut() {
+        *v = silu(*v * inv_hc);
+    }
+}
+
+/// `hc_mix` の手順 7-8: `mixed[d] = (1/hc) * Σ_s xn[s][d] * sigmoid(gate[s][d])`。
+///
+/// 加算は `s` の昇順、`1/hc` は和の後 (順序を変えると最終ビットが変わる)。
+pub fn hc_mixed(xn: &[f32], gate: &[f32], p: &HyperParams) -> Vec<f32> {
+    let e = p.n_embd;
+    let hc = p.hc;
+    assert_eq!(xn.len(), hc * e, "xn は [hc][n_embd]");
+    assert_eq!(gate.len(), hc * e, "gate は [hc][n_embd]");
+    let inv_hc = 1.0f32 / hc as f32;
     let mut mixed = vec![0.0f32; e];
     for d in 0..e {
         let mut acc = xn[d] * sigmoid(gate[d]);
@@ -222,8 +256,16 @@ fn mix_internal(
         }
         mixed[d] = acc * inv_hc;
     }
+    mixed
+}
 
-    (mixed, inject)
+/// `hc_mix` の inject の後処理: `inject[r] *= 1/hc` (silu は掛けない)。
+pub fn hc_inject_apply(inject: &mut [f32], p: &HyperParams) {
+    assert_eq!(inject.len(), p.hc, "inject は [hc]");
+    let inv_hc = 1.0f32 / p.hc as f32;
+    for v in inject.iter_mut() {
+        *v *= inv_hc;
+    }
 }
 
 /// attn / ffn の入口。`mixed` は `[n_embd]`、`inject` は `[hc]`。
