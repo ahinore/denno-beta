@@ -606,6 +606,29 @@ pub fn expert_gemv_q8_fast(
     expert_gemv(GgmlType::Q8_0, blocks, n_in, n_out, x, out)
 }
 
+/// expert テンソルの量子型で GEMV を振り分ける (P-MOE-G1 で追加)。
+///
+/// mmap 経路 ([`crate::model::qwen4exp`] の `ExpertW::gemv`) とキャッシュ経路
+/// (`ExpertCacheSet::get` が返したバイト列) の**両方がこれを通る**ので、
+/// 同じバイト列に対しては必ず同じカーネル・同じ丸め順になる (ビット一致の根拠)。
+///
+/// - Q5_1 / Q8_0 は AVX2+FMA の融合カーネル、それ以外 (Q4_K / Q5_K) は
+///   [`expert_gemv`] (Q4_K は AVX2+FMA があれば融合)。
+pub fn expert_gemv_any(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    match ty {
+        GgmlType::Q5_1 => expert_gemv_q5_1_fast(blocks, n_in, n_out, x, out),
+        GgmlType::Q8_0 => expert_gemv_q8_fast(blocks, n_in, n_out, x, out),
+        _ => expert_gemv(ty, blocks, n_in, n_out, x, out),
+    }
+}
+
 /// スカラー経路そのもの (`dequant_row_into` + [`dot_seq`])。**ビット一致の基準**。
 ///
 /// [`expert_gemv`] が融合カーネルへ振る Q4_K でも、こちらは常に逐次加算のままなので、

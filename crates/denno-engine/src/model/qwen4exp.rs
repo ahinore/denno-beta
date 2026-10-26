@@ -37,10 +37,11 @@ use std::fmt;
 
 use crate::gguf::{GgufFile, GgufTensorInfo, GgufValue, TensorRef};
 use crate::kquant::GgmlType;
+use crate::model::expert_cache::{self, CacheSpec, ExpertCacheSet, ExpertKey, ExpertMatrix};
 use crate::model::hyper::{self, HyperParams, HyperStreams};
 use crate::model::linear_gguf::GgufLinear;
 use crate::model::moe::select_topk;
-use crate::model::moe_expert::{self, expert_gemv, ExpertSlice};
+use crate::model::moe_expert::{self, ExpertSlice};
 use crate::ple::{PleNgram, PleTable, PLE_TABLE_NAME};
 use crate::quant::WeightBlocks;
 use crate::tensor::{silu_inplace, softmax};
@@ -1544,6 +1545,12 @@ struct ExpertW {
     n_in: usize,
     n_out: usize,
     n_expert: usize,
+    /// テンソルが属する GGUF のパート番号 (split GGUF の読み口の選択に使う)
+    file: usize,
+    /// テンソルのデータ先頭の**ファイル内絶対オフセット**
+    /// ([`crate::gguf::GgufFile::tensor_mapping_parts`] の 2 番目)。
+    /// `blocks` の先頭と同じ位置 (mmap はこのオフセットから写像している)。
+    abs: u64,
 }
 
 impl ExpertW {
@@ -1568,6 +1575,8 @@ impl ExpertW {
             n_in: dims[0] as usize,
             n_out: dims[1] as usize,
             n_expert: dims[2] as usize,
+            file,
+            abs: off as u64,
         };
         // 期待値との突き合わせ (validate 済みだが、ここでも次元の取り違えを落とす)。
         if w.n_expert != p.n_expert {
@@ -1606,20 +1615,36 @@ impl ExpertW {
         }
     }
 
+    /// expert `e` の**ファイル内絶対オフセット**とバイト数 (キャッシュ経路用)。
+    ///
+    /// mmap 経路の [`ExpertW::slice`] と同じ [`ExpertSlice`] を使うので、
+    /// 2 経路が指す範囲は必ず一致する (ずれる余地を作らない)。
+    fn slice_abs(&self, e: usize) -> Result<(u64, usize)> {
+        let s = ExpertSlice::new(self.ty, self.n_in, self.n_out, self.n_expert, e)
+            .map_err(|err| one(format!("{}: {err}", self.name)))?;
+        let b = self.blocks.as_slice();
+        if s.end() > b.len() {
+            return Err(one(format!(
+                "{}: expert {e} の範囲 {}..{} がテンソル長 {} を超える",
+                self.name,
+                s.off,
+                s.end(),
+                b.len()
+            )));
+        }
+        Ok((self.abs + s.off as u64, s.len))
+    }
+
     /// `out[r] = dot(row_r, x)` を 1 expert ぶん計算する。
     ///
     /// Flash-Next の expert は型が混在している (`ffn_gate_exps`/`ffn_up_exps` は
-    /// ほぼ Q4_K、`ffn_down_exps` はほぼ Q5_1、一部 Q8_0)。Q5_1 / Q8_0 には
-    /// AVX2 の融合カーネルがあるので、型で振り分ける。
+    /// ほぼ Q4_K、`ffn_down_exps` はほぼ Q5_1、一部 Q8_0)。振り分けは
+    /// [`moe_expert::expert_gemv_any`] に集約してある (キャッシュ経路と同じ関数)。
     fn gemv(&self, e: usize, x: &[f32], out: &mut [f32]) -> Result<()> {
         let s = self.slice(e)?;
         let (n_in, n_out) = (self.n_in, self.n_out);
-        match self.ty {
-            GgmlType::Q5_1 => moe_expert::expert_gemv_q5_1_fast(s, n_in, n_out, x, out),
-            GgmlType::Q8_0 => moe_expert::expert_gemv_q8_fast(s, n_in, n_out, x, out),
-            _ => expert_gemv(self.ty, s, n_in, n_out, x, out),
-        }
-        .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))
+        moe_expert::expert_gemv_any(self.ty, s, n_in, n_out, x, out)
+            .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))
     }
 }
 
@@ -1719,6 +1744,62 @@ impl LayerW {
     }
 }
 
+/// 層 `l` の行列 `m` の [`ExpertW`]。
+fn matrix_w(l: &LayerW, m: ExpertMatrix) -> &ExpertW {
+    match m {
+        ExpertMatrix::Gate => &l.gate_exps,
+        ExpertMatrix::Up => &l.up_exps,
+        ExpertMatrix::Down => &l.down_exps,
+    }
+}
+
+/// `DENNO_EXPERT_CACHE_MB` (> 0) のとき expert キャッシュを組む (既定 0 = 無効)。
+///
+/// - スロット数 = `MB * 1024 * 1024 / slot_bytes` (切り捨て・最低 1) を行列ごとに。
+/// - `slot_bytes` は**層をまたいだ最大**の expert バイト数を採る。UD 量子化では
+///   層ごとに expert の型が変わる (`ffn_down_exps` が Q5_1 と Q8_0) ので、最小を
+///   採ると `ExpertCache::get` が `len > slot_bytes` で落ちる。
+/// - 読み口は GGUF のパート数だけ開く (split GGUF では層ごとに属するファイルが
+///   変わる)。
+fn build_expert_caches(f: &GgufFile, layers: &[LayerW]) -> Result<Option<ExpertCacheSet>> {
+    build_expert_caches_with_mb(expert_cache::mb_from_env(), f, layers)
+}
+
+/// [`build_expert_caches`] の本体 (MB を引数で受けるのでテストできる)。
+fn build_expert_caches_with_mb(
+    mb: usize,
+    f: &GgufFile,
+    layers: &[LayerW],
+) -> Result<Option<ExpertCacheSet>> {
+    if mb == 0 {
+        return Ok(None);
+    }
+    let mut specs = Vec::with_capacity(3);
+    for m in ExpertMatrix::ALL {
+        let mut slot_bytes = 0usize;
+        for l in layers {
+            let w = matrix_w(l, m);
+            let s = ExpertSlice::new(w.ty, w.n_in, w.n_out, w.n_expert, 0)
+                .map_err(|err| one(format!("{}: {err}", w.name)))?;
+            slot_bytes = slot_bytes.max(s.len);
+        }
+        specs.push(CacheSpec { slot_bytes });
+    }
+    let [gate, up, down]: [CacheSpec; 3] = specs
+        .try_into()
+        .map_err(|_| one("expert キャッシュ: 行列の指定が 3 本でない"))?;
+    let mut paths = Vec::with_capacity(f.part_count());
+    for i in 0..f.part_count() {
+        let p = f
+            .path_at(i)
+            .ok_or_else(|| one(format!("expert キャッシュ: パート {i} のパスが無い")))?;
+        paths.push(p.to_path_buf());
+    }
+    let set = ExpertCacheSet::from_mb(mb, [gate, up, down], &paths)
+        .map_err(|err| one(format!("expert キャッシュの構築に失敗: {err}")))?;
+    Ok(Some(set))
+}
+
 /// 最終段の重み (参照実装では `output_norm` が無く、head の mixer がそれを担う)。
 ///
 /// テンソル名は実ファイルに合わせて `output_hc_*` (タスク文の `hc_head_*` と
@@ -1765,6 +1846,9 @@ pub struct Qwen4Exp {
     /// `grouped_rms_norm(gated)` を古い順に保持する。層に PLE が無ければ `None`。
     ple_conv_state: Vec<Option<Vec<f32>>>,
     pub attn: Box<dyn LayerAttn>,
+    /// P-MOE-G1: `DENNO_EXPERT_CACHE_MB` > 0 のときだけ `Some`。
+    /// `None` は従来どおり mmap + `prefetch()` の経路 (バイト列も挙動も変えない)。
+    expert_cache: Option<ExpertCacheSet>,
 }
 
 impl Qwen4Exp {
@@ -1809,6 +1893,9 @@ impl Qwen4Exp {
             })
             .collect();
 
+        // P-MOE-G1: expert キャッシュ (既定 OFF。`DENNO_EXPERT_CACHE_MB` > 0 で構築)。
+        let expert_cache = build_expert_caches(f, &layers)?;
+
         Ok(Qwen4Exp {
             p,
             layers,
@@ -1817,6 +1904,7 @@ impl Qwen4Exp {
             ple,
             ple_conv_state,
             attn,
+            expert_cache,
         })
     }
 
@@ -2005,7 +2093,7 @@ impl Qwen4Exp {
         q4prof::add(&q4prof::MIX, t_mix);
         hook("hc_mixed_ffn", il, &cur)?;
         let t_moe = std::time::Instant::now();
-        let cur = moe_ffn_quant(&self.p, lw, &cur)?;
+        let cur = moe_ffn_quant(&self.p, lw, &cur, self.expert_cache.as_mut())?;
         q4prof::add(&q4prof::MOE, t_moe);
         hook("ffn_out", il, &cur)?;
         *res = hyper::hc_combine(res, &cur, &inject, hp);
@@ -2294,7 +2382,17 @@ pub mod q4prof {
 /// - shared expert: `sigmoid(ffn_gate_inp_shexp @ x)` を掛けて最後に 1 回加算。
 ///
 /// `silu` は dense 経路 (`crate::tensor::silu_inplace`) と同じ式を使う。
-fn moe_ffn_quant(p: &Qwen4ExpParams, lw: &LayerW, x: &[f32]) -> Result<Vec<f32>> {
+///
+/// `cache` が `Some` のときだけ expert の生バイトを [`ExpertCacheSet`] から取る
+/// (P-MOE-G1)。`None` は従来どおり mmap のスライス + `prefetch()` で、バイト列も
+/// 呼び出し順も変えない。**どちらの経路も同じ [`moe_expert::expert_gemv_any`] を
+/// 通る**ので、同じバイト列に対しては出力がビット一致する。
+fn moe_ffn_quant(
+    p: &Qwen4ExpParams,
+    lw: &LayerW,
+    x: &[f32],
+    cache: Option<&mut ExpertCacheSet>,
+) -> Result<Vec<f32>> {
     let e = p.n_embd;
     let ne = p.n_expert;
     let k = p.n_expert_used;
@@ -2322,10 +2420,15 @@ fn moe_ffn_quant(p: &Qwen4ExpParams, lw: &LayerW, x: &[f32]) -> Result<Vec<f32>>
 
     // 3.5 選択 expert の重みを先に読み始める (I/O と計算を重ねる)。
     //     1 トークンで 48 層 × 11 行列 × 921 KB を触るので、フォルト待ちが支配的になる。
-    for &ei in &sel {
-        lw.gate_exps.prefetch(ei);
-        lw.up_exps.prefetch(ei);
-        lw.down_exps.prefetch(ei);
+    //     キャッシュ経路は pread で必要ぶんだけ読むので、mmap のページフォルトを
+    //     先に起こす意味が無い (`prefetch()` 自体は無効化も変更もしない)。
+    let mut cache = cache;
+    if cache.is_none() {
+        for &ei in &sel {
+            lw.gate_exps.prefetch(ei);
+            lw.up_exps.prefetch(ei);
+            lw.down_exps.prefetch(ei);
+        }
     }
 
     // 4. 選択 expert を index 昇順に積む
@@ -2334,13 +2437,32 @@ fn moe_ffn_quant(p: &Qwen4ExpParams, lw: &LayerW, x: &[f32]) -> Result<Vec<f32>>
     let mut up = vec![0.0f32; ff];
     let mut h = vec![0.0f32; e];
     for (t, &ei) in sel.iter().enumerate() {
-        lw.gate_exps.gemv(ei, x, &mut act)?;
-        silu_inplace(&mut act);
-        lw.up_exps.gemv(ei, x, &mut up)?;
-        for r in 0..ff {
-            act[r] *= up[r];
+        match cache.as_deref_mut() {
+            // 従来経路: mmap のスライスを直接 GEMV する。
+            None => {
+                lw.gate_exps.gemv(ei, x, &mut act)?;
+                silu_inplace(&mut act);
+                lw.up_exps.gemv(ei, x, &mut up)?;
+                for r in 0..ff {
+                    act[r] *= up[r];
+                }
+                lw.down_exps.gemv(ei, &act, &mut h)?;
+            }
+            // P-MOE-G1: SSD pread + LRU スロット経路。同じ expert は読み直さない。
+            Some(c) => {
+                let key = ExpertKey {
+                    layer: lw.il as u16,
+                    expert: ei as u16,
+                };
+                expert_gemv_cached(c, ExpertMatrix::Gate, &lw.gate_exps, key, x, &mut act)?;
+                silu_inplace(&mut act);
+                expert_gemv_cached(c, ExpertMatrix::Up, &lw.up_exps, key, x, &mut up)?;
+                for r in 0..ff {
+                    act[r] *= up[r];
+                }
+                expert_gemv_cached(c, ExpertMatrix::Down, &lw.down_exps, key, &act, &mut h)?;
+            }
         }
-        lw.down_exps.gemv(ei, &act, &mut h)?;
         let pe = weights[t];
         for j in 0..e {
             out[j] += pe * h[j];
@@ -2377,6 +2499,27 @@ fn moe_ffn_quant(p: &Qwen4ExpParams, lw: &LayerW, x: &[f32]) -> Result<Vec<f32>>
     Ok(out)
 }
 
+/// キャッシュ経路の 1 expert GEMV (P-MOE-G1)。
+///
+/// `w` はオフセット・量子型・形状の出所で、バイト列は `c` から取る。
+/// 使う範囲は [`ExpertW::slice_abs`] = mmap 経路の [`ExpertW::slice`] と同じ
+/// [`ExpertSlice`] なので、2 経路が読むバイト列は同一になる。
+fn expert_gemv_cached(
+    c: &mut ExpertCacheSet,
+    m: ExpertMatrix,
+    w: &ExpertW,
+    key: ExpertKey,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    let (off, len) = w.slice_abs(key.expert as usize)?;
+    let bytes = c
+        .get(m, w.file, key, off, len)
+        .map_err(|err| one(format!("{}: expert {} (cache): {err}", w.name, key.expert)))?;
+    moe_expert::expert_gemv_any(w.ty, bytes, w.n_in, w.n_out, x, out)
+        .map_err(|err| one(format!("{}: expert {} (cache): {err}", w.name, key.expert)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2409,5 +2552,476 @@ mod tests {
             min_last_dim: true,
         };
         assert_eq!(e.fmt_dims(), "[160, 40 以上]");
+    }
+
+    // -----------------------------------------------------------------
+    // P-MOE-G1: expert キャッシュ経路 (合成 GGUF)
+    // -----------------------------------------------------------------
+
+    use std::path::{Path, PathBuf};
+
+    use crate::model::expert_cache::CacheStats;
+
+    /// 合成 GGUF のデータ部アラインメント (`gguf.rs` の既定と同じ)。
+    const ALIGN: usize = 32;
+    const GT_U32: u32 = 4;
+    const GT_STRING: u32 = 8;
+    /// ggml_type id
+    const TY_Q4_K: u32 = 12;
+    const TY_Q5_1: u32 = 7;
+
+    /// 合成モデルの次元 (Q4_K は ne[0] が 256 の倍数である必要がある)。
+    const N_EMBD: usize = 256;
+    const N_FF: usize = 640;
+    const N_EXPERT: usize = 4;
+
+    enum Kv {
+        U32(u32),
+        Str(&'static str),
+    }
+
+    impl Kv {
+        fn write(&self, b: &mut Vec<u8>) {
+            match self {
+                Kv::U32(v) => {
+                    b.extend_from_slice(&GT_U32.to_le_bytes());
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                Kv::Str(s) => {
+                    b.extend_from_slice(&GT_STRING.to_le_bytes());
+                    push_str(b, s);
+                }
+            }
+        }
+    }
+
+    fn push_str(b: &mut Vec<u8>, s: &str) {
+        b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        b.extend_from_slice(s.as_bytes());
+    }
+
+    fn align_up(v: usize, a: usize) -> usize {
+        (v + a - 1) & !(a - 1)
+    }
+
+    /// 最小 GGUF (v3) を書き出す。データ部は 32 B 整列。
+    fn write_gguf(
+        path: &Path,
+        kvs: &[(&str, Kv)],
+        tensors: &[(String, Vec<u64>, u32, Vec<u8>)],
+    ) {
+        let mut head = Vec::new();
+        head.extend_from_slice(b"GGUF");
+        head.extend_from_slice(&3u32.to_le_bytes());
+        head.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        head.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
+        for (k, v) in kvs {
+            push_str(&mut head, k);
+            v.write(&mut head);
+        }
+
+        let mut offs = Vec::with_capacity(tensors.len());
+        let mut cur = 0usize;
+        for (_, _, _, data) in tensors {
+            offs.push(cur as u64);
+            cur = align_up(cur + data.len(), ALIGN);
+        }
+        for ((name, dims, ty, _), off) in tensors.iter().zip(&offs) {
+            push_str(&mut head, name);
+            head.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for d in dims {
+                head.extend_from_slice(&d.to_le_bytes());
+            }
+            head.extend_from_slice(&ty.to_le_bytes());
+            head.extend_from_slice(&off.to_le_bytes());
+        }
+
+        let mut out = head;
+        out.resize(align_up(out.len(), ALIGN), 0);
+        for (_, _, _, data) in tensors {
+            out.extend_from_slice(data);
+            out.resize(align_up(out.len(), ALIGN), 0);
+        }
+        std::fs::write(path, out).expect("合成 GGUF の書き出し");
+    }
+
+    fn f16_bytes(v: f32) -> [u8; 2] {
+        half::f16::from_f32(v).to_le_bytes()
+    }
+
+    /// Q4_K (144 B = 256 要素) の 1 expert ぶん。expert ごとに値が違うこと。
+    fn q4k_expert_bytes(n_in: usize, n_out: usize, e: usize) -> Vec<u8> {
+        let nb = n_in / 256;
+        let mut v = Vec::with_capacity(n_out * nb * 144);
+        for r in 0..n_out {
+            for b in 0..nb {
+                v.extend_from_slice(&f16_bytes(0.02 + 0.001 * ((r + b + e) % 7) as f32));
+                v.extend_from_slice(&f16_bytes(0.0005));
+                for i in 0..12 {
+                    v.push((0x11 + ((r * 3 + i + e) % 6)) as u8);
+                }
+                for i in 0..128 {
+                    v.push(((i * 7 + r * 13 + b * 3 + e * 5) % 251) as u8);
+                }
+            }
+        }
+        v
+    }
+
+    /// Q5_1 (24 B = 32 要素) の 1 expert ぶん。
+    fn q5_1_expert_bytes(n_in: usize, n_out: usize, e: usize) -> Vec<u8> {
+        let nb = n_in / 32;
+        let mut v = Vec::with_capacity(n_out * nb * 24);
+        for r in 0..n_out {
+            for b in 0..nb {
+                v.extend_from_slice(&f16_bytes(0.02 + 0.001 * ((r + b + e) % 5) as f32));
+                v.extend_from_slice(&f16_bytes(0.0004));
+                let qh = ((r * 37 + b * 11 + e * 7) as u32) & 0xffff
+                    | (((r as u32) & 0xffff) << 16);
+                v.extend_from_slice(&qh.to_le_bytes());
+                for i in 0..16 {
+                    v.push(((i * 13 + r * 5 + b * 3 + e * 11) % 251) as u8);
+                }
+            }
+        }
+        v
+    }
+
+    /// テスト用の一時ディレクトリ (drop で消す)。
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "denno_q4exp_cache_{tag}_{}_{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("temp dir");
+            TempDir(p)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 実モデルと同じ型の expert 3 本 (Q4_K gate/up・Q5_1 down・4 expert) を持つ
+    /// 合成 GGUF を書く。
+    fn write_expert_gguf(dir: &TempDir) -> PathBuf {
+        let path = dir.path("experts.gguf");
+        let (n_in, n_ff, ne) = (N_EMBD, N_FF, N_EXPERT);
+        let mut gate = Vec::new();
+        let mut up = Vec::new();
+        let mut down = Vec::new();
+        for e in 0..ne {
+            gate.extend_from_slice(&q4k_expert_bytes(n_in, n_ff, e));
+            up.extend_from_slice(&q4k_expert_bytes(n_in, n_ff, e + 7));
+            down.extend_from_slice(&q5_1_expert_bytes(n_ff, n_in, e + 3));
+        }
+        let tensors = vec![
+            (
+                "blk.0.ffn_gate_exps.weight".to_string(),
+                vec![n_in as u64, n_ff as u64, ne as u64],
+                TY_Q4_K,
+                gate,
+            ),
+            (
+                "blk.0.ffn_up_exps.weight".to_string(),
+                vec![n_in as u64, n_ff as u64, ne as u64],
+                TY_Q4_K,
+                up,
+            ),
+            (
+                "blk.0.ffn_down_exps.weight".to_string(),
+                vec![n_ff as u64, n_in as u64, ne as u64],
+                TY_Q5_1,
+                down,
+            ),
+        ];
+        let kvs = [
+            ("general.architecture", Kv::Str("qwen4exp")),
+            ("general.alignment", Kv::U32(ALIGN as u32)),
+        ];
+        write_gguf(&path, &kvs, &tensors);
+        path
+    }
+
+    /// `moe_ffn_quant` が読むぶんだけ埋めた諸元 (validate は通さない)。
+    fn cache_test_params() -> Qwen4ExpParams {
+        Qwen4ExpParams {
+            n_layer: 1,
+            n_ctx: 8,
+            n_embd: N_EMBD,
+            n_head: 1,
+            n_head_kv: 1,
+            n_embd_head_k: 32,
+            n_embd_head_v: 32,
+            rms_eps: 1e-6,
+            n_rot: 32,
+            rope_sections: [0, 0, 0, 0],
+            rope_freq_base: 1e7,
+            n_expert: N_EXPERT,
+            n_expert_used: 2,
+            n_ff_exp: N_FF,
+            n_ff_shexp: 64,
+            ssm_d_conv: 4,
+            ssm_d_state: 32,
+            ssm_n_group: 1,
+            ssm_dt_rank: 1,
+            ssm_d_inner: 32,
+            full_attn_interval: 4,
+            n_hc: 1,
+            hc_low_rank: 32,
+            indexer_n_head: 1,
+            indexer_head_size: 32,
+            indexer_top_k: 1,
+            compress_ratios: vec![0],
+            n_embd_per_layer: 0,
+            ple_layers: Vec::new(),
+            ple_ngram_size: 0,
+            ple_heads_per_ngram: 0,
+            ple_conv_kernel: 0,
+            ple_eos_token_id: 0,
+            ple_image_token_id: 0,
+            ple_layer_multipliers: Vec::new(),
+            ple_head_offsets: Vec::new(),
+            ple_head_vocab_sizes: Vec::new(),
+            n_vocab: 8,
+        }
+    }
+
+    /// 決定的な f32 の重み (F32 の GgufLinear)。
+    fn f32_linear(k: usize, n: usize, seed: f32) -> GgufLinear {
+        let mut v = Vec::with_capacity(k * n * 4);
+        for i in 0..k * n {
+            let x = seed + (i % 17) as f32 * 0.01;
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        GgufLinear::new(GgmlType::F32, k, n, WeightBlocks::from_vec(v))
+            .expect("GgufLinear::new (F32)")
+    }
+
+    /// `moe_ffn_quant` が触るフィールドだけ実体を入れた層。
+    /// hc_* は MoE では使わないので 1x1 のダミー。
+    fn cache_test_layer(f: &GgufFile, p: &Qwen4ExpParams) -> LayerW {
+        let name = |s: &str| format!("blk.0.{s}");
+        LayerW {
+            il: 0,
+            hc_attn_norm: vec![1.0; p.n_embd],
+            hc_attn_down: f32_linear(1, 1, 0.5),
+            hc_attn_up: f32_linear(1, 1, 0.5),
+            hc_attn_inject: f32_linear(1, 1, 0.5),
+            hc_ffn_norm: vec![1.0; p.n_embd],
+            hc_ffn_down: f32_linear(1, 1, 0.5),
+            hc_ffn_up: f32_linear(1, 1, 0.5),
+            hc_ffn_inject: f32_linear(1, 1, 0.5),
+            gate_inp: f32_linear(p.n_embd, p.n_expert, 0.1),
+            gate_inp_shexp: f32_linear(p.n_embd, 1, 0.2),
+            gate_exps: ExpertW::load(f, &name("ffn_gate_exps.weight"), p).expect("gate"),
+            up_exps: ExpertW::load(f, &name("ffn_up_exps.weight"), p).expect("up"),
+            down_exps: ExpertW::load(f, &name("ffn_down_exps.weight"), p).expect("down"),
+            gate_shexp: f32_linear(p.n_embd, p.n_ff_shexp, 0.3),
+            up_shexp: f32_linear(p.n_embd, p.n_ff_shexp, 0.4),
+            down_shexp: f32_linear(p.n_ff_shexp, p.n_embd, 0.5),
+            ple: None,
+        }
+    }
+
+    /// 行列ごとの 1 expert のバイト数 (合成 GGUF の実値)。
+    fn expert_lens(lw: &LayerW) -> [usize; 3] {
+        [
+            lw.gate_exps.slice_abs(0).expect("gate len").1,
+            lw.up_exps.slice_abs(0).expect("up len").1,
+            lw.down_exps.slice_abs(0).expect("down len").1,
+        ]
+    }
+
+    fn cache_test_x(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013)
+            .collect()
+    }
+
+    fn assert_bitwise_eq(a: &[f32], b: &[f32], what: &str) {
+        assert_eq!(a.len(), b.len(), "{what}: 長さが違う");
+        for i in 0..a.len() {
+            assert_eq!(
+                a[i].to_bits(),
+                b[i].to_bits(),
+                "{what}: 要素 {i} がビット一致しない (mmap {} / cache {})",
+                a[i],
+                b[i]
+            );
+        }
+    }
+
+    #[test]
+    fn expert_cache_path_is_bit_identical_to_mmap() {
+        let dir = TempDir::new("bit");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        // 1. 従来経路 (mmap + prefetch)
+        let want = moe_ffn_quant(&p, &lw, &x, None).expect("mmap 経路");
+        assert!(want.iter().all(|v| v.is_finite()), "mmap 経路に NaN/inf");
+        assert!(want.iter().any(|v| *v != 0.0), "mmap 経路が全 0");
+
+        // 2. キャッシュ経路 (2 スロット)
+        let lens = expert_lens(&lw);
+        let mut set =
+            ExpertCacheSet::new_with_slots([2, 2, 2], lens, &[path.clone()], 2).expect("cache set");
+        assert_eq!(set.slots(ExpertMatrix::Gate), 2, "スロット数が 2 でない");
+        let got = moe_ffn_quant(&p, &lw, &x, Some(&mut set)).expect("cache 経路");
+        assert_bitwise_eq(&want, &got, "mmap vs cache");
+
+        // 3. 初回は全ミス (top-2 なので行列ごとに 2 回読む)
+        for (k, &m) in ExpertMatrix::ALL.iter().enumerate() {
+            let s = set.stats(m);
+            assert_eq!(s.hits, 0, "{m:?}: 初回でヒットした");
+            assert_eq!(s.misses, 2, "{m:?}: 初回のミス数");
+            assert_eq!(s.bytes_read, 2 * lens[k] as u64, "{m:?}: 読んだバイト数");
+            assert_eq!(s.evictions, 0, "{m:?}: 2 スロットに top-2 で追い出しは起きない");
+        }
+
+        // 4. 同じ x をもう一度 → 同じ expert が選ばれるのでヒット (ミスは増えない)
+        let before: Vec<u64> = ExpertMatrix::ALL.iter().map(|&m| set.stats(m).misses).collect();
+        let again = moe_ffn_quant(&p, &lw, &x, Some(&mut set)).expect("cache 経路 2 回目");
+        assert_bitwise_eq(&want, &again, "mmap vs cache (2 回目)");
+        for (k, &m) in ExpertMatrix::ALL.iter().enumerate() {
+            let s = set.stats(m);
+            assert_eq!(s.misses, before[k], "{m:?}: 同じ expert なのにミスが増えた");
+            assert_eq!(s.hits, 2, "{m:?}: 2 回目でヒットしていない");
+        }
+        assert_eq!(set.hit_rate(ExpertMatrix::Gate), 0.5, "ヒット率");
+    }
+
+    #[test]
+    fn one_slot_cache_keeps_evicting() {
+        let dir = TempDir::new("one");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+        let lens = expert_lens(&lw);
+
+        let mut set =
+            ExpertCacheSet::new_with_slots([1, 1, 1], lens, &[path.clone()], 1).expect("cache set");
+        for m in ExpertMatrix::ALL {
+            assert_eq!(set.slots(m), 1, "{m:?}: スロット数が 1 でない");
+        }
+
+        // 1 スロットで top-2 → 1 回の forward で必ず追い出しが起きる
+        moe_ffn_quant(&p, &lw, &x, Some(&mut set)).expect("1 回目");
+        let first: Vec<(u64, u64)> = ExpertMatrix::ALL
+            .iter()
+            .map(|&m| (set.stats(m).misses, set.stats(m).evictions))
+            .collect();
+        for (k, &m) in ExpertMatrix::ALL.iter().enumerate() {
+            let (misses, evictions) = first[k];
+            assert_eq!(misses, 2, "{m:?}: 1 回目のミス数");
+            assert_eq!(evictions, 1, "{m:?}: 1 回目の追い出し数");
+        }
+
+        // 2 回目も同じ expert を引くが、1 スロットなので前回の 2 個目しか残っていない
+        // → 少なくとも 1 回は必ずミスし、追い出しが増える
+        moe_ffn_quant(&p, &lw, &x, Some(&mut set)).expect("2 回目");
+        for (k, &m) in ExpertMatrix::ALL.iter().enumerate() {
+            let s = set.stats(m);
+            assert!(s.misses > first[k].0, "{m:?}: 2 回目でミスが増えていない");
+            assert!(s.evictions > first[k].1, "{m:?}: 2 回目で追い出しが増えていない");
+        }
+    }
+
+    #[test]
+    fn zero_slots_still_returns_mmap_bytes() {
+        let dir = TempDir::new("zero");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+        let lens = expert_lens(&lw);
+
+        let want = moe_ffn_quant(&p, &lw, &x, None).expect("mmap 経路");
+        let mut set =
+            ExpertCacheSet::new_with_slots([0, 0, 0], lens, &[path.clone()], 0).expect("cache set");
+        for m in ExpertMatrix::ALL {
+            assert_eq!(set.slots(m), 0, "{m:?}: スロット数が 0 でない");
+        }
+        let got = moe_ffn_quant(&p, &lw, &x, Some(&mut set)).expect("slots=0 経路");
+        assert_bitwise_eq(&want, &got, "mmap vs slots=0");
+        for (k, &m) in ExpertMatrix::ALL.iter().enumerate() {
+            let s = set.stats(m);
+            assert_eq!((s.hits, s.misses), (0, 2), "{m:?}: slots=0 の統計");
+            assert_eq!(s.bytes_read, 2 * lens[k] as u64, "{m:?}: 読んだバイト数");
+        }
+    }
+
+    #[test]
+    fn build_expert_caches_takes_mb_and_per_matrix_max() {
+        let dir = TempDir::new("build");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let layers = vec![cache_test_layer(&f, &p)];
+        let lens = expert_lens(&layers[0]);
+
+        // MB = 0 は「無効」= 構築しない (mmap 経路のまま)
+        assert!(
+            build_expert_caches_with_mb(0, &f, &layers)
+                .expect("mb=0")
+                .is_none(),
+            "mb=0 でキャッシュを組んだ"
+        );
+
+        // MB = 4: 行列ごとに 4 MiB / slot_bytes (切り捨て)
+        let set = build_expert_caches_with_mb(4, &f, &layers)
+            .expect("mb=4")
+            .expect("キャッシュが組まれていない");
+        assert_eq!(set.mb(), 4);
+        for (k, &m) in ExpertMatrix::ALL.iter().enumerate() {
+            assert_eq!(set.slot_bytes(m), lens[k], "{m:?}: slot_bytes");
+            assert_eq!(
+                set.slots(m),
+                4 * 1024 * 1024 / lens[k],
+                "{m:?}: スロット数が MB の式と違う"
+            );
+            assert_eq!(set.stats(m), CacheStats::default(), "{m:?}: 初期統計");
+        }
+    }
+
+    #[test]
+    fn slot_bytes_below_the_largest_expert_is_an_error() {
+        // 静かに切り詰めないこと (Q5_1 down の 1 expert より小さいスロット)
+        let dir = TempDir::new("small");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+        let mut lens = expert_lens(&lw);
+        lens[2] -= 1; // down だけ 1 バイト足りない
+
+        let mut set =
+            ExpertCacheSet::new_with_slots([2, 2, 2], lens, &[path.clone()], 2).expect("cache set");
+        let err = moe_ffn_quant(&p, &lw, &x, Some(&mut set)).expect_err("切り詰めて通った");
+        assert!(
+            err.to_string().contains("1 スロット"),
+            "エラーがスロット超過でない: {err}"
+        );
     }
 }
