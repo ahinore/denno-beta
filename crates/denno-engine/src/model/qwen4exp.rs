@@ -1478,6 +1478,20 @@ impl LayerTensors {
 /// `hc_mix` の出力 `cur` (`[n_embd]`) を受けて、その層の出力 (`[n_embd]`) を返す。
 pub trait LayerAttn: Send {
     fn forward(&mut self, layer: usize, cur: &[f32]) -> Result<Vec<f32>>;
+
+    /// 層をまたいで呼び出し順を入れ替えても状態が壊れないか。
+    ///
+    /// 層優先 (トークンをまとめて層ごとに回す) のバッチ prefill は、1 層ぶんの
+    /// 全トークンを先に処理してから次の層へ進む。状態を持つ実装 (full attention の
+    /// KV / pos、ssm の conv・GDN) が「1 トークンで全層を 1 周する」前提で位置を
+    /// 進めている場合、この順序では壊れる。
+    ///
+    /// 既定は `false` (安全側 = 逐次経路に落ちる)。層優先で正しく動く実装だけが
+    /// `true` を返す。full attention の `pos` は「全 full attention 層が揃うまで
+    /// 進めない」実装なので、現状は [`IdentityAttn`] だけが `true`。
+    fn layer_major_safe(&self) -> bool {
+        false
+    }
 }
 
 /// F1 の恒等実装。`cur` をそのまま返す (attention / ssm は F2 / F3)。
@@ -1486,6 +1500,11 @@ pub struct IdentityAttn;
 impl LayerAttn for IdentityAttn {
     fn forward(&mut self, _layer: usize, cur: &[f32]) -> Result<Vec<f32>> {
         Ok(cur.to_vec())
+    }
+
+    /// 状態を持たない (恒等) ので、層優先の順序でも壊れない。
+    fn layer_major_safe(&self) -> bool {
+        true
     }
 }
 
@@ -2138,6 +2157,164 @@ impl Qwen4Exp {
         }
         Ok(())
     }
+
+    /// プロンプト全体を 1 回で処理して**最後のトークンの logits** を返す。
+    ///
+    /// `DENNO_PREFILL_BATCH=1` のときだけ層優先のバッチ経路を使う (既定 off)。
+    /// off のとき、または attention が層優先の順序に耐えない実装のときは、
+    /// decoder と同じ「1 トークンずつ [`Qwen4Exp::forward_token`]」に落ちる。
+    /// どちらの経路も出力はビット一致する (バッチ経路は行列積を
+    /// [`gemv_batch`] = 行優先・同一カーネルに置き換えるだけ)。
+    pub fn forward_prefill(&mut self, ctx: &[u32]) -> Result<Vec<f32>> {
+        self.forward_prefill_with(ctx, prefill_batch_enabled())
+    }
+
+    /// [`Qwen4Exp::forward_prefill`] の切替を引数で受ける版 (テスト用)。
+    ///
+    /// `batch == false` は既存の逐次経路そのもの (1 ビットも変えない)。
+    pub fn forward_prefill_with(&mut self, ctx: &[u32], batch: bool) -> Result<Vec<f32>> {
+        if batch && self.attn.layer_major_safe() {
+            self.forward_prefill_batch(ctx, prefill_batch_chunk())
+        } else {
+            self.prefill_seq(ctx)
+        }
+    }
+
+    /// 逐次 prefill (= decoder と同じ経路)。既存の [`Qwen4Exp::forward_token`] を
+    /// トークン数だけ呼ぶだけで、数値経路には触らない。
+    fn prefill_seq(&mut self, ctx: &[u32]) -> Result<Vec<f32>> {
+        if ctx.is_empty() {
+            return Err(one("ctx が空 (現在のトークンが無い)"));
+        }
+        let mut logits = Vec::new();
+        for i in 0..ctx.len() {
+            logits = self.forward_token(&ctx[..=i])?;
+        }
+        Ok(logits)
+    }
+
+    /// 層優先のバッチ prefill。`ctx` を `chunk` トークンずつに切り、チャンク内では
+    /// 「層 0 の全トークン → 層 1 の全トークン → ...」の順に回す。
+    ///
+    /// チャンクを跨いで持ち越す残差は無い (各トークンの層 0 の入力は埋め込みだけで、
+    /// 残差は層の中で閉じる)。attention の KV / GDN 状態は `attn` の中に
+    /// **トークン順**で積まれるので、層優先でも順序は保たれる
+    /// (`LayerAttn::layer_major_safe` が true の実装だけがここへ来る)。
+    ///
+    /// 数値: 1 トークンぶんの演算は逐次版と同じ関数・同じ順序で、行列積だけを
+    /// [`gemv_batch`] に置き換える。したがって f32 でビット一致する。
+    fn forward_prefill_batch(&mut self, ctx: &[u32], chunk: usize) -> Result<Vec<f32>> {
+        if ctx.is_empty() {
+            return Err(one("ctx が空 (現在のトークンが無い)"));
+        }
+        #[cfg(test)]
+        PREFILL_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let hp = self.hp();
+        let e = self.p.n_embd;
+        let n_layer = self.p.n_layer;
+        let chunk = chunk.max(1);
+        let mut last: Option<HyperStreams> = None;
+        let mut start = 0usize;
+        while start < ctx.len() {
+            let end = (start + chunk).min(ctx.len());
+            let nt = end - start;
+            let mut ress: Vec<HyperStreams> = Vec::with_capacity(nt);
+            let mut ples: Vec<Option<Vec<f32>>> = Vec::with_capacity(nt);
+            for i in start..end {
+                ress.push(self.forward_embed(&ctx[..=i], &hp)?);
+                ples.push(self.gather_ple(&ctx[..=i])?);
+            }
+
+            for il in 0..n_layer {
+                let lw = &self.layers[il];
+                if q4prof::enabled() {
+                    q4prof::N_LAYER.fetch_add(nt as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // 3.1 PLE 注入 (層 1 のみ)。conv 履歴はトークン順に進める。
+                if let Some(pw) = &lw.ple {
+                    for t in 0..nt {
+                        let pe = ples[t]
+                            .as_ref()
+                            .ok_or_else(|| one(format!("層 {il}: PLE の行が無い")))?;
+                        let hist = self.ple_conv_state[il]
+                            .as_mut()
+                            .ok_or_else(|| one(format!("層 {il}: PLE の conv 履歴が無い")))?;
+                        ress[t] = ple_inject(&self.p, pw, pe, &ress[t], &hp, hist)?;
+                    }
+                }
+
+                // 3.2-3.4 attention 入口 (バッチ) → attn (トークン順) → 出口
+                let t_mix = std::time::Instant::now();
+                let (curs, injs) = hc_mix_quant_batch(
+                    &ress,
+                    &lw.hc_attn_norm,
+                    &lw.hc_attn_down,
+                    &lw.hc_attn_up,
+                    Some(&lw.hc_attn_inject),
+                    &hp,
+                )?;
+                q4prof::add(&q4prof::MIX, t_mix);
+                let t_attn = std::time::Instant::now();
+                let mut outs = Vec::with_capacity(nt);
+                for cur in &curs {
+                    let o = self.attn.forward(il, cur)?;
+                    if o.len() != e {
+                        return Err(one(format!(
+                            "層 {il}: attention の出力長 {} が n_embd {e} と違う",
+                            o.len()
+                        )));
+                    }
+                    outs.push(o);
+                }
+                q4prof::add(&q4prof::ATTN, t_attn);
+                for t in 0..nt {
+                    ress[t] = hyper::hc_combine(&ress[t], &outs[t], &injs[t], &hp);
+                }
+
+                // 3.5-3.7 ffn 入口 (バッチ) → MoE FFN (バッチ) → 出口
+                let t_mix = std::time::Instant::now();
+                let (curs, injs) = hc_mix_quant_batch(
+                    &ress,
+                    &lw.hc_ffn_norm,
+                    &lw.hc_ffn_down,
+                    &lw.hc_ffn_up,
+                    Some(&lw.hc_ffn_inject),
+                    &hp,
+                )?;
+                q4prof::add(&q4prof::MIX, t_mix);
+                let flat = flatten_rows(&curs, e)?;
+                let t_moe = std::time::Instant::now();
+                let ffn = moe_ffn_quant_batch(&self.p, lw, &flat, nt, self.expert_cache.as_mut())?;
+                q4prof::add(&q4prof::MOE, t_moe);
+                for t in 0..nt {
+                    ress[t] = hyper::hc_combine(&ress[t], &ffn[t * e..(t + 1) * e], &injs[t], &hp);
+                }
+            }
+
+            // 次のチャンクは自分の埋め込みから始まる (残差の持ち越しは無い)。
+            last = ress.pop();
+            start = end;
+        }
+
+        // 4. 最終 mixer (output_norm の代わり) + 5. logits (最後のトークンだけ)
+        let res = last.ok_or_else(|| one("ctx が空 (現在のトークンが無い)"))?;
+        let cur = hc_mix_quant(
+            &res,
+            &self.head.norm,
+            &self.head.down,
+            &self.head.up,
+            None,
+            &hp,
+        )?
+        .0;
+        let mut logits = vec![0.0f32; self.head.output.n()];
+        self.head
+            .output
+            .gemv(&cur, &mut logits)
+            .map_err(|err| one(format!("output: {err}")))?;
+        Ok(logits)
+    }
 }
 
 /// `hc_mix` を**量子化重み**で計算する (`hyper::hc_mix` と同じ丸め順序)。
@@ -2175,6 +2352,70 @@ fn hc_mix_quant(
         None => vec![0.0f32; hp.hc],
     };
     Ok((mixed, inj))
+}
+
+/// [`hc_mix_quant`] のバッチ版 (`nt` トークンぶんまとめて行列積)。
+///
+/// 行列積 (`down` / `up` / `inject`) だけを [`gemv_batch`] に置き換え、
+/// ストリームごとの RMS 正規化・`hc_lo_apply` / `hc_mixed` / `hc_inject_apply` は
+/// 逐次版と同じ関数をトークンごとに呼ぶ。要素ごとの演算順序は変わらないので、
+/// 1 トークンぶんの出力は [`hc_mix_quant`] とビット一致する。
+fn hc_mix_quant_batch(
+    ress: &[HyperStreams],
+    norm: &[f32],
+    down: &GgufLinear,
+    up: &GgufLinear,
+    inject: Option<&GgufLinear>,
+    hp: &HyperParams,
+) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let nt = ress.len();
+    let hc_dim = hp.hc * hp.n_embd;
+    let mut xn: Vec<Vec<f32>> = Vec::with_capacity(nt);
+    for (t, r) in ress.iter().enumerate() {
+        if r.data.len() != hc_dim {
+            return Err(one(format!(
+                "hc_mix (batch): トークン {t} の res 長 {} が hc_dim {hc_dim} と違う",
+                r.data.len()
+            )));
+        }
+        xn.push(hyper::grouped_rms_norm(r, norm, hp));
+    }
+    let xn_flat = flatten_rows(&xn, hc_dim)?;
+
+    let dn = down.n();
+    let mut lo = vec![0.0f32; nt * dn];
+    gemv_batch(down, &xn_flat, nt, &mut lo)
+        .map_err(|err| one(format!("hc_mix down (batch): {err}")))?;
+    for t in 0..nt {
+        hyper::hc_lo_apply(&mut lo[t * dn..(t + 1) * dn], hp);
+    }
+
+    let un = up.n();
+    let mut gate = vec![0.0f32; nt * un];
+    gemv_batch(up, &lo, nt, &mut gate).map_err(|err| one(format!("hc_mix up (batch): {err}")))?;
+    let mut mixed = Vec::with_capacity(nt);
+    for t in 0..nt {
+        mixed.push(hyper::hc_mixed(&xn[t], &gate[t * un..(t + 1) * un], hp));
+    }
+
+    let injs = match inject {
+        Some(w) => {
+            let wn = w.n();
+            let mut v = vec![0.0f32; nt * wn];
+            gemv_batch(w, &xn_flat, nt, &mut v)
+                .map_err(|err| one(format!("hc_mix inject (batch): {err}")))?;
+            for t in 0..nt {
+                hyper::hc_inject_apply(&mut v[t * wn..(t + 1) * wn], hp);
+            }
+            let mut out = Vec::with_capacity(nt);
+            for t in 0..nt {
+                out.push(v[t * wn..(t + 1) * wn].to_vec());
+            }
+            out
+        }
+        None => vec![vec![0.0f32; hp.hc]; nt],
+    };
+    Ok((mixed, injs))
 }
 
 /// PLE 注入 (層 `ple.layers` のみ)。`res_hc` を置き換えて返す。
@@ -2566,6 +2807,386 @@ fn moe_ffn_quant_with_par(
     let sgw = hyper::sigmoid(sg[0]);
     for j in 0..e {
         out[j] += sh[j] * sgw;
+    }
+
+    Ok(out)
+}
+
+/// バッチ GEMV が 1 行ぶんを計算するときの入口。
+///
+/// **同じ量子型でも入口によってカーネルが違う**ので、呼び出し側に合わせる:
+/// - [`GgufLinear::gemv`] は `moe_expert::expert_gemv` を通る。Q4_K / Q5_K だけが
+///   融合カーネル、Q5_1 / Q8_0 はスカラー。ただしこのモデルのテンソルは
+///   [`linear`] が `with_fast_q8(true)` で組むので、**Q8_0 だけ**は
+///   `expert_gemv_q8_fast` (AVX2 融合) になる。
+/// - [`ExpertW::gemv`] は `moe_expert::expert_gemv_any` を通る。Q5_1 / Q8_0 も
+///   融合カーネル (AVX2+FMA) になる。
+///
+/// ここを取り違えると、同じバイト列・同じ `x` でも Q5_1 / Q8_0 で 1 ulp ずれる
+/// (2026-10-27 に実際に踏んだ)。
+#[derive(Clone, Copy)]
+enum GemvKernel {
+    /// [`GgufLinear::gemv`] と同じ入口。**`linear()` 経由のテンソル前提**
+    /// (`fast_q8 = true`)。`from_slice` で組んだ層を比べるときは、その層も
+    /// `with_fast_q8(true)` にしておくこと。
+    Linear,
+    /// [`ExpertW::gemv`] と同じ入口 (`expert_gemv_any`)
+    Expert,
+}
+
+/// 量子化重みの行優先バッチ GEMV: `out[t * n + r] = dot(row_r, x_t)`。
+///
+/// 行 `r` を外側で 1 回だけ切り出し、内側でトークンを回す。1 行ぶんの計算は
+/// `kern` が指す入口を `n_out = 1` で呼ぶ = 逐次版と**同じカーネル**なので、
+/// Q4_K の融合カーネル (AVX2+FMA) を含めてビット一致する。行は互いに独立で、
+/// `x` に依存する前計算も同じ `x` から作られる。
+///
+/// 速くなる根拠は演算量ではなく**重みの再読み込み**: 逐次版はトークンごとに同じ
+/// 行を最初から読み直すが、ここでは 1 行がキャッシュに載ったまま `nt` トークンぶん
+/// 使われる (27B の expert は 1 トークンで 487 MB を触るので、ここが支配的)。
+fn gemv_rows_batch(
+    kern: GemvKernel,
+    ty: GgmlType,
+    bytes: &[u8],
+    k: usize,
+    n: usize,
+    xs: &[f32],
+    nt: usize,
+    outs: &mut [f32],
+) -> Result<()> {
+    if nt == 0 {
+        return Ok(());
+    }
+    if xs.len() != nt * k {
+        return Err(one(format!(
+            "gemv_batch: x の長さ {} が nt({nt}) * k({k}) と違う",
+            xs.len()
+        )));
+    }
+    if outs.len() != nt * n {
+        return Err(one(format!(
+            "gemv_batch: out の長さ {} が nt({nt}) * n({n}) と違う",
+            outs.len()
+        )));
+    }
+    if n == 0 || bytes.len() % n != 0 {
+        return Err(one(format!(
+            "gemv_batch: 行数 {n} でバイト数 {} を割り切れない",
+            bytes.len()
+        )));
+    }
+    let rb = bytes.len() / n;
+    for r in 0..n {
+        let row = &bytes[r * rb..(r + 1) * rb];
+        for t in 0..nt {
+            let x = &xs[t * k..(t + 1) * k];
+            let o = &mut outs[t * n + r..t * n + r + 1];
+            let res = match kern {
+                // モデルの Q8_0 は fast_q8 = true (linear() がそう組む) なので、
+                // GgufLinear::gemv と同じく融合カーネルの入口を使う。
+                GemvKernel::Linear if ty == GgmlType::Q8_0 => {
+                    moe_expert::expert_gemv_q8_fast(row, k, 1, x, o)
+                }
+                GemvKernel::Linear => moe_expert::expert_gemv(ty, row, k, 1, x, o),
+                GemvKernel::Expert => moe_expert::expert_gemv_any(ty, row, k, 1, x, o),
+            };
+            res.map_err(|err| one(format!("gemv_batch: 行 {r} トークン {t}: {err}")))?;
+        }
+    }
+    #[cfg(test)]
+    GEMV_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// [`GgufLinear`] のバッチ GEMV (`nt` トークン × 1 行列)。
+///
+/// 量子型は [`gemv_rows_batch`] (行優先・`GgufLinear::gemv` と同じ入口)、
+/// 無量子型 (F32/F16/BF16) は [`GgufLinear::gemv`] と同じ「行を f32 に開いて
+/// 列昇順に逐次加算」を、行ごとに 1 回だけ展開してトークンぶん使い回す。
+///
+/// 注意: `--features cuda` で重みが VRAM に常駐している場合、逐次版
+/// ([`GgufLinear::gemv`]) は GPU カーネルで計算するため、ここ (CPU 参照) とは
+/// 一致しない。バッチ経路は現状 CPU のみ (GPU 常駐時は `DENNO_PREFILL_BATCH` を
+/// 立てないこと)。
+fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]) -> Result<()> {
+    let (k, n) = (w.k(), w.n());
+    match w.ty() {
+        GgmlType::Q8_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K => gemv_rows_batch(
+            GemvKernel::Linear,
+            w.ty(),
+            w.blocks().as_slice(),
+            k,
+            n,
+            xs,
+            nt,
+            outs,
+        ),
+        GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => {
+            if nt == 0 {
+                return Ok(());
+            }
+            if xs.len() != nt * k {
+                return Err(one(format!(
+                    "gemv_batch: x の長さ {} が nt({nt}) * k({k}) と違う",
+                    xs.len()
+                )));
+            }
+            if outs.len() != nt * n {
+                return Err(one(format!(
+                    "gemv_batch: out の長さ {} が nt({nt}) * n({n}) と違う",
+                    outs.len()
+                )));
+            }
+            let bytes = w.blocks().as_slice();
+            if n == 0 || bytes.len() % n != 0 {
+                return Err(one(format!(
+                    "gemv_batch: 行数 {n} でバイト数 {} を割り切れない",
+                    bytes.len()
+                )));
+            }
+            let rb = bytes.len() / n;
+            let mut row = vec![0.0f32; k];
+            for r in 0..n {
+                crate::kquant::dequant_row_into(w.ty(), &bytes[r * rb..(r + 1) * rb], &mut row);
+                for t in 0..nt {
+                    let x = &xs[t * k..(t + 1) * k];
+                    let mut acc = 0.0f32;
+                    for i in 0..k {
+                        acc += row[i] * x[i];
+                    }
+                    outs[t * n + r] = acc;
+                }
+            }
+            #[cfg(test)]
+            GEMV_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+        other => Err(one(format!("gemv_batch: 未対応の量子型 {other:?}"))),
+    }
+}
+
+/// [`ExpertW::gemv`] のバッチ版 (1 expert × `nt` トークン)。
+///
+/// [`ExpertW::slice`] が返す 1 expert ぶんのバイト列を [`gemv_rows_batch`] に渡す。
+/// 逐次版と同じ [`moe_expert::expert_gemv_any`] を 1 行ずつ通るのでビット一致する
+/// (`GgufLinear::gemv` とは Q5_1 / Q8_0 で入口が違う点に注意 → [`GemvKernel`])。
+fn expert_gemv_batch(
+    w: &ExpertW,
+    e: usize,
+    xs: &[f32],
+    nt: usize,
+    outs: &mut [f32],
+) -> Result<()> {
+    let s = w.slice(e)?;
+    gemv_rows_batch(
+        GemvKernel::Expert,
+        w.ty,
+        s,
+        w.n_in,
+        w.n_out,
+        xs,
+        nt,
+        outs,
+    )
+    .map_err(|err| one(format!("{}: expert {e} (batch): {err}", w.name)))
+}
+
+/// 行のベクタを 1 本の平坦な配列に連結する ([`gemv_batch`] の入力形式)。
+fn flatten_rows(rows: &[Vec<f32>], width: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(rows.len() * width);
+    for (t, r) in rows.iter().enumerate() {
+        if r.len() != width {
+            return Err(one(format!(
+                "flatten_rows: 行 {t} の長さ {} が {width} と違う",
+                r.len()
+            )));
+        }
+        out.extend_from_slice(r);
+    }
+    Ok(out)
+}
+
+/// テスト用: 層優先バッチ prefill / バッチ GEMV が実際に走った回数。
+/// 「緑 = 経路が発動した証拠」ではないので、分岐の通過をここで数える。
+#[cfg(test)]
+pub(crate) static PREFILL_BATCH_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static GEMV_BATCH_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `DENNO_PREFILL_BATCH` の値の解釈 (純粋関数)。既定 (未設定) は無効。
+///
+/// `"1"` のときだけ有効。`"0"`・空文字・その他は無効 (既定 off を崩さない)。
+fn prefill_batch_from_value(v: Option<&str>) -> bool {
+    matches!(v, Some("1"))
+}
+
+/// 層優先バッチ prefill が有効か (`DENNO_PREFILL_BATCH`, 既定 off)。プロセスで 1 回だけ読む。
+fn prefill_batch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| prefill_batch_from_value(std::env::var("DENNO_PREFILL_BATCH").ok().as_deref()))
+}
+
+/// 1 チャンクのトークン数 (`DENNO_PREFILL_BATCH_CHUNK`, 既定 8, 1..=64)。
+///
+/// チャンクを大きくするほど重みの再読み込みは減るが、残差 `[nt][hc_dim]` と
+/// `hc_mix` の中間がそのぶん増える (27B の hc_dim は 20480 f32 = 80 KiB/トークン)。
+fn prefill_batch_chunk() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("DENNO_PREFILL_BATCH_CHUNK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(1, 64))
+            .unwrap_or(8)
+    })
+}
+
+/// [`moe_ffn_quant`] のバッチ版 (`nt` トークン)。
+///
+/// ルータ / shared expert / 選択 expert の行列積を [`gemv_batch`] に置き換える。
+/// 同じ expert を選んだトークンはまとめて GEMV する。
+///
+/// 数値: トークンごとの softmax → top-k → 再正規化 → **index 昇順**の重み付き加算、
+/// という順序をそのまま保つ。1 トークンの `h_e` は (行, トークン) ごとに逐次版と
+/// 同じカーネルで計算され、足し込みは index 昇順の逐次なので f32 でビット一致する。
+///
+/// キャッシュ経路 (`cache: Some`) は [`ExpertCacheSet`] が `&mut` でスロットを
+/// 共有するためバッチ化しない (トークンごとに逐次版へ落とす)。
+fn moe_ffn_quant_batch(
+    p: &Qwen4ExpParams,
+    lw: &LayerW,
+    xs: &[f32],
+    nt: usize,
+    cache: Option<&mut ExpertCacheSet>,
+) -> Result<Vec<f32>> {
+    let e = p.n_embd;
+    let ne = p.n_expert;
+    let k = p.n_expert_used;
+    let ff = p.n_ff_exp;
+    if nt == 0 {
+        return Ok(Vec::new());
+    }
+    if xs.len() != nt * e {
+        return Err(one(format!(
+            "moe_ffn_quant (batch): x の長さ {} が nt({nt}) * n_embd({e}) と違う",
+            xs.len()
+        )));
+    }
+    let mut cache = cache;
+    if let Some(c) = cache.as_deref_mut() {
+        let mut out = Vec::with_capacity(nt * e);
+        for t in 0..nt {
+            out.extend_from_slice(&moe_ffn_quant(p, lw, &xs[t * e..(t + 1) * e], Some(c))?);
+        }
+        return Ok(out);
+    }
+
+    // 1. ルータ (バッチ)
+    let mut probs = vec![0.0f32; nt * ne];
+    gemv_batch(&lw.gate_inp, xs, nt, &mut probs)
+        .map_err(|err| one(format!("層 {}: ffn_gate_inp (batch): {err}", lw.il)))?;
+
+    // 2. トークンごとの softmax / top-k / 再正規化 (逐次版と同じ順序)
+    let mut sels: Vec<Vec<usize>> = Vec::with_capacity(nt);
+    let mut weights: Vec<Vec<f32>> = Vec::with_capacity(nt);
+    for t in 0..nt {
+        let pr = &mut probs[t * ne..(t + 1) * ne];
+        softmax(pr);
+        let sel = select_topk(pr, k);
+        let mut sum = 0.0f32;
+        for &i in &sel {
+            sum += pr[i];
+        }
+        let mut w = vec![0.0f32; k];
+        for (j, &i) in sel.iter().enumerate() {
+            w[j] = pr[i] / sum;
+        }
+        sels.push(sel);
+        weights.push(w);
+    }
+
+    // 3. 選択 expert の重みを先に読み始める (逐次版と同じ expert を同じ順で)
+    for sel in &sels {
+        for &ei in sel {
+            lw.gate_exps.prefetch(ei);
+            lw.up_exps.prefetch(ei);
+            lw.down_exps.prefetch(ei);
+        }
+    }
+
+    // 4. expert を index 昇順に、同じ expert を選んだトークンをまとめて回す
+    let mut out = vec![0.0f32; nt * e];
+    for ei in 0..ne {
+        let picks: Vec<(usize, usize)> = sels
+            .iter()
+            .enumerate()
+            .filter_map(|(t, s)| s.iter().position(|&x| x == ei).map(|j| (t, j)))
+            .collect();
+        if picks.is_empty() {
+            continue;
+        }
+        let m = picks.len();
+        let mut xin = Vec::with_capacity(m * e);
+        for &(t, _) in &picks {
+            xin.extend_from_slice(&xs[t * e..(t + 1) * e]);
+        }
+        let mut act = vec![0.0f32; m * ff];
+        let mut up = vec![0.0f32; m * ff];
+        let mut h = vec![0.0f32; m * e];
+        if m == 1 {
+            // 1 トークンなら逐次版とまったく同じ入口を使う (行並列も従来どおり)。
+            lw.gate_exps.gemv(ei, &xin, &mut act)?;
+            silu_inplace(&mut act);
+            lw.up_exps.gemv(ei, &xin, &mut up)?;
+            for r in 0..m * ff {
+                act[r] *= up[r];
+            }
+            lw.down_exps.gemv(ei, &act, &mut h)?;
+        } else {
+            expert_gemv_batch(&lw.gate_exps, ei, &xin, m, &mut act)?;
+            silu_inplace(&mut act);
+            expert_gemv_batch(&lw.up_exps, ei, &xin, m, &mut up)?;
+            for r in 0..m * ff {
+                act[r] *= up[r];
+            }
+            expert_gemv_batch(&lw.down_exps, ei, &act, m, &mut h)?;
+        }
+        // 重み付きの足し込みはトークンごとに逐次 (index 昇順のまま)
+        for (idx, &(t, j)) in picks.iter().enumerate() {
+            let pe = weights[t][j];
+            let hh = &h[idx * e..(idx + 1) * e];
+            for d in 0..e {
+                out[t * e + d] += pe * hh[d];
+            }
+        }
+    }
+
+    // 5. shared expert (バッチ)。係数は sigmoid(gate_inp_shexp @ x)
+    let sff = lw.gate_shexp.n();
+    let mut sact = vec![0.0f32; nt * sff];
+    gemv_batch(&lw.gate_shexp, xs, nt, &mut sact)
+        .map_err(|err| one(format!("層 {}: ffn_gate_shexp (batch): {err}", lw.il)))?;
+    silu_inplace(&mut sact);
+    let mut sup = vec![0.0f32; nt * sff];
+    gemv_batch(&lw.up_shexp, xs, nt, &mut sup)
+        .map_err(|err| one(format!("層 {}: ffn_up_shexp (batch): {err}", lw.il)))?;
+    for r in 0..nt * sff {
+        sact[r] *= sup[r];
+    }
+    let mut sh = vec![0.0f32; nt * e];
+    gemv_batch(&lw.down_shexp, &sact, nt, &mut sh)
+        .map_err(|err| one(format!("層 {}: ffn_down_shexp (batch): {err}", lw.il)))?;
+    let gn = lw.gate_inp_shexp.n();
+    let mut sg = vec![0.0f32; nt * gn];
+    gemv_batch(&lw.gate_inp_shexp, xs, nt, &mut sg)
+        .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp (batch): {err}", lw.il)))?;
+    for t in 0..nt {
+        let sgw = hyper::sigmoid(sg[t * gn]);
+        for d in 0..e {
+            out[t * e + d] += sh[t * e + d] * sgw;
+        }
     }
 
     Ok(out)
@@ -3216,5 +3837,534 @@ mod tests {
             err.to_string().contains("1 スロット"),
             "エラーがスロット超過でない: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // H2: prefill のバッチ化 (層優先) — 逐次経路とのビット一致
+    //
+    // 合成モデルは**目録 (`expected_tensors`) から組む**: テンソル名・形状・
+    // 量子型をここに写さないので、目録が変わればテストも自動で追随する。
+    // -----------------------------------------------------------------
+
+    mod h2 {
+        use super::*;
+        use std::sync::atomic::Ordering;
+
+        // 次元 (tests/qwen4exp_fwd.rs の合成モデルと同じ値。目録の下限を満たす最小)
+        const E: usize = 256;
+        const VOCAB: usize = 8;
+        const NHEAD: usize = 2;
+        const HEAD: usize = 256;
+        const NKV: usize = 1;
+        const NEXP: usize = 2;
+        const FF: usize = 256;
+        const HC: usize = 2;
+        const HC_LR: usize = 32;
+        const SSM_CONV: usize = 4;
+        const SSM_STATE: usize = 32;
+        const SSM_GROUP: usize = 2;
+        const SSM_DT: usize = 2;
+        const SSM_INNER: usize = 64;
+        const INTERVAL: usize = 4;
+        const IDX_HEAD: usize = 2;
+        const IDX_DIM: usize = 32;
+        const IDX_TOP_K: usize = 8;
+        const RATIO: u32 = 2;
+        const PLE_HEADS_PER_NGRAM: usize = 2;
+        const EPL: usize = 64;
+        const PLE_LAYER: usize = 1;
+        const PLE_NGRAM: usize = 3;
+        const PLE_CONV: usize = 4;
+        const PLE_ROWS: u64 = 40;
+        const LAYERS: usize = 4;
+
+        const GT_F32: u32 = 6;
+        const GT_ARRAY: u32 = 9;
+        const GT_U64: u32 = 10;
+
+        enum V {
+            U32(u32),
+            F32(f32),
+            S(&'static str),
+            A32(Vec<u32>),
+            A64(Vec<u64>),
+            AStr(Vec<String>),
+        }
+
+        fn push_str(b: &mut Vec<u8>, s: &str) {
+            b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            b.extend_from_slice(s.as_bytes());
+        }
+
+        /// 決定的な擬似乱数バイト (0..=255)。
+        fn pat(i: usize, seed: u32) -> u8 {
+            let mut x = (i as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(seed.wrapping_mul(40_503));
+            x ^= x >> 13;
+            x = x.wrapping_mul(0x9E37_79B1);
+            x ^= x >> 16;
+            x as u8
+        }
+
+        fn write_meta(b: &mut Vec<u8>, k: &str, v: &V) {
+            push_str(b, k);
+            match v {
+                V::U32(x) => {
+                    b.extend_from_slice(&GT_U32.to_le_bytes());
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                V::F32(x) => {
+                    b.extend_from_slice(&GT_F32.to_le_bytes());
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                V::S(s) => {
+                    b.extend_from_slice(&GT_STRING.to_le_bytes());
+                    push_str(b, s);
+                }
+                V::A32(v) => {
+                    b.extend_from_slice(&GT_ARRAY.to_le_bytes());
+                    b.extend_from_slice(&GT_U32.to_le_bytes());
+                    b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                    for x in v {
+                        b.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+                V::A64(v) => {
+                    b.extend_from_slice(&GT_ARRAY.to_le_bytes());
+                    b.extend_from_slice(&GT_U64.to_le_bytes());
+                    b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                    for x in v {
+                        b.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+                V::AStr(v) => {
+                    b.extend_from_slice(&GT_ARRAY.to_le_bytes());
+                    b.extend_from_slice(&GT_STRING.to_le_bytes());
+                    b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                    for s in v {
+                        push_str(b, s);
+                    }
+                }
+            }
+        }
+
+        fn kvs() -> Vec<(&'static str, V)> {
+            let mut ratios = vec![0u32; LAYERS];
+            for (il, r) in ratios.iter_mut().enumerate() {
+                if (il + 1) % INTERVAL == 0 {
+                    *r = RATIO;
+                }
+            }
+            vec![
+                ("general.architecture", V::S("qwen4exp")),
+                ("general.alignment", V::U32(ALIGN as u32)),
+                ("qwen4exp.block_count", V::U32(LAYERS as u32)),
+                ("qwen4exp.context_length", V::U32(1024)),
+                ("qwen4exp.embedding_length", V::U32(E as u32)),
+                ("qwen4exp.attention.head_count", V::U32(NHEAD as u32)),
+                ("qwen4exp.attention.head_count_kv", V::U32(NKV as u32)),
+                ("qwen4exp.attention.key_length", V::U32(HEAD as u32)),
+                ("qwen4exp.attention.value_length", V::U32(HEAD as u32)),
+                ("qwen4exp.attention.layer_norm_rms_epsilon", V::F32(1e-6)),
+                ("qwen4exp.rope.dimension_count", V::U32(4)),
+                ("qwen4exp.rope.dimension_sections", V::A32(vec![2, 2, 2, 0])),
+                ("qwen4exp.rope.freq_base", V::F32(1e7)),
+                ("qwen4exp.expert_count", V::U32(NEXP as u32)),
+                // 2 expert を両方選ばせる: MoE のバッチ経路 (同じ expert を選んだ
+                // トークンをまとめる) を実際に通すため。1 だと 1 トークン 1 expert で
+                // 逐次版と同じ入口に落ち、まとめる経路が一度も走らない。
+                ("qwen4exp.expert_used_count", V::U32(NEXP as u32)),
+                ("qwen4exp.expert_feed_forward_length", V::U32(FF as u32)),
+                (
+                    "qwen4exp.expert_shared_feed_forward_length",
+                    V::U32(FF as u32),
+                ),
+                ("qwen4exp.ssm.conv_kernel", V::U32(SSM_CONV as u32)),
+                ("qwen4exp.ssm.state_size", V::U32(SSM_STATE as u32)),
+                ("qwen4exp.ssm.group_count", V::U32(SSM_GROUP as u32)),
+                ("qwen4exp.ssm.time_step_rank", V::U32(SSM_DT as u32)),
+                ("qwen4exp.ssm.inner_size", V::U32(SSM_INNER as u32)),
+                ("qwen4exp.full_attention_interval", V::U32(INTERVAL as u32)),
+                ("qwen4exp.hyper_connection.count", V::U32(HC as u32)),
+                ("qwen4exp.hyper_connection.low_rank", V::U32(HC_LR as u32)),
+                ("qwen4exp.attention.indexer.head_count", V::U32(IDX_HEAD as u32)),
+                ("qwen4exp.attention.indexer.key_length", V::U32(IDX_DIM as u32)),
+                ("qwen4exp.attention.indexer.top_k", V::U32(IDX_TOP_K as u32)),
+                ("qwen4exp.attention.compress_ratios", V::A32(ratios)),
+                ("qwen4exp.embedding_length_per_layer_input", V::U32(EPL as u32)),
+                ("qwen4exp.ple.layers", V::A32(vec![PLE_LAYER as u32])),
+                ("qwen4exp.ple.ngram_size", V::U32(PLE_NGRAM as u32)),
+                (
+                    "qwen4exp.ple.heads_per_ngram",
+                    V::U32(PLE_HEADS_PER_NGRAM as u32),
+                ),
+                ("qwen4exp.ple.conv_kernel", V::U32(PLE_CONV as u32)),
+                ("qwen4exp.ple.eos_token_id", V::U32(7)),
+                ("qwen4exp.ple.image_token_id", V::U32(9)),
+                ("qwen4exp.ple.layer_multipliers", V::A64(vec![1, 2, 3])),
+                ("qwen4exp.ple.head_offsets", V::A64(vec![0, 10, 20, 30])),
+                ("qwen4exp.ple.head_vocab_sizes", V::A64(vec![10, 10, 10, 10])),
+                ("tokenizer.ggml.tokens", V::AStr(vec![String::new(); VOCAB])),
+            ]
+        }
+
+        /// 最小 GGUF (v3) を書く。データ部は 32 B 整列。
+        fn write_model(path: &Path, tensors: &[(String, Vec<u64>, u32, Vec<u8>)]) {
+            let ks = kvs();
+            let mut head = Vec::new();
+            head.extend_from_slice(b"GGUF");
+            head.extend_from_slice(&3u32.to_le_bytes());
+            head.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+            head.extend_from_slice(&(ks.len() as u64).to_le_bytes());
+            for (k, v) in &ks {
+                write_meta(&mut head, k, v);
+            }
+
+            let mut offs = Vec::with_capacity(tensors.len());
+            let mut cur = 0usize;
+            for (_, _, _, data) in tensors {
+                offs.push(cur as u64);
+                cur = align_up(cur + data.len(), ALIGN);
+            }
+            for ((name, dims, ty, _), off) in tensors.iter().zip(&offs) {
+                push_str(&mut head, name);
+                head.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+                for d in dims {
+                    head.extend_from_slice(&d.to_le_bytes());
+                }
+                head.extend_from_slice(&ty.to_le_bytes());
+                head.extend_from_slice(&off.to_le_bytes());
+            }
+
+            let mut out = head;
+            out.resize(align_up(out.len(), ALIGN), 0);
+            for (_, _, _, data) in tensors {
+                out.extend_from_slice(data);
+                out.resize(align_up(out.len(), ALIGN), 0);
+            }
+            std::fs::write(path, out).expect("合成 GGUF の書き出し");
+        }
+
+        /// 目録の量子型 → ggml_type id。
+        fn ggml_id(ty: GgmlType) -> u32 {
+            match ty {
+                GgmlType::F32 => 0,
+                GgmlType::F16 => 1,
+                GgmlType::Q5_1 => 7,
+                GgmlType::Q8_0 => 8,
+                GgmlType::Q4K => 12,
+                GgmlType::Q5K => 13,
+                GgmlType::IQ4Nl => 20,
+                GgmlType::Bf16 => 30,
+                other => panic!("テストヘルパ未対応の型 {other:?}"),
+            }
+        }
+
+        /// テンソルの中身。**有限値だけ**を作る (スケール欄を乱数にすると NaN になる)。
+        fn tensor_bytes(name: &str, dims: &[u64], ty: GgmlType, seed: u32) -> Vec<u8> {
+            let ne: u64 = dims.iter().product();
+            let bs = ty.blck_size() as u64;
+            let ts = ty.type_size() as u64;
+            let nb = (ne / bs * ts + if ne % bs == 0 { 0 } else { ts }) as usize;
+            let mut b: Vec<u8> = (0..nb).map(|i| pat(i, 7 + seed)).collect();
+            match ty {
+                GgmlType::F32 => {
+                    // norm の gamma は 1.0 (変換器が 1 + w に畳んだ前提の値)
+                    let gamma = name.ends_with("norm.weight");
+                    for i in 0..nb / 4 {
+                        let v = if gamma {
+                            1.0f32
+                        } else {
+                            (((i as u32).wrapping_add(seed * 5) % 17) as f32 - 8.0) * 0.01
+                        };
+                        b[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                GgmlType::Bf16 => {
+                    for i in 0..nb / 2 {
+                        let v = (((i as u32).wrapping_add(seed * 3) % 13) as f32 - 6.0) * 0.01;
+                        let bits = (v.to_bits() >> 16) as u16;
+                        b[i * 2..i * 2 + 2].copy_from_slice(&bits.to_le_bytes());
+                    }
+                }
+                GgmlType::Q8_0 => {
+                    for blk in 0..nb / 34 {
+                        let o = blk * 34;
+                        b[o..o + 2].copy_from_slice(&f16_bytes(0.02));
+                        for j in 0..32u32 {
+                            // ブロックごとに量子値をずらす (行ごとに違う値になる)
+                            let q = ((j as i32 + blk as i32 * 3 + seed as i32 * 7) % 11) - 5;
+                            b[o + 2 + j as usize] = q as i8 as u8;
+                        }
+                    }
+                }
+                GgmlType::Q5_1 => {
+                    for blk in 0..nb / 24 {
+                        let o = blk * 24;
+                        b[o..o + 2].copy_from_slice(&f16_bytes(0.02));
+                        b[o + 2..o + 4].copy_from_slice(&f16_bytes(0.001));
+                    }
+                }
+                GgmlType::Q4K => {
+                    for blk in 0..nb / 144 {
+                        let o = blk * 144;
+                        b[o..o + 2].copy_from_slice(&f16_bytes(0.02));
+                        b[o + 2..o + 4].copy_from_slice(&f16_bytes(0.001));
+                    }
+                }
+                GgmlType::IQ4Nl => {
+                    for blk in 0..nb / 18 {
+                        let o = blk * 18;
+                        b[o..o + 2].copy_from_slice(&f16_bytes(0.02));
+                    }
+                }
+                other => panic!("テストヘルパ未対応の型 {other:?}"),
+            }
+            b
+        }
+
+        /// メタデータだけの GGUF から params を取って、目録の全テンソルを
+        /// 決定的な中身で埋めた GGUF を書く。
+        fn build(dir: &TempDir) -> PathBuf {
+            let meta = dir.path("h2_meta.gguf");
+            write_model(&meta, &[]);
+            let f = GgufFile::open(&meta).expect("メタデータ GGUF を開けない");
+            let p = Qwen4ExpParams::from_meta(&f).expect("from_meta が通らない");
+            let specs = expected_tensors(&p).expect("目録を組めない");
+            let mut tensors = Vec::with_capacity(specs.len());
+            for (i, e) in specs.iter().enumerate() {
+                let data = tensor_bytes(&e.name, &e.dims, e.ty, i as u32 + 1);
+                tensors.push((e.name.clone(), e.dims.clone(), ggml_id(e.ty), data));
+            }
+            let path = dir.path("h2_model.gguf");
+            write_model(&path, &tensors);
+            path
+        }
+
+        /// 1 回ぶんの prefill を新しいモデルで回し、logits と
+        /// 「バッチ分岐 / バッチ GEMV が何回走ったか」を返す。
+        fn run(f: &GgufFile, ctx: &[u32], batch: bool, chunk: usize) -> (Vec<f32>, usize, usize) {
+            let mut m = Qwen4Exp::new(f).expect("Qwen4Exp::new");
+            let b0 = PREFILL_BATCH_CALLS.load(Ordering::Relaxed);
+            let g0 = GEMV_BATCH_CALLS.load(Ordering::Relaxed);
+            let out = if batch {
+                m.forward_prefill_batch(ctx, chunk).expect("バッチ prefill")
+            } else {
+                m.forward_prefill_with(ctx, false).expect("逐次 prefill")
+            };
+            (
+                out,
+                PREFILL_BATCH_CALLS.load(Ordering::Relaxed) - b0,
+                GEMV_BATCH_CALLS.load(Ordering::Relaxed) - g0,
+            )
+        }
+
+        #[test]
+        fn prefill_batch_gate_defaults_off() {
+            // DENNO_PREFILL_BATCH の解釈 (既定 off)。env を触らずに純粋関数だけを見る。
+            assert!(!prefill_batch_from_value(None), "未設定は既定で無効");
+            assert!(prefill_batch_from_value(Some("1")));
+            assert!(!prefill_batch_from_value(Some("0")));
+            assert!(!prefill_batch_from_value(Some("")));
+            assert!(
+                !prefill_batch_from_value(Some("true")),
+                "\"1\" 以外は無効 (既定 off を崩さない)"
+            );
+        }
+
+        /// hc_mix のバッチ版が逐次版とビット一致する (要素ごとの演算は同じ関数)。
+        #[test]
+        fn hc_mix_batch_matches_seq() {
+            let hp = HyperParams {
+                hc: 2,
+                n_embd: 8,
+                low_rank: 4,
+                eps: 1e-6,
+            };
+            let hc_dim = hp.hc * hp.n_embd;
+            let norm = vec![1.0f32; hc_dim];
+            let down = f32_linear(hc_dim, hp.low_rank, 0.1);
+            let up = f32_linear(hp.low_rank, hc_dim, 0.2);
+            let inject = f32_linear(hc_dim, hp.hc, 0.3);
+            let ress: Vec<HyperStreams> = (0..3)
+                .map(|t| HyperStreams {
+                    data: (0..hc_dim)
+                        .map(|i| (((i * 7 + t * 13) % 23) as f32 - 11.0) * 0.03)
+                        .collect(),
+                    hc: hp.hc,
+                    n_embd: hp.n_embd,
+                })
+                .collect();
+
+            let (mixed, injs) = hc_mix_quant_batch(
+                &ress,
+                &norm,
+                &down,
+                &up,
+                Some(&inject),
+                &hp,
+            )
+            .expect("hc_mix_quant_batch");
+            for (t, r) in ress.iter().enumerate() {
+                let (m, i) = hc_mix_quant(r, &norm, &down, &up, Some(&inject), &hp)
+                    .expect("hc_mix_quant");
+                assert_bitwise_eq(&m, &mixed[t], &format!("hc_mix mixed (token {t})"));
+                assert_bitwise_eq(&i, &injs[t], &format!("hc_mix inject (token {t})"));
+            }
+            assert!(
+                mixed[0].iter().any(|v| *v != 0.0),
+                "mixed が全 0 (経路の生死が分からない)"
+            );
+        }
+
+        /// MoE FFN のバッチ版が逐次版とビット一致する (同じ expert を選んだ
+        /// トークンをまとめる経路 = `m > 1` を実際に通す)。
+        #[test]
+        fn moe_ffn_batch_matches_seq() {
+            let _g = moe_test_guard();
+            let dir = TempDir::new("h2moe");
+            let path = write_expert_gguf(&dir);
+            let f = GgufFile::open(&path).expect("open");
+            let p = cache_test_params();
+            assert!(
+                p.n_expert_used > 1,
+                "まとめる経路を通すには n_expert_used > 1 が必要"
+            );
+            let lw = cache_test_layer(&f, &p);
+            let nt = 3;
+            let xs: Vec<f32> = (0..nt * p.n_embd)
+                .map(|i| (((i * 37 % 101) as f32) - 50.0) * 0.013)
+                .collect();
+
+            let bat = moe_ffn_quant_batch(&p, &lw, &xs, nt, None).expect("batch");
+            for t in 0..nt {
+                let seq = moe_ffn_quant(&p, &lw, &xs[t * p.n_embd..(t + 1) * p.n_embd], None)
+                    .expect("seq");
+                assert_bitwise_eq(&seq, &bat[t * p.n_embd..(t + 1) * p.n_embd], &format!("moe token {t}"));
+            }
+            assert!(
+                bat.iter().any(|v| *v != 0.0),
+                "MoE の出力が全 0 (経路の生死が分からない)"
+            );
+        }
+
+        /// バッチ GEMV は逐次版と同じ**入口**を通るので、融合カーネルを
+        /// 含めてビット一致する。2 つの入口 (`GgufLinear::gemv` = expert_gemv、
+        /// `ExpertW::gemv` = expert_gemv_any) を別々に確かめる
+        /// (Q5_1 / Q8_0 は入口でカーネルが変わるため)。
+        #[test]
+        fn gemv_batch_matches_gemv_bitwise() {
+            let dir = TempDir::new("h2gemv");
+            let path = write_expert_gguf(&dir);
+            let f = GgufFile::open(&path).expect("open");
+            let p = cache_test_params();
+            let lw = cache_test_layer(&f, &p);
+            let nt = 3;
+            for (w, name) in [
+                (&lw.gate_exps, "gate (Q4_K = 融合カーネル)"),
+                (&lw.down_exps, "down (Q5_1 = 入口でカーネルが変わる)"),
+            ] {
+                let xs: Vec<f32> = (0..nt * w.n_in)
+                    .map(|i| (((i * 29) % 101) as f32 - 50.0) * 0.007)
+                    .collect();
+
+                // 1. GgufLinear 経路 (`linear()` と同じく fast_q8 = true で組む)
+                let lin = GgufLinear::from_slice(
+                    w.ty,
+                    w.n_in,
+                    w.n_out,
+                    w.slice(0).expect("expert 0"),
+                )
+                .expect("GgufLinear::from_slice")
+                .with_fast_q8(true);
+                let mut bat = vec![0.0f32; nt * w.n_out];
+                gemv_batch(&lin, &xs, nt, &mut bat).expect("gemv_batch");
+                let mut seq = vec![0.0f32; nt * w.n_out];
+                for t in 0..nt {
+                    let mut one = vec![0.0f32; w.n_out];
+                    lin.gemv(&xs[t * w.n_in..(t + 1) * w.n_in], &mut one)
+                        .expect("gemv");
+                    seq[t * w.n_out..(t + 1) * w.n_out].copy_from_slice(&one);
+                }
+                assert!(
+                    bat.iter().any(|v| *v != 0.0),
+                    "{name}: GgufLinear 経路の出力が全 0 (経路の生死が分からない)"
+                );
+                assert_bitwise_eq(&seq, &bat, &format!("{name} / GgufLinear"));
+
+                // 2. ExpertW 経路 (expert_gemv_any = Q5_1/Q8_0 も融合)
+                let mut bat2 = vec![0.0f32; nt * w.n_out];
+                expert_gemv_batch(w, 0, &xs, nt, &mut bat2).expect("expert_gemv_batch");
+                let mut seq2 = vec![0.0f32; nt * w.n_out];
+                for t in 0..nt {
+                    let mut one = vec![0.0f32; w.n_out];
+                    w.gemv(0, &xs[t * w.n_in..(t + 1) * w.n_in], &mut one)
+                        .expect("ExpertW::gemv");
+                    seq2[t * w.n_out..(t + 1) * w.n_out].copy_from_slice(&one);
+                }
+                assert_bitwise_eq(&seq2, &bat2, &format!("{name} / ExpertW"));
+            }
+
+            // Q8_0 は fast_q8 = true のとき融合カーネルになる (モデルの linear() と
+            // 同じ設定)。ここも行優先バッチでビット一致すること。
+            let (k8, n8) = (64usize, 5usize);
+            let bytes8 = tensor_bytes("w", &[k8 as u64, n8 as u64], GgmlType::Q8_0, 11);
+            let lin8 = GgufLinear::from_slice(GgmlType::Q8_0, k8, n8, &bytes8)
+                .expect("Q8_0 の GgufLinear")
+                .with_fast_q8(true);
+            let xs8: Vec<f32> = (0..nt * k8)
+                .map(|i| (((i * 17) % 97) as f32 - 48.0) * 0.011)
+                .collect();
+            let mut b8 = vec![0.0f32; nt * n8];
+            gemv_batch(&lin8, &xs8, nt, &mut b8).expect("gemv_batch (Q8_0)");
+            let mut s8 = vec![0.0f32; nt * n8];
+            for t in 0..nt {
+                let mut one = vec![0.0f32; n8];
+                lin8.gemv(&xs8[t * k8..(t + 1) * k8], &mut one)
+                    .expect("gemv (Q8_0)");
+                s8[t * n8..(t + 1) * n8].copy_from_slice(&one);
+            }
+            assert!(
+                b8.iter().any(|v| *v != 0.0),
+                "Q8_0: 出力が全 0 (経路の生死が分からない)"
+            );
+            assert_bitwise_eq(&s8, &b8, "Q8_0 (fast_q8 = 融合)");
+        }
+
+        /// 層優先バッチ prefill の logits が逐次経路とビット一致する。
+        ///
+        /// 併せて「バッチ分岐とバッチ GEMV が実際に走った」ことをカウンタで見る
+        /// (緑 = 経路が発動した証拠ではない)。チャンク 1 / 3 / 8 で切れ目を変えても
+        /// 一致することを確かめる (チャンク跨ぎの状態持ち越しが無いことの確認)。
+        #[test]
+        fn prefill_batch_matches_sequential() {
+            let _g = moe_test_guard();
+            let dir = TempDir::new("h2model");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("合成モデルを開けない");
+            // 語彙内のトークン列 (PLE の n-gram 窓は末尾 3 個)
+            let ctx: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+
+            let (seq, bseq, _) = run(&f, &ctx, false, 0);
+            assert_eq!(bseq, 0, "逐次経路でバッチ分岐が走った");
+            assert_eq!(seq.len(), VOCAB, "logits の長さが n_vocab と違う");
+            assert!(seq.iter().all(|v| v.is_finite()), "逐次 prefill に NaN/inf");
+            assert!(
+                seq.iter().any(|&v| v != seq[0]),
+                "logits が全要素同値 (経路の生死が分からない)"
+            );
+
+            // 決定性 (同じモデルを組み直して同じ値)
+            let (seq2, _, _) = run(&f, &ctx, false, 0);
+            assert_bitwise_eq(&seq, &seq2, "逐次 prefill 2 回目");
+
+            for chunk in [1usize, 3, 8] {
+                let (bat, nb, ng) = run(&f, &ctx, true, chunk);
+                assert!(nb > 0, "chunk {chunk}: 層優先バッチ経路が発動していない");
+                assert!(ng > 0, "chunk {chunk}: バッチ GEMV が 1 回も走っていない");
+                assert_bitwise_eq(&seq, &bat, &format!("chunk {chunk}"));
+            }
+        }
     }
 }
