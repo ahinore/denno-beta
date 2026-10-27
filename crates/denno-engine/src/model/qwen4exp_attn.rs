@@ -827,6 +827,12 @@ impl LayerAttn for FullAttn {
         self.forward_token(layer, cur)
             .map_err(|e| Qwen4ExpError(vec![format!("{e:#}")]))
     }
+
+    /// 層優先の順序でも安全。KV は層ごとに独立して持ち、forward は 1 層に
+    /// 1 トークンを積むだけなので、層優先でも各層の中ではトークン順が保たれる。
+    fn layer_major_safe(&self) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------

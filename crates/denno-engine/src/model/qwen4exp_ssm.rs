@@ -456,4 +456,11 @@ impl LayerAttn for SsmAttn {
             Some(None) => self.full.forward(layer, cur),
         }
     }
+
+    /// 層優先の順序でも安全。`forward` は「1 層の状態を 1 トークン進める」だけで、
+    /// 層どうしは独立している。層優先にしても各層の中でトークン順は保たれるので、
+    /// GDN の conv / ssm 状態の進み方は逐次版と同じになる。
+    fn layer_major_safe(&self) -> bool {
+        true
+    }
 }
