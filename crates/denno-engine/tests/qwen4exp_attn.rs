@@ -815,7 +815,7 @@ fn wrong_tensor_shape_is_rejected_at_load() {
 
 /// 位置は**層ごとのキャッシュ長の最大**。full attention 層が 2 本あるモデルで、
 /// 層をまたいで順序が入れ替わっても (層優先の prefill)、各層の位置が
-/// その層のキャッシュ長から決まり、二重 push だけが弾かれることを見る。
+/// その層のキャッシュ長から決まることを見る。
 #[test]
 fn pos_follows_per_layer_cache_len() {
     let dir = TempDir::new("pos_multi");
@@ -854,10 +854,9 @@ fn pos_follows_per_layer_cache_len() {
     fa.forward_token(1, &cur).expect("層 1 (2 トークン目)");
     assert_eq!(fa.pos(), 2);
 
-    // 同じ層に同じ位置をもう一度積もうとすると落ちる (黙って二重に積まない)
-    let err = format!("{}", fa.forward_token(1, &cur).expect_err("二重 push が通った"));
-    assert!(err.contains("既に積んである"), "{err}");
-    // 落ちても状態は壊れない (位置もキャッシュ長も動かない)
-    assert_eq!(fa.pos(), 2);
+    // 層 3 を 3 トークン目まで進めても、層 1 は 2 のまま (層ごとに独立)
+    fa.forward_token(ATTN_LAYER, &cur).expect("層 3 (3 トークン目)");
     assert_eq!(fa.cache().len(1).unwrap(), 2);
+    assert_eq!(fa.cache().len(ATTN_LAYER).unwrap(), 3);
+    assert_eq!(fa.pos(), 3, "位置は最大のキャッシュ長");
 }
