@@ -655,7 +655,9 @@ pub struct FullAttn {
     pos: usize,
     /// full attention 層ごとに「このトークンで既に積んだか」。同じ層を 1 トークンで
     /// 二度通したときに黙って二重 push しないための番人。全層が揃ったら false に戻す。
-    pushed: Vec<bool>,
+    /// 層ごとの「最後に積んだ位置 + 1」(0 = まだ何も積んでいない)。
+    /// 二重 push の検出に使う。層優先の順序でも成立する。
+    pushed: Vec<usize>,
     /// QSA (indexer による key 選択)。`DENNO_QSA=1` のときだけ `Some`。
     /// 既定 (`DENNO_QSA` 未設定 / 0) は `None` で、indexer のテンソルは読まない
     /// (dense 経路そのまま・追加確保なし)。
@@ -722,7 +724,7 @@ impl FullAttn {
             layers,
             cache,
             pos: 0,
-            pushed: vec![false; layers_len],
+            pushed: vec![0usize; layers_len],
             qsa,
         })
     }
@@ -752,7 +754,7 @@ impl FullAttn {
     pub fn reset(&mut self) {
         self.cache.clear_all();
         self.pos = 0;
-        self.pushed.iter_mut().for_each(|b| *b = false);
+        self.pushed.iter_mut().for_each(|b| *b = 0);
         if let Some(q) = self.qsa.as_mut() {
             q.reset();
         }
@@ -787,9 +789,12 @@ impl FullAttn {
         // 位置は**層ごとのキャッシュ長**から取る。層優先の prefill では、層 L の
         // t 番目を積む時点で他層は既に t+1 番目まで進んでいるため、全層で共有する
         // `pos` は使えない (逐次経路では全層が同じ長さなので値は一致する)。
-        // 二重 push は起きない: 積んだ直後にその層の長さが 1 増えるので、次に同じ
-        // 層へ来る入力は必ず pos+1 として扱われる。
+        // 二重 push は「この層が同じ位置に 2 回積まれたか」で見る (`pushed` は
+        // 最後に積んだ位置 + 1 を持つ)。
         let pos = self.cache.len(layer)?;
+        if self.pushed[layer] == pos + 1 {
+            bail!("FullAttn::forward: 層 {layer} はこのトークン (pos {pos}) で既に積んである");
+        }
         if pos >= self.cache.max_ctx() {
             bail!("FullAttn::forward: 層 {layer} が容量 max_ctx = {} に達した", self.cache.max_ctx());
         }
@@ -805,7 +810,7 @@ impl FullAttn {
             Some(c) => l.forward_token_visible(cur, &mut self.cache, layer, pos, c)?,
             None => l.forward_token(cur, &mut self.cache, layer, pos)?,
         };
-        self.pushed[layer] = true;
+        self.pushed[layer] = pos + 1;
         // 対外的な「何トークン進んだか」は最大値で持つ (診断とリセット用)。
         if self.pos < pos + 1 {
             self.pos = pos + 1;

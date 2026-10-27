@@ -813,10 +813,11 @@ fn wrong_tensor_shape_is_rejected_at_load() {
 
 // ---- 位置の進み方 (full attention 層が複数ある場合) ----------------------
 
-/// 位置は 1 トークンにつき 1 回だけ進む。full attention 層が 2 本あるモデルで、
-/// 先に片方だけ通した時点では pos が進まず、両方そろって初めて進むことを見る。
+/// 位置は**層ごとのキャッシュ長の最大**。full attention 層が 2 本あるモデルで、
+/// 層をまたいで順序が入れ替わっても (層優先の prefill)、各層の位置が
+/// その層のキャッシュ長から決まり、二重 push だけが弾かれることを見る。
 #[test]
-fn pos_advances_once_per_token_across_full_layers() {
+fn pos_follows_per_layer_cache_len() {
     let dir = TempDir::new("pos_multi");
     let path = dir.path("pos_multi.gguf");
     // 層 1 と層 3 を full attention にする (interval 2)。
@@ -839,27 +840,24 @@ fn pos_advances_once_per_token_across_full_layers() {
 
     let cur = vec![0.25f32; N_EMBD];
     fa.forward_token(1, &cur).expect("層 1");
-    assert_eq!(fa.pos(), 0, "片方だけでは進まない");
     assert_eq!(fa.cache().len(1).unwrap(), 1);
     assert_eq!(fa.cache().len(ATTN_LAYER).unwrap(), 0);
+    assert_eq!(fa.pos(), 1, "位置は層ごとのキャッシュ長の最大");
     fa.forward_token(ATTN_LAYER, &cur).expect("層 3");
-    assert_eq!(fa.pos(), 1, "2 本そろって 1 回進む");
     assert_eq!(fa.cache().len(ATTN_LAYER).unwrap(), 1);
+    assert_eq!(fa.pos(), 1, "2 本とも 1 トークン目なので 1 のまま");
 
-    // 2 トークン目も同じ規則で進む
+    // 層 3 だけ 2 トークン目 (層優先の順序で起きる並び)
     fa.forward_token(ATTN_LAYER, &cur).expect("層 3 (2 トークン目)");
-    assert_eq!(fa.pos(), 1, "層 3 だけでは進まない");
+    assert_eq!(fa.cache().len(ATTN_LAYER).unwrap(), 2);
+    assert_eq!(fa.pos(), 2);
     fa.forward_token(1, &cur).expect("層 1 (2 トークン目)");
     assert_eq!(fa.pos(), 2);
 
-    // 3 トークン目: 層 1 を積んだ直後にもう一度層 1 を積むと落ちる (黙って二重に積まない)
-    fa.forward_token(1, &cur).expect("層 1 (3 トークン目)");
+    // 同じ層に同じ位置をもう一度積もうとすると落ちる (黙って二重に積まない)
     let err = format!("{}", fa.forward_token(1, &cur).expect_err("二重 push が通った"));
     assert!(err.contains("既に積んである"), "{err}");
     // 落ちても状態は壊れない (位置もキャッシュ長も動かない)
     assert_eq!(fa.pos(), 2);
-    assert_eq!(fa.cache().len(1).unwrap(), 3);
-    // そのあと層 3 を通せば 1 回だけ進む
-    fa.forward_token(ATTN_LAYER, &cur).expect("層 3 (3 トークン目)");
-    assert_eq!(fa.pos(), 3);
+    assert_eq!(fa.cache().len(1).unwrap(), 2);
 }
