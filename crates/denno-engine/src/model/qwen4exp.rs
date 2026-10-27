@@ -2904,17 +2904,53 @@ fn gemv_rows_batch(
         )));
     }
     let rb = bytes.len() / n;
-    // H3 のバッチ GEMV に委譲する。行を rayon で分け、**重み行のデコードを 1 回だけ**
-    // 行って nt トークンで使い回す。以前はここで「行 → トークン」の二重ループを
-    // 回していたため、行の再利用は効くが並列化が無く、逐次経路とほぼ同じ時間だった
-    // (実測 246.1 → 241.3 ms/tok)。
-    //
-    // `kern` は Linear / Expert の入口の区別だが、どちらも同じカーネルに落ちるので
-    // ここでは使わない (Q8_0 の fast_q8 も expert_gemv_any と同じ融合カーネル)。
-    let _ = kern;
-    let _ = rb;
-    moe_expert::expert_gemm_any(ty, bytes, k, n, xs, nt, outs)
-        .map_err(|err| one(format!("gemv_batch: {err}")))?;
+    match kern {
+        // 線形層 (`GgufLinear::gemv`) と同じカーネルを行並列で回す。行内の加算順は
+        // 逐次版と同一なのでビット一致する。Q5_1 は `expert_gemv_any` と 1 ULP
+        // 違うカーネルなので、ここを Expert 側の実装で代用してはいけない
+        // (実測: down Q5_1 で要素 0 が 1 ULP ずれた)。
+        GemvKernel::Linear => {
+            let par = n >= 64 && k >= 256;
+            // 行ごとに書くと出力がトークン優先の並びなので、いったん行優先で作って
+            // 最後に詰め替える (n * nt * 4 バイト。640x8 で 20 KB)。
+            let mut tmp = vec![0f32; n * nt];
+            let run_row = |r: usize, o: &mut [f32]| -> Result<()> {
+                let row = &bytes[r * rb..(r + 1) * rb];
+                for t in 0..nt {
+                    let x = &xs[t * k..(t + 1) * k];
+                    let slot = &mut o[t..t + 1];
+                    let res = if ty == GgmlType::Q8_0 {
+                        moe_expert::expert_gemv_q8_fast(row, k, 1, x, slot)
+                    } else {
+                        moe_expert::expert_gemv(ty, row, k, 1, x, slot)
+                    };
+                    res.map_err(|err| one(format!("gemv_batch: 行 {r} トークン {t}: {err}")))?;
+                }
+                Ok(())
+            };
+            if par {
+                use rayon::prelude::*;
+                tmp.par_chunks_mut(nt)
+                    .enumerate()
+                    .try_for_each(|(r, o)| run_row(r, o))?;
+            } else {
+                for (r, o) in tmp.chunks_mut(nt).enumerate() {
+                    run_row(r, o)?;
+                }
+            }
+            for t in 0..nt {
+                for r in 0..n {
+                    outs[t * n + r] = tmp[r * nt + t];
+                }
+            }
+        }
+        // expert の重みは型ごとの融合カーネルを使う。1 行版 `expert_gemv_any` と
+        // ビット一致することを H3 側のテストで確認済み。
+        GemvKernel::Expert => {
+            moe_expert::expert_gemm_any(ty, bytes, k, n, xs, nt, outs)
+                .map_err(|err| one(format!("gemv_batch: {err}")))?;
+        }
+    }
     #[cfg(test)]
     GEMV_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
