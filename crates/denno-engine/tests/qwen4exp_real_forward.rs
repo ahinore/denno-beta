@@ -435,6 +435,13 @@ fn real_model_layer_timings() {
             "PHASE/層 attn内訳 qkv {:.2} / gate {:.2} / gdn {:.2} / out {:.2} / full {:.2} ms",
             per(qkv), per(gate), per(gdn), per(out), per(full)
         );
+        let (r, ex, sh) = denno_engine::model::qwen4exp::moe_sub_take();
+        eprintln!(
+            "PHASE/層 moe内訳 router {:.2} / experts {:.2} / shared {:.2} ms",
+            per(r),
+            per(ex),
+            per(sh)
+        );
     }
 }
 

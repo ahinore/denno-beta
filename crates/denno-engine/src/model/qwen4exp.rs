@@ -2435,6 +2435,7 @@ fn moe_ffn_quant_with_par(
     cache: Option<&mut ExpertCacheSet>,
     par: bool,
 ) -> Result<Vec<f32>> {
+    let t_router = std::time::Instant::now();
     let e = p.n_embd;
     let ne = p.n_expert;
     let k = p.n_expert_used;
@@ -2491,6 +2492,9 @@ fn moe_ffn_quant_with_par(
         false
     };
 
+    moe_sub_add(0, t_router.elapsed());
+    let t_experts = std::time::Instant::now();
+
     if parallel {
         #[cfg(feature = "par")]
         {
@@ -2542,6 +2546,8 @@ fn moe_ffn_quant_with_par(
     }
 
     // 5. shared expert (係数は sigmoid(gate_inp_shexp @ x))
+    moe_sub_add(1, t_experts.elapsed());
+    let t_shared = std::time::Instant::now();
     let sff = lw.gate_shexp.n();
     let mut sact = vec![0.0f32; sff];
     lw.gate_shexp
@@ -2567,8 +2573,30 @@ fn moe_ffn_quant_with_par(
     for j in 0..e {
         out[j] += sh[j] * sgw;
     }
+    moe_sub_add(2, t_shared.elapsed());
 
     Ok(out)
+}
+
+/// MoE フェーズの内訳を測るための累積カウンタ (ns)。0 = router、1 = 選択 expert、2 = shared。
+///
+/// `moe` のフェーズ時間が 110〜124 ms と大きく、どこに落ちているか分からなかったので
+/// 入れた。常時計測する (1 層あたり `Instant::now()` が 4 回で、無視できる)。
+static MOE_SUB_NS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+fn moe_sub_add(idx: usize, d: std::time::Duration) {
+    MOE_SUB_NS[idx].fetch_add(d.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `moe` の内訳 (router / 選択 expert / shared expert) を ms で返し、カウンタを 0 に戻す。
+pub fn moe_sub_take() -> (f64, f64, f64) {
+    use std::sync::atomic::Ordering;
+    let mut v = [0f64; 3];
+    for (i, slot) in MOE_SUB_NS.iter().enumerate() {
+        v[i] = slot.swap(0, Ordering::Relaxed) as f64 / 1e6;
+    }
+    (v[0], v[1], v[2])
 }
 
 /// テスト用: 並列の寄与計算を何回走らせたか (P-MOE-G5 の分岐が実際に通ったことの証拠)。
