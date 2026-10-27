@@ -1646,6 +1646,18 @@ impl ExpertW {
         moe_expert::expert_gemv_any(self.ty, s, n_in, n_out, x, out)
             .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))
     }
+
+    /// [`ExpertW::gemv`] の**行並列を使わない**版 (P-MOE-G5)。
+    ///
+    /// 呼ぶ側 (MoE の expert ループ) が rayon で並列化されているときはこちらを使う。
+    /// 内側でさらに行を分けるとスレッドが二重に立つため。行は独立なので、
+    /// 分割の有無で各要素の計算順序は変わらず、[`ExpertW::gemv`] とビット一致する。
+    fn gemv_seq(&self, e: usize, x: &[f32], out: &mut [f32]) -> Result<()> {
+        let s = self.slice(e)?;
+        let (n_in, n_out) = (self.n_in, self.n_out);
+        moe_expert::expert_gemv_any_seq(self.ty, s, n_in, n_out, x, out)
+            .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))
+    }
 }
 
 /// PLE 層 1 つぶんの重み。
@@ -2387,11 +2399,41 @@ pub mod q4prof {
 /// (P-MOE-G1)。`None` は従来どおり mmap のスライス + `prefetch()` で、バイト列も
 /// 呼び出し順も変えない。**どちらの経路も同じ [`moe_expert::expert_gemv_any`] を
 /// 通る**ので、同じバイト列に対しては出力がビット一致する。
+///
+/// P-MOE-G5: 選択 expert の寄与 `h_e` は互いに独立なので、`DENNO_MOE_PAR` (既定 1) が
+/// 有効で選択 expert が 2 個以上のときだけ rayon で並列に計算する。**重み付きの
+/// 足し込みは index 昇順の逐次**のままなので、丸めの順序は従来と変わらない。
 fn moe_ffn_quant(
     p: &Qwen4ExpParams,
     lw: &LayerW,
     x: &[f32],
     cache: Option<&mut ExpertCacheSet>,
+) -> Result<Vec<f32>> {
+    moe_ffn_quant_with_par(p, lw, x, cache, moe_par_enabled())
+}
+
+/// `DENNO_MOE_PAR` の値の解釈 (純粋関数)。既定 (未設定) は有効、`"0"` のときだけ無効。
+///
+/// env を読む部分から切り離してあるのは、テストが環境変数を触らずに
+/// 両方の分岐を確かめられるようにするため。
+fn moe_par_from_value(v: Option<&str>) -> bool {
+    !matches!(v, Some("0"))
+}
+
+/// expert ループの並列化が有効か (`DENNO_MOE_PAR`, 既定 1)。プロセスで 1 回だけ読む。
+fn moe_par_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| moe_par_from_value(std::env::var("DENNO_MOE_PAR").ok().as_deref()))
+}
+
+/// [`moe_ffn_quant`] の本体。`par` は expert ループの並列化 on/off
+/// (env を読まずに両経路を比べられるよう引数で受ける)。
+fn moe_ffn_quant_with_par(
+    p: &Qwen4ExpParams,
+    lw: &LayerW,
+    x: &[f32],
+    cache: Option<&mut ExpertCacheSet>,
+    par: bool,
 ) -> Result<Vec<f32>> {
     let e = p.n_embd;
     let ne = p.n_expert;
@@ -2432,40 +2474,70 @@ fn moe_ffn_quant(
     }
 
     // 4. 選択 expert を index 昇順に積む
+    //
+    // P-MOE-G5: 各 expert の寄与 `h_e` は x だけで決まる独立な計算なので並列化できる。
+    // ただし **重み付きの足し込みは index 昇順の逐次** のままにする (並列に足すと
+    // 丸めの順序が変わる)。並列化するのは `h_e` の計算だけ。
+    //
+    // キャッシュ経路 (`cache: Some`) は並列化しない: `ExpertCacheSet` が `&mut` で、
+    // スロットの取り合いを直列化する仕組みが無いため (従来どおりの逐次ループ)。
     let mut out = vec![0.0f32; e];
-    let mut act = vec![0.0f32; ff];
-    let mut up = vec![0.0f32; ff];
-    let mut h = vec![0.0f32; e];
-    for (t, &ei) in sel.iter().enumerate() {
-        match cache.as_deref_mut() {
-            // 従来経路: mmap のスライスを直接 GEMV する。
-            None => {
-                lw.gate_exps.gemv(ei, x, &mut act)?;
-                silu_inplace(&mut act);
-                lw.up_exps.gemv(ei, x, &mut up)?;
-                for r in 0..ff {
-                    act[r] *= up[r];
+    #[cfg(feature = "par")]
+    let parallel = par && cache.is_none() && sel.len() > 1;
+    #[cfg(not(feature = "par"))]
+    let parallel = {
+        // par 機能なしでは行並列も expert 並列も無い (従来と同じ逐次経路)。
+        let _ = par;
+        false
+    };
+
+    if parallel {
+        #[cfg(feature = "par")]
+        {
+            let hs = expert_contribs_par(lw, &sel, x, e, ff)?;
+            for (t, &_ei) in sel.iter().enumerate() {
+                let pe = weights[t];
+                let hh = &hs[t];
+                for j in 0..e {
+                    out[j] += pe * hh[j];
                 }
-                lw.down_exps.gemv(ei, &act, &mut h)?;
-            }
-            // P-MOE-G1: SSD pread + LRU スロット経路。同じ expert は読み直さない。
-            Some(c) => {
-                let key = ExpertKey {
-                    layer: lw.il as u16,
-                    expert: ei as u16,
-                };
-                expert_gemv_cached(c, ExpertMatrix::Gate, &lw.gate_exps, key, x, &mut act)?;
-                silu_inplace(&mut act);
-                expert_gemv_cached(c, ExpertMatrix::Up, &lw.up_exps, key, x, &mut up)?;
-                for r in 0..ff {
-                    act[r] *= up[r];
-                }
-                expert_gemv_cached(c, ExpertMatrix::Down, &lw.down_exps, key, &act, &mut h)?;
             }
         }
-        let pe = weights[t];
-        for j in 0..e {
-            out[j] += pe * h[j];
+    } else {
+        let mut act = vec![0.0f32; ff];
+        let mut up = vec![0.0f32; ff];
+        let mut h = vec![0.0f32; e];
+        for (t, &ei) in sel.iter().enumerate() {
+            match cache.as_deref_mut() {
+                // 従来経路: mmap のスライスを直接 GEMV する。
+                None => {
+                    lw.gate_exps.gemv(ei, x, &mut act)?;
+                    silu_inplace(&mut act);
+                    lw.up_exps.gemv(ei, x, &mut up)?;
+                    for r in 0..ff {
+                        act[r] *= up[r];
+                    }
+                    lw.down_exps.gemv(ei, &act, &mut h)?;
+                }
+                // P-MOE-G1: SSD pread + LRU スロット経路。同じ expert は読み直さない。
+                Some(c) => {
+                    let key = ExpertKey {
+                        layer: lw.il as u16,
+                        expert: ei as u16,
+                    };
+                    expert_gemv_cached(c, ExpertMatrix::Gate, &lw.gate_exps, key, x, &mut act)?;
+                    silu_inplace(&mut act);
+                    expert_gemv_cached(c, ExpertMatrix::Up, &lw.up_exps, key, x, &mut up)?;
+                    for r in 0..ff {
+                        act[r] *= up[r];
+                    }
+                    expert_gemv_cached(c, ExpertMatrix::Down, &lw.down_exps, key, &act, &mut h)?;
+                }
+            }
+            let pe = weights[t];
+            for j in 0..e {
+                out[j] += pe * h[j];
+            }
         }
     }
 
@@ -2497,6 +2569,47 @@ fn moe_ffn_quant(
     }
 
     Ok(out)
+}
+
+/// テスト用: 並列の寄与計算を何回走らせたか (P-MOE-G5 の分岐が実際に通ったことの証拠)。
+#[cfg(test)]
+pub(crate) static PAR_CONTRIB_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 選択 expert の寄与 `h_e` (長さ `e = n_embd`) を rayon で並列に計算する (P-MOE-G5)。
+///
+/// 返り値の `hs[t]` は `sel[t]` の寄与で、**足し込みは呼び出し側が index 昇順に
+/// 逐次行う** (丸めの順序を変えないため。ここで足してはいけない)。
+///
+/// 内側は [`ExpertW::gemv_seq`] (行並列なし) を使う。外側が expert 並列なので、
+/// 内側でも行を分けるとスレッドが二重に立つ。行分割の有無は各要素の計算順序を
+/// 変えないので、逐次版とビット一致する。
+#[cfg(feature = "par")]
+fn expert_contribs_par(
+    lw: &LayerW,
+    sel: &[usize],
+    x: &[f32],
+    e: usize,
+    ff: usize,
+) -> Result<Vec<Vec<f32>>> {
+    use rayon::prelude::*;
+    sel.par_iter()
+        .map(|&ei| {
+            let mut act = vec![0.0f32; ff];
+            let mut up = vec![0.0f32; ff];
+            let mut h = vec![0.0f32; e];
+            lw.gate_exps.gemv_seq(ei, x, &mut act)?;
+            silu_inplace(&mut act);
+            lw.up_exps.gemv_seq(ei, x, &mut up)?;
+            for r in 0..ff {
+                act[r] *= up[r];
+            }
+            lw.down_exps.gemv_seq(ei, &act, &mut h)?;
+            #[cfg(test)]
+            PAR_CONTRIB_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(h)
+        })
+        .collect()
 }
 
 /// キャッシュ経路の 1 expert GEMV (P-MOE-G1)。
@@ -2561,6 +2674,15 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::model::expert_cache::CacheStats;
+
+    /// `moe_ffn_quant` (mmap 経路 = 並列分岐に入りうる) を回すテストを直列化する。
+    /// P-MOE-G5 のカウンタ (PAR_CONTRIB_CALLS / SEQ_CALLS) はプロセス全体の
+    /// 静的値なので、並行に走る別テストの寄与を混ぜないため。
+    static MOE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn moe_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        MOE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// 合成 GGUF のデータ部アラインメント (`gguf.rs` の既定と同じ)。
     const ALIGN: usize = 32;
@@ -2866,7 +2988,77 @@ mod tests {
     }
 
     #[test]
+    fn moe_par_gate_value_parsing() {
+        // DENNO_MOE_PAR の解釈 (既定 1)。env を触らずに純粋関数だけを見る。
+        assert!(moe_par_from_value(None), "未設定は既定で有効");
+        assert!(moe_par_from_value(Some("1")));
+        assert!(moe_par_from_value(Some("8")));
+        assert!(!moe_par_from_value(Some("0")), "\"0\" で無効");
+        assert!(
+            moe_par_from_value(Some("")),
+            "空文字は「未設定」と同じ扱い (有効)"
+        );
+    }
+
+    /// P-MOE-G5: expert ループの並列化は数値を 1 ビットも変えない。
+    ///
+    /// 同じ合成 expert で `par=0` (従来の逐次) と `par=1` (expert 並列) を回し、
+    /// `to_bits()` が全要素一致することを見る。併せて「並列分岐が実際に通った」
+    /// 「内側が行並列なしの入口を通った」をカウンタで確かめる (緑 = 発動の証拠ではない)。
+    #[test]
+    fn moe_expert_loop_par_is_bit_identical_to_seq() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("par");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+        assert!(
+            p.n_expert_used > 1,
+            "並列経路を通すには選択 expert が 2 個以上必要 (n_expert_used = {})",
+            p.n_expert_used
+        );
+
+        // 1. 従来経路 (DENNO_MOE_PAR=0 相当)
+        let seq = moe_ffn_quant_with_par(&p, &lw, &x, None, false).expect("逐次 (par=0)");
+        assert!(seq.iter().all(|v| v.is_finite()), "逐次経路に NaN/inf");
+        assert!(seq.iter().any(|v| *v != 0.0), "逐次経路が全 0");
+
+        // 2. 並列経路 (DENNO_MOE_PAR=1 相当)
+        let par_before = PAR_CONTRIB_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let seq_before = moe_expert::SEQ_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let par = moe_ffn_quant_with_par(&p, &lw, &x, None, true).expect("並列 (par=1)");
+        let par_calls = PAR_CONTRIB_CALLS.load(std::sync::atomic::Ordering::Relaxed) - par_before;
+        let seq_calls = moe_expert::SEQ_CALLS.load(std::sync::atomic::Ordering::Relaxed) - seq_before;
+
+        // 3. 並列分岐が発動したこと (top-k の数だけ寄与計算が走る)
+        #[cfg(feature = "par")]
+        {
+            assert_eq!(
+                par_calls, p.n_expert_used,
+                "並列の寄与計算が選択 expert 数ぶん走っていない (par=1 で並列分岐に入っていない)"
+            );
+            // 内側は gemv_seq = 1 expert あたり gate/up/down の 3 本
+            assert_eq!(
+                seq_calls,
+                3 * p.n_expert_used,
+                "並列時は内側が行並列なしの入口 (gemv_seq) を通るはず"
+            );
+        }
+        #[cfg(not(feature = "par"))]
+        {
+            assert_eq!(par_calls, 0, "par 機能なしで並列分岐に入った");
+            assert_eq!(seq_calls, 0, "par 機能なしで逐次入口を通った");
+        }
+
+        // 4. ビット一致
+        assert_bitwise_eq(&seq, &par, "par=0 vs par=1");
+    }
+
+    #[test]
     fn expert_cache_path_is_bit_identical_to_mmap() {
+        let _g = moe_test_guard();
         let dir = TempDir::new("bit");
         let path = write_expert_gguf(&dir);
         let f = GgufFile::open(&path).expect("open");
@@ -2948,6 +3140,7 @@ mod tests {
 
     #[test]
     fn zero_slots_still_returns_mmap_bytes() {
+        let _g = moe_test_guard();
         let dir = TempDir::new("zero");
         let path = write_expert_gguf(&dir);
         let f = GgufFile::open(&path).expect("open");

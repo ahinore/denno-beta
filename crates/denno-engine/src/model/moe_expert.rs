@@ -354,13 +354,17 @@ const PAR_MIN_ROWS: usize = 512;
 ///
 /// **行は互いに独立**なので、どの行をどのスレッドが担当しても各要素の計算順序は
 /// 変わらない (ビット一致は保たれる)。`f` は行チャンクぶんの `blocks` と `out` を受ける。
+///
+/// `par == false` のときは呼び出しスレッドだけで全行を回す。外側で expert を
+/// rayon 並列化しているとき (P-MOE-G5) に内側で二重にスレッドを立てないための入口で、
+/// 分割の有無は各要素の計算順序を変えないので結果はビット一致する。
 #[cfg(feature = "par")]
-fn for_each_row_chunk<F>(blocks: &[u8], n_out: usize, rb: usize, out: &mut [f32], f: F)
+fn for_each_row_chunk<F>(blocks: &[u8], n_out: usize, rb: usize, out: &mut [f32], par: bool, f: F)
 where
     F: Fn(&[u8], &mut [f32]) + Sync + Send,
 {
     use rayon::prelude::*;
-    if n_out < PAR_MIN_ROWS {
+    if !par || n_out < PAR_MIN_ROWS {
         f(blocks, out);
         return;
     }
@@ -376,7 +380,7 @@ where
 }
 
 #[cfg(not(feature = "par"))]
-fn for_each_row_chunk<F>(blocks: &[u8], _n_out: usize, _rb: usize, out: &mut [f32], f: F)
+fn for_each_row_chunk<F>(blocks: &[u8], _n_out: usize, _rb: usize, out: &mut [f32], _par: bool, f: F)
 where
     F: Fn(&[u8], &mut [f32]),
 {
@@ -398,6 +402,20 @@ pub fn expert_gemv(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<()> {
+    expert_gemv_inner(ty, blocks, n_in, n_out, x, out, true)
+}
+
+/// [`expert_gemv`] の本体。`par == false` なら行方向の rayon 並列を使わない
+/// (外側で expert を並列化しているとき用。P-MOE-G5)。
+fn expert_gemv_inner(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    par: bool,
+) -> Result<()> {
     let rb = check_gemv_args(ty, blocks, n_in, n_out, x, out)?;
 
     if ty == GgmlType::Q4K && q4k_fused_supported() {
@@ -406,7 +424,7 @@ pub fn expert_gemv(
             // SAFETY: check_gemv_args が n_in%256==0・blocks/x/out の長さを検証済みで、
             // q4k_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
             // 行は独立なので、チャンク分割しても各要素の計算順序は変わらない。
-            for_each_row_chunk(blocks, n_out, rb, out, |b, o| unsafe {
+            for_each_row_chunk(blocks, n_out, rb, out, par, |b, o| unsafe {
                 gemv_q4k_avx2(b, n_in, o.len(), x, o)
             });
             #[cfg(test)]
@@ -551,6 +569,17 @@ pub fn expert_gemv_q5_1_fast(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<()> {
+    expert_gemv_q5_1_inner(blocks, n_in, n_out, x, out, true)
+}
+
+fn expert_gemv_q5_1_inner(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    par: bool,
+) -> Result<()> {
     check_gemv_args(GgmlType::Q5_1, blocks, n_in, n_out, x, out)?;
     if n_in % 32 == 0 && q8_0_fused_supported() {
         #[cfg(target_arch = "x86_64")]
@@ -558,13 +587,13 @@ pub fn expert_gemv_q5_1_fast(
             // SAFETY: 引数は check_gemv_args が検証済み (n_in%32==0 は直前で確認) で、
             // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
             let rb = n_in / 32 * 24;
-            for_each_row_chunk(blocks, n_out, rb, out, |b, o| unsafe {
+            for_each_row_chunk(blocks, n_out, rb, out, par, |b, o| unsafe {
                 gemv_q5_1_avx2(b, n_in, o.len(), x, o)
             });
             return Ok(());
         }
     }
-    expert_gemv(GgmlType::Q5_1, blocks, n_in, n_out, x, out)
+    expert_gemv_inner(GgmlType::Q5_1, blocks, n_in, n_out, x, out, par)
 }
 
 /// Q8_0 の融合カーネルが使えるか (AVX2 + FMA の実行時判定)。
@@ -590,6 +619,17 @@ pub fn expert_gemv_q8_fast(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<()> {
+    expert_gemv_q8_inner(blocks, n_in, n_out, x, out, true)
+}
+
+fn expert_gemv_q8_inner(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    par: bool,
+) -> Result<()> {
     check_gemv_args(GgmlType::Q8_0, blocks, n_in, n_out, x, out)?;
     if n_in % 32 == 0 && q8_0_fused_supported() {
         #[cfg(target_arch = "x86_64")]
@@ -597,13 +637,13 @@ pub fn expert_gemv_q8_fast(
             // SAFETY: 引数は check_gemv_args が検証済み (n_in%32==0 は直前で確認) で、
             // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
             let rb = n_in / 32 * 34;
-            for_each_row_chunk(blocks, n_out, rb, out, |b, o| unsafe {
+            for_each_row_chunk(blocks, n_out, rb, out, par, |b, o| unsafe {
                 gemv_q8_0_avx2(b, n_in, o.len(), x, o)
             });
             return Ok(());
         }
     }
-    expert_gemv(GgmlType::Q8_0, blocks, n_in, n_out, x, out)
+    expert_gemv_inner(GgmlType::Q8_0, blocks, n_in, n_out, x, out, par)
 }
 
 /// expert テンソルの量子型で GEMV を振り分ける (P-MOE-G1 で追加)。
@@ -622,10 +662,47 @@ pub fn expert_gemv_any(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<()> {
+    expert_gemv_any_inner(ty, blocks, n_in, n_out, x, out, true)
+}
+
+/// テスト用: 行並列なしの入口 ([`expert_gemv_any_seq`]) を通った回数。
+/// 「外側 expert 並列の内側が逐次版を通っている」ことをテストで数えるためのもの。
+#[cfg(test)]
+pub(crate) static SEQ_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// [`expert_gemv_any`] の**行並列を使わない**版 (P-MOE-G5)。
+///
+/// 外側で expert ループを rayon 並列化しているときに呼ぶ。内側でも並列にすると
+/// スレッドが二重に立ってオーバーサブスクライブするので、ここでは行を分割しない。
+/// 行は互いに独立で、分割の有無は各要素の計算順序を変えないため、
+/// [`expert_gemv_any`] と**ビット一致**する (同じカーネルを通る)。
+pub fn expert_gemv_any_seq(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    #[cfg(test)]
+    SEQ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    expert_gemv_any_inner(ty, blocks, n_in, n_out, x, out, false)
+}
+
+fn expert_gemv_any_inner(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    par: bool,
+) -> Result<()> {
     match ty {
-        GgmlType::Q5_1 => expert_gemv_q5_1_fast(blocks, n_in, n_out, x, out),
-        GgmlType::Q8_0 => expert_gemv_q8_fast(blocks, n_in, n_out, x, out),
-        _ => expert_gemv(ty, blocks, n_in, n_out, x, out),
+        GgmlType::Q5_1 => expert_gemv_q5_1_inner(blocks, n_in, n_out, x, out, par),
+        GgmlType::Q8_0 => expert_gemv_q8_inner(blocks, n_in, n_out, x, out, par),
+        _ => expert_gemv_inner(ty, blocks, n_in, n_out, x, out, par),
     }
 }
 
@@ -1235,6 +1312,45 @@ mod tests {
                 d_ft,
                 d_st
             );
+        }
+    }
+
+    /// P-MOE-G5: 行並列なしの入口 [`expert_gemv_any_seq`] は行並列版と**ビット一致**する。
+    ///
+    /// `n_out` を [`PAR_MIN_ROWS`] (512) 以上にして、行並列版が実際にチャンクへ
+    /// 分割する条件で比べる (分割の有無が各要素の計算順序を変えないことの確認)。
+    #[test]
+    fn seq_entry_matches_row_parallel_entry_on_large_matrix() {
+        let n_in = N_IN;
+        let n_out = 640;
+        assert!(n_out >= PAR_MIN_ROWS, "行並列が分割する大きさで比べる");
+        let x: Vec<f32> = (0..n_in)
+            .map(|i| ((i * 29 % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        for ty in [GgmlType::Q4K, GgmlType::Q5_1, GgmlType::Q8_0] {
+            // 1 行 = n_in 要素ぶんのブロック (Q4_K は 256 要素/blk、Q5_1・Q8_0 は 32)。
+            let per_row = row_bytes(ty, n_in).expect("row_bytes") / ty.type_size();
+            let mut blocks = Vec::new();
+            for r in 0..n_out {
+                for b in 0..per_row {
+                    blocks.extend_from_slice(&make_block(ty, (r * per_row + b) as u32 + 1));
+                }
+            }
+            let mut par = vec![0.0f32; n_out];
+            let mut seq = vec![0.0f32; n_out];
+            expert_gemv_any(ty, &blocks, n_in, n_out, &x, &mut par).expect("行並列");
+            expert_gemv_any_seq(ty, &blocks, n_in, n_out, &x, &mut seq).expect("行並列なし");
+            assert!(
+                par.iter().any(|v| *v != 0.0),
+                "{ty:?}: 出力が全 0 (テストが無意味)"
+            );
+            for r in 0..n_out {
+                assert_eq!(
+                    par[r].to_bits(),
+                    seq[r].to_bits(),
+                    "{ty:?}: 行 {r} がビット一致しない"
+                );
+            }
         }
     }
 
