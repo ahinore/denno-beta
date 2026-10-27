@@ -141,6 +141,32 @@ impl GgufLinear {
             GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => {
                 let rb = row_bytes_any(self.ty, self.k)?;
                 let b = self.blocks.as_slice();
+                // P-MOE-G11: 行を rayon で分割する。行は独立で、行内の逐次加算順は
+                // 変えないので、分割の有無で結果はビット一致する (従来の逐次版と
+                // 同じ `dequant_row_into` + 同じ順の内積を通る)。
+                // MoE のルータ (`ffn_gate_inp`, F32, 2560x512 = 5.2 MB) がここを通り、
+                // 1 層あたり 1.07 ms かかっていた (moe の 42%)。
+                #[cfg(feature = "par")]
+                if self.n >= 64 && self.k >= 256 {
+                    use rayon::prelude::*;
+                    let threads = rayon::current_num_threads().max(1);
+                    let rows = self.n.div_ceil(threads).max(32).min(self.n);
+                    let bytes = rows * rb;
+                    b.par_chunks(bytes).zip(out.par_chunks_mut(rows)).for_each(
+                        |(bb, oo)| {
+                            let mut row = vec![0f32; self.k];
+                            for (r, slot) in oo.iter_mut().enumerate() {
+                                dequant_row_into(self.ty, &bb[r * rb..(r + 1) * rb], &mut row);
+                                let mut acc = 0f32;
+                                for i in 0..self.k {
+                                    acc += row[i] * x[i];
+                                }
+                                *slot = acc;
+                            }
+                        },
+                    );
+                    return Ok(());
+                }
                 let mut row = vec![0f32; self.k];
                 for r in 0..self.n {
                     dequant_row_into(self.ty, &b[r * rb..(r + 1) * rb], &mut row);
