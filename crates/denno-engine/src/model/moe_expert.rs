@@ -723,6 +723,574 @@ pub fn expert_gemv_scalar(
     Ok(())
 }
 
+// ---- H3: 量子型のバッチ GEMV (GEMM) --------------------------------------
+//
+// prefill はプロンプト全体 (m トークン) を 1 回で流す。1 行版 ([`expert_gemv_any`]) を
+// m 回呼ぶと同じ重み行を m 回読むことになり、mmap 越しの 1 expert 921 KB が
+// そのまま RAM 帯域に当たる。ここでは**重み行のデコードを 1 回だけ行い m トークンに
+// 使い回す**。
+//
+// 数値契約: `outs[t * n_out + r]` は [`expert_gemv_any`] を m 回呼んだ結果とビット一致。
+// 根拠は「1 行版と同じカーネル・同じ順序」:
+//
+// - Q8_0 / Q5_1 / Q4_K かつ AVX2+FMA がある環境では、1 行版と同じ融合カーネルと
+//   同じレーンの累積順を持つバッチ版を通す。ブロックの int→f32 変換
+//   (`w = q * d` の丸め) は行に依らないので、ブロックごとに 1 回へ括り出しても
+//   積和の順序は変わらない (各行の累積チェーンは独立で、行間で共有しない)。
+// - それ以外 (Q5_K、AVX2/FMA 無し) は 1 行版がスカラー経路に落ちるので、
+//   [`dequant_row_into`] の結果 1 本を m 行で共有して [`dot_seq`] する。
+
+/// [`expert_gemm_any`] の引数検証。行バイト数を返す。
+///
+/// 対象型の門番は [`row_bytes`] と同じ (Q4_K / Q5_K / Q5_1 / Q8_0)。
+fn check_gemm_args(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    xs: &[f32],
+    m: usize,
+    outs: &[f32],
+) -> Result<usize> {
+    let rb = row_bytes(ty, n_in)?;
+    if n_out == 0 {
+        bail!("n_out が 0 (行が無い)");
+    }
+    if m == 0 {
+        bail!("m が 0 (トークンが無い)");
+    }
+    let want_x = m
+        .checked_mul(n_in)
+        .ok_or_else(|| anyhow::anyhow!("xs の長さが usize を溢れる (m={}, n_in={})", m, n_in))?;
+    if xs.len() != want_x {
+        bail!("xs の長さ {} が m * n_in = {} と違う", xs.len(), want_x);
+    }
+    let want_o = m
+        .checked_mul(n_out)
+        .ok_or_else(|| anyhow::anyhow!("outs の長さが usize を溢れる (m={}, n_out={})", m, n_out))?;
+    if outs.len() != want_o {
+        bail!("outs の長さ {} が m * n_out = {} と違う", outs.len(), want_o);
+    }
+    let want_b = n_out
+        .checked_mul(rb)
+        .ok_or_else(|| anyhow::anyhow!("1 expert のバイト数が usize を溢れる (n_out={})", n_out))?;
+    if blocks.len() != want_b {
+        bail!("blocks の長さ {} が n_out * row_bytes = {} と違う", blocks.len(), want_b);
+    }
+    Ok(rb)
+}
+
+/// テスト用: バッチ融合カーネルが実際に発火した回数 (スレッドローカル)。
+/// 「テストが緑」= 「融合経路が通った」ではないので、ゲートの通過を数える。
+/// テストは 1 本 1 スレッドで走るので、スレッドローカルなら他のテストと混ざらない
+/// (行数が少ない行列は rayon を使わないので、数えるのは常に呼び出しスレッド)。
+#[cfg(test)]
+thread_local! {
+    static GEMM_FUSED_CALLS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+#[inline]
+fn gemm_fused_fired() {
+    #[cfg(test)]
+    GEMM_FUSED_CALLS.with(|c| c.set(c.get() + 1));
+}
+
+/// テスト用: このスレッドでバッチ融合カーネルが発火した累計回数。
+#[cfg(test)]
+fn gemm_fused_count() -> usize {
+    GEMM_FUSED_CALLS.with(|c| c.get())
+}
+
+/// 行範囲 `r0..r1` を計算し、`out[t * stride + (r - r0)]` に書く (`out.len() == m * stride`)。
+///
+/// 行範囲で切るのは、行が互いに独立で、切っても各要素の計算順序が変わらないため
+/// (どのスレッドが担当しても結果はビット一致)。
+fn gemm_rows(
+    ty: GgmlType,
+    rb: usize,
+    blocks: &[u8],
+    n_in: usize,
+    r0: usize,
+    r1: usize,
+    xs: &[f32],
+    m: usize,
+    out: &mut [f32],
+    stride: usize,
+) {
+    debug_assert_eq!(out.len(), m * stride);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if ty == GgmlType::Q8_0 && q8_0_fused_supported() {
+            gemm_fused_fired();
+            // SAFETY: 引数は check_gemm_args が検証済み (n_in%32==0 は row_bytes が保証) で、
+            // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
+            // `out` は m*stride 要素ちょうど (debug_assert 済み)。
+            unsafe { gemm_q8_0_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
+            return;
+        }
+        if ty == GgmlType::Q5_1 && q8_0_fused_supported() {
+            gemm_fused_fired();
+            // SAFETY: 同上 (Q5_1 のブロックは 32 要素 = 24 バイト)。
+            unsafe { gemm_q5_1_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
+            return;
+        }
+        if ty == GgmlType::Q4K && q4k_fused_supported() {
+            gemm_fused_fired();
+            // SAFETY: 同上 (Q4_K は n_in%256==0 が row_bytes で保証される)。
+            unsafe { gemm_q4k_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
+            return;
+        }
+    }
+    gemm_rows_scalar(ty, rb, blocks, n_in, r0, r1, xs, m, out, stride);
+}
+
+/// スカラー経路のバッチ版 ([`expert_gemv_scalar`] を m 回呼んだのと同じ順序)。
+///
+/// 行のデコードは 1 回だけ行い、m トークンぶんの内積で共有する。
+fn gemm_rows_scalar(
+    ty: GgmlType,
+    rb: usize,
+    blocks: &[u8],
+    n_in: usize,
+    r0: usize,
+    r1: usize,
+    xs: &[f32],
+    m: usize,
+    out: &mut [f32],
+    stride: usize,
+) {
+    let mut row = vec![0.0f32; n_in];
+    for r in r0..r1 {
+        dequant_row_into(ty, &blocks[r * rb..(r + 1) * rb], &mut row);
+        for t in 0..m {
+            let x = &xs[t * n_in..(t + 1) * n_in];
+            out[t * stride + (r - r0)] = dot_seq(&row, x);
+        }
+    }
+}
+
+/// Q8_0 のバッチ融合カーネル。[`gemv_q8_0_avx2`] と**同じレーン累積順**。
+///
+/// 1 行版はブロックごとに `w = q*d` を変換し直すが、`w` は行に依らないので
+/// ここではブロックごとに 1 回だけ変換し、m トークンの積和で共有する。
+/// 累積は 8 レーン 2 本 (`a0`/`a1`) で、行ごとに同じ順序で回るので値は 1 行版と同一。
+///
+/// # Safety
+///
+/// `blocks.len() == (r1 - r0 を含む全行) * (n_in/32)*34`、`xs.len() == m*n_in`、
+/// `out.len() == m*stride`、`r1 <= n_out`、実行 CPU が AVX2 と FMA を持つこと。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemm_q8_0_avx2(
+    blocks: &[u8],
+    n_in: usize,
+    r0: usize,
+    r1: usize,
+    xs: &[f32],
+    m: usize,
+    out: &mut [f32],
+    stride: usize,
+) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 34; // d(2) + qs(32)
+    let nb = n_in / 32;
+    let rb = nb * BLK;
+    let bp = blocks.as_ptr();
+    let xp = xs.as_ptr();
+
+    // トークンごとの 8 レーン累積 2 本。レジスタには収まらないのでメモリに置く
+    // (行あたり nb 回のロード/ストアだけ。重みの読みは 1 回で済む)。
+    let mut a0 = vec![_mm256_setzero_ps(); m];
+    let mut a1 = vec![_mm256_setzero_ps(); m];
+
+    for r in r0..r1 {
+        for v in a0.iter_mut() {
+            *v = _mm256_setzero_ps();
+        }
+        for v in a1.iter_mut() {
+            *v = _mm256_setzero_ps();
+        }
+        let row = bp.add(r * rb);
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let dv = _mm256_set1_ps(d);
+            let q = p.add(2);
+            let lo = _mm_loadu_si128(q as *const __m128i);
+            let hi = _mm_loadu_si128(q.add(16) as *const __m128i);
+            // ブロックのデコード (行に依らない) は 1 回だけ。
+            let w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), dv);
+            let w1 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(lo))),
+                dv,
+            );
+            let w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)), dv);
+            let w3 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(hi))),
+                dv,
+            );
+            for t in 0..m {
+                let xb = xp.add(t * n_in + b * 32);
+                let mut c0 = a0[t];
+                let mut c1 = a1[t];
+                c0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xb), c0);
+                c1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xb.add(8)), c1);
+                c0 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(xb.add(16)), c0);
+                c1 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(xb.add(24)), c1);
+                a0[t] = c0;
+                a1[t] = c1;
+            }
+        }
+        for t in 0..m {
+            let s = _mm256_add_ps(a0[t], a1[t]);
+            let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps::<1>(s));
+            let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+            let h = _mm_add_ss(h, _mm_shuffle_ps::<0x55>(h, h));
+            *out.get_unchecked_mut(t * stride + (r - r0)) = _mm_cvtss_f32(h);
+        }
+    }
+}
+
+/// Q5_1 のバッチ融合カーネル。[`gemv_q5_1_avx2`] と**同じレーン累積順**。
+///
+/// 5 ビットの展開 (`qh` + `qs` → 32 要素) は行に依らないのでブロックごとに 1 回だけ。
+/// 最小値項 `Σ m*x` は `sum(x[32])` をトークンごとに先に作っておく (1 行版と同じ)。
+///
+/// # Safety
+///
+/// [`gemm_q8_0_avx2`] と同じ (Q5_1 のブロックは 32 要素 = 24 バイト)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemm_q5_1_avx2(
+    blocks: &[u8],
+    n_in: usize,
+    r0: usize,
+    r1: usize,
+    xs: &[f32],
+    m: usize,
+    out: &mut [f32],
+    stride: usize,
+) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 24; // d(2) + m(2) + qh(4) + qs(16)
+    let nb = n_in / 32;
+    let rb = nb * BLK;
+    let bp = blocks.as_ptr();
+    let xp = xs.as_ptr();
+
+    // ブロック位置ごとの `sum(x[32])` (1 行版と同じ昇順の和)。トークンごとに違う。
+    let mut gsums = vec![0f32; m * nb];
+    for t in 0..m {
+        for b in 0..nb {
+            let mut acc = 0f32;
+            for j in 0..32 {
+                acc += *xp.add(t * n_in + b * 32 + j);
+            }
+            gsums[t * nb + b] = acc;
+        }
+    }
+
+    let mut a0 = vec![_mm256_setzero_ps(); m];
+    let mut a1 = vec![_mm256_setzero_ps(); m];
+    let mut a2 = vec![_mm256_setzero_ps(); m];
+    let mut a3 = vec![_mm256_setzero_ps(); m];
+    let mut macc = vec![0f32; m];
+    let mut q = [0f32; 32];
+
+    for r in r0..r1 {
+        for t in 0..m {
+            a0[t] = _mm256_setzero_ps();
+            a1[t] = _mm256_setzero_ps();
+            a2[t] = _mm256_setzero_ps();
+            a3[t] = _mm256_setzero_ps();
+            macc[t] = 0f32;
+        }
+        let row = bp.add(r * rb);
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let mv = half::f16::from_bits(std::ptr::read_unaligned(p.add(2) as *const u16)).to_f32();
+            let qh = std::ptr::read_unaligned(p.add(4) as *const u32);
+            let qs = p.add(8);
+            for j in 0..16 {
+                let byte = *qs.add(j);
+                let xh0 = (((qh >> j) << 4) & 0x10) as u8 as i32;
+                let xh1 = ((qh >> (j + 12)) & 0x10) as i32;
+                q[j] = (((byte & 0x0f) as i32) | xh0) as f32;
+                q[j + 16] = (((byte >> 4) as i32) | xh1) as f32;
+            }
+            let dv = _mm256_set1_ps(d);
+            let qp = q.as_ptr();
+            // ブロックのデコード (行に依らない) は 1 回だけ。
+            let w0 = _mm256_mul_ps(_mm256_loadu_ps(qp), dv);
+            let w1 = _mm256_mul_ps(_mm256_loadu_ps(qp.add(8)), dv);
+            let w2 = _mm256_mul_ps(_mm256_loadu_ps(qp.add(16)), dv);
+            let w3 = _mm256_mul_ps(_mm256_loadu_ps(qp.add(24)), dv);
+            for t in 0..m {
+                let xb = xp.add(t * n_in + b * 32);
+                let mut c0 = a0[t];
+                let mut c1 = a1[t];
+                let mut c2 = a2[t];
+                let mut c3 = a3[t];
+                c0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xb), c0);
+                c1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xb.add(8)), c1);
+                c2 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(xb.add(16)), c2);
+                c3 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(xb.add(24)), c3);
+                a0[t] = c0;
+                a1[t] = c1;
+                a2[t] = c2;
+                a3[t] = c3;
+                macc[t] += mv * gsums[t * nb + b];
+            }
+        }
+        for t in 0..m {
+            let s01 = _mm256_add_ps(a0[t], a1[t]);
+            let s23 = _mm256_add_ps(a2[t], a3[t]);
+            let s = _mm256_add_ps(s01, s23);
+            let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps::<1>(s));
+            let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+            let h = _mm_add_ss(h, _mm_shuffle_ps::<0x55>(h, h));
+            *out.get_unchecked_mut(t * stride + (r - r0)) = _mm_cvtss_f32(h) + macc[t];
+        }
+    }
+}
+
+/// Q4_K のバッチ融合カーネル。[`gemv_q4k_avx2`] と**同じレーン累積順**。
+///
+/// 1 行版は 256 要素ブロックごとに nibble を f32 へ開き直すが、その値
+/// (`w = nib * d*sc`) は行に依らないので、ブロックごとに 1 回だけ作って m トークンで
+/// 共有する。累積は 8 レーン 2 本をブロック内でリセットし、ブロックごとに
+/// `hsum8(acc0+acc1) - minsum` を `total` へ足す (1 行版と同じ順序)。
+///
+/// # Safety
+///
+/// [`gemm_q8_0_avx2`] と同じ。加えて Q4_K は `n_in % 256 == 0` が [`row_bytes`] で
+/// 保証される。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemm_q4k_avx2(
+    blocks: &[u8],
+    n_in: usize,
+    r0: usize,
+    r1: usize,
+    xs: &[f32],
+    m: usize,
+    out: &mut [f32],
+    stride: usize,
+) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 144; // Q4_K 1 ブロック = 256 要素
+
+    let nb = n_in / 256;
+    let rb = nb * BLK;
+    let bp = blocks.as_ptr();
+    let xp = xs.as_ptr();
+
+    /// 8 レーンの水平和 ([`gemv_q4k_avx2`] の `hsum8` と同じ順序)。
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn hsum8(v: __m256) -> f32 {
+        let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        let s = _mm_add_ss(s, _mm_shuffle_ps::<0x55>(s, s));
+        _mm_cvtss_f32(s)
+    }
+
+    // 32 要素グループごとの `sum(x)` (最小値項 Σ m*x 用)。1 行版と同じ昇順の和。
+    let ng32 = n_in / 32;
+    let mut gsums = vec![0f32; m * ng32];
+    for t in 0..m {
+        for g in 0..ng32 {
+            let mut acc = 0f32;
+            for j in 0..32 {
+                acc += *xp.add(t * n_in + g * 32 + j);
+            }
+            gsums[t * ng32 + g] = acc;
+        }
+    }
+
+    let mut a0 = vec![_mm256_setzero_ps(); m];
+    let mut a1 = vec![_mm256_setzero_ps(); m];
+    let mut minsum = vec![0f32; m];
+    let mut total = vec![0f32; m];
+
+    for r in r0..r1 {
+        for t in 0..m {
+            total[t] = 0f32;
+        }
+        let row = bp.add(r * rb);
+        for b in 0..nb {
+            let blk = std::slice::from_raw_parts(row.add(b * BLK), BLK);
+            let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+            let dmin = half::f16::from_le_bytes([blk[2], blk[3]]).to_f32();
+            let sc = &blk[4..16];
+            let qrow = row.add(b * BLK + 16);
+            for t in 0..m {
+                a0[t] = _mm256_setzero_ps();
+                a1[t] = _mm256_setzero_ps();
+                minsum[t] = 0f32;
+            }
+            for j in 0..4usize {
+                let (s0, m0) = scale_min_k4(2 * j, sc);
+                let (s1, m1) = scale_min_k4(2 * j + 1, sc);
+                let dv0 = _mm256_set1_ps(d * s0 as f32);
+                let dv1 = _mm256_set1_ps(d * s1 as f32);
+                let qv = _mm256_loadu_si256(qrow.add(j * 32) as *const __m256i);
+                let lo = _mm256_and_si256(qv, _mm256_set1_epi8(0x0f));
+                let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(qv), _mm256_set1_epi8(0x0f));
+                // ブロックのデコード (行に依らない) は 1 回だけ。
+                let lol = _mm256_castsi256_si128(lo);
+                let loh = _mm256_extracti128_si256::<1>(lo);
+                let hil = _mm256_castsi256_si128(hi);
+                let hih = _mm256_extracti128_si256::<1>(hi);
+                let w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lol)), dv0);
+                let w1 = _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(lol))),
+                    dv0,
+                );
+                let w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(loh)), dv0);
+                let w3 = _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(loh))),
+                    dv0,
+                );
+                let w4 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hil)), dv1);
+                let w5 = _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(hil))),
+                    dv1,
+                );
+                let w6 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hih)), dv1);
+                let w7 = _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(hih))),
+                    dv1,
+                );
+                let g = b * 8 + j * 2; // 32 要素グループの添字 (x 側)
+                for t in 0..m {
+                    let xb = xp.add(t * n_in + b * 256 + j * 64);
+                    let mut c0 = a0[t];
+                    let mut c1 = a1[t];
+                    c0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xb), c0);
+                    c0 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xb.add(8)), c0);
+                    c0 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(xb.add(16)), c0);
+                    c0 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(xb.add(24)), c0);
+                    c1 = _mm256_fmadd_ps(w4, _mm256_loadu_ps(xb.add(32)), c1);
+                    c1 = _mm256_fmadd_ps(w5, _mm256_loadu_ps(xb.add(40)), c1);
+                    c1 = _mm256_fmadd_ps(w6, _mm256_loadu_ps(xb.add(48)), c1);
+                    c1 = _mm256_fmadd_ps(w7, _mm256_loadu_ps(xb.add(56)), c1);
+                    a0[t] = c0;
+                    a1[t] = c1;
+                    minsum[t] += dmin * m0 as f32 * *gsums.get_unchecked(t * ng32 + g);
+                    minsum[t] += dmin * m1 as f32 * *gsums.get_unchecked(t * ng32 + g + 1);
+                }
+            }
+            for t in 0..m {
+                total[t] += hsum8(_mm256_add_ps(a0[t], a1[t])) - minsum[t];
+            }
+        }
+        for t in 0..m {
+            *out.get_unchecked_mut(t * stride + (r - r0)) = total[t];
+        }
+    }
+}
+
+/// 行チャンクの切り方。`par == false`・`n_out` が小さい・`par` feature 無しでは
+/// 1 チャンク (= 呼び出しスレッドだけで全行)。
+fn gemm_row_ranges(n_out: usize, par: bool) -> Vec<(usize, usize)> {
+    #[cfg(feature = "par")]
+    {
+        if par && n_out >= PAR_MIN_ROWS {
+            let threads = rayon::current_num_threads().max(1);
+            let want = n_out.div_ceil(threads).max(64).min(n_out);
+            return (0..n_out)
+                .step_by(want)
+                .map(|a| (a, (a + want).min(n_out)))
+                .collect();
+        }
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        let _ = par;
+    }
+    vec![(0, n_out)]
+}
+
+/// 量子型のバッチ GEMV (GEMM)。`outs[t * n_out + r] = dot(row_r, xs[t])`。
+///
+/// - `xs` は `m * n_in` (行優先、1 行 = 1 トークン)、`outs` は `m * n_out`。
+/// - 重み (`blocks`) は 1 expert ぶん ([`ExpertSlice`] で切り出したもの)。
+/// - 結果は [`expert_gemv_any`] を m 回呼んだ結果と**ビット一致**する
+///   (根拠は上のモジュール内コメント)。
+/// - 行 (`n_out`) 方向に rayon で分割する。行は独立なので分割しても値は変わらない。
+pub fn expert_gemm_any(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    xs: &[f32],
+    m: usize,
+    outs: &mut [f32],
+) -> Result<()> {
+    expert_gemm_any_inner(ty, blocks, n_in, n_out, xs, m, outs, true)
+}
+
+/// [`expert_gemm_any`] の**行並列を使わない**版。
+///
+/// 外側で expert ループを rayon 並列化しているときに呼ぶ (内側で二重にスレッドを
+/// 立てない)。行の分割は各要素の計算順序を変えないので結果はビット一致する。
+pub fn expert_gemm_any_seq(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    xs: &[f32],
+    m: usize,
+    outs: &mut [f32],
+) -> Result<()> {
+    expert_gemm_any_inner(ty, blocks, n_in, n_out, xs, m, outs, false)
+}
+
+fn expert_gemm_any_inner(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    xs: &[f32],
+    m: usize,
+    outs: &mut [f32],
+    par: bool,
+) -> Result<()> {
+    let rb = check_gemm_args(ty, blocks, n_in, n_out, xs, m, outs)?;
+    let ranges = gemm_row_ranges(n_out, par);
+    if ranges.len() > 1 {
+        #[cfg(feature = "par")]
+        {
+            use rayon::prelude::*;
+            // `outs` はトークン優先なので行チャンクが連続しない (= 同じ `&mut` を
+            // 分割できない)。チャンクごとに別バッファへ書いてから詰める。
+            let parts: Vec<(usize, usize, Vec<f32>)> = ranges
+                .par_iter()
+                .map(|&(a, b)| {
+                    let mut buf = vec![0.0f32; m * (b - a)];
+                    gemm_rows(ty, rb, blocks, n_in, a, b, xs, m, &mut buf, b - a);
+                    (a, b, buf)
+                })
+                .collect();
+            for (a, b, buf) in parts {
+                let w = b - a;
+                for t in 0..m {
+                    outs[t * n_out + a..t * n_out + b].copy_from_slice(&buf[t * w..(t + 1) * w]);
+                }
+            }
+            return Ok(());
+        }
+    }
+    let (a, b) = ranges[0];
+    gemm_rows(ty, rb, blocks, n_in, a, b, xs, m, outs, b - a);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! 実ファイルはこのコンテナから見えないので、ブロックはテスト内で組み立てる。
@@ -1435,5 +2003,196 @@ mod tests {
             reps
         );
         assert!(sc_ns > 0.0 && fu_ns > 0.0, "計測値が 0 (測れていない)");
+    }
+
+    // ---- 7. バッチ GEMM (H3) -----------------------------------------------
+
+    /// m トークンぶんの入力 (`xs[t*n_in + i]`)。トークンごとに値の列を変える
+    /// (トークンと行の取り違え、行の使い回しを検出するため)。
+    fn make_xs(m: usize, n_in: usize) -> Vec<f32> {
+        let mut v = Vec::with_capacity(m * n_in);
+        for t in 0..m {
+            for i in 0..n_in {
+                let k = (i * 37 + t * 911) % 101;
+                v.push((k as f32 - 50.0) / 64.0);
+            }
+        }
+        v
+    }
+
+    /// 参照: `expert_gemv_any` を m 回呼んだ結果を、GEMM と同じ並び (`t*n_out + r`) に詰める。
+    fn gemv_any_m_times(
+        ty: GgmlType,
+        blocks: &[u8],
+        n_in: usize,
+        n_out: usize,
+        xs: &[f32],
+        m: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; m * n_out];
+        let mut one = vec![0.0f32; n_out];
+        for t in 0..m {
+            one.iter_mut().for_each(|v| *v = 0.0);
+            expert_gemv_any(ty, blocks, n_in, n_out, &xs[t * n_in..(t + 1) * n_in], &mut one)
+                .expect("gemv_any");
+            out[t * n_out..(t + 1) * n_out].copy_from_slice(&one);
+        }
+        out
+    }
+
+    #[test]
+    fn gemm_matches_m_times_gemv_any_bits() {
+        // 本体の契約: `outs[t*n_out + r]` が 1 行版を m 回呼んだ結果とビット一致。
+        // m = 1 (1 行版と同値) / 4 / 17 (タイル外れ) で見る。
+        for ty in ALL_TYPES {
+            let blocks = make_expert(ty, N_IN, N_OUT, 0);
+            for m in [1usize, 4, 17] {
+                let xs = make_xs(m, N_IN);
+                let mut got = vec![0.0f32; m * N_OUT];
+                expert_gemm_any(ty, &blocks, N_IN, N_OUT, &xs, m, &mut got)
+                    .unwrap_or_else(|e| panic!("{ty:?} m={m}: {e}"));
+                let want = gemv_any_m_times(ty, &blocks, N_IN, N_OUT, &xs, m);
+                expect_bits(&got, &want);
+                // 縮退していないこと (全 0 なら一致しても意味が無い)
+                assert!(
+                    got.iter().any(|v| *v != 0.0),
+                    "{ty:?} m={m}: 出力が全 0 (テストが無意味)"
+                );
+                assert!(got.iter().all(|v| v.is_finite()), "{ty:?} m={m}: 非有限値");
+                // トークンごとに値が違うこと (行の取り違え・共有の検出)
+                if m > 1 {
+                    let t0 = &got[0..N_OUT];
+                    assert!(
+                        (1..m).any(|t| got[t * N_OUT..(t + 1) * N_OUT] != *t0),
+                        "{ty:?} m={m}: 全トークンが同じ値 (入力を共有している疑い)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gemm_matches_m_times_gemv_scalar_bits() {
+        // スカラー経路 (`dequant_row_into` + 逐次内積) のバッチ本体 `gemm_rows_scalar` を
+        // 直接呼び、1 行版のスカラー経路を m 回呼んだ結果とビット一致することを見る。
+        // 「デコードを 1 回に括り出す」変形が丸め順を変えていないことの直接確認で、
+        // AVX2/FMA が無い環境で実際に使われる経路でもある。
+        // (融合カーネルへ振れる型の `expert_gemm_any` は 1 行版の融合経路と一致するので、
+        //  そちらは `gemm_matches_m_times_gemv_any_bits` が見る。)
+        for ty in ALL_TYPES {
+            let rb = row_bytes(ty, N_IN).unwrap();
+            let blocks = make_expert(ty, N_IN, N_OUT, 0);
+            for m in [1usize, 4, 17] {
+                let xs = make_xs(m, N_IN);
+                let mut got = vec![0.0f32; m * N_OUT];
+                gemm_rows_scalar(ty, rb, &blocks, N_IN, 0, N_OUT, &xs, m, &mut got, N_OUT);
+                let mut want = vec![0.0f32; m * N_OUT];
+                for t in 0..m {
+                    let mut one = vec![0.0f32; N_OUT];
+                    expert_gemv_scalar(
+                        ty,
+                        &blocks,
+                        N_IN,
+                        N_OUT,
+                        &xs[t * N_IN..(t + 1) * N_IN],
+                        &mut one,
+                    )
+                    .unwrap();
+                    want[t * N_OUT..(t + 1) * N_OUT].copy_from_slice(&one);
+                }
+                expect_bits(&got, &want);
+                assert!(got.iter().any(|v| *v != 0.0), "{ty:?} m={m}: 出力が全 0");
+            }
+        }
+    }
+
+    #[test]
+    fn gemm_matches_gemv_any_on_real_shape() {
+        // 実形状 (640 行 x 2560 列 = 10 ブロック/行) かつ n_out >= PAR_MIN_ROWS なので、
+        // 行チャンクの並列経路とチャンク詰めもここで通る。
+        for ty in ALL_TYPES {
+            let blocks = make_expert(ty, PERF_N_IN, PERF_N_OUT, 0);
+            for m in [1usize, 4] {
+                let xs = make_xs(m, PERF_N_IN);
+                let mut got = vec![0.0f32; m * PERF_N_OUT];
+                expert_gemm_any(ty, &blocks, PERF_N_IN, PERF_N_OUT, &xs, m, &mut got).unwrap();
+                let want = gemv_any_m_times(ty, &blocks, PERF_N_IN, PERF_N_OUT, &xs, m);
+                expect_bits(&got, &want);
+                assert!(got.iter().any(|v| *v != 0.0), "{ty:?}: 出力が全 0");
+            }
+        }
+    }
+
+    #[test]
+    fn gemm_seq_entry_matches_parallel_entry() {
+        // 行の分割の有無は各要素の計算順序を変えない (ビット一致)。
+        let n_out = 640;
+        assert!(n_out >= PAR_MIN_ROWS, "行並列が分割する大きさで比べる");
+        for ty in ALL_TYPES {
+            let blocks = make_expert(ty, N_IN, n_out, 0);
+            let m = 3usize;
+            let xs = make_xs(m, N_IN);
+            let mut par = vec![0.0f32; m * n_out];
+            let mut seq = vec![0.0f32; m * n_out];
+            expert_gemm_any(ty, &blocks, N_IN, n_out, &xs, m, &mut par).unwrap();
+            expert_gemm_any_seq(ty, &blocks, N_IN, n_out, &xs, m, &mut seq).unwrap();
+            assert!(par.iter().any(|v| *v != 0.0), "{ty:?}: 出力が全 0");
+            expect_bits(&par, &seq);
+        }
+    }
+
+    #[test]
+    fn gemm_fused_gate_fires() {
+        // 「緑 = 経路が発動した証拠」ではないので、バッチ融合カーネルの発火を数える。
+        // 行数が PAR_MIN_ROWS 未満なので rayon は使わず、このスレッドで数えられる。
+        if !q8_0_fused_supported() {
+            eprintln!("skip gemm_fused_gate_fires: この CPU には AVX2/FMA が無い");
+            return;
+        }
+        assert!(N_OUT < PAR_MIN_ROWS, "ゲートの計数は逐次経路で行う");
+        let xs = make_xs(4, N_IN);
+        for ty in [GgmlType::Q4K, GgmlType::Q5_1, GgmlType::Q8_0] {
+            let blocks = make_expert(ty, N_IN, N_OUT, 0);
+            let mut out = vec![0.0f32; 4 * N_OUT];
+            let before = gemm_fused_count();
+            expert_gemm_any(ty, &blocks, N_IN, N_OUT, &xs, 4, &mut out).unwrap();
+            let fired = gemm_fused_count() - before;
+            assert!(fired >= 1, "{ty:?}: バッチ融合カーネルが発火していない");
+        }
+        // 対照: Q5_K は 1 行版もスカラー経路なので、バッチ融合は選ばれない。
+        let blocks = make_expert(GgmlType::Q5K, N_IN, N_OUT, 0);
+        let mut out = vec![0.0f32; 4 * N_OUT];
+        let before = gemm_fused_count();
+        expert_gemm_any(GgmlType::Q5K, &blocks, N_IN, N_OUT, &xs, 4, &mut out).unwrap();
+        assert_eq!(
+            gemm_fused_count(),
+            before,
+            "Q5_K でバッチ融合カーネルが発火した (スカラー経路のはず)"
+        );
+        assert!(out.iter().any(|v| *v != 0.0), "Q5_K: 出力が全 0");
+    }
+
+    #[test]
+    fn gemm_rejects_wrong_lengths() {
+        let ty = GgmlType::Q8_0;
+        let blocks = make_expert(ty, N_IN, N_OUT, 0);
+        let m = 3usize;
+        let xs = make_xs(m, N_IN);
+        let mut out = vec![0.0f32; m * N_OUT];
+
+        // m = 0 / xs の長さ違い / outs の長さ違い
+        assert!(expert_gemm_any(ty, &blocks, N_IN, N_OUT, &xs, 0, &mut []).is_err());
+        assert!(expert_gemm_any(ty, &blocks, N_IN, N_OUT, &xs[..m * N_IN - 1], m, &mut out).is_err());
+        let mut short = vec![0.0f32; m * N_OUT - 1];
+        assert!(expert_gemm_any(ty, &blocks, N_IN, N_OUT, &xs, m, &mut short).is_err());
+        // blocks の長さ違い
+        assert!(expert_gemm_any(ty, &blocks[..blocks.len() - 1], N_IN, N_OUT, &xs, m, &mut out).is_err());
+        // n_out = 0
+        assert!(expert_gemm_any(ty, &[], N_IN, 0, &[], 0, &mut []).is_err());
+        // 対象外の型 (1 行版と同じ門番)
+        assert!(expert_gemm_any(GgmlType::F32, &blocks, N_IN, N_OUT, &xs, m, &mut out).is_err());
+        assert!(expert_gemm_any(GgmlType::Q6K, &blocks, N_IN, N_OUT, &xs, m, &mut out).is_err());
+        // 正常系が通ること (上の否定だけでは「常に Err」でも緑になる)
+        assert!(expert_gemm_any(ty, &blocks, N_IN, N_OUT, &xs, m, &mut out).is_ok());
     }
 }
