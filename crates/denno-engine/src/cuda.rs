@@ -2229,7 +2229,10 @@ static GPU_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 #[cfg(test)]
 static GPU_FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn cuda_enabled() -> bool {
+/// CUDA 経路が有効か (`DENNO_CUDA=1` かつ初期化が壊れていない)。
+///
+/// テストから「逐次経路が GPU カーネルか CPU 参照か」を判定するのにも使う。
+pub fn cuda_enabled() -> bool {
     if GPU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }

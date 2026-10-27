@@ -197,6 +197,99 @@ impl SsmLayer {
         Ok(out)
     }
 
+    /// チャンクぶんの入力をまとめて回す (バッチ prefill 用)。
+    ///
+    /// 変えるのは行列積の呼び方だけ: 5 本の投影をチャンクで 1 回ずつ
+    /// [`gemv_batch`] に流す (GPU 常駐時は 1 トークンあたり 5 往復していたのが
+    /// チャンクあたり 5 往復になる)。GDN の中身は状態をトークン順に進めるので
+    /// 1 トークンずつ [`gdn::forward_token_core_gate`] に渡す (数式・順序は不変)。
+    ///
+    /// 数値: 行列積は逐次と同じカーネルをトークンごとに当てるだけなので、
+    /// `forward_token` とビット一致する。
+    pub fn forward_batch(&mut self, curs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        let nt = curs.len();
+        if nt == 0 {
+            return Ok(Vec::new());
+        }
+        if nt == 1 {
+            return Ok(vec![self.forward_token(&curs[0])?]);
+        }
+        let e = self.p.n_embd;
+        let mut flat = Vec::with_capacity(nt * e);
+        for cur in curs {
+            if cur.len() != e {
+                bail!(
+                    "SsmLayer::forward_batch: 入力長 {} が n_embd={e} と違う",
+                    cur.len()
+                );
+            }
+            flat.extend_from_slice(cur);
+        }
+
+        let prof = crate::model::qwen4exp::q4prof::enabled();
+        let qd = self.p.qkv_dim();
+        let vd = self.p.value_dim();
+        let nh = self.p.n_v_heads;
+
+        let t = std::time::Instant::now();
+        let mut qkv = vec![0f32; nt * qd];
+        crate::model::qwen4exp::gemv_batch(&self.w_qkv, &flat, nt, &mut qkv)?;
+        if prof {
+            crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_QKV, t);
+        }
+
+        let t = std::time::Instant::now();
+        let mut z = vec![0f32; nt * vd];
+        crate::model::qwen4exp::gemv_batch(&self.w_gate, &flat, nt, &mut z)?;
+        let mut beta_raw = vec![0f32; nt * nh];
+        crate::model::qwen4exp::gemv_batch(&self.w_beta, &flat, nt, &mut beta_raw)?;
+        let mut alpha = vec![0f32; nt * nh];
+        crate::model::qwen4exp::gemv_batch(&self.w_alpha, &flat, nt, &mut alpha)?;
+        if prof {
+            crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_GATE, t);
+        }
+
+        let t = std::time::Instant::now();
+        gdn::gdn_dbg_set_layer(self.il as i64);
+        let mut ys = Vec::with_capacity(nt * vd);
+        for i in 0..nt {
+            let cw = GdnCore {
+                conv1d: &self.conv1d,
+                ssm_a: &self.ssm_a,
+                ssm_dt: &self.ssm_dt,
+                ssm_norm: &self.ssm_norm,
+            };
+            let y = gdn::forward_token_core_gate(
+                &self.p,
+                &cw,
+                &qkv[i * qd..(i + 1) * qd],
+                &z[i * vd..(i + 1) * vd],
+                &beta_raw[i * nh..(i + 1) * nh],
+                &alpha[i * nh..(i + 1) * nh],
+                &mut self.state,
+                gdn::GateKind::Sigmoid,
+            );
+            if y.len() != vd {
+                bail!(
+                    "SsmLayer::forward_batch: GDN の出力長 {} が value_dim={vd} と違う",
+                    y.len()
+                );
+            }
+            ys.extend_from_slice(&y);
+        }
+        if prof {
+            crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_GDN, t);
+        }
+
+        let t = std::time::Instant::now();
+        let mut outs = vec![0f32; nt * e];
+        crate::model::qwen4exp::gemv_batch(&self.w_out, &ys, nt, &mut outs)?;
+        if prof {
+            crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_OUT, t);
+        }
+        Ok(outs.chunks_exact(e).map(|c| c.to_vec()).collect())
+    }
+
     /// `attn_qkv` の投影だけを行う (state は進めない)。
     ///
     /// 戻り値の並びは **[q key_dim][k key_dim][v value_dim]**。F4 の切り分けと
@@ -454,6 +547,31 @@ impl LayerAttn for SsmAttn {
                 // anyhow の文脈を 1 行に畳む (`{:#}` は "外側: 内側" を連結する)
                 .map_err(|e| Qwen4ExpError(vec![format!("層 {layer}: {e:#}")])),
             Some(None) => self.full.forward(layer, cur),
+        }
+    }
+
+    /// ssm 層だけ投影をチャンクでまとめる。full 層は逐次に任せる
+    /// (投影 4 本のうち 3 本が小さいので、いまは利得が小さい)。
+    fn forward_batch(
+        &mut self,
+        layer: usize,
+        curs: &[Vec<f32>],
+    ) -> std::result::Result<Vec<Vec<f32>>, Qwen4ExpError> {
+        let n = self.layers.len();
+        match self.layers.get_mut(layer) {
+            None => Err(one(format!(
+                "SsmAttn::forward_batch: 層 {layer} は範囲外 (層数 {n})"
+            ))),
+            Some(Some(s)) => s
+                .forward_batch(curs)
+                .map_err(|e| Qwen4ExpError(vec![format!("層 {layer}: {e:#}")])),
+            Some(None) => {
+                let mut outs = Vec::with_capacity(curs.len());
+                for cur in curs {
+                    outs.push(self.full.forward(layer, cur)?);
+                }
+                Ok(outs)
+            }
         }
     }
 

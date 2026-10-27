@@ -1479,6 +1479,20 @@ impl LayerTensors {
 pub trait LayerAttn: Send {
     fn forward(&mut self, layer: usize, cur: &[f32]) -> Result<Vec<f32>>;
 
+    /// チャンクぶんの入力をまとめて処理する (バッチ prefill 用)。
+    ///
+    /// 既定は [`Self::forward`] をトークン順に呼ぶだけなので、数値は逐次と
+    /// まったく同じ。行列積をまとめて GPU へ流せる実装だけが上書きする。
+    /// 上書きする実装は **状態を `forward` と同じ順で進めること**
+    /// (層の中で 1 トークンずつ。KV / GDN の積み方が変わってはいけない)。
+    fn forward_batch(&mut self, layer: usize, curs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        let mut outs = Vec::with_capacity(curs.len());
+        for cur in curs {
+            outs.push(self.forward(layer, cur)?);
+        }
+        Ok(outs)
+    }
+
     /// 層をまたいで呼び出し順を入れ替えても状態が壊れないか。
     ///
     /// 層優先 (トークンをまとめて層ごとに回す) のバッチ prefill は、1 層ぶんの
@@ -2256,16 +2270,15 @@ impl Qwen4Exp {
                 )?;
                 q4prof::add(&q4prof::MIX, t_mix);
                 let t_attn = std::time::Instant::now();
-                let mut outs = Vec::with_capacity(nt);
-                for cur in &curs {
-                    let o = self.attn.forward(il, cur)?;
+                // 投影をチャンクでまとめる実装 (ssm 層) はここで GPU 往復を減らす。
+                let outs = self.attn.forward_batch(il, &curs)?;
+                for o in &outs {
                     if o.len() != e {
                         return Err(one(format!(
                             "層 {il}: attention の出力長 {} が n_embd {e} と違う",
                             o.len()
                         )));
                     }
-                    outs.push(o);
                 }
                 q4prof::add(&q4prof::ATTN, t_attn);
                 for t in 0..nt {
@@ -2966,7 +2979,12 @@ fn gemv_rows_batch(
 /// ([`GgufLinear::gemv`]) は GPU カーネルで計算するため、ここ (CPU 参照) とは
 /// 一致しない。バッチ経路は現状 CPU のみ (GPU 常駐時は `DENNO_PREFILL_BATCH` を
 /// 立てないこと)。
-fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]) -> Result<()> {
+///
+/// 2026-10-27: GPU 常駐の重みをバッチでも使う版 (`grid.y` = トークンのカーネル) を
+/// 実装して A/B したが、802 トークンで **GPU 版のほうが遅かった** (mix 0.30 → 0.72,
+/// attn 1.04 → 1.20, moe 1.70 → 1.75 ms/層)。呼び出しごとの H2D + 起動 + 同期 +
+/// D2H が、この行列サイズ (k=320〜10240) では計算量を上回る。CPU 参照のままにする。
+pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]) -> Result<()> {
     let (k, n) = (w.k(), w.n());
     match w.ty() {
         GgmlType::Q8_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K => gemv_rows_batch(
@@ -3003,16 +3021,46 @@ fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]) -> Result
                 )));
             }
             let rb = bytes.len() / n;
-            let mut row = vec![0.0f32; k];
+            let ty = w.ty();
+            // 行を 1 回だけ f32 に展開し、トークン方向を並列に回す (P-PF-GPU)。
+            // 1 要素の累積は i 昇順の逐次加算のまま (行とトークンは独立) なので、
+            // 逐次版とビット一致する。ルータ (`ffn_gate_inp` 2560→512, F32) は
+            // これで 0.79 → 0.05 ms/層になる (802 トークン実測の見込み)。
+            let mut wf = vec![0.0f32; n * k];
             for r in 0..n {
-                crate::kquant::dequant_row_into(w.ty(), &bytes[r * rb..(r + 1) * rb], &mut row);
+                crate::kquant::dequant_row_into(
+                    ty,
+                    &bytes[r * rb..(r + 1) * rb],
+                    &mut wf[r * k..(r + 1) * k],
+                );
+            }
+            #[cfg(feature = "par")]
+            {
+                use rayon::prelude::*;
+                outs.par_chunks_mut(n).enumerate().for_each(|(t, o)| {
+                    let x = &xs[t * k..(t + 1) * k];
+                    for r in 0..n {
+                        let row = &wf[r * k..(r + 1) * k];
+                        let mut acc = 0.0f32;
+                        for i in 0..k {
+                            acc += row[i] * x[i];
+                        }
+                        o[r] = acc;
+                    }
+                });
+            }
+            #[cfg(not(feature = "par"))]
+            {
                 for t in 0..nt {
                     let x = &xs[t * k..(t + 1) * k];
-                    let mut acc = 0.0f32;
-                    for i in 0..k {
-                        acc += row[i] * x[i];
+                    for r in 0..n {
+                        let row = &wf[r * k..(r + 1) * k];
+                        let mut acc = 0.0f32;
+                        for i in 0..k {
+                            acc += row[i] * x[i];
+                        }
+                        outs[t * n + r] = acc;
                     }
-                    outs[t * n + r] = acc;
                 }
             }
             #[cfg(test)]
@@ -3142,6 +3190,7 @@ fn moe_ffn_quant_batch(
     }
 
     // 1. ルータ (バッチ)
+    let t_router = std::time::Instant::now();
     let mut probs = vec![0.0f32; nt * ne];
     gemv_batch(&lw.gate_inp, xs, nt, &mut probs)
         .map_err(|err| one(format!("層 {}: ffn_gate_inp (batch): {err}", lw.il)))?;
@@ -3164,6 +3213,7 @@ fn moe_ffn_quant_batch(
         sels.push(sel);
         weights.push(w);
     }
+    moe_sub_add(0, t_router.elapsed());
 
     // 3. 選択 expert の重みを先に読み始める (逐次版と同じ expert を同じ順で)
     for sel in &sels {
@@ -3175,6 +3225,7 @@ fn moe_ffn_quant_batch(
     }
 
     // 4. expert を index 昇順に、同じ expert を選んだトークンをまとめて回す
+    let t_experts = std::time::Instant::now();
     let mut out = vec![0.0f32; nt * e];
     for ei in 0..ne {
         let picks: Vec<(usize, usize)> = sels
@@ -3222,6 +3273,8 @@ fn moe_ffn_quant_batch(
     }
 
     // 5. shared expert (バッチ)。係数は sigmoid(gate_inp_shexp @ x)
+    moe_sub_add(1, t_experts.elapsed());
+    let t_shared = std::time::Instant::now();
     let sff = lw.gate_shexp.n();
     let mut sact = vec![0.0f32; nt * sff];
     gemv_batch(&lw.gate_shexp, xs, nt, &mut sact)
@@ -3246,6 +3299,7 @@ fn moe_ffn_quant_batch(
             out[t * e + d] += sh[t * e + d] * sgw;
         }
     }
+    moe_sub_add(2, t_shared.elapsed());
 
     Ok(out)
 }
