@@ -114,8 +114,9 @@ pub struct FlashBudget {
     pub weights_dev: u64,
     /// その本数
     pub weights_dev_tensors: usize,
-    /// 1 回の GEMV が作る一時バッファのピーク (`moe_gemv_dev` の x + out)。
-    /// 呼び出しごとに alloc/free されるので**積み上がらない**。
+    /// `moe_gemv_dev` の入出力スクラッチの上限 (x + out)。
+    /// P-pf-moe-scratch 以降は thread_local の grow-only で**常駐**する
+    /// (1 スレッドあたり最大 max_k + max_n 要素。呼び出しスレッド数だけ積み上がる)。
     pub staging_peak: u64,
     /// q4 経路のスクラッチ arena (1 GiB チャンク単位・grow-only)。
     /// Flash-Next は q4 の線形層を持たないので 0。
@@ -141,7 +142,9 @@ pub fn n_full_layers(n_layer: usize, full_attn_interval: usize) -> usize {
 ///
 /// - `kv_host_max = full 層数 × max_ctx × kv_dim × 2(K,V) × 4 B`
 ///   (`AttnCache` のレイアウト。層ごとに k/v を `Vec<f32>` で持つ)
-/// - `staging_peak = (max_k + max_n) × 4 B` (`moe_gemv_dev` が 1 呼び出しで作る 2 本)
+/// - `staging_peak = (max_k + max_n) × 4 B` (`moe_gemv_dev` の x + out の
+///   スクラッチ上限。P-pf-moe-scratch で per-call alloc/free から grow-only の
+///   常駐に変わったが、**上限の式と値は同じ**なので項は増やさない)
 /// - `arena_dev = q4 の重みがあるときだけ 1 GiB` (チャンク単位。無ければ 0)
 pub fn flash_budget(
     totals: WeightTotals,

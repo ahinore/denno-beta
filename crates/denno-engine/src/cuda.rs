@@ -1227,29 +1227,92 @@ impl CudaCtx {
         }
 
         self.make_current()?;
-        let dev_x = DevBuffer::from_slice(x)?;
-        let dev_o = DevBuffer::alloc(n_out * 4)?;
+        // P-pf-moe-scratch: 入出力の一時バッファは thread_local の grow-only
+        // スクラッチから取る (従来は 1 呼び出しごとに cuMemAlloc 2 本 +
+        // cuMemFree 2 本を回していた。decode 中に数万回)。
+        // 数値は不変: カーネル・引数・発行順はそのままで、x は n_in 要素・
+        // out は n_out 要素の範囲しか読み書きしない (前回の残りは読まない)。
         const MOE_ROWS_PER_BLOCK: usize = 4; // kernels_moe.cu の MOE_ROWS と一致
         let shmem = (MOE_ROWS_PER_BLOCK * rb) as u32;
-        unsafe {
-            let (mut pw, mut px, mut po) = (dev_w.ptr, dev_x.ptr, dev_o.ptr);
-            let (mut n_in_c, mut n_out_c, mut rb_c) =
-                (n_in as c_int, n_out as c_int, rb as c_int);
-            let mut args = [
-                &mut pw as *mut _ as *mut c_void,
-                &mut px as *mut _ as *mut c_void,
-                &mut po as *mut _ as *mut c_void,
-                &mut n_in_c as *mut _ as *mut c_void,
-                &mut n_out_c as *mut _ as *mut c_void,
-                &mut rb_c as *mut _ as *mut c_void,
-            ];
-            let grid = ((n_out + MOE_ROWS_PER_BLOCK - 1) / MOE_ROWS_PER_BLOCK) as u32;
-            self.launch_async(f, (grid, 1, 1), (256, 1, 1), shmem, &mut args)?;
-            self.sync()?;
-        }
-        let got: Vec<f32> = dev_o.to_vec(n_out)?;
-        out.copy_from_slice(&got);
+        let grid = ((n_out + MOE_ROWS_PER_BLOCK - 1) / MOE_ROWS_PER_BLOCK) as u32;
+        MOE_SCRATCH.with(|cell| -> Result<()> {
+            let mut s = cell.borrow_mut();
+            MoeScratch::ensure(&mut s.x, n_in * 4)?;
+            MoeScratch::ensure(&mut s.o, n_out * 4)?;
+            let xb = s.x.as_ref().expect("x は ensure 済み");
+            let ob = s.o.as_ref().expect("o は ensure 済み");
+            xb.copy_from(x)?;
+            // H2D の計上は従来の `from_slice` と同じ (1 呼び出し = n_in * 4 B)。
+            dbg_htod(n_in * 4);
+            unsafe {
+                let (mut pw, mut px, mut po) = (dev_w.ptr, xb.ptr, ob.ptr);
+                let (mut n_in_c, mut n_out_c, mut rb_c) =
+                    (n_in as c_int, n_out as c_int, rb as c_int);
+                let mut args = [
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut px as *mut _ as *mut c_void,
+                    &mut po as *mut _ as *mut c_void,
+                    &mut n_in_c as *mut _ as *mut c_void,
+                    &mut n_out_c as *mut _ as *mut c_void,
+                    &mut rb_c as *mut _ as *mut c_void,
+                ];
+                self.launch_async(f, (grid, 1, 1), (256, 1, 1), shmem, &mut args)?;
+                self.sync()?;
+            }
+            let got: Vec<f32> = ob.to_vec(n_out)?;
+            out.copy_from_slice(&got);
+            Ok(())
+        })?;
         Ok(true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P-pf-moe-scratch: `moe_gemv_dev` の入出力スクラッチ (thread_local, grow-only)
+// ---------------------------------------------------------------------------
+//
+// 背景 (pf_arena の調査 = 85cd04d8): `--max-ctx` を上げると初回リクエストの
+// 重み登録が失敗する (`要求 644 MiB / 空き 7 MiB`)。max_ctx は GPU 側の確保に
+// 入っていないので、残る原因は「1 GEMV = cuMemAlloc 2 本 + cuMemFree 2 本」を
+// decode 中に数万回繰り返すことによる断片化。行列の形はモデルで固定なので、
+// スレッドごとに grow-only で持ち回す (既存 `Scratch` と同じ規約)。
+//
+// - 確保するのは「今の容量 < 今回の要求」のときだけ。より大きい 1 本に
+//   置き換え、古い方はその場で drop = cuMemFree する (毎回は free しない)。
+// - 数値は不変: カーネル・引数・発行順・丸め順は 1 つも変えない。x は毎回
+//   `n_in` 要素を先頭から書き、out は `n_out` 要素だけ読む (前回の残りは読まない)。
+// - スレッド終了時の解放はベストエフォート (`Scratch` と同じ規約)。
+struct MoeScratch {
+    x: Option<DevBuffer>, // >= n_in * 4 B
+    o: Option<DevBuffer>, // >= n_out * 4 B
+}
+
+thread_local! {
+    static MOE_SCRATCH: std::cell::RefCell<MoeScratch> =
+        std::cell::RefCell::new(MoeScratch { x: None, o: None });
+}
+
+/// スクラッチの確保サイズを決める純関数 (GPU 無しで検証できる)。
+///
+/// - `cur >= want` -> `None` (確保しない = 同じサイズの繰り返しで増えない)
+/// - `cur <  want` -> `Some(want)` (そのサイズへ grow。0 バイトは確保しない)
+///
+/// 返す値は `want` に対して単調 (要求が増えれば返る値も増える)。
+fn moe_scratch_alloc_bytes(cur: usize, want: usize) -> Option<usize> {
+    if cur >= want {
+        None
+    } else {
+        Some(want.max(1))
+    }
+}
+
+impl MoeScratch {
+    fn ensure(cap: &mut Option<DevBuffer>, want: usize) -> Result<()> {
+        let cur = cap.as_ref().map(|b| b.bytes()).unwrap_or(0);
+        if let Some(bytes) = moe_scratch_alloc_bytes(cur, want) {
+            *cap = Some(DevBuffer::alloc(bytes)?);
+        }
+        Ok(())
     }
 }
 
@@ -17108,5 +17171,45 @@ mod p59_dedup_tests {
         assert!(parse_q4_dedup(Some("1")));
         assert!(parse_q4_dedup(Some("off")));
         assert!(!parse_q4_dedup(Some("0")));
+    }
+
+    // -----------------------------------------------------------------------
+    // P-pf-moe-scratch: `moe_gemv_dev` のスクラッチ (grow-only) のサイズ決定。
+    // GPU 無しで検証できる純関数だけを見る。
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn moe_scratch_grows_only_on_larger_request() {
+        // 初回は必ず確保する (0 -> want)。
+        assert_eq!(moe_scratch_alloc_bytes(0, 1024), Some(1024));
+        // 足りていれば確保しない = 同じサイズの繰り返しで alloc/free しない。
+        assert_eq!(moe_scratch_alloc_bytes(1024, 1024), None);
+        assert_eq!(moe_scratch_alloc_bytes(2048, 1024), None);
+        // 大きくなったときだけ、そのサイズで 1 回 grow する。
+        assert_eq!(moe_scratch_alloc_bytes(1024, 2048), Some(2048));
+        assert_eq!(moe_scratch_alloc_bytes(2048, 2048), None);
+        // 0 バイトの確保はしない (呼び出し側の形状検査で want > 0 だが、
+        // 純関数として 0 を渡しても 0 バイト確保にしない)。
+        assert_eq!(moe_scratch_alloc_bytes(0, 0), None);
+    }
+
+    #[test]
+    fn moe_scratch_alloc_is_monotone_in_want() {
+        // 要求サイズが増えると、返るサイズは減らない (単調)。
+        let caps = [0usize, 1, 1024, 4096, 1 << 20];
+        let wants = [0usize, 1, 1000, 1024, 4096, (1 << 20) + 1];
+        for &cur in &caps {
+            let mut prev = 0usize;
+            for &want in &wants {
+                if let Some(bytes) = moe_scratch_alloc_bytes(cur, want) {
+                    assert!(bytes >= want.max(1), "cur={cur} want={want}: {bytes}");
+                    assert!(bytes >= prev, "cur={cur} want={want}: 単調でない");
+                    prev = bytes;
+                }
+                // 確保しない場合も含め、確保後は必ず要求以上になる。
+                let now = moe_scratch_alloc_bytes(cur, want).unwrap_or(cur);
+                assert!(now >= want, "cur={cur} want={want}: 確保後も不足");
+            }
+        }
     }
 }
