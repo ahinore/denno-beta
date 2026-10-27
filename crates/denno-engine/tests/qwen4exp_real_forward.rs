@@ -702,6 +702,8 @@ fn real_model_prefill_timings() {
     // 逐次
     let mut m1 = build(&parts);
     let _ = m1.forward_prefill_with(&ctx[..3], false).expect("warm-up seq");
+    denno_engine::model::qwen4exp::q4prof::reset();
+    let _ = denno_engine::model::qwen4exp::moe_sub_take();
     let t0 = Instant::now();
     let l1 = m1.forward_prefill_with(&ctx, false).expect("prefill seq");
     let d_seq = t0.elapsed();
@@ -709,6 +711,9 @@ fn real_model_prefill_timings() {
     // バッチ
     let mut m2 = build(&parts);
     let _ = m2.forward_prefill_with(&ctx[..3], false).expect("warm-up batch");
+    let seq_prof = prof_line("seq");
+    denno_engine::model::qwen4exp::q4prof::reset();
+    let _ = denno_engine::model::qwen4exp::moe_sub_take();
     let t1 = Instant::now();
     let l2 = m2.forward_prefill_with(&ctx, true).expect("prefill batch");
     let d_bat = t1.elapsed();
@@ -739,5 +744,25 @@ fn real_model_prefill_timings() {
         argmax(&l1),
         argmax(&l2)
     );
+    if let Some(a) = seq_prof {
+        eprintln!("{a}");
+    }
+    if let Some(b) = prof_line("batch") {
+        eprintln!("{b}");
+    }
     assert_eq!(diff, 0, "バッチ経路の logits が逐次と一致しない");
+}
+
+/// q4prof の累積を 1 行にする (層あたりに割る)。計測していなければ None。
+fn prof_line(tag: &str) -> Option<String> {
+    let (ple, mix, attn, moe, n) = denno_engine::model::qwen4exp::q4prof::dump();
+    if n == 0 {
+        return None;
+    }
+    let per = |v: f64| v / n as f64;
+    let (r, ex, sh) = denno_engine::model::qwen4exp::moe_sub_take();
+    Some(format!(
+        "PHASE {tag} 層あたり ple {:.2} / mix {:.2} / attn {:.2} / moe {:.2} ms (moe内訳 router {:.2} / experts {:.2} / shared {:.2}, {n} 層分)",
+        per(ple), per(mix), per(attn), per(moe), per(r), per(ex), per(sh)
+    ))
 }
