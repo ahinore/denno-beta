@@ -1643,8 +1643,28 @@ impl ExpertW {
     fn gemv(&self, e: usize, x: &[f32], out: &mut [f32]) -> Result<()> {
         let s = self.slice(e)?;
         let (n_in, n_out) = (self.n_in, self.n_out);
+        // P-MOE-G12: 重みが VRAM に載っていれば GPU で計算する。`DENNO_CUDA=1` の
+        // ときだけ有効 (既定は CPU)。expert 全体で 1.3 GB なので 32 GB に収まる。
+        #[cfg(feature = "cuda")]
+        {
+            if crate::cuda::maybe_gpu_gguf_gemv_into(self.gpu_uid(e), self.ty, s, n_in, n_out, x, out)
+            {
+                return Ok(());
+            }
+        }
         moe_expert::expert_gemv_any(self.ty, s, n_in, n_out, x, out)
             .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))
+    }
+
+    /// GPU の重みキャッシュ用の uid。**衝突しないこと**が前提 (衝突すると別テンソルの
+    /// 重みで計算して静かに壊れる)。`file` と `abs` と `e` を桁で分けて詰める。
+    #[cfg(feature = "cuda")]
+    fn gpu_uid(&self, e: usize) -> u64 {
+        const BASE: u64 = 0xF000_0000_0000_0000;
+        debug_assert!(self.abs < (1u64 << 40), "abs が 1 TB を超える");
+        debug_assert!(e < 1024, "expert 数が 1024 を超える");
+        BASE | ((self.file as u64 & 0x3FF) << 50) | ((self.abs & ((1u64 << 40) - 1)) << 10)
+            | (e as u64 & 0x3FF)
     }
 
     /// [`ExpertW::gemv`] の**行並列を使わない**版 (P-MOE-G5)。
@@ -1655,6 +1675,15 @@ impl ExpertW {
     fn gemv_seq(&self, e: usize, x: &[f32], out: &mut [f32]) -> Result<()> {
         let s = self.slice(e)?;
         let (n_in, n_out) = (self.n_in, self.n_out);
+        // GPU 経路は行並列の概念が無いので、外側が expert 並列でもそのまま使える
+        // (P-MOE-G12)。
+        #[cfg(feature = "cuda")]
+        {
+            if crate::cuda::maybe_gpu_gguf_gemv_into(self.gpu_uid(e), self.ty, s, n_in, n_out, x, out)
+            {
+                return Ok(());
+            }
+        }
         moe_expert::expert_gemv_any_seq(self.ty, s, n_in, n_out, x, out)
             .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))
     }
