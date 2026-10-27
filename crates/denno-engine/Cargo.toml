@@ -38,6 +38,9 @@ cuda = []
 [dev-dependencies]
 # 統合テスト (tests/) から test-utils (ダミーモデル) を使うための自己参照。
 denno-engine = { path = ".", features = ["test-utils"] }
+# 統合テストが rayon のプールを明示して「スレッド数を変えても値が動かない」ことを
+# 見るため (本体と同じ版を指す)。
+rayon = "1"
 
 # scripts/bench_all.sh 用のベンチ例は `denno_engine::cuda` を直接呼ぶので、
 # cuda feature 無しの `cargo test -p denno-engine` でビルドしようとすると
