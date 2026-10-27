@@ -584,6 +584,14 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     let t = Instant::now();
     let f = GgufFile::open_split(&parts).context("分割 GGUF を開けない")?;
     let tok = GgufTokenizer::from_gguf(&f).context("トークナイザを組めない")?;
+    // P-pf-arena: どの項が VRAM を食うかを実測前に 1 行で出す。
+    // デバイス側 (weights / staging / arena) に max_ctx は入らず、
+    // max_ctx に比例するのはホスト側の KV だけ (式は gpu_budget の doc)。
+    {
+        let p = Qwen4ExpParams::from_meta(&f).context("メタデータを読めない")?;
+        let budget = denno_engine::gpu_budget::flash_budget_from_gguf(&f, &p, cfg.max_ctx);
+        eprintln!("{}", denno_engine::gpu_budget::budget_line(&budget));
+    }
     drop(f);
     let batch = std::env::var("DENNO_PREFILL_BATCH").ok().as_deref() != Some("0");
     let chunk = std::env::var("DENNO_PREFILL_BATCH_CHUNK").unwrap_or_else(|_| "8".into());
@@ -619,6 +627,13 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                     eprintln!("[flash] リクエスト失敗: {e:#}");
                 }
                 eprintln!("[flash] request done {:.1}s", t.elapsed().as_secs_f64());
+                // P-pf-arena: 重み登録の成否をリクエスト単位で 1 行 (登録を試みた
+                // ときだけ)。GPU_BROKEN のラッチはプロセス寿命なので reset しない。
+                let st = denno_engine::gpu_budget::weight_upload_stats();
+                if st.attempted() > 0 {
+                    eprintln!("{}", denno_engine::gpu_budget::summary_line(&st));
+                    denno_engine::gpu_budget::reset_weight_upload_stats();
+                }
             }
             Err(e) => eprintln!("[flash] accept 失敗: {e}"),
         }
