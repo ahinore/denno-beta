@@ -2904,23 +2904,17 @@ fn gemv_rows_batch(
         )));
     }
     let rb = bytes.len() / n;
-    for r in 0..n {
-        let row = &bytes[r * rb..(r + 1) * rb];
-        for t in 0..nt {
-            let x = &xs[t * k..(t + 1) * k];
-            let o = &mut outs[t * n + r..t * n + r + 1];
-            let res = match kern {
-                // モデルの Q8_0 は fast_q8 = true (linear() がそう組む) なので、
-                // GgufLinear::gemv と同じく融合カーネルの入口を使う。
-                GemvKernel::Linear if ty == GgmlType::Q8_0 => {
-                    moe_expert::expert_gemv_q8_fast(row, k, 1, x, o)
-                }
-                GemvKernel::Linear => moe_expert::expert_gemv(ty, row, k, 1, x, o),
-                GemvKernel::Expert => moe_expert::expert_gemv_any(ty, row, k, 1, x, o),
-            };
-            res.map_err(|err| one(format!("gemv_batch: 行 {r} トークン {t}: {err}")))?;
-        }
-    }
+    // H3 のバッチ GEMV に委譲する。行を rayon で分け、**重み行のデコードを 1 回だけ**
+    // 行って nt トークンで使い回す。以前はここで「行 → トークン」の二重ループを
+    // 回していたため、行の再利用は効くが並列化が無く、逐次経路とほぼ同じ時間だった
+    // (実測 246.1 → 241.3 ms/tok)。
+    //
+    // `kern` は Linear / Expert の入口の区別だが、どちらも同じカーネルに落ちるので
+    // ここでは使わない (Q8_0 の fast_q8 も expert_gemv_any と同じ融合カーネル)。
+    let _ = kern;
+    let _ = rb;
+    moe_expert::expert_gemm_any(ty, bytes, k, n, xs, nt, outs)
+        .map_err(|err| one(format!("gemv_batch: {err}")))?;
     #[cfg(test)]
     GEMV_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
