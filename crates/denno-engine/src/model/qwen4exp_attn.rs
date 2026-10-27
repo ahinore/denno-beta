@@ -784,15 +784,14 @@ impl FullAttn {
         if slot.is_none() {
             bail!("FullAttn::forward: 層 {layer} は ssm 層で full attention の担当外 (F5 で合成する)");
         }
-        let pos = self.pos;
-        // 番人を先に見る。二重 push のときはキャッシュ長が pos+1 になるので、
-        // 長さの検査を先に置くと「既に積んである」が影に隠れてしまう。
-        if self.pushed[layer] {
-            bail!("FullAttn::forward: 層 {layer} はこのトークン (pos {pos}) で既に積んである");
-        }
-        let len = self.cache.len(layer)?;
-        if len != pos {
-            bail!("FullAttn::forward: 層 {layer} のキャッシュ長 {len} が pos {pos} と違う");
+        // 位置は**層ごとのキャッシュ長**から取る。層優先の prefill では、層 L の
+        // t 番目を積む時点で他層は既に t+1 番目まで進んでいるため、全層で共有する
+        // `pos` は使えない (逐次経路では全層が同じ長さなので値は一致する)。
+        // 二重 push は起きない: 積んだ直後にその層の長さが 1 増えるので、次に同じ
+        // 層へ来る入力は必ず pos+1 として扱われる。
+        let pos = self.cache.len(layer)?;
+        if pos >= self.cache.max_ctx() {
+            bail!("FullAttn::forward: 層 {layer} が容量 max_ctx = {} に達した", self.cache.max_ctx());
         }
         let l = self.layers[layer].as_mut().expect("上の is_none で除外済み");
         // QSA 層なら、このトークンの生キーを indexer に積んで見える cell を貰う。
@@ -807,12 +806,9 @@ impl FullAttn {
             None => l.forward_token(cur, &mut self.cache, layer, pos)?,
         };
         self.pushed[layer] = true;
-        // 位置は 1 トークンにつき 1 回だけ進める。full attention 層は 1 トークンで
-        // 12 本ぶん呼ばれるので、全層が揃ったときだけ進める。
-        let all = (0..self.layers.len()).all(|il| self.layers[il].is_none() || self.pushed[il]);
-        if all {
+        // 対外的な「何トークン進んだか」は最大値で持つ (診断とリセット用)。
+        if self.pos < pos + 1 {
             self.pos = pos + 1;
-            self.pushed.iter_mut().for_each(|b| *b = false);
         }
         Ok(out)
     }
