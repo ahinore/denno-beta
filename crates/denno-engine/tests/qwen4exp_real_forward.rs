@@ -395,6 +395,8 @@ fn real_model_layer_timings() {
     // 重みの VRAM 転送を行うので、これを計測に含めると GPU 側だけ過大に出る。
     let _ = m2.forward_token(&[16, 10, 16]).expect("計測用の warm-up");
     denno_engine::model::qwen4exp::q4prof::reset();
+    // moe 内訳のカウンタも同じ位置で 0 に戻す (warm-up 2 回ぶんを混ぜない)。
+    let _ = denno_engine::model::qwen4exp::moe_sub_take();
     let t0 = std::time::Instant::now();
     let logits = m2
         .forward_token_with(&[16, 10, 16, 14876, 30], |_il, _res| {
