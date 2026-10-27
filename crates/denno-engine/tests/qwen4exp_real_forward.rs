@@ -691,7 +691,8 @@ fn real_model_prefill_timings() {
     let build = |parts: &[std::path::PathBuf]| {
         let f = GgufFile::open_split(parts).expect("分割 GGUF を開けない");
         let p = Qwen4ExpParams::from_meta(&f).expect("メタデータを読めない");
-        let full = FullAttn::from_gguf(&f, &p, 32).expect("FullAttn");
+        // prefill は warm-up 3 + 本番 32 を積むので、容量は 128 にしておく。
+        let full = FullAttn::from_gguf(&f, &p, 128).expect("FullAttn");
         let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
         Qwen4Exp::with_attn(&f, Box::new(attn)).expect("モデルを組めない")
     };
