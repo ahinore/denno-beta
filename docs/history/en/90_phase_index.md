@@ -4,7 +4,7 @@
 > Japanese original: [../90_phase_index.md](../90_phase_index.md)
 
 This document is a **mechanically built index**. It takes the `## Phases covered` table of each volume,
-lines them up and re-sorts them by date (143 rows). **The authoritative content is the body of each volume**;
+lines them up and re-sorts them by date (153 rows). **The authoritative content is the body of each volume**;
 this is a table for looking up "when, in which commit, and in which volume it is written".
 
 - The same phase can appear in two volumes (P11 is API and decode, s53c is the accepted form of the API and the isolation of quality).
@@ -179,3 +179,13 @@ this is a table for looking up "when, in which commit, and in which volume it is
 | 2026-10-27 | P-MOE-F15 | `74e41d3` | Parallelized the GEMV row direction | 30 |
 | 2026-10-27 | P-MOE-F16 | `a42e144` | Parallelized the GDN delta rule over heads | 30 |
 | 2026-10-27 | P-MOE-F17 | `a469224` | Stop-token decode did not append the stop token to `tokens` | 30 |
+| 2026-10-27 | P-MOE-G1 | `6d3fc13` | Wire ExpertCache into the MoE expert path (sealed at a default of 0) | 30 |
+| 2026-10-27 | P-MOE-G2 | `e4e5547` | Wire the QSA indexer into the full attention path (`DENNO_QSA=1`) | 30 |
+| 2026-10-27 | P-MOE-G3 / G4 | not merged | Widening to AVX-512 only gains −12 ms in mix for Q8_0 | 30 |
+| 2026-10-27 | P-MOE-G5 | `3dc3612` | Parallelize the expert loop with rayon, 355 → 278 ms | 30 |
+| 2026-10-27 | P-MOE-G6 | not merged | Keeping dense weights resident in RAM makes no difference | 30 |
+| 2026-10-27 | P-MOE-G7 | no commit | Flattening expert × row-block parallelism is within the noise | 30 |
+| 2026-10-27 | P-MOE-G8 | not merged | Head parallelism for attention moves attn 90 → 93 ms | 30 |
+| 2026-10-27 | P-MOE-G9 | no commit | madvise read-ahead for the selected experts makes no difference | 30 |
+| 2026-10-27 | P-MOE-G10 | not merged | Software prefetch in the GEMV row loop makes no difference | 30 |
+| 2026-10-27 | H1 | no commit | Reusing GPU scratch takes 302 → 313 ms | 30 |
