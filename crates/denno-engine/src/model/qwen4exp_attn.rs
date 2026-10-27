@@ -52,12 +52,16 @@
 //! [`GgufLinear`] で持つ (f32 へ展開しない)。`attn_q_norm` / `attn_k_norm`
 //! (各 `[head_dim]` = 1 KB) だけ f32 常駐。
 
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
 use anyhow::{bail, Context, Result};
 
 use crate::gguf::GgufFile;
 use crate::kquant::GgmlType;
 use crate::model::linear_gguf::GgufLinear;
-use crate::model::qwen4exp::{LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams};
+use crate::model::qwen4exp::{
+    gemv_batch, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams,
+};
 use crate::model::qwen4exp_qsa::QsaState;
 use crate::quant::WeightBlocks;
 use crate::tensor::{qknorm_rows_inplace, softmax};
@@ -280,6 +284,18 @@ impl AttnCache {
 // ---------------------------------------------------------------------------
 // 1 層ぶんの重み
 // ---------------------------------------------------------------------------
+
+/// [`AttnLayer::attend_batch`] が走った回数。
+///
+/// 緑 = 経路が発動した証拠ではないので、テストが「バッチ版が実際に呼ばれた」
+/// ことをこれで見る。層×チャンクで 1 回だけ増える (relaxed の fetch_add) ので
+/// 実測への影響は無視できる。
+static ATTN_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// [`AttnLayer::attend_batch`] が走った回数 (プロセス通算)。
+pub fn attend_batch_calls() -> usize {
+    ATTN_BATCH_CALLS.load(AtomicOrdering::Relaxed)
+}
 
 /// full attention 層 1 つぶんの重み。
 pub struct AttnLayer {
@@ -540,6 +556,117 @@ impl AttnLayer {
                 let p = scores[i];
                 for d in 0..dh {
                     out[h * dh + d] += p * vrow[d];
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// チャンクぶんの attention を **KV を 1 回走査する形** で回す
+    /// (バッチ prefill 用)。
+    ///
+    /// `qs` は `nt * q_dim` (トークン順、各 head は正規化 + rope 済み)。
+    /// 呼ぶ前に層 `layer` のキャッシュへ今回の `nt` 行を push してあること
+    /// (末尾 `nt` 行が今回のぶん)。トークン `t` が見るのは `0..=(base + t)`
+    /// (`base = cache.len(layer) - nt`) で、[`AttnLayer::attend`] を
+    /// `len = base + t + 1` で呼んだ場合と同じ範囲 (因果性はここで閉じる)。
+    ///
+    /// 丸め順序の契約 (1 トークン版と同一):
+    /// - スコアの内積は d 昇順 (`acc += q[d] * k[d]`)、`* kq_scale` は最後に 1 回
+    /// - softmax は [`softmax`] (max 引き → exp → 前からの和)
+    /// - 出力の重み付き和は **j 昇順**の逐次加算 (`out[d] += p * v[d]`)
+    ///
+    /// ループを j 外・t 内に入れ替えても、各 (トークン, head, d) の加算列は
+    /// j 昇順のまま、各 (トークン, 位置, head) の内積の加算列は d 昇順のまま
+    /// なので、値は 1 トークン版とビット一致する。変わるのは「同じ (t, j, d) を
+    /// 計算する順番」だけ。KV は kv head ごとに 1 回だけ読む (GQA の q head は
+    /// 同じ行を共有する)。
+    pub fn attend_batch(
+        &self,
+        qs: &[f32],
+        nt: usize,
+        cache: &AttnCache,
+        layer: usize,
+    ) -> Result<Vec<f32>> {
+        let qd = self.q_dim();
+        if qs.len() != nt * qd {
+            bail!(
+                "attend_batch: q の長さ {} が nt({nt}) * q_dim({qd}) と違う",
+                qs.len()
+            );
+        }
+        let row = cache.row();
+        if row != self.kv_dim() {
+            bail!(
+                "attend_batch: キャッシュの row = {row} が kv_dim = {} と違う",
+                self.kv_dim()
+            );
+        }
+        let len = cache.len(layer)?;
+        if nt > len {
+            bail!("attend_batch: nt({nt}) が積まれている本数 {len} より多い (層 {layer})");
+        }
+        let base = len - nt;
+        let mut out = vec![0f32; nt * qd];
+        if nt == 0 {
+            return Ok(out);
+        }
+        ATTN_BATCH_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        let kb = cache.k(layer)?;
+        let vb = cache.v(layer)?;
+        let dh = self.head_dim;
+        let ncols = len;
+
+        // q head → kv head のまとめ (GQA で同じ kv 行を共有する head を 1 度に回す)。
+        let mut groups: Vec<Vec<usize>> = vec![Vec::new(); self.n_head_kv];
+        for h in 0..self.n_head {
+            groups[self.kv_head(h)].push(h);
+        }
+        let gmax = groups.iter().map(|g| g.len()).max().unwrap_or(0);
+        let mut scores = vec![0f32; gmax * nt * ncols];
+
+        for (hk, group) in groups.iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let ng = group.len();
+            // 1) スコア: j (位置) を外・t (トークン) を内にして k 行を 1 回だけ読む。
+            for j in 0..ncols {
+                let krow = &kb[j * row + hk * dh..][..dh];
+                let t0 = j.saturating_sub(base);
+                for (li, &h) in group.iter().enumerate() {
+                    let sbase = (li * nt) * ncols;
+                    for t in t0..nt {
+                        let qrow = &qs[t * qd + h * dh..][..dh];
+                        let mut acc = 0f32;
+                        for d in 0..dh {
+                            acc += qrow[d] * krow[d];
+                        }
+                        scores[sbase + t * ncols + j] = acc * self.kq_scale;
+                    }
+                }
+            }
+            // 2) softmax はトークンごとに可視範囲だけ ([`softmax`] そのもの)。
+            for li in 0..ng {
+                for t in 0..nt {
+                    let nvis = base + t + 1;
+                    let o = (li * nt + t) * ncols;
+                    softmax(&mut scores[o..o + nvis]);
+                }
+            }
+            // 3) 出力: j 昇順の逐次加算 (v 行も 1 回だけ読む)。
+            for j in 0..ncols {
+                let vrow = &vb[j * row + hk * dh..][..dh];
+                let t0 = j.saturating_sub(base);
+                for (li, &h) in group.iter().enumerate() {
+                    let sbase = (li * nt) * ncols;
+                    for t in t0..nt {
+                        let p = scores[sbase + t * ncols + j];
+                        let orow = &mut out[t * qd + h * dh..][..dh];
+                        for d in 0..dh {
+                            orow[d] += p * vrow[d];
+                        }
+                    }
                 }
             }
         }
@@ -810,6 +937,112 @@ impl FullAttn {
         }
         Ok(out)
     }
+
+    /// チャンクぶんの full attention 層をまとめて回す (バッチ prefill 用)。
+    ///
+    /// [`FullAttn::forward_token`] をトークン順に呼んだ場合とビット一致する。
+    /// 変えるのは (1) 4 本の投影をチャンクで 1 回にまとめる ([`gemv_batch`] は
+    /// 1 トークン版と同じカーネル・同じ丸め順)、(2) `attend` を
+    /// [`AttnLayer::attend_batch`] (KV を 1 回走査) にする、の 2 点だけ。
+    /// KV キャッシュへは `forward_token` と同じくトークン順に push するので、
+    /// 積まれる内容も順序も同じ。位置は層ごとのキャッシュ長から取る
+    /// (`forward_token` と同じ規則)。
+    ///
+    /// 1 トークンのチャンクと QSA 層 (`DENNO_QSA=1` で選択が有効な層) は
+    /// 逐次経路 ([`FullAttn::forward_token`]) に任せる。QSA の選択結果は
+    /// トークンごとに依存するので dense のバッチ経路と混ぜない。
+    pub fn forward_batch(&mut self, layer: usize, curs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        let nt = curs.len();
+        if nt == 0 {
+            return Ok(Vec::new());
+        }
+        for (i, cur) in curs.iter().enumerate() {
+            if cur.len() != self.n_embd {
+                bail!(
+                    "FullAttn::forward_batch: トークン {i} の入力長 {} が n_embd = {} と違う",
+                    cur.len(),
+                    self.n_embd
+                );
+            }
+        }
+        let Some(slot) = self.layers.get(layer) else {
+            bail!(
+                "FullAttn::forward_batch: 層 {layer} は範囲外 (n_layer = {})",
+                self.layers.len()
+            );
+        };
+        if slot.is_none() {
+            bail!("FullAttn::forward_batch: 層 {layer} は ssm 層で full attention の担当外");
+        }
+        if nt == 1 || matches!(&self.qsa, Some(q) if q.is_qsa(layer)) {
+            let mut outs = Vec::with_capacity(nt);
+            for cur in curs {
+                outs.push(self.forward_token(layer, cur)?);
+            }
+            return Ok(outs);
+        }
+        let base = self.cache.len(layer)?;
+        if base + nt > self.cache.max_ctx() {
+            bail!(
+                "FullAttn::forward_batch: 層 {layer} が容量 max_ctx = {} を超える ({base} + {nt})",
+                self.cache.max_ctx()
+            );
+        }
+        let n_embd = self.n_embd;
+        let mut flat = Vec::with_capacity(nt * n_embd);
+        for cur in curs {
+            flat.extend_from_slice(cur);
+        }
+
+        let l = self.layers[layer]
+            .as_mut()
+            .expect("上の is_none で除外済み");
+        let qd = l.q_dim();
+        let kv = l.kv_dim();
+        let qg = l.qg_dim();
+
+        // 投影はチャンクで 1 回ずつ (トークンごとの `gemv` と同じカーネル)。
+        let mut qgs = vec![0f32; nt * qg];
+        gemv_batch(&l.wq, &flat, nt, &mut qgs)?;
+        let mut ks = vec![0f32; nt * kv];
+        gemv_batch(&l.wk, &flat, nt, &mut ks)?;
+        let mut vs = vec![0f32; nt * kv];
+        gemv_batch(&l.wv, &flat, nt, &mut vs)?;
+
+        // 正規化 + rope はトークンごと (pos が違う)。k は rope 後にキャッシュへ積む。
+        let mut qs = vec![0f32; nt * qd];
+        let mut gates = vec![0f32; nt * qd];
+        for t in 0..nt {
+            let (mut q, gate) = l.split_q_gate(&qgs[t * qg..(t + 1) * qg])?;
+            let pos = base + t;
+            l.norm_rope_q(&mut q, pos)?;
+            qs[t * qd..(t + 1) * qd].copy_from_slice(&q);
+            gates[t * qd..(t + 1) * qd].copy_from_slice(&gate);
+            l.norm_rope_k(&mut ks[t * kv..(t + 1) * kv], pos)?;
+            self.cache.push(
+                layer,
+                &ks[t * kv..(t + 1) * kv],
+                &vs[t * kv..(t + 1) * kv],
+            )?;
+        }
+
+        let attn = l.attend_batch(&qs, nt, &self.cache, layer)?;
+        let mut gated = vec![0f32; nt * qd];
+        for t in 0..nt {
+            let g = l.gate_mul(
+                &attn[t * qd..(t + 1) * qd],
+                &gates[t * qd..(t + 1) * qd],
+            )?;
+            gated[t * qd..(t + 1) * qd].copy_from_slice(&g);
+        }
+        let mut outs = vec![0f32; nt * n_embd];
+        gemv_batch(&l.wo, &gated, nt, &mut outs)?;
+        // 対外的な「何トークン進んだか」は最大値で持つ (`forward_token` と同じ)。
+        if self.pos < base + nt {
+            self.pos = base + nt;
+        }
+        Ok(outs.chunks_exact(n_embd).map(|c| c.to_vec()).collect())
+    }
 }
 
 impl LayerAttn for FullAttn {
@@ -819,6 +1052,17 @@ impl LayerAttn for FullAttn {
         cur: &[f32],
     ) -> std::result::Result<Vec<f32>, Qwen4ExpError> {
         self.forward_token(layer, cur)
+            .map_err(|e| Qwen4ExpError(vec![format!("{e:#}")]))
+    }
+
+    /// チャンクぶんの full attention を KV 1 回走査で回す
+    /// ([`FullAttn::forward_batch`])。1 トークン版とビット一致する。
+    fn forward_batch(
+        &mut self,
+        layer: usize,
+        curs: &[Vec<f32>],
+    ) -> std::result::Result<Vec<Vec<f32>>, Qwen4ExpError> {
+        FullAttn::forward_batch(self, layer, curs)
             .map_err(|e| Qwen4ExpError(vec![format!("{e:#}")]))
     }
 

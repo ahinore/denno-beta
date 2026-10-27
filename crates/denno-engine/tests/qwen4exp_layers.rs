@@ -33,6 +33,7 @@ use denno_engine::gguf::GgufFile;
 use denno_engine::model::qwen4exp::{
     validate, IdentityAttn, LayerAttn, LayerKind, Qwen4Exp, Qwen4ExpError, Qwen4ExpParams,
 };
+use denno_engine::model::qwen4exp_attn::{attend_batch_calls, FullAttn};
 use denno_engine::model::qwen4exp_ssm::{gdn_params, SsmAttn};
 use denno_engine::ple::{PleNgram, PleTable, PLE_TABLE_NAME};
 
@@ -367,6 +368,8 @@ const PLE_CONV: u64 = 4;
 /// head_offsets [0,10,20,30] + head_vocab_sizes [10,10,10,10] の最大値
 const PLE_MIN_ROWS: u64 = 40;
 const DEFAULT_LAYERS: usize = 4;
+/// full attention の層番号 ((3 + 1) % INTERVAL == 0)。
+const FULL_LAYER: usize = 3;
 
 const HC_DIM: u64 = N_EMBD * HC;
 const KEY_DIM: u64 = SSM_STATE * SSM_GROUP;
@@ -996,4 +999,97 @@ fn forward_rejects_out_of_range_layer() {
     assert_eq!(errs.len(), 1);
     assert!(errs[0].contains("範囲外"), "{}", errs[0]);
     assert!(errs[0].contains(&DEFAULT_LAYERS.to_string()), "{}", errs[0]);
+}
+
+// ---------------------------------------------------------------------------
+// 8. full attention 層のバッチ版 (`SsmAttn::forward_batch` 経由)
+// ---------------------------------------------------------------------------
+
+/// 合成モデル (4 層 / full attention は層 3) に `FullAttn` を入れた `SsmAttn` を組み、
+/// full 層の `forward_batch` が 1 トークンずつの `forward` とビット一致することを見る。
+///
+/// `SsmAttn` の full 層の腕が `self.full.forward` のループに戻っていないこと
+/// (`attend_batch_calls` が増えること) も併せて確認する。
+#[test]
+fn ssm_attn_full_layer_batch_matches_sequential() {
+    let dir = TempDir::new("fullbatch");
+    let f = open_synth(&dir, "model.gguf", false);
+    let p = validate(&f).expect("validate");
+    let max_ctx = 32usize;
+
+    let full_a = FullAttn::from_gguf_with(&f, &p, max_ctx, false).expect("FullAttn a");
+    let mut a = SsmAttn::with_full(&f, &p, Box::new(full_a)).expect("SsmAttn a");
+    let full_b = FullAttn::from_gguf_with(&f, &p, max_ctx, false).expect("FullAttn b");
+    let mut b = SsmAttn::with_full(&f, &p, Box::new(full_b)).expect("SsmAttn b");
+
+    let curs: Vec<Vec<f32>> = (0..5)
+        .map(|t| {
+            (0..N_EMBD as usize)
+                .map(|j| (((t * 13 + j * 7) % 19) as f32 - 9.0) * 0.05)
+                .collect()
+        })
+        .collect();
+
+    let before = attend_batch_calls();
+    let bat = a.forward_batch(FULL_LAYER, &curs).expect("forward_batch");
+    assert!(
+        attend_batch_calls() > before,
+        "full 層のバッチ版 (attend_batch) が 1 回も走っていない"
+    );
+    assert_eq!(bat.len(), curs.len());
+
+    let mut seq = Vec::with_capacity(curs.len());
+    for cur in &curs {
+        seq.push(b.forward(FULL_LAYER, cur).expect("forward"));
+    }
+    for t in 0..curs.len() {
+        assert_eq!(
+            bits(&bat[t]),
+            bits(&seq[t]),
+            "full 層 {FULL_LAYER} のトークン {t}: forward_batch と forward がビット一致しない"
+        );
+        assert!(bat[t].iter().all(|v| v.is_finite()), "トークン {t} に NaN/inf");
+    }
+}
+
+/// prefill 全体 (層優先バッチ) の logits が逐次 prefill とビット一致する。
+///
+/// `Qwen4Exp::with_attn` に `SsmAttn + FullAttn` を入れた合成モデルで、
+/// `forward_prefill_with(ctx, true)` と `false` を比べる。12 トークンを既定の
+/// チャンク 8 で切るので **2 チャンク目はキャッシュに 8 行積まれた状態**から
+/// 始まる (位置が進んだ状態のバッチ attention が通る)。
+#[test]
+fn prefill_batch_with_full_attention_matches_sequential() {
+    let dir = TempDir::new("fullprefill");
+    let f = open_synth(&dir, "model.gguf", false);
+    let p = validate(&f).expect("validate");
+    let max_ctx = 64usize;
+    let build = |f: &GgufFile| -> Qwen4Exp {
+        let full = FullAttn::from_gguf_with(f, &p, max_ctx, false).expect("FullAttn");
+        let attn = SsmAttn::with_full(f, &p, Box::new(full)).expect("SsmAttn");
+        Qwen4Exp::with_attn(f, Box::new(attn)).expect("model")
+    };
+
+    let ctx: Vec<u32> = (0..12u32).map(|i| i % (N_VOCAB as u32)).collect();
+
+    let mut seq = build(&f);
+    let l_seq = seq.forward_prefill_with(&ctx, false).expect("逐次 prefill");
+    let mut bat = build(&f);
+    let before = attend_batch_calls();
+    let l_bat = bat.forward_prefill_with(&ctx, true).expect("バッチ prefill");
+    assert!(
+        attend_batch_calls() > before,
+        "バッチ prefill で full 層のバッチ attention が走っていない"
+    );
+
+    assert_eq!(l_seq.len(), l_bat.len(), "logits の長さが違う");
+    assert_eq!(
+        bits(&l_seq),
+        bits(&l_bat),
+        "バッチ prefill の logits が逐次 prefill とビット一致しない"
+    );
+    assert!(
+        l_bat.iter().any(|v| *v != l_bat[0]),
+        "logits が全要素同値 (計算が効いていない)"
+    );
 }

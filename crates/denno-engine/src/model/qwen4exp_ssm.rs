@@ -550,8 +550,10 @@ impl LayerAttn for SsmAttn {
         }
     }
 
-    /// ssm 層だけ投影をチャンクでまとめる。full 層は逐次に任せる
-    /// (投影 4 本のうち 3 本が小さいので、いまは利得が小さい)。
+    /// ssm 層は投影をチャンクでまとめる。full 層は `self.full` の
+    /// [`LayerAttn::forward_batch`] に委譲する (バッチ prefill で `FullAttn` が
+    /// 入っているときは KV を 1 回走査するバッチ版が走る。既定の実装 =
+    /// 1 トークンずつの `forward` と同じ値)。
     fn forward_batch(
         &mut self,
         layer: usize,
@@ -565,13 +567,7 @@ impl LayerAttn for SsmAttn {
             Some(Some(s)) => s
                 .forward_batch(curs)
                 .map_err(|e| Qwen4ExpError(vec![format!("層 {layer}: {e:#}")])),
-            Some(None) => {
-                let mut outs = Vec::with_capacity(curs.len());
-                for cur in curs {
-                    outs.push(self.full.forward(layer, cur)?);
-                }
-                Ok(outs)
-            }
+            Some(None) => self.full.forward_batch(layer, curs),
         }
     }
 
