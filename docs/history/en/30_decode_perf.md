@@ -5,7 +5,7 @@
 
 A record of what we measured, what we added, and what we discarded in order to make decode (the path that generates one token at a time) faster.
 It begins with CPU SIMD, then moves through batching, GPU offload of attention, the device-resident chain,
-and ends with the verdict that "Rust alone cannot get there" and five rejections closed with numbers, laid out in chronological order.
+and ends with the verdict that "Rust alone cannot get there" and a run of rejections closed with numbers, laid out in chronological order.
 Dates are the commit author dates in JST.
 `119dd92` (P8) / `1bbffff` (P9) / `4e2428f` (P10) / `16319c7` (P11) / `55c1de0` (P12) are
 from the predecessor repository and do not exist in this repository.
@@ -69,6 +69,16 @@ reading s160 right after s157 shows that "the same numbers are being denied from
 | P-MOE-F15 | 2026-10-27 | `74e41d3` | Parallelize the GEMV row direction and expose in-layer phases |
 | P-MOE-F16 | 2026-10-27 | `a42e144` | Parallelize the GDN delta rule over heads |
 | P-MOE-F17 | 2026-10-27 | `a469224` | Stop-token decode did not append the stop token to `tokens` |
+| P-MOE-G1 | 2026-10-27 | `6d3fc13` | Wire ExpertCache into the MoE expert path (sealed at a default of 0) |
+| P-MOE-G2 | 2026-10-27 | `e4e5547` | Wire the QSA indexer into the full attention path (`DENNO_QSA=1`) |
+| P-MOE-G3 / G4 | 2026-10-27 | not merged | Widening to AVX-512 only gains −12 ms in mix for Q8_0 |
+| P-MOE-G5 | 2026-10-27 | `3dc3612` | Parallelize the expert loop with rayon, 355 → 278 ms |
+| P-MOE-G6 | 2026-10-27 | not merged | Keeping dense weights resident in RAM makes no difference |
+| P-MOE-G7 | 2026-10-27 | no commit | Flattening expert × row-block parallelism is within the noise |
+| P-MOE-G8 | 2026-10-27 | not merged | Head parallelism for attention moves attn 90 → 93 ms |
+| P-MOE-G9 | 2026-10-27 | no commit | madvise read-ahead for the selected experts makes no difference |
+| P-MOE-G10 | 2026-10-27 | not merged | Software prefetch in the GEMV row loop makes no difference |
+| H1 | 2026-10-27 | no commit | Reusing GPU scratch takes 302 → 313 ms |
 
 ## Gap between the ceiling (theoretical values) and measurements
 
@@ -894,6 +904,49 @@ forward and then stops.
 re-measured because the production server is down. Row and head parallelism do not change
 accumulation order, so the numbers should be unchanged, but this gets confirmed after restart.
 
+---
+
+### P-MOE-G1..G5: wiring ExpertCache and QSA, and parallelizing the expert loop with rayon (2026-10-27, `6d3fc13`..`3dc3612`)
+
+All numbers are CPU, real weights, 1 forward of 5 tokens, after warm-up, median of 3 alternating rounds.
+
+**Goal** — F17's 579 ms was I/O-bound rather than compute-bound, with a per-layer breakdown of attn 3.72 ms
+(of which gdn 1.29) / moe 4.63 ms / mix 1.50 ms. The model is 104 GB against only 60 GB of RAM, so the expert
+reads fall to disk every time. We tried 3 directions: (G1) lift that with an explicit cache, (G2) reduce the
+cell count by selecting keys with QSA, (G5) parallelize the computation itself.
+
+**What went in (measured at each step)**
+
+| step | commit | change | forward |
+|---|---|---|---|
+| right after F17 | — | — | 579 ms |
+| G1 + G2 | `6d3fc13` / `e4e5547` | wire ExpertCache and the QSA indexer into the paths | 355 ms (attn 93 / moe 185 / mix 56) |
+| G5 | `3dc3612` | compute the selected experts' contributions h_e with rayon | **278 ms** (attn 84 / moe 121 / mix 56) |
+
+- G1's ExpertCache is `DENNO_EXPERT_CACHE_MB`. It **lost badly to parallel mmap in measurement, so it is
+  sealed off at a default of 0** (disabled in the default configuration).
+- G2's QSA is enabled with `DENNO_QSA=1`. It only passes the selected cell list to `attend_visible`; the dense
+  path goes through `attend_impl(None)` and keeps the same loop expressions and the same rounding order as
+  before G2. The output is exactly identical to dense.
+- G5 is `DENNO_MOE_PAR` (default 1). Only the mutually independent h_e are parallelized, and the weighted
+  accumulation stays sequential in index order, so the addition order is unchanged = **bit-identical**
+  (all `to_bits()` equal between `par` 0 and 1 on a synthetic GGUF).
+
+**Why it worked, and why the first step did not** — Most of the reduction is in G5's moe, 185 → 121 ms (−64 ms).
+The 9-token greedy run goes 5769 → 4515 ms. Expert contributions are independent of each other, so raising the
+parallelism changes no element's sequence of operations and the numerical contract did not have to be relaxed.
+attn also dropped from 93 to 84 ms, but G5 touches only the moe expert loop, so that difference cannot be
+explained by G5 (the per-layer breakdown may be measured differently at each step; the material gives no
+explanation).
+
+**Numerical agreement** — 16/16 tokens agree with the reference implementation (llama.cpp). GREEDY4 is
+`[271, 248068, 198, 760]`. In the F series only the first 4 tokens agreed and it diverged at the 9th, so this
+agreement is for a configuration with QSA enabled (estimate).
+
+**Remaining bottleneck** — The 278 ms breakdown is attn 84 / moe 121 / mix 56, and moe is still the largest.
+The 5 further attempts to cut it (G6 to G10) and 1 GPU-side attempt (H1) were all rejected by measurement
+(see the rejected catalog below).
+
 ## Rejected approaches
 
 Judgments that looked reasonable at the time but were discarded later. We place only references to the corresponding
@@ -940,3 +993,45 @@ entries in the body; the numbers are taken from the body and from the records in
 - Measured value: 29.5 ms/call × 64 layers = 1,888 ms/token, which conflicts with the measured 32.42 by a factor of **58**. Of the 6 stages of the fixed cost, 5 (allocation, activation quantization, H2D, issuing, synchronization, copy-out) are structurally 0 times. Against gate_up's byte share of 42.7%, the measured share is 28.4%, smaller than the byte share.
 - Why we dropped it: the m=21.5 in the record is prefill's average m and decode is m=1. `lin_sync_wait` 89% is a value waiting for the kernel execution itself, not a fixed cost. We rejected the way of reading the measurement itself, which chases a fixed cost that does not exist.
 - Record: body s160, related commit `2701cf3`.
+
+### P-MOE-G3 / G4: widening to AVX-512 (2026-10-27, not merged)
+- What we tried: widen the Q4_K / Q8_0 / Q5_1 GEMV to 512 bits and process 2 rows in 1 instruction. Row r keeps its lanes exactly where the AVX2 version puts them, so the values stay bit-identical to AVX2.
+- Measured value: **Q4_K is decode-bound and shows no gain. Q8_0 gains −12 ms in mix only.** Per kernel alone (n_in = 2560, n = 640) Q8_0 goes 253.6 → 133.1 ns/row (1.91x) and Q5_1 goes 220.8 → 192.8 ns/row (1.14x).
+- Why we dropped it: only mix's 12 ms moves in the forward, and the main attn / moe buckets do not move. As long as moe is I/O-bound, widening the kernel does not reduce the wait for rows to arrive (estimate).
+- Record: the work survives only as a WIP commit (`909cb18`) and was not merged. The values are `to_bits()` identical to the AVX2 version.
+
+### P-MOE-G6: keeping dense weights resident in RAM (2026-10-27, not merged)
+- What we tried: hold every `GgufLinear` other than the experts in an owned Vec instead of mmap, to avoid page eviction (`DENNO_PIN_DENSE=1`).
+- Measured value: forward is 363–371 ms against 349–372 ms, **no difference**.
+- Why we dropped it: dense is about 1 GB, and keeping it resident does not make the per-token reads faster. The difference drowns in the overlap of the ranges.
+- Record: unmerged work commit `4fc94da`. The byte ranges are identical on and off (a copy of the same range), and `to_bits()` equality is fixed by tests.
+
+### P-MOE-G7: flattening expert × row-block parallelism (no commit)
+- What we tried: flatten G5's expert parallelism and F15's row parallelism from 2 levels into 1, evening out the load difference between experts.
+- Measured value: moe **124 → 110 ms**. But the 9-token greedy run is **4515 against 4438 ms**, a difference within the noise.
+- Why we dropped it: the per-layer moe figure improves by 14 ms but does not show up in the per-token total. Acceptance is on total time, so it is not taken.
+- Record: no commit.
+
+### P-MOE-G8: head parallelism for attention (2026-10-27, not merged)
+- What we tried: parallelize the `attend` head loop with rayon (`DENNO_ATTN_PAR`). Heads are independent, so whichever thread takes one, each element's sequence of products and sums is unchanged.
+- Measured value: attn **90 → 93 ms** (slightly worse).
+- Why we dropped it: attn is already filled by GEMV row parallelism, and against 24 heads the work for 1 head is too small, so the fork-join cost wins.
+- Record: unmerged work commit `089dbea`. `to_bits()` identical to the sequential path, and the parallel branch actually running is checked by a counter.
+
+### P-MOE-G9: madvise read-ahead for the selected experts (no commit)
+- What we tried: read the ranges of the selected experts ahead of time with `MADV_WILLNEED`.
+- Measured value: moe **123 against 123 ms**.
+- Why we dropped it: no difference. Same conclusion as `MADV_WILLNEED` in the F series (5197 against 5214 ms).
+- Record: no commit.
+
+### P-MOE-G10: software prefetch in the GEMV row loop (2026-10-27, not merged)
+- What we tried: issue `_mm_prefetch` on the head of row r+3 just before processing row r (`DENNO_GEMV_PF`). The PF-disabled monomorphization keeps not 1 prefetch instruction.
+- Measured value: moe **125 against 124 ms**.
+- Why we dropped it: no difference. The row access is fully sequential, so the hardware prefetcher is already doing the job (estimate).
+- Record: unmerged work commit `f9df39d`. `to_bits()` equality on and off and the number of prefetches issued (off = 0, on = `n_out - PF_DIST`) are fixed by tests.
+
+### H1: reusing GPU scratch (no commit)
+- What we tried: reuse the GPU-side scratch buffers instead of allocating them again.
+- Measured value: **302 → 313 ms** (there is no record of what this total covers).
+- Why we dropped it: it got worse. The material gives no breakdown of the regression.
+- Record: no commit.
