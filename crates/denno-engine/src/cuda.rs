@@ -1424,7 +1424,7 @@ impl Scratch {
 // ---------------------------------------------------------------------------
 
 /// arena の成長単位 (1,024 MiB)。
-const ARENA_CHUNK: usize = 1 << 30;
+pub(crate) const ARENA_CHUNK: usize = 1 << 30;
 /// チャンク内オフセットのアライン。cuMemAlloc の返す境界 (256 B) に合わせる。
 const ARENA_ALIGN: usize = 256;
 /// 予約キー: デバイス常駐チェーンのスロット (`CH_*`)。
@@ -2225,6 +2225,12 @@ fn gdn_flush_step(is_gdn_layer: bool, stale: bool, target: usize, pos: Option<us
 
 static GPU_CTX: OnceLock<Option<CudaCtx>> = OnceLock::new();
 static GPU_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 集計用 (gpu_budget): 重みの失敗などで GPU 経路が恒久停止しているか。
+/// 読み取りのみ・状態は変えない。
+pub(crate) fn gpu_broken_flag() -> bool {
+    GPU_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[cfg(test)]
 static GPU_FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3847,6 +3853,7 @@ fn weights_for_q4(uid: u64, blocks: &[u8], k: usize, n: usize) -> Result<&'stati
             (nib.len() + n * nb * 4) as f64 / 1e6
         );
         map.insert(uid, Box::new(GpuWq4 { nib: nib_dev, sc: sc_dev, k, n }));
+        crate::gpu_budget::note_weight_upload();
     }
     let e = map.get(&uid).expect("just inserted");
     debug_assert_eq!((e.k, e.n), (k, n), "uid 重複: 同一 uid に異なる形状 (q4)");
@@ -3916,6 +3923,7 @@ fn weights_for_gguf(
             want as f64 / 1e6
         );
         map.insert(uid, Box::new(GpuGgufW { buf, ty, k, n }));
+        crate::gpu_budget::note_weight_upload();
     }
     let e = map.get(&uid).expect("just inserted");
     if (e.k, e.n, e.ty) != (k, n, ty) {
@@ -3960,7 +3968,20 @@ pub fn maybe_gpu_gguf_gemv_into(
     let w = match weights_for_gguf(uid, ty, blocks, k, n) {
         Ok(w) => w,
         Err(e) => {
-            tracing::error!("gguf weight register failed (uid={uid}): {e:#}");
+            // P-pf-arena: 同じ失敗を 1 呼び出しごとに ERROR で出すと 1 リクエストで
+            // 数万行になる (実測 40,554 行)。数だけ数え、ログは「1 回目 + 1,000
+            // 回ごとの進捗」に畳む。出す内容 (uid とメッセージ) は従来と同じ。
+            let msg = format!("{e:#}");
+            match crate::gpu_budget::note_weight_failure(uid, &msg) {
+                Some(true) => tracing::error!(
+                    "gguf weight register failed (uid={uid}): {msg} (同種の失敗は数えるだけ。集計はリクエスト末尾の 1 行)"
+                ),
+                Some(false) => {
+                    let s = crate::gpu_budget::weight_upload_stats();
+                    tracing::warn!("gguf weight register failed: 累計 {} 本 (最後の uid={uid})", s.failed);
+                }
+                None => {}
+            }
             return false;
         }
     };
@@ -4074,7 +4095,14 @@ fn maybe_gpu_linear_q4_into_inner(
     let gw = match weights_for_q4(uid, blocks, k, n) {
         Ok(g) => g,
         Err(e) => {
-            tracing::error!("CUDA q4 weight upload failed, using CPU: {e:#}");
+            let msg = format!("{e:#}");
+            // この経路は 1 本失敗した時点で GPU 全体を止めるので、抑制せず必ず 1 行出す
+            // (プロセスあたり 1 回しか来ない)。数えるほうは共通の集計に任せる。
+            crate::gpu_budget::note_weight_failure(uid, &msg);
+            tracing::error!(
+                "CUDA q4 weight upload failed, using CPU permanently (この 1 本で GPU 経路全体を停止): {msg}"
+            );
+            crate::gpu_budget::note_gpu_broken("q4 weight upload failed");
             GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
             crate::prof::lin_other_close(st);
             crate::prof::lin_other_close(entry_st);

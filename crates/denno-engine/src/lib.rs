@@ -6,6 +6,7 @@
 pub mod engine;
 pub mod gguf;
 pub mod gdn;
+pub mod gpu_budget;
 pub mod kquant;
 pub mod kquant_tables;
 pub mod kv_cache;
