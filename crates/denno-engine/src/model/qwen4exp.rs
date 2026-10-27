@@ -2867,24 +2867,42 @@ pub fn moe_sub_take() -> (f64, f64, f64) {
 /// (2026-10-27 に実際に踏んだ)。
 #[derive(Clone, Copy)]
 enum GemvKernel {
-    /// [`GgufLinear::gemv`] と同じ入口。**`linear()` 経由のテンソル前提**
-    /// (`fast_q8 = true`)。`from_slice` で組んだ層を比べるときは、その層も
-    /// `with_fast_q8(true)` にしておくこと。
-    Linear,
+    /// [`GgufLinear::gemv`] と同じ入口。`fast_q8` は層の設定
+    /// ([`GgufLinear::fast_q8`]) をそのまま渡す (Q8_0 で融合カーネルに載るかが
+    /// 変わる)。`from_slice` で組んだ層を比べるときは、その層も同じ設定に
+    /// しておくこと。
+    Linear { fast_q8: bool },
     /// [`ExpertW::gemv`] と同じ入口 (`expert_gemv_any`)
     Expert,
 }
 
-/// 量子化重みの行優先バッチ GEMV: `out[t * n + r] = dot(row_r, x_t)`。
+/// バッチ GEMV が 1 回の呼び出しで触る `x` の上限 (バイト)。
 ///
-/// 行 `r` を外側で 1 回だけ切り出し、内側でトークンを回す。1 行ぶんの計算は
-/// `kern` が指す入口を `n_out = 1` で呼ぶ = 逐次版と**同じカーネル**なので、
-/// Q4_K の融合カーネル (AVX2+FMA) を含めてビット一致する。行は互いに独立で、
-/// `x` に依存する前計算も同じ `x` から作られる。
+/// ブロックを 1 回だけデコードして全トークンへ配る形は、1 行あたり
+/// `nt * k * 4` バイトの `x` を読む。これが L2 (≈1 MB) を超えると行ごとの
+/// 読み直しでキャッシュを落とし、逐次版より遅くなる (k=10240 / nt=64 で
+/// 31 ms/chunk、逐次版 1.7 ms)。256 KB に切ると 1 呼び出しの `x` が L2 に
+/// 収まり、重みのデコード回数も nt 回から nt/T 回に減る。
+const GEMV_BATCH_TILE_BYTES: usize = 256 * 1024;
+
+/// ブロック 1 回デコード版に載せる最小の行数。
 ///
-/// 速くなる根拠は演算量ではなく**重みの再読み込み**: 逐次版はトークンごとに同じ
-/// 行を最初から読み直すが、ここでは 1 行がキャッシュに載ったまま `nt` トークンぶん
-/// 使われる (27B の expert は 1 トークンで 487 MB を触るので、ここが支配的)。
+/// 行数が少ない行列は、重みを nt 回デコードし直す代わりに行を 16 分割できる
+/// 旧経路のほうが速い (実測 nt=64: n=640 で x0.88、n=1024 で x0.96、
+/// n=2560 で x1.23〜1.47)。しきい値はその境目。
+const GEMV_BATCH_MIN_ROWS: usize = 2048;
+
+/// 量子化重みのバッチ GEMV: `out[t * n + r] = dot(row_r, x_t)`。
+///
+/// 行 `r` について `acc[t]` (t = 0..nt) を 0 から始め、ブロックを先頭から順に
+/// **1 回だけ** f32 へ開いて、その場で全トークンへ配る。1 行ぶんの計算は
+/// `kern` が指す入口 (= 逐次版と同じカーネル) なので、Q4_K の融合カーネル
+/// (AVX2+FMA) を含めてビット一致する。行は互いに独立で、`x` に依存する前計算も
+/// 同じ `x` から作られる。
+///
+/// 速くなる根拠は演算量ではなく**重みのデコードと読み込み**: 逐次版はトークン
+/// ごとに同じ行を最初から読み直すが、ここでは重みのバイト列を 1 チャンクあたり
+/// 1 回しか読まない。27B の expert は 1 トークンで 487 MB を触るので、ここが支配的。
 fn gemv_rows_batch(
     kern: GemvKernel,
     ty: GgmlType,
@@ -2916,44 +2934,62 @@ fn gemv_rows_batch(
             bytes.len()
         )));
     }
-    let rb = bytes.len() / n;
     match kern {
-        // 線形層 (`GgufLinear::gemv`) と同じカーネルを行並列で回す。行内の加算順は
-        // 逐次版と同一なのでビット一致する。Q5_1 は `expert_gemv_any` と 1 ULP
-        // 違うカーネルなので、ここを Expert 側の実装で代用してはいけない
-        // (実測: down Q5_1 で要素 0 が 1 ULP ずれた)。
-        GemvKernel::Linear => {
-            let par = n >= 64 && k >= 256;
-            // 行ごとに書くと出力がトークン優先の並びなので、いったん行優先で作って
-            // 最後に詰め替える (n * nt * 4 バイト。640x8 で 20 KB)。
-            let mut tmp = vec![0f32; n * nt];
-            let run_row = |r: usize, o: &mut [f32]| -> Result<()> {
-                let row = &bytes[r * rb..(r + 1) * rb];
-                for t in 0..nt {
-                    let x = &xs[t * k..(t + 1) * k];
-                    let slot = &mut o[t..t + 1];
-                    let res = if ty == GgmlType::Q8_0 {
-                        moe_expert::expert_gemv_q8_fast(row, k, 1, x, slot)
-                    } else {
-                        moe_expert::expert_gemv(ty, row, k, 1, x, slot)
-                    };
-                    res.map_err(|err| one(format!("gemv_batch: 行 {r} トークン {t}: {err}")))?;
-                }
-                Ok(())
-            };
-            if par {
-                use rayon::prelude::*;
-                tmp.par_chunks_mut(nt)
-                    .enumerate()
-                    .try_for_each(|(r, o)| run_row(r, o))?;
+        // 1 行版 (`GgufLinear::gemv`) と同じカーネルに振る。同じ型でも入口で
+        // カーネルが違うので、ここを取り違えると 1 ulp ずれる ([`GemvKernel`]):
+        //   Q8_0 + `fast_q8` → `expert_gemv_q8_fast` (AVX2+FMA 融合)
+        //   Q8_0 (`fast_q8` 無し) / Q5_1 → `expert_gemv` のスカラー経路
+        //   Q4_K → `expert_gemv` (AVX2+FMA があれば融合、無ければスカラー)
+        //   Q5_K → `expert_gemv` (常にスカラー)
+        // どちらのバッチ経路も「重みのブロックを 1 回だけデコードし、その場で
+        // 全トークンへ配る」ので、重みのバイト列は 1 チャンクあたり 1 回しか読まない。
+        // トークンごとの累積順は 1 行版と同一 = ビット一致。
+        //
+        // 2026-10-28: 以前は行ごとに `expert_gemv*` を nt 回呼んでいた (行優先)。
+        // トークンを外側にしていたので、同じ重み行を nt 回デコードし直していた。
+        GemvKernel::Linear { fast_q8 } => {
+            let scalar_only = ty == GgmlType::Q5_1 || (ty == GgmlType::Q8_0 && !fast_q8);
+            // 行数が少ない形はバッチ版が行並列を使えない (gemm 側の門番は
+            // `PAR_MIN_ROWS`) うえ、重みのデコードし直しより行分割の効きが大きい。
+            // その場合は行を自分で分ける旧経路の方が速い (実測: k=10240 / n=320 で
+            // 旧 1.7 ms/chunk、バッチ版 8.6 ms。n=640 / 1024 も旧がわずかに速い)。
+            if !gemv_batch_blockdecode(n, nt) {
+                gemv_rows_pertoken(ty, fast_q8, bytes, k, n, xs, nt, outs)?;
             } else {
-                for (r, o) in tmp.chunks_mut(nt).enumerate() {
-                    run_row(r, o)?;
-                }
-            }
-            for t in 0..nt {
-                for r in 0..n {
-                    outs[t * n + r] = tmp[r * nt + t];
+                #[cfg(test)]
+                GEMV_BATCH_BLOCKDECODE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // トークンをまとめて渡すと、1 行の計算で触る x が nt * k * 4 バイトに
+                // なる。k=10240 / nt=64 だと 2.6 MB で L2 に載らず、行ごとに
+                // 読み直すたびにキャッシュを落とす (実測: 31 ms/chunk、逐次版 1.7 ms)。
+                // そこで 1 呼び出しの x を L2 に収まる枚数へ切り、重みのデコード回数を
+                // nt 回から nt/T 回に減らす。トークンは独立なので値は変わらない。
+                let t_max = (GEMV_BATCH_TILE_BYTES / (4 * k.max(1))).max(1);
+                let mut done = 0usize;
+                while done < nt {
+                    let t = t_max.min(nt - done);
+                    let res = if scalar_only {
+                        moe_expert::expert_gemm_scalar(
+                            ty,
+                            bytes,
+                            k,
+                            n,
+                            &xs[done * k..(done + t) * k],
+                            t,
+                            &mut outs[done * n..(done + t) * n],
+                        )
+                    } else {
+                        moe_expert::expert_gemm_any(
+                            ty,
+                            bytes,
+                            k,
+                            n,
+                            &xs[done * k..(done + t) * k],
+                            t,
+                            &mut outs[done * n..(done + t) * n],
+                        )
+                    };
+                    res.map_err(|err| one(format!("gemv_batch: {err}")))?;
+                    done += t;
                 }
             }
         }
@@ -2969,9 +3005,83 @@ fn gemv_rows_batch(
     Ok(())
 }
 
+/// 量子型のバッチ GEMV を「ブロック 1 回デコード」で回すか (純粋関数)。
+///
+/// 行数が [`GEMV_BATCH_MIN_ROWS`] 未満の行列は、重みを nt 回デコードし直す
+/// 代わりに行を 16 分割できる旧経路 ([`gemv_rows_pertoken`]) の方が速いので
+/// そちらへ振る (実測値は定数の doc)。境目はテストで固定する。
+fn gemv_batch_blockdecode(n: usize, nt: usize) -> bool {
+    nt > 0 && n >= GEMV_BATCH_MIN_ROWS
+}
+
+/// 旧経路: 行ごとに `expert_gemv*` を `nt` 回呼び、行方向だけ並列にする。
+///
+/// バッチ版 ([`gemv_rows_batch`] の `Linear`) は行並列を gemm 側
+/// ([`moe_expert::PAR_MIN_ROWS`]) に任せるので、行数がその門番より少ない形では
+/// 1 スレッドに落ちる。行数が少ない行列はむしろこちらが速い (実測: k=10240 /
+/// n=320 / nt=64 で 1.7 ms/chunk、バッチ版 8.6 ms)。重み行は nt 回デコードするが、
+/// x は 1 トークンずつ L1 に載る。
+///
+/// 数値: 1 行 1 トークンの計算は [`GgufLinear::gemv`] と同じカーネル・同じ引数
+/// (`n_out = 1`) なので、`fast_q8` の扱いさえ合わせればビット一致する。
+fn gemv_rows_pertoken(
+    ty: GgmlType,
+    fast_q8: bool,
+    bytes: &[u8],
+    k: usize,
+    n: usize,
+    xs: &[f32],
+    nt: usize,
+    outs: &mut [f32],
+) -> Result<()> {
+    let par = n >= 64 && k >= 256;
+    let rb = bytes.len() / n;
+    // 行ごとに書くと出力がトークン優先の並びなので、いったん行優先で作って
+    // 最後に詰め替える (n * nt * 4 バイト。640x8 で 20 KB)。
+    let mut tmp = vec![0f32; n * nt];
+    let run_row = |r: usize, o: &mut [f32]| -> Result<()> {
+        let row = &bytes[r * rb..(r + 1) * rb];
+        for t in 0..nt {
+            let x = &xs[t * k..(t + 1) * k];
+            let slot = &mut o[t..t + 1];
+            let res = if ty == GgmlType::Q8_0 && fast_q8 {
+                moe_expert::expert_gemv_q8_fast(row, k, 1, x, slot)
+            } else {
+                moe_expert::expert_gemv(ty, row, k, 1, x, slot)
+            };
+            res.map_err(|err| one(format!("gemv_batch: 行 {r} トークン {t}: {err}")))?;
+        }
+        Ok(())
+    };
+    #[cfg(feature = "par")]
+    if par {
+        use rayon::prelude::*;
+        tmp.par_chunks_mut(nt)
+            .enumerate()
+            .try_for_each(|(r, o)| run_row(r, o))?;
+    } else {
+        for (r, o) in tmp.chunks_mut(nt).enumerate() {
+            run_row(r, o)?;
+        }
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        let _ = par;
+        for (r, o) in tmp.chunks_mut(nt).enumerate() {
+            run_row(r, o)?;
+        }
+    }
+    for t in 0..nt {
+        for r in 0..n {
+            outs[t * n + r] = tmp[r * nt + t];
+        }
+    }
+    Ok(())
+}
+
 /// [`GgufLinear`] のバッチ GEMV (`nt` トークン × 1 行列)。
 ///
-/// 量子型は [`gemv_rows_batch`] (行優先・`GgufLinear::gemv` と同じ入口)、
+/// 量子型は [`gemv_rows_batch`] (逐次版と同じカーネル)、
 /// 無量子型 (F32/F16/BF16) は [`GgufLinear::gemv`] と同じ「行を f32 に開いて
 /// 列昇順に逐次加算」を、行ごとに 1 回だけ展開してトークンぶん使い回す。
 ///
@@ -2988,7 +3098,9 @@ pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]
     let (k, n) = (w.k(), w.n());
     match w.ty() {
         GgmlType::Q8_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K => gemv_rows_batch(
-            GemvKernel::Linear,
+            GemvKernel::Linear {
+                fast_q8: w.fast_q8(),
+            },
             w.ty(),
             w.blocks().as_slice(),
             k,
@@ -3119,6 +3231,12 @@ pub(crate) static PREFILL_BATCH_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 pub(crate) static GEMV_BATCH_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// テスト用: 量子型のバッチ GEMV が**ブロック 1 回デコード経路**に入った回数。
+/// 行数が少ない形は旧経路 (行ごとに nt 回デコード) に落ちるので、どちらを通ったかを
+/// 値の一致だけからは判定できない。分岐の通過をここで数える。
+#[cfg(test)]
+pub(crate) static GEMV_BATCH_BLOCKDECODE_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// `DENNO_PREFILL_BATCH` の値の解釈 (純粋関数)。既定 (未設定) は無効。
@@ -4225,6 +4343,14 @@ mod tests {
                         b[o + 2..o + 4].copy_from_slice(&f16_bytes(0.001));
                     }
                 }
+                GgmlType::Q5K => {
+                    // 176 B = d(2) + dmin(2) + scales(12) + qh(32) + qs(128)
+                    for blk in 0..nb / 176 {
+                        let o = blk * 176;
+                        b[o..o + 2].copy_from_slice(&f16_bytes(0.02));
+                        b[o + 2..o + 4].copy_from_slice(&f16_bytes(0.001));
+                    }
+                }
                 GgmlType::IQ4Nl => {
                     for blk in 0..nb / 18 {
                         let o = blk * 18;
@@ -4442,6 +4568,194 @@ mod tests {
                 "Q8_0: 出力が全 0 (経路の生死が分からない)"
             );
             assert_bitwise_eq(&s8, &b8, "Q8_0 (fast_q8 = 融合)");
+        }
+
+        /// 合成 GGUF に書いた 4 種の量子型 (Q8_0 / Q5_1 / Q4_K / Q5_K) で、
+        ///
+        /// (a) `gemv_batch(nt=1)` が逐次 `gemv` とビット一致する、
+        /// (b) `gemv_batch(nt=64)` の各トークンが `gemv` (1 トークン) とビット一致する、
+        /// (c) 行数の多い形が「ブロック 1 回デコード」経路を通る (カウンタで確認)、
+        ///
+        /// を確かめる。Q8_0 は `fast_q8` の両方 (融合カーネル / スカラー) を通す。
+        /// 行数の少ない形 (n=5) は旧経路 (行ごとに nt 回デコード) に落ちるが、
+        /// 同じ `gemv_batch` から同じ値が出ることをここで見る。
+        #[test]
+        fn gemv_batch_all_quant_types_bitwise() {
+            let dir = TempDir::new("h2q4gt");
+            let types = [
+                GgmlType::Q8_0,
+                GgmlType::Q5_1,
+                GgmlType::Q4K,
+                GgmlType::Q5K,
+            ];
+            // 大きい形: ブロック 1 回デコード経路 + トークンのタイル分割
+            // (T = GEMV_BATCH_TILE_BYTES / (4k) = 32 < nt=64 なので 2 枚に割れる)。
+            let (bk, bn, bnt) = (2048usize, GEMV_BATCH_MIN_ROWS, 64usize);
+            // 小さい形: 旧経路。
+            let (sk, sn, snt) = (512usize, 5usize, 3usize);
+
+            // 境目は純粋関数で固定する (行数 / トークン数)
+            assert!(!gemv_batch_blockdecode(GEMV_BATCH_MIN_ROWS - 1, 64));
+            assert!(gemv_batch_blockdecode(GEMV_BATCH_MIN_ROWS, 64));
+            assert!(gemv_batch_blockdecode(bn, bnt), "大きい形がバッチ経路に載らない");
+            assert!(!gemv_batch_blockdecode(sn, snt), "小さい形がバッチ経路に載った");
+            assert!(!gemv_batch_blockdecode(usize::MAX, 0), "nt=0 では回さない");
+
+            let mut tensors = Vec::new();
+            for (i, ty) in types.iter().enumerate() {
+                for (tag, k, n) in [("b", bk, bn), ("s", sk, sn)] {
+                    let name = format!("{tag}{i}");
+                    let data = tensor_bytes(&name, &[k as u64, n as u64], *ty, i as u32 + 1);
+                    tensors.push((name, vec![k as u64, n as u64], ggml_id(*ty), data));
+                }
+            }
+            let path = dir.path("gemv_types.gguf");
+            write_model(&path, &tensors);
+            let f = GgufFile::open(&path).expect("合成 GGUF を開けない");
+
+            let c0 = GEMV_BATCH_BLOCKDECODE_CALLS.load(Ordering::Relaxed);
+            for (i, ty) in types.iter().enumerate() {
+                for (tag, k, n, nt) in [("b", bk, bn, bnt), ("s", sk, sn, snt)] {
+                    let name = format!("{tag}{i}");
+                    let (file, off, len) = f.tensor_mapping_parts(&name).expect("データ範囲");
+                    let map = f.mmap_handle_at(file).expect("part の mmap");
+                    let bytes = &map[off..off + len];
+                    for fast_q8 in [false, true] {
+                        let lin = GgufLinear::from_slice(*ty, k, n, bytes)
+                            .expect("GgufLinear")
+                            .with_fast_q8(fast_q8);
+                        let want = |i: usize, w: usize| -> Vec<f32> {
+                            (0..w).map(|j| (((i + j * 37) % 101) as f32 - 50.0) * 0.011).collect()
+                        };
+
+                        // (a) nt=1 が逐次版とビット一致
+                        let x1 = want(0, k);
+                        let mut b1 = vec![0.0f32; n];
+                        gemv_batch(&lin, &x1, 1, &mut b1).expect("gemv_batch (nt=1)");
+                        let mut s1 = vec![0.0f32; n];
+                        lin.gemv(&x1, &mut s1).expect("gemv");
+                        assert!(
+                            s1.iter().any(|v| *v != 0.0),
+                            "{name}: 出力が全 0 (経路の生死が分からない)"
+                        );
+                        assert_bitwise_eq(
+                            &s1,
+                            &b1,
+                            &format!("{name} fast_q8={fast_q8} nt=1 / gemv"),
+                        );
+
+                        // (b) nt トークンの各行が 1 トークンの計算とビット一致
+                        let mut xs = Vec::with_capacity(nt * k);
+                        for t in 0..nt {
+                            xs.extend_from_slice(&want(t + 1, k));
+                        }
+                        let mut bat = vec![0.0f32; nt * n];
+                        gemv_batch(&lin, &xs, nt, &mut bat).expect("gemv_batch (nt)");
+                        for t in 0..nt {
+                            let mut seq = vec![0.0f32; n];
+                            lin.gemv(&xs[t * k..(t + 1) * k], &mut seq).expect("gemv");
+                            assert_bitwise_eq(
+                                &seq,
+                                &bat[t * n..(t + 1) * n],
+                                &format!("{name} fast_q8={fast_q8} token {t} / gemv"),
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(
+                GEMV_BATCH_BLOCKDECODE_CALLS.load(Ordering::Relaxed) > c0,
+                "ブロック 1 回デコード経路が 1 回も走っていない"
+            );
+        }
+
+        /// 実形状 (Flash-Next / n_embd 2560) の Q8_0 行列で、バッチ GEMV の
+        /// 1 呼び出しを CPU で測る。**GPU 実測の代わりではない**。
+        /// カーネル構造の A/B (per-token 呼び出し vs ブロック 1 回デコード) 用。
+        #[test]
+        #[ignore = "CPU のカーネル A/B (実機の ms/token は main が測る)"]
+        fn gemv_batch_shape_ab() {
+            use std::time::Instant;
+            let nt = 64usize;
+            // (名前, k, n) — qwen4exp の実形状 (n_embd 2560 / conv_dim 10240 /
+            // inner 6144 / kv 1024 / q 12288 / shexp 640 / hc_lr 320)
+            let shapes = [
+                ("ssm_qkv", 2560usize, 10240usize),
+                ("ssm_gate", 2560, 6144),
+                ("ssm_out", 6144, 2560),
+                ("hc_up", 320, 10240),
+                ("hc_down", 10240, 320),
+                ("shexp_gate", 2560, 640),
+                ("shexp_down", 640, 2560),
+                ("full_q", 2560, 12288),
+                ("full_kv", 2560, 1024),
+                ("full_o", 6144, 2560),
+            ];
+            let mut tot_new = 0.0f64;
+            let mut tot_old = 0.0f64;
+            for (name, k, n) in shapes {
+                let bytes = tensor_bytes("w", &[k as u64, n as u64], GgmlType::Q8_0, 3);
+                let lin = GgufLinear::from_slice(GgmlType::Q8_0, k, n, &bytes)
+                    .expect("GgufLinear")
+                    .with_fast_q8(true);
+                let xs: Vec<f32> = (0..nt * k)
+                    .map(|i| (((i * 31) % 97) as f32 - 48.0) * 0.01)
+                    .collect();
+                let mut outs = vec![0.0f32; nt * n];
+                let mut old = vec![0.0f32; nt * n];
+                gemv_batch(&lin, &xs, nt, &mut outs).expect("warm-up");
+                assert!(outs.iter().any(|v| *v != 0.0), "{name}: 出力が全 0");
+                // 旧経路 (行ごとに 1 行 GEMV を nt 回) を同じ入力で測る
+                gemv_rows_pertoken(
+                    GgmlType::Q8_0,
+                    true,
+                    &bytes,
+                    k,
+                    n,
+                    &xs,
+                    nt,
+                    &mut old,
+                )
+                .expect("pertoken");
+                assert_bitwise_eq(&old, &outs, &format!("{name}: 旧経路と一致"));
+                let reps = 7;
+                let mut best_new = f64::MAX;
+                let mut best_old = f64::MAX;
+                for _ in 0..reps {
+                    let t0 = Instant::now();
+                    gemv_batch(&lin, &xs, nt, &mut outs).expect("bench");
+                    best_new = best_new.min(t0.elapsed().as_secs_f64());
+                    let t0 = Instant::now();
+                    gemv_rows_pertoken(
+                        GgmlType::Q8_0,
+                        true,
+                        &bytes,
+                        k,
+                        n,
+                        &xs,
+                        nt,
+                        &mut old,
+                    )
+                    .expect("bench old");
+                    best_old = best_old.min(t0.elapsed().as_secs_f64());
+                }
+                tot_new += best_new;
+                tot_old += best_old;
+                println!(
+                    "{name:<11} k={k:<6} n={n:<6} 新 {:7.3} / 旧 {:7.3} ms/chunk  x{:.2}",
+                    best_new * 1e3,
+                    best_old * 1e3,
+                    best_old / best_new
+                );
+            }
+            println!(
+                "合計 新 {:.3} / 旧 {:.3} ms/chunk (= {:.3} / {:.3} ms/token)  x{:.2}",
+                tot_new * 1e3,
+                tot_old * 1e3,
+                tot_new * 1e3 / nt as f64,
+                tot_old * 1e3 / nt as f64,
+                tot_old / tot_new
+            );
         }
 
         /// 層優先バッチ prefill の logits が逐次経路とビット一致する。

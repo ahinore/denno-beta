@@ -816,11 +816,12 @@ fn gemm_rows(
     m: usize,
     out: &mut [f32],
     stride: usize,
+    fused: bool,
 ) {
     debug_assert_eq!(out.len(), m * stride);
     #[cfg(target_arch = "x86_64")]
     {
-        if ty == GgmlType::Q8_0 && q8_0_fused_supported() {
+        if fused && ty == GgmlType::Q8_0 && q8_0_fused_supported() {
             gemm_fused_fired();
             // SAFETY: 引数は check_gemm_args が検証済み (n_in%32==0 は row_bytes が保証) で、
             // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
@@ -828,25 +829,33 @@ fn gemm_rows(
             unsafe { gemm_q8_0_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
             return;
         }
-        if ty == GgmlType::Q5_1 && q8_0_fused_supported() {
+        if fused && ty == GgmlType::Q5_1 && q8_0_fused_supported() {
             gemm_fused_fired();
             // SAFETY: 同上 (Q5_1 のブロックは 32 要素 = 24 バイト)。
             unsafe { gemm_q5_1_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
             return;
         }
-        if ty == GgmlType::Q4K && q4k_fused_supported() {
+        if fused && ty == GgmlType::Q4K && q4k_fused_supported() {
             gemm_fused_fired();
             // SAFETY: 同上 (Q4_K は n_in%256==0 が row_bytes で保証される)。
             unsafe { gemm_q4k_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
             return;
         }
     }
+    let _ = fused;
     gemm_rows_scalar(ty, rb, blocks, n_in, r0, r1, xs, m, out, stride);
 }
 
 /// スカラー経路のバッチ版 ([`expert_gemv_scalar`] を m 回呼んだのと同じ順序)。
 ///
-/// 行のデコードは 1 回だけ行い、m トークンぶんの内積で共有する。
+/// 行を f32 に開かない。**1 ブロックずつデコードし、その場で m トークンぶんの
+/// 積和へ配る** (作業バッファは 1 ブロック = 32 or 256 要素だけ)。重みのバイト列を
+/// 読むのは 1 行あたり 1 回で済む。
+///
+/// 数値: トークン t の累積は「ブロックを先頭から、ブロック内の要素 i を昇順」に
+/// `acc += w[i] * x[i]` する逐次加算そのもの ([`dot_seq`] と同じ順序) なので、
+/// `dequant_row_into` + [`dot_seq`] と**ビット一致**する。トークン方向のループを
+/// 内側に置くか外側に置くかは、各トークンの累積チェーンが独立なので値に影響しない。
 fn gemm_rows_scalar(
     ty: GgmlType,
     rb: usize,
@@ -859,12 +868,31 @@ fn gemm_rows_scalar(
     out: &mut [f32],
     stride: usize,
 ) {
-    let mut row = vec![0.0f32; n_in];
+    let bs = ty.blck_size();
+    let ts = ty.type_size();
+    debug_assert_eq!((n_in / bs) * ts, rb, "gemm_rows_scalar: 行長");
+    let nb = n_in / bs;
+    let mut w = vec![0f32; bs];
+    let mut acc = vec![0f32; m];
     for r in r0..r1 {
-        dequant_row_into(ty, &blocks[r * rb..(r + 1) * rb], &mut row);
-        for t in 0..m {
-            let x = &xs[t * n_in..(t + 1) * n_in];
-            out[t * stride + (r - r0)] = dot_seq(&row, x);
+        for a in acc.iter_mut() {
+            *a = 0.0f32;
+        }
+        let row = &blocks[r * rb..(r + 1) * rb];
+        for b in 0..nb {
+            crate::kquant::dequant_block_into(ty, &row[b * ts..(b + 1) * ts], &mut w);
+            let base = b * bs;
+            for (t, a) in acc.iter_mut().enumerate() {
+                let xb = &xs[t * n_in + base..t * n_in + base + bs];
+                let mut s = *a;
+                for i in 0..bs {
+                    s += w[i] * xb[i];
+                }
+                *a = s;
+            }
+        }
+        for (t, a) in acc.iter().enumerate() {
+            out[t * stride + (r - r0)] = *a;
         }
     }
 }
@@ -1232,7 +1260,26 @@ pub fn expert_gemm_any(
     m: usize,
     outs: &mut [f32],
 ) -> Result<()> {
-    expert_gemm_any_inner(ty, blocks, n_in, n_out, xs, m, outs, true)
+    expert_gemm_inner(ty, blocks, n_in, n_out, xs, m, outs, true, true)
+}
+
+/// [`expert_gemm_any`] の**融合カーネルを使わない**版。
+///
+/// 1 行版がスカラー経路に落ちる入口 (`GgufLinear::gemv` の Q5_1 / `fast_q8` 無しの
+/// Q8_0) をバッチ化するときに使う。融合カーネルは同じ型でも 1 行版と累積順が
+/// 違う (1 ulp ずれる) ので、ここを取り違えるとビット一致が壊れる。
+///
+/// 結果は [`expert_gemv_scalar`] を m 回呼んだ結果とビット一致する。
+pub fn expert_gemm_scalar(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    xs: &[f32],
+    m: usize,
+    outs: &mut [f32],
+) -> Result<()> {
+    expert_gemm_inner(ty, blocks, n_in, n_out, xs, m, outs, true, false)
 }
 
 /// [`expert_gemm_any`] の**行並列を使わない**版。
@@ -1248,10 +1295,10 @@ pub fn expert_gemm_any_seq(
     m: usize,
     outs: &mut [f32],
 ) -> Result<()> {
-    expert_gemm_any_inner(ty, blocks, n_in, n_out, xs, m, outs, false)
+    expert_gemm_inner(ty, blocks, n_in, n_out, xs, m, outs, false, true)
 }
 
-fn expert_gemm_any_inner(
+fn expert_gemm_inner(
     ty: GgmlType,
     blocks: &[u8],
     n_in: usize,
@@ -1260,6 +1307,7 @@ fn expert_gemm_any_inner(
     m: usize,
     outs: &mut [f32],
     par: bool,
+    fused: bool,
 ) -> Result<()> {
     let rb = check_gemm_args(ty, blocks, n_in, n_out, xs, m, outs)?;
     let ranges = gemm_row_ranges(n_out, par);
@@ -1273,7 +1321,7 @@ fn expert_gemm_any_inner(
                 .par_iter()
                 .map(|&(a, b)| {
                     let mut buf = vec![0.0f32; m * (b - a)];
-                    gemm_rows(ty, rb, blocks, n_in, a, b, xs, m, &mut buf, b - a);
+                    gemm_rows(ty, rb, blocks, n_in, a, b, xs, m, &mut buf, b - a, fused);
                     (a, b, buf)
                 })
                 .collect();
@@ -1287,7 +1335,7 @@ fn expert_gemm_any_inner(
         }
     }
     let (a, b) = ranges[0];
-    gemm_rows(ty, rb, blocks, n_in, a, b, xs, m, outs, b - a);
+    gemm_rows(ty, rb, blocks, n_in, a, b, xs, m, outs, b - a, fused);
     Ok(())
 }
 

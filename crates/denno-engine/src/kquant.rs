@@ -184,6 +184,26 @@ pub fn dequant_row_into(ty: GgmlType, blocks: &[u8], out: &mut [f32]) {
     }
 }
 
+/// 1 ブロックだけを f32 へ開く ([`dequant_row_into`] の 1 ブロック版)。
+///
+/// 中身は [`dequant_row_into`] が行ごとに呼ぶのと同じ [`dequant_block`] なので、
+/// 同じバイト列からは同じ f32 列になる (ビット一致)。バッチ GEMV が
+/// 「ブロックを 1 回だけ開いて全トークンへ配る」ために使う。
+pub fn dequant_block_into(ty: GgmlType, block: &[u8], out: &mut [f32]) {
+    let bs = ty.blck_size();
+    let ts = ty.type_size();
+    debug_assert_eq!(block.len(), ts, "dequant_block_into: ブロック長");
+    debug_assert_eq!(out.len(), bs, "dequant_block_into: 出力長");
+    match ty {
+        GgmlType::F32 => out[0] = f32::from_le_bytes([block[0], block[1], block[2], block[3]]),
+        GgmlType::F16 => out[0] = f16_to_f32(&block[0..2]),
+        GgmlType::Bf16 => {
+            out[0] = f32::from_bits((u16::from_le_bytes([block[0], block[1]]) as u32) << 16)
+        }
+        _ => dequant_block(ty, block, out),
+    }
+}
+
 /// 1 ブロックのデ量子化 (llama.cpp のループ本体と 1:1 対応・出力順も同一)。
 fn dequant_block(ty: GgmlType, x: &[u8], y: &mut [f32]) {
     match ty {

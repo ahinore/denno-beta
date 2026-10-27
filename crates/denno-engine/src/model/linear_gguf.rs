@@ -79,6 +79,11 @@ impl GgufLinear {
         self
     }
 
+    /// Q8_0 の融合カーネルが有効か (既定 false)。
+    pub fn fast_q8(&self) -> bool {
+        self.fast_q8
+    }
+
     /// スライスから作る (テスト・小さいテンソル用)。
     pub fn from_slice(ty: GgmlType, k: usize, n: usize, bytes: &[u8]) -> Result<Self> {
         Self::new(ty, k, n, WeightBlocks::from_vec(bytes.to_vec()))
