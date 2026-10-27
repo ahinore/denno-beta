@@ -253,6 +253,66 @@ impl GgufTokenizer {
         }
     }
 
+    /// メッセージ列を chat_template で描画してトークン列にする (多ターン用)。
+    ///
+    /// `messages` は `(role, text)` の古い順。`tools` は HF の tools 配列
+    /// (無ければ `None`)。描画に失敗したら system と最後の user だけで組む
+    /// ([`Self::encode_chat`]) に落ちる。
+    pub fn encode_messages(
+        &self,
+        system: Option<&str>,
+        messages: &[(String, String)],
+        tools: Option<&serde_json::Value>,
+        enable_thinking: bool,
+    ) -> Result<Vec<u32>> {
+        let fallback = || -> Result<Vec<u32>> {
+            let last = messages
+                .iter()
+                .rev()
+                .find(|(r, _)| r == "user")
+                .map(|(_, t)| t.as_str())
+                .unwrap_or("");
+            self.encode_chat(system, last)
+        };
+        let Some(tpl) = &self.chat_template else {
+            return fallback();
+        };
+        let mut msgs: Vec<serde_json::Value> = Vec::new();
+        if let Some(sys) = system {
+            if !sys.is_empty() {
+                msgs.push(serde_json::json!({"role": "system", "content": sys}));
+            }
+        }
+        for (role, text) in messages {
+            msgs.push(serde_json::json!({"role": role, "content": text}));
+        }
+        let token_str = |id: Option<u32>| -> serde_json::Value {
+            id.and_then(|i| self.tok.id_to_token(i))
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null)
+        };
+        let ctx = serde_json::json!({
+            "messages": msgs,
+            "add_generation_prompt": true,
+            "bos_token": token_str(self.bos),
+            "eos_token": token_str(self.eos),
+            "pad_token": serde_json::Value::Null,
+            "tools": tools.cloned().unwrap_or(serde_json::Value::Null),
+            "enable_thinking": enable_thinking,
+        });
+        let mut env = minijinja::Environment::new();
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+        match env.render_str(tpl, ctx) {
+            Ok(s) if !s.is_empty() => self.encode(&s),
+            Ok(_) => fallback(),
+            Err(e) => {
+                tracing::warn!("chat_template の描画に失敗、1 ターンに落とす: {e}");
+                fallback()
+            }
+        }
+    }
+
     pub fn eos(&self) -> Option<u32> {
         self.eos
     }

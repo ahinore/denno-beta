@@ -1,6 +1,7 @@
 //! denno: TensorFold 型の単一バイナリ CLI (pull / models / info / generate / serve)
 
 mod pull;
+mod serve_flash;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -43,6 +44,26 @@ enum Commands {
         #[arg(long, default_value = "fp32")] quant: String,
         /// chat template を適用しない(生プロンプト)
         #[arg(long)] raw: bool,
+    },
+    /// Qwen3.8-Flash-Next (arch qwen4exp) の最小サーバー。
+    /// 27B 用の `serve` とは別経路 (Engine 実装を持たない別アーキのため)。
+    ServeFlash {
+        /// 分割 GGUF のあるディレクトリ
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8098)]
+        port: u16,
+        /// コンテキスト長 (KV / GDN 状態の容量)
+        #[arg(long, default_value_t = 4096)]
+        max_ctx: usize,
+        /// クライアントに広告するモデルID
+        #[arg(long)]
+        name: Option<String>,
+        /// 1 リクエストの生成上限 (max_tokens 未指定時の既定でもある)
+        #[arg(long, default_value_t = 512)]
+        max_tokens: usize,
     },
     /// HTTP サーバー起動 (Anthropic Messages API)
     Serve {
@@ -554,6 +575,16 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
+        Commands::ServeFlash { dir, host, port, max_ctx, name, max_tokens } => {
+            serve_flash::run(serve_flash::FlashConfig {
+                dir,
+                host,
+                port,
+                max_ctx,
+                name: name.unwrap_or_else(|| "qwen3.8-flash-next".to_string()),
+                max_tokens,
+            })?;
+        }
         Commands::Pull { repo } => {
             let dir = model_dir(&repo);
             pull::pull(&repo, &dir)?;
