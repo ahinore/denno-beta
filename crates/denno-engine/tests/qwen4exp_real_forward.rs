@@ -672,3 +672,71 @@ fn real_model_dump_gdn0() {
     }
     eprintln!("dumped");
 }
+
+/// 実重みで prefill の逐次 vs バッチを測る (`DENNO_PREFILL_BATCH` の効果)。
+///
+/// 同じプロンプトを 2 つのインスタンスに流し、出力 logits を `to_bits()` で
+/// 突き合わせてから時間を比べる。数値が一致しなければ時間は出さない。
+#[test]
+#[ignore]
+fn real_model_prefill_timings() {
+    use std::time::Instant;
+    let parts = match parts() {
+        Some(p) => p,
+        None => {
+            eprintln!("DENNO_Q4_DIR が無いので skip");
+            return;
+        }
+    };
+    let build = |parts: &[std::path::PathBuf]| {
+        let f = GgufFile::open_split(parts).expect("分割 GGUF を開けない");
+        let p = Qwen4ExpParams::from_meta(&f).expect("メタデータを読めない");
+        let full = FullAttn::from_gguf(&f, &p, 32).expect("FullAttn");
+        let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
+        Qwen4Exp::with_attn(&f, Box::new(attn)).expect("モデルを組めない")
+    };
+    let n = 32usize;
+    let ctx: Vec<u32> = (0..n).map(|i| 100 + (i as u32 % 50)).collect();
+
+    // 逐次
+    let mut m1 = build(&parts);
+    let _ = m1.forward_prefill_with(&ctx[..3], false).expect("warm-up seq");
+    let t0 = Instant::now();
+    let l1 = m1.forward_prefill_with(&ctx, false).expect("prefill seq");
+    let d_seq = t0.elapsed();
+
+    // バッチ
+    let mut m2 = build(&parts);
+    let _ = m2.forward_prefill_with(&ctx[..3], false).expect("warm-up batch");
+    let t1 = Instant::now();
+    let l2 = m2.forward_prefill_with(&ctx, true).expect("prefill batch");
+    let d_bat = t1.elapsed();
+
+    assert_eq!(l1.len(), l2.len(), "logits の長さが違う");
+    let diff = l1
+        .iter()
+        .zip(l2.iter())
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let argmax = |v: &[f32]| {
+        let mut bi = 0usize;
+        for (i, x) in v.iter().enumerate() {
+            if *x > v[bi] {
+                bi = i;
+            }
+        }
+        bi
+    };
+    eprintln!(
+        "PREFILL {} tok: 逐次 {:.0} ms ({:.1} ms/tok) / バッチ {:.0} ms ({:.1} ms/tok) / 差 {} 要素 / argmax {} vs {}",
+        n,
+        d_seq.as_secs_f64() * 1e3,
+        d_seq.as_secs_f64() * 1e3 / n as f64,
+        d_bat.as_secs_f64() * 1e3,
+        d_bat.as_secs_f64() * 1e3 / n as f64,
+        diff,
+        argmax(&l1),
+        argmax(&l2)
+    );
+    assert_eq!(diff, 0, "バッチ経路の logits が逐次と一致しない");
+}
