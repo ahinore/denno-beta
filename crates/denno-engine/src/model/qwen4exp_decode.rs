@@ -135,6 +135,23 @@ impl Qwen4ExpDecoder {
         Ok(logits)
     }
 
+    /// 層優先のバッチ経路で prefill する (`batch == false` なら [`Self::prefill`] と同じ)。
+    ///
+    /// `Qwen4Exp::forward_prefill_with` にそのまま渡し、`tokens` を同期させる。
+    /// 数値は逐次版と一致する (テスト `real_model_prefill_timings` が logits の
+    /// `to_bits()` で突き合わせている)。速さは層優先 + 行並列ぶんだけ違う。
+    pub fn prefill_batched(&mut self, prompt: &[u32], batch: bool) -> Result<Vec<f32>> {
+        if prompt.is_empty() {
+            return Err(one("prefill_batched: プロンプトが空"));
+        }
+        if !batch {
+            return self.prefill(prompt);
+        }
+        let logits = self.model.forward_prefill_with(prompt, true)?;
+        self.tokens.extend_from_slice(prompt);
+        Ok(logits)
+    }
+
     /// 貪欲に `n_new` 個伸ばす。生成した id を返す (プロンプトは含めない)。
     ///
     /// `n_new == 0` は何も食わせずに空を返す (エラーにしない)。

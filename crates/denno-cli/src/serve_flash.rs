@@ -8,8 +8,10 @@
 //! - `GET /v1/models`
 //! - `GET /health`
 //!
-//! 状態はリクエストごとに組み直す (KV / GDN / PLE の窓を確実に空にするため)。
-//! mmap 越しなので組み直しはページキャッシュに乗っていれば軽い。
+//! 直前のリクエストの状態 (KV / GDN / PLE の窓) を 1 つだけ保持し、次の
+//! プロンプトが**そのトークン列の続き**なら差分だけ食わせる。会話のたびに
+//! システムプロンプトを読み直さないための仕組みで、前置きが一致しないときは
+//! モデルを組み直して最初から prefill する。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -167,32 +169,38 @@ impl GenReq {
     }
 }
 
+/// 直前のリクエストの状態。`toks` は `dec` が食ったトークン列 (古い順)。
+struct Cached {
+    dec: Qwen4ExpDecoder,
+    toks: Vec<u32>,
+    logits: Vec<f32>,
+}
+
 struct Flash {
     parts: Vec<PathBuf>,
     max_ctx: usize,
     name: String,
     default_max: usize,
+    tok: GgufTokenizer,
+    /// 層優先のバッチ prefill を使うか (`DENNO_PREFILL_BATCH=0` で切れる)
+    batch: bool,
+    cache: Option<Cached>,
 }
 
 impl Flash {
-    /// モデルとトークナイザを組み直す (mmap 越し)。
-    fn build(&self) -> Result<(Qwen4Exp, GgufTokenizer)> {
+    /// モデルを組む (mmap 越し)。
+    fn build_model(&self) -> Result<Qwen4Exp> {
         let f = GgufFile::open_split(&self.parts).context("分割 GGUF を開けない")?;
         let p = Qwen4ExpParams::from_meta(&f).context("メタデータを読めない")?;
-        let tok = GgufTokenizer::from_gguf(&f).context("トークナイザを組めない")?;
         let full = FullAttn::from_gguf(&f, &p, self.max_ctx).context("FullAttn")?;
         let attn = SsmAttn::with_full(&f, &p, Box::new(full)).context("SsmAttn")?;
-        let m = Qwen4Exp::with_attn(&f, Box::new(attn)).context("モデルを組めない")?;
-        Ok((m, tok))
+        Qwen4Exp::with_attn(&f, Box::new(attn)).context("モデルを組めない")
     }
 
     /// 生成して、確定した本文を返す。`emit` は差分テキストを受け取る。
-    fn generate(&self, req: &GenReq, mut emit: impl FnMut(&str) -> Result<()>) -> Result<GenOut> {
-        let t0 = Instant::now();
-        let (m, tok) = self.build()?;
-        let t_build = t0.elapsed().as_secs_f64();
-
-        let prompt = tok
+    fn generate(&mut self, req: &GenReq, mut emit: impl FnMut(&str) -> Result<()>) -> Result<GenOut> {
+        let prompt = self
+            .tok
             .encode_messages(
                 req.system.as_deref(),
                 &req.messages,
@@ -212,9 +220,26 @@ impl Flash {
         }
         let n_prompt = prompt.len();
 
-        let mut d = Qwen4ExpDecoder::new(m, DecoderConfig::new(self.max_ctx));
+        // 直前の状態が使えるなら差分だけ食わせる。
         let t1 = Instant::now();
-        let mut logits = d.prefill(&prompt).context("prefill")?;
+        let mut reused = 0usize;
+        let (mut dec, mut logits) = match self.cache.take() {
+            Some(mut c) if c.toks.len() <= prompt.len() && prompt[..c.toks.len()] == c.toks[..] => {
+                reused = c.toks.len();
+                if reused < prompt.len() {
+                    let lg = c.dec.prefill_batched(&prompt[reused..], self.batch)?;
+                    (c.dec, lg)
+                } else {
+                    (c.dec, c.logits)
+                }
+            }
+            _ => {
+                let m = self.build_model()?;
+                let mut d = Qwen4ExpDecoder::new(m, DecoderConfig::new(self.max_ctx));
+                let lg = d.prefill_batched(&prompt, self.batch)?;
+                (d, lg)
+            }
+        };
         let t_prefill = t1.elapsed().as_secs_f64();
 
         let mut sampler = Sampler::new(
@@ -227,10 +252,11 @@ impl Flash {
             req.top_p,
             Some(42),
         );
-        let eos = tok.eos();
+        let eos = self.tok.eos();
         let mut out: Vec<u32> = Vec::new();
         let mut text = String::new();
         let mut stop_hit: Option<String> = None;
+        let mut failed: Option<anyhow::Error> = None;
         let t2 = Instant::now();
         for _ in 0..req.max_tokens {
             let id = sampler.sample(&logits) as u32;
@@ -238,9 +264,8 @@ impl Flash {
                 break;
             }
             out.push(id);
-            let full = tok.decode(&out).unwrap_or_default();
+            let full = self.tok.decode(&out).unwrap_or_default();
             if full.len() > text.len() && full.starts_with(&text) {
-                let delta = full[text.len()..].to_string();
                 // 停止語が本文に現れたら、そこまでで切る
                 let mut cut: Option<usize> = None;
                 for s in &req.stop_sequences {
@@ -251,26 +276,43 @@ impl Flash {
                 if let Some(c) = cut {
                     let keep = &full[..c];
                     if keep.len() > text.len() {
-                        emit(&keep[text.len()..])?;
+                        if let Err(e) = emit(&keep[text.len()..]) {
+                            failed = Some(e);
+                        }
                     }
                     text = keep.to_string();
                     stop_hit = Some("stop_sequence".into());
                     break;
                 }
-                emit(&delta)?;
+                if let Err(e) = emit(&full[text.len()..]) {
+                    failed = Some(e);
+                    break;
+                }
                 text = full;
             } else {
                 text = full;
             }
-            logits = d.step(id).context("decode")?;
+            match dec.step(id) {
+                Ok(lg) => logits = lg,
+                Err(e) => {
+                    failed = Some(e.into());
+                    break;
+                }
+            }
         }
         let t_decode = t2.elapsed().as_secs_f64();
         eprintln!(
-            "[flash] prompt={n_prompt} out={} build={t_build:.2}s prefill={t_prefill:.2}s ({:.0} ms/tok) decode={t_decode:.2}s ({:.0} ms/tok)",
+            "[flash] prompt={n_prompt} reuse={reused} out={} prefill={t_prefill:.2}s ({:.0} ms/tok) decode={t_decode:.2}s ({:.0} ms/tok)",
             out.len(),
-            t_prefill * 1e3 / n_prompt.max(1) as f64,
+            t_prefill * 1e3 / (n_prompt - reused).max(1) as f64,
             t_decode * 1e3 / out.len().max(1) as f64
         );
+        // 途中で失敗したら状態は信用しない (次のリクエストで組み直す)。
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        let toks = dec.tokens().to_vec();
+        self.cache = Some(Cached { dec, toks, logits });
         Ok(GenOut {
             text,
             n_prompt,
@@ -373,7 +415,7 @@ fn sse_event(stream: &mut TcpStream, name: &str, data: &Value) -> Result<()> {
     Ok(())
 }
 
-fn handle(flash: &Flash, mut stream: TcpStream) -> Result<()> {
+fn handle(flash: &mut Flash, mut stream: TcpStream) -> Result<()> {
     stream.set_nodelay(true).ok();
     let mut r = BufReader::new(stream.try_clone()?);
     let Some(req) = read_req(&mut r)? else {
@@ -539,21 +581,31 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
             .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
             .collect::<Vec<_>>()
     );
-    let flash = Flash {
+    let t = Instant::now();
+    let f = GgufFile::open_split(&parts).context("分割 GGUF を開けない")?;
+    let tok = GgufTokenizer::from_gguf(&f).context("トークナイザを組めない")?;
+    drop(f);
+    let batch = std::env::var("DENNO_PREFILL_BATCH").ok().as_deref() != Some("0");
+    let chunk = std::env::var("DENNO_PREFILL_BATCH_CHUNK").unwrap_or_else(|_| "8".into());
+    let mut flash = Flash {
         parts,
         max_ctx: cfg.max_ctx,
         name: cfg.name.clone(),
         default_max: cfg.max_tokens,
+        tok,
+        batch,
+        cache: None,
     };
     // 起動時に 1 回組んで、読めないならここで落とす
-    let t = Instant::now();
-    let (_m, tok) = flash.build().context("起動時のロード")?;
+    let m = flash.build_model().context("起動時のロード")?;
+    drop(m);
     eprintln!(
-        "[flash] load ok {:.1}s eos={:?}",
+        "[flash] load ok {:.1}s eos={:?} batch={} chunk={}",
         t.elapsed().as_secs_f64(),
-        tok.eos()
+        flash.tok.eos(),
+        flash.batch,
+        chunk
     );
-    drop(_m);
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = TcpListener::bind(&addr).with_context(|| format!("{addr} を listen できない"))?;
@@ -561,10 +613,9 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     for s in listener.incoming() {
         match s {
             Ok(stream) => {
-                let f = &flash;
                 let t = Instant::now();
                 // 逐次処理 (モデルは 1 つ、同時リクエストは受けない)
-                if let Err(e) = handle(f, stream) {
+                if let Err(e) = handle(&mut flash, stream) {
                     eprintln!("[flash] リクエスト失敗: {e:#}");
                 }
                 eprintln!("[flash] request done {:.1}s", t.elapsed().as_secs_f64());
