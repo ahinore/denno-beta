@@ -292,53 +292,13 @@ fn gdn_head(
     let g = cw.ssm_a[h] * softplus(alpha[h] + cw.ssm_dt[h]);
     let eg = g.exp();
 
-    // S ← S * exp(g)   (S[h] は [dk][dv] 行優先)
-    for r in 0..dk {
-        for c in 0..dv {
-            s_head[r * dv + c] *= eg;
-        }
-    }
-
-    // sk[c] = Σ_r k[r] * S[r][c]
-    let mut sk = vec![0.0f32; dv];
-    for r in 0..dk {
-        let kr = kh_v[r];
-        if kr != 0.0 {
-            let row = &s_head[r * dv..r * dv + dv];
-            for (c, skc) in sk.iter_mut().enumerate() {
-                *skc += kr * row[c];
-            }
-        }
-    }
-
-    // d[c] = beta * (v[c] - sk[c])
+    // beta
     let b = sigmoid(beta_raw[h]);
+
+    // 本体 (デルタ則)。作業域はヘッド 1 本ぶん (チャンク版と同じ関数を使う)
+    let mut sk = vec![0.0f32; dv];
     let mut d = vec![0.0f32; dv];
-    for c in 0..dv {
-        d[c] = b * (vh[c] - sk[c]);
-    }
-
-    // S[r][c] += k[r] * d[c]
-    for r in 0..dk {
-        let kr = kh_v[r];
-        if kr != 0.0 {
-            let row = &mut s_head[r * dv..r * dv + dv];
-            for (c, dc) in d.iter().enumerate() {
-                row[c] += kr * dc;
-            }
-        }
-    }
-
-    // o[c] = Σ_r q[r] * S[r][c]
-    for r in 0..dk {
-        let qr = qh[r];
-        if qr != 0.0 {
-            let row = &s_head[r * dv..r * dv + dv];
-            for (c, oc) in o_head.iter_mut().enumerate() {
-                *oc += qr * row[c];
-            }
-        }
-    }
+    gdn_head_step(dk, dv, qh, kh_v, vh, eg, b, s_head, o_head, &mut sk, &mut d);
 }
 
 pub fn forward_token_core_gate(
@@ -516,6 +476,496 @@ pub fn forward_token_core_gate(
         gdump("y", &y); // gated norm 後
     }
 
+    y
+}
+
+// ---------------------------------------------------------------------------
+// P-PF-GDN: チャンク版 (トークン逐次のループをヘッド並列に置き換える)
+// ---------------------------------------------------------------------------
+//
+// 現行のバッチ prefill は `for i in 0..nt { forward_token_core_gate(..) }` で、
+// 1 トークンあたり 1 回の変換 + 1 回の rayon 分割 (ヘッド) を回す。状態
+// S は 1 層 48 × 128 × 128 × 4 B = 3.1 MB あり、毎トークン全スレッドが触るので
+// L3 帯域で止まる (実測: スキャン ≈215 µs/token = gdn 全体 279 µs/token の 8 割)。
+//
+// ここでは **ヘッド範囲をタスクに固定** し、そのタスクがチャンク全長の
+// トークンループを回す。1 タスク 3 ヘッド = 状態 192 KB が L2 に載ったまま
+// 走る。ヘッドどうしは独立 (S[h] / o[h] がヘッド専用) なので、要素ごとの
+// 演算順序はトークン逐次と同一 = ビット一致。
+
+thread_local! {
+    /// conv 出力の作業域 (grow-only)。`vec![0.0; nt*conv_dim]` を毎回確保すると
+    /// 初回タッチのページフォルトで 21 MB あたり数 ms かかる。
+    static CONV_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// gated norm 出力の作業域 (ヘッド優先・grow-only)。
+    static YH_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// スレッドローカルの grow-only 作業域 (取得 / 返却)。
+macro_rules! scratch_pair {
+    ($get:ident, $put:ident, $tl:ident) => {
+        fn $get(n: usize) -> Vec<f32> {
+            $tl.with(|c| {
+                let mut v = c.borrow_mut();
+                if v.len() < n {
+                    v.resize(n, 0.0);
+                }
+                std::mem::take(&mut *v)
+            })
+        }
+
+        fn $put(v: Vec<f32>) {
+            $tl.with(|c| {
+                let mut s = c.borrow_mut();
+                if s.capacity() < v.capacity() {
+                    *s = v;
+                }
+            });
+        }
+    };
+}
+
+scratch_pair!(conv_scratch, conv_scratch_put, CONV_SCRATCH);
+scratch_pair!(yh_scratch, yh_scratch_put, YH_SCRATCH);
+
+/// 時刻 `tau` (チャンク先頭を 0 とし、負は conv 初期状態) の conv 入力。
+#[inline]
+fn conv_in_at(
+    qkv: &[f32],
+    conv_st: &[f32],
+    cd: usize,
+    cs: usize,
+    tau: isize,
+    ch: usize,
+) -> f32 {
+    if tau >= 0 {
+        qkv[tau as usize * cd + ch]
+    } else {
+        conv_st[ch * cs + (tau + cs as isize) as usize]
+    }
+}
+
+/// デルタ則 1 ヘッドぶんの中身 (減衰 → sk → d → 更新 → o)。
+///
+/// [`gdn_head`] から切り出しただけで演算順序は同一。作業域 `sk` / `d` を
+/// 呼び出し側が持つので、ヘッド×トークンごとの `vec![]` が消える。
+#[allow(clippy::too_many_arguments)]
+fn gdn_head_step(
+    dk: usize,
+    dv: usize,
+    qh: &[f32],
+    kh_v: &[f32],
+    vh: &[f32],
+    eg: f32,
+    b: f32,
+    s_head: &mut [f32],
+    o_head: &mut [f32],
+    sk: &mut [f32],
+    d: &mut [f32],
+) {
+    // すべて zip で回す: スライス添字だと要素ごとの境界チェックが残り、
+    // LLVM がベクトル化を諦める (実測でスカラー 1 要素/cycle まで落ちる)。
+    let s = &mut s_head[..dk * dv];
+
+    // S ← S * exp(g)
+    for v in s.iter_mut() {
+        *v *= eg;
+    }
+
+    // sk[c] = Σ_r k[r] * S[r][c]
+    for v in sk[..dv].iter_mut() {
+        *v = 0.0;
+    }
+    for r in 0..dk {
+        let kr = kh_v[r];
+        if kr != 0.0 {
+            let row = &s[r * dv..r * dv + dv];
+            for (skc, rc) in sk.iter_mut().zip(row.iter()) {
+                *skc += kr * rc;
+            }
+        }
+    }
+
+    // d[c] = beta * (v[c] - sk[c])
+    for ((dc, &vc), &sc) in d.iter_mut().zip(vh.iter()).zip(sk.iter()) {
+        *dc = b * (vc - sc);
+    }
+
+    // S[r][c] += k[r] * d[c]
+    for r in 0..dk {
+        let kr = kh_v[r];
+        if kr != 0.0 {
+            let row = &mut s[r * dv..r * dv + dv];
+            for (rc, &dc) in row.iter_mut().zip(d.iter()) {
+                *rc += kr * dc;
+            }
+        }
+    }
+
+    // o[c] = Σ_r q[r] * S[r][c]
+    for r in 0..dk {
+        let qr = qh[r];
+        if qr != 0.0 {
+            let row = &s[r * dv..r * dv + dv];
+            for (oc, rc) in o_head.iter_mut().zip(row.iter()) {
+                *oc += qr * rc;
+            }
+        }
+    }
+}
+
+/// (a) conv1d + silu を全トークン一括で計算し `cv[t * conv_dim + c]` に書く。
+///
+/// 出力をトークン方向のブロックに切り、1 タスクがそのブロックを走査する
+/// (書き込みは連続・作業域は「直前 3 トークン × ブロック幅」だけ)。
+/// 1 要素の計算は `acc = 0; acc += w[j]*in[j] (j=0..d_conv)` の昇順そのままで、
+/// [`forward_token_core_gate`] の `zip` 版と同一の丸めになる。
+fn conv_silu_all(
+    p: &GdnParams,
+    cw: &GdnCore<'_>,
+    qkv: &[f32],
+    conv_st: &[f32],
+    cv: &mut [f32],
+    nt: usize,
+) {
+    let cs = p.d_conv - 1;
+    let dc = p.d_conv;
+    let cd = p.conv_dim();
+    let w = cw.conv1d;
+    if nt == 0 || cd == 0 {
+        return;
+    }
+    let one_block = |t0: usize, out: &mut [f32]| {
+        let ntb = out.len() / cd;
+        // ブロック先頭の直前 3 行 (負の時刻は conv 初期状態) を 1 本に詰める
+        let mut pre = vec![0.0f32; cs * cd];
+        for i in 0..cs {
+            let tau = t0 as isize - cs as isize + i as isize;
+            let dst = &mut pre[i * cd..(i + 1) * cd];
+            if tau >= 0 {
+                dst.copy_from_slice(&qkv[tau as usize * cd..(tau as usize + 1) * cd]);
+            } else {
+                let si = (tau + cs as isize) as usize;
+                for (ch, d) in dst.iter_mut().enumerate() {
+                    *d = conv_st[ch * cs + si];
+                }
+            }
+        }
+        let mut r0 = &pre[0..cd];
+        let mut r1 = &pre[cd..2 * cd];
+        let mut r2 = &pre[2 * cd..3 * cd];
+        for tt in 0..ntb {
+            let t = t0 + tt;
+            let r3 = &qkv[t * cd..(t + 1) * cd];
+            let o = &mut out[tt * cd..(tt + 1) * cd];
+            for c in 0..cd {
+                let wr = &w[c * dc..c * dc + dc];
+                let mut acc = 0.0f32;
+                acc += wr[0] * r0[c];
+                acc += wr[1] * r1[c];
+                acc += wr[2] * r2[c];
+                acc += wr[3] * r3[c];
+                o[c] = silu(acc);
+            }
+            r0 = r1;
+            r1 = r2;
+            r2 = r3;
+        }
+    };
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        let tb = (nt / rayon::current_num_threads().max(1)).max(1);
+        cv.par_chunks_mut(tb * cd)
+            .enumerate()
+            .for_each(|(bi, out)| one_block(bi * tb, out));
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        one_block(0, cv);
+    }
+}
+
+/// (b) beta / alpha の変換 (sigmoid / softplus / exp) を全トークン一括。
+/// トークン×ヘッドで独立なので、どの順に計算しても値は変わらない。
+fn gate_table(
+    p: &GdnParams,
+    cw: &GdnCore<'_>,
+    beta_raw: &[f32],
+    alpha: &[f32],
+    nt: usize,
+    egt: &mut [f32],
+    bt: &mut [f32],
+) {
+    let nv = p.n_v_heads;
+    if nv == 0 {
+        return;
+    }
+    let one = |t: usize, e: &mut [f32], b: &mut [f32]| {
+        for h in 0..nv {
+            let g = cw.ssm_a[h] * softplus(alpha[t * nv + h] + cw.ssm_dt[h]);
+            e[h] = g.exp();
+            b[h] = sigmoid(beta_raw[t * nv + h]);
+        }
+    };
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        egt.par_chunks_mut(nv)
+            .zip(bt.par_chunks_mut(nv))
+            .enumerate()
+            .for_each(|(t, (e, b))| {
+                if t < nt {
+                    one(t, e, b);
+                }
+            });
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        for t in 0..nt {
+            one(t, &mut egt[t * nv..(t + 1) * nv], &mut bt[t * nv..(t + 1) * nv]);
+        }
+    }
+}
+
+/// タスクあたりのヘッド数。48 ヘッド / 16 スレッド = 3 (状態 192 KB が L2 に載る)。
+fn batch_head_group(nv: usize) -> usize {
+    #[cfg(feature = "par")]
+    {
+        let th = rayon::current_num_threads().max(1);
+        nv.div_ceil(th).max(1)
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        nv.max(1)
+    }
+}
+
+/// (c)(d) スキャン + gated RMS norm。`h0` から `nh` ヘッドぶんを、
+/// トークン順を保ったまま処理する (1 タスク = 1 グループ)。
+///
+/// 出力は **ヘッド優先** `yh[hh * nt * dv + t * dv + c]` に書く。タスクが
+/// 連続した出力スライスを持てるようにするため (トークン優先の `y` は
+/// ヘッド方向に切れない)。並べ替えは [`transpose_y`] で 1 回だけ行う。
+#[allow(clippy::too_many_arguments)]
+fn scan_gate_group(
+    p: &GdnParams,
+    cw: &GdnCore<'_>,
+    cv: &[f32],
+    z: &[f32],
+    egt: &[f32],
+    bt: &[f32],
+    nt: usize,
+    h0: usize,
+    sgrp: &mut [f32],
+    yh: &mut [f32],
+    gate: GateKind,
+) {
+    let dk = p.head_k_dim;
+    let dv = p.head_v_dim;
+    let kd = p.key_dim();
+    let cd = p.conv_dim();
+    let vd = p.value_dim();
+    let nv = p.n_v_heads;
+    let nk = p.n_k_heads;
+    let q_scale = 1.0 / (dk as f32).sqrt();
+    let nh = sgrp.len() / (dk * dv);
+    // ヘッド専用の作業域 (トークン×ヘッドごとの vec![] を消す)
+    let mut qb = vec![0.0f32; dk];
+    let mut kb = vec![0.0f32; dk];
+    let mut sk = vec![0.0f32; dv];
+    let mut dl = vec![0.0f32; dv];
+    let mut o = vec![0.0f32; dv];
+    for t in 0..nt {
+        let row = &cv[t * cd..(t + 1) * cd];
+        for hh in 0..nh {
+            let h = h0 + hh;
+            // q/k は k-head 単位に L2 正規化 + q のみスケール (現行と同一)
+            let ko = (h % nk) * dk;
+            qb.copy_from_slice(&row[ko..ko + dk]);
+            kb.copy_from_slice(&row[kd + ko..kd + ko + dk]);
+            l2_norm(&mut qb, p.eps);
+            l2_norm(&mut kb, p.eps);
+            for v in qb.iter_mut() {
+                *v *= q_scale;
+            }
+            for v in o.iter_mut() {
+                *v = 0.0;
+            }
+            let sh = &mut sgrp[hh * dk * dv..(hh + 1) * dk * dv];
+            let vh = &row[2 * kd + h * dv..2 * kd + (h + 1) * dv];
+            gdn_head_step(
+                dk,
+                dv,
+                &qb,
+                &kb,
+                vh,
+                egt[t * nv + h],
+                bt[t * nv + h],
+                sh,
+                &mut o,
+                &mut sk,
+                &mut dl,
+            );
+            // gated RMS norm: rmsnorm(o) * w * g(z)
+            rms_norm(&mut o, p.eps);
+            let base = hh * nt * dv + t * dv;
+            let yo = &mut yh[base..base + dv];
+            let zo = t * vd + h * dv;
+            for (c, v) in o.iter_mut().enumerate() {
+                let zc = z[zo + c];
+                let g = match gate {
+                    GateKind::Silu => silu(zc),
+                    GateKind::Sigmoid => sigmoid(zc),
+                };
+                yo[c] = *v * (cw.ssm_norm[c] * g);
+            }
+        }
+    }
+}
+
+/// ヘッド優先 `yh[h * nt * dv + t * dv]` → トークン優先 `y[t * vd + h * dv]`。
+fn transpose_y(yh: &[f32], y: &mut [f32], nt: usize, nv: usize, vd: usize, dv: usize) {
+    let one = |t: usize, out: &mut [f32]| {
+        for h in 0..nv {
+            let s = h * nt * dv + t * dv;
+            out[h * dv..(h + 1) * dv].copy_from_slice(&yh[s..s + dv]);
+        }
+    };
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        y.par_chunks_mut(vd).enumerate().for_each(|(t, out)| {
+            if t < nt {
+                one(t, out);
+            }
+        });
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        for t in 0..nt {
+            one(t, &mut y[t * vd..(t + 1) * vd]);
+        }
+    }
+}
+
+/// (c)(d) をヘッドグループ並列で回す。`group` はテスト・計測用に外から与える。
+#[allow(clippy::too_many_arguments)]
+fn scan_gate_all(
+    p: &GdnParams,
+    cw: &GdnCore<'_>,
+    cv: &[f32],
+    z: &[f32],
+    egt: &[f32],
+    bt: &[f32],
+    nt: usize,
+    ssm: &mut [f32],
+    yh: &mut [f32],
+    y: &mut [f32],
+    gate: GateKind,
+    group: usize,
+) {
+    let dk = p.head_k_dim;
+    let dv = p.head_v_dim;
+    let vd = p.value_dim();
+    let nv = p.n_v_heads;
+    let group = group.max(1);
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        ssm.par_chunks_mut(group * dk * dv)
+            .zip(yh.par_chunks_mut(group * nt * dv))
+            .enumerate()
+            .for_each(|(gi, (s, yy))| {
+                scan_gate_group(p, cw, cv, z, egt, bt, nt, gi * group, s, yy, gate);
+            });
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        for (gi, (s, yy)) in ssm
+            .chunks_mut(group * dk * dv)
+            .zip(yh.chunks_mut(group * nt * dv))
+            .enumerate()
+        {
+            scan_gate_group(p, cw, cv, z, egt, bt, nt, gi * group, s, yy, gate);
+        }
+    }
+    transpose_y(yh, y, nt, nv, vd, dv);
+}
+
+/// チャンク版 GDN 本体。`qkv` / `z` / `beta_raw` / `alpha` は投影済みの
+/// チャンク一括バッファ (`[nt][dim]`)。戻り値は `[nt][value_dim]`。
+///
+/// [`forward_token_core_gate`] を nt 回呼ぶのと **f32 でビット一致**する。
+/// 根拠: (1) conv / L2 / beta・alpha 変換 / gated RMS norm は要素ごとに独立、
+/// (2) デルタ則の状態と出力はヘッド専用で、ヘッドをまたぐ依存が無い。
+/// どちらもトークン方向の順序を保てば丸め順が変わらない。
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_core_gate(
+    p: &GdnParams,
+    cw: &GdnCore<'_>,
+    qkv: &[f32],
+    z: &[f32],
+    beta_raw: &[f32],
+    alpha: &[f32],
+    st: &mut GdnState,
+    gate: GateKind,
+) -> Vec<f32> {
+    let cd = p.conv_dim();
+    let vd = p.value_dim();
+    let nv = p.n_v_heads;
+    let cs = p.d_conv - 1;
+    let nt = if vd == 0 { 0 } else { z.len() / vd };
+    if nt == 0 {
+        return Vec::new();
+    }
+    debug_assert_eq!(qkv.len(), nt * cd);
+    debug_assert_eq!(beta_raw.len(), nt * nv);
+    debug_assert_eq!(alpha.len(), nt * nv);
+    debug_assert_eq!(st.conv.len(), cd * cs);
+    debug_assert_eq!(st.ssm.len(), nv * p.head_k_dim * p.head_v_dim);
+
+    let conv_st = st.conv.clone();
+
+    // ---- (a) conv1d + silu (全トークン一括) --------------------------------
+    // 作業域は grow-only (前のチャンクの残りが入っている) ので、長さを明示する。
+    let mut cv = conv_scratch(nt * cd);
+    conv_silu_all(p, cw, qkv, &conv_st, &mut cv[..nt * cd], nt);
+
+    // ---- conv 状態をチャンク末尾へ (入力の末尾 cs 本を写すだけ) ------------
+    for i in 0..cs {
+        let tau = nt as isize - cs as isize + i as isize;
+        for c in 0..cd {
+            st.conv[c * cs + i] = conv_in_at(qkv, &conv_st, cd, cs, tau, c);
+        }
+    }
+
+    // ---- (b) beta / alpha の変換 -----------------------------------------
+    let mut egt = vec![0.0f32; nt * nv];
+    let mut bt = vec![0.0f32; nt * nv];
+    gate_table(p, cw, beta_raw, alpha, nt, &mut egt, &mut bt);
+
+    // ---- (c)(d) スキャン + gated RMS norm ---------------------------------
+    let mut yh = yh_scratch(nt * vd);
+    let mut y = vec![0.0f32; nt * vd];
+    let group = batch_head_group(nv);
+    scan_gate_all(
+        p,
+        cw,
+        &cv[..nt * cd],
+        z,
+        &egt,
+        &bt,
+        nt,
+        &mut st.ssm,
+        &mut yh[..nt * vd],
+        &mut y,
+        gate,
+        group,
+    );
+
+    conv_scratch_put(cv);
+    yh_scratch_put(yh);
     y
 }
 
@@ -1543,6 +1993,378 @@ mod tests {
         assert_eq!(bits(&a), bits(&b));
         assert_eq!(bits(&s1.ssm), bits(&s2.ssm));
         assert_eq!(bits(&s1.conv), bits(&s2.conv));
+    }
+
+    /// チャンク版 ([`forward_batch_core_gate`]) がトークン逐次とビット一致すること。
+    /// 形状は実モデル (qwen4exp の ssm 1 層: cd=10240 / vd=6144 / nv=48 / dk=dv=128)。
+    /// 初期状態は**非ゼロの乱数**にして conv プロローグ (負の時刻) と状態の持ち越し
+    /// の両方を通す。
+    #[test]
+    fn gdn_batch_matches_token_by_token_bitexact() {
+        let p = GdnParams::qwen4exp();
+        for nt in [1usize, 3, 64, 512] {
+            let (w, qkv, z, beta, alpha) = real_case(nt);
+            let cw = core(&p, &w);
+            let mut rnd = lcg_rng(0xabcd_1234 ^ nt as u64);
+            let st0 = GdnState {
+                conv: (0..p.conv_state_len()).map(|_| rnd()).collect(),
+                ssm: (0..p.ssm_state_len()).map(|_| rnd()).collect(),
+            };
+
+            // 参照: 現行のトークン逐次ループ
+            let mut st_ref = st0.clone();
+            let mut y_ref = vec![0.0f32; nt * p.value_dim()];
+            seq_tokens(&p, &cw, nt, &qkv, &z, &beta, &alpha, &mut st_ref, &mut y_ref);
+
+            // 新: チャンク一括
+            let mut st_new = st0.clone();
+            let y_new = forward_batch_core_gate(
+                &p,
+                &cw,
+                &qkv,
+                &z,
+                &beta,
+                &alpha,
+                &mut st_new,
+                GateKind::Sigmoid,
+            );
+
+            assert_eq!(y_new.len(), nt * p.value_dim(), "nt={nt}: 出力長");
+            assert_eq!(bits(&y_ref), bits(&y_new), "nt={nt}: y がビット不一致");
+            assert_eq!(bits(&st_ref.ssm), bits(&st_new.ssm), "nt={nt}: ssm 状態");
+            assert_eq!(bits(&st_ref.conv), bits(&st_new.conv), "nt={nt}: conv 状態");
+        }
+    }
+
+    /// チャンクを分割しても 1 回で回したのと同じ (状態の持ち越しが正しい)。
+    /// conv 状態は「チャンク末尾の d_conv-1 本」で決まるので、ここがずれると
+    /// 2 回目の先頭トークンだけが静かに壊れる。
+    #[test]
+    fn gdn_batch_chunk_split_matches_single_chunk() {
+        let p = GdnParams::qwen4exp();
+        let nt = 40usize;
+        let (w, qkv, z, beta, alpha) = real_case(nt);
+        let cw = core(&p, &w);
+        let cd = p.conv_dim();
+        let vd = p.value_dim();
+        let nv = p.n_v_heads;
+
+        let mut st_a = GdnState::new(&p);
+        let y_all = forward_batch_core_gate(
+            &p,
+            &cw,
+            &qkv,
+            &z,
+            &beta,
+            &alpha,
+            &mut st_a,
+            GateKind::Sigmoid,
+        );
+
+        let mut st_b = GdnState::new(&p);
+        let mut y_split = Vec::with_capacity(nt * vd);
+        for (t0, t1) in [(0usize, 13usize), (13, 14), (14, 40)] {
+            let n = t1 - t0;
+            let y = forward_batch_core_gate(
+                &p,
+                &cw,
+                &qkv[t0 * cd..t1 * cd],
+                &z[t0 * vd..t1 * vd],
+                &beta[t0 * nv..t1 * nv],
+                &alpha[t0 * nv..t1 * nv],
+                &mut st_b,
+                GateKind::Sigmoid,
+            );
+            assert_eq!(y.len(), n * vd);
+            y_split.extend_from_slice(&y);
+        }
+        assert_eq!(bits(&y_all), bits(&y_split), "分割チャンクで y が変わる");
+        assert_eq!(bits(&st_a.ssm), bits(&st_b.ssm), "分割チャンクで ssm 状態");
+        assert_eq!(bits(&st_a.conv), bits(&st_b.conv), "分割チャンクで conv 状態");
+    }
+
+    // -----------------------------------------------------------------------
+    // P-PF-GDN: 実形状マイクロベンチ (qwen4exp の ssm 1 層・nt=512)
+    // -----------------------------------------------------------------------
+
+    /// 実形状 (`GdnParams::qwen4exp`) の投影済み入力一式を乱数で作る。
+    ///
+    /// 投影 (`w_qkv` 等) は使わないので空。時間は入力値に依存しない
+    /// (分岐は `if kr != 0.0` だけで、乱数は 0 を踏まない)。
+    fn real_case(
+        nt: usize,
+    ) -> (GdnWeights, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let p = GdnParams::qwen4exp();
+        let mut rnd = lcg_rng(0x5eed_1234);
+        let conv1d: Vec<f32> = (0..p.conv_dim() * p.d_conv).map(|_| rnd() * 0.4).collect();
+        let w = GdnWeights {
+            w_qkv: Vec::new(),
+            w_gate: Vec::new(),
+            w_beta: Vec::new(),
+            w_alpha: Vec::new(),
+            conv1d,
+            ssm_a: (0..p.n_v_heads).map(|_| -0.02 - 0.05 * rnd().abs()).collect(),
+            ssm_dt: (0..p.n_v_heads).map(|_| 0.1 * rnd()).collect(),
+            ssm_norm: (0..p.head_v_dim).map(|_| 0.5 + rnd().abs()).collect(),
+            w_out: Vec::new(),
+        };
+        let qkv: Vec<f32> = (0..nt * p.conv_dim()).map(|_| 2.0 * rnd()).collect();
+        let z: Vec<f32> = (0..nt * p.value_dim()).map(|_| 4.0 * rnd()).collect();
+        let beta: Vec<f32> = (0..nt * p.n_v_heads).map(|_| 2.0 * rnd()).collect();
+        let alpha: Vec<f32> = (0..nt * p.n_v_heads).map(|_| 2.0 * rnd()).collect();
+        (w, qkv, z, beta, alpha)
+    }
+
+    /// 現行のトークン逐次ループ (= `SsmLayer::forward_batch` が回しているもの)。
+    fn seq_tokens(
+        p: &GdnParams,
+        cw: &GdnCore<'_>,
+        nt: usize,
+        qkv: &[f32],
+        z: &[f32],
+        beta: &[f32],
+        alpha: &[f32],
+        st: &mut GdnState,
+        out: &mut [f32],
+    ) {
+        let cd = p.conv_dim();
+        let vd = p.value_dim();
+        let nv = p.n_v_heads;
+        for t in 0..nt {
+            let y = forward_token_core_gate(
+                p,
+                cw,
+                &qkv[t * cd..(t + 1) * cd],
+                &z[t * vd..(t + 1) * vd],
+                &beta[t * nv..(t + 1) * nv],
+                &alpha[t * nv..(t + 1) * nv],
+                st,
+                GateKind::Sigmoid,
+            );
+            out[t * vd..(t + 1) * vd].copy_from_slice(&y);
+        }
+    }
+
+    fn best_of(reps: usize, mut f: impl FnMut()) -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            f();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        best
+    }
+
+    /// 内訳 (a) conv1d / (a2) L2 正規化 / (b) beta・alpha 変換 / (c) スキャン /
+    /// (d) gated RMS norm を実形状で測る。合計は現行のトークン逐次 1 回ぶん。
+    ///
+    /// 実行: cargo test --release -p denno-engine --lib -- --ignored --nocapture bench_gdn
+    #[test]
+    #[ignore = "実形状 (nt=512) のマイクロベンチ。--ignored --nocapture で実行"]
+    fn bench_gdn_core_real_shape() {
+        let nt = 512usize;
+        let p = GdnParams::qwen4exp();
+        let (w, qkv, z, beta, alpha) = real_case(nt);
+        let cw = core(&p, &w);
+        let cd = p.conv_dim();
+        let vd = p.value_dim();
+        let nv = p.n_v_heads;
+        let kd = p.key_dim();
+        let dk = p.head_k_dim;
+        let dv = p.head_v_dim;
+        let dc = p.d_conv;
+        let cs = p.d_conv - 1;
+        let reps = 3;
+
+        // ---- 0) 現行: トークン逐次 (全部入り) ----
+        let mut ys = vec![0.0f32; nt * vd];
+        let mut st = GdnState::new(&p);
+        let total = best_of(reps, || {
+            st = GdnState::new(&p);
+            seq_tokens(&p, &cw, nt, &qkv, &z, &beta, &alpha, &mut st, &mut ys);
+        });
+
+        // ---- (a) conv + 状態ロール + silu (確保も現行と同じく内側) ----
+        let mut st_a = GdnState::new(&p);
+        let mut conv_out = vec![0.0f32; cd];
+        let ta = best_of(reps, || {
+            st_a = GdnState::new(&p);
+            for t in 0..nt {
+                let mut conv_in = vec![0.0f32; cd * dc];
+                for c in 0..cd {
+                    conv_in[c * dc..c * dc + cs].copy_from_slice(&st_a.conv[c * cs..(c + 1) * cs]);
+                    conv_in[c * dc + cs] = qkv[t * cd + c];
+                }
+                for c in 0..cd {
+                    st_a.conv[c * cs..(c + 1) * cs]
+                        .copy_from_slice(&conv_in[c * dc + 1..(c + 1) * dc]);
+                }
+                for c in 0..cd {
+                    let row = &cw.conv1d[c * dc..(c + 1) * dc];
+                    let inp = &conv_in[c * dc..(c + 1) * dc];
+                    let mut acc = 0.0f32;
+                    for (a, b) in row.iter().zip(inp.iter()) {
+                        acc += a * b;
+                    }
+                    conv_out[c] = silu(acc);
+                }
+            }
+        });
+
+        // ---- (a2) L2 正規化 (q/k, 全トークン先出し) ----
+        let mut qall = vec![0.0f32; nt * kd];
+        let mut kall = vec![0.0f32; nt * kd];
+        let q_scale = 1.0 / (dk as f32).sqrt();
+        let ta2 = best_of(reps, || {
+            for t in 0..nt {
+                for h in 0..p.n_k_heads {
+                    let o = h * dk;
+                    qall[t * kd + o..t * kd + o + dk]
+                        .copy_from_slice(&conv_out[o..o + dk]);
+                    kall[t * kd + o..t * kd + o + dk]
+                        .copy_from_slice(&conv_out[kd + o..kd + o + dk]);
+                    l2_norm(&mut qall[t * kd + o..t * kd + o + dk], p.eps);
+                    l2_norm(&mut kall[t * kd + o..t * kd + o + dk], p.eps);
+                    for v in qall[t * kd + o..t * kd + o + dk].iter_mut() {
+                        *v *= q_scale;
+                    }
+                }
+            }
+        });
+
+        // ---- (b) beta・alpha の変換 (sigmoid / softplus / exp) — (c) の内数 ----
+        let mut egt = vec![0.0f32; nt * nv];
+        let mut bt = vec![0.0f32; nt * nv];
+        let tb = best_of(reps, || {
+            for t in 0..nt {
+                for h in 0..nv {
+                    let g = cw.ssm_a[h] * softplus(alpha[t * nv + h] + cw.ssm_dt[h]);
+                    egt[t * nv + h] = g.exp();
+                    bt[t * nv + h] = sigmoid(beta[t * nv + h]);
+                }
+            }
+        });
+
+        // ---- (c) スキャン (gdn_head をトークン逐次・ヘッド逐次) ----
+        let mut st_c = GdnState::new(&p);
+        let mut o = vec![0.0f32; nt * vd];
+        let tc = best_of(reps, || {
+            st_c = GdnState::new(&p);
+            for t in 0..nt {
+                for h in 0..nv {
+                    gdn_head(
+                        &p,
+                        &cw,
+                        &qall[t * kd..(t + 1) * kd],
+                        &kall[t * kd..(t + 1) * kd],
+                        &conv_out[2 * kd..2 * kd + vd], // v は値に依らない
+                        &beta[t * nv..(t + 1) * nv],
+                        &alpha[t * nv..(t + 1) * nv],
+                        &mut st_c.ssm[h * dk * dv..(h + 1) * dk * dv],
+                        &mut o[t * vd + h * dv..t * vd + (h + 1) * dv],
+                        h,
+                    );
+                }
+            }
+        });
+
+        // ---- (d) gated RMS norm ----
+        let mut y2 = vec![0.0f32; nt * vd];
+        let td = best_of(reps, || {
+            for t in 0..nt {
+                for h in 0..nv {
+                    let obase = t * vd + h * dv;
+                    let mut seg: Vec<f32> = o[obase..obase + dv].to_vec();
+                    rms_norm(&mut seg, p.eps);
+                    for (c, v) in seg.iter_mut().enumerate() {
+                        let zc = z[h * dv + c];
+                        *v *= cw.ssm_norm[c] * sigmoid(zc);
+                    }
+                    y2[obase..obase + dv].copy_from_slice(&seg);
+                }
+            }
+        });
+
+        let per_tok = |s: f64| s * 1e6 / nt as f64;
+        println!("GDN core 実形状 (nt={nt}, cd={cd}, vd={vd}, nv={nv}) — µs/token");
+        println!("  現行 トークン逐次 合計 {:8.1}", per_tok(total));
+        println!("  (a) conv+roll+silu   {:8.1}", per_tok(ta));
+        println!("  (a2) L2 正規化 q/k   {:8.1}", per_tok(ta2));
+        println!("  (b) 変換 (c の内数)  {:8.1}", per_tok(tb));
+        println!("  (c) スキャン (逐次)  {:8.1}", per_tok(tc));
+        println!("  (d) gated RMS norm   {:8.1}", per_tok(td));
+        println!(
+            "  現行のスキャン実効 (= 合計 - a - a2 - d) {:8.1}",
+            per_tok(total - ta - ta2 - td)
+        );
+
+        // ---- ビット一致 (nt=512・実形状): 逐次 vs チャンク一括 ----
+        let mut st_r = GdnState::new(&p);
+        let mut y_ref = vec![0.0f32; nt * vd];
+        seq_tokens(&p, &cw, nt, &qkv, &z, &beta, &alpha, &mut st_r, &mut y_ref);
+        let mut st_b = GdnState::new(&p);
+        let y_bat = forward_batch_core_gate(
+            &p,
+            &cw,
+            &qkv,
+            &z,
+            &beta,
+            &alpha,
+            &mut st_b,
+            GateKind::Sigmoid,
+        );
+        assert_eq!(bits(&y_ref), bits(&y_bat), "y がビット不一致");
+        assert_eq!(bits(&st_r.ssm), bits(&st_b.ssm), "ssm 状態がビット不一致");
+        assert_eq!(bits(&st_r.conv), bits(&st_b.conv), "conv 状態がビット不一致");
+
+        // ---- 新実装 (チャンク一括・ヘッド範囲をタスクに固定) ----
+        let mut st_n = GdnState::new(&p);
+        let mut y_new = vec![0.0f32; nt * vd];
+        let tnew = best_of(reps, || {
+            st_n = GdnState::new(&p);
+            y_new = forward_batch_core_gate(
+                &p,
+                &cw,
+                &qkv,
+                &z,
+                &beta,
+                &alpha,
+                &mut st_n,
+                GateKind::Sigmoid,
+            );
+        });
+        assert_eq!(bits(&y_new), bits(&y_ref));
+        println!("  新実装 合計          {:8.1}", per_tok(tnew));
+
+        // ---- (c)(d) のグループ幅の掃引 (タスクあたりのヘッド数) ----
+        let mut cv = vec![0.0f32; nt * cd];
+        let conv_st0 = vec![0.0f32; cd * cs];
+        conv_silu_all(&p, &cw, &qkv, &conv_st0, &mut cv, nt);
+        for group in [1usize, 2, 3, 4, 6, 8, 12, 16] {
+            let mut ssm = vec![0.0f32; p.ssm_state_len()];
+            let mut yy = vec![0.0f32; nt * vd];
+            let mut yyh = vec![0.0f32; nt * vd];
+            let tg = best_of(reps, || {
+                for v in ssm.iter_mut() {
+                    *v = 0.0;
+                }
+                scan_gate_all(
+                    &p,
+                    &cw,
+                    &cv,
+                    &z,
+                    &egt,
+                    &bt,
+                    nt,
+                    &mut ssm,
+                    &mut yyh,
+                    &mut yy,
+                    GateKind::Sigmoid,
+                    group,
+                );
+            });
+            println!("  group={group:<3} scan+gate{:8.1}", per_tok(tg));
+        }
     }
 }
 
