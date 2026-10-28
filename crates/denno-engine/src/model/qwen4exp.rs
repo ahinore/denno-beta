@@ -3310,6 +3310,451 @@ fn prefill_batch_chunk() -> usize {
     })
 }
 
+/// flat スケジューラの 1 行チャンク幅 (行数)。
+///
+/// 1 タスクの仕事は `MOE_FLAT_ROWS × n_in × m` MAC。実形 (n_in=2560, m=60) なら
+/// 64 行で約 9.8 MMAC。1 層のタスク数は expert 数 × (n_ff/64 + n_embd/64) で、
+/// 86 expert / n_ff 640 / n_embd 2560 なら 860 + 3,440 = 4,300 本。16 スレッドで
+/// 269 本ずつなので、最後の 1 本の偏りは 1 タスク = 0.4% 程度。
+///
+/// 実測 (`moe_flat_schedule_microbench`, m=5..120 / 16 スレッド): 32 行 220 ms・
+/// 64 行 210 ms・128 行 212 ms・256 行 213 ms。64〜256 は測定誤差 (±2%) の範囲で
+/// 同等なので、偏りの小さい 64 を採る。
+const MOE_FLAT_ROWS: usize = 64;
+
+/// flat 経路へ切り替える閾値 (1 expert あたりの最大トークン数 `m_max`)。
+///
+/// 実測 (`moe_flat_schedule_microbench`, REPORT_P30.md) では **m = 1 でも flat が
+/// 勝つ** (legacy の 10.5 ms/層 → flat 7.2 ms。1 層あたりの fork-join が 258 回 →
+/// 2 回 + gather/scatter の 2 回になるため)。よって既定は閾値 0 = 常に flat。
+/// legacy は `DENNO_MOE_FLAT=0` と、ビット一致の参照用テストに残してある。
+const MOE_FLAT_MIN_M: usize = 0;
+
+/// 選択 expert のループの並べ方。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MoeSchedule {
+    /// `m_max` の閾値 ([`MOE_FLAT_MIN_M`]) で選ぶ (既定)
+    Auto,
+    /// 層全体の (expert, 行列, 行チャンク) を 1 本のタスク列にして 1 回だけ並列化する
+    Flat,
+    /// expert ごと × 行列ごとに 1 回ずつ rayon を立てる (従来の形)
+    Legacy,
+}
+
+/// `DENNO_MOE_FLAT` の解釈 (純粋関数)。未設定・その他の値は [`MoeSchedule::Auto`]。
+fn moe_schedule_from_value(v: Option<&str>) -> MoeSchedule {
+    match v {
+        Some("1") => MoeSchedule::Flat,
+        Some("0") => MoeSchedule::Legacy,
+        _ => MoeSchedule::Auto,
+    }
+}
+
+/// expert ループの並べ方 (既定 Auto)。プロセスで 1 回だけ読む。
+fn moe_schedule() -> MoeSchedule {
+    static ON: std::sync::OnceLock<MoeSchedule> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| moe_schedule_from_value(std::env::var("DENNO_MOE_FLAT").ok().as_deref()))
+}
+
+/// テスト用: flat 経路 / legacy 経路が実際に走った回数。
+/// 「緑 = その経路が発動した証拠」ではないので、分岐の通過をここで数える。
+#[cfg(test)]
+pub(crate) static MOE_FLAT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static MOE_LEGACY_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// flat スケジューラの 1 タスク (1 expert × 行チャンク `[a, b)`)。
+///
+/// 行列の別 (gate / up / down) はフィールドに持たず、タスク列を 2 本に分ける。
+/// gate と up は同じ入力 `xin` を読むので 1 タスクにまとめ、silu の積までその場で
+/// 書く (3 回目のバリアを作らないため)。`pos` は active な expert の並び (`eid`) の添字。
+#[derive(Clone, Copy)]
+struct MoeTask {
+    pos: u16,
+    a: u16,
+    b: u16,
+}
+
+/// 1 行チャンクのタスクを作る (u16 に収まらない形は黙って切らずにエラーで落とす)。
+fn moe_task(pos: usize, a: usize, b: usize) -> Result<MoeTask> {
+    let conv = |v: usize, what: &str| {
+        u16::try_from(v).map_err(|_| one(format!("flat スケジューラ: {what} {v} が u16 を超える")))
+    };
+    Ok(MoeTask {
+        pos: conv(pos, "expert 添字")?,
+        a: conv(a, "行")?,
+        b: conv(b, "行")?,
+    })
+}
+
+/// `n_out` 行を `rows` 行ずつのタスクへ切って `out` に積む。
+fn moe_row_chunks(pos: usize, n_out: usize, rows: usize, out: &mut Vec<MoeTask>) -> Result<()> {
+    let mut a = 0usize;
+    while a < n_out {
+        let b = (a + rows).min(n_out);
+        out.push(moe_task(pos, a, b)?);
+        a = b;
+    }
+    Ok(())
+}
+
+/// `silu(v) * u`。`silu_inplace` と同じ式 (`v / (1 + exp(-v))`) の後に積を取る。
+#[inline]
+fn silu_mul(v: f32, u: f32) -> f32 {
+    v / (1.0 + (-v).exp()) * u
+}
+
+/// flat スケジューラの作業バッファ。**層をまたいで使い回す**。
+///
+/// 層ごとに `vec![0.0; n]` で確保すると、初回タッチのページフォルトを毎層払う
+/// (実形 m=64 で 4 本合計 140 MB ≈ 35,000 ページ。実測は REPORT_P30.md)。
+/// 中身は「読む前に必ず全部書く」のでゼロ初期化には依存しない
+/// (`gemm_rows` は行チャンクの全要素を書き、gather は `xin` を全部埋める)。
+#[derive(Default)]
+struct MoeScratch {
+    xin: Vec<f32>,
+    act: Vec<f32>,
+    up: Vec<f32>,
+    h: Vec<f32>,
+}
+
+impl MoeScratch {
+    /// 必要な長さに合わせる (伸ばすときだけゼロ埋めが走る = 初回だけ)。
+    fn resize(&mut self, tot: usize, e: usize, ff: usize) {
+        self.xin.resize(tot * e, 0.0);
+        self.act.resize(tot * ff, 0.0);
+        self.up.resize(tot * ff, 0.0);
+        self.h.resize(tot * e, 0.0);
+    }
+
+    fn bytes(&self) -> usize {
+        (self.xin.capacity() + self.act.capacity() + self.up.capacity() + self.h.capacity()) * 4
+    }
+}
+
+/// 使い回し用の置き場 (プロセスで 1 つ)。使用中は `None` にして貸し出す。
+static MOE_SCRATCH: std::sync::Mutex<Option<MoeScratch>> = std::sync::Mutex::new(None);
+
+/// 借りる。使用中 (同時に 2 本走っている) なら新しく確保する = 壊れない。
+fn moe_scratch_take() -> MoeScratch {
+    MOE_SCRATCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default()
+}
+
+/// 返す。大きすぎるものは捨てる (巨大な層のあとメモリを抱え込まない)。
+fn moe_scratch_put(s: MoeScratch) {
+    const KEEP_BYTES: usize = 512 * 1024 * 1024;
+    let mut g = MOE_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+    *g = if s.bytes() <= KEEP_BYTES { Some(s) } else { None };
+}
+
+/// 選択 expert の FFN を「層全体の (expert, 行列, 行チャンク) を 1 本のタスク列に
+/// して 1 回だけ並列化する」形で計算し、`out` に重み付きで足し込む (呼び出し側で
+/// ゼロ初期化済み)。
+///
+/// 従来の [`moe_experts_legacy`] は expert 1 体につき gate / up / down で 3 回
+/// rayon の fork-join をしていた (86 expert × 3 × 48 層 = 12,384 回/chunk)。
+/// ここでは 1 層あたり「gate+up+silu 積」の 1 パスと「down」の 1 パスの計 2 回に減らす。
+/// down の入力は gate/up の結果 (silu の積) なので、この 2 パスは分けざるをえない。
+///
+/// # 数値 (ビット一致の根拠)
+///
+/// - 1 要素の計算は `moe_expert::expert_gemm_any` と**同じ関数** (`moe_expert::gemm_rows`)
+///   を同じ引数 (同じ `n_in` / `m` / 行) で呼ぶ。行チャンクは `[0, n_out)` の分割で、
+///   行の中の累積順は行内で閉じるので、どのスレッドがどの行を計算しても値は変わらない。
+/// - silu の積は `v / (1 + (-v).exp()) * u` で、legacy の `silu_inplace` + `*=` と同順。
+/// - 足し込みは expert index 昇順 → トークン昇順の逐次 (legacy と同順)。
+#[allow(clippy::too_many_arguments)]
+fn moe_experts_flat(
+    lw: &LayerW,
+    by_expert: &[Vec<(usize, usize)>],
+    weights: &[Vec<f32>],
+    xs: &[f32],
+    e: usize,
+    ff: usize,
+    rows: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    #[cfg(test)]
+    MOE_FLAT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // 1. expert の並びと、expert ごとの領域の先頭 (f32 要素) を確定する。
+    let mut eid: Vec<usize> = Vec::new();
+    let mut ms: Vec<usize> = Vec::new();
+    let mut off_x: Vec<usize> = Vec::new();
+    let mut off_a: Vec<usize> = Vec::new();
+    let mut off_h: Vec<usize> = Vec::new();
+    let mut tot = 0usize;
+    for (ei, picks) in by_expert.iter().enumerate() {
+        if picks.is_empty() {
+            continue;
+        }
+        eid.push(ei);
+        ms.push(picks.len());
+        off_x.push(tot * e);
+        off_a.push(tot * ff);
+        off_h.push(tot * e);
+        tot += picks.len();
+    }
+    let n = eid.len();
+    if n == 0 {
+        return Ok(());
+    }
+
+    // フェーズ内訳 (`DENNO_MOE_FLAT_PHASE=1` のときだけ stderr へ出す)。
+    let ph = std::env::var_os("DENNO_MOE_FLAT_PHASE").is_some();
+    let mut ph_t = std::time::Instant::now();
+    macro_rules! lap {
+        ($name:expr) => {
+            if ph {
+                eprintln!("[moe-flat] {:.1} ms {}", ph_t.elapsed().as_secs_f64() * 1e3, $name);
+                ph_t = std::time::Instant::now();
+            }
+        };
+    }
+
+    // 2. 作業バッファ (層をまたいで使い回す) を必要な長さに合わせる。
+    let mut sc = moe_scratch_take();
+    sc.resize(tot, e, ff);
+    let MoeScratch {
+        mut xin,
+        mut act,
+        mut up,
+        mut h,
+    } = sc;
+
+    // 3. gather: expert ごとにトークンを詰め直す (legacy と同じ順序 = トークン昇順)。
+    //    expert ごとに独立なコピーなので、expert を単位に並列化しても値は変わらない。
+    {
+        let mut parts: Vec<&mut [f32]> = Vec::with_capacity(n);
+        let mut rest: &mut [f32] = &mut xin[..];
+        for pos in 0..n {
+            let (head, tail) = rest.split_at_mut(ms[pos] * e);
+            parts.push(head);
+            rest = tail;
+        }
+        let gather_one = |(pos, dst): (usize, &mut [f32])| {
+            let ei = eid[pos];
+            for (idx, &(t, _)) in by_expert[ei].iter().enumerate() {
+                dst[idx * e..(idx + 1) * e].copy_from_slice(&xs[t * e..(t + 1) * e]);
+            }
+        };
+        #[cfg(feature = "par")]
+        {
+            use rayon::prelude::*;
+            parts.into_par_iter().enumerate().for_each(gather_one);
+        }
+        #[cfg(not(feature = "par"))]
+        parts.into_iter().enumerate().for_each(gather_one);
+    }
+    lap!("gather");
+
+    // 4. 行列・入力・出力長の検証 (1 expert 1 行列につき 1 度だけ) とバイト列の切り出し
+    let (g, u, d) = (&lw.gate_exps, &lw.up_exps, &lw.down_exps);
+    let (gty, uty, dty) = (g.ty, u.ty, d.ty);
+    let rb_g = moe_expert::row_bytes(gty, e).map_err(|err| one(format!("{}: {err}", g.name)))?;
+    let rb_u = moe_expert::row_bytes(uty, e).map_err(|err| one(format!("{}: {err}", u.name)))?;
+    let rb_d = moe_expert::row_bytes(dty, ff).map_err(|err| one(format!("{}: {err}", d.name)))?;
+    let mut gs: Vec<&[u8]> = Vec::with_capacity(n);
+    let mut us: Vec<&[u8]> = Vec::with_capacity(n);
+    let mut ds: Vec<&[u8]> = Vec::with_capacity(n);
+    for pos in 0..n {
+        let m = ms[pos];
+        let ei = eid[pos];
+        let xa = &xin[off_x[pos]..off_x[pos] + m * e];
+        let ad = &act[off_a[pos]..off_a[pos] + m * ff];
+        let bg = g.slice(ei)?;
+        moe_expert::check_gemm_matrix(gty, bg, e, ff, xa, m)
+            .map_err(|err| one(format!("{}: expert {ei}: {err}", g.name)))?;
+        let bu = u.slice(ei)?;
+        moe_expert::check_gemm_matrix(uty, bu, e, ff, xa, m)
+            .map_err(|err| one(format!("{}: expert {ei}: {err}", u.name)))?;
+        let bd = d.slice(ei)?;
+        moe_expert::check_gemm_matrix(dty, bd, ff, e, ad, m)
+            .map_err(|err| one(format!("{}: expert {ei}: {err}", d.name)))?;
+        gs.push(bg);
+        us.push(bu);
+        ds.push(bd);
+    }
+    lap!("validate+slices+task_table");
+
+    // 5. タスク表 (gate+up+silu 積 / down)
+    let mut ta: Vec<MoeTask> = Vec::new();
+    let mut tb: Vec<MoeTask> = Vec::new();
+    let rows = rows.max(1);
+    for pos in 0..n {
+        moe_row_chunks(pos, ff, rows, &mut ta)?;
+        moe_row_chunks(pos, e, rows, &mut tb)?;
+    }
+
+    // SAFETY (act / up / h をタスク間で共有してよい根拠):
+    // - タスク (pos, a, b) が書くのは expert `pos` の領域の `t * n_out + [a, b)`
+    //   (t < ms[pos]) だけで、`[a, b)` はタスク間で重ならない。
+    // - 領域の大きさは `tot * ff` / `tot * e` で、添字は必ずその内側。
+    // - `moe_expert::gemm_rows` は `m * stride` 要素以上を書き、行チャンクの外へは書かない。
+    // よって異なるタスクが同じ要素へ書くことはない (data race なし)。
+    let act_p = moe_expert::OutPtr::new(act.as_mut_ptr());
+    let up_p = moe_expert::OutPtr::new(up.as_mut_ptr());
+    let h_p = moe_expert::OutPtr::new(h.as_mut_ptr());
+
+    // 6. gate+up+silu 積 (行チャンクごとに 1 タスク)
+    let run_a = |t: &MoeTask| {
+        let pos = t.pos as usize;
+        let (a, b) = (t.a as usize, t.b as usize);
+        let m = ms[pos];
+        let x = &xin[off_x[pos]..off_x[pos] + m * e];
+        let dst_a = act_p.add(off_a[pos] + a);
+        let dst_u = up_p.add(off_a[pos] + a);
+        // 前提 (安全に呼べる条件): `[a, b)` は [0, n_out) の分割の 1 つで、領域は
+        // `m * stride` 要素以上。`gemm_rows` 自身は unsafe fn ではないが、生ポインタの
+        // 指す先の条件はこのモジュールのタスク分割が保証する (上の SAFETY を参照)。
+        moe_expert::gemm_rows(gty, rb_g, gs[pos], e, a, b, x, m, dst_a.get(), ff, true);
+        moe_expert::gemm_rows(uty, rb_u, us[pos], e, a, b, x, m, dst_u.get(), ff, true);
+        // act の行 [a, b) を silu(act) * up で置き換える (このタスクが書いた行だけ)。
+        let pa = act_p.get();
+        let pu = up_p.get();
+        for idx in 0..m {
+            let base = off_a[pos] + idx * ff;
+            for r in a..b {
+                // SAFETY: base + r はこのタスクが上で書いた範囲 (他タスクと重ならない)。
+                unsafe {
+                    let v = *pa.add(base + r);
+                    *pa.add(base + r) = silu_mul(v, *pu.add(base + r));
+                }
+            }
+        }
+    };
+
+    // 7. down (act は前のパスで確定しているので読むだけ)
+    let act_r: &[f32] = &act;
+    let run_b = |t: &MoeTask| {
+        let pos = t.pos as usize;
+        let (a, b) = (t.a as usize, t.b as usize);
+        let m = ms[pos];
+        let x = &act_r[off_a[pos]..off_a[pos] + m * ff];
+        let dst = h_p.add(off_h[pos] + a);
+        // 前提は run_a と同じ (`[a, b)` は [0, n_out) の分割の 1 つ、領域は `m * stride` 以上)。
+        moe_expert::gemm_rows(dty, rb_d, ds[pos], ff, a, b, x, m, dst.get(), e, true);
+    };
+
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        ta.par_iter().for_each(run_a);
+        tb.par_iter().for_each(run_b);
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        ta.iter().for_each(run_a);
+        tb.iter().for_each(run_b);
+    }
+    lap!("phaseA+phaseB");
+
+    // 8. 重み付きの足し込み。トークンごとに書く先が違う (`out[t*e..]`) ので
+    //    トークン単位で並列化する。1 トークンの中は expert 昇順の逐次 = legacy と同順。
+    {
+        let nt = out.len() / e.max(1);
+        // (pos, expert 内の添字, 重みの添字)。pos 昇順に積むので index 昇順が保たれる。
+        let mut by_token: Vec<Vec<(u16, usize, u16)>> = vec![Vec::new(); nt];
+        for (pos, &ei) in eid.iter().enumerate() {
+            let pos_u16 = moe_task(pos, 0, 0)?.pos;
+            for (idx, &(t, j)) in by_expert[ei].iter().enumerate() {
+                by_token[t].push((pos_u16, idx, j as u16));
+            }
+        }
+        let mut parts: Vec<&mut [f32]> = out.chunks_mut(e.max(1)).collect();
+        let scatter_one = |(t, o): (usize, &mut [f32])| {
+            for &(pos, idx, j) in &by_token[t] {
+                let pos = pos as usize;
+                let pe = weights[t][j as usize];
+                let hh = &h[off_h[pos] + idx * e..off_h[pos] + (idx + 1) * e];
+                for d in 0..e {
+                    o[d] += pe * hh[d];
+                }
+            }
+        };
+        #[cfg(feature = "par")]
+        {
+            use rayon::prelude::*;
+            parts.into_par_iter().enumerate().for_each(scatter_one);
+        }
+        #[cfg(not(feature = "par"))]
+        parts.into_iter().enumerate().for_each(scatter_one);
+    }
+    lap!("scatter");
+    moe_scratch_put(MoeScratch { xin, act, up, h });
+    Ok(())
+}
+
+/// 選択 expert の FFN を expert ごとに回す (従来の形)。
+///
+/// expert 1 体につき gate / up / down で 3 回 rayon の fork-join をする。
+/// `m == 1` の expert は 1 トークン用の入口 ([`ExpertW::gemv`]) を通る。
+/// `m_max` が小さい層 ([`MOE_FLAT_MIN_M`] 以下) ではこちらが速い
+/// (`moe_flat_schedule_microbench` の実測)。
+///
+/// 数値: 各 expert の `h_e` は (行, トークン) ごとに逐次版と同じカーネルで計算し、
+/// 足し込みは expert index 昇順 → トークン昇順の逐次。`moe_ffn_quant` と一致する。
+fn moe_experts_legacy(
+    lw: &LayerW,
+    by_expert: &[Vec<(usize, usize)>],
+    weights: &[Vec<f32>],
+    xs: &[f32],
+    e: usize,
+    ff: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    #[cfg(test)]
+    MOE_LEGACY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    for ei in 0..by_expert.len() {
+        let picks = &by_expert[ei];
+        if picks.is_empty() {
+            continue;
+        }
+        let m = picks.len();
+        let mut xin = Vec::with_capacity(m * e);
+        for &(t, _) in picks {
+            xin.extend_from_slice(&xs[t * e..(t + 1) * e]);
+        }
+        let mut act = vec![0.0f32; m * ff];
+        let mut up = vec![0.0f32; m * ff];
+        let mut h = vec![0.0f32; m * e];
+        if m == 1 {
+            // 1 トークンなら逐次版とまったく同じ入口を使う (行並列も従来どおり)。
+            lw.gate_exps.gemv(ei, &xin, &mut act)?;
+            silu_inplace(&mut act);
+            lw.up_exps.gemv(ei, &xin, &mut up)?;
+            for r in 0..m * ff {
+                act[r] *= up[r];
+            }
+            lw.down_exps.gemv(ei, &act, &mut h)?;
+        } else {
+            expert_gemv_batch(&lw.gate_exps, ei, &xin, m, &mut act)?;
+            silu_inplace(&mut act);
+            expert_gemv_batch(&lw.up_exps, ei, &xin, m, &mut up)?;
+            for r in 0..m * ff {
+                act[r] *= up[r];
+            }
+            expert_gemv_batch(&lw.down_exps, ei, &act, m, &mut h)?;
+        }
+        // 重み付きの足し込みはトークンごとに逐次 (index 昇順のまま)
+        for (idx, &(t, j)) in picks.iter().enumerate() {
+            let pe = weights[t][j];
+            let hh = &h[idx * e..(idx + 1) * e];
+            for d in 0..e {
+                out[t * e + d] += pe * hh[d];
+            }
+        }
+    }
+    Ok(())
+}
+
 /// [`moe_ffn_quant`] のバッチ版 (`nt` トークン)。
 ///
 /// ルータ / shared expert / 選択 expert の行列積を [`gemv_batch`] に置き換える。
@@ -3327,6 +3772,19 @@ fn moe_ffn_quant_batch(
     xs: &[f32],
     nt: usize,
     cache: Option<&mut ExpertCacheSet>,
+) -> Result<Vec<f32>> {
+    moe_ffn_quant_batch_with(p, lw, xs, nt, cache, moe_schedule())
+}
+
+/// [`moe_ffn_quant_batch`] の本体。expert ループの並べ方 (`sched`) を外から渡せる
+/// 形にしてある (テストと A/B 計測で両方の経路を同じ入力に通すため)。
+fn moe_ffn_quant_batch_with(
+    p: &Qwen4ExpParams,
+    lw: &LayerW,
+    xs: &[f32],
+    nt: usize,
+    cache: Option<&mut ExpertCacheSet>,
+    sched: MoeSchedule,
 ) -> Result<Vec<f32>> {
     let e = p.n_embd;
     let ne = p.n_expert;
@@ -3394,67 +3852,35 @@ fn moe_ffn_quant_batch(
         }
     }
 
-    // 4. expert を index 昇順に、同じ expert を選んだトークンをまとめて回す
+    // 4. expert ごとのトークン一覧 (`picks`) と件数 `m` を先に確定する。
+    //    sels は index 昇順の distinct な expert なので、legacy が
+    //    `position()` で作っていた順 (トークン昇順, 同トークン内は j 昇順) と一致する。
     let t_experts = std::time::Instant::now();
     let mut out = vec![0.0f32; nt * e];
-    let dbg_m = std::env::var_os("DENNO_MOE_M_DEBUG").is_some();
-    let mut dbg_nonempty = 0usize;
-    let mut dbg_sum_m = 0usize;
-    let mut dbg_max_m = 0usize;
-    for ei in 0..ne {
-        let picks: Vec<(usize, usize)> = sels
-            .iter()
-            .enumerate()
-            .filter_map(|(t, s)| s.iter().position(|&x| x == ei).map(|j| (t, j)))
-            .collect();
-        if picks.is_empty() {
-            continue;
-        }
-        let m = picks.len();
-        if dbg_m {
-            dbg_nonempty += 1;
-            dbg_sum_m += m;
-            dbg_max_m = dbg_max_m.max(m);
-        }
-        let mut xin = Vec::with_capacity(m * e);
-        for &(t, _) in &picks {
-            xin.extend_from_slice(&xs[t * e..(t + 1) * e]);
-        }
-        let mut act = vec![0.0f32; m * ff];
-        let mut up = vec![0.0f32; m * ff];
-        let mut h = vec![0.0f32; m * e];
-        if m == 1 {
-            // 1 トークンなら逐次版とまったく同じ入口を使う (行並列も従来どおり)。
-            lw.gate_exps.gemv(ei, &xin, &mut act)?;
-            silu_inplace(&mut act);
-            lw.up_exps.gemv(ei, &xin, &mut up)?;
-            for r in 0..m * ff {
-                act[r] *= up[r];
-            }
-            lw.down_exps.gemv(ei, &act, &mut h)?;
-        } else {
-            expert_gemv_batch(&lw.gate_exps, ei, &xin, m, &mut act)?;
-            silu_inplace(&mut act);
-            expert_gemv_batch(&lw.up_exps, ei, &xin, m, &mut up)?;
-            for r in 0..m * ff {
-                act[r] *= up[r];
-            }
-            expert_gemv_batch(&lw.down_exps, ei, &act, m, &mut h)?;
-        }
-        // 重み付きの足し込みはトークンごとに逐次 (index 昇順のまま)
-        for (idx, &(t, j)) in picks.iter().enumerate() {
-            let pe = weights[t][j];
-            let hh = &h[idx * e..(idx + 1) * e];
-            for d in 0..e {
-                out[t * e + d] += pe * hh[d];
-            }
+    let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
+    for (t, sel) in sels.iter().enumerate() {
+        for (j, &ei) in sel.iter().enumerate() {
+            by_expert[ei].push((t, j));
         }
     }
-    if dbg_m {
+    let m_max = by_expert.iter().map(|p| p.len()).max().unwrap_or(0);
+    let flat = match sched {
+        MoeSchedule::Flat => true,
+        MoeSchedule::Legacy => false,
+        MoeSchedule::Auto => m_max > MOE_FLAT_MIN_M,
+    };
+    if std::env::var_os("DENNO_MOE_M_DEBUG").is_some() {
+        let nonempty = by_expert.iter().filter(|p| !p.is_empty()).count();
+        let sum_m: usize = by_expert.iter().map(|p| p.len()).sum();
         eprintln!(
-            "[moe-m] nt={nt} ne={ne} k={k} nonempty={dbg_nonempty} sum_m={dbg_sum_m} mean={:.2} max={dbg_max_m}",
-            dbg_sum_m as f32 / dbg_nonempty.max(1) as f32
+            "[moe-m] nt={nt} ne={ne} k={k} nonempty={nonempty} sum_m={sum_m} mean={:.2} max={m_max} flat={flat}",
+            sum_m as f32 / nonempty.max(1) as f32
         );
+    }
+    if flat {
+        moe_experts_flat(lw, &by_expert, &weights, xs, e, ff, MOE_FLAT_ROWS, &mut out)?;
+    } else {
+        moe_experts_legacy(lw, &by_expert, &weights, xs, e, ff, &mut out)?;
     }
 
     // 5. shared expert (バッチ)。係数は sigmoid(gate_inp_shexp @ x)
@@ -4798,6 +5224,314 @@ mod tests {
                 bat.iter().any(|v| *v != 0.0),
                 "MoE の出力が全 0 (経路の生死が分からない)"
             );
+        }
+
+        /// flat スケジューラ (層全体の (expert, 行列, 行チャンク) を 1 本のタスク列で回す) が
+        /// legacy (expert ごと × 行列ごとに 1 回 rayon) とビット一致する。
+        ///
+        /// 同じ入力に対して両方の経路を**明示的に**通し、出力を突き合わせる。小さい形なので
+        /// `m` は 1〜4 に散らばり、`m == 1` の expert と `m > 1` の expert の両方ができる。
+        #[test]
+        fn moe_flat_matches_legacy_bitwise() {
+            crate::cuda::set_gpu_gemm_enabled(false);
+            let _g = moe_test_guard();
+            let dir = TempDir::new("h2flat");
+            let path = write_expert_gguf(&dir);
+            let f = GgufFile::open(&path).expect("open");
+            let p = cache_test_params();
+            let lw = cache_test_layer(&f, &p);
+            let nt = 8;
+            let xs: Vec<f32> = (0..nt * p.n_embd)
+                .map(|i| (((i * 37 % 101) as f32) - 50.0) * 0.013)
+                .collect();
+
+            let flat0 = MOE_FLAT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let leg0 = MOE_LEGACY_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let flat =
+                moe_ffn_quant_batch_with(&p, &lw, &xs, nt, None, MoeSchedule::Flat).expect("flat");
+            let legacy = moe_ffn_quant_batch_with(&p, &lw, &xs, nt, None, MoeSchedule::Legacy)
+                .expect("legacy");
+            assert!(
+                MOE_FLAT_CALLS.load(std::sync::atomic::Ordering::Relaxed) > flat0,
+                "flat 経路が発動していない"
+            );
+            assert!(
+                MOE_LEGACY_CALLS.load(std::sync::atomic::Ordering::Relaxed) > leg0,
+                "legacy 経路が発動していない"
+            );
+            assert!(
+                flat.iter().any(|v| *v != 0.0),
+                "flat の出力が全 0 (経路の生死が分からない)"
+            );
+            assert_bitwise_eq(&legacy, &flat, "flat vs legacy");
+
+            // 逐次版 (トークンごとの `moe_ffn_quant`) とも一致する
+            for t in 0..nt {
+                let seq = moe_ffn_quant(&p, &lw, &xs[t * p.n_embd..(t + 1) * p.n_embd], None)
+                    .expect("seq");
+                assert_bitwise_eq(
+                    &seq,
+                    &flat[t * p.n_embd..(t + 1) * p.n_embd],
+                    &format!("flat token {t}"),
+                );
+            }
+        }
+
+        /// `DENNO_MOE_FLAT` の解釈 (未設定・不明な値は既定の Auto に落ちる)。
+        #[test]
+        fn moe_schedule_env_values() {
+            assert_eq!(moe_schedule_from_value(None), MoeSchedule::Auto);
+            assert_eq!(moe_schedule_from_value(Some("1")), MoeSchedule::Flat);
+            assert_eq!(moe_schedule_from_value(Some("0")), MoeSchedule::Legacy);
+            assert_eq!(moe_schedule_from_value(Some("")), MoeSchedule::Auto);
+            assert_eq!(moe_schedule_from_value(Some("true")), MoeSchedule::Auto);
+        }
+
+        /// タスク分割が `[0, n_out)` を 1 度ずつ覆う (端数・0 行も落とさない)。
+        #[test]
+        fn moe_row_chunks_cover_all_rows_once() {
+            for n_out in [0usize, 1, 31, 32, 33, 640, 2560] {
+                let mut v = Vec::new();
+                moe_row_chunks(0, n_out, MOE_FLAT_ROWS, &mut v).expect("chunks");
+                let mut covers = vec![0u8; n_out];
+                for t in &v {
+                    assert!(t.a < t.b, "空のチャンク (n_out={n_out})");
+                    assert!(t.b as usize <= n_out, "行が範囲外 (n_out={n_out})");
+                    for r in t.a as usize..t.b as usize {
+                        covers[r] += 1;
+                    }
+                }
+                assert!(
+                    covers.iter().all(|&c| c == 1),
+                    "n_out={n_out}: 行の重複か欠落がある"
+                );
+                assert_eq!(v.len(), n_out.div_ceil(MOE_FLAT_ROWS), "n_out={n_out}: 本数");
+            }
+        }
+
+        /// 実形状 (n_in=2560, n_ff=640) の expert 3 本だけを持つ合成 GGUF。
+        ///
+        /// 実形は 1 expert あたり gate/up が 921 KB・down が 1.23 MB なので、
+        /// 86 expert で約 264 MB になる (テスト用の一時ファイル)。
+        fn write_expert_gguf_big(dir: &TempDir, n_in: usize, n_ff: usize, ne: usize) -> PathBuf {
+            let path = dir.path("experts_big.gguf");
+            let mut gate = Vec::new();
+            let mut up = Vec::new();
+            let mut down = Vec::new();
+            for e in 0..ne {
+                gate.extend_from_slice(&q4k_expert_bytes(n_in, n_ff, e));
+                up.extend_from_slice(&q4k_expert_bytes(n_in, n_ff, e + 7));
+                down.extend_from_slice(&q5_1_expert_bytes(n_ff, n_in, e + 3));
+            }
+            let tensors = vec![
+                (
+                    "blk.0.ffn_gate_exps.weight".to_string(),
+                    vec![n_in as u64, n_ff as u64, ne as u64],
+                    TY_Q4_K,
+                    gate,
+                ),
+                (
+                    "blk.0.ffn_up_exps.weight".to_string(),
+                    vec![n_in as u64, n_ff as u64, ne as u64],
+                    TY_Q4_K,
+                    up,
+                ),
+                (
+                    "blk.0.ffn_down_exps.weight".to_string(),
+                    vec![n_ff as u64, n_in as u64, ne as u64],
+                    TY_Q5_1,
+                    down,
+                ),
+            ];
+            let kvs = [
+                ("general.architecture", Kv::Str("qwen4exp")),
+                ("general.alignment", Kv::U32(ALIGN as u32)),
+            ];
+            write_gguf(&path, &kvs, &tensors);
+            path
+        }
+
+        /// マイクロベンチ用の諸元 (実形)。
+        fn bench_params(n_in: usize, n_ff: usize, ne: usize, k: usize) -> Qwen4ExpParams {
+            let mut p = cache_test_params();
+            p.n_embd = n_in;
+            p.n_ff_exp = n_ff;
+            p.n_ff_shexp = n_ff;
+            p.n_expert = ne;
+            p.n_expert_used = k;
+            p
+        }
+
+        /// マイクロベンチ (手動)。選択 expert の FFN **1 層ぶん**を
+        /// flat (層全体のタスク表) と legacy (expert ごと) で A/B する。
+        ///
+        /// 実形: 86 expert / n_embd 2560 / n_ff_exp 640 / gate・up は Q4_K、down は Q5_1
+        /// (Flash-Next の実型)。m は 5〜120 に散らし (平均 ≈ 60 = 512 トークン × top-10 / 86)、
+        /// 一様な m で閾値の当たりも取る。
+        ///
+        /// このコンテナはホスト共有で load average が動くので、**同一バイナリ・同一ループ内**で
+        /// legacy / flat (行幅 4 種) を交互に測り、rep の min を取る (別バイナリ比較はしない)。
+        ///
+        /// 16 スレッドで走らせる:
+        /// `RAYON_NUM_THREADS=16 cargo test --release -p denno-engine --features cuda --lib \
+        ///   moe_flat_schedule_microbench -- --ignored --nocapture --test-threads=1`
+        #[test]
+        #[ignore = "CPU のスケジュール A/B (実機の ms/token は main が測る)"]
+        fn moe_flat_schedule_microbench() {
+            crate::cuda::set_gpu_gemm_enabled(false);
+            let _g = moe_test_guard();
+            let (n_in, n_ff, ne, k) = (2560usize, 640usize, 86usize, 10usize);
+            let dir = TempDir::new("h2bench");
+            let path = write_expert_gguf_big(&dir, n_in, n_ff, ne);
+            let f = GgufFile::open(&path).expect("open");
+            let p = bench_params(n_in, n_ff, ne, k);
+            let lw = cache_test_layer(&f, &p);
+            let widths = [64usize, 128, 256, 512];
+
+            // expert ごとの件数 `ms` から、(t, j) の割り当て・重み・入力を組み立てる。
+            // スロット (t, j) を決定的にシャッフルして各 expert に配るので、
+            // 1 expert のトークンは層全体に散らばる (実モデルと同じ形)。
+            let build = |ms: &[usize]| {
+                let sum: usize = ms.iter().sum();
+                let nt = sum.div_ceil(k);
+                let total = nt * k;
+                let mut slots: Vec<usize> = (0..total).collect();
+                let mut seed = 12345u64;
+                for i in (1..total).rev() {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let j = ((seed >> 33) as usize) % (i + 1);
+                    slots.swap(i, j);
+                }
+                let mut it = slots.into_iter();
+                let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ms.len()];
+                for (ei, &m) in ms.iter().enumerate() {
+                    let mut v: Vec<(usize, usize)> = (0..m)
+                        .map(|_| {
+                            let s = it.next().expect("slot");
+                            (s / k, s % k)
+                        })
+                        .collect();
+                    // legacy の `position()` 順 (トークン昇順, 同トークン内は j 昇順)
+                    v.sort_unstable();
+                    by_expert[ei] = v;
+                }
+                let weights = vec![vec![0.1f32; k]; nt];
+                let xs: Vec<f32> = (0..nt * n_in)
+                    .map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.003)
+                    .collect();
+                (by_expert, weights, xs, nt)
+            };
+
+            println!(
+                "threads={} ne={ne} n_in={n_in} n_ff={n_ff} k={k}",
+                rayon::current_num_threads()
+            );
+
+            // 1 つの分布について legacy + flat (行幅 4 種) を交互に測り、min を出す。
+            let run = |ms: &[usize], label: &str| {
+                let (by_expert, weights, xs, nt) = build(ms);
+                let mut outs: Vec<Vec<f32>> = (0..1 + widths.len())
+                    .map(|_| vec![0.0f32; nt * n_in])
+                    .collect();
+                // 温め (ページフォルト・分岐・レイアウト) + 値の突き合わせ
+                for (vi, out) in outs.iter_mut().enumerate() {
+                    if vi == 0 {
+                        moe_experts_legacy(&lw, &by_expert, &weights, &xs, n_in, n_ff, out)
+                            .expect("legacy");
+                    } else {
+                        moe_experts_flat(
+                            &lw, &by_expert, &weights, &xs, n_in, n_ff, widths[vi - 1], out,
+                        )
+                        .expect("flat");
+                    }
+                }
+                for vi in 1..outs.len() {
+                    assert_bitwise_eq(
+                        &outs[0],
+                        &outs[vi],
+                        &format!("{label}: flat(rows={}) vs legacy", widths[vi - 1]),
+                    );
+                }
+
+                let reps = 3usize;
+                let mut best = vec![f64::INFINITY; outs.len()];
+                for _ in 0..reps {
+                    for (vi, out) in outs.iter_mut().enumerate() {
+                        for v in out.iter_mut() {
+                            *v = 0.0;
+                        }
+                        let t0 = std::time::Instant::now();
+                        if vi == 0 {
+                            moe_experts_legacy(&lw, &by_expert, &weights, &xs, n_in, n_ff, out)
+                                .expect("legacy");
+                        } else {
+                            moe_experts_flat(
+                                &lw, &by_expert, &weights, &xs, n_in, n_ff, widths[vi - 1], out,
+                            )
+                            .expect("flat");
+                        }
+                        let us = t0.elapsed().as_secs_f64() * 1e6;
+                        best[vi] = best[vi].min(us);
+                    }
+                }
+                let tot: usize = ms.iter().sum();
+                println!(
+                    "{label:>10} (tot_m={tot:5}) legacy={:8.0}us | flat 32={:8.0} ({:.2}x) \
+                     64={:8.0} ({:.2}x) 128={:8.0} ({:.2}x) 256={:8.0} ({:.2}x)",
+                    best[0],
+                    best[1],
+                    best[0] / best[1],
+                    best[2],
+                    best[0] / best[2],
+                    best[3],
+                    best[0] / best[3],
+                    best[4],
+                    best[0] / best[4],
+                );
+            };
+
+            // 参考: 作業バッファを毎層 `vec![0.0; n]` で作るときの「確保 + 初回タッチ」。
+            // flat は層をまたいでプールを使い回すので、この分は毎層は払わない。
+            let alloc_probe = |tot: usize| -> f64 {
+                let t0 = std::time::Instant::now();
+                {
+                    let mut v = vec![0.0f32; tot * n_in];
+                    let mut a = vec![0.0f32; tot * n_ff];
+                    let mut b = vec![0.0f32; tot * n_ff];
+                    let mut hh = vec![0.0f32; tot * n_in];
+                    for x in v.iter_mut() {
+                        *x = 1.0;
+                    }
+                    for x in a.iter_mut() {
+                        *x = 1.0;
+                    }
+                    for x in b.iter_mut() {
+                        *x = 1.0;
+                    }
+                    for x in hh.iter_mut() {
+                        *x = 1.0;
+                    }
+                    std::hint::black_box((&v, &a, &b, &hh));
+                }
+                t0.elapsed().as_secs_f64() * 1e6
+            };
+
+            // 実測されている分布: m は 5〜120 (平均 ≈ 60)
+            let spread: Vec<usize> = (0..ne).map(|ei| 5 + (ei * 37) % 116).collect();
+            let tot: usize = spread.iter().sum();
+            println!(
+                "m=5..120: mean={:.1}  alloc+touch(毎層)={:.0}us",
+                tot as f32 / ne as f32,
+                alloc_probe(tot)
+            );
+            run(&spread, "m=5..120");
+
+            // 閾値 (`MOE_FLAT_MIN_M`) の当たり: 一様な m
+            for &mu in &[1usize, 2, 4, 8, 16, 32, 64, 120] {
+                run(&vec![mu; ne], &format!("m={mu}"));
+            }
         }
 
         /// バッチ GEMV は逐次版と同じ**入口**を通るので、融合カーネルを
