@@ -1577,7 +1577,9 @@ fn gemm_row_ranges(n_out: usize, par: bool) -> Vec<(usize, usize)> {
     {
         if par && n_out >= PAR_MIN_ROWS {
             let threads = rayon::current_num_threads().max(1);
-            let want = n_out.div_ceil(threads).max(64).min(n_out);
+            // 64 行固定だと n_out=640 / 16 スレッドで 10 チャンクしか立たず 6 本が遊ぶ。
+            // スレッド数で割り切れる幅にして 16 本すべてを埋める (下限 32 行は据え置き)。
+            let want = n_out.div_ceil(threads).max(32).min(n_out);
             return (0..n_out)
                 .step_by(want)
                 .map(|a| (a, (a + want).min(n_out)))
