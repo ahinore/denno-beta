@@ -3377,11 +3377,20 @@ fn moe_ffn_quant_batch(
     moe_sub_add(0, t_router.elapsed());
 
     // 3. 選択 expert の重みを先に読み始める (逐次版と同じ expert を同じ順で)
-    for sel in &sels {
-        for &ei in sel {
-            lw.gate_exps.prefetch(ei);
-            lw.up_exps.prefetch(ei);
-            lw.down_exps.prefetch(ei);
+    //    同じ expert は 1 層で何度も選ばれる。madvise は 1 expert 1 回で足りるので、
+    //    トークン×k 回 (512 × 10 = 5,120 回/層) ではなく distinct な expert の数 (86 回/層)
+    //    だけ呼ぶ。選択順は変わらないので数値には影響しない。
+    {
+        let mut seen = vec![false; ne];
+        for sel in &sels {
+            for &ei in sel {
+                if !seen[ei] {
+                    seen[ei] = true;
+                    lw.gate_exps.prefetch(ei);
+                    lw.up_exps.prefetch(ei);
+                    lw.down_exps.prefetch(ei);
+                }
+            }
         }
     }
 
