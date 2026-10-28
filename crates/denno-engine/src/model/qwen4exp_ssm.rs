@@ -199,13 +199,20 @@ impl SsmLayer {
 
     /// チャンクぶんの入力をまとめて回す (バッチ prefill 用)。
     ///
-    /// 変えるのは行列積の呼び方だけ: 5 本の投影をチャンクで 1 回ずつ
-    /// [`gemv_batch`] に流す (GPU 常駐時は 1 トークンあたり 5 往復していたのが
-    /// チャンクあたり 5 往復になる)。GDN の中身は状態をトークン順に進めるので
-    /// 1 トークンずつ [`gdn::forward_token_core_gate`] に渡す (数式・順序は不変)。
+    /// 変えるのは行列積と GDN 本体の呼び方だけ:
+    /// - 5 本の投影をチャンクで 1 回ずつ [`gemv_batch`] に流す (GPU 常駐時は
+    ///   1 トークンあたり 5 往復していたのがチャンクあたり 5 往復になる)。
+    /// - GDN 本体は [`gdn::forward_batch_core_gate`] にチャンク一括で渡す
+    ///   (conv1d をトークン方向にまとめ、状態スキャンをヘッド範囲で並列化)。
+    ///   ヘッドは互いに独立なので、トークン順を保てば要素ごとの丸め順は不変。
     ///
-    /// 数値: 行列積は逐次と同じカーネルをトークンごとに当てるだけなので、
-    /// `forward_token` とビット一致する。
+    /// 数値: 行列積は逐次と同じカーネルをトークンごとに当てるだけ、GDN 本体は
+    /// 要素ごとに独立な演算を同じ順序で並べ替えただけなので、`forward_token` と
+    /// ビット一致する (テスト `gdn_batch_matches_token_by_token_bitexact`、
+    /// `ssm_batch_matches_token_by_token_bitexact`)。
+    ///
+    /// 診断ダンプ (`DENNO_DEBUG_GDN_DUMP_LAYER`) がこの層を指しているときだけ
+    /// 従来のトークン逐次に落ちる (サブステージの追記順を保つため)。
     pub fn forward_batch(&mut self, curs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
         let nt = curs.len();
         if nt == 0 {
@@ -251,31 +258,53 @@ impl SsmLayer {
 
         let t = std::time::Instant::now();
         gdn::gdn_dbg_set_layer(self.il as i64);
-        let mut ys = Vec::with_capacity(nt * vd);
-        for i in 0..nt {
-            let cw = GdnCore {
-                conv1d: &self.conv1d,
-                ssm_a: &self.ssm_a,
-                ssm_dt: &self.ssm_dt,
-                ssm_norm: &self.ssm_norm,
-            };
-            let y = gdn::forward_token_core_gate(
+        let cw = GdnCore {
+            conv1d: &self.conv1d,
+            ssm_a: &self.ssm_a,
+            ssm_dt: &self.ssm_dt,
+            ssm_norm: &self.ssm_norm,
+        };
+        // サブステージのダンプがこの層を指しているときだけトークン逐次に落ちる
+        // (追記順 = llama.cpp の lchk と同一に保つ)。通常はチャンク一括。
+        let ys = if gdn::gdn_dbg_enabled_for(self.il as i64) {
+            let mut ys = Vec::with_capacity(nt * vd);
+            for i in 0..nt {
+                let y = gdn::forward_token_core_gate(
+                    &self.p,
+                    &cw,
+                    &qkv[i * qd..(i + 1) * qd],
+                    &z[i * vd..(i + 1) * vd],
+                    &beta_raw[i * nh..(i + 1) * nh],
+                    &alpha[i * nh..(i + 1) * nh],
+                    &mut self.state,
+                    gdn::GateKind::Sigmoid,
+                );
+                if y.len() != vd {
+                    bail!(
+                        "SsmLayer::forward_batch: GDN の出力長 {} が value_dim={vd} と違う",
+                        y.len()
+                    );
+                }
+                ys.extend_from_slice(&y);
+            }
+            ys
+        } else {
+            gdn::forward_batch_core_gate(
                 &self.p,
                 &cw,
-                &qkv[i * qd..(i + 1) * qd],
-                &z[i * vd..(i + 1) * vd],
-                &beta_raw[i * nh..(i + 1) * nh],
-                &alpha[i * nh..(i + 1) * nh],
+                &qkv,
+                &z,
+                &beta_raw,
+                &alpha,
                 &mut self.state,
                 gdn::GateKind::Sigmoid,
+            )
+        };
+        if ys.len() != nt * vd {
+            bail!(
+                "SsmLayer::forward_batch: GDN の出力長 {} が nt={nt} * value_dim={vd} と違う",
+                ys.len()
             );
-            if y.len() != vd {
-                bail!(
-                    "SsmLayer::forward_batch: GDN の出力長 {} が value_dim={vd} と違う",
-                    y.len()
-                );
-            }
-            ys.extend_from_slice(&y);
         }
         if prof {
             crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_GDN, t);
@@ -576,5 +605,145 @@ impl LayerAttn for SsmAttn {
     /// GDN の conv / ssm 状態の進み方は逐次版と同じになる。
     fn layer_major_safe(&self) -> bool {
         true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P-PF-GDN: ssm 層のバッチ経路 (`forward_batch` → `gdn::forward_batch_core_gate`)
+// が 1 トークンずつの `forward_token` とビット一致することの固定。
+//
+// 実モデル (111 GB) は使わない。合成した F32 の投影行列で「構造は実モデルと同じ・
+// 寸法だけ小さい」層を組み、同じ入力列を 2 つの層に「逐次」と「チャンク」で
+// 食わせて比べる。出力だけでなく conv / ssm 状態も比べる (状態がずれると次の
+// チャンクで静かに壊れる)。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    fn lcg_rng(seed: u64) -> impl FnMut() -> f32 {
+        let mut rng = seed;
+        move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((rng >> 33) as f32) / (u32::MAX as f32) - 0.5
+        }
+    }
+
+    /// F32 の重みで [`GgufLinear`] を作る (`WeightBlocks` は行優先 [n][k])。
+    fn f32_linear(k: usize, n: usize, rnd: &mut impl FnMut() -> f32) -> GgufLinear {
+        let data: Vec<f32> = (0..k * n).map(|_| rnd()).collect();
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for v in &data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        GgufLinear::new(GgmlType::F32, k, n, WeightBlocks::from_vec(bytes))
+            .expect("GgufLinear (F32)")
+    }
+
+    /// 構造は実モデルと同じ・寸法だけ小さい ssm 層 (nk=2 / nv=4 で GQA の
+    /// タイル対応 h % nk も通る)。
+    fn small_layer() -> (SsmLayer, GdnParams) {
+        let p = GdnParams {
+            n_embd: 16,
+            n_k_heads: 2,
+            n_v_heads: 4,
+            head_k_dim: 8,
+            head_v_dim: 8,
+            d_conv: 4,
+            eps: 1e-6,
+        };
+        let mut rnd = lcg_rng(0x0f0f_1234_5678_9abc);
+        let vd = p.value_dim();
+        let layer = SsmLayer {
+            il: 0,
+            p: p.clone(),
+            w_qkv: f32_linear(p.n_embd, p.qkv_dim(), &mut rnd),
+            w_gate: f32_linear(p.n_embd, vd, &mut rnd),
+            w_beta: f32_linear(p.n_embd, p.n_v_heads, &mut rnd),
+            w_alpha: f32_linear(p.n_embd, p.n_v_heads, &mut rnd),
+            w_out: f32_linear(vd, p.n_embd, &mut rnd),
+            conv1d: (0..p.conv_dim() * p.d_conv).map(|_| 0.4 * rnd()).collect(),
+            ssm_a: (0..p.n_v_heads).map(|_| -0.05 - 0.05 * rnd().abs()).collect(),
+            ssm_dt: (0..p.n_v_heads).map(|_| 0.1 * rnd()).collect(),
+            ssm_norm: (0..p.head_v_dim).map(|_| 0.5 + rnd().abs()).collect(),
+            state: GdnState::new(&p),
+        };
+        (layer, p)
+    }
+
+    fn inputs(p: &GdnParams, nt: usize) -> Vec<Vec<f32>> {
+        (0..nt)
+            .map(|t| {
+                (0..p.n_embd)
+                    .map(|j| 0.3 * (((t * 7 + j * 3) % 5) as f32) - 0.6)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// 2 トークン以上で `forward_batch` のチャンク経路が発動し、`forward_token` を
+    /// nt 回呼ぶのと出力・状態ともビット一致する。
+    #[test]
+    fn ssm_batch_matches_token_by_token_bitexact() {
+        for nt in [2usize, 3, 5, 9, 17] {
+            let (mut seq, p) = small_layer();
+            let (mut bat, _) = small_layer();
+            let curs = inputs(&p, nt);
+
+            let want: Vec<Vec<f32>> = curs
+                .iter()
+                .map(|c| seq.forward_token(c).expect("forward_token"))
+                .collect();
+            let got = bat.forward_batch(&curs).expect("forward_batch");
+
+            assert_eq!(got.len(), nt, "nt={nt}: 出力トークン数");
+            for t in 0..nt {
+                assert_eq!(
+                    bits(&got[t]),
+                    bits(&want[t]),
+                    "nt={nt}: トークン {t} の出力がビット不一致"
+                );
+            }
+            assert_eq!(bits(&seq.state.ssm), bits(&bat.state.ssm), "nt={nt}: ssm 状態");
+            assert_eq!(bits(&seq.state.conv), bits(&bat.state.conv), "nt={nt}: conv 状態");
+        }
+    }
+
+    /// チャンクの切り方を変えても同じ (状態の持ち越しが正しい)。
+    #[test]
+    fn ssm_batch_chunk_split_matches_single_chunk() {
+        let (mut one, p) = small_layer();
+        let (mut split, _) = small_layer();
+        let curs = inputs(&p, 11);
+
+        let whole = one.forward_batch(&curs).expect("forward_batch (1 回)");
+        let mut pieces: Vec<Vec<f32>> = Vec::new();
+        for (a, b) in [(0usize, 3usize), (3, 4), (4, 11)] {
+            pieces.extend(split.forward_batch(&curs[a..b]).expect("forward_batch (分割)"));
+        }
+        assert_eq!(pieces.len(), whole.len());
+        for t in 0..whole.len() {
+            assert_eq!(bits(&pieces[t]), bits(&whole[t]), "トークン {t}");
+        }
+        assert_eq!(bits(&one.state.ssm), bits(&split.state.ssm), "ssm 状態");
+        assert_eq!(bits(&one.state.conv), bits(&split.state.conv), "conv 状態");
+    }
+
+    /// nt=1 は `forward_token` へ委譲する (バッチ経路に入らない)。
+    #[test]
+    fn ssm_batch_single_token_delegates() {
+        let (mut a, p) = small_layer();
+        let (mut b, _) = small_layer();
+        let curs = inputs(&p, 1);
+        let want = a.forward_token(&curs[0]).expect("forward_token");
+        let got = b.forward_batch(&curs).expect("forward_batch");
+        assert_eq!(got.len(), 1);
+        assert_eq!(bits(&got[0]), bits(&want));
     }
 }
