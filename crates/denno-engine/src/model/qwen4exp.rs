@@ -5809,7 +5809,12 @@ mod tests {
                 .collect();
 
             let before = GEMV_BATCH_BLOCKED_CALLS.load(std::sync::atomic::Ordering::Relaxed);
-            let bat = moe_ffn_quant_batch(&p, &lw, &xs, nt, None).expect("batch");
+            // VNNI は活性を int8 に落とすので逐次 (f32) とビット一致しない。
+            // このテストは「バッチ経路の値が逐次と 1 ビットも変わらない」ことの検査なので
+            // f32 経路 (vnni=false) で回す。VNNI 経路の一致は
+            // `moe_flat_vnni_fires_and_matches_within_tolerance` が見る。
+            let bat = moe_ffn_quant_batch_opts(&p, &lw, &xs, nt, None, moe_schedule(), false)
+                .expect("batch");
             assert!(
                 GEMV_BATCH_BLOCKED_CALLS.load(std::sync::atomic::Ordering::Relaxed) > before,
                 "ルータのトークンブロック経路が発動していない"
