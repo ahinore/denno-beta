@@ -65,9 +65,14 @@ struct GenReq {
     enable_thinking: bool,
 }
 
+/// 環境変数が 1/true のときだけ有効。
+fn env_flag(k: &str) -> bool {
+    matches!(std::env::var(k).as_deref(), Ok("1") | Ok("true") | Ok("yes"))
+}
+
 impl GenReq {
     fn from_json(v: &Value, default_max: usize) -> Result<Self> {
-        let system = match v.get("system") {
+        let mut system = match v.get("system") {
             Some(Value::String(s)) => Some(s.clone()),
             Some(Value::Array(a)) => {
                 let mut s = String::new();
@@ -126,6 +131,30 @@ impl GenReq {
         if messages.is_empty() {
             bail!("messages が空");
         }
+
+        // 推論サーバ側で、会話に不要なツール定義を落とす (既定 off)。
+        // クライアントの MCP / tool 定義は数千トークンになり prefill を直接押し上げる。
+        // `DENNO_STRIP_TOOLS=1` で落とす。`DENNO_MAX_SYSTEM=N` なら system の先頭 N 文字だけ残す。
+        let mut tools = v.get("tools").cloned();
+        if env_flag("DENNO_STRIP_TOOLS") {
+            if let Some(t) = tools.take() {
+                let bytes = serde_json::to_string(&t).map(|s| s.len()).unwrap_or(0);
+                println!("[flash] strip tools: {bytes} bytes dropped");
+            }
+        }
+        if let Some(maxc) = std::env::var("DENNO_MAX_SYSTEM")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            if let Some(s) = system.as_mut() {
+                let n = s.chars().count();
+                if n > maxc {
+                    let cut = s.char_indices().nth(maxc).map(|(i, _)| i).unwrap_or(s.len());
+                    s.truncate(cut);
+                    println!("[flash] strip system: {n} -> {maxc} chars");
+                }
+            }
+        }
         let max_tokens = v
             .get("max_tokens")
             .and_then(|x| x.as_u64())
@@ -158,7 +187,7 @@ impl GenReq {
         Ok(GenReq {
             system,
             messages,
-            tools: v.get("tools").cloned(),
+            tools,
             max_tokens,
             temperature,
             top_p,
