@@ -297,6 +297,40 @@ pub fn attend_batch_calls() -> usize {
     ATTN_BATCH_CALLS.load(AtomicOrdering::Relaxed)
 }
 
+/// [`AttnLayer::attend_batch`] がトークン方向の rayon 経路を走らせた回数。
+///
+/// 緑 = 経路が発動した証拠ではないので、テストが「並列の枝が実際に通った」
+/// ことをこれで見る (層×チャンクで 1 回)。
+static ATTN_BATCH_PAR_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// [`AttnLayer::attend_batch`] が並列経路を走らせた回数 (プロセス通算)。
+pub fn attend_batch_par_calls() -> usize {
+    ATTN_BATCH_PAR_CALLS.load(AtomicOrdering::Relaxed)
+}
+
+/// トークン方向の並列化を始める最小 `nt` (既定 8)。
+///
+/// 1 トークンぶんの計算は head_dim 256 × 24 head × 位置数で、nt が 1 桁だと
+/// rayon の分割コスト (µs 台) が仕事量に比べて無視できない。実測 (CPU) で
+/// nt = 8 前後から並列が勝ち始めたのでここを既定にした
+/// (`crates/denno-engine/tests/qwen4exp_attn_batch.rs` のベンチ)。
+const ATTN_PAR_MIN_DEFAULT: usize = 8;
+
+static ATTN_PAR_MIN: AtomicUsize = AtomicUsize::new(ATTN_PAR_MIN_DEFAULT);
+
+/// 現在の並列化しきい値 (`nt` がこれ未満なら逐次)。
+pub fn attend_par_min() -> usize {
+    ATTN_PAR_MIN.load(AtomicOrdering::Relaxed)
+}
+
+/// しきい値を差し替え、以前の値を返す。
+///
+/// ベンチが「バッチ逐次」を測るためだけに使う (`usize::MAX` で強制逐次)。
+/// 本番経路は既定値のまま。
+pub fn set_attend_par_min(nt: usize) -> usize {
+    ATTN_PAR_MIN.swap(nt, AtomicOrdering::Relaxed)
+}
+
 /// full attention 層 1 つぶんの重み。
 pub struct AttnLayer {
     pub n_embd: usize,
@@ -562,8 +596,7 @@ impl AttnLayer {
         Ok(out)
     }
 
-    /// チャンクぶんの attention を **KV を 1 回走査する形** で回す
-    /// (バッチ prefill 用)。
+    /// チャンクぶんの attention を回す (バッチ prefill 用)。
     ///
     /// `qs` は `nt * q_dim` (トークン順、各 head は正規化 + rope 済み)。
     /// 呼ぶ前に層 `layer` のキャッシュへ今回の `nt` 行を push してあること
@@ -576,11 +609,20 @@ impl AttnLayer {
     /// - softmax は [`softmax`] (max 引き → exp → 前からの和)
     /// - 出力の重み付き和は **j 昇順**の逐次加算 (`out[d] += p * v[d]`)
     ///
-    /// ループを j 外・t 内に入れ替えても、各 (トークン, head, d) の加算列は
-    /// j 昇順のまま、各 (トークン, 位置, head) の内積の加算列は d 昇順のまま
-    /// なので、値は 1 トークン版とビット一致する。変わるのは「同じ (t, j, d) を
-    /// 計算する順番」だけ。KV は kv head ごとに 1 回だけ読む (GQA の q head は
+    /// # 並列化 (トークン方向)
+    ///
+    /// トークン `t` が見る範囲は `0..=(base + t)` で閉じていて、トークン同士は
+    /// 状態を共有しない (KV キャッシュは読むだけ)。1 トークンぶんの計算を
+    /// [`AttnLayer::attend_one_into`] に切り出し、`0..nt` を `par_chunks_mut` で
+    /// 割る。各 (t, head, d) の加算列は j 昇順、各 (t, 位置, head) の内積は
+    /// d 昇順のまま変わらないので、**スレッド数にも分割の仕方にも依存せず
+    /// ビット一致する**。変わるのは「どのトークンをどのスレッドが計算するか」
+    /// だけ。KV は (トークン, kv head) ごとに 1 回だけ読む (GQA の q head は
     /// 同じ行を共有する)。
+    ///
+    /// `nt` が [`attend_par_min`] 未満のときは**同じ関数**をトークン順に回す
+    /// (rayon の分割コストが見合わない)。経路が違っても計算は同一なので値は
+    /// 動かない。呼び出し側が既に rayon の中でも work-stealing でそのまま走る。
     pub fn attend_batch(
         &self,
         qs: &[f32],
@@ -614,8 +656,6 @@ impl AttnLayer {
         ATTN_BATCH_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
         let kb = cache.k(layer)?;
         let vb = cache.v(layer)?;
-        let dh = self.head_dim;
-        let ncols = len;
 
         // q head → kv head のまとめ (GQA で同じ kv 行を共有する head を 1 度に回す)。
         let mut groups: Vec<Vec<usize>> = vec![Vec::new(); self.n_head_kv];
@@ -623,54 +663,112 @@ impl AttnLayer {
             groups[self.kv_head(h)].push(h);
         }
         let gmax = groups.iter().map(|g| g.len()).max().unwrap_or(0);
-        let mut scores = vec![0f32; gmax * nt * ncols];
+        // 作業バッファは 1 トークンぶん (head グループ最大 × 可視位置の最大)。
+        let scratch_len = gmax * len;
 
+        // トークン方向の並列。`nt` がしきい値以上なら rayon に割る。
+        #[cfg(feature = "par")]
+        if nt >= attend_par_min() {
+            use rayon::prelude::*;
+
+            ATTN_BATCH_PAR_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            // `for_each_init` でスレッドごとに 1 本の作業バッファを使い回す。
+            out.par_chunks_mut(qd)
+                .enumerate()
+                .for_each_init(|| vec![0f32; scratch_len], |scores, (t, o)| {
+                    self.attend_one_into(
+                        &qs[t * qd..(t + 1) * qd],
+                        kb,
+                        vb,
+                        row,
+                        base + t + 1,
+                        &groups,
+                        scores,
+                        o,
+                    );
+                });
+            return Ok(out);
+        }
+
+        // 逐次 (nt が小さいとき / `par` 無効時)。並列と同じ関数をトークン順に回す。
+        let mut scores = vec![0f32; scratch_len];
+        for t in 0..nt {
+            self.attend_one_into(
+                &qs[t * qd..(t + 1) * qd],
+                kb,
+                vb,
+                row,
+                base + t + 1,
+                &groups,
+                &mut scores,
+                &mut out[t * qd..(t + 1) * qd],
+            );
+        }
+        Ok(out)
+    }
+
+    /// 1 トークンぶんの GQA attention を `out` に書く
+    /// ([`AttnLayer::attend_batch`] の本体)。
+    ///
+    /// `nvis` = 見る位置の本数 (トークン `t` なら `base + t + 1`)。キャッシュの
+    /// `0..nvis` 行だけを見る (因果性は呼び出し側が閉じる)。加算順は 1 トークン版
+    /// と同一: 内積は d 昇順 → `* kq_scale` 1 回、[`softmax`] は前からの和、
+    /// 出力は j 昇順の逐次加算。
+    ///
+    /// `scores` は `ng * nvis` 以上 (ng = 最大の head グループ)、`out` は
+    /// `q_dim` で、呼ぶ前に 0 で埋まっていること。トークン内では kv head ごとに
+    /// k / v の行を 1 回だけ読み、その kv head を共有する q head をまとめて回す。
+    #[allow(clippy::too_many_arguments)]
+    fn attend_one_into(
+        &self,
+        qrow: &[f32],
+        kb: &[f32],
+        vb: &[f32],
+        row: usize,
+        nvis: usize,
+        groups: &[Vec<usize>],
+        scores: &mut [f32],
+        out: &mut [f32],
+    ) {
+        let dh = self.head_dim;
+        debug_assert_eq!(qrow.len(), self.q_dim());
+        debug_assert_eq!(out.len(), self.q_dim());
+        debug_assert!(nvis >= 1);
         for (hk, group) in groups.iter().enumerate() {
             if group.is_empty() {
                 continue;
             }
             let ng = group.len();
-            // 1) スコア: j (位置) を外・t (トークン) を内にして k 行を 1 回だけ読む。
-            for j in 0..ncols {
+            debug_assert!(scores.len() >= ng * nvis);
+            let sc = &mut scores[..ng * nvis];
+            // 1) スコア: j (位置) を外・head を内にして k 行を 1 回だけ読む。
+            for j in 0..nvis {
                 let krow = &kb[j * row + hk * dh..][..dh];
-                let t0 = j.saturating_sub(base);
                 for (li, &h) in group.iter().enumerate() {
-                    let sbase = (li * nt) * ncols;
-                    for t in t0..nt {
-                        let qrow = &qs[t * qd + h * dh..][..dh];
-                        let mut acc = 0f32;
-                        for d in 0..dh {
-                            acc += qrow[d] * krow[d];
-                        }
-                        scores[sbase + t * ncols + j] = acc * self.kq_scale;
+                    let qh = &qrow[h * dh..][..dh];
+                    let mut acc = 0f32;
+                    for d in 0..dh {
+                        acc += qh[d] * krow[d];
                     }
+                    sc[li * nvis + j] = acc * self.kq_scale;
                 }
             }
-            // 2) softmax はトークンごとに可視範囲だけ ([`softmax`] そのもの)。
+            // 2) softmax は可視範囲だけ ([`softmax`] そのもの)。
             for li in 0..ng {
-                for t in 0..nt {
-                    let nvis = base + t + 1;
-                    let o = (li * nt + t) * ncols;
-                    softmax(&mut scores[o..o + nvis]);
-                }
+                softmax(&mut sc[li * nvis..(li + 1) * nvis]);
             }
             // 3) 出力: j 昇順の逐次加算 (v 行も 1 回だけ読む)。
-            for j in 0..ncols {
+            for j in 0..nvis {
                 let vrow = &vb[j * row + hk * dh..][..dh];
-                let t0 = j.saturating_sub(base);
                 for (li, &h) in group.iter().enumerate() {
-                    let sbase = (li * nt) * ncols;
-                    for t in t0..nt {
-                        let p = scores[sbase + t * ncols + j];
-                        let orow = &mut out[t * qd + h * dh..][..dh];
-                        for d in 0..dh {
-                            orow[d] += p * vrow[d];
-                        }
+                    let p = sc[li * nvis + j];
+                    let orow = &mut out[h * dh..][..dh];
+                    for d in 0..dh {
+                        orow[d] += p * vrow[d];
                     }
                 }
             }
         }
-        Ok(out)
     }
 
     /// 出力ゲート: `attn * sigmoid(gate)` (要素ごと)。

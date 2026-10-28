@@ -21,7 +21,9 @@ use std::sync::{Mutex, MutexGuard};
 
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::qwen4exp::Qwen4ExpParams;
-use denno_engine::model::qwen4exp_attn::{attend_batch_calls, FullAttn};
+use denno_engine::model::qwen4exp_attn::{
+    attend_batch_calls, attend_batch_par_calls, attend_par_min, set_attend_par_min, FullAttn,
+};
 
 /// プロセス通算のカウンタ (`attend_batch_calls`) を読むテストは直列に走らせる。
 /// 並列だと他のテストの呼び出しが混ざり、「+1 回」を検査できない。
@@ -498,91 +500,262 @@ fn single_token_batch_falls_back_and_bad_inputs_are_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// トークン方向の並列化 (P-PF-ATTN-PAR)
+// ---------------------------------------------------------------------------
+
+/// `nt` が閾値以上のとき並列の枝が実際に走り、出力が逐次とビット一致することを
+/// 固定する。スレッド数 1 / 16 のプールで同じ `forward_batch` を回して比べる
+/// (スレッド数が値に漏れていないことの検査。プールは `install` の中だけで効く)。
+///
+/// 緑 = 発動の証拠ではないので、`attend_batch_par_calls` の増加も併せて見る。
+#[test]
+fn parallel_path_matches_sequential_across_thread_counts() {
+    let _g = lock();
+    let dir = TempDir::new("par");
+    const NT_PAR: usize = 16; // 既定の閾値 8 以上
+    assert!(
+        NT_PAR >= attend_par_min(),
+        "閾値 {} が {NT_PAR} より大きい (このテストは並列の枝を通らない)",
+        attend_par_min()
+    );
+    let curs = tokens(0, NT_PAR);
+    for (nh, nkv) in CASES {
+        let tag = format!("heads {nh} / kv {nkv} (並列)");
+        // 基準: 1 トークンずつ `forward_token` を回す。
+        let mut seq = build(&dir, nh, nkv, HEAD_DIM, 64);
+        let mut want = Vec::with_capacity(NT_PAR);
+        for cur in &curs {
+            want.push(seq.forward_token(ATTN_LAYER, cur).expect("forward_token"));
+        }
+
+        for threads in [1usize, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("rayon プール");
+            let mut bat = build(&dir, nh, nkv, HEAD_DIM, 64);
+            let before = attend_batch_par_calls();
+            let got = pool
+                .install(|| bat.forward_batch(ATTN_LAYER, &curs))
+                .expect("forward_batch");
+            assert_eq!(
+                attend_batch_par_calls() - before,
+                1,
+                "{tag}: {threads} スレッドで並列の枝が走っていない (nt={NT_PAR})"
+            );
+            assert_eq!(got.len(), NT_PAR, "{tag}: 出力トークン数");
+            for t in 0..NT_PAR {
+                assert_bits_eq(
+                    &got[t],
+                    &want[t],
+                    &format!("{tag}: {threads} スレッドのトークン {t}"),
+                );
+            }
+            // 全トークン同値 (= head/位置が効いていない) でないことも見る。
+            assert!(
+                (1..NT_PAR).any(|t| bits(&got[t]) != bits(&got[0])),
+                "{tag}: {threads} スレッドで全トークンの出力が同一"
+            );
+        }
+    }
+}
+
+/// 閾値未満の `nt` は逐次に落ちること (並列の枝が走らないこと)。
+#[test]
+fn below_threshold_uses_sequential_branch() {
+    let _g = lock();
+    let min = attend_par_min();
+    assert!(min >= 2, "閾値 {min} ではこのテストが意味を持たない");
+    let dir = TempDir::new("parmin");
+    let mut fa = build(&dir, 2, 1, HEAD_DIM, 32);
+    let n = min - 1;
+    let before = attend_batch_par_calls();
+    let got = fa
+        .forward_batch(ATTN_LAYER, &tokens(0, n))
+        .expect("forward_batch");
+    assert_eq!(got.len(), n);
+    assert_eq!(
+        attend_batch_par_calls(),
+        before,
+        "閾値未満 (nt={n} < {min}) なのに並列の枝が走った"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // CPU マイクロベンチ (実機の prefill 計測ではない。main が実機で測る前の目安)
 // ---------------------------------------------------------------------------
 
-/// 実モデルと同じ形の attend を CPU で A/B する。
+/// 1 つの形 (head 数 / kv head 数) で 3 条件を測る。
 ///
-/// 24 head / 2 kv head / head_dim 256 / チャンク 64 / 位置 738 から 802。
-/// 測るのは **attention 本体だけ** (投影は含めない)。逐次 = 1 トークンずつ
-/// push して `attend`、バッチ = 全部 push して `attend_batch`。
+/// - 逐次 = 1 トークンずつ push して `attend`
+/// - バッチ逐次 = 全部 push して `attend_batch` (閾値を `usize::MAX` にして
+///   並列の枝を止める。**同じ関数**をトークン順に回したもの)
+/// - バッチ並列 = 全部 push して `attend_batch` (rayon 1 / 4 / 8 / 16 スレッド)
 ///
-/// `--ignored` で手動実行する。数字は CPU・単一スレッド・合成 KV のものなので、
-/// 実機 (802 トークン / CUDA) の ms/tok と直接は比べられない。
-#[test]
-#[ignore = "CPU マイクロベンチ (実機の prefill 計測ではない)"]
-fn bench_attend_sequential_vs_batch() {
-    let _g = lock();
-    const NH: usize = 24;
-    const NKV: usize = 2;
-    const DH: usize = 256;
-    const NT: usize = 64;
-    const BASE: usize = 738;
-
+/// 3 条件の出力がビット一致することも同じループで確かめる。数字は CPU・合成 KV の
+/// もので、実機 (802 トークン / CUDA) の ms/tok と直接は比べられない。
+///
+/// しきい値 (`attend_par_min`) 未満の `nt` の形も測れるよう、並列の測定中だけ
+/// しきい値を 1 に落とす (逐次の測定は `usize::MAX` で止める)。
+fn bench_attend_shape(
+    tag: &str,
+    nh: usize,
+    nkv: usize,
+    dh: usize,
+    nt: usize,
+    base: usize,
+    reps: usize,
+) {
     let dir = TempDir::new("bench");
-    let mut fa = build(&dir, NH, NKV, DH, 1024);
-    let row = NKV * DH;
-    let qd = NH * DH;
+    let mut fa = build(&dir, nh, nkv, dh, base + nt + 64);
+    let row = nkv * dh;
+    let qd = nh * dh;
 
     // 位置ごとに違う KV を作る (全部同じ値だと内積が同じになる)。
     let mut rng = Rng::new(7);
-    let kbuf: Vec<f32> = (0..(BASE + NT) * row).map(|_| rng.next_sym()).collect();
-    let vbuf: Vec<f32> = (0..(BASE + NT) * row).map(|_| rng.next_sym()).collect();
-    let qs: Vec<f32> = (0..NT * qd).map(|_| rng.next_sym()).collect();
+    let kbuf: Vec<f32> = (0..(base + nt) * row).map(|_| rng.next_sym()).collect();
+    let vbuf: Vec<f32> = (0..(base + nt) * row).map(|_| rng.next_sym()).collect();
+    let qs: Vec<f32> = (0..nt * qd).map(|_| rng.next_sym()).collect();
 
-    let mut seq_ms = f64::INFINITY;
-    let mut bat_ms = f64::INFINITY;
-    let reps = 3;
-    for _ in 0..reps {
-        // --- 逐次: t ごとに push → attend(0..base+t+1) ---
+    // 先頭 base 本を積んだ状態を 3 条件で共通に作る。
+    let prefill = |fa: &mut FullAttn| {
         fa.reset();
-        for j in 0..BASE {
+        for j in 0..base {
             fa.cache_mut()
-                .push(ATTN_LAYER, &kbuf[j * row..(j + 1) * row], &vbuf[j * row..(j + 1) * row])
+                .push(
+                    ATTN_LAYER,
+                    &kbuf[j * row..(j + 1) * row],
+                    &vbuf[j * row..(j + 1) * row],
+                )
                 .expect("push");
         }
-        let t0 = std::time::Instant::now();
-        for t in 0..NT {
-            let j = BASE + t;
+    };
+    // 今回の nt 行を push する (タイマーの内側。逐次側も push を含むので条件を揃える)。
+    let push_chunk = |fa: &mut FullAttn| {
+        for t in 0..nt {
+            let j = base + t;
             fa.cache_mut()
-                .push(ATTN_LAYER, &kbuf[j * row..(j + 1) * row], &vbuf[j * row..(j + 1) * row])
+                .push(
+                    ATTN_LAYER,
+                    &kbuf[j * row..(j + 1) * row],
+                    &vbuf[j * row..(j + 1) * row],
+                )
+                .expect("push");
+        }
+    };
+
+    let threads = [1usize, 4, 8, 16];
+    let mut seq_ms = f64::INFINITY;
+    let mut bat_seq_ms = f64::INFINITY;
+    let mut par_ms = vec![f64::INFINITY; threads.len()];
+    for _ in 0..reps {
+        // --- 逐次: t ごとに push → attend(0..base+t+1) ---
+        prefill(&mut fa);
+        let t0 = std::time::Instant::now();
+        let mut seq_out: Vec<f32> = Vec::with_capacity(nt * qd);
+        for t in 0..nt {
+            let j = base + t;
+            fa.cache_mut()
+                .push(
+                    ATTN_LAYER,
+                    &kbuf[j * row..(j + 1) * row],
+                    &vbuf[j * row..(j + 1) * row],
+                )
                 .expect("push");
             let out = {
                 let l = fa.layer(ATTN_LAYER).expect("layer");
                 l.attend(&qs[t * qd..(t + 1) * qd], fa.cache(), ATTN_LAYER)
                     .expect("attend")
             };
-            assert_eq!(out.len(), qd);
+            seq_out.extend_from_slice(&out);
         }
         seq_ms = seq_ms.min(t0.elapsed().as_secs_f64() * 1e3);
 
-        // --- バッチ: 全部 push → attend_batch ---
-        fa.reset();
-        for j in 0..BASE {
-            fa.cache_mut()
-                .push(ATTN_LAYER, &kbuf[j * row..(j + 1) * row], &vbuf[j * row..(j + 1) * row])
-                .expect("push");
-        }
+        // --- バッチ逐次: 閾値を usize::MAX にして並列の枝を止める ---
+        let prev = set_attend_par_min(usize::MAX);
+        prefill(&mut fa);
         let t0 = std::time::Instant::now();
-        for t in 0..NT {
-            let j = BASE + t;
-            fa.cache_mut()
-                .push(ATTN_LAYER, &kbuf[j * row..(j + 1) * row], &vbuf[j * row..(j + 1) * row])
-                .expect("push");
-        }
+        push_chunk(&mut fa);
+        let before = attend_batch_par_calls();
         let out = {
             let l = fa.layer(ATTN_LAYER).expect("layer");
-            l.attend_batch(&qs, NT, fa.cache(), ATTN_LAYER)
+            l.attend_batch(&qs, nt, fa.cache(), ATTN_LAYER)
                 .expect("attend_batch")
         };
-        assert_eq!(out.len(), NT * qd);
-        bat_ms = bat_ms.min(t0.elapsed().as_secs_f64() * 1e3);
+        assert_eq!(
+            attend_batch_par_calls(),
+            before,
+            "閾値 usize::MAX なのに並列の枝が走った"
+        );
+        set_attend_par_min(prev);
+        bat_seq_ms = bat_seq_ms.min(t0.elapsed().as_secs_f64() * 1e3);
+        assert_bits_eq(&out, &seq_out, "バッチ逐次 vs 逐次");
+
+        // --- バッチ並列: 1 / 4 / 8 / 16 スレッド ---
+        // nt がしきい値未満の形も測れるよう、ベンチの間だけしきい値を 1 にする。
+        let prev_min = set_attend_par_min(1);
+        for (i, &th) in threads.iter().enumerate() {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(th)
+                .build()
+                .expect("rayon プール");
+            prefill(&mut fa);
+            let t0 = std::time::Instant::now();
+            push_chunk(&mut fa);
+            let before = attend_batch_par_calls();
+            let out = {
+                let l = fa.layer(ATTN_LAYER).expect("layer");
+                let cache = fa.cache();
+                pool.install(|| l.attend_batch(&qs, nt, cache, ATTN_LAYER))
+                    .expect("attend_batch")
+            };
+            assert!(
+                attend_batch_par_calls() > before,
+                "{th} スレッドで並列の枝が走っていない"
+            );
+            par_ms[i] = par_ms[i].min(t0.elapsed().as_secs_f64() * 1e3);
+            assert_bits_eq(&out, &seq_out, &format!("バッチ並列 {th} スレッド vs 逐次"));
+        }
+        set_attend_par_min(prev_min);
     }
+
     println!(
-        "CPU attend 1 層 1 チャンク (heads {NH}/kv {NKV}/dh {DH}/nt {NT}/pos {BASE}..{}): \
-         逐次 {seq_ms:.2} ms / バッチ {bat_ms:.2} ms / 比 {:.2}x",
-        BASE + NT,
-        seq_ms / bat_ms
+        "{tag}: heads {nh}/kv {nkv}/dh {dh}/nt {nt}/pos {base}..{}  (1 層 1 チャンク)",
+        base + nt
     );
-    assert!(bat_ms.is_finite() && seq_ms.is_finite());
+    println!(
+        "  逐次 {seq_ms:8.2} ms / バッチ逐次 {bat_seq_ms:8.2} ms (比 {:.2}x)",
+        seq_ms / bat_seq_ms
+    );
+    for (i, &th) in threads.iter().enumerate() {
+        println!(
+            "  バッチ並列 {th:2} スレッド {tmp:8.2} ms / 逐次比 {a:5.2}x / バッチ逐次比 {b:5.2}x",
+            tmp = par_ms[i],
+            a = seq_ms / par_ms[i],
+            b = bat_seq_ms / par_ms[i]
+        );
+    }
+}
+
+/// 実モデルと同じ形の attend を CPU で A/B する。
+///
+/// タスクの前提と同じ形 (heads 24 / kv 2 / dh 256 / nt 64 / 位置 738..802) と、
+/// 実モデル (Qwen3.8-27B のメタデータ: heads 24 / kv **4** / dh 256) の 2 つを測る。
+/// 測るのは **attention 本体だけ** (投影は含めない)。`--ignored` で手動実行する。
+#[test]
+#[ignore = "CPU マイクロベンチ (実機の prefill 計測ではない)"]
+fn bench_attend_sequential_vs_batch() {
+    let _g = lock();
+    bench_attend_shape("前提の形", 24, 2, 256, 64, 738, 3);
+    bench_attend_shape("実モデル形 (kv 4, chunk 64)", 24, 4, 256, 64, 738, 3);
+    // 既定のチャンク (DENNO_PREFILL_BATCH_CHUNK の既定 = 8) と、その 2 倍。
+    // しきい値 8 の妥当性をここで見る。
+    bench_attend_shape("実モデル形 (chunk 16)", 24, 4, 256, 16, 738, 5);
+    bench_attend_shape("実モデル形 (chunk 8 = 既定)", 24, 4, 256, 8, 738, 5);
+    bench_attend_shape("実モデル形 (chunk 4)", 24, 4, 256, 4, 738, 5);
+    bench_attend_shape("実モデル形 (chunk 2)", 24, 4, 256, 2, 738, 5);
+    println!(
+        "  rayon 既定スレッド数 {} (この数字は CPU・合成 KV のもの)",
+        rayon::current_num_threads()
+    );
 }
