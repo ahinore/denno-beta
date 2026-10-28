@@ -703,30 +703,42 @@ fn real_model_prefill_timings() {
     let ctx: Vec<u32> = (0..n).map(|i| 100 + (i as u32 % 50)).collect();
 
     // 逐次
-    let mut m1 = build(&parts);
-    let _ = m1.forward_prefill_with(&ctx[..3], false).expect("warm-up seq");
-    denno_engine::model::qwen4exp::q4prof::reset();
-    let _ = denno_engine::model::qwen4exp::moe_sub_take();
-    let t0 = Instant::now();
-    let l1 = m1.forward_prefill_with(&ctx, false).expect("prefill seq");
-    let d_seq = t0.elapsed();
+    //
+    // `DENNO_PREFILL_SEQ=0` で逐次パスを省ける (ベンチ専用。モデルを 2 回組んで
+    // 逐次 802 トークンを回すのは 3 分かかり、バッチ側の比較には要らない)。
+    // 数値の突き合わせをしないので、そのときは diff / argmax の検査も飛ばす。
+    let run_seq = std::env::var("DENNO_PREFILL_SEQ").ok().as_deref() != Some("0");
+    let mut d_seq = std::time::Duration::ZERO;
+    let mut l1: Vec<f32> = Vec::new();
+    if run_seq {
+        let mut m1 = build(&parts);
+        let _ = m1.forward_prefill_with(&ctx[..3], false).expect("warm-up seq");
+        denno_engine::model::qwen4exp::q4prof::reset();
+        let _ = denno_engine::model::qwen4exp::moe_sub_take();
+        let t0 = Instant::now();
+        l1 = m1.forward_prefill_with(&ctx, false).expect("prefill seq");
+        d_seq = t0.elapsed();
+    }
 
     // バッチ
     let mut m2 = build(&parts);
     let _ = m2.forward_prefill_with(&ctx[..3], false).expect("warm-up batch");
-    let seq_prof = prof_line("seq");
+    let seq_prof = if run_seq { prof_line("seq") } else { None };
     denno_engine::model::qwen4exp::q4prof::reset();
     let _ = denno_engine::model::qwen4exp::moe_sub_take();
     let t1 = Instant::now();
     let l2 = m2.forward_prefill_with(&ctx, true).expect("prefill batch");
     let d_bat = t1.elapsed();
 
-    assert_eq!(l1.len(), l2.len(), "logits の長さが違う");
-    let diff = l1
-        .iter()
-        .zip(l2.iter())
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count();
+    let mut diff = 0usize;
+    if run_seq {
+        assert_eq!(l1.len(), l2.len(), "logits の長さが違う");
+        diff = l1
+            .iter()
+            .zip(l2.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+    }
     let argmax = |v: &[f32]| {
         let mut bi = 0usize;
         for (i, x) in v.iter().enumerate() {
@@ -753,18 +765,39 @@ fn real_model_prefill_timings() {
     if let Some(b) = prof_line("batch") {
         eprintln!("{b}");
     }
+    // GPU GEMM の生死 (「緑 = 経路が発動した証拠ではない」ので回数を出す)。
+    if denno_engine::cuda::cuda_enabled() {
+        let (used, skipped) = denno_engine::cuda::gpu_gemm_stats();
+        let r = denno_engine::cuda::gpu_gemm_skip_reasons();
+        let why: Vec<String> = r
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v > 0)
+            .map(|(i, v)| format!("{}={v}", denno_engine::cuda::SKIP_NAMES[i]))
+            .collect();
+        eprintln!(
+            "GEMM gpu used={used} / cpu fallback={skipped} ({})",
+            if why.is_empty() {
+                "-".to_string()
+            } else {
+                why.join(" ")
+            }
+        );
+    }
     // 逐次経路が CUDA カーネルで、バッチ経路が CPU 参照のときは、量子化 GEMV の
     // 実装差 (AVX2 融合カーネル / GPU カーネル) で最下位ビットがずれる。これは
     // 経路の不一致ではなく実装差なので、GPU 有効時は argmax の一致だけを見る。
     // ビット一致の契約は CPU 同士 (DENNO_CUDA=0) で検査する。
-    if denno_engine::cuda::cuda_enabled() {
-        assert_eq!(
-            argmax(&l1),
-            argmax(&l2),
-            "バッチ経路の argmax が逐次と違う (CUDA 有効時はビット一致を要求しない)"
-        );
-    } else {
-        assert_eq!(diff, 0, "バッチ経路の logits が逐次と一致しない");
+    if run_seq {
+        if denno_engine::cuda::cuda_enabled() {
+            assert_eq!(
+                argmax(&l1),
+                argmax(&l2),
+                "バッチ経路の argmax が逐次と違う (CUDA 有効時はビット一致を要求しない)"
+            );
+        } else {
+            assert_eq!(diff, 0, "バッチ経路の logits が逐次と一致しない");
+        }
     }
 }
 

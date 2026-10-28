@@ -558,6 +558,12 @@ pub struct CudaCtx {
     #[allow(dead_code)]
     module_moe: CUmodule,
     f_moe: Option<[CUfunction; 4]>,
+    /// P-PF-GB: prefill 用の量子 GEMM (Q8_0 / Q5_1 / Q4_K / Q5_K) を積んだ
+    /// モジュール。数値契約は prefill のみ解除済み (`-fmad=true` で JIT)。
+    /// 読み込みに失敗しても起動は壊さず `f_gemm_q = None` (CPU バッチへ落ちる)。
+    #[allow(dead_code)]
+    module_gemm_q: CUmodule,
+    f_gemm_q: Option<[CUfunction; 4]>,
 }
 
 const PTX: &[u8] = include_bytes!("../kernels/kernels_int8.ptx");
@@ -566,6 +572,9 @@ const PTX_GDN: &[u8] = include_bytes!("../kernels/kernels_gdn.ptx");
 // P-MOE-E1: Flash-Next の expert GEMV (Q8_0 / Q5_1 / Q4_K / Q5_K)。
 // CPU 参照 (`model::moe_expert::expert_gemv`) とビット一致する。
 const PTX_MOE: &[u8] = include_bytes!("../kernels/kernels_moe.ptx");
+/// P-PF-GB: prefill 用の量子 GEMM。契約外 (FMA 融合あり) なので
+/// `kernels_moe.ptx` (-fmad=false) とは別ファイルにしてある。
+const PTX_GEMM_Q: &[u8] = include_bytes!("../kernels/kernels_gemm.ptx");
 
 // 中身は生ハンドル (context / module / function)。CUcontext はスレッドごとに
 // current 設定して使うハンドルであり、所有権の移動は伴わないため Send/Sync を
@@ -880,6 +889,35 @@ impl CudaCtx {
                 }
             }
 
+            // P-PF-GB: prefill 用の量子 GEMM のモジュール。同じ規約 (4 本そろって初めて Some)。
+            let mut module_gemm_q: CUmodule = std::ptr::null_mut();
+            let mut f_gemm_q: Option<[CUfunction; 4]> = None;
+            {
+                let mut image = PTX_GEMM_Q.to_vec();
+                image.push(0);
+                if (lib.module_load_data)(&mut module_gemm_q, image.as_ptr() as *const c_void) == CUDA_SUCCESS {
+                    let mut fs: [CUfunction; 4] = [std::ptr::null_mut(); 4];
+                    let names: [&[u8]; 4] = [
+                        b"dno_gemm_q8_0_w\0",
+                        b"dno_gemm_q5_1_w\0",
+                        b"dno_gemm_q4k_w\0",
+                        b"dno_gemm_q5k_w\0",
+                    ];
+                    let mut ok = true;
+                    for (k, n) in names.iter().enumerate() {
+                        if (lib.module_get_function)(&mut fs[k], module_gemm_q, n.as_ptr() as *const c_char)
+                            != CUDA_SUCCESS
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        f_gemm_q = Some(fs);
+                    }
+                }
+            }
+
             Ok(Self {
                 device: dev,
                 name,
@@ -916,6 +954,8 @@ impl CudaCtx {
                 f_gdn_chunk_scan_hoist,
                 module_moe,
                 f_moe,
+                module_gemm_q,
+                f_gemm_q,
             })
         }
     }
@@ -1261,6 +1301,98 @@ impl CudaCtx {
             }
             let got: Vec<f32> = ob.to_vec(n_out)?;
             out.copy_from_slice(&got);
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
+    /// P-PF-GB: prefill 用の量子 GEMM (nt トークン一括, `kernels_gemm.ptx`)。
+    ///
+    /// 数値契約は **解除済み** (2026-10-28 のオペレーター指示)。`-fmad=true` で
+    /// JIT するので FMA 融合が入る。prefill の比較は argmax / 出力 md5 で行う。
+    ///
+    /// `false` を返したら呼び出し側は CPU バッチへ落ちること (fail closed)。
+    /// 落ちる条件: 未対応の型 / nt が 1 か 128 超 / 共有メモリが 46 KiB 超 /
+    /// GPU 無効 / `DENNO_GPU_GEMM=0`。
+    pub fn moe_gemm_dev(
+        &self,
+        ty: crate::kquant::GgmlType,
+        dev_w: &DevBuffer,
+        x: &[f32],
+        nt: usize,
+        n_in: usize,
+        n_out: usize,
+        out: &mut [f32],
+    ) -> Result<bool> {
+        use crate::kquant::GgmlType as T;
+        const ROWS: usize = 16; // kernels_gemm.cu の GEMM_ROWS
+        const NTG_MAX: usize = 8; // kernels_gemm.cu の GEMM_NTG_MAX
+        let Some(fs) = self.f_gemm_q else {
+            return Ok(false);
+        };
+        if nt <= 1 || nt > ROWS * NTG_MAX {
+            return Ok(false);
+        }
+        let (f, rb, blk) = match ty {
+            T::Q8_0 => (fs[0], (n_in / 32) * 34, 32usize),
+            T::Q5_1 => (fs[1], (n_in / 32) * 24, 32usize),
+            T::Q4K => (fs[2], (n_in / 256) * 144, 256usize),
+            T::Q5K => (fs[3], (n_in / 256) * 176, 256usize),
+            _ => return Ok(false),
+        };
+        if n_in == 0 || n_out == 0 || n_in % blk != 0 {
+            return Ok(false);
+        }
+        if x.len() != nt * n_in || out.len() != nt * n_out {
+            bail!(
+                "moe_gemm_dev: 形状が不正 (nt={nt}, n_in={n_in}, n_out={n_out}, \
+                 x={}, out={})",
+                x.len(),
+                out.len()
+            );
+        }
+        if dev_w.bytes() != n_out * rb {
+            bail!(
+                "moe_gemm_dev: 重みのデバイスバイト数 {} が n_out * row_bytes = {} と違う",
+                dev_w.bytes(),
+                n_out * rb
+            );
+        }
+        // 動的共有メモリ: 1 ブロックぶんのデコード済み f32 (ROWS × blk) だけ。
+        // 行の生バイトはカーネルが global から直接読む (丸ごと載せると k=5120 で
+        // 62 KiB になり 48 KiB の既定を超える = 実モデルで 1 度も発火しなかった原因)。
+        let shmem = ROWS * blk * 4;
+        if shmem > 46_000 {
+            return Ok(false);
+        }
+        self.make_current()?;
+        let grid = ((n_out + ROWS - 1) / ROWS) as u32;
+        MOE_SCRATCH.with(|cell| -> Result<()> {
+            let mut s = cell.borrow_mut();
+            MoeScratch::ensure(&mut s.x, nt * n_in * 4)?;
+            MoeScratch::ensure(&mut s.o, nt * n_out * 4)?;
+            let xb = s.x.as_ref().expect("x は ensure 済み");
+            let ob = s.o.as_ref().expect("o は ensure 済み");
+            xb.copy_from(x)?;
+            dbg_htod(nt * n_in * 4);
+            unsafe {
+                let (mut pw, mut px, mut po) = (dev_w.ptr, xb.ptr, ob.ptr);
+                let (mut nt_c, mut ni_c, mut no_c, mut rb_c) =
+                    (nt as c_int, n_in as c_int, n_out as c_int, rb as c_int);
+                let mut args = [
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut px as *mut _ as *mut c_void,
+                    &mut po as *mut _ as *mut c_void,
+                    &mut nt_c as *mut _ as *mut c_void,
+                    &mut ni_c as *mut _ as *mut c_void,
+                    &mut no_c as *mut _ as *mut c_void,
+                    &mut rb_c as *mut _ as *mut c_void,
+                ];
+                self.launch_async(f, (grid, 1, 1), (ROWS as u32, 16, 1), shmem as u32, &mut args)?;
+                self.sync()?;
+            }
+            let got: Vec<f32> = ob.to_vec(nt * n_out)?;
+            out[..nt * n_out].copy_from_slice(&got);
             Ok(())
         })?;
         Ok(true)
@@ -2347,6 +2479,9 @@ fn shared_ctx() -> Option<&'static CudaCtx> {
             }
             Err(e) => {
                 tracing::warn!("CUDA int8 offload unavailable, using CPU int8: {e:#}");
+                // テスト/ベンチは tracing を出さないので、1 回だけ stderr にも書く
+                // (「緑 = 経路が発動した証拠ではない」の取りこぼしを防ぐ)。
+                eprintln!("[cuda] CudaCtx::new 失敗 → CPU へ: {e:#}");
                 None
             }
         })
@@ -4057,6 +4192,196 @@ pub fn maybe_gpu_gguf_gemv_into(
         Err(e) => {
             tracing::error!("gguf gemv failed (uid={uid}): {e:#}");
             false
+        }
+    }
+}
+
+/// P-PF-GB: prefill 用の量子 GEMM の入口 (nt トークン一括)。
+///
+/// `maybe_gpu_gguf_gemv_into` のバッチ版。重みは同じレジストリ (`uid`) を使うので、
+/// decode で既に載っていれば転送は起きない。`false` = CPU バッチへ落ちること。
+/// `DENNO_GPU_GEMM=0` で無効化できる (A/B 用)。
+///
+/// CPU のバッチ演算とは **ビット一致しない** (FMA 融合 + 加算順が違う)。
+/// prefill は 2026-10-28 のオペレーター指示で契約の外にある。CPU 参照と
+/// 突き合わせるテストは `set_gpu_gemm_enabled(false)` で切ってから走らせること。
+pub fn gpu_gemm_enabled() -> bool {
+    if !GPU_GEMM_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    !matches!(
+        std::env::var("DENNO_GPU_GEMM").ok().as_deref(),
+        Some("0") | Some("off") | Some("false")
+    )
+}
+
+/// テスト用: GPU GEMM を明示的に切る / 入れる。
+pub fn set_gpu_gemm_enabled(on: bool) {
+    GPU_GEMM_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+static GPU_GEMM_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// GPU GEMM が実際に計算を肩代わりした回数 / 落ちた回数 (プロセス通算)。
+///
+/// 「緑 = 経路が発動した証拠ではない」ので、実モデルの prefill で本当に
+/// 通ったかをこれで数える (2026-10-28: 共有メモリ超過で全滅していたのを
+/// `差 0 要素` から追った)。
+static GEMM_USED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GEMM_SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// (`使われた回数`, `CPU へ落ちた回数`)。
+pub fn gpu_gemm_stats() -> (usize, usize) {
+    (
+        GEMM_USED.load(std::sync::atomic::Ordering::Relaxed),
+        GEMM_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// 落ちた理由の内訳 (添字は [`SKIP_*`] 定数)。
+pub const SKIP_NAMES: [&str; 8] = [
+    "off(env/flag)",
+    "cuda無効",
+    "nt範囲外",
+    "未対応の型",
+    "ctx無し",
+    "重み未登録",
+    "カーネル拒否",
+    "実行エラー",
+];
+pub const SKIP_OFF: usize = 0;
+pub const SKIP_NO_CUDA: usize = 1;
+pub const SKIP_NT: usize = 2;
+pub const SKIP_TYPE: usize = 3;
+pub const SKIP_NO_CTX: usize = 4;
+pub const SKIP_NO_WEIGHT: usize = 5;
+pub const SKIP_KERNEL: usize = 6;
+pub const SKIP_ERR: usize = 7;
+static GEMM_SKIP_REASONS: [std::sync::atomic::AtomicUsize; 8] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// 落ちた理由の内訳。
+pub fn gpu_gemm_skip_reasons() -> [usize; 8] {
+    let mut a = [0usize; 8];
+    for (i, c) in GEMM_SKIP_REASONS.iter().enumerate() {
+        a[i] = c.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    a
+}
+
+fn skip(r: usize) -> bool {
+    GEMM_SKIP_REASONS[r].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    false
+}
+
+/// 計数を 0 に戻す (ベンチの区切り用)。
+pub fn reset_gpu_gemm_stats() {
+    GEMM_USED.store(0, std::sync::atomic::Ordering::Relaxed);
+    GEMM_SKIPPED.store(0, std::sync::atomic::Ordering::Relaxed);
+    for c in GEMM_SKIP_REASONS.iter() {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 入口。計数を付けて [`gemm_try`] に渡す (再帰の内側は数えない)。
+pub fn maybe_gpu_gguf_gemm_into(
+    uid: u64,
+    ty: crate::kquant::GgmlType,
+    blocks: &[u8],
+    k: usize,
+    n: usize,
+    x: &[f32],
+    nt: usize,
+    out: &mut [f32],
+) -> bool {
+    let ok = gemm_try(uid, ty, blocks, k, n, x, nt, out);
+    let c = if ok { &GEMM_USED } else { &GEMM_SKIPPED };
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ok
+}
+
+fn gemm_try(
+    uid: u64,
+    ty: crate::kquant::GgmlType,
+    blocks: &[u8],
+    k: usize,
+    n: usize,
+    x: &[f32],
+    nt: usize,
+    out: &mut [f32],
+) -> bool {
+    if !gpu_gemm_enabled() {
+        return skip(SKIP_OFF);
+    }
+    if !cuda_enabled() {
+        return skip(SKIP_NO_CUDA);
+    }
+    if nt <= 1 {
+        return skip(SKIP_NT);
+    }
+    if gguf_row_bytes(ty, k).is_none() {
+        return skip(SKIP_TYPE);
+    }
+    // カーネルは 1 起動で 128 トークンまで (GEMM_ROWS × GEMM_NTG_MAX = 16 × 8)。
+    // それより大きい chunk はここで 128 ずつに割る (重みは VRAM 常駐なので
+    // 読み直しは VRAM 内で済む)。
+    const TILE: usize = 128;
+    if nt > TILE {
+        let mut t0 = 0usize;
+        while t0 < nt {
+            let t1 = (t0 + TILE).min(nt);
+            let m = t1 - t0;
+            let ok = gemm_try(
+                uid,
+                ty,
+                blocks,
+                k,
+                n,
+                &x[t0 * k..t1 * k],
+                m,
+                &mut out[t0 * n..t1 * n],
+            );
+            if !ok {
+                return false; // 途中で落ちたら呼び出し側が CPU で全部やり直す
+            }
+            t0 = t1;
+        }
+        return true;
+    }
+    if nt <= 1 {
+        return skip(SKIP_NT);
+    }
+    let Some(ctx) = shared_ctx() else {
+        return skip(SKIP_NO_CTX);
+    };
+    if let Err(e) = ctx.make_current() {
+        tracing::error!("CUDA cuCtxSetCurrent failed, using CPU gguf gemm: {e:#}");
+        return skip(SKIP_ERR);
+    }
+    let w = match weights_for_gguf(uid, ty, blocks, k, n) {
+        Ok(w) => w,
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if let Some(true) = crate::gpu_budget::note_weight_failure(uid, &msg) {
+                tracing::error!("gguf weight register failed (gemm, uid={uid}): {msg}");
+            }
+            return skip(SKIP_NO_WEIGHT);
+        }
+    };
+    match ctx.moe_gemm_dev(ty, &w.buf, x, nt, k, n, out) {
+        Ok(true) => true,
+        Ok(false) => skip(SKIP_KERNEL),
+        Err(e) => {
+            tracing::error!("gguf gemm failed (uid={uid}): {e:#}");
+            skip(SKIP_ERR)
         }
     }
 }

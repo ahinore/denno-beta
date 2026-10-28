@@ -3097,18 +3097,37 @@ fn gemv_rows_pertoken(
 pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]) -> Result<()> {
     let (k, n) = (w.k(), w.n());
     match w.ty() {
-        GgmlType::Q8_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K => gemv_rows_batch(
-            GemvKernel::Linear {
-                fast_q8: w.fast_q8(),
-            },
-            w.ty(),
-            w.blocks().as_slice(),
-            k,
-            n,
-            xs,
-            nt,
-            outs,
-        ),
+        GgmlType::Q8_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K => {
+            // P-PF-GB: prefill のバッチ投影は GPU GEMM を先に試す。
+            // 数値契約は prefill のみ解除済み (FMA 融合 + 加算順が違う)。
+            // `DENNO_GPU_GEMM=0` で切れる。false なら CPU バッチへ落ちる。
+            if crate::cuda::maybe_gpu_gguf_gemm_into(
+                w.uid(),
+                w.ty(),
+                w.blocks().as_slice(),
+                k,
+                n,
+                xs,
+                nt,
+                outs,
+            ) {
+                #[cfg(test)]
+                GEMV_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+            gemv_rows_batch(
+                GemvKernel::Linear {
+                    fast_q8: w.fast_q8(),
+                },
+                w.ty(),
+                w.blocks().as_slice(),
+                k,
+                n,
+                xs,
+                nt,
+                outs,
+            )
+        }
         GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => {
             if nt == 0 {
                 return Ok(());
@@ -3252,17 +3271,22 @@ fn prefill_batch_enabled() -> bool {
     *ON.get_or_init(|| prefill_batch_from_value(std::env::var("DENNO_PREFILL_BATCH").ok().as_deref()))
 }
 
-/// 1 チャンクのトークン数 (`DENNO_PREFILL_BATCH_CHUNK`, 既定 8, 1..=64)。
+/// 1 チャンクのトークン数 (`DENNO_PREFILL_BATCH_CHUNK`, 既定 8, 1..=512)。
 ///
 /// チャンクを大きくするほど重みの再読み込みは減るが、残差 `[nt][hc_dim]` と
 /// `hc_mix` の中間がそのぶん増える (27B の hc_dim は 20480 f32 = 80 KiB/トークン)。
+///
+/// 2026-10-28: 上限を 64 から 512 へ。Flash-Next は 512 expert / top-10 なので、
+/// chunk 64 では 1 チャンクで 365 体ぶんの expert 重みを読む (1 体あたり 1.4
+/// トークンしか使わない)。512 まで上げると 1 体あたり 10 トークンになり、
+/// トークンあたりの expert 読み出しが 5.7 分の 1 になる。
 fn prefill_batch_chunk() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("DENNO_PREFILL_BATCH_CHUNK")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .map(|n| n.clamp(1, 64))
+            .map(|n| n.clamp(1, 512))
             .unwrap_or(8)
     })
 }
@@ -3345,6 +3369,10 @@ fn moe_ffn_quant_batch(
     // 4. expert を index 昇順に、同じ expert を選んだトークンをまとめて回す
     let t_experts = std::time::Instant::now();
     let mut out = vec![0.0f32; nt * e];
+    let dbg_m = std::env::var_os("DENNO_MOE_M_DEBUG").is_some();
+    let mut dbg_nonempty = 0usize;
+    let mut dbg_sum_m = 0usize;
+    let mut dbg_max_m = 0usize;
     for ei in 0..ne {
         let picks: Vec<(usize, usize)> = sels
             .iter()
@@ -3355,6 +3383,11 @@ fn moe_ffn_quant_batch(
             continue;
         }
         let m = picks.len();
+        if dbg_m {
+            dbg_nonempty += 1;
+            dbg_sum_m += m;
+            dbg_max_m = dbg_max_m.max(m);
+        }
         let mut xin = Vec::with_capacity(m * e);
         for &(t, _) in &picks {
             xin.extend_from_slice(&xs[t * e..(t + 1) * e]);
@@ -3388,6 +3421,12 @@ fn moe_ffn_quant_batch(
                 out[t * e + d] += pe * hh[d];
             }
         }
+    }
+    if dbg_m {
+        eprintln!(
+            "[moe-m] nt={nt} ne={ne} k={k} nonempty={dbg_nonempty} sum_m={dbg_sum_m} mean={:.2} max={dbg_max_m}",
+            dbg_sum_m as f32 / dbg_nonempty.max(1) as f32
+        );
     }
 
     // 5. shared expert (バッチ)。係数は sigmoid(gate_inp_shexp @ x)
@@ -4460,6 +4499,8 @@ mod tests {
         /// トークンをまとめる経路 = `m > 1` を実際に通す)。
         #[test]
         fn moe_ffn_batch_matches_seq() {
+            // P-PF-GB: CPU 参照とのビット比較なので GPU GEMM を切る。
+            crate::cuda::set_gpu_gemm_enabled(false);
             let _g = moe_test_guard();
             let dir = TempDir::new("h2moe");
             let path = write_expert_gguf(&dir);
@@ -4493,6 +4534,8 @@ mod tests {
         /// (Q5_1 / Q8_0 は入口でカーネルが変わるため)。
         #[test]
         fn gemv_batch_matches_gemv_bitwise() {
+            // P-PF-GB: CPU 参照とのビット比較なので GPU GEMM を切る (契約は prefill のみ解除)。
+            crate::cuda::set_gpu_gemm_enabled(false);
             let dir = TempDir::new("h2gemv");
             let path = write_expert_gguf(&dir);
             let f = GgufFile::open(&path).expect("open");
@@ -4581,6 +4624,8 @@ mod tests {
         /// 同じ `gemv_batch` から同じ値が出ることをここで見る。
         #[test]
         fn gemv_batch_all_quant_types_bitwise() {
+            // P-PF-GB: CPU 参照とのビット比較なので GPU GEMM を切る (契約は prefill のみ解除)。
+            crate::cuda::set_gpu_gemm_enabled(false);
             let dir = TempDir::new("h2q4gt");
             let types = [
                 GgmlType::Q8_0,
@@ -4675,6 +4720,8 @@ mod tests {
         #[test]
         #[ignore = "CPU のカーネル A/B (実機の ms/token は main が測る)"]
         fn gemv_batch_shape_ab() {
+            // P-PF-GB: CPU 参照とのビット比較なので GPU GEMM を切る (契約は prefill のみ解除)。
+            crate::cuda::set_gpu_gemm_enabled(false);
             use std::time::Instant;
             let nt = 64usize;
             // (名前, k, n) — qwen4exp の実形状 (n_embd 2560 / conv_dim 10240 /
