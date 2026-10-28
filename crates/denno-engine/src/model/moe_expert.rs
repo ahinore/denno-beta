@@ -756,6 +756,30 @@ fn check_gemm_args(
     m: usize,
     outs: &[f32],
 ) -> Result<usize> {
+    let rb = check_gemm_matrix(ty, blocks, n_in, n_out, xs, m)?;
+    let want_o = m
+        .checked_mul(n_out)
+        .ok_or_else(|| anyhow::anyhow!("outs の長さが usize を溢れる (m={}, n_out={})", m, n_out))?;
+    if outs.len() != want_o {
+        bail!("outs の長さ {} が m * n_out = {} と違う", outs.len(), want_o);
+    }
+    Ok(rb)
+}
+
+/// [`check_gemm_args`] のうち **出力スライスを見ない** 部分 (行バイト数を返す)。
+///
+/// 層全体のタスク表を 1 本の rayon で回す経路 ([`crate::model::qwen4exp`] の
+/// flat スケジューラ) は、出力を `*mut f32` で受けて行チャンクごとに書く。
+/// 出力の長さ検証は呼び出し側が 1 度だけ行うので、ここでは行列と `xs` だけを見る。
+/// 検証内容・エラー文は [`check_gemm_args`] と同一。
+pub(crate) fn check_gemm_matrix(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    xs: &[f32],
+    m: usize,
+) -> Result<usize> {
     let rb = row_bytes(ty, n_in)?;
     if n_out == 0 {
         bail!("n_out が 0 (行が無い)");
@@ -768,12 +792,6 @@ fn check_gemm_args(
         .ok_or_else(|| anyhow::anyhow!("xs の長さが usize を溢れる (m={}, n_in={})", m, n_in))?;
     if xs.len() != want_x {
         bail!("xs の長さ {} が m * n_in = {} と違う", xs.len(), want_x);
-    }
-    let want_o = m
-        .checked_mul(n_out)
-        .ok_or_else(|| anyhow::anyhow!("outs の長さが usize を溢れる (m={}, n_out={})", m, n_out))?;
-    if outs.len() != want_o {
-        bail!("outs の長さ {} が m * n_out = {} と違う", outs.len(), want_o);
     }
     let want_b = n_out
         .checked_mul(rb)
@@ -819,7 +837,13 @@ fn gemm_fused_count() -> usize {
 ///   `r1 <= n_out`。書き込みは `t * n_out + [r0, r1)` に限られるので、チャンク
 ///   同士 (rayon のタスク同士) で重ならない。
 /// - どのカーネルも `(m-1)*n_out + n_out - 1` より先へは書かない。
-fn gemm_rows(
+///
+/// 上の条件は [`expert_gemm_inner`] (行列 1 本を丸ごと回す) と、層全体の
+/// タスク表を 1 本の rayon で回す flat スケジューラ
+/// (`crate::model::qwen4exp::moe_experts_flat`) の両方が満たす。flat 側は
+/// 行列・`xs`・出力長を [`check_gemm_matrix`] で 1 度だけ検証し、あとは
+/// `[0, n_out)` を重ならない行範囲に切ってここへ渡す (チャンクごとの再検証はしない)。
+pub(crate) fn gemm_rows(
     ty: GgmlType,
     rb: usize,
     blocks: &[u8],
@@ -1671,15 +1695,31 @@ pub fn expert_gemm_any_seq(
 /// したがって異なるタスクが同じ要素へ書くことはなく、ポインタを共有しても
 /// data race にならない。
 #[derive(Clone, Copy)]
-struct OutPtr(*mut f32);
+pub(crate) struct OutPtr(*mut f32);
 
 impl OutPtr {
+    /// 生ポインタから作る。指す先の条件 (この型のドキュメント) は呼び出し側が守る。
+    #[inline]
+    pub(crate) fn new(p: *mut f32) -> Self {
+        Self(p)
+    }
+
     /// ラッパごと (構造体の値として) 取り出す。フィールドを直接触ると
     /// Rust 2021 の閉包キャプチャが `*mut f32` 単体を掴み、`Send`/`Sync` を
     /// 満たさなくなるため、メソッド経由にして `OutPtr` を捕捉させる。
     #[inline]
-    fn get(self) -> *mut f32 {
+    pub(crate) fn get(self) -> *mut f32 {
         self.0
+    }
+
+    /// `n` 要素先を指す新しいラッパ (元のラッパの範囲は呼び出し側が管理する)。
+    ///
+    /// # Safety
+    /// 元のポインタの指す領域が `n` 要素以上あること (この型のドキュメント)。
+    #[inline]
+    pub(crate) fn add(self, n: usize) -> Self {
+        // SAFETY: 呼び出し側が領域の大きさを保証している (上の Safety)。
+        Self(unsafe { self.0.add(n) })
     }
 }
 
