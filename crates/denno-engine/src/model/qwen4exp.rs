@@ -2281,9 +2281,14 @@ impl Qwen4Exp {
                     }
                 }
                 q4prof::add(&q4prof::ATTN, t_attn);
-                for t in 0..nt {
-                    ress[t] = hyper::hc_combine(&ress[t], &outs[t], &injs[t], &hp);
+                if outs.len() != nt {
+                    return Err(one(format!(
+                        "層 {il}: attention の出力本数 {} が nt {nt} と違う",
+                        outs.len()
+                    )));
                 }
+                let flat_outs = flatten_rows(&outs, e)?;
+                hyper::hc_combine_batch(&mut ress, &flat_outs, &injs, &hp);
 
                 // 3.5-3.7 ffn 入口 (バッチ) → MoE FFN (バッチ) → 出口
                 let t_mix = std::time::Instant::now();
@@ -2300,9 +2305,13 @@ impl Qwen4Exp {
                 let t_moe = std::time::Instant::now();
                 let ffn = moe_ffn_quant_batch(&self.p, lw, &flat, nt, self.expert_cache.as_mut())?;
                 q4prof::add(&q4prof::MOE, t_moe);
-                for t in 0..nt {
-                    ress[t] = hyper::hc_combine(&ress[t], &ffn[t * e..(t + 1) * e], &injs[t], &hp);
+                if ffn.len() != nt * e {
+                    return Err(one(format!(
+                        "層 {il}: MoE の出力長 {} が nt {nt} * n_embd {e} と違う",
+                        ffn.len()
+                    )));
                 }
+                hyper::hc_combine_batch(&mut ress, &ffn, &injs, &hp);
             }
 
             // 次のチャンクは自分の埋め込みから始まる (残差の持ち越しは無い)。
@@ -2369,10 +2378,11 @@ fn hc_mix_quant(
 
 /// [`hc_mix_quant`] のバッチ版 (`nt` トークンぶんまとめて行列積)。
 ///
-/// 行列積 (`down` / `up` / `inject`) だけを [`gemv_batch`] に置き換え、
-/// ストリームごとの RMS 正規化・`hc_lo_apply` / `hc_mixed` / `hc_inject_apply` は
-/// 逐次版と同じ関数をトークンごとに呼ぶ。要素ごとの演算順序は変わらないので、
-/// 1 トークンぶんの出力は [`hc_mix_quant`] とビット一致する。
+/// 行列積 (`down` / `up` / `inject`) を [`gemv_batch`] に、要素演算
+/// (grouped RMS 正規化・`hc_lo_apply` / `hc_mixed` / `hc_inject_apply`) を
+/// `hyper::*_batch` に置き換える。要素演算は要素ごとに独立で、トークン内の
+/// 加算順序も逐次版と同じなので、1 トークンぶんの出力は [`hc_mix_quant`] と
+/// ビット一致する (`inject` は `[nt][hc]` の連結で返す)。
 fn hc_mix_quant_batch(
     ress: &[HyperStreams],
     norm: &[f32],
@@ -2380,10 +2390,10 @@ fn hc_mix_quant_batch(
     up: &GgufLinear,
     inject: Option<&GgufLinear>,
     hp: &HyperParams,
-) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
     let nt = ress.len();
+    let e = hp.n_embd;
     let hc_dim = hp.hc * hp.n_embd;
-    let mut xn: Vec<Vec<f32>> = Vec::with_capacity(nt);
     for (t, r) in ress.iter().enumerate() {
         if r.data.len() != hc_dim {
             return Err(one(format!(
@@ -2391,42 +2401,51 @@ fn hc_mix_quant_batch(
                 r.data.len()
             )));
         }
-        xn.push(hyper::grouped_rms_norm(r, norm, hp));
     }
-    let xn_flat = flatten_rows(&xn, hc_dim)?;
+    let xn_flat = hyper::grouped_rms_norm_batch(ress, norm, hp);
 
     let dn = down.n();
+    if dn != hp.low_rank {
+        return Err(one(format!(
+            "hc_mix down (batch): 行数 {dn} が low_rank {} と違う",
+            hp.low_rank
+        )));
+    }
     let mut lo = vec![0.0f32; nt * dn];
     gemv_batch(down, &xn_flat, nt, &mut lo)
         .map_err(|err| one(format!("hc_mix down (batch): {err}")))?;
-    for t in 0..nt {
-        hyper::hc_lo_apply(&mut lo[t * dn..(t + 1) * dn], hp);
-    }
+    hyper::hc_lo_apply_batch(&mut lo, nt, hp);
 
     let un = up.n();
+    if un != hc_dim {
+        return Err(one(format!(
+            "hc_mix up (batch): 行数 {un} が hc_dim {hc_dim} と違う"
+        )));
+    }
     let mut gate = vec![0.0f32; nt * un];
     gemv_batch(up, &lo, nt, &mut gate).map_err(|err| one(format!("hc_mix up (batch): {err}")))?;
+    let mixed_flat = hyper::hc_mixed_batch(&xn_flat, &gate, nt, hp);
     let mut mixed = Vec::with_capacity(nt);
     for t in 0..nt {
-        mixed.push(hyper::hc_mixed(&xn[t], &gate[t * un..(t + 1) * un], hp));
+        mixed.push(mixed_flat[t * e..(t + 1) * e].to_vec());
     }
 
     let injs = match inject {
         Some(w) => {
             let wn = w.n();
+            if wn != hp.hc {
+                return Err(one(format!(
+                    "hc_mix inject (batch): 行数 {wn} が hc {} と違う",
+                    hp.hc
+                )));
+            }
             let mut v = vec![0.0f32; nt * wn];
             gemv_batch(w, &xn_flat, nt, &mut v)
                 .map_err(|err| one(format!("hc_mix inject (batch): {err}")))?;
-            for t in 0..nt {
-                hyper::hc_inject_apply(&mut v[t * wn..(t + 1) * wn], hp);
-            }
-            let mut out = Vec::with_capacity(nt);
-            for t in 0..nt {
-                out.push(v[t * wn..(t + 1) * wn].to_vec());
-            }
-            out
+            hyper::hc_inject_apply_batch(&mut v, nt, hp);
+            v
         }
-        None => vec![vec![0.0f32; hp.hc]; nt],
+        None => vec![0.0f32; nt * hp.hc],
     };
     Ok((mixed, injs))
 }
@@ -4448,12 +4467,256 @@ mod tests {
                 let (m, i) = hc_mix_quant(r, &norm, &down, &up, Some(&inject), &hp)
                     .expect("hc_mix_quant");
                 assert_bitwise_eq(&m, &mixed[t], &format!("hc_mix mixed (token {t})"));
-                assert_bitwise_eq(&i, &injs[t], &format!("hc_mix inject (token {t})"));
+                assert_bitwise_eq(
+                    &i,
+                    &injs[t * hp.hc..(t + 1) * hp.hc],
+                    &format!("hc_mix inject (token {t})"),
+                );
             }
             assert!(
                 mixed[0].iter().any(|v| *v != 0.0),
                 "mixed が全 0 (経路の生死が分からない)"
             );
+        }
+
+        /// hyper のバッチ版が逐次版とビット一致する。
+        ///
+        /// nt = 1 / 3 は逐次ループ、nt = 64 は rayon 経路
+        /// ([`hyper::HC_BATCH_PAR_MIN_TOKENS`]) に入る。どちらもトークン内の
+        /// 演算順序は変えていないので `to_bits()` で一致する。
+        #[test]
+        fn hyper_batch_matches_seq_bitwise() {
+            let hp = HyperParams {
+                hc: 4,
+                n_embd: 16,
+                low_rank: 5,
+                eps: 1e-6,
+            };
+            let e = hp.n_embd;
+            let hc_dim = hp.hc * hp.n_embd;
+            assert_eq!(hc_dim, 64, "テストの前提 (hc_dim = 64)");
+            let norm: Vec<f32> = (0..hc_dim).map(|i| 0.5 + ((i * 7) % 11) as f32 * 0.1).collect();
+
+            let make = |nt: usize| -> Vec<HyperStreams> {
+                (0..nt)
+                    .map(|t| HyperStreams {
+                        data: (0..hc_dim)
+                            .map(|i| (((i * 7 + t * 13) % 23) as f32 - 11.0) * 0.03)
+                            .collect(),
+                        hc: hp.hc,
+                        n_embd: e,
+                    })
+                    .collect()
+            };
+
+            let par_before = par_calls();
+            for &nt in &[1usize, 3, 64] {
+                let ress = make(nt);
+
+                // 1. grouped RMS 正規化
+                let seq_xn: Vec<f32> = ress
+                    .iter()
+                    .flat_map(|r| hyper::grouped_rms_norm(r, &norm, &hp))
+                    .collect();
+                let bat_xn = hyper::grouped_rms_norm_batch(&ress, &norm, &hp);
+                assert_bitwise_eq(&seq_xn, &bat_xn, &format!("grouped_rms_norm nt={nt}"));
+
+                // 2. lo の後処理 (silu(v/hc))
+                let lo_in: Vec<f32> = (0..nt * hp.low_rank)
+                    .map(|i| (((i * 11) % 19) as f32 - 9.0) * 0.02)
+                    .collect();
+                let mut lo_seq = lo_in.clone();
+                for t in 0..nt {
+                    hyper::hc_lo_apply(&mut lo_seq[t * hp.low_rank..(t + 1) * hp.low_rank], &hp);
+                }
+                let mut lo_bat = lo_in.clone();
+                hyper::hc_lo_apply_batch(&mut lo_bat, nt, &hp);
+                assert_bitwise_eq(&lo_seq, &lo_bat, &format!("hc_lo_apply nt={nt}"));
+
+                // 3. mixed (s の昇順に加算してから 1/hc)
+                let gate: Vec<f32> = (0..nt * hc_dim)
+                    .map(|i| (((i * 17) % 29) as f32 - 14.0) * 0.05)
+                    .collect();
+                let seq_mixed: Vec<f32> = (0..nt)
+                    .flat_map(|t| {
+                        hyper::hc_mixed(
+                            &seq_xn[t * hc_dim..(t + 1) * hc_dim],
+                            &gate[t * hc_dim..(t + 1) * hc_dim],
+                            &hp,
+                        )
+                    })
+                    .collect();
+                let bat_mixed = hyper::hc_mixed_batch(&seq_xn, &gate, nt, &hp);
+                assert_bitwise_eq(&seq_mixed, &bat_mixed, &format!("hc_mixed nt={nt}"));
+
+                // 4. inject の後処理 (silu 無し)
+                let inj_in: Vec<f32> = (0..nt * hp.hc)
+                    .map(|i| (((i * 5) % 7) as f32 - 3.0) * 0.1)
+                    .collect();
+                let mut inj_seq = inj_in.clone();
+                for t in 0..nt {
+                    hyper::hc_inject_apply(&mut inj_seq[t * hp.hc..(t + 1) * hp.hc], &hp);
+                }
+                let mut inj_bat = inj_in.clone();
+                hyper::hc_inject_apply_batch(&mut inj_bat, nt, &hp);
+                assert_bitwise_eq(&inj_seq, &inj_bat, &format!("hc_inject_apply nt={nt}"));
+
+                // 5. combine (逐次版は新しい HyperStreams を作る / バッチ版は in-place)
+                let outs: Vec<f32> = (0..nt * e)
+                    .map(|i| (((i * 23) % 31) as f32 - 15.0) * 0.01)
+                    .collect();
+                let mut seq_res = make(nt);
+                for t in 0..nt {
+                    let out = hyper::hc_combine(
+                        &seq_res[t],
+                        &outs[t * e..(t + 1) * e],
+                        &inj_seq[t * hp.hc..(t + 1) * hp.hc],
+                        &hp,
+                    );
+                    seq_res[t] = out;
+                }
+                let mut bat_res = make(nt);
+                hyper::hc_combine_batch(&mut bat_res, &outs, &inj_bat, &hp);
+                for t in 0..nt {
+                    assert_bitwise_eq(
+                        &seq_res[t].data,
+                        &bat_res[t].data,
+                        &format!("hc_combine nt={nt} token={t}"),
+                    );
+                }
+                assert!(
+                    bat_res.iter().flat_map(|r| r.data.iter()).any(|v| *v != 0.0),
+                    "combine の出力が全 0 (経路の生死が分からない)"
+                );
+            }
+
+            // nt >= 64 で rayon 経路に実際に入ったことを数える
+            // (feature par のときだけ。off なら逐次で回るのが正しい)。
+            #[cfg(feature = "par")]
+            assert!(
+                par_calls() > par_before,
+                "nt=64 でバッチ版の rayon 経路に入っていない (HC_BATCH_PAR_CALLS が増えない)"
+            );
+            #[cfg(not(feature = "par"))]
+            assert_eq!(par_calls(), par_before, "par off なのに並列カウンタが増えた");
+        }
+
+        /// バッチ版が rayon 経路に入った回数 (テスト用カウンタ)。
+        #[cfg(feature = "par")]
+        fn par_calls() -> usize {
+            hyper::HC_BATCH_PAR_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        #[cfg(not(feature = "par"))]
+        fn par_calls() -> usize {
+            0
+        }
+
+        /// マイクロベンチ (手動)。mix の**要素演算だけ**を旧ループ / バッチで比べる。
+        ///
+        /// 行列積 (gemv) は GPU 側の仕事なので含めない。実形 (hc=4, n_embd=2560,
+        /// hc_dim=10240) で nt 別に 200 回まわし、ms/トークンを出す。
+        ///
+        /// `cargo test --release -p denno-engine --lib hc_mix_elementwise_microbench -- --ignored --nocapture --test-threads=1`
+        #[test]
+        #[ignore]
+        fn hc_mix_elementwise_microbench() {
+            let hp = HyperParams {
+                hc: 4,
+                n_embd: 2560,
+                low_rank: 320,
+                eps: 1e-6,
+            };
+            let e = hp.n_embd;
+            let hc_dim = hp.hc * hp.n_embd; // 10240 (実形)
+            let reps = 200usize;
+            let norm: Vec<f32> = (0..hc_dim).map(|i| 0.9 + ((i % 13) as f32) * 0.01).collect();
+
+            println!("reps={reps} hc_dim={hc_dim} low_rank={}", hp.low_rank);
+            println!("nt\told_ms_per_tok\tnew_ms_per_tok\tratio(old/new)");
+            for &nt in &[1usize, 8, 64, 512] {
+                let base: Vec<Vec<f32>> = (0..nt)
+                    .map(|t| {
+                        (0..hc_dim)
+                            .map(|i| (((i * 7 + t * 13) % 23) as f32 - 11.0) * 0.03)
+                            .collect()
+                    })
+                    .collect();
+                let gate: Vec<f32> = (0..nt * hc_dim)
+                    .map(|i| (((i * 17) % 29) as f32 - 14.0) * 0.05)
+                    .collect();
+                let lo_in: Vec<f32> = (0..nt * hp.low_rank)
+                    .map(|i| (((i * 11) % 19) as f32 - 9.0) * 0.02)
+                    .collect();
+                let inj_in: Vec<f32> = (0..nt * hp.hc)
+                    .map(|i| (((i * 5) % 7) as f32 - 3.0) * 0.1)
+                    .collect();
+                let outs: Vec<f32> = (0..nt * e)
+                    .map(|i| (((i * 23) % 31) as f32 - 15.0) * 0.01)
+                    .collect();
+
+                // 旧: トークンごとに関数を呼ぶ (hc_mix_quant_batch の元の形)
+                let mut ress: Vec<HyperStreams> = base
+                    .iter()
+                    .map(|d| HyperStreams {
+                        data: d.clone(),
+                        hc: hp.hc,
+                        n_embd: e,
+                    })
+                    .collect();
+                let mut lo_buf = lo_in.clone();
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    for t in 0..nt {
+                        let xn = hyper::grouped_rms_norm(&ress[t], &norm, &hp);
+                        let lo = &mut lo_buf[t * hp.low_rank..(t + 1) * hp.low_rank];
+                        lo.copy_from_slice(&lo_in[t * hp.low_rank..(t + 1) * hp.low_rank]);
+                        hyper::hc_lo_apply(lo, &hp);
+                        let mixed =
+                            hyper::hc_mixed(&xn, &gate[t * hc_dim..(t + 1) * hc_dim], &hp);
+                        let mut inj = inj_in[t * hp.hc..(t + 1) * hp.hc].to_vec();
+                        hyper::hc_inject_apply(&mut inj, &hp);
+                        ress[t] = hyper::hc_combine(
+                            &ress[t],
+                            &outs[t * e..(t + 1) * e],
+                            &inj,
+                            &hp,
+                        );
+                        std::hint::black_box(&mixed);
+                        std::hint::black_box(&lo);
+                    }
+                }
+                let old_ms = t0.elapsed().as_secs_f64() * 1e3 / (reps * nt) as f64;
+
+                // 新: バッチ版 (トークン方向に 1 回で回す。nt >= 64 は rayon)
+                let mut ress2: Vec<HyperStreams> = base
+                    .iter()
+                    .map(|d| HyperStreams {
+                        data: d.clone(),
+                        hc: hp.hc,
+                        n_embd: e,
+                    })
+                    .collect();
+                let mut lo_buf2 = lo_in.clone();
+                let mut inj_buf2 = inj_in.clone();
+                let t1 = std::time::Instant::now();
+                for _ in 0..reps {
+                    let xn_flat = hyper::grouped_rms_norm_batch(&ress2, &norm, &hp);
+                    lo_buf2.copy_from_slice(&lo_in);
+                    hyper::hc_lo_apply_batch(&mut lo_buf2, nt, &hp);
+                    let mixed = hyper::hc_mixed_batch(&xn_flat, &gate, nt, &hp);
+                    inj_buf2.copy_from_slice(&inj_in);
+                    hyper::hc_inject_apply_batch(&mut inj_buf2, nt, &hp);
+                    hyper::hc_combine_batch(&mut ress2, &outs, &inj_buf2, &hp);
+                    std::hint::black_box(&mixed);
+                    std::hint::black_box(&lo_buf2);
+                }
+                let new_ms = t1.elapsed().as_secs_f64() * 1e3 / (reps * nt) as f64;
+                println!(
+                    "{nt}\t{old_ms:.4}\t{new_ms:.4}\t{:.2}",
+                    old_ms / new_ms
+                );
+            }
         }
 
         /// MoE FFN のバッチ版が逐次版とビット一致する (同じ expert を選んだ

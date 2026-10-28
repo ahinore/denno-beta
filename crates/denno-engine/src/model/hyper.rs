@@ -331,3 +331,224 @@ pub fn hc_head(
 ) -> Vec<f32> {
     mix_internal(x, w_norm, w_down, w_up, None, p).0
 }
+
+// ---------------------------------------------------------------------------
+// バッチ版 (トークン方向にまとめる)
+//
+// 層優先 prefill は nt トークンをまとめて持っているのに、要素演算をトークンごとに
+// 呼ぶと、関数呼び出しと Vec 確保がトークン数ぶん乗る (1 トークン = hc_dim 要素
+// = 実形 40 KB)。ここでは `[nt][...]` の連続バッファを 1 回で埋める。
+//
+// 数値: どの関数も要素ごとに独立で、トークン内の演算順序は逐次版と同一
+// (加算する順序・1/hc を掛ける位置を変えない)。したがって `to_bits()` で一致する。
+// トークン方向に rayon で割っても、トークン間で共有する状態は無いので同じ。
+// ---------------------------------------------------------------------------
+
+/// バッチ版の要素演算を rayon で割る最小トークン数。
+///
+/// 1 トークンあたり hc_dim (実形 10240) 要素を触るので、64 トークンで 640 K 要素
+/// = 2.5 MB になり、分割の損益分岐を超える。`low_rank` 行 (実形 320) や
+/// `hc` 行 (実形 4) の小さい行はトークン並列にしない (1 行が L1 に収まり、
+/// rayon の起動コストだけが乗る)。
+pub const HC_BATCH_PAR_MIN_TOKENS: usize = 64;
+
+/// テスト用: バッチ版が rayon 経路に入った回数。
+/// 「緑 = 分岐が発動した証拠」ではないので、nt >= [`HC_BATCH_PAR_MIN_TOKENS`] の
+/// テストでここを数える。
+#[cfg(test)]
+pub(crate) static HC_BATCH_PAR_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn bump_par_calls() {
+    #[cfg(test)]
+    HC_BATCH_PAR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`grouped_rms_norm`] のバッチ版。戻り値は `[nt][hc][n_embd]` の連結。
+///
+/// 1 トークンぶんは [`grouped_rms_norm`] と同じ計算 (ストリームごとに逐次二乗和 →
+/// rsqrt → `x * inv * gamma`) なので、トークンをまとめても値はビット一致する。
+pub fn grouped_rms_norm_batch(xs: &[HyperStreams], w_norm: &[f32], p: &HyperParams) -> Vec<f32> {
+    let e = p.n_embd;
+    let hc = p.hc;
+    let hc_dim = hc * e;
+    assert!(hc >= 1, "hc が 0");
+    assert!(e >= 1, "n_embd が 0");
+    assert_eq!(w_norm.len(), hc_dim, "w_norm は [hc][n_embd] (変換器が 1+w に畳んだ値)");
+    for (t, x) in xs.iter().enumerate() {
+        assert_eq!(x.hc, hc, "トークン {t}: ストリーム本数が hc と一致しない");
+        assert_eq!(x.n_embd, e, "トークン {t}: ストリーム次元が n_embd と一致しない");
+        assert_eq!(
+            x.data.len(),
+            hc_dim,
+            "トークン {t}: data.len() は hc*n_embd と一致する必要がある"
+        );
+    }
+
+    let mut out = vec![0.0f32; xs.len() * hc_dim];
+    let fill = |row: &mut [f32], x: &HyperStreams| {
+        for s in 0..hc {
+            let src = &x.data[s * e..(s + 1) * e];
+            let gamma = &w_norm[s * e..(s + 1) * e];
+            // `crate::tensor::rmsnorm` と同じ丸め順 (逐次二乗和 → rsqrt → x*inv*w)
+            let ss = src.iter().map(|v| v * v).sum::<f32>() / e as f32;
+            let inv = 1.0 / (ss + p.eps).sqrt();
+            let dst = &mut row[s * e..(s + 1) * e];
+            for i in 0..e {
+                dst[i] = src[i] * inv * gamma[i];
+            }
+        }
+    };
+
+    #[cfg(feature = "par")]
+    if xs.len() >= HC_BATCH_PAR_MIN_TOKENS {
+        use rayon::prelude::*;
+        bump_par_calls();
+        out.par_chunks_mut(hc_dim)
+            .zip(xs.par_iter())
+            .for_each(|(row, x)| fill(row, x));
+        return out;
+    }
+
+    for (row, x) in out.chunks_mut(hc_dim).zip(xs.iter()) {
+        fill(row, x);
+    }
+    out
+}
+
+/// [`hc_lo_apply`] のバッチ版。`lo` は `[nt][low_rank]`。
+///
+/// 行が小さい (実形 320 要素 = 1.25 KB) のでトークン並列はしない。
+pub fn hc_lo_apply_batch(lo: &mut [f32], nt: usize, p: &HyperParams) {
+    assert!(p.low_rank >= 1, "low_rank が 0");
+    assert_eq!(lo.len(), nt * p.low_rank, "lo は [nt][low_rank]");
+    let inv_hc = 1.0f32 / p.hc as f32;
+    for row in lo.chunks_exact_mut(p.low_rank) {
+        for v in row.iter_mut() {
+            *v = silu(*v * inv_hc);
+        }
+    }
+}
+
+/// [`hc_mixed`] のバッチ版。`xn` / `gate` は `[nt][hc][n_embd]` の連結、
+/// 戻り値は `[nt][n_embd]` の連結。
+///
+/// 加算は `s` の昇順、`1/hc` は和の後 (逐次版と同じ順序)。内側は `n_embd` 方向に
+/// 連続アクセスする (`d` ごとに `s` を回すと stride が n_embd になる)。
+pub fn hc_mixed_batch(xn: &[f32], gate: &[f32], nt: usize, p: &HyperParams) -> Vec<f32> {
+    let e = p.n_embd;
+    let hc = p.hc;
+    let hc_dim = hc * e;
+    assert!(hc >= 1, "hc が 0");
+    assert!(e >= 1, "n_embd が 0");
+    assert_eq!(xn.len(), nt * hc_dim, "xn は [nt][hc][n_embd]");
+    assert_eq!(gate.len(), xn.len(), "gate は xn と同じ長さ ([nt][hc][n_embd])");
+
+    let inv_hc = 1.0f32 / hc as f32;
+    let mut mixed = vec![0.0f32; nt * e];
+    let fill = |m: &mut [f32], x: &[f32], g: &[f32]| {
+        for d in 0..e {
+            m[d] = x[d] * sigmoid(g[d]);
+        }
+        for s in 1..hc {
+            let xs = &x[s * e..(s + 1) * e];
+            let gs = &g[s * e..(s + 1) * e];
+            for d in 0..e {
+                m[d] += xs[d] * sigmoid(gs[d]);
+            }
+        }
+        for v in m.iter_mut() {
+            *v *= inv_hc;
+        }
+    };
+
+    #[cfg(feature = "par")]
+    if nt >= HC_BATCH_PAR_MIN_TOKENS {
+        use rayon::prelude::*;
+        bump_par_calls();
+        mixed
+            .par_chunks_mut(e)
+            .zip(xn.par_chunks(hc_dim))
+            .zip(gate.par_chunks(hc_dim))
+            .for_each(|((m, x), g)| fill(m, x, g));
+        return mixed;
+    }
+
+    for (t, m) in mixed.chunks_mut(e).enumerate() {
+        fill(
+            m,
+            &xn[t * hc_dim..(t + 1) * hc_dim],
+            &gate[t * hc_dim..(t + 1) * hc_dim],
+        );
+    }
+    mixed
+}
+
+/// [`hc_inject_apply`] のバッチ版。`v` は `[nt][hc]`。
+pub fn hc_inject_apply_batch(v: &mut [f32], nt: usize, p: &HyperParams) {
+    assert!(p.hc >= 1, "hc が 0");
+    assert_eq!(v.len(), nt * p.hc, "inject は [nt][hc]");
+    let inv_hc = 1.0f32 / p.hc as f32;
+    for row in v.chunks_exact_mut(p.hc) {
+        for x in row.iter_mut() {
+            *x *= inv_hc;
+        }
+    }
+}
+
+/// [`hc_combine`] のバッチ版 (in-place)。`res` は `[nt][hc][n_embd]`、
+/// `block_out` は `[nt][n_embd]`、`inject` は `[nt][hc]`。
+///
+/// 逐次版はトークンごとに `HyperStreams` を作り直す (実形 40 KB の Vec を
+/// 層あたり 2 回 x トークン数)。ここは `res` をそのまま書き換える。
+pub fn hc_combine_batch(
+    res: &mut [HyperStreams],
+    block_out: &[f32],
+    inject: &[f32],
+    p: &HyperParams,
+) {
+    let e = p.n_embd;
+    let hc = p.hc;
+    let hc_dim = hc * e;
+    let nt = res.len();
+    assert!(hc >= 1, "hc が 0");
+    assert!(e >= 1, "n_embd が 0");
+    assert_eq!(block_out.len(), nt * e, "block_out は [nt][n_embd]");
+    assert_eq!(inject.len(), nt * hc, "inject は [nt][hc]");
+    for (t, r) in res.iter().enumerate() {
+        assert_eq!(r.hc, hc, "トークン {t}: residual.hc が hc と一致しない");
+        assert_eq!(r.n_embd, e, "トークン {t}: residual.n_embd が n_embd と一致しない");
+        assert_eq!(
+            r.data.len(),
+            hc_dim,
+            "トークン {t}: residual.data.len() は hc*n_embd と一致する必要がある"
+        );
+    }
+
+    let fill = |r: &mut HyperStreams, bo: &[f32], inj: &[f32]| {
+        for s in 0..hc {
+            // 逐次版と同じ式・同じ順序: out = residual + block_out * (2*sigmoid(inject))
+            let ws = 2.0f32 * sigmoid(inj[s]);
+            let row = &mut r.data[s * e..(s + 1) * e];
+            for d in 0..e {
+                row[d] = row[d] + bo[d] * ws;
+            }
+        }
+    };
+
+    #[cfg(feature = "par")]
+    if nt >= HC_BATCH_PAR_MIN_TOKENS {
+        use rayon::prelude::*;
+        bump_par_calls();
+        res.par_iter_mut()
+            .zip(block_out.par_chunks(e))
+            .zip(inject.par_chunks(hc))
+            .for_each(|((r, bo), inj)| fill(r, bo, inj));
+        return;
+    }
+
+    for (t, r) in res.iter_mut().enumerate() {
+        fill(r, &block_out[t * e..(t + 1) * e], &inject[t * hc..(t + 1) * hc]);
+    }
+}
