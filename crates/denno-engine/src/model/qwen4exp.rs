@@ -40,7 +40,7 @@ use crate::kquant::GgmlType;
 use crate::model::expert_cache::{self, CacheSpec, ExpertCacheSet, ExpertKey, ExpertMatrix};
 use crate::model::hyper::{self, HyperParams, HyperStreams};
 use crate::model::linear_gguf::GgufLinear;
-use crate::model::moe::select_topk;
+use crate::model::moe::{select_topk, select_topk_into};
 use crate::model::moe_expert::{self, ExpertSlice};
 use crate::ple::{PleNgram, PleTable, PLE_TABLE_NAME};
 use crate::quant::WeightBlocks;
@@ -3133,6 +3133,160 @@ fn gemv_rows_pertoken(
     Ok(())
 }
 
+/// F32 行列積のトークンブロック幅 (1 ブロックのトークン数)。
+///
+/// 32 にすると 1 行の内側ループが 32 レーン (AVX2 で 4 本、AVX-512 で 2 本の
+/// ベクタ) になり、重み 1 要素の読み出しで 32 MAC を回せる。ルータ
+/// (`ffn_gate_inp` 2560→512, F32) の重みの再読み出しが「トークンごと」= nt 回から
+/// nt/32 回へ減る (実測は REPORT_P33.md)。
+const ROUTER_TB: usize = 32;
+
+/// [`ROUTER_TB`] 本のトークンと同時に回す行数。
+///
+/// 2 × 32 = 64 f32 = 512 bit ベクタ 4 本で、アキュムレータがレジスタに載る。
+/// 実測 (`moe_router_microbench`, 実形 nt=512 / n=512 / k=2560, 同一実行内 A/B):
+/// RB=1 で 3.9〜4.6 ms、RB=2 で 2.5〜3.0 ms、RB=4 で 2.6 ms (8 スレッドでは 4.2)、
+/// RB=8 で 4.1 ms。RB=4 以上はレジスタが溢れて遅くなる。
+const ROUTER_RB: usize = 2;
+
+/// [`ROUTER_TB`] 本のトークンを列優先へ詰め替える (`src` はトークン優先)。
+///
+/// `dst[(i * tb + t)] = src[t * k + i]`。8×8 タイルで回すと、読み書きとも
+/// 連続 f32 8 本 (= 1 ベクタ) になる。
+fn transpose_token_block(src: &[f32], dst: &mut [f32], k: usize, tb: usize) {
+    const T: usize = 8;
+    let kt = k / T * T;
+    let tt = tb / T * T;
+    for t0 in (0..tt).step_by(T) {
+        for i0 in (0..kt).step_by(T) {
+            // tile[i][t] (i = 列内の行方向、t = トークン)
+            let mut tile = [[0f32; T]; T];
+            for r in 0..T {
+                let s = &src[(t0 + r) * k + i0..(t0 + r) * k + i0 + T];
+                for (c, &v) in s.iter().enumerate() {
+                    tile[c][r] = v;
+                }
+            }
+            for c in 0..T {
+                dst[(i0 + c) * tb + t0..(i0 + c) * tb + t0 + T].copy_from_slice(&tile[c]);
+            }
+        }
+        // k の端数
+        for t in t0..t0 + T {
+            for i in kt..k {
+                dst[i * tb + t] = src[t * k + i];
+            }
+        }
+    }
+    // トークンの端数
+    for t in tt..tb {
+        for i in 0..k {
+            dst[i * tb + t] = src[t * k + i];
+        }
+    }
+}
+
+/// [`ROUTER_TB`] 本のトークン × 全行の内積を、行 [`ROUTER_RB`] 本ずつの
+/// アキュムレータで回す (`xt` は列優先、`out` は `[ROUTER_TB][n]` のトークン優先)。
+///
+/// 1 要素の演算列は [`gemv_f32_blocked`] の doc を参照 (i 昇順の f32 逐次加算)。
+fn router_block_kernel(wf: &[f32], k: usize, n: usize, xt: &[f32], out: &mut [f32]) {
+    let mut r0 = 0usize;
+    while r0 < n {
+        let rb = (n - r0).min(ROUTER_RB);
+        let mut acc = [[0f32; ROUTER_TB]; ROUTER_RB];
+        for i in 0..k {
+            let xv = &xt[i * ROUTER_TB..i * ROUTER_TB + ROUTER_TB];
+            for r in 0..rb {
+                let w = wf[(r0 + r) * k + i];
+                let a = &mut acc[r];
+                for t in 0..ROUTER_TB {
+                    a[t] += w * xv[t];
+                }
+            }
+        }
+        for (t, o) in out.chunks_exact_mut(n).enumerate() {
+            for r in 0..rb {
+                o[r0 + r] = acc[r][t];
+            }
+        }
+        r0 += rb;
+    }
+}
+
+/// F32 行列積のトークンブロック版: `out[t*n + r] = dot(row_r, x_t)`。
+///
+/// # 速くなる理由
+///
+/// 従来は「トークンごとに重み全行を読む」ので、重み 5.2 MB (2560×512 F32) を
+/// `nt` 回読んでいた (512 トークンで 2.7 GB/層)。ここでは 32 トークンをまとめて
+/// 1 行の内積を 32 レーンで回すので、重みの読み出しが `nt/32` 回 = 16 回
+/// (84 MB/層) になる。
+///
+/// # 数値 (ビット一致の根拠)
+///
+/// 1 要素は `acc = 0.0; for i in 0..k { acc += w[r*k + i] * x_t[i] }` の i 昇順
+/// 逐次で、行を f32 に開いてから同じ順で内積する従来経路 ([`gemv_f32_pertoken`])
+/// と**同じ演算列**。トークン 32 本と行 [`ROUTER_RB`] 本は互いに独立なので、同時に
+/// 回しても丸めの順序は変わらない (mul と add は融合しない: Rust は fast-math を
+/// 付けない)。端数 (nt % [`ROUTER_TB`]、n % [`ROUTER_RB`]) は同じ関数の中で
+/// 1 本ずつ処理する。
+fn gemv_f32_blocked(
+    wf: &[f32],
+    k: usize,
+    n: usize,
+    xs: &[f32],
+    nt: usize,
+    outs: &mut [f32],
+) {
+    let nb = nt / ROUTER_TB;
+    // 1. トークンを 32 本ずつ列優先へ詰め替える (ブロックごとに連続配置)。
+    let mut xt = vec![0f32; nb * ROUTER_TB * k];
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        xt.par_chunks_mut(ROUTER_TB * k)
+            .enumerate()
+            .for_each(|(b, dst)| {
+                let src = &xs[b * ROUTER_TB * k..(b + 1) * ROUTER_TB * k];
+                transpose_token_block(src, dst, k, ROUTER_TB);
+            });
+    }
+    #[cfg(not(feature = "par"))]
+    for b in 0..nb {
+        let src = &xs[b * ROUTER_TB * k..(b + 1) * ROUTER_TB * k];
+        transpose_token_block(src, &mut xt[b * ROUTER_TB * k..(b + 1) * ROUTER_TB * k], k, ROUTER_TB);
+    }
+    // 2. ブロック × 全行 (ブロックは独立なので並列化しても値は変わらない)。
+    let blocks: Vec<&mut [f32]> = outs[..nb * ROUTER_TB * n]
+        .chunks_mut(ROUTER_TB * n)
+        .collect();
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        blocks.into_par_iter().enumerate().for_each(|(b, o)| {
+            router_block_kernel(wf, k, n, &xt[b * ROUTER_TB * k..(b + 1) * ROUTER_TB * k], o);
+        });
+    }
+    #[cfg(not(feature = "par"))]
+    for (b, o) in blocks.into_iter().enumerate() {
+        router_block_kernel(wf, k, n, &xt[b * ROUTER_TB * k..(b + 1) * ROUTER_TB * k], o);
+    }
+    // 3. 端数のトークン (nt % 32) は従来どおり 1 トークンずつ。
+    for t in nb * ROUTER_TB..nt {
+        let x = &xs[t * k..(t + 1) * k];
+        let o = &mut outs[t * n..(t + 1) * n];
+        for r in 0..n {
+            let row = &wf[r * k..(r + 1) * k];
+            let mut acc = 0.0f32;
+            for i in 0..k {
+                acc += row[i] * x[i];
+            }
+            o[r] = acc;
+        }
+    }
+}
+
 /// [`GgufLinear`] のバッチ GEMV (`nt` トークン × 1 行列)。
 ///
 /// 量子型は [`gemv_rows_batch`] (逐次版と同じカーネル)、
@@ -3207,52 +3361,90 @@ pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]
             }
             let rb = bytes.len() / n;
             let ty = w.ty();
-            // 行を 1 回だけ f32 に展開し、トークン方向を並列に回す (P-PF-GPU)。
-            // 1 要素の累積は i 昇順の逐次加算のまま (行とトークンは独立) なので、
-            // 逐次版とビット一致する。ルータ (`ffn_gate_inp` 2560→512, F32) は
-            // これで 0.79 → 0.05 ms/層になる (802 トークン実測の見込み)。
-            let mut wf = vec![0.0f32; n * k];
-            for r in 0..n {
-                crate::kquant::dequant_row_into(
-                    ty,
-                    &bytes[r * rb..(r + 1) * rb],
-                    &mut wf[r * k..(r + 1) * k],
-                );
+            // P33: ルータ級の形 (32 トークン × 2 ブロック以上) はトークンブロック版。
+            // 重みの再読み出しが nt 回 → nt/32 回になる。値は同じ (doc 参照)。
+            if nt / ROUTER_TB >= 2 && n >= ROUTER_RB {
+                let wf = dequant_rows_f32(ty, bytes, rb, k, n);
+                gemv_f32_blocked(&wf, k, n, xs, nt, outs);
+                #[cfg(test)]
+                GEMV_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(test)]
+                GEMV_BATCH_BLOCKED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
             }
-            #[cfg(feature = "par")]
-            {
-                use rayon::prelude::*;
-                outs.par_chunks_mut(n).enumerate().for_each(|(t, o)| {
-                    let x = &xs[t * k..(t + 1) * k];
-                    for r in 0..n {
-                        let row = &wf[r * k..(r + 1) * k];
-                        let mut acc = 0.0f32;
-                        for i in 0..k {
-                            acc += row[i] * x[i];
-                        }
-                        o[r] = acc;
-                    }
-                });
-            }
-            #[cfg(not(feature = "par"))]
-            {
-                for t in 0..nt {
-                    let x = &xs[t * k..(t + 1) * k];
-                    for r in 0..n {
-                        let row = &wf[r * k..(r + 1) * k];
-                        let mut acc = 0.0f32;
-                        for i in 0..k {
-                            acc += row[i] * x[i];
-                        }
-                        outs[t * n + r] = acc;
-                    }
-                }
-            }
+            gemv_f32_pertoken(ty, bytes, rb, k, n, xs, nt, outs);
             #[cfg(test)]
             GEMV_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
         other => Err(one(format!("gemv_batch: 未対応の量子型 {other:?}"))),
+    }
+}
+
+/// 重みを 1 行ずつ f32 へ開く (行は独立なので rayon で分割してよい)。
+fn dequant_rows_f32(ty: GgmlType, bytes: &[u8], rb: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut wf = vec![0.0f32; n * k];
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        wf.par_chunks_mut(k).enumerate().for_each(|(r, row)| {
+            crate::kquant::dequant_row_into(ty, &bytes[r * rb..(r + 1) * rb], row);
+        });
+    }
+    #[cfg(not(feature = "par"))]
+    for r in 0..n {
+        crate::kquant::dequant_row_into(ty, &bytes[r * rb..(r + 1) * rb], &mut wf[r * k..(r + 1) * k]);
+    }
+    wf
+}
+
+/// 従来経路: 行を 1 回だけ f32 に開き、1 トークンずつ全行の内積を回す
+/// (並列化するのはトークン方向だけ)。
+///
+/// 1 要素の累積は `acc += row[i] * x[i]` の i 昇順逐次なので、逐次版とビット一致する。
+/// P33 でルータ級の形は [`gemv_f32_blocked`] に置き換えたが、形が小さいとき
+/// (nt < 2 ブロック / n < [`ROUTER_RB`]) はこちらが速いので残してある。
+#[allow(clippy::too_many_arguments)]
+fn gemv_f32_pertoken(
+    ty: GgmlType,
+    bytes: &[u8],
+    rb: usize,
+    k: usize,
+    n: usize,
+    xs: &[f32],
+    nt: usize,
+    outs: &mut [f32],
+) {
+    debug_assert_eq!(outs.len(), nt * n, "gemv_f32_pertoken: out の長さ");
+    let wf = dequant_rows_f32(ty, bytes, rb, k, n);
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        outs.par_chunks_mut(n).enumerate().for_each(|(t, o)| {
+            let x = &xs[t * k..(t + 1) * k];
+            for r in 0..n {
+                let row = &wf[r * k..(r + 1) * k];
+                let mut acc = 0.0f32;
+                for i in 0..k {
+                    acc += row[i] * x[i];
+                }
+                o[r] = acc;
+            }
+        });
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        for t in 0..nt {
+            let x = &xs[t * k..(t + 1) * k];
+            for r in 0..n {
+                let row = &wf[r * k..(r + 1) * k];
+                let mut acc = 0.0f32;
+                for i in 0..k {
+                    acc += row[i] * x[i];
+                }
+                outs[t * n + r] = acc;
+            }
+        }
     }
 }
 
@@ -3310,6 +3502,12 @@ pub(crate) static GEMV_BATCH_CALLS: std::sync::atomic::AtomicUsize =
 /// 値の一致だけからは判定できない。分岐の通過をここで数える。
 #[cfg(test)]
 pub(crate) static GEMV_BATCH_BLOCKDECODE_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// テスト用: 無量子型 (F32/F16/BF16) のバッチ GEMV が**トークンブロック経路**
+/// ([`gemv_f32_blocked`]) に入った回数。形が小さいと従来の 1 トークン経路へ
+/// 落ちるので、分岐の通過をここで数える (緑 = 経路が発動した証拠ではない)。
+#[cfg(test)]
+pub(crate) static GEMV_BATCH_BLOCKED_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// `DENNO_PREFILL_BATCH` の値の解釈 (純粋関数)。既定 (未設定) は無効。
@@ -3504,11 +3702,14 @@ fn moe_scratch_put(s: MoeScratch) {
 ///   行の中の累積順は行内で閉じるので、どのスレッドがどの行を計算しても値は変わらない。
 /// - silu の積は `v / (1 + (-v).exp()) * u` で、legacy の `silu_inplace` + `*=` と同順。
 /// - 足し込みは expert index 昇順 → トークン昇順の逐次 (legacy と同順)。
+/// - タスク表は **m の降順** に並べるが、タスクは (expert, 行チャンク) ごとに
+///   独立な領域を書くだけなので順序は値に影響しない (gather / scatter は eid 昇順)。
 #[allow(clippy::too_many_arguments)]
 fn moe_experts_flat(
     lw: &LayerW,
     by_expert: &[Vec<(usize, usize)>],
-    weights: &[Vec<f32>],
+    weights: &[f32],
+    k: usize,
     xs: &[f32],
     e: usize,
     ff: usize,
@@ -3618,11 +3819,15 @@ fn moe_experts_flat(
     }
     lap!("validate+slices+task_table");
 
-    // 5. タスク表 (gate+up+silu 積 / down)
+    // 5. タスク表 (gate+up+silu 積 / down)。**m の降順** に並べる
+    //    (m の大きい expert から先にタスク列へ入るので、rayon の分割で
+    //    重い仕事が先に始まる)。タスクは独立な領域を書くので順序は値に影響しない。
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| ms[b].cmp(&ms[a]).then_with(|| a.cmp(&b)));
     let mut ta: Vec<MoeTask> = Vec::new();
     let mut tb: Vec<MoeTask> = Vec::new();
     let rows = rows.max(1);
-    for pos in 0..n {
+    for &pos in &order {
         moe_row_chunks(pos, ff, rows, &mut ta)?;
         moe_row_chunks(pos, e, rows, &mut tb)?;
     }
@@ -3706,7 +3911,7 @@ fn moe_experts_flat(
         let scatter_one = |(t, o): (usize, &mut [f32])| {
             for &(pos, idx, j) in &by_token[t] {
                 let pos = pos as usize;
-                let pe = weights[t][j as usize];
+                let pe = weights[t * k + j as usize];
                 let hh = &h[off_h[pos] + idx * e..off_h[pos] + (idx + 1) * e];
                 for d in 0..e {
                     o[d] += pe * hh[d];
@@ -3738,7 +3943,8 @@ fn moe_experts_flat(
 fn moe_experts_legacy(
     lw: &LayerW,
     by_expert: &[Vec<(usize, usize)>],
-    weights: &[Vec<f32>],
+    weights: &[f32],
+    k: usize,
     xs: &[f32],
     e: usize,
     ff: usize,
@@ -3780,7 +3986,7 @@ fn moe_experts_legacy(
         }
         // 重み付きの足し込みはトークンごとに逐次 (index 昇順のまま)
         for (idx, &(t, j)) in picks.iter().enumerate() {
-            let pe = weights[t][j];
+            let pe = weights[t * k + j];
             let hh = &h[idx * e..(idx + 1) * e];
             for d in 0..e {
                 out[t * e + d] += pe * hh[d];
@@ -3849,53 +4055,88 @@ fn moe_ffn_quant_batch_with(
     gemv_batch(&lw.gate_inp, xs, nt, &mut probs)
         .map_err(|err| one(format!("層 {}: ffn_gate_inp (batch): {err}", lw.il)))?;
 
-    // 2. トークンごとの softmax / top-k / 再正規化 (逐次版と同じ順序)
-    let mut sels: Vec<Vec<usize>> = Vec::with_capacity(nt);
-    let mut weights: Vec<Vec<f32>> = Vec::with_capacity(nt);
+    // 2. トークンごとの softmax (行は独立なので並列化しても値は変わらない)
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        probs.par_chunks_mut(ne).for_each(softmax);
+    }
+    #[cfg(not(feature = "par"))]
     for t in 0..nt {
-        let pr = &mut probs[t * ne..(t + 1) * ne];
-        softmax(pr);
-        let sel = select_topk(pr, k);
+        softmax(&mut probs[t * ne..(t + 1) * ne]);
+    }
+
+    // 3. top-k (index 昇順) + 再正規化 (選択 index 昇順に逐次加算した和で割る)。
+    //    P33: トークンごとの `Vec` を作らず、平らな配列へ直接書く (1 層あたり
+    //    1,024 回の確保が 2 回になる)。選択規則は [`select_topk_into`] が
+    //    [`select_topk`] と同じ (同値は小さい index) なので値は変わらない。
+    let mut sels: Vec<usize> = vec![0; nt * k];
+    let mut weights: Vec<f32> = vec![0.0; nt * k];
+    let renorm = |pr: &[f32], sel: &[usize], w: &mut [f32]| {
         let mut sum = 0.0f32;
-        for &i in &sel {
+        for &i in sel {
             sum += pr[i];
         }
-        let mut w = vec![0.0f32; k];
         for (j, &i) in sel.iter().enumerate() {
             w[j] = pr[i] / sum;
         }
-        sels.push(sel);
-        weights.push(w);
+    };
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        sels.par_chunks_mut(k)
+            .zip(weights.par_chunks_mut(k))
+            .enumerate()
+            .for_each_init(Vec::<u32>::new, |buf, (t, (s, w))| {
+                let pr = &probs[t * ne..(t + 1) * ne];
+                select_topk_into(pr, k, buf, s);
+                renorm(pr, s, w);
+            });
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        let mut buf: Vec<u32> = Vec::new();
+        for t in 0..nt {
+            let pr = &probs[t * ne..(t + 1) * ne];
+            select_topk_into(pr, k, &mut buf, &mut sels[t * k..(t + 1) * k]);
+            renorm(pr, &sels[t * k..(t + 1) * k], &mut weights[t * k..(t + 1) * k]);
+        }
     }
     moe_sub_add(0, t_router.elapsed());
 
-    // 3. 選択 expert の重みを先に読み始める (逐次版と同じ expert を同じ順で)
+    // 4. 選択 expert の重みを先に読み始める (逐次版と同じ expert を同じ順で)
     //    同じ expert は 1 層で何度も選ばれる。madvise は 1 expert 1 回で足りるので、
     //    トークン×k 回 (512 × 10 = 5,120 回/層) ではなく distinct な expert の数 (86 回/層)
     //    だけ呼ぶ。選択順は変わらないので数値には影響しない。
     {
         let mut seen = vec![false; ne];
-        for sel in &sels {
-            for &ei in sel {
-                if !seen[ei] {
-                    seen[ei] = true;
-                    lw.gate_exps.prefetch(ei);
-                    lw.up_exps.prefetch(ei);
-                    lw.down_exps.prefetch(ei);
-                }
+        for &ei in &sels {
+            if !seen[ei] {
+                seen[ei] = true;
+                lw.gate_exps.prefetch(ei);
+                lw.up_exps.prefetch(ei);
+                lw.down_exps.prefetch(ei);
             }
         }
     }
 
-    // 4. expert ごとのトークン一覧 (`picks`) と件数 `m` を先に確定する。
+    // 5. expert ごとのトークン一覧 (`picks`) と件数 `m` を 1 パスで確定する。
     //    sels は index 昇順の distinct な expert なので、legacy が
     //    `position()` で作っていた順 (トークン昇順, 同トークン内は j 昇順) と一致する。
+    //    件数を先に数えて容量を確保するので、push のたびの再確保は無い。
     let t_experts = std::time::Instant::now();
     let mut out = vec![0.0f32; nt * e];
-    let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
-    for (t, sel) in sels.iter().enumerate() {
-        for (j, &ei) in sel.iter().enumerate() {
-            by_expert[ei].push((t, j));
+    let mut counts = vec![0usize; ne];
+    for &ei in &sels {
+        counts[ei] += 1;
+    }
+    let mut by_expert: Vec<Vec<(usize, usize)>> = counts
+        .iter()
+        .map(|&c| Vec::with_capacity(c))
+        .collect();
+    for t in 0..nt {
+        for j in 0..k {
+            by_expert[sels[t * k + j]].push((t, j));
         }
     }
     let m_max = by_expert.iter().map(|p| p.len()).max().unwrap_or(0);
@@ -3913,9 +4154,19 @@ fn moe_ffn_quant_batch_with(
         );
     }
     if flat {
-        moe_experts_flat(lw, &by_expert, &weights, xs, e, ff, MOE_FLAT_ROWS, &mut out)?;
+        moe_experts_flat(
+            lw,
+            &by_expert,
+            &weights,
+            k,
+            xs,
+            e,
+            ff,
+            MOE_FLAT_ROWS,
+            &mut out,
+        )?;
     } else {
-        moe_experts_legacy(lw, &by_expert, &weights, xs, e, ff, &mut out)?;
+        moe_experts_legacy(lw, &by_expert, &weights, k, xs, e, ff, &mut out)?;
     }
 
     // 5. shared expert (バッチ)。係数は sigmoid(gate_inp_shexp @ x)
@@ -5262,6 +5513,85 @@ mod tests {
             );
         }
 
+        /// P33: ルータ F32 行列積のトークンブロック経路が、1 トークンずつの
+        /// `gemv` (従来経路) とビット一致する。
+        ///
+        /// 実形 (k=2560 / n=512 / nt=512) と、端数が出る形 (k=2570 / n=6 / nt=71:
+        /// トークン 7 本・行 2 行・列 2 列があまる) の両方で確かめる。
+        #[test]
+        fn gemv_batch_f32_blocked_matches_gemv() {
+            crate::cuda::set_gpu_gemm_enabled(false);
+            let _g = moe_test_guard();
+            for (k, n, nt) in [(2560usize, 512usize, 512usize), (2570, 6, 71)] {
+                let mut bytes = vec![0u8; n * k * 4];
+                for i in 0..n * k {
+                    let r = (i as u64)
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let v = ((r >> 33) % 2001) as f32;
+                    bytes[i * 4..i * 4 + 4].copy_from_slice(&((v - 1000.0) * 1e-3).to_le_bytes());
+                }
+                let w = GgufLinear::from_slice(GgmlType::F32, k, n, &bytes).expect("F32 層");
+                let xs: Vec<f32> = (0..nt * k)
+                    .map(|i| (((i * 37 + 11) % 401) as f32 - 200.0) * 1e-3)
+                    .collect();
+                // 参照: 1 トークンずつ `gemv` (従来経路) で計算する。
+                let mut want = vec![0.0f32; nt * n];
+                for t in 0..nt {
+                    w.gemv(&xs[t * k..(t + 1) * k], &mut want[t * n..(t + 1) * n])
+                        .expect("gemv");
+                }
+                let before = GEMV_BATCH_BLOCKED_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+                let mut got = vec![0.0f32; nt * n];
+                gemv_batch(&w, &xs, nt, &mut got).expect("gemv_batch");
+                let after = GEMV_BATCH_BLOCKED_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+                if nt / ROUTER_TB >= 2 && n >= ROUTER_RB {
+                    assert!(
+                        after > before,
+                        "k={k} n={n} nt={nt}: トークンブロック経路が発動していない"
+                    );
+                }
+                assert_bitwise_eq(&want, &got, &format!("k={k} n={n} nt={nt}"));
+            }
+        }
+
+        /// P33: 長いバッチ (nt=64) でも MoE のバッチ経路が逐次版とビット一致する。
+        /// ルータ (`ffn_gate_inp`) がトークンブロック経路に入ることをカウンタで見る。
+        #[test]
+        fn moe_ffn_batch_long_matches_seq() {
+            crate::cuda::set_gpu_gemm_enabled(false);
+            let _g = moe_test_guard();
+            let dir = TempDir::new("h2moe64");
+            let path = write_expert_gguf(&dir);
+            let f = GgufFile::open(&path).expect("open");
+            let p = cache_test_params();
+            let lw = cache_test_layer(&f, &p);
+            let nt = 64;
+            let xs: Vec<f32> = (0..nt * p.n_embd)
+                .map(|i| (((i * 37 % 101) as f32) - 50.0) * 0.013)
+                .collect();
+
+            let before = GEMV_BATCH_BLOCKED_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let bat = moe_ffn_quant_batch(&p, &lw, &xs, nt, None).expect("batch");
+            assert!(
+                GEMV_BATCH_BLOCKED_CALLS.load(std::sync::atomic::Ordering::Relaxed) > before,
+                "ルータのトークンブロック経路が発動していない"
+            );
+            for t in 0..nt {
+                let seq = moe_ffn_quant(&p, &lw, &xs[t * p.n_embd..(t + 1) * p.n_embd], None)
+                    .expect("seq");
+                assert_bitwise_eq(
+                    &seq,
+                    &bat[t * p.n_embd..(t + 1) * p.n_embd],
+                    &format!("moe long token {t}"),
+                );
+            }
+            assert!(
+                bat.iter().any(|v| *v != 0.0),
+                "MoE の出力が全 0 (経路の生死が分からない)"
+            );
+        }
+
         /// flat スケジューラ (層全体の (expert, 行列, 行チャンク) を 1 本のタスク列で回す) が
         /// legacy (expert ごと × 行列ごとに 1 回 rayon) とビット一致する。
         ///
@@ -5453,7 +5783,7 @@ mod tests {
                     v.sort_unstable();
                     by_expert[ei] = v;
                 }
-                let weights = vec![vec![0.1f32; k]; nt];
+                let weights = vec![0.1f32; nt * k];
                 let xs: Vec<f32> = (0..nt * n_in)
                     .map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.003)
                     .collect();
@@ -5474,11 +5804,11 @@ mod tests {
                 // 温め (ページフォルト・分岐・レイアウト) + 値の突き合わせ
                 for (vi, out) in outs.iter_mut().enumerate() {
                     if vi == 0 {
-                        moe_experts_legacy(&lw, &by_expert, &weights, &xs, n_in, n_ff, out)
+                        moe_experts_legacy(&lw, &by_expert, &weights, k, &xs, n_in, n_ff, out)
                             .expect("legacy");
                     } else {
                         moe_experts_flat(
-                            &lw, &by_expert, &weights, &xs, n_in, n_ff, widths[vi - 1], out,
+                            &lw, &by_expert, &weights, k, &xs, n_in, n_ff, widths[vi - 1], out,
                         )
                         .expect("flat");
                     }
@@ -5500,11 +5830,11 @@ mod tests {
                         }
                         let t0 = std::time::Instant::now();
                         if vi == 0 {
-                            moe_experts_legacy(&lw, &by_expert, &weights, &xs, n_in, n_ff, out)
+                            moe_experts_legacy(&lw, &by_expert, &weights, k, &xs, n_in, n_ff, out)
                                 .expect("legacy");
                         } else {
                             moe_experts_flat(
-                                &lw, &by_expert, &weights, &xs, n_in, n_ff, widths[vi - 1], out,
+                                &lw, &by_expert, &weights, k, &xs, n_in, n_ff, widths[vi - 1], out,
                             )
                             .expect("flat");
                         }
@@ -5880,6 +6210,216 @@ mod tests {
                 assert!(ng > 0, "chunk {chunk}: バッチ GEMV が 1 回も走っていない");
                 assert_bitwise_eq(&seq, &bat, &format!("chunk {chunk}"));
             }
+        }
+
+        // -----------------------------------------------------------------
+        // P33: MoE ルータ (gate 行列積 + softmax + top-k + m 集計) の実形状ベンチ
+        // -----------------------------------------------------------------
+
+        /// 実形状のルータ 1 層ぶんの入力を組み立てる (モデル不要)。
+        ///
+        /// `blk.N.ffn_gate_inp.weight` は実行 GGUF で `[2560, 512] ty=F32`
+        /// (5,242,880 B)。値を [-1, 1] の決定的な擬似乱数にするので、
+        /// logits は N(0, 3.4) 程度に散り、top-k はほぼ一様に選ばれる。
+        fn router_bench_inputs(nt: usize, ne: usize, n_in: usize) -> (GgufLinear, Vec<f32>) {
+            let mut bytes = vec![0u8; ne * n_in * 4];
+            for i in 0..ne * n_in {
+                let r = (i as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let v = ((r >> 33) % 2001) as f32;
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&((v - 1000.0) * 1e-3).to_le_bytes());
+            }
+            let w = GgufLinear::from_slice(GgmlType::F32, n_in, ne, &bytes).expect("gate_inp F32");
+            let xs: Vec<f32> = (0..nt * n_in)
+                .map(|i| (((i * 37 + 11) % 401) as f32 - 200.0) * 1e-3)
+                .collect();
+            (w, xs)
+        }
+
+        /// `reps` 回まわして最小値 (ms) を返す。ホストは共有なので**同一実行内**で比べる。
+        fn best_of_ms(reps: usize, mut f: impl FnMut()) -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..reps {
+                let t = std::time::Instant::now();
+                f();
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            best
+        }
+
+        /// ルータ 1 層ぶん (nt=512) の (a) gate 行列積 / (b) softmax /
+        /// (c) top-k + m 集計 を、**旧実装と新実装の両方**で同一ループ内で測る。
+        /// 1 層合計と ms/token/層 も出す。
+        ///
+        /// `cargo test --release -p denno-engine --lib --features cuda \
+        ///   moe_router_microbench -- --ignored --nocapture --test-threads=1`
+        /// を `RAYON_NUM_THREADS=8` と `16` で回す。
+        #[test]
+        #[ignore = "CPU ルータのマイクロベンチ (実機の ms/token は main が測る)"]
+        fn moe_router_microbench() {
+            crate::cuda::set_gpu_gemm_enabled(false);
+            let _g = moe_test_guard();
+            let (nt, ne, n_in, k) = (512usize, 512usize, 2560usize, 10usize);
+            let (gate, xs) = router_bench_inputs(nt, ne, n_in);
+            let reps = 20usize;
+            println!(
+                "threads={} nt={nt} ne={ne} n_in={n_in} k={k} reps={reps}",
+                rayon::current_num_threads()
+            );
+
+            // ---- (a) gate 行列積: out[t*ne + r] = dot(row_r, xs[t]) ----
+            let bytes = gate.blocks().as_slice();
+            let rb = bytes.len() / ne;
+            let ty = gate.ty();
+            let mut old = vec![0.0f32; nt * ne];
+            let a_old = best_of_ms(reps, || {
+                gemv_f32_pertoken(ty, bytes, rb, n_in, ne, &xs, nt, &mut old)
+            });
+            let mut new = vec![0.0f32; nt * ne];
+            let a_new = best_of_ms(reps, || {
+                let wf = dequant_rows_f32(ty, bytes, rb, n_in, ne);
+                gemv_f32_blocked(&wf, n_in, ne, &xs, nt, &mut new);
+            });
+            assert_bitwise_eq(&old, &new, "(a) 旧 vs 新 (gate 行列積)");
+            let a_new_dequant = best_of_ms(reps, || {
+                let wf = dequant_rows_f32(ty, bytes, rb, n_in, ne);
+                std::hint::black_box(wf.as_ptr());
+            });
+
+            // ---- (b) softmax (トークンごと) ----
+            let mut probs = old.clone();
+            let probs0 = probs.clone();
+            let b_old = best_of_ms(reps, || {
+                for t in 0..nt {
+                    softmax(&mut probs[t * ne..(t + 1) * ne]);
+                }
+            });
+            probs.copy_from_slice(&probs0);
+            let b_new = best_of_ms(reps, || {
+                #[cfg(feature = "par")]
+                {
+                    use rayon::prelude::*;
+                    probs.par_chunks_mut(ne).for_each(softmax);
+                }
+                #[cfg(not(feature = "par"))]
+                for t in 0..nt {
+                    softmax(&mut probs[t * ne..(t + 1) * ne]);
+                }
+            });
+            // (c) 用の入力は 1 回だけ作る (どちらの実装もこの probs を読む)
+            probs.copy_from_slice(&probs0);
+            for t in 0..nt {
+                softmax(&mut probs[t * ne..(t + 1) * ne]);
+            }
+
+            // ---- (c) top-k 選択 + 再正規化 + expert ごとのトークン集計 ----
+            // 旧: トークンごとの Vec + 「最大値を k 回走査」の選択
+            let mut m_old = (0usize, 0usize, 0usize);
+            let c_old = best_of_ms(reps, || {
+                let mut sels: Vec<Vec<usize>> = Vec::with_capacity(nt);
+                let mut weights: Vec<Vec<f32>> = Vec::with_capacity(nt);
+                for t in 0..nt {
+                    let pr = &probs[t * ne..(t + 1) * ne];
+                    let mut sel = vec![0usize; k];
+                    crate::model::moe::select_topk_scan(pr, k, &mut sel);
+                    let mut sum = 0.0f32;
+                    for &i in &sel {
+                        sum += pr[i];
+                    }
+                    let mut w = vec![0.0f32; k];
+                    for (j, &i) in sel.iter().enumerate() {
+                        w[j] = pr[i] / sum;
+                    }
+                    sels.push(sel);
+                    weights.push(w);
+                }
+                let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
+                for (t, sel) in sels.iter().enumerate() {
+                    for (j, &ei) in sel.iter().enumerate() {
+                        by_expert[ei].push((t, j));
+                    }
+                }
+                let nonempty = by_expert.iter().filter(|p| !p.is_empty()).count();
+                let m_max = by_expert.iter().map(|p| p.len()).max().unwrap_or(0);
+                m_old = (nonempty, nt * k / nonempty.max(1), m_max);
+                std::hint::black_box((sels, weights, by_expert));
+            });
+
+            // 新: 平らな配列 + select_nth_unstable_by の選択 + 件数を先に数える集計
+            let mut m_new = (0usize, 0usize, 0usize);
+            let c_new = best_of_ms(reps, || {
+                let mut sels = vec![0usize; nt * k];
+                let mut weights = vec![0.0f32; nt * k];
+                let renorm = |pr: &[f32], sel: &[usize], w: &mut [f32]| {
+                    let mut sum = 0.0f32;
+                    for &i in sel {
+                        sum += pr[i];
+                    }
+                    for (j, &i) in sel.iter().enumerate() {
+                        w[j] = pr[i] / sum;
+                    }
+                };
+                #[cfg(feature = "par")]
+                {
+                    use rayon::prelude::*;
+                    sels.par_chunks_mut(k)
+                        .zip(weights.par_chunks_mut(k))
+                        .enumerate()
+                        .for_each_init(Vec::<u32>::new, |buf, (t, (s, w))| {
+                            let pr = &probs[t * ne..(t + 1) * ne];
+                            select_topk_into(pr, k, buf, s);
+                            renorm(pr, s, w);
+                        });
+                }
+                #[cfg(not(feature = "par"))]
+                {
+                    let mut buf: Vec<u32> = Vec::new();
+                    for t in 0..nt {
+                        let pr = &probs[t * ne..(t + 1) * ne];
+                        select_topk_into(pr, k, &mut buf, &mut sels[t * k..(t + 1) * k]);
+                        renorm(pr, &sels[t * k..(t + 1) * k], &mut weights[t * k..(t + 1) * k]);
+                    }
+                }
+                let mut counts = vec![0usize; ne];
+                for &ei in &sels {
+                    counts[ei] += 1;
+                }
+                let mut by_expert: Vec<Vec<(usize, usize)>> = counts
+                    .iter()
+                    .map(|&c| Vec::with_capacity(c))
+                    .collect();
+                for t in 0..nt {
+                    for j in 0..k {
+                        by_expert[sels[t * k + j]].push((t, j));
+                    }
+                }
+                let nonempty = by_expert.iter().filter(|p| !p.is_empty()).count();
+                let m_max = by_expert.iter().map(|p| p.len()).max().unwrap_or(0);
+                m_new = (nonempty, nt * k / nonempty.max(1), m_max);
+                std::hint::black_box((sels, weights, by_expert));
+            });
+            assert_eq!(m_old, m_new, "(c) 旧 vs 新で m の分布が違う");
+
+            let tot_old = a_old + b_old + c_old;
+            let tot_new = a_new + b_new + c_new;
+            println!("                       旧 (ms/層)   新 (ms/層)   倍率");
+            println!("(a) gate 行列積       {a_old:9.3}   {a_new:9.3}   x{:.2}", a_old / a_new);
+            println!("(b) softmax           {b_old:9.3}   {b_new:9.3}   x{:.2}", b_old / b_new);
+            println!("(c) top-k + m 集計    {c_old:9.3}   {c_new:9.3}   x{:.2}", c_old / c_new);
+            println!("合計                  {tot_old:9.3}   {tot_new:9.3}   x{:.2}", tot_old / tot_new);
+            println!(
+                "ms/token/層            {:.4}      {:.4}",
+                tot_old / nt as f64,
+                tot_new / nt as f64
+            );
+            println!(
+                "うち (a) の重み展開    {a_new_dequant:9.3} ms/層 (新経路の内訳)"
+            );
+            println!(
+                "m 分布: nonempty={} mean={} max={}",
+                m_new.0, m_new.1, m_new.2
+            );
         }
     }
 }
