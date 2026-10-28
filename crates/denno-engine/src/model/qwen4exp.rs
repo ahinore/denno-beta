@@ -3651,6 +3651,11 @@ struct MoeScratch {
     act: Vec<f32>,
     up: Vec<f32>,
     h: Vec<f32>,
+    /// VNNI 経路の活性 (int8) とスケール・32 要素ごとの和。位相 A と B で使い回す
+    /// (`quant_all` が長さを合わせる)。
+    q8: Vec<i8>,
+    qsc: Vec<f32>,
+    qgs: Vec<f32>,
 }
 
 impl MoeScratch {
@@ -3664,6 +3669,101 @@ impl MoeScratch {
 
     fn bytes(&self) -> usize {
         (self.xin.capacity() + self.act.capacity() + self.up.capacity() + self.h.capacity()) * 4
+            + self.q8.capacity()
+            + (self.qsc.capacity() + self.qgs.capacity()) * 4
+    }
+}
+
+/// 活性 `src` (`tot × n_in`) を expert ごとに int8 へ量子化する (`q8` / `qsc` / `qgs`)。
+///
+/// expert の並びは gather と同じ (`off_x[pos] = その expert の先頭トークン × n_in`)。
+/// 量子化の粒度は重みの型のブロック長 (`blk`)。
+fn moe_quant_all(
+    src: &[f32],
+    ms: &[usize],
+    off_x: &[usize],
+    n_in: usize,
+    blk: usize,
+    q8: &mut Vec<i8>,
+    qsc: &mut Vec<f32>,
+    qgs: &mut Vec<f32>,
+) {
+    let tot: usize = ms.iter().sum();
+    let nb = n_in / blk;
+    let ng = n_in / 32;
+    q8.resize(tot * n_in, 0);
+    qsc.resize(tot * nb, 0.0);
+    qgs.resize(tot * ng, 0.0);
+
+    // expert ごとの範囲に切る (3 本とも同じ expert 順)。
+    let mut pq: Vec<&mut [i8]> = Vec::with_capacity(ms.len());
+    let mut rest: &mut [i8] = &mut q8[..];
+    for &m in ms {
+        let (h, t) = rest.split_at_mut(m * n_in);
+        pq.push(h);
+        rest = t;
+    }
+    let mut ps: Vec<&mut [f32]> = Vec::with_capacity(ms.len());
+    let mut rest: &mut [f32] = &mut qsc[..];
+    for &m in ms {
+        let (h, t) = rest.split_at_mut(m * nb);
+        ps.push(h);
+        rest = t;
+    }
+    let mut pg: Vec<&mut [f32]> = Vec::with_capacity(ms.len());
+    let mut rest: &mut [f32] = &mut qgs[..];
+    for &m in ms {
+        let (h, t) = rest.split_at_mut(m * ng);
+        pg.push(h);
+        rest = t;
+    }
+    let parts: Vec<(&mut [i8], &mut [f32], &mut [f32])> = pq
+        .into_iter()
+        .zip(ps)
+        .zip(pg)
+        .map(|((a, b), c)| (a, b, c))
+        .collect();
+    // expert ごとに独立なので、どのスレッドが担当しても値は変わらない。
+    let one = |(pos, (q, sc, gs)): (usize, (&mut [i8], &mut [f32], &mut [f32]))| {
+        let m = ms[pos];
+        let x = &src[off_x[pos]..off_x[pos] + m * n_in];
+        moe_expert::quant_act_i8(x, m, n_in, blk, q, sc, gs).expect("活性の量子化 (VNNI)")
+    };
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        parts.into_par_iter().enumerate().for_each(one);
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        parts.into_iter().enumerate().for_each(one);
+    }
+}
+
+/// タスク表の `ahead` 個先のタスクが触る重みの行頭を先読みする。
+///
+/// expert の重みは毎層 DRAM から cold で来る (実測 1 層あたり 86〜255 expert × 約 3 MB)。
+/// 1 つ先ではなく 2〜4 個先まで出す。行の残りは HW プリフェッチャに任せる。
+fn moe_prefetch_task_ahead(table: &[MoeTask], i: usize, ahead: usize, blocks: &[&[u8]], rb: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let Some(t) = table.get(i + ahead) else { return };
+        let Some(b) = blocks.get(t.pos as usize) else {
+            return;
+        };
+        for r in t.a as usize..t.b as usize {
+            // SAFETY: `r < n_out` で `b` は n_out 行ぶんのバイト列 (呼び出し側の契約)。
+            let p = unsafe { b.as_ptr().add(r * rb) };
+            unsafe {
+                _mm_prefetch(p as *const i8, _MM_HINT_T0);
+                _mm_prefetch(p.add(64) as *const i8, _MM_HINT_T0);
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (table, i, ahead, blocks, rb);
     }
 }
 
@@ -3715,6 +3815,7 @@ fn moe_experts_flat(
     ff: usize,
     rows: usize,
     out: &mut [f32],
+    vnni: bool,
 ) -> Result<()> {
     #[cfg(test)]
     MOE_FLAT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3762,6 +3863,9 @@ fn moe_experts_flat(
         mut act,
         mut up,
         mut h,
+        mut q8,
+        mut qsc,
+        mut qgs,
     } = sc;
 
     // 3. gather: expert ごとにトークンを詰め直す (legacy と同じ順序 = トークン昇順)。
@@ -3842,19 +3946,84 @@ fn moe_experts_flat(
     let up_p = moe_expert::OutPtr::new(up.as_mut_ptr());
     let h_p = moe_expert::OutPtr::new(h.as_mut_ptr());
 
+    // 5.5 VNNI (AVX-512 `vpdpbusd`): 活性を expert ごとに 1 回だけ int8 へ量子化する。
+    //     粒度は重みの型のブロック長 (Q4_K 256 / Q5_1 32)。gate と up は同じ `xin` を
+    //     読むので、位相 A の量子化は 1 回で両方に使える (型のブロック長が同じときだけ)。
+    //     `DENNO_VNNI=0` と、VNNI 非対応 CPU では `blk_a`/`blk_b` が `None` になり
+    //     従来の f32 経路 ([`moe_expert::gemm_rows`]) のまま動く。
+    let blk_g = moe_expert::vnni_act_block(gty);
+    let blk_u = moe_expert::vnni_act_block(uty);
+    let blk_d = moe_expert::vnni_act_block(dty);
+    let blk_a = if !vnni {
+        None
+    } else if blk_g.is_some() {
+        blk_g
+    } else if blk_u.is_some() {
+        blk_u
+    } else {
+        None
+    };
+    let use_g = blk_a.is_some() && blk_g == blk_a;
+    let use_u = blk_a.is_some() && blk_u == blk_a;
+    let use_d = vnni && blk_d.is_some();
+    // expert ごとの先頭 (ブロック単位)。`off_x` は f32 要素単位なので割って使う。
+    let mut off_s: Vec<usize> = Vec::with_capacity(n);
+    let mut off_g: Vec<usize> = Vec::with_capacity(n);
+    if let Some(blk) = blk_a {
+        let (nb, ng) = (e / blk, e / 32);
+        let (mut so, mut go) = (0usize, 0usize);
+        for &m in ms.iter() {
+            off_s.push(so);
+            off_g.push(go);
+            so += m * nb;
+            go += m * ng;
+        }
+        moe_quant_all(&xin, &ms, &off_x, e, blk, &mut q8, &mut qsc, &mut qgs);
+    }
+    let nb_a = blk_a.map(|b| e / b).unwrap_or(0);
+    let ng_a = e / 32;
+
     // 6. gate+up+silu 積 (行チャンクごとに 1 タスク)
-    let run_a = |t: &MoeTask| {
+    let run_a = |(i, t): (usize, &MoeTask)| {
         let pos = t.pos as usize;
         let (a, b) = (t.a as usize, t.b as usize);
         let m = ms[pos];
         let x = &xin[off_x[pos]..off_x[pos] + m * e];
         let dst_a = act_p.add(off_a[pos] + a);
         let dst_u = up_p.add(off_a[pos] + a);
+        // 2〜4 個先のタスクの重みを先読みする (層のタスク表は expert ごとに cold)。
+        moe_prefetch_task_ahead(&ta, i, 3, &gs, rb_g);
+        moe_prefetch_task_ahead(&ta, i, 3, &us, rb_u);
         // 前提 (安全に呼べる条件): `[a, b)` は [0, n_out) の分割の 1 つで、領域は
         // `m * stride` 要素以上。`gemm_rows` 自身は unsafe fn ではないが、生ポインタの
         // 指す先の条件はこのモジュールのタスク分割が保証する (上の SAFETY を参照)。
-        moe_expert::gemm_rows(gty, rb_g, gs[pos], e, a, b, x, m, dst_a.get(), ff, true);
-        moe_expert::gemm_rows(uty, rb_u, us[pos], e, a, b, x, m, dst_u.get(), ff, true);
+        // VNNI を使わない位相では空の活性を渡す (使わないので中身は見られない)。
+        let mut act_g = moe_expert::VnniAct {
+            q: &[],
+            sc: &[],
+            gs: &[],
+            m,
+            n_in: e,
+            blk: 0,
+        };
+        if let Some(blk) = blk_a {
+            act_g = moe_expert::VnniAct {
+                q: &q8[off_x[pos]..off_x[pos] + m * e],
+                sc: &qsc[off_s[pos]..off_s[pos] + m * nb_a],
+                gs: &qgs[off_g[pos]..off_g[pos] + m * ng_a],
+                m,
+                n_in: e,
+                blk,
+            };
+        }
+        for (ty, rb, w, dst, use_vnni) in [
+            (gty, rb_g, gs[pos], dst_a.get(), use_g),
+            (uty, rb_u, us[pos], dst_u.get(), use_u),
+        ] {
+            if !(use_vnni && moe_expert::gemm_rows_vnni(ty, w, e, a, b, &act_g, dst, ff)) {
+                moe_expert::gemm_rows(ty, rb, w, e, a, b, x, m, dst, ff, true);
+            }
+        }
         // act の行 [a, b) を silu(act) * up で置き換える (このタスクが書いた行だけ)。
         let pa = act_p.get();
         let pu = up_p.get();
@@ -3870,30 +4039,73 @@ fn moe_experts_flat(
         }
     };
 
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        ta.par_iter().enumerate().for_each(run_a);
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        ta.iter().enumerate().for_each(run_a);
+    }
+    lap!("phaseA");
+
+    // 6.5 位相 B の活性 (silu の積) を int8 に量子化する (down は Q5_1 = 32 要素)。
+    let (nb_b, off_sb, off_gb) = if use_d {
+        let blk = blk_d.unwrap_or(32);
+        let (nb, ng) = (ff / blk, ff / 32);
+        let mut offs: Vec<usize> = Vec::with_capacity(n);
+        let mut offg: Vec<usize> = Vec::with_capacity(n);
+        let (mut so, mut go) = (0usize, 0usize);
+        for &m in ms.iter() {
+            offs.push(so);
+            offg.push(go);
+            so += m * nb;
+            go += m * ng;
+        }
+        let act_r: &[f32] = &act;
+        moe_quant_all(act_r, &ms, &off_a, ff, blk, &mut q8, &mut qsc, &mut qgs);
+        (nb, offs, offg)
+    } else {
+        (0, Vec::new(), Vec::new())
+    };
+
     // 7. down (act は前のパスで確定しているので読むだけ)
     let act_r: &[f32] = &act;
-    let run_b = |t: &MoeTask| {
+    let run_b = |(i, t): (usize, &MoeTask)| {
         let pos = t.pos as usize;
         let (a, b) = (t.a as usize, t.b as usize);
         let m = ms[pos];
         let x = &act_r[off_a[pos]..off_a[pos] + m * ff];
         let dst = h_p.add(off_h[pos] + a);
+        moe_prefetch_task_ahead(&tb, i, 3, &ds, rb_d);
         // 前提は run_a と同じ (`[a, b)` は [0, n_out) の分割の 1 つ、領域は `m * stride` 以上)。
+        if use_d {
+            let act_d = moe_expert::VnniAct {
+                q: &q8[off_a[pos]..off_a[pos] + m * ff],
+                sc: &qsc[off_sb[pos]..off_sb[pos] + m * nb_b],
+                gs: &qgs[off_gb[pos]..off_gb[pos] + m * (ff / 32)],
+                m,
+                n_in: ff,
+                blk: blk_d.unwrap_or(32),
+            };
+            if moe_expert::gemm_rows_vnni(dty, ds[pos], ff, a, b, &act_d, dst.get(), e) {
+                return;
+            }
+        }
         moe_expert::gemm_rows(dty, rb_d, ds[pos], ff, a, b, x, m, dst.get(), e, true);
     };
 
     #[cfg(feature = "par")]
     {
         use rayon::prelude::*;
-        ta.par_iter().for_each(run_a);
-        tb.par_iter().for_each(run_b);
+        tb.par_iter().enumerate().for_each(run_b);
     }
     #[cfg(not(feature = "par"))]
     {
-        ta.iter().for_each(run_a);
-        tb.iter().for_each(run_b);
+        tb.iter().enumerate().for_each(run_b);
     }
-    lap!("phaseA+phaseB");
+    lap!("phaseB");
 
     // 8. 重み付きの足し込み。トークンごとに書く先が違う (`out[t*e..]`) ので
     //    トークン単位で並列化する。1 トークンの中は expert 昇順の逐次 = legacy と同順。
@@ -3927,7 +4139,15 @@ fn moe_experts_flat(
         parts.into_iter().enumerate().for_each(scatter_one);
     }
     lap!("scatter");
-    moe_scratch_put(MoeScratch { xin, act, up, h });
+    moe_scratch_put(MoeScratch {
+        xin,
+        act,
+        up,
+        h,
+        q8,
+        qsc,
+        qgs,
+    });
     Ok(())
 }
 
@@ -4026,6 +4246,20 @@ fn moe_ffn_quant_batch_with(
     nt: usize,
     cache: Option<&mut ExpertCacheSet>,
     sched: MoeSchedule,
+) -> Result<Vec<f32>> {
+    moe_ffn_quant_batch_opts(p, lw, xs, nt, cache, sched, moe_expert::vnni_enabled())
+}
+
+/// [`moe_ffn_quant_batch_with`] の本体。VNNI 経路の可否 (`vnni`) も外から渡せる
+/// 形にしてある (テストが同じ入力で両方の経路を通して比べるため)。
+fn moe_ffn_quant_batch_opts(
+    p: &Qwen4ExpParams,
+    lw: &LayerW,
+    xs: &[f32],
+    nt: usize,
+    cache: Option<&mut ExpertCacheSet>,
+    sched: MoeSchedule,
+    vnni: bool,
 ) -> Result<Vec<f32>> {
     let e = p.n_embd;
     let ne = p.n_expert;
@@ -4164,6 +4398,7 @@ fn moe_ffn_quant_batch_with(
             ff,
             MOE_FLAT_ROWS,
             &mut out,
+            vnni,
         )?;
     } else {
         moe_experts_legacy(lw, &by_expert, &weights, k, xs, e, ff, &mut out)?;
@@ -5501,7 +5736,9 @@ mod tests {
                 .map(|i| (((i * 37 % 101) as f32) - 50.0) * 0.013)
                 .collect();
 
-            let bat = moe_ffn_quant_batch(&p, &lw, &xs, nt, None).expect("batch");
+            // ビット一致は f32 経路どうしで見る (VNNI は活性を int8 に量子化するので別枠)。
+            let bat = moe_ffn_quant_batch_opts(&p, &lw, &xs, nt, None, moe_schedule(), false)
+                .expect("batch");
             for t in 0..nt {
                 let seq = moe_ffn_quant(&p, &lw, &xs[t * p.n_embd..(t + 1) * p.n_embd], None)
                     .expect("seq");
@@ -5613,8 +5850,9 @@ mod tests {
 
             let flat0 = MOE_FLAT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
             let leg0 = MOE_LEGACY_CALLS.load(std::sync::atomic::Ordering::Relaxed);
-            let flat =
-                moe_ffn_quant_batch_with(&p, &lw, &xs, nt, None, MoeSchedule::Flat).expect("flat");
+            // ビット一致は f32 経路どうしで見る (VNNI は活性を int8 に量子化するので別枠)。
+            let flat = moe_ffn_quant_batch_opts(&p, &lw, &xs, nt, None, MoeSchedule::Flat, false)
+                .expect("flat");
             let legacy = moe_ffn_quant_batch_with(&p, &lw, &xs, nt, None, MoeSchedule::Legacy)
                 .expect("legacy");
             assert!(
@@ -5641,6 +5879,53 @@ mod tests {
                     &format!("flat token {t}"),
                 );
             }
+        }
+
+        /// flat スケジューラの VNNI 経路 (`vpdpbusd`) が実際に発火し、f32 経路と
+        /// 許容誤差で一致する。ビット一致は求めない (prefill は 2026-10-28 の
+        /// オペレーター指示でビット一致契約の外)。
+        #[test]
+        fn moe_flat_vnni_fires_and_matches_within_tolerance() {
+            crate::cuda::set_gpu_gemm_enabled(false);
+            let _g = moe_test_guard();
+            if !moe_expert::vnni_supported() {
+                eprintln!("skip moe_flat_vnni_fires_and_matches_within_tolerance: avx512vnni が無い");
+                return;
+            }
+            let dir = TempDir::new("h2vnni");
+            let path = write_expert_gguf(&dir);
+            let f = GgufFile::open(&path).expect("open");
+            let p = cache_test_params();
+            let lw = cache_test_layer(&f, &p);
+            let nt = 8;
+            let xs: Vec<f32> = (0..nt * p.n_embd)
+                .map(|i| (((i * 37 % 101) as f32) - 50.0) * 0.013)
+                .collect();
+
+            let before = moe_expert::vnni_calls();
+            let got = moe_ffn_quant_batch_opts(&p, &lw, &xs, nt, None, MoeSchedule::Flat, true)
+                .expect("flat vnni");
+            assert!(
+                moe_expert::vnni_calls() > before,
+                "VNNI 経路が発火していない (flat から vpdpbusd が呼ばれていない)"
+            );
+            let want = moe_ffn_quant_batch_opts(&p, &lw, &xs, nt, None, MoeSchedule::Flat, false)
+                .expect("flat f32");
+            assert!(got.iter().any(|v| *v != 0.0), "VNNI の出力が全 0");
+            let scale = want.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+            let max_rel = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs() / scale)
+                .fold(0f32, f32::max);
+            let mean_rel = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| ((a - b).abs() / scale) as f64)
+                .sum::<f64>()
+                / got.len() as f64;
+            eprintln!("flat VNNI vs f32: max rel {max_rel:.3e} / mean rel {mean_rel:.3e}");
+            assert!(max_rel < 5e-2, "flat VNNI の相対誤差 {max_rel} が大きすぎる");
         }
 
         /// `DENNO_MOE_FLAT` の解釈 (未設定・不明な値は既定の Auto に落ちる)。
@@ -5809,6 +6094,7 @@ mod tests {
                     } else {
                         moe_experts_flat(
                             &lw, &by_expert, &weights, k, &xs, n_in, n_ff, widths[vi - 1], out,
+                            false,
                         )
                         .expect("flat");
                     }
@@ -5835,6 +6121,7 @@ mod tests {
                         } else {
                             moe_experts_flat(
                                 &lw, &by_expert, &weights, k, &xs, n_in, n_ff, widths[vi - 1], out,
+                                false,
                             )
                             .expect("flat");
                         }
@@ -6185,6 +6472,10 @@ mod tests {
         #[test]
         fn prefill_batch_matches_sequential() {
             let _g = moe_test_guard();
+            // このテストは「バッチ経路が逐次経路とビット一致する」ことを固定する。
+            // VNNI は活性を int8 に量子化するので、ここでは明示的に切る
+            // (既定は VNNI 有効。VNNI の誤差は moe_flat_vnni_fires_and_matches_within_tolerance)。
+            moe_expert::set_vnni_for_test(Some(false));
             let dir = TempDir::new("h2model");
             let path = build(&dir);
             let f = GgufFile::open(&path).expect("合成モデルを開けない");
@@ -6210,6 +6501,7 @@ mod tests {
                 assert!(ng > 0, "chunk {chunk}: バッチ GEMV が 1 回も走っていない");
                 assert_bitwise_eq(&seq, &bat, &format!("chunk {chunk}"));
             }
+            moe_expert::set_vnni_for_test(None);
         }
 
         // -----------------------------------------------------------------
