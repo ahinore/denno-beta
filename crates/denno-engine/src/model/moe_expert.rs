@@ -805,10 +805,20 @@ fn gemm_fused_count() -> usize {
     GEMM_FUSED_CALLS.with(|c| c.get())
 }
 
-/// 行範囲 `r0..r1` を計算し、`out[t * stride + (r - r0)]` に書く (`out.len() == m * stride`)。
+/// 行範囲 `r0..r1` を計算し、`out.add(t * stride + (r - r0))` に書く。
 ///
 /// 行範囲で切るのは、行が互いに独立で、切っても各要素の計算順序が変わらないため
 /// (どのスレッドが担当しても結果はビット一致)。
+///
+/// # 出力ポインタの安全性 (呼び出し側が守る条件)
+///
+/// - `out` は `m * stride` 要素以上の有効な領域を指すこと。呼び出し元は
+///   `stride = n_out` を渡し、`outs.len() == m * n_out` は [`check_gemm_args`] が
+///   検証済み。
+/// - `[r0, r1)` は [`gemm_row_ranges`] が返した `[0, n_out)` の分割の 1 つで
+///   `r1 <= n_out`。書き込みは `t * n_out + [r0, r1)` に限られるので、チャンク
+///   同士 (rayon のタスク同士) で重ならない。
+/// - どのカーネルも `(m-1)*n_out + n_out - 1` より先へは書かない。
 fn gemm_rows(
     ty: GgmlType,
     rb: usize,
@@ -818,11 +828,10 @@ fn gemm_rows(
     r1: usize,
     xs: &[f32],
     m: usize,
-    out: &mut [f32],
+    out: *mut f32,
     stride: usize,
     fused: bool,
 ) {
-    debug_assert_eq!(out.len(), m * stride);
     #[cfg(target_arch = "x86_64")]
     {
         if fused && ty == GgmlType::Q8_0 && q8_0_fused_supported() {
@@ -869,7 +878,7 @@ fn gemm_rows_scalar(
     r1: usize,
     xs: &[f32],
     m: usize,
-    out: &mut [f32],
+    out: *mut f32,
     stride: usize,
 ) {
     let bs = ty.blck_size();
@@ -896,7 +905,9 @@ fn gemm_rows_scalar(
             }
         }
         for (t, a) in acc.iter().enumerate() {
-            out[t * stride + (r - r0)] = *a;
+            // SAFETY: out は m * stride 要素以上 (gemm_rows の条件) で、
+            // t < m / r0 <= r < r1 <= n_out = stride なので範囲内。
+            unsafe { *out.add(t * stride + (r - r0)) = *a };
         }
     }
 }
@@ -910,7 +921,8 @@ fn gemm_rows_scalar(
 /// # Safety
 ///
 /// `blocks.len() == (r1 - r0 を含む全行) * (n_in/32)*34`、`xs.len() == m*n_in`、
-/// `out.len() == m*stride`、`r1 <= n_out`、実行 CPU が AVX2 と FMA を持つこと。
+/// `out` が `m*stride` 要素以上の有効な領域を指す (`r0..r1` は `[0, n_out)` の
+/// 分割の 1 つ = [`gemm_rows`] の条件)、`r1 <= n_out`、実行 CPU が AVX2 と FMA を持つこと。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn gemm_q8_0_avx2(
@@ -920,7 +932,7 @@ unsafe fn gemm_q8_0_avx2(
     r1: usize,
     xs: &[f32],
     m: usize,
-    out: &mut [f32],
+    out: *mut f32,
     stride: usize,
 ) {
     use std::arch::x86_64::*;
@@ -979,7 +991,7 @@ unsafe fn gemm_q8_0_avx2(
             let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps::<1>(s));
             let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
             let h = _mm_add_ss(h, _mm_shuffle_ps::<0x55>(h, h));
-            *out.get_unchecked_mut(t * stride + (r - r0)) = _mm_cvtss_f32(h);
+            *out.add(t * stride + (r - r0)) = _mm_cvtss_f32(h);
         }
     }
 }
@@ -1005,7 +1017,7 @@ unsafe fn gemm_q5_1_avx2_ref(
     r1: usize,
     xs: &[f32],
     m: usize,
-    out: &mut [f32],
+    out: *mut f32,
     stride: usize,
 ) {
     use std::arch::x86_64::*;
@@ -1088,7 +1100,7 @@ unsafe fn gemm_q5_1_avx2_ref(
             let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps::<1>(s));
             let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
             let h = _mm_add_ss(h, _mm_shuffle_ps::<0x55>(h, h));
-            *out.get_unchecked_mut(t * stride + (r - r0)) = _mm_cvtss_f32(h) + macc[t];
+            *out.add(t * stride + (r - r0)) = _mm_cvtss_f32(h) + macc[t];
         }
     }
 }
@@ -1117,7 +1129,7 @@ unsafe fn gemm_q4k_avx2_ref(
     r1: usize,
     xs: &[f32],
     m: usize,
-    out: &mut [f32],
+    out: *mut f32,
     stride: usize,
 ) {
     use std::arch::x86_64::*;
@@ -1230,7 +1242,7 @@ unsafe fn gemm_q4k_avx2_ref(
             }
         }
         for t in 0..m {
-            *out.get_unchecked_mut(t * stride + (r - r0)) = total[t];
+            *out.add(t * stride + (r - r0)) = total[t];
         }
     }
 }
@@ -1283,7 +1295,7 @@ unsafe fn gemm_q4k_avx2(
     r1: usize,
     xs: &[f32],
     m: usize,
-    out: &mut [f32],
+    out: *mut f32,
     stride: usize,
 ) {
     use std::arch::x86_64::*;
@@ -1409,7 +1421,7 @@ unsafe fn gemm_q4k_avx2(
     for t in 0..m {
         let base = t * stride;
         for ri in 0..rows {
-            *out.get_unchecked_mut(base + ri) = *total.get_unchecked(ri * m + t);
+            *out.add(base + ri) = *total.get_unchecked(ri * m + t);
         }
     }
 }
@@ -1441,7 +1453,7 @@ unsafe fn gemm_q5_1_avx2(
     r1: usize,
     xs: &[f32],
     m: usize,
-    out: &mut [f32],
+    out: *mut f32,
     stride: usize,
 ) {
     use std::arch::x86_64::*;
@@ -1562,7 +1574,7 @@ unsafe fn gemm_q5_1_avx2(
                 let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps::<1>(s));
                 let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
                 let h = _mm_add_ss(h, _mm_shuffle_ps::<0x55>(h, h));
-                *out.get_unchecked_mut(t * stride + (r - r0)) =
+                *out.add(t * stride + (r - r0)) =
                     _mm_cvtss_f32(h) + *macc.get_unchecked((r - ra) * m + t);
             }
         }
@@ -1647,6 +1659,35 @@ pub fn expert_gemm_any_seq(
     expert_gemm_inner(ty, blocks, n_in, n_out, xs, m, outs, false, true)
 }
 
+/// rayon のタスクへ `*mut f32` を渡すための薄いラッパ。
+///
+/// # 安全性 (この型を `Send`/`Sync` にしてよい理由)
+///
+/// - `ranges` ([`gemm_row_ranges`] の戻り値) は `[0, n_out)` の分割なので、
+///   タスクが書く `t*n_out + [a, b)` はタスク間で重ならない。
+/// - `outs.len() == m * n_out` は [`check_gemm_args`] が検証済み。
+/// - どのカーネルも `(m-1)*n_out + n_out - 1` より先へは書かない。
+///
+/// したがって異なるタスクが同じ要素へ書くことはなく、ポインタを共有しても
+/// data race にならない。
+#[derive(Clone, Copy)]
+struct OutPtr(*mut f32);
+
+impl OutPtr {
+    /// ラッパごと (構造体の値として) 取り出す。フィールドを直接触ると
+    /// Rust 2021 の閉包キャプチャが `*mut f32` 単体を掴み、`Send`/`Sync` を
+    /// 満たさなくなるため、メソッド経由にして `OutPtr` を捕捉させる。
+    #[inline]
+    fn get(self) -> *mut f32 {
+        self.0
+    }
+}
+
+// SAFETY: 上の条件により書き込み領域はタスク間で重ならない (ポインタ値の
+// コピーは読み取りだけで、指す先への書き込みは各タスクの範囲に閉じる)。
+unsafe impl Send for OutPtr {}
+unsafe impl Sync for OutPtr {}
+
 fn expert_gemm_inner(
     ty: GgmlType,
     blocks: &[u8],
@@ -1660,31 +1701,38 @@ fn expert_gemm_inner(
 ) -> Result<()> {
     let rb = check_gemm_args(ty, blocks, n_in, n_out, xs, m, outs)?;
     let ranges = gemm_row_ranges(n_out, par);
+    // `outs` はトークン優先 (`outs[t * n_out + r]`) なので行チャンクは連続しないが、
+    // `ranges` は [0, n_out) の分割なので、タスクが書く `t * n_out + [a, b)` は
+    // 互いに重ならない。よって各タスクは `outs.as_mut_ptr().add(a)` を基点に
+    // stride = n_out, r0 = a で直接書ける (中間バッファの確保・ゼロ埋め・コピー無し)。
     if ranges.len() > 1 {
         #[cfg(feature = "par")]
         {
             use rayon::prelude::*;
-            // `outs` はトークン優先なので行チャンクが連続しない (= 同じ `&mut` を
-            // 分割できない)。チャンクごとに別バッファへ書いてから詰める。
-            let parts: Vec<(usize, usize, Vec<f32>)> = ranges
-                .par_iter()
-                .map(|&(a, b)| {
-                    let mut buf = vec![0.0f32; m * (b - a)];
-                    gemm_rows(ty, rb, blocks, n_in, a, b, xs, m, &mut buf, b - a, fused);
-                    (a, b, buf)
-                })
-                .collect();
-            for (a, b, buf) in parts {
-                let w = b - a;
-                for t in 0..m {
-                    outs[t * n_out + a..t * n_out + b].copy_from_slice(&buf[t * w..(t + 1) * w]);
-                }
-            }
+            let base = OutPtr(outs.as_mut_ptr());
+            ranges.par_iter().for_each(move |&(a, b)| {
+                // SAFETY: `[a, b)` は [0, n_out) の分割の 1 つで、outs.len() == m * n_out
+                // は check_gemm_args が検証済み。書き込みは base.get().add(a) から
+                // t * n_out + (r - a) (r < b) に限られるので他タスクと重ならない。
+                gemm_rows(
+                    ty,
+                    rb,
+                    blocks,
+                    n_in,
+                    a,
+                    b,
+                    xs,
+                    m,
+                    unsafe { base.get().add(a) },
+                    n_out,
+                    fused,
+                );
+            });
             return Ok(());
         }
     }
     let (a, b) = ranges[0];
-    gemm_rows(ty, rb, blocks, n_in, a, b, xs, m, outs, b - a, fused);
+    gemm_rows(ty, rb, blocks, n_in, a, b, xs, m, outs.as_mut_ptr(), n_out, fused);
     Ok(())
 }
 
@@ -2482,7 +2530,7 @@ mod tests {
             for m in [1usize, 4, 17] {
                 let xs = make_xs(m, N_IN);
                 let mut got = vec![0.0f32; m * N_OUT];
-                gemm_rows_scalar(ty, rb, &blocks, N_IN, 0, N_OUT, &xs, m, &mut got, N_OUT);
+                gemm_rows_scalar(ty, rb, &blocks, N_IN, 0, N_OUT, &xs, m, got.as_mut_ptr(), N_OUT);
                 let mut want = vec![0.0f32; m * N_OUT];
                 for t in 0..m {
                     let mut one = vec![0.0f32; N_OUT];
@@ -2616,8 +2664,8 @@ mod tests {
     /// k ブロック版と旧カーネル (参照実装) のビット一致を見る共通部。
     fn expect_kblock_bits(
         ty: GgmlType,
-        new_k: unsafe fn(&[u8], usize, usize, usize, &[f32], usize, &mut [f32], usize),
-        ref_k: unsafe fn(&[u8], usize, usize, usize, &[f32], usize, &mut [f32], usize),
+        new_k: unsafe fn(&[u8], usize, usize, usize, &[f32], usize, *mut f32, usize),
+        ref_k: unsafe fn(&[u8], usize, usize, usize, &[f32], usize, *mut f32, usize),
         ms: &[usize],
     ) -> usize {
         let n_in = PERF_N_IN;
@@ -2630,8 +2678,8 @@ mod tests {
             let mut want = vec![0.0f32; m * n_out];
             // SAFETY: 形状は check_gemm_args と同じ条件を満たし、AVX2/FMA は
             // 呼び出し側が確認している。
-            unsafe { new_k(&blocks, n_in, 0, n_out, &xs, m, &mut got, n_out) };
-            unsafe { ref_k(&blocks, n_in, 0, n_out, &xs, m, &mut want, n_out) };
+            unsafe { new_k(&blocks, n_in, 0, n_out, &xs, m, got.as_mut_ptr(), n_out) };
+            unsafe { ref_k(&blocks, n_in, 0, n_out, &xs, m, want.as_mut_ptr(), n_out) };
             expect_bits(&got, &want);
             assert!(
                 got.iter().any(|v| *v != 0.0),
@@ -2646,8 +2694,8 @@ mod tests {
         let xs = make_xs(m, n_in);
         let mut got = vec![0.0f32; m * (r1 - r0)];
         let mut want = vec![0.0f32; m * (r1 - r0)];
-        unsafe { new_k(&blocks, n_in, r0, r1, &xs, m, &mut got, r1 - r0) };
-        unsafe { ref_k(&blocks, n_in, r0, r1, &xs, m, &mut want, r1 - r0) };
+        unsafe { new_k(&blocks, n_in, r0, r1, &xs, m, got.as_mut_ptr(), r1 - r0) };
+        unsafe { ref_k(&blocks, n_in, r0, r1, &xs, m, want.as_mut_ptr(), r1 - r0) };
         expect_bits(&got, &want);
         compared += 1;
         compared
@@ -2709,10 +2757,28 @@ mod tests {
                 unsafe {
                     match ty {
                         GgmlType::Q4K => {
-                            gemm_q4k_avx2_ref(&blocks, n_in, 0, n_out, &xs, m, &mut want, n_out)
+                            gemm_q4k_avx2_ref(
+                                &blocks,
+                                n_in,
+                                0,
+                                n_out,
+                                &xs,
+                                m,
+                                want.as_mut_ptr(),
+                                n_out,
+                            )
                         }
                         GgmlType::Q5_1 => {
-                            gemm_q5_1_avx2_ref(&blocks, n_in, 0, n_out, &xs, m, &mut want, n_out)
+                            gemm_q5_1_avx2_ref(
+                                &blocks,
+                                n_in,
+                                0,
+                                n_out,
+                                &xs,
+                                m,
+                                want.as_mut_ptr(),
+                                n_out,
+                            )
                         }
                         _ => unreachable!(),
                     }
@@ -2742,16 +2808,34 @@ mod tests {
 
         macro_rules! run {
             ($label:expr, $k:expr, $m:expr, $blocks:expr, $xs:expr, $out:expr) => {{
-                let k: unsafe fn(&[u8], usize, usize, usize, &[f32], usize, &mut [f32], usize) = $k;
+                let k: unsafe fn(&[u8], usize, usize, usize, &[f32], usize, *mut f32, usize) = $k;
                 for _ in 0..WARM {
                     unsafe {
-                        k(black_box(&$blocks), n_in, 0, n_out, black_box(&$xs), $m, &mut $out, n_out)
+                        k(
+                            black_box(&$blocks),
+                            n_in,
+                            0,
+                            n_out,
+                            black_box(&$xs),
+                            $m,
+                            $out.as_mut_ptr(),
+                            n_out,
+                        )
                     };
                 }
                 let t0 = Instant::now();
                 for _ in 0..ITERS {
                     unsafe {
-                        k(black_box(&$blocks), n_in, 0, n_out, black_box(&$xs), $m, &mut $out, n_out)
+                        k(
+                            black_box(&$blocks),
+                            n_in,
+                            0,
+                            n_out,
+                            black_box(&$xs),
+                            $m,
+                            $out.as_mut_ptr(),
+                            n_out,
+                        )
                     };
                 }
                 let dt = t0.elapsed().as_secs_f64();
@@ -2777,5 +2861,67 @@ mod tests {
             run!("Q5_1 旧 (ref)", gemm_q5_1_avx2_ref, m, q51, xs, out);
             run!("Q5_1 新 (k block)", gemm_q5_1_avx2, m, q51, xs, out);
         }
+    }
+
+    /// 行チャンクごとの確保・ゼロ埋め・コピーを消した効果を、実形状
+    /// (n_in=2560, n_out=640, m=60, Q4_K) の 1 呼び出しあたり µs で見る。
+    ///
+    /// 実行:
+    /// `RAYON_NUM_THREADS=16 cargo test --release -p denno-engine --lib -- --ignored --nocapture bench_gemm_chunk_alloc`
+    #[test]
+    #[ignore = "マイクロベンチ (実形状 640x2560, Q4_K, m=60)"]
+    fn bench_gemm_chunk_alloc_q4k_m60() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        if !q8_0_fused_supported() {
+            eprintln!("skip bench_gemm_chunk_alloc_q4k_m60: AVX2/FMA が無い");
+            return;
+        }
+        const ITERS: usize = 100;
+        const WARM: usize = 10;
+        const REPS: usize = 5;
+        let n_in = PERF_N_IN;
+        let n_out = PERF_N_OUT;
+        let m = 60usize;
+        assert!(n_out >= PAR_MIN_ROWS, "行並列が分割する大きさで測る");
+        let blocks = make_expert(GgmlType::Q4K, n_in, n_out, 0);
+        let xs = make_xs(m, n_in);
+        let mut out = vec![0.0f32; m * n_out];
+        let ranges = gemm_row_ranges(n_out, true);
+        eprintln!(
+            "threads={} ranges={} rows/range={}",
+            rayon::current_num_threads(),
+            ranges.len(),
+            ranges[0].1 - ranges[0].0
+        );
+        for _ in 0..WARM {
+            expert_gemm_any(GgmlType::Q4K, &blocks, n_in, n_out, &xs, m, &mut out).unwrap();
+        }
+        let mut best = f64::INFINITY;
+        let mut worst = 0f64;
+        for _ in 0..REPS {
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                expert_gemm_any(
+                    GgmlType::Q4K,
+                    black_box(&blocks),
+                    n_in,
+                    n_out,
+                    black_box(&xs),
+                    m,
+                    black_box(&mut out),
+                )
+                .unwrap();
+            }
+            let us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+            best = best.min(us);
+            worst = worst.max(us);
+        }
+        let macs = (m * n_in * n_out) as f64;
+        eprintln!(
+            "bench_gemm_chunk_alloc_q4k_m60: {best:.1} us/回 (min, max={worst:.1})  {:.1} GMAC/s",
+            macs / (best * 1e-6) / 1e9
+        );
+        black_box(&out);
     }
 }
