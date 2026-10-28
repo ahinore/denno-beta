@@ -2281,6 +2281,269 @@ pub(crate) fn gemm_rows_vnni(
     }
 }
 
+// ===========================================================================
+// 可変 m の grouped GEMM: タスク表 (Segment) と CPU 参照実装
+// ===========================================================================
+//
+// 1 層ぶんの expert 呼び出しを「expert ごとの (m, 入力の範囲, 出力の範囲)」の列に
+// ならしたもの。GPU 側 (重みを都度転送して可変 m の GEMM を回すカーネル) に渡す
+// 入力形式と、その正解データを出す CPU 参照実装をここに置く。推論経路には
+// 接続しない (既存の flat / legacy 経路の数値は 1 ビットも変えない)。
+//
+// - `Segment` は GPU の引数にそのまま載る固定幅 (`u16` / `u32`)。
+//   オフセットは **f32 要素単位** (バイトではない)。
+// - 並びは **m の降順** (同 m は expert 昇順)。GPU 側のブロック割当で重い仕事が
+//   先に始まるようにするため。segment は互いに素な範囲を書くだけなので、
+//   並び順は値に影響しない。
+// - `xs` は expert ごとにトークンを詰め直した入力 (m_total × n_in)、
+//   `outs` は同じ行順の出力 (m_total × n_out)。行 → 元トークンの対応は
+//   呼び出し側の gather 索引 (`by_expert[expert][i].0`) と同じ。
+
+/// 1 層ぶんの expert 呼び出し 1 本 (可変 m の grouped GEMM の 1 単位)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Segment {
+    /// 重みの何番目の expert か。
+    pub expert: u16,
+    /// この expert に割り当たったトークン数。
+    pub m: u32,
+    /// `xs` の先頭 (f32 要素単位)。範囲は `m * n_in`。
+    pub x_off: u32,
+    /// `outs` の先頭 (f32 要素単位)。範囲は `m * n_out`。
+    pub out_off: u32,
+}
+
+/// [`build_grouped_batch`] の結果 (タスク表 + 詰め直した入力)。
+#[derive(Debug, Clone)]
+pub struct GroupedBatch {
+    /// m の降順 (同 m は expert 昇順) のタスク表。
+    pub segs: Vec<Segment>,
+    /// expert ごとに詰め直した入力 (`m_total × n_in`、行優先)。
+    pub xs: Vec<f32>,
+    /// `xs` / `outs` の行数 (= Σ m)。
+    pub m_total: usize,
+}
+
+impl GroupedBatch {
+    /// `outs` に必要な要素数 (`m_total * n_out`)。
+    pub fn outs_len(&self, n_out: usize) -> usize {
+        self.m_total * n_out
+    }
+}
+
+/// gather 索引から segment 表と詰め直した入力を作る。
+///
+/// `by_expert[expert]` は既存の flat 経路と同じ形 (`(トークン, ルータのスロット)`
+/// の列、expert 内はトークン昇順)。`xs` はトークン優先の入力 (`nt × n_in`)。
+///
+/// 行の詰め方は既存の gather と同一 (expert 内はトークン昇順) だが、segment を
+/// **m の降順** に並べるので `xs` の行順もその並びになる。`outs` は呼び出し側が
+/// `outs_len(n_out)` 要素で確保する (中身は [`grouped_expert_gemm_cpu`] が全部書く)。
+pub fn build_grouped_batch(
+    by_expert: &[Vec<(usize, usize)>],
+    xs: &[f32],
+    n_in: usize,
+    n_out: usize,
+) -> Result<GroupedBatch> {
+    if n_in == 0 {
+        bail!("build_grouped_batch: n_in が 0");
+    }
+    if n_out == 0 {
+        bail!("build_grouped_batch: n_out が 0");
+    }
+    if xs.len() % n_in != 0 {
+        bail!(
+            "build_grouped_batch: xs の長さ {} が n_in={} で割り切れない",
+            xs.len(),
+            n_in
+        );
+    }
+    let nt = xs.len() / n_in;
+
+    // 1. 空でない expert と件数を集める。
+    let mut active: Vec<(usize, usize)> = Vec::new(); // (expert, m)
+    let mut m_total = 0usize;
+    for (ei, picks) in by_expert.iter().enumerate() {
+        if picks.is_empty() {
+            continue;
+        }
+        for &(t, _) in picks {
+            if t >= nt {
+                bail!(
+                    "build_grouped_batch: expert {ei} のトークン {t} が範囲外 (nt={nt})"
+                );
+            }
+        }
+        active.push((ei, picks.len()));
+        m_total += picks.len();
+    }
+
+    // 2. m の降順・同 m は expert 昇順 (決定的な並び)。
+    active.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    // 3. オフセットを詰めながら gather する (行は segment の並びに従う)。
+    let mut segs: Vec<Segment> = Vec::with_capacity(active.len());
+    let mut gx: Vec<f32> = vec![0.0; m_total * n_in];
+    let (mut xo, mut oo) = (0usize, 0usize);
+    for (ei, m) in active {
+        let x_off = u32::try_from(xo)
+            .map_err(|_| anyhow::anyhow!("build_grouped_batch: x_off {xo} が u32 を超える"))?;
+        let out_off = u32::try_from(oo)
+            .map_err(|_| anyhow::anyhow!("build_grouped_batch: out_off {oo} が u32 を超える"))?;
+        let expert = u16::try_from(ei)
+            .map_err(|_| anyhow::anyhow!("build_grouped_batch: expert {ei} が u16 を超える"))?;
+        let m32 = u32::try_from(m)
+            .map_err(|_| anyhow::anyhow!("build_grouped_batch: m {m} が u32 を超える"))?;
+        for (i, &(t, _)) in by_expert[ei].iter().enumerate() {
+            let dst = xo + i * n_in;
+            gx[dst..dst + n_in].copy_from_slice(&xs[t * n_in..(t + 1) * n_in]);
+        }
+        segs.push(Segment {
+            expert,
+            m: m32,
+            x_off,
+            out_off,
+        });
+        xo += m * n_in;
+        oo += m * n_out;
+    }
+    // 4. 合計の検算 (Σ m == m_total、x/out の範囲が総量に一致)。
+    if xo != m_total * n_in || oo != m_total * n_out {
+        bail!(
+            "build_grouped_batch: 合計が合わない (Σm={m_total}, x={xo}/{}, out={oo}/{})",
+            m_total * n_in,
+            m_total * n_out
+        );
+    }
+    Ok(GroupedBatch {
+        segs,
+        xs: gx,
+        m_total,
+    })
+}
+
+/// segment 表の整合性を検証し、`m_total` を返す。
+///
+/// 契約: `x_off` / `out_off` は 0 から**隙間なく連続**し (重複・飛びなし)、
+/// 最後の segment の終端が `xs_len` / `outs_len` に一致する。
+/// `m == 0` の segment は認めない (GPU 側で空タスクを回さない)。
+pub fn check_segments(
+    segs: &[Segment],
+    n_in: usize,
+    n_out: usize,
+    xs_len: usize,
+    outs_len: usize,
+) -> Result<usize> {
+    let (mut xo, mut oo, mut m_total) = (0usize, 0usize, 0usize);
+    for (i, s) in segs.iter().enumerate() {
+        if s.m == 0 {
+            bail!("segment {i}: m が 0");
+        }
+        if s.x_off as usize != xo {
+            bail!(
+                "segment {i}: x_off {} が連続でない (期待 {xo})",
+                s.x_off
+            );
+        }
+        if s.out_off as usize != oo {
+            bail!(
+                "segment {i}: out_off {} が連続でない (期待 {oo})",
+                s.out_off
+            );
+        }
+        xo += s.m as usize * n_in;
+        oo += s.m as usize * n_out;
+        m_total += s.m as usize;
+    }
+    if xo != xs_len {
+        bail!("segment の x 範囲の合計 {xo} が xs の長さ {xs_len} と違う");
+    }
+    if oo != outs_len {
+        bail!("segment の out 範囲の合計 {oo} が outs の長さ {outs_len} と違う");
+    }
+    Ok(m_total)
+}
+
+/// CPU 参照実装 (GPU カーネルの正解データ)。
+///
+/// Segment ごとに「expert の重み (量子化ブロック) を 1 行ずつ f32 に開いて、
+/// `xs` の m 行と内積を取る」。`weights[expert]` は [`ExpertSlice`] で切り出した
+/// 1 expert ぶんのバイト列 (`n_out * row_bytes(ty, n_in)`)。
+///
+/// # ビット一致の根拠
+///
+/// 行のデコードは [`crate::kquant::dequant_row_into`] (中身は [`crate::kquant::dequant_block`]
+/// を 1 ブロックずつ呼ぶだけ)、内積は [`dot_seq`] (`0..n_in` の昇順に
+/// `acc += w[i] * x[i]`)。これは [`expert_gemm_scalar`] の
+/// `gemm_rows_scalar` と同じ演算列 (ブロック昇順・ブロック内要素昇順の逐次加算)
+/// なので、**丸めの順序が変わらずビット一致**する。
+///
+/// 行 (`n_out`) とトークンのループは segment 内で独立、segment 同士も互いに素な
+/// 範囲を書くので、どの順に回しても値は変わらない。
+///
+/// 注意: 本体の推論で使う融合カーネル ([`gemm_rows`] の AVX2 版) は
+/// レーン累積のため**この参照とは丸め順が違う** (相対 1e-6 程度)。GPU との
+/// 比較相手は、モジュール冒頭の契約どおりスカラー経路 (= この関数) にする。
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_expert_gemm_cpu(
+    ty: GgmlType,
+    weights: &[&[u8]],
+    n_in: usize,
+    n_out: usize,
+    segs: &[Segment],
+    xs: &[f32],
+    outs: &mut [f32],
+) -> Result<()> {
+    let rb = row_bytes(ty, n_in)?;
+    check_segments(segs, n_in, n_out, xs.len(), outs.len())?;
+    grouped_range_cpu(ty, rb, n_in, n_out, weights, segs, xs, 0, outs)
+}
+
+/// [`grouped_expert_gemm_cpu`] の本体 (segment の部分列を回す)。
+///
+/// `outs` は全体の `out_base` 要素目から始まる部分スライス。並列化するときは
+/// segment の列を切り、その先頭の `out_off` を `out_base` にして渡す
+/// (segment の範囲は連続なので、切り口は必ず重ならない部分スライスになる)。
+#[allow(clippy::too_many_arguments)]
+fn grouped_range_cpu(
+    ty: GgmlType,
+    rb: usize,
+    n_in: usize,
+    n_out: usize,
+    weights: &[&[u8]],
+    segs: &[Segment],
+    xs: &[f32],
+    out_base: usize,
+    outs: &mut [f32],
+) -> Result<()> {
+    let want_b = n_out
+        .checked_mul(rb)
+        .ok_or_else(|| anyhow::anyhow!("1 expert のバイト数が usize を溢れる (n_out={n_out})"))?;
+    let mut w = vec![0.0f32; n_in];
+    for (i, seg) in segs.iter().enumerate() {
+        let ei = seg.expert as usize;
+        let Some(blocks) = weights.get(ei) else {
+            bail!("segment {i}: expert {ei} の重みが無い (weights={})", weights.len());
+        };
+        if blocks.len() != want_b {
+            bail!(
+                "segment {i}: expert {ei} の重みの長さ {} が n_out * row_bytes = {want_b} と違う",
+                blocks.len()
+            );
+        }
+        let m = seg.m as usize;
+        let x0 = seg.x_off as usize;
+        let o0 = seg.out_off as usize - out_base;
+        for r in 0..n_out {
+            dequant_row_into(ty, &blocks[r * rb..(r + 1) * rb], &mut w);
+            for t in 0..m {
+                let xb = &xs[x0 + t * n_in..x0 + (t + 1) * n_in];
+                outs[o0 + t * n_out + r] = dot_seq(&w, xb);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! 実ファイルはこのコンテナから見えないので、ブロックはテスト内で組み立てる。
@@ -4090,6 +4353,443 @@ mod tests {
                     t_v * 1e3,
                     t_q * 1e3,
                     t_f / (t_v + t_q)
+                );
+            }
+        }
+    }
+
+    // ---- 9. grouped GEMM (可変 m) ------------------------------------------
+
+    /// m の一覧から gather 索引 (`by_expert`) を組み立てる。
+    ///
+    /// expert 内のトークンは `(e * 37) % (ntok - m + 1)` から連続 m 個 (昇順・重複なし)。
+    /// ルータのスロットは `i % k`。
+    fn by_expert_from_ms(ms: &[usize], ntok: usize, k: usize) -> Vec<Vec<(usize, usize)>> {
+        ms.iter()
+            .enumerate()
+            .map(|(e, &m)| {
+                assert!(m <= ntok, "m {m} がトークン数 {ntok} を超える");
+                let base = (e * 37) % (ntok - m + 1);
+                (0..m).map(|i| (base + i, i % k)).collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grouped_segments_are_descending_and_contiguous() {
+        let ms = [7usize, 3, 7, 1, 6, 3];
+        let (n_in, n_out) = (8usize, 4usize);
+        let ntok = 9usize;
+        let x_all = make_xs(ntok, n_in);
+        let by = by_expert_from_ms(&ms, ntok, 3);
+        let gb = build_grouped_batch(&by, &x_all, n_in, n_out).unwrap();
+
+        assert_eq!(gb.m_total, ms.iter().sum::<usize>());
+        assert_eq!(gb.segs.len(), ms.len());
+        // m の降順 (同 m は expert 昇順)
+        for w in gb.segs.windows(2) {
+            assert!(w[0].m >= w[1].m, "m が降順でない: {:?} -> {:?}", w[0], w[1]);
+            if w[0].m == w[1].m {
+                assert!(
+                    w[0].expert < w[1].expert,
+                    "同 m で expert 昇順でない: {:?} -> {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+        // オフセットは 0 から隙間なく連続し、終端が xs / outs の長さに一致する
+        let (mut xo, mut oo) = (0usize, 0usize);
+        for s in &gb.segs {
+            assert_eq!(s.x_off as usize, xo, "x_off が連続でない: {s:?}");
+            assert_eq!(s.out_off as usize, oo, "out_off が連続でない: {s:?}");
+            xo += s.m as usize * n_in;
+            oo += s.m as usize * n_out;
+        }
+        assert_eq!(xo, gb.xs.len());
+        assert_eq!(xo, gb.m_total * n_in);
+        assert_eq!(oo, gb.outs_len(n_out));
+        assert_eq!(
+            check_segments(&gb.segs, n_in, n_out, gb.xs.len(), gb.outs_len(n_out)).unwrap(),
+            gb.m_total
+        );
+        // xs は gather した行 (expert 内はトークン昇順)
+        for s in &gb.segs {
+            let picks = &by[s.expert as usize];
+            assert_eq!(picks.len(), s.m as usize);
+            for (i, &(t, _)) in picks.iter().enumerate() {
+                let a = s.x_off as usize + i * n_in;
+                assert_eq!(
+                    &gb.xs[a..a + n_in],
+                    &x_all[t * n_in..(t + 1) * n_in],
+                    "segment expert={} 行 {i} が gather と違う",
+                    s.expert
+                );
+            }
+        }
+        // 空の expert は segment にならない (m = 0 の空タスクを作らない)
+        let mut by2 = by.clone();
+        by2[2] = Vec::new();
+        let gb2 = build_grouped_batch(&by2, &x_all, n_in, n_out).unwrap();
+        assert_eq!(gb2.segs.len(), ms.len() - 1);
+        assert!(gb2.segs.iter().all(|s| s.expert != 2));
+    }
+
+    #[test]
+    fn grouped_cpu_matches_scalar_entry_all_types() {
+        // 小さな形で全 4 型を「既存の per-expert 経路 (スカラー)」とビット比較する。
+        let (n_in, n_out) = (N_IN, N_OUT);
+        let ms = [3usize, 1, 4, 2];
+        let ntok = 5usize;
+        let x_all = make_xs(ntok, n_in);
+        let by = by_expert_from_ms(&ms, ntok, 2);
+        for ty in ALL_TYPES {
+            let ws: Vec<Vec<u8>> = (0..ms.len())
+                .map(|e| make_expert(ty, n_in, n_out, e))
+                .collect();
+            let wrefs: Vec<&[u8]> = ws.iter().map(|v| v.as_slice()).collect();
+            let gb = build_grouped_batch(&by, &x_all, n_in, n_out).unwrap();
+            let mut got = vec![0.0f32; gb.outs_len(n_out)];
+            grouped_expert_gemm_cpu(ty, &wrefs, n_in, n_out, &gb.segs, &gb.xs, &mut got)
+                .unwrap_or_else(|e| panic!("{ty:?}: {e}"));
+            for s in &gb.segs {
+                let m = s.m as usize;
+                let x0 = s.x_off as usize;
+                let o = s.out_off as usize;
+                let mut want = vec![0.0f32; m * n_out];
+                expert_gemm_scalar(
+                    ty,
+                    wrefs[s.expert as usize],
+                    n_in,
+                    n_out,
+                    &gb.xs[x0..x0 + m * n_in],
+                    m,
+                    &mut want,
+                )
+                .unwrap();
+                expect_bits(&got[o..o + m * n_out], &want);
+                assert!(
+                    want.iter().any(|v| *v != 0.0),
+                    "{ty:?} expert {}: 出力が全 0 (テストが無意味)",
+                    s.expert
+                );
+            }
+            assert!(got.iter().all(|v| v.is_finite()), "{ty:?}: 非有限値");
+        }
+    }
+
+    #[test]
+    fn grouped_cpu_matches_per_expert_bits_real_shape() {
+        // 実形状 (n_in=2560 / n_out=640、130 expert、合計 5120、m は 5〜492)。
+        // Q4_K は gate/up 形、Q5_1 は down 形 (n_in=640 → n_out=2560)。
+        let ms = bench_m_distribution();
+        let ntok = 512usize; // 512 トークン × k=10 = 5120
+        assert_eq!(ms.len(), 130);
+        assert_eq!(ms.iter().sum::<usize>(), 5120);
+        assert_eq!(ms.iter().max(), Some(&492));
+        assert_eq!(ms.iter().min(), Some(&5));
+        let by = by_expert_from_ms(&ms, ntok, 10);
+        for (ty, n_in, n_out) in [
+            (GgmlType::Q4K, PERF_N_IN, PERF_N_OUT),
+            (GgmlType::Q5_1, PERF_N_OUT, PERF_N_IN),
+        ] {
+            let ws: Vec<Vec<u8>> = (0..ms.len())
+                .map(|e| make_expert(ty, n_in, n_out, e))
+                .collect();
+            let wrefs: Vec<&[u8]> = ws.iter().map(|v| v.as_slice()).collect();
+            let x_all = make_xs(ntok, n_in);
+            let gb = build_grouped_batch(&by, &x_all, n_in, n_out).unwrap();
+            assert_eq!(gb.segs.len(), 130);
+            let mut got = vec![0.0f32; gb.outs_len(n_out)];
+            grouped_expert_gemm_cpu(ty, &wrefs, n_in, n_out, &gb.segs, &gb.xs, &mut got)
+                .unwrap_or_else(|e| panic!("{ty:?}: {e}"));
+            // (a) 既存の per-expert 経路 (スカラー) とビット一致
+            for s in &gb.segs {
+                let m = s.m as usize;
+                let x0 = s.x_off as usize;
+                let o = s.out_off as usize;
+                let mut want = vec![0.0f32; m * n_out];
+                expert_gemm_scalar(
+                    ty,
+                    wrefs[s.expert as usize],
+                    n_in,
+                    n_out,
+                    &gb.xs[x0..x0 + m * n_in],
+                    m,
+                    &mut want,
+                )
+                .unwrap();
+                expect_bits(&got[o..o + m * n_out], &want);
+                assert!(
+                    want.iter().any(|v| *v != 0.0),
+                    "{ty:?} expert {}: 出力が全 0",
+                    s.expert
+                );
+            }
+            assert!(got.iter().all(|v| v.is_finite()), "{ty:?}: 非有限値");
+            // トークン (行) の取り違えが無いこと: 最大 m の expert の先頭 2 行は別の値
+            let s0 = gb.segs[0];
+            assert!(s0.m > 1, "先頭 segment の m が 1");
+            let o0 = s0.out_off as usize;
+            assert_ne!(
+                got[o0..o0 + n_out],
+                got[o0 + n_out..o0 + 2 * n_out],
+                "{ty:?}: 同じ expert の 2 トークンが同値 (行を共有している疑い)"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_cpu_does_not_depend_on_segment_order() {
+        // m 降順の並びを逆 (m 昇順) に組み直しても結果が変わらないこと。
+        let ms = [5usize, 3, 9, 1, 6, 4, 7];
+        let ntok = 12usize;
+        // n_in は Q4_K のブロック長 256 で割り切れる必要がある (row_bytes の門番)。
+        let (n_in, n_out) = (256usize, 8usize);
+        let x_all = make_xs(ntok, n_in);
+        let by = by_expert_from_ms(&ms, ntok, 4);
+        for ty in [GgmlType::Q4K, GgmlType::Q5_1] {
+            let ws: Vec<Vec<u8>> = (0..ms.len())
+                .map(|e| make_expert(ty, n_in, n_out, e))
+                .collect();
+            let wrefs: Vec<&[u8]> = ws.iter().map(|v| v.as_slice()).collect();
+            let gb = build_grouped_batch(&by, &x_all, n_in, n_out).unwrap();
+            let mut want = vec![0.0f32; gb.outs_len(n_out)];
+            grouped_expert_gemm_cpu(ty, &wrefs, n_in, n_out, &gb.segs, &gb.xs, &mut want).unwrap();
+
+            let mut perm: Vec<usize> = (0..gb.segs.len()).collect();
+            perm.reverse();
+            let mut segs2: Vec<Segment> = Vec::with_capacity(gb.segs.len());
+            let mut xs2: Vec<f32> = Vec::with_capacity(gb.xs.len());
+            let (mut xo, mut oo) = (0usize, 0usize);
+            for &i in &perm {
+                let s = gb.segs[i];
+                let m = s.m as usize;
+                let x0 = s.x_off as usize;
+                segs2.push(Segment {
+                    expert: s.expert,
+                    m: s.m,
+                    x_off: xo as u32,
+                    out_off: oo as u32,
+                });
+                xs2.extend_from_slice(&gb.xs[x0..x0 + m * n_in]);
+                xo += m * n_in;
+                oo += m * n_out;
+            }
+            let mut got = vec![0.0f32; gb.outs_len(n_out)];
+            grouped_expert_gemm_cpu(ty, &wrefs, n_in, n_out, &segs2, &xs2, &mut got).unwrap();
+            // 元の並びへ戻して突き合わせる。
+            let mut back = vec![0.0f32; gb.outs_len(n_out)];
+            let mut o = 0usize;
+            for &i in &perm {
+                let d = gb.segs[i].out_off as usize;
+                let n = gb.segs[i].m as usize * n_out;
+                back[d..d + n].copy_from_slice(&got[o..o + n]);
+                o += n;
+            }
+            expect_bits(&back, &want);
+            assert!(want.iter().any(|v| *v != 0.0), "{ty:?}: 出力が全 0");
+            assert_ne!(
+                want[..n_out],
+                want[gb.segs[0].m as usize * n_out..],
+                "{ty:?}: segment の範囲がずれている疑い"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_cpu_rejects_bad_tables() {
+        let (n_in, n_out) = (N_IN, N_OUT);
+        for ty in [GgmlType::Q4K, GgmlType::Q5_1] {
+            let w0 = make_expert(ty, n_in, n_out, 0);
+            let weights: [&[u8]; 1] = [&w0];
+            let xs = make_xs(3, n_in);
+            let mut outs = vec![0.0f32; 3 * n_out];
+            let ok = [Segment {
+                expert: 0,
+                m: 3,
+                x_off: 0,
+                out_off: 0,
+            }];
+            grouped_expert_gemm_cpu(ty, &weights, n_in, n_out, &ok, &xs, &mut outs).unwrap();
+            assert!(outs.iter().any(|v| *v != 0.0), "{ty:?}: 出力が全 0");
+
+            // xs が短い (m の合計と合わない)
+            let e = grouped_expert_gemm_cpu(ty, &weights, n_in, n_out, &ok, &xs[..xs.len() - 1], &mut outs)
+                .unwrap_err();
+            assert!(format!("{e}").contains("xs"), "エラー文が違う: {e}");
+            // outs が短い
+            let n = outs.len() - 1;
+            let e = grouped_expert_gemm_cpu(ty, &weights, n_in, n_out, &ok, &xs, &mut outs[..n])
+                .unwrap_err();
+            assert!(format!("{e}").contains("outs"), "エラー文が違う: {e}");
+            // オフセットが連続でない (重複)
+            let dup = [
+                Segment {
+                    expert: 0,
+                    m: 2,
+                    x_off: 0,
+                    out_off: 0,
+                },
+                Segment {
+                    expert: 0,
+                    m: 1,
+                    x_off: 0,
+                    out_off: (2 * n_out) as u32,
+                },
+            ];
+            assert!(
+                grouped_expert_gemm_cpu(ty, &weights, n_in, n_out, &dup, &xs, &mut outs).is_err(),
+                "{ty:?}: 重複した x_off を通した"
+            );
+            // m == 0 の segment
+            let zero = [Segment {
+                expert: 0,
+                m: 0,
+                x_off: 0,
+                out_off: 0,
+            }];
+            assert!(check_segments(&zero, n_in, n_out, 0, 0).is_err());
+            // 重みが無い expert
+            let missing = [Segment {
+                expert: 1,
+                m: 3,
+                x_off: 0,
+                out_off: 0,
+            }];
+            let e = grouped_expert_gemm_cpu(ty, &weights, n_in, n_out, &missing, &xs, &mut outs)
+                .unwrap_err();
+            assert!(format!("{e}").contains("重みが無い"), "エラー文が違う: {e}");
+            // 重みの長さが違う
+            let short: [&[u8]; 1] = [&w0[..w0.len() - 1]];
+            assert!(
+                grouped_expert_gemm_cpu(ty, &short, n_in, n_out, &ok, &xs, &mut outs).is_err(),
+                "{ty:?}: 短い重みを通した"
+            );
+        }
+    }
+
+    /// grouped CPU 参照実装のマイクロベンチ (GPU 側の比較対象)。
+    ///
+    /// - 形状: Q4_K は gate/up (n_in=2560 / n_out=640)、Q5_1 は down (640 / 2560)。
+    /// - m: 130 expert で合計 5120 (5〜492) の実測分布。
+    /// - 1 スレッドと 8 スレッド (segment の列を割る。segment は互いに素な範囲を
+    ///   書くだけなので、スレッド数を変えても値は変わらない)。
+    /// - 重み 130 expert を 1 周で全部触るので cold (Q4_K 120 MB / Q5_1 160 MB)。
+    ///
+    /// 実行:
+    /// `cargo test --release -p denno-engine --lib -- --ignored --nocapture bench_grouped_cpu_gmacs`
+    #[test]
+    #[ignore = "マイクロベンチ (130 expert x 実形状、約 300 MB を確保)"]
+    fn bench_grouped_cpu_gmacs() {
+        use std::time::Instant;
+        const REPS: usize = 2;
+        let ms = bench_m_distribution();
+        let n_expert = ms.len();
+        let ntok = 512usize;
+        let by = by_expert_from_ms(&ms, ntok, 10);
+
+        /// segment の列を `threads` 本に割り、重ならない outs の部分スライスで回す。
+        #[allow(clippy::too_many_arguments)]
+        fn run_split(
+            ty: GgmlType,
+            n_in: usize,
+            n_out: usize,
+            weights: &[&[u8]],
+            segs: &[Segment],
+            xs: &[f32],
+            outs: &mut [f32],
+            threads: usize,
+        ) -> f64 {
+            let rb = row_bytes(ty, n_in).unwrap();
+            let per = segs.len().div_ceil(threads.max(1));
+            let mut ranges: Vec<(usize, usize, usize, usize)> = Vec::new(); // lo, hi, o_lo, o_hi
+            let mut i = 0usize;
+            while i < segs.len() {
+                let hi = (i + per).min(segs.len());
+                let o_lo = segs[i].out_off as usize;
+                let last = &segs[hi - 1];
+                let o_hi = last.out_off as usize + last.m as usize * n_out;
+                ranges.push((i, hi, o_lo, o_hi));
+                i = hi;
+            }
+            // outs を ranges の順に重ならない部分スライスへ切る (範囲は連続している)。
+            let mut parts: Vec<&mut [f32]> = Vec::with_capacity(ranges.len());
+            let mut rest: &mut [f32] = outs;
+            let mut cur = 0usize;
+            for &(_, _, o_lo, o_hi) in &ranges {
+                let (gap, tail) = rest.split_at_mut(o_lo - cur);
+                debug_assert!(gap.is_empty(), "outs の範囲に隙間がある");
+                let (mid, tail) = tail.split_at_mut(o_hi - o_lo);
+                parts.push(mid);
+                rest = tail;
+                cur = o_hi;
+            }
+            let t0 = Instant::now();
+            std::thread::scope(|s| {
+                let mut hs = Vec::with_capacity(parts.len());
+                for ((lo, hi, _, _), part) in ranges.into_iter().zip(parts) {
+                    let part_segs = &segs[lo..hi];
+                    let base = part_segs[0].out_off as usize;
+                    hs.push(s.spawn(move || {
+                        grouped_range_cpu(
+                            ty, rb, n_in, n_out, weights, part_segs, xs, base, part,
+                        )
+                        .unwrap();
+                    }));
+                }
+                for h in hs {
+                    h.join().unwrap();
+                }
+            });
+            t0.elapsed().as_secs_f64()
+        }
+
+        for (tag, ty, n_in, n_out) in [
+            ("Q4_K (gate/up)", GgmlType::Q4K, PERF_N_IN, PERF_N_OUT),
+            ("Q5_1 (down)", GgmlType::Q5_1, PERF_N_OUT, PERF_N_IN),
+        ] {
+            let rb = row_bytes(ty, n_in).unwrap();
+            let ws: Vec<Vec<u8>> = (0..n_expert)
+                .map(|e| make_expert(ty, n_in, n_out, e))
+                .collect();
+            let wrefs: Vec<&[u8]> = ws.iter().map(|v| v.as_slice()).collect();
+            let x_all = make_xs(ntok, n_in);
+            let gb = build_grouped_batch(&by, &x_all, n_in, n_out).unwrap();
+            let mut outs = vec![0.0f32; gb.outs_len(n_out)];
+            let macs = gb.m_total as f64 * n_in as f64 * n_out as f64;
+            eprintln!(
+                "\n== {tag}: n_in={n_in} n_out={n_out} expert={n_expert} m_total={} (m {}..{}) \
+                 重み {} MB ({rb} B/行) ==",
+                gb.m_total,
+                ms.iter().min().unwrap(),
+                ms.iter().max().unwrap(),
+                n_expert * n_out * rb / (1024 * 1024)
+            );
+            let mut base: Option<Vec<f32>> = None;
+            for threads in [1usize, 8] {
+                let mut best = f64::INFINITY;
+                for _ in 0..REPS {
+                    best = best.min(run_split(
+                        ty, n_in, n_out, &wrefs, &gb.segs, &gb.xs, &mut outs, threads,
+                    ));
+                }
+                assert!(outs.iter().any(|v| *v != 0.0), "{tag}: 出力が全 0 (計測が無意味)");
+                assert!(best > 0.0, "{tag}: 計測値が 0");
+                match &base {
+                    None => base = Some(outs.clone()),
+                    Some(b) => {
+                        // スレッド数で値が変わらないこと (segment は互いに素)
+                        for (a, w) in outs.iter().zip(b.iter()) {
+                            assert_eq!(a.to_bits(), w.to_bits(), "{tag}: {threads}T で値が違う");
+                        }
+                    }
+                }
+                eprintln!(
+                    "  {threads}T: {:6.3} s = {:6.2} GMAC/s ({:.2} G MAC)",
+                    best,
+                    macs / best / 1e9,
+                    macs / 1e9
                 );
             }
         }
