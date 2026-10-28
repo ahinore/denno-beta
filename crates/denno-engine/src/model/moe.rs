@@ -79,12 +79,54 @@ fn dot_row(w: &[f32], x: &[f32]) -> f32 {
 ///
 /// P-MOE-F1: 量子化重みの経路 (`model::qwen4exp`) も同じタイブレーク規則を
 /// 使うので `pub(crate)` にしてある (規則を 2 箇所に書かないため)。
+///
+/// P33: 実装を「最大値を k 回走査」から `select_nth_unstable_by` + k 個の
+/// sort に変えた。比較キーは **(値の降順, index 昇順)** なので、選ばれる集合も
+/// 並びも従来と同一 (同値は小さい index が勝つ)。NaN を含む入力だけは
+/// `partial_cmp` が順序にならないため、従来の走査 [`select_topk_scan`] へ落とす。
 pub(crate) fn select_topk(probs: &[f32], k: usize) -> Vec<usize> {
+    let mut buf: Vec<u32> = Vec::new();
+    let mut out = vec![0usize; k];
+    select_topk_into(probs, k, &mut buf, &mut out);
+    out
+}
+
+/// [`select_topk`] の作業域版。`buf` を使い回すのでトークンごとの確保が無い。
+/// `out` には **index 昇順** で k 個を書く。
+pub(crate) fn select_topk_into(probs: &[f32], k: usize, buf: &mut Vec<u32>, out: &mut [usize]) {
     let n = probs.len();
     assert!(k >= 1 && k <= n, "k={} は 1..={} の範囲外", k, n);
+    assert_eq!(out.len(), k, "out.len() は k と一致する必要がある");
+    if probs.iter().any(|v| v.is_nan()) {
+        // NaN 入りは比較が全順序にならない (現行の走査規則をそのまま使う)。
+        select_topk_scan(probs, k, out);
+        return;
+    }
+    buf.clear();
+    buf.extend(0..n as u32);
+    // 先頭 k 個が「上位 k 個」になる (k 番目未満は比較キーで k 番目以下)。
+    buf.select_nth_unstable_by(k - 1, |&a, &b| {
+        let (pa, pb) = (probs[a as usize], probs[b as usize]);
+        // 値の降順 → index 昇順 (同値は小さい index が先)
+        pb.partial_cmp(&pa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+    let sel = &mut buf[..k];
+    sel.sort_unstable();
+    for (o, &v) in out.iter_mut().zip(sel.iter()) {
+        *o = v as usize;
+    }
+}
+
+/// 従来どおりの走査版 (NaN 入りの入力と、規則の参照実装)。
+///
+/// 走査を index 昇順に行い、`probs[i] > probs[best]` の厳密比較で更新するので、
+/// 同値なら先に見つかった (= 小さい index) が残る。O(k * n)。
+pub(crate) fn select_topk_scan(probs: &[f32], k: usize, out: &mut [usize]) {
+    let n = probs.len();
     let mut used = vec![false; n];
-    let mut chosen = Vec::with_capacity(k);
-    for _ in 0..k {
+    for slot in out.iter_mut().take(k) {
         let mut best: Option<usize> = None;
         for i in 0..n {
             if used[i] {
@@ -101,10 +143,9 @@ pub(crate) fn select_topk(probs: &[f32], k: usize) -> Vec<usize> {
         }
         let b = best.expect("k <= n なので候補は必ず残る");
         used[b] = true;
-        chosen.push(b);
+        *slot = b;
     }
-    chosen.sort_unstable();
-    chosen
+    out.sort_unstable();
 }
 
 /// 1 つの expert の FFN 出力 `h = down( silu(gate(x)) * up(x) )` を書く。
@@ -509,6 +550,60 @@ mod tests {
         // 戻り値は常に index 昇順
         let probs2 = [0.05f32, 0.4, 0.15, 0.4];
         assert_eq!(select_topk(&probs2, 3), vec![1, 2, 3]);
+    }
+
+    /// P33: `select_nth_unstable_by` 版が従来の走査版 ([`select_topk_scan`]) と
+    /// **同じ集合を同じ順序で** 返す。
+    ///
+    /// 同値が大量に出る入力 (値を 5 段階に量子化) と、ほぼ一様な乱数、
+    /// 全部同じ値、そして k = 1 / k = n を混ぜる。NaN 入りは走査版へ落ちるので
+    /// 別に確かめる。
+    #[test]
+    fn select_topk_matches_scan() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for &n in &[1usize, 2, 7, 64, 512] {
+            for &k in &[1usize, 2, 10] {
+                if k > n {
+                    continue;
+                }
+                for mode in 0..4 {
+                    let probs: Vec<f32> = (0..n)
+                        .map(|i| match mode {
+                            // 同値だらけ (5 段階)
+                            0 => ((i * 37) % 5) as f32,
+                            // 一様乱数
+                            1 => (next() >> 40) as f32 / 1.0e7,
+                            // 全部同じ
+                            2 => 0.25,
+                            // 単調 (同値なし)
+                            _ => i as f32,
+                        })
+                        .collect();
+                    let want = {
+                        let mut o = vec![0usize; k];
+                        select_topk_scan(&probs, k, &mut o);
+                        o
+                    };
+                    let got = select_topk(&probs, k);
+                    assert_eq!(got, want, "n={n} k={k} mode={mode}");
+                }
+            }
+        }
+        // k == n は全 index が昇順で返る
+        let probs: Vec<f32> = (0..32).map(|i| (i % 3) as f32).collect();
+        assert_eq!(select_topk(&probs, 32), (0..32).collect::<Vec<_>>());
+        // NaN 入りは走査版へ落ちる (走査は best=None のときだけ無条件に取るので、
+        // 先頭が NaN なら 1 個目はそれになる。規則は従来どおり)
+        let probs = [f32::NAN, 0.5, 0.25, f32::NAN, 0.75];
+        assert_eq!(select_topk(&probs, 2), vec![0, 4]);
+        let probs = [0.5f32, f32::NAN, 0.75, 0.25];
+        assert_eq!(select_topk(&probs, 2), vec![0, 2]);
     }
 
     /// 4. k == n_expert なら全 expert を使い、dense 合成と一致する。
