@@ -103,6 +103,48 @@ mod gpu {
             }
         }
         eprintln!("{ty:?}: 2 パスとも {n} 行ビット一致");
+
+        // P-pf-moe-scratch: x / out の一時バッファは thread_local の grow-only
+        // スクラッチを使い回す。**別の入力の後でも**同じ出力になること
+        // (前回の残りを読んでいないこと) を固定する。x2 で 1 回走らせてから
+        // x に戻し、上の CPU 参照 `want` とビット一致することを要求する。
+        let x2: Vec<f32> = x.iter().map(|v| v * -0.5 + 0.25).collect();
+        let mut got2 = vec![0f32; n];
+        assert!(
+            denno_engine::cuda::maybe_gpu_gguf_gemv_into(
+                lin.uid(),
+                ty,
+                lin.blocks().as_slice(),
+                k,
+                n,
+                &x2,
+                &mut got2,
+            ),
+            "{ty:?}: x2 で GPU 経路が使われなかった"
+        );
+        let mut again = vec![0f32; n];
+        assert!(
+            denno_engine::cuda::maybe_gpu_gguf_gemv_into(
+                lin.uid(),
+                ty,
+                lin.blocks().as_slice(),
+                k,
+                n,
+                &x,
+                &mut again,
+            ),
+            "{ty:?}: x に戻したときに GPU 経路が使われなかった"
+        );
+        for r in 0..n {
+            assert_eq!(
+                again[r].to_bits(),
+                want[r].to_bits(),
+                "{ty:?}: 別入力の後で行 {r} が変わった (gpu={} cpu={})",
+                again[r],
+                want[r]
+            );
+        }
+        eprintln!("{ty:?}: 別入力の後でも {n} 行ビット一致");
     }
 
     #[test]
