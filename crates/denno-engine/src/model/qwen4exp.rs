@@ -2229,6 +2229,8 @@ impl Qwen4Exp {
         let chunk = chunk.max(1);
         let mut last: Option<HyperStreams> = None;
         let mut start = 0usize;
+        // mix の要素演算の作業域 (実形で xn/gate 20 MB ずつ)。層ループの外で 1 回だけ持つ。
+        let mut mx = MixScratch::default();
         while start < ctx.len() {
             let end = (start + chunk).min(ctx.len());
             let nt = end - start;
@@ -2267,6 +2269,7 @@ impl Qwen4Exp {
                     &lw.hc_attn_up,
                     Some(&lw.hc_attn_inject),
                     &hp,
+                    &mut mx,
                 )?;
                 q4prof::add(&q4prof::MIX, t_mix);
                 let t_attn = std::time::Instant::now();
@@ -2299,6 +2302,7 @@ impl Qwen4Exp {
                     &lw.hc_ffn_up,
                     Some(&lw.hc_ffn_inject),
                     &hp,
+                    &mut mx,
                 )?;
                 q4prof::add(&q4prof::MIX, t_mix);
                 let flat = flatten_rows(&curs, e)?;
@@ -2376,6 +2380,32 @@ fn hc_mix_quant(
     Ok((mixed, inj))
 }
 
+/// [`hc_mix_quant_batch`] が使う作業域 (grow-only)。
+///
+/// 実形 (nt=512 / hc_dim=10240) では `xn` と `gate` が 20 MB ずつ、`mixed` が
+/// 5 MB ある。呼び出しごとに `vec![0.0; ..]` で確保すると、書き込み時の
+/// first-touch のページフォルトだけで 2 ms 前後乗る (実測:
+/// `crate::model::hyper::tests::bench_mix_call_real_shape` で
+/// grouped_rms_norm_batch 3.02 → 1.05 ms)。層ループの外で 1 回だけ持ち、
+/// チャンクを跨いで使い回す。
+#[derive(Default)]
+struct MixScratch {
+    xn: Vec<f32>,
+    lo: Vec<f32>,
+    gate: Vec<f32>,
+    mixed: Vec<f32>,
+}
+
+impl MixScratch {
+    /// `buf` を `n` 要素ぶん確保して `&mut [..n]` を返す (長さは呼び出し側が明示する)。
+    fn take(buf: &mut Vec<f32>, n: usize) -> &mut [f32] {
+        if buf.len() < n {
+            buf.resize(n, 0.0);
+        }
+        &mut buf[..n]
+    }
+}
+
 /// [`hc_mix_quant`] のバッチ版 (`nt` トークンぶんまとめて行列積)。
 ///
 /// 行列積 (`down` / `up` / `inject`) を [`gemv_batch`] に、要素演算
@@ -2383,6 +2413,8 @@ fn hc_mix_quant(
 /// `hyper::*_batch` に置き換える。要素演算は要素ごとに独立で、トークン内の
 /// 加算順序も逐次版と同じなので、1 トークンぶんの出力は [`hc_mix_quant`] と
 /// ビット一致する (`inject` は `[nt][hc]` の連結で返す)。
+///
+/// 要素演算の出力は `scratch` に書く (戻り値で返す `mixed` / `inject` だけ確保する)。
 fn hc_mix_quant_batch(
     ress: &[HyperStreams],
     norm: &[f32],
@@ -2390,6 +2422,7 @@ fn hc_mix_quant_batch(
     up: &GgufLinear,
     inject: Option<&GgufLinear>,
     hp: &HyperParams,
+    scratch: &mut MixScratch,
 ) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
     let nt = ress.len();
     let e = hp.n_embd;
@@ -2402,7 +2435,8 @@ fn hc_mix_quant_batch(
             )));
         }
     }
-    let xn_flat = hyper::grouped_rms_norm_batch(ress, norm, hp);
+    let xn_flat = MixScratch::take(&mut scratch.xn, nt * hc_dim);
+    hyper::grouped_rms_norm_batch_into(ress, norm, xn_flat, hp);
 
     let dn = down.n();
     if dn != hp.low_rank {
@@ -2411,10 +2445,10 @@ fn hc_mix_quant_batch(
             hp.low_rank
         )));
     }
-    let mut lo = vec![0.0f32; nt * dn];
-    gemv_batch(down, &xn_flat, nt, &mut lo)
+    let lo = MixScratch::take(&mut scratch.lo, nt * dn);
+    gemv_batch(down, xn_flat, nt, lo)
         .map_err(|err| one(format!("hc_mix down (batch): {err}")))?;
-    hyper::hc_lo_apply_batch(&mut lo, nt, hp);
+    hyper::hc_lo_apply_batch(lo, nt, hp);
 
     let un = up.n();
     if un != hc_dim {
@@ -2422,9 +2456,10 @@ fn hc_mix_quant_batch(
             "hc_mix up (batch): 行数 {un} が hc_dim {hc_dim} と違う"
         )));
     }
-    let mut gate = vec![0.0f32; nt * un];
-    gemv_batch(up, &lo, nt, &mut gate).map_err(|err| one(format!("hc_mix up (batch): {err}")))?;
-    let mixed_flat = hyper::hc_mixed_batch(&xn_flat, &gate, nt, hp);
+    let gate = MixScratch::take(&mut scratch.gate, nt * un);
+    gemv_batch(up, lo, nt, gate).map_err(|err| one(format!("hc_mix up (batch): {err}")))?;
+    let mixed_flat = MixScratch::take(&mut scratch.mixed, nt * e);
+    hyper::hc_mixed_batch_into(xn_flat, gate, nt, mixed_flat, hp);
     let mut mixed = Vec::with_capacity(nt);
     for t in 0..nt {
         mixed.push(mixed_flat[t * e..(t + 1) * e].to_vec());
@@ -2440,7 +2475,7 @@ fn hc_mix_quant_batch(
                 )));
             }
             let mut v = vec![0.0f32; nt * wn];
-            gemv_batch(w, &xn_flat, nt, &mut v)
+            gemv_batch(w, xn_flat, nt, &mut v)
                 .map_err(|err| one(format!("hc_mix inject (batch): {err}")))?;
             hyper::hc_inject_apply_batch(&mut v, nt, hp);
             v
@@ -4935,6 +4970,7 @@ mod tests {
                 &up,
                 Some(&inject),
                 &hp,
+                &mut MixScratch::default(),
             )
             .expect("hc_mix_quant_batch");
             for (t, r) in ress.iter().enumerate() {

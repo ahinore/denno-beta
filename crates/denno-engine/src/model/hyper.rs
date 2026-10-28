@@ -365,17 +365,24 @@ fn bump_par_calls() {
     HC_BATCH_PAR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// [`grouped_rms_norm`] のバッチ版。戻り値は `[nt][hc][n_embd]` の連結。
+/// [`grouped_rms_norm_batch`] の in-place 版。`out` は `[nt][hc][n_embd]` の連結。
 ///
-/// 1 トークンぶんは [`grouped_rms_norm`] と同じ計算 (ストリームごとに逐次二乗和 →
-/// rsqrt → `x * inv * gamma`) なので、トークンをまとめても値はビット一致する。
-pub fn grouped_rms_norm_batch(xs: &[HyperStreams], w_norm: &[f32], p: &HyperParams) -> Vec<f32> {
+/// 作業域を呼び出し側が持てるようにしてある。実形 (nt=512 / hc_dim=10240) では
+/// 出力が 20 MB あり、毎回 `vec![0.0; 20 MB]` を確保すると first-touch の
+/// ページフォルトだけで数 ms 乗る (実測は `bench_mix_call_real_shape`)。
+pub fn grouped_rms_norm_batch_into(
+    xs: &[HyperStreams],
+    w_norm: &[f32],
+    out: &mut [f32],
+    p: &HyperParams,
+) {
     let e = p.n_embd;
     let hc = p.hc;
     let hc_dim = hc * e;
     assert!(hc >= 1, "hc が 0");
     assert!(e >= 1, "n_embd が 0");
     assert_eq!(w_norm.len(), hc_dim, "w_norm は [hc][n_embd] (変換器が 1+w に畳んだ値)");
+    assert_eq!(out.len(), xs.len() * hc_dim, "out は [nt][hc][n_embd]");
     for (t, x) in xs.iter().enumerate() {
         assert_eq!(x.hc, hc, "トークン {t}: ストリーム本数が hc と一致しない");
         assert_eq!(x.n_embd, e, "トークン {t}: ストリーム次元が n_embd と一致しない");
@@ -386,7 +393,6 @@ pub fn grouped_rms_norm_batch(xs: &[HyperStreams], w_norm: &[f32], p: &HyperPara
         );
     }
 
-    let mut out = vec![0.0f32; xs.len() * hc_dim];
     let fill = |row: &mut [f32], x: &HyperStreams| {
         for s in 0..hc {
             let src = &x.data[s * e..(s + 1) * e];
@@ -395,8 +401,10 @@ pub fn grouped_rms_norm_batch(xs: &[HyperStreams], w_norm: &[f32], p: &HyperPara
             let ss = src.iter().map(|v| v * v).sum::<f32>() / e as f32;
             let inv = 1.0 / (ss + p.eps).sqrt();
             let dst = &mut row[s * e..(s + 1) * e];
-            for i in 0..e {
-                dst[i] = src[i] * inv * gamma[i];
+            // 添字アクセス (`dst[i]`/`src[i]`/`gamma[i]`) だと 3 本の境界チェックが
+            // 残ってベクトル化が止まる。zip にすると等幅 SIMD になる。
+            for ((o, &v), &g) in dst.iter_mut().zip(src.iter()).zip(gamma.iter()) {
+                *o = v * inv * g;
             }
         }
     };
@@ -408,12 +416,21 @@ pub fn grouped_rms_norm_batch(xs: &[HyperStreams], w_norm: &[f32], p: &HyperPara
         out.par_chunks_mut(hc_dim)
             .zip(xs.par_iter())
             .for_each(|(row, x)| fill(row, x));
-        return out;
+        return;
     }
 
     for (row, x) in out.chunks_mut(hc_dim).zip(xs.iter()) {
         fill(row, x);
     }
+}
+
+/// [`grouped_rms_norm_batch_into`] の確保あり版 (戻り値は `[nt][hc][n_embd]`)。
+///
+/// 1 トークンぶんは [`grouped_rms_norm`] と同じ計算 (ストリームごとに逐次二乗和 →
+/// rsqrt → `x * inv * gamma`) なので、トークンをまとめても値はビット一致する。
+pub fn grouped_rms_norm_batch(xs: &[HyperStreams], w_norm: &[f32], p: &HyperParams) -> Vec<f32> {
+    let mut out = vec![0.0f32; xs.len() * p.hc * p.n_embd];
+    grouped_rms_norm_batch_into(xs, w_norm, &mut out, p);
     out
 }
 
@@ -431,12 +448,17 @@ pub fn hc_lo_apply_batch(lo: &mut [f32], nt: usize, p: &HyperParams) {
     }
 }
 
-/// [`hc_mixed`] のバッチ版。`xn` / `gate` は `[nt][hc][n_embd]` の連結、
-/// 戻り値は `[nt][n_embd]` の連結。
+/// [`hc_mixed_batch`] の in-place 版 (`out` は `[nt][n_embd]`)。
 ///
 /// 加算は `s` の昇順、`1/hc` は和の後 (逐次版と同じ順序)。内側は `n_embd` 方向に
 /// 連続アクセスする (`d` ごとに `s` を回すと stride が n_embd になる)。
-pub fn hc_mixed_batch(xn: &[f32], gate: &[f32], nt: usize, p: &HyperParams) -> Vec<f32> {
+pub fn hc_mixed_batch_into(
+    xn: &[f32],
+    gate: &[f32],
+    nt: usize,
+    out: &mut [f32],
+    p: &HyperParams,
+) {
     let e = p.n_embd;
     let hc = p.hc;
     let hc_dim = hc * e;
@@ -444,9 +466,9 @@ pub fn hc_mixed_batch(xn: &[f32], gate: &[f32], nt: usize, p: &HyperParams) -> V
     assert!(e >= 1, "n_embd が 0");
     assert_eq!(xn.len(), nt * hc_dim, "xn は [nt][hc][n_embd]");
     assert_eq!(gate.len(), xn.len(), "gate は xn と同じ長さ ([nt][hc][n_embd])");
+    assert_eq!(out.len(), nt * e, "out は [nt][n_embd]");
 
     let inv_hc = 1.0f32 / hc as f32;
-    let mut mixed = vec![0.0f32; nt * e];
     let fill = |m: &mut [f32], x: &[f32], g: &[f32]| {
         for d in 0..e {
             m[d] = x[d] * sigmoid(g[d]);
@@ -467,22 +489,28 @@ pub fn hc_mixed_batch(xn: &[f32], gate: &[f32], nt: usize, p: &HyperParams) -> V
     if nt >= HC_BATCH_PAR_MIN_TOKENS {
         use rayon::prelude::*;
         bump_par_calls();
-        mixed
-            .par_chunks_mut(e)
+        out.par_chunks_mut(e)
             .zip(xn.par_chunks(hc_dim))
             .zip(gate.par_chunks(hc_dim))
             .for_each(|((m, x), g)| fill(m, x, g));
-        return mixed;
+        return;
     }
 
-    for (t, m) in mixed.chunks_mut(e).enumerate() {
+    for (t, m) in out.chunks_mut(e).enumerate() {
         fill(
             m,
             &xn[t * hc_dim..(t + 1) * hc_dim],
             &gate[t * hc_dim..(t + 1) * hc_dim],
         );
     }
-    mixed
+}
+
+/// [`hc_mixed_batch_into`] の確保あり版。`xn` / `gate` は `[nt][hc][n_embd]` の
+/// 連結、戻り値は `[nt][n_embd]` の連結。
+pub fn hc_mixed_batch(xn: &[f32], gate: &[f32], nt: usize, p: &HyperParams) -> Vec<f32> {
+    let mut out = vec![0.0f32; nt * p.n_embd];
+    hc_mixed_batch_into(xn, gate, nt, &mut out, p);
+    out
 }
 
 /// [`hc_inject_apply`] のバッチ版。`v` は `[nt][hc]`。
@@ -550,5 +578,393 @@ pub fn hc_combine_batch(
 
     for (t, r) in res.iter_mut().enumerate() {
         fill(r, &block_out[t * e..(t + 1) * e], &inject[t * hc..(t + 1) * hc]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 実形状マイクロベンチ (CPU のみ、GPU 不使用)
+//
+// 目的: `mix` 1 呼び出しの中身を 8 つ (要素演算 5 + バッチ GEMV 3) に割り、
+// どこが重いかを実形状 (nt=512 / hc=4 / n_embd=2560 / low_rank=320) で測る。
+//
+//   RAYON_NUM_THREADS=16 cargo test --release -p denno-engine --lib --features cuda \
+//       -- --ignored --nocapture --test-threads=1 bench_mix_call_real_shape
+//
+// 実機の ms/token の代わりではない (GPU も実モデルも要らない CPU 内訳)。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kquant::GgmlType;
+    use crate::model::linear_gguf::GgufLinear;
+    use crate::model::qwen4exp::gemv_batch;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    /// Q8_0 のダミー重み (`[n][k]` 行優先。1 ブロック = f16 スケール 2 B + 32 個の i8)。
+    /// 実ファイルの hc_down / hc_up と同じ量子型・同じバイト数になる。
+    fn q8_0_dummy(k: usize, n: usize, seed: u32) -> Vec<u8> {
+        assert_eq!(k % 32, 0, "Q8_0 のブロックは 32 要素");
+        let nb = k * n / 32 * 34;
+        let mut b = vec![0u8; nb];
+        let scale = half::f16::from_f32(0.02).to_le_bytes();
+        for blk in 0..nb / 34 {
+            let o = blk * 34;
+            b[o..o + 2].copy_from_slice(&scale);
+            for j in 0..32usize {
+                let q = ((j as i32 + blk as i32 * 3 + seed as i32 * 7) % 11) - 5;
+                b[o + 2 + j] = q as i8 as u8;
+            }
+        }
+        b
+    }
+
+    /// 1 回の計測値のうち最小 (ホストは共有なので最小値で比べる)。
+    fn best_of(reps: usize, mut f: impl FnMut()) -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..reps {
+            let t = Instant::now();
+            f();
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            if ms < best {
+                best = ms;
+            }
+        }
+        best
+    }
+
+    struct Row {
+        name: &'static str,
+        ms: f64,
+        mb: f64,
+    }
+
+    impl Row {
+        fn print(&self, nt: usize) {
+            // MB / ms = GB/s
+            let gbs = if self.ms > 0.0 { self.mb / self.ms } else { 0.0 };
+            println!(
+                "{:<28} {:>8.3} ms  {:>8.2} us/tok  {:>7.2} GB/s  ({:.1} MB)",
+                self.name,
+                self.ms,
+                self.ms * 1e3 / nt as f64,
+                gbs,
+                self.mb
+            );
+        }
+    }
+
+    #[test]
+    fn batch_into_reuses_stale_buffer_bitwise() {
+        // grow-only の作業域 (前のチャンクの値が残っている) に書いても、
+        // 確保したてのバッファと同じビットになること。長さが違えば panic する
+        // ことも固定する (呼び出し側が `[..n]` で切る契約)。
+        let hp = HyperParams {
+            hc: 2,
+            n_embd: 8,
+            low_rank: 4,
+            eps: 1e-6,
+        };
+        let hc_dim = hp.hc * hp.n_embd;
+        let norm = vec![1.1f32; hc_dim];
+        let xs: Vec<HyperStreams> = (0..3)
+            .map(|t| HyperStreams {
+                data: (0..hc_dim)
+                    .map(|i| (((i * 7 + t * 13) % 23) as f32 - 11.0) * 0.03)
+                    .collect(),
+                hc: hp.hc,
+                n_embd: hp.n_embd,
+            })
+            .collect();
+        let gate: Vec<f32> = (0..3 * hc_dim)
+            .map(|i| (((i * 17) % 29) as f32 - 14.0) * 0.05)
+            .collect();
+
+        let fresh = grouped_rms_norm_batch(&xs, &norm, &hp);
+        let mut stale = vec![-7.0f32; 3 * hc_dim];
+        grouped_rms_norm_batch_into(&xs, &norm, &mut stale, &hp);
+        assert_eq!(stale, fresh, "再利用バッファの xn が確保版と違う");
+
+        let want = hc_mixed_batch(&fresh, &gate, 3, &hp);
+        let mut got = vec![f32::NAN; 3 * hp.n_embd];
+        hc_mixed_batch_into(&fresh, &gate, 3, &mut got, &hp);
+        assert_eq!(got, want, "再利用バッファの mixed が確保版と違う");
+    }
+
+    #[test]
+    #[ignore = "実形状の CPU マイクロベンチ (手動)"]
+    fn bench_mix_call_real_shape() {
+        let hp = HyperParams {
+            hc: 4,
+            n_embd: 2560,
+            low_rank: 320,
+            eps: 1e-6,
+        };
+        let (e, hc, lr) = (hp.n_embd, hp.hc, hp.low_rank);
+        let hc_dim = hc * e;
+        let nt = 512usize;
+        let f32b = 4.0f64;
+
+        // 実形状の入力 (実モデル不要。値は乱数ではなく決定的なパターン)
+        let base: Vec<Vec<f32>> = (0..nt)
+            .map(|t| {
+                (0..hc_dim)
+                    .map(|i| (((i * 7 + t * 13) % 23) as f32 - 11.0) * 0.03)
+                    .collect()
+            })
+            .collect();
+        let norm: Vec<f32> = (0..hc_dim).map(|i| 0.9 + ((i % 13) as f32) * 0.01).collect();
+        let gate: Vec<f32> = (0..nt * hc_dim)
+            .map(|i| (((i * 17) % 29) as f32 - 14.0) * 0.05)
+            .collect();
+        let lo_in: Vec<f32> = (0..nt * lr)
+            .map(|i| (((i * 11) % 19) as f32 - 9.0) * 0.02)
+            .collect();
+        let inj_in: Vec<f32> = (0..nt * hc)
+            .map(|i| (((i * 5) % 7) as f32 - 3.0) * 0.1)
+            .collect();
+        let outs: Vec<f32> = (0..nt * e)
+            .map(|i| (((i * 23) % 31) as f32 - 15.0) * 0.01)
+            .collect();
+
+        // Q8_0 のダミー重み (実ファイルと同じ [n][k] と量子型)
+        let w_down = GgufLinear::from_slice(GgmlType::Q8_0, hc_dim, lr, &q8_0_dummy(hc_dim, lr, 3))
+            .expect("hc_down");
+        let w_up = GgufLinear::from_slice(GgmlType::Q8_0, lr, hc_dim, &q8_0_dummy(lr, hc_dim, 5))
+            .expect("hc_up");
+        let w_inj = GgufLinear::from_slice(GgmlType::Q8_0, hc_dim, hc, &q8_0_dummy(hc_dim, hc, 7))
+            .expect("hc_inject");
+
+        let mut ress: Vec<HyperStreams> = base
+            .iter()
+            .map(|d| HyperStreams {
+                data: d.clone(),
+                hc,
+                n_embd: e,
+            })
+            .collect();
+        let mut lo = lo_in.clone();
+        let mut inj = inj_in.clone();
+
+        let reps = 20usize;
+        println!(
+            "\n=== mix 1 呼び出しの内訳 (nt={nt} hc={hc} n_embd={e} low_rank={lr} hc_dim={hc_dim}) ==="
+        );
+        println!(
+            "rayon threads = {}",
+            std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "(default)".into())
+        );
+
+        let mut rows: Vec<Row> = Vec::new();
+        let mut elem_ms = 0.0;
+        let mut elem_new_ms = 0.0;
+        // 実経路では直前の grouped_rms_norm_batch の出力 = 20 MB。読み手の
+        // キャッシュ状態を実経路に近づけるため、計測用に 1 本作っておく。
+        let xn_flat = grouped_rms_norm_batch(&ress, &norm, &hp);
+
+        // 1. grouped_rms_norm_batch: res 読み + xn 書き
+        let ms = best_of(reps, || {
+            let xn = grouped_rms_norm_batch(&ress, &norm, &hp);
+            black_box(&xn);
+        });
+        let r = Row {
+            name: "grouped_rms_norm_batch",
+            ms,
+            mb: (2 * nt * hc_dim) as f64 * f32b / 1e6,
+        };
+        elem_ms += ms;
+        r.print(nt);
+        rows.push(r);
+
+        // 1b. 作業域を使い回す版 (毎回の 20 MB 確保を消す)
+        let mut xn_buf = vec![0.0f32; nt * hc_dim];
+        let ms = best_of(reps, || {
+            grouped_rms_norm_batch_into(&ress, &norm, &mut xn_buf, &hp);
+            black_box(&xn_buf);
+        });
+        let r = Row {
+            name: "  (reuse buffer)",
+            ms,
+            mb: (2 * nt * hc_dim) as f64 * f32b / 1e6,
+        };
+        elem_new_ms += ms;
+        r.print(nt);
+        rows.push(r);
+
+        // 2. hc_lo_apply_batch: lo を in-place
+        let ms = best_of(reps, || {
+            lo.copy_from_slice(&lo_in);
+            hc_lo_apply_batch(&mut lo, nt, &hp);
+            black_box(&lo);
+        });
+        let r = Row {
+            name: "hc_lo_apply_batch",
+            ms,
+            mb: (2 * nt * lr) as f64 * f32b / 1e6,
+        };
+        elem_ms += ms;
+        elem_new_ms += ms;
+        r.print(nt);
+        rows.push(r);
+
+        // 3. hc_mixed_batch: xn + gate 読み + mixed 書き
+        let ms = best_of(reps, || {
+            let m = hc_mixed_batch(&xn_flat, &gate, nt, &hp);
+            black_box(&m);
+        });
+        let r = Row {
+            name: "hc_mixed_batch",
+            ms,
+            mb: (3 * nt * hc_dim) as f64 * f32b / 1e6,
+        };
+        elem_ms += ms;
+        r.print(nt);
+        rows.push(r);
+
+        // 3b. 作業域を使い回す版 (毎回の 5 MB 確保を消す)
+        let mut mixed_buf = vec![0.0f32; nt * e];
+        let ms = best_of(reps, || {
+            hc_mixed_batch_into(&xn_flat, &gate, nt, &mut mixed_buf, &hp);
+            black_box(&mixed_buf);
+        });
+        let r = Row {
+            name: "  (reuse buffer)",
+            ms,
+            mb: (3 * nt * hc_dim) as f64 * f32b / 1e6,
+        };
+        elem_new_ms += ms;
+        r.print(nt);
+        rows.push(r);
+
+        // 4. hc_inject_apply_batch
+        let ms = best_of(reps, || {
+            inj.copy_from_slice(&inj_in);
+            hc_inject_apply_batch(&mut inj, nt, &hp);
+            black_box(&inj);
+        });
+        let r = Row {
+            name: "hc_inject_apply_batch",
+            ms,
+            mb: (2 * nt * hc) as f64 * f32b / 1e6,
+        };
+        elem_ms += ms;
+        elem_new_ms += ms;
+        r.print(nt);
+        rows.push(r);
+
+        // 5. hc_combine_batch: res 読み書き + block_out 読み (ストリーム数ぶん)
+        let ms = best_of(reps, || {
+            hc_combine_batch(&mut ress, &outs, &inj_in, &hp);
+            black_box(&ress[0].data);
+        });
+        let r = Row {
+            name: "hc_combine_batch",
+            ms,
+            mb: ((2 * nt * hc_dim + hc * nt * e) as f64) * f32b / 1e6,
+        };
+        elem_ms += ms;
+        elem_new_ms += ms;
+        r.print(nt);
+        rows.push(r);
+
+        // 参考: 20 MB の確保と first-touch だけ (上の差の原因を見る)
+        let ms = best_of(reps, || {
+            let v = vec![0.0f32; nt * hc_dim];
+            black_box(&v);
+        });
+        Row {
+            name: "[ref] vec![0.0; 20 MB]",
+            ms,
+            mb: (nt * hc_dim) as f64 * f32b / 1e6,
+        }
+        .print(nt);
+
+        println!("--- バッチ GEMV (Q8_0 ダミー重み) ---");
+        let mut gemv_ms = 0.0;
+        let mut out_lo = vec![0.0f32; nt * lr];
+        let mut out_gate = vec![0.0f32; nt * hc_dim];
+        let mut out_inj = vec![0.0f32; nt * hc];
+
+        let ms = best_of(reps, || {
+            gemv_batch(&w_down, &xn_flat, nt, &mut out_lo).expect("down");
+            black_box(&out_lo);
+        });
+        let r = Row {
+            name: "gemv down (10240x320)",
+            ms,
+            mb: (nt * hc_dim) as f64 * f32b / 1e6,
+        };
+        gemv_ms += ms;
+        r.print(nt);
+        rows.push(r);
+
+        let ms = best_of(reps, || {
+            gemv_batch(&w_up, &lo_in, nt, &mut out_gate).expect("up");
+            black_box(&out_gate);
+        });
+        let r = Row {
+            name: "gemv up (320x10240)",
+            ms,
+            mb: (nt * hc_dim) as f64 * f32b / 1e6,
+        };
+        gemv_ms += ms;
+        r.print(nt);
+        rows.push(r);
+
+        let ms = best_of(reps, || {
+            gemv_batch(&w_inj, &xn_flat, nt, &mut out_inj).expect("inject");
+            black_box(&out_inj);
+        });
+        let r = Row {
+            name: "gemv inject (10240x4)",
+            ms,
+            mb: (nt * hc_dim) as f64 * f32b / 1e6,
+        };
+        gemv_ms += ms;
+        r.print(nt);
+        rows.push(r);
+
+        // 呼び出し側の詰め替え (mixed_flat -> Vec<Vec<f32>>)
+        let mixed_flat = hc_mixed_batch(&xn_flat, &gate, nt, &hp);
+        let ms = best_of(reps, || {
+            let mut v: Vec<Vec<f32>> = Vec::with_capacity(nt);
+            for t in 0..nt {
+                v.push(mixed_flat[t * e..(t + 1) * e].to_vec());
+            }
+            black_box(&v);
+        });
+        let r = Row {
+            name: "to_vec repack (512x)",
+            ms,
+            mb: (2 * nt * e) as f64 * f32b / 1e6,
+        };
+        let to_vec_ms = r.ms;
+        r.print(nt);
+        rows.push(r);
+
+        println!("--- 合計 ---");
+        println!(
+            "要素演算 5 本 (確保あり)       {:>8.3} ms",
+            elem_ms
+        );
+        println!(
+            "要素演算 5 本 (作業域再利用)   {:>8.3} ms   ({:.2}x)",
+            elem_new_ms,
+            elem_ms / elem_new_ms
+        );
+        println!("バッチ GEMV 3 本 (CPU)         {:>8.3} ms", gemv_ms);
+        println!(
+            "mix 1 呼び出し (要素演算+詰め替え) 旧 {:>8.3} ms / 新 {:>8.3} ms",
+            elem_ms + to_vec_ms,
+            elem_new_ms + to_vec_ms
+        );
+        println!(
+            "参考: 1 chunk (48 層 x 2 回) の要素演算 = 旧 {:.3} s / 新 {:.3} s (推定)",
+            (elem_ms + to_vec_ms) * 48.0 * 2.0 / 1e3,
+            (elem_new_ms + to_vec_ms) * 48.0 * 2.0 / 1e3
+        );
+        println!("(GEMV は GPU 常駐時に GPU へ行くので、この CPU 値は実機の mix には含まれない)");
+        black_box(&rows);
+        let _ = (gemv_ms, xn_buf[0], mixed_buf[0]);
     }
 }
