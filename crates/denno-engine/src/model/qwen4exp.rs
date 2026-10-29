@@ -1925,6 +1925,60 @@ pub struct LayerOut<'a> {
     pub n_embd: usize,
     /// 層の出力 (残差を足した後)。`[hc][n_embd]` の連結。
     pub res: &'a [f32],
+    /// 役割別 RMS (P54)。観測していないときは `None`。
+    ///
+    /// `Some` のときだけ engine が層の中で RMS を取る (取らないときは
+    /// 数値経路に触れないのと同じで、走査もしない)。
+    pub roles: Option<&'a RoleRms>,
+}
+
+/// 1 層ぶんの役割別 RMS (P54)。
+///
+/// テレメトリ (3D ビューア) 用の**読み取り専用**の値。層の出力を変えない。
+/// 単位はバラバラ (ベクトルの RMS と、router の確率和) なので、送る側で
+/// 層内最大により 0..1 に正規化する ([`RoleRms::normalized`])。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RoleRms {
+    /// full attention 層の attention 出力の RMS (ssm 層では 0)
+    pub attn: f32,
+    /// ssm (GDN) 層の scan 出力の RMS (full attention 層では 0)
+    pub gdn: f32,
+    /// router の top-k 確率和 (0..1)。スカラーなので RMS は値そのもの
+    pub router: f32,
+    /// shared expert の出力 (`ffn_down_shexp` の出力) の RMS
+    pub shex: f32,
+    /// PLE 注入の寄与 (`out - res` = gated + conv) の RMS
+    pub ple: f32,
+}
+
+impl RoleRms {
+    /// `[attn, gdn, router, shex, ple]` の生値。
+    pub fn as_array(&self) -> [f32; 5] {
+        [self.attn, self.gdn, self.router, self.shex, self.ple]
+    }
+
+    /// 層内最大で割った 0..1 の 5 値 (最大が 0 なら全部 0)。
+    ///
+    /// 正規化の規則は `denno_telemetry::normalize_roles` と同じ。engine から
+    /// テレメトリへの依存を増やさないため、ここでは生値だけを持ち、正規化は
+    /// 送る側 (CLI) で行う。
+    pub fn normalized(&self) -> [f32; 5] {
+        let a = self.as_array();
+        let mut max = 0.0f32;
+        for v in a {
+            if v > max {
+                max = v;
+            }
+        }
+        if !(max > 0.0) {
+            return [0.0; 5];
+        }
+        let mut out = [0.0f32; 5];
+        for (o, v) in out.iter_mut().zip(a) {
+            *o = (v / max).clamp(0.0, 1.0);
+        }
+        out
+    }
 }
 
 impl<'a> LayerOut<'a> {
@@ -2036,13 +2090,27 @@ impl Qwen4Exp {
         }
     }
 
+    /// P54: expert の置き場所の統計 `(RAM 常駐 expert 数, SSD 読みの累計)`。
+    ///
+    /// `DENNO_EXPERT_CACHE_MB` が 0 (既定) のときは `(0, 0)`。VRAM の使用量は
+    /// [`expert_vram::budget_usage`] から取る (こちらはキャッシュを持たない)。
+    pub fn expert_tier_stats(&self) -> (u32, u32) {
+        match &self.expert_cache {
+            Some(c) => (
+                c.used_experts().min(u32::MAX as usize) as u32,
+                c.total_reads().min(u32::MAX as u64) as u32,
+            ),
+            None => (0, 0),
+        }
+    }
+
     /// 1 トークンぶんの logits (`[n_vocab]`)。
     ///
     /// `ctx` は **新しい順** ではなく **古い順**で、末尾が現在のトークン
     /// (`ple.ngram` の窓は末尾 3 個 = 現在 + 直前 2)。PLE が無いモデルでは
     /// 末尾しか使わない。
     pub fn forward_token(&mut self, ctx: &[u32]) -> Result<Vec<f32>> {
-        self.forward_token_at(ctx, 0, 1, None)
+        self.forward_token_at(ctx, 0, 1, None, None)
     }
 
     /// [`Qwen4Exp::forward_token`] の層ごとフック付き版。
@@ -2054,7 +2122,7 @@ impl Qwen4Exp {
         F: FnMut(usize, &[f32]) -> Result<()>,
     {
         let mut hook = |o: &LayerOut<'_>| -> Result<()> { on_layer(o.il, o.res) };
-        self.forward_token_at(ctx, 0, 1, Some(&mut hook))
+        self.forward_token_at(ctx, 0, 1, Some(&mut hook), None)
     }
 
     /// P53: 層の出口観測フック付きの 1 トークン forward。
@@ -2062,7 +2130,23 @@ impl Qwen4Exp {
     /// `on_layer` は層ごとに 1 回、**層の出口 (ffn の `hc_combine` の後)** で
     /// 呼ばれる。戻り値を持たないので、観測側は数値経路に影響を与えられない
     /// (読むだけ)。`t` / `nt` は (0, 1)。
-    pub fn forward_token_tapped<F>(&mut self, ctx: &[u32], mut on_layer: F) -> Result<Vec<f32>>
+    pub fn forward_token_tapped<F>(&mut self, ctx: &[u32], on_layer: F) -> Result<Vec<f32>>
+    where
+        F: FnMut(&LayerOut<'_>),
+    {
+        self.forward_token_tapped_roles(ctx, on_layer, None)
+    }
+
+    /// P54: 役割別 RMS も取る [`Qwen4Exp::forward_token_tapped`]。
+    ///
+    /// `roles` が `Some` のときだけ層の中で RMS を取り、[`LayerOut::roles`] に載せる。
+    /// 読むだけなので logits は [`Qwen4Exp::forward_token`] とビット一致する。
+    pub fn forward_token_tapped_roles<F>(
+        &mut self,
+        ctx: &[u32],
+        mut on_layer: F,
+        roles: Option<&mut RoleRms>,
+    ) -> Result<Vec<f32>>
     where
         F: FnMut(&LayerOut<'_>),
     {
@@ -2070,7 +2154,7 @@ impl Qwen4Exp {
             on_layer(o);
             Ok(())
         };
-        self.forward_token_at(ctx, 0, 1, Some(&mut hook))
+        self.forward_token_at(ctx, 0, 1, Some(&mut hook), roles)
     }
 
     /// [`Qwen4Exp::forward_token_tapped`] の本体。`on_layer` が `None` のときは
@@ -2082,15 +2166,34 @@ impl Qwen4Exp {
         t: usize,
         nt: usize,
         mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+        mut roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>> {
         let hp = self.hp();
         let mut res = self.forward_embed(ctx, &hp)?;
         let ple_emb = self.gather_ple(ctx)?;
 
         for il in 0..self.p.n_layer {
-            self.run_layer(il, &mut res, ple_emb.as_ref(), &hp, &mut |_, _, _| Ok(()))?;
+            // P54: 役割別 RMS は層ごとに 0 から取り直す (観測しないときは None)。
+            if let Some(d) = roles.as_deref_mut() {
+                *d = RoleRms::default();
+            }
+            self.run_layer(
+                il,
+                &mut res,
+                ple_emb.as_ref(),
+                &hp,
+                &mut |_, _, _| Ok(()),
+                roles.as_deref_mut(),
+            )?;
             if let Some(h) = on_layer.as_deref_mut() {
-                h(&LayerOut { il, t, nt, n_embd: self.p.n_embd, res: &res.data })?;
+                h(&LayerOut {
+                    il,
+                    t,
+                    nt,
+                    n_embd: self.p.n_embd,
+                    res: &res.data,
+                    roles: roles.as_deref(),
+                })?;
             }
         }
 
@@ -2156,6 +2259,9 @@ impl Qwen4Exp {
     ///
     /// `hook(name, il, vals)` は層の中間値の観測用。通常の forward は空のフックを
     /// 渡すので、この関数を経由しても数値は変わらない (演算順序は同じ)。
+    ///
+    /// `roles` が `Some` のときだけ役割別 RMS (P54) を書く。**読むだけ**なので
+    /// 数値経路は変わらない。`None` のときは分岐 1 個ぶんのコストも無い。
     fn run_layer(
         &mut self,
         il: usize,
@@ -2163,6 +2269,7 @@ impl Qwen4Exp {
         ple_emb: Option<&Vec<f32>>,
         hp: &HyperParams,
         hook: &mut dyn FnMut(&str, usize, &[f32]) -> Result<()>,
+        mut roles: Option<&mut RoleRms>,
     ) -> Result<()> {
         let e = self.p.n_embd;
         let lw = &self.layers[il];
@@ -2178,7 +2285,20 @@ impl Qwen4Exp {
                 Some(b) => b,
                 None => return Err(one(format!("層 {il}: PLE の conv 履歴が無い"))),
             };
-            *res = ple_inject(&self.p, pw, pe, res, hp, hist_buf)?;
+            // P54: PLE の寄与 (gated + conv) の RMS を ple_inject の中で 1 パスで取る。
+            let mut contrib = 0.0f32;
+            *res = ple_inject(
+                &self.p,
+                pw,
+                pe,
+                res,
+                hp,
+                hist_buf,
+                roles.is_some().then_some(&mut contrib),
+            )?;
+            if let Some(r) = roles.as_deref_mut() {
+                r.ple = contrib;
+            }
             hook("ple_after", il, &res.data)?;
         }
 
@@ -2205,6 +2325,15 @@ impl Qwen4Exp {
             )));
         }
         hook("attn_out", il, &cur)?;
+        // P54: 層の種別で attn (full attention) と gdn (ssm) のどちらに入れるかが決まる。
+        if let Some(r) = roles.as_deref_mut() {
+            let v = rms_of(&cur);
+            if matches!(self.p.layer_kind(il), Ok(LayerKind::FullAttn)) {
+                r.attn = v;
+            } else {
+                r.gdn = v;
+            }
+        }
         *res = hyper::hc_combine(res, &cur, &inject, hp);
         hook("res_after_attn", il, &res.data)?;
 
@@ -2221,7 +2350,13 @@ impl Qwen4Exp {
         q4prof::add(&q4prof::MIX, t_mix);
         hook("hc_mixed_ffn", il, &cur)?;
         let t_moe = std::time::Instant::now();
-        let cur = moe_ffn_quant(&self.p, lw, &cur, self.expert_cache.as_ref())?;
+        let cur = moe_ffn_quant_tapped(
+            &self.p,
+            lw,
+            &cur,
+            self.expert_cache.as_ref(),
+            roles.as_deref_mut(),
+        )?;
         q4prof::add(&q4prof::MOE, t_moe);
         hook("ffn_out", il, &cur)?;
         *res = hyper::hc_combine(res, &cur, &inject, hp);
@@ -2249,7 +2384,7 @@ impl Qwen4Exp {
                     }
                     Ok(())
                 };
-                self.run_layer(il, &mut res, ple_emb.as_ref(), &hp, &mut hook)?;
+                self.run_layer(il, &mut res, ple_emb.as_ref(), &hp, &mut hook, None)?;
             }
         }
         Ok(())
@@ -2270,7 +2405,7 @@ impl Qwen4Exp {
     ///
     /// `batch == false` は既存の逐次経路そのもの (1 ビットも変えない)。
     pub fn forward_prefill_with(&mut self, ctx: &[u32], batch: bool) -> Result<Vec<f32>> {
-        self.forward_prefill_inner(ctx, batch, TapTokens::Last, None)
+        self.forward_prefill_inner(ctx, batch, TapTokens::Last, None, None)
     }
 
     /// P53: 層の出口観測フック付きの prefill。
@@ -2285,7 +2420,25 @@ impl Qwen4Exp {
         ctx: &[u32],
         batch: bool,
         tokens: TapTokens,
+        on_layer: F,
+    ) -> Result<Vec<f32>>
+    where
+        F: FnMut(&LayerOut<'_>),
+    {
+        self.forward_prefill_tapped_roles(ctx, batch, tokens, on_layer, None)
+    }
+
+    /// P54: 役割別 RMS も取る [`Qwen4Exp::forward_prefill_tapped`]。
+    ///
+    /// `roles` が `Some` のときだけ層の中で RMS を取る。観測するトークンは
+    /// `tokens` に従う (`TapTokens::Last` ならチャンク末尾だけ)。
+    pub fn forward_prefill_tapped_roles<F>(
+        &mut self,
+        ctx: &[u32],
+        batch: bool,
+        tokens: TapTokens,
         mut on_layer: F,
+        roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>>
     where
         F: FnMut(&LayerOut<'_>),
@@ -2294,7 +2447,7 @@ impl Qwen4Exp {
             on_layer(o);
             Ok(())
         };
-        self.forward_prefill_inner(ctx, batch, tokens, Some(&mut hook))
+        self.forward_prefill_inner(ctx, batch, tokens, Some(&mut hook), roles)
     }
 
     fn forward_prefill_inner(
@@ -2303,11 +2456,12 @@ impl Qwen4Exp {
         batch: bool,
         tokens: TapTokens,
         on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+        roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>> {
         if batch && self.attn.layer_major_safe() {
-            self.forward_prefill_batch_tapped(ctx, prefill_batch_chunk(), tokens, on_layer)
+            self.forward_prefill_batch_tapped(ctx, prefill_batch_chunk(), tokens, on_layer, roles)
         } else {
-            self.prefill_seq(ctx, tokens, on_layer)
+            self.prefill_seq(ctx, tokens, on_layer, roles)
         }
     }
 
@@ -2318,6 +2472,7 @@ impl Qwen4Exp {
         ctx: &[u32],
         tokens: TapTokens,
         mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+        mut roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>> {
         if ctx.is_empty() {
             return Err(one("ctx が空 (現在のトークンが無い)"));
@@ -2335,14 +2490,18 @@ impl Qwen4Exp {
                 Some(f) if want => Some(&mut **f),
                 _ => None,
             };
-            logits = self.forward_token_at(&ctx[..=i], i, nt, hook)?;
+            let rr: Option<&mut RoleRms> = match &mut roles {
+                Some(r) if want => Some(&mut **r),
+                _ => None,
+            };
+            logits = self.forward_token_at(&ctx[..=i], i, nt, hook, rr)?;
         }
         Ok(logits)
     }
 
     /// [`Qwen4Exp::forward_prefill_batch_tapped`] のフック無し版 (テスト用)。
     fn forward_prefill_batch(&mut self, ctx: &[u32], chunk: usize) -> Result<Vec<f32>> {
-        self.forward_prefill_batch_tapped(ctx, chunk, TapTokens::Last, None)
+        self.forward_prefill_batch_tapped(ctx, chunk, TapTokens::Last, None, None)
     }
 
     /// 層優先のバッチ prefill。`ctx` を `chunk` トークンずつに切り、チャンク内では
@@ -2361,6 +2520,7 @@ impl Qwen4Exp {
         chunk: usize,
         tokens: TapTokens,
         mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+        mut roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>> {
         if ctx.is_empty() {
             return Err(one("ctx が空 (現在のトークンが無い)"));
@@ -2390,6 +2550,10 @@ impl Qwen4Exp {
                 if q4prof::enabled() {
                     q4prof::N_LAYER.fetch_add(nt as u64, std::sync::atomic::Ordering::Relaxed);
                 }
+                // P54: 役割別 RMS は層ごとに 0 から取り直す (観測しないときは None)。
+                if let Some(d) = roles.as_deref_mut() {
+                    *d = RoleRms::default();
+                }
 
                 // 3.1 PLE 注入 (層 1 のみ)。conv 履歴はトークン順に進める。
                 if let Some(pw) = &lw.ple {
@@ -2400,7 +2564,23 @@ impl Qwen4Exp {
                         let hist = self.ple_conv_state[il]
                             .as_mut()
                             .ok_or_else(|| one(format!("層 {il}: PLE の conv 履歴が無い")))?;
-                        ress[t] = ple_inject(&self.p, pw, pe, &ress[t], &hp, hist)?;
+                        // P54: 寄与の RMS はチャンク末尾のトークンだけ取る。
+                        let mut contrib = 0.0f32;
+                        let want = roles.is_some() && t + 1 == nt;
+                        ress[t] = ple_inject(
+                            &self.p,
+                            pw,
+                            pe,
+                            &ress[t],
+                            &hp,
+                            hist,
+                            want.then_some(&mut contrib),
+                        )?;
+                        if want {
+                            if let Some(r) = roles.as_deref_mut() {
+                                r.ple = contrib;
+                            }
+                        }
                     }
                 }
 
@@ -2435,6 +2615,16 @@ impl Qwen4Exp {
                     )));
                 }
                 let flat_outs = flatten_rows(&outs, e)?;
+                // P54: attn / gdn の RMS はチャンク末尾のトークンの出力で取る。
+                if let Some(r) = roles.as_deref_mut() {
+                    let t = nt - 1;
+                    let v = rms_of(&flat_outs[t * e..(t + 1) * e]);
+                    if matches!(self.p.layer_kind(il), Ok(LayerKind::FullAttn)) {
+                        r.attn = v;
+                    } else {
+                        r.gdn = v;
+                    }
+                }
                 hyper::hc_combine_batch(&mut ress, &flat_outs, &injs, &hp);
 
                 // 3.5-3.7 ffn 入口 (バッチ) → MoE FFN (バッチ) → 出口
@@ -2451,7 +2641,14 @@ impl Qwen4Exp {
                 q4prof::add(&q4prof::MIX, t_mix);
                 let flat = flatten_rows(&curs, e)?;
                 let t_moe = std::time::Instant::now();
-                let ffn = moe_ffn_quant_batch(&self.p, lw, &flat, nt, self.expert_cache.as_ref())?;
+                let ffn = moe_ffn_quant_batch_tapped(
+                    &self.p,
+                    lw,
+                    &flat,
+                    nt,
+                    self.expert_cache.as_ref(),
+                    roles.as_deref_mut(),
+                )?;
                 q4prof::add(&q4prof::MOE, t_moe);
                 if ffn.len() != nt * e {
                     return Err(one(format!(
@@ -2462,16 +2659,33 @@ impl Qwen4Exp {
                 hyper::hc_combine_batch(&mut ress, &ffn, &injs, &hp);
 
                 // P53: 層の出口 (残差を足した後) を観測フックに渡す。読むだけ。
+                // P54: 役割別 RMS はチャンク末尾のトークンのぶんしか無いので、
+                // 他のトークンには載せない (嘘の値を送らない)。
                 if let Some(h) = on_layer.as_deref_mut() {
                     match tokens {
                         TapTokens::All => {
                             for t in 0..nt {
-                                h(&LayerOut { il, t, nt, n_embd: e, res: &ress[t].data })?;
+                                let is_last = t + 1 == nt;
+                                h(&LayerOut {
+                                    il,
+                                    t,
+                                    nt,
+                                    n_embd: e,
+                                    res: &ress[t].data,
+                                    roles: if is_last { roles.as_deref() } else { None },
+                                })?;
                             }
                         }
                         TapTokens::Last => {
                             let t = nt - 1;
-                            h(&LayerOut { il, t, nt, n_embd: e, res: &ress[t].data })?;
+                            h(&LayerOut {
+                                il,
+                                t,
+                                nt,
+                                n_embd: e,
+                                res: &ress[t].data,
+                                roles: roles.as_deref(),
+                            })?;
                         }
                     }
                 }
@@ -2667,6 +2881,7 @@ fn ple_inject(
     res: &HyperStreams,
     hp: &HyperParams,
     hist_buf: &mut Vec<f32>,
+    mut contrib_rms: Option<&mut f32>,
 ) -> Result<HyperStreams> {
     let e = p.n_embd;
     let hc = p.n_hc;
@@ -2780,14 +2995,40 @@ fn ple_inject(
 
     // 6. res + (gated + conv)
     let mut out = Vec::with_capacity(hc_dim);
+    let want_rms = contrib_rms.is_some();
+    let mut sq = 0.0f32;
     for i in 0..hc_dim {
-        out.push(res.data[i] + (gated[i] + conv[i]));
+        let add = gated[i] + conv[i];
+        if want_rms {
+            sq += add * add;
+        }
+        out.push(res.data[i] + add);
+    }
+    // P54: 寄与の RMS (`out - res` = gated + conv)。読み取りのみ。
+    if let Some(dst) = contrib_rms.as_deref_mut() {
+        *dst = if hc_dim == 0 {
+            0.0
+        } else {
+            (sq / hc_dim as f32).sqrt()
+        };
     }
     Ok(HyperStreams {
         data: out,
         hc,
         n_embd: e,
     })
+}
+
+/// ベクトルの RMS (P54)。空は 0。**読むだけ** (数値経路に触れない)。
+fn rms_of(x: &[f32]) -> f32 {
+    if x.is_empty() {
+        return 0.0;
+    }
+    let mut s = 0.0f32;
+    for &v in x {
+        s += v * v;
+    }
+    (s / x.len() as f32).sqrt()
 }
 
 /// 層内フェーズ別の累積時間 (ns)。`DENNO_Q4_PROFILE=1` のときだけ加算する。
@@ -2881,6 +3122,21 @@ fn moe_ffn_quant(
     cache: Option<&ExpertCacheSet>,
 ) -> Result<Vec<f32>> {
     moe_ffn_quant_with(p, lw, x, cache, moe_par_enabled(), expert_route())
+}
+
+/// P54: 役割別 RMS (router の top-k 確率和 / shared expert の RMS) も取る
+/// [`moe_ffn_quant`]。
+///
+/// `roles` が `Some` のときだけ 2 つの値を書く。どちらも**すでに計算した値**を
+/// 読むだけで、追加の行列積も確保もしない (top-k 和は再正規化の分母をそのまま使う)。
+fn moe_ffn_quant_tapped(
+    p: &Qwen4ExpParams,
+    lw: &LayerW,
+    x: &[f32],
+    cache: Option<&ExpertCacheSet>,
+    roles: Option<&mut RoleRms>,
+) -> Result<Vec<f32>> {
+    moe_ffn_quant_full(p, lw, x, cache, moe_par_enabled(), expert_route(), roles)
 }
 
 /// P39: expert の計算経路 (`DENNO_EXPERT_GPU` + `DENNO_EXPERT_VRAM_MB`)。プロセスで 1 回だけ。
@@ -3096,6 +3352,19 @@ fn moe_ffn_quant_with(
     par: bool,
     route: Route,
 ) -> Result<Vec<f32>> {
+    moe_ffn_quant_full(p, lw, x, cache, par, route, None)
+}
+
+/// [`moe_ffn_quant_with`] の本体 (+ P54 の役割別 RMS)。
+fn moe_ffn_quant_full(
+    p: &Qwen4ExpParams,
+    lw: &LayerW,
+    x: &[f32],
+    cache: Option<&ExpertCacheSet>,
+    par: bool,
+    route: Route,
+    mut roles: Option<&mut RoleRms>,
+) -> Result<Vec<f32>> {
     let t_router = std::time::Instant::now();
     let e = p.n_embd;
     let ne = p.n_expert;
@@ -3120,6 +3389,11 @@ fn moe_ffn_quant_with(
     }
     for (t, &i) in sel.iter().enumerate() {
         weights[t] = probs[i] / sum;
+    }
+    // P54: router の活性 = top-k 確率和。`sum` は再正規化の分母 (= 選択 expert の
+    // 確率の和) そのものなので、追加の走査は無い。スカラーなので RMS は値そのもの。
+    if let Some(r) = roles.as_deref_mut() {
+        r.router = sum;
     }
 
     // 3.5 選択 expert の重みを先に読み始める (I/O と計算を重ねる)。
@@ -3333,6 +3607,11 @@ fn moe_ffn_quant_with(
     let sgw = hyper::sigmoid(sg[0]);
     for j in 0..e {
         out[j] += sh[j] * sgw;
+    }
+    // P54: shared expert の出力そのもの (`ffn_down_shexp` の出力) の RMS。
+    // 係数 `sgw` は掛ける前の値を見る (expert の寄与の大きさを測るため)。
+    if let Some(r) = roles.as_deref_mut() {
+        r.shex = rms_of(&sh);
     }
     moe_sub_add(2, t_shared.elapsed());
 
@@ -4945,6 +5224,27 @@ fn moe_ffn_quant_batch(
     moe_ffn_quant_batch_with(p, lw, xs, nt, cache, moe_schedule())
 }
 
+/// P54: 役割別 RMS (チャンク末尾のトークン) も取る [`moe_ffn_quant_batch`]。
+fn moe_ffn_quant_batch_tapped(
+    p: &Qwen4ExpParams,
+    lw: &LayerW,
+    xs: &[f32],
+    nt: usize,
+    cache: Option<&ExpertCacheSet>,
+    roles: Option<&mut RoleRms>,
+) -> Result<Vec<f32>> {
+    moe_ffn_quant_batch_full(
+        p,
+        lw,
+        xs,
+        nt,
+        cache,
+        moe_schedule(),
+        moe_expert::vnni_enabled(),
+        roles,
+    )
+}
+
 /// [`moe_ffn_quant_batch`] の本体。expert ループの並べ方 (`sched`) を外から渡せる
 /// 形にしてある (テストと A/B 計測で両方の経路を同じ入力に通すため)。
 fn moe_ffn_quant_batch_with(
@@ -4969,6 +5269,23 @@ fn moe_ffn_quant_batch_opts(
     sched: MoeSchedule,
     vnni: bool,
 ) -> Result<Vec<f32>> {
+    moe_ffn_quant_batch_full(p, lw, xs, nt, cache, sched, vnni, None)
+}
+
+/// [`moe_ffn_quant_batch_opts`] の本体 (+ P54 の役割別 RMS)。
+///
+/// `roles` が `Some` のときだけ、**チャンク末尾のトークン**の router 確率和と
+/// shared expert の RMS を書く (prefill の観測はチャンク末尾だけ、の仕様に合わせる)。
+fn moe_ffn_quant_batch_full(
+    p: &Qwen4ExpParams,
+    lw: &LayerW,
+    xs: &[f32],
+    nt: usize,
+    cache: Option<&ExpertCacheSet>,
+    sched: MoeSchedule,
+    vnni: bool,
+    mut roles: Option<&mut RoleRms>,
+) -> Result<Vec<f32>> {
     let e = p.n_embd;
     let ne = p.n_expert;
     let k = p.n_expert_used;
@@ -4985,7 +5302,18 @@ fn moe_ffn_quant_batch_opts(
     let mut out = Vec::with_capacity(nt * e);
     if let Some(c) = cache {
         for t in 0..nt {
-            out.extend_from_slice(&moe_ffn_quant(p, lw, &xs[t * e..(t + 1) * e], Some(c))?);
+            // P54: 役割別 RMS はチャンク末尾のトークンだけ取る。
+            let rr: Option<&mut RoleRms> =
+                if t + 1 == nt { roles.as_deref_mut() } else { None };
+            out.extend_from_slice(&moe_ffn_quant_full(
+                p,
+                lw,
+                &xs[t * e..(t + 1) * e],
+                Some(c),
+                moe_par_enabled(),
+                expert_route(),
+                rr,
+            )?);
         }
         return Ok(out);
     }
@@ -5177,6 +5505,17 @@ fn moe_ffn_quant_batch_opts(
         for d in 0..e {
             out[t * e + d] += sh[t * e + d] * sgw;
         }
+    }
+    // P54: チャンク末尾のトークンの router 確率和 (= 選択 expert の確率の和) と
+    // shared expert の出力の RMS。probs / sh はすでに計算済みなので読むだけ。
+    if let Some(r) = roles.as_deref_mut() {
+        let t = nt - 1;
+        let mut s = 0.0f32;
+        for j in 0..k {
+            s += probs[t * ne + sels[t * k + j]];
+        }
+        r.router = s;
+        r.shex = rms_of(&sh[t * e..(t + 1) * e]);
     }
     moe_sub_add(2, t_shared.elapsed());
 

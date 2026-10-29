@@ -38,10 +38,23 @@ pub mod kind {
     pub const LAYER_RUN: u8 = 11;
     /// 1 層の活性 (P53: 3D ビューア用)。層の出力の |x| 上位 K 個。
     pub const LAYER_ACT: u8 = 12;
+    /// 1 層の役割別活性 (P54: 3D ビューア用)。attn / gdn / router / shex / ple の
+    /// 正規化 RMS。decode は 1 トークンにつき層数ぶん。
+    pub const ROLE_ACT: u8 = 13;
+    /// 1 層の VRAM 常駐 expert 一覧 (P54)。変化したときと 64 トークンごと。
+    pub const EXPERT_RESIDENCY: u8 = 14;
+    /// 置き場所の統計 (VRAM / RAM / SSD)。1 秒に 1 回 (P54)。
+    pub const TIER_STATS: u8 = 15;
 }
 
 pub const MAGIC: [u8; 4] = *b"DNTL";
 pub const VERSION: u8 = 1;
+
+/// [`Frame::ExpertResidency`] の `in_vram` の上限 (本)。
+///
+/// 1 層の expert は最大 256 本だが、ビューア側の配列を固定長で持てるように
+/// 512 で切る (超過分は落とす。層の在庫が 512 を超えるモデルは今のところ無い)。
+pub const RESIDENCY_MAX: usize = 512;
 
 /// セッション終了理由 (`engine::StopReason` に対応)
 pub mod done_reason {
@@ -220,6 +233,34 @@ pub enum Frame {
     /// フレームにトークン位置は無い (P53 の仕様)。受け手は直前の `Token` /
     /// `Prefill` と並び順で対応付ける。
     LayerAct { layer: u16, idx: Vec<u32>, val: Vec<u16> },
+    /// 1 層の**役割別**活性 (P54: 3D ビューア用)。
+    ///
+    /// 各役割の出力ベクトルの RMS を、**その層の最大役割**で割った値 (0..1) を
+    /// f16 ビットで送る。5 値とも同じ正規化なので、層の中での相対的な強さが読める。
+    ///
+    /// - `attn`: full attention 層の attention 出力の RMS (ssm 層では 0)
+    /// - `gdn`: ssm (GDN) 層の scan 出力の RMS (full attention 層では 0)
+    /// - `router`: router の top-k (k = n_expert_used = 10) 確率和。スカラーなので
+    ///   RMS は絶対値そのもの
+    /// - `shex`: shared expert の出力 (`ffn_down_shexp` の出力) の RMS
+    /// - `ple`: PLE 注入の寄与 (`out - res` = gated + conv) の RMS
+    ///
+    /// 層内最大が 0 なら 5 値とも 0。decode は 1 トークンにつき層数 (48) 枚、
+    /// prefill はチャンク末尾のトークンだけ。
+    RoleAct { layer: u16, attn: u16, gdn: u16, router: u16, shex: u16, ple: u16 },
+    /// その層で**いま VRAM に載っている** expert の index (P54)。
+    ///
+    /// `in_vram` は昇順・重複なし・最大 [`RESIDENCY_MAX`] 本 (超過分は切る)。
+    /// 変化したときだけ送り、加えて 64 トークンごとに全層のスナップショットを送る。
+    ExpertResidency { layer: u16, in_vram: Vec<u16> },
+    /// 置き場所の統計 (P54)。1 秒に 1 回。
+    ///
+    /// - `vram_used_mb` / `vram_total_mb`: expert 用 VRAM の使用量 / 予算
+    ///   (`DENNO_EXPERT_VRAM_MB`)。VRAM 経路が無効なら 0 / 0。
+    /// - `ram_experts`: RAM キャッシュに載っている expert の数
+    ///   (`DENNO_EXPERT_CACHE_MB`、無効なら 0)
+    /// - `ssd_reads`: SSD からの読み (pread) の累計回数
+    TierStats { vram_used_mb: u32, vram_total_mb: u32, ram_experts: u32, ssd_reads: u32 },
 }
 
 impl Frame {
@@ -237,6 +278,9 @@ impl Frame {
             Frame::TopK { .. } => kind::TOP_K,
             Frame::LayerRun { .. } => kind::LAYER_RUN,
             Frame::LayerAct { .. } => kind::LAYER_ACT,
+            Frame::RoleAct { .. } => kind::ROLE_ACT,
+            Frame::ExpertResidency { .. } => kind::EXPERT_RESIDENCY,
+            Frame::TierStats { .. } => kind::TIER_STATS,
         }
     }
 
@@ -331,6 +375,25 @@ impl Frame {
                 for &v in val {
                     b.extend_from_slice(&v.to_le_bytes());
                 }
+            }
+            Frame::RoleAct { layer, attn, gdn, router, shex, ple } => {
+                put_varint_u32(&mut b, *layer as u32);
+                for v in [attn, gdn, router, shex, ple] {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            Frame::ExpertResidency { layer, in_vram } => {
+                put_varint_u32(&mut b, *layer as u32);
+                put_varint_u32(&mut b, in_vram.len() as u32);
+                for &i in in_vram {
+                    put_varint_u32(&mut b, i as u32);
+                }
+            }
+            Frame::TierStats { vram_used_mb, vram_total_mb, ram_experts, ssd_reads } => {
+                put_varint_u32(&mut b, *vram_used_mb);
+                put_varint_u32(&mut b, *vram_total_mb);
+                put_varint_u32(&mut b, *ram_experts);
+                put_varint_u32(&mut b, *ssd_reads);
             }
         }
         b
@@ -478,6 +541,38 @@ impl Frame {
                 }
                 Frame::LayerAct { layer, idx, val }
             }
+            kind::ROLE_ACT => {
+                let layer = u32v(p, &mut i)? as u16;
+                let mut v = [0u16; 5];
+                for slot in v.iter_mut() {
+                    *slot = u16::from_le_bytes([p[i], p[i + 1]]);
+                    i += 2;
+                }
+                Frame::RoleAct {
+                    layer,
+                    attn: v[0],
+                    gdn: v[1],
+                    router: v[2],
+                    shex: v[3],
+                    ple: v[4],
+                }
+            }
+            kind::EXPERT_RESIDENCY => {
+                let layer = u32v(p, &mut i)? as u16;
+                let n = u32v(p, &mut i)? as usize;
+                let mut in_vram = Vec::with_capacity(n);
+                for _ in 0..n {
+                    in_vram.push(u32v(p, &mut i)? as u16);
+                }
+                Frame::ExpertResidency { layer, in_vram }
+            }
+            kind::TIER_STATS => {
+                let vram_used_mb = u32v(p, &mut i)?;
+                let vram_total_mb = u32v(p, &mut i)?;
+                let ram_experts = u32v(p, &mut i)?;
+                let ssd_reads = u32v(p, &mut i)?;
+                Frame::TierStats { vram_used_mb, vram_total_mb, ram_experts, ssd_reads }
+            }
             other => return Err(format!("unknown kind: {other}")),
         };
         if i != p.len() {
@@ -610,6 +705,110 @@ pub fn layer_flush() {
             emit(Frame::LayerRun { layer, ops });
         }
     }
+}
+
+// ---------- 役割別活性 / expert 在庫 / tier 統計 (P54) ----------
+
+/// `DENNO_TELEMETRY_ARCH` の解釈 (既定 off)。
+///
+/// 未設定・空・`0` 以外で有効。**off のときは呼び出し側が役割 RMS を取らない**
+/// (層ループにフックを付けない) ので、数値経路にも計測コストにも触れない。
+pub fn arch_from_value(v: Option<&str>) -> bool {
+    matches!(v, Some(s) if !s.is_empty() && s != "0")
+}
+
+static ARCH_ON: AtomicI8 = AtomicI8::new(-1);
+
+/// P54: 役割別活性などの送出が有効か (プロセスで 1 回だけ env を読む)。
+pub fn arch_enabled() -> bool {
+    match ARCH_ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = arch_from_value(std::env::var("DENNO_TELEMETRY_ARCH").ok().as_deref());
+            ARCH_ON.store(if v { 1 } else { 0 }, Ordering::Relaxed);
+            v
+        }
+    }
+}
+
+/// テスト専用: arch の ON/OFF を上書きする (本番コードからは使わない)。
+#[doc(hidden)]
+pub fn set_arch_for_tests(v: bool) {
+    ARCH_ON.store(if v { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// `DENNO_TELEMETRY_ARCH_DBG` の解釈 (既定 off、`1` / `true` / `yes` で有効)。
+pub fn arch_dbg_from_value(v: Option<&str>) -> bool {
+    matches!(v, Some("1") | Some("true") | Some("yes"))
+}
+
+/// P54: 1 トークンあたりの所要 ns と送出バイト数を stderr に出すか。
+pub fn arch_dbg() -> bool {
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| {
+        arch_dbg_from_value(std::env::var("DENNO_TELEMETRY_ARCH_DBG").ok().as_deref())
+    })
+}
+
+/// ベクトルの RMS (二乗平均平方根)。空・全部 0 は 0。
+pub fn rms(x: &[f32]) -> f32 {
+    if x.is_empty() {
+        return 0.0;
+    }
+    let mut s = 0.0f32;
+    for &v in x {
+        s += v * v;
+    }
+    (s / x.len() as f32).sqrt()
+}
+
+/// 5 役割の生値 `[attn, gdn, router, shex, ple]` を**層内最大**で割る (P54)。
+///
+/// - 最大が 0 (全部 0 / 負) なら 5 値とも 0
+/// - 戻り値は 0..1 に収まる (最大の役割がちょうど 1.0)
+pub fn normalize_roles(roles: [f32; 5]) -> [f32; 5] {
+    let mut max = 0.0f32;
+    for v in roles {
+        if v > max {
+            max = v;
+        }
+    }
+    if !(max > 0.0) {
+        return [0.0; 5];
+    }
+    let mut out = [0.0f32; 5];
+    for (o, v) in out.iter_mut().zip(roles) {
+        *o = (v / max).clamp(0.0, 1.0);
+    }
+    out
+}
+
+/// P54: 1 層ぶんの役割別活性フレームを作る (正規化は層内最大)。
+///
+/// `roles` は `[attn, gdn, router, shex, ple]` の生値 (RMS と top-k 確率和)。
+pub fn role_act_frame(layer: u16, roles: [f32; 5]) -> Frame {
+    let n = normalize_roles(roles);
+    Frame::RoleAct {
+        layer,
+        attn: f32_to_f16_bits(n[0]),
+        gdn: f32_to_f16_bits(n[1]),
+        router: f32_to_f16_bits(n[2]),
+        shex: f32_to_f16_bits(n[3]),
+        ple: f32_to_f16_bits(n[4]),
+    }
+}
+
+/// P54: expert 在庫フレームを作る (昇順・重複なし・最大 [`RESIDENCY_MAX`] 本)。
+///
+/// 入力の順序は問わない (並べ直してから切る)。**ソートしてから切る**ので、
+/// 512 本を超える層でも「小さい index の側」が落ちない。
+pub fn expert_residency_frame(layer: u16, in_vram: &[u16]) -> Frame {
+    let mut v = in_vram.to_vec();
+    v.sort_unstable();
+    v.dedup();
+    v.truncate(RESIDENCY_MAX);
+    Frame::ExpertResidency { layer, in_vram: v }
 }
 
 // ---------- 層活性 (P53: 3D ビューア用) ----------
@@ -878,6 +1077,28 @@ mod tests {
                 val: (0..64u16).map(|i| 0x3c00 - i).collect(),
             },
             Frame::LayerAct { layer: 12, idx: Vec::new(), val: Vec::new() },
+            // P54: 役割別活性 (全部 0 / 1 本だけ 1.0)
+            Frame::RoleAct { layer: 5, attn: 0, gdn: 0, router: 0, shex: 0, ple: 0 },
+            Frame::RoleAct {
+                layer: 47,
+                attn: 0,
+                gdn: 0x3c00,
+                router: 0x3800,
+                shex: 0x3c00,
+                ple: 0x0001,
+            },
+            // P54: expert 在庫 (空 / 1 本 / 512 本)
+            Frame::ExpertResidency { layer: 3, in_vram: Vec::new() },
+            Frame::ExpertResidency { layer: 4, in_vram: vec![7] },
+            Frame::ExpertResidency { layer: 5, in_vram: (0..512u16).collect() },
+            // P54: tier 統計 (0 / 実形の値)
+            Frame::TierStats { vram_used_mb: 0, vram_total_mb: 0, ram_experts: 0, ssd_reads: 0 },
+            Frame::TierStats {
+                vram_used_mb: 4_096,
+                vram_total_mb: 8_192,
+                ram_experts: 64,
+                ssd_reads: 1_234_567,
+            },
         ];
         for f in frames {
             let enc = f.encode();
@@ -887,6 +1108,86 @@ mod tests {
             assert_eq!(dec, f, "roundtrip failed for kind {}", f.kind());
         }
         assert_eq!(kind::LAYER_ACT, 12, "kind 番号は既存の次の値 (11 の次)");
+        // P54: kind 番号は既存の続き (12 の次から 3 個)
+        assert_eq!(kind::ROLE_ACT, 13);
+        assert_eq!(kind::EXPERT_RESIDENCY, 14);
+        assert_eq!(kind::TIER_STATS, 15);
+    }
+
+    /// P54: 役割別活性の正規化 (層内最大で割る) とフレーム化。
+    #[test]
+    fn role_act_frame_normalizes_by_layer_max() {
+        // 最大の役割が 1.0、他は比
+        let f = role_act_frame(9, [2.0, 1.0, 0.5, 4.0, 0.0]);
+        assert_eq!(
+            f,
+            Frame::RoleAct {
+                layer: 9,
+                attn: f32_to_f16_bits(0.5),
+                gdn: f32_to_f16_bits(0.25),
+                router: f32_to_f16_bits(0.125),
+                shex: f32_to_f16_bits(1.0),
+                ple: 0x0000,
+            }
+        );
+        // 最大が 0 → 5 値とも 0 (0/0 を作らない)
+        assert_eq!(
+            role_act_frame(1, [0.0; 5]),
+            Frame::RoleAct { layer: 1, attn: 0, gdn: 0, router: 0, shex: 0, ple: 0 }
+        );
+        // normalize_roles は 0..1 に収まる
+        let n = normalize_roles([0.0, 3.0, 0.0, 0.0, 0.0]);
+        assert_eq!(n, [0.0, 1.0, 0.0, 0.0, 0.0]);
+        // 負の値は 0 に落とす (RMS は負にならないが、防御的に)
+        assert_eq!(normalize_roles([-1.0, -2.0, 0.0, 0.0, 0.0]), [0.0; 5]);
+        // rms: 空 = 0、[3,4] = sqrt(12.5)
+        assert_eq!(rms(&[]), 0.0);
+        assert!((rms(&[3.0, 4.0]) - 12.5f32.sqrt()).abs() < 1e-6);
+        assert_eq!(rms(&[0.0; 8]), 0.0);
+    }
+
+    /// P54: expert 在庫は昇順・重複なし・最大 512 本。
+    #[test]
+    fn expert_residency_frame_sorts_and_caps() {
+        assert_eq!(
+            expert_residency_frame(2, &[9, 3, 3, 7]),
+            Frame::ExpertResidency { layer: 2, in_vram: vec![3, 7, 9] }
+        );
+        assert_eq!(
+            expert_residency_frame(0, &[]),
+            Frame::ExpertResidency { layer: 0, in_vram: Vec::new() }
+        );
+        // 512 本を超える入力は小さい index 側を残して切る
+        let many: Vec<u16> = (0..600u16).rev().collect();
+        match expert_residency_frame(1, &many) {
+            Frame::ExpertResidency { layer: 1, in_vram } => {
+                assert_eq!(in_vram.len(), RESIDENCY_MAX);
+                assert_eq!(in_vram.first(), Some(&0));
+                assert_eq!(in_vram.last(), Some(&(RESIDENCY_MAX as u16 - 1)));
+            }
+            other => panic!("ExpertResidency でない: {other:?}"),
+        }
+    }
+
+    /// P54: env の解釈 (既定 off)。
+    #[test]
+    fn arch_env_parsing() {
+        assert!(!arch_from_value(None), "未設定は既定 off");
+        assert!(!arch_from_value(Some("")), "空は off");
+        assert!(!arch_from_value(Some("0")), "0 は off");
+        assert!(arch_from_value(Some("1")));
+        assert!(arch_from_value(Some("true")), "0 以外は有効");
+        assert!(!arch_dbg_from_value(None));
+        assert!(arch_dbg_from_value(Some("1")));
+        assert!(arch_dbg_from_value(Some("yes")));
+        assert!(!arch_dbg_from_value(Some("0")));
+        // テスト用の上書きは元に戻せる (他のテストに漏らさない)
+        let before = arch_enabled();
+        set_arch_for_tests(true);
+        assert!(arch_enabled());
+        set_arch_for_tests(false);
+        assert!(!arch_enabled());
+        set_arch_for_tests(before);
     }
 
     /// P53: 層活性の選択 (上位 K・昇順・層内最大で正規化) を全ソートの参照実装と

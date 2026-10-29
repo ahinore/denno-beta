@@ -325,6 +325,14 @@ impl ExpertCache {
         self.slot_bytes
     }
 
+    /// いま常駐しているキー (= expert) の数 (P54 の `ram_experts`)。
+    ///
+    /// スロットの中身は追い出しでしか減らないので、`map.len()` がそのまま
+    /// 「載っている本数」になる。
+    pub fn used(&self) -> usize {
+        lock_inner(&self.inner).map.len()
+    }
+
     /// 鍵に対応する生バイトを返す。未命中なら `src` (pread 元) から読む。
     ///
     /// `off` は **ファイル内の絶対オフセット** ([`crate::gguf::GgufFile::tensor_mapping_parts`]
@@ -645,6 +653,19 @@ impl ExpertCacheSet {
     /// 行列ごとの常駐上限 (バイト)。`DENNO_EXPERT_CACHE_STATS` の 1 行に出す。
     pub fn resident_bytes(&self, m: ExpertMatrix) -> u64 {
         self.slots(m) as u64 * self.slot_bytes(m) as u64
+    }
+
+    /// いま RAM に常駐している expert の数 (P54 の `ram_experts`)。
+    ///
+    /// expert 1 本は gate / up / down の 3 行列がそろって入るので、gate 行列の
+    /// スロット使用数で数える (行列ごとに LRU が独立なので、3 つの和は 3 倍になる)。
+    pub fn used_experts(&self) -> usize {
+        self.caches[ExpertMatrix::Gate.index()].used()
+    }
+
+    /// 3 行列の読みミス (= SSD からの pread) の累計 (P54 の `ssd_reads`)。
+    pub fn total_reads(&self) -> u64 {
+        ExpertMatrix::ALL.iter().map(|&m| self.stats(m).misses).sum()
     }
 
     /// 行列 `m` の expert 生バイトを返す。
