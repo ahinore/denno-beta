@@ -23,6 +23,25 @@
 //! いけない (v1 は `out.len() < h.len()` を要求して実機の全 48 層で落ちた)。
 //! 対応は [`ScatterPlan`] が明示的な配列として持ち、scatter はそれだけを根拠にする。
 //!
+//! # 重みの番地 (P50)
+//!
+//! 実機で出力が `[PAD…]` の連続になった原因は 3 つとも「別の expert の重みを
+//! 読んでいた」こと:
+//!
+//! 1. segment 表の `w_off` を **segment の添字**で `plan.w_off` から引いていた。
+//!    segment は m 降順、packed は expert 昇順なので、並びが一致しない層では
+//!    全 expert が別人の重みになる。→ expert id で引く
+//!    ([`crate::model::moe_grouped::GroupedPlan::w_off_for`])。
+//! 2. down の `w_off` に gate のストライドを使っていた。実形は gate 921,600 B /
+//!    down 1,228,800 B で違う。→ down 専用の表を作り、別のデバイスバッファで渡す。
+//! 3. パック済みバッファの使い回しが expert 集合だけで、**層 id を見ていなかった**。
+//!    実形は全層でほぼ全 512 expert を使うので、2 層目以降が 1 層目の重みで
+//!    計算されていた。→ [`PackCache`] の鍵に層 id を入れる。
+//!
+//! 1 と 2 は `check_seg_addresses` が起動のたびに配車と突き合わせる。3 は
+//! `DENNO_MOE_GROUPED_CHECK=1` (最初の 1 層だけ、元テンソルからの CPU 参照と
+//! 比較) で値の差として出る。
+//!
 //! # ゲート
 //!
 //! `DENNO_MOE_GROUPED_GPU=1` のときだけ動く (既定 off)。off のとき
@@ -152,18 +171,21 @@ fn max_pack_bytes() -> usize {
 ///
 /// `e_off` / `ff_off` は segment の並びでの「f32 要素単位の先頭」で、
 /// gate/up の入力と down の入力 (gate/up の出力) を 1 枚の表で表すために両方持つ。
-/// `w_off` は [`Segment`] には無いので配車 (`GroupedPlan`) から引く。
+/// `w_off` は [`GroupedPlan`] から **expert id で**引く
+/// ([`crate::model::moe_grouped::GroupedPlan::w_off_for`])。`pass` は
+/// 0 = gate / 1 = up / 2 = down で、**down はストライドが gate と違う**ので
+/// パスごとに表を作り直す (P50)。
 pub(crate) fn seg_table(
     segs: &[Segment],
-    w_off: &[u32],
+    plan: &crate::model::moe_grouped::GroupedPlan,
+    pass: usize,
     e_off: &[u32],
     ff_off: &[u32],
 ) -> Result<Vec<u32>> {
-    if segs.len() != w_off.len() || segs.len() != e_off.len() || segs.len() != ff_off.len() {
+    if segs.len() != e_off.len() || segs.len() != ff_off.len() {
         bail!(
-            "seg_table: 長さが揃っていない (segs={}, w_off={}, e_off={}, ff_off={})",
+            "seg_table: 長さが揃っていない (segs={}, e_off={}, ff_off={})",
             segs.len(),
-            w_off.len(),
             e_off.len(),
             ff_off.len()
         );
@@ -175,11 +197,57 @@ pub(crate) fn seg_table(
         }
         t.push(s.expert as u32);
         t.push(s.m);
-        t.push(w_off[i]);
+        t.push(plan.w_off_for(s.expert, pass)?);
         t.push(e_off[i]);
         t.push(ff_off[i]);
     }
     Ok(t)
+}
+
+/// segment 表の `w_off` が配車 (`GroupedPlan`) の expert スライスと一致するか。
+///
+/// GPU 無しで回る純関数。P50 の実機バグ (segment の並び順で `w_off` を引き、
+/// 別 expert の重みを読んでいた) と同じ種類の取り違えを、起動のたびに
+/// 1 層あたり O(nseg · log n_expert) で落とす。
+pub(crate) fn check_seg_addresses(
+    plan: &crate::model::moe_grouped::GroupedPlan,
+    segs: &[Segment],
+    table_gu: &[u32],
+    table_dn: &[u32],
+) -> Result<()> {
+    if table_gu.len() != segs.len() * 5 || table_dn.len() != segs.len() * 5 {
+        bail!(
+            "seg 表の長さが segment 数と違う (segs={}, gu={}, dn={})",
+            segs.len(),
+            table_gu.len(),
+            table_dn.len()
+        );
+    }
+    for (i, s) in segs.iter().enumerate() {
+        let Some(sl) = plan.expert_slices(s.expert) else {
+            bail!("segment {i}: expert {} のスライスが配車に無い", s.expert);
+        };
+        let want_g = sl[0].start - plan.block_off[0];
+        let want_d = sl[2].start - plan.block_off[2];
+        let gu = table_gu[i * 5 + 2] as usize;
+        let dn = table_dn[i * 5 + 2] as usize;
+        if gu != want_g || dn != want_d {
+            bail!(
+                "segment {i} (expert {}): w_off が gate {gu}/down {dn} で、配車の \
+                 gate {want_g}/down {want_d} と違う (別 expert の重みを読む)",
+                s.expert
+            );
+        }
+        // 1 expert ぶんがブロック内に収まること (範囲外は隣のブロックを読む)。
+        if sl[0].end > plan.block_off[1] || sl[2].end > plan.packed_bytes {
+            bail!(
+                "segment {i} (expert {}): スライス {:?} がブロックの外へ出る",
+                s.expert,
+                sl
+            );
+        }
+    }
+    Ok(())
 }
 
 /// mmap のスライスからパック済みバッファを埋める。
@@ -257,8 +325,6 @@ pub(crate) fn reference_h(
     segs: &[Segment],
     xin: &[f32],
 ) -> Result<Vec<f32>> {
-    let (e, ff) = (gate.n_in, gate.n_out);
-    let m_total: usize = segs.iter().map(|s| s.m as usize).sum();
     let strides = plan.strides()?;
     let wg = packed_by_expert(
         packed,
@@ -281,6 +347,64 @@ pub(crate) fn reference_h(
         &plan.expert_ids,
         down.n_expert,
     )?;
+    reference_h_with_weights(
+        gate.ty, up.ty, down.ty, &wg, &wu, &wd, gate.n_in, gate.n_out, segs, xin,
+    )
+}
+
+/// mmap のスライスから直接作る CPU 参照 (**pack を経由しない**)。
+///
+/// `DENNO_MOE_GROUPED_VERIFY` / `DENNO_MOE_GROUPED_CHECK` の比較相手。
+/// [`reference_h`] は pack 済みバッファを読むので、pack が古い (層の取り違え)
+/// ときは GPU と同じ誤った重みで計算してしまい、差が出ない。こちらは元の
+/// テンソルを読むので、pack の取り違えも値の差として出る。
+pub(crate) fn reference_h_from_sources(
+    gate: &ExpertSource<'_>,
+    up: &ExpertSource<'_>,
+    down: &ExpertSource<'_>,
+    segs: &[Segment],
+    xin: &[f32],
+) -> Result<Vec<f32>> {
+    let wg = slices_by_expert(gate, segs)?;
+    let wu = slices_by_expert(up, segs)?;
+    let wd = slices_by_expert(down, segs)?;
+    reference_h_with_weights(
+        gate.ty, up.ty, down.ty, &wg, &wu, &wd, gate.n_in, gate.n_out, segs, xin,
+    )
+}
+
+/// `segs` に出てくる expert の 1 本ぶんのバイト列を expert id で引ける表にする。
+fn slices_by_expert<'a>(src: &ExpertSource<'a>, segs: &[Segment]) -> Result<Vec<&'a [u8]>> {
+    let mut w: Vec<&'a [u8]> = vec![&[]; src.n_expert];
+    for s in segs {
+        let eid = s.expert as usize;
+        if eid >= src.n_expert {
+            bail!("expert {eid} が範囲外 (n_expert={})", src.n_expert);
+        }
+        if !w[eid].is_empty() {
+            continue;
+        }
+        let sl = src.slice(s.expert)?;
+        w[eid] = &src.blocks[sl.off..sl.end()];
+    }
+    Ok(w)
+}
+
+/// 3 行列の「expert id で引けるスライス列」から参照 h を作る共通部。
+#[allow(clippy::too_many_arguments)]
+fn reference_h_with_weights(
+    gate_ty: GgmlType,
+    up_ty: GgmlType,
+    down_ty: GgmlType,
+    wg: &[&[u8]],
+    wu: &[&[u8]],
+    wd: &[&[u8]],
+    e: usize,
+    ff: usize,
+    segs: &[Segment],
+    xin: &[f32],
+) -> Result<Vec<f32>> {
+    let m_total: usize = segs.iter().map(|s| s.m as usize).sum();
     let (x_gu, o_gu) = offsets_for_pass(segs, e, ff);
     let gu_segs: Vec<Segment> = segs
         .iter()
@@ -306,14 +430,14 @@ pub(crate) fn reference_h(
 
     let mut g = vec![0.0f32; m_total * ff];
     let mut u = vec![0.0f32; m_total * ff];
-    grouped_expert_gemm_cpu(gate.ty, &wg, e, ff, &gu_segs, xin, &mut g)?;
-    grouped_expert_gemm_cpu(up.ty, &wu, e, ff, &gu_segs, xin, &mut u)?;
+    grouped_expert_gemm_cpu(gate_ty, wg, e, ff, &gu_segs, xin, &mut g)?;
+    grouped_expert_gemm_cpu(up_ty, wu, e, ff, &gu_segs, xin, &mut u)?;
     let mut act = vec![0.0f32; m_total * ff];
     for i in 0..m_total * ff {
         act[i] = g[i] / (1.0 + (-g[i]).exp()) * u[i];
     }
     let mut h = vec![0.0f32; m_total * e];
-    grouped_expert_gemm_cpu(down.ty, &wd, ff, e, &d_segs, &act, &mut h)?;
+    grouped_expert_gemm_cpu(down_ty, wd, ff, e, &d_segs, &act, &mut h)?;
     Ok(h)
 }
 
@@ -475,7 +599,12 @@ pub(crate) fn check_scatter_shapes(
 }
 
 /// 前回のパック済みバッファ (1 本だけ持ち回る)。
+///
+/// **層 id も鍵に入れる**。P50 以前は expert 集合 (`ids`) だけで比較していたため、
+/// expert 集合が同じ層 (実形ではほぼ全層) で前の層の重みを持ち回り、2 層目以降が
+/// 1 層目の expert 重みで計算されていた (実機で `[PAD…]` の連続になった原因の 1 つ)。
 struct PackCache {
+    layer: u64,
     ids: Vec<u16>,
     bytes: Vec<u8>,
 }
@@ -484,6 +613,7 @@ static PACK_CACHE: std::sync::Mutex<Option<PackCache>> = std::sync::Mutex::new(N
 
 /// パック済みバッファを借りて `f` を呼び、返す。
 fn with_packed<R>(
+    layer: u64,
     plan: &crate::model::moe_grouped::GroupedPlan,
     sources: [&ExpertSource<'_>; 3],
     f: impl FnOnce(&[u8]) -> R,
@@ -497,16 +627,19 @@ fn with_packed<R>(
     }
     let mut g = PACK_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let mut cache = g.take().unwrap_or(PackCache {
+        layer: u64::MAX,
         ids: Vec::new(),
         bytes: Vec::new(),
     });
     if cache.bytes.len() != plan.packed_bytes {
         cache.bytes.resize(plan.packed_bytes, 0);
         cache.ids.clear();
+        cache.layer = u64::MAX;
     }
-    if cache.ids != plan.expert_ids {
+    if cache.layer != layer || cache.ids != plan.expert_ids {
         pack_from_sources(plan, sources, &mut cache.bytes)?;
         cache.ids = plan.expert_ids.clone();
+        cache.layer = layer;
     }
     let r = f(&cache.bytes);
     *g = Some(cache);
@@ -571,17 +704,24 @@ pub(crate) fn try_experts(
         }
         (a, b)
     };
-    let table = seg_table(&batch.segs, &plan.w_off, &e_off, &ff_off)?;
+    let table_gu = seg_table(&batch.segs, &plan, 0, &e_off, &ff_off)?;
+    // down は 1 expert あたりのバイト数が gate と違う (Q4_K 640×2560 と
+    // Q5_1 2560×640)。w_off を gate のストライドで作ると 2 体目以降が別の
+    // expert の重みを読むので、down 用の表は strides[2] で作り直す (P50)。
+    let table_dn = seg_table(&batch.segs, &plan, 2, &e_off, &ff_off)?;
+    // 表と配車の突き合わせ (GPU 無しで回る・毎層)。取り違えはここで落とす。
+    check_seg_addresses(&plan, &batch.segs, &table_gu, &table_dn)?;
     let stamp = pack_stamp(layer_key, &plan.expert_ids);
     // 行 → (トークン, スロット) の対応はここで 1 度だけ作る。
     let scatter = ScatterPlan::new(&batch.segs, by_expert, nt)?;
 
-    let ran = with_packed(&plan, [&gate, &up, &down], |packed| -> Result<bool> {
+    let ran = with_packed(layer_key, &plan, [&gate, &up, &down], |packed| -> Result<bool> {
         let mut h = vec![0.0f32; m_total * e];
         let ok = launch(
             stamp,
             packed,
-            &table,
+            &table_gu,
+            &table_dn,
             &gate,
             &up,
             &down,
@@ -617,10 +757,83 @@ pub(crate) fn try_experts(
                 am_g == am_c
             );
         }
+        // P50: 最初の 1 層だけ、**元テンソル**から作った CPU 参照と比べる
+        // (pack を経由しないので、層の取り違え・w_off の取り違えも値に出る)。
+        if check_first_layer() {
+            let cpu = reference_h_from_sources(&gate, &up, &down, &batch.segs, &batch.xs)?;
+            report_check(layer_key, &h, &cpu, e)?;
+        }
         scatter.scatter(&mut *out, &h, weights, k, e)?;
         Ok(true)
     })??;
     Ok(ran)
+}
+
+/// `DENNO_MOE_GROUPED_CHECK=1` で、プロセス内の最初の 1 層だけ true。
+fn check_first_layer() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let on = *ON.get_or_init(|| {
+        matches!(
+            std::env::var("DENNO_MOE_GROUPED_CHECK").ok().as_deref(),
+            Some("1") | Some("on") | Some("true")
+        )
+    });
+    on && !USED.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// CHECK の比較結果を 1 行で出す。
+///
+/// GPU は `fmaf` + `expf` で計算する (ビット一致契約の外) ので、ビット比較は
+/// 「最初にビットが違った位置」の報告まで。判定は相対 1e-4 を超えた最初の
+/// (行, 列) で行う。行は segment の並び (詰め直した入力の行)、列は n_embd。
+fn report_check(layer: u64, h: &[f32], cpu: &[f32], e: usize) -> Result<()> {
+    if h.len() != cpu.len() {
+        bail!(
+            "CHECK: GPU の h が {} 要素、CPU 参照が {} 要素で違う",
+            h.len(),
+            cpu.len()
+        );
+    }
+    if e == 0 {
+        bail!("CHECK: e が 0");
+    }
+    let mut first_bit: Option<usize> = None;
+    let mut first_over: Option<usize> = None;
+    let mut max_abs = 0.0f32;
+    let mut am_g = 0usize;
+    let mut am_c = 0usize;
+    for i in 0..h.len() {
+        if first_bit.is_none() && h[i].to_bits() != cpu[i].to_bits() {
+            first_bit = Some(i);
+        }
+        let d = (h[i] - cpu[i]).abs();
+        if d > max_abs {
+            max_abs = d;
+        }
+        let tol = 1e-4 * cpu[i].abs().max(1.0);
+        if first_over.is_none() && d > tol {
+            first_over = Some(i);
+        }
+        if h[i] > h[am_g] {
+            am_g = i;
+        }
+        if cpu[i] > cpu[am_c] {
+            am_c = i;
+        }
+    }
+    let at = |i: Option<usize>| match i {
+        Some(i) => format!("row={} col={} gpu={} cpu={}", i / e, i % e, h[i], cpu[i]),
+        None => "なし".to_string(),
+    };
+    eprintln!(
+        "[moe-grouped] CHECK 層 {layer}: rows={} max_abs={max_abs:.6e} 許容超え={} (最初のビット差 {}) argmax_eq={}",
+        h.len() / e,
+        at(first_over),
+        at(first_bit),
+        am_g == am_c
+    );
+    Ok(())
 }
 
 /// GPU 起動 (cuda feature 無しは常に false)。
@@ -629,7 +842,8 @@ pub(crate) fn try_experts(
 fn launch(
     stamp: u64,
     packed: &[u8],
-    table: &[u32],
+    table_gu: &[u32],
+    table_dn: &[u32],
     gate: &ExpertSource<'_>,
     up: &ExpertSource<'_>,
     down: &ExpertSource<'_>,
@@ -658,7 +872,7 @@ fn launch(
         row_bytes: row_bytes(down.ty, down.n_in)?,
         w_off: plan.block_off[2],
     };
-    crate::cuda::moe_grouped_gemm_layer(stamp, packed, table, g, u, d, xin, h)
+    crate::cuda::moe_grouped_gemm_layer(stamp, packed, table_gu, table_dn, g, u, d, xin, h)
 }
 
 /// cuda feature 無しのスタブ。
@@ -667,7 +881,8 @@ fn launch(
 fn launch(
     _stamp: u64,
     _packed: &[u8],
-    _table: &[u32],
+    _table_gu: &[u32],
+    _table_dn: &[u32],
     _gate: &ExpertSource<'_>,
     _up: &ExpertSource<'_>,
     _down: &ExpertSource<'_>,
@@ -733,7 +948,12 @@ mod tests {
     }
 
     fn source(ty: GgmlType, n_in: usize, n_out: usize) -> ExpertSource<'static> {
-        let blocks = make_blocks(ty, n_in, n_out, N_EXPERT, 7);
+        source_seed(ty, n_in, n_out, 7)
+    }
+
+    /// 量子値を seed でずらしたソース (層ごとに重みが違うことの検証用)。
+    fn source_seed(ty: GgmlType, n_in: usize, n_out: usize, seed: u64) -> ExpertSource<'static> {
+        let blocks = make_blocks(ty, n_in, n_out, N_EXPERT, seed);
         ExpertSource {
             blocks: Box::leak(blocks.into_boxed_slice()),
             ty,
@@ -834,19 +1054,19 @@ mod tests {
             let s = down.slice(ei as u16).expect("slice");
             let d = &down.blocks[s.off..s.end()];
             // `weights` は expert id で引かれるので、使う 1 本だけを置いた表を作る。
-            let mut wv: Vec<&[u8]> = vec![&[]; N_EXPERT];
+            let mut wv: Vec<&[u8]> = vec![&[]; gate.n_expert];
             wv[ei] = g;
             let mut act = vec![0.0f32; m * ff];
             let mut upo = vec![0.0f32; m * ff];
             grouped_expert_gemm_cpu(gate.ty, &wv, e, ff, &seg, &xin, &mut act).expect("gate");
-            let mut wv: Vec<&[u8]> = vec![&[]; N_EXPERT];
+            let mut wv: Vec<&[u8]> = vec![&[]; gate.n_expert];
             wv[ei] = u;
             grouped_expert_gemm_cpu(up.ty, &wv, e, ff, &seg, &xin, &mut upo).expect("up");
             for i in 0..m * ff {
                 act[i] = act[i] / (1.0 + (-act[i]).exp()) * upo[i];
             }
             let mut h = vec![0.0f32; m * e];
-            let mut wv: Vec<&[u8]> = vec![&[]; N_EXPERT];
+            let mut wv: Vec<&[u8]> = vec![&[]; gate.n_expert];
             wv[ei] = d;
             grouped_expert_gemm_cpu(down.ty, &wv, ff, e, &seg, &act, &mut h).expect("down");
             for (i, &(t, j)) in p.iter().enumerate() {
@@ -887,17 +1107,242 @@ mod tests {
     }
 
     #[test]
+    fn seg_table_w_off_follows_expert_id_and_pass_stride() {
+        let _g = FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (picks, xs, _w, e, ff) = fixture();
+        let gate = source(GgmlType::Q4K, N_IN, N_OUT);
+        let up = source(GgmlType::Q4K, N_IN, N_OUT);
+        let down = source(GgmlType::Q5_1, N_OUT, N_IN);
+        let batch = build_grouped_batch(&picks, &xs, e, ff).expect("batch");
+        let layout = ExpertLayout::new(
+            gate.shape().expect("g"),
+            up.shape().expect("u"),
+            down.shape().expect("d"),
+        )
+        .expect("layout");
+        let plan = plan_grouped(&batch.segs, &layout).expect("plan");
+        // 前提: segment は m 降順 (expert 1, 3, 0)、expert_ids は昇順 (0, 1, 3)。
+        // つまり segment の添字と expert_ids の添字はずれる。
+        assert_eq!(
+            batch.segs.iter().map(|s| s.expert).collect::<Vec<_>>(),
+            vec![1, 3, 0]
+        );
+        assert_eq!(plan.expert_ids, vec![0, 1, 3]);
+        let strides = plan.strides().expect("strides");
+        assert_ne!(strides[0], strides[2], "gate と down の stride は違う形");
+        let (xo, ff_o) = offsets_for_pass(&batch.segs, e, ff);
+        let t_gu = seg_table(&batch.segs, &plan, 0, &xo, &ff_o).expect("gu");
+        let t_dn = seg_table(&batch.segs, &plan, 2, &xo, &ff_o).expect("dn");
+        for (i, s) in batch.segs.iter().enumerate() {
+            let k = plan.expert_ids.binary_search(&s.expert).expect("配車にある");
+            assert_eq!(
+                t_gu[i * 5 + 2] as usize,
+                k * strides[0],
+                "segment {i} (expert {}) の gate w_off",
+                s.expert
+            );
+            assert_eq!(
+                t_dn[i * 5 + 2] as usize,
+                k * strides[2],
+                "segment {i} (expert {}) の down w_off",
+                s.expert
+            );
+        }
+        check_seg_addresses(&plan, &batch.segs, &t_gu, &t_dn).expect("配車と一致するはず");
+        // P50 以前の引き方 (segment index で plan.w_off を引く) で作った表は落ちる。
+        let bad_gu: Vec<u32> = batch
+            .segs
+            .iter()
+            .enumerate()
+            .flat_map(|(i, s)| [s.expert as u32, s.m, plan.w_off[i], xo[i], ff_o[i]])
+            .collect();
+        let err = check_seg_addresses(&plan, &batch.segs, &bad_gu, &t_dn)
+            .expect_err("segment index で引いた表は別 expert を指す");
+        assert!(
+            format!("{err:#}").contains("segment 0"),
+            "最初のずれを報告する: {err:#}"
+        );
+        // down 用の表を gate のストライドで作っても落ちる。
+        let bad_dn = seg_table(&batch.segs, &plan, 0, &xo, &ff_o).expect("gu で作る");
+        assert!(check_seg_addresses(&plan, &batch.segs, &t_gu, &bad_dn).is_err());
+    }
+
+    /// 実形の寸法 (n_embd 2560 / n_ff 640 / Q4_K gate・up / Q5_1 down) で
+    /// grouped と per-expert が **ビット一致**すること。
+    ///
+    /// 1 expert あたり gate 921,600 B / down 1,228,800 B でストライドが違う。
+    /// P50 の実機バグ (w_off を segment の並びで引く / down に gate の stride を
+    /// 使う) は、どちらもこの寸法で別 expert の重みを読む。
+    #[test]
+    fn real_dims_grouped_matches_per_expert_bitwise() {
+        let _g = FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const NE: usize = 2;
+        let (e, ff) = (E_REAL, 640); // 実形: n_embd 2560 / n_ff_exp 640
+        let gate = ExpertSource {
+            blocks: Box::leak(make_blocks(GgmlType::Q4K, e, ff, NE, 21).into_boxed_slice()),
+            ty: GgmlType::Q4K,
+            n_in: e,
+            n_out: ff,
+            n_expert: NE,
+        };
+        let up = ExpertSource {
+            blocks: Box::leak(make_blocks(GgmlType::Q4K, e, ff, NE, 22).into_boxed_slice()),
+            ty: GgmlType::Q4K,
+            n_in: e,
+            n_out: ff,
+            n_expert: NE,
+        };
+        let down = ExpertSource {
+            blocks: Box::leak(make_blocks(GgmlType::Q5_1, ff, e, NE, 23).into_boxed_slice()),
+            ty: GgmlType::Q5_1,
+            n_in: ff,
+            n_out: e,
+            n_expert: NE,
+        };
+        // nt=3 / k=2。expert 1 が 4 本、expert 0 が 2 本 → segment は expert 1 が先頭。
+        let picks: Vec<Vec<(usize, usize)>> = vec![
+            vec![(0, 0), (1, 0)],
+            vec![(0, 1), (1, 1), (2, 0), (2, 1)],
+        ];
+        let nt = 3usize;
+        let k = 2usize;
+        let xs: Vec<f32> = (0..nt * e)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.03125)
+            .collect();
+        let weights: Vec<f32> = vec![0.5, 1.0, 0.25, 0.75, 0.125, 0.625];
+        let batch = build_grouped_batch(&picks, &xs, e, ff).expect("batch");
+        assert_eq!(
+            batch.segs.iter().map(|s| s.expert).collect::<Vec<_>>(),
+            vec![1, 0],
+            "m 降順で expert 1 が先頭"
+        );
+        let layout = ExpertLayout::new(
+            gate.shape().expect("g"),
+            up.shape().expect("u"),
+            down.shape().expect("d"),
+        )
+        .expect("layout");
+        let plan = plan_grouped(&batch.segs, &layout).expect("plan");
+        let strides = plan.strides().expect("strides");
+        assert_eq!(strides[0], 640 * 1440, "gate 1 expert = 921,600 B");
+        assert_eq!(strides[2], 2560 * 480, "down 1 expert = 1,228,800 B");
+        let mut packed = vec![0u8; plan.packed_bytes];
+        pack_from_sources(&plan, [&gate, &up, &down], &mut packed).expect("pack");
+        let h = reference_h(&gate, &up, &down, &plan, &packed, &batch.segs, &batch.xs)
+            .expect("reference_h");
+        let sp = ScatterPlan::new(&batch.segs, &picks, nt).expect("scatter_plan");
+        let mut got = vec![0.0f32; nt * e];
+        sp.scatter(&mut got, &h, &weights, k, e).expect("scatter");
+        let want = per_expert_reference(&gate, &up, &down, &picks, &weights, &xs, nt, e, ff);
+        assert_eq!(got.len(), want.len());
+        for i in 0..got.len() {
+            assert_eq!(
+                got[i].to_bits(),
+                want[i].to_bits(),
+                "要素 {i}: grouped {} vs per-expert {}",
+                got[i],
+                want[i]
+            );
+        }
+        // segment 表: segment 0 は expert 1 (expert_ids の位置 1)。
+        let (xo, ff_o) = offsets_for_pass(&batch.segs, e, ff);
+        let t_gu = seg_table(&batch.segs, &plan, 0, &xo, &ff_o).expect("gu");
+        let t_dn = seg_table(&batch.segs, &plan, 2, &xo, &ff_o).expect("dn");
+        assert_eq!(t_gu[2] as usize, strides[0], "segment 0 (expert 1) の gate");
+        assert_eq!(t_dn[2] as usize, strides[2], "segment 0 (expert 1) の down");
+        check_seg_addresses(&plan, &batch.segs, &t_gu, &t_dn).expect("配車と一致");
+    }
+
+    #[test]
+    fn reference_from_sources_matches_packed_reference() {
+        let _g = FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = source(GgmlType::Q4K, N_IN, N_OUT);
+        let up = source(GgmlType::Q4K, N_IN, N_OUT);
+        let down = source(GgmlType::Q5_1, N_OUT, N_IN);
+        let (packed, plan, segs, xin) = pack(&gate, &up, &down).expect("pack");
+        let from_pack = reference_h(&gate, &up, &down, &plan, &packed, &segs, &xin)
+            .expect("packed 参照");
+        let from_src = reference_h_from_sources(&gate, &up, &down, &segs, &xin)
+            .expect("元テンソル参照");
+        assert_eq!(from_pack.len(), from_src.len());
+        for i in 0..from_pack.len() {
+            assert_eq!(
+                from_pack[i].to_bits(),
+                from_src[i].to_bits(),
+                "要素 {i}: pack 経由 {} vs 元テンソル {}",
+                from_pack[i],
+                from_src[i]
+            );
+        }
+    }
+
+    #[test]
+    fn pack_cache_is_keyed_by_layer() {
+        let _g = FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gate_a = source_seed(GgmlType::Q4K, N_IN, N_OUT, 7);
+        let up_a = source_seed(GgmlType::Q4K, N_IN, N_OUT, 8);
+        let down_a = source_seed(GgmlType::Q5_1, N_OUT, N_IN, 9);
+        let gate_b = source_seed(GgmlType::Q4K, N_IN, N_OUT, 10);
+        let up_b = source_seed(GgmlType::Q4K, N_IN, N_OUT, 11);
+        let down_b = source_seed(GgmlType::Q5_1, N_OUT, N_IN, 12);
+        let (picks, xs, _w, e, ff) = fixture();
+        let batch = build_grouped_batch(&picks, &xs, e, ff).expect("batch");
+        let layout = ExpertLayout::new(
+            gate_a.shape().expect("g"),
+            up_a.shape().expect("u"),
+            down_a.shape().expect("d"),
+        )
+        .expect("layout");
+        let plan = plan_grouped(&batch.segs, &layout).expect("plan");
+        let mut a = Vec::new();
+        with_packed(1, &plan, [&gate_a, &up_a, &down_a], |p| -> Result<()> {
+            a = p.to_vec();
+            Ok(())
+        })
+        .expect("層 1");
+        let mut b = Vec::new();
+        with_packed(2, &plan, [&gate_b, &up_b, &down_b], |p| -> Result<()> {
+            b = p.to_vec();
+            Ok(())
+        })
+        .expect("層 2");
+        // expert 集合は同じでも、層が変われば重みは別人。パックし直すこと。
+        assert_eq!(plan.expert_ids, vec![0, 1, 3]);
+        assert_ne!(a, b, "層が変わったらパックし直す (前の層の重みを使い回さない)");
+        assert_eq!(a.len(), b.len());
+        let mut c = Vec::new();
+        with_packed(2, &plan, [&gate_b, &up_b, &down_b], |p| -> Result<()> {
+            c = p.to_vec();
+            Ok(())
+        })
+        .expect("層 2 の 2 回目");
+        assert_eq!(b, c, "同じ層の 2 回目は同じパック");
+    }
+
+    #[test]
     fn seg_table_offsets_are_cumulative() {
         let _g = FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (picks, xs, _w, e, ff) = fixture();
         let batch = build_grouped_batch(&picks, &xs, e, ff).expect("batch");
+        let gate = source(GgmlType::Q4K, N_IN, N_OUT);
+        let up = source(GgmlType::Q4K, N_IN, N_OUT);
+        let down = source(GgmlType::Q5_1, N_OUT, N_IN);
+        let layout = ExpertLayout::new(
+            gate.shape().expect("g"),
+            up.shape().expect("u"),
+            down.shape().expect("d"),
+        )
+        .expect("layout");
+        let plan = plan_grouped(&batch.segs, &layout).expect("plan");
         let (xo, ff_o) = offsets_for_pass(&batch.segs, e, ff);
-        let w_off: Vec<u32> = (0..batch.segs.len() as u32).map(|i| i * 7).collect();
-        let t = seg_table(&batch.segs, &w_off, &xo, &ff_o).expect("seg_table");
+        let t = seg_table(&batch.segs, &plan, 0, &xo, &ff_o).expect("seg_table");
         assert_eq!(t.len(), batch.segs.len() * 5);
+        let strides = plan.strides().expect("strides");
         for (i, s) in batch.segs.iter().enumerate() {
             assert_eq!(t[i * 5], s.expert as u32);
             assert_eq!(t[i * 5 + 1], s.m);
+            let k = plan.expert_ids.binary_search(&s.expert).expect("配車にある");
+            assert_eq!(t[i * 5 + 2] as usize, k * strides[0]);
             assert_eq!(t[i * 5 + 3], xo[i]);
             assert_eq!(t[i * 5 + 4], ff_o[i]);
             // e_off / ff_off は m の累積 (segment の並び順)
