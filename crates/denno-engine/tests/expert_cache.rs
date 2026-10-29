@@ -1,4 +1,4 @@
-//! P-MOE-B2: expert 重みの SSD pread とスロットキャッシュのテスト。
+//! P-MOE-B2 / P38: expert 重みの SSD pread と常駐キャッシュのテスト。
 //!
 //! 実 GGUF は開かない。合成バイト列とテスト用 [`PreadAt`] 実装
 //! (`Vec<u8>` + 読み取り回数) で検証し、実ファイル経路は
@@ -6,6 +6,8 @@
 //! GPU / CUDA は通さない。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use denno_engine::kquant::GgmlType;
 use denno_engine::model::expert_cache::{
@@ -22,36 +24,51 @@ fn pat(n: usize) -> Vec<u8> {
 
 /// `Vec<u8>` をファイルに見立てるテスト用の口。
 ///
-/// 読み取り回数と読めたバイト数を数える。ファイル末尾を超えるオフセットでは
-/// `Ok(0)` (EOF) を返し、エラー化はキャッシュ側の責務に任せる。
+/// 読み取り回数と読めたバイト数を数える (`&self` なのでスレッドから共有できる)。
+/// ファイル末尾を超えるオフセットでは `Ok(0)` (EOF) を返し、エラー化は
+/// キャッシュ側の責務に任せる。
 struct Mem {
     data: Vec<u8>,
-    reads: usize,
-    bytes: u64,
+    reads: AtomicUsize,
+    bytes: AtomicU64,
     /// 1 回の pread で返す上限 (短読みの再現用)。既定は無制限。
     max_chunk: usize,
 }
 
 impl Mem {
     fn new(data: Vec<u8>) -> Self {
-        Mem { data, reads: 0, bytes: 0, max_chunk: usize::MAX }
+        Mem {
+            data,
+            reads: AtomicUsize::new(0),
+            bytes: AtomicU64::new(0),
+            max_chunk: usize::MAX,
+        }
     }
 
     fn short(data: Vec<u8>, max_chunk: usize) -> Self {
-        Mem { data, reads: 0, bytes: 0, max_chunk }
+        Mem {
+            data,
+            reads: AtomicUsize::new(0),
+            bytes: AtomicU64::new(0),
+            max_chunk,
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
     }
 }
 
 impl PreadAt for Mem {
-    fn pread_at(&mut self, off: u64, buf: &mut [u8]) -> anyhow::Result<usize> {
-        self.reads += 1;
+    fn pread_at(&self, off: u64, buf: &mut [u8]) -> anyhow::Result<usize> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
         let off = off as usize;
         if off >= self.data.len() {
             return Ok(0); // EOF
         }
         let n = buf.len().min(self.data.len() - off).min(self.max_chunk);
         buf[..n].copy_from_slice(&self.data[off..off + n]);
-        self.bytes += n as u64;
+        self.bytes.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
     }
 }
@@ -65,19 +82,18 @@ fn key(layer: u16, expert: u16) -> ExpertKey {
 #[test]
 fn miss_then_hit_returns_same_bytes_and_reads_once() {
     let data = pat(4096);
-    let mut src = Mem::new(data.clone());
-    let mut c = ExpertCache::new(2, 1024);
+    let src = Mem::new(data.clone());
+    let c = ExpertCache::new(2, 1024);
     let k = key(0, 1);
 
-    let a = c.get(k, 100, 512, &mut src).unwrap();
-    assert_eq!(a, &data[100..612], "未命中の戻り値がファイル内容と違う");
-    assert_eq!(src.reads, 1);
-    assert_eq!(src.bytes, 512);
+    let a = c.get(k, 100, 512, &src).unwrap();
+    assert_eq!(&a[..], &data[100..612], "未命中の戻り値がファイル内容と違う");
+    assert_eq!(src.reads(), 1);
+    assert_eq!(src.bytes.load(Ordering::Relaxed), 512);
 
-    let b = c.get(k, 100, 512, &mut src).unwrap();
-    assert_eq!(b, &data[100..612], "ヒットの戻り値が未命中時と違う");
-    assert_eq!(src.reads, 1, "ヒットなのに読み直している");
-    assert_eq!(src.bytes, 512);
+    let b = c.get(k, 100, 512, &src).unwrap();
+    assert_eq!(&b[..], &data[100..612], "ヒットの戻り値が未命中時と違う");
+    assert_eq!(src.reads(), 1, "ヒットなのに読み直している");
 
     let s = c.stats();
     assert_eq!((s.hits, s.misses, s.bytes_read, s.evictions), (1, 1, 512, 0));
@@ -86,12 +102,12 @@ fn miss_then_hit_returns_same_bytes_and_reads_once() {
 #[test]
 fn same_key_with_other_len_is_a_miss() {
     let data = pat(4096);
-    let mut src = Mem::new(data.clone());
-    let mut c = ExpertCache::new(1, 1024);
+    let src = Mem::new(data.clone());
+    let c = ExpertCache::new(1, 1024);
     let k = key(3, 7);
-    assert_eq!(c.get(k, 0, 256, &mut src).unwrap(), &data[0..256]);
-    assert_eq!(c.get(k, 0, 512, &mut src).unwrap(), &data[0..512]);
-    assert_eq!(src.reads, 2, "長さ違いをヒット扱いした");
+    assert_eq!(&c.get(k, 0, 256, &src).unwrap()[..], &data[0..256]);
+    assert_eq!(&c.get(k, 0, 512, &src).unwrap()[..], &data[0..512]);
+    assert_eq!(src.reads(), 2, "長さ違いをヒット扱いした");
 }
 
 // ---- 2. LRU の追い出し ---------------------------------------------------
@@ -99,26 +115,26 @@ fn same_key_with_other_len_is_a_miss() {
 #[test]
 fn lru_evicts_the_oldest_of_three_slots() {
     let data = pat(8192);
-    let mut src = Mem::new(data.clone());
-    let mut c = ExpertCache::new(3, 512);
+    let src = Mem::new(data.clone());
+    let c = ExpertCache::new(3, 512);
     for e in 0..3u16 {
-        c.get(key(0, e), (e as u64) * 512, 512, &mut src).unwrap();
+        c.get(key(0, e), (e as u64) * 512, 512, &src).unwrap();
     }
-    assert_eq!(src.reads, 3);
+    assert_eq!(src.reads(), 3);
     assert_eq!(c.stats().evictions, 0);
 
     // 4 種類目 → 最初の 1 つ (expert 0) が追い出される
-    c.get(key(0, 3), 3 * 512, 512, &mut src).unwrap();
-    assert_eq!(src.reads, 4);
+    c.get(key(0, 3), 3 * 512, 512, &src).unwrap();
+    assert_eq!(src.reads(), 4);
     assert_eq!(c.stats().evictions, 1);
 
     // 残っている expert 1 は読み直さない
-    assert_eq!(c.get(key(0, 1), 512, 512, &mut src).unwrap(), &data[512..1024]);
-    assert_eq!(src.reads, 4, "残っているはずの expert を読み直した");
+    assert_eq!(&c.get(key(0, 1), 512, 512, &src).unwrap()[..], &data[512..1024]);
+    assert_eq!(src.reads(), 4, "残っているはずの expert を読み直した");
 
     // 追い出された expert 0 を再要求すると読み取り回数が増える
-    assert_eq!(c.get(key(0, 0), 0, 512, &mut src).unwrap(), &data[0..512]);
-    assert_eq!(src.reads, 5, "追い出された expert がヒットした");
+    assert_eq!(&c.get(key(0, 0), 0, 512, &src).unwrap()[..], &data[0..512]);
+    assert_eq!(src.reads(), 5, "追い出された expert がヒットした");
     assert_eq!(c.stats().evictions, 2);
 }
 
@@ -126,58 +142,58 @@ fn lru_evicts_the_oldest_of_three_slots() {
 fn lru_order_follows_last_use_not_insertion() {
     // 0,1,2 を入れて 0 を触り直す → 追い出されるのは 1。
     let data = pat(8192);
-    let mut src = Mem::new(data.clone());
-    let mut c = ExpertCache::new(3, 512);
+    let src = Mem::new(data.clone());
+    let c = ExpertCache::new(3, 512);
     for e in 0..3u16 {
-        c.get(key(0, e), (e as u64) * 512, 512, &mut src).unwrap();
+        c.get(key(0, e), (e as u64) * 512, 512, &src).unwrap();
     }
-    c.get(key(0, 0), 0, 512, &mut src).unwrap();
-    c.get(key(0, 3), 3 * 512, 512, &mut src).unwrap();
+    c.get(key(0, 0), 0, 512, &src).unwrap();
+    c.get(key(0, 3), 3 * 512, 512, &src).unwrap();
     assert_eq!(c.stats().evictions, 1);
 
-    let reads = src.reads;
-    c.get(key(0, 0), 0, 512, &mut src).unwrap();
-    assert_eq!(src.reads, reads, "触り直した expert 0 が追い出された");
-    c.get(key(0, 1), 512, 512, &mut src).unwrap();
-    assert_eq!(src.reads, reads + 1, "最終使用が最も古い expert 1 が残っていた");
+    let reads = src.reads();
+    c.get(key(0, 0), 0, 512, &src).unwrap();
+    assert_eq!(src.reads(), reads, "触り直した expert 0 が追い出された");
+    c.get(key(0, 1), 512, 512, &src).unwrap();
+    assert_eq!(src.reads(), reads + 1, "最終使用が最も古い expert 1 が残っていた");
 }
 
 // ---- 3. エラー系 ---------------------------------------------------------
 
 #[test]
 fn len_over_slot_bytes_is_an_error() {
-    let mut src = Mem::new(pat(4096));
-    let mut c = ExpertCache::new(1, 1024);
-    assert!(c.get(key(0, 0), 0, 1025, &mut src).is_err(), "スロット超過が通った");
-    assert_eq!(src.reads, 0, "エラーなのに読んでいる");
+    let src = Mem::new(pat(4096));
+    let c = ExpertCache::new(1, 1024);
+    assert!(c.get(key(0, 0), 0, 1025, &src).is_err(), "スロット超過が通った");
+    assert_eq!(src.reads(), 0, "エラーなのに読んでいる");
     // 0 バイトも弾く
-    assert!(c.get(key(0, 0), 0, 0, &mut src).is_err());
+    assert!(c.get(key(0, 0), 0, 0, &src).is_err());
     // ちょうど slot_bytes は通る (境界)
-    assert_eq!(c.get(key(0, 0), 0, 1024, &mut src).unwrap().len(), 1024);
+    assert_eq!(c.get(key(0, 0), 0, 1024, &src).unwrap().len(), 1024);
 }
 
 #[test]
 fn out_of_range_offset_is_an_error() {
     let data = pat(4096);
-    let mut src = Mem::new(data.clone());
-    let mut c = ExpertCache::new(2, 1024);
+    let src = Mem::new(data.clone());
+    let c = ExpertCache::new(2, 1024);
     // 末尾をまたぐ (off + len > ファイル長)
-    assert!(c.get(key(0, 0), 4000, 512, &mut src).is_err(), "末尾超えが通った");
+    assert!(c.get(key(0, 0), 4000, 512, &src).is_err(), "末尾超えが通った");
     // 完全に外
-    assert!(c.get(key(0, 1), 99_999, 512, &mut src).is_err(), "範囲外が通った");
+    assert!(c.get(key(0, 1), 99_999, 512, &src).is_err(), "範囲外が通った");
     // off + len が u64 を溢れる
-    assert!(c.get(key(0, 0), u64::MAX - 8, 512, &mut src).is_err());
+    assert!(c.get(key(0, 0), u64::MAX - 8, 512, &src).is_err());
 }
 
 #[test]
 fn failed_read_does_not_leave_a_valid_slot() {
     let data = pat(4096);
-    let mut src = Mem::new(data.clone());
-    let mut c = ExpertCache::new(1, 1024);
+    let src = Mem::new(data.clone());
+    let c = ExpertCache::new(1, 1024);
     let k = key(1, 2);
-    assert!(c.get(k, 4000, 512, &mut src).is_err());
+    assert!(c.get(k, 4000, 512, &src).is_err());
     // 同じ鍵・同じ長さで正しい位置を要求 → ヒットしてはいけない
-    assert_eq!(c.get(k, 0, 512, &mut src).unwrap(), &data[0..512]);
+    assert_eq!(&c.get(k, 0, 512, &src).unwrap()[..], &data[0..512]);
     let s = c.stats();
     assert_eq!(s.hits, 0, "失敗した読みがヒットになった");
     assert_eq!(s.misses, 2);
@@ -187,9 +203,9 @@ fn failed_read_does_not_leave_a_valid_slot() {
 #[test]
 fn short_read_is_an_error() {
     // 要求より短く返す口 (trait 契約違反だが、キャッシュ側の門番を確かめる)。
-    let mut src = Mem::short(pat(4096), 256);
-    let mut c = ExpertCache::new(1, 1024);
-    assert!(c.get(key(0, 0), 0, 512, &mut src).is_err(), "短読みが通った");
+    let src = Mem::short(pat(4096), 256);
+    let c = ExpertCache::new(1, 1024);
+    assert!(c.get(key(0, 0), 0, 512, &src).is_err(), "短読みが通った");
 }
 
 // ---- 4. slots == 0 -------------------------------------------------------
@@ -197,19 +213,19 @@ fn short_read_is_an_error() {
 #[test]
 fn zero_slots_reads_every_time_but_values_are_right() {
     let data = pat(4096);
-    let mut src = Mem::new(data.clone());
-    let mut c = ExpertCache::new(0, 1024);
+    let src = Mem::new(data.clone());
+    let c = ExpertCache::new(0, 1024);
     assert_eq!(c.slots(), 0);
     let k = key(4, 9);
     for _ in 0..3 {
-        assert_eq!(c.get(k, 128, 512, &mut src).unwrap(), &data[128..640]);
+        assert_eq!(&c.get(k, 128, 512, &src).unwrap()[..], &data[128..640]);
     }
-    assert_eq!(src.reads, 3, "slots=0 なのに読み回数が 3 でない");
+    assert_eq!(src.reads(), 3, "slots=0 なのに読み回数が 3 でない");
     let s = c.stats();
     assert_eq!((s.hits, s.misses, s.evictions), (0, 3, 0));
     assert_eq!(s.bytes_read, 3 * 512);
-    // スロット超過は slots=0 でもエラー (scratch を無制限に伸ばさない)
-    assert!(c.get(k, 0, 1025, &mut src).is_err());
+    // スロット超過は slots=0 でもエラー (作業域を無制限に伸ばさない)
+    assert!(c.get(k, 0, 1025, &src).is_err());
 }
 
 // ---- 5. 統計 -------------------------------------------------------------
@@ -217,36 +233,44 @@ fn zero_slots_reads_every_time_but_values_are_right() {
 #[test]
 fn stats_are_exact_over_a_mixed_sequence() {
     let data = pat(8192);
-    let mut src = Mem::new(data.clone());
-    let mut c = ExpertCache::new(2, 512);
+    let src = Mem::new(data.clone());
+    let c = ExpertCache::new(2, 512);
     // 0:miss, 1:miss, 0:hit, 2:miss(evict 1), 0:hit, 1:miss(evict 2), 1:hit
-    for (e, off) in [(0u16, 0u64), (1, 512), (0, 0), (2, 1024), (0, 0), (1, 512), (1, 512)] {
-        c.get(key(0, e), off, 512, &mut src).unwrap();
+    for (e, off) in [
+        (0u16, 0u64),
+        (1, 512),
+        (0, 0),
+        (2, 1024),
+        (0, 0),
+        (1, 512),
+        (1, 512),
+    ] {
+        c.get(key(0, e), off, 512, &src).unwrap();
     }
     let s = c.stats();
     assert_eq!(s.hits, 3, "hits");
     assert_eq!(s.misses, 4, "misses");
     assert_eq!(s.evictions, 2, "evictions");
     assert_eq!(s.bytes_read, 4 * 512, "bytes_read");
-    assert_eq!(src.reads, 4, "実際の読み取り回数");
+    assert_eq!(src.reads(), 4, "実際の読み取り回数");
 }
 
 #[test]
 fn reset_stats_keeps_slots_warm() {
     let data = pat(4096);
-    let mut src = Mem::new(data.clone());
+    let src = Mem::new(data.clone());
     let mut c = ExpertCache::new(2, 1024);
     let k = key(0, 0);
-    c.get(k, 0, 512, &mut src).unwrap();
-    c.get(k, 0, 512, &mut src).unwrap();
+    c.get(k, 0, 512, &src).unwrap();
+    c.get(k, 0, 512, &src).unwrap();
     assert_eq!(c.stats().hits, 1);
 
     c.reset_stats();
     assert_eq!(c.stats(), CacheStats::default());
 
-    c.get(k, 0, 512, &mut src).unwrap();
+    c.get(k, 0, 512, &src).unwrap();
     assert_eq!(c.stats().hits, 1, "reset でスロットまで捨てた");
-    assert_eq!(src.reads, 1, "reset 後に読み直している");
+    assert_eq!(src.reads(), 1, "reset 後に読み直している");
 }
 
 // ---- 6. 定数 (前提の実測値) ---------------------------------------------
@@ -276,10 +300,35 @@ fn defaults_cover_the_largest_expert() {
 }
 
 #[test]
-fn cache_is_send() {
-    fn assert_send<T: Send>() {}
-    assert_send::<ExpertCache>();
-    assert_send::<FileReader>();
+fn cache_is_send_and_sync() {
+    // P38: rayon の worker から `&ExpertCache` を共有するので Sync が要る。
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ExpertCache>();
+    assert_send_sync::<FileReader>();
+}
+
+#[test]
+fn concurrent_readers_see_the_same_bytes() {
+    let data = pat(32 * 1024);
+    let src = Arc::new(Mem::new(data.clone()));
+    let c = Arc::new(ExpertCache::new(8, 8192));
+    // 8 スレッドが別々の鍵を引く (全ミス → 全ヒット)。
+    let mut hs = Vec::new();
+    for t in 0..8u16 {
+        let (c, src, want) = (c.clone(), src.clone(), data[0..8192].to_vec());
+        hs.push(std::thread::spawn(move || {
+            for _ in 0..20 {
+                let got = c.get(key(1, t), 0, 8192, src.as_ref()).unwrap();
+                assert_eq!(&got[..], &want[..], "スレッド {t}");
+            }
+        }));
+    }
+    for h in hs {
+        h.join().unwrap();
+    }
+    let s = c.stats();
+    assert_eq!(s.misses, 8, "各スレッドの初回だけミスするはず");
+    assert_eq!(s.hits, 8 * 19, "2 回目以降がヒットしていない");
 }
 
 // ---- 7. FileReader (実ファイル) -----------------------------------------
@@ -289,7 +338,7 @@ struct TempFile(PathBuf);
 
 impl TempFile {
     fn new(tag: &str, data: &[u8]) -> Self {
-        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::atomic::AtomicU32;
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
@@ -314,7 +363,7 @@ impl Drop for TempFile {
 fn file_reader_reads_exact_bytes_at_offset() {
     let data = pat(4096);
     let f = TempFile::new("read", &data);
-    let mut r = FileReader::open(f.path()).unwrap();
+    let r = FileReader::open(f.path()).unwrap();
 
     let mut buf = vec![0u8; 512];
     assert_eq!(r.pread_at(100, &mut buf).unwrap(), 512);
@@ -342,7 +391,7 @@ fn file_reader_reads_exact_bytes_at_offset() {
 fn file_reader_past_eof_is_an_error() {
     let data = pat(1024);
     let f = TempFile::new("eof", &data);
-    let mut r = FileReader::open(f.path()).unwrap();
+    let r = FileReader::open(f.path()).unwrap();
 
     // 完全に外
     let mut buf = vec![0u8; 64];
@@ -367,24 +416,24 @@ fn cache_over_file_reader_matches_file_bytes() {
     // 4 expert × 512 B を 2 スロットで回す (実ファイル経路の end-to-end)。
     let data = pat(2048);
     let f = TempFile::new("cache", &data);
-    let mut src = FileReader::open(f.path()).unwrap();
-    let mut c = ExpertCache::new(2, 512);
+    let src = FileReader::open(f.path()).unwrap();
+    let c = ExpertCache::new(2, 512);
 
     for e in 0..4u16 {
         let off = e as u64 * 512;
-        let got = c.get(key(5, e), off, 512, &mut src).unwrap();
-        assert_eq!(got, &data[e as usize * 512..(e as usize + 1) * 512], "expert {e}");
+        let got = c.get(key(5, e), off, 512, &src).unwrap();
+        assert_eq!(&got[..], &data[e as usize * 512..(e as usize + 1) * 512], "expert {e}");
     }
     let s = c.stats();
     assert_eq!((s.hits, s.misses, s.evictions), (0, 4, 2));
     assert_eq!(s.bytes_read, 4 * 512);
 
     // 直近 2 つは温まっている
-    assert_eq!(c.get(key(5, 3), 3 * 512, 512, &mut src).unwrap(), &data[1536..2048]);
-    assert_eq!(c.get(key(5, 2), 2 * 512, 512, &mut src).unwrap(), &data[1024..1536]);
+    assert_eq!(&c.get(key(5, 3), 3 * 512, 512, &src).unwrap()[..], &data[1536..2048]);
+    assert_eq!(&c.get(key(5, 2), 2 * 512, 512, &src).unwrap()[..], &data[1024..1536]);
     assert_eq!(c.stats().hits, 2);
     assert_eq!(c.stats().bytes_read, 4 * 512, "ヒットで読んでいる");
 
     // 範囲外はエラー
-    assert!(c.get(key(5, 9), 4096, 512, &mut src).is_err());
+    assert!(c.get(key(5, 9), 4096, 512, &src).is_err());
 }

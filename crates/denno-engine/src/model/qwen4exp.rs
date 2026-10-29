@@ -1840,8 +1840,18 @@ fn build_expert_caches_with_mb(
             .ok_or_else(|| one(format!("expert キャッシュ: パート {i} のパスが無い")))?;
         paths.push(p.to_path_buf());
     }
-    let set = ExpertCacheSet::from_mb(mb, [gate, up, down], &paths)
-        .map_err(|err| one(format!("expert キャッシュの構築に失敗: {err}")))?;
+    let set = ExpertCacheSet::from_mb_capped(
+        mb,
+        expert_cache::cap_bytes_from_env(),
+        [gate, up, down],
+        &paths,
+    )
+    .map_err(|err| one(format!("expert キャッシュの構築に失敗: {err}")))?;
+    // 総量上限 (`DENNO_EXPERT_CACHE_CAP_MB`) で全行列が 0 スロットになったら
+    // 「無効」と同じ扱いにする (mmap 経路のまま。毎回 pread する経路へは落とさない)。
+    if ExpertMatrix::ALL.iter().all(|&m| set.slots(m) == 0) {
+        return Ok(None);
+    }
     Ok(Some(set))
 }
 
@@ -2138,7 +2148,7 @@ impl Qwen4Exp {
         q4prof::add(&q4prof::MIX, t_mix);
         hook("hc_mixed_ffn", il, &cur)?;
         let t_moe = std::time::Instant::now();
-        let cur = moe_ffn_quant(&self.p, lw, &cur, self.expert_cache.as_mut())?;
+        let cur = moe_ffn_quant(&self.p, lw, &cur, self.expert_cache.as_ref())?;
         q4prof::add(&q4prof::MOE, t_moe);
         hook("ffn_out", il, &cur)?;
         *res = hyper::hc_combine(res, &cur, &inject, hp);
@@ -2307,7 +2317,7 @@ impl Qwen4Exp {
                 q4prof::add(&q4prof::MIX, t_mix);
                 let flat = flatten_rows(&curs, e)?;
                 let t_moe = std::time::Instant::now();
-                let ffn = moe_ffn_quant_batch(&self.p, lw, &flat, nt, self.expert_cache.as_mut())?;
+                let ffn = moe_ffn_quant_batch(&self.p, lw, &flat, nt, self.expert_cache.as_ref())?;
                 q4prof::add(&q4prof::MOE, t_moe);
                 if ffn.len() != nt * e {
                     return Err(one(format!(
@@ -2715,7 +2725,7 @@ fn moe_ffn_quant(
     p: &Qwen4ExpParams,
     lw: &LayerW,
     x: &[f32],
-    cache: Option<&mut ExpertCacheSet>,
+    cache: Option<&ExpertCacheSet>,
 ) -> Result<Vec<f32>> {
     moe_ffn_quant_with_par(p, lw, x, cache, moe_par_enabled())
 }
@@ -2740,7 +2750,7 @@ fn moe_ffn_quant_with_par(
     p: &Qwen4ExpParams,
     lw: &LayerW,
     x: &[f32],
-    cache: Option<&mut ExpertCacheSet>,
+    cache: Option<&ExpertCacheSet>,
     par: bool,
 ) -> Result<Vec<f32>> {
     let t_router = std::time::Instant::now();
@@ -2773,7 +2783,6 @@ fn moe_ffn_quant_with_par(
     //     1 トークンで 48 層 × 11 行列 × 921 KB を触るので、フォルト待ちが支配的になる。
     //     キャッシュ経路は pread で必要ぶんだけ読むので、mmap のページフォルトを
     //     先に起こす意味が無い (`prefetch()` 自体は無効化も変更もしない)。
-    let mut cache = cache;
     if cache.is_none() {
         for &ei in &sel {
             lw.gate_exps.prefetch(ei);
@@ -2788,11 +2797,12 @@ fn moe_ffn_quant_with_par(
     // ただし **重み付きの足し込みは index 昇順の逐次** のままにする (並列に足すと
     // 丸めの順序が変わる)。並列化するのは `h_e` の計算だけ。
     //
-    // キャッシュ経路 (`cache: Some`) は並列化しない: `ExpertCacheSet` が `&mut` で、
-    // スロットの取り合いを直列化する仕組みが無いため (従来どおりの逐次ループ)。
+    // P38: キャッシュ経路も並列化する。`ExpertCacheSet` は `&self` で共有でき、
+    // ヒットは `Arc` を clone するだけ・ミスの pread はロックの外なので、旧実装のように
+    // 「キャッシュを有効にすると 10 expert が逐次になる」ことがない。
     let mut out = vec![0.0f32; e];
     #[cfg(feature = "par")]
-    let parallel = par && cache.is_none() && sel.len() > 1;
+    let parallel = par && sel.len() > 1;
     #[cfg(not(feature = "par"))]
     let parallel = {
         // par 機能なしでは行並列も expert 並列も無い (従来と同じ逐次経路)。
@@ -2806,7 +2816,7 @@ fn moe_ffn_quant_with_par(
     if parallel {
         #[cfg(feature = "par")]
         {
-            let hs = expert_contribs_par(lw, &sel, x, e, ff)?;
+            let hs = expert_contribs_par(lw, &sel, x, e, ff, cache)?;
             for (t, &_ei) in sel.iter().enumerate() {
                 let pe = weights[t];
                 let hh = &hs[t];
@@ -2820,7 +2830,7 @@ fn moe_ffn_quant_with_par(
         let mut up = vec![0.0f32; ff];
         let mut h = vec![0.0f32; e];
         for (t, &ei) in sel.iter().enumerate() {
-            match cache.as_deref_mut() {
+            match cache {
                 // 従来経路: mmap のスライスを直接 GEMV する。
                 None => {
                     lw.gate_exps.gemv(ei, x, &mut act)?;
@@ -3287,6 +3297,30 @@ fn gemv_f32_blocked(
     }
 }
 
+/// `cuda` feature の有無で GPU GEMM の入口を切り替える (feature 無しは常に false)。
+///
+/// `gemv_batch` が `crate::cuda` を直接参照すると、既定ビルド (cuda なし) で
+/// `E0433` になる (cd23ec8fc 以降、`--lib` がコンパイルできなかった)。
+/// 入口をここに閉じ込めて、feature 無しでもこのファイルがコンパイルできるようにする。
+#[cfg(feature = "cuda")]
+fn gpu_gemm_into(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]) -> bool {
+    crate::cuda::maybe_gpu_gguf_gemm_into(
+        w.uid(),
+        w.ty(),
+        w.blocks().as_slice(),
+        w.k(),
+        w.n(),
+        xs,
+        nt,
+        outs,
+    )
+}
+
+#[cfg(not(feature = "cuda"))]
+fn gpu_gemm_into(_w: &GgufLinear, _xs: &[f32], _nt: usize, _outs: &mut [f32]) -> bool {
+    false
+}
+
 /// [`GgufLinear`] のバッチ GEMV (`nt` トークン × 1 行列)。
 ///
 /// 量子型は [`gemv_rows_batch`] (逐次版と同じカーネル)、
@@ -3309,16 +3343,7 @@ pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]
             // P-PF-GB: prefill のバッチ投影は GPU GEMM を先に試す。
             // 数値契約は prefill のみ解除済み (FMA 融合 + 加算順が違う)。
             // `DENNO_GPU_GEMM=0` で切れる。false なら CPU バッチへ落ちる。
-            if crate::cuda::maybe_gpu_gguf_gemm_into(
-                w.uid(),
-                w.ty(),
-                w.blocks().as_slice(),
-                k,
-                n,
-                xs,
-                nt,
-                outs,
-            ) {
+            if gpu_gemm_into(w, xs, nt, outs) {
                 #[cfg(test)]
                 GEMV_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(());
@@ -4232,7 +4257,7 @@ fn moe_ffn_quant_batch(
     lw: &LayerW,
     xs: &[f32],
     nt: usize,
-    cache: Option<&mut ExpertCacheSet>,
+    cache: Option<&ExpertCacheSet>,
 ) -> Result<Vec<f32>> {
     moe_ffn_quant_batch_with(p, lw, xs, nt, cache, moe_schedule())
 }
@@ -4244,7 +4269,7 @@ fn moe_ffn_quant_batch_with(
     lw: &LayerW,
     xs: &[f32],
     nt: usize,
-    cache: Option<&mut ExpertCacheSet>,
+    cache: Option<&ExpertCacheSet>,
     sched: MoeSchedule,
 ) -> Result<Vec<f32>> {
     moe_ffn_quant_batch_opts(p, lw, xs, nt, cache, sched, moe_expert::vnni_enabled())
@@ -4257,7 +4282,7 @@ fn moe_ffn_quant_batch_opts(
     lw: &LayerW,
     xs: &[f32],
     nt: usize,
-    cache: Option<&mut ExpertCacheSet>,
+    cache: Option<&ExpertCacheSet>,
     sched: MoeSchedule,
     vnni: bool,
 ) -> Result<Vec<f32>> {
@@ -4274,9 +4299,8 @@ fn moe_ffn_quant_batch_opts(
             xs.len()
         )));
     }
-    let mut cache = cache;
-    if let Some(c) = cache.as_deref_mut() {
-        let mut out = Vec::with_capacity(nt * e);
+    let mut out = Vec::with_capacity(nt * e);
+    if let Some(c) = cache {
         for t in 0..nt {
             out.extend_from_slice(&moe_ffn_quant(p, lw, &xs[t * e..(t + 1) * e], Some(c))?);
         }
@@ -4456,6 +4480,7 @@ fn expert_contribs_par(
     x: &[f32],
     e: usize,
     ff: usize,
+    cache: Option<&ExpertCacheSet>,
 ) -> Result<Vec<Vec<f32>>> {
     use rayon::prelude::*;
     sel.par_iter()
@@ -4463,13 +4488,53 @@ fn expert_contribs_par(
             let mut act = vec![0.0f32; ff];
             let mut up = vec![0.0f32; ff];
             let mut h = vec![0.0f32; e];
-            lw.gate_exps.gemv_seq(ei, x, &mut act)?;
-            silu_inplace(&mut act);
-            lw.up_exps.gemv_seq(ei, x, &mut up)?;
-            for r in 0..ff {
-                act[r] *= up[r];
+            match cache {
+                // 従来経路: mmap のスライスを直接 GEMV する (行並列なし)。
+                None => {
+                    lw.gate_exps.gemv_seq(ei, x, &mut act)?;
+                    silu_inplace(&mut act);
+                    lw.up_exps.gemv_seq(ei, x, &mut up)?;
+                    for r in 0..ff {
+                        act[r] *= up[r];
+                    }
+                    lw.down_exps.gemv_seq(ei, &act, &mut h)?;
+                }
+                // P38: 常駐キャッシュ経路。バイト列の出所だけが違い、GEMV の入口は
+                // mmap 経路の `gemv_seq` と同じ `expert_gemv_any_seq`。
+                Some(c) => {
+                    expert_gemv_cached_seq(
+                        c,
+                        ExpertMatrix::Gate,
+                        &lw.gate_exps,
+                        lw.il,
+                        ei,
+                        x,
+                        &mut act,
+                    )?;
+                    silu_inplace(&mut act);
+                    expert_gemv_cached_seq(
+                        c,
+                        ExpertMatrix::Up,
+                        &lw.up_exps,
+                        lw.il,
+                        ei,
+                        x,
+                        &mut up,
+                    )?;
+                    for r in 0..ff {
+                        act[r] *= up[r];
+                    }
+                    expert_gemv_cached_seq(
+                        c,
+                        ExpertMatrix::Down,
+                        &lw.down_exps,
+                        lw.il,
+                        ei,
+                        &act,
+                        &mut h,
+                    )?;
+                }
             }
-            lw.down_exps.gemv_seq(ei, &act, &mut h)?;
             #[cfg(test)]
             PAR_CONTRIB_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(h)
@@ -4483,7 +4548,7 @@ fn expert_contribs_par(
 /// 使う範囲は [`ExpertW::slice_abs`] = mmap 経路の [`ExpertW::slice`] と同じ
 /// [`ExpertSlice`] なので、2 経路が読むバイト列は同一になる。
 fn expert_gemv_cached(
-    c: &mut ExpertCacheSet,
+    c: &ExpertCacheSet,
     m: ExpertMatrix,
     w: &ExpertW,
     key: ExpertKey,
@@ -4494,13 +4559,47 @@ fn expert_gemv_cached(
     let bytes = c
         .get(m, w.file, key, off, len)
         .map_err(|err| one(format!("{}: expert {} (cache): {err}", w.name, key.expert)))?;
-    moe_expert::expert_gemv_any(w.ty, bytes, w.n_in, w.n_out, x, out)
+    moe_expert::expert_gemv_any(w.ty, &bytes, w.n_in, w.n_out, x, out)
         .map_err(|err| one(format!("{}: expert {} (cache): {err}", w.name, key.expert)))
+}
+
+/// [`expert_gemv_cached`] の**行並列なし**版 (expert 並列の内側で使う)。
+///
+/// mmap 経路の [`ExpertW::gemv_seq`] と同じ `expert_gemv_any_seq` を通るので、
+/// 同じバイト列・同じ `x` に対してビット一致する。
+fn expert_gemv_cached_seq(
+    c: &ExpertCacheSet,
+    m: ExpertMatrix,
+    w: &ExpertW,
+    layer: usize,
+    ei: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    let key = ExpertKey {
+        layer: layer as u16,
+        expert: ei as u16,
+    };
+    let (off, len) = w.slice_abs(ei)?;
+    let bytes = c
+        .get(m, w.file, key, off, len)
+        .map_err(|err| one(format!("{}: expert {ei} (cache): {err}", w.name)))?;
+    moe_expert::expert_gemv_any_seq(w.ty, &bytes, w.n_in, w.n_out, x, out)
+        .map_err(|err| one(format!("{}: expert {ei} (cache): {err}", w.name)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cuda` feature の有無で GPU GEMM を切る (無いビルドでは何もしない)。
+    ///
+    /// 既定ビルド (`--features cuda` なし) のテストが `crate::cuda` を直接
+    /// 参照していて、cd23ec8fc 以降 `--lib` のテストがコンパイルできなかった。
+    fn gpu_gemm_off() {
+        #[cfg(feature = "cuda")]
+        crate::cuda::set_gpu_gemm_enabled(false);
+    }
 
     #[test]
     fn ty_name_covers_manifest_types() {
@@ -4938,11 +5037,21 @@ mod tests {
 
         // 2. キャッシュ経路 (2 スロット)
         let lens = expert_lens(&lw);
-        let mut set =
+        let set =
             ExpertCacheSet::new_with_slots([2, 2, 2], lens, &[path.clone()], 2).expect("cache set");
         assert_eq!(set.slots(ExpertMatrix::Gate), 2, "スロット数が 2 でない");
-        let got = moe_ffn_quant(&p, &lw, &x, Some(&mut set)).expect("cache 経路");
+        let par0 = PAR_CONTRIB_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let got = moe_ffn_quant(&p, &lw, &x, Some(&set)).expect("cache 経路");
         assert_bitwise_eq(&want, &got, "mmap vs cache");
+        // P38: キャッシュ経路でも expert 並列の分岐が発動している。旧実装は
+        // `parallel = par && cache.is_none()` で、キャッシュを有効にすると
+        // 10 expert が逐次に落ちていた (並列化の喪失が cache 大敗の主因)。
+        #[cfg(feature = "par")]
+        assert_eq!(
+            PAR_CONTRIB_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            par0 + p.n_expert_used,
+            "キャッシュ経路が並列分岐に入っていない"
+        );
 
         // 3. 初回は全ミス (top-2 なので行列ごとに 2 回読む)
         for (k, &m) in ExpertMatrix::ALL.iter().enumerate() {
@@ -4955,7 +5064,7 @@ mod tests {
 
         // 4. 同じ x をもう一度 → 同じ expert が選ばれるのでヒット (ミスは増えない)
         let before: Vec<u64> = ExpertMatrix::ALL.iter().map(|&m| set.stats(m).misses).collect();
-        let again = moe_ffn_quant(&p, &lw, &x, Some(&mut set)).expect("cache 経路 2 回目");
+        let again = moe_ffn_quant(&p, &lw, &x, Some(&set)).expect("cache 経路 2 回目");
         assert_bitwise_eq(&want, &again, "mmap vs cache (2 回目)");
         for (k, &m) in ExpertMatrix::ALL.iter().enumerate() {
             let s = set.stats(m);
@@ -4982,7 +5091,7 @@ mod tests {
         }
 
         // 1 スロットで top-2 → 1 回の forward で必ず追い出しが起きる
-        moe_ffn_quant(&p, &lw, &x, Some(&mut set)).expect("1 回目");
+        moe_ffn_quant(&p, &lw, &x, Some(&set)).expect("1 回目");
         let first: Vec<(u64, u64)> = ExpertMatrix::ALL
             .iter()
             .map(|&m| (set.stats(m).misses, set.stats(m).evictions))
@@ -4995,7 +5104,7 @@ mod tests {
 
         // 2 回目も同じ expert を引くが、1 スロットなので前回の 2 個目しか残っていない
         // → 少なくとも 1 回は必ずミスし、追い出しが増える
-        moe_ffn_quant(&p, &lw, &x, Some(&mut set)).expect("2 回目");
+        moe_ffn_quant(&p, &lw, &x, Some(&set)).expect("2 回目");
         for (k, &m) in ExpertMatrix::ALL.iter().enumerate() {
             let s = set.stats(m);
             assert!(s.misses > first[k].0, "{m:?}: 2 回目でミスが増えていない");
@@ -5020,7 +5129,7 @@ mod tests {
         for m in ExpertMatrix::ALL {
             assert_eq!(set.slots(m), 0, "{m:?}: スロット数が 0 でない");
         }
-        let got = moe_ffn_quant(&p, &lw, &x, Some(&mut set)).expect("slots=0 経路");
+        let got = moe_ffn_quant(&p, &lw, &x, Some(&set)).expect("slots=0 経路");
         assert_bitwise_eq(&want, &got, "mmap vs slots=0");
         for (k, &m) in ExpertMatrix::ALL.iter().enumerate() {
             let s = set.stats(m);
@@ -5076,7 +5185,7 @@ mod tests {
 
         let mut set =
             ExpertCacheSet::new_with_slots([2, 2, 2], lens, &[path.clone()], 2).expect("cache set");
-        let err = moe_ffn_quant(&p, &lw, &x, Some(&mut set)).expect_err("切り詰めて通った");
+        let err = moe_ffn_quant(&p, &lw, &x, Some(&set)).expect_err("切り詰めて通った");
         assert!(
             err.to_string().contains("1 スロット"),
             "エラーがスロット超過でない: {err}"
@@ -5720,7 +5829,7 @@ mod tests {
         #[test]
         fn moe_ffn_batch_matches_seq() {
             // P-PF-GB: CPU 参照とのビット比較なので GPU GEMM を切る。
-            crate::cuda::set_gpu_gemm_enabled(false);
+            gpu_gemm_off();
             let _g = moe_test_guard();
             let dir = TempDir::new("h2moe");
             let path = write_expert_gguf(&dir);
@@ -5757,7 +5866,7 @@ mod tests {
         /// トークン 7 本・行 2 行・列 2 列があまる) の両方で確かめる。
         #[test]
         fn gemv_batch_f32_blocked_matches_gemv() {
-            crate::cuda::set_gpu_gemm_enabled(false);
+            gpu_gemm_off();
             let _g = moe_test_guard();
             for (k, n, nt) in [(2560usize, 512usize, 512usize), (2570, 6, 71)] {
                 let mut bytes = vec![0u8; n * k * 4];
@@ -5796,7 +5905,7 @@ mod tests {
         /// ルータ (`ffn_gate_inp`) がトークンブロック経路に入ることをカウンタで見る。
         #[test]
         fn moe_ffn_batch_long_matches_seq() {
-            crate::cuda::set_gpu_gemm_enabled(false);
+            gpu_gemm_off();
             let _g = moe_test_guard();
             let dir = TempDir::new("h2moe64");
             let path = write_expert_gguf(&dir);
@@ -5841,7 +5950,7 @@ mod tests {
         /// `m` は 1〜4 に散らばり、`m == 1` の expert と `m > 1` の expert の両方ができる。
         #[test]
         fn moe_flat_matches_legacy_bitwise() {
-            crate::cuda::set_gpu_gemm_enabled(false);
+            gpu_gemm_off();
             let _g = moe_test_guard();
             let dir = TempDir::new("h2flat");
             let path = write_expert_gguf(&dir);
@@ -5891,7 +6000,7 @@ mod tests {
         /// オペレーター指示でビット一致契約の外)。
         #[test]
         fn moe_flat_vnni_fires_and_matches_within_tolerance() {
-            crate::cuda::set_gpu_gemm_enabled(false);
+            gpu_gemm_off();
             let _g = moe_test_guard();
             if !moe_expert::vnni_supported() {
                 eprintln!("skip moe_flat_vnni_fires_and_matches_within_tolerance: avx512vnni が無い");
@@ -6034,7 +6143,7 @@ mod tests {
         #[test]
         #[ignore = "CPU のスケジュール A/B (実機の ms/token は main が測る)"]
         fn moe_flat_schedule_microbench() {
-            crate::cuda::set_gpu_gemm_enabled(false);
+            gpu_gemm_off();
             let _g = moe_test_guard();
             let (n_in, n_ff, ne, k) = (2560usize, 640usize, 86usize, 10usize);
             let dir = TempDir::new("h2bench");
@@ -6199,7 +6308,7 @@ mod tests {
         #[test]
         fn gemv_batch_matches_gemv_bitwise() {
             // P-PF-GB: CPU 参照とのビット比較なので GPU GEMM を切る (契約は prefill のみ解除)。
-            crate::cuda::set_gpu_gemm_enabled(false);
+            gpu_gemm_off();
             let dir = TempDir::new("h2gemv");
             let path = write_expert_gguf(&dir);
             let f = GgufFile::open(&path).expect("open");
@@ -6289,7 +6398,7 @@ mod tests {
         #[test]
         fn gemv_batch_all_quant_types_bitwise() {
             // P-PF-GB: CPU 参照とのビット比較なので GPU GEMM を切る (契約は prefill のみ解除)。
-            crate::cuda::set_gpu_gemm_enabled(false);
+            gpu_gemm_off();
             let dir = TempDir::new("h2q4gt");
             let types = [
                 GgmlType::Q8_0,
@@ -6385,7 +6494,7 @@ mod tests {
         #[ignore = "CPU のカーネル A/B (実機の ms/token は main が測る)"]
         fn gemv_batch_shape_ab() {
             // P-PF-GB: CPU 参照とのビット比較なので GPU GEMM を切る (契約は prefill のみ解除)。
-            crate::cuda::set_gpu_gemm_enabled(false);
+            gpu_gemm_off();
             use std::time::Instant;
             let nt = 64usize;
             // (名前, k, n) — qwen4exp の実形状 (n_embd 2560 / conv_dim 10240 /
@@ -6555,7 +6664,7 @@ mod tests {
         #[test]
         #[ignore = "CPU ルータのマイクロベンチ (実機の ms/token は main が測る)"]
         fn moe_router_microbench() {
-            crate::cuda::set_gpu_gemm_enabled(false);
+            gpu_gemm_off();
             let _g = moe_test_guard();
             let (nt, ne, n_in, k) = (512usize, 512usize, 2560usize, 10usize);
             let (gate, xs) = router_bench_inputs(nt, ne, n_in);
