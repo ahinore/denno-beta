@@ -642,6 +642,31 @@ pub fn budget_usage() -> Option<(usize, usize, usize)> {
     }
 }
 
+/// P54: いま VRAM に載っている expert の層別一覧 `(層, 昇順の expert index 列)`。
+///
+/// 層番号の昇順で返す。**載っていない層は含めない** (呼び出し側は
+/// 「送られてこない層 = 変化なし」として扱う)。VRAM 経路が無効/未初期化なら空。
+///
+/// ロックは 1 回だけ取る。中で写しを作ってすぐ離すので、推論スレッドを待たせない
+/// (`lru_keys` は 100 本程度の走査 + ソートしかしない)。
+pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
+    #[cfg(feature = "cuda")]
+    {
+        let mut out: Vec<(u16, Vec<u16>)> = Vec::new();
+        for k in gpu::resident_keys() {
+            match out.last_mut() {
+                Some((layer, v)) if *layer == k.layer => v.push(k.expert),
+                _ => out.push((k.layer, vec![k.expert])),
+            }
+        }
+        out
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Vec::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GPU 側 (feature = "cuda" のみ)
 // ---------------------------------------------------------------------------
@@ -758,6 +783,21 @@ mod gpu {
         let c = CACHE.get()?;
         let g = c.lock().ok()?;
         Some((g.used_bytes(), g.pinned_bytes(), g.cap_bytes()))
+    }
+
+    /// P54: いま載っている expert の鍵を `(層, expert)` 昇順で返す。
+    ///
+    /// 未初期化・ロック破損なら空 (テレメトリなので落とさない)。
+    pub fn resident_keys() -> Vec<ExpertKey> {
+        let Some(c) = CACHE.get() else {
+            return Vec::new();
+        };
+        let Ok(g) = c.lock() else {
+            return Vec::new();
+        };
+        let mut keys = g.lru_keys();
+        keys.sort_unstable_by_key(|k| (k.layer, k.expert));
+        keys
     }
 
     /// P43: LRU 管理外の常駐 (prefill のパック済み重み) を予算から借りる。

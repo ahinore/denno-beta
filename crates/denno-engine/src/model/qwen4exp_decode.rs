@@ -29,7 +29,7 @@
 //! は末尾 `n_gram` 個を反転してから `gather` に渡す (P-MOE-F7 で修正済み)。
 //! このモジュールは古い順のまま渡してよい。
 
-use crate::model::qwen4exp::{one, LayerOut, Qwen4Exp, Qwen4ExpError, TapTokens};
+use crate::model::qwen4exp::{one, LayerOut, Qwen4Exp, Qwen4ExpError, RoleRms, TapTokens};
 
 /// `qwen4exp.rs` と同じ「1 行 1 件」のエラー型を使う。
 type Result<T> = std::result::Result<T, Qwen4ExpError>;
@@ -111,20 +111,46 @@ impl Qwen4ExpDecoder {
         &self.cfg
     }
 
+    /// 層数 (P54: expert 在庫スナップショットの本数)。
+    pub fn n_layer(&self) -> usize {
+        self.model.n_layer()
+    }
+
+    /// P54: expert の置き場所の統計 `(RAM 常駐 expert 数, SSD 読みの累計)`。
+    pub fn expert_tier_stats(&self) -> (u32, u32) {
+        self.model.expert_tier_stats()
+    }
+
     /// 1 トークン進めて logits を返す。`tokens` の末尾に積む。
     ///
     /// `max_ctx` を超えるときは **積む前に** エラーを返す。forward が途中で
     /// 失敗した場合は `tokens` にそのトークンが残り、ssm / attention の状態は
     /// 進んだところまで進んでいる (その decoder は作り直すこと)。
     pub fn step(&mut self, token: u32) -> Result<Vec<f32>> {
-        self.step_inner(token, None)
+        self.step_inner(token, None, None)
     }
 
     /// 1 トークン進めて logits を返す。層の出口フック付き (P53)。
     ///
     /// `on_layer` は層ごとに 1 回、**層の出口 (ffn の `hc_combine` の後)** で
     /// 呼ばれる。読むだけなので logits は [`Self::step`] とビット一致する。
-    pub fn step_tapped<F>(&mut self, token: u32, mut on_layer: F) -> Result<Vec<f32>>
+    pub fn step_tapped<F>(&mut self, token: u32, on_layer: F) -> Result<Vec<f32>>
+    where
+        F: FnMut(&LayerOut<'_>),
+    {
+        self.step_tapped_roles(token, on_layer, None)
+    }
+
+    /// P54: 役割別 RMS も取る [`Self::step_tapped`]。
+    ///
+    /// `roles` が `Some` のときだけ層の中で RMS を取り、[`LayerOut::roles`] に載せる。
+    /// 読むだけなので logits は [`Self::step`] とビット一致する。
+    pub fn step_tapped_roles<F>(
+        &mut self,
+        token: u32,
+        mut on_layer: F,
+        roles: Option<&mut RoleRms>,
+    ) -> Result<Vec<f32>>
     where
         F: FnMut(&LayerOut<'_>),
     {
@@ -132,7 +158,7 @@ impl Qwen4ExpDecoder {
             on_layer(o);
             Ok(())
         };
-        self.step_inner(token, Some(&mut hook))
+        self.step_inner(token, Some(&mut hook), roles)
     }
 
     /// プロンプトを全部食わせて、最後の logits を返す。
@@ -178,7 +204,25 @@ impl Qwen4ExpDecoder {
         prompt: &[u32],
         batch: bool,
         tokens: TapTokens,
+        on_layer: F,
+    ) -> Result<Vec<f32>>
+    where
+        F: FnMut(&LayerOut<'_>),
+    {
+        self.prefill_batched_tapped_roles(prompt, batch, tokens, on_layer, None)
+    }
+
+    /// P54: 役割別 RMS も取る [`Self::prefill_batched_tapped`]。
+    ///
+    /// `roles` が `Some` のときだけ層の中で RMS を取る。観測するトークンは
+    /// `tokens` に従う (`TapTokens::Last` ならチャンク末尾だけ)。
+    pub fn prefill_batched_tapped_roles<F>(
+        &mut self,
+        prompt: &[u32],
+        batch: bool,
+        tokens: TapTokens,
         mut on_layer: F,
+        mut roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>>
     where
         F: FnMut(&LayerOut<'_>),
@@ -200,14 +244,14 @@ impl Qwen4ExpDecoder {
                         on_layer(o);
                         Ok(())
                     };
-                    logits = self.step_inner(t, Some(&mut hook))?;
+                    logits = self.step_inner(t, Some(&mut hook), roles.as_deref_mut())?;
                 } else {
-                    logits = self.step_inner(t, None)?;
+                    logits = self.step_inner(t, None, None)?;
                 }
             }
             return Ok(logits);
         }
-        let logits = self.model.forward_prefill_tapped(prompt, true, tokens, on_layer)?;
+        let logits = self.model.forward_prefill_tapped_roles(prompt, true, tokens, on_layer, roles)?;
         self.tokens.extend_from_slice(prompt);
         Ok(logits)
     }
@@ -303,7 +347,7 @@ impl Qwen4ExpDecoder {
         F: FnMut(usize, &[f32]) -> Result<()>,
     {
         let mut hook = |o: &LayerOut<'_>| -> Result<()> { on_layer(o.il, o.res) };
-        self.step_inner(token, Some(&mut hook))
+        self.step_inner(token, Some(&mut hook), None)
     }
 
     /// [`Qwen4ExpDecoder::step`] / [`Qwen4ExpDecoder::step_tapped`] の共通本体。
@@ -311,6 +355,7 @@ impl Qwen4ExpDecoder {
         &mut self,
         token: u32,
         on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+        roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>> {
         let max = self.cfg.max_ctx;
         if max == 0 {
@@ -333,7 +378,7 @@ impl Qwen4ExpDecoder {
         let start = self.tokens.len().saturating_sub(win);
         let ctx: Vec<u32> = self.tokens[start..].to_vec();
 
-        self.model.forward_token_at(&ctx, 0, 1, on_layer)
+        self.model.forward_token_at(&ctx, 0, 1, on_layer, roles)
     }
 }
 
