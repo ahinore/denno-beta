@@ -510,12 +510,6 @@ window.onLayerActivation = function (layer, idx, val) {
   promote(layer, sel);
   document.getElementById('mode').textContent = 'mode: live (telemetry)';
 };
-window.onRouting = function (layer, experts) {   // 実際の top-10
-  const s = slabs[layer]; if (!s) return;
-  s.route = experts.slice(0, TOPK);
-  for (const k of s.route) s.used[k] = 1;
-  demo.cursor = layer;
-};
 window.onResidency = function (layer, inVram) {
   const s = slabs[layer]; if (!s) return;
   const set = new Set(inVram);

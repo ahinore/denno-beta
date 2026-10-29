@@ -259,12 +259,12 @@ function decodePayload(kind, r) {
       return { kind: 'ExpertResidency', layer, vram: idx };
     }
     case KIND.ROUTER_TOPK: {
-      const layer = rd.varint();
-      const n = rd.varint();
+      const layer = r.u32();
+      const n = r.u32();
       const experts = new Array(n);
-      for (let i = 0; i < n; i++) experts[i] = rd.varint();
+      for (let i = 0; i < n; i++) experts[i] = r.u32();
       const weights = new Array(n);
-      for (let i = 0; i < n; i++) weights[i] = rd.f16();
+      for (let i = 0; i < n; i++) weights[i] = f16ToF32(r.f16());
       return { kind: 'RouterTopK', layer, experts, weights };
     }
     case KIND.TIER_STATS:
