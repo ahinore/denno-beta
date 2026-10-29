@@ -1,6 +1,7 @@
 //! モデルファミリー抽象とディスパッチ
 
 pub mod expert_cache;
+pub mod expert_vram;
 pub mod gpt2;
 pub mod hyper;
 pub mod indexer;

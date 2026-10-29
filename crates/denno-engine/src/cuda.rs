@@ -1306,6 +1306,47 @@ impl CudaCtx {
         Ok(true)
     }
 
+    /// P39: expert の VRAM 常駐 GEMV 用の口。`shared_ctx` を隠したまま
+    /// 既に VRAM にある `DevBuffer` 1 本で GEMV する。
+    ///
+    /// `weights_for_gguf` (dense の uid 登録簿) は**通さない**ので、常駐の
+    /// 置き場所が 2 か所に分かれることはない。
+    ///
+    /// `Ok(false)` は「この型・この環境では GPU で回せない」。呼び出し側は
+    /// CPU へ落ちること (fail closed)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_gemv_dev_buf(
+        ty: crate::kquant::GgmlType,
+        dev_w: &DevBuffer,
+        x: &[f32],
+        n_in: usize,
+        n_out: usize,
+        out: &mut [f32],
+    ) -> Result<bool> {
+        let Some(ctx) = shared_ctx() else {
+            return Ok(false);
+        };
+        if let Err(e) = ctx.make_current() {
+            tracing::error!("CUDA cuCtxSetCurrent failed (expert gemv): {e:#}");
+            GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Ok(false);
+        }
+        ctx.moe_gemv_dev(ty, dev_w, x, n_in, n_out, out)
+    }
+
+    /// P39: expert を VRAM に載せてよいか (カーネルと型が対応しているか)。
+    ///
+    /// 載せてから `false` で落ちると VRAM が無駄に埋まるので、**載せる前**に
+    /// これを確かめる。`DENNO_CUDA` が無効なら false。
+    pub fn moe_gemv_dev_ready(ty: crate::kquant::GgmlType, k: usize) -> bool {
+        if !cuda_enabled() || gguf_row_bytes(ty, k).is_none() {
+            return false;
+        }
+        shared_ctx()
+            .map(|c| c.f_moe.is_some())
+            .unwrap_or(false)
+    }
+
     /// P-PF-GB: prefill 用の量子 GEMM (nt トークン一括, `kernels_gemm.ptx`)。
     ///
     /// 数値契約は **解除済み** (2026-10-28 のオペレーター指示)。`-fmad=true` で
