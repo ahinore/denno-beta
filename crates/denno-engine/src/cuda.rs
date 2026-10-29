@@ -1736,6 +1736,10 @@ struct GroupedScratch {
     key: u64,
     packed: Option<DevBuffer>,
     packed_len: usize,
+    /// P43: パック済み重みが予算から借りている分 (drop で返る)。
+    reserved: Option<crate::model::expert_vram::ExternalReserve>,
+    /// P43: この呼び出しで予算が足りず載せられなかった (呼び出し側は CPU へ)
+    denied: bool,
     seg: Option<DevBuffer>,
     x: Option<DevBuffer>,
     act: Option<DevBuffer>,
@@ -1748,6 +1752,8 @@ impl GroupedScratch {
             key: u64::MAX,
             packed: None,
             packed_len: 0,
+            reserved: None,
+            denied: false,
             seg: None,
             x: None,
             act: None,
@@ -1869,11 +1875,37 @@ pub fn moe_grouped_gemm_layer(
     let mut out_buf: Option<Vec<f32>> = None;
     GROUPED_SCRATCH.with(|cell| -> Result<()> {
         let mut sc = cell.borrow_mut();
+        sc.denied = false;
         // 1. パック済み重み (層が変わったら作り直す)
+        //
+        // P43: 確保の前に予算 (`DENNO_EXPERT_VRAM_MB`) から借りる。借りるために
+        // LRU の expert は追い出される。予算が無いときは会計なしで素通りするので
+        // 既定の挙動は変わらない。入れないときは CPU へ落とす (fail closed)。
         if sc.key != key || sc.packed_len != packed.len() || sc.packed.is_none() {
-            sc.packed = Some(DevBuffer::alloc(packed.len().max(1))?);
-            sc.key = key;
-            sc.packed_len = packed.len();
+            // 先に手放してから借りる (手放した分がそのまま予約に回る)。
+            sc.packed = None;
+            sc.reserved = None;
+            match crate::model::expert_vram::reserve_external(packed.len()) {
+                Some(r) => {
+                    sc.packed = Some(DevBuffer::alloc(packed.len().max(1))?);
+                    sc.reserved = Some(r);
+                    sc.key = key;
+                    sc.packed_len = packed.len();
+                }
+                None => {
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!(
+                            "[moe-grouped] パック済み {} MiB が expert の VRAM 予算に載らない \
+                             (DENNO_EXPERT_VRAM_MB) → この層は CPU へ",
+                            packed.len() >> 20
+                        );
+                    }
+                    sc.denied = true;
+                    return Ok(());
+                }
+            }
         }
         {
             let pb = sc.packed.as_ref().expect("確保済み");
@@ -1962,10 +1994,384 @@ pub fn moe_grouped_gemm_layer(
         }
         out_buf = Some(h_buf.to_vec::<f32>(n_h)?);
         dbg_d2h(n_h * 4);
+        // P43: 予算下では層の終わりに手放す。予算 (`DENNO_EXPERT_VRAM_MB`) は
+        // decode の LRU と共有なので、prefill が持ち回ると decode が載せられない
+        // (P39 の実測: 10,372 MiB で cuMemAlloc 失敗)。予算が無いときは従来どおり
+        // 持ち回る (同じ層をもう一度呼ぶときに H2D を省く)。
+        if sc.reserved.as_ref().map(|r| r.is_guarded()).unwrap_or(false) {
+            sc.packed = None;
+            sc.reserved = None;
+        }
         Ok(())
     })?;
-    let got = out_buf.expect("スクラッチで必ず埋まる");
+    let Some(got) = out_buf else {
+        // P43: 予算が埋まっていてパック済み重みを載せられなかった → CPU へ。
+        return Ok(false);
+    };
     h.copy_from_slice(&got);
+    Ok(true)
+}
+
+// ===========================================================================
+// P43: 層一括 expert GEMV (decode) — `kernels_moe_batch.cu`
+// ===========================================================================
+//
+// decode の expert FFN は 1 トークン = 480 expert x 3 行列 = 1,440 起動 +
+// 1,440 同期だった (実測 382 ms/token の主因。CPU は 189 ms/token)。
+// 1 層ぶん (top-k = 10 expert) を segment 表 + デバイスポインタ表でまとめ、
+// **gate 1 + up 1 + down 1 = 3 起動 / 2 同期**にする。
+//
+// 数値: 1 行の累積は `kernels_moe.cu` と同じ「1 スレッドが i の昇順に f32 で
+// 加算」。同じ expert・同じ入力なら per-expert 版とビット一致する。gate と up は
+// 同じ同期で受け取り、ホストで `silu(g) * u` を作る (これも per-expert 版の
+// `silu_inplace` + 積と同じ式・同じ順)。したがって寄与 h は 10 回起動版と
+// 1 ビットも変わらない。
+//
+// PTX は起動時に 1 回だけファイルから読む (`DENNO_MOE_BATCH_PTX` で差し替え可)。
+// 読めなければ `false` を返して呼び出し側は per-expert 経路へ落ちる (fail closed)。
+
+/// カーネル (PTX を起動時に 1 回だけ読む)。
+struct MoeBatchKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    /// Q8_0 / Q5_1 / Q4_K / Q5_K の 4 本
+    fns: [CUfunction; 4],
+}
+
+// 生ハンドル (context / module / function)。CudaCtx と同じ規約。
+unsafe impl Send for MoeBatchKernels {}
+unsafe impl Sync for MoeBatchKernels {}
+
+static MOE_BATCH_KERNELS: OnceLock<Option<MoeBatchKernels>> = OnceLock::new();
+
+/// カーネル名 (添字は [`moe_batch_slot`] の順)。
+const MOE_BATCH_NAMES: [&[u8]; 4] = [
+    b"dno_moe_gemv_seg_q8_0\0",
+    b"dno_moe_gemv_seg_q5_1\0",
+    b"dno_moe_gemv_seg_q4k\0",
+    b"dno_moe_gemv_seg_q5k\0",
+];
+
+/// 型 → カーネル添字。未対応は `None` (呼び出し側は CPU へ)。
+fn moe_batch_slot(ty: crate::kquant::GgmlType) -> Option<usize> {
+    use crate::kquant::GgmlType as T;
+    match ty {
+        T::Q8_0 => Some(0),
+        T::Q5_1 => Some(1),
+        T::Q4K => Some(2),
+        T::Q5K => Some(3),
+        _ => None,
+    }
+}
+
+/// PTX の置き場所。`DENNO_MOE_BATCH_PTX` があればそれ、無ければクレート配下
+/// `kernels/kernels_moe_batch.ptx`。
+fn moe_batch_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MOE_BATCH_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_moe_batch.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None をキャッシュする
+/// (grouped と同じ扱い = 二度と試さない)。
+fn moe_batch_kernels() -> Option<&'static MoeBatchKernels> {
+    MOE_BATCH_KERNELS
+        .get_or_init(|| {
+            let path = moe_batch_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[moe-batch] PTX が読めない ({}) : {e} → per-expert 経路へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0); // cuModuleLoadData は NUL 終端の PTX を期待する
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[moe-batch] cuModuleLoadData 失敗 → per-expert 経路へ");
+                    return None;
+                }
+            }
+            let mut fns: [CUfunction; 4] = [std::ptr::null_mut(); 4];
+            for (i, name) in MOE_BATCH_NAMES.iter().enumerate() {
+                unsafe {
+                    if (lib.module_get_function)(&mut fns[i], module, name.as_ptr() as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!(
+                            "[moe-batch] PTX に {} が無い → per-expert 経路へ",
+                            String::from_utf8_lossy(&name[..name.len() - 1])
+                        );
+                        return None;
+                    }
+                }
+            }
+            Some(MoeBatchKernels { module, fns })
+        })
+        .as_ref()
+}
+
+/// 層一括 GEMV が使えるか (`false` なら呼び出し側は per-expert 経路へ)。
+///
+/// `DENNO_CUDA` 無効・未対応の型・PTX 不在のいずれでも false。**載せる前**の
+/// 判定に使う (載せてから落ちると VRAM が無駄に埋まる)。
+pub fn moe_gemv_seg_ready(ty: crate::kquant::GgmlType, k: usize) -> bool {
+    if !cuda_enabled() || gguf_row_bytes(ty, k).is_none() {
+        return false;
+    }
+    moe_batch_slot(ty).is_some() && moe_batch_kernels().is_some()
+}
+
+/// 1 層ぶんの行列 1 本 (segment 表と組み合わせて 1 起動になる)。
+struct SegJob<'a> {
+    ty: crate::kquant::GgmlType,
+    /// segment ごとの重み先頭 (デバイスアドレス)。長さ = nseg。
+    wptrs: &'a [u64],
+    n_in: usize,
+    n_out: usize,
+    row_bytes: usize,
+    out: &'a mut [f32],
+}
+
+/// スレッド局所のスクラッチ (grow-only)。`MoeScratch` と同じ規約。
+struct SegScratch {
+    /// segment ごとの重みポインタ表 (デバイス)
+    ptr: [Option<DevBuffer>; 2],
+    /// segment 表 (4 語 x nseg)
+    seg: Option<DevBuffer>,
+    /// 入力 (segment の x_off を足して読む)
+    x: Option<DevBuffer>,
+    /// 出力 (segment の out_off を足して書く)
+    out: [Option<DevBuffer>; 2],
+}
+
+impl SegScratch {
+    fn new() -> Self {
+        SegScratch {
+            ptr: [None, None],
+            seg: None,
+            x: None,
+            out: [None, None],
+        }
+    }
+}
+
+thread_local! {
+    static SEG_SCRATCH: std::cell::RefCell<SegScratch> =
+        std::cell::RefCell::new(SegScratch::new());
+}
+
+/// 1 回の同期で終わる層一括 GEMV。`jobs` は 1 本か 2 本 (gate, up)。
+///
+/// 前提 (呼び出し側が検査済み): 全 job が同じ `n_out` / `row_bytes` / segment 表。
+/// 発行順は job の並び順で、**同期は最後に 1 回だけ**。
+fn moe_gemv_seg_run(jobs: &mut [SegJob<'_>], seg: &[u32], m_max: usize, x: &[f32]) -> Result<()> {
+    if jobs.is_empty() || jobs.len() > 2 {
+        bail!("moe_gemv_seg_run: job 数 {} が 1..=2 でない", jobs.len());
+    }
+    if !seg.len().is_multiple_of(4) {
+        bail!("moe_gemv_seg_run: segment 表の長さ {} が 4 の倍数でない", seg.len());
+    }
+    let nseg = seg.len() / 4;
+    let (n_out, row_bytes) = (jobs[0].n_out, jobs[0].row_bytes);
+    for (i, j) in jobs.iter().enumerate() {
+        if j.n_out != n_out || j.row_bytes != row_bytes {
+            bail!(
+                "moe_gemv_seg_run: job {i} の形が揃っていない (n_out={}/{n_out}, row_bytes={}/{row_bytes})",
+                j.n_out,
+                j.row_bytes
+            );
+        }
+        if j.wptrs.len() != nseg {
+            bail!(
+                "moe_gemv_seg_run: job {i} のポインタ表 {} が segment 数 {nseg} と違う",
+                j.wptrs.len()
+            );
+        }
+        let (mx, mo) = crate::model::expert_batch::seg_extents(seg, j.n_in, j.n_out)?;
+        if x.len() < mx {
+            bail!(
+                "moe_gemv_seg_run: job {i} の入力長 {} が segment の最大 x 範囲 {mx} より短い",
+                x.len()
+            );
+        }
+        if j.out.len() < mo {
+            bail!(
+                "moe_gemv_seg_run: job {i} の出力長 {} が segment の最大 out 範囲 {mo} より短い",
+                j.out.len()
+            );
+        }
+    }
+    let Some(plan) = crate::model::expert_batch::seg_launch_plan(nseg, m_max, n_out, row_bytes) else {
+        bail!("moe_gemv_seg_run: 起動形が作れない (nseg={nseg}, m_max={m_max}, n_out={n_out})");
+    };
+    let Some(ctx) = shared_ctx() else {
+        bail!("moe_gemv_seg_run: CUDA コンテキストが無い");
+    };
+    ctx.make_current()?;
+    let Some(kernels) = moe_batch_kernels() else {
+        bail!("moe_gemv_seg_run: カーネルが無い");
+    };
+
+    SEG_SCRATCH.with(|cell| -> Result<()> {
+        let mut sc = cell.borrow_mut();
+        // 1. ポインタ表 / segment 表 / 入力 (すべて起動より前に H2D)
+        for (i, job) in jobs.iter().enumerate() {
+            MoeScratch::ensure(&mut sc.ptr[i], job.wptrs.len() * 8)?;
+            let pb = sc.ptr[i].as_ref().expect("確保済み");
+            pb.copy_from(job.wptrs)?;
+            dbg_htod(job.wptrs.len() * 8);
+        }
+        MoeScratch::ensure(&mut sc.seg, seg.len() * 4)?;
+        MoeScratch::ensure(&mut sc.x, x.len() * 4)?;
+        {
+            let sb = sc.seg.as_ref().expect("確保済み");
+            sb.copy_from(seg)?;
+            dbg_htod(seg.len() * 4);
+            let xb = sc.x.as_ref().expect("確保済み");
+            xb.copy_from(x)?;
+            dbg_htod(x.len() * 4);
+        }
+        for (i, job) in jobs.iter().enumerate() {
+            MoeScratch::ensure(&mut sc.out[i], job.out.len() * 4)?;
+        }
+        // 2. 起動 (job ごと。まだ同期しない)
+        let seg_buf = sc.seg.as_ref().expect("確保済み");
+        let x_buf = sc.x.as_ref().expect("確保済み");
+        unsafe {
+            for (i, job) in jobs.iter().enumerate() {
+                let slot = moe_batch_slot(job.ty)
+                    .ok_or_else(|| anyhow::anyhow!("未対応の量子型 {:?}", job.ty))?;
+                let mut pw = sc.ptr[i].as_ref().expect("確保済み").ptr;
+                let mut px = x_buf.ptr;
+                let mut po = sc.out[i].as_ref().expect("確保済み").ptr;
+                let mut ps = seg_buf.ptr;
+                let (mut ns, mut ni, mut no, mut rb) = (
+                    nseg as c_int,
+                    job.n_in as c_int,
+                    job.n_out as c_int,
+                    job.row_bytes as c_int,
+                );
+                let mut args = [
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut px as *mut _ as *mut c_void,
+                    &mut po as *mut _ as *mut c_void,
+                    &mut ps as *mut _ as *mut c_void,
+                    &mut ns as *mut _ as *mut c_void,
+                    &mut ni as *mut _ as *mut c_void,
+                    &mut no as *mut _ as *mut c_void,
+                    &mut rb as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(
+                    kernels.fns[slot],
+                    plan.grid,
+                    plan.block,
+                    plan.smem,
+                    &mut args,
+                )?;
+            }
+            // 3. 同期は 1 回だけ (gate と up が同じ同期で終わる)
+            ctx.sync()?;
+        }
+        // 4. D2H
+        for (i, job) in jobs.iter_mut().enumerate() {
+            let got: Vec<f32> = sc.out[i].as_ref().expect("確保済み").to_vec(job.out.len())?;
+            dbg_d2h(job.out.len() * 4);
+            job.out.copy_from_slice(&got);
+        }
+        Ok(())
+    })
+}
+
+/// gate と up を **2 起動 + 1 同期**で回し、両方の出力を返す (P43)。
+///
+/// `seg` は gate/up 用 (全 segment が同じ入力 x を読むので `x_off = 0`)。
+/// `Ok(false)` は「GPU でやらなかった」= 呼び出し側は per-expert 経路へ。
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gemv_seg_pair(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    wptrs_g: &[u64],
+    wptrs_u: &[u64],
+    seg: &[u32],
+    m_max: usize,
+    x: &[f32],
+    n_in: usize,
+    n_out: usize,
+    out_g: &mut [f32],
+    out_u: &mut [f32],
+) -> Result<bool> {
+    let (Some(rb_g), Some(rb_u)) = (gguf_row_bytes(ty_g, n_in), gguf_row_bytes(ty_u, n_in)) else {
+        return Ok(false);
+    };
+    if rb_g != rb_u || moe_batch_slot(ty_g).is_none() || moe_batch_slot(ty_u).is_none() {
+        return Ok(false);
+    }
+    if !moe_gemv_seg_ready(ty_g, n_in) || !moe_gemv_seg_ready(ty_u, n_in) {
+        return Ok(false);
+    }
+    let mut jobs = [
+        SegJob {
+            ty: ty_g,
+            wptrs: wptrs_g,
+            n_in,
+            n_out,
+            row_bytes: rb_g,
+            out: out_g,
+        },
+        SegJob {
+            ty: ty_u,
+            wptrs: wptrs_u,
+            n_in,
+            n_out,
+            row_bytes: rb_u,
+            out: out_u,
+        },
+    ];
+    moe_gemv_seg_run(&mut jobs, seg, m_max, x)?;
+    Ok(true)
+}
+
+/// 1 本だけ (down) を **1 起動 + 1 同期**で回す (P43)。
+///
+/// `seg` は down 用 (`x_off = s * n_in`, `out_off = s * n_out`)。
+/// `Ok(false)` は「GPU でやらなかった」= 呼び出し側は per-expert 経路へ。
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gemv_seg_one(
+    ty: crate::kquant::GgmlType,
+    wptrs: &[u64],
+    seg: &[u32],
+    m_max: usize,
+    x: &[f32],
+    n_in: usize,
+    n_out: usize,
+    out: &mut [f32],
+) -> Result<bool> {
+    let Some(rb) = gguf_row_bytes(ty, n_in) else {
+        return Ok(false);
+    };
+    if moe_batch_slot(ty).is_none() || !moe_gemv_seg_ready(ty, n_in) {
+        return Ok(false);
+    }
+    let mut jobs = [SegJob {
+        ty,
+        wptrs,
+        n_in,
+        n_out,
+        row_bytes: rb,
+        out,
+    }];
+    moe_gemv_seg_run(&mut jobs, seg, m_max, x)?;
     Ok(true)
 }
 

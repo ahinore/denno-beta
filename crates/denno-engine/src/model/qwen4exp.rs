@@ -2903,50 +2903,70 @@ fn moe_ffn_quant_with(
         let mut act = vec![0.0f32; ff];
         let mut up = vec![0.0f32; ff];
         let mut h = vec![0.0f32; e];
-        for (t, &ei) in sel.iter().enumerate() {
-            // P39: VRAM 常駐経路。載らない/未対応なら `false` が返るので CPU へ落ちる。
-            #[cfg(feature = "cuda")]
-            let gpu_done = if use_gpu {
-                moe_expert_gpu(lw, ei, x, &mut act, &mut up, &mut h)?
-            } else {
-                false
-            };
-            #[cfg(not(feature = "cuda"))]
-            let gpu_done = false;
-
-            if !gpu_done {
-                match cache {
-                    // 従来経路: mmap のスライスを直接 GEMV する。
-                    None => {
-                        lw.gate_exps.gemv(ei, x, &mut act)?;
-                        silu_inplace(&mut act);
-                        lw.up_exps.gemv(ei, x, &mut up)?;
-                        for r in 0..ff {
-                            act[r] *= up[r];
-                        }
-                        lw.down_exps.gemv(ei, &act, &mut h)?;
-                    }
-                    // P-MOE-G1: SSD pread + LRU スロット経路。同じ expert は読み直さない。
-                    Some(c) => {
-                        let key = ExpertKey {
-                            layer: lw.il as u16,
-                            expert: ei as u16,
-                        };
-                        expert_gemv_cached(c, ExpertMatrix::Gate, &lw.gate_exps, key, x, &mut act)?;
-                        silu_inplace(&mut act);
-                        expert_gemv_cached(c, ExpertMatrix::Up, &lw.up_exps, key, x, &mut up)?;
-                        for r in 0..ff {
-                            act[r] *= up[r];
-                        }
-                        expert_gemv_cached(c, ExpertMatrix::Down, &lw.down_exps, key, &act, &mut h)?;
-                    }
+        // P43: まず層一括経路 (gate 1 + up 1 + down 1 = 3 起動 / 2 同期) を試す。
+        // `Some(hs)` は「選択 expert 全員の寄与が揃った」という意味で、そのときは
+        // per-expert のループを回さない。足し込みは下の per-expert 経路と同一の
+        // 「index 昇順の逐次」なので、丸めの順序は変わらない。
+        let batched = if use_gpu {
+            moe_experts_gpu_batched(lw, &sel, x, e, ff)?
+        } else {
+            None
+        };
+        if let Some(hs) = batched {
+            debug_assert_eq!(hs.len(), sel.len(), "寄与の本数が選択 expert と違う");
+            for (t, _) in sel.iter().enumerate() {
+                let pe = weights[t];
+                let hh = &hs[t];
+                for j in 0..e {
+                    out[j] += pe * hh[j];
                 }
-            } else {
-                debug_assert!(use_gpu, "GPU 経路が use_gpu=false で走った");
             }
-            let pe = weights[t];
-            for j in 0..e {
-                out[j] += pe * h[j];
+        } else {
+            for (t, &ei) in sel.iter().enumerate() {
+                // P39: VRAM 常駐経路。載らない/未対応なら `false` が返るので CPU へ落ちる。
+                #[cfg(feature = "cuda")]
+                let gpu_done = if use_gpu {
+                    moe_expert_gpu(lw, ei, x, &mut act, &mut up, &mut h)?
+                } else {
+                    false
+                };
+                #[cfg(not(feature = "cuda"))]
+                let gpu_done = false;
+
+                if !gpu_done {
+                    match cache {
+                        // 従来経路: mmap のスライスを直接 GEMV する。
+                        None => {
+                            lw.gate_exps.gemv(ei, x, &mut act)?;
+                            silu_inplace(&mut act);
+                            lw.up_exps.gemv(ei, x, &mut up)?;
+                            for r in 0..ff {
+                                act[r] *= up[r];
+                            }
+                            lw.down_exps.gemv(ei, &act, &mut h)?;
+                        }
+                        // P-MOE-G1: SSD pread + LRU スロット経路。同じ expert は読み直さない。
+                        Some(c) => {
+                            let key = ExpertKey {
+                                layer: lw.il as u16,
+                                expert: ei as u16,
+                            };
+                            expert_gemv_cached(c, ExpertMatrix::Gate, &lw.gate_exps, key, x, &mut act)?;
+                            silu_inplace(&mut act);
+                            expert_gemv_cached(c, ExpertMatrix::Up, &lw.up_exps, key, x, &mut up)?;
+                            for r in 0..ff {
+                                act[r] *= up[r];
+                            }
+                            expert_gemv_cached(c, ExpertMatrix::Down, &lw.down_exps, key, &act, &mut h)?;
+                        }
+                    }
+                } else {
+                    debug_assert!(use_gpu, "GPU 経路が use_gpu=false で走った");
+                }
+                let pe = weights[t];
+                for j in 0..e {
+                    out[j] += pe * h[j];
+                }
             }
         }
     }
@@ -2955,18 +2975,27 @@ fn moe_ffn_quant_with(
     #[cfg(feature = "cuda")]
     if use_gpu {
         if let Some(c) = expert_vram::take_check() {
-            let (used, cap) = expert_vram::cache_usage().unwrap_or((0, 0));
+            // P43: 予算は prefill のパック済み重みと共有なので、`pinned` も出す
+            // (`vram=LRU使用+外部予約/上限`)。
+            let (used, pinned, cap) = match expert_vram::budget_usage() {
+                Some((u, p, c)) => (u, p, c),
+                None => {
+                    let (u, c) = expert_vram::cache_usage().unwrap_or((0, 0));
+                    (u, 0, c)
+                }
+            };
             eprintln!(
                 "[flash] expert_gpu_check layer={} cmp={} argmax={}/{} max_abs={:.3e} max_rel={:.3e} \
-                 vram={}/{} MiB cpu_fallback={}",
+                 vram={}/{} MiB (pinned={} MiB) cpu_fallback={}",
                 lw.il,
                 c.n,
                 c.argmax,
                 c.n,
                 c.max_abs,
                 c.max_rel,
-                used >> 20,
+                (used + pinned) >> 20,
                 cap >> 20,
+                pinned >> 20,
                 expert_vram::fallbacks()
             );
         }
@@ -3090,6 +3119,145 @@ fn moe_expert_gpu(
         expert_vram::note_check(h, &h_c);
     }
     Ok(true)
+}
+
+/// P43: 選択 expert **全員** の寄与を「3 起動 / 2 同期」でまとめて計算する。
+///
+/// `sel` の全 expert が VRAM に載り、カーネル (PTX) と型が対応しているときだけ
+/// `Ok(Some(hs))` を返す (`hs[t]` は `sel[t]` の寄与 h、長さ `e`)。
+/// 1 本でも載らない / カーネルが無い / 型が未対応なら `Ok(None)` を返し、
+/// 呼び出し側は per-expert 経路 ([`moe_expert_gpu`]) へ落ちる (fail closed)。
+///
+/// 起動計画 (`DENNO_EXPERT_BATCH` / segment 表の作り方) は
+/// [`crate::model::expert_batch`] にある。数値は per-expert 経路とビット一致する
+/// (同じ dequant・同じ i 昇順の累積・同じ silu の式)。
+#[cfg(feature = "cuda")]
+fn moe_experts_gpu_batched(
+    lw: &LayerW,
+    sel: &[usize],
+    x: &[f32],
+    e: usize,
+    ff: usize,
+) -> Result<Option<Vec<Vec<f32>>>> {
+    use crate::model::expert_batch as eb;
+    use crate::model::expert_vram::ExpertShape;
+
+    if sel.is_empty() || !eb::batch_enabled() {
+        return Ok(None);
+    }
+    let n = sel.len();
+    let shapes = [
+        ExpertShape {
+            ty: lw.gate_exps.ty,
+            k: x.len(),
+            n: ff,
+        },
+        ExpertShape {
+            ty: lw.up_exps.ty,
+            k: x.len(),
+            n: ff,
+        },
+        ExpertShape {
+            ty: lw.down_exps.ty,
+            k: ff,
+            n: e,
+        },
+    ];
+    // 1. 全 expert を VRAM に載せる (1 本でも載らなければ per-expert 経路へ)。
+    let mut devs = Vec::with_capacity(n);
+    let mut ids: Vec<u16> = Vec::with_capacity(n);
+    for &ei in sel {
+        let key = ExpertKey {
+            layer: lw.il as u16,
+            expert: ei as u16,
+        };
+        let dev = expert_vram::acquire(key, shapes, || {
+            Ok([
+                lw.gate_exps.slice(ei)?,
+                lw.up_exps.slice(ei)?,
+                lw.down_exps.slice(ei)?,
+            ])
+        })
+        .map_err(|err| one(format!("層 {}: expert {ei}: VRAM 経路 (層一括): {err:#}", lw.il)))?;
+        let Some(d) = dev else {
+            return Ok(None);
+        };
+        devs.push(d);
+        ids.push(ei as u16);
+    }
+    let ptr_table = |m: ExpertMatrix| -> Vec<u64> { devs.iter().map(|d| d.ptr(m)).collect() };
+    let (pg, pu, pd) = (
+        ptr_table(ExpertMatrix::Gate),
+        ptr_table(ExpertMatrix::Up),
+        ptr_table(ExpertMatrix::Down),
+    );
+
+    // 2. gate + up (2 起動 / 1 同期)
+    let mut g = vec![0.0f32; n * ff];
+    let mut up = vec![0.0f32; n * ff];
+    let seg_gu = eb::seg_table_shared_x(&ids, ff);
+    let ran = crate::cuda::moe_gemv_seg_pair(
+        lw.gate_exps.ty,
+        lw.up_exps.ty,
+        &pg,
+        &pu,
+        &seg_gu,
+        1,
+        x,
+        x.len(),
+        ff,
+        &mut g,
+        &mut up,
+    )
+    .map_err(|err| one(format!("層 {}: 層一括 GEMV (gate+up): {err:#}", lw.il)))?;
+    if !ran {
+        return Ok(None);
+    }
+    // 3. act = silu(g) * u (per-expert 経路と同じ式・同じ順)
+    let mut act = vec![0.0f32; n * ff];
+    eb::silu_mul(&g, &up, &mut act);
+    drop(g);
+    drop(up);
+
+    // 4. down (1 起動 / 1 同期)
+    let mut h = vec![0.0f32; n * e];
+    let seg_d = eb::seg_table_per_act(&ids, ff, e);
+    let ran = crate::cuda::moe_gemv_seg_one(lw.down_exps.ty, &pd, &seg_d, 1, &act, ff, e, &mut h)
+        .map_err(|err| one(format!("層 {}: 層一括 GEMV (down): {err:#}", lw.il)))?;
+    if !ran {
+        return Ok(None);
+    }
+    let hs: Vec<Vec<f32>> = h.chunks_exact(e).map(|c| c.to_vec()).collect();
+
+    // 5. DENNO_EXPERT_GPU_CHECK=1: per-expert 経路と同じ比較 (層ごとに 1 行)。
+    if expert_vram::check_enabled() {
+        let mut act_c = vec![0.0f32; ff];
+        let mut up_c = vec![0.0f32; ff];
+        let mut h_c = vec![0.0f32; e];
+        for (t, &ei) in sel.iter().enumerate() {
+            lw.gate_exps.gemv(ei, x, &mut act_c)?;
+            silu_inplace(&mut act_c);
+            lw.up_exps.gemv(ei, x, &mut up_c)?;
+            for r in 0..ff {
+                act_c[r] *= up_c[r];
+            }
+            lw.down_exps.gemv(ei, &act_c, &mut h_c)?;
+            expert_vram::note_check(&hs[t], &h_c);
+        }
+    }
+    Ok(Some(hs))
+}
+
+/// `cuda` feature 無しでは層一括経路は無い (常に `None` = per-expert 経路)。
+#[cfg(not(feature = "cuda"))]
+fn moe_experts_gpu_batched(
+    _lw: &LayerW,
+    _sel: &[usize],
+    _x: &[f32],
+    _e: usize,
+    _ff: usize,
+) -> Result<Option<Vec<Vec<f32>>>> {
+    Ok(None)
 }
 
 /// MoE フェーズの内訳を測るための累積カウンタ (ns)。0 = router、1 = 選択 expert、2 = shared。
@@ -5215,6 +5383,33 @@ mod tests {
             "CPU 経路で expert_gemv_any が 3 本 × top-k 回呼ばれていない (既定で GPU 経路に入った?)"
         );
         assert_bitwise_eq(&base, &got, "route=Cpu");
+    }
+
+    /// P43: GPU 経路 (`Route::Vram`) を要求しても、CUDA が無い / expert が VRAM に
+    /// 載らない / カーネル (PTX) が無いときは per-expert の CPU 経路へ落ちる。
+    /// 値は既定経路とビット一致し、呼び出し回数も 3 × top-k のまま (fail closed)。
+    #[test]
+    fn moe_ffn_quant_vram_route_falls_back_to_cpu() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("route_vram");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        let base = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("Cpu 経路");
+        let before = moe_expert::any_calls();
+        let got = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Vram)
+            .expect("Vram 経路 (落ちる)");
+        let calls = moe_expert::any_calls() - before;
+
+        assert_eq!(
+            calls,
+            3 * p.n_expert_used,
+            "層一括/VRAM 経路が載らないのに CPU へ落ちていない (expert_gemv_any の回数)"
+        );
+        assert_bitwise_eq(&base, &got, "route=Vram → CPU 経路");
     }
 
     #[test]
