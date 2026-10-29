@@ -79,7 +79,10 @@ const TOPK = 10;                 // qwen4exp.expert_used_count
 const INTERVAL = 4;              // qwen4exp.full_attention_interval -> QSA 1 : GDN 3
 const PLE_LAYERS = [1];          // qwen4exp.ple.layers (Layer 2 のみ)
 const NGRAMS = 16;               // ple.head_vocab_sizes の要素数
-const VRAM_CAP = 96;             // 画面表現用の VRAM 枠 (expert 数)
+const VRAM_CAP = 10500;          // VRAM に載る expert 枠。実測からの換算:
+                                 // DENNO_EXPERT_VRAM_MB=18000 / 1 expert 約 1.7 MB
+                                 // (gate+up Q4_K 2560x640x512 + down Q5_1 640x2560x512)
+                                 // = 約 10,500 本 / 全 24,576 本 (48 層 x 512) = 43%
 
 const isQSA = (il) => (il + 1) % INTERVAL === 0;
 const zOf = (il) => -il * ZSTEP;
