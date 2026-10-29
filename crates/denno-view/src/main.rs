@@ -176,6 +176,8 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/", get(dashboard))
+        .route("/3d", get(dashboard3d))
+        .route("/vendor/*path", get(vendor))
         .route("/ws", get(view_ws))
         .route("/tokenizer.json", get(tokenizer_json))
         .route("/replay", get(replay_bin))
@@ -337,6 +339,37 @@ async fn chat_proxy(
 
 async fn dashboard() -> Html<&'static str> {
     Html(include_str!("index.html"))
+}
+
+/// GET /3d — three.js の 3D ビューア (層の箱 = ニューロン、活性化で発光)。
+async fn dashboard3d() -> Html<&'static str> {
+    Html(include_str!("index3d.html"))
+}
+
+/// GET /vendor/*path — three.js 本体と addons (ビルド時に埋め込む)。
+/// 開発コンテナは外部ネットワークに出られないため、CDN ではなく同梱する。
+async fn vendor(axum::extract::Path(path): axum::extract::Path<String>) -> axum::response::Response {
+    let (body, mime): (&'static [u8], &'static str) = match path.as_str() {
+        "three.module.js" => (include_bytes!("vendor/three.module.js"), "text/javascript; charset=utf-8"),
+        "addons/controls/OrbitControls.js" => (include_bytes!("vendor/addons/controls/OrbitControls.js"), "text/javascript; charset=utf-8"),
+        "addons/postprocessing/EffectComposer.js" => (include_bytes!("vendor/addons/postprocessing/EffectComposer.js"), "text/javascript; charset=utf-8"),
+        "addons/postprocessing/RenderPass.js" => (include_bytes!("vendor/addons/postprocessing/RenderPass.js"), "text/javascript; charset=utf-8"),
+        "addons/postprocessing/ShaderPass.js" => (include_bytes!("vendor/addons/postprocessing/ShaderPass.js"), "text/javascript; charset=utf-8"),
+        "addons/postprocessing/MaskPass.js" => (include_bytes!("vendor/addons/postprocessing/MaskPass.js"), "text/javascript; charset=utf-8"),
+        "addons/postprocessing/UnrealBloomPass.js" => (include_bytes!("vendor/addons/postprocessing/UnrealBloomPass.js"), "text/javascript; charset=utf-8"),
+        "addons/postprocessing/OutputPass.js" => (include_bytes!("vendor/addons/postprocessing/OutputPass.js"), "text/javascript; charset=utf-8"),
+        "addons/shaders/CopyShader.js" => (include_bytes!("vendor/addons/shaders/CopyShader.js"), "text/javascript; charset=utf-8"),
+        "addons/shaders/LuminosityHighPassShader.js" => (include_bytes!("vendor/addons/shaders/LuminosityHighPassShader.js"), "text/javascript; charset=utf-8"),
+        "addons/shaders/OutputShader.js" => (include_bytes!("vendor/addons/shaders/OutputShader.js"), "text/javascript; charset=utf-8"),
+        _ => (b"not found", "text/plain; charset=utf-8"),
+    };
+    let status = if body == b"not found" { 404 } else { 200 };
+    axum::response::Response::builder()
+        .status(status)
+        .header("content-type", mime)
+        .header("cache-control", "public, max-age=3600")
+        .body(axum::body::Body::from(body.to_vec()))
+        .unwrap()
 }
 
 /// 実装ソース 3 ファイル (実コード表示用)。コンパイル時に埋め込むので

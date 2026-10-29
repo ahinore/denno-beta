@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>denno-view 3D — neural flow</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { --bg:#05070d; --fg:#d7f7ff; --acc:#00f0ff; --acc2:#ff2bd6; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+              font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; overflow:hidden; }
+  #c { display:block; width:100%; height:100%; }
+  #hud { position:fixed; left:14px; top:12px; pointer-events:none;
+         text-shadow:0 0 8px rgba(0,240,255,.55); letter-spacing:.06em; }
+  #hud b { color:var(--acc); font-weight:600; }
+  #hud .dim { color:#5b7480; }
+  #hud .mag { color:var(--acc2); }
+  #legend { position:fixed; right:14px; bottom:12px; text-align:right;
+            color:#5b7480; pointer-events:none; line-height:1.7; }
+  #legend .k { color:var(--acc); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div><b>denno-view</b> 3D neural flow <span class="dim">| three.js r160</span></div>
+  <div id="stat">layers <b>48</b> · neurons/layer <b>512</b> (of 2560, stride 5) · fps <b id="fps">--</b></div>
+  <div id="mode" class="mag">mode: demo (telemetry inactive)</div>
+</div>
+<div id="legend">
+  <div><span class="k">box</span> = neuron</div>
+  <div><span class="k">glow</span> = activation</div>
+  <div><span class="k">line</span> = layer-to-layer link</div>
+  <div>drag: rotate · wheel: zoom</div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+    "three": "/vendor/three.module.js",
+    "three/addons/": "/vendor/addons/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+// ---- config -------------------------------------------------------------
+const LAYERS   = 48;     // Flash-Next の層数 (ServerInfo で上書き)
+const NEURONS  = 512;    // 1 層の可視化ボックス数 (2560 を stride 5 で間引く)
+const COLS     = 32;     // 格子
+const ROWS     = 16;
+const ZSTEP    = 2.6;    // 層の間隔
+const SPACING  = 0.30;   // ボックス間隔
+const TOPK     = 10;     // 線を引く上位ニューロン数
+const CYAN     = new THREE.Color('#00f0ff');
+const MAGENTA  = new THREE.Color('#ff2bd6');
+const HOT      = new THREE.Color('#fff2b0');
+
+// ---- renderer -----------------------------------------------------------
+const canvas   = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, powerPreference:'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight, false);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#05070d');
+scene.fog = new THREE.FogExp2('#05070d', 0.017);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth/innerHeight, 0.1, 400);
+camera.position.set(0, 15, 34);
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 0, -(LAYERS-1)*ZSTEP*0.42);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.35;
+controls.maxPolarAngle = Math.PI*0.92;
+
+// ---- floor grid (cyberpunk) --------------------------------------------
+const grid = new THREE.GridHelper(260, 64, 0x0a3a44, 0x08222a);
+grid.position.y = -9;
+scene.add(grid);
+const glowGrid = new THREE.GridHelper(260, 16, 0x0f6070, 0x0f6070);
+glowGrid.position.y = -8.99;
+glowGrid.material.opacity = 0.35; glowGrid.material.transparent = true;
+scene.add(glowGrid);
+
+// ---- layer slabs --------------------------------------------------------
+const geo = new THREE.BoxGeometry(1,1,1);
+const mat = new THREE.MeshStandardMaterial({
+  color: 0x0b1c24, emissive: 0x000000, metalness: 0.65, roughness: 0.32
+});
+const slabGroup = new THREE.Group();
+scene.add(slabGroup);
+
+const slabs = [];
+const x0 = -(COLS-1)*SPACING/2, y0 = -(ROWS-1)*SPACING/2;
+for (let L = 0; L < LAYERS; L++) {
+  const inst = new THREE.InstancedMesh(geo, mat.clone(), NEURONS);
+  inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  const m = new THREE.Matrix4();
+  const pos = new Float32Array(NEURONS*3);
+  for (let n = 0; n < NEURONS; n++) {
+    const cx = n % COLS, cy = (n / COLS) | 0;
+    const x = x0 + cx*SPACING, y = y0 + cy*SPACING, z = -L*ZSTEP;
+    pos[n*3] = x; pos[n*3+1] = y; pos[n*3+2] = z;
+    m.makeTranslation(x, y, z);
+    inst.setMatrixAt(n, m);
+    inst.setColorAt(n, CYAN.clone().multiplyScalar(0.08));
+  }
+  inst.instanceMatrix.needsUpdate = true;
+  inst.instanceColor.needsUpdate = true;
+  slabGroup.add(inst);
+  slabs.push({ inst, pos, act: new Float32Array(NEURONS) });
+}
+
+// ---- inter-layer edges --------------------------------------------------
+const edgeGeo = new THREE.BufferGeometry();
+const EDGES = (LAYERS-1) * TOPK * 2;           // 2 本/上位ニューロン
+const edgePos = new Float32Array(EDGES * 2 * 3);
+const edgeCol = new Float32Array(EDGES * 2 * 3);
+edgeGeo.setAttribute('position', new THREE.BufferAttribute(edgePos, 3));
+edgeGeo.setAttribute('color', new THREE.BufferAttribute(edgeCol, 3));
+const edgeMat = new THREE.LineBasicMaterial({
+  vertexColors: true, transparent: true, opacity: 0.55,
+  blending: THREE.AdditiveBlending, depthWrite: false
+});
+const edges = new THREE.LineSegments(edgeGeo, edgeMat);
+scene.add(edges);
+
+// ---- postprocessing -----------------------------------------------------
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.85, 0.75, 0.18);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+// ---- activation state (demo until telemetry arrives) --------------------
+const demo = {
+  on: true,
+  t: 0,
+  speed: 0.9,          // layer を進む速さ
+  wave: 9.0,           // 同時に光る層の幅
+  noise: 0.35
+};
+// 実テレメトリ: LayerAct { layer, idx[], val[] } を受けたら demo.on = false
+const live = { layer: -1, idx: [], val: [], ts: 0 };
+
+const tmpC = new THREE.Color();
+function applyActivation(dt) {
+  demo.t += dt;
+  for (let L = 0; L < LAYERS; L++) {
+    const s = slabs[L];
+    let head;
+    if (demo.on) {
+      // 層を下から上へ走る波 + ニューロンごとのゆらぎ
+      const center = (demo.t*demo.speed) % (LAYERS + demo.wave*2) - demo.wave;
+      const d = Math.abs(L - center);
+      head = Math.exp(-(d*d)/(2*demo.wave*demo.wave));
+      head *= 0.75 + 0.25*Math.sin(demo.t*2.1 + L*0.7);
+    } else {
+      const age = performance.now() - live.ts;
+      head = (L === live.layer) ? Math.exp(-age/260) : Math.max(0, 1 - age/900)*0.25;
+    }
+    for (let n = 0; n < NEURONS; n++) {
+      let a;
+      if (demo.on) {
+        const r = Math.sin(n*12.9898 + L*78.233)*43758.5453;
+        const rnd = r - Math.floor(r);
+        a = head * (0.25 + 0.75*rnd) * (0.6 + 0.4*Math.sin(demo.t*3 + n*0.11));
+      } else {
+        a = head;
+      }
+      a = Math.max(0, Math.min(1, a));
+      s.act[n] = s.act[n]*0.72 + a*0.28;             // 平滑化
+    }
+    const col = s.inst.instanceColor.array;
+    for (let n = 0; n < NEURONS; n++) {
+      const a = s.act[n];
+      // 低: 暗いシアン → 高: シアン→白熱
+      tmpC.copy(CYAN).multiplyScalar(0.06 + a*0.9);
+      if (a > 0.55) tmpC.lerp(HOT, (a-0.55)*1.6);
+      if (a > 0.85) tmpC.lerp(MAGENTA, (a-0.85)*3.0);
+      col[n*3] = tmpC.r; col[n*3+1] = tmpC.g; col[n*3+2] = tmpC.b;
+    }
+    s.inst.instanceColor.needsUpdate = true;
+    s.inst.material.emissive.setRGB(0.02, 0.10, 0.13);
+  }
+}
+
+function updateEdges() {
+  let e = 0;
+  for (let L = 0; L < LAYERS-1; L++) {
+    const a = slabs[L], b = slabs[L+1];
+    const top = [];
+    for (let n = 0; n < NEURONS; n++) top.push([n, a.act[n]]);
+    top.sort((p,q)=>q[1]-p[1]);
+    for (let k = 0; k < TOPK; k++) {
+      const [n, av] = top[k];
+      const m = (n*7 + L*13 + k*3) % NEURONS;      // 疑似結合 (実結合が来たら差し替え)
+      const bv = b.act[m];
+      const w = Math.min(1, (av + bv)*0.6);
+      if (w < 0.06) { continue; }
+      const o = e*6;
+      edgePos[o  ] = a.pos[n*3  ]; edgePos[o+1] = a.pos[n*3+1]; edgePos[o+2] = a.pos[n*3+2];
+      edgePos[o+3] = b.pos[m*3  ]; edgePos[o+4] = b.pos[m*3+1]; edgePos[o+5] = b.pos[m*3+2];
+      const c = tmpC.copy(CYAN).lerp(MAGENTA, Math.min(1, av*1.4));
+      edgeCol[o  ] = c.r*w; edgeCol[o+1] = c.g*w; edgeCol[o+2] = c.b*w;
+      edgeCol[o+3] = c.r*w; edgeCol[o+4] = c.g*w; edgeCol[o+5] = c.b*w;
+      e++;
+    }
+  }
+  for (let i = e*6; i < EDGES*6; i++) edgePos[i] = 0;
+  edgeGeo.setDrawRange(0, e*2);
+  edgeGeo.attributes.position.needsUpdate = true;
+  edgeGeo.attributes.color.needsUpdate = true;
+}
+
+// ---- telemetry hook -----------------------------------------------------
+// /ws から生フレームが流れてくる。フレーム形式 (MAGIC/version/kind + varint) の解読は
+// 開発タスクで実装する。ここでは LayerAct 相当を受け取ったら差し替える口だけ用意する。
+export function onLayerActivation(layer, idx, val) {
+  demo.on = false;
+  live.layer = layer; live.idx = idx; live.val = val; live.ts = performance.now();
+  document.getElementById('mode').textContent = 'mode: live telemetry';
+}
+
+// ---- loop ---------------------------------------------------------------
+const clock = new THREE.Clock();
+let fpsAcc = 0, fpsN = 0;
+function frame() {
+  const dt = Math.min(0.05, clock.getDelta());
+  applyActivation(dt);
+  if ((frame.n = (frame.n||0)+1) % 2 === 0) updateEdges();
+  controls.update();
+  composer.render();
+
+  fpsAcc += dt; fpsN++;
+  if (fpsAcc > 0.5) {
+    document.getElementById('fps').textContent = (fpsN/fpsAcc).toFixed(0);
+    fpsAcc = 0; fpsN = 0;
+  }
+  requestAnimationFrame(frame);
+}
+frame();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight, false);
+  composer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
