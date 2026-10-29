@@ -774,6 +774,8 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     // P51: 推論テレメトリ (denno-view が購読する WS)。既定で有効で、
     // `DENNO_TELEMETRY=0` のときだけ無効。無効時はチャネルもスレッドも作らない。
     let telem_on = std::env::var("DENNO_TELEMETRY").ok().as_deref() != Some("0");
+    // エンジン側の emit() も同じ判定にする (未設定なら有効、ここでは off のみ無効)。
+    denno_telemetry::set_enabled(telem_on);
     let (telemetry, telem_rx) = Telemetry::new(
         telem_on,
         Frame::ServerInfo {
@@ -792,6 +794,9 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     if let Some(rx) = telem_rx {
         telemetry.start_relay(rx).context("telemetry relay を起動できない")?;
     }
+    telemetry
+        .start_engine_bridge()
+        .context("telemetry の engine bridge を起動できない")?;
     eprintln!(
         "[flash] telemetry: {} (GET /v1/telemetry/ws)",
         if telem_on {

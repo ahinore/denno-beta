@@ -141,6 +141,26 @@ impl Telemetry {
             .map(|_| ())
     }
 
+    /// エンジン側の送出ハブ (`denno_telemetry::emit`) を WS へ中継するスレッド。
+    ///
+    /// serve の WS は自前の送信路を使うため、エンジンが `emit()` で出す
+    /// 構造系フレーム (RouterTopK など) は自動では届かない。ここで拾って流す。
+    pub fn start_engine_bridge(&self) -> std::io::Result<()> {
+        if !self.on {
+            return Ok(());
+        }
+        let shared = self.shared.clone();
+        std::thread::Builder::new()
+            .name("flash-engine-tel".into())
+            .spawn(move || loop {
+                match denno_telemetry::recv_global_timeout(RELAY_POLL) {
+                    Some(f) => broadcast(&shared, &f.encode()),
+                    None => continue,
+                }
+            })
+            .map(|_| ())
+    }
+
     /// `GET /v1/telemetry/ws` の Upgrade を処理する。
     ///
     /// 101 を返し、ServerInfo を 1 フレーム送ってからクライアントを登録する。

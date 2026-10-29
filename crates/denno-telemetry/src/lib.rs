@@ -668,6 +668,36 @@ pub fn enabled() -> bool {
     }
 }
 
+/// エンジン側の送出ハブ (`emit`) から 1 枚取り出す。`timeout` だけ待つ。
+///
+/// serve は自前の [`crate::Frame`] 送信路 (WS) を持つので、エンジンが
+/// `emit()` で出すフレーム (RouterTopK / RoleAct など) はここで拾って
+/// WS 側へ中継する。無効時・ハブ未初期化なら `None` を返す。
+pub fn recv_global_timeout(timeout: std::time::Duration) -> Option<Frame> {
+    if !enabled() {
+        return None;
+    }
+    let rx = RX.get_or_init(|| {
+        // 先に RX を入れ、TX は emit 側が埋める (二重初期化は OnceLock が弾く)。
+        let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_CAP);
+        let _ = TX.set(tx);
+        Mutex::new(rx)
+    });
+    match rx.lock() {
+        Ok(g) => g.recv_timeout(timeout).ok(),
+        Err(_) => None,
+    }
+}
+
+/// 送出可否を明示的に決める。
+///
+/// serve は `DENNO_TELEMETRY` を「未設定なら有効」と解釈するが、[`enabled`] は
+/// 「未設定なら無効」なので、解釈結果をここで 1 回だけ流し込む
+/// (エンジン側の `emit()` も同じ判定になる)。
+pub fn set_enabled(v: bool) {
+    ON.store(if v { 1 } else { 0 }, Ordering::Relaxed);
+}
+
 /// テスト専用: env 由来の ON/OFF を上書きする (本番コードからは使わない)。
 #[doc(hidden)]
 pub fn set_enabled_for_tests(v: bool) {
