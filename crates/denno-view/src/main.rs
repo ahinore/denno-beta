@@ -177,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/3d", get(dashboard3d))
+        .route("/frames.mjs", get(frames_mjs))
         .route("/vendor/*path", get(vendor))
         .route("/ws", get(view_ws))
         .route("/tokenizer.json", get(tokenizer_json))
@@ -344,6 +345,19 @@ async fn dashboard() -> Html<&'static str> {
 /// GET /3d — three.js の 3D ビューア (層の箱 = ニューロン、活性化で発光)。
 async fn dashboard3d() -> Html<&'static str> {
     Html(include_str!("index3d.html"))
+}
+
+/// GET /frames.mjs — 3D ビューアが import するフレームデコーダ。
+/// 形式の正は `denno-telemetry` の v1 (この JS はその写し。DOM 非依存)。
+async fn frames_mjs() -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(200)
+        .header("content-type", "text/javascript; charset=utf-8")
+        .header("cache-control", "no-cache")
+        .body(axum::body::Body::from(
+            include_str!("frames.mjs").as_bytes().to_vec(),
+        ))
+        .unwrap()
 }
 
 /// GET /vendor/*path — three.js 本体と addons (ビルド時に埋め込む)。

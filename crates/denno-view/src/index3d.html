@@ -33,6 +33,8 @@
   <div><span class="vram">VRAM <b id="n_vram">0</b></span> / <span class="dim">cap <b id="cap">96</b></span> ·
        <span class="ram">RAM <b id="n_ram">0</b></span> ·
        <span class="ssd">SSD <b id="n_ssd">0</b></span></div>
+  <div id="live" class="dim">telemetry: <b id="ws_state">--</b> · prefill <b id="pf">--</b> · decode <b id="dc">--</b></div>
+  <div id="tier" class="dim">vram <b id="t_vram">--</b> / <b id="t_total">--</b> MB · ram experts <b id="t_ram">--</b> · ssd reads <b id="t_ssd">--</b></div>
   <div id="mode" class="dim">mode: demo (routing simulated)</div>
 </div>
 <div id="legend" class="panel">
@@ -42,6 +44,7 @@
 </div>
 <div id="err"></div>
 <div id="dump" style="display:none"></div>
+<div id="live_done" style="display:none"></div>
 <script>
 (function () {
   var box = document.getElementById('err'), shown = 0;
@@ -66,6 +69,7 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { decodeFrame, FrameDecodeError } from '/frames.mjs';
 
 // ===== 実モデルの数 (GGUF ヘッダ実測) =====================================
 const Q = new URLSearchParams(location.search);
@@ -288,23 +292,20 @@ composer.addPass(new OutputPass());
 
 // ===== 状態 ==============================================================
 const demo = { on: true, t: 0, paused: false, cursor: 0, hold: 0 };
-const live = { ts: 0, act: new Map() };
+const live = { ts: 0, act: new Map(),
+  hit() { const age = performance.now() - this.ts; return Math.exp(-age / 400); } };
 const lru = [];                 // VRAM 在庫 (expert の通し番号)
 let vramUsed = 0;
 const key = (il, k) => il * EXPERTS + k;
 
 function hash(a, b) { const r = Math.sin(a * 127.1 + b * 311.7) * 43758.5453; return r - Math.floor(r); }
 
-// ルーティング: 層 il の top-10 を選び、VRAM に載せる (枠が溢れたら LRU を追い出す)
-function routeLayer(il, token) {
+// 選ばれた expert を VRAM 枠に載せる (枠が溢れたら LRU を RAM へ落とす)
+function promote(il, ids) {
   const s = slabs[il];
-  const cand = [];
-  for (let k = 0; k < EXPERTS; k++) cand.push(k);
-  cand.sort((a, b) => hash(b + 1, token) - hash(a + 1, token));
-  const sel = cand.slice(0, TOPK);
-  s.route = sel;
-
-  for (const k of sel) {
+  for (const k0 of ids) {
+    const k = k0 | 0;
+    if (k < 0 || k >= EXPERTS) continue;
     s.used[k] = 1;
     const kk = key(il, k);
     const i = lru.indexOf(kk);
@@ -312,6 +313,17 @@ function routeLayer(il, token) {
     lru.push(kk);
     if (s.tier[k] !== TIER.VRAM) { s.tier[k] = TIER.VRAM; s.dirty[k] = 1; }
   }
+}
+
+// ルーティング (デモ): 層 il の top-10 を選ぶ
+function routeLayer(il, token) {
+  const s = slabs[il];
+  const cand = [];
+  for (let k = 0; k < EXPERTS; k++) cand.push(k);
+  cand.sort((a, b) => hash(b + 1, token) - hash(a + 1, token));
+  const sel = cand.slice(0, TOPK);
+  s.route = sel;
+  promote(il, sel);
   // VRAM 枠を超えたぶんを LRU から RAM へ
   while (lru.length > VRAM_CAP) {
     const kk = lru.shift();
@@ -401,7 +413,7 @@ function step(dt) {
   const perLayer = 0.16;
   const cursor = Math.floor((demo.t / perLayer) % LAYERS);
   const token = Math.floor(demo.t / (perLayer * LAYERS));
-  if (cursor !== demo.cursor) {
+  if (demo.on && cursor !== demo.cursor) {
     demo.cursor = cursor;
     routeLayer(cursor, token);
     document.getElementById('cur').textContent = String(cursor).padStart(2, '0');
@@ -409,11 +421,12 @@ function step(dt) {
     ck.textContent = isQSA(cursor) ? 'QSA' : 'GDN';
     ck.className = isQSA(cursor) ? 'qsa' : 'gdn';
   }
-  const head = 0.35 + 0.65 * Math.exp(-Math.abs((demo.t / perLayer) % 1) * 3);
+  const head = demo.on ? 0.35 + 0.65 * Math.exp(-Math.abs((demo.t / perLayer) % 1) * 3)
+                      : Math.min(1, 0.55 + live.hit());
 
   // 見えている層だけ色を更新 (負荷を 1/4 に)
   for (let il = 0; il < LAYERS; il++) {
-    if ((il + demo.cursor) % 4 !== 0) continue;
+    if (il !== demo.cursor && (il + demo.cursor) % 3 !== 0) continue;
     updateLayerColors(il);
     updateRoleColors(il, il === demo.cursor ? head : 0.16);
   }
@@ -463,7 +476,21 @@ function frame() {
 // telemetry の口 (row 54/55 で接続)
 window.onLayerActivation = function (layer, idx, val) {
   demo.on = false; live.ts = performance.now(); live.act.set(layer, idx);
-  document.getElementById('mode').textContent = 'mode: live (layer ' + layer + ')';
+  demo.cursor = layer;
+  const s = slabs[layer];
+  if (!s) return;
+  // LayerAct の idx は「その層で実際に選ばれた expert」。これを経路として使う。
+  const sel = [];
+  for (let i = 0; i < idx.length && sel.length < TOPK; i++) {
+    const k = idx[i] | 0;
+    if (k >= 0 && k < EXPERTS) {
+      sel.push(k);
+      s.act[k] = Math.max(s.act[k], Math.min(1, (val && val[i]) ? val[i] * 3 : 0.9));
+    }
+  }
+  s.route = sel;
+  promote(layer, sel);
+  document.getElementById('mode').textContent = 'mode: live (telemetry)';
 };
 window.onRouting = function (layer, experts) {   // 実際の top-10
   const s = slabs[layer]; if (!s) return;
@@ -480,9 +507,103 @@ window.onResidency = function (layer, inVram) {
   }
 };
 
+// ===== 実テレメトリ (/ws -> VIEW_UPSTREAM) ================================
+const hudEl = {
+  ws: document.getElementById('ws_state'), pf: document.getElementById('pf'),
+  dc: document.getElementById('dc'), vram: document.getElementById('t_vram'),
+  total: document.getElementById('t_total'), ram: document.getElementById('t_ram'),
+  ssd: document.getElementById('t_ssd'), mode: document.getElementById('mode'),
+  cur: document.getElementById('cur'), curkind: document.getElementById('curkind')
+};
+const liveState = { tokens: 0, lastStepMs: 0, prefillMs: 0, frames: 0 };
+
+function handleFrame(f) {
+  liveState.frames++;
+  switch (f.kind) {
+    case 'ServerInfo':
+      hudEl.ws.textContent = 'connected (' + (f.model || 'flash') + ')';
+      break;
+    case 'Prefill':
+      liveState.prefillMs = f.ns / 1e6 / Math.max(1, f.prompt_tokens || 1);
+      hudEl.pf.textContent = liveState.prefillMs.toFixed(1) + ' ms/tok';
+      break;
+    case 'Step':
+      liveState.lastStepMs = f.ns / 1e6;
+      hudEl.dc.textContent = liveState.lastStepMs.toFixed(0) + ' ms/tok';
+      break;
+    case 'Token':
+      liveState.tokens++;
+      break;
+    case 'LayerAct':
+      window.onLayerActivation(f.layer, f.idx, f.val);
+      hudEl.cur.textContent = String(f.layer).padStart(2, '0');
+      hudEl.curkind.textContent = isQSA(f.layer) ? 'QSA' : 'GDN';
+      hudEl.curkind.className = isQSA(f.layer) ? 'qsa' : 'gdn';
+      break;
+    case 'RoleAct':
+      window.onRoleActivation(f.layer, f.roles);
+      break;
+    case 'ExpertResidency':
+      window.onResidency(f.layer, f.vram);
+      break;
+    case 'TierStats':
+      hudEl.vram.textContent = f.vramMB;
+      hudEl.total.textContent = f.vramTotalMB;
+      hudEl.ram.textContent = f.ramExperts;
+      hudEl.ssd.textContent = f.ssdReads;
+      break;
+  }
+}
+
+let wsRetry = 2000, wsRef = null, liveReconnect = true;
+function connectLive() {
+  const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+  let ws;
+  try { ws = new WebSocket(url); } catch (e) { setTimeout(connectLive, wsRetry); return; }
+  wsRef = ws;
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { hudEl.ws.textContent = 'connected'; };
+  ws.onmessage = (ev) => {
+    const buf = new Uint8Array(ev.data);
+    let off = 0;
+    while (off < buf.length) {
+      try {
+        const r = decodeFrame(buf, off);
+        off = r.next;
+        handleFrame(r.frame);
+      } catch (e) {
+        if (e instanceof FrameDecodeError) { hudEl.ws.textContent = 'decode error: ' + e.message; }
+        break;
+      }
+    }
+  };
+  ws.onclose = () => {
+    hudEl.ws.textContent = 'disconnected';
+    if (liveReconnect) setTimeout(connectLive, wsRetry);
+  };
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+}
+
 addEventListener('keydown', (e) => { if (e.code === 'Space') { demo.paused = !demo.paused; e.preventDefault(); } });
 
-if (Q.get('shot')) {
+if (Q.get('live')) {
+  // ?live=<秒> — 実テレメトリを <秒> だけ受け、WS を閉じてから canvas を書き出す
+  // (開いたままだと仮想時間が進まず headless が終わらない)
+  const secs = Math.max(1, parseInt(Q.get('live'), 10) || 8);
+  liveReconnect = false;
+  connectLive();
+  const t0 = performance.now();
+  const tick = () => {
+    step(1 / 60);
+    if ((performance.now() - t0) / 1000 < secs) return requestAnimationFrame(tick);
+    window.__viewReady = true; hud();
+    document.getElementById('fps').textContent = 'live';
+    document.getElementById('dump').textContent = canvas.toDataURL('image/png');
+    try { if (wsRef) wsRef.close(); } catch (e) {}
+    document.getElementById('live_done').textContent = 'live capture done: ' + liveState.frames + ' frames';
+  };
+  requestAnimationFrame(tick);
+} else if (Q.get('shot')) {
   const steps = parseInt(Q.get('steps') || '170', 10);
   let i = 0;
   const tick = () => {
@@ -494,6 +615,7 @@ if (Q.get('shot')) {
   };
   requestAnimationFrame(tick);
 } else {
+  connectLive();
   frame();
 }
 
