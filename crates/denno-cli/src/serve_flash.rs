@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use denno_engine::gguf::GgufFile;
-use denno_engine::model::qwen4exp::{Qwen4Exp, Qwen4ExpParams};
+use denno_engine::model::qwen4exp::{Qwen4Exp, Qwen4ExpParams, TapTokens};
 use denno_engine::model::qwen4exp_attn::FullAttn;
 use denno_engine::model::qwen4exp_decode::{DecoderConfig, Qwen4ExpDecoder};
 use denno_engine::model::qwen4exp_ssm::SsmAttn;
@@ -29,7 +29,7 @@ use denno_engine::tok_gguf::GgufTokenizer;
 use denno_telemetry::{self as telem, Frame};
 use serde_json::{json, Value};
 
-use crate::flash_telemetry::Telemetry;
+use crate::flash_telemetry::{ActTap, Telemetry};
 
 pub struct FlashConfig {
     pub dir: PathBuf,
@@ -231,6 +231,26 @@ impl Flash {
         Qwen4Exp::with_attn(&f, Box::new(attn)).context("モデルを組めない")
     }
 
+    /// P53: 層活性の送出が有効か。テレメトリ本体が有効で、かつ
+    /// `DENNO_TELEMETRY_ACT` が立っているときだけ (既定 off)。
+    fn act_on(&self) -> bool {
+        self.telem.on() && denno_telemetry::act_enabled()
+    }
+
+    /// P53: prefill の logits。act が有効なら層の出口をタップする
+    /// (`TapTokens::Last` = チャンク末尾の 1 トークンだけ)。無効時は従来の
+    /// `prefill_batched` をそのまま呼ぶ (フックを付けないので数値経路は不変)。
+    fn prefill_logits(&self, dec: &mut Qwen4ExpDecoder, prompt: &[u32]) -> Result<Vec<f32>> {
+        if !self.act_on() {
+            return Ok(dec.prefill_batched(prompt, self.batch)?);
+        }
+        let mut tap = ActTap::new(&self.telem, true);
+        let logits =
+            dec.prefill_batched_tapped(prompt, self.batch, TapTokens::Last, |o| tap.on_layer(o))?;
+        tap.report_summary("prefill");
+        Ok(logits)
+    }
+
     /// 生成して、確定した本文を返す。`emit` は差分テキストを受け取る。
     fn generate(&mut self, req: &GenReq, mut emit: impl FnMut(&str) -> Result<()>) -> Result<GenOut> {
         let prompt = self
@@ -266,7 +286,7 @@ impl Flash {
             Some(mut c) if c.toks.len() <= prompt.len() && prompt[..c.toks.len()] == c.toks[..] => {
                 reused = c.toks.len();
                 if reused < prompt.len() {
-                    let lg = c.dec.prefill_batched(&prompt[reused..], self.batch)?;
+                    let lg = self.prefill_logits(&mut c.dec, &prompt[reused..])?;
                     (c.dec, lg)
                 } else {
                     (c.dec, c.logits)
@@ -275,7 +295,7 @@ impl Flash {
             _ => {
                 let m = self.build_model()?;
                 let mut d = Qwen4ExpDecoder::new(m, DecoderConfig::new(self.max_ctx));
-                let lg = d.prefill_batched(&prompt, self.batch)?;
+                let lg = self.prefill_logits(&mut d, &prompt)?;
                 (d, lg)
             }
         };
@@ -315,6 +335,12 @@ impl Flash {
         let mut text = String::new();
         let mut stop_hit: Option<String> = None;
         let mut failed: Option<anyhow::Error> = None;
+        // P53: decode は 1 トークンあたり全層ぶん流す (act が有効なときだけ)。
+        let mut act = if self.act_on() {
+            Some(ActTap::new(&self.telem, false))
+        } else {
+            None
+        };
         let t2 = Instant::now();
         for _ in 0..req.max_tokens {
             let id = sampler.sample(&logits) as u32;
@@ -352,7 +378,11 @@ impl Flash {
             }
             let t_step = t_on.then(Instant::now);
             let pos = dec.tokens().len() as u32;
-            match dec.step(id) {
+            let stepped = match act.as_mut() {
+                Some(tap) => dec.step_tapped(id, |o| tap.on_layer(o)),
+                None => dec.step(id),
+            };
+            match stepped {
                 Ok(lg) => logits = lg,
                 Err(e) => {
                     failed = Some(e.into());
@@ -370,6 +400,9 @@ impl Flash {
                     t_lens: vec![dec.tokens().len() as u32],
                 });
             }
+        }
+        if let Some(tap) = act.as_ref() {
+            tap.report_summary("decode");
         }
         let t_decode = t2.elapsed().as_secs_f64();
         eprintln!(
@@ -765,6 +798,20 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
             "on"
         } else {
             "off (DENNO_TELEMETRY=0)"
+        }
+    );
+    // P53: 層活性 (DENNO_TELEMETRY_ACT, 既定 off)。テレメトリ本体が無効なら動かない。
+    let act_on = telem_on && denno_telemetry::act_enabled();
+    eprintln!(
+        "[flash] telemetry act: {}",
+        if act_on {
+            format!(
+                "on k={} dbg={} (decode=全層 / prefill=チャンク末尾)",
+                denno_telemetry::act_topk(),
+                denno_telemetry::act_dbg()
+            )
+        } else {
+            "off (DENNO_TELEMETRY_ACT=1 で有効)".to_string()
         }
     );
 

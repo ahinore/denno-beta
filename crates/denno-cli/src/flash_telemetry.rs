@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::Result;
+use denno_engine::model::qwen4exp::LayerOut;
 use denno_telemetry::Frame;
 
 /// フレームチャネルの容量 (フレーム数)。denno-telemetry のハブと同じ 4096。
@@ -227,6 +228,100 @@ fn broadcast(shared: &Shared, payload: &[u8]) {
     }
     if !dead.is_empty() {
         lock(&shared.clients).retain(|c| !dead.contains(&c.id));
+    }
+}
+
+// ---------- P53: 層活性の観測タップ ----------
+
+/// P53: 1 層の活性を [`Frame::LayerAct`] にして送出するタップ。
+///
+/// `DENNO_TELEMETRY_ACT=1` のときだけ作る ([`Telemetry::on`] も真であること)。
+/// 推論スレッドから直接 `Telemetry::emit` (try_send) を呼ぶので、満杯・切断は
+/// 捨てられ、relay スレッドが `Gap` として流す (P51 と同じ規律)。
+///
+/// 数値経路には触れない (**読むだけ**)。作業域 (`scratch`) はタップ 1 個で
+/// 使い回すので、層をまたいでも確保は初回だけ。
+pub struct ActTap<'a> {
+    telem: &'a Telemetry,
+    /// 観測するトークン: true なら forward 呼び出しの最後のトークンだけ
+    /// (prefill のチャンク末尾)、false なら全部 (decode)。
+    last_only: bool,
+    k: usize,
+    dbg: bool,
+    scratch: Vec<(f32, u32)>,
+    /// DBG の累計 (frames 枚 / bytes バイト / ns ナノ秒)。
+    frames: u64,
+    bytes: u64,
+    ns: u64,
+}
+
+impl<'a> ActTap<'a> {
+    pub fn new(telem: &'a Telemetry, last_only: bool) -> Self {
+        ActTap {
+            telem,
+            last_only,
+            k: denno_telemetry::act_topk(),
+            dbg: denno_telemetry::act_dbg(),
+            scratch: Vec::new(),
+            frames: 0,
+            bytes: 0,
+            ns: 0,
+        }
+    }
+
+    /// 層の出口 1 回ぶん。`last_only` のときは最後のトークン以外を捨てる。
+    pub fn on_layer(&mut self, o: &LayerOut<'_>) {
+        if self.last_only && o.t + 1 != o.nt {
+            return;
+        }
+        let t0 = self.dbg.then(std::time::Instant::now);
+        let f = denno_telemetry::layer_act_frame(
+            o.il as u16,
+            o.stream0(),
+            self.k,
+            &mut self.scratch,
+        );
+        if let Some(t0) = t0 {
+            let bytes = f.encode().len() as u64;
+            let ns = t0.elapsed().as_nanos() as u64;
+            self.frames += 1;
+            self.bytes += bytes;
+            self.ns += ns;
+            eprintln!(
+                "[tel-act] layer={} t={}/{} k={} ns={ns} bytes={bytes}",
+                o.il, o.t, o.nt, self.k
+            );
+        }
+        self.telem.emit(f);
+    }
+
+    /// DBG のときだけ、累計を 1 行出す (推論の最後に 1 回)。
+    pub fn report_summary(&self, what: &str) {
+        if !self.dbg {
+            return;
+        }
+        eprintln!(
+            "[tel-act] summary {what}: frames={} bytes={} ns={} (1 枚あたり {:.0} ns)",
+            self.frames,
+            self.bytes,
+            self.ns,
+            self.ns as f64 / self.frames.max(1) as f64
+        );
+    }
+
+    /// テスト用: 累計 (frames, bytes, ns)。
+    #[cfg(test)]
+    fn totals(&self) -> (u64, u64, u64) {
+        (self.frames, self.bytes, self.ns)
+    }
+
+    /// テスト用: DBG を強制したタップ (env に依らずに計測する)。
+    #[cfg(test)]
+    fn with_dbg(telem: &'a Telemetry, last_only: bool, k: usize) -> Self {
+        let mut t = Self::new(telem, last_only);
+        t.k = k;
+        t.dbg = true;
+        t
     }
 }
 
