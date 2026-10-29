@@ -4642,10 +4642,54 @@ struct GpuGgufW {
     n: usize,
 }
 
-fn gguf_registry() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Box<GpuGgufW>>> {
-    static REG: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Box<GpuGgufW>>>> =
-        OnceLock::new();
-    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+/// P46: 診断 (`DENNO_GPU_W_DBG=1`)。登録 1 本ごとに 1 行、既定は完全に無効。
+fn w_dbg() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("DENNO_GPU_W_DBG").as_deref(), Ok("1")))
+}
+
+/// P46: GGUF 重みレジストリ (uid → デバイスバッファ + バイト上限つき LRU)。
+///
+/// 既定 (`DENNO_GPU_WEIGHT_MB` 未設定 = 0) は退避しない = 従来と同じ挙動。
+/// 0 以外のときだけ、登録のたびに「上限」と「空き VRAM」を見て古い uid を
+/// **確保の前に**解放する (`cuMemAlloc` の失敗を通常経路にしない)。
+struct GgufReg {
+    map: std::collections::HashMap<u64, Box<GpuGgufW>>,
+    lru: crate::gpu_budget::WeightLru,
+}
+
+fn gguf_registry() -> &'static std::sync::Mutex<GgufReg> {
+    static REG: OnceLock<std::sync::Mutex<GgufReg>> = OnceLock::new();
+    REG.get_or_init(|| {
+        std::sync::Mutex::new(GgufReg {
+            map: std::collections::HashMap::new(),
+            lru: crate::gpu_budget::WeightLru::new(crate::gpu_budget::weight_cap_bytes()),
+        })
+    })
+}
+
+/// 使用中の重み 1 本。Drop で「使用中」を落とす (= 以後は退避対象になる)。
+///
+/// 中の参照は `'static` だが、このガードが生きている間は LRU がその uid を
+/// 退避対象から外すので、指し先が解放されることはない。
+struct GgufWRef {
+    w: &'static GpuGgufW,
+    uid: u64,
+}
+
+impl std::ops::Deref for GgufWRef {
+    type Target = GpuGgufW;
+    fn deref(&self) -> &GpuGgufW {
+        self.w
+    }
+}
+
+impl Drop for GgufWRef {
+    fn drop(&mut self) {
+        if let Ok(mut g) = gguf_registry().lock() {
+            g.lru.unpin(self.uid);
+        }
+    }
 }
 
 /// GGUF ブロック 1 行のバイト数。expert GEMV が扱う 4 型だけ `Some`。
@@ -4665,48 +4709,124 @@ fn gguf_row_bytes(ty: crate::kquant::GgmlType, k: usize) -> Option<usize> {
 
 /// 重みを (初回だけ) VRAM へ上げて常駐エントリを返す。`uid` は呼び出し側が
 /// 安定して持つこと (同じ uid に別の形状・型を渡したらエラー)。
+///
+/// P46: `DENNO_GPU_WEIGHT_MB` が 0 以外なら、確保の前にバイト上限と空き VRAM を
+/// 見て最終使用が最も古い uid を解放する (使用中の uid は飛ばす)。解放された
+/// 重みは次に使うとき、呼び出し側が渡すホストの生ブロックから**同じバイト列で**
+/// 上げ直される (転送はコピーなので GEMV の入力は 1 bit も変わらない)。
 fn weights_for_gguf(
     uid: u64,
     ty: crate::kquant::GgmlType,
     blocks: &[u8],
     k: usize,
     n: usize,
-) -> Result<&'static GpuGgufW> {
+) -> Result<GgufWRef> {
     let reg = gguf_registry();
-    let mut map = reg
+    let mut g = reg
         .lock()
         .map_err(|_| anyhow::anyhow!("gguf weights registry poisoned"))?;
-    if !map.contains_key(&uid) {
-        let rb = gguf_row_bytes(ty, k)
-            .ok_or_else(|| anyhow::anyhow!("gguf: 未対応の型 {ty:?} (k={k})"))?;
-        let want = n
-            .checked_mul(rb)
-            .ok_or_else(|| anyhow::anyhow!("gguf: n * row_bytes が usize を溢れる"))?;
-        if blocks.len() != want {
+    // 既に載っている: 形状/型の一致だけ見て「使った」に更新し、使用中にする。
+    if g.map.contains_key(&uid) {
+        let e = g.map.get(&uid).expect("contains_key");
+        let (ek, en, ety) = (e.k, e.n, e.ty);
+        if (ek, en, ety) != (k, n, ty) {
             bail!(
-                "gguf: バイト数 {} が n * row_bytes = {} と違う (ty={ty:?}, k={k}, n={n})",
-                blocks.len(),
-                want
+                "uid 重複: 同一 uid {uid} に別の形状/型 (登録済み k={ek} n={en} ty={ety:?} / 今回 k={k} n={n} ty={ty:?})"
             );
         }
-        let buf = DevBuffer::from_slice(blocks)?;
-        tracing::info!(
-            "CUDA gguf weight upload (uid={uid}): ty={ty:?} k={k} n={n} ({:.1} MB)",
-            want as f64 / 1e6
-        );
-        map.insert(uid, Box::new(GpuGgufW { buf, ty, k, n }));
-        crate::gpu_budget::note_weight_upload();
+        g.lru.touch(uid);
+        g.lru.pin(uid);
+        let e = g.map.get(&uid).expect("pinned");
+        let w = unsafe { std::mem::transmute::<&GpuGgufW, &'static GpuGgufW>(e.as_ref()) };
+        return Ok(GgufWRef { w, uid });
     }
-    let e = map.get(&uid).expect("just inserted");
-    if (e.k, e.n, e.ty) != (k, n, ty) {
+    let rb = gguf_row_bytes(ty, k)
+        .ok_or_else(|| anyhow::anyhow!("gguf: 未対応の型 {ty:?} (k={k})"))?;
+    let want = n
+        .checked_mul(rb)
+        .ok_or_else(|| anyhow::anyhow!("gguf: n * row_bytes が usize を溢れる"))?;
+    if blocks.len() != want {
         bail!(
-            "uid 重複: 同一 uid {uid} に別の形状/型 (登録済み k={} n={} ty={:?} / 今回 k={k} n={n} ty={ty:?})",
-            e.k,
-            e.n,
-            e.ty
+            "gguf: バイト数 {} が n * row_bytes = {} と違う (ty={ty:?}, k={k}, n={n})",
+            blocks.len(),
+            want
         );
     }
-    Ok(unsafe { std::mem::transmute::<&GpuGgufW, &'static GpuGgufW>(e.as_ref()) })
+    // P46: 確保の前に退避する。上限 0 (既定) のときは記帳だけで 1 本も
+    // 返らない = 従来と同じ経路 (空き VRAM の照会もしない)。
+    let cap = crate::gpu_budget::weight_cap_bytes();
+    let free_mb = if cap == 0 {
+        None
+    } else {
+        dev_mem_mb().map(|(f, _total)| f as u64)
+    };
+    let ev0 = (g.lru.evicted_tensors(), g.lru.evicted_bytes());
+    let victims =
+        crate::gpu_budget::plan_weight_evictions(&mut g.lru, uid, want as u64, cap, free_mb);
+    let mut dropped: Vec<u64> = Vec::new();
+    for v in &victims {
+        if g.map.remove(v).is_some() {
+            dropped.push(*v);
+        }
+    }
+    let freed = g.lru.evicted_bytes().saturating_sub(ev0.1);
+    let freed_n = g.lru.evicted_tensors().saturating_sub(ev0.0);
+    if freed_n > 0 {
+        crate::gpu_budget::note_weight_evicted(freed_n, freed);
+    }
+    let buf = match DevBuffer::from_slice(blocks) {
+        Ok(b) => b,
+        Err(e) => {
+            // 記帳だけ進んで実体が無い状態を残さない。
+            g.lru.note_remove(uid);
+            return Err(e);
+        }
+    };
+    tracing::info!(
+        "CUDA gguf weight upload (uid={uid}): ty={ty:?} k={k} n={n} ({:.1} MB)",
+        want as f64 / 1e6
+    );
+    g.map.insert(uid, Box::new(GpuGgufW { buf, ty, k, n }));
+    g.lru.pin(uid);
+    let resident = g.map.len();
+    let used = g.lru.used_bytes();
+    let evicted_tensors = g.lru.evicted_tensors();
+    let evicted_bytes = g.lru.evicted_bytes();
+    let w = {
+        let e = g.map.get(&uid).expect("just inserted");
+        unsafe { std::mem::transmute::<&GpuGgufW, &'static GpuGgufW>(e.as_ref()) }
+    };
+    drop(g);
+    crate::gpu_budget::note_weight_upload();
+    crate::gpu_budget::note_weight_upload_bytes(want as u64);
+    crate::gpu_budget::note_weight_resident(resident, used);
+    if w_dbg() {
+        let free = match dev_mem_mb() {
+            Some((f, t)) => format!("空き {f} MiB / 全 {t} MiB"),
+            None => "空き 不明".to_string(),
+        };
+        let cap_s = if cap == 0 {
+            "無制限".to_string()
+        } else {
+            format!("{} MiB", cap >> 20)
+        };
+        let ev = if dropped.is_empty() {
+            String::new()
+        } else {
+            let list: Vec<String> = dropped.iter().take(8).map(|u| u.to_string()).collect();
+            format!(" / 今回退避 {} 本 [{}] {:.1} MiB", dropped.len(), list.join(","), freed as f64 / (1 << 20) as f64)
+        };
+        tracing::info!(
+            target: "denno_engine::gpu_w",
+            "[gpu-w] uid={uid} ty={ty:?} k={k} n={n} {:.2} MB / 常駐 {} 本 {:.1} MiB / 上限 {cap_s} / 退避 計 {} 本 {:.1} MiB{ev} / {free}",
+            want as f64 / 1e6,
+            resident,
+            used as f64 / (1 << 20) as f64,
+            evicted_tensors,
+            evicted_bytes as f64 / (1 << 20) as f64,
+        );
+    }
+    Ok(GgufWRef { w, uid })
 }
 
 /// P-MOE-E5: GGUF ブロックのままの線形層 (m=1) を GPU で計算する。
