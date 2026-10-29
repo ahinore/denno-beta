@@ -6,33 +6,61 @@
 <title>denno-view 3D — neural flow</title>
 <link rel="icon" href="data:,">
 <style>
-  :root { --bg:#05070d; --fg:#d7f7ff; --acc:#00f0ff; --acc2:#ff2bd6; }
+  :root { --bg:#04060b; --fg:#cfeeff; --acc:#00eaff; --acc2:#ff2bd6; --dim:#4d6470; }
   html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
-              font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; overflow:hidden; }
+              font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; overflow:hidden; }
   #c { display:block; width:100%; height:100%; }
-  #hud { position:fixed; left:14px; top:12px; pointer-events:none;
-         text-shadow:0 0 8px rgba(0,240,255,.55); letter-spacing:.06em; }
+  .panel { position:fixed; pointer-events:none; letter-spacing:.05em; }
+  #hud { left:14px; top:12px; text-shadow:0 0 10px rgba(0,234,255,.5); }
   #hud b { color:var(--acc); font-weight:600; }
-  #hud .dim { color:#5b7480; }
+  #hud .dim { color:var(--dim); }
   #hud .mag { color:var(--acc2); }
-  #legend { position:fixed; right:14px; bottom:12px; text-align:right;
-            color:#5b7480; pointer-events:none; line-height:1.7; }
+  #legend { right:14px; bottom:12px; text-align:right; color:var(--dim); line-height:1.8; }
   #legend .k { color:var(--acc); }
+  #err { display:none; position:fixed; left:14px; bottom:12px; right:14px; max-height:38%;
+         overflow:auto; white-space:pre-wrap; color:#ff5c7a; background:rgba(20,0,8,.86);
+         border:1px solid #ff2b55; border-radius:4px; padding:8px 10px;
+         font-size:11px; line-height:1.5; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="hud">
+<div id="hud" class="panel">
   <div><b>denno-view</b> 3D neural flow <span class="dim">| three.js r160</span></div>
-  <div id="stat">layers <b>48</b> · neurons/layer <b>512</b> (of 2560, stride 5) · fps <b id="fps">--</b></div>
+  <div>layers <b id="nlayers">48</b> · boxes/layer <b id="nneur">512</b> <span class="dim">(of 2560, stride 5)</span> · fps <b id="fps">--</b></div>
   <div id="mode" class="mag">mode: demo (telemetry inactive)</div>
+  <div id="dbg" class="dim"></div>
+  <div id="probe" class="dim"></div>
+  <div id="dump" style="display:none"></div>
 </div>
-<div id="legend">
+<div id="legend" class="panel">
   <div><span class="k">box</span> = neuron</div>
   <div><span class="k">glow</span> = activation</div>
   <div><span class="k">line</span> = layer-to-layer link</div>
   <div>drag: rotate · wheel: zoom</div>
 </div>
+<div id="err"></div>
+<script>
+// モジュールの読み込み失敗は無言で画面が真っ暗になるため、必ず表に出す
+(function () {
+  var box = document.getElementById('err'), shown = 0;
+  function show(msg) {
+    shown++;
+    box.style.display = 'block';
+    box.textContent += (shown === 1 ? '' : '\n') + String(msg).slice(0, 600);
+  }
+  window.addEventListener('error', function (e) {
+    if (e.target && e.target.tagName === 'SCRIPT') show('script load failed: ' + (e.target.src || ''));
+    else show((e.message || 'error') + (e.filename ? ' @ ' + e.filename.split('/').pop() + ':' + e.lineno : ''));
+  }, true);
+  window.addEventListener('unhandledrejection', function (e) {
+    show('promise rejected: ' + (e.reason && e.reason.message ? e.reason.message : e.reason));
+  });
+  setTimeout(function () {
+    if (!window.__viewReady) show('no frame rendered after 4s (module did not start)');
+  }, 4000);
+})();
+</script>
 
 <script type="importmap">
 { "imports": {
@@ -49,210 +77,397 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
-// ---- config -------------------------------------------------------------
-const LAYERS   = 48;     // Flash-Next の層数 (ServerInfo で上書き)
-const NEURONS  = 512;    // 1 層の可視化ボックス数 (2560 を stride 5 で間引く)
-const COLS     = 32;     // 格子
-const ROWS     = 16;
-const ZSTEP    = 2.6;    // 層の間隔
-const SPACING  = 0.30;   // ボックス間隔
-const TOPK     = 10;     // 線を引く上位ニューロン数
-const CYAN     = new THREE.Color('#00f0ff');
-const MAGENTA  = new THREE.Color('#ff2bd6');
-const HOT      = new THREE.Color('#fff2b0');
+// ---- layout -------------------------------------------------------------
+const Q = new URLSearchParams(location.search);
+const LAYERS  = 48;
+const COLS    = 32;
+const ROWS    = 16;
+const NEURONS = COLS * ROWS;              // 512 (2560 を stride 5 で間引いた見立て)
+const SPACING = 0.34;                     // ボックス間隔
+const BOX     = 0.20;                     // ボックス一辺 (間隔より十分小さく)
+const ZSTEP   = 2.6;                      // 層の間隔
+const TOPK    = 14;                       // 層間線の本数
+const DENSE   = Q.get('n') !== '256';
+
+const CYAN    = new THREE.Color('#00eaff');
+const MAGENTA = new THREE.Color('#ff2bd6');
+const HOT     = new THREE.Color('#eafcff');
+const DEEP    = new THREE.Color('#0a2130');
 
 // ---- renderer -----------------------------------------------------------
-const canvas   = document.getElementById('c');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, powerPreference:'high-performance' });
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, powerPreference:'high-performance',
+                          preserveDrawingBuffer: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight, false);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.05;
+renderer.toneMappingExposure = 1.10;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color('#05070d');
-scene.fog = new THREE.FogExp2('#05070d', 0.017);
+scene.background = new THREE.Color('#04060b');
+scene.fog = new THREE.FogExp2('#04060b', 0.0085);
 
-const camera = new THREE.PerspectiveCamera(50, innerWidth/innerHeight, 0.1, 400);
-camera.position.set(0, 15, 34);
+const totalZ = (LAYERS - 1) * ZSTEP;
+const center = new THREE.Vector3(0, 0, -totalZ / 2);
+const camera = new THREE.PerspectiveCamera(42, innerWidth/innerHeight, 0.1, 600);
+camera.position.set(15, 9, 12);
+camera.lookAt(center);
+
 const controls = new OrbitControls(camera, canvas);
-controls.target.set(0, 0, -(LAYERS-1)*ZSTEP*0.42);
+controls.target.copy(center);
 controls.enableDamping = true;
-controls.dampingFactor = 0.06;
+controls.dampingFactor = 0.07;
 controls.autoRotate = true;
-controls.autoRotateSpeed = 0.35;
-controls.maxPolarAngle = Math.PI*0.92;
+controls.autoRotateSpeed = 0.5;
+controls.minDistance = 8;
+controls.maxDistance = 240;
 
-// ---- floor grid (cyberpunk) --------------------------------------------
-const grid = new THREE.GridHelper(260, 64, 0x0a3a44, 0x08222a);
-grid.position.y = -9;
-scene.add(grid);
-const glowGrid = new THREE.GridHelper(260, 16, 0x0f6070, 0x0f6070);
-glowGrid.position.y = -8.99;
-glowGrid.material.opacity = 0.35; glowGrid.material.transparent = true;
-scene.add(glowGrid);
+// ---- floor grid ---------------------------------------------------------
+function gridPlane(size, div, c1, c2, y) {
+  const g = new THREE.GridHelper(size, div, c1, c2);
+  g.position.y = y;
+  g.material.transparent = true;
+  g.material.opacity = 0.5;
+  g.material.depthWrite = false;
+  return g;
+}
+scene.add(gridPlane(320, 80, 0x0d4a58, 0x07222b, -7.5));
+scene.add(gridPlane(160, 20, 0x1a7d92, 0x114a58, -7.49));
 
 // ---- layer slabs --------------------------------------------------------
-const geo = new THREE.BoxGeometry(1,1,1);
-const mat = new THREE.MeshStandardMaterial({
-  color: 0x0b1c24, emissive: 0x000000, metalness: 0.65, roughness: 0.32
-});
+const boxGeo = new THREE.BoxGeometry(BOX, BOX, BOX);
+const baseMat = new THREE.MeshBasicMaterial({ color: 0xffffff, fog: true });
 const slabGroup = new THREE.Group();
 scene.add(slabGroup);
 
 const slabs = [];
-const x0 = -(COLS-1)*SPACING/2, y0 = -(ROWS-1)*SPACING/2;
+const m4 = new THREE.Matrix4();
+
 for (let L = 0; L < LAYERS; L++) {
-  const inst = new THREE.InstancedMesh(geo, mat.clone(), NEURONS);
+  const n = DENSE ? NEURONS : 256;
+  const cols = DENSE ? COLS : 16;
+  const rows = DENSE ? ROWS : 16;
+  const sp = DENSE ? SPACING : SPACING * 2;
+  const inst = new THREE.InstancedMesh(boxGeo, baseMat.clone(), n);
   inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  const m = new THREE.Matrix4();
-  const pos = new Float32Array(NEURONS*3);
-  for (let n = 0; n < NEURONS; n++) {
-    const cx = n % COLS, cy = (n / COLS) | 0;
-    const x = x0 + cx*SPACING, y = y0 + cy*SPACING, z = -L*ZSTEP;
-    pos[n*3] = x; pos[n*3+1] = y; pos[n*3+2] = z;
-    m.makeTranslation(x, y, z);
-    inst.setMatrixAt(n, m);
-    inst.setColorAt(n, CYAN.clone().multiplyScalar(0.08));
+  const pos = new Float32Array(n * 3);
+  const hw = (cols - 1) * sp / 2, hh = (rows - 1) * sp / 2;
+  for (let k = 0; k < n; k++) {
+    const cx = k % cols, cy = (k / cols) | 0;
+    const x = -hw + cx * sp, y = hh - cy * sp, z = -L * ZSTEP;
+    pos[k*3] = x; pos[k*3+1] = y; pos[k*3+2] = z;
+    m4.makeTranslation(x, y, z);
+    inst.setMatrixAt(k, m4);
+    inst.setColorAt(k, DEEP.clone());
   }
   inst.instanceMatrix.needsUpdate = true;
   inst.instanceColor.needsUpdate = true;
+  inst.frustumCulled = false;
   slabGroup.add(inst);
-  slabs.push({ inst, pos, act: new Float32Array(NEURONS) });
+  slabs.push({ inst, pos, act: new Float32Array(n), n, cols, rows, sp });
 }
 
+// 層の枠 (板として読ませる)。4 層ごとに明るくする。
+const w0 = (COLS - 1) * SPACING + 0.5, h0 = (ROWS - 1) * SPACING + 0.5;
+const frameGeo = new THREE.BufferGeometry();
+frameGeo.setAttribute('position', new THREE.Float32BufferAttribute([
+  -w0/2,-h0/2,0,  w0/2,-h0/2,0,
+   w0/2,-h0/2,0,  w0/2, h0/2,0,
+   w0/2, h0/2,0, -w0/2, h0/2,0,
+  -w0/2, h0/2,0, -w0/2,-h0/2,0
+], 3));
+for (let L = 0; L < LAYERS; L++) {
+  const major = (L % 4 === 0) || L === LAYERS - 1;
+  const mat = new THREE.LineBasicMaterial({
+    color: major ? 0x27b6cc : 0x0d3a46,
+    transparent: true, opacity: major ? 0.7 : 0.32,
+    blending: THREE.AdditiveBlending, depthWrite: false
+  });
+  const f = new THREE.LineSegments(frameGeo, mat);
+  f.position.z = -L * ZSTEP;
+  scene.add(f);
+}
+
+// 層番号ラベル (4 層ごと)
+function layerLabel(L) {
+  const cv = document.createElement('canvas');
+  cv.width = 128; cv.height = 64;
+  const g = cv.getContext('2d');
+  g.font = 'bold 40px ui-monospace, monospace';
+  g.fillStyle = '#3fd6ea';
+  g.textAlign = 'right';
+  g.textBaseline = 'middle';
+  g.fillText(String(L).padStart(2, '0'), 122, 34);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, transparent: true, depthWrite: false, opacity: 0.85
+  }));
+  sp.scale.set(2.2, 1.1, 1);
+  sp.position.set(-w0 / 2 - 1.8, 0, -L * ZSTEP);
+  return sp;
+}
+for (let L = 0; L < LAYERS; L += 4) scene.add(layerLabel(L));
+
 // ---- inter-layer edges --------------------------------------------------
+const EDGES = (LAYERS - 1) * TOPK;
 const edgeGeo = new THREE.BufferGeometry();
-const EDGES = (LAYERS-1) * TOPK * 2;           // 2 本/上位ニューロン
 const edgePos = new Float32Array(EDGES * 2 * 3);
 const edgeCol = new Float32Array(EDGES * 2 * 3);
 edgeGeo.setAttribute('position', new THREE.BufferAttribute(edgePos, 3));
 edgeGeo.setAttribute('color', new THREE.BufferAttribute(edgeCol, 3));
 const edgeMat = new THREE.LineBasicMaterial({
-  vertexColors: true, transparent: true, opacity: 0.55,
+  vertexColors: true, transparent: true, opacity: 1.0,
   blending: THREE.AdditiveBlending, depthWrite: false
 });
-const edges = new THREE.LineSegments(edgeGeo, edgeMat);
-scene.add(edges);
+scene.add(new THREE.LineSegments(edgeGeo, edgeMat));
+
+// ---- flow particles (層間を流れる活性) -----------------------------------
+const PER_PAIR = 6;                       // 層ペアごとの粒の数
+const PARTICLES = (LAYERS - 1) * PER_PAIR;
+const flowGeo = new THREE.BufferGeometry();
+const flowPos = new Float32Array(PARTICLES * 3);
+const flowCol = new Float32Array(PARTICLES * 3);
+flowGeo.setAttribute('position', new THREE.BufferAttribute(flowPos, 3));
+flowGeo.setAttribute('color', new THREE.BufferAttribute(flowCol, 3));
+const dotTex = (() => {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = 64;
+  const g = cv.getContext('2d');
+  const grd = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grd.addColorStop(0, 'rgba(255,255,255,1)');
+  grd.addColorStop(0.35, 'rgba(190,255,255,0.55)');
+  grd.addColorStop(1, 'rgba(0,180,220,0)');
+  g.fillStyle = grd;
+  g.fillRect(0, 0, 64, 64);
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+})();
+const flowMat = new THREE.PointsMaterial({
+  size: 1.6, map: dotTex, vertexColors: true, transparent: true,
+  blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true, fog: true
+});
+const flow = new THREE.Points(flowGeo, flowMat);
+flow.frustumCulled = false;
+scene.add(flow);
+
+// 各層ペアの結び先を決める (箱の index と、その 2 層の活性)
+function flowPairs(L) {
+  const a = slabs[L], b = slabs[L + 1];
+  orderBuf.length = 0;
+  for (let k = 0; k < a.n; k++) orderBuf.push(k);
+  orderBuf.sort((p, q) => (b.act[q] + a.act[p]) - (b.act[p] + a.act[q]));
+  const out = [];
+  for (let i = 0; i < PER_PAIR; i++) {
+    const k1 = orderBuf[i], av = a.act[k1];
+    let k2 = k1, bv = -1;
+    for (let d = -2; d <= 2; d++) {
+      const c = k1 + d * a.cols + d;
+      if (c < 0 || c >= b.n) continue;
+      if (b.act[c] > bv) { bv = b.act[c]; k2 = c; }
+    }
+    out.push([k1, k2, av, bv]);
+  }
+  return out;
+}
+
+function updateFlow(t) {
+  let n = 0;
+  for (let L = 0; L < LAYERS - 1; L++) {
+    const a = slabs[L], b = slabs[L + 1];
+    const pairs = flowPairs(L);
+    for (let i = 0; i < pairs.length; i++) {
+      const [k1, k2, av, bv] = pairs[i];
+      const w = Math.min(1, av * 0.8 + bv * 0.5);
+      const ph = ((t * 0.85 + i * 0.37 + L * 0.11) % 1);
+      const o = n * 3;
+      flowPos[o]   = a.pos[k1*3]   + (b.pos[k2*3]   - a.pos[k1*3])   * ph;
+      flowPos[o+1] = a.pos[k1*3+1] + (b.pos[k2*3+1] - a.pos[k1*3+1]) * ph;
+      flowPos[o+2] = a.pos[k1*3+2] + (b.pos[k2*3+2] - a.pos[k1*3+2]) * ph;
+      const fade = Math.sin(Math.PI * ph) * Math.min(1, w * 1.6 + 0.15);
+      cTmp.copy(CYAN).lerp(MAGENTA, Math.min(1, av * 0.9));
+      flowCol[o] = cTmp.r * fade; flowCol[o+1] = cTmp.g * fade; flowCol[o+2] = cTmp.b * fade;
+      n++;
+    }
+  }
+  flowGeo.attributes.position.needsUpdate = true;
+  flowGeo.attributes.color.needsUpdate = true;
+}
 
 // ---- postprocessing -----------------------------------------------------
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
-const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.85, 0.75, 0.18);
+const bloom = new UnrealBloomPass(
+  new THREE.Vector2(innerWidth / 2, innerHeight / 2), 0.95, 0.42, 0.28
+);
 composer.addPass(bloom);
 composer.addPass(new OutputPass());
 
-// ---- activation state (demo until telemetry arrives) --------------------
-const demo = {
-  on: true,
-  t: 0,
-  speed: 0.9,          // layer を進む速さ
-  wave: 9.0,           // 同時に光る層の幅
-  noise: 0.35
-};
-// 実テレメトリ: LayerAct { layer, idx[], val[] } を受けたら demo.on = false
-const live = { layer: -1, idx: [], val: [], ts: 0 };
+// ---- activation ---------------------------------------------------------
+const demo = { on: true, t: 0, speed: 1.15, wave: 7.0 };
+const live = { layer: -1, hit: new Map(), top: new Map(), ts: 0 };
+const cTmp = new THREE.Color();
 
-const tmpC = new THREE.Color();
-function applyActivation(dt) {
-  demo.t += dt;
-  for (let L = 0; L < LAYERS; L++) {
-    const s = slabs[L];
-    let head;
-    if (demo.on) {
-      // 層を下から上へ走る波 + ニューロンごとのゆらぎ
-      const center = (demo.t*demo.speed) % (LAYERS + demo.wave*2) - demo.wave;
-      const d = Math.abs(L - center);
-      head = Math.exp(-(d*d)/(2*demo.wave*demo.wave));
-      head *= 0.75 + 0.25*Math.sin(demo.t*2.1 + L*0.7);
-    } else {
-      const age = performance.now() - live.ts;
-      head = (L === live.layer) ? Math.exp(-age/260) : Math.max(0, 1 - age/900)*0.25;
-    }
-    for (let n = 0; n < NEURONS; n++) {
-      let a;
-      if (demo.on) {
-        const r = Math.sin(n*12.9898 + L*78.233)*43758.5453;
-        const rnd = r - Math.floor(r);
-        a = head * (0.25 + 0.75*rnd) * (0.6 + 0.4*Math.sin(demo.t*3 + n*0.11));
-      } else {
-        a = head;
-      }
-      a = Math.max(0, Math.min(1, a));
-      s.act[n] = s.act[n]*0.72 + a*0.28;             // 平滑化
-    }
-    const col = s.inst.instanceColor.array;
-    for (let n = 0; n < NEURONS; n++) {
-      const a = s.act[n];
-      // 低: 暗いシアン → 高: シアン→白熱
-      tmpC.copy(CYAN).multiplyScalar(0.06 + a*0.9);
-      if (a > 0.55) tmpC.lerp(HOT, (a-0.55)*1.6);
-      if (a > 0.85) tmpC.lerp(MAGENTA, (a-0.85)*3.0);
-      col[n*3] = tmpC.r; col[n*3+1] = tmpC.g; col[n*3+2] = tmpC.b;
-    }
-    s.inst.instanceColor.needsUpdate = true;
-    s.inst.material.emissive.setRGB(0.02, 0.10, 0.13);
+// 層ごとに「光る箱」の集合を先に決める (毎フレーム同じ場所が光るので構造が読める)
+const HOT_PER_LAYER = 72;
+const hotSets = [];
+for (let L = 0; L < LAYERS; L++) {
+  const set = new Uint8Array(NEURONS);
+  for (let i = 0; i < HOT_PER_LAYER; i++) {
+    const r = Math.sin((i + 1) * 91.7 + L * 311.9) * 43758.5453;
+    set[Math.floor((r - Math.floor(r)) * NEURONS) % NEURONS] = 1;
   }
+  hotSets.push(set);
 }
 
+function updateLayer(L) {
+  const s = slabs[L], n = s.n;
+  let head;
+  if (demo.on) {
+    const span = LAYERS + demo.wave * 2;
+    const centerL = (demo.t * demo.speed) % span - demo.wave;
+    const d = L - centerL;
+    head = Math.exp(-(d * d) / (2 * demo.wave * demo.wave));
+    head *= 0.80 + 0.20 * Math.sin(demo.t * 1.7 + L * 0.8);
+  } else {
+    const age = performance.now() - live.ts;
+    head = (live.hit.get(L) || 0) * Math.exp(-age / 420) + 0.10 * Math.exp(-age / 1500);
+  }
+
+  const hot = hotSets[L];
+  const top = demo.on ? null : live.top.get(L);
+  for (let k = 0; k < n; k++) {
+    let a;
+    if (demo.on) {
+      const lit = hot[k] ? 1.0 : 0.08;
+      const r = Math.sin(k * 12.9898 + L * 78.233) * 43758.5453;
+      const flick = 0.75 + 0.25 * (r - Math.floor(r));
+      a = head * lit * flick;
+    } else {
+      a = head * (top && top.has(k) ? 1.0 : 0.10);
+    }
+    a = a < 0 ? 0 : (a > 1 ? 1 : a);
+    s.act[k] += (a - s.act[k]) * 0.35;
+  }
+
+  const col = s.inst.instanceColor.array;
+  for (let k = 0; k < n; k++) {
+    const a = s.act[k];
+    if (a < 0.015) {
+      col[k*3] = 0.016; col[k*3+1] = 0.040; col[k*3+2] = 0.054;
+      continue;
+    }
+    const g2 = a * a;
+    cTmp.copy(CYAN).multiplyScalar(0.07 + g2 * 1.5);
+    if (a > 0.68) cTmp.lerp(HOT, (a - 0.68) * 1.3);
+    if (a > 0.90) cTmp.lerp(MAGENTA, (a - 0.90) * 2.2);
+    col[k*3] = cTmp.r; col[k*3+1] = cTmp.g; col[k*3+2] = cTmp.b;
+  }
+  s.inst.instanceColor.needsUpdate = true;
+}
+
+const orderBuf = [];
 function updateEdges() {
   let e = 0;
-  for (let L = 0; L < LAYERS-1; L++) {
-    const a = slabs[L], b = slabs[L+1];
-    const top = [];
-    for (let n = 0; n < NEURONS; n++) top.push([n, a.act[n]]);
-    top.sort((p,q)=>q[1]-p[1]);
-    for (let k = 0; k < TOPK; k++) {
-      const [n, av] = top[k];
-      const m = (n*7 + L*13 + k*3) % NEURONS;      // 疑似結合 (実結合が来たら差し替え)
-      const bv = b.act[m];
-      const w = Math.min(1, (av + bv)*0.6);
-      if (w < 0.06) { continue; }
-      const o = e*6;
-      edgePos[o  ] = a.pos[n*3  ]; edgePos[o+1] = a.pos[n*3+1]; edgePos[o+2] = a.pos[n*3+2];
-      edgePos[o+3] = b.pos[m*3  ]; edgePos[o+4] = b.pos[m*3+1]; edgePos[o+5] = b.pos[m*3+2];
-      const c = tmpC.copy(CYAN).lerp(MAGENTA, Math.min(1, av*1.4));
-      edgeCol[o  ] = c.r*w; edgeCol[o+1] = c.g*w; edgeCol[o+2] = c.b*w;
-      edgeCol[o+3] = c.r*w; edgeCol[o+4] = c.g*w; edgeCol[o+5] = c.b*w;
+  for (let L = 0; L < LAYERS - 1; L++) {
+    const a = slabs[L], b = slabs[L + 1];
+    orderBuf.length = 0;
+    for (let k = 0; k < a.n; k++) orderBuf.push(k);
+    orderBuf.sort((p, q) => (b.act[q] + a.act[p]) - (b.act[p] + a.act[q]));
+    for (let i = 0; i < TOPK; i++) {
+      const k1 = orderBuf[i];
+      const av = a.act[k1];
+      if (av < 0.16) continue;
+      // 次の層の近傍 (窓 ±2 行/列) で最も活性な相手へ結ぶ
+      let k2 = k1, bv = -1;
+      for (let d = -2; d <= 2; d++) {
+        const c = k1 + d * a.cols + d;
+        if (c < 0 || c >= b.n) continue;
+        if (b.act[c] > bv) { bv = b.act[c]; k2 = c; }
+      }
+      const w = Math.min(1, 0.35 + av * 0.9 + bv * 0.4);
+      if (w < 0.25) continue;
+      const o = e * 6;
+      edgePos[o]   = a.pos[k1*3]; edgePos[o+1] = a.pos[k1*3+1]; edgePos[o+2] = a.pos[k1*3+2];
+      edgePos[o+3] = b.pos[k2*3]; edgePos[o+4] = b.pos[k2*3+1]; edgePos[o+5] = b.pos[k2*3+2];
+      cTmp.copy(CYAN).lerp(MAGENTA, Math.min(1, av * 1.3));
+      const r = cTmp.r * w, g = cTmp.g * w, bl = cTmp.b * w;
+      edgeCol[o] = r; edgeCol[o+1] = g; edgeCol[o+2] = bl;
+      edgeCol[o+3] = r; edgeCol[o+4] = g; edgeCol[o+5] = bl;
       e++;
     }
   }
-  for (let i = e*6; i < EDGES*6; i++) edgePos[i] = 0;
-  edgeGeo.setDrawRange(0, e*2);
+  edgeGeo.setDrawRange(0, e * 2);
   edgeGeo.attributes.position.needsUpdate = true;
   edgeGeo.attributes.color.needsUpdate = true;
 }
 
-// ---- telemetry hook -----------------------------------------------------
-// /ws から生フレームが流れてくる。フレーム形式 (MAGIC/version/kind + varint) の解読は
-// 開発タスクで実装する。ここでは LayerAct 相当を受け取ったら差し替える口だけ用意する。
-export function onLayerActivation(layer, idx, val) {
+// 実テレメトリ (task 53 の LayerAct) を受けたらここを呼ぶ
+window.onLayerActivation = function (layer, idx, val) {
   demo.on = false;
-  live.layer = layer; live.idx = idx; live.val = val; live.ts = performance.now();
-  document.getElementById('mode').textContent = 'mode: live telemetry';
-}
+  live.layer = layer; live.ts = performance.now();
+  let sum = 0;
+  const top = new Set();
+  for (let i = 0; i < idx.length; i++) { sum += val[i]; top.add(idx[i]); }
+  live.hit.set(layer, idx.length ? sum / idx.length : 0);
+  live.top.set(layer, top);
+  const el = document.getElementById('mode');
+  if (el) el.textContent = 'mode: live telemetry (layer ' + layer + ')';
+};
 
 // ---- loop ---------------------------------------------------------------
 const clock = new THREE.Clock();
-let fpsAcc = 0, fpsN = 0;
+let acc = 0, cnt = 0, frameNo = 0;
 function frame() {
-  const dt = Math.min(0.05, clock.getDelta());
-  applyActivation(dt);
-  if ((frame.n = (frame.n||0)+1) % 2 === 0) updateEdges();
+  const dt = Math.min(0.06, clock.getDelta());
+  if (demo.on) demo.t += dt;
+  for (let L = 0; L < LAYERS; L++) updateLayer(L);
+  if (frameNo++ % 2 === 0) updateEdges();
+  updateFlow(demo.t);
   controls.update();
   composer.render();
+  window.__viewReady = true;
 
-  fpsAcc += dt; fpsN++;
-  if (fpsAcc > 0.5) {
-    document.getElementById('fps').textContent = (fpsN/fpsAcc).toFixed(0);
-    fpsAcc = 0; fpsN = 0;
+  acc += dt; cnt++;
+  if (acc > 0.5) {
+    document.getElementById('fps').textContent = (cnt / acc).toFixed(0);
+    acc = 0; cnt = 0;
   }
   requestAnimationFrame(frame);
 }
-frame();
+document.getElementById('nneur').textContent = DENSE ? NEURONS : 256;
+
+// ?shot=1 : ヘッドレス撮影用。固定ステップで進め、最後の描画は rAF の中で行う
+// (rAF 外で 1 回だけ描くと合成されずスクリーンショットが空になる)
+if (Q.get('shot')) {
+  const steps = parseInt(Q.get('steps') || '140', 10);
+  let i = 0;
+  const tick = () => {
+    demo.t += 1 / 60;
+    for (let L = 0; L < LAYERS; L++) updateLayer(L);
+    updateEdges();
+    updateFlow(demo.t);
+    composer.render();
+    if (++i < steps) { requestAnimationFrame(tick); return; }
+    window.__viewReady = true;
+    document.getElementById('fps').textContent = 'shot';
+    // ヘッドレスのスクショは canvas が合成されないことがあるため、画素を直接書き出す
+    document.getElementById('dump').textContent = canvas.toDataURL('image/png');
+    const inf = renderer.info.render;
+    document.getElementById('dbg').textContent =
+      'dbg: calls=' + inf.calls + ' tris=' + inf.triangles +
+      ' cam=' + camera.position.toArray().map(v => v.toFixed(1)).join(',') +
+      ' aspect=' + camera.aspect.toFixed(2) +
+      ' size=' + renderer.getSize(new THREE.Vector2()).toArray().join('x');
+  };
+  requestAnimationFrame(tick);
+} else {
+  frame();
+}
 
 addEventListener('resize', () => {
-  camera.aspect = innerWidth/innerHeight;
+  camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight, false);
   composer.setSize(innerWidth, innerHeight);

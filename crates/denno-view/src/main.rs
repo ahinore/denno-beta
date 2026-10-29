@@ -353,6 +353,7 @@ async fn vendor(axum::extract::Path(path): axum::extract::Path<String>) -> axum:
         "three.module.js" => (include_bytes!("vendor/three.module.js"), "text/javascript; charset=utf-8"),
         "addons/controls/OrbitControls.js" => (include_bytes!("vendor/addons/controls/OrbitControls.js"), "text/javascript; charset=utf-8"),
         "addons/postprocessing/EffectComposer.js" => (include_bytes!("vendor/addons/postprocessing/EffectComposer.js"), "text/javascript; charset=utf-8"),
+        "addons/postprocessing/Pass.js" => (include_bytes!("vendor/addons/postprocessing/Pass.js"), "text/javascript; charset=utf-8"),
         "addons/postprocessing/RenderPass.js" => (include_bytes!("vendor/addons/postprocessing/RenderPass.js"), "text/javascript; charset=utf-8"),
         "addons/postprocessing/ShaderPass.js" => (include_bytes!("vendor/addons/postprocessing/ShaderPass.js"), "text/javascript; charset=utf-8"),
         "addons/postprocessing/MaskPass.js" => (include_bytes!("vendor/addons/postprocessing/MaskPass.js"), "text/javascript; charset=utf-8"),
