@@ -45,6 +45,11 @@ pub mod kind {
     pub const EXPERT_RESIDENCY: u8 = 14;
     /// 置き場所の統計 (VRAM / RAM / SSD)。1 秒に 1 回 (P54)。
     pub const TIER_STATS: u8 = 15;
+    /// 1 層の MoE で実際に選ばれた expert index と gate 重み (P56: 3D ビューア用)。
+    ///
+    /// 13..15 は arch_telemetry 側の RoleAct (13) / ExpertResidency (14) /
+    /// TierStats (15) が使う。番号を詰めない (kind はブランチを跨いで同じ意味にする)。
+    pub const ROUTER_TOPK: u8 = 16;
 }
 
 pub const MAGIC: [u8; 4] = *b"DNTL";
@@ -261,6 +266,20 @@ pub enum Frame {
     ///   (`DENNO_EXPERT_CACHE_MB`、無効なら 0)
     /// - `ssd_reads`: SSD からの読み (pread) の累計回数
     TierStats { vram_used_mb: u32, vram_total_mb: u32, ram_experts: u32, ssd_reads: u32 },
+    /// 1 層の MoE で実際に選ばれた expert index と gate 重み (P56: 3D ビューア用)。
+    ///
+    /// - `layer`: 層番号
+    /// - `experts`: 選ばれた expert index (`n_expert_used` 個以下)。**重みの降順**。
+    ///   同値 (f16 に丸める前の f32 が同じ) は index 昇順。
+    /// - `weights`: `weights[j]` は `experts[j]` の gate 重みの f16 ビット。
+    ///   softmax → top-k 再正規化後の値 (合計 1、丸め前は f32)。
+    ///
+    /// フレームにトークン位置は無い ([`Frame::LayerAct`] と同じ規則)。受け手は
+    /// 直前の [`Frame::Token`] / [`Frame::Prefill`] と並び順で対応付ける。
+    ///
+    /// 送出は `DENNO_TELEMETRY_ARCH` が立っているときだけ (既定 off)。
+    /// decode は 1 トークンにつき層数ぶん、prefill はチャンク末尾の 1 トークンだけ。
+    RouterTopK { layer: u16, experts: Vec<u16>, weights: Vec<u16> },
 }
 
 impl Frame {
@@ -281,6 +300,7 @@ impl Frame {
             Frame::RoleAct { .. } => kind::ROLE_ACT,
             Frame::ExpertResidency { .. } => kind::EXPERT_RESIDENCY,
             Frame::TierStats { .. } => kind::TIER_STATS,
+            Frame::RouterTopK { .. } => kind::ROUTER_TOPK,
         }
     }
 
@@ -394,6 +414,17 @@ impl Frame {
                 put_varint_u32(&mut b, *vram_total_mb);
                 put_varint_u32(&mut b, *ram_experts);
                 put_varint_u32(&mut b, *ssd_reads);
+            }
+            Frame::RouterTopK { layer, experts, weights } => {
+                put_varint_u32(&mut b, *layer as u32);
+                put_varint_u32(&mut b, experts.len() as u32);
+                for &e in experts {
+                    put_varint_u32(&mut b, e as u32);
+                }
+                // 重みは experts と同じ本数を f16 ビット (2B, LE) で並べる。
+                for &w in weights {
+                    b.extend_from_slice(&w.to_le_bytes());
+                }
             }
         }
         b
@@ -572,6 +603,31 @@ impl Frame {
                 let ram_experts = u32v(p, &mut i)?;
                 let ssd_reads = u32v(p, &mut i)?;
                 Frame::TierStats { vram_used_mb, vram_total_mb, ram_experts, ssd_reads }
+            kind::ROUTER_TOPK => {
+                let layer = u32v(p, &mut i)? as u16;
+                let n = u32v(p, &mut i)? as usize;
+                let mut experts = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let e = u32v(p, &mut i)?;
+                    if e > u16::MAX as u32 {
+                        return Err(format!("router_topk: expert index {e} が u16 を超える"));
+                    }
+                    experts.push(e as u16);
+                }
+                let mut weights = Vec::with_capacity(n);
+                for _ in 0..n {
+                    // 途中で切れたペイロードで panic しない (index の範囲を先に見る)。
+                    if i + 2 > p.len() {
+                        return Err(format!(
+                            "router_topk: weights が途中で切れている ({i}/{})",
+                            p.len()
+                        ));
+                    }
+                    let wb = [p[i], p[i + 1]];
+                    i += 2;
+                    weights.push(u16::from_le_bytes(wb));
+                }
+                Frame::RouterTopK { layer, experts, weights }
             }
             other => return Err(format!("unknown kind: {other}")),
         };
@@ -913,6 +969,63 @@ pub fn layer_act_frame(layer: u16, x: &[f32], k: usize, scratch: &mut Vec<(f32, 
     Frame::LayerAct { layer, idx, val }
 }
 
+// ---------- ルーティング (P56: RouterTopK) ----------
+
+/// `DENNO_TELEMETRY_ARCH` の解釈 (既定 off)。
+///
+/// 未設定・空・`0` 以外で有効。off のときは呼び出し側がルータ結果を
+/// フレームにしない (`enabled()` の分岐 1 個ぶんのコストしか掛からない)。
+/// 意味は arch_telemetry 側 (P54) の同名フラグと同じ。
+pub fn arch_from_value(v: Option<&str>) -> bool {
+    matches!(v, Some(s) if !s.is_empty() && s != "0")
+}
+
+static ARCH_ON: AtomicI8 = AtomicI8::new(-1);
+
+/// P56: ルーティングなどの構造フレームの送出が有効か (プロセスで 1 回だけ env を読む)。
+pub fn arch_enabled() -> bool {
+    match ARCH_ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = arch_from_value(std::env::var("DENNO_TELEMETRY_ARCH").ok().as_deref());
+            ARCH_ON.store(if v { 1 } else { 0 }, Ordering::Relaxed);
+            v
+        }
+    }
+}
+
+/// テスト専用: arch の ON/OFF を上書きする (本番コードからは使わない)。
+#[doc(hidden)]
+pub fn set_arch_for_tests(v: bool) {
+    ARCH_ON.store(if v { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// P56: 1 層ぶんのルータ結果から [`Frame::RouterTopK`] を作る。
+///
+/// - `sel`: 選ばれた expert index。`moe::select_topk` の出力 = **index 昇順**。
+/// - `weights`: `sel` と同じ並びの gate 重み (softmax → top-k 再正規化後、合計 1)。
+///
+/// フレームの並びは **重みの降順** (同値は index 昇順) にする。ビューアは先頭から
+/// 「強く選ばれた expert」として光らせるので、index 順のままでは強さが読めない。
+/// 重みは f16 ビットへ丸める (合計 1 の情報は f16 で十分)。
+///
+/// `sel` と `weights` の長さが違うときは短い方に合わせる (長さの食い違いで
+/// panic しない)。expert index は `u16` に飽和させる (実モデルは 512 本)。
+pub fn router_topk_frame(layer: u16, sel: &[usize], weights: &[f32]) -> Frame {
+    let n = sel.len().min(weights.len());
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_unstable_by(|&a, &b| {
+        weights[b].total_cmp(&weights[a]).then_with(|| sel[a].cmp(&sel[b]))
+    });
+    let experts: Vec<u16> = order
+        .iter()
+        .map(|&j| sel[j].min(u16::MAX as usize) as u16)
+        .collect();
+    let w: Vec<u16> = order.iter().map(|&j| f32_to_f16_bits(weights[j])).collect();
+    Frame::RouterTopK { layer, experts, weights: w }
+}
+
 /// 消費側: 1 フレームを受信 (タイムアウト付き)。サーバーの WS 転送タスクが使う。
 pub fn try_recv_timeout(d: Duration) -> Option<Frame> {
     let rx = RX.get()?;
@@ -1098,6 +1211,17 @@ mod tests {
                 vram_total_mb: 8_192,
                 ram_experts: 64,
                 ssd_reads: 1_234_567,
+            // P56: RouterTopK (空 / 1 要素 / 10 要素)
+            Frame::RouterTopK { layer: 47, experts: Vec::new(), weights: Vec::new() },
+            Frame::RouterTopK {
+                layer: 3,
+                experts: vec![511],
+                weights: vec![f32_to_f16_bits(1.0)],
+            },
+            Frame::RouterTopK {
+                layer: 47,
+                experts: (0..10u16).map(|i| 502 + i).collect(),
+                weights: (0..10u16).map(|i| 0x3c00 - i * 13).collect(),
             },
         ];
         for f in frames {
@@ -1181,6 +1305,95 @@ mod tests {
         assert!(arch_dbg_from_value(Some("1")));
         assert!(arch_dbg_from_value(Some("yes")));
         assert!(!arch_dbg_from_value(Some("0")));
+        assert_eq!(kind::ROUTER_TOPK, 16, "kind 番号は 13..15 (RoleAct 等) の次");
+    }
+
+    /// P56: RouterTopK のペイロード長 (実形: 層 47 / expert 512 本 / top-10)。
+    ///
+    /// 6 (magic+version+kind) + 1 (layer) + 1 (n) + 10×2 (index は 128 以上 = 2B)
+    /// + 10×2 (重み f16) = 48 B。decode は途中で切れた weights を Err にする
+    /// (panic しない)。
+    #[test]
+    fn router_topk_payload_len_and_truncation() {
+        let f = Frame::RouterTopK {
+            layer: 47,
+            experts: (0..10u16).map(|i| 502 + i).collect(),
+            weights: (0..10u16).map(|i| 0x3c00 - i * 13).collect(),
+        };
+        let enc = f.encode();
+        assert_eq!(enc.len(), 48, "実形の RouterTopK は 48 B");
+        assert_eq!(Frame::decode(&enc).unwrap(), f);
+        // 空 (層 47 / 0 本) は 6 + 1 + 1 = 8 B
+        let e = Frame::RouterTopK { layer: 47, experts: Vec::new(), weights: Vec::new() };
+        assert_eq!(e.encode().len(), 8);
+        assert_eq!(Frame::decode(&e.encode()).unwrap(), e);
+        // weights を 1 バイト削ると「途中で切れている」で Err (panic しない)
+        let broken = &enc[..enc.len() - 1];
+        match Frame::decode(broken) {
+            Err(msg) => assert!(msg.contains("weights"), "{msg}"),
+            Ok(f) => panic!("切り詰めたペイロードが通った: {f:?}"),
+        }
+        // expert index が u16 を超えるペイロードは Err
+        let mut over = Vec::new();
+        over.extend_from_slice(&MAGIC);
+        over.push(VERSION);
+        over.push(kind::ROUTER_TOPK);
+        put_varint_u32(&mut over, 0); // layer
+        put_varint_u32(&mut over, 1); // n
+        put_varint_u32(&mut over, 70_000); // expert index
+        over.extend_from_slice(&0x3c00u16.to_le_bytes());
+        assert!(Frame::decode(&over).is_err());
+    }
+
+    /// P56: フレームの並びは重みの降順 (同値は index 昇順)、重みは f16 に丸める。
+    #[test]
+    fn router_topk_frame_sorts_by_weight_desc() {
+        // sel は index 昇順で渡ってくる (select_topk の出力)。
+        let f = router_topk_frame(5, &[2, 7, 9], &[0.1, 0.7, 0.2]);
+        match f {
+            Frame::RouterTopK { layer: 5, experts, weights } => {
+                assert_eq!(experts, vec![7, 9, 2], "重みの降順でない");
+                assert_eq!(
+                    weights,
+                    vec![
+                        f32_to_f16_bits(0.7),
+                        f32_to_f16_bits(0.2),
+                        f32_to_f16_bits(0.1)
+                    ]
+                );
+            }
+            other => panic!("RouterTopK でない: {other:?}"),
+        }
+        // f16 の丸め (0.5 はちょうど 0x3800、1.0 は 0x3c00)
+        match router_topk_frame(0, &[0, 1], &[0.5, 0.5]) {
+            Frame::RouterTopK { experts, weights, .. } => {
+                assert_eq!(experts, vec![0, 1], "同値は index 昇順");
+                assert_eq!(weights, vec![0x3800, 0x3800]);
+            }
+            other => panic!("RouterTopK でない: {other:?}"),
+        }
+        // 空 / 長さの食い違い (短い方に合わせる・panic しない)
+        assert_eq!(
+            router_topk_frame(9, &[], &[]),
+            Frame::RouterTopK { layer: 9, experts: Vec::new(), weights: Vec::new() }
+        );
+        match router_topk_frame(9, &[4, 5, 6], &[0.9, 0.1]) {
+            Frame::RouterTopK { experts, weights, .. } => {
+                assert_eq!(experts, vec![4, 5]);
+                assert_eq!(weights.len(), 2);
+            }
+            other => panic!("RouterTopK でない: {other:?}"),
+        }
+    }
+
+    /// P56: `DENNO_TELEMETRY_ARCH` の解釈 (既定 off)。
+    #[test]
+    fn arch_env_parsing() {
+        assert!(!arch_from_value(None), "未設定は既定 off");
+        assert!(!arch_from_value(Some("")));
+        assert!(!arch_from_value(Some("0")));
+        assert!(arch_from_value(Some("1")));
+        assert!(arch_from_value(Some("true")), "0 以外は有効");
         // テスト用の上書きは元に戻せる (他のテストに漏らさない)
         let before = arch_enabled();
         set_arch_for_tests(true);
