@@ -2752,9 +2752,11 @@ fn expert_route() -> Route {
                 #[cfg(feature = "cuda")]
                 {
                     expert_vram::init(mb.saturating_mul(1024 * 1024));
+                    let min_hit = expert_min_hit();
                     eprintln!(
-                        "[flash] expert GPU: ON (VRAM {} MiB, 既定の CPU 経路は使わない)",
-                        mb
+                        "[flash] expert GPU: ON (VRAM {} MiB, 既定の CPU 経路は使わない / \
+                         ヒット率 < {} のトークンは CPU: DENNO_EXPERT_GPU_MIN_HIT)",
+                        mb, min_hit
                     );
                 }
             }
@@ -2773,6 +2775,133 @@ fn expert_route() -> Route {
         }
         route
     })
+}
+
+/// P45: `DENNO_EXPERT_GPU_MIN_HIT` (既定 0.5)。プロセスで 1 回だけ読む。
+///
+/// ゲート本体 ([`expert_vram::ExpertGate`]) は GPU に依存しないので、この層も
+/// `cuda` feature で切らない (CPU だけのビルドでも判定式をテストできる)。
+fn expert_min_hit() -> f32 {
+    static H: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *H.get_or_init(|| {
+        expert_vram::min_hit_from_value(
+            std::env::var(expert_vram::EXPERT_GPU_MIN_HIT_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// P45: 直近のヒット率ゲート (プロセスで 1 個)。
+///
+/// `Route::Cpu` (既定) と `DENNO_EXPERT_GPU_MIN_HIT=0` では**作らない**。
+/// その場合 [`expert_gate_decide`] は常に GPU を返すので、P39 までの経路と
+/// 1 バイトも変わらない (env を読む以外に何もしない)。
+fn expert_gate() -> Option<&'static std::sync::Mutex<expert_vram::ExpertGate>> {
+    static G: std::sync::OnceLock<Option<std::sync::Mutex<expert_vram::ExpertGate>>> =
+        std::sync::OnceLock::new();
+    G.get_or_init(|| {
+        if expert_route() != Route::Vram {
+            return None;
+        }
+        let min_hit = expert_min_hit();
+        if min_hit <= 0.0 {
+            return None;
+        }
+        Some(std::sync::Mutex::new(expert_vram::ExpertGate::new(
+            expert_vram::GateConfig {
+                min_hit,
+                ..Default::default()
+            },
+        )))
+    })
+    .as_ref()
+}
+
+/// expert 1 本 (gate / up / down) を VRAM へ積むときのバイト数。
+///
+/// `None` は「型・形から読めない」。呼び出し側は「ミス時の H2D 量が読めない」と
+/// みなして CPU に倒す (fail-safe)。
+fn expert_h2d_bytes_one(lw: &LayerW, e: usize, ff: usize) -> Option<u64> {
+    let rb = |ty, k| {
+        crate::model::moe_expert::row_bytes(ty, k)
+            .ok()
+            .map(|b| b as u64)
+    };
+    let g = rb(lw.gate_exps.ty, e)? * ff as u64;
+    let u = rb(lw.up_exps.ty, e)? * ff as u64;
+    let d = rb(lw.down_exps.ty, ff)? * e as u64;
+    Some(g + u + d)
+}
+
+/// P45: このトークンを GPU で回すか。`layer` はログ用。
+///
+/// ゲートが無効 (CPU 経路 / `DENNO_EXPERT_GPU_MIN_HIT=0`) なら常に GPU =
+/// P39 までの挙動。ロックが壊れているときも GPU に倒す (リクエストを落とさない)。
+fn expert_gate_decide(
+    layer: usize,
+    n_sel: usize,
+    per_expert: Option<u64>,
+) -> expert_vram::GateDecision {
+    gate_decide(expert_gate(), layer, n_sel, per_expert)
+}
+
+/// [`expert_gate_decide`] の本体。ゲートを引数で受けるので、env を触らずに
+/// 「冷えたゲート → CPU」「温まったゲート → GPU」「見積り不能 → CPU」を通せる。
+fn gate_decide(
+    g: Option<&std::sync::Mutex<expert_vram::ExpertGate>>,
+    layer: usize,
+    n_sel: usize,
+    per_expert: Option<u64>,
+) -> expert_vram::GateDecision {
+    let Some(g) = g else {
+        return expert_vram::GateDecision::Gpu;
+    };
+    let h2d = per_expert.and_then(|b| b.checked_mul(n_sel as u64));
+    let Ok(mut s) = g.lock() else {
+        return expert_vram::GateDecision::Gpu;
+    };
+    let (rate, samples) = (s.hit_rate(), s.samples());
+    let d = s.decide(layer, h2d);
+    // 切り替えは 1 回ずつだけ言う (decode のたびに 48 層ぶん出さない)。
+    static CPU_LOGGED: std::sync::Once = std::sync::Once::new();
+    static PROBE_LOGGED: std::sync::Once = std::sync::Once::new();
+    match d {
+        expert_vram::GateDecision::Cpu => CPU_LOGGED.call_once(|| {
+            let rate = match rate {
+                Some(r) => format!("{r:.2}"),
+                None => "n/a (未測定)".to_string(),
+            };
+            eprintln!(
+                "[flash] expert GPU gate: 層 {layer} で CPU 経路 (直近 {samples} トークンのヒット率 {rate} \
+                 < {:.2} / CPU に倒してから {} トークンごとに 1 回 GPU で測り直す)",
+                s.cfg().min_hit,
+                s.cfg().probe_every
+            );
+        }),
+        expert_vram::GateDecision::Probe => PROBE_LOGGED.call_once(|| {
+            eprintln!(
+                "[flash] expert GPU gate: ヒット率が低いので CPU 経路。計測のため {} トークンに 1 回だけ \
+                 GPU で試す (DENNO_EXPERT_GPU_MIN_HIT=0 で常時 GPU に戻る)",
+                s.cfg().probe_every
+            );
+        }),
+        expert_vram::GateDecision::Gpu => {}
+    }
+    d
+}
+
+/// P45: 1 層ぶんの実測 (ヒット数 / expert 参照数) をゲートへ積む。
+///
+/// サンプルへの確定はトークンの先頭 ([`ExpertGate::decide`] を `layer == 0` で
+/// 呼んだとき) に行うので、ここでは足すだけ。
+fn expert_gate_record(hits: u32, lookups: u32) {
+    let Some(g) = expert_gate() else {
+        return;
+    };
+    if let Ok(mut s) = g.lock() {
+        s.record(hits, lookups);
+    }
 }
 
 /// `DENNO_MOE_PAR` の値の解釈 (純粋関数)。既定 (未設定) は有効、`"0"` のときだけ無効。
@@ -2807,6 +2936,10 @@ fn moe_ffn_quant_with_par(
 
 /// [`moe_ffn_quant`] の本体。`par` は expert ループの並列化 on/off、
 /// `route` は expert の計算経路 (P39)。
+///
+/// P45: `Route::Vram` でも、[`expert_gate_decide`] が低ヒット率と判断したトークンは
+/// CPU で計算する (`use_gpu == false`)。CPU と GPU は同じバイト列に同じ式を通すので、
+/// どのトークンがどちらに落ちても最終出力は CPU 経路と一致する (実測 max_abs 0.000e0)。
 fn moe_ffn_quant_with(
     p: &Qwen4ExpParams,
     lw: &LayerW,
@@ -2846,13 +2979,20 @@ fn moe_ffn_quant_with(
     //     キャッシュ経路は pread で必要ぶんだけ読むので、mmap のページフォルトを
     //     先に起こす意味が無い (`prefetch()` 自体は無効化も変更もしない)。
     //
-    //     P39: VRAM 常駐経路 (`use_gpu`) では pread キャッシュを**使わない**
+    //     P39: VRAM 常駐経路 (`vram_mode`) では pread キャッシュを**使わない**
     //     (置き場所を 2 か所に持たない)。ヒットした expert は mmap を触らないので
     //     prefetch も投げない。ミスした expert は H2D のために同じページを
     //     順に読むので、先読みの有無で総 I/O は変わらない。
-    let use_gpu = route == Route::Vram;
-    #[cfg(feature = "cuda")]
-    if use_gpu && cache.is_some() {
+    //
+    //     P45: `vram_mode` でも、直近のヒット率がしきい値未満のトークンは CPU で
+    //     計算する (`use_gpu == false`)。そのトークンは mmap を直接読むので
+    //     prefetch は投げる (RAM キャッシュは vram_mode では使わない = P39 と同じ)。
+    let vram_mode = route == Route::Vram;
+    let use_gpu = vram_mode && {
+        let per = expert_h2d_bytes_one(lw, e, ff);
+        expert_gate_decide(lw.il, sel.len(), per).uses_gpu()
+    };
+    if vram_mode && cache.is_some() {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
             eprintln!(
@@ -2860,7 +3000,7 @@ fn moe_ffn_quant_with(
             );
         });
     }
-    let cache = if use_gpu { None } else { cache };
+    let cache = if vram_mode { None } else { cache };
     if cache.is_none() && !use_gpu {
         for &ei in &sel {
             lw.gate_exps.prefetch(ei);
@@ -2907,16 +3047,21 @@ fn moe_ffn_quant_with(
         let mut act = vec![0.0f32; ff];
         let mut up = vec![0.0f32; ff];
         let mut h = vec![0.0f32; e];
+        // P45: このトークンで VRAM に載っていた expert の本数 (ゲートのサンプル)。
+        let mut gpu_hits = 0u32;
         // P43: まず層一括経路 (gate 1 + up 1 + down 1 = 3 起動 / 2 同期) を試す。
         // `Some(hs)` は「選択 expert 全員の寄与が揃った」という意味で、そのときは
         // per-expert のループを回さない。足し込みは下の per-expert 経路と同一の
         // 「index 昇順の逐次」なので、丸めの順序は変わらない。
+        // P45: ゲートが CPU と決めたトークンは層一括経路も呼ばない (`use_gpu` が false)。
         let batched = if use_gpu {
             moe_experts_gpu_batched(lw, &sel, x, e, ff)?
         } else {
             None
         };
-        if let Some(hs) = batched {
+        if let Some((hs, hits)) = batched {
+            // P45: 層一括経路も「何本が載っていたか」を返す (ゲートの 1 サンプル)。
+            gpu_hits = hits;
             debug_assert_eq!(hs.len(), sel.len(), "寄与の本数が選択 expert と違う");
             for (t, _) in sel.iter().enumerate() {
                 let pe = weights[t];
@@ -2927,17 +3072,21 @@ fn moe_ffn_quant_with(
             }
         } else {
             for (t, &ei) in sel.iter().enumerate() {
-                // P39: VRAM 常駐経路。載らない/未対応なら `false` が返るので CPU へ落ちる。
+                // P39: VRAM 常駐経路。`None` = 載らない/未対応なので CPU へ落ちる。
+                // P45: `Some(true)` はヒット (積まずに回せた)、`Some(false)` はミス。
                 #[cfg(feature = "cuda")]
-                let gpu_done = if use_gpu {
+                let gpu = if use_gpu {
                     moe_expert_gpu(lw, ei, x, &mut act, &mut up, &mut h)?
                 } else {
-                    false
+                    None
                 };
                 #[cfg(not(feature = "cuda"))]
-                let gpu_done = false;
+                let gpu: Option<bool> = None;
+                if gpu == Some(true) {
+                    gpu_hits += 1;
+                }
 
-                if !gpu_done {
+                if gpu.is_none() {
                     match cache {
                         // 従来経路: mmap のスライスを直接 GEMV する。
                         None => {
@@ -2972,6 +3121,10 @@ fn moe_ffn_quant_with(
                     out[j] += pe * h[j];
                 }
             }
+        }
+        // P45: 1 トークンぶんの実測をゲートへ積む (CPU のトークンはサンプルにしない)。
+        if use_gpu {
+            expert_gate_record(gpu_hits, sel.len() as u32);
         }
     }
 
@@ -3040,10 +3193,14 @@ fn moe_ffn_quant_with(
 
 /// P39: expert 1 本ぶんの FFN (`down(silu(gate(x)) * up(x))`) を **VRAM 常駐の重み**で回す。
 ///
-/// `true` = GPU で計算した (`act` は silu 後で `up` との積、`h` は down の出力)。
-/// `false` = この expert は GPU に載せられない (型・カーネル・上限)。呼び出し側は
-/// 従来の CPU 経路へ落ちること。`act` / `up` / `h` は **`true` のときだけ**書き換える
-/// (途中で失敗して半端な値を残さない)。
+/// 戻り値 (P45 で `bool` から変更):
+/// - `Some(true)` — GPU で計算した。重みは**すでに VRAM に載っていた** (ヒット)。
+/// - `Some(false)` — GPU で計算した。重みは今回 VRAM へ積んだ (ミス)。
+/// - `None` — この expert は GPU に載せられない (型・カーネル・上限)。呼び出し側は
+///   従来の CPU 経路へ落ちること。
+///
+/// `act` / `up` / `h` は **GPU で計算したときだけ**書き換える (途中で失敗して
+/// 半端な値を残さない)。ヒット率は `Some(..)` の割合としてゲートに積まれる。
 #[cfg(feature = "cuda")]
 fn moe_expert_gpu(
     lw: &LayerW,
@@ -3052,7 +3209,7 @@ fn moe_expert_gpu(
     act: &mut [f32],
     up: &mut [f32],
     h: &mut [f32],
-) -> Result<bool> {
+) -> Result<Option<bool>> {
     use crate::model::expert_vram::ExpertShape;
 
     let shapes = [
@@ -3077,7 +3234,7 @@ fn moe_expert_gpu(
         expert: ei as u16,
     };
     // ミスのときだけ mmap のスライスを要求する (ヒットでページフォルトを起こさない)。
-    let dev = expert_vram::acquire(key, shapes, || {
+    let got = expert_vram::acquire(key, shapes, || {
         Ok([
             lw.gate_exps.slice(ei)?,
             lw.up_exps.slice(ei)?,
@@ -3085,9 +3242,11 @@ fn moe_expert_gpu(
         ])
     })
     .map_err(|e| one(format!("層 {}: expert {ei}: VRAM 経路: {e:#}", lw.il)))?;
-    let Some(dev) = dev else {
-        return Ok(false);
+    let Some(got) = got else {
+        return Ok(None);
     };
+    let hit = got.hit;
+    let dev = got.dev;
 
     let ctx = |e: anyhow::Error, m: ExpertMatrix| {
         one(format!(
@@ -3122,13 +3281,14 @@ fn moe_expert_gpu(
         lw.down_exps.gemv(ei, &act_c, &mut h_c)?;
         expert_vram::note_check(h, &h_c);
     }
-    Ok(true)
+    Ok(Some(hit))
 }
 
 /// P43: 選択 expert **全員** の寄与を「3 起動 / 2 同期」でまとめて計算する。
 ///
 /// `sel` の全 expert が VRAM に載り、カーネル (PTX) と型が対応しているときだけ
-/// `Ok(Some(hs))` を返す (`hs[t]` は `sel[t]` の寄与 h、長さ `e`)。
+/// `Ok(Some((hs, hits)))` を返す (`hs[t]` は `sel[t]` の寄与 h、長さ `e`。
+/// `hits` は「すでに VRAM に載っていて H2D しなかった本数」= P45 のゲートのサンプル)。
 /// 1 本でも載らない / カーネルが無い / 型が未対応なら `Ok(None)` を返し、
 /// 呼び出し側は per-expert 経路 ([`moe_expert_gpu`]) へ落ちる (fail closed)。
 ///
@@ -3142,7 +3302,7 @@ fn moe_experts_gpu_batched(
     x: &[f32],
     e: usize,
     ff: usize,
-) -> Result<Option<Vec<Vec<f32>>>> {
+) -> Result<Option<(Vec<Vec<f32>>, u32)>> {
     use crate::model::expert_batch as eb;
     use crate::model::expert_vram::ExpertShape;
 
@@ -3168,14 +3328,16 @@ fn moe_experts_gpu_batched(
         },
     ];
     // 1. 全 expert を VRAM に載せる (1 本でも載らなければ per-expert 経路へ)。
+    //    P45: 載っていた本数 (`hit`) を数え、ゲートの 1 サンプルにする。
     let mut devs = Vec::with_capacity(n);
     let mut ids: Vec<u16> = Vec::with_capacity(n);
+    let mut hits = 0u32;
     for &ei in sel {
         let key = ExpertKey {
             layer: lw.il as u16,
             expert: ei as u16,
         };
-        let dev = expert_vram::acquire(key, shapes, || {
+        let got = expert_vram::acquire(key, shapes, || {
             Ok([
                 lw.gate_exps.slice(ei)?,
                 lw.up_exps.slice(ei)?,
@@ -3183,10 +3345,13 @@ fn moe_experts_gpu_batched(
             ])
         })
         .map_err(|err| one(format!("層 {}: expert {ei}: VRAM 経路 (層一括): {err:#}", lw.il)))?;
-        let Some(d) = dev else {
+        let Some(a) = got else {
             return Ok(None);
         };
-        devs.push(d);
+        if a.hit {
+            hits += 1;
+        }
+        devs.push(a.dev);
         ids.push(ei as u16);
     }
     let ptr_table = |m: ExpertMatrix| -> Vec<u64> { devs.iter().map(|d| d.ptr(m)).collect() };
@@ -3249,7 +3414,7 @@ fn moe_experts_gpu_batched(
             expert_vram::note_check(&hs[t], &h_c);
         }
     }
-    Ok(Some(hs))
+    Ok(Some((hs, hits)))
 }
 
 /// `cuda` feature 無しでは層一括経路は無い (常に `None` = per-expert 経路)。
@@ -3260,7 +3425,7 @@ fn moe_experts_gpu_batched(
     _x: &[f32],
     _e: usize,
     _ff: usize,
-) -> Result<Option<Vec<Vec<f32>>>> {
+) -> Result<Option<(Vec<Vec<f32>>, u32)>> {
     Ok(None)
 }
 
@@ -5414,6 +5579,157 @@ mod tests {
             "層一括/VRAM 経路が載らないのに CPU へ落ちていない (expert_gemv_any の回数)"
         );
         assert_bitwise_eq(&base, &got, "route=Vram → CPU 経路");
+    }
+
+    /// P45: ヒット率 0 / 0.3 / 0.9 で経路が期待どおりに選ばれ、**どの経路でも出力が
+    /// CPU 経路と一致する**こと (argmax と max_abs)。
+    ///
+    /// GPU の無いビルドでは `Route::Vram` も CPU に落ちるので、ここで確かまるのは
+    /// 「判定」と「CPU 経路との一致」。`--features cuda` かつ GPU のある環境では
+    /// 0.9 のケースが実際に GPU 経路を通る (同じテストが argmax / max_abs を比べる)。
+    #[test]
+    fn expert_gate_picks_route_by_hit_rate_and_output_matches_cpu() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("gate_route");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        // 参照: 従来の CPU 経路 (mmap のスライスを直接 GEMV)。
+        let want = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("CPU 参照");
+        let argmax = |v: &[f32]| {
+            let mut best = 0usize;
+            for (i, &x) in v.iter().enumerate() {
+                if x > v[best] {
+                    best = i;
+                }
+            }
+            best
+        };
+        // ミスしたときに VRAM へ積む量 (合成 GGUF の実バイト数から)。
+        let per_expert: u64 = expert_lens(&lw).iter().map(|&b| b as u64).sum();
+        let h2d = per_expert * p.n_expert_used as u64;
+
+        for (rate, want_gpu) in [(0.0f64, false), (0.3, false), (0.9, true)] {
+            let mut gate = expert_vram::ExpertGate::new(expert_vram::GateConfig::default());
+            let hits = (rate * 10.0).round() as u32;
+            for _ in 0..expert_vram::GATE_WINDOW_TOKENS {
+                gate.record(hits, 10);
+            }
+            let d = gate.decide(0, Some(h2d));
+            assert_eq!(
+                d.uses_gpu(),
+                want_gpu,
+                "ヒット率 {rate} の経路選択が違う ({d:?})"
+            );
+            let route = if d.uses_gpu() {
+                Route::Vram
+            } else {
+                Route::Cpu
+            };
+            let got = moe_ffn_quant_with(&p, &lw, &x, None, false, route).expect("経路");
+            assert_eq!(
+                argmax(&got),
+                argmax(&want),
+                "ヒット率 {rate}: argmax が CPU 経路と違う"
+            );
+            let max_abs = got
+                .iter()
+                .zip(want.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert_eq!(
+                max_abs, 0.0,
+                "ヒット率 {rate}: max_abs {max_abs} で CPU 経路と一致しない"
+            );
+        }
+    }
+
+    /// P45: `DENNO_EXPERT_GPU_MIN_HIT=0` は「常に GPU」= P39 までと同じ判定。
+    /// 既定 (0.5) では冷えた状態が CPU に落ちる。
+    #[test]
+    fn expert_gate_default_threshold_falls_back_when_cold() {
+        let cold = |min_hit: f32| {
+            let mut g = expert_vram::ExpertGate::new(expert_vram::GateConfig {
+                min_hit,
+                ..Default::default()
+            });
+            g.decide(0, Some(1024))
+        };
+        assert!(
+            !cold(expert_vram::DEFAULT_EXPERT_GPU_MIN_HIT).uses_gpu(),
+            "既定 0.5 は起動直後 CPU"
+        );
+        assert!(cold(0.0).uses_gpu(), "0 は常に GPU (P39 までと同じ)");
+    }
+
+    /// P45: ゲートが見積る「ミス時に積む量」が、合成 GGUF の実バイト数と一致する。
+    ///
+    /// ここが `None` になるとゲートは fail-safe で常に CPU になるので、
+    /// 「見積れる」こと自体をテストで固定する。
+    #[test]
+    fn expert_h2d_bytes_one_matches_expert_lens() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("h2d_bytes");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let want: u64 = expert_lens(&lw).iter().map(|&b| b as u64).sum();
+        assert_eq!(
+            expert_h2d_bytes_one(&lw, p.n_embd, p.n_ff_exp),
+            Some(want),
+            "見積りが実バイト数と違う (ゲートが fail-safe で CPU に固定される)"
+        );
+    }
+
+    /// P45: `Route::Vram` の層入口 ([`gate_decide`]) が、冷えたゲートで CPU・
+    /// 温まったゲートで GPU を返し、H2D 量が読めない型では CPU に倒れること。
+    ///
+    /// env を使わずに、`moe_ffn_quant_with` が毎層呼ぶ関数をそのまま通す
+    /// (グローバルのゲートは既定の CPU 経路では作られないので、ここでは実体を渡す)。
+    #[test]
+    fn gate_decide_routes_layers_without_env() {
+        let gate = std::sync::Mutex::new(expert_vram::ExpertGate::new(
+            expert_vram::GateConfig::default(),
+        ));
+        // 冷えている (サンプル 0): 1 層目から CPU。
+        assert_eq!(
+            gate_decide(Some(&gate), 0, 2, Some(1024)),
+            expert_vram::GateDecision::Cpu,
+            "冷えたゲートで GPU を選んだ"
+        );
+        // 層 1 以降はトークン先頭の判定をそのまま使う (トークン内で混ざらない)。
+        assert_eq!(
+            gate_decide(Some(&gate), 1, 2, Some(1024)),
+            expert_vram::GateDecision::Cpu
+        );
+        // ミス時の H2D 量が読めない (None) は fail-safe で CPU。
+        assert_eq!(
+            gate_decide(Some(&gate), 0, 2, None),
+            expert_vram::GateDecision::Cpu,
+            "見積り不能で GPU に倒れた"
+        );
+        // 全ヒットのトークンで温めると GPU。
+        {
+            let mut g = gate.lock().expect("gate");
+            for _ in 0..expert_vram::GATE_WINDOW_TOKENS {
+                g.record(10, 10);
+            }
+        }
+        assert_eq!(
+            gate_decide(Some(&gate), 0, 2, Some(1024)),
+            expert_vram::GateDecision::Gpu,
+            "ヒット率 1.0 でも GPU に戻らない"
+        );
+        // ゲート無し = 既定の CPU 経路 / `DENNO_EXPERT_GPU_MIN_HIT=0`。
+        assert_eq!(
+            gate_decide(None, 0, 2, None),
+            expert_vram::GateDecision::Gpu,
+            "ゲート無しで CPU に倒れた (P39 までの経路と変わる)"
+        );
     }
 
     #[test]
