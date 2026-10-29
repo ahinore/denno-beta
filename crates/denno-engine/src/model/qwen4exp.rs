@@ -2338,6 +2338,17 @@ impl Qwen4Exp {
         // (0 件なら何も出さない)。
         crate::model::moe_grouped_gpu::flush_failures();
 
+        // P49: `DENNO_PF_ATT_DBG=1` のときだけ attn の層別内訳を 1 層 1 行で出す
+        // (層 0 / 23 = ssm、47 = full attention)。既定 off では何もしない。
+        if q4prof::att_dbg() {
+            for &l in q4prof::DBG_LAYERS.iter() {
+                let is_full = matches!(self.p.layer_kind(l), Ok(LayerKind::FullAttn));
+                if let Some(line) = q4prof::layer_line(l, is_full) {
+                    eprintln!("{line}");
+                }
+            }
+        }
+
         // 4. 最終 mixer (output_norm の代わり) + 5. logits (最後のトークンだけ)
         let res = last.ok_or_else(|| one("ctx が空 (現在のトークンが無い)"))?;
         let cur = hc_mix_quant(
@@ -2669,6 +2680,170 @@ pub mod q4prof {
         *ON.get_or_init(|| std::env::var_os("DENNO_Q4_PROFILE").is_some())
     }
 
+    /// `DENNO_PF_ATT_DBG=1` で attention の層別内訳を取る (既定 off)。
+    pub fn att_dbg() -> bool {
+        static D: OnceLock<bool> = OnceLock::new();
+        if *D.get_or_init(|| std::env::var_os("DENNO_PF_ATT_DBG").is_some()) {
+            return true;
+        }
+        #[cfg(test)]
+        {
+            return FORCE_ATT_DBG.load(Ordering::Relaxed);
+        }
+        #[allow(unreachable_code)]
+        false
+    }
+
+    /// テストが env を立てずに層別内訳の経路を通すための強制フラグ
+    /// (env は OnceLock なので プロセス内で 1 回しか読めない)。
+    #[cfg(test)]
+    static FORCE_ATT_DBG: AtomicBool = AtomicBool::new(false);
+
+    /// 層別内訳をテストから強制する (`None` で env の値に戻す)。
+    #[cfg(test)]
+    pub fn set_att_dbg_for_test(v: bool) {
+        FORCE_ATT_DBG.store(v, Ordering::Relaxed);
+    }
+
+    /// 時間を取るか (Q4_PROFILE か PF_ATT_DBG のどちらかが有効)。
+    #[inline]
+    pub fn timed() -> bool {
+        static T: OnceLock<bool> = OnceLock::new();
+        *T.get_or_init(|| on() || att_dbg())
+    }
+
+    // ---- 層別内訳 (DENNO_PF_ATT_DBG) -------------------------------------
+    //
+    // prefill の層 0 / 23 / 47 だけを段別に積む。1 層につき 1 行で出すので、
+    // 「どの層のどの段が重いか」が実機のログだけで読める。既定 off。
+
+    /// 内訳を取る層 (48 層の 0 = ssm / 23 = ssm / 47 = full attention)。
+    pub const DBG_LAYERS: [usize; 3] = [0, 23, 47];
+    /// 段の数 (下の ST_* の個数)。
+    pub const NSTAGE: usize = 7;
+    /// 段: qkv 射影 (full は q/k/v、ssm は qkv の 1 本)
+    pub const ST_QKV: usize = 0;
+    /// 段: ssm の gate / beta / alpha 射影
+    pub const ST_GATE: usize = 1;
+    /// 段: ssm の GDN 本体 (conv + scan + gated norm)
+    pub const ST_GDN: usize = 2;
+    /// 段: full の qk-norm + rope + KV push
+    pub const ST_ROPE: usize = 3;
+    /// 段: full の attend (スコア + softmax + PV)
+    pub const ST_ATTEND: usize = 4;
+    /// 段: full の出力ゲート
+    pub const ST_GMUL: usize = 5;
+    /// 段: 出力射影 (full / ssm 共通)
+    pub const ST_OUT: usize = 6;
+
+    static LAYER_NS: [AtomicU64; 3 * NSTAGE] = [const { AtomicU64::new(0) }; 3 * NSTAGE];
+    static LAYER_NT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+    fn dbg_slot(layer: usize) -> Option<usize> {
+        DBG_LAYERS.iter().position(|&l| l == layer)
+    }
+
+    /// 計測が要るときだけ `Instant` を取る (既定 off では `None` = 呼び出し側は no-op)。
+    #[inline]
+    pub fn stamp() -> Option<std::time::Instant> {
+        if timed() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    }
+
+    /// 区間 `t` をグローバル束 `c` と層別束の両方へ足す。
+    #[inline]
+    pub fn mark(t: Option<std::time::Instant>, c: &AtomicU64, layer: usize, stage: usize) {
+        if let Some(t) = t {
+            let ns = t.elapsed().as_nanos() as u64;
+            if enabled() {
+                c.fetch_add(ns, Ordering::Relaxed);
+            }
+            mark_l_ns(layer, stage, ns);
+        }
+    }
+
+    /// 区間 `t` を層別束だけへ足す (グローバル束を持たない段用)。
+    #[inline]
+    pub fn mark_l(t: Option<std::time::Instant>, layer: usize, stage: usize) {
+        if let Some(t) = t {
+            mark_l_ns(layer, stage, t.elapsed().as_nanos() as u64);
+        }
+    }
+
+    #[inline]
+    fn mark_l_ns(layer: usize, stage: usize, ns: u64) {
+        if !att_dbg() {
+            return;
+        }
+        if let Some(slot) = dbg_slot(layer) {
+            LAYER_NS[slot * NSTAGE + stage].fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// 層別内訳の分母 (その層を回したトークン数)。
+    #[inline]
+    pub fn bump_nt(layer: usize, nt: usize) {
+        if !att_dbg() {
+            return;
+        }
+        if let Some(slot) = dbg_slot(layer) {
+            LAYER_NT[slot].fetch_add(nt as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// 層別内訳の 1 行 (積んでいない層は `None`)。
+    ///
+    /// `is_full` はその層が full attention かどうか (段名の出し分けに使う)。
+    pub fn layer_line(layer: usize, is_full: bool) -> Option<String> {
+        let slot = dbg_slot(layer)?;
+        let nt = LAYER_NT[slot].load(Ordering::Relaxed);
+        if nt == 0 {
+            return None;
+        }
+        let ms = |stage: usize| LAYER_NS[slot * NSTAGE + stage].load(Ordering::Relaxed) as f64 / 1e6;
+        let per = |stage: usize| {
+            let v = ms(stage);
+            if nt == 0 {
+                0.0
+            } else {
+                v * 1e3 / nt as f64
+            }
+        };
+        let kind = if is_full { "full" } else { "ssm " };
+        if is_full {
+            Some(format!(
+                "[pf-att] layer {layer} ({kind}) qkv {:.2} / rope {:.2} / attend {:.2} / gmul {:.2} / out {:.2} ms \
+                 (nt {nt}, per-token {:.3} / {:.3} / {:.3} / {:.3} / {:.3} ms)",
+                ms(ST_QKV),
+                ms(ST_ROPE),
+                ms(ST_ATTEND),
+                ms(ST_GMUL),
+                ms(ST_OUT),
+                per(ST_QKV),
+                per(ST_ROPE),
+                per(ST_ATTEND),
+                per(ST_GMUL),
+                per(ST_OUT),
+            ))
+        } else {
+            Some(format!(
+                "[pf-att] layer {layer} ({kind}) qkv {:.2} / gate {:.2} / gdn {:.2} / out {:.2} ms \
+                 (nt {nt}, per-token {:.3} / {:.3} / {:.3} / {:.3} ms)",
+                ms(ST_QKV),
+                ms(ST_GATE),
+                ms(ST_GDN),
+                ms(ST_OUT),
+                per(ST_QKV),
+                per(ST_GATE),
+                per(ST_GDN),
+                per(ST_OUT),
+            ))
+        }
+    }
+
     #[inline]
     pub fn enabled() -> bool {
         static E: OnceLock<bool> = OnceLock::new();
@@ -2705,6 +2880,12 @@ pub mod q4prof {
             c.store(0, Ordering::Relaxed);
         }
         N_LAYER.store(0, Ordering::Relaxed);
+        for c in LAYER_NS.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+        for c in LAYER_NT.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
     }
 }
 
