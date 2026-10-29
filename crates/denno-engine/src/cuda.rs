@@ -1741,6 +1741,8 @@ struct GroupedScratch {
     /// P43: この呼び出しで予算が足りず載せられなかった (呼び出し側は CPU へ)
     denied: bool,
     seg: Option<DevBuffer>,
+    /// down 用の segment 表 (w_off のストライドが gate と違う)
+    seg_dn: Option<DevBuffer>,
     x: Option<DevBuffer>,
     act: Option<DevBuffer>,
     h: Option<DevBuffer>,
@@ -1755,6 +1757,7 @@ impl GroupedScratch {
             reserved: None,
             denied: false,
             seg: None,
+            seg_dn: None,
             x: None,
             act: None,
             h: None,
@@ -1776,8 +1779,12 @@ thread_local! {
 /// 引数:
 /// - `key`: パック済み重みの持ち主 (層 id)。変わったら VRAM を作り直す。
 /// - `packed`: `[gate(e0..eN)][up(e0..eN)][down(e0..eN)]` のパック済み重み。
-/// - `seg`: 5 個で 1 segment (`[eid, m, w_off, e_off, ff_off]`、要素単位の
-///   offset は `m * n_in` の累積)。空 (`nseg == 0`) は `Ok(false)`。
+/// - `seg_gu` / `seg_dn`: 5 個で 1 segment (`[eid, m, w_off, e_off, ff_off]`。
+///   `e_off` / `ff_off` は `m * n_in` / `m * n_out` の累積)。空 (`nseg == 0`) は
+///   `Ok(false)`。
+/// - `seg_gu` は gate/up 用、`seg_dn` は down 用。**down は 1 expert あたりの
+///   バイト数が gate と違う**ので `w_off` のストライドが別 (P50)。1 枚の表を
+///   使い回すと 2 体目以降が別の expert の重みを読む。
 /// - `xin`: segment の並びに詰め直した入力 (m_total × gate.n_in)。
 /// - `h`: 出力 (m_total × down.n_out)。成功時のみ全要素を書く。
 ///
@@ -1787,7 +1794,8 @@ thread_local! {
 pub fn moe_grouped_gemm_layer(
     key: u64,
     packed: &[u8],
-    seg: &[u32],
+    seg_gu: &[u32],
+    seg_dn: &[u32],
     gate: GroupedMatrix,
     up: GroupedMatrix,
     down: GroupedMatrix,
@@ -1797,7 +1805,11 @@ pub fn moe_grouped_gemm_layer(
     if !moe_grouped_gpu_enabled() || !cuda_enabled() || !gpu_gemm_enabled() {
         return Ok(false);
     }
-    if seg.is_empty() || seg.len() % 5 != 0 {
+    if seg_gu.is_empty() || seg_gu.len() % 5 != 0 {
+        return Ok(false);
+    }
+    // down 用の表は同じ segment 数でなければならない (eid/m の並びは同じ)。
+    if seg_dn.len() != seg_gu.len() {
         return Ok(false);
     }
     // gate と up は同形 (同じ x を読み、同じ形の act を書く)。
@@ -1820,20 +1832,37 @@ pub fn moe_grouped_gemm_layer(
         return Ok(false);
     };
 
-    let nseg = seg.len() / 5;
+    let nseg = seg_gu.len() / 5;
+    // ブロックの範囲: gate は [gate.w_off, up.w_off)、down は [down.w_off, 末尾)。
+    // w_off がこの範囲を出ると隣のブロック (別の行列) を重みとして読む。
+    let Some(gate_block) = up.w_off.checked_sub(gate.w_off) else {
+        return Ok(false);
+    };
+    let Some(down_block) = packed.len().checked_sub(down.w_off) else {
+        return Ok(false);
+    };
     let mut m_max = 0usize;
     let mut m_total = 0usize;
-    for s in seg.chunks_exact(5) {
+    for (s, sd) in seg_gu.chunks_exact(5).zip(seg_dn.chunks_exact(5)) {
+        if s[0] != sd[0] || s[1] != sd[1] || s[3] != sd[3] || s[4] != sd[4] {
+            bail!("moe_grouped_gemm_layer: seg_gu と seg_dn の segment が違う");
+        }
         let m = s[1] as usize;
         if m == 0 {
             return Ok(false); // 空タスクは積まない (呼び出し側の契約)
         }
-        let w_off = s[2] as usize;
-        if w_off + gb > packed.len() || w_off + db > packed.len() {
+        let wg_off = s[2] as usize;
+        if wg_off + gb > gate_block {
             bail!(
-                "moe_grouped_gemm_layer: w_off {w_off} + expert バイト ({gb}/{db}) が \
-                 packed {} を超える",
-                packed.len()
+                "moe_grouped_gemm_layer: gate の w_off {wg_off} + {gb} B が \
+                 gate ブロック {gate_block} B を超える"
+            );
+        }
+        let wd_off = sd[2] as usize;
+        if wd_off + db > down_block {
+            bail!(
+                "moe_grouped_gemm_layer: down の w_off {wd_off} + {db} B が \
+                 down ブロック {down_block} B を超える"
             );
         }
         m_max = m_max.max(m);
@@ -1868,7 +1897,7 @@ pub fn moe_grouped_gemm_layer(
         return Ok(false);
     };
 
-    let seg_words = seg.len();
+    let seg_words = seg_gu.len();
     let n_x = xin.len();
     let n_act = m_total * up.n_out;
     let n_h = h.len();
@@ -1914,12 +1943,16 @@ pub fn moe_grouped_gemm_layer(
         }
         // 2. segment 表 / 入力 / 中間 / 出力
         MoeScratch::ensure(&mut sc.seg, seg_words * 4)?;
+        MoeScratch::ensure(&mut sc.seg_dn, seg_words * 4)?;
         MoeScratch::ensure(&mut sc.x, n_x * 4)?;
         MoeScratch::ensure(&mut sc.act, n_act * 4)?;
         MoeScratch::ensure(&mut sc.h, n_h * 4)?;
         {
             let sb = sc.seg.as_ref().expect("確保済み");
-            sb.copy_from(seg)?;
+            sb.copy_from(seg_gu)?;
+            dbg_htod(seg_words * 4);
+            let sd = sc.seg_dn.as_ref().expect("確保済み");
+            sd.copy_from(seg_dn)?;
             dbg_htod(seg_words * 4);
             let xb = sc.x.as_ref().expect("確保済み");
             xb.copy_from(xin)?;
@@ -1927,6 +1960,7 @@ pub fn moe_grouped_gemm_layer(
         }
         let packed_buf = sc.packed.as_ref().expect("確保済み");
         let seg_buf = sc.seg.as_ref().expect("確保済み");
+        let seg_dn_buf = sc.seg_dn.as_ref().expect("確保済み");
         let x_buf = sc.x.as_ref().expect("確保済み");
         let act_buf = sc.act.as_ref().expect("確保済み");
         let h_buf = sc.h.as_ref().expect("確保済み");
@@ -1967,7 +2001,7 @@ pub fn moe_grouped_gemm_layer(
                 let mut pwd = packed_buf.ptr + down.w_off as u64;
                 let mut px = act_buf.ptr;
                 let mut po = h_buf.ptr;
-                let mut ps = seg_buf.ptr;
+                let mut ps = seg_dn_buf.ptr;
                 let (mut ns, mut ni, mut no, mut rb) = (
                     nseg as c_int,
                     down.n_in as c_int,

@@ -281,6 +281,26 @@ impl GroupedPlan {
         ])
     }
 
+    /// `expert` の `pass` ブロック内の先頭バイト (pass = 0 gate / 1 up / 2 down)。
+    ///
+    /// `w_off` は **expert id で引く**。segment 表は m 降順で並ぶが packed は
+    /// expert 昇順に詰まっているので、segment の添字をそのまま `w_off` の添字に
+    /// してはならない (P50 の実機バグ)。
+    pub fn w_off_for(&self, expert: u16, pass: usize) -> Result<u32> {
+        let strides = self.strides()?;
+        let stride = *strides
+            .get(pass)
+            .ok_or_else(|| anyhow::anyhow!("w_off_for: pass {pass} が 3 ブロックの範囲外"))?;
+        let i = self.expert_ids.binary_search(&expert).map_err(|_| {
+            anyhow::anyhow!("w_off_for: expert {expert} が配車 (expert_ids) に無い")
+        })?;
+        let off = i
+            .checked_mul(stride)
+            .ok_or_else(|| anyhow::anyhow!("w_off_for: {i} x {stride} が usize を溢れる"))?;
+        u32::try_from(off)
+            .map_err(|_| anyhow::anyhow!("w_off_for: オフセット {off} が u32 を超える"))
+    }
+
     /// 内部整合 (expert_ids が昇順・重複なし、w_off と block_off がストライドの累積)。
     pub fn is_consistent(&self) -> bool {
         let Ok(strides) = self.strides() else {
