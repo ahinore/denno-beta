@@ -662,7 +662,25 @@ pub fn expert_gemv_any(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<()> {
+    #[cfg(test)]
+    ANY_CALLS.with(|c| c.set(c.get() + 1));
     expert_gemv_any_inner(ty, blocks, n_in, n_out, x, out, true)
+}
+
+/// テスト用: [`expert_gemv_any`] を通った回数 (スレッドごと)。
+///
+/// 「GPU 経路を切ったときに CPU の入口が実際に使われた」ことを数えるためのもの。
+/// スレッドローカルにしてあるので、並列に走る他のテストの呼び出しと混ざらない
+/// (行並列の内側は別スレッドだが、数えるのは top-level の呼び出しだけ)。
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ANY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// テスト用: このスレッドの [`ANY_CALLS`]。
+#[cfg(test)]
+pub(crate) fn any_calls() -> usize {
+    ANY_CALLS.with(|c| c.get())
 }
 
 /// テスト用: 行並列なしの入口 ([`expert_gemv_any_seq`]) を通った回数。
