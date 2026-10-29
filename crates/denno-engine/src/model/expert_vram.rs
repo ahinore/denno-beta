@@ -26,6 +26,10 @@
 //!   経路に固定する (プロセス寿命のラッチ。リクエストは落とさない)。
 //! - `DENNO_EXPERT_GPU_CHECK=1` のときは expert 1 本ごとに CPU で同じ計算を
 //!   走らせ、最終寄与 `h` の max abs diff / argmax 一致を**層ごとに 1 行**出す。
+//! - P45: `DENNO_EXPERT_GPU_MIN_HIT` (既定 0.5)。直近 64 トークンのヒット率が
+//!   これ未満なら、そのトークンは CPU 経路で計算する ([`ExpertGate`])。
+//!   `0` で常に GPU (= P39 までと同じ)。VRAM が温まっていない起動直後は
+//!   サンプルが無いので CPU に倒れる。
 //! - 並行 decode では [`acquire`] が返す `Arc` を計算中は保持する。追い出しで
 //!   登録簿から外れても、使用中のバッファは最後の利用者が drop するまで残る
 //!   (したがって上限は並行時にわずかに超え得る)。
@@ -59,6 +63,18 @@ pub const EXPERT_VRAM_MB_ENV: &str = "DENNO_EXPERT_VRAM_MB";
 pub const EXPERT_GPU_ENV: &str = "DENNO_EXPERT_GPU";
 /// `DENNO_EXPERT_GPU_CHECK=1`: GPU と CPU の差を層ごとに 1 行で出す。
 pub const EXPERT_GPU_CHECK_ENV: &str = "DENNO_EXPERT_GPU_CHECK";
+/// P45: `DENNO_EXPERT_GPU_MIN_HIT`: 直近のヒット率がこれ未満なら CPU 経路。既定 0.5。
+/// `0` は「常に GPU」(P39 までと同じ挙動)。
+pub const EXPERT_GPU_MIN_HIT_ENV: &str = "DENNO_EXPERT_GPU_MIN_HIT";
+
+/// [`EXPERT_GPU_MIN_HIT_ENV`] の既定値。
+pub const DEFAULT_EXPERT_GPU_MIN_HIT: f32 = 0.5;
+
+/// 移動平均を取るトークン数 (直近何トークンぶんの MoE 呼び出しを見るか)。
+pub const GATE_WINDOW_TOKENS: usize = 64;
+
+/// CPU に倒してから何トークン目で 1 回だけ GPU を試すか (計測用の probe)。
+pub const GATE_PROBE_TOKENS: u32 = 8;
 
 /// `"1"` / `"true"` / `"on"` だけを真として扱う (`cuda_enabled` と同じ集合)。
 ///
@@ -82,7 +98,8 @@ pub fn vram_mb_from_value(v: Option<&str>) -> usize {
 pub enum Route {
     /// 従来の CPU (`moe_expert::expert_gemv_any`)。**既定**。
     Cpu,
-    /// VRAM 常駐 + `cuda::moe_gemv_dev_buf`。
+    /// VRAM 常駐 + `cuda::moe_gemv_dev_buf`。**トークンごとに [`ExpertGate`] が
+    /// CPU へ落とすことがある** (P45)。
     Vram,
 }
 
@@ -107,6 +124,215 @@ pub fn gpu_available() -> bool {
     #[cfg(not(feature = "cuda"))]
     {
         false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P45: 直近のヒット率で GPU / CPU を選ぶゲート (GPU 無しでテストできる中核)
+// ---------------------------------------------------------------------------
+
+/// [`EXPERT_GPU_MIN_HIT_ENV`] の解釈 (純粋関数)。
+///
+/// - 未設定 / 空 / 数値でない値 → 既定 [`DEFAULT_EXPERT_GPU_MIN_HIT`] (0.5)。
+/// - `"0"` → 0.0 = **常に GPU** (P39 までと同じ)。
+/// - 範囲外は 0..1 に丸める (負は「常に GPU」、1 超は「常に CPU」と同じ意味)。
+pub fn min_hit_from_value(v: Option<&str>) -> f32 {
+    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_EXPERT_GPU_MIN_HIT;
+    };
+    match s.parse::<f32>() {
+        Ok(x) if x.is_finite() => x.clamp(0.0, 1.0),
+        _ => DEFAULT_EXPERT_GPU_MIN_HIT,
+    }
+}
+
+/// ゲートの判定。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GateDecision {
+    /// ヒット率がしきい値以上 (または `min_hit = 0`) → GPU 経路。
+    Gpu,
+    /// ヒット率がしきい値未満 → CPU 経路。
+    Cpu,
+    /// ヒット率がしきい値未満だが、計測のためこの 1 トークンだけ GPU を試す。
+    /// 実行そのものは [`GateDecision::Gpu`] と同じ。
+    Probe,
+}
+
+impl GateDecision {
+    /// この判定で GPU を使うか。
+    pub fn uses_gpu(self) -> bool {
+        !matches!(self, GateDecision::Cpu)
+    }
+}
+
+/// ゲートの設定。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GateConfig {
+    /// ヒット率のしきい値。0 以下ならゲート無効 (常に GPU)。
+    pub min_hit: f32,
+    /// 移動平均を取るトークン数 (> 0)。
+    pub window: usize,
+    /// CPU に倒してから何トークン目で probe するか (> 0)。
+    pub probe_every: u32,
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        GateConfig {
+            min_hit: DEFAULT_EXPERT_GPU_MIN_HIT,
+            window: GATE_WINDOW_TOKENS,
+            probe_every: GATE_PROBE_TOKENS,
+        }
+    }
+}
+
+/// 直近 `window` トークンのヒット率で GPU / CPU を選ぶ判定器 (P45)。
+///
+/// # 1 サンプル = 1 トークン (全層ぶん)
+///
+/// 観測は「1 トークンで全層が使った expert 集合のうち、VRAM に載っていた割合」。
+/// VRAM の LRU は**全層で共有**なので、層ごとに独立して判定・probe すると
+/// 「他の層が積んだぶんを追い出した状態」を測ってしまい、定常状態より低い
+/// ヒット率が出る。トークンの先頭 (`layer == 0`) で判定し、層 1 以降は同じ判定を
+/// 使い、実測はトークンの終わりに 1 サンプルへ畳む。
+///
+/// # 復帰 (probe)
+///
+/// ヒット率が低いまま CPU に倒し続けると VRAM が温まらないので永久に CPU になる
+/// (ラッチ)。これを避けるため、CPU に倒してから `probe_every` トークン目だけ
+/// GPU で回して測り直す。CPU のトークンは LRU を 1 本も挿れないので、probe の
+/// ヒット率は「いま GPU に戻したらどれだけ当たるか」をそのまま表す。
+pub struct ExpertGate {
+    cfg: GateConfig,
+    /// 直近のヒット率 (トークンごとの 0..1) のリングバッファ
+    samples: Vec<f32>,
+    next: usize,
+    filled: usize,
+    sum: f64,
+    /// CPU に倒してからの連続トークン数 (probe の間隔を数える)
+    cpu_streak: u32,
+    probes: u64,
+    /// いまのトークンの判定 (layer 0 で決めて層 1 以降が使う)
+    cur: Option<GateDecision>,
+    /// いまのトークンの実測 (層ぶんを足して、次のトークンの先頭で 1 サンプルにする)
+    acc_hits: u32,
+    acc_lookups: u32,
+}
+
+impl ExpertGate {
+    /// 設定 `cfg` で作る (`window` 0 は 1 に丸める)。
+    pub fn new(cfg: GateConfig) -> Self {
+        let window = cfg.window.max(1);
+        ExpertGate {
+            cfg: GateConfig { window, ..cfg },
+            samples: vec![0.0; window],
+            next: 0,
+            filled: 0,
+            sum: 0.0,
+            cpu_streak: 0,
+            probes: 0,
+            cur: None,
+            acc_hits: 0,
+            acc_lookups: 0,
+        }
+    }
+
+    pub fn cfg(&self) -> GateConfig {
+        self.cfg
+    }
+
+    /// 窓に入っているサンプル数 (最大 `window`)。1 サンプル = 1 トークン。
+    pub fn samples(&self) -> usize {
+        self.filled
+    }
+
+    /// 直近のヒット率。サンプルが 1 本も無ければ `None`。
+    pub fn hit_rate(&self) -> Option<f32> {
+        if self.filled == 0 {
+            return None;
+        }
+        Some((self.sum / self.filled as f64) as f32)
+    }
+
+    /// 1 層ぶんの実測を足す。**サンプルにはまだしない** (次のトークンの先頭で畳む)。
+    pub fn record(&mut self, hits: u32, lookups: u32) {
+        if lookups == 0 {
+            return;
+        }
+        self.acc_hits = self.acc_hits.saturating_add(hits.min(lookups));
+        self.acc_lookups = self.acc_lookups.saturating_add(lookups);
+    }
+
+    /// 前のトークンの実測を 1 サンプルとして確定する (実測が無ければ何もしない)。
+    ///
+    /// 窓が埋まっていれば最も古いサンプルを落として入れ替える (移動平均)。
+    fn flush(&mut self) {
+        let (hits, lookups) = (self.acc_hits, self.acc_lookups);
+        self.acc_hits = 0;
+        self.acc_lookups = 0;
+        if lookups == 0 {
+            return;
+        }
+        let f = (hits.min(lookups) as f64) / lookups as f64;
+        if self.filled == self.samples.len() {
+            self.sum -= self.samples[self.next] as f64;
+        } else {
+            self.filled += 1;
+        }
+        self.samples[self.next] = f as f32;
+        self.sum += f;
+        self.next = (self.next + 1) % self.samples.len();
+    }
+
+    /// 1 層ぶんの入口。`layer == 0` を「トークンの先頭」として扱う。
+    ///
+    /// - `layer == 0`: 前のトークンの実測を 1 サンプルに畳んでから、このトークンの
+    ///   判定を出す。
+    /// - `layer >= 1`: トークンの途中なので、layer 0 で決めた判定をそのまま返す
+    ///   (層によって GPU / CPU が混ざらない)。
+    /// - 先頭を通らずに呼ばれた場合 (層の部分実行) は従来どおり GPU。
+    pub fn decide(&mut self, layer: usize, h2d_bytes: Option<u64>) -> GateDecision {
+        if layer == 0 {
+            self.flush();
+            let d = self.decide_token(h2d_bytes);
+            self.cur = Some(d);
+            return d;
+        }
+        self.cur.unwrap_or(GateDecision::Gpu)
+    }
+
+    /// このトークンを GPU で回してよいか。
+    ///
+    /// `h2d_bytes` は「このトークンでミスした場合に VRAM へ積む量」の見積り。
+    /// **`None` は見積れない = fail-safe で CPU** に倒す (型が非対応・形が読めない)。
+    fn decide_token(&mut self, h2d_bytes: Option<u64>) -> GateDecision {
+        // 1. `DENNO_EXPERT_GPU_MIN_HIT=0` はゲート無効 = P39 までと同じ挙動。
+        if self.cfg.min_hit <= 0.0 {
+            return GateDecision::Gpu;
+        }
+        // 2. ミス時に積む量が読めないなら GPU にしない (fail-safe)。
+        if h2d_bytes.is_none() {
+            return GateDecision::Cpu;
+        }
+        // 3. 直近のヒット率で決める。まだ 1 本も測っていない (起動直後) も CPU。
+        let warm = self.hit_rate().is_some_and(|r| r >= self.cfg.min_hit);
+        if warm {
+            self.cpu_streak = 0;
+            return GateDecision::Gpu;
+        }
+        // 4. 低いままなら probe_every トークンに 1 回だけ測り直す。
+        self.cpu_streak = self.cpu_streak.saturating_add(1);
+        if self.cpu_streak >= self.cfg.probe_every.max(1) {
+            self.cpu_streak = 0;
+            self.probes += 1;
+            return GateDecision::Probe;
+        }
+        GateDecision::Cpu
+    }
+
+    /// probe した回数 (診断用)。
+    pub fn probes(&self) -> u64 {
+        self.probes
     }
 }
 
@@ -422,8 +648,8 @@ pub fn budget_usage() -> Option<(usize, usize, usize)> {
 
 #[cfg(feature = "cuda")]
 pub use gpu::{
-    acquire, cache_usage, check_enabled, fallbacks, init, note_check, take_check, CheckAcc,
-    ExpertDev, ExpertShape,
+    acquire, cache_usage, check_enabled, fallbacks, init, note_check, take_check, Acquired,
+    CheckAcc, ExpertDev, ExpertShape,
 };
 
 #[cfg(feature = "cuda")]
@@ -584,11 +810,18 @@ mod gpu {
         FALLBACKS.load(Ordering::Relaxed)
     }
 
+    /// [`acquire`] の結果。`hit` は「すでに VRAM に載っていたか」(P45 のゲートが
+    /// ヒット率として数える)。
+    pub struct Acquired {
+        pub dev: Arc<ExpertDev>,
+        pub hit: bool,
+    }
+
     /// expert 1 本を VRAM から取る。無ければ `load` でバイト列を取って載せる。
     ///
     /// 戻り値:
-    /// - `Ok(Some(dev))` — GPU で回すこと。`dev` は計算中ずっと保持してよい
-    ///   (追い出されても drop まで生きている)。
+    /// - `Ok(Some(a))` — GPU で回すこと。`a.dev` は計算中ずっと保持してよい
+    ///   (追い出されても drop まで生きている)。`a.hit` は載っていたかどうか。
     /// - `Ok(None)` — この expert は GPU で回せない。呼び出し側は CPU へ。
     /// - `Err` — 同じ鍵に別の形が来た / ロックが壊れた (実装の誤り)。
     ///
@@ -597,7 +830,7 @@ mod gpu {
         key: ExpertKey,
         shapes: [ExpertShape; 3],
         load: F,
-    ) -> Result<Option<Arc<ExpertDev>>>
+    ) -> Result<Option<Acquired>>
     where
         F: FnOnce() -> Result<[&'a [u8]; 3]>,
     {
@@ -620,7 +853,10 @@ mod gpu {
                     shapes
                 );
             }
-            return Ok(Some(Arc::clone(dev)));
+            return Ok(Some(Acquired {
+                dev: Arc::clone(dev),
+                hit: true,
+            }));
         }
 
         // 載せる前に「型・カーネルが対応しているか」を確かめる。載せてから
@@ -673,7 +909,7 @@ mod gpu {
             shapes,
         });
         g.insert(key, want, Arc::clone(&dev));
-        Ok(Some(dev))
+        Ok(Some(Acquired { dev, hit: false }))
     }
 
     // -----------------------------------------------------------------------
@@ -977,5 +1213,203 @@ mod tests {
         assert_eq!(r.bytes(), 3_000_000);
         assert_eq!(budget_usage(), None, "予算そのものが無い");
         drop(r); // 何も起きない (パニックしないこと)
+    }
+
+    // -----------------------------------------------------------------------
+    // P45: ヒット率ゲート
+    // -----------------------------------------------------------------------
+
+    /// `DENNO_EXPERT_GPU_MIN_HIT` の解釈。
+    #[test]
+    fn min_hit_parsing() {
+        assert_eq!(min_hit_from_value(None), 0.5, "未設定は既定 0.5");
+        assert_eq!(min_hit_from_value(Some("")), 0.5);
+        assert_eq!(min_hit_from_value(Some("   ")), 0.5);
+        assert_eq!(min_hit_from_value(Some("0")), 0.0, "0 は常に GPU");
+        assert_eq!(min_hit_from_value(Some("0.3")), 0.3);
+        assert_eq!(min_hit_from_value(Some(" 0.75 ")), 0.75);
+        assert_eq!(min_hit_from_value(Some("1")), 1.0);
+        assert_eq!(min_hit_from_value(Some("2")), 1.0, "1 超は 1 に丸める");
+        assert_eq!(min_hit_from_value(Some("-1")), 0.0, "負は 0 (常に GPU) に丸める");
+        assert_eq!(min_hit_from_value(Some("abc")), 0.5, "数値でない値は既定");
+        assert_eq!(min_hit_from_value(Some("nan")), 0.5, "NaN は既定");
+    }
+
+    /// 起動直後 (サンプル 0) は CPU。probe の間隔でだけ GPU を試す。
+    #[test]
+    fn gate_cold_start_is_cpu_and_probes_periodically() {
+        let mut g = ExpertGate::new(GateConfig {
+            min_hit: 0.5,
+            window: 64,
+            probe_every: 8,
+        });
+        assert_eq!(g.hit_rate(), None, "最初はサンプルが無い");
+        let first: Vec<GateDecision> = (0..8).map(|_| g.decide(0, Some(1024))).collect();
+        assert_eq!(
+            first,
+            vec![
+                GateDecision::Cpu,
+                GateDecision::Cpu,
+                GateDecision::Cpu,
+                GateDecision::Cpu,
+                GateDecision::Cpu,
+                GateDecision::Cpu,
+                GateDecision::Cpu,
+                GateDecision::Probe,
+            ],
+            "冷えた状態では CPU、8 トークン目だけ計測のため GPU"
+        );
+        assert_eq!(g.probes(), 1);
+        // probe の後もヒット率が低いままなら CPU に戻る
+        g.record(0, 10);
+        assert_eq!(g.decide(0, Some(1024)), GateDecision::Cpu);
+    }
+
+    /// 1 サンプル = 1 トークン。層 1 以降はトークン先頭の判定をそのまま使う。
+    #[test]
+    fn gate_one_sample_per_token_and_layers_share_the_decision() {
+        let mut g = ExpertGate::new(GateConfig::default());
+        assert_eq!(g.decide(0, Some(1024)), GateDecision::Cpu, "1 トークン目は冷えている");
+        for layer in 1..48 {
+            assert_eq!(
+                g.decide(layer, Some(1024)),
+                GateDecision::Cpu,
+                "層 {layer} で判定が変わった (トークン内で混ざる)"
+            );
+        }
+        // 48 層ぶんの実測 (全ヒット) を足す → まだサンプルではない
+        for _ in 0..48 {
+            g.record(10, 10);
+        }
+        assert_eq!(g.samples(), 0, "トークンの先頭までサンプルにしない");
+        // 次のトークンの先頭で 1 サンプルに畳まれ、ヒット率 1.0 で GPU に戻る
+        assert_eq!(g.decide(0, Some(1024)), GateDecision::Gpu);
+        assert_eq!(g.samples(), 1);
+        assert_eq!(g.hit_rate(), Some(1.0));
+        // 層 1 以降も GPU のまま
+        assert_eq!(g.decide(1, None), GateDecision::Gpu);
+    }
+
+    /// ヒット率 0 / 0.3 / 0.9 で経路が期待どおりになる (しきい値 0.5)。
+    #[test]
+    fn gate_switches_on_hit_rate() {
+        let cases: [(f64, GateDecision); 3] = [
+            (0.0, GateDecision::Cpu),
+            (0.3, GateDecision::Cpu),
+            (0.9, GateDecision::Gpu),
+        ];
+        for (rate, want) in cases {
+            let mut g = ExpertGate::new(GateConfig {
+                min_hit: 0.5,
+                window: 64,
+                probe_every: 8,
+            });
+            let hits = (rate * 10.0).round() as u32;
+            for _ in 0..64 {
+                g.record(hits, 10);
+                g.decide(0, Some(4096)); // 1 トークンぶんを確定させる
+            }
+            let got = g.hit_rate().expect("サンプルあり") as f64;
+            assert!(
+                (got - rate).abs() < 1e-6,
+                "ヒット率 {got} が {rate} にならない"
+            );
+            assert_eq!(g.decide(0, Some(4096)), want, "ヒット率 {rate} の経路");
+        }
+    }
+
+    /// しきい値 0 はゲート無効 = 常に GPU (P39 までと同じ)。
+    #[test]
+    fn gate_zero_threshold_always_gpu() {
+        let mut g = ExpertGate::new(GateConfig {
+            min_hit: 0.0,
+            window: 64,
+            probe_every: 8,
+        });
+        for _ in 0..200 {
+            assert_eq!(g.decide(0, Some(4096)), GateDecision::Gpu);
+        }
+        g.record(0, 10); // 全部ミスでも関係ない
+        assert_eq!(g.decide(0, None), GateDecision::Gpu, "0 は見積り不能でも GPU");
+        assert_eq!(g.probes(), 0);
+    }
+
+    /// H2D 量が見積れない (`None`) ときは CPU に倒す (fail-safe)。
+    #[test]
+    fn gate_unknown_h2d_is_cpu() {
+        let mut g = ExpertGate::new(GateConfig::default());
+        for _ in 0..64 {
+            g.record(10, 10); // ヒット率 1.0 = 温まっていても
+            g.decide(0, Some(1));
+        }
+        assert_eq!(
+            g.decide(0, None),
+            GateDecision::Cpu,
+            "積む量が読めないなら GPU にしない"
+        );
+        assert_eq!(
+            g.decide(0, Some(1)),
+            GateDecision::Gpu,
+            "読めればヒット率で判断"
+        );
+    }
+
+    /// 移動平均は「直近 window トークン」だけを見る。
+    #[test]
+    fn gate_window_keeps_only_recent_samples() {
+        let mut g = ExpertGate::new(GateConfig {
+            min_hit: 0.5,
+            window: 4,
+            probe_every: 8,
+        });
+        let push = |g: &mut ExpertGate, hits: u32| {
+            g.record(hits, 10);
+            g.decide(0, Some(1));
+        };
+        push(&mut g, 0);
+        push(&mut g, 0);
+        assert_eq!(g.hit_rate(), Some(0.0));
+        push(&mut g, 10);
+        push(&mut g, 10);
+        assert_eq!(g.hit_rate(), Some(0.5), "4 本そろった時点の平均");
+        push(&mut g, 10); // 古い 0.0 が落ちる
+        assert_eq!(g.samples(), 4, "窓は 4 本で固定");
+        assert_eq!(g.hit_rate(), Some(0.75));
+        // 全部ミスで埋めると 0 に戻る
+        for _ in 0..4 {
+            g.record(0, 5);
+            g.decide(0, Some(1));
+        }
+        assert_eq!(g.hit_rate(), Some(0.0));
+    }
+
+    /// `lookups == 0` はサンプルにしない。
+    #[test]
+    fn gate_ignores_empty_lookups() {
+        let mut g = ExpertGate::new(GateConfig::default());
+        g.record(0, 0);
+        g.decide(0, Some(1));
+        assert_eq!(g.samples(), 0);
+        assert_eq!(g.hit_rate(), None);
+    }
+
+    /// 窓 0 は 1 に丸める (0 除算しない)。
+    #[test]
+    fn gate_window_zero_is_one() {
+        let mut g = ExpertGate::new(GateConfig {
+            min_hit: 0.5,
+            window: 0,
+            probe_every: 0,
+        });
+        assert_eq!(g.cfg().window, 1);
+        assert_eq!(g.cfg().probe_every, 0);
+        g.record(0, 2);
+        // probe_every 0 は「毎回 probe」= 1 トークン目から GPU (0 除算しない)
+        assert_eq!(g.decide(0, Some(8)), GateDecision::Probe);
+        assert_eq!(g.samples(), 1, "トークンの先頭で 1 サンプル確定");
+        assert_eq!(g.hit_rate(), Some(0.0));
+        assert_eq!(g.probes(), 1);
+        assert_eq!(g.decide(0, Some(8)), GateDecision::Probe);
+        assert_eq!(g.probes(), 2);
     }
 }
