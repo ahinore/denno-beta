@@ -1,5 +1,6 @@
 //! denno: TensorFold 型の単一バイナリ CLI (pull / models / info / generate / serve)
 
+mod flash_telemetry;
 mod pull;
 mod serve_flash;
 

@@ -1907,6 +1907,46 @@ pub struct Qwen4Exp {
     expert_cache: Option<ExpertCacheSet>,
 }
 
+/// 層の出口で観測フックに渡す情報 (P53)。
+///
+/// 数値経路には触れない (**読むだけ**)。フックを付けないとき
+/// ([`Qwen4Exp::forward_token`] / [`Qwen4Exp::forward_prefill_with`]) は
+/// 実装側で `None` を渡すので、層ループには `if let Some(..)` が 1 個増えるだけで
+/// 走査も確保も起きない。
+pub struct LayerOut<'a> {
+    /// 層番号
+    pub il: usize,
+    /// この forward 呼び出し内のトークン位置 (バッチ prefill はチャンク内、
+    /// 逐次経路は `ctx` の先頭から)
+    pub t: usize,
+    /// この forward 呼び出しで回したトークン本数
+    pub nt: usize,
+    /// 埋め込み次元 (残差ストリーム 1 本の長さ)
+    pub n_embd: usize,
+    /// 層の出力 (残差を足した後)。`[hc][n_embd]` の連結。
+    pub res: &'a [f32],
+}
+
+impl<'a> LayerOut<'a> {
+    /// 代表ストリーム (stream 0) の `n_embd` 個。P53 の層活性はこれを使う。
+    ///
+    /// hyper-connection は hc 本の残差ストリームを持つが、活性の走査コストを
+    /// `n_layer * n_embd` に固定するため 1 本だけ見る (残差を足した後の値)。
+    pub fn stream0(&self) -> &'a [f32] {
+        let n = self.n_embd.min(self.res.len());
+        &self.res[..n]
+    }
+}
+
+/// どのトークンの層出口を観測するか (P53)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapTokens {
+    /// 全部 (decode は 1 トークン呼び出しなので実質ごとトークン)
+    All,
+    /// forward 呼び出しの**最後のトークンだけ** (prefill のチャンク末尾で 1 回)
+    Last,
+}
+
 impl Qwen4Exp {
     /// 実 GGUF から組む。**全テンソルの存在・形状・量子型を先に検査**して、
     /// 1 本でも欠けたら `Err` にする (黙って 0 で埋めない)。
@@ -2002,7 +2042,7 @@ impl Qwen4Exp {
     /// (`ple.ngram` の窓は末尾 3 個 = 現在 + 直前 2)。PLE が無いモデルでは
     /// 末尾しか使わない。
     pub fn forward_token(&mut self, ctx: &[u32]) -> Result<Vec<f32>> {
-        self.forward_token_with(ctx, |_, _| Ok(()))
+        self.forward_token_at(ctx, 0, 1, None)
     }
 
     /// [`Qwen4Exp::forward_token`] の層ごとフック付き版。
@@ -2013,13 +2053,45 @@ impl Qwen4Exp {
     where
         F: FnMut(usize, &[f32]) -> Result<()>,
     {
+        let mut hook = |o: &LayerOut<'_>| -> Result<()> { on_layer(o.il, o.res) };
+        self.forward_token_at(ctx, 0, 1, Some(&mut hook))
+    }
+
+    /// P53: 層の出口観測フック付きの 1 トークン forward。
+    ///
+    /// `on_layer` は層ごとに 1 回、**層の出口 (ffn の `hc_combine` の後)** で
+    /// 呼ばれる。戻り値を持たないので、観測側は数値経路に影響を与えられない
+    /// (読むだけ)。`t` / `nt` は (0, 1)。
+    pub fn forward_token_tapped<F>(&mut self, ctx: &[u32], mut on_layer: F) -> Result<Vec<f32>>
+    where
+        F: FnMut(&LayerOut<'_>),
+    {
+        let mut hook = |o: &LayerOut<'_>| -> Result<()> {
+            on_layer(o);
+            Ok(())
+        };
+        self.forward_token_at(ctx, 0, 1, Some(&mut hook))
+    }
+
+    /// [`Qwen4Exp::forward_token_tapped`] の本体。`on_layer` が `None` のときは
+    /// 層ループに `if let` が 1 個増えるだけで、走査も確保もしない
+    /// (`qwen4exp_decode` の `step_inner` からも使う)。
+    pub(crate) fn forward_token_at(
+        &mut self,
+        ctx: &[u32],
+        t: usize,
+        nt: usize,
+        mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+    ) -> Result<Vec<f32>> {
         let hp = self.hp();
         let mut res = self.forward_embed(ctx, &hp)?;
         let ple_emb = self.gather_ple(ctx)?;
 
         for il in 0..self.p.n_layer {
             self.run_layer(il, &mut res, ple_emb.as_ref(), &hp, &mut |_, _, _| Ok(()))?;
-            on_layer(il, &res.data)?;
+            if let Some(h) = on_layer.as_deref_mut() {
+                h(&LayerOut { il, t, nt, n_embd: self.p.n_embd, res: &res.data })?;
+            }
         }
 
         // 4. 最終 mixer (output_norm の代わり) + 5. logits
@@ -2198,24 +2270,79 @@ impl Qwen4Exp {
     ///
     /// `batch == false` は既存の逐次経路そのもの (1 ビットも変えない)。
     pub fn forward_prefill_with(&mut self, ctx: &[u32], batch: bool) -> Result<Vec<f32>> {
+        self.forward_prefill_inner(ctx, batch, TapTokens::Last, None)
+    }
+
+    /// P53: 層の出口観測フック付きの prefill。
+    ///
+    /// `tokens` で観測するトークンを選ぶ。`TapTokens::Last` は**チャンクの
+    /// 最後のトークンだけ**を流す (層ループがチャンクを跨いでも 1 チャンク 1 回)。
+    ///
+    /// フックは層の出口 (ffn の `hc_combine` の後) で呼ばれる。読むだけなので
+    /// logits は `forward_prefill_with` とビット一致する。
+    pub fn forward_prefill_tapped<F>(
+        &mut self,
+        ctx: &[u32],
+        batch: bool,
+        tokens: TapTokens,
+        mut on_layer: F,
+    ) -> Result<Vec<f32>>
+    where
+        F: FnMut(&LayerOut<'_>),
+    {
+        let mut hook = |o: &LayerOut<'_>| -> Result<()> {
+            on_layer(o);
+            Ok(())
+        };
+        self.forward_prefill_inner(ctx, batch, tokens, Some(&mut hook))
+    }
+
+    fn forward_prefill_inner(
+        &mut self,
+        ctx: &[u32],
+        batch: bool,
+        tokens: TapTokens,
+        on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+    ) -> Result<Vec<f32>> {
         if batch && self.attn.layer_major_safe() {
-            self.forward_prefill_batch(ctx, prefill_batch_chunk())
+            self.forward_prefill_batch_tapped(ctx, prefill_batch_chunk(), tokens, on_layer)
         } else {
-            self.prefill_seq(ctx)
+            self.prefill_seq(ctx, tokens, on_layer)
         }
     }
 
-    /// 逐次 prefill (= decoder と同じ経路)。既存の [`Qwen4Exp::forward_token`] を
+    /// 逐次 prefill (= decoder と同じ経路)。既存の [`Qwen4Exp::forward_token_at`] を
     /// トークン数だけ呼ぶだけで、数値経路には触らない。
-    fn prefill_seq(&mut self, ctx: &[u32]) -> Result<Vec<f32>> {
+    fn prefill_seq(
+        &mut self,
+        ctx: &[u32],
+        tokens: TapTokens,
+        mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+    ) -> Result<Vec<f32>> {
         if ctx.is_empty() {
             return Err(one("ctx が空 (現在のトークンが無い)"));
         }
+        let nt = ctx.len();
         let mut logits = Vec::new();
-        for i in 0..ctx.len() {
-            logits = self.forward_token(&ctx[..=i])?;
+        for i in 0..nt {
+            let want = match tokens {
+                TapTokens::All => true,
+                TapTokens::Last => i + 1 == nt,
+            };
+            // `on_layer` は `&mut dyn` なので、ループのたびに短い寿命で借り直す
+            // (`as_deref_mut` だと外側の寿命に固定されて 2 回目で E0499 になる)。
+            let hook: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>> = match &mut on_layer {
+                Some(f) if want => Some(&mut **f),
+                _ => None,
+            };
+            logits = self.forward_token_at(&ctx[..=i], i, nt, hook)?;
         }
         Ok(logits)
+    }
+
+    /// [`Qwen4Exp::forward_prefill_batch_tapped`] のフック無し版 (テスト用)。
+    fn forward_prefill_batch(&mut self, ctx: &[u32], chunk: usize) -> Result<Vec<f32>> {
+        self.forward_prefill_batch_tapped(ctx, chunk, TapTokens::Last, None)
     }
 
     /// 層優先のバッチ prefill。`ctx` を `chunk` トークンずつに切り、チャンク内では
@@ -2228,7 +2355,13 @@ impl Qwen4Exp {
     ///
     /// 数値: 1 トークンぶんの演算は逐次版と同じ関数・同じ順序で、行列積だけを
     /// [`gemv_batch`] に置き換える。したがって f32 でビット一致する。
-    fn forward_prefill_batch(&mut self, ctx: &[u32], chunk: usize) -> Result<Vec<f32>> {
+    fn forward_prefill_batch_tapped(
+        &mut self,
+        ctx: &[u32],
+        chunk: usize,
+        tokens: TapTokens,
+        mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+    ) -> Result<Vec<f32>> {
         if ctx.is_empty() {
             return Err(one("ctx が空 (現在のトークンが無い)"));
         }
@@ -2327,6 +2460,21 @@ impl Qwen4Exp {
                     )));
                 }
                 hyper::hc_combine_batch(&mut ress, &ffn, &injs, &hp);
+
+                // P53: 層の出口 (残差を足した後) を観測フックに渡す。読むだけ。
+                if let Some(h) = on_layer.as_deref_mut() {
+                    match tokens {
+                        TapTokens::All => {
+                            for t in 0..nt {
+                                h(&LayerOut { il, t, nt, n_embd: e, res: &ress[t].data })?;
+                            }
+                        }
+                        TapTokens::Last => {
+                            let t = nt - 1;
+                            h(&LayerOut { il, t, nt, n_embd: e, res: &ress[t].data })?;
+                        }
+                    }
+                }
             }
 
             // 次のチャンクは自分の埋め込みから始まる (残差の持ち越しは無い)。
