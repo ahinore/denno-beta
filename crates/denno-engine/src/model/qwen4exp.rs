@@ -2177,6 +2177,8 @@ impl Qwen4Exp {
             if let Some(d) = roles.as_deref_mut() {
                 *d = RoleRms::default();
             }
+            // P56: RouterTopK はこの呼び出しの最終トークンだけ (`t + 1 == nt`)。
+            // decode は (0, 1) なので常に真、逐次 prefill は末尾の 1 トークンだけ。
             self.run_layer(
                 il,
                 &mut res,
@@ -2184,6 +2186,7 @@ impl Qwen4Exp {
                 &hp,
                 &mut |_, _, _| Ok(()),
                 roles.as_deref_mut(),
+                t + 1 == nt,
             )?;
             if let Some(h) = on_layer.as_deref_mut() {
                 h(&LayerOut {
@@ -2262,6 +2265,11 @@ impl Qwen4Exp {
     ///
     /// `roles` が `Some` のときだけ役割別 RMS (P54) を書く。**読むだけ**なので
     /// 数値経路は変わらない。`None` のときは分岐 1 個ぶんのコストも無い。
+    ///
+    /// `emit_router` は RouterTopK (P56) を送るか。呼び出し側が「このトークンが
+    /// prefill のチャンク末尾か」を知っているので、そこで決める (decode は常に
+    /// true、逐次 prefill は末尾の 1 トークンだけ true)。役割 RMS と RouterTopK は
+    /// どちらも読むだけの観測で、同じ本体 ([`moe_ffn_quant_full`]) を通る。
     fn run_layer(
         &mut self,
         il: usize,
@@ -2270,6 +2278,7 @@ impl Qwen4Exp {
         hp: &HyperParams,
         hook: &mut dyn FnMut(&str, usize, &[f32]) -> Result<()>,
         mut roles: Option<&mut RoleRms>,
+        emit_router: bool,
     ) -> Result<()> {
         let e = self.p.n_embd;
         let lw = &self.layers[il];
@@ -2356,6 +2365,7 @@ impl Qwen4Exp {
             &cur,
             self.expert_cache.as_ref(),
             roles.as_deref_mut(),
+            emit_router,
         )?;
         q4prof::add(&q4prof::MOE, t_moe);
         hook("ffn_out", il, &cur)?;
@@ -2384,7 +2394,7 @@ impl Qwen4Exp {
                     }
                     Ok(())
                 };
-                self.run_layer(il, &mut res, ple_emb.as_ref(), &hp, &mut hook, None)?;
+                self.run_layer(il, &mut res, ple_emb.as_ref(), &hp, &mut hook, None, false)?;
             }
         }
         Ok(())
@@ -2648,6 +2658,7 @@ impl Qwen4Exp {
                     nt,
                     self.expert_cache.as_ref(),
                     roles.as_deref_mut(),
+                    true,
                 )?;
                 q4prof::add(&q4prof::MOE, t_moe);
                 if ffn.len() != nt * e {
@@ -3121,7 +3132,23 @@ fn moe_ffn_quant(
     x: &[f32],
     cache: Option<&ExpertCacheSet>,
 ) -> Result<Vec<f32>> {
-    moe_ffn_quant_with(p, lw, x, cache, moe_par_enabled(), expert_route())
+    moe_ffn_quant_full(p, lw, x, cache, moe_par_enabled(), expert_route(), None, true)
+}
+
+/// P56: 1 層ぶんのルータ結果を [`denno_telemetry::Frame::RouterTopK`] として送る。
+///
+/// `DENNO_TELEMETRY` と `DENNO_TELEMETRY_ARCH` の両方が立っているときだけ
+/// フレームを作る (どちらもプロセスで 1 回だけ env を読む。既定はどちらも off)。
+/// **probs / sel / weights を読むだけ**なので logits も出力も変わらない。
+/// 満杯時はハブが捨てる (推論は待たない)。
+///
+/// expert index と重みはルータの結果そのものなので、コストは top-k (≤10) 個の
+/// コピーと並べ替えだけ (フレームの並びは重みの降順)。
+fn emit_router_topk(layer: usize, sel: &[usize], weights: &[f32]) {
+    if !denno_telemetry::enabled() || !denno_telemetry::arch_enabled() {
+        return;
+    }
+    denno_telemetry::emit(denno_telemetry::router_topk_frame(layer as u16, sel, weights));
 }
 
 /// P54: 役割別 RMS (router の top-k 確率和 / shared expert の RMS) も取る
@@ -3129,14 +3156,17 @@ fn moe_ffn_quant(
 ///
 /// `roles` が `Some` のときだけ 2 つの値を書く。どちらも**すでに計算した値**を
 /// 読むだけで、追加の行列積も確保もしない (top-k 和は再正規化の分母をそのまま使う)。
+///
+/// `emit_router` は P56 の RouterTopK を送るか (どちらも読むだけの観測)。
 fn moe_ffn_quant_tapped(
     p: &Qwen4ExpParams,
     lw: &LayerW,
     x: &[f32],
     cache: Option<&ExpertCacheSet>,
     roles: Option<&mut RoleRms>,
+    emit_router: bool,
 ) -> Result<Vec<f32>> {
-    moe_ffn_quant_full(p, lw, x, cache, moe_par_enabled(), expert_route(), roles)
+    moe_ffn_quant_full(p, lw, x, cache, moe_par_enabled(), expert_route(), roles, emit_router)
 }
 
 /// P39: expert の計算経路 (`DENNO_EXPERT_GPU` + `DENNO_EXPERT_VRAM_MB`)。プロセスで 1 回だけ。
@@ -3344,6 +3374,10 @@ fn moe_ffn_quant_with_par(
 /// P45: `Route::Vram` でも、[`expert_gate_decide`] が低ヒット率と判断したトークンは
 /// CPU で計算する (`use_gpu == false`)。CPU と GPU は同じバイト列に同じ式を通すので、
 /// どのトークンがどちらに落ちても最終出力は CPU 経路と一致する (実測 max_abs 0.000e0)。
+///
+/// テスト専用: 本番の入口は [`moe_ffn_quant`] / [`moe_ffn_quant_tapped`]
+/// (RouterTopK を送るかと役割 RMS を取るかを引数で受ける)。
+#[cfg(test)]
 fn moe_ffn_quant_with(
     p: &Qwen4ExpParams,
     lw: &LayerW,
@@ -3352,10 +3386,14 @@ fn moe_ffn_quant_with(
     par: bool,
     route: Route,
 ) -> Result<Vec<f32>> {
-    moe_ffn_quant_full(p, lw, x, cache, par, route, None)
+    moe_ffn_quant_full(p, lw, x, cache, par, route, None, true)
 }
 
-/// [`moe_ffn_quant_with`] の本体 (+ P54 の役割別 RMS)。
+/// [`moe_ffn_quant_with`] の本体 (+ P54 の役割別 RMS / P56 の RouterTopK)。
+///
+/// `emit_router` が false のときは RouterTopK を送らない (prefill の非末尾
+/// トークン)。役割 RMS と RouterTopK はどちらも読むだけなので、数値経路は
+/// どちらの引数にも依らない。
 fn moe_ffn_quant_full(
     p: &Qwen4ExpParams,
     lw: &LayerW,
@@ -3364,6 +3402,7 @@ fn moe_ffn_quant_full(
     par: bool,
     route: Route,
     mut roles: Option<&mut RoleRms>,
+    emit_router: bool,
 ) -> Result<Vec<f32>> {
     let t_router = std::time::Instant::now();
     let e = p.n_embd;
@@ -3394,6 +3433,13 @@ fn moe_ffn_quant_full(
     // 確率の和) そのものなので、追加の走査は無い。スカラーなので RMS は値そのもの。
     if let Some(r) = roles.as_deref_mut() {
         r.router = sum;
+    }
+
+    // P56: ルータ結果 (index 昇順の expert と再正規化後の重み) を 1 フレームで送る。
+    // 送るのは decode (1 呼び出し = 1 トークン) と、prefill のチャンク末尾の
+    // トークンだけ (`emit_router` は呼び出し側が決める)。
+    if emit_router {
+        emit_router_topk(lw.il, &sel, &weights);
     }
 
     // 3.5 選択 expert の重みを先に読み始める (I/O と計算を重ねる)。
@@ -5225,6 +5271,8 @@ fn moe_ffn_quant_batch(
 }
 
 /// P54: 役割別 RMS (チャンク末尾のトークン) も取る [`moe_ffn_quant_batch`]。
+///
+/// `emit_router` は P56 の RouterTopK を送るか (チャンク末尾の 1 トークンだけ)。
 fn moe_ffn_quant_batch_tapped(
     p: &Qwen4ExpParams,
     lw: &LayerW,
@@ -5232,6 +5280,7 @@ fn moe_ffn_quant_batch_tapped(
     nt: usize,
     cache: Option<&ExpertCacheSet>,
     roles: Option<&mut RoleRms>,
+    emit_router: bool,
 ) -> Result<Vec<f32>> {
     moe_ffn_quant_batch_full(
         p,
@@ -5242,6 +5291,7 @@ fn moe_ffn_quant_batch_tapped(
         moe_schedule(),
         moe_expert::vnni_enabled(),
         roles,
+        emit_router,
     )
 }
 
@@ -5269,13 +5319,14 @@ fn moe_ffn_quant_batch_opts(
     sched: MoeSchedule,
     vnni: bool,
 ) -> Result<Vec<f32>> {
-    moe_ffn_quant_batch_full(p, lw, xs, nt, cache, sched, vnni, None)
+    moe_ffn_quant_batch_full(p, lw, xs, nt, cache, sched, vnni, None, true)
 }
 
-/// [`moe_ffn_quant_batch_opts`] の本体 (+ P54 の役割別 RMS)。
+/// [`moe_ffn_quant_batch_opts`] の本体 (+ P54 の役割別 RMS / P56 の RouterTopK)。
 ///
 /// `roles` が `Some` のときだけ、**チャンク末尾のトークン**の router 確率和と
 /// shared expert の RMS を書く (prefill の観測はチャンク末尾だけ、の仕様に合わせる)。
+/// `emit_router` も同じく**チャンク末尾の 1 トークンだけ**送る。
 fn moe_ffn_quant_batch_full(
     p: &Qwen4ExpParams,
     lw: &LayerW,
@@ -5285,6 +5336,7 @@ fn moe_ffn_quant_batch_full(
     sched: MoeSchedule,
     vnni: bool,
     mut roles: Option<&mut RoleRms>,
+    emit_router: bool,
 ) -> Result<Vec<f32>> {
     let e = p.n_embd;
     let ne = p.n_expert;
@@ -5301,10 +5353,14 @@ fn moe_ffn_quant_batch_full(
     }
     let mut out = Vec::with_capacity(nt * e);
     if let Some(c) = cache {
+        // P56: RouterTopK はチャンク末尾の 1 トークンだけ送る (キャッシュ経路は
+        // トークンごとに逐次版へ落ちるので、末尾以外は emit_router=false)。
         for t in 0..nt {
             // P54: 役割別 RMS はチャンク末尾のトークンだけ取る。
+            // P56: RouterTopK も同じく末尾の 1 トークンだけ送る。
             let rr: Option<&mut RoleRms> =
                 if t + 1 == nt { roles.as_deref_mut() } else { None };
+            let er = emit_router && t + 1 == nt;
             out.extend_from_slice(&moe_ffn_quant_full(
                 p,
                 lw,
@@ -5313,6 +5369,7 @@ fn moe_ffn_quant_batch_full(
                 moe_par_enabled(),
                 expert_route(),
                 rr,
+                er,
             )?);
         }
         return Ok(out);
@@ -5372,6 +5429,18 @@ fn moe_ffn_quant_batch_full(
         }
     }
     moe_sub_add(0, t_router.elapsed());
+
+    // P56: RouterTopK は**チャンク末尾の 1 トークンだけ**送る。
+    //
+    // 理由: 全トークンを送ると 1 プロンプトで nt × n_layer 枚 (512 トークン ×
+    // 48 層 = 24,576 枚) になり、テレメトリのチャネル (4096) が溢れて
+    // Gap だらけになる。ビューアが描くのは「その層が今どの expert を使うか」で、
+    // チャンク内の代表 1 トークンで足りる (`TapTokens::Last` と同じ規則)。
+    // ここは非キャッシュ経路なので、全トークンの sels / weights が手元にある。
+    if emit_router {
+        let tail = (nt - 1) * k;
+        emit_router_topk(lw.il, &sels[tail..tail + k], &weights[tail..tail + k]);
+    }
 
     // 4. 選択 expert の重みを先に読み始める (逐次版と同じ expert を同じ順で)
     //    同じ expert は 1 層で何度も選ばれる。madvise は 1 expert 1 回で足りるので、
@@ -6039,6 +6108,108 @@ mod tests {
             "CPU 経路で expert_gemv_any が 3 本 × top-k 回呼ばれていない (既定で GPU 経路に入った?)"
         );
         assert_bitwise_eq(&base, &got, "route=Cpu");
+    }
+
+    /// P56: ルーティングの期待値 (テレメトリに依らない参照)。同じ式を手で回す。
+    fn expected_router_topk(p: &Qwen4ExpParams, lw: &LayerW, x: &[f32]) -> (Vec<usize>, Vec<f32>) {
+        let mut probs = vec![0.0f32; p.n_expert];
+        lw.gate_inp.gemv(x, &mut probs).expect("gate_inp");
+        softmax(&mut probs);
+        let sel = select_topk(&probs, p.n_expert_used);
+        let mut sum = 0.0f32;
+        for &i in &sel {
+            sum += probs[i];
+        }
+        let w: Vec<f32> = sel.iter().map(|&i| probs[i] / sum).collect();
+        (sel, w)
+    }
+
+    /// P56: RouterTopK の送出。
+    ///
+    /// - `DENNO_TELEMETRY_ARCH` が off なら 1 枚も出ない (ゲートが効いている)
+    /// - on なら decode の 1 トークン (moe_ffn_quant 1 回) で 1 枚、中身は
+    ///   select_topk の結果と一致する (重みは f16)
+    /// - prefill のバッチ経路は**チャンク末尾の 1 トークンだけ**送る
+    #[test]
+    fn router_topk_frames_are_arch_gated_and_last_token_only() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("router_topk");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        fn drain() -> Vec<denno_telemetry::Frame> {
+            let mut v = Vec::new();
+            while let Some(fr) = denno_telemetry::try_recv_nowait() {
+                v.push(fr);
+            }
+            v
+        }
+        fn is_router(fr: &denno_telemetry::Frame) -> bool {
+            matches!(fr, denno_telemetry::Frame::RouterTopK { .. })
+        }
+
+        let (sel, w) = expected_router_topk(&p, &lw, &x);
+        let want = denno_telemetry::router_topk_frame(lw.il as u16, &sel, &w);
+        // 期待値そのものの健全性: top-k 本で、重みは合計 1・降順。
+        assert_eq!(sel.len(), p.n_expert_used);
+        let total: f32 = w.iter().sum();
+        assert!((total - 1.0).abs() < 1e-6, "重みの合計が 1 でない: {total}");
+
+        let prev_on = denno_telemetry::enabled();
+        let prev_arch = denno_telemetry::arch_enabled();
+        denno_telemetry::set_enabled_for_tests(true);
+        denno_telemetry::set_arch_for_tests(false);
+
+        // (1) ARCH off → RouterTopK は 0 枚
+        drain();
+        moe_ffn_quant(&p, &lw, &x, None).expect("arch off");
+        let got = drain();
+        assert!(
+            !got.iter().any(is_router),
+            "DENNO_TELEMETRY_ARCH=0 で RouterTopK が出た: {got:?}"
+        );
+
+        // (2) ARCH on → 1 呼び出し (1 トークン) で 1 枚、中身は select_topk と一致
+        denno_telemetry::set_arch_for_tests(true);
+        drain();
+        moe_ffn_quant(&p, &lw, &x, None).expect("arch on");
+        let got = drain();
+        assert_eq!(
+            got.iter().filter(|fr| **fr == want).count(),
+            1,
+            "decode 1 トークンで期待した RouterTopK が 1 枚でない: {got:?}"
+        );
+
+        // (3) prefill (バッチ, nt=3) → チャンク末尾のトークンだけ 1 枚
+        let xs: Vec<f32> = [1.0f32, 0.5, -1.0]
+            .iter()
+            .flat_map(|&a| cache_test_x(p.n_embd).iter().map(move |v| v * a).collect::<Vec<_>>())
+            .collect();
+        let (sel0, w0) = expected_router_topk(&p, &lw, &xs[..p.n_embd]);
+        let first = denno_telemetry::router_topk_frame(lw.il as u16, &sel0, &w0);
+        let (sel2, w2) = expected_router_topk(&p, &lw, &xs[2 * p.n_embd..]);
+        let last = denno_telemetry::router_topk_frame(lw.il as u16, &sel2, &w2);
+        drain();
+        let out = moe_ffn_quant_batch(&p, &lw, &xs, 3, None).expect("batch");
+        assert_eq!(out.len(), 3 * p.n_embd);
+        let got = drain();
+        assert_eq!(
+            got.iter().filter(|fr| **fr == last).count(),
+            1,
+            "prefill でチャンク末尾の RouterTopK が 1 枚でない: {got:?}"
+        );
+        assert_eq!(
+            got.iter().filter(|fr| **fr == first).count(),
+            0,
+            "prefill で非末尾トークンの RouterTopK が送られた: {got:?}"
+        );
+
+        // env 由来の状態に戻す (他のテストに漏らさない)
+        denno_telemetry::set_arch_for_tests(prev_arch);
+        denno_telemetry::set_enabled_for_tests(prev_on);
     }
 
     /// P43: GPU 経路 (`Route::Vram`) を要求しても、CUDA が無い / expert が VRAM に
@@ -7884,6 +8055,46 @@ mod tests {
                 assert_bitwise_eq(&seq, &bat, &format!("chunk {chunk}"));
             }
             moe_expert::set_vnni_for_test(None);
+        }
+
+        /// P56: 逐次 prefill (`forward_prefill_with(ctx, false)`) の RouterTopK は
+        /// **チャンク末尾の 1 トークンだけ**。ctx が 6 トークンでも層数ぶんしか
+        /// 出ない (トークンごとに送ると 6 × LAYERS 枚になってしまう)。
+        #[test]
+        fn router_topk_prefill_seq_sends_last_token_only() {
+            let _g = moe_test_guard();
+            let dir = TempDir::new("router_topk_seq");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("合成モデルを開けない");
+            let ctx: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+
+            let prev_on = denno_telemetry::enabled();
+            let prev_arch = denno_telemetry::arch_enabled();
+            denno_telemetry::set_enabled_for_tests(true);
+            denno_telemetry::set_arch_for_tests(true);
+            while denno_telemetry::try_recv_nowait().is_some() {}
+
+            let mut m = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+            let logits = m.forward_prefill_with(&ctx, false).expect("逐次 prefill");
+            assert_eq!(logits.len(), VOCAB);
+
+            let mut layers: Vec<u16> = Vec::new();
+            let mut sizes: Vec<usize> = Vec::new();
+            while let Some(fr) = denno_telemetry::try_recv_nowait() {
+                if let denno_telemetry::Frame::RouterTopK { layer, experts, .. } = fr {
+                    layers.push(layer);
+                    sizes.push(experts.len());
+                }
+            }
+            assert_eq!(
+                layers,
+                (0..LAYERS as u16).collect::<Vec<_>>(),
+                "逐次 prefill の RouterTopK が層数ぶん (末尾トークン 1 回) でない"
+            );
+            assert!(sizes.iter().all(|&n| n == NEXP), "top-k の本数が違う: {sizes:?}");
+
+            denno_telemetry::set_arch_for_tests(prev_arch);
+            denno_telemetry::set_enabled_for_tests(prev_on);
         }
 
         // -----------------------------------------------------------------
