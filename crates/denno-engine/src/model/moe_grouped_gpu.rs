@@ -12,8 +12,16 @@
 //! 2. plan_grouped          … 使う expert の一覧と packed バッファ内の位置
 //! 3. pack_from_sources     … mmap のスライスを 1 本のバッファへコピー (デコード無し)
 //! 4. moe_grouped_gemm_layer… gate+up+silu 積 → down の 2 起動
-//! 5. scatter_add           … 重み付きでトークン行へ足し込む (expert 昇順)
+//! 5. ScatterPlan           … 「h の行 → (トークン, スロット)」の対応表
+//! 6. scatter               … その表の順でトークン行へ足し込む (expert 昇順)
 //! ```
+//!
+//! # 行の対応 (P42)
+//!
+//! `h` の行は **segment の並び** (m 降順、行数 `Σ m = nt × k`)、`out` の行は
+//! **トークンの並び** (行数 `nt`)。両者は行数が違うので、長さの大小で検査しては
+//! いけない (v1 は `out.len() < h.len()` を要求して実機の全 48 層で落ちた)。
+//! 対応は [`ScatterPlan`] が明示的な配列として持ち、scatter はそれだけを根拠にする。
 //!
 //! # ゲート
 //!
@@ -88,6 +96,33 @@ pub(crate) fn enabled() -> bool {
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn enabled() -> bool {
     false
+}
+
+/// grouped 経路の失敗回数 (層ごとに 1 行出さないための集計)。
+static FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 失敗を記録する。**詳細は最初の 1 回だけ**出し、以降は数えるだけ。
+///
+/// 実機では 48 層すべてが同じ理由で落ちるので、層ごとに 1 行出すと 48 行になる。
+/// 集計行は [`flush_failures`] が prefill の最後に 1 回だけ出す。
+pub(crate) fn note_failure(layer: usize, err: &anyhow::Error) {
+    let n = FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 {
+        eprintln!(
+            "[moe-grouped] 層 {layer}: 失敗 → CPU 経路へ: {err:#} (以降の層は同じ理由なので集計に畳む)"
+        );
+    }
+}
+
+/// 集計行を 1 回だけ出す (0 件なら何も出さない)。返り値は失敗回数。
+pub(crate) fn flush_failures() -> usize {
+    let n = FAILURES.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if n > 1 {
+        eprintln!(
+            "[moe-grouped] grouped GPU 経路の失敗 {n} 回 → 該当層は CPU 経路で計算 (理由は最初の 1 行)"
+        );
+    }
+    n
 }
 
 /// `DENNO_MOE_GROUPED_VERIFY=1` で CPU 参照との差を stderr に出す。
@@ -282,65 +317,159 @@ pub(crate) fn reference_h(
     Ok(h)
 }
 
-/// 重み付きの足し込み (expert 昇順 → トークン昇順)。
+/// 「h の行 → 元のトークン」の対応表。scatter はこの表だけを根拠にする。
 ///
-/// 並びを `moe_experts_flat` の scatter と同じにしてあるので、寄与の和の順序が
-/// 変わらない (各トークンの `out` は expert 昇順に足される)。
-pub(crate) fn scatter_add(
-    out: &mut [f32],
-    h: &[f32],
-    segs: &[Segment],
-    by_expert: &[Vec<(usize, usize)>],
-    weights: &[f32],
-    k: usize,
-    e: usize,
-) -> Result<()> {
-    let ne = by_expert.len();
-    if e == 0 || out.len() % e != 0 {
-        bail!("scatter_add: out の長さ {} が e={e} で割り切れない", out.len());
-    }
-    // expert id → (h の行先頭, m)。h の行は segment の並び (m 降順) に
-    // 詰まっているので、行先頭は `Σ m` の累積で求める
-    // (`Segment::out_off` は f32 要素単位で n_out 倍されており、行番号ではない)。
-    let mut at: Vec<Option<(usize, usize)>> = vec![None; ne];
-    let mut row = 0usize;
-    for s in segs {
-        if at[s.expert as usize].is_some() {
-            bail!("scatter_add: expert {} の segment が 2 本ある", s.expert);
+/// # なぜ表を持つか
+///
+/// `h` の行は segment の並び (m 降順) に詰まっており、`out` の行はトークンの
+/// 並びである。行数は `Σ m = nt × k` と `nt` で違うので、長さの大小で対応を
+/// 検査することはできない。build_grouped_batch が gather した順
+/// (`by_expert[expert]` の順) をここで 1 度だけ表に落とし、scatter 側は
+/// 並び順を仮定しない。
+#[derive(Debug, Clone)]
+pub(crate) struct ScatterPlan {
+    /// h の行 → (トークン, ルータのスロット)。長さ = Σ m。
+    rows: Vec<(usize, usize)>,
+    /// 足し込みの順 (h の行番号)。expert 昇順 → segment 内の行順で、
+    /// `moe_experts_flat` の scatter と同じ順序。
+    order: Vec<usize>,
+}
+
+impl ScatterPlan {
+    /// segment 表と `by_expert` から対応表を作る。
+    ///
+    /// 契約: `by_expert[expert]` は segment の行順と同じ (build_grouped_batch が
+    /// この順で gather する)。件数と index をここで突き合わせる。
+    pub(crate) fn new(
+        segs: &[Segment],
+        by_expert: &[Vec<(usize, usize)>],
+        nt: usize,
+    ) -> Result<Self> {
+        let m_total: usize = segs.iter().map(|s| s.m as usize).sum();
+        let mut rows: Vec<(usize, usize)> = Vec::with_capacity(m_total);
+        let mut heads: Vec<(usize, usize, u16)> = Vec::with_capacity(segs.len());
+        let mut used = vec![false; by_expert.len()];
+        let mut r0 = 0usize;
+        for (i, s) in segs.iter().enumerate() {
+            let ei = s.expert as usize;
+            if ei >= by_expert.len() {
+                bail!(
+                    "scatter_plan: segment {i} の expert {ei} が by_expert({}) の範囲外",
+                    by_expert.len()
+                );
+            }
+            if used[ei] {
+                bail!("scatter_plan: expert {ei} の segment が 2 本ある");
+            }
+            used[ei] = true;
+            let picks = &by_expert[ei];
+            if picks.len() != s.m as usize {
+                bail!(
+                    "scatter_plan: expert {ei} の picks {} が segment の m {} と違う",
+                    picks.len(),
+                    s.m
+                );
+            }
+            for &(t, j) in picks {
+                if t >= nt {
+                    bail!("scatter_plan: expert {ei} のトークン {t} が範囲外 (nt={nt})");
+                }
+                rows.push((t, j));
+            }
+            heads.push((r0, s.m as usize, s.expert));
+            r0 += s.m as usize;
         }
-        at[s.expert as usize] = Some((row, s.m as usize));
-        row += s.m as usize;
-    }
-    if out.len() < h.len() {
-        bail!(
-            "scatter_add: h の長さ {} が out の長さ {} を超える",
-            h.len(),
-            out.len()
-        );
-    }
-    if h.len() != row * e {
-        bail!(
-            "scatter_add: h の長さ {} が Σ m({row}) * e({e}) と違う",
-            h.len()
-        );
-    }
-    for (ei, slot) in at.iter().enumerate() {
-        let Some((r0, m)) = *slot else { continue };
-        let picks = &by_expert[ei];
-        if picks.len() != m {
+        if r0 != m_total || rows.len() != m_total {
+            bail!("scatter_plan: 行数 {} が Σ m({m_total}) と違う", rows.len());
+        }
+        // expert 昇順 (同一 expert の segment は 1 本だけなので同順位は無い)。
+        heads.sort_by_key(|&(_, _, expert)| expert);
+        let mut order = Vec::with_capacity(m_total);
+        for (start, m, _) in heads {
+            order.extend(start..start + m);
+        }
+        if order.len() != m_total {
             bail!(
-                "scatter_add: expert {ei} の picks {} が segment の m {m} と違う",
-                picks.len()
+                "scatter_plan: 足し込み順の長さ {} が Σ m({m_total}) と違う",
+                order.len()
             );
         }
-        for (i, &(t, j)) in picks.iter().enumerate() {
+        Ok(Self { rows, order })
+    }
+
+    /// 行数 (= Σ m)。
+    pub(crate) fn n_rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// h の行 → (トークン, スロット)。
+    pub(crate) fn rows(&self) -> &[(usize, usize)] {
+        &self.rows
+    }
+
+    /// 足し込み順 (h の行番号)。
+    pub(crate) fn order(&self) -> &[usize] {
+        &self.order
+    }
+
+    /// `h` (segment の並び) を `out` (トークンの並び) へ重み付きで足し込む。
+    pub(crate) fn scatter(
+        &self,
+        out: &mut [f32],
+        h: &[f32],
+        weights: &[f32],
+        k: usize,
+        e: usize,
+    ) -> Result<()> {
+        let nt = if e == 0 { 0 } else { out.len() / e };
+        check_scatter_shapes(out.len(), h.len(), self.rows.len(), weights.len(), nt, k, e)?;
+        for (i, &(_, j)) in self.rows.iter().enumerate() {
+            if j >= k {
+                bail!("scatter: 行 {i} のスロット {j} が k({k}) を超える");
+            }
+        }
+        for &row in &self.order {
+            let (t, j) = self.rows[row];
             let w = weights[t * k + j];
-            let src = &h[(r0 + i) * e..(r0 + i + 1) * e];
+            let src = &h[row * e..(row + 1) * e];
             let dst = &mut out[t * e..(t + 1) * e];
             for d in 0..e {
                 dst[d] += src[d] * w;
             }
         }
+        Ok(())
+    }
+}
+
+/// scatter の形の検算 (GPU 無しで回る純関数)。
+///
+/// `h` は segment の並び (`Σ m × n_embd`)、`out` はトークンの並び
+/// (`nt × n_embd`)。`Σ m = nt × k` なので `h` は `out` の k 倍になる
+/// (706 トークン / top-10 / n_embd 2560 なら h=18,073,600 / out=1,807,360)。
+/// 見るのは長さの大小ではなく、定義どおりの要素数かどうかだけ。
+pub(crate) fn check_scatter_shapes(
+    out_len: usize,
+    h_len: usize,
+    n_rows: usize,
+    weights_len: usize,
+    nt: usize,
+    k: usize,
+    e: usize,
+) -> Result<()> {
+    if e == 0 {
+        bail!("scatter: e が 0");
+    }
+    if nt == 0 {
+        bail!("scatter: nt が 0");
+    }
+    if nt.checked_mul(e) != Some(out_len) {
+        bail!("scatter: out の長さ {out_len} が nt({nt}) * e({e}) と違う");
+    }
+    if n_rows.checked_mul(e) != Some(h_len) {
+        bail!("scatter: h の長さ {h_len} が Σ m({n_rows}) * e({e}) と違う");
+    }
+    if nt.checked_mul(k) != Some(weights_len) {
+        bail!("scatter: weights の長さ {weights_len} が nt({nt}) * k({k}) と違う");
     }
     Ok(())
 }
@@ -444,6 +573,8 @@ pub(crate) fn try_experts(
     };
     let table = seg_table(&batch.segs, &plan.w_off, &e_off, &ff_off)?;
     let stamp = pack_stamp(layer_key, &plan.expert_ids);
+    // 行 → (トークン, スロット) の対応はここで 1 度だけ作る。
+    let scatter = ScatterPlan::new(&batch.segs, by_expert, nt)?;
 
     let ran = with_packed(&plan, [&gate, &up, &down], |packed| -> Result<bool> {
         let mut h = vec![0.0f32; m_total * e];
@@ -486,7 +617,7 @@ pub(crate) fn try_experts(
                 am_g == am_c
             );
         }
-        scatter_add(&mut *out, &h, &batch.segs, by_expert, weights, k, e)?;
+        scatter.scatter(&mut *out, &h, weights, k, e)?;
         Ok(true)
     })??;
     Ok(ran)
@@ -790,8 +921,9 @@ mod tests {
         let (packed, plan, segs, xin) = pack(&gate, &up, &down).expect("pack");
         // reference_h は「詰め直した入力」を受ける (segment の並び)。
         let h = reference_h(&gate, &up, &down, &plan, &packed, &segs, &xin).expect("reference_h");
+        let sp = ScatterPlan::new(&segs, &picks, nt).expect("scatter_plan");
         let mut got = vec![0.0f32; nt * e];
-        scatter_add(&mut got, &h, &segs, &picks, &weights, 2, e).expect("scatter");
+        sp.scatter(&mut got, &h, &weights, 2, e).expect("scatter");
         let want =
             per_expert_reference(&gate, &up, &down, &picks, &weights, &xs, nt, e, ff);
         assert_eq!(got.len(), want.len());
@@ -822,5 +954,167 @@ mod tests {
             .expect("try_experts");
         assert!(!did);
         assert_eq!(out, before);
+    }
+
+    // ------------------------------------------------------------------
+    // 実形状の固定 (P42: 実機で 48 層すべてが形状エラーになった)
+    //
+    // 実機は RTX 5090 / 706 トークン / chunk 512 / n_embd 2560 / top-10 /
+    // support 170。末尾チャンク (706 - 512 = 194 トークン) のとき
+    //   h   = Σ m × n_embd = 1,940 × 2,560 = 4,966,400
+    //   out = nt  × n_embd =   194 × 2,560 =   496,640
+    // が出ていた 2 つの数 (比はちょうど k = 10)。
+    // ------------------------------------------------------------------
+    const E_REAL: usize = 2560;
+    const FF_REAL: usize = 1536;
+    const K_REAL: usize = 10;
+    const SUPPORT_REAL: usize = 170;
+
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// 1 トークンあたり `k` 体を `support` から重複なしで選ぶ (P37 の仮定と同じ)。
+    fn uniform_picks(
+        tokens: usize,
+        k: usize,
+        support: usize,
+        seed: u64,
+    ) -> Vec<Vec<(usize, usize)>> {
+        let mut rng = seed;
+        let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); support];
+        let mut seen = vec![0u64; support.div_ceil(64)];
+        for t in 0..tokens {
+            seen.fill(0);
+            let mut got = 0usize;
+            while got < k {
+                let e = (splitmix64(&mut rng) % support as u64) as usize;
+                let (w, b) = (e / 64, 1u64 << (e % 64));
+                if seen[w] & b != 0 {
+                    continue;
+                }
+                seen[w] |= b;
+                by_expert[e].push((t, got));
+                got += 1;
+            }
+        }
+        by_expert
+    }
+
+    #[test]
+    fn real_shape_rows_and_lengths_are_consistent() {
+        let _g = FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for &nt in &[706usize, 194] {
+            let picks = uniform_picks(nt, K_REAL, SUPPORT_REAL, 0x5EED_1234_ABCD_0001);
+            let xs = vec![0.0f32; nt * E_REAL];
+            let batch = build_grouped_batch(&picks, &xs, E_REAL, FF_REAL).expect("batch");
+            let m_total: usize = batch.segs.iter().map(|s| s.m as usize).sum();
+            // 全トークンが k 体ずつ選ぶので Σ m = nt × k。
+            assert_eq!(m_total, nt * K_REAL, "Σ m が nt × k と違う (nt={nt})");
+            assert_eq!(batch.m_total, m_total);
+            // h は segment の並び、out はトークンの並び。
+            let h_len = m_total * E_REAL;
+            let out_len = nt * E_REAL;
+            assert_eq!(h_len, m_total * E_REAL);
+            assert_eq!(out_len, nt * E_REAL);
+            if nt == 194 {
+                // 実機ログの 2 つの数 (4966400 / 496640 = 10)。
+                assert_eq!(h_len, 4_966_400, "実機ログの h の長さと違う");
+                assert_eq!(out_len, 496_640, "実機ログの out の長さと違う");
+                assert_eq!(h_len / out_len, K_REAL);
+            }
+            let sp = ScatterPlan::new(&batch.segs, &picks, nt).expect("scatter_plan");
+            assert_eq!(sp.n_rows(), m_total);
+            assert_eq!(sp.rows().len(), m_total);
+            check_scatter_shapes(out_len, h_len, sp.n_rows(), nt * K_REAL, nt, K_REAL, E_REAL)
+                .expect("長さは定義どおりのはず");
+            // 行 → トークンの対応: 全行が使われ、各トークンはちょうど k 行。
+            let mut mask = vec![0u32; nt];
+            for &(t, j) in sp.rows() {
+                assert!(t < nt, "トークン {t} が範囲外");
+                let b = 1u32 << j;
+                assert_eq!(mask[t] & b, 0, "トークン {t} のスロット {j} が重複");
+                mask[t] |= b;
+            }
+            assert!(
+                mask.iter().all(|&m| m.count_ones() as usize == K_REAL),
+                "各トークンが k 行ずつになっていない"
+            );
+            // 足し込み順は h の行の置換 (重複も抜けも無い)。
+            let mut hit = vec![false; m_total];
+            for &row in sp.order() {
+                assert!(!hit[row], "行 {row} が 2 回足される");
+                hit[row] = true;
+            }
+            assert!(hit.iter().all(|&b| b), "足されない行がある");
+            // 旧コードは `out.len() < h.len()` を要求していた (これが実機の失敗)。
+            // h は out のちょうど k 倍なので、この検査は必ず落ちる。
+            assert!(out_len < h_len);
+            assert_eq!(h_len, out_len * K_REAL);
+        }
+    }
+
+    #[test]
+    fn check_scatter_shapes_pins_the_definitions() {
+        let (nt, k, e) = (194usize, 10usize, 2560usize);
+        let n_rows = nt * k;
+        // 定義どおりなら通る。
+        check_scatter_shapes(nt * e, n_rows * e, n_rows, nt * k, nt, k, e).expect("正常系");
+        // out を h と同じ長さにする (旧コードの前提) と落ちる。
+        assert!(check_scatter_shapes(n_rows * e, n_rows * e, n_rows, nt * k, nt, k, e).is_err());
+        // h が 1 行足りない / weights が 1 本足りない / nt が 0。
+        assert!(check_scatter_shapes(nt * e, (n_rows - 1) * e, n_rows, nt * k, nt, k, e).is_err());
+        assert!(check_scatter_shapes(nt * e, n_rows * e, n_rows, nt * k - 1, nt, k, e).is_err());
+        assert!(check_scatter_shapes(0, 0, n_rows, nt * k, 0, k, e).is_err());
+    }
+
+    #[test]
+    fn failures_are_counted_once_per_prefill() {
+        // 実機では 48 層が同じ理由で落ちる。詳細は 1 行目だけ、集計は 1 行。
+        let _g = FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = flush_failures(); // 他のテストの取りこぼしを消す
+        let err = anyhow::anyhow!("テスト用の失敗");
+        for layer in 0..48 {
+            note_failure(layer, &err);
+        }
+        assert_eq!(flush_failures(), 48, "集計は 48 回ぶんを 1 行に畳むはず");
+        assert_eq!(flush_failures(), 0, "2 回目の集計行は出さない");
+    }
+
+    #[test]
+    fn scatter_plan_rejects_broken_mapping() {
+        let _g = FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let segs = [
+            Segment {
+                expert: 1,
+                m: 1,
+                x_off: 0,
+                out_off: 0,
+            },
+            Segment {
+                expert: 0,
+                m: 1,
+                x_off: 0,
+                out_off: 0,
+            },
+        ];
+        let mut picks: Vec<Vec<(usize, usize)>> = vec![Vec::new(); 2];
+        picks[0].push((0, 0));
+        picks[1].push((0, 1));
+        assert!(ScatterPlan::new(&segs, &picks, 1).is_ok());
+        // picks の本数が segment の m と違う。
+        let mut bad = picks.clone();
+        bad[0].push((0, 0));
+        assert!(ScatterPlan::new(&segs, &bad, 1).is_err());
+        // 同じ expert の segment が 2 本。
+        assert!(ScatterPlan::new(&[segs[0], segs[0]], &picks, 1).is_err());
+        // トークン index が nt を超える。
+        assert!(ScatterPlan::new(&segs, &picks, 0).is_err());
+        // expert id が by_expert の範囲外。
+        assert!(ScatterPlan::new(&segs, &picks[..1], 1).is_err());
     }
 }

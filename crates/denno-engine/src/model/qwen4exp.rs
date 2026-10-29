@@ -2334,6 +2334,10 @@ impl Qwen4Exp {
             start = end;
         }
 
+        // P42: grouped GPU 経路の失敗は「最初の 1 行 + ここの集計 1 行」に畳む
+        // (0 件なら何も出さない)。
+        crate::model::moe_grouped_gpu::flush_failures();
+
         // 4. 最終 mixer (output_norm の代わり) + 5. logits (最後のトークンだけ)
         let res = last.ok_or_else(|| one("ctx が空 (現在のトークンが無い)"))?;
         let cur = hc_mix_quant(
@@ -4642,9 +4646,9 @@ fn moe_ffn_quant_batch_opts(
             &mut out,
         ) {
             Ok(v) => experts_done = v,
-            Err(err) => {
-                eprintln!("[moe-grouped] 層 {}: 失敗 → CPU 経路へ: {err:#}", lw.il);
-            }
+            // P42: 層ごとに 1 行出すと実機で 48 行になる。詳細は最初の 1 回だけ
+            // 出し、残りは prefill 末尾の集計 1 行に畳む。
+            Err(err) => crate::model::moe_grouped_gpu::note_failure(lw.il, &err),
         }
     }
     if !experts_done {
