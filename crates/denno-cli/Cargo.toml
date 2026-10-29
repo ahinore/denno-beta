@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 denno-engine = { path = "../denno-engine" }
 denno-server = { path = "../denno-server" }
+denno-telemetry = { path = "../denno-telemetry" }
 clap = { version = "4", features = ["derive"] }
 tokio.workspace = true
 anyhow.workspace = true
@@ -19,3 +20,9 @@ serde.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = "2"
+
+[dev-dependencies]
+# P51: 実クライアント (denno-view が使うのと同じ tokio-tungstenite) での
+# WebSocket 相互運用テスト用。どちらも workspace の Cargo.lock に既にある。
+tokio-tungstenite = "0.23"
+futures-util = "0.3"
