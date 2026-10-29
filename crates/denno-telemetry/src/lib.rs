@@ -36,6 +36,8 @@ pub mod kind {
     pub const TOP_K: u8 = 10;
     /// 1 層の forward 内で実行された op 列 (実行順)。
     pub const LAYER_RUN: u8 = 11;
+    /// 1 層の活性 (P53: 3D ビューア用)。層の出力の |x| 上位 K 個。
+    pub const LAYER_ACT: u8 = 12;
 }
 
 pub const MAGIC: [u8; 4] = *b"DNTL";
@@ -209,6 +211,15 @@ pub enum Frame {
     /// 1 層の forward で実行された op 列 (op id, ns)。層の実行順に送出される
     /// (P14: ビューアのコールグラフ/層パネルの点灯アニメーション用)。
     LayerRun { layer: u16, ops: Vec<(u8, u64)> },
+    /// 1 層の活性 (P53: 3D ビューア用)。層の出力 (残差を足した後) の |x| 上位 K。
+    ///
+    /// - `layer`: 層番号
+    /// - `idx`: |x| の上位 K 個のニューロン index。**昇順**に正規化して送る。
+    /// - `val`: 対応する |x| を**層内最大**で割った値の f16 ビット (0.0〜1.0)
+    ///
+    /// フレームにトークン位置は無い (P53 の仕様)。受け手は直前の `Token` /
+    /// `Prefill` と並び順で対応付ける。
+    LayerAct { layer: u16, idx: Vec<u32>, val: Vec<u16> },
 }
 
 impl Frame {
@@ -225,6 +236,7 @@ impl Frame {
             Frame::Gap { .. } => kind::GAP,
             Frame::TopK { .. } => kind::TOP_K,
             Frame::LayerRun { .. } => kind::LAYER_RUN,
+            Frame::LayerAct { .. } => kind::LAYER_ACT,
         }
     }
 
@@ -308,6 +320,16 @@ impl Frame {
                 for (op, ns) in ops {
                     b.push(*op);
                     put_varint_u64(&mut b, *ns);
+                }
+            }
+            Frame::LayerAct { layer, idx, val } => {
+                put_varint_u32(&mut b, *layer as u32);
+                put_varint_u32(&mut b, idx.len() as u32);
+                for &i in idx {
+                    put_varint_u32(&mut b, i);
+                }
+                for &v in val {
+                    b.extend_from_slice(&v.to_le_bytes());
                 }
             }
         }
@@ -441,6 +463,21 @@ impl Frame {
                 }
                 Frame::LayerRun { layer, ops }
             }
+            kind::LAYER_ACT => {
+                let layer = u32v(p, &mut i)? as u16;
+                let n = u32v(p, &mut i)? as usize;
+                let mut idx = Vec::with_capacity(n);
+                for _ in 0..n {
+                    idx.push(u32v(p, &mut i)?);
+                }
+                let mut val = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let vb = [p[i], p[i + 1]];
+                    i += 2;
+                    val.push(u16::from_le_bytes(vb));
+                }
+                Frame::LayerAct { layer, idx, val }
+            }
             other => return Err(format!("unknown kind: {other}")),
         };
         if i != p.len() {
@@ -573,6 +610,108 @@ pub fn layer_flush() {
             emit(Frame::LayerRun { layer, ops });
         }
     }
+}
+
+// ---------- 層活性 (P53: 3D ビューア用) ----------
+
+/// `DENNO_TELEMETRY_ACT` の解釈 (既定 off)。
+///
+/// 未設定・空・`0` 以外で有効。層の出力は**読むだけ**なので数値経路は変わらない。
+/// 無効時は呼び出し側がフックを付けない (`serve-flash` は `*_tapped` を呼ばない)。
+pub fn act_from_value(v: Option<&str>) -> bool {
+    matches!(v, Some(s) if !s.is_empty() && s != "0")
+}
+
+static ACT_ON: AtomicI8 = AtomicI8::new(-1);
+
+/// P53: 層活性の送出が有効か (プロセスで 1 回だけ env を読む)。
+pub fn act_enabled() -> bool {
+    match ACT_ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = act_from_value(std::env::var("DENNO_TELEMETRY_ACT").ok().as_deref());
+            ACT_ON.store(if v { 1 } else { 0 }, Ordering::Relaxed);
+            v
+        }
+    }
+}
+
+/// テスト専用: act の ON/OFF を上書きする (本番コードからは使わない)。
+#[doc(hidden)]
+pub fn set_act_for_tests(v: bool) {
+    ACT_ON.store(if v { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// 上位 K の既定値 (`DENNO_TELEMETRY_ACT_TOPK` 未設定時)。
+pub const ACT_TOPK_DEFAULT: usize = 64;
+
+/// `DENNO_TELEMETRY_ACT_TOPK` の解釈。読めない値は既定 64。
+pub fn act_topk_from_value(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(ACT_TOPK_DEFAULT)
+}
+
+/// P53: 上位 K (プロセスで 1 回だけ env を読む)。
+pub fn act_topk() -> usize {
+    static K: OnceLock<usize> = OnceLock::new();
+    *K.get_or_init(|| {
+        act_topk_from_value(std::env::var("DENNO_TELEMETRY_ACT_TOPK").ok().as_deref())
+    })
+}
+
+/// `DENNO_TELEMETRY_ACT_DBG` の解釈 (既定 off、`1` / `true` / `yes` で有効)。
+pub fn act_dbg_from_value(v: Option<&str>) -> bool {
+    matches!(v, Some("1") | Some("true") | Some("yes"))
+}
+
+/// P53: 1 フレームあたりの所要 ns と送出バイト数を stderr に 1 行出すか。
+pub fn act_dbg() -> bool {
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| {
+        act_dbg_from_value(std::env::var("DENNO_TELEMETRY_ACT_DBG").ok().as_deref())
+    })
+}
+
+/// P53: 1 層の出力 `x` (stream 1 本ぶん、n_embd 個) から [`Frame::LayerAct`] を作る。
+///
+/// - `idx`: |x| の上位 `k` 個の index。**昇順**に並べて返す。
+///   `k` が `x.len()` より大きければ `x.len()` 個。|x| がちょうど 0 の要素は
+///   送らない (上位 K に 0 が混じっても落とす)。
+/// - `val`: 対応する |x| を**層内最大**で割った値の f16 ビット。最大が 0
+///   (全部 0 / 空 / k == 0) なら `idx` と `val` は空。
+/// - 選択は `select_nth_unstable_by` (nth_element 相当) で、全ソートしない。
+///   同値 (|x| が同じ) は index が小さい方を先に採る (入力順に依らず決定的)。
+///
+/// `x` は読むだけで書き換えない。`scratch` は呼び出し側が使い回す作業域
+/// (層をまたいで再利用すると確保が 1 回で済む)。
+pub fn layer_act_frame(layer: u16, x: &[f32], k: usize, scratch: &mut Vec<(f32, u32)>) -> Frame {
+    let mut max = 0.0f32;
+    scratch.clear();
+    if k > 0 {
+        scratch.reserve(x.len());
+        for (i, &v) in x.iter().enumerate() {
+            let a = v.abs();
+            if a > max {
+                max = a;
+            }
+            scratch.push((a, i as u32));
+        }
+    }
+    if k == 0 || x.is_empty() || !(max > 0.0) {
+        return Frame::LayerAct { layer, idx: Vec::new(), val: Vec::new() };
+    }
+    let want = k.min(scratch.len());
+    scratch.select_nth_unstable_by(want - 1, |a, b| {
+        b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1))
+    });
+    scratch.truncate(want);
+    // |x| がちょうど 0 の要素は送らない (値が 0 の帯は情報を持たない。
+    // 「1 個だけ非 0」の層で 63 個の 0 を積まないための規則)。
+    scratch.retain(|e| e.0 > 0.0);
+    scratch.sort_unstable_by_key(|e| e.1);
+    let idx: Vec<u32> = scratch.iter().map(|e| e.1).collect();
+    let val: Vec<u16> = scratch.iter().map(|e| f32_to_f16_bits(e.0 / max)).collect();
+    Frame::LayerAct { layer, idx, val }
 }
 
 /// 消費側: 1 フレームを受信 (タイムアウト付き)。サーバーの WS 転送タスクが使う。
@@ -727,13 +866,158 @@ mod tests {
                 layer: 5,
                 ops: vec![(1, 2100), (3, 154_000), (2, 8800), (4, 1_204_500), (5, 96_000)],
             },
+            // P53: K=1 / K=64 / 空 (0 件) の往復
+            Frame::LayerAct {
+                layer: 47,
+                idx: vec![1531],
+                val: vec![0x3c00],
+            },
+            Frame::LayerAct {
+                layer: 0,
+                idx: (0..64u32).map(|i| i * 37).collect(),
+                val: (0..64u16).map(|i| 0x3c00 - i).collect(),
+            },
+            Frame::LayerAct { layer: 12, idx: Vec::new(), val: Vec::new() },
         ];
         for f in frames {
             let enc = f.encode();
             assert_eq!(&enc[..4], &MAGIC);
+            assert_eq!(enc[5], f.kind());
             let dec = Frame::decode(&enc).unwrap();
             assert_eq!(dec, f, "roundtrip failed for kind {}", f.kind());
         }
+        assert_eq!(kind::LAYER_ACT, 12, "kind 番号は既存の次の値 (11 の次)");
+    }
+
+    /// P53: 層活性の選択 (上位 K・昇順・層内最大で正規化) を全ソートの参照実装と
+    /// 突き合わせる。値は決定的な擬似乱数 (実形 n_embd=2560)。
+    #[test]
+    fn layer_act_frame_matches_full_sort_reference() {
+        let n = 2560usize;
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let h = (i as u64).wrapping_mul(2654435761) % 2048;
+                (h as f32 / 1024.0 - 1.0) * (1.0 + (i % 7) as f32)
+            })
+            .collect();
+        let x_before = x.clone();
+        let mut scratch = Vec::new();
+        for k in [1usize, 64, 200, n, n + 10] {
+            let f = layer_act_frame(9, &x, k, &mut scratch);
+            let (idx, val) = match f {
+                Frame::LayerAct { layer: 9, idx, val } => (idx, val),
+                other => panic!("LayerAct でない: {other:?}"),
+            };
+            let want_n = k.min(n);
+            // 参照: 全ソート (|x| 降順・同値は index 昇順) → k 個 → 0 を落とす → index 昇順
+            let mut all: Vec<(f32, u32)> =
+                x.iter().enumerate().map(|(i, &v)| (v.abs(), i as u32)).collect();
+            all.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            all.truncate(want_n);
+            all.retain(|e| e.0 > 0.0);
+            all.sort_unstable_by_key(|e| e.1);
+            assert_eq!(idx.len(), all.len(), "k={k}");
+            assert_eq!(val.len(), all.len());
+            assert_eq!(
+                idx,
+                all.iter().map(|e| e.1).collect::<Vec<_>>(),
+                "k={k}: 上位 K の集合が全ソートと違う"
+            );
+            let max = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            for (i, &e) in all.iter().enumerate() {
+                let want = f32_to_f16_bits(e.0 / max);
+                assert_eq!(val[i], want, "k={k} idx={}: 正規化が違う", e.1);
+            }
+            // idx は昇順 (正規化して送る約束)
+            assert!(idx.windows(2).all(|w| w[0] < w[1]), "k={k}: idx が昇順でない");
+            // 最大の |x| はちょうど 1.0 に正規化される (idx は昇順なので位置で見る)
+            let max_pos = all
+                .iter()
+                .position(|e| e.0 == all.iter().fold(0.0f32, |m, e| m.max(e.0)))
+                .expect("最大値が上位 K に無い");
+            assert_eq!(val[max_pos], 0x3c00, "k={k}: 最大の |x| は 1.0 になるはず");
+        }
+        assert_eq!(x, x_before, "x を書き換えている");
+    }
+
+    /// P53: 正規化の境界 (全部 0 / 1 個だけ非 0 / 空 / k=0)。
+    #[test]
+    fn layer_act_frame_normalization_edges() {
+        let mut scratch = Vec::new();
+
+        // 全部 0 → 空フレーム (0/0 を作らない)
+        let z = vec![0.0f32; 2560];
+        assert_eq!(
+            layer_act_frame(3, &z, 64, &mut scratch),
+            Frame::LayerAct { layer: 3, idx: Vec::new(), val: Vec::new() }
+        );
+        // -0.0 も 0 として扱う
+        let nz = vec![-0.0f32; 8];
+        assert_eq!(
+            layer_act_frame(1, &nz, 4, &mut scratch),
+            Frame::LayerAct { layer: 1, idx: Vec::new(), val: Vec::new() }
+        );
+
+        // 1 個だけ非 0 → その index 1 件だけ、値は 1.0
+        let mut one = vec![0.0f32; 2560];
+        one[123] = -2.5;
+        assert_eq!(
+            layer_act_frame(7, &one, 64, &mut scratch),
+            Frame::LayerAct { layer: 7, idx: vec![123], val: vec![0x3c00] }
+        );
+
+        // 空スライス / k=0 → 空フレーム
+        assert_eq!(
+            layer_act_frame(0, &[], 64, &mut scratch),
+            Frame::LayerAct { layer: 0, idx: Vec::new(), val: Vec::new() }
+        );
+        assert_eq!(
+            layer_act_frame(0, &[1.0, 2.0], 0, &mut scratch),
+            Frame::LayerAct { layer: 0, idx: Vec::new(), val: Vec::new() }
+        );
+
+        // 同値は index が小さい方が先 (入力順に依らない)
+        let t = vec![1.0f32, -1.0, 1.0, -1.0];
+        assert_eq!(
+            layer_act_frame(2, &t, 2, &mut scratch),
+            Frame::LayerAct { layer: 2, idx: vec![0, 1], val: vec![0x3c00, 0x3c00] }
+        );
+        // 2 番目に大きい値の正規化 (0.5 → 0x3800)
+        assert_eq!(
+            layer_act_frame(2, &[2.0, 1.0], 1, &mut scratch),
+            Frame::LayerAct { layer: 2, idx: vec![0], val: vec![0x3c00] }
+        );
+        let f = layer_act_frame(2, &[2.0, 1.0], 2, &mut scratch);
+        assert_eq!(
+            f,
+            Frame::LayerAct { layer: 2, idx: vec![0, 1], val: vec![0x3c00, 0x3800] }
+        );
+    }
+
+    /// P53: env の解釈 (既定 off・K の既定 64)。
+    #[test]
+    fn act_env_parsing() {
+        assert!(!act_from_value(None), "未設定は既定 off");
+        assert!(!act_from_value(Some("0")));
+        assert!(!act_from_value(Some("")));
+        assert!(act_from_value(Some("1")));
+        assert!(act_from_value(Some("true")), "0 以外は有効");
+        assert_eq!(act_topk_from_value(None), 64);
+        assert_eq!(act_topk_from_value(Some("")), 64);
+        assert_eq!(act_topk_from_value(Some("x")), 64, "読めない値は既定");
+        assert_eq!(act_topk_from_value(Some("1")), 1);
+        assert_eq!(act_topk_from_value(Some(" 128 ")), 128, "前後の空白は許す");
+        assert!(!act_dbg_from_value(None));
+        assert!(act_dbg_from_value(Some("1")));
+        assert!(act_dbg_from_value(Some("true")));
+        assert!(!act_dbg_from_value(Some("0")));
+        // テスト用の上書きは元に戻せる (他のテストに漏らさない)
+        let before = act_enabled();
+        set_act_for_tests(true);
+        assert!(act_enabled());
+        set_act_for_tests(false);
+        assert!(!act_enabled());
+        set_act_for_tests(before);
     }
 
     #[test]

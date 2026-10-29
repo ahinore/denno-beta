@@ -29,7 +29,7 @@
 //! は末尾 `n_gram` 個を反転してから `gather` に渡す (P-MOE-F7 で修正済み)。
 //! このモジュールは古い順のまま渡してよい。
 
-use crate::model::qwen4exp::{one, Qwen4Exp, Qwen4ExpError};
+use crate::model::qwen4exp::{one, LayerOut, Qwen4Exp, Qwen4ExpError, TapTokens};
 
 /// `qwen4exp.rs` と同じ「1 行 1 件」のエラー型を使う。
 type Result<T> = std::result::Result<T, Qwen4ExpError>;
@@ -117,7 +117,22 @@ impl Qwen4ExpDecoder {
     /// 失敗した場合は `tokens` にそのトークンが残り、ssm / attention の状態は
     /// 進んだところまで進んでいる (その decoder は作り直すこと)。
     pub fn step(&mut self, token: u32) -> Result<Vec<f32>> {
-        self.step_with(token, |_, _| Ok(()))
+        self.step_inner(token, None)
+    }
+
+    /// 1 トークン進めて logits を返す。層の出口フック付き (P53)。
+    ///
+    /// `on_layer` は層ごとに 1 回、**層の出口 (ffn の `hc_combine` の後)** で
+    /// 呼ばれる。読むだけなので logits は [`Self::step`] とビット一致する。
+    pub fn step_tapped<F>(&mut self, token: u32, mut on_layer: F) -> Result<Vec<f32>>
+    where
+        F: FnMut(&LayerOut<'_>),
+    {
+        let mut hook = |o: &LayerOut<'_>| -> Result<()> {
+            on_layer(o);
+            Ok(())
+        };
+        self.step_inner(token, Some(&mut hook))
     }
 
     /// プロンプトを全部食わせて、最後の logits を返す。
@@ -148,6 +163,51 @@ impl Qwen4ExpDecoder {
             return self.prefill(prompt);
         }
         let logits = self.model.forward_prefill_with(prompt, true)?;
+        self.tokens.extend_from_slice(prompt);
+        Ok(logits)
+    }
+
+    /// [`Self::prefill_batched`] の層の出口フック付き版 (P53)。
+    ///
+    /// `tokens` で観測するトークンを選ぶ。`TapTokens::Last` は**チャンクの
+    /// 最後のトークンだけ**を流す (`batch == false` の逐次経路では prompt の
+    /// 最後の 1 トークンだけ)。読むだけなので logits は [`Self::prefill_batched`]
+    /// とビット一致する。
+    pub fn prefill_batched_tapped<F>(
+        &mut self,
+        prompt: &[u32],
+        batch: bool,
+        tokens: TapTokens,
+        mut on_layer: F,
+    ) -> Result<Vec<f32>>
+    where
+        F: FnMut(&LayerOut<'_>),
+    {
+        if prompt.is_empty() {
+            return Err(one("prefill_batched: プロンプトが空"));
+        }
+        if !batch {
+            // 逐次経路は `step` を 1 トークンずつ (max_ctx の検査も従来どおり)。
+            let nt = prompt.len();
+            let mut logits = Vec::new();
+            for (i, &t) in prompt.iter().enumerate() {
+                let want = match tokens {
+                    TapTokens::All => true,
+                    TapTokens::Last => i + 1 == nt,
+                };
+                if want {
+                    let mut hook = |o: &LayerOut<'_>| -> Result<()> {
+                        on_layer(o);
+                        Ok(())
+                    };
+                    logits = self.step_inner(t, Some(&mut hook))?;
+                } else {
+                    logits = self.step_inner(t, None)?;
+                }
+            }
+            return Ok(logits);
+        }
+        let logits = self.model.forward_prefill_tapped(prompt, true, tokens, on_layer)?;
         self.tokens.extend_from_slice(prompt);
         Ok(logits)
     }
@@ -237,11 +297,21 @@ impl Qwen4ExpDecoder {
         Ok(out)
     }
 
-    /// [`Qwen4ExpDecoder::step`] の層フック付き版 (内部用)。
+    /// [`Qwen4ExpDecoder::step_tapped`] の旧フック版 (内部用)。
     fn step_with<F>(&mut self, token: u32, mut on_layer: F) -> Result<Vec<f32>>
     where
         F: FnMut(usize, &[f32]) -> Result<()>,
     {
+        let mut hook = |o: &LayerOut<'_>| -> Result<()> { on_layer(o.il, o.res) };
+        self.step_inner(token, Some(&mut hook))
+    }
+
+    /// [`Qwen4ExpDecoder::step`] / [`Qwen4ExpDecoder::step_tapped`] の共通本体。
+    fn step_inner(
+        &mut self,
+        token: u32,
+        on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+    ) -> Result<Vec<f32>> {
         let max = self.cfg.max_ctx;
         if max == 0 {
             return Err(one("max_ctx が 0 (1 トークンも食わせられない)"));
@@ -263,8 +333,7 @@ impl Qwen4ExpDecoder {
         let start = self.tokens.len().saturating_sub(win);
         let ctx: Vec<u32> = self.tokens[start..].to_vec();
 
-        self.model
-            .forward_token_with(&ctx, |il, res| on_layer(il, res))
+        self.model.forward_token_at(&ctx, 0, 1, on_layer)
     }
 }
 
