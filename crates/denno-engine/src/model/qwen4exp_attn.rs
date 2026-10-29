@@ -52,7 +52,8 @@
 //! [`GgufLinear`] で持つ (f32 へ展開しない)。`attn_q_norm` / `attn_k_norm`
 //! (各 `[head_dim]` = 1 KB) だけ f32 常駐。
 
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::OnceLock;
 
 use anyhow::{bail, Context, Result};
 
@@ -60,7 +61,7 @@ use crate::gguf::GgufFile;
 use crate::kquant::GgmlType;
 use crate::model::linear_gguf::GgufLinear;
 use crate::model::qwen4exp::{
-    gemv_batch, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams,
+    gemv_batch, q4prof, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams,
 };
 use crate::model::qwen4exp_qsa::QsaState;
 use crate::quant::WeightBlocks;
@@ -96,6 +97,38 @@ pub fn rope_neox_partial(
     pos: usize,
     theta: f32,
 ) {
+    // half が表の上限を超える形だけ従来版に落とす (実形状の n_rot は 64 = half 32)。
+    if rope_tab_on() && n_rot / 2 <= ROPE_TAB_MAX {
+        rope_neox_partial_tab(x, heads, dh, n_rot, pos, theta);
+    } else {
+        rope_neox_partial_serial(x, heads, dh, n_rot, pos, theta);
+    }
+}
+
+/// 表の上限 (対の本数)。`n_rot <= 2 * ROPE_TAB_MAX` まで表引き版を使う。
+const ROPE_TAB_MAX: usize = 128;
+
+/// 表引き (`DENNO_PF_ATT_ROPE_TAB=0` で従来版・既定 ON)。A/B 用。
+static ROPE_TAB: OnceLock<AtomicBool> = OnceLock::new();
+
+fn rope_tab_on() -> bool {
+    ROPE_TAB
+        .get_or_init(|| AtomicBool::new(std::env::var("DENNO_PF_ATT_ROPE_TAB").ok().as_deref() != Some("0")))
+        .load(AtomicOrdering::Relaxed)
+}
+
+/// 従来版 (基準実装): 対ごとの `powf` / `cos` / `sin` を **head ごとに** 払い直す。
+///
+/// 実形状 (heads 24 / half 32) では 1 トークンあたり 768 回の超越関数になる。
+/// 値の基準なので消さず、`DENNO_PF_ATT_ROPE_TAB=0` とテストの比較対象に残す。
+fn rope_neox_partial_serial(
+    x: &mut [f32],
+    heads: usize,
+    dh: usize,
+    n_rot: usize,
+    pos: usize,
+    theta: f32,
+) {
     let half = n_rot / 2;
     let posf = pos as f32;
     for h in 0..heads {
@@ -103,6 +136,44 @@ pub fn rope_neox_partial(
         for j in 0..half {
             let ang = posf * theta.powf(-2.0 * j as f32 / n_rot as f32);
             let (c, s) = (ang.cos(), ang.sin());
+            let x0 = x[base + j];
+            let x1 = x[base + half + j];
+            x[base + j] = x0 * c - x1 * s;
+            x[base + half + j] = x0 * s + x1 * c;
+        }
+    }
+}
+
+/// 表引き版: 角度 `pos * theta^(-2j/n_rot)` と `cos` / `sin` は **head に
+/// 依存しない**ので、対ごとに 1 回だけ出して全 head で使い回す。
+///
+/// 1 要素の演算列 (`x0*c - x1*s` / `x0*s + x1*c`、左から) と角度の式は
+/// 従来版と同一の式・同一の f32 演算なので、出力はビット一致する
+/// (テスト `rope_tab_matches_serial_bitexact`)。
+fn rope_neox_partial_tab(
+    x: &mut [f32],
+    heads: usize,
+    dh: usize,
+    n_rot: usize,
+    pos: usize,
+    theta: f32,
+) {
+    let half = n_rot / 2;
+    if half == 0 {
+        return;
+    }
+    let posf = pos as f32;
+    // (c, s) の表。half <= ROPE_TAB_MAX は呼び出し側で保証済み。
+    let mut cs = [0f32; ROPE_TAB_MAX * 2];
+    for j in 0..half {
+        let ang = posf * theta.powf(-2.0 * j as f32 / n_rot as f32);
+        cs[j * 2] = ang.cos();
+        cs[j * 2 + 1] = ang.sin();
+    }
+    for h in 0..heads {
+        let base = h * dh;
+        for j in 0..half {
+            let (c, s) = (cs[j * 2], cs[j * 2 + 1]);
             let x0 = x[base + j];
             let x1 = x[base + half + j];
             x[base + j] = x0 * c - x1 * s;
@@ -730,7 +801,6 @@ impl AttnLayer {
         scores: &mut [f32],
         out: &mut [f32],
     ) {
-        let dh = self.head_dim;
         debug_assert_eq!(qrow.len(), self.q_dim());
         debug_assert_eq!(out.len(), self.q_dim());
         debug_assert!(nvis >= 1);
@@ -738,39 +808,172 @@ impl AttnLayer {
             if group.is_empty() {
                 continue;
             }
-            let ng = group.len();
-            debug_assert!(scores.len() >= ng * nvis);
-            let sc = &mut scores[..ng * nvis];
-            // 1) スコア: j (位置) を外・head を内にして k 行を 1 回だけ読む。
-            for j in 0..nvis {
-                let krow = &kb[j * row + hk * dh..][..dh];
-                for (li, &h) in group.iter().enumerate() {
-                    let qh = &qrow[h * dh..][..dh];
-                    let mut acc = 0f32;
-                    for d in 0..dh {
-                        acc += qh[d] * krow[d];
-                    }
-                    sc[li * nvis + j] = acc * self.kq_scale;
-                }
-            }
-            // 2) softmax は可視範囲だけ ([`softmax`] そのもの)。
-            for li in 0..ng {
-                softmax(&mut sc[li * nvis..(li + 1) * nvis]);
-            }
-            // 3) 出力: j 昇順の逐次加算 (v 行も 1 回だけ読む)。
-            for j in 0..nvis {
-                let vrow = &vb[j * row + hk * dh..][..dh];
-                for (li, &h) in group.iter().enumerate() {
-                    let p = sc[li * nvis + j];
-                    let orow = &mut out[h * dh..][..dh];
-                    for d in 0..dh {
-                        orow[d] += p * vrow[d];
-                    }
-                }
+            debug_assert!(scores.len() >= group.len() * nvis);
+            attend_group_into(
+                qrow,
+                kb,
+                vb,
+                row,
+                nvis,
+                hk,
+                group,
+                self.head_dim,
+                self.kq_scale,
+                scores,
+                out,
+            );
+            // 次のグループは自分の `ng * nvis` だけを使う (先頭から書き直す)。
+        }
+    }
+}
+
+/// 1 トークン・1 kv head グループぶんの attention ([`AttnLayer::attend_one_into`]
+/// の本体)。
+///
+/// `heads` は同じ kv head を共有する q head (昇順)。`scores` は
+/// `heads.len() * nvis` 以上、`out` は `n_head * head_dim`。
+///
+/// 計算順は [`AttnLayer::attend_batch`] の doc と同じ:
+/// 内積は d 昇順 → `* kq_scale` 1 回、softmax は [`softmax`]、出力は j 昇順。
+/// 内積を head 方向にまとめる版 ([`attend_group_scores_ilp`]) も **head ごとの
+/// 累積列は d 昇順のまま**なので、値は逐次版とビット一致する。
+#[allow(clippy::too_many_arguments)]
+fn attend_group_into(
+    qrow: &[f32],
+    kb: &[f32],
+    vb: &[f32],
+    row: usize,
+    nvis: usize,
+    hk: usize,
+    heads: &[usize],
+    dh: usize,
+    kq_scale: f32,
+    scores: &mut [f32],
+    out: &mut [f32],
+) {
+    let ng = heads.len();
+    debug_assert!(ng >= 1);
+    debug_assert!(scores.len() >= ng * nvis);
+    let sc = &mut scores[..ng * nvis];
+    // 1) スコア: j (位置) を外・head を内にして k 行を 1 回だけ読む。
+    if attend_ilp_on() && ng <= ATTEND_ILP_LANES {
+        attend_group_scores_ilp(qrow, kb, row, nvis, hk, heads, dh, kq_scale, sc);
+    } else {
+        attend_group_scores_serial(qrow, kb, row, nvis, hk, heads, dh, kq_scale, sc);
+    }
+    // 2) softmax は可視範囲だけ ([`softmax`] そのもの)。
+    for li in 0..ng {
+        softmax(&mut sc[li * nvis..(li + 1) * nvis]);
+    }
+    // 3) 出力: j 昇順の逐次加算 (v 行も 1 回だけ読む)。
+    for j in 0..nvis {
+        let vrow = &vb[j * row + hk * dh..][..dh];
+        for (li, &h) in heads.iter().enumerate() {
+            let p = sc[li * nvis + j];
+            let orow = &mut out[h * dh..][..dh];
+            for d in 0..dh {
+                orow[d] += p * vrow[d];
             }
         }
     }
+}
 
+/// head を内側で同時に進める本数 (実形状の GQA 比 24/2 = 12 を 8 + 4 で覆う)。
+const ATTEND_ILP_LANES: usize = 8;
+
+/// 内積の head 同時化 (`DENNO_PF_ATT_ILP=0` で従来版・既定 ON)。A/B 用。
+static ATTEND_ILP: OnceLock<AtomicBool> = OnceLock::new();
+
+fn attend_ilp_on() -> bool {
+    ATTEND_ILP
+        .get_or_init(|| {
+            AtomicBool::new(std::env::var("DENNO_PF_ATT_ILP").ok().as_deref() != Some("0"))
+        })
+        .load(AtomicOrdering::Relaxed)
+}
+
+/// 内積を head 方向に同時に進める版 (`DENNO_PF_ATT_ILP=0` で逐次版)。
+///
+/// 1 head ずつ回すと 256 要素の FMA 依存鎖 (レイテンシ 4 クロック/要素) が
+/// そのまま律速になり、FMA ユニットが埋まらない。独立な鎖を 8 本立てる
+/// (レーンが足りないときは末尾 head で埋めて捨てる) と、同じ FMA 本数でも
+/// スループット側に寄る。
+///
+/// 数値: `acc[k]` の加算は d 昇順・head ごとに独立なので、逐次版とビット一致
+/// (テスト `attend_ilp_matches_serial_bitexact`)。
+#[allow(clippy::too_many_arguments)]
+fn attend_group_scores_ilp(
+    qrow: &[f32],
+    kb: &[f32],
+    row: usize,
+    nvis: usize,
+    hk: usize,
+    heads: &[usize],
+    dh: usize,
+    kq_scale: f32,
+    sc: &mut [f32],
+) {
+    const L: usize = ATTEND_ILP_LANES;
+    let ng = heads.len();
+    let mut i = 0;
+    while i < ng {
+        let w = (ng - i).min(L);
+        // 8 レーン固定で回すため、余りは末尾 head で埋める (値は捨てる)。
+        let mut hp = [heads[ng - 1]; L];
+        hp[..w].copy_from_slice(&heads[i..i + w]);
+        let mut off = [0usize; L];
+        for k in 0..L {
+            off[k] = hp[k] * dh;
+        }
+        for j in 0..nvis {
+            let krow = &kb[j * row + hk * dh..][..dh];
+            let mut acc = [0f32; L];
+            for d in 0..dh {
+                let kv = krow[d];
+                acc[0] += qrow[off[0] + d] * kv;
+                acc[1] += qrow[off[1] + d] * kv;
+                acc[2] += qrow[off[2] + d] * kv;
+                acc[3] += qrow[off[3] + d] * kv;
+                acc[4] += qrow[off[4] + d] * kv;
+                acc[5] += qrow[off[5] + d] * kv;
+                acc[6] += qrow[off[6] + d] * kv;
+                acc[7] += qrow[off[7] + d] * kv;
+            }
+            for k in 0..w {
+                sc[(i + k) * nvis + j] = acc[k] * kq_scale;
+            }
+        }
+        i += w;
+    }
+}
+
+/// 従来版 (基準実装): head ごとに 1 本の累積で d 昇順に足す。
+#[allow(clippy::too_many_arguments)]
+fn attend_group_scores_serial(
+    qrow: &[f32],
+    kb: &[f32],
+    row: usize,
+    nvis: usize,
+    hk: usize,
+    heads: &[usize],
+    dh: usize,
+    kq_scale: f32,
+    sc: &mut [f32],
+) {
+    for j in 0..nvis {
+        let krow = &kb[j * row + hk * dh..][..dh];
+        for (li, &h) in heads.iter().enumerate() {
+            let qh = &qrow[h * dh..][..dh];
+            let mut acc = 0f32;
+            for d in 0..dh {
+                acc += qh[d] * krow[d];
+            }
+            sc[li * nvis + j] = acc * kq_scale;
+        }
+    }
+}
+
+impl AttnLayer {
     /// 出力ゲート: `attn * sigmoid(gate)` (要素ごと)。
     pub fn gate_mul(&self, attn: &[f32], gate: &[f32]) -> Result<Vec<f32>> {
         if attn.len() != self.q_dim() || gate.len() != self.q_dim() {
@@ -1092,6 +1295,10 @@ impl FullAttn {
             flat.extend_from_slice(cur);
         }
 
+        // P49: 段別の時間 (`DENNO_Q4_PROFILE` か `DENNO_PF_ATT_DBG` のときだけ取る)。
+        let t_all = q4prof::stamp();
+        q4prof::bump_nt(layer, nt);
+
         let l = self.layers[layer]
             .as_mut()
             .expect("上の is_none で除外済み");
@@ -1100,14 +1307,17 @@ impl FullAttn {
         let qg = l.qg_dim();
 
         // 投影はチャンクで 1 回ずつ (トークンごとの `gemv` と同じカーネル)。
+        let t_qkv = q4prof::stamp();
         let mut qgs = vec![0f32; nt * qg];
         gemv_batch(&l.wq, &flat, nt, &mut qgs)?;
         let mut ks = vec![0f32; nt * kv];
         gemv_batch(&l.wk, &flat, nt, &mut ks)?;
         let mut vs = vec![0f32; nt * kv];
         gemv_batch(&l.wv, &flat, nt, &mut vs)?;
+        q4prof::mark_l(t_qkv, layer, q4prof::ST_QKV);
 
         // 正規化 + rope はトークンごと (pos が違う)。k は rope 後にキャッシュへ積む。
+        let t_rope = q4prof::stamp();
         let mut qs = vec![0f32; nt * qd];
         let mut gates = vec![0f32; nt * qd];
         for t in 0..nt {
@@ -1123,8 +1333,12 @@ impl FullAttn {
                 &vs[t * kv..(t + 1) * kv],
             )?;
         }
+        q4prof::mark_l(t_rope, layer, q4prof::ST_ROPE);
 
+        let t_att = q4prof::stamp();
         let attn = l.attend_batch(&qs, nt, &self.cache, layer)?;
+        q4prof::mark_l(t_att, layer, q4prof::ST_ATTEND);
+        let t_gmul = q4prof::stamp();
         let mut gated = vec![0f32; nt * qd];
         for t in 0..nt {
             let g = l.gate_mul(
@@ -1133,8 +1347,15 @@ impl FullAttn {
             )?;
             gated[t * qd..(t + 1) * qd].copy_from_slice(&g);
         }
+        q4prof::mark_l(t_gmul, layer, q4prof::ST_GMUL);
+        let t_out = q4prof::stamp();
         let mut outs = vec![0f32; nt * n_embd];
         gemv_batch(&l.wo, &gated, nt, &mut outs)?;
+        q4prof::mark_l(t_out, layer, q4prof::ST_OUT);
+        // full 層の合計 (`dump_attn` の A_FULL。従来は誰も加算していなかった)。
+        if let Some(t) = t_all {
+            q4prof::add(&q4prof::A_FULL, t);
+        }
         // 対外的な「何トークン進んだか」は最大値で持つ (`forward_token` と同じ)。
         if self.pos < base + nt {
             self.pos = base + nt;
@@ -1246,4 +1467,280 @@ fn dequant_exact(f: &GgufFile, name: &str, want: usize) -> Result<Vec<f32>> {
         bail!("{name}: 要素数 {} が期待 {want} と違う", v.len());
     }
     Ok(v)
+}
+
+// ---------------------------------------------------------------------------
+// P49: attn の段別テストと実形状ベンチ (このコンテナの CPU)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod p49 {
+    //! prefill の full attention を段別に見るためのテスト群。
+    //!
+    //! - 数値: 新しい経路 (rope の表引き・内積の head 同時化) が従来版と
+    //!   **ビット一致**することを固定する。
+    //! - 実測: 実形状 (Flash-Next = 24 head / 2 kv head / dh 256) の段別コスト。
+    //!   `cargo test --release -p denno-engine --lib p49 -- --ignored --nocapture -j 8`
+    //!   で回す (既定のテストでは走らない)。
+    use super::*;
+
+    fn lcg(seed: u64) -> impl FnMut() -> f32 {
+        let mut s = seed | 1;
+        move || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        }
+    }
+
+    fn fill(seed: u64, v: &mut [f32]) {
+        let mut r = lcg(seed);
+        for x in v.iter_mut() {
+            *x = r();
+        }
+    }
+
+    /// 表引き版 rope が従来版とビット一致する (実形状 + 端の形)。
+    #[test]
+    fn rope_tab_matches_serial_bitexact() {
+        for &(heads, dh, n_rot, pos) in &[
+            (24usize, 256usize, 64usize, 0usize),
+            (24, 256, 64, 1),
+            (24, 256, 64, 511),
+            (24, 256, 64, 65535),
+            (2, 256, 64, 7),
+            (3, 128, 32, 13),
+            (1, 64, 64, 5),
+        ] {
+            let mut a = vec![0f32; heads * dh];
+            fill(0x51 + pos as u64, &mut a);
+            let mut b = a.clone();
+            rope_neox_partial_serial(&mut a, heads, dh, n_rot, pos, 10_000_000.0);
+            rope_neox_partial_tab(&mut b, heads, dh, n_rot, pos, 10_000_000.0);
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "rope 表引きが従来版と違う (heads {heads} dh {dh} n_rot {n_rot} pos {pos} i {i})"
+                );
+            }
+            // 回転していること (全要素が入力と同一なら経路が死んでいる)
+            assert!(
+                a.iter().zip(b.iter()).any(|(x, _)| *x != 0.0),
+                "rope の出力が全部 0"
+            );
+        }
+    }
+
+    /// 内積の head 同時化が従来版とビット一致する (グループ長 1 / 5 / 12 / 16)。
+    #[test]
+    fn attend_ilp_matches_serial_bitexact() {
+        let dh = 64usize;
+        let row = 2 * dh; // kv head 2 本ぶんの行
+        for &ng in &[1usize, 5, 8, 12, 16] {
+            for &nvis in &[1usize, 7, 33] {
+                let mut q = vec![0f32; 24 * dh];
+                fill(0x91 + ng as u64, &mut q);
+                let mut kb = vec![0f32; 40 * row];
+                fill(0x37 + nvis as u64, &mut kb);
+                let heads: Vec<usize> = (0..ng).collect();
+                let mut serial = vec![0f32; ng * nvis];
+                let mut ilp = vec![0f32; ng * nvis];
+                attend_group_scores_serial(
+                    &q,
+                    &kb,
+                    row,
+                    nvis,
+                    1,
+                    &heads,
+                    dh,
+                    1.0 / (dh as f32).sqrt(),
+                    &mut serial,
+                );
+                attend_group_scores_ilp(
+                    &q,
+                    &kb,
+                    row,
+                    nvis,
+                    1,
+                    &heads,
+                    dh,
+                    1.0 / (dh as f32).sqrt(),
+                    &mut ilp,
+                );
+                for (i, (a, b)) in serial.iter().zip(ilp.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "head 同時化が逐次版と違う (ng {ng} nvis {nvis} i {i})"
+                    );
+                }
+                assert!(
+                    serial.iter().any(|v| *v != 0.0),
+                    "スコアが全部 0 (経路が死んでいる)"
+                );
+            }
+        }
+    }
+
+    // ---- 実形状ベンチ -----------------------------------------------------
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    }
+
+    /// Flash-Next full 層の実形状: n_head 24 / n_head_kv 2 / dh 256 / n_rot 64。
+    const P49_HEADS: usize = 24;
+    const P49_KV: usize = 2;
+    const P49_DH: usize = 256;
+    const P49_NROT: usize = 64;
+    const P49_ROW: usize = P49_KV * P49_DH;
+
+    /// rope 1 トークンぶん (q 24 head + k 2 head) の従来版 / 表引き版。
+    #[test]
+    #[ignore]
+    fn bench_rope_p49() {
+        let mut q_serial = vec![0f32; P49_HEADS * P49_DH];
+        let mut q_tab = vec![0f32; P49_HEADS * P49_DH];
+        let mut k_serial = vec![0f32; P49_KV * P49_DH];
+        let mut k_tab = vec![0f32; P49_KV * P49_DH];
+        fill(1, &mut q_serial);
+        fill(2, &mut k_serial);
+        q_tab.copy_from_slice(&q_serial);
+        k_tab.copy_from_slice(&k_serial);
+        let reps = 2000usize;
+        let mut ts = Vec::new();
+        let mut tt = Vec::new();
+        for _ in 0..7 {
+            let s = std::time::Instant::now();
+            for i in 0..reps {
+                rope_neox_partial_serial(&mut q_serial, P49_HEADS, P49_DH, P49_NROT, i, 1e7);
+                rope_neox_partial_serial(&mut k_serial, P49_KV, P49_DH, P49_NROT, i, 1e7);
+            }
+            ts.push(s.elapsed().as_secs_f64() * 1e6 / reps as f64);
+            let s = std::time::Instant::now();
+            for i in 0..reps {
+                rope_neox_partial_tab(&mut q_tab, P49_HEADS, P49_DH, P49_NROT, i, 1e7);
+                rope_neox_partial_tab(&mut k_tab, P49_KV, P49_DH, P49_NROT, i, 1e7);
+            }
+            tt.push(s.elapsed().as_secs_f64() * 1e6 / reps as f64);
+        }
+        let (a, b) = (median(ts), median(tt));
+        println!(
+            "[p49] rope 1 token (24 head + 2 head, dh 256, n_rot 64): serial {a:.2} us / tab {b:.2} us = {:.2}x",
+            a / b
+        );
+        assert!(b < a, "表引き版が遅い (serial {a:.2} us / tab {b:.2} us)");
+    }
+
+    /// attend 1 トークン (nvis 512 = チャンク末尾) の スコア / softmax+PV / 合計。
+    #[test]
+    #[ignore]
+    fn bench_attend_p49() {
+        let nvis = 512usize;
+        let mut q = vec![0f32; P49_HEADS * P49_DH];
+        fill(11, &mut q);
+        let mut kb = vec![0f32; nvis * P49_ROW];
+        let mut vb = vec![0f32; nvis * P49_ROW];
+        fill(12, &mut kb);
+        fill(13, &mut vb);
+        let heads: Vec<usize> = (0..P49_HEADS / P49_KV).collect();
+        let ng = heads.len();
+        let mut sc_serial = vec![0f32; ng * nvis];
+        let mut sc_ilp = vec![0f32; ng * nvis];
+        let mut out = vec![0f32; P49_HEADS * P49_DH];
+        // `attend_group_into` は softmax 後でスコアを上書きするので、比較用の
+        // 生スコアは別バッファに残す。
+        let mut sc_used = vec![0f32; ng * nvis];
+        let kq = 1.0f32 / (P49_DH as f32).sqrt();
+        let reps = 200usize;
+        let mut t_serial = Vec::new();
+        let mut t_ilp = Vec::new();
+        let mut t_full = Vec::new();
+        for _ in 0..5 {
+            let s = std::time::Instant::now();
+            for _ in 0..reps {
+                attend_group_scores_serial(
+                    &q, &kb, P49_ROW, nvis, 0, &heads, P49_DH, kq, &mut sc_serial,
+                );
+            }
+            t_serial.push(s.elapsed().as_secs_f64() * 1e6 / reps as f64);
+            let s = std::time::Instant::now();
+            for _ in 0..reps {
+                attend_group_scores_ilp(
+                    &q, &kb, P49_ROW, nvis, 0, &heads, P49_DH, kq, &mut sc_ilp,
+                );
+            }
+            t_ilp.push(s.elapsed().as_secs_f64() * 1e6 / reps as f64);
+            let s = std::time::Instant::now();
+            for _ in 0..reps {
+                // 1 kv head グループ × 2 (2 kv head ぶんが 1 トークンの全 q head)
+                attend_group_into(
+                    &q, &kb, &vb, P49_ROW, nvis, 0, &heads, P49_DH, kq, &mut sc_used, &mut out,
+                );
+                attend_group_into(
+                    &q, &kb, &vb, P49_ROW, nvis, 1, &heads, P49_DH, kq, &mut sc_used, &mut out,
+                );
+            }
+            t_full.push(s.elapsed().as_secs_f64() * 1e6 / reps as f64);
+        }
+        let (a, b, c) = (median(t_serial), median(t_ilp), median(t_full));
+        println!(
+            "[p49] attend 1 token nvis {nvis} (2 kv head x {ng} head, dh {P49_DH}): \
+             scores/1kvhead serial {a:.1} us / ilp {b:.1} us ({:.2}x) / 2kvhead total {c:.1} us / \
+             softmax+PV {:.1} us",
+            a / b,
+            c - 2.0 * b,
+        );
+        for (i, (x, y)) in sc_serial.iter().zip(sc_ilp.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "スコアが一致しない (i {i})");
+        }
+    }
+
+    /// `DENNO_PF_ATT_DBG` の層別集計と 1 行出力が実際に組み上がる
+    /// (緑 = 経路が発動した証拠ではないので、行の中身まで見る)。
+    #[test]
+    fn att_dbg_layers_build_one_line_each() {
+        use crate::model::qwen4exp::q4prof;
+        q4prof::set_att_dbg_for_test(true);
+        q4prof::reset();
+
+        // ssm 層 (0): gdn に 1 ms、qkv に 0.5 ms 相当を積む
+        q4prof::bump_nt(0, 512);
+        let t = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        q4prof::mark(Some(t), &q4prof::A_QKV, 0, q4prof::ST_QKV);
+        q4prof::mark_l(Some(t), 0, q4prof::ST_GDN);
+
+        // full 層 (47): attend に 1 ms 相当
+        q4prof::bump_nt(47, 512);
+        q4prof::mark_l(Some(t), 47, q4prof::ST_ATTEND);
+
+        let ssm = q4prof::layer_line(0, false).expect("ssm 層の行が出ない");
+        assert!(ssm.starts_with("[pf-att] layer 0 "), "行の頭が違う: {ssm}");
+        assert!(ssm.contains("qkv ") && ssm.contains("gate ") && ssm.contains("gdn "),
+            "ssm の段名が揃っていない: {ssm}");
+        assert!(ssm.contains("nt 512"), "分母 (nt) が出ていない: {ssm}");
+        let gdn_ms: f64 = ssm
+            .split("gdn ")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .and_then(|s| s.parse().ok())
+            .expect("gdn の ms が読めない");
+        // 並行して走る他のテストも同じ束に積むので「以上」で見る (値は増える方向だけ)。
+        assert!(gdn_ms >= 0.5, "gdn の ms が積まれていない: {ssm}");
+
+        let full = q4prof::layer_line(47, true).expect("full 層の行が出ない");
+        assert!(full.starts_with("[pf-att] layer 47 (full)"), "行の頭が違う: {full}");
+        assert!(full.contains("rope ") && full.contains("attend ") && full.contains("gmul "),
+            "full の段名が揃っていない: {full}");
+
+        // 内訳の対象外の層は行を出さない (空行で埋めない)。DBG_LAYERS の 23 は
+        // 並行テストが積みうるので、対象外の層番号で見る。
+        assert!(q4prof::layer_line(5, true).is_none(), "対象外の層に行が出た");
+
+        // 内訳は Q4_PROFILE の束 (A_FULL) を汚さない
+        q4prof::reset();
+        q4prof::set_att_dbg_for_test(false);
+    }
 }

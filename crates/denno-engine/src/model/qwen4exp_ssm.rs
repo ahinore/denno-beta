@@ -233,30 +233,36 @@ impl SsmLayer {
             flat.extend_from_slice(cur);
         }
 
-        let prof = crate::model::qwen4exp::q4prof::enabled();
         let qd = self.p.qkv_dim();
         let vd = self.p.value_dim();
         let nh = self.p.n_v_heads;
 
-        let t = std::time::Instant::now();
+        let t = crate::model::qwen4exp::q4prof::stamp();
         let mut qkv = vec![0f32; nt * qd];
         crate::model::qwen4exp::gemv_batch(&self.w_qkv, &flat, nt, &mut qkv)?;
-        if prof {
-            crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_QKV, t);
-        }
+        crate::model::qwen4exp::q4prof::mark(
+            t,
+            &crate::model::qwen4exp::q4prof::A_QKV,
+            self.il,
+            crate::model::qwen4exp::q4prof::ST_QKV,
+        );
+        crate::model::qwen4exp::q4prof::bump_nt(self.il, nt);
 
-        let t = std::time::Instant::now();
+        let t = crate::model::qwen4exp::q4prof::stamp();
         let mut z = vec![0f32; nt * vd];
         crate::model::qwen4exp::gemv_batch(&self.w_gate, &flat, nt, &mut z)?;
         let mut beta_raw = vec![0f32; nt * nh];
         crate::model::qwen4exp::gemv_batch(&self.w_beta, &flat, nt, &mut beta_raw)?;
         let mut alpha = vec![0f32; nt * nh];
         crate::model::qwen4exp::gemv_batch(&self.w_alpha, &flat, nt, &mut alpha)?;
-        if prof {
-            crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_GATE, t);
-        }
+        crate::model::qwen4exp::q4prof::mark(
+            t,
+            &crate::model::qwen4exp::q4prof::A_GATE,
+            self.il,
+            crate::model::qwen4exp::q4prof::ST_GATE,
+        );
 
-        let t = std::time::Instant::now();
+        let t = crate::model::qwen4exp::q4prof::stamp();
         gdn::gdn_dbg_set_layer(self.il as i64);
         let cw = GdnCore {
             conv1d: &self.conv1d,
@@ -306,16 +312,21 @@ impl SsmLayer {
                 ys.len()
             );
         }
-        if prof {
-            crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_GDN, t);
-        }
+        crate::model::qwen4exp::q4prof::mark_l(
+            t,
+            self.il,
+            crate::model::qwen4exp::q4prof::ST_GDN,
+        );
 
-        let t = std::time::Instant::now();
+        let t = crate::model::qwen4exp::q4prof::stamp();
         let mut outs = vec![0f32; nt * e];
         crate::model::qwen4exp::gemv_batch(&self.w_out, &ys, nt, &mut outs)?;
-        if prof {
-            crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_OUT, t);
-        }
+        crate::model::qwen4exp::q4prof::mark(
+            t,
+            &crate::model::qwen4exp::q4prof::A_OUT,
+            self.il,
+            crate::model::qwen4exp::q4prof::ST_OUT,
+        );
         Ok(outs.chunks_exact(e).map(|c| c.to_vec()).collect())
     }
 
