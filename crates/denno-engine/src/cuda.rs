@@ -1449,6 +1449,539 @@ impl MoeScratch {
 }
 
 // ===========================================================================
+// P40: grouped expert GEMM (可変 m・1 起動) — `kernels_gemm_grouped.cu`
+// ===========================================================================
+//
+// 目的: prefill で expert ごとに回している GEMM (expert × 3 行列) を、
+// 「層全体の segment 表 + パック済み重み」の 2 起動 (gate+up+silu / down) に
+// まとめる。重みは `model::moe_grouped::pack_expert_weights` の
+// `[gate(e0..eN)][up(e0..eN)][down(e0..eN)]` をそのまま渡す。
+//
+// 既定 off (`DENNO_MOE_GROUPED_GPU=1` で有効)。off のとき呼び出し側はこの節に
+// 入らないので、既存の per-expert 経路は 1 バイトも変わらない。
+//
+// PTX を `include_bytes!` しない理由: `kernels_gemm_grouped.ptx` の生成は
+// メインセッションの担当で、このコンテナには nvcc が無い。埋め込むと PTX が
+// 置かれるまで `cargo check --lib` が通らない。起動時に 1 回だけファイルから
+// 読む (`DENNO_MOE_GROUPED_PTX` で差し替え可)。読めなければ None を返して
+// CPU へ落ちる (fail closed)。
+//
+// 数値: prefill はビット一致契約の外 (2026-10-28)。カーネルは FMA 融合と
+// 共有メモリ経由のデコードを使うので、CPU 参照とは丸め順が違う。差は呼び出し側
+// (`model::moe_grouped_gpu`) が argmax / max abs diff で出す。
+
+/// パック済み重みの 1 ブロック (gate / up / down のどれか) の形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupedMatrix {
+    pub ty: crate::kquant::GgmlType,
+    /// 行長 (量子型のブロック長で割り切れること)
+    pub n_in: usize,
+    /// 行数
+    pub n_out: usize,
+    /// 1 行のバイト数 ([`crate::model::moe_expert::row_bytes`] と同じ値)
+    pub row_bytes: usize,
+    /// パック済みバッファ内のこのブロックの先頭バイト
+    pub w_off: usize,
+}
+
+impl GroupedMatrix {
+    /// カーネルに渡す (量子型 id, ブロック要素数, ブロックバイト数)。
+    /// 未対応の型は `None` (呼び出し側は CPU へ落ちる)。
+    pub fn kernel_layout(&self) -> Option<(i32, usize, usize)> {
+        use crate::kquant::GgmlType as T;
+        // kernels_gemm_grouped.cu の dno_gr_deq の分岐と 1:1 で対応する。
+        match self.ty {
+            T::Q8_0 => Some((0, 32, 34)),
+            T::Q5_1 => Some((1, 32, 24)),
+            T::Q4K => Some((2, 256, 144)),
+            T::Q5K => Some((3, 256, 176)),
+            _ => None,
+        }
+    }
+
+    /// 1 expert ぶんのバイト数 (パック済みブロック内のストライド)。
+    pub fn expert_bytes(&self) -> Option<usize> {
+        self.n_out.checked_mul(self.row_bytes)
+    }
+
+    /// 形の検査 (起動前)。`Ok(())` 以外は起動しない。
+    pub fn check(&self) -> Result<()> {
+        let Some((_, blkj, _)) = self.kernel_layout() else {
+            bail!("grouped GEMM の対象外の量子型 {:?}", self.ty);
+        };
+        if self.n_in == 0 || self.n_out == 0 || self.row_bytes == 0 {
+            bail!(
+                "grouped GEMM: 形に 0 がある (n_in={}, n_out={}, row_bytes={})",
+                self.n_in,
+                self.n_out,
+                self.row_bytes
+            );
+        }
+        if self.n_in % blkj != 0 {
+            bail!(
+                "grouped GEMM: n_in={} がブロック長 {blkj} で割り切れない",
+                self.n_in
+            );
+        }
+        let want_rb = self.n_in / blkj * match self.ty {
+            crate::kquant::GgmlType::Q8_0 => 34,
+            crate::kquant::GgmlType::Q5_1 => 24,
+            crate::kquant::GgmlType::Q4K => 144,
+            crate::kquant::GgmlType::Q5K => 176,
+            _ => 0,
+        };
+        if want_rb != self.row_bytes {
+            bail!(
+                "grouped GEMM: row_bytes={} が型から決まる {want_rb} と違う",
+                self.row_bytes
+            );
+        }
+        Ok(())
+    }
+}
+
+/// 1 起動ぶんの grid / block / 動的共有メモリ (GPU 無しで検証できる純関数)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupedLaunch {
+    pub grid: (u32, u32, u32),
+    pub block: (u32, u32, u32),
+    pub smem: u32,
+}
+
+/// groupd GEMM の起動形を決める。`None` = この形では起動しない (CPU へ)。
+///
+/// - grid.x = segment 数、grid.y = 行タイル (ceil(n_out / 16))、
+///   grid.z = トークンタイル (ceil(m_max / 16))。
+/// - 1 ブロックは 16 行 × 16 トークン。m < 16 の expert では z の余分なブロックが
+///   即 return する (実形の平均 m は 10 なので 1 タイルで足りる)。
+/// - 共有メモリは「デコード済み f32 の 1 ブロックぶん」だけ。
+///   `nmat` 本の行列を同時にデコードするので `16 * blkj * 4 * nmat` バイト。
+pub fn grouped_launch_plan(
+    nseg: usize,
+    m_max: usize,
+    n_out: usize,
+    blkj: usize,
+    nmat: usize,
+) -> Result<Option<GroupedLaunch>> {
+    const ROWS: usize = 16; // kernels_gemm_grouped.cu の GR_ROWS
+    const TG: usize = 16; // 同 GR_TG
+    if nseg == 0 || m_max == 0 || n_out == 0 || blkj == 0 || nmat == 0 {
+        return Ok(None);
+    }
+    let tiles_y = n_out.div_ceil(ROWS);
+    let tiles_z = m_max.div_ceil(TG);
+    // grid の上限 (y/z は 65535)。実形 (n_out 2560 / m_max 128) では届かない。
+    if nseg > u32::MAX as usize || tiles_y > 65535 || tiles_z > 65535 {
+        return Ok(None);
+    }
+    let smem = ROWS
+        .checked_mul(blkj)
+        .and_then(|v| v.checked_mul(4))
+        .and_then(|v| v.checked_mul(nmat))
+        .ok_or_else(|| anyhow::anyhow!("grouped GEMM: 共有メモリ量が usize を溢れる"))?;
+    // 48 KiB の既定を超えると起動できない (実績: 62 KiB で全滅)。
+    if smem > 46_000 {
+        return Ok(None);
+    }
+    Ok(Some(GroupedLaunch {
+        grid: (nseg as u32, tiles_y as u32, tiles_z as u32),
+        block: (ROWS as u32, TG as u32, 1),
+        smem: smem as u32,
+    }))
+}
+
+/// `DENNO_MOE_GROUPED_GPU` の値の解釈 (純関数。env を読むのは 1 箇所だけ)。
+pub fn moe_grouped_gpu_from_value(v: Option<&str>) -> bool {
+    matches!(v, Some("1") | Some("on") | Some("true"))
+}
+
+/// grouped expert GEMM を試すか (既定 off)。
+///
+/// `DENNO_MOE_GROUPED_GPU=1` / `on` / `true` のときだけ true。値はプロセスで
+/// 1 回だけ読む (テストは [`moe_grouped_gpu_from_value`] を直接叩く)。
+pub fn moe_grouped_gpu_enabled() -> bool {
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        moe_grouped_gpu_from_value(std::env::var("DENNO_MOE_GROUPED_GPU").ok().as_deref())
+    })
+}
+
+/// grouped GEMM のカーネル (PTX を起動時に 1 回だけ読む)。
+struct GroupedKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    gate_up: CUfunction,
+    down: CUfunction,
+}
+
+// 生ハンドル (context / module / function)。CUcontext はスレッドごとに current を
+// 設定して使うハンドルで、所有権の移動を伴わない (CudaCtx と同じ規約)。
+unsafe impl Send for GroupedKernels {}
+unsafe impl Sync for GroupedKernels {}
+
+static GROUPED_KERNELS: OnceLock<Option<GroupedKernels>> = OnceLock::new();
+
+/// PTX の置き場所。`DENNO_MOE_GROUPED_PTX` があればそれ、無ければビルド時の
+/// クレートディレクトリ配下 `kernels/kernels_gemm_grouped.ptx`。
+fn grouped_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MOE_GROUPED_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gemm_grouped.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None をキャッシュする
+/// (`moe_gemm_dev` の `f_gemm_q = None` と同じ扱い = 二度と試さない)。
+fn grouped_kernels() -> Option<&'static GroupedKernels> {
+    GROUPED_KERNELS
+        .get_or_init(|| {
+            let path = grouped_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[moe-grouped] PTX が読めない ({}) : {e} → CPU へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0); // cuModuleLoadData は NUL 終端の PTX を期待する
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[moe-grouped] cuModuleLoadData 失敗 → CPU へ");
+                    return None;
+                }
+                let mut gate_up: CUfunction = std::ptr::null_mut();
+                let mut down: CUfunction = std::ptr::null_mut();
+                let rc1 = (lib.module_get_function)(
+                    &mut gate_up,
+                    module,
+                    b"dno_moe_grouped_gate_up\0".as_ptr() as *const c_char,
+                );
+                let rc2 = (lib.module_get_function)(
+                    &mut down,
+                    module,
+                    b"dno_moe_grouped_down\0".as_ptr() as *const c_char,
+                );
+                if rc1 != CUDA_SUCCESS || rc2 != CUDA_SUCCESS {
+                    eprintln!(
+                        "[moe-grouped] PTX に dno_moe_grouped_gate_up / dno_moe_grouped_down が無い → CPU へ"
+                    );
+                    return None;
+                }
+                Some(GroupedKernels {
+                    module,
+                    gate_up,
+                    down,
+                })
+            }
+        })
+        .as_ref()
+}
+
+/// grouped GEMM 用のスレッド局所スクラッチ (grow-only)。
+///
+/// `packed` だけは「層の重み」なので key (層 id) が変わったら作り直す。
+/// それ以外 (seg / x / act / h) は要求サイズが増えたときだけ確保し直す。
+struct GroupedScratch {
+    /// `packed` の持ち主 (層) の識別子
+    key: u64,
+    packed: Option<DevBuffer>,
+    packed_len: usize,
+    seg: Option<DevBuffer>,
+    x: Option<DevBuffer>,
+    act: Option<DevBuffer>,
+    h: Option<DevBuffer>,
+}
+
+impl GroupedScratch {
+    const fn new() -> Self {
+        Self {
+            key: u64::MAX,
+            packed: None,
+            packed_len: 0,
+            seg: None,
+            x: None,
+            act: None,
+            h: None,
+        }
+    }
+}
+
+thread_local! {
+    static GROUPED_SCRATCH: std::cell::RefCell<GroupedScratch> =
+        std::cell::RefCell::new(GroupedScratch::new());
+}
+
+/// P40: grouped expert GEMM を 1 層ぶん走らせる。
+///
+/// 2 起動で expert FFN を終わらせる:
+///   1. `dno_moe_grouped_gate_up` — act = silu(gate·x) * (up·x)
+///   2. `dno_moe_grouped_down`    — h = down·act
+///
+/// 引数:
+/// - `key`: パック済み重みの持ち主 (層 id)。変わったら VRAM を作り直す。
+/// - `packed`: `[gate(e0..eN)][up(e0..eN)][down(e0..eN)]` のパック済み重み。
+/// - `seg`: 5 個で 1 segment (`[eid, m, w_off, e_off, ff_off]`、要素単位の
+///   offset は `m * n_in` の累積)。空 (`nseg == 0`) は `Ok(false)`。
+/// - `xin`: segment の並びに詰め直した入力 (m_total × gate.n_in)。
+/// - `h`: 出力 (m_total × down.n_out)。成功時のみ全要素を書く。
+///
+/// 戻り値 `Ok(false)` は「GPU でやらなかった」= 呼び出し側は CPU 経路へ。
+/// 環境 (env / CUDA / PTX / 形 / 共有メモリ) のどれかが欠ければ false。
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_gemm_layer(
+    key: u64,
+    packed: &[u8],
+    seg: &[u32],
+    gate: GroupedMatrix,
+    up: GroupedMatrix,
+    down: GroupedMatrix,
+    xin: &[f32],
+    h: &mut [f32],
+) -> Result<bool> {
+    if !moe_grouped_gpu_enabled() || !cuda_enabled() || !gpu_gemm_enabled() {
+        return Ok(false);
+    }
+    if seg.is_empty() || seg.len() % 5 != 0 {
+        return Ok(false);
+    }
+    // gate と up は同形 (同じ x を読み、同じ形の act を書く)。
+    if (gate.ty, gate.n_in, gate.n_out, gate.row_bytes) != (up.ty, up.n_in, up.n_out, up.row_bytes)
+    {
+        return Ok(false);
+    }
+    // down は gate の転置 (n_in = ff、n_out = e)。
+    if down.n_in != gate.n_out || down.n_out != gate.n_in {
+        return Ok(false);
+    }
+    gate.check()?;
+    down.check()?;
+    let (ty_g, blkj_g, blkb_g) = gate.kernel_layout().expect("check 済み");
+    let (ty_d, blkj_d, blkb_d) = down.kernel_layout().expect("check 済み");
+    let Some(gb) = gate.expert_bytes() else {
+        return Ok(false);
+    };
+    let Some(db) = down.expert_bytes() else {
+        return Ok(false);
+    };
+
+    let nseg = seg.len() / 5;
+    let mut m_max = 0usize;
+    let mut m_total = 0usize;
+    for s in seg.chunks_exact(5) {
+        let m = s[1] as usize;
+        if m == 0 {
+            return Ok(false); // 空タスクは積まない (呼び出し側の契約)
+        }
+        let w_off = s[2] as usize;
+        if w_off + gb > packed.len() || w_off + db > packed.len() {
+            bail!(
+                "moe_grouped_gemm_layer: w_off {w_off} + expert バイト ({gb}/{db}) が \
+                 packed {} を超える",
+                packed.len()
+            );
+        }
+        m_max = m_max.max(m);
+        m_total += m;
+    }
+    if xin.len() != m_total * gate.n_in {
+        bail!(
+            "moe_grouped_gemm_layer: x の長さ {} が m_total({m_total}) * n_in({}) と違う",
+            xin.len(),
+            gate.n_in
+        );
+    }
+    if h.len() != m_total * down.n_out {
+        bail!(
+            "moe_grouped_gemm_layer: h の長さ {} が m_total({m_total}) * n_out({}) と違う",
+            h.len(),
+            down.n_out
+        );
+    }
+    let Some(p_gu) = grouped_launch_plan(nseg, m_max, gate.n_out, blkj_g, 2)? else {
+        return Ok(false);
+    };
+    let Some(p_d) = grouped_launch_plan(nseg, m_max, down.n_out, blkj_d, 1)? else {
+        return Ok(false);
+    };
+
+    let Some(ctx) = shared_ctx() else {
+        return Ok(false);
+    };
+    ctx.make_current()?;
+    let Some(k) = grouped_kernels() else {
+        return Ok(false);
+    };
+
+    let seg_words = seg.len();
+    let n_x = xin.len();
+    let n_act = m_total * up.n_out;
+    let n_h = h.len();
+    let mut out_buf: Option<Vec<f32>> = None;
+    GROUPED_SCRATCH.with(|cell| -> Result<()> {
+        let mut sc = cell.borrow_mut();
+        // 1. パック済み重み (層が変わったら作り直す)
+        if sc.key != key || sc.packed_len != packed.len() || sc.packed.is_none() {
+            sc.packed = Some(DevBuffer::alloc(packed.len().max(1))?);
+            sc.key = key;
+            sc.packed_len = packed.len();
+        }
+        {
+            let pb = sc.packed.as_ref().expect("確保済み");
+            pb.copy_from(packed)?;
+            dbg_htod(packed.len());
+        }
+        // 2. segment 表 / 入力 / 中間 / 出力
+        MoeScratch::ensure(&mut sc.seg, seg_words * 4)?;
+        MoeScratch::ensure(&mut sc.x, n_x * 4)?;
+        MoeScratch::ensure(&mut sc.act, n_act * 4)?;
+        MoeScratch::ensure(&mut sc.h, n_h * 4)?;
+        {
+            let sb = sc.seg.as_ref().expect("確保済み");
+            sb.copy_from(seg)?;
+            dbg_htod(seg_words * 4);
+            let xb = sc.x.as_ref().expect("確保済み");
+            xb.copy_from(xin)?;
+            dbg_htod(n_x * 4);
+        }
+        let packed_buf = sc.packed.as_ref().expect("確保済み");
+        let seg_buf = sc.seg.as_ref().expect("確保済み");
+        let x_buf = sc.x.as_ref().expect("確保済み");
+        let act_buf = sc.act.as_ref().expect("確保済み");
+        let h_buf = sc.h.as_ref().expect("確保済み");
+        unsafe {
+            // 3. gate + up + silu 積
+            {
+                let mut pwg = packed_buf.ptr + gate.w_off as u64;
+                let mut pwu = packed_buf.ptr + up.w_off as u64;
+                let mut px = x_buf.ptr;
+                let mut pa = act_buf.ptr;
+                let mut ps = seg_buf.ptr;
+                let (mut ns, mut ni, mut no, mut rb) = (
+                    nseg as c_int,
+                    gate.n_in as c_int,
+                    gate.n_out as c_int,
+                    gate.row_bytes as c_int,
+                );
+                let (mut wt, mut blkj, mut blkb) =
+                    (ty_g, blkj_g as c_int, blkb_g as c_int);
+                let mut args = [
+                    &mut pwg as *mut _ as *mut c_void,
+                    &mut pwu as *mut _ as *mut c_void,
+                    &mut px as *mut _ as *mut c_void,
+                    &mut pa as *mut _ as *mut c_void,
+                    &mut ps as *mut _ as *mut c_void,
+                    &mut ns as *mut _ as *mut c_void,
+                    &mut ni as *mut _ as *mut c_void,
+                    &mut no as *mut _ as *mut c_void,
+                    &mut rb as *mut _ as *mut c_void,
+                    &mut wt as *mut _ as *mut c_void,
+                    &mut blkj as *mut _ as *mut c_void,
+                    &mut blkb as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(k.gate_up, p_gu.grid, p_gu.block, p_gu.smem, &mut args)?;
+            }
+            // 4. down (act はデバイス上に残っている)
+            {
+                let mut pwd = packed_buf.ptr + down.w_off as u64;
+                let mut px = act_buf.ptr;
+                let mut po = h_buf.ptr;
+                let mut ps = seg_buf.ptr;
+                let (mut ns, mut ni, mut no, mut rb) = (
+                    nseg as c_int,
+                    down.n_in as c_int,
+                    down.n_out as c_int,
+                    down.row_bytes as c_int,
+                );
+                let (mut wt, mut blkj, mut blkb) = (ty_d, blkj_d as c_int, blkb_d as c_int);
+                let mut args = [
+                    &mut pwd as *mut _ as *mut c_void,
+                    &mut px as *mut _ as *mut c_void,
+                    &mut po as *mut _ as *mut c_void,
+                    &mut ps as *mut _ as *mut c_void,
+                    &mut ns as *mut _ as *mut c_void,
+                    &mut ni as *mut _ as *mut c_void,
+                    &mut no as *mut _ as *mut c_void,
+                    &mut rb as *mut _ as *mut c_void,
+                    &mut wt as *mut _ as *mut c_void,
+                    &mut blkj as *mut _ as *mut c_void,
+                    &mut blkb as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(k.down, p_d.grid, p_d.block, p_d.smem, &mut args)?;
+            }
+            ctx.sync()?;
+        }
+        out_buf = Some(h_buf.to_vec::<f32>(n_h)?);
+        dbg_d2h(n_h * 4);
+        Ok(())
+    })?;
+    let got = out_buf.expect("スクラッチで必ず埋まる");
+    h.copy_from_slice(&got);
+    Ok(true)
+}
+
+#[cfg(test)]
+mod grouped_tests {
+    //! P40: 起動形の純関数 (GPU 無しでも検証できる部分)。
+    use super::*;
+
+    #[test]
+    fn launch_plan_sizes_smem_for_two_matrices() {
+        // Q4_K (blkj=256) の gate+up: 16 行 × 256 × 4 B × 2 本 = 32 KiB
+        let p = grouped_launch_plan(86, 60, 640, 256, 2)
+            .expect("plan")
+            .expect("some");
+        assert_eq!(p.grid, (86, 40, 4)); // 640/16 = 40 行タイル、ceil(60/16) = 4
+        assert_eq!(p.block, (16, 16, 1));
+        assert_eq!(p.smem, 16 * 256 * 4 * 2);
+        assert!(p.smem < 46_000, "48 KiB 既定を超えないこと");
+        // Q5_1 (blkj=32) の down: 16 × 32 × 4 = 2 KiB
+        let q = grouped_launch_plan(86, 60, 2560, 32, 1)
+            .expect("plan")
+            .expect("some");
+        assert_eq!(q.grid, (86, 160, 4));
+        assert_eq!(q.smem, 16 * 32 * 4);
+    }
+
+    #[test]
+    fn launch_plan_rejects_oversized_smem_and_empty() {
+        assert!(grouped_launch_plan(0, 10, 640, 256, 2)
+            .expect("plan")
+            .is_none());
+        assert!(grouped_launch_plan(8, 0, 640, 256, 2)
+            .expect("plan")
+            .is_none());
+        // 3 本同時 (Q4_K) は 48 KiB で既定を超える = 過去に全滅した形
+        assert!(grouped_launch_plan(8, 10, 640, 256, 3)
+            .expect("plan")
+            .is_none());
+        // 32 行タイル x 256 要素 x 4 B x 2 = 64 KiB も落ちる
+        assert!(grouped_launch_plan(8, 10, 640, 512, 2)
+            .expect("plan")
+            .is_none());
+    }
+
+    #[test]
+    fn env_value_parsing() {
+        assert!(moe_grouped_gpu_from_value(Some("1")));
+        assert!(moe_grouped_gpu_from_value(Some("on")));
+        assert!(moe_grouped_gpu_from_value(Some("true")));
+        assert!(!moe_grouped_gpu_from_value(None));
+        assert!(!moe_grouped_gpu_from_value(Some("0")));
+        assert!(!moe_grouped_gpu_from_value(Some("off")));
+        assert!(!moe_grouped_gpu_from_value(Some("")));
+    }
+}
+
+// ===========================================================================
 // P17b: エンジン統合 (重み VRAM 常駐 + ピン留め/非同期パイプライン)
 // ===========================================================================
 //

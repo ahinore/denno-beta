@@ -4411,21 +4411,61 @@ fn moe_ffn_quant_batch_opts(
             sum_m as f32 / nonempty.max(1) as f32
         );
     }
-    if flat {
-        moe_experts_flat(
-            lw,
+    // 5.4 (P40): expert FFN を GPU の grouped GEMM にまとめる。
+    //      `DENNO_MOE_GROUPED_GPU=1` のときだけ入る (既定 off)。off のときは
+    //      この分岐に入らないので、従来の flat / legacy 経路は 1 バイトも変わらない。
+    //      false = GPU が引き受けなかった (env / CUDA / PTX / 形のどれかが欠けた)。
+    let mut experts_done = false;
+    if crate::model::moe_grouped_gpu::enabled() {
+        /// P40: `ExpertW` (mmap のスライス) を grouped GEMM の入力へ。
+        fn src<'a>(w: &'a ExpertW) -> crate::model::moe_grouped_gpu::ExpertSource<'a> {
+            crate::model::moe_grouped_gpu::ExpertSource {
+                blocks: w.blocks.as_slice(),
+                ty: w.ty,
+                n_in: w.n_in,
+                n_out: w.n_out,
+                n_expert: w.n_expert,
+            }
+        }
+        // 失敗したら CPU 経路へ落とす (この経路は実験的で、既定 off。
+        // ここで層を落とすと prefill 全体が落ちるため fail closed にする)。
+        match crate::model::moe_grouped_gpu::try_experts(
+            lw.il as u64,
+            src(&lw.gate_exps),
+            src(&lw.up_exps),
+            src(&lw.down_exps),
             &by_expert,
             &weights,
             k,
             xs,
+            nt,
             e,
             ff,
-            MOE_FLAT_ROWS,
             &mut out,
-            vnni,
-        )?;
-    } else {
-        moe_experts_legacy(lw, &by_expert, &weights, k, xs, e, ff, &mut out)?;
+        ) {
+            Ok(v) => experts_done = v,
+            Err(err) => {
+                eprintln!("[moe-grouped] 層 {}: 失敗 → CPU 経路へ: {err:#}", lw.il);
+            }
+        }
+    }
+    if !experts_done {
+        if flat {
+            moe_experts_flat(
+                lw,
+                &by_expert,
+                &weights,
+                k,
+                xs,
+                e,
+                ff,
+                MOE_FLAT_ROWS,
+                &mut out,
+                vnni,
+            )?;
+        } else {
+            moe_experts_legacy(lw, &by_expert, &weights, k, xs, e, ff, &mut out)?;
+        }
     }
 
     // 5. shared expert (バッチ)。係数は sigmoid(gate_inp_shexp @ x)
