@@ -474,6 +474,21 @@ function frame() {
 }
 
 // telemetry の口 (row 54/55 で接続)
+// RouterTopK: gate 重み付きの実ルーティング。LayerAct より細かい (重みが読める)。
+window.onRouting = function (layer, experts, weights) {
+  demo.on = false; live.ts = performance.now(); demo.cursor = layer;
+  const s = slabs[layer]; if (!s) return;
+  const sel = [];
+  for (let i = 0; i < experts.length && sel.length < TOPK; i++) {
+    const k = experts[i] | 0;
+    if (k < 0 || k >= EXPERTS) continue;
+    sel.push(k);
+    s.act[k] = Math.max(s.act[k], Math.min(1, (weights && weights[i]) || 0.5));
+  }
+  if (sel.length) { s.route = sel; promote(layer, sel); }
+  document.getElementById('mode').textContent = 'mode: live (telemetry)';
+};
+
 window.onLayerActivation = function (layer, idx, val) {
   demo.on = false; live.ts = performance.now(); live.act.set(layer, idx);
   demo.cursor = layer;
@@ -542,6 +557,9 @@ function handleFrame(f) {
       break;
     case 'RoleAct':
       window.onRoleActivation(f.layer, f.roles);
+      break;
+    case 'RouterTopK':
+      window.onRouting(f.layer, f.experts, f.weights);
       break;
     case 'ExpertResidency':
       window.onResidency(f.layer, f.vram);

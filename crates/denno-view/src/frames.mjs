@@ -29,13 +29,14 @@ export const KIND = Object.freeze({
   LAYER_ACT: 12,
   ROLE_ACT: 13,          // lib.rs: Frame::RoleAct
   EXPERT_RESIDENCY: 14,  // lib.rs: Frame::ExpertResidency
-  TIER_STATS: 15         // lib.rs: Frame::TierStats
+  TIER_STATS: 15,        // lib.rs: Frame::TierStats
+  ROUTER_TOPK: 16        // lib.rs: Frame::RouterTopK
 });
 
 const NAME_OF_KIND = Object.create(null);
 for (const [k, v] of Object.entries(KIND)) NAME_OF_KIND[v] = k;
 
-/** 役割 id → 名前。RoleAct の role バイトはこの並びの添字。 */
+/** 役割 id → 名前。RoleAct のペイロードはこの並びの f16 5 個 (role バイトは無い)。 */
 export const ROLE_NAMES = Object.freeze(['attn', 'gdn', 'router', 'shex', 'ple']);
 
 /** フレームが壊れていたときに投げる。`.decoded` = そこまでに読めたフレーム列。 */
@@ -256,6 +257,15 @@ function decodePayload(kind, r) {
       const idx = new Array(n);
       for (let i = 0; i < n; i++) idx[i] = r.u32();
       return { kind: 'ExpertResidency', layer, vram: idx };
+    }
+    case KIND.ROUTER_TOPK: {
+      const layer = rd.varint();
+      const n = rd.varint();
+      const experts = new Array(n);
+      for (let i = 0; i < n; i++) experts[i] = rd.varint();
+      const weights = new Array(n);
+      for (let i = 0; i < n; i++) weights[i] = rd.f16();
+      return { kind: 'RouterTopK', layer, experts, weights };
     }
     case KIND.TIER_STATS:
       // lib.rs の encode に合わせる: varint 4 個 (hit は載っていない)
