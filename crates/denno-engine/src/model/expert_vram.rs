@@ -29,6 +29,26 @@
 //! - 並行 decode では [`acquire`] が返す `Arc` を計算中は保持する。追い出しで
 //!   登録簿から外れても、使用中のバッファは最後の利用者が drop するまで残る
 //!   (したがって上限は並行時にわずかに超え得る)。
+//!
+//! # P43: 予算の共有 (prefill のパック済み重みと decode の LRU が同じ上限を見る)
+//!
+//! P39 の実測では `DENNO_EXPERT_VRAM_MB=18000` でも 10,372 MiB で
+//! `cuMemAlloc` が失敗し、CPU 固定のラッチが発火した。原因は prefill の
+//! grouped GEMM が層ごとに確保するパック済み重み (1 層 ≈ 1.5 GB) が
+//! **上限の外**で VRAM を食っていたこと。
+//!
+//! そこで LRU に「外部予約 (pinned)」を持たせ、`used + pinned <= cap` を
+//! 不変条件にする:
+//!
+//! - [`reserve_external`] は prefill 側 (LRU 管理外) の常駐を予算から借りる。
+//!   借りる前に LRU の古い expert を追い出す ([`VramLru::reserve_pinned`])。
+//!   返る [`ExternalReserve`] を drop すると予算へ返る。
+//! - decode の [`acquire`] は `pinned` を差し引いた残りにしか載せない
+//!   (入らなければ `Ok(None)` = CPU 経路。cuMemAlloc の失敗まで進まない)。
+//! - 予算が未初期化 (`DENNO_EXPERT_VRAM_MB` = 0 / 未設定) のときは
+//!   [`reserve_external`] が**会計なしの予約**を返すので、既定の挙動は不変。
+//! - 予算が埋まっているときに外部予約が入らない場合は `None` を返し、
+//!   呼び出し側 (prefill) は CPU 経路へ落ちる (fail closed)。
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -105,11 +125,16 @@ pub struct VramStats {
     pub evictions: u64,
     /// 1 本が上限より大きくて載せられなかった回数
     pub oversize: u64,
+    /// 外部予約 (prefill のパック済み重み) が予算に収まらなかった回数
+    pub pinned_oversize: u64,
     /// H2D したバイト数の累計
     pub upload_bytes: u64,
 }
 
 /// [`VramLru::make_room`] の失敗。上限より大きい 1 本は載せない (静かに切り詰めない)。
+///
+/// P43: `bytes` は**要求量**で、`pinned` (外部予約) と合わせて上限を超えた場合も
+/// 要求量をそのまま返す。呼び出し側は「上限を上げるしかない」と読めばよい。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LruError {
     TooBig { bytes: usize, cap: usize },
@@ -138,6 +163,8 @@ struct Slot<V> {
 pub struct VramLru<K, V> {
     cap_bytes: usize,
     used_bytes: usize,
+    /// LRU 管理外の常駐 (prefill のパック済み重み) が借りているバイト数
+    pinned_bytes: usize,
     clock: u64,
     entries: HashMap<K, Slot<V>>,
     stats: VramStats,
@@ -149,6 +176,7 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
         VramLru {
             cap_bytes,
             used_bytes: 0,
+            pinned_bytes: 0,
             clock: 0,
             entries: HashMap::new(),
             stats: VramStats::default(),
@@ -161,6 +189,16 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
 
     pub fn used_bytes(&self) -> usize {
         self.used_bytes
+    }
+
+    /// 外部予約 (LRU 管理外) が借りているバイト数。
+    pub fn pinned_bytes(&self) -> usize {
+        self.pinned_bytes
+    }
+
+    /// 予算の消費量 (`used + pinned`)。これが `cap_bytes` を超えない。
+    pub fn total_bytes(&self) -> usize {
+        self.used_bytes + self.pinned_bytes
     }
 
     pub fn len(&self) -> usize {
@@ -188,9 +226,10 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
     /// `bytes` を載せる余地を作る。追い出した `(key, value)` を返す
     /// (**呼び出し側がすぐ drop すれば VRAM が空く**)。
     ///
-    /// `bytes > cap` は [`LruError::TooBig`]。このときは 1 本も追い出さない。
+    /// `bytes + pinned > cap` は [`LruError::TooBig`]。このときは 1 本も追い出さない
+    /// (外部予約は LRU からは動かせないので、追い出しても入らない)。
     pub fn make_room(&mut self, bytes: usize) -> Result<Vec<(K, V)>, LruError> {
-        if bytes > self.cap_bytes {
+        if bytes + self.pinned_bytes > self.cap_bytes {
             self.stats.oversize += 1;
             return Err(LruError::TooBig {
                 bytes,
@@ -198,10 +237,10 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
             });
         }
         let mut evicted = Vec::new();
-        while self.used_bytes + bytes > self.cap_bytes {
+        while self.used_bytes + self.pinned_bytes + bytes > self.cap_bytes {
             let Some(victim) = self.oldest() else {
                 // entries が空なら used_bytes == 0 なので、ここには来ない
-                // (`bytes <= cap` が前提)。
+                // (`bytes + pinned <= cap` が前提)。
                 break;
             };
             if let Some(v) = self.remove(&victim) {
@@ -212,11 +251,47 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
         Ok(evicted)
     }
 
+    /// LRU 管理外の常駐 (prefill のパック済み重み) のために `bytes` を借りる (P43)。
+    ///
+    /// 予算 (`cap`) に収めるために、必要なら**最終使用が古い expert から追い出す**。
+    /// 追い出した `(key, value)` を返す (呼び出し側がすぐ drop すれば VRAM が空く)。
+    /// 成功すると `pinned_bytes` が `bytes` 増える ([`VramLru::release_pinned`] で返す)。
+    ///
+    /// `bytes + pinned > cap` は [`LruError::TooBig`] (このときは 1 本も追い出さない
+    /// うえで `pinned_bytes` も増やさない)。
+    pub fn reserve_pinned(&mut self, bytes: usize) -> Result<Vec<(K, V)>, LruError> {
+        if bytes + self.pinned_bytes > self.cap_bytes {
+            self.stats.pinned_oversize += 1;
+            return Err(LruError::TooBig {
+                bytes,
+                cap: self.cap_bytes,
+            });
+        }
+        let mut evicted = Vec::new();
+        while self.used_bytes + self.pinned_bytes + bytes > self.cap_bytes {
+            let Some(victim) = self.oldest() else {
+                break;
+            };
+            if let Some(v) = self.remove(&victim) {
+                evicted.push((victim, v));
+            }
+        }
+        self.stats.evictions += evicted.len() as u64;
+        self.pinned_bytes += bytes;
+        Ok(evicted)
+    }
+
+    /// 外部予約を予算へ返す。借りた量より多く返しても `pinned_bytes` は 0 で止まる
+    /// (二重返却で予算が増えない)。
+    pub fn release_pinned(&mut self, bytes: usize) {
+        self.pinned_bytes = self.pinned_bytes.saturating_sub(bytes);
+    }
+
     /// [`VramLru::make_room`] の後で載せる。同じ key が既にあれば置き換える
     /// (同じ expert を二重に持たない)。
     pub fn insert(&mut self, key: K, bytes: usize, value: V) {
         debug_assert!(
-            self.used_bytes + bytes <= self.cap_bytes,
+            self.used_bytes + self.pinned_bytes + bytes <= self.cap_bytes,
             "make_room を通さずに上限を超えて insert した"
         );
         self.remove(&key);
@@ -259,6 +334,85 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
         let mut v: Vec<(K, u64)> = self.entries.iter().map(|(k, s)| (*k, s.last_use)).collect();
         v.sort_by_key(|(_, t)| *t);
         v.into_iter().map(|(k, _)| k).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P43: 予算の外部予約 (prefill のパック済み重みなど、LRU 管理外の常駐)
+// ---------------------------------------------------------------------------
+
+/// 予算から借りた「LRU 管理外の常駐」1 本。**drop すると予算へ返る**。
+///
+/// `is_guarded() == false` は「予算が未初期化 (会計なし)」で、返しても何も起きない
+/// (既定経路の挙動を変えないための区別)。
+pub struct ExternalReserve {
+    bytes: usize,
+    guarded: bool,
+}
+
+impl ExternalReserve {
+    /// 借りたバイト数。
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// 予算に計上されているか (false = 予算未初期化で素通し)。
+    pub fn is_guarded(&self) -> bool {
+        self.guarded
+    }
+}
+
+impl Drop for ExternalReserve {
+    fn drop(&mut self) {
+        if self.guarded {
+            release_external(self.bytes);
+        }
+    }
+}
+
+/// 予算から `bytes` を外部予約する (P43)。
+///
+/// 戻り値:
+/// - `Some(r)` — 予約できた (`r.is_guarded()` が false なら会計なし = 予算未初期化)。
+/// - `None` — 予算が埋まっていて入らない。呼び出し側は CPU 経路へ (fail closed)。
+///
+/// 予算が初期化済みなら、入れるために LRU の古い expert を追い出す。
+pub fn reserve_external(bytes: usize) -> Option<ExternalReserve> {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::reserve_external(bytes)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        // cuda feature 無しでは VRAM 経路そのものが動かない (予算も未初期化)。
+        Some(ExternalReserve {
+            bytes,
+            guarded: false,
+        })
+    }
+}
+
+/// [`ExternalReserve`] を予算へ返す (`ExternalReserve::drop` から呼ばれる)。
+pub fn release_external(bytes: usize) {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::release_pinned(bytes);
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = bytes;
+    }
+}
+
+/// 予算の消費量 `(LRU 使用中, 外部予約, 上限)`。未初期化なら `None`。
+pub fn budget_usage() -> Option<(usize, usize, usize)> {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::budget_usage()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        None
     }
 }
 
@@ -323,6 +477,14 @@ mod gpu {
             self.shapes
         }
 
+        /// 行列 `m` の重みのデバイスアドレス (P43: 層一括 GEMV のポインタ表に載せる)。
+        ///
+        /// 1 本の `DevBuffer` の先頭そのもの。呼び出し側は**計算が終わるまで
+        /// `Arc<ExpertDev>` を保持する**こと (保持している間は追い出されても実体が残る)。
+        pub fn ptr(&self, m: ExpertMatrix) -> u64 {
+            self.bufs[m.index()].ptr()
+        }
+
         /// 行列 `m` の GEMV。`x` は行列の入力長、`out` は出力長でなければならない
         /// (検査は `cuda::moe_gemv_dev_buf` が行う)。
         ///
@@ -363,6 +525,58 @@ mod gpu {
         let c = CACHE.get()?;
         let g = c.lock().ok()?;
         Some((g.used_bytes(), g.cap_bytes()))
+    }
+
+    /// (LRU 使用中バイト, 外部予約バイト, 上限バイト)。未初期化なら `None`。
+    pub fn budget_usage() -> Option<(usize, usize, usize)> {
+        let c = CACHE.get()?;
+        let g = c.lock().ok()?;
+        Some((g.used_bytes(), g.pinned_bytes(), g.cap_bytes()))
+    }
+
+    /// P43: LRU 管理外の常駐 (prefill のパック済み重み) を予算から借りる。
+    ///
+    /// - 予算が未初期化 (`DENNO_EXPERT_VRAM_MB` = 0) → 会計なしの予約
+    ///   (`is_guarded() == false`)。既定の挙動を変えない。
+    /// - 予算が埋まっていて LRU を全部追い出しても入らない → `None` (CPU へ)。
+    /// - `ALLOC_DEAD` (確保失敗で CPU 固定) の間は `None`。
+    pub fn reserve_external(bytes: usize) -> Option<ExternalReserve> {
+        let Some(cache) = CACHE.get() else {
+            return Some(ExternalReserve {
+                bytes,
+                guarded: false,
+            });
+        };
+        if ALLOC_DEAD.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut g = match cache.lock() {
+            Ok(g) => g,
+            // ロックが壊れている = 実装の誤り。会計を諦めて素通しする
+            // (ここで落とすと prefill が丸ごと CPU になる)。
+            Err(_) => {
+                return Some(ExternalReserve {
+                    bytes,
+                    guarded: false,
+                })
+            }
+        };
+        let evicted = g.reserve_pinned(bytes).ok()?;
+        drop(evicted); // ここで DevBuffer が落ちて VRAM が空く
+        Some(ExternalReserve {
+            bytes,
+            guarded: true,
+        })
+    }
+
+    /// P43: 外部予約を予算へ返す (`ExternalReserve::drop` から)。
+    pub fn release_pinned(bytes: usize) {
+        let Some(cache) = CACHE.get() else {
+            return;
+        };
+        if let Ok(mut g) = cache.lock() {
+            g.release_pinned(bytes);
+        }
     }
 
     /// 上限超過・未対応・確保失敗で CPU へ落ちた回数 (診断用)。
@@ -673,5 +887,95 @@ mod tests {
         assert!(!flag_on(Some("")));
         assert!(!flag_on(Some("0")));
         assert!(!flag_on(Some("TRUE")));
+    }
+
+    // -----------------------------------------------------------------------
+    // P43: 予算の共有 (外部予約 = prefill のパック済み重み)
+    // -----------------------------------------------------------------------
+
+    /// 外部予約は「LRU の古い expert を追い出して」予算に収まる。
+    #[test]
+    fn pinned_reservation_evicts_lru_first() {
+        let mut c: VramLru<u8, &'static str> = VramLru::new(1000);
+        for i in 0..4u8 {
+            c.make_room(250).unwrap();
+            c.insert(i, 250, "e");
+        }
+        assert_eq!(c.used_bytes(), 1000);
+        assert_eq!(c.pinned_bytes(), 0);
+
+        // 予算は 1000 なので 400 を借りるには 400 ぶん追い出す (2 本)。
+        let ev = c.reserve_pinned(400).unwrap();
+        assert_eq!(ev.len(), 2, "最終使用が古い 0 と 1 を追い出す");
+        assert_eq!(c.pinned_bytes(), 400);
+        assert_eq!(c.used_bytes(), 500);
+        assert_eq!(c.total_bytes(), 900, "上限は超えない");
+        assert_eq!(c.lru_keys(), vec![2, 3]);
+        assert_eq!(c.stats().evictions, 2);
+    }
+
+    /// 外部予約が載っている間は、残りにしか expert を載せない (入らなければ追い出す)。
+    #[test]
+    fn pinned_limits_expert_loads() {
+        let mut c: VramLru<u8, &'static str> = VramLru::new(1000);
+        c.reserve_pinned(800).unwrap();
+        assert!(c.make_room(200).is_ok(), "残り 200 は載る");
+        c.insert(1, 200, "a");
+        // 1000 - 800 = 200 しか空きが無いので、1 バイト載せるには expert 1 を
+        // 追い出す (外部予約は LRU から追い出せない)。
+        let ev = c.make_room(1).unwrap();
+        assert_eq!(ev.len(), 1, "残りに収めるために expert を追い出す");
+        assert_eq!(ev[0].0, 1);
+        assert_eq!(c.used_bytes(), 0);
+        // 残り (200) より大きい要求は、追い出しても入らないので届かない。
+        c.make_room(200).unwrap();
+        c.insert(2, 200, "b");
+        let err = c.make_room(201).unwrap_err();
+        assert_eq!(err, LruError::TooBig { bytes: 201, cap: 1000 });
+        assert_eq!(c.len(), 1, "追い出しても入らないので何もしない");
+        assert_eq!(c.pinned_bytes(), 800);
+        assert_eq!(c.stats().oversize, 1);
+    }
+
+    /// 予約を返すと、その分だけ expert が載るようになる。
+    #[test]
+    fn release_pinned_returns_room() {
+        let mut c: VramLru<u8, &'static str> = VramLru::new(1000);
+        c.reserve_pinned(900).unwrap();
+        assert_eq!(c.make_room(200).unwrap_err(), LruError::TooBig { bytes: 200, cap: 1000 });
+        c.release_pinned(900);
+        assert_eq!(c.pinned_bytes(), 0);
+        c.make_room(900).unwrap();
+        c.insert(1, 900, "a");
+        assert_eq!(c.total_bytes(), 900);
+        // 借りた量より多く返しても 0 で止まる。
+        c.release_pinned(12345);
+        assert_eq!(c.pinned_bytes(), 0);
+    }
+
+    /// 上限より大きい外部予約は断る。このとき既存のエントリを巻き込まない。
+    #[test]
+    fn pinned_rejects_oversize_without_evicting() {
+        let mut c: VramLru<u8, &'static str> = VramLru::new(100);
+        c.make_room(60).unwrap();
+        c.insert(1, 60, "a");
+        let err = c.reserve_pinned(101).unwrap_err();
+        assert_eq!(err, LruError::TooBig { bytes: 101, cap: 100 });
+        assert_eq!(c.len(), 1, "追い出してはいけない");
+        assert_eq!(c.pinned_bytes(), 0, "予約も増やさない");
+        assert_eq!(c.stats().pinned_oversize, 1);
+        assert_eq!(c.stats().evictions, 0);
+    }
+
+    /// 予算が未初期化 (cuda feature 無し / `DENNO_EXPERT_VRAM_MB` = 0) のときの
+    /// [`reserve_external`] は会計なしで素通しする = 既定の挙動が変わらない。
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn external_reserve_without_budget_is_unguarded() {
+        let r = reserve_external(3_000_000).expect("予算が無いときは必ず借りられる");
+        assert!(!r.is_guarded(), "会計なし (予算未初期化)");
+        assert_eq!(r.bytes(), 3_000_000);
+        assert_eq!(budget_usage(), None, "予算そのものが無い");
+        drop(r); // 何も起きない (パニックしないこと)
     }
 }
