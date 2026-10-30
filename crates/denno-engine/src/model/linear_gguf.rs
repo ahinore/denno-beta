@@ -71,23 +71,24 @@ pub(crate) fn set_cpu_gemv_par_for_test(v: Option<bool>) {
     }, Ordering::Relaxed);
 }
 
-/// task 69: `DENNO_ROUTER_GPU` の値の解釈 (純関数)。**既定 on**。
+/// task 69: `DENNO_ROUTER_GPU` の値の解釈 (純関数)。**既定 off**。
 ///
 /// ルータ (`ffn_gate_inp`, f32 512x2560) だけを GPU (`dno_matvec_f32`) で回す。
 /// このカーネルは 1 行 = 1 ブロックで `s = fadd_rn(s, fmul_rn(x[d], w[d]))` を
 /// d の昇順に繰り返す (PTX に `fma.rn` も `.ftz` も無い) ので、CPU 側の
 /// `acc += row[i] * x[i]` (i 昇順・積と加算を別々に丸める) と**ビット一致**する。
-/// 一致が崩れたときのために `DENNO_ROUTER_GPU=0/off/false/no` で必ず CPU へ戻せる。
 ///
-/// env を読む部分から切り離してあるのは、テストが環境変数を触らずに両方の分岐を
-/// 確かめられるようにするため (`cpu_gemv_par_from_value` と同じ流儀)。
+/// ただし main の実測 (2026-10-31 03:00 JST、v3 rows=8 の decode 118 tok、3 ラン平均) では
+/// **遅くなる**: off 121.7 ms/token (17.82/18.15/18.04 s) -> on 124.5 (18.18/18.35/18.39)。
+/// 1 token あたり 48 回の同期が支配的で、CPU 16.6 ms/token の削減分を食い潰す。
+/// 既定を on に戻すときは、まず同期を減らす (層をまたいでまとめる) こと。
 fn router_gpu_from_value(v: Option<&str>) -> bool {
     match v {
-        Some(s) => !matches!(
+        Some(s) => matches!(
             s.trim().to_ascii_lowercase().as_str(),
-            "0" | "off" | "false" | "no"
+            "1" | "on" | "true" | "yes"
         ),
-        None => true,
+        None => false,
     }
 }
 
@@ -753,18 +754,18 @@ mod tests {
     #[test]
     fn router_gpu_gate_defaults() {
         for v in [
-            None,
             Some("1"),
             Some("on"),
             Some("ON"),
             Some("true"),
             Some("TRUE"),
             Some(" on "),
-            Some(""),
         ] {
             assert!(router_gpu_from_value(v), "value={v:?} は on のはず");
         }
         for v in [
+            None,
+            Some(""),
             Some("0"),
             Some("off"),
             Some("false"),
