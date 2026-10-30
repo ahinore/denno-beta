@@ -2684,16 +2684,25 @@ impl Drop for VnniGateGuard {
     }
 }
 
-/// テスト用: ゲートを触るテストを直列化する (プロセス全体の状態なので)。
+/// テスト用: MoE の forward と VNNI のゲートを直列化する共有ロック。
 ///
-/// `moe_expert` と `qwen4exp` の両方のテストがこれを通すこと。
+/// ゲートはプロセス全体の状態なので、**ゲートを開くテストは forward を回すテストと
+/// 同じミューテックスを取る**必要がある (取らないと、par/seq のビット一致を
+/// 前後 2 回の呼び出しで見ているテストの間にゲートが開いて落ちる)。
+/// `qwen4exp` 側の `moe_test_guard` もここを指す。
 #[cfg(test)]
-pub(crate) fn gemv_vnni_test_guard() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn moe_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
     match L.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     }
+}
+
+/// テスト用: ゲートを触るテストの直列化 ([`moe_test_lock`] と同じミューテックス)。
+#[cfg(test)]
+pub(crate) fn gemv_vnni_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    moe_test_lock()
 }
 
 /// テスト用: M=1 VNNI カーネルが発火した回数 (プロセス全体)。

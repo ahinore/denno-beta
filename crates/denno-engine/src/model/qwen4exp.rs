@@ -6203,7 +6203,8 @@ mod tests {
     static MOE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn moe_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        MOE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        // VNNI のゲートを開くテスト (moe_expert 側) と同じミューテックス。
+        moe_expert::moe_test_lock()
     }
 
     /// 合成 GGUF のデータ部アラインメント (`gguf.rs` の既定と同じ)。
@@ -6542,8 +6543,6 @@ mod tests {
     #[test]
     fn moe_ffn_quant_cpu_route_uses_vnni_when_enabled() {
         let _g = moe_test_guard();
-        // ゲートはプロセス全体の状態なので、`moe_expert` 側のテストとも直列化する。
-        let _vg = moe_expert::gemv_vnni_test_guard();
         if !moe_expert::vnni_supported() {
             eprintln!("skip moe_ffn_quant_cpu_route_uses_vnni_when_enabled: avx512vnni が無い");
             return;
