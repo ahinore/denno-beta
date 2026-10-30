@@ -111,7 +111,34 @@ impl GgufLinear {
     }
 
     /// `out[r] = dot(row_r, x)`。`x.len() == k`、`out.len() == n` が必要。
+    ///
+    /// プロファイラ上の行名は既定で `"gemv"` (op 名を付けたいときは
+    /// [`Self::gemv_label`])。
     pub fn gemv(&self, x: &[f32], out: &mut [f32]) -> Result<()> {
+        self.gemv_label("gemv", x, out)
+    }
+
+    /// [`Self::gemv`] の op 名付き入口。
+    ///
+    /// `label` は device プロファイラ (`DENNO_DEV_PROFILE=1`) の行名にだけ使う。
+    /// 数値経路には影響しない (文字列を渡すだけで、カーネル・引数・丸め順は
+    /// 同一)。off のときは `devprof::on()` の atomic load 1 回で従来と同じ経路。
+    pub fn gemv_label(&self, label: &'static str, x: &[f32], out: &mut [f32]) -> Result<()> {
+        use crate::model::devprof;
+        if !devprof::on() {
+            return self.gemv_impl(x, out);
+        }
+        let t = std::time::Instant::now();
+        devprof::clear();
+        let r = self.gemv_impl(x, out);
+        let ns = t.elapsed().as_nanos() as u64;
+        let (up, down, sync_ns) = devprof::take_pending();
+        devprof::add(label, ns, up, down, sync_ns);
+        r
+    }
+
+    /// 本体。[`Self::gemv_label`] が時間と転送量を測るために外側から包む。
+    fn gemv_impl(&self, x: &[f32], out: &mut [f32]) -> Result<()> {
         if x.len() != self.k {
             bail!("GgufLinear::gemv: x の長さ {} が k={} と違う", x.len(), self.k);
         }

@@ -317,6 +317,15 @@ pub fn note_weight_upload_bytes(bytes: u64) {
     UPLOADED_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
+/// VRAM へ上がった重みの累計バイト数 (ロックを取らない軽い版)。
+///
+/// [`weight_upload_stats`] は診断用の文字列 2 つを掴むために Mutex を 2 回
+/// 取るので、1 呼び出しごとに差分を取る用途 (device プロファイラ) では
+/// こちらの方が安い。意味は `weight_upload_stats().uploaded_bytes` と同じ。
+pub fn weight_upload_bytes() -> u64 {
+    UPLOADED_BYTES.load(Ordering::Relaxed)
+}
+
 /// レジストリの常駐量 (本数 / バイト数) を**絶対値**で書く。
 ///
 /// 登録・退避のたびに cuda.rs が現在値を渡す (`reset` では戻さない =

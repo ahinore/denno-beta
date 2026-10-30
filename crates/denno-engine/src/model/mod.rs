@@ -1,5 +1,6 @@
 //! モデルファミリー抽象とディスパッチ
 
+pub mod devprof;
 pub mod expert_batch;
 pub mod expert_cache;
 pub mod expert_vram;

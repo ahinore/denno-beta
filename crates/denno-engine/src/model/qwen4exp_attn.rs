@@ -507,19 +507,19 @@ impl AttnLayer {
     /// `attn_q` の投影 (q と gate が交互に並ぶ)。
     pub fn project_q_gate(&self, cur: &[f32]) -> Result<Vec<f32>> {
         let mut out = vec![0f32; self.qg_dim()];
-        self.wq.gemv(cur, &mut out)?;
+        self.wq.gemv_label("qkv", cur, &mut out)?;
         Ok(out)
     }
     /// `attn_k` の投影
     pub fn project_k(&self, cur: &[f32]) -> Result<Vec<f32>> {
         let mut out = vec![0f32; self.kv_dim()];
-        self.wk.gemv(cur, &mut out)?;
+        self.wk.gemv_label("qkv", cur, &mut out)?;
         Ok(out)
     }
     /// `attn_v` の投影
     pub fn project_v(&self, cur: &[f32]) -> Result<Vec<f32>> {
         let mut out = vec![0f32; self.kv_dim()];
-        self.wv.gemv(cur, &mut out)?;
+        self.wv.gemv_label("qkv", cur, &mut out)?;
         Ok(out)
     }
 
@@ -994,7 +994,7 @@ impl AttnLayer {
     /// `attn_output` の投影 (`n_head * head_dim` → `n_embd`)。
     pub fn project_out(&self, x: &[f32]) -> Result<Vec<f32>> {
         let mut out = vec![0f32; self.n_embd];
-        self.wo.gemv(x, &mut out)?;
+        self.wo.gemv_label("attn_out", x, &mut out)?;
         Ok(out)
     }
 
