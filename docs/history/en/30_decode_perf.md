@@ -1035,3 +1035,27 @@ entries in the body; the numbers are taken from the body and from the records in
 - Measured value: **302 → 313 ms** (there is no record of what this total covers).
 - Why we dropped it: it got worse. The material gives no breakdown of the regression.
 - Record: no commit.
+### P57: splitting Flash-Next decode by in-layer phase (2026-10-30, commit `8c981776d`)
+
+`DENNO_Q4_PROFILE=1` is now readable from the real serve path (`q4prof` and `moe_sub_take`).
+One line is printed at the end of prefill and at the end of decode, then the counters reset.
+The measurement points sit at layer boundaries only; nothing inside the GEMV loops is timed.
+When the variable is unset the cost is one branch and the numeric path is unchanged.
+
+- Conditions: real UD-Q4_K_XL weights, one request of **49 in + 128 out** (temp 0), third of three
+  identical runs, 48 layers x 128 tokens = 6,144 layer executions.
+- Measured (one decode token, total **193.9 ms**): selected experts **71.9 (37.1%)**, mix 31.8 (16.4%),
+  router 17.0 (8.8%), shared expert 10.9 (5.6%), attention 62.2 (32.1%).
+- Inside attention: gate 14.4, other (conv and gated norm) 16.1, qkv 11.9, gdn 10.6, out 9.1 ms.
+- Per layer, per token: prefill 0.61 ms (mix 0.112, attn 0.159, moe 0.341) against decode 4.04 ms
+  (0.663, 1.295, 2.081) — **6.6x**.
+- Prefill has the same shape: of 29.4 ms/token at 566 in, selected experts take 13.6 (46.1%),
+  mix 5.4 (18.3%) and full attention 2.6 (8.9%).
+- Reading: the largest decode item is the selected experts, which run on the CPU (37%). Moving them
+  into VRAM (`DENNO_GPU_WEIGHT_MB=8000`, `DENNO_EXPERT_VRAM_MB=16000`, zero allocation failures) left
+  decode at 233-247 ms/token in the same-day A/B. **Expert placement is not the bottleneck.** The next
+  suspect is the decode GEMV itself: 4.04 ms per layer at batch 1.
+- Record: `8c981776d` (instrumentation only).
+
+![Flash-Next decode by in-layer phase](img/p57_decode_breakdown.png)
+

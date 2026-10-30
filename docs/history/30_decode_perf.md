@@ -1012,3 +1012,26 @@ expert の読みが毎回ディスクへ落ちる。ここを (G1) 明示的な�
 - 実測値: **302 → 313 ms** (何の合計かの記録は無い)。
 - なぜ捨てたか: 悪化。悪化の内訳は素材に無い。
 - 記録: commit なし。
+### P57: Flash-Next の decode を層内フェーズで割る (2026-10-30, commit `8c981776d`)
+
+`DENNO_Q4_PROFILE=1` を serve の実経路から読めるようにした (`q4prof` と `moe_sub_take`)。
+リクエストの prefill 終端と decode 終端で 1 行ずつ出して 0 に戻す。計測点は層の区切りだけで、
+GEMV の内側には入っていない。未設定なら分岐 1 回で no-op、数値経路は不変。
+
+- 測定条件: 実モデル UD-Q4_K_XL、1 リクエスト **49 in + 128 out** (temp 0)、同条件 3 本のうち 3 本目。
+  48 層 × 128 トークン = 6,144 層実行。
+- 実測 (decode 1 トークン、合計 **193.9 ms**): 選択 expert **71.9 (37.1%)** / mix 31.8 (16.4%)
+  / router 17.0 (8.8%) / shared expert 10.9 (5.6%) / attention 62.2 (32.1%)。
+- attention の内訳: gate 14.4 / その他 (conv・gated norm 等) 16.1 / qkv 11.9 / gdn 10.6 / out 9.1 ms。
+- 層あたり (1 層 1 トークン): prefill 0.61 ms (mix 0.112 / attn 0.159 / moe 0.341) に対し
+  decode 4.04 ms (0.663 / 1.295 / 2.081)。**6.6 倍**。
+- prefill も同じ費目構成で、566 in の 29.4 ms/token のうち選択 expert が 13.6 (46.1%)、mix 5.4 (18.3%)、
+  full attention 2.6 (8.9%)。
+- 読み: decode の最大項は CPU に落ちている選択 expert (37%)。ただし
+  `DENNO_GPU_WEIGHT_MB=8000` / `DENNO_EXPERT_VRAM_MB=16000` で expert を VRAM に載せても decode は
+  233〜247 ms/token で変わらなかった (同日の A/B、確保失敗 0 件)。**expert の置き場所は律速ではない**。
+  次に疑うのは decode の GEMV そのもの (batch 1 で 1 層 4.04 ms)。
+- 記録: `8c981776d` (計測の配線のみ)。
+
+![Flash-Next decode の位相別内訳](img/p57_decode_breakdown.png)
+
