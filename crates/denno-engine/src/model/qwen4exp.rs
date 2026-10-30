@@ -1729,6 +1729,32 @@ impl ExpertW {
         moe_expert::expert_gemv_any_seq(self.ty, s, n_in, n_out, x, out)
             .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))
     }
+
+    /// [`ExpertW::gemv_seq`] の**行範囲**版 (P70)。
+    ///
+    /// 1 expert のうち行 `[r0, r1)` だけを計算する。行は独立なので、チャンクに
+    /// 切っても各要素の積和順は変わらず [`ExpertW::gemv_seq`] と**ビット一致**する。
+    /// decode の expert 寄与を expert 横断で平坦化するときに使う
+    /// (`DENNO_EXPERT_FLAT_DECODE`)。VNNI のゲートは [`ExpertW::gemv_seq`] と同じ。
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_rows_seq(
+        &self,
+        e: usize,
+        r0: usize,
+        r1: usize,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        let s = self.slice(e)?;
+        let (n_in, n_out) = (self.n_in, self.n_out);
+        if moe_expert::expert_gemv_any_vnni_rows(self.ty, s, n_in, n_out, r0, r1, x, out)
+            .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))?
+        {
+            return Ok(());
+        }
+        moe_expert::expert_gemv_any_rows(self.ty, s, n_in, n_out, r0, r1, x, out)
+            .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))
+    }
 }
 
 /// PLE 層 1 つぶんの重み。
@@ -3820,6 +3846,37 @@ fn expert_loop_from_value(v: Option<&str>) -> bool {
     )
 }
 
+/// P70: decode の expert 寄与を **expert 横断の行タスク**に平坦化する新経路の
+/// ゲート (`DENNO_EXPERT_FLAT_DECODE`, 既定 off)。プロセスで 1 回だけ読む。
+///
+/// off のときの経路は従来と同一 ([`expert_contribs_par_into`] = expert 1 本を
+/// 1 タスクとして並列化)。on のときは「expert × 行列 × 行チャンク」を 1 本の
+/// タスク列にして 2 位相 (gate+up → down) で回す。
+fn expert_flat_decode_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on =
+            expert_flat_decode_from_value(std::env::var("DENNO_EXPERT_FLAT_DECODE").ok().as_deref());
+        if on {
+            // 1 回だけ出す (毎層の eprintln は decode の邪魔になる)。
+            eprintln!(
+                "[flash] expert flat decode: ON (expert 横断の行タスク / \
+                 DENNO_EXPERT_FLAT_DECODE)"
+            );
+        }
+        on
+    })
+}
+
+/// `DENNO_EXPERT_FLAT_DECODE` の値解釈 (純粋関数)。**既定は off**。
+/// `1` / `on` / `ON` / `true` のときだけ on (`DENNO_EXPERT_LOOP` と同じ規則)。
+fn expert_flat_decode_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim),
+        Some("1") | Some("on") | Some("ON") | Some("true")
+    )
+}
+
 /// task 67: 選択 expert の mmap 先読み (`MADV_WILLNEED`) の on/off
 /// (`DENNO_EXPERT_PREFETCH`)。**既定 off** (task 67 の実測で on が遅かった)。
 ///
@@ -4033,9 +4090,41 @@ fn moe_ffn_quant_full_opts(
     cache: Option<&ExpertCacheSet>,
     par: bool,
     route: Route,
+    roles: Option<&mut RoleRms>,
+    emit_router: bool,
+    loop_on: bool,
+) -> Result<Vec<f32>> {
+    moe_ffn_quant_impl(
+        p,
+        lw,
+        x,
+        cache,
+        par,
+        route,
+        roles,
+        emit_router,
+        loop_on,
+        expert_flat_decode_enabled(),
+    )
+}
+
+/// [`moe_ffn_quant_full_opts`] の本体。`flat_decode` は P70 の expert 横断平坦化
+/// (env を読まずにテストから選べるように引数で受ける)。
+///
+/// **`flat_decode == false` のときの経路は従来と同一** (下の `if flat_new` が
+/// 丸ごと飛ばされるだけで、`else if parallel` 以降の文は 1 行も変えていない)。
+#[allow(clippy::too_many_arguments)]
+fn moe_ffn_quant_impl(
+    p: &Qwen4ExpParams,
+    lw: &LayerW,
+    x: &[f32],
+    cache: Option<&ExpertCacheSet>,
+    par: bool,
+    route: Route,
     mut roles: Option<&mut RoleRms>,
     emit_router: bool,
     loop_on: bool,
+    flat_decode: bool,
 ) -> Result<Vec<f32>> {
     let t_router = std::time::Instant::now();
     let e = p.n_embd;
@@ -4138,6 +4227,16 @@ fn moe_ffn_quant_full_opts(
         false
     };
 
+    // P70: expert 寄与の expert 横断平坦化。**mmap 経路だけ**に使う (キャッシュ経路は
+    // expert 単位の pread が前提で、行チャンクに切ると同じ expert を何度も読む)。
+    #[cfg(feature = "par")]
+    let flat_new = flat_decode && !use_gpu && cache.is_none();
+    #[cfg(not(feature = "par"))]
+    let flat_new = {
+        let _ = flat_decode;
+        false
+    };
+
     moe_sub_add(0, t_router.elapsed());
     let t_experts = std::time::Instant::now();
 
@@ -4158,10 +4257,20 @@ fn moe_ffn_quant_full_opts(
     } else if parallel {
         #[cfg(feature = "par")]
         {
-            // task 67: 作業域を使い回す経路 (既定) と、従来の「expert ごとに
-            // `vec!` を確保する」経路。足し込みはどちらも index 昇順の逐次なので
-            // 出力はビット一致する (`DENNO_EXPERT_SCRATCH=0` で従来経路)。
-            if expert_scratch_enabled() {
+            // P70: expert 寄与を expert 横断の行タスクに平坦化する経路 (既定 off)。
+            // 足し込みは下の 2 経路と同一の「index 昇順の逐次」なので、
+            // 行分割の有無・タスクの割り当てに依らず出力はビット一致する。
+            if flat_new {
+                let mut hs = vec![0.0f32; sel.len() * e];
+                expert_contribs_flat_decode_into(lw, &sel, x, e, ff, &mut hs, DECODE_FLAT_ROWS)?;
+                for (t, _) in sel.iter().enumerate() {
+                    let pe = weights[t];
+                    let hh = &hs[t * e..(t + 1) * e];
+                    for j in 0..e {
+                        out[j] += pe * hh[j];
+                    }
+                }
+            } else if expert_scratch_enabled() {
                 let mut hs = vec![0.0f32; sel.len() * e];
                 expert_contribs_par_into(lw, &sel, x, e, ff, cache, &mut hs)?;
                 for (t, _) in sel.iter().enumerate() {
@@ -6288,6 +6397,18 @@ pub(crate) static PAR_CONTRIB_REGIONS: std::sync::atomic::AtomicUsize =
 pub(crate) static EXPERT_LOOP_REGIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// テスト用: P70 の平坦化経路 ([`expert_contribs_flat_decode_into`]) が
+/// **層 1 回ぶんの計算**を回した回数 (層 1 回 = 1)。
+#[cfg(test)]
+pub(crate) static FLAT_DECODE_REGIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// テスト用: 平坦化経路が積んだ**行タスク**の本数
+/// (`expert × 行列 × 行チャンク`。実形 10 expert / 64 行なら 600/層)。
+#[cfg(test)]
+pub(crate) static FLAT_DECODE_TASKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// 選択 expert の寄与 `h_e` (長さ `e = n_embd`) を rayon で並列に計算する (P-MOE-G5)。
 ///
 /// 返り値の `hs[t]` は `sel[t]` の寄与で、**足し込みは呼び出し側が index 昇順に
@@ -6487,6 +6608,162 @@ fn expert_contribs_par_into(
             })
         })
 }
+
+/// 1 層ぶんの expert 寄与を **expert 横断の行タスク**に平坦化して計算する
+/// (P70, `DENNO_EXPERT_FLAT_DECODE`)。結果は `hs[t * e + j]` に書く
+/// (`hs` は `sel.len() * e` 要素)。
+///
+/// # なぜ平坦化するか
+///
+/// 従来の [`expert_contribs_par_into`] は **1 expert = 1 タスク**で、10 expert を
+/// スレッド数 (8〜16) で割ると端数が出る (10/16 = 1 巡 + 6 スレッド遊び)。
+/// ここでは「expert × 行列 × 行チャンク」を 1 本のタスク列にするので、
+/// 重みの読み出しが全スレッドに均等に割り当たる。位相は 2 つ:
+///
+/// 1. gate / up の全行 (入力はどちらも `x`)
+/// 2. down の全行 (入力は `silu(gate) * up`)
+///
+/// down は自分の expert の `act` 全要素を要るので、位相をまたぐバリアが 1 本要る。
+///
+/// # ビット一致の根拠
+///
+/// 1 行の計算は [`ExpertW::gemv_rows_seq`] が [`ExpertW::gemv_seq`] と同じ行
+/// カーネルを同じ行順で通す (行は独立で、行チャンクの境界は各要素の積和に
+/// 影響しない)。`silu` と `act *= up` も従来と同じ式・同じ順で、足し込みは
+/// 呼び出し側が index 昇順に逐次行う。
+#[cfg(feature = "par")]
+fn expert_contribs_flat_decode_into(
+    lw: &LayerW,
+    sel: &[usize],
+    x: &[f32],
+    e: usize,
+    ff: usize,
+    hs: &mut [f32],
+    rows: usize,
+) -> Result<()> {
+    use rayon::prelude::*;
+    if rows == 0 {
+        return Err(one("expert 平坦化: 行チャンク幅が 0".to_string()));
+    }
+    if hs.len() != sel.len() * e {
+        return Err(one(format!(
+            "expert 平坦化: hs の長さ {} が sel.len() * e = {} と違う",
+            hs.len(),
+            sel.len() * e
+        )));
+    }
+    #[cfg(test)]
+    FLAT_DECODE_REGIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // gate / up の中間結果を 1 本ずつ確保する (sel.len() * ff 要素。実形で 25 KB)。
+    let mut act = vec![0.0f32; sel.len() * ff];
+    let mut up = vec![0.0f32; sel.len() * ff];
+
+    /// 1 タスク = 1 行チャンク。`mat` は 0 = gate / 1 = up。
+    struct Job<'a> {
+        ei: usize,
+        r0: usize,
+        r1: usize,
+        out: &'a mut [f32],
+        mat: u8,
+    }
+
+    // 位相 1: gate と up の行を 1 本のタスク列にする (出力は act / up)。
+    let mut jobs: Vec<Job> = Vec::new();
+    {
+        let mut ar: &mut [f32] = &mut act;
+        let mut ur: &mut [f32] = &mut up;
+        for &ei in sel {
+            let mut r = 0;
+            while r < ff {
+                let n = rows.min(ff - r);
+                let (a, arest) = ar.split_at_mut(n);
+                ar = arest;
+                let (u, urest) = ur.split_at_mut(n);
+                ur = urest;
+                jobs.push(Job {
+                    ei,
+                    r0: r,
+                    r1: r + n,
+                    out: a,
+                    mat: 0,
+                });
+                jobs.push(Job {
+                    ei,
+                    r0: r,
+                    r1: r + n,
+                    out: u,
+                    mat: 1,
+                });
+                r += n;
+            }
+        }
+    }
+    #[cfg(test)]
+    FLAT_DECODE_TASKS.fetch_add(jobs.len(), std::sync::atomic::Ordering::Relaxed);
+    jobs.into_par_iter().try_for_each(|j| -> Result<()> {
+        if j.mat == 0 {
+            lw.gate_exps.gemv_rows_seq(j.ei, j.r0, j.r1, x, j.out)
+        } else {
+            lw.up_exps.gemv_rows_seq(j.ei, j.r0, j.r1, x, j.out)
+        }
+    })?;
+
+    // silu(act) * up。expert ごとに従来と同じ順で適用する (要素ごとの演算なので
+    // expert 間の順序は値に影響しない)。
+    for t in 0..sel.len() {
+        let a = &mut act[t * ff..(t + 1) * ff];
+        silu_inplace(a);
+        let u = &up[t * ff..(t + 1) * ff];
+        for r in 0..ff {
+            a[r] *= u[r];
+        }
+    }
+
+    /// 1 タスク = down の 1 行チャンク (入力は expert ごとの `act`)。
+    struct DownJob<'a> {
+        ei: usize,
+        r0: usize,
+        r1: usize,
+        inp: &'a [f32],
+        out: &'a mut [f32],
+    }
+
+    // 位相 2: down の行。出力は最終寄与 `hs` へ直接書く (expert ごとの Vec を作らない)。
+    let mut djobs: Vec<DownJob> = Vec::new();
+    {
+        let mut hr: &mut [f32] = hs;
+        for (t, &ei) in sel.iter().enumerate() {
+            let inp = &act[t * ff..(t + 1) * ff];
+            let mut r = 0;
+            while r < e {
+                let n = rows.min(e - r);
+                let (h, hrest) = hr.split_at_mut(n);
+                hr = hrest;
+                djobs.push(DownJob {
+                    ei,
+                    r0: r,
+                    r1: r + n,
+                    inp,
+                    out: h,
+                });
+                r += n;
+            }
+        }
+    }
+    #[cfg(test)]
+    FLAT_DECODE_TASKS.fetch_add(djobs.len(), std::sync::atomic::Ordering::Relaxed);
+    djobs.into_par_iter().try_for_each(|j| -> Result<()> {
+        lw.down_exps
+            .gemv_rows_seq(j.ei, j.r0, j.r1, j.inp, j.out)
+    })?;
+    Ok(())
+}
+
+/// P70: 平坦化経路の 1 タスクあたりの行数。32 行未満はタスクのオーバーヘッドが
+/// 勝ち、128 行を超えると端数 (10 expert × 行数) でスレッドが遊ぶ。
+/// 実形 (e = 2560 / ff = 640) の実測は `bench_decode_flat` を参照。
+const DECODE_FLAT_ROWS: usize = 64;
 
 /// P64: expert 1 本の寄与 `h = down(silu(gate(x)) * up(x))` を `h` に書く。
 ///
@@ -7728,6 +8005,248 @@ mod tests {
             assert_bitwise_eq(&old_par, &new, &format!("層 {il}: 旧 vs 新 (mmap)"));
             let new_c = run(&lw, &x, Some(&set), true, true);
             assert_bitwise_eq(&old_par, &new_c, &format!("層 {il}: 旧 vs 新 (常駐キャッシュ)"));
+        }
+    }
+
+    /// P70: `DENNO_EXPERT_FLAT_DECODE` の値解釈 (既定 off・誤設定で on にしない)。
+    #[test]
+    fn expert_flat_decode_gate_values() {
+        assert!(!expert_flat_decode_from_value(None));
+        assert!(!expert_flat_decode_from_value(Some("")));
+        assert!(!expert_flat_decode_from_value(Some("0")));
+        assert!(!expert_flat_decode_from_value(Some("yes")));
+        assert!(expert_flat_decode_from_value(Some("1")));
+        assert!(expert_flat_decode_from_value(Some("on")));
+        assert!(expert_flat_decode_from_value(Some("ON")));
+        assert!(expert_flat_decode_from_value(Some("true")));
+        assert!(expert_flat_decode_from_value(Some(" 1 ")));
+    }
+
+    /// P70: expert 横断の平坦化経路は、従来の expert 並列と**ビット一致**する
+    /// (層 1 回ぶんを丸ごと比較 = ルータ・shared expert も同じ経路)。
+    #[test]
+    #[cfg(feature = "par")]
+    fn decode_flat_matches_expert_parallel() {
+        gpu_gemm_off();
+        let _g = moe_test_guard();
+        let dir = TempDir::new("p70flat");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        assert!(
+            p.n_expert_used > 1,
+            "平坦化の意味が出るのは 2 expert 以上を選ぶ形"
+        );
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        let before = FLAT_DECODE_REGIONS.load(std::sync::atomic::Ordering::Relaxed);
+        let old = moe_ffn_quant_impl(&p, &lw, &x, None, true, Route::Cpu, None, true, false, false)
+            .expect("従来 (expert 並列)");
+        let new = moe_ffn_quant_impl(&p, &lw, &x, None, true, Route::Cpu, None, true, false, true)
+            .expect("新 (expert 横断平坦化)");
+        assert!(
+            old.iter().any(|v| *v != 0.0),
+            "MoE の出力が全 0 (経路の生死が分からない)"
+        );
+        assert_bitwise_eq(&old, &new, "平坦化 vs expert 並列");
+        assert!(
+            FLAT_DECODE_REGIONS.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "平坦化の分岐が通っていない (カウンタが増えていない)"
+        );
+    }
+
+    /// P70: 行チャンク幅を変えても expert 寄与はビット一致する
+    /// (割り切れない幅 7 も含める = 末尾の端数チャンクを通す)。
+    #[test]
+    #[cfg(feature = "par")]
+    fn decode_flat_row_chunk_is_independent() {
+        gpu_gemm_off();
+        let _g = moe_test_guard();
+        let dir = TempDir::new("p70chunk");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+        let sel: Vec<usize> = (0..p.n_expert_used).collect();
+        let (e, ff) = (p.n_embd, p.n_ff_exp);
+
+        let mut want = vec![0.0f32; sel.len() * e];
+        expert_contribs_par_into(&lw, &sel, &x, e, ff, None, &mut want).expect("従来経路");
+        assert!(want.iter().any(|v| *v != 0.0), "寄与が全 0");
+
+        for rows in [7usize, 32, 64, 96, 1000] {
+            let mut got = vec![0.0f32; want.len()];
+            let t0 = FLAT_DECODE_TASKS.load(std::sync::atomic::Ordering::Relaxed);
+            expert_contribs_flat_decode_into(&lw, &sel, &x, e, ff, &mut got, rows)
+                .expect("平坦化");
+            // タスク本数 = expert × (gate + up のチャンク + down のチャンク)。
+            let want_tasks = sel.len()
+                * (2 * ff.div_ceil(rows) + e.div_ceil(rows));
+            assert_eq!(
+                FLAT_DECODE_TASKS.load(std::sync::atomic::Ordering::Relaxed) - t0,
+                want_tasks,
+                "rows={rows}: 行タスクの本数が違う"
+            );
+            assert_bitwise_eq(&want, &got, &format!("rows={rows}"));
+        }
+        // 0 行は落ちる (空タスクを回さない)。
+        let mut got = vec![0.0f32; want.len()];
+        assert!(expert_contribs_flat_decode_into(&lw, &sel, &x, e, ff, &mut got, 0).is_err());
+    }
+
+    /// P70 マイクロベンチ: decode の expert 寄与 (10 expert) と層 1 回ぶんを
+    /// 従来 (1 expert = 1 タスク) / 平坦化 (expert 横断の行タスク) で A/B する。
+    ///
+    /// 実形: n_embd 2560 / n_ff_exp 640 / gate・up は Q4_K、down は Q5_1 /
+    /// top-k 10 (実モデルと同じ型・同じ行長)。512 expert の疎 GGUF に
+    /// **選ばれる 10 expert だけ実データ**を置く (残りは穴)。
+    ///
+    /// このコンテナはホスト共有で load average が動くので、**同一バイナリ・
+    /// 同一ループ内**で従来 / 平坦化 (行幅 3 種) を交互に測り、rep の min を取る。
+    /// 実機の ms/token は main が測る (ここは CPU のスケジュール差だけ)。
+    ///
+    /// `cargo test --release -p denno-engine --lib --features cuda bench_decode_flat \
+    ///   -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[cfg(feature = "par")]
+    #[ignore = "P70 マイクロベンチ (CPU のスケジュール A/B。実機は main が測る)"]
+    fn bench_decode_flat() {
+        gpu_gemm_off();
+        let _g = moe_test_guard();
+        let (n_embd, n_ff, ne, k) = (2560usize, 640usize, 512usize, 10usize);
+        let x = cache_test_x_seed(n_embd, 0);
+        let sel: Vec<usize> = (0..k).collect();
+        let dir = TempDir::new("p70bench");
+        let path = dir.path("bench.gguf");
+        write_expert_gguf_sparse(&path, n_embd, n_ff, ne, &sel);
+        let f = GgufFile::open(&path).expect("open");
+        let p = params_dims(n_embd, n_ff, ne, k);
+        let mut lw = layer_at(&f, &p, 0);
+        lw.gate_inp = gate_inp_for(&x, ne);
+
+        // 選ばれる expert が「実データを置いた expert」と一致すること
+        // (穴を読むと 0 が返り、比較が無意味になる)。
+        let mut probs = vec![0.0f32; ne];
+        lw.gate_inp.gemv(&x, &mut probs).expect("router");
+        softmax(&mut probs);
+        assert_eq!(select_topk(&probs, k), sel, "ルータの top-k が 0..k でない");
+
+        let rows_opts = [32usize, 64, 128, 256];
+        let reps = 20usize;
+        let inner = 5usize;
+        for threads in [8usize, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            let mut hs_old = vec![0.0f32; k * n_embd];
+            let mut hs_new: Vec<Vec<f32>> = (0..rows_opts.len())
+                .map(|_| vec![0.0f32; k * n_embd])
+                .collect();
+            // 温め + 値の突き合わせ (経路が本当に同じ値を作ることを先に固定する)。
+            pool.install(|| {
+                expert_contribs_par_into(&lw, &sel, &x, n_embd, n_ff, None, &mut hs_old)
+                    .expect("従来");
+                for (i, &rows) in rows_opts.iter().enumerate() {
+                    expert_contribs_flat_decode_into(
+                        &lw, &sel, &x, n_embd, n_ff, &mut hs_new[i], rows,
+                    )
+                    .expect("平坦化");
+                    assert_bitwise_eq(
+                        &hs_old,
+                        &hs_new[i],
+                        &format!("expert 寄与 threads={threads} rows={rows}"),
+                    );
+                }
+                assert!(hs_old.iter().any(|v| *v != 0.0), "寄与が全 0");
+            });
+
+            let mut best = vec![f64::INFINITY; 1 + rows_opts.len()];
+            for _ in 0..reps {
+                for vi in 0..1 + rows_opts.len() {
+                    let t0 = std::time::Instant::now();
+                    pool.install(|| {
+                        for _ in 0..inner {
+                            if vi == 0 {
+                                expert_contribs_par_into(
+                                    &lw, &sel, &x, n_embd, n_ff, None, &mut hs_old,
+                                )
+                                .expect("従来");
+                            } else {
+                                expert_contribs_flat_decode_into(
+                                    &lw, &sel, &x, n_embd, n_ff, &mut hs_new[vi - 1],
+                                    rows_opts[vi - 1],
+                                )
+                                .expect("平坦化");
+                            }
+                        }
+                    });
+                    let ms = t0.elapsed().as_secs_f64() * 1e3 / inner as f64;
+                    best[vi] = best[vi].min(ms);
+                }
+            }
+
+            // 層 1 回ぶん (ルータ + expert + shared expert)。平坦化は既定行幅。
+            let mut out_old = Vec::new();
+            let mut out_new = Vec::new();
+            pool.install(|| {
+                out_old = moe_ffn_quant_impl(
+                    &p, &lw, &x, None, true, Route::Cpu, None, true, false, false,
+                )
+                .expect("層 従来");
+                out_new = moe_ffn_quant_impl(
+                    &p, &lw, &x, None, true, Route::Cpu, None, true, false, true,
+                )
+                .expect("層 平坦化");
+            });
+            assert_bitwise_eq(&out_old, &out_new, "層 1 回 (ルータ+expert+shared)");
+
+            let mut layer_best = [f64::INFINITY; 2];
+            for _ in 0..reps {
+                for vi in 0..2 {
+                    let t0 = std::time::Instant::now();
+                    pool.install(|| {
+                        for _ in 0..inner {
+                            if vi == 0 {
+                                out_old = moe_ffn_quant_impl(
+                                    &p, &lw, &x, None, true, Route::Cpu, None, true, false, false,
+                                )
+                                .expect("層 従来");
+                            } else {
+                                out_new = moe_ffn_quant_impl(
+                                    &p, &lw, &x, None, true, Route::Cpu, None, true, false, true,
+                                )
+                                .expect("層 平坦化");
+                            }
+                        }
+                    });
+                    let ms = t0.elapsed().as_secs_f64() * 1e3 / inner as f64;
+                    layer_best[vi] = layer_best[vi].min(ms);
+                }
+            }
+
+            eprintln!(
+                "[bench70] threads={threads} ne={ne} k={k} e={n_embd} ff={n_ff} reps={reps}x{inner}"
+            );
+            eprintln!("[bench70] expert  old={:7.3} ms", best[0]);
+            for (i, &rows) in rows_opts.iter().enumerate() {
+                eprintln!(
+                    "[bench70]           rows={rows:<3} {:7.3} ms ({:.2}x)",
+                    best[i + 1],
+                    best[0] / best[i + 1]
+                );
+            }
+            eprintln!(
+                "[bench70] layer   old={:7.3} ms | flat={:7.3} ms ({:.2}x)  \
+                 48 層換算 old={:.1} / flat={:.1} ms/token (推定)",
+                layer_best[0],
+                layer_best[1],
+                layer_best[0] / layer_best[1],
+                layer_best[0] * 48.0,
+                layer_best[1] * 48.0,
+            );
         }
     }
 

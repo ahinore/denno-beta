@@ -764,6 +764,60 @@ pub fn expert_gemv_any_seq(
     expert_gemv_any_inner(ty, blocks, n_in, n_out, x, out, false)
 }
 
+/// 行範囲の検証 (行 `[r0, r1)` を切り出す)。
+///
+/// 戻り値は (切り出した expert のブロック列, 行数)。`blocks` は **1 expert 全体**
+/// (`n_out * row_bytes`) を要求する (呼び出し側が誤って部分列を渡すと、
+/// 行番号とバイト位置がずれたまま静かに別の重みを読むため)。
+fn check_row_range<'a>(
+    ty: GgmlType,
+    blocks: &'a [u8],
+    n_in: usize,
+    n_out: usize,
+    r0: usize,
+    r1: usize,
+    out_len: usize,
+) -> Result<(&'a [u8], usize)> {
+    let rb = row_bytes(ty, n_in)?;
+    if r1 <= r0 || r1 > n_out {
+        bail!("行範囲 {r0}..{r1} が 0..{n_out} の外");
+    }
+    let nrows = r1 - r0;
+    if out_len != nrows {
+        bail!("out の長さ {out_len} が行数 {nrows} と違う");
+    }
+    let want = n_out
+        .checked_mul(rb)
+        .ok_or_else(|| anyhow::anyhow!("1 expert のバイト数が usize を溢れる (n_out={n_out})"))?;
+    if blocks.len() != want {
+        bail!("blocks の長さ {} が n_out * row_bytes = {want} と違う", blocks.len());
+    }
+    Ok((&blocks[r0 * rb..r1 * rb], nrows))
+}
+
+/// [`expert_gemv_any_seq`] の**行範囲**版 (P70)。
+///
+/// 1 expert のうち行 `[r0, r1)` だけを計算し、`out` (長さ `r1 - r0`) に書く。
+/// 行は互いに独立で、行チャンクでも全行でも同じカーネルの同じ行順を通るので、
+/// [`expert_gemv_any_seq`] と**ビット一致**する。
+///
+/// decode の expert 寄与を expert 横断で 1 本のタスク列に平坦化するために置いた
+/// (`DENNO_EXPERT_FLAT_DECODE`)。1 タスク = 1 行チャンク。
+#[allow(clippy::too_many_arguments)]
+pub fn expert_gemv_any_rows(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    r0: usize,
+    r1: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    let (sub, nrows) = check_row_range(ty, blocks, n_in, n_out, r0, r1, out.len())?;
+    expert_gemv_any_inner(ty, sub, n_in, nrows, x, out, false)
+}
+
 fn expert_gemv_any_inner(
     ty: GgmlType,
     blocks: &[u8],
@@ -2815,6 +2869,28 @@ pub fn expert_gemv_any_vnni_seq(
     expert_gemv_any_vnni_inner(ty, blocks, n_in, n_out, x, out, false)
 }
 
+/// [`expert_gemv_any_vnni_seq`] の**行範囲**版 (P70)。
+///
+/// [`expert_gemv_any_rows`] と同じ用途 (decode の expert 寄与の平坦化)。
+/// VNNI が無効なときは `Ok(false)` を返し、呼び出し側は f32 の行範囲入口へ落ちる。
+#[allow(clippy::too_many_arguments)]
+pub fn expert_gemv_any_vnni_rows(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    r0: usize,
+    r1: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<bool> {
+    if !gemv_vnni_enabled() {
+        return Ok(false);
+    }
+    let (sub, nrows) = check_row_range(ty, blocks, n_in, n_out, r0, r1, out.len())?;
+    expert_gemv_any_vnni_inner(ty, sub, n_in, nrows, x, out, false)
+}
+
 fn expert_gemv_any_vnni_inner(
     ty: GgmlType,
     blocks: &[u8],
@@ -3246,6 +3322,50 @@ mod tests {
             out[r] = acc;
         }
         out
+    }
+
+    /// P70: 行範囲入口 ([`expert_gemv_any_rows`]) は全行入口
+    /// ([`expert_gemv_any_seq`]) とビット一致する (行は独立)。
+    #[test]
+    fn any_rows_matches_any_seq() {
+        for (ty, n_in) in [
+            (GgmlType::Q4K, 512usize),
+            (GgmlType::Q5_1, 256),
+            (GgmlType::Q8_0, 256),
+        ] {
+            let n_out = 96usize;
+            let blocks = make_expert(ty, n_in, n_out, 0);
+            let x = make_x(n_in);
+            let mut want = vec![0.0f32; n_out];
+            expert_gemv_any_seq(ty, &blocks, n_in, n_out, &x, &mut want).expect("全行");
+
+            // 端数が出る範囲 (1..95) と 0 開始・末尾までを混ぜる。
+            for (r0, r1) in [(0usize, 32usize), (32, 64), (64, 96), (0, 96), (1, 95)] {
+                let mut got = vec![0.0f32; r1 - r0];
+                expert_gemv_any_rows(ty, &blocks, n_in, n_out, r0, r1, &x, &mut got)
+                    .expect("行範囲");
+                expect_bits(&got, &want[r0..r1]);
+            }
+
+            // 範囲・長さの誤りは落ちる (静かに別の行を読まない)。
+            let mut one = [0.0f32; 1];
+            assert!(expert_gemv_any_rows(ty, &blocks, n_in, n_out, 5, 5, &x, &mut one).is_err());
+            let mut over = vec![0.0f32; n_out + 1];
+            assert!(
+                expert_gemv_any_rows(ty, &blocks, n_in, n_out, 0, n_out + 1, &x, &mut over).is_err()
+            );
+            let mut short = vec![0.0f32; 31];
+            assert!(
+                expert_gemv_any_rows(ty, &blocks, n_in, n_out, 0, 32, &x, &mut short).is_err()
+            );
+            // expert 全体でないブロック列 (1 行ぶん欠けた列) も落ちる。
+            let mut cut = blocks.clone();
+            cut.truncate(cut.len() - row_bytes(ty, n_in).unwrap());
+            let mut all = vec![0.0f32; n_out];
+            assert!(
+                expert_gemv_any_rows(ty, &cut, n_in, n_out, 0, n_out, &x, &mut all).is_err()
+            );
+        }
     }
 
     fn expect_bits(got: &[f32], want: &[f32]) {
