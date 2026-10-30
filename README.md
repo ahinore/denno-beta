@@ -138,7 +138,9 @@ With the dense `serve` path instead, pass `DENNO_TELEMETRY=1` when starting it, 
 
 **Demo** — the 3D view (`/3d`) running a live conversation against Flash-Next: the prompt is tokenised in the input rail, the router pulls experts up from SSD into VRAM, the layer columns light up per neuron, and the sampler's top-8 candidates sit at the prediction head while the chosen token flies back to the chat box:
 
-![denno-view 3D demo](docs/assets/denno_3d.gif)
+[![denno-view 3D demo (click to play the MP4)](docs/assets/denno_3d_poster.jpg)](docs/assets/denno_3d.mp4)
+
+*Still from the 27 s recording; click it to play [`docs/assets/denno_3d.mp4`](docs/assets/denno_3d.mp4) (H.264, 1256x618, 5 fps, 2.2 MB). GitHub's markdown renderer will not play a video that lives in the repository, so the animation is one click away rather than inline.*
 
 The 3D view (`/3d`) is built from the model's real topology rather than an illustration: 48 layers along Z, each with its mixer (12 QSA / 36 GDN), router, 512 experts laid out 32x16, shared expert and GR read/write, with a hybrid-block frame every 4 layers. Experts sit at the height of the tier that currently holds them (VRAM / RAM / SSD) and move between tiers as the router selects them; the KV band shows prefix-cache reuse, the prompt tokens, and the decode read position; the prediction head shows the real top-8 candidates from the sampler, and the chosen token flies back to the chat box. Keys: `f` toggles a quaternion-based free-flight mode (WASD + mouse, Shift to accelerate, Q/E up/down, Esc back to orbit).
 
