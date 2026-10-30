@@ -411,6 +411,16 @@ impl Flash {
             t_prefill * 1e3 / (n_prompt - reused).max(1) as f64,
             t_decode * 1e3 / out.len().max(1) as f64
         );
+        // 計測のみ (数値経路に触れない): `DENNO_PROFILE=1` のとき、リクエスト 1 本の
+        // 終わりに表 C (serve の 1 ステップ内訳) を 1 行ずつ出す。既定 off では
+        // `enabled()` の分岐 1 回だけで何もしない。
+        if denno_engine::prof::enabled() {
+            eprintln!("[prof] ---- request: prompt={n_prompt} reuse={reused} out={}", out.len());
+            for line in denno_engine::prof::summary().lines() {
+                eprintln!("[prof] {line}");
+            }
+            denno_engine::prof::reset();
+        }
         // 途中で失敗したら状態は信用しない (次のリクエストで組み直す)。
         let stop_reason = stop_hit.unwrap_or_else(|| {
             if out.len() >= req.max_tokens {
