@@ -1814,7 +1814,7 @@ impl LayerW {
             hc_ffn_down: linear(f, &name("hc_ffn_down.weight"))?,
             hc_ffn_up: linear(f, &name("hc_ffn_up.weight"))?,
             hc_ffn_inject: linear(f, &name("hc_ffn_inject.weight"))?,
-            gate_inp: linear(f, &name("ffn_gate_inp.weight"))?,
+            gate_inp: linear(f, &name("ffn_gate_inp.weight"))?.with_router_gpu(true),
             gate_inp_shexp: linear(f, &name("ffn_gate_inp_shexp.weight"))?,
             gate_exps: ExpertW::load(f, &name("ffn_gate_exps.weight"), p)?,
             up_exps: ExpertW::load(f, &name("ffn_up_exps.weight"), p)?,
@@ -7080,7 +7080,7 @@ mod tests {
             hc_ffn_down: f32_linear(1, 1, 0.5),
             hc_ffn_up: f32_linear(1, 1, 0.5),
             hc_ffn_inject: f32_linear(1, 1, 0.5),
-            gate_inp: f32_linear(p.n_embd, p.n_expert, 0.1),
+            gate_inp: f32_linear(p.n_embd, p.n_expert, 0.1).with_router_gpu(true),
             gate_inp_shexp: f32_linear(p.n_embd, 1, 0.2),
             gate_exps: ExpertW::load(f, &name("ffn_gate_exps.weight"), p).expect("gate"),
             up_exps: ExpertW::load(f, &name("ffn_up_exps.weight"), p).expect("up"),
@@ -8357,6 +8357,74 @@ mod tests {
 
         // 3. 出力はビット一致 (行の分割は丸め順序を変えない)。
         assert_bitwise_eq(&off, &on, "router gate off vs on");
+    }
+
+    /// task 69: `moe_ffn_quant` の入口から GPU 経路の**分岐に実際に入る**こと。
+    ///
+    /// このコンテナに GPU は無いので計算は CPU に落ちるが、`cuda_enabled()` より
+    /// 前のカウンタで「配線が生きている」ことを数える。ゲート off では 0 回。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn router_gpu_gate_is_live_end_to_end() {
+        use crate::model::linear_gguf as lg;
+        let _m = moe_test_guard();
+        let _g = lg::par_test_lock();
+        let dir = TempDir::new("router_gpu_e2e");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        // 1. ゲート off: 入口に 1 回も入らない。
+        lg::set_router_gpu_for_test(Some(false));
+        crate::cuda::router_gpu_attempts_reset();
+        let off = moe_ffn_quant(&p, &lw, &x, None).expect("off");
+        let n_off = crate::cuda::router_gpu_attempts();
+
+        // 2. ゲート on: 層 1 回 = 1 回入る (GPU が無いので中で CPU に落ちる)。
+        lg::set_router_gpu_for_test(Some(true));
+        crate::cuda::router_gpu_attempts_reset();
+        let on = moe_ffn_quant(&p, &lw, &x, None).expect("on");
+        let n_on = crate::cuda::router_gpu_attempts();
+        lg::set_router_gpu_for_test(None);
+
+        assert_eq!(n_off, 0, "ゲート off なのにルータ GPU 入口に入った");
+        assert_eq!(n_on, 1, "ルータ GPU 入口の回数が層数と違う (配線が切れている)");
+        // 3. 数値はどちらの経路でも同一 (CPU に落ちた場合)。
+        assert_bitwise_eq(&off, &on, "router gpu gate off vs on");
+    }
+
+    /// task 69: ルータ GPU 経路の対象は `ffn_gate_inp` **だけ**であること。
+    ///
+    /// `with_router_gpu(true)` を付けた 1 本だけが対象で、shared expert の
+    /// ルータ (`ffn_gate_inp_shexp`) や他の F32 線形は CPU のまま (VRAM を
+    /// 余計に使わない)。実際に GPU で回ることはこのコンテナでは確かめられない
+    /// (`cuda_f32_gemv_bit_exact_vs_cpu` が実機用の #[ignore])。
+    #[test]
+    fn router_gpu_flag_is_on_gate_inp_only() {
+        let dir = TempDir::new("router_gpu_flag");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        assert!(
+            lw.gate_inp.router_gpu(),
+            "ffn_gate_inp がルータ GPU 経路の対象になっていない (配線が切れている)"
+        );
+        assert!(
+            !lw.gate_inp_shexp.router_gpu(),
+            "shared expert のルータまで対象になっている"
+        );
+        for (name, on) in [
+            ("gate_shexp", lw.gate_shexp.router_gpu()),
+            ("up_shexp", lw.up_shexp.router_gpu()),
+            ("down_shexp", lw.down_shexp.router_gpu()),
+            ("hc_attn_down", lw.hc_attn_down.router_gpu()),
+            ("hc_ffn_inject", lw.hc_ffn_inject.router_gpu()),
+        ] {
+            assert!(!on, "{name} までルータ扱いになっている");
+        }
     }
 
     #[test]

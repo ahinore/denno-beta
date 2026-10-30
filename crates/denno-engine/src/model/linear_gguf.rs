@@ -71,6 +71,59 @@ pub(crate) fn set_cpu_gemv_par_for_test(v: Option<bool>) {
     }, Ordering::Relaxed);
 }
 
+/// task 69: `DENNO_ROUTER_GPU` の値の解釈 (純関数)。**既定 on**。
+///
+/// ルータ (`ffn_gate_inp`, f32 512x2560) だけを GPU (`dno_matvec_f32`) で回す。
+/// このカーネルは 1 行 = 1 ブロックで `s = fadd_rn(s, fmul_rn(x[d], w[d]))` を
+/// d の昇順に繰り返す (PTX に `fma.rn` も `.ftz` も無い) ので、CPU 側の
+/// `acc += row[i] * x[i]` (i 昇順・積と加算を別々に丸める) と**ビット一致**する。
+/// 一致が崩れたときのために `DENNO_ROUTER_GPU=0/off/false/no` で必ず CPU へ戻せる。
+///
+/// env を読む部分から切り離してあるのは、テストが環境変数を触らずに両方の分岐を
+/// 確かめられるようにするため (`cpu_gemv_par_from_value` と同じ流儀)。
+fn router_gpu_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// ルータ GPU 経路のテスト用上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+static ROUTER_GPU_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// ルータを GPU で回してよいか (`DENNO_ROUTER_GPU`、既定 on)。プロセスで 1 回だけ読む。
+///
+/// GPU が無いビルド (`feature = "cuda"` なし) では呼び出し側が無いので dead に
+/// なるが、判定関数そのものはテストから同じ形で叩けるよう残す。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn router_gpu_enabled() -> bool {
+    match ROUTER_GPU_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| router_gpu_from_value(std::env::var("DENNO_ROUTER_GPU").ok().as_deref()))
+}
+
+/// テスト専用: ルータ GPU 経路の on/off を強制する (`None` で env に戻す)。
+///
+/// `CPU_GEMV_PAR_OVERRIDE` と同じくプロセス全体で 1 個なので、触るテストは
+/// `par_test_lock()` を取って直列化する。
+#[cfg(test)]
+pub(crate) fn set_router_gpu_for_test(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    ROUTER_GPU_OVERRIDE.store(match v {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }, Ordering::Relaxed);
+}
+
 /// 行並列を立てる条件 (実測で決めた)。
 ///
 /// - **行数が 8 以上**、または
@@ -201,6 +254,9 @@ pub struct GgufLinear {
     /// 既定は false (27B の Q8_0 テンソル 1 本がビット一致契約の対象なので、
     /// 明示的に選んだモデルだけ速い経路に載せる)。
     fast_q8: bool,
+    /// task 69: ルータ (`ffn_gate_inp`) だけ true。f32 重みを VRAM に常駐させ、
+    /// `dno_matvec_f32` で計算する (ビット一致・`DENNO_ROUTER_GPU` で on/off)。
+    router_gpu: bool,
 }
 
 impl GgufLinear {
@@ -227,7 +283,19 @@ impl GgufLinear {
             n,
             blocks,
             fast_q8: false,
+            router_gpu: false,
         })
+    }
+
+    /// task 69: この線形層をルータ GPU 経路の対象にする (`ffn_gate_inp` 専用)。
+    pub fn with_router_gpu(mut self, on: bool) -> Self {
+        self.router_gpu = on;
+        self
+    }
+
+    /// ルータ GPU 経路の対象か。
+    pub fn router_gpu(&self) -> bool {
+        self.router_gpu
     }
 
     /// Q8_0 の AVX2 融合カーネルを有効にする (ビット一致は保証しない)。
@@ -330,6 +398,27 @@ impl GgufLinear {
             GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => {
                 let rb = row_bytes_any(self.ty, self.k)?;
                 let b = self.blocks.as_slice();
+                // task 69: ルータ (`ffn_gate_inp`, 512x2560 の F32) だけ GPU 経路。
+                // カーネルは `dno_matvec_f32` (1 行 = 1 ブロック・k 昇順の逐次加算・
+                // `mul.rn`+`add.rn` で FMA 無し) なので、下の CPU 参照
+                // (`acc += row[i] * x[i]` を i 昇順) と丸め順が同じ = ビット一致。
+                // 不発 (GPU 無効・予算外・失敗) はすべて CPU 参照へ落ちる。
+                #[cfg(feature = "cuda")]
+                {
+                    if self.router_gpu
+                        && router_gpu_enabled()
+                        && crate::cuda::maybe_gpu_router_gemv_into(
+                            self.uid,
+                            b,
+                            self.k,
+                            self.n,
+                            x,
+                            out,
+                        )
+                    {
+                        return Ok(());
+                    }
+                }
                 // task 65: `DENNO_CPU_GEMV_PAR=1` のときだけ、行方向を rayon で分ける。
                 // 既定 off は従来経路 (下の feature="par" の分割も含めて 1 行も変えない)。
                 // 行は独立・行内の加算順は不変なので、分割の有無で値はビット一致する。
@@ -396,11 +485,16 @@ impl GgufLinear {
 /// serve-flash は prefix が一致しないとモデルを組み直す (= 新しい uid を払い出す)。
 /// この Drop が無いと古い重みが VRAM に残り、会話を重ねるたびに使用量が増えて
 /// 最後は dense の確保に失敗して CPU に落ちる (decode が倍近く遅くなる症状)。
+///
+/// task 69: VRAM に上げた f32 重み (ルータ) も同じ uid で登録されるので、
+/// ここで両方まとめて外す。レジストリは uid キーなので、モデルを差し替えて
+/// 新しい uid の層が載ると古いエントリは `DENNO_GPU_WEIGHT_MB` の会計に残り続ける。
 impl Drop for GgufLinear {
     fn drop(&mut self) {
         #[cfg(feature = "cuda")]
         {
             crate::cuda::gguf_unregister(self.uid);
+            crate::cuda::unregister_f32_weights(self.uid);
         }
     }
 }
@@ -637,6 +731,65 @@ mod tests {
         for v in [Some("0"), Some("off"), Some("false")] {
             assert!(!cpu_gemv_par_from_value(v), "value={v:?}");
         }
+    }
+
+    // ---- task 69: ルータ GPU 経路 (`DENNO_ROUTER_GPU`) ---------------------
+
+    /// 上書きを必ず env 読みに戻す (panic しても戻る)。
+    struct RouterGuard;
+    impl RouterGuard {
+        fn new() -> Self {
+            set_router_gpu_for_test(None);
+            Self
+        }
+    }
+    impl Drop for RouterGuard {
+        fn drop(&mut self) {
+            set_router_gpu_for_test(None);
+        }
+    }
+
+    /// task 69: `DENNO_ROUTER_GPU` の真理値表。既定 on、明示的な偽値だけ off。
+    #[test]
+    fn router_gpu_gate_defaults() {
+        for v in [
+            None,
+            Some("1"),
+            Some("on"),
+            Some("ON"),
+            Some("true"),
+            Some("TRUE"),
+            Some(" on "),
+            Some(""),
+        ] {
+            assert!(router_gpu_from_value(v), "value={v:?} は on のはず");
+        }
+        for v in [
+            Some("0"),
+            Some("off"),
+            Some("false"),
+            Some("no"),
+            Some("OFF"),
+            Some("False"),
+        ] {
+            assert!(!router_gpu_from_value(v), "value={v:?} は off のはず");
+        }
+        // テスト用上書きが実際に効くこと (`None` で env 読みに戻る)。
+        let _g = par_test_lock();
+        let _p = RouterGuard::new();
+        set_router_gpu_for_test(Some(false));
+        assert!(!router_gpu_enabled(), "off の上書きが効いていない");
+        set_router_gpu_for_test(Some(true));
+        assert!(router_gpu_enabled(), "on の上書きが効いていない");
+    }
+
+    /// task 69: ルータ扱いは層ごとの opt-in。既定は false (他の F32 線形は CPU のまま)。
+    #[test]
+    fn router_gpu_flag_is_opt_in_per_linear() {
+        let (lin, _x) = f32_lin(2560, 512, 3);
+        assert!(!lin.router_gpu(), "既定でルータ扱いになっている");
+        let lin = lin.with_router_gpu(true);
+        assert!(lin.router_gpu());
     }
 
     /// 実形状 4 本で旧経路と新経路がビット一致し、期待どおりの側に落ちること。

@@ -7060,7 +7060,34 @@ struct Lmv32Fn(CUfunction);
 unsafe impl Send for Lmv32Fn {}
 unsafe impl Sync for Lmv32Fn {}
 
-static LMV32_FNS: OnceLock<Option<Lmv32Fn>> = OnceLock::new();
+/// dno_matvec_f32 のハンドルキャッシュ。s49 (fp32 lm_head) と task 69 (MoE
+/// ルータ) が**同じカーネル**を共有するので 1 本にまとめてある。
+static MATVEC_F32_FNS: OnceLock<Option<Lmv32Fn>> = OnceLock::new();
+
+/// `dno_matvec_f32` のハンドル (未収録 PTX では None をキャッシュして恒久不発動・
+/// ラッチはしない)。カーネルは 1 行 = 1 ブロックで k を昇順に逐次加算し、
+/// `mul.rn.f32` + `add.rn.f32` のみ (fma 0 個・ftz 0 個) を PTX で確認済み。
+fn matvec_f32_fn(ctx: &CudaCtx) -> Option<CUfunction> {
+    MATVEC_F32_FNS
+        .get_or_init(|| {
+            let lib = lib().ok()?;
+            let mut f: CUfunction = std::ptr::null_mut();
+            let r = unsafe {
+                (lib.module_get_function)(
+                    &mut f,
+                    ctx.module_elem,
+                    b"dno_matvec_f32\0".as_ptr() as *const c_char,
+                )
+            };
+            if r != 0 {
+                None
+            } else {
+                Some(Lmv32Fn(f))
+            }
+        })
+        .as_ref()
+        .map(|h| h.0)
+}
 
 /// s49: fp32 重み (lm_head / tied embed) のデバイスキャッシュ。key はモデル
 /// ロード毎に一意 (qwen35 の mid 由来)。無ければ同期 H2D でアップロードし
@@ -7100,25 +7127,7 @@ pub fn maybe_gpu_matvec_f32(
         return None;
     }
     // カーネルハンドル (lazy fetch・None キャッシュ = PTX 未収録はラッチ無し)
-    let f = LMV32_FNS
-        .get_or_init(|| {
-            let lib = lib().ok()?;
-            let mut f: CUfunction = std::ptr::null_mut();
-            let r = unsafe {
-                (lib.module_get_function)(
-                    &mut f,
-                    ctx.module_elem,
-                    b"dno_matvec_f32\0".as_ptr() as *const c_char,
-                )
-            };
-            if r != 0 {
-                None
-            } else {
-                Some(Lmv32Fn(f))
-            }
-        })
-        .as_ref()?
-        .0;
+    let f = matvec_f32_fn(ctx)?;
     // 重みアップロード (初回 1 回・同期。他スレッドとの二重アップロード防止に
     // ロック内で行う)
     let reg = LMV32_W.get_or_init(|| Mutex::new(HashMap::new()));
@@ -7208,6 +7217,331 @@ pub fn maybe_gpu_matvec_f32(
             tracing::error!("CUDA fp32 lm_head matvec failed, using CPU permanently: {e:#}");
             LMV32_BROKEN.store(true, AO::Relaxed);
             None
+        }
+    }
+}
+
+// ===========================================================================
+// task 69: Flash-Next の MoE ルータ (ffn_gate_inp, f32 512x2560) を GPU へ
+// ===========================================================================
+// 前提 (main の実測・118 tok / DENNO_Q4_PROFILE=1): router = 1,962.7 ms =
+// 16.6 ms/token。48 層 x (512 行 x k=2560) の f32 GEMV = 63 MMAC/token で、
+// CPU の実効 3.8 GMAC/s は f32 の帯域 (重み 250 MB/token・50 GB/s なら 5 ms)
+// からも大きく外れている。
+//
+// カーネルは新規に作らず、s49 の fp32 lm_head と同じ `dno_matvec_f32` を流用する
+// (.cu / PTX は 1 バイトも変えない = このコンテナでは PTX を再生成できない):
+//   - 1 行 = 1 ブロック (grid=(n,1,1))・k を d=0..k-1 の昇順に
+//     `s = __fadd_rn(s, __fmul_rn(h[d], row[d]))`
+//   - PTX を確認: `mul.rn.f32` + `add.rn.f32` のみ。`fma.rn` 0 個・`.ftz` 0 個
+//     (非正規化も保存)。加算の連鎖は d の昇順そのもの (4 倍展開でも鎖は直列)。
+//   - CPU 側 (GgufLinear の F32 経路) は同じ 4 バイトを `f32::from_le_bytes` で
+//     開き、`acc += row[i] * x[i]` を i 昇順で 1 要素ずつ丸める (FMA 無し・行並列
+//     でも行内の順序は不変)。同じ演算列なので**ビット一致**する。
+//
+// 重みは GGUF ブロックのレジストリと同じ LRU を共有する (`DENNO_GPU_WEIGHT_MB`
+// の枠は 1 本。48 層 x 5.2 MB = 250 MB)。枠が足りない・GPU が無い・確保に
+// 失敗した場合は全部 CPU 参照へ落ちる (fail-closed・panic しない)。
+
+/// task 69: ルータ GPU 経路のスコープド恒久ラッチ (他の GPU 経路へ波及させない)。
+static ROUTER_GPU_BROKEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// task 69: ルータ GPU の入口に入った回数 (テスト専用)。
+///
+/// 「ゲートを足したが分岐が通っていない」を GPU 無しで検出するために、
+/// `cuda_enabled()` の判定より**前**で数える (`moe_ffn_quant` → `GgufLinear::gemv`
+/// → ここ、の配線が生きていることの証拠)。
+#[cfg(test)]
+static ROUTER_GPU_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn router_gpu_attempts() -> usize {
+    ROUTER_GPU_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn router_gpu_attempts_reset() {
+    ROUTER_GPU_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 69: ルータ用スクラッチ。lm_head の `Scratch` と分ける (形が違うので
+/// 同じ枠を使うと毎回作り直しになる)。x = [k] f32・out = [n] f32。
+struct RouterScratch {
+    x: Option<DevBuffer>,
+    out: Option<DevBuffer>,
+    hx: Option<PinMem>,
+    ho: Option<PinMem>,
+}
+
+thread_local! {
+    static ROUTER_SC: std::cell::RefCell<RouterScratch> = std::cell::RefCell::new(RouterScratch {
+        x: None,
+        out: None,
+        hx: None,
+        ho: None,
+    });
+}
+
+/// task 69: f32 重みを (初回だけ) VRAM へ上げて常駐エントリを返す。
+///
+/// レジストリは GGUF ブロックと同じ (`gguf_registry`)。予算・退避・使用中ピン・
+/// 失敗時の会計は `weights_for_gguf` と同一の規約で、違うのは行の単位
+/// (k * 4 バイト固定) だけ。
+fn weights_for_f32(uid: u64, bytes: &[u8], k: usize, n: usize) -> Result<GgufWRef> {
+    use crate::kquant::GgmlType as T;
+    let reg = gguf_registry();
+    let mut g = reg
+        .lock()
+        .map_err(|_| anyhow::anyhow!("gguf weights registry poisoned"))?;
+    if g.map.contains_key(&uid) {
+        let e = g.map.get(&uid).expect("contains_key");
+        let (ek, en, ety) = (e.k, e.n, e.ty);
+        if (ek, en, ety) != (k, n, T::F32) {
+            bail!(
+                "uid 重複: 同一 uid {uid} に別の形状/型 (登録済み k={ek} n={en} ty={ety:?} / 今回 k={k} n={n} ty=F32)"
+            );
+        }
+        g.lru.touch(uid);
+        g.lru.pin(uid);
+        let e = g.map.get(&uid).expect("pinned");
+        let w = unsafe { std::mem::transmute::<&GpuGgufW, &'static GpuGgufW>(e.as_ref()) };
+        return Ok(GgufWRef { w, uid });
+    }
+    let want = n
+        .checked_mul(k)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or_else(|| anyhow::anyhow!("f32: n * k * 4 が usize を溢れる"))?;
+    if bytes.len() != want {
+        bail!(
+            "f32: バイト数 {} が n * k * 4 = {} と違う (k={k}, n={n})",
+            bytes.len(),
+            want
+        );
+    }
+    // P46 と同じ: 確保の前に上限と空き VRAM を見て古い uid を解放する。
+    let cap = crate::gpu_budget::weight_cap_bytes();
+    let free_mb = if cap == 0 {
+        None
+    } else {
+        dev_mem_mb().map(|(f, _total)| f as u64)
+    };
+    let ev0 = (g.lru.evicted_tensors(), g.lru.evicted_bytes());
+    let victims =
+        crate::gpu_budget::plan_weight_evictions(&mut g.lru, uid, want as u64, cap, free_mb);
+    let mut dropped: Vec<u64> = Vec::new();
+    for v in &victims {
+        if g.map.remove(v).is_some() {
+            dropped.push(*v);
+        }
+    }
+    let freed = g.lru.evicted_bytes().saturating_sub(ev0.1);
+    let freed_n = g.lru.evicted_tensors().saturating_sub(ev0.0);
+    if freed_n > 0 {
+        crate::gpu_budget::note_weight_evicted(freed_n, freed);
+    }
+    // 生バイトのスライスは 4 バイト整列を保証しない (`Vec<u8>` / mmap の途中) ので、
+    // CPU と同じ `from_le_bytes` で f32 に開いてから上げる (値は 1 bit も変わらない)。
+    let mut host: Vec<f32> = Vec::with_capacity(k * n);
+    for c in bytes.chunks_exact(4) {
+        host.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    }
+    let buf = match DevBuffer::from_slice(&host) {
+        Ok(b) => b,
+        Err(e) => {
+            g.lru.note_remove(uid);
+            return Err(e);
+        }
+    };
+    tracing::info!(
+        "CUDA f32 weight upload (uid={uid}): router k={k} n={n} ({:.1} MB)",
+        want as f64 / 1e6
+    );
+    g.map.insert(uid, Box::new(GpuGgufW { buf, ty: T::F32, k, n }));
+    g.lru.pin(uid);
+    let resident = g.map.len();
+    let used = g.lru.used_bytes();
+    let w = {
+        let e = g.map.get(&uid).expect("just inserted");
+        unsafe { std::mem::transmute::<&GpuGgufW, &'static GpuGgufW>(e.as_ref()) }
+    };
+    drop(g);
+    crate::gpu_budget::note_weight_upload();
+    crate::gpu_budget::note_weight_upload_bytes(want as u64);
+    crate::gpu_budget::note_weight_resident(resident, used);
+    if w_dbg() {
+        let free = match dev_mem_mb() {
+            Some((f, t)) => format!("空き {f} MiB / 全 {t} MiB"),
+            None => "空き 不明".to_string(),
+        };
+        let ev = if dropped.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " / 今回退避 {} 本 {:.1} MiB",
+                dropped.len(),
+                freed as f64 / (1 << 20) as f64
+            )
+        };
+        tracing::info!(
+            target: "denno_engine::gpu_w",
+            "[gpu-w] uid={uid} f32 router k={k} n={n} {:.2} MB / 常駐 {} 本 {:.1} MiB{ev} / {free}",
+            want as f64 / 1e6,
+            resident,
+            used as f64 / (1 << 20) as f64,
+        );
+    }
+    Ok(GgufWRef { w, uid })
+}
+
+/// task 69: ルータ f32 重みの常駐エントリを解放する (`GgufLinear::drop` から)。
+/// 載っていない uid・量子化型の uid は触らない。
+pub fn unregister_f32_weights(uid: u64) {
+    let Ok(mut g) = gguf_registry().lock() else {
+        return;
+    };
+    let is_f32 = g
+        .map
+        .get(&uid)
+        .map(|e| e.ty == crate::kquant::GgmlType::F32)
+        .unwrap_or(false);
+    if is_f32 {
+        g.map.remove(&uid);
+        let freed = g.lru.note_remove(uid);
+        if freed > 0 {
+            crate::gpu_budget::note_weight_resident(g.map.len(), g.lru.used_bytes());
+        }
+    }
+}
+
+/// task 69: ルータ (f32・m=1) を GPU で計算して `out` に書く。
+///
+/// `false` = 呼び出し側は CPU 参照で計算すること (GPU 無効・PTX 未収録・予算外・
+/// 実行時エラー)。数値は CPU 経路とビット一致するので、どちらに落ちても出力は
+/// 変わらない。
+pub fn maybe_gpu_router_gemv_into(
+    uid: u64,
+    bytes: &[u8],
+    k: usize,
+    n: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> bool {
+    use std::sync::atomic::Ordering as AO;
+    #[cfg(test)]
+    ROUTER_GPU_ATTEMPTS.fetch_add(1, AO::Relaxed);
+    if !cuda_enabled() || ROUTER_GPU_BROKEN.load(AO::Relaxed) {
+        return false;
+    }
+    if k == 0
+        || n == 0
+        || x.len() != k
+        || out.len() != n
+        || bytes.len() != k.saturating_mul(n).saturating_mul(4)
+        || k > i32::MAX as usize
+        || n > i32::MAX as usize
+    {
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if let Err(e) = ctx.make_current() {
+        tracing::error!("CUDA cuCtxSetCurrent failed (router f32), using CPU: {e:#}");
+        ROUTER_GPU_BROKEN.store(true, AO::Relaxed);
+        return false;
+    }
+    // カーネルハンドル (未収録 PTX は None をキャッシュ = ラッチしない)
+    let Some(f) = matvec_f32_fn(ctx) else {
+        return false;
+    };
+    let prof = crate::model::devprof::on();
+    let up_before = if prof {
+        crate::gpu_budget::weight_upload_bytes()
+    } else {
+        0
+    };
+    let w = match weights_for_f32(uid, bytes, k, n) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!(
+                "router f32 weight register failed (uid={uid}), using CPU permanently: {e:#}"
+            );
+            ROUTER_GPU_BROKEN.store(true, AO::Relaxed);
+            return false;
+        }
+    };
+    let lib = match lib() {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("CUDA lib load failed (router f32), using CPU: {e:#}");
+            ROUTER_GPU_BROKEN.store(true, AO::Relaxed);
+            return false;
+        }
+    };
+    let r = ROUTER_SC.with(|cell| -> Result<()> {
+        let mut s = cell.borrow_mut();
+        let RouterScratch {
+            x: dx,
+            out: dout,
+            hx,
+            ho,
+        } = &mut *s;
+        let bytes_x = k * 4;
+        let bytes_out = n * 4;
+        Scratch::ensure(dx, bytes_x)?;
+        Scratch::ensure(dout, bytes_out)?;
+        Scratch::ensure_pin(hx, bytes_x)?;
+        Scratch::ensure_pin(ho, bytes_out)?;
+        let (dx, dout) = (dx.as_ref().unwrap(), dout.as_ref().unwrap());
+        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        hx.as_mut_slice::<f32>()[..k].copy_from_slice(x);
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(
+                    dx.ptr(),
+                    hx.ptr as *const c_void,
+                    bytes_x,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyHtoDAsync",
+            )?;
+            let (mut ph, mut pw, mut po) = (dx.ptr(), w.buf.ptr(), dout.ptr());
+            let (mut kc, mut nc) = (k as c_int, n as c_int);
+            let mut args = [
+                &mut ph as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            // 1 block = 1 行 (カーネルが block 内全スレッドで同一計算するため
+            // block=(1,1,1))。grid.x は 2^31-1 まで合法。
+            ctx.launch_async(f, (n as u32, 1, 1), (1, 1, 1), 0, &mut args)?;
+            check(
+                (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync",
+            )?;
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        }
+        ctx.sync()?;
+        out.copy_from_slice(&ho.as_slice::<f32>()[..n]);
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            set_last_linear_ran_on_gpu(true);
+            if prof {
+                let up_w = crate::gpu_budget::weight_upload_bytes().saturating_sub(up_before);
+                crate::model::devprof::note_bytes(k as u64 * 4 + up_w, n as u64 * 4);
+            }
+            true
+        }
+        Err(e) => {
+            tracing::error!("CUDA router f32 gemv failed, using CPU permanently: {e:#}");
+            ROUTER_GPU_BROKEN.store(true, AO::Relaxed);
+            false
         }
     }
 }
@@ -12601,6 +12935,107 @@ mod tests {
         // ゲート: 形状不正 (w.len() != k*n) は None (CPU フォールバック) であること
         let w = vec![0.0f32; 10];
         assert!(maybe_gpu_matvec_f32(9_000_002, &w, &[0.0; 4], 4, 3).is_none());
+    }
+
+    /// task 69: ルータ (f32 512x2560) の GPU 経路が CPU 経路と**ビット一致**する
+    /// こと。合成行列は ±1e3 の一様乱数で、64 行ごとに全体を 1e-42 (非正規化域) に
+    /// した行を混ぜる — その行の積は 1e-39 前後の非正規化数になるので、もし
+    /// カーネルが FTZ (flush-to-zero) で走っていれば和がちょうど 0 になって落ちる。
+    /// 比較は `to_bits()` (`==` は -0.0 と 0.0 を区別しない)。
+    #[test]
+    #[ignore] // GPU が必要: cargo test --release --features cuda -- --ignored
+    fn cuda_f32_gemv_bit_exact_vs_cpu() {
+        use crate::kquant::GgmlType;
+        use crate::model::linear_gguf;
+        let _g = test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let _ctx = CudaCtx::new().unwrap();
+        let (k, n) = (2560usize, 512usize);
+
+        // 決定的な擬似乱数 ([-1e3, 1e3) の一様)。
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 8_388_608.0) * 2000.0 - 1000.0
+        };
+        let mut w = vec![0f32; k * n];
+        for r in 0..n {
+            for i in 0..k {
+                let v = next();
+                w[r * k + i] = if r % 64 == 0 {
+                    // 非正規化の積を作る行 (x は ±1e3 なので積は ~1e-39)。
+                    if i % 2 == 0 {
+                        1.0e-42
+                    } else {
+                        -1.0e-42
+                    }
+                } else if i % 64 == 63 {
+                    -1.0e-42 // 通常行にも小さい値を混ぜる
+                } else {
+                    v
+                };
+            }
+        }
+        let mut x = vec![0f32; k];
+        for i in 0..k {
+            let v = next();
+            x[i] = if i % 32 == 31 { 3.0e-40 } else { v };
+        }
+
+        let w_bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let lin = linear_gguf::GgufLinear::from_slice(GgmlType::F32, k, n, &w_bytes)
+            .expect("GgufLinear(F32)")
+            .with_router_gpu(true);
+
+        // 1. CPU 参照 (GPU ゲートを切る)。
+        linear_gguf::set_router_gpu_for_test(Some(false));
+        let mut cpu = vec![0f32; n];
+        lin.gemv(&x, &mut cpu).expect("CPU 参照");
+        set_last_linear_ran_on_gpu(false);
+
+        // 2. GPU 経路。不発なら fail (PTX 未収録・DENNO_CUDA 無効を黙って通さない)。
+        linear_gguf::set_router_gpu_for_test(Some(true));
+        let mut gpu = vec![0f32; n];
+        lin.gemv(&x, &mut gpu).expect("GPU 経路");
+        let fired = last_linear_ran_on_gpu();
+        linear_gguf::set_router_gpu_for_test(None);
+        assert!(
+            fired,
+            "ルータ GPU 経路が不発 (kernels_elem.ptx に dno_matvec_f32 が無い / DENNO_CUDA 無効)"
+        );
+
+        // 3. 非正規化の行が実際に非ゼロであること (FTZ 検出の前提)。
+        let tiny_rows: Vec<usize> = (0..n).step_by(64).collect();
+        for &r in &tiny_rows {
+            assert!(
+                cpu[r] != 0.0,
+                "行 {r} の CPU 参照が 0 (非正規化の検出力が無い)"
+            );
+        }
+
+        // 4. 1 要素も違わない。
+        for i in 0..n {
+            assert_eq!(
+                gpu[i].to_bits(),
+                cpu[i].to_bits(),
+                "行 {i} が bit 不一致 (gpu={} cpu={})",
+                gpu[i],
+                cpu[i]
+            );
+        }
+
+        // 5. 決定論 (同一入力の 2 回目)。
+        let mut gpu2 = vec![0f32; n];
+        lin.gemv(&x, &mut gpu2).expect("GPU 経路 2 回目");
+        for i in 0..n {
+            assert_eq!(gpu2[i].to_bits(), gpu[i].to_bits(), "行 {i} が非決定論的");
+        }
+        println!(
+            "cuda router f32 gemv k={k} n={n}: bit exact OK (非正規化の行 {} 本)",
+            tiny_rows.len()
+        );
     }
 
     /// s48 (C1): qwen35 形状 (dh=256・heads=16・kv_heads=4・group=4 = 実 9B の
