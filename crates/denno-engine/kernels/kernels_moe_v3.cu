@@ -12,20 +12,25 @@
 // CPU の逐次実装との差は丸め順だけ (相対 1e-5 以内。テスト
 // `cuda_gemv_v3_matches_cpu`)。
 //
-// レイアウト: warp (32 lane) = 8 行 × 4 レーン。block 256 スレッド = 64 行。
-//   1 行を 4 レーンが担当し、レーン l は k を 4 等分した連続区間
-//   [l*k/4, (l+1)*k/4) を持つ。区間長 k/4 は 32 の倍数 (k が 128 の倍数) で
-//   あることを前提にする。満たさない k はホスト側 (`moe_gemv_v3_k_ok`) が
-//   v2 へ落とすので、このカーネルには来ない。
+// レイアウト: `lanes` レーンが 1 行を分担する (blockDim = rows_per_block * lanes)。
+//   レーン l は k を lanes 等分した連続区間 [l*k/lanes, (l+1)*k/lanes) を持ち、
+//   その中で量子ブロック (最小 32 要素) を丸ごと読む。したがって区間長が 32 の
+//   倍数であることが要る (lanes=4 は k が 128 の倍数、lanes=2 は k が 64 の倍数)。
+//   満たさない k はホスト側 (`moe_gemv_v3_lanes`) が v2 へ落とすので来ない。
+//   `rows_per_block` と `lanes` は**カーネル引数**で受ける (rows は
+//   DENNO_GEMV_V3_ROWS で 8/16/32/64・既定 64)。引数を増やしたのでこの PTX は
+//   旧版と別 ABI になる (v2 の .cu / .ptx には一切触らない)。
+//   行番号は blockIdx.x * rows_per_block + threadIdx.x / lanes (lanes は 2 の冪)。
 //
 // v2 との違い (数値以外):
 //   - v2 は行の生バイトを 64 レーンで共有メモリへステージしてから 1 レーンが
-//     消費していた。v3 は 4 レーンが自分の区間を global から直接読む
-//     (1 行あたりの読み出しバイト数は同じ。64 行/ブロックでは行の生バイトを
+//     消費していた。v3 は lanes レーンが自分の区間を global から直接読む
+//     (1 行あたりの読み出しバイト数は同じ。rows=64 では行の生バイトを
 //     共有メモリに置くと k=2560 の Q4_K で 90 KiB になり 48 KiB の既定を超える
 //     ため、ステージしない)。
 //   - 無効行 (row >= n_out) のスレッドもシャッフルには参加する (マスクが
 //     warp 全体なので、早期 return すると __shfl_down_sync が揃わない)。
+//     lanes=2 で rows=8 (blockDim=16) のときはマスクを実在する 16 スレッドに絞る。
 //
 // ブロックレイアウトは ggml 仕様 (llama.cpp, MIT) に従う。ライセンス台帳は
 // `docs/history/80_licenses.md`。
@@ -66,25 +71,38 @@ __device__ __forceinline__ void dno_scale_min_k4_v3(int j, const unsigned char* 
     }
 }
 
-#define MOE_V3_ROWS_PER_BLOCK 64
-#define MOE_V3_LANES 4
+#define MOE_V3_ROWS_DEFAULT 64
+#define MOE_V3_LANES_MAX 4
 
-// 行番号とレーン番号。4 レーンは同一行を担当し、スレッド番号が連続する
-// (warp 内の 0..3, 4..7, ... がそれぞれ 1 行) ので、シャッフルは 4 レーンの
-// 中で閉じる。
-__device__ __forceinline__ int moe_v3_row_of(int* lane)
+// 行番号とレーン番号。lanes レーンが同一行を担当し、スレッド番号が連続する
+// (lane = threadIdx.x & (lanes-1)、行内番号 = threadIdx.x / lanes)。
+// lanes は 2 か 4 (2 の冪) なので、割り算はシフトで足りる。
+// シャッフルは lanes レーンの中で閉じる。
+__device__ __forceinline__ int moe_v3_row_of(int rows_per_block, int lanes, int* lane)
 {
     const int t = threadIdx.x;
-    *lane = t & (MOE_V3_LANES - 1);
-    return blockIdx.x * MOE_V3_ROWS_PER_BLOCK + (t / MOE_V3_LANES);
+    const int lshift = (lanes == MOE_V3_LANES_MAX) ? 2 : 1;
+    *lane = t & (lanes - 1);
+    return blockIdx.x * rows_per_block + (t >> lshift);
 }
 
-// 4 レーンの合計 (offset 1, 2 の 2 段)。lane 0 の値だけが使われる。
-// マスクは warp 全体なので、呼び出し時に warp の全スレッドが揃っていること。
-__device__ __forceinline__ float moe_v3_reduce4(float v)
+// シャッフルのマスク。ブロックが 1 warp 未満 (rows=8 の 2 レーン版 = 16 スレッド)
+// のときは実在しないスレッドをマスクに含めない。
+__device__ __forceinline__ unsigned int moe_v3_mask()
 {
-    v += __shfl_down_sync(0xffffffffu, v, 1);
-    v += __shfl_down_sync(0xffffffffu, v, 2);
+    const unsigned int n = blockDim.x;
+    return (n >= 32u) ? 0xffffffffu : ((1u << n) - 1u);
+}
+
+// lanes レーンの合計 (offset 1 の 1 段。4 レーンのときだけ offset 2 の 2 段目)。
+// 加算順は 4 レーン版の従来 (offset 1 → 2) と同じ。lane 0 の値だけが使われる。
+// マスクは warp 全体 (または実在する全スレッド) なので、呼び出し時に揃っていること。
+__device__ __forceinline__ float moe_v3_reduce(float v, int lanes, unsigned int mask)
+{
+    v += __shfl_down_sync(mask, v, 1);
+    if (lanes == MOE_V3_LANES_MAX) {
+        v += __shfl_down_sync(mask, v, 2);
+    }
     return v;
 }
 
@@ -108,17 +126,18 @@ extern "C" __global__ void dno_gemv_q8_0_v3(
     const unsigned char* __restrict__ w,
     const float* __restrict__ x,
     float* __restrict__ out,
-    int n_in, int n_out, int row_bytes)
+    int n_in, int n_out, int row_bytes, int rows_per_block, int lanes)
 {
     int lane;
-    const int row = moe_v3_row_of(&lane);
+    const int row = moe_v3_row_of(rows_per_block, lanes, &lane);
     const bool valid = (row < n_out);
+    const unsigned int mask = moe_v3_mask();
 
     float acc = 0.0f;
     if (valid) {
         const unsigned char* rowp = w + (size_t)row * (size_t)row_bytes;
         const int nb = n_in >> 5;
-        const int per = nb >> 2; // 1 レーンぶんのブロック数 (nb は 4 の倍数)
+        const int per = nb / lanes; // 1 レーンぶんのブロック数 (nb は lanes の倍数)
         for (int b = lane * per; b < (lane + 1) * per; ++b) {
             const unsigned char* blk = rowp + (size_t)b * 34u;
             const float d = dno_f16_to_f32_v3(blk);
@@ -132,7 +151,7 @@ extern "C" __global__ void dno_gemv_q8_0_v3(
             }
         }
     }
-    acc = moe_v3_reduce4(acc);
+    acc = moe_v3_reduce(acc, lanes, mask);
     if (valid && lane == 0) out[row] = acc;
 }
 
@@ -143,17 +162,18 @@ extern "C" __global__ void dno_gemv_q5_1_v3(
     const unsigned char* __restrict__ w,
     const float* __restrict__ x,
     float* __restrict__ out,
-    int n_in, int n_out, int row_bytes)
+    int n_in, int n_out, int row_bytes, int rows_per_block, int lanes)
 {
     int lane;
-    const int row = moe_v3_row_of(&lane);
+    const int row = moe_v3_row_of(rows_per_block, lanes, &lane);
     const bool valid = (row < n_out);
+    const unsigned int mask = moe_v3_mask();
 
     float acc = 0.0f;
     if (valid) {
         const unsigned char* rowp = w + (size_t)row * (size_t)row_bytes;
         const int nb = n_in >> 5;
-        const int per = nb >> 2;
+        const int per = nb / lanes;
         for (int b = lane * per; b < (lane + 1) * per; ++b) {
             const unsigned char* blk = rowp + (size_t)b * 24u;
             const float d = dno_f16_to_f32_v3(blk);
@@ -181,32 +201,33 @@ extern "C" __global__ void dno_gemv_q5_1_v3(
             }
         }
     }
-    acc = moe_v3_reduce4(acc);
+    acc = moe_v3_reduce(acc, lanes, mask);
     if (valid && lane == 0) out[row] = acc;
 }
 
 // ---------------------------------------------------------------------------
 // Q4_K: d(2B) + dmin(2B) + scales[12] + qs[128] = 144 B / 256 要素
 //
-// レーン境界 k/4 は 32 要素 (サブブロック) の倍数だが 256 要素 (スーパーブロック)
-// の倍数とは限らない (k=2560 では 640 = 2.5 ブロック) ので、レーンの担当区間に
-// 重なるスーパーブロックを回り、その中でレーン内のサブブロックだけを計算する。
-// レーン外のサブブロックは読まない (x も q も触らない)。
+// レーン境界 k/lanes は 32 要素 (サブブロック) の倍数だが 256 要素 (スーパー
+// ブロック) の倍数とは限らない (k=2560 / lanes=4 では 640 = 2.5 ブロック) ので、
+// レーンの担当区間に重なるスーパーブロックを回り、その中でレーン内のサブブロック
+// だけを計算する。レーン外のサブブロックは読まない (x も q も触らない)。
 // ---------------------------------------------------------------------------
 extern "C" __global__ void dno_gemv_q4k_v3(
     const unsigned char* __restrict__ w,
     const float* __restrict__ x,
     float* __restrict__ out,
-    int n_in, int n_out, int row_bytes)
+    int n_in, int n_out, int row_bytes, int rows_per_block, int lanes)
 {
     int lane;
-    const int row = moe_v3_row_of(&lane);
+    const int row = moe_v3_row_of(rows_per_block, lanes, &lane);
     const bool valid = (row < n_out);
+    const unsigned int mask = moe_v3_mask();
 
     float acc = 0.0f;
     if (valid) {
         const unsigned char* rowp = w + (size_t)row * (size_t)row_bytes;
-        const int seg = n_in >> 2; // 1 レーンぶんの要素数 (32 の倍数)
+        const int seg = n_in / lanes; // 1 レーンぶんの要素数 (32 の倍数)
         const int lo = lane * seg;
         const int hi = lo + seg;
         const int b0 = lo >> 8;
@@ -240,7 +261,7 @@ extern "C" __global__ void dno_gemv_q4k_v3(
             }
         }
     }
-    acc = moe_v3_reduce4(acc);
+    acc = moe_v3_reduce(acc, lanes, mask);
     if (valid && lane == 0) out[row] = acc;
 }
 
@@ -254,16 +275,17 @@ extern "C" __global__ void dno_gemv_q5k_v3(
     const unsigned char* __restrict__ w,
     const float* __restrict__ x,
     float* __restrict__ out,
-    int n_in, int n_out, int row_bytes)
+    int n_in, int n_out, int row_bytes, int rows_per_block, int lanes)
 {
     int lane;
-    const int row = moe_v3_row_of(&lane);
+    const int row = moe_v3_row_of(rows_per_block, lanes, &lane);
     const bool valid = (row < n_out);
+    const unsigned int mask = moe_v3_mask();
 
     float acc = 0.0f;
     if (valid) {
         const unsigned char* rowp = w + (size_t)row * (size_t)row_bytes;
-        const int seg = n_in >> 2;
+        const int seg = n_in / lanes;
         const int lo = lane * seg;
         const int hi = lo + seg;
         const int b0 = lo >> 8;
@@ -296,6 +318,6 @@ extern "C" __global__ void dno_gemv_q5k_v3(
             }
         }
     }
-    acc = moe_v3_reduce4(acc);
+    acc = moe_v3_reduce(acc, lanes, mask);
     if (valid && lane == 0) out[row] = acc;
 }
