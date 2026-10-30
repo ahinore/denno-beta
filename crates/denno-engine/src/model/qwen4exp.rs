@@ -5063,6 +5063,10 @@ fn prefill_batch_enabled() -> bool {
 /// chunk 64 では 1 チャンクで 365 体ぶんの expert 重みを読む (1 体あたり 1.4
 /// トークンしか使わない)。512 まで上げると 1 体あたり 10 トークンになり、
 /// トークンあたりの expert 読み出しが 5.7 分の 1 になる。
+///
+/// 2026-10-30: 既定を 8 から **512** へ (上の実測に合わせる)。`DENNO_PREFILL_BATCH_CHUNK`
+/// で下げられるが、512 未満は expert の読み直しが増えるだけなので通常は触らない。
+/// 中間バッファが増える (hc_mix の 512 トークンぶん) ので、RAM が厳しい環境だけ下げる。
 fn prefill_batch_chunk() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -5070,7 +5074,7 @@ fn prefill_batch_chunk() -> usize {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .map(|n| n.clamp(1, 512))
-            .unwrap_or(8)
+            .unwrap_or(512)
     })
 }
 
