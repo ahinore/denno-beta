@@ -1677,6 +1677,13 @@ impl ExpertW {
     fn gemv(&self, e: usize, x: &[f32], out: &mut [f32]) -> Result<()> {
         let s = self.slice(e)?;
         let (n_in, n_out) = (self.n_in, self.n_out);
+        // decode 用の VNNI 経路 (Q4_K / Q5_1 / Q8_0、`DENNO_GEMV_VNNI=1` のときだけ)。
+        // 使えないときは false が返るので従来の入口へ落とす (既定は必ずこちら)。
+        if moe_expert::expert_gemv_any_vnni(self.ty, s, n_in, n_out, x, out)
+            .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))?
+        {
+            return Ok(());
+        }
         moe_expert::expert_gemv_any(self.ty, s, n_in, n_out, x, out)
             .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))
     }
@@ -1689,6 +1696,12 @@ impl ExpertW {
     fn gemv_seq(&self, e: usize, x: &[f32], out: &mut [f32]) -> Result<()> {
         let s = self.slice(e)?;
         let (n_in, n_out) = (self.n_in, self.n_out);
+        // [`ExpertW::gemv`] と同じゲート (行並列なしの版)。
+        if moe_expert::expert_gemv_any_vnni_seq(self.ty, s, n_in, n_out, x, out)
+            .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))?
+        {
+            return Ok(());
+        }
         moe_expert::expert_gemv_any_seq(self.ty, s, n_in, n_out, x, out)
             .map_err(|err| one(format!("{}: expert {e}: {err}", self.name)))
     }
@@ -6093,6 +6106,12 @@ fn expert_gemv_cached(
     let bytes = c
         .get(m, w.file, key, off, len)
         .map_err(|err| one(format!("{}: expert {} (cache): {err}", w.name, key.expert)))?;
+    // mmap 経路と同じゲートを通す (同じバイト列なら同じカーネル・同じ丸め順)。
+    if moe_expert::expert_gemv_any_vnni(w.ty, &bytes, w.n_in, w.n_out, x, out)
+        .map_err(|err| one(format!("{}: expert {} (cache): {err}", w.name, key.expert)))?
+    {
+        return Ok(());
+    }
     moe_expert::expert_gemv_any(w.ty, &bytes, w.n_in, w.n_out, x, out)
         .map_err(|err| one(format!("{}: expert {} (cache): {err}", w.name, key.expert)))
 }
@@ -6118,6 +6137,11 @@ fn expert_gemv_cached_seq(
     let bytes = c
         .get(m, w.file, key, off, len)
         .map_err(|err| one(format!("{}: expert {ei} (cache): {err}", w.name)))?;
+    if moe_expert::expert_gemv_any_vnni_seq(w.ty, &bytes, w.n_in, w.n_out, x, out)
+        .map_err(|err| one(format!("{}: expert {ei} (cache): {err}", w.name)))?
+    {
+        return Ok(());
+    }
     moe_expert::expert_gemv_any_seq(w.ty, &bytes, w.n_in, w.n_out, x, out)
         .map_err(|err| one(format!("{}: expert {ei} (cache): {err}", w.name)))
 }
@@ -6179,7 +6203,8 @@ mod tests {
     static MOE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn moe_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        MOE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        // VNNI のゲートを開くテスト (moe_expert 側) と同じミューテックス。
+        moe_expert::moe_test_lock()
     }
 
     /// 合成 GGUF のデータ部アラインメント (`gguf.rs` の既定と同じ)。
@@ -6511,6 +6536,45 @@ mod tests {
             "CPU 経路で expert_gemv_any が 3 本 × top-k 回呼ばれていない (既定で GPU 経路に入った?)"
         );
         assert_bitwise_eq(&base, &got, "route=Cpu");
+    }
+
+    /// M=1 VNNI のゲートを開けたとき、decode の CPU 経路が `expert_gemv_any` ではなく
+    /// VNNI カーネルを通ること (配線の確認。緑 = 経路が発動した証拠ではないので数を数える)。
+    #[test]
+    fn moe_ffn_quant_cpu_route_uses_vnni_when_enabled() {
+        let _g = moe_test_guard();
+        if !moe_expert::vnni_supported() {
+            eprintln!("skip moe_ffn_quant_cpu_route_uses_vnni_when_enabled: avx512vnni が無い");
+            return;
+        }
+        let dir = TempDir::new("route_vnni");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        let before_any = moe_expert::any_calls();
+        let before_vnni = moe_expert::gemv_vnni_calls();
+        let got = {
+            let _gate = moe_expert::VnniGateGuard::on();
+            moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("Cpu 経路")
+        };
+        let vnni = moe_expert::gemv_vnni_calls() - before_vnni;
+        let any = moe_expert::any_calls() - before_any;
+        // `any_calls` はスレッドローカルなので厳密に見る。`gemv_vnni_calls` は
+        // プロセス全体の数え上げで、moe のガードを取らない他テストの forward が
+        // 混ざりうるので下限で見る (0 なら配線が死んでいる)。
+        assert_eq!(any, 0, "VNNI 経路なのに expert_gemv_any も呼ばれている");
+        assert!(
+            vnni >= 3 * p.n_expert_used,
+            "VNNI カーネルが expert 1 本あたり 3 回 (gate / up / down) 呼ばれていない ({vnni})"
+        );
+        assert!(
+            got.iter().any(|v| *v != 0.0),
+            "出力が全 0 (経路の生死が分からない)"
+        );
+        assert!(got.iter().all(|v| v.is_finite()), "非有限値が出た");
     }
 
     /// P58: ExpertResidency は「前回の送出から変わった層だけ」送る。

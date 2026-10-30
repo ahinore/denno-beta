@@ -27,6 +27,10 @@
 //!   展開せず、144 バイトの量子化ブロックから直接 FMA で内積を取る。累積順が変わるので
 //!   スカラー経路とはビット一致しない (相対 1e-5 / 絶対 1e-4 以内)。
 //!   実行時に `is_x86_feature_detected!` で判定し、AVX2/FMA が無ければスカラーへ落ちる。
+//! - **decode (M=1) 専用**に、活性を 32 要素ブロックで int8 にして `vpdpbusd` で
+//!   積む経路を持つ ([`expert_gemv_any_vnni`])。Q4_K / Q5_1 / Q8_0 が対象で、
+//!   `DENNO_GEMV_VNNI=1` のときだけ [`expert_gemv_any`] の代わりに使われる
+//!   (既定 off。活性を量子化するので f32 経路とはビット一致しない)。
 //! - 行バッファは 1 本だけ確保して行ごとに使い回す (行ごとに `Vec` を作らない)。
 
 use anyhow::{bail, Result};
@@ -2300,6 +2304,515 @@ pub(crate) fn gemm_rows_vnni(
 }
 
 // ===========================================================================
+// ===========================================================================
+// M=1 (decode) の VNNI GEMV: 活性を 32 要素ブロックで int8 にして `vpdpbusd`
+// ===========================================================================
+//
+// prefill のバッチ経路 ([`gemm_rows_vnni`]) は活性の量子化ブロック長が型ごとに
+// 違う (Q4_K は 256、Q5_1 は 32) が、decode は 1 トークン = 1 行なので
+// **型によらず 32 要素固定**で 1 回だけ量子化し、行ループの外に置く。
+//
+// 数値: f32 経路 ([`expert_gemv_any`]) とはビット一致しない。差の出所は
+// (a) 累積順、(b) 活性の int8 量子化。重み側は整数のまま `vpdpbusd` に載るので、
+// 重みの復元式 (Q4_K `d*sc*q - dmin*m`、Q5_1 `d*q + m`、Q8_0 `d*q`) は f32 経路と同一。
+
+/// M=1 用に量子化した活性 (32 要素ブロック。`n_in % 32 == 0` が前提)。
+///
+/// 1 回の GEMV 呼び出しの中で 1 度だけ埋め、行ループでは読むだけにする
+/// (行ごとに量子化し直さない)。
+#[derive(Default)]
+pub(crate) struct VnniActM1 {
+    /// `n_in` 要素の int8 (`round(x / sc[g])` を `[-127, 127]` に clamp)
+    pub q: Vec<i8>,
+    /// `n_in / 32` のスケール (`max|x| / 127`。max が 0 のブロックは 1.0)
+    pub sc: Vec<f32>,
+    /// `n_in / 32` の `Σ x` (量子化前の f32。Q4_K の `Σ m x` と Q5_1 の `m Σ x` 用)
+    pub gs: Vec<f32>,
+    /// `n_in / 32` の `Σ q` (int)。Q8_0 は重みを +128 して u8 にするので、
+    /// その分を i32 で引き戻すのに使う。
+    pub sq: Vec<i32>,
+    /// Q8_0 の引き戻しベクトル (8 レーン × グループ数)。レーン 0 に `128 * Σ q`、
+    /// 残りは 0。ブロックごとに `_mm256_setr_epi32` を組まないための表。
+    pub q8_fix: Vec<i32>,
+}
+
+impl VnniActM1 {
+    /// `x` を 32 要素ブロックで int8 に量子化する (スケールはブロック単位で f32)。
+    pub fn quantize(&mut self, x: &[f32]) -> Result<()> {
+        let n_in = x.len();
+        if n_in == 0 || n_in % 32 != 0 {
+            bail!("VNNI GEMV の活性長 {} が 32 の倍数でない", n_in);
+        }
+        let ng = n_in / 32;
+        self.q.clear();
+        self.q.resize(n_in, 0);
+        self.sc.clear();
+        self.sc.resize(ng, 0.0);
+        self.gs.clear();
+        self.gs.resize(ng, 0.0);
+        // ブロック長 32 固定 (`max|x| / 127`)。gs も 32 要素ごとに作られる。
+        quant_act_i8(x, 1, n_in, 32, &mut self.q, &mut self.sc, &mut self.gs)?;
+        self.sq.clear();
+        self.q8_fix.clear();
+        self.q8_fix.resize(ng * 8, 0);
+        for (g, c) in self.q.chunks_exact(32).enumerate() {
+            let mut s = 0i32;
+            for &v in c {
+                s += v as i32;
+            }
+            self.sq.push(s);
+            self.q8_fix[g * 8] = 128 * s;
+        }
+        Ok(())
+    }
+}
+
+/// 8 レーンの水平和 (既存 AVX2 カーネルと同じ順序)。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn hsum8_avx2(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+    let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    let s = _mm_add_ss(s, _mm_shuffle_ps::<0x55>(s, s));
+    _mm_cvtss_f32(s)
+}
+
+/// 16 レーンの水平和 (`hsum8_avx2` の 2 本を足す)。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,fma,avx512f")]
+unsafe fn hsum16_avx512(v: std::arch::x86_64::__m512) -> f32 {
+    use std::arch::x86_64::*;
+    let lo = _mm512_castps512_ps256(v);
+    // 128 ビット組を [2,3,2,3] に並べ替えると下位 256 ビットが上半分になる。
+    let hi = _mm512_castps512_ps256(_mm512_shuffle_f32x4::<0b11_10_11_10>(v, v));
+    hsum8_avx2(_mm256_add_ps(lo, hi))
+}
+
+/// 16 ビットの各ビットを 1 バイトずつ (0x10 / 0x00) に展開する。
+///
+/// Q5_1 の 5 ビット目 (`qh`) を 32 バイトの u8 に載せるために使う。
+/// `gemm_q5_1_vnni` の中にも同じものがある (prefill 側はそのままにしてある)。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn spread_hi_bits(v: u16) -> std::arch::x86_64::__m128i {
+    use std::arch::x86_64::*;
+    let mask = _mm_setr_epi16(1, 2, 4, 8, 16, 32, 64, 128);
+    let lo = _mm_set1_epi16(v as i16);
+    let hi = _mm_set1_epi16((v >> 8) as i16);
+    let a = _mm_and_si128(
+        _mm_cmpeq_epi16(_mm_and_si128(lo, mask), mask),
+        _mm_set1_epi16(0x10),
+    );
+    let b = _mm_and_si128(
+        _mm_cmpeq_epi16(_mm_and_si128(hi, mask), mask),
+        _mm_set1_epi16(0x10),
+    );
+    _mm_packus_epi16(a, b)
+}
+
+/// 数行先の行頭を L1 へ先読みする (重みは decode では毎層 cold で来る)。
+///
+/// 範囲は `r + PF_ROWS < rows` のときに限るので、行チャンクの外へは触らない。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn prefetch_rows_ahead(row: *const u8, rb: usize, r: usize, rows: usize, ahead: usize) {
+    use std::arch::x86_64::*;
+    if ahead == 0 {
+        return; // A/B 用の逃げ道 (定数なので最適化で消える)
+    }
+    if r + ahead < rows {
+        let nx = row.add(ahead * rb);
+        let mut o = 0usize;
+        while o < rb {
+            _mm_prefetch(nx.add(o) as *const i8, _MM_HINT_T0);
+            o += 128;
+        }
+    }
+}
+
+/// Q4_K の M=1 VNNI カーネル。`out[r] = dot(row_r, x)` (r は渡したチャンク内)。
+///
+/// 1 ブロック (256 要素) = 4 個の 64 要素チャンク。各チャンクは
+/// `[下位 nibble 32 B][上位 nibble 32 B]` を 1 本の 512 ビットにして `vpdpbusd`
+/// 1 回で 64 MAC を取る (`gemm_q4k_vnni` と同じ nibble 順)。
+/// 復元式は `y = (d*sc)*q - dmin*m` なので
+/// `Σ y x = (d*sc)*sd*Σ q xq - dmin*m*Σ x` (sd は 32 要素グループの活性スケール)。
+/// 最小値項の `Σ x` は量子化前の f32 ([`VnniActM1::gs`]) を使う
+/// (活性スケールを掛けると最小値項だけが sd 倍に潰れる)。
+///
+/// # Safety
+///
+/// - `n_in % 256 == 0`、`blocks.len() == n_out * row_bytes(Q4K, n_in)`、
+///   `act` は `n_in` 要素を量子化済み、`out.len() == n_out`。
+/// - 実行 CPU が AVX-512 (F/BW/VL/DQ/VNNI) を持つこと ([`vnni_supported`])。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn gemv_q4k_vnni(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    act: &VnniActM1,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 144; // Q4_K 1 ブロック = 256 要素
+    const PF_ROWS: usize = 3;
+
+    let nb = n_in / 256; // 行あたりのブロック数
+    let rb = nb * BLK;
+    let bp = blocks.as_ptr();
+    let xp = act.q.as_ptr();
+    let scp = act.sc.as_ptr();
+    let gsp = act.gs.as_ptr();
+    let nib = _mm256_set1_epi8(0x0f);
+
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        // 行全体で 1 本のベクタ累積。1 レーンあたりの項数は 4 (チャンク内の
+        // 4 要素) × 4 (チャンク) × ブロック数 = 160 で、誤差は量子化より十分小さい。
+        let mut acc = _mm512_setzero_ps();
+        let mut minsum = 0.0f32;
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let dmin =
+                half::f16::from_bits(std::ptr::read_unaligned(p.add(2) as *const u16)).to_f32();
+            let scq = std::slice::from_raw_parts(p.add(4), 12);
+            let g0 = b * 8; // 32 要素グループの先頭添字
+            let xb = xp.add(b * 256);
+            for j in 0..4usize {
+                let (s0, m0) = scale_min_k4(2 * j, scq);
+                let (s1, m1) = scale_min_k4(2 * j + 1, scq);
+                // 64 要素 = 2 グループ。スケールは [g(2j) ×8, g(2j+1) ×8]。
+                let v0 = _mm256_set1_ps(d * s0 as f32 * *scp.add(g0 + 2 * j));
+                let v1 = _mm256_set1_ps(d * s1 as f32 * *scp.add(g0 + 2 * j + 1));
+                let av = _mm512_insertf32x8(_mm512_castps256_ps512(v0), v1, 1);
+                let qs = _mm256_loadu_si256(p.add(16 + j * 32) as *const __m256i);
+                let lo = _mm256_and_si256(qs, nib);
+                let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(qs), nib);
+                // 要素順: 下位 nibble が先頭 32 要素、上位 nibble が次の 32 要素。
+                let qv = _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+                let xv = _mm512_loadu_si512(xb.add(j * 64) as *const __m512i);
+                let dp = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qv, xv);
+                acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dp), av, acc);
+                minsum += dmin * m0 as f32 * *gsp.add(g0 + 2 * j);
+                minsum += dmin * m1 as f32 * *gsp.add(g0 + 2 * j + 1);
+            }
+        }
+        prefetch_rows_ahead(row, rb, r, n_out, PF_ROWS);
+        *out.get_unchecked_mut(r) = hsum16_avx512(acc) - minsum;
+    }
+}
+
+/// Q5_1 の M=1 VNNI カーネル (1 ブロック = 32 要素 = 24 バイト)。
+///
+/// `y = d*q + m` なので `Σ y x = d*sd*Σ q xq + m*Σ x`。`vpdpbusd` (256 ビット =
+/// 32 MAC) 1 回で `Σ q xq` を取り、ブロックごとに `d*sd` を掛けて累積する。
+/// `m*Σ x` は量子化前の `Σ x` をスカラーで足す。
+///
+/// # Safety
+///
+/// [`gemv_q4k_vnni`] と同じ (Q5_1 は `n_in % 32 == 0` が [`row_bytes`] で保証される)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn gemv_q5_1_vnni(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    act: &VnniActM1,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 24; // d(2) + m(2) + qh(4) + qs(16)
+    const PF_ROWS: usize = 3;
+
+    let nb = n_in / 32;
+    let rb = nb * BLK;
+    let bp = blocks.as_ptr();
+    let xp = act.q.as_ptr();
+    let scp = act.sc.as_ptr();
+    let gsp = act.gs.as_ptr();
+    let nib = _mm_set1_epi8(0x0f);
+
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut acc = _mm256_setzero_ps();
+        let mut msum = 0.0f32;
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let mc =
+                half::f16::from_bits(std::ptr::read_unaligned(p.add(2) as *const u16)).to_f32();
+            let qh = std::ptr::read_unaligned(p.add(4) as *const u32);
+            let qs = _mm_loadu_si128(p.add(8) as *const __m128i);
+            let nib_lo = _mm_and_si128(qs, nib);
+            let nib_hi = _mm_and_si128(_mm_srli_epi16::<4>(qs), nib);
+            // 要素 0..31 = [下位 nibble 16 個, 上位 nibble 16 個] | 5 ビット目
+            let qv = _mm256_set_m128i(
+                _mm_or_si128(nib_hi, spread_hi_bits((qh >> 16) as u16)),
+                _mm_or_si128(nib_lo, spread_hi_bits(qh as u16)),
+            );
+            let xv = _mm256_loadu_si256(xp.add(b * 32) as *const __m256i);
+            let dp = _mm256_dpbusd_epi32(_mm256_setzero_si256(), qv, xv);
+            let sd = *scp.add(b);
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dp), _mm256_set1_ps(d * sd), acc);
+            // gs は量子化前の Σ x なので sd を掛けない (掛けると最小値項が潰れる)。
+            msum += mc * *gsp.add(b);
+        }
+        prefetch_rows_ahead(row, rb, r, n_out, PF_ROWS);
+        *out.get_unchecked_mut(r) = hsum8_avx2(acc) + msum;
+    }
+}
+
+/// Q8_0 の M=1 VNNI カーネル (1 ブロック = 32 要素 = 34 バイト)。
+///
+/// `y = d*q` (q は i8) だが `vpdpbusd` の片側は u8 でなければならない。
+/// そこで重みを `q ^ 0x80 = q + 128` で u8 にし、`128 * Σ q` を i32 のうちに
+/// 引き戻す (`dpbusd` の後に `_mm256_sub_epi32`)。f32 で引くと大きな値の差し引きに
+/// なって桁落ちする。`Σ q` は 32 要素グループごとに 1 回だけ作る
+/// ([`VnniActM1::q8_fix`])。
+///
+/// # Safety
+///
+/// [`gemv_q4k_vnni`] と同じ。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn gemv_q8_0_vnni(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    act: &VnniActM1,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 34; // d(2) + qs(32)
+    // Q8_0 は行が 2720 B と短く、先読みの命令数が本体に比べて重い (実測で 1T が
+    // 33.7 -> 22.6 GMAC/s に落ちた)。ここだけ先読みしない。
+    const PF_ROWS: usize = 0;
+
+    let nb = n_in / 32;
+    let rb = nb * BLK;
+    let bp = blocks.as_ptr();
+    let xp = act.q.as_ptr();
+    let scp = act.sc.as_ptr();
+    let fixp = act.q8_fix.as_ptr();
+    let bias = _mm256_set1_epi8(-128);
+
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut acc = _mm256_setzero_ps();
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let q = _mm256_loadu_si256(p.add(2) as *const __m256i);
+            let qu = _mm256_xor_si256(q, bias);
+            let xv = _mm256_loadu_si256(xp.add(b * 32) as *const __m256i);
+            let dp = _mm256_dpbusd_epi32(_mm256_setzero_si256(), qu, xv);
+            let dp = _mm256_sub_epi32(dp, _mm256_loadu_si256(fixp.add(b * 8) as *const __m256i));
+            let sd = *scp.add(b);
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dp), _mm256_set1_ps(d * sd), acc);
+        }
+        prefetch_rows_ahead(row, rb, r, n_out, PF_ROWS);
+        *out.get_unchecked_mut(r) = hsum8_avx2(acc);
+    }
+}
+
+/// このプロセスで M=1 (decode) の VNNI GEMV を使ってよいか。
+///
+/// 既定は無効。`DENNO_GEMV_VNNI=1` のときだけ有効 (判定はプロセスで 1 回)。
+/// prefill のバッチ経路 (`DENNO_VNNI`) とは別のスイッチにしてある
+/// (decode と prefill を独立に A/B できるようにするため)。
+pub fn gemv_vnni_enabled() -> bool {
+    #[cfg(test)]
+    {
+        match GEMV_VNNI_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => return false,
+            1 => return vnni_supported(),
+            _ => {}
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        vnni_supported()
+            && matches!(
+                std::env::var("DENNO_GEMV_VNNI").ok().as_deref(),
+                Some("1")
+            )
+    })
+}
+
+/// テスト用: M=1 VNNI のゲートを上書きする (`None` で既定に戻す)。
+///
+/// プロセス全体の状態なので、[`gemv_vnni_guard`] (テスト内) を取ったテストだけが呼ぶこと。
+#[cfg(test)]
+pub(crate) fn set_gemv_vnni_for_test(on: Option<bool>) {
+    let v = match on {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    GEMV_VNNI_TEST_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+static GEMV_VNNI_TEST_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// テスト用: M=1 VNNI のゲートを開け、Drop で必ず既定へ戻す (panic でも戻る)。
+#[cfg(test)]
+pub(crate) struct VnniGateGuard;
+
+#[cfg(test)]
+impl VnniGateGuard {
+    pub(crate) fn on() -> Self {
+        set_gemv_vnni_for_test(Some(true));
+        VnniGateGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for VnniGateGuard {
+    fn drop(&mut self) {
+        set_gemv_vnni_for_test(None);
+    }
+}
+
+/// テスト用: MoE の forward と VNNI のゲートを直列化する共有ロック。
+///
+/// ゲートはプロセス全体の状態なので、**ゲートを開くテストは forward を回すテストと
+/// 同じミューテックスを取る**必要がある (取らないと、par/seq のビット一致を
+/// 前後 2 回の呼び出しで見ているテストの間にゲートが開いて落ちる)。
+/// `qwen4exp` 側の `moe_test_guard` もここを指す。
+#[cfg(test)]
+pub(crate) fn moe_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    match L.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+/// テスト用: ゲートを触るテストの直列化 ([`moe_test_lock`] と同じミューテックス)。
+#[cfg(test)]
+pub(crate) fn gemv_vnni_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    moe_test_lock()
+}
+
+/// テスト用: M=1 VNNI カーネルが発火した回数 (プロセス全体)。
+#[cfg(test)]
+static GEMV_VNNI_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn gemv_vnni_fired() {
+    #[cfg(test)]
+    GEMV_VNNI_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// テスト用: M=1 VNNI カーネルが発火した累計回数。
+#[cfg(test)]
+pub(crate) fn gemv_vnni_calls() -> usize {
+    GEMV_VNNI_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// 活性の量子化を 1 回だけ行うためのスクラッチ (スレッドごとに使い回す)。
+// GEMV は 1 トークンで 1440 回呼ばれるので、呼び出しごとに `Vec` を 5 本
+// 確保しない (行並列のワーカーも同じスレッドのスクラッチを再利用する)。
+thread_local! {
+    static GEMV_VNNI_ACT: std::cell::RefCell<VnniActM1> =
+        std::cell::RefCell::new(VnniActM1::default());
+}
+
+/// Flash-Next の decode (M=1) 用 VNNI GEMV。使えたときだけ `true` を返す。
+///
+/// - 対象は Q4_K / Q5_1 / Q8_0。`n_in` は Q4_K が 256 の倍数、Q5_1 / Q8_0 が 32 の倍数。
+/// - `DENNO_GEMV_VNNI=1` が無い / AVX-512 VNNI が無い / 対象外の型・形 → `Ok(false)`
+///   (呼び出し側は [`expert_gemv_any`] へ落とす)。
+/// - [`expert_gemv_any`] の既定動作は変えない (27B のビット一致契約に触らない)。
+pub fn expert_gemv_any_vnni(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<bool> {
+    expert_gemv_any_vnni_inner(ty, blocks, n_in, n_out, x, out, true)
+}
+
+/// [`expert_gemv_any_vnni`] の**行並列を使わない**版。
+///
+/// [`expert_gemv_any_seq`] と同じ用途 (外側で expert を並列化しているとき)。
+/// 行は独立なので、行の分割の有無で各要素の計算順序は変わらない
+/// (どちらの入口も同じカーネル・同じ活性量子化を通るので結果は一致する)。
+pub fn expert_gemv_any_vnni_seq(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<bool> {
+    expert_gemv_any_vnni_inner(ty, blocks, n_in, n_out, x, out, false)
+}
+
+fn expert_gemv_any_vnni_inner(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    par: bool,
+) -> Result<bool> {
+    // ゲートを最初に見る (既定 off のときは引数検証もせずに f32 経路へ返す)。
+    if !gemv_vnni_enabled() {
+        return Ok(false);
+    }
+    match ty {
+        GgmlType::Q4K if n_in % 256 == 0 && n_in > 0 => {}
+        GgmlType::Q5_1 | GgmlType::Q8_0 if n_in % 32 == 0 && n_in > 0 => {}
+        _ => return Ok(false),
+    }
+    let rb = check_gemv_args(ty, blocks, n_in, n_out, x, out)?;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        GEMV_VNNI_ACT.with(|cell| {
+            let mut act = cell.borrow_mut();
+            act.quantize(x)?;
+            gemv_vnni_fired();
+            // クロージャには `&VnniActM1` だけを渡す (RefMut を持たせると !Sync)。
+            let a: &VnniActM1 = &act;
+            // SAFETY: check_gemv_args が blocks/x/out の長さと n_in の粒度を検証済みで、
+            // 直前の n_in % 256 / % 32 の確認と vnni_supported() (gemv_vnni_enabled が
+            // 見ている) がカーネルの前提を満たす。行は独立なので分割しても値は変わらない。
+            for_each_row_chunk(blocks, n_out, rb, out, par, |b, o| unsafe {
+                match ty {
+                    GgmlType::Q4K => gemv_q4k_vnni(b, n_in, o.len(), a, o),
+                    GgmlType::Q5_1 => gemv_q5_1_vnni(b, n_in, o.len(), a, o),
+                    GgmlType::Q8_0 => gemv_q8_0_vnni(b, n_in, o.len(), a, o),
+                    _ => unreachable!("対象外の型は上で弾いている"),
+                }
+            });
+            Ok(true)
+        })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (rb, par);
+        Ok(false)
+    }
+}
+
+// ===========================================================================
 // 可変 m の grouped GEMM: タスク表 (Segment) と CPU 参照実装
 // ===========================================================================
 //
@@ -4373,6 +4886,413 @@ mod tests {
                     t_f / (t_v + t_q)
                 );
             }
+        }
+    }
+
+    // ---- M=1 (decode) の VNNI GEMV -----------------------------------------
+
+    /// M=1 VNNI カーネルが計算する式の f64 参照実装。
+    ///
+    /// **量子化済みの活性** (`q`, `sc`, `gs`) を使うので、差は f32 の累積順だけになる。
+    /// ここが一致すれば nibble / 5 ビット目の並び・32 要素グループと重みスケールの
+    /// 対応・最小値項の扱いが正しい。
+    fn ref_gemv_quantized_f64(
+        ty: GgmlType,
+        blocks: &[u8],
+        n_in: usize,
+        n_out: usize,
+        q: &[i8],
+        sc: &[f32],
+        gs: &[f32],
+    ) -> Vec<f64> {
+        let rb = row_bytes(ty, n_in).unwrap();
+        let ts = ty.type_size();
+        let xq = |i: usize| q[i] as f64;
+        let mut out = vec![0f64; n_out];
+        for (r, o) in out.iter_mut().enumerate() {
+            let row = &blocks[r * rb..(r + 1) * rb];
+            let mut acc = 0.0f64;
+            match ty {
+                GgmlType::Q4K => {
+                    let nb = n_in / 256;
+                    for b in 0..nb {
+                        let bl = &row[b * ts..(b + 1) * ts];
+                        let d = half::f16::from_le_bytes([bl[0], bl[1]]).to_f64();
+                        let dmin = half::f16::from_le_bytes([bl[2], bl[3]]).to_f64();
+                        let scq = &bl[4..16];
+                        for j in 0..4usize {
+                            for half_i in 0..2usize {
+                                let g8 = 2 * j + half_i;
+                                let (sg, mg) = scale_min_k4(g8, scq);
+                                let grp = b * 8 + g8; // 32 要素グループ
+                                let mut dot = 0.0f64;
+                                for i in 0..32usize {
+                                    let byte = bl[16 + j * 32 + i];
+                                    let qn = if half_i == 0 {
+                                        byte & 0x0f
+                                    } else {
+                                        byte >> 4
+                                    } as f64;
+                                    dot += qn * xq(grp * 32 + i);
+                                }
+                                acc += sc[grp] as f64 * d * sg as f64 * dot
+                                    - dmin * mg as f64 * gs[grp] as f64;
+                            }
+                        }
+                    }
+                }
+                GgmlType::Q5_1 => {
+                    let nb = n_in / 32;
+                    for b in 0..nb {
+                        let bl = &row[b * ts..(b + 1) * ts];
+                        let d = half::f16::from_le_bytes([bl[0], bl[1]]).to_f64();
+                        let mc = half::f16::from_le_bytes([bl[2], bl[3]]).to_f64();
+                        let qh = u32::from_le_bytes([bl[4], bl[5], bl[6], bl[7]]);
+                        let mut dot = 0.0f64;
+                        for j in 0..16usize {
+                            let byte = bl[8 + j];
+                            let lo = ((byte & 0x0f) as u32 | (((qh >> j) & 1) << 4)) as f64;
+                            let hi =
+                                (((byte >> 4) as u32) | (((qh >> (16 + j)) & 1) << 4)) as f64;
+                            dot += lo * xq(b * 32 + j) + hi * xq(b * 32 + 16 + j);
+                        }
+                        acc += sc[b] as f64 * d * dot + mc * gs[b] as f64;
+                    }
+                }
+                GgmlType::Q8_0 => {
+                    let nb = n_in / 32;
+                    for b in 0..nb {
+                        let bl = &row[b * ts..(b + 1) * ts];
+                        let d = half::f16::from_le_bytes([bl[0], bl[1]]).to_f64();
+                        let mut dot = 0.0f64;
+                        for i in 0..32usize {
+                            dot += (bl[2 + i] as i8) as f64 * xq(b * 32 + i);
+                        }
+                        acc += sc[b] as f64 * d * dot;
+                    }
+                }
+                other => panic!("テスト対象外の型: {:?}", other),
+            }
+            *o = acc;
+        }
+        out
+    }
+
+    /// 量子化のブロック長・スケール・`Σ x`・`Σ q` を手計算と突き合わせる。
+    #[test]
+    fn vnni_m1_quantize_blocks_scales_and_sums() {
+        let mut x = vec![0f32; 64];
+        x[0] = 2.0;
+        x[1] = -1.0;
+        // 第 2 ブロック (32..64) は全部 0 → スケール 1.0・q は全部 0。
+        let mut a = VnniActM1::default();
+        a.quantize(&x).unwrap();
+        assert_eq!(a.q.len(), 64);
+        assert_eq!(a.sc.len(), 2);
+        assert!((a.sc[0] - 2.0 / 127.0).abs() < 1e-12, "sc[0]={}", a.sc[0]);
+        assert_eq!(a.sc[1], 1.0, "max=0 のブロックのスケールは 1.0");
+        assert_eq!((a.q[0], a.q[1]), (127, -64), "丸めが round-to-nearest でない");
+        assert!(a.q[32..].iter().all(|&v| v == 0));
+        assert!((a.gs[0] - 1.0).abs() < 1e-6, "gs[0]={}", a.gs[0]);
+        assert_eq!(a.gs[1], 0.0);
+        assert_eq!(a.sq[0], 127 - 64);
+        assert_eq!(a.sq[1], 0);
+        assert_eq!(a.q8_fix[0], 128 * (127 - 64));
+        assert_eq!(a.q8_fix[8], 0);
+        assert_eq!(a.q8_fix.len(), 16, "8 レーン x グループ数");
+        // 32 の倍数でない活性は弾く (黙って端数を落とさない)。
+        assert!(a.quantize(&vec![0f32; 48]).is_err());
+    }
+
+    /// 実形 3 種で f32 経路と比べる (誤差の出所は活性の int8 量子化だけ)。
+    ///
+    /// `|x|` が大きいケース (i8 に落とすときの飽和側) も同じループで見る。
+    /// 量子化はブロックごとに `max|x|/127` で正規化するので、値の絶対値では
+    /// 相対誤差は変わらない (変わるのは i8 の飽和ではなく f32 の丸め)。
+    #[test]
+    fn gemv_vnni_matches_f32_path_within_tolerance() {
+        let _g = gemv_vnni_test_guard();
+        if !vnni_supported() {
+            eprintln!("skip gemv_vnni_matches_f32_path_within_tolerance: avx512vnni が無い");
+            return;
+        }
+        let _gate = VnniGateGuard::on();
+        for (tag, ty, n_in, n_out) in [
+            ("Q4_K 2560x640", GgmlType::Q4K, 2560usize, 640usize),
+            ("Q5_1 640x2560", GgmlType::Q5_1, 640usize, 2560usize),
+            ("Q8_0 2560x640", GgmlType::Q8_0, 2560usize, 640usize),
+        ] {
+            let blocks = make_expert(ty, n_in, n_out, 0);
+            for (case, k) in [("通常", 1.0f32), ("|x| 大 (1e4 倍)", 1.0e4f32)] {
+                let x: Vec<f32> = make_x_wide(n_in).iter().map(|v| v * k).collect();
+                let mut want = vec![0f32; n_out];
+                expert_gemv_any(ty, &blocks, n_in, n_out, &x, &mut want).unwrap();
+                let mut got = vec![0f32; n_out];
+                let before = gemv_vnni_calls();
+                let used = expert_gemv_any_vnni(ty, &blocks, n_in, n_out, &x, &mut got).unwrap();
+                assert!(used, "{tag}: VNNI 経路が使われていない");
+                assert!(
+                    gemv_vnni_calls() > before,
+                    "{tag}: ゲートは開いたがカーネルが発火していない"
+                );
+                assert!(
+                    want.iter().any(|v| *v != 0.0),
+                    "{tag}: f32 経路の出力が全 0 (比較が無意味)"
+                );
+                assert!(got.iter().all(|v| v.is_finite()), "{tag}: 非有限値が出た");
+
+                let scale = want.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-30);
+                let max_abs = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(g, w)| (g - w).abs())
+                    .fold(0f32, f32::max);
+                let mean_abs = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(g, w)| ((g - w).abs() / scale) as f64)
+                    .sum::<f64>()
+                    / got.len() as f64;
+                // 行ごとの相対誤差 (|want| が基準の 1% 未満の行は除く)。
+                let mut row_rel = 0f32;
+                for (g, w) in got.iter().zip(&want) {
+                    if w.abs() >= 0.01 * scale {
+                        row_rel = row_rel.max((g - w).abs() / w.abs());
+                    }
+                }
+                eprintln!(
+                    "{tag} [{case}]: max|Δ|/max|ref| = {:.3e} / mean = {:.3e} / 行相対の最大 = {:.3e}",
+                    max_abs / scale,
+                    mean_abs,
+                    row_rel
+                );
+                // 量子化の刻みは `max|x|/127` の半分 = 入力の 0.39%。積和で
+                // 平均化されるので、出力の相対誤差はその 1 桁上に出る。
+                assert!(
+                    max_abs / scale < 1e-2,
+                    "{tag} [{case}]: 相対誤差 {:.3e} が大きすぎる",
+                    max_abs / scale
+                );
+            }
+        }
+    }
+
+    /// カーネルが「量子化済みの式」をそのまま計算していること (f64 参照との比較)。
+    ///
+    /// ここは活性の量子化誤差が入らないので、nibble 順・スケール割り当て・最小値項の
+    /// 対応が違えば O(1) の差になり、正しければ f32 の累積順だけで 1e-4 台に収まる。
+    #[test]
+    fn gemv_vnni_matches_quantized_f64_reference() {
+        let _g = gemv_vnni_test_guard();
+        if !vnni_supported() {
+            eprintln!("skip gemv_vnni_matches_quantized_f64_reference: avx512vnni が無い");
+            return;
+        }
+        let _gate = VnniGateGuard::on();
+        for (tag, ty, n_in, n_out) in [
+            ("Q4_K 2560x640", GgmlType::Q4K, 2560usize, 640usize),
+            ("Q5_1 640x2560", GgmlType::Q5_1, 640usize, 2560usize),
+            ("Q8_0 2560x640", GgmlType::Q8_0, 2560usize, 640usize),
+        ] {
+            let blocks = make_expert(ty, n_in, n_out, 0);
+            let x = make_x_wide(n_in);
+            let mut act = VnniActM1::default();
+            act.quantize(&x).unwrap();
+            let mut got = vec![0f32; n_out];
+            assert!(
+                expert_gemv_any_vnni(ty, &blocks, n_in, n_out, &x, &mut got).unwrap(),
+                "{tag}: VNNI 経路が使われていない"
+            );
+            let want = ref_gemv_quantized_f64(ty, &blocks, n_in, n_out, &act.q, &act.sc, &act.gs);
+            let scale = want.iter().fold(0f64, |a, v| a.max(v.abs())).max(1e-30);
+            let max_rel = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| ((*g as f64) - *w).abs() / scale)
+                .fold(0f64, f64::max);
+            eprintln!("{tag}: 量子化した式との差 (f64 基準) {max_rel:.3e}");
+            assert!(
+                max_rel < 1e-3,
+                "{tag}: カーネルの式と一致しない (rel {max_rel:.3e}) — nibble 順かスケールが違う"
+            );
+        }
+    }
+
+    /// 既定 (env 未設定) では VNNI 経路を名乗らない = `expert_gemv_any` の動作を変えない。
+    #[test]
+    fn gemv_vnni_is_off_by_default() {
+        let _g = gemv_vnni_test_guard();
+        set_gemv_vnni_for_test(Some(false));
+        let (n_in, n_out) = (2560usize, 640usize);
+        let blocks = make_expert(GgmlType::Q4K, n_in, n_out, 0);
+        let x = make_x_wide(n_in);
+        let mut out = vec![0f32; n_out];
+        let before = gemv_vnni_calls();
+        assert!(
+            !expert_gemv_any_vnni(GgmlType::Q4K, &blocks, n_in, n_out, &x, &mut out).unwrap(),
+            "既定で VNNI 経路を名乗った"
+        );
+        assert_eq!(gemv_vnni_calls(), before, "既定でカーネルが発火した");
+        set_gemv_vnni_for_test(None);
+    }
+
+    /// M=1 VNNI のマイクロベンチ (1 スレッド / 8 スレッド、f32 経路との比)。
+    ///
+    /// - 形は実形: Q4_K 2560x640 / Q5_1 640x2560 / Q8_0 2560x640 (n_in x n_out)。
+    /// - decode は 1 トークンで 48 層 x 10 expert の別々の重み (合計 487 MB) を触るので、
+    ///   ここでは 24 枚を巡回して L3 (16 MB) に載りきらない条件にする
+    ///   (実機の mmap cold よりは温かい = 比は上振れしうる)。
+    /// - 実行:
+    ///   `cargo test --release -p denno-engine --lib -- --ignored --nocapture bench_gemv_vnni`
+    #[test]
+    #[ignore = "マイクロベンチ (24 枚 x 3 形の重みを確保、約 90 MB)"]
+    fn bench_gemv_vnni_m1_gmacs() {
+        use std::time::Instant;
+        let _g = gemv_vnni_test_guard();
+        if !vnni_supported() {
+            eprintln!("skip bench_gemv_vnni_m1_gmacs: avx512vnni が無い");
+            return;
+        }
+        let _gate = VnniGateGuard::on();
+        const N_MAT: usize = 24;
+        const REPS: usize = 7;
+
+        /// f32 と VNNI を交互に測り、それぞれの最小を返す。
+        ///
+        /// このコンテナはホスト共有で load average が動くので、別々に測ると
+        /// 比が ±30% ぶれる。同じ rep の中で続けて測って交互に取る。
+        fn paired(reps: usize, mut a: impl FnMut(), mut b: impl FnMut()) -> (f64, f64) {
+            let (mut ba, mut bb) = (f64::INFINITY, f64::INFINITY);
+            for i in 0..reps {
+                let t0 = Instant::now();
+                a();
+                let ta = t0.elapsed().as_secs_f64();
+                let t0 = Instant::now();
+                b();
+                let tb = t0.elapsed().as_secs_f64();
+                if i > 0 {
+                    // 1 回目はウォームアップとして捨てる。
+                    ba = ba.min(ta);
+                    bb = bb.min(tb);
+                }
+            }
+            (ba, bb)
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .expect("8 スレッドの rayon プール");
+
+        for (tag, ty, n_in, n_out) in [
+            ("Q4_K 2560x640", GgmlType::Q4K, 2560usize, 640usize),
+            ("Q5_1 640x2560", GgmlType::Q5_1, 640usize, 2560usize),
+            ("Q8_0 2560x640", GgmlType::Q8_0, 2560usize, 640usize),
+        ] {
+            let ws: Vec<Vec<u8>> = (0..N_MAT)
+                .map(|e| make_expert(ty, n_in, n_out, e))
+                .collect();
+            let x = make_x_wide(n_in);
+            let mut of = vec![0f32; n_out]; // f32 経路の出力
+            let mut ov = vec![0f32; n_out]; // VNNI 経路の出力
+            let bytes = N_MAT * n_out * row_bytes(ty, n_in).unwrap();
+            let macs = (N_MAT * n_in * n_out) as f64;
+            let before = gemv_vnni_calls();
+
+            // (a) 24 枚を巡回 (L3 16 MB に載りきらない = 帯域も見る)。
+            let (t_f1, t_v1) = paired(
+                REPS,
+                || {
+                    for w in &ws {
+                        expert_gemv_any_seq(ty, w, n_in, n_out, &x, &mut of).unwrap();
+                    }
+                    std::hint::black_box(&of);
+                },
+                || {
+                    for w in &ws {
+                        assert!(expert_gemv_any_vnni_seq(ty, w, n_in, n_out, &x, &mut ov).unwrap());
+                    }
+                    std::hint::black_box(&ov);
+                },
+            );
+            let (t_f8, t_v8) = paired(
+                REPS,
+                || {
+                    pool.install(|| {
+                        for w in &ws {
+                            expert_gemv_any(ty, w, n_in, n_out, &x, &mut of).unwrap();
+                        }
+                    });
+                },
+                || {
+                    pool.install(|| {
+                        for w in &ws {
+                            assert!(expert_gemv_any_vnni(ty, w, n_in, n_out, &x, &mut ov).unwrap());
+                        }
+                    });
+                },
+            );
+            // (b) 1 枚を 24 回 (毎回同じ重み = L2 に載る)。帯域ではなく
+            //     カーネルとスレッド起動のコストを見る。
+            let one = &ws[0];
+            let (h_f1, h_v1) = paired(
+                REPS,
+                || {
+                    for _ in 0..N_MAT {
+                        expert_gemv_any_seq(ty, one, n_in, n_out, &x, &mut of).unwrap();
+                    }
+                    std::hint::black_box(&of);
+                },
+                || {
+                    for _ in 0..N_MAT {
+                        assert!(expert_gemv_any_vnni_seq(ty, one, n_in, n_out, &x, &mut ov).unwrap());
+                    }
+                    std::hint::black_box(&ov);
+                },
+            );
+            let (h_f8, h_v8) = paired(
+                REPS,
+                || {
+                    pool.install(|| {
+                        for _ in 0..N_MAT {
+                            expert_gemv_any(ty, one, n_in, n_out, &x, &mut of).unwrap();
+                        }
+                    });
+                },
+                || {
+                    pool.install(|| {
+                        for _ in 0..N_MAT {
+                            assert!(
+                                expert_gemv_any_vnni(ty, one, n_in, n_out, &x, &mut ov).unwrap()
+                            );
+                        }
+                    });
+                },
+            );
+            assert!(
+                gemv_vnni_calls() > before,
+                "{tag}: VNNI カーネルが発火していない (ゲートの通過を数える)"
+            );
+            eprintln!(
+                "{tag}: 重み {} MB / {} MAC/枚\n  \
+                 24 枚 (L3 超)  1T f32 {:6.1} -> VNNI {:6.1} GMAC/s ({:.2}x) \
+                 | 8T f32 {:6.1} -> VNNI {:6.1} GMAC/s ({:.2}x)\n  \
+                 1 枚 x24 (L2)  1T f32 {:6.1} -> VNNI {:6.1} GMAC/s ({:.2}x) \
+                 | 8T f32 {:6.1} -> VNNI {:6.1} GMAC/s ({:.2}x)",
+                bytes / (1024 * 1024),
+                n_in * n_out,
+                macs / t_f1 / 1e9,
+                macs / t_v1 / 1e9,
+                t_f1 / t_v1,
+                macs / t_f8 / 1e9,
+                macs / t_v8 / 1e9,
+                t_f8 / t_v8,
+                macs / h_f1 / 1e9,
+                macs / h_v1 / 1e9,
+                h_f1 / h_v1,
+                macs / h_f8 / 1e9,
+                macs / h_v8 / 1e9,
+                h_f8 / h_v8,
+            );
         }
     }
 
