@@ -138,9 +138,9 @@ dense の `serve` 経路を使う場合は、起動時に `DENNO_TELEMETRY=1` �
 
 **動作デモ** — 3D ビュー(`/3d`)で Flash-Next と実際に会話している様子。プロンプトが入力レールでトークン化され、router が SSD から VRAM へ expert を引き上げ、層の柱がニューロン単位で光り、予測ヘッドにサンプラの top-8 候補が出て、選ばれたトークンがチャット欄へ飛ぶ:
 
-[![denno-view 3D デモ(mp4 を再生)](docs/assets/denno_3d_poster.jpg)](docs/assets/denno_3d.mp4)
+https://github.com/user-attachments/assets/3eb62bce-bfc8-44e7-adc8-bd95d60360f1
 
-*27 秒の記録からの静止画。クリックで [`docs/assets/denno_3d.mp4`](docs/assets/denno_3d.mp4)(H.264 / 1256x618 / 5 fps / 2.2 MB)が再生される。GitHub の markdown はリポジトリ内の動画を再生しないため、アニメーションはインラインではなく 1 クリック先に置いている。*
+*27 秒 / 1256x618 / 5 fps / 2.2 MB。上のプレイヤーは GitHub の添付として読み込んでいる(GitHub の markdown はリポジトリ内の動画をインライン再生しないため)。同じ mp4 は [`docs/assets/denno_3d.mp4`](docs/assets/denno_3d.mp4) にも入れてある。*
 
 3D ビュー(`/3d`)は絵ではなく実構造から組んである。48 層を Z 軸に並べ、各層に mixer(12 QSA / 36 GDN)、router、512 expert の 32x16 配置、shared expert、GR の read/write を置き、4 層ごとに hybrid block の枠を描く。expert は「いまどの階層にいるか」の高さ(VRAM / RAM / SSD)に置かれ、router が選ぶたびに階層を移動する。KV 帯は prefix cache の再利用分・今回書いた分・decode の読み出し位置を色で分け、予測ヘッドにはサンプラの実 top-8 候補が出て、選ばれたトークンがチャット欄へ飛ぶ。`f` キーでクォータニオンによるフライトモード(WASD + マウス、Shift 加速、Q/E 上下、Esc で俯瞰)。
 

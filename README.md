@@ -140,7 +140,7 @@ With the dense `serve` path instead, pass `DENNO_TELEMETRY=1` when starting it, 
 
 https://github.com/user-attachments/assets/3eb62bce-bfc8-44e7-adc8-bd95d60360f1
 
-*Still from the 27 s recording; click it to play [`docs/assets/denno_3d.mp4`](docs/assets/denno_3d.mp4) (H.264, 1256x618, 5 fps, 2.2 MB). GitHub's markdown renderer will not play a video that lives in the repository, so the animation is one click away rather than inline.*
+*27 s, 1256x618, 5 fps, 2.2 MB. The player above is a GitHub attachment, because GitHub's markdown renderer will not play a video that lives in the repository; the same file is checked in at [`docs/assets/denno_3d.mp4`](docs/assets/denno_3d.mp4).*
 
 The 3D view (`/3d`) is built from the model's real topology rather than an illustration: 48 layers along Z, each with its mixer (12 QSA / 36 GDN), router, 512 experts laid out 32x16, shared expert and GR read/write, with a hybrid-block frame every 4 layers. Experts sit at the height of the tier that currently holds them (VRAM / RAM / SSD) and move between tiers as the router selects them; the KV band shows prefix-cache reuse, the prompt tokens, and the decode read position; the prediction head shows the real top-8 candidates from the sampler, and the chosen token flies back to the chat box. Keys: `f` toggles a quaternion-based free-flight mode (WASD + mouse, Shift to accelerate, Q/E up/down, Esc back to orbit).
 
