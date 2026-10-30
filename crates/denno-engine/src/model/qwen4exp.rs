@@ -3400,6 +3400,30 @@ fn emit_role_act(layer: usize, roles: &RoleRms) {
     denno_telemetry::emit(denno_telemetry::role_act_frame(layer as u16, roles.as_array()));
 }
 
+/// P60: 初回送出用に**全層**ぶんの在庫を並べる (`n_layer` 層。在庫の無い層は空)。
+///
+/// 差分だけではビューワが初期状態を描けないので、最初の 1 回はこれを送る。
+/// `now` に `n_layer` 以上の層が混ざっていた場合 (モデルの層数より多い在庫) は
+/// 落とさずに後ろへ足す。
+fn full_residency(now: &[(u16, Vec<u16>)], n_layer: usize) -> Vec<(u16, Vec<u16>)> {
+    let mut out: Vec<(u16, Vec<u16>)> = Vec::with_capacity(n_layer.max(now.len()));
+    for il in 0..n_layer {
+        let layer = il as u16;
+        let idx = now
+            .iter()
+            .find(|(l, _)| *l == layer)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        out.push((layer, idx));
+    }
+    for (layer, idx) in now {
+        if (*layer as usize) >= n_layer {
+            out.push((*layer, idx.clone()));
+        }
+    }
+    out
+}
+
 /// P58: [`Frame::ExpertResidency`] の間引き規則 (前回の送出との差分)。
 ///
 /// - `now` に在って `prev` と集合が違う層 → `now` の集合を返す
@@ -3433,6 +3457,11 @@ fn residency_delta(prev: &[(u16, Vec<u16>)], now: &[(u16, Vec<u16>)]) -> Vec<(u1
 struct ArchEmit {
     /// 前回送った層別の VRAM 常駐 expert ([`expert_vram::resident_by_layer`] の写し)。
     prev_res: Vec<(u16, Vec<u16>)>,
+    /// P60: 初回の「全層」送出を済ませたか。
+    ///
+    /// `prev_res` が空かどうかで判定すると、在庫が 0 本のときに毎回「初回」に
+    /// なってしまう (全層の空フレームを毎トークン送る)。フラグで 1 回だけにする。
+    sent_initial: bool,
     /// TierStats の間引き用カウンタ (1 トークン呼び出しごとに 1 増える)。
     tokens: u32,
 }
@@ -3468,12 +3497,26 @@ impl Qwen4Exp {
         self.emit_residency();
     }
 
-    /// P58: いま VRAM に載っている expert のうち、前回から変わった層だけ送る。
+    /// P58/P60: いま VRAM に載っている expert を送る。
     ///
-    /// 走査は [`expert_vram::resident_by_layer`] 1 回 (LRU のロックを 1 回取り、
-    /// 100 本程度の鍵を写すだけ)。全 512 本を毎層並べることはしない。
+    /// - **初回は全層**を送る (在庫の無い層は空)。差分だけではビューワが初期状態を
+    ///   描けない。初回の判定は [`ArchEmit::sent_initial`] で 1 回だけ。
+    /// - 2 回目以降は「変化した層だけ」。消えた層は空フレームで送る
+    ///   ([`residency_delta`])。
+    ///
+    /// 走査は [`expert_vram::resident_keys`] 1 回 (LRU の写し + staging の和集合)。
+    /// 全 512 本 × 48 層を毎層並べることはしない。
     fn emit_residency(&mut self) {
         let now = expert_vram::resident_by_layer();
+        if !self.arch_emit.sent_initial {
+            let full = full_residency(&now, self.layers.len());
+            for (layer, idx) in &full {
+                denno_telemetry::emit(denno_telemetry::expert_residency_frame(*layer, idx));
+            }
+            self.arch_emit.prev_res = full;
+            self.arch_emit.sent_initial = true;
+            return;
+        }
         if now == self.arch_emit.prev_res {
             return;
         }
@@ -3483,19 +3526,17 @@ impl Qwen4Exp {
         self.arch_emit.prev_res = now;
     }
 
-    /// P58: 置き場所の統計 (kind 15)。**実際の計測値だけ**を送る。
+    /// P60: 置き場所の統計 (kind 15)。**実際の計測値だけ**を送る。
     ///
-    /// - `vram_used_mb` / `vram_total_mb`: expert 用 VRAM の使用量 (LRU + 外部予約) /
-    ///   予算 (`DENNO_EXPERT_VRAM_MB`)。VRAM 経路が未初期化なら 0 / 0
-    ///   (`DENNO_EXPERT_GPU_CHECK` の 1 行と同じ定義)。
+    /// - `vram_used_mb` / `vram_total_mb`: expert の VRAM 会計
+    ///   ([`expert_vram::budget_usage`] = LRU 使用 + 外部予約 / 予算)。予算は
+    ///   `DENNO_EXPERT_VRAM_MB` + `DENNO_GPU_WEIGHT_MB` の合計で、カードの全容量では
+    ///   ない。どちらも未設定で在庫も無ければ 0 / 0。
     /// - `ram_experts`: RAM の pread キャッシュに載っている expert 本数
     ///   (`DENNO_EXPERT_CACHE_MB` 無効なら 0)。
     /// - `ssd_reads`: キャッシュのミス (= SSD からの pread) の累計。
     fn emit_tier_stats(&self) {
-        let (used_mb, total_mb) = match expert_vram::budget_usage() {
-            Some((used, pinned, cap)) => (((used + pinned) >> 20) as u32, (cap >> 20) as u32),
-            None => (0, 0),
-        };
+        let (used_mb, total_mb) = expert_vram::tier_mb(expert_vram::budget_usage());
         let ram_experts = self
             .expert_cache
             .as_ref()
@@ -6501,6 +6542,33 @@ mod tests {
         );
     }
 
+    /// P60: 初回送出は全層 (在庫の無い層は空)。差分では初期状態を描けないため。
+    #[test]
+    fn initial_residency_covers_every_layer() {
+        // 層 3 にだけ在庫がある状態。
+        let now = vec![(3u16, vec![7u16, 9])];
+        let full = full_residency(&now, 5);
+        assert_eq!(
+            full,
+            vec![
+                (0, Vec::new()),
+                (1, Vec::new()),
+                (2, Vec::new()),
+                (3, vec![7, 9]),
+                (4, Vec::new()),
+            ],
+            "初回の全層送出が層数ぶん並んでいない"
+        );
+        // 在庫が 1 本も無くても全層を空で返す (ビューワが「空」を描ける)。
+        let full = full_residency(&[], 3);
+        assert_eq!(full, vec![(0, Vec::new()), (1, Vec::new()), (2, Vec::new())]);
+
+        // 初回を済ませた後は、在庫が同じなら差分は空 (毎トークン全層を送らない)。
+        assert!(residency_delta(&full, &[]).is_empty(), "空の層を送り直している");
+        // 初回の写しに在庫が入った層は、同じ在庫なら沈黙する。
+        assert!(residency_delta(&full_residency(&now, 5), &now).is_empty());
+    }
+
     /// P56: ルーティングの期待値 (テレメトリに依らない参照)。同じ式を手で回す。
     fn expected_router_topk(p: &Qwen4ExpParams, lw: &LayerW, x: &[f32]) -> (Vec<usize>, Vec<f32>) {
         let mut probs = vec![0.0f32; p.n_expert];
@@ -8564,6 +8632,8 @@ mod tests {
             let mut kind_zero: Vec<(u16, u16, u16)> = Vec::new(); // (層, attn, gdn)
             let mut tier = 0usize;
             let mut residency = 0usize;
+            let mut res_layers: Vec<u16> = Vec::new();
+            let mut res_nonempty = 0usize;
             for fr in &pre {
                 match fr {
                     denno_telemetry::Frame::RoleAct {
@@ -8589,6 +8659,10 @@ mod tests {
                     }
                     denno_telemetry::Frame::ExpertResidency { layer, in_vram } => {
                         residency += 1;
+                        res_layers.push(*layer);
+                        if !in_vram.is_empty() {
+                            res_nonempty += 1;
+                        }
                         assert!(
                             in_vram.len() <= denno_telemetry::RESIDENCY_MAX,
                             "層 {layer}: 本数 {} が上限 {} を超える",
@@ -8610,9 +8684,16 @@ mod tests {
                 "prefill の RoleAct が層数ぶん (末尾トークン 1 回) でない"
             );
             assert!(tier >= 1, "TierStats が 1 枚も出ていない");
-            assert!(
-                residency == 0 || residency <= LAYERS,
-                "ExpertResidency が層数を超える ({residency} 枚)"
+            // P60: 初回は**全層**送る (在庫の無い層は空)。GPU 無しのビルドでは
+            // staging も LRU も空なので、48 枚すべて空になる。
+            assert_eq!(
+                res_layers,
+                (0..LAYERS as u16).collect::<Vec<_>>(),
+                "初回の ExpertResidency が全層でない (枚数 {residency})"
+            );
+            assert_eq!(
+                res_nonempty, 0,
+                "GPU 無しのビルドで在庫が非空になっている (staging の残り?)"
             );
             // 層の種別で使わない役割は 0.0 で埋める (full attention は (il+1) % INTERVAL == 0)。
             for (layer, attn, gdn) in kind_zero {
@@ -8628,15 +8709,24 @@ mod tests {
             m_on.forward_token_tapped(&[1, 2, 3, 4], |_| {})
                 .expect("decode (arch on)");
             let mut dec: Vec<u16> = Vec::new();
+            let mut dec_res = 0usize;
             while let Some(fr) = denno_telemetry::try_recv_nowait() {
-                if let denno_telemetry::Frame::RoleAct { layer, .. } = fr {
-                    dec.push(layer);
+                match fr {
+                    denno_telemetry::Frame::RoleAct { layer, .. } => dec.push(layer),
+                    denno_telemetry::Frame::ExpertResidency { .. } => dec_res += 1,
+                    _ => {}
                 }
             }
             assert_eq!(
                 dec,
                 (0..LAYERS as u16).collect::<Vec<_>>(),
                 "decode の RoleAct が層数ぶん出ていない"
+            );
+            // P60: 初回の全層送出を済ませた後は、在庫が変わらなければ 1 枚も出さない
+            // (「初回」を毎トークン繰り返していないことの確認)。
+            assert_eq!(
+                dec_res, 0,
+                "在庫が変わっていないのに ExpertResidency が {dec_res} 枚出た"
             );
 
             denno_telemetry::set_arch_for_tests(prev_arch);
