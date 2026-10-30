@@ -1905,6 +1905,8 @@ pub struct Qwen4Exp {
     /// P-MOE-G1: `DENNO_EXPERT_CACHE_MB` > 0 のときだけ `Some`。
     /// `None` は従来どおり mmap + `prefetch()` の経路 (バイト列も挙動も変えない)。
     expert_cache: Option<ExpertCacheSet>,
+    /// P58: 構造テレメトリ (ExpertResidency / TierStats) の間引き状態。
+    arch_emit: ArchEmit,
 }
 
 /// 層の出口で観測フックに渡す情報 (P53)。
@@ -2055,6 +2057,7 @@ impl Qwen4Exp {
             ple_conv_state,
             attn,
             expert_cache,
+            arch_emit: ArchEmit::default(),
         })
     }
 
@@ -2172,22 +2175,36 @@ impl Qwen4Exp {
         let mut res = self.forward_embed(ctx, &hp)?;
         let ple_emb = self.gather_ple(ctx)?;
 
+        // P58: arch テレメトリが有効なら、呼び出し側が roles を渡していなくても
+        // 役割 RMS を取る (RoleAct を送るため)。取るのは読むだけなので logits は
+        // 変わらない。off のときは従来どおり `roles = None` のまま (走査もしない)。
+        let mut auto_roles = RoleRms::default();
+        let auto = roles.is_none() && arch_frames_enabled();
+
         for il in 0..self.p.n_layer {
             // P54: 役割別 RMS は層ごとに 0 から取り直す (観測しないときは None)。
-            if let Some(d) = roles.as_deref_mut() {
-                *d = RoleRms::default();
+            {
+                let mut rr: Option<&mut RoleRms> = if auto {
+                    Some(&mut auto_roles)
+                } else {
+                    roles.as_deref_mut()
+                };
+                if let Some(d) = rr.as_deref_mut() {
+                    *d = RoleRms::default();
+                }
+                // P56: RouterTopK はこの呼び出しの最終トークンだけ (`t + 1 == nt`)。
+                // decode は (0, 1) なので常に真、逐次 prefill は末尾の 1 トークンだけ。
+                // P58 の RoleAct も同じ規則。
+                self.run_layer(
+                    il,
+                    &mut res,
+                    ple_emb.as_ref(),
+                    &hp,
+                    &mut |_, _, _| Ok(()),
+                    rr.as_deref_mut(),
+                    t + 1 == nt,
+                )?;
             }
-            // P56: RouterTopK はこの呼び出しの最終トークンだけ (`t + 1 == nt`)。
-            // decode は (0, 1) なので常に真、逐次 prefill は末尾の 1 トークンだけ。
-            self.run_layer(
-                il,
-                &mut res,
-                ple_emb.as_ref(),
-                &hp,
-                &mut |_, _, _| Ok(()),
-                roles.as_deref_mut(),
-                t + 1 == nt,
-            )?;
             if let Some(h) = on_layer.as_deref_mut() {
                 h(&LayerOut {
                     il,
@@ -2370,6 +2387,14 @@ impl Qwen4Exp {
         q4prof::add(&q4prof::MOE, t_moe);
         hook("ffn_out", il, &cur)?;
         *res = hyper::hc_combine(res, &cur, &inject, hp);
+        // P58: 層の役割別活性 (kind 13)。`emit_router` は「このトークンが forward
+        // 呼び出しの末尾か」の意味も持つ (decode は常に真、逐次 prefill は末尾の
+        // 1 トークンだけ)。読むだけなので数値経路には触れない。
+        if emit_router {
+            if let Some(r) = roles.as_deref() {
+                emit_role_act(il, r);
+            }
+        }
         Ok(())
     }
 
@@ -2468,11 +2493,14 @@ impl Qwen4Exp {
         on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
         roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>> {
-        if batch && self.attn.layer_major_safe() {
-            self.forward_prefill_batch_tapped(ctx, prefill_batch_chunk(), tokens, on_layer, roles)
+        let logits = if batch && self.attn.layer_major_safe() {
+            self.forward_prefill_batch_tapped(ctx, prefill_batch_chunk(), tokens, on_layer, roles)?
         } else {
-            self.prefill_seq(ctx, tokens, on_layer, roles)
-        }
+            self.prefill_seq(ctx, tokens, on_layer, roles)?
+        };
+        // P58: 1 リクエスト 1 回の階層統計 (prefill 終了時)。arch off なら即座に戻る。
+        self.arch_emit_prefill_done();
+        Ok(logits)
     }
 
     /// 逐次 prefill (= decoder と同じ経路)。既存の [`Qwen4Exp::forward_token_at`] を
@@ -2530,13 +2558,21 @@ impl Qwen4Exp {
         chunk: usize,
         tokens: TapTokens,
         mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
-        mut roles: Option<&mut RoleRms>,
+        roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>> {
         if ctx.is_empty() {
             return Err(one("ctx が空 (現在のトークンが無い)"));
         }
         #[cfg(test)]
         PREFILL_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // P58: arch テレメトリが有効なら、呼び出し側が roles を渡していなくても
+        // 役割 RMS を取る (RoleAct を送るため)。読むだけなので logits は変わらない。
+        let mut auto_roles = RoleRms::default();
+        let mut roles: Option<&mut RoleRms> = if roles.is_none() && arch_frames_enabled() {
+            Some(&mut auto_roles)
+        } else {
+            roles
+        };
         let hp = self.hp();
         let e = self.p.n_embd;
         let n_layer = self.p.n_layer;
@@ -2668,6 +2704,16 @@ impl Qwen4Exp {
                     )));
                 }
                 hyper::hc_combine_batch(&mut ress, &ffn, &injs, &hp);
+
+                // P58: 層の役割別活性 (kind 13)。prefill は**最後のチャンクの末尾**
+                // トークンだけ送る (チャンクは既定 8 トークンなので、全チャンクで
+                // 送ると 層数 × チャンク数 枚になってチャネル (4096) が溢れる)。
+                // RoleRms 自体もチャンク末尾のトークンのぶんしか持たない。
+                if end == ctx.len() {
+                    if let Some(r) = roles.as_deref() {
+                        emit_role_act(il, r);
+                    }
+                }
 
                 // P53: 層の出口 (残差を足した後) を観測フックに渡す。読むだけ。
                 // P54: 役割別 RMS はチャンク末尾のトークンのぶんしか無いので、
@@ -3330,6 +3376,141 @@ fn emit_router_topk(layer: usize, sel: &[usize], weights: &[f32]) {
         return;
     }
     denno_telemetry::emit(denno_telemetry::router_topk_frame(layer as u16, sel, weights));
+}
+
+/// P58: 構造テレメトリ (RoleAct / ExpertResidency / TierStats) の送出が有効か。
+///
+/// RouterTopK と同じく `DENNO_TELEMETRY` と `DENNO_TELEMETRY_ARCH` の両方が要る
+/// (どちらもプロセスで 1 回だけ env を読む。既定はどちらも off)。off のときは
+/// フレームを作らないので、送出バイトも確保もゼロ。
+fn arch_frames_enabled() -> bool {
+    denno_telemetry::enabled() && denno_telemetry::arch_enabled()
+}
+
+/// P58: 1 層ぶんの役割別活性 (kind 13) を送る。
+///
+/// 値は `[attn, gdn, router, shex, ple]` の生値を**層内の最大役割**で割った 0..1
+/// ([`denno_telemetry::role_act_frame`] が正規化する)。層の種別で使わない役割
+/// (ssm 層の attn / full attention 層の gdn / PLE の無い層の ple) は 0.0 になる。
+/// 読むだけなので logits は変わらない。
+fn emit_role_act(layer: usize, roles: &RoleRms) {
+    if !arch_frames_enabled() {
+        return;
+    }
+    denno_telemetry::emit(denno_telemetry::role_act_frame(layer as u16, roles.as_array()));
+}
+
+/// P58: [`Frame::ExpertResidency`] の間引き規則 (前回の送出との差分)。
+///
+/// - `now` に在って `prev` と集合が違う層 → `now` の集合を返す
+/// - `prev` に在って `now` に無い層 (全部追い出された) → 空で返す
+///   (送らないとビューアが古い在庫を描き続ける)
+/// - 集合が同じ層は返さない (変化が無い層は沈黙する)
+///
+/// 並びは `now` の順、そのあと消えた層の昇順。`n` の上限は
+/// [`denno_telemetry::RESIDENCY_MAX`] を [`expert_residency_frame`] が切る。
+///
+/// [`Frame::ExpertResidency`]: denno_telemetry::Frame::ExpertResidency
+/// [`expert_residency_frame`]: denno_telemetry::expert_residency_frame
+fn residency_delta(prev: &[(u16, Vec<u16>)], now: &[(u16, Vec<u16>)]) -> Vec<(u16, Vec<u16>)> {
+    let mut out: Vec<(u16, Vec<u16>)> = Vec::new();
+    for (layer, idx) in now {
+        let same = prev.iter().any(|(l, p)| l == layer && p == idx);
+        if !same {
+            out.push((*layer, idx.clone()));
+        }
+    }
+    for (layer, idx) in prev {
+        if !idx.is_empty() && !now.iter().any(|(l, _)| l == layer) {
+            out.push((*layer, Vec::new()));
+        }
+    }
+    out
+}
+
+/// P58: 構造テレメトリの間引き状態 (モデル 1 個につき 1 個)。
+#[derive(Default)]
+struct ArchEmit {
+    /// 前回送った層別の VRAM 常駐 expert ([`expert_vram::resident_by_layer`] の写し)。
+    prev_res: Vec<(u16, Vec<u16>)>,
+    /// TierStats の間引き用カウンタ (1 トークン呼び出しごとに 1 増える)。
+    tokens: u32,
+}
+
+/// P58: decode で TierStats を送る間隔 (トークン数)。
+///
+/// 仕様は「1 秒に 1 回」だが、engine は時刻を持たないのでトークン数で粗く間引く
+/// (27B の decode は 1 トークン数十 ms なので、100 トークンで数秒に 1 回)。
+const TIER_STATS_TOKENS: u32 = 100;
+
+impl Qwen4Exp {
+    /// P58: decode 1 トークンぶんの構造テレメトリ。
+    ///
+    /// ExpertResidency は**変化した層だけ**、TierStats は
+    /// [`TIER_STATS_TOKENS`] トークンごと。arch off なら即座に戻る (確保もしない)。
+    pub(crate) fn arch_emit_token(&mut self) {
+        if !arch_frames_enabled() {
+            return;
+        }
+        self.arch_emit.tokens = self.arch_emit.tokens.wrapping_add(1);
+        if self.arch_emit.tokens % TIER_STATS_TOKENS == 0 {
+            self.emit_tier_stats();
+        }
+        self.emit_residency();
+    }
+
+    /// P58: prefill 終了時の構造テレメトリ (1 リクエスト 1 回)。
+    pub(crate) fn arch_emit_prefill_done(&mut self) {
+        if !arch_frames_enabled() {
+            return;
+        }
+        self.emit_tier_stats();
+        self.emit_residency();
+    }
+
+    /// P58: いま VRAM に載っている expert のうち、前回から変わった層だけ送る。
+    ///
+    /// 走査は [`expert_vram::resident_by_layer`] 1 回 (LRU のロックを 1 回取り、
+    /// 100 本程度の鍵を写すだけ)。全 512 本を毎層並べることはしない。
+    fn emit_residency(&mut self) {
+        let now = expert_vram::resident_by_layer();
+        if now == self.arch_emit.prev_res {
+            return;
+        }
+        for (layer, idx) in residency_delta(&self.arch_emit.prev_res, &now) {
+            denno_telemetry::emit(denno_telemetry::expert_residency_frame(layer, &idx));
+        }
+        self.arch_emit.prev_res = now;
+    }
+
+    /// P58: 置き場所の統計 (kind 15)。**実際の計測値だけ**を送る。
+    ///
+    /// - `vram_used_mb` / `vram_total_mb`: expert 用 VRAM の使用量 (LRU + 外部予約) /
+    ///   予算 (`DENNO_EXPERT_VRAM_MB`)。VRAM 経路が未初期化なら 0 / 0
+    ///   (`DENNO_EXPERT_GPU_CHECK` の 1 行と同じ定義)。
+    /// - `ram_experts`: RAM の pread キャッシュに載っている expert 本数
+    ///   (`DENNO_EXPERT_CACHE_MB` 無効なら 0)。
+    /// - `ssd_reads`: キャッシュのミス (= SSD からの pread) の累計。
+    fn emit_tier_stats(&self) {
+        let (used_mb, total_mb) = match expert_vram::budget_usage() {
+            Some((used, pinned, cap)) => (((used + pinned) >> 20) as u32, (cap >> 20) as u32),
+            None => (0, 0),
+        };
+        let ram_experts = self
+            .expert_cache
+            .as_ref()
+            .map_or(0, |c| c.used_experts() as u32);
+        let ssd_reads = self
+            .expert_cache
+            .as_ref()
+            .map_or(0, |c| c.total_reads().min(u32::MAX as u64) as u32);
+        denno_telemetry::emit(denno_telemetry::Frame::TierStats {
+            vram_used_mb: used_mb,
+            vram_total_mb: total_mb,
+            ram_experts,
+            ssd_reads,
+        });
+    }
 }
 
 /// P54: 役割別 RMS (router の top-k 確率和 / shared expert の RMS) も取る
@@ -6291,6 +6472,35 @@ mod tests {
         assert_bitwise_eq(&base, &got, "route=Cpu");
     }
 
+    /// P58: ExpertResidency は「前回の送出から変わった層だけ」送る。
+    ///
+    /// - 集合が同じ層は出さない (変化が無い層は沈黙する)
+    /// - 集合が変わった層は新しい集合で出す
+    /// - 前回は載っていたが今回 0 本になった層は**空**で出す
+    ///   (出さないとビューアが古い在庫を描き続ける)
+    #[test]
+    fn residency_delta_emits_only_changed_layers() {
+        let prev = vec![(0u16, vec![1u16, 2]), (3, vec![7]), (5, vec![9])];
+        assert!(
+            residency_delta(&prev, &prev).is_empty(),
+            "変化が無いのに層を送っている"
+        );
+
+        // 層 3 は集合が変わり、層 9 が新しく載り、層 5 は全部追い出された。
+        let now = vec![(0, vec![1, 2]), (3, vec![7, 8]), (9, vec![4])];
+        assert_eq!(
+            residency_delta(&prev, &now),
+            vec![(3, vec![7, 8]), (9, vec![4]), (5, Vec::new())],
+            "差分の層・順序・空フレームが仕様と違う"
+        );
+
+        // 全滅 → 前回載っていた層をすべて空で送る (在庫を 0 本に更新する)。
+        assert_eq!(
+            residency_delta(&prev, &[]),
+            vec![(0, Vec::new()), (3, Vec::new()), (5, Vec::new())]
+        );
+    }
+
     /// P56: ルーティングの期待値 (テレメトリに依らない参照)。同じ式を手で回す。
     fn expected_router_topk(p: &Qwen4ExpParams, lw: &LayerW, x: &[f32]) -> (Vec<usize>, Vec<f32>) {
         let mut probs = vec![0.0f32; p.n_expert];
@@ -8273,6 +8483,201 @@ mod tests {
                 "逐次 prefill の RouterTopK が層数ぶん (末尾トークン 1 回) でない"
             );
             assert!(sizes.iter().all(|&n| n == NEXP), "top-k の本数が違う: {sizes:?}");
+
+            denno_telemetry::set_arch_for_tests(prev_arch);
+            denno_telemetry::set_enabled_for_tests(prev_on);
+        }
+
+        /// P58: 構造テレメトリ (RoleAct / ExpertResidency / TierStats) の送出。
+        ///
+        /// - arch off では 3 種とも **0 枚** (ゲートが効いている)
+        /// - arch on にしても logits は arch off と**ビット一致** (読むだけ)
+        /// - prefill (逐次) は末尾トークン 1 回 → RoleAct が層数ぶん、
+        ///   TierStats が 1 枚以上。各 RoleAct の 5 値は有限で 0..1
+        /// - decode の 1 トークンでも RoleAct が層数ぶん
+        /// - 使わない役割 (ssm 層の attn / full attention 層の gdn) は 0.0
+        ///
+        /// ExpertResidency は VRAM 経路 (GPU) が無いと 1 枚も出ないので、
+        /// 出たときだけ「n ≤ 512・重複なし」を検査する (差分規則そのものは
+        /// `residency_delta_emits_only_changed_layers` が固定する)。
+        #[test]
+        fn arch_emit_frames() {
+            let _g = moe_test_guard();
+            let dir = TempDir::new("arch_emit");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("合成モデルを開けない");
+            let ctx: Vec<u32> = vec![1, 2, 3];
+
+            fn drain() -> Vec<denno_telemetry::Frame> {
+                let mut v = Vec::new();
+                while let Some(fr) = denno_telemetry::try_recv_nowait() {
+                    v.push(fr);
+                }
+                v
+            }
+
+            let prev_on = denno_telemetry::enabled();
+            let prev_arch = denno_telemetry::arch_enabled();
+
+            // (0) テレメトリ自体が off → arch が on でも 0 枚
+            denno_telemetry::set_enabled_for_tests(false);
+            denno_telemetry::set_arch_for_tests(true);
+            drain();
+            let mut m_none = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+            m_none
+                .forward_prefill_with(&ctx, false)
+                .expect("prefill (telemetry off)");
+            let got = drain();
+            assert!(
+                got.is_empty(),
+                "テレメトリ off でフレームが出た: {} 枚 ({got:?})",
+                got.len()
+            );
+
+            denno_telemetry::set_enabled_for_tests(true);
+
+            // (1) arch off → フレーム 0 枚
+            denno_telemetry::set_arch_for_tests(false);
+            drain();
+            let mut m_off = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+            let l_off = m_off
+                .forward_prefill_with(&ctx, false)
+                .expect("prefill (arch off)");
+            let got = drain();
+            assert!(
+                got.is_empty(),
+                "arch off でフレームが出た: {} 枚 ({got:?})",
+                got.len()
+            );
+
+            // (2) arch on → RoleAct は層数ぶん・TierStats は 1 枚以上・logits は不変
+            denno_telemetry::set_arch_for_tests(true);
+            drain();
+            let mut m_on = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+            let l_on = m_on
+                .forward_prefill_with(&ctx, false)
+                .expect("prefill (arch on)");
+            assert_bitwise_eq(&l_off, &l_on, "arch on/off の prefill logits");
+
+            let pre = drain();
+            let mut role_layers: Vec<u16> = Vec::new();
+            let mut kind_zero: Vec<(u16, u16, u16)> = Vec::new(); // (層, attn, gdn)
+            let mut tier = 0usize;
+            let mut residency = 0usize;
+            for fr in &pre {
+                match fr {
+                    denno_telemetry::Frame::RoleAct {
+                        layer,
+                        attn,
+                        gdn,
+                        router,
+                        shex,
+                        ple,
+                    } => {
+                        for (name, bits) in
+                            [("attn", attn), ("gdn", gdn), ("router", router), ("shex", shex), ("ple", ple)]
+                        {
+                            let v = denno_telemetry::f16_bits_to_f32(*bits);
+                            assert!(v.is_finite(), "層 {layer} の {name} が有限でない: {v}");
+                            assert!(
+                                (0.0..=1.0).contains(&v),
+                                "層 {layer} の {name} が 0..1 の外: {v}"
+                            );
+                        }
+                        role_layers.push(*layer);
+                        kind_zero.push((*layer, *attn, *gdn));
+                    }
+                    denno_telemetry::Frame::ExpertResidency { layer, in_vram } => {
+                        residency += 1;
+                        assert!(
+                            in_vram.len() <= denno_telemetry::RESIDENCY_MAX,
+                            "層 {layer}: 本数 {} が上限 {} を超える",
+                            in_vram.len(),
+                            denno_telemetry::RESIDENCY_MAX
+                        );
+                        let mut s = in_vram.clone();
+                        s.sort_unstable();
+                        s.dedup();
+                        assert_eq!(s.len(), in_vram.len(), "層 {layer}: expert index が重複");
+                    }
+                    denno_telemetry::Frame::TierStats { .. } => tier += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                role_layers,
+                (0..LAYERS as u16).collect::<Vec<_>>(),
+                "prefill の RoleAct が層数ぶん (末尾トークン 1 回) でない"
+            );
+            assert!(tier >= 1, "TierStats が 1 枚も出ていない");
+            assert!(
+                residency == 0 || residency <= LAYERS,
+                "ExpertResidency が層数を超える ({residency} 枚)"
+            );
+            // 層の種別で使わない役割は 0.0 で埋める (full attention は (il+1) % INTERVAL == 0)。
+            for (layer, attn, gdn) in kind_zero {
+                if (layer as usize + 1) % INTERVAL == 0 {
+                    assert_eq!(gdn, 0, "full attention 層 {layer} の gdn が 0 でない");
+                } else {
+                    assert_eq!(attn, 0, "ssm 層 {layer} の attn が 0 でない");
+                }
+            }
+
+            // (3) decode の 1 トークン (t+1 == nt) でも RoleAct が層数ぶん出る
+            drain();
+            m_on.forward_token_tapped(&[1, 2, 3, 4], |_| {})
+                .expect("decode (arch on)");
+            let mut dec: Vec<u16> = Vec::new();
+            while let Some(fr) = denno_telemetry::try_recv_nowait() {
+                if let denno_telemetry::Frame::RoleAct { layer, .. } = fr {
+                    dec.push(layer);
+                }
+            }
+            assert_eq!(
+                dec,
+                (0..LAYERS as u16).collect::<Vec<_>>(),
+                "decode の RoleAct が層数ぶん出ていない"
+            );
+
+            denno_telemetry::set_arch_for_tests(prev_arch);
+            denno_telemetry::set_enabled_for_tests(prev_on);
+        }
+
+        /// P58: TierStats の間引き。decode は 100 トークンごと、prefill 終了時は
+        /// その場で 1 枚 (トークンごとには出さない)。
+        #[test]
+        fn tier_stats_emitted_every_100_decode_tokens() {
+            let _g = moe_test_guard();
+            let dir = TempDir::new("tier_stats");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("合成モデルを開けない");
+
+            fn tier_count() -> usize {
+                let mut n = 0;
+                while let Some(fr) = denno_telemetry::try_recv_nowait() {
+                    if matches!(fr, denno_telemetry::Frame::TierStats { .. }) {
+                        n += 1;
+                    }
+                }
+                n
+            }
+
+            let prev_on = denno_telemetry::enabled();
+            let prev_arch = denno_telemetry::arch_enabled();
+            denno_telemetry::set_enabled_for_tests(true);
+            denno_telemetry::set_arch_for_tests(true);
+            while denno_telemetry::try_recv_nowait().is_some() {}
+
+            let mut m = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+            for _ in 0..TIER_STATS_TOKENS - 1 {
+                m.arch_emit_token();
+            }
+            assert_eq!(tier_count(), 0, "100 トークン未満で TierStats が出た");
+            m.arch_emit_token();
+            assert_eq!(tier_count(), 1, "100 トークン目で TierStats が出ていない");
+
+            m.arch_emit_prefill_done();
+            assert_eq!(tier_count(), 1, "prefill 終了時に TierStats が出ていない");
 
             denno_telemetry::set_arch_for_tests(prev_arch);
             denno_telemetry::set_enabled_for_tests(prev_on);
