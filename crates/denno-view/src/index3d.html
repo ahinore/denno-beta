@@ -68,6 +68,7 @@
   <div id="tokline" class="dim">tokens: prompt <b id="tok_total">--</b> · fed <b id="tok_fed">--</b> ·
        prefix cache reuse <b id="tok_reuse">0</b> · kv <b id="kv_len">0</b>/<b id="kv_max">--</b> · pos <b id="kv_pos">--</b></div>
   <div id="promptline" class="dim">prompt: <span id="prompt_txt">--</span></div>
+  <div id="candline" class="dim">logits: p1 <b id="cand_p1">--</b> · chosen <b id="cand_ch">--</b> · entropy <b id="cand_h">--</b></div>
   <div id="mode" class="dim">mode: demo (routing simulated)</div>
 </div>
 <div id="legend" class="panel">
@@ -564,6 +565,178 @@ function paintTokens() {
   tokInst.instanceColor.needsUpdate = true;
 }
 
+
+// ===== 11) 出力の候補 (Prediction Head) と、チャット<->3D の飛翔 ==========
+// TopK フレームは serve_flash がサンプリング前の分布から top-8 を作って送る
+// (Frame::TopK、確率は f16)。chosen がそのステップで選ばれた id。
+const CANDN = 8;
+const candInst = new THREE.InstancedMesh(
+  new THREE.BoxGeometry(0.26, 1, 0.26),
+  new THREE.MeshBasicMaterial({ color: 0xffffff }), CANDN);
+candInst.frustumCulled = false;
+const CAND_X0 = -8.1, CAND_DX = 0.44, CAND_Z = topZ + 1.4;
+for (let i = 0; i < CANDN; i++) {
+  m4.makeTranslation(CAND_X0 + i * CAND_DX, 0.9, CAND_Z);
+  m4.scale(new THREE.Vector3(1, 0.02, 1));
+  candInst.setMatrixAt(i, m4);
+  candInst.setColorAt(i, new THREE.Color(0x2a2410));
+}
+candInst.instanceMatrix.needsUpdate = true; candInst.instanceColor.needsUpdate = true;
+scene.add(candInst);
+label('候補 top-8 (実 logits, softmax 前の分布)', '#fff2b0', 5.2, -6.5, 2.4, CAND_Z);
+let cands = [], candChosen = -1, candPulse = 0;
+
+function paintCands() {
+  const col = candInst.instanceColor.array;
+  for (let i = 0; i < CANDN; i++) {
+    const e = cands[i];
+    const pr = e ? Math.max(0.004, e[1]) : 0;
+    const h = 0.05 + Math.min(1, Math.sqrt(pr) * 1.5) * 2.0;
+    m4.makeTranslation(CAND_X0 + i * CAND_DX, 0.9 + h / 2 - 1.0, CAND_Z);
+    m4.scale(new THREE.Vector3(1, h, 1));
+    candInst.setMatrixAt(i, m4);
+    const on = e && e[0] === candChosen;
+    if (!e) { col[i * 3] = 0.08; col[i * 3 + 1] = 0.07; col[i * 3 + 2] = 0.04; }
+    else if (on) { col[i * 3] = 1.0; col[i * 3 + 1] = 1.0; col[i * 3 + 2] = 1.0; }
+    else { col[i * 3] = 0.65; col[i * 3 + 1] = 0.50; col[i * 3 + 2] = 0.12; }
+  }
+  candInst.instanceMatrix.needsUpdate = true;
+  candInst.instanceColor.needsUpdate = true;
+}
+
+// ---- 画面座標 -> 3D (チャット欄と 3D のあいだを飛ばすため) ----
+function screenPoint(el, fx, fy, dist) {
+  const r = el ? el.getBoundingClientRect() : { left: innerWidth * 0.72, top: innerHeight * 0.6, width: 10, height: 10 };
+  const nx = ((r.left + r.width * fx) / innerWidth) * 2 - 1;
+  const ny = 1 - ((r.top + r.height * fy) / innerHeight) * 2;
+  const v = new THREE.Vector3(nx, ny, 0.5).unproject(camera);
+  return camera.position.clone().add(v.sub(camera.position).normalize().multiplyScalar(dist));
+}
+
+const flights = [];
+function makeTextSprite(txt, color, w) {
+  const cv = document.createElement('canvas');
+  const g0 = cv.getContext('2d');
+  g0.font = 'bold 34px ui-monospace, monospace';
+  const tw = Math.ceil(g0.measureText(txt).width) + 16;
+  cv.width = Math.max(64, tw); cv.height = 64;
+  const g = cv.getContext('2d');
+  g.font = 'bold 34px ui-monospace, monospace'; g.fillStyle = color;
+  g.textBaseline = 'middle'; g.fillText(txt, 8, 34);
+  const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
+  sp.scale.set(w, w * cv.height / cv.width, 1);
+  return { obj: sp, tex };
+}
+function flyText(txt, color, w, from, to, dur, onArrive) {
+  const { obj, tex } = makeTextSprite(txt, color, w);
+  obj.position.copy(from);
+  scene.add(obj);
+  const mid = from.clone().lerp(to, 0.5);
+  mid.y += Math.max(3, from.distanceTo(to) * 0.18);
+  flights.push({ obj, tex, t: 0, dur, p0: from.clone(), p1: mid, p2: to.clone(), onArrive, s0: w });
+}
+function stepFlights(dt) {
+  for (let i = flights.length - 1; i >= 0; i--) {
+    const f = flights[i];
+    f.t += dt / f.dur;
+    const u = Math.min(1, f.t), w = 1 - u;
+    f.obj.position.set(
+      w * w * f.p0.x + 2 * w * u * f.p1.x + u * u * f.p2.x,
+      w * w * f.p0.y + 2 * w * u * f.p1.y + u * u * f.p2.y,
+      w * w * f.p0.z + 2 * w * u * f.p1.z + u * u * f.p2.z);
+    f.obj.material.opacity = u < 0.85 ? 1 : (1 - u) / 0.15;
+    if (u >= 1) {
+      scene.remove(f.obj);
+      f.obj.material.map.dispose(); f.obj.material.dispose(); f.tex.dispose();
+      if (f.onArrive) f.onArrive();
+      flights.splice(i, 1);
+    }
+  }
+}
+
+// テレメトリの TopK (kind 15) — 選ばれたトークンを予測ヘッドからチャットへ飛ばす
+window.onTopK = function (f) {
+  cands = f.entries || [];
+  candChosen = f.chosen;
+  candPulse = 1;
+  paintCands();
+  if (f.entries && f.entries.length) {
+    document.getElementById('cand_p1').textContent =
+      'tok ' + f.entries[0][0] + ' ' + (f.entries[0][1] * 100).toFixed(1) + '%';
+  }
+  document.getElementById('cand_ch').textContent = 'tok ' + f.chosen;
+  document.getElementById('cand_h').textContent = (f.entropy === undefined ? '--' : Number(f.entropy).toFixed(2));
+  const from = new THREE.Vector3(-6.6, 1.0, topZ + 1.2);
+  const to = screenPoint(document.getElementById('chat'), 0.5, 0.55, 26);
+  flyText('tok ' + f.chosen, '#fff2b0', 2.6, from, to, 1.15, () => {
+    chatEl.box.classList.remove('flash'); void chatEl.box.offsetWidth;
+    if (chatEl.box.classList.contains('flash')) chatEl.box.classList.remove('flash');
+    chatEl.box.style.boxShadow = '0 0 32px rgba(120,255,190,.55)';
+    setTimeout(() => { chatEl.box.style.boxShadow = ''; }, 220);
+  });
+};
+
+// ===== 12) フライトモード (WASD + クォータニオンで自由視点) ===============
+// 俯瞰の回転モード (OrbitControls) とは別。f で入る。Esc か f で戻る。
+const fly = { on: false, keys: new Set(), sens: 0.0022, speed: 16, savedTarget: new THREE.Vector3() };
+const _qy = new THREE.Quaternion(), _qyAxis = new THREE.Vector3(0, 1, 0);
+const _qp = new THREE.Quaternion(), _qxAxis = new THREE.Vector3(1, 0, 0);
+function enterFly() {
+  fly.on = true;
+  controls.enabled = false;
+  fly.savedTarget.copy(controls.target);
+  fly.keys.clear();
+  hudEl.mode.textContent = 'mode: fly (WASD 移動 / マウス視点 / Shift 加速 / Q E 上下 / Esc 解除)';
+  if (canvas.requestPointerLock) { try { canvas.requestPointerLock(); } catch (e) {} }
+}
+function exitFly() {
+  fly.on = false;
+  controls.enabled = true;
+  fly.keys.clear();
+  if (document.exitPointerLock && document.pointerLockElement) { try { document.exitPointerLock(); } catch (e) {} }
+  // いまの向きの 10 先を注視点にして OrbitControls に戻す
+  const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+  controls.target.copy(camera.position).addScaledVector(fwd, 10);
+  controls.update();
+  hudEl.mode.textContent = replayOn ? 'mode: replay' : 'mode: live (telemetry)';
+}
+addEventListener('pointermove', (e) => {
+  if (!fly.on) return;
+  const dx = e.movementX || 0, dy = e.movementY || 0;
+  if (!dx && !dy) return;
+  // ヨーはワールド Y 軸まわり (premultiply)、ピッチは機体のローカル X 軸まわり (multiply)。
+  // クォータニオンの合成順がそのまま「ヨー -> ピッチ」の意味になる。
+  _qy.setFromAxisAngle(_qyAxis, -dx * fly.sens);
+  _qp.setFromAxisAngle(_qxAxis, -dy * fly.sens);
+  camera.quaternion.premultiply(_qy).multiply(_qp).normalize();
+});
+addEventListener('keydown', (e) => {
+  if (e.target && /input|textarea/i.test(e.target.tagName)) return;
+  if (e.key === 'f' || e.key === 'F') { fly.on ? exitFly() : enterFly(); e.preventDefault(); return; }
+  if (e.key === 'Escape' && fly.on) { exitFly(); return; }
+  if (fly.on) fly.keys.add(e.code);
+});
+addEventListener('keyup', (e) => { fly.keys.delete(e.code); });
+const _fwd = new THREE.Vector3(), _right = new THREE.Vector3(), _move = new THREE.Vector3();
+function stepFly(dt) {
+  if (!fly.on) return;
+  _fwd.set(0, 0, -1).applyQuaternion(camera.quaternion);
+  _right.set(1, 0, 0).applyQuaternion(camera.quaternion);
+  _move.set(0, 0, 0);
+  const k = fly.keys;
+  if (k.has('KeyW') || k.has('ArrowUp')) _move.add(_fwd);
+  if (k.has('KeyS') || k.has('ArrowDown')) _move.sub(_fwd);
+  if (k.has('KeyD') || k.has('ArrowRight')) _move.add(_right);
+  if (k.has('KeyA') || k.has('ArrowLeft')) _move.sub(_right);
+  if (k.has('KeyE')) _move.y += 1;
+  if (k.has('KeyQ')) _move.y -= 1;
+  if (_move.lengthSq() > 0) {
+    const boost = (k.has('ShiftLeft') || k.has('ShiftRight')) ? 3.2 : 1;
+    camera.position.addScaledVector(_move.normalize(), fly.speed * boost * dt);
+  }
+}
+
 // ===== post ==============================================================
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
@@ -815,7 +988,10 @@ function step(dt, doRender) {
   }
   fGeo.attributes.position.needsUpdate = true; fGeo.attributes.color.needsUpdate = true;
 
-  controls.update();
+  stepFlights(dt);
+  if (candPulse > 0.01) { candPulse *= 0.94; paintCands(); }
+  stepFly(dt);
+  if (!fly.on) controls.update();
   if (doRender !== false) composer.render();
 }
 
@@ -1011,6 +1187,9 @@ function handleFrame(f) {
     case 'TierStats':
       window.onTierStats(f.vramMB, f.vramTotalMB, f.ramExperts, f.ssdReads);
       break;
+    case 'TopK':
+      window.onTopK(f);
+      break;
   }
 }
 
@@ -1118,6 +1297,16 @@ async function sendMsg(text) {
   if (busy || !text.trim()) return;
   busy = true; chatEl.send.disabled = true;
   addLine('u', '> ' + text);
+  // 入力テキストをチャット欄から tokenizer の箱へ飛ばし、着いたらトークン列を光らせる
+  if (typeof flyText === 'function') {
+    const from = screenPoint(document.getElementById('chat'), 0.5, 0.86, 26);
+    const to = new THREE.Vector3(-12.6, TOK_Y, TOK_Z);
+    flyText(text.length > 24 ? text.slice(0, 24) + '...' : text, '#8fe6ff', 6.2, from, to, 0.95, () => {
+      inpPulse = 1;
+      for (let i = 0; i < 24; i++) tokAct[i] = 0.9;
+      paintTokens();
+    });
+  }
   chatEl.inp.value = '';
   hist.push({ role: 'user', content: text });
   const node = addLine('a', '');

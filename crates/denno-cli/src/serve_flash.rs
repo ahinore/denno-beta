@@ -373,6 +373,9 @@ impl Flash {
         };
         let t2 = Instant::now();
         for _ in 0..req.max_tokens {
+            // P58: 選ぶ前の分布を top-8 で送る (3D ビューワの候補表示用)。
+            // テレメトリ OFF なら計算しない。数値経路には触れない。
+            let cand = if t_on { Some(denno_telemetry::topk_softmax(&logits, 8)) } else { None };
             let id = sampler.sample(&logits) as u32;
             if Some(id) == eos {
                 break;
@@ -425,6 +428,18 @@ impl Flash {
                     ns: t0.elapsed().as_nanos() as u64,
                 });
                 self.telem.emit(Frame::Token { session: sid, token: id, pos });
+                if let Some(tk) = cand.as_ref() {
+                    self.telem.emit(Frame::TopK {
+                        session: sid,
+                        chosen: id,
+                        entropy_f16: denno_telemetry::f32_to_f16_bits(tk.entropy),
+                        entries: tk
+                            .entries
+                            .iter()
+                            .map(|&(tid, p)| (tid, denno_telemetry::f32_to_f16_bits(p)))
+                            .collect(),
+                    });
+                }
                 self.telem.emit(Frame::KvUsage {
                     busy: vec![true],
                     t_lens: vec![dec.tokens().len() as u32],
