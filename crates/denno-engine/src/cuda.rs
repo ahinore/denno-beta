@@ -1612,7 +1612,7 @@ struct MoeScratch {
     x: Option<DevBuffer>, // >= n_in * 4 B
     o: Option<DevBuffer>, // >= n_out * 4 B
     // P-async: pinned の staging (H2D / D2H を async にするため)。
-    // `DENNO_GEMV_ASYNC=1` のときだけ確保する。
+    // [`gemv_async_on`] が真のときだけ確保する (既定 on、`DENNO_GEMV_ASYNC=0` で off)。
     pin_x: Option<PinMem>,
     pin_o: Option<PinMem>,
 }
@@ -1624,18 +1624,17 @@ thread_local! {
 
 /// P-async: decode の GEMV を「pinned staging + async コピー + 同期 1 回」で回すか。
 ///
-/// 既定 off (`DENNO_GEMV_ASYNC=1` で有効)。off のとき従来の
-/// `copy_from` (同期 H2D) → カーネル → `sync` → `to_vec` (同期 D2H) を
-/// **1 命令も変えずに**通す。
-///
-/// 数値は不変: カーネル・引数・発行順・丸め順は同じで、コピーの API だけが
-/// 「同期」から「非同期 + 最後に 1 回同期」に変わる (バイト列は同一)。
+/// 既定 **on** (`DENNO_GEMV_ASYNC=0` で従来の同期経路に戻る)。従来経路は
+/// `copy_from` (同期 H2D) → カーネル → `sync` → `to_vec` (同期 D2H) で、
+/// **カーネル・引数・発行順・丸め順は同じ**、コピーの API だけが変わる
+/// (バイト列は同一)。実測 2026-10-30: 26.15 -> 25.66 s (118 tok)、
+/// 出力 md5 は v1 と一致 (`3b77a3b996fd`、12 ラン全部同じ)。
 pub fn gemv_async_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("DENNO_GEMV_ASYNC").ok().as_deref(),
-            Some("1") | Some("on") | Some("true")
+            Some("0") | Some("off") | Some("false")
         )
     })
 }
@@ -12349,6 +12348,72 @@ mod tests {
         let got2 = run_gpu(&kc, &vc);
         assert_eq!(got, got2, "prefill attention (dh={dh}) が非決定論的");
         println!("prefill attention qwen35 shape (dh={dh}) determinism OK");
+    }
+
+    /// P-gemv2: GPU の GEMV (x 先読み版カーネル = 既定) が CPU の逐次実装と
+    /// **ビット一致**すること。4 型すべてで、行数も複数 (ブロック跨ぎ) で見る。
+    ///
+    /// 重みは決定的な擬似乱数バイト。scale は f16 の 1.0 (`0x3C00`) に固定して
+    /// NaN/Inf を作らない (NaN は to_bits 比較でも一致するはずだが、失敗時に
+    /// 原因が読みにくくなるため避ける)。
+    #[test]
+    #[ignore]
+    fn cuda_moe_gemv_v2_bit_exact_vs_cpu() {
+        use crate::kquant::GgmlType as T;
+        let ctx = CudaCtx::new().unwrap();
+        println!("device: {}", ctx.info());
+        let n_in = 512usize;
+        let n_out = 13usize; // 4 行/ブロックを跨ぐ中途半端な数
+        let x = pseudo_random(n_in, 7);
+        for ty in [T::Q8_0, T::Q5_1, T::Q4K, T::Q5K] {
+            let rb = gguf_row_bytes(ty, n_in).expect("row_bytes");
+            let blk = ty.blck_size();
+            let hdr = match ty {
+                T::Q8_0 | T::Q4K | T::Q5K => 4usize, // d (+ dmin)
+                T::Q5_1 => 4usize,                   // d, m
+                _ => unreachable!(),
+            };
+            let mut w = vec![0u8; rb * n_out];
+            let mut s = 12345u32;
+            for r in 0..n_out {
+                let row = &mut w[r * rb..(r + 1) * rb];
+                for b in 0..(n_in / blk) {
+                    let base = b * ty.type_size();
+                    // d = 1.0 (f16), Q4_K/Q5_K の dmin, Q5_1 の m も 1.0
+                    row[base] = 0x00;
+                    row[base + 1] = 0x3c;
+                    if hdr == 4 {
+                        row[base + 2] = 0x00;
+                        row[base + 3] = 0x3c;
+                    }
+                    for i in hdr..ty.type_size() {
+                        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        row[base + i] = (s >> 16) as u8;
+                    }
+                }
+            }
+            let mut want = vec![0f32; n_out];
+            crate::model::moe_expert::expert_gemv_scalar(ty, &w, n_in, n_out, &x, &mut want)
+                .expect("cpu 参照");
+            let dev_w = DevBuffer::from_slice(&w).unwrap();
+            let mut got = vec![0f32; n_out];
+            assert!(
+                ctx.moe_gemv_dev(ty, &dev_w, &x, n_in, n_out, &mut got)
+                    .unwrap(),
+                "{ty:?}: GPU 経路が発動しなかった"
+            );
+            let bad: Vec<usize> = (0..n_out)
+                .filter(|&i| got[i].to_bits() != want[i].to_bits())
+                .collect();
+            assert!(
+                bad.is_empty(),
+                "{ty:?}: CPU と{}行で不一致 (行 {:?}: gpu={:?} cpu={:?})",
+                bad.len(),
+                &bad[..bad.len().min(4)],
+                bad.iter().map(|&i| got[i]).take(4).collect::<Vec<_>>(),
+                bad.iter().map(|&i| want[i]).take(4).collect::<Vec<_>>()
+            );
+        }
     }
 
     /// GPU の量子化が CPU (`tensor::quantize_row_i8`) とビット一致するか
