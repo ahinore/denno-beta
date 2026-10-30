@@ -83,6 +83,10 @@ const VRAM_CAP = 10500;          // VRAM に載る expert 枠。実測からの�
                                  // DENNO_EXPERT_VRAM_MB=18000 / 1 expert 約 1.7 MB
                                  // (gate+up Q4_K 2560x640x512 + down Q5_1 640x2560x512)
                                  // = 約 10,500 本 / 全 24,576 本 (48 層 x 512) = 43%
+const RAM_CAP = 10500;           // RAM (ホスト側) に置ける expert 枠。テレメトリには
+                                 // 載っていない (ExpertResidency は VRAM の集合だけ)
+                                 // ので VRAM と同数と置く近似。溢れたぶんだけ単調 LRU で
+                                 // SSD へ落とす (受信のたびに全 512 本を SSD に送らない)。
 
 const isQSA = (il) => (il + 1) % INTERVAL === 0;
 const zOf = (il) => -il * ZSTEP;
@@ -298,8 +302,25 @@ const demo = { on: true, t: 0, paused: false, cursor: 0, hold: 0 };
 const live = { ts: 0, act: new Map(),
   hit() { const age = performance.now() - this.ts; return Math.exp(-age / 400); } };
 const lru = [];                 // VRAM 在庫 (expert の通し番号)
+const lruRam = [];              // RAM 在庫。VRAM から押し出された順 (単調 LRU)
 let vramUsed = 0;
 const key = (il, k) => il * EXPERTS + k;
+
+/** 配列内の 1 要素を末尾へ移す (無ければ push)。LRU の「触った」を表す。 */
+function touch(arr, kk) {
+  const i = arr.indexOf(kk);
+  if (i >= 0) arr.splice(i, 1);
+  arr.push(kk);
+}
+
+// kind 13 RoleAct: 層ごとの役割の強さ (0..1 に clamp 済み)。
+// -1 = その層の値は未受信 → 従来どおり head (デモ / 直近の活性) で塗る。
+const ROLE_KEYS = ['attn', 'gdn', 'router', 'shex', 'ple'];
+const roleTarget = {}, roleCur = {};
+for (const k of ROLE_KEYS) {
+  roleTarget[k] = new Float32Array(LAYERS).fill(-1);
+  roleCur[k] = new Float32Array(LAYERS);
+}
 
 function hash(a, b) { const r = Math.sin(a * 127.1 + b * 311.7) * 43758.5453; return r - Math.floor(r); }
 
@@ -379,15 +400,27 @@ function updateLayerColors(il) {
 
 function updateRoleColors(il, head) {
   const qsa = isQSA(il);
-  const z = zOf(il);
-  const set = (r, idx, v, base) => { r.inst.setColorAt(idx, r.color.clone().multiplyScalar(base + v * 1.7)); };
-  set(R.qsa, il, qsa ? head : 0, qsa ? 0.16 : 0);
-  set(R.gdn, il, qsa ? 0 : head, qsa ? 0 : 0.16);
-  set(R.router, il, Math.min(1, head * 1.5), 0.10);
-  set(R.shex, il, head * 0.8, 0.16);
+  // kind 13 の実値が届いている層はそちらを使う。届いていない層は head のまま
+  // (0 に落とさない)。値は前フレームから補間してちらつきを抑える。
+  const v = (name, fallback) => {
+    const t = roleTarget[name][il];
+    if (t < 0) return fallback;
+    roleCur[name][il] += (t - roleCur[name][il]) * 0.35;
+    return roleCur[name][il];
+  };
+  const set = (r, idx, val, base) => { r.inst.setColorAt(idx, r.color.clone().multiplyScalar(base + val * 1.7)); };
+  set(R.qsa, il, qsa ? v('attn', head) : 0, qsa ? 0.16 : 0);
+  set(R.gdn, il, qsa ? 0 : v('gdn', head), qsa ? 0 : 0.16);
+  set(R.router, il, v('router', Math.min(1, head * 1.5)), 0.10);
+  set(R.shex, il, v('shex', head * 0.8), 0.16);
   set(R.gr, il * 2, head, 0.14);
   set(R.gr, il * 2 + 1, head * 0.6, 0.14);
   for (const k of ['qsa', 'gdn', 'router', 'shex', 'gr']) R[k].inst.instanceColor.needsUpdate = true;
+  // PLE は層のスラブではなく layer 2 の表 (pleGroup の 16 個) だけ
+  if (il === PLE_LAYERS[0]) {
+    const pl = v('ple', 0);
+    for (const m of pleGroup.children) m.material.color.copy(COL.ple).multiplyScalar(0.35 + pl * 1.7);
+  }
 }
 
 let prevCursor = -1;
@@ -510,13 +543,76 @@ window.onLayerActivation = function (layer, idx, val) {
   promote(layer, sel);
   document.getElementById('mode').textContent = 'mode: live (telemetry)';
 };
-window.onResidency = function (layer, inVram) {
-  const s = slabs[layer]; if (!s) return;
-  const set = new Set(inVram);
-  for (let k = 0; k < EXPERTS; k++) {
-    const want = set.has(k) ? TIER.VRAM : (s.tier[k] === TIER.VRAM ? TIER.RAM : s.tier[k]);
-    if (s.tier[k] !== want) { s.tier[k] = want; s.dirty[k] = 1; }
+// kind 13 RoleAct: 層の役割ごとの強さ (attn/gdn/router/shex/ple)。実値は 0.0〜数倍。
+// 値を 0..1 に clamp して該当ブロックの発光に使う。届いていない層は既定値のまま。
+window.onRoleActivation = function (layer, roles) {
+  const il = layer | 0;
+  live.ts = performance.now(); demo.on = false;
+  if (il < 0 || il >= LAYERS || !roles) return;
+  demo.cursor = il;
+  for (const k of ROLE_KEYS) {
+    const x = Number(roles[k]);
+    roleTarget[k][il] = Number.isFinite(x) ? Math.max(0, Math.min(1, x)) : 0;
   }
+  document.getElementById('mode').textContent = 'mode: live (telemetry)';
+};
+
+// kind 14 ExpertResidency: その層の VRAM 在庫 (expert index の配列、層は 0 始まり)。
+//   inVram に入っている      → VRAM
+//   入っていないが VRAM に居る → RAM  (VRAM から押し出された)
+//   RAM に居て、さらに押し出された → SSD
+// SSD へ送るのは RAM 枠 (RAM_CAP) を超えたぶんだけ。受信のたびに全 512 本は動かさない。
+window.onResidency = function (layer, inVram) {
+  const il = layer | 0;
+  const s = slabs[il]; if (!s) return;
+  live.ts = performance.now(); demo.on = false;
+  const set = new Set();
+  for (const x of inVram || []) {
+    const k = x | 0;
+    if (k >= 0 && k < EXPERTS) set.add(k);
+  }
+  // 1) inVram の expert を VRAM へ (受信順を「新しく触った順」とみなす)
+  for (const k of set) {
+    const kk = key(il, k);
+    if (s.tier[k] !== TIER.VRAM) { s.tier[k] = TIER.VRAM; s.dirty[k] = 1; }
+    const i = lruRam.indexOf(kk);
+    if (i >= 0) lruRam.splice(i, 1);
+    touch(lru, kk);
+  }
+  // 2) inVram に無いのに VRAM に居る expert は RAM へ (位置の再計算は変わった箱だけ)
+  for (let k = 0; k < EXPERTS; k++) {
+    if (set.has(k) || s.tier[k] !== TIER.VRAM) continue;
+    s.tier[k] = TIER.RAM; s.dirty[k] = 1;
+    const kk = key(il, k);
+    const i = lru.indexOf(kk);
+    if (i >= 0) lru.splice(i, 1);
+    touch(lruRam, kk);
+  }
+  // 3) VRAM 枠を超えたぶんを古い順に RAM へ
+  while (lru.length > VRAM_CAP) {
+    const kk = lru.shift();
+    const l2 = (kk / EXPERTS) | 0, k2 = kk % EXPERTS;
+    const s2 = slabs[l2];
+    if (s2 && s2.tier[k2] === TIER.VRAM) {
+      s2.tier[k2] = TIER.RAM; s2.dirty[k2] = 1; touch(lruRam, kk);
+    }
+  }
+  // 4) RAM 枠を超えたぶんだけ SSD へ (押し出し順は単調 LRU)
+  while (lruRam.length > RAM_CAP) {
+    const kk = lruRam.shift();
+    const l2 = (kk / EXPERTS) | 0, k2 = kk % EXPERTS;
+    const s2 = slabs[l2];
+    if (s2 && s2.tier[k2] === TIER.RAM) { s2.tier[k2] = TIER.SSD; s2.dirty[k2] = 1; }
+  }
+};
+
+// kind 15 TierStats: HUD の実値 (MB は 1000 区切り、ramExperts は本数)。
+const fmtNum = (n) => String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+window.onTierStats = function (vramMB, vramTotalMB, ramExperts, ssdReads) {
+  hudEl.vram.textContent = fmtNum(vramMB);
+  hudEl.total.textContent = fmtNum(vramTotalMB);
+  hudEl.ram.textContent = fmtNum(ramExperts);
+  hudEl.ssd.textContent = fmtNum(ssdReads);
 };
 
 // ===== 実テレメトリ (/ws -> VIEW_UPSTREAM) ================================
@@ -562,10 +658,7 @@ function handleFrame(f) {
       window.onResidency(f.layer, f.vram);
       break;
     case 'TierStats':
-      hudEl.vram.textContent = f.vramMB;
-      hudEl.total.textContent = f.vramTotalMB;
-      hudEl.ram.textContent = f.ramExperts;
-      hudEl.ssd.textContent = f.ssdReads;
+      window.onTierStats(f.vramMB, f.vramTotalMB, f.ramExperts, f.ssdReads);
       break;
   }
 }

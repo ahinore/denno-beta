@@ -6,10 +6,10 @@
 //   magic "DNTL" (4B) | version (1B) | kind (1B) | payload...
 //   payload 内の整数は LEB128 (unsigned)、f16 はリトルエンディアンの u16。
 //
-// kind 1..12 は lib.rs の Frame と 1:1。kind 13..15 (RoleAct / ExpertResidency /
-// TierStats) は **lib.rs にまだ定義が無い** ので、このファイルで暫定仕様を決めて
-// いる (lib.rs の流儀 = varint + f16 を踏襲)。エンジン側の送出が入ったら
-// lib.rs に合わせて直すこと。暫定であることは REPORT_P55.md に書いた。
+// kind 1..16 は lib.rs の Frame と 1:1。kind 13..15 (RoleAct / ExpertResidency /
+// TierStats) と 16 (RouterTopK) は lib.rs の encode/decode に合わせてある
+// (定義は P54/P56 で入った)。暫定だった 13/14/15 は role id バイトや count を
+// 持たない形式へ直した (P59)。
 
 export const MAGIC = 'DNTL';
 export const VERSION = 1;
@@ -371,16 +371,12 @@ export function encodeFrame(frame) {
       for (const i of frame.idx) w.u32(i);
       for (const v of frame.val) w.f16(v);
       break;
-    // ---- 暫定 (lib.rs 未定義) ------------------------------------------
+    // ---- P54/P56 で lib.rs に定義が入った kind ---------------------------
     case 'RoleAct': {
+      // lib.rs: varint layer のあと ROLE_NAMES の並びで f16 × 5 (id も count も無い)
       w.u8(KIND.ROLE_ACT); w.u32(frame.layer);
-      const entries = Object.entries(frame.roles || {});
-      w.u32(entries.length);
-      for (const [name, v] of entries) {
-        const id = ROLE_NAMES.indexOf(name);
-        w.u8(id < 0 ? 0xff : id);
-        w.f16(v);
-      }
+      const roles = frame.roles || {};
+      for (const name of ROLE_NAMES) w.f16(roles[name] === undefined ? 0 : roles[name]);
       break;
     }
     case 'ExpertResidency':
@@ -388,9 +384,16 @@ export function encodeFrame(frame) {
       for (const i of frame.vram) w.u32(i);
       break;
     case 'TierStats':
+      // lib.rs: varint 4 個 (hit は載っていない)
       w.u8(KIND.TIER_STATS);
       w.u32(frame.vramMB); w.u32(frame.vramTotalMB);
-      w.u32(frame.ramExperts); w.u32(frame.ssdReads); w.f16(frame.hit);
+      w.u32(frame.ramExperts); w.u32(frame.ssdReads);
+      break;
+    case 'RouterTopK':
+      // lib.rs: varint layer + varint n + varint × n + f16 × n
+      w.u8(KIND.ROUTER_TOPK); w.u32(frame.layer); w.u32(frame.experts.length);
+      for (const e of frame.experts) w.u32(e);
+      for (let i = 0; i < frame.experts.length; i++) w.f16(frame.weights[i] === undefined ? 0 : frame.weights[i]);
       break;
     default:
       throw new Error('encodeFrame: unknown kind ' + frame.kind);
