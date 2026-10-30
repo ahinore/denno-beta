@@ -34,7 +34,7 @@ use anyhow::{bail, Context, Result};
 use crate::gdn::{self, GdnCore, GdnParams, GdnState};
 use crate::gguf::GgufFile;
 use crate::kquant::GgmlType;
-use crate::model::linear_gguf::GgufLinear;
+use crate::model::linear_gguf::{FusedLinear, GgufLinear};
 use crate::model::qwen4exp::{
     one, IdentityAttn, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams,
 };
@@ -46,14 +46,14 @@ pub struct SsmLayer {
     pub il: usize,
     /// GDN のハイパーパラメータ (`GdnParams::qwen4exp()`)。
     pub p: GdnParams,
-    /// [2560 -> 10240] q/k/v の融合投影 (出力順は [q 2048][k 2048][v 6144])
-    w_qkv: GgufLinear,
-    /// [2560 -> 6144] z (出力ゲート)
-    w_gate: GgufLinear,
-    /// [2560 -> 48] beta の生値
-    w_beta: GgufLinear,
-    /// [2560 -> 48] alpha の生値
-    w_alpha: GgufLinear,
+    /// [2560 -> 10240] q/k/v の融合投影 (出力順は [q 2048][k 2048][v 6144]) と
+    /// [2560 -> 6144] z (出力ゲート)。
+    ///
+    /// task 72: どちらも同じ入力 `cur` を取るので、**行方向に連結して 1 本の
+    /// GEMV** にする (量子型が同じとき)。行は独立なので値はビット一致する。
+    qkv_gate: FusedLinear,
+    /// [2560 -> 48] beta と alpha の生値 (どちらも F32・同じ入力なので連結)。
+    beta_alpha: FusedLinear,
     /// [6144 -> 2560] 出力投影
     w_out: GgufLinear,
     /// [conv_dim][d_conv] — チャネルが外・tap が内
@@ -110,6 +110,11 @@ impl SsmLayer {
         let w_beta = linear(f, &n_beta, p.n_embd, p.n_v_heads)?;
         let w_alpha = linear(f, &n_alpha, p.n_embd, p.n_v_heads)?;
         let w_out = linear(f, &n_out, p.value_dim(), p.n_embd)?;
+        // task 72: 同じ入力を取る投影を 1 本の GEMV にまとめる。qkv+gate は
+        // 実モデルではどちらも Q8_0、beta/alpha はどちらも F32 なので 2 組に
+        // 分かれて連結される (型が揃わなければ自動で個別のまま)。
+        let qkv_gate = FusedLinear::concat(vec![w_qkv, w_gate]);
+        let beta_alpha = FusedLinear::concat(vec![w_beta, w_alpha]);
 
         // ---- 小さい 4 本は f32 常駐 -------------------------------------
         let conv1d = dequant_exact(f, &n_conv, p.conv_dim() * p.d_conv)?;
@@ -121,10 +126,8 @@ impl SsmLayer {
         Ok(Self {
             il,
             p,
-            w_qkv,
-            w_gate,
-            w_beta,
-            w_alpha,
+            qkv_gate,
+            beta_alpha,
             w_out,
             conv1d,
             ssm_a,
@@ -145,18 +148,23 @@ impl SsmLayer {
         }
         let prof = crate::model::qwen4exp::q4prof::enabled();
         let t = std::time::Instant::now();
-        let qkv = self.project_qkv(cur)?;
+        // task 72: qkv と z (出力ゲート) は同じ入力 cur を取るので 1 本の GEMV に
+        // まとめる。行は独立・1 行の中の加算順は連結しても変わらないので、
+        // 個別に呼んだ場合とビット一致する。ゲートの時間もここ (A_QKV) に入る。
+        let mut qkvg = vec![0f32; self.qkv_gate.n()];
+        self.qkv_gate.gemv_concat_into("qkv", cur, &mut qkvg)?;
+        let qkv = &qkvg[self.qkv_gate.range(0)];
+        let z = &qkvg[self.qkv_gate.range(1)];
         if prof {
             crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_QKV, t);
         }
         let t = std::time::Instant::now();
 
-        let mut z = vec![0f32; self.p.value_dim()];
-        self.w_gate.gemv_label("ssm_gate", cur, &mut z)?;
-        let mut beta_raw = vec![0f32; self.p.n_v_heads];
-        self.w_beta.gemv_label("ssm_beta", cur, &mut beta_raw)?;
-        let mut alpha = vec![0f32; self.p.n_v_heads];
-        self.w_alpha.gemv_label("ssm_alpha", cur, &mut alpha)?;
+        // task 72: beta と alpha も同じ入力なので 1 本にまとめる (どちらも F32)。
+        let mut ba = vec![0f32; self.beta_alpha.n()];
+        self.beta_alpha.gemv_concat_into("ssm_beta", cur, &mut ba)?;
+        let beta_raw = &ba[self.beta_alpha.range(0)];
+        let alpha = &ba[self.beta_alpha.range(1)];
 
         if prof {
             crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_GATE, t);
@@ -176,10 +184,10 @@ impl SsmLayer {
         let y = gdn::forward_token_core_gate(
             &self.p,
             &cw,
-            &qkv,
-            &z,
-            &beta_raw,
-            &alpha,
+            qkv,
+            z,
+            beta_raw,
+            alpha,
             &mut self.state,
             gdn::GateKind::Sigmoid,
         );
@@ -238,8 +246,12 @@ impl SsmLayer {
         let nh = self.p.n_v_heads;
 
         let t = crate::model::qwen4exp::q4prof::stamp();
+        // task 72: qkv と z、beta と alpha をそれぞれ 1 回のバッチ GEMV にまとめる。
+        // トークンごとの値は個別に呼んだ場合と同じ (行の独立)。
         let mut qkv = vec![0f32; nt * qd];
-        crate::model::qwen4exp::gemv_batch(&self.w_qkv, &flat, nt, &mut qkv)?;
+        let mut z = vec![0f32; nt * vd];
+        self.qkv_gate
+            .gemv_batch_split(&flat, nt, &mut [&mut qkv[..], &mut z[..]])?;
         crate::model::qwen4exp::q4prof::mark(
             t,
             &crate::model::qwen4exp::q4prof::A_QKV,
@@ -249,12 +261,10 @@ impl SsmLayer {
         crate::model::qwen4exp::q4prof::bump_nt(self.il, nt);
 
         let t = crate::model::qwen4exp::q4prof::stamp();
-        let mut z = vec![0f32; nt * vd];
-        crate::model::qwen4exp::gemv_batch(&self.w_gate, &flat, nt, &mut z)?;
         let mut beta_raw = vec![0f32; nt * nh];
-        crate::model::qwen4exp::gemv_batch(&self.w_beta, &flat, nt, &mut beta_raw)?;
         let mut alpha = vec![0f32; nt * nh];
-        crate::model::qwen4exp::gemv_batch(&self.w_alpha, &flat, nt, &mut alpha)?;
+        self.beta_alpha
+            .gemv_batch_split(&flat, nt, &mut [&mut beta_raw[..], &mut alpha[..]])?;
         crate::model::qwen4exp::q4prof::mark(
             t,
             &crate::model::qwen4exp::q4prof::A_GATE,
@@ -334,10 +344,24 @@ impl SsmLayer {
     ///
     /// 戻り値の並びは **[q key_dim][k key_dim][v value_dim]**。F4 の切り分けと
     /// レイアウト検証で使う。
+    ///
+    /// task 72: qkv は gate と連結されているので、この入口でも連結ぶん
+    /// (gate) を計算する。診断・テスト用の入口で、decode の本線は
+    /// [`Self::forward_token`] (1 回の GEMV で qkv と z を同時に得る)。
     pub fn project_qkv(&self, cur: &[f32]) -> Result<Vec<f32>> {
-        let mut qkv = vec![0f32; self.p.qkv_dim()];
-        self.w_qkv.gemv_label("qkv", cur, &mut qkv)?;
-        Ok(qkv)
+        let mut buf = vec![0f32; self.qkv_gate.n()];
+        self.qkv_gate.gemv_concat_into("qkv", cur, &mut buf)?;
+        Ok(buf[self.qkv_gate.range(0)].to_vec())
+    }
+
+    /// task 72: qkv+gate が 1 本の GEMV に連結されているか (発動確認用)。
+    pub fn qkv_gate_is_fused(&self) -> bool {
+        self.qkv_gate.is_fused()
+    }
+
+    /// task 72: beta+alpha が 1 本の GEMV に連結されているか (発動確認用)。
+    pub fn beta_alpha_is_fused(&self) -> bool {
+        self.beta_alpha.is_fused()
     }
 
     /// qkv 出力の切り分け `(q_end, k_end, v_end)`。qwen4exp では `(2048, 4096, 10240)`。
@@ -349,10 +373,8 @@ impl SsmLayer {
 
     /// 1 トークンあたりの重みバイト数 (大きい 5 本の合計)。
     pub fn weight_bytes(&self) -> usize {
-        self.w_qkv.weight_bytes()
-            + self.w_gate.weight_bytes()
-            + self.w_beta.weight_bytes()
-            + self.w_alpha.weight_bytes()
+        self.qkv_gate.weight_bytes()
+            + self.beta_alpha.weight_bytes()
             + self.w_out.weight_bytes()
             + self.conv1d.len() * 4
             + self.ssm_a.len() * 4
@@ -674,10 +696,14 @@ mod tests {
         let layer = SsmLayer {
             il: 0,
             p: p.clone(),
-            w_qkv: f32_linear(p.n_embd, p.qkv_dim(), &mut rnd),
-            w_gate: f32_linear(p.n_embd, vd, &mut rnd),
-            w_beta: f32_linear(p.n_embd, p.n_v_heads, &mut rnd),
-            w_alpha: f32_linear(p.n_embd, p.n_v_heads, &mut rnd),
+            qkv_gate: FusedLinear::concat(vec![
+                f32_linear(p.n_embd, p.qkv_dim(), &mut rnd),
+                f32_linear(p.n_embd, vd, &mut rnd),
+            ]),
+            beta_alpha: FusedLinear::concat(vec![
+                f32_linear(p.n_embd, p.n_v_heads, &mut rnd),
+                f32_linear(p.n_embd, p.n_v_heads, &mut rnd),
+            ]),
             w_out: f32_linear(vd, p.n_embd, &mut rnd),
             conv1d: (0..p.conv_dim() * p.d_conv).map(|_| 0.4 * rnd()).collect(),
             ssm_a: (0..p.n_v_heads).map(|_| -0.05 - 0.05 * rnd().abs()).collect(),
@@ -756,5 +782,74 @@ mod tests {
         let got = b.forward_batch(&curs).expect("forward_batch");
         assert_eq!(got.len(), 1);
         assert_eq!(bits(&got[0]), bits(&want));
+    }
+
+    // ---- task 72: qkv+gate / beta+alpha の融合 ------------------------------
+
+    /// 上書きを必ず env 読みに戻す (panic しても戻る)。
+    struct FusedGuard;
+    impl FusedGuard {
+        fn new() -> Self {
+            crate::model::linear_gguf::set_fused_gemv_for_test(None);
+            Self
+        }
+    }
+    impl Drop for FusedGuard {
+        fn drop(&mut self) {
+            crate::model::linear_gguf::set_fused_gemv_for_test(None);
+        }
+    }
+
+    /// 融合した層と分けた層が、出力も状態も**ビット一致**する。
+    ///
+    /// 数値不変の根拠: 行は独立で、1 行の内積は `i` 昇順の逐次加算のまま
+    /// (連結しても 1 行の中の順序は変わらない)。
+    #[test]
+    fn ssm_fused_matches_separate_bitexact() {
+        let _g = crate::model::linear_gguf::par_test_lock();
+        let _p = FusedGuard::new();
+
+        crate::model::linear_gguf::set_fused_gemv_for_test(Some(true));
+        let (mut fused, p) = small_layer();
+        assert!(fused.qkv_gate_is_fused(), "qkv+gate が連結されていない");
+        assert!(fused.beta_alpha_is_fused(), "beta+alpha が連結されていない");
+
+        crate::model::linear_gguf::set_fused_gemv_for_test(Some(false));
+        let (mut sep, _) = small_layer();
+        assert!(!sep.qkv_gate_is_fused(), "off なのに連結された");
+        assert!(!sep.beta_alpha_is_fused(), "off なのに連結された");
+
+        let curs = inputs(&p, 7);
+        for (t, c) in curs.iter().enumerate() {
+            let a = fused.forward_token(c).expect("fused forward_token");
+            let b = sep.forward_token(c).expect("separate forward_token");
+            assert_eq!(bits(&a), bits(&b), "トークン {t}");
+        }
+        assert_eq!(bits(&fused.state.ssm), bits(&sep.state.ssm), "ssm 状態");
+        assert_eq!(bits(&fused.state.conv), bits(&sep.state.conv), "conv 状態");
+    }
+
+    /// バッチ経路 (`gemv_batch_split`) も融合の有無でビット一致する。
+    #[test]
+    fn ssm_fused_batch_matches_separate_bitexact() {
+        let _g = crate::model::linear_gguf::par_test_lock();
+        let _p = FusedGuard::new();
+
+        crate::model::linear_gguf::set_fused_gemv_for_test(Some(true));
+        let (mut fused, p) = small_layer();
+        assert!(fused.qkv_gate_is_fused());
+
+        crate::model::linear_gguf::set_fused_gemv_for_test(Some(false));
+        let (mut sep, _) = small_layer();
+
+        let curs = inputs(&p, 5);
+        let a = fused.forward_batch(&curs).expect("fused forward_batch");
+        let b = sep.forward_batch(&curs).expect("separate forward_batch");
+        assert_eq!(a.len(), b.len());
+        for t in 0..a.len() {
+            assert_eq!(bits(&a[t]), bits(&b[t]), "トークン {t}");
+        }
+        assert_eq!(bits(&fused.state.ssm), bits(&sep.state.ssm), "ssm 状態");
+        assert_eq!(bits(&fused.state.conv), bits(&sep.state.conv), "conv 状態");
     }
 }

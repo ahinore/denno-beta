@@ -325,6 +325,10 @@ fn qkv_projection_rows_and_split() {
 
     // qkv の切り分け (q 2048 / k 2048 / v 6144)
     assert_eq!(layer.qkv_split(), (2048, 4096, 10240));
+    // task 72: 実モデルと同じ型 (Q8_0) の qkv+gate は 1 本に連結される。
+    // フィクスチャでは attn_qkv と attn_gate がファイル上で隣接するので写しなし。
+    assert!(layer.qkv_gate_is_fused(), "qkv+gate が連結されていない");
+    assert!(layer.beta_alpha_is_fused(), "beta+alpha が連結されていない");
     assert_eq!(layer.p.n_embd, N_EMBD);
     assert_eq!(layer.p.n_k_heads, 16);
     assert_eq!(layer.p.n_v_heads, 48);

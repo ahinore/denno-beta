@@ -124,6 +124,50 @@ pub(crate) fn set_router_gpu_for_test(v: Option<bool>) {
     }, Ordering::Relaxed);
 }
 
+/// task 72: `DENNO_FUSED_GEMV` の値の解釈 (純関数)。**既定 on**、明示的な偽値だけ無効。
+///
+/// `FusedLinear::concat` を通る層 (ssm の qkv+gate / beta+alpha、full attention の
+/// q/k/v) だけが対象。行は互いに独立で、1 行の内積は `i` の昇順に f32 で加算する
+/// (連結しても 1 行の中の順序は変わらない) ので、個別に呼んだ場合と**ビット一致**
+/// する。崩れたときは `DENNO_FUSED_GEMV=0` で従来経路へ戻せる。
+fn fused_gemv_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// 融合 GEMV のテスト用上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+static FUSED_GEMV_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// 融合 GEMV を有効にしてよいか (`DENNO_FUSED_GEMV`、既定 on)。プロセスで 1 回だけ読む。
+fn fused_gemv_enabled() -> bool {
+    match FUSED_GEMV_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| fused_gemv_from_value(std::env::var("DENNO_FUSED_GEMV").ok().as_deref()))
+}
+
+/// テスト専用: 融合 GEMV の on/off を強制する (`None` で env に戻す)。
+///
+/// 上書きはプロセス全体で 1 個なので、触るテストは `par_test_lock()` を取る。
+#[cfg(test)]
+pub(crate) fn set_fused_gemv_for_test(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    FUSED_GEMV_OVERRIDE.store(match v {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }, Ordering::Relaxed);
+}
+
 /// 行並列を立てる条件 (実測で決めた)。
 ///
 /// - **行数が 8 以上**、または
@@ -478,6 +522,328 @@ impl GgufLinear {
         dequant_row_into(self.ty, &b[j * rb..(j + 1) * rb], &mut out);
         Ok(out)
     }
+}
+
+/// task 72: 同じ入力 `x` を取る複数の投影を、行方向に連結して 1 本の GEMV にする。
+///
+/// 行は互いに独立で、1 行の内積は `i` の昇順に f32 で加算する (個別に呼んだ
+/// 場合と同じ順序)。よって連結の有無・切り分けの位置で値は**ビット一致**する
+/// (`fused_split_matches_separate_bits` が固定)。
+///
+/// 連結のしかたは 2 通り:
+/// - **写しなし**: 元の層が mmap の隣接した範囲を指しているときは、まとめた 1 本の
+///   共有写像 ([`WeightBlocks::mapped`]) を指すだけ。匿名 RSS は増えない。
+///   ファイル上の並びが逆でも、行範囲の対応表 (`ranges`) で吸収する。
+/// - **写しあり**: 隣接していない / ヒープ実体のときは 1 本の `Vec` に連結する。
+///   元の層は捨てるので、常駐するバイト数は連結前と同じ。
+///
+/// 型・`k` が揃わないときは連結せず、`parts` を順に呼ぶ (従来と同じ経路)。
+pub struct FusedLinear {
+    /// 連結済みの 1 本 (`Some` のとき `parts` は空)。
+    inner: Option<GgufLinear>,
+    /// 連結しなかったときの元の層 (呼び出し順)。
+    parts: Vec<GgufLinear>,
+    /// 呼び出し順の行境界 (累積終端)。長さ = 層数。合計 = [`Self::n`]。
+    splits: Vec<usize>,
+    /// 呼び出し順 → 連結バッファ内の行範囲。連結していないときは `splits` と同じ。
+    ranges: Vec<std::ops::Range<usize>>,
+    /// 写しなしで連結できたか (診断・テスト用)。
+    zero_copy: bool,
+}
+
+impl FusedLinear {
+    /// 与えた順に並べた層を 1 本にまとめる。まとめられなければ個別のまま持つ。
+    ///
+    /// `DENNO_FUSED_GEMV=0` のときは何もせず個別のまま ([`Self::separate`])。
+    pub fn concat(parts: Vec<GgufLinear>) -> Self {
+        let mut me = Self::separate(parts);
+        if !fused_gemv_enabled() || me.parts.len() < 2 {
+            return me;
+        }
+        if let Some((inner, ranges)) = fuse_parts(&me.parts) {
+            me.zero_copy = inner.blocks().is_mapped();
+            me.inner = Some(inner);
+            me.ranges = ranges;
+            me.parts = Vec::new();
+        }
+        me
+    }
+
+    /// まとめずに持つ (従来の呼び出し)。`DENNO_FUSED_GEMV=0` と同じ経路。
+    pub fn separate(parts: Vec<GgufLinear>) -> Self {
+        let mut splits = Vec::with_capacity(parts.len());
+        let mut ranges = Vec::with_capacity(parts.len());
+        let mut at = 0usize;
+        for p in &parts {
+            let n = p.n();
+            splits.push(at + n);
+            ranges.push(at..at + n);
+            at += n;
+        }
+        Self { inner: None, parts, splits, ranges, zero_copy: false }
+    }
+
+    /// 1 本に連結できているか (偽なら個別に呼ぶ)。
+    pub fn is_fused(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    /// 写しなしで連結できたか。`is_fused()` が偽のときは false。
+    pub fn is_zero_copy(&self) -> bool {
+        self.zero_copy
+    }
+
+    /// 連結前の本数。
+    pub fn n_parts(&self) -> usize {
+        self.splits.len()
+    }
+
+    /// 出力の合計行数 (連結バッファの長さ)。
+    pub fn n(&self) -> usize {
+        self.splits.last().copied().unwrap_or(0)
+    }
+
+    /// 入力長 (列数)。層が空なら 0。
+    pub fn k(&self) -> usize {
+        match &self.inner {
+            Some(i) => i.k(),
+            None => self.parts.first().map(|p| p.k()).unwrap_or(0),
+        }
+    }
+
+    /// 呼び出し順の行境界 (累積終端)。
+    pub fn splits(&self) -> &[usize] {
+        &self.splits
+    }
+
+    /// 呼び出し順 `i` 番目の層が、連結バッファのどの行範囲に入るか。
+    pub fn range(&self, i: usize) -> std::ops::Range<usize> {
+        self.ranges[i].clone()
+    }
+
+    pub fn weight_bytes(&self) -> usize {
+        match &self.inner {
+            Some(i) => i.weight_bytes(),
+            None => self.parts.iter().map(|p| p.weight_bytes()).sum(),
+        }
+    }
+
+    /// 連結 1 本の GEMV を `buf` (`n()` 要素) に書く。
+    ///
+    /// 連結していないときは各層を順に `buf` の行範囲へ書く (値は同じ)。
+    pub fn gemv_concat_into(
+        &self,
+        label: &'static str,
+        x: &[f32],
+        buf: &mut [f32],
+    ) -> Result<()> {
+        if buf.len() != self.n() {
+            bail!(
+                "FusedLinear::gemv_concat_into: buf の長さ {} が n={} と違う",
+                buf.len(),
+                self.n()
+            );
+        }
+        match &self.inner {
+            Some(inner) => inner.gemv_label(label, x, buf),
+            None => {
+                for (p, r) in self.parts.iter().zip(self.ranges.iter()) {
+                    p.gemv_label(label, x, &mut buf[r.clone()])?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// 連結 1 本の GEMV を計算し、層ごとに切り分けて `outs` へ写す。
+    ///
+    /// `buf` は `n()` 要素の作業域。連結していないときは各層が直接 `outs` へ書く。
+    pub fn gemv_split(
+        &self,
+        label: &'static str,
+        x: &[f32],
+        buf: &mut [f32],
+        outs: &mut [&mut [f32]],
+    ) -> Result<()> {
+        self.check_outs(outs, 1)?;
+        self.gemv_concat_into(label, x, buf)?;
+        for (o, r) in outs.iter_mut().zip(self.ranges.iter()) {
+            o.copy_from_slice(&buf[r.clone()]);
+        }
+        Ok(())
+    }
+
+    /// チャンクぶんのバッチ GEMV (`nt` トークン) を計算し、層ごとに切り分ける。
+    ///
+    /// `outs[i]` は `nt * (その層の行数)` 要素。連結しているときだけ、連結ぶんの
+    /// 出力を置く作業域を使う (スレッドごとに grow-only で使い回す)。
+    pub fn gemv_batch_split(
+        &self,
+        xs: &[f32],
+        nt: usize,
+        outs: &mut [&mut [f32]],
+    ) -> Result<()> {
+        self.check_outs(outs, nt)?;
+        if nt == 0 {
+            return Ok(());
+        }
+        let Some(inner) = &self.inner else {
+            for (p, o) in self.parts.iter().zip(outs.iter_mut()) {
+                crate::model::qwen4exp::gemv_batch(p, xs, nt, o)?;
+            }
+            return Ok(());
+        };
+        let n = self.n();
+        FUSED_BATCH_BUF.with(|cell| -> Result<()> {
+            let mut b = cell.borrow_mut();
+            if b.len() < nt * n {
+                b.resize(nt * n, 0.0);
+            }
+            let buf = &mut b[..nt * n];
+            crate::model::qwen4exp::gemv_batch(inner, xs, nt, buf)?;
+            for (o, r) in outs.iter_mut().zip(self.ranges.iter()) {
+                let w = r.len();
+                for t in 0..nt {
+                    o[t * w..(t + 1) * w]
+                        .copy_from_slice(&buf[t * n + r.start..t * n + r.end]);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// `outs` の本数と長さが、この層の切り分けと一致するか。
+    fn check_outs(&self, outs: &[&mut [f32]], nt: usize) -> Result<()> {
+        // `gemv_split` は連結バッファに書いてから写すので、長さの検算だけ行う。
+        if outs.len() != self.ranges.len() {
+            bail!(
+                "FusedLinear: outs の本数 {} が層数 {} と違う",
+                outs.len(),
+                self.ranges.len()
+            );
+        }
+        for (i, (o, r)) in outs.iter().zip(self.ranges.iter()).enumerate() {
+            if o.len() != nt * r.len() {
+                bail!(
+                    "FusedLinear: outs[{i}] の長さ {} が {} と違う",
+                    o.len(),
+                    nt * r.len()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+// 連結バッチの作業域 (スレッドごとに grow-only)。
+//
+// `vec![0.0; nt * n]` を呼び出しごとに確保すると、初回タッチのページフォルトで
+// 数十 ms 落ちる (P13 と同じ理由)。prefill のチャンクは層ごとに同じ大きさなので、
+// 1 本を使い回すのが一番安い。
+thread_local! {
+    static FUSED_BATCH_BUF: std::cell::RefCell<Vec<f32>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// 層を 1 本に連結する。できないときは `None`。
+///
+/// 型と `k` が揃っていることが前提 (揃わなければ `None`)。並びはファイル上の
+/// 隣接を優先し、隣接しなければ呼び出し順のまま写して連結する。
+fn fuse_parts(parts: &[GgufLinear]) -> Option<(GgufLinear, Vec<std::ops::Range<usize>>)> {
+    let first = parts.first()?;
+    let (ty, k) = (first.ty(), first.k());
+    if !parts.iter().all(|p| p.ty() == ty && p.k() == k) {
+        return None;
+    }
+    let total: usize = parts.iter().map(|p| p.n()).sum();
+    let rb = row_bytes_any(ty, k).ok()?;
+    let fast_q8 = parts.iter().all(|p| p.fast_q8());
+
+    // 1. 写しなし: 同じ写像の隣接範囲を、どの並びで連結できるか探す
+    //    (層数は 2〜3 本なので全順列で足りる)。
+    if let Some(order) = contiguous_order(parts) {
+        let (map, off, _) = parts[order[0]].blocks().mapping()?;
+        let blocks = WeightBlocks::mapped(std::sync::Arc::clone(map), off, total * rb);
+        let inner = GgufLinear::new(ty, k, total, blocks).ok()?.with_fast_q8(fast_q8);
+        let mut ranges = vec![0..0; parts.len()];
+        let mut at = 0usize;
+        for &i in &order {
+            let n = parts[i].n();
+            ranges[i] = at..at + n;
+            at += n;
+        }
+        return Some((inner, ranges));
+    }
+
+    // 2. 写しあり: 呼び出し順のまま 1 本に連結する。
+    let mut bytes = Vec::with_capacity(total * rb);
+    for p in parts {
+        bytes.extend_from_slice(p.blocks().as_slice());
+    }
+    if bytes.len() != total * rb {
+        return None;
+    }
+    let inner = GgufLinear::new(ty, k, total, WeightBlocks::from_vec(bytes))
+        .ok()?
+        .with_fast_q8(fast_q8);
+    let mut ranges = Vec::with_capacity(parts.len());
+    let mut at = 0usize;
+    for p in parts {
+        let n = p.n();
+        ranges.push(at..at + n);
+        at += n;
+    }
+    Some((inner, ranges))
+}
+
+/// 全順列のうち、mmap 上で隣接して並ぶものを 1 つ返す (見つからなければ `None`)。
+fn contiguous_order(parts: &[GgufLinear]) -> Option<Vec<usize>> {
+    let mut idx: Vec<usize> = (0..parts.len()).collect();
+    let mut found: Option<Vec<usize>> = None;
+    permute_into_contiguous(&mut idx, 0, parts, &mut found);
+    found
+}
+
+fn permute_into_contiguous(
+    idx: &mut Vec<usize>,
+    k: usize,
+    parts: &[GgufLinear],
+    found: &mut Option<Vec<usize>>,
+) {
+    if found.is_some() {
+        return;
+    }
+    if k == idx.len() {
+        if contiguous_in_order(parts, idx) {
+            *found = Some(idx.clone());
+        }
+        return;
+    }
+    for i in k..idx.len() {
+        idx.swap(k, i);
+        permute_into_contiguous(idx, k + 1, parts, found);
+        idx.swap(k, i);
+    }
+}
+
+/// `order` の順に並べたとき、ブロックが同じ写像の連続した範囲になるか。
+fn contiguous_in_order(parts: &[GgufLinear], order: &[usize]) -> bool {
+    let mut prev: Option<(&std::sync::Arc<memmap2::Mmap>, usize)> = None;
+    for &i in order {
+        let Some((map, off, len)) = parts[i].blocks().mapping() else {
+            return false;
+        };
+        match prev {
+            None => prev = Some((map, off + len)),
+            Some((pmap, end)) => {
+                if !std::sync::Arc::ptr_eq(pmap, map) || off != end {
+                    return false;
+                }
+                prev = Some((map, off + len));
+            }
+        }
+    }
+    true
 }
 
 /// 重みを捨てるときに VRAM の常駐も返す。
@@ -1070,6 +1436,245 @@ mod tests {
                     mac / (new_ms * 1e6)
                 );
             }
+        }
+    }
+
+    // ---- task 72: FusedLinear (同じ入力を取る投影の連結) ---------------------
+
+    /// 上書きを必ず env 読みに戻す (panic しても戻る)。
+    struct FusedGuard;
+    impl FusedGuard {
+        fn new() -> Self {
+            set_fused_gemv_for_test(None);
+            Self
+        }
+    }
+    impl Drop for FusedGuard {
+        fn drop(&mut self) {
+            set_fused_gemv_for_test(None);
+        }
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// 行数だけ違う層を何本か作る (ヒープ実体)。
+    fn parts_of(ty: GgmlType, k: usize, ns: &[usize], seed: u32) -> Vec<GgufLinear> {
+        ns.iter()
+            .enumerate()
+            .map(|(i, &n)| {
+                let w = make_matrix(ty, k, n, seed.wrapping_add(i as u32 * 37));
+                GgufLinear::from_slice(ty, k, n, &w).expect("GgufLinear")
+            })
+            .collect()
+    }
+
+    /// `DENNO_FUSED_GEMV` の真理値表。既定 on、明示的な偽値だけ off。
+    #[test]
+    fn fused_gemv_gate_defaults() {
+        for v in [None, Some("1"), Some("on"), Some("ON"), Some("true"), Some(" on "), Some("")] {
+            assert!(fused_gemv_from_value(v), "value={v:?} は on のはず");
+        }
+        for v in [Some("0"), Some("off"), Some("false"), Some("no"), Some("OFF"), Some("False")] {
+            assert!(!fused_gemv_from_value(v), "value={v:?} は off のはず");
+        }
+        let _g = par_test_lock();
+        let _p = FusedGuard::new();
+        set_fused_gemv_for_test(Some(false));
+        assert!(!fused_gemv_enabled(), "off の上書きが効いていない");
+        set_fused_gemv_for_test(Some(true));
+        assert!(fused_gemv_enabled(), "on の上書きが効いていない");
+    }
+
+    /// 連結版と個別版の出力が `to_bits()` で一致する (タスクの指定テスト)。
+    ///
+    /// 行は独立・1 行の内積は `i` 昇順の逐次加算のままなので、連結しても
+    /// 丸め順序は変わらない。全量子型 + F32/F16/Bf16 で固定する。
+    #[test]
+    fn fused_split_matches_separate_bits() {
+        let _g = par_test_lock();
+        let _p = FusedGuard::new();
+        set_fused_gemv_for_test(Some(true));
+        let k = 256usize;
+        let ns = [5usize, 3, 2];
+        for ty in [
+            GgmlType::Q8_0,
+            GgmlType::Q5_1,
+            GgmlType::Q4K,
+            GgmlType::Q5K,
+            GgmlType::F32,
+            GgmlType::F16,
+            GgmlType::Bf16,
+        ] {
+            let x = make_x(k, 61);
+            let parts = parts_of(ty, k, &ns, 7);
+            // 個別版 (従来の呼び出し) の期待値。
+            let mut want: Vec<Vec<f32>> = Vec::new();
+            for (p, &n) in parts.iter().zip(ns.iter()) {
+                let mut o = vec![0f32; n];
+                p.gemv(&x, &mut o).expect("gemv (個別)");
+                want.push(o);
+            }
+            // 連結版。
+            let fused = FusedLinear::concat(parts);
+            assert!(fused.is_fused(), "{ty:?}: 連結されていない");
+            assert_eq!(fused.n(), ns.iter().sum::<usize>(), "{ty:?}: 合計行数");
+            let mut buf = vec![0f32; fused.n()];
+            let mut outs: Vec<Vec<f32>> = ns.iter().map(|&n| vec![0f32; n]).collect();
+            {
+                let mut refs: Vec<&mut [f32]> = outs.iter_mut().map(|v| &mut v[..]).collect();
+                fused.gemv_split("t", &x, &mut buf, &mut refs).expect("gemv_split");
+            }
+            for i in 0..ns.len() {
+                assert_eq!(bits(&outs[i]), bits(&want[i]), "{ty:?}: 層 {i} がビット不一致");
+            }
+            // 連結バッファの側も同じ (切り分け位置の検算)。
+            for i in 0..ns.len() {
+                assert_eq!(
+                    bits(&buf[fused.range(i)]),
+                    bits(&want[i]),
+                    "{ty:?}: 連結バッファの層 {i}"
+                );
+            }
+        }
+    }
+
+    /// 連結できない (型・k が違う) ときは個別のまま落ち、値は従来どおり。
+    #[test]
+    fn fused_falls_back_to_separate_on_type_mismatch() {
+        let _g = par_test_lock();
+        let _p = FusedGuard::new();
+        set_fused_gemv_for_test(Some(true));
+        let k = 256usize;
+        let a = GgufLinear::from_slice(GgmlType::Q8_0, k, 3, &make_matrix(GgmlType::Q8_0, k, 3, 3))
+            .expect("Q8_0");
+        let b = GgufLinear::from_slice(GgmlType::F32, k, 2, &make_matrix(GgmlType::F32, k, 2, 5))
+            .expect("F32");
+        let fused = FusedLinear::concat(vec![a, b]);
+        assert!(!fused.is_fused(), "型が違うのに連結した");
+        assert_eq!(fused.splits(), &[3, 5]);
+        assert_eq!(fused.range(1), 3..5);
+
+        let x = make_x(k, 9);
+        let mut outs = [vec![0f32; 3], vec![0f32; 2]];
+        {
+            let mut refs: Vec<&mut [f32]> = outs.iter_mut().map(|v| &mut v[..]).collect();
+            let mut buf = vec![0f32; fused.n()];
+            fused.gemv_split("t", &x, &mut buf, &mut refs).expect("gemv_split");
+        }
+        let mut buf = vec![0f32; fused.n()];
+        fused.gemv_concat_into("t", &x, &mut buf).expect("gemv_concat_into");
+        // 個別版と同じ (Q8_0 の 3 行 + F32 の 2 行)。
+        let mut want0 = vec![0f32; 3];
+        let lin0 = GgufLinear::from_slice(GgmlType::Q8_0, k, 3, &make_matrix(GgmlType::Q8_0, k, 3, 3))
+            .expect("Q8_0");
+        lin0.gemv(&x, &mut want0).expect("gemv");
+        let mut want1 = vec![0f32; 2];
+        let lin1 = GgufLinear::from_slice(GgmlType::F32, k, 2, &make_matrix(GgmlType::F32, k, 2, 5))
+            .expect("F32");
+        lin1.gemv(&x, &mut want1).expect("gemv");
+        assert_eq!(bits(&outs[0]), bits(&want0));
+        assert_eq!(bits(&outs[1]), bits(&want1));
+        assert_eq!(bits(&buf[0..3]), bits(&want0));
+        assert_eq!(bits(&buf[3..5]), bits(&want1));
+    }
+
+    /// mmap 上で隣接していれば**写さずに**連結する (並びが逆でも行範囲で吸収)。
+    #[test]
+    fn fused_zero_copy_when_adjacent_in_mmap() {
+        let _g = par_test_lock();
+        let _p = FusedGuard::new();
+        set_fused_gemv_for_test(Some(true));
+        let ty = GgmlType::Q8_0;
+        let k = 64usize;
+        let a_bytes = make_matrix(ty, k, 3, 71); // ファイル先頭
+        let b_bytes = make_matrix(ty, k, 2, 73); // その直後
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(&a_bytes);
+        file_bytes.extend_from_slice(&b_bytes);
+
+        let path = std::env::temp_dir().join(format!(
+            "denno_fused_zero_copy_{}_{}.bin",
+            std::process::id(),
+            ty.type_size()
+        ));
+        std::fs::write(&path, &file_bytes).expect("write");
+        let f = std::fs::File::open(&path).expect("open");
+        // SAFETY: 読み取り専用の共有写像。テスト中にこのファイルを書き換えない。
+        let map = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&f).expect("mmap") });
+        drop(f);
+
+        // 呼び出し順は [後ろ, 前] (ファイルの並びと逆)。
+        let second = GgufLinear::new(
+            ty,
+            k,
+            2,
+            WeightBlocks::mapped(map.clone(), a_bytes.len(), b_bytes.len()),
+        )
+        .expect("second");
+        let first = GgufLinear::new(ty, k, 3, WeightBlocks::mapped(map.clone(), 0, a_bytes.len()))
+            .expect("first");
+        let fused = FusedLinear::concat(vec![second, first]);
+        assert!(fused.is_fused(), "隣接しているのに連結されていない");
+        assert!(fused.is_zero_copy(), "隣接しているのに写している");
+        // バッファはファイル順 [前 3 行][後ろ 2 行]。呼び出し順の対応表で引く。
+        assert_eq!(fused.range(0), 3..5, "後ろの層の行範囲");
+        assert_eq!(fused.range(1), 0..3, "前の層の行範囲");
+
+        let x = make_x(k, 77);
+        let mut buf = vec![0f32; fused.n()];
+        fused.gemv_concat_into("t", &x, &mut buf).expect("gemv");
+        assert_eq!(bits(&buf[3..5]), bits(&naive_gemv(ty, &b_bytes, k, 2, &x)));
+        assert_eq!(bits(&buf[0..3]), bits(&naive_gemv(ty, &a_bytes, k, 3, &x)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ヒープ実体 (隣接情報なし) は写して連結する。値は同じ。
+    #[test]
+    fn fused_copies_when_not_mapped() {
+        let _g = par_test_lock();
+        let _p = FusedGuard::new();
+        set_fused_gemv_for_test(Some(true));
+        let ty = GgmlType::Q5_1;
+        let k = 256usize;
+        let parts = parts_of(ty, k, &[4, 3], 11);
+        let fused = FusedLinear::concat(parts);
+        assert!(fused.is_fused());
+        assert!(!fused.is_zero_copy(), "ヒープ実体なのに写しなしになっている");
+        assert_eq!(fused.weight_bytes(), 7 * (k / 32) * ty.type_size());
+    }
+
+    /// バッチ経路 (`gemv_batch_split`) も個別の `gemv_batch` とビット一致する。
+    #[test]
+    fn fused_batch_split_matches_separate_bits() {
+        let _g = par_test_lock();
+        let _p = FusedGuard::new();
+        set_fused_gemv_for_test(Some(true));
+        let ty = GgmlType::Q8_0;
+        let k = 256usize;
+        let ns = [5usize, 3];
+        let nt = 3usize;
+        let xs: Vec<f32> = (0..nt * k)
+            .map(|i| ((pat(i, 91) as f32) / 128.0) - 1.0)
+            .collect();
+
+        let parts = parts_of(ty, k, &ns, 13);
+        let mut want: Vec<Vec<f32>> = Vec::new();
+        for (p, &n) in parts.iter().zip(ns.iter()) {
+            let mut o = vec![0f32; nt * n];
+            crate::model::qwen4exp::gemv_batch(p, &xs, nt, &mut o).expect("gemv_batch (個別)");
+            want.push(o);
+        }
+        let fused = FusedLinear::concat(parts);
+        assert!(fused.is_fused());
+        let mut outs: Vec<Vec<f32>> = ns.iter().map(|&n| vec![0f32; nt * n]).collect();
+        {
+            let mut refs: Vec<&mut [f32]> = outs.iter_mut().map(|v| &mut v[..]).collect();
+            fused.gemv_batch_split(&xs, nt, &mut refs).expect("gemv_batch_split");
+        }
+        for i in 0..ns.len() {
+            assert_eq!(bits(&outs[i]), bits(&want[i]), "層 {i}");
         }
     }
 }
