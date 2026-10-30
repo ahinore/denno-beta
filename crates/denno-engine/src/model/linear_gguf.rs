@@ -391,6 +391,20 @@ impl GgufLinear {
     }
 }
 
+/// 重みを捨てるときに VRAM の常駐も返す。
+///
+/// serve-flash は prefix が一致しないとモデルを組み直す (= 新しい uid を払い出す)。
+/// この Drop が無いと古い重みが VRAM に残り、会話を重ねるたびに使用量が増えて
+/// 最後は dense の確保に失敗して CPU に落ちる (decode が倍近く遅くなる症状)。
+impl Drop for GgufLinear {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda::gguf_unregister(self.uid);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! 実 GGUF はこのコンテナから見えないのでブロックはテスト内で組み立てる。

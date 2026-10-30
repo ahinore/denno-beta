@@ -5326,6 +5326,31 @@ fn gguf_registry() -> &'static std::sync::Mutex<GgufReg> {
     })
 }
 
+/// uid の重みをレジストリから外し、VRAM を返す。戻り値は解放したバイト数。
+///
+/// モデルを捨てて組み直す経路 (serve-flash の prefix 不一致) で呼ぶ。これが無いと
+/// 古いモデルの重みが VRAM に残り、リクエストを重ねるたびに使用量が増えて
+/// 最後は dense の確保に失敗して CPU に落ちる。
+///
+/// 使用中 (pin) の uid でも外す: 呼ぶ側は「その重みをもう使わない」と分かっている
+/// 前提 (`GgufLinear` の `Drop`)。進行中の GEMV がある状態で呼んではいけない。
+pub fn gguf_unregister(uid: u64) -> u64 {
+    let reg = gguf_registry();
+    let Ok(mut g) = reg.lock() else {
+        return 0;
+    };
+    let Some(w) = g.map.remove(&uid) else {
+        return 0;
+    };
+    let bytes = g.lru.note_remove(uid);
+    let (k, n, ty) = (w.k, w.n, w.ty);
+    drop(w); // DevBuffer の Drop が VRAM を返す
+    if w_dbg() {
+        eprintln!("[gpu-w] unregister uid={uid} ty={ty:?} k={k} n={n} bytes={bytes}");
+    }
+    bytes
+}
+
 /// 使用中の重み 1 本。Drop で「使用中」を落とす (= 以後は退避対象になる)。
 ///
 /// 中の参照は `'static` だが、このガードが生きている間は LRU がその uid を
