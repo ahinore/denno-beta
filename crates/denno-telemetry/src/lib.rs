@@ -675,14 +675,15 @@ pub fn enabled() -> bool {
 /// WS 側へ中継する。無効時・ハブ未初期化なら `None` を返す。
 pub fn recv_global_timeout(timeout: std::time::Duration) -> Option<Frame> {
     if !enabled() {
+        // 呼び出し側はループで回すので、無効時は待ってから返す (空回りさせない)。
+        std::thread::sleep(timeout);
         return None;
     }
-    let rx = RX.get_or_init(|| {
-        // 先に RX を入れ、TX は emit 側が埋める (二重初期化は OnceLock が弾く)。
-        let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_CAP);
-        let _ = TX.set(tx);
-        Mutex::new(rx)
-    });
+    let _tx = hub();
+    let rx = match RX.get() {
+        Some(r) => r,
+        None => return None,
+    };
     match rx.lock() {
         Ok(g) => g.recv_timeout(timeout).ok(),
         Err(_) => None,
@@ -713,15 +714,29 @@ pub fn next_session_id() -> u32 {
 /// フレームを送出する。非ブロッキング。満杯/切断時はドロップして計上。
 /// enabled() でない場合は即座に戻る (フレーム生成コストすら掛けないよう
 /// 呼び出し側も enabled() ガードを推奨)。
+/// 送出ハブを 1 回だけ組む。`TX` と `RX` の初期化が競合すると、
+/// 片方だけ別チャネルを掴んで永久に空になるため、初期化を直列化する。
+/// `RX` を先に埋めてから `TX` を公開する。
+fn hub() -> &'static std::sync::mpsc::SyncSender<Frame> {
+    if let Some(tx) = TX.get() {
+        return tx;
+    }
+    static INIT: Mutex<()> = Mutex::new(());
+    let _g = INIT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = TX.get() {
+        return tx;
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_CAP);
+    let _ = RX.set(Mutex::new(rx));
+    let _ = TX.set(tx);
+    TX.get().expect("hub: TX を直前に set した")
+}
+
 pub fn emit(frame: Frame) {
     if !enabled() {
         return;
     }
-    let tx = TX.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_CAP);
-        let _ = RX.set(Mutex::new(rx));
-        tx
-    });
+    let tx = hub();
     match tx.try_send(frame) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
