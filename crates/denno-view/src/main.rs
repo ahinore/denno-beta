@@ -375,17 +375,21 @@ async fn chat_proxy(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
-    match resp.bytes().await {
-        Ok(bytes) => axum::response::Response::builder()
-            .status(status)
-            .header("content-type", ctype)
-            .body(axum::body::Body::from(bytes))
-            .unwrap(),
-        Err(e) => axum::response::Response::builder()
-            .status(502)
-            .body(axum::body::Body::from(format!("upstream read error: {e}")))
-            .unwrap(),
-    }
+    // SSE をそのまま流す (チャンクを待たずにブラウザへ届ける)。
+    // 途中で切れたときに備えて、ストリームのエラーは 1 フレームのイベントにして流す。
+    let stream = futures_util::StreamExt::map(resp.bytes_stream(), |chunk| match chunk {
+        Ok(b) => Ok::<_, std::io::Error>(b),
+        Err(e) => Ok(axum::body::Bytes::from(format!(
+            "\nevent: error\ndata: {{\"type\":\"error\",\"error\":{{\"message\":\"upstream read error: {e}\"}}}}\n\n"
+        ))),
+    });
+    axum::response::Response::builder()
+        .status(status)
+        .header("content-type", ctype)
+        .header("cache-control", "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
 }
 
 async fn dashboard() -> Html<&'static str> {

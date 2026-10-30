@@ -13,7 +13,7 @@ axum = { version = "0.7", features = ["ws"] }
 tokio-tungstenite = "0.23"
 futures-util = "0.3"
 # チャットプロキシ (/chat → 上流 denno の /v1/messages)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 # 実コード配信 (/code/src) の JSON 応答
 serde_json.workspace = true
 tracing.workspace = true

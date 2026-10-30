@@ -7,7 +7,8 @@
 <link rel="icon" href="data:,">
 <style>
   :root { --bg:#04060b; --fg:#cfeeff; --dim:#4d6470; --vram:#00eaff; --ram:#ffb020; --ssd:#ff3b6b;
-          --qsa:#b46bff; --gdn:#00d9a0; --router:#ffe14d; --shex:#ff2bd6; --gr:#59b6ff; --ple:#7f8bff; }
+          --qsa:#b46bff; --gdn:#00d9a0; --router:#ffe14d; --shex:#ff2bd6; --gr:#59b6ff; --ple:#7f8bff;
+          --neu:#7ff0ff; }
   html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
               font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; overflow:hidden; }
   #c { display:block; width:100%; height:100%; }
@@ -18,19 +19,47 @@
   .vram { color:var(--vram); } .ram { color:var(--ram); } .ssd { color:var(--ssd); }
   .qsa { color:var(--qsa); } .gdn { color:var(--gdn); } .router { color:var(--router); }
   .shex { color:var(--shex); } .ple { color:var(--ple); } .gr { color:var(--gr); }
-  #legend { right:14px; bottom:12px; text-align:right; color:var(--dim); line-height:1.75; }
+  .neu { color:var(--neu); }
+  #legend { right:14px; top:12px; text-align:right; color:var(--dim); line-height:1.75; }
   #err { display:none; position:fixed; left:14px; bottom:12px; right:14px; max-height:38%;
          overflow:auto; white-space:pre-wrap; color:#ff5c7a; background:rgba(20,0,8,.86);
          border:1px solid #ff2b55; border-radius:4px; padding:8px 10px; font-size:11px; }
+  /* ---- chat panel ---- */
+  #chat { position:fixed; right:14px; bottom:12px; width:372px; max-height:58vh; display:flex;
+          flex-direction:column; background:rgba(5,11,18,.86); border:1px solid #123a4c;
+          border-radius:6px; box-shadow:0 0 24px rgba(0,190,240,.10); overflow:hidden;
+          pointer-events:auto; }
+  #chat.hide { display:none; }
+  #chat .hd { display:flex; align-items:center; gap:8px; padding:6px 10px; border-bottom:1px solid #0f2b38;
+              color:var(--vram); letter-spacing:.06em; font-size:11px; }
+  #chat .hd .dim { color:var(--dim); }
+  #chat .hd .sp { flex:1; }
+  #chat .hd button { pointer-events:auto; background:#0d2531; color:#8fe6ff; border:1px solid #1b4b60;
+                     border-radius:3px; font:inherit; font-size:10px; padding:1px 6px; cursor:pointer; }
+  #log { flex:1; min-height:90px; overflow-y:auto; padding:8px 10px; white-space:pre-wrap;
+         word-break:break-word; font-size:11.5px; line-height:1.55; }
+  #log .u { color:#8fe6ff; }
+  #log .a { color:#dff4ff; }
+  #log .s { color:var(--dim); font-size:10.5px; }
+  #log .e { color:#ff6b86; }
+  #row { display:flex; gap:6px; padding:7px 8px; border-top:1px solid #0f2b38; }
+  #in { flex:1; resize:none; height:34px; background:#08131c; color:var(--fg); border:1px solid #1b4b60;
+        border-radius:3px; font:inherit; font-size:11.5px; padding:5px 7px; outline:none; }
+  #in:focus { border-color:#2f8aa8; }
+  #send { background:#0f3a4d; color:#9fefff; border:1px solid #2f8aa8; border-radius:3px;
+          font:inherit; font-size:11px; padding:0 12px; cursor:pointer; }
+  #send:disabled { opacity:.45; cursor:default; }
+  #cmeta { padding:0 10px 6px; color:var(--dim); font-size:10px; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <div id="hud" class="panel">
   <div><b>denno-view</b> · Qwen3.8-Flash-Next · three.js r160</div>
-  <div class="dim">48 layers = 12 hybrid blocks (GDN x3 + QSA) · 512 experts/layer · top-10 · moe layer 2 only PLE</div>
-  <div id="stat">layer <b id="cur">--</b> <span id="curkind" class="qsa">QSA</span> · fps <b id="fps">--</b></div>
-  <div><span class="vram">VRAM <b id="n_vram">0</b></span> / <span class="dim">cap <b id="cap">96</b></span> ·
+  <div class="dim">48 layers = 12 hybrid blocks (GDN x3 + QSA) · 512 experts/layer · top-10 · PLE = layer 2 only</div>
+  <div id="stat">layer <b id="cur">--</b> <span id="curkind" class="qsa">QSA</span> ·
+       <span class="neu">neurons lit <b id="nlit">0</b></span> · fps <b id="fps">--</b></div>
+  <div><span class="vram">VRAM <b id="n_vram">0</b></span> / <span class="dim">cap <b id="cap">10500</b></span> ·
        <span class="ram">RAM <b id="n_ram">0</b></span> ·
        <span class="ssd">SSD <b id="n_ssd">0</b></span></div>
   <div id="live" class="dim">telemetry: <b id="ws_state">--</b> · prefill <b id="pf">--</b> · decode <b id="dc">--</b></div>
@@ -38,9 +67,20 @@
   <div id="mode" class="dim">mode: demo (routing simulated)</div>
 </div>
 <div id="legend" class="panel">
-  <div><span class="qsa">QSA</span> 12 · <span class="gdn">GDN</span> 36 · <span class="router">router</span> · <span class="shex">shared</span> · <span class="gr">GR r/w</span> · <span class="ple">PLE</span>(L2)</div>
-  <div>expert の置き場: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">SSD</span></div>
-  <div>drag: rotate · wheel: zoom · space: pause</div>
+  <div><span class="neu">neuron</span> 2560/layer · <span class="qsa">QSA</span> 12 · <span class="gdn">GDN</span> 36</div>
+  <div><span class="router">router</span> · <span class="shex">shared</span> · <span class="gr">GR r/w</span> · <span class="ple">PLE</span>(L2)</div>
+  <div>expert: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">SSD</span></div>
+  <div>drag: rotate · wheel: zoom · space: pause · [c] chat</div>
+</div>
+<div id="chat">
+  <div class="hd"><b>denno</b> <span class="dim" id="endpoint">--</span><span class="sp"></span>
+    <button id="clear">clear</button><button id="hidec">hide</button></div>
+  <div id="log"><div class="s">8098 の /v1/messages に直接つないでいます。送信すると実テレメトリが流れ、層のニューロンが光ります。</div></div>
+  <div id="row">
+    <textarea id="in" placeholder="denno に話しかける (Enter 送信 / Shift+Enter 改行)"></textarea>
+    <button id="send">送信</button>
+  </div>
+  <div id="cmeta"></div>
 </div>
 <div id="err"></div>
 <div id="dump" style="display:none"></div>
@@ -73,37 +113,40 @@ import { decodeFrame, FrameDecodeError } from '/frames.mjs';
 
 // ===== 実モデルの数 (GGUF ヘッダ実測) =====================================
 const Q = new URLSearchParams(location.search);
+
 const LAYERS = 48;               // qwen4exp.block_count
 const EXPERTS = 512;             // qwen4exp.expert_count
 const TOPK = 10;                 // qwen4exp.expert_used_count
 const INTERVAL = 4;              // qwen4exp.full_attention_interval -> QSA 1 : GDN 3
-const PLE_LAYERS = [1];          // qwen4exp.ple.layers (Layer 2 のみ)
+const PLE_LAYERS = [1];          // qwen4exp.ple.layers (0 始まりなので図の Layer 2)
 const NGRAMS = 16;               // ple.head_vocab_sizes の要素数
-const VRAM_CAP = 10500;          // VRAM に載る expert 枠。実測からの換算:
-                                 // DENNO_EXPERT_VRAM_MB=18000 / 1 expert 約 1.7 MB
-                                 // (gate+up Q4_K 2560x640x512 + down Q5_1 640x2560x512)
-                                 // = 約 10,500 本 / 全 24,576 本 (48 層 x 512) = 43%
-const RAM_CAP = 10500;           // RAM (ホスト側) に置ける expert 枠。テレメトリには
-                                 // 載っていない (ExpertResidency は VRAM の集合だけ)
-                                 // ので VRAM と同数と置く近似。溢れたぶんだけ単調 LRU で
-                                 // SSD へ落とす (受信のたびに全 512 本を SSD に送らない)。
+const EMB = 2560;                // qwen4exp.embedding_length
+const HYP = 4;                   // qwen4exp.hyper_connection.count (GR read/write)
+const HYP_LR = 320;              // qwen4exp.hyper_connection.low_rank
+const VRAM_CAP = 10500;          // VRAM に載る expert 枠 (18 GB / 1 expert 約 1.7 MB)
+const RAM_CAP = 10500;           // RAM 側の枠 (テレメトリには出ないので VRAM と同数で近似)
 
-const isQSA = (il) => (il + 1) % INTERVAL === 0;
+const isQSA = (il) => (il + 1) % INTERVAL === 0;    // compress_ratios が 4 になる層
+const ZSTEP = 1.7;
 const zOf = (il) => -il * ZSTEP;
-const ZSTEP = 2.3;
 
-// 置き場 (Y 軸) と footprint (X 軸)
+// 置き場 (Y 軸)
 const TIER = { SSD: 0, RAM: 1, VRAM: 2 };
-const TIER_Y = [-7.4, 0, 7.4];
+const TIER_Y = [-7.0, 0, 7.0];
 const TIER_COL = [new THREE.Color('#ff3b6b'), new THREE.Color('#ffb020'), new THREE.Color('#00eaff')];
 
-const X = { mixer: -6.4, router: -4.6, exp0: -3.0, exp1: 2.4, shex: 3.5, gr: 5.0, resid: 6.6 };
+// 層の中の並び (X 軸)。左から ニューロン壁 -> 残差 -> mixer -> gate -> router -> experts -> shared -> GR -> 残差レーン
+const X = {
+  neu: -11.2, residIn: -9.5, mixer: -8.3, gate1: -7.3, router: -6.3,
+  exp0: -5.4, exp1: 1.0, shex: 1.9, gate2: 2.7, gr: 3.5, hs: 4.4, resid: 5.3
+};
 const ECOL = 32, EROW = EXPERTS / ECOL;   // 512 -> 32 x 16
-const EBOX = 0.12;
+const EBOX = 0.11;
 const COL = {
   qsa: new THREE.Color('#b46bff'), gdn: new THREE.Color('#00d9a0'),
   router: new THREE.Color('#ffe14d'), shex: new THREE.Color('#ff2bd6'),
-  gr: new THREE.Color('#59b6ff'), ple: new THREE.Color('#7f8bff')
+  gr: new THREE.Color('#59b6ff'), ple: new THREE.Color('#7f8bff'),
+  neuBase: new THREE.Color('#1b2f3a'), neuHot: new THREE.Color('#7ff0ff')
 };
 
 // ===== renderer ==========================================================
@@ -117,28 +160,30 @@ renderer.toneMappingExposure = 1.0;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color('#04060b');
-scene.fog = new THREE.FogExp2('#04060b', 0.0062);
+scene.fog = new THREE.FogExp2('#04060b', 0.0032);
 
 const totalZ = (LAYERS - 1) * ZSTEP;
-const center = new THREE.Vector3(0, 0, -totalZ * 0.48);
-const camera = new THREE.PerspectiveCamera(42, innerWidth / innerHeight, 0.1, 900);
-camera.position.set(27, 25, 34);
+const center = new THREE.Vector3(-4, -2.2, -totalZ * 0.42);
+const camera = new THREE.PerspectiveCamera(39, innerWidth / innerHeight, 0.1, 900);
+camera.position.set(27, 39, 36);
 camera.lookAt(center);
 
 const controls = new OrbitControls(camera, canvas);
 controls.target.copy(center);
 controls.enableDamping = true; controls.dampingFactor = 0.07;
 controls.autoRotate = false; controls.autoRotateSpeed = 0.30;
-controls.minDistance = 8; controls.maxDistance = 340;
+controls.minDistance = 8; controls.maxDistance = 380;
+
+const m4 = new THREE.Matrix4();
 
 // ===== 3 つの記憶デッキ ==================================================
 function deck(y, hex) {
-  const pts = [], x0 = -8.4, x1 = 7.6, z0 = 4.2, z1 = -totalZ - 4.2;
-  for (let i = 0; i <= 16; i++) { const x = x0 + (x1 - x0) * i / 16; pts.push(x, 0, z0, x, 0, z1); }
-  for (let i = 0; i <= 52; i++) { const z = z0 + (z1 - z0) * i / 52; pts.push(x0, 0, z, x1, 0, z); }
+  const pts = [], x0 = -14.8, x1 = 7.6, z0 = 9.0, z1 = -totalZ - 6.0;
+  for (let i = 0; i <= 18; i++) { const x = x0 + (x1 - x0) * i / 18; pts.push(x, 0, z0, x, 0, z1); }
+  for (let i = 0; i <= 56; i++) { const z = z0 + (z1 - z0) * i / 56; pts.push(x0, 0, z, x1, 0, z); }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
-  const m = new THREE.LineBasicMaterial({ color: hex, transparent: true, opacity: 0.18,
+  const m = new THREE.LineBasicMaterial({ color: hex, transparent: true, opacity: 0.26,
                                           blending: THREE.AdditiveBlending, depthWrite: false });
   const l = new THREE.LineSegments(g, m); l.position.y = y; return l;
 }
@@ -147,55 +192,131 @@ scene.add(deck(TIER_Y[TIER.RAM], 0x4a3a10));
 scene.add(deck(TIER_Y[TIER.VRAM], 0x0d4a58));
 
 function sprite(txt, color, w) {
-  const cv = document.createElement('canvas'); cv.width = 256; cv.height = 64;
-  const g = cv.getContext('2d');
-  g.font = 'bold 38px ui-monospace, monospace'; g.fillStyle = color;
-  g.textAlign = 'left'; g.textBaseline = 'middle'; g.fillText(txt, 4, 34);
+  const cv = document.createElement('canvas');
+  const pad = 8, fs = 34;
+  let g = cv.getContext('2d');
+  g.font = 'bold ' + fs + 'px ui-monospace, monospace';
+  const tw = Math.ceil(g.measureText(txt).width) + pad * 2;
+  cv.width = Math.max(64, tw); cv.height = 64;
+  g = cv.getContext('2d');
+  g.font = 'bold ' + fs + 'px ui-monospace, monospace'; g.fillStyle = color;
+  g.textAlign = 'left'; g.textBaseline = 'middle'; g.fillText(txt, pad, 34);
   const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace;
   const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, transparent: true, depthWrite: false, opacity: 0.92 }));
-  s.scale.set(w, w / 4, 1); return s;
+  s.scale.set(w, w * cv.height / cv.width, 1); return s;
 }
-[['VRAM', '#00eaff', TIER.VRAM], ['RAM', '#ffb020', TIER.RAM], ['SSD', '#ff3b6b', TIER.SSD]]
-  .forEach(([n, c, t]) => { const s = sprite(n, c, 4.2); s.position.set(-9.6, TIER_Y[t], -3.0); scene.add(s); });
+function label(txt, color, w, x, y, z) { const s = sprite(txt, color, w); s.position.set(x, y, z); scene.add(s); return s; }
+function arrow(x0, y0, z0, x1, y1, z1, hex, op) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute([x0, y0, z0, x1, y1, z1], 3));
+  const l = new THREE.Line(g, new THREE.LineBasicMaterial({ color: hex, transparent: true, opacity: op,
+    blending: THREE.AdditiveBlending, depthWrite: false }));
+  l.frustumCulled = false; scene.add(l); return l;
+}
 
-// ===== 層カード (hybrid block ごとに区切る) ===============================
+label('VRAM', '#00eaff', 4.2, -14.2, TIER_Y[TIER.VRAM], -3.0);
+label('RAM', '#ffb020', 4.2, -14.2, TIER_Y[TIER.RAM], -3.0);
+label('SSD', '#ff3b6b', 4.2, -14.2, TIER_Y[TIER.SSD], -3.0);
+
+// ===== 1) ニューロン壁 (層あたり 2560 個の小箱、実 index と 1:1) ==========
+// LayerAct の idx は「その層の残差ストリームの index」(0..2559)。expert ではない。
+// 壁は X-Y 平面 (カメラ側を向く) に 64 列 x 40 行。index i -> col = i % 64, row = i / 64。
+const NW = 64, NH = EMB / NW;          // 40
+const NWX0 = -13.6, NWX1 = -10.4, NWY = 4.2;
+const neuGeo = new THREE.BoxGeometry(0.040, 0.158, 0.036);
+const walls = [];
+for (let il = 0; il < LAYERS; il++) {
+  const inst = new THREE.InstancedMesh(neuGeo, new THREE.MeshBasicMaterial({ color: 0xffffff, fog: true }), EMB);
+  inst.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+  inst.frustumCulled = false;
+  for (let i = 0; i < EMB; i++) {
+    const c = i % NW, r = (i / NW) | 0;
+    const x = NWX0 + (NWX1 - NWX0) * (c / (NW - 1));
+    const y = NWY - 2 * NWY * (r / (NH - 1));
+    m4.makeTranslation(x, y, zOf(il));
+    inst.setMatrixAt(i, m4);
+    inst.setColorAt(i, COL.neuBase);
+  }
+  inst.instanceMatrix.needsUpdate = true; inst.instanceColor.needsUpdate = true;
+  scene.add(inst);
+  // 壁の枠 (層の位置が読めるように)
+  const fr = new THREE.BufferGeometry();
+  const a = NWX0 - 0.18, b = NWX1 + 0.18, c1 = NWY + 0.22, c2 = -NWY - 0.22, z = zOf(il);
+  fr.setAttribute('position', new THREE.Float32BufferAttribute([
+    a, c1, z, b, c1, z, b, c1, z, b, c2, z, b, c2, z, a, c2, z, a, c2, z, a, c1, z
+  ], 3));
+  scene.add(new THREE.LineSegments(fr, new THREE.LineBasicMaterial({
+    color: isQSA(il) ? 0x5a3f8a : 0x1d5f5a, transparent: true, opacity: 0.55, depthWrite: false })));
+  walls.push({ il, inst, act: new Float32Array(EMB), lit: 0 });
+}
+const hotWalls = new Set();
+
+function paintWall(il) {
+  const w = walls[il], col = w.inst.instanceColor.array;
+  let lit = 0;
+  for (let i = 0; i < EMB; i++) {
+    const a = w.act[i];
+    const o = i * 3;
+    if (a <= 0.004) {
+      col[o] = COL.neuBase.r; col[o + 1] = COL.neuBase.g; col[o + 2] = COL.neuBase.b;
+      continue;
+    }
+    lit++;
+    const v = a * a * 0.9 + a * 0.1;
+    const wb = Math.max(0, a - 0.72) * 2.2;
+    col[o]     = COL.neuBase.r + (COL.neuHot.r - COL.neuBase.r) * v + (1 - COL.neuHot.r) * wb;
+    col[o + 1] = COL.neuBase.g + (COL.neuHot.g - COL.neuBase.g) * v + (1 - COL.neuHot.g) * wb;
+    col[o + 2] = COL.neuBase.b + (COL.neuHot.b - COL.neuBase.b) * v + (1 - COL.neuHot.b) * wb;
+  }
+  w.lit = lit;
+  w.inst.instanceColor.needsUpdate = true;
+}
+
+/** 層 il のニューロン (index, 0..1) を光らせる。実 index をそのまま使う。 */
+function lightNeurons(il, idx, val) {
+  const w = walls[il];
+  if (!w) return;
+  for (let i = 0; i < idx.length; i++) {
+    const k = idx[i] | 0;
+    if (k < 0 || k >= EMB) continue;
+    const v = Math.max(0, Math.min(1, (val && val[i]) || 0));
+    if (v > w.act[k]) w.act[k] = v;
+  }
+  paintWall(il);
+  hotWalls.add(il);
+}
+
+// ===== 2) 層カード (残差レーン + hybrid block の枠) =======================
 const HB = LAYERS / INTERVAL;   // 12
 for (let il = 0; il < LAYERS; il++) {
   const qsa = isQSA(il);
   const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute([
-    -7.4, 0, 0, 6.9, 0, 0,   // 残差レーン
-  ], 3));
+  g.setAttribute('position', new THREE.Float32BufferAttribute([X.residIn, 0, 0, 6.4, 0, 0], 3));
   const l = new THREE.LineSegments(g, new THREE.LineBasicMaterial({
-    color: qsa ? 0x9a5bff : 0x00a97f, transparent: true, opacity: qsa ? 0.5 : 0.28,
+    color: qsa ? 0x9a5bff : 0x00a97f, transparent: true, opacity: qsa ? 0.5 : 0.26,
     blending: THREE.AdditiveBlending, depthWrite: false }));
   l.position.set(0, 0.0, zOf(il));
   scene.add(l);
 }
-// hybrid block のラベル + 枠
 for (let b = 0; b < HB; b++) {
   const z0 = zOf(b * INTERVAL), z1 = zOf(b * INTERVAL + INTERVAL - 1);
   const mid = (z0 + z1) / 2;
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute([
-    -8.0, -1.5, z0 + 1.4, 7.4, -1.5, z0 + 1.4,
-    7.4, -1.5, z0 + 1.4, 7.4, -1.5, z1 - 1.4,
-    7.4, -1.5, z1 - 1.4, -8.0, -1.5, z1 - 1.4,
-    -8.0, -1.5, z1 - 1.4, -8.0, -1.5, z0 + 1.4
+    -13.4, -1.5, z0 + 1.5, 7.0, -1.5, z0 + 1.5,
+     7.0, -1.5, z0 + 1.5, 7.0, -1.5, z1 - 1.5,
+     7.0, -1.5, z1 - 1.5, -13.4, -1.5, z1 - 1.5,
+    -13.4, -1.5, z1 - 1.5, -13.4, -1.5, z0 + 1.5
   ], 3));
   scene.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({
-    color: 0x1d5f74, transparent: true, opacity: 0.32, blending: THREE.AdditiveBlending, depthWrite: false })));
-  const s = sprite('HB' + String(b).padStart(2, '0') + '  L' + (b * INTERVAL) + '-' + (b * INTERVAL + INTERVAL - 1),
-                   '#3fd6ea', 3.6);
-  s.position.set(-10.6, -1.5, mid);
-  scene.add(s);
+    color: 0x1d5f74, transparent: true, opacity: 0.30, blending: THREE.AdditiveBlending, depthWrite: false })));
+  label('HB' + String(b).padStart(2, '0') + ' L' + (b * INTERVAL) + '-' + (b * INTERVAL + INTERVAL - 1) +
+        ' 1xQSA+3xGDN', '#3fd6ea', 3.4, -15.8, -1.5, mid);
 }
 
-// ===== expert (層ごとに 512 個を 32x16 で敷く) ============================
+// ===== 3) expert (層ごとに 512 個を 32x16 で敷く) =========================
 const eGeo = new THREE.BoxGeometry(EBOX, EBOX, EBOX);
 const slabs = [];
-const m4 = new THREE.Matrix4();
-
 for (let il = 0; il < LAYERS; il++) {
   const inst = new THREE.InstancedMesh(eGeo, new THREE.MeshBasicMaterial({ color: 0xffffff, fog: true }), EXPERTS);
   inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -204,7 +325,7 @@ for (let il = 0; il < LAYERS; il++) {
   for (let k = 0; k < EXPERTS; k++) {
     const c = k % ECOL, r = (k / ECOL) | 0;
     const x = X.exp0 + (X.exp1 - X.exp0) * (c / (ECOL - 1));
-    const z = zOf(il) - 0.62 + 1.24 * (r / (EROW - 1));
+    const z = zOf(il) - 0.55 + 1.10 * (r / (EROW - 1));
     xz[k * 2] = x; xz[k * 2 + 1] = z;
     y3[k * 3] = x; y3[k * 3 + 1] = TIER_Y[0]; y3[k * 3 + 2] = z;
     m4.makeTranslation(x, TIER_Y[0], z);
@@ -218,7 +339,7 @@ for (let il = 0; il < LAYERS; il++) {
                used: new Float32Array(EXPERTS), dirty: new Uint8Array(EXPERTS), route: [] });
 }
 
-// ===== 役割ブロック (層あたり 1 個ずつ、層数ぶんの instance) ==============
+// ===== 4) 役割ブロック (mixer / gate / router / shared / GR) ==============
 function blockSet(count, makeGeo, color) {
   const inst = new THREE.InstancedMesh(makeGeo, new THREE.MeshBasicMaterial({ color: 0xffffff, fog: true }), count);
   inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -227,40 +348,82 @@ function blockSet(count, makeGeo, color) {
   return { inst, color };
 }
 const R = {
-  qsa:   blockSet(LAYERS, new THREE.BoxGeometry(0.60, 1.5, 0.55), COL.qsa),      // QSA (compress 4)
-  gdn:   blockSet(LAYERS, new THREE.BoxGeometry(0.52, 1.1, 0.55), COL.gdn),      // Gated DeltaNet
+  qsa:   blockSet(LAYERS, new THREE.BoxGeometry(0.62, 1.6, 0.55), COL.qsa),      // QSA (compress 4)
+  gdn:   blockSet(LAYERS, new THREE.BoxGeometry(0.54, 1.15, 0.55), COL.gdn),     // Gated DeltaNet
+  gate:  blockSet(LAYERS * 2, new THREE.TorusGeometry(0.16, 0.05, 6, 14), COL.gr),
   router:blockSet(LAYERS, new THREE.OctahedronGeometry(0.30, 0), COL.router),
-  shex:  blockSet(LAYERS, new THREE.BoxGeometry(0.40, 0.9, 0.50), COL.shex),     // shared expert
-  gr:    blockSet(LAYERS * 2, new THREE.BoxGeometry(0.34, 0.34, 0.42), COL.gr),  // GR read / write
+  shex:  blockSet(LAYERS, new THREE.BoxGeometry(0.28, 0.70, 0.40), COL.shex),    // shared expert
+  gr:    blockSet(LAYERS * 2, new THREE.BoxGeometry(0.34, 0.34, 0.42), COL.gr)   // GR write / read
 };
 for (let il = 0; il < LAYERS; il++) {
   const z = zOf(il), qsa = isQSA(il);
-  m4.makeTranslation(X.mixer, 0, z); R.qsa.inst.setMatrixAt(il, m4);
-  m4.makeTranslation(X.mixer, 0, z); R.gdn.inst.setMatrixAt(il, m4);
-  if (!qsa) R.qsa.inst.setMatrixAt(il, m4.makeScale(0, 0, 0));
-  if (qsa) R.gdn.inst.setMatrixAt(il, m4.makeScale(0, 0, 0));
-  m4.makeTranslation(X.router, 0.85, z); R.router.inst.setMatrixAt(il, m4);
+  if (qsa) m4.makeTranslation(X.mixer, 0, z); else m4.makeScale(0, 0, 0);
+  R.qsa.inst.setMatrixAt(il, m4);
+  if (!qsa) m4.makeTranslation(X.mixer, 0, z); else m4.makeScale(0, 0, 0);
+  R.gdn.inst.setMatrixAt(il, m4);
+  m4.makeTranslation(X.gate1, 0, z); R.gate.inst.setMatrixAt(il * 2, m4);
+  m4.makeTranslation(X.gate2, 0, z); R.gate.inst.setMatrixAt(il * 2 + 1, m4);
+  m4.makeTranslation(X.router, 0.95, z); R.router.inst.setMatrixAt(il, m4);
   m4.makeTranslation(X.shex, 0, z); R.shex.inst.setMatrixAt(il, m4);
-  m4.makeTranslation(X.gr, 0.55, z); R.gr.inst.setMatrixAt(il * 2, m4);         // GR write
-  m4.makeTranslation(X.gr, -0.55, z); R.gr.inst.setMatrixAt(il * 2 + 1, m4);    // GR read
+  m4.makeTranslation(X.gr, 0.62, z); R.gr.inst.setMatrixAt(il * 2, m4);      // GR write
+  m4.makeTranslation(X.gr, -0.62, z); R.gr.inst.setMatrixAt(il * 2 + 1, m4); // GR read
   for (const key of ['qsa', 'gdn', 'router', 'shex'])
     R[key].inst.setColorAt(il, R[key].color.clone().multiplyScalar(key === 'router' ? 0.10 : 0.16));
   R.gr.inst.setColorAt(il * 2, COL.gr.clone().multiplyScalar(0.14));
   R.gr.inst.setColorAt(il * 2 + 1, COL.gr.clone().multiplyScalar(0.14));
+  R.gate.inst.setColorAt(il * 2, COL.gr.clone().multiplyScalar(0.12));
+  R.gate.inst.setColorAt(il * 2 + 1, COL.gr.clone().multiplyScalar(0.12));
 }
 for (const k of Object.keys(R)) { R[k].inst.instanceMatrix.needsUpdate = true; R[k].inst.instanceColor.needsUpdate = true; }
 
-// ===== PLE (n-gram embedding, layer 2 のみ, 表は SSD) ====================
+// ===== 5) 入出力 (Vocabulary Embedding / N-gram Embedding Layer) ==========
 const pleGroup = new THREE.Group();
-for (let n = 0; n < NGRAMS; n++) {
-  const m = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.22, 0.22),
+const pleSlab = new THREE.Mesh(new THREE.BoxGeometry(7.2, 0.85, 1.5),
+  new THREE.MeshBasicMaterial({ color: COL.ple.clone().multiplyScalar(0.22), transparent: true, opacity: 0.9 }));
+pleSlab.position.set(2.2, -2.4, 3.6);
+pleGroup.add(pleSlab);
+for (let n = 0; n < NGRAMS; n++) {                     // 16 head (head_vocab_sizes の要素数)
+  const m = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.30, 0.34),
     new THREE.MeshBasicMaterial({ color: COL.ple.clone().multiplyScalar(0.35) }));
-  m.position.set(X.exp0 - 0.4 + n * 0.26, 0, zOf(PLE_LAYERS[0]) - 1.5);
+  m.position.set(-1.2 + n * 0.45, -1.75, 3.6);
   pleGroup.add(m);
 }
-scene.add(pleGroup);
+const vocabBox = new THREE.Mesh(new THREE.BoxGeometry(3.6, 1.1, 1.3),
+  new THREE.MeshBasicMaterial({ color: 0x9b6cff, transparent: true, opacity: 0.55 }));
+vocabBox.position.set(-8.8, -2.4, 3.6);
+pleGroup.add(vocabBox);
+const tokBox = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.5, 0.9),
+  new THREE.MeshBasicMaterial({ color: 0x5f7d8c, transparent: true, opacity: 0.6 }));
+tokBox.position.set(-8.8, -2.4, 6.0);
+pleGroup.add(tokBox);
+for (const m of pleGroup.children) scene.add(m);
 
-// ===== ルーティングの光線 (層あたり top-10) ==============================
+arrow(-8.8, -1.85, 6.0, -8.8, -1.85, 3.6, 0x8fa6b8, 0.5);
+arrow(-8.8, -1.85, 3.6, -12.0, -NWY - 0.6, zOf(0) + 0.3, 0xb08bff, 0.35);
+arrow(2.2, -1.95, 3.6, -12.0, -NWY - 0.6, zOf(PLE_LAYERS[0]) + 0.3, 0x7f8bff, 0.45);
+label('Vocabulary Embedding', '#b08bff', 3.0, -8.8, -3.4, 3.6);
+label('N-gram Embedding Layer (Layer 2 only)', '#7f8bff', 5.2, 2.2, -3.4, 3.6);
+label('ngram 3 / 8 heads per ngram / 16 head x 20.0M vocab', '#5f6bb0', 6.4, 2.2, -4.25, 3.6);
+label('input tokens', '#6c8794', 2.2, -8.8, -3.05, 6.5);
+
+// ===== 6) 出力側 (GR Read -> Prediction Head / MTP) =======================
+const topZ = zOf(LAYERS - 1) - 4.6;
+const predHead = new THREE.Mesh(new THREE.BoxGeometry(3.4, 1.2, 1.1),
+  new THREE.MeshBasicMaterial({ color: 0xfff2b0, transparent: true, opacity: 0.5 }));
+predHead.position.set(-6.6, 0.2, topZ); scene.add(predHead);
+label('Prediction Head', '#fff2b0', 3.2, -6.6, 1.3, topZ);
+const grReadTop = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.42, 0.5),
+  new THREE.MeshBasicMaterial({ color: COL.gr }));
+grReadTop.position.set(X.gr, 0.62, zOf(LAYERS - 1) - 1.8); scene.add(grReadTop);
+const mtp = new THREE.Mesh(new THREE.BoxGeometry(3.2, 1.0, 1.0),
+  new THREE.MeshBasicMaterial({ color: 0x8a93a8, transparent: true, opacity: 0.20 }));
+mtp.position.set(-11.6, 3.6, topZ); scene.add(mtp);
+label('MTP Modules (この GGUF には無い)', '#6b7488', 3.6, -11.6, 4.5, topZ);
+label('GR read/write = hyper-connection x4 (low_rank 320)', '#59b6ff', 5.2, X.gr, -1.6, zOf(0) + 0.4);
+arrow(X.gr, 0.62, zOf(LAYERS - 1) - 1.8, -6.6, 0.2, topZ, 0x59b6ff, 0.45);
+arrow(-10.9, 0.5, topZ, -6.6, 0.5, topZ, 0x8a93a8, 0.20);
+
+// ===== 7) ルーティングの光線 (層あたり top-10) ============================
 const beamGeo = new THREE.BufferGeometry();
 const beamPos = new Float32Array(LAYERS * TOPK * 6);
 beamGeo.setAttribute('position', new THREE.BufferAttribute(beamPos, 3));
@@ -270,7 +433,7 @@ const beams = new THREE.LineSegments(beamGeo, new THREE.LineBasicMaterial({
 beams.frustumCulled = false;
 scene.add(beams);
 
-// ===== 残差レーンの粒 ====================================================
+// ===== 8) 残差レーンの粒 ==================================================
 const PPL = 3, PARTICLES = (LAYERS - 1) * PPL;
 const fGeo = new THREE.BufferGeometry();
 const fPos = new Float32Array(PARTICLES * 3), fCol = new Float32Array(PARTICLES * 3);
@@ -298,33 +461,18 @@ composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth / 2, innerHeig
 composer.addPass(new OutputPass());
 
 // ===== 状態 ==============================================================
-const demo = { on: true, t: 0, paused: false, cursor: 0, hold: 0 };
-const live = { ts: 0, act: new Map(),
-  hit() { const age = performance.now() - this.ts; return Math.exp(-age / 400); } };
-const lru = [];                 // VRAM 在庫 (expert の通し番号)
-const lruRam = [];              // RAM 在庫。VRAM から押し出された順 (単調 LRU)
-let vramUsed = 0;
+const demo = { on: true, t: 0, paused: false, cursor: 0 };
+const live = { ts: 0, hit() { const age = performance.now() - this.ts; return Math.exp(-age / 400); } };
+const lru = [], lruRam = [];
 const key = (il, k) => il * EXPERTS + k;
+function touch(arr, kk) { const i = arr.indexOf(kk); if (i >= 0) arr.splice(i, 1); arr.push(kk); }
 
-/** 配列内の 1 要素を末尾へ移す (無ければ push)。LRU の「触った」を表す。 */
-function touch(arr, kk) {
-  const i = arr.indexOf(kk);
-  if (i >= 0) arr.splice(i, 1);
-  arr.push(kk);
-}
-
-// kind 13 RoleAct: 層ごとの役割の強さ (0..1 に clamp 済み)。
-// -1 = その層の値は未受信 → 従来どおり head (デモ / 直近の活性) で塗る。
 const ROLE_KEYS = ['attn', 'gdn', 'router', 'shex', 'ple'];
 const roleTarget = {}, roleCur = {};
-for (const k of ROLE_KEYS) {
-  roleTarget[k] = new Float32Array(LAYERS).fill(-1);
-  roleCur[k] = new Float32Array(LAYERS);
-}
+for (const k of ROLE_KEYS) { roleTarget[k] = new Float32Array(LAYERS).fill(-1); roleCur[k] = new Float32Array(LAYERS); }
 
 function hash(a, b) { const r = Math.sin(a * 127.1 + b * 311.7) * 43758.5453; return r - Math.floor(r); }
 
-// 選ばれた expert を VRAM 枠に載せる (枠が溢れたら LRU を RAM へ落とす)
 function promote(il, ids) {
   const s = slabs[il];
   for (const k0 of ids) {
@@ -339,7 +487,7 @@ function promote(il, ids) {
   }
 }
 
-// ルーティング (デモ): 層 il の top-10 を選ぶ
+/** デモのルーティング (実テレメトリが来ないときだけ) */
 function routeLayer(il, token) {
   const s = slabs[il];
   const cand = [];
@@ -347,14 +495,13 @@ function routeLayer(il, token) {
   cand.sort((a, b) => hash(b + 1, token) - hash(a + 1, token));
   const sel = cand.slice(0, TOPK);
   s.route = sel;
+  for (let i = 0; i < sel.length; i++) s.act[sel[i]] = Math.max(s.act[sel[i]], 0.6 + 0.4 * hash(i, token));
   promote(il, sel);
-  // VRAM 枠を超えたぶんを LRU から RAM へ
   while (lru.length > VRAM_CAP) {
     const kk = lru.shift();
     const l2 = (kk / EXPERTS) | 0, k2 = kk % EXPERTS;
     if (slabs[l2].tier[k2] === TIER.VRAM) { slabs[l2].tier[k2] = TIER.RAM; slabs[l2].dirty[k2] = 1; }
   }
-  // しばらく使われていない expert は RAM -> SSD
   for (const s2 of slabs) {
     if (s2.il === il) continue;
     for (let k = 0; k < EXPERTS; k++) {
@@ -372,16 +519,16 @@ function updateLayerColors(il) {
   for (let k = 0; k < EXPERTS; k++) {
     const tier = s.tier[k];
     const c = TIER_COL[tier];
-    let base = tier === TIER.VRAM ? 0.55 : (tier === TIER.RAM ? 0.34 : 0.16);
+    const base = tier === TIER.VRAM ? 0.55 : (tier === TIER.RAM ? 0.34 : 0.16);
     let g = s.act[k];
     if (sel.has(k)) g = Math.max(g, 1.0);
     const v = base + g * 1.6;
     col[k * 3] = c.r * v; col[k * 3 + 1] = c.g * v; col[k * 3 + 2] = c.b * v;
     if (g > 0.72) {
       const w = Math.min(1, (g - 0.72) * 1.8);
-      col[k * 3] = col[k * 3] + (1 - col[k * 3]) * w;
-      col[k * 3 + 1] = col[k * 3 + 1] + (1 - col[k * 3 + 1]) * w;
-      col[k * 3 + 2] = col[k * 3 + 2] + (1 - col[k * 3 + 2]) * w;
+      col[k * 3] += (1 - col[k * 3]) * w;
+      col[k * 3 + 1] += (1 - col[k * 3 + 1]) * w;
+      col[k * 3 + 2] += (1 - col[k * 3 + 2]) * w;
     }
   }
   s.inst.instanceColor.needsUpdate = true;
@@ -400,8 +547,6 @@ function updateLayerColors(il) {
 
 function updateRoleColors(il, head) {
   const qsa = isQSA(il);
-  // kind 13 の実値が届いている層はそちらを使う。届いていない層は head のまま
-  // (0 に落とさない)。値は前フレームから補間してちらつきを抑える。
   const v = (name, fallback) => {
     const t = roleTarget[name][il];
     if (t < 0) return fallback;
@@ -415,11 +560,16 @@ function updateRoleColors(il, head) {
   set(R.shex, il, v('shex', head * 0.8), 0.16);
   set(R.gr, il * 2, head, 0.14);
   set(R.gr, il * 2 + 1, head * 0.6, 0.14);
-  for (const k of ['qsa', 'gdn', 'router', 'shex', 'gr']) R[k].inst.instanceColor.needsUpdate = true;
-  // PLE は層のスラブではなく layer 2 の表 (pleGroup の 16 個) だけ
+  set(R.gate, il * 2, head * 0.5, 0.12);
+  set(R.gate, il * 2 + 1, head * 0.4, 0.12);
+  for (const k of ['qsa', 'gdn', 'router', 'shex', 'gr', 'gate']) R[k].inst.instanceColor.needsUpdate = true;
   if (il === PLE_LAYERS[0]) {
     const pl = v('ple', 0);
-    for (const m of pleGroup.children) m.material.color.copy(COL.ple).multiplyScalar(0.35 + pl * 1.7);
+    for (const m of pleGroup.children) {
+      if (m === pleSlab || m === vocabBox || m === tokBox) continue;
+      m.material.color.copy(COL.ple).multiplyScalar(0.35 + pl * 1.7);
+    }
+    pleSlab.material.color.copy(COL.ple).multiplyScalar(0.22 + pl * 0.9);
   }
 }
 
@@ -434,7 +584,7 @@ function updateBeams(il, strength) {
   const o = il * TOPK * 6;
   for (let i = 0; i < TOPK; i++) {
     const k = s.route[i] === undefined ? 0 : s.route[i];
-    beamPos[o + i * 6 + 0] = X.router; beamPos[o + i * 6 + 1] = 0.85; beamPos[o + i * 6 + 2] = z;
+    beamPos[o + i * 6 + 0] = X.router; beamPos[o + i * 6 + 1] = 0.95; beamPos[o + i * 6 + 2] = z;
     beamPos[o + i * 6 + 3] = s.y3[k * 3];
     beamPos[o + i * 6 + 4] = s.y3[k * 3 + 1] + 0.06;
     beamPos[o + i * 6 + 5] = s.y3[k * 3 + 2];
@@ -443,15 +593,21 @@ function updateBeams(il, strength) {
   beamGeo.attributes.position.needsUpdate = true;
 }
 
-function step(dt) {
+function step(dt, doRender) {
   if (demo.on && !demo.paused) demo.t += dt;
-  // トークン 1 個ぶん: 層を 0 -> 47 と流す
   const perLayer = 0.16;
   const cursor = Math.floor((demo.t / perLayer) % LAYERS);
   const token = Math.floor(demo.t / (perLayer * LAYERS));
   if (demo.on && cursor !== demo.cursor) {
     demo.cursor = cursor;
     routeLayer(cursor, token);
+    // デモでもニューロンを光らせる (実テレメトリの代わり)
+    const idx = [], val = [];
+    for (let i = 0; i < 64; i++) {
+      idx.push(((hash(i + 1.7, token * 7.3 + cursor) * EMB) | 0));
+      val.push(0.25 + 0.75 * hash(i * 2.1, cursor + token));
+    }
+    lightNeurons(cursor, idx, val);
     document.getElementById('cur').textContent = String(cursor).padStart(2, '0');
     const ck = document.getElementById('curkind');
     ck.textContent = isQSA(cursor) ? 'QSA' : 'GDN';
@@ -460,7 +616,24 @@ function step(dt) {
   const head = demo.on ? 0.35 + 0.65 * Math.exp(-Math.abs((demo.t / perLayer) % 1) * 3)
                       : Math.min(1, 0.55 + live.hit());
 
-  // 見えている層だけ色を更新 (負荷を 1/4 に)
+  // ニューロンの減衰 (光った層だけ)
+  if (hotWalls.size) {
+    let nlit = 0;
+    for (const il of Array.from(hotWalls)) {
+      const w = walls[il];
+      let any = 0;
+      for (let i = 0; i < EMB; i++) {
+        const a = w.act[i];
+        if (a > 0.004) { w.act[i] = a * (demo.on ? 0.955 : 0.90); any = 1; }
+      }
+      paintWall(il);
+      nlit += w.lit;
+      if (!any) hotWalls.delete(il);
+    }
+    document.getElementById('nlit').textContent = String(nlit);
+  }
+
+  // 層の色 (見えている層だけ更新)
   for (let il = 0; il < LAYERS; il++) {
     if (il !== demo.cursor && (il + demo.cursor) % 3 !== 0) continue;
     updateLayerColors(il);
@@ -468,7 +641,6 @@ function step(dt) {
   }
   updateBeams(demo.cursor, head);
 
-  // 残差レーンの粒
   let n = 0;
   for (let il = 0; il < LAYERS - 1; il++) {
     for (let i = 0; i < PPL; i++) {
@@ -484,7 +656,7 @@ function step(dt) {
   fGeo.attributes.position.needsUpdate = true; fGeo.attributes.color.needsUpdate = true;
 
   controls.update();
-  composer.render();
+  if (doRender !== false) composer.render();
 }
 
 function hud() {
@@ -492,7 +664,6 @@ function hud() {
   for (const s of slabs) for (let k = 0; k < EXPERTS; k++) {
     if (s.tier[k] === TIER.VRAM) v++; else if (s.tier[k] === TIER.RAM) r++; else d++;
   }
-  vramUsed = v;
   document.getElementById('n_vram').textContent = v;
   document.getElementById('n_ram').textContent = r;
   document.getElementById('n_ssd').textContent = d;
@@ -503,15 +674,28 @@ let acc = 0, cnt = 0;
 function frame() {
   const dt = Math.min(0.06, clock.getDelta());
   step(dt);
-  if (replayOn) replayStep();      // 再生中は 1 フレーム/ステップで実データを流す
+  if (replayOn) replayStep();
   window.__viewReady = true;
   acc += dt; cnt++;
   if (acc > 0.4) { document.getElementById('fps').textContent = (cnt / acc).toFixed(0); hud(); acc = 0; cnt = 0; }
   requestAnimationFrame(frame);
 }
 
-// telemetry の口 (row 54/55 で接続)
-// RouterTopK: gate 重み付きの実ルーティング。LayerAct より細かい (重みが読める)。
+// ===== テレメトリの口 ====================================================
+const hudEl = {
+  ws: document.getElementById('ws_state'), pf: document.getElementById('pf'),
+  dc: document.getElementById('dc'), vram: document.getElementById('t_vram'),
+  total: document.getElementById('t_total'), ram: document.getElementById('t_ram'),
+  ssd: document.getElementById('t_ssd'), mode: document.getElementById('mode'),
+  cur: document.getElementById('cur'), curkind: document.getElementById('curkind')
+};
+const liveState = { tokens: 0, lastStepMs: 0, prefillMs: 0, frames: 0 };
+let replayOn = false;
+function noteLiveMode() {
+  hudEl.mode.textContent = replayOn ? 'mode: replay' : 'mode: live (telemetry)';
+}
+
+// kind 16 RouterTopK: 実ルーティング (expert index + 重み)
 window.onRouting = function (layer, experts, weights) {
   demo.on = false; live.ts = performance.now(); demo.cursor = layer;
   const s = slabs[layer]; if (!s) return;
@@ -526,26 +710,18 @@ window.onRouting = function (layer, experts, weights) {
   noteLiveMode();
 };
 
+// kind 12 LayerAct: 層の残差ストリームで |x| 上位 64 個。
+// index は 0..2559 のニューロン番号なので、そのまま壁の index に当てる (1:1)。
 window.onLayerActivation = function (layer, idx, val) {
-  demo.on = false; live.ts = performance.now(); live.act.set(layer, idx);
-  demo.cursor = layer;
-  const s = slabs[layer];
-  if (!s) return;
-  // LayerAct の idx は「その層で実際に選ばれた expert」。これを経路として使う。
-  const sel = [];
-  for (let i = 0; i < idx.length && sel.length < TOPK; i++) {
-    const k = idx[i] | 0;
-    if (k >= 0 && k < EXPERTS) {
-      sel.push(k);
-      s.act[k] = Math.max(s.act[k], Math.min(1, (val && val[i]) ? val[i] * 3 : 0.9));
-    }
-  }
-  s.route = sel;
-  promote(layer, sel);
+  demo.on = false; live.ts = performance.now(); demo.cursor = layer;
+  lightNeurons(layer, idx, val);
+  hudEl.cur.textContent = String(layer).padStart(2, '0');
+  hudEl.curkind.textContent = isQSA(layer) ? 'QSA' : 'GDN';
+  hudEl.curkind.className = isQSA(layer) ? 'qsa' : 'gdn';
   noteLiveMode();
 };
-// kind 13 RoleAct: 層の役割ごとの強さ (attn/gdn/router/shex/ple)。実値は 0.0〜数倍。
-// 値を 0..1 に clamp して該当ブロックの発光に使う。届いていない層は既定値のまま。
+
+// kind 13 RoleAct: attn / gdn / router / shex / ple の強さ
 window.onRoleActivation = function (layer, roles) {
   const il = layer | 0;
   live.ts = performance.now(); demo.on = false;
@@ -558,21 +734,13 @@ window.onRoleActivation = function (layer, roles) {
   noteLiveMode();
 };
 
-// kind 14 ExpertResidency: その層の VRAM 在庫 (expert index の配列、層は 0 始まり)。
-//   inVram に入っている      → VRAM
-//   入っていないが VRAM に居る → RAM  (VRAM から押し出された)
-//   RAM に居て、さらに押し出された → SSD
-// SSD へ送るのは RAM 枠 (RAM_CAP) を超えたぶんだけ。受信のたびに全 512 本は動かさない。
+// kind 14 ExpertResidency: その層の VRAM 在庫 (expert index の配列)
 window.onResidency = function (layer, inVram) {
   const il = layer | 0;
   const s = slabs[il]; if (!s) return;
   live.ts = performance.now(); demo.on = false;
   const set = new Set();
-  for (const x of inVram || []) {
-    const k = x | 0;
-    if (k >= 0 && k < EXPERTS) set.add(k);
-  }
-  // 1) inVram の expert を VRAM へ (受信順を「新しく触った順」とみなす)
+  for (const x of inVram || []) { const k = x | 0; if (k >= 0 && k < EXPERTS) set.add(k); }
   for (const k of set) {
     const kk = key(il, k);
     if (s.tier[k] !== TIER.VRAM) { s.tier[k] = TIER.VRAM; s.dirty[k] = 1; }
@@ -580,7 +748,6 @@ window.onResidency = function (layer, inVram) {
     if (i >= 0) lruRam.splice(i, 1);
     touch(lru, kk);
   }
-  // 2) inVram に無いのに VRAM に居る expert は RAM へ (位置の再計算は変わった箱だけ)
   for (let k = 0; k < EXPERTS; k++) {
     if (set.has(k) || s.tier[k] !== TIER.VRAM) continue;
     s.tier[k] = TIER.RAM; s.dirty[k] = 1;
@@ -589,16 +756,12 @@ window.onResidency = function (layer, inVram) {
     if (i >= 0) lru.splice(i, 1);
     touch(lruRam, kk);
   }
-  // 3) VRAM 枠を超えたぶんを古い順に RAM へ
   while (lru.length > VRAM_CAP) {
     const kk = lru.shift();
     const l2 = (kk / EXPERTS) | 0, k2 = kk % EXPERTS;
     const s2 = slabs[l2];
-    if (s2 && s2.tier[k2] === TIER.VRAM) {
-      s2.tier[k2] = TIER.RAM; s2.dirty[k2] = 1; touch(lruRam, kk);
-    }
+    if (s2 && s2.tier[k2] === TIER.VRAM) { s2.tier[k2] = TIER.RAM; s2.dirty[k2] = 1; touch(lruRam, kk); }
   }
-  // 4) RAM 枠を超えたぶんだけ SSD へ (押し出し順は単調 LRU)
   while (lruRam.length > RAM_CAP) {
     const kk = lruRam.shift();
     const l2 = (kk / EXPERTS) | 0, k2 = kk % EXPERTS;
@@ -607,7 +770,7 @@ window.onResidency = function (layer, inVram) {
   }
 };
 
-// kind 15 TierStats: HUD の実値 (MB は 1000 区切り、ramExperts は本数)。
+// kind 15 TierStats
 const fmtNum = (n) => String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 window.onTierStats = function (vramMB, vramTotalMB, ramExperts, ssdReads) {
   hudEl.vram.textContent = fmtNum(vramMB);
@@ -616,29 +779,10 @@ window.onTierStats = function (vramMB, vramTotalMB, ramExperts, ssdReads) {
   hudEl.ssd.textContent = fmtNum(ssdReads);
 };
 
-// ===== 実テレメトリ (/ws -> VIEW_UPSTREAM) ================================
-const hudEl = {
-  ws: document.getElementById('ws_state'), pf: document.getElementById('pf'),
-  dc: document.getElementById('dc'), vram: document.getElementById('t_vram'),
-  total: document.getElementById('t_total'), ram: document.getElementById('t_ram'),
-  ssd: document.getElementById('t_ssd'), mode: document.getElementById('mode'),
-  cur: document.getElementById('cur'), curkind: document.getElementById('curkind')
-};
-const liveState = { tokens: 0, lastStepMs: 0, prefillMs: 0, frames: 0 };
-
-// どの運転モードかを HUD に出す。キャプチャ再生 (?replay=1) 中は live 系の口が
-// 呼ばれても 'mode: replay' のままにする (合成でないことを見失わない)。
-let replayOn = false;
-function noteLiveMode() {
-  document.getElementById('mode').textContent =
-    replayOn ? 'mode: replay' : 'mode: live (telemetry)';
-}
-
 function handleFrame(f) {
   liveState.frames++;
   switch (f.kind) {
     case 'ServerInfo':
-      // 再生中は WS を開いていないので、状態欄は 'off (replay)' のままにする
       hudEl.ws.textContent = replayOn ? 'off (replay)' : 'connected (' + (f.model || 'flash') + ')';
       break;
     case 'Prefill':
@@ -654,9 +798,6 @@ function handleFrame(f) {
       break;
     case 'LayerAct':
       window.onLayerActivation(f.layer, f.idx, f.val);
-      hudEl.cur.textContent = String(f.layer).padStart(2, '0');
-      hudEl.curkind.textContent = isQSA(f.layer) ? 'QSA' : 'GDN';
-      hudEl.curkind.className = isQSA(f.layer) ? 'qsa' : 'gdn';
       break;
     case 'RoleAct':
       window.onRoleActivation(f.layer, f.roles);
@@ -702,36 +843,24 @@ function connectLive() {
   ws.onerror = () => { try { ws.close(); } catch (e) {} };
 }
 
-// ===== キャプチャ再生 (?replay=1) ==========================================
-// GET /capture.bin (サーバ側 VIEW_CAPTURE の連結フレーム列) を fetch し、
-// 先頭から decodeFrame で 1 ステップ 1 フレームずつ handleFrame に流す。
-// WS は開かない (再接続タイマーも張らない)。末尾まで来たら先頭に戻る。
-// キャプチャが無い (404) ときは従来どおりのデモに落ちる。
+// ===== キャプチャ再生 (?replay=1) =========================================
 const cap = { buf: null, off: 0, frames: 0, bad: 0 };
-window.__replay = cap;     // ヘッドレス検証用 (frames = 流したフレーム数)
-
-/** 壊れたフレームのあと、次の "DNTL" まで進める。無ければ末尾。 */
+window.__replay = cap;
 function replayResync(buf, from) {
   for (let i = from; i + 3 < buf.length; i++) {
     if (buf[i] === 0x44 && buf[i + 1] === 0x4e && buf[i + 2] === 0x54 && buf[i + 3] === 0x4c) return i;
   }
   return buf.length;
 }
-
-/** 1 ステップぶん = 1 フレーム。流せたら true。 */
 function replayStep() {
   const buf = cap.buf;
   if (!buf || buf.length < 6) return false;
-  if (cap.off >= buf.length) cap.off = 0;                  // 末尾 → 先頭 (ループ)
+  if (cap.off >= buf.length) cap.off = 0;
   let r;
   try {
     r = decodeFrame(buf, cap.off);
   } catch (e) {
-    if (e instanceof FrameDecodeError && e.partial) {
-      cap.off = 0;                                         // 末尾が途中で切れている
-      return false;
-    }
-    // 壊れたフレームは次の magic へ飛ばす (再生を止めない)
+    if (e instanceof FrameDecodeError && e.partial) { cap.off = 0; return false; }
     cap.bad++;
     cap.off = replayResync(buf, cap.off + 1);
     if (cap.off >= buf.length) cap.off = 0;
@@ -742,8 +871,6 @@ function replayStep() {
   handleFrame(r.frame);
   return true;
 }
-
-/** /capture.bin を読む。読めたら true (false = デモに落とす)。 */
 async function startReplay() {
   replayOn = true;
   hudEl.ws.textContent = 'off (replay)';
@@ -765,17 +892,102 @@ async function startReplay() {
   return true;
 }
 
-addEventListener('keydown', (e) => { if (e.code === 'Space') { demo.paused = !demo.paused; e.preventDefault(); } });
+// ===== ビューワ内チャット ==================================================
+// 既定は同一オリジンの /chat (denno-view が上流 8098 の /v1/messages へ中継し、SSE を素通しする)。
+// ?api=http://host:8098 を渡すと直接つなぐ。
+const CHAT_API = Q.get('api') || '';
+const CHAT_URL = CHAT_API ? CHAT_API + '/v1/messages' : '/chat';
+const chatEl = {
+  log: document.getElementById('log'), inp: document.getElementById('in'),
+  send: document.getElementById('send'), meta: document.getElementById('cmeta'),
+  box: document.getElementById('chat'), ep: document.getElementById('endpoint')
+};
+chatEl.ep.textContent = CHAT_API ? CHAT_API.replace(/^https?:\/\//, '') + ' (direct)' : '/chat → 8098';
+const hist = [];
+let busy = false;
 
-// ?shot — 固定ステップ数だけ進めて canvas を #dump に書き出す (ヘッドレス検証用)。
-// 再生中 (?replay=1) は 1 ステップ 1 フレームでキャプチャを流してから書き出す。
+function addLine(cls, text) {
+  const d = document.createElement('div');
+  d.className = cls; d.textContent = text;
+  chatEl.log.appendChild(d);
+  chatEl.log.scrollTop = chatEl.log.scrollHeight;
+  return d;
+}
+
+async function sendMsg(text) {
+  if (busy || !text.trim()) return;
+  busy = true; chatEl.send.disabled = true;
+  addLine('u', '> ' + text);
+  chatEl.inp.value = '';
+  hist.push({ role: 'user', content: text });
+  const node = addLine('a', '');
+  const t0 = performance.now();
+  let acc = '', usage = null, err = null;
+  try {
+    const body = { model: 'denno', max_tokens: 512, stream: true, messages: hist.slice(-12) };
+    const res = await fetch(CHAT_URL, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 200));
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buf += dec.decode(chunk.value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const ev = buf.slice(0, i); buf = buf.slice(i + 2);
+        let data = '';
+        for (const L of ev.split('\n')) if (L.startsWith('data: ')) data += L.slice(6);
+        if (!data) continue;
+        let j; try { j = JSON.parse(data); } catch (e) { continue; }
+        if (j.type === 'content_block_delta' && j.delta && j.delta.text) {
+          acc += j.delta.text; node.textContent = acc;
+          chatEl.log.scrollTop = chatEl.log.scrollHeight;
+        } else if (j.type === 'message_delta' && j.usage) {
+          usage = j.usage;
+        } else if (j.type === 'error') {
+          err = (j.error && j.error.message) || 'error';
+        }
+      }
+    }
+  } catch (e) {
+    err = (e && e.message) ? e.message : String(e);
+  }
+  const secs = (performance.now() - t0) / 1000;
+  if (err) addLine('e', '[error] ' + err);
+  if (!acc && !err) node.textContent = '(空の応答)';
+  hist.push({ role: 'assistant', content: acc || '' });
+  const nOut = usage ? usage.output_tokens : null;
+  const nIn = usage ? usage.input_tokens : null;
+  chatEl.meta.textContent = (err ? 'error' : 'ok') + ' · ' + secs.toFixed(1) + ' s' +
+    (nOut ? ' · ' + nOut + ' tok (' + (nOut / secs).toFixed(1) + ' tok/s)' : '') +
+    (nIn ? ' · in ' + nIn : '') + ' · ' + (CHAT_API ? CHAT_API.replace(/^https?:\/\//, '') : 'local /chat');
+  busy = false; chatEl.send.disabled = false;
+}
+
+chatEl.send.addEventListener('click', () => sendMsg(chatEl.inp.value));
+chatEl.inp.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(chatEl.inp.value); }
+});
+document.getElementById('clear').addEventListener('click', () => {
+  hist.length = 0; chatEl.log.innerHTML = ''; chatEl.meta.textContent = '';
+});
+document.getElementById('hidec').addEventListener('click', () => chatEl.box.classList.add('hide'));
+addEventListener('keydown', (e) => {
+  if (e.target && /input|textarea/i.test(e.target.tagName)) return;
+  if (e.code === 'Space') { demo.paused = !demo.paused; e.preventDefault(); }
+  if (e.key === 'c') chatEl.box.classList.toggle('hide');
+});
+
+// ?shot — 固定ステップ数だけ進めて canvas を #dump に書き出す
 function shotRun() {
   const steps = parseInt(Q.get('steps') || '170', 10);
-  // 再生 (?replay=1) は fetch の後に rAF の連鎖が続かないことがある (headless の
-  // 仮想時間だと 2 回目以降のコールバックが来ない)。toDataURL は
-  // preserveDrawingBuffer で読むので、1 タスクで回しきって構わない。
   if (replayOn) {
-    for (let i = 0; i < steps; i++) { step(0.016); replayStep(); }
+    // 再生中は fetch 後の rAF 連鎖が headless で途切れるので、1 タスクで回しきる。
+    for (let i = 0; i < steps; i++) { step(0.016, i === steps - 1); replayStep(); }
     window.__viewReady = true; hud();
     document.getElementById('fps').textContent = 'shot';
     document.getElementById('dump').textContent = canvas.toDataURL('image/png');
@@ -783,25 +995,14 @@ function shotRun() {
       'replay: ' + cap.frames + ' frames / ' + cap.buf.length + ' B (bad ' + cap.bad + ')';
     return;
   }
-  let i = 0;
-  const tick = () => {
-    step(0.016);
-    if (replayOn) replayStep();
-    if (++i < steps) return requestAnimationFrame(tick);
-    window.__viewReady = true; hud();
-    document.getElementById('fps').textContent = 'shot';
-    document.getElementById('dump').textContent = canvas.toDataURL('image/png');
-    if (replayOn) {
-      document.getElementById('live_done').textContent =
-        'replay: ' + cap.frames + ' frames / ' + cap.buf.length + ' B (bad ' + cap.bad + ')';
-    }
-  };
-  requestAnimationFrame(tick);
+  // headless では rAF の連鎖が続かないことがあるので、1 タスクで回し切る。
+  for (let i = 0; i < steps; i++) step(0.016, i === steps - 1);
+  window.__viewReady = true; hud();
+  document.getElementById('fps').textContent = 'shot';
+  document.getElementById('dump').textContent = canvas.toDataURL('image/png');
 }
 
 if (Q.get('live')) {
-  // ?live=<秒> — 実テレメトリを <秒> だけ受け、WS を閉じてから canvas を書き出す
-  // (開いたままだと仮想時間が進まず headless が終わらない)
   const secs = Math.max(1, parseInt(Q.get('live'), 10) || 8);
   liveReconnect = false;
   connectLive();
@@ -817,8 +1018,6 @@ if (Q.get('live')) {
   };
   requestAnimationFrame(tick);
 } else if (Q.get('replay')) {
-  // ?replay=1 — /capture.bin の実フレーム列を流す。WS は開かない (再接続もしない)。
-  // キャプチャが無い (404) ときはデモに落としてビューワを壊さない。
   startReplay().then((ok) => {
     if (ok) {
       if (Q.get('shot')) shotRun(); else frame();
