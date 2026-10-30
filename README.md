@@ -52,10 +52,10 @@ Older numbers, rejected experiments and the protocol that defines "official" liv
 
 ```bash
 # 1. download the model (into the HF hub cache ~/.cache/denno/hub)
-cargo run --release -- pull Qwen/Qwen2.5-0.5B-Instruct
+cargo run --release -p denno-cli -- pull Qwen/Qwen2.5-0.5B-Instruct
 
 # 2. start the server (fixed seed for exact decoding)
-cargo run --release -- serve Qwen/Qwen2.5-0.5B-Instruct --name denno --port 8080 --seed 42
+cargo run --release -p denno-cli -- serve Qwen/Qwen2.5-0.5B-Instruct --name denno --port 8080 --seed 42
 
 # 3. call the API (Anthropic Messages format)
 curl http://127.0.0.1:8080/v1/messages \
@@ -67,8 +67,8 @@ curl http://127.0.0.1:8080/v1/messages \
 Generate directly from the CLI:
 
 ```bash
-cargo run --release -- generate Qwen/Qwen2.5-0.5B-Instruct --prompt "1+1=?" --temperature 0 --seed 42
-cargo run --release -- generate openai-community/gpt2 --prompt "The capital of France is" --raw --seed 42
+cargo run --release -p denno-cli -- generate Qwen/Qwen2.5-0.5B-Instruct --prompt "1+1=?" --temperature 0 --seed 42
+cargo run --release -p denno-cli -- generate openai-community/gpt2 --prompt "The capital of France is" --raw --seed 42
 ```
 
 It also works as-is with the official Anthropic Python SDK:
@@ -83,10 +83,13 @@ print(c.messages.create(model="denno", max_tokens=128,
 ### Flash-Next
 
 ```bash
+# the cuda feature lives on denno-engine, so build both packages, then run the binary
+cargo build --release --features cuda -p denno-cli -p denno-engine
+
 # --dir points at the directory holding the split GGUF shards
-DENNO_CUDA=1 cargo run --release --features cuda -- \
-  serve-flash --dir /models/Qwen3.8-Flash-Next/UD-Q4_K_XL \
-              --port 8098 --max-ctx 65536 --max-tokens 1024
+DENNO_CUDA=1 ./target/release/denno serve-flash \
+  --dir /models/Qwen3.8-Flash-Next/UD-Q4_K_XL \
+  --port 8098 --max-ctx 65536 --max-tokens 1024
 ```
 
 The request format is the same `/v1/messages`; only the model id differs. Environment knobs that matter in practice:
@@ -104,7 +107,7 @@ The request format is the same `/v1/messages`; only the model id differs. Enviro
 
 ```bash
 # 1. start the server with telemetry on (same command plus DENNO_TELEMETRY=1)
-DENNO_TELEMETRY=1 cargo run --release -- serve Qwen/Qwen2.5-0.5B-Instruct --name denno --port 8080 --seed 42
+DENNO_TELEMETRY=1 cargo run --release -p denno-cli -- serve Qwen/Qwen2.5-0.5B-Instruct --name denno --port 8080 --seed 42
 
 # 2. in another terminal, start denno-view
 #    (defaults to the telemetry WS at ws://127.0.0.1:8080, listens on :8093)

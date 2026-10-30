@@ -52,10 +52,10 @@ Flash-Next の decode 内訳(入力 49 + 出力 128 トークン、193.9 ms/toke
 
 ```bash
 # 1. モデルのダウンロード(HF hub キャッシュ ~/.cache/denno/hub に入る)
-cargo run --release -- pull Qwen/Qwen2.5-0.5B-Instruct
+cargo run --release -p denno-cli -- pull Qwen/Qwen2.5-0.5B-Instruct
 
 # 2. サーバー起動(seed 固定で exact decoding)
-cargo run --release -- serve Qwen/Qwen2.5-0.5B-Instruct --name denno --port 8080 --seed 42
+cargo run --release -p denno-cli -- serve Qwen/Qwen2.5-0.5B-Instruct --name denno --port 8080 --seed 42
 
 # 3. API を叩く(Anthropic Messages 形式)
 curl http://127.0.0.1:8080/v1/messages \
@@ -67,8 +67,8 @@ curl http://127.0.0.1:8080/v1/messages \
 CLI で直接生成することもできる:
 
 ```bash
-cargo run --release -- generate Qwen/Qwen2.5-0.5B-Instruct --prompt "1+1は?" --temperature 0 --seed 42
-cargo run --release -- generate openai-community/gpt2 --prompt "The capital of France is" --raw --seed 42
+cargo run --release -p denno-cli -- generate Qwen/Qwen2.5-0.5B-Instruct --prompt "1+1は?" --temperature 0 --seed 42
+cargo run --release -p denno-cli -- generate openai-community/gpt2 --prompt "The capital of France is" --raw --seed 42
 ```
 
 Anthropic 公式の Python SDK からもそのまま使える:
@@ -83,10 +83,13 @@ print(c.messages.create(model="denno", max_tokens=128,
 ### Flash-Next
 
 ```bash
+# cuda フィーチャは denno-engine 側にあるので、両方をビルドしてからバイナリを直接起動する
+cargo build --release --features cuda -p denno-cli -p denno-engine
+
 # --dir は分割 GGUF が置かれたディレクトリ
-DENNO_CUDA=1 cargo run --release --features cuda -- \
-  serve-flash --dir /models/Qwen3.8-Flash-Next/UD-Q4_K_XL \
-              --port 8098 --max-ctx 65536 --max-tokens 1024
+DENNO_CUDA=1 ./target/release/denno serve-flash \
+  --dir /models/Qwen3.8-Flash-Next/UD-Q4_K_XL \
+  --port 8098 --max-ctx 65536 --max-tokens 1024
 ```
 
 リクエスト形式は同じ `/v1/messages` で、変わるのはモデル ID だけ。実運用で効く環境変数:
@@ -104,7 +107,7 @@ DENNO_CUDA=1 cargo run --release --features cuda -- \
 
 ```bash
 # 1. サーバーをテレメトリ ON で起てる(DENNO_TELEMETRY=1 以外は同一コマンド)
-DENNO_TELEMETRY=1 cargo run --release -- serve Qwen/Qwen2.5-0.5B-Instruct --name denno --port 8080 --seed 42
+DENNO_TELEMETRY=1 cargo run --release -p denno-cli -- serve Qwen/Qwen2.5-0.5B-Instruct --name denno --port 8080 --seed 42
 
 # 2. 別ターミナルで denno-view を起動
 #    (既定で ws://127.0.0.1:8080 のテレメトリ WS に接続し、:8093 で待受)
