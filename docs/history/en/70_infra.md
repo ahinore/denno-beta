@@ -270,3 +270,53 @@ does not break down.
 - **Committing everything with `git add -A`** — pulled in 43,249 files and required rewriting history.
 - **Starting a new task on a stale base of the shared tree** — causes rework at integration. Check the base
   before starting.
+
+---
+
+## 9. Visualisation — the real structure, lit by real data (P58)
+
+`denno-view` sits next to the inference server, subscribes to the telemetry WebSocket and draws it in 3D. It exists
+for two reasons: to see **what the implementation actually selects and where it ran**, and to keep the shape of the
+layers visibly honest against the measured weights.
+
+**Structure (numbers from the GGUF header)**
+
+- 48 layers as 12 hybrid blocks (`full_attention_interval = 4`), each block = 1 QSA + 3 GDN.
+- Inside a layer: neuron wall -> residual -> mixer (QSA/GDN) -> gate -> router -> 512 experts (32x16) -> shared
+  expert -> GR read/write (hyper-connection, 4 branches, low_rank 320). Experts sit on three heights:
+  VRAM / RAM / SSD.
+- On the input side, Vocabulary Embedding plus the N-gram Embedding Layer (`ple.layers = [1]`, so layer 2 only,
+  16 heads); Prediction Head on top. MTP is not in these weights and is drawn dashed.
+
+**One-to-one mapping**
+
+- Each layer carries 2560 small boxes in a 64x40 grid; the `idx` of a `LayerAct` frame is used directly as the box
+  index. `LayerAct` reports the top 64 entries of the residual stream by |x|, so a lit box is that neuron of that
+  layer.
+- Expert selection is drawn only from `RouterTopK` (indices and weights). Treating `LayerAct` indices as expert ids
+  is wrong — they are hidden-dimension indices 0..2559. v5 fixes that mix-up.
+- VRAM / RAM / SSD residency comes from `ExpertResidency` and `TierStats`; promotions and demotions show up as
+  changes in height.
+
+**Measured**
+
+- One `POST /chat` (24 tokens) produced **1,570 frames / 164 KB** on the WebSocket: `LayerAct 480`
+  (48 layers x 10 tokens), `RoleAct 480`, `RouterTopK 480`, `ExpertResidency 96`, `TierStats 1`, and 9 each of
+  `Token`/`Step`.
+- Headless checks use `?shot=1&replay=1`, which replays a recorded WebSocket capture one frame per step: 240
+  frames gave a 560,913-byte canvas with zero decode errors. `?shot=1` also runs its whole loop inside one task,
+  because the rAF chain does not continue in headless mode. `?live=<seconds>` cannot be captured — while the
+  WebSocket is open the virtual clock does not advance.
+
+**Chat**
+
+- The input box in the viewer posts to the same-origin `POST /chat`; `denno-view` relays to the upstream
+  `/v1/messages` (Anthropic-compatible) and streams the SSE without buffering (`reqwest` with the `stream`
+  feature). Every message drives the telemetry, so the layers light up while the answer is being written.
+
+**Rejected here**
+
+- `?live=<seconds>` under headless capture — the virtual clock stalls with an open WebSocket (`exit 124`).
+- Spreading the three tiers to +/-8.6 — too tall against the 48 x 2.3 layer depth; the layers stop reading.
+  Kept at +/-7.0.
+

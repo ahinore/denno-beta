@@ -238,3 +238,48 @@ CUPTI の activity は権限不要で動く。
 - **`pgrep -f` でサーバを止める** — 自分のコマンドラインに一致して自滅する（exit 143）。pid を先に取る。
 - **`git add -A` でまとめて commit する** — 43,249 ファイルを巻き込み、履歴の書き換えが必要になった。
 - **共有ツリーの古い base のまま新タスクを始める** — 統合時に手戻りする。開始前に base を確認する。
+
+---
+
+## 9. 可視化 — 実構造のまま、実データで光らせる (P58)
+
+推論サーバーの隣に `denno-view` を置き、テレメトリ WS を購読して 3D で描く。目的は 2 つ。
+実装が**実際に何を選び、どこが動いたか**を目で確かめることと、層の形が**重みの実測**と食い違っていないかを
+毎回見えるようにしておくこと。
+
+**構造 (数は GGUF ヘッダの実測値)**
+
+- 48 層を `full_attention_interval = 4` の hybrid block 12 個として並べる（各ブロック = 1 QSA + 3 GDN）。
+- 各層の中は ニューロン壁 → 残差 → mixer (QSA/GDN) → gate → router → expert 512 個（32×16）→ shared expert
+  → GR read/write (hyper-connection, 4 本 / low_rank 320) の順。expert は VRAM / RAM / SSD の 3 段の高さに載る。
+- 入力側に Vocabulary Embedding と N-gram Embedding Layer（`ple.layers = [1]` なので layer 2 のみ、16 head）、
+  上端に Prediction Head。MTP はこの重みに無いので破線扱いで置く。
+
+**1:1 の対応**
+
+- 層ごとに 2560 個の小箱を 64×40 で敷き、`LayerAct` の `idx` をそのまま箱の index に当てる。
+  `LayerAct` は残差ストリームで |x| の上位 64 個を送る（`layer_act_frame(il, stream, 64)`）ので、
+  光っている箱は「その層のそのニューロン」と 1 対 1 で対応する。
+- expert の選択は `RouterTopK`（index と重み）だけで描く。**`LayerAct` の index を expert として扱うのは誤り**
+  （実際は 0..2559 の隠れ次元 index）。v5 でこの取り違えを直した。
+- VRAM / RAM / SSD の在庫は `ExpertResidency` と `TierStats`。位置の移動（昇格・降格）はそのまま高さの変化になる。
+
+**実測**
+
+- `POST /chat` 1 回（24 tok）で WS は **1,570 フレーム / 164 KB**。内訳は `LayerAct 480`（48 層 × 10 トークン）、
+  `RoleAct 480`、`RouterTopK 480`、`ExpertResidency 96`、`TierStats 1`、`Token`/`Step` 各 9。
+- ヘッドレス検証は `?shot=1&replay=1`（記録した WS キャプチャを 1 ステップ 1 フレームで再生）。240 フレームで
+  canvas 560,913 B、デコードエラー 0。`?shot=1` も replay と同じく 1 タスクで回し切る（rAF の連鎖は
+  headless では続かない）。`?live=<秒>` は WS が開いていると仮想時間が進まず撮れない。
+
+**チャット**
+
+- ビューワ右下の入力欄は同一オリジンの `POST /chat`。`denno-view` が上流の `/v1/messages`（Anthropic 互換）へ
+  中継し、SSE をバッファせず流す（`reqwest` の `stream` feature を使う）。送信ごとにテレメトリが流れるので、
+  応答が伸びるのと同じ瞬間に層が光る。
+
+**この節の棄却**
+
+- `?live=<秒>` のヘッドレス撮影 — WS が開いていると Chrome の仮想時間が進まず `exit 124`。
+- 3 階層の高さを ±8.6 に広げる — 48 層 × 2.3 の奥行きに対して縦に伸びすぎ、層が読めなくなる。±7.0 に戻した。
+
