@@ -71,7 +71,7 @@ __device__ __forceinline__ void dno_scale_min_k4_v3(int j, const unsigned char* 
     }
 }
 
-#define MOE_V3_ROWS_DEFAULT 64
+#define MOE_V3_ROWS_DEFAULT 8  // main の実測で rows 8 が最良 (decode 122.6 ms/token)
 #define MOE_V3_LANES_MAX 4
 
 // 行番号とレーン番号。lanes レーンが同一行を担当し、スレッド番号が連続する

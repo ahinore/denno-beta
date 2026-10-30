@@ -1344,7 +1344,7 @@ impl CudaCtx {
         // P-gemv3: 1 行を lanes レーン (4 or 2) で分担する版 (kernels_moe_v3.cu)。
         // 共有メモリ無し (行の生バイトをステージしない) ので、起動形状も v2 と違う。
         // blockDim = rows_per_block * lanes、rows_per_block は DENNO_GEMV_V3_ROWS
-        // (8/16/32/64・既定 64)。k が lanes で割り切れない / v3 の PTX が無い /
+        // (8/16/32/64・既定 8)。k が lanes で割り切れない / v3 の PTX が無い /
         // PTX が旧 ABI (引数 6 本) のときは v2 の 4 行/ブロック + 行ステージングへ落ちる。
         let v3 = if want_v3 {
             let lanes = moe_gemv_v3_lanes(n_in);
@@ -1769,12 +1769,12 @@ pub fn moe_gemv_v3_k_ok(k: usize) -> bool {
     moe_gemv_v3_lanes(k) > 0
 }
 
-/// v3 の 1 ブロックあたりの行数 (`DENNO_GEMV_V3_ROWS`、既定 64)。
+/// v3 の 1 ブロックあたりの行数 (`DENNO_GEMV_V3_ROWS`、既定 8)。
 ///
 /// 8 / 16 / 32 / 64 のどれか。それ以外 (未設定・空・数値でない・対象外の値) は 64。
 /// blockDim = rows * lanes、grid = ceil(n_out / rows) になる。n_out=2560 の形状では
 /// rows=64 で 40 block、rows=8 で 320 block (5090 の 170 SM を埋める)。
-/// 既定 64 は kernels_moe_v3.cu の MOE_V3_ROWS_DEFAULT と一致させること。
+/// 既定 8 は main の実測 (rows 8 が最良) による。kernels_moe_v3.cu の MOE_V3_ROWS_DEFAULT は引数の既定値なので、実際の値はホスト側が渡す。
 pub fn moe_gemv_v3_rows() -> usize {
     // テストが rows を振って 1 プロセスで全組み合わせを回すための上書き
     // (0 = env を見る)。env は OnceLock で 1 回しか読めないため。
@@ -1810,13 +1810,17 @@ pub(crate) fn set_v3_rows_for_test(rows: usize) {
 }
 
 /// `DENNO_GEMV_V3_ROWS` の生値 → rows/block (純関数。真理値表はテストで固定)。
+///
+/// 既定は 8 (main の実測: rows 8 / 16 / 32 / 64 で decode 122.6 / 142.3 / 135.0 /
+/// 132.3 ms/token。8 は blockDim = 8 x 4 = 32 = 1 warp で、n_out=2560 でも
+/// grid が 320 block になり 170 SM を埋められるため)。
 pub fn parse_v3_rows(raw: Option<&str>) -> usize {
     match raw.map(str::trim) {
         Some("8") => 8,
         Some("16") => 16,
         Some("32") => 32,
         Some("64") => 64,
-        _ => 64,
+        _ => 8,
     }
 }
 
@@ -12902,19 +12906,19 @@ mod tests {
         assert!(moe_gemv_v3_k_ok(320) && moe_gemv_v3_k_ok(2560));
         assert!(!moe_gemv_v3_k_ok(1000));
 
-        // DENNO_GEMV_V3_ROWS: 8/16/32/64 だけを通し、他は既定 64。
+        // DENNO_GEMV_V3_ROWS: 8/16/32/64 だけを通し、他は既定 8 (main の実測で最良)。
         let table: [(Option<&str>, usize); 11] = [
             (Some("8"), 8),
             (Some("16"), 16),
             (Some("32"), 32),
             (Some("64"), 64),
             (Some(" 32 "), 32),
-            (None, 64),
-            (Some(""), 64),
-            (Some("0"), 64),
-            (Some("128"), 64),
-            (Some("abc"), 64),
-            (Some("-16"), 64),
+            (None, 8),
+            (Some(""), 8),
+            (Some("0"), 8),
+            (Some("128"), 8),
+            (Some("abc"), 8),
+            (Some("-16"), 8),
         ];
         for (raw, want) in table {
             assert_eq!(parse_v3_rows(raw), want, "DENNO_GEMV_V3_ROWS={raw:?}");
