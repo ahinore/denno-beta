@@ -571,10 +571,10 @@ function paintTokens() {
 // (Frame::TopK、確率は f16)。chosen がそのステップで選ばれた id。
 const CANDN = 8;
 const candInst = new THREE.InstancedMesh(
-  new THREE.BoxGeometry(0.26, 1, 0.26),
+  new THREE.BoxGeometry(0.95, 1, 0.95),
   new THREE.MeshBasicMaterial({ color: 0xffffff }), CANDN);
 candInst.frustumCulled = false;
-const CAND_X0 = -8.1, CAND_DX = 0.44, CAND_Z = topZ + 1.4;
+const CAND_X0 = -9.6, CAND_DX = 1.30, CAND_Z = topZ + 2.2;
 for (let i = 0; i < CANDN; i++) {
   m4.makeTranslation(CAND_X0 + i * CAND_DX, 0.9, CAND_Z);
   m4.scale(new THREE.Vector3(1, 0.02, 1));
@@ -583,7 +583,7 @@ for (let i = 0; i < CANDN; i++) {
 }
 candInst.instanceMatrix.needsUpdate = true; candInst.instanceColor.needsUpdate = true;
 scene.add(candInst);
-label('候補 top-8 (実 logits, softmax 前の分布)', '#fff2b0', 5.2, -6.5, 2.4, CAND_Z);
+label('候補 top-8 (実 logits の softmax 確率 / 白 = 選ばれた)', '#fff2b0', 7.6, -4.6, 7.4, CAND_Z);
 let cands = [], candChosen = -1, candPulse = 0;
 
 function paintCands() {
@@ -591,7 +591,7 @@ function paintCands() {
   for (let i = 0; i < CANDN; i++) {
     const e = cands[i];
     const pr = e ? Math.max(0.004, e[1]) : 0;
-    const h = 0.05 + Math.min(1, Math.sqrt(pr) * 1.5) * 2.0;
+    const h = 0.12 + Math.min(1, Math.sqrt(pr) * 1.5) * 6.0;
     m4.makeTranslation(CAND_X0 + i * CAND_DX, 0.9 + h / 2 - 1.0, CAND_Z);
     m4.scale(new THREE.Vector3(1, h, 1));
     candInst.setMatrixAt(i, m4);
@@ -677,6 +677,19 @@ window.onTopK = function (f) {
   });
 };
 
+// 入力テキストをチャット欄から tokenizer の箱へ飛ばし、着いたらトークン列を光らせる。
+// 実際のトークン id は Prefill フレームで届くので、ここは「文字列が届く」演出。
+function animateInputText(text) {
+  const from = screenPoint(document.getElementById('chat'), 0.5, 0.86, 26);
+  const to = new THREE.Vector3(-12.6, TOK_Y, TOK_Z);
+  const disp = text.length > 26 ? text.slice(0, 26) + '…' : text;
+  flyText(disp, '#8fe6ff', 6.4, from, to, 0.95, () => {
+    inpPulse = 1;
+    tokRamp.t = 0; tokRamp.lit = 0;     // 着地したら 1 個ずつ作る
+  });
+}
+window.__animateInputText = animateInputText;
+
 // ===== 12) フライトモード (WASD + クォータニオンで自由視点) ===============
 // 俯瞰の回転モード (OrbitControls) とは別。f で入る。Esc か f で戻る。
 const fly = { on: false, keys: new Set(), sens: 0.0022, speed: 16, savedTarget: new THREE.Vector3() };
@@ -688,7 +701,14 @@ function enterFly() {
   fly.savedTarget.copy(controls.target);
   fly.keys.clear();
   hudEl.mode.textContent = 'mode: fly (WASD 移動 / マウス視点 / Shift 加速 / Q E 上下 / Esc 解除)';
-  if (canvas.requestPointerLock) { try { canvas.requestPointerLock(); } catch (e) {} }
+  hudEl.mode.style.color = '#7ff0ff';
+  if (canvas.requestPointerLock) {
+    try {
+      const p = canvas.requestPointerLock();
+      // ユーザー操作なし (headless など) では reject する。握りつぶす。
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+  }
 }
 function exitFly() {
   fly.on = false;
@@ -699,6 +719,7 @@ function exitFly() {
   const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
   controls.target.copy(camera.position).addScaledVector(fwd, 10);
   controls.update();
+  hudEl.mode.style.color = '';
   hudEl.mode.textContent = replayOn ? 'mode: replay' : 'mode: live (telemetry)';
 }
 addEventListener('pointermove', (e) => {
@@ -755,6 +776,8 @@ const ROLE_KEYS = ['attn', 'gdn', 'router', 'shex', 'ple'];
 // 正規化されるので 0.04 前後と小さい。そのままだと見えないので、光は減衰つきの
 // パルスにして、実値は HUD に数字で出す (見た目と数字を混同しないため)。
 let pleVal = 0, plePulse = 0;
+// tokenizer に着いたあと、トークン列を 1 個ずつ点けていく演出 (t: 0->1 で 24 個)
+const tokRamp = { t: 1, lit: 0 };
 const roleTarget = {}, roleCur = {};
 for (const k of ROLE_KEYS) { roleTarget[k] = new Float32Array(LAYERS).fill(-1); roleCur[k] = new Float32Array(LAYERS); }
 
@@ -935,6 +958,14 @@ function step(dt, doRender) {
     inpGeo.attributes.position.needsUpdate = true; inpGeo.attributes.color.needsUpdate = true;
   }
 
+  // トークンが作られていく様子
+  if (tokRamp.t < 1) {
+    tokRamp.t = Math.min(1, tokRamp.t + dt * 2.4);
+    const n = Math.floor(tokRamp.t * 24);
+    for (let i = tokRamp.lit; i < n; i++) tokAct[i] = 0.92;
+    if (n !== tokRamp.lit) { tokRamp.lit = n; paintTokens(); }
+  }
+
   // トークン列の減衰
   let tokAny = 0;
   for (let i = 0; i < TOKN; i++) {
@@ -1028,6 +1059,7 @@ const hudEl = {
 const liveState = { tokens: 0, lastStepMs: 0, prefillMs: 0, frames: 0 };
 let replayOn = false;
 function noteLiveMode() {
+  if (fly.on) return;   // フライト中の案内を消さない
   hudEl.mode.textContent = replayOn ? 'mode: replay' : 'mode: live (telemetry)';
 }
 
@@ -1297,16 +1329,7 @@ async function sendMsg(text) {
   if (busy || !text.trim()) return;
   busy = true; chatEl.send.disabled = true;
   addLine('u', '> ' + text);
-  // 入力テキストをチャット欄から tokenizer の箱へ飛ばし、着いたらトークン列を光らせる
-  if (typeof flyText === 'function') {
-    const from = screenPoint(document.getElementById('chat'), 0.5, 0.86, 26);
-    const to = new THREE.Vector3(-12.6, TOK_Y, TOK_Z);
-    flyText(text.length > 24 ? text.slice(0, 24) + '...' : text, '#8fe6ff', 6.2, from, to, 0.95, () => {
-      inpPulse = 1;
-      for (let i = 0; i < 24; i++) tokAct[i] = 0.9;
-      paintTokens();
-    });
-  }
+  animateInputText(text);
   chatEl.inp.value = '';
   hist.push({ role: 'user', content: text });
   const node = addLine('a', '');
@@ -1374,9 +1397,13 @@ addEventListener('keydown', (e) => {
 // ?shot — 固定ステップ数だけ進めて canvas を #dump に書き出す
 function shotRun() {
   const steps = parseInt(Q.get('steps') || '170', 10);
+  if (Q.get('fly')) { enterFly(); fly.keys.add('KeyW'); }   // 検証用: フライトモードで前進
   if (replayOn) {
     // 再生中は fetch 後の rAF 連鎖が headless で途切れるので、1 タスクで回しきる。
-    for (let i = 0; i < steps; i++) { step(0.016, i === steps - 1); replayStep(); }
+    for (let i = 0; i < steps; i++) {
+      if (i === 3 && Q.get('flyin')) animateInputText(Q.get('flyin'));
+      step(0.016, i === steps - 1); replayStep();
+    }
     window.__viewReady = true; hud();
     document.getElementById('fps').textContent = 'shot';
     document.getElementById('dump').textContent = canvas.toDataURL('image/png');
