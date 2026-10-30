@@ -19,13 +19,15 @@
 #
 # アーキは既存の PTX と同じ compute_75 (JIT で実機の arch に落ちる)。
 # 変えたいときは DENNO_PTX_ARCH=compute_120 など。
+#
+# 終了コード: 0 = 生成した / 2 = 引数が不正 / 127 = nvcc が無い。
 set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
+targets_all=(int8 elem gdn moe moe_batch moe_v2 gemm gemm_grouped moe_v3)
 
-# 名前 -> "ソース|fmad" (fmad: nofmad = -fmad=false / fmad = 既定)
-targets_all=(int8 elem gdn moe moe_batch moe_v2 gemm gemm_grouped)
+# 名前 -> "ソース|fmad" (fmad: nofmad = -fmad=false / fmad = 既定)。未知は 1。
 spec() {
     case "$1" in
         int8)         echo "kernels_int8.cu|nofmad" ;;
@@ -41,47 +43,43 @@ spec() {
     esac
 }
 
-list_all() { printf '%s\n' "${targets_all[@]}" moe_v3 | sort -u; }
+require() {
+    spec "$1" >/dev/null || { echo "unknown target: $1 (--list を見る)" >&2; exit 2; }
+}
 
 compile() {
     local name="$1" src mode
-    src=$(spec "$name") || { echo "unknown target: $name" >&2; exit 2; }
+    require "$name"
+    src=$(spec "$name")
     mode="${src##*|}"
     src="${src%%|*}"
-    if [ ! -f "$src" ]; then
-        echo "missing source: $src" >&2
-        exit 2
-    fi
+    [ -f "$src" ] || { echo "missing source: $src" >&2; exit 2; }
     case "$mode" in
-        nofmad)
-            echo "+ nvcc -ptx -arch=$ARCH -fmad=false -O3 $src -o kernels_$name.ptx"
-            nvcc -ptx -arch="$ARCH" -fmad=false -O3 "$src" -o "kernels_$name.ptx"
-            ;;
-        fmad)
-            echo "+ nvcc -ptx -arch=$ARCH -O3 $src -o kernels_$name.ptx"
-            nvcc -ptx -arch="$ARCH" -O3 "$src" -o "kernels_$name.ptx"
-            ;;
-        *) echo "bad mode: $mode" >&2; exit 2 ;;
+        nofmad) set -- -ptx -arch="$ARCH" -fmad=false -O3 "$src" -o "kernels_$name.ptx" ;;
+        fmad)   set -- -ptx -arch="$ARCH" -O3 "$src" -o "kernels_$name.ptx" ;;
     esac
+    echo "+ nvcc $*"
+    nvcc "$@"
 }
 
-if [ "${1:-}" = "--list" ]; then
-    list_all
-    exit 0
-fi
+case "${1:-}" in
+    --list) printf '%s\n' "${targets_all[@]}"; exit 0 ;;
+esac
+[ "$#" -gt 0 ] || set -- moe_v3
+
+# 引数は nvcc の有無より先に検証する (タイポを「nvcc が無い」と誤報しない)
+for arg in "$@"; do
+    [ "$arg" = all ] || require "$arg"
+done
 
 if ! command -v nvcc >/dev/null 2>&1; then
     echo "nvcc が無い (このコンテナでは生成できない。denno-gpu 側で実行する)" >&2
     exit 127
 fi
 
-if [ "$#" -eq 0 ]; then
-    set -- moe_v3
+if [ "$1" = all ]; then
+    set -- "${targets_all[@]}"
 fi
-
 for arg in "$@"; do
-    case "$arg" in
-        all) for t in $(list_all); do compile "$t"; done; exit 0 ;;
-        *) compile "$arg" ;;
-    esac
+    compile "$arg"
 done

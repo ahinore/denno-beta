@@ -1288,8 +1288,9 @@ impl CudaCtx {
         self.moe_gemv_dev_with(ty, dev_w, x, n_in, n_out, out, moe_gemv_v3_on())
     }
 
-    /// [`Self::moe_gemv_dev`] の実体。`want_v3` のときだけ v3 (4 レーン版) を
-    /// 選ぶ。k が 128 の倍数でない / v3 の PTX が読めない ときは v2 へ落ちる。
+    /// [`Self::moe_gemv_dev`] の実体。`want_v3` のときだけ v3 (4 レーン版または
+    /// 2 レーン版) を選ぶ。k が 64 の倍数でない / v3 の PTX が読めない /
+    /// PTX が旧 ABI (引数 6 本) のときは v2 へ落ちる。
     ///
     /// 戻り値は「GPU で走ったか」(v2 に落ちても true)。v3 が実際に走ったかは
     /// 呼び出し側のテストが「v2 とビット一致しないこと」で確かめる。
@@ -1340,22 +1341,34 @@ impl CudaCtx {
         // cuMemFree 2 本を回していた。decode 中に数万回)。
         // 数値は不変: カーネル・引数・発行順はそのままで、x は n_in 要素・
         // out は n_out 要素の範囲しか読み書きしない (前回の残りは読まない)。
-        // P-gemv3: 1 行を 4 レーンで分担する版 (kernels_moe_v3.cu)。64 行/ブロック・
-        // 共有メモリ無し (行の生バイトをステージしない) なので、起動形状も v2 と違う。
-        // 使えないときは v2 の 4 行/ブロック + 行ステージングへ落ちる。
-        let v3 = if want_v3 && moe_gemv_v3_k_ok(n_in) {
-            gemv_v3_kernels().map(|k| k.f)
+        // P-gemv3: 1 行を lanes レーン (4 or 2) で分担する版 (kernels_moe_v3.cu)。
+        // 共有メモリ無し (行の生バイトをステージしない) ので、起動形状も v2 と違う。
+        // blockDim = rows_per_block * lanes、rows_per_block は DENNO_GEMV_V3_ROWS
+        // (8/16/32/64・既定 64)。k が lanes で割り切れない / v3 の PTX が無い /
+        // PTX が旧 ABI (引数 6 本) のときは v2 の 4 行/ブロック + 行ステージングへ落ちる。
+        let v3 = if want_v3 {
+            let lanes = moe_gemv_v3_lanes(n_in);
+            if lanes == 0 {
+                None
+            } else {
+                gemv_v3_kernels().map(|k| (k.f, lanes))
+            }
         } else {
             None
         };
         const MOE_ROWS_PER_BLOCK: usize = 4; // kernels_moe.cu の MOE_ROWS と一致
-        const V3_ROWS_PER_BLOCK: usize = 64; // kernels_moe_v3.cu の MOE_V3_ROWS_PER_BLOCK と一致
-        let (fs, rows_per_block, shmem) = match v3 {
-            Some(f3) => (f3, V3_ROWS_PER_BLOCK, 0u32),
+        // v3 の blockDim は rows*lanes (rows=64/lanes=4 で 256)。v2 は 256 固定。
+        let (fs, rows_per_block, block_dim, shmem, lanes) = match v3 {
+            Some((f3, lanes)) => {
+                let rows = moe_gemv_v3_rows();
+                (f3, rows, (rows * lanes) as u32, 0u32, lanes)
+            }
             None => (
                 fs_v12,
                 MOE_ROWS_PER_BLOCK,
+                256u32,
                 (MOE_ROWS_PER_BLOCK * rb) as u32,
+                1usize,
             ),
         };
         let f = fs[ki];
@@ -1402,6 +1415,8 @@ impl CudaCtx {
                     let (mut pw, mut px, mut po) = (dev_w.ptr, xb.ptr, ob.ptr);
                     let (mut n_in_c, mut n_out_c, mut rb_c) =
                         (n_in as c_int, n_out as c_int, rb as c_int);
+                    // v3 は rows_per_block と lanes を余分に渡す (v2 は 6 本のまま)。
+                    let (mut rows_c, mut lanes_c) = (rows_per_block as c_int, lanes as c_int);
                     let mut args = [
                         &mut pw as *mut _ as *mut c_void,
                         &mut px as *mut _ as *mut c_void,
@@ -1409,8 +1424,17 @@ impl CudaCtx {
                         &mut n_in_c as *mut _ as *mut c_void,
                         &mut n_out_c as *mut _ as *mut c_void,
                         &mut rb_c as *mut _ as *mut c_void,
+                        &mut rows_c as *mut _ as *mut c_void,
+                        &mut lanes_c as *mut _ as *mut c_void,
                     ];
-                    self.launch_async(f, (grid, 1, 1), (256, 1, 1), shmem, &mut args)?;
+                    let nargs = if lanes > 1 { 8 } else { 6 };
+                    self.launch_async(
+                        f,
+                        (grid, 1, 1),
+                        (block_dim, 1, 1),
+                        shmem,
+                        &mut args[..nargs],
+                    )?;
                 }
                 let t2 = t0.map(|_| std::time::Instant::now());
                 {
@@ -1459,6 +1483,8 @@ impl CudaCtx {
                 let (mut pw, mut px, mut po) = (dev_w.ptr, xb.ptr, ob.ptr);
                 let (mut n_in_c, mut n_out_c, mut rb_c) =
                     (n_in as c_int, n_out as c_int, rb as c_int);
+                // v3 は rows_per_block と lanes を余分に渡す (v2 は 6 本のまま)。
+                let (mut rows_c, mut lanes_c) = (rows_per_block as c_int, lanes as c_int);
                 let mut args = [
                     &mut pw as *mut _ as *mut c_void,
                     &mut px as *mut _ as *mut c_void,
@@ -1466,8 +1492,17 @@ impl CudaCtx {
                     &mut n_in_c as *mut _ as *mut c_void,
                     &mut n_out_c as *mut _ as *mut c_void,
                     &mut rb_c as *mut _ as *mut c_void,
+                    &mut rows_c as *mut _ as *mut c_void,
+                    &mut lanes_c as *mut _ as *mut c_void,
                 ];
-                self.launch_async(f, (grid, 1, 1), (256, 1, 1), shmem, &mut args)?;
+                let nargs = if lanes > 1 { 8 } else { 6 };
+                self.launch_async(
+                    f,
+                    (grid, 1, 1),
+                    (block_dim, 1, 1),
+                    shmem,
+                    &mut args[..nargs],
+                )?;
                 self.sync()?;
             }
             let got: Vec<f32> = ob.to_vec(n_out)?;
@@ -1689,12 +1724,13 @@ pub fn moe_gemv_v2_on() -> bool {
     })
 }
 
-/// decode GEMV の 4 レーン版 (`kernels_moe_v3.cu`) を使うか (既定 **off**)。
+/// decode GEMV のレーン分割版 (`kernels_moe_v3.cu`、4 レーンまたは 2 レーン) を
+/// 使うか (既定 **off**)。
 ///
 /// `DENNO_GEMV_V3=1` のときだけ v3。未設定 / `0` / `off` / `false` では v2 (既定
 /// 経路) のままで、1 バイトも挙動が変わらない。
 ///
-/// v3 は 1 行の累積を 4 レーンで分担するので **v2 とビット一致しない** (加算順が
+/// v3 は 1 行の累積を lanes レーンで分担するので **v2 とビット一致しない** (加算順が
 /// 変わる。prefill の GPU バッチ GEMM と同じ扱い = 契約の外)。既定で使わない理由。
 pub fn moe_gemv_v3_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1706,13 +1742,130 @@ pub fn moe_gemv_v3_on() -> bool {
     })
 }
 
-/// v3 のレーン分割が成立する k か (純関数。GPU 無しで検証できる)。
+/// v3 のレーン数 (4 / 2 / 0 = v2)。純関数なので GPU 無しで検証できる。
 ///
-/// v3 のレーン l は k を 4 等分した連続区間 `[l*k/4, (l+1)*k/4)` を持ち、区間の
-/// 中で量子ブロック (最小 32 要素) を丸ごと読む。したがって k/4 が 32 の倍数 =
-/// k が 128 の倍数であることが要る。満たさない k は v2 へ落ちる (panic しない)。
+/// v3 のレーン l は k を lanes 等分した連続区間 `[l*k/lanes, (l+1)*k/lanes)` を
+/// 持ち、区間の中で量子ブロック (最小 32 要素) を丸ごと読む。したがって区間長
+/// k/lanes が 32 の倍数であることが要る:
+///
+/// - k が 128 の倍数 → 4 レーン (区間長 k/4 が 32 の倍数)
+/// - k が 64 の倍数で 128 の倍数でない → 2 レーン (区間長 k/2 が 32 の倍数)
+/// - それ以外 → 0 (= v2 へ落ちる。panic しない)
+///
+/// 実形: 2560 / 5120 / 6144 は 4 レーン、320 (`output_hc_up` の k) は 2 レーン、
+/// 1000 は v2。2 レーン経路はカーネル引数 `lanes` で切り替える (カーネルは 1 組のまま)。
+pub fn moe_gemv_v3_lanes(k: usize) -> usize {
+    if k >= 128 && k % 128 == 0 {
+        4
+    } else if k >= 64 && k % 64 == 0 {
+        2
+    } else {
+        0
+    }
+}
+
+/// v3 (4 レーン版または 2 レーン版) が使える k か。
 pub fn moe_gemv_v3_k_ok(k: usize) -> bool {
-    k >= 128 && k % 128 == 0
+    moe_gemv_v3_lanes(k) > 0
+}
+
+/// v3 の 1 ブロックあたりの行数 (`DENNO_GEMV_V3_ROWS`、既定 64)。
+///
+/// 8 / 16 / 32 / 64 のどれか。それ以外 (未設定・空・数値でない・対象外の値) は 64。
+/// blockDim = rows * lanes、grid = ceil(n_out / rows) になる。n_out=2560 の形状では
+/// rows=64 で 40 block、rows=8 で 320 block (5090 の 170 SM を埋める)。
+/// 既定 64 は kernels_moe_v3.cu の MOE_V3_ROWS_DEFAULT と一致させること。
+pub fn moe_gemv_v3_rows() -> usize {
+    // テストが rows を振って 1 プロセスで全組み合わせを回すための上書き
+    // (0 = env を見る)。env は OnceLock で 1 回しか読めないため。
+    #[cfg(test)]
+    {
+        let f = V3_ROWS_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f != 0 {
+            return f;
+        }
+    }
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        let raw = std::env::var("DENNO_GEMV_V3_ROWS").ok();
+        let rows = parse_v3_rows(raw.as_deref());
+        if let Some(v) = raw.as_deref() {
+            if !matches!(v.trim(), "8" | "16" | "32" | "64") {
+                eprintln!("[gemv-v3] DENNO_GEMV_V3_ROWS={v:?} は 8/16/32/64 以外 → {rows} を使う");
+            }
+        }
+        rows
+    })
+}
+
+/// テストが rows/block を強制するための上書き (0 で env の値に戻る)。
+#[cfg(test)]
+static V3_ROWS_FORCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// テストから rows/block を固定する (`0` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_v3_rows_for_test(rows: usize) {
+    assert!(rows == 0 || matches!(rows, 8 | 16 | 32 | 64));
+    V3_ROWS_FORCE.store(rows, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `DENNO_GEMV_V3_ROWS` の生値 → rows/block (純関数。真理値表はテストで固定)。
+pub fn parse_v3_rows(raw: Option<&str>) -> usize {
+    match raw.map(str::trim) {
+        Some("8") => 8,
+        Some("16") => 16,
+        Some("32") => 32,
+        Some("64") => 64,
+        _ => 64,
+    }
+}
+
+/// v3 カーネルの引数の数 (w, x, out, n_in, n_out, row_bytes, rows_per_block, lanes)。
+/// 旧版 (task 66) は 6 本。数を取り違えたまま起動すると **黙って別の行を書く**ので、
+/// PTX を読む前に `.param` を数えて弾く (`ptx_entry_params`)。
+const V3_NARGS: usize = 8;
+
+/// v3 のカーネル名 (PTX から取る順 = `ki` の順 = 量子型の順)。
+const V3_KERNEL_NAMES: [&str; 4] = [
+    "dno_gemv_q8_0_v3",
+    "dno_gemv_q5_1_v3",
+    "dno_gemv_q4k_v3",
+    "dno_gemv_q5k_v3",
+];
+
+/// PTX テキストの entry `name` の引数の個数 (`.param` 行を数える)。
+///
+/// nvcc は引数名を `NAME_param_N` にするので、`.visible .entry NAME(` の次から
+/// `)` の行までの `.param` 行を数えれば個数が分かる。GPU 無しで検証できる
+/// (テスト `v3_ptx_param_count_matches_nvcc_output` がコミット済みの
+/// `kernels_moe_v2.ptx` で 6 本を数えて、nvcc の実出力で成立することを固定する)。
+fn ptx_entry_params(ptx: &str, name: &str) -> Option<usize> {
+    let mut lines = ptx.lines();
+    while let Some(l) = lines.next() {
+        let head = l.trim_start();
+        let after = match head.strip_prefix(".visible .entry ") {
+            Some(rest) => rest,
+            None => match head.strip_prefix(".entry ") {
+                Some(rest) => rest,
+                None => continue,
+            },
+        };
+        if !after.starts_with(name) || !after[name.len()..].trim_start().starts_with('(') {
+            continue;
+        }
+        let mut n = 0usize;
+        for body in lines.by_ref() {
+            let t = body.trim();
+            if t.starts_with(')') {
+                return Some(n);
+            }
+            if t.starts_with(".param ") {
+                n += 1;
+            }
+        }
+        return None;
+    }
+    None
 }
 
 /// v3 のカーネル一式。4 本そろって初めて `Some`。
@@ -1758,6 +1911,25 @@ fn gemv_v3_kernels() -> Option<&'static V3Kernels> {
                     return None;
                 }
             };
+            // 引数の数が合わない PTX (task 66 の旧版 = 6 引数) を読むと、
+            // cuLaunchKernel が rows_per_block / lanes を渡さないまま起動して
+            // 黙って別の行を書く。**モジュールを読む前に** ABI を確かめて弾く。
+            let text = String::from_utf8_lossy(&image);
+            let mut short: Vec<&str> = Vec::new();
+            for name in V3_KERNEL_NAMES {
+                if ptx_entry_params(&text, name) != Some(V3_NARGS) {
+                    short.push(name);
+                }
+            }
+            if !short.is_empty() {
+                eprintln!(
+                    "[gemv-v3] PTX の引数が {} 本でない ({}) → v2 へ。\
+                     `bash build_ptx.sh moe_v3` で再生成する",
+                    V3_NARGS,
+                    short.join(", ")
+                );
+                return None;
+            }
             image.push(0); // cuModuleLoadData は NUL 終端の PTX を期待する
             let lib = lib().ok()?;
             unsafe {
@@ -1769,20 +1941,13 @@ fn gemv_v3_kernels() -> Option<&'static V3Kernels> {
                     return None;
                 }
                 let mut f: [CUfunction; 4] = [std::ptr::null_mut(); 4];
-                let names: [&[u8]; 4] = [
-                    b"dno_gemv_q8_0_v3\0",
-                    b"dno_gemv_q5_1_v3\0",
-                    b"dno_gemv_q4k_v3\0",
-                    b"dno_gemv_q5k_v3\0",
-                ];
-                for (k, n) in names.iter().enumerate() {
-                    if (lib.module_get_function)(&mut f[k], module, n.as_ptr() as *const c_char)
+                for (k, name) in V3_KERNEL_NAMES.iter().enumerate() {
+                    let mut cname = name.as_bytes().to_vec();
+                    cname.push(0); // cuModuleGetFunction は NUL 終端の名前を期待する
+                    if (lib.module_get_function)(&mut f[k], module, cname.as_ptr() as *const c_char)
                         != CUDA_SUCCESS
                     {
-                        eprintln!(
-                            "[gemv-v3] PTX に {} が無い → v2 へ",
-                            String::from_utf8_lossy(&n[..n.len() - 1])
-                        );
+                        eprintln!("[gemv-v3] PTX に {name} が無い → v2 へ");
                         return None;
                     }
                 }
@@ -12589,14 +12754,18 @@ mod tests {
         }
     }
 
-    /// P-gemv3: 4 レーン版 GEMV が CPU の逐次実装 (`expert_gemv_scalar`) と
+    /// P-gemv3: lanes レーン版 GEMV が CPU の逐次実装 (`expert_gemv_scalar`) と
     /// 相対 1e-5 以内で一致し、NaN / Inf を作らないこと。
     ///
-    /// v3 は 1 行の加算を 4 分割するので v2 とは**ビット一致しない**。ここでは
+    /// v3 は 1 行の加算を lanes 分割するので v2 とは**ビット一致しない**。ここでは
     /// 行列全体で「最大絶対差 / 最大絶対値」を相対誤差として見る (行ごとの相対は
     /// 打ち消し合いで 0 に近い行が暴れるため)。v3 が実際に走ったことは
     /// 「v2 の結果とビット一致しない行がある」ことで確かめる (黙って v2 に
     /// 落ちていたら 1 bit も変わらない)。
+    ///
+    /// lanes (4 = k が 128 の倍数 / 2 = k が 64 の倍数) × rows/block (8/16/32/64) の
+    /// 組み合わせを回す。rows は env (OnceLock で 1 回しか読めない) ではなく
+    /// テスト用の上書き (`set_v3_rows_for_test`) で振る。
     ///
     /// 実行 (GPU のある環境):
     ///   DENNO_GEMV_V3_PTX=$PWD/crates/denno-engine/kernels/kernels_moe_v3.ptx \
@@ -12611,13 +12780,17 @@ mod tests {
             moe_gemv_v3_loaded(),
             "v3 の PTX が読めていない (DENNO_GEMV_V3_PTX / kernels_moe_v3.ptx を確認)"
         );
-        // 実モデルの k (Q4_K 2560 / Q5_1 640 / Q8_0 2560)。n_out は 64 行/ブロックを跨ぐ。
-        let cases: [(T, usize, usize); 3] = [
+        // 実モデルの k: Q4_K 2560 / Q5_1 640 / Q8_0 2560 は 4 レーン、
+        // Q8_0 320 (`output_hc_up`) は 2 レーン。n_out は 1 block の行数を跨ぐ。
+        let cases: [(T, usize, usize); 4] = [
             (T::Q4K, 2560, 256),
             (T::Q5_1, 640, 2560),
             (T::Q8_0, 2560, 256),
+            (T::Q8_0, 320, 10240),
         ];
         for (ty, n_in, n_out) in cases {
+            let lanes = moe_gemv_v3_lanes(n_in);
+            assert!(lanes > 0, "{ty:?} k={n_in} は v3 の対象外");
             let rb = gguf_row_bytes(ty, n_in).expect("row_bytes");
             let blk = ty.blck_size();
             // v2 のビット一致テストと同じ合成行列: d (と Q4_K/Q5_K の dmin、
@@ -12650,13 +12823,8 @@ mod tests {
                     .unwrap(),
                 "{ty:?}: GPU 経路 (v2) が発動しなかった"
             );
-            let mut got = vec![0f32; n_out];
-            assert!(
-                ctx.moe_gemv_dev_with(ty, &dev_w, &x, n_in, n_out, &mut got, true)
-                    .unwrap(),
-                "{ty:?}: GPU 経路 (v3) が発動しなかった"
-            );
-            // 基準 (v2 は CPU とビット一致する契約) が壊れていないこと
+            // 基準 (v2 は CPU とビット一致する契約) が壊れていないこと。
+            // rows/block を振っても v2 の経路 (4 行/ブロック固定) は変わらない。
             for i in 0..n_out {
                 assert_eq!(
                     got_v2[i].to_bits(),
@@ -12664,57 +12832,143 @@ mod tests {
                     "{ty:?}: v2 が CPU とビット一致しない (行 {i})"
                 );
             }
-            // v3 が実際に走ったか (走っていれば加算順の違いでビットが変わる)
-            let ndiff = (0..n_out)
-                .filter(|&i| got[i].to_bits() != got_v2[i].to_bits())
-                .count();
-            assert!(
-                ndiff > 0,
-                "{ty:?}: v3 の出力が v2 と 1 行も違わない = v3 が走っていない \
-                 (PTX 未ロード / k={n_in} が 128 の倍数でない)"
-            );
-            let mut maxd = 0f32;
-            let mut maxv = 0f32;
-            let mut nonfinite = 0usize;
-            for i in 0..n_out {
-                if !got[i].is_finite() {
-                    nonfinite += 1;
-                    continue;
+            for rows in [8usize, 16, 32, 64] {
+                set_v3_rows_for_test(rows);
+                let mut got = vec![0f32; n_out];
+                assert!(
+                    ctx.moe_gemv_dev_with(ty, &dev_w, &x, n_in, n_out, &mut got, true)
+                        .unwrap(),
+                    "{ty:?}: GPU 経路 (v3 lanes={lanes} rows={rows}) が発動しなかった"
+                );
+                // v3 が実際に走ったか (走っていれば加算順の違いでビットが変わる)
+                let ndiff = (0..n_out)
+                    .filter(|&i| got[i].to_bits() != got_v2[i].to_bits())
+                    .count();
+                assert!(
+                    ndiff > 0,
+                    "{ty:?} lanes={lanes} rows={rows}: v3 の出力が v2 と 1 行も違わない \
+                     = v3 が走っていない (PTX 未ロード / k={n_in} が 64 の倍数でない)"
+                );
+                let mut maxd = 0f32;
+                let mut maxv = 0f32;
+                let mut nonfinite = 0usize;
+                for i in 0..n_out {
+                    if !got[i].is_finite() {
+                        nonfinite += 1;
+                        continue;
+                    }
+                    maxd = maxd.max((got[i] - want[i]).abs());
+                    maxv = maxv.max(want[i].abs());
                 }
-                maxd = maxd.max((got[i] - want[i]).abs());
-                maxv = maxv.max(want[i].abs());
+                let rel = maxd / maxv.max(f32::MIN_POSITIVE);
+                println!(
+                    "{ty:?} k={n_in} n={n_out} lanes={lanes} rows={rows} block={}: \
+                     max|diff|={maxd:e} max|ref|={maxv:e} rel={rel:e} \
+                     (v2 と {ndiff}/{n_out} 行がビット不一致)",
+                    rows * lanes
+                );
+                assert_eq!(nonfinite, 0, "{ty:?}: NaN / Inf が {nonfinite} 行");
+                assert!(
+                    rel < 1e-5,
+                    "{ty:?} lanes={lanes} rows={rows}: 相対誤差 {rel:e} >= 1e-5 \
+                     (max|diff|={maxd:e}, max|ref|={maxv:e})"
+                );
             }
-            let rel = maxd / maxv.max(f32::MIN_POSITIVE);
-            println!(
-                "{ty:?} k={n_in} n={n_out}: max|diff|={maxd:e} max|ref|={maxv:e} rel={rel:e} \
-                 (v2 と {ndiff}/{n_out} 行がビット不一致)"
-            );
-            assert_eq!(nonfinite, 0, "{ty:?}: NaN / Inf が {nonfinite} 行");
-            assert!(
-                rel < 1e-5,
-                "{ty:?}: 相対誤差 {rel:e} >= 1e-5 (max|diff|={maxd:e}, max|ref|={maxv:e})"
-            );
+            set_v3_rows_for_test(0);
         }
     }
 
-    /// v3 のレーン分割が成立する k の判定と、ゲートの真理値表 (GPU 無しで回る)。
+    /// v3 のレーン数の適格判定と、`DENNO_GEMV_V3_ROWS` の真理値表 (GPU 無しで回る)。
     ///
-    /// 実モデルの k (640 / 2560 / 5120 / 6144) は通り、128 の倍数でない k は
-    /// v2 へ落ちる。ここが崩れると v3 が「サブブロックの途中から読む」ことになる。
+    /// 実モデルの k (640 / 2560 / 5120 / 6144) は 4 レーン、320 (`hc_up`) は
+    /// 2 レーン、1000 は v2。ここが崩れると v3 が「サブブロックの途中から読む」
+    /// ことになる (2 レーンは区間長 k/2 が 32 の倍数であること)。
     #[test]
-    fn gemv_v3_lane_split_needs_k_multiple_of_128() {
-        for k in [128usize, 640, 2560, 5120, 6144] {
-            assert!(moe_gemv_v3_k_ok(k), "k={k} は v3 で割り切れるはず");
+    fn gemv_v3_lane_and_rows_truth_table() {
+        // 区間長 k/4 が 32 の倍数
+        for k in [128usize, 640, 2560, 5120, 6144, 10240] {
+            assert_eq!(moe_gemv_v3_lanes(k), 4, "k={k} は 4 レーン");
+            assert!(k % 128 == 0);
         }
-        for k in [0usize, 32, 96, 192, 320, 1344, 1000] {
-            assert!(!moe_gemv_v3_k_ok(k), "k={k} は v3 の対象外のはず");
+        // 4 レーンでは割れないが 2 レーンなら割れる (k % 64 == 0 かつ k % 128 != 0)
+        for k in [64usize, 192, 320, 448, 1344, 1472] {
+            assert_eq!(moe_gemv_v3_lanes(k), 2, "k={k} は 2 レーン");
+            assert!(k % 64 == 0 && k % 128 != 0);
         }
+        // 2 でも割れない → v2
+        for k in [0usize, 32, 96, 1000, 3208] {
+            assert_eq!(moe_gemv_v3_lanes(k), 0, "k={k} は v2");
+        }
+        assert!(moe_gemv_v3_k_ok(320) && moe_gemv_v3_k_ok(2560));
+        assert!(!moe_gemv_v3_k_ok(1000));
+
+        // DENNO_GEMV_V3_ROWS: 8/16/32/64 だけを通し、他は既定 64。
+        let table: [(Option<&str>, usize); 11] = [
+            (Some("8"), 8),
+            (Some("16"), 16),
+            (Some("32"), 32),
+            (Some("64"), 64),
+            (Some(" 32 "), 32),
+            (None, 64),
+            (Some(""), 64),
+            (Some("0"), 64),
+            (Some("128"), 64),
+            (Some("abc"), 64),
+            (Some("-16"), 64),
+        ];
+        for (raw, want) in table {
+            assert_eq!(parse_v3_rows(raw), want, "DENNO_GEMV_V3_ROWS={raw:?}");
+        }
+        // 環境変数の実値 (OnceLock) とも一致する (GPU テストが並走して
+        // `set_v3_rows_for_test` を立てているときはその値を期待する)。
+        let env_rows = match V3_ROWS_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => parse_v3_rows(std::env::var("DENNO_GEMV_V3_ROWS").ok().as_deref()),
+            forced => forced,
+        };
+        assert_eq!(moe_gemv_v3_rows(), env_rows, "DENNO_GEMV_V3_ROWS の実値");
+
         // ゲートは env の値だけで決まる (未設定は off)。
         let env_on = matches!(
             std::env::var("DENNO_GEMV_V3").ok().as_deref(),
             Some("1") | Some("on") | Some("true")
         );
         assert_eq!(moe_gemv_v3_on(), env_on, "DENNO_GEMV_V3 の真理値表");
+    }
+
+    /// PTX の引数の数え方 (GPU 無しで回る)。nvcc が実際に出す
+    /// `kernels_moe_v2.ptx` で 6 本を数えられること = パーサの前提の裏取り。
+    #[test]
+    fn v3_ptx_param_count_matches_nvcc_output() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_moe_v2.ptx");
+        let text = std::fs::read_to_string(&p).expect("kernels_moe_v2.ptx が読めない");
+        for name in [
+            "dno_gemv_q8_0_v2",
+            "dno_gemv_q5_1_v2",
+            "dno_gemv_q4k_v2",
+            "dno_gemv_q5k_v2",
+        ] {
+            assert_eq!(ptx_entry_params(&text, name), Some(6), "{name}");
+        }
+        // v3 の新 ABI (rows_per_block と lanes が増えた 8 本)
+        let synth = "\
+.visible .entry dno_gemv_q4k_v3(\n\
+\t.param .u64 dno_gemv_q4k_v3_param_0,\n\
+\t.param .u64 dno_gemv_q4k_v3_param_1,\n\
+\t.param .u64 dno_gemv_q4k_v3_param_2,\n\
+\t.param .u32 dno_gemv_q4k_v3_param_3,\n\
+\t.param .u32 dno_gemv_q4k_v3_param_4,\n\
+\t.param .u32 dno_gemv_q4k_v3_param_5,\n\
+\t.param .u32 dno_gemv_q4k_v3_param_6,\n\
+\t.param .u32 dno_gemv_q4k_v3_param_7\n\
+)\n\
+{\n\
+}\n";
+        assert_eq!(ptx_entry_params(synth, "dno_gemv_q4k_v3"), Some(V3_NARGS));
+        // 名前の前方一致で別カーネルを拾わない
+        assert_eq!(ptx_entry_params(synth, "dno_gemv_q4k_v3_l2"), None);
+        assert_eq!(ptx_entry_params("", "dno_gemv_q4k_v3"), None);
     }
 
     /// GPU の量子化が CPU (`tensor::quantize_row_i8`) とビット一致するか
