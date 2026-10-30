@@ -32,12 +32,14 @@ fn row_bytes_any(ty: GgmlType, k: usize) -> Result<usize> {
     Ok((k / bs) * ts)
 }
 
-/// `DENNO_CPU_GEMV_PAR` の値の解釈 (純粋関数)。`"1"` のときだけ有効、既定 off。
+/// `DENNO_CPU_GEMV_PAR` の値の解釈 (純粋関数)。**既定 on**、`0` のときだけ無効。
 ///
+/// 2026-10-30 の実測 (118 出力 tok、3 ラン/構成) で 25.66 -> 25.14 s (-2.2 %)、
+/// 出力 md5 は全ラン一致 (`3b77a3b996fd`)。行は互いに独立なので数値は変わらない。
 /// env を読む部分から切り離してあるのは、テストが環境変数を触らずに両方の分岐を
 /// 確かめられるようにするため (`moe_par_from_value` と同じ流儀)。
 fn cpu_gemv_par_from_value(v: Option<&str>) -> bool {
-    matches!(v, Some("1"))
+    !matches!(v, Some("0") | Some("off") | Some("false"))
 }
 
 /// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
@@ -614,9 +616,11 @@ mod tests {
 
     #[test]
     fn cpu_gemv_par_env_values() {
-        // `1` のときだけ有効。未設定・`0`・`true` は無効 (既定 off)。
-        assert!(cpu_gemv_par_from_value(Some("1")));
-        for v in [None, Some("0"), Some("true"), Some(""), Some("01")] {
+        // 既定 on。`0` / `off` / `false` のときだけ無効。
+        for v in [None, Some("1"), Some("true"), Some("")] {
+            assert!(cpu_gemv_par_from_value(v), "value={v:?}");
+        }
+        for v in [Some("0"), Some("off"), Some("false")] {
             assert!(!cpu_gemv_par_from_value(v), "value={v:?}");
         }
     }
