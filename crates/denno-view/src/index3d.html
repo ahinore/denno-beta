@@ -25,7 +25,7 @@
          overflow:auto; white-space:pre-wrap; color:#ff5c7a; background:rgba(20,0,8,.86);
          border:1px solid #ff2b55; border-radius:4px; padding:8px 10px; font-size:11px; }
   /* ---- chat panel ---- */
-  #chat { position:fixed; right:14px; bottom:12px; width:372px; max-height:58vh; display:flex;
+  #chat { position:fixed; right:14px; bottom:12px; width:540px; max-height:78vh; display:flex;
           flex-direction:column; background:rgba(5,11,18,.86); border:1px solid #123a4c;
           border-radius:6px; box-shadow:0 0 24px rgba(0,190,240,.10); overflow:hidden;
           pointer-events:auto; }
@@ -36,15 +36,15 @@
   #chat .hd .sp { flex:1; }
   #chat .hd button { pointer-events:auto; background:#0d2531; color:#8fe6ff; border:1px solid #1b4b60;
                      border-radius:3px; font:inherit; font-size:10px; padding:1px 6px; cursor:pointer; }
-  #log { flex:1; min-height:90px; overflow-y:auto; padding:8px 10px; white-space:pre-wrap;
-         word-break:break-word; font-size:11.5px; line-height:1.55; }
+  #log { flex:1; min-height:260px; overflow-y:auto; padding:10px 12px; white-space:pre-wrap;
+         word-break:break-word; font-size:12.5px; line-height:1.6; }
   #log .u { color:#8fe6ff; }
   #log .a { color:#dff4ff; }
   #log .s { color:var(--dim); font-size:10.5px; }
   #log .e { color:#ff6b86; }
   #row { display:flex; gap:6px; padding:7px 8px; border-top:1px solid #0f2b38; }
-  #in { flex:1; resize:none; height:34px; background:#08131c; color:var(--fg); border:1px solid #1b4b60;
-        border-radius:3px; font:inherit; font-size:11.5px; padding:5px 7px; outline:none; }
+  #in { flex:1; resize:none; height:56px; background:#08131c; color:var(--fg); border:1px solid #1b4b60;
+        border-radius:3px; font:inherit; font-size:12.5px; padding:6px 8px; outline:none; }
   #in:focus { border-color:#2f8aa8; }
   #send { background:#0f3a4d; color:#9fefff; border:1px solid #2f8aa8; border-radius:3px;
           font:inherit; font-size:11px; padding:0 12px; cursor:pointer; }
@@ -65,6 +65,9 @@
   <div id="live" class="dim">telemetry: <b id="ws_state">--</b> · prefill <b id="pf">--</b> · decode <b id="dc">--</b></div>
   <div id="tier" class="dim">vram <b id="t_vram">--</b> / <b id="t_total">--</b> MB · ram experts <b id="t_ram">--</b> · ssd reads <b id="t_ssd">--</b></div>
   <div id="pleline" class="dim">PLE (layer 2 only): <b id="ple_v">--</b> <span class="dim">ngram 3 x 8 heads = 16 tables</span></div>
+  <div id="tokline" class="dim">tokens: prompt <b id="tok_total">--</b> · fed <b id="tok_fed">--</b> ·
+       prefix cache reuse <b id="tok_reuse">0</b> · kv <b id="kv_len">0</b>/<b id="kv_max">--</b> · pos <b id="kv_pos">--</b></div>
+  <div id="promptline" class="dim">prompt: <span id="prompt_txt">--</span></div>
   <div id="mode" class="dim">mode: demo (routing simulated)</div>
 </div>
 <div id="legend" class="panel">
@@ -164,9 +167,9 @@ scene.background = new THREE.Color('#04060b');
 scene.fog = new THREE.FogExp2('#04060b', 0.0032);
 
 const totalZ = (LAYERS - 1) * ZSTEP;
-const center = new THREE.Vector3(-4, -2.2, -totalZ * 0.42);
+const center = new THREE.Vector3(-4, -1.0, -totalZ * 0.32);
 const camera = new THREE.PerspectiveCamera(39, innerWidth / innerHeight, 0.1, 900);
-camera.position.set(27, 39, 36);
+camera.position.set(29, 30, 47);
 camera.lookAt(center);
 
 const controls = new OrbitControls(camera, canvas);
@@ -455,6 +458,112 @@ const flow = new THREE.Points(fGeo, new THREE.PointsMaterial({
 flow.frustumCulled = false;
 scene.add(flow);
 
+
+// ===== 9) 入力の流れ: 文字列 -> tokenizer -> トークン列 -> embedding =======
+// テレメトリの Prefill.tokens は「実際に食わせた分」(再利用した前置きは含まない)。
+// SessionAdmit.prompt_tokens がプロンプト全体なので、reuse = admit - fed で出る。
+const TOKN = 96, TCOLS = 48;
+const TOK_Y = -1.2, TOK_Z = 9.6, TOK_X0 = -12.0, TOK_DX = 0.44, TOK_ROWH = 0.40;
+const tokInst = new THREE.InstancedMesh(
+  new THREE.BoxGeometry(0.30, 0.26, 0.10),
+  new THREE.MeshBasicMaterial({ color: 0xffffff }), TOKN);
+tokInst.frustumCulled = false;
+const tokAct = new Float32Array(TOKN);
+for (let i = 0; i < TOKN; i++) {
+  const c = i % TCOLS, r = (i / TCOLS) | 0;
+  m4.makeTranslation(TOK_X0 + c * TOK_DX, TOK_Y - r * TOK_ROWH, TOK_Z);
+  tokInst.setMatrixAt(i, m4);
+  tokInst.setColorAt(i, new THREE.Color(0x10222c));
+}
+tokInst.instanceMatrix.needsUpdate = true; tokInst.instanceColor.needsUpdate = true;
+scene.add(tokInst);
+
+// tokenizer の箱と、プロンプト文字列そのものの表示
+const tokzBox = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.62, 0.62),
+  new THREE.MeshBasicMaterial({ color: 0x1f6f8a, transparent: true, opacity: 0.55,
+    blending: THREE.AdditiveBlending, depthWrite: false }));
+tokzBox.position.set(-12.6, TOK_Y, TOK_Z);
+scene.add(tokzBox);
+label('tokenizer (BPE)', '#8fe6ff', 3.4, -12.6, TOK_Y + 0.66, TOK_Z);
+label('prompt tokens (実トークン id 順)', '#5f7f8c', 5.2, -4.6, TOK_Y + 0.66, TOK_Z);
+arrow(-11.7, TOK_Y, TOK_Z, -11.0, TOK_Y, TOK_Z, 0x8fe6ff, 0.6);
+arrow(-4.6, TOK_Y + 0.22, TOK_Z, -8.8, -2.9, 6.0, 0x8fe6ff, 0.4);
+
+// 入力の粒 (トークン列 -> embedding -> layer 1 の壁)
+const INP_N = 18;
+const inpGeo = new THREE.BufferGeometry();
+const inpPos = new Float32Array(INP_N * 3), inpCol = new Float32Array(INP_N * 3);
+inpGeo.setAttribute('position', new THREE.BufferAttribute(inpPos, 3));
+inpGeo.setAttribute('color', new THREE.BufferAttribute(inpCol, 3));
+const inpFlow = new THREE.Points(inpGeo, new THREE.PointsMaterial({
+  size: 0.9, map: dotTex, vertexColors: true, transparent: true,
+  blending: THREE.AdditiveBlending, depthWrite: false, fog: true }));
+inpFlow.frustumCulled = false;
+scene.add(inpFlow);
+let inpPulse = 0;
+// 2 次ベジエ: トークン列の中央 -> embedding 箱 -> layer 1 の壁の下端
+const IP0 = [-4.6, TOK_Y + 0.35, TOK_Z], IP1 = [-8.8, -3.4, 5.4], IP2 = [-12.0, -NWY - 0.4, zOf(0) + 0.3];
+
+// ===== 10) KV キャッシュ / prefix cache ===================================
+// KvUsage.t_lens[0] が実測の KV 長。prefix は前リクエストから再利用した分
+// (serve_flash.rs の self.cache が返す dec.tokens())。decode では毎ステップ
+// この全域を読むので、読み出し位置を掃引として描く。
+// 手前の帯として描く (層に沿って置くと手前ほど画面外に飛ぶため)。
+const KVN = 64;
+const KV_X0 = -12.0, KV_DX = 0.33, KV_Y = 3.2, KV_Z = 10.0;
+const kvInst = new THREE.InstancedMesh(
+  new THREE.BoxGeometry(0.17, 0.36, 0.36),
+  new THREE.MeshBasicMaterial({ color: 0xffffff }), KVN);
+kvInst.frustumCulled = false;
+const kvZ = new Float32Array(KVN);
+for (let i = 0; i < KVN; i++) {
+  kvZ[i] = KV_Z;
+  m4.makeTranslation(KV_X0 + i * KV_DX, KV_Y, KV_Z);
+  kvInst.setMatrixAt(i, m4);
+  kvInst.setColorAt(i, new THREE.Color(0x0a141c));
+}
+kvInst.instanceMatrix.needsUpdate = true; kvInst.instanceColor.needsUpdate = true;
+scene.add(kvInst);
+arrow(KV_X0 - 0.4, KV_Y, KV_Z, -12.4, 1.0, zOf(0) + 0.6, 0x00eaff, 0.35);
+label('KV cache (slot 0) / 48 layers', '#00eaff', 5.0, KV_X0 + 7.6, KV_Y + 0.72, KV_Z);
+label('green: prefix cache (前ターンから再利用) / amber: 今回書いた分 / 白: decode の読み出し位置', '#4d6470', 11.0, KV_X0 + 8.0, KV_Y - 0.66, KV_Z);
+
+const kv = { total: 0, fed: 0, reuse: 0, len: 0, pos: 0, busy: false, maxctx: 65536, sweep: 0, dirty: true };
+
+
+function paintKv() {
+  const col = kvInst.instanceColor.array;
+  // 1 セル = kvDen/KVN トークン。kvDen は実際の長さに合わせて伸ばす
+  // (max_ctx 65536 を 64 セルに割ると 1 セル 1024 tok になり、573 tok では点かない)。
+  const den = Math.max(1024, kv.total * 1.15, kv.len * 1.15);
+  const per = den / KVN;
+  const nFill = Math.min(KVN, Math.ceil(kv.len / per));
+  const nPre = Math.min(nFill, Math.floor(kv.reuse / per));
+  const head = Math.min(nFill - 1, Math.floor(kv.sweep * nFill));
+  for (let i = 0; i < KVN; i++) {
+    let r = 0.04, g = 0.08, b = 0.11;
+    if (i < nPre) { r = 0.06; g = 0.62; b = 0.36; }
+    else if (i < nFill) { r = 0.68; g = 0.44; b = 0.06; }
+    if (i === head && nFill > 0) { r = 1.0; g = 1.0; b = 1.0; }         // 読み出し中のセル
+    else if (i === head - 1 && head > 0) { r = Math.min(1, r + .5); g = Math.min(1, g + .5); b = Math.min(1, b + .5); }
+    col[i * 3] = r; col[i * 3 + 1] = g; col[i * 3 + 2] = b;
+  }
+  kvInst.instanceColor.needsUpdate = true;
+  kv.dirty = false;
+}
+paintKv();
+
+function paintTokens() {
+  const col = tokInst.instanceColor.array;
+  for (let i = 0; i < TOKN; i++) {
+    const a = tokAct[i];
+    col[i * 3] = 0.04 + a * 0.30;
+    col[i * 3 + 1] = 0.10 + a * 0.55;
+    col[i * 3 + 2] = 0.16 + a * 0.62;
+  }
+  tokInst.instanceColor.needsUpdate = true;
+}
+
 // ===== post ==============================================================
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
@@ -489,6 +598,7 @@ function promote(il, ids) {
     if (i >= 0) lru.splice(i, 1);
     lru.push(kk);
     if (s.tier[k] !== TIER.VRAM) { s.tier[k] = TIER.VRAM; s.dirty[k] = 1; }
+    s.act[k] = Math.max(s.act[k], 0.5);   // 移送中は光らせる
   }
 }
 
@@ -538,14 +648,19 @@ function updateLayerColors(il) {
   }
   s.inst.instanceColor.needsUpdate = true;
 
+  // 段の移動は補間する。瞬間移動だと SSD -> RAM -> VRAM の移送が見えないため。
   let moved = false;
   for (let k = 0; k < EXPERTS; k++) {
-    if (!s.dirty[k]) continue;
-    const y = TIER_Y[s.tier[k]];
-    m4.makeTranslation(s.xz[k * 2], y, s.xz[k * 2 + 1]);
+    const ty = TIER_Y[s.tier[k]];
+    const cy = s.y3[k * 3 + 1];
+    const d = ty - cy;
+    if (!s.dirty[k] && Math.abs(d) < 0.004) continue;
+    const ny = Math.abs(d) < 0.06 ? ty : cy + d * 0.16;
+    m4.makeTranslation(s.xz[k * 2], ny, s.xz[k * 2 + 1]);
     s.inst.setMatrixAt(k, m4);
-    s.y3[k * 3 + 1] = y;
-    s.dirty[k] = 0; moved = true;
+    s.y3[k * 3 + 1] = ny;
+    if (s.dirty[k] && Math.abs(ny - ty) < 0.004) s.dirty[k] = 0;
+    moved = true;
   }
   if (moved) s.inst.instanceMatrix.needsUpdate = true;
 }
@@ -616,6 +731,13 @@ function step(dt, doRender) {
     }
     lightNeurons(cursor, idx, val);
     if (cursor === PLE_LAYERS[0]) plePulse = 1;   // デモでも layer 2 の寄与を光らせる
+    if (cursor === 0) {                            // 1 周 = 1 トークン
+      const n = (demo.tok = (demo.tok || 0) + 1);
+      kv.total = 512; kv.fed = 512; kv.reuse = n > 1 ? 500 : 0;
+      kv.len = 500 + Math.min(12, n); kv.pos = kv.len - 1; kv.dirty = true;
+      for (let i = 0; i < TOKN; i++) tokAct[i] = i < 24 ? 0.9 : 0;
+      paintTokens();
+    }
     document.getElementById('cur').textContent = String(cursor).padStart(2, '0');
     const ck = document.getElementById('curkind');
     ck.textContent = isQSA(cursor) ? 'QSA' : 'GDN';
@@ -623,6 +745,35 @@ function step(dt, doRender) {
   }
   const head = demo.on ? 0.35 + 0.65 * Math.exp(-Math.abs((demo.t / perLayer) % 1) * 3)
                       : Math.min(1, 0.55 + live.hit());
+
+  // 入力の粒 (prefill 直後ほど濃い)
+  if (inpPulse > 0.01) {
+    inpPulse *= 0.982;
+    for (let i = 0; i < INP_N; i++) {
+      const ph = ((demo.t * 1.15 + i / INP_N) % 1);
+      const u = ph, w = 1 - u;
+      const o = i * 3;
+      inpPos[o]     = w * w * IP0[0] + 2 * w * u * IP1[0] + u * u * IP2[0];
+      inpPos[o + 1] = w * w * IP0[1] + 2 * w * u * IP1[1] + u * u * IP2[1];
+      inpPos[o + 2] = w * w * IP0[2] + 2 * w * u * IP1[2] + u * u * IP2[2];
+      const f = Math.sin(Math.PI * u) * inpPulse;
+      inpCol[o] = 0.55 * f; inpCol[o + 1] = 0.90 * f; inpCol[o + 2] = 1.00 * f;
+    }
+    inpGeo.attributes.position.needsUpdate = true; inpGeo.attributes.color.needsUpdate = true;
+  }
+
+  // トークン列の減衰
+  let tokAny = 0;
+  for (let i = 0; i < TOKN; i++) {
+    if (tokAct[i] > 0.005) { tokAct[i] *= 0.992; tokAny = 1; }
+  }
+  if (tokAny) paintTokens();
+
+  // KV の読み出し掃引 (prefill / decode のどちらでも回す)
+  kv.sweep = (kv.sweep + dt * (kv.busy ? 0.85 : 0.25)) % 1;
+  if (kv.len > 0) { kv.dirty = true; }
+  if (kv.dirty) paintKv();
+  if (!kv.busy && inpPulse < 0.02 && kv.len === 0) inpPulse *= 0.99;
 
   // ニューロンの減衰 (光った層だけ)
   if (hotWalls.size) {
@@ -799,10 +950,44 @@ function handleFrame(f) {
   switch (f.kind) {
     case 'ServerInfo':
       hudEl.ws.textContent = replayOn ? 'off (replay)' : 'connected (' + (f.model || 'flash') + ')';
+      if (f.context) { kv.maxctx = f.context; document.getElementById('kv_max').textContent = f.context; }
       break;
-    case 'Prefill':
+    case 'SessionAdmit':
+      // プロンプト全体の長さ。この時点でトークン列と KV をリセットする。
+      kv.total = f.prompt_tokens; kv.fed = 0; kv.reuse = 0; kv.len = 0; kv.pos = 0; kv.busy = true;
+      kv.dirty = true; tokAct.fill(0); paintTokens();
+      document.getElementById('tok_total').textContent = String(f.prompt_tokens);
+      document.getElementById('tok_fed').textContent = '0';
+      document.getElementById('tok_reuse').textContent = '0';
+      document.getElementById('kv_len').textContent = '0';
+      break;
+    case 'Prefill': {
       liveState.prefillMs = f.ns / 1e6 / Math.max(1, f.prompt_tokens || 1);
       hudEl.pf.textContent = liveState.prefillMs.toFixed(1) + ' ms/tok';
+      kv.fed = f.prompt_tokens;
+      kv.reuse = Math.max(0, kv.total - kv.fed);
+      kv.len = kv.total;
+      kv.dirty = true;
+      inpPulse = 1;
+      // 実際に食わせたトークン id を順に並べる (再利用分は先頭に詰まっている)
+      const n = Math.min(f.tokens.length, TOKN);
+      for (let i = 0; i < n; i++) tokAct[i] = 1;
+      paintTokens();
+      document.getElementById('tok_fed').textContent = String(f.prompt_tokens);
+      document.getElementById('tok_reuse').textContent = String(kv.reuse);
+      break;
+    }
+    case 'KvUsage':
+      kv.len = f.t_lens[0] || 0; kv.busy = !!f.busy[0]; kv.dirty = true;
+      document.getElementById('kv_len').textContent = String(kv.len);
+      break;
+    case 'Token':
+      kv.pos = f.pos; kv.dirty = true;
+      inpPulse = Math.max(inpPulse, 0.7);
+      document.getElementById('kv_pos').textContent = String(f.pos);
+      break;
+    case 'SessionDone':
+      kv.busy = false;
       break;
     case 'Step':
       liveState.lastStepMs = f.ns / 1e6;
