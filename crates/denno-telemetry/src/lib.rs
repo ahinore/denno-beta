@@ -1088,14 +1088,36 @@ pub fn topk_softmax(logits: &[f32], k: usize) -> TopK {
         t += e * (l - max);
     }
     let entropy = (s.ln() - t / s).max(0.0);
-    // top-k 選択 (logit 降順、同点は id 昇順 — 部分ソートではなく全ソートで単純に)
-    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
-    idx.sort_unstable_by(|&a, &b| {
-        logits[b as usize].total_cmp(&logits[a as usize]).then(a.cmp(&b))
-    });
-    idx.truncate(k);
-    let entries =
-        idx.into_iter().map(|i| (i, ((logits[i as usize] - max).exp() / s).max(0.0))).collect();
+    // top-k 選択 (logit 降順、同点は id 昇順)。
+    // 全ソートは語彙全体 (約 25 万) の間接比較になり、毎トークンで数 ms かかる。
+    // 上位 k 件を保つだけの 1 パス走査にすると比較関数が同じなので結果は全ソートと同一。
+    let take = k.min(logits.len());
+    if take == 0 {
+        return TopK { chosen: 0, entropy, entries: Vec::new() };
+    }
+    let mut best: Vec<(u32, f32)> = Vec::with_capacity(take);
+    for (i, &l) in logits.iter().enumerate() {
+        let id = i as u32;
+        if best.len() == take {
+            // 末尾 (最下位) より後ろなら捨てる。比較は全ソートと同じ total order。
+            let (wid, wl) = best[take - 1];
+            if l.total_cmp(&wl).then(id.cmp(&wid)) != std::cmp::Ordering::Less {
+                continue;
+            }
+        }
+        let pos = best
+            .iter()
+            .position(|&(bid, bl)| l.total_cmp(&bl).then(id.cmp(&bid)) == std::cmp::Ordering::Less)
+            .unwrap_or(best.len());
+        if pos < take {
+            best.insert(pos, (id, l));
+            best.truncate(take);
+        }
+    }
+    let entries = best
+        .into_iter()
+        .map(|(i, l)| (i, ((l - max).exp() / s).max(0.0)))
+        .collect();
     TopK { chosen: 0, entropy, entries }
 }
 
@@ -1570,5 +1592,42 @@ mod tests {
         // 確率の合計は top-k ≤ 1
         let sum: f32 = tk.entries.iter().map(|e| e.1).sum();
         assert!(sum <= 1.0 + 1e-6);
+    }
+
+    /// 1 パス選択が旧実装 (語彙全体の sort_unstable_by) と 1 件も違わないこと。
+    ///
+    /// 同点・NaN・k が語彙数以上・k=0 を混ぜる。乱数は固定の LCG (再現可能)。
+    #[test]
+    fn topk_select_matches_full_sort() {
+        fn full_sort(logits: &[f32], k: usize) -> Vec<u32> {
+            let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+            idx.sort_unstable_by(|&a, &b| {
+                logits[b as usize].total_cmp(&logits[a as usize]).then(a.cmp(&b))
+            });
+            idx.truncate(k);
+            idx
+        }
+        let mut seed = 0x1234_5678u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 8) as f32 / (1u32 << 24) as f32) * 20.0 - 10.0
+        };
+        for trial in 0..40 {
+            let n = 1 + (trial * 7) % 300;
+            let mut logits: Vec<f32> = (0..n).map(|_| next()).collect();
+            // 同点を作る (丸めで衝突させる)
+            if trial % 3 == 0 && n > 4 {
+                logits[1] = logits[0];
+                logits[2] = logits[0];
+            }
+            if trial == 7 {
+                logits[n / 2] = f32::NAN;
+            }
+            for k in [0usize, 1, 5, 8, n, n + 3] {
+                let got: Vec<u32> = topk_softmax(&logits, k).entries.iter().map(|e| e.0).collect();
+                let want = full_sort(&logits, k.min(n));
+                assert_eq!(got, want, "trial={trial} n={n} k={k}");
+            }
+        }
     }
 }
