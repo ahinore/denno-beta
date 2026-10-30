@@ -53,9 +53,30 @@
 //!   [`reserve_external`] が**会計なしの予約**を返すので、既定の挙動は不変。
 //! - 予算が埋まっているときに外部予約が入らない場合は `None` を返し、
 //!   呼び出し側 (prefill) は CPU 経路へ落ちる (fail closed)。
+//!
+//! # P60: 在庫の情報源 (テレメトリの kind 14 / 15)
+//!
+//! 「VRAM に何本居るか」は 1 か所では分からない。実装上の置き場所は 2 つ:
+//!
+//! 1. このモジュールの LRU (decode の expert 1 本 = 3 行列、鍵は `(層, expert)`)。
+//! 2. prefill の層一括 GEMM (`model::moe_grouped_gpu` → `cuda::moe_grouped_gemm_layer`)
+//!    が層ぶんの expert を詰め直して置く **パック済みバッファ**。こちらは
+//!    `reserve_external` でこの LRU の予算を借りるが、鍵は cuda 側の stamp で
+//!    `(層, expert)` を持たない。
+//!
+//! `cuda.rs` の GGUF 重みレジストリ (`DENNO_GPU_WEIGHT_MB`) には **expert は入らない**
+//! (uid は `quant::next_q8_uid` の通し番号で、層・expert を復元できない。expert は
+//! `ExpertW` が mmap の生ブロックを持ち、dense の `GgufLinear` を通らない)。
+//!
+//! そこで [`note_staging`] で 2 の内容 (層・expert 集合・バイト数) を推論スレッドから
+//! 登録し、[`resident_keys`] が 1 と 2 の和集合を返す。`budget_usage()` の予算は
+//! `DENNO_EXPERT_VRAM_MB` + `DENNO_GPU_WEIGHT_MB` の合計とする (エンジンが VRAM に
+//! ついて持っている上限の和。カードの全容量ではない)。
 
 use std::collections::HashMap;
 use std::hash::Hash;
+
+use crate::model::expert_cache::ExpertKey;
 
 /// `DENNO_EXPERT_VRAM_MB`: expert の VRAM 常駐に使う上限 (MiB)。既定 0 = 無効。
 pub const EXPERT_VRAM_MB_ENV: &str = "DENNO_EXPERT_VRAM_MB";
@@ -630,41 +651,228 @@ pub fn release_external(bytes: usize) {
     }
 }
 
-/// 予算の消費量 `(LRU 使用中, 外部予約, 上限)`。未初期化なら `None`。
+/// 予算の消費量 `(使用中バイト, ピン留めバイト, 予算バイト)`。1 つも設定が無ければ `None`。
+///
+/// - 使用中 = decode の LRU に載っている expert のバイト数。
+/// - ピン留め = 「LRU 管理外だが同じ予算を使っている常駐」= prefill のパック済み重み
+///   ([`reserve_external`] が計上した分) + 会計が無いときの staging のバイト数
+///   ([`Staging::guarded`] が false のもの。二重計上しない)。
+/// - 予算 = `DENNO_EXPERT_VRAM_MB` + `DENNO_GPU_WEIGHT_MB` の合計 (MiB 単位の env を
+///   バイトに直して足す)。**カードの全容量ではない**。
+///
+/// 値を返す条件: 予算か在庫のどちらかが 0 でないとき。両方 0 なら `None`。
 pub fn budget_usage() -> Option<(usize, usize, usize)> {
-    #[cfg(feature = "cuda")]
-    {
-        gpu::budget_usage()
+    let (used, pinned, cap_lru) = lru_budget();
+    let expert_cap = if cap_lru > 0 {
+        cap_lru
+    } else {
+        env_expert_cap()
+    };
+    let weight_cap = crate::gpu_budget::weight_cap_bytes().min(usize::MAX as u64) as usize;
+    let unguarded_staged = staged()
+        .filter(|s| !s.guarded)
+        .map_or(0, |s| s.bytes);
+    budget_from_parts(
+        used,
+        pinned.saturating_add(unguarded_staged),
+        expert_cap,
+        weight_cap,
+    )
+}
+
+/// [`budget_usage`] の中身 (純関数)。予算も在庫も 0 なら `None`。
+///
+/// `expert_cap` は expert の LRU+外部予約の上限、`weight_cap` は dense 重みレジストリ
+/// (`DENNO_GPU_WEIGHT_MB`) の上限。予算はこの 2 つの合計として扱う。
+pub fn budget_from_parts(
+    used: usize,
+    pinned: usize,
+    expert_cap: usize,
+    weight_cap: usize,
+) -> Option<(usize, usize, usize)> {
+    let cap = expert_cap.saturating_add(weight_cap);
+    if cap == 0 && used == 0 && pinned == 0 {
+        return None;
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        None
+    Some((used, pinned, cap))
+}
+
+/// P60: [`budget_usage`] を TierStats の `(vramMB, vramTotalMB)` に落とす (純関数)。
+///
+/// 使用量が 1 MiB 未満なら 0 になる (ワイヤは MB 単位)。
+pub fn tier_mb(usage: Option<(usize, usize, usize)>) -> (u32, u32) {
+    match usage {
+        Some((used, pinned, cap)) => (
+            bytes_to_mb(used.saturating_add(pinned)),
+            bytes_to_mb(cap),
+        ),
+        None => (0, 0),
     }
 }
 
-/// P54: いま VRAM に載っている expert の層別一覧 `(層, 昇順の expert index 列)`。
-///
-/// 層番号の昇順で返す。**載っていない層は含めない** (呼び出し側は
-/// 「送られてこない層 = 変化なし」として扱う)。VRAM 経路が無効/未初期化なら空。
-///
-/// ロックは 1 回だけ取る。中で写しを作ってすぐ離すので、推論スレッドを待たせない
-/// (`lru_keys` は 100 本程度の走査 + ソートしかしない)。
-pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
+fn bytes_to_mb(bytes: usize) -> u32 {
+    ((bytes >> 20).min(u32::MAX as usize)) as u32
+}
+
+/// LRU 側の `(使用中, ピン留め, 上限)`。未初期化 (cuda 無し / `DENNO_EXPERT_VRAM_MB` = 0)
+/// なら `(0, 0, 0)`。
+fn lru_budget() -> (usize, usize, usize) {
     #[cfg(feature = "cuda")]
     {
-        let mut out: Vec<(u16, Vec<u16>)> = Vec::new();
-        for k in gpu::resident_keys() {
-            match out.last_mut() {
-                Some((layer, v)) if *layer == k.layer => v.push(k.expert),
-                _ => out.push((k.layer, vec![k.expert])),
-            }
+        gpu::budget_usage().unwrap_or((0, 0, 0))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        (0, 0, 0)
+    }
+}
+
+/// `DENNO_EXPERT_VRAM_MB` のバイト数 (LRU が未初期化のときの予算の代わり)。
+fn env_expert_cap() -> usize {
+    vram_mb_from_value(std::env::var(EXPERT_VRAM_MB_ENV).ok().as_deref())
+        .saturating_mul(1024 * 1024)
+}
+
+/// 予算が初期化されているか (= 外部予約が会計に載るか)。
+///
+/// prefill の staging が [`budget_usage`] の `pinned` に二重計上されないように、
+/// 呼び出し側はこれを `Staging::guarded` として渡す。
+pub fn accounting_active() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::accounting_active()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P60: prefill のパック済み重み (VRAM staging) の在庫
+// ---------------------------------------------------------------------------
+
+/// P60: prefill の層一括 GEMM が VRAM に置いている「パック済み expert 群」1 本。
+///
+/// 1 層ぶんの gate/up/down を expert 昇順に詰め直したバッファで、実形 (27B) では
+/// 512 本 × 3 行列 ≈ 1.5 GB。**中身は 1 層ぶんだけ** (層が変われば作り直す)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Staging {
+    /// 一意な識別子 (cuda 側のパック cache の stamp = 層と expert 集合のハッシュ)
+    pub stamp: u64,
+    /// 層番号
+    pub layer: u16,
+    /// 昇順・重複なしの expert index
+    pub experts: Vec<u16>,
+    /// このバッファが VRAM で占めているバイト数
+    pub bytes: usize,
+    /// [`reserve_external`] が予算へ計上した (`pinned` に含まれる) か
+    pub guarded: bool,
+}
+
+thread_local! {
+    /// このスレッドが最後に VRAM へ載せたパック。
+    ///
+    /// 推論と構造テレメトリの送出は同じスレッドで走り、cuda 側の
+    /// `GROUPED_SCRATCH` も thread_local なので、スレッドごとに 1 本で足りる。
+    /// スレッドが終わればエントリも消える (VRAM も同じ寿命)。
+    static STAGING: std::cell::RefCell<Option<Staging>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// P60: prefill が VRAM に置いたパックを登録する (層が変われば置き換え)。
+///
+/// `experts` は問い合わせ順で良い (ここで昇順・重複なしに畳む)。
+/// `bytes` は VRAM を占めているバイト数 (`packed_bytes`)。
+/// `guarded` は「その VRAM がすでに [`budget_usage`] の `pinned` に計上されている」か。
+pub fn note_staging(stamp: u64, layer: u16, experts: &[u16], bytes: usize, guarded: bool) {
+    let mut v = experts.to_vec();
+    v.sort_unstable();
+    v.dedup();
+    let s = Staging {
+        stamp,
+        layer,
+        experts: v,
+        bytes,
+        guarded,
+    };
+    STAGING.with(|c| *c.borrow_mut() = Some(s));
+}
+
+/// P60: パックを手放したことを登録する (`stamp` が一致するときだけ)。
+pub fn clear_staging(stamp: u64) {
+    STAGING.with(|c| {
+        let mut b = c.borrow_mut();
+        if b.as_ref().is_some_and(|s| s.stamp == stamp) {
+            *b = None;
         }
-        out
+    });
+}
+
+/// P60: このスレッドが VRAM に持っているパックの写し (テレメトリ・テスト用)。
+pub fn staged() -> Option<Staging> {
+    STAGING.with(|c| c.borrow().clone())
+}
+
+/// P60: 複数の情報源の鍵を `(層, expert)` 昇順・重複なしに畳む (純関数)。
+pub fn union_keys(sources: &[&[ExpertKey]]) -> Vec<ExpertKey> {
+    let mut out: Vec<ExpertKey> = sources
+        .iter()
+        .flat_map(|s| s.iter().copied())
+        .collect();
+    out.sort_unstable_by_key(|k| (k.layer, k.expert));
+    out.dedup();
+    out
+}
+
+/// LRU 側の鍵 (cuda 無し・未初期化なら空)。
+fn lru_keys() -> Vec<ExpertKey> {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::resident_keys()
     }
     #[cfg(not(feature = "cuda"))]
     {
         Vec::new()
     }
+}
+
+/// P60: いま VRAM に載っている expert の鍵 `(層, expert)` 昇順・重複なし。
+///
+/// 情報源は「decode の LRU」+「prefill のパック済み staging」の和集合。
+/// どちらも空なら空。ロックは LRU の写しを作るときだけ取る (この関数の中で
+/// ソートするのは写しの後)。
+pub fn resident_keys() -> Vec<ExpertKey> {
+    let lru = lru_keys();
+    let mut staged_keys: Vec<ExpertKey> = Vec::new();
+    if let Some(s) = staged() {
+        staged_keys.reserve(s.experts.len());
+        for &expert in &s.experts {
+            staged_keys.push(ExpertKey {
+                layer: s.layer,
+                expert,
+            });
+        }
+    }
+    union_keys(&[&lru, &staged_keys])
+}
+
+/// P54: いま VRAM に載っている expert の層別一覧 `(層, 昇順の expert index 列)`。
+///
+/// 層番号の昇順で返す。**載っていない層は含めない** (呼び出し側は
+/// 「送られてこない層 = 変化なし」として扱う)。VRAM 経路が無効/未初期化で
+/// staging も無ければ空。
+///
+/// 走査は [`resident_keys`] 1 回。LRU のロックは写しを作るときだけ取る。
+pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
+    let mut out: Vec<(u16, Vec<u16>)> = Vec::new();
+    for k in resident_keys() {
+        match out.last_mut() {
+            Some((layer, v)) if *layer == k.layer => v.push(k.expert),
+            _ => out.push((k.layer, vec![k.expert])),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -783,6 +991,11 @@ mod gpu {
         let c = CACHE.get()?;
         let g = c.lock().ok()?;
         Some((g.used_bytes(), g.pinned_bytes(), g.cap_bytes()))
+    }
+
+    /// P60: 予算が初期化されているか (= [`reserve_external`] が会計に載るか)。
+    pub fn accounting_active() -> bool {
+        CACHE.get().is_some()
     }
 
     /// P54: いま載っている expert の鍵を `(層, expert)` 昇順で返す。
@@ -1020,6 +1233,7 @@ mod gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::expert_cache::ExpertKey;
 
     /// 追い出しは「最終使用が最も古い」1 本から。
     #[test]
@@ -1251,8 +1465,119 @@ mod tests {
         let r = reserve_external(3_000_000).expect("予算が無いときは必ず借りられる");
         assert!(!r.is_guarded(), "会計なし (予算未初期化)");
         assert_eq!(r.bytes(), 3_000_000);
-        assert_eq!(budget_usage(), None, "予算そのものが無い");
+        // 予算が 1 つも設定されていなければ会計は無い。`DENNO_GPU_WEIGHT_MB` だけが
+        // 立っている環境では「dense の予算だけある」状態なので、そのときは
+        // `used + pinned == 0` かつ `cap == weight_cap` を返す (P60)。
+        match budget_usage() {
+            None => assert_eq!(crate::gpu_budget::weight_cap_bytes(), 0, "予算が設定済み"),
+            Some((used, pinned, cap)) => {
+                assert_eq!((used, pinned), (0, 0));
+                assert_eq!(cap as u64, crate::gpu_budget::weight_cap_bytes());
+            }
+        }
         drop(r); // 何も起きない (パニックしないこと)
+    }
+
+    // -----------------------------------------------------------------------
+    // P60: 在庫の情報源 (LRU + prefill staging) と TierStats の値
+    // -----------------------------------------------------------------------
+
+    fn key(layer: u16, expert: u16) -> ExpertKey {
+        ExpertKey { layer, expert }
+    }
+
+    /// 2 つの情報源 (LRU と staging) の和集合が `(層, expert)` 昇順・重複なしになる。
+    #[test]
+    fn union_of_sources_is_sorted_and_deduped() {
+        let lru = [key(3, 7), key(1, 2)];
+        let staged = [key(1, 2), key(0, 9), key(3, 1)];
+        assert_eq!(
+            union_keys(&[&lru, &staged]),
+            vec![key(0, 9), key(1, 2), key(3, 1), key(3, 7)],
+            "和集合が昇順・重複なしでない"
+        );
+        assert_eq!(union_keys(&[]), Vec::<ExpertKey>::new());
+        assert_eq!(union_keys(&[&[], &[]]), Vec::<ExpertKey>::new());
+        // 片方が空でも他方は残る (GPU 無しのビルドで staging だけが見える場合)。
+        assert_eq!(union_keys(&[&lru, &[]]), vec![key(1, 2), key(3, 7)]);
+    }
+
+    /// staging に載せた expert が在庫として見える。層が変われば置き換わる。
+    ///
+    /// `STAGING` は thread_local なので、テストごとのスレッドで独立している
+    /// (他のテストや推論スレッドの在庫と混ざらない)。
+    #[test]
+    fn staging_keys_are_part_of_the_inventory() {
+        assert!(staged().is_none(), "このスレッドに前の登録が残っている");
+        note_staging(11, 4, &[9, 3, 3, 5], 1 << 20, true);
+        let s = staged().expect("登録した staging が無い");
+        assert_eq!(s.experts, vec![3, 5, 9], "昇順・重複なしに畳んでいない");
+        assert_eq!(s.bytes, 1 << 20);
+        assert!(s.guarded);
+        assert_eq!(
+            resident_keys(),
+            vec![key(4, 3), key(4, 5), key(4, 9)],
+            "staging の expert が在庫に入っていない"
+        );
+        assert_eq!(resident_by_layer(), vec![(4u16, vec![3u16, 5, 9])]);
+
+        // 層が変われば置き換え (VRAM には 1 層ぶんしか無い)。
+        note_staging(12, 7, &[1], 1 << 20, true);
+        assert_eq!(resident_keys(), vec![key(7, 1)], "前の層の在庫が残っている");
+        clear_staging(11); // 古い stamp では消えない
+        assert!(staged().is_some(), "stamp が違うのに消した");
+        clear_staging(12);
+        assert!(staged().is_none());
+        assert!(resident_keys().is_empty());
+    }
+
+    /// 会計が無い (予算未初期化) ときの staging も `pinned` に足す = 在庫を隠さない。
+    #[test]
+    fn unguarded_staging_is_counted_as_pinned() {
+        note_staging(21, 2, &[1, 2], 5 * 1024 * 1024, false);
+        let (used, pinned, _cap) = budget_usage().expect("在庫があるので会計は返る");
+        assert_eq!(used, 0, "LRU は空 (GPU 無し / 未初期化)");
+        assert_eq!(
+            pinned,
+            5 * 1024 * 1024,
+            "会計なしの staging が pinned に入っていない"
+        );
+        clear_staging(21);
+
+        // 計上済み (guarded) の staging は足さない (二重計上しない)。
+        // 予算も無いので会計そのものは `None` (返るなら pinned は 0)。
+        note_staging(22, 2, &[1, 2], 5 * 1024 * 1024, true);
+        if let Some((_used, pinned, _cap)) = budget_usage() {
+            assert_eq!(pinned, 0, "guarded の stage を二重に数えている");
+        }
+        clear_staging(22);
+    }
+
+    /// TierStats の `vramMB` は「予算 > 0 かつ在庫 > 0」で 0 でなくなる。
+    ///
+    /// 実機 (GPU) では `budget_usage()` が LRU の実バイトを返す。ここではその
+    /// 組み立てを純関数で固定する (GPU 無しで回る)。
+    #[test]
+    fn tier_stats_mb_is_nonzero_with_budget_and_inventory() {
+        const MIB: usize = 1024 * 1024;
+        let usage = budget_from_parts(1 * MIB, 2 * MIB, 18 * 1024 * MIB, 0)
+            .expect("予算があるので会計は返る");
+        let (used_mb, total_mb) = tier_mb(Some(usage));
+        assert_eq!(used_mb, 3, "在庫 3 MiB が 0 になっている");
+        assert_ne!(used_mb, 0, "在庫 > 0 なのに vramMB が 0");
+        assert_eq!(total_mb, 18 * 1024);
+
+        // 予算は expert (18 GiB) + dense 重み (6 GiB) の合計。
+        let usage = budget_from_parts(0, 3 * MIB, 18 * 1024 * MIB, 6 * 1024 * MIB).unwrap();
+        assert_eq!(tier_mb(Some(usage)), (3, 24 * 1024));
+
+        // 予算も在庫も無い → 0/0 (`tier_mb(None)`)。
+        assert_eq!(budget_from_parts(0, 0, 0, 0), None);
+        assert_eq!(tier_mb(None), (0, 0));
+
+        // 予算だけある (在庫 0) → used 0 / total > 0。0 を 0 のまま出す。
+        let usage = budget_from_parts(0, 0, 0, 18 * 1024 * MIB).unwrap();
+        assert_eq!(tier_mb(Some(usage)), (0, 18 * 1024));
     }
 
     // -----------------------------------------------------------------------

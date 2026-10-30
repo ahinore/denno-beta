@@ -766,6 +766,26 @@ pub(crate) fn try_experts(
         scatter.scatter(&mut *out, &h, weights, k, e)?;
         Ok(true)
     })??;
+    // P60: 実際に VRAM に残っているパックを在庫として登録する。
+    //
+    // `with_packed` が `true` を返した = パック済みバッファがデバイスに載って
+    // カーネルが走った、という意味なので、そのときだけ登録する (走らなかった
+    // 回に登録すると在庫を過大に報告する)。バッファは次の層まで残るので、
+    // 登録はそのまま「いま VRAM にある」を表す。
+    //
+    // `guarded` は「この VRAM がすでに expert の予算 (`pinned`) に計上済みか」。
+    // 計上済みなら `budget_usage` 側で二重に足さない。
+    if ran {
+        if let Ok(layer) = u16::try_from(layer_key) {
+            crate::model::expert_vram::note_staging(
+                stamp,
+                layer,
+                &plan.expert_ids,
+                plan.packed_bytes,
+                crate::model::expert_vram::accounting_active(),
+            );
+        }
+    }
     Ok(ran)
 }
 
