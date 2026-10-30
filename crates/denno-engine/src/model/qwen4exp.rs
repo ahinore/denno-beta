@@ -3768,6 +3768,34 @@ fn moe_par_enabled() -> bool {
     *ON.get_or_init(|| moe_par_from_value(std::env::var("DENNO_MOE_PAR").ok().as_deref()))
 }
 
+/// P64: 1 層ぶんの expert ループを **1 つの rayon 並列領域**にまとめる新経路の
+/// ゲート (`DENNO_EXPERT_LOOP`, 既定 off)。プロセスで 1 回だけ読む。
+///
+/// off のときの経路は従来と同一 (`moe_ffn_quant_full_opts` の `loop_on=false`)。
+fn expert_loop_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = expert_loop_from_value(std::env::var("DENNO_EXPERT_LOOP").ok().as_deref());
+        if on {
+            // 1 回だけ出す (毎層の eprintln は decode の邪魔になる)。
+            eprintln!("[flash] expert loop: ON (1 層 1 並列領域 / DENNO_EXPERT_LOOP)");
+        }
+        on
+    })
+}
+
+/// `DENNO_EXPERT_LOOP` の値解釈。
+///
+/// **既定 (未設定・空) は off**。`1` / `on` / `true` のときだけ on にする
+/// (`DENNO_MOE_PAR` のような「0 以外は on」にしない。誤設定で新経路に入ると
+/// 比較の基準が無くなるため)。
+fn expert_loop_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim),
+        Some("1") | Some("on") | Some("ON") | Some("true")
+    )
+}
+
 /// [`moe_ffn_quant`] の本体。`par` は expert ループの並列化 on/off
 /// (env を読まずに両経路を比べられるよう引数で受ける)。
 ///
@@ -3802,7 +3830,9 @@ fn moe_ffn_quant_with(
     par: bool,
     route: Route,
 ) -> Result<Vec<f32>> {
-    moe_ffn_quant_full(p, lw, x, cache, par, route, None, true)
+    // 既存のテスト用入口は**従来経路を固定**する (`DENNO_EXPERT_LOOP` に依存させない)。
+    // P64 の新経路は [`moe_ffn_quant_full_opts`] を直接呼ぶテストで確かめる。
+    moe_ffn_quant_full_opts(p, lw, x, cache, par, route, None, true, false)
 }
 
 /// [`moe_ffn_quant_with`] の本体 (+ P54 の役割別 RMS / P56 の RouterTopK)。
@@ -3817,8 +3847,37 @@ fn moe_ffn_quant_full(
     cache: Option<&ExpertCacheSet>,
     par: bool,
     route: Route,
+    roles: Option<&mut RoleRms>,
+    emit_router: bool,
+) -> Result<Vec<f32>> {
+    moe_ffn_quant_full_opts(
+        p,
+        lw,
+        x,
+        cache,
+        par,
+        route,
+        roles,
+        emit_router,
+        expert_loop_enabled(),
+    )
+}
+
+/// [`moe_ffn_quant_full`] の本体。`loop_on` は P64 の新経路 (1 層 1 並列領域) を
+/// env を読まずに選ぶための引数。
+///
+/// **`loop_on == false` のときの経路は従来と同一** (下の `if loop_new` が丸ごと
+/// 飛ばされるだけで、`else if parallel` 以降の文は 1 行も変えていない)。
+fn moe_ffn_quant_full_opts(
+    p: &Qwen4ExpParams,
+    lw: &LayerW,
+    x: &[f32],
+    cache: Option<&ExpertCacheSet>,
+    par: bool,
+    route: Route,
     mut roles: Option<&mut RoleRms>,
     emit_router: bool,
+    loop_on: bool,
 ) -> Result<Vec<f32>> {
     let t_router = std::time::Instant::now();
     let e = p.n_embd;
@@ -3911,11 +3970,34 @@ fn moe_ffn_quant_full(
         let _ = par;
         false
     };
+    // P64: 新経路 (1 層 1 並列領域)。rayon が要るので `par` 機能が無いビルドと、
+    // GPU 経路 (`use_gpu`) では使わない (GPU の層一括・per-expert 経路は従来のまま)。
+    #[cfg(feature = "par")]
+    let loop_new = loop_on && !use_gpu;
+    #[cfg(not(feature = "par"))]
+    let loop_new = {
+        let _ = loop_on;
+        false
+    };
 
     moe_sub_add(0, t_router.elapsed());
     let t_experts = std::time::Instant::now();
 
-    if parallel {
+    if loop_new {
+        // P64: 1 層ぶんの寄与を 1 つの並列領域で計算し、足し込みは index 昇順の
+        // 逐次 (下の `else if parallel` と 1 要素ずつ同じ順序で足す)。
+        #[cfg(feature = "par")]
+        {
+            let hs = expert_contribs_loop(lw, &sel, x, e, ff, cache)?;
+            for (t, &_ei) in sel.iter().enumerate() {
+                let pe = weights[t];
+                let hh = &hs[t * e..(t + 1) * e];
+                for j in 0..e {
+                    out[j] += pe * hh[j];
+                }
+            }
+        }
+    } else if parallel {
         #[cfg(feature = "par")]
         {
             let hs = expert_contribs_par(lw, &sel, x, e, ff, cache)?;
@@ -6012,6 +6094,18 @@ fn moe_ffn_quant_batch_full(
 pub(crate) static PAR_CONTRIB_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// テスト用: 従来の並列経路 [`expert_contribs_par`] が**並列領域**を立てた回数
+/// (層 1 回 = 1)。P64 の「1 層 1 回」の比較対象。
+#[cfg(test)]
+pub(crate) static PAR_CONTRIB_REGIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// テスト用: 新経路 [`expert_contribs_loop`] が**並列領域**を立てた回数
+/// (層 1 回 = 1)。P64 の「1 層 1 回」の証拠。
+#[cfg(test)]
+pub(crate) static EXPERT_LOOP_REGIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// 選択 expert の寄与 `h_e` (長さ `e = n_embd`) を rayon で並列に計算する (P-MOE-G5)。
 ///
 /// 返り値の `hs[t]` は `sel[t]` の寄与で、**足し込みは呼び出し側が index 昇順に
@@ -6030,6 +6124,8 @@ fn expert_contribs_par(
     cache: Option<&ExpertCacheSet>,
 ) -> Result<Vec<Vec<f32>>> {
     use rayon::prelude::*;
+    #[cfg(test)]
+    PAR_CONTRIB_REGIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     sel.par_iter()
         .map(|&ei| {
             let mut act = vec![0.0f32; ff];
@@ -6087,6 +6183,107 @@ fn expert_contribs_par(
             Ok(h)
         })
         .collect()
+}
+
+/// P64: 新経路 ([`expert_contribs_loop`]) のスレッドローカルな作業域。
+///
+/// `act` / `up` は `n_ff_exp`。寄与の出力 (`e` 要素) は呼び出し側のバッファへ
+/// 直接書くので、ここには持たない。
+#[cfg(feature = "par")]
+struct ExpertScratch {
+    act: Vec<f32>,
+    up: Vec<f32>,
+}
+
+#[cfg(feature = "par")]
+impl ExpertScratch {
+    fn new(ff: usize) -> Self {
+        Self {
+            act: vec![0.0f32; ff],
+            up: vec![0.0f32; ff],
+        }
+    }
+}
+
+/// P64: expert 1 本の寄与 `h = down(silu(gate(x)) * up(x))` を `h` に書く。
+///
+/// 従来の並列経路 ([`expert_contribs_par`]) の 1 expert ぶんと**同じ呼び出し列**:
+/// `gemv_seq` → `silu_inplace` → `gemv_seq` → 積 → `gemv_seq`
+/// (キャッシュ経路は `expert_gemv_cached_seq` × 3)。入口が同じなので、
+/// 同じ `x` に対してビット一致する。
+#[cfg(feature = "par")]
+fn expert_contrib_one(
+    lw: &LayerW,
+    cache: Option<&ExpertCacheSet>,
+    ei: usize,
+    x: &[f32],
+    s: &mut ExpertScratch,
+    h: &mut [f32],
+) -> Result<()> {
+    let ExpertScratch { act, up } = s;
+    match cache {
+        // 従来経路: mmap のスライスを直接 GEMV する (行並列なし)。
+        None => {
+            lw.gate_exps.gemv_seq(ei, x, act)?;
+            silu_inplace(act);
+            lw.up_exps.gemv_seq(ei, x, up)?;
+            for r in 0..act.len() {
+                act[r] *= up[r];
+            }
+            lw.down_exps.gemv_seq(ei, act, h)?;
+        }
+        // 常駐キャッシュ経路。バイト列の出所だけが違う。
+        Some(c) => {
+            expert_gemv_cached_seq(c, ExpertMatrix::Gate, &lw.gate_exps, lw.il, ei, x, act)?;
+            silu_inplace(act);
+            expert_gemv_cached_seq(c, ExpertMatrix::Up, &lw.up_exps, lw.il, ei, x, up)?;
+            for r in 0..act.len() {
+                act[r] *= up[r];
+            }
+            expert_gemv_cached_seq(c, ExpertMatrix::Down, &lw.down_exps, lw.il, ei, act, h)?;
+        }
+    }
+    Ok(())
+}
+
+/// P64: 1 層ぶんの expert 寄与を**1 つの rayon 並列領域**で計算する新経路。
+///
+/// 返り値は `hs[t * e + j]` = `sel[t]` の寄与の `j` 番目 (expert ごとの `Vec` は
+/// 作らない)。**足し込みは呼び出し側が index 昇順に逐次行う** (丸めの順序を
+/// 変えないため。ここで足してはいけない)。
+///
+/// 形:
+/// - 並列単位は expert (`sel` の各要素)。1 ジョブが gate / up / down の 3 行列を
+///   順に回す (**行列ごとに並列領域を立てない**)。
+/// - スクラッチ (`act` / `up`) は `map_init` の初期化でスレッドごとに 1 回だけ
+///   確保し、そのスレッドが担当する以降の expert で使い回す。
+/// - 寄与のバッファ `hs` は並列領域の外で 1 回だけ確保する。
+///
+/// 数値: 1 expert の計算は [`expert_contrib_one`] が [`ExpertW::gemv_seq`]
+/// (= `expert_gemv_any_seq`) で回す。従来の並列経路 ([`expert_contribs_par`]) と
+/// 同じカーネル・同じ行順で、行分割の有無は各要素の計算順序を変えないので
+/// **旧経路とビット一致**する。
+#[cfg(feature = "par")]
+fn expert_contribs_loop(
+    lw: &LayerW,
+    sel: &[usize],
+    x: &[f32],
+    e: usize,
+    ff: usize,
+    cache: Option<&ExpertCacheSet>,
+) -> Result<Vec<f32>> {
+    use rayon::prelude::*;
+    #[cfg(test)]
+    EXPERT_LOOP_REGIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut hs = vec![0.0f32; sel.len() * e];
+    hs.par_chunks_mut(e)
+        .zip(sel.par_iter())
+        .map_init(
+            || ExpertScratch::new(ff),
+            |s, (h, &ei)| -> Result<()> { expert_contrib_one(lw, cache, ei, x, s, h) },
+        )
+        .collect::<Result<Vec<()>>>()?;
+    Ok(hs)
 }
 
 /// キャッシュ経路の 1 expert GEMV (P-MOE-G1)。
@@ -6401,6 +6598,131 @@ mod tests {
         path
     }
 
+    /// P64: 層数と次元を指定して expert 3 行列 (`blk.{il}.ffn_{gate,up,down}_exps`)
+    /// を `nl` 層ぶん書く。1 層版の [`write_expert_gguf`] と同じ型 (Q4_K gate/up・
+    /// Q5_1 down) で、層ごとに expert のバイト値を変えてある。
+    fn write_expert_gguf_n(
+        dir: &TempDir,
+        name: &str,
+        n_embd: usize,
+        n_ff: usize,
+        ne: usize,
+        nl: usize,
+    ) -> PathBuf {
+        let path = dir.path(name);
+        let mut tensors: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+        for il in 0..nl {
+            let (mut gate, mut up, mut down) = (Vec::new(), Vec::new(), Vec::new());
+            for e in 0..ne {
+                let s = e + 1000 * il;
+                gate.extend_from_slice(&q4k_expert_bytes(n_embd, n_ff, s));
+                up.extend_from_slice(&q4k_expert_bytes(n_embd, n_ff, s + 7));
+                down.extend_from_slice(&q5_1_expert_bytes(n_ff, n_embd, s + 3));
+            }
+            tensors.push((
+                format!("blk.{il}.ffn_gate_exps.weight"),
+                vec![n_embd as u64, n_ff as u64, ne as u64],
+                TY_Q4_K,
+                gate,
+            ));
+            tensors.push((
+                format!("blk.{il}.ffn_up_exps.weight"),
+                vec![n_embd as u64, n_ff as u64, ne as u64],
+                TY_Q4_K,
+                up,
+            ));
+            tensors.push((
+                format!("blk.{il}.ffn_down_exps.weight"),
+                vec![n_ff as u64, n_embd as u64, ne as u64],
+                TY_Q5_1,
+                down,
+            ));
+        }
+        let kvs = [
+            ("general.architecture", Kv::Str("qwen4exp")),
+            ("general.alignment", Kv::U32(ALIGN as u32)),
+        ];
+        write_gguf(&path, &kvs, &tensors);
+        path
+    }
+
+    /// P64 ベンチ用: `real` に挙げた expert だけ実データを書き、他は 0 (疎) のままに
+    /// する巨大な合成 GGUF。512 expert × 3 行列を 1 本にすると 1.5 GB になるので、
+    /// [`write_gguf`] のように全体を `Vec` に組まず、ヘッダだけ書いてから
+    /// `set_len` + pwrite で必要な expert を置く。
+    #[cfg(feature = "par")]
+    fn write_expert_gguf_sparse(
+        path: &Path,
+        n_embd: usize,
+        n_ff: usize,
+        ne: usize,
+        real: &[usize],
+    ) {
+        use std::io::{Seek, SeekFrom, Write};
+
+        // 1 expert ぶんのバイト数 (gate/up は Q4_K、down は Q5_1)。
+        let gate_e = n_ff * (n_embd / 256) * 144;
+        let down_e = n_embd * (n_ff / 32) * 24;
+        let lens = [ne * gate_e, ne * gate_e, ne * down_e];
+        let dims: [Vec<u64>; 3] = [
+            vec![n_embd as u64, n_ff as u64, ne as u64],
+            vec![n_embd as u64, n_ff as u64, ne as u64],
+            vec![n_ff as u64, n_embd as u64, ne as u64],
+        ];
+        let names = [
+            "blk.0.ffn_gate_exps.weight".to_string(),
+            "blk.0.ffn_up_exps.weight".to_string(),
+            "blk.0.ffn_down_exps.weight".to_string(),
+        ];
+        let tys = [TY_Q4_K, TY_Q4_K, TY_Q5_1];
+
+        // ヘッダは [`write_gguf`] と同じ並び (データは 32 B 整列で順に置く)。
+        let mut head = Vec::new();
+        head.extend_from_slice(b"GGUF");
+        head.extend_from_slice(&3u32.to_le_bytes());
+        head.extend_from_slice(&(3u64).to_le_bytes());
+        head.extend_from_slice(&(2u64).to_le_bytes());
+        push_str(&mut head, "general.architecture");
+        Kv::Str("qwen4exp").write(&mut head);
+        push_str(&mut head, "general.alignment");
+        Kv::U32(ALIGN as u32).write(&mut head);
+        let mut offs = Vec::new();
+        let mut cur = 0usize;
+        for len in &lens {
+            offs.push(cur);
+            cur = align_up(cur + len, ALIGN);
+        }
+        for i in 0..3 {
+            push_str(&mut head, &names[i]);
+            head.extend_from_slice(&(dims[i].len() as u32).to_le_bytes());
+            for d in &dims[i] {
+                head.extend_from_slice(&d.to_le_bytes());
+            }
+            head.extend_from_slice(&tys[i].to_le_bytes());
+            head.extend_from_slice(&(offs[i] as u64).to_le_bytes());
+        }
+
+        let head_len = align_up(head.len(), ALIGN);
+        let mut file = std::fs::File::create(path).expect("疎 GGUF の作成");
+        file.write_all(&head).expect("ヘッダ");
+        file.set_len((head_len + cur) as u64).expect("set_len");
+        let per = [gate_e, gate_e, down_e];
+        for &e in real {
+            for (i, bytes) in [
+                q4k_expert_bytes(n_embd, n_ff, e),
+                q4k_expert_bytes(n_embd, n_ff, e + 7),
+                q5_1_expert_bytes(n_ff, n_embd, e + 3),
+            ]
+            .iter()
+            .enumerate()
+            {
+                file.seek(SeekFrom::Start((head_len + offs[i] + e * per[i]) as u64))
+                    .expect("seek");
+                file.write_all(bytes).expect("expert のバイト列");
+            }
+        }
+    }
+
     /// `moe_ffn_quant` が読むぶんだけ埋めた諸元 (validate は通さない)。
     fn cache_test_params() -> Qwen4ExpParams {
         Qwen4ExpParams {
@@ -6459,9 +6781,14 @@ mod tests {
     /// `moe_ffn_quant` が触るフィールドだけ実体を入れた層。
     /// hc_* は MoE では使わないので 1x1 のダミー。
     fn cache_test_layer(f: &GgufFile, p: &Qwen4ExpParams) -> LayerW {
-        let name = |s: &str| format!("blk.0.{s}");
+        layer_at(f, p, 0)
+    }
+
+    /// P64: `blk.{il}` のテンソルで組んだ層 (層番号だけ差し替える)。
+    fn layer_at(f: &GgufFile, p: &Qwen4ExpParams, il: usize) -> LayerW {
+        let name = |s: &str| format!("blk.{il}.{s}");
         LayerW {
-            il: 0,
+            il,
             hc_attn_norm: vec![1.0; p.n_embd],
             hc_attn_down: f32_linear(1, 1, 0.5),
             hc_attn_up: f32_linear(1, 1, 0.5),
@@ -6495,6 +6822,42 @@ mod tests {
         (0..n)
             .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013)
             .collect()
+    }
+
+    /// P64: 層ごとに違う入力 (seed で位相をずらすだけ。決定的)。
+    fn cache_test_x_seed(n: usize, seed: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| (((i * 37 + seed * 101) % 101) as f32 - 50.0) * 0.013)
+            .collect()
+    }
+
+    /// P64: 次元だけ差し替えた諸元 (合成 GGUF に合わせる)。
+    fn params_dims(n_embd: usize, n_ff: usize, ne: usize, k: usize) -> Qwen4ExpParams {
+        let mut p = cache_test_params();
+        p.n_embd = n_embd;
+        p.n_ff_exp = n_ff;
+        p.n_expert = ne;
+        p.n_expert_used = k;
+        p
+    }
+
+    /// P64 ベンチ用: `x` に対して logit が expert index の降順になるルータ。
+    ///
+    /// 行 `e` を `x * ((ne - e) * 0.001)` にすると `logit_e = (ne - e) * 0.001 * |x|^2`
+    /// で、top-k は必ず index 昇順の `0..k` になる。疎 GGUF で「実データを置いた
+    /// expert」と選択を一致させるために使う。
+    #[cfg(feature = "par")]
+    fn gate_inp_for(x: &[f32], ne: usize) -> GgufLinear {
+        let n = x.len();
+        let mut v = Vec::with_capacity(n * ne);
+        for e in 0..ne {
+            let s = (ne - e) as f32 * 0.001;
+            for &xv in x {
+                v.extend_from_slice(&(xv * s).to_le_bytes());
+            }
+        }
+        GgufLinear::new(GgmlType::F32, n, ne, WeightBlocks::from_vec(v))
+            .expect("GgufLinear::new (gate_inp)")
     }
 
     fn assert_bitwise_eq(a: &[f32], b: &[f32], what: &str) {
@@ -6982,6 +7345,213 @@ mod tests {
         assert_bitwise_eq(&seq, &par, "par=0 vs par=1");
     }
 
+    /// P64: `DENNO_EXPERT_LOOP` の値解釈。**既定は off**。
+    #[test]
+    fn expert_loop_gate_values() {
+        assert!(!expert_loop_from_value(None), "未設定は off (既定 off)");
+        assert!(!expert_loop_from_value(Some("")), "空文字は off");
+        assert!(!expert_loop_from_value(Some("0")), "0 は off");
+        assert!(!expert_loop_from_value(Some("2")), "1 以外の数は off");
+        assert!(expert_loop_from_value(Some("1")), "1 は on");
+        assert!(expert_loop_from_value(Some(" on ")), "on は on (前後の空白は無視)");
+        assert!(expert_loop_from_value(Some("true")), "true は on");
+    }
+
+    /// P64: decode 1 層あたりの rayon 並列領域の回数。
+    ///
+    /// - 新経路 (`DENNO_EXPERT_LOOP=1` 相当): **1 回**。
+    /// - 従来の既定 (par=1): 1 回 (expert 並列)。
+    /// - 従来の par=0: 行列ごとに立つので 選択 expert 数 x 3 回。
+    ///
+    /// 行並列は `n_out >= PAR_MIN_ROWS` (512) でしか立たないので、この合成層は
+    /// `n_embd = 512` (down の `n_out` = 512) にしてある。
+    #[test]
+    #[cfg(feature = "par")]
+    fn expert_loop_one_region_per_layer() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("loop_num");
+        let (nl, ne, k) = (3usize, 8usize, 3usize);
+        let path = write_expert_gguf_n(&dir, "3l.gguf", 512, 640, ne, nl);
+        let f = GgufFile::open(&path).expect("open");
+        let p = params_dims(512, 640, ne, k);
+        let xs: Vec<Vec<f32>> = (0..nl).map(|t| cache_test_x_seed(p.n_embd, t)).collect();
+        let load = |c: &std::sync::atomic::AtomicUsize| c.load(std::sync::atomic::Ordering::Relaxed);
+
+        for il in 0..nl {
+            let lw = layer_at(&f, &p, il);
+            let x = &xs[il];
+
+            // 1. 新経路: 層あたり 1 領域・内側の行並列なし。
+            let (e0, c0, r0) = (load(&EXPERT_LOOP_REGIONS), load(&PAR_CONTRIB_REGIONS), load(&moe_expert::ROW_PAR_REGIONS));
+            let _ = moe_ffn_quant_full_opts(&p, &lw, x, None, true, Route::Cpu, None, true, true)
+                .expect("新経路");
+            assert_eq!(load(&EXPERT_LOOP_REGIONS) - e0, 1, "層 {il}: 新経路の並列領域が 1 回でない");
+            assert_eq!(load(&PAR_CONTRIB_REGIONS) - c0, 0, "層 {il}: 新経路で旧の並列領域が立った");
+            assert_eq!(load(&moe_expert::ROW_PAR_REGIONS) - r0, 0, "層 {il}: 新経路の内側で行並列が立った");
+
+            // 2. 旧経路 (既定 par=1): expert 並列の 1 領域・内側は行並列なし。
+            let (e0, c0, r0) = (load(&EXPERT_LOOP_REGIONS), load(&PAR_CONTRIB_REGIONS), load(&moe_expert::ROW_PAR_REGIONS));
+            let _ = moe_ffn_quant_full_opts(&p, &lw, x, None, true, Route::Cpu, None, true, false)
+                .expect("旧 par=1");
+            assert_eq!(load(&PAR_CONTRIB_REGIONS) - c0, 1, "層 {il}: 旧 par=1 の並列領域が 1 回でない");
+            assert_eq!(load(&moe_expert::ROW_PAR_REGIONS) - r0, 0, "層 {il}: 旧 par=1 の内側で行並列が立った");
+            assert_eq!(load(&EXPERT_LOOP_REGIONS) - e0, 0, "層 {il}: loop_on=false なのに新経路が走った");
+
+            // 3. 旧経路 (par=0): 行列ごとに立つ (選択 expert 数 x 3)。
+            let r0 = load(&moe_expert::ROW_PAR_REGIONS);
+            let _ = moe_ffn_quant_full_opts(&p, &lw, x, None, false, Route::Cpu, None, true, false)
+                .expect("旧 par=0");
+            assert_eq!(
+                load(&moe_expert::ROW_PAR_REGIONS) - r0,
+                k * 3,
+                "層 {il}: 旧 par=0 の行並列領域が k*3 でない"
+            );
+        }
+    }
+
+    /// P64: 新経路 (1 層 1 並列領域) が旧経路とビット一致する。
+    ///
+    /// 合成重みで 3 層ぶん回し、旧 par=1 / 旧 par=0 / 新 / 新+常駐キャッシュ の 4 本を
+    /// `to_bits()` で比べる。ビット一致の根拠は「1 要素の計算順を変えていない」こと:
+    /// 1 expert は同じ `gemv_seq` (同じカーネル・同じ行順)、足し込みは index 昇順の
+    /// 逐次で、並列化は expert 単位だけ。
+    #[test]
+    fn expert_loop_is_bit_identical_to_old_paths() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("loop_bits");
+        let (nl, ne, k) = (3usize, 8usize, 3usize);
+        let path = write_expert_gguf_n(&dir, "3l.gguf", 512, 640, ne, nl);
+        let f = GgufFile::open(&path).expect("open");
+        let p = params_dims(512, 640, ne, k);
+        let lw0 = layer_at(&f, &p, 0);
+        let lens = expert_lens(&lw0);
+        let set = ExpertCacheSet::new_with_slots([4, 4, 4], lens, &[path.clone()], 4).expect("cache set");
+
+        let run = |lw: &LayerW, x: &[f32], cache: Option<&ExpertCacheSet>, par: bool, lp: bool| {
+            moe_ffn_quant_full_opts(&p, lw, x, cache, par, Route::Cpu, None, true, lp)
+                .expect("moe_ffn_quant_full_opts")
+        };
+
+        for il in 0..nl {
+            let lw = layer_at(&f, &p, il);
+            let x = cache_test_x_seed(p.n_embd, il);
+            let old_par = run(&lw, &x, None, true, false);
+            let old_seq = run(&lw, &x, None, false, false);
+            assert!(old_par.iter().all(|v| v.is_finite()), "層 {il}: 旧経路に NaN/inf");
+            assert!(old_par.iter().any(|v| *v != 0.0), "層 {il}: 旧経路が全 0");
+            assert_bitwise_eq(&old_par, &old_seq, &format!("層 {il}: 旧 par=1 vs 旧 par=0"));
+
+            let new = run(&lw, &x, None, true, true);
+            assert_bitwise_eq(&old_par, &new, &format!("層 {il}: 旧 vs 新 (mmap)"));
+            let new_c = run(&lw, &x, Some(&set), true, true);
+            assert_bitwise_eq(&old_par, &new_c, &format!("層 {il}: 旧 vs 新 (常駐キャッシュ)"));
+        }
+    }
+
+    /// P64 マイクロベンチ: 1 層ぶん (512 expert 中 top-10、3 行列、`n_in = 2560` /
+    /// `n_ff = 640`) を 8 スレッドで 100 回流し、旧経路と新経路の時間を出す。
+    ///
+    /// 実行: `cargo test --release -p denno-engine --lib -- --ignored --nocapture bench_expert_loop_layer`
+    ///
+    /// 重みは疎ファイル (選択される expert 0..9 だけ実データ)。ループだけの比較と、
+    /// ルータ・shared expert を含む層 1 回ぶんの比較の両方を出す。数値は**実測**で、
+    /// この環境 (コンテナ・共有ホスト) の値であることに注意。
+    #[test]
+    #[cfg(feature = "par")]
+    #[ignore = "P64 マイクロベンチ (実測。通常のテストでは走らせない)"]
+    fn bench_expert_loop_layer() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("bench_loop");
+        let (n_embd, n_ff, ne, k) = (2560usize, 640usize, 512usize, 10usize);
+        let x = cache_test_x_seed(n_embd, 0);
+        let sel: Vec<usize> = (0..k).collect();
+        let path = dir.path("bench.gguf");
+        write_expert_gguf_sparse(&path, n_embd, n_ff, ne, &sel);
+        let f = GgufFile::open(&path).expect("open");
+        let p = params_dims(n_embd, n_ff, ne, k);
+        let mut lw = layer_at(&f, &p, 0);
+        lw.gate_inp = gate_inp_for(&x, ne);
+
+        // 選択が「実データを置いた expert」と一致すること (穴を読んだら比較が無意味)。
+        let mut probs = vec![0.0f32; ne];
+        lw.gate_inp.gemv(&x, &mut probs).expect("router");
+        softmax(&mut probs);
+        assert_eq!(select_topk(&probs, k), sel, "ルータの top-k が 0..k でない");
+
+        fn time_min<R, F: FnMut() -> R>(reps: usize, mut f: F) -> (f64, f64, R) {
+            let mut best = f64::INFINITY;
+            let mut sum = 0.0f64;
+            let mut out: Option<R> = None;
+            for _ in 0..reps {
+                let t = std::time::Instant::now();
+                let r = f();
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                best = best.min(ms);
+                sum += ms;
+                out = Some(r);
+            }
+            (best, sum / reps as f64, out.expect("reps > 0"))
+        }
+
+        let reps = 100usize;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .expect("8 スレッドのプール");
+
+        // 1. expert ループだけ (ルータ・shared expert を含まない)。
+        let (par_ms, par_avg, par_hs) = pool.install(|| {
+            time_min(reps, || {
+                expert_contribs_par(&lw, &sel, &x, n_embd, n_ff, None).expect("旧 par")
+            })
+        });
+        let (loop_ms, loop_avg, loop_hs) = pool.install(|| {
+            time_min(reps, || {
+                expert_contribs_loop(&lw, &sel, &x, n_embd, n_ff, None).expect("新")
+            })
+        });
+        let par_flat: Vec<f32> = par_hs.iter().flatten().copied().collect();
+        assert_bitwise_eq(&par_flat, &loop_hs, "ループ: 旧 vs 新");
+
+        // 2. 層 1 回ぶん (ルータ + expert + shared expert)。
+        let (layer_old_ms, layer_old_avg, old_out) = pool.install(|| {
+            time_min(reps, || {
+                moe_ffn_quant_full_opts(&p, &lw, &x, None, true, Route::Cpu, None, true, false)
+                    .expect("旧 層 par=1")
+            })
+        });
+        let (layer_seq_ms, _, seq_out) = pool.install(|| {
+            time_min(reps, || {
+                moe_ffn_quant_full_opts(&p, &lw, &x, None, false, Route::Cpu, None, true, false)
+                    .expect("旧 層 par=0")
+            })
+        });
+        let (layer_new_ms, layer_new_avg, new_out) = pool.install(|| {
+            time_min(reps, || {
+                moe_ffn_quant_full_opts(&p, &lw, &x, None, true, Route::Cpu, None, true, true)
+                    .expect("新 層")
+            })
+        });
+        assert_bitwise_eq(&old_out, &new_out, "層: 旧 par=1 vs 新");
+        assert_bitwise_eq(&old_out, &seq_out, "層: 旧 par=1 vs 旧 par=0");
+
+        eprintln!(
+            "[bench64] threads=8 reps={reps} experts={ne} topk={k} n_in={n_embd} n_ff={n_ff}"
+        );
+        eprintln!(
+            "[bench64] loop  旧(expert 並列) min/avg {par_ms:.3} / {par_avg:.3} ms  \
+             新(1 領域) min/avg {loop_ms:.3} / {loop_avg:.3} ms  比 {:.3}",
+            loop_ms / par_ms
+        );
+        eprintln!(
+            "[bench64] layer 旧 par=1 {layer_old_ms:.3} / {layer_old_avg:.3} ms  \
+             旧 par=0 {layer_seq_ms:.3} ms  新 {layer_new_ms:.3} / {layer_new_avg:.3} ms  \
+             比 新/旧(par=1) {:.3}  新/旧(par=0) {:.3}",
+            layer_new_ms / layer_old_ms,
+            layer_new_ms / layer_seq_ms
+        );
+    }
+
     #[test]
     fn expert_cache_path_is_bit_identical_to_mmap() {
         let _g = moe_test_guard();
@@ -7003,17 +7573,23 @@ mod tests {
             ExpertCacheSet::new_with_slots([2, 2, 2], lens, &[path.clone()], 2).expect("cache set");
         assert_eq!(set.slots(ExpertMatrix::Gate), 2, "スロット数が 2 でない");
         let par0 = PAR_CONTRIB_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let loop0 = EXPERT_LOOP_REGIONS.load(std::sync::atomic::Ordering::Relaxed);
         let got = moe_ffn_quant(&p, &lw, &x, Some(&set)).expect("cache 経路");
         assert_bitwise_eq(&want, &got, "mmap vs cache");
         // P38: キャッシュ経路でも expert 並列の分岐が発動している。旧実装は
         // `parallel = par && cache.is_none()` で、キャッシュを有効にすると
         // 10 expert が逐次に落ちていた (並列化の喪失が cache 大敗の主因)。
+        // P64: `DENNO_EXPERT_LOOP=1` のときは新経路 (1 層 1 領域) が動くので、
+        // どちらかが発動していればよい。
         #[cfg(feature = "par")]
-        assert_eq!(
-            PAR_CONTRIB_CALLS.load(std::sync::atomic::Ordering::Relaxed),
-            par0 + p.n_expert_used,
-            "キャッシュ経路が並列分岐に入っていない"
-        );
+        {
+            let jobs = PAR_CONTRIB_CALLS.load(std::sync::atomic::Ordering::Relaxed) - par0;
+            let regions = EXPERT_LOOP_REGIONS.load(std::sync::atomic::Ordering::Relaxed) - loop0;
+            assert!(
+                jobs == p.n_expert_used || regions == 1,
+                "キャッシュ経路が並列分岐にも新経路にも入っていない (jobs={jobs}, regions={regions})"
+            );
+        }
 
         // 3. 初回は全ミス (top-2 なので行列ごとに 2 回読む)
         for (k, &m) in ExpertMatrix::ALL.iter().enumerate() {

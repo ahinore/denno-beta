@@ -158,6 +158,15 @@ pub fn q4k_fused_supported() -> bool {
 #[cfg(test)]
 static FUSED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// テスト用: GEMV の**行並列領域**を立てた回数 (行列 1 回 = 1)。
+///
+/// [`for_each_row_chunk`] が実際に `par_chunks` を回したときだけ増える
+/// (`par=false` と `n_out < PAR_MIN_ROWS` では増えない)。
+/// 「1 層あたりの rayon 並列領域の回数」を数えるためのもの (P64)。
+#[cfg(test)]
+pub(crate) static ROW_PAR_REGIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Q4_K の融合 GEMV (AVX2 + FMA)。`out[r] = Σ_i w_ri * x_i` を、
 /// 行を f32 に展開せず 144 バイトブロックから直接 FMA で取る。
 ///
@@ -372,6 +381,8 @@ where
         f(blocks, out);
         return;
     }
+    #[cfg(test)]
+    ROW_PAR_REGIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // 1 スレッドあたり最低 64 行は残す (チャンクが細かすぎるとオーバーヘッドが勝つ)。
     let threads = rayon::current_num_threads().max(1);
     let want = n_out.div_ceil(threads).max(64);
