@@ -3883,6 +3883,14 @@ pub fn summary() -> String {
         s.push_str(&line);
         s.push('\n');
     }
+    // decode の GDN コア 4 区間 (`DENNO_GDN_KPROF=1` のときだけ)。
+    // prefill の上の行 (`[GDN_KPROF] pre/state/scan`) とは別系統で、こちらは
+    // `forward_token_core_gate` の conv / l2 / scan / rms を積んだもの。
+    // 未設定なら `line()` が None = 1 バイトも足さない。
+    if let Some(line) = crate::gdn::kprof::line() {
+        s.push_str(&line);
+        s.push('\n');
+    }
     s
 }
 
