@@ -771,6 +771,18 @@ addEventListener('keydown', (e) => { if (e.code === 'Space') { demo.paused = !de
 // 再生中 (?replay=1) は 1 ステップ 1 フレームでキャプチャを流してから書き出す。
 function shotRun() {
   const steps = parseInt(Q.get('steps') || '170', 10);
+  // 再生 (?replay=1) は fetch の後に rAF の連鎖が続かないことがある (headless の
+  // 仮想時間だと 2 回目以降のコールバックが来ない)。toDataURL は
+  // preserveDrawingBuffer で読むので、1 タスクで回しきって構わない。
+  if (replayOn) {
+    for (let i = 0; i < steps; i++) { step(0.016); replayStep(); }
+    window.__viewReady = true; hud();
+    document.getElementById('fps').textContent = 'shot';
+    document.getElementById('dump').textContent = canvas.toDataURL('image/png');
+    document.getElementById('live_done').textContent =
+      'replay: ' + cap.frames + ' frames / ' + cap.buf.length + ' B (bad ' + cap.bad + ')';
+    return;
+  }
   let i = 0;
   const tick = () => {
     step(0.016);
