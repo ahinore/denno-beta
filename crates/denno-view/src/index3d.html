@@ -535,7 +535,7 @@ function paintKv() {
   const col = kvInst.instanceColor.array;
   // 1 セル = kvDen/KVN トークン。kvDen は実際の長さに合わせて伸ばす
   // (max_ctx 65536 を 64 セルに割ると 1 セル 1024 tok になり、573 tok では点かない)。
-  const den = Math.max(1024, kv.total * 1.15, kv.len * 1.15);
+  const den = Math.max(96, kv.total * 1.15, kv.len * 1.15);
   const per = den / KVN;
   const nFill = Math.min(KVN, Math.ceil(kv.len / per));
   const nPre = Math.min(nFill, Math.floor(kv.reuse / per));
