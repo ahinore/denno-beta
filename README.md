@@ -52,17 +52,42 @@ Older numbers, rejected experiments and the protocol that defines "official" liv
 
 Flash-Next is a sparse MoE model served by its own path, `serve-flash`. It speaks the same `/v1/messages` API as everything else; `serve-flash` exists because the model has no `Engine` implementation behind `serve` — the 512-expert layout and the PLE tables need their own loader.
 
+### Getting the weights
+
+The GGUF is on the Hugging Face Hub, public — no login, no acceptance gate:
+
+| | |
+|---|---|
+| Repo | [`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (quantised from [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)) |
+| Quant | `UD-Q4_K_XL`, 4 shards, 111.3 GB / 103.7 GiB |
+| License | Qwen Community License 1.0 — `LICENSE` ships with the weights; keep it with any copy you pass on |
+
+```bash
+pip install -U huggingface_hub
+hf download unsloth/Qwen3.8-Flash-Next-GGUF \
+  --include "UD-Q4_K_XL/*" --local-dir ~/models/qwen38-flash-next
+```
+
+That leaves `~/models/qwen38-flash-next/UD-Q4_K_XL/` holding:
+
+```
+Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf   10.9 MB
+Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf   49.9 GB
+Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf   49.4 GB
+Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf   12.1 GB
+```
+
+`--dir` reads every `*.gguf` in a directory in sorted order, so keep one quant per folder. Sizes above are decimal GB (`du` reports 104 GiB).
+
 ```bash
 # 1. build the CUDA path (the feature lives on denno-engine, not on the binary crate)
 cargo build --release --features cuda -p denno-cli -p denno-engine
 
-# 2. fetch the split GGUF with any Hugging Face client and keep the shards in one directory;
-#    --dir takes every *.gguf in it, sorted, so don't mix two quants in the same folder
-hf download <org>/Qwen3.8-Flash-Next-GGUF --include "*UD-Q4_K_XL*" --local-dir ~/models/flash-next
+# 2. fetch the weights (command above), then point --dir at the shard directory
 
 # 3. start the server
 DENNO_CUDA=1 ./target/release/denno serve-flash \
-  --dir ~/models/flash-next \
+  --dir ~/models/qwen38-flash-next/UD-Q4_K_XL \
   --port 8098 --max-ctx 65536 --max-tokens 1024
 ```
 
@@ -181,4 +206,4 @@ Everything is sent on a channel that drops rather than blocks, so a slow viewer 
 
 Code: dual licensed under MIT or Apache License 2.0 — see [LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE).
 
-Weights are not distributed with this repository and keep their own licenses. Reference implementations are attributed in [docs/history/80_licenses.md](docs/history/80_licenses.md): llama.cpp (MIT) for the k-quant block formats and the GDN formulas, and the Qwen model sources for their architecture.
+Weights are not distributed with this repository and keep their own licenses — Qwen3.8-Flash-Next is under the [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE) (use, modification and redistribution are permitted; the notice must travel with copies, and a Model-as-a-Service offering needs a separate license from Qwen). Reference implementations are attributed in [docs/history/80_licenses.md](docs/history/80_licenses.md): llama.cpp (MIT) for the k-quant block formats and the GDN formulas, and the Qwen model sources for their architecture.

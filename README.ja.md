@@ -52,17 +52,42 @@ Flash-Next の decode 内訳(入力 49 + 出力 128 トークン、193.9 ms/toke
 
 Flash-Next はスパース MoE で、専用の `serve-flash` 経路で配信する。API は他と同じ `/v1/messages` で、`serve` と別経路なのはモデルが `Engine` 実装を持たないため(512 expert の配置と PLE の表に専用ローダが要る)。
 
+### 重みの取得先
+
+GGUF は Hugging Face Hub にあり、公開リポジトリなのでログインも同意ゲートも不要:
+
+| | |
+|---|---|
+| リポジトリ | [`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)(量子化元は [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)) |
+| 量子化 | `UD-Q4_K_XL`、4 分割、111.3 GB / 103.7 GiB |
+| ライセンス | Qwen Community License 1.0。`LICENSE` が重みと同梱されているので、複製を渡すときも一緒に渡す |
+
+```bash
+pip install -U huggingface_hub
+hf download unsloth/Qwen3.8-Flash-Next-GGUF \
+  --include "UD-Q4_K_XL/*" --local-dir ~/models/qwen38-flash-next
+```
+
+これで `~/models/qwen38-flash-next/UD-Q4_K_XL/` に次が入る:
+
+```
+Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf   10.9 MB
+Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf   49.9 GB
+Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf   49.4 GB
+Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf   12.1 GB
+```
+
+`--dir` はディレクトリ内の `*.gguf` をソート順に全部読むので、1 フォルダ 1 量子化にする。上の数字は 10 進 GB(`du` は 104 GiB と出る)。
+
 ```bash
 # 1. CUDA 経路をビルド(フィーチャは denno-engine 側にある)
 cargo build --release --features cuda -p denno-cli -p denno-engine
 
-# 2. 分割 GGUF を任意の HF クライアントで取得し、1 つのディレクトリに置く
-#    --dir はその中の *.gguf をソート順に全部読むので、別の量子化を混ぜないこと
-hf download <org>/Qwen3.8-Flash-Next-GGUF --include "*UD-Q4_K_XL*" --local-dir ~/models/flash-next
+# 2. 重みを取得(上のコマンド)し、shard のディレクトリを --dir に渡す
 
 # 3. サーバー起動
 DENNO_CUDA=1 ./target/release/denno serve-flash \
-  --dir ~/models/flash-next \
+  --dir ~/models/qwen38-flash-next/UD-Q4_K_XL \
   --port 8098 --max-ctx 65536 --max-tokens 1024
 ```
 
@@ -181,4 +206,4 @@ https://github.com/user-attachments/assets/3eb62bce-bfc8-44e7-adc8-bd95d60360f1
 
 コード: MIT または Apache License 2.0 のデュアルライセンス — [LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE)。
 
-重みはリポジトリに含めず、それぞれのライセンスに従う。参照した実装の出典は [docs/history/80_licenses.md](docs/history/80_licenses.md) にある: k-quant のブロック形式と GDN の数式は llama.cpp(MIT)、アーキテクチャは Qwen のモデル実装を参照している。
+重みはリポジトリに含めず、それぞれのライセンスに従う。Qwen3.8-Flash-Next は [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE)(利用・改変・再配布は可。複製には著作権表示と本ライセンスを同梱すること。Model as a Service として提供する場合は Qwen との別契約が要る)。参照した実装の出典は [docs/history/80_licenses.md](docs/history/80_licenses.md) にある: k-quant のブロック形式と GDN の数式は llama.cpp(MIT)、アーキテクチャは Qwen のモデル実装を参照している。
