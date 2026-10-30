@@ -558,6 +558,8 @@ pub struct CudaCtx {
     #[allow(dead_code)]
     module_moe: CUmodule,
     f_moe: Option<[CUfunction; 4]>,
+    /// P-gemv2: x 先読み版の GEMV (ビット一致)。読めなければ v1 を使う。
+    f_moe2: Option<[CUfunction; 4]>,
     /// P-PF-GB: prefill 用の量子 GEMM (Q8_0 / Q5_1 / Q4_K / Q5_K) を積んだ
     /// モジュール。数値契約は prefill のみ解除済み (`-fmad=true` で JIT)。
     /// 読み込みに失敗しても起動は壊さず `f_gemm_q = None` (CPU バッチへ落ちる)。
@@ -572,6 +574,9 @@ const PTX_GDN: &[u8] = include_bytes!("../kernels/kernels_gdn.ptx");
 // P-MOE-E1: Flash-Next の expert GEMV (Q8_0 / Q5_1 / Q4_K / Q5_K)。
 // CPU 参照 (`model::moe_expert::expert_gemv`) とビット一致する。
 const PTX_MOE: &[u8] = include_bytes!("../kernels/kernels_moe.ptx");
+/// P-gemv2: 同じ数値契約のまま x をレジスタへ先読みする版 (`kernels_moe_v2.cu`)。
+/// v1 とビット一致する (加算順・丸め順は同一)。`DENNO_GEMV_V2=0` で v1 に戻る。
+const PTX_MOE_V2: &[u8] = include_bytes!("../kernels/kernels_moe_v2.ptx");
 /// P-PF-GB: prefill 用の量子 GEMM。契約外 (FMA 融合あり) なので
 /// `kernels_moe.ptx` (-fmad=false) とは別ファイルにしてある。
 const PTX_GEMM_Q: &[u8] = include_bytes!("../kernels/kernels_gemm.ptx");
@@ -889,6 +894,35 @@ impl CudaCtx {
                 }
             }
 
+            // P-gemv2: 数値契約は v1 と同一で、x をレジスタへ先読みする版。
+            let mut module_moe2: CUmodule = std::ptr::null_mut();
+            let mut f_moe2: Option<[CUfunction; 4]> = None;
+            {
+                let mut image = PTX_MOE_V2.to_vec();
+                image.push(0);
+                if (lib.module_load_data)(&mut module_moe2, image.as_ptr() as *const c_void) == CUDA_SUCCESS {
+                    let mut fs: [CUfunction; 4] = [std::ptr::null_mut(); 4];
+                    let names: [&[u8]; 4] = [
+                        b"dno_gemv_q8_0_v2\0",
+                        b"dno_gemv_q5_1_v2\0",
+                        b"dno_gemv_q4k_v2\0",
+                        b"dno_gemv_q5k_v2\0",
+                    ];
+                    let mut ok = true;
+                    for (k, n) in names.iter().enumerate() {
+                        if (lib.module_get_function)(&mut fs[k], module_moe2, n.as_ptr() as *const c_char)
+                            != CUDA_SUCCESS
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        f_moe2 = Some(fs);
+                    }
+                }
+            }
+
             // P-PF-GB: prefill 用の量子 GEMM のモジュール。同じ規約 (4 本そろって初めて Some)。
             let mut module_gemm_q: CUmodule = std::ptr::null_mut();
             let mut f_gemm_q: Option<[CUfunction; 4]> = None;
@@ -954,6 +988,7 @@ impl CudaCtx {
                 f_gdn_chunk_scan_hoist,
                 module_moe,
                 f_moe,
+                f_moe2,
                 module_gemm_q,
                 f_gemm_q,
             })
@@ -1224,6 +1259,20 @@ impl CudaCtx {
         Ok(used)
     }
 
+    /// P-gemv2: 使う GEMV カーネル一式を選ぶ。
+    ///
+    /// `DENNO_GEMV_V2=0` で v1 (従来) に固定できる。v2 が読めていなければ v1。
+    /// v1 と v2 は**同じ数値契約** (i 昇順・f32 逐次加算・-fmad=false) なので、
+    /// どちらを選んでも出力ビットは一致する。
+    fn pick_moe_kernels(&self) -> Option<[CUfunction; 4]> {
+        if moe_gemv_v2_on() {
+            if let Some(f) = self.f_moe2 {
+                return Some(f);
+            }
+        }
+        self.f_moe
+    }
+
     /// P-MOE-E5: 既に VRAM に載っている重み (`dev_w`) で GEMV する。
     /// 重みの H2D を含まないので、常駐キャッシュ越しに毎トークン呼べる。
     /// 引数検査は [`Self::moe_gemv`] と同じ (重みのバイト長は検査できない)。
@@ -1237,7 +1286,7 @@ impl CudaCtx {
         out: &mut [f32],
     ) -> Result<bool> {
         use crate::kquant::GgmlType as T;
-        let fs = match self.f_moe {
+        let fs = match self.pick_moe_kernels() {
             Some(f) => f,
             None => return Ok(false),
         };
@@ -1277,13 +1326,96 @@ impl CudaCtx {
         let grid = ((n_out + MOE_ROWS_PER_BLOCK - 1) / MOE_ROWS_PER_BLOCK) as u32;
         MOE_SCRATCH.with(|cell| -> Result<()> {
             let mut s = cell.borrow_mut();
+            let s: &mut MoeScratch = &mut s;
             MoeScratch::ensure(&mut s.x, n_in * 4)?;
             MoeScratch::ensure(&mut s.o, n_out * 4)?;
+            let async_on = gemv_async_on();
+            if async_on {
+                MoeScratch::ensure_pin(&mut s.pin_x, n_in * 4)?;
+                MoeScratch::ensure_pin(&mut s.pin_o, n_out * 4)?;
+            }
             let xb = s.x.as_ref().expect("x は ensure 済み");
             let ob = s.o.as_ref().expect("o は ensure 済み");
+            let tr = gemv_trace_allow();
+            let t0 = tr.then(std::time::Instant::now);
+            if async_on {
+                // P-async: pinned → dev の H2D を非同期で積み、カーネルを積み、
+                // dev → pinned の D2H を非同期で積んで、**最後に 1 回だけ**同期する。
+                // 従来は「同期 H2D / カーネル / 明示 sync / 同期 D2H」で暗黙の同期が
+                // 3 回入っていた。カーネル・引数・発行順・丸め順は従来と同一。
+                {
+                    let px = s.pin_x.as_mut().expect("pin_x は ensure 済み");
+                    px.as_mut_slice::<f32>()[..n_in].copy_from_slice(x);
+                    let lib = lib()?;
+                    unsafe {
+                        check(
+                            (lib.memcpy_htod_async)(
+                                xb.ptr,
+                                px.ptr as *const c_void,
+                                n_in * 4,
+                                std::ptr::null_mut(),
+                            ),
+                            "cuMemcpyHtoDAsync (moe gemv)",
+                        )?;
+                    }
+                }
+                dbg_htod(n_in * 4);
+                let t1 = t0.map(|_| std::time::Instant::now());
+                let t_sync = crate::model::devprof::sync_start();
+                unsafe {
+                    let (mut pw, mut px, mut po) = (dev_w.ptr, xb.ptr, ob.ptr);
+                    let (mut n_in_c, mut n_out_c, mut rb_c) =
+                        (n_in as c_int, n_out as c_int, rb as c_int);
+                    let mut args = [
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut px as *mut _ as *mut c_void,
+                        &mut po as *mut _ as *mut c_void,
+                        &mut n_in_c as *mut _ as *mut c_void,
+                        &mut n_out_c as *mut _ as *mut c_void,
+                        &mut rb_c as *mut _ as *mut c_void,
+                    ];
+                    self.launch_async(f, (grid, 1, 1), (256, 1, 1), shmem, &mut args)?;
+                }
+                let t2 = t0.map(|_| std::time::Instant::now());
+                {
+                    let po = s.pin_o.as_mut().expect("pin_o は ensure 済み");
+                    let lib = lib()?;
+                    unsafe {
+                        check(
+                            (lib.memcpy_dtoh_async)(
+                                po.ptr,
+                                ob.ptr,
+                                n_out * 4,
+                                std::ptr::null_mut(),
+                            ),
+                            "cuMemcpyDtoHAsync (moe gemv)",
+                        )?;
+                    }
+                }
+                self.sync()?;
+                let t3 = t0.map(|_| std::time::Instant::now());
+                if let Some(t) = t_sync {
+                    crate::model::devprof::note_sync(t.elapsed().as_nanos() as u64);
+                }
+                let po = s.pin_o.as_ref().expect("pin_o は ensure 済み");
+                out.copy_from_slice(&po.as_slice::<f32>()[..n_out]);
+                if let (Some(a), Some(b), Some(c), Some(d)) = (t0, t1, t2, t3) {
+                    eprintln!(
+                        "[gemvt] {}x{} async=1 h2d={} launch={} sync={} copy={}us",
+                        n_out,
+                        n_in,
+                        (b - a).as_micros(),
+                        (c - b).as_micros(),
+                        (d - c).as_micros(),
+                        std::time::Instant::now().duration_since(d).as_micros()
+                    );
+                }
+                return Ok(());
+            }
             xb.copy_from(x)?;
             // H2D の計上は従来の `from_slice` と同じ (1 呼び出し = n_in * 4 B)。
             dbg_htod(n_in * 4);
+            let t1 = t0.map(|_| std::time::Instant::now());
             // devprof: 起動後の待ち (sync) + 結果読み出し (同期コピー) の実測。
             // off なら `None` で Instant を取らない。
             let t_sync = crate::model::devprof::sync_start();
@@ -1303,10 +1435,20 @@ impl CudaCtx {
                 self.sync()?;
             }
             let got: Vec<f32> = ob.to_vec(n_out)?;
+            let t3 = t0.map(|_| std::time::Instant::now());
             if let Some(t) = t_sync {
                 crate::model::devprof::note_sync(t.elapsed().as_nanos() as u64);
             }
             out.copy_from_slice(&got);
+            if let (Some(a), Some(b), Some(c)) = (t0, t1, t3) {
+                eprintln!(
+                    "[gemvt] {}x{} async=0 h2d={} launch+sync+d2h={}us",
+                    n_out,
+                    n_in,
+                    (b - a).as_micros(),
+                    (c - b).as_micros()
+                );
+            }
             Ok(())
         })?;
         Ok(true)
@@ -1469,11 +1611,69 @@ impl CudaCtx {
 struct MoeScratch {
     x: Option<DevBuffer>, // >= n_in * 4 B
     o: Option<DevBuffer>, // >= n_out * 4 B
+    // P-async: pinned の staging (H2D / D2H を async にするため)。
+    // `DENNO_GEMV_ASYNC=1` のときだけ確保する。
+    pin_x: Option<PinMem>,
+    pin_o: Option<PinMem>,
 }
 
 thread_local! {
     static MOE_SCRATCH: std::cell::RefCell<MoeScratch> =
-        std::cell::RefCell::new(MoeScratch { x: None, o: None });
+        std::cell::RefCell::new(MoeScratch { x: None, o: None, pin_x: None, pin_o: None });
+}
+
+/// P-async: decode の GEMV を「pinned staging + async コピー + 同期 1 回」で回すか。
+///
+/// 既定 off (`DENNO_GEMV_ASYNC=1` で有効)。off のとき従来の
+/// `copy_from` (同期 H2D) → カーネル → `sync` → `to_vec` (同期 D2H) を
+/// **1 命令も変えずに**通す。
+///
+/// 数値は不変: カーネル・引数・発行順・丸め順は同じで、コピーの API だけが
+/// 「同期」から「非同期 + 最後に 1 回同期」に変わる (バイト列は同一)。
+pub fn gemv_async_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("DENNO_GEMV_ASYNC").ok().as_deref(),
+            Some("1") | Some("on") | Some("true")
+        )
+    })
+}
+
+/// P-gemv2: x 先読み版の GEMV カーネルを使うか (既定 **on**)。
+///
+/// `DENNO_GEMV_V2=0` で v1 に戻る。v1 と v2 は同じ数値契約なので、切り替えても
+/// 出力ビットは一致する (速度だけが変わる)。
+pub fn moe_gemv_v2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("DENNO_GEMV_V2").ok().as_deref(),
+            Some("0") | Some("off") | Some("false")
+        )
+    })
+}
+
+/// 一時診断: 最初の N 回だけ GEMV の内訳 (H2D / 起動 / 同期 / D2H) を stderr に出す。
+/// `DENNO_GEMV_TRACE=N` (未設定 = 無効)。
+fn gemv_trace_allow() -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static LEFT: std::sync::OnceLock<AtomicUsize> = std::sync::OnceLock::new();
+    let left = LEFT.get_or_init(|| {
+        let n = std::env::var("DENNO_GEMV_TRACE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        AtomicUsize::new(n)
+    });
+    left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        if v == 0 {
+            None
+        } else {
+            Some(v - 1)
+        }
+    })
+    .is_ok()
 }
 
 /// スクラッチの確保サイズを決める純関数 (GPU 無しで検証できる)。
@@ -1495,6 +1695,14 @@ impl MoeScratch {
         let cur = cap.as_ref().map(|b| b.bytes()).unwrap_or(0);
         if let Some(bytes) = moe_scratch_alloc_bytes(cur, want) {
             *cap = Some(DevBuffer::alloc(bytes)?);
+        }
+        Ok(())
+    }
+
+    /// P-async: pinned staging の grow-only 確保。
+    fn ensure_pin(cap: &mut Option<PinMem>, bytes: usize) -> Result<()> {
+        if cap.as_ref().map(|b| b.bytes).unwrap_or(0) < bytes {
+            *cap = Some(PinMem::alloc(bytes)?);
         }
         Ok(())
     }
