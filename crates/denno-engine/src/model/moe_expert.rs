@@ -360,6 +360,47 @@ pub fn prefetch_range(bytes: &[u8]) {
     }
 }
 
+/// ページ単位に外側へ丸めた範囲へ `MADV_HUGEPAGE` を投げる (2 MB ページの利用を促す)。
+///
+/// 戻り値は `madvise(2)` が 0 を返したか。**失敗しても呼び出し側は続行する**
+/// (遅くなるだけで、読むバイト列は変わらない)。
+///
+/// 効くのはカーネルとファイルシステムが read-only のファイル写像に対する
+/// Transparent Huge Page をサポートしている場合だけ。**このコンテナ
+/// (kernel 6.17 / overlayfs) では `MADV_COLLAPSE` が EINVAL、`FilePmdMapped` は
+/// 0 のままで、実測の効果は無かった** (`REPORT_task67.md`)。
+///
+/// Linux 以外・非 x86_64 では何もせず false を返す。
+pub fn advise_hugepage_range(bytes: &[u8]) -> bool {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        extern "C" {
+            fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        const MADV_HUGEPAGE: i32 = 14; // linux/mman-common.h
+        const PAGE: usize = 4096;
+
+        if bytes.is_empty() {
+            return false;
+        }
+        let start = bytes.as_ptr() as usize;
+        let aligned = start & !(PAGE - 1);
+        // テンソルの末尾はページ境界に揃っていないので、外側へ丸める
+        // (VMA はファイル長をページに丸めた長さなので、丸めた末尾は写像の内側)。
+        let end = (start + bytes.len() + PAGE - 1) & !(PAGE - 1);
+        let len = end - aligned;
+        // SAFETY: `aligned` はページ境界で、`len` はその境界から元のスライス末尾を
+        // ページ単位に切り上げた位置まで。どちらも同じ mmap の読み取り専用写像の
+        // 内側なので範囲外を指さない。`madvise` はメモリの中身を変えない。
+        unsafe { madvise(aligned as *mut core::ffi::c_void, len, MADV_HUGEPAGE) == 0 }
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let _ = bytes;
+        false
+    }
+}
+
 /// 行方向の並列化しきい値。これ未満の行列はスレッドを立てる損のほうが大きい。
 const PAR_MIN_ROWS: usize = 512;
 

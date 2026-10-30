@@ -1619,6 +1619,22 @@ impl ExpertW {
                 w.n_expert, p.n_expert
             )));
         }
+        // task 67: expert テンソルの mmap に `MADV_HUGEPAGE` を付ける (既定 off)。
+        // 失敗しても読むバイト列は変わらないので、警告 1 行を出して続行する。
+        if expert_hugepage_enabled() {
+            #[cfg(test)]
+            EXPERT_HUGEPAGE_ADVISES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let ok = crate::model::moe_expert::advise_hugepage_range(w.blocks.as_slice());
+            if !ok {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "[flash] DENNO_EXPERT_HUGEPAGE=1: madvise(MADV_HUGEPAGE) が失敗 \
+                         (2 MB ページは使いません。動作は変わりません)"
+                    )
+                });
+            }
+        }
         Ok(w)
     }
 
@@ -1640,7 +1656,15 @@ impl ExpertW {
     }
 
     /// expert `e` のバイト範囲に先読みを投げる (mmap のページフォルトを先に起こす)。
+    ///
+    /// task 67: `DENNO_EXPERT_PREFETCH=1` のときだけ投げる (**既定 off**。
+    /// 実測で on が 6-8 % 遅かった。`REPORT_task67.md`)。
     fn prefetch(&self, e: usize) {
+        if !expert_prefetch_enabled() {
+            return;
+        }
+        #[cfg(test)]
+        EXPERT_PREFETCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Ok(s) = ExpertSlice::new(self.ty, self.n_in, self.n_out, self.n_expert, e) {
             let b = self.blocks.as_slice();
             if s.end() <= b.len() {
@@ -3796,6 +3820,140 @@ fn expert_loop_from_value(v: Option<&str>) -> bool {
     )
 }
 
+/// task 67: 選択 expert の mmap 先読み (`MADV_WILLNEED`) の on/off
+/// (`DENNO_EXPERT_PREFETCH`)。**既定 off** (task 67 の実測で on が遅かった)。
+///
+/// 数値には影響しない (ページを先に page cache へ読むだけ)。ただし
+/// `MADV_WILLNEED` は 1 呼び出しぶん (921 KB) の readahead を**呼び出しスレッドで
+/// 同期的に**起こすので、8 スレッドがフォルトで並列に読む従来経路より遅い。
+/// dev コンテナの実測は `REPORT_task67.md`: 温 page cache で +8 %、
+/// 冷 page cache (fadvise で落とした後) で +7 %。
+/// `DENNO_EXPERT_PREFETCH=1` で従来 (常時先読み) に戻せる。
+static EXPERT_PREFETCH_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// `DENNO_EXPERT_PREFETCH` の値解釈 (純粋関数)。既定 off、`1` / `on` / `true` で on。
+fn expert_prefetch_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim),
+        Some("1") | Some("on") | Some("ON") | Some("true")
+    )
+}
+
+fn expert_prefetch_enabled() -> bool {
+    match EXPERT_PREFETCH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        expert_prefetch_from_value(std::env::var("DENNO_EXPERT_PREFETCH").ok().as_deref())
+    })
+}
+
+/// task 67: expert テンソルの mmap に `MADV_HUGEPAGE` を付けるか
+/// (`DENNO_EXPERT_HUGEPAGE`)。**既定 off**。
+///
+/// dev コンテナ (kernel 6.17 / overlayfs) では read-only のファイル写像に対する
+/// THP が効かず (`MADV_COLLAPSE` が EINVAL・`FilePmdMapped` が 0)、実測の効果が
+/// 無かったので既定 off のままにした (`REPORT_task67.md`)。RO のファイル THP を
+/// サポートするカーネルでは `=1` で試せる。
+static EXPERT_HUGEPAGE_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// `DENNO_EXPERT_HUGEPAGE` の値解釈 (純粋関数)。既定 off、
+/// `1` / `on` / `true` のときだけ on (`DENNO_EXPERT_LOOP` と同じ厳しさ)。
+fn expert_hugepage_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim),
+        Some("1") | Some("on") | Some("ON") | Some("true")
+    )
+}
+
+fn expert_hugepage_enabled() -> bool {
+    match EXPERT_HUGEPAGE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        expert_hugepage_from_value(std::env::var("DENNO_EXPERT_HUGEPAGE").ok().as_deref())
+    })
+}
+
+/// task 67: CPU expert GEMV の作業域 (`act` / `up` / `h`) をスレッドローカルで
+/// 使い回すか (`DENNO_EXPERT_SCRATCH`)。**既定 off**。
+///
+/// dev コンテナの実測では効果が雑音に埋もれた (1 トークンの確保は 7.4 MB で、
+/// glibc のアリーナ再利用が効くため)。`=1` で使い回し経路になる。数値は変わらない
+/// (使う前に必ずゼロ埋めする)。詳細は [`with_expert_scratch`]。
+static EXPERT_SCRATCH_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// `DENNO_EXPERT_SCRATCH` の値解釈 (純粋関数)。既定 off、`1` / `on` / `true` で on。
+fn expert_scratch_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim),
+        Some("1") | Some("on") | Some("ON") | Some("true")
+    )
+}
+
+fn expert_scratch_enabled() -> bool {
+    match EXPERT_SCRATCH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        expert_scratch_from_value(std::env::var("DENNO_EXPERT_SCRATCH").ok().as_deref())
+    })
+}
+
+/// テスト専用: task 67 の 3 ゲートを env を触らずに切り替える (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_expert_fault_gates_for_test(
+    prefetch: Option<bool>,
+    hugepage: Option<bool>,
+    scratch: Option<bool>,
+) {
+    use std::sync::atomic::Ordering;
+    let enc = |v: Option<bool>| match v {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    EXPERT_PREFETCH_OVERRIDE.store(enc(prefetch), Ordering::Relaxed);
+    EXPERT_HUGEPAGE_OVERRIDE.store(enc(hugepage), Ordering::Relaxed);
+    EXPERT_SCRATCH_OVERRIDE.store(enc(scratch), Ordering::Relaxed);
+}
+
+/// テスト用: task 67 の各ゲートが実際に通った回数 (分岐が発動した証拠)。
+#[cfg(test)]
+pub(crate) static EXPERT_PREFETCH_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// テスト用: `MADV_HUGEPAGE` を投げたテンソル数。
+#[cfg(test)]
+pub(crate) static EXPERT_HUGEPAGE_ADVISES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// テスト用: スレッドローカルの作業域を使い回した回数 (確保し直した回数ではない)。
+#[cfg(test)]
+pub(crate) static EXPERT_SCRATCH_REUSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 選択 expert (`sel`) の 3 行列ぶんの先読みをまとめて投げる (task 67 で切り出し)。
+///
+/// `DENNO_EXPERT_PREFETCH=0` のときは [`ExpertW::prefetch`] が即座に戻る。
+fn prefetch_selected(lw: &LayerW, sel: &[usize]) {
+    for &ei in sel {
+        lw.gate_exps.prefetch(ei);
+        lw.up_exps.prefetch(ei);
+        lw.down_exps.prefetch(ei);
+    }
+}
+
 /// [`moe_ffn_quant`] の本体。`par` は expert ループの並列化 on/off
 /// (env を読まずに両経路を比べられるよう引数で受ける)。
 ///
@@ -3922,6 +4080,10 @@ fn moe_ffn_quant_full_opts(
     //     キャッシュ経路は pread で必要ぶんだけ読むので、mmap のページフォルトを
     //     先に起こす意味が無い (`prefetch()` 自体は無効化も変更もしない)。
     //
+    //     task 67: **先読みは既定で off** (`DENNO_EXPERT_PREFETCH=1` で on)。
+    //     `MADV_WILLNEED` は readahead を呼び出しスレッドで同期的に起こすので、
+    //     8 スレッドがフォルトで並列に読むほうが速い (実測 +6-8 %)。
+    //
     //     P39: VRAM 常駐経路 (`vram_mode`) では pread キャッシュを**使わない**
     //     (置き場所を 2 か所に持たない)。ヒットした expert は mmap を触らないので
     //     prefetch も投げない。ミスした expert は H2D のために同じページを
@@ -3945,11 +4107,7 @@ fn moe_ffn_quant_full_opts(
     }
     let cache = if vram_mode { None } else { cache };
     if cache.is_none() && !use_gpu {
-        for &ei in &sel {
-            lw.gate_exps.prefetch(ei);
-            lw.up_exps.prefetch(ei);
-            lw.down_exps.prefetch(ei);
-        }
+        prefetch_selected(lw, &sel);
     }
 
     // 4. 選択 expert を index 昇順に積む
@@ -4000,19 +4158,33 @@ fn moe_ffn_quant_full_opts(
     } else if parallel {
         #[cfg(feature = "par")]
         {
-            let hs = expert_contribs_par(lw, &sel, x, e, ff, cache)?;
-            for (t, &_ei) in sel.iter().enumerate() {
-                let pe = weights[t];
-                let hh = &hs[t];
-                for j in 0..e {
-                    out[j] += pe * hh[j];
+            // task 67: 作業域を使い回す経路 (既定) と、従来の「expert ごとに
+            // `vec!` を確保する」経路。足し込みはどちらも index 昇順の逐次なので
+            // 出力はビット一致する (`DENNO_EXPERT_SCRATCH=0` で従来経路)。
+            if expert_scratch_enabled() {
+                let mut hs = vec![0.0f32; sel.len() * e];
+                expert_contribs_par_into(lw, &sel, x, e, ff, cache, &mut hs)?;
+                for (t, _) in sel.iter().enumerate() {
+                    let pe = weights[t];
+                    let hh = &hs[t * e..(t + 1) * e];
+                    for j in 0..e {
+                        out[j] += pe * hh[j];
+                    }
+                }
+            } else {
+                let hs = expert_contribs_par(lw, &sel, x, e, ff, cache)?;
+                for (t, &_ei) in sel.iter().enumerate() {
+                    let pe = weights[t];
+                    let hh = &hs[t];
+                    for j in 0..e {
+                        out[j] += pe * hh[j];
+                    }
                 }
             }
         }
     } else {
-        let mut act = vec![0.0f32; ff];
-        let mut up = vec![0.0f32; ff];
-        let mut h = vec![0.0f32; e];
+        // task 67: 作業域 (act / up / h) はスレッドローカルで使い回す (既定)。
+        // `DENNO_EXPERT_SCRATCH=0` のときは従来どおり呼び出しごとに確保する。
         // P45: このトークンで VRAM に載っていた expert の本数 (ゲートのサンプル)。
         let mut gpu_hits = 0u32;
         // P43: まず層一括経路 (gate 1 + up 1 + down 1 = 3 起動 / 2 同期) を試す。
@@ -4037,56 +4209,62 @@ fn moe_ffn_quant_full_opts(
                 }
             }
         } else {
-            for (t, &ei) in sel.iter().enumerate() {
-                // P39: VRAM 常駐経路。`None` = 載らない/未対応なので CPU へ落ちる。
-                // P45: `Some(true)` はヒット (積まずに回せた)、`Some(false)` はミス。
-                #[cfg(feature = "cuda")]
-                let gpu = if use_gpu {
-                    moe_expert_gpu(lw, ei, x, &mut act, &mut up, &mut h)?
-                } else {
-                    None
-                };
-                #[cfg(not(feature = "cuda"))]
-                let gpu: Option<bool> = None;
-                if gpu == Some(true) {
-                    gpu_hits += 1;
-                }
-
-                if gpu.is_none() {
-                    match cache {
-                        // 従来経路: mmap のスライスを直接 GEMV する。
-                        None => {
-                            lw.gate_exps.gemv(ei, x, &mut act)?;
-                            silu_inplace(&mut act);
-                            lw.up_exps.gemv(ei, x, &mut up)?;
-                            for r in 0..ff {
-                                act[r] *= up[r];
-                            }
-                            lw.down_exps.gemv(ei, &act, &mut h)?;
-                        }
-                        // P-MOE-G1: SSD pread + LRU スロット経路。同じ expert は読み直さない。
-                        Some(c) => {
-                            let key = ExpertKey {
-                                layer: lw.il as u16,
-                                expert: ei as u16,
-                            };
-                            expert_gemv_cached(c, ExpertMatrix::Gate, &lw.gate_exps, key, x, &mut act)?;
-                            silu_inplace(&mut act);
-                            expert_gemv_cached(c, ExpertMatrix::Up, &lw.up_exps, key, x, &mut up)?;
-                            for r in 0..ff {
-                                act[r] *= up[r];
-                            }
-                            expert_gemv_cached(c, ExpertMatrix::Down, &lw.down_exps, key, &act, &mut h)?;
-                        }
+            with_expert_scratch(ff, e, |s| -> Result<()> {
+                let act = &mut s.act[..ff];
+                let up = &mut s.up[..ff];
+                let h = &mut s.h[..e];
+                for (t, &ei) in sel.iter().enumerate() {
+                    // P39: VRAM 常駐経路。`None` = 載らない/未対応なので CPU へ落ちる。
+                    // P45: `Some(true)` はヒット (積まずに回せた)、`Some(false)` はミス。
+                    #[cfg(feature = "cuda")]
+                    let gpu = if use_gpu {
+                        moe_expert_gpu(lw, ei, x, act, up, h)?
+                    } else {
+                        None
+                    };
+                    #[cfg(not(feature = "cuda"))]
+                    let gpu: Option<bool> = None;
+                    if gpu == Some(true) {
+                        gpu_hits += 1;
                     }
-                } else {
-                    debug_assert!(use_gpu, "GPU 経路が use_gpu=false で走った");
+
+                    if gpu.is_none() {
+                        match cache {
+                            // 従来経路: mmap のスライスを直接 GEMV する。
+                            None => {
+                                lw.gate_exps.gemv(ei, x, act)?;
+                                silu_inplace(act);
+                                lw.up_exps.gemv(ei, x, up)?;
+                                for r in 0..ff {
+                                    act[r] *= up[r];
+                                }
+                                lw.down_exps.gemv(ei, act, h)?;
+                            }
+                            // P-MOE-G1: SSD pread + LRU スロット経路。同じ expert は読み直さない。
+                            Some(c) => {
+                                let key = ExpertKey {
+                                    layer: lw.il as u16,
+                                    expert: ei as u16,
+                                };
+                                expert_gemv_cached(c, ExpertMatrix::Gate, &lw.gate_exps, key, x, act)?;
+                                silu_inplace(act);
+                                expert_gemv_cached(c, ExpertMatrix::Up, &lw.up_exps, key, x, up)?;
+                                for r in 0..ff {
+                                    act[r] *= up[r];
+                                }
+                                expert_gemv_cached(c, ExpertMatrix::Down, &lw.down_exps, key, act, h)?;
+                            }
+                        }
+                    } else {
+                        debug_assert!(use_gpu, "GPU 経路が use_gpu=false で走った");
+                    }
+                    let pe = weights[t];
+                    for j in 0..e {
+                        out[j] += pe * h[j];
+                    }
                 }
-                let pe = weights[t];
-                for j in 0..e {
-                    out[j] += pe * h[j];
-                }
-            }
+                Ok(())
+            })?;
         }
         // P45: 1 トークンぶんの実測をゲートへ積む (CPU のトークンはサンプルにしない)。
         if use_gpu {
@@ -6189,24 +6367,125 @@ fn expert_contribs_par(
         .collect()
 }
 
-/// P64: 新経路 ([`expert_contribs_loop`]) のスレッドローカルな作業域。
+/// task 67: CPU expert GEMV の作業域 (`act` / `up` / `h`)。
 ///
-/// `act` / `up` は `n_ff_exp`。寄与の出力 (`e` 要素) は呼び出し側のバッファへ
-/// 直接書くので、ここには持たない。
-#[cfg(feature = "par")]
+/// 27B の形 (e = 2560 / ff = 640) では 1 expert あたり act + up = 5 KB、h = 10 KB。
+/// 従来は expert ごとに `vec![0.0; ..]` を確保していた (1 トークン = 48 層 ×
+/// top-10 × 3 本 ≈ 7.4 MB の確保)。**使う前に必ずゼロ埋めする**ので、前の expert の
+/// 値が残っていても出力は変わらない。
+///
+/// P64 の新経路 ([`expert_contribs_loop`]) は `act` / `up` だけを使う
+/// (寄与の出力は呼び出し側のバッファへ直接書く)。
+#[derive(Default)]
 struct ExpertScratch {
     act: Vec<f32>,
     up: Vec<f32>,
+    h: Vec<f32>,
 }
 
-#[cfg(feature = "par")]
 impl ExpertScratch {
+    /// P64 の新経路用 (`act` / `up` だけを用意する)。
+    #[cfg(feature = "par")]
     fn new(ff: usize) -> Self {
-        Self {
-            act: vec![0.0f32; ff],
-            up: vec![0.0f32; ff],
-        }
+        let mut s = Self::default();
+        s.prepare(ff, 0);
+        s
     }
+
+    /// 使う長さまで伸ばし (grow-only)、**使う範囲をゼロ埋めする**。
+    fn prepare(&mut self, ff: usize, e: usize) {
+        if self.act.len() < ff {
+            self.act.resize(ff, 0.0);
+        }
+        if self.up.len() < ff {
+            self.up.resize(ff, 0.0);
+        }
+        if self.h.len() < e {
+            self.h.resize(e, 0.0);
+        }
+        self.act[..ff].fill(0.0);
+        self.up[..ff].fill(0.0);
+        self.h[..e].fill(0.0);
+    }
+}
+
+thread_local! {
+    /// スレッドごとに 1 本。rayon のワーカーも OS スレッドなので、層をまたいで
+    /// 同じバッファを使い回す (スレッドをまたいで共有しない = データ競合しない)。
+    static EXPERT_SCRATCH: std::cell::RefCell<ExpertScratch> =
+        std::cell::RefCell::new(ExpertScratch::default());
+}
+
+/// 作業域を借りて `f` を実行する。`DENNO_EXPERT_SCRATCH=0` のときは従来どおり
+/// 呼び出しごとに確保する (A/B 用。数値はどちらも同じ)。
+fn with_expert_scratch<R>(ff: usize, e: usize, f: impl FnOnce(&mut ExpertScratch) -> R) -> R {
+    if expert_scratch_enabled() {
+        #[cfg(test)]
+        EXPERT_SCRATCH_REUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        EXPERT_SCRATCH.with(|cell| {
+            let mut s = cell.borrow_mut();
+            s.prepare(ff, e);
+            f(&mut s)
+        })
+    } else {
+        let mut s = ExpertScratch::default();
+        s.prepare(ff, e);
+        f(&mut s)
+    }
+}
+
+/// task 67: [`expert_contribs_par`] の**確保なし**版。寄与を `hs[t * e + j]` へ直接書く。
+///
+/// 1 expert の計算は従来と同じ [`ExpertW::gemv_seq`] を同じ順で通すので、寄与は
+/// 従来経路と**ビット一致**する。足し込みは呼び出し側が index 昇順に逐次行う
+/// (ここでは足さない)。作業域は [`with_expert_scratch`] から借りるので、expert
+/// ごとの `Vec` 確保が無い (`hs` は呼び出し側が 1 回だけ確保する)。
+#[cfg(feature = "par")]
+fn expert_contribs_par_into(
+    lw: &LayerW,
+    sel: &[usize],
+    x: &[f32],
+    e: usize,
+    ff: usize,
+    cache: Option<&ExpertCacheSet>,
+    hs: &mut [f32],
+) -> Result<()> {
+    use rayon::prelude::*;
+    #[cfg(test)]
+    PAR_CONTRIB_REGIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    hs.par_chunks_mut(e)
+        .zip(sel.par_iter())
+        .try_for_each(|(h, &ei)| -> Result<()> {
+            with_expert_scratch(ff, e, |s| -> Result<()> {
+                let act = &mut s.act[..ff];
+                let up = &mut s.up[..ff];
+                match cache {
+                    // 従来経路: mmap のスライスを直接 GEMV する (行並列なし)。
+                    None => {
+                        lw.gate_exps.gemv_seq(ei, x, act)?;
+                        silu_inplace(act);
+                        lw.up_exps.gemv_seq(ei, x, up)?;
+                        for r in 0..ff {
+                            act[r] *= up[r];
+                        }
+                        lw.down_exps.gemv_seq(ei, act, h)?;
+                    }
+                    // 常駐キャッシュ経路。バイト列の出所だけが違う。
+                    Some(c) => {
+                        expert_gemv_cached_seq(c, ExpertMatrix::Gate, &lw.gate_exps, lw.il, ei, x, act)?;
+                        silu_inplace(act);
+                        expert_gemv_cached_seq(c, ExpertMatrix::Up, &lw.up_exps, lw.il, ei, x, up)?;
+                        for r in 0..ff {
+                            act[r] *= up[r];
+                        }
+                        expert_gemv_cached_seq(c, ExpertMatrix::Down, &lw.down_exps, lw.il, ei, act, h)?;
+                    }
+                }
+                #[cfg(test)]
+                PAR_CONTRIB_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            })
+        })
 }
 
 /// P64: expert 1 本の寄与 `h = down(silu(gate(x)) * up(x))` を `h` に書く。
@@ -6224,7 +6503,7 @@ fn expert_contrib_one(
     s: &mut ExpertScratch,
     h: &mut [f32],
 ) -> Result<()> {
-    let ExpertScratch { act, up } = s;
+    let ExpertScratch { act, up, .. } = s;
     match cache {
         // 従来経路: mmap のスライスを直接 GEMV する (行並列なし)。
         None => {
@@ -7554,6 +7833,483 @@ mod tests {
             layer_new_ms / layer_old_ms,
             layer_new_ms / layer_seq_ms
         );
+    }
+
+    /// task 67 ベンチ用: `nl` 層ぶんの expert 3 行列を、`real` の expert だけ実データで
+    /// 置いた疎 GGUF。全 expert・全層のバイト列は同じ (ページの位置だけを分けるのが
+    /// 目的なので、変種間の出力はビット一致するはず)。
+    ///
+    /// 見かけの大きさは `nl` × 3 行列 × `ne` expert (512 expert・48 層で 75 GB)。
+    /// 実データは `nl` × `real.len()` × 1 expert ぶん (10 expert・48 層で 1.5 GB)。
+    ///
+    /// 戻り値は実データを書いた `(ファイル内オフセット, 長さ)` の一覧
+    /// (ベンチの prewarm が穴を読まずに page cache へ載せるために使う)。
+    fn write_expert_gguf_fault_bench(
+        path: &Path,
+        n_embd: usize,
+        n_ff: usize,
+        ne: usize,
+        nl: usize,
+        real: &[usize],
+    ) -> Vec<(u64, u64)> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let gate_e = n_ff * (n_embd / 256) * 144;
+        let down_e = n_embd * (n_ff / 32) * 24;
+        let lens = [ne * gate_e, ne * gate_e, ne * down_e];
+        let per = [gate_e, gate_e, down_e];
+
+        // データ部のレイアウト (層ごとに gate / up / down を 32 B 整列で並べる)。
+        let mut cur = 0usize;
+        let mut offs_all: Vec<[usize; 3]> = Vec::with_capacity(nl);
+        for _ in 0..nl {
+            let mut offs = [0usize; 3];
+            for i in 0..3 {
+                offs[i] = cur;
+                cur = align_up(cur + lens[i], ALIGN);
+            }
+            offs_all.push(offs);
+        }
+
+        let mut head = Vec::new();
+        head.extend_from_slice(b"GGUF");
+        head.extend_from_slice(&3u32.to_le_bytes());
+        head.extend_from_slice(&((3 * nl) as u64).to_le_bytes());
+        head.extend_from_slice(&(2u64).to_le_bytes());
+        push_str(&mut head, "general.architecture");
+        Kv::Str("qwen4exp").write(&mut head);
+        push_str(&mut head, "general.alignment");
+        Kv::U32(ALIGN as u32).write(&mut head);
+        for il in 0..nl {
+            for i in 0..3 {
+                let name = match i {
+                    0 => format!("blk.{il}.ffn_gate_exps.weight"),
+                    1 => format!("blk.{il}.ffn_up_exps.weight"),
+                    _ => format!("blk.{il}.ffn_down_exps.weight"),
+                };
+                let dims: [u64; 3] = if i < 2 {
+                    [n_embd as u64, n_ff as u64, ne as u64]
+                } else {
+                    [n_ff as u64, n_embd as u64, ne as u64]
+                };
+                let ty = if i < 2 { TY_Q4_K } else { TY_Q5_1 };
+                push_str(&mut head, &name);
+                head.extend_from_slice(&(3u32).to_le_bytes());
+                for d in dims {
+                    head.extend_from_slice(&d.to_le_bytes());
+                }
+                head.extend_from_slice(&ty.to_le_bytes());
+                head.extend_from_slice(&(offs_all[il][i] as u64).to_le_bytes());
+            }
+        }
+
+        let head_len = align_up(head.len(), ALIGN);
+        let mut file = std::fs::File::create(path).expect("疎 GGUF の作成");
+        file.write_all(&head).expect("ヘッダ");
+        file.set_len((head_len + cur) as u64).expect("set_len");
+
+        // 3 行列ぶんのバイト列を 1 回だけ作り、全 expert の位置へ書く。
+        let bytes = [
+            q4k_expert_bytes(n_embd, n_ff, 3),
+            q4k_expert_bytes(n_embd, n_ff, 11),
+            q5_1_expert_bytes(n_ff, n_embd, 5),
+        ];
+        let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(nl * real.len() * 3);
+        for il in 0..nl {
+            for &e in real {
+                for (i, b) in bytes.iter().enumerate() {
+                    let off = (head_len + offs_all[il][i] + e * per[i]) as u64;
+                    file.seek(SeekFrom::Start(off)).expect("seek");
+                    file.write_all(b).expect("expert のバイト列");
+                    ranges.push((off, b.len() as u64));
+                }
+            }
+        }
+        // 冷 A/B で fadvise(DONTNEED) を効かせるには dirty を落としておく。
+        file.sync_all().expect("sync_all");
+        ranges
+    }
+
+    /// task 67: 3 ゲートの値解釈 (純粋関数)。
+    #[test]
+    fn expert_fault_gates_from_value() {
+        // prefetch: 既定 off。1 / on / true のときだけ on。
+        assert!(!expert_prefetch_from_value(None));
+        assert!(!expert_prefetch_from_value(Some("0")));
+        assert!(!expert_prefetch_from_value(Some("off")));
+        assert!(!expert_prefetch_from_value(Some("")));
+        assert!(expert_prefetch_from_value(Some("1")));
+        assert!(expert_prefetch_from_value(Some("on")));
+        assert!(expert_prefetch_from_value(Some("true")));
+        // hugepage: 既定 off。
+        assert!(!expert_hugepage_from_value(None));
+        assert!(!expert_hugepage_from_value(Some("0")));
+        assert!(expert_hugepage_from_value(Some("1")));
+        assert!(expert_hugepage_from_value(Some("ON")));
+        // scratch: 既定 off。
+        assert!(!expert_scratch_from_value(None));
+        assert!(!expert_scratch_from_value(Some("off")));
+        assert!(expert_scratch_from_value(Some("1")));
+        assert!(expert_scratch_from_value(Some("true")));
+    }
+
+    /// task 67: 3 ゲートが実際に分岐を変えること (緑 = 通った証拠ではないので、
+    /// カウンタで通過を数える) と、どの組み合わせでも出力がビット一致すること。
+    ///
+    /// - prefetch=1: `ExpertW::prefetch` が選択 expert × 3 行列ぶん呼ばれる
+    /// - hugepage=1: `MADV_HUGEPAGE` が expert テンソル 3 本ぶん呼ばれる
+    /// - scratch=1: スレッドローカルの作業域が expert ごとに 1 回使われる
+    #[test]
+    #[cfg(feature = "par")]
+    fn expert_fault_gates_take_effect_and_stay_bit_identical() {
+        use std::sync::atomic::Ordering;
+        let _g = moe_test_guard();
+        let dir = TempDir::new("gates67");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let x = cache_test_x(p.n_embd);
+
+        let run = |lw: &LayerW| {
+            // emit_router=false: テレメトリを出す他のテストにフレームを混ぜない。
+            moe_ffn_quant_full_opts(&p, lw, &x, None, true, Route::Cpu, None, false, false)
+                .expect("moe_ffn_quant")
+        };
+
+        // 1. 既定 (3 つとも off): 先読みも hugepage も scratch も 0 回。
+        set_expert_fault_gates_for_test(None, None, None);
+        let lw = cache_test_layer(&f, &p);
+        let p0 = EXPERT_PREFETCH_CALLS.load(Ordering::Relaxed);
+        let s0 = EXPERT_SCRATCH_REUSES.load(Ordering::Relaxed);
+        let want = run(&lw);
+        assert_eq!(
+            EXPERT_PREFETCH_CALLS.load(Ordering::Relaxed) - p0,
+            0,
+            "既定で先読みが走った"
+        );
+        assert_eq!(
+            EXPERT_SCRATCH_REUSES.load(Ordering::Relaxed) - s0,
+            0,
+            "既定で scratch を使った"
+        );
+        assert!(want.iter().all(|v| v.is_finite()), "既定経路に NaN/inf");
+
+        // 2. prefetch=1: 選択 expert (k) × 3 行列ぶん。
+        set_expert_fault_gates_for_test(Some(true), Some(false), Some(false));
+        let p1 = EXPERT_PREFETCH_CALLS.load(Ordering::Relaxed);
+        let got = run(&lw);
+        let calls = EXPERT_PREFETCH_CALLS.load(Ordering::Relaxed) - p1;
+        assert_eq!(
+            calls,
+            p.n_expert_used * 3,
+            "先読みの回数が expert × 3 でない: {calls}"
+        );
+        assert_bitwise_eq(&want, &got, "prefetch=1");
+
+        // 3. hugepage=1: 層を読み直すと expert テンソル 3 本ぶん madvise する。
+        set_expert_fault_gates_for_test(Some(false), Some(true), Some(false));
+        let h1 = EXPERT_HUGEPAGE_ADVISES.load(Ordering::Relaxed);
+        let lw_h = cache_test_layer(&f, &p);
+        let advises = EXPERT_HUGEPAGE_ADVISES.load(Ordering::Relaxed) - h1;
+        assert_eq!(advises, 3, "MADV_HUGEPAGE が 3 テンソルでない: {advises}");
+        let got = run(&lw_h);
+        assert_bitwise_eq(&want, &got, "hugepage=1");
+
+        // 4. scratch=1: 作業域を expert ごとに 1 回借りる。
+        set_expert_fault_gates_for_test(Some(false), Some(false), Some(true));
+        let s1 = EXPERT_SCRATCH_REUSES.load(Ordering::Relaxed);
+        let got = run(&lw);
+        let reuses = EXPERT_SCRATCH_REUSES.load(Ordering::Relaxed) - s1;
+        assert_eq!(
+            reuses, p.n_expert_used,
+            "scratch の回数が expert 数でない: {reuses}"
+        );
+        assert_bitwise_eq(&want, &got, "scratch=1");
+
+        set_expert_fault_gates_for_test(None, None, None);
+    }
+
+    /// task 67 マイクロベンチ: expert GEMV の minor fault / 時間 / 実効 GB/s を
+    /// 変種ごとに測る。
+    ///
+    /// 実形状 (e = 2560 / ff = 640 / 512 expert / top-10) の疎 GGUF を作り、48 層を
+    /// 6 変種 × 8 層に分ける (変種ごとに触るページが違う = 毎回ほぼ cold)。1 変種
+    /// 8 層を測って 6 倍し「1 トークン (48 層) 相当」に換算する (**換算値**)。
+    /// 同じ 8 層をもう 1 回回した「温」も出す (フォールトを含まない時間)。
+    ///
+    /// 実行: `cargo test --release -p denno-engine --lib -- --ignored --nocapture --test-threads=1 bench_expert_faults`
+    #[test]
+    #[cfg(feature = "par")]
+    #[ignore = "task 67 マイクロベンチ (実測。通常のテストでは走らせない)"]
+    fn bench_expert_faults() {
+        let _g = moe_test_guard();
+        let (n_embd, n_ff, ne, k) = (2560usize, 640usize, 512usize, 10usize);
+        let nl = 48usize;
+        let sel: Vec<usize> = (0..k).collect();
+        let x = cache_test_x_seed(n_embd, 0);
+        let p = params_dims(n_embd, n_ff, ne, k);
+
+        // 1. 疎 GGUF (見かけ 75 GB / 実データ 1.5 GB)。/tmp は overlay なので
+        //    workspace の target/ に置く (ext4 の sparse + mmap)。
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("target")
+            .join("bench67");
+        std::fs::create_dir_all(&dir).expect("bench67 dir");
+        let path = dir.join("expert_faults.gguf");
+        let t_write = std::time::Instant::now();
+        let ranges = write_expert_gguf_fault_bench(&path, n_embd, n_ff, ne, nl, &sel);
+        let apparent = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "[bench67] 疎 GGUF: {} (見かけ {:.1} GB / 実データ約 {:.2} GB / 書き {:?})",
+            path.display(),
+            apparent as f64 / 1e9,
+            ranges.iter().map(|r| r.1).sum::<u64>() as f64 / 1e9,
+            t_write.elapsed()
+        );
+
+        // /proc/self/stat の 10 番目 (minflt) と 12 番目 (majflt)。comm は括弧を
+        // 含みうるので、最後の ')' 以降をフィールド 3 として数える。
+        fn stat_faults() -> (u64, u64) {
+            let s = std::fs::read_to_string("/proc/self/stat").expect("/proc/self/stat");
+            let rest = &s[s.rfind(')').expect("stat: )") + 1..];
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            (
+                f[7].parse().expect("minflt"),
+                f[9].parse().expect("majflt"),
+            )
+        }
+
+        /// 実データの範囲だけを read して page cache に載せる (穴は読まない)。
+        fn prewarm_ranges(path: &Path, ranges: &[(u64, u64)]) {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = std::fs::File::open(path).expect("prewarm open");
+            let mut buf = vec![0u8; 1 << 20];
+            let mut total = 0u64;
+            for &(off, len) in ranges {
+                f.seek(SeekFrom::Start(off)).expect("prewarm seek");
+                let mut left = len as usize;
+                while left > 0 {
+                    let want = left.min(buf.len());
+                    let n = f.read(&mut buf[..want]).expect("prewarm read");
+                    if n == 0 {
+                        break;
+                    }
+                    left -= n;
+                    total += n as u64;
+                }
+            }
+            eprintln!(
+                "[bench67] prewarm: {:.2} GB を page cache に載せた",
+                total as f64 / 1e9
+            );
+        }
+
+        /// ファイルの page cache を落とす (冷 A/B 用)。mapped のページは落ちないので、
+        /// 先に mmap を全部 drop しておくこと。
+        fn fadvise_dontneed(path: &Path) {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::io::AsRawFd;
+                extern "C" {
+                    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+                }
+                const POSIX_FADV_DONTNEED: i32 = 4;
+                let f = std::fs::File::open(path).expect("fadvise open");
+                let rc = unsafe { posix_fadvise(f.as_raw_fd(), 0, 0, POSIX_FADV_DONTNEED) };
+                eprintln!("[bench67] fadvise(DONTNEED) rc={rc}");
+            }
+        }
+
+        /// 1 パス = `layers` ぶんの expert ループ (prefetch → gate/up/down)。
+        fn run_pass(layers: &[LayerW], sel: &[usize], x: &[f32], e: usize, ff: usize) -> Vec<f32> {
+            let mut out = vec![0.0f32; e];
+            for lw in layers {
+                prefetch_selected(lw, sel);
+                if expert_scratch_enabled() {
+                    let mut hs = vec![0.0f32; sel.len() * e];
+                    expert_contribs_par_into(lw, sel, x, e, ff, None, &mut hs).expect("par_into");
+                    for (t, _) in sel.iter().enumerate() {
+                        let hh = &hs[t * e..(t + 1) * e];
+                        for j in 0..e {
+                            out[j] += hh[j];
+                        }
+                    }
+                } else {
+                    let hs = expert_contribs_par(lw, sel, x, e, ff, None).expect("par");
+                    for (t, _) in sel.iter().enumerate() {
+                        let hh = &hs[t];
+                        for j in 0..e {
+                            out[j] += hh[j];
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        fn median_f(mut v: Vec<f64>) -> f64 {
+            v.sort_by(|a, b| a.partial_cmp(b).expect("NaN"));
+            v[v.len() / 2]
+        }
+        fn median_u(mut v: Vec<u64>) -> u64 {
+            v.sort_unstable();
+            v[v.len() / 2]
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .expect("8 スレッドのプール");
+
+        prewarm_ranges(&path, &ranges);
+
+        // ---- A. 温 page cache (minor fault だけ) ----
+        // 6 変種 × 8 ラウンド × 1 層 = 48 層。ラウンドごとに層を変えるので、どの
+        // 測定も「まだ 1 ページも触っていない」層から始まる (cold)。2×2 (prefetch ×
+        // scratch) に hugepage と base の繰り返しを足して、同じ実行で比べる。
+        let variants: [(&str, Option<bool>, Option<bool>, Option<bool>); 6] = [
+            ("pf0,sc0", Some(false), Some(false), Some(false)),
+            ("pf0,sc1", Some(false), Some(false), Some(true)),
+            ("pf1,sc0", Some(true), Some(false), Some(false)),
+            ("pf1,sc1", Some(true), Some(false), Some(true)),
+            ("huge=1", Some(false), Some(true), Some(false)),
+            ("pf0,sc0(再)", Some(false), Some(false), Some(false)),
+        ];
+        let (per_round, rounds) = (1usize, 8usize);
+        let mut stats: Vec<(Vec<f64>, Vec<u64>, Vec<f64>, Vec<u64>)> = (0..variants.len())
+            .map(|_| (Vec::new(), Vec::new(), Vec::new(), Vec::new()))
+            .collect();
+        let mut reference: Option<Vec<f32>> = None;
+        let bytes_per_layer;
+        eprintln!(
+            "[bench67] 形 e={n_embd} ff={n_ff} ne={ne} topk={k} layers={nl} / 温: {rounds} ラウンド × {per_round} 層（換算 ×{}）",
+            nl / per_round
+        );
+        {
+            let f = GgufFile::open(&path).expect("open");
+            {
+                let mut lw = layer_at(&f, &p, 0);
+                lw.gate_inp = f32_linear(1, 1, 0.1);
+                let lens = expert_lens(&lw);
+                bytes_per_layer = (lens[0] + lens[1] + lens[2]) * k;
+            }
+            for round in 0..rounds {
+                for slot in 0..variants.len() {
+                    // 変種の順番をラウンドごとに回す (「そのラウンドの最初の測定」が
+                    // いつも同じ変種にならないように)。
+                    let vi = (slot + round) % variants.len();
+                    let (name, pf, hp, sc) = &variants[vi];
+                    // ゲートは層を読む前に立てる (hugepage は ExpertW::load で投げる)。
+                    set_expert_fault_gates_for_test(*pf, *hp, *sc);
+                    let il0 = round * variants.len() * per_round + slot * per_round;
+                    let mut layers: Vec<LayerW> = Vec::with_capacity(per_round);
+                    for il in il0..il0 + per_round {
+                        let mut lw = layer_at(&f, &p, il);
+                        // ルータはこのベンチでは使わない (層ごとの 5 MB の F32 を捨てる)。
+                        lw.gate_inp = f32_linear(1, 1, 0.1);
+                        layers.push(lw);
+                    }
+
+                    let (f0, m0) = stat_faults();
+                    let t0 = std::time::Instant::now();
+                    let out = pool.install(|| run_pass(&layers, &sel, &x, n_embd, n_ff));
+                    let cold_ms = t0.elapsed().as_secs_f64() * 1e3;
+                    let (f1, m1) = stat_faults();
+
+                    let t1 = std::time::Instant::now();
+                    let out2 = pool.install(|| run_pass(&layers, &sel, &x, n_embd, n_ff));
+                    let warm_ms = t1.elapsed().as_secs_f64() * 1e3;
+                    let (f2, _) = stat_faults();
+
+                    assert_bitwise_eq(&out, &out2, &format!("{name} r{round}: cold vs warm"));
+                    match &reference {
+                        Some(r) => assert_bitwise_eq(r, &out, &format!("{name} r{round}: 変種間")),
+                        None => reference = Some(out.clone()),
+                    }
+                    eprintln!(
+                        "[bench67] A r{round} {name:<12} cold {cold_ms:6.2} ms  minor {:5}  major {}  \
+                         warm {warm_ms:6.2} ms (warm minor {})",
+                        f1 - f0,
+                        m1 - m0,
+                        f2 - f1
+                    );
+                    let s = &mut stats[vi];
+                    s.0.push(cold_ms);
+                    s.1.push(f1 - f0);
+                    s.2.push(warm_ms);
+                    s.3.push(m1 - m0);
+                }
+            }
+        }
+
+        let per_round_bytes = bytes_per_layer as f64 * per_round as f64;
+        let scale = nl as f64 / per_round as f64;
+        eprintln!(
+            "[bench67] === 温 page cache: {rounds} ラウンドの中央値（換算 ×{scale} = 48 層）==="
+        );
+        for (vi, (name, ..)) in variants.iter().enumerate() {
+            let s = &stats[vi];
+            let cold = median_f(s.0.clone());
+            let warm = median_f(s.2.clone());
+            let cold_min = s.0.iter().copied().fold(f64::INFINITY, f64::min);
+            let warm_min = s.2.iter().copied().fold(f64::INFINITY, f64::min);
+            let faults = median_u(s.1.clone());
+            let major = median_u(s.3.clone());
+            eprintln!(
+                "[bench67] {name:<12} cold min {cold_min:6.2} / 中央 {cold:6.2} ms/{per_round}層 \
+                 (換算 {:6.1} ms/token)  minor {faults:5} (換算 {:6.0}/token, {:5.2}/GEMV)  \
+                 major {major}  warm min {warm_min:6.2} / 中央 {warm:6.2} (換算 {:6.1})  \
+                 {:5.2} GB/s cold(min) / {:5.2} GB/s warm(min)",
+                cold * scale,
+                faults as f64 * scale,
+                faults as f64 / (per_round * k * 3) as f64,
+                warm * scale,
+                per_round_bytes / (cold_min / 1e3) / 1e9,
+                per_round_bytes / (warm_min / 1e3) / 1e9
+            );
+        }
+
+        // ---- B. 冷 page cache (major fault / I/O がある状態) ----
+        // 30 GB のモデルは 60 GB のマシンでもページが追い出されうる。prefetch
+        // (`MADV_WILLNEED`) が効くのはこの条件だけなので、fadvise(DONTNEED) で
+        // 落としてから prefetch の有無を比べる。
+        eprintln!("[bench67] === 冷 page cache: fadvise(DONTNEED) の後、新しい写像で {per_round} 層 ===");
+        for (name, pf) in [("prefetch=1", true), ("prefetch=0", false)] {
+            for round in 0..3 {
+                fadvise_dontneed(&path);
+                set_expert_fault_gates_for_test(Some(pf), Some(false), Some(false));
+                let (f0, m0) = stat_faults();
+                let t0 = std::time::Instant::now();
+                let out = {
+                    let f = GgufFile::open(&path).expect("open (cold)");
+                    let mut layers: Vec<LayerW> = Vec::with_capacity(per_round);
+                    for il in 0..per_round {
+                        let mut lw = layer_at(&f, &p, il);
+                        lw.gate_inp = f32_linear(1, 1, 0.1);
+                        layers.push(lw);
+                    }
+                    pool.install(|| run_pass(&layers, &sel, &x, n_embd, n_ff))
+                    // f と layers はここで drop (次の fadvise を効かせる)
+                };
+                let cold_ms = t0.elapsed().as_secs_f64() * 1e3;
+                let (f1, m1) = stat_faults();
+                if let Some(r) = &reference {
+                    assert_bitwise_eq(r, &out, &format!("冷 {name} r{round}"));
+                }
+                eprintln!(
+                    "[bench67] B r{round} {name:<10} cold {cold_ms:6.2} ms/{per_round}層 (換算 {:6.1} ms/token)  \
+                     minor {:5} (換算 {:6.0}/token)  major {}  {:5.2} GB/s",
+                    cold_ms * scale,
+                    f1 - f0,
+                    (f1 - f0) as f64 * scale,
+                    m1 - m0,
+                    per_round_bytes / (cold_ms / 1e3) / 1e9
+                );
+            }
+        }
+        set_expert_fault_gates_for_test(None, None, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// task 65: decode の入口 (`moe_ffn_quant` = router の GEMV) が
