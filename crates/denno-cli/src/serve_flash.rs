@@ -221,6 +221,35 @@ struct Flash {
     telem: Telemetry,
 }
 
+/// 計測のみ (`DENNO_Q4_PROFILE=1`)。Flash-Next の層内フェーズを 1 行にまとめて出す。
+///
+/// `q4prof` は 27B の `DENNO_PROFILE` (表 C) とは別系統で、このモデル専用の軽量な
+/// カウンタ。以前はテストからしか読めず serve では取れなかったので、リクエストの
+/// 区切り (prefill 終端 / decode 終端) でここから出す。既定 off では
+/// `enabled()` の分岐 1 回だけで、数値経路には触れない。
+fn prof_flash(tag: &str, tok: usize) {
+    use denno_engine::model::qwen4exp::{moe_sub_take, q4prof};
+    if !q4prof::enabled() {
+        return;
+    }
+    let (ple, mix, attn, moe, n) = q4prof::dump();
+    let (qkv, gate, gdn, aout, full) = q4prof::dump_attn();
+    let (rtr, exp, shx) = moe_sub_take();
+    let d = n.max(1) as f64;
+    eprintln!(
+        "[q4prof] {tag} tok={tok} layer_exec={n} ms total={:.1} | per-layer ple={:.3} mix={:.3} attn={:.3} moe={:.3}",
+        ple + mix + attn + moe,
+        ple / d,
+        mix / d,
+        attn / d,
+        moe / d
+    );
+    eprintln!(
+        "[q4prof] {tag} ms moe router={rtr:.1} experts={exp:.1} shared={shx:.1} | attn qkv={qkv:.1} gate={gate:.1} gdn={gdn:.1} out={aout:.1} full={full:.1}"
+    );
+    q4prof::reset();
+}
+
 impl Flash {
     /// モデルを組む (mmap 越し)。
     fn build_model(&self) -> Result<Qwen4Exp> {
@@ -320,6 +349,7 @@ impl Flash {
             });
         }
 
+        prof_flash("prefill", n_prompt - reused);
         let mut sampler = Sampler::new(
             if req.temperature <= 0.0 {
                 None
@@ -411,16 +441,7 @@ impl Flash {
             t_prefill * 1e3 / (n_prompt - reused).max(1) as f64,
             t_decode * 1e3 / out.len().max(1) as f64
         );
-        // 計測のみ (数値経路に触れない): `DENNO_PROFILE=1` のとき、リクエスト 1 本の
-        // 終わりに表 C (serve の 1 ステップ内訳) を 1 行ずつ出す。既定 off では
-        // `enabled()` の分岐 1 回だけで何もしない。
-        if denno_engine::prof::enabled() {
-            eprintln!("[prof] ---- request: prompt={n_prompt} reuse={reused} out={}", out.len());
-            for line in denno_engine::prof::summary().lines() {
-                eprintln!("[prof] {line}");
-            }
-            denno_engine::prof::reset();
-        }
+        prof_flash("decode", out.len());
         // 途中で失敗したら状態は信用しない (次のリクエストで組み直す)。
         let stop_reason = stop_hit.unwrap_or_else(|| {
             if out.len() >= req.max_tokens {
