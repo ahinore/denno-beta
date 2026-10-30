@@ -503,6 +503,7 @@ let acc = 0, cnt = 0;
 function frame() {
   const dt = Math.min(0.06, clock.getDelta());
   step(dt);
+  if (replayOn) replayStep();      // 再生中は 1 フレーム/ステップで実データを流す
   window.__viewReady = true;
   acc += dt; cnt++;
   if (acc > 0.4) { document.getElementById('fps').textContent = (cnt / acc).toFixed(0); hud(); acc = 0; cnt = 0; }
@@ -522,7 +523,7 @@ window.onRouting = function (layer, experts, weights) {
     s.act[k] = Math.max(s.act[k], Math.min(1, (weights && weights[i]) || 0.5));
   }
   if (sel.length) { s.route = sel; promote(layer, sel); }
-  document.getElementById('mode').textContent = 'mode: live (telemetry)';
+  noteLiveMode();
 };
 
 window.onLayerActivation = function (layer, idx, val) {
@@ -541,7 +542,7 @@ window.onLayerActivation = function (layer, idx, val) {
   }
   s.route = sel;
   promote(layer, sel);
-  document.getElementById('mode').textContent = 'mode: live (telemetry)';
+  noteLiveMode();
 };
 // kind 13 RoleAct: 層の役割ごとの強さ (attn/gdn/router/shex/ple)。実値は 0.0〜数倍。
 // 値を 0..1 に clamp して該当ブロックの発光に使う。届いていない層は既定値のまま。
@@ -554,7 +555,7 @@ window.onRoleActivation = function (layer, roles) {
     const x = Number(roles[k]);
     roleTarget[k][il] = Number.isFinite(x) ? Math.max(0, Math.min(1, x)) : 0;
   }
-  document.getElementById('mode').textContent = 'mode: live (telemetry)';
+  noteLiveMode();
 };
 
 // kind 14 ExpertResidency: その層の VRAM 在庫 (expert index の配列、層は 0 始まり)。
@@ -625,11 +626,20 @@ const hudEl = {
 };
 const liveState = { tokens: 0, lastStepMs: 0, prefillMs: 0, frames: 0 };
 
+// どの運転モードかを HUD に出す。キャプチャ再生 (?replay=1) 中は live 系の口が
+// 呼ばれても 'mode: replay' のままにする (合成でないことを見失わない)。
+let replayOn = false;
+function noteLiveMode() {
+  document.getElementById('mode').textContent =
+    replayOn ? 'mode: replay' : 'mode: live (telemetry)';
+}
+
 function handleFrame(f) {
   liveState.frames++;
   switch (f.kind) {
     case 'ServerInfo':
-      hudEl.ws.textContent = 'connected (' + (f.model || 'flash') + ')';
+      // 再生中は WS を開いていないので、状態欄は 'off (replay)' のままにする
+      hudEl.ws.textContent = replayOn ? 'off (replay)' : 'connected (' + (f.model || 'flash') + ')';
       break;
     case 'Prefill':
       liveState.prefillMs = f.ns / 1e6 / Math.max(1, f.prompt_tokens || 1);
@@ -692,7 +702,90 @@ function connectLive() {
   ws.onerror = () => { try { ws.close(); } catch (e) {} };
 }
 
+// ===== キャプチャ再生 (?replay=1) ==========================================
+// GET /capture.bin (サーバ側 VIEW_CAPTURE の連結フレーム列) を fetch し、
+// 先頭から decodeFrame で 1 ステップ 1 フレームずつ handleFrame に流す。
+// WS は開かない (再接続タイマーも張らない)。末尾まで来たら先頭に戻る。
+// キャプチャが無い (404) ときは従来どおりのデモに落ちる。
+const cap = { buf: null, off: 0, frames: 0, bad: 0 };
+window.__replay = cap;     // ヘッドレス検証用 (frames = 流したフレーム数)
+
+/** 壊れたフレームのあと、次の "DNTL" まで進める。無ければ末尾。 */
+function replayResync(buf, from) {
+  for (let i = from; i + 3 < buf.length; i++) {
+    if (buf[i] === 0x44 && buf[i + 1] === 0x4e && buf[i + 2] === 0x54 && buf[i + 3] === 0x4c) return i;
+  }
+  return buf.length;
+}
+
+/** 1 ステップぶん = 1 フレーム。流せたら true。 */
+function replayStep() {
+  const buf = cap.buf;
+  if (!buf || buf.length < 6) return false;
+  if (cap.off >= buf.length) cap.off = 0;                  // 末尾 → 先頭 (ループ)
+  let r;
+  try {
+    r = decodeFrame(buf, cap.off);
+  } catch (e) {
+    if (e instanceof FrameDecodeError && e.partial) {
+      cap.off = 0;                                         // 末尾が途中で切れている
+      return false;
+    }
+    // 壊れたフレームは次の magic へ飛ばす (再生を止めない)
+    cap.bad++;
+    cap.off = replayResync(buf, cap.off + 1);
+    if (cap.off >= buf.length) cap.off = 0;
+    return false;
+  }
+  cap.off = r.next;
+  cap.frames++;
+  handleFrame(r.frame);
+  return true;
+}
+
+/** /capture.bin を読む。読めたら true (false = デモに落とす)。 */
+async function startReplay() {
+  replayOn = true;
+  hudEl.ws.textContent = 'off (replay)';
+  hudEl.mode.textContent = 'mode: replay';
+  try {
+    const res = await fetch('/capture.bin', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (bytes.length < 6) throw new Error('capture too short (' + bytes.length + ' B)');
+    cap.buf = bytes;
+  } catch (e) {
+    replayOn = false;
+    cap.buf = null;
+    hudEl.ws.textContent = 'capture unavailable (' + ((e && e.message) ? e.message : e) + ')';
+    hudEl.mode.textContent = 'mode: demo (routing simulated)';
+    return false;
+  }
+  document.getElementById('live_done').textContent = 'replay: capture ' + cap.buf.length + ' B';
+  return true;
+}
+
 addEventListener('keydown', (e) => { if (e.code === 'Space') { demo.paused = !demo.paused; e.preventDefault(); } });
+
+// ?shot — 固定ステップ数だけ進めて canvas を #dump に書き出す (ヘッドレス検証用)。
+// 再生中 (?replay=1) は 1 ステップ 1 フレームでキャプチャを流してから書き出す。
+function shotRun() {
+  const steps = parseInt(Q.get('steps') || '170', 10);
+  let i = 0;
+  const tick = () => {
+    step(0.016);
+    if (replayOn) replayStep();
+    if (++i < steps) return requestAnimationFrame(tick);
+    window.__viewReady = true; hud();
+    document.getElementById('fps').textContent = 'shot';
+    document.getElementById('dump').textContent = canvas.toDataURL('image/png');
+    if (replayOn) {
+      document.getElementById('live_done').textContent =
+        'replay: ' + cap.frames + ' frames / ' + cap.buf.length + ' B (bad ' + cap.bad + ')';
+    }
+  };
+  requestAnimationFrame(tick);
+}
 
 if (Q.get('live')) {
   // ?live=<秒> — 実テレメトリを <秒> だけ受け、WS を閉じてから canvas を書き出す
@@ -711,17 +804,21 @@ if (Q.get('live')) {
     document.getElementById('live_done').textContent = 'live capture done: ' + liveState.frames + ' frames';
   };
   requestAnimationFrame(tick);
+} else if (Q.get('replay')) {
+  // ?replay=1 — /capture.bin の実フレーム列を流す。WS は開かない (再接続もしない)。
+  // キャプチャが無い (404) ときはデモに落としてビューワを壊さない。
+  startReplay().then((ok) => {
+    if (ok) {
+      if (Q.get('shot')) shotRun(); else frame();
+    } else if (Q.get('shot')) {
+      shotRun();
+    } else {
+      connectLive();
+      frame();
+    }
+  });
 } else if (Q.get('shot')) {
-  const steps = parseInt(Q.get('steps') || '170', 10);
-  let i = 0;
-  const tick = () => {
-    step(0.016);
-    if (++i < steps) return requestAnimationFrame(tick);
-    window.__viewReady = true; hud();
-    document.getElementById('fps').textContent = 'shot';
-    document.getElementById('dump').textContent = canvas.toDataURL('image/png');
-  };
-  requestAnimationFrame(tick);
+  shotRun();
 } else {
   connectLive();
   frame();

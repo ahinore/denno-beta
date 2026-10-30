@@ -6,6 +6,8 @@
 //! - 記録: `VIEW_RECORD=/path/to/file` でフレームを [u32 len][bytes] で追記
 //! - 再生: `VIEW_REPLAY=/path/to/file` で記録ファイルを読み込み `GET /replay`
 //!   で生フレーム列を配信 (P16 のリプレイスクラバーがブラウザ側で解析・再生)
+//! - キャプチャ: `VIEW_CAPTURE=/path/to/file` の連結フレーム列を `GET /capture.bin`
+//!   で配信 (3D ビューワの `?replay=1` が fetch する。WS を開かずに実データを描く)
 //!
 //! P13 の位置づけ: パイプライン全体 (denno 捕捉 → WS → 中継 → ブラウザ) の
 //! 疎通確認が目的。WASM ビューアは P14。
@@ -50,6 +52,12 @@ static TOKENIZER: std::sync::OnceLock<Option<axum::body::Bytes>> = std::sync::On
 /// 記録はブラウザ側パーサが途中まで読む)。
 static REPLAY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
+/// キャプチャ配信ファイル (`GET /capture.bin`)。8098 の WS メッセージをそのまま
+/// 連結したフレーム列 (`DNTL` magic の連なり)。`VIEW_CAPTURE` でパスを指定し、
+/// リクエスト毎に読み込む。実データは環境ごとに用意するもので、リポジトリには
+/// 同梱しない (未設定・無い場合は 404 を返すだけ)。
+static CAPTURE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
 async fn replay_bin() -> axum::response::Response {
     let not_conf = || {
         axum::response::Response::builder()
@@ -72,6 +80,40 @@ async fn replay_bin() -> axum::response::Response {
             .body(axum::body::Body::from(format!("replay record read failed: {e}")))
             .unwrap(),
     }
+}
+
+/// キャプチャ応答の実体 (グローバルを見ないので単体で叩ける)。
+/// 返り値は (status, content-type, body)。未設定・存在しない場合は 404 で短い
+/// テキストを返す (ブラウザ側はこれを「キャプチャ無し」としてデモに落とす)。
+fn capture_body(path: Option<&str>) -> (u16, &'static str, Vec<u8>) {
+    let Some(path) = path else {
+        return (
+            404,
+            "text/plain; charset=utf-8",
+            b"capture not configured (set VIEW_CAPTURE)".to_vec(),
+        );
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => (200, "application/octet-stream", bytes),
+        Err(e) => (
+            404,
+            "text/plain; charset=utf-8",
+            format!("capture read failed: {e}").into_bytes(),
+        ),
+    }
+}
+
+/// GET /capture.bin — `VIEW_CAPTURE` が指す連結フレーム列をそのまま返す。
+/// 3D ビューワの `?replay=1` が fetch する (WS を開かずに実データを流し込む)。
+async fn capture_bin() -> axum::response::Response {
+    let path = CAPTURE.get().and_then(|o| o.as_deref());
+    let (status, ctype, body) = capture_body(path);
+    axum::response::Response::builder()
+        .status(status)
+        .header("content-type", ctype)
+        .header("cache-control", "no-store")
+        .body(axum::body::Body::from(body))
+        .unwrap()
 }
 
 async fn tokenizer_json() -> axum::response::Response {
@@ -126,6 +168,13 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("replay record path: {p}");
     }
     let _ = REPLAY.set(replay_path);
+
+    // キャプチャ配信のパスを保持 (実体はリクエスト毎に読み込む)
+    let capture_path = std::env::var("VIEW_CAPTURE").ok();
+    if let Some(p) = &capture_path {
+        tracing::info!("capture file path: {p}");
+    }
+    let _ = CAPTURE.set(capture_path);
 
     let (tx, _) = broadcast::channel::<Vec<u8>>(1024);
     let bcast: Bcast = Arc::new(tx);
@@ -182,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/ws", get(view_ws))
         .route("/tokenizer.json", get(tokenizer_json))
         .route("/replay", get(replay_bin))
+        .route("/capture.bin", get(capture_bin))
         .route("/code/src", get(code_src))
         .route("/chat", post(chat_proxy))
         .with_state(app);
@@ -453,4 +503,44 @@ async fn view_socket(mut socket: WebSocket, app: AppState) {
         }
     }
     let _ = telem::dropped(); // 将来の統計表示用 (現状は no-op)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_body;
+
+    /// GET /capture.bin の応答実体。ルート登録そのものはテストしない
+    /// (Router を作るには AppState/上流接続が要る) が、404 の 2 経路と
+    /// 200 のバイト透過 (0x00 を含む) はここで固定する。
+    #[test]
+    fn capture_body_404_when_unset_or_missing_and_200_bytes_verbatim() {
+        // 1) VIEW_CAPTURE 未設定 → 404 + 設定方法を書いた短いテキスト
+        let (status, ctype, body) = capture_body(None);
+        assert_eq!(status, 404);
+        assert!(ctype.starts_with("text/plain"), "unset content-type: {ctype}");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("VIEW_CAPTURE"), "unset body: {text}");
+
+        // 2) パスはあるがファイルが無い → 404 (ビューワはデモに落ちる)
+        let (status, ctype, body) = capture_body(Some("/nonexistent/denno-capture.bin"));
+        assert_eq!(status, 404);
+        assert!(ctype.starts_with("text/plain"), "missing content-type: {ctype}");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("capture read failed"), "missing body: {text}");
+
+        // 3) 実ファイル → 200 + application/octet-stream + バイト列そのまま
+        //    (magic "DNTL" + version + kind。0x00 が落ちないこと = 文字列化しない)
+        let path = std::env::temp_dir().join(format!(
+            "denno-capture-test-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let want: Vec<u8> = b"DNTL\x01\x09\x03\x00\x00\xff".to_vec();
+        std::fs::write(&path, &want).expect("write temp capture");
+        let (status, ctype, body) = capture_body(Some(path.to_str().unwrap()));
+        assert_eq!(status, 200);
+        assert_eq!(ctype, "application/octet-stream");
+        assert_eq!(body, want);
+        let _ = std::fs::remove_file(&path);
+    }
 }

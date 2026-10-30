@@ -240,6 +240,81 @@ test('RouterTopK を 3 枚連結しても 3 枚とも読める (合成データ)
   assert.equal(n, 3);
 });
 
+// ---- 再生ループ (?replay=1) の土台 ---------------------------------------
+
+/** 全 16 kind を 1 枚ずつ並べた連結列 (実キャプチャの代替になる合成列)。 */
+function allKindsCapture() {
+  const parts = [
+    frame(KIND.SERVER_INFO, cat(str('Qwen3.8-Flash-Next'), str('flash-next'), str('Q4_0'),
+      varint(4), varint(65536), varint(48))),
+    frame(KIND.SESSION_ADMIT, cat(varint(7), varint(1), varint(300))),
+    frame(KIND.PREFILL, cat(varint(7), varint(3), varint(4_100_000_000), varint(2), varint(1), varint(70000))),
+    frame(KIND.TOKEN, cat(varint(7), varint(248046), varint(900))),
+    frame(KIND.STEP, cat(varint(1), varint(32_430_000))),
+    frame(KIND.OP_SUMMARY, cat(varint(1), [3], varint(2 ** 40))),
+    frame(KIND.KV_USAGE, cat(varint(2), [1, 0], varint(1024), varint(0))),
+    frame(KIND.GAP, varint(2)),
+    frame(KIND.TOP_K, cat(varint(7), varint(248046), h16(0x3e00), varint(1), varint(5), h16(0x3800))),
+    frame(KIND.LAYER_RUN, cat(varint(47), varint(1), [1], varint(123456))),
+    frame(KIND.LAYER_ACT, cat(varint(47), varint(2), varint(0), varint(511), h16(0x3c00), h16(0x3800))),
+    frame(KIND.ROLE_ACT, cat(varint(47), h16(0x3c00), h16(0x3800), h16(0x3400), h16(0x3a00), h16(0x3000))),
+    frame(KIND.EXPERT_RESIDENCY, cat(varint(47), varint(2), varint(0), varint(511))),
+    frame(KIND.TIER_STATS, cat(varint(21000), varint(24576), varint(1200), varint(87))),
+    frame(KIND.ROUTER_TOPK, cat(varint(47), varint(2), varint(502), varint(511), h16(0x3c00), h16(0x3800))),
+    frame(KIND.SESSION_DONE, cat(varint(7), [1], varint(128)))
+  ];
+  return {
+    buf: Uint8Array.from(parts.flatMap((p) => [...p])),
+    kinds: ['ServerInfo', 'SessionAdmit', 'Prefill', 'Token', 'Step', 'OpSummary', 'KvUsage',
+      'Gap', 'TopK', 'LayerRun', 'LayerAct', 'RoleAct', 'ExpertResidency', 'TierStats',
+      'RouterTopK', 'SessionDone']
+  };
+}
+
+test('連結列を decodeFrame で繰り返すと最後まで進み、消費バイト数が入力長と一致する', () => {
+  // ?replay=1 の再生ループは「off を next で進め、末尾に乗ったら 0 に戻す」だけ。
+  // ここでは 16 kind の連結列を 2 周ぶん 1 フレームずつ読み、例外が出ないこと・
+  // off が buf.length にちょうど一致すること・2 周目が同じ列になることを固定する。
+  const { buf, kinds } = allKindsCapture();
+  assert.ok(buf.length > 0);
+  let off = 0, laps = 0;
+  while (laps < 2) {
+    const seen = [];
+    while (off < buf.length) {
+      const r = decodeFrame(buf, off);       // 壊れた列ならここで例外
+      assert.ok(r.next > off, 'next が進まない (off=' + off + ')');
+      off = r.next;
+      seen.push(r.frame.kind);
+    }
+    assert.equal(off, buf.length, 'lap ' + laps + ': 消費バイト数が入力長と一致しない');
+    assert.deepEqual(seen, kinds, 'lap ' + laps + ' の kind 列');
+    off = 0;                                  // 末尾 → 先頭 (ループ)
+    laps++;
+  }
+  // 途中から折り返しても同じフレームが読める (loop は任意のフレーム境界から)
+  const mid = decodeFrame(buf, 0).next;
+  assert.equal(decodeFrame(buf, mid).frame.kind, kinds[1]);
+});
+
+test('末尾が途中で切れた列でも、折り返せば先頭から読める (partial は握る)', () => {
+  const { buf } = allKindsCapture();
+  const cut = Uint8Array.from(buf.subarray(0, buf.length - 3));   // 最終フレームの途中で切る
+  let off = 0, n = 0;
+  for (;;) {
+    try {
+      const r = decodeFrame(cut, off);
+      off = r.next; n++;
+    } catch (e) {
+      assert.ok(e instanceof FrameDecodeError, e.constructor.name);
+      assert.equal(e.partial, true, '末尾の欠けは partial (次のメッセージに繰り越せる)');
+      break;
+    }
+  }
+  assert.ok(n > 0);
+  assert.ok(off < cut.length, '欠けた最終フレームは消費しない');
+  assert.equal(decodeFrame(cut, 0).frame.kind, 'ServerInfo', '折り返せば先頭から読める');
+});
+
 // ---- 異常系 --------------------------------------------------------------
 
 test('magic が違う → FrameDecodeError (partial=false)', () => {
