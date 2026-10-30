@@ -221,13 +221,25 @@ struct Flash {
     telem: Telemetry,
 }
 
-/// 計測のみ (`DENNO_Q4_PROFILE=1`)。Flash-Next の層内フェーズを 1 行にまとめて出す。
+/// 計測のみ (`DENNO_Q4_PROFILE=1` / `DENNO_DEV_PROFILE=1`)。
 ///
+/// - `devprof` (T63): op 別の時間・転送量・同期。GPU の GEMV 1 回ごとの
+///   内訳を役割名で出す。`DENNO_DEV_PROFILE` 未設定なら 1 行も出さない。
+/// - `q4prof`: Flash-Next の層内フェーズを 1 行にまとめて出す。
+///
+/// どちらも既定 off では分岐 1 回だけで、数値経路には触れない。
+fn prof_flash(tag: &str, tok: usize) {
+    for line in denno_engine::model::devprof::report(tag, tok) {
+        eprintln!("{line}");
+    }
+    prof_flash_q4(tag, tok);
+}
+
 /// `q4prof` は 27B の `DENNO_PROFILE` (表 C) とは別系統で、このモデル専用の軽量な
 /// カウンタ。以前はテストからしか読めず serve では取れなかったので、リクエストの
 /// 区切り (prefill 終端 / decode 終端) でここから出す。既定 off では
 /// `enabled()` の分岐 1 回だけで、数値経路には触れない。
-fn prof_flash(tag: &str, tok: usize) {
+fn prof_flash_q4(tag: &str, tok: usize) {
     use denno_engine::model::qwen4exp::{moe_sub_take, q4prof};
     if !q4prof::enabled() {
         return;

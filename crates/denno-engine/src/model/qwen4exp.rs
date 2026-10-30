@@ -2230,7 +2230,7 @@ impl Qwen4Exp {
         let mut logits = vec![0.0f32; self.head.output.n()];
         self.head
             .output
-            .gemv(&cur, &mut logits)
+            .gemv_label("output", &cur, &mut logits)
             .map_err(|err| one(format!("output: {err}")))?;
         Ok(logits)
     }
@@ -2782,7 +2782,7 @@ impl Qwen4Exp {
         let mut logits = vec![0.0f32; self.head.output.n()];
         self.head
             .output
-            .gemv(&cur, &mut logits)
+            .gemv_label("output", &cur, &mut logits)
             .map_err(|err| one(format!("output: {err}")))?;
         Ok(logits)
     }
@@ -2803,19 +2803,19 @@ fn hc_mix_quant(
     let xn = hyper::grouped_rms_norm(res, norm, hp);
 
     let mut lo = vec![0.0f32; down.n()];
-    down.gemv(&xn, &mut lo)
+    down.gemv_label("hc_down", &xn, &mut lo)
         .map_err(|err| one(format!("hc_mix down: {err}")))?;
     hyper::hc_lo_apply(&mut lo, hp);
 
     let mut gate = vec![0.0f32; up.n()];
-    up.gemv(&lo, &mut gate)
+    up.gemv_label("hc_up", &lo, &mut gate)
         .map_err(|err| one(format!("hc_mix up: {err}")))?;
     let mixed = hyper::hc_mixed(&xn, &gate, hp);
 
     let inj = match inject {
         Some(w) => {
             let mut v = vec![0.0f32; w.n()];
-            w.gemv(&xn, &mut v)
+            w.gemv_label("hc_inject", &xn, &mut v)
                 .map_err(|err| one(format!("hc_mix inject: {err}")))?;
             hyper::hc_inject_apply(&mut v, hp);
             v
@@ -2958,7 +2958,7 @@ fn ple_inject(
     // 1. key / value
     let mut key = vec![0.0f32; pw.key.n()];
     pw.key
-        .gemv(ple_emb, &mut key)
+        .gemv_label("ple", ple_emb, &mut key)
         .map_err(|err| one(format!("ple_key: {err}")))?;
     if key.len() != hc_dim {
         return Err(one(format!(
@@ -2968,7 +2968,7 @@ fn ple_inject(
     }
     let mut value = vec![0.0f32; pw.value.n()];
     pw.value
-        .gemv(ple_emb, &mut value)
+        .gemv_label("ple", ple_emb, &mut value)
         .map_err(|err| one(format!("ple_value: {err}")))?;
     if value.len() != e {
         return Err(one(format!(
@@ -3816,7 +3816,7 @@ fn moe_ffn_quant_full(
     // 1. ルータ
     let mut probs = vec![0.0f32; ne];
     lw.gate_inp
-        .gemv(x, &mut probs)
+        .gemv_label("gate_inp", x, &mut probs)
         .map_err(|err| one(format!("層 {}: ffn_gate_inp: {err}", lw.il)))?;
     softmax(&mut probs);
 
@@ -4035,23 +4035,23 @@ fn moe_ffn_quant_full(
     let sff = lw.gate_shexp.n();
     let mut sact = vec![0.0f32; sff];
     lw.gate_shexp
-        .gemv(x, &mut sact)
+        .gemv_label("shared_gate", x, &mut sact)
         .map_err(|err| one(format!("層 {}: ffn_gate_shexp: {err}", lw.il)))?;
     silu_inplace(&mut sact);
     let mut sup = vec![0.0f32; sff];
     lw.up_shexp
-        .gemv(x, &mut sup)
+        .gemv_label("shared_up", x, &mut sup)
         .map_err(|err| one(format!("層 {}: ffn_up_shexp: {err}", lw.il)))?;
     for r in 0..sff {
         sact[r] *= sup[r];
     }
     let mut sh = vec![0.0f32; e];
     lw.down_shexp
-        .gemv(&sact, &mut sh)
+        .gemv_label("shared_down", &sact, &mut sh)
         .map_err(|err| one(format!("層 {}: ffn_down_shexp: {err}", lw.il)))?;
     let mut sg = vec![0.0f32; lw.gate_inp_shexp.n()];
     lw.gate_inp_shexp
-        .gemv(x, &mut sg)
+        .gemv_label("shared_gate_inp", x, &mut sg)
         .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp: {err}", lw.il)))?;
     let sgw = hyper::sigmoid(sg[0]);
     for j in 0..e {

@@ -1284,6 +1284,9 @@ impl CudaCtx {
             xb.copy_from(x)?;
             // H2D の計上は従来の `from_slice` と同じ (1 呼び出し = n_in * 4 B)。
             dbg_htod(n_in * 4);
+            // devprof: 起動後の待ち (sync) + 結果読み出し (同期コピー) の実測。
+            // off なら `None` で Instant を取らない。
+            let t_sync = crate::model::devprof::sync_start();
             unsafe {
                 let (mut pw, mut px, mut po) = (dev_w.ptr, xb.ptr, ob.ptr);
                 let (mut n_in_c, mut n_out_c, mut rb_c) =
@@ -1300,6 +1303,9 @@ impl CudaCtx {
                 self.sync()?;
             }
             let got: Vec<f32> = ob.to_vec(n_out)?;
+            if let Some(t) = t_sync {
+                crate::model::devprof::note_sync(t.elapsed().as_nanos() as u64);
+            }
             out.copy_from_slice(&got);
             Ok(())
         })?;
@@ -1416,6 +1422,8 @@ impl CudaCtx {
             let ob = s.o.as_ref().expect("o は ensure 済み");
             xb.copy_from(x)?;
             dbg_htod(nt * n_in * 4);
+            // devprof: 起動後の待ち (sync) + 結果読み出し (同期コピー) の実測。
+            let t_sync = crate::model::devprof::sync_start();
             unsafe {
                 let (mut pw, mut px, mut po) = (dev_w.ptr, xb.ptr, ob.ptr);
                 let (mut nt_c, mut ni_c, mut no_c, mut rb_c) =
@@ -1433,6 +1441,9 @@ impl CudaCtx {
                 self.sync()?;
             }
             let got: Vec<f32> = ob.to_vec(nt * n_out)?;
+            if let Some(t) = t_sync {
+                crate::model::devprof::note_sync(t.elapsed().as_nanos() as u64);
+            }
             out[..nt * n_out].copy_from_slice(&got);
             Ok(())
         })?;
@@ -5297,6 +5308,14 @@ pub fn maybe_gpu_gguf_gemv_into(
         GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
         return false;
     }
+    // devprof: 重みのアップロードは「この呼び出しで増えたバイト数」だけ数える
+    // (常駐ヒットなら 0)。集計は gpu_budget が持っている。
+    let prof = crate::model::devprof::on();
+    let up_before = if prof {
+        crate::gpu_budget::weight_upload_bytes()
+    } else {
+        0
+    };
     let w = match weights_for_gguf(uid, ty, blocks, k, n) {
         Ok(w) => w,
         Err(e) => {
@@ -5320,6 +5339,10 @@ pub fn maybe_gpu_gguf_gemv_into(
     match ctx.moe_gemv_dev(ty, &w.buf, x, k, n, out) {
         Ok(true) => {
             set_last_linear_ran_on_gpu(true);
+            if prof {
+                let up_w = crate::gpu_budget::weight_upload_bytes().saturating_sub(up_before);
+                crate::model::devprof::note_bytes(k as u64 * 4 + up_w, n as u64 * 4);
+            }
             true
         }
         Ok(false) => false,
@@ -5436,9 +5459,33 @@ pub fn maybe_gpu_gguf_gemm_into(
     nt: usize,
     out: &mut [f32],
 ) -> bool {
+    // devprof: 1 呼び出しぶんの時間・転送量・同期待ちを op "gemm" に積む。
+    // `nt > 128` は `gemm_try` の内側で分割されるが、ここで数えるのは
+    // 呼び出し側から見た 1 回ぶん (H2D = nt * k * 4, D2H = nt * n * 4)。
+    let prof = crate::model::devprof::on();
+    let t0 = prof.then(std::time::Instant::now);
+    let up_before = if prof {
+        crate::gpu_budget::weight_upload_bytes()
+    } else {
+        0
+    };
+    if prof {
+        crate::model::devprof::clear();
+    }
     let ok = gemm_try(uid, ty, blocks, k, n, x, nt, out);
     let c = if ok { &GEMM_USED } else { &GEMM_SKIPPED };
     c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let (true, Some(t0)) = (ok, t0) {
+        let up_w = crate::gpu_budget::weight_upload_bytes().saturating_sub(up_before);
+        let (_, _, sync_ns) = crate::model::devprof::take_pending();
+        crate::model::devprof::add(
+            "gemm",
+            t0.elapsed().as_nanos() as u64,
+            (nt * k * 4) as u64 + up_w,
+            (nt * n * 4) as u64,
+            sync_ns,
+        );
+    }
     ok
 }
 

@@ -152,11 +152,11 @@ impl SsmLayer {
         let t = std::time::Instant::now();
 
         let mut z = vec![0f32; self.p.value_dim()];
-        self.w_gate.gemv(cur, &mut z)?;
+        self.w_gate.gemv_label("ssm_gate", cur, &mut z)?;
         let mut beta_raw = vec![0f32; self.p.n_v_heads];
-        self.w_beta.gemv(cur, &mut beta_raw)?;
+        self.w_beta.gemv_label("ssm_beta", cur, &mut beta_raw)?;
         let mut alpha = vec![0f32; self.p.n_v_heads];
-        self.w_alpha.gemv(cur, &mut alpha)?;
+        self.w_alpha.gemv_label("ssm_alpha", cur, &mut alpha)?;
 
         if prof {
             crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_GATE, t);
@@ -190,7 +190,7 @@ impl SsmLayer {
         let t = std::time::Instant::now();
 
         let mut out = vec![0f32; self.p.n_embd];
-        self.w_out.gemv(&y, &mut out)?;
+        self.w_out.gemv_label("attn_out", &y, &mut out)?;
         if prof {
             crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_OUT, t);
         }
@@ -336,7 +336,7 @@ impl SsmLayer {
     /// レイアウト検証で使う。
     pub fn project_qkv(&self, cur: &[f32]) -> Result<Vec<f32>> {
         let mut qkv = vec![0f32; self.p.qkv_dim()];
-        self.w_qkv.gemv(cur, &mut qkv)?;
+        self.w_qkv.gemv_label("qkv", cur, &mut qkv)?;
         Ok(qkv)
     }
 

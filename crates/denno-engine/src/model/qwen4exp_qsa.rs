@@ -168,7 +168,7 @@ impl QsaLayer {
             );
         }
         let mut out = vec![0f32; self.idx_dim];
-        self.k_proj.gemv(cur, &mut out)?;
+        self.k_proj.gemv_label("qsa", cur, &mut out)?;
         Ok(out)
     }
 
@@ -182,7 +182,7 @@ impl QsaLayer {
             );
         }
         let mut q = vec![0f32; self.n_idx_h * self.idx_dim];
-        self.q_proj.gemv(cur, &mut q)?;
+        self.q_proj.gemv_label("qsa", cur, &mut q)?;
         qknorm_rows_inplace(
             &mut q,
             1,
