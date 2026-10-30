@@ -173,6 +173,8 @@ impl Qwen4ExpDecoder {
         for &t in prompt {
             logits = self.step(t)?;
         }
+        // P58: 1 リクエスト 1 回の階層統計 (prefill 終了時)。arch off なら即座に戻る。
+        self.model.arch_emit_prefill_done();
         Ok(logits)
     }
 
@@ -249,6 +251,9 @@ impl Qwen4ExpDecoder {
                     logits = self.step_inner(t, None, None)?;
                 }
             }
+            // P58: 逐次経路の prefill 終了時 (バッチ経路は
+            // `Qwen4Exp::forward_prefill_inner` が送る)。
+            self.model.arch_emit_prefill_done();
             return Ok(logits);
         }
         let logits = self.model.forward_prefill_tapped_roles(prompt, true, tokens, on_layer, roles)?;
@@ -378,7 +383,11 @@ impl Qwen4ExpDecoder {
         let start = self.tokens.len().saturating_sub(win);
         let ctx: Vec<u32> = self.tokens[start..].to_vec();
 
-        self.model.forward_token_at(&ctx, 0, 1, on_layer, roles)
+        let logits = self.model.forward_token_at(&ctx, 0, 1, on_layer, roles)?;
+        // P58: decode 1 トークンぶんの構造テレメトリ (変化した expert 在庫と
+        // 100 トークンごとの階層統計)。arch off ならエンジン側で即座に戻る。
+        self.model.arch_emit_token();
+        Ok(logits)
     }
 }
 
