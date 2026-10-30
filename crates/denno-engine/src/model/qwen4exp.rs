@@ -7552,6 +7552,53 @@ mod tests {
         );
     }
 
+    /// task 65: decode の入口 (`moe_ffn_quant` = router の GEMV) が
+    /// `DENNO_CPU_GEMV_PAR` の分岐に実際に入ること。
+    ///
+    /// 合成モデルは 256→4 と小さく既定のしきい値 (8 行 / 32768 MAC) には届かない
+    /// ので、しきい値だけテスト用に 1 に下げて「入口 → `GgufLinear::gemv` →
+    /// 行並列」の配線を見る。しきい値そのものの根拠は `linear_gguf` 側の
+    /// 実形状テスト (`cpu_gemv_par_*`) で固定している。
+    #[test]
+    fn router_gemv_takes_cpu_gemv_par_gate() {
+        use crate::model::linear_gguf as lg;
+        // 入口 (`moe_ffn_quant`) は RouterTopK のフレームを出すので、
+        // テレメトリを数えるテストと直列化する (moe_test_guard を先に取る)。
+        let _m = moe_test_guard();
+        let _g = lg::par_test_lock();
+        let dir = TempDir::new("cpu_gemv_par");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        // 1. 既定 (off): 新経路は 1 回も立たない。
+        lg::set_cpu_gemv_par_for_test(Some(false));
+        lg::set_par_min_rows_for_test(None);
+        lg::par_reset();
+        let off = moe_ffn_quant(&p, &lw, &x, None).expect("off");
+        assert_eq!(lg::par_launches(), 0, "off で行並列が立った");
+
+        // 2. on: 入口 1 回で F32 の GEMV が新経路に入る (router を含む)。
+        lg::set_par_min_rows_for_test(Some(1));
+        lg::set_cpu_gemv_par_for_test(Some(true));
+        lg::par_reset();
+        let on = moe_ffn_quant(&p, &lw, &x, None).expect("on");
+        let launches = lg::par_launches();
+        let tasks = lg::par_tasks();
+        lg::set_cpu_gemv_par_for_test(None);
+        lg::set_par_min_rows_for_test(None);
+        assert!(
+            launches >= 1,
+            "moe_ffn_quant の入口から行並列が 1 回も立たない (配線が切れている)"
+        );
+        assert!(tasks >= launches, "タスク数 {tasks} < 領域数 {launches}");
+
+        // 3. 出力はビット一致 (行の分割は丸め順序を変えない)。
+        assert_bitwise_eq(&off, &on, "router gate off vs on");
+    }
+
     #[test]
     fn expert_cache_path_is_bit_identical_to_mmap() {
         let _g = moe_test_guard();
@@ -9154,6 +9201,50 @@ mod tests {
                 assert_bitwise_eq(&seq, &bat, &format!("chunk {chunk}"));
             }
             moe_expert::set_vnni_for_test(None);
+        }
+
+        /// task 65: 合成モデルの 1 回の prefill で `DENNO_CPU_GEMV_PAR` の
+        /// 行並列が実際に何度も立つこと (= decode/prefill の各入口
+        /// (router / ssm_beta / ssm_alpha / hc_inject) が `GgufLinear::gemv` を
+        /// 通っている) と、立っても logits がビット一致すること。
+        ///
+        /// 合成形は小さいのでしきい値だけテスト用に 1 に下げる。しきい値そのものは
+        /// `linear_gguf` の実形状テストで固定している。
+        #[test]
+        fn cpu_gemv_par_gate_is_live_end_to_end() {
+            use crate::model::linear_gguf as lg;
+            let _g = moe_test_guard();
+            let _l = lg::par_test_lock();
+            moe_expert::set_vnni_for_test(Some(false));
+            let dir = TempDir::new("cpu_gemv_par_e2e");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("open");
+            let ctx: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+
+            // 1. 旧 (off): 新経路は 1 回も立たない。
+            lg::set_cpu_gemv_par_for_test(Some(false));
+            lg::set_par_min_rows_for_test(Some(1));
+            lg::par_reset();
+            let (off, _, _) = run(&f, &ctx, false, 0);
+            let launches_off = lg::par_launches();
+
+            // 2. 新 (on): 入口ごとに立つ (6 トークン × 4 層 × 複数本)。
+            lg::set_cpu_gemv_par_for_test(Some(true));
+            lg::par_reset();
+            let (on, _, _) = run(&f, &ctx, false, 0);
+            let launches_on = lg::par_launches();
+            let tasks_on = lg::par_tasks();
+            lg::set_cpu_gemv_par_for_test(None);
+            lg::set_par_min_rows_for_test(None);
+            moe_expert::set_vnni_for_test(None);
+
+            assert_eq!(launches_off, 0, "off で行並列が立った");
+            assert!(
+                launches_on >= 10,
+                "行並列が入口からほとんど立っていない ({launches_on} 回)"
+            );
+            assert!(tasks_on >= launches_on, "タスク数 {tasks_on} < 領域数 {launches_on}");
+            assert_bitwise_eq(&off, &on, "cpu gemv par e2e (off vs on)");
         }
 
         /// P56: 逐次 prefill (`forward_prefill_with(ctx, false)`) の RouterTopK は
