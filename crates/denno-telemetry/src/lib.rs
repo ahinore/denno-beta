@@ -1095,24 +1095,27 @@ pub fn topk_softmax(logits: &[f32], k: usize) -> TopK {
     if take == 0 {
         return TopK { chosen: 0, entropy, entries: Vec::new() };
     }
+    // 「a (val, id) が b より前 = 順位が上」を返す全順序 (logit 降順・同点は id 昇順)。
+    // 全ソート版の比較関数と同じ順序になる。
+    let rank = |av: f32, ai: u32, bv: f32, bi: u32| -> std::cmp::Ordering {
+        av.total_cmp(&bv).then(bi.cmp(&ai))
+    };
     let mut best: Vec<(u32, f32)> = Vec::with_capacity(take);
     for (i, &l) in logits.iter().enumerate() {
         let id = i as u32;
         if best.len() == take {
-            // 末尾 (最下位) より後ろなら捨てる。比較は全ソートと同じ total order。
+            // 最下位より順位が下なら捨てる。
             let (wid, wl) = best[take - 1];
-            if l.total_cmp(&wl).then(id.cmp(&wid)) != std::cmp::Ordering::Less {
+            if rank(l, id, wl, wid) != std::cmp::Ordering::Greater {
                 continue;
             }
         }
         let pos = best
             .iter()
-            .position(|&(bid, bl)| l.total_cmp(&bl).then(id.cmp(&bid)) == std::cmp::Ordering::Less)
+            .position(|&(bid, bl)| rank(l, id, bl, bid) == std::cmp::Ordering::Greater)
             .unwrap_or(best.len());
-        if pos < take {
-            best.insert(pos, (id, l));
-            best.truncate(take);
-        }
+        best.insert(pos, (id, l));
+        best.truncate(take);
     }
     let entries = best
         .into_iter()
