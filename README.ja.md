@@ -17,7 +17,7 @@ LLM の動作原理(トークン化 → forward pass → サンプリング → 
 - **CUDA オフロード**: decode / prefill の両チェーンを自前 CUDA カーネルで GPU 化し、重み / KV / 隠れ状態を VRAM に常駐させる。数値契約は「線形層・rope・rmsnorm・swiglu は CPU とビット一致、緩和枠は attention のみ」([アーキテクチャ解説 §8](docs/ARCHITECTURE.ja.md)、[数値方針](docs/NUMERIC_POLICY.ja.md))
 - 連続バッチング(複数セッションの decode を 1 forward に統合・KV スロットプール)、prefix cache(LCP 最大選択・GDN 状態スナップショット対応)、27B 経路の int8 量子化、repetition / frequency / presence penalty、no-repeat n-gram
 - **expert の階層配置**(Flash-Next): 512 個の expert を VRAM → RAM → SSD(GGUF 直読み)の順にキャッシュし、層ごとに router の top-10 が必要なものだけを引き上げる。階層ごとに予算を持つので、重み 104 GB のモデルを遥かに小さい VRAM 枠で回せる
-- **推論テレメトリ + ビューワ**: 推論を一切待たせないテレメトリ(`DENNO_TELEMETRY=1`、既定 OFF・read-only)と、別プロセスの `denno-view`。2D ダッシュボード(`/`)と、実構造をそのまま組んだ 3D ビュー(`/3d`)
+- **推論テレメトリ + ビューワ**: 推論を一切待たせないテレメトリ(`DENNO_TELEMETRY`、`serve-flash` 経路では既定 ON、`serve` では既定 OFF・read-only)と、別プロセスの `denno-view`。2D ダッシュボード(`/`)と、実構造をそのまま組んだ 3D ビュー(`/3d`)
 
 ## Qwen3.8-Flash-Next の構成
 
@@ -48,74 +48,93 @@ Flash-Next の decode 内訳(入力 49 + 出力 128 トークン、193.9 ms/toke
 
 古い数値・棄却した試み・「正式値」の定義は [docs/TASKS.md](docs/TASKS.md) と[開発史](docs/history/README.md) にある。
 
-## 使い方(Qwen の例)
+## 使い方(Qwen3.8-Flash-Next)
+
+Flash-Next はスパース MoE で、専用の `serve-flash` 経路で配信する。API は他と同じ `/v1/messages` で、`serve` と別経路なのはモデルが `Engine` 実装を持たないため(512 expert の配置と PLE の表に専用ローダが要る)。
 
 ```bash
-# 1. モデルのダウンロード(HF hub キャッシュ ~/.cache/denno/hub に入る)
+# 1. CUDA 経路をビルド(フィーチャは denno-engine 側にある)
+cargo build --release --features cuda -p denno-cli -p denno-engine
+
+# 2. 分割 GGUF を任意の HF クライアントで取得し、1 つのディレクトリに置く
+#    --dir はその中の *.gguf をソート順に全部読むので、別の量子化を混ぜないこと
+hf download <org>/Qwen3.8-Flash-Next-GGUF --include "*UD-Q4_K_XL*" --local-dir ~/models/flash-next
+
+# 3. サーバー起動
+DENNO_CUDA=1 ./target/release/denno serve-flash \
+  --dir ~/models/flash-next \
+  --port 8098 --max-ctx 65536 --max-tokens 1024
+```
+
+Anthropic Messages 形式で叩く。`stream: true` で SSE になる:
+
+```bash
+curl http://127.0.0.1:8098/v1/messages \
+  -H "content-type: application/json" \
+  -d '{"model":"qwen3.8-flash-next","max_tokens":256,
+       "messages":[{"role":"user","content":"1+1は?"}]}'
+```
+
+```python
+import anthropic
+c = anthropic.Anthropic(base_url="http://127.0.0.1:8098", api_key="sk-test")
+print(c.messages.create(model="qwen3.8-flash-next", max_tokens=256,
+      messages=[{"role":"user","content":"こんにちは"}]).content[0].text)
+```
+
+| エンドポイント | 内容 |
+|---|---|
+| `POST /v1/messages` | Messages API。JSON、`stream: true` なら SSE(`message_start` / `content_block_delta` / `message_delta` / `message_stop`) |
+| `GET /v1/models` | 広告しているモデル ID(`--name`、既定は `qwen3.8-flash-next`) |
+| `GET /health` | 死活確認 |
+| `GET /v1/telemetry/ws` | `denno-view` 用のテレメトリ |
+
+`/v1/chat/completions` は未実装(404)。リクエストは逐次処理で、KV スロットは 1 本しかないため 2 本目の呼び出しは 1 本目の完了を待つ。リクエスト間で prefix cache を保持し、805 トークンぶん再利用できた続きの会話は 204.7 s → 5.7 s になる。
+
+実運用で効く環境変数:
+
+| 変数 | 効果 |
+|---|---|
+| `DENNO_CUDA=1` | GPU 経路を有効化(付けなければ同じバイナリが CPU で動く。概ね一桁遅い) |
+| `DENNO_PREFILL_BATCH=1`、`DENNO_PREFILL_BATCH_CHUNK=512` | prefill を GPU バッチ GEMM で回す(chunk の既定は 8、実測で 512 が最良。1024 より上げると退行) |
+| `DENNO_GPU_WEIGHT_MB`、`DENNO_EXPERT_VRAM_MB` | dense 重みと expert キャッシュの VRAM 予算。dense 重みが先の枠を食い切ると expert が CPU に落ち、decode が概ね半分になる |
+| `DENNO_EXPERT_GPU=1`、`DENNO_EXPERT_BATCH=1` | 選択 expert を GPU に載せる / まとめて処理する |
+| `DENNO_STRIP_TOOLS=1` | プロンプトから `tools` 定義を落とす(40 ツールで prompt 6,979 トークンが 842 になる) |
+| `DENNO_MAX_SYSTEM=N` | system プロンプトの先頭 N 文字だけ残す |
+| `DENNO_TELEMETRY`、`DENNO_TELEMETRY_ACT=1`、`DENNO_TELEMETRY_ARCH=1` | テレメトリ(この経路では既定 ON、`0` で無効)/ 層活性 / 構造系フレーム |
+
+### その他のモデル(dense 経路の `serve`)
+
+`serve` は GPT-2、Llama 系(Qwen2.5-0.5B〜7B-Instruct、Qwen3-0.6B)、GGUF の Qwen3.5-27B を扱い、連続バッチング・prefix cache・int8 量子化を備える:
+
+```bash
+# 1. HF hub キャッシュ(~/.cache/denno/hub)へダウンロード
 cargo run --release -p denno-cli -- pull Qwen/Qwen2.5-0.5B-Instruct
 
 # 2. サーバー起動(seed 固定で exact decoding)
 cargo run --release -p denno-cli -- serve Qwen/Qwen2.5-0.5B-Instruct --name denno --port 8080 --seed 42
 
-# 3. API を叩く(Anthropic Messages 形式)
-curl http://127.0.0.1:8080/v1/messages \
-  -H "content-type: application/json" \
-  -d '{"model":"denno","max_tokens":128,
-       "messages":[{"role":"user","content":"1+1は?"}]}'
-```
-
-CLI で直接生成することもできる:
-
-```bash
+# 3. サーバーを立てずに単発生成
 cargo run --release -p denno-cli -- generate Qwen/Qwen2.5-0.5B-Instruct --prompt "1+1は?" --temperature 0 --seed 42
 cargo run --release -p denno-cli -- generate openai-community/gpt2 --prompt "The capital of France is" --raw --seed 42
 ```
 
-Anthropic 公式の Python SDK からもそのまま使える:
-
-```python
-import anthropic
-c = anthropic.Anthropic(base_url="http://127.0.0.1:8080", api_key="sk-test")
-print(c.messages.create(model="denno", max_tokens=128,
-      messages=[{"role":"user","content":"こんにちは"}]).content[0].text)
-```
-
-### Flash-Next
-
-```bash
-# cuda フィーチャは denno-engine 側にあるので、両方をビルドしてからバイナリを直接起動する
-cargo build --release --features cuda -p denno-cli -p denno-engine
-
-# --dir は分割 GGUF が置かれたディレクトリ
-DENNO_CUDA=1 ./target/release/denno serve-flash \
-  --dir /models/Qwen3.8-Flash-Next/UD-Q4_K_XL \
-  --port 8098 --max-ctx 65536 --max-tokens 1024
-```
-
-リクエスト形式は同じ `/v1/messages` で、変わるのはモデル ID だけ。実運用で効く環境変数:
-
-| 変数 | 効果 |
-|---|---|
-| `DENNO_CUDA=1` | GPU 経路を有効化 |
-| `DENNO_PREFILL_BATCH=1`、`DENNO_PREFILL_BATCH_CHUNK=512` | prefill を GPU バッチ GEMM で回す(chunk の既定は 8、実測で 512 が最良。1024 より上げると退行) |
-| `DENNO_GPU_WEIGHT_MB`、`DENNO_EXPERT_VRAM_MB` | dense 重みと expert キャッシュの VRAM 予算 |
-| `DENNO_EXPERT_GPU=1`、`DENNO_EXPERT_BATCH=1` | 選択 expert を GPU に載せる / まとめて処理する |
-| `DENNO_STRIP_TOOLS=1` | プロンプトから `tools` 定義を落とす(40 ツールで prompt 6,979 トークンが 842 になる) |
-| `DENNO_TELEMETRY`、`DENNO_TELEMETRY_ACT=1`、`DENNO_TELEMETRY_ARCH=1` | テレメトリ(この経路では既定 ON、`0` で無効)/ 層活性 / 構造系フレーム |
-
 ## 可視化(denno-view)を起動する
 
 ```bash
-# 1. サーバーをテレメトリ ON で起てる(DENNO_TELEMETRY=1 以外は同一コマンド)
-DENNO_TELEMETRY=1 cargo run --release -p denno-cli -- serve Qwen/Qwen2.5-0.5B-Instruct --name denno --port 8080 --seed 42
+# 1. サーバー起動(serve-flash はテレメトリ既定 ON。DENNO_TELEMETRY=0 で無効)
+DENNO_CUDA=1 ./target/release/denno serve-flash \
+  --dir ~/models/flash-next --port 8098 --max-ctx 65536 --max-tokens 1024
 
-# 2. 別ターミナルで denno-view を起動
-#    (既定で ws://127.0.0.1:8080 のテレメトリ WS に接続し、:8093 で待受)
-VIEW_TOKENIZER=~/.cache/denno/hub/models--Qwen--Qwen2.5-0.5B-Instruct/tokenizer.json \
+# 2. 別ターミナルで、そのサーバーに向けて denno-view を起動
+#    (VIEW_PORT の既定は 8093)
+VIEW_UPSTREAM=ws://127.0.0.1:8098/v1/telemetry/ws \
   cargo run --release -p denno-view
 
 # 3. ブラウザで http://localhost:8093/ を開く(ダッシュボード)。3D は /3d
 ```
+
+dense の `serve` 経路を使う場合は、起動時に `DENNO_TELEMETRY=1` を渡し、`VIEW_TOKENIZER` にモデルの `tokenizer.json` を指定するとトークン id が文字になる(GGUF 経路はトークナイザを内包しているので、未指定なら id のまま表示される)。
 
 **動作デモ** — 3D ビュー(`/3d`)で Flash-Next と実際に会話している様子。プロンプトが入力レールでトークン化され、router が SSD から VRAM へ expert を引き上げ、層の柱がニューロン単位で光り、予測ヘッドにサンプラの top-8 候補が出て、選ばれたトークンがチャット欄へ飛ぶ:
 
