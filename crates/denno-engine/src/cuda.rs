@@ -1285,16 +1285,35 @@ impl CudaCtx {
         n_out: usize,
         out: &mut [f32],
     ) -> Result<bool> {
+        self.moe_gemv_dev_with(ty, dev_w, x, n_in, n_out, out, moe_gemv_v3_on())
+    }
+
+    /// [`Self::moe_gemv_dev`] の実体。`want_v3` のときだけ v3 (4 レーン版) を
+    /// 選ぶ。k が 128 の倍数でない / v3 の PTX が読めない ときは v2 へ落ちる。
+    ///
+    /// 戻り値は「GPU で走ったか」(v2 に落ちても true)。v3 が実際に走ったかは
+    /// 呼び出し側のテストが「v2 とビット一致しないこと」で確かめる。
+    #[allow(clippy::too_many_arguments)]
+    fn moe_gemv_dev_with(
+        &self,
+        ty: crate::kquant::GgmlType,
+        dev_w: &DevBuffer,
+        x: &[f32],
+        n_in: usize,
+        n_out: usize,
+        out: &mut [f32],
+        want_v3: bool,
+    ) -> Result<bool> {
         use crate::kquant::GgmlType as T;
-        let fs = match self.pick_moe_kernels() {
+        let fs_v12 = match self.pick_moe_kernels() {
             Some(f) => f,
             None => return Ok(false),
         };
-        let (f, rb) = match ty {
-            T::Q8_0 => (fs[0], (n_in / 32) * 34),
-            T::Q5_1 => (fs[1], (n_in / 32) * 24),
-            T::Q4K => (fs[2], (n_in / 256) * 144),
-            T::Q5K => (fs[3], (n_in / 256) * 176),
+        let (ki, rb) = match ty {
+            T::Q8_0 => (0usize, (n_in / 32) * 34),
+            T::Q5_1 => (1usize, (n_in / 32) * 24),
+            T::Q4K => (2usize, (n_in / 256) * 144),
+            T::Q5K => (3usize, (n_in / 256) * 176),
             _ => return Ok(false),
         };
         let bs = ty.blck_size();
@@ -1321,9 +1340,26 @@ impl CudaCtx {
         // cuMemFree 2 本を回していた。decode 中に数万回)。
         // 数値は不変: カーネル・引数・発行順はそのままで、x は n_in 要素・
         // out は n_out 要素の範囲しか読み書きしない (前回の残りは読まない)。
+        // P-gemv3: 1 行を 4 レーンで分担する版 (kernels_moe_v3.cu)。64 行/ブロック・
+        // 共有メモリ無し (行の生バイトをステージしない) なので、起動形状も v2 と違う。
+        // 使えないときは v2 の 4 行/ブロック + 行ステージングへ落ちる。
+        let v3 = if want_v3 && moe_gemv_v3_k_ok(n_in) {
+            gemv_v3_kernels().map(|k| k.f)
+        } else {
+            None
+        };
         const MOE_ROWS_PER_BLOCK: usize = 4; // kernels_moe.cu の MOE_ROWS と一致
-        let shmem = (MOE_ROWS_PER_BLOCK * rb) as u32;
-        let grid = ((n_out + MOE_ROWS_PER_BLOCK - 1) / MOE_ROWS_PER_BLOCK) as u32;
+        const V3_ROWS_PER_BLOCK: usize = 64; // kernels_moe_v3.cu の MOE_V3_ROWS_PER_BLOCK と一致
+        let (fs, rows_per_block, shmem) = match v3 {
+            Some(f3) => (f3, V3_ROWS_PER_BLOCK, 0u32),
+            None => (
+                fs_v12,
+                MOE_ROWS_PER_BLOCK,
+                (MOE_ROWS_PER_BLOCK * rb) as u32,
+            ),
+        };
+        let f = fs[ki];
+        let grid = ((n_out + rows_per_block - 1) / rows_per_block) as u32;
         MOE_SCRATCH.with(|cell| -> Result<()> {
             let mut s = cell.borrow_mut();
             let s: &mut MoeScratch = &mut s;
@@ -1651,6 +1687,116 @@ pub fn moe_gemv_v2_on() -> bool {
             Some("0") | Some("off") | Some("false")
         )
     })
+}
+
+/// decode GEMV の 4 レーン版 (`kernels_moe_v3.cu`) を使うか (既定 **off**)。
+///
+/// `DENNO_GEMV_V3=1` のときだけ v3。未設定 / `0` / `off` / `false` では v2 (既定
+/// 経路) のままで、1 バイトも挙動が変わらない。
+///
+/// v3 は 1 行の累積を 4 レーンで分担するので **v2 とビット一致しない** (加算順が
+/// 変わる。prefill の GPU バッチ GEMM と同じ扱い = 契約の外)。既定で使わない理由。
+pub fn moe_gemv_v3_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("DENNO_GEMV_V3").ok().as_deref(),
+            Some("1") | Some("on") | Some("true")
+        )
+    })
+}
+
+/// v3 のレーン分割が成立する k か (純関数。GPU 無しで検証できる)。
+///
+/// v3 のレーン l は k を 4 等分した連続区間 `[l*k/4, (l+1)*k/4)` を持ち、区間の
+/// 中で量子ブロック (最小 32 要素) を丸ごと読む。したがって k/4 が 32 の倍数 =
+/// k が 128 の倍数であることが要る。満たさない k は v2 へ落ちる (panic しない)。
+pub fn moe_gemv_v3_k_ok(k: usize) -> bool {
+    k >= 128 && k % 128 == 0
+}
+
+/// v3 のカーネル一式。4 本そろって初めて `Some`。
+struct V3Kernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: [CUfunction; 4],
+}
+
+// 生ハンドル (CudaCtx / GroupedKernels と同じ規約)。
+unsafe impl Send for V3Kernels {}
+unsafe impl Sync for V3Kernels {}
+
+static V3_KERNELS: OnceLock<Option<V3Kernels>> = OnceLock::new();
+
+/// v3 の PTX の置き場所。`DENNO_GEMV_V3_PTX` があればそれ、無ければビルド時の
+/// クレートディレクトリ配下 `kernels/kernels_moe_v3.ptx`。
+fn gemv_v3_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_GEMV_V3_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_moe_v3.ptx"),
+    }
+}
+
+/// v3 のカーネルを取得する (初回だけ PTX を読む)。
+///
+/// 失敗は `None` をキャッシュする (= 二度と試さない)。読めなかったときは
+/// **1 行だけ**警告を出し、呼び出し側は v2 へ落ちる。呼ぶ前に必ず context を
+/// current にしておくこと (cuModuleLoadData は current context に入る)。
+fn gemv_v3_kernels() -> Option<&'static V3Kernels> {
+    V3_KERNELS
+        .get_or_init(|| {
+            let path = gemv_v3_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[gemv-v3] PTX が読めない ({}) : {e} → v2 へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0); // cuModuleLoadData は NUL 終端の PTX を期待する
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[gemv-v3] cuModuleLoadData 失敗 → v2 へ");
+                    return None;
+                }
+                let mut f: [CUfunction; 4] = [std::ptr::null_mut(); 4];
+                let names: [&[u8]; 4] = [
+                    b"dno_gemv_q8_0_v3\0",
+                    b"dno_gemv_q5_1_v3\0",
+                    b"dno_gemv_q4k_v3\0",
+                    b"dno_gemv_q5k_v3\0",
+                ];
+                for (k, n) in names.iter().enumerate() {
+                    if (lib.module_get_function)(&mut f[k], module, n.as_ptr() as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!(
+                            "[gemv-v3] PTX に {} が無い → v2 へ",
+                            String::from_utf8_lossy(&n[..n.len() - 1])
+                        );
+                        return None;
+                    }
+                }
+                Some(V3Kernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+/// v3 の PTX が読めているか (テスト専用。**context を current にしてから**呼ぶこと。
+/// 失敗を `OnceLock` に焼き付けるので、本番経路からは呼ばない)。
+#[cfg(test)]
+pub(crate) fn moe_gemv_v3_loaded() -> bool {
+    gemv_v3_kernels().is_some()
 }
 
 /// 一時診断: 最初の N 回だけ GEMV の内訳 (H2D / 起動 / 同期 / D2H) を stderr に出す。
@@ -12422,8 +12568,10 @@ mod tests {
                 .expect("cpu 参照");
             let dev_w = DevBuffer::from_slice(&w).unwrap();
             let mut got = vec![0f32; n_out];
+            // v3 (4 レーン版) は加算順が変わるので、このテストは明示的に v2 経路へ
+            // 固定する (DENNO_GEMV_V3=1 の環境でもビット一致の基準を保つ)。
             assert!(
-                ctx.moe_gemv_dev(ty, &dev_w, &x, n_in, n_out, &mut got)
+                ctx.moe_gemv_dev_with(ty, &dev_w, &x, n_in, n_out, &mut got, false)
                     .unwrap(),
                 "{ty:?}: GPU 経路が発動しなかった"
             );
@@ -12439,6 +12587,134 @@ mod tests {
                 bad.iter().map(|&i| want[i]).take(4).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// P-gemv3: 4 レーン版 GEMV が CPU の逐次実装 (`expert_gemv_scalar`) と
+    /// 相対 1e-5 以内で一致し、NaN / Inf を作らないこと。
+    ///
+    /// v3 は 1 行の加算を 4 分割するので v2 とは**ビット一致しない**。ここでは
+    /// 行列全体で「最大絶対差 / 最大絶対値」を相対誤差として見る (行ごとの相対は
+    /// 打ち消し合いで 0 に近い行が暴れるため)。v3 が実際に走ったことは
+    /// 「v2 の結果とビット一致しない行がある」ことで確かめる (黙って v2 に
+    /// 落ちていたら 1 bit も変わらない)。
+    ///
+    /// 実行 (GPU のある環境):
+    ///   DENNO_GEMV_V3_PTX=$PWD/crates/denno-engine/kernels/kernels_moe_v3.ptx \
+    ///   cargo test --release --features cuda -- --ignored cuda_gemv_v3_matches_cpu
+    #[test]
+    #[ignore]
+    fn cuda_gemv_v3_matches_cpu() {
+        use crate::kquant::GgmlType as T;
+        let ctx = CudaCtx::new().unwrap();
+        println!("device: {}", ctx.info());
+        assert!(
+            moe_gemv_v3_loaded(),
+            "v3 の PTX が読めていない (DENNO_GEMV_V3_PTX / kernels_moe_v3.ptx を確認)"
+        );
+        // 実モデルの k (Q4_K 2560 / Q5_1 640 / Q8_0 2560)。n_out は 64 行/ブロックを跨ぐ。
+        let cases: [(T, usize, usize); 3] = [
+            (T::Q4K, 2560, 256),
+            (T::Q5_1, 640, 2560),
+            (T::Q8_0, 2560, 256),
+        ];
+        for (ty, n_in, n_out) in cases {
+            let rb = gguf_row_bytes(ty, n_in).expect("row_bytes");
+            let blk = ty.blck_size();
+            // v2 のビット一致テストと同じ合成行列: d (と Q4_K/Q5_K の dmin、
+            // Q5_1 の m) は f16 の 1.0 固定 = NaN / Inf を作らない。
+            let hdr = 4usize;
+            let mut w = vec![0u8; rb * n_out];
+            let mut s = 12345u32;
+            for r in 0..n_out {
+                let row = &mut w[r * rb..(r + 1) * rb];
+                for b in 0..(n_in / blk) {
+                    let base = b * ty.type_size();
+                    row[base] = 0x00;
+                    row[base + 1] = 0x3c;
+                    row[base + 2] = 0x00;
+                    row[base + 3] = 0x3c;
+                    for i in hdr..ty.type_size() {
+                        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        row[base + i] = (s >> 16) as u8;
+                    }
+                }
+            }
+            let x = pseudo_random(n_in, 7);
+            let mut want = vec![0f32; n_out];
+            crate::model::moe_expert::expert_gemv_scalar(ty, &w, n_in, n_out, &x, &mut want)
+                .expect("cpu 参照");
+            let dev_w = DevBuffer::from_slice(&w).unwrap();
+            let mut got_v2 = vec![0f32; n_out];
+            assert!(
+                ctx.moe_gemv_dev_with(ty, &dev_w, &x, n_in, n_out, &mut got_v2, false)
+                    .unwrap(),
+                "{ty:?}: GPU 経路 (v2) が発動しなかった"
+            );
+            let mut got = vec![0f32; n_out];
+            assert!(
+                ctx.moe_gemv_dev_with(ty, &dev_w, &x, n_in, n_out, &mut got, true)
+                    .unwrap(),
+                "{ty:?}: GPU 経路 (v3) が発動しなかった"
+            );
+            // 基準 (v2 は CPU とビット一致する契約) が壊れていないこと
+            for i in 0..n_out {
+                assert_eq!(
+                    got_v2[i].to_bits(),
+                    want[i].to_bits(),
+                    "{ty:?}: v2 が CPU とビット一致しない (行 {i})"
+                );
+            }
+            // v3 が実際に走ったか (走っていれば加算順の違いでビットが変わる)
+            let ndiff = (0..n_out)
+                .filter(|&i| got[i].to_bits() != got_v2[i].to_bits())
+                .count();
+            assert!(
+                ndiff > 0,
+                "{ty:?}: v3 の出力が v2 と 1 行も違わない = v3 が走っていない \
+                 (PTX 未ロード / k={n_in} が 128 の倍数でない)"
+            );
+            let mut maxd = 0f32;
+            let mut maxv = 0f32;
+            let mut nonfinite = 0usize;
+            for i in 0..n_out {
+                if !got[i].is_finite() {
+                    nonfinite += 1;
+                    continue;
+                }
+                maxd = maxd.max((got[i] - want[i]).abs());
+                maxv = maxv.max(want[i].abs());
+            }
+            let rel = maxd / maxv.max(f32::MIN_POSITIVE);
+            println!(
+                "{ty:?} k={n_in} n={n_out}: max|diff|={maxd:e} max|ref|={maxv:e} rel={rel:e} \
+                 (v2 と {ndiff}/{n_out} 行がビット不一致)"
+            );
+            assert_eq!(nonfinite, 0, "{ty:?}: NaN / Inf が {nonfinite} 行");
+            assert!(
+                rel < 1e-5,
+                "{ty:?}: 相対誤差 {rel:e} >= 1e-5 (max|diff|={maxd:e}, max|ref|={maxv:e})"
+            );
+        }
+    }
+
+    /// v3 のレーン分割が成立する k の判定と、ゲートの真理値表 (GPU 無しで回る)。
+    ///
+    /// 実モデルの k (640 / 2560 / 5120 / 6144) は通り、128 の倍数でない k は
+    /// v2 へ落ちる。ここが崩れると v3 が「サブブロックの途中から読む」ことになる。
+    #[test]
+    fn gemv_v3_lane_split_needs_k_multiple_of_128() {
+        for k in [128usize, 640, 2560, 5120, 6144] {
+            assert!(moe_gemv_v3_k_ok(k), "k={k} は v3 で割り切れるはず");
+        }
+        for k in [0usize, 32, 96, 192, 320, 1344, 1000] {
+            assert!(!moe_gemv_v3_k_ok(k), "k={k} は v3 の対象外のはず");
+        }
+        // ゲートは env の値だけで決まる (未設定は off)。
+        let env_on = matches!(
+            std::env::var("DENNO_GEMV_V3").ok().as_deref(),
+            Some("1") | Some("on") | Some("true")
+        );
+        assert_eq!(moe_gemv_v3_on(), env_on, "DENNO_GEMV_V3 の真理値表");
     }
 
     /// GPU の量子化が CPU (`tensor::quantize_row_i8`) とビット一致するか
