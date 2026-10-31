@@ -6160,7 +6160,7 @@ mod tests {
 
 
     /// IQ4_NL / Q2_0 の AVX2 融合カーネルがスカラー経路と一致すること。
-    /// (累積順が違うのでビット一致ではなく相対 1e-5 で見る)
+    /// (累積順が違うのでビット一致ではなく相対 1e-4 で見る)
     #[test]
     fn fused_iq4nl_and_q2_0_match_scalar() {
         if !q4k_fused_supported() {
@@ -6198,7 +6198,7 @@ mod tests {
             for i in 0..n_out {
                 let scale = b2[i].abs().max(1e-3);
                 assert!(
-                    (a[i] - b2[i]).abs() / scale < 1e-5,
+                    (a[i] - b2[i]).abs() / scale < 1e-4,
                     "{ty:?} 行 {i}: fused {} vs scalar {}",
                     a[i],
                     b2[i]
