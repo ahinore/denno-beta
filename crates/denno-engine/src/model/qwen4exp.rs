@@ -10887,13 +10887,15 @@ mod tests {
         /// P84: 行並列 region のカウンタが down / up で積まれる
         /// (実機で「発火の有無・チャンク数・実効並列度」が読めることの証拠)。
         ///
-        /// down / up とも 320 行 (= 門番 64 以上) の形で 1 呼び出し回す。
+        /// down は 320 行 (門番 [`HC_DOWN_ROW_PAR_MIN`] = 64 以上)、up は 640 行
+        /// (既定門番 = moe_expert の `PAR_MIN_ROWS` = 512 以上) の形で
+        /// 1 呼び出し回す (実形 27B では down=320 / up=10240 行。up は既定門番で発火)。
         /// inject にはラベルを立てないので、region 数が down=1 / up=1 のままで
         /// あることも同時に確認する (expert GEMV 等が混ざらないことの証拠)。
         #[test]
         fn mix_kprof_rowpar_counts_down_and_up() {
             use mix_kprof::rowpar;
-            let (hp, norm, down, up, inject, res) = mix_q8_case(2, 160, 320);
+            let (hp, norm, down, up, inject, res) = mix_q8_case(2, 320, 320);
             mix_kprof::set_for_test(true);
             mix_kprof::reset();
             let _ = hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
@@ -10903,7 +10905,7 @@ mod tests {
             assert_eq!(fd, 1, "down の行並列が発火していない (320 行 >= 門番 64)");
             assert!(cd >= 2, "down が 1 チャンクしか割れていない (cd={cd})");
             assert_eq!(ru, 1, "up region が 1 回計上されていない");
-            assert_eq!(fu, 1, "up の行並列が発火していない (10240 行 >= 門番 512)");
+            assert_eq!(fu, 1, "up の行並列が発火していない (640 行 >= 既定門番 512)");
             assert!(cu >= 2, "up が 1 チャンクしか割れていない (cu={cu})");
             // 1 行の内訳に par 部が載る (serve が読む形)。
             let line = mix_kprof::line().expect("強制 on なのに line() が None");
