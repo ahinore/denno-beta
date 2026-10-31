@@ -2223,6 +2223,26 @@ impl Qwen4Exp {
         self.forward_token_at(ctx, 0, 1, Some(&mut hook), roles)
     }
 
+    /// head (`output`) の GEMV を 1 回だけ回し、`DENNO_HEAD_PROF` の区間を積む。
+    ///
+    /// decode は 1 トークンで 1 回だけ、prefill はチャンク末尾で 1 回だけ通る。
+    /// `DENNO_HEAD_PAR=0` のときだけ従来の [`GgufLinear::gemv_label`] (汎用の門番
+    /// = 512 行)。既定は [`head_row_par_min`] の行数で**語彙方向を rayon に割る**。
+    /// どの行をどのスレッドが担当しても 1 行の計算順序は変わらない (同じ Q8_0 の
+    /// 融合カーネル・行内は `b` 昇順) ので、分割の有無で値はビット一致する。
+    fn head_logits_into(&self, x: &[f32], out: &mut [f32]) -> Result<()> {
+        let t = headprof::stamp();
+        let bytes = self.head.output.weight_bytes() as u64;
+        let row_min = head_row_par_min();
+        let r = if row_min == 0 {
+            self.head.output.gemv_label("output", x, out)
+        } else {
+            self.head.output.gemv_label_par("output", x, out, row_min)
+        };
+        headprof::mark(headprof::GEMV, t, bytes);
+        r.map_err(|err| one(format!("output: {err}")))
+    }
+
     /// [`Qwen4Exp::forward_token_tapped`] の本体。`on_layer` が `None` のときは
     /// 層ループに `if let` が 1 個増えるだけで、走査も確保もしない
     /// (`qwen4exp_decode` の `step_inner` からも使う)。
@@ -2281,6 +2301,7 @@ impl Qwen4Exp {
         }
 
         // 4. 最終 mixer (output_norm の代わり) + 5. logits
+        let t_mix = headprof::stamp();
         let cur = hc_mix_quant(
             &res,
             &self.head.norm,
@@ -2290,11 +2311,9 @@ impl Qwen4Exp {
             &hp,
         )?
         .0;
+        headprof::mark(headprof::MIX, t_mix, 0);
         let mut logits = vec![0.0f32; self.head.output.n()];
-        self.head
-            .output
-            .gemv_label("output", &cur, &mut logits)
-            .map_err(|err| one(format!("output: {err}")))?;
+        self.head_logits_into(&cur, &mut logits)?;
         Ok(logits)
     }
 
@@ -2833,6 +2852,7 @@ impl Qwen4Exp {
 
         // 4. 最終 mixer (output_norm の代わり) + 5. logits (最後のトークンだけ)
         let res = last.ok_or_else(|| one("ctx が空 (現在のトークンが無い)"))?;
+        let t_mix = headprof::stamp();
         let cur = hc_mix_quant(
             &res,
             &self.head.norm,
@@ -2842,11 +2862,9 @@ impl Qwen4Exp {
             &hp,
         )?
         .0;
+        headprof::mark(headprof::MIX, t_mix, 0);
         let mut logits = vec![0.0f32; self.head.output.n()];
-        self.head
-            .output
-            .gemv_label("output", &cur, &mut logits)
-            .map_err(|err| one(format!("output: {err}")))?;
+        self.head_logits_into(&cur, &mut logits)?;
         Ok(logits)
     }
 }
@@ -2869,6 +2887,31 @@ fn mix_fast_from_value(v: Option<&str>) -> bool {
 fn mix_fast_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| mix_fast_from_value(std::env::var("DENNO_MIX_FAST").ok().as_deref()))
+}
+
+/// head (`output`) の GEMV を**行 (語彙方向) で並列化する**門番 (行数)。
+///
+/// `GgufLinear::gemv_label` の汎用の門番は 512 行 (`PAR_MIN_ROWS`) なので、実形
+/// (151936 行) では既に行並列に入る。ここは head 専用にしきい値を明示するための
+/// もので、**門番が 512 に届かない形でも head だけは割る**。行は独立で、1 行の
+/// 計算順序 (`dot` の累積順) は分割に依らないので、値を変えずに分割だけ変わる。
+pub const HEAD_ROW_PAR_MIN: usize = 8;
+
+/// `DENNO_HEAD_PAR` の解釈。**既定 on**。`0` / `false` / `off` のときだけ 0
+/// (= 汎用の門番に任せる = 従来の `gemv_label`)。
+fn head_row_par_min_from(v: Option<&str>) -> usize {
+    match v {
+        Some(s) if s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off") => {
+            0
+        }
+        _ => HEAD_ROW_PAR_MIN,
+    }
+}
+
+/// `DENNO_HEAD_PAR` をプロセスで 1 回だけ読む (逃げ道 `DENNO_HEAD_PAR=0`)。
+fn head_row_par_min() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| head_row_par_min_from(std::env::var("DENNO_HEAD_PAR").ok().as_deref()))
 }
 
 /// `hc_*_down` (320 行 × `hc_dim`) の GEMV を並列化する門番 (行数)。
@@ -3695,6 +3738,130 @@ pub mod mix_kprof {
             c.store(0, Ordering::Relaxed);
         }
         CALLS.store(0, Ordering::Relaxed);
+    }
+}
+
+/// output head (`lm_head`) の**層の外**の内訳 (`DENNO_HEAD_PROF=1`、既定 off)。
+///
+/// [`q4prof`] の層合計は層の中しか積まないので、decode で 1 トークンあたり 1 回だけ
+/// 回る head (`output` の GEMV と head の mixer) は「層の外」として残る。ここでは
+/// その 2 個を 1 呼び出し単位で積み、**呼び出しごとに 1 行**を stderr に出す:
+///
+/// ```text
+/// [head] calls=118 total=4123.437 per_call=34944.1us threads=16 gbps=9.5
+/// [head-mix] calls=118 total=214.002 per_call=1813.6us threads=16
+/// ```
+///
+/// `per_call` は 1 呼び出しあたりの µs、`gbps` は重み (`output.weight`) の実バイトを
+/// 累積時間で割った実効帯域。**積むのは診断カウンタだけで、GEMV の引数・カーネル・
+/// 丸め順は変えない** (off のとき呼び出し側が払うのは [`stamp`] の atomic load 1 回)。
+pub mod headprof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    /// 区間: `output` の GEMV (語彙方向の 151936 行)
+    pub const GEMV: usize = 0;
+    /// 区間: head の mixer (`hc_mix_quant` = grouped RMS + down/up + silu + 混ぜ)
+    pub const MIX: usize = 1;
+    /// 区間の数
+    pub const N: usize = 2;
+
+    static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static CALLS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// 区間ごとの累積バイト数 (`gbps` の分子。mixer は 0 のまま)。
+    static BYTES: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+
+    /// テストが env を立てずに計測を強制するためのフラグ。
+    #[cfg(test)]
+    static FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// 計測をテストから強制する (`false` で env の解釈に戻る)。
+    #[cfg(test)]
+    pub fn set_for_test(v: bool) {
+        FORCE.store(v, Ordering::Relaxed);
+    }
+
+    /// `DENNO_HEAD_PROF` が立っているか (既定 off)。
+    pub fn on() -> bool {
+        #[cfg(test)]
+        if FORCE.load(Ordering::Relaxed) {
+            return true;
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DENNO_HEAD_PROF").is_some())
+    }
+
+    /// 計測が要るときだけ `Instant` を取る (既定 off では `None` = 呼び出し側は no-op)。
+    #[inline]
+    pub fn stamp() -> Option<std::time::Instant> {
+        if on() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    }
+
+    /// 区間 `slot` を 1 呼び出しとして積み、累積の 1 行を stderr に出す。
+    ///
+    /// `bytes` はこの呼び出しで読んだ重みのバイト数 (`gbps` 用。mixer は 0)。
+    /// `t` が `None` (off) のときは数えるのも出すのも行わない。
+    #[inline]
+    pub fn mark(slot: usize, t: Option<std::time::Instant>, bytes: u64) {
+        let Some(t) = t else { return };
+        if slot >= N {
+            return;
+        }
+        NS[slot].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        CALLS[slot].fetch_add(1, Ordering::Relaxed);
+        if bytes > 0 {
+            BYTES[slot].fetch_add(bytes, Ordering::Relaxed);
+        }
+        if let Some(l) = line(slot) {
+            eprintln!("{l}");
+        }
+    }
+
+    /// 区間の累積 1 行。無効時・未計測時は `None`。
+    pub fn line(slot: usize) -> Option<String> {
+        if !on() || slot >= N {
+            return None;
+        }
+        let calls = CALLS[slot].load(Ordering::Relaxed);
+        if calls == 0 {
+            return None;
+        }
+        let ns = NS[slot].load(Ordering::Relaxed);
+        let name = match slot {
+            GEMV => "head",
+            _ => "head-mix",
+        };
+        let threads = rayon::current_num_threads().max(1);
+        let mut s = format!(
+            "[{name}] calls={calls} total={:.3} per_call={:.1}us threads={threads}",
+            ns as f64 / 1e6,
+            ns as f64 / calls as f64 / 1e3
+        );
+        let bytes = BYTES[slot].load(Ordering::Relaxed);
+        if bytes > 0 && ns > 0 {
+            s.push_str(&format!(
+                " gbps={:.1}",
+                bytes as f64 / (ns as f64 / 1e9) / 1e9
+            ));
+        }
+        Some(s)
+    }
+
+    /// 累積を 0 に戻す。
+    pub fn reset() {
+        for c in NS.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+        for c in CALLS.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+        for c in BYTES.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
     }
 }
 
@@ -7762,6 +7929,131 @@ mod tests {
                 b[i]
             );
         }
+    }
+
+    /// head (`output`) 用の Q8_0 ダミー重み (34 B ブロック = f16 スケール + i8 x 32)。
+    /// 実ファイルと同じ量子型で、`linear()` と同じく `fast_q8` を立てて使う。
+    fn head_q8_weights(k: usize, n: usize, seed: u32) -> Vec<u8> {
+        assert_eq!(k % 32, 0, "Q8_0 のブロックは 32 要素");
+        let mut b = vec![0u8; k * n / 32 * 34];
+        let scale = half::f16::from_f32(0.02).to_le_bytes();
+        for blk in 0..b.len() / 34 {
+            let o = blk * 34;
+            b[o..o + 2].copy_from_slice(&scale);
+            for j in 0..32usize {
+                let q = ((j as i32 * 5 + blk as i32 + seed as i32 * 11) % 13) - 6;
+                b[o + 2 + j] = q as i8 as u8;
+            }
+        }
+        b
+    }
+
+    /// head の形 (k x n、Q8_0 + fast_q8) と入力 1 本。
+    fn head_gemv_case(k: usize, n: usize) -> (GgufLinear, Vec<f32>) {
+        let lin = GgufLinear::from_slice(GgmlType::Q8_0, k, n, &head_q8_weights(k, n, 3))
+            .expect("GgufLinear::from_slice (Q8_0)")
+            .with_fast_q8(true);
+        let x: Vec<f32> = (0..k).map(|i| ((i % 23) as f32 - 11.0) * 0.05).collect();
+        (lin, x)
+    }
+
+    /// `DENNO_HEAD_PAR` の解釈 (既定 on、`0` / `false` / `off` だけ従来経路)。
+    #[test]
+    fn head_par_gate_defaults_on() {
+        assert_eq!(head_row_par_min_from(None), HEAD_ROW_PAR_MIN);
+        assert_eq!(head_row_par_min_from(Some("1")), HEAD_ROW_PAR_MIN);
+        assert_eq!(head_row_par_min_from(Some("")), HEAD_ROW_PAR_MIN);
+        assert_eq!(head_row_par_min_from(Some("0")), 0, "\"0\" で従来経路");
+        assert_eq!(head_row_par_min_from(Some("false")), 0);
+        assert_eq!(head_row_par_min_from(Some("OFF")), 0);
+    }
+
+    /// 明示の行並列 (`gemv_label_par`) が汎用の門番 (`gemv_label`) と**ビット一致**する。
+    ///
+    /// 実形の head は 151936 行なのでテストでは縮めるが、通るカーネル (Q8_0 の AVX2
+    /// 融合) と行内の `b` 昇順は実形と同じ。行は独立なので、行の切り方だけが違う。
+    #[test]
+    fn head_par_matches_default_path_bits() {
+        let (lin, x) = head_gemv_case(256, 1024);
+        let mut a = vec![0f32; lin.n()];
+        let mut b = vec![0f32; lin.n()];
+        lin.gemv_label("output", &x, &mut a).expect("default");
+        lin.gemv_label_par("output", &x, &mut b, HEAD_ROW_PAR_MIN)
+            .expect("par");
+        assert!(
+            a.iter().any(|v| *v != 0.0),
+            "全 0 (経路の生死が分からない)"
+        );
+        assert_bitwise_eq(&a, &b, "head: 汎用の門番 vs 明示の行並列");
+    }
+
+    /// head の値が**スレッド数に依らない** (1 スレッドと 8 スレッドでビット一致)。
+    #[test]
+    fn head_par_bits_do_not_depend_on_threads() {
+        let (lin, x) = head_gemv_case(256, 1024);
+        let run = |threads: usize| -> Vec<f32> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            let mut out = vec![0f32; lin.n()];
+            pool.install(|| {
+                lin.gemv_label_par("output", &x, &mut out, HEAD_ROW_PAR_MIN)
+                    .expect("gemv_label_par")
+            });
+            out
+        };
+        let one = run(1);
+        let eight = run(8);
+        assert_bitwise_eq(&one, &eight, "head: 1 スレッド vs 8 スレッド");
+    }
+
+    /// 行並列の分岐が**実際に通る** (門番 8 行 <= 1024 行なので行並列領域が立つ)。
+    ///
+    /// カウンタはプロセス全体なので並列に走る他のテストの分も混ざる。ここでは
+    /// 「増えた」ことだけを見る (増えない側の断定は他テストと競合して flaky になる)。
+    #[test]
+    fn head_row_par_branch_is_live() {
+        use crate::model::moe_expert::ROW_PAR_REGIONS;
+        let ld = || ROW_PAR_REGIONS.load(std::sync::atomic::Ordering::Relaxed);
+        let (lin, x) = head_gemv_case(256, 1024);
+        assert!(lin.n() >= HEAD_ROW_PAR_MIN, "テストの前提 (行数 >= 門番)");
+        let before = ld();
+        let mut out = vec![0f32; lin.n()];
+        lin.gemv_label_par("output", &x, &mut out, HEAD_ROW_PAR_MIN)
+            .expect("gemv_label_par");
+        assert!(
+            ld() > before,
+            "head の行並列が立っていない (門番 {HEAD_ROW_PAR_MIN} <= 行数 {})",
+            lin.n()
+        );
+    }
+
+    /// `DENNO_HEAD_PROF` の行が `[head] calls=.. total=.. per_call=..us` の形で出る。
+    #[test]
+    fn headprof_line_format() {
+        headprof::set_for_test(true);
+        headprof::reset();
+        let t = headprof::stamp().expect("強制 on で stamp が Some");
+        headprof::mark(headprof::GEMV, Some(t), 34 * 8 * 2);
+        headprof::mark(headprof::MIX, Some(t), 0);
+        let g = headprof::line(headprof::GEMV).expect("gemv の行が出ない");
+        assert!(g.starts_with("[head] calls="), "{g}");
+        assert!(g.contains(" total="), "{g}");
+        assert!(g.contains("per_call="), "{g}");
+        assert!(g.contains("us"), "{g}");
+        assert!(g.contains("gbps="), "gbps が無い: {g}");
+        let m = headprof::line(headprof::MIX).expect("mix の行が出ない");
+        assert!(m.starts_with("[head-mix] calls="), "{m}");
+        assert!(!m.contains("gbps="), "mixer に gbps が付いている: {m}");
+        headprof::reset();
+        assert!(
+            headprof::line(headprof::GEMV).is_none(),
+            "reset 後に行が出る"
+        );
+        // off では stamp を取らない (計測ゼロ)。
+        headprof::set_for_test(false);
+        assert!(headprof::stamp().is_none(), "off なのに stamp が Some");
     }
 
     /// P39: `DENNO_EXPERT_GPU` が未設定 (= 経路 Cpu) のときは従来の
