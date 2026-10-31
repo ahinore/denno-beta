@@ -515,7 +515,7 @@ pub fn advise_hugepage_range(bytes: &[u8]) -> bool {
 }
 
 /// 行方向の並列化しきい値。これ未満の行列はスレッドを立てる損のほうが大きい。
-const PAR_MIN_ROWS: usize = 512;
+pub(crate) const PAR_MIN_ROWS: usize = 512;
 
 /// 行分割の 1 スレッドあたり最小行数 (既定)。チャンクが細かすぎると fork-join が勝つ。
 const PAR_MIN_CHUNK_ROWS: usize = 64;
@@ -640,11 +640,45 @@ pub fn expert_gemv(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<()> {
-    expert_gemv_inner(ty, blocks, n_in, n_out, x, out, true)
+    expert_gemv_inner(ty, blocks, n_in, n_out, x, out, true, PAR_MIN_ROWS, PAR_MIN_CHUNK_ROWS)
+}
+
+/// task 88: 行並列の門番 (`min_rows`) を呼び出し側が決める版。
+///
+/// hc mix の decode 経路 (`two_row` 明示の呼び出し) が、Q8_0 以外の量子化型
+/// (Swift-1.5 の hc down/up が Q8_0 でない場合の IQ4_XS / IQ3_S など) でも
+/// 行並列に乗せるために使う。融合カーネルの有無・スカラーへの落ち方は
+/// [`expert_gemv`] と同じ (`ty` だけで決まり、行の分割に依らない)。
+///
+/// 値は [`expert_gemv`] と**ビット一致**する:
+/// - 行は互いに独立で、1 行の計算 ([`gemv_scalar_body`] = 1 行デコード +
+///   [`dot_seq`] の k 昇順、または融合カーネル) は行の分割に依らない。
+/// - 変わるのは「どの行をどのスレッドが担当するか」の粒度だけ。
+///
+/// `min_rows >= PAR_MIN_ROWS` (既定の門番) のときは 1 スレッドあたりの行数の
+/// 下限も [`PAR_MIN_CHUNK_ROWS`] に戻す。門番を下げた呼び出し
+/// (hc down の 320 行 / 16 スレッド = 20 行) は [`PAR_MIN_CHUNK_ROWS_TIGHT`]
+/// を使う ([`expert_gemv_q8_fast_min_2row`] と同じ規約)。
+pub fn expert_gemv_par_min(
+    ty: GgmlType,
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    min_rows: usize,
+) -> Result<()> {
+    let min_chunk = if min_rows >= PAR_MIN_ROWS {
+        PAR_MIN_CHUNK_ROWS
+    } else {
+        PAR_MIN_CHUNK_ROWS_TIGHT
+    };
+    expert_gemv_inner(ty, blocks, n_in, n_out, x, out, true, min_rows, min_chunk)
 }
 
 /// [`expert_gemv`] の本体。`par == false` なら行方向の rayon 並列を使わない
 /// (外側で expert を並列化しているとき用。P-MOE-G5)。
+#[allow(clippy::too_many_arguments)]
 fn expert_gemv_inner(
     ty: GgmlType,
     blocks: &[u8],
@@ -653,6 +687,8 @@ fn expert_gemv_inner(
     x: &[f32],
     out: &mut [f32],
     par: bool,
+    min_rows: usize,
+    min_chunk: usize,
 ) -> Result<()> {
     let rb = check_gemv_args(ty, blocks, n_in, n_out, x, out)?;
 
@@ -673,8 +709,8 @@ fn expert_gemv_inner(
                 rb,
                 out,
                 par,
-                PAR_MIN_ROWS,
-                PAR_MIN_CHUNK_ROWS,
+                min_rows,
+                min_chunk,
                 |b, o| unsafe { f(b, n_in, o.len(), x, o) },
             );
             return Ok(());
@@ -702,8 +738,8 @@ fn expert_gemv_inner(
                 rb,
                 out,
                 par,
-                PAR_MIN_ROWS,
-                PAR_MIN_CHUNK_ROWS,
+                min_rows,
+                min_chunk,
                 |b, o| unsafe { gemv_q4k_avx2(b, n_in, o.len(), x, o) },
             );
             #[cfg(test)]
@@ -712,7 +748,13 @@ fn expert_gemv_inner(
         }
     }
 
-    gemv_scalar_body(ty, rb, blocks, n_in, n_out, x, out);
+    // task 88: スカラー経路 (融合カーネルの無い型) も行チャンクで回す。
+    // 行は独立で、`gemv_scalar_body` は担当チャンクの先頭行から連続で計算する
+    // ので、分割しても各要素の値は変わらない (1 行の内積は [`dot_seq`] の
+    // k 昇順のまま)。旧実装は 1 スレッドで全行を回していた。
+    for_each_row_chunk(blocks, n_out, rb, out, par, min_rows, min_chunk, |b, o| {
+        gemv_scalar_body(ty, rb, b, n_in, o.len(), x, o);
+    });
     Ok(())
 }
 
@@ -2160,7 +2202,17 @@ fn expert_gemv_q5_1_inner(
             return Ok(());
         }
     }
-    expert_gemv_inner(GgmlType::Q5_1, blocks, n_in, n_out, x, out, par)
+    expert_gemv_inner(
+        GgmlType::Q5_1,
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        par,
+        PAR_MIN_ROWS,
+        PAR_MIN_CHUNK_ROWS,
+    )
 }
 
 /// Q8_0 の融合カーネルが使えるか (AVX2 + FMA の実行時判定)。
@@ -2303,7 +2355,17 @@ fn expert_gemv_q8_inner(
             return Ok(());
         }
     }
-    expert_gemv_inner(GgmlType::Q8_0, blocks, n_in, n_out, x, out, par)
+    expert_gemv_inner(
+        GgmlType::Q8_0,
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        par,
+        PAR_MIN_ROWS,
+        PAR_MIN_CHUNK_ROWS,
+    )
 }
 
 /// expert テンソルの量子型で GEMV を振り分ける (P-MOE-G1 で追加)。
@@ -2449,7 +2511,7 @@ fn expert_gemv_any_inner(
             PAR_MIN_CHUNK_ROWS,
             false,
         ),
-        _ => expert_gemv_inner(ty, blocks, n_in, n_out, x, out, par),
+        _ => expert_gemv_inner(ty, blocks, n_in, n_out, x, out, par, PAR_MIN_ROWS, PAR_MIN_CHUNK_ROWS),
     };
     if let Some(t) = prof {
         if res.is_ok() {
@@ -4943,6 +5005,38 @@ mod tests {
         half::f16::from_f32(v).to_le_bytes()
     }
 
+    /// IQ4_XS の 1 ブロック (136 B = d f16 + scales_h u16 + scales_l u8x4 + qs u8x128)。
+    ///
+    /// dequant は任意のバイト列で決定的 (KVALUES_IQ4NL の 4bit テーブル参照) なので、
+    /// スケール類だけ有限値に固定して残りを決定的パターンに詰める。
+    /// 値そのものの正しさは `dequant_row` 参照との比較 (既存テスト) が担保し、
+    /// ここでは「行の分割で値が変わらない」ことだけを見る。
+    fn iq4_xs_block(seed: u32) -> Vec<u8> {
+        let ts = GgmlType::IQ4Xs.type_size();
+        let mut b = vec![0u8; ts];
+        b[0..2].copy_from_slice(&f16_bytes(0.01));
+        // scales_h の上位 2bit (ib 8..16) は 0..3 に制限しなくてもよい (2bit しか読まない)。
+        let sh = (pat(0, seed) as u16) | (((pat(1, seed) as u16) & 0x3) << 8);
+        b[2..4].copy_from_slice(&sh.to_le_bytes());
+        for i in 4..ts {
+            b[i] = pat(i, seed);
+        }
+        b
+    }
+
+    /// IQ4_XS の重み行列 (行優先の生バイト)。`k` は 256 の倍数。
+    fn iq4_xs_weights(k: usize, n: usize, seed: u32) -> Vec<u8> {
+        assert_eq!(k % 256, 0, "IQ4_XS のブロックは 256 要素");
+        let nblk = k / 256;
+        let mut v = Vec::new();
+        for r in 0..n {
+            for blk in 0..nblk {
+                v.extend_from_slice(&iq4_xs_block((seed as usize * 10_000 + r * 100 + blk) as u32));
+            }
+        }
+        v
+    }
+
     /// 1 ブロックを組み立てる。スケール類は有限値に固定する
     /// (生バイトをそのまま d に入れると f16 が NaN/Inf になり、テストが無意味になる)。
     fn make_block(ty: GgmlType, seed: u32) -> Vec<u8> {
@@ -5308,12 +5402,91 @@ mod tests {
         // ブロックサイズで割り切れない n_in は弾く (N_IN=256 は 64 で割れるが 100 は割れない)
         assert!(row_bytes(GgmlType::Q2_0, 100).is_err());
         assert!(row_bytes(GgmlType::IQ2S, 300).is_err());
+        // IQ4_XS は 256 要素/ブロックなので、hc up の入力 (low_rank=320) は表現できない。
+        // 実機 GGUF ヘッダの「hc テンソル (down [10240, 320] / up [320, 10240]) が
+        // IQ4_XS」の前提は up で破れる (down の k=10240 は表現できる)。
+        assert!(row_bytes(GgmlType::IQ4Xs, 320).is_err());
+        assert_eq!(row_bytes(GgmlType::IQ4Xs, 10240).unwrap(), 10240 / 256 * 136);
 
         // 形が合わない blocks (バッファ不足) は expert_gemv でも弾く
         let x = make_x(N_IN);
         let mut out = vec![0.0f32; N_OUT];
         assert!(expert_gemv(GgmlType::Q6K, &[], N_IN, N_OUT, &x, &mut out).is_err());
         assert!(expert_gemv(GgmlType::Q2_0, &[0u8; 3], N_IN, N_OUT, &x, &mut out).is_err());
+    }
+
+    /// task 88: IQ4_XS の行並列 GEMV ([`expert_gemv_par_min`]) がスカラー参照
+    /// ([`expert_gemv_scalar`]) とビット一致する。
+    ///
+    /// 形は実機の hc down (k=10240 / n=320) を中心に、up 相当 (行が多い・1 行が
+    /// 短い)、端数 (奇数行)、門番未満 (行並列が立たない) を並べる。行は独立で
+    /// [`gemv_scalar_body`] は 1 行デコード + [`dot_seq`] (k 昇順) なので、
+    /// 行の分割の有無で各要素の値は変わらない。
+    #[test]
+    fn iq4xs_gemv_par_min_matches_scalar_bitexact() {
+        let shapes = [
+            ("down 実形", 10240usize, 320usize),
+            ("up 相当 (1 行が短い)", 256usize, 1024usize),
+            ("端数 (奇数行)", 10240usize, 321usize),
+            ("門番未満 (63 行)", 10240usize, 63usize),
+        ];
+        for (name, k, n) in shapes {
+            let blocks = iq4_xs_weights(k, n, 11);
+            let x: Vec<f32> = (0..k).map(|i| (((i * 31) % 97) as f32 - 48.0) * 0.011).collect();
+            let mut a = vec![0.0f32; n];
+            expert_gemv_scalar(GgmlType::IQ4Xs, &blocks, k, n, &x, &mut a).unwrap();
+            assert!(a.iter().any(|v| *v != 0.0), "{name}: 出力が全 0 (経路の生死が分からない)");
+            for min_rows in [64usize, PAR_MIN_ROWS] {
+                let mut b = vec![0.0f32; n];
+                expert_gemv_par_min(GgmlType::IQ4Xs, &blocks, k, n, &x, &mut b, min_rows)
+                    .unwrap();
+                assert_eq!(
+                    a.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    b.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    "{name} (min_rows={min_rows}): 行並列がスカラー参照とビット一致しない"
+                );
+            }
+        }
+    }
+
+    /// task 88: 行並列の門番が実際に下がっていること (発火の証拠)。
+    ///
+    /// hc down の 320 行は既定の門番 ([`PAR_MIN_ROWS`] = 512) 未満なので
+    /// [`expert_gemv`] では 1 スレッド。[`expert_gemv_par_min`] に 64 を渡すと
+    /// 行チャンクに割れる。発火は [`mix_kprof::rowpar`] のラベル方式で見る
+    /// (ラベルは thread-local で、ラベルを立てていない呼び出しは 1 件も積まない。
+    /// プロセス共通の [`ROW_PAR_REGIONS`] を before/after で見ると、同じカウンタを
+    /// 使う他のテストと並列実行で干渉するため)。
+    #[test]
+    fn iq4xs_gemv_par_min_fires_below_default_gate() {
+        use crate::model::qwen4exp::mix_kprof::{self, rowpar};
+        let (k, n) = (10240usize, 320usize);
+        let blocks = iq4_xs_weights(k, n, 5);
+        let x: Vec<f32> = (0..k).map(|i| (i % 13) as f32 - 6.0).collect();
+        let mut out = vec![0.0f32; n];
+
+        mix_kprof::set_for_test(true);
+        mix_kprof::reset();
+        rowpar::set_label(rowpar::L_DOWN);
+        // 既定の門番 (512) では 320 行は 1 スレッド → fired は立たない。
+        // region 自体は計上される (record は逐次チャンクも 1 件積む。
+        // 実機の `regions=0` は「ラベル付き GEMV が 1 回も届いていない」の意味)。
+        expert_gemv(GgmlType::IQ4Xs, &blocks, k, n, &x, &mut out).unwrap();
+        let (regions0, fired0, ..) = rowpar::stats(rowpar::L_DOWN as usize - 1);
+        // 門番 64 は行チャンクに割れる。前半の逐次 1 件を戻してから見るので
+        // ここでは down の region が 1 回・発火 1 回。
+        rowpar::reset();
+        expert_gemv_par_min(GgmlType::IQ4Xs, &blocks, k, n, &x, &mut out, 64).unwrap();
+        rowpar::set_label(rowpar::NONE);
+        let (regions, fired, chunks, _, _) = rowpar::stats(rowpar::L_DOWN as usize - 1);
+        mix_kprof::reset();
+        mix_kprof::set_for_test(false);
+
+        assert_eq!(fired0, 0, "expert_gemv (既定門番 512) で 320 行が行並列に入った");
+        assert_eq!(regions0, 1, "expert_gemv (既定門番 512) の逐次 region が計上されていない");
+        assert_eq!(regions, 1, "expert_gemv_par_min(64) の down region が 1 回計上されていない");
+        assert_eq!(fired, 1, "expert_gemv_par_min(64) で 320 行が行並列に入っていない");
+        assert!(chunks >= 2, "down が 1 チャンクしか割れていない (chunks={chunks})");
     }
 
     // ---- 実ファイルの形 (前提の実測値) との突き合わせ -----------------------
@@ -7660,7 +7833,7 @@ mod tests {
             let x: Vec<f32> = (0..n_in).map(|_| rnd()).collect();
             let mut a = vec![0f32; n_out];
             let mut b2 = vec![0f32; n_out];
-            expert_gemv_inner(ty, &blocks, n_in, n_out, &x, &mut a, false).unwrap();
+            expert_gemv_inner(ty, &blocks, n_in, n_out, &x, &mut a, false, PAR_MIN_ROWS, PAR_MIN_CHUNK_ROWS).unwrap();
             gemv_scalar_body(ty, rb, &blocks, n_in, n_out, &x, &mut b2);
             for i in 0..n_out {
                 let scale = b2[i].abs().max(1e-3);
@@ -7718,6 +7891,8 @@ mod tests {
                     &xs[t * n_in..(t + 1) * n_in],
                     &mut one,
                     false,
+                    PAR_MIN_ROWS,
+                    PAR_MIN_CHUNK_ROWS,
                 )
                 .unwrap();
                 for r in 0..n_out {
@@ -8829,6 +9004,8 @@ mod iq_kernel_tests {
                             &x,
                             &mut out,
                             true,
+                            PAR_MIN_ROWS,
+                            PAR_MIN_CHUNK_ROWS,
                         )
                         .expect("gemv");
                     }
@@ -8841,10 +9018,10 @@ mod iq_kernel_tests {
                     // v2 と v3 が同じ値を出すことを 1 度だけ確かめる
                     let mut a = vec![0f32; n_out];
                     set_iq_kernel_for_test(Some(false));
-                    expert_gemv_inner(ty, &blocks, n_in, n_out, &x, &mut a, false).unwrap();
+                    expert_gemv_inner(ty, &blocks, n_in, n_out, &x, &mut a, false, PAR_MIN_ROWS, PAR_MIN_CHUNK_ROWS).unwrap();
                     let mut b = vec![0f32; n_out];
                     set_iq_kernel_for_test(Some(true));
-                    expert_gemv_inner(ty, &blocks, n_in, n_out, &x, &mut b, false).unwrap();
+                    expert_gemv_inner(ty, &blocks, n_in, n_out, &x, &mut b, false, PAR_MIN_ROWS, PAR_MIN_CHUNK_ROWS).unwrap();
                     set_iq_kernel_for_test(None);
                     assert_eq!(
                         a.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),

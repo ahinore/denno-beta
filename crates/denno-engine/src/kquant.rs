@@ -103,6 +103,72 @@ impl GgmlType {
         })
     }
 
+    /// 型の短い名前 (カウンタ・テレメトリの表示用)。ggml.h の enum 名に合わせる。
+    ///
+    /// `Debug` (`IQ4Xs` / `Q4K` など Rust の variant 名) とは綴りが違うので、
+    /// 実機の GGUF ヘッダと照合するときはこちらを使う。
+    pub fn name(self) -> &'static str {
+        match self {
+            GgmlType::F32 => "F32",
+            GgmlType::F16 => "F16",
+            GgmlType::Q4_0 => "Q4_0",
+            GgmlType::Q4_1 => "Q4_1",
+            GgmlType::Q5_0 => "Q5_0",
+            GgmlType::Q5_1 => "Q5_1",
+            GgmlType::Q8_0 => "Q8_0",
+            GgmlType::Q2K => "Q2_K",
+            GgmlType::Q3K => "Q3_K",
+            GgmlType::Q4K => "Q4_K",
+            GgmlType::Q5K => "Q5_K",
+            GgmlType::Q6K => "Q6_K",
+            GgmlType::IQ2Xxs => "IQ2_XXS",
+            GgmlType::IQ2Xs => "IQ2_XS",
+            GgmlType::IQ3Xxs => "IQ3_XXS",
+            GgmlType::IQ1S => "IQ1_S",
+            GgmlType::IQ4Nl => "IQ4_NL",
+            GgmlType::IQ3S => "IQ3_S",
+            GgmlType::IQ2S => "IQ2_S",
+            GgmlType::IQ4Xs => "IQ4_XS",
+            GgmlType::Iq1M => "IQ1_M",
+            GgmlType::Bf16 => "BF16",
+            GgmlType::Tq1_0 => "TQ1_0",
+            GgmlType::Mxfp4 => "MXFP4",
+            GgmlType::Q2_0 => "Q2_0",
+        }
+    }
+
+    /// 型 id (ggml.h の enum 値)。[`GgmlType::from_id`] と対になる
+    /// (カウンタに積んで後で [`GgmlType`] に戻すのに使う)。
+    pub fn id(self) -> u32 {
+        match self {
+            GgmlType::F32 => 0,
+            GgmlType::F16 => 1,
+            GgmlType::Q4_0 => 2,
+            GgmlType::Q4_1 => 3,
+            GgmlType::Q5_0 => 6,
+            GgmlType::Q5_1 => 7,
+            GgmlType::Q8_0 => 8,
+            GgmlType::Q2K => 10,
+            GgmlType::Q3K => 11,
+            GgmlType::Q4K => 12,
+            GgmlType::Q5K => 13,
+            GgmlType::Q6K => 14,
+            GgmlType::IQ2Xxs => 16,
+            GgmlType::IQ2Xs => 17,
+            GgmlType::IQ3Xxs => 18,
+            GgmlType::IQ1S => 19,
+            GgmlType::IQ4Nl => 20,
+            GgmlType::IQ3S => 21,
+            GgmlType::IQ2S => 22,
+            GgmlType::IQ4Xs => 23,
+            GgmlType::Iq1M => 29,
+            GgmlType::Bf16 => 30,
+            GgmlType::Tq1_0 => 34,
+            GgmlType::Mxfp4 => 39,
+            GgmlType::Q2_0 => 42,
+        }
+    }
+
     /// ブロックあたり要素数 (ggml_blck_size)
     pub fn blck_size(self) -> usize {
         match self {

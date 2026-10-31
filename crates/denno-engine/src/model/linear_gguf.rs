@@ -19,8 +19,8 @@ use anyhow::{bail, Result};
 
 use crate::kquant::{dequant_row_into, GgmlType};
 use crate::model::moe_expert::{
-    expert_gemv, expert_gemv_q8_fast, expert_gemv_q8_fast_2row, expert_gemv_q8_fast_min,
-    expert_gemv_q8_fast_min_2row,
+    expert_gemv, expert_gemv_par_min, expert_gemv_q8_fast, expert_gemv_q8_fast_2row,
+    expert_gemv_q8_fast_min, expert_gemv_q8_fast_min_2row, PAR_MIN_ROWS,
 };
 use crate::quant::WeightBlocks;
 
@@ -542,6 +542,9 @@ impl GgufLinear {
     /// [`Self::gemv_label_par`] と**ビット一致**する (行ごとの累積順序は不変)。
     /// 対象・しきい値の意味は [`Self::gemv_label_par`] と同じ
     /// (`row_par_min = 0` は既定の門番)。
+    ///
+    /// task 88: `two_row` 明示の呼び出しでは Q8_0 以外の量子化型も行並列に乗る
+    /// (融合カーネルが無い型は行チャンクで割るだけ。[`expert_gemv_par_min`] 参照)。
     pub fn gemv_label_par_2row(
         &self,
         label: &'static str,
@@ -656,6 +659,16 @@ impl GgufLinear {
                             row_par_min,
                         )
                     };
+                }
+                // task 88: Q8_0 以外の量子化型 (`two_row` 明示の呼び出し = hc mix の
+                // decode 経路) は、融合カーネルが無くても行並列の門番 (`row_par_min`)
+                // を効かせる。実機の hc down/up は Q8_0 でないことが GGUF ヘッダ実読
+                // で判明した (P84/P86 の 2 行カーネルが型の門番で発火していなかった)。
+                // 行は独立で 1 行の加算順は不変なので、[`expert_gemv`] とビット一致。
+                // `row_par_min == 0` は既定の門番 ([`moe_expert::PAR_MIN_ROWS`]) に委譲。
+                if two_row {
+                    let min_rows = if row_par_min == 0 { PAR_MIN_ROWS } else { row_par_min };
+                    return expert_gemv_par_min(self.ty, self.blocks.as_slice(), self.k, self.n, x, out, min_rows);
                 }
                 expert_gemv(self.ty, self.blocks.as_slice(), self.k, self.n, x, out)
             }

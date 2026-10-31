@@ -3080,6 +3080,8 @@ fn hc_mix_quant_ref(
     mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_DOWN);
     down.gemv_label("hc_down", &xn, &mut lo)
         .map_err(|err| one(format!("hc_mix down: {err}")))?;
+    // task 88: down GEMV 1 発の実行先と dtype (区間計測と同じ `Instant` を再利用)。
+    mix_kprof::gemv::note_down(t, down.ty());
     mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_UP);
     mix_kprof::mark(t, mix_kprof::DOWN);
 
@@ -3091,6 +3093,7 @@ fn hc_mix_quant_ref(
     let mut gate = vec![0.0f32; up.n()];
     up.gemv_label("hc_up", &lo, &mut gate)
         .map_err(|err| one(format!("hc_mix up: {err}")))?;
+    mix_kprof::gemv::note_up(t, up.ty());
     mix_kprof::rowpar::set_label(mix_kprof::rowpar::NONE);
     mix_kprof::mark(t, mix_kprof::UP);
 
@@ -3206,6 +3209,8 @@ fn hc_mix_quant_fast(
             down.gemv_label_par("hc_down", xn, lo, HC_DOWN_ROW_PAR_MIN)
         }
         .map_err(|err| one(format!("hc_mix down: {err}")))?;
+        // task 88: down GEMV 1 発の実行先と dtype (区間計測と同じ `Instant` を再利用)。
+        mix_kprof::gemv::note_down(t, down.ty());
         mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_UP);
         mix_kprof::mark(t, mix_kprof::DOWN);
 
@@ -3221,6 +3226,7 @@ fn hc_mix_quant_fast(
             up.gemv_label("hc_up", lo, gate)
         }
         .map_err(|err| one(format!("hc_mix up: {err}")))?;
+        mix_kprof::gemv::note_up(t, up.ty());
         mix_kprof::rowpar::set_label(mix_kprof::rowpar::NONE);
         mix_kprof::mark(t, mix_kprof::UP);
 
@@ -3890,6 +3896,8 @@ pub mod mix_kprof {
         for i in 0..rowpar::NL {
             s.push_str(&rowpar::line_part(i));
         }
+        // task 88: down / up GEMV の実行先内訳 (calls / ms / gpu / ty)。
+        s.push_str(&gemv::line_part());
         Some(s)
     }
 
@@ -3900,6 +3908,7 @@ pub mod mix_kprof {
         }
         CALLS.store(0, Ordering::Relaxed);
         rowpar::reset();
+        gemv::reset();
     }
 
     /// P84: hc mix の行並列 region の常時カウンタ ([`on`] と同じ env ゲート)。
@@ -4014,6 +4023,130 @@ pub mod mix_kprof {
                 per(wall_ns),
                 per(comp_ns),
             )
+        }
+    }
+
+    /// task 88: down / up GEMV 1 発ぶんの実行先内訳 ([`attn_kprof`] と同じ形式、
+    /// `[mix-kprof]` の 1 行に統合)。
+    ///
+    /// hc down/up はモデルごとに量子化型が違う (本番 Swift-1.5 IQ3_S の GGUF
+    /// ヘッダ実読では Q8_0 でない型。P84/P86 の 2 行カーネルは Q8_0 専門の門番を
+    /// 持つので一度も発火しなかった = regions=0 の最終的な正体)。
+    /// 実機で次のことを区別するために積む:
+    /// - `calls` / `ms`: down と up の GEMV 1 発ずつの発数と時間 (区間計測
+    ///   [`DOWN`] / [`UP`] と同じ `Instant` を再利用するので追加の取得は不要)
+    /// - `gpu`: GEMV 直後の [`crate::cuda::last_linear_ran_on_gpu`] を数える
+    ///   (cuda 無しのビルドでは常に 0)。decode 経路は P86 の two_row バイパスで
+    ///   GPU を通らないはずなので、gpu が積まれていたら別経路 (classic / batch)
+    ///   が GPU に落ちている印になる
+    /// - `ty`: 呼び出し側が渡した [`GgmlType`] の id (ggml.h の enum 値)。
+    ///   型が混ざるプロセスでは最後に積んだ 1 個 (hc down/up はプロセスで 1 種)
+    pub mod gemv {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static DOWN_CALLS: AtomicU64 = AtomicU64::new(0);
+        static DOWN_NS: AtomicU64 = AtomicU64::new(0);
+        static DOWN_GPU: AtomicU64 = AtomicU64::new(0);
+        static UP_CALLS: AtomicU64 = AtomicU64::new(0);
+        static UP_NS: AtomicU64 = AtomicU64::new(0);
+        static UP_GPU: AtomicU64 = AtomicU64::new(0);
+        /// 最後に積んだ型の id ([`GgmlType::from_id`] で戻す。0 は「未設定」を兼ねる。
+        /// ggml には id 0 = F32 があるので、未設定の表示は `from_id` 前の 0 チェック)。
+        static DOWN_TY_ID: AtomicU64 = AtomicU64::new(0);
+        static UP_TY_ID: AtomicU64 = AtomicU64::new(0);
+
+        /// 直前の GEMV が GPU で走りきったか (cuda 無しのビルドは常に false)。
+        #[cfg(feature = "cuda")]
+        fn ran_on_gpu() -> bool {
+            crate::cuda::last_linear_ran_on_gpu()
+        }
+        #[cfg(not(feature = "cuda"))]
+        fn ran_on_gpu() -> bool {
+            false
+        }
+
+        fn ty_name(id: &AtomicU64) -> &'static str {
+            let v = id.load(Ordering::Relaxed);
+            // 0 は未積算 (note がまだ一度も走っていないときの初期値)。
+            // hc down/up は量子化型のテンソルなので F32 (id 0) との区別はしない。
+            if v == 0 {
+                return "-";
+            }
+            crate::kquant::GgmlType::from_id(v as u32)
+                .map(|t| t.name())
+                .unwrap_or("-")
+        }
+
+        /// `hc_down` の GEMV 1 発。`t` は GEMV 直前に取った `Instant` の
+        /// [`super::stamp`] の戻り値 (区間計測 [`super::DOWN`] と共有する。off の
+        /// ときは呼び出し側が `None` を持つので note も no-op)。
+        #[inline]
+        pub fn note_down(t: Option<std::time::Instant>, ty: crate::kquant::GgmlType) {
+            if !super::on() {
+                return;
+            }
+            let Some(t) = t else { return };
+            DOWN_CALLS.fetch_add(1, Ordering::Relaxed);
+            DOWN_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if ran_on_gpu() {
+                DOWN_GPU.fetch_add(1, Ordering::Relaxed);
+            }
+            DOWN_TY_ID.store(ty.id() as u64, Ordering::Relaxed);
+        }
+
+        /// `hc_up` の GEMV 1 発 ([`note_down`] と同じ規約)。
+        #[inline]
+        pub fn note_up(t: Option<std::time::Instant>, ty: crate::kquant::GgmlType) {
+            if !super::on() {
+                return;
+            }
+            let Some(t) = t else { return };
+            UP_CALLS.fetch_add(1, Ordering::Relaxed);
+            UP_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if ran_on_gpu() {
+                UP_GPU.fetch_add(1, Ordering::Relaxed);
+            }
+            UP_TY_ID.store(ty.id() as u64, Ordering::Relaxed);
+        }
+
+        fn slot(
+            calls: &AtomicU64,
+            ns: &AtomicU64,
+            gpu: &AtomicU64,
+            ty_id: &AtomicU64,
+            name: &str,
+            s: &mut String,
+        ) {
+            let c = calls.load(Ordering::Relaxed);
+            let n = ns.load(Ordering::Relaxed);
+            let g = gpu.load(Ordering::Relaxed);
+            let pct = if c == 0 {
+                0.0
+            } else {
+                g as f64 * 100.0 / c as f64
+            };
+            let tn = ty_name(ty_id);
+            s.push_str(&format!(
+                " | gemv {name} calls={c} ms={:.1} gpu={g} ({pct:.1}%) ty={tn}",
+                n as f64 / 1e6
+            ));
+        }
+
+        /// `[mix-kprof]` 行の末尾に付ける 2 区間ぶん (down と up)。
+        pub fn line_part() -> String {
+            let mut s = String::new();
+            slot(&DOWN_CALLS, &DOWN_NS, &DOWN_GPU, &DOWN_TY_ID, "down", &mut s);
+            slot(&UP_CALLS, &UP_NS, &UP_GPU, &UP_TY_ID, "up", &mut s);
+            s
+        }
+
+        /// カウンタを 0 に戻す ([`super::reset`] から呼ぶ)。
+        pub fn reset() {
+            for c in [&DOWN_CALLS, &DOWN_NS, &DOWN_GPU, &UP_CALLS, &UP_NS, &UP_GPU] {
+                c.store(0, Ordering::Relaxed);
+            }
+            DOWN_TY_ID.store(0, Ordering::Relaxed);
+            UP_TY_ID.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -10950,6 +11083,46 @@ mod tests {
             (hp, norm, down, up, inject, res)
         }
 
+        /// IQ4_XS の 1 ブロック (136 B = d f16 + scales_h u16 + scales_l u8x4 + qs u8x128)。
+        ///
+        /// dequant は任意のバイト列で決定的 (KVALUES_IQ4NL の 4bit テーブル参照)。
+        /// moe_expert のテストと同じ形 (スケール類だけ有限値に固定)。
+        fn iq4_xs_block(seed: u32) -> Vec<u8> {
+            let ts = GgmlType::IQ4Xs.type_size();
+            let mut b = vec![0u8; ts];
+            b[0..2].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+            let sh = (pat4(0, seed) as u16) | (((pat4(1, seed) as u16) & 0x3) << 8);
+            b[2..4].copy_from_slice(&sh.to_le_bytes());
+            for i in 4..ts {
+                b[i] = pat4(i, seed);
+            }
+            b
+        }
+
+        /// 決定的バイト列 (0..=255)。moe_expert の `pat` と同じ式。
+        fn pat4(i: usize, seed: u32) -> u8 {
+            let mut x = (i as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(seed.wrapping_mul(40_503));
+            x ^= x >> 13;
+            x = x.wrapping_mul(0x9E37_79B1);
+            x ^= x >> 16;
+            x as u8
+        }
+
+        /// IQ4_XS の重み行列 (行優先の生バイト)。`k` は 256 の倍数。
+        fn iq4_xs_weights(k: usize, n: usize, seed: u32) -> Vec<u8> {
+            assert_eq!(k % 256, 0, "IQ4_XS のブロックは 256 要素");
+            let nblk = k / 256;
+            let mut v = Vec::new();
+            for r in 0..n {
+                for blk in 0..nblk {
+                    v.extend_from_slice(&iq4_xs_block((seed as usize * 10_000 + r * 100 + blk) as u32));
+                }
+            }
+            v
+        }
+
         /// `DENNO_MIX_FAST` の解釈 (既定 on、`0` / `false` / `off` だけ旧経路)。
         #[test]
         fn mix_fast_gate_defaults_on() {
@@ -11197,6 +11370,118 @@ mod tests {
             );
             mix_kprof::reset();
             mix_kprof::set_for_test(false);
+        }
+
+        /// task 88: down / up GEMV の実行先内訳 (calls / ms / gpu / ty) が
+        /// `[mix-kprof]` の 1 行に載る ([`attn_kprof`] と同じ形式)。
+        ///
+        /// 強制 on で note を積み、serve (`prof_flash_q4`) が読む形を確かめる。
+        /// `gpu` は cuda ビルドで「直前の線形呼び出し」の実行先を数えるだけ
+        /// (テストでは GPU を回さない) ので、上限 (calls) だけを見る。
+        #[test]
+        fn mix_kprof_gemv_line_counts_calls_type_and_gpu() {
+            use crate::kquant::GgmlType;
+            mix_kprof::set_for_test(true);
+            mix_kprof::reset();
+            let t = std::time::Instant::now();
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            mix_kprof::gemv::note_down(Some(t), GgmlType::IQ4Xs);
+            mix_kprof::gemv::note_up(Some(t), GgmlType::IQ4Xs);
+            let line = mix_kprof::line().expect("強制 on なのに line() が None");
+            assert!(
+                line.contains("gemv down calls=1 ms="),
+                "down の形が違う: {line}"
+            );
+            assert!(line.contains("ty=IQ4_XS"), "dtype が無い: {line}");
+            assert!(line.contains("gemv up calls=1 ms="), "up の形が違う: {line}");
+            // gpu は 0..=calls の範囲 (cuda ビルドでは直前の線形呼び出し次第)。
+            let part = line
+                .split("gemv down calls=1 ")
+                .nth(1)
+                .unwrap_or_default();
+            let gpu: u64 = part
+                .split(" gpu=")
+                .nth(1)
+                .and_then(|s| s.split(' ').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            assert!(gpu <= 1, "down: gpu 発数 {gpu} が calls を超えた: {line}");
+            // reset で戻る (ty も未積算の "-" に戻る)。
+            mix_kprof::reset();
+            let line2 = mix_kprof::line().expect("reset 後も on なら行は出る");
+            assert!(
+                line2.contains("gemv down calls=0 ms=0.0"),
+                "reset が効いていない: {line2}"
+            );
+            assert!(line2.contains("ty=-"), "reset で ty が残っている: {line2}");
+            // off のときは note も積まない。
+            mix_kprof::set_for_test(false);
+            mix_kprof::gemv::note_down(Some(t), GgmlType::IQ4Xs);
+            mix_kprof::set_for_test(true);
+            mix_kprof::reset();
+            let line3 = mix_kprof::line().expect("強制 on なのに line() が None");
+            assert!(
+                line3.contains("gemv down calls=0 ms=0.0"),
+                "off で note が積まれた: {line3}"
+            );
+            mix_kprof::reset();
+            mix_kprof::set_for_test(false);
+        }
+
+        /// task 88: hc down が Q8_0 でない型 (IQ4_XS) のときも、fast 経路の
+        /// two_row バイパスが行並列 (門番 [`HC_DOWN_ROW_PAR_MIN`] = 64) に入り、
+        /// 旧経路 (classic カーネル + 既定門番) とビット一致する。
+        ///
+        /// 実形の down (k=10240 / n=320) を IQ4_XS で作る。up は k=320
+        /// (low_rank) で IQ4_XS が表現できない (256 要素/ブロック、
+        /// `row_bytes` がエラー) ので Q8_0 のまま混在で比べる。
+        /// 行並列の発火は `mix_kprof::rowpar` のラベル方式で見る (ラベルを立てて
+        /// いない呼び出しは 1 件も積まない。プロセス共通の `ROW_PAR_REGIONS` を
+        /// before/after で見ると、同じカウンタを使う他のテストと並列実行で干渉する)。
+        #[test]
+        fn hc_mix_iq4xs_down_takes_row_parallel_bitexact() {
+            use mix_kprof::rowpar;
+            let hc = 4usize;
+            let e = 2560usize;
+            let lr = 320usize;
+            let hp = HyperParams { hc, n_embd: e, low_rank: lr, eps: 1e-6 };
+            let hc_dim = hc * e;
+            assert_eq!(hc_dim, 10240, "実形の down 入力 (hc_dim)");
+            let norm: Vec<f32> = (0..hc_dim).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect();
+            let down = GgufLinear::from_slice(GgmlType::IQ4Xs, hc_dim, lr, &iq4_xs_weights(hc_dim, lr, 3))
+                .expect("GgufLinear::from_slice (IQ4_XS down)");
+            let up = GgufLinear::from_slice(GgmlType::Q8_0, lr, hc_dim, &q8_0_weights(lr, hc_dim, 5))
+                .expect("GgufLinear::from_slice (Q8_0 up)")
+                .with_fast_q8(true);
+            let inject = GgufLinear::from_slice(GgmlType::Q8_0, hc_dim, hc, &q8_0_weights(hc_dim, hc, 7))
+                .expect("GgufLinear::from_slice (Q8_0 inject)")
+                .with_fast_q8(true);
+            let res = HyperStreams {
+                data: (0..hc_dim)
+                    .map(|i| (((i * 11) % 17) as f32 - 8.0) * 0.05)
+                    .collect(),
+                hc,
+                n_embd: e,
+            };
+            mix_kprof::set_for_test(true);
+            mix_kprof::reset();
+            let (m_fast, i_fast) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            // down の行並列が 1 region・1 発火 (320 行 >= 門番 64)。
+            let (rd, fd, cd, _, _) = rowpar::stats(rowpar::L_DOWN as usize - 1);
+            mix_kprof::reset();
+            mix_kprof::set_for_test(false);
+            assert_eq!(rd, 1, "IQ4_XS の down region が 1 回計上されていない");
+            assert_eq!(fd, 1, "IQ4_XS の down が行並列に入っていない");
+            assert!(cd >= 2, "IQ4_XS の down が 1 チャンクしか割れていない (cd={cd})");
+            let (m_ref, i_ref) =
+                hc_mix_quant_ref(&res, &norm, &down, &up, Some(&inject), &hp).expect("ref");
+            assert_bitwise_eq(&m_fast, &m_ref, "IQ4_XS down (mixed)");
+            assert_bitwise_eq(&i_fast, &i_ref, "IQ4_XS down (inject)");
+            assert!(
+                m_fast.iter().any(|v| *v != 0.0),
+                "mixed が全 0 (経路の生死が分からない)"
+            );
         }
 
         /// P86: 実機で起きていたこと (GPU GEMV が hc mix の down / up を奪い、
