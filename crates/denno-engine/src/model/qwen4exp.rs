@@ -3847,7 +3847,7 @@ fn expert_loop_from_value(v: Option<&str>) -> bool {
 }
 
 /// P70: decode の expert 寄与を **expert 横断の行タスク**に平坦化する新経路の
-/// ゲート (`DENNO_EXPERT_FLAT_DECODE`, 既定 off)。プロセスで 1 回だけ読む。
+/// ゲート (`DENNO_EXPERT_FLAT_DECODE`, 既定 on)。プロセスで 1 回だけ読む。
 ///
 /// off のときの経路は従来と同一 ([`expert_contribs_par_into`] = expert 1 本を
 /// 1 タスクとして並列化)。on のときは「expert × 行列 × 行チャンク」を 1 本の
@@ -3868,13 +3868,18 @@ fn expert_flat_decode_enabled() -> bool {
     })
 }
 
-/// `DENNO_EXPERT_FLAT_DECODE` の値解釈 (純粋関数)。**既定は off**。
-/// `1` / `on` / `ON` / `true` のときだけ on (`DENNO_EXPERT_LOOP` と同じ規則)。
+/// `DENNO_EXPERT_FLAT_DECODE` の値解釈 (純粋関数)。**既定は on**。
+///
+/// main の実測 (2026-10-31 12:40 JST、v3 + gdn 並列 + attn GQA + fused gemv の上で
+/// 118 tok を 3 ラン): off 106.0 -> on **103.8 ms/token**、wall 16.48 -> 16.21 s、
+/// md5 は `3b77a3b996fd` で不変。`decode_flat_matches_expert_parallel` が
+/// 従来経路とのビット一致を固定しているので既定を on にした。
+/// 逃げ道は `0` / `off` / `false` / `no`。
 fn expert_flat_decode_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(str::trim),
-        Some("1") | Some("on") | Some("ON") | Some("true")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("0") | Some("off") | Some("false") | Some("no") => false,
+        _ => true,
+    }
 }
 
 /// task 67: 選択 expert の mmap 先読み (`MADV_WILLNEED`) の on/off
@@ -8015,17 +8020,21 @@ mod tests {
         }
     }
 
-    /// P70: `DENNO_EXPERT_FLAT_DECODE` の値解釈 (既定 off・誤設定で on にしない)。
+    /// P70: `DENNO_EXPERT_FLAT_DECODE` の値解釈 (既定 on・明示的な偽値だけ off)。
     #[test]
     fn expert_flat_decode_gate_values() {
-        assert!(!expert_flat_decode_from_value(None));
-        assert!(!expert_flat_decode_from_value(Some("")));
-        assert!(!expert_flat_decode_from_value(Some("0")));
-        assert!(!expert_flat_decode_from_value(Some("yes")));
+        assert!(expert_flat_decode_from_value(None), "未設定は既定で on");
+        assert!(expert_flat_decode_from_value(Some("")), "空文字も on");
         assert!(expert_flat_decode_from_value(Some("1")));
         assert!(expert_flat_decode_from_value(Some("on")));
         assert!(expert_flat_decode_from_value(Some("ON")));
         assert!(expert_flat_decode_from_value(Some("true")));
+        assert!(expert_flat_decode_from_value(Some("yes")), "未知の値は on のまま");
+        assert!(!expert_flat_decode_from_value(Some("0")));
+        assert!(!expert_flat_decode_from_value(Some("off")));
+        assert!(!expert_flat_decode_from_value(Some("OFF")));
+        assert!(!expert_flat_decode_from_value(Some("false")));
+        assert!(!expert_flat_decode_from_value(Some("no")));
         assert!(expert_flat_decode_from_value(Some(" 1 ")));
     }
 
