@@ -1157,7 +1157,11 @@ fn check_one(e: &ExpectedTensor, t: &GgufTensorInfo, errs: &mut Vec<String>) {
             e.fmt_dims()
         ));
     }
-    if t.ty != e.ty && !e.ty_alt.contains(&t.ty) {
+    // 2026-10-31: 量子型の一致は「構造の取り違え検出」ではなく「量子化の選択」の
+    // 話なので、**デコードできる型なら通す** (Swift 1.5 の重みは層ごとに型が混在し、
+    // 期待表は UD-Q4_K_XL 時代の固定値)。形状と名前の照合は従来どおり厳密。
+    let ty_decodable = crate::kquant::dequant_supported(t.ty);
+    if t.ty != e.ty && !e.ty_alt.contains(&t.ty) && !ty_decodable {
         let allowed = if e.ty_alt.is_empty() {
             ty_name(e.ty).to_string()
         } else {
