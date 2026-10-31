@@ -5666,7 +5666,7 @@ pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]
         // IQ2_S / Q2_0 / IQ4_NL 等) は、無量子型と同じ「行を f32 に開いて
         // トークンブロックで使い回す」経路へ流す。値は逐次版と同じ規則
         // (行内は i 昇順の逐次加算) で、型ごとの分岐を増やさない。
-        ty if crate::kquant::dequant_supported(ty) => {
+        GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => {
             if nt == 0 {
                 return Ok(());
             }
@@ -5705,6 +5705,34 @@ pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]
             gemv_f32_pertoken(ty, bytes, rb, k, n, xs, nt, outs);
             #[cfg(test)]
             GEMV_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+        // 2026-10-31: 融合カーネル/GPU GEMM を持たない量子型 (IQ4_XS / IQ3_S /
+        // IQ2_S / Q2_0 / IQ4_NL 等) は、無量子型と同じ「行を f32 に開いて
+        // トークンブロックで使い回す」経路へ流す (型ごとの分岐を増やさない)。
+        ty if crate::kquant::dequant_supported(ty) => {
+            if nt == 0 {
+                return Ok(());
+            }
+            if xs.len() != nt * k || outs.len() != nt * n {
+                return Err(one(format!(
+                    "gemv_batch: x/out の長さが nt({nt}) * k({k}) / n({n}) と違う"
+                )));
+            }
+            let bytes = w.blocks().as_slice();
+            if n == 0 || bytes.len() % n != 0 {
+                return Err(one(format!(
+                    "gemv_batch: 行数 {n} でバイト数 {} を割り切れない",
+                    bytes.len()
+                )));
+            }
+            let rb = bytes.len() / n;
+            let wf = dequant_rows_f32(ty, bytes, rb, k, n);
+            gemv_f32_blocked(&wf, k, n, xs, nt, outs);
+            #[cfg(test)]
+            GEMV_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(test)]
+            GEMV_BATCH_BLOCKED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
         other => Err(one(format!("gemv_batch: 未対応の量子型 {other:?}"))),

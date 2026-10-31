@@ -540,7 +540,8 @@ impl GgufLinear {
             // ここに来た型は expert GEMV (= 1 行デコード + 逐次内積) の
             // スカラー経路で計算する。Swift 1.5 は IQ4_XS / IQ3_S / IQ2_S /
             // Q2_0 などを密行列にも使うため、旧 whitelist では読めなかった。
-            ty if crate::kquant::dequant_supported(ty) => {
+            ty if !matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16)
+                && crate::kquant::dequant_supported(ty) => {
                 // P-MOE-E5: 重みが VRAM に常駐していれば GPU で計算する。
                 // 対象外・GPU 無効・不調では false が返り、下の CPU 参照へ落ちる。
                 #[cfg(feature = "cuda")]
