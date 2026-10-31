@@ -260,6 +260,13 @@ fn prof_flash_q4(tag: &str, tok: usize) {
         eprintln!("{line}");
         denno_engine::model::exp_kprof::reset();
     }
+    // prefill の expert GEMM (gemm_iq 系) の 1 行カウンタ
+    // (`DENNO_GEMM_IQ_KPROF=1` のときだけ 1 行)。decode は exp_kprof、
+    // prefill はこちら (gemm_iq_v2 / gemm_iq の IQ 系バッチ経路だけを積む)。
+    if let Some(line) = denno_engine::model::gemm_iq_kprof::line() {
+        eprintln!("{line}");
+        denno_engine::model::gemm_iq_kprof::reset();
+    }
     if !q4prof::enabled() {
         return;
     }
