@@ -12,6 +12,24 @@
 //! テーブル (KQUANT_TABLES) は ggml-common.h から自動生成 (gen_kquant_tables.py)。
 //! 手で編集しない。
 
+/// IQ2_S の格子 (8 要素 = u64) を外へ出す。融合カーネルが 8 バイトを直接読む。
+#[inline]
+pub fn iq2s_grid() -> &'static [u64; 1024] {
+    &crate::kquant_tables::IQ2S_GRID
+}
+
+/// IQ3_XXS の格子 (4 要素 = u32) を外へ出す。
+#[inline]
+pub fn iq3xxs_grid() -> &'static [u32; 256] {
+    &crate::kquant_tables::IQ3XXS_GRID
+}
+
+/// IQ2_S / IQ3_XXS の符号表 (7 ビット -> 8 レーンの符号マスク)。
+#[inline]
+pub fn ksigns_iq2xs() -> &'static [u8; 128] {
+    &crate::kquant_tables::KSIGNS_IQ2XS
+}
+
 /// IQ4_NL の 4 ビット表 (16 エントリ) を外へ出す。融合カーネルが `pshufb` で引く。
 #[inline]
 pub fn kvalues_iq4nl() -> &'static [i8; 16] {
