@@ -719,7 +719,10 @@ fn expert_gemv_inner(
 
     // IQ4_XS (hc テンソルの実型・Swift 1.5 系の密層) は AVX2 融合カーネルへ (P89)。
     // P80 の IQ カーネル選択と同じスタイルの型判定で、`DENNO_IQ4XS_FAST=0` で
-    // 下のスカラー経路に戻る。
+    // 下のスカラー経路に戻る。task 90: 門番 (`min_rows` / `min_chunk`) は
+    // 呼び出し側 ([`expert_gemv_par_min`]) の指定をそのまま通す。旧実装は
+    // `PAR_MIN_ROWS` を上書きしていて、門番 64 を渡した呼び出しの行並列が
+    // 発火しなかった (fired=0。マージで dev2 のテストが赤になった実原因)。
     if ty == GgmlType::IQ4Xs && q4k_fused_supported() && iq4xs_fast_enabled() {
         #[cfg(target_arch = "x86_64")]
         {
@@ -729,8 +732,8 @@ fn expert_gemv_inner(
                 rb,
                 out,
                 par,
-                PAR_MIN_ROWS,
-                PAR_MIN_CHUNK_ROWS,
+                min_rows,
+                min_chunk,
                 |b, o| unsafe { gemv_iq4xs_avx2(b, n_in, o.len(), x, o) },
             );
             #[cfg(test)]
@@ -5811,15 +5814,77 @@ mod tests {
         assert!(expert_gemv(GgmlType::Q2_0, &[0u8; 3], N_IN, N_OUT, &x, &mut out).is_err());
     }
 
-    /// task 88: IQ4_XS の行並列 GEMV ([`expert_gemv_par_min`]) がスカラー参照
-    /// ([`expert_gemv_scalar`]) とビット一致する。
+    /// task 90: IQ4_XS の行並列 GEMV ([`expert_gemv_par_min`]) の契約。
     ///
+    /// P89 マージで旧「スカラー参照とのビット一致」テストが落ちたため、融合カーネル
+    /// (AVX2+FMA, 実測 15.3 GMAC/s vs classic 1.0・f64 真値誤差は classic の約 6 分の 1)
+    /// を正として書き直したもの (Q8_0 fast と同じ立場)。classic
+    /// ([`expert_gemv_scalar`] = 1 行デコード + [`dot_seq`] の k 昇順) とは累積順が
+    /// 違うのでビット一致しない代わりに、次を契約に固定する:
+    /// - dequant の値は kquant 参照 ([`dequant_row`]) と `to_bits()` 一致
+    ///   (one-hot な x で w_i を 1 出力に抜き出す。FMA 累積は fma(w, 1, ±0) = w
+    ///   で厳密。±0 の符号だけレーン縮約で崩れうるので「両方 0」を同一視する)、
+    /// - f64 真値との誤差は classic 以下 (classic が丸めで偶然真値に一致する行が
+    ///   あるので、絶対 1e-6 の同値許容を足す)。
+    /// 行の分割 (`min_rows`) が値を変えないことは [`expert_gemv`] とのビット一致で見る。
     /// 形は実機の hc down (k=10240 / n=320) を中心に、up 相当 (行が多い・1 行が
-    /// 短い)、端数 (奇数行)、門番未満 (行並列が立たない) を並べる。行は独立で
-    /// [`gemv_scalar_body`] は 1 行デコード + [`dot_seq`] (k 昇順) なので、
-    /// 行の分割の有無で各要素の値は変わらない。
+    /// 短い)、端数 (奇数行)、門番未満 (63 行) を並べる。
     #[test]
-    fn iq4xs_gemv_par_min_matches_scalar_bitexact() {
+    fn iq4xs_gemv_par_min_dequant_and_f64_accuracy() {
+        if !q4k_fused_supported() {
+            eprintln!(
+                "skip iq4xs_gemv_par_min_dequant_and_f64_accuracy: この CPU には AVX2/FMA が無い (融合経路は選ばれずスカラーへ落ちる)"
+            );
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq4xs_fast_for_test(Some(true));
+
+        // (1) dequant の to_bits 一致。k=256 (up 相当の 1 ブロック行) は全要素、
+        //     実形 (k=10240) は両端と中間の 8 点を抜く (全要素だと 1 万回の
+        //     GEMV 呼び出しになる)。n_out=128 / 320 は min_rows=64 で
+        //     行並列に割れた経路で見る (task 90 で門番を通すように直した分岐)。
+        for (name, k, n, probes) in [
+            (
+                "up 相当",
+                256usize,
+                128usize,
+                (0..256usize).collect::<Vec<usize>>(),
+            ),
+            (
+                "down 実形",
+                10240usize,
+                320usize,
+                vec![0, 1, 127, 255, 5120, 8191, 10238, 10239],
+            ),
+        ] {
+            let blocks = iq4_xs_weights(k, n, 11);
+            let rb = row_bytes(GgmlType::IQ4Xs, k).unwrap();
+            let ws: Vec<Vec<f32>> = (0..n)
+                .map(|r| dequant_row(GgmlType::IQ4Xs, &blocks[r * rb..(r + 1) * rb], k))
+                .collect();
+            let mut out = vec![0.0f32; n];
+            for i in probes {
+                let mut x = vec![0.0f32; k];
+                x[i] = 1.0;
+                expert_gemv_par_min(GgmlType::IQ4Xs, &blocks, k, n, &x, &mut out, 64).unwrap();
+                for r in 0..n {
+                    let (kv, rw) = (out[r].to_bits(), ws[r][i].to_bits());
+                    assert!(
+                        kv == rw || (out[r] == 0.0 && ws[r][i] == 0.0),
+                        "{name} i={i} row {r}: カーネルの w {} ({kv:#x}) が kquant 参照 {} ({rw:#x}) と違う",
+                        out[r],
+                        ws[r][i]
+                    );
+                }
+            }
+            assert!(
+                ws.iter().any(|w| w.iter().any(|v| *v != 0.0)),
+                "{name}: 参照行が全 0 (fixture が壊れた)"
+            );
+        }
+
+        // (2) f64 真値との誤差は classic 以下 + 行分割が値を変えない。
         let shapes = [
             ("down 実形", 10240usize, 320usize),
             ("up 相当 (1 行が短い)", 256usize, 1024usize),
@@ -5829,33 +5894,78 @@ mod tests {
         for (name, k, n) in shapes {
             let blocks = iq4_xs_weights(k, n, 11);
             let x: Vec<f32> = (0..k).map(|i| (((i * 31) % 97) as f32 - 48.0) * 0.011).collect();
+            let rb = row_bytes(GgmlType::IQ4Xs, k).unwrap();
             let mut a = vec![0.0f32; n];
             expert_gemv_scalar(GgmlType::IQ4Xs, &blocks, k, n, &x, &mut a).unwrap();
-            assert!(a.iter().any(|v| *v != 0.0), "{name}: 出力が全 0 (経路の生死が分からない)");
+            assert!(
+                a.iter().any(|v| *v != 0.0),
+                "{name}: 出力が全 0 (経路の生死が分からない)"
+            );
+            // 真値: dequant 値を f64 で累積したものを f32 に戻す。
+            let t: Vec<f32> = (0..n)
+                .map(|r| {
+                    let w = dequant_row(GgmlType::IQ4Xs, &blocks[r * rb..(r + 1) * rb], k);
+                    let mut acc = 0.0f64;
+                    for (i, wi) in w.iter().enumerate() {
+                        acc += *wi as f64 * x[i] as f64;
+                    }
+                    acc as f32
+                })
+                .collect();
+            let d_st = a
+                .iter()
+                .zip(t.iter())
+                .map(|(v, tv)| (v - tv).abs())
+                .fold(0.0f32, f32::max);
             for min_rows in [64usize, PAR_MIN_ROWS] {
                 let mut b = vec![0.0f32; n];
-                expert_gemv_par_min(GgmlType::IQ4Xs, &blocks, k, n, &x, &mut b, min_rows)
-                    .unwrap();
+                expert_gemv_par_min(GgmlType::IQ4Xs, &blocks, k, n, &x, &mut b, min_rows).unwrap();
+                let d_ft = b
+                    .iter()
+                    .zip(t.iter())
+                    .map(|(v, tv)| (v - tv).abs())
+                    .fold(0.0f32, f32::max);
+                // 絶対 1e-6 は「classic が丸めで偶然真値に一致する行」があるための
+                // 同値許容 (P89 実測では融合の誤差は classic の約 6 分の 1)。
+                assert!(
+                    d_ft <= d_st + 1e-6,
+                    "{name} (min_rows={min_rows}): 融合の f64 真値誤差 {d_ft:.3e} が classic の {d_st:.3e} を超える"
+                );
+                // 行の分割 (min_rows) が値を変えない: [`expert_gemv`] とビット一致。
+                // 行は独立で、1 行の累積順序はチャンク分割に依らない。
+                let mut c = vec![0.0f32; n];
+                expert_gemv(GgmlType::IQ4Xs, &blocks, k, n, &x, &mut c).unwrap();
                 assert_eq!(
-                    a.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
                     b.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
-                    "{name} (min_rows={min_rows}): 行並列がスカラー参照とビット一致しない"
+                    c.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    "{name} (min_rows={min_rows}): par_min が expert_gemv とビット不一致"
                 );
             }
         }
+        set_iq4xs_fast_for_test(None);
     }
 
-    /// task 88: 行並列の門番が実際に下がっていること (発火の証拠)。
+    /// task 90: 行並列の門番が実際に下がっていること (発火の証拠)。
     ///
     /// hc down の 320 行は既定の門番 ([`PAR_MIN_ROWS`] = 512) 未満なので
     /// [`expert_gemv`] では 1 スレッド。[`expert_gemv_par_min`] に 64 を渡すと
-    /// 行チャンクに割れる。発火は [`mix_kprof::rowpar`] のラベル方式で見る
-    /// (ラベルは thread-local で、ラベルを立てていない呼び出しは 1 件も積まない。
-    /// プロセス共通の [`ROW_PAR_REGIONS`] を before/after で見ると、同じカウンタを
-    /// 使う他のテストと並列実行で干渉するため)。
+    /// 行チャンクに割れる。P89 マージ後は IQ4_XS も AVX2 融合カーネルに流れる
+    /// ([`expert_gemv_inner`] の IQ4_XS 分岐。task 90 で `min_rows` / `min_chunk`
+    /// を呼び出し側の指定のまま通すように直した) ので、発火は
+    /// [`mix_kprof::rowpar`] のラベル方式に加えて融合カウンタ
+    /// ([`IQ4XS_FUSED_CALLS`]) で「融合カーネルの [`for_each_row_chunk`] を通った」
+    /// ことまで見る (ラベルは thread-local で、ラベルを立てていない呼び出しは
+    /// 1 件も積まない。プロセス共通の [`ROW_PAR_REGIONS`] を before/after で見ると、
+    /// 同じカウンタを使う他のテストと並列実行で干渉するため)。
     #[test]
     fn iq4xs_gemv_par_min_fires_below_default_gate() {
         use crate::model::qwen4exp::mix_kprof::{self, rowpar};
+        if !q4k_fused_supported() {
+            eprintln!("skip iq4xs_gemv_par_min_fires_below_default_gate: この CPU には AVX2/FMA が無い");
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq4xs_fast_for_test(Some(true));
         let (k, n) = (10240usize, 320usize);
         let blocks = iq4_xs_weights(k, n, 5);
         let x: Vec<f32> = (0..k).map(|i| (i % 13) as f32 - 6.0).collect();
@@ -5870,19 +5980,42 @@ mod tests {
         expert_gemv(GgmlType::IQ4Xs, &blocks, k, n, &x, &mut out).unwrap();
         let (regions0, fired0, ..) = rowpar::stats(rowpar::L_DOWN as usize - 1);
         // 門番 64 は行チャンクに割れる。前半の逐次 1 件を戻してから見るので
-        // ここでは down の region が 1 回・発火 1 回。
+        // ここでは down の region が 1 回・発火 1 回。融合カウンタも増える
+        // (IQ4_XS は P89 の AVX2 融合カーネル経路で割れている証拠)。
         rowpar::reset();
+        let fused0 = IQ4XS_FUSED_CALLS.load(std::sync::atomic::Ordering::Relaxed);
         expert_gemv_par_min(GgmlType::IQ4Xs, &blocks, k, n, &x, &mut out, 64).unwrap();
+        let fused_n = IQ4XS_FUSED_CALLS.load(std::sync::atomic::Ordering::Relaxed) - fused0;
         rowpar::set_label(rowpar::NONE);
         let (regions, fired, chunks, _, _) = rowpar::stats(rowpar::L_DOWN as usize - 1);
         mix_kprof::reset();
         mix_kprof::set_for_test(false);
+        set_iq4xs_fast_for_test(None);
 
-        assert_eq!(fired0, 0, "expert_gemv (既定門番 512) で 320 行が行並列に入った");
-        assert_eq!(regions0, 1, "expert_gemv (既定門番 512) の逐次 region が計上されていない");
-        assert_eq!(regions, 1, "expert_gemv_par_min(64) の down region が 1 回計上されていない");
-        assert_eq!(fired, 1, "expert_gemv_par_min(64) で 320 行が行並列に入っていない");
-        assert!(chunks >= 2, "down が 1 チャンクしか割れていない (chunks={chunks})");
+        assert_eq!(
+            fired0, 0,
+            "expert_gemv (既定門番 512) で 320 行が行並列に入った"
+        );
+        assert_eq!(
+            regions0, 1,
+            "expert_gemv (既定門番 512) の逐次 region が計上されていない"
+        );
+        assert_eq!(
+            regions, 1,
+            "expert_gemv_par_min(64) の down region が 1 回計上されていない"
+        );
+        assert_eq!(
+            fired, 1,
+            "expert_gemv_par_min(64) で 320 行が行並列に入っていない"
+        );
+        assert!(
+            chunks >= 2,
+            "down が 1 チャンクしか割れていない (chunks={chunks})"
+        );
+        assert!(
+            fused_n >= 1,
+            "expert_gemv_par_min(64) が AVX2 融合カーネルを通っていない (スカラーに落ちた, fused_n={fused_n})"
+        );
     }
 
     // ---- 実ファイルの形 (前提の実測値) との突き合わせ -----------------------
