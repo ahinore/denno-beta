@@ -363,3 +363,153 @@ fn hc_mix_gemv_iq4xs_shape_scaling() {
         );
     }
 }
+
+/// task 92: BF16 融合 GEMV の実形マイクロベンチ (hc mix の down/up 実型)。
+///
+/// 本番モデルの hc テンソルは BF16 (実機 mix-kprof: down 0.34 ms/呼び出し、
+/// down+up で 0.68 ms) なので、2 形とも**実形そのまま**で測れる:
+///
+/// - `hc_down`: k=10240, n=320 (x = 40 KB、重み 6.55 MB、3.28 M MAC)
+/// - `hc_up`  : k=320,  n=10240 (x = 1.3 KB、重み 6.55 MB、3.28 M MAC)
+///
+/// - classic = [`expert_gemv_scalar`] (1 行 dequant + [`dot_seq`] = P91 までの本番経路)
+/// - fused   = 本番入口 ([`GgufLinear::gemv_label_par`] /
+///   [`GgufLinear::gemv_label_par_2row`]) を通す (task 92 で BF16 が融合へ振れる)。
+///   1 / 2 / 4 / 8 スレッド。
+/// - 値は classic と**ビット一致**する (BF16 -> f32 変換は正確で、カーネルは
+///   積を i 昇順で逐次加算する。FMA もレーン並列の部分和も使わない) ので、
+///   スレッド数と 2 行指定の差と合わせてここで `to_bits()` を固定する。
+///
+/// 実行:
+/// ```text
+/// cargo test --release -p denno-engine --test hc_mix_bench -- --ignored --nocapture hc_mix_gemv_bf16
+/// ```
+#[test]
+#[ignore = "BF16 合成重み (6.55 MB x 2) とスレッドプールを使う (明示実行のみ)"]
+fn hc_mix_gemv_bf16_shape_scaling() {
+    use denno_engine::model::moe_expert::{bf16_fast_enabled, expert_gemv_scalar};
+
+    assert!(
+        bf16_fast_enabled(),
+        "DENNO_BF16_FAST=0 で起動されている (fused 経路を測れない)"
+    );
+    let shapes: [(&str, usize, usize, usize); 2] = [
+        ("hc_down", 10240, 320, HC_DOWN_ROW_PAR_MIN),
+        ("hc_up", 320, 10240, 0),
+    ];
+    for (name, k, n, row_par_min) in shapes {
+        // BF16 合成重み: 要素ごとに決定的な値 (f32 を bf16 に切り捨て)。
+        let rb = k * 2;
+        let mut blocks = vec![0u8; n * rb];
+        for r in 0..n {
+            for i in 0..k {
+                let h = ((i.wrapping_mul(2_654_435_761)) ^ (r.wrapping_mul(40_503))) & 0xFF_FFFF;
+                let f = (h as f32 / 2_048.0 - 4_096.0) * 2.0;
+                let bits = (f.to_bits() >> 16) as u16;
+                blocks[(r * k + i) * 2..(r * k + i) * 2 + 2].copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        let mb = blocks.len() as f64 / 1e6;
+        let gmac = (k * n) as f64 / 1e9;
+        let x: Vec<f32> = (0..k).map(|i| ((i % 29) as f32 - 14.0) * 0.01).collect();
+        let lin = GgufLinear::from_slice(GgmlType::Bf16, k, n, &blocks)
+            .expect("GgufLinear::from_slice (BF16)");
+        println!("\n[hc-bench-bf16] {name}: k={k} n={n} BF16 = {mb:.2} MB, {gmac:.2} GMAC");
+
+        // classic (P91 までの本番経路: 逐次 dequant + 逐次内積)。
+        let mut out_c = vec![0f32; n];
+        let ms_c = best_ms(|| {
+            expert_gemv_scalar(GgmlType::Bf16, &blocks, k, n, &x, &mut out_c)
+                .expect("expert_gemv_scalar");
+        });
+        println!(
+            "[hc-bench-bf16]   classic (逐次)          : {ms_c:8.3} ms ({:.1} GMAC/s, {:.1} GB/s)",
+            gmac / (ms_c * 1e-3),
+            mb / 1e3 / (ms_c * 1e-3)
+        );
+
+        // fused: 本番入口をスレッド数別に (1 行版と 2 行指定版。値は同じ)。
+        let mut rows: Vec<(usize, f64, f64, Vec<f32>, Vec<f32>)> = Vec::new();
+        for threads in [1usize, 2, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            let mut out = vec![0f32; n];
+            let ms = best_ms(|| {
+                pool.install(|| {
+                    lin.gemv_label_par("hc_mix_bench_bf16", &x, &mut out, row_par_min)
+                        .expect("gemv_label_par");
+                });
+            });
+            let mut out_f = vec![0f32; n];
+            let ms_f = best_ms(|| {
+                pool.install(|| {
+                    lin.gemv_label_par_2row(
+                        "hc_mix_bench_bf16_2row",
+                        &x,
+                        &mut out_f,
+                        row_par_min,
+                    )
+                    .expect("gemv_label_par_2row");
+                });
+            });
+            rows.push((threads, ms, ms_f, out, out_f));
+        }
+        let base = rows[0].1;
+        for (threads, ms, ms_f, out, out_f) in rows.iter() {
+            println!(
+                "[hc-bench-bf16]   fused 1row {threads:2}thr     : {ms:8.3} ms ({:.1} GMAC/s, \
+                 {:.1} GB/s, {:.2}x vs 1thr, {:.1}x vs classic)",
+                gmac / (ms * 1e-3),
+                mb / 1e3 / (ms * 1e-3),
+                base / ms,
+                ms_c / ms
+            );
+            println!(
+                "[hc-bench-bf16]   fused 2row {threads:2}thr     : {ms_f:8.3} ms ({:.1} GMAC/s, \
+                 {:.1} GB/s, {:.2}x vs 1thr, {:.1}x vs classic)",
+                gmac / (ms_f * 1e-3),
+                mb / 1e3 / (ms_f * 1e-3),
+                base / ms_f,
+                ms_c / ms_f
+            );
+            // 融合は classic とビット一致 (BF16 の契約)。
+            for (r, (a, b)) in out.iter().zip(out_c.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name} fused {threads} スレッドで行 {r} が classic とビット不一致 \
+                     ({a} vs {b})"
+                );
+            }
+            for (r, (a, b)) in out_f.iter().zip(out_c.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name} fused 2row {threads} スレッドで行 {r} が classic とビット不一致"
+                );
+            }
+            // スレッド数が変わっても値は動かない (行は独立)。
+            let (_, _, _, out1, out_f1) = &rows[0];
+            for (r, (a, b)) in out.iter().zip(out1.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name} fused {threads} スレッドで行 {r} が 1 スレッドとビット不一致"
+                );
+            }
+            for (r, (a, b)) in out_f.iter().zip(out_f1.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name} fused 2row {threads} スレッドで行 {r} が 1 スレッドとビット不一致"
+                );
+            }
+        }
+        assert!(
+            out_c.iter().any(|v| *v != 0.0),
+            "{name}: 全 0 (経路の生死が分からない)"
+        );
+    }
+}
