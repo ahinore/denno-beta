@@ -503,6 +503,30 @@ fn expert_gemv_inner(
 ) -> Result<()> {
     let rb = check_gemv_args(ty, blocks, n_in, n_out, x, out)?;
 
+    // IQ4_NL / Q2_0 (Swift 1.5 の ffn_down_exps) は AVX2 融合カーネルへ。
+    // 2026-10-31 実測: スカラー 2788 ms/token -> 下記カーネルで短縮。
+    if matches!(ty, GgmlType::IQ4Nl | GgmlType::Q2_0) && q4k_fused_supported() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let f: unsafe fn(&[u8], usize, usize, &[f32], &mut [f32]) = if ty == GgmlType::IQ4Nl {
+                gemv_iq4nl_avx2
+            } else {
+                gemv_q2_0_avx2
+            };
+            for_each_row_chunk(
+                blocks,
+                n_out,
+                rb,
+                out,
+                par,
+                PAR_MIN_ROWS,
+                PAR_MIN_CHUNK_ROWS,
+                |b, o| unsafe { f(b, n_in, o.len(), x, o) },
+            );
+            return Ok(());
+        }
+    }
+
     if ty == GgmlType::Q4K && q4k_fused_supported() {
         #[cfg(target_arch = "x86_64")]
         {
@@ -565,6 +589,129 @@ unsafe fn gemv_q8_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
             a1 = _mm256_fmadd_ps(_mm256_mul_ps(v1, dv), _mm256_loadu_ps(x0.add(8)), a1);
             a0 = _mm256_fmadd_ps(_mm256_mul_ps(v2, dv), _mm256_loadu_ps(x0.add(16)), a0);
             a1 = _mm256_fmadd_ps(_mm256_mul_ps(v3, dv), _mm256_loadu_ps(x0.add(24)), a1);
+        }
+        let s = _mm256_add_ps(a0, a1);
+        let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+        let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+        let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
+        out[r] = _mm_cvtss_f32(h);
+    }
+}
+
+/// IQ4_NL (18 バイトブロック = 32 要素) の AVX2+FMA 融合カーネル。
+///
+/// ブロックは `d: f16` + `qs: [u8; 16]`。値は `d * KVALUES_IQ4NL[q]` (q は 4 ビット)。
+/// 16 エントリの表を `pshufb` で引けるよう両レーンに複製してから、符号付き 8 ビットを
+/// 8 本ずつ f32 へ広げて FMA する。累積順はスカラー経路と違う (相対 1e-6 程度)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_iq4nl_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 18; // d(2) + qs(16)
+    let nb = n_in / 32;
+    let rb = nb * BLK;
+    let xp = x.as_ptr();
+    let bp = blocks.as_ptr();
+
+    // 16 エントリの表を 256 ビット両レーンへ複製 (pshufb の索引は 0..15)。
+    let t16 = _mm_loadu_si128(crate::kquant::KVALUES_IQ4NL.as_ptr() as *const __m128i);
+    let m4 = _mm_set1_epi8(0x0f);
+
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let dv = _mm256_set1_ps(d);
+            let q = _mm_loadu_si128(p.add(2) as *const __m128i);
+            let lo = _mm_and_si128(q, m4);
+            let hi = _mm_and_si128(_mm_srli_epi16(q, 4), m4);
+            let vlo = _mm_shuffle_epi8(t16, lo);
+            let vhi = _mm_shuffle_epi8(t16, hi);
+            let x0 = xp.add(b * 32);
+            a0 = _mm256_fmadd_ps(
+                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vlo)), dv),
+                _mm256_loadu_ps(x0),
+                a0,
+            );
+            a1 = _mm256_fmadd_ps(
+                _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(vlo))),
+                    dv,
+                ),
+                _mm256_loadu_ps(x0.add(8)),
+                a1,
+            );
+            a0 = _mm256_fmadd_ps(
+                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vhi)), dv),
+                _mm256_loadu_ps(x0.add(16)),
+                a0,
+            );
+            a1 = _mm256_fmadd_ps(
+                _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(vhi))),
+                    dv,
+                ),
+                _mm256_loadu_ps(x0.add(24)),
+                a1,
+            );
+        }
+        let s = _mm256_add_ps(a0, a1);
+        let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+        let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+        let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
+        out[r] = _mm_cvtss_f32(h);
+    }
+}
+
+/// Q2_0 (18 バイトブロック = 64 要素) の AVX2+FMA 融合カーネル。
+///
+/// ブロックは `d: f16` + `qs: [u8; 16]`。要素 `j` は `qs[j/4]` の `(j%4)*2` ビット目から
+/// 2 ビットを取り、`(q - 1) * d`。2 バイトずつ 8 要素に開いて (シフト量 0/2/4/6 を
+/// `vpsrlvd` で一括)、`(q-1)` を f32 にして FMA する。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_q2_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 18; // d(2) + qs(16)
+    let nb = n_in / 64;
+    let rb = nb * BLK;
+    let xp = x.as_ptr();
+    let bp = blocks.as_ptr();
+
+    // 2 バイト (= 8 要素) を 8 レーンへ開くためのシフト量とマスク。
+    let shifts = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+    let three = _mm256_set1_epi32(3);
+    let one = _mm256_set1_ps(1.0);
+
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let dv = _mm256_set1_ps(d);
+            let qs = p.add(2);
+            let x0 = xp.add(b * 64);
+            for g in 0..4 {
+                // 8 要素 = 2 バイト (要素 8g..8g+7) を 8 レーンへ。
+                let b0 = *qs.add(g * 2) as i32;
+                let b1 = *qs.add(g * 2 + 1) as i32;
+                let bcast = _mm256_setr_epi32(b0, b0, b0, b0, b1, b1, b1, b1);
+                let codes = _mm256_and_si256(_mm256_srlv_epi32(bcast, shifts), three);
+                let f = _mm256_sub_ps(_mm256_cvtepi32_ps(codes), one);
+                let v = _mm256_mul_ps(f, dv);
+                if g % 2 == 0 {
+                    a0 = _mm256_fmadd_ps(v, _mm256_loadu_ps(x0.add(g * 8)), a0);
+                } else {
+                    a1 = _mm256_fmadd_ps(v, _mm256_loadu_ps(x0.add(g * 8)), a1);
+                }
+            }
         }
         let s = _mm256_add_ps(a0, a1);
         let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
@@ -6011,4 +6158,52 @@ mod tests {
         }
     }
 
+
+    /// IQ4_NL / Q2_0 の AVX2 融合カーネルがスカラー経路と一致すること。
+    /// (累積順が違うのでビット一致ではなく相対 1e-5 で見る)
+    #[test]
+    fn fused_iq4nl_and_q2_0_match_scalar() {
+        if !q4k_fused_supported() {
+            return;
+        }
+        let mut seed = 0x243f_6a88_85a3_08d3u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5
+        };
+        for ty in [GgmlType::IQ4Nl, GgmlType::Q2_0] {
+            let (n_in, n_out) = (256usize, 7usize);
+            let blk = ty.blck_size();
+            let ts = ty.type_size();
+            let nb = n_in / blk;
+            let rb = nb * ts;
+            let mut blocks = vec![0u8; rb * n_out];
+            for r in 0..n_out {
+                for b in 0..nb {
+                    let p = &mut blocks[r * rb + b * ts..r * rb + (b + 1) * ts];
+                    let d = half::f16::from_f32(0.011 + 0.001 * b as f32);
+                    p[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+                    for j in 2..ts {
+                        p[j] = (rnd() * 200.0) as i8 as u8;
+                    }
+                }
+            }
+            let x: Vec<f32> = (0..n_in).map(|_| rnd()).collect();
+            let mut a = vec![0f32; n_out];
+            let mut b2 = vec![0f32; n_out];
+            expert_gemv_inner(ty, &blocks, n_in, n_out, &x, &mut a, false).unwrap();
+            gemv_scalar_body(ty, rb, &blocks, n_in, n_out, &x, &mut b2);
+            for i in 0..n_out {
+                let scale = b2[i].abs().max(1e-3);
+                assert!(
+                    (a[i] - b2[i]).abs() / scale < 1e-5,
+                    "{ty:?} 行 {i}: fused {} vs scalar {}",
+                    a[i],
+                    b2[i]
+                );
+            }
+        }
+    }
 }
