@@ -615,7 +615,7 @@ unsafe fn gemv_iq4nl_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], o
     let bp = blocks.as_ptr();
 
     // 16 エントリの表を 256 ビット両レーンへ複製 (pshufb の索引は 0..15)。
-    let t16 = _mm_loadu_si128(crate::kquant::KVALUES_IQ4NL.as_ptr() as *const __m128i);
+    let t16 = _mm_loadu_si128(crate::kquant::kvalues_iq4nl().as_ptr() as *const __m128i);
     let m4 = _mm_set1_epi8(0x0f);
 
     for r in 0..n_out {

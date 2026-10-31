@@ -12,6 +12,12 @@
 //! テーブル (KQUANT_TABLES) は ggml-common.h から自動生成 (gen_kquant_tables.py)。
 //! 手で編集しない。
 
+/// IQ4_NL の 4 ビット表 (16 エントリ) を外へ出す。融合カーネルが `pshufb` で引く。
+#[inline]
+pub fn kvalues_iq4nl() -> &'static [i8; 16] {
+    &crate::kquant_tables::KVALUES_IQ4NL
+}
+
 use crate::kquant_tables::*;
 
 /// GGML 型 ID (ggml.h enum ggml_type と同一値)。
