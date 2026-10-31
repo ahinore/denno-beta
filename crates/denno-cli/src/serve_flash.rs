@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use denno_engine::gguf::GgufFile;
+use denno_engine::model::prekprof;
 use denno_engine::model::qwen4exp::{Qwen4Exp, Qwen4ExpParams, TapTokens};
 use denno_engine::model::qwen4exp_attn::FullAttn;
 use denno_engine::model::qwen4exp_decode::{DecoderConfig, Qwen4ExpDecoder};
@@ -307,6 +308,8 @@ impl Flash {
 
     /// 生成して、確定した本文を返す。`emit` は差分テキストを受け取る。
     fn generate(&mut self, req: &GenReq, mut emit: impl FnMut(&str) -> Result<()>) -> Result<GenOut> {
+        // P78: 層の外の内訳 (tokenize は prefill wall の外なので別に積む)。
+        let t_tok = prekprof::stamp();
         let prompt = self
             .tok
             .encode_messages(
@@ -316,6 +319,7 @@ impl Flash {
                 req.enable_thinking,
             )
             .context("プロンプトを組めない")?;
+        prekprof::mark(t_tok, prekprof::TOKENIZE);
         if prompt.is_empty() {
             bail!("プロンプトが空になった");
         }
@@ -347,7 +351,10 @@ impl Flash {
                 }
             }
             _ => {
+                // P78: mmap と attention/KV 状態の確保は「層の外」でも重い候補。
+                let t_model = prekprof::stamp();
                 let m = self.build_model()?;
+                prekprof::mark(t_model, prekprof::MODEL);
                 let mut d = Qwen4ExpDecoder::new(m, DecoderConfig::new(self.max_ctx));
                 let lg = self.prefill_logits(&mut d, &prompt)?;
                 (d, lg)
@@ -401,7 +408,11 @@ impl Flash {
             // P58: 選ぶ前の分布を top-8 で送る (3D ビューワの候補表示用)。
             // テレメトリ OFF なら計算しない。数値経路には触れない。
             let cand = if t_on { Some(denno_telemetry::topk_softmax(&logits, 8)) } else { None };
+            // P78: サンプリングは decode 側 (prefill wall の外)。
+            let t_s = prekprof::stamp();
             let id = sampler.sample(&logits) as u32;
+            prekprof::mark(t_s, prekprof::SAMPLE);
+            prekprof::note_sample();
             if Some(id) == eos {
                 break;
             }
@@ -482,6 +493,13 @@ impl Flash {
             t_decode * 1e3 / out.len().max(1) as f64
         );
         prof_flash("decode", out.len());
+        // P78: `DENNO_PRE_KPROF=1` のときだけ、層の外の区間を 2 行で出す
+        // (既定 off では `report` が空を返す = 出力ゼロ)。
+        for line in
+            prekprof::report("prefill", (n_prompt - reused).max(1), (t_prefill * 1e9) as u64)
+        {
+            eprintln!("{line}");
+        }
         // 途中で失敗したら状態は信用しない (次のリクエストで組み直す)。
         let stop_reason = stop_hit.unwrap_or_else(|| {
             if out.len() >= req.max_tokens {
