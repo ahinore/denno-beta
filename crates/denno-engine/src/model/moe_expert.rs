@@ -505,18 +505,14 @@ fn expert_gemv_inner(
 
     // IQ4_NL / Q2_0 (Swift 1.5 の ffn_down_exps) は AVX2 融合カーネルへ。
     // 2026-10-31 実測: スカラー 2788 ms/token -> 下記カーネルで短縮。
-    if matches!(
-        ty,
-        GgmlType::IQ4Nl | GgmlType::Q2_0 | GgmlType::IQ2S | GgmlType::IQ3Xxs
-    ) && q4k_fused_supported()
-    {
+    if iq_kind(ty).is_some() && q4k_fused_supported() {
         #[cfg(target_arch = "x86_64")]
         {
-            let f: unsafe fn(&[u8], usize, usize, &[f32], &mut [f32]) = match ty {
-                GgmlType::IQ4Nl => gemv_iq4nl_avx2,
-                GgmlType::Q2_0 => gemv_q2_0_avx2,
-                GgmlType::IQ2S => gemv_iq2s_avx2,
-                _ => gemv_iq3xxs_avx2,
+            let f: unsafe fn(&[u8], usize, usize, &[f32], &mut [f32]) = match iq_kind(ty) {
+                Some(0) => gemv_iq::<0>,
+                Some(1) => gemv_iq::<1>,
+                Some(2) => gemv_iq::<2>,
+                _ => gemv_iq::<3>,
             };
             for_each_row_chunk(
                 blocks,
@@ -603,118 +599,143 @@ unsafe fn gemv_q8_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
     }
 }
 
-/// IQ4_NL (18 バイトブロック = 32 要素) の AVX2+FMA 融合カーネル。
+/// IQ 系 4 型の「ブロック内 8 要素」を f32 レーンへ開く共通部品。
 ///
-/// ブロックは `d: f16` + `qs: [u8; 16]`。値は `d * KVALUES_IQ4NL[q]` (q は 4 ビット)。
-/// 16 エントリの表を `pshufb` で引けるよう両レーンに複製してから、符号付き 8 ビットを
-/// 8 本ずつ f32 へ広げて FMA する。累積順はスカラー経路と違う (相対 1e-6 程度)。
+/// `KIND`: 0 = IQ4_NL (32 要素/18 B)、1 = Q2_0 (64 要素/18 B)、
+/// 2 = IQ2_S (256 要素/82 B)、3 = IQ3_XXS (256 要素/98 B)。
+/// `h` はブロック内の 8 要素グループ番号で、`h * 8` 要素目から始まる。
+/// 係数 (`d` やスケール) を掛けた**重み値そのもの**を返す。
 #[cfg(target_arch = "x86_64")]
+#[inline(always)]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn gemv_iq4nl_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
+#[allow(clippy::missing_safety_doc)]
+unsafe fn iq_vec8<const KIND: u8>(p: *const u8, h: usize) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
 
-    const BLK: usize = 18; // d(2) + qs(16)
-    let nb = n_in / 32;
-    let rb = nb * BLK;
-    let xp = x.as_ptr();
-    let bp = blocks.as_ptr();
-
-    // 16 エントリの表を 256 ビット両レーンへ複製 (pshufb の索引は 0..15)。
-    let t16 = _mm_loadu_si128(crate::kquant::kvalues_iq4nl().as_ptr() as *const __m128i);
-    let m4 = _mm_set1_epi8(0x0f);
-
-    for r in 0..n_out {
-        let row = bp.add(r * rb);
-        let mut a0 = _mm256_setzero_ps();
-        let mut a1 = _mm256_setzero_ps();
-        for b in 0..nb {
-            let p = row.add(b * BLK);
+    match KIND {
+        // ---- IQ4_NL: d(f16) + qs[16] を 16 エントリ表で引く ----------------------
+        0 => {
             let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
             let dv = _mm256_set1_ps(d);
-            let q = _mm_loadu_si128(p.add(2) as *const __m128i);
-            let lo = _mm_and_si128(q, m4);
-            let hi = _mm_and_si128(_mm_srli_epi16(q, 4), m4);
-            let vlo = _mm_shuffle_epi8(t16, lo);
-            let vhi = _mm_shuffle_epi8(t16, hi);
-            let x0 = xp.add(b * 32);
-            a0 = _mm256_fmadd_ps(
-                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vlo)), dv),
-                _mm256_loadu_ps(x0),
-                a0,
-            );
-            a1 = _mm256_fmadd_ps(
-                _mm256_mul_ps(
-                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(vlo))),
-                    dv,
-                ),
-                _mm256_loadu_ps(x0.add(8)),
-                a1,
-            );
-            a0 = _mm256_fmadd_ps(
-                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vhi)), dv),
-                _mm256_loadu_ps(x0.add(16)),
-                a0,
-            );
-            a1 = _mm256_fmadd_ps(
-                _mm256_mul_ps(
-                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(vhi))),
-                    dv,
-                ),
-                _mm256_loadu_ps(x0.add(24)),
-                a1,
-            );
+            let t16 = _mm_loadu_si128(crate::kquant::kvalues_iq4nl().as_ptr() as *const __m128i);
+            let q = _mm_loadu_si128(p.add(2 + (h % 2) * 8) as *const __m128i);
+            let idx = if h < 2 {
+                _mm_and_si128(q, _mm_set1_epi8(0x0f))
+            } else {
+                _mm_and_si128(_mm_srli_epi16(q, 4), _mm_set1_epi8(0x0f))
+            };
+            let v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_shuffle_epi8(t16, idx)));
+            _mm256_mul_ps(v, dv)
         }
-        let s = _mm256_add_ps(a0, a1);
-        let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
-        let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
-        let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
-        out[r] = _mm_cvtss_f32(h);
-    }
-}
-
-/// Q2_0 (18 バイトブロック = 64 要素) の AVX2+FMA 融合カーネル。
-///
-/// ブロックは `d: f16` + `qs: [u8; 16]`。要素 `j` は `qs[j/4]` の `(j%4)*2` ビット目から
-/// 2 ビットを取り、`(q - 1) * d`。2 バイトずつ 8 要素に開いて (シフト量 0/2/4/6 を
-/// `vpsrlvd` で一括)、`(q-1)` を f32 にして FMA する。
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn gemv_q2_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
-    use std::arch::x86_64::*;
-
-    const BLK: usize = 18; // d(2) + qs(16)
-    let nb = n_in / 64;
-    let rb = nb * BLK;
-    let xp = x.as_ptr();
-    let bp = blocks.as_ptr();
-
-    // 2 バイト (= 8 要素) を 8 レーンへ開くためのシフト量とマスク。
-    let shifts = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
-    let three = _mm256_set1_epi32(3);
-    let one = _mm256_set1_ps(1.0);
-
-    for r in 0..n_out {
-        let row = bp.add(r * rb);
-        let mut a0 = _mm256_setzero_ps();
-        let mut a1 = _mm256_setzero_ps();
-        for b in 0..nb {
-            let p = row.add(b * BLK);
+        // ---- Q2_0: d(f16) + qs[16]、2 ビット (値は (q-1)) -----------------------
+        1 => {
             let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
             let dv = _mm256_set1_ps(d);
             let qs = p.add(2);
-            let x0 = xp.add(b * 64);
-            for g in 0..8 {
-                // 8 要素 = 2 バイト (要素 8g..8g+7) を 8 レーンへ。16 バイトで 8 組。
-                let b0 = *qs.add(g * 2) as i32;
-                let b1 = *qs.add(g * 2 + 1) as i32;
-                let bcast = _mm256_setr_epi32(b0, b0, b0, b0, b1, b1, b1, b1);
-                let codes = _mm256_and_si256(_mm256_srlv_epi32(bcast, shifts), three);
-                let f = _mm256_sub_ps(_mm256_cvtepi32_ps(codes), one);
-                let v = _mm256_mul_ps(f, dv);
-                if g % 2 == 0 {
-                    a0 = _mm256_fmadd_ps(v, _mm256_loadu_ps(x0.add(g * 8)), a0);
+            let b0 = *qs.add(h * 2) as i32;
+            let b1 = *qs.add(h * 2 + 1) as i32;
+            let bcast = _mm256_setr_epi32(b0, b0, b0, b0, b1, b1, b1, b1);
+            let shifts = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+            let codes = _mm256_and_si256(_mm256_srlv_epi32(bcast, shifts), _mm256_set1_epi32(3));
+            let f = _mm256_sub_ps(_mm256_cvtepi32_ps(codes), _mm256_set1_ps(1.0));
+            _mm256_mul_ps(f, dv)
+        }
+        // ---- IQ2_S: 8 要素 = 格子 1 本 (u64) + 符号 1 バイト ---------------------
+        2 => {
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let ib = h / 4;
+            let l = h % 4;
+            let sc = *p.add(74 + ib);
+            let db = d
+                * if l < 2 {
+                    (0.5 + (sc & 0xf) as f32) * 0.25
                 } else {
-                    a1 = _mm256_fmadd_ps(v, _mm256_loadu_ps(x0.add(g * 8)), a1);
+                    (0.5 + (sc >> 4) as f32) * 0.25
+                };
+            let qhb = *p.add(66 + ib) as usize;
+            let idx = (*p.add(2 + ib * 4 + l) as usize) | ((qhb << (8 - 2 * l)) & 0x300);
+            let g = crate::kquant::iq2s_grid().as_ptr().add(idx) as *const i8;
+            let sg = *p.add(34 + ib * 4 + l) as i32;
+            let vi = _mm_loadl_epi64(g as *const __m128i);
+            let v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vi));
+            // レーンごとにビット位置が違うので、比較で符号ビット (bit31) を作る。
+            let hit = _mm256_and_si256(
+                _mm256_set1_epi32(sg),
+                _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128),
+            );
+            let pos = _mm256_cmpeq_epi32(hit, _mm256_setzero_si256());
+            let neg = _mm256_andnot_si256(pos, _mm256_set1_epi32(i32::MIN));
+            _mm256_mul_ps(_mm256_xor_ps(v, _mm256_castsi256_ps(neg)), _mm256_set1_ps(db))
+        }
+        // ---- IQ3_XXS: 8 要素 = 4 要素の格子 2 本 + 符号表 ------------------------
+        _ => {
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let ib = h / 4;
+            let l = h % 4;
+            let aux32 = std::ptr::read_unaligned(p.add(66 + ib * 4) as *const u32);
+            let db = d * (0.5 + ((aux32 >> 28) as f32)) * 0.5;
+            let sg = *crate::kquant::ksigns_iq2xs().as_ptr().add(((aux32 >> (7 * l)) & 127) as usize) as i32;
+            let g1 = *crate::kquant::iq3xxs_grid().as_ptr().add(*p.add(2 + ib * 8 + 2 * l) as usize) as u64;
+            let g2 = *crate::kquant::iq3xxs_grid().as_ptr().add(*p.add(2 + ib * 8 + 2 * l + 1) as usize) as u64;
+            let bytes = (g1 | (g2 << 32)).to_le_bytes();
+            let vi = _mm_loadl_epi64(bytes.as_ptr() as *const __m128i);
+            let v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vi));
+            let hit = _mm256_and_si256(
+                _mm256_set1_epi32(sg),
+                _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128),
+            );
+            let pos = _mm256_cmpeq_epi32(hit, _mm256_setzero_si256());
+            let neg = _mm256_andnot_si256(pos, _mm256_set1_epi32(i32::MIN));
+            _mm256_mul_ps(_mm256_xor_ps(v, _mm256_castsi256_ps(neg)), _mm256_set1_ps(db))
+        }
+    }
+}
+
+/// IQ 系の `(ブロックバイト数, ブロック内の 8 要素グループ数)`。
+const fn iq_geom(kind: u8) -> (usize, usize) {
+    match kind {
+        0 => (18, 4),
+        1 => (18, 8),
+        2 => (82, 32),
+        _ => (98, 32),
+    }
+}
+
+/// IQ 系 4 型の 1 行 GEMV (1 トークン)。`expert_gemv_inner` から呼ぶ。
+///
+/// 行ごとに 8 要素ベクトルを 1 本作り、2 本の累積 (`a0`/`a1` をグループ番号の
+/// 偶奇で振り分け) へ FMA する。累積順はスカラー経路と違う (相対 1e-6 程度)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_iq<const KIND: u8>(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let (blk, nvec) = iq_geom(KIND);
+    let nb = n_in / (nvec * 8);
+    let rb = nb * blk;
+    let xp = x.as_ptr();
+    let bp = blocks.as_ptr();
+
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        for b in 0..nb {
+            let p = row.add(b * blk);
+            let xb = xp.add(b * nvec * 8);
+            for h in 0..nvec {
+                let v = iq_vec8::<KIND>(p, h);
+                let xo = xb.add(h * 8);
+                if h % 2 == 0 {
+                    a0 = _mm256_fmadd_ps(v, _mm256_loadu_ps(xo), a0);
+                } else {
+                    a1 = _mm256_fmadd_ps(v, _mm256_loadu_ps(xo), a1);
                 }
             }
         }
@@ -726,134 +747,58 @@ unsafe fn gemv_q2_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
     }
 }
 
-/// IQ2_S (82 バイトのスーパーブロック = 256 要素) の AVX2+FMA 融合カーネル。
+/// IQ 系 4 型のバッチ GEMM (`m` トークン)。prefill の expert 経路。
 ///
-/// レイアウト: `d: f16` / `qs[64]` / `signs[32]` (オフセット 34) / `qh[8]` (66) /
-/// `scales[8]` (74)。8 要素ずつ格子 (`IQ2S_GRID` の u64) を読んで f32 に開き、
-/// 符号ビットを float の符号ビットへ XOR で入れてから FMA する。
-/// 累積順はスカラー経路と違う (相対 1e-6 程度)。
+/// トークン方向を 4 本ずつまとめ、1 本の重みベクトルを 4 トークンで使い回す。
+/// 累積は 1 トークンあたり 2 本 (`h` の偶奇) で [`gemv_iq`] と同じ順序なので、
+/// `m = 1` のとき [`gemv_iq`] とビット一致する。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn gemv_iq2s_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
+unsafe fn gemm_iq<const KIND: u8>(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    xs: &[f32],
+    m: usize,
+    out: *mut f32,
+    stride: usize,
+) {
     use std::arch::x86_64::*;
 
-    const BLK: usize = 82;
-    let nb = n_in / 256;
-    let rb = nb * BLK;
-    let xp = x.as_ptr();
+    const TG: usize = 4; // 同時に回すトークン数
+    let (blk, nvec) = iq_geom(KIND);
+    let nb = n_in / (nvec * 8);
+    let rb = nb * blk;
     let bp = blocks.as_ptr();
-    let signbit = _mm256_set1_epi32(i32::MIN);
-    let grid = crate::kquant::iq2s_grid().as_ptr();
-    // レーン j の符号ビット (1<<j) を i32 で並べたもの。
-    let bits = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+    let xp = xs.as_ptr();
 
     for r in 0..n_out {
         let row = bp.add(r * rb);
-        let mut a0 = _mm256_setzero_ps();
-        let mut a1 = _mm256_setzero_ps();
-        for b in 0..nb {
-            let p = row.add(b * BLK);
-            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
-            let qs = p.add(2);
-            let signs = p.add(34);
-            let qh = p.add(66);
-            let scales = p.add(74);
-            let xb = xp.add(b * 256);
-            for ib in 0..8 {
-                let sc = *scales.add(ib);
-                let db0 = d * (0.5 + (sc & 0xf) as f32) * 0.25;
-                let db1 = d * (0.5 + (sc >> 4) as f32) * 0.25;
-                let qhb = *qh.add(ib) as i32;
-                for l in 0..4 {
-                    let idx = (*qs.add(ib * 4 + l) as usize) | (((qhb as usize) << (8 - 2 * l)) & 0x300);
-                    let g = grid.add(idx) as *const i8;
-                    let sg = *signs.add(ib * 4 + l) as i32;
-                    let db = if l < 2 { db0 } else { db1 };
-                    let vi = _mm_loadl_epi64(g as *const __m128i);
-                    let v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vi));
-                    // レーンのビット位置が違うので、シフトではなく
-                    // 「0 と比較して 0x80000000 を立てる」で符号ビットを作る。
-                    let hit = _mm256_and_si256(_mm256_set1_epi32(sg), bits);
-                    let pos = _mm256_cmpeq_epi32(hit, _mm256_setzero_si256());
-                    let neg = _mm256_castsi256_ps(_mm256_andnot_si256(pos, signbit));
-                    let w = _mm256_mul_ps(_mm256_xor_ps(v, neg), _mm256_set1_ps(db));
-                    let xo = xb.add(ib * 32 + l * 8);
-                    if l % 2 == 0 {
-                        a0 = _mm256_fmadd_ps(w, _mm256_loadu_ps(xo), a0);
-                    } else {
-                        a1 = _mm256_fmadd_ps(w, _mm256_loadu_ps(xo), a1);
+        let mut t0 = 0usize;
+        while t0 < m {
+            let tg = TG.min(m - t0);
+            let mut acc = [[_mm256_setzero_ps(); 2]; TG];
+            for b in 0..nb {
+                let p = row.add(b * blk);
+                for h in 0..nvec {
+                    let v = iq_vec8::<KIND>(p, h);
+                    let e = h % 2;
+                    let xo = h * 8;
+                    for (g, a) in acc.iter_mut().enumerate().take(tg) {
+                        let xr = xp.add((t0 + g) * n_in + b * nvec * 8 + xo);
+                        a[e] = _mm256_fmadd_ps(v, _mm256_loadu_ps(xr), a[e]);
                     }
                 }
             }
-        }
-        let s = _mm256_add_ps(a0, a1);
-        let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
-        let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
-        let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
-        out[r] = _mm_cvtss_f32(h);
-    }
-}
-
-/// IQ3_XXS (98 バイトのスーパーブロック = 256 要素) の AVX2+FMA 融合カーネル。
-///
-/// レイアウト: `d: f16` / `qs[96]` / `scales_and_signs[32]` (66)。8 要素 =
-/// 4 要素の格子 2 本 (`IQ3XXS_GRID` の u32) を繋げたもの。
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn gemv_iq3xxs_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
-    use std::arch::x86_64::*;
-
-    const BLK: usize = 98;
-    let nb = n_in / 256;
-    let rb = nb * BLK;
-    let xp = x.as_ptr();
-    let bp = blocks.as_ptr();
-    let signbit = _mm256_set1_epi32(i32::MIN);
-    let grid = crate::kquant::iq3xxs_grid().as_ptr();
-    let signs_tbl = crate::kquant::ksigns_iq2xs().as_ptr();
-    let bits = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
-
-    for r in 0..n_out {
-        let row = bp.add(r * rb);
-        let mut a0 = _mm256_setzero_ps();
-        let mut a1 = _mm256_setzero_ps();
-        for b in 0..nb {
-            let p = row.add(b * BLK);
-            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
-            let qs = p.add(2);
-            let ss = p.add(66);
-            let xb = xp.add(b * 256);
-            for ib in 0..8 {
-                let aux32 = std::ptr::read_unaligned(ss.add(ib * 4) as *const u32);
-                let db = d * (0.5 + ((aux32 >> 28) as f32)) * 0.5;
-                let dbv = _mm256_set1_ps(db);
-                for l in 0..4 {
-                    let sg = *signs_tbl.add(((aux32 >> (7 * l)) & 127) as usize) as i32;
-                    let g1 = *grid.add(*qs.add(ib * 8 + 2 * l) as usize) as u64;
-                    let g2 = *grid.add(*qs.add(ib * 8 + 2 * l + 1) as usize) as u64;
-                    let bytes = (g1 | (g2 << 32)).to_le_bytes();
-                    let vi = _mm_loadl_epi64(bytes.as_ptr() as *const __m128i);
-                    let v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vi));
-                    // レーンのビット位置が違うので、シフトではなく
-                    // 「0 と比較して 0x80000000 を立てる」で符号ビットを作る。
-                    let hit = _mm256_and_si256(_mm256_set1_epi32(sg), bits);
-                    let pos = _mm256_cmpeq_epi32(hit, _mm256_setzero_si256());
-                    let neg = _mm256_castsi256_ps(_mm256_andnot_si256(pos, signbit));
-                    let w = _mm256_mul_ps(_mm256_xor_ps(v, neg), dbv);
-                    let xo = xb.add(ib * 32 + l * 8);
-                    if l % 2 == 0 {
-                        a0 = _mm256_fmadd_ps(w, _mm256_loadu_ps(xo), a0);
-                    } else {
-                        a1 = _mm256_fmadd_ps(w, _mm256_loadu_ps(xo), a1);
-                    }
-                }
+            for (g, a) in acc.iter().enumerate().take(tg) {
+                let s = _mm256_add_ps(a[0], a[1]);
+                let hh = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+                let hh = _mm_add_ps(hh, _mm_movehl_ps(hh, hh));
+                let hh = _mm_add_ss(hh, _mm_shuffle_ps(hh, hh, 0x55));
+                *out.add((t0 + g) * stride + r) = _mm_cvtss_f32(hh);
             }
+            t0 += tg;
         }
-        let s = _mm256_add_ps(a0, a1);
-        let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
-        let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
-        let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
-        out[r] = _mm_cvtss_f32(h);
     }
 }
 
@@ -1376,6 +1321,26 @@ pub(crate) fn gemm_rows(
             gemm_fused_fired();
             // SAFETY: 同上 (Q4_K は n_in%256==0 が row_bytes で保証される)。
             unsafe { gemm_q4k_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
+            return;
+        }
+        if fused && iq_kind(ty).is_some() && q4k_fused_supported() {
+            // 行範囲だけを回す版が無いので、行範囲を切り出して呼ぶ。
+            // (r0/r1 は行の分割なので、範囲を変えても各要素の計算順序は変わらない)
+            gemm_fused_fired();
+            let rb_iq = {
+                let (blk, nvec) = iq_geom(iq_kind(ty).unwrap_or(0));
+                (n_in / (nvec * 8)) * blk
+            };
+            let sub = &blocks[r0 * rb_iq..r1 * rb_iq];
+            // SAFETY: 同上。`sub` は行 r0..r1 のバイト列ちょうど。
+            unsafe {
+                match iq_kind(ty) {
+                    Some(0) => gemm_iq::<0>(sub, n_in, r1 - r0, xs, m, out.add(r0), stride),
+                    Some(1) => gemm_iq::<1>(sub, n_in, r1 - r0, xs, m, out.add(r0), stride),
+                    Some(2) => gemm_iq::<2>(sub, n_in, r1 - r0, xs, m, out.add(r0), stride),
+                    _ => gemm_iq::<3>(sub, n_in, r1 - r0, xs, m, out.add(r0), stride),
+                }
+            }
             return;
         }
     }
@@ -2146,6 +2111,22 @@ pub fn expert_gemm_any(
     outs: &mut [f32],
 ) -> Result<()> {
     expert_gemm_inner(ty, blocks, n_in, n_out, xs, m, outs, true, true)
+}
+
+/// IQ 系 4 型の識別子 (`iq_vec8` の `KIND`)。それ以外は `None`。
+///
+/// 2026-10-31: Swift-1.5 の expert は gate/up が IQ2_S / IQ3_XXS、down が
+/// IQ4_NL / Q2_0。どれも融合カーネルが無く、decode は 1 行ずつデコードする
+/// スカラー経路、prefill はトークン方向がストライド読みで SIMD 化されない
+/// スカラー GEMM に落ちていた (実測: decode 3960 ms/token、prefill 149 ms/tok)。
+pub fn iq_kind(ty: GgmlType) -> Option<u8> {
+    match ty {
+        GgmlType::IQ4Nl => Some(0),
+        GgmlType::Q2_0 => Some(1),
+        GgmlType::IQ2S => Some(2),
+        GgmlType::IQ3Xxs => Some(3),
+        _ => None,
+    }
 }
 
 /// [`expert_gemm_any`] の**融合カーネルを使わない**版。
