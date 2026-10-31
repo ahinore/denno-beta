@@ -1558,14 +1558,18 @@ fn linear(f: &GgufFile, name: &str) -> Result<GgufLinear> {
         .map_err(|e| one(format!("{name}: {e}")))
 }
 
-/// F32 テンソルを f32 の Vec として読む (norm の gamma・conv の重み用)。
+/// f32 の Vec として読む小さなテンソル (norm の gamma・conv の重み用)。
+///
+/// 2026-10-31: F32 固定をやめた。Swift 1.5 は `ple_conv1d` が F16、`ssm_alpha` などが
+/// BF16 で入っており、どれも f32 へ展開して同じに扱える。F32 以外は `dequant_tensor`
+/// の経路 (要素数一致を確認したうえで 1 要素ずつ変換) を通す。
 fn f32_tensor(f: &GgufFile, name: &str) -> Result<Vec<f32>> {
     let t = f
         .tensor(name)
         .ok_or_else(|| one(format!("{name}: テンソルが無い")))?;
-    if t.ty != GgmlType::F32 {
+    if !crate::kquant::dequant_supported(t.ty) {
         return Err(one(format!(
-            "{name}: 型 {} が期待 F32 と違う",
+            "{name}: 型 {} はデコードできない",
             ty_name(t.ty)
         )));
     }
