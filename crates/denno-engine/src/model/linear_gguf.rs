@@ -1807,6 +1807,160 @@ mod tests {
         }
     }
 
+    // ---- task 93: DENNO_BF16_CHUNK (BF16 融合経路の目標チャンク数) -----------
+
+    /// `DENNO_BF16_CHUNK` が値を変えないこと (実形 2 形)。
+    ///
+    /// 行は互いに独立で、1 行の累積順序は行の割り方に依らない。だから自動分割
+    /// (rayon スレッド数から決まる) も、N=1 (1 チャンク) も、N=3/7 の割り切れない
+    /// 端数も、N=64 の細かいチャンクも、classic (融合 off・scalar body + 行チャンク)
+    /// とビット一致するはず。env 掃引の前にここで固定する。
+    #[test]
+    fn bf16_chunk_override_bit_matches_auto() {
+        use crate::model::moe_expert::{set_bf16_chunk_for_test, set_bf16_fast_for_test};
+        use crate::model::qwen4exp::HC_DOWN_ROW_PAR_MIN;
+        let _g = par_test_lock();
+        for (k, n, min, name) in [
+            (10240usize, 320usize, HC_DOWN_ROW_PAR_MIN, "hc_down 10240->320"),
+            (320usize, 10240usize, 0usize, "hc_up 320->10240"),
+        ] {
+            let w = make_matrix(GgmlType::Bf16, k, n, 7);
+            let lin = GgufLinear::from_slice(GgmlType::Bf16, k, n, &w).expect("GgufLinear");
+            let x = make_x(k, 9);
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+
+            // classic: 融合 off (scalar body を行チャンクで回る退避路)。
+            set_bf16_fast_for_test(Some(false));
+            let mut classic = vec![0f32; n];
+            lin.gemv_label_par_2row("bit", &x, &mut classic, min)
+                .unwrap_or_else(|e| panic!("{name}: classic: {e}"));
+            set_bf16_fast_for_test(None);
+
+            // 融合 + 自動分割。
+            set_bf16_chunk_for_test(None);
+            let mut auto = vec![0f32; n];
+            lin.gemv_label_par_2row("bit", &x, &mut auto, min)
+                .unwrap_or_else(|e| panic!("{name}: auto: {e}"));
+            assert_eq!(
+                bits(&classic),
+                bits(&auto),
+                "{name}: 融合 (自動分割) が classic とビット不一致"
+            );
+
+            // 融合 + 明示チャンク数 (端数が出る N も含む)。
+            for chunk in [1usize, 3, 7, 64] {
+                set_bf16_chunk_for_test(Some(chunk));
+                let mut got = vec![0f32; n];
+                lin.gemv_label_par_2row("bit", &x, &mut got, min)
+                    .unwrap_or_else(|e| panic!("{name}: chunk={chunk}: {e}"));
+                set_bf16_chunk_for_test(None);
+                assert_eq!(
+                    bits(&classic),
+                    bits(&got),
+                    "{name}: chunk={chunk} が classic とビット不一致"
+                );
+            }
+        }
+    }
+
+    /// task 93: BF16 融合 GEMV のチャンク数掃引 (`DENNO_BF16_CHUNK` の A/B 用)。
+    ///
+    /// 実機の乖離 (コンテナ 1 スレッド 0.107 ms vs 実機 8 スレッドで 0.238 ms) の
+    /// うち「チャンク粒度」と「スレッド取り合い」を切り分ける。実機は呼び出しごとに
+    /// 別の expert (6.55 MB) を読むので L3 に載らない — `mats` 本の独立な行列を
+    /// 轮回して DRAM 条件を作る (`mats=1` は同じ行列の再読み = L3 常駐条件で、
+    /// コンテナの 0.107 ms の条件)。`chunk=auto` は従来動作
+    /// (1 チャンクの行数 = n_out / rayon スレッド数)。
+    ///
+    /// `cargo test --release -p denno-engine --lib -- --ignored --nocapture bench_bf16_chunk_sweep`
+    #[test]
+    #[ignore = "実形状の CPU マイクロベンチ (手動)"]
+    fn bench_bf16_chunk_sweep() {
+        use crate::model::moe_expert::set_bf16_chunk_for_test;
+        use crate::model::qwen4exp::mix_kprof;
+        use crate::model::qwen4exp::HC_DOWN_ROW_PAR_MIN;
+        let _g = par_test_lock();
+        let reps = 24usize;
+        let bytes = 6_553_600f64; // 320 * 10240 * 2 (down / up とも同サイズ)
+        for (k, n, min, name, idx) in [
+            (10240usize, 320usize, HC_DOWN_ROW_PAR_MIN, "hc_down 10240->320", 0usize),
+            (320usize, 10240usize, 0usize, "hc_up 320->10240", 1usize),
+        ] {
+            let cpus = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(0);
+            println!("\n=== {name} (reps={reps}, cpus={cpus}) ===");
+            for mats in [1usize, 32] {
+                let lins: Vec<GgufLinear> = (0..mats)
+                    .map(|m| {
+                        let w = make_matrix(GgmlType::Bf16, k, n, (m as u32) * 17 + 3);
+                        GgufLinear::from_slice(GgmlType::Bf16, k, n, &w).expect("GgufLinear")
+                    })
+                    .collect();
+                let x = make_x(k, 13);
+                for th in [1usize, 8, 16] {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(th)
+                        .build()
+                        .expect("pool");
+                    pool.install(|| {
+                        for chunk in [0usize, 1, 2, 4, 8, 16, 32] {
+                            set_bf16_chunk_for_test(if chunk == 0 { None } else { Some(chunk) });
+                            let mut out = vec![0f32; n];
+                            for w in 0..4 {
+                                lins[w % mats]
+                                    .gemv_label_par_2row("sweep", &x, &mut out, min)
+                                    .expect("gemv");
+                            }
+                            // rowpar カウンタで chunks / wall / comp / par_eff を取る。
+                            mix_kprof::set_for_test(true);
+                            mix_kprof::reset();
+                            mix_kprof::rowpar::set_label(if idx == 0 {
+                                mix_kprof::rowpar::L_DOWN
+                            } else {
+                                mix_kprof::rowpar::L_UP
+                            });
+                            let mut best = f64::INFINITY;
+                            for r in 0..reps {
+                                let t = std::time::Instant::now();
+                                lins[r % mats]
+                                    .gemv_label_par_2row("sweep", &x, &mut out, min)
+                                    .expect("gemv");
+                                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                            }
+                            std::hint::black_box(&out);
+                            mix_kprof::rowpar::set_label(mix_kprof::rowpar::NONE);
+                            let (regions, fired, chunks, wall_ns, comp_ns) =
+                                mix_kprof::rowpar::stats(idx);
+                            let regions = regions.max(1);
+                            let wall_us = wall_ns as f64 / regions as f64 / 1e3;
+                            let comp_us = comp_ns as f64 / regions as f64 / 1e3;
+                            let par_eff = if wall_ns > 0 {
+                                comp_ns as f64 / wall_ns as f64
+                            } else {
+                                1.0
+                            };
+                            mix_kprof::reset();
+                            mix_kprof::set_for_test(false);
+                            set_bf16_chunk_for_test(None);
+                            println!(
+                                "mats={mats:>2} th={th:>2} chunk={:>4}  best={best:.3} ms \
+                                 ({:.1} GB/s)  rowpar regions={regions} fired={fired} \
+                                 chunks={:.1} wall={wall_us:.0}us comp={comp_us:.0}us \
+                                 par_eff={par_eff:.1}",
+                                if chunk == 0 {
+                                    "auto".to_string()
+                                } else {
+                                    chunk.to_string()
+                                },
+                                bytes / (best * 1e6),
+                                chunks as f64 / fired.max(1) as f64,
+                            );
+                        }
+                    });
+                }
+            }
+        }
+    }
+
     // ---- task 72: FusedLinear (同じ入力を取る投影の連結) ---------------------
 
     /// 上書きを必ず env 読みに戻す (panic しても戻る)。

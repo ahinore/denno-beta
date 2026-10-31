@@ -3943,6 +3943,10 @@ pub mod mix_kprof {
         static CHUNKS: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
         static WALL_NS: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
         static COMP_NS: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
+        /// task 93: 発火した region で `rayon::current_num_threads()` が返した値の合計
+        /// (発火 1 件あたりの平均を `th=` で出す。逐次 region は積まない)。
+        /// 実機の「プール スレッド数 > 物理コア数」(SMT の取り合い) を見るため。
+        static TH_SUM: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
 
         thread_local! {
             static LBL: std::cell::Cell<u8> = const { std::cell::Cell::new(NONE) };
@@ -3968,13 +3972,15 @@ pub mod mix_kprof {
 
         /// region を 1 件積む。`fired` は rayon で割れたか、`chunks` は分割チャンク数
         /// (逐次は 1)、`wall_ns` は region の壁時計、`comp_ns` はチャンク内の純計算
-        /// (`f`) の合計 (スレッド時間の合計)。
-        pub fn record(l: u8, fired: bool, chunks: usize, wall_ns: u64, comp_ns: u64) {
+        /// (`f`) の合計 (スレッド時間の合計)。`th` は発火 region の
+        /// `rayon::current_num_threads()` (逐次は 0 = 積まない)。
+        pub fn record(l: u8, fired: bool, chunks: usize, wall_ns: u64, comp_ns: u64, th: usize) {
             let i = (l as usize).saturating_sub(1).min(NL - 1);
             REGIONS[i].fetch_add(1, Ordering::Relaxed);
             if fired {
                 FIRED[i].fetch_add(1, Ordering::Relaxed);
                 CHUNKS[i].fetch_add(chunks as u64, Ordering::Relaxed);
+                TH_SUM[i].fetch_add(th as u64, Ordering::Relaxed);
             }
             WALL_NS[i].fetch_add(wall_ns, Ordering::Relaxed);
             COMP_NS[i].fetch_add(comp_ns, Ordering::Relaxed);
@@ -4000,6 +4006,7 @@ pub mod mix_kprof {
                 CHUNKS[i].store(0, Ordering::Relaxed);
                 WALL_NS[i].store(0, Ordering::Relaxed);
                 COMP_NS[i].store(0, Ordering::Relaxed);
+                TH_SUM[i].store(0, Ordering::Relaxed);
             }
         }
 
@@ -4016,8 +4023,16 @@ pub mod mix_kprof {
             } else {
                 1.0
             };
+            // task 93: th = 発火 region の rayon スレッド数の平均 (逐次 region は積まない)。
+            // chunks と並べて見ると「プール スレッド数 > chunks (物理コア数)」の
+            // SMT の取り合いが読める。
+            let th = if fired > 0 {
+                TH_SUM[i].load(Ordering::Relaxed) as f64 / fired as f64
+            } else {
+                0.0
+            };
             format!(
-                " | {name} regions={regions} fired={fired} chunks={:.1} wall={:.0}us \
+                " | {name} regions={regions} fired={fired} chunks={:.1} th={th:.1} wall={:.0}us \
                  comp={:.0}us par_eff={par_eff:.1}",
                 chunks as f64 / regions as f64,
                 per(wall_ns),
