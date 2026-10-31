@@ -679,3 +679,75 @@ fn indices_reject_empty_ctx() {
     let e = ng.indices(&[]).expect_err("空の ctx はエラー");
     assert!(e.to_string().contains("ctx"), "{e}");
 }
+
+// ---- P78: まとめ引き ---------------------------------------------------------
+
+/// 複数の窓をまとめて引いても、窓ごとの `gather` とビット一致する。
+///
+/// まとめ引きは行 index を昇順・重複排除で 1 行 1 回だけ読む。行のデコードは
+/// 同じ関数・同じバイト列なので、**I/O の順序と重複の有無では値が動かない**
+/// ことをここで固定する。窓は「同じ行が 2 つの窓に出る」「窓が完全に重複する」
+/// 「履歴が短い」を混ぜてある (小さな表なので衝突も起きる)。
+#[test]
+fn gather_many_matches_single_gather_bitwise() {
+    let (_d, f, _data) = open_small("gather_many", 0x1234_5678);
+    let ng = PleNgram::from_meta(&f).expect("from_meta");
+    let tref = f.tensor_ref(PLE_TABLE_NAME).expect("tensor_ref");
+    let ple = PleTable::open(&tref, &f).expect("PleTable::open");
+
+    let ctxs: Vec<Vec<u32>> = vec![
+        vec![7, 8, 9],
+        vec![8, 9, 10],
+        vec![9, 10, 11],
+        vec![7, 8, 9], // 完全な重複
+        vec![3],
+        vec![3, 3, 3],
+    ];
+    let refs: Vec<&[u32]> = ctxs.iter().map(|c| c.as_slice()).collect();
+    let flat = ng.gather_many(&ple, &refs).expect("gather_many");
+
+    let stride = ng.n_heads() * ple.n_dim();
+    assert_eq!(flat.len(), ctxs.len() * stride, "窓数 × n_heads × n_dim");
+    for (i, c) in ctxs.iter().enumerate() {
+        let one = ng.gather(&ple, c).expect("gather");
+        assert_eq!(one.len(), stride);
+        for d in 0..stride {
+            assert_eq!(
+                flat[i * stride + d].to_bits(),
+                one[d].to_bits(),
+                "窓 {i} (ctx {c:?}) の次元 {d}"
+            );
+        }
+    }
+}
+
+/// まとめ引きの行数は「窓ごとの行数 × 窓数」から重複を引いたもの。
+/// 表の行が 64 本しかないので、6 窓 × 16 本 = 96 本のうち必ず重複が出る。
+/// ここでは「重複を落としても値が変わらない」ことを上のテストで見ているので、
+/// ここでは空入力の扱いだけを固定する。
+#[test]
+fn gather_many_empty_is_empty() {
+    let (_d, f, _data) = open_small("gather_many_empty", 0x7777);
+    let ng = PleNgram::from_meta(&f).expect("from_meta");
+    let tref = f.tensor_ref(PLE_TABLE_NAME).expect("tensor_ref");
+    let ple = PleTable::open(&tref, &f).expect("PleTable::open");
+    let flat = ng.gather_many(&ple, &[]).expect("gather_many");
+    assert!(flat.is_empty(), "空の窓列で {} 要素が返った", flat.len());
+}
+
+/// 範囲外の行は窓ごとの gather と同じくエラー (黙って 0 にしない)。
+#[test]
+fn gather_many_rejects_out_of_range_rows() {
+    let (_d1, f_meta) = open_real("gather_many_oor_meta");
+    let ng = PleNgram::from_meta(&f_meta).expect("from_meta");
+    let (_d2, f_tab, _data) = open_small("gather_many_oor_tab", 0x9999);
+    let tref = f_tab.tensor_ref(PLE_TABLE_NAME).expect("tensor_ref");
+    let ple = PleTable::open(&tref, &f_tab).expect("PleTable::open");
+
+    let ctxs: Vec<Vec<u32>> = vec![vec![1, 2, 3], vec![100, 200, 300]];
+    let refs: Vec<&[u32]> = ctxs.iter().map(|c| c.as_slice()).collect();
+    let e = ng
+        .gather_many(&ple, &refs)
+        .expect_err("範囲外はエラー");
+    assert!(e.to_string().contains("範囲外"), "{e}");
+}

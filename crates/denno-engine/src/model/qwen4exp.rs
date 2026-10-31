@@ -43,6 +43,7 @@ use crate::model::hyper::{self, HyperParams, HyperStreams};
 use crate::model::linear_gguf::GgufLinear;
 use crate::model::moe::{select_topk, select_topk_into};
 use crate::model::moe_expert::{self, ExpertSlice};
+use crate::model::prekprof;
 use crate::ple::{PleNgram, PleTable, PLE_TABLE_NAME};
 use crate::quant::WeightBlocks;
 use crate::tensor::{silu_inplace, softmax};
@@ -2265,8 +2266,18 @@ impl Qwen4Exp {
         mut roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>> {
         let hp = self.hp();
+        // P78: 逐次 prefill の中だけ層の外を区間計測する (decode では false)。
+        let prof = prekprof::measuring();
+        let t_emb = prekprof::stamp_when(prof);
         let mut res = self.forward_embed(ctx, &hp)?;
+        prekprof::mark(t_emb, prekprof::EMBED);
+        let t_ple = prekprof::stamp_when(prof);
+        let f0 = if prof { prekprof::faults() } else { None };
         let ple_emb = self.gather_ple(ctx)?;
+        prekprof::mark(t_ple, prekprof::PLE);
+        if prof {
+            prekprof::note_fault_delta(f0);
+        }
 
         // P58: arch テレメトリが有効なら、呼び出し側が roles を渡していなくても
         // 役割 RMS を取る (RoleAct を送るため)。取るのは読むだけなので logits は
@@ -2274,6 +2285,7 @@ impl Qwen4Exp {
         let mut auto_roles = RoleRms::default();
         let auto = roles.is_none() && arch_frames_enabled();
 
+        let t_lay = prekprof::stamp_when(prof);
         for il in 0..self.p.n_layer {
             // P54: 役割別 RMS は層ごとに 0 から取り直す (観測しないときは None)。
             {
@@ -2311,7 +2323,9 @@ impl Qwen4Exp {
         }
 
         // 4. 最終 mixer (output_norm の代わり) + 5. logits
+        prekprof::mark(t_lay, prekprof::LAYER);
         let t_mix = headprof::stamp();
+        let t_fin = prekprof::stamp_when(prof);
         let cur = hc_mix_quant(
             &res,
             &self.head.norm,
@@ -2322,8 +2336,11 @@ impl Qwen4Exp {
         )?
         .0;
         headprof::mark(headprof::MIX, t_mix, 0);
+        prekprof::mark(t_fin, prekprof::FINAL_NORM);
         let mut logits = vec![0.0f32; self.head.output.n()];
+        let t_head = prekprof::stamp_when(prof);
         self.head_logits_into(&cur, &mut logits)?;
+        prekprof::mark(t_head, prekprof::HEAD);
         Ok(logits)
     }
 
@@ -2365,6 +2382,47 @@ impl Qwen4Exp {
             }
             None => Ok(None),
         }
+    }
+
+    /// チャンクぶんの PLE の行 gather をまとめて行う (P78)。
+    ///
+    /// `ctx[..]` は古い順の履歴で、`start..ctx.len()` の各トークンの窓を作る。
+    /// 戻り値は長さ `ctx.len() - start` で、PLE を持たないモデルでは全部 `None`。
+    ///
+    /// 窓ごとに [`Qwen4Exp::gather_ple`] を呼ぶのと値はビット一致する
+    /// ([`PleNgram::gather_many`] は I/O の順序だけを変える)。1 チャンクで
+    /// `トークン数 × 16` 本のランダムな 90 B pread をまとめて出すので、
+    /// 1 トークンずつ待つよりキューを深く使える。
+    fn gather_ple_many(&self, ctx: &[u32], start: usize) -> Result<Vec<Option<Vec<f32>>>> {
+        let nt = ctx.len().saturating_sub(start);
+        let rt = match &self.ple {
+            Some(rt) => rt,
+            None => return Ok(vec![None; nt]),
+        };
+        #[cfg(test)]
+        PLE_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let n_gram = rt.ngram.n_gram();
+        let mut wins: Vec<Vec<u32>> = Vec::with_capacity(nt);
+        for i in start..ctx.len() {
+            wins.push(ple_window(&ctx[..=i], n_gram));
+        }
+        let refs: Vec<&[u32]> = wins.iter().map(|w| w.as_slice()).collect();
+        let flat = rt
+            .ngram
+            .gather_many(&rt.table, &refs)
+            .map_err(|err| one(format!("PLE 索引: {err}")))?;
+        let stride = rt
+            .ngram
+            .n_heads()
+            .checked_mul(rt.table.n_dim())
+            .ok_or_else(|| one("PLE 索引: n_heads * n_dim がオーバーフロー"))?;
+        if flat.len() != nt * stride {
+            return Err(one(format!(
+                "PLE 索引: まとめ引きの長さ {} が nt {nt} * {stride} と違う",
+                flat.len()
+            )));
+        }
+        Ok(flat.chunks_exact(stride).map(|c| Some(c.to_vec())).collect())
     }
 
     /// 1 層ぶんの本体 (PLE 注入 → attention → MoE FFN)。
@@ -2585,6 +2643,8 @@ impl Qwen4Exp {
         on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
         roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>> {
+        // P78: 層の外の区間計測の分母 (prefill 回数とトークン数)。
+        prekprof::note_prefill(ctx.len());
         let logits = if batch && self.attn.layer_major_safe() {
             self.forward_prefill_batch_tapped(ctx, prefill_batch_chunk(), tokens, on_layer, roles)?
         } else {
@@ -2609,6 +2669,9 @@ impl Qwen4Exp {
         }
         let nt = ctx.len();
         let mut logits = Vec::new();
+        // P78: このループの間だけ `forward_token_at` の層の外の区間を積む
+        // (decode の `forward_token_at` は同じ関数なので、ガードで切り分ける)。
+        let _pf = prekprof::enter_prefill();
         for i in 0..nt {
             let want = match tokens {
                 TapTokens::All => true,
@@ -2673,16 +2736,41 @@ impl Qwen4Exp {
         let mut start = 0usize;
         // mix の要素演算の作業域 (実形で xn/gate 20 MB ずつ)。層ループの外で 1 回だけ持つ。
         let mut mx = MixScratch::default();
+        // P78: チャンクぶんの PLE を行単位でまとめて引くか (既定 on)。
+        let ple_batch = ple_batch_enabled();
         while start < ctx.len() {
             let end = (start + chunk).min(ctx.len());
             let nt = end - start;
             let mut ress: Vec<HyperStreams> = Vec::with_capacity(nt);
-            let mut ples: Vec<Option<Vec<f32>>> = Vec::with_capacity(nt);
+            // P78: embedding と PLE は層の外。区間を分けて積む。
+            let t_emb = prekprof::stamp();
             for i in start..end {
                 ress.push(self.forward_embed(&ctx[..=i], &hp)?);
-                ples.push(self.gather_ple(&ctx[..=i])?);
+            }
+            prekprof::mark(t_emb, prekprof::EMBED);
+            let t_ple = prekprof::stamp();
+            let f0 = if t_ple.is_some() {
+                prekprof::faults()
+            } else {
+                None
+            };
+            // P78: PLE の行 gather はチャンクぶんまとめて引く (既定 on、
+            // `DENNO_PLE_BATCH=0` で 1 トークンずつの旧経路)。値はビット一致。
+            let ples: Vec<Option<Vec<f32>>> = if ple_batch {
+                self.gather_ple_many(&ctx[..end], start)?
+            } else {
+                let mut v: Vec<Option<Vec<f32>>> = Vec::with_capacity(nt);
+                for i in start..end {
+                    v.push(self.gather_ple(&ctx[..=i])?);
+                }
+                v
+            };
+            prekprof::mark(t_ple, prekprof::PLE);
+            if t_ple.is_some() {
+                prekprof::note_fault_delta(f0);
             }
 
+            let t_lay = prekprof::stamp();
             for il in 0..n_layer {
                 let lw = &self.layers[il];
                 if q4prof::enabled() {
@@ -2839,6 +2927,7 @@ impl Qwen4Exp {
                     }
                 }
             }
+            prekprof::mark(t_lay, prekprof::LAYER);
 
             // 次のチャンクは自分の埋め込みから始まる (残差の持ち越しは無い)。
             last = ress.pop();
@@ -2863,6 +2952,7 @@ impl Qwen4Exp {
         // 4. 最終 mixer (output_norm の代わり) + 5. logits (最後のトークンだけ)
         let res = last.ok_or_else(|| one("ctx が空 (現在のトークンが無い)"))?;
         let t_mix = headprof::stamp();
+        let t_fin = prekprof::stamp();
         let cur = hc_mix_quant(
             &res,
             &self.head.norm,
@@ -2873,8 +2963,11 @@ impl Qwen4Exp {
         )?
         .0;
         headprof::mark(headprof::MIX, t_mix, 0);
+        prekprof::mark(t_fin, prekprof::FINAL_NORM);
         let mut logits = vec![0.0f32; self.head.output.n()];
+        let t_head = prekprof::stamp();
         self.head_logits_into(&cur, &mut logits)?;
+        prekprof::mark(t_head, prekprof::HEAD);
         Ok(logits)
     }
 }
@@ -5869,6 +5962,11 @@ pub(crate) static GEMV_BATCH_BLOCKDECODE_CALLS: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 pub(crate) static GEMV_BATCH_BLOCKED_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// テスト用: PLE のまとめ引き ([`Qwen4Exp::gather_ple_many`]) が走った回数。
+/// 経路の通過を数える (緑 = 経路が発動した証拠ではない)。
+#[cfg(test)]
+pub(crate) static PLE_BATCH_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// `DENNO_PREFILL_BATCH` の値の解釈 (純粋関数)。既定 (未設定) は無効。
 ///
@@ -5906,6 +6004,54 @@ fn prefill_batch_chunk() -> usize {
             .unwrap_or(512)
     })
 }
+
+/// `DENNO_PLE_BATCH` の値の解釈 (純粋関数)。**既定 on**。
+///
+/// `0` / `false` / `off` のときだけ無効 (トークンごとに 1 回ずつ引く旧経路)。
+/// どちらの経路も logits はビット一致する (行のデコードは同じ関数)。
+fn ple_batch_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => true,
+        Some(s) => {
+            !(s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off"))
+        }
+    }
+}
+
+/// PLE の行 gather をチャンクぶんまとめて引くか (`DENNO_PLE_BATCH`, 既定 on)。
+///
+/// まとめ引きは「行 index を全トークン分集める → 昇順・重複排除 → 1 行 1 回読む」
+/// だけなので、値はトークンごとの gather とビット一致する。逃げ道として
+/// `DENNO_PLE_BATCH=0` で旧経路に戻せる。
+fn ple_batch_enabled() -> bool {
+    #[cfg(test)]
+    {
+        match PLE_BATCH_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => return false,
+            1 => return true,
+            _ => {}
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ple_batch_from_value(std::env::var("DENNO_PLE_BATCH").ok().as_deref()))
+}
+
+/// テストが env を立てずに PLE のまとめ引きを on/off するための強制値
+/// (env は `OnceLock` なのでプロセス内で 1 回しか読めない)。`2` = 未設定。
+#[cfg(test)]
+static PLE_BATCH_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// テストから [`ple_batch_enabled`] を固定する (`None` で env の解釈に戻る)。
+#[cfg(test)]
+pub(crate) fn set_ple_batch_for_test(v: Option<bool>) {
+    let raw = match v {
+        None => 2u8,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    PLE_BATCH_FORCE.store(raw, std::sync::atomic::Ordering::Relaxed);
+}
+
 
 /// flat スケジューラの 1 行チャンク幅 (行数)。
 ///
@@ -11630,11 +11776,113 @@ mod tests {
             assert_bitwise_eq(&seq, &seq2, "逐次 prefill 2 回目");
 
             for chunk in [1usize, 3, 8] {
+                let p0 = PLE_BATCH_CALLS.load(Ordering::Relaxed);
                 let (bat, nb, ng) = run(&f, &ctx, true, chunk);
                 assert!(nb > 0, "chunk {chunk}: 層優先バッチ経路が発動していない");
                 assert!(ng > 0, "chunk {chunk}: バッチ GEMV が 1 回も走っていない");
+                // P78: PLE のまとめ引きが実際に走ったか (値の一致だけでは分からない)。
+                assert!(
+                    PLE_BATCH_CALLS.load(Ordering::Relaxed) > p0,
+                    "chunk {chunk}: PLE のまとめ引きが 1 回も走っていない"
+                );
                 assert_bitwise_eq(&seq, &bat, &format!("chunk {chunk}"));
             }
+            moe_expert::set_vnni_for_test(None);
+        }
+
+        /// `DENNO_PLE_BATCH` の解釈: **既定 on**、`0` / `false` / `off` だけ無効。
+        #[test]
+        fn ple_batch_gate_defaults_on() {
+            assert!(ple_batch_from_value(None), "未設定は既定で有効");
+            assert!(ple_batch_from_value(Some("1")));
+            assert!(ple_batch_from_value(Some("")), "空文字は既定 (有効) のまま");
+            assert!(!ple_batch_from_value(Some("0")));
+            assert!(!ple_batch_from_value(Some("false")));
+            assert!(!ple_batch_from_value(Some("OFF")), "大文字も無効");
+        }
+
+        /// P78: まとめ引き (既定) と 1 トークンずつの旧経路がビット一致し、
+        /// 分岐が実際に切り替わること (カウンタで通過を確認する)。
+        #[test]
+        fn prefill_ple_batch_off_matches_on() {
+            let _g = moe_test_guard();
+            moe_expert::set_vnni_for_test(Some(false));
+            let dir = TempDir::new("h2plebatch");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("合成モデルを開けない");
+            let ctx: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+
+            set_ple_batch_for_test(Some(true));
+            let p0 = PLE_BATCH_CALLS.load(Ordering::Relaxed);
+            let (on, _, _) = run(&f, &ctx, true, 8);
+            assert!(
+                PLE_BATCH_CALLS.load(Ordering::Relaxed) > p0,
+                "まとめ引きが 1 回も走っていない"
+            );
+
+            set_ple_batch_for_test(Some(false));
+            let p1 = PLE_BATCH_CALLS.load(Ordering::Relaxed);
+            let (off, _, _) = run(&f, &ctx, true, 8);
+            assert_eq!(
+                PLE_BATCH_CALLS.load(Ordering::Relaxed),
+                p1,
+                "off なのにまとめ引きが走った"
+            );
+
+            set_ple_batch_for_test(None);
+            assert_bitwise_eq(&on, &off, "まとめ引き on/off");
+            assert!(
+                on.iter().any(|&v| v != on[0]),
+                "logits が全要素同値 (経路の生死が分からない)"
+            );
+            moe_expert::set_vnni_for_test(None);
+        }
+
+        /// P78: `DENNO_PRE_KPROF` の区間計測が prefill で実際に積まれ、
+        /// decode (同じ `forward_token_at` を通る) では積まれないこと。
+        #[test]
+        fn prekprof_records_sections_in_prefill_only() {
+            let _g = moe_test_guard();
+            moe_expert::set_vnni_for_test(Some(false));
+            prekprof::set_for_test(true);
+            prekprof::reset();
+            let dir = TempDir::new("prekprof");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("合成モデルを開けない");
+            let ctx: Vec<u32> = vec![1, 2, 3, 4];
+            let mut m = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+
+            // 逐次 prefill (ガード経路) で embed / ple / layer が積まれる。
+            let _ = m.forward_prefill_with(&ctx, false).expect("逐次 prefill");
+            assert!(prekprof::ns(prekprof::EMBED) > 0, "embed 区間が積まれていない");
+            assert!(prekprof::ns(prekprof::PLE) > 0, "ple 区間が積まれていない");
+            assert!(prekprof::ns(prekprof::LAYER) > 0, "layer 区間が積まれていない");
+
+            // 同じ関数を通る decode では積まない (prefill のガードの外)。
+            let before = prekprof::ns(prekprof::PLE);
+            let _ = m.forward_token(&ctx).expect("decode");
+            assert_eq!(
+                prekprof::ns(prekprof::PLE),
+                before,
+                "decode で PLE 区間が積まれた"
+            );
+
+            // レポートは 2 行で、PLE の pread 統計と累積のリセットを行う。
+            let lines = prekprof::report("unit", ctx.len(), 1_000_000);
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(lines[0].starts_with("[pre-kprof] unit tok=4"), "{:?}", lines[0]);
+            assert!(!lines[1].contains(" rows=0 "), "PLE の行数が 0: {:?}", lines[1]);
+            assert_eq!(prekprof::ns(prekprof::PLE), 0, "report が累積を消していない");
+
+            // バッチ経路でも同じ区間が立つ (こちらはチャンク単位)。
+            prekprof::reset();
+            let _ = m.forward_prefill_batch(&ctx, 2).expect("バッチ prefill");
+            assert!(prekprof::ns(prekprof::EMBED) > 0, "バッチ: embed が積まれていない");
+            assert!(prekprof::ns(prekprof::PLE) > 0, "バッチ: ple が積まれていない");
+            assert!(prekprof::ns(prekprof::LAYER) > 0, "バッチ: layer が積まれていない");
+
+            prekprof::reset();
+            prekprof::set_for_test(false);
             moe_expert::set_vnni_for_test(None);
         }
 

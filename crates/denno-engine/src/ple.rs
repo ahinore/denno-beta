@@ -42,6 +42,7 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crate::gguf::{GgufFile, GgufValue, TensorRef};
 use crate::kquant::{self, GgmlType};
@@ -309,6 +310,9 @@ impl PleTable {
 
         // 連続 index のまとめ読み。1 回の pread は max_read バイト以下に切る。
         let max_rows_per_read = (self.max_read / self.row_bytes).max(1);
+        // P78: `DENNO_PRE_KPROF` のときだけ pread の回数・行数・バイト数を積む
+        // (off のときはここで atomic load 1 回、ループの中は何も増えない)。
+        let prof = crate::model::prekprof::on();
         let mut buf: Vec<u8> = Vec::new();
         let mut i = 0usize;
         while i < rows.len() {
@@ -334,6 +338,9 @@ impl PleTable {
                     "pread 失敗 (行 {start_row} から {run_rows} 行, off={off}, len={span}): {e}"
                 ));
             }
+            if prof {
+                crate::model::prekprof::note_ple_pread(run_rows, span);
+            }
             for (k, &r) in rows[i..j].iter().enumerate() {
                 let rb = (r as usize - start_row) * self.row_bytes;
                 let o = &mut out[(i + k) * self.n_dim..(i + k + 1) * self.n_dim];
@@ -345,10 +352,57 @@ impl PleTable {
         }
         Ok(())
     }
+
+    /// [`PleTable::gather_rows`] を `parts` 本に割って並列に読む (P78)。
+    ///
+    /// 行は独立 (1 行のデコードはその行のバイト列だけで閉じる) なので、分割して
+    /// も値は [`PleTable::gather_rows`] とビット一致する。90 B のランダム読みが
+    /// デバイスのキューに複数同時に乗るぶん、レイテンシ律速のときに効く。
+    /// エラーの**発生順**は並列度に依存する (どの行で落ちたかは同じ)。
+    ///
+    /// `parts <= 1` または行が 1 本以下なら [`PleTable::gather_rows`] に落ちる。
+    pub fn gather_rows_par(&self, rows: &[u32], out: &mut [f32], parts: usize) -> Result<()> {
+        let parts = parts.min(rows.len());
+        if parts <= 1 {
+            return self.gather_rows(rows, out);
+        }
+        let per = rows.len().div_ceil(parts);
+        use rayon::prelude::*;
+        let results: Vec<Result<()>> = out
+            .par_chunks_mut(per * self.n_dim)
+            .zip(rows.par_chunks(per))
+            .map(|(o, r)| self.gather_rows(r, o))
+            .collect();
+        for r in results {
+            r?;
+        }
+        Ok(())
+    }
 }
 
 /// PLE 表のテンソル名 (行索引が指す先)。
 pub const PLE_TABLE_NAME: &str = "per_layer_token_embd.weight";
+
+/// まとめ引き (`PleNgram::gather_many`) の並列度 (`DENNO_PLE_PAR`)。
+///
+/// 既定 8。`0` / `1` で逐次 (1 行 1 pread を順に出す)。行数が
+/// [`PLE_PAR_MIN_ROWS`] 未満のときは並列にしない (起動のほうが高い)。
+fn ple_par_parts(rows: usize) -> usize {
+    /// これ未満は並列にしない (1 回のまとめ引きの行数)。
+    const PLE_PAR_MIN_ROWS: usize = 64;
+    if rows < PLE_PAR_MIN_ROWS {
+        return 1;
+    }
+    static N: OnceLock<usize> = OnceLock::new();
+    let n = *N.get_or_init(|| {
+        std::env::var("DENNO_PLE_PAR")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.min(16))
+            .unwrap_or(8)
+    });
+    n.max(1)
+}
 
 /// n-gram 索引の異常値を弾くための上限。
 ///
@@ -606,20 +660,68 @@ impl PleNgram {
     ///
     /// 表の範囲外を指す索引は `gather_rows` がエラーにする (黙って 0 にしない)。
     pub fn gather(&self, table: &PleTable, ctx: &[u32]) -> Result<Vec<f32>> {
-        let idx = self.indices(ctx)?;
-        let mut rows = Vec::with_capacity(idx.len());
-        for (h, &r) in idx.iter().enumerate() {
-            if r < 0 {
-                return err(format!("ヘッド {h} の行 index {r} が負"));
-            }
-            rows.push(r as u32);
-        }
-        let want = rows
-            .len()
-            .checked_mul(table.n_dim())
+        self.gather_many(table, &[ctx])
+    }
+
+    /// 複数の窓をまとめて引く (P78)。
+    ///
+    /// `ctxs` の各要素は 1 つの窓 ([`PleNgram::gather`] に渡す `ctx` と同じもの)。
+    /// 戻り値は `[ctxs.len()][n_heads * n_dim]` の平坦な f32 で、窓の順に並ぶ。
+    ///
+    /// 窓ごとに `gather` を呼ぶのとの違いは **I/O の順序だけ**:
+    ///
+    /// 1. 全窓の行 index を集める (i32 の負値はここで弾く)
+    /// 2. 昇順に並べ、重複を落とす (同じ行を 2 回読まない)
+    /// 3. 1 行 1 回だけ読む (`parts > 1` ならキューに複数同時に載せる)
+    /// 4. 窓の順に配り直す
+    ///
+    /// 1 行のデコードは [`PleTable::gather_rows`] の同じ関数・同じバイト列なので、
+    /// 行の読み順・重複の有無に関わらず値は `gather` とビット一致する
+    /// (行長はブロック長の倍数 = 行境界がブロック境界に乗る)。
+    pub fn gather_many(&self, table: &PleTable, ctxs: &[&[u32]]) -> Result<Vec<f32>> {
+        let n_heads = self.n_heads();
+        let n_dim = table.n_dim();
+        let per_ctx = n_heads
+            .checked_mul(n_dim)
             .ok_or_else(|| PleError("n_heads * n_dim がオーバーフロー".into()))?;
-        let mut out = vec![0f32; want];
-        table.gather_rows(&rows, &mut out)?;
+        let total = ctxs
+            .len()
+            .checked_mul(per_ctx)
+            .ok_or_else(|| PleError("ctxs.len() * n_heads * n_dim がオーバーフロー".into()))?;
+        let mut out = vec![0f32; total];
+        if ctxs.is_empty() {
+            return Ok(out);
+        }
+
+        // 1. 窓ごとの行 index (出力と同じ順で並べる)。
+        let mut rows: Vec<u32> = Vec::with_capacity(ctxs.len() * n_heads);
+        for c in ctxs {
+            let idx = self.indices(c)?;
+            for (h, &r) in idx.iter().enumerate() {
+                if r < 0 {
+                    return err(format!("ヘッド {h} の行 index {r} が負"));
+                }
+                rows.push(r as u32);
+            }
+        }
+
+        // 2. 昇順 + 重複排除。同じ行は 1 回だけ読む。
+        let mut uniq = rows.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+
+        // 3. 表を 1 行 1 回だけ読む。
+        let parts = ple_par_parts(uniq.len());
+        let mut buf = vec![0f32; uniq.len() * n_dim];
+        table.gather_rows_par(&uniq, &mut buf, parts)?;
+
+        // 4. 窓の順に配り直す (binary_search は uniq が昇順なので必ず当たる)。
+        for (i, &r) in rows.iter().enumerate() {
+            let pos = uniq.binary_search(&r).map_err(|_| {
+                PleError(format!("行 {r} が重複排除の結果に無い (内部不整合)"))
+            })?;
+            out[i * n_dim..(i + 1) * n_dim].copy_from_slice(&buf[pos * n_dim..(pos + 1) * n_dim]);
+        }
         Ok(out)
     }
 }
