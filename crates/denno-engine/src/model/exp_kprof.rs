@@ -345,15 +345,17 @@ pub const K_VNNI: usize = 9;
 pub const K_GIQ_V1: usize = 10;
 /// カーネル実行先: prefill の AVX-512 gemm_iq_z (P85)。
 pub const K_GIQ_Z: usize = 11;
+/// カーネル実行先: Q2_0 融合 (task 95)。
+pub const K_Q2_0: usize = 12;
 /// カーネル実行先の種別数。
-pub const NKER: usize = 12;
+pub const NKER: usize = 13;
 /// カーネル実行先の名前 (レポート用)。
 pub const KERNEL_NAME: [&str; NKER] = [
     "scalar", "iq_v2", "iq_v3", "iq4xs", "q4k", "q6k", "q5k", "q5_1", "q8_0", "vnni", "giq_v1",
-    "giq_z",
+    "giq_z", "q2_0",
 ];
 /// 融合カーネル (型専用の AVX2 GEMV/GEMM) のスロット ([`path_of`] の分類用)。
-const KER_FUSED: [usize; 6] = [K_IQ4XS, K_Q4K, K_Q6K, K_Q5K, K_Q5_1, K_Q8_0];
+const KER_FUSED: [usize; 7] = [K_IQ4XS, K_Q4K, K_Q6K, K_Q5K, K_Q5_1, K_Q8_0, K_Q2_0];
 /// gemv_iq 系 (IQ 系ジェネリックカーネル、decode の v2/v3 と prefill の v1/z) のスロット。
 const KER_IQ: [usize; 4] = [K_IQ_V2, K_IQ_V3, K_GIQ_V1, K_GIQ_Z];
 
