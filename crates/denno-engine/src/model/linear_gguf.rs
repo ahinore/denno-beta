@@ -312,6 +312,12 @@ pub fn maybe_requant(l: GgufLinear) -> Result<GgufLinear> {
     if off || l.has_fused_kernel() {
         return Ok(l);
     }
+    // F32/F16/BF16 は作り直さない。ルータ (`ffn_gate_inp`)・norm・hc_inject など
+    // 小さな行列で、F32 のまま行並列 GEMV / GPU ルータ経路を使うほうが速く、
+    // 量子化すると数値も変わる (task 65 の経路が死ぬ)。
+    if matches!(l.ty(), GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16) {
+        return Ok(l);
+    }
     l.requant_to_q8_0()
 }
 
