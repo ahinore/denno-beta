@@ -19,8 +19,9 @@ use anyhow::{bail, Result};
 
 use crate::kquant::{dequant_row_into, GgmlType};
 use crate::model::moe_expert::{
-    expert_gemv, expert_gemv_q8_fast, expert_gemv_q8_fast_2row, expert_gemv_q8_fast_min,
-    expert_gemv_q8_fast_min_2row,
+    expert_gemv, expert_gemv_iq4xs, expert_gemv_iq4xs_2row, expert_gemv_iq4xs_min,
+    expert_gemv_iq4xs_min_2row, expert_gemv_q8_fast, expert_gemv_q8_fast_2row,
+    expert_gemv_q8_fast_min, expert_gemv_q8_fast_min_2row, iq4xs_fast_enabled,
 };
 use crate::quant::WeightBlocks;
 
@@ -648,6 +649,38 @@ impl GgufLinear {
                         )
                     } else {
                         expert_gemv_q8_fast_min(
+                            self.blocks.as_slice(),
+                            self.k,
+                            self.n,
+                            x,
+                            out,
+                            row_par_min,
+                        )
+                    };
+                }
+                // P89: IQ4_XS の融合カーネル (本番モデルの hc テンソルの実型)。
+                // fast_q8 分岐と同じ形で `two_row` / `row_par_min` を伝える。
+                // `DENNO_IQ4XS_FAST=0` で下の classic ([`expert_gemv`] 経由のスカラー)
+                // に戻る。値は classic とビット一致しない (内積の累積順が違う。相対
+                // 1e-6 程度)。
+                if self.ty == GgmlType::IQ4Xs && iq4xs_fast_enabled() {
+                    return if row_par_min == 0 {
+                        if two_row {
+                            expert_gemv_iq4xs_2row(self.blocks.as_slice(), self.k, self.n, x, out)
+                        } else {
+                            expert_gemv_iq4xs(self.blocks.as_slice(), self.k, self.n, x, out)
+                        }
+                    } else if two_row {
+                        expert_gemv_iq4xs_min_2row(
+                            self.blocks.as_slice(),
+                            self.k,
+                            self.n,
+                            x,
+                            out,
+                            row_par_min,
+                        )
+                    } else {
+                        expert_gemv_iq4xs_min(
                             self.blocks.as_slice(),
                             self.k,
                             self.n,
