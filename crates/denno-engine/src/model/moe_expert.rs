@@ -905,7 +905,11 @@ fn iq_kernel_v3() -> bool {
                 .map(str::trim)
                 .map(str::to_ascii_lowercase)
                 .as_deref(),
-            Some("v2") | Some("1row") | Some("off")
+            // 既定は v2。v3 は実機 (Swift-1.5 IQ3_S, 1196 tok) で
+            // prefill 79.4 -> 85.6 s (71 -> 77 ms/tok)、decode 246 -> 245 ms/tok
+            // と **prefill が 8 % 遅い**。マイクロベンチの 1.87 倍は L2 常駐の
+            // 重みでの話で、実機では出ない。`DENNO_IQ_KERNEL=v3` で戻せる。
+            Some("v3") | Some("ib") | Some("on")
         )
     })
 }
