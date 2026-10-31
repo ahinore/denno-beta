@@ -991,6 +991,7 @@ fn expert_gemv_inner(
                 crate::model::exp_kprof::K_IQ_V2
             };
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 ker,
@@ -1026,6 +1027,7 @@ fn expert_gemv_inner(
         #[cfg(target_arch = "x86_64")]
         {
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 crate::model::exp_kprof::K_IQ4XS,
@@ -1051,6 +1053,7 @@ fn expert_gemv_inner(
         #[cfg(target_arch = "x86_64")]
         {
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 crate::model::exp_kprof::K_Q4K,
@@ -1093,6 +1096,7 @@ fn expert_gemv_inner(
         #[cfg(target_arch = "x86_64")]
         {
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 crate::model::exp_kprof::K_Q6K,
@@ -1117,6 +1121,7 @@ fn expert_gemv_inner(
         #[cfg(target_arch = "x86_64")]
         {
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 crate::model::exp_kprof::K_Q5K,
@@ -1142,6 +1147,7 @@ fn expert_gemv_inner(
     // k 昇順のまま)。旧実装は 1 スレッドで全行を回していた。
 
     crate::model::exp_kprof::bump_kernel(
+        crate::model::exp_kprof::PH_DECODE,
         crate::model::exp_kprof::cur_mat(),
         ty.id(),
         crate::model::exp_kprof::K_SCALAR,
@@ -3740,6 +3746,7 @@ fn expert_gemv_any_inner(
     let res = match ty {
         GgmlType::Q5_1 => {
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 crate::model::exp_kprof::K_Q5_1,
@@ -3749,6 +3756,7 @@ fn expert_gemv_any_inner(
         // expert の Q8_0 は classic カーネルのまま (P84 の f16c 版は hc mix 専用)。
         GgmlType::Q8_0 => {
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 crate::model::exp_kprof::K_Q8_0,
@@ -3930,10 +3938,49 @@ pub(crate) fn gemm_rows(
     stride: usize,
     fused: bool,
 ) {
+    // task 95: `DENNO_EXP_KPROF=1` のときだけ prefill 位相として (行列, 型) ごとの
+    // 呼び出し数 / バイト / 時間を積む。既定 off では `stamp()` が `None` = 分岐なし。
+    // 行列 (`mat`) は呼び出し側 (moe_experts_flat) が `exp_kprof::set_mat` で立てる。
+    let prof = crate::model::exp_kprof::stamp();
+    let mat = crate::model::exp_kprof::cur_mat();
+    gemm_rows_disp(ty, rb, blocks, n_in, r0, r1, xs, m, out, stride, fused);
+    if let Some(t) = prof {
+        crate::model::exp_kprof::record_call_ph(
+            crate::model::exp_kprof::PH_PREFILL,
+            mat,
+            ty.id(),
+            (r1 - r0) * rb,
+            r1 - r0,
+            m,
+            t.elapsed(),
+        );
+    }
+}
+
+/// [`gemm_rows`] の本体 (経路の振り分けだけ。記録は包装側)。
+fn gemm_rows_disp(
+    ty: GgmlType,
+    rb: usize,
+    blocks: &[u8],
+    n_in: usize,
+    r0: usize,
+    r1: usize,
+    xs: &[f32],
+    m: usize,
+    out: *mut f32,
+    stride: usize,
+    fused: bool,
+) {
     #[cfg(target_arch = "x86_64")]
     {
         if fused && ty == GgmlType::Q8_0 && q8_0_fused_supported() {
             gemm_fused_fired();
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                crate::model::exp_kprof::K_Q8_0,
+            );
             // SAFETY: 引数は check_gemm_args が検証済み (n_in%32==0 は row_bytes が保証) で、
             // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
             // `out` は m*stride 要素ちょうど (debug_assert 済み)。
@@ -3942,18 +3989,36 @@ pub(crate) fn gemm_rows(
         }
         if fused && ty == GgmlType::Q5_1 && q8_0_fused_supported() {
             gemm_fused_fired();
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                crate::model::exp_kprof::K_Q5_1,
+            );
             // SAFETY: 同上 (Q5_1 のブロックは 32 要素 = 24 バイト)。
             unsafe { gemm_q5_1_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
             return;
         }
         if fused && ty == GgmlType::Q4K && q4k_fused_supported() {
             gemm_fused_fired();
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                crate::model::exp_kprof::K_Q4K,
+            );
             // SAFETY: 同上 (Q4_K は n_in%256==0 が row_bytes で保証される)。
             unsafe { gemm_q4k_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
             return;
         }
         if fused && ty == GgmlType::Q5K && q4k_fused_supported() && q5k_fast_enabled() {
             gemm_fused_fired();
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                crate::model::exp_kprof::K_Q5K,
+            );
             // SAFETY: 同上 (Q5_K は n_in%256==0 が row_bytes で保証される)。
             // ゲートは 1 行版 ([`expert_gemv_inner`] の Q5_K 分岐) と同じ
             // [`q5k_fast_enabled`]。`DENNO_Q5K_FAST=0` では 1 行版がスカラーへ落ちる
@@ -3991,6 +4056,18 @@ pub(crate) fn gemm_rows(
                 None
             };
             let v2_used = !z_used && v2 && matches!(iq_kind(ty), Some(2) | Some(3));
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                if z_used {
+                    crate::model::exp_kprof::K_GIQ_Z
+                } else if v2_used {
+                    crate::model::exp_kprof::K_IQ_V2
+                } else {
+                    crate::model::exp_kprof::K_GIQ_V1
+                },
+            );
             if v2_used {
                 gemm_iq_v2_fired();
             }
@@ -4026,6 +4103,12 @@ pub(crate) fn gemm_rows(
         }
     }
     let _ = fused;
+    crate::model::exp_kprof::bump_kernel(
+        crate::model::exp_kprof::PH_PREFILL,
+        crate::model::exp_kprof::cur_mat(),
+        ty.id(),
+        crate::model::exp_kprof::K_SCALAR,
+    );
     gemm_rows_scalar(ty, rb, blocks, n_in, r0, r1, xs, m, out, stride);
 }
 
@@ -5654,6 +5737,9 @@ pub(crate) fn gemm_rows_vnni(
             return false;
         }
         vnni_fired();
+        // task 95: `DENNO_EXP_KPROF=1` のときだけ prefill 位相 (VNNI 経路) を積む。
+        let prof = crate::model::exp_kprof::stamp();
+        let mat = crate::model::exp_kprof::cur_mat();
         // SAFETY: 上の検証で `blocks` の行数・`act` の形・`r0..r1` の範囲は確認済み。
         // `out` の指す先 (m * stride 要素以上) は呼び出し側の契約
         // ([`gemm_rows`] の Safety) と同じ。実行 CPU の機能は `vnni_supported` が見た。
@@ -5667,6 +5753,23 @@ pub(crate) fn gemm_rows_vnni(
                 }
                 _ => return false,
             }
+        }
+        if let Some(t) = prof {
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                mat,
+                ty.id(),
+                crate::model::exp_kprof::K_VNNI,
+            );
+            crate::model::exp_kprof::record_call_ph(
+                crate::model::exp_kprof::PH_PREFILL,
+                mat,
+                ty.id(),
+                (r1 - r0) * rb,
+                r1 - r0,
+                act.m,
+                t.elapsed(),
+            );
         }
         true
     }
@@ -10430,30 +10533,154 @@ mod exp_kprof_tests {
         let mut out = vec![0f32; n_out];
         expert_gemv_any_seq(GgmlType::Q6K, &blocks, n_in, n_out, &x, &mut out).unwrap();
 
-        let (c, b, rows, ns) = kp::ty_stats(kp::GATE, GgmlType::Q6K.id());
+        let (c, b, rows, ns) = kp::ty_stats(kp::PH_DECODE, kp::GATE, GgmlType::Q6K.id());
         assert_eq!(c, 1, "Q6_K gate の呼び出し数");
         assert_eq!(b, blocks.len() as u64, "Q6_K gate のバイト数");
         assert_eq!(rows, 64, "Q6_K gate の行数");
         assert!(ns > 0, "Q6_K gate の時間が積まれていない");
         assert_eq!(
-            kp::ty_kernel(kp::GATE, GgmlType::Q6K.id(), kp::K_Q6K),
+            kp::ty_kernel(kp::PH_DECODE, kp::GATE, GgmlType::Q6K.id(), kp::K_Q6K),
             1,
             "Q6_K が q6k カーネルとして数えられていない"
         );
-        assert_eq!(kp::ty_kernel(kp::GATE, GgmlType::Q6K.id(), kp::K_SCALAR), 0);
+        assert_eq!(kp::ty_kernel(kp::PH_DECODE, kp::GATE, GgmlType::Q6K.id(), kp::K_SCALAR), 0);
         // m 分布: 64 行はビン 6 (33..=64)。
-        assert_eq!(kp::ty_mbin(kp::GATE, GgmlType::Q6K.id(), 6), 1);
-        assert_eq!(kp::ty_mbin(kp::GATE, GgmlType::Q6K.id(), 5), 0);
+        assert_eq!(kp::ty_mbin(kp::PH_DECODE, kp::GATE, GgmlType::Q6K.id(), 6), 1);
+        assert_eq!(kp::ty_mbin(kp::PH_DECODE, kp::GATE, GgmlType::Q6K.id(), 5), 0);
 
         let line = kp::line().expect("on なのにレポートが無い");
         assert!(line.contains("Q6_K"), "型名が無い: {line}");
         assert!(line.contains("ker q6k=1"), "カーネル実行先が無い: {line}");
         assert!(line.contains("m 64:1"), "m 分布が無い: {line}");
+        // task 95: decode 位相のタグと経路の粗分類。
+        assert!(line.contains("d gate"), "decode 位相のタグが無い: {line}");
+        assert!(line.contains("d total"), "decode 位相の合計が無い: {line}");
+        assert!(line.contains("path=fused"), "経路が無い: {line}");
 
         kp::set_for_test(false);
         kp::set_mat(kp::OTHER);
         kp::reset();
         set_q6k_fast_for_test(None);
+    }
+
+    /// task 95: prefill (バッチ GEMM) 位相が (行列, 型) ごとに積まれること。
+    ///
+    /// decode 位相 ([`expert_gemv_any_seq`]) とは別スロットに出る。Q6_K には
+    /// バッチ融合カーネルが無いので [`gemm_rows`] はスカラー バッチ
+    /// ([`gemm_rows_scalar`]) を通る — その分岐が `path=scalar` / `ker scalar=1`
+    /// として見えることまで確かめる。
+    #[test]
+    fn exp_kprof_prefill_phase_counts_gemm_rows() {
+        let _g = kprof_lock();
+        let _m = moe_test_lock();
+        kp::set_for_test(false);
+        kp::reset();
+        kp::set_for_test(true);
+
+        // gate (Q6_K) を m=4 トークンで 1 回 (prefill のバッチ形)。
+        let (n_in, n_out, m) = (256usize, 64usize, 4usize);
+        let blocks = q6k_expert(n_in, n_out);
+        let xs: Vec<f32> = (0..m * n_in)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+            .collect();
+        kp::set_mat(kp::GATE);
+        let mut out = vec![0f32; m * n_out];
+        gemm_rows(
+            GgmlType::Q6K,
+            row_bytes(GgmlType::Q6K, n_in).unwrap(),
+            &blocks,
+            n_in,
+            0,
+            n_out,
+            &xs,
+            m,
+            out.as_mut_ptr(),
+            n_out,
+            true,
+        );
+
+        // prefill 位相に積まれている (呼び出し 1 / バイト = 1 expert 分 / 行 = n_out)。
+        let (c, b, rows, ns) = kp::ty_stats(kp::PH_PREFILL, kp::GATE, GgmlType::Q6K.id());
+        assert_eq!(c, 1, "prefill Q6_K gate の呼び出し数");
+        assert_eq!(b, blocks.len() as u64, "prefill Q6_K gate のバイト数");
+        assert_eq!(rows, n_out as u64, "prefill Q6_K gate の行数");
+        assert!(ns > 0, "prefill Q6_K gate の時間が積まれていない");
+        // Q6_K にはバッチ融合カーネルが無い -> スカラー バッチ。
+        assert_eq!(
+            kp::ty_kernel(kp::PH_PREFILL, kp::GATE, GgmlType::Q6K.id(), kp::K_SCALAR),
+            1,
+            "prefill Q6_K が scalar として数えられていない"
+        );
+        // m 分布はトークン数で振る (m=4 はビン 2 = 2..=4。ビン 1 は 2 まで)。
+        assert_eq!(kp::ty_mbin(kp::PH_PREFILL, kp::GATE, GgmlType::Q6K.id(), 2), 1);
+        assert_eq!(kp::ty_mbin(kp::PH_PREFILL, kp::GATE, GgmlType::Q6K.id(), 1), 0);
+        // decode 位相は触れていない。
+        assert_eq!(
+            kp::ty_stats(kp::PH_DECODE, kp::GATE, GgmlType::Q6K.id()).0,
+            0,
+            "prefill の記録が decode 位相に漏れている"
+        );
+
+        let line = kp::line().expect("on なのにレポートが無い");
+        assert!(line.contains("p gate"), "prefill 位相のタグが無い: {line}");
+        assert!(line.contains("p total"), "prefill 位相の合計が無い: {line}");
+        assert!(line.contains("path=scalar"), "経路が無い: {line}");
+
+        // VNNI 経路 (Q4_K) の記録も prefill 位相に載ること (CPU が対応するときだけ)。
+        // 出力値の正しさは vnni_gemm_matches_fused_kernels_within_tolerance が見る。
+        if vnni_supported() {
+            kp::reset();
+            let (n_in, n_out, m) = (256usize, 16usize, 5usize);
+            // Q4_K の 1 expert ぶん (内容は任意。ここでは記録の通過だけを見る)。
+            let rb = 144usize;
+            let mut blocks = vec![0u8; rb * n_out];
+            for r in 0..n_out {
+                let p = &mut blocks[r * rb..(r + 1) * rb];
+                p[0..2].copy_from_slice(&f16b(0.01));
+                p[2..4].copy_from_slice(&f16b(0.001));
+            }
+            let xs: Vec<f32> = (0..m * n_in)
+                .map(|i| ((i * 53 % 211) as f32 - 105.0) / 128.0)
+                .collect();
+            let mut q = vec![0i8; m * n_in];
+            let mut sc = vec![0f32; m * (n_in / 256)];
+            let mut gs = vec![0f32; m * (n_in / 32)];
+            quant_act_i8(&xs, m, n_in, 256, &mut q, &mut sc, &mut gs).unwrap();
+            let act = VnniAct {
+                q: &q,
+                sc: &sc,
+                gs: &gs,
+                m,
+                n_in,
+                blk: 256,
+            };
+            let mut got = vec![0f32; m * n_out];
+            let used = gemm_rows_vnni(
+                GgmlType::Q4K,
+                &blocks,
+                n_in,
+                0,
+                n_out,
+                &act,
+                got.as_mut_ptr(),
+                n_out,
+            );
+            assert!(used, "VNNI 経路が使われていない");
+            assert_eq!(
+                kp::ty_kernel(kp::PH_PREFILL, kp::GATE, GgmlType::Q4K.id(), kp::K_VNNI),
+                1,
+                "VNNI が prefill 位相に数えられていない"
+            );
+            assert_eq!(
+                kp::ty_stats(kp::PH_PREFILL, kp::GATE, GgmlType::Q4K.id()).0,
+                1,
+                "VNNI の呼び出しが prefill 位相に積まれていない"
+            );
+        }
+
+        kp::set_for_test(false);
+        kp::set_mat(kp::OTHER);
+        kp::reset();
     }
 }
 

@@ -6993,10 +6993,19 @@ fn moe_experts_flat(
                 blk,
             };
         }
-        for (ty, rb, w, dst, use_vnni) in [
-            (gty, rb_g, gs[pos], dst_a.get(), use_g),
-            (uty, rb_u, us[pos], dst_u.get(), use_u),
+        // task 95: `DENNO_EXP_KPROF=1` のとき、バッチ GEMM の型別記録が行列を
+        // 知る必要がある。off では `set_mat` が分岐 1 回で戻る。
+        for (mat, (ty, rb, w, dst, use_vnni)) in [
+            (
+                crate::model::exp_kprof::GATE,
+                (gty, rb_g, gs[pos], dst_a.get(), use_g),
+            ),
+            (
+                crate::model::exp_kprof::UP,
+                (uty, rb_u, us[pos], dst_u.get(), use_u),
+            ),
         ] {
+            crate::model::exp_kprof::set_mat(mat);
             if !(use_vnni && moe_expert::gemm_rows_vnni(ty, w, e, a, b, &act_g, dst, ff)) {
                 moe_expert::gemm_rows(ty, rb, w, e, a, b, x, m, dst, ff, true);
             }
@@ -7055,6 +7064,7 @@ fn moe_experts_flat(
         let m = ms[pos];
         let x = &act_r[off_a[pos]..off_a[pos] + m * ff];
         let dst = h_p.add(off_h[pos] + a);
+        crate::model::exp_kprof::set_mat(crate::model::exp_kprof::DOWN);
         moe_prefetch_task_ahead(&tb, i, 3, &ds, rb_d);
         // 前提は run_a と同じ (`[a, b)` は [0, n_out) の分割の 1 つ、領域は `m * stride` 以上)。
         if use_d {
