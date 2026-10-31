@@ -19,8 +19,9 @@ use anyhow::{bail, Result};
 
 use crate::kquant::{dequant_row_into, GgmlType};
 use crate::model::moe_expert::{
-    expert_gemv, expert_gemv_iq4xs, expert_gemv_iq4xs_2row, expert_gemv_iq4xs_min,
-    expert_gemv_iq4xs_min_2row, expert_gemv_par_min, expert_gemv_q8_fast,
+    bf16_fast_enabled, expert_gemv_bf16, expert_gemv_bf16_2row, expert_gemv_bf16_min,
+    expert_gemv_bf16_min_2row, expert_gemv, expert_gemv_iq4xs, expert_gemv_iq4xs_2row,
+    expert_gemv_iq4xs_min, expert_gemv_iq4xs_min_2row, expert_gemv_par_min, expert_gemv_q8_fast,
     expert_gemv_q8_fast_2row, expert_gemv_q8_fast_min, expert_gemv_q8_fast_min_2row,
     iq4xs_fast_enabled, PAR_MIN_ROWS,
 };
@@ -731,6 +732,25 @@ impl GgufLinear {
                     {
                         return Ok(());
                     }
+                }
+                // task 92: BF16 (hc mix の down/up 実型) は AVX2 融合カーネルへ。
+                // BF16 -> f32 変換は正確で、カーネルは積を i 昇順で逐次加算するので
+                // 下の classic (dequant + 逐次内積) と**ビット一致**する
+                // (`DENNO_BF16_FAST=0` で下に戻る。戻っても値は変わらない)。
+                // two_row / row_par_min は Q8_0 / IQ4_XS と同じ形で伝える (カーネルは
+                // もともと複数行を交互に回すので 2 行指定の有無で経路は変わらない)。
+                if self.ty == GgmlType::Bf16 && bf16_fast_enabled() {
+                    return if row_par_min == 0 {
+                        if two_row {
+                            expert_gemv_bf16_2row(b, self.k, self.n, x, out)
+                        } else {
+                            expert_gemv_bf16(b, self.k, self.n, x, out)
+                        }
+                    } else if two_row {
+                        expert_gemv_bf16_min_2row(b, self.k, self.n, x, out, row_par_min)
+                    } else {
+                        expert_gemv_bf16_min(b, self.k, self.n, x, out, row_par_min)
+                    };
                 }
                 // task 65: `DENNO_CPU_GEMV_PAR=1` のときだけ、行方向を rayon で分ける。
                 // 既定 off は従来経路 (下の feature="par" の分割も含めて 1 行も変えない)。

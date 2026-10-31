@@ -2767,6 +2767,322 @@ pub(crate) fn expert_gemv_iq4xs_min_2row(
     )
 }
 
+// ---- BF16 (hc mix の down/up 実型, task 92) --------------------------------
+//
+// 本番モデルの hc down/up は BF16 [k=10240, n=320] / [k=320, n=10240] (各 6.55 MB)
+// で、`GgufLinear` の無量子型経路 (dequant + [`dot_seq`]) が 1 呼び出し 0.68 ms
+// (実機 mix-kprof)。BF16 は f32 の上位 16 bit なので変換が正確に定義され、
+// **積を i 昇順で逐次加算する限り** AVX2 に持ち上げても [`dot_seq`] と丸め順序が
+// 同じままになる (FMA もレーン並列の部分和も使わない)。速度は、8 要素の dequant
+// (16 B ロード + シフト) と乗算をベクトルで行い、8 行ぶんの加算チェーンを交互に
+// 回して逐次加算のレイテンシを隠すことで出す (行ごとの値は classic とビット一致)。
+
+/// `DENNO_BF16_FAST` の値の解釈 (既定 on)。
+fn bf16_fast_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => true,
+        Some(s) => !(s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off")),
+    }
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+#[cfg(test)]
+static BF16_FAST_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト専用: BF16 融合経路の on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_bf16_fast_for_test(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    BF16_FAST_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_BF16_FAST` をプロセスで 1 回だけ読む (既定 on)。
+pub fn bf16_fast_enabled() -> bool {
+    #[cfg(test)]
+    match BF16_FAST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| bf16_fast_from_value(std::env::var("DENNO_BF16_FAST").ok().as_deref()))
+}
+
+/// テスト用: BF16 融合カーネルが実際に発火した回数。
+/// 「緑 = 経路が発動した証拠ではない」ので、発火の証拠としてはこのカウンタを見る。
+#[cfg(test)]
+pub(crate) static BF16_FUSED_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// bf16 16 バイト (8 要素) を f32 の 8 レーンへ開く。
+///
+/// bf16 は f32 の上位 16 bit なので、`u16` を `u32` に広げて 16 bit 左シフトする
+/// だけで正確 ([`crate::kquant::dequant_row_into`] の Bf16 枝と同じ式)。
+/// 端数・非正規・無限大もビットがそのまま写る (丸めは発生しない)。
+/// `target_feature` を付けずに `inline(always)` で呼び出し側 (AVX2 指定) に
+/// 畳み込む (`iq4xs_subblock_w` と同じ形)。
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn bf16_w8(p: *const u8) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let q = _mm_loadu_si128(p as *const __m128i);
+    _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(q), 16))
+}
+
+/// 8 レーンの積 `p` をレーン順 (0..8) で `acc` に逐次加算する。
+///
+/// 1 レーンずつ `_mm_add_ss` で足すので、`acc += w[i] * x[i]` の i 昇順と
+/// **丸め順序が完全に同じ**になる (ここが FMA / レーン並列部分和との違い)。
+/// 積 `p` の各レーンは 1 回の f32 乗算で、スカラーの `w[i] * x[i]` と同じ丸め。
+/// `target_feature` を付けずに `inline(always)` で呼び出し側 (AVX2 指定) に
+/// 畳み込む (`iq4xs_subblock_w` と同じ形)。
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn bf16_seq_add8(acc: f32, p: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castps256_ps128(p);
+    let hi = _mm256_extractf128_ps(p, 1);
+    let m2 = _mm_movehl_ps(lo, lo); // [lo2, lo3, ..]
+    let m3 = _mm_movehl_ps(hi, hi); // [hi2, hi3, ..]
+    let mut a = _mm_add_ss(_mm_set_ss(acc), lo); // lane 0
+    a = _mm_add_ss(a, _mm_shuffle_ps(lo, lo, 0x55)); // lane 1
+    a = _mm_add_ss(a, m2); // lane 2
+    a = _mm_add_ss(a, _mm_shuffle_ps(m2, m2, 0x55)); // lane 3
+    a = _mm_add_ss(a, hi); // lane 4
+    a = _mm_add_ss(a, _mm_shuffle_ps(hi, hi, 0x55)); // lane 5
+    a = _mm_add_ss(a, m3); // lane 6
+    a = _mm_add_ss(a, _mm_shuffle_ps(m3, m3, 0x55)); // lane 7
+    _mm_cvtss_f32(a)
+}
+
+/// `G` 行を同じ k 位置で交互に回す (行ごとの加算チェーンは独立なので、
+/// 逐次加算のレイテンシが G 本のチェーンで隠れる。P86 の 2 行カーネルと同じ発想)。
+///
+/// 行 1 本の計算は [`dot_seq`] と同じ「積を i 昇順で逐次加算」で、dequant を
+/// 行バッファに開かず 16 B の bf16 から直接行う (融合)。G 行で x の 8 要素
+/// ロードを共有する (classic が行ごとに読み直す x が 1/G になる)。
+/// k の 8 の端数はスカラー尾で `i` 昇順に足す (逐次経路と同じ順)。
+///
+/// # Safety
+///
+/// - `bp` から `rows * n_in * 2` バイト以上が読めること、`x.len() >= n_in`、
+///   `out.len() >= rows` であること (呼び出し側の `check_gemv_args` が保証)。
+/// - `rows` は `G` の倍数であること (呼び出し側で切り分ける)。
+/// - 実行 CPU が AVX2 を持つこと ([`q4k_fused_supported`] で確認する)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn gemv_bf16_rows_avx2<const G: usize>(
+    bp: *const u8,
+    n_in: usize,
+    rows: usize,
+    x: &[f32],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let rb = n_in * 2;
+    let xp = x.as_ptr();
+    let nv = n_in / 8; // 8 要素チャンク数
+    let tail = nv * 8;
+    let mut r = 0usize;
+    while r + G <= rows {
+        let row0 = bp.add(r * rb);
+        let mut acc = [0f32; G];
+        for c in 0..nv {
+            let xv = _mm256_loadu_ps(xp.add(c * 8));
+            for g in 0..G {
+                let w = bf16_w8(row0.add(g * rb + c * 16));
+                acc[g] = bf16_seq_add8(acc[g], _mm256_mul_ps(w, xv));
+            }
+        }
+        for g in 0..G {
+            let row = row0.add(g * rb);
+            let mut a = acc[g];
+            for j in tail..n_in {
+                let w = f32::from_bits(
+                    (u16::from_le_bytes([*row.add(j * 2), *row.add(j * 2 + 1)]) as u32) << 16,
+                );
+                a += w * *xp.add(j);
+            }
+            out[r + g] = a;
+        }
+        r += G;
+    }
+}
+
+/// BF16 の 1 expert ぶんの融合 GEMV ([`gemv_bf16_rows_avx2`] の行グループ配分)。
+///
+/// 8 行ずつ交互に回し、残りを 4 行 / 1 行で処理する。グループの分け方は
+/// 値に影響しない (行は独立で、1 行の累積順序はグループの大きさに依らない)。
+///
+/// # Safety
+///
+/// - `check_gemv_args` と同じ条件 (`blocks.len() == n_out * n_in * 2`、
+///   `x.len() == n_in`、`out.len() == n_out`) を呼び出し側が検証済みであること。
+/// - 実行 CPU が AVX2 を持つこと ([`q4k_fused_supported`] で確認する)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn gemv_bf16_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
+    let bp = blocks.as_ptr();
+    let rb = n_in * 2;
+    let n8 = n_out & !7usize;
+    if n8 > 0 {
+        gemv_bf16_rows_avx2::<8>(bp, n_in, n8, x, out);
+    }
+    let rest = n_out - n8;
+    let n4 = rest & !3usize;
+    if n4 > 0 {
+        gemv_bf16_rows_avx2::<4>(bp.add(n8 * rb), n_in, n4, x, &mut out[n8..]);
+    }
+    let rest2 = rest - n4;
+    if rest2 > 0 {
+        gemv_bf16_rows_avx2::<1>(
+            bp.add((n8 + n4) * rb),
+            n_in,
+            rest2,
+            x,
+            &mut out[n8 + n4..],
+        );
+    }
+}
+
+/// [`expert_gemv_bf16`] 系の本体。`par == false` なら行方向の rayon 並列を使わない。
+///
+/// `two_row` (hc mix の 2 行カーネル指定) は BF16 では値も経路も変えない:
+/// カーネルはもともと 8 行を交互に回すので、2 行指定はその部分集合になる
+/// (Q8_0 / IQ4_XS の 2 行専用カーネルに相当するものは持たない)。
+#[allow(clippy::too_many_arguments)]
+fn expert_gemv_bf16_inner(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    par: bool,
+    min_rows: usize,
+    min_chunk: usize,
+    _two_row: bool,
+) -> Result<()> {
+    let rb = check_gemv_args(GgmlType::Bf16, blocks, n_in, n_out, x, out)?;
+    if q4k_fused_supported() && bf16_fast_enabled() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            #[cfg(test)]
+            BF16_FUSED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: check_gemv_args が blocks/x/out の長さを検証済みで、
+            // q4k_fused_supported() が AVX2 (+FMA) の存在を実行時に確認している。
+            // 行は独立なので、チャンク分割しても各行の累積順序は変わらない。
+            for_each_row_chunk(blocks, n_out, rb, out, par, min_rows, min_chunk, |b, o| unsafe {
+                gemv_bf16_avx2(b, n_in, o.len(), x, o)
+            });
+            return Ok(());
+        }
+    }
+    // 退避路: classic (dequant + 逐次内積)。融合経路とビット一致する
+    // (BF16 -> f32 変換は正確で、積和の順序も同じ)。
+    gemv_scalar_body(GgmlType::Bf16, rb, blocks, n_in, n_out, x, out);
+    Ok(())
+}
+
+/// BF16 の 1 トークン融合 GEMV (task 92、hc mix の down/up 実型)。
+///
+/// 値は classic ([`expert_gemv_scalar`] = 1 行 dequant + [`dot_seq`]) と
+/// **ビット一致する** (BF16 -> f32 変換は正確で、カーネルは積を i 昇順で
+/// 逐次加算する。FMA もレーン並列の部分和も使わない)。
+/// `DENNO_BF16_FAST=0` で classic に戻る (戻っても値は変わらない)。
+pub fn expert_gemv_bf16(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    expert_gemv_bf16_inner(
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        true,
+        PAR_MIN_ROWS,
+        PAR_MIN_CHUNK_ROWS,
+        false,
+    )
+}
+
+/// [`expert_gemv_bf16`] の 2 行指定版 (hc mix の `_par_2row` 入口と同じ形)。
+/// 出力は 1 行版と**ビット一致**する (上の `_two_row` の説明を参照)。
+pub fn expert_gemv_bf16_2row(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    expert_gemv_bf16_inner(
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        true,
+        PAR_MIN_ROWS,
+        PAR_MIN_CHUNK_ROWS,
+        true,
+    )
+}
+
+/// [`expert_gemv_bf16`] の行並列しきい値を呼び出し側が決める版。
+/// 行は独立なので `min_rows` をどう選んでも出力はビット一致する。
+pub(crate) fn expert_gemv_bf16_min(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    min_rows: usize,
+) -> Result<()> {
+    expert_gemv_bf16_inner(
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        true,
+        min_rows,
+        PAR_MIN_CHUNK_ROWS_TIGHT,
+        false,
+    )
+}
+
+/// [`expert_gemv_bf16_min`] の 2 行指定版。
+pub(crate) fn expert_gemv_bf16_min_2row(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    min_rows: usize,
+) -> Result<()> {
+    expert_gemv_bf16_inner(
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        true,
+        min_rows,
+        PAR_MIN_CHUNK_ROWS_TIGHT,
+        true,
+    )
+}
+
 /// expert テンソルの量子型で GEMV を振り分ける (P-MOE-G1 で追加)。
 ///
 /// mmap 経路 ([`crate::model::qwen4exp`] の `ExpertW::gemv`) とキャッシュ経路
@@ -9873,3 +10189,266 @@ mod iq4xs_tests {
     }
 }
 
+
+/// task 92: BF16 融合 GEMV カーネル (`expert_gemv_bf16*`) の検証と発火確認。
+///
+/// 契約は P89 と同じ立て方で、classic に対しては**さらに強い**:
+/// 1. **classic との `to_bits()` 一致**。BF16 -> f32 変換は正確 (上位 16 bit の
+///    シフト) で、カーネルは積を i 昇順で逐次加算する ([`dot_seq`] と丸め順序が
+///    同じ。FMA もレーン並列の部分和も使わない)。
+/// 2. 1 行 / 8 行交互 / 4 行 / 1 行の端数 / 2 行指定 / 行並列しきい値 / スレッド数の
+///    差でも `to_bits()` 一致 (行は独立で 1 行の累積順序は不変)。
+/// 3. `DENNO_BF16_FAST=0` 相当 ([`set_bf16_fast_for_test`]) で classic に戻る
+///    (戻っても値は変わらない。発火は [`BF16_FUSED_CALLS`] で数える)。
+#[cfg(test)]
+mod bf16_tests {
+    use super::*;
+    use crate::kquant::dequant_row;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// AVX2 が無い環境では黙って緑にせず、理由を出して skip する。
+    fn fused_ready(what: &str) -> bool {
+        if q4k_fused_supported() {
+            return true;
+        }
+        eprintln!(
+            "skip {what}: この CPU には AVX2/FMA が無い (融合経路は選ばれず classic に落ちる)"
+        );
+        false
+    }
+
+    /// f32 を bf16 に落とす (llama.cpp と同じ切り捨て: bits >> 16)。
+    fn bf16_of(v: f32) -> u16 {
+        (v.to_bits() >> 16) as u16
+    }
+
+    /// `n_out * n_in` の合成 BF16 行列 (行・要素ごとに決定的な値)。
+    ///
+    /// 値は通常域 (±8192) に加えて、0 / -0 / 1 / -1 / f32 最小正規 / 大きい有限値
+    /// などの特殊ケースを数点混ぜる (変換がビット保存することを見るため)。
+    fn bf16_rows(n_in: usize, n_out: usize) -> Vec<u8> {
+        let mut v = vec![0u8; n_out * n_in * 2];
+        let specials = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            f32::from_bits(0x0080_0000), // f32 最小正規 (bf16 に落とすと 0)
+            f32::from_bits(0x7F7F_FFFF), // 大きい有限値
+        ];
+        for r in 0..n_out {
+            for i in 0..n_in {
+                let w = if (r.wrapping_mul(n_in) + i) % 211 == 0 {
+                    specials[(r + i) % specials.len()]
+                } else {
+                    let h = ((i.wrapping_mul(2_654_435_761)) ^ (r.wrapping_mul(40_503))) & 0xFF_FFFF;
+                    // bf16 に正確に表現できる値 (仮数 8 bit に収まるよう 2 の冪で縮める)
+                    let f = (h as f32 / 2_048.0 - 4_096.0) * 2.0;
+                    f
+                };
+                let bits = bf16_of(w);
+                v[(r * n_in + i) * 2..(r * n_in + i) * 2 + 2].copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        v
+    }
+
+    fn xvec(n_in: usize) -> Vec<f32> {
+        (0..n_in)
+            .map(|i| {
+                let m = i % 17;
+                match m {
+                    0 => 0.0,
+                    1 => -1.0e-6,
+                    2 => 1.0e6,
+                    _ => ((i * 37 % 101) as f32 - 50.0) / 64.0,
+                }
+            })
+            .collect()
+    }
+
+    /// (1) 融合カーネルが classic ([`expert_gemv_scalar`]) と `to_bits()` 一致する。
+    ///     発火もカウンタで確認する。実形 2 形 + 端数 (k % 8 != 0 / 奇数行) を含む。
+    #[test]
+    fn bf16_fused_matches_classic_bits() {
+        if !fused_ready("bf16_fused_matches_classic_bits") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_bf16_fast_for_test(Some(true));
+        // (k, n): down 実形 / up 実形 / 奇数行 / k 端数 / 最小形。
+        let shapes = [
+            ("down 実形", 10240usize, 320usize),
+            ("up 実形", 320usize, 10240usize),
+            ("奇数行", 320usize, 321usize),
+            ("k 端数 (k%8=7)", 23usize, 5usize),
+            ("1 チャンク + 端数行", 8usize, 9usize),
+        ];
+        for (name, k, n) in shapes {
+            let blocks = bf16_rows(k, n);
+            let x = xvec(k);
+            let mut fused = vec![0.0f32; n];
+            let mut classic = vec![0.0f32; n];
+
+            let before = BF16_FUSED_CALLS.load(Relaxed);
+            expert_gemv_bf16(&blocks, k, n, &x, &mut fused).unwrap();
+            let fired = BF16_FUSED_CALLS.load(Relaxed) - before;
+            expert_gemv_scalar(GgmlType::Bf16, &blocks, k, n, &x, &mut classic).unwrap();
+
+            assert!(fired >= 1, "{name}: 融合カーネルが発火していない");
+            assert!(
+                classic.iter().any(|v| *v != 0.0),
+                "{name}: classic 出力が全 0 (fixture が壊れた)"
+            );
+            for (r, (a, b)) in fused.iter().zip(classic.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name} 行 {r}: 融合 {} ({:#x}) が classic {} ({:#x}) とビット不一致",
+                    a,
+                    a.to_bits(),
+                    b,
+                    b.to_bits()
+                );
+            }
+        }
+        set_bf16_fast_for_test(None);
+    }
+
+    /// (2) one-hot な x で重み w_i を 1 出力に抜き出し、kquant 参照
+    ///     ([`crate::kquant::dequant_row`]) と `to_bits()` 比較する (P89 と同じ形)。
+    ///     逐次加算は `0.0 + w*1.0` を通るので ±0 の符号だけは「両方 0」を同一視する。
+    #[test]
+    fn bf16_fused_dequant_matches_kquant_reference() {
+        if !fused_ready("bf16_fused_dequant_matches_kquant_reference") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_bf16_fast_for_test(Some(true));
+        let (k, n) = (320usize, 8usize);
+        let blocks = bf16_rows(k, n);
+        let rb = row_bytes(GgmlType::Bf16, k).unwrap();
+        let ws: Vec<Vec<f32>> = (0..n)
+            .map(|r| dequant_row(GgmlType::Bf16, &blocks[r * rb..(r + 1) * rb], k))
+            .collect();
+        let mut out = vec![0.0f32; n];
+        for i in [0usize, 1, 7, 63, 159, 319] {
+            let mut x = vec![0.0f32; k];
+            x[i] = 1.0;
+            expert_gemv_bf16(&blocks, k, n, &x, &mut out).unwrap();
+            for r in 0..n {
+                let (kv, rw) = (out[r].to_bits(), ws[r][i].to_bits());
+                assert!(
+                    kv == rw || (out[r] == 0.0 && ws[r][i] == 0.0),
+                    "i={i} 行 {r}: カーネルの w {} ({kv:#x}) が kquant 参照 {} ({rw:#x}) と違う",
+                    out[r],
+                    ws[r][i]
+                );
+            }
+        }
+        assert!(
+            ws.iter().any(|w| w.iter().any(|v| *v != 0.0)),
+            "参照行が全 0 (fixture が壊れた)"
+        );
+        set_bf16_fast_for_test(None);
+    }
+
+    /// (3) 1 行版 / 2 行指定 / 行並列しきい値の差で `to_bits()` 一致。
+    #[test]
+    fn bf16_entries_and_row_split_bit_identical() {
+        if !fused_ready("bf16_entries_and_row_split_bit_identical") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_bf16_fast_for_test(Some(true));
+        let shapes = [
+            ("down 実形", 10240usize, 320usize),
+            ("up 実形", 320usize, 10240usize),
+        ];
+        for (name, k, n) in shapes {
+            let blocks = bf16_rows(k, n);
+            let x = xvec(k);
+            let mut base = vec![0.0f32; n];
+            expert_gemv_bf16(&blocks, k, n, &x, &mut base).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            let base = bits(&base);
+
+            let mut two = vec![0.0f32; n];
+            expert_gemv_bf16_2row(&blocks, k, n, &x, &mut two).unwrap();
+            assert_eq!(bits(&two), base, "{name}: 2 行指定が 1 行版とビット不一致");
+
+            for min_rows in [16usize, 64, PAR_MIN_ROWS] {
+                let mut m = vec![0.0f32; n];
+                expert_gemv_bf16_min(&blocks, k, n, &x, &mut m, min_rows).unwrap();
+                assert_eq!(
+                    bits(&m),
+                    base,
+                    "{name}: min_rows={min_rows} が 1 行版とビット不一致"
+                );
+                let mut mt = vec![0.0f32; n];
+                expert_gemv_bf16_min_2row(&blocks, k, n, &x, &mut mt, min_rows).unwrap();
+                assert_eq!(
+                    bits(&mt),
+                    base,
+                    "{name}: min_rows={min_rows} の 2 行指定が 1 行版とビット不一致"
+                );
+            }
+        }
+        set_bf16_fast_for_test(None);
+    }
+
+    /// (4) スレッド数 (行チャンク分割) が変わっても値は動かない。
+    #[test]
+    #[cfg(feature = "par")]
+    fn bf16_row_parallel_threads_bit_identical() {
+        if !fused_ready("bf16_row_parallel_threads_bit_identical") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_bf16_fast_for_test(Some(true));
+        let (k, n) = (320usize, 1024usize);
+        let blocks = bf16_rows(k, n);
+        let x = xvec(k);
+        let mut want = vec![0.0f32; n];
+        expert_gemv_bf16(&blocks, k, n, &x, &mut want).unwrap();
+        let want: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+        for threads in [1usize, 2, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            let mut got = vec![0.0f32; n];
+            pool.install(|| {
+                expert_gemv_bf16_min(&blocks, k, n, &x, &mut got, 1).unwrap();
+            });
+            let got: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(want, got, "{threads} スレッドでビット不一致");
+        }
+        set_bf16_fast_for_test(None);
+    }
+
+    /// (5) `DENNO_BF16_FAST=0` 相当で classic に戻る (発火しない・値も同じ)。
+    #[test]
+    fn bf16_gate_off_falls_back_to_classic() {
+        let _g = moe_test_lock();
+        set_bf16_fast_for_test(Some(false));
+        let (k, n) = (320usize, 9usize);
+        let blocks = bf16_rows(k, n);
+        let x = xvec(k);
+        let mut a = vec![0.0f32; n];
+        let before = BF16_FUSED_CALLS.load(Relaxed);
+        expert_gemv_bf16(&blocks, k, n, &x, &mut a).unwrap();
+        assert_eq!(
+            BF16_FUSED_CALLS.load(Relaxed),
+            before,
+            "gate off で融合カーネルが発火した"
+        );
+        let mut b = vec![0.0f32; n];
+        expert_gemv_scalar(GgmlType::Bf16, &blocks, k, n, &x, &mut b).unwrap();
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&a), bits(&b), "退避路の出力が classic とビット不一致");
+        set_bf16_fast_for_test(None);
+    }
+}
