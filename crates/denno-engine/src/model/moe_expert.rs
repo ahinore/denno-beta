@@ -606,7 +606,7 @@ unsafe fn gemv_q8_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
 /// `h` はブロック内の 8 要素グループ番号で、`h * 8` 要素目から始まる。
 /// 係数 (`d` やスケール) を掛けた**重み値そのもの**を返す。
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::missing_safety_doc)]
 unsafe fn iq_vec8<const KIND: u8>(p: *const u8, h: usize) -> std::arch::x86_64::__m256 {
