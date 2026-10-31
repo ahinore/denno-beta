@@ -337,6 +337,7 @@ fn ggml_type_name(ty: GgmlType) -> &'static str {
         GgmlType::Bf16 => "BF16",
         GgmlType::Tq1_0 => "TQ1_0",
         GgmlType::Mxfp4 => "MXFP4",
+        GgmlType::Q2_0 => "Q2_0",
     }
 }
 
@@ -368,6 +369,7 @@ fn ggml_type_id(ty: GgmlType) -> u32 {
         GgmlType::Bf16 => 30,
         GgmlType::Tq1_0 => 34,
         GgmlType::Mxfp4 => 39,
+        GgmlType::Q2_0 => 42,
     }
 }
 
