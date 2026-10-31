@@ -6500,6 +6500,9 @@ fn moe_experts_flat(
     if n == 0 {
         return Ok(());
     }
+    // P85: kprof に expert 数を積む (0 トークンの expert はここで落ちるので
+    // 呼び出し側で数える。off のときは no-op)。
+    crate::model::gemm_iq_kprof::record_experts(n, by_expert.len());
 
     // フェーズ内訳 (`DENNO_MOE_FLAT_PHASE=1` のときだけ stderr へ出す)。
     let ph = std::env::var_os("DENNO_MOE_FLAT_PHASE").is_some();
