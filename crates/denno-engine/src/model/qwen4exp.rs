@@ -10921,6 +10921,47 @@ mod tests {
             mix_kprof::set_for_test(false);
         }
 
+        /// P86: 実機で起きていたこと (GPU GEMV が hc mix の down / up を奪い、
+        /// CPU の行並列が一度も走らない = `regions=0`) を GPU 無しで再現し、
+        /// two_row のバイパスで CPU に落ちることを確かめる (cuda ビルドのみ)。
+        ///
+        /// intercept は `maybe_gpu_gguf_gemv_into` を「GPU が取った」ことにする
+        /// (out を書かない)。旧コードでは fast 経路の down / up がここで消えて
+        /// mixed が作業域の残骸になる。修正後は 2 行カーネルで計算されるので
+        /// 旧経路 (CPU) とビット一致し、rowpar region が down / up で 1 回ずつ
+        /// 積まれる。inject は plain 入口のまま intercept に奪われるので比較しない
+        /// (intercept は値を作らない。実機の GPU なら実値が入る)。
+        #[cfg(feature = "cuda")]
+        #[test]
+        fn hc_mix_quant_reaches_cpu_2row_even_when_gpu_intercepts() {
+            use crate::cuda::GemvInterceptGuard;
+            use mix_kprof::rowpar;
+
+            let (hp, norm, down, up, inject, res) = mix_q8_case(2, 320, 320);
+            let (m_ref, _i_ref) =
+                hc_mix_quant_ref(&res, &norm, &down, &up, Some(&inject), &hp).expect("ref");
+            let before = crate::model::linear_gguf::TWO_ROW_CPU_CALLS
+                .load(std::sync::atomic::Ordering::Relaxed);
+
+            let _g = GemvInterceptGuard::new();
+            mix_kprof::set_for_test(true);
+            mix_kprof::reset();
+            let (m, _i) = hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            assert_bitwise_eq(&m, &m_ref, "intercept 下の高速経路 (mixed)");
+            let (rd, fd, ..) = rowpar::stats(rowpar::L_DOWN as usize - 1);
+            let (ru, fu, ..) = rowpar::stats(rowpar::L_UP as usize - 1);
+            assert_eq!((rd, fd), (1, 1), "down が CPU の行並列 region に届いていない");
+            assert_eq!((ru, fu), (1, 1), "up が CPU の行並列 region に届いていない");
+            assert_eq!(
+                crate::model::linear_gguf::TWO_ROW_CPU_CALLS
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                before + 2,
+                "down / up の two_row 呼び出しが CPU に届いていない"
+            );
+            mix_kprof::reset();
+            mix_kprof::set_for_test(false);
+        }
+
         /// 実形状 (hc=4 / n_embd=2560 / low_rank=320 / Q8_0 + fast_q8) の
         /// `hc_mix_quant` 1 呼び出しと区間内訳。手動実行:
         /// `cargo test --release -p denno-engine --lib --features cuda -- --ignored --nocapture bench_hc_mix_quant`
