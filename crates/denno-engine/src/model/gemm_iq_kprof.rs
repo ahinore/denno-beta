@@ -33,14 +33,25 @@ pub const BUCKET_NAME: [&str; NBUCKET] =
 
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static CALLS_V2: AtomicU64 = AtomicU64::new(0);
+static CALLS_Z: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 static MACS: AtomicU64 = AtomicU64::new(0);
 static NS: AtomicU64 = AtomicU64::new(0);
 static M_SUM: AtomicU64 = AtomicU64::new(0);
 static M_MAX: AtomicU64 = AtomicU64::new(0);
+static M_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
 static BUCKET_CALLS: [AtomicU64; NBUCKET] = const { [const { AtomicU64::new(0) }; NBUCKET] };
 static DEQ_TICKS: AtomicU64 = AtomicU64::new(0);
 static FMA_TICKS: AtomicU64 = AtomicU64::new(0);
+static WRITE_TICKS: AtomicU64 = AtomicU64::new(0);
+/// m ビンごとの dequant / fma ticks (P85)。`add_deq` / `add_fma` が `m` を
+/// 受けて振り分ける。書き込み区間は行単位でサンプルするのでビンに切らない。
+static BUCKET_DEQ: [AtomicU64; NBUCKET] = const { [const { AtomicU64::new(0) }; NBUCKET] };
+static BUCKET_FMA: [AtomicU64; NBUCKET] = const { [const { AtomicU64::new(0) }; NBUCKET] };
+/// expert の数 (flat スケジューラが層ごとに 1 回積む)。
+/// `nonempty` = トークンを 1 個以上受け取った expert、total = 層の全 expert。
+static EXP_NONEMPTY: AtomicU64 = AtomicU64::new(0);
+static EXP_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// 計測が有効か (既定 off)。`DENNO_GEMM_IQ_KPROF` が立っているときだけ true。
 #[inline]
@@ -80,11 +91,12 @@ pub fn bucket(m: usize) -> usize {
 
 /// gemm_iq 系カーネル 1 呼び出しぶんの実測を積む。
 ///
-/// `v2` は新経路 ([`gemm_iq_v2`]) で回ったか、`bytes` は読んだ重みのバイト数
+/// `v2` は AVX2 の新経路 ([`gemm_iq_v2`])、`z` は AVX-512 版
+/// ([`gemm_iq_z`]) で回ったか、`bytes` は読んだ重みのバイト数
 /// (`(r1-r0) * row_bytes`)、`macs` は `m * n_in * (r1-r0)`、`ns` は呼び出しの
 /// 経過時間 (スレッドごとに積む)。
 #[inline]
-pub fn record(v2: bool, bytes: usize, macs: usize, m: usize, ns: u64) {
+pub fn record(v2: bool, z: bool, bytes: usize, macs: usize, m: usize, ns: u64) {
     if !on() {
         return;
     }
@@ -92,27 +104,54 @@ pub fn record(v2: bool, bytes: usize, macs: usize, m: usize, ns: u64) {
     if v2 {
         CALLS_V2.fetch_add(1, Ordering::Relaxed);
     }
+    if z {
+        CALLS_Z.fetch_add(1, Ordering::Relaxed);
+    }
     BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
     MACS.fetch_add(macs as u64, Ordering::Relaxed);
     NS.fetch_add(ns, Ordering::Relaxed);
     M_SUM.fetch_add(m as u64, Ordering::Relaxed);
     M_MAX.fetch_max(m as u64, Ordering::Relaxed);
+    M_MIN.fetch_min(m as u64, Ordering::Relaxed);
     BUCKET_CALLS[bucket(m)].fetch_add(1, Ordering::Relaxed);
 }
 
-/// v2 カーネルの dequant 区間 (タイル生成) の ticks を積む。
+/// flat スケジューラが層ごとに 1 回積む expert 数。
+/// `nonempty` = トークン 1 個以上を持った expert、`total` = 層の全 expert。
+/// 0 トークンの expert は `gemm_rows` まで来ないので、呼び出し側で数える。
 #[inline]
-pub fn add_deq(ticks: u64) {
+pub fn record_experts(nonempty: usize, total: usize) {
     if on() {
-        DEQ_TICKS.fetch_add(ticks, Ordering::Relaxed);
+        EXP_NONEMPTY.fetch_add(nonempty as u64, Ordering::Relaxed);
+        EXP_TOTAL.fetch_add(total as u64, Ordering::Relaxed);
     }
 }
 
-/// v2 カーネルの fma 区間 (タイルを m トークンに配る) の ticks を積む。
+/// v2 系カーネルの dequant 区間 (タイル生成) の ticks を積む。
+/// `m` はその呼び出しの expert あたりトークン数 (ビン集計用)。
 #[inline]
-pub fn add_fma(ticks: u64) {
+pub fn add_deq(ticks: u64, m: usize) {
+    if on() {
+        DEQ_TICKS.fetch_add(ticks, Ordering::Relaxed);
+        BUCKET_DEQ[bucket(m)].fetch_add(ticks, Ordering::Relaxed);
+    }
+}
+
+/// v2 系カーネルの fma 区間 (タイルを m トークンに配る) の ticks を積む。
+#[inline]
+pub fn add_fma(ticks: u64, m: usize) {
     if on() {
         FMA_TICKS.fetch_add(ticks, Ordering::Relaxed);
+        BUCKET_FMA[bucket(m)].fetch_add(ticks, Ordering::Relaxed);
+    }
+}
+
+/// v2 系カーネルの書き込み区間 (行末の横加算 + out store) の ticks を積む。
+/// 行単位でサンプルする (呼び出し側が `SAMPLE_EVERY` 行に 1 回)。
+#[inline]
+pub fn add_write(ticks: u64, _m: usize) {
+    if on() {
+        WRITE_TICKS.fetch_add(ticks, Ordering::Relaxed);
     }
 }
 
@@ -152,20 +191,29 @@ fn ticks_to_ns(ticks: u64) -> f64 {
 }
 
 /// 内訳を 1 行の文字列にする。無効時・実測ゼロのときは `None` (出力ゼロ)。
+///
+/// P85 で足した区間: `m min` / `nonempty` (トークンを持った expert 数) /
+/// `write` (行末の横加算 + store、行サンプル) / ビンごとの dequant 比
+/// (`dm=` 以下、calls>0 のビンだけ出す。fma 比は 100 - deq - write に当たる)。
 pub fn line() -> Option<String> {
     if !on() {
         return None;
     }
     let calls = CALLS.load(Ordering::Relaxed);
-    if calls == 0 {
+    let deq_t = DEQ_TICKS.load(Ordering::Relaxed);
+    let fma_t = FMA_TICKS.load(Ordering::Relaxed);
+    let wr_t = WRITE_TICKS.load(Ordering::Relaxed);
+    if calls == 0 && deq_t + fma_t + wr_t == 0 {
         return None;
     }
     let v2 = CALLS_V2.load(Ordering::Relaxed);
+    let zc = CALLS_Z.load(Ordering::Relaxed);
     let bytes = BYTES.load(Ordering::Relaxed);
     let macs = MACS.load(Ordering::Relaxed);
     let ns = NS.load(Ordering::Relaxed);
     let m_sum = M_SUM.load(Ordering::Relaxed);
     let m_max = M_MAX.load(Ordering::Relaxed);
+    let m_min = M_MIN.load(Ordering::Relaxed);
     let cpu_ms = ns as f64 / 1e6;
     let gbs = if ns > 0 {
         bytes as f64 / (ns as f64 / 1e9) / 1e9
@@ -173,13 +221,30 @@ pub fn line() -> Option<String> {
         0.0
     };
     let mut s = format!(
-        "[giq-kprof] calls={calls} v2={v2} bytes={:.1} MB macs={:.2} G cpu={cpu_ms:.1} ms \
-         (cpu_sum 換算 {:.2} GB/s) | m mean={:.1} max={m_max} [",
+        "[giq-kprof] calls={calls} v2={v2} z={zc} bytes={:.1} MB macs={:.2} G cpu={cpu_ms:.1} ms \
+         (cpu_sum 換算 {:.2} GB/s) | m min={} mean={:.1} max={m_max}",
         bytes as f64 / 1e6,
         macs as f64 / 1e9,
         gbs,
-        m_sum as f64 / calls as f64
+        if calls > 0 && m_min != u64::MAX {
+            m_min.to_string()
+        } else {
+            "-".to_string()
+        },
+        if calls > 0 {
+            m_sum as f64 / calls as f64
+        } else {
+            0.0
+        }
     );
+    let (ne, tot) = (
+        EXP_NONEMPTY.load(Ordering::Relaxed),
+        EXP_TOTAL.load(Ordering::Relaxed),
+    );
+    if tot > 0 {
+        s.push_str(&format!(" nonempty={ne}/{tot}"));
+    }
+    s.push_str(" [");
     for (i, name) in BUCKET_NAME.iter().enumerate() {
         if i > 0 {
             s.push(' ');
@@ -187,17 +252,35 @@ pub fn line() -> Option<String> {
         s.push_str(&format!("{name}:{}", BUCKET_CALLS[i].load(Ordering::Relaxed)));
     }
     s.push(']');
-    let deq = DEQ_TICKS.load(Ordering::Relaxed);
-    let fma = FMA_TICKS.load(Ordering::Relaxed);
-    if deq + fma > 0 {
-        let d = ticks_to_ns(deq) * SAMPLE_EVERY as f64 / 1e6;
-        let f = ticks_to_ns(fma) * SAMPLE_EVERY as f64 / 1e6;
-        let pct = |v: f64| if d + f > 0.0 { v * 100.0 / (d + f) } else { 0.0 };
+    let wr = wr_t; // 行サンプル: SAMPLE_EVERY 行に 1 回
+    if deq_t + fma_t > 0 {
+        let d = ticks_to_ns(deq_t) * SAMPLE_EVERY as f64 / 1e6;
+        let f = ticks_to_ns(fma_t) * SAMPLE_EVERY as f64 / 1e6;
+        let w = ticks_to_ns(wr) * SAMPLE_EVERY as f64 / 1e6;
+        let sum = d + f + w;
+        let pct = |v: f64| if sum > 0.0 { v * 100.0 / sum } else { 0.0 };
         s.push_str(&format!(
-            " | dequant {d:.1} ms ({:.0}%) fma {f:.1} ms ({:.0}%)",
+            " | dequant {d:.1} ms ({:.0}%) fma {f:.1} ms ({:.0}%) write {w:.1} ms ({:.0}%)",
             pct(d),
-            pct(f)
+            pct(f),
+            pct(w)
         ));
+        // m ビンごとの dequant 比 (calls>0 のビンだけ)。
+        let mut parts: Vec<String> = Vec::new();
+        for i in 0..NBUCKET {
+            let c = BUCKET_CALLS[i].load(Ordering::Relaxed);
+            if c == 0 {
+                continue;
+            }
+            let bd = BUCKET_DEQ[i].load(Ordering::Relaxed) as f64 * SAMPLE_EVERY as f64;
+            let bf = BUCKET_FMA[i].load(Ordering::Relaxed) as f64 * SAMPLE_EVERY as f64;
+            if bd + bf > 0.0 {
+                parts.push(format!("{}:{:.0}%", BUCKET_NAME[i], bd * 100.0 / (bd + bf)));
+            }
+        }
+        if !parts.is_empty() {
+            s.push_str(&format!(" | deq%/m [{}]", parts.join(" ")));
+        }
     }
     Some(s)
 }
@@ -206,16 +289,27 @@ pub fn line() -> Option<String> {
 pub fn reset() {
     CALLS.store(0, Ordering::Relaxed);
     CALLS_V2.store(0, Ordering::Relaxed);
+    CALLS_Z.store(0, Ordering::Relaxed);
     BYTES.store(0, Ordering::Relaxed);
     MACS.store(0, Ordering::Relaxed);
     NS.store(0, Ordering::Relaxed);
     M_SUM.store(0, Ordering::Relaxed);
     M_MAX.store(0, Ordering::Relaxed);
+    M_MIN.store(u64::MAX, Ordering::Relaxed);
     for b in &BUCKET_CALLS {
+        b.store(0, Ordering::Relaxed);
+    }
+    for b in &BUCKET_DEQ {
+        b.store(0, Ordering::Relaxed);
+    }
+    for b in &BUCKET_FMA {
         b.store(0, Ordering::Relaxed);
     }
     DEQ_TICKS.store(0, Ordering::Relaxed);
     FMA_TICKS.store(0, Ordering::Relaxed);
+    WRITE_TICKS.store(0, Ordering::Relaxed);
+    EXP_NONEMPTY.store(0, Ordering::Relaxed);
+    EXP_TOTAL.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
