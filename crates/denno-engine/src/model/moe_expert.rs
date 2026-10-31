@@ -681,6 +681,28 @@ fn expert_gemv_inner(
         }
     }
 
+    // IQ4_XS (hc テンソルの実型・Swift 1.5 系の密層) は AVX2 融合カーネルへ (P89)。
+    // P80 の IQ カーネル選択と同じスタイルの型判定で、`DENNO_IQ4XS_FAST=0` で
+    // 下のスカラー経路に戻る。
+    if ty == GgmlType::IQ4Xs && q4k_fused_supported() && iq4xs_fast_enabled() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            for_each_row_chunk(
+                blocks,
+                n_out,
+                rb,
+                out,
+                par,
+                PAR_MIN_ROWS,
+                PAR_MIN_CHUNK_ROWS,
+                |b, o| unsafe { gemv_iq4xs_avx2(b, n_in, o.len(), x, o) },
+            );
+            #[cfg(test)]
+            IQ4XS_FUSED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+    }
+
     if ty == GgmlType::Q4K && q4k_fused_supported() {
         #[cfg(target_arch = "x86_64")]
         {
@@ -2304,6 +2326,380 @@ fn expert_gemv_q8_inner(
         }
     }
     expert_gemv_inner(GgmlType::Q8_0, blocks, n_in, n_out, x, out, par)
+}
+
+// ---- IQ4_XS の 1 トークン融合 GEMV (P89) ------------------------------------
+//
+// hc テンソル (本番モデルの実型、k=10240 / k=320 の両形を想定) と Swift 1.5 系の
+// 密 IQ4_XS 層が対象。方針は [`expert_gemv_q8_fast`] と同じ:
+//
+// - 行ごとにブロック昇順で処理し、32 要素サブブロックごとに
+//   `[0..8] -> a0` / `[8..16] -> a1` / `[16..24] -> a0` / `[24..32] -> a1`
+//   のレーン割り当て (Q8_0 カーネルと同じ) で FMA する。末尾の横加算は
+//   [`q8_hadd`] を使い回す。
+// - dequant の値は kquant.rs の参照 (GgmlType::IQ4Xs 分岐) と 1 ビットも違わない:
+//   `dl = d * (ls - 32)` と `w = dl * kvalues[nibble]` を**別々の f32 乗算**で
+//   計算する (1 本の FMA に畳まない。乗算は可換なのでオペランド順は影響しない)。
+// - 内積は `w * x` を FMA で累積するので、classic (dequant + [`dot_seq`]) とは
+//   累積順・積の丸めが違い**ビット一致しない** (相対 1e-6 程度。Q8_0 融合と
+//   同じ立場)。1 行版 / 2 行版 / 行並列しきい値の差ではビット一致する。
+//
+// `DENNO_IQ4XS_FAST=0` で classic 経路へ戻せる (退避路)。
+
+/// `DENNO_IQ4XS_FAST` の値の解釈。**既定 on**。`0` / `false` / `off` のときだけ無効。
+fn iq4xs_fast_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => true,
+        Some(s) => !(s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off")),
+    }
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+/// env はプロセスで 1 回しか読めず、テストは並列に走るので
+/// [`cpu_gemv_par_enabled`] と同じく明示的な入口を用意する。
+#[cfg(test)]
+static IQ4XS_FAST_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト専用: IQ4_XS 融合経路の on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_iq4xs_fast_for_test(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    IQ4XS_FAST_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_IQ4XS_FAST` をプロセスで 1 回だけ読む (既定 on)。
+pub fn iq4xs_fast_enabled() -> bool {
+    #[cfg(test)]
+    match IQ4XS_FAST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| iq4xs_fast_from_value(std::env::var("DENNO_IQ4XS_FAST").ok().as_deref()))
+}
+
+/// テスト用: IQ4_XS 融合カーネルが実際に発火した回数。
+/// 「緑 = 経路が発動した証拠ではない」ので、発火の証拠としてはこのカウンタを見る。
+#[cfg(test)]
+pub(crate) static IQ4XS_FUSED_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// IQ4_XS のサブブロック `ib` (32 要素) の重みベクトル 4 本を作る。
+///
+/// 戻り値は `[要素 0..8, 8..16, 16..24, 24..32]`。`p` は 136 B ブロックの先頭
+/// (d=2 B + scales_h=2 B + scales_l=4 B + qs=128 B)。nibble → kvalues の引きは
+/// [`iq_vec8`] の IQ4_NL (KIND 0) と同じ `pshufb` で、要素順は kquant 参照と同じ
+/// (qs[j] の下位 nibble = 要素 j、上位 nibble = 要素 j+16)。
+///
+/// 値の丸め: `dl = d * (ls-32)` (スカラー f32 積)、`w = kvalues[..] * dl`
+/// (ベクトル f32 積)。kquant 参照は `dl * KVALUES[..]` だが、f32 乗算は可換で
+/// ビットも一致する。
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq4xs_subblock_w(
+    p: *const u8,
+    ib: usize,
+    sh: u16,
+    d: f32,
+    t16: std::arch::x86_64::__m128i,
+) -> [std::arch::x86_64::__m256; 4] {
+    use std::arch::x86_64::*;
+
+    // ls = scales_l の nibble (下位 4bit) | scales_h の 2bit << 4 (kquant 参照どおり)。
+    let lb = *p.add(4 + ib / 2) as i32;
+    let nib = (lb >> (4 * (ib % 2))) & 0xf;
+    let hi2 = ((sh >> (2 * ib)) & 3) as i32;
+    let ls = nib | (hi2 << 4);
+    let dlv = _mm256_set1_ps(d * ((ls - 32) as f32));
+
+    let q = _mm_loadu_si128(p.add(8 + ib * 16) as *const __m128i);
+    let m0f = _mm_set1_epi8(0x0f);
+    // 下位 nibble → 要素 0..15、上位 nibble → 要素 16..31。
+    let lo = _mm_shuffle_epi8(t16, _mm_and_si128(q, m0f));
+    let hi = _mm_shuffle_epi8(t16, _mm_and_si128(_mm_srli_epi16(q, 4), m0f));
+    [
+        _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), dlv),
+        _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(lo))),
+            dlv,
+        ),
+        _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)), dlv),
+        _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(hi))),
+            dlv,
+        ),
+    ]
+}
+
+/// IQ4_XS (256 要素 / 136 B ブロック) の 1 行 GEMV (1 トークン)。
+///
+/// [`gemv_q8_0_avx2`] と同じ構成: 行ごとにブロック昇順、32 要素サブブロックごとに
+/// w[0..8]/w[16..24] を `a0` へ、w[8..16]/w[24..32] を `a1` へ FMA し、末尾で
+/// [`q8_hadd`]。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_iq4xs_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 136; // d(2) + scales_h(2) + scales_l(4) + qs(128)
+    const SUB: usize = 8; // 1 ブロック = 32 要素 x 8
+    let nb = n_in / 256; // 行あたりのブロック数
+    let rb = nb * BLK;
+    let xp = x.as_ptr();
+    let bp = blocks.as_ptr();
+    let t16 = _mm_loadu_si128(crate::kquant::kvalues_iq4nl().as_ptr() as *const __m128i);
+
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let sh = std::ptr::read_unaligned(p.add(2) as *const u16);
+            let xb = xp.add(b * 256);
+            for ib in 0..SUB {
+                let w = iq4xs_subblock_w(p, ib, sh, d, t16);
+                let xo = xb.add(ib * 32);
+                a0 = _mm256_fmadd_ps(w[0], _mm256_loadu_ps(xo), a0);
+                a1 = _mm256_fmadd_ps(w[1], _mm256_loadu_ps(xo.add(8)), a1);
+                a0 = _mm256_fmadd_ps(w[2], _mm256_loadu_ps(xo.add(16)), a0);
+                a1 = _mm256_fmadd_ps(w[3], _mm256_loadu_ps(xo.add(24)), a1);
+            }
+        }
+        out[r] = q8_hadd(a0, a1);
+    }
+}
+
+/// [`gemv_iq4xs_avx2`] の 2 行同時版 ([`gemv_q8_0_avx2_2row`] と同じ構成)。
+///
+/// 隣接 2 行を同じサブブロック位置で処理し、x の 32 要素ロードを 2 行で共有する。
+/// 行ごとの累積チェーン (同じオペランド・同じ順序) は 1 行版と一切変わらないので
+/// 出力は 1 行版と**ビット一致**する。奇数行の端数は 1 行版と同じループで回す。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_iq4xs_avx2_2row(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 136;
+    const SUB: usize = 8;
+    let nb = n_in / 256;
+    let rb = nb * BLK;
+    let xp = x.as_ptr();
+    let bp = blocks.as_ptr();
+    let t16 = _mm_loadu_si128(crate::kquant::kvalues_iq4nl().as_ptr() as *const __m128i);
+    let npair = n_out & !1usize;
+
+    let mut r = 0usize;
+    while r < npair {
+        let row0 = bp.add(r * rb);
+        let row1 = bp.add((r + 1) * rb);
+        let mut a00 = _mm256_setzero_ps();
+        let mut a01 = _mm256_setzero_ps();
+        let mut a10 = _mm256_setzero_ps();
+        let mut a11 = _mm256_setzero_ps();
+        for b in 0..nb {
+            let p0 = row0.add(b * BLK);
+            let p1 = row1.add(b * BLK);
+            let d0 = half::f16::from_bits(std::ptr::read_unaligned(p0 as *const u16)).to_f32();
+            let sh0 = std::ptr::read_unaligned(p0.add(2) as *const u16);
+            let d1 = half::f16::from_bits(std::ptr::read_unaligned(p1 as *const u16)).to_f32();
+            let sh1 = std::ptr::read_unaligned(p1.add(2) as *const u16);
+            let xb = xp.add(b * 256);
+            for ib in 0..SUB {
+                // x ブロックは 2 行で共有 (1 回だけ読む)。
+                let xo = xb.add(ib * 32);
+                let xv0 = _mm256_loadu_ps(xo);
+                let xv1 = _mm256_loadu_ps(xo.add(8));
+                let xv2 = _mm256_loadu_ps(xo.add(16));
+                let xv3 = _mm256_loadu_ps(xo.add(24));
+                // 行 r (1 行版と同じ順: [0..8]->a0, [8..16]->a1, [16..24]->a0, [24..32]->a1)。
+                let w0 = iq4xs_subblock_w(p0, ib, sh0, d0, t16);
+                a00 = _mm256_fmadd_ps(w0[0], xv0, a00);
+                a01 = _mm256_fmadd_ps(w0[1], xv1, a01);
+                a00 = _mm256_fmadd_ps(w0[2], xv2, a00);
+                a01 = _mm256_fmadd_ps(w0[3], xv3, a01);
+                // 行 r+1 (行 r と独立なチェーン)。
+                let w1 = iq4xs_subblock_w(p1, ib, sh1, d1, t16);
+                a10 = _mm256_fmadd_ps(w1[0], xv0, a10);
+                a11 = _mm256_fmadd_ps(w1[1], xv1, a11);
+                a10 = _mm256_fmadd_ps(w1[2], xv2, a10);
+                a11 = _mm256_fmadd_ps(w1[3], xv3, a11);
+            }
+        }
+        out[r] = q8_hadd(a00, a01);
+        out[r + 1] = q8_hadd(a10, a11);
+        r += 2;
+    }
+    // 端数の 1 行 (n_out が奇数) は 1 行版と同じループ。
+    if n_out != npair {
+        let row = bp.add(npair * rb);
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let sh = std::ptr::read_unaligned(p.add(2) as *const u16);
+            let xb = xp.add(b * 256);
+            for ib in 0..SUB {
+                let w = iq4xs_subblock_w(p, ib, sh, d, t16);
+                let xo = xb.add(ib * 32);
+                a0 = _mm256_fmadd_ps(w[0], _mm256_loadu_ps(xo), a0);
+                a1 = _mm256_fmadd_ps(w[1], _mm256_loadu_ps(xo.add(8)), a1);
+                a0 = _mm256_fmadd_ps(w[2], _mm256_loadu_ps(xo.add(16)), a0);
+                a1 = _mm256_fmadd_ps(w[3], _mm256_loadu_ps(xo.add(24)), a1);
+            }
+        }
+        out[npair] = q8_hadd(a0, a1);
+    }
+}
+
+/// IQ4_XS 専用入口の共通本体 ([`expert_gemv_q8_inner`] と同じ形)。
+///
+/// AVX2+FMA が無い / `n_in` が 256 の倍数でない / `DENNO_IQ4XS_FAST=0` のときは
+/// classic ([`gemv_scalar_body`] = dequant + [`dot_seq`]) に落ちる (退避路)。
+#[allow(clippy::too_many_arguments)]
+fn expert_gemv_iq4xs_inner(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    par: bool,
+    min_rows: usize,
+    min_chunk: usize,
+    two_row: bool,
+) -> Result<()> {
+    let rb = check_gemv_args(GgmlType::IQ4Xs, blocks, n_in, n_out, x, out)?;
+    if n_in % 256 == 0 && q4k_fused_supported() && iq4xs_fast_enabled() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: 引数は check_gemv_args が検証済み (n_in%256==0 は直前で確認) で、
+            // q4k_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
+            // 2 行版も AVX2+FMA だけで動く (行ごとの累積順序は 1 行版と同じで
+            // ビット一致する)。
+            let kern: unsafe fn(&[u8], usize, usize, &[f32], &mut [f32]) = if two_row {
+                gemv_iq4xs_avx2_2row
+            } else {
+                gemv_iq4xs_avx2
+            };
+            #[cfg(test)]
+            IQ4XS_FUSED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for_each_row_chunk(blocks, n_out, rb, out, par, min_rows, min_chunk, |b, o| unsafe {
+                kern(b, n_in, o.len(), x, o)
+            });
+            return Ok(());
+        }
+    }
+    // 退避路: classic (dequant + 逐次内積)。融合経路と比べると累積順が違うだけで、
+    // dequant の値は同じ。
+    gemv_scalar_body(GgmlType::IQ4Xs, rb, blocks, n_in, n_out, x, out);
+    Ok(())
+}
+
+/// IQ4_XS の 1 トークン融合 GEMV (P89)。AVX2+FMA が使える環境で
+/// [`expert_gemv_scalar`] より速い (dequant を行バッファに開かない)。
+///
+/// 値は classic とビット一致**しない** (内積を FMA で累積するため。相対 1e-6 程度)。
+/// `DENNO_IQ4XS_FAST=0` で classic に戻る。
+pub fn expert_gemv_iq4xs(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    expert_gemv_iq4xs_inner(
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        true,
+        PAR_MIN_ROWS,
+        PAR_MIN_CHUNK_ROWS,
+        false,
+    )
+}
+
+/// [`expert_gemv_iq4xs`] の 2 行同時カーネル版。出力は 1 行版と**ビット一致**する。
+pub fn expert_gemv_iq4xs_2row(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    expert_gemv_iq4xs_inner(
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        true,
+        PAR_MIN_ROWS,
+        PAR_MIN_CHUNK_ROWS,
+        true,
+    )
+}
+
+/// [`expert_gemv_iq4xs`] の行並列しきい値を呼び出し側が決める版。
+/// 行は独立なので `min_rows` をどう選んでも出力はビット一致する。
+pub(crate) fn expert_gemv_iq4xs_min(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    min_rows: usize,
+) -> Result<()> {
+    expert_gemv_iq4xs_inner(
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        true,
+        min_rows,
+        PAR_MIN_CHUNK_ROWS_TIGHT,
+        false,
+    )
+}
+
+/// [`expert_gemv_iq4xs_min`] の 2 行同時カーネル版。
+pub(crate) fn expert_gemv_iq4xs_min_2row(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    min_rows: usize,
+) -> Result<()> {
+    expert_gemv_iq4xs_inner(
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        true,
+        min_rows,
+        PAR_MIN_CHUNK_ROWS_TIGHT,
+        true,
+    )
 }
 
 /// expert テンソルの量子型で GEMV を振り分ける (P-MOE-G1 で追加)。
@@ -8868,6 +9264,302 @@ mod iq_kernel_tests {
                 best[0] / best[1]
             );
         }
+    }
+}
+
+/// P89: IQ4_XS 融合 GEMV カーネルの検証と発火確認。
+///
+/// 値の契約は 3 段階:
+/// 1. **dequant の値**は kquant 参照 ([`crate::kquant::dequant_row`]) と
+///    `to_bits()` 一致 (1 入力 one-hot で全要素を抽出する)。
+/// 2. **内積**は classic (dequant + [`dot_seq`]) と許容内で一致 (FMA 累積の
+///    ためビット一致しない。Q8_0 融合と同じ立場)。
+/// 3. 1 行版 / 2 行版 / 行並列しきい値の差では `to_bits()` 一致。
+#[cfg(test)]
+mod iq4xs_tests {
+    use super::*;
+    use crate::kquant::dequant_row;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// テスト用の決定的バイト列 (0..=255)。`mod tests` の `pat` と同じ式の写し
+    /// (あちらは非公開なので共有しない)。
+    fn pat(i: usize, seed: u32) -> u8 {
+        let mut x = (i as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(seed.wrapping_mul(40_503));
+        x ^= x >> 13;
+        x = x.wrapping_mul(0x9E37_79B1);
+        x ^= x >> 16;
+        x as u8
+    }
+
+    fn f16_bytes(v: f32) -> [u8; 2] {
+        half::f16::from_f32(v).to_le_bytes()
+    }
+
+    /// AVX2/FMA が無い環境では黙って緑にせず、理由を出して skip する。
+    fn fused_ready(what: &str) -> bool {
+        if q4k_fused_supported() {
+            return true;
+        }
+        eprintln!(
+            "skip {what}: この CPU には AVX2/FMA が無い (融合経路は選ばれずスカラーへ落ちる)"
+        );
+        false
+    }
+
+    /// IQ4_XS の 1 ブロック (136 B = d(2) + scales_h(2) + scales_l(4) + qs(128))。
+    ///
+    /// サブブロック `ib` の 6bit スケール `ls` が `(seed + ib * 9) % 64` を巡回する
+    /// (9 と 64 は互いに素なので 1 ブロックで 0..=63 の全値を通る。`ls - 32` の
+    /// 負 / 0 / 正の三態を含む)。qs は nibble 全域 (0..=15) を通す。
+    fn iq4xs_block(seed: u32) -> [u8; 136] {
+        let mut b = [0u8; 136];
+        b[0..2].copy_from_slice(&f16_bytes(0.01 + 0.001 * (seed % 17) as f32));
+        let mut scales_l = [0u8; 4];
+        let mut scales_h: u16 = 0;
+        for ib in 0..8usize {
+            let ls = ((seed as usize + ib * 9) % 64) as u16;
+            let nib = (ls & 0xf) as u8;
+            let hi2 = ((ls >> 4) & 0x3) as u16;
+            // kquant 参照と同じ詰め方: 偶数 ib が下位 nibble、奇数 ib が上位。
+            scales_l[ib / 2] = if ib % 2 == 0 {
+                (scales_l[ib / 2] & 0xf0) | nib
+            } else {
+                (scales_l[ib / 2] & 0x0f) | (nib << 4)
+            };
+            scales_h |= hi2 << (2 * ib);
+        }
+        b[2..4].copy_from_slice(&scales_h.to_le_bytes());
+        b[4..8].copy_from_slice(&scales_l);
+        for i in 8..136 {
+            b[i] = pat(i, seed);
+        }
+        b
+    }
+
+    /// `n_out * (n_in / 256)` ブロックの合成 IQ4_XS 行列 (行・ブロックごとに別 seed)。
+    fn iq4xs_rows(n_in: usize, n_out: usize) -> Vec<u8> {
+        assert_eq!(n_in % 256, 0, "IQ4_XS の行長は 256 の倍数");
+        let nb = n_in / 256;
+        let mut v = Vec::with_capacity(n_out * nb * 136);
+        for r in 0..n_out {
+            for b in 0..nb {
+                v.extend_from_slice(&iq4xs_block((r * 131 + b * 17) as u32 + 5));
+            }
+        }
+        v
+    }
+
+    fn xvec(n_in: usize) -> Vec<f32> {
+        (0..n_in)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+            .collect()
+    }
+
+    /// 融合経路が classic (dequant + 逐次内積) と許容内で一致する。
+    /// あわせて `expert_gemv` (P80 型判定の入口) からも融合カーネルが発火することを
+    /// カウンタで確認する (緑 = 発動の証拠ではないので数える)。
+    #[test]
+    fn iq4xs_fused_matches_scalar_within_tolerance() {
+        if !fused_ready("iq4xs_fused_matches_scalar_within_tolerance") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq4xs_fast_for_test(Some(true));
+        // 256 = 1 ブロック/行 (最小)、10240 = 実形 hc_down の行長 (40 ブロック)。
+        for (n_in, n_out) in [(256usize, 4usize), (10240, 320)] {
+            let x = xvec(n_in);
+            let blocks = iq4xs_rows(n_in, n_out);
+            let mut fused = vec![0.0f32; n_out];
+            let mut scalar = vec![0.0f32; n_out];
+
+            let before = IQ4XS_FUSED_CALLS.load(Relaxed);
+            expert_gemv(GgmlType::IQ4Xs, &blocks, n_in, n_out, &x, &mut fused).unwrap();
+            let fired = IQ4XS_FUSED_CALLS.load(Relaxed) - before;
+            expert_gemv_scalar(GgmlType::IQ4Xs, &blocks, n_in, n_out, &x, &mut scalar).unwrap();
+
+            assert!(fired >= 1, "n_in={n_in}: 融合カーネルが発火していない");
+            assert!(
+                scalar.iter().any(|v| *v != 0.0),
+                "n_in={n_in}: スカラー出力が全 0 (入力を作り直すこと)"
+            );
+
+            let rb = row_bytes(GgmlType::IQ4Xs, n_in).unwrap();
+            let (mut d_fs, mut d_ft, mut d_st) = (0.0f32, 0.0f32, 0.0f32);
+            for r in 0..n_out {
+                let w = dequant_row(GgmlType::IQ4Xs, &blocks[r * rb..(r + 1) * rb], n_in);
+                let mut acc = 0.0f64;
+                for i in 0..n_in {
+                    acc += w[i] as f64 * x[i] as f64;
+                }
+                let t = acc as f32;
+                let diff = (fused[r] - scalar[r]).abs();
+                d_fs = d_fs.max(diff);
+                d_ft = d_ft.max((fused[r] - t).abs());
+                d_st = d_st.max((scalar[r] - t).abs());
+                // 許容は「絶対 1e-3 + 相対 1e-3」のサニティ境界。この fixture は
+                // 部分和が数百に育って打ち消す行があり (row 9: 出力 0.70 に対し
+                // 経路差 4.0e-4 実測)、f32 累積の誤差は出力値ではなく部分和の
+                // 大きさに比例するので相対幅では押さえられない。精度の契約は
+                // f64 真値との比較 (下の assert) で固定する。
+                let tol = 1e-3 + 1e-3 * scalar[r].abs();
+                assert!(
+                    diff <= tol,
+                    "n_in={n_in} row {r}: 融合 {} とスカラー {} の差 {diff} が許容 {tol} を超える",
+                    fused[r],
+                    scalar[r]
+                );
+            }
+            eprintln!(
+                "IQ4_XS {n_out} 行 x {n_in} 列: 融合vsスカラー 最大絶対差 {d_fs:.3e} / f64真値との最大差 融合 {d_ft:.3e} スカラー {d_st:.3e}"
+            );
+            assert!(
+                d_ft <= 2.0 * d_st + 1e-6,
+                "n_in={n_in}: 融合の真値誤差 {d_ft:.3e} がスカラーの {d_st:.3e} より大きすぎる"
+            );
+        }
+        set_iq4xs_fast_for_test(None);
+    }
+
+    /// 2 行版 / 行並列しきい値差し替え版は 1 行版と `to_bits()` 一致する
+    /// (行ごとの累積順序は不変。n_out が偶数 / 奇数 = 端数行の両方を見る)。
+    #[test]
+    fn iq4xs_variants_match_1row_bitwise() {
+        if !fused_ready("iq4xs_variants_match_1row_bitwise") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq4xs_fast_for_test(Some(true));
+        for (n_in, n_out) in [(256usize, 1usize), (512, 7), (512, 8), (768, 9)] {
+            let x = xvec(n_in);
+            let blocks = iq4xs_rows(n_in, n_out);
+            let mut one = vec![0.0f32; n_out];
+            expert_gemv_iq4xs(&blocks, n_in, n_out, &x, &mut one).unwrap();
+            assert!(
+                one.iter().any(|v| *v != 0.0),
+                "n_in={n_in}: 1 行版の出力が全 0 (入力を作り直すこと)"
+            );
+
+            let mut two = vec![0.0f32; n_out];
+            expert_gemv_iq4xs_2row(&blocks, n_in, n_out, &x, &mut two).unwrap();
+            let want: Vec<u32> = one.iter().map(|v| v.to_bits()).collect();
+            let got: Vec<u32> = two.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(
+                want, got,
+                "n_in={n_in} n_out={n_out}: 2 行版が 1 行版とビット不一致"
+            );
+
+            // 行並列しきい値を下げても行は独立なのでビット一致する。
+            for min_rows in [1usize, 4, 64] {
+                let mut par = vec![0.0f32; n_out];
+                expert_gemv_iq4xs_min(&blocks, n_in, n_out, &x, &mut par, min_rows).unwrap();
+                let got: Vec<u32> = par.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(
+                    want, got,
+                    "n_in={n_in} n_out={n_out} min_rows={min_rows}: 行並列版がビット不一致"
+                );
+                let mut par2 = vec![0.0f32; n_out];
+                expert_gemv_iq4xs_min_2row(&blocks, n_in, n_out, &x, &mut par2, min_rows).unwrap();
+                let got: Vec<u32> = par2.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(
+                    want, got,
+                    "n_in={n_in} n_out={n_out} min_rows={min_rows}: 2 行並列版がビット不一致"
+                );
+            }
+        }
+        set_iq4xs_fast_for_test(None);
+    }
+
+    /// dequant の値は kquant 参照と `to_bits()` 一致。
+    ///
+    /// one-hot な x (要素 i だけ 1.0) を通すと、積は w_i * 1.0 = w_i だけで
+    /// 他は ±0 なので、FMA 累積の順序に依らず出力 = w_i になる
+    /// (fma(w, 1.0, ±0) = w は厳密。ただし w が ±0 のときの符号だけは
+    /// レーン縮約で落ちるので「両方 0」を同一視する)。
+    #[test]
+    fn iq4xs_dequant_values_match_kquant_bitwise() {
+        if !fused_ready("iq4xs_dequant_values_match_kquant_bitwise") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq4xs_fast_for_test(Some(true));
+        for n_in in [256usize, 512] {
+            let n_out = 3usize;
+            let blocks = iq4xs_rows(n_in, n_out);
+            let rb = row_bytes(GgmlType::IQ4Xs, n_in).unwrap();
+            let mut out = vec![0.0f32; n_out];
+            for i in 0..n_in {
+                let mut x = vec![0.0f32; n_in];
+                x[i] = 1.0;
+                expert_gemv_iq4xs(&blocks, n_in, n_out, &x, &mut out).unwrap();
+                let w = dequant_row(GgmlType::IQ4Xs, &blocks[0..rb], n_in);
+                let (kv, rw) = (out[0].to_bits(), w[i].to_bits());
+                assert!(
+                    kv == rw || (out[0] == 0.0 && w[i] == 0.0),
+                    "n_in={n_in} i={i}: カーネルの w {} ({kv:#x}) が kquant 参照 {} ({rw:#x}) と違う",
+                    out[0],
+                    w[i]
+                );
+            }
+            // 念のため: one-hot の和が 0 でない要素がある (抽出が空振りでない)。
+            let w = dequant_row(GgmlType::IQ4Xs, &blocks[0..rb], n_in);
+            assert!(
+                w.iter().any(|v| *v != 0.0),
+                "参照行が全 0 (fixture が壊れた)"
+            );
+        }
+        set_iq4xs_fast_for_test(None);
+    }
+
+    /// 実形 (hc_down 形) で行並列の分割が走ったときも 1 行版とビット一致する。
+    #[test]
+    fn iq4xs_row_par_real_shape_bitwise() {
+        if !fused_ready("iq4xs_row_par_real_shape_bitwise") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq4xs_fast_for_test(Some(true));
+        let (n_in, n_out) = (10240usize, 320usize);
+        let x = xvec(n_in);
+        let blocks = iq4xs_rows(n_in, n_out);
+        let mut seq = vec![0.0f32; n_out];
+        expert_gemv_iq4xs(&blocks, n_in, n_out, &x, &mut seq).unwrap();
+        // min_rows=64: 320 行は rayon のチャンクに分割される (行は独立)。
+        let mut par = vec![0.0f32; n_out];
+        expert_gemv_iq4xs_min(&blocks, n_in, n_out, &x, &mut par, 64).unwrap();
+        let want: Vec<u32> = seq.iter().map(|v| v.to_bits()).collect();
+        let got: Vec<u32> = par.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(want, got, "行並列版が逐次版とビット不一致 (実形 320 行)");
+        set_iq4xs_fast_for_test(None);
+    }
+
+    /// `DENNO_IQ4XS_FAST=0` (テスト上書き) で classic へ戻る。
+    /// 出力はスカラー経路と `to_bits()` 一致し、融合カウンタは増えない。
+    #[test]
+    fn iq4xs_escape_falls_back_to_scalar() {
+        if !fused_ready("iq4xs_escape_falls_back_to_scalar") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq4xs_fast_for_test(Some(false));
+        let (n_in, n_out) = (512usize, 7usize);
+        let x = xvec(n_in);
+        let blocks = iq4xs_rows(n_in, n_out);
+        let mut got = vec![0.0f32; n_out];
+        let before = IQ4XS_FUSED_CALLS.load(Relaxed);
+        expert_gemv(GgmlType::IQ4Xs, &blocks, n_in, n_out, &x, &mut got).unwrap();
+        assert_eq!(
+            IQ4XS_FUSED_CALLS.load(Relaxed),
+            before,
+            "退避路なのに融合カーネルが発火した"
+        );
+        let mut want = vec![0.0f32; n_out];
+        expert_gemv_scalar(GgmlType::IQ4Xs, &blocks, n_in, n_out, &x, &mut want).unwrap();
+        let want: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+        let got: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(want, got, "退避路の出力がスカラー経路とビット不一致");
+        set_iq4xs_fast_for_test(None);
     }
 }
 
