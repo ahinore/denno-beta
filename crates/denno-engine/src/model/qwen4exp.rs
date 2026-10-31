@@ -3924,6 +3924,15 @@ pub mod mix_kprof {
     ///   (`chunks` / `fired`)
     /// - 実効並列度 (`comp` / `wall`。1 のままなら 1 スレッドでしか回っていない)、
     ///   fork-join の固定費は 1 スレッドのときの `wall - comp` で読む
+    ///
+    /// task 96: wall の内訳を skew 3 項目で分離する (発火 region のみ)。
+    /// - `t_first=`: region 先頭 -> 最初のチャンク完了。1 チャンクの平均時間
+    ///   (`comp` / `chunks`) と等しければ全スレッドが即座に仕事を得ている。
+    ///   大きく上回るなら fork/ディスパッチ待ちが実在する。
+    /// - `spread=`: 最初の完了 -> 最後の完了。`t_first` + `spread` = wall。
+    ///   チャンク実時間のばらつき (メモリ競合での伸び) と後発走行がここに出る。
+    /// - `tstart=`: チャンク開始オフセットのチャンク平均。0 に近ければ
+    ///   スレッドは仕事を待っていなかった (不足しているのは走行の重なり)。
     pub mod rowpar {
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3945,8 +3954,18 @@ pub mod mix_kprof {
         static COMP_NS: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
         /// task 93: 発火した region で `rayon::current_num_threads()` が返した値の合計
         /// (発火 1 件あたりの平均を `th=` で出す。逐次 region は積まない)。
-        /// 実機の「プール スレッド数 > 物理コア数」(SMT の取り合い) を見るため。
+        /// 実機の「プール スレッド数 > 物理コア数」(SMT の取り合い) を判別する。
         static TH_SUM: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
+        /// task 96: 発火 region の「最初のチャンク完了オフセット」の合計
+        /// (region 先頭基準。[`FIRED`] で割ると `t_first=`)。
+        static FIRST_END_SUM: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
+        /// task 96: 発火 region の全チャンク開始オフセットの合計
+        /// ([`CHUNKS`] で割ると `tstart=` = スレッドが仕事を得るまでの待ちの平均)。
+        static START_SUM: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
+        /// task 96: 発火 region の wall の合計 ([`FIRED`] で割った値と
+        /// [`FIRST_END_SUM`] から `spread=` を出す。[`WALL_NS`] は逐次 region も
+        /// 含むので発火だけの平均には使えない)。
+        static FIRED_WALL_NS: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
 
         thread_local! {
             static LBL: std::cell::Cell<u8> = const { std::cell::Cell::new(NONE) };
@@ -3974,13 +3993,30 @@ pub mod mix_kprof {
         /// (逐次は 1)、`wall_ns` は region の壁時計、`comp_ns` はチャンク内の純計算
         /// (`f`) の合計 (スレッド時間の合計)。`th` は発火 region の
         /// `rayon::current_num_threads()` (逐次は 0 = 積まない)。
-        pub fn record(l: u8, fired: bool, chunks: usize, wall_ns: u64, comp_ns: u64, th: usize) {
+        ///
+        /// task 96: `first_end_ns` は発火 region の「最初のチャンク完了オフセット」
+        /// (region 先頭基準)、`start_sum_ns` は全チャンク開始オフセットの和。
+        /// **fired のときだけ**積む (逐次呼び出し側は 0 を渡す。逐次は単一チャンクで
+        /// 開始オフセット 0・完了 = wall なので skew の情報を持たない)。
+        pub fn record(
+            l: u8,
+            fired: bool,
+            chunks: usize,
+            wall_ns: u64,
+            comp_ns: u64,
+            th: usize,
+            first_end_ns: u64,
+            start_sum_ns: u64,
+        ) {
             let i = (l as usize).saturating_sub(1).min(NL - 1);
             REGIONS[i].fetch_add(1, Ordering::Relaxed);
             if fired {
                 FIRED[i].fetch_add(1, Ordering::Relaxed);
                 CHUNKS[i].fetch_add(chunks as u64, Ordering::Relaxed);
                 TH_SUM[i].fetch_add(th as u64, Ordering::Relaxed);
+                FIRST_END_SUM[i].fetch_add(first_end_ns, Ordering::Relaxed);
+                START_SUM[i].fetch_add(start_sum_ns, Ordering::Relaxed);
+                FIRED_WALL_NS[i].fetch_add(wall_ns, Ordering::Relaxed);
             }
             WALL_NS[i].fetch_add(wall_ns, Ordering::Relaxed);
             COMP_NS[i].fetch_add(comp_ns, Ordering::Relaxed);
@@ -3998,6 +4034,17 @@ pub mod mix_kprof {
             )
         }
 
+        /// task 96: (first_end_sum, start_sum, fired_wall_ns)。発火 region だけの
+        /// skew 累計。テスト用 (本番の表示は [`line_part`])。
+        pub fn skew(i: usize) -> (u64, u64, u64) {
+            let i = i.min(NL - 1);
+            (
+                FIRST_END_SUM[i].load(Ordering::Relaxed),
+                START_SUM[i].load(Ordering::Relaxed),
+                FIRED_WALL_NS[i].load(Ordering::Relaxed),
+            )
+        }
+
         /// カウンタを 0 に戻す ([`super::reset`] から呼ぶ)。
         pub fn reset() {
             for i in 0..NL {
@@ -4007,6 +4054,9 @@ pub mod mix_kprof {
                 WALL_NS[i].store(0, Ordering::Relaxed);
                 COMP_NS[i].store(0, Ordering::Relaxed);
                 TH_SUM[i].store(0, Ordering::Relaxed);
+                FIRST_END_SUM[i].store(0, Ordering::Relaxed);
+                START_SUM[i].store(0, Ordering::Relaxed);
+                FIRED_WALL_NS[i].store(0, Ordering::Relaxed);
             }
         }
 
@@ -4031,13 +4081,39 @@ pub mod mix_kprof {
             } else {
                 0.0
             };
-            format!(
+            let mut s = format!(
                 " | {name} regions={regions} fired={fired} chunks={:.1} th={th:.1} wall={:.0}us \
                  comp={:.0}us par_eff={par_eff:.1}",
                 chunks as f64 / regions as f64,
                 per(wall_ns),
                 per(comp_ns),
-            )
+            );
+            // task 96: wall の内訳 (発火 region のみ。逐次は単一チャンクなので
+            // skew を持たない)。
+            // - t_first: region 先頭 -> 最初のチャンク完了。comp/chunks (1 チャンクの
+            //   平均時間) と比べると fork/ディスパッチ待ちが読める (等しければ
+            //   全スレッドが即座に仕事を得て並列走行している)。
+            // - spread: 最初の完了 -> 最後の完了 (= wall)。完了の散らばり。
+            //   t_first が理想に近く spread が大きいときは、チャンクは即時開始だが
+            //   一部が長く走っている (メモリ競合での伸び or 後発走行)。
+            // - tstart: チャンク開始オフセットのチャンク平均。スレッドが仕事を
+            //   得るまでの待ちの平均 (0 に近ければ待ち無し)。
+            if fired > 0 {
+                let fired_f = fired as f64;
+                let t_first_us = FIRST_END_SUM[i].load(Ordering::Relaxed) as f64 / fired_f / 1e3;
+                let fired_wall_us = FIRED_WALL_NS[i].load(Ordering::Relaxed) as f64 / fired_f / 1e3;
+                let spread_us = (fired_wall_us - t_first_us).max(0.0);
+                let chunks_total = CHUNKS[i].load(Ordering::Relaxed);
+                let tstart_us = if chunks_total > 0 {
+                    START_SUM[i].load(Ordering::Relaxed) as f64 / chunks_total as f64 / 1e3
+                } else {
+                    0.0
+                };
+                s.push_str(&format!(
+                    " t_first={t_first_us:.0}us spread={spread_us:.0}us tstart={tstart_us:.0}us"
+                ));
+            }
+            s
         }
     }
 
@@ -11422,6 +11498,93 @@ mod tests {
             );
             mix_kprof::reset();
             mix_kprof::set_for_test(false);
+        }
+
+        /// task 96: 発火 region の skew 3 項目 (`t_first=` / `spread=` / `tstart=`) が
+        /// `[mix-kprof]` の 1 行に載る。
+        ///
+        /// down (320 行 >= 門番 64) と up (640 行 >= 既定門番 512) が 1 region ずつ
+        /// 発火する形で mix を 1 回回し、(a) 項目が出ること、(b) `skew()` の生の値が
+        /// 構造上の制約 (最初の完了 <= 発火 wall、開始オフセットの和 <= チャンク数 ×
+        /// 発火 wall) を満たすことを確かめる。値の大きさ自体はタイミング依存なので
+        /// 見ない (ホストで変わる)。
+        #[test]
+        fn mix_kprof_rowpar_skew_fields_on_fired_region() {
+            use mix_kprof::rowpar;
+            let (hp, norm, down, up, inject, res) = mix_q8_case(2, 320, 320);
+            mix_kprof::set_for_test(true);
+            mix_kprof::reset();
+            let _ = hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            let line = mix_kprof::line().expect("強制 on なのに line() が None");
+            // 生の値は reset の前に読む (reset は rowpar も 0 に戻す)。
+            let (fd, _, cd, _, _) = rowpar::stats(rowpar::L_DOWN as usize - 1);
+            let (fe_d, ss_d, fw_d) = rowpar::skew(rowpar::L_DOWN as usize - 1);
+            mix_kprof::reset();
+            mix_kprof::set_for_test(false);
+
+            for name in ["down", "up"] {
+                // rowpar 部だけを切り出す (region 計時の "{name} {ns} ns" と
+                // gemv の "{name} calls=" も "{name} " で始まるので
+                // "regions=" を含む位置で切る)。
+                let seg = line
+                    .split(&format!(" | {name} regions="))
+                    .nth(1)
+                    .unwrap_or_default();
+                assert!(
+                    seg.starts_with("1 fired=1") && seg.contains(" t_first="),
+                    "{name}: skew 項目が載っていない: {line}"
+                );
+                assert!(seg.contains(" spread="), "{name}: spread が無い: {line}");
+                assert!(seg.contains(" tstart="), "{name}: tstart が無い: {line}");
+            }
+            // 生の値の構造制約: 最初のチャンク完了は発火 wall 以内、開始オフセットの
+            // 和はチャンク数 x 発火 wall 以内 (各チャンクの開始 + 実時間 <= wall)。
+            assert_eq!(fd, 1, "down の発火 region が 1 でない");
+            assert!(fe_d > 0, "down の t_first が 0 (skew が積まれていない)");
+            assert!(
+                fe_d <= fw_d,
+                "down の最初の完了 {fe_d} ns が発火 wall {fw_d} ns を超えた"
+            );
+            assert!(
+                ss_d <= cd.saturating_mul(fw_d),
+                "down の開始オフセット和 {ss_d} が chunks={cd} x wall={fw_d} を超えた"
+            );
+        }
+
+        /// task 96: skew の表示書式 (ns -> us、チャンク平均)。`record` を直接積んで
+        /// `[mix-kprof]` 行の部分文字列を確かめる (タイミング非依存の固定値)。
+        /// fired=1 / chunks=4 / wall=250us / comp=700us / t_first=150us /
+        /// start_sum=120us -> tstart = 120/4 = 30us、spread = 250-150 = 100us。
+        #[test]
+        fn mix_kprof_rowpar_skew_line_format_is_deterministic() {
+            use mix_kprof::rowpar;
+            mix_kprof::set_for_test(true);
+            mix_kprof::reset();
+            rowpar::record(
+                rowpar::L_DOWN,
+                true,
+                4,
+                250_000,
+                700_000,
+                8,
+                150_000,
+                120_000,
+            );
+            let line = mix_kprof::line().expect("強制 on なのに line() が None");
+            mix_kprof::reset();
+            mix_kprof::set_for_test(false);
+            let seg = line
+                .split(" | down regions=")
+                .nth(1)
+                .unwrap_or_default();
+            assert!(
+                seg.contains("wall=250us comp=700us par_eff=2.8"),
+                "既存項目の書式が違う: {seg}"
+            );
+            assert!(
+                seg.contains("t_first=150us spread=100us tstart=30us"),
+                "skew 項目の書式が違う: {seg}"
+            );
         }
 
         /// task 88: down / up GEMV の実行先内訳 (calls / ms / gpu / ty) が

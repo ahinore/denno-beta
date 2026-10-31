@@ -833,7 +833,9 @@ fn for_each_row_chunk<F>(
             let t0 = std::time::Instant::now();
             f(blocks, out);
             let ns = t0.elapsed().as_nanos() as u64;
-            crate::model::qwen4exp::mix_kprof::rowpar::record(lbl, false, 1, ns, ns, 0);
+            // task 96: 逐次 region は skew (開始/完了オフセット) を積まない
+            // (record 側で fired のときだけ使う)。
+            crate::model::qwen4exp::mix_kprof::rowpar::record(lbl, false, 1, ns, ns, 0, 0, 0);
         } else {
             f(blocks, out);
         }
@@ -855,15 +857,28 @@ fn for_each_row_chunk<F>(
     if lbl != 0 {
         let comp = std::sync::atomic::AtomicU64::new(0);
         let comp_ref = &comp;
+        // task 96: チャンクの開始/完了オフセット (region 先頭 = `t0` 基準)。
+        // `first_end` は「最初のチャンクが完了するまでの時間」、`start_sum` は
+        // 全チャンクの開始オフセットの和 (チャンク平均 = スレッドが仕事を得る
+        // までの待ちの平均)。`Instant` の追加取得は無い (既存の `tc` と
+        // `tc.elapsed()` を再利用する。atomic 2 操作/チャンクのみ)。
+        let first_end = std::sync::atomic::AtomicU64::new(u64::MAX);
+        let first_end_ref = &first_end;
+        let start_sum = std::sync::atomic::AtomicU64::new(0);
+        let start_sum_ref = &start_sum;
         let t0 = std::time::Instant::now();
         blocks
             .par_chunks(bytes)
             .zip(out.par_chunks_mut(rows))
             .for_each(|(b, o)| {
                 let tc = std::time::Instant::now();
+                let start_off = tc.duration_since(t0).as_nanos() as u64;
                 f(b, o);
-                comp_ref.fetch_add(
-                    tc.elapsed().as_nanos() as u64,
+                let dur = tc.elapsed().as_nanos() as u64;
+                comp_ref.fetch_add(dur, std::sync::atomic::Ordering::Relaxed);
+                start_sum_ref.fetch_add(start_off, std::sync::atomic::Ordering::Relaxed);
+                first_end_ref.fetch_min(
+                    start_off.saturating_add(dur),
                     std::sync::atomic::Ordering::Relaxed,
                 );
             });
@@ -875,6 +890,13 @@ fn for_each_row_chunk<F>(
             wall,
             comp.load(std::sync::atomic::Ordering::Relaxed),
             threads,
+            // 完了オフセットは join 前に完了したチャンクのものなので wall 以下
+            // (クロックのゆらぎの保険で min を取る)。u64::MAX のまま (チャンク 0)
+            // でも wall にクランプされる。
+            first_end
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(wall),
+            start_sum.load(std::sync::atomic::Ordering::Relaxed),
         );
     } else {
         blocks
@@ -905,7 +927,8 @@ fn for_each_row_chunk<F>(
         let t0 = std::time::Instant::now();
         f(blocks, out);
         let ns = t0.elapsed().as_nanos() as u64;
-        crate::model::qwen4exp::mix_kprof::rowpar::record(lbl, false, 1, ns, ns, 0);
+        // task 96: 逐次 region は skew (開始/完了オフセット) を積まない。
+        crate::model::qwen4exp::mix_kprof::rowpar::record(lbl, false, 1, ns, ns, 0, 0, 0);
     } else {
         f(blocks, out);
     }
