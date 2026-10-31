@@ -272,6 +272,8 @@ pub fn line() -> Option<String> {
             pct(wb)
         ));
     }
+    // P93: (行列, 型) ごとの内訳 (非ゼロだけ。カーネル実行先と m 分布を含む)。
+    s.push_str(&ty_lines());
     Some(s)
 }
 
@@ -290,4 +292,185 @@ pub fn reset() {
         L_NS[slot].store(0, Ordering::Relaxed);
     }
     LAYERS.store(0, Ordering::Relaxed);
+    reset_ty();
+}
+
+// ---- 型別 / カーネル別 / m 分布の内訳 (P93) --------------------------------
+//
+// 本番モデルの expert は層ごとに型が混在している (gate/up: Q4_K / Q6_K / Q5_K /
+// IQ4_XS / IQ3_XXS、down: IQ4_NL / Q2_0)。行列ごとの集計だけでは「どの型がどの
+// カーネルを通って何 ms 使ったか」が読めないので、(行列, 型) ごとに
+// 呼び出し数 / バイト / ns / m (1 呼び出しの行数) 分布 / カーネル実行先を積む。
+// こちらも読み取り専用のカウンタで、数値経路には触れない。
+
+/// 型別内訳のスロット数。型 id は ggml 値そのまま (実機で確認されている最大は 42)。
+pub const NTY: usize = 48;
+/// m (1 呼び出しの行数) 分布のビン数。上限は `M_BIN_MAX` ([1, 2, 4, 8, 16, 32, 64, 65+])。
+pub const NMB: usize = 8;
+/// m 分布のビン上限 (`rows <= max` の最初のビンに入れる。末尾は 65+)。
+pub const M_BIN_MAX: [u64; NMB] = [1, 2, 4, 8, 16, 32, 64, u64::MAX];
+/// m 分布のビン名 (レポート用)。
+pub const M_BIN_NAME: [&str; NMB] = ["1", "2", "4", "8", "16", "32", "64", "65+"];
+
+/// カーネル実行先: スカラー (1 行 dequant + [`crate::model::moe_expert::dot_seq`])。
+pub const K_SCALAR: usize = 0;
+/// カーネル実行先: IQ 系 v2 (8 要素グループを 1 本ずつ)。
+pub const K_IQ_V2: usize = 1;
+/// カーネル実行先: IQ 系 v3 (副ブロック 32 要素をまとめて)。
+pub const K_IQ_V3: usize = 2;
+/// カーネル実行先: IQ4_XS 融合 (P89)。
+pub const K_IQ4XS: usize = 3;
+/// カーネル実行先: Q4_K 融合。
+pub const K_Q4K: usize = 4;
+/// カーネル実行先: Q6_K 融合 (P93)。
+pub const K_Q6K: usize = 5;
+/// カーネル実行先: Q5_K 融合 (P93)。
+pub const K_Q5K: usize = 6;
+/// カーネル実行先: Q5_1 融合。
+pub const K_Q5_1: usize = 7;
+/// カーネル実行先: Q8_0 (expert は classic)。
+pub const K_Q8_0: usize = 8;
+/// カーネル実行先: VNNI (int8 活性、`DENNO_GEMV_VNNI=1` のときだけ)。
+pub const K_VNNI: usize = 9;
+/// カーネル実行先の種別数。
+pub const NKER: usize = 10;
+/// カーネル実行先の名前 (レポート用)。
+pub const KERNEL_NAME: [&str; NKER] = [
+    "scalar", "iq_v2", "iq_v3", "iq4xs", "q4k", "q6k", "q5k", "q5_1", "q8_0", "vnni",
+];
+
+static TY_CALLS: [AtomicU64; NSLOT * NTY] = [const { AtomicU64::new(0) }; NSLOT * NTY];
+static TY_BYTES: [AtomicU64; NSLOT * NTY] = [const { AtomicU64::new(0) }; NSLOT * NTY];
+static TY_ROWS: [AtomicU64; NSLOT * NTY] = [const { AtomicU64::new(0) }; NSLOT * NTY];
+static TY_NS: [AtomicU64; NSLOT * NTY] = [const { AtomicU64::new(0) }; NSLOT * NTY];
+static TY_MBIN: [AtomicU64; NSLOT * NTY * NMB] =
+    [const { AtomicU64::new(0) }; NSLOT * NTY * NMB];
+static TY_KER: [AtomicU64; NSLOT * NTY * NKER] =
+    [const { AtomicU64::new(0) }; NSLOT * NTY * NKER];
+
+#[inline]
+fn ty_slot(mat: usize, ty_id: u32) -> usize {
+    mat.min(NSLOT - 1) * NTY + (ty_id as usize).min(NTY - 1)
+}
+
+/// 行数を m 分布のビン番号にする。
+fn m_bin(rows: usize) -> usize {
+    let r = rows as u64;
+    for (i, max) in M_BIN_MAX.iter().enumerate() {
+        if r <= *max {
+            return i;
+        }
+    }
+    NMB - 1
+}
+
+/// (行列, 型) ごとの GEMV 1 回ぶんの実測 ([`record_call`] の型別版)。
+#[inline]
+pub fn record_call_ty(mat: usize, ty_id: u32, bytes: usize, rows: usize, d: std::time::Duration) {
+    if !on() {
+        return;
+    }
+    let s = ty_slot(mat, ty_id);
+    TY_CALLS[s].fetch_add(1, Ordering::Relaxed);
+    TY_BYTES[s].fetch_add(bytes as u64, Ordering::Relaxed);
+    TY_ROWS[s].fetch_add(rows as u64, Ordering::Relaxed);
+    TY_NS[s].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    TY_MBIN[s * NMB + m_bin(rows)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// カーネル実行先を 1 回数える (分岐の直後で呼ぶ)。
+#[inline]
+pub fn bump_kernel(mat: usize, ty_id: u32, ker: usize) {
+    if on() {
+        TY_KER[ty_slot(mat, ty_id) * NKER + ker.min(NKER - 1)].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 型 id の表示名 ([`crate::kquant::GgmlType`] に無い id は `ty{n}`)。
+fn ty_name(ty_id: usize) -> String {
+    match crate::kquant::GgmlType::from_id(ty_id as u32) {
+        Some(t) => t.name().to_string(),
+        None => format!("ty{ty_id}"),
+    }
+}
+
+/// (行列, 型) ごとの累積。テスト用。
+pub fn ty_stats(mat: usize, ty_id: u32) -> (u64, u64, u64, u64) {
+    let s = ty_slot(mat, ty_id);
+    (
+        TY_CALLS[s].load(Ordering::Relaxed),
+        TY_BYTES[s].load(Ordering::Relaxed),
+        TY_ROWS[s].load(Ordering::Relaxed),
+        TY_NS[s].load(Ordering::Relaxed),
+    )
+}
+
+/// (行列, 型) のカーネル実行先の累積。テスト用。
+pub fn ty_kernel(mat: usize, ty_id: u32, ker: usize) -> u64 {
+    TY_KER[ty_slot(mat, ty_id) * NKER + ker.min(NKER - 1)].load(Ordering::Relaxed)
+}
+
+/// (行列, 型) の m 分布。テスト用。
+pub fn ty_mbin(mat: usize, ty_id: u32, bin: usize) -> u64 {
+    TY_MBIN[ty_slot(mat, ty_id) * NMB + bin.min(NMB - 1)].load(Ordering::Relaxed)
+}
+
+fn reset_ty() {
+    for s in 0..NSLOT * NTY {
+        TY_CALLS[s].store(0, Ordering::Relaxed);
+        TY_BYTES[s].store(0, Ordering::Relaxed);
+        TY_ROWS[s].store(0, Ordering::Relaxed);
+        TY_NS[s].store(0, Ordering::Relaxed);
+        for b in 0..NMB {
+            TY_MBIN[s * NMB + b].store(0, Ordering::Relaxed);
+        }
+        for k in 0..NKER {
+            TY_KER[s * NKER + k].store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 型別内訳を [`line`] の後ろに付ける (非ゼロの (行列, 型) だけ)。
+fn ty_lines() -> String {
+    let mut s = String::new();
+    for m in 0..NSLOT {
+        for ty in 0..NTY {
+            let (c, b, rows, ns) = ty_stats(m, ty as u32);
+            if c == 0 {
+                continue;
+            }
+            let mat_name = if m < NMAT { MAT_NAME[m] } else { "other" };
+            let mut ker = String::new();
+            for k in 0..NKER {
+                let v = TY_KER[ty_slot(m, ty as u32) * NKER + k].load(Ordering::Relaxed);
+                if v > 0 {
+                    if !ker.is_empty() {
+                        ker.push('/');
+                    }
+                    ker.push_str(&format!("{}={v}", KERNEL_NAME[k]));
+                }
+            }
+            if ker.is_empty() {
+                ker.push('-');
+            }
+            let mut mbin = String::new();
+            for bin in 0..NMB {
+                let v = ty_mbin(m, ty as u32, bin);
+                if v > 0 {
+                    if !mbin.is_empty() {
+                        mbin.push('/');
+                    }
+                    mbin.push_str(&format!("{}:{}", M_BIN_NAME[bin], v));
+                }
+            }
+            s.push_str(&format!(
+                "\n[exp-kprof]  {} {:6} calls={c} rows={rows} {:.1} MB {:.1} ms ker {ker} | m {mbin}",
+                mat_name,
+                ty_name(ty),
+                b as f64 / 1e6,
+                ns as f64 / 1e6,
+            ));
+        }
+    }
+    s
 }
