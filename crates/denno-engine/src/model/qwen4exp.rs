@@ -2986,10 +2986,21 @@ fn mix_fast_from_value(v: Option<&str>) -> bool {
     }
 }
 
-/// `hc_mix_quant` を高速経路で計算するか (既定 on)。
+/// `DENNO_MIX_FAST` を hc mix に適用するか (既定 on)。
 fn mix_fast_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| mix_fast_from_value(std::env::var("DENNO_MIX_FAST").ok().as_deref()))
+}
+
+/// `DENNO_HC_MIX_FAST` の解釈。**既定 on**。`0` / `false` / `off` のときだけ
+/// P84 より前の経路 (classic カーネル + 従来の入口) に戻る。
+///
+/// P84 は `hc_down` / `hc_up` の Q8_0 融合カーネルを 2 行同時版
+/// ([`moe_expert::expert_gemv_q8_fast_2row`]) に切り替える (値はビット一致、
+/// 行ごとの累積順序は不変)。実機で退行したときの逃げ道。
+fn hc_mix_fast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| mix_fast_from_value(std::env::var("DENNO_HC_MIX_FAST").ok().as_deref()))
 }
 
 /// head (`output`) の GEMV を**行 (語彙方向) で並列化する**門番 (行数)。
@@ -3021,8 +3032,9 @@ fn head_row_par_min() -> usize {
 ///
 /// 既定の門番は 512 行なので 320 行は 1 スレッドで回っていた (実形の CPU 計測で
 /// mix の約 50%)。行は独立で各要素の加算順は行内で完結するので、行を分けても
-/// 値はビット一致する。
-const HC_DOWN_ROW_PAR_MIN: usize = 64;
+/// 値はビット一致する。マイクロベンチ ([`tests/head_gemv_bench`] と同じ流儀) が
+/// 本番入口を通すので `pub`。
+pub const HC_DOWN_ROW_PAR_MIN: usize = 64;
 
 /// `hc_mix` を**量子化重み**で計算する (`hyper::hc_mix` と同じ丸め順序)。
 ///
@@ -3065,8 +3077,10 @@ fn hc_mix_quant_ref(
 
     let t = mix_kprof::stamp();
     let mut lo = vec![0.0f32; down.n()];
+    mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_DOWN);
     down.gemv_label("hc_down", &xn, &mut lo)
         .map_err(|err| one(format!("hc_mix down: {err}")))?;
+    mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_UP);
     mix_kprof::mark(t, mix_kprof::DOWN);
 
     let t = mix_kprof::stamp();
@@ -3077,6 +3091,7 @@ fn hc_mix_quant_ref(
     let mut gate = vec![0.0f32; up.n()];
     up.gemv_label("hc_up", &lo, &mut gate)
         .map_err(|err| one(format!("hc_mix up: {err}")))?;
+    mix_kprof::rowpar::set_label(mix_kprof::rowpar::NONE);
     mix_kprof::mark(t, mix_kprof::UP);
 
     let t = mix_kprof::stamp();
@@ -3183,8 +3198,15 @@ fn hc_mix_quant_fast(
 
         let lo = MixScratch::take(lo, down.n());
         let t = mix_kprof::stamp();
-        down.gemv_label_par("hc_down", xn, lo, HC_DOWN_ROW_PAR_MIN)
-            .map_err(|err| one(format!("hc_mix down: {err}")))?;
+        mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_DOWN);
+        let hc_fast = hc_mix_fast_enabled();
+        if hc_fast {
+            down.gemv_label_par_2row("hc_down", xn, lo, HC_DOWN_ROW_PAR_MIN)
+        } else {
+            down.gemv_label_par("hc_down", xn, lo, HC_DOWN_ROW_PAR_MIN)
+        }
+        .map_err(|err| one(format!("hc_mix down: {err}")))?;
+        mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_UP);
         mix_kprof::mark(t, mix_kprof::DOWN);
 
         let t = mix_kprof::stamp();
@@ -3193,8 +3215,13 @@ fn hc_mix_quant_fast(
 
         let gate = MixScratch::take(gate, up.n());
         let t = mix_kprof::stamp();
-        up.gemv_label("hc_up", lo, gate)
-            .map_err(|err| one(format!("hc_mix up: {err}")))?;
+        if hc_fast {
+            up.gemv_label_par_2row("hc_up", lo, gate, 0)
+        } else {
+            up.gemv_label("hc_up", lo, gate)
+        }
+        .map_err(|err| one(format!("hc_mix up: {err}")))?;
+        mix_kprof::rowpar::set_label(mix_kprof::rowpar::NONE);
         mix_kprof::mark(t, mix_kprof::UP);
 
         let mixed = MixScratch::take(mixed, e);
@@ -3811,7 +3838,7 @@ pub mod mix_kprof {
             .map(|&s| ns(s))
             .sum();
         let other = ns(TOTAL).saturating_sub(staged);
-        Some(format!(
+        let mut s = format!(
             "[mix-kprof] calls={calls} total={} ns | gn {} ns {:.1}% | down {} ns {:.1}% | \
              lo {} ns {:.1}% | up {} ns {:.1}% | mixed {} ns {:.1}% | inj {} ns {:.1}% | \
              inj_apply {} ns {:.1}% | other {} ns {:.1}%",
@@ -3832,7 +3859,12 @@ pub mod mix_kprof {
             pct(INJ_APPLY),
             other,
             other as f64 * 100.0 / tot as f64
-        ))
+        );
+        // P84: 行並列 region の実態 (発火の有無・チャンク数・実効並列度)。
+        for i in 0..rowpar::NL {
+            s.push_str(&rowpar::line_part(i));
+        }
+        Some(s)
     }
 
     /// 累積を 0 に戻す。
@@ -3841,6 +3873,122 @@ pub mod mix_kprof {
             c.store(0, Ordering::Relaxed);
         }
         CALLS.store(0, Ordering::Relaxed);
+        rowpar::reset();
+    }
+
+    /// P84: hc mix の行並列 region の常時カウンタ ([`on`] と同じ env ゲート)。
+    ///
+    /// [`crate::model::moe_expert`] の `for_each_row_chunk` が region のたびに積む。
+    /// どの GEMV の region かは mix 側が thread-local のラベルで示す
+    /// ([`rowpar::set_label`]、`0` は未設定 = 何も積まない)。expert GEMV など
+    /// ラベルの立っていない呼び出しは混ざらない。
+    ///
+    /// 実機で読みたいこと (task 84):
+    /// - P79b の行並列が本番で発火しているか (`fired` / `regions`)
+    /// - 1 呼び出しで rayon が何チャンク (= 最大スレッド数) に割ったか
+    ///   (`chunks` / `fired`)
+    /// - 実効並列度 (`comp` / `wall`。1 のままなら 1 スレッドでしか回っていない)、
+    ///   fork-join の固定費は 1 スレッドのときの `wall - comp` で読む
+    pub mod rowpar {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// ラベル: 未設定 (何も積まない)。
+        pub const NONE: u8 = 0;
+        /// ラベル: `hc_down` の GEMV。
+        pub const L_DOWN: u8 = 1;
+        /// ラベル: `hc_up` の GEMV。
+        pub const L_UP: u8 = 2;
+        /// ラベルの数 (カウンタ配列の長さ)。
+        pub const NL: usize = 2;
+        /// 行の名前 (レポート用、[`L_DOWN`] / [`L_UP`] の順)。
+        pub const NAME: [&str; NL] = ["down", "up"];
+
+        static REGIONS: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
+        static FIRED: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
+        static CHUNKS: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
+        static WALL_NS: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
+        static COMP_NS: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
+
+        thread_local! {
+            static LBL: std::cell::Cell<u8> = const { std::cell::Cell::new(NONE) };
+        }
+
+        /// このスレッドの GEMV ラベルを立てる (off のときは no-op)。
+        #[inline]
+        pub fn set_label(l: u8) {
+            if super::on() {
+                LBL.with(|c| c.set(l));
+            }
+        }
+
+        /// 現在のラベル (off なら常に [`NONE`])。
+        #[inline]
+        pub fn label() -> u8 {
+            if super::on() {
+                LBL.with(|c| c.get())
+            } else {
+                NONE
+            }
+        }
+
+        /// region を 1 件積む。`fired` は rayon で割れたか、`chunks` は分割チャンク数
+        /// (逐次は 1)、`wall_ns` は region の壁時計、`comp_ns` はチャンク内の純計算
+        /// (`f`) の合計 (スレッド時間の合計)。
+        pub fn record(l: u8, fired: bool, chunks: usize, wall_ns: u64, comp_ns: u64) {
+            let i = (l as usize).saturating_sub(1).min(NL - 1);
+            REGIONS[i].fetch_add(1, Ordering::Relaxed);
+            if fired {
+                FIRED[i].fetch_add(1, Ordering::Relaxed);
+                CHUNKS[i].fetch_add(chunks as u64, Ordering::Relaxed);
+            }
+            WALL_NS[i].fetch_add(wall_ns, Ordering::Relaxed);
+            COMP_NS[i].fetch_add(comp_ns, Ordering::Relaxed);
+        }
+
+        /// (regions, fired, chunks, wall_ns, comp_ns)。テスト用。
+        pub fn stats(i: usize) -> (u64, u64, u64, u64, u64) {
+            let i = i.min(NL - 1);
+            (
+                REGIONS[i].load(Ordering::Relaxed),
+                FIRED[i].load(Ordering::Relaxed),
+                CHUNKS[i].load(Ordering::Relaxed),
+                WALL_NS[i].load(Ordering::Relaxed),
+                COMP_NS[i].load(Ordering::Relaxed),
+            )
+        }
+
+        /// カウンタを 0 に戻す ([`super::reset`] から呼ぶ)。
+        pub fn reset() {
+            for i in 0..NL {
+                REGIONS[i].store(0, Ordering::Relaxed);
+                FIRED[i].store(0, Ordering::Relaxed);
+                CHUNKS[i].store(0, Ordering::Relaxed);
+                WALL_NS[i].store(0, Ordering::Relaxed);
+                COMP_NS[i].store(0, Ordering::Relaxed);
+            }
+        }
+
+        /// 1 ラベルぶんの追記 (`[mix-kprof]` 行の末尾に付ける)。
+        pub fn line_part(i: usize) -> String {
+            let (regions, fired, chunks, wall_ns, comp_ns) = stats(i);
+            let name = NAME[i];
+            if regions == 0 {
+                return format!(" | {name} regions=0");
+            }
+            let per = |v: u64| v as f64 / regions as f64 / 1e3;
+            let par_eff = if wall_ns > 0 {
+                comp_ns as f64 / wall_ns as f64
+            } else {
+                1.0
+            };
+            format!(
+                " | {name} regions={regions} fired={fired} chunks={:.1} wall={:.0}us \
+                 comp={:.0}us par_eff={par_eff:.1}",
+                chunks as f64 / regions as f64,
+                per(wall_ns),
+                per(comp_ns),
+            )
+        }
     }
 }
 
@@ -10638,6 +10786,73 @@ mod tests {
             assert_bitwise_eq(&i_fast, &i_ref, "down 行並列の有無 (inject)");
         }
 
+        /// P84: 2 行同時カーネル ([`hc_mix_quant_fast`] の既定経路) が classic
+        /// カーネルと**ビット一致**する。
+        ///
+        /// 1 行 / 実形の down (320 行) と up (10240 行) / 端数 (奇数行) / 門番未満
+        /// (行並列が立たない逐次) を比べ、さらに `gemv_batch` の 1 トークン
+        /// (prefill と同じ経路) とも比べる。行ごとの累積順序は 2 行化で変わらない
+        /// ので、全部 `to_bits()` で一致するはず。
+        #[test]
+        fn hc_mix_2row_kernel_matches_classic_bitexact() {
+            // (k, n): down 実形 / up 実形 / 1 行 / 端数 (偶数側が切り捨てられる奇数) /
+            // 門番未満の逐次。k は 32 の倍数 (Q8_0 のブロック)。
+            let shapes = [
+                ("down 実形", 10240usize, 320usize),
+                ("up 実形", 320, 10240),
+                ("1 行", 10240, 1),
+                ("端数 (down)", 10240, 321),
+                ("端数 (up)", 320, 10241),
+                ("門番未満", 10240, 63),
+            ];
+            for (name, k, n) in shapes {
+                let lin = GgufLinear::from_slice(GgmlType::Q8_0, k, n, &q8_0_weights(k, n, 11))
+                    .expect("GgufLinear::from_slice (Q8_0)")
+                    .with_fast_q8(true);
+                let x: Vec<f32> =
+                    (0..k).map(|i| (((i * 31) % 97) as f32 - 48.0) * 0.011).collect();
+                // classic (P84 までの入口。`gemv_label_par` は門番 64 を明示、
+                // `gemv_label` は既定門番 512) と 2 行同時版。
+                let mut a = vec![0.0f32; n];
+                lin.gemv_label_par("hc_2row_test_classic", &x, &mut a, 64)
+                    .expect("gemv_label_par (classic)");
+                let mut b = vec![0.0f32; n];
+                lin.gemv_label_par_2row("hc_2row_test_2row", &x, &mut b, 64)
+                    .expect("gemv_label_par_2row");
+                assert_bitwise_eq(&b, &a, &format!("2row vs classic ({name})"));
+                let mut c = vec![0.0f32; n];
+                lin.gemv_label("hc_2row_test_label", &x, &mut c)
+                    .expect("gemv_label (classic 既定門番)");
+                assert_bitwise_eq(&b, &c, &format!("2row vs gemv_label ({name})"));
+                assert!(
+                    a.iter().any(|v| *v != 0.0),
+                    "{name}: 出力が全 0 (経路の生死が分からない)"
+                );
+                // batch (`gemv_batch` = prefill の経路) の 1 トークンとも一致。
+                let mut bat = vec![0.0f32; n];
+                gemv_batch(&lin, &x, 1, &mut bat).expect("gemv_batch (nt=1)");
+                assert_bitwise_eq(&bat, &a, &format!("batch vs classic ({name})"));
+            }
+        }
+
+        /// P84: mix 全体でも 2 行同時カーネル (既定 on の高速経路) が旧経路と
+        /// ビット一致することを**実形** (hc=4 / e=2560 / lr=320: down は
+        /// 10240 x 320、up は 320 x 10240) で確かめる。
+        /// `hc_mix_fast_matches_ref_bitexact` が小さい形、このテストが実形を通る。
+        #[test]
+        fn hc_mix_2row_fast_matches_ref_bitexact_realish() {
+            let (hp, norm, down, up, inject, res) = mix_q8_case(4, 2560, 320);
+            assert_eq!(down.k(), 4 * 2560, "down の入力長 (hc_dim)");
+            assert_eq!(down.n(), 320, "down の行数 (hc_lr)");
+            assert_eq!(up.n(), 4 * 2560, "up の出力長 (hc_dim)");
+            let (m_fast, i_fast) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            let (m_ref, i_ref) =
+                hc_mix_quant_ref(&res, &norm, &down, &up, Some(&inject), &hp).expect("ref");
+            assert_bitwise_eq(&m_fast, &m_ref, "2row 高速経路 vs 旧経路 (mixed)");
+            assert_bitwise_eq(&i_fast, &i_ref, "2row 高速経路 vs 旧経路 (inject)");
+        }
+
         /// `DENNO_MIX_KPROF` の区間計測が全区間で回る (強制 on で確認)。
         #[test]
         fn mix_kprof_counts_every_region() {
@@ -10665,6 +10880,43 @@ mod tests {
                     "区間 {name} が 0 ns (計測が通っていない): {line}"
                 );
             }
+            mix_kprof::reset();
+            mix_kprof::set_for_test(false);
+        }
+
+        /// P84: 行並列 region のカウンタが down / up で積まれる
+        /// (実機で「発火の有無・チャンク数・実効並列度」が読めることの証拠)。
+        ///
+        /// down は 320 行 (門番 [`HC_DOWN_ROW_PAR_MIN`] = 64 以上)、up は 640 行
+        /// (既定門番 = moe_expert の `PAR_MIN_ROWS` = 512 以上) の形で
+        /// 1 呼び出し回す (実形 27B では down=320 / up=10240 行。up は既定門番で発火)。
+        /// inject にはラベルを立てないので、region 数が down=1 / up=1 のままで
+        /// あることも同時に確認する (expert GEMV 等が混ざらないことの証拠)。
+        #[test]
+        fn mix_kprof_rowpar_counts_down_and_up() {
+            use mix_kprof::rowpar;
+            let (hp, norm, down, up, inject, res) = mix_q8_case(2, 320, 320);
+            mix_kprof::set_for_test(true);
+            mix_kprof::reset();
+            let _ = hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            let (rd, fd, cd, _, _) = rowpar::stats(rowpar::L_DOWN as usize - 1);
+            let (ru, fu, cu, _, _) = rowpar::stats(rowpar::L_UP as usize - 1);
+            assert_eq!(rd, 1, "down region が 1 回計上されていない");
+            assert_eq!(fd, 1, "down の行並列が発火していない (320 行 >= 門番 64)");
+            assert!(cd >= 2, "down が 1 チャンクしか割れていない (cd={cd})");
+            assert_eq!(ru, 1, "up region が 1 回計上されていない");
+            assert_eq!(fu, 1, "up の行並列が発火していない (640 行 >= 既定門番 512)");
+            assert!(cu >= 2, "up が 1 チャンクしか割れていない (cu={cu})");
+            // 1 行の内訳に par 部が載る (serve が読む形)。
+            let line = mix_kprof::line().expect("強制 on なのに line() が None");
+            assert!(
+                line.contains("down regions=1 fired=1"),
+                "行の par 部が違う: {line}"
+            );
+            assert!(
+                line.contains("up regions=1 fired=1"),
+                "行の par 部が違う: {line}"
+            );
             mix_kprof::reset();
             mix_kprof::set_for_test(false);
         }

@@ -18,7 +18,10 @@
 use anyhow::{bail, Result};
 
 use crate::kquant::{dequant_row_into, GgmlType};
-use crate::model::moe_expert::{expert_gemv, expert_gemv_q8_fast, expert_gemv_q8_fast_min};
+use crate::model::moe_expert::{
+    expert_gemv, expert_gemv_q8_fast, expert_gemv_q8_fast_2row, expert_gemv_q8_fast_min,
+    expert_gemv_q8_fast_min_2row,
+};
 use crate::quant::WeightBlocks;
 
 /// 1 行のバイト数。`moe_expert::row_bytes` は量子型だけを受けるので、
@@ -514,11 +517,37 @@ impl GgufLinear {
     ) -> Result<()> {
         use crate::model::devprof;
         if !devprof::on() {
-            return self.gemv_impl_par(x, out, row_par_min);
+            return self.gemv_impl_par(x, out, row_par_min, false);
         }
         let t = std::time::Instant::now();
         devprof::clear();
-        let r = self.gemv_impl_par(x, out, row_par_min);
+        let r = self.gemv_impl_par(x, out, row_par_min, false);
+        let ns = t.elapsed().as_nanos() as u64;
+        let (up, down, sync_ns) = devprof::take_pending();
+        devprof::add(label, ns, up, down, sync_ns);
+        r
+    }
+
+    /// [`Self::gemv_label_par`] の 2 行同時カーネル版 (P84、hc mix 専用)。
+    ///
+    /// Q8_0 融合カーネルを隣接 2 行を同時に処理する版に変えるだけで、出力は
+    /// [`Self::gemv_label_par`] と**ビット一致**する (行ごとの累積順序は不変)。
+    /// 対象・しきい値の意味は [`Self::gemv_label_par`] と同じ
+    /// (`row_par_min = 0` は既定の門番)。
+    pub fn gemv_label_par_2row(
+        &self,
+        label: &'static str,
+        x: &[f32],
+        out: &mut [f32],
+        row_par_min: usize,
+    ) -> Result<()> {
+        use crate::model::devprof;
+        if !devprof::on() {
+            return self.gemv_impl_par(x, out, row_par_min, true);
+        }
+        let t = std::time::Instant::now();
+        devprof::clear();
+        let r = self.gemv_impl_par(x, out, row_par_min, true);
         let ns = t.elapsed().as_nanos() as u64;
         let (up, down, sync_ns) = devprof::take_pending();
         devprof::add(label, ns, up, down, sync_ns);
@@ -527,13 +556,21 @@ impl GgufLinear {
 
     /// 本体 ([`Self::gemv_label`] 用。行並列は既定の門番)。
     fn gemv_impl(&self, x: &[f32], out: &mut [f32]) -> Result<()> {
-        self.gemv_impl_par(x, out, 0)
+        self.gemv_impl_par(x, out, 0, false)
     }
 
     /// 本体。[`Self::gemv_label`] が時間と転送量を測るために外側から包む。
     ///
     /// `row_par_min != 0` のとき、Q8_0 融合カーネルの行並列の門番を差し替える。
-    fn gemv_impl_par(&self, x: &[f32], out: &mut [f32], row_par_min: usize) -> Result<()> {
+    /// `two_row` は Q8_0 融合カーネルに 2 行同時版
+    /// ([`expert_gemv_q8_fast_2row`]) を選ばせる (値は classic 版とビット一致)。
+    fn gemv_impl_par(
+        &self,
+        x: &[f32],
+        out: &mut [f32],
+        row_par_min: usize,
+        two_row: bool,
+    ) -> Result<()> {
         if x.len() != self.k {
             bail!("GgufLinear::gemv: x の長さ {} が k={} と違う", x.len(), self.k);
         }
@@ -566,7 +603,20 @@ impl GgufLinear {
                 }
                 if self.fast_q8 && self.ty == GgmlType::Q8_0 {
                     return if row_par_min == 0 {
-                        expert_gemv_q8_fast(self.blocks.as_slice(), self.k, self.n, x, out)
+                        if two_row {
+                            expert_gemv_q8_fast_2row(self.blocks.as_slice(), self.k, self.n, x, out)
+                        } else {
+                            expert_gemv_q8_fast(self.blocks.as_slice(), self.k, self.n, x, out)
+                        }
+                    } else if two_row {
+                        expert_gemv_q8_fast_min_2row(
+                            self.blocks.as_slice(),
+                            self.k,
+                            self.n,
+                            x,
+                            out,
+                            row_par_min,
+                        )
                     } else {
                         expert_gemv_q8_fast_min(
                             self.blocks.as_slice(),
