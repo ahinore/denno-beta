@@ -3259,7 +3259,18 @@ fn hc_mix_quant_fast(
 /// 加算順序も逐次版と同じなので、1 トークンぶんの出力は [`hc_mix_quant`] と
 /// ビット一致する (`inject` は `[nt][hc]` の連結で返す)。
 ///
+/// **nt == 1 (decode) は逐次 fast 経路 ([`hc_mix_quant_fast`]) に委譲する**
+/// (task 86c)。1 トークンぶんの出力は上記の通り逐次版とビット一致するので、
+/// 委譲で値は動かない。batch 経路の [`gemv_batch`] は nt=1 では classic カーネルを
+/// 1 行ずつ回すだけで (`gemv_rows_pertoken` / `expert_gemm_any` m=1)、2 行カーネルも
+/// 行並列の region 計測も持たない。委譲先は P84/P86 でチューニングした入口そのもの
+/// (2 行カーネル + `HC_DOWN_ROW_PAR_MIN` の行並列 + scratch 使い回し) で、
+/// `DENNO_HC_MIX_FAST=0` で旧経路 (GPU intercept に落ちる入口) に戻るのも
+/// 逐次経路と同じ。
+///
 /// 要素演算の出力は `scratch` に書く (戻り値で返す `mixed` / `inject` だけ確保する)。
+/// nt == 1 の委譲時は `scratch` を使わない (委譲先がスレッドローカルの
+/// [`MIX_SCRATCH`] を使う)。
 fn hc_mix_quant_batch(
     ress: &[HyperStreams],
     norm: &[f32],
@@ -3280,9 +3291,8 @@ fn hc_mix_quant_batch(
             )));
         }
     }
-    let xn_flat = MixScratch::take(&mut scratch.xn, nt * hc_dim);
-    hyper::grouped_rms_norm_batch_into(ress, norm, xn_flat, hp);
-
+    // 形の検査は nt によらず先に済ませる (nt == 1 の委譲時もエラーの文言を揃える。
+    // 委譲先の逐次 fast は low_rank / hc_dim の検査を持たない)。
     let dn = down.n();
     if dn != hp.low_rank {
         return Err(one(format!(
@@ -3290,17 +3300,33 @@ fn hc_mix_quant_batch(
             hp.low_rank
         )));
     }
-    let lo = MixScratch::take(&mut scratch.lo, nt * dn);
-    gemv_batch(down, xn_flat, nt, lo)
-        .map_err(|err| one(format!("hc_mix down (batch): {err}")))?;
-    hyper::hc_lo_apply_batch(lo, nt, hp);
-
     let un = up.n();
     if un != hc_dim {
         return Err(one(format!(
             "hc_mix up (batch): 行数 {un} が hc_dim {hc_dim} と違う"
         )));
     }
+    if let Some(w) = inject {
+        let wn = w.n();
+        if wn != hp.hc {
+            return Err(one(format!(
+                "hc_mix inject (batch): 行数 {wn} が hc {} と違う",
+                hp.hc
+            )));
+        }
+    }
+    if nt == 1 {
+        let (mixed, inj) = hc_mix_quant_fast(&ress[0], norm, down, up, inject, hp)?;
+        return Ok((vec![mixed], inj));
+    }
+    let xn_flat = MixScratch::take(&mut scratch.xn, nt * hc_dim);
+    hyper::grouped_rms_norm_batch_into(ress, norm, xn_flat, hp);
+
+    let lo = MixScratch::take(&mut scratch.lo, nt * dn);
+    gemv_batch(down, xn_flat, nt, lo)
+        .map_err(|err| one(format!("hc_mix down (batch): {err}")))?;
+    hyper::hc_lo_apply_batch(lo, nt, hp);
+
     let gate = MixScratch::take(&mut scratch.gate, nt * un);
     gemv_batch(up, lo, nt, gate).map_err(|err| one(format!("hc_mix up (batch): {err}")))?;
     let mixed_flat = MixScratch::take(&mut scratch.mixed, nt * e);
@@ -10671,6 +10697,66 @@ mod tests {
                 mixed[0].iter().any(|v| *v != 0.0),
                 "mixed が全 0 (経路の生死が分からない)"
             );
+        }
+
+        /// P86c: batch の nt == 1 は逐次 fast 経路 ([`hc_mix_quant_fast`]) に
+        /// 委譲する (2 行カーネル + `HC_DOWN_ROW_PAR_MIN` の行並列 +
+        /// `MIX_SCRATCH` 使い回しを持つ P84/P86 の入口そのもの)。
+        ///
+        /// 委譲が実際に発火したことは `MIX_FAST_CALLS` の増分で示す。batch 本体は
+        /// fast を呼ばないので nt = 2 では増えないのが対照になる。出力は
+        /// 逐次 [`hc_mix_quant`] と `to_bits()` 一致で、nt = 2 の batch 本体の
+        /// token 0 とも一致する (gemv_batch は行ごとの独立な行列積なので、
+        /// 委譲で batch 経路の値が動かないことの固定)。
+        #[test]
+        fn hc_mix_batch_nt1_delegates_to_seq_fast() {
+            let (hp, norm, down, up, inject, res) = mix_q8_case(2, 32, 32);
+            let make = |d: &[f32]| HyperStreams {
+                data: d.to_vec(),
+                hc: hp.hc,
+                n_embd: hp.n_embd,
+            };
+            let calls = || MIX_FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+
+            // nt = 1: 委譲が発火して fast がちょうど 1 回呼ばれる。
+            let before = calls();
+            let (mixed, injs) = hc_mix_quant_batch(
+                &[make(&res.data)],
+                &norm,
+                &down,
+                &up,
+                Some(&inject),
+                &hp,
+                &mut MixScratch::default(),
+            )
+            .expect("hc_mix_quant_batch (nt=1)");
+            assert_eq!(
+                calls() - before,
+                1,
+                "nt=1 で逐次 fast 経路に委譲していない (2 行カーネルに届かない)"
+            );
+            assert_eq!(injs.len(), hp.hc, "nt=1 の inject は [nt][hc] = hc 本");
+
+            // 出力は逐次版とビット一致 (委譲先は逐次 fast そのもの)。
+            let (m, i) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("hc_mix_quant");
+            assert_bitwise_eq(&m, &mixed[0], "hc_mix mixed (nt=1 委譲)");
+            assert_bitwise_eq(&i, &injs, "hc_mix inject (nt=1 委譲)");
+
+            // nt >= 2 は batch 本体のまま (委譲しない)。
+            let before = calls();
+            let (mixed2, _) = hc_mix_quant_batch(
+                &[make(&res.data), res],
+                &norm,
+                &down,
+                &up,
+                Some(&inject),
+                &hp,
+                &mut MixScratch::default(),
+            )
+            .expect("hc_mix_quant_batch (nt=2)");
+            assert_eq!(calls() - before, 0, "nt=2 で委譲が発火した");
+            assert_bitwise_eq(&mixed2[0], &mixed[0], "hc_mix mixed (nt=2 token 0)");
         }
 
         /// Q8_0 のダミー重み (34 B ブロック: f16 スケール + i8 x 32)。
