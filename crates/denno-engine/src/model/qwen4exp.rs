@@ -3107,6 +3107,8 @@ fn hc_mix_quant_ref(
             let t = mix_kprof::stamp();
             w.gemv_label("hc_inject", &xn, &mut v)
                 .map_err(|err| one(format!("hc_mix inject: {err}")))?;
+            // task 96: inject GEMV 1 発の実行先と dtype (down/up と同じ `Instant`)。
+            mix_kprof::gemv::note_inj(t, w.ty());
             mix_kprof::mark(t, mix_kprof::INJ);
             let t = mix_kprof::stamp();
             hyper::hc_inject_apply(&mut v, hp);
@@ -3241,6 +3243,8 @@ fn hc_mix_quant_fast(
                 let t = mix_kprof::stamp();
                 w.gemv_label("hc_inject", xn, &mut v)
                     .map_err(|err| one(format!("hc_mix inject: {err}")))?;
+                // task 96: inject GEMV 1 発の実行先と dtype (down/up と同じ `Instant`)。
+                mix_kprof::gemv::note_inj(t, w.ty());
                 mix_kprof::mark(t, mix_kprof::INJ);
                 let t = mix_kprof::stamp();
                 hyper::hc_inject_apply(&mut v, hp);
@@ -3924,6 +3928,15 @@ pub mod mix_kprof {
     ///   (`chunks` / `fired`)
     /// - 実効並列度 (`comp` / `wall`。1 のままなら 1 スレッドでしか回っていない)、
     ///   fork-join の固定費は 1 スレッドのときの `wall - comp` で読む
+    ///
+    /// task 96: wall の内訳を skew 3 項目で分離する (発火 region のみ)。
+    /// - `t_first=`: region 先頭 -> 最初のチャンク完了。1 チャンクの平均時間
+    ///   (`comp` / `chunks`) と等しければ全スレッドが即座に仕事を得ている。
+    ///   大きく上回るなら fork/ディスパッチ待ちが実在する。
+    /// - `spread=`: 最初の完了 -> 最後の完了。`t_first` + `spread` = wall。
+    ///   チャンク実時間のばらつき (メモリ競合での伸び) と後発走行がここに出る。
+    /// - `tstart=`: チャンク開始オフセットのチャンク平均。0 に近ければ
+    ///   スレッドは仕事を待っていなかった (不足しているのは走行の重なり)。
     pub mod rowpar {
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3945,8 +3958,18 @@ pub mod mix_kprof {
         static COMP_NS: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
         /// task 93: 発火した region で `rayon::current_num_threads()` が返した値の合計
         /// (発火 1 件あたりの平均を `th=` で出す。逐次 region は積まない)。
-        /// 実機の「プール スレッド数 > 物理コア数」(SMT の取り合い) を見るため。
+        /// 実機の「プール スレッド数 > 物理コア数」(SMT の取り合い) を判別する。
         static TH_SUM: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
+        /// task 96: 発火 region の「最初のチャンク完了オフセット」の合計
+        /// (region 先頭基準。[`FIRED`] で割ると `t_first=`)。
+        static FIRST_END_SUM: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
+        /// task 96: 発火 region の全チャンク開始オフセットの合計
+        /// ([`CHUNKS`] で割ると `tstart=` = スレッドが仕事を得るまでの待ちの平均)。
+        static START_SUM: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
+        /// task 96: 発火 region の wall の合計 ([`FIRED`] で割った値と
+        /// [`FIRST_END_SUM`] から `spread=` を出す。[`WALL_NS`] は逐次 region も
+        /// 含むので発火だけの平均には使えない)。
+        static FIRED_WALL_NS: [AtomicU64; NL] = [const { AtomicU64::new(0) }; NL];
 
         thread_local! {
             static LBL: std::cell::Cell<u8> = const { std::cell::Cell::new(NONE) };
@@ -3974,13 +3997,30 @@ pub mod mix_kprof {
         /// (逐次は 1)、`wall_ns` は region の壁時計、`comp_ns` はチャンク内の純計算
         /// (`f`) の合計 (スレッド時間の合計)。`th` は発火 region の
         /// `rayon::current_num_threads()` (逐次は 0 = 積まない)。
-        pub fn record(l: u8, fired: bool, chunks: usize, wall_ns: u64, comp_ns: u64, th: usize) {
+        ///
+        /// task 96: `first_end_ns` は発火 region の「最初のチャンク完了オフセット」
+        /// (region 先頭基準)、`start_sum_ns` は全チャンク開始オフセットの和。
+        /// **fired のときだけ**積む (逐次呼び出し側は 0 を渡す。逐次は単一チャンクで
+        /// 開始オフセット 0・完了 = wall なので skew の情報を持たない)。
+        pub fn record(
+            l: u8,
+            fired: bool,
+            chunks: usize,
+            wall_ns: u64,
+            comp_ns: u64,
+            th: usize,
+            first_end_ns: u64,
+            start_sum_ns: u64,
+        ) {
             let i = (l as usize).saturating_sub(1).min(NL - 1);
             REGIONS[i].fetch_add(1, Ordering::Relaxed);
             if fired {
                 FIRED[i].fetch_add(1, Ordering::Relaxed);
                 CHUNKS[i].fetch_add(chunks as u64, Ordering::Relaxed);
                 TH_SUM[i].fetch_add(th as u64, Ordering::Relaxed);
+                FIRST_END_SUM[i].fetch_add(first_end_ns, Ordering::Relaxed);
+                START_SUM[i].fetch_add(start_sum_ns, Ordering::Relaxed);
+                FIRED_WALL_NS[i].fetch_add(wall_ns, Ordering::Relaxed);
             }
             WALL_NS[i].fetch_add(wall_ns, Ordering::Relaxed);
             COMP_NS[i].fetch_add(comp_ns, Ordering::Relaxed);
@@ -3998,6 +4038,17 @@ pub mod mix_kprof {
             )
         }
 
+        /// task 96: (first_end_sum, start_sum, fired_wall_ns)。発火 region だけの
+        /// skew 累計。テスト用 (本番の表示は [`line_part`])。
+        pub fn skew(i: usize) -> (u64, u64, u64) {
+            let i = i.min(NL - 1);
+            (
+                FIRST_END_SUM[i].load(Ordering::Relaxed),
+                START_SUM[i].load(Ordering::Relaxed),
+                FIRED_WALL_NS[i].load(Ordering::Relaxed),
+            )
+        }
+
         /// カウンタを 0 に戻す ([`super::reset`] から呼ぶ)。
         pub fn reset() {
             for i in 0..NL {
@@ -4007,6 +4058,9 @@ pub mod mix_kprof {
                 WALL_NS[i].store(0, Ordering::Relaxed);
                 COMP_NS[i].store(0, Ordering::Relaxed);
                 TH_SUM[i].store(0, Ordering::Relaxed);
+                FIRST_END_SUM[i].store(0, Ordering::Relaxed);
+                START_SUM[i].store(0, Ordering::Relaxed);
+                FIRED_WALL_NS[i].store(0, Ordering::Relaxed);
             }
         }
 
@@ -4031,13 +4085,39 @@ pub mod mix_kprof {
             } else {
                 0.0
             };
-            format!(
+            let mut s = format!(
                 " | {name} regions={regions} fired={fired} chunks={:.1} th={th:.1} wall={:.0}us \
                  comp={:.0}us par_eff={par_eff:.1}",
                 chunks as f64 / regions as f64,
                 per(wall_ns),
                 per(comp_ns),
-            )
+            );
+            // task 96: wall の内訳 (発火 region のみ。逐次は単一チャンクなので
+            // skew を持たない)。
+            // - t_first: region 先頭 -> 最初のチャンク完了。comp/chunks (1 チャンクの
+            //   平均時間) と比べると fork/ディスパッチ待ちが読める (等しければ
+            //   全スレッドが即座に仕事を得て並列走行している)。
+            // - spread: 最初の完了 -> 最後の完了 (= wall)。完了の散らばり。
+            //   t_first が理想に近く spread が大きいときは、チャンクは即時開始だが
+            //   一部が長く走っている (メモリ競合での伸び or 後発走行)。
+            // - tstart: チャンク開始オフセットのチャンク平均。スレッドが仕事を
+            //   得るまでの待ちの平均 (0 に近ければ待ち無し)。
+            if fired > 0 {
+                let fired_f = fired as f64;
+                let t_first_us = FIRST_END_SUM[i].load(Ordering::Relaxed) as f64 / fired_f / 1e3;
+                let fired_wall_us = FIRED_WALL_NS[i].load(Ordering::Relaxed) as f64 / fired_f / 1e3;
+                let spread_us = (fired_wall_us - t_first_us).max(0.0);
+                let chunks_total = CHUNKS[i].load(Ordering::Relaxed);
+                let tstart_us = if chunks_total > 0 {
+                    START_SUM[i].load(Ordering::Relaxed) as f64 / chunks_total as f64 / 1e3
+                } else {
+                    0.0
+                };
+                s.push_str(&format!(
+                    " t_first={t_first_us:.0}us spread={spread_us:.0}us tstart={tstart_us:.0}us"
+                ));
+            }
+            s
         }
     }
 
@@ -4056,6 +4136,14 @@ pub mod mix_kprof {
     ///   が GPU に落ちている印になる
     /// - `ty`: 呼び出し側が渡した [`GgmlType`] の id (ggml.h の enum 値)。
     ///   型が混ざるプロセスでは最後に積んだ 1 個 (hc down/up はプロセスで 1 種)
+    ///
+    /// task 96: `inj` ([`hc_mix_quant_fast`] / [`hc_mix_quant_ref`] の inject GEMV,
+    /// k=hc_dim / n=hc の小行列) も同じ形式で積む。hc テンソルの目録上の型
+    /// (`hc_attn_inject.weight` は F32) は down/up (目録 Q8_0、実機 BF16) で
+    /// 外れていた実績があるので、実型と融合カーネルの要否を実機で判定するための
+    /// 出力。BF16 なら [`crate::model::moe_expert::expert_gemv_bf16`] (task 92 の
+    /// 融合カーネル) に今日の経路のまま乗る (`gemv_label` -> `gemv_impl_par` の
+    /// BF16 アーム)。`DENNO_BF16_FAST=0` で ms が動けば融合カーネルだった証拠。
     pub mod gemv {
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -4065,10 +4153,14 @@ pub mod mix_kprof {
         static UP_CALLS: AtomicU64 = AtomicU64::new(0);
         static UP_NS: AtomicU64 = AtomicU64::new(0);
         static UP_GPU: AtomicU64 = AtomicU64::new(0);
+        static INJ_CALLS: AtomicU64 = AtomicU64::new(0);
+        static INJ_NS: AtomicU64 = AtomicU64::new(0);
+        static INJ_GPU: AtomicU64 = AtomicU64::new(0);
         /// 最後に積んだ型の id ([`GgmlType::from_id`] で戻す。0 は「未設定」を兼ねる。
         /// ggml には id 0 = F32 があるので、未設定の表示は `from_id` 前の 0 チェック)。
         static DOWN_TY_ID: AtomicU64 = AtomicU64::new(0);
         static UP_TY_ID: AtomicU64 = AtomicU64::new(0);
+        static INJ_TY_ID: AtomicU64 = AtomicU64::new(0);
 
         /// 直前の GEMV が GPU で走りきったか (cuda 無しのビルドは常に false)。
         #[cfg(feature = "cuda")]
@@ -4124,6 +4216,21 @@ pub mod mix_kprof {
             UP_TY_ID.store(ty.id() as u64, Ordering::Relaxed);
         }
 
+        /// `hc_inject` の GEMV 1 発 (task 96。[`note_down`] と同じ規約)。
+        #[inline]
+        pub fn note_inj(t: Option<std::time::Instant>, ty: crate::kquant::GgmlType) {
+            if !super::on() {
+                return;
+            }
+            let Some(t) = t else { return };
+            INJ_CALLS.fetch_add(1, Ordering::Relaxed);
+            INJ_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if ran_on_gpu() {
+                INJ_GPU.fetch_add(1, Ordering::Relaxed);
+            }
+            INJ_TY_ID.store(ty.id() as u64, Ordering::Relaxed);
+        }
+
         fn slot(
             calls: &AtomicU64,
             ns: &AtomicU64,
@@ -4147,21 +4254,33 @@ pub mod mix_kprof {
             ));
         }
 
-        /// `[mix-kprof]` 行の末尾に付ける 2 区間ぶん (down と up)。
+        /// `[mix-kprof]` 行の末尾に付ける 3 区間ぶん (down / up / inj)。
         pub fn line_part() -> String {
             let mut s = String::new();
             slot(&DOWN_CALLS, &DOWN_NS, &DOWN_GPU, &DOWN_TY_ID, "down", &mut s);
             slot(&UP_CALLS, &UP_NS, &UP_GPU, &UP_TY_ID, "up", &mut s);
+            slot(&INJ_CALLS, &INJ_NS, &INJ_GPU, &INJ_TY_ID, "inj", &mut s);
             s
         }
 
         /// カウンタを 0 に戻す ([`super::reset`] から呼ぶ)。
         pub fn reset() {
-            for c in [&DOWN_CALLS, &DOWN_NS, &DOWN_GPU, &UP_CALLS, &UP_NS, &UP_GPU] {
+            for c in [
+                &DOWN_CALLS,
+                &DOWN_NS,
+                &DOWN_GPU,
+                &UP_CALLS,
+                &UP_NS,
+                &UP_GPU,
+                &INJ_CALLS,
+                &INJ_NS,
+                &INJ_GPU,
+            ] {
                 c.store(0, Ordering::Relaxed);
             }
             DOWN_TY_ID.store(0, Ordering::Relaxed);
             UP_TY_ID.store(0, Ordering::Relaxed);
+            INJ_TY_ID.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -11434,6 +11553,93 @@ mod tests {
             mix_kprof::set_for_test(false);
         }
 
+        /// task 96: 発火 region の skew 3 項目 (`t_first=` / `spread=` / `tstart=`) が
+        /// `[mix-kprof]` の 1 行に載る。
+        ///
+        /// down (320 行 >= 門番 64) と up (640 行 >= 既定門番 512) が 1 region ずつ
+        /// 発火する形で mix を 1 回回し、(a) 項目が出ること、(b) `skew()` の生の値が
+        /// 構造上の制約 (最初の完了 <= 発火 wall、開始オフセットの和 <= チャンク数 ×
+        /// 発火 wall) を満たすことを確かめる。値の大きさ自体はタイミング依存なので
+        /// 見ない (ホストで変わる)。
+        #[test]
+        fn mix_kprof_rowpar_skew_fields_on_fired_region() {
+            use mix_kprof::rowpar;
+            let (hp, norm, down, up, inject, res) = mix_q8_case(2, 320, 320);
+            mix_kprof::set_for_test(true);
+            mix_kprof::reset();
+            let _ = hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            let line = mix_kprof::line().expect("強制 on なのに line() が None");
+            // 生の値は reset の前に読む (reset は rowpar も 0 に戻す)。
+            let (fd, _, cd, _, _) = rowpar::stats(rowpar::L_DOWN as usize - 1);
+            let (fe_d, ss_d, fw_d) = rowpar::skew(rowpar::L_DOWN as usize - 1);
+            mix_kprof::reset();
+            mix_kprof::set_for_test(false);
+
+            for name in ["down", "up"] {
+                // rowpar 部だけを切り出す (region 計時の "{name} {ns} ns" と
+                // gemv の "{name} calls=" も "{name} " で始まるので
+                // "regions=" を含む位置で切る)。
+                let seg = line
+                    .split(&format!(" | {name} regions="))
+                    .nth(1)
+                    .unwrap_or_default();
+                assert!(
+                    seg.starts_with("1 fired=1") && seg.contains(" t_first="),
+                    "{name}: skew 項目が載っていない: {line}"
+                );
+                assert!(seg.contains(" spread="), "{name}: spread が無い: {line}");
+                assert!(seg.contains(" tstart="), "{name}: tstart が無い: {line}");
+            }
+            // 生の値の構造制約: 最初のチャンク完了は発火 wall 以内、開始オフセットの
+            // 和はチャンク数 x 発火 wall 以内 (各チャンクの開始 + 実時間 <= wall)。
+            assert_eq!(fd, 1, "down の発火 region が 1 でない");
+            assert!(fe_d > 0, "down の t_first が 0 (skew が積まれていない)");
+            assert!(
+                fe_d <= fw_d,
+                "down の最初の完了 {fe_d} ns が発火 wall {fw_d} ns を超えた"
+            );
+            assert!(
+                ss_d <= cd.saturating_mul(fw_d),
+                "down の開始オフセット和 {ss_d} が chunks={cd} x wall={fw_d} を超えた"
+            );
+        }
+
+        /// task 96: skew の表示書式 (ns -> us、チャンク平均)。`record` を直接積んで
+        /// `[mix-kprof]` 行の部分文字列を確かめる (タイミング非依存の固定値)。
+        /// fired=1 / chunks=4 / wall=250us / comp=700us / t_first=150us /
+        /// start_sum=120us -> tstart = 120/4 = 30us、spread = 250-150 = 100us。
+        #[test]
+        fn mix_kprof_rowpar_skew_line_format_is_deterministic() {
+            use mix_kprof::rowpar;
+            mix_kprof::set_for_test(true);
+            mix_kprof::reset();
+            rowpar::record(
+                rowpar::L_DOWN,
+                true,
+                4,
+                250_000,
+                700_000,
+                8,
+                150_000,
+                120_000,
+            );
+            let line = mix_kprof::line().expect("強制 on なのに line() が None");
+            mix_kprof::reset();
+            mix_kprof::set_for_test(false);
+            let seg = line
+                .split(" | down regions=")
+                .nth(1)
+                .unwrap_or_default();
+            assert!(
+                seg.contains("wall=250us comp=700us par_eff=2.8"),
+                "既存項目の書式が違う: {seg}"
+            );
+            assert!(
+                seg.contains("t_first=150us spread=100us tstart=30us"),
+                "skew 項目の書式が違う: {seg}"
+            );
+        }
+
         /// task 88: down / up GEMV の実行先内訳 (calls / ms / gpu / ty) が
         /// `[mix-kprof]` の 1 行に載る ([`attn_kprof`] と同じ形式)。
         ///
@@ -11449,6 +11655,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_micros(50));
             mix_kprof::gemv::note_down(Some(t), GgmlType::IQ4Xs);
             mix_kprof::gemv::note_up(Some(t), GgmlType::IQ4Xs);
+            mix_kprof::gemv::note_inj(Some(t), GgmlType::Bf16);
             let line = mix_kprof::line().expect("強制 on なのに line() が None");
             assert!(
                 line.contains("gemv down calls=1 ms="),
@@ -11456,6 +11663,9 @@ mod tests {
             );
             assert!(line.contains("ty=IQ4_XS"), "dtype が無い: {line}");
             assert!(line.contains("gemv up calls=1 ms="), "up の形が違う: {line}");
+            // task 96: inj も同じ形式で載る (型は down/up と独立に表示)。
+            assert!(line.contains("gemv inj calls=1 ms="), "inj の形が違う: {line}");
+            assert!(line.contains("ty=BF16"), "inj の dtype が無い: {line}");
             // gpu は 0..=calls の範囲 (cuda ビルドでは直前の線形呼び出し次第)。
             let part = line
                 .split("gemv down calls=1 ")
@@ -11610,6 +11820,69 @@ mod tests {
             assert!(
                 m_fast.iter().any(|v| *v != 0.0),
                 "mixed が全 0 (経路の生死が分からない)"
+            );
+        }
+
+        /// task 96: hc mix の inject (`hc_inject`, k=hc_dim / n=hc の小行列) が
+        /// BF16 のとき、task 92 の AVX2 融合カーネルに**今日の経路のまま**乗ることの
+        /// 契約 (mix-kprof の `gemv inj ty=` で実型が BF16 だったときに当てはまる)。
+        ///
+        /// down/up を Q8_0 (`BF16_FUSED_CALLS` に載らない型) にして inject だけ
+        /// BF16 にすると、`hc_mix_quant` 1 回で融合カウンタがちょうど 1 増える
+        /// (inject の GEMV 1 発だけが融合経路を通る。n=hc は行並列の門番未満なので
+        /// 1 チャンク = 単独発火)。`set_bf16_fast_for_test(Some(false))` の classic
+        /// (dequant + 逐次内積) と to_bits で一致する (BF16 -> f32 変換は正確で、
+        /// 積和の順序も同じ。[`hc_mix_bf16_down_up_take_row_parallel_bitexact`] と
+        /// 同じ根拠)。inject が F32 など BF16 以外の実型なら融合カーネルは
+        /// 適用できない (REPORT の判定を参照)。
+        #[test]
+        fn hc_mix_bf16_inject_takes_fused_kernel_bitexact() {
+            use crate::model::moe_expert::{set_bf16_fast_for_test, BF16_FUSED_CALLS};
+            let hc = 4usize;
+            let e = 2560usize;
+            let lr = 320usize;
+            let hp = HyperParams { hc, n_embd: e, low_rank: lr, eps: 1e-6 };
+            let hc_dim = hc * e;
+            let norm: Vec<f32> = (0..hc_dim).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect();
+            let down = GgufLinear::from_slice(GgmlType::Q8_0, hc_dim, lr, &q8_0_weights(hc_dim, lr, 3))
+                .expect("GgufLinear::from_slice (Q8_0 down)")
+                .with_fast_q8(true);
+            let up = GgufLinear::from_slice(GgmlType::Q8_0, lr, hc_dim, &q8_0_weights(lr, hc_dim, 5))
+                .expect("GgufLinear::from_slice (Q8_0 up)")
+                .with_fast_q8(true);
+            let inject =
+                GgufLinear::from_slice(GgmlType::Bf16, hc_dim, hc, &bf16_weights(hc_dim, hc, 7))
+                    .expect("GgufLinear::from_slice (BF16 inject)");
+            let res = HyperStreams {
+                data: (0..hc_dim)
+                    .map(|i| (((i * 11) % 17) as f32 - 8.0) * 0.05)
+                    .collect(),
+                hc,
+                n_embd: e,
+            };
+            let fused = || BF16_FUSED_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+
+            // 融合 on (既定): inject の GEMV 1 発だけ融合カウンタが増える。
+            set_bf16_fast_for_test(Some(true));
+            let before = fused();
+            let (m_fast, i_fast) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            assert_eq!(
+                fused() - before,
+                1,
+                "BF16 inject が融合カーネルを通っていない (down/up 分以外の増分が 1 でない)"
+            );
+
+            // 融合 off (classic): inject は dequant + 逐次内積に落ちる。値はビット一致。
+            set_bf16_fast_for_test(Some(false));
+            let (m_ref, i_ref) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("classic");
+            set_bf16_fast_for_test(None);
+            assert_bitwise_eq(&i_fast, &i_ref, "BF16 inject (融合 vs classic)");
+            assert_bitwise_eq(&m_fast, &m_ref, "BF16 inject case (mixed)");
+            assert!(
+                i_fast.iter().any(|v| *v != 0.0),
+                "inject が全 0 (経路の生死が分からない)"
             );
         }
 
