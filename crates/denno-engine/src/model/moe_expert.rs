@@ -742,6 +742,7 @@ unsafe fn gemv_iq2s_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
     let rb = nb * BLK;
     let xp = x.as_ptr();
     let bp = blocks.as_ptr();
+    let signbit = _mm256_set1_epi32(i32::MIN);
     let grid = crate::kquant::iq2s_grid().as_ptr();
     // レーン j の符号ビット (1<<j) を i32 で並べたもの。
     let bits = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
@@ -770,10 +771,11 @@ unsafe fn gemv_iq2s_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
                     let db = if l < 2 { db0 } else { db1 };
                     let vi = _mm_loadl_epi64(g as *const __m128i);
                     let v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vi));
-                    let neg = _mm256_castsi256_ps(_mm256_slli_epi32(
-                        _mm256_and_si256(_mm256_set1_epi32(sg), bits),
-                        31,
-                    ));
+                    // レーンのビット位置が違うので、シフトではなく
+                    // 「0 と比較して 0x80000000 を立てる」で符号ビットを作る。
+                    let hit = _mm256_and_si256(_mm256_set1_epi32(sg), bits);
+                    let pos = _mm256_cmpeq_epi32(hit, _mm256_setzero_si256());
+                    let neg = _mm256_castsi256_ps(_mm256_andnot_si256(pos, signbit));
                     let w = _mm256_mul_ps(_mm256_xor_ps(v, neg), _mm256_set1_ps(db));
                     let xo = xb.add(ib * 32 + l * 8);
                     if l % 2 == 0 {
@@ -806,6 +808,7 @@ unsafe fn gemv_iq3xxs_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], 
     let rb = nb * BLK;
     let xp = x.as_ptr();
     let bp = blocks.as_ptr();
+    let signbit = _mm256_set1_epi32(i32::MIN);
     let grid = crate::kquant::iq3xxs_grid().as_ptr();
     let signs_tbl = crate::kquant::ksigns_iq2xs().as_ptr();
     let bits = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
@@ -831,10 +834,11 @@ unsafe fn gemv_iq3xxs_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], 
                     let bytes = (g1 | (g2 << 32)).to_le_bytes();
                     let vi = _mm_loadl_epi64(bytes.as_ptr() as *const __m128i);
                     let v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vi));
-                    let neg = _mm256_castsi256_ps(_mm256_slli_epi32(
-                        _mm256_and_si256(_mm256_set1_epi32(sg), bits),
-                        31,
-                    ));
+                    // レーンのビット位置が違うので、シフトではなく
+                    // 「0 と比較して 0x80000000 を立てる」で符号ビットを作る。
+                    let hit = _mm256_and_si256(_mm256_set1_epi32(sg), bits);
+                    let pos = _mm256_cmpeq_epi32(hit, _mm256_setzero_si256());
+                    let neg = _mm256_castsi256_ps(_mm256_andnot_si256(pos, signbit));
                     let w = _mm256_mul_ps(_mm256_xor_ps(v, neg), dbv);
                     let xo = xb.add(ib * 32 + l * 8);
                     if l % 2 == 0 {
