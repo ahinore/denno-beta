@@ -6323,4 +6323,63 @@ mod tests {
             }
         }
     }
+
+    /// IQ 系のバッチ GEMM がモートークン GEMV とビット一致すること。
+    /// (トークン方向のループ位置だけが違い、1 トークンの累積順は同じ)
+    #[test]
+    fn fused_iq_gemm_matches_gemv_bitwise() {
+        if !q4k_fused_supported() {
+            return;
+        }
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5
+        };
+        for ty in [GgmlType::IQ4Nl, GgmlType::Q2_0, GgmlType::IQ2S, GgmlType::IQ3Xxs] {
+            let (n_in, n_out, m) = (256usize, 5usize, 3usize);
+            let blk = ty.blck_size();
+            let ts = ty.type_size();
+            let nb = n_in / blk;
+            let rb = nb * ts;
+            let mut blocks = vec![0u8; rb * n_out];
+            for r in 0..n_out {
+                for b in 0..nb {
+                    let p = &mut blocks[r * rb + b * ts..r * rb + (b + 1) * ts];
+                    let d = half::f16::from_f32(0.013 + 0.002 * b as f32);
+                    p[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+                    for j in 2..ts {
+                        p[j] = (rnd() * 200.0) as i8 as u8;
+                    }
+                }
+            }
+            let xs: Vec<f32> = (0..m * n_in).map(|_| rnd()).collect();
+            let mut batch = vec![0f32; m * n_out];
+            expert_gemm_any(ty, &blocks, n_in, n_out, &xs, m, &mut batch).unwrap();
+            for t in 0..m {
+                let mut one = vec![0f32; n_out];
+                expert_gemv_inner(
+                    ty,
+                    &blocks,
+                    n_in,
+                    n_out,
+                    &xs[t * n_in..(t + 1) * n_in],
+                    &mut one,
+                    false,
+                )
+                .unwrap();
+                for r in 0..n_out {
+                    assert_eq!(
+                        one[r].to_bits(),
+                        batch[t * n_out + r].to_bits(),
+                        "{ty:?} token {t} 行 {r}: gemv {} vs gemm {}",
+                        one[r],
+                        batch[t * n_out + r]
+                    );
+                }
+            }
+        }
+    }
 }
