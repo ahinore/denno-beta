@@ -3673,21 +3673,29 @@ mod tests {
 
     #[test]
     fn unsupported_types_are_rejected() {
+        // 2026-10-31: 方針変更。融合カーネルを持たない型も **スカラー経路で通す**
+        // (Swift 1.5 の expert は IQ2_S / Q2_0 で、旧実装はここで弾いていた)。
+        // 代わりに「形が合わないもの」を弾くことを固定する。
         for ty in [
             GgmlType::F32,
             GgmlType::Q4_0,
             GgmlType::Q6K,
-            GgmlType::Q8_0, // 下で「対象」であることを確認する対照
+            GgmlType::Q2_0,
+            GgmlType::IQ2S,
+            GgmlType::Q8_0,
         ] {
-            let want_ok = ty == GgmlType::Q8_0;
-            assert_eq!(row_bytes(ty, N_IN).is_ok(), want_ok, "{:?}", ty);
-            assert_eq!(
+            assert!(row_bytes(ty, N_IN).is_ok(), "{:?} は通す", ty);
+            assert!(
                 ExpertSlice::new(ty, N_IN, N_OUT, N_EXPERT, 0).is_ok(),
-                want_ok,
-                "{:?}",
+                "{:?} は通す",
                 ty
             );
         }
+        // ブロックサイズで割り切れない n_in は弾く (N_IN=256 は 64 で割れるが 100 は割れない)
+        assert!(row_bytes(GgmlType::Q2_0, 100).is_err());
+        assert!(row_bytes(GgmlType::IQ2S, 300).is_err());
+
+        // 形が合わない blocks は expert_gemv でも弾く
         let x = make_x(N_IN);
         let mut out = vec![0.0f32; N_OUT];
         assert!(expert_gemv(GgmlType::Q6K, &[0u8; 4096], N_IN, N_OUT, &x, &mut out).is_err());
