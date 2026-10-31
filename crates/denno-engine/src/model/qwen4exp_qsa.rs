@@ -545,16 +545,8 @@ fn expect_1d(f: &GgufFile, name: &str, n: usize) -> Result<()> {
 
 /// [`GgufLinear`] の `gemv` が扱える型か。
 fn gemv_supported(ty: GgmlType) -> bool {
-    matches!(
-        ty,
-        GgmlType::Q8_0
-            | GgmlType::Q5_1
-            | GgmlType::Q4K
-            | GgmlType::Q5K
-            | GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::Bf16
-    )
+    // 融合カーネルの有無ではなく「デコードできるか」で通す (2026-10-31)。
+    crate::kquant::dequant_supported(ty)
 }
 
 /// 量子化ブロックを保持したまま [`GgufLinear`] を作る (mmap のスライスを共有)。

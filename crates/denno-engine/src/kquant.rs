@@ -146,6 +146,43 @@ fn rd_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+/// [`dequant_block_into`] が扱える型か (スカラー経路に流せるかの判定)。
+///
+/// 2026-10-31: 旧実装は `GgufLinear` / attn / qsa / ssm の各所に「融合カーネルが
+/// ある型だけ」を通す閉じた whitelist を持っていた。Swift 1.5 の重みは層ごとに
+/// Q4_K / Q5_K / Q6_K / IQ4_XS が混在し、expert も IQ3_S / IQ2_S / IQ2_0 と
+/// ばらけるため、**デコードさえできれば通す** 方針へ変えた。
+pub fn dequant_supported(ty: GgmlType) -> bool {
+    matches!(
+        ty,
+        GgmlType::F32
+            | GgmlType::F16
+            | GgmlType::Bf16
+            | GgmlType::Q2_0
+            | GgmlType::Q4_0
+            | GgmlType::Q4_1
+            | GgmlType::Q5_0
+            | GgmlType::Q5_1
+            | GgmlType::Q8_0
+            | GgmlType::Q2K
+            | GgmlType::Q3K
+            | GgmlType::Q4K
+            | GgmlType::Q5K
+            | GgmlType::Q6K
+            | GgmlType::IQ2Xxs
+            | GgmlType::IQ2Xs
+            | GgmlType::IQ2S
+            | GgmlType::IQ3Xxs
+            | GgmlType::IQ3S
+            | GgmlType::IQ1S
+            | GgmlType::IQ4Nl
+            | GgmlType::IQ4Xs
+            | GgmlType::Iq1M
+            | GgmlType::Tq1_0
+            | GgmlType::Mxfp4
+    )
+}
+
 /// 1 行 (n 要素・n はブロックサイズの倍数) を f32 へデ量子化する。
 /// `blocks` は n / blck_size ブロック分の連続バイト列。
 pub fn dequant_row(ty: GgmlType, blocks: &[u8], n: usize) -> Vec<f32> {

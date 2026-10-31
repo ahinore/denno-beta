@@ -450,7 +450,11 @@ impl GgufLinear {
         }
         match self.ty {
             // 量子型は expert GEMV と本体を共有する (1 行ずつデコードして逐次内積)。
-            GgmlType::Q8_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K => {
+            // 2026-10-31: 融合カーネルの有無ではなく「デコードできるか」で通す。
+            // ここに来た型は expert GEMV (= 1 行デコード + 逐次内積) の
+            // スカラー経路で計算する。Swift 1.5 は IQ4_XS / IQ3_S / IQ2_S /
+            // Q2_0 などを密行列にも使うため、旧 whitelist では読めなかった。
+            ty if crate::kquant::dequant_supported(ty) => {
                 // P-MOE-E5: 重みが VRAM に常駐していれば GPU で計算する。
                 // 対象外・GPU 無効・不調では false が返り、下の CPU 参照へ落ちる。
                 #[cfg(feature = "cuda")]
