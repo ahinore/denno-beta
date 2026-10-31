@@ -7882,17 +7882,24 @@ mod tests {
         let seq_calls = moe_expert::SEQ_CALLS.load(std::sync::atomic::Ordering::Relaxed) - seq_before;
 
         // 3. 並列分岐が発動したこと (top-k の数だけ寄与計算が走る)
+        //
+        // カウンタはプロセス全体の AtomicUsize なので、`--test-threads` を 1 にしない
+        // 実行では**同じバイナリで並行に走る他のテスト** (h2 / engine 側の moe 呼び出し) の
+        // 分がこの窓に入る (実測: 2 のはずが 3)。厳密な本数は直列実行
+        // (`--test-threads=1`、deploy8098.sh の既定) のときにだけ意味を持つ。
+        // ここでは「並列分岐に実際に入った」ことが言えればよいので下限で見る。
         #[cfg(feature = "par")]
         {
-            assert_eq!(
-                par_calls, p.n_expert_used,
-                "並列の寄与計算が選択 expert 数ぶん走っていない (par=1 で並列分岐に入っていない)"
+            assert!(
+                par_calls >= p.n_expert_used,
+                "並列の寄与計算が選択 expert 数ぶん走っていない (par=1 で並列分岐に入っていない): par_calls={par_calls} used={}",
+                p.n_expert_used
             );
             // 内側は gemv_seq = 1 expert あたり gate/up/down の 3 本
-            assert_eq!(
-                seq_calls,
-                3 * p.n_expert_used,
-                "並列時は内側が行並列なしの入口 (gemv_seq) を通るはず"
+            assert!(
+                seq_calls >= 3 * p.n_expert_used,
+                "並列時は内側が行並列なしの入口 (gemv_seq) を通るはず: seq_calls={seq_calls} want>={}",
+                3 * p.n_expert_used
             );
         }
         #[cfg(not(feature = "par"))]
