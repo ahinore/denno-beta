@@ -430,7 +430,6 @@ impl GgufLinear {
         });
         GgufLinear::new(GgmlType::Q8_0, k, n, WeightBlocks::from_vec(out))
             .map(|l| l.with_fast_q8(true))
-            .with_context(|| format!("requant_to_q8_0: {k}x{n}"))
     }
 
     /// 融合カーネルがある型か (Q8_0 / Q5_1 / Q4_K / Q5_K)。
