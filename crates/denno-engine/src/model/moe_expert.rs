@@ -549,8 +549,17 @@ fn for_each_row_chunk<F>(
     F: Fn(&[u8], &mut [f32]) + Sync + Send,
 {
     use rayon::prelude::*;
+    // P84: hc mix の行並列 region を計上する (ラベル 0 = 未設定は何も積まない)。
+    let lbl = crate::model::qwen4exp::mix_kprof::rowpar::label();
     if !par || n_out < min_rows {
-        f(blocks, out);
+        if lbl != 0 {
+            let t0 = std::time::Instant::now();
+            f(blocks, out);
+            let ns = t0.elapsed().as_nanos() as u64;
+            crate::model::qwen4exp::mix_kprof::rowpar::record(lbl, false, 1, ns, ns);
+        } else {
+            f(blocks, out);
+        }
         return;
     }
     #[cfg(test)]
@@ -559,10 +568,35 @@ fn for_each_row_chunk<F>(
     let want = n_out.div_ceil(threads).max(min_chunk);
     let rows = want.min(n_out);
     let bytes = rows * rb;
-    blocks
-        .par_chunks(bytes)
-        .zip(out.par_chunks_mut(rows))
-        .for_each(|(b, o)| f(b, o));
+    if lbl != 0 {
+        let comp = std::sync::atomic::AtomicU64::new(0);
+        let comp_ref = &comp;
+        let t0 = std::time::Instant::now();
+        blocks
+            .par_chunks(bytes)
+            .zip(out.par_chunks_mut(rows))
+            .for_each(|(b, o)| {
+                let tc = std::time::Instant::now();
+                f(b, o);
+                comp_ref.fetch_add(
+                    tc.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            });
+        let wall = t0.elapsed().as_nanos() as u64;
+        crate::model::qwen4exp::mix_kprof::rowpar::record(
+            lbl,
+            true,
+            n_out.div_ceil(rows),
+            wall,
+            comp.load(std::sync::atomic::Ordering::Relaxed),
+        );
+    } else {
+        blocks
+            .par_chunks(bytes)
+            .zip(out.par_chunks_mut(rows))
+            .for_each(|(b, o)| f(b, o));
+    }
 }
 
 #[cfg(not(feature = "par"))]
@@ -579,7 +613,16 @@ fn for_each_row_chunk<F>(
 ) where
     F: Fn(&[u8], &mut [f32]),
 {
-    f(blocks, out);
+    // P84: par feature 無しは逐次固定。ラベルが立っていれば逐次 region として計上する。
+    let lbl = crate::model::qwen4exp::mix_kprof::rowpar::label();
+    if lbl != 0 {
+        let t0 = std::time::Instant::now();
+        f(blocks, out);
+        let ns = t0.elapsed().as_nanos() as u64;
+        crate::model::qwen4exp::mix_kprof::rowpar::record(lbl, false, 1, ns, ns);
+    } else {
+        f(blocks, out);
+    }
 }
 
 /// 1 expert ぶんの生バイト (`blocks`) に対する GEMV。`out[r] = dot(row_r, x)`。
@@ -716,6 +759,161 @@ unsafe fn gemv_q8_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
         let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
         out[r] = _mm_cvtss_f32(h);
     }
+}
+
+/// [`gemv_q8_0_avx2`] の 2 行同時版 (P84)。
+///
+/// 1 行ずつの処理では `a0` / `a1` の FMA 依存チェーンが律速で、1 スレッドで
+/// 9-13 GMAC/s しか出ない (実測: `tests/hc_mix_bench`。up の 1 行 = 10 ブロック
+/// でチェーン 20 段 × ~4.5 サイクル ≈ 228 µs が実測 248 µs とほぼ一致)。
+/// 隣接 2 行を同じブロック位置で処理すると、**行ごとの累積チェーンはそのまま**
+/// (同じオペランド・同じ順序) で独立なチェーンが 2 本になりレイテンシが隠れる。
+/// x ブロックのロードは 2 行で共有する (down の x 再読みが半分になる)。
+/// 出力は classic 版と**ビット一致**する (行ごとの演算順序を一切変えていない)。
+/// 奇数行の端数は最後に 1 行ずつ classic と同じループで回す。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_q8_0_avx2_2row(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 34; // d(2) + qs(32)
+    let nb = n_in / 32; // 行あたりのブロック数
+    let rb = nb * BLK; // 行バイト数
+    let xp = x.as_ptr();
+    let bp = blocks.as_ptr();
+    let npair = n_out & !1usize;
+
+    let mut r = 0usize;
+    while r < npair {
+        let row0 = bp.add(r * rb);
+        let row1 = bp.add((r + 1) * rb);
+        let mut a00 = _mm256_setzero_ps();
+        let mut a01 = _mm256_setzero_ps();
+        let mut a10 = _mm256_setzero_ps();
+        let mut a11 = _mm256_setzero_ps();
+        for b in 0..nb {
+            let x0 = xp.add(b * 32);
+            // x ブロックは 2 行で共有 (1 回だけ読む)。
+            let xv0 = _mm256_loadu_ps(x0);
+            let xv1 = _mm256_loadu_ps(x0.add(8));
+            let xv2 = _mm256_loadu_ps(x0.add(16));
+            let xv3 = _mm256_loadu_ps(x0.add(24));
+            let p0 = row0.add(b * BLK);
+            let p1 = row1.add(b * BLK);
+            // 行 r (classic と同じ順: lo の下位 → a0、lo の上位 → a1、
+            // hi の下位 → a0、hi の上位 → a1)。
+            let dv0 = _mm256_set1_ps(
+                half::f16::from_bits(std::ptr::read_unaligned(p0 as *const u16)).to_f32(),
+            );
+            let q0 = p0.add(2);
+            let l0 = _mm_loadu_si128(q0 as *const __m128i);
+            let h0 = _mm_loadu_si128(q0.add(16) as *const __m128i);
+            a00 = _mm256_fmadd_ps(
+                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(l0)), dv0),
+                xv0,
+                a00,
+            );
+            a01 = _mm256_fmadd_ps(
+                _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(l0))),
+                    dv0,
+                ),
+                xv1,
+                a01,
+            );
+            a00 = _mm256_fmadd_ps(
+                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(h0)), dv0),
+                xv2,
+                a00,
+            );
+            a01 = _mm256_fmadd_ps(
+                _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(h0))),
+                    dv0,
+                ),
+                xv3,
+                a01,
+            );
+            // 行 r+1 (行 r と独立なチェーン)。
+            let dv1 = _mm256_set1_ps(
+                half::f16::from_bits(std::ptr::read_unaligned(p1 as *const u16)).to_f32(),
+            );
+            let q1 = p1.add(2);
+            let l1 = _mm_loadu_si128(q1 as *const __m128i);
+            let h1 = _mm_loadu_si128(q1.add(16) as *const __m128i);
+            a10 = _mm256_fmadd_ps(
+                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(l1)), dv1),
+                xv0,
+                a10,
+            );
+            a11 = _mm256_fmadd_ps(
+                _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(l1))),
+                    dv1,
+                ),
+                xv1,
+                a11,
+            );
+            a10 = _mm256_fmadd_ps(
+                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(h1)), dv1),
+                xv2,
+                a10,
+            );
+            a11 = _mm256_fmadd_ps(
+                _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(h1))),
+                    dv1,
+                ),
+                xv3,
+                a11,
+            );
+        }
+        out[r] = q8_hadd(a00, a01);
+        out[r + 1] = q8_hadd(a10, a11);
+        r += 2;
+    }
+    // 端数の 1 行 (n_out が奇数のとき) は classic と同じ 1 行ループ。
+    if n_out != npair {
+        let row = bp.add(npair * rb);
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let dv = _mm256_set1_ps(d);
+            let q = p.add(2);
+            let lo = _mm_loadu_si128(q as *const __m128i);
+            let hi = _mm_loadu_si128(q.add(16) as *const __m128i);
+            let x0 = xp.add(b * 32);
+            let v0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo));
+            let v1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(lo)));
+            let v2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi));
+            let v3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(hi)));
+            a0 = _mm256_fmadd_ps(_mm256_mul_ps(v0, dv), _mm256_loadu_ps(x0), a0);
+            a1 = _mm256_fmadd_ps(_mm256_mul_ps(v1, dv), _mm256_loadu_ps(x0.add(8)), a1);
+            a0 = _mm256_fmadd_ps(_mm256_mul_ps(v2, dv), _mm256_loadu_ps(x0.add(16)), a0);
+            a1 = _mm256_fmadd_ps(_mm256_mul_ps(v3, dv), _mm256_loadu_ps(x0.add(24)), a1);
+        }
+        out[npair] = q8_hadd(a0, a1);
+    }
+}
+
+/// Q8_0 カーネルの末尾の横加算 (`a0 + a1` をスカラーへ)。classic 版と同じ順。
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn q8_hadd(a0: std::arch::x86_64::__m256, a1: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let s = _mm256_add_ps(a0, a1);
+    let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+    let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+    let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
+    _mm_cvtss_f32(h)
 }
 
 /// IQ 系 4 型の「ブロック内 8 要素」を f32 レーンへ開く共通部品。
@@ -1508,6 +1706,7 @@ pub fn expert_gemv_q8_fast(
         true,
         PAR_MIN_ROWS,
         PAR_MIN_CHUNK_ROWS,
+        false,
     )
 }
 
@@ -1533,6 +1732,53 @@ pub(crate) fn expert_gemv_q8_fast_min(
         true,
         min_rows,
         PAR_MIN_CHUNK_ROWS_TIGHT,
+        false,
+    )
+}
+
+/// [`expert_gemv_q8_fast`] の 2 行同時カーネル版 (P84)。
+///
+/// 出力は [`expert_gemv_q8_fast`] と**ビット一致**する (行ごとの累積順序は
+/// 一切変わらない。[`gemv_q8_0_avx2_2row`] のドキュメント)。
+pub fn expert_gemv_q8_fast_2row(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    expert_gemv_q8_inner(
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        true,
+        PAR_MIN_ROWS,
+        PAR_MIN_CHUNK_ROWS,
+        true,
+    )
+}
+
+/// [`expert_gemv_q8_fast_min`] の 2 行同時カーネル版 (P84)。
+pub fn expert_gemv_q8_fast_min_2row(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    min_rows: usize,
+) -> Result<()> {
+    expert_gemv_q8_inner(
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        true,
+        min_rows,
+        PAR_MIN_CHUNK_ROWS_TIGHT,
+        true,
     )
 }
 
@@ -1546,6 +1792,7 @@ fn expert_gemv_q8_inner(
     par: bool,
     min_rows: usize,
     min_chunk: usize,
+    two_row: bool,
 ) -> Result<()> {
     check_gemv_args(GgmlType::Q8_0, blocks, n_in, n_out, x, out)?;
     if n_in % 32 == 0 && q8_0_fused_supported() {
@@ -1553,9 +1800,16 @@ fn expert_gemv_q8_inner(
         {
             // SAFETY: 引数は check_gemv_args が検証済み (n_in%32==0 は直前で確認) で、
             // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
+            // 2 行版も AVX2+FMA だけで動く (行ごとの累積順序は classic 版と同じで
+            // ビット一致する)。
             let rb = n_in / 32 * 34;
+            let kern: unsafe fn(&[u8], usize, usize, &[f32], &mut [f32]) = if two_row {
+                gemv_q8_0_avx2_2row
+            } else {
+                gemv_q8_0_avx2
+            };
             for_each_row_chunk(blocks, n_out, rb, out, par, min_rows, min_chunk, |b, o| unsafe {
-                gemv_q8_0_avx2(b, n_in, o.len(), x, o)
+                kern(b, n_in, o.len(), x, o)
             });
             return Ok(());
         }
@@ -1694,6 +1948,7 @@ fn expert_gemv_any_inner(
     let mat = crate::model::exp_kprof::cur_mat();
     let res = match ty {
         GgmlType::Q5_1 => expert_gemv_q5_1_inner(blocks, n_in, n_out, x, out, par),
+        // expert の Q8_0 は classic カーネルのまま (P84 の f16c 版は hc mix 専用)。
         GgmlType::Q8_0 => expert_gemv_q8_inner(
             blocks,
             n_in,
@@ -1703,6 +1958,7 @@ fn expert_gemv_any_inner(
             par,
             PAR_MIN_ROWS,
             PAR_MIN_CHUNK_ROWS,
+            false,
         ),
         _ => expert_gemv_inner(ty, blocks, n_in, n_out, x, out, par),
     };
