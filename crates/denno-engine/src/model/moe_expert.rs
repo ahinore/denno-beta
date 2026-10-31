@@ -618,7 +618,9 @@ unsafe fn iq_vec8<const KIND: u8>(p: *const u8, h: usize) -> std::arch::x86_64::
             let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
             let dv = _mm256_set1_ps(d);
             let t16 = _mm_loadu_si128(crate::kquant::kvalues_iq4nl().as_ptr() as *const __m128i);
-            let q = _mm_loadu_si128(p.add(2 + (h % 2) * 8) as *const __m128i);
+            // 8 要素ぶん (8 バイト) だけ読む。ブロックは 18 バイトなので
+            // 16 バイト読みだと最終ブロックで行末を越える。
+            let q = _mm_loadl_epi64(p.add(2 + (h % 2) * 8) as *const __m128i);
             let idx = if h < 2 {
                 _mm_and_si128(q, _mm_set1_epi8(0x0f))
             } else {
@@ -757,7 +759,8 @@ unsafe fn gemv_iq<const KIND: u8>(
 unsafe fn gemm_iq<const KIND: u8>(
     blocks: &[u8],
     n_in: usize,
-    n_out: usize,
+    r0: usize,
+    r1: usize,
     xs: &[f32],
     m: usize,
     out: *mut f32,
@@ -772,7 +775,7 @@ unsafe fn gemm_iq<const KIND: u8>(
     let bp = blocks.as_ptr();
     let xp = xs.as_ptr();
 
-    for r in 0..n_out {
+    for r in r0..r1 {
         let row = bp.add(r * rb);
         let mut t0 = 0usize;
         while t0 < m {
@@ -795,7 +798,7 @@ unsafe fn gemm_iq<const KIND: u8>(
                 let hh = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
                 let hh = _mm_add_ps(hh, _mm_movehl_ps(hh, hh));
                 let hh = _mm_add_ss(hh, _mm_shuffle_ps(hh, hh, 0x55));
-                *out.add((t0 + g) * stride + r) = _mm_cvtss_f32(hh);
+                *out.add((t0 + g) * stride + (r - r0)) = _mm_cvtss_f32(hh);
             }
             t0 += tg;
         }
@@ -1324,21 +1327,14 @@ pub(crate) fn gemm_rows(
             return;
         }
         if fused && iq_kind(ty).is_some() && q4k_fused_supported() {
-            // 行範囲だけを回す版が無いので、行範囲を切り出して呼ぶ。
-            // (r0/r1 は行の分割なので、範囲を変えても各要素の計算順序は変わらない)
+            // SAFETY: 既存カーネルと同じ規約 (`blocks` は全行、`out` は行 r0 の位置).
             gemm_fused_fired();
-            let rb_iq = {
-                let (blk, nvec) = iq_geom(iq_kind(ty).unwrap_or(0));
-                (n_in / (nvec * 8)) * blk
-            };
-            let sub = &blocks[r0 * rb_iq..r1 * rb_iq];
-            // SAFETY: 同上。`sub` は行 r0..r1 のバイト列ちょうど。
             unsafe {
                 match iq_kind(ty) {
-                    Some(0) => gemm_iq::<0>(sub, n_in, r1 - r0, xs, m, out.add(r0), stride),
-                    Some(1) => gemm_iq::<1>(sub, n_in, r1 - r0, xs, m, out.add(r0), stride),
-                    Some(2) => gemm_iq::<2>(sub, n_in, r1 - r0, xs, m, out.add(r0), stride),
-                    _ => gemm_iq::<3>(sub, n_in, r1 - r0, xs, m, out.add(r0), stride),
+                    Some(0) => gemm_iq::<0>(blocks, n_in, r0, r1, xs, m, out, stride),
+                    Some(1) => gemm_iq::<1>(blocks, n_in, r0, r1, xs, m, out, stride),
+                    Some(2) => gemm_iq::<2>(blocks, n_in, r0, r1, xs, m, out, stride),
+                    _ => gemm_iq::<3>(blocks, n_in, r0, r1, xs, m, out, stride),
                 }
             }
             return;
