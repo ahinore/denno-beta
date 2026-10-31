@@ -41,6 +41,7 @@ pub enum GgmlType {
     Bf16,    // 30
     Tq1_0,   // 34
     Mxfp4,   // 39
+    Q2_0,    // 42 — ブロック 64 要素 (QK2_0)、Swift 1.5 の ffn_down_exps が使う
 }
 
 impl GgmlType {
@@ -73,6 +74,7 @@ impl GgmlType {
             30 => GgmlType::Bf16,
             34 => GgmlType::Tq1_0,
             39 => GgmlType::Mxfp4,
+            42 => GgmlType::Q2_0,
             _ => return None,
         })
     }
@@ -83,6 +85,8 @@ impl GgmlType {
             GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => 1,
             GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1
             | GgmlType::Q8_0 | GgmlType::IQ4Nl | GgmlType::Mxfp4 => 32,
+            // Q2_0 は K 系ではなく 64 要素ブロック (ggml QK2_0)
+            GgmlType::Q2_0 => 64,
             // K 系・IQ 系・TQ 系スーパーブロック
             GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K
             | GgmlType::IQ2Xxs | GgmlType::IQ2Xs | GgmlType::IQ3Xxs | GgmlType::IQ1S
@@ -101,6 +105,8 @@ impl GgmlType {
             GgmlType::Q5_0 => 22,
             GgmlType::Q5_1 => 24,
             GgmlType::Q8_0 => 34,
+            // block_q2_0 = d(f16) + qs[16] = 18 (QK2_0 = 64)
+            GgmlType::Q2_0 => 18,
             GgmlType::Q2K => 84,
             GgmlType::Q3K => 110,
             GgmlType::Q4K => 144,
@@ -208,6 +214,17 @@ pub fn dequant_block_into(ty: GgmlType, block: &[u8], out: &mut [f32]) {
 fn dequant_block(ty: GgmlType, x: &[u8], y: &mut [f32]) {
     match ty {
         GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => unreachable!(),
+
+        // ---- Q2_0: d + qs[16] (64 要素、1 要素 2 bit、値は (q-1)*d) -----------
+        // llama.cpp ggml-quants.c の dequantize_row_q2_0 と 1:1。
+        GgmlType::Q2_0 => {
+            let d = f16_to_f32(&x[0..2]);
+            for j in 0..64 {
+                let byte = x[2 + j / 4];
+                let q = ((byte >> ((j % 4) * 2)) & 0x03) as i32;
+                y[j] = (q - 1) as f32 * d;
+            }
+        }
 
         // ---- Q4_0: d + qs[16] -------------------------------------------------
         GgmlType::Q4_0 => {

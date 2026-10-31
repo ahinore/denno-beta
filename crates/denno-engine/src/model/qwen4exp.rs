@@ -114,6 +114,7 @@ pub fn ty_name(t: GgmlType) -> &'static str {
         GgmlType::Bf16 => "BF16",
         GgmlType::Tq1_0 => "TQ1_0",
         GgmlType::Mxfp4 => "MXFP4",
+        GgmlType::Q2_0 => "Q2_0",
     }
 }
 

@@ -79,14 +79,17 @@ impl ExpertSlice {
 
 /// 1 行 (`n_in` 要素) あたりのバイト数。`n_in` は量子型のブロックサイズで割り切れる必要がある。
 ///
-/// 対象外の量子型は `Err` (Q4_K / Q5_K / Q5_1 / Q8_0 以外)。
+/// **型の許可制はしない** (2026-10-31): 融合カーネルを使うかどうかは
+/// [`expert_gemv_inner`] / [`gemm_rows`] の型一致で決まり、それ以外の型は
+/// `dequant_row_into` を 1 ブロックずつ呼ぶスカラー経路に落ちる。IQ 系や Q2_0 の
+/// ような「融合カーネルが無い型」でも動かせるようにここは通す
+/// (Swift 1.5 の GGUF は expert が IQ2_S / Q2_0 で、以前はここで弾かれていた)。
 pub fn row_bytes(ty: GgmlType, n_in: usize) -> Result<usize> {
-    match ty {
-        GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q5_1 | GgmlType::Q8_0 => {}
-        other => bail!("expert GEMV の対象外の量子型: {:?}", other),
-    }
     let bs = ty.blck_size();
     let ts = ty.type_size();
+    if bs == 0 || ts == 0 {
+        bail!("ブロックサイズ/型サイズが 0 の量子型: {:?}", ty);
+    }
     if n_in == 0 {
         bail!("n_in が 0");
     }
