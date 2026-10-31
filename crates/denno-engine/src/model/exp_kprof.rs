@@ -14,8 +14,9 @@
 //!   どの型が何 GB/s 出ているかが 1 行で読める。
 //!
 //! 使い方: `DENNO_EXP_KPROF=1` で serve-flash を起動し、リクエストを 1 本流すと
-//! `serve_flash::prof_flash_q4` が [`line`] を 1 回出して [`reset`] する
-//! (`DENNO_MIX_KPROF` / `DENNO_GDN_KPROF` と同じ流儀)。
+//! `serve_flash::prof_flash_q4` が decode 終端 (リクエストの終端) で [`line`] を
+//! 1 回出して [`reset`] する (prefill 終端では積むだけにして、decode (m=1) と
+//! prefill (m>1) を 1 つのレポートに分けて載せる。task 95)。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -54,7 +55,15 @@ pub const SCAT: usize = 2;
 pub const TOTAL: usize = 3;
 /// 層レベルの区間の数。
 pub const NL: usize = 4;
-/// カーネルが rdtsc を取る間隔 (ブロック数)。区間の**比率**は偏らないが、
+/// 位相: decode (m=1 の expert GEMV。1 トークン step とバッチでない prefill)。
+pub const PH_DECODE: usize = 0;
+/// 位相: prefill (バッチ GEMM。`moe_expert::gemm_rows` / `gemm_rows_vnni` 経路)。
+pub const PH_PREFILL: usize = 1;
+/// 位相の数。
+pub const NPH: usize = 2;
+/// 位相の名前 (レポート用。d = decode / p = prefill)。
+pub const PH_NAME: [&str; NPH] = ["d", "p"];
+/// rdtsc を取る間隔 (ブロック数)。
 /// 絶対値はこの倍数で戻す ([`line`] が掛ける)。
 pub const SAMPLE_EVERY: usize = 8;
 
@@ -332,25 +341,61 @@ pub const K_Q5_1: usize = 7;
 pub const K_Q8_0: usize = 8;
 /// カーネル実行先: VNNI (int8 活性、`DENNO_GEMV_VNNI=1` のときだけ)。
 pub const K_VNNI: usize = 9;
+/// カーネル実行先: prefill の gemm_iq v1 (従来カーネル、4 トークン使い回し)。
+pub const K_GIQ_V1: usize = 10;
+/// カーネル実行先: prefill の AVX-512 gemm_iq_z (P85)。
+pub const K_GIQ_Z: usize = 11;
+/// カーネル実行先: Q2_0 融合 (task 95)。
+pub const K_Q2_0: usize = 12;
 /// カーネル実行先の種別数。
-pub const NKER: usize = 10;
+pub const NKER: usize = 13;
 /// カーネル実行先の名前 (レポート用)。
 pub const KERNEL_NAME: [&str; NKER] = [
-    "scalar", "iq_v2", "iq_v3", "iq4xs", "q4k", "q6k", "q5k", "q5_1", "q8_0", "vnni",
+    "scalar", "iq_v2", "iq_v3", "iq4xs", "q4k", "q6k", "q5k", "q5_1", "q8_0", "vnni", "giq_v1",
+    "giq_z", "q2_0",
 ];
+/// 融合カーネル (型専用の AVX2 GEMV/GEMM) のスロット ([`path_of`] の分類用)。
+const KER_FUSED: [usize; 7] = [K_IQ4XS, K_Q4K, K_Q6K, K_Q5K, K_Q5_1, K_Q8_0, K_Q2_0];
+/// gemv_iq 系 (IQ 系ジェネリックカーネル、decode の v2/v3 と prefill の v1/z) のスロット。
+const KER_IQ: [usize; 4] = [K_IQ_V2, K_IQ_V3, K_GIQ_V1, K_GIQ_Z];
 
-static TY_CALLS: [AtomicU64; NSLOT * NTY] = [const { AtomicU64::new(0) }; NSLOT * NTY];
-static TY_BYTES: [AtomicU64; NSLOT * NTY] = [const { AtomicU64::new(0) }; NSLOT * NTY];
-static TY_ROWS: [AtomicU64; NSLOT * NTY] = [const { AtomicU64::new(0) }; NSLOT * NTY];
-static TY_NS: [AtomicU64; NSLOT * NTY] = [const { AtomicU64::new(0) }; NSLOT * NTY];
-static TY_MBIN: [AtomicU64; NSLOT * NTY * NMB] =
-    [const { AtomicU64::new(0) }; NSLOT * NTY * NMB];
-static TY_KER: [AtomicU64; NSLOT * NTY * NKER] =
-    [const { AtomicU64::new(0) }; NSLOT * NTY * NKER];
+/// カーネル実行先の累積から経路の粗分類を出す (fused / gemv_iq / scalar / vnni)。
+///
+/// カウントが最大の族を採用する。同点のときは scalar > gemv_iq > vnni > fused の順で
+/// 残す (遅い側を優先して目に付くように。1 つの (位相, 行列, 型) が混在するのは
+/// env で経路を切り替えたときくらい)。
+fn path_of(ker: &[u64; NKER]) -> &'static str {
+    let fused: u64 = KER_FUSED.iter().map(|&k| ker[k]).sum();
+    let iq: u64 = KER_IQ.iter().map(|&k| ker[k]).sum();
+    let mut best: (&'static str, u64) = ("-", 0);
+    for (name, v) in [
+        ("scalar", ker[K_SCALAR]),
+        ("gemv_iq", iq),
+        ("vnni", ker[K_VNNI]),
+        ("fused", fused),
+    ] {
+        if v > best.1 {
+            best = (name, v);
+        }
+    }
+    best.0
+}
+
+static TY_CALLS: [AtomicU64; NPH * NSLOT * NTY] =
+    [const { AtomicU64::new(0) }; NPH * NSLOT * NTY];
+static TY_BYTES: [AtomicU64; NPH * NSLOT * NTY] =
+    [const { AtomicU64::new(0) }; NPH * NSLOT * NTY];
+static TY_ROWS: [AtomicU64; NPH * NSLOT * NTY] =
+    [const { AtomicU64::new(0) }; NPH * NSLOT * NTY];
+static TY_NS: [AtomicU64; NPH * NSLOT * NTY] = [const { AtomicU64::new(0) }; NPH * NSLOT * NTY];
+static TY_MBIN: [AtomicU64; NPH * NSLOT * NTY * NMB] =
+    [const { AtomicU64::new(0) }; NPH * NSLOT * NTY * NMB];
+static TY_KER: [AtomicU64; NPH * NSLOT * NTY * NKER] =
+    [const { AtomicU64::new(0) }; NPH * NSLOT * NTY * NKER];
 
 #[inline]
-fn ty_slot(mat: usize, ty_id: u32) -> usize {
-    mat.min(NSLOT - 1) * NTY + (ty_id as usize).min(NTY - 1)
+fn ty_slot(ph: usize, mat: usize, ty_id: u32) -> usize {
+    (ph.min(NPH - 1) * NSLOT + mat.min(NSLOT - 1)) * NTY + (ty_id as usize).min(NTY - 1)
 }
 
 /// 行数を m 分布のビン番号にする。
@@ -364,25 +409,46 @@ fn m_bin(rows: usize) -> usize {
     NMB - 1
 }
 
-/// (行列, 型) ごとの GEMV 1 回ぶんの実測 ([`record_call`] の型別版)。
+/// (行列, 型) ごとの decode GEMV 1 回ぶんの実測 ([`record_call`] の型別版)。
+///
+/// 位相は decode 固定。prefill (バッチ GEMM) は [`record_call_ph`] を使う。
 #[inline]
 pub fn record_call_ty(mat: usize, ty_id: u32, bytes: usize, rows: usize, d: std::time::Duration) {
+    record_call_ph(PH_DECODE, mat, ty_id, bytes, rows, 1, d);
+}
+
+/// (位相, 行列, 型) ごとの GEMV/GEMM 1 回ぶんの実測。
+///
+/// `m` は 1 呼び出しのトークン数 (decode は常に 1)。m 分布のビンは decode では
+/// 行チャンク幅 `rows`、prefill ではトークン数 `m` で振る (decode は「1 呼び出しが
+/// どの行粒度で切られたか」、prefill は「1 expert に何トークン集まったか」を見る)。
+#[inline]
+pub fn record_call_ph(
+    ph: usize,
+    mat: usize,
+    ty_id: u32,
+    bytes: usize,
+    rows: usize,
+    m: usize,
+    d: std::time::Duration,
+) {
     if !on() {
         return;
     }
-    let s = ty_slot(mat, ty_id);
+    let s = ty_slot(ph, mat, ty_id);
     TY_CALLS[s].fetch_add(1, Ordering::Relaxed);
     TY_BYTES[s].fetch_add(bytes as u64, Ordering::Relaxed);
     TY_ROWS[s].fetch_add(rows as u64, Ordering::Relaxed);
     TY_NS[s].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
-    TY_MBIN[s * NMB + m_bin(rows)].fetch_add(1, Ordering::Relaxed);
+    let bin_src = if ph == PH_DECODE { rows } else { m };
+    TY_MBIN[s * NMB + m_bin(bin_src)].fetch_add(1, Ordering::Relaxed);
 }
 
-/// カーネル実行先を 1 回数える (分岐の直後で呼ぶ)。
+/// カーネル実行先を 1 回数える (分岐の直後で呼ぶ)。位相は呼び出し側が指定する。
 #[inline]
-pub fn bump_kernel(mat: usize, ty_id: u32, ker: usize) {
+pub fn bump_kernel(ph: usize, mat: usize, ty_id: u32, ker: usize) {
     if on() {
-        TY_KER[ty_slot(mat, ty_id) * NKER + ker.min(NKER - 1)].fetch_add(1, Ordering::Relaxed);
+        TY_KER[ty_slot(ph, mat, ty_id) * NKER + ker.min(NKER - 1)].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -394,9 +460,9 @@ fn ty_name(ty_id: usize) -> String {
     }
 }
 
-/// (行列, 型) ごとの累積。テスト用。
-pub fn ty_stats(mat: usize, ty_id: u32) -> (u64, u64, u64, u64) {
-    let s = ty_slot(mat, ty_id);
+/// (位相, 行列, 型) ごとの累積。テスト用。
+pub fn ty_stats(ph: usize, mat: usize, ty_id: u32) -> (u64, u64, u64, u64) {
+    let s = ty_slot(ph, mat, ty_id);
     (
         TY_CALLS[s].load(Ordering::Relaxed),
         TY_BYTES[s].load(Ordering::Relaxed),
@@ -405,18 +471,18 @@ pub fn ty_stats(mat: usize, ty_id: u32) -> (u64, u64, u64, u64) {
     )
 }
 
-/// (行列, 型) のカーネル実行先の累積。テスト用。
-pub fn ty_kernel(mat: usize, ty_id: u32, ker: usize) -> u64 {
-    TY_KER[ty_slot(mat, ty_id) * NKER + ker.min(NKER - 1)].load(Ordering::Relaxed)
+/// (位相, 行列, 型) のカーネル実行先の累積。テスト用。
+pub fn ty_kernel(ph: usize, mat: usize, ty_id: u32, ker: usize) -> u64 {
+    TY_KER[ty_slot(ph, mat, ty_id) * NKER + ker.min(NKER - 1)].load(Ordering::Relaxed)
 }
 
-/// (行列, 型) の m 分布。テスト用。
-pub fn ty_mbin(mat: usize, ty_id: u32, bin: usize) -> u64 {
-    TY_MBIN[ty_slot(mat, ty_id) * NMB + bin.min(NMB - 1)].load(Ordering::Relaxed)
+/// (位相, 行列, 型) の m 分布。テスト用。
+pub fn ty_mbin(ph: usize, mat: usize, ty_id: u32, bin: usize) -> u64 {
+    TY_MBIN[ty_slot(ph, mat, ty_id) * NMB + bin.min(NMB - 1)].load(Ordering::Relaxed)
 }
 
 fn reset_ty() {
-    for s in 0..NSLOT * NTY {
+    for s in 0..NPH * NSLOT * NTY {
         TY_CALLS[s].store(0, Ordering::Relaxed);
         TY_BYTES[s].store(0, Ordering::Relaxed);
         TY_ROWS[s].store(0, Ordering::Relaxed);
@@ -430,47 +496,76 @@ fn reset_ty() {
     }
 }
 
-/// 型別内訳を [`line`] の後ろに付ける (非ゼロの (行列, 型) だけ)。
+/// 型別内訳を [`line`] の後ろに付ける (非ゼロの (位相, 行列, 型) だけ)。
+///
+/// 位相ごとに合計 1 行 + 明細 (呼び出し数 / 行数 / MB / ms / 経路 / カーネル実行先 /
+/// m 分布)。経路は [`path_of`] の粗分類 (fused / gemv_iq / scalar / vnni)。
 fn ty_lines() -> String {
     let mut s = String::new();
-    for m in 0..NSLOT {
-        for ty in 0..NTY {
-            let (c, b, rows, ns) = ty_stats(m, ty as u32);
-            if c == 0 {
-                continue;
-            }
-            let mat_name = if m < NMAT { MAT_NAME[m] } else { "other" };
-            let mut ker = String::new();
-            for k in 0..NKER {
-                let v = TY_KER[ty_slot(m, ty as u32) * NKER + k].load(Ordering::Relaxed);
-                if v > 0 {
-                    if !ker.is_empty() {
-                        ker.push('/');
-                    }
-                    ker.push_str(&format!("{}={v}", KERNEL_NAME[k]));
+    for ph in 0..NPH {
+        let mut body = String::new();
+        let (mut tot_c, mut tot_ns) = (0u64, 0u64);
+        for m in 0..NSLOT {
+            for ty in 0..NTY {
+                let (c, b, rows, ns) = ty_stats(ph, m, ty as u32);
+                if c == 0 {
+                    continue;
                 }
-            }
-            if ker.is_empty() {
-                ker.push('-');
-            }
-            let mut mbin = String::new();
-            for bin in 0..NMB {
-                let v = ty_mbin(m, ty as u32, bin);
-                if v > 0 {
-                    if !mbin.is_empty() {
-                        mbin.push('/');
+                tot_c += c;
+                tot_ns += ns;
+                let mat_name = if m < NMAT { MAT_NAME[m] } else { "other" };
+                let mut ker = String::new();
+                for k in 0..NKER {
+                    let v = TY_KER[ty_slot(ph, m, ty as u32) * NKER + k].load(Ordering::Relaxed);
+                    if v > 0 {
+                        if !ker.is_empty() {
+                            ker.push('/');
+                        }
+                        ker.push_str(&format!("{}={v}", KERNEL_NAME[k]));
                     }
-                    mbin.push_str(&format!("{}:{}", M_BIN_NAME[bin], v));
                 }
+                if ker.is_empty() {
+                    ker.push('-');
+                }
+                let mut mbin = String::new();
+                for bin in 0..NMB {
+                    let v = ty_mbin(ph, m, ty as u32, bin);
+                    if v > 0 {
+                        if !mbin.is_empty() {
+                            mbin.push('/');
+                        }
+                        mbin.push_str(&format!("{}:{}", M_BIN_NAME[bin], v));
+                    }
+                }
+                body.push_str(&format!(
+                    "\n[exp-kprof]  {} {} {:6} calls={c} rows={rows} {:.1} MB {:.1} ms path={} ker {ker} | m {mbin}",
+                    PH_NAME[ph],
+                    mat_name,
+                    ty_name(ty),
+                    b as f64 / 1e6,
+                    ns as f64 / 1e6,
+                    path_of(&ker_counts(ph, m, ty as u32)),
+                ));
             }
+        }
+        if tot_c > 0 {
             s.push_str(&format!(
-                "\n[exp-kprof]  {} {:6} calls={c} rows={rows} {:.1} MB {:.1} ms ker {ker} | m {mbin}",
-                mat_name,
-                ty_name(ty),
-                b as f64 / 1e6,
-                ns as f64 / 1e6,
+                "\n[exp-kprof]  {} total calls={tot_c} {:.1} ms",
+                PH_NAME[ph],
+                tot_ns as f64 / 1e6
             ));
+            s.push_str(&body);
         }
     }
     s
+}
+
+/// (位相, 行列, 型) のカーネル実行先の累積を配列にする ([`path_of`] の引数)。
+fn ker_counts(ph: usize, mat: usize, ty_id: u32) -> [u64; NKER] {
+    let base = ty_slot(ph, mat, ty_id) * NKER;
+    let mut a = [0u64; NKER];
+    for (k, v) in a.iter_mut().enumerate() {
+        *v = TY_KER[base + k].load(Ordering::Relaxed);
+    }
+    a
 }

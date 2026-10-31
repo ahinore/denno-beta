@@ -978,6 +978,36 @@ fn expert_gemv_inner(
 ) -> Result<()> {
     let rb = check_gemv_args(ty, blocks, n_in, n_out, x, out)?;
 
+    // task 95: Q2_0 (Swift 1.5 の ffn_down_exps の実型) はジェネリックな
+    // [`gemv_iq`] (v2) ではなく専用の融合カーネルへ。v2 は 8 要素ごとに 2 バイトを
+    // スカラーで読むため dequant が頭打ち (このコンテナの実測 3.48 GB/s。IQ4_NL v2 は
+    // 9.12 GB/s / bench80)。`DENNO_Q2_0_FAST=0` で下の経路に戻る (退避路)。
+    if ty == GgmlType::Q2_0 && q4k_fused_supported() && q2_0_fast_enabled() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                crate::model::exp_kprof::K_Q2_0,
+            );
+            for_each_row_chunk(
+                blocks,
+                n_out,
+                rb,
+                out,
+                par,
+                min_rows,
+                min_chunk,
+                0,
+                |b, o| unsafe { gemv_q2_0_avx2(b, n_in, o.len(), x, o) },
+            );
+            #[cfg(test)]
+            Q2_0_FUSED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+    }
+
     // IQ4_NL / Q2_0 (Swift 1.5 の ffn_down_exps) は AVX2 融合カーネルへ。
     // 2026-10-31 実測: スカラー 2788 ms/token -> 下記カーネルで短縮。
     if iq_kind(ty).is_some() && q4k_fused_supported() {
@@ -991,6 +1021,7 @@ fn expert_gemv_inner(
                 crate::model::exp_kprof::K_IQ_V2
             };
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 ker,
@@ -1026,6 +1057,7 @@ fn expert_gemv_inner(
         #[cfg(target_arch = "x86_64")]
         {
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 crate::model::exp_kprof::K_IQ4XS,
@@ -1051,6 +1083,7 @@ fn expert_gemv_inner(
         #[cfg(target_arch = "x86_64")]
         {
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 crate::model::exp_kprof::K_Q4K,
@@ -1093,6 +1126,7 @@ fn expert_gemv_inner(
         #[cfg(target_arch = "x86_64")]
         {
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 crate::model::exp_kprof::K_Q6K,
@@ -1117,6 +1151,7 @@ fn expert_gemv_inner(
         #[cfg(target_arch = "x86_64")]
         {
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 crate::model::exp_kprof::K_Q5K,
@@ -1142,6 +1177,7 @@ fn expert_gemv_inner(
     // k 昇順のまま)。旧実装は 1 スレッドで全行を回していた。
 
     crate::model::exp_kprof::bump_kernel(
+        crate::model::exp_kprof::PH_DECODE,
         crate::model::exp_kprof::cur_mat(),
         ty.id(),
         crate::model::exp_kprof::K_SCALAR,
@@ -2827,6 +2863,54 @@ pub fn iq4xs_fast_enabled() -> bool {
 pub(crate) static IQ4XS_FUSED_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+// ---- Q2_0 の融合 GEMV (task 95) ---------------------------------------------
+//
+// 本番モデル (Swift 1.5 系) の `ffn_down_exps` の実型。従来はジェネリックな
+// [`gemv_iq`] (v2) を通っていたが、8 要素ごとに 2 バイトをスカラーで読んで
+// `srlv` で広げる形なので dequant が頭打ちになる (このコンテナの 1 スレッド実測
+// 3.48 GB/s。IQ4_NL v2 は 9.12 GB/s / bench80)。カーネルは [`gemv_q2_0_avx2`]。
+// `DENNO_Q2_0_FAST=0` で classic 経路へ戻せる (退避路)。
+
+/// `DENNO_Q2_0_FAST` の値の解釈。**既定 on** ([`iq4xs_fast_from_value`] と同じ規約)。
+fn q2_0_fast_from_value(v: Option<&str>) -> bool {
+    iq4xs_fast_from_value(v)
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+#[cfg(test)]
+static Q2_0_FAST_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト専用: Q2_0 融合経路の on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_q2_0_fast_for_test(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    Q2_0_FAST_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_Q2_0_FAST` をプロセスで 1 回だけ読む (既定 on)。
+pub fn q2_0_fast_enabled() -> bool {
+    #[cfg(test)]
+    match Q2_0_FAST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| q2_0_fast_from_value(std::env::var("DENNO_Q2_0_FAST").ok().as_deref()))
+}
+
+/// テスト用: Q2_0 融合カーネルが実際に発火した回数 ([`IQ4XS_FUSED_CALLS`] と同じ)。
+#[cfg(test)]
+pub(crate) static Q2_0_FUSED_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 // ---- Q6_K / Q5_K の融合 GEMV (P93) ------------------------------------------
 //
 // 本番モデル (Flash-Next) の `ffn_gate_exps` / `ffn_up_exps` は層ごとに型が混在して
@@ -3740,6 +3824,7 @@ fn expert_gemv_any_inner(
     let res = match ty {
         GgmlType::Q5_1 => {
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 crate::model::exp_kprof::K_Q5_1,
@@ -3749,6 +3834,7 @@ fn expert_gemv_any_inner(
         // expert の Q8_0 は classic カーネルのまま (P84 の f16c 版は hc mix 専用)。
         GgmlType::Q8_0 => {
             crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
                 crate::model::exp_kprof::cur_mat(),
                 ty.id(),
                 crate::model::exp_kprof::K_Q8_0,
@@ -3792,6 +3878,82 @@ pub fn expert_gemv_scalar(
     let rb = check_gemv_args(ty, blocks, n_in, n_out, x, out)?;
     gemv_scalar_body(ty, rb, blocks, n_in, n_out, x, out);
     Ok(())
+}
+
+// ---- Q2_0 の 1 トークン融合 GEMV (task 95) ----------------------------------
+//
+// [`gemv_iq4xs_avx2`] (P89) と同じ構成: 行ごとにブロック昇順、8 バイト (32 要素)
+// ごとに 2 ビット コードを `cvtepu8_epi32` で 8 レーンに広げてから 4 本に切る。
+// レーン j がバイト j (要素 4j + k) を持つので、x を**コード位置ごとの飛び配列**
+// `xs_k[i] = x[4i + k]` に 1 回並べ替えておけば転置なしでそのまま FMA に載る
+// (並べ替えは 1 呼び出し 1 回。重みは行数分あるのでコストは無視できる)。
+//
+// 数値:
+// - dequant は `w = (q - 1) as f32 * d`。[`crate::kquant`] 参照 ([`dequant_block`]
+//   の Q2_0 分岐) と同じ 1 回の f32 乗算なので **to_bits 一致**する。
+// - 内積は `w * x` を FMA で累積するので、classic (dequant + [`dot_seq`]) とは
+//   累積順・積の丸めが違い**ビット一致しない** (相対 1e-6 程度。P89 と同じ立場)。
+//   累積は 8 バイト グループ内でコード位置 k = 0,1,2,3 の順 (a0/a1 に振り分け)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_q2_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 18; // d(2) + qs(16)。64 要素
+    let nb = n_in / 64;
+    let rb = nb * BLK;
+    let bp = blocks.as_ptr();
+    // x をコード位置 k ごとの飛び配列に並べ替える (xs_k[i] = x[4i + k])。
+    // 8 バイト グループのコード ベクトル c_k (レーン j = 要素 4(8g + j) + k) は
+    // xs_k[8g..8g + 8] とそのままペアになる。
+    let n4 = n_in / 4;
+    let mut xs = vec![0f32; 4 * n4];
+    for i in 0..n4 {
+        let x4 = [x[4 * i], x[4 * i + 1], x[4 * i + 2], x[4 * i + 3]];
+        xs[i] = x4[0];
+        xs[n4 + i] = x4[1];
+        xs[2 * n4 + i] = x4[2];
+        xs[3 * n4 + i] = x4[3];
+    }
+    let (x0, rest) = xs.split_at(n4);
+    let (x1, rest) = rest.split_at(n4);
+    let (x2, x3) = rest.split_at(n4);
+    let m3 = _mm256_set1_epi32(3);
+    let one = _mm256_set1_epi32(1);
+
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let dv = _mm256_set1_ps(d);
+            // 前半 8 バイト (要素 0..31) / 後半 8 バイト (要素 32..63)。
+            // レーン j がバイト j = 要素 4(8g + j) + k を持つ。
+            for h in 0..2usize {
+                let g = b * 2 + h; // 8 バイト グループの番号
+                let q = _mm_loadl_epi64(p.add(2 + h * 8) as *const __m128i);
+                let v = _mm256_cvtepu8_epi32(q);
+                // 2 ビット コード k (要素 4(8g + j) + k) を 4 本に切る。
+                let c0 = _mm256_and_si256(v, m3);
+                let c1 = _mm256_and_si256(_mm256_srli_epi32::<2>(v), m3);
+                let c2 = _mm256_and_si256(_mm256_srli_epi32::<4>(v), m3);
+                let c3 = _mm256_and_si256(_mm256_srli_epi32::<6>(v), m3);
+                // w = (q - 1) as f32 * d (参照と同じ 1 回の f32 乗算)。
+                let w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(c0, one)), dv);
+                let w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(c1, one)), dv);
+                let w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(c2, one)), dv);
+                let w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(c3, one)), dv);
+                let o = g * 8;
+                a0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x0.as_ptr().add(o)), a0);
+                a1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x1.as_ptr().add(o)), a1);
+                a0 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(x2.as_ptr().add(o)), a0);
+                a1 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(x3.as_ptr().add(o)), a1);
+            }
+        }
+        out[r] = q8_hadd(a0, a1);
+    }
 }
 
 // ---- H3: 量子型のバッチ GEMV (GEMM) --------------------------------------
@@ -3930,10 +4092,49 @@ pub(crate) fn gemm_rows(
     stride: usize,
     fused: bool,
 ) {
+    // task 95: `DENNO_EXP_KPROF=1` のときだけ prefill 位相として (行列, 型) ごとの
+    // 呼び出し数 / バイト / 時間を積む。既定 off では `stamp()` が `None` = 分岐なし。
+    // 行列 (`mat`) は呼び出し側 (moe_experts_flat) が `exp_kprof::set_mat` で立てる。
+    let prof = crate::model::exp_kprof::stamp();
+    let mat = crate::model::exp_kprof::cur_mat();
+    gemm_rows_disp(ty, rb, blocks, n_in, r0, r1, xs, m, out, stride, fused);
+    if let Some(t) = prof {
+        crate::model::exp_kprof::record_call_ph(
+            crate::model::exp_kprof::PH_PREFILL,
+            mat,
+            ty.id(),
+            (r1 - r0) * rb,
+            r1 - r0,
+            m,
+            t.elapsed(),
+        );
+    }
+}
+
+/// [`gemm_rows`] の本体 (経路の振り分けだけ。記録は包装側)。
+fn gemm_rows_disp(
+    ty: GgmlType,
+    rb: usize,
+    blocks: &[u8],
+    n_in: usize,
+    r0: usize,
+    r1: usize,
+    xs: &[f32],
+    m: usize,
+    out: *mut f32,
+    stride: usize,
+    fused: bool,
+) {
     #[cfg(target_arch = "x86_64")]
     {
         if fused && ty == GgmlType::Q8_0 && q8_0_fused_supported() {
             gemm_fused_fired();
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                crate::model::exp_kprof::K_Q8_0,
+            );
             // SAFETY: 引数は check_gemm_args が検証済み (n_in%32==0 は row_bytes が保証) で、
             // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
             // `out` は m*stride 要素ちょうど (debug_assert 済み)。
@@ -3942,18 +4143,36 @@ pub(crate) fn gemm_rows(
         }
         if fused && ty == GgmlType::Q5_1 && q8_0_fused_supported() {
             gemm_fused_fired();
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                crate::model::exp_kprof::K_Q5_1,
+            );
             // SAFETY: 同上 (Q5_1 のブロックは 32 要素 = 24 バイト)。
             unsafe { gemm_q5_1_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
             return;
         }
         if fused && ty == GgmlType::Q4K && q4k_fused_supported() {
             gemm_fused_fired();
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                crate::model::exp_kprof::K_Q4K,
+            );
             // SAFETY: 同上 (Q4_K は n_in%256==0 が row_bytes で保証される)。
             unsafe { gemm_q4k_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
             return;
         }
         if fused && ty == GgmlType::Q5K && q4k_fused_supported() && q5k_fast_enabled() {
             gemm_fused_fired();
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                crate::model::exp_kprof::K_Q5K,
+            );
             // SAFETY: 同上 (Q5_K は n_in%256==0 が row_bytes で保証される)。
             // ゲートは 1 行版 ([`expert_gemv_inner`] の Q5_K 分岐) と同じ
             // [`q5k_fast_enabled`]。`DENNO_Q5K_FAST=0` では 1 行版がスカラーへ落ちる
@@ -3991,6 +4210,18 @@ pub(crate) fn gemm_rows(
                 None
             };
             let v2_used = !z_used && v2 && matches!(iq_kind(ty), Some(2) | Some(3));
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                if z_used {
+                    crate::model::exp_kprof::K_GIQ_Z
+                } else if v2_used {
+                    crate::model::exp_kprof::K_IQ_V2
+                } else {
+                    crate::model::exp_kprof::K_GIQ_V1
+                },
+            );
             if v2_used {
                 gemm_iq_v2_fired();
             }
@@ -4026,6 +4257,12 @@ pub(crate) fn gemm_rows(
         }
     }
     let _ = fused;
+    crate::model::exp_kprof::bump_kernel(
+        crate::model::exp_kprof::PH_PREFILL,
+        crate::model::exp_kprof::cur_mat(),
+        ty.id(),
+        crate::model::exp_kprof::K_SCALAR,
+    );
     gemm_rows_scalar(ty, rb, blocks, n_in, r0, r1, xs, m, out, stride);
 }
 
@@ -5654,6 +5891,9 @@ pub(crate) fn gemm_rows_vnni(
             return false;
         }
         vnni_fired();
+        // task 95: `DENNO_EXP_KPROF=1` のときだけ prefill 位相 (VNNI 経路) を積む。
+        let prof = crate::model::exp_kprof::stamp();
+        let mat = crate::model::exp_kprof::cur_mat();
         // SAFETY: 上の検証で `blocks` の行数・`act` の形・`r0..r1` の範囲は確認済み。
         // `out` の指す先 (m * stride 要素以上) は呼び出し側の契約
         // ([`gemm_rows`] の Safety) と同じ。実行 CPU の機能は `vnni_supported` が見た。
@@ -5667,6 +5907,23 @@ pub(crate) fn gemm_rows_vnni(
                 }
                 _ => return false,
             }
+        }
+        if let Some(t) = prof {
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                mat,
+                ty.id(),
+                crate::model::exp_kprof::K_VNNI,
+            );
+            crate::model::exp_kprof::record_call_ph(
+                crate::model::exp_kprof::PH_PREFILL,
+                mat,
+                ty.id(),
+                (r1 - r0) * rb,
+                r1 - r0,
+                act.m,
+                t.elapsed(),
+            );
         }
         true
     }
@@ -10430,30 +10687,381 @@ mod exp_kprof_tests {
         let mut out = vec![0f32; n_out];
         expert_gemv_any_seq(GgmlType::Q6K, &blocks, n_in, n_out, &x, &mut out).unwrap();
 
-        let (c, b, rows, ns) = kp::ty_stats(kp::GATE, GgmlType::Q6K.id());
+        let (c, b, rows, ns) = kp::ty_stats(kp::PH_DECODE, kp::GATE, GgmlType::Q6K.id());
         assert_eq!(c, 1, "Q6_K gate の呼び出し数");
         assert_eq!(b, blocks.len() as u64, "Q6_K gate のバイト数");
         assert_eq!(rows, 64, "Q6_K gate の行数");
         assert!(ns > 0, "Q6_K gate の時間が積まれていない");
         assert_eq!(
-            kp::ty_kernel(kp::GATE, GgmlType::Q6K.id(), kp::K_Q6K),
+            kp::ty_kernel(kp::PH_DECODE, kp::GATE, GgmlType::Q6K.id(), kp::K_Q6K),
             1,
             "Q6_K が q6k カーネルとして数えられていない"
         );
-        assert_eq!(kp::ty_kernel(kp::GATE, GgmlType::Q6K.id(), kp::K_SCALAR), 0);
+        assert_eq!(kp::ty_kernel(kp::PH_DECODE, kp::GATE, GgmlType::Q6K.id(), kp::K_SCALAR), 0);
         // m 分布: 64 行はビン 6 (33..=64)。
-        assert_eq!(kp::ty_mbin(kp::GATE, GgmlType::Q6K.id(), 6), 1);
-        assert_eq!(kp::ty_mbin(kp::GATE, GgmlType::Q6K.id(), 5), 0);
+        assert_eq!(kp::ty_mbin(kp::PH_DECODE, kp::GATE, GgmlType::Q6K.id(), 6), 1);
+        assert_eq!(kp::ty_mbin(kp::PH_DECODE, kp::GATE, GgmlType::Q6K.id(), 5), 0);
 
         let line = kp::line().expect("on なのにレポートが無い");
         assert!(line.contains("Q6_K"), "型名が無い: {line}");
         assert!(line.contains("ker q6k=1"), "カーネル実行先が無い: {line}");
         assert!(line.contains("m 64:1"), "m 分布が無い: {line}");
+        // task 95: decode 位相のタグと経路の粗分類。
+        assert!(line.contains("d gate"), "decode 位相のタグが無い: {line}");
+        assert!(line.contains("d total"), "decode 位相の合計が無い: {line}");
+        assert!(line.contains("path=fused"), "経路が無い: {line}");
 
         kp::set_for_test(false);
         kp::set_mat(kp::OTHER);
         kp::reset();
         set_q6k_fast_for_test(None);
+    }
+
+    /// task 95: prefill (バッチ GEMM) 位相が (行列, 型) ごとに積まれること。
+    ///
+    /// decode 位相 ([`expert_gemv_any_seq`]) とは別スロットに出る。Q6_K には
+    /// バッチ融合カーネルが無いので [`gemm_rows`] はスカラー バッチ
+    /// ([`gemm_rows_scalar`]) を通る — その分岐が `path=scalar` / `ker scalar=1`
+    /// として見えることまで確かめる。
+    #[test]
+    fn exp_kprof_prefill_phase_counts_gemm_rows() {
+        let _g = kprof_lock();
+        let _m = moe_test_lock();
+        kp::set_for_test(false);
+        kp::reset();
+        kp::set_for_test(true);
+
+        // gate (Q6_K) を m=4 トークンで 1 回 (prefill のバッチ形)。
+        let (n_in, n_out, m) = (256usize, 64usize, 4usize);
+        let blocks = q6k_expert(n_in, n_out);
+        let xs: Vec<f32> = (0..m * n_in)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+            .collect();
+        kp::set_mat(kp::GATE);
+        let mut out = vec![0f32; m * n_out];
+        gemm_rows(
+            GgmlType::Q6K,
+            row_bytes(GgmlType::Q6K, n_in).unwrap(),
+            &blocks,
+            n_in,
+            0,
+            n_out,
+            &xs,
+            m,
+            out.as_mut_ptr(),
+            n_out,
+            true,
+        );
+
+        // prefill 位相に積まれている (呼び出し 1 / バイト = 1 expert 分 / 行 = n_out)。
+        let (c, b, rows, ns) = kp::ty_stats(kp::PH_PREFILL, kp::GATE, GgmlType::Q6K.id());
+        assert_eq!(c, 1, "prefill Q6_K gate の呼び出し数");
+        assert_eq!(b, blocks.len() as u64, "prefill Q6_K gate のバイト数");
+        assert_eq!(rows, n_out as u64, "prefill Q6_K gate の行数");
+        assert!(ns > 0, "prefill Q6_K gate の時間が積まれていない");
+        // Q6_K にはバッチ融合カーネルが無い -> スカラー バッチ。
+        assert_eq!(
+            kp::ty_kernel(kp::PH_PREFILL, kp::GATE, GgmlType::Q6K.id(), kp::K_SCALAR),
+            1,
+            "prefill Q6_K が scalar として数えられていない"
+        );
+        // m 分布はトークン数で振る (m=4 はビン 2 = 2..=4。ビン 1 は 2 まで)。
+        assert_eq!(kp::ty_mbin(kp::PH_PREFILL, kp::GATE, GgmlType::Q6K.id(), 2), 1);
+        assert_eq!(kp::ty_mbin(kp::PH_PREFILL, kp::GATE, GgmlType::Q6K.id(), 1), 0);
+        // decode 位相は触れていない。
+        assert_eq!(
+            kp::ty_stats(kp::PH_DECODE, kp::GATE, GgmlType::Q6K.id()).0,
+            0,
+            "prefill の記録が decode 位相に漏れている"
+        );
+
+        let line = kp::line().expect("on なのにレポートが無い");
+        assert!(line.contains("p gate"), "prefill 位相のタグが無い: {line}");
+        assert!(line.contains("p total"), "prefill 位相の合計が無い: {line}");
+        assert!(line.contains("path=scalar"), "経路が無い: {line}");
+
+        // VNNI 経路 (Q4_K) の記録も prefill 位相に載ること (CPU が対応するときだけ)。
+        // 出力値の正しさは vnni_gemm_matches_fused_kernels_within_tolerance が見る。
+        if vnni_supported() {
+            kp::reset();
+            let (n_in, n_out, m) = (256usize, 16usize, 5usize);
+            // Q4_K の 1 expert ぶん (内容は任意。ここでは記録の通過だけを見る)。
+            let rb = 144usize;
+            let mut blocks = vec![0u8; rb * n_out];
+            for r in 0..n_out {
+                let p = &mut blocks[r * rb..(r + 1) * rb];
+                p[0..2].copy_from_slice(&f16b(0.01));
+                p[2..4].copy_from_slice(&f16b(0.001));
+            }
+            let xs: Vec<f32> = (0..m * n_in)
+                .map(|i| ((i * 53 % 211) as f32 - 105.0) / 128.0)
+                .collect();
+            let mut q = vec![0i8; m * n_in];
+            let mut sc = vec![0f32; m * (n_in / 256)];
+            let mut gs = vec![0f32; m * (n_in / 32)];
+            quant_act_i8(&xs, m, n_in, 256, &mut q, &mut sc, &mut gs).unwrap();
+            let act = VnniAct {
+                q: &q,
+                sc: &sc,
+                gs: &gs,
+                m,
+                n_in,
+                blk: 256,
+            };
+            let mut got = vec![0f32; m * n_out];
+            let used = gemm_rows_vnni(
+                GgmlType::Q4K,
+                &blocks,
+                n_in,
+                0,
+                n_out,
+                &act,
+                got.as_mut_ptr(),
+                n_out,
+            );
+            assert!(used, "VNNI 経路が使われていない");
+            assert_eq!(
+                kp::ty_kernel(kp::PH_PREFILL, kp::GATE, GgmlType::Q4K.id(), kp::K_VNNI),
+                1,
+                "VNNI が prefill 位相に数えられていない"
+            );
+            assert_eq!(
+                kp::ty_stats(kp::PH_PREFILL, kp::GATE, GgmlType::Q4K.id()).0,
+                1,
+                "VNNI の呼び出しが prefill 位相に積まれていない"
+            );
+        }
+
+        kp::set_for_test(false);
+        kp::set_mat(kp::OTHER);
+        kp::reset();
+    }
+
+    /// task 95: Q2_0 融合 GEMV ([`gemv_q2_0_avx2`]) の検証。
+    ///
+    /// 契約は P89 (IQ4_XS) と同じ立て方:
+    /// (1) dequant は kquant 参照 (classic = dequant + `dot_seq`) と **to_bits 一致**
+    ///     (one-hot x で 1 要素ずつ見る。one-hot の内積は `w * 1.0` なので値がそのまま出る)。
+    /// (2) 内積は classic と相対 1e-4 以内で、f64 真値との誤差は classic 以下。
+    /// (3) 発火は exp_kprof の K_Q2_0 bump で数える。`DENNO_Q2_0_FAST=0` 相当では
+    ///     K_SCALAR に落ちること (退避路が実際に効くこと) も確認する。
+    #[test]
+    fn q2_0_fused_gemv_dequant_bits_and_accuracy() {
+        let _g = kprof_lock();
+        let _m = moe_test_lock();
+        if !q4k_fused_supported() {
+            eprintln!("skip q2_0_fused_gemv: この CPU には AVX2/FMA が無い");
+            return;
+        }
+        set_q2_0_fast_for_test(Some(true));
+
+        // Q2_0 の 1 expert ぶん (1 ブロック 18 バイト = 64 要素)。
+        // ブロック index と行で d とコードをずらす (全ブロック同一だと
+        // 出力が潰れて生死が見えない)。
+        let q2_blocks = |n_in: usize, n_out: usize| -> Vec<u8> {
+            let nb = n_in / 64;
+            let mut v = Vec::with_capacity(n_out * nb * 18);
+            for r in 0..n_out {
+                for b in 0..nb {
+                    let mut blk = vec![0u8; 18];
+                    blk[0..2].copy_from_slice(&f16b(0.01 + 0.003 * ((r + b) % 7) as f32));
+                    for i in 0..16usize {
+                        blk[2 + i] = byte_at(i, (r * 131 + b * 17) as u32 + 9);
+                    }
+                    v.extend_from_slice(&blk);
+                }
+            }
+            v
+        };
+        // f64 の参照 dequant (kquant の dequant_block Q2_0 分岐と同じ式)。
+        let q2_row_f64 = |bytes: &[u8], k: usize| -> Vec<f64> {
+            let nb = k / 64;
+            let mut w = vec![0f64; k];
+            for b in 0..nb {
+                let blk = &bytes[b * 18..(b + 1) * 18];
+                let d =
+                    half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32() as f64;
+                for j in 0..64usize {
+                    let q = ((blk[2 + j / 4] >> ((j % 4) * 2)) & 0x03) as i64;
+                    w[b * 64 + j] = (q - 1) as f64 * d;
+                }
+            }
+            w
+        };
+
+        // (1) dequant の to_bits 一致 (one-hot)。1 ブロック形は全 64 要素、
+        //     down 形 (n_in=640) は両端と中間の 9 点。
+        for (name, k, n, probes) in [
+            (
+                "1 ブロック",
+                64usize,
+                96usize,
+                (0..64usize).collect::<Vec<usize>>(),
+            ),
+            (
+                "down 形",
+                640usize,
+                128usize,
+                vec![0, 1, 63, 64, 127, 255, 320, 511, 639],
+            ),
+        ] {
+            let blocks = q2_blocks(k, n);
+            let mut ref_out = vec![0f32; n];
+            let mut got = vec![0f32; n];
+            for i in probes {
+                let mut x = vec![0f32; k];
+                x[i] = 1.0;
+                expert_gemv_scalar(GgmlType::Q2_0, &blocks, k, n, &x, &mut ref_out).unwrap();
+                expert_gemv(GgmlType::Q2_0, &blocks, k, n, &x, &mut got).unwrap();
+                for r in 0..n {
+                    let (kv, rw) = (got[r].to_bits(), ref_out[r].to_bits());
+                    assert!(
+                        kv == rw || (got[r] == 0.0 && ref_out[r] == 0.0),
+                        "{name} i={i} row {r}: 融合 {} ({kv:#x}) が classic {} ({rw:#x}) と不一致",
+                        got[r],
+                        ref_out[r]
+                    );
+                }
+            }
+            assert!(
+                ref_out.iter().any(|v| *v != 0.0),
+                "{name}: 参照が全 0 (fixture が壊れた)"
+            );
+        }
+
+        // (2) classic との相対誤差と f64 真値。
+        for (name, k, n) in [
+            ("down 形", 640usize, 2560usize),
+            ("1 ブロック", 64usize, 1024usize),
+            ("奇数行", 640usize, 321usize),
+            ("門番未満 (63 行)", 640usize, 63usize),
+        ] {
+            let blocks = q2_blocks(k, n);
+            let x: Vec<f32> = (0..k)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+                .collect();
+            let mut a = vec![0f32; n];
+            let mut b = vec![0f32; n];
+            expert_gemv_scalar(GgmlType::Q2_0, &blocks, k, n, &x, &mut a).unwrap();
+            expert_gemv(GgmlType::Q2_0, &blocks, k, n, &x, &mut b).unwrap();
+            assert!(
+                b.iter().any(|v| *v != 0.0),
+                "{name}: 出力が全 0 (経路の生死が分からない)"
+            );
+            let rb = row_bytes(GgmlType::Q2_0, k).unwrap();
+            for r in 0..n {
+                let w = q2_row_f64(&blocks[r * rb..(r + 1) * rb], k);
+                let truth: f32 = w
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(wv, xv)| wv * *xv as f64)
+                    .sum::<f64>() as f32;
+                let scale = truth.abs().max(1e-3);
+                let rel_fa = (b[r] - truth).abs() / scale;
+                let rel_fc = (a[r] - b[r]).abs() / scale;
+                assert!(
+                    rel_fc < 1e-4,
+                    "{name} row {r}: 融合 {} が classic {} から相対 {rel_fc} 外れた",
+                    b[r],
+                    a[r]
+                );
+                assert!(
+                    rel_fa < 1e-4,
+                    "{name} row {r}: 融合 {} の f64 真値 {} に対する相対誤差 {rel_fa}",
+                    b[r],
+                    truth
+                );
+            }
+        }
+
+        // (3) 発火 (exp_kprof の K_Q2_0) と退避路 (FAST=0 で K_SCALAR へ)。
+        kp::set_for_test(false);
+        kp::reset();
+        kp::set_for_test(true);
+        let (k, n) = (640usize, 64usize);
+        let blocks = q2_blocks(k, n);
+        let x: Vec<f32> = (0..k).map(|i| ((i * 53 % 211) as f32 - 105.0) / 128.0).collect();
+        let mut out = vec![0f32; n];
+        expert_gemv(GgmlType::Q2_0, &blocks, k, n, &x, &mut out).unwrap();
+        assert!(
+            kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::Q2_0.id(), kp::K_Q2_0) >= 1,
+            "Q2_0 が融合カーネルとして数えられていない"
+        );
+        assert_eq!(
+            kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::Q2_0.id(), kp::K_SCALAR),
+            0
+        );
+        kp::reset();
+        set_q2_0_fast_for_test(Some(false));
+        expert_gemv(GgmlType::Q2_0, &blocks, k, n, &x, &mut out).unwrap();
+        // 退避路はスカラーではなく従来の gemm_iq (v2) カーネル (IQ4_XS と同じ立て方)。
+        assert!(
+            kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::Q2_0.id(), kp::K_IQ_V2) >= 1,
+            "退避路 (FAST=0) が従来の gemv_iq に落ちていない"
+        );
+        assert_eq!(
+            kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::Q2_0.id(), kp::K_Q2_0),
+            0,
+            "FAST=0 なのに融合カーネルが発火した"
+        );
+        set_q2_0_fast_for_test(None);
+        kp::set_for_test(false);
+        kp::reset();
+    }
+
+    /// task 95 マイクロベンチ: Q2_0 の融合 GEMV と従来の gemv_iq (v2) を
+    /// down 実形 (n_in=640 / n_out=2560、1 expert) で比べる。1 スレッド、
+    /// 重みは L2 に載る大きさ (512 KB)。
+    ///
+    /// 実行: `cargo test --release -p denno-engine --lib \
+    ///        -- --ignored --nocapture --test-threads=1 bench_q2_0_gemv`
+    #[test]
+    #[ignore = "task 95 マイクロベンチ (実測。通常のテストでは走らせない)"]
+    fn bench_q2_0_gemv_fused_vs_v2() {
+        if !q4k_fused_supported() {
+            eprintln!("[bench95] AVX2/FMA が無いので計測しない");
+            return;
+        }
+        let _g = kprof_lock();
+        let _m = moe_test_lock();
+        let (n_in, n_out) = (640usize, 2560usize);
+        let nb = n_in / 64;
+        let rb = nb * 18;
+        let mut blocks = vec![0u8; rb * n_out];
+        for r in 0..n_out {
+            for b in 0..nb {
+                let blk = &mut blocks[r * rb + b * 18..r * rb + (b + 1) * 18];
+                blk[0..2].copy_from_slice(&f16b(0.01 + 0.003 * ((r + b) % 7) as f32));
+                for i in 0..16usize {
+                    blk[2 + i] = byte_at(i, (r * 131 + b * 17) as u32 + 9);
+                }
+            }
+        }
+        let x: Vec<f32> = (0..n_in)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+            .collect();
+        let gb = blocks.len() as f64 / 1e9;
+        let mut out = vec![0f32; n_out];
+        let mut best = [f64::INFINITY; 2];
+        for rep in 0..12 {
+            for vi in 0..2usize {
+                set_q2_0_fast_for_test(Some(vi == 0));
+                let t0 = std::time::Instant::now();
+                expert_gemv(GgmlType::Q2_0, &blocks, n_in, n_out, &x, &mut out).unwrap();
+                let dt = t0.elapsed().as_secs_f64();
+                std::hint::black_box(&out);
+                best[vi] = best[vi].min(dt);
+            }
+        }
+        set_q2_0_fast_for_test(None);
+        eprintln!(
+            "[bench95] Q2_0 {n_in}x{n_out} 1T | 融合 {:8.1} us {:6.2} GB/s | v2 {:8.1} us {:6.2} GB/s | {:.3}x",
+            best[0] * 1e6,
+            gb / best[0],
+            best[1] * 1e6,
+            gb / best[1],
+            best[1] / best[0]
+        );
     }
 }
 

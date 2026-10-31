@@ -262,10 +262,15 @@ fn prof_flash_q4(tag: &str, tok: usize) {
         eprintln!("{line}");
         denno_engine::model::qwen4exp::attn_kprof::reset();
     }
-    // expert GEMV の区間内訳 (`DENNO_EXP_KPROF=1` のときだけ 1 行 × 行列数)。
-    if let Some(line) = denno_engine::model::exp_kprof::line() {
-        eprintln!("{line}");
-        denno_engine::model::exp_kprof::reset();
+    // expert GEMV の型別内訳 (`DENNO_EXP_KPROF=1` のときだけ 1 レポート)。
+    // task 95: prefill 終端では積むだけにして、decode 終端 (= リクエストの終端) で
+    // decode (m=1) と prefill (m>1) を分けた 1 レポートを出して reset する
+    // (prefill だけで終わるリクエストでは次のリクエストに持ち越す)。
+    if tag == "decode" {
+        if let Some(line) = denno_engine::model::exp_kprof::line() {
+            eprintln!("{line}");
+            denno_engine::model::exp_kprof::reset();
+        }
     }
     // prefill の expert GEMM (gemm_iq 系) の 1 行カウンタ
     // (`DENNO_GEMM_IQ_KPROF=1` のときだけ 1 行)。decode は exp_kprof、
