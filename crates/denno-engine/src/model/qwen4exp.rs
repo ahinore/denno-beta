@@ -1553,7 +1553,7 @@ fn linear(f: &GgufFile, name: &str) -> Result<GgufLinear> {
         .mmap_handle_at(file)
         .ok_or_else(|| one(format!("{name}: パート {file} の mmap が無い")))?;
     let blocks = WeightBlocks::mapped(map, off, len);
-    GgufLinear::new(t.ty, k, n, blocks)
+    crate::model::linear_gguf::maybe_requant(GgufLinear::new(t.ty, k, n, blocks)?)
         .map(|l| l.with_fast_q8(true))
         .map_err(|e| one(format!("{name}: {e}")))
 }

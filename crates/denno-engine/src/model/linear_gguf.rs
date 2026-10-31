@@ -354,6 +354,93 @@ impl GgufLinear {
         self.fast_q8
     }
 
+/// 融合カーネルを持たない型を Q8_0 へ作り直す共通の入口。
+///
+/// `DENNO_REQUANT_Q8=0` で無効化 (`DENNO_REQUANT_Q8` 未設定は有効)。
+pub fn maybe_requant(l: GgufLinear) -> Result<GgufLinear> {
+    let off = std::env::var("DENNO_REQUANT_Q8").ok().as_deref() == Some("0");
+    if off || l.has_fused_kernel() {
+        return Ok(l);
+    }
+    l.requant_to_q8_0()
+}
+
+    /// 密行列を Q8_0 へ**作り直す** (融合カーネル・GPU 常駐の対象型へ載せ替える)。
+    ///
+    /// 2026-10-31: Swift 1.5 の密行列は IQ4_XS / Q4_K / Q5_K / Q6_K が層ごとに
+    /// 混在する。これらの型には融合 GEMV も GPU GEMM も無く、`gemv` は 1 行ずつ
+    /// デコードするスカラー経路に落ちる (実測 decode 3960 ms/token、うち attn の
+    /// qkv+out が 15 s / 9 token)。Q8_0 へ作り直すと既存の AVX2 融合カーネル・
+    /// GPU 常駐・バッチ経路がそのまま使える。量子化誤差は元の 4 bit 量子化に対して
+    /// 十分小さく、**元の値からの相対誤差は Q8_0 の丸め (≤0.4%) だけ**になる。
+    ///
+    /// 行は独立なので並列に作れる。`DENNO_REQUANT_Q8=0` で無効化できる。
+    pub fn requant_to_q8_0(self) -> Result<Self> {
+        if self.ty == GgmlType::Q8_0 {
+            return Ok(self);
+        }
+        let (k, n) = (self.k, self.n);
+        if k % 32 != 0 {
+            bail!("requant_to_q8_0: k={k} が 32 の倍数でない");
+        }
+        let rb = row_bytes_any(self.ty, k)?;
+        let src = self.blocks.as_slice();
+        let nblk = k / 32;
+        let out_rb = nblk * 34;
+        let mut out = vec![0u8; n * out_rb];
+        let ty = self.ty;
+        let rows_per = n.div_ceil(std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4));
+        std::thread::scope(|sc| {
+            let mut rest: &mut [u8] = &mut out;
+            let mut done = 0usize;
+            while done < n {
+                let take = rows_per.min(n - done);
+                let (chunk, tail) = rest.split_at_mut(take * out_rb);
+                let s = src;
+                sc.spawn(move || {
+                    let mut row = vec![0f32; k];
+                    for r in 0..take {
+                        let g = done + r;
+                        dequant_row_into(ty, &s[g * rb..(g + 1) * rb], &mut row);
+                        let dst = &mut chunk[r * out_rb..(r + 1) * out_rb];
+                        for b in 0..nblk {
+                            let x = &row[b * 32..(b + 1) * 32];
+                            let mut amax = 0f32;
+                            for v in x {
+                                let a = v.abs();
+                                if a > amax {
+                                    amax = a;
+                                }
+                            }
+                            let d = amax / 127.0;
+                            let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                            let o = &mut dst[b * 34..(b + 1) * 34];
+                            let dbits = denno_telemetry::f32_to_f16_bits(d);
+                            o[0..2].copy_from_slice(&dbits.to_le_bytes());
+                            for j in 0..32 {
+                                let q = (x[j] * id).round().clamp(-127.0, 127.0) as i8;
+                                o[2 + j] = q as u8;
+                            }
+                        }
+                    }
+                });
+                rest = tail;
+                done += take;
+            }
+        });
+        GgufLinear::new(GgmlType::Q8_0, k, n, WeightBlocks::from_vec(out))
+            .map(|l| l.with_fast_q8(true))
+            .with_context(|| format!("requant_to_q8_0: {k}x{n}"))
+    }
+
+    /// 融合カーネルがある型か (Q8_0 / Q5_1 / Q4_K / Q5_K)。
+    pub fn has_fused_kernel(&self) -> bool {
+        matches!(
+            self.ty,
+            GgmlType::Q8_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K
+        )
+    }
+
     /// スライスから作る (テスト・小さいテンソル用)。
     pub fn from_slice(ty: GgmlType, k: usize, n: usize, bytes: &[u8]) -> Result<Self> {
         Self::new(ty, k, n, WeightBlocks::from_vec(bytes.to_vec()))

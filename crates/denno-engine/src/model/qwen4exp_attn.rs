@@ -1664,16 +1664,21 @@ fn linear(f: &GgufFile, name: &str, k: usize, n: usize) -> Result<GgufLinear> {
     let ty = t.ty;
     if let Some((file, off, len)) = f.tensor_mapping_parts(name) {
         if let Some(map) = f.mmap_handle_at(file) {
-            return GgufLinear::new(ty, k, n, WeightBlocks::mapped(map, off, len))
+            let l = GgufLinear::new(ty, k, n, WeightBlocks::mapped(map, off, len))
+                .with_context(|| format!("{name}: mmap ブロックから GgufLinear を作れない"))?;
+            return crate::model::linear_gguf::maybe_requant(l)
                 .map(|l| l.with_fast_q8(true))
-                .with_context(|| format!("{name}: mmap ブロックから GgufLinear を作れない"));
+                .with_context(|| format!("{name}: Q8_0 へ作り直せない"));
         }
     }
     let bytes = f
         .tensor_bytes(name)
         .with_context(|| format!("tensor {name}"))?;
-    GgufLinear::new(ty, k, n, WeightBlocks::from_vec(bytes.to_vec()))
-        .with_context(|| format!("{name}: GgufLinear を作れない"))
+    let l = GgufLinear::new(ty, k, n, WeightBlocks::from_vec(bytes.to_vec()))
+        .with_context(|| format!("{name}: GgufLinear を作れない"))?;
+    crate::model::linear_gguf::maybe_requant(l)
+        .map(|l| l.with_fast_q8(true))
+        .with_context(|| format!("{name}: Q8_0 へ作り直せない"))
 }
 
 /// 小さい f32 テンソルを厳密な要素数で読み出す。
