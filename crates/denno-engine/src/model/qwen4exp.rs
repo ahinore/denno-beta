@@ -3107,6 +3107,8 @@ fn hc_mix_quant_ref(
             let t = mix_kprof::stamp();
             w.gemv_label("hc_inject", &xn, &mut v)
                 .map_err(|err| one(format!("hc_mix inject: {err}")))?;
+            // task 96: inject GEMV 1 発の実行先と dtype (down/up と同じ `Instant`)。
+            mix_kprof::gemv::note_inj(t, w.ty());
             mix_kprof::mark(t, mix_kprof::INJ);
             let t = mix_kprof::stamp();
             hyper::hc_inject_apply(&mut v, hp);
@@ -3241,6 +3243,8 @@ fn hc_mix_quant_fast(
                 let t = mix_kprof::stamp();
                 w.gemv_label("hc_inject", xn, &mut v)
                     .map_err(|err| one(format!("hc_mix inject: {err}")))?;
+                // task 96: inject GEMV 1 発の実行先と dtype (down/up と同じ `Instant`)。
+                mix_kprof::gemv::note_inj(t, w.ty());
                 mix_kprof::mark(t, mix_kprof::INJ);
                 let t = mix_kprof::stamp();
                 hyper::hc_inject_apply(&mut v, hp);
@@ -4132,6 +4136,14 @@ pub mod mix_kprof {
     ///   が GPU に落ちている印になる
     /// - `ty`: 呼び出し側が渡した [`GgmlType`] の id (ggml.h の enum 値)。
     ///   型が混ざるプロセスでは最後に積んだ 1 個 (hc down/up はプロセスで 1 種)
+    ///
+    /// task 96: `inj` ([`hc_mix_quant_fast`] / [`hc_mix_quant_ref`] の inject GEMV,
+    /// k=hc_dim / n=hc の小行列) も同じ形式で積む。hc テンソルの目録上の型
+    /// (`hc_attn_inject.weight` は F32) は down/up (目録 Q8_0、実機 BF16) で
+    /// 外れていた実績があるので、実型と融合カーネルの要否を実機で判定するための
+    /// 出力。BF16 なら [`crate::model::moe_expert::expert_gemv_bf16`] (task 92 の
+    /// 融合カーネル) に今日の経路のまま乗る (`gemv_label` -> `gemv_impl_par` の
+    /// BF16 アーム)。`DENNO_BF16_FAST=0` で ms が動けば融合カーネルだった証拠。
     pub mod gemv {
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -4141,10 +4153,14 @@ pub mod mix_kprof {
         static UP_CALLS: AtomicU64 = AtomicU64::new(0);
         static UP_NS: AtomicU64 = AtomicU64::new(0);
         static UP_GPU: AtomicU64 = AtomicU64::new(0);
+        static INJ_CALLS: AtomicU64 = AtomicU64::new(0);
+        static INJ_NS: AtomicU64 = AtomicU64::new(0);
+        static INJ_GPU: AtomicU64 = AtomicU64::new(0);
         /// 最後に積んだ型の id ([`GgmlType::from_id`] で戻す。0 は「未設定」を兼ねる。
         /// ggml には id 0 = F32 があるので、未設定の表示は `from_id` 前の 0 チェック)。
         static DOWN_TY_ID: AtomicU64 = AtomicU64::new(0);
         static UP_TY_ID: AtomicU64 = AtomicU64::new(0);
+        static INJ_TY_ID: AtomicU64 = AtomicU64::new(0);
 
         /// 直前の GEMV が GPU で走りきったか (cuda 無しのビルドは常に false)。
         #[cfg(feature = "cuda")]
@@ -4200,6 +4216,21 @@ pub mod mix_kprof {
             UP_TY_ID.store(ty.id() as u64, Ordering::Relaxed);
         }
 
+        /// `hc_inject` の GEMV 1 発 (task 96。[`note_down`] と同じ規約)。
+        #[inline]
+        pub fn note_inj(t: Option<std::time::Instant>, ty: crate::kquant::GgmlType) {
+            if !super::on() {
+                return;
+            }
+            let Some(t) = t else { return };
+            INJ_CALLS.fetch_add(1, Ordering::Relaxed);
+            INJ_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if ran_on_gpu() {
+                INJ_GPU.fetch_add(1, Ordering::Relaxed);
+            }
+            INJ_TY_ID.store(ty.id() as u64, Ordering::Relaxed);
+        }
+
         fn slot(
             calls: &AtomicU64,
             ns: &AtomicU64,
@@ -4223,21 +4254,33 @@ pub mod mix_kprof {
             ));
         }
 
-        /// `[mix-kprof]` 行の末尾に付ける 2 区間ぶん (down と up)。
+        /// `[mix-kprof]` 行の末尾に付ける 3 区間ぶん (down / up / inj)。
         pub fn line_part() -> String {
             let mut s = String::new();
             slot(&DOWN_CALLS, &DOWN_NS, &DOWN_GPU, &DOWN_TY_ID, "down", &mut s);
             slot(&UP_CALLS, &UP_NS, &UP_GPU, &UP_TY_ID, "up", &mut s);
+            slot(&INJ_CALLS, &INJ_NS, &INJ_GPU, &INJ_TY_ID, "inj", &mut s);
             s
         }
 
         /// カウンタを 0 に戻す ([`super::reset`] から呼ぶ)。
         pub fn reset() {
-            for c in [&DOWN_CALLS, &DOWN_NS, &DOWN_GPU, &UP_CALLS, &UP_NS, &UP_GPU] {
+            for c in [
+                &DOWN_CALLS,
+                &DOWN_NS,
+                &DOWN_GPU,
+                &UP_CALLS,
+                &UP_NS,
+                &UP_GPU,
+                &INJ_CALLS,
+                &INJ_NS,
+                &INJ_GPU,
+            ] {
                 c.store(0, Ordering::Relaxed);
             }
             DOWN_TY_ID.store(0, Ordering::Relaxed);
             UP_TY_ID.store(0, Ordering::Relaxed);
+            INJ_TY_ID.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -11602,6 +11645,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_micros(50));
             mix_kprof::gemv::note_down(Some(t), GgmlType::IQ4Xs);
             mix_kprof::gemv::note_up(Some(t), GgmlType::IQ4Xs);
+            mix_kprof::gemv::note_inj(Some(t), GgmlType::Bf16);
             let line = mix_kprof::line().expect("強制 on なのに line() が None");
             assert!(
                 line.contains("gemv down calls=1 ms="),
@@ -11609,6 +11653,9 @@ mod tests {
             );
             assert!(line.contains("ty=IQ4_XS"), "dtype が無い: {line}");
             assert!(line.contains("gemv up calls=1 ms="), "up の形が違う: {line}");
+            // task 96: inj も同じ形式で載る (型は down/up と独立に表示)。
+            assert!(line.contains("gemv inj calls=1 ms="), "inj の形が違う: {line}");
+            assert!(line.contains("ty=BF16"), "inj の dtype が無い: {line}");
             // gpu は 0..=calls の範囲 (cuda ビルドでは直前の線形呼び出し次第)。
             let part = line
                 .split("gemv down calls=1 ")
@@ -11763,6 +11810,69 @@ mod tests {
             assert!(
                 m_fast.iter().any(|v| *v != 0.0),
                 "mixed が全 0 (経路の生死が分からない)"
+            );
+        }
+
+        /// task 96: hc mix の inject (`hc_inject`, k=hc_dim / n=hc の小行列) が
+        /// BF16 のとき、task 92 の AVX2 融合カーネルに**今日の経路のまま**乗ることの
+        /// 契約 (mix-kprof の `gemv inj ty=` で実型が BF16 だったときに当てはまる)。
+        ///
+        /// down/up を Q8_0 (`BF16_FUSED_CALLS` に載らない型) にして inject だけ
+        /// BF16 にすると、`hc_mix_quant` 1 回で融合カウンタがちょうど 1 増える
+        /// (inject の GEMV 1 発だけが融合経路を通る。n=hc は行並列の門番未満なので
+        /// 1 チャンク = 単独発火)。`set_bf16_fast_for_test(Some(false))` の classic
+        /// (dequant + 逐次内積) と to_bits で一致する (BF16 -> f32 変換は正確で、
+        /// 積和の順序も同じ。[`hc_mix_bf16_down_up_take_row_parallel_bitexact`] と
+        /// 同じ根拠)。inject が F32 など BF16 以外の実型なら融合カーネルは
+        /// 適用できない (REPORT の判定を参照)。
+        #[test]
+        fn hc_mix_bf16_inject_takes_fused_kernel_bitexact() {
+            use crate::model::moe_expert::{set_bf16_fast_for_test, BF16_FUSED_CALLS};
+            let hc = 4usize;
+            let e = 2560usize;
+            let lr = 320usize;
+            let hp = HyperParams { hc, n_embd: e, low_rank: lr, eps: 1e-6 };
+            let hc_dim = hc * e;
+            let norm: Vec<f32> = (0..hc_dim).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect();
+            let down = GgufLinear::from_slice(GgmlType::Q8_0, hc_dim, lr, &q8_0_weights(hc_dim, lr, 3))
+                .expect("GgufLinear::from_slice (Q8_0 down)")
+                .with_fast_q8(true);
+            let up = GgufLinear::from_slice(GgmlType::Q8_0, lr, hc_dim, &q8_0_weights(lr, hc_dim, 5))
+                .expect("GgufLinear::from_slice (Q8_0 up)")
+                .with_fast_q8(true);
+            let inject =
+                GgufLinear::from_slice(GgmlType::Bf16, hc_dim, hc, &bf16_weights(hc_dim, hc, 7))
+                    .expect("GgufLinear::from_slice (BF16 inject)");
+            let res = HyperStreams {
+                data: (0..hc_dim)
+                    .map(|i| (((i * 11) % 17) as f32 - 8.0) * 0.05)
+                    .collect(),
+                hc,
+                n_embd: e,
+            };
+            let fused = || BF16_FUSED_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+
+            // 融合 on (既定): inject の GEMV 1 発だけ融合カウンタが増える。
+            set_bf16_fast_for_test(Some(true));
+            let before = fused();
+            let (m_fast, i_fast) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            assert_eq!(
+                fused() - before,
+                1,
+                "BF16 inject が融合カーネルを通っていない (down/up 分以外の増分が 1 でない)"
+            );
+
+            // 融合 off (classic): inject は dequant + 逐次内積に落ちる。値はビット一致。
+            set_bf16_fast_for_test(Some(false));
+            let (m_ref, i_ref) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("classic");
+            set_bf16_fast_for_test(None);
+            assert_bitwise_eq(&i_fast, &i_ref, "BF16 inject (融合 vs classic)");
+            assert_bitwise_eq(&m_fast, &m_ref, "BF16 inject case (mixed)");
+            assert!(
+                i_fast.iter().any(|v| *v != 0.0),
+                "inject が全 0 (経路の生死が分からない)"
             );
         }
 
