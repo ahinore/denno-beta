@@ -698,8 +698,8 @@ unsafe fn gemv_q2_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
             let dv = _mm256_set1_ps(d);
             let qs = p.add(2);
             let x0 = xp.add(b * 64);
-            for g in 0..4 {
-                // 8 要素 = 2 バイト (要素 8g..8g+7) を 8 レーンへ。
+            for g in 0..8 {
+                // 8 要素 = 2 バイト (要素 8g..8g+7) を 8 レーンへ。16 バイトで 8 組。
                 let b0 = *qs.add(g * 2) as i32;
                 let b1 = *qs.add(g * 2 + 1) as i32;
                 let bcast = _mm256_setr_epi32(b0, b0, b0, b0, b1, b1, b1, b1);
