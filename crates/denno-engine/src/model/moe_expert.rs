@@ -536,6 +536,7 @@ pub(crate) const PAR_MIN_CHUNK_ROWS_TIGHT: usize = 16;
 /// `min_rows` は「これ未満ならスレッドを立てない」門番、`min_chunk` は 1 スレッドに
 /// 残す最小行数。どちらも値には影響しない (分割の粒度だけ)。
 #[cfg(feature = "par")]
+#[allow(clippy::too_many_arguments)]
 fn for_each_row_chunk<F>(
     blocks: &[u8],
     n_out: usize,
@@ -544,6 +545,7 @@ fn for_each_row_chunk<F>(
     par: bool,
     min_rows: usize,
     min_chunk: usize,
+    chunk_override: usize,
     f: F,
 ) where
     F: Fn(&[u8], &mut [f32]) + Sync + Send,
@@ -556,7 +558,7 @@ fn for_each_row_chunk<F>(
             let t0 = std::time::Instant::now();
             f(blocks, out);
             let ns = t0.elapsed().as_nanos() as u64;
-            crate::model::qwen4exp::mix_kprof::rowpar::record(lbl, false, 1, ns, ns);
+            crate::model::qwen4exp::mix_kprof::rowpar::record(lbl, false, 1, ns, ns, 0);
         } else {
             f(blocks, out);
         }
@@ -565,8 +567,15 @@ fn for_each_row_chunk<F>(
     #[cfg(test)]
     ROW_PAR_REGIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let threads = rayon::current_num_threads().max(1);
-    let want = n_out.div_ceil(threads).max(min_chunk);
-    let rows = want.min(n_out);
+    // task 93: `chunk_override > 0` は BF16 融合経路だけが渡す (`DENNO_BF16_CHUNK`)。
+    // 目標チャンク数 N に対して 1 チャンクの行数 = `n_out.div_ceil(N)`。`min_chunk`
+    // の下支えは無視する (粒度そのものを掃引する明示指定)。行の割り方で値は
+    // 変わらない (行は互いに独立で、1 行の累積順序は分割に依らない)。
+    let rows = if chunk_override > 0 {
+        n_out.div_ceil(chunk_override)
+    } else {
+        n_out.div_ceil(threads).max(min_chunk).min(n_out)
+    };
     let bytes = rows * rb;
     if lbl != 0 {
         let comp = std::sync::atomic::AtomicU64::new(0);
@@ -590,6 +599,7 @@ fn for_each_row_chunk<F>(
             n_out.div_ceil(rows),
             wall,
             comp.load(std::sync::atomic::Ordering::Relaxed),
+            threads,
         );
     } else {
         blocks
@@ -609,6 +619,7 @@ fn for_each_row_chunk<F>(
     _par: bool,
     _min_rows: usize,
     _min_chunk: usize,
+    _chunk_override: usize,
     f: F,
 ) where
     F: Fn(&[u8], &mut [f32]),
@@ -619,7 +630,7 @@ fn for_each_row_chunk<F>(
         let t0 = std::time::Instant::now();
         f(blocks, out);
         let ns = t0.elapsed().as_nanos() as u64;
-        crate::model::qwen4exp::mix_kprof::rowpar::record(lbl, false, 1, ns, ns);
+        crate::model::qwen4exp::mix_kprof::rowpar::record(lbl, false, 1, ns, ns, 0);
     } else {
         f(blocks, out);
     }
@@ -711,6 +722,7 @@ fn expert_gemv_inner(
                 par,
                 min_rows,
                 min_chunk,
+                0,
                 |b, o| unsafe { f(b, n_in, o.len(), x, o) },
             );
             return Ok(());
@@ -734,6 +746,7 @@ fn expert_gemv_inner(
                 par,
                 min_rows,
                 min_chunk,
+                0,
                 |b, o| unsafe { gemv_iq4xs_avx2(b, n_in, o.len(), x, o) },
             );
             #[cfg(test)]
@@ -765,6 +778,7 @@ fn expert_gemv_inner(
                 par,
                 min_rows,
                 min_chunk,
+                0,
                 |b, o| unsafe { gemv_q4k_avx2(b, n_in, o.len(), x, o) },
             );
             #[cfg(test)]
@@ -777,7 +791,7 @@ fn expert_gemv_inner(
     // 行は独立で、`gemv_scalar_body` は担当チャンクの先頭行から連続で計算する
     // ので、分割しても各要素の値は変わらない (1 行の内積は [`dot_seq`] の
     // k 昇順のまま)。旧実装は 1 スレッドで全行を回していた。
-    for_each_row_chunk(blocks, n_out, rb, out, par, min_rows, min_chunk, |b, o| {
+    for_each_row_chunk(blocks, n_out, rb, out, par, min_rows, min_chunk, 0, |b, o| {
         gemv_scalar_body(ty, rb, b, n_in, o.len(), x, o);
     });
     Ok(())
@@ -2222,6 +2236,7 @@ fn expert_gemv_q5_1_inner(
                 par,
                 PAR_MIN_ROWS,
                 PAR_MIN_CHUNK_ROWS,
+                0,
                 |b, o| unsafe { gemv_q5_1_avx2(b, n_in, o.len(), x, o, simd) },
             );
             return Ok(());
@@ -2374,7 +2389,7 @@ fn expert_gemv_q8_inner(
             } else {
                 gemv_q8_0_avx2
             };
-            for_each_row_chunk(blocks, n_out, rb, out, par, min_rows, min_chunk, |b, o| unsafe {
+            for_each_row_chunk(blocks, n_out, rb, out, par, min_rows, min_chunk, 0, |b, o| unsafe {
                 kern(b, n_in, o.len(), x, o)
             });
             return Ok(());
@@ -2664,7 +2679,7 @@ fn expert_gemv_iq4xs_inner(
             };
             #[cfg(test)]
             IQ4XS_FUSED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for_each_row_chunk(blocks, n_out, rb, out, par, min_rows, min_chunk, |b, o| unsafe {
+            for_each_row_chunk(blocks, n_out, rb, out, par, min_rows, min_chunk, 0, |b, o| unsafe {
                 kern(b, n_in, o.len(), x, o)
             });
             return Ok(());
@@ -2813,6 +2828,49 @@ pub fn bf16_fast_enabled() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| bf16_fast_from_value(std::env::var("DENNO_BF16_FAST").ok().as_deref()))
+}
+
+/// task 93: `DENNO_BF16_CHUNK` の値の解釈 (0 または未設定 = 自動)。
+fn bf16_chunk_from_value(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
+}
+
+/// テスト用の上書き (0 = env を見る / >0 = 強制値)。
+#[cfg(test)]
+static BF16_CHUNK_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// テスト専用: BF16 融合経路の目標チャンク数を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_bf16_chunk_for_test(v: Option<usize>) {
+    BF16_CHUNK_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(n) => n,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_BF16_CHUNK` をプロセスで 1 回だけ読む (0 = 自動)。
+///
+/// task 93: BF16 融合 GEMV (`hc mix` の down/up) の行チャンクの**目標チャンク数**。
+/// 未設定 / `0` は従来どおり 1 チャンクの行数を `n_out.div_ceil(rayon スレッド数)`
+/// で決める (実機の `[mix-kprof]` `chunks=16.0` はプール 16 スレッドの結果)。
+/// 実機は物理コア数よりスレッドが多い (SMT を取り合う) 疑いがあるので、チャンク数
+/// を env で指定して実機で掃引できるようにする。`N > 0` は 1 チャンクの行数を
+/// `n_out.div_ceil(N)` で決め、`min_chunk` の下支えを無視する (粒度そのものを
+/// 掃引する明示指定)。値には影響しない: 行は互いに独立で、1 行の累積順序は
+/// 行の割り方に依らない (テスト `bf16_chunk_override_bit_matches_auto`)。
+/// BF16 融合経路だけがこの値を渡す (他の型の行チャンクは従来どおり自動)。
+pub fn bf16_chunk_override() -> usize {
+    #[cfg(test)]
+    match BF16_CHUNK_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        v => return v,
+    }
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| bf16_chunk_from_value(std::env::var("DENNO_BF16_CHUNK").ok().as_deref()))
 }
 
 /// テスト用: BF16 融合カーネルが実際に発火した回数。
@@ -2978,9 +3036,17 @@ fn expert_gemv_bf16_inner(
             // SAFETY: check_gemv_args が blocks/x/out の長さを検証済みで、
             // q4k_fused_supported() が AVX2 (+FMA) の存在を実行時に確認している。
             // 行は独立なので、チャンク分割しても各行の累積順序は変わらない。
-            for_each_row_chunk(blocks, n_out, rb, out, par, min_rows, min_chunk, |b, o| unsafe {
-                gemv_bf16_avx2(b, n_in, o.len(), x, o)
-            });
+            for_each_row_chunk(
+                blocks,
+                n_out,
+                rb,
+                out,
+                par,
+                min_rows,
+                min_chunk,
+                bf16_chunk_override(),
+                |b, o| unsafe { gemv_bf16_avx2(b, n_in, o.len(), x, o) },
+            );
             return Ok(());
         }
     }
@@ -5410,6 +5476,7 @@ fn expert_gemv_any_vnni_inner(
                 par,
                 PAR_MIN_ROWS,
                 PAR_MIN_CHUNK_ROWS,
+                0,
                 |b, o| unsafe {
                     match ty {
                         GgmlType::Q4K => gemv_q4k_vnni(b, n_in, o.len(), a, o),
