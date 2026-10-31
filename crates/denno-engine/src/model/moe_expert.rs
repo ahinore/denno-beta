@@ -9837,13 +9837,26 @@ mod tests {
                 )
                 .unwrap();
                 for r in 0..n_out {
-                    assert_eq!(
-                        one[r].to_bits(),
-                        batch[t * n_out + r].to_bits(),
-                        "{ty:?} token {t} 行 {r}: gemv {} vs gemm {}",
-                        one[r],
-                        batch[t * n_out + r]
-                    );
+                    if ty == GgmlType::Q2_0 {
+                        // Q2_0 の融合 m=1 GEMV は累積順が classic / バッチと違う
+                        // (P89 と同じ立場)。dequant はビット一致、内積は相対 1e-6。
+                        let a = one[r];
+                        let b = batch[t * n_out + r];
+                        let diff = (a - b).abs();
+                        let scale = a.abs().max(b.abs()).max(1e-30);
+                        assert!(
+                            diff / scale < 1e-5,
+                            "{ty:?} token {t} 行 {r}: gemv {} vs gemm {} (rel {})",
+                            a, b, diff / scale
+                        );
+                    } else {
+                        assert_eq!(
+                            one[r].to_bits(),
+                            batch[t * n_out + r].to_bits(),
+                            "{ty:?} token {t} 行 {r}: gemv {} vs gemm {}",
+                            one[r], batch[t * n_out + r]
+                        );
+                    }
                 }
             }
         }
