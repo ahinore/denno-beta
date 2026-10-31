@@ -4172,7 +4172,7 @@ pub mod mix_kprof {
 /// をそのまま渡す)。
 ///
 /// 実測 (`[q4prof] ... attn qkv=616.4 gate=118.3 gdn=288.7 out=362.9 full=0.0`,
-/// 8096, 1116 in / 48 out) の qkv / gate / out は
+/// 検証機, 1116 in / 48 out) の qkv / gate / out は
 /// [`crate::model::qwen4exp_ssm::SsmLayer::forward_token`] の 3 区間の合計
 /// (ssm 層 36 × decode トークン数) で、1 呼び出し = qkv+z 連結 GEMV 1 発 /
 /// beta+alpha 連結 GEMV 1 発 / ssm_out GEMV 1 発。区間内は GEMV 1 発のみなので、
