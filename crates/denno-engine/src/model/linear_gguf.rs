@@ -304,6 +304,17 @@ pub struct GgufLinear {
     router_gpu: bool,
 }
 
+/// 融合カーネルを持たない型を Q8_0 へ作り直す共通の入口。
+///
+/// `DENNO_REQUANT_Q8=0` で無効化 (`DENNO_REQUANT_Q8` 未設定は有効)。
+pub fn maybe_requant(l: GgufLinear) -> Result<GgufLinear> {
+    let off = std::env::var("DENNO_REQUANT_Q8").ok().as_deref() == Some("0");
+    if off || l.has_fused_kernel() {
+        return Ok(l);
+    }
+    l.requant_to_q8_0()
+}
+
 impl GgufLinear {
     /// 生バイトから作る。`blocks.len()` は `n * row_bytes(ty, k)` と一致すること。
     pub fn new(ty: GgmlType, k: usize, n: usize, blocks: WeightBlocks) -> Result<Self> {
@@ -353,17 +364,6 @@ impl GgufLinear {
     pub fn fast_q8(&self) -> bool {
         self.fast_q8
     }
-
-/// 融合カーネルを持たない型を Q8_0 へ作り直す共通の入口。
-///
-/// `DENNO_REQUANT_Q8=0` で無効化 (`DENNO_REQUANT_Q8` 未設定は有効)。
-pub fn maybe_requant(l: GgufLinear) -> Result<GgufLinear> {
-    let off = std::env::var("DENNO_REQUANT_Q8").ok().as_deref() == Some("0");
-    if off || l.has_fused_kernel() {
-        return Ok(l);
-    }
-    l.requant_to_q8_0()
-}
 
     /// 密行列を Q8_0 へ**作り直す** (融合カーネル・GPU 常駐の対象型へ載せ替える)。
     ///
