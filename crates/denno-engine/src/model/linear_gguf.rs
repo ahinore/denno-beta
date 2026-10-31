@@ -585,6 +585,12 @@ impl GgufLinear {
         if out.len() != self.n {
             bail!("GgufLinear::gemv: out の長さ {} が n={} と違う", out.len(), self.n);
         }
+        // task 87: 実行先フラグの初期値 (s57 の `maybe_gpu_*` 入口と同じ規約)。
+        // GPU 経路を**試みない**呼び出し (P86 の two_row バイパス / F32・F16・BF16
+        // の CPU 参照) でも毎回 false から始めないと、直前の呼び出しの true が残り、
+        // attn_kprof (`note_gate`) が「GPU を通った」ように誤って数える。計測のみ。
+        #[cfg(feature = "cuda")]
+        crate::cuda::set_last_linear_ran_on_gpu(false);
         match self.ty {
             // 量子型は expert GEMV と本体を共有する (1 行ずつデコードして逐次内積)。
             // 2026-10-31: 融合カーネルの有無ではなく「デコードできるか」で通す。
@@ -1940,5 +1946,39 @@ mod tests {
         }
         assert_eq!(bits(&out2), bits(&want), "intercept 下の 2 行結果が CPU 参照と違う");
         assert_eq!(delta(), before2 + 1, "two_row の呼び出しが CPU に届いていない");
+    }
+
+    /// task 87: `gemv_impl_par` は intercept を**試みない**呼び出し (two_row
+    /// バイパス / F32 の CPU 参照) でも実行先フラグを毎回 false に戻す。
+    /// 戻さないと直前の呼び出しの true が残り、attn_kprof の `note_gate`
+    /// (gate の直前は qkv の GPU GEMV) が gate を「GPU を通った」ように誤って
+    /// 数える。cuda ビルドのみ (フラグ自体が cfg(feature = "cuda"))。GPU 実体不要。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gemv_impl_par_resets_gpu_flag_without_intercept() {
+        // two_row 入口 (hc mix decode / P86 バイパス): intercept を試みない。
+        let lin =
+            GgufLinear::from_slice(GgmlType::Q8_0, K, N, &make_matrix(GgmlType::Q8_0, K, N, 3))
+                .expect("from_slice")
+                .with_fast_q8(true);
+        let x = make_x(K, 1);
+        let mut out = vec![0f32; N];
+        crate::cuda::set_last_linear_ran_on_gpu(true);
+        lin.gemv_label_par_2row("hc_2row", &x, &mut out, 64)
+            .expect("gemv_label_par_2row");
+        assert!(
+            !crate::cuda::last_linear_ran_on_gpu(),
+            "two_row (CPU) の呼び出し後にフラグが true のまま"
+        );
+
+        // F32 (ssm の beta / alpha): GPU 経路が存在しない (router_gpu は未設定)。
+        let (lin, x) = f32_lin(K, 64, 43);
+        let mut out = vec![0f32; 64];
+        crate::cuda::set_last_linear_ran_on_gpu(true);
+        lin.gemv(&x, &mut out).expect("f32 gemv");
+        assert!(
+            !crate::cuda::last_linear_ran_on_gpu(),
+            "F32 (CPU) の呼び出し後にフラグが true のまま"
+        );
     }
 }
