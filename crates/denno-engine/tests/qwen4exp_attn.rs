@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::qwen4exp::Qwen4ExpParams;
 use denno_engine::model::qwen4exp_attn::{
-    rope_mrope_partial, rope_neox_partial, sigmoid, AttnCache, FullAttn,
+    attend_gqa_calls, attend_gqa_par_calls, rope_mrope_partial, rope_neox_partial,
+    set_attn_gqa_chunk, sigmoid, AttnCache, FullAttn,
 };
 
 // ---- 小モデルの諸元 (構造は本物と同じ、寸法だけ小さい) --------------------
@@ -175,6 +176,14 @@ fn f32_data(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// `params` の head_dim 差し替え版 (ベンチが実形状 dh 256 を組むため)。
+fn params_dh(n_head: usize, n_head_kv: usize, dh: usize) -> Qwen4ExpParams {
+    let mut p = params(n_head, n_head_kv);
+    p.n_embd_head_k = dh;
+    p.n_embd_head_v = dh;
+    p
+}
+
 fn params(n_head: usize, n_head_kv: usize) -> Qwen4ExpParams {
     Qwen4ExpParams {
         n_layer: N_LAYER,
@@ -226,9 +235,19 @@ fn params(n_head: usize, n_head_kv: usize) -> Qwen4ExpParams {
 /// - `attn_k` / `attn_v`: 行 r は入力列 r を読む。
 /// - `attn_output`: 恒等 (行 r が列 r) — ゲートの検査で `attn` と直接比べられる。
 fn layer_tensors(n_head: usize, n_head_kv: usize, break_k: bool) -> Vec<TensorSpec> {
+    layer_tensors_dh(n_head, n_head_kv, break_k, HEAD_DIM)
+}
+
+/// `layer_tensors` の head_dim 差し替え版 (ベンチが実形状 dh 256 を組むため)。
+fn layer_tensors_dh(
+    n_head: usize,
+    n_head_kv: usize,
+    break_k: bool,
+    dh: usize,
+) -> Vec<TensorSpec> {
     let n = |s: &str| format!("blk.{ATTN_LAYER}.{s}");
-    let q_rows = 2 * n_head * HEAD_DIM;
-    let kv_rows = n_head_kv * HEAD_DIM;
+    let q_rows = 2 * n_head * dh;
+    let kv_rows = n_head_kv * dh;
     let q_ones: Vec<(usize, usize)> = (0..q_rows).map(|r| (r, r % N_EMBD)).collect();
     let kv_ones: Vec<(usize, usize)> = (0..kv_rows).map(|r| (r, r % N_EMBD)).collect();
     let out_ones: Vec<(usize, usize)> = (0..N_EMBD).map(|r| (r, r)).collect();
@@ -256,32 +275,32 @@ fn layer_tensors(n_head: usize, n_head_kv: usize, break_k: bool) -> Vec<TensorSp
         },
         TensorSpec {
             name: n("attn_q_norm.weight"),
-            dims: vec![HEAD_DIM as u64],
+            dims: vec![dh as u64],
             ty: TY_F32,
-            data: f32_data(&vec![1.0f32; HEAD_DIM]),
+            data: f32_data(&vec![1.0f32; dh]),
         },
         TensorSpec {
             name: n("attn_k_norm.weight"),
-            dims: vec![HEAD_DIM as u64],
+            dims: vec![dh as u64],
             ty: TY_F32,
-            data: f32_data(&vec![1.0f32; HEAD_DIM]),
+            data: f32_data(&vec![1.0f32; dh]),
         },
         TensorSpec {
             name: n("attn_output.weight"),
-            dims: vec![(n_head * HEAD_DIM) as u64, N_EMBD as u64],
+            dims: vec![(n_head * dh) as u64, N_EMBD as u64],
             ty: TY_Q8_0,
-            data: q8_0_matrix(n_head * HEAD_DIM, N_EMBD, &out_ones),
+            data: q8_0_matrix(n_head * dh, N_EMBD, &out_ones),
         },
     ]
 }
 
-fn kvs() -> Vec<(&'static str, Kv)> {
+fn kvs(n_head: usize, n_head_kv: usize) -> Vec<(&'static str, Kv)> {
     vec![
         ("general.architecture", Kv::Str("qwen4exp")),
         ("qwen4exp.block_count", Kv::U32(N_LAYER as u32)),
         ("qwen4exp.embedding_length", Kv::U32(N_EMBD as u32)),
-        ("qwen4exp.attention.head_count", Kv::U32(2)),
-        ("qwen4exp.attention.head_count_kv", Kv::U32(1)),
+        ("qwen4exp.attention.head_count", Kv::U32(n_head as u32)),
+        ("qwen4exp.attention.head_count_kv", Kv::U32(n_head_kv as u32)),
     ]
 }
 
@@ -294,7 +313,7 @@ fn open_fixture(
     break_k: bool,
 ) -> GgufFile {
     let path = dir.path(&format!("{tag}.gguf"));
-    write_gguf(&path, &kvs(), &layer_tensors(n_head, n_head_kv, break_k));
+    write_gguf(&path, &kvs(n_head, n_head_kv), &layer_tensors(n_head, n_head_kv, break_k));
     GgufFile::open(&path).expect("合成 GGUF を開けない")
 }
 
@@ -321,6 +340,74 @@ fn full_attn(dir: &TempDir, tag: &str, max_ctx: usize) -> (GgufFile, Qwen4ExpPar
     let p = params(2, 1);
     let fa = FullAttn::from_gguf(&f, &p, max_ctx).expect("from_gguf");
     (f, p, fa)
+}
+
+// ---- 0. GQA まとめ経路 (decode) のビット一致 ------------------------------
+
+/// 実形状と同じ GQA 比 (24 head / 2 kv head = 同じ kv 行を 12 head が共有) で、
+/// decode の GQA まとめ経路 (KV 共有 + 並列) が head 個別経路と **ビット一致**
+/// することを見る。あわせて、まとめ経路と rayon の並列枝が実際に通ったことを
+/// プロセス通算カウンタで確かめる (緑 = 発動の証拠ではない)。
+///
+/// 並列は 4 スレッドのプールで回す (既定プールのスレッド数に依存させない)。
+#[test]
+fn attend_group_matches_per_head_bits() {
+    const NH: usize = 24;
+    const NKV: usize = 2;
+    const LEN: usize = 37;
+    let dir = TempDir::new("gqa_bits");
+    let f = open_fixture(&dir, "gqa_bits", NH, NKV, false);
+    let p = params(NH, NKV);
+    let mut fa = FullAttn::from_gguf(&f, &p, 64).expect("from_gguf");
+
+    // 決定的な擬似乱数で K/V を LEN 本積む (head ごとに値が違う)。
+    let mut s = 0x1234_5678_9abc_def0u64 | 1;
+    let mut next = move || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    };
+    let row = NKV * HEAD_DIM;
+    for _ in 0..LEN {
+        let k: Vec<f32> = (0..row).map(|_| next()).collect();
+        let v: Vec<f32> = (0..row).map(|_| next()).collect();
+        fa.cache_mut().push(ATTN_LAYER, &k, &v).expect("push");
+    }
+    let mut q = vec![0f32; NH * HEAD_DIM];
+    for x in q.iter_mut() {
+        *x = next();
+    }
+
+    let l = fa.layer(ATTN_LAYER).expect("層 3 が full attention でない");
+    let before = attend_gqa_calls();
+    let before_par = attend_gqa_par_calls();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .expect("4 スレッドのプール");
+    let (fast, slow) = pool.install(|| {
+        let fast = l
+            .attend_gqa_mode(&q, fa.cache(), ATTN_LAYER, true)
+            .expect("まとめ経路");
+        let slow = l
+            .attend_gqa_mode(&q, fa.cache(), ATTN_LAYER, false)
+            .expect("head 個別経路");
+        (fast, slow)
+    });
+    assert!(
+        attend_gqa_calls() - before >= 1,
+        "まとめ経路が呼ばれていない"
+    );
+    assert!(
+        attend_gqa_par_calls() - before_par >= 1,
+        "まとめ経路の並列枝が通っていない (ntasks > 1 になっていない)"
+    );
+    assert_bits_eq(&fast, &slow, "GQA まとめ経路 vs head 個別経路");
+    assert!(
+        fast.iter().any(|x| *x != 0.0),
+        "attention の出力が全部 0 (経路が死んでいる)"
+    );
 }
 
 // ---- 1. attn_q の切り分け ------------------------------------------------
@@ -830,7 +917,7 @@ fn pos_follows_per_layer_cache_len() {
         })
         .collect();
     tensors.append(&mut l1);
-    write_gguf(&path, &kvs(), &tensors);
+    write_gguf(&path, &kvs(2, 1), &tensors);
     let f = GgufFile::open(&path).expect("合成 GGUF を開けない");
     let mut p = params(2, 1);
     p.full_attn_interval = 2;
@@ -859,4 +946,92 @@ fn pos_follows_per_layer_cache_len() {
     assert_eq!(fa.cache().len(1).unwrap(), 2);
     assert_eq!(fa.cache().len(ATTN_LAYER).unwrap(), 3);
     assert_eq!(fa.pos(), 3, "位置は最大のキャッシュ長");
+}
+
+// ---- decode attention の A/B (CPU 実測・既定では走らない) ------------------
+
+/// decode attention 1 層ぶんを旧経路 (head 個別・逐次) と新経路 (GQA まとめ +
+/// rayon) で交互に測る。実形状 (24 head / 2 kv / dh 256)・KV 長ごとの比を見る。
+///
+/// `cargo test --release -p denno-engine --test qwen4exp_attn -- bench_attend_gqa_decode --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_attend_gqa_decode() {
+    const NH: usize = 24;
+    const NKV: usize = 2;
+    const DH: usize = 256;
+    const MAXLEN: usize = 512;
+    let dir = TempDir::new("gqa_bench");
+    let path = dir.path("gqa_bench.gguf");
+    write_gguf(
+        &path,
+        &kvs(NH, NKV),
+        &layer_tensors_dh(NH, NKV, false, DH),
+    );
+    let f = GgufFile::open(&path).expect("合成 GGUF を開けない");
+    let p = params_dh(NH, NKV, DH);
+    let fa = FullAttn::from_gguf(&f, &p, MAXLEN).expect("from_gguf");
+    let l = fa.layer(ATTN_LAYER).expect("層 3 が full attention でない");
+
+    let mut s = 0x9e37_79b9_7f4a_7c15u64 | 1;
+    let mut next = move || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    };
+    let row = NKV * DH;
+    let mut q = vec![0f32; NH * DH];
+    for x in q.iter_mut() {
+        *x = next();
+    }
+    let mut kv = vec![0f32; MAXLEN * row];
+    for x in kv.iter_mut() {
+        *x = next();
+    }
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .build()
+        .expect("8 スレッドのプール");
+    let reps = 30usize;
+    println!("[gqa] decode attend 1 layer (24 head / 2 kv / dh 256, 8 threads)");
+    for nvis in [1usize, 8, 32, 64, 118, 256, 512] {
+        let mut c = AttnCache::new(N_LAYER, NKV, DH, MAXLEN).expect("cache");
+        for j in 0..nvis {
+            c.push(ATTN_LAYER, &kv[j * row..(j + 1) * row], &kv[j * row..(j + 1) * row])
+                .expect("push");
+        }
+        let mut old = f64::INFINITY;
+        let mut new = f64::INFINITY;
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            let a = pool.install(|| l.attend_gqa_mode(&q, &c, ATTN_LAYER, false).expect("old"));
+            old = old.min(t.elapsed().as_secs_f64() * 1e3);
+            let t = std::time::Instant::now();
+            let b = pool.install(|| l.attend_gqa_mode(&q, &c, ATTN_LAYER, true).expect("new"));
+            new = new.min(t.elapsed().as_secs_f64() * 1e3);
+            assert_bits_eq(&a, &b, "bench の旧 vs 新");
+        }
+        // 1 タスクの head 数を振る (12 = kv head 単位の 2 タスク / 2 = 12 タスク)。
+        let a_hold = pool.install(|| l.attend_gqa_mode(&q, &c, ATTN_LAYER, false).expect("old ref"));
+        let mut sweep = Vec::new();
+        for chunk in [12usize, 6, 4, 3, 2] {
+            set_attn_gqa_chunk(chunk);
+            let mut best = f64::INFINITY;
+            for _ in 0..reps {
+                let t = std::time::Instant::now();
+                let b = pool.install(|| l.attend_gqa_mode(&q, &c, ATTN_LAYER, true).expect("new"));
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                assert_bits_eq(&b, &a_hold, "sweep の旧 vs 新");
+            }
+            sweep.push(format!("{chunk}head {best:.3} ms"));
+        }
+        set_attn_gqa_chunk(0);
+        println!(
+            "[gqa] nvis {nvis:4}: old {old:8.3} ms / new(auto) {new:8.3} ms = {:.2}x | {}",
+            old / new,
+            sweep.join(" / ")
+        );
+    }
 }

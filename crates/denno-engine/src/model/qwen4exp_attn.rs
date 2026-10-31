@@ -402,6 +402,39 @@ pub fn set_attend_par_min(nt: usize) -> usize {
     ATTN_PAR_MIN.swap(nt, AtomicOrdering::Relaxed)
 }
 
+/// decode の GQA まとめ経路 (`DENNO_ATTN_GQA_FAST=0` で従来の head 個別版)。
+///
+/// 既定 ON。head ごとの加算順 (内積は d 昇順、出力は j 昇順) を変えないので
+/// ビット一致が保てる。env は最初の 1 回だけ読む (プロセス内で固定)。
+static ATTN_GQA_FAST: OnceLock<AtomicBool> = OnceLock::new();
+
+fn attn_gqa_fast() -> bool {
+    ATTN_GQA_FAST
+        .get_or_init(|| {
+            AtomicBool::new(std::env::var("DENNO_ATTN_GQA_FAST").ok().as_deref() != Some("0"))
+        })
+        .load(AtomicOrdering::Relaxed)
+}
+
+/// decode の GQA まとめ経路が走った回数 (プロセス通算)。
+///
+/// 緑 = 経路が発動した証拠ではないので、テストが「まとめ経路が実際に
+/// 呼ばれた」ことをこれで見る (層 × トークンで 1 回)。
+static ATTN_GQA_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// [`ATTN_GQA_CALLS`] の読み出し。
+pub fn attend_gqa_calls() -> usize {
+    ATTN_GQA_CALLS.load(AtomicOrdering::Relaxed)
+}
+
+/// まとめ経路のうち rayon の並列枝を走らせた回数 (プロセス通算)。
+static ATTN_GQA_PAR_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// [`ATTN_GQA_PAR_CALLS`] の読み出し。
+pub fn attend_gqa_par_calls() -> usize {
+    ATTN_GQA_PAR_CALLS.load(AtomicOrdering::Relaxed)
+}
+
 /// full attention 層 1 つぶんの重み。
 pub struct AttnLayer {
     pub n_embd: usize,
@@ -577,6 +610,22 @@ impl AttnLayer {
         self.attend_impl(q, cache, layer, None, len)
     }
 
+    /// [`AttnLayer::attend`] を GQA まとめ経路の on/off 明示で回す (テスト・A/B 用)。
+    ///
+    /// `gqa_fast = false` は `DENNO_ATTN_GQA_FAST=0` と同じ従来の head 個別経路。
+    /// どちらも同じ値になる (テスト `attend_group_matches_per_head_bits`)。
+    #[doc(hidden)]
+    pub fn attend_gqa_mode(
+        &self,
+        q: &[f32],
+        cache: &AttnCache,
+        layer: usize,
+        gqa_fast: bool,
+    ) -> Result<Vec<f32>> {
+        let len = cache.len(layer)?;
+        self.attend_impl_mode(q, cache, layer, None, len, gqa_fast)
+    }
+
     /// 見る cell を `cells` に限定した attention (QSA の選択結果を食わせる口)。
     ///
     /// `cells` は **昇順・重複なし・すべて `cache.len(layer)` 未満** でなければ
@@ -622,6 +671,22 @@ impl AttnLayer {
         cells: Option<&[usize]>,
         len: usize,
     ) -> Result<Vec<f32>> {
+        self.attend_impl_mode(q, cache, layer, cells, len, attn_gqa_fast())
+    }
+
+    /// [`AttnLayer::attend_impl`] の本体。`gqa_fast` は decode のまとめ経路の
+    /// on/off で、本番は env `DENNO_ATTN_GQA_FAST`、テストは明示指定で両経路を
+    /// 比べる (テストが env のプロセス内キャッシュに触らないようにするため)。
+    #[allow(clippy::too_many_arguments)]
+    fn attend_impl_mode(
+        &self,
+        q: &[f32],
+        cache: &AttnCache,
+        layer: usize,
+        cells: Option<&[usize]>,
+        len: usize,
+        gqa_fast: bool,
+    ) -> Result<Vec<f32>> {
         if q.len() != self.q_dim() {
             bail!("attend: q の長さ {} が n_head * head_dim = {} と違う", q.len(), self.q_dim());
         }
@@ -640,6 +705,13 @@ impl AttnLayer {
             Some(c) => c[i],
             None => i,
         };
+        // decode (cells = None) は GQA まとめ経路: kv head ごとに q head を
+        // まとめ、KV の行を 1 回だけ読む。`cells` 付き (QSA) は位置の対応が
+        // 飛び番になるので従来の head 個別版のまま (どちらもビット一致)。
+        if cells.is_none() && gqa_fast {
+            ATTN_GQA_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            return Ok(self.attend_dense_grouped(q, kb, vb, row, len));
+        }
         let mut out = vec![0f32; self.q_dim()];
         let mut scores = vec![0f32; n];
         for h in 0..self.n_head {
@@ -665,6 +737,92 @@ impl AttnLayer {
             }
         }
         Ok(out)
+    }
+
+    /// 1 つの kv head を共有する q head 数 (`n_head / n_head_kv`)。
+    /// [`AttnLayer::from_gguf`] が割り切れることを検査済み。
+    fn heads_per_kv(&self) -> usize {
+        self.n_head / self.n_head_kv
+    }
+
+    /// 1 トークンの attention を kv head グループ単位で回す ([`AttnLayer::attend_impl`]
+    /// の decode 用まとめ経路、`DENNO_ATTN_GQA_FAST=0` で従来版)。
+    ///
+    /// q head を「同じ kv head を共有する範囲」に区切り、その中を
+    /// [`gqa_chunk_heads`] ごとのタスクに割って rayon に渡す。各 (head, d) の
+    /// 出力は j 昇順の逐次加算のまま、各 (head, j) の内積は d 昇順のままなので、
+    /// **スレッド数にも分割の仕方にも依存せず**従来の head 個別版とビット一致する
+    /// (変わるのは「どの head をどのスレッドが計算するか」だけ)。
+    ///
+    /// タスクは同じ kv head の中だけで切るので、1 タスクが 2 つの kv head を
+    /// またぐことはない (`chunk` は `heads_per_kv()` の約数)。
+    fn attend_dense_grouped(
+        &self,
+        q: &[f32],
+        kb: &[f32],
+        vb: &[f32],
+        row: usize,
+        len: usize,
+    ) -> Vec<f32> {
+        let dh = self.head_dim;
+        let ng = self.heads_per_kv();
+        let mut out = vec![0f32; self.q_dim()];
+        if len == 0 {
+            return out;
+        }
+        let chunk = gqa_chunk_heads(ng);
+        let ntasks = self.n_head / chunk;
+        debug_assert_eq!(ntasks * chunk, self.n_head);
+
+        #[cfg(feature = "par")]
+        if ntasks > 1 && rayon::current_num_threads() > 1 {
+            use rayon::prelude::*;
+
+            ATTN_GQA_PAR_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            out.par_chunks_mut(chunk * dh)
+                .enumerate()
+                .for_each_init(|| vec![0f32; chunk * len], |scores, (t, obuf)| {
+                    let h0 = t * chunk;
+                    attend_group_into(
+                        q,
+                        kb,
+                        vb,
+                        row,
+                        len,
+                        h0 / ng,
+                        h0,
+                        chunk,
+                        dh,
+                        self.kq_scale,
+                        h0,
+                        scores,
+                        obuf,
+                    );
+                });
+            return out;
+        }
+
+        // 逐次 (rayon 無効 / 1 スレッド / タスク 1 本)。並列と同じ関数を回す。
+        let mut scores = vec![0f32; chunk * len];
+        for t in 0..ntasks {
+            let h0 = t * chunk;
+            attend_group_into(
+                q,
+                kb,
+                vb,
+                row,
+                len,
+                h0 / ng,
+                h0,
+                chunk,
+                dh,
+                self.kq_scale,
+                h0,
+                &mut scores,
+                &mut out[h0 * dh..(h0 + chunk) * dh],
+            );
+        }
+        out
     }
 
     /// チャンクぶんの attention を回す (バッチ prefill 用)。
@@ -728,14 +886,8 @@ impl AttnLayer {
         let kb = cache.k(layer)?;
         let vb = cache.v(layer)?;
 
-        // q head → kv head のまとめ (GQA で同じ kv 行を共有する head を 1 度に回す)。
-        let mut groups: Vec<Vec<usize>> = vec![Vec::new(); self.n_head_kv];
-        for h in 0..self.n_head {
-            groups[self.kv_head(h)].push(h);
-        }
-        let gmax = groups.iter().map(|g| g.len()).max().unwrap_or(0);
-        // 作業バッファは 1 トークンぶん (head グループ最大 × 可視位置の最大)。
-        let scratch_len = gmax * len;
+        // 作業バッファは 1 トークンぶん (1 kv head を共有する q head 数 × 可視位置の最大)。
+        let scratch_len = self.heads_per_kv() * len;
 
         // トークン方向の並列。`nt` がしきい値以上なら rayon に割る。
         #[cfg(feature = "par")]
@@ -753,7 +905,6 @@ impl AttnLayer {
                         vb,
                         row,
                         base + t + 1,
-                        &groups,
                         scores,
                         o,
                     );
@@ -770,7 +921,6 @@ impl AttnLayer {
                 vb,
                 row,
                 base + t + 1,
-                &groups,
                 &mut scores,
                 &mut out[t * qd..(t + 1) * qd],
             );
@@ -786,7 +936,7 @@ impl AttnLayer {
     /// と同一: 内積は d 昇順 → `* kq_scale` 1 回、[`softmax`] は前からの和、
     /// 出力は j 昇順の逐次加算。
     ///
-    /// `scores` は `ng * nvis` 以上 (ng = 最大の head グループ)、`out` は
+    /// `scores` は `ng * nvis` 以上 (ng = 1 kv head を共有する q head 数)、`out` は
     /// `q_dim` で、呼ぶ前に 0 で埋まっていること。トークン内では kv head ごとに
     /// k / v の行を 1 回だけ読み、その kv head を共有する q head をまとめて回す。
     #[allow(clippy::too_many_arguments)]
@@ -797,18 +947,15 @@ impl AttnLayer {
         vb: &[f32],
         row: usize,
         nvis: usize,
-        groups: &[Vec<usize>],
         scores: &mut [f32],
         out: &mut [f32],
     ) {
         debug_assert_eq!(qrow.len(), self.q_dim());
         debug_assert_eq!(out.len(), self.q_dim());
         debug_assert!(nvis >= 1);
-        for (hk, group) in groups.iter().enumerate() {
-            if group.is_empty() {
-                continue;
-            }
-            debug_assert!(scores.len() >= group.len() * nvis);
+        let ng = self.heads_per_kv();
+        for hk in 0..self.n_head_kv {
+            debug_assert!(scores.len() >= ng * nvis);
             attend_group_into(
                 qrow,
                 kb,
@@ -816,9 +963,11 @@ impl AttnLayer {
                 row,
                 nvis,
                 hk,
-                group,
+                hk * ng,
+                ng,
                 self.head_dim,
                 self.kq_scale,
+                0,
                 scores,
                 out,
             );
@@ -827,11 +976,62 @@ impl AttnLayer {
     }
 }
 
-/// 1 トークン・1 kv head グループぶんの attention ([`AttnLayer::attend_one_into`]
-/// の本体)。
+/// 1 タスクぶんの q head 数 (GQA まとめ経路の分割単位)。
 ///
-/// `heads` は同じ kv head を共有する q head (昇順)。`scores` は
-/// `heads.len() * nvis` 以上、`out` は `n_head * head_dim`。
+/// 出力は head ごとに独立に足すので、足し算の順序を保つには **head 境界で
+/// しか割れない**。細かく割るほど並列度は上がるが、そのぶん同じ kv 行を
+/// タスク数だけ読み直す。実形状 (12 head 共有) では半分の 6 head = 4 タスクに
+/// すると、KV の再読みが 2 倍・タスクが 4 本になり、読み出し増 (全体の数 %)
+/// より並列の利得が上回る。共有数が 12 未満なら割らない (内積の ILP 幅 8 に
+/// 対してレーンが余り、割るほど 1 本あたりの効率が落ちる)。
+fn gqa_chunk_heads(ng: usize) -> usize {
+    let mut want = ATTN_GQA_CHUNK.load(AtomicOrdering::Relaxed);
+    if want == usize::MAX {
+        // 最初の 1 回だけ env を読む (負けた側は同じ値なので上書きしない)。
+        let v = std::env::var("DENNO_ATTN_GQA_CHUNK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let _ = ATTN_GQA_CHUNK.compare_exchange(
+            usize::MAX,
+            v,
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+        );
+        want = ATTN_GQA_CHUNK.load(AtomicOrdering::Relaxed);
+    }
+    let mut c = if want == 0 {
+        if ng >= 12 && ng % 2 == 0 {
+            ng / 2
+        } else {
+            ng
+        }
+    } else {
+        want.clamp(1, ng)
+    };
+    // `out` は head 境界でしか切れないので、ng の約数に丸める。
+    while c > 1 && ng % c != 0 {
+        c -= 1;
+    }
+    c
+}
+
+/// 1 タスクの q head 数 (`DENNO_ATTN_GQA_CHUNK`、0 = 自動)。`usize::MAX` = 未初期化。
+static ATTN_GQA_CHUNK: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// テスト・A/B 用: 1 タスクの q head 数を上書きし、以前の値を返す (0 = 自動)。
+#[doc(hidden)]
+pub fn set_attn_gqa_chunk(c: usize) -> usize {
+    ATTN_GQA_CHUNK.swap(c, AtomicOrdering::Relaxed)
+}
+
+/// 1 トークン・1 kv head グループぶんの attention ([`AttnLayer::attend_one_into`]
+/// と [`AttnLayer::attend_dense_grouped`] の本体)。
+///
+/// `head0..head0 + ng` は同じ kv head を共有する q head (昇順)。`scores` は
+/// `ng * nvis` 以上、`out` は `out_base * dh` ぶん後ろから
+/// `(head0 + ng - out_base) * dh` 要素以上 (`out_base` はタスクの先頭 head。
+/// グループ全体を 1 タスクで回すときは 0)。
 ///
 /// 計算順は [`AttnLayer::attend_batch`] の doc と同じ:
 /// 内積は d 昇順 → `* kq_scale` 1 回、softmax は [`softmax`]、出力は j 昇順。
@@ -845,21 +1045,22 @@ fn attend_group_into(
     row: usize,
     nvis: usize,
     hk: usize,
-    heads: &[usize],
+    head0: usize,
+    ng: usize,
     dh: usize,
     kq_scale: f32,
+    out_base: usize,
     scores: &mut [f32],
     out: &mut [f32],
 ) {
-    let ng = heads.len();
     debug_assert!(ng >= 1);
     debug_assert!(scores.len() >= ng * nvis);
     let sc = &mut scores[..ng * nvis];
     // 1) スコア: j (位置) を外・head を内にして k 行を 1 回だけ読む。
     if attend_ilp_on() && ng <= ATTEND_ILP_LANES {
-        attend_group_scores_ilp(qrow, kb, row, nvis, hk, heads, dh, kq_scale, sc);
+        attend_group_scores_ilp(qrow, kb, row, nvis, hk, head0, ng, dh, kq_scale, sc);
     } else {
-        attend_group_scores_serial(qrow, kb, row, nvis, hk, heads, dh, kq_scale, sc);
+        attend_group_scores_serial(qrow, kb, row, nvis, hk, head0, ng, dh, kq_scale, sc);
     }
     // 2) softmax は可視範囲だけ ([`softmax`] そのもの)。
     for li in 0..ng {
@@ -868,9 +1069,9 @@ fn attend_group_into(
     // 3) 出力: j 昇順の逐次加算 (v 行も 1 回だけ読む)。
     for j in 0..nvis {
         let vrow = &vb[j * row + hk * dh..][..dh];
-        for (li, &h) in heads.iter().enumerate() {
+        for li in 0..ng {
             let p = sc[li * nvis + j];
-            let orow = &mut out[h * dh..][..dh];
+            let orow = &mut out[(head0 + li - out_base) * dh..][..dh];
             for d in 0..dh {
                 orow[d] += p * vrow[d];
             }
@@ -908,22 +1109,21 @@ fn attend_group_scores_ilp(
     row: usize,
     nvis: usize,
     hk: usize,
-    heads: &[usize],
+    head0: usize,
+    ng: usize,
     dh: usize,
     kq_scale: f32,
     sc: &mut [f32],
 ) {
     const L: usize = ATTEND_ILP_LANES;
-    let ng = heads.len();
     let mut i = 0;
     while i < ng {
         let w = (ng - i).min(L);
         // 8 レーン固定で回すため、余りは末尾 head で埋める (値は捨てる)。
-        let mut hp = [heads[ng - 1]; L];
-        hp[..w].copy_from_slice(&heads[i..i + w]);
         let mut off = [0usize; L];
         for k in 0..L {
-            off[k] = hp[k] * dh;
+            let h = if k < w { head0 + i + k } else { head0 + ng - 1 };
+            off[k] = h * dh;
         }
         for j in 0..nvis {
             let krow = &kb[j * row + hk * dh..][..dh];
@@ -955,15 +1155,16 @@ fn attend_group_scores_serial(
     row: usize,
     nvis: usize,
     hk: usize,
-    heads: &[usize],
+    head0: usize,
+    ng: usize,
     dh: usize,
     kq_scale: f32,
     sc: &mut [f32],
 ) {
     for j in 0..nvis {
         let krow = &kb[j * row + hk * dh..][..dh];
-        for (li, &h) in heads.iter().enumerate() {
-            let qh = &qrow[h * dh..][..dh];
+        for li in 0..ng {
+            let qh = &qrow[(head0 + li) * dh..][..dh];
             let mut acc = 0f32;
             for d in 0..dh {
                 acc += qh[d] * krow[d];
@@ -1542,7 +1743,6 @@ mod p49 {
                 fill(0x91 + ng as u64, &mut q);
                 let mut kb = vec![0f32; 40 * row];
                 fill(0x37 + nvis as u64, &mut kb);
-                let heads: Vec<usize> = (0..ng).collect();
                 let mut serial = vec![0f32; ng * nvis];
                 let mut ilp = vec![0f32; ng * nvis];
                 attend_group_scores_serial(
@@ -1551,7 +1751,8 @@ mod p49 {
                     row,
                     nvis,
                     1,
-                    &heads,
+                    0,
+                    ng,
                     dh,
                     1.0 / (dh as f32).sqrt(),
                     &mut serial,
@@ -1562,7 +1763,8 @@ mod p49 {
                     row,
                     nvis,
                     1,
-                    &heads,
+                    0,
+                    ng,
                     dh,
                     1.0 / (dh as f32).sqrt(),
                     &mut ilp,
@@ -1644,8 +1846,7 @@ mod p49 {
         let mut vb = vec![0f32; nvis * P49_ROW];
         fill(12, &mut kb);
         fill(13, &mut vb);
-        let heads: Vec<usize> = (0..P49_HEADS / P49_KV).collect();
-        let ng = heads.len();
+        let ng = P49_HEADS / P49_KV;
         let mut sc_serial = vec![0f32; ng * nvis];
         let mut sc_ilp = vec![0f32; ng * nvis];
         let mut out = vec![0f32; P49_HEADS * P49_DH];
@@ -1661,14 +1862,14 @@ mod p49 {
             let s = std::time::Instant::now();
             for _ in 0..reps {
                 attend_group_scores_serial(
-                    &q, &kb, P49_ROW, nvis, 0, &heads, P49_DH, kq, &mut sc_serial,
+                    &q, &kb, P49_ROW, nvis, 0, 0, ng, P49_DH, kq, &mut sc_serial,
                 );
             }
             t_serial.push(s.elapsed().as_secs_f64() * 1e6 / reps as f64);
             let s = std::time::Instant::now();
             for _ in 0..reps {
                 attend_group_scores_ilp(
-                    &q, &kb, P49_ROW, nvis, 0, &heads, P49_DH, kq, &mut sc_ilp,
+                    &q, &kb, P49_ROW, nvis, 0, 0, ng, P49_DH, kq, &mut sc_ilp,
                 );
             }
             t_ilp.push(s.elapsed().as_secs_f64() * 1e6 / reps as f64);
@@ -1676,10 +1877,12 @@ mod p49 {
             for _ in 0..reps {
                 // 1 kv head グループ × 2 (2 kv head ぶんが 1 トークンの全 q head)
                 attend_group_into(
-                    &q, &kb, &vb, P49_ROW, nvis, 0, &heads, P49_DH, kq, &mut sc_used, &mut out,
+                    &q, &kb, &vb, P49_ROW, nvis, 0, 0, ng, P49_DH, kq, 0, &mut sc_used,
+                    &mut out,
                 );
                 attend_group_into(
-                    &q, &kb, &vb, P49_ROW, nvis, 1, &heads, P49_DH, kq, &mut sc_used, &mut out,
+                    &q, &kb, &vb, P49_ROW, nvis, 1, ng, ng, P49_DH, kq, 0, &mut sc_used,
+                    &mut out,
                 );
             }
             t_full.push(s.elapsed().as_secs_f64() * 1e6 / reps as f64);
