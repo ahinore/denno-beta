@@ -241,6 +241,13 @@ fn prof_flash(tag: &str, tok: usize) {
 /// `enabled()` の分岐 1 回だけで、数値経路には触れない。
 fn prof_flash_q4(tag: &str, tok: usize) {
     use denno_engine::model::qwen4exp::{moe_sub_take, q4prof};
+    // decode の GDN コア内訳 (`DENNO_GDN_KPROF=1` のときだけ 1 行)。
+    // q4prof とは独立に出す (`DENNO_Q4_PROFILE` を立てなくても読める)。
+    // 未設定なら `line()` が None = 出力ゼロ・積算もゼロのまま。
+    if let Some(line) = denno_engine::gdn::kprof::line() {
+        eprintln!("{line}");
+        denno_engine::gdn::kprof::reset();
+    }
     if !q4prof::enabled() {
         return;
     }

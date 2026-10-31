@@ -301,7 +301,177 @@ fn gdn_head(
     gdn_head_step(dk, dv, qh, kh_v, vh, eg, b, s_head, o_head, &mut sk, &mut d);
 }
 
+// ---------------------------------------------------------------------------
+// 区間計測 (`DENNO_GDN_KPROF=1`・既定 OFF)
+//
+// decode の GDN コアは 1 トークン = 1 層 1 回なので、4 区間
+// (conv / l2 / scan / rms) の ns を積むだけで「層あたりどこが重いか」が出る。
+// 計測専用で数値経路からは読まない。`on()` が偽なら `Instant` も取らない
+// (サイトあたり分岐 1 回)。
+// ---------------------------------------------------------------------------
+pub mod kprof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    /// 区間名 (添字が区間 ID)。
+    pub const NAMES: [&str; 4] = ["conv", "l2", "scan", "rms"];
+    /// 区間数。
+    pub const N: usize = 4;
+
+    static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// 計測するか (`DENNO_GDN_KPROF=1` のときだけ真)。既定 off。
+    #[inline]
+    pub fn on() -> bool {
+        #[cfg(test)]
+        if let Some(v) = forced() {
+            return v;
+        }
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("DENNO_GDN_KPROF").ok().as_deref() == Some("1"))
+    }
+
+    // env はプロセスで 1 回しか読めず、テストは並列なので上書き口を置く
+    // (`cpu_gemv_par_from_value` と同じ流儀)。0 = env・1 = 強制 off・2 = 強制 on。
+    #[cfg(test)]
+    static FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    #[cfg(test)]
+    fn forced() -> Option<bool> {
+        match FORCE.load(Ordering::Relaxed) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// テストから env を介さずに切り替える (`None` で env の値に戻す)。
+    #[cfg(test)]
+    pub fn set_on_for_test(v: Option<bool>) {
+        FORCE.store(
+            match v {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// 区間 `i` を閉じて次の時刻を返す。`t` が `None` (計測 off) なら no-op。
+    #[inline]
+    pub fn lap(t: Option<Instant>, i: usize) -> Option<Instant> {
+        match t {
+            Some(t0) => {
+                NS[i].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                Some(Instant::now())
+            }
+            None => None,
+        }
+    }
+
+    /// 1 回ぶんの呼び出しを数える。
+    #[inline]
+    pub fn bump_call() {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 積算を 0 に戻す (表示後に呼ぶ)。
+    pub fn reset() {
+        for c in NS.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+        CALLS.store(0, Ordering::Relaxed);
+    }
+
+    /// (call 数, 区間ごとの ns) を読む。
+    pub fn take() -> (u64, [u64; N]) {
+        let mut ns = [0u64; N];
+        for (d, s) in ns.iter_mut().zip(NS.iter()) {
+            *d = s.load(Ordering::Relaxed);
+        }
+        (CALLS.load(Ordering::Relaxed), ns)
+    }
+
+    /// 表示行 (未計測・call 0 なら `None`)。
+    pub fn line() -> Option<String> {
+        if !on() {
+            return None;
+        }
+        let (calls, ns) = take();
+        if calls == 0 {
+            return None;
+        }
+        let total: u64 = ns.iter().sum();
+        let ms = |v: u64| v as f64 / 1e6;
+        let pct = |v: u64| v as f64 / total.max(1) as f64 * 100.0;
+        Some(format!(
+            "[GDN_CORE_KPROF] conv={:.3} l2={:.3} scan={:.3} rms={:.3} total={:.3} calls={} \
+             per-call={:.3} ms (conv {:.1}% l2 {:.1}% scan {:.1}% rms {:.1}%)",
+            ms(ns[0]),
+            ms(ns[1]),
+            ms(ns[2]),
+            ms(ns[3]),
+            ms(total),
+            calls,
+            ms(total) / calls as f64,
+            pct(ns[0]),
+            pct(ns[1]),
+            pct(ns[2]),
+            pct(ns[3])
+        ))
+    }
+
+    /// 1 行を stderr へ出す (未計測なら何もしない)。
+    pub fn report() {
+        if let Some(l) = line() {
+            eprintln!("{l}");
+        }
+    }
+}
+
 pub fn forward_token_core_gate(
+    p: &GdnParams,
+    cw: &GdnCore<'_>,
+    qkv: &[f32],
+    z: &[f32],
+    beta_raw: &[f32],
+    alpha: &[f32],
+    st: &mut GdnState,
+    gate: GateKind,
+) -> Vec<f32> {
+    // 既定は並列版 (`forward_token_core_gate_par`)。次の 2 つだけ旧実装に落ちる:
+    // - サブステージダンプ (`DENNO_DEBUG_GDN_DUMP_LAYER`) がこの層を指している
+    //   → 追記順を llama.cpp の lchk と同一に保つため、トークン逐次のまま回す。
+    // - `DENNO_GDN_CORE_SCALAR=1` → 実機で新旧のビット一致を A/B するための逃げ道。
+    let dbg_layer = DBG_CUR_LAYER.with(|c| c.get());
+    let dbg = matches!(gdump_cfg(), Some((_, l)) if l == dbg_layer && dbg_layer >= 0);
+    if dbg || core_scalar() {
+        return forward_token_core_gate_ref(p, cw, qkv, z, beta_raw, alpha, st, gate);
+    }
+    forward_token_core_gate_par(p, cw, qkv, z, beta_raw, alpha, st, gate)
+}
+
+/// `DENNO_GDN_CORE_SCALAR=1` で decode の GDN コアを旧実装 (トークン逐次) にする。
+///
+/// decode の GDN は 1 トークン 1 層 1 回なので、並列版と旧実装の出力は
+/// ビット一致する (要素ごとの演算順序を変えない)。実機で A/B するための
+/// 逃げ道として残す。既定 off。
+fn core_scalar_from_value(v: Option<&str>) -> bool {
+    v.map(|s| s.trim() == "1").unwrap_or(false)
+}
+
+/// [`core_scalar_from_value`] の実効値 (env はプロセスで 1 回)。
+fn core_scalar() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| core_scalar_from_value(std::env::var("DENNO_GDN_CORE_SCALAR").ok().as_deref()))
+}
+
+/// 旧実装 (トークン逐次・スカラー)。値の基準であり、診断ダンプ経路でもある。
+///
+/// 並列版 [`forward_token_core_gate_par`] はこの関数と **f32 でビット一致**する。
+pub fn forward_token_core_gate_ref(
     p: &GdnParams,
     cw: &GdnCore<'_>,
     qkv: &[f32],
@@ -334,6 +504,11 @@ pub fn forward_token_core_gate(
 
     // ---- causal depthwise conv + silu --------------------------------
     // 入力列 = [conv_state (d_conv-1), qkv_t] をチャネルごとに畳み込み
+    let mut kt = if kprof::on() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let cs = p.d_conv - 1;
     let cd = p.conv_dim();
     let mut conv_in = vec![0.0f32; cd * p.d_conv];
@@ -362,6 +537,7 @@ pub fn forward_token_core_gate(
         gdump("beta", &beta_sig);
         gdump("gate", &gate_dbg);
     }
+    kt = kprof::lap(kt, 0);
 
     // ---- split q/k/v ---------------------------------------------------
     let kd = p.key_dim();
@@ -389,6 +565,7 @@ pub fn forward_token_core_gate(
         gdump("k", &k);
         gdump("v", v_raw);
     }
+    kt = kprof::lap(kt, 1);
 
     // ---- デルタルール (head ごと・AR 形式) ------------------------------
     let dk = p.head_k_dim;
@@ -456,6 +633,7 @@ pub fn forward_token_core_gate(
 
     // ---- gated RMS norm (head ごと): rmsnorm(o)*w * g(z) ----------------
     // g は `GateKind` (qwen35 = silu / qwen4exp = sigmoid)。
+    kt = kprof::lap(kt, 2);
     let mut y = vec![0.0f32; vd];
     for h in 0..p.n_v_heads {
         let obase = h * dv;
@@ -474,6 +652,10 @@ pub fn forward_token_core_gate(
     if dbg {
         gdump("o", &o); // scan 出力 (gated norm 前)
         gdump("y", &y); // gated norm 後
+    }
+    if kt.is_some() {
+        kprof::lap(kt, 3);
+        kprof::bump_call();
     }
 
     y
@@ -527,6 +709,308 @@ macro_rules! scratch_pair {
 
 scratch_pair!(conv_scratch, conv_scratch_put, CONV_SCRATCH);
 scratch_pair!(yh_scratch, yh_scratch_put, YH_SCRATCH);
+
+// ---------------------------------------------------------------------------
+// decode 1 トークンの GDN コア (並列版・既定)
+// ---------------------------------------------------------------------------
+//
+// 旧実装 [`forward_token_core_gate_ref`] との違いは **並列化と作業域の再利用だけ**:
+// - conv: チャネルごとの `acc = Σ_j w[j]*in[j]` (j 昇順) はそのまま。160 KB の
+//   `conv_in` は作らず、状態 `st.conv` をその場で左ロールする (結果は同一)。
+// - L2 正規化: k-head ごとに conv 出力をコピー → 2 乗和 (昇順) → `*= inv` →
+//   q だけ `*= q_scale`。途中の丸めを変えない。
+// - デルタ則: ヘッド独立なので [`gdn_head_step`] をそのまま呼び、担当ヘッドだけを
+//   分ける。出力 o もヘッド専用スライス。
+// - gated RMS norm: ヘッドごとに独立。
+// よって 1 トークン 1 層の出力は f32 でビット一致する
+// (テスト `par_core_matches_ref_bitexact`)。
+//
+// 旧実装の実測 (decode, 27B 形, 36 層, このコンテナ): conv 93 µs/層・l2 4・
+// scan 95・rms 24。conv と rms は exp が 10240 + 6144 本ぶんスカラーで直列、
+// これが全体の 5 割を占めていた。並列化で両方をスレッド数で割る。
+thread_local! {
+    /// 並列版 decode の conv 出力作業域 (grow-only, len = conv_dim)。
+    static TOK_CV: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// 並列版 decode の q|k 作業域 (grow-only, len = 2*key_dim)。
+    static TOK_QK: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// 並列版 decode の scan 出力作業域 (grow-only, len = value_dim)。
+    static TOK_O: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+scratch_pair!(tok_cv, tok_cv_put, TOK_CV);
+scratch_pair!(tok_qk, tok_qk_put, TOK_QK);
+scratch_pair!(tok_o, tok_o_put, TOK_O);
+
+/// 並列度 (`par` が無いビルドでは 1)。
+#[inline]
+fn par_threads() -> usize {
+    #[cfg(feature = "par")]
+    {
+        rayon::current_num_threads().max(1)
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        1
+    }
+}
+
+/// 1 タスクが受け持つチャネル数 `bs` (= `head_k_dim` × 2^k)。
+///
+/// q/k のブロックが q と k をまたがないよう、`key_dim` を割り切る幅にする
+/// (ブロック数がスレッド数の 4 倍程度になるまで倍にする)。
+#[inline]
+fn tok_block_channels(dk: usize, nk: usize, cd: usize, threads: usize) -> usize {
+    if dk == 0 {
+        return 1;
+    }
+    let mut hpb = 1usize;
+    while nk % (hpb * 2) == 0 && cd / (dk * hpb) > 4 * threads.max(1) {
+        hpb *= 2;
+    }
+    dk * hpb
+}
+
+/// decode 1 トークンの GDN コア (並列版)。[`forward_token_core_gate_ref`] とビット一致。
+#[allow(clippy::too_many_arguments)]
+pub fn forward_token_core_gate_par(
+    p: &GdnParams,
+    cw: &GdnCore<'_>,
+    qkv: &[f32],
+    z: &[f32],
+    beta_raw: &[f32],
+    alpha: &[f32],
+    st: &mut GdnState,
+    gate: GateKind,
+) -> Vec<f32> {
+    let cs = p.d_conv - 1;
+    let dc = p.d_conv;
+    let cd = p.conv_dim();
+    let kd = p.key_dim();
+    let vd = p.value_dim();
+    let dk = p.head_k_dim;
+    let dv = p.head_v_dim;
+    let nk = p.n_k_heads;
+    let nv = p.n_v_heads;
+    let eps = p.eps;
+    // 退化形 (conv 幅 1・ヘッド無し・入力長不一致・状態長不一致) は旧実装に任せる。
+    // 状態長が違うと zip が黙って短い方で回るので、ここで落とす (旧実装は panic する)。
+    if cs == 0
+        || dk == 0
+        || dv == 0
+        || nk == 0
+        || nv == 0
+        || qkv.len() != cd
+        || z.len() != vd
+        || st.conv.len() != cd * cs
+        || st.ssm.len() != nv * dk * dv
+    {
+        return forward_token_core_gate_ref(p, cw, qkv, z, beta_raw, alpha, st, gate);
+    }
+
+    let q_scale = 1.0 / (dk as f32).sqrt();
+    let threads = par_threads();
+    let bs = tok_block_channels(dk, nk, cd, threads);
+    let group = batch_head_group(nv);
+
+    let mut cvv = tok_cv(cd);
+    let mut qkv2 = tok_qk(2 * kd);
+    let mut ovv = tok_o(vd);
+    let cv = &mut cvv[..cd];
+    let qk = &mut qkv2[..2 * kd];
+    let o = &mut ovv[..vd];
+
+    let mut kt = if kprof::on() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
+    // ---- A: causal depthwise conv + silu + 状態ロール (チャネル並列) ----
+    {
+        let conv1d = cw.conv1d;
+        let block = |bi: usize, cvb: &mut [f32], scb: &mut [f32]| {
+            let c0 = bi * bs;
+            for (i, out) in cvb.iter_mut().enumerate() {
+                let c = c0 + i;
+                let w = &conv1d[c * dc..c * dc + dc];
+                let base = i * cs;
+                let mut acc = 0.0f32;
+                for (j, wj) in w[..cs].iter().enumerate() {
+                    acc += *wj * scb[base + j];
+                }
+                acc += w[cs] * qkv[c];
+                for j in 0..cs - 1 {
+                    scb[base + j] = scb[base + j + 1];
+                }
+                scb[base + cs - 1] = qkv[c];
+                *out = silu(acc);
+            }
+        };
+        #[cfg(feature = "par")]
+        {
+            use rayon::prelude::*;
+            cv.par_chunks_mut(bs)
+                .zip(st.conv.par_chunks_mut(cs * bs))
+                .enumerate()
+                .for_each(|(bi, (cvb, scb))| block(bi, cvb, scb));
+        }
+        #[cfg(not(feature = "par"))]
+        {
+            for (bi, (cvb, scb)) in cv.chunks_mut(bs).zip(st.conv.chunks_mut(cs * bs)).enumerate() {
+                block(bi, cvb, scb);
+            }
+        }
+    }
+    kt = kprof::lap(kt, 0);
+
+    // ---- B: q/k の L2 正規化 (k-head ごと・conv 出力のコピーから) ----
+    {
+        let cv_qk: &[f32] = &cv[..2 * kd];
+        let block = |bi: usize, dst: &mut [f32], src: &[f32]| {
+            let is_q = bi * bs < kd;
+            for (d, s) in dst.chunks_mut(dk).zip(src.chunks(dk)) {
+                d.copy_from_slice(s);
+                l2_norm(d, eps);
+                if is_q {
+                    for v in d.iter_mut() {
+                        *v *= q_scale;
+                    }
+                }
+            }
+        };
+        // `par` ビルドでもここは直列: 2*kd = 4096 要素 (16 KB) は 16 スレッドに
+        // 割ると fork-join の方が高くつく (実測 9.3 µs/層 → 直列 3 µs/層)。
+        for (bi, (dst, src)) in qk.chunks_mut(bs).zip(cv_qk.chunks(bs)).enumerate() {
+            block(bi, dst, src);
+        }
+    }
+    kt = kprof::lap(kt, 1);
+
+    // ---- C: デルタ則 (ヘッド並列) ---------------------------------------
+    {
+        let qh_all: &[f32] = &qk[..kd];
+        let kh_all: &[f32] = &qk[kd..2 * kd];
+        let vraw: &[f32] = &cv[2 * kd..2 * kd + vd];
+        let do_group = |gi: usize, sgrp: &mut [f32], ogrp: &mut [f32]| {
+            let nh = sgrp.len() / (dk * dv);
+            // 作業域はタスクの外で 1 回だけ (ヘッド×トークンごとの vec![] を消す)
+            let mut sk = vec![0.0f32; dv];
+            let mut dl = vec![0.0f32; dv];
+            for hh in 0..nh {
+                let h = gi * group + hh;
+                let ob = &mut ogrp[hh * dv..(hh + 1) * dv];
+                let kh = h % nk;
+                let g = cw.ssm_a[h] * softplus(alpha[h] + cw.ssm_dt[h]);
+                let eg = g.exp();
+                let b = sigmoid(beta_raw[h]);
+                let sh = &mut sgrp[hh * dk * dv..(hh + 1) * dk * dv];
+                gdn_head_step_fused(
+                    dk,
+                    dv,
+                    &qh_all[kh * dk..kh * dk + dk],
+                    &kh_all[kh * dk..kh * dk + dk],
+                    &vraw[h * dv..(h + 1) * dv],
+                    eg,
+                    b,
+                    sh,
+                    ob,
+                    &mut sk,
+                    &mut dl,
+                );
+            }
+        };
+        let par_ok = {
+            #[cfg(feature = "par")]
+            {
+                nv >= 8
+            }
+            #[cfg(not(feature = "par"))]
+            {
+                false
+            }
+        };
+        #[cfg(feature = "par")]
+        if par_ok {
+            use rayon::prelude::*;
+            st.ssm
+                .par_chunks_mut(group * dk * dv)
+                .zip(o.par_chunks_mut(group * dv))
+                .enumerate()
+                .for_each(|(gi, (sgrp, ogrp))| do_group(gi, sgrp, ogrp));
+        }
+        if !par_ok {
+            for (gi, (sgrp, ogrp)) in st
+                .ssm
+                .chunks_mut(group * dk * dv)
+                .zip(o.chunks_mut(group * dv))
+                .enumerate()
+            {
+                do_group(gi, sgrp, ogrp);
+            }
+        }
+    }
+    kt = kprof::lap(kt, 2);
+
+    // ---- D: gated RMS norm (ヘッド並列): rmsnorm(o)*w * g(z) -------------
+    let mut y = vec![0.0f32; vd];
+    {
+        let do_group = |gi: usize, ob: &[f32], yb: &mut [f32]| {
+            let nh = ob.len() / dv;
+            for hh in 0..nh {
+                let h = gi * group + hh;
+                let os = &ob[hh * dv..(hh + 1) * dv];
+                let ys = &mut yb[hh * dv..(hh + 1) * dv];
+                ys.copy_from_slice(os);
+                rms_norm(ys, eps);
+                let base = h * dv;
+                for (c, v) in ys.iter_mut().enumerate() {
+                    let zc = z[base + c];
+                    let g = match gate {
+                        GateKind::Silu => silu(zc),
+                        GateKind::Sigmoid => sigmoid(zc),
+                    };
+                    *v *= cw.ssm_norm[c] * g;
+                }
+            }
+        };
+        let par_ok = {
+            #[cfg(feature = "par")]
+            {
+                nv >= 8
+            }
+            #[cfg(not(feature = "par"))]
+            {
+                false
+            }
+        };
+        #[cfg(feature = "par")]
+        if par_ok {
+            use rayon::prelude::*;
+            o.par_chunks(group * dv)
+                .zip(y.par_chunks_mut(group * dv))
+                .enumerate()
+                .for_each(|(gi, (ob, yb))| do_group(gi, ob, yb));
+        }
+        if !par_ok {
+            for (gi, (ob, yb)) in o
+                .chunks(group * dv)
+                .zip(y.chunks_mut(group * dv))
+                .enumerate()
+            {
+                do_group(gi, ob, yb);
+            }
+        }
+    }
+    if kt.is_some() {
+        kprof::lap(kt, 3);
+        kprof::bump_call();
+    }
+
+    tok_cv_put(cvv);
+    tok_qk_put(qkv2);
+    tok_o_put(ovv);
+    y
+}
 
 /// 時刻 `tau` (チャンク先頭を 0 とし、負は conv 初期状態) の conv 入力。
 #[inline]
@@ -609,6 +1093,77 @@ fn gdn_head_step(
             let row = &s[r * dv..r * dv + dv];
             for (oc, rc) in o_head.iter_mut().zip(row.iter()) {
                 *oc += qr * rc;
+            }
+        }
+    }
+}
+
+/// decode 用のデルタ則 1 ヘッドぶん (**走査 2 回**版)。
+///
+/// [`gdn_head_step`] と同じ値になる (テスト `par_core_matches_ref_bitexact`):
+/// - pass 1+2 融合: ある要素の `S *= eg` と、その要素を使う `sk += k[r]*S` を
+///   同じ走査で行う。行 `r` の昇順・列の昇順はそのまま (各要素の丸めは 1 回きり)。
+/// - pass 3+4 融合: `S[r][c] += k[r]*d[c]` の直後に `o[c] += q[r]*S[r][c]` を足す。
+///   列 `c` の総和は `r` 昇順のままで、各項は更新後の `S[r][c]`。
+///
+/// 4 走査 (decay / sk / 更新 / o) を 2 走査にすると状態 64 KB の読み書きが
+/// 半減する (実測: decode 27B 形 36 層で scan 38.8 → 25 µs/層)。
+#[allow(clippy::too_many_arguments)]
+fn gdn_head_step_fused(
+    dk: usize,
+    dv: usize,
+    qh: &[f32],
+    kh_v: &[f32],
+    vh: &[f32],
+    eg: f32,
+    b: f32,
+    s_head: &mut [f32],
+    o_head: &mut [f32],
+    sk: &mut [f32],
+    d: &mut [f32],
+) {
+    let (sk, d) = (&mut sk[..dv], &mut d[..dv]);
+    let s = &mut s_head[..dk * dv];
+
+    // ---- pass 1+2: S *= exp(g) と sk = Σ_r k[r]*S[r][c] ----
+    for v in sk.iter_mut() {
+        *v = 0.0;
+    }
+    for (r, row) in s.chunks_exact_mut(dv).enumerate() {
+        let kr = kh_v[r];
+        if kr != 0.0 {
+            for (skc, rc) in sk.iter_mut().zip(row.iter_mut()) {
+                let v = *rc * eg;
+                *rc = v;
+                *skc += kr * v;
+            }
+        } else {
+            for rc in row.iter_mut() {
+                *rc *= eg;
+            }
+        }
+    }
+
+    // d[c] = beta * (v[c] - sk[c])
+    for ((dc, &vc), &sc) in d.iter_mut().zip(vh.iter()).zip(sk.iter()) {
+        *dc = b * (vc - sc);
+    }
+
+    // ---- pass 3+4: S[r][c] += k[r]*d[c] と o[c] = Σ_r q[r]*S[r][c] ----
+    for v in o_head[..dv].iter_mut() {
+        *v = 0.0;
+    }
+    for (r, row) in s.chunks_exact_mut(dv).enumerate() {
+        let kr = kh_v[r];
+        let qr = qh[r];
+        if kr != 0.0 {
+            for (rc, &dc) in row.iter_mut().zip(d.iter()) {
+                *rc += kr * dc;
+            }
+        }
+        if qr != 0.0 {
+            for (oc, rc) in o_head[..dv].iter_mut().zip(row.iter()) {
+                *oc += qr * *rc;
             }
         }
     }
@@ -2094,7 +2649,14 @@ mod tests {
     fn real_case(
         nt: usize,
     ) -> (GdnWeights, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-        let p = GdnParams::qwen4exp();
+        case_for(&GdnParams::qwen4exp(), nt)
+    }
+
+    /// 任意のパラメータで投影済み入力一式を乱数で作る (`real_case` の一般形)。
+    fn case_for(
+        p: &GdnParams,
+        nt: usize,
+    ) -> (GdnWeights, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
         let mut rnd = lcg_rng(0x5eed_1234);
         let conv1d: Vec<f32> = (0..p.conv_dim() * p.d_conv).map(|_| rnd() * 0.4).collect();
         let w = GdnWeights {
@@ -2364,6 +2926,217 @@ mod tests {
                 );
             });
             println!("  group={group:<3} scan+gate{:8.1}", per_tok(tg));
+        }
+    }
+
+    /// decode 実形 (nt=1 × 36 層 = 1 トークンぶん) の A/B と区間内訳。
+    ///
+    /// `DENNO_GDN_KPROF` をテストから強制し、4 区間 (conv / l2 / scan / rms) を
+    /// 36 層積算で出す。壁時計は旧実装 (ref) と並列版 (par) を同一実行で比べる
+    /// (ホストは他セッションと共有なので、別実行の比較はしない)。
+    ///
+    /// 実行: cargo test --release -p denno-engine --lib --features cuda \
+    ///        -- --ignored --nocapture bench_gdn_decode
+    #[test]
+    #[ignore = "decode 実形 (nt=1) のマイクロベンチ。--ignored --nocapture で実行"]
+    fn bench_gdn_decode_layers() {
+        let _g = crate::prof::counters_guard();
+        let layers = 36usize;
+        let p = GdnParams::qwen4exp();
+        let (w, qkv, z, beta, alpha) = real_case(1);
+        let cw = core(&p, &w);
+
+        // 壁時計 (状態は 0 から始まり、1 回目以降は値が入った状態で回る。
+        // 時間は値に依存しない: 分岐は `if kr != 0.0` だけで q/k は L2 正規化後)。
+        let one_rep = |f: &dyn Fn(&mut GdnState) -> Vec<f32>| {
+            let mut st = GdnState::new(&p);
+            best_of(5, || {
+                for _ in 0..layers {
+                    let y = f(&mut st);
+                    std::hint::black_box(&y);
+                }
+            })
+        };
+        let total_ref = one_rep(&|st| {
+            forward_token_core_gate_ref(&p, &cw, &qkv, &z, &beta, &alpha, st, GateKind::Sigmoid)
+        });
+        let total_par = one_rep(&|st| {
+            forward_token_core_gate_par(&p, &cw, &qkv, &z, &beta, &alpha, st, GateKind::Sigmoid)
+        });
+
+        // 区間内訳 (計測 on で同じ 36 層)
+        kprof::set_on_for_test(Some(true));
+        kprof::reset();
+        let mut st2 = GdnState::new(&p);
+        for _ in 0..layers {
+            let y = forward_token_core_gate_par(
+                &p,
+                &cw,
+                &qkv,
+                &z,
+                &beta,
+                &alpha,
+                &mut st2,
+                GateKind::Sigmoid,
+            );
+            std::hint::black_box(&y);
+        }
+        let (calls, ns) = kprof::take();
+        let us_per_layer = |v: u64| v as f64 / 1e3 / layers as f64;
+        kprof::set_on_for_test(None);
+        kprof::reset();
+
+        println!(
+            "GDN decode 実形 (36 層, nv={}, dk={}, cd={})",
+            p.n_v_heads,
+            p.head_k_dim,
+            p.conv_dim()
+        );
+        println!(
+            "  旧 (ref)  {:8.3} ms/token ({:7.1} µs/層)  [壁時計]",
+            total_ref * 1e3,
+            total_ref * 1e6 / layers as f64
+        );
+        println!(
+            "  並列 (par){:8.3} ms/token ({:7.1} µs/層)  比 {:.2}x",
+            total_par * 1e3,
+            total_par * 1e6 / layers as f64,
+            total_ref / total_par
+        );
+        println!("  区間計測 (par) calls={calls} (36 層) [µs/層]");
+        for (i, name) in kprof::NAMES.iter().enumerate() {
+            println!(
+                "    {name:<5} {:8.1}  ({:.1}%)",
+                us_per_layer(ns[i]),
+                ns[i] as f64 / ns.iter().sum::<u64>().max(1) as f64 * 100.0
+            );
+        }
+        let sum: u64 = ns.iter().sum();
+        println!(
+            "    合計  {:8.1}  ({:.3} ms/token)",
+            us_per_layer(sum),
+            sum as f64 / 1e6
+        );
+    }
+
+    /// 区間計測のゲートが実際に通ることを示す (緑 = 配線が生きている証拠)。
+    ///
+    /// - 強制 off: 1 回呼んでも call 数も区間も増えない・表示行は出ない。
+    /// - 強制 on: 1 回呼ぶと call が 1 以上増え、4 区間すべて ns が増える。
+    ///
+    /// 他のテストが並列で `forward_token_core_gate` を呼ぶ可能性があるので、
+    /// 「増えないこと」は差分 0、「増えること」は差分 > 0 で見る (>= 比較)。
+    #[test]
+    fn kprof_gate_covers_four_phases() {
+        let _g = crate::prof::counters_guard();
+        let p = GdnParams::qwen4exp();
+        let (w, qkv, z, beta, alpha) = real_case(1);
+        let cw = core(&p, &w);
+        let mut st = GdnState::new(&p);
+
+        // ---- off: 何も積まない ----
+        kprof::set_on_for_test(Some(false));
+        kprof::reset();
+        let (c0, ns0) = kprof::take();
+        assert!(kprof::line().is_none(), "off なのに表示行が出た");
+        let y = forward_token_core_gate(
+            &p,
+            &cw,
+            &qkv,
+            &z,
+            &beta,
+            &alpha,
+            &mut st,
+            GateKind::Sigmoid,
+        );
+        assert_eq!(y.len(), p.value_dim());
+        let (c1, ns1) = kprof::take();
+        assert_eq!(c1, c0, "off なのに call を数えた");
+        assert_eq!(ns1, ns0, "off なのに区間を積んだ");
+
+        // ---- on: 4 区間すべてに ns が入る ----
+        kprof::set_on_for_test(Some(true));
+        kprof::reset();
+        let (c2, ns2) = kprof::take();
+        let _ = forward_token_core_gate(
+            &p,
+            &cw,
+            &qkv,
+            &z,
+            &beta,
+            &alpha,
+            &mut st,
+            GateKind::Sigmoid,
+        );
+        let (c3, ns3) = kprof::take();
+        kprof::set_on_for_test(None);
+        kprof::reset();
+        assert!(c3 >= c2 + 1, "on なのに call が増えない ({c2} -> {c3})");
+        for (i, name) in kprof::NAMES.iter().enumerate() {
+            assert!(ns3[i] > ns2[i], "区間 {i} ({name}) に ns が入らない");
+        }
+    }
+
+    /// 並列版 decode コアが旧実装と **f32 でビット一致**する。
+    ///
+    /// 実形 (nk=16 / nv=48 = 並列経路) と小型 (nk=1 / nv=2 = 直列経路) の両方を、
+    /// 非ゼロ初期状態から 3 トークン進めて比較する (状態そのものも `to_bits` で比較)。
+    /// 両方のゲート種別 (Silu / Sigmoid) を回す。
+    #[test]
+    fn par_core_matches_ref_bitexact() {
+        let _g = crate::prof::counters_guard();
+        let small = GdnParams {
+            n_embd: 8,
+            n_k_heads: 1,
+            n_v_heads: 2,
+            head_k_dim: 4,
+            head_v_dim: 4,
+            d_conv: 4,
+            eps: 1e-6,
+        };
+        for p in [GdnParams::qwen4exp(), small] {
+            let (w, qkv, z, beta, alpha) = case_for(&p, 1);
+            let cw = core(&p, &w);
+            for gate in [GateKind::Sigmoid, GateKind::Silu] {
+                // 非ゼロ初期状態 (conv のロールと scan の両方を通す)
+                let mut rnd = lcg_rng(0x0bad_c0de);
+                let mut st_ref = GdnState::new(&p);
+                for v in st_ref.conv.iter_mut() {
+                    *v = rnd();
+                }
+                for v in st_ref.ssm.iter_mut() {
+                    *v = rnd();
+                }
+                let mut st_par = GdnState {
+                    conv: st_ref.conv.clone(),
+                    ssm: st_ref.ssm.clone(),
+                };
+                for step in 0..3 {
+                    let ya = forward_token_core_gate_ref(
+                        &p, &cw, &qkv, &z, &beta, &alpha, &mut st_ref, gate,
+                    );
+                    let yb = forward_token_core_gate_par(
+                        &p, &cw, &qkv, &z, &beta, &alpha, &mut st_par, gate,
+                    );
+                    assert_eq!(
+                        bits(&ya),
+                        bits(&yb),
+                        "y がビット不一致 (dk={}, nv={}, step={step}, gate={gate:?})",
+                        p.head_k_dim,
+                        p.n_v_heads
+                    );
+                    assert_eq!(
+                        bits(&st_ref.ssm),
+                        bits(&st_par.ssm),
+                        "ssm 状態がビット不一致 (step={step})"
+                    );
+                    assert_eq!(
+                        bits(&st_ref.conv),
+                        bits(&st_par.conv),
+                        "conv 状態がビット不一致 (step={step})"
+                    );
+                }
+            }
         }
     }
 }
