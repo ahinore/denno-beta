@@ -1144,6 +1144,196 @@ unsafe fn gemm_iq<const KIND: u8>(
     }
 }
 
+/// `DENNO_GEMM_IQ_V2` (P83): prefill の IQ 系バッチ GEMM の実装選択。
+///
+/// - 既定 / `1` = IQ2_S / IQ3_XXS (256 要素ブロック) は dequant を 1 ブロック 1 回に
+///   まとめた新経路 ([`gemm_iq_v2`])。IQ4_NL / Q2_0 (32/64 要素) は従来カーネルのまま
+///   (bench83 実測: down 形では v2 が 0.57-0.94x しか出ない)。
+/// - `0` = 全型を従来の 4 トークン使い回し ([`gemm_iq`]) に戻す逃げ道
+///
+/// 判定はプロセスで 1 回だけ ([`std::sync::OnceLock`])。
+///
+/// テスト用: v2 カーネルが dispatcher から実際に発火した回数 (プロセス全体)。
+#[cfg(test)]
+static GEMM_IQ_V2_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// テスト用: v2 経路の発火を数える (off のビルドでは何もしない)。
+#[inline]
+fn gemm_iq_v2_fired() {
+    #[cfg(test)]
+    GEMM_IQ_V2_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn gemm_iq_v2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("DENNO_GEMM_IQ_V2")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("0") | Some("off") | Some("false")
+        )
+    })
+}
+
+/// IQ 系 4 型のバッチ GEMM (`m` トークン) — dequant を 1 ブロック 1 回にした版 (P83)。
+///
+/// 本番の dispatcher は IQ2_S / IQ3_XXS だけをここに振る ([`gemm_iq_v2_enabled`])。
+/// IQ4_NL / Q2_0 は [`gemm_iq`] のまま (下記の構成の弱点: ブロックが小さいと
+/// 累積のメモリ出し入れが FMA 1 回あたり 1 回に達する)。
+///
+/// [`gemm_iq`] は重みベクトル 1 本 (8 要素) を 4 トークン (TG) で使い回すが、
+/// `m > TG` のとき同じ 8 要素を `ceil(m / TG)` 回 dequant し直す。IQ2_S / IQ3_XXS
+/// は dequant が重い (格子表引き + 符号展開) ので、prefill ではこれが支配的になる。
+///
+/// この版は **ブロックごとに 1 回だけ dequant して f32 タイル (`nvec` 本の
+/// `__m256`、IQ2_S / IQ3_XXS で 256 要素 = 1 KB) を作り**、全トークンの FMA で
+/// 使い回す。タイルの値は [`iq_vec8`] と 1 ビットも違わない ([`iq_vec8_4`] は
+/// 4 グループをまとめて作るだけで値は同じ)。累積はトークンごとに「ブロック昇順 →
+/// ブロック内 `h` 昇順 → 偶奇 2 本」で [`gemm_iq`] と同じ順序、横加算も同じなので
+/// **出力はビット一致**する (m が TG の倍数でなくても同じ)。
+///
+/// 累積器はトークンあたり 2 本だが `m` 分はレジスタに収まらないのでメモリに置く
+/// ([`gemm_q8_0_avx2`] と同じ構成)。ブロック 1 回ごとに 4 トークンぶんを
+/// レジスタに引き取って `h` ループを回し、書き戻す。
+///
+/// `DENNO_GEMM_IQ_KPROF=1` のとき、[`crate::model::gemm_iq_kprof::SAMPLE_EVERY`]
+/// ブロックに 1 回 `rdtsc` でタイル生成 (dequant) と FMA を切り分けて積む
+/// (比率を見るためのもの。本体の分岐は 1 回だけで、off なら計測はゼロコスト)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemm_iq_v2<const KIND: u8>(
+    blocks: &[u8],
+    n_in: usize,
+    r0: usize,
+    r1: usize,
+    xs: &[f32],
+    m: usize,
+    out: *mut f32,
+    stride: usize,
+) {
+    use std::arch::x86_64::*;
+
+    const TG: usize = 4; // レジスタに置くトークン数 (累積 8 本 + タイル/活性で 10 本程度)
+    let prof = crate::model::gemm_iq_kprof::on();
+    let (blk, nvec) = iq_geom(KIND);
+    let ng = nvec / 4; // 1 ブロック内の 32 要素 (4 グループ) 単位の数
+    let nb = n_in / (nvec * 8);
+    let rb = nb * blk;
+    let bp = blocks.as_ptr();
+    let xp = xs.as_ptr();
+
+    // トークンごとの 8 レーン累積 2 本 (行をまたいで使い回す)。
+    let mut acc = vec![[_mm256_setzero_ps(); 2]; m];
+    // ブロック 1 個ぶんの重みタイル。`nvec` は型で固定 (最大 32 = IQ2_S / IQ3_XXS)。
+    let mut tile = [_mm256_setzero_ps(); 32];
+
+    for r in r0..r1 {
+        let row = bp.add(r * rb);
+        for a in acc.iter_mut() {
+            *a = [_mm256_setzero_ps(); 2];
+        }
+        for b in 0..nb {
+            let p = row.add(b * blk);
+            // rdtsc は 1 回 20-30 サイクルなので 8 ブロックに 1 回だけ取る
+            // (比率は偏らない。絶対値の歪みは 1 割程度に収まる)。
+            let sample = prof && b % crate::model::gemm_iq_kprof::SAMPLE_EVERY == 0;
+            let td0 = if sample { _rdtsc() } else { 0 };
+            for g in 0..ng {
+                let vs = iq_vec8_4::<KIND>(p, g);
+                tile[g * 4] = vs[0];
+                tile[g * 4 + 1] = vs[1];
+                tile[g * 4 + 2] = vs[2];
+                tile[g * 4 + 3] = vs[3];
+            }
+            let td1 = if sample { _rdtsc() } else { 0 };
+            let xbb = xp.add(b * nvec * 8);
+            // 満杯グループ (TG=4)。g のループは定数回なので完全展開され、
+            // 累積 8 本はレジスタに乗る (動的な tg のままだと実測 2 倍遅い)。
+            let mut t = 0usize;
+            while t + TG <= m {
+                let mut a0 = [_mm256_setzero_ps(); TG];
+                let mut a1 = [_mm256_setzero_ps(); TG];
+                a0[0] = acc[t][0];
+                a1[0] = acc[t][1];
+                a0[1] = acc[t + 1][0];
+                a1[1] = acc[t + 1][1];
+                a0[2] = acc[t + 2][0];
+                a1[2] = acc[t + 2][1];
+                a0[3] = acc[t + 3][0];
+                a1[3] = acc[t + 3][1];
+                for h in 0..nvec {
+                    let v = tile[h];
+                    let x0 = xbb.add(t * n_in + h * 8);
+                    if h % 2 == 0 {
+                        a0[0] = _mm256_fmadd_ps(v, _mm256_loadu_ps(x0), a0[0]);
+                        a0[1] = _mm256_fmadd_ps(v, _mm256_loadu_ps(x0.add(n_in)), a0[1]);
+                        a0[2] = _mm256_fmadd_ps(v, _mm256_loadu_ps(x0.add(2 * n_in)), a0[2]);
+                        a0[3] = _mm256_fmadd_ps(v, _mm256_loadu_ps(x0.add(3 * n_in)), a0[3]);
+                    } else {
+                        a1[0] = _mm256_fmadd_ps(v, _mm256_loadu_ps(x0), a1[0]);
+                        a1[1] = _mm256_fmadd_ps(v, _mm256_loadu_ps(x0.add(n_in)), a1[1]);
+                        a1[2] = _mm256_fmadd_ps(v, _mm256_loadu_ps(x0.add(2 * n_in)), a1[2]);
+                        a1[3] = _mm256_fmadd_ps(v, _mm256_loadu_ps(x0.add(3 * n_in)), a1[3]);
+                    }
+                }
+                acc[t][0] = a0[0];
+                acc[t][1] = a1[0];
+                acc[t + 1][0] = a0[1];
+                acc[t + 1][1] = a1[1];
+                acc[t + 2][0] = a0[2];
+                acc[t + 2][1] = a1[2];
+                acc[t + 3][0] = a0[3];
+                acc[t + 3][1] = a1[3];
+                t += TG;
+            }
+            // 端数 (m が TG の倍数でないときの残り 1..3 トークン)。
+            // ここは動的 tg のまま (全体の FMA に占める割合は m/TG 分の 1 以下)。
+            if t < m {
+                let tg = m - t;
+                let mut a0 = [_mm256_setzero_ps(); TG];
+                let mut a1 = [_mm256_setzero_ps(); TG];
+                for g in 0..tg {
+                    a0[g] = acc[t + g][0];
+                    a1[g] = acc[t + g][1];
+                }
+                for h in 0..nvec {
+                    let v = tile[h];
+                    let e = h % 2;
+                    for g in 0..tg {
+                        let xr = xbb.add((t + g) * n_in + h * 8);
+                        if e == 0 {
+                            a0[g] = _mm256_fmadd_ps(v, _mm256_loadu_ps(xr), a0[g]);
+                        } else {
+                            a1[g] = _mm256_fmadd_ps(v, _mm256_loadu_ps(xr), a1[g]);
+                        }
+                    }
+                }
+                for g in 0..tg {
+                    acc[t + g][0] = a0[g];
+                    acc[t + g][1] = a1[g];
+                }
+            }
+            if sample {
+                let td2 = _rdtsc();
+                crate::model::gemm_iq_kprof::add_deq(td1.wrapping_sub(td0));
+                crate::model::gemm_iq_kprof::add_fma(td2.wrapping_sub(td1));
+            }
+        }
+        for g in 0..m {
+            let s = _mm256_add_ps(acc[g][0], acc[g][1]);
+            let hh = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+            let hh = _mm_add_ps(hh, _mm_movehl_ps(hh, hh));
+            let hh = _mm_add_ss(hh, _mm_shuffle_ps(hh, hh, 0x55));
+            *out.add(g * stride + (r - r0)) = _mm_cvtss_f32(hh);
+        }
+    }
+}
+
 /// Q5_1 (24 バイトブロック = 32 要素) の AVX2+FMA 融合カーネル。
 ///
 /// ブロックは `d: f16` + `m: f16` + `qh: u32` (5 ビット目) + `qs: [u8; 16]`
@@ -1889,13 +2079,44 @@ pub(crate) fn gemm_rows(
         if fused && iq_kind(ty).is_some() && q4k_fused_supported() {
             // SAFETY: 既存カーネルと同じ規約 (`blocks` は全行、`out` は行 r0 の位置).
             gemm_fused_fired();
-            unsafe {
-                match iq_kind(ty) {
-                    Some(0) => gemm_iq::<0>(blocks, n_in, r0, r1, xs, m, out, stride),
-                    Some(1) => gemm_iq::<1>(blocks, n_in, r0, r1, xs, m, out, stride),
-                    Some(2) => gemm_iq::<2>(blocks, n_in, r0, r1, xs, m, out, stride),
-                    _ => gemm_iq::<3>(blocks, n_in, r0, r1, xs, m, out, stride),
-                }
+            // P83: 既定は dequant を 1 ブロック 1 回にまとめた v2 ([`gemm_iq_v2`])。
+            // `DENNO_GEMM_IQ_V2=0` で全部従来カーネル (4 トークン使い回し) に戻す。
+            //
+            // v2 を使い回すのは IQ2_S / IQ3_XXS (256 要素ブロック、dequant が重い) だけ。
+            // IQ4_NL / Q2_0 (32/64 要素) は dequant が軽く、v2 の「ブロックごとに累積を
+            // メモリへ出し入れする」構成が負ける (bench83 実測: down 形 k=640 n=2560 の
+            // m>=64 で v2 は v1 の 0.58-0.80x)。Swift-1.5 の down はこの 2 型なので
+            // 従来カーネルのままにする。
+            let v2 = gemm_iq_v2_enabled();
+            let v2_used = v2 && matches!(iq_kind(ty), Some(2) | Some(3));
+            if v2_used {
+                gemm_iq_v2_fired();
+            }
+            type GemmIQ = unsafe fn(&[u8], usize, usize, usize, &[f32], usize, *mut f32, usize);
+            let kern: GemmIQ = match (iq_kind(ty), v2_used) {
+                (Some(0), _) => gemm_iq::<0>,
+                (Some(1), _) => gemm_iq::<1>,
+                (Some(2), true) => gemm_iq_v2::<2>,
+                (Some(2), false) => gemm_iq::<2>,
+                (_, true) => gemm_iq_v2::<3>,
+                (_, false) => gemm_iq::<3>,
+            };
+            // P83: `DENNO_GEMM_IQ_KPROF=1` のときだけ 1 呼び出しずつ積む
+            // (off では分岐 1 回だけ。呼び出しは ms 単位なので Instant も無視できる)。
+            if crate::model::gemm_iq_kprof::on() {
+                let t = std::time::Instant::now();
+                // SAFETY: 上と同じ規約。
+                unsafe { kern(blocks, n_in, r0, r1, xs, m, out, stride) };
+                crate::model::gemm_iq_kprof::record(
+                    v2_used,
+                    (r1 - r0) * rb,
+                    m * n_in * (r1 - r0),
+                    m,
+                    t.elapsed().as_nanos() as u64,
+                );
+            } else {
+                // SAFETY: 上と同じ規約。
+                unsafe { kern(blocks, n_in, r0, r1, xs, m, out, stride) };
             }
             return;
         }
@@ -6936,6 +7157,310 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// IQ 系のバッチ GEMM v2 (dequant 1 ブロック 1 回) が v1 (4 トークン使い回し) と
+    /// **ビット一致**すること。累積順 (ブロック昇順 → ブロック内 h 昇順 → 偶奇 2 本)
+    /// と横加算は同じで、タイルの値も `iq_vec8` と同じだから、m が TG の倍数で
+    /// なくても 1 ビットも違わないはず (P83)。
+    #[test]
+    fn gemm_iq_v2_matches_v1_bitwise() {
+        if !q4k_fused_supported() {
+            return;
+        }
+        // gate/up 形 (k=2560) は 4 型全部、down 形 (k=640) はブロックが 32/64 要素の
+        // IQ4_NL / Q2_0 だけ (IQ2_S / IQ3_XXS は 256 要素ブロックなので 640 を割れない)。
+        let shapes: [(GgmlType, usize, usize); 6] = [
+            (GgmlType::IQ4Nl, 2560, 24),
+            (GgmlType::Q2_0, 2560, 24),
+            (GgmlType::IQ2S, 2560, 24),
+            (GgmlType::IQ3Xxs, 2560, 24),
+            (GgmlType::IQ4Nl, 640, 16),
+            (GgmlType::Q2_0, 640, 16),
+        ];
+        for (ty, n_in, n_out) in shapes {
+            let blk = ty.blck_size();
+            let ts = ty.type_size();
+            let nb = n_in / blk;
+            let rb = nb * ts;
+            let mut blocks = vec![0u8; rb * n_out];
+            for r in 0..n_out {
+                for b in 0..nb {
+                    let p = &mut blocks[r * rb + b * ts..r * rb + (b + 1) * ts];
+                    let d = half::f16::from_f32(0.013 + 0.002 * b as f32);
+                    p[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+                    for j in 2..ts {
+                        p[j] = pat(j, (r * 131 + b * 17) as u32 + 3);
+                    }
+                }
+            }
+            for m in [1usize, 7, 8, 64] {
+                let xs = make_xs(m, n_in);
+                let mut v1 = vec![0f32; m * n_out];
+                let mut v2 = vec![0f32; m * n_out];
+                unsafe {
+                    match ty {
+                        GgmlType::IQ4Nl => {
+                            gemm_iq::<0>(&blocks, n_in, 0, n_out, &xs, m, v1.as_mut_ptr(), n_out);
+                            gemm_iq_v2::<0>(&blocks, n_in, 0, n_out, &xs, m, v2.as_mut_ptr(), n_out);
+                        }
+                        GgmlType::Q2_0 => {
+                            gemm_iq::<1>(&blocks, n_in, 0, n_out, &xs, m, v1.as_mut_ptr(), n_out);
+                            gemm_iq_v2::<1>(&blocks, n_in, 0, n_out, &xs, m, v2.as_mut_ptr(), n_out);
+                        }
+                        GgmlType::IQ2S => {
+                            gemm_iq::<2>(&blocks, n_in, 0, n_out, &xs, m, v1.as_mut_ptr(), n_out);
+                            gemm_iq_v2::<2>(&blocks, n_in, 0, n_out, &xs, m, v2.as_mut_ptr(), n_out);
+                        }
+                        _ => {
+                            gemm_iq::<3>(&blocks, n_in, 0, n_out, &xs, m, v1.as_mut_ptr(), n_out);
+                            gemm_iq_v2::<3>(&blocks, n_in, 0, n_out, &xs, m, v2.as_mut_ptr(), n_out);
+                        }
+                    }
+                }
+                for i in 0..m * n_out {
+                    assert_eq!(
+                        v1[i].to_bits(),
+                        v2[i].to_bits(),
+                        "{ty:?} n_in={n_in} m={m} 要素 {i}: v1 {} vs v2 {}",
+                        v1[i],
+                        v2[i]
+                    );
+                }
+            }
+        }
+    }
+
+    /// dispatcher が型と env ゲートに従って v2 / v1 を振り分けていること。
+    /// 出力はどちらもビット一致なので、カウンタで分岐の通過を見る。
+    /// (`DENNO_GEMM_IQ_V2=0` で動かすと v2 の発火は 0 になる = 逃げ道の確認になる。)
+    #[test]
+    fn gemm_iq_v2_gate_routes_by_kind() {
+        if !q4k_fused_supported() {
+            return;
+        }
+        let want_v2 = gemm_iq_v2_enabled();
+        let (n_in, n_out, m) = (256usize, 5usize, 3usize);
+        for ty in [GgmlType::IQ2S, GgmlType::IQ4Nl] {
+            let ts = ty.type_size();
+            let rb = (n_in / ty.blck_size()) * ts;
+            let mut blocks = vec![0u8; rb * n_out];
+            for r in 0..n_out {
+                let p = &mut blocks[r * rb..(r + 1) * rb];
+                let d = half::f16::from_f32(0.013);
+                p[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+                for j in 2..ts {
+                    p[j] = pat(j, r as u32 + 3);
+                }
+            }
+            let xs = make_xs(m, n_in);
+            let mut out = vec![0f32; m * n_out];
+            let before = GEMM_IQ_V2_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            expert_gemm_any(ty, &blocks, n_in, n_out, &xs, m, &mut out).unwrap();
+            let fired = GEMM_IQ_V2_CALLS.load(std::sync::atomic::Ordering::Relaxed) - before;
+            let expect = usize::from(want_v2 && ty == GgmlType::IQ2S);
+            assert_eq!(fired, expect, "{ty:?}: v2 発火回数が期待と違う (v2_enabled={want_v2})");
+        }
+    }
+
+    /// gemm_iq_kprof の 1 行形式 (`DENNO_GEMM_IQ_KPROF=1` 相当をテストから強制)。
+    ///
+    /// 後半は `gemm_rows` の IQ 分岐から `record()` まで通す (v2 カーネルの rdtsc
+    /// サンプリングも発火する。m=3 は端数 = トークン 3 個の tail 経路)。
+    #[test]
+    fn gemm_iq_kprof_line_format() {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = L.lock().unwrap_or_else(|e| e.into_inner());
+        if !q4k_fused_supported() {
+            return;
+        }
+        crate::model::gemm_iq_kprof::set_for_test(true);
+        crate::model::gemm_iq_kprof::reset();
+        // 行チャンクタスク 2 回ぶんの実測を積む (m はビン 5 と 6)。
+        crate::model::gemm_iq_kprof::record(true, 640 * 820, 60 * 2560 * 640, 60, 1_500_000);
+        crate::model::gemm_iq_kprof::record(true, 640 * 820, 100 * 2560 * 640, 100, 2_500_000);
+        crate::model::gemm_iq_kprof::add_deq(1_000);
+        crate::model::gemm_iq_kprof::add_fma(3_000);
+        let line = crate::model::gemm_iq_kprof::line().expect("kprof line");
+        assert!(line.starts_with("[giq-kprof] calls=2 v2=2"), "{line}");
+        assert!(line.contains("33-64:1") && line.contains("65-128:1"), "{line}");
+        assert!(line.contains("dequant") && line.contains("fma"), "{line}");
+        assert!(line.contains("m mean=80.0 max=100"), "{line}");
+        crate::model::gemm_iq_kprof::reset();
+
+        // gemm_rows 経路 (IQ2S は既定で v2 に振る)。n_out=5 < PAR_MIN_ROWS なので
+        // 行チャンクは 1 個 = record は 1 呼び出しずつ。
+        let (n_in, n_out, m) = (256usize, 5usize, 3usize);
+        let ts = GgmlType::IQ2S.type_size();
+        let mut blocks = vec![0u8; ts * n_out];
+        for r in 0..n_out {
+            let p = &mut blocks[r * ts..(r + 1) * ts];
+            let d = half::f16::from_f32(0.013);
+            p[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+            for j in 2..ts {
+                p[j] = pat(j, r as u32 + 3);
+            }
+        }
+        let xs = make_xs(m, n_in);
+        let mut out = vec![0f32; m * n_out];
+        expert_gemm_any(GgmlType::IQ2S, &blocks, n_in, n_out, &xs, m, &mut out).unwrap();
+        let line = crate::model::gemm_iq_kprof::line().expect("kprof line (gemm_rows)");
+        assert!(line.starts_with("[giq-kprof] calls=1 v2=1"), "{line}");
+        assert!(line.contains("2-4:1"), "{line}");
+        assert!(line.contains("dequant") && line.contains("fma"), "{line}");
+        crate::model::gemm_iq_kprof::reset();
+        crate::model::gemm_iq_kprof::set_for_test(false);
+        assert!(crate::model::gemm_iq_kprof::line().is_none());
+    }
+
+    /// P83 マイクロベンチ: gemm_iq v1 (dequant を 4 トークンで使い回す) と v2
+    /// (1 ブロック 1 回 dequant して m トークンに使い回す) を**同一バイナリ内で
+    /// 交互に**測り、rep の最小を出す (ホスト共有の負荷変動で別バイナリ比較は
+    /// ±35% 動くため)。実行:
+    /// `cargo test --release -p denno-engine --lib -- --ignored --nocapture bench_gemm_iq_m_reuse`
+    #[test]
+    #[ignore = "マイクロベンチ (IQ2_S/IQ3_XXS k=2560 n=640, IQ4_NL/Q2_0 k=640 n=2560)"]
+    fn bench_gemm_iq_m_reuse() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        if !q4k_fused_supported() {
+            eprintln!("skip bench_gemm_iq_m_reuse: AVX2/FMA が無い");
+            return;
+        }
+        const REPS: usize = 7;
+        const WARM: usize = 3;
+        let shapes: [(GgmlType, usize, usize); 4] = [
+            (GgmlType::IQ2S, 2560, 640),
+            (GgmlType::IQ3Xxs, 2560, 640),
+            (GgmlType::IQ4Nl, 640, 2560),
+            (GgmlType::Q2_0, 640, 2560),
+        ];
+        type Kernel = unsafe fn(&[u8], usize, usize, usize, &[f32], usize, *mut f32, usize);
+        for (ty, n_in, n_out) in shapes {
+            let blk = ty.blck_size();
+            let ts = ty.type_size();
+            let nb = n_in / blk;
+            let rb = nb * ts;
+            let (v1, v2): (Kernel, Kernel) = match ty {
+                GgmlType::IQ4Nl => (gemm_iq::<0>, gemm_iq_v2::<0>),
+                GgmlType::Q2_0 => (gemm_iq::<1>, gemm_iq_v2::<1>),
+                GgmlType::IQ2S => (gemm_iq::<2>, gemm_iq_v2::<2>),
+                _ => (gemm_iq::<3>, gemm_iq_v2::<3>),
+            };
+            let mut blocks = vec![0u8; rb * n_out];
+            for r in 0..n_out {
+                for b in 0..nb {
+                    let p = &mut blocks[r * rb + b * ts..r * rb + (b + 1) * ts];
+                    let d = half::f16::from_f32(0.013 + 0.002 * b as f32);
+                    p[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+                    for j in 2..ts {
+                        p[j] = pat(j, (r * 131 + b * 17) as u32 + 3);
+                    }
+                }
+            }
+            for m in [1usize, 4, 8, 32, 64, 128] {
+                let xs = make_xs(m, n_in);
+                let mut out = vec![0f32; m * n_out];
+                let iters = (600 / m).clamp(4, 75);
+                for _ in 0..WARM {
+                    unsafe { v1(&blocks, n_in, 0, n_out, &xs, m, out.as_mut_ptr(), n_out) };
+                    unsafe { v2(&blocks, n_in, 0, n_out, &xs, m, out.as_mut_ptr(), n_out) };
+                }
+                let mut best = [f64::INFINITY; 2];
+                for rep in 0..REPS {
+                    // 交互に測る (v1 -> v2 -> v1 -> ...)。
+                    for (ki, k) in [v1, v2].into_iter().enumerate() {
+                        let t0 = Instant::now();
+                        for _ in 0..iters {
+                            unsafe {
+                                k(black_box(&blocks), n_in, 0, n_out, black_box(&xs), m, out.as_mut_ptr(), n_out)
+                            };
+                        }
+                        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                        if rep == 0 || us < best[ki] {
+                            best[ki] = best[ki].min(us);
+                        }
+                    }
+                }
+                let macs = (m * n_in * n_out) as f64;
+                eprintln!(
+                    "[bench83] {ty:?} k={n_in} n={n_out} m={m:<3} v1 {:7.1} GMAC/s | v2 {:7.1} GMAC/s | x{:.2} (us/回 v1 {:.0} v2 {:.0})",
+                    macs / (best[0] * 1e-6) / 1e9,
+                    macs / (best[1] * 1e-6) / 1e9,
+                    best[0] / best[1],
+                    best[0],
+                    best[1]
+                );
+                black_box(&out);
+            }
+        }
+
+        // dequant 単体: 1 行分のタイル生成 (nb ブロック × nvec ベクトル) を回す。
+        // 「1 dequant (8 要素) あたり何 ns か」と「m 倍の再利用でどれだけ消えるか」の
+        // 分母になる値。ブロックの生バイトをそのまま測る (d が有限になる先頭だけ固定)。
+        for (ty, kind, n_in) in [
+            (GgmlType::IQ2S, 2usize, 2560usize),
+            (GgmlType::IQ3Xxs, 3, 2560),
+            (GgmlType::IQ4Nl, 0, 640),
+            (GgmlType::Q2_0, 1, 640),
+        ] {
+            let ts = ty.type_size();
+            let nb = n_in / ty.blck_size();
+            let mut row = vec![0u8; nb * ts];
+            for b in 0..nb {
+                let p = &mut row[b * ts..(b + 1) * ts];
+                let d = half::f16::from_f32(0.013);
+                p[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+                for j in 2..ts {
+                    p[j] = pat(j, (b * 17) as u32 + 3);
+                }
+            }
+            let (_, nvec) = iq_geom(kind as u8);
+            let ng = nvec / 4;
+            let p = row.as_ptr();
+            let iters = 2000usize;
+            // ウォームアップ (キャッシュ + 分岐予測)
+            let mut acc = 0f32;
+            for _ in 0..20 {
+                for b in 0..nb {
+                    for g in 0..ng {
+                        let vs = unsafe { iq_vec8_4_kind(kind, p.add(b * ts), g) };
+                        acc += unsafe { std::arch::x86_64::_mm_cvtss_f32(std::arch::x86_64::_mm256_castps256_ps128(vs[0])) };
+                    }
+                }
+            }
+            black_box(acc);
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                for b in 0..nb {
+                    for g in 0..ng {
+                        let vs = unsafe { iq_vec8_4_kind(kind, p.add(b * ts), g) };
+                        acc += unsafe { std::arch::x86_64::_mm_cvtss_f32(std::arch::x86_64::_mm256_castps256_ps128(vs[0])) };
+                    }
+                }
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            black_box(acc);
+            let per = dt * 1e9 / (iters * nb * nvec) as f64;
+            eprintln!(
+                "[bench83] dequant {ty:?} 1 ベクトル (8 要素) {:.1} ns (1 行 {:.1} us, {} ベクトル/行)",
+                per,
+                dt * 1e6 / iters as f64,
+                nb * nvec
+            );
+        }
+    }
+
+    /// `iq_vec8_4` の KIND を動的に選ぶラッパ (ベンチ専用。本体は使わない)。
+    #[cfg(test)]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn iq_vec8_4_kind(kind: usize, p: *const u8, g: usize) -> [std::arch::x86_64::__m256; 4] {
+        match kind {
+            0 => iq_vec8_4::<0>(p, g),
+            1 => iq_vec8_4::<1>(p, g),
+            2 => iq_vec8_4::<2>(p, g),
+            _ => iq_vec8_4::<3>(p, g),
         }
     }
 }
