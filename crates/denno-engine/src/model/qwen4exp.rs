@@ -5846,8 +5846,8 @@ fn gemv_rows_batch(
         // カーネルが違うので、ここを取り違えると 1 ulp ずれる ([`GemvKernel`]):
         //   Q8_0 + `fast_q8` → `expert_gemv_q8_fast` (AVX2+FMA 融合)
         //   Q8_0 (`fast_q8` 無し) / Q5_1 → `expert_gemv` のスカラー経路
-        //   Q4_K → `expert_gemv` (AVX2+FMA があれば融合、無ければスカラー)
-        //   Q5_K → `expert_gemv` (常にスカラー)
+        //   Q4_K / Q5_K → `expert_gemv` (AVX2+FMA があれば融合、無ければスカラー。
+        //   Q5_K は P93 の融合カーネルで、`DENNO_Q5K_FAST=0` でスカラーに戻る)
         // どちらのバッチ経路も「重みのブロックを 1 回だけデコードし、その場で
         // 全トークンへ配る」ので、重みのバイト列は 1 チャンクあたり 1 回しか読まない。
         // トークンごとの累積順は 1 行版と同一 = ビット一致。
