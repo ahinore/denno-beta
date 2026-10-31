@@ -158,6 +158,8 @@ impl SsmLayer {
         if prof {
             crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_QKV, t);
         }
+        // task 87: 経路内訳 (GPU intercept か CPU か)。off なら分岐 1 回。
+        crate::model::qwen4exp::attn_kprof::note_qkv(t);
         let t = std::time::Instant::now();
 
         // task 72: beta と alpha も同じ入力なので 1 本にまとめる (どちらも F32)。
@@ -169,6 +171,7 @@ impl SsmLayer {
         if prof {
             crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_GATE, t);
         }
+        crate::model::qwen4exp::attn_kprof::note_gate(t);
         let t = std::time::Instant::now();
 
         // 診断ダンプ (DENNO_DEBUG_GDN_DUMP_LAYER) のゲートに層番号を渡す。
@@ -202,6 +205,7 @@ impl SsmLayer {
         if prof {
             crate::model::qwen4exp::q4prof::add(&crate::model::qwen4exp::q4prof::A_OUT, t);
         }
+        crate::model::qwen4exp::attn_kprof::note_out(t);
         Ok(out)
     }
 
@@ -848,5 +852,29 @@ mod tests {
         }
         assert_eq!(bits(&fused.state.ssm), bits(&sep.state.ssm), "ssm 状態");
         assert_eq!(bits(&fused.state.conv), bits(&sep.state.conv), "conv 状態");
+    }
+
+    /// task 87: decode (`forward_token`) が attn_kprof の 3 区間を実際に積むことの
+    /// 証拠。calls がトークン数ぶん増え、line() に 3 区間とも現れる。
+    /// 合成層は F32 の投影なので GPU intercept の対象外。gpu 発数は cuda ビルドで
+    /// 直前の線形呼び出しの実行先を数えるだけ (ここでは GPU を回さない) ので
+    /// assert しない。終わりに必ず FORCE を戻す。
+    #[test]
+    fn ssm_decode_fills_attn_kprof_slots() {
+        crate::model::qwen4exp::attn_kprof::set_for_test(true);
+        crate::model::qwen4exp::attn_kprof::reset();
+        let (mut layer, _p) = small_layer();
+        for _ in 0..3 {
+            let cur: Vec<f32> = (0..layer.p.n_embd)
+                .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
+                .collect();
+            let _ = layer.forward_token(&cur).expect("forward_token");
+        }
+        let line = crate::model::qwen4exp::attn_kprof::line().expect("強制 on なのに line() が None");
+        assert!(line.contains("qkv calls=3"), "qkv が積まれていない: {line}");
+        assert!(line.contains("gate calls=3"), "gate が積まれていない: {line}");
+        assert!(line.contains("out calls=3"), "out が積まれていない: {line}");
+        crate::model::qwen4exp::attn_kprof::reset();
+        crate::model::qwen4exp::attn_kprof::set_for_test(false);
     }
 }

@@ -4590,7 +4590,7 @@ pub fn last_linear_ran_on_gpu() -> bool {
 
 #[cfg(feature = "cuda")]
 #[inline]
-fn set_last_linear_ran_on_gpu(v: bool) {
+pub(crate) fn set_last_linear_ran_on_gpu(v: bool) {
     LINEAR_RAN_ON_GPU.with(|c| c.set(v));
     // s61: 開いている区間 (Probe) があれば OR で集積する (計測のみ)
     if v {

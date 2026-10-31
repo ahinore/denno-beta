@@ -255,6 +255,13 @@ fn prof_flash_q4(tag: &str, tok: usize) {
         eprintln!("{line}");
         denno_engine::model::qwen4exp::mix_kprof::reset();
     }
+    // task 87: decode の ssm 層 attention 投影 (qkv / gate / out GEMV) の経路内訳
+    // (`DENNO_ATTN_KPROF=1` のときだけ 1 行)。GPU intercept を通った発数 / CPU へ
+    // 落ちた発数が読める (`mix_kprof` と同じく q4prof とは独立に出す)。
+    if let Some(line) = denno_engine::model::qwen4exp::attn_kprof::line() {
+        eprintln!("{line}");
+        denno_engine::model::qwen4exp::attn_kprof::reset();
+    }
     // expert GEMV の区間内訳 (`DENNO_EXP_KPROF=1` のときだけ 1 行 × 行列数)。
     if let Some(line) = denno_engine::model::exp_kprof::line() {
         eprintln!("{line}");

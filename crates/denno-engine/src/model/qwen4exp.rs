@@ -3992,6 +3992,148 @@ pub mod mix_kprof {
     }
 }
 
+/// task 87: decode の ssm 層 attention 投影 (qkv / gate / out GEMV) の経路内訳
+/// 1 行カウンタ。`DENNO_ATTN_KPROF=1` のときだけ積む (既定 off は分岐 1 回・
+/// `Instant` も追加で取らない — 呼び出し側が既存の q4prof 用に作った `Instant`
+/// をそのまま渡す)。
+///
+/// 実測 (`[q4prof] ... attn qkv=616.4 gate=118.3 gdn=288.7 out=362.9 full=0.0`,
+/// 8096, 1116 in / 48 out) の qkv / gate / out は
+/// [`crate::model::qwen4exp_ssm::SsmLayer::forward_token`] の 3 区間の合計
+/// (ssm 層 36 × decode トークン数) で、1 呼び出し = qkv+z 連結 GEMV 1 発 /
+/// beta+alpha 連結 GEMV 1 発 / ssm_out GEMV 1 発。区間内は GEMV 1 発のみなので、
+/// GEMV 直後に [`crate::cuda::last_linear_ran_on_gpu`] を読めば
+/// **その 1 発の実行先** (GPU intercept か CPU) が取る (GPU 経路は同期 GEMV =
+/// 帰ってきた時点で計算済み)。cuda feature 無しのビルドでは常に CPU 扱い。
+///
+/// full 層 12 本の投影は q4prof にも未計上 (`A_FULL` は decode で積まない) なので、
+/// ここにも積まない — 内訳の合計が実測行と一致することを保つ。
+///
+/// 出力は `serve_flash::prof_flash_q4` が prefill / decode の区切りで 1 行出して
+/// [`reset`] する (`mix_kprof` と同じ規約・`DENNO_Q4_PROFILE` とは独立に
+/// `DENNO_ATTN_KPROF=1` だけで読める)。
+///
+/// ```text
+/// [attn-kprof] qkv calls=1728 ms=616.4 gpu=1728 (100.0%) | gate calls=1728 ms=118.3 gpu=0 (0.0%) | out calls=1728 ms=362.9 gpu=1728 (100.0%)
+/// ```
+pub mod attn_kprof {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    static QKV_CALLS: AtomicU64 = AtomicU64::new(0);
+    static QKV_NS: AtomicU64 = AtomicU64::new(0);
+    static QKV_GPU: AtomicU64 = AtomicU64::new(0);
+    static GATE_CALLS: AtomicU64 = AtomicU64::new(0);
+    static GATE_NS: AtomicU64 = AtomicU64::new(0);
+    static GATE_GPU: AtomicU64 = AtomicU64::new(0);
+    static OUT_CALLS: AtomicU64 = AtomicU64::new(0);
+    static OUT_NS: AtomicU64 = AtomicU64::new(0);
+    static OUT_GPU: AtomicU64 = AtomicU64::new(0);
+
+    fn on() -> bool {
+        #[cfg(test)]
+        if FORCE.load(Ordering::Relaxed) {
+            return true;
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DENNO_ATTN_KPROF").is_some())
+    }
+
+    /// テストが env を立てずに区間計測を通すための強制フラグ
+    /// (env は OnceLock なのでプロセス内で 1 回しか読めない)。
+    #[cfg(test)]
+    static FORCE: AtomicBool = AtomicBool::new(false);
+
+    /// 区間計測をテストから強制する (`false` で env の解釈に戻す)。
+    #[cfg(test)]
+    pub fn set_for_test(v: bool) {
+        FORCE.store(v, Ordering::Relaxed);
+    }
+
+    /// 直前の GEMV が GPU で走りきったか (cuda feature 無しのビルドは常に false)。
+    #[cfg(feature = "cuda")]
+    fn ran_on_gpu() -> bool {
+        crate::cuda::last_linear_ran_on_gpu()
+    }
+    #[cfg(not(feature = "cuda"))]
+    fn ran_on_gpu() -> bool {
+        false
+    }
+
+    /// GEMV 1 発ぶんを積む。`t` は呼び出し直前に取った `Instant` (q4prof と共有)。
+    #[inline]
+    fn note(t: std::time::Instant, calls: &AtomicU64, ns: &AtomicU64, gpu: &AtomicU64) {
+        if !on() {
+            return;
+        }
+        calls.fetch_add(1, Ordering::Relaxed);
+        ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if ran_on_gpu() {
+            gpu.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// qkv+z 連結 GEMV (`attn_qkv` + `attn_gate`) 1 発。
+    #[inline]
+    pub fn note_qkv(t: std::time::Instant) {
+        note(t, &QKV_CALLS, &QKV_NS, &QKV_GPU);
+    }
+    /// beta+alpha 連結 GEMV (`ssm_beta` + `ssm_alpha`) 1 発。
+    #[inline]
+    pub fn note_gate(t: std::time::Instant) {
+        note(t, &GATE_CALLS, &GATE_NS, &GATE_GPU);
+    }
+    /// ssm_out GEMV 1 発。
+    #[inline]
+    pub fn note_out(t: std::time::Instant) {
+        note(t, &OUT_CALLS, &OUT_NS, &OUT_GPU);
+    }
+
+    fn slot(calls: &AtomicU64, ns: &AtomicU64, gpu: &AtomicU64, name: &str, s: &mut String) {
+        let c = calls.load(Ordering::Relaxed);
+        let n = ns.load(Ordering::Relaxed);
+        let g = gpu.load(Ordering::Relaxed);
+        let pct = if c == 0 {
+            0.0
+        } else {
+            g as f64 * 100.0 / c as f64
+        };
+        s.push_str(&format!(
+            " | {name} calls={c} ms={:.1} gpu={g} ({pct:.1}%)",
+            n as f64 / 1e6
+        ));
+    }
+
+    /// 内訳 1 行。無効時は `None` (出力ゼロ)。
+    pub fn line() -> Option<String> {
+        if !on() {
+            return None;
+        }
+        let mut s = String::from("[attn-kprof]");
+        slot(&QKV_CALLS, &QKV_NS, &QKV_GPU, "qkv", &mut s);
+        slot(&GATE_CALLS, &GATE_NS, &GATE_GPU, "gate", &mut s);
+        slot(&OUT_CALLS, &OUT_NS, &OUT_GPU, "out", &mut s);
+        Some(s)
+    }
+
+    /// 累積を 0 に戻す。
+    pub fn reset() {
+        for c in [
+            &QKV_CALLS,
+            &QKV_NS,
+            &QKV_GPU,
+            &GATE_CALLS,
+            &GATE_NS,
+            &GATE_GPU,
+            &OUT_CALLS,
+            &OUT_NS,
+            &OUT_GPU,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// output head (`lm_head`) の**層の外**の内訳 (`DENNO_HEAD_PROF=1`、既定 off)。
 ///
 /// [`q4prof`] の層合計は層の中しか積まないので、decode で 1 トークンあたり 1 回だけ
@@ -10885,6 +11027,53 @@ mod tests {
             }
             mix_kprof::reset();
             mix_kprof::set_for_test(false);
+        }
+
+        /// task 87: `attn_kprof` の 1 行組み立て (calls / ms / gpu 発数)。
+        ///
+        /// 強制 on で note を積み、serve (`prof_flash_q4`) が読む形の行が
+        /// 出ることを確かめる。`gpu` は cuda ビルドでは「直前の線形呼び出し」の
+        /// 実行先を数えるだけ (テストでは GPU を回さない) ので、上限 (calls)
+        /// だけを見る。終わりに必ず FORCE を戻す (並行する hc_mix 系テストが
+        /// env の解釈に従うことを保つ)。
+        #[test]
+        fn attn_kprof_line_counts_calls_and_gpu_hits() {
+            crate::model::qwen4exp::attn_kprof::set_for_test(true);
+            crate::model::qwen4exp::attn_kprof::reset();
+            let t = std::time::Instant::now();
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            crate::model::qwen4exp::attn_kprof::note_qkv(t);
+            crate::model::qwen4exp::attn_kprof::note_gate(t);
+            attn_kprof::note_out(t);
+            let line = crate::model::qwen4exp::attn_kprof::line().expect("強制 on なのに line() が None");
+            assert!(
+                line.starts_with("[attn-kprof] | qkv calls=1"),
+                "行の頭 (qkv calls) が違う: {line}"
+            );
+            assert!(line.contains("gate calls=1"), "gate の calls が無い: {line}");
+            assert!(line.contains("out calls=1"), "out の calls が無い: {line}");
+            // gpu は 0..=calls の範囲 (cuda ビルドでは直前の線形呼び出し次第)。
+            for name in ["qkv", "gate", "out"] {
+                let part = line
+                    .split(&format!("{name} calls=1 "))
+                    .nth(1)
+                    .unwrap_or_default();
+                let gpu: u64 = part
+                    .split(" gpu=")
+                    .nth(1)
+                    .and_then(|s| s.split(' ').next())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                assert!(gpu <= 1, "{name}: gpu 発数 {gpu} が calls を超えた: {line}");
+            }
+            attn_kprof::reset();
+            let line2 = attn_kprof::line().expect("reset 後も on なら行は出る");
+            assert!(
+                line2.contains("qkv calls=0 ms=0.0"),
+                "reset が効いていない: {line2}"
+            );
+            crate::model::qwen4exp::attn_kprof::set_for_test(false);
+            assert!(crate::model::qwen4exp::attn_kprof::line().is_none(), "off なのに行が出る");
         }
 
         /// P84: 行並列 region のカウンタが down / up で積まれる
