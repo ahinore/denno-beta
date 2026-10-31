@@ -3695,11 +3695,11 @@ mod tests {
         assert!(row_bytes(GgmlType::Q2_0, 100).is_err());
         assert!(row_bytes(GgmlType::IQ2S, 300).is_err());
 
-        // 形が合わない blocks は expert_gemv でも弾く
+        // 形が合わない blocks (バッファ不足) は expert_gemv でも弾く
         let x = make_x(N_IN);
         let mut out = vec![0.0f32; N_OUT];
-        assert!(expert_gemv(GgmlType::Q6K, &[0u8; 4096], N_IN, N_OUT, &x, &mut out).is_err());
-        assert!(expert_gemv(GgmlType::F32, &[0u8; 4096], N_IN, N_OUT, &x, &mut out).is_err());
+        assert!(expert_gemv(GgmlType::Q6K, &[], N_IN, N_OUT, &x, &mut out).is_err());
+        assert!(expert_gemv(GgmlType::Q2_0, &[0u8; 3], N_IN, N_OUT, &x, &mut out).is_err());
     }
 
     // ---- 実ファイルの形 (前提の実測値) との突き合わせ -----------------------
