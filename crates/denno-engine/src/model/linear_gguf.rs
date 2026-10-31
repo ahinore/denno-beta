@@ -732,6 +732,26 @@ impl GgufLinear {
                         return Ok(());
                     }
                 }
+                // task 91: `two_row` / `row_par_min` の明示呼び出し (hc mix の decode
+                // 経路) は、無量子型 (実機 P90 の mix-kprof で判明した hc down/up の
+                // BF16 を含む) でも行並列の行チャンクに乗せる ([`expert_gemv_par_min`]
+                // = `for_each_row_chunk` 枠組み)。旧来の無量子型アームは two_row /
+                // row_par_min を無視し、`mix_kprof::rowpar` の region 計上も素通りして
+                // いた (実機 [mix-kprof] の `regions=0` の最終的な理由)。
+                //
+                // 1 行の計算は `gemv_scalar_body` = `dequant_row_into` (BF16 -> f32 は
+                // 上位 16bit の複製で正確に定義される) + `dot_seq` (k 昇順の逐次加算)
+                // で、下の逐次経路・`gemv_rows_par` と**ビット一致**する (行は独立、
+                // 行内の加算順はどのチャンクに割っても不変)。region 計上は
+                // `for_each_row_chunk` 側が面倒を見る (ラベルは hc mix 側が立てる)。
+                // `row_par_min == 0` は既定の門番 ([`moe_expert::PAR_MIN_ROWS`]) に
+                // 委譲する (量子型 two_row と同じ規約)。ルータ (`router_gpu`) は
+                // `two_row` / `row_par_min` を付けない呼び出しなので、この分岐の
+                // 影響を受けない。
+                if two_row || row_par_min != 0 {
+                    let min_rows = if row_par_min == 0 { PAR_MIN_ROWS } else { row_par_min };
+                    return expert_gemv_par_min(self.ty, b, self.k, self.n, x, out, min_rows);
+                }
                 // task 65: `DENNO_CPU_GEMV_PAR=1` のときだけ、行方向を rayon で分ける。
                 // 既定 off は従来経路 (下の feature="par" の分割も含めて 1 行も変えない)。
                 // 行は独立・行内の加算順は不変なので、分割の有無で値はビット一致する。
@@ -1703,6 +1723,65 @@ mod tests {
                     if new_ms > 0.0 { old_ms / new_ms } else { 0.0 },
                     mac / (old_ms * 1e6),
                     mac / (new_ms * 1e6)
+                );
+            }
+        }
+    }
+
+    // ---- task 91: BF16 (hc down/up の実型) の行並列 GEMV ---------------------
+
+    /// BF16 の実形 2 形 (hc down 10240->320 / hc up 320->10240) を 1/2/4/8 スレッドで、
+    /// 旧経路 ([`GgufLinear::gemv`] = `cpu_gemv_par` の行チャンク) と
+    /// 新経路 ([`GgufLinear::gemv_label_par_2row`] = `for_each_row_chunk` の行チャンク)
+    /// で測る。実機の decode 1 呼び出しは down / up 各 1 発 (6.55 MB / 発)。
+    ///
+    /// `cargo test --release -p denno-engine --lib -- --ignored --nocapture bench_bf16_hc_real_shape`
+    #[test]
+    #[ignore = "実形状の CPU マイクロベンチ (手動)"]
+    fn bench_bf16_hc_real_shape_rowpar() {
+        use crate::model::qwen4exp::HC_DOWN_ROW_PAR_MIN;
+        let _g = par_test_lock();
+        let _p = ParGuard::new();
+        let reps = 30usize;
+        println!("\n=== BF16 hc GEMV 実形 (reps={reps}) ===");
+        for (k, n, min, name) in [
+            (10240usize, 320usize, HC_DOWN_ROW_PAR_MIN, "hc_down 10240->320"),
+            (320usize, 10240usize, 0usize, "hc_up 320->10240"),
+        ] {
+            let w = make_matrix(GgmlType::Bf16, k, n, 11);
+            let lin = GgufLinear::from_slice(GgmlType::Bf16, k, n, &w).expect("GgufLinear");
+            let x = make_x(k, 13);
+            let bytes = (k * n * 2) as f64; // BF16 は 1 要素 2 B
+            for th in [1usize, 2, 4, 8] {
+                let pool =
+                    rayon::ThreadPoolBuilder::new().num_threads(th).build().expect("thread pool");
+                let (old_ms, new_ms) = pool.install(|| {
+                    // warm-up (スレッドプールとページを立ち上げる)
+                    let mut warm = vec![0f32; n];
+                    for _ in 0..3 {
+                        lin.gemv(&x, &mut warm).expect("old");
+                        lin.gemv_label_par_2row("bench_bf16", &x, &mut warm, min).expect("new");
+                    }
+                    best_pair(
+                        reps,
+                        n,
+                        |out| {
+                            lin.gemv(&x, out).expect("old");
+                            std::hint::black_box(out);
+                        },
+                        |out| {
+                            lin.gemv_label_par_2row("bench_bf16", &x, out, min).expect("new");
+                            std::hint::black_box(out);
+                        },
+                    )
+                });
+                println!(
+                    "{:<22} threads={th}  old={old_ms:.3} ms ({:.1} GB/s)  \
+                     new={new_ms:.3} ms ({:.1} GB/s)  gain {:.2}x",
+                    name,
+                    bytes / (old_ms * 1e6),
+                    bytes / (new_ms * 1e6),
+                    if new_ms > 0.0 { old_ms / new_ms } else { 0.0 },
                 );
             }
         }
