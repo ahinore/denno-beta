@@ -5661,7 +5661,11 @@ pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]
                 outs,
             )
         }
-        GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => {
+        // 2026-10-31: 融合カーネル/GPU GEMM を持たない量子型 (IQ4_XS / IQ3_S /
+        // IQ2_S / Q2_0 / IQ4_NL 等) は、無量子型と同じ「行を f32 に開いて
+        // トークンブロックで使い回す」経路へ流す。値は逐次版と同じ規則
+        // (行内は i 昇順の逐次加算) で、型ごとの分岐を増やさない。
+        ty if crate::kquant::dequant_supported(ty) => {
             if nt == 0 {
                 return Ok(());
             }
