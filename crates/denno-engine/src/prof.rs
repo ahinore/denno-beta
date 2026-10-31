@@ -4140,6 +4140,12 @@ mod tests {
     /// リセットする形だと、途中で assert が落ちたときに値を残し、後続のテスト
     /// (`attn_core_is_split_into_gdn_and_full_rows` 等) を巻き込む (実際に踏んだ)。
     fn with_prof_counters<T>(f: impl FnOnce() -> T) -> T {
+        // P74: `serve_on()` は `enabled() || crate::telemetry_on()` なので、
+        // 並走するテストがテレメトリを ON にしていると表 C にサンプルが入る。
+        // テレメトリを切り替えるテスト (qwen4exp) は `moe_test_lock` を握るので、
+        // ここでも同じロックを取って「計測の窓」を排他する (ロック順は
+        // moe -> counters で固定。逆順を取るテストは無い)。
+        let _moe = crate::model::moe_expert::moe_test_lock();
         let _guard = lock_counters();
         *FORCE_ENABLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(true);
         let _on = ForceEnabled(true);
@@ -5555,6 +5561,10 @@ mod tests {
     /// s148: 計測を**明示的に無効にして** `f` を実行するガード (OFF 側の no-op を
     /// 検査する用)。`with_prof_counters` の対。
     fn with_prof_counters_off<T>(f: impl FnOnce() -> T) -> T {
+        // P74: `with_prof_counters` と同じ理由で moe 側のロックも取る
+        // (`serve_on()` の第 2 項 `crate::telemetry_on()` を並走テストが
+        //  true にすると、計測 OFF でも `step_begin` が時刻を読む)。
+        let _moe = crate::model::moe_expert::moe_test_lock();
         let _guard = lock_counters();
         *FORCE_ENABLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(false);
         let _on = ForceEnabled(false);

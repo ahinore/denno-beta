@@ -3846,13 +3846,25 @@ fn expert_loop_from_value(v: Option<&str>) -> bool {
     )
 }
 
+/// P74: 平坦化経路のテスト用上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+///
+/// `CPU_GEMV_PAR_OVERRIDE` / `ROUTER_GPU_OVERRIDE` と同じ流儀で `OnceLock` より
+/// 優先する。プロセス全体で 1 個なので、触るテストは `moe_test_guard()` を取る。
+static EXPERT_FLAT_DECODE_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 /// P70: decode の expert 寄与を **expert 横断の行タスク**に平坦化する新経路の
-/// ゲート (`DENNO_EXPERT_FLAT_DECODE`, 既定 off)。プロセスで 1 回だけ読む。
+/// ゲート (`DENNO_EXPERT_FLAT_DECODE`, 既定 on = P74)。プロセスで 1 回だけ読む。
 ///
 /// off のときの経路は従来と同一 ([`expert_contribs_par_into`] = expert 1 本を
 /// 1 タスクとして並列化)。on のときは「expert × 行列 × 行チャンク」を 1 本の
 /// タスク列にして 2 位相 (gate+up → down) で回す。
 fn expert_flat_decode_enabled() -> bool {
+    match EXPERT_FLAT_DECODE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on =
@@ -3868,13 +3880,32 @@ fn expert_flat_decode_enabled() -> bool {
     })
 }
 
-/// `DENNO_EXPERT_FLAT_DECODE` の値解釈 (純粋関数)。**既定は off**。
-/// `1` / `on` / `ON` / `true` のときだけ on (`DENNO_EXPERT_LOOP` と同じ規則)。
+/// テスト専用: 平坦化経路の on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_expert_flat_decode_for_test(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    EXPERT_FLAT_DECODE_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_EXPERT_FLAT_DECODE` の値解釈 (純粋関数)。**既定は on**。
+///
+/// main の実測 (2026-10-31 12:40 JST、v3 + gdn 並列 + attn GQA + fused gemv の上で
+/// 118 tok を 3 ラン): off 106.0 -> on **103.8 ms/token**、wall 16.48 -> 16.21 s、
+/// md5 は `3b77a3b996fd` で不変。`decode_flat_matches_expert_parallel` が
+/// 従来経路とのビット一致を固定しているので既定を on にした。
+/// 逃げ道は `0` / `off` / `false` / `no` (それ以外・未設定は on)。
 fn expert_flat_decode_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(str::trim),
-        Some("1") | Some("on") | Some("ON") | Some("true")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("0") | Some("off") | Some("false") | Some("no") => false,
+        _ => true,
+    }
 }
 
 /// task 67: 選択 expert の mmap 先読み (`MADV_WILLNEED`) の on/off
@@ -7857,6 +7888,10 @@ mod tests {
     #[test]
     fn moe_expert_loop_par_is_bit_identical_to_seq() {
         let _g = moe_test_guard();
+        // P74: このテストが見るのは**旧 (expert 並列) 経路**のカウンタ本数。
+        // 既定 on の平坦化経路は `PAR_CONTRIB_CALLS` を積まず `FLAT_DECODE_REGIONS`
+        // を積むので、ここでは明示的に off へ固定する (期待値は緩めない)。
+        set_expert_flat_decode_for_test(Some(false));
         let dir = TempDir::new("par");
         let path = write_expert_gguf(&dir);
         let f = GgufFile::open(&path).expect("open");
@@ -7910,6 +7945,7 @@ mod tests {
 
         // 4. ビット一致
         assert_bitwise_eq(&seq, &par, "par=0 vs par=1");
+        set_expert_flat_decode_for_test(None);
     }
 
     /// P64: `DENNO_EXPERT_LOOP` の値解釈。**既定は off**。
@@ -7936,6 +7972,10 @@ mod tests {
     #[cfg(feature = "par")]
     fn expert_loop_one_region_per_layer() {
         let _g = moe_test_guard();
+        // P74: 2. の「旧 par=1」は `PAR_CONTRIB_REGIONS` が 1 回立つことを見る。
+        // 既定 on の平坦化経路はこの領域を立てない (`FLAT_DECODE_REGIONS` を立てる)
+        // ので、旧経路の本数を数えるここでは明示的に off へ固定する。
+        set_expert_flat_decode_for_test(Some(false));
         let dir = TempDir::new("loop_num");
         let (nl, ne, k) = (3usize, 8usize, 3usize);
         let path = write_expert_gguf_n(&dir, "3l.gguf", 512, 640, ne, nl);
@@ -7974,6 +8014,7 @@ mod tests {
                 "層 {il}: 旧 par=0 の行並列領域が k*3 でない"
             );
         }
+        set_expert_flat_decode_for_test(None);
     }
 
     /// P64: 新経路 (1 層 1 並列領域) が旧経路とビット一致する。
@@ -8015,18 +8056,44 @@ mod tests {
         }
     }
 
-    /// P70: `DENNO_EXPERT_FLAT_DECODE` の値解釈 (既定 off・誤設定で on にしない)。
+    /// P70/P74: `DENNO_EXPERT_FLAT_DECODE` の値解釈 (既定 on・明示的な偽値だけ off)。
     #[test]
     fn expert_flat_decode_gate_values() {
-        assert!(!expert_flat_decode_from_value(None));
-        assert!(!expert_flat_decode_from_value(Some("")));
-        assert!(!expert_flat_decode_from_value(Some("0")));
-        assert!(!expert_flat_decode_from_value(Some("yes")));
+        assert!(expert_flat_decode_from_value(None), "未設定は既定で on");
+        assert!(expert_flat_decode_from_value(Some("")), "空文字も on");
         assert!(expert_flat_decode_from_value(Some("1")));
         assert!(expert_flat_decode_from_value(Some("on")));
         assert!(expert_flat_decode_from_value(Some("ON")));
         assert!(expert_flat_decode_from_value(Some("true")));
+        assert!(expert_flat_decode_from_value(Some("yes")), "未知の値は on のまま");
+        assert!(!expert_flat_decode_from_value(Some("0")), "0 は off");
+        assert!(!expert_flat_decode_from_value(Some("off")), "off は off");
+        assert!(!expert_flat_decode_from_value(Some("OFF")), "大文字 OFF も off");
+        assert!(!expert_flat_decode_from_value(Some("false")), "false は off");
+        assert!(!expert_flat_decode_from_value(Some("no")), "no は off");
+        assert!(!expert_flat_decode_from_value(Some(" off ")), "前後の空白は無視");
         assert!(expert_flat_decode_from_value(Some(" 1 ")));
+    }
+
+    /// P74: テスト用上書きが、env 由来の `OnceLock` より優先すること。
+    ///
+    /// `OnceLock` はプロセスで 1 回しか決まらないので、既定を on にした後で
+    /// 「旧経路の本数を見るテスト」を書くには上書き口が要る。ここでは
+    /// OnceLock を既定 (on) で初期化させたうえで、off の上書きが勝つことを見る。
+    #[test]
+    fn expert_flat_decode_override_beats_env() {
+        let _g = moe_test_guard();
+        set_expert_flat_decode_for_test(None);
+        assert!(expert_flat_decode_enabled(), "既定 (env 未設定) は on");
+        set_expert_flat_decode_for_test(Some(false));
+        assert!(
+            !expert_flat_decode_enabled(),
+            "off の上書きが OnceLock に負けている"
+        );
+        set_expert_flat_decode_for_test(Some(true));
+        assert!(expert_flat_decode_enabled(), "on の上書きが効いていない");
+        set_expert_flat_decode_for_test(None);
+        assert!(expert_flat_decode_enabled(), "上書きを外したら既定 (on) に戻る");
     }
 
     /// P70: expert 横断の平坦化経路は、従来の expert 並列と**ビット一致**する
@@ -8490,6 +8557,11 @@ mod tests {
     fn expert_fault_gates_take_effect_and_stay_bit_identical() {
         use std::sync::atomic::Ordering;
         let _g = moe_test_guard();
+        // P74: prefetch / scratch のカウンタは**旧 (expert 単位) 経路**の
+        // `ExpertW::prefetch` とスレッドローカル作業域が積む。既定 on の平坦化
+        // 経路はどちらも通らないので、ゲートの発動回数を見るここでは明示的に
+        // off へ固定する (ゲート自体の意味は変えない)。
+        set_expert_flat_decode_for_test(Some(false));
         let dir = TempDir::new("gates67");
         let path = write_expert_gguf(&dir);
         let f = GgufFile::open(&path).expect("open");
@@ -8553,6 +8625,7 @@ mod tests {
         assert_bitwise_eq(&want, &got, "scratch=1");
 
         set_expert_fault_gates_for_test(None, None, None);
+        set_expert_flat_decode_for_test(None);
     }
 
     /// task 67 マイクロベンチ: expert GEMV の minor fault / 時間 / 実効 GB/s を
@@ -9015,6 +9088,11 @@ mod tests {
 
     #[test]
     fn one_slot_cache_keeps_evicting() {
+        // P74: `moe_ffn_quant` を通るので、他の MoE テストと同じロックを取る。
+        // 取らないと、テレメトリを ON にしている別テストの窓で RouterTopK の
+        // フレームが共有チャネルに混ざる (実測: -j4 で
+        // `router_topk_frames_are_arch_gated_and_last_token_only` が落ちた)。
+        let _g = moe_test_guard();
         let dir = TempDir::new("one");
         let path = write_expert_gguf(&dir);
         let f = GgufFile::open(&path).expect("open");
@@ -9112,6 +9190,8 @@ mod tests {
 
     #[test]
     fn slot_bytes_below_the_largest_expert_is_an_error() {
+        // P74: `moe_ffn_quant` を通るので他の MoE テストと同じロックを取る。
+        let _g = moe_test_guard();
         // 静かに切り詰めないこと (Q5_1 down の 1 expert より小さいスロット)
         let dir = TempDir::new("small");
         let path = write_expert_gguf(&dir);
