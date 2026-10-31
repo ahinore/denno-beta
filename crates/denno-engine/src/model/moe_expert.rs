@@ -619,10 +619,10 @@ fn expert_gemv_inner(
         #[cfg(target_arch = "x86_64")]
         {
             let f: unsafe fn(&[u8], usize, usize, &[f32], &mut [f32]) = match iq_kind(ty) {
-                Some(0) => gemv_iq::<0>,
-                Some(1) => gemv_iq::<1>,
-                Some(2) => gemv_iq::<2>,
-                _ => gemv_iq::<3>,
+                Some(0) => gemv_iq_dispatch::<0>,
+                Some(1) => gemv_iq_dispatch::<1>,
+                Some(2) => gemv_iq_dispatch::<2>,
+                _ => gemv_iq_dispatch::<3>,
             };
             for_each_row_chunk(
                 blocks,
@@ -865,6 +865,222 @@ unsafe fn gemv_iq<const KIND: u8>(
         let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
         let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
         out[r] = _mm_cvtss_f32(h);
+    }
+}
+
+/// 8 レーン f32 の横加算。**足す順序は [`gemv_iq`] のインライン展開と同じ**
+/// (下位 128 + 上位 128 → movehl → shuffle 0x55) なので、値はビット一致する。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::missing_safety_doc)]
+unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let h = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+    let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
+    _mm_cvtss_f32(h)
+}
+
+/// `DENNO_IQ_KERNEL` (P80): IQ 系 GEMV の実装選択。
+///
+/// - `v2` = 8 要素グループを 1 本ずつ作る従来カーネル ([`gemv_iq`])
+/// - `v3` = 副ブロック 32 要素 (4 グループ) をまとめて作る新カーネル ([`gemv_iq_ib`]、既定)
+///
+/// どちらも **1 行あたりの累積順は同じ** なので出力はビット一致する
+/// (`h` 昇順・偶奇 2 本の累積・横加算の順序を変えない)。
+/// v3 は IQ2_S (1.87x) / IQ3_XXS (1.62x) でだけ速い。IQ4_NL / Q2_0 は副ブロックで
+/// 共有できるスカラーが無く、v3 にすると 1.03x / 0.93〜0.99x (ブレ)なので v2 のまま。
+fn iq_kernel_v3() -> bool {
+    #[cfg(test)]
+    if let Some(v) = iq_v3_force() {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("DENNO_IQ_KERNEL")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("v2") | Some("1row") | Some("off")
+        )
+    })
+}
+
+/// テストが env (プロセスで 1 回しか読めない) を迂回して経路を固定するための上書き。
+/// `-1` = 未設定 (env を見る)。
+#[cfg(test)]
+static IQ_V3_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+#[cfg(test)]
+fn iq_v3_force() -> Option<bool> {
+    match IQ_V3_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        -1 => None,
+        v => Some(v != 0),
+    }
+}
+
+/// テスト用: 経路を固定する (`None` で env の解釈に戻る)。
+#[cfg(test)]
+fn set_iq_kernel_for_test(v: Option<bool>) {
+    IQ_V3_FORCE.store(match v {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// テスト用: v3 カーネルが実際に発火した回数。
+#[cfg(test)]
+static IQ_V3_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `DENNO_IQ_KERNEL` に従って IQ 系 GEMV の実体を選ぶ (1 行入口の関数ポインタ)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_iq_dispatch<const KIND: u8>(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) {
+    // 副ブロック (32 要素) を 4 グループで共有できるのは IQ2_S / IQ3_XXS だけ。
+    // IQ4_NL / Q2_0 は v3 にすると横ばい〜わずかに遅い (0.93〜0.99x) ので v2 のまま。
+    if KIND >= 2 && iq_kernel_v3() {
+        #[cfg(test)]
+        IQ_V3_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        gemv_iq_ib::<KIND>(blocks, n_in, n_out, x, out);
+    } else {
+        gemv_iq::<KIND>(blocks, n_in, n_out, x, out);
+    }
+}
+
+/// 8 要素の格子値 (int8) に符号バイトを掛けて f32 8 レーンへ広げる。
+///
+/// 符号は「bit j が立っていれば負」(`ksigns_iq2xs` と同じ約束)で、
+/// f32 の符号ビット (bit31) を XOR するのと同じ値になる。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::missing_safety_doc)]
+unsafe fn iq_sign_i8(
+    vi: std::arch::x86_64::__m128i,
+    sg: i32,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vi));
+    // レーンごとにビット位置が違うので、比較で符号ビットを作る。
+    let hit = _mm256_and_si256(
+        _mm256_set1_epi32(sg),
+        _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128),
+    );
+    let pos = _mm256_cmpeq_epi32(hit, _mm256_setzero_si256());
+    let neg = _mm256_andnot_si256(pos, _mm256_set1_epi32(i32::MIN));
+    _mm256_xor_ps(v, _mm256_castsi256_ps(neg))
+}
+
+/// 1 ブロック内の 4 グループ (32 要素) ぶんの重みベクトルをまとめて作る。
+///
+/// IQ2_S / IQ3_XXS では **ブロック内の副ブロック `ib` が 4 グループを共有する** ので、
+/// `qh` / `scale` / `aux32` のロードと `ib` 由来のアドレス計算を 4 グループで 1 回に
+/// する (従来は 8 要素ごとに同じバイトを読み直していた)。戻り値の並びは
+/// `h = 4g + l` の昇順で、[`iq_vec8`] を 4 回呼んだのと同じ値。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::missing_safety_doc)]
+unsafe fn iq_vec8_4<const KIND: u8>(p: *const u8, g: usize) -> [std::arch::x86_64::__m256; 4] {
+    use std::arch::x86_64::*;
+
+    if KIND < 2 {
+        return [
+            iq_vec8::<KIND>(p, 4 * g),
+            iq_vec8::<KIND>(p, 4 * g + 1),
+            iq_vec8::<KIND>(p, 4 * g + 2),
+            iq_vec8::<KIND>(p, 4 * g + 3),
+        ];
+    }
+
+    let mut out = [_mm256_setzero_ps(); 4];
+    let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+    if KIND == 2 {
+        let qhb = *p.add(66 + g) as usize;
+        let sc = *p.add(74 + g);
+        let db0 = d * ((0.5 + (sc & 0xf) as f32) * 0.25);
+        let db1 = d * ((0.5 + (sc >> 4) as f32) * 0.25);
+        let gp = crate::kquant::iq2s_grid().as_ptr();
+        for l in 0..4 {
+            let idx = (*p.add(2 + g * 4 + l) as usize) | ((qhb << (8 - 2 * l)) & 0x300);
+            let vi = _mm_loadl_epi64(gp.add(idx) as *const __m128i);
+            let sg = *p.add(34 + g * 4 + l) as i32;
+            let vs = iq_sign_i8(vi, sg);
+            out[l] = _mm256_mul_ps(vs, _mm256_set1_ps(if l < 2 { db0 } else { db1 }));
+        }
+    } else {
+        let aux32 = std::ptr::read_unaligned(p.add(66 + g * 4) as *const u32);
+        let db = d * (0.5 + ((aux32 >> 28) as f32)) * 0.5;
+        let gp = crate::kquant::iq3xxs_grid().as_ptr();
+        let ks = crate::kquant::ksigns_iq2xs().as_ptr();
+        for l in 0..4 {
+            let sg = *ks.add(((aux32 >> (7 * l)) & 127) as usize) as i32;
+            let g1 = *gp.add(*p.add(2 + g * 8 + 2 * l) as usize);
+            let g2 = *gp.add(*p.add(2 + g * 8 + 2 * l + 1) as usize);
+            // 8 要素 = g1 の 4 バイト + g2 の 4 バイト (下位 64 ビットに詰める)。
+            // スタック経由の `to_le_bytes` をやめて movq 1 本にする。
+            let vi = _mm_cvtsi64_si128(((g1 as u64) | ((g2 as u64) << 32)) as i64);
+            let vs = iq_sign_i8(vi, sg);
+            out[l] = _mm256_mul_ps(vs, _mm256_set1_ps(db));
+        }
+    }
+    out
+}
+
+/// IQ 系 4 型の 1 行 GEMV (P80 の新経路、`DENNO_IQ_KERNEL=v3`)。
+///
+/// [`iq_vec8_4`] で 32 要素 (4 グループ) ずつ重みベクトルを作り、`x` の 32 要素と
+/// 1 行ぶん積和する。**累積順は [`gemv_iq`] と同じ** (`h` 昇順・偶奇 2 本・
+/// 横加算の順序を変えない) なので出力はビット一致する。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_iq_ib<const KIND: u8>(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let (blk, nvec) = iq_geom(KIND);
+    let nb = n_in / (nvec * 8);
+    let rb = nb * blk;
+    let ng = nvec / 4; // 1 ブロック内の 32 要素単位の数
+    let xp = x.as_ptr();
+    let bp = blocks.as_ptr();
+
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        for b in 0..nb {
+            let p = row.add(b * blk);
+            let xb = xp.add(b * nvec * 8);
+            for g in 0..ng {
+                let vs = iq_vec8_4::<KIND>(p, g);
+                for l in 0..4 {
+                    let xv = _mm256_loadu_ps(xb.add(g * 32 + l * 8));
+                    if l % 2 == 0 {
+                        a0 = _mm256_fmadd_ps(vs[l], xv, a0);
+                    } else {
+                        a1 = _mm256_fmadd_ps(vs[l], xv, a1);
+                    }
+                }
+            }
+        }
+        out[r] = hsum256(_mm256_add_ps(a0, a1));
     }
 }
 
@@ -6984,3 +7200,324 @@ mod exp_kprof_tests {
         let _ = ms;
     }
 }
+
+/// P80: IQ 系 GEMV の副ブロック一括版 (v3) の検証とマイクロベンチ。
+#[cfg(test)]
+mod iq_kernel_tests {
+    use super::*;
+
+    fn f16b(v: f32) -> [u8; 2] {
+        half::f16::from_f32(v).to_le_bytes()
+    }
+
+    fn byte_at(i: usize, seed: u32) -> u8 {
+        let mut x = (i as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(seed.wrapping_mul(40_503));
+        x ^= x >> 13;
+        x = x.wrapping_mul(0x9E37_79B1);
+        x ^= x >> 16;
+        x as u8
+    }
+
+    /// IQ 系 4 型の合成ブロック列 (`n_out * (n_in / blck) * type_size`)。
+    fn iq_expert(ty: GgmlType, n_in: usize, n_out: usize) -> Vec<u8> {
+        let ts = ty.type_size();
+        let nb = n_in / ty.blck_size();
+        let mut v = Vec::with_capacity(n_out * nb * ts);
+        for r in 0..n_out {
+            for b in 0..nb {
+                let seed = (r * 131 + b * 17) as u32 + 11;
+                let mut blk = vec![0u8; ts];
+                blk[0..2].copy_from_slice(&f16b(0.011 + 0.0001 * (b % 13) as f32));
+                for (i, q) in blk.iter_mut().enumerate().skip(2) {
+                    *q = byte_at(i, seed);
+                }
+                v.extend_from_slice(&blk);
+            }
+        }
+        v
+    }
+
+    /// 型ごとに `iq_vec8` の `KIND` を決めて実装を選ぶ。
+    unsafe fn run_kind<const KIND: u8>(
+        variant: usize,
+        blocks: &[u8],
+        n_in: usize,
+        n_out: usize,
+        x: &[f32],
+        out: &mut [f32],
+    ) {
+        match variant {
+            0 => gemv_iq::<KIND>(blocks, n_in, n_out, x, out),
+            1 => gemv_iq_ib::<KIND>(blocks, n_in, n_out, x, out),
+            _ => gemv_iq_dispatch::<KIND>(blocks, n_in, n_out, x, out),
+        }
+    }
+
+    /// ベンチ・テストで回す実装の名前 (添字が `run_kind` の `variant`)。
+    const VARIANT_NAMES: [&str; 3] = ["v2 1row", "v3 ib", "dispatch"];
+
+    unsafe fn run_kernel(
+        ty: GgmlType,
+        variant: usize,
+        blocks: &[u8],
+        n_in: usize,
+        n_out: usize,
+        x: &[f32],
+        out: &mut [f32],
+    ) {
+        match iq_kind(ty).expect("IQ 系の型") {
+            0 => run_kind::<0>(variant, blocks, n_in, n_out, x, out),
+            1 => run_kind::<1>(variant, blocks, n_in, n_out, x, out),
+            2 => run_kind::<2>(variant, blocks, n_in, n_out, x, out),
+            _ => run_kind::<3>(variant, blocks, n_in, n_out, x, out),
+        }
+    }
+
+    /// 副ブロック一括版 (v3) は 1 グループ版 (v2) と**ビット一致**する。
+    ///
+    /// 1 行あたりの累積順 (`h` 昇順・偶奇 2 本・横加算の順序) を変えていないので、
+    /// 32 要素ずつまとめて作っても値は変わらない。n_out が偶数/奇数 (端数行) の両方を見る。
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn iq_ib_kernel_matches_single_row_bitwise() {
+        if !q4k_fused_supported() {
+            return;
+        }
+        let n_in = 512usize;
+        let mut seed = 0x5eed_1234_9abc_def1u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5
+        };
+        for ty in [
+            GgmlType::IQ4Nl,
+            GgmlType::Q2_0,
+            GgmlType::IQ2S,
+            GgmlType::IQ3Xxs,
+        ] {
+            for n_out in [1usize, 7, 16] {
+                let blocks = iq_expert(ty, n_in, n_out);
+                let x: Vec<f32> = (0..n_in).map(|_| rnd()).collect();
+                let mut outs: Vec<Vec<f32>> = (0..VARIANT_NAMES.len())
+                    .map(|_| vec![0f32; n_out])
+                    .collect();
+                for (variant, o) in outs.iter_mut().enumerate() {
+                    unsafe { run_kernel(ty, variant, &blocks, n_in, n_out, &x, o) };
+                }
+                assert!(
+                    outs[0].iter().any(|v| *v != 0.0),
+                    "{ty:?} n_out={n_out}: 出力が全 0 (入力を作り直すこと)"
+                );
+                for variant in 1..VARIANT_NAMES.len() {
+                    let same: Vec<u32> = outs[0].iter().map(|f| f.to_bits()).collect();
+                    let got: Vec<u32> = outs[variant].iter().map(|f| f.to_bits()).collect();
+                    assert_eq!(
+                        same, got,
+                        "{ty:?} n_out={n_out} ({}): v2 とビット一致しない ({:?} vs {:?})",
+                        VARIANT_NAMES[variant], outs[0], outs[variant]
+                    );
+                }
+            }
+        }
+    }
+
+    /// `DENNO_IQ_KERNEL` の分岐が**両方**実際に通ること。
+    /// (緑 = 分岐した証拠、ではないので、v3 側は発火カウンタで見る)
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn iq_kernel_gate_selects_both_paths() {
+        if !q4k_fused_supported() {
+            return;
+        }
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = L.lock().unwrap_or_else(|e| e.into_inner());
+        let (n_in, n_out) = (256usize, 4usize);
+        let blocks = iq_expert(GgmlType::IQ2S, n_in, n_out);
+        let x: Vec<f32> = (0..n_in).map(|i| ((i as f32) * 0.11).sin()).collect();
+
+        let mut v2 = vec![0f32; n_out];
+        unsafe { gemv_iq::<2>(&blocks, n_in, n_out, &x, &mut v2) };
+
+        // v2 固定: ゲートが v3 に入らないこと (カウンタが動かない)
+        let before = IQ_V3_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        set_iq_kernel_for_test(Some(false));
+        let mut got2 = vec![0f32; n_out];
+        unsafe { gemv_iq_dispatch::<2>(&blocks, n_in, n_out, &x, &mut got2) };
+        let after_v2 = IQ_V3_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+
+        // v3 固定: ゲートが v3 に入ること
+        set_iq_kernel_for_test(Some(true));
+        let mut got3 = vec![0f32; n_out];
+        unsafe { gemv_iq_dispatch::<2>(&blocks, n_in, n_out, &x, &mut got3) };
+        let after_v3 = IQ_V3_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        set_iq_kernel_for_test(None);
+
+        assert_eq!(
+            before, after_v2,
+            "DENNO_IQ_KERNEL=v2 なのに v3 カーネルが動いた"
+        );
+        assert!(
+            after_v3 > after_v2,
+            "DENNO_IQ_KERNEL=v3 なのに v3 カーネルが動いていない"
+        );
+        let b = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert_eq!(b(&v2), b(&got2), "v2 固定の出力が v2 と違う");
+        assert_eq!(b(&v2), b(&got3), "v3 固定の出力が v2 と違う");
+    }
+
+    /// P80 マイクロベンチ。v2 (8 要素ずつ) と v3 (32 要素ずつ) を**同一実行内で交互**に
+    /// 回し、最小値を取る (共有ホストなので 1 回測りは信じない)。
+    ///
+    /// - (A) 1 スレッド: 1 行あたりの ns と GB/s (重みは L2 に載る = 計算律速)。
+    /// - (B) `RAYON_NUM_THREADS` スレッド + L3 を越える作業集合: 実機と同じ行分割
+    ///   (`for_each_row_chunk`) を通した実効 GB/s。
+    ///
+    /// 実行: `RAYON_NUM_THREADS=8 cargo test --release -p denno-engine --lib \
+    ///        -- --ignored --nocapture --test-threads=1 bench_iq_gemv_ns_per_row`
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "P80 マイクロベンチ (実測。通常のテストでは走らせない)"]
+    fn bench_iq_gemv_ns_per_row() {
+        if !q4k_fused_supported() {
+            eprintln!("[bench80] AVX2/FMA が無いので計測しない");
+            return;
+        }
+        let (n_in, n_out) = (2560usize, 640usize);
+        let x: Vec<f32> = (0..n_in)
+            .map(|i| ((i as f32) * 0.017).sin() + 0.05 * ((i % 11) as f32))
+            .collect();
+        let names = VARIANT_NAMES;
+        const NV: usize = 2; // dispatch は (B) でだけ見る
+
+        // ---- (A) 1 スレッド
+        eprintln!("[bench80] --- 1 スレッド (重み L2 常駐) ---");
+        for ty in [GgmlType::IQ2S, GgmlType::IQ3Xxs] {
+            let blocks = iq_expert(ty, n_in, n_out);
+            let gb = blocks.len() as f64 / 1e9;
+            let mut out = vec![0f32; n_out];
+            let mut best = [f64::INFINITY; NV];
+            for rep in 0..9 {
+                for vi in 0..NV {
+                    let vi = (vi + rep) % NV;
+                    let t0 = std::time::Instant::now();
+                    unsafe { run_kernel(ty, vi, &blocks, n_in, n_out, &x, &mut out) };
+                    let d = t0.elapsed().as_secs_f64();
+                    std::hint::black_box(&out);
+                    best[vi] = best[vi].min(d);
+                }
+            }
+            for (vi, name) in names.iter().enumerate().take(NV) {
+                eprintln!(
+                    "[bench80] {ty:?} {name:8}: {:8.1} us/行列 {:7.1} ns/行 {:6.2} GB/s {:5.3}x",
+                    best[vi] * 1e6,
+                    best[vi] * 1e9 / n_out as f64,
+                    gb / best[vi],
+                    best[0] / best[vi]
+                );
+            }
+        }
+
+        // ---- ダウン形 (n_in=640, n_out=2560) の比較対照
+        {
+            let (di, do_) = (640usize, 2560usize);
+            let xd: Vec<f32> = (0..di).map(|i| ((i as f32) * 0.013).cos()).collect();
+            for ty in [GgmlType::IQ4Nl, GgmlType::Q2_0] {
+                let blocks = iq_expert(ty, di, do_);
+                let gb = blocks.len() as f64 / 1e9;
+                let mut out = vec![0f32; do_];
+                let mut best = [f64::INFINITY; NV];
+                for rep in 0..9 {
+                    for vi in 0..NV {
+                        let vi = (vi + rep) % NV;
+                        let t0 = std::time::Instant::now();
+                        unsafe { run_kernel(ty, vi, &blocks, di, do_, &xd, &mut out) };
+                        let d = t0.elapsed().as_secs_f64();
+                        std::hint::black_box(&out);
+                        best[vi] = best[vi].min(d);
+                    }
+                }
+                for (vi, name) in names.iter().enumerate().take(NV) {
+                    eprintln!(
+                        "[bench80] {ty:?} {name:8}: {:8.1} us/行列 {:6.1} ns/行 {:6.2} GB/s {:5.3}x",
+                        best[vi] * 1e6,
+                        best[vi] * 1e9 / do_ as f64,
+                        gb / best[vi],
+                        best[0] / best[vi]
+                    );
+                }
+            }
+        }
+
+        // ---- (B) 実機と同じ行分割 + L3 を越える作業集合
+        let threads = rayon::current_num_threads();
+        eprintln!("[bench80] --- {threads} スレッド (expert 64 本 = L3 超過) ---");
+        for ty in [GgmlType::IQ2S, GgmlType::IQ3Xxs] {
+            let blocks = iq_expert(ty, n_in, n_out);
+            let per = blocks.len();
+            let nexp = 64usize;
+            let mut big = Vec::with_capacity(per * nexp);
+            for _ in 0..nexp {
+                big.extend_from_slice(&blocks);
+            }
+            let mut best = [f64::INFINITY; 2];
+            for rep in 0..7 {
+                for vi in 0..2 {
+                    let vi = (vi + rep) % 2;
+                    set_iq_kernel_for_test(Some(vi == 1));
+                    let mut out = vec![0f32; n_out];
+                    let t0 = std::time::Instant::now();
+                    for c in 0..nexp {
+                        expert_gemv_inner(
+                            ty,
+                            &big[c * per..(c + 1) * per],
+                            n_in,
+                            n_out,
+                            &x,
+                            &mut out,
+                            true,
+                        )
+                        .expect("gemv");
+                    }
+                    let d = t0.elapsed().as_secs_f64();
+                    set_iq_kernel_for_test(None);
+                    std::hint::black_box(&out);
+                    best[vi] = best[vi].min(d);
+                }
+                if rep == 0 {
+                    // v2 と v3 が同じ値を出すことを 1 度だけ確かめる
+                    let mut a = vec![0f32; n_out];
+                    set_iq_kernel_for_test(Some(false));
+                    expert_gemv_inner(ty, &blocks, n_in, n_out, &x, &mut a, false).unwrap();
+                    let mut b = vec![0f32; n_out];
+                    set_iq_kernel_for_test(Some(true));
+                    expert_gemv_inner(ty, &blocks, n_in, n_out, &x, &mut b, false).unwrap();
+                    set_iq_kernel_for_test(None);
+                    assert_eq!(
+                        a.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                        b.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                        "{ty:?}: bench データで v2 と v3 がビット一致しない"
+                    );
+                    assert!(a.iter().any(|v| *v != 0.0), "{ty:?}: bench 出力が全 0");
+                }
+            }
+            let gb = big.len() as f64 / 1e9;
+            for (vi, name) in ["v2 1row", "v3 ib"].iter().enumerate() {
+                eprintln!(
+                    "[bench80] {ty:?} {name:8}: {:8.2} ms / {:.0} MB {:6.2} GB/s",
+                    best[vi] * 1e3,
+                    big.len() as f64 / 1e6,
+                    gb / best[vi]
+                );
+            }
+            eprintln!(
+                "[bench80] {ty:?} 実効 {:.3}x (v3/v2)",
+                best[0] / best[1]
+            );
+        }
+    }
+}
+
