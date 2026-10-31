@@ -5827,6 +5827,36 @@ fn weights_for_gguf(
     Ok(GgufWRef { w, uid })
 }
 
+/// テスト用: `maybe_gpu_gguf_gemv_into` を「GPU が取った」ことにするフラグ。
+///
+/// 実デバイスには一切触らない (即 `true` を返すだけ)。P86 のように
+/// 「GPU GEMV が呼び出しを奪ったとき CPU 経路が死ぬ」ことを、GPU の無い
+/// コンテナで再現するためのもの。`GemvInterceptGuard` で立てる。
+#[cfg(test)]
+static GEMV_INTERCEPT_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`GEMV_INTERCEPT_FOR_TEST`] の間、`maybe_gpu_gguf_gemv_into` は
+/// 「GPU が計算した」ことにして CPU へ落とさない。Drop で必ず戻す。
+#[cfg(test)]
+pub struct GemvInterceptGuard;
+
+#[cfg(test)]
+impl GemvInterceptGuard {
+    /// フラグを立てる (Drop まで有効)。
+    pub fn new() -> Self {
+        GEMV_INTERCEPT_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for GemvInterceptGuard {
+    fn drop(&mut self) {
+        GEMV_INTERCEPT_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// P-MOE-E5: GGUF ブロックのままの線形層 (m=1) を GPU で計算する。
 ///
 /// 対象外の型・GPU 無効・CUDA 不調・登録失敗では `false` を返す。呼び出し側は
@@ -5841,6 +5871,11 @@ pub fn maybe_gpu_gguf_gemv_into(
     out: &mut [f32],
 ) -> bool {
     set_last_linear_ran_on_gpu(false);
+    #[cfg(test)]
+    if GEMV_INTERCEPT_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        // テスト用: GPU が呼び出しを取った体で抜ける (out は書かない)。
+        return true;
+    }
     if !cuda_enabled() || gguf_row_bytes(ty, k).is_none() {
         return false;
     }

@@ -24,6 +24,14 @@ use crate::model::moe_expert::{
 };
 use crate::quant::WeightBlocks;
 
+/// テスト用: `two_row` の呼び出しが GPU 経路を素通りして CPU 側に届いた回数。
+///
+/// P86 のバイパス (`two_row` は `maybe_gpu_gguf_gemv_into` を試みない) が実際に
+/// 通ったことの証拠。GPU が呼び出しを奪った (旧経路) 場合は増えない。
+#[cfg(test)]
+pub(crate) static TWO_ROW_CPU_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// 1 行のバイト数。`moe_expert::row_bytes` は量子型だけを受けるので、
 /// F32 / F16 / BF16 も含めて受ける版をここに持つ (ブロック仕様は同じ)。
 fn row_bytes_any(ty: GgmlType, k: usize) -> Result<usize> {
@@ -587,19 +595,34 @@ impl GgufLinear {
                 && crate::kquant::dequant_supported(ty) => {
                 // P-MOE-E5: 重みが VRAM に常駐していれば GPU で計算する。
                 // 対象外・GPU 無効・不調では false が返り、下の CPU 参照へ落ちる。
+                //
+                // P86: `two_row` が明示された呼び出し (hc mix の decode 1 トークン経路
+                // だけが使う) は GPU に奪わない。実機では hc down/up (Q8_0, 3.4 MB) の
+                // GPU GEMV が 1 呼び出し 0.6-0.7 ms かかり、CPU 側の 2 行 + 行並列は
+                // 一度も走っていなかった ([mix-kprof] down 48% / up 43.4%、
+                // `rowpar regions=0` = `for_each_row_chunk` 未到達の証拠)。
+                // two_row は「CPU の 2 行カーネルでビット一致計算したい」という呼び出し
+                // 側の明示なので、ここを素通しさせない。旧経路 (GPU に落ちる) は
+                // `DENNO_HC_MIX_FAST=0` で戻る。
                 #[cfg(feature = "cuda")]
                 {
-                    if crate::cuda::maybe_gpu_gguf_gemv_into(
-                        self.uid,
-                        self.ty,
-                        self.blocks.as_slice(),
-                        self.k,
-                        self.n,
-                        x,
-                        out,
-                    ) {
+                    if !two_row
+                        && crate::cuda::maybe_gpu_gguf_gemv_into(
+                            self.uid,
+                            self.ty,
+                            self.blocks.as_slice(),
+                            self.k,
+                            self.n,
+                            x,
+                            out,
+                        )
+                    {
                         return Ok(());
                     }
+                }
+                #[cfg(test)]
+                if two_row {
+                    TWO_ROW_CPU_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 if self.fast_q8 && self.ty == GgmlType::Q8_0 {
                     return if row_par_min == 0 {
@@ -1868,5 +1891,54 @@ mod tests {
         for i in 0..ns.len() {
             assert_eq!(bits(&outs[i]), bits(&want[i]), "層 {i}");
         }
+    }
+
+    /// P86: `two_row` の呼び出しは GPU GEMV に奪われず CPU の 2 行カーネルに届く
+    /// (cuda ビルドのみ。GPU 実体は無くても intercept フックで再現する)。
+    ///
+    /// intercept は `maybe_gpu_gguf_gemv_into` を「成功」させ、かつ out を
+    /// 書かない。旧経路 (GPU 素通り) なら two_row の呼び出しも out が埋まらない
+    /// まま返る。修正後は down / up の 2 行入口が CPU で計算する。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn two_row_reaches_cpu_while_plain_entry_is_intercepted() {
+        use crate::cuda::GemvInterceptGuard;
+        use crate::model::linear_gguf::TWO_ROW_CPU_CALLS;
+
+        let lin = GgufLinear::from_slice(GgmlType::Q8_0, K, N, &make_matrix(GgmlType::Q8_0, K, N, 3))
+            .expect("from_slice")
+            .with_fast_q8(true);
+        let x = make_x(K, 1);
+        let delta = || TWO_ROW_CPU_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+
+        // 対照: plain 入口 (two_row = false) は intercept に奪われ、out は書かれない。
+        let before = delta();
+        let mut out = vec![f32::NAN; N];
+        {
+            let _g = GemvInterceptGuard::new();
+            lin.gemv_label("plain", &x, &mut out).expect("gemv_label");
+        }
+        assert!(
+            out.iter().all(|v| v.is_nan()),
+            "GPU に奪われたはずの呼び出しが out を書いた (intercept が効いていない)"
+        );
+        assert_eq!(delta(), before, "plain 入口で two_row カウンタが動いた");
+
+        // two_row 入口は CPU に落ちる (intercept 中でも out が正しく埋まる)。
+        // 参照値は先に (intercept 無しで) 取る。参照呼び出し自体も two_row なので
+        // カウンタを進める。
+        let mut want = vec![0f32; N];
+        lin.gemv_label_par_2row("hc_2row_ref", &x, &mut want, 64)
+            .expect("gemv_label_par_2row (参照)");
+        let before2 = delta();
+
+        let mut out2 = vec![f32::NAN; N];
+        {
+            let _g = GemvInterceptGuard::new();
+            lin.gemv_label_par_2row("hc_2row", &x, &mut out2, 64)
+                .expect("gemv_label_par_2row");
+        }
+        assert_eq!(bits(&out2), bits(&want), "intercept 下の 2 行結果が CPU 参照と違う");
+        assert_eq!(delta(), before2 + 1, "two_row の呼び出しが CPU に届いていない");
     }
 }
