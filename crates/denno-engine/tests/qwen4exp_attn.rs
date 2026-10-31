@@ -423,6 +423,8 @@ fn q_gate_split_uses_head_local_offsets() {
     assert_eq!(l.qg_dim(), 2 * l.q_dim());
     assert_eq!(l.q_dim(), 2 * HEAD_DIM);
     assert_eq!(l.kv_dim(), HEAD_DIM);
+    // task 72: attn_q / attn_k / attn_v はどれも Q8_0 なので 1 本に連結される。
+    assert!(l.qkv_is_fused(), "q/k/v が連結されていない");
 
     // 入力 i (0..32) は値 i+1。q は列 0..15、gate は列 16..31 を読む。
     let cur: Vec<f32> = (0..N_EMBD).map(|i| (i as f32) + 1.0).collect();

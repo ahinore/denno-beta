@@ -59,7 +59,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::gguf::GgufFile;
 use crate::kquant::GgmlType;
-use crate::model::linear_gguf::GgufLinear;
+use crate::model::linear_gguf::{FusedLinear, GgufLinear};
 use crate::model::qwen4exp::{
     gemv_batch, q4prof, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams,
 };
@@ -447,12 +447,13 @@ pub struct AttnLayer {
     /// `1 / sqrt(head_dim)`。参照実装の `kq_scale` で、この arch には
     /// `attention.scale` (`f_attention_scale`) が無いので常にこの値。
     pub kq_scale: f32,
-    /// `attn_q.weight` — in `n_embd` → out `2 * n_head * head_dim`
-    wq: GgufLinear,
-    /// `attn_k.weight` — in `n_embd` → out `n_head_kv * head_dim`
-    wk: GgufLinear,
-    /// `attn_v.weight` — in `n_embd` → out `n_head_kv * head_dim`
-    wv: GgufLinear,
+    /// `attn_q.weight` (in `n_embd` → out `2 * n_head * head_dim`) /
+    /// `attn_k.weight` / `attn_v.weight` (in `n_embd` → out `n_head_kv * head_dim`)
+    /// を行方向に連結した 1 本。
+    ///
+    /// task 72: 3 本とも同じ入力 `cur` を取るので 1 回の GEMV にする。実モデルでは
+    /// どれも Q8_0 なので連結できる。行は独立なので値はビット一致する。
+    qkv: FusedLinear,
     /// `attn_output.weight` — in `n_head * head_dim` → out `n_embd`
     wo: GgufLinear,
     /// `attn_q_norm.weight` — `[head_dim]` (head 間で共有)
@@ -511,9 +512,13 @@ impl AttnLayer {
             rope_theta: p.rope_freq_base,
             rms_eps: p.rms_eps,
             kq_scale: 1.0 / (dh as f32).sqrt(),
-            wq: linear(f, &name("attn_q.weight"), p.n_embd, q_out)?,
-            wk: linear(f, &name("attn_k.weight"), p.n_embd, kv_out)?,
-            wv: linear(f, &name("attn_v.weight"), p.n_embd, kv_out)?,
+            // task 72: q / k / v は同じ入力 cur を取るので 1 本の GEMV にまとめる
+            // (実モデルはどれも Q8_0。揃わなければ自動で個別のまま)。
+            qkv: FusedLinear::concat(vec![
+                linear(f, &name("attn_q.weight"), p.n_embd, q_out)?,
+                linear(f, &name("attn_k.weight"), p.n_embd, kv_out)?,
+                linear(f, &name("attn_v.weight"), p.n_embd, kv_out)?,
+            ]),
             wo: linear(f, &name("attn_output.weight"), p.n_head * dh, p.n_embd)?,
             q_norm,
             k_norm,
@@ -537,23 +542,43 @@ impl AttnLayer {
         h * self.n_head_kv / self.n_head
     }
 
+    /// `attn_q` / `attn_k` / `attn_v` を 1 回の GEMV で投影する (task 72)。
+    ///
+    /// 戻り値は `qkv.n()` 要素。`q` / `k` / `v` の位置は [`FusedLinear::range`] で
+    /// 引く ([`Self::proj_part`])。
+    fn project_qkv_concat(&self, cur: &[f32]) -> Result<Vec<f32>> {
+        let mut buf = vec![0f32; self.qkv.n()];
+        self.qkv.gemv_concat_into("qkv", cur, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// 連結バッファから `i` 番目 (0=q, 1=k, 2=v) の行範囲を切り出す。
+    fn proj_part<'a>(&self, buf: &'a [f32], i: usize) -> &'a [f32] {
+        &buf[self.qkv.range(i)]
+    }
+
     /// `attn_q` の投影 (q と gate が交互に並ぶ)。
+    ///
+    /// task 72: q/k/v は連結されているので、この入口でも k/v を計算する
+    /// (テスト・診断用。decode の本線は [`Self::forward_token`])。
     pub fn project_q_gate(&self, cur: &[f32]) -> Result<Vec<f32>> {
-        let mut out = vec![0f32; self.qg_dim()];
-        self.wq.gemv_label("qkv", cur, &mut out)?;
-        Ok(out)
+        let buf = self.project_qkv_concat(cur)?;
+        Ok(self.proj_part(&buf, 0).to_vec())
     }
     /// `attn_k` の投影
     pub fn project_k(&self, cur: &[f32]) -> Result<Vec<f32>> {
-        let mut out = vec![0f32; self.kv_dim()];
-        self.wk.gemv_label("qkv", cur, &mut out)?;
-        Ok(out)
+        let buf = self.project_qkv_concat(cur)?;
+        Ok(self.proj_part(&buf, 1).to_vec())
     }
     /// `attn_v` の投影
     pub fn project_v(&self, cur: &[f32]) -> Result<Vec<f32>> {
-        let mut out = vec![0f32; self.kv_dim()];
-        self.wv.gemv_label("qkv", cur, &mut out)?;
-        Ok(out)
+        let buf = self.project_qkv_concat(cur)?;
+        Ok(self.proj_part(&buf, 2).to_vec())
+    }
+
+    /// task 72: q/k/v が 1 本の GEMV に連結されているか (発動確認用)。
+    pub fn qkv_is_fused(&self) -> bool {
+        self.qkv.is_fused()
     }
 
     /// `attn_q` の出力を q と gate に割る。head h の 2*dh 要素のうち
@@ -1240,13 +1265,15 @@ impl AttnLayer {
                 self.n_embd
             );
         }
-        let qg = self.project_q_gate(cur)?;
-        let (mut q, gate) = self.split_q_gate(&qg)?;
+        // task 72: q / k / v は同じ入力 cur を取るので 1 回の GEMV で得る。
+        // 行は独立なので、個別に投影した場合とビット一致する。
+        let proj = self.project_qkv_concat(cur)?;
+        let (mut q, gate) = self.split_q_gate(self.proj_part(&proj, 0))?;
         self.norm_rope_q(&mut q, pos)?;
 
-        let mut k = self.project_k(cur)?;
+        let mut k = self.proj_part(&proj, 1).to_vec();
         self.norm_rope_k(&mut k, pos)?;
-        let v = self.project_v(cur)?;
+        let v = self.proj_part(&proj, 2).to_vec();
 
         // 積んでから全 len に対して attention (参照実装の KV 書き込みと同じ順)。
         cache.push(layer, &k, &v)?;
@@ -1260,9 +1287,7 @@ impl AttnLayer {
 
     /// 1 トークンあたりの重みバイト数 (量子化ブロック + norm)。
     pub fn weight_bytes(&self) -> usize {
-        self.wq.weight_bytes()
-            + self.wk.weight_bytes()
-            + self.wv.weight_bytes()
+        self.qkv.weight_bytes()
             + self.wo.weight_bytes()
             + self.q_norm.len() * 4
             + self.k_norm.len() * 4
@@ -1508,13 +1533,13 @@ impl FullAttn {
         let qg = l.qg_dim();
 
         // 投影はチャンクで 1 回ずつ (トークンごとの `gemv` と同じカーネル)。
+        // task 72: q/k/v は 1 本に連結されているので、バッチも 1 回で回す。
         let t_qkv = q4prof::stamp();
         let mut qgs = vec![0f32; nt * qg];
-        gemv_batch(&l.wq, &flat, nt, &mut qgs)?;
         let mut ks = vec![0f32; nt * kv];
-        gemv_batch(&l.wk, &flat, nt, &mut ks)?;
         let mut vs = vec![0f32; nt * kv];
-        gemv_batch(&l.wv, &flat, nt, &mut vs)?;
+        l.qkv
+            .gemv_batch_split(&flat, nt, &mut [&mut qgs[..], &mut ks[..], &mut vs[..]])?;
         q4prof::mark_l(t_qkv, layer, q4prof::ST_QKV);
 
         // 正規化 + rope はトークンごと (pos が違う)。k は rope 後にキャッシュへ積む。

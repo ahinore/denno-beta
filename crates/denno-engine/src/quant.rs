@@ -119,6 +119,18 @@ impl WeightBlocks {
         matches!(self.src, BlocksSrc::Mapped { .. })
     }
 
+    /// mmap 越しのとき `(写像, 開始, 長さ)` を返す。
+    ///
+    /// task 72: 隣り合う 2 本のブロックを**写さずに** 1 本へまとめられるかの
+    /// 判定に使う (`Arc::ptr_eq` で同じ写像か、`off + len` が次の `off` と
+    /// 一致するかを見る)。ヒープ実体のときは `None`。
+    pub fn mapping(&self) -> Option<(&std::sync::Arc<Mmap>, usize, usize)> {
+        match &self.src {
+            BlocksSrc::Heap(_) => None,
+            BlocksSrc::Mapped { map, off, len } => Some((map, *off, *len)),
+        }
+    }
+
     /// ヒープ実体のときだけ書き込み口を返す (`Mapped` は読み取り専用)。
     pub fn heap_vec_mut(&mut self) -> Option<&mut Vec<u8>> {
         match &mut self.src {
