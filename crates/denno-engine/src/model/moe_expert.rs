@@ -276,6 +276,116 @@ unsafe fn gemv_q4k_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out
     }
 }
 
+/// [`gemv_q4k_avx2`] の**prof 版** (`DENNO_EXP_KPROF=1` のときだけ通る)。
+///
+/// 算術は本体と 1 命令ずつ同じ (nibble 抽出 → int→f32 → スケール乗算 → FMA の順、
+/// `acc0`/`acc1` の積和順も同じ) なので出力はビット一致する。面 (32 要素) ごとに
+/// `rdtsc` で dequant と FMA を切り分けて `exp_kprof` に積む。
+/// rdtsc の分だけ遅くなるので、**比率だけ**を読むこと。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_q4k_avx2_prof(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    mat: usize,
+) {
+    use crate::model::exp_kprof::{add_ticks, DEQ, FMA, WB};
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 144;
+    let nb = n_in / 256;
+    let rb = nb * BLK;
+    let gsum = group_sums_32(x);
+    let xp = x.as_ptr();
+    let bp = blocks.as_ptr();
+
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn hsum8(v: __m256) -> f32 {
+        let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        let s = _mm_add_ss(s, _mm_shuffle_ps::<0x55>(s, s));
+        _mm_cvtss_f32(s)
+    }
+
+    /// fma32 を「dequant (4 本のスケール済み重み)」と「FMA」に割って時間を積む。
+    macro_rules! prof_face {
+        ($acc:expr, $nib:expr, $xb:expr, $dv:expr, $sample:expr) => {{
+            let take = $sample;
+            let t0 = if take { _rdtsc() } else { 0 };
+            let l = _mm256_castsi256_si128($nib);
+            let h = _mm256_extracti128_si256::<1>($nib);
+            let p0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(l)), $dv);
+            let p1 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(l))),
+                $dv,
+            );
+            let p2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(h)), $dv);
+            let p3 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(h))),
+                $dv,
+            );
+            let t1 = if take { _rdtsc() } else { 0 };
+            let mut a = $acc;
+            a = _mm256_fmadd_ps(p0, _mm256_loadu_ps($xb), a);
+            a = _mm256_fmadd_ps(p1, _mm256_loadu_ps($xb.add(8)), a);
+            a = _mm256_fmadd_ps(p2, _mm256_loadu_ps($xb.add(16)), a);
+            a = _mm256_fmadd_ps(p3, _mm256_loadu_ps($xb.add(24)), a);
+            let t2 = if take { _rdtsc() } else { 0 };
+            if take {
+                add_ticks(mat, DEQ, t1.wrapping_sub(t0));
+                add_ticks(mat, FMA, t2.wrapping_sub(t1));
+            }
+            a
+        }};
+    }
+
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut total = 0.0f32;
+        for b in 0..nb {
+            // rdtsc は 1 回 20-30 サイクルなので 8 ブロックに 1 回だけ取る
+            // (比率は偏らない。絶対値の歪みは 1 割程度に収まる)。
+            let sample = b % crate::model::exp_kprof::SAMPLE_EVERY == 0;
+            let blk = std::slice::from_raw_parts(row.add(b * BLK), BLK);
+            let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+            let dmin = half::f16::from_le_bytes([blk[2], blk[3]]).to_f32();
+            let sc = &blk[4..16];
+            let qrow = blk.as_ptr().add(16);
+            let mut acc0 = _mm256_setzero_ps();
+            let mut acc1 = _mm256_setzero_ps();
+            let mut minsum = 0.0f32;
+            for j in 0..4usize {
+                let (s0, m0) = scale_min_k4(2 * j, sc);
+                let (s1, m1) = scale_min_k4(2 * j + 1, sc);
+                let dv0 = _mm256_set1_ps(d * s0 as f32);
+                let dv1 = _mm256_set1_ps(d * s1 as f32);
+                let qv = _mm256_loadu_si256(qrow.add(j * 32) as *const __m256i);
+                let lo = _mm256_and_si256(qv, _mm256_set1_epi8(0x0f));
+                let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(qv), _mm256_set1_epi8(0x0f));
+                let g = b * 8 + j * 2;
+                let xb = xp.add(b * 256 + j * 64);
+                acc0 = prof_face!(acc0, lo, xb, dv0, sample);
+                acc1 = prof_face!(acc1, hi, xb.add(32), dv1, sample);
+                minsum += dmin * m0 as f32 * *gsum.get_unchecked(g);
+                minsum += dmin * m1 as f32 * *gsum.get_unchecked(g + 1);
+            }
+            if sample {
+                let t3 = _rdtsc();
+                total += hsum8(_mm256_add_ps(acc0, acc1)) - minsum;
+                let t4 = _rdtsc();
+                add_ticks(mat, WB, t4.wrapping_sub(t3));
+            } else {
+                total += hsum8(_mm256_add_ps(acc0, acc1)) - minsum;
+            }
+        }
+        *out.get_unchecked_mut(r) = total;
+    }
+}
+
 /// 引数検証 (スカラー経路と融合経路で共通)。行バイト数を返す。
 fn check_gemv_args(
     ty: GgmlType,
@@ -503,6 +613,15 @@ fn expert_gemv_inner(
     if ty == GgmlType::Q4K && q4k_fused_supported() {
         #[cfg(target_arch = "x86_64")]
         {
+            // `DENNO_EXP_KPROF=1` のときだけ prof 版 (dequant / FMA を rdtsc で
+            // 切り分ける)。既定は通らない (分岐 1 回だけ)。
+            if crate::model::exp_kprof::on() {
+                let mat = crate::model::exp_kprof::cur_mat();
+                unsafe { gemv_q4k_avx2_prof(blocks, n_in, n_out, x, out, mat) };
+                #[cfg(test)]
+                FUSED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
             // SAFETY: check_gemv_args が n_in%256==0・blocks/x/out の長さを検証済みで、
             // q4k_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
             // 行は独立なので、チャンク分割しても各要素の計算順序は変わらない。
@@ -577,9 +696,37 @@ unsafe fn gemv_q8_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
 /// (下位 4 ビット、要素 j と j+16 を 1 バイトに詰める)。`w = d*q + m` なので
 /// `dot(w, x) = d*dot(q, x) + m*sum(x)` に分け、`sum(x)` はブロック位置ごとに
 /// 1 度だけ作る。5 ビットの展開はスカラーで行う (32 要素で 100 命令程度)。
+/// Q5_1 の 5 ビット目の展開を SIMD で行うか (`DENNO_Q51_SIMD=0` で従来のスカラー展開)。
+///
+/// スカラー展開は 1 ブロック (32 要素) あたり 16 回のループで `q[32]` を組み立ててから
+/// 32 バイトのロードで読み直す (store-to-load forwarding が効かない形)。SIMD 版は
+/// `vpsrlvd` で 5 ビット目を 8 レーンぶんまとめて取り出す。**値は同じ** (int→f32 の
+/// 変換も積和の順も変えない) ので、出力はビット一致する。
+fn q51_simd_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("DENNO_Q51_SIMD")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("0") | Some("off") | Some("false")
+        )
+    })
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn gemv_q5_1_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
+unsafe fn gemv_q5_1_avx2(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    simd: bool,
+) {
     use std::arch::x86_64::*;
 
     const BLK: usize = 24;
@@ -610,34 +757,89 @@ unsafe fn gemv_q5_1_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
             let p = row.add(b * BLK);
             let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
             let m = half::f16::from_bits(std::ptr::read_unaligned(p.add(2) as *const u16)).to_f32();
-            let qh = std::ptr::read_unaligned(p.add(4) as *const u32);
-            let qs = p.add(8);
-            for j in 0..16 {
-                let byte = *qs.add(j);
-                let xh0 = (((qh >> j) << 4) & 0x10) as u8 as i32;
-                let xh1 = ((qh >> (j + 12)) & 0x10) as i32;
-                q[j] = (((byte & 0x0f) as i32) | xh0) as f32;
-                q[j + 16] = (((byte >> 4) as i32) | xh1) as f32;
-            }
             let dv = _mm256_set1_ps(d);
             let xb = xp.add(b * 32);
-            let qp = q.as_ptr();
-            a0 = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_loadu_ps(qp), dv), _mm256_loadu_ps(xb), a0);
-            a1 = _mm256_fmadd_ps(
-                _mm256_mul_ps(_mm256_loadu_ps(qp.add(8)), dv),
-                _mm256_loadu_ps(xb.add(8)),
-                a1,
-            );
-            a2 = _mm256_fmadd_ps(
-                _mm256_mul_ps(_mm256_loadu_ps(qp.add(16)), dv),
-                _mm256_loadu_ps(xb.add(16)),
-                a2,
-            );
-            a3 = _mm256_fmadd_ps(
-                _mm256_mul_ps(_mm256_loadu_ps(qp.add(24)), dv),
-                _mm256_loadu_ps(xb.add(24)),
-                a3,
-            );
+            if simd {
+                // 5 ビット目: 要素 j (0..16) は bit j、要素 j+16 は bit j+16 を 0x10 として足す。
+                let qh = _mm256_set1_epi32(std::ptr::read_unaligned(p.add(4) as *const i32));
+                let raw = _mm_loadu_si128(p.add(8) as *const __m128i);
+                let lo4 = _mm_and_si128(raw, _mm_set1_epi8(0x0f));
+                let hi4 = _mm_and_si128(_mm_srli_epi16(raw, 4), _mm_set1_epi8(0x0f));
+                let one = _mm256_set1_epi32(1);
+                let b0 = _mm256_slli_epi32::<4>(_mm256_and_si256(
+                    _mm256_srlv_epi32(qh, _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7)),
+                    one,
+                ));
+                let b1 = _mm256_slli_epi32::<4>(_mm256_and_si256(
+                    _mm256_srlv_epi32(qh, _mm256_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15)),
+                    one,
+                ));
+                let b2 = _mm256_slli_epi32::<4>(_mm256_and_si256(
+                    _mm256_srlv_epi32(qh, _mm256_setr_epi32(16, 17, 18, 19, 20, 21, 22, 23)),
+                    one,
+                ));
+                let b3 = _mm256_slli_epi32::<4>(_mm256_and_si256(
+                    _mm256_srlv_epi32(qh, _mm256_setr_epi32(24, 25, 26, 27, 28, 29, 30, 31)),
+                    one,
+                ));
+                let lo = _mm256_or_si256(_mm256_cvtepu8_epi32(lo4), b0);
+                let lo2 =
+                    _mm256_or_si256(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(lo4)), b1);
+                let hi = _mm256_or_si256(_mm256_cvtepu8_epi32(hi4), b2);
+                let hi2 =
+                    _mm256_or_si256(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(hi4)), b3);
+                a0 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(lo), dv),
+                    _mm256_loadu_ps(xb),
+                    a0,
+                );
+                a1 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(lo2), dv),
+                    _mm256_loadu_ps(xb.add(8)),
+                    a1,
+                );
+                a2 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(hi), dv),
+                    _mm256_loadu_ps(xb.add(16)),
+                    a2,
+                );
+                a3 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(hi2), dv),
+                    _mm256_loadu_ps(xb.add(24)),
+                    a3,
+                );
+            } else {
+                let qh = std::ptr::read_unaligned(p.add(4) as *const u32);
+                let qs = p.add(8);
+                for j in 0..16 {
+                    let byte = *qs.add(j);
+                    let xh0 = (((qh >> j) << 4) & 0x10) as u8 as i32;
+                    let xh1 = ((qh >> (j + 12)) & 0x10) as i32;
+                    q[j] = (((byte & 0x0f) as i32) | xh0) as f32;
+                    q[j + 16] = (((byte >> 4) as i32) | xh1) as f32;
+                }
+                let qp = q.as_ptr();
+                a0 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(_mm256_loadu_ps(qp), dv),
+                    _mm256_loadu_ps(xb),
+                    a0,
+                );
+                a1 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(_mm256_loadu_ps(qp.add(8)), dv),
+                    _mm256_loadu_ps(xb.add(8)),
+                    a1,
+                );
+                a2 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(_mm256_loadu_ps(qp.add(16)), dv),
+                    _mm256_loadu_ps(xb.add(16)),
+                    a2,
+                );
+                a3 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(_mm256_loadu_ps(qp.add(24)), dv),
+                    _mm256_loadu_ps(xb.add(24)),
+                    a3,
+                );
+            }
             macc += m * gsum[b];
         }
         let s01 = _mm256_add_ps(a0, a1);
@@ -647,6 +849,128 @@ unsafe fn gemv_q5_1_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
         let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
         let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
         out[r] = _mm_cvtss_f32(h) + macc;
+    }
+}
+
+/// [`gemv_q5_1_avx2`] の**prof 版** (`DENNO_EXP_KPROF=1` のときだけ通る)。
+///
+/// 算術は本体と 1 命令ずつ同じ (変換→スケール乗算→FMA の順、`a0..a3` の積和順も同じ)
+/// なので出力はビット一致する。ブロックごとに `rdtsc` で dequant と FMA を切り分けて
+/// `exp_kprof` に積む。rdtsc の分だけ遅くなるので、**比率だけ**を読むこと。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_q5_1_avx2_prof(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    mat: usize,
+    simd: bool,
+) {
+    use std::arch::x86_64::*;
+    use crate::model::exp_kprof::{add_ticks, DEQ, FMA, WB};
+
+    const BLK: usize = 24;
+    let nb = n_in / 32;
+    let rb = nb * BLK;
+    let xp = x.as_ptr();
+    let bp = blocks.as_ptr();
+
+    let mut gsum = vec![0f32; nb];
+    for (b, g) in gsum.iter_mut().enumerate() {
+        let mut acc = 0f32;
+        for j in 0..32 {
+            acc += *xp.add(b * 32 + j);
+        }
+        *g = acc;
+    }
+
+    let mut q = [0f32; 32];
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        let mut macc = 0f32;
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let m = half::f16::from_bits(std::ptr::read_unaligned(p.add(2) as *const u16)).to_f32();
+            let dv = _mm256_set1_ps(d);
+            let xb = xp.add(b * 32);
+            let take = b % crate::model::exp_kprof::SAMPLE_EVERY == 0;
+            let t0 = if take { _rdtsc() } else { 0 };
+            let (w0, w1, w2, w3);
+            if simd {
+                let qh = _mm256_set1_epi32(std::ptr::read_unaligned(p.add(4) as *const i32));
+                let raw = _mm_loadu_si128(p.add(8) as *const __m128i);
+                let lo4 = _mm_and_si128(raw, _mm_set1_epi8(0x0f));
+                let hi4 = _mm_and_si128(_mm_srli_epi16(raw, 4), _mm_set1_epi8(0x0f));
+                let one = _mm256_set1_epi32(1);
+                let b0 = _mm256_slli_epi32::<4>(_mm256_and_si256(
+                    _mm256_srlv_epi32(qh, _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7)),
+                    one,
+                ));
+                let b1 = _mm256_slli_epi32::<4>(_mm256_and_si256(
+                    _mm256_srlv_epi32(qh, _mm256_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15)),
+                    one,
+                ));
+                let b2 = _mm256_slli_epi32::<4>(_mm256_and_si256(
+                    _mm256_srlv_epi32(qh, _mm256_setr_epi32(16, 17, 18, 19, 20, 21, 22, 23)),
+                    one,
+                ));
+                let b3 = _mm256_slli_epi32::<4>(_mm256_and_si256(
+                    _mm256_srlv_epi32(qh, _mm256_setr_epi32(24, 25, 26, 27, 28, 29, 30, 31)),
+                    one,
+                ));
+                let l0 = _mm256_or_si256(_mm256_cvtepu8_epi32(lo4), b0);
+                let l1 = _mm256_or_si256(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(lo4)), b1);
+                let h0 = _mm256_or_si256(_mm256_cvtepu8_epi32(hi4), b2);
+                let h1 = _mm256_or_si256(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(hi4)), b3);
+                w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(l0), dv);
+                w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(l1), dv);
+                w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(h0), dv);
+                w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(h1), dv);
+            } else {
+                let qh = std::ptr::read_unaligned(p.add(4) as *const u32);
+                let qs = p.add(8);
+                for j in 0..16 {
+                    let byte = *qs.add(j);
+                    let xh0 = (((qh >> j) << 4) & 0x10) as u8 as i32;
+                    let xh1 = ((qh >> (j + 12)) & 0x10) as i32;
+                    q[j] = (((byte & 0x0f) as i32) | xh0) as f32;
+                    q[j + 16] = (((byte >> 4) as i32) | xh1) as f32;
+                }
+                let qp = q.as_ptr();
+                w0 = _mm256_mul_ps(_mm256_loadu_ps(qp), dv);
+                w1 = _mm256_mul_ps(_mm256_loadu_ps(qp.add(8)), dv);
+                w2 = _mm256_mul_ps(_mm256_loadu_ps(qp.add(16)), dv);
+                w3 = _mm256_mul_ps(_mm256_loadu_ps(qp.add(24)), dv);
+            }
+            macc += m * gsum[b];
+            let t1 = if take { _rdtsc() } else { 0 };
+            a0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xb), a0);
+            a1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xb.add(8)), a1);
+            a2 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(xb.add(16)), a2);
+            a3 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(xb.add(24)), a3);
+            let t2 = if take { _rdtsc() } else { 0 };
+            if take {
+                add_ticks(mat, DEQ, t1.wrapping_sub(t0));
+                add_ticks(mat, FMA, t2.wrapping_sub(t1));
+            }
+        }
+        let t3 = _rdtsc();
+        let s01 = _mm256_add_ps(a0, a1);
+        let s23 = _mm256_add_ps(a2, a3);
+        let s = _mm256_add_ps(s01, s23);
+        let h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+        let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+        let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
+        out[r] = _mm_cvtss_f32(h) + macc;
+        let t4 = _rdtsc();
+        add_ticks(mat, WB, t4.wrapping_sub(t3));
     }
 }
 
@@ -676,6 +1000,12 @@ fn expert_gemv_q5_1_inner(
             // SAFETY: 引数は check_gemv_args が検証済み (n_in%32==0 は直前で確認) で、
             // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
             let rb = n_in / 32 * 24;
+            let simd = q51_simd_enabled();
+            if crate::model::exp_kprof::on() {
+                let mat = crate::model::exp_kprof::cur_mat();
+                unsafe { gemv_q5_1_avx2_prof(blocks, n_in, n_out, x, out, mat, simd) };
+                return Ok(());
+            }
             for_each_row_chunk(
                 blocks,
                 n_out,
@@ -684,7 +1014,7 @@ fn expert_gemv_q5_1_inner(
                 par,
                 PAR_MIN_ROWS,
                 PAR_MIN_CHUNK_ROWS,
-                |b, o| unsafe { gemv_q5_1_avx2(b, n_in, o.len(), x, o) },
+                |b, o| unsafe { gemv_q5_1_avx2(b, n_in, o.len(), x, o, simd) },
             );
             return Ok(());
         }
@@ -904,7 +1234,11 @@ fn expert_gemv_any_inner(
     out: &mut [f32],
     par: bool,
 ) -> Result<()> {
-    match ty {
+    // `DENNO_EXP_KPROF=1` のときだけ、呼び出し全体の時間と読んだ重みのバイトを積む。
+    // 既定 off では `stamp()` が `None` を返すので分岐 1 回だけ。
+    let prof = crate::model::exp_kprof::stamp();
+    let mat = crate::model::exp_kprof::cur_mat();
+    let res = match ty {
         GgmlType::Q5_1 => expert_gemv_q5_1_inner(blocks, n_in, n_out, x, out, par),
         GgmlType::Q8_0 => expert_gemv_q8_inner(
             blocks,
@@ -917,7 +1251,13 @@ fn expert_gemv_any_inner(
             PAR_MIN_CHUNK_ROWS,
         ),
         _ => expert_gemv_inner(ty, blocks, n_in, n_out, x, out, par),
+    };
+    if let Some(t) = prof {
+        if res.is_ok() {
+            crate::model::exp_kprof::record_call(mat, blocks.len(), n_out, t.elapsed());
+        }
     }
+    res
 }
 
 /// スカラー経路そのもの (`dequant_row_into` + [`dot_seq`])。**ビット一致の基準**。
@@ -6000,4 +6340,269 @@ mod tests {
         }
     }
 
+}
+
+/// `DENNO_EXP_KPROF` (P77) の検証と、Q5_1 の 5bit SIMD 展開のマイクロベンチ。
+#[cfg(test)]
+mod exp_kprof_tests {
+    use super::*;
+    use crate::model::exp_kprof as kp;
+
+    /// `exp_kprof` の強制フラグはプロセス全体なので、触るテストは直列化する。
+    fn kprof_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn f16b(v: f32) -> [u8; 2] {
+        half::f16::from_f32(v).to_le_bytes()
+    }
+
+    fn byte_at(i: usize, seed: u32) -> u8 {
+        let mut x = (i as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(seed.wrapping_mul(40_503));
+        x ^= x >> 13;
+        x = x.wrapping_mul(0x9E37_79B1);
+        x ^= x >> 16;
+        x as u8
+    }
+
+    /// Q4_K の 1 expert ぶん (`n_out * (n_in/256) * 144` バイト)。
+    fn q4k_expert(n_in: usize, n_out: usize) -> Vec<u8> {
+        let nb = n_in / 256;
+        let mut v = Vec::with_capacity(n_out * nb * 144);
+        for r in 0..n_out {
+            for b in 0..nb {
+                let seed = (r * 131 + b * 17) as u32 + 3;
+                let mut blk = [0u8; 144];
+                blk[0..2].copy_from_slice(&f16b(0.01));
+                blk[2..4].copy_from_slice(&f16b(0.005));
+                for i in 4..144 {
+                    blk[i] = byte_at(i, seed);
+                }
+                v.extend_from_slice(&blk);
+            }
+        }
+        v
+    }
+
+    /// Q5_1 の 1 expert ぶん (`n_out * (n_in/32) * 24` バイト)。
+    fn q5_1_expert(n_in: usize, n_out: usize) -> Vec<u8> {
+        let nb = n_in / 32;
+        let mut v = Vec::with_capacity(n_out * nb * 24);
+        for r in 0..n_out {
+            for b in 0..nb {
+                let seed = (r * 131 + b * 17) as u32 + 5;
+                let mut blk = [0u8; 24];
+                blk[0..2].copy_from_slice(&f16b(0.01));
+                blk[2..4].copy_from_slice(&f16b(-0.004));
+                for i in 4..24 {
+                    blk[i] = byte_at(i, seed);
+                }
+                v.extend_from_slice(&blk);
+            }
+        }
+        v
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|f| f.to_bits()).collect()
+    }
+
+    /// prof カーネルは本体と**ビット一致**し、区間のカウンタが積まれる。
+    ///
+    /// ゲートが実際に prof 側へ分岐した証拠は「tick が 0 でないこと」で見る
+    /// (緑 = 分岐した、ではないため)。
+    #[test]
+    fn prof_kernels_are_bit_identical_and_count_ticks() {
+        let _g = kprof_lock();
+        let (n_in, n_out) = (512usize, 64usize);
+        let x: Vec<f32> = (0..n_in)
+            .map(|i| ((i as f32) * 0.017).sin() + 0.1 * (i % 7) as f32)
+            .collect();
+
+        for ty in [GgmlType::Q4K, GgmlType::Q5_1] {
+            let blocks = if ty == GgmlType::Q4K {
+                q4k_expert(n_in, n_out)
+            } else {
+                q5_1_expert(n_in, n_out)
+            };
+            let mut plain = vec![0.0f32; n_out];
+            let mut prof = vec![0.0f32; n_out];
+            kp::set_for_test(false);
+            expert_gemv_any(ty, &blocks, n_in, n_out, &x, &mut plain).expect("本体");
+            kp::set_for_test(true);
+            kp::set_mat(kp::GATE);
+            let before = kp::mat_stats(kp::GATE);
+            let ticks_before = kp::kernel_ns(kp::GATE, kp::DEQ);
+            expert_gemv_any(ty, &blocks, n_in, n_out, &x, &mut prof).expect("prof");
+            let after = kp::mat_stats(kp::GATE);
+            let ticks_after = kp::kernel_ns(kp::GATE, kp::DEQ);
+            kp::set_for_test(false);
+            kp::set_mat(kp::OTHER);
+
+            assert_eq!(
+                bits(&plain),
+                bits(&prof),
+                "{ty:?}: prof カーネルがビット一致しない"
+            );
+            assert!(plain.iter().any(|v| *v != 0.0), "{ty:?}: 出力が全 0");
+            assert!(
+                after.0 > before.0,
+                "{ty:?}: prof 経路の呼び出しが数えられていない"
+            );
+            // カウンタはプロセス全体なので、並列に走る他のテストの分が混ざりうる
+            // (下限で見る)。
+            assert!(
+                after.1 - before.1 >= blocks.len() as u64,
+                "{ty:?}: 読んだバイトが足りない ({} < {})",
+                after.1 - before.1,
+                blocks.len()
+            );
+            assert!(ticks_after > ticks_before, "{ty:?}: dequant の tick が 0");
+            assert!(
+                kp::kernel_ns(kp::GATE, kp::FMA) > 0.0,
+                "{ty:?}: FMA の tick が 0"
+            );
+        }
+    }
+
+    /// レポート行は行列ごとの GB/s と区間の割合を出す (無効時は None)。
+    #[test]
+    fn prof_report_has_per_matrix_rows() {
+        let _g = kprof_lock();
+        kp::set_for_test(false);
+        assert!(kp::line().is_none(), "off なのにレポートが出た");
+        kp::reset();
+        kp::set_for_test(true);
+        let (n_in, n_out) = (256usize, 8usize);
+        let blocks = q4k_expert(n_in, n_out);
+        let x = vec![0.5f32; n_in];
+        let mut out = vec![0.0f32; n_out];
+        kp::set_mat(kp::GATE);
+        kp::bump_layer();
+        expert_gemv_any(GgmlType::Q4K, &blocks, n_in, n_out, &x, &mut out).expect("gemv");
+        let s = kp::line().expect("on なのにレポートが無い");
+        kp::set_for_test(false);
+        kp::set_mat(kp::OTHER);
+        kp::reset();
+        assert!(s.contains("layers=1"), "{s}");
+        assert!(s.contains("gate calls=1"), "{s}");
+        assert!(s.contains("GB/s"), "{s}");
+        assert!(s.contains("dequant"), "{s}");
+        assert!(s.contains("fma"), "{s}");
+        assert!(s.contains("writeback"), "{s}");
+    }
+
+    /// Q5_1 の 5bit SIMD 展開はスカラー展開と**ビット一致**する。
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn q51_simd_matches_scalar_expansion() {
+        if !q8_0_fused_supported() {
+            return;
+        }
+        let (n_in, n_out) = (640usize, 256usize);
+        let blocks = q5_1_expert(n_in, n_out);
+        let x: Vec<f32> = (0..n_in).map(|i| ((i as f32) * 0.031).cos()).collect();
+        let mut a = vec![0.0f32; n_out];
+        let mut b = vec![0.0f32; n_out];
+        unsafe {
+            gemv_q5_1_avx2(&blocks, n_in, n_out, &x, &mut a, false);
+            gemv_q5_1_avx2(&blocks, n_in, n_out, &x, &mut b, true);
+        }
+        assert_eq!(bits(&a), bits(&b), "SIMD 展開がスカラー展開と一致しない");
+        assert!(a.iter().any(|v| *v != 0.0), "出力が全 0");
+    }
+
+    /// P77 マイクロベンチ: Q5_1 (down 相当、2560 行 x 640 列) を 8 スレッドで回し、
+    /// 5bit SIMD 展開の有無で GB/s を比べる。**同一実行内で交互に測り min を取る**
+    /// (共有ホストなので 1 回測りを信じない)。
+    ///
+    /// 実行: `cargo test --release -p denno-engine --lib --features par -- --ignored \
+    ///        --nocapture --test-threads=1 bench_q51_simd_gbs`
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "P77 マイクロベンチ (実測。通常のテストでは走らせない)"]
+    fn bench_q51_simd_gbs() {
+        if !q8_0_fused_supported() {
+            eprintln!("[bench77] AVX2/FMA が無いので計測しない");
+            return;
+        }
+        let (n_in, n_out) = (640usize, 2560usize);
+        let row_bytes = (n_in / 32) * 24;
+        let matrix = q5_1_expert(n_in, n_out);
+        assert_eq!(matrix.len(), n_out * row_bytes);
+        let copies = 768usize; // 768 x 1,228,800 B = 944 MB (L3 16 MB の外)
+        let mut buf = Vec::with_capacity(matrix.len() * copies);
+        for _ in 0..copies {
+            buf.extend_from_slice(&matrix);
+        }
+        let x: Vec<f32> = (0..n_in).map(|i| ((i as f32) * 0.031).cos()).collect();
+
+        let run = |simd: bool, threads: usize| -> Vec<f32> {
+            let per = copies / threads;
+            let mut outs: Vec<Vec<f32>> = (0..threads).map(|_| vec![0.0f32; n_out]).collect();
+            std::thread::scope(|sc| {
+                for (t, o) in outs.iter_mut().enumerate() {
+                    let b = &buf[t * per * row_bytes..(t + 1) * per * row_bytes];
+                    let xr = &x;
+                    sc.spawn(move || {
+                        let om = o.as_mut_slice();
+                        for c in 0..per {
+                            unsafe {
+                                gemv_q5_1_avx2(
+                                    &b[c * row_bytes..(c + 1) * row_bytes],
+                                    n_in,
+                                    n_out,
+                                    xr,
+                                    om,
+                                    simd,
+                                )
+                            };
+                        }
+                    });
+                }
+            });
+            outs[0].clone()
+        };
+
+        // 値の一致 (同じバイト列に対して 2 経路が同じ値を出す)
+        let a = run(false, 1);
+        let b = run(true, 1);
+        assert_eq!(bits(&a), bits(&b), "SIMD 経路がビット一致しない");
+
+        let reps = 7usize;
+        let mut ms = [[f64::INFINITY; 2]; 3];
+        for threads in [8usize, 16] {
+            let mut v0 = Vec::new();
+            let mut v1 = Vec::new();
+            for rep in 0..reps {
+                for vi in 0..2 {
+                    let vi = (vi + rep) % 2;
+                    let t0 = std::time::Instant::now();
+                    let out = run(vi == 1, threads);
+                    let d = t0.elapsed().as_secs_f64() * 1e3;
+                    std::hint::black_box(&out);
+                    if vi == 0 {
+                        v0.push(d);
+                    } else {
+                        v1.push(d);
+                    }
+                }
+            }
+            let mn = |v: &Vec<f64>| v.iter().cloned().fold(f64::INFINITY, f64::min);
+            let gb = (buf.len() as f64 / 1e6) / 1e3;
+            let (m0, m1) = (mn(&v0), mn(&v1));
+            eprintln!(
+                "[bench77] threads={threads} {:.0} MB x {reps} | スカラー展開 min {m0:.2} ms                  ({:.2} GB/s) | SIMD 展開 min {m1:.2} ms ({:.2} GB/s) | {:.3}x",
+                buf.len() as f64 / 1e6,
+                gb / (m0 / 1e3),
+                gb / (m1 / 1e3),
+                m0 / m1
+            );
+            ms[if threads == 8 { 0 } else { 1 }] = [m0, m1];
+        }
+        let _ = ms;
+    }
 }

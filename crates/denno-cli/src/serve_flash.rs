@@ -254,6 +254,11 @@ fn prof_flash_q4(tag: &str, tok: usize) {
         eprintln!("{line}");
         denno_engine::model::qwen4exp::mix_kprof::reset();
     }
+    // expert GEMV の区間内訳 (`DENNO_EXP_KPROF=1` のときだけ 1 行 × 行列数)。
+    if let Some(line) = denno_engine::model::exp_kprof::line() {
+        eprintln!("{line}");
+        denno_engine::model::exp_kprof::reset();
+    }
     if !q4prof::enabled() {
         return;
     }

@@ -4761,6 +4761,7 @@ fn moe_ffn_quant_impl(
             if flat_new {
                 let mut hs = vec![0.0f32; sel.len() * e];
                 expert_contribs_flat_decode_into(lw, &sel, x, e, ff, &mut hs, DECODE_FLAT_ROWS)?;
+                let t_scat = crate::model::exp_kprof::stamp();
                 for (t, _) in sel.iter().enumerate() {
                     let pe = weights[t];
                     let hh = &hs[t * e..(t + 1) * e];
@@ -4768,6 +4769,7 @@ fn moe_ffn_quant_impl(
                         out[j] += pe * hh[j];
                     }
                 }
+                crate::model::exp_kprof::mark(t_scat, crate::model::exp_kprof::SCAT);
             } else if expert_scratch_enabled() {
                 let mut hs = vec![0.0f32; sel.len() * e];
                 expert_contribs_par_into(lw, &sel, x, e, ff, cache, &mut hs)?;
@@ -7153,6 +7155,12 @@ fn expert_contribs_flat_decode_into(
     #[cfg(test)]
     FLAT_DECODE_REGIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+    // `DENNO_EXP_KPROF=1` のときだけ区間を積む (既定 off では `stamp()` が None)。
+    use crate::model::exp_kprof as kp;
+    kp::bump_layer();
+    let t_phase = kp::stamp();
+    let t_gather1 = kp::stamp();
+
     // gate / up の中間結果を 1 本ずつ確保する (sel.len() * ff 要素。実形で 25 KB)。
     let mut act = vec![0.0f32; sel.len() * ff];
     let mut up = vec![0.0f32; sel.len() * ff];
@@ -7199,7 +7207,9 @@ fn expert_contribs_flat_decode_into(
     }
     #[cfg(test)]
     FLAT_DECODE_TASKS.fetch_add(jobs.len(), std::sync::atomic::Ordering::Relaxed);
+    kp::mark(t_gather1, kp::GATHER);
     jobs.into_par_iter().try_for_each(|j| -> Result<()> {
+        kp::set_mat(if j.mat == 0 { kp::GATE } else { kp::UP });
         if j.mat == 0 {
             lw.gate_exps.gemv_rows_seq(j.ei, j.r0, j.r1, x, j.out)
         } else {
@@ -7209,6 +7219,7 @@ fn expert_contribs_flat_decode_into(
 
     // silu(act) * up。expert ごとに従来と同じ順で適用する (要素ごとの演算なので
     // expert 間の順序は値に影響しない)。
+    let t_silu = kp::stamp();
     for t in 0..sel.len() {
         let a = &mut act[t * ff..(t + 1) * ff];
         silu_inplace(a);
@@ -7217,6 +7228,7 @@ fn expert_contribs_flat_decode_into(
             a[r] *= u[r];
         }
     }
+    kp::mark(t_silu, kp::SILU);
 
     /// 1 タスク = down の 1 行チャンク (入力は expert ごとの `act`)。
     struct DownJob<'a> {
@@ -7228,6 +7240,7 @@ fn expert_contribs_flat_decode_into(
     }
 
     // 位相 2: down の行。出力は最終寄与 `hs` へ直接書く (expert ごとの Vec を作らない)。
+    let t_gather2 = kp::stamp();
     let mut djobs: Vec<DownJob> = Vec::new();
     {
         let mut hr: &mut [f32] = hs;
@@ -7251,10 +7264,13 @@ fn expert_contribs_flat_decode_into(
     }
     #[cfg(test)]
     FLAT_DECODE_TASKS.fetch_add(djobs.len(), std::sync::atomic::Ordering::Relaxed);
+    kp::mark(t_gather2, kp::GATHER);
     djobs.into_par_iter().try_for_each(|j| -> Result<()> {
+        kp::set_mat(kp::DOWN);
         lw.down_exps
             .gemv_rows_seq(j.ei, j.r0, j.r1, j.inp, j.out)
     })?;
+    kp::mark(t_phase, kp::TOTAL);
     Ok(())
 }
 
@@ -7282,12 +7298,16 @@ fn expert_contrib_one(
     match cache {
         // 従来経路: mmap のスライスを直接 GEMV する (行並列なし)。
         None => {
+            let kp = crate::model::exp_kprof::set_mat;
+            kp(crate::model::exp_kprof::GATE);
             lw.gate_exps.gemv_seq(ei, x, act)?;
             silu_inplace(act);
+            kp(crate::model::exp_kprof::UP);
             lw.up_exps.gemv_seq(ei, x, up)?;
             for r in 0..act.len() {
                 act[r] *= up[r];
             }
+            kp(crate::model::exp_kprof::DOWN);
             lw.down_exps.gemv_seq(ei, act, h)?;
         }
         // 常駐キャッシュ経路。バイト列の出所だけが違う。
@@ -8914,6 +8934,125 @@ mod tests {
                 layer_best[1] * 48.0,
             );
         }
+    }
+
+    /// P77 マイクロベンチ: 実形 (e=2560 / ff=640 / 512 expert / top-10) の 1 層を
+    /// 平坦化経路で 1 回回し、`DENNO_EXP_KPROF` の区間内訳を出す。
+    ///
+    /// 実行: `DENNO_EXP_KPROF=1 cargo test --release -p denno-engine --lib --features par \
+    ///        -- --ignored --nocapture --test-threads=1 bench_exp_kprof_layer`
+    ///
+    /// **この環境 (dev コンテナ) の値**。実機の decode は main が測る。
+    #[test]
+    #[cfg(feature = "par")]
+    #[ignore = "P77 マイクロベンチ (実測。通常のテストでは走らせない)"]
+    fn bench_exp_kprof_layer() {
+        use crate::model::exp_kprof as kp;
+        gpu_gemm_off();
+        let _g = moe_test_guard();
+        let (n_embd, n_ff, ne, k) = (2560usize, 640usize, 512usize, 10usize);
+        let x = cache_test_x_seed(n_embd, 0);
+        let sel: Vec<usize> = (0..k).collect();
+        let dir = TempDir::new("p77bench");
+        let path = dir.path("kprof_bench.gguf");
+        write_expert_gguf_sparse(&path, n_embd, n_ff, ne, &sel);
+        let f = GgufFile::open(&path).expect("open");
+        let p = params_dims(n_embd, n_ff, ne, k);
+        let mut lw = layer_at(&f, &p, 0);
+        lw.gate_inp = gate_inp_for(&x, ne);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .expect("pool");
+        let run = |on: bool| {
+            kp::set_for_test(on);
+            kp::reset();
+            let out = pool
+                .install(|| {
+                    moe_ffn_quant_impl(
+                        &p, &lw, &x, None, true, Route::Cpu, None, false, false, true,
+                    )
+                })
+                .expect("層 1 回");
+            (out, if on { kp::line() } else { None })
+        };
+        // 1 回目はページフォルト込みなので捨てる (2 回目を測る)。
+        let _ = run(false);
+        let _ = run(true);
+        let (want, _) = run(false);
+        let (got, line) = run(true);
+        kp::set_for_test(false);
+        assert_bitwise_eq(&want, &got, "prof on/off の層 1 回");
+        // 1 トークン = 48 層なので、この 1 層の 48 倍が decode の expert 時間になる。
+        for l in line.expect("レポート").lines() {
+            eprintln!("{l}");
+        }
+        let (calls, bytes, rows, ns) = kp::mat_stats(kp::GATE);
+        eprintln!(
+            "[bench77] gate {calls} 呼び出し / {rows} 行 / {:.1} MB / {:.3} ms \
+             (48 層換算 {:.1} ms/token)",
+            bytes as f64 / 1e6,
+            ns as f64 / 1e6,
+            ns as f64 / 1e6 * 48.0
+        );
+        kp::reset();
+    }
+
+    /// P77: 平坦化経路 (decode の既定) の区間内訳が実際に積まれること。
+    ///
+    /// `DENNO_EXP_KPROF` を強制した状態で「平坦化 off / on」の層 1 回を回し、
+    /// (1) 出力がビット一致 (prof 経路は数値に触れない)、(2) gather / silu / scatter の
+    /// ns が 0 でない、(3) `line()` が行列ごとの行を出す、を確かめる。
+    #[test]
+    #[cfg(feature = "par")]
+    fn exp_kprof_flat_path_fills_intervals() {
+        use crate::model::exp_kprof as kp;
+        gpu_gemm_off();
+        let _g = moe_test_guard();
+        let (n_embd, n_ff, ne, k) = (256usize, 64usize, 8usize, 2usize);
+        let x = cache_test_x_seed(n_embd, 0);
+        let sel: Vec<usize> = (0..k).collect();
+        let dir = TempDir::new("p77kprof");
+        let path = dir.path("kprof.gguf");
+        write_expert_gguf_sparse(&path, n_embd, n_ff, ne, &sel);
+        let f = GgufFile::open(&path).expect("open");
+        let p = params_dims(n_embd, n_ff, ne, k);
+        let mut lw = layer_at(&f, &p, 0);
+        lw.gate_inp = gate_inp_for(&x, ne);
+
+        let run = |flat: bool| {
+            moe_ffn_quant_impl(&p, &lw, &x, None, true, Route::Cpu, None, false, false, flat)
+                .expect("層 1 回")
+        };
+        // 既定 (prof off) の基準
+        kp::set_for_test(false);
+        let want = run(true);
+        // prof on: 区間が積まれ、値は変わらない
+        kp::reset();
+        kp::set_for_test(true);
+        let got_flat = run(true);
+        let got_old = run(false);
+        let g = kp::layer_ns(kp::GATHER);
+        let si = kp::layer_ns(kp::SILU);
+        let sc = kp::layer_ns(kp::SCAT);
+        let line = kp::line().expect("prof on なのにレポートが無い");
+        let (gate_calls, gate_bytes, _, _) = kp::mat_stats(kp::GATE);
+        let (down_calls, down_bytes, _, _) = kp::mat_stats(kp::DOWN);
+        kp::set_for_test(false);
+        kp::reset();
+
+        assert_bitwise_eq(&want, &got_flat, "prof on/off の平坦化経路");
+        assert_bitwise_eq(&got_flat, &got_old, "prof on の平坦化 vs 従来");
+        // 平坦化 on の 1 層 + 従来 1 層ぶんが積まれている
+        assert!(g > 0, "gather が 0 ns");
+        assert!(si > 0, "silu が 0 ns");
+        assert!(sc > 0, "scatter が 0 ns");
+        assert!(gate_calls >= 2, "gate の呼び出しが {gate_calls} 回");
+        assert!(down_calls >= 2, "down の呼び出しが {down_calls} 回");
+        assert!(gate_bytes > 0 && down_bytes > 0, "バイトが 0");
+        assert!(line.contains("gate calls="), "{line}");
+        assert!(line.contains("down calls="), "{line}");
+        assert!(line.contains("GB/s"), "{line}");
     }
 
     /// P64 マイクロベンチ: 1 層ぶん (512 expert 中 top-10、3 行列、`n_in = 2560` /
