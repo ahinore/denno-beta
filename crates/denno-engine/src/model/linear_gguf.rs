@@ -18,7 +18,7 @@
 use anyhow::{bail, Result};
 
 use crate::kquant::{dequant_row_into, GgmlType};
-use crate::model::moe_expert::{expert_gemv, expert_gemv_q8_fast};
+use crate::model::moe_expert::{expert_gemv, expert_gemv_q8_fast, expert_gemv_q8_fast_min};
 use crate::quant::WeightBlocks;
 
 /// 1 行のバイト数。`moe_expert::row_bytes` は量子型だけを受けるので、
@@ -407,8 +407,41 @@ impl GgufLinear {
         r
     }
 
-    /// 本体。[`Self::gemv_label`] が時間と転送量を測るために外側から包む。
+    /// [`Self::gemv_label`] の行並列しきい値を呼び出し側が決める版。
+    ///
+    /// `row_par_min` 行以上のときだけ行を rayon で分ける (`0` は既定 = 512 行)。
+    /// **行は独立**なので、しきい値を下げても出力はビット一致する (変わるのは
+    /// 分割の粒度だけ)。対象は Q8_0 の融合カーネル (`fast_q8`) のみで、他の型は
+    /// 既定の門番のまま。
+    pub fn gemv_label_par(
+        &self,
+        label: &'static str,
+        x: &[f32],
+        out: &mut [f32],
+        row_par_min: usize,
+    ) -> Result<()> {
+        use crate::model::devprof;
+        if !devprof::on() {
+            return self.gemv_impl_par(x, out, row_par_min);
+        }
+        let t = std::time::Instant::now();
+        devprof::clear();
+        let r = self.gemv_impl_par(x, out, row_par_min);
+        let ns = t.elapsed().as_nanos() as u64;
+        let (up, down, sync_ns) = devprof::take_pending();
+        devprof::add(label, ns, up, down, sync_ns);
+        r
+    }
+
+    /// 本体 ([`Self::gemv_label`] 用。行並列は既定の門番)。
     fn gemv_impl(&self, x: &[f32], out: &mut [f32]) -> Result<()> {
+        self.gemv_impl_par(x, out, 0)
+    }
+
+    /// 本体。[`Self::gemv_label`] が時間と転送量を測るために外側から包む。
+    ///
+    /// `row_par_min != 0` のとき、Q8_0 融合カーネルの行並列の門番を差し替える。
+    fn gemv_impl_par(&self, x: &[f32], out: &mut [f32], row_par_min: usize) -> Result<()> {
         if x.len() != self.k {
             bail!("GgufLinear::gemv: x の長さ {} が k={} と違う", x.len(), self.k);
         }
@@ -435,7 +468,18 @@ impl GgufLinear {
                     }
                 }
                 if self.fast_q8 && self.ty == GgmlType::Q8_0 {
-                    return expert_gemv_q8_fast(self.blocks.as_slice(), self.k, self.n, x, out);
+                    return if row_par_min == 0 {
+                        expert_gemv_q8_fast(self.blocks.as_slice(), self.k, self.n, x, out)
+                    } else {
+                        expert_gemv_q8_fast_min(
+                            self.blocks.as_slice(),
+                            self.k,
+                            self.n,
+                            x,
+                            out,
+                            row_par_min,
+                        )
+                    };
                 }
                 expert_gemv(self.ty, self.blocks.as_slice(), self.k, self.n, x, out)
             }

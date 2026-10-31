@@ -238,25 +238,71 @@ pub fn hc_lo_apply(lo: &mut [f32], p: &HyperParams) {
     }
 }
 
+/// `hc_mixed` の 1 要素あたりの計算: `out[k] = (1/hc) * Σ_s x[s*e+d] * sigmoid(g[s*e+d])`
+/// (`d = d0 + k`、加算は `s` の昇順、`1/hc` は和の後)。
+///
+/// [`hc_mixed`] と [`hc_mixed_into_par`] が共有する**唯一の実装**。
+/// `e` 方向のどの範囲を渡しても各要素の丸め順は同じなので、範囲の切り方は
+/// 値に影響しない。
+fn mixed_range(m: &mut [f32], d0: usize, x: &[f32], g: &[f32], e: usize, hc: usize, inv_hc: f32) {
+    for (k, slot) in m.iter_mut().enumerate() {
+        let d = d0 + k;
+        let mut acc = x[d] * sigmoid(g[d]);
+        for s in 1..hc {
+            let i = s * e + d;
+            acc += x[i] * sigmoid(g[i]);
+        }
+        *slot = acc * inv_hc;
+    }
+}
+
 /// `hc_mix` の手順 7-8: `mixed[d] = (1/hc) * Σ_s xn[s][d] * sigmoid(gate[s][d])`。
 ///
 /// 加算は `s` の昇順、`1/hc` は和の後 (順序を変えると最終ビットが変わる)。
 pub fn hc_mixed(xn: &[f32], gate: &[f32], p: &HyperParams) -> Vec<f32> {
+    let mut mixed = vec![0.0f32; p.n_embd];
+    hc_mixed_into(xn, gate, &mut mixed, p);
+    mixed
+}
+
+/// [`hc_mixed`] の確保なし版 (`out` は `[n_embd]`)。**1 スレッド**で回す。
+pub fn hc_mixed_into(xn: &[f32], gate: &[f32], out: &mut [f32], p: &HyperParams) {
     let e = p.n_embd;
     let hc = p.hc;
+    assert!(hc >= 1, "hc が 0");
     assert_eq!(xn.len(), hc * e, "xn は [hc][n_embd]");
-    assert_eq!(gate.len(), hc * e, "gate は [hc][n_embd]");
+    assert_eq!(gate.len(), xn.len(), "gate は xn と同じ長さ ([hc][n_embd])");
+    assert_eq!(out.len(), e, "out は [n_embd]");
     let inv_hc = 1.0f32 / hc as f32;
-    let mut mixed = vec![0.0f32; e];
-    for d in 0..e {
-        let mut acc = xn[d] * sigmoid(gate[d]);
-        for s in 1..hc {
-            let i = s * e + d;
-            acc += xn[i] * sigmoid(gate[i]);
-        }
-        mixed[d] = acc * inv_hc;
+    mixed_range(out, 0, xn, gate, e, hc, inv_hc);
+}
+
+/// [`hc_mixed_into`] の `d` 方向 rayon 版 (`e >= MIXED_PAR_MIN_E` のときだけ分割)。
+///
+/// `d` は互いに独立で、`s` の昇順の加算は 1 つの `d` の中で完結する。どの `d` を
+/// どのスレッドが担当しても各要素の丸め順は変わらない = **ビット一致**。
+pub fn hc_mixed_into_par(xn: &[f32], gate: &[f32], out: &mut [f32], p: &HyperParams) {
+    let e = p.n_embd;
+    let hc = p.hc;
+    assert!(hc >= 1, "hc が 0");
+    assert_eq!(xn.len(), hc * e, "xn は [hc][n_embd]");
+    assert_eq!(gate.len(), xn.len(), "gate は xn と同じ長さ ([hc][n_embd])");
+    assert_eq!(out.len(), e, "out は [n_embd]");
+    let inv_hc = 1.0f32 / hc as f32;
+
+    #[cfg(feature = "par")]
+    if e >= MIXED_PAR_MIN_E {
+        use rayon::prelude::*;
+        bump_par_calls();
+        let threads = rayon::current_num_threads().max(1);
+        let chunk = e.div_ceil(threads).max(1);
+        out.par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(i, m)| mixed_range(m, i * chunk, xn, gate, e, hc, inv_hc));
+        return;
     }
-    mixed
+
+    mixed_range(out, 0, xn, gate, e, hc, inv_hc);
 }
 
 /// `hc_mix` の inject の後処理: `inject[r] *= 1/hc` (silu は掛けない)。
@@ -351,6 +397,12 @@ pub fn hc_head(
 /// `hc` 行 (実形 4) の小さい行はトークン並列にしない (1 行が L1 に収まり、
 /// rayon の起動コストだけが乗る)。
 pub const HC_BATCH_PAR_MIN_TOKENS: usize = 64;
+
+/// [`hc_mixed_into_par`] が `d` 方向を rayon で分ける最小の `n_embd`。
+///
+/// 1 要素あたり `hc` 本の sigmoid (`exp`) を回すので、実形 (n_embd=2560, hc=4 =
+/// 10240 本) は分割の損益が合う。小さい形 (`n_embd` が 4 桁未満) は fork-join 負けする。
+pub const MIXED_PAR_MIN_E: usize = 1024;
 
 /// テスト用: バッチ版が rayon 経路に入った回数。
 /// 「緑 = 分岐が発動した証拠」ではないので、nt >= [`HC_BATCH_PAR_MIN_TOKENS`] の
@@ -689,6 +741,46 @@ mod tests {
         let mut got = vec![f32::NAN; 3 * hp.n_embd];
         hc_mixed_batch_into(&fresh, &gate, 3, &mut got, &hp);
         assert_eq!(got, want, "再利用バッファの mixed が確保版と違う");
+    }
+
+    /// `d` 方向の rayon 版が逐次版とビット一致する。
+    ///
+    /// `n_embd >= MIXED_PAR_MIN_E` で rayon 経路、それ未満は逐次のまま。境界
+    /// (`e = MIXED_PAR_MIN_E`) と端数 (`e` がスレッド数で割り切れない) も含める。
+    #[test]
+    fn hc_mixed_into_par_matches_seq_bitwise() {
+        let par0 = HC_BATCH_PAR_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        for &(hc, e) in &[(4usize, 2560usize), (4, 1024), (3, 1031), (2, 1000), (1, 7)] {
+            let hp = HyperParams {
+                hc,
+                n_embd: e,
+                low_rank: 2,
+                eps: 1e-6,
+            };
+            let hc_dim = hc * e;
+            let xn: Vec<f32> = (0..hc_dim)
+                .map(|i| (((i * 13) % 29) as f32 - 14.0) * 0.04)
+                .collect();
+            let gate: Vec<f32> = (0..hc_dim)
+                .map(|i| (((i * 7 + 3) % 31) as f32 - 15.0) * 0.09)
+                .collect();
+            let want = hc_mixed(&xn, &gate, &hp);
+            let mut got = vec![f32::NAN; e];
+            hc_mixed_into_par(&xn, &gate, &mut got, &hp);
+            for i in 0..e {
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "hc_mixed_into_par: hc={hc} e={e} 要素 {i} がビット一致しない"
+                );
+            }
+            assert!(want.iter().any(|v| *v != 0.0), "mixed が全 0 (hc={hc} e={e})");
+        }
+        #[cfg(feature = "par")]
+        assert!(
+            HC_BATCH_PAR_CALLS.load(std::sync::atomic::Ordering::Relaxed) > par0,
+            "rayon 経路に入っていない (e >= MIXED_PAR_MIN_E の分岐が死んでいる)"
+        );
     }
 
     #[test]
