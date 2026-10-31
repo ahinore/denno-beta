@@ -11123,6 +11123,43 @@ mod tests {
             v
         }
 
+        /// BF16 のダミー重み (1 要素 2 B = f32 の上位 16bit)。
+        ///
+        /// linear_gguf の `make_block` (Bf16 アーム) と同じ式 (`pat4` から f32 を作り
+        /// 上位 16bit に落とす)。dequant は bit 複製 (`f32::from_bits(u16 << 16)`) で
+        /// 丸めが入らないので、書いた値がそのまま f32 として読み出る。
+        fn bf16_weights(k: usize, n: usize, seed: u32) -> Vec<u8> {
+            let mut b = vec![0u8; k * n * 2];
+            for (i, o) in b.chunks_exact_mut(2).enumerate() {
+                let v = ((pat4(i, seed) as f32) / 128.0) - 1.0;
+                let bits = (v.to_bits() >> 16) as u16;
+                o.copy_from_slice(&bits.to_le_bytes());
+            }
+            b
+        }
+
+        /// BF16 の逐次参照 (`GgufLinear::gemv*` のどの経路も通らない独立実装)。
+        ///
+        /// 行ごとに `dequant_row_into` して `acc += row[i] * x[i]` を i の昇順に
+        /// 加算する (`gemv_scalar_body` と同じ演算列)。行並列の有無で動いては
+        /// いけない基準値。
+        fn bf16_gemv_seq(lin: &GgufLinear, x: &[f32]) -> Vec<f32> {
+            let (k, n) = (lin.k(), lin.n());
+            let rb = k * 2; // BF16 は 1 要素 2 B
+            let b = lin.blocks().as_slice();
+            let mut row = vec![0f32; k];
+            let mut out = vec![0f32; n];
+            for r in 0..n {
+                crate::kquant::dequant_row_into(GgmlType::Bf16, &b[r * rb..(r + 1) * rb], &mut row);
+                let mut acc = 0f32;
+                for i in 0..k {
+                    acc += row[i] * x[i];
+                }
+                out[r] = acc;
+            }
+            out
+        }
+
         /// `DENNO_MIX_FAST` の解釈 (既定 on、`0` / `false` / `off` だけ旧経路)。
         #[test]
         fn mix_fast_gate_defaults_on() {
@@ -11482,6 +11519,130 @@ mod tests {
                 m_fast.iter().any(|v| *v != 0.0),
                 "mixed が全 0 (経路の生死が分からない)"
             );
+        }
+
+        /// task 91: hc down/up の実型は BF16 (実機 P90 の mix-kprof `ty=BF16 gpu=0`)。
+        /// 無量子型アームに落ちていた two_row 呼び出しが、行並列の行チャンク
+        /// ([`for_each_row_chunk`]) に乗り、`mix_kprof::rowpar` の region / fired が
+        /// 計上される。旧経路 ([`hc_mix_quant_ref`]) とビット一致する。
+        ///
+        /// 実形の down (k=10240 / n=320、門番 [`HC_DOWN_ROW_PAR_MIN`] = 64) と
+        /// up (k=320 / n=10240、`row_par_min=0` は既定の門番 512 に委譲) を BF16 で
+        /// 作る。up は k=320 が BF16 (1 要素 2 B) で表現できるので、down/up とも
+        /// 実型に揃える (IQ4_XS のテストと違い混在にしない)。
+        /// region 計上は `mix_kprof::rowpar` のラベル方式で見る ([`rowpar::stats`])。
+        #[test]
+        fn hc_mix_bf16_down_up_take_row_parallel_bitexact() {
+            use mix_kprof::rowpar;
+            let hc = 4usize;
+            let e = 2560usize;
+            let lr = 320usize;
+            let hp = HyperParams { hc, n_embd: e, low_rank: lr, eps: 1e-6 };
+            let hc_dim = hc * e;
+            assert_eq!(hc_dim, 10240, "実形の down 入力 (hc_dim)");
+            let norm: Vec<f32> = (0..hc_dim).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect();
+            let down =
+                GgufLinear::from_slice(GgmlType::Bf16, hc_dim, lr, &bf16_weights(hc_dim, lr, 3))
+                    .expect("GgufLinear::from_slice (BF16 down)");
+            let up =
+                GgufLinear::from_slice(GgmlType::Bf16, lr, hc_dim, &bf16_weights(lr, hc_dim, 5))
+                    .expect("GgufLinear::from_slice (BF16 up)");
+            let inject =
+                GgufLinear::from_slice(GgmlType::Bf16, hc_dim, hc, &bf16_weights(hc_dim, hc, 7))
+                    .expect("GgufLinear::from_slice (BF16 inject)");
+            let res = HyperStreams {
+                data: (0..hc_dim)
+                    .map(|i| (((i * 11) % 17) as f32 - 8.0) * 0.05)
+                    .collect(),
+                hc,
+                n_embd: e,
+            };
+            mix_kprof::set_for_test(true);
+            mix_kprof::reset();
+            let (m_fast, i_fast) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            let line = mix_kprof::line().expect("強制 on なのに line() が None");
+            // down の行並列が 1 region・1 発火 (320 行 >= 門番 64)。
+            let (rd, fd, cd, _, _) = rowpar::stats(rowpar::L_DOWN as usize - 1);
+            // up の行並列が 1 region・1 発火 (10240 行 >= 既定門番 512)。
+            let (ru, fu, cu, _, _) = rowpar::stats(rowpar::L_UP as usize - 1);
+            mix_kprof::reset();
+            mix_kprof::set_for_test(false);
+            assert_eq!(rd, 1, "BF16 の down region が 1 回計上されていない");
+            assert_eq!(fd, 1, "BF16 の down が行並列に入っていない");
+            assert!(cd >= 2, "BF16 の down が 1 チャンクしか割れていない (cd={cd})");
+            assert_eq!(ru, 1, "BF16 の up region が 1 回計上されていない");
+            assert_eq!(fu, 1, "BF16 の up が行並列に入っていない");
+            assert!(cu >= 2, "BF16 の up が 1 チャンクしか割れていない (cu={cu})");
+            assert!(
+                line.contains("ty=BF16"),
+                "mix-kprof の型表示が BF16 でない: {line}"
+            );
+            let (m_ref, i_ref) =
+                hc_mix_quant_ref(&res, &norm, &down, &up, Some(&inject), &hp).expect("ref");
+            assert_bitwise_eq(&m_fast, &m_ref, "BF16 down/up (mixed)");
+            assert_bitwise_eq(&i_fast, &i_ref, "BF16 down/up (inject)");
+            assert!(
+                m_fast.iter().any(|v| *v != 0.0),
+                "mixed が全 0 (経路の生死が分からない)"
+            );
+        }
+
+        /// task 91: BF16 実形の GEMV が、入口 (`gemv` / `gemv_label_par_2row` (two_row)
+        /// / `gemv_label_par` (row_par_min 明示)) とスレッド数 (1 / 8) に依らず
+        /// **to_bits で一致**する。
+        ///
+        /// down 実形 (k=10240 / n=320) と up 実形 (k=320 / n=10240)。参照は
+        /// [`bf16_gemv_seq`] (エンジンの経路を通らない逐次実装)。`row_par_min`
+        /// 明示版は down と同じ門番 64 を使う (up は two_row で既定門番 512 を通る)。
+        #[test]
+        fn hc_bf16_gemv_real_shape_bitexact_across_paths() {
+            for (name, k, n, min) in [
+                ("down 実形", 10240usize, 320usize, HC_DOWN_ROW_PAR_MIN),
+                ("up 実形", 320usize, 10240usize, 0usize),
+            ] {
+                let lin =
+                    GgufLinear::from_slice(GgmlType::Bf16, k, n, &bf16_weights(k, n, 11))
+                        .expect("GgufLinear::from_slice (BF16)");
+                let x: Vec<f32> =
+                    (0..k).map(|i| (((i * 31) % 97) as f32 - 48.0) * 0.011).collect();
+                let want = bf16_gemv_seq(&lin, &x);
+                assert!(want.iter().any(|v| *v != 0.0), "{name}: 参照が全 0");
+
+                // 旧経路 (`gemv` = cpu_gemv_par の行チャンク。two_row / row_par_min 無し)。
+                let mut a = vec![0f32; n];
+                lin.gemv(&x, &mut a).expect("gemv (旧経路)");
+                assert_bitwise_eq(&a, &want, &format!("BF16 {name}: 旧経路 vs 逐次参照"));
+
+                // 新経路 (two_row 明示。row_par_min=0 は既定門番 512 に委譲)。
+                let mut b = vec![0f32; n];
+                lin.gemv_label_par_2row("hc_bf16_2row", &x, &mut b, min)
+                    .expect("gemv_label_par_2row (two_row)");
+                assert_bitwise_eq(&b, &want, &format!("BF16 {name}: two_row vs 逐次参照"));
+
+                // 新経路 (row_par_min 明示のみ。down と同じ門番 64。up は行数が
+                // 10240 なので 64 以上で発火する)。
+                let mut c = vec![0f32; n];
+                lin.gemv_label_par("hc_bf16_par", &x, &mut c, HC_DOWN_ROW_PAR_MIN)
+                    .expect("gemv_label_par (row_par_min)");
+                assert_bitwise_eq(&c, &want, &format!("BF16 {name}: row_par_min vs 逐次参照"));
+
+                // スレッド数で値が動かない (1 と 8)。
+                let run = |threads: usize| -> Vec<f32> {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .expect("thread pool");
+                    let mut out = vec![0f32; n];
+                    pool.install(|| {
+                        lin.gemv_label_par_2row("hc_bf16_2row", &x, &mut out, min)
+                            .expect("gemv_label_par_2row")
+                    });
+                    out
+                };
+                assert_bitwise_eq(&run(1), &want, &format!("BF16 {name}: 1 スレッド"));
+                assert_bitwise_eq(&run(8), &want, &format!("BF16 {name}: 8 スレッド"));
+            }
         }
 
         /// P86: 実機で起きていたこと (GPU GEMV が hc mix の down / up を奪い、
