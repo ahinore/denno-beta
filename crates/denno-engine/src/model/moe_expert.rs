@@ -404,6 +404,13 @@ pub fn advise_hugepage_range(bytes: &[u8]) -> bool {
 /// 行方向の並列化しきい値。これ未満の行列はスレッドを立てる損のほうが大きい。
 const PAR_MIN_ROWS: usize = 512;
 
+/// 行分割の 1 スレッドあたり最小行数 (既定)。チャンクが細かすぎると fork-join が勝つ。
+const PAR_MIN_CHUNK_ROWS: usize = 64;
+
+/// `hc_*_down` のような「行が少ないが 1 行が長い」行列を並列化するときの
+/// 1 スレッドあたり最小行数。320 行 / 16 スレッド = 20 行を許す。
+pub(crate) const PAR_MIN_CHUNK_ROWS_TIGHT: usize = 16;
+
 /// `n_out` 行を rayon で分けて `f(chunk_blocks, chunk_out)` を回す。
 ///
 /// **行は互いに独立**なので、どの行をどのスレッドが担当しても各要素の計算順序は
@@ -412,21 +419,31 @@ const PAR_MIN_ROWS: usize = 512;
 /// `par == false` のときは呼び出しスレッドだけで全行を回す。外側で expert を
 /// rayon 並列化しているとき (P-MOE-G5) に内側で二重にスレッドを立てないための入口で、
 /// 分割の有無は各要素の計算順序を変えないので結果はビット一致する。
+///
+/// `min_rows` は「これ未満ならスレッドを立てない」門番、`min_chunk` は 1 スレッドに
+/// 残す最小行数。どちらも値には影響しない (分割の粒度だけ)。
 #[cfg(feature = "par")]
-fn for_each_row_chunk<F>(blocks: &[u8], n_out: usize, rb: usize, out: &mut [f32], par: bool, f: F)
-where
+fn for_each_row_chunk<F>(
+    blocks: &[u8],
+    n_out: usize,
+    rb: usize,
+    out: &mut [f32],
+    par: bool,
+    min_rows: usize,
+    min_chunk: usize,
+    f: F,
+) where
     F: Fn(&[u8], &mut [f32]) + Sync + Send,
 {
     use rayon::prelude::*;
-    if !par || n_out < PAR_MIN_ROWS {
+    if !par || n_out < min_rows {
         f(blocks, out);
         return;
     }
     #[cfg(test)]
     ROW_PAR_REGIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // 1 スレッドあたり最低 64 行は残す (チャンクが細かすぎるとオーバーヘッドが勝つ)。
     let threads = rayon::current_num_threads().max(1);
-    let want = n_out.div_ceil(threads).max(64);
+    let want = n_out.div_ceil(threads).max(min_chunk);
     let rows = want.min(n_out);
     let bytes = rows * rb;
     blocks
@@ -436,8 +453,17 @@ where
 }
 
 #[cfg(not(feature = "par"))]
-fn for_each_row_chunk<F>(blocks: &[u8], _n_out: usize, _rb: usize, out: &mut [f32], _par: bool, f: F)
-where
+#[allow(clippy::too_many_arguments)]
+fn for_each_row_chunk<F>(
+    blocks: &[u8],
+    _n_out: usize,
+    _rb: usize,
+    out: &mut [f32],
+    _par: bool,
+    _min_rows: usize,
+    _min_chunk: usize,
+    f: F,
+) where
     F: Fn(&[u8], &mut [f32]),
 {
     f(blocks, out);
@@ -480,9 +506,16 @@ fn expert_gemv_inner(
             // SAFETY: check_gemv_args が n_in%256==0・blocks/x/out の長さを検証済みで、
             // q4k_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
             // 行は独立なので、チャンク分割しても各要素の計算順序は変わらない。
-            for_each_row_chunk(blocks, n_out, rb, out, par, |b, o| unsafe {
-                gemv_q4k_avx2(b, n_in, o.len(), x, o)
-            });
+            for_each_row_chunk(
+                blocks,
+                n_out,
+                rb,
+                out,
+                par,
+                PAR_MIN_ROWS,
+                PAR_MIN_CHUNK_ROWS,
+                |b, o| unsafe { gemv_q4k_avx2(b, n_in, o.len(), x, o) },
+            );
             #[cfg(test)]
             FUSED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
@@ -643,9 +676,16 @@ fn expert_gemv_q5_1_inner(
             // SAFETY: 引数は check_gemv_args が検証済み (n_in%32==0 は直前で確認) で、
             // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
             let rb = n_in / 32 * 24;
-            for_each_row_chunk(blocks, n_out, rb, out, par, |b, o| unsafe {
-                gemv_q5_1_avx2(b, n_in, o.len(), x, o)
-            });
+            for_each_row_chunk(
+                blocks,
+                n_out,
+                rb,
+                out,
+                par,
+                PAR_MIN_ROWS,
+                PAR_MIN_CHUNK_ROWS,
+                |b, o| unsafe { gemv_q5_1_avx2(b, n_in, o.len(), x, o) },
+            );
             return Ok(());
         }
     }
@@ -675,9 +715,44 @@ pub fn expert_gemv_q8_fast(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<()> {
-    expert_gemv_q8_inner(blocks, n_in, n_out, x, out, true)
+    expert_gemv_q8_inner(
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        true,
+        PAR_MIN_ROWS,
+        PAR_MIN_CHUNK_ROWS,
+    )
 }
 
+/// [`expert_gemv_q8_fast`] の行並列しきい値を呼び出し側が決める版。
+///
+/// `hc_*_down` (320 行 × 10240) のように「既定の門番 (512 行) には届かないが
+/// 1 行が長い」行列を並列化するために使う。行は独立なので `min_rows` /
+/// `min_chunk` をどう選んでも出力はビット一致する (変わるのは分割の粒度だけ)。
+pub(crate) fn expert_gemv_q8_fast_min(
+    blocks: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    out: &mut [f32],
+    min_rows: usize,
+) -> Result<()> {
+    expert_gemv_q8_inner(
+        blocks,
+        n_in,
+        n_out,
+        x,
+        out,
+        true,
+        min_rows,
+        PAR_MIN_CHUNK_ROWS_TIGHT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn expert_gemv_q8_inner(
     blocks: &[u8],
     n_in: usize,
@@ -685,6 +760,8 @@ fn expert_gemv_q8_inner(
     x: &[f32],
     out: &mut [f32],
     par: bool,
+    min_rows: usize,
+    min_chunk: usize,
 ) -> Result<()> {
     check_gemv_args(GgmlType::Q8_0, blocks, n_in, n_out, x, out)?;
     if n_in % 32 == 0 && q8_0_fused_supported() {
@@ -693,7 +770,7 @@ fn expert_gemv_q8_inner(
             // SAFETY: 引数は check_gemv_args が検証済み (n_in%32==0 は直前で確認) で、
             // q8_0_fused_supported() が AVX2 と FMA の存在を実行時に確認している。
             let rb = n_in / 32 * 34;
-            for_each_row_chunk(blocks, n_out, rb, out, par, |b, o| unsafe {
+            for_each_row_chunk(blocks, n_out, rb, out, par, min_rows, min_chunk, |b, o| unsafe {
                 gemv_q8_0_avx2(b, n_in, o.len(), x, o)
             });
             return Ok(());
@@ -829,7 +906,16 @@ fn expert_gemv_any_inner(
 ) -> Result<()> {
     match ty {
         GgmlType::Q5_1 => expert_gemv_q5_1_inner(blocks, n_in, n_out, x, out, par),
-        GgmlType::Q8_0 => expert_gemv_q8_inner(blocks, n_in, n_out, x, out, par),
+        GgmlType::Q8_0 => expert_gemv_q8_inner(
+            blocks,
+            n_in,
+            n_out,
+            x,
+            out,
+            par,
+            PAR_MIN_ROWS,
+            PAR_MIN_CHUNK_ROWS,
+        ),
         _ => expert_gemv_inner(ty, blocks, n_in, n_out, x, out, par),
     }
 }
@@ -2922,14 +3008,23 @@ fn expert_gemv_any_vnni_inner(
             // SAFETY: check_gemv_args が blocks/x/out の長さと n_in の粒度を検証済みで、
             // 直前の n_in % 256 / % 32 の確認と vnni_supported() (gemv_vnni_enabled が
             // 見ている) がカーネルの前提を満たす。行は独立なので分割しても値は変わらない。
-            for_each_row_chunk(blocks, n_out, rb, out, par, |b, o| unsafe {
-                match ty {
-                    GgmlType::Q4K => gemv_q4k_vnni(b, n_in, o.len(), a, o),
-                    GgmlType::Q5_1 => gemv_q5_1_vnni(b, n_in, o.len(), a, o),
-                    GgmlType::Q8_0 => gemv_q8_0_vnni(b, n_in, o.len(), a, o),
-                    _ => unreachable!("対象外の型は上で弾いている"),
-                }
-            });
+            for_each_row_chunk(
+                blocks,
+                n_out,
+                rb,
+                out,
+                par,
+                PAR_MIN_ROWS,
+                PAR_MIN_CHUNK_ROWS,
+                |b, o| unsafe {
+                    match ty {
+                        GgmlType::Q4K => gemv_q4k_vnni(b, n_in, o.len(), a, o),
+                        GgmlType::Q5_1 => gemv_q5_1_vnni(b, n_in, o.len(), a, o),
+                        GgmlType::Q8_0 => gemv_q8_0_vnni(b, n_in, o.len(), a, o),
+                        _ => unreachable!("対象外の型は上で弾いている"),
+                    }
+                },
+            );
             Ok(true)
         })
     }

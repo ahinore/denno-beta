@@ -2851,10 +2851,40 @@ impl Qwen4Exp {
     }
 }
 
+/// `DENNO_MIX_FAST` の解釈。**既定 on**。`0` / `false` / `off` のときだけ旧経路。
+///
+/// 旧経路は呼び出しごとに `vec![0.0; ..]` を確保し、`hc_mixed` を 1 スレッドで
+/// 回す。新経路は作業域を使い回し、`hc_mixed` を `d` 方向に rayon で分ける
+/// (どちらも演算順序は同じ = ビット一致)。
+fn mix_fast_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => true,
+        Some(s) => {
+            !(s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off"))
+        }
+    }
+}
+
+/// `hc_mix_quant` を高速経路で計算するか (既定 on)。
+fn mix_fast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| mix_fast_from_value(std::env::var("DENNO_MIX_FAST").ok().as_deref()))
+}
+
+/// `hc_*_down` (320 行 × `hc_dim`) の GEMV を並列化する門番 (行数)。
+///
+/// 既定の門番は 512 行なので 320 行は 1 スレッドで回っていた (実形の CPU 計測で
+/// mix の約 50%)。行は独立で各要素の加算順は行内で完結するので、行を分けても
+/// 値はビット一致する。
+const HC_DOWN_ROW_PAR_MIN: usize = 64;
+
 /// `hc_mix` を**量子化重み**で計算する (`hyper::hc_mix` と同じ丸め順序)。
 ///
 /// `inject` が `None` なら inject は 0 で返す (head の mixer は inject を
 /// 持たない: 参照実装は `w_inject` / `w_down_inject` とも `nullptr`)。
+///
+/// `DENNO_MIX_FAST` (既定 on) で [`hc_mix_quant_fast`]、off で
+/// [`hc_mix_quant_ref`] を通る。どちらも同じ値 (ビット一致) を返す。
 fn hc_mix_quant(
     res: &HyperStreams,
     norm: &[f32],
@@ -2863,28 +2893,66 @@ fn hc_mix_quant(
     inject: Option<&GgufLinear>,
     hp: &HyperParams,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
-    let xn = hyper::grouped_rms_norm(res, norm, hp);
+    if mix_fast_enabled() {
+        return hc_mix_quant_fast(res, norm, down, up, inject, hp);
+    }
+    hc_mix_quant_ref(res, norm, down, up, inject, hp)
+}
 
+/// [`hc_mix_quant`] の旧経路 (A/B と `DENNO_MIX_FAST=0` 用)。
+///
+/// `DENNO_MIX_KPROF=1` のときだけ区間ごとの時間を積む (既定 off では
+/// `stamp()` が `None` を返すだけで、確保も演算も従来どおり)。
+fn hc_mix_quant_ref(
+    res: &HyperStreams,
+    norm: &[f32],
+    down: &GgufLinear,
+    up: &GgufLinear,
+    inject: Option<&GgufLinear>,
+    hp: &HyperParams,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let t_all = mix_kprof::stamp();
+
+    let t = mix_kprof::stamp();
+    let xn = hyper::grouped_rms_norm(res, norm, hp);
+    mix_kprof::mark(t, mix_kprof::GN);
+
+    let t = mix_kprof::stamp();
     let mut lo = vec![0.0f32; down.n()];
     down.gemv_label("hc_down", &xn, &mut lo)
         .map_err(|err| one(format!("hc_mix down: {err}")))?;
-    hyper::hc_lo_apply(&mut lo, hp);
+    mix_kprof::mark(t, mix_kprof::DOWN);
 
+    let t = mix_kprof::stamp();
+    hyper::hc_lo_apply(&mut lo, hp);
+    mix_kprof::mark(t, mix_kprof::LO);
+
+    let t = mix_kprof::stamp();
     let mut gate = vec![0.0f32; up.n()];
     up.gemv_label("hc_up", &lo, &mut gate)
         .map_err(|err| one(format!("hc_mix up: {err}")))?;
+    mix_kprof::mark(t, mix_kprof::UP);
+
+    let t = mix_kprof::stamp();
     let mixed = hyper::hc_mixed(&xn, &gate, hp);
+    mix_kprof::mark(t, mix_kprof::MIXED);
 
     let inj = match inject {
         Some(w) => {
             let mut v = vec![0.0f32; w.n()];
+            let t = mix_kprof::stamp();
             w.gemv_label("hc_inject", &xn, &mut v)
                 .map_err(|err| one(format!("hc_mix inject: {err}")))?;
+            mix_kprof::mark(t, mix_kprof::INJ);
+            let t = mix_kprof::stamp();
             hyper::hc_inject_apply(&mut v, hp);
+            mix_kprof::mark(t, mix_kprof::INJ_APPLY);
             v
         }
         None => vec![0.0f32; hp.hc],
     };
+    mix_kprof::mark(t_all, mix_kprof::TOTAL);
+    mix_kprof::bump_call();
     Ok((mixed, inj))
 }
 
@@ -2912,6 +2980,102 @@ impl MixScratch {
         }
         &mut buf[..n]
     }
+}
+
+thread_local! {
+    /// [`hc_mix_quant_fast`] が使う 1 トークンぶんの作業域 (grow-only)。
+    ///
+    /// decode は 1 トークンで mix を `2 * n_layer + 1` 回呼ぶ。呼び出しごとに
+    /// `xn` / `gate` を `vec![0.0; 10240]` (40 KB ずつ) で確保すると、ゼロ埋めと
+    /// 解放だけで毎回 ~90 KB を触る。スレッドを跨がず、次の呼び出しが全要素を
+    /// 書くので、残っていても値は変わらない (長さは必ず `[..n]` で切る)。
+    static MIX_SCRATCH: std::cell::RefCell<MixScratch> = const {
+        std::cell::RefCell::new(MixScratch {
+            xn: Vec::new(),
+            lo: Vec::new(),
+            gate: Vec::new(),
+            mixed: Vec::new(),
+        })
+    };
+}
+
+/// テスト用: [`hc_mix_quant_fast`] が呼ばれた回数。
+/// 「既定 on の分岐が実際に通った」ことを数えるためのもの。
+#[cfg(test)]
+pub(crate) static MIX_FAST_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// [`hc_mix_quant`] の高速経路 (`DENNO_MIX_FAST` 既定 on)。
+///
+/// 旧経路との違いは 2 点だけで、どちらも**値はビット一致**する:
+/// 1. 作業域 (`xn` / `lo` / `gate` / `mixed`) をスレッドローカルで使い回す
+///    (毎回の `vec![0.0; ..]` とゼロ埋めを消す)。
+/// 2. `hc_mixed` を `d` 方向に rayon で分ける ([`hyper::hc_mixed_into_par`])。
+///    `d` は独立で、`s` の昇順の加算は 1 つの `d` の中で完結する。
+fn hc_mix_quant_fast(
+    res: &HyperStreams,
+    norm: &[f32],
+    down: &GgufLinear,
+    up: &GgufLinear,
+    inject: Option<&GgufLinear>,
+    hp: &HyperParams,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    #[cfg(test)]
+    MIX_FAST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let hc_dim = hp.hc * hp.n_embd;
+    let e = hp.n_embd;
+    let t_all = mix_kprof::stamp();
+    MIX_SCRATCH.with(|cell| {
+        let mut b = cell.borrow_mut();
+        let MixScratch { xn, lo, gate, mixed } = &mut *b;
+
+        let xn = MixScratch::take(xn, hc_dim);
+        let t = mix_kprof::stamp();
+        hyper::grouped_rms_norm_batch_into(std::slice::from_ref(res), norm, xn, hp);
+        mix_kprof::mark(t, mix_kprof::GN);
+
+        let lo = MixScratch::take(lo, down.n());
+        let t = mix_kprof::stamp();
+        down.gemv_label_par("hc_down", xn, lo, HC_DOWN_ROW_PAR_MIN)
+            .map_err(|err| one(format!("hc_mix down: {err}")))?;
+        mix_kprof::mark(t, mix_kprof::DOWN);
+
+        let t = mix_kprof::stamp();
+        hyper::hc_lo_apply(lo, hp);
+        mix_kprof::mark(t, mix_kprof::LO);
+
+        let gate = MixScratch::take(gate, up.n());
+        let t = mix_kprof::stamp();
+        up.gemv_label("hc_up", lo, gate)
+            .map_err(|err| one(format!("hc_mix up: {err}")))?;
+        mix_kprof::mark(t, mix_kprof::UP);
+
+        let mixed = MixScratch::take(mixed, e);
+        let t = mix_kprof::stamp();
+        hyper::hc_mixed_into_par(xn, gate, mixed, hp);
+        mix_kprof::mark(t, mix_kprof::MIXED);
+
+        let inj = match inject {
+            Some(w) => {
+                let mut v = vec![0.0f32; w.n()];
+                let t = mix_kprof::stamp();
+                w.gemv_label("hc_inject", xn, &mut v)
+                    .map_err(|err| one(format!("hc_mix inject: {err}")))?;
+                mix_kprof::mark(t, mix_kprof::INJ);
+                let t = mix_kprof::stamp();
+                hyper::hc_inject_apply(&mut v, hp);
+                mix_kprof::mark(t, mix_kprof::INJ_APPLY);
+                v
+            }
+            None => vec![0.0f32; hp.hc],
+        };
+        // 戻り値は呼び出し側が所有する (層の出口で combine に渡す) ので 1 本だけ確保する。
+        let out = mixed.to_vec();
+        mix_kprof::mark(t_all, mix_kprof::TOTAL);
+        mix_kprof::bump_call();
+        Ok((out, inj))
+    })
 }
 
 /// [`hc_mix_quant`] のバッチ版 (`nt` トークンぶんまとめて行列積)。
@@ -3395,6 +3559,142 @@ pub mod q4prof {
         for c in LAYER_NT.iter() {
             c.store(0, Ordering::Relaxed);
         }
+    }
+}
+
+/// `hc_mix_quant` の内側の区間別累積時間 (ns)。`DENNO_MIX_KPROF=1` のときだけ
+/// `Instant` を取り、区間ごとに atomic へ足す。既定 off では [`stamp`] が `None`
+/// を返すだけで、演算順序にも確保にも触れない。
+///
+/// decode は 1 トークンで mix を `2 * n_layer + 1` 回呼ぶので、リクエスト末尾で
+/// [`line`] を出して [`reset`] すると「1 トークンぶんの内訳」が 1 行で読める
+/// (`serve_flash::prof_flash_q4` がそうする)。
+pub mod mix_kprof {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    /// 区間: grouped RMS 正規化 (入力の整形)。
+    pub const GN: usize = 0;
+    /// 区間: `hc_down` の GEMV (`hc_dim -> low_rank`)。
+    pub const DOWN: usize = 1;
+    /// 区間: `hc_lo_apply` (`1/hc` と silu)。
+    pub const LO: usize = 2;
+    /// 区間: `hc_up` の GEMV (`low_rank -> hc_dim`)。
+    pub const UP: usize = 3;
+    /// 区間: `hc_mixed` (ストリームごとの sigmoid と加算と `1/hc`)。
+    pub const MIXED: usize = 4;
+    /// 区間: `hc_inject` の GEMV (`hc_dim -> hc`)。
+    pub const INJ: usize = 5;
+    /// 区間: `hc_inject_apply` (`1/hc`)。
+    pub const INJ_APPLY: usize = 6;
+    /// 区間: `hc_mix_quant` 全体。上の合計との差が確保などの「その他」。
+    pub const TOTAL: usize = 7;
+    /// 区間の数。
+    pub const N: usize = 8;
+
+    static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// テストが env を立てずに区間計測を通すための強制フラグ
+    /// (env は `OnceLock` なのでプロセス内で 1 回しか読めない)。
+    #[cfg(test)]
+    static FORCE: AtomicBool = AtomicBool::new(false);
+
+    /// 区間計測をテストから強制する (`false` で env の解釈に戻る)。
+    #[cfg(test)]
+    pub fn set_for_test(v: bool) {
+        FORCE.store(v, Ordering::Relaxed);
+    }
+
+    /// 区間計測が有効か (既定 off)。
+    #[inline]
+    pub fn on() -> bool {
+        #[cfg(test)]
+        if FORCE.load(Ordering::Relaxed) {
+            return true;
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DENNO_MIX_KPROF").is_some())
+    }
+
+    /// 計測が要るときだけ `Instant` を取る (既定 off では `None` = 呼び出し側は no-op)。
+    #[inline]
+    pub fn stamp() -> Option<std::time::Instant> {
+        if on() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    }
+
+    /// 区間 `slot` に `t` からの経過を足す。
+    #[inline]
+    pub fn mark(t: Option<std::time::Instant>, slot: usize) {
+        if let Some(t) = t {
+            NS[slot].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// `hc_mix_quant` の呼び出し回数 (1 行の分母)。
+    #[inline]
+    pub fn bump_call() {
+        if on() {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn ns(slot: usize) -> u64 {
+        NS[slot].load(Ordering::Relaxed)
+    }
+
+    /// 区間の累積 (ns)。`reset` してから 1 トークン回すと、そのトークンの内訳になる。
+    pub fn ns_of(slot: usize) -> u64 {
+        ns(slot)
+    }
+
+    /// 内訳 1 行。無効時は `None` (出力ゼロ)。
+    pub fn line() -> Option<String> {
+        if !on() {
+            return None;
+        }
+        let calls = CALLS.load(Ordering::Relaxed);
+        let tot = ns(TOTAL).max(1);
+        let pct = |slot: usize| ns(slot) as f64 * 100.0 / tot as f64;
+        let staged: u64 = [GN, DOWN, LO, UP, MIXED, INJ, INJ_APPLY]
+            .iter()
+            .map(|&s| ns(s))
+            .sum();
+        let other = ns(TOTAL).saturating_sub(staged);
+        Some(format!(
+            "[mix-kprof] calls={calls} total={} ns | gn {} ns {:.1}% | down {} ns {:.1}% | \
+             lo {} ns {:.1}% | up {} ns {:.1}% | mixed {} ns {:.1}% | inj {} ns {:.1}% | \
+             inj_apply {} ns {:.1}% | other {} ns {:.1}%",
+            ns(TOTAL),
+            ns(GN),
+            pct(GN),
+            ns(DOWN),
+            pct(DOWN),
+            ns(LO),
+            pct(LO),
+            ns(UP),
+            pct(UP),
+            ns(MIXED),
+            pct(MIXED),
+            ns(INJ),
+            pct(INJ),
+            ns(INJ_APPLY),
+            pct(INJ_APPLY),
+            other,
+            other as f64 * 100.0 / tot as f64
+        ))
+    }
+
+    /// 累積を 0 に戻す。
+    pub fn reset() {
+        for c in NS.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+        CALLS.store(0, Ordering::Relaxed);
     }
 }
 
@@ -9601,6 +9901,234 @@ mod tests {
                 mixed[0].iter().any(|v| *v != 0.0),
                 "mixed が全 0 (経路の生死が分からない)"
             );
+        }
+
+        /// Q8_0 のダミー重み (34 B ブロック: f16 スケール + i8 x 32)。
+        /// 実ファイルの `hc_*` と同じ量子型で、`linear()` と同じく `fast_q8` を立てる。
+        fn q8_0_weights(k: usize, n: usize, seed: u32) -> Vec<u8> {
+            assert_eq!(k % 32, 0, "Q8_0 のブロックは 32 要素");
+            let mut b = vec![0u8; k * n / 32 * 34];
+            let scale = half::f16::from_f32(0.02).to_le_bytes();
+            for blk in 0..b.len() / 34 {
+                let o = blk * 34;
+                b[o..o + 2].copy_from_slice(&scale);
+                for j in 0..32usize {
+                    let q = ((j as i32 + blk as i32 * 3 + seed as i32 * 7) % 11) - 5;
+                    b[o + 2 + j] = q as i8 as u8;
+                }
+            }
+            b
+        }
+
+        /// Q8_0 の `hc_down` / `hc_up` / `hc_inject` と入力 1 本。
+        fn mix_q8_case(
+            hc: usize,
+            e: usize,
+            lr: usize,
+        ) -> (HyperParams, Vec<f32>, GgufLinear, GgufLinear, GgufLinear, HyperStreams) {
+            let hp = HyperParams {
+                hc,
+                n_embd: e,
+                low_rank: lr,
+                eps: 1e-6,
+            };
+            let hc_dim = hc * e;
+            let norm: Vec<f32> = (0..hc_dim).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect();
+            let mk = |k: usize, n: usize, seed: u32| {
+                GgufLinear::from_slice(GgmlType::Q8_0, k, n, &q8_0_weights(k, n, seed))
+                    .expect("GgufLinear::from_slice (Q8_0)")
+                    .with_fast_q8(true)
+            };
+            let down = mk(hc_dim, lr, 3);
+            let up = mk(lr, hc_dim, 5);
+            let inject = mk(hc_dim, hc, 7);
+            let res = HyperStreams {
+                data: (0..hc_dim)
+                    .map(|i| (((i * 11) % 17) as f32 - 8.0) * 0.05)
+                    .collect(),
+                hc,
+                n_embd: e,
+            };
+            (hp, norm, down, up, inject, res)
+        }
+
+        /// `DENNO_MIX_FAST` の解釈 (既定 on、`0` / `false` / `off` だけ旧経路)。
+        #[test]
+        fn mix_fast_gate_defaults_on() {
+            assert!(mix_fast_from_value(None), "未設定は既定で on");
+            assert!(mix_fast_from_value(Some("1")));
+            assert!(mix_fast_from_value(Some("")));
+            assert!(!mix_fast_from_value(Some("0")), "\"0\" で旧経路");
+            assert!(!mix_fast_from_value(Some("false")));
+            assert!(!mix_fast_from_value(Some("OFF")));
+        }
+
+        /// 高速経路 (既定 on) が旧経路とビット一致する。実モデルと同じ
+        /// Q8_0 + `fast_q8` の融合カーネルを通る形で比べる。
+        #[test]
+        fn hc_mix_fast_matches_ref_bitexact() {
+            let (hp, norm, down, up, inject, res) = mix_q8_case(2, 32, 32);
+            let before = MIX_FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let (m_fast, i_fast) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            assert!(
+                MIX_FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed) > before,
+                "既定 on の高速経路が通っていない"
+            );
+            let (m_ref, i_ref) =
+                hc_mix_quant_ref(&res, &norm, &down, &up, Some(&inject), &hp).expect("ref");
+            assert_bitwise_eq(&m_fast, &m_ref, "hc_mix_quant fast vs ref (mixed)");
+            assert_bitwise_eq(&i_fast, &i_ref, "hc_mix_quant fast vs ref (inject)");
+            assert!(
+                m_fast.iter().any(|v| *v != 0.0),
+                "mixed が全 0 (経路の生死が分からない)"
+            );
+        }
+
+        /// 高速経路の `hc_mixed` が rayon 経路に入る形 (n_embd = しきい値) でも
+        /// 旧経路とビット一致する。
+        #[test]
+        fn hc_mix_fast_matches_ref_at_par_threshold() {
+            let (hp, norm, down, up, inject, res) = mix_q8_case(4, 1024, 32);
+            assert_eq!(hp.n_embd, crate::model::hyper::MIXED_PAR_MIN_E);
+            let (m_fast, _) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            let (m_ref, _) =
+                hc_mix_quant_ref(&res, &norm, &down, &up, Some(&inject), &hp).expect("ref");
+            assert_bitwise_eq(&m_fast, &m_ref, "hc_mix_quant fast vs ref (e = 1024)");
+        }
+
+        /// `hc_*_down` (320 行) が高速経路で行並列に入り、値は旧経路とビット一致する。
+        ///
+        /// 既定の門番は 512 行なので、旧経路では 1 スレッドだった分岐。
+        #[test]
+        fn mix_fast_down_gemv_takes_row_parallel() {
+            use crate::model::moe_expert::ROW_PAR_REGIONS;
+            let (hp, norm, down, up, inject, res) = mix_q8_case(2, 160, 320);
+            assert_eq!(down.n(), 320, "テストの前提 (down は 320 行)");
+            let before = ROW_PAR_REGIONS.load(std::sync::atomic::Ordering::Relaxed);
+            let (m_fast, i_fast) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            assert!(
+                ROW_PAR_REGIONS.load(std::sync::atomic::Ordering::Relaxed) > before,
+                "320 行の down が行並列に入っていない"
+            );
+            let (m_ref, i_ref) =
+                hc_mix_quant_ref(&res, &norm, &down, &up, Some(&inject), &hp).expect("ref");
+            assert_bitwise_eq(&m_fast, &m_ref, "down 行並列の有無 (mixed)");
+            assert_bitwise_eq(&i_fast, &i_ref, "down 行並列の有無 (inject)");
+        }
+
+        /// `DENNO_MIX_KPROF` の区間計測が全区間で回る (強制 on で確認)。
+        #[test]
+        fn mix_kprof_counts_every_region() {
+            let (hp, norm, down, up, inject, res) = mix_q8_case(2, 32, 32);
+            mix_kprof::set_for_test(true);
+            mix_kprof::reset();
+            for _ in 0..64 {
+                let _ = hc_mix_quant_ref(&res, &norm, &down, &up, Some(&inject), &hp)
+                    .expect("ref");
+            }
+            let line = mix_kprof::line().expect("強制 on なのに line() が None");
+            assert!(line.contains("[mix-kprof] calls="), "行の形が違う: {line}");
+            for (name, slot) in [
+                ("gn", mix_kprof::GN),
+                ("down", mix_kprof::DOWN),
+                ("lo", mix_kprof::LO),
+                ("up", mix_kprof::UP),
+                ("mixed", mix_kprof::MIXED),
+                ("inj", mix_kprof::INJ),
+                ("inj_apply", mix_kprof::INJ_APPLY),
+                ("total", mix_kprof::TOTAL),
+            ] {
+                assert!(
+                    mix_kprof::ns_of(slot) > 0,
+                    "区間 {name} が 0 ns (計測が通っていない): {line}"
+                );
+            }
+            mix_kprof::reset();
+            mix_kprof::set_for_test(false);
+        }
+
+        /// 実形状 (hc=4 / n_embd=2560 / low_rank=320 / Q8_0 + fast_q8) の
+        /// `hc_mix_quant` 1 呼び出しと区間内訳。手動実行:
+        /// `cargo test --release -p denno-engine --lib --features cuda -- --ignored --nocapture bench_hc_mix_quant`
+        #[test]
+        #[ignore = "実形状の CPU マイクロベンチ (手動)"]
+        fn bench_hc_mix_quant_real_shape() {
+            let (hp, _norm, down, up, inject, res) = mix_q8_case(4, 2560, 320);
+            let norm: Vec<f32> = (0..hp.hc * hp.n_embd)
+                .map(|i| 0.9 + ((i % 13) as f32) * 0.01)
+                .collect();
+            let reps = 20usize;
+            let best = |mut f: Box<dyn FnMut()>| -> f64 {
+                let mut best = f64::INFINITY;
+                for _ in 0..reps {
+                    let t = std::time::Instant::now();
+                    f();
+                    best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                }
+                best
+            };
+            // warm-up (スレッドプールと作業域を作る)
+            for _ in 0..3 {
+                let _ = hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("warm");
+            }
+            println!(
+                "\n=== hc_mix_quant 1 呼び出し (n_embd={} hc={} low_rank={}) ===",
+                hp.n_embd, hp.hc, hp.low_rank
+            );
+            println!(
+                "rayon threads = {}",
+                std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "(default)".into())
+            );
+
+            let old = best(Box::new(|| {
+                let _ = hc_mix_quant_ref(&res, &norm, &down, &up, Some(&inject), &hp).expect("ref");
+            }));
+            let new = best(Box::new(|| {
+                let _ = hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            }));
+            println!("旧経路 (MIX_FAST=0) {:8.3} ms/call", old);
+            println!("高速経路 (既定)     {:8.3} ms/call  ({:.2}x)", new, old / new);
+
+            // 区間内訳は 1 回ぶんの ns に直して出す (reps で割る)。
+            let breakdown = |fast: bool| {
+                mix_kprof::set_for_test(true);
+                mix_kprof::reset();
+                for _ in 0..reps {
+                    let r = if fast {
+                        hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp)
+                    } else {
+                        hc_mix_quant_ref(&res, &norm, &down, &up, Some(&inject), &hp)
+                    };
+                    let _ = r.expect("breakdown");
+                }
+                println!(
+                    "{}  [{} / {reps} 回]",
+                    mix_kprof::line().expect("kprof が None"),
+                    if fast { "高速経路" } else { "旧経路" }
+                );
+                for (label, slot) in [
+                    ("gn", mix_kprof::GN),
+                    ("down", mix_kprof::DOWN),
+                    ("lo", mix_kprof::LO),
+                    ("up", mix_kprof::UP),
+                    ("mixed", mix_kprof::MIXED),
+                    ("inj", mix_kprof::INJ),
+                    ("inj_apply", mix_kprof::INJ_APPLY),
+                    ("total", mix_kprof::TOTAL),
+                ] {
+                    println!(
+                        "  {label:>9}: {:8.1} us/call",
+                        mix_kprof::ns_of(slot) as f64 / reps as f64 / 1e3
+                    );
+                }
+                mix_kprof::reset();
+                mix_kprof::set_for_test(false);
+            };
+            breakdown(false);
+            breakdown(true);
         }
 
         /// hyper のバッチ版が逐次版とビット一致する。

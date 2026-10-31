@@ -248,6 +248,12 @@ fn prof_flash_q4(tag: &str, tok: usize) {
         eprintln!("{line}");
         denno_engine::gdn::kprof::reset();
     }
+    // decode の mix 内訳 (`DENNO_MIX_KPROF=1` のときだけ 1 行)。
+    // こちらも q4prof とは独立に出す (`DENNO_Q4_PROFILE` を立てなくても読める)。
+    if let Some(line) = denno_engine::model::qwen4exp::mix_kprof::line() {
+        eprintln!("{line}");
+        denno_engine::model::qwen4exp::mix_kprof::reset();
+    }
     if !q4prof::enabled() {
         return;
     }
