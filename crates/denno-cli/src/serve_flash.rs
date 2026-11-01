@@ -67,6 +67,8 @@ struct GenReq {
     top_k: Option<usize>,
     stop_sequences: Vec<String>,
     enable_thinking: bool,
+    /// 継続生成: 最後の assistant メッセージを閉じずにプロンプトへ含める。
+    cont: bool,
 }
 
 /// 環境変数が 1/true のときだけ有効。
@@ -188,6 +190,10 @@ impl GenReq {
             .get("enable_thinking")
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
+        let cont = v
+            .get("continue")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
         Ok(GenReq {
             system,
             messages,
@@ -198,6 +204,7 @@ impl GenReq {
             top_k,
             stop_sequences,
             enable_thinking,
+            cont,
         })
     }
 }
@@ -334,15 +341,29 @@ impl Flash {
     fn generate(&mut self, req: &GenReq, mut emit: impl FnMut(&str) -> Result<()>) -> Result<GenOut> {
         // P78: 層の外の内訳 (tokenize は prefill wall の外なので別に積む)。
         let t_tok = prekprof::stamp();
-        let prompt = self
+        // 継続生成 (continue: true): 最後が assistant なら、その分を閉じずに
+        // 生成プロンプトの末尾へ生テキストとして継ぎ、モデルに続きを書かせる。
+        // チャットテンプレートは最後の assistant ターンを <|im_end|> で閉じて
+        // しまうため、そのままでは続きにならない。
+        let (msgs_for_tpl, partial) =
+            if req.cont && req.messages.last().map(|(r, _)| r == "assistant").unwrap_or(false) {
+                let n = req.messages.len();
+                (&req.messages[..n - 1], Some(req.messages[n - 1].1.clone()))
+            } else {
+                (&req.messages[..], None)
+            };
+        let mut prompt = self
             .tok
             .encode_messages(
                 req.system.as_deref(),
-                &req.messages,
+                msgs_for_tpl,
                 req.tools.as_ref(),
                 req.enable_thinking,
             )
             .context("プロンプトを組めない")?;
+        if let Some(p) = partial {
+            prompt.extend(self.tok.encode(&p).context("継続テキストをトークン化できない")?);
+        }
         prekprof::mark(t_tok, prekprof::TOKENIZE);
         if prompt.is_empty() {
             bail!("プロンプトが空になった");

@@ -42,6 +42,10 @@
   #log .a { color:#dff4ff; }
   #log .s { color:var(--dim); font-size:10.5px; }
   #log .e { color:#ff6b86; }
+  #log .contbtn { display:block; margin:6px 0 2px; padding:3px 12px; font-size:11px;
+    background:rgba(143,230,255,.08); color:#8fe6ff; border:1px solid rgba(143,230,255,.3);
+    border-radius:4px; cursor:pointer; }
+  #log .contbtn:hover { background:rgba(143,230,255,.18); }
   #row { display:flex; gap:6px; padding:7px 8px; border-top:1px solid #0f2b38; }
   #in { flex:1; resize:none; height:56px; background:#08131c; color:var(--fg); border:1px solid #1b4b60;
         border-radius:3px; font:inherit; font-size:12.5px; padding:6px 8px; outline:none; }
@@ -1337,18 +1341,13 @@ function addLine(cls, text) {
   return d;
 }
 
-async function sendMsg(text) {
-  if (busy || !text.trim()) return;
-  busy = true; chatEl.send.disabled = true;
-  addLine('u', '> ' + text);
-  animateInputText(text);
-  chatEl.inp.value = '';
-  hist.push({ role: 'user', content: text });
-  const node = addLine('a', '');
+async function runStream(node, baseAcc) {
   const t0 = performance.now();
-  let acc = '', usage = null, err = null;
+  let acc = baseAcc, usage = null, err = null, stop = null;
   try {
-    const body = { model: 'denno', max_tokens: CHAT_LIMITS.max_tokens_default || 4096, stream: true, messages: hist.slice(-12) };
+    const body = { model: 'denno', max_tokens: CHAT_LIMITS.max_tokens_default || 4096, stream: true,
+                   messages: hist.slice(-12) };
+    if (baseAcc) body.continue = true;   // 継続: 最後の assistant を閉じずに続ける
     const res = await fetch(CHAT_URL, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
     });
@@ -1370,8 +1369,9 @@ async function sendMsg(text) {
         if (j.type === 'content_block_delta' && j.delta && j.delta.text) {
           acc += j.delta.text; node.textContent = acc;
           chatEl.log.scrollTop = chatEl.log.scrollHeight;
-        } else if (j.type === 'message_delta' && j.usage) {
-          usage = j.usage;
+        } else if (j.type === 'message_delta') {
+          if (j.usage) usage = j.usage;
+          if (j.delta && j.delta.stop_reason) stop = j.delta.stop_reason;
         } else if (j.type === 'error') {
           err = (j.error && j.error.message) || 'error';
         }
@@ -1380,16 +1380,52 @@ async function sendMsg(text) {
   } catch (e) {
     err = (e && e.message) ? e.message : String(e);
   }
-  const secs = (performance.now() - t0) / 1000;
-  if (err) addLine('e', '[error] ' + err);
-  if (!acc && !err) node.textContent = '(空の応答)';
-  hist.push({ role: 'assistant', content: acc || '' });
-  const nOut = usage ? usage.output_tokens : null;
-  const nIn = usage ? usage.input_tokens : null;
-  chatEl.meta.textContent = (err ? 'error' : 'ok') + ' · ' + secs.toFixed(1) + ' s' +
-    (nOut ? ' · ' + nOut + ' tok (' + (nOut / secs).toFixed(1) + ' tok/s)' : '') +
+  return { acc, usage, err, stop, secs: (performance.now() - t0) / 1000 };
+}
+
+function showMeta(r) {
+  const nOut = r.usage ? r.usage.output_tokens : null;
+  const nIn = r.usage ? r.usage.input_tokens : null;
+  chatEl.meta.textContent = (r.err ? 'error' : 'ok') + ' · ' + r.secs.toFixed(1) + ' s' +
+    (nOut ? ' · ' + nOut + ' tok (' + (nOut / r.secs).toFixed(1) + ' tok/s)' : '') +
     (nIn ? ' · in ' + nIn : '') + ' · ' + (CHAT_API ? CHAT_API.replace(/^https?:\/\//, '') : 'local /chat');
+}
+
+function showContinue(node) {
+  const b = document.createElement('button');
+  b.className = 'contbtn'; b.textContent = '続きを生成';
+  b.addEventListener('click', () => { b.remove(); continueMsg(node); });
+  chatEl.log.appendChild(b);
+  chatEl.log.scrollTop = chatEl.log.scrollHeight;
+}
+
+async function sendMsg(text) {
+  if (busy || !text.trim()) return;
+  busy = true; chatEl.send.disabled = true;
+  addLine('u', '> ' + text);
+  animateInputText(text);
+  chatEl.inp.value = '';
+  hist.push({ role: 'user', content: text });
+  const node = addLine('a', '');
+  const r = await runStream(node, '');
+  if (r.err) addLine('e', '[error] ' + r.err);
+  if (!r.acc && !r.err) node.textContent = '(空の応答)';
+  hist.push({ role: 'assistant', content: r.acc || '' });
+  showMeta(r);
   busy = false; chatEl.send.disabled = false;
+  if (r.stop === 'max_tokens' && r.acc && !r.err) showContinue(node);
+}
+
+async function continueMsg(node) {
+  if (busy) return;
+  busy = true; chatEl.send.disabled = true;
+  const base = node.textContent;
+  const r = await runStream(node, base);
+  if (r.err) addLine('e', '[error] ' + r.err);
+  if (hist.length && hist[hist.length - 1].role === 'assistant') hist[hist.length - 1].content = r.acc;
+  showMeta(r);
+  busy = false; chatEl.send.disabled = false;
+  if (r.stop === 'max_tokens' && r.acc !== base && !r.err) showContinue(node);
 }
 
 chatEl.send.addEventListener('click', () => sendMsg(chatEl.inp.value));
