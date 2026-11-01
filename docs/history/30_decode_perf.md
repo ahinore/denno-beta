@@ -78,6 +78,7 @@ s160 は s157 の直後に読むと「同じ数字を別の角度から否定し
 | P-MOE-G9 | 2026-10-27 | commit なし | 選択 expert の madvise 先読みは差なし |
 | P-MOE-G10 | 2026-10-27 | 統合せず | GEMV 行ループのソフトウェアプリフェッチは差なし |
 | H1 | 2026-10-27 | commit なし | GPU スクラッチ再利用は 302 → 313 ms |
+| task 98 | 2026-11-01 | 本 commit | IQ4_NL の m=1 融合 GEMV (dequant はビット一致、内積は FMA) |
 
 ## 天井(理論値)と実測の差
 
@@ -1034,4 +1035,23 @@ GEMV の内側には入っていない。未設定なら分岐 1 回で no-op、
 - 記録: `8c981776d` (計測の配線のみ)。
 
 ![Flash-Next decode の位相別内訳](img/p57_decode_breakdown.png)
+
+### task 98: IQ4_NL の m=1 融合 GEMV (2026-11-01, 本 commit)
+
+task 95 の Q2_0 と同じ立て方で、decode (m=1) の選択 expert IQ4_NL 行を融合カーネルへ載せる。
+v2 ([`gemv_iq`] KIND=0) は 8 要素ごとに読みと LUT 展開をブロック内 4 回回すが、本カーネルは
+qs の 16 バイトを 1 回の読みにしてニブル抽出と 16 エントリ表引きをブロックあたり 2 回に
+まとめる。AVX-512F があれば zmm 版 (16 レーン、表引きは VPERMD の i32 LUT 1 uop)、
+無ければ AVX2 版に落ちる。`DENNO_IQ4NL_M1=0` で従来の gemv_iq (v2) へ退避 (既定 on)。
+
+- 契約: dequant は kquant 参照と to_bits 一致 (`w = d * kv[code]` の 1 回の f32 乗算のみ)。
+  内積は FMA 累積で classic / バッチ GEMM と非ビット一致 (task 95 の Q2_0 と同じ緩和、
+  gemv/gemm 差の実測は相対 ~1.3e-7)。f64 真値誤差は融合 1.13e-4 < classic 1.41e-4、
+  融合-classic 差 max 1.76e-4 (caps 2e-4 / 1.5e-4。down 形 640x2560 実測)。
+- 実測 (27B 実形 640x2560 と 2560x640、Zen 4 8700G・AVX-512F、1T): 融合 10.6-10.9 GB/s
+  対 v2 9.0-9.4 GB/s = **1.16-1.18x** (2 形 × 2 計測日で安定)。8T は 1.12-1.19x。
+- 見積り: スクラッチ検証の zmm 単体は v2 proxy の 2.0-2.2x に出るが、proxy の v2 が実装の
+  v2 より遅い (5.7 対 9.0 GB/s) ので 2.0x は統合経路には移転しない。AVX-512F が無い実機は
+  AVX2 版に落ち、スクラッチ測定では vpshufb + vpmovsxbd の shuffle uop 壁で上限 ~1.15x。
+- 記録: 本 commit。
 

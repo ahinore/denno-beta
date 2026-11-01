@@ -1032,9 +1032,17 @@ fn expert_gemv_inner(
     }
 
     // task 98: IQ4_NL (decode m=1 の down_exps) は専用融合カーネルへ。AVX-512F が
-    // あれば zmm 版、無ければ AVX2 版 ([`gemv_iq4nl_m1_avx512`] / [`gemv_iq4nl_m1_avx2`])。
-    // `DENNO_IQ4NL_M1=0` で下の経路 (gemv_iq v2) に戻る (退避路)。
-    if ty == GgmlType::IQ4Nl && q4k_fused_supported() && iq4nl_m1_enabled() {
+    // ある環境だけで zmm 版 ([`gemv_iq4nl_m1_avx512`]) を選ぶ。AVX2 版
+    // ([`gemv_iq4nl_m1_avx2`]) は 2026-11-01 の実 dispatch 実測で v2 比 0.925-0.945x
+    // (27B 実形 2 形 × 1T/8T の全部で悪化) だったため dispatch から外した (悪化を本番に
+    // 残さない規則。正しさの記録は cfg(test) のカーネルとテスト直参照に残す)。
+    // AVX-512F が無い環境は従来の gemv_iq (v2) に留まる。`DENNO_IQ4NL_M1=0` でも
+    // 同じ下の経路に戻る (退避路)。
+    if ty == GgmlType::IQ4Nl
+        && q4k_fused_supported()
+        && iq4nl_m1_enabled()
+        && iq4nl_m1_zmm_ok()
+    {
         #[cfg(target_arch = "x86_64")]
         {
             crate::model::exp_kprof::bump_kernel(
@@ -1043,12 +1051,6 @@ fn expert_gemv_inner(
                 ty.id(),
                 crate::model::exp_kprof::K_IQ4NL_M1,
             );
-            let kern: unsafe fn(&[u8], usize, usize, &[f32], &mut [f32]) =
-                if iq4nl_m1_zmm_ok() {
-                    gemv_iq4nl_m1_avx512
-                } else {
-                    gemv_iq4nl_m1_avx2
-                };
             for_each_row_chunk(
                 blocks,
                 n_out,
@@ -1058,7 +1060,7 @@ fn expert_gemv_inner(
                 min_rows,
                 min_chunk,
                 0,
-                |b, o| unsafe { kern(b, n_in, o.len(), x, o) },
+                |b, o| unsafe { gemv_iq4nl_m1_avx512(b, n_in, o.len(), x, o) },
             );
             #[cfg(test)]
             IQ4NL_M1_FUSED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2973,10 +2975,12 @@ pub(crate) static Q2_0_FUSED_CALLS: std::sync::atomic::AtomicUsize =
 //
 // 本番モデルの `ffn_down_exps` (IQ4_NL) は decode で従来の [`gemv_iq`] (v2) を
 // 通っている (9.12 GB/s / bench80)。v2 は 8 要素ごとに LUT 展開 (shuffle 1 回 +
-// `cvtepi8_epi32`) を回すので、1 ブロック 32 要素に 4 回の展開列が付く。本カーネルは
-// LUT 展開を 8 バイト読み 2 回 (低/高ニブル) に圧縮し、1 ブロック 4 FMA で閉じる。
-// カーネルは [`gemv_iq4nl_m1_avx2`]。`DENNO_IQ4NL_M1=0` で classic 経路へ戻せる
-// (退避路)。バッチ (prefill) 側の gemm_iq は触らない (dev1 が別 task で扱う)。
+// `cvtepi8_epi32`) を回すので、1 ブロック 32 要素に 4 回の展開列が付く。zmm 版
+// ([`gemv_iq4nl_m1_avx512`]) は qs を 16 バイト 1 読みにして展開列をブロックあたり
+// 2 回に圧縮する。`DENNO_IQ4NL_M1=0` で classic 経路へ戻せる (退避路)。
+// AVX2 版 ([`gemv_iq4nl_m1_avx2`]) は実 v2 比 0.925-0.945x で悪化のため dispatch から
+// 外した (cfg(test) に正しさの記録として残す)。バッチ (prefill) 側の gemm_iq は触らない
+// (dev1 が別 task で扱う)。
 
 /// `DENNO_IQ4NL_M1` の値の解釈。**既定 on** ([`iq4xs_fast_from_value`] と同じ規約)。
 fn iq4nl_m1_from_value(v: Option<&str>) -> bool {
@@ -3021,7 +3025,8 @@ pub(crate) static IQ4NL_M1_FUSED_CALLS: std::sync::atomic::AtomicUsize =
 /// AVX-512F 版 ([`gemv_iq4nl_m1_avx512`]) が実行時に選べるか。
 ///
 /// AVX2+FMA は分岐の外側 ([`q4k_fused_supported`]) で済んでいるので、ここでは
-/// AVX-512F だけを見る。無い CPU (AVX2 まで) は [`gemv_iq4nl_m1_avx2`] に落ちる。
+/// AVX-512F だけを見る。無い CPU (AVX2 まで) は融合を使わず従来の gemv_iq (v2) に
+/// 留まる (AVX2 版は 2026-11-01 の実 dispatch 実測 0.925-0.945x で悪化のため外した)。
 fn iq4nl_m1_zmm_ok() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -4086,15 +4091,14 @@ unsafe fn gemv_q2_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
 // - 内積は `w * x` を FMA で累積するので、classic (dequant + [`dot_seq`]) とは
 //   累積順・積の丸めが違い**ビット一致しない** (相対 2e-4 以内。Q2_0 / P89 と同じ立場)。
 //
-// 実行先は 2 段構え (P85 の gemm_iq_z と同じ立て方):
-// - AVX-512F がある CPU (このコンテナの Zen 4 実測 2.02x) は
-//   [`gemv_iq4nl_m1_avx512`]: qs の 16 バイトを `cvtepu8_epi32` (zmm) で 16 レーンに
-//   開き、i32 LUT を VPERMD で 1 uop で引く。1 ブロック 32 要素が zmm 2 本で閉じる。
-// - 無い CPU は [`gemv_iq4nl_m1_avx2`]: v2 ([`gemv_iq`] KIND=0) の 8 要素ごとの
-//   LUT 展開 (shuffle + `cvtepi8_epi32` がブロック内 4 回) を 16 バイト読み 1 回 +
-//   256 ビット ニブル抽出 2 回に圧縮し、累積を 4 本に分けて FMA 依存鎖を半分にする
-//   (このコンテナ実測 1.15x。AVX2 では vpshufb + vpmovsxbd の shuffle 系が
-//   ブロックあたり 8 uop で頭打ちになり、それ以上は削れない)。
+// 実行先 (2026-11-01 の実 dispatch 実測で決めた。27B 実形 2 形、1T/8T):
+// - AVX-512F がある CPU は [`gemv_iq4nl_m1_avx512`]: qs の 16 バイトを
+//   `cvtepu8_epi32` (zmm) で 16 レーンに開き、i32 LUT を VPERMD で 1 uop で引く。
+//   1 ブロック 32 要素が zmm 2 本で閉じる。実 v2 比 **1.165-1.180x** (1T)。
+// - [`gemv_iq4nl_m1_avx2`] は実 v2 比 0.925-0.945x で悪化したため dispatch から外した
+//   (cfg(test) に正しさの記録として残す。スクラッチ比 1.15x という当初の見積りは
+//   proxy の v2 が実装より遅かった (5.7 対 9.0 GB/s) ため実経路には移転しなかった。
+//   AVX2 では vpshufb + vpmovsxbd の shuffle 系がブロックあたり 8 uop で頭打ち)。
 //
 // ニブルの取り出しは `vpshufb` / `VPERMD` の index 規約に注意:
 // `vpshufb` は selector の bit7 が立つと 0 を返し、`VPERMD` は index の下位 4 ビット
@@ -4148,8 +4152,11 @@ unsafe fn gemv_iq4nl_m1_avx512(blocks: &[u8], n_in: usize, n_out: usize, x: &[f3
     }
 }
 
-/// AVX-512 が無い環境用の AVX2 版 ([`gemv_iq4nl_m1_avx512`] と同じ契約)。
-#[cfg(target_arch = "x86_64")]
+/// IQ4_NL 融合の AVX2 版 ([`gemv_iq4nl_m1_avx512`] と同じ契約)。
+/// 2026-11-01 の実 dispatch 実測 (このコンテナ) で v2 比 0.925-0.945x と悪化したため
+/// dispatch から外した (悪化を本番に残さない規則)。正しさの記録として cfg(test) で
+/// 残し、テストから直参照する。
+#[cfg(all(target_arch = "x86_64", test))]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn gemv_iq4nl_m1_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
     use std::arch::x86_64::*;
@@ -10029,6 +10036,8 @@ mod tests {
 
     /// IQ 系のバッチ GEMM がモートークン GEMV とビット一致すること。
     /// (トークン方向のループ位置だけが違い、1 トークンの累積順は同じ)
+    /// 例外: Q2_0 (task 95) と IQ4_NL (task 98) の融合 m=1 GEMV は FMA 累積で
+    /// 累積順がバッチと違うため非ビット一致 (相対 1e-6 程度)。dequant はビット一致。
     #[test]
     fn fused_iq_gemm_matches_gemv_bitwise() {
         if !q4k_fused_supported() {
@@ -10076,9 +10085,11 @@ mod tests {
                 )
                 .unwrap();
                 for r in 0..n_out {
-                    if ty == GgmlType::Q2_0 {
-                        // Q2_0 の融合 m=1 GEMV は累積順が classic / バッチと違う
-                        // (P89 と同じ立場)。dequant はビット一致、内積は相対 1e-6。
+                    if matches!(ty, GgmlType::Q2_0 | GgmlType::IQ4Nl) {
+                        // Q2_0 (task 95) / IQ4_NL (task 98) の融合 m=1 GEMV は
+                        // 累積順が classic / バッチと違う (FMA、P89 と同じ立場)。
+                        // dequant はビット一致、内積は相対 1e-6 (実測は IQ4_NL で
+                        // max ~1.3e-7)。
                         let a = one[r];
                         let b = batch[t * n_out + r];
                         let diff = (a - b).abs();
@@ -11339,74 +11350,8 @@ mod exp_kprof_tests {
         );
     }
 
-    /// task 98 一時計測 (commit 前に削除): 誤差分布の確認。
-    #[test]
-    #[ignore = "一時 probe"]
-    fn probe_iq4nl_error_dist() {
-        if !q4k_fused_supported() {
-            return;
-        }
-        let _g = kprof_lock();
-        let _m = moe_test_lock();
-        set_iq4nl_m1_for_test(Some(true));
-        let (k, n) = (640usize, 2560usize);
-        let nb = k / 32;
-        let mut blocks = Vec::with_capacity(n * nb * 18);
-        for r in 0..n {
-            for b in 0..nb {
-                let mut blk = vec![0u8; 18];
-                blk[0..2].copy_from_slice(&f16b(0.01 + 0.003 * ((r + b) % 7) as f32));
-                for i in 0..16usize {
-                    blk[2 + i] = byte_at(i, (r * 131 + b * 17) as u32 + 9);
-                }
-                blocks.extend_from_slice(&blk);
-            }
-        }
-        let kv = crate::kquant::kvalues_iq4nl();
-        let x: Vec<f32> = (0..k)
-            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
-            .collect();
-        let rb = nb * 18;
-        let mut a = vec![0f32; n];
-        let mut c = vec![0f32; n];
-        expert_gemv_scalar(GgmlType::IQ4Nl, &blocks, k, n, &x, &mut a).unwrap();
-        expert_gemv(GgmlType::IQ4Nl, &blocks, k, n, &x, &mut c).unwrap();
-        let mut worst_fa = 0f64;
-        let mut worst_ca = 0f64;
-        let mut worst_fc = 0f64;
-        let mut worse_than_classic = 0usize;
-        let mut worst_fa_row = 0usize;
-        for r in 0..n {
-            let mut truth = 0f64;
-            for b in 0..nb {
-                let blk = &blocks[r * rb + b * 18..r * rb + (b + 1) * 18];
-                let d = half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32() as f64;
-                for j in 0..16usize {
-                    truth += d * kv[(blk[2 + j] & 0xf) as usize] as f64 * x[b * 32 + j] as f64;
-                    truth += d * kv[(blk[2 + j] >> 4) as usize] as f64 * x[b * 32 + j + 16] as f64;
-                }
-            }
-            let scale = truth.abs().max(1e-3);
-            let fa = (c[r] as f64 - truth).abs() / scale;
-            let ca = (a[r] as f64 - truth).abs() / scale;
-            let fc = (c[r] as f64 - a[r] as f64).abs() / scale;
-            worst_fa = worst_fa.max(fa);
-            worst_ca = worst_ca.max(ca);
-            worst_fc = worst_fc.max(fc);
-            if fa > ca {
-                worse_than_classic += 1;
-            }
-            if fa >= worst_fa {
-                worst_fa_row = r;
-            }
-        }
-        eprintln!(
-            "[probe98] max rel_fa={worst_fa:.3e} max rel_ca={worst_ca:.3e} max rel_fc={worst_fc:.3e} fused>classic rows={worse_than_classic}/{n} worst_fa_row={worst_fa_row}"
-        );
-        set_iq4nl_m1_for_test(None);
-    }
-
-    /// task 98: IQ4_NL 融合 GEMV ([`gemv_iq4nl_m1_avx2`]) の検証。
+    /// task 98: IQ4_NL 融合 GEMV の検証 (dispatch は zmm 版。AVX2 版は cfg(test) の
+    /// カーネルを直参照して検証する)。
     ///
     /// 契約は task 95 (Q2_0) と同じ立て方:
     /// (1) dequant は kquant 参照 (classic = dequant + `dot_seq`) と **to_bits 一致**
@@ -11417,8 +11362,11 @@ mod exp_kprof_tests {
     ///     (down 形 640x2560 の実測: AVX-512 版の真値誤差 max 1.13e-4、classic 同 1.41e-4、
     ///     融合-classic 差 max 1.76e-4。融合は row 単位では classic を超える行が
     ///     あるが、最大誤差は classic を下回る = FMA で積の丸めが無い分、全体では精度が良い)。
-    /// (3) 発火は exp_kprof の K_IQ4NL_M1 bump で数える。`DENNO_IQ4NL_M1=0` 相当では
-    ///     従来の gemv_iq (v2) に落ちること (退避路が実際に効くこと) も確認する。
+    /// (3) 発火は exp_kprof の K_IQ4NL_M1 bump で数える (AVX-512F がある環境)。
+    ///     AVX-512F が無い環境では融合を使わず v2 に留まること (AVX2 版カーネルは
+    ///     2026-11-01 実測 0.925-0.945x で悪化したため dispatch から外した) と、
+    ///     `DENNO_IQ4NL_M1=0` 相当で従来の gemv_iq (v2) に落ちること (退避路が実際に
+    ///     効くこと) も確認する。
     #[test]
     fn iq4nl_m1_fused_gemv_dequant_bits_and_accuracy() {
         let _g = kprof_lock();
@@ -11572,10 +11520,29 @@ mod exp_kprof_tests {
         let x: Vec<f32> = (0..k).map(|i| ((i * 53 % 211) as f32 - 105.0) / 128.0).collect();
         let mut out = vec![0f32; n];
         expert_gemv(GgmlType::IQ4Nl, &blocks, k, n, &x, &mut out).unwrap();
-        assert!(
-            kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::IQ4Nl.id(), kp::K_IQ4NL_M1) >= 1,
-            "IQ4_NL が融合カーネルとして数えられていない"
-        );
+        if iq4nl_m1_zmm_ok() {
+            assert!(
+                kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::IQ4Nl.id(), kp::K_IQ4NL_M1) >= 1,
+                "IQ4_NL が融合カーネルとして数えられていない"
+            );
+            assert_eq!(
+                kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::IQ4Nl.id(), kp::K_IQ_V2),
+                0,
+                "AVX-512F があるのに融合ではなく v2 で計算した"
+            );
+        } else {
+            // AVX-512F 無しの環境は融合を使わない (AVX2 版は実測 0.925-0.945x で
+            // 悪化のため dispatch から外した)。v2 に留まることを確認する。
+            assert!(
+                kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::IQ4Nl.id(), kp::K_IQ_V2) >= 1,
+                "AVX-512F 無しで v2 に落ちていない"
+            );
+            assert_eq!(
+                kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::IQ4Nl.id(), kp::K_IQ4NL_M1),
+                0,
+                "AVX-512F 無しで融合カーネルが発火した"
+            );
+        }
         assert_eq!(
             kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::IQ4Nl.id(), kp::K_SCALAR),
             0
@@ -11610,6 +11577,11 @@ mod exp_kprof_tests {
     fn bench_iq4nl_gemv_fused_vs_v2() {
         if !q4k_fused_supported() {
             eprintln!("[bench98] AVX2/FMA が無いので計測しない");
+            return;
+        }
+        if !iq4nl_m1_zmm_ok() {
+            // AVX-512F 無しでは融合 dispatch が無効 (v2 に退避) のため比較にならない。
+            eprintln!("[bench98] AVX-512F 無し: 融合 dispatch が無効なので計測しない");
             return;
         }
         let _g = kprof_lock();

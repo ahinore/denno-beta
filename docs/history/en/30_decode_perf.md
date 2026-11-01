@@ -79,6 +79,7 @@ reading s160 right after s157 shows that "the same numbers are being denied from
 | P-MOE-G9 | 2026-10-27 | no commit | madvise read-ahead for the selected experts makes no difference |
 | P-MOE-G10 | 2026-10-27 | not merged | Software prefetch in the GEMV row loop makes no difference |
 | H1 | 2026-10-27 | no commit | Reusing GPU scratch takes 302 → 313 ms |
+| task 98 | 2026-11-01 | this commit | m=1 fused GEMV for IQ4_NL (dequant bit-exact, dot product via FMA) |
 
 ## Gap between the ceiling (theoretical values) and measurements
 
@@ -1058,4 +1059,29 @@ When the variable is unset the cost is one branch and the numeric path is unchan
 - Record: `8c981776d` (instrumentation only).
 
 ![Flash-Next decode by in-layer phase](img/p57_decode_breakdown.png)
+
+### task 98: m=1 fused GEMV for IQ4_NL (2026-11-01, this commit)
+
+Using the same approach as task 95 (Q2_0), the selected-expert IQ4_NL rows of decode (m=1) move
+onto a fused kernel. The v2 path ([`gemv_iq`], KIND=0) repeats its 8-element load and LUT
+expansion 4 times per block, while this kernel reads the 16 bytes of `qs` once and folds the
+nibble extraction and 16-entry table lookup into 2 steps per block. With AVX-512F it uses the
+zmm variant (16 lanes, table lookup as a single VPERMD i32 LUT op); without it, it falls back
+to the AVX2 variant. `DENNO_IQ4NL_M1=0` returns to the classic gemv_iq (v2) path (default on).
+
+- Contract: dequant matches the kquant reference to_bits (a single f32 multiply
+  `w = d * kv[code]`). The dot product accumulates via FMA and is not bit-exact against the
+  classic / batch GEMM paths (same relaxation as task 95's Q2_0; measured gemv/gemm difference
+  is ~1.3e-7 relative). Against the f64 truth, the fused error is 1.13e-4 < classic 1.41e-4,
+  and the fused-classic difference peaks at 1.76e-4 (caps 2e-4 / 1.5e-4; measured on the
+  640x2560 down shape).
+- Measured (27B real shapes 640x2560 and 2560x640, Zen 4 8700G with AVX-512F, 1T): fused
+  10.6-10.9 GB/s vs v2 9.0-9.4 GB/s = **1.16-1.18x** (stable across 2 shapes x 2 measurement
+  days). 8T gives 1.12-1.19x.
+- Estimate: the standalone zmm kernel in the scratch harness reaches 2.0-2.2x over the v2
+  proxy, but the proxy's v2 is slower than the real v2 (5.7 vs 9.0 GB/s), so the 2.0x does not
+  transfer to the integrated path. On machines without AVX-512F the AVX2 variant runs; the
+  scratch measurements put its ceiling at ~1.15x due to the vpshufb + vpmovsxbd shuffle uop
+  wall.
+- Record: this commit.
 
