@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn moe moe_batch moe_v2 gemm gemm_grouped moe_v3)
+targets_all=(int8 elem gdn moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16)
 
 # 名前 -> "ソース|fmad" (fmad: nofmad = -fmad=false / fmad = 既定)。未知は 1。
 spec() {
@@ -37,6 +37,7 @@ spec() {
         moe_batch)    echo "kernels_moe_batch.cu|nofmad" ;;
         moe_v2)       echo "kernels_moe_v2.cu|nofmad" ;;
         moe_v3)       echo "kernels_moe_v3.cu|nofmad" ;;
+        moe_fp16)     echo "kernels_moe_fp16.cu|nofmad" ;;
         gemm)         echo "kernels_gemm.cu|fmad" ;;
         gemm_grouped) echo "kernels_gemm_grouped.cu|fmad" ;;
         *)            return 1 ;;
