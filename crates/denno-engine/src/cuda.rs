@@ -7582,6 +7582,279 @@ pub fn maybe_gpu_router_gemv_into(
 }
 
 // ===========================================================================
+// task 110: hc mix (hc_down / hc_up) の BF16 GEMV を GPU へ (decode 96 回/token)
+// ===========================================================================
+// 実測 (メインセッション 2026-11-02、swift15 IQ3_S、DENNO_MIX_KPROF=1): decode
+// mix 47.1 ms/tok の 91% が hc_down / hc_up の BF16 GEMV。down = [10240->320] /
+// up = [320->10240]、48 層 x 2 = 96 回/token、重み 630 MB/token を CPU が読む
+// 帯域律速 (316 MMAC/token で 42.9 ms = 7.4 GMAC/s)。
+//
+// カーネルは新規に作らず、s49 / task 69 と同じ `dno_matvec_f32` を流用する
+// (.cu / PTX は 1 バイトも変えない。BF16 を直接読むカーネルは現行 PTX に無い):
+//   - 1 行 = 1 ブロック (grid=(n,1,1)・block=(1,1,1))・k 昇順の直列加算。
+//     PTX は `mul.rn.f32` + `add.rn.f32` のみ (fma.rn 0 個・.ftz 0 個)。
+//   - CPU 参照は `kquant::dequant_row_into` (BF16 -> f32 は上位 16bit 複製 =
+//     情報落ちなし) + 1 行の `acc += row[i] * x[i]` (i 昇順・積と加算の丸め分離)。
+//     同じ演算列なので**ビット一致**する (task 92 の AVX2 融合カーネルも
+//     「積を i 昇順で逐次加算・FMA 無し」で classic とビット一致済み)。
+//   - BF16 のまま VRAM に載せられない (カーネルは f32 を読む) ため f32 に展開
+//     して常駐する (630 MB BF16 -> 1,260 MB f32。BF16 -> f32 は情報落ちなしで
+//     値は不変)。展開は初回の GPU 呼び出しで 1 回だけ。
+//   - 常駐は s49 (LMV32_W) と同じ**専用レジストリ** (eviction 無し・uid key)。
+//     gguf_registry (DENNO_GPU_WEIGHT_MB) にも expert LRU (DENNO_EXPERT_VRAM_MB)
+//     にも乗らないので、ルータ / lm_head / expert と枠を奪い合わない。
+//   - 失敗時 (VRAM 足りない等) は CPU へフォールバックして warning を 1 行だけ
+//     出す (MIX_GPU_BROKEN ラッチ。2 回目以降は warn 無しで静かに CPU に落ちる)。
+//     cuda_enabled() が false (GPU 無し・DENNO_CUDA 未設定) は正常フォール
+//     バックなので warn を出さない。
+
+/// task 110: hc mix BF16 経路のスコープド恒久ラッチ (s49 / task 69 とは独立。
+/// 本経路の失敗で他の GPU 経路を落とさない)。
+static MIX_GPU_BROKEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// task 110: hc mix BF16 経路の入口に入った回数 (テスト専用)。
+/// 「ゲートを足したが分岐が通っていない」を GPU 無しで検出するために、
+/// `cuda_enabled()` の判定より**前**で数える (task 69 の ROUTER_GPU_ATTEMPTS
+/// と同じ流儀)。
+#[cfg(test)]
+static MIX_GPU_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// task 110: [`MIX_GPU_ATTEMPTS`] を読む (テスト専用)。
+#[cfg(test)]
+pub(crate) fn mix_gpu_attempts() -> usize {
+    MIX_GPU_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// task 110: hc mix BF16 経路の失敗 warning (1 行だけ。ラッチは swap で 1 回保証)。
+fn mix_gpu_broken_once(msg: &str) {
+    let prev = MIX_GPU_BROKEN.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if !prev {
+        tracing::warn!("CUDA hc mix BF16 GPU disabled, using CPU: {msg}");
+    }
+}
+
+/// task 110: BF16 重みを f32 に展開する (行ごとに [`crate::kquant::dequant_row_into`]
+/// を通す = BF16 -> f32 変換の定義を 1 か所に保つ。BF16 は f32 の上位 16bit なので
+/// 情報落ちは無い)。
+fn mix_expand_bf16(bytes: &[u8], k: usize, n: usize) -> Vec<f32> {
+    let rb = k * 2;
+    let mut out = vec![0f32; k * n];
+    let mut row = vec![0f32; k];
+    for r in 0..n {
+        crate::kquant::dequant_row_into(
+            crate::kquant::GgmlType::Bf16,
+            &bytes[r * rb..(r + 1) * rb],
+            &mut row,
+        );
+        out[r * k..(r + 1) * k].copy_from_slice(&row);
+    }
+    out
+}
+
+/// task 110: 展開済み f32 重みの常駐エントリ (s49 の LMV32_W と同じ方針:
+/// eviction 無し・uid key。解放は [`mix_gpu_unregister`] が `GgufLinear::drop` から)。
+struct MixGpuW {
+    buf: DevBuffer,
+    k: usize,
+    n: usize,
+}
+
+static MIX_GPU_W: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, MixGpuW>>> =
+    OnceLock::new();
+
+/// task 110: hc mix 用スクラッチ。ルータの RouterScratch と分ける (mix down は
+/// x=41KB/out=1.3KB、up は x=1.3KB/out=41KB と交互に来るが grow-only なので
+/// 41KB x 2 で固定)。decode は 1 スレッド直列だが thread_local にする理由は同じ。
+struct MixGpuScratch {
+    x: Option<DevBuffer>,
+    out: Option<DevBuffer>,
+    hx: Option<PinMem>,
+    ho: Option<PinMem>,
+}
+
+thread_local! {
+    static MIX_GPU_SC: std::cell::RefCell<MixGpuScratch> =
+        std::cell::RefCell::new(MixGpuScratch {
+            x: None,
+            out: None,
+            hx: None,
+            ho: None,
+        });
+}
+
+/// task 110: hc mix BF16 (m==1) の GEMV を GPU で実行する (CPU とビット一致)。
+///
+/// 戻り値 false = CPU パスを使うこと (GPU 無効・PTX 未収録・形状不一致・確保失敗・
+/// 実行エラー)。数値は CPU 経路とビット一致するので、どちらに落ちても出力は
+/// 変わらない。uid は `GgufLinear` のもの (モデルロード毎に一意) で、そのまま
+/// 常駐レジストリの key にする。bytes は BF16 の生バイト (k * n * 2)。
+///
+/// ゲート (`DENNO_MIX_GPU`、既定 off) の判定は呼び出し側 (qwen4exp の
+/// hc_mix_quant_fast) が持つ。
+pub fn maybe_gpu_mix_bf16_into(
+    uid: u64,
+    bytes: &[u8],
+    k: usize,
+    n: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> bool {
+    use std::sync::atomic::Ordering as AO;
+    #[cfg(test)]
+    MIX_GPU_ATTEMPTS.fetch_add(1, AO::Relaxed);
+    if !cuda_enabled() {
+        return false;
+    }
+    if MIX_GPU_BROKEN.load(AO::Relaxed) {
+        return false;
+    }
+    if k == 0
+        || n == 0
+        || x.len() != k
+        || out.len() != n
+        || bytes.len() != k.saturating_mul(n).saturating_mul(2)
+        || k > i32::MAX as usize
+        || n > i32::MAX as usize
+    {
+        mix_gpu_broken_once(&format!(
+            "shape mismatch (k={k}, n={n}, bytes={} / want {})",
+            bytes.len(),
+            k.saturating_mul(n).saturating_mul(2)
+        ));
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        mix_gpu_broken_once("shared_ctx() is None");
+        return false;
+    };
+    if let Err(e) = ctx.make_current() {
+        mix_gpu_broken_once(&format!("cuCtxSetCurrent: {e:#}"));
+        return false;
+    }
+    // カーネルハンドル (lazy fetch)。未収録 PTX は 1 行 warn して CPU に落とす。
+    let Some(f) = matvec_f32_fn(ctx) else {
+        mix_gpu_broken_once("kernels_elem.ptx に dno_matvec_f32 が無い (PTX 再生成が必要)");
+        return false;
+    };
+    // 重みの展開 + 常駐 (初回 1 回・同期 H2D)。ロック内で二重アップロード防止。
+    let reg = MIX_GPU_W.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let wp = {
+        let mut map = match reg.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                mix_gpu_broken_once("hc mix weight registry poisoned");
+                return false;
+            }
+        };
+        match map.get(&uid) {
+            Some(w) if w.k == k && w.n == n => w.buf.ptr(),
+            Some(_) => {
+                mix_gpu_broken_once(&format!("uid 重複: uid={uid} に別の形状 (k={k}, n={n})"));
+                return false;
+            }
+            None => {
+                let host = mix_expand_bf16(bytes, k, n);
+                match DevBuffer::from_slice(&host) {
+                    Ok(buf) => {
+                        tracing::info!(
+                            "[mix-gpu] uid={uid} bf16 mix k={k} n={n} {:.1} MB (f32 展開済み・常駐)",
+                            (k * n * 4) as f64 / 1e6
+                        );
+                        let p = buf.ptr();
+                        map.insert(uid, MixGpuW { buf, k, n });
+                        p
+                    }
+                    Err(e) => {
+                        mix_gpu_broken_once(&format!("f32 展開重みの VRAM 確保に失敗: {e:#}"));
+                        return false;
+                    }
+                }
+            }
+        }
+    };
+    let lib = match lib() {
+        Ok(l) => l,
+        Err(e) => {
+            mix_gpu_broken_once(&format!("CUDA lib load failed: {e:#}"));
+            return false;
+        }
+    };
+    let r = MIX_GPU_SC.with(|cell| -> Result<()> {
+        let mut s = cell.borrow_mut();
+        let MixGpuScratch {
+            x: dx,
+            out: dout,
+            hx,
+            ho,
+        } = &mut *s;
+        let bytes_x = k * 4;
+        let bytes_out = n * 4;
+        Scratch::ensure(dx, bytes_x)?;
+        Scratch::ensure(dout, bytes_out)?;
+        Scratch::ensure_pin(hx, bytes_x)?;
+        Scratch::ensure_pin(ho, bytes_out)?;
+        let (dx, dout) = (dx.as_ref().unwrap(), dout.as_ref().unwrap());
+        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        hx.as_mut_slice::<f32>()[..k].copy_from_slice(x);
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(
+                    dx.ptr(),
+                    hx.ptr as *const c_void,
+                    bytes_x,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyHtoDAsync",
+            )?;
+            let (mut ph, mut pw, mut po) = (dx.ptr(), wp, dout.ptr());
+            let (mut kc, mut nc) = (k as c_int, n as c_int);
+            let mut args = [
+                &mut ph as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            // 1 block = 1 行 (カーネルが block 内全スレッドで同一計算するため
+            // block=(1,1,1)。grid.x は 2^31-1 まで合法)。
+            ctx.launch_async(f, (n as u32, 1, 1), (1, 1, 1), 0, &mut args)?;
+            check(
+                (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync",
+            )?;
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        }
+        ctx.sync()?;
+        out.copy_from_slice(&ho.as_slice::<f32>()[..n]);
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            set_last_linear_ran_on_gpu(true);
+            true
+        }
+        Err(e) => {
+            mix_gpu_broken_once(&format!("hc mix BF16 matvec failed: {e:#}"));
+            false
+        }
+    }
+}
+
+/// task 110: hc mix BF16 展開重みの常駐を解放する (`GgufLinear::drop` から)。
+/// 載っていない uid は触らない。MIX_GPU_W が未初期化 (一度も GPU に載せていない)
+/// なら何もしない。
+pub fn mix_gpu_unregister(uid: u64) {
+    let Some(reg) = MIX_GPU_W.get() else {
+        return;
+    };
+    if let Ok(mut map) = reg.lock() {
+        map.remove(&uid);
+    }
+}
+
+// ===========================================================================
 // P17d: decode chain (隠れ状態デバイス常駐 + 要素演算融合)
 // ===========================================================================
 // solo decode (n==1) の 1 ステップを
@@ -20018,6 +20291,110 @@ mod p59_dedup_tests {
                 let now = moe_scratch_alloc_bytes(cur, want).unwrap_or(cur);
                 assert!(now >= want, "cur={cur} want={want}: 確保後も不足");
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // task 110: hc mix BF16 (down / up) の GPU 経路
+    // -----------------------------------------------------------------------
+
+    /// task 110: BF16 の決定的重み列 (qwen4exp tests の `bf16_weights` と同じ
+    /// LCG。テストモジュールが別なのでここにも置く)。
+    fn mix_bf16_bytes(k: usize, n: usize, seed: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(k * n * 2);
+        let mut x = seed.wrapping_mul(2_654_435_761) | 1;
+        for _ in 0..(k * n) {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = (((x >> 8) % 2000) as f32 / 1000.0 - 1.0) * 0.9;
+            out.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        out
+    }
+
+    /// task 110: BF16 -> f32 展開 ([`mix_expand_bf16`]) が `kquant::dequant_row`
+    /// と全要素ビット一致する (GPU 無しで可。展開の定義は 1 か所で保たれている
+    /// ことの確認)。
+    #[test]
+    fn mix_bf16_expand_matches_dequant_row() {
+        for (k, n, seed) in [(32usize, 3usize, 3u32), (7usize, 5usize, 11u32)] {
+            let bytes = mix_bf16_bytes(k, n, seed);
+            let expanded = mix_expand_bf16(&bytes, k, n);
+            let rb = k * 2;
+            for r in 0..n {
+                let row = crate::kquant::dequant_row(
+                    crate::kquant::GgmlType::Bf16,
+                    &bytes[r * rb..(r + 1) * rb],
+                    k,
+                );
+                for i in 0..k {
+                    assert_eq!(
+                        expanded[r * k + i].to_bits(),
+                        row[i].to_bits(),
+                        "r={r} i={i} (k={k}, n={n}) が dequant_row とビット不一致"
+                    );
+                }
+            }
+        }
+    }
+
+    /// task 110: 実 GPU で hc mix BF16 GEMV を回し、CPU の BF16 経路 (AVX2 融合 =
+    /// classic とビット一致済み) と全要素ビット一致・2 回連続で同一・発動フラグ
+    /// が立つことを確かめる。実形 (down [10240->320] / up [320->10240]) + 端数 k。
+    ///
+    /// 実機: `cargo test --release -p denno-engine --features cuda --lib -- --ignored cuda_mix_bf16 --nocapture`
+    #[test]
+    #[ignore] // GPU が必要
+    fn cuda_mix_bf16_bit_matches_classic_and_is_deterministic() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !cuda_enabled() {
+            CudaCtx::new().expect("CUDA init");
+            enable_for_tests();
+        }
+        let cases = [
+            (10240usize, 320usize, 3u32),
+            (320usize, 10240usize, 5u32),
+            (13usize, 5usize, 7u32),
+            (5usize, 13usize, 11u32),
+        ];
+        for (idx, (k, n, seed)) in cases.iter().enumerate() {
+            let (k, n) = (*k, *n);
+            let bytes = mix_bf16_bytes(k, n, *seed);
+            let x: Vec<f32> = (0..k)
+                .map(|i| (((i * 31) % 97) as f32 - 48.0) * 0.01)
+                .collect();
+            let mut cpu = vec![0f32; n];
+            crate::model::moe_expert::expert_gemv_bf16(&bytes, k, n, &x, &mut cpu)
+                .expect("CPU BF16 GEMV");
+            let uid = 0xD110_0000u64 + idx as u64;
+            let mut gpu = vec![0f32; n];
+            set_last_linear_ran_on_gpu(false);
+            assert!(
+                maybe_gpu_mix_bf16_into(uid, &bytes, k, n, &x, &mut gpu),
+                "GPU 経路が発動しない (k={k}, n={n})"
+            );
+            assert!(
+                last_linear_ran_on_gpu(),
+                "発動フラグが立っていない (k={k}, n={n})"
+            );
+            for r in 0..n {
+                assert_eq!(
+                    gpu[r].to_bits(),
+                    cpu[r].to_bits(),
+                    "行 {r} (k={k}, n={n}) が CPU とビット不一致"
+                );
+            }
+            // 決定論 (2 回目も同一)。
+            let mut gpu2 = vec![0f32; n];
+            assert!(maybe_gpu_mix_bf16_into(uid, &bytes, k, n, &x, &mut gpu2));
+            for r in 0..n {
+                assert_eq!(
+                    gpu[r].to_bits(),
+                    gpu2[r].to_bits(),
+                    "2 回目が不一致 (k={k}, n={n})"
+                );
+            }
+            // 登録の解放が死なないこと (モデル差し替えの経路)。
+            mix_gpu_unregister(uid);
         }
     }
 }

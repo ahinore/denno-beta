@@ -3003,6 +3003,52 @@ fn hc_mix_fast_enabled() -> bool {
     *ON.get_or_init(|| mix_fast_from_value(std::env::var("DENNO_HC_MIX_FAST").ok().as_deref()))
 }
 
+/// task 110: `DENNO_MIX_GPU` の解釈。**既定 off**。`1` / `on` / `true` / `yes`
+/// (`trim` + 小文字化。`router_gpu_from_value` と同一規約) のとき hc mix の
+/// BF16 down / up を GPU (`cuda::maybe_gpu_mix_bf16_into` = `dno_matvec_f32`
+/// 流用) で回す。失敗時は cuda 側が warn 1 行で CPU に落ちる (値はビット一致)。
+fn mix_gpu_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+        None => false,
+    }
+}
+
+/// task 110: hc mix GPU 経路のテスト用上書き (0 = env を見る / 1 = 強制 off /
+/// 2 = 強制 on)。`ROUTER_GPU_OVERRIDE` と同じ 3 点セット。
+static MIX_GPU_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// task 110: hc mix の down / up を GPU で回してよいか (`DENNO_MIX_GPU`、既定 off)。
+/// プロセスで 1 回だけ読む。GPU 無しビルドでは呼び出し側が cfg(feature = "cuda")
+/// の下にあるので dead になるが、判定関数そのものはテストから同じ形で叩ける。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn mix_gpu_enabled() -> bool {
+    match MIX_GPU_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| mix_gpu_from_value(std::env::var("DENNO_MIX_GPU").ok().as_deref()))
+}
+
+/// task 110: テスト専用: hc mix GPU 経路の on/off を強制する (`None` で env に戻す)。
+/// 上書きはプロセス全体で 1 個なので、触るテストは直列化する (下の MIX_GPU_GUARD)。
+#[cfg(test)]
+pub(crate) fn set_mix_gpu_for_test(v: Option<bool>) {
+    MIX_GPU_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// head (`output`) の GEMV を**行 (語彙方向) で並列化する**門番 (行数)。
 ///
 /// `GgufLinear::gemv_label` の汎用の門番は 512 行 (`PAR_MIN_ROWS`) なので、実形
@@ -3207,12 +3253,32 @@ fn hc_mix_quant_fast(
         let t = mix_kprof::stamp();
         mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_DOWN);
         let hc_fast = hc_mix_fast_enabled();
-        if hc_fast {
-            down.gemv_label_par_2row("hc_down", xn, lo, HC_DOWN_ROW_PAR_MIN)
-        } else {
-            down.gemv_label_par("hc_down", xn, lo, HC_DOWN_ROW_PAR_MIN)
+        // task 110: `DENNO_MIX_GPU=1` かつ BF16 のときだけ down GEMV を GPU に奪う
+        // (カーネルは dno_matvec_f32 流用・1 行 = 1 ブロック・k 昇順直列加算 = CPU
+        // 参照とビット一致)。false のときは従来どおり CPU 経路 (cuda 側が warn を
+        // 1 行だけ出す)。GPU 経路が成功すると `last_linear_ran_on_gpu` が立つので
+        // 下の `note_down` が gpu= を積む ([mix-kprof] の内訳で見える)。
+        #[cfg(feature = "cuda")]
+        let gpu_down = mix_gpu_enabled()
+            && down.ty() == crate::kquant::GgmlType::Bf16
+            && crate::cuda::maybe_gpu_mix_bf16_into(
+                down.uid(),
+                down.blocks().as_slice(),
+                down.k(),
+                down.n(),
+                xn,
+                lo,
+            );
+        #[cfg(not(feature = "cuda"))]
+        let gpu_down = false;
+        if !gpu_down {
+            if hc_fast {
+                down.gemv_label_par_2row("hc_down", xn, lo, HC_DOWN_ROW_PAR_MIN)
+            } else {
+                down.gemv_label_par("hc_down", xn, lo, HC_DOWN_ROW_PAR_MIN)
+            }
+            .map_err(|err| one(format!("hc_mix down: {err}")))?;
         }
-        .map_err(|err| one(format!("hc_mix down: {err}")))?;
         // task 88: down GEMV 1 発の実行先と dtype (区間計測と同じ `Instant` を再利用)。
         mix_kprof::gemv::note_down(t, down.ty());
         mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_UP);
@@ -3224,12 +3290,29 @@ fn hc_mix_quant_fast(
 
         let gate = MixScratch::take(gate, up.n());
         let t = mix_kprof::stamp();
-        if hc_fast {
-            up.gemv_label_par_2row("hc_up", lo, gate, 0)
-        } else {
-            up.gemv_label("hc_up", lo, gate)
+        // task 110: up GEMV も down と同じ (`DENNO_MIX_GPU=1` かつ BF16 のときだけ
+        // GPU に奪う。入力は hc_lo_apply 済みの `lo`、成功で `note_up` が gpu= を積む)。
+        #[cfg(feature = "cuda")]
+        let gpu_up = mix_gpu_enabled()
+            && up.ty() == crate::kquant::GgmlType::Bf16
+            && crate::cuda::maybe_gpu_mix_bf16_into(
+                up.uid(),
+                up.blocks().as_slice(),
+                up.k(),
+                up.n(),
+                lo,
+                gate,
+            );
+        #[cfg(not(feature = "cuda"))]
+        let gpu_up = false;
+        if !gpu_up {
+            if hc_fast {
+                up.gemv_label_par_2row("hc_up", lo, gate, 0)
+            } else {
+                up.gemv_label("hc_up", lo, gate)
+            }
+            .map_err(|err| one(format!("hc_mix up: {err}")))?;
         }
-        .map_err(|err| one(format!("hc_mix up: {err}")))?;
         mix_kprof::gemv::note_up(t, up.ty());
         mix_kprof::rowpar::set_label(mix_kprof::rowpar::NONE);
         mix_kprof::mark(t, mix_kprof::UP);
@@ -11421,6 +11504,39 @@ mod tests {
             (hp, norm, down, up, inject, res)
         }
 
+        /// task 110: BF16 版の hc mix フィクスチャ (`mix_q8_case` と同じ形・
+        /// 実 decode の down/up 実型)。重みは既存の [`bf16_weights`] (pat4 ベース
+        /// の決定的バイト列)。
+        fn mix_bf16_case(
+            hc: usize,
+            e: usize,
+            lr: usize,
+        ) -> (HyperParams, Vec<f32>, GgufLinear, GgufLinear, GgufLinear, HyperStreams) {
+            let hp = HyperParams {
+                hc,
+                n_embd: e,
+                low_rank: lr,
+                eps: 1e-6,
+            };
+            let hc_dim = hc * e;
+            let norm: Vec<f32> = (0..hc_dim).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect();
+            let mk = |k: usize, n: usize, seed: u32| {
+                GgufLinear::from_slice(GgmlType::Bf16, k, n, &bf16_weights(k, n, seed))
+                    .expect("GgufLinear::from_slice (Bf16)")
+            };
+            let down = mk(hc_dim, lr, 3);
+            let up = mk(lr, hc_dim, 5);
+            let inject = mk(hc_dim, hc, 7);
+            let res = HyperStreams {
+                data: (0..hc_dim)
+                    .map(|i| (((i * 11) % 17) as f32 - 8.0) * 0.05)
+                    .collect(),
+                hc,
+                n_embd: e,
+            };
+            (hp, norm, down, up, inject, res)
+        }
+
         /// IQ4_XS の 1 ブロック (136 B = d f16 + scales_h u16 + scales_l u8x4 + qs u8x128)。
         ///
         /// dequant は任意のバイト列で決定的 (KVALUES_IQ4NL の 4bit テーブル参照)。
@@ -11563,6 +11679,133 @@ mod tests {
                 hc_mix_quant_ref(&res, &norm, &down, &up, Some(&inject), &hp).expect("ref");
             assert_bitwise_eq(&m_fast, &m_ref, "down 行並列の有無 (mixed)");
             assert_bitwise_eq(&i_fast, &i_ref, "down 行並列の有無 (inject)");
+        }
+
+        // -------------------------------------------------------------------
+        // task 110: hc mix BF16 down/up の GPU 経路 (`DENNO_MIX_GPU`、既定 off)
+        // -------------------------------------------------------------------
+
+        /// task 110: 上書きを必ず env 読みに戻す (panic しても戻る)。
+        /// `MIX_GPU_OVERRIDE` はプロセス全体で 1 個なので、触るテストは
+        /// [`mix_gpu_test_lock`] で直列化してからこのガードを立てる。
+        struct MixGpuGuard;
+        static MIX_GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        impl MixGpuGuard {
+            fn new() -> Self {
+                set_mix_gpu_for_test(None);
+                Self
+            }
+        }
+        impl Drop for MixGpuGuard {
+            fn drop(&mut self) {
+                set_mix_gpu_for_test(None);
+            }
+        }
+
+        /// task 110: 上書きを触るテストの直列化 (linear_gguf の `par_test_lock` と
+        /// 同じ流儀。ロックはテスト側の変数で保持する)。
+        fn mix_gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+            MIX_GPU_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// task 110: `DENNO_MIX_GPU` の真理値表。既定 off、明示的な真値だけ on
+        /// (`router_gpu_from_value` と同一規約)。
+        #[test]
+        fn mix_gpu_gate_defaults_off() {
+            for v in [
+                Some("1"),
+                Some("on"),
+                Some("ON"),
+                Some("true"),
+                Some(" yes "),
+            ] {
+                assert!(mix_gpu_from_value(v), "value={v:?} は on のはず");
+            }
+            for v in [
+                None,
+                Some(""),
+                Some("0"),
+                Some("off"),
+                Some("false"),
+                Some("no"),
+            ] {
+                assert!(!mix_gpu_from_value(v), "value={v:?} は off のはず");
+            }
+            let _l = mix_gpu_test_lock();
+            let _g = MixGpuGuard::new();
+            set_mix_gpu_for_test(Some(false));
+            assert!(!mix_gpu_enabled(), "off の上書きが効いていない");
+            set_mix_gpu_for_test(Some(true));
+            assert!(mix_gpu_enabled(), "on の上書きが効いていない");
+        }
+
+        /// task 110: 配線確認。テスト上書きが on のときだけ hc_mix_quant から
+        /// cuda 入口 (`MIX_GPU_ATTEMPTS`) に届くこと。入口は `cuda_enabled()` の
+        /// 判定より**前**で数えるので、GPU 無し環境でも配線だけ検証できる
+        /// (BF16 実型の down/up で 1 呼び出し 2 回届く)。
+        #[cfg(feature = "cuda")]
+        #[test]
+        fn mix_gpu_gate_wiring_reaches_cuda_entry() {
+            let _l = mix_gpu_test_lock();
+            let _g = MixGpuGuard::new();
+            // hc_mix_quant は mix_kprof::rowpar のラベルを立てる (= 計上を積む) ので、
+            // rowpar::stats を before/after 差分で数えるテスト群と同じロックで
+            // 直列化する (実 decode 形の GEMV を呼ぶテストの共通の規約)。
+            let _m = moe_test_guard();
+            let (hp, norm, down, up, inject, res) = mix_bf16_case(2, 32, 8);
+            let attempts = || crate::cuda::mix_gpu_attempts();
+            set_mix_gpu_for_test(Some(false));
+            let before = attempts();
+            hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("mix (off)");
+            assert_eq!(attempts(), before, "off なのに cuda 入口に届いた");
+            set_mix_gpu_for_test(Some(true));
+            let before = attempts();
+            hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("mix (on)");
+            assert!(
+                attempts() >= before + 2,
+                "on なのに cuda 入口に届いていない (down + up = 2 回 / 呼び出し)"
+            );
+        }
+
+        /// task 110: GPU 経路が実行する演算列 (= BF16 -> f32 展開 + 1 行の k 昇順
+        /// 逐次内積 `acc += row[i] * x[i]`、積と加算の丸め分離) が、hc mix が CPU
+        /// で通る BF16 経路 (2 行カーネル指定 = 実 decode の呼び出し形) と
+        /// **全要素ビット一致**すること。
+        ///
+        /// 参照は既存の独立実装 [`bf16_gemv_seq`] (どの GEMV 経路も通らない)。
+        /// 実形 (down [10240->320] / up [320->10240]) + 4 で割り切れない端数 k
+        /// (GPU カーネル `dno_matvec_f32` の 4 倍展開ループと端数ループの両方)。
+        /// カーネルは `mul.rn.f32` + `add.rn.f32` のみ・fma.rn 0 個・.ftz 0 個・
+        /// k 昇順直列 (PTX を静的確認済み) なので、この逐次列とビット一致する。
+        /// 実 GPU での最終確認は cuda.rs の cuda_mix_bf16_bit_matches_classic。
+        #[test]
+        fn mix_gpu_bf16_real_shapes_match_sequential_ref_bitwise() {
+            // 実 decode の呼び出し形 (2row 指定) は rowpar region を立てるので、
+            // プロセス共通の ROW_PAR_REGIONS を before/after 差分で数えるテスト
+            // (expert_loop_one_region_per_layer 等、moe_test_guard を取る) と
+            // 同じロックで直列化する。
+            let _g = moe_test_guard();
+            let cases: [(&str, usize, usize, u32, usize); 4] = [
+                ("hc_down 実形", 10240, 320, 3, HC_DOWN_ROW_PAR_MIN),
+                ("hc_up 実形", 320, 10240, 5, 0),
+                ("端数 k=13", 13, 5, 7, HC_DOWN_ROW_PAR_MIN),
+                ("端数 k=5", 5, 13, 11, 0),
+            ];
+            for (label, k, n, seed, row_par_min) in cases {
+                let bytes = bf16_weights(k, n, seed);
+                let lin =
+                    GgufLinear::from_slice(GgmlType::Bf16, k, n, &bytes).expect("GgufLinear (Bf16)");
+                let x: Vec<f32> = (0..k)
+                    .map(|i| (((i * 31) % 97) as f32 - 48.0) * 0.01)
+                    .collect();
+                let want = bf16_gemv_seq(&lin, &x);
+                let mut out = vec![0f32; n];
+                lin.gemv_label_par_2row(label, &x, &mut out, row_par_min)
+                    .expect("BF16 GEMV (2row 実経路)");
+                assert_bitwise_eq(&out, &want, &format!("{label} (k={k}, n={n})"));
+            }
         }
 
         /// P84: 2 行同時カーネル ([`hc_mix_quant_fast`] の既定経路) が classic

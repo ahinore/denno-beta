@@ -1213,6 +1213,8 @@ impl Drop for GgufLinear {
         {
             crate::cuda::gguf_unregister(self.uid);
             crate::cuda::unregister_f32_weights(self.uid);
+            // task 110: hc mix BF16 展開重み (f32) の常駐も同じ uid で外す。
+            crate::cuda::mix_gpu_unregister(self.uid);
         }
     }
 }
