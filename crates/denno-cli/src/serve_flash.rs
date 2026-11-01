@@ -721,6 +721,19 @@ fn handle(flash: &mut Flash, mut stream: TcpStream) -> Result<()> {
             return send_json(&mut stream, "200 OK", &v);
         }
     }
+    // GET /v1/limits — 生成上限の問い合わせ。ビューワが値をハードコードせずに
+    // ここから読む (取得できないクライアント側の既定は 4096)。
+    if req.method == "GET" && path == "/v1/limits" {
+        return send_json(
+            &mut stream,
+            "200 OK",
+            &json!({
+                "max_tokens_default": flash.default_max,
+                "max_tokens_limit": flash.default_max,
+                "max_context_tokens": flash.max_ctx
+            }),
+        );
+    }
     if req.method != "POST" || path != "/v1/messages" {
         return send_json(
             &mut stream,

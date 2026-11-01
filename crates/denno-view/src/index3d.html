@@ -1308,6 +1308,18 @@ async function startReplay() {
 // ?api=http://host:8098 を渡すと直接つなぐ。
 const CHAT_API = Q.get('api') || '';
 const CHAT_URL = CHAT_API ? CHAT_API + '/v1/messages' : '/chat';
+// 生成上限はサーバー (/v1/limits) から読む。取れないときの既定は 4096。
+let CHAT_LIMITS = { max_tokens_default: 4096 };
+(async () => {
+  try {
+    const lu = CHAT_API ? CHAT_API + '/v1/limits' : '/v1/limits';
+    const r = await fetch(lu);
+    if (r.ok) {
+      const j = await r.json();
+      if (j && Number(j.max_tokens_default) > 0) CHAT_LIMITS = j;
+    }
+  } catch (e) { /* 既定値のまま */ }
+})();
 const chatEl = {
   log: document.getElementById('log'), inp: document.getElementById('in'),
   send: document.getElementById('send'), meta: document.getElementById('cmeta'),
@@ -1336,7 +1348,7 @@ async function sendMsg(text) {
   const t0 = performance.now();
   let acc = '', usage = null, err = null;
   try {
-    const body = { model: 'denno', max_tokens: 4096, stream: true, messages: hist.slice(-12) };
+    const body = { model: 'denno', max_tokens: CHAT_LIMITS.max_tokens_default || 4096, stream: true, messages: hist.slice(-12) };
     const res = await fetch(CHAT_URL, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
     });

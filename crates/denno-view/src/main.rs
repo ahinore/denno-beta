@@ -234,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/capture.bin", get(capture_bin))
         .route("/code/src", get(code_src))
         .route("/chat", post(chat_proxy))
+        .route("/v1/limits", get(limits_proxy))
         .with_state(app);
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("denno-view listening on http://{} (upstream: {})", addr, upstream);
@@ -394,6 +395,29 @@ async fn chat_proxy(
 
 async fn dashboard() -> Html<&'static str> {
     Html(include_str!("index.html"))
+}
+
+/// GET /v1/limits — 上流 serve-flash の生成上限を中継する。
+/// 上流に繋がらないときはクライアント側の既定と同じ 4096 を返す。
+async fn limits_proxy(
+    axum::extract::State(app): axum::extract::State<AppState>,
+) -> axum::response::Response {
+    let url = format!("{}/v1/limits", app.api);
+    let fallback =
+        "{\"max_tokens_default\":4096,\"max_tokens_limit\":4096,\"max_context_tokens\":65536}";
+    let body = match app.http.get(&url).send().await {
+        Ok(r) if r.status().is_success() => match r.text().await {
+            Ok(t) => t,
+            Err(_) => fallback.to_string(),
+        },
+        _ => fallback.to_string(),
+    };
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header("content-type", "application/json")
+        .header("cache-control", "no-cache")
+        .body(axum::body::Body::from(body))
+        .unwrap()
 }
 
 /// GET /3d — three.js の 3D ビューア (層の箱 = ニューロン、活性化で発光)。
