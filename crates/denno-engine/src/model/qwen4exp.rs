@@ -6691,37 +6691,178 @@ pub(crate) static MOE_FLAT_CALLS: std::sync::atomic::AtomicUsize =
 pub(crate) static MOE_LEGACY_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// flat スケジューラの 1 タスク (1 expert × 行チャンク `[a, b)`)。
+/// task 104: token 分割が実際に 2 以上に割った expert の数 (テスト用カウンタ)。
+/// 「テストが緑」=「分割が発動した」ではないので、分岐の通過をここで数える。
+#[cfg(test)]
+static MOE_TOKSPLIT_EXPERTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// flat スケジューラの token 分割の既定値。
+///
+/// 1 expert の m トークンを最大 `MAX` 個のチャンクに割る。m が expert 間で偏る
+/// (実機プロファイル: mean 20-60 / max 492) ので、m の大きい expert の重みを
+/// スケジューラが細かく配れるようにする。既定の最大 4 は「2〜4 分割」の中央で、
+/// `MIN = 64` 未満の expert は割らない (小さすぎるタスクは rayon の任せると
+/// オーバーヘッドが勝つ)。どちらも env で実機 A/B できる。
+const MOE_TOK_SPLIT_MAX_DEF: usize = 4;
+const MOE_TOK_SPLIT_MIN_DEF: usize = 64;
+
+/// `DENNO_MOE_TOKSPLIT` の解釈 (純粋関数)。1 expert の最大 token チャンク数。
+/// 未設定・数値でない値は既定。0 は無効、上限は 64 (それ以上はタスク表が無駄に太る)。
+fn moe_tok_split_max_from_value(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(MOE_TOK_SPLIT_MAX_DEF)
+        .min(64)
+}
+
+/// `DENNO_MOE_TOKSPLIT_MIN` の解釈 (純粋関数)。分割する最小の m。0 は「しきい値なし」。
+fn moe_tok_split_min_from_value(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(MOE_TOK_SPLIT_MIN_DEF)
+}
+
+/// テストが env を立てずに token 分割を強制するための上書き。
+/// `usize::MAX` = 未設定 (env と既定に従う)。
+#[cfg(test)]
+static TOK_SPLIT_MAX_OVR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+#[cfg(test)]
+static TOK_SPLIT_MIN_OVR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// テスト専用: token 分割の (最大チャンク数, 最小 m) を強制する (`None` で env に戻す)。
+#[cfg(test)]
+fn set_moe_tok_split_for_test(max_c: Option<usize>, min_m: Option<usize>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    TOK_SPLIT_MAX_OVR.store(max_c.unwrap_or(usize::MAX), Relaxed);
+    TOK_SPLIT_MIN_OVR.store(min_m.unwrap_or(usize::MAX), Relaxed);
+}
+
+/// `DENNO_MOE_TOKSPLIT` をプロセスで 1 回だけ読む。
+fn moe_tok_split_max() -> usize {
+    #[cfg(test)]
+    {
+        let v = TOK_SPLIT_MAX_OVR.load(std::sync::atomic::Ordering::Relaxed);
+        if v != usize::MAX {
+            return v;
+        }
+    }
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        moe_tok_split_max_from_value(std::env::var("DENNO_MOE_TOKSPLIT").ok().as_deref())
+    })
+}
+
+/// `DENNO_MOE_TOKSPLIT_MIN` をプロセスで 1 回だけ読む。
+fn moe_tok_split_min() -> usize {
+    #[cfg(test)]
+    {
+        let v = TOK_SPLIT_MIN_OVR.load(std::sync::atomic::Ordering::Relaxed);
+        if v != usize::MAX {
+            return v;
+        }
+    }
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        moe_tok_split_min_from_value(std::env::var("DENNO_MOE_TOKSPLIT_MIN").ok().as_deref())
+    })
+}
+
+/// 1 expert の token チャンク数 (純粋関数)。
+///
+/// - `max_c <= 1` は常に 1 (無効)。
+/// - `m < min_m` は 1 (割らない。`min_m == 0` はしきい値なし = 全 expert が対象)。
+/// - それ以外は「1 チャンク `min_m` トークン以上」で割れる数 `m.div_ceil(min_m)` と
+///   `max_c` の小さい方。
+///
+/// チャンク長は呼び出し側 ([`moe_push_tasks`] / gather / [`moe_quant_all`]) が
+/// `m / c` + 端数で均等に切るので、どの分割数でも `[0, m)` を 1 度ずつ覆う。
+fn moe_split_n(m: usize, max_c: usize, min_m: usize) -> usize {
+    if max_c <= 1 || m <= 1 {
+        return 1;
+    }
+    if min_m == 0 || m >= min_m {
+        let by_len = if min_m == 0 { m } else { m.div_ceil(min_m) };
+        return max_c.min(by_len).max(1);
+    }
+    1
+}
+
+/// flat スケジューラの 1 タスク (1 expert × token チャンク `[t0, t1)` × 行チャンク `[a, b)`)。
 ///
 /// 行列の別 (gate / up / down) はフィールドに持たず、タスク列を 2 本に分ける。
 /// gate と up は同じ入力 `xin` を読むので 1 タスクにまとめ、silu の積までその場で
 /// 書く (3 回目のバリアを作らないため)。`pos` は active な expert の並び (`eid`) の添字。
+///
+/// task 104: token チャンクを追加した。m が expert 間で極端に偏る (実機: mean 20-60 /
+/// max 492) ため、行チャンクだけだと 1 expert の全 m が行チャンク数個のタスクに付随し、
+/// m 最大の expert が重い。トークンは互いに独立 (出力の 1 要素 = 1 行 × 1 トークン) なので、
+/// 分割しても各要素の計算列は変わらずビット一致する。
 #[derive(Clone, Copy)]
 struct MoeTask {
     pos: u16,
+    t0: u16,
+    t1: u16,
     a: u16,
     b: u16,
 }
 
 /// 1 行チャンクのタスクを作る (u16 に収まらない形は黙って切らずにエラーで落とす)。
-fn moe_task(pos: usize, a: usize, b: usize) -> Result<MoeTask> {
+fn moe_task(pos: usize, t0: usize, t1: usize, a: usize, b: usize) -> Result<MoeTask> {
     let conv = |v: usize, what: &str| {
         u16::try_from(v).map_err(|_| one(format!("flat スケジューラ: {what} {v} が u16 を超える")))
     };
     Ok(MoeTask {
         pos: conv(pos, "expert 添字")?,
+        t0: conv(t0, "トークン")?,
+        t1: conv(t1, "トークン")?,
         a: conv(a, "行")?,
         b: conv(b, "行")?,
     })
 }
 
-/// `n_out` 行を `rows` 行ずつのタスクへ切って `out` に積む。
-fn moe_row_chunks(pos: usize, n_out: usize, rows: usize, out: &mut Vec<MoeTask>) -> Result<()> {
+/// token チャンク `[t0, t1)` × `n_out` 行を `rows` 行ずつのタスクへ切って `out` に積む。
+fn moe_row_chunks(
+    pos: usize,
+    t0: usize,
+    t1: usize,
+    n_out: usize,
+    rows: usize,
+    out: &mut Vec<MoeTask>,
+) -> Result<()> {
     let mut a = 0usize;
     while a < n_out {
         let b = (a + rows).min(n_out);
-        out.push(moe_task(pos, a, b)?);
+        out.push(moe_task(pos, t0, t1, a, b)?);
         a = b;
+    }
+    Ok(())
+}
+
+/// 1 expert ぶんのタスク (token チャンク × 行チャンク) を全部 `out` に積む。
+///
+/// token チャンク数は [`moe_split_n`] で決め、各チャンクの長さはできるだけ均等
+/// (差 1 以下) に切る。チャンクは `[0, m)` を隙間なく 1 度ずつ覆うので、
+/// 全タスクの和は従来 (チャンク 1 個) と同じ領域になる。
+fn moe_push_tasks(
+    pos: usize,
+    m: usize,
+    n_out: usize,
+    rows: usize,
+    max_c: usize,
+    min_m: usize,
+    out: &mut Vec<MoeTask>,
+) -> Result<()> {
+    let c = moe_split_n(m, max_c, min_m);
+    #[cfg(test)]
+    if c > 1 {
+        MOE_TOKSPLIT_EXPERTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let (base, rem) = (m / c, m % c);
+    let mut t0 = 0usize;
+    for i in 0..c {
+        let t1 = t0 + base + usize::from(i < rem);
+        moe_row_chunks(pos, t0, t1, n_out, rows, out)?;
+        t0 = t1;
     }
     Ok(())
 }
@@ -6771,12 +6912,21 @@ impl MoeScratch {
 ///
 /// expert の並びは gather と同じ (`off_x[pos] = その expert の先頭トークン × n_in`)。
 /// 量子化の粒度は重みの型のブロック長 (`blk`)。
+///
+/// task 104: タスクは (expert, token チャンク) に切る。expert 単位のままだと
+/// m 最大の expert が 1 タスクになり、この位相の straggler になる (量子化は
+/// 1 expert あたり `m × n_in` 要素の走査なので、m の偏りがそのまま偏りになる)。
+/// `quant_act_i8` はトークンごとに独立 (外側ループがトークン) なので、
+/// 分割しても 1 ビットも変わらない。
+#[allow(clippy::too_many_arguments)]
 fn moe_quant_all(
     src: &[f32],
     ms: &[usize],
     off_x: &[usize],
     n_in: usize,
     blk: usize,
+    tok_max: usize,
+    tok_min: usize,
     q8: &mut Vec<i8>,
     qsc: &mut Vec<f32>,
     qgs: &mut Vec<f32>,
@@ -6788,25 +6938,39 @@ fn moe_quant_all(
     qsc.resize(tot * nb, 0.0);
     qgs.resize(tot * ng, 0.0);
 
-    // expert ごとの範囲に切る (3 本とも同じ expert 順)。
-    let mut pq: Vec<&mut [i8]> = Vec::with_capacity(ms.len());
+    // タスク表 (pos, チャンク先頭トークン, チャンク長)。expert 内は連続で、
+    // 全チャンクの長さの和が `tot` になる (3 バッファの分割と同じ順序)。
+    let mut specs: Vec<(usize, usize, usize)> = Vec::new();
+    for (pos, &m) in ms.iter().enumerate() {
+        let c = moe_split_n(m, tok_max, tok_min);
+        let (base, rem) = (m / c, m % c);
+        let mut t0 = 0usize;
+        for i in 0..c {
+            let len = base + usize::from(i < rem);
+            specs.push((pos, t0, len));
+            t0 += len;
+        }
+    }
+
+    // 3 本のバッファをタスク順に**非重複**で切る (task i が書くのは part i だけ)。
+    let mut pq: Vec<&mut [i8]> = Vec::with_capacity(specs.len());
     let mut rest: &mut [i8] = &mut q8[..];
-    for &m in ms {
-        let (h, t) = rest.split_at_mut(m * n_in);
+    for &(_, _, len) in &specs {
+        let (h, t) = rest.split_at_mut(len * n_in);
         pq.push(h);
         rest = t;
     }
-    let mut ps: Vec<&mut [f32]> = Vec::with_capacity(ms.len());
+    let mut ps: Vec<&mut [f32]> = Vec::with_capacity(specs.len());
     let mut rest: &mut [f32] = &mut qsc[..];
-    for &m in ms {
-        let (h, t) = rest.split_at_mut(m * nb);
+    for &(_, _, len) in &specs {
+        let (h, t) = rest.split_at_mut(len * nb);
         ps.push(h);
         rest = t;
     }
-    let mut pg: Vec<&mut [f32]> = Vec::with_capacity(ms.len());
+    let mut pg: Vec<&mut [f32]> = Vec::with_capacity(specs.len());
     let mut rest: &mut [f32] = &mut qgs[..];
-    for &m in ms {
-        let (h, t) = rest.split_at_mut(m * ng);
+    for &(_, _, len) in &specs {
+        let (h, t) = rest.split_at_mut(len * ng);
         pg.push(h);
         rest = t;
     }
@@ -6816,11 +6980,12 @@ fn moe_quant_all(
         .zip(pg)
         .map(|((a, b), c)| (a, b, c))
         .collect();
-    // expert ごとに独立なので、どのスレッドが担当しても値は変わらない。
-    let one = |(pos, (q, sc, gs)): (usize, (&mut [i8], &mut [f32], &mut [f32]))| {
-        let m = ms[pos];
-        let x = &src[off_x[pos]..off_x[pos] + m * n_in];
-        moe_expert::quant_act_i8(x, m, n_in, blk, q, sc, gs).expect("活性の量子化 (VNNI)")
+    // チャンクごとに独立なので、どのスレッドが担当しても値は変わらない。
+    let one = |(i, (q, sc, gs)): (usize, (&mut [i8], &mut [f32], &mut [f32]))| {
+        let (pos, t0, len) = specs[i];
+        let o = off_x[pos] + t0 * n_in;
+        let x = &src[o..o + len * n_in];
+        moe_expert::quant_act_i8(x, len, n_in, blk, q, sc, gs).expect("活性の量子化 (VNNI)")
     };
     #[cfg(feature = "par")]
     {
@@ -6893,10 +7058,14 @@ fn moe_scratch_put(s: MoeScratch) {
 /// - 1 要素の計算は `moe_expert::expert_gemm_any` と**同じ関数** (`moe_expert::gemm_rows`)
 ///   を同じ引数 (同じ `n_in` / `m` / 行) で呼ぶ。行チャンクは `[0, n_out)` の分割で、
 ///   行の中の累積順は行内で閉じるので、どのスレッドがどの行を計算しても値は変わらない。
+/// - task 104: タスクは (expert, token チャンク, 行チャンク) に切る。出力の 1 要素は
+///   「1 行 × 1 トークン」で独立、1 要素の累積順は行のブロック昇順でトークンの
+///   分割に依らないので、token を割っても 1 ビットも変わらない
+///   (量子化 [`moe_quant_all`] と gather もトークンごとに独立)。
 /// - silu の積は `v / (1 + (-v).exp()) * u` で、legacy の `silu_inplace` + `*=` と同順。
 /// - 足し込みは expert index 昇順 → トークン昇順の逐次 (legacy と同順)。
-/// - タスク表は **m の降順** に並べるが、タスクは (expert, 行チャンク) ごとに
-///   独立な領域を書くだけなので順序は値に影響しない (gather / scatter は eid 昇順)。
+/// - タスク表は **m の降順** に並べるが、タスクは (expert, token チャンク, 行チャンク)
+///   ごとに独立な領域を書くだけなので順序は値に影響しない (gather / scatter は eid 昇順)。
 #[allow(clippy::too_many_arguments)]
 fn moe_experts_flat(
     lw: &LayerW,
@@ -6965,18 +7134,34 @@ fn moe_experts_flat(
     } = sc;
 
     // 3. gather: expert ごとにトークンを詰め直す (legacy と同じ順序 = トークン昇順)。
-    //    expert ごとに独立なコピーなので、expert を単位に並列化しても値は変わらない。
+    //    task 104: m の大きい expert は token チャンクに割って複数タスクにする
+    //    (expert 単位のままだと m 最大の expert が gather の straggler になる)。
+    //    expert ごとに独立なコピーなので、分割しても値は変わらない。
+    let (tok_max, tok_min) = (moe_tok_split_max(), moe_tok_split_min());
     {
-        let mut parts: Vec<&mut [f32]> = Vec::with_capacity(n);
+        // (pos, チャンクの先頭トークン, 長さ)。expert 内のチャンクは連続。
+        let mut gspec: Vec<(usize, usize, usize)> = Vec::new();
+        for (pos, &m) in ms.iter().enumerate() {
+            let c = moe_split_n(m, tok_max, tok_min);
+            let (base, rem) = (m / c, m % c);
+            let mut t0 = 0usize;
+            for i in 0..c {
+                let len = base + usize::from(i < rem);
+                gspec.push((pos, t0, len));
+                t0 += len;
+            }
+        }
+        let mut parts: Vec<&mut [f32]> = Vec::with_capacity(gspec.len());
         let mut rest: &mut [f32] = &mut xin[..];
-        for pos in 0..n {
-            let (head, tail) = rest.split_at_mut(ms[pos] * e);
+        for &(_, _, len) in &gspec {
+            let (head, tail) = rest.split_at_mut(len * e);
             parts.push(head);
             rest = tail;
         }
-        let gather_one = |(pos, dst): (usize, &mut [f32])| {
+        let gather_one = |(gi, dst): (usize, &mut [f32])| {
+            let (pos, t0, len) = gspec[gi];
             let ei = eid[pos];
-            for (idx, &(t, _)) in by_expert[ei].iter().enumerate() {
+            for (idx, &(t, _)) in by_expert[ei].iter().skip(t0).take(len).enumerate() {
                 dst[idx * e..(idx + 1) * e].copy_from_slice(&xs[t * e..(t + 1) * e]);
             }
         };
@@ -7022,19 +7207,23 @@ fn moe_experts_flat(
     // 5. タスク表 (gate+up+silu 積 / down)。**m の降順** に並べる
     //    (m の大きい expert から先にタスク列へ入るので、rayon の分割で
     //    重い仕事が先に始まる)。タスクは独立な領域を書くので順序は値に影響しない。
+    //    task 104: 1 expert のタスクは (token チャンク × 行チャンク) に切る
+    //    ([`moe_push_tasks`])。m 最大の expert の 1 タスクの重みが 1/C になり、
+    //    行チャンクだけの分割より末尾の偏りが小さい。
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| ms[b].cmp(&ms[a]).then_with(|| a.cmp(&b)));
     let mut ta: Vec<MoeTask> = Vec::new();
     let mut tb: Vec<MoeTask> = Vec::new();
     let rows = rows.max(1);
     for &pos in &order {
-        moe_row_chunks(pos, ff, rows, &mut ta)?;
-        moe_row_chunks(pos, e, rows, &mut tb)?;
+        moe_push_tasks(pos, ms[pos], ff, rows, tok_max, tok_min, &mut ta)?;
+        moe_push_tasks(pos, ms[pos], e, rows, tok_max, tok_min, &mut tb)?;
     }
 
     // SAFETY (act / up / h をタスク間で共有してよい根拠):
-    // - タスク (pos, a, b) が書くのは expert `pos` の領域の `t * n_out + [a, b)`
-    //   (t < ms[pos]) だけで、`[a, b)` はタスク間で重ならない。
+    // - タスク (pos, [t0,t1), [a,b)) が書くのは expert `pos` の領域の
+    //   `t * n_out + [a, b)` (t0 <= t < t1) だけで、token チャンク × 行チャンクは
+    //   タスク間で重ならない (token も行も `[0, m)` / `[0, n_out)` の分割)。
     // - 領域の大きさは `tot * ff` / `tot * e` で、添字は必ずその内側。
     // - `moe_expert::gemm_rows` は `m * stride` 要素以上を書き、行チャンクの外へは書かない。
     // よって異なるタスクが同じ要素へ書くことはない (data race なし)。
@@ -7074,7 +7263,7 @@ fn moe_experts_flat(
             so += m * nb;
             go += m * ng;
         }
-        moe_quant_all(&xin, &ms, &off_x, e, blk, &mut q8, &mut qsc, &mut qgs);
+        moe_quant_all(&xin, &ms, &off_x, e, blk, tok_max, tok_min, &mut q8, &mut qsc, &mut qgs);
     }
     let nb_a = blk_a.map(|b| e / b).unwrap_or(0);
     let ng_a = e / 32;
@@ -7083,10 +7272,11 @@ fn moe_experts_flat(
     let run_a = |(i, t): (usize, &MoeTask)| {
         let pos = t.pos as usize;
         let (a, b) = (t.a as usize, t.b as usize);
-        let m = ms[pos];
-        let x = &xin[off_x[pos]..off_x[pos] + m * e];
-        let dst_a = act_p.add(off_a[pos] + a);
-        let dst_u = up_p.add(off_a[pos] + a);
+        let (t0, t1) = (t.t0 as usize, t.t1 as usize);
+        let m = t1 - t0;
+        let x = &xin[off_x[pos] + t0 * e..off_x[pos] + t1 * e];
+        let dst_a = act_p.add(off_a[pos] + t0 * ff + a);
+        let dst_u = up_p.add(off_a[pos] + t0 * ff + a);
         // 2〜4 個先のタスクの重みを先読みする (層のタスク表は expert ごとに cold)。
         moe_prefetch_task_ahead(&ta, i, 3, &gs, rb_g);
         moe_prefetch_task_ahead(&ta, i, 3, &us, rb_u);
@@ -7104,9 +7294,9 @@ fn moe_experts_flat(
         };
         if let Some(blk) = blk_a {
             act_g = moe_expert::VnniAct {
-                q: &q8[off_x[pos]..off_x[pos] + m * e],
-                sc: &qsc[off_s[pos]..off_s[pos] + m * nb_a],
-                gs: &qgs[off_g[pos]..off_g[pos] + m * ng_a],
+                q: &q8[off_x[pos] + t0 * e..off_x[pos] + t1 * e],
+                sc: &qsc[off_s[pos] + t0 * nb_a..off_s[pos] + t1 * nb_a],
+                gs: &qgs[off_g[pos] + t0 * ng_a..off_g[pos] + t1 * ng_a],
                 m,
                 n_in: e,
                 blk,
@@ -7132,7 +7322,7 @@ fn moe_experts_flat(
         // act の行 [a, b) を silu(act) * up で置き換える (このタスクが書いた行だけ)。
         let pa = act_p.get();
         let pu = up_p.get();
-        for idx in 0..m {
+        for idx in t0..t1 {
             let base = off_a[pos] + idx * ff;
             for r in a..b {
                 // SAFETY: base + r はこのタスクが上で書いた範囲 (他タスクと重ならない)。
@@ -7169,7 +7359,7 @@ fn moe_experts_flat(
             go += m * ng;
         }
         let act_r: &[f32] = &act;
-        moe_quant_all(act_r, &ms, &off_a, ff, blk, &mut q8, &mut qsc, &mut qgs);
+        moe_quant_all(act_r, &ms, &off_a, ff, blk, tok_max, tok_min, &mut q8, &mut qsc, &mut qgs);
         (nb, offs, offg)
     } else {
         (0, Vec::new(), Vec::new())
@@ -7180,17 +7370,18 @@ fn moe_experts_flat(
     let run_b = |(i, t): (usize, &MoeTask)| {
         let pos = t.pos as usize;
         let (a, b) = (t.a as usize, t.b as usize);
-        let m = ms[pos];
-        let x = &act_r[off_a[pos]..off_a[pos] + m * ff];
-        let dst = h_p.add(off_h[pos] + a);
+        let (t0, t1) = (t.t0 as usize, t.t1 as usize);
+        let m = t1 - t0;
+        let x = &act_r[off_a[pos] + t0 * ff..off_a[pos] + t1 * ff];
+        let dst = h_p.add(off_h[pos] + t0 * e + a);
         crate::model::exp_kprof::set_mat(crate::model::exp_kprof::DOWN);
         moe_prefetch_task_ahead(&tb, i, 3, &ds, rb_d);
         // 前提は run_a と同じ (`[a, b)` は [0, n_out) の分割の 1 つ、領域は `m * stride` 以上)。
         if use_d {
             let act_d = moe_expert::VnniAct {
-                q: &q8[off_a[pos]..off_a[pos] + m * ff],
-                sc: &qsc[off_sb[pos]..off_sb[pos] + m * nb_b],
-                gs: &qgs[off_gb[pos]..off_gb[pos] + m * (ff / 32)],
+                q: &q8[off_a[pos] + t0 * ff..off_a[pos] + t1 * ff],
+                sc: &qsc[off_sb[pos] + t0 * nb_b..off_sb[pos] + t1 * nb_b],
+                gs: &qgs[off_gb[pos] + t0 * (ff / 32)..off_gb[pos] + t1 * (ff / 32)],
                 m,
                 n_in: ff,
                 blk: blk_d.unwrap_or(32),
@@ -7220,7 +7411,7 @@ fn moe_experts_flat(
         // (pos, expert 内の添字, 重みの添字)。pos 昇順に積むので index 昇順が保たれる。
         let mut by_token: Vec<Vec<(u16, usize, u16)>> = vec![Vec::new(); nt];
         for (pos, &ei) in eid.iter().enumerate() {
-            let pos_u16 = moe_task(pos, 0, 0)?.pos;
+            let pos_u16 = moe_task(pos, 0, 0, 0, 0)?.pos;
             for (idx, &(t, j)) in by_expert[ei].iter().enumerate() {
                 by_token[t].push((pos_u16, idx, j as u16));
             }
@@ -12538,7 +12729,7 @@ mod tests {
         fn moe_row_chunks_cover_all_rows_once() {
             for n_out in [0usize, 1, 31, 32, 33, 640, 2560] {
                 let mut v = Vec::new();
-                moe_row_chunks(0, n_out, MOE_FLAT_ROWS, &mut v).expect("chunks");
+                moe_row_chunks(0, 0, 1, n_out, MOE_FLAT_ROWS, &mut v).expect("chunks");
                 let mut covers = vec![0u8; n_out];
                 for t in &v {
                     assert!(t.a < t.b, "空のチャンク (n_out={n_out})");
@@ -12553,6 +12744,361 @@ mod tests {
                 );
                 assert_eq!(v.len(), n_out.div_ceil(MOE_FLAT_ROWS), "n_out={n_out}: 本数");
             }
+        }
+
+        /// `moe_split_n` の真理値表 (task 104)。
+        #[test]
+        fn moe_split_n_table() {
+            // 無効 (max_c <= 1) と m が小さいときは割らない。
+            for max_c in [0usize, 1] {
+                for m in [0usize, 1, 63, 64, 492] {
+                    assert_eq!(moe_split_n(m, max_c, 64), 1, "max_c={max_c} m={m}");
+                }
+            }
+            // しきい値未満。
+            assert_eq!(moe_split_n(63, 4, 64), 1);
+            assert_eq!(moe_split_n(1, 4, 64), 1);
+            // しきい値以上: min(4, ceil(m/64))。
+            assert_eq!(moe_split_n(64, 4, 64), 1, "m == min_m は 1 (割る余地が無い)");
+            assert_eq!(moe_split_n(65, 4, 64), 2);
+            assert_eq!(moe_split_n(128, 4, 64), 2);
+            assert_eq!(moe_split_n(192, 4, 64), 3);
+            assert_eq!(moe_split_n(256, 4, 64), 4);
+            assert_eq!(moe_split_n(492, 4, 64), 4);
+            assert_eq!(moe_split_n(492, 2, 64), 2);
+            assert_eq!(moe_split_n(492, 8, 64), 8);
+            // min_m == 0 はしきい値なし。
+            assert_eq!(moe_split_n(5, 4, 0), 4);
+        }
+
+        /// `moe_push_tasks` が token チャンク × 行チャンクの全領域を 1 度ずつ覆う。
+        #[test]
+        fn moe_push_tasks_cover_all_tokens_and_rows() {
+            let (max_c, min_m) = (4usize, 64usize);
+            for m in [1usize, 63, 64, 65, 129, 256, 492] {
+                for n_out in [1usize, 33, 640] {
+                    let mut v = Vec::new();
+                    moe_push_tasks(0, m, n_out, MOE_FLAT_ROWS, max_c, min_m, &mut v)
+                        .expect("tasks");
+                    let c = moe_split_n(m, max_c, min_m);
+                    assert_eq!(
+                        v.len(),
+                        c * n_out.div_ceil(MOE_FLAT_ROWS),
+                        "m={m} n_out={n_out}: タスク数"
+                    );
+                    let mut covers = vec![0u32; m * n_out];
+                    for t in &v {
+                        let (t0, t1) = (t.t0 as usize, t.t1 as usize);
+                        let (a, b) = (t.a as usize, t.b as usize);
+                        assert!(t0 < t1 && a < b, "空チャンク m={m}");
+                        for tok in t0..t1 {
+                            for r in a..b {
+                                covers[tok * n_out + r] += 1;
+                            }
+                        }
+                    }
+                    assert!(
+                        covers.iter().all(|&c| c == 1),
+                        "m={m} n_out={n_out}: 領域の重複か欠落"
+                    );
+                }
+            }
+        }
+
+        /// `DENNO_MOE_TOKSPLIT` / `DENNO_MOE_TOKSPLIT_MIN` の解釈。
+        #[test]
+        fn moe_tok_split_env_values() {
+            assert_eq!(moe_tok_split_max_from_value(None), 4);
+            assert_eq!(moe_tok_split_max_from_value(Some("")), 4);
+            assert_eq!(moe_tok_split_max_from_value(Some("nope")), 4);
+            assert_eq!(moe_tok_split_max_from_value(Some("0")), 0);
+            assert_eq!(moe_tok_split_max_from_value(Some("2")), 2);
+            assert_eq!(moe_tok_split_max_from_value(Some("999")), 64, "上限 64");
+            assert_eq!(moe_tok_split_min_from_value(None), 64);
+            assert_eq!(moe_tok_split_min_from_value(Some("0")), 0);
+            assert_eq!(moe_tok_split_min_from_value(Some("128")), 128);
+        }
+
+        /// task 104: token 分割 on/off で出力が 1 ビットも変わらないこと。
+        ///
+        /// m に偏り (max 492 / mean ≈ 59) を作り、off / 2 分割 / 4 分割 / しきい値 32 を
+        /// 同じ入力で回して `to_bits()` 比較する。VNNI 経路 (活性の int8 量子化が入る)
+        /// も「off と on の比較」がビット一致することを見る (f32 との比較は別枠)。
+        #[test]
+        fn moe_toksplit_matches_nosplit_bitwise() {
+            gpu_gemm_off();
+            let _g = moe_test_guard();
+            let (n_in, n_ff, ne, k) = (2560usize, 640usize, 86usize, 10usize);
+            let dir = TempDir::new("h2toksplit");
+            let path = write_expert_gguf_big(&dir, n_in, n_ff, ne);
+            let f = GgufFile::open(&path).expect("open");
+            let p = bench_params(n_in, n_ff, ne, k);
+            let lw = cache_test_layer(&f, &p);
+
+            // m に強い偏りを作る (実機プロファイルの形: 大きい expert が少数)。
+            // nt = Σm / k が max(m) 以上になるようにする (m <= nt の実モデルの形)。
+            let mut ms: Vec<usize> = vec![492, 300, 200, 150, 120, 100, 80, 70, 65, 64];
+            while ms.len() < ne {
+                ms.push(45);
+            }
+            let sum: usize = ms.iter().sum();
+            let nt = sum.div_ceil(k);
+            assert!(nt >= *ms.iter().max().unwrap(), "nt={nt} が max m 未満");
+
+            let total = nt * k;
+            let mut slots: Vec<usize> = (0..total).collect();
+            let mut seed = 777u64;
+            for i in (1..total).rev() {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let j = ((seed >> 33) as usize) % (i + 1);
+                slots.swap(i, j);
+            }
+            let mut it = slots.into_iter();
+            let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
+            for (ei, &m) in ms.iter().enumerate() {
+                let mut v: Vec<(usize, usize)> = (0..m)
+                    .map(|_| {
+                        let s = it.next().expect("slot");
+                        (s / k, s % k)
+                    })
+                    .collect();
+                v.sort_unstable();
+                by_expert[ei] = v;
+            }
+            let weights = vec![0.37f32; nt * k];
+            let xs: Vec<f32> = (0..nt * n_in)
+                .map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.003)
+                .collect();
+
+            let run = |max_c: usize, min_m: usize, vnni: bool| -> Vec<f32> {
+                set_moe_tok_split_for_test(Some(max_c), Some(min_m));
+                let mut out = vec![0.0f32; nt * n_in];
+                moe_experts_flat(
+                    &lw, &by_expert, &weights, k, &xs, n_in, n_ff, MOE_FLAT_ROWS, &mut out, vnni,
+                )
+                .expect("flat");
+                out
+            };
+
+            // f32 経路: off が基準。
+            let split0 = MOE_TOKSPLIT_EXPERTS.load(std::sync::atomic::Ordering::Relaxed);
+            let ref_off = run(0, 64, false);
+            let out2 = run(2, 64, false);
+            let out4 = run(4, 64, false);
+            let out4m32 = run(4, 32, false);
+            assert_bitwise_eq(&ref_off, &out2, "toksplit 2 vs off (f32)");
+            assert_bitwise_eq(&ref_off, &out4, "toksplit 4 vs off (f32)");
+            assert_bitwise_eq(&ref_off, &out4m32, "toksplit 4/min32 vs off (f32)");
+            let split_cnt = MOE_TOKSPLIT_EXPERTS.load(std::sync::atomic::Ordering::Relaxed)
+                - split0;
+            assert!(
+                split_cnt > 0,
+                "token 分割が一度も発動していない (m に偏りが無い?)"
+            );
+            assert!(
+                ref_off.iter().any(|v| *v != 0.0),
+                "出力が全 0 (経路の生死が分からない)"
+            );
+
+            // VNNI 経路: off と on の比較がビット一致 (量子化の token 分割は独立)。
+            let ref_v = run(0, 64, true);
+            let out_v4 = run(4, 64, true);
+            assert_bitwise_eq(&ref_v, &out_v4, "toksplit 4 vs off (VNNI)");
+            set_moe_tok_split_for_test(None, None);
+        }
+
+        /// task 104 のマイクロベンチ (手動)。実機プロファイルの m 分布 (偏り:
+        /// mean ≈ 21 / max 492) を再現した 1 層ぶんで、token 分割 off / 2 / 4 を
+        /// 同一バイナリ・同一ループ内で交互に測る (rep の min を取る)。
+        /// あわせて活性の int8 量子化 ([`moe_quant_all`]) だけの A/B も出す
+        /// (expert 単位 1 タスクだった位相 = 分割の効果が最も大きい場所)。
+        ///
+        /// 実行 (16 スレッド):
+        /// `RAYON_NUM_THREADS=16 cargo test --release -p denno-engine --features cuda --lib \
+        ///   moe_tok_split_microbench -- --ignored --nocapture --test-threads=1`
+        #[test]
+        #[ignore = "CPU のスケジュール A/B (実機の ms/token は main が測る)"]
+        fn moe_tok_split_microbench() {
+            gpu_gemm_off();
+            let _g = moe_test_guard();
+            let (n_in, n_ff, ne, k) = (2560usize, 640usize, 256usize, 10usize);
+            let dir = TempDir::new("h2tokbench");
+            let path = write_expert_gguf_big(&dir, n_in, n_ff, ne);
+            let f = GgufFile::open(&path).expect("open");
+            let p = bench_params(n_in, n_ff, ne, k);
+            let lw = cache_test_layer(&f, &p);
+
+            // 実機プロファイルの m 分布を比例サンプルする (task 104 の背景の値):
+            // m=1: 22070 / 2-3: 12110 / 4-7: 16990 / 8-15: 16570 / 16-31: 15220 /
+            //      32-63: 13540 / 64: 8920 / 65+: 6330 (max 492)
+            let buckets: [(u64, usize, usize); 8] = [
+                (22070, 1, 1),
+                (12110, 2, 3),
+                (16990, 4, 7),
+                (16570, 8, 15),
+                (15220, 16, 31),
+                (13540, 32, 63),
+                (8920, 64, 64),
+                (6330, 65, 492),
+            ];
+            let total_w: u64 = buckets.iter().map(|b| b.0).sum();
+            let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+            let mut rnd = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let mut ms: Vec<usize> = Vec::with_capacity(ne);
+            for _ in 0..ne {
+                let r = rnd() % total_w;
+                let mut acc = 0u64;
+                let mut m = 1usize;
+                for &(w, lo, hi) in &buckets {
+                    acc += w;
+                    if r < acc {
+                        m = lo + (rnd() as usize) % (hi - lo + 1);
+                        break;
+                    }
+                }
+                ms.push(m);
+            }
+            ms.sort_unstable_by(|a, b| b.cmp(a));
+            let sum: usize = ms.iter().sum();
+            let nt = sum.div_ceil(k);
+            println!(
+                "threads={} ne={ne} n_in={n_in} n_ff={n_ff} k={k} tot_m={sum} nt={nt} max_m={} mean={:.1}",
+                rayon::current_num_threads(),
+                ms[0],
+                sum as f64 / ne as f64,
+            );
+            assert!(nt >= ms[0], "nt={nt} が max m ({}) 未満", ms[0]);
+
+            let total = nt * k;
+            let mut slots: Vec<usize> = (0..total).collect();
+            let mut s2 = 424242u64;
+            for i in (1..total).rev() {
+                s2 = s2
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let j = ((s2 >> 33) as usize) % (i + 1);
+                slots.swap(i, j);
+            }
+            let mut it = slots.into_iter();
+            let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
+            for (ei, &m) in ms.iter().enumerate() {
+                let mut v: Vec<(usize, usize)> = (0..m)
+                    .map(|_| {
+                        let s = it.next().expect("slot");
+                        (s / k, s % k)
+                    })
+                    .collect();
+                v.sort_unstable();
+                by_expert[ei] = v;
+            }
+            let weights = vec![0.1f32; nt * k];
+            let xs: Vec<f32> = (0..nt * n_in)
+                .map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.003)
+                .collect();
+
+            let variants: [(usize, usize); 3] = [(0, 64), (2, 64), (4, 64)];
+            let outs: Vec<Vec<f32>> = (0..variants.len()).map(|_| vec![0.0f32; nt * n_in]).collect();
+            let mut outs = outs;
+            // 温め + 値の突き合わせ
+            for (vi, out) in outs.iter_mut().enumerate() {
+                let (max_c, min_m) = variants[vi];
+                set_moe_tok_split_for_test(Some(max_c), Some(min_m));
+                for v in out.iter_mut() {
+                    *v = 0.0;
+                }
+                moe_experts_flat(
+                    &lw, &by_expert, &weights, k, &xs, n_in, n_ff, MOE_FLAT_ROWS, out, true,
+                )
+                .expect("flat");
+            }
+            assert_bitwise_eq(&outs[0], &outs[1], "bench: 2 分割 vs off");
+            assert_bitwise_eq(&outs[0], &outs[2], "bench: 4 分割 vs off");
+
+            let reps = 7usize;
+            let mut best = vec![f64::INFINITY; outs.len()];
+            for _ in 0..reps {
+                for (vi, out) in outs.iter_mut().enumerate() {
+                    let (max_c, min_m) = variants[vi];
+                    set_moe_tok_split_for_test(Some(max_c), Some(min_m));
+                    for v in out.iter_mut() {
+                        *v = 0.0;
+                    }
+                    let t0 = std::time::Instant::now();
+                    moe_experts_flat(
+                        &lw, &by_expert, &weights, k, &xs, n_in, n_ff, MOE_FLAT_ROWS, out, true,
+                    )
+                    .expect("flat");
+                    let us = t0.elapsed().as_secs_f64() * 1e6;
+                    best[vi] = best[vi].min(us);
+                }
+            }
+            println!(
+                "layer: off={:8.0}us | split2={:8.0} ({:.3}x) | split4={:8.0} ({:.3}x)",
+                best[0],
+                best[1],
+                best[0] / best[1],
+                best[2],
+                best[0] / best[2],
+            );
+
+            // 量子化だけの A/B (gather 出力と同じ expert 並びに組み直す。全 expert が
+            // nonempty なので eid[pos] == pos)。
+            let mut xin_q = vec![0.0f32; sum * n_in];
+            let mut off_x = Vec::with_capacity(ne);
+            let mut o = 0usize;
+            for &m in &ms {
+                off_x.push(o);
+                o += m * n_in;
+            }
+            for (pos, picks) in by_expert.iter().enumerate() {
+                for (idx, &(t, _)) in picks.iter().enumerate() {
+                    xin_q[off_x[pos] + idx * n_in..off_x[pos] + (idx + 1) * n_in]
+                        .copy_from_slice(&xs[t * n_in..(t + 1) * n_in]);
+                }
+            }
+            let blk = moe_expert::vnni_act_block(lw.gate_exps.ty)
+                .expect("bench: gate の型が VNNI 非対応");
+            let mut bufs: Vec<_> = (0..variants.len())
+                .map(|_| (Vec::<i8>::new(), Vec::<f32>::new(), Vec::<f32>::new()))
+                .collect();
+            for (vi, (q8, qsc, qgs)) in bufs.iter_mut().enumerate() {
+                let (max_c, min_m) = variants[vi];
+                set_moe_tok_split_for_test(Some(max_c), Some(min_m));
+                let mut b = f64::INFINITY;
+                for _ in 0..reps {
+                    let t0 = std::time::Instant::now();
+                    moe_quant_all(
+                        &xin_q, &ms, &off_x, n_in, blk, tok_split_eff(max_c), min_m, q8, qsc, qgs,
+                    );
+                    b = b.min(t0.elapsed().as_secs_f64() * 1e6);
+                }
+                println!("quant[{vi}] max_c={max_c}: {b:8.0}us");
+            }
+            assert_eq!(
+                bufs[0].0.len(),
+                bufs[2].0.len(),
+                "bench quant: q8 の長さが違う"
+            );
+            for (i, (a, b)) in bufs[0].0.iter().zip(bufs[2].0.iter()).enumerate() {
+                assert_eq!(a, b, "bench quant: q8 の {i} 番目が違う (4 分割 vs off)");
+            }
+            assert_bitwise_eq(&bufs[0].1, &bufs[2].1, "bench quant: qsc 4 分割 vs off");
+            assert_bitwise_eq(&bufs[0].2, &bufs[2].2, "bench quant: qgs 4 分割 vs off");
+            set_moe_tok_split_for_test(None, None);
+        }
+
+        /// マイクロベンチの variant 値 (0 = off) を `moe_quant_all` の実引数へ。
+        /// (off を 0 のまま渡すと `moe_split_n` は max_c<=1 で 1 を返すので同じ意味だが、
+        /// 意図を明示するために 1 を渡す。)
+        fn tok_split_eff(max_c: usize) -> usize {
+            max_c.max(1)
         }
 
         /// 実形状 (n_in=2560, n_ff=640) の expert 3 本だけを持つ合成 GGUF。
