@@ -60,6 +60,7 @@ const char *ggml_type_name(enum ggml_type type) {
         case GGML_TYPE_IQ4_XS: return "iq4_xs";
         case GGML_TYPE_TQ1_0: return "tq1_0";
         case GGML_TYPE_IQ1_M: return "iq1_m";
+        case GGML_TYPE_Q2_0: return "q2_0";
         default: return "?";
     }
 }
@@ -73,7 +74,8 @@ static size_t ggml_type_size_impl(enum ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
-        case GGML_TYPE_IQ4_NL: return 18;
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q2_0: return 18; /* block_q2_0 = d(f16) + qs[QK2_0/4] */
         case GGML_TYPE_Q2_K: return 84;
         case GGML_TYPE_Q3_K: return 110;
         case GGML_TYPE_Q4_K: return 144;
@@ -105,6 +107,7 @@ int64_t ggml_blck_size(enum ggml_type type) {
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL: return 32;
+        case GGML_TYPE_Q2_0: return 64; /* QK2_0 */
         default: return 256; /* K/IQ 系 */
     }
 }
@@ -203,6 +206,10 @@ int main(int argc, char **argv) {
          * 既存 18 型の後ろに追記する (先頭セクションのバイト列を変えないため)。 */
         { "TQ1_0",   sizeof(block_tq1_0),   QK_K,     (void *)dequantize_row_tq1_0 },
         { "IQ1_M",   sizeof(block_iq1_m),   QK_K,     (void *)dequantize_row_iq1_m },
+        /* Task P105: Q2_0 (ggml type 42) = 64 要素 / 18 B ブロック。
+         * kquant.rs が Q2_0 を対応済みにしたので参照と突き合わせる。
+         * 既存 20 型の後ろに追記する (先頭セクションのバイト列を変えないため)。 */
+        { "Q2_0",    sizeof(block_q2_0),    QK2_0,    (void *)dequantize_row_q2_0 },
     };
     const int n_secs = (int)(sizeof(secs) / sizeof(secs[0]));
     /* Task K3: 既存 20 型の後ろに Q4_0_EDGE (type 2 のエッジ列) を 1 つ足す。
