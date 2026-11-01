@@ -1045,3 +1045,61 @@ fn decode_greedy_stop_with_zero_new_is_empty() {
     assert!(got.is_empty());
     assert_eq!(d.tokens().len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// task 106: decode 出力の指紋 (変更前後の to_bits 比較を別プロセスで行う)
+// ---------------------------------------------------------------------------
+
+/// decode 出力 (prefill の logits + 貪欲生成列) の FNV-1a 指紋を出す。
+///
+/// このテスト自体は決定性だけを固定し (同一プロセスで 2 回、logits を
+/// `to_bits()` で比較)、**指紋の値は常に出力する**。数値経路の変更前後で
+/// 比べるときは、env を変えて別プロセスで 2 回実行し、指紋が一致することを見る:
+///
+/// ```text
+/// DENNO_MIX_FAST=1   cargo test --release -p denno-engine --test qwen4exp_decode \
+///   decode_logits_fingerprint_task106 -- --nocapture   (mix 旧経路は DENNO_MIX_FAST=0)
+/// DENNO_CPU_GEMV_PAR=1 / =0 も同様 (F32 行並列 GEMV の copy / direct)
+/// ```
+///
+/// 指紋が一致すれば、mix の合成走査変更 (`mixed_range`)・合成の直書き化
+/// ([`Qwen4Exp`] の fast 経路)・F32 GEMV direct 化のどれでも decode 出力は
+/// 1 ビットも動いていない。1 回の変更検証につき 1 度まわす (task 106 の規約)。
+#[test]
+fn decode_logits_fingerprint_task106() {
+    fn fnv(bytes: impl Iterator<Item = u8>) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    let dir = TempDir::new("t106fp");
+    let f = open_synth(&dir, "model.gguf", false, None);
+
+    // prefill の logits (1 回目)。
+    let mut a = make_decoder(&f, 64);
+    let l1 = a.prefill(&PROMPT).expect("prefill a");
+    // 同じ入力をもう 1 回 (同一プロセス内の決定性)。
+    let mut b = make_decoder(&f, 64);
+    let l2 = b.prefill(&PROMPT).expect("prefill b");
+    assert_eq!(bits(&l1), bits(&l2), "同一プロセスで logits がビット一致しない");
+    assert!(
+        l1.iter().any(|v| *v != 0.0),
+        "logits が全 0 (経路の生死が分からない)"
+    );
+
+    // 貪欲生成列 (6 トークン)。
+    let mut c = make_decoder(&f, 64);
+    let ids = c.decode_greedy(&PROMPT, 6).expect("decode_greedy");
+    assert_eq!(ids.len(), 6);
+
+    let h_logits = fnv(l1.iter().flat_map(|v| v.to_bits().to_le_bytes()));
+    let h_ids = fnv(ids.iter().flat_map(|v| v.to_le_bytes()));
+    println!(
+        "[task106-fingerprint] logits={h_logits:016x} ids={h_ids:016x}"
+    );
+}
+

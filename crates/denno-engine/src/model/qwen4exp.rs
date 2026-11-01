@@ -3174,10 +3174,12 @@ pub(crate) static MIX_FAST_CALLS: std::sync::atomic::AtomicUsize =
 /// [`hc_mix_quant`] の高速経路 (`DENNO_MIX_FAST` 既定 on)。
 ///
 /// 旧経路との違いは 2 点だけで、どちらも**値はビット一致**する:
-/// 1. 作業域 (`xn` / `lo` / `gate` / `mixed`) をスレッドローカルで使い回す
+/// 1. 作業域 (`xn` / `lo` / `gate`) をスレッドローカルで使い回す
 ///    (毎回の `vec![0.0; ..]` とゼロ埋めを消す)。
 /// 2. `hc_mixed` を `d` 方向に rayon で分ける ([`hyper::hc_mixed_into_par`])。
 ///    `d` は独立で、`s` の昇順の加算は 1 つの `d` の中で完結する。
+/// 3. task 106: 合成 (`hc_mixed_into_par`) は戻り値の `Vec` に直接書く
+///    (scratch へ書いて `to_vec()` で写す 10 KB の 2 パスを 1 パスに)。
 fn hc_mix_quant_fast(
     res: &HyperStreams,
     norm: &[f32],
@@ -3194,7 +3196,7 @@ fn hc_mix_quant_fast(
     let t_all = mix_kprof::stamp();
     MIX_SCRATCH.with(|cell| {
         let mut b = cell.borrow_mut();
-        let MixScratch { xn, lo, gate, mixed } = &mut *b;
+        let MixScratch { xn, lo, gate, .. } = &mut *b;
 
         let xn = MixScratch::take(xn, hc_dim);
         let t = mix_kprof::stamp();
@@ -3232,9 +3234,12 @@ fn hc_mix_quant_fast(
         mix_kprof::rowpar::set_label(mix_kprof::rowpar::NONE);
         mix_kprof::mark(t, mix_kprof::UP);
 
-        let mixed = MixScratch::take(mixed, e);
         let t = mix_kprof::stamp();
-        hyper::hc_mixed_into_par(xn, gate, mixed, hp);
+        // task 106: 合成は戻り値に直接書く (scratch へ書いて `to_vec()` で写す
+        // 旧形から、10 KB の写しを消す。同じ [`hyper::hc_mixed_into_par`] なので
+        // 値はビット一致)。`mixed` scratch は batch 経路 (`hc_mix_quant_batch`) 専用。
+        let mut out = vec![0.0f32; e];
+        hyper::hc_mixed_into_par(xn, gate, &mut out, hp);
         mix_kprof::mark(t, mix_kprof::MIXED);
 
         let inj = match inject {
@@ -3253,8 +3258,6 @@ fn hc_mix_quant_fast(
             }
             None => vec![0.0f32; hp.hc],
         };
-        // 戻り値は呼び出し側が所有する (層の出口で combine に渡す) ので 1 本だけ確保する。
-        let out = mixed.to_vec();
         mix_kprof::mark(t_all, mix_kprof::TOTAL);
         mix_kprof::bump_call();
         Ok((out, inj))

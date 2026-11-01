@@ -244,15 +244,38 @@ pub fn hc_lo_apply(lo: &mut [f32], p: &HyperParams) {
 /// [`hc_mixed`] と [`hc_mixed_into_par`] が共有する**唯一の実装**。
 /// `e` 方向のどの範囲を渡しても各要素の丸め順は同じなので、範囲の切り方は
 /// 値に影響しない。
+///
+/// task 106: 走査を `d` 外側 / `s` 内側から `s` 外側 / `d` 内側へ変えた
+/// (1 要素あたりの演算列は不変: `acc = x0*sig0` → `acc += x_s*sig_s` を `s` 昇順
+/// → `acc * inv_hc`。1 要素の f32 演算の並びは旧実装と 1 つも変わらないので
+/// **ビット一致**する — [`tests::mixed_range_matches_old_body_bitwise`] で旧本体
+/// と突き合わせる)。目的は 2 つ:
+/// - 添字アクセス (`x[d]` / `g[d]` / `x[i]`) の境界チェックを消す (zip 化)。
+/// - `x` / `g` を連続アクセスにする (旧は `s` ごとに stride `e` = 10 KB 飛び)。
+///   `sigmoid` の `exp` がスカラーで残る (= 数値契約) ため内側ループの SIMD 化は
+///   起きないが、メモリ側の余計な仕事を減らす。
 fn mixed_range(m: &mut [f32], d0: usize, x: &[f32], g: &[f32], e: usize, hc: usize, inv_hc: f32) {
-    for (k, slot) in m.iter_mut().enumerate() {
-        let d = d0 + k;
-        let mut acc = x[d] * sigmoid(g[d]);
-        for s in 1..hc {
-            let i = s * e + d;
-            acc += x[i] * sigmoid(g[i]);
+    debug_assert!(hc >= 1, "hc が 0");
+    debug_assert_eq!(x.len(), hc * e, "x は [hc][e]");
+    debug_assert_eq!(g.len(), x.len(), "g は x と同じ長さ");
+    debug_assert!(d0 + m.len() <= e, "d0+len が n_embd を超える");
+    // s = 0: m[k] = x[d] * sigmoid(g[d])
+    let x0 = &x[d0..d0 + m.len()];
+    let g0 = &g[d0..d0 + m.len()];
+    for ((slot, &xv), &gv) in m.iter_mut().zip(x0.iter()).zip(g0.iter()) {
+        *slot = xv * sigmoid(gv);
+    }
+    // s = 1..hc: m[k] += x[s*e+d] * sigmoid(g[s*e+d])  (s の昇順・1 要素ずつ丸め)
+    for s in 1..hc {
+        let xs = &x[s * e + d0..s * e + d0 + m.len()];
+        let gs = &g[s * e + d0..s * e + d0 + m.len()];
+        for ((slot, &xv), &gv) in m.iter_mut().zip(xs.iter()).zip(gs.iter()) {
+            *slot += xv * sigmoid(gv);
         }
-        *slot = acc * inv_hc;
+    }
+    // 1/hc は和の後 (順序を変えると最終ビットが変わる)。
+    for v in m.iter_mut() {
+        *v *= inv_hc;
     }
 }
 
@@ -781,6 +804,222 @@ mod tests {
             HC_BATCH_PAR_CALLS.load(std::sync::atomic::Ordering::Relaxed) > par0,
             "rayon 経路に入っていない (e >= MIXED_PAR_MIN_E の分岐が死んでいる)"
         );
+    }
+
+    /// task 106 以前の [`mixed_range`] 本体 (d 外側 / s 内側・添字アクセス)。
+    ///
+    /// `mixed_range` は逐次 / rayon 両経路の**共有実装**なので、par vs seq の
+    /// 既存テストでは「共有実装そのものの変更」を検出できない。そこで旧本体を
+    /// ここに置き、新実装と `to_bits()` で突き合わせる (数値契約の担保)。
+    fn mixed_range_old_body(
+        m: &mut [f32],
+        d0: usize,
+        x: &[f32],
+        g: &[f32],
+        e: usize,
+        hc: usize,
+        inv_hc: f32,
+    ) {
+        for (k, slot) in m.iter_mut().enumerate() {
+            let d = d0 + k;
+            let mut acc = x[d] * sigmoid(g[d]);
+            for s in 1..hc {
+                let i = s * e + d;
+                acc += x[i] * sigmoid(g[i]);
+            }
+            *slot = acc * inv_hc;
+        }
+    }
+
+    /// task 106: `mixed_range` の走査変更 (d 外側 → s 外側・zip 化) が旧本体と
+    /// ビット一致する。実形 (hc=4 / e=2560) と、rayon のチャンク相当の分割
+    /// (d0 > 0)、小形・端数・hc=1 も含める。
+    #[test]
+    fn mixed_range_matches_old_body_bitwise() {
+        for &(hc, e) in &[(4usize, 2560usize), (4, 1024), (3, 1031), (2, 1000), (1, 7)] {
+            let hc_dim = hc * e;
+            let x: Vec<f32> = (0..hc_dim)
+                .map(|i| (((i * 13) % 29) as f32 - 14.0) * 0.04)
+                .collect();
+            let g: Vec<f32> = (0..hc_dim)
+                .map(|i| (((i * 7 + 3) % 31) as f32 - 15.0) * 0.09)
+                .collect();
+            let inv_hc = 1.0f32 / hc as f32;
+            let hp = HyperParams { hc, n_embd: e, low_rank: 2, eps: 1e-6 };
+            let want = hc_mixed(&x, &g, &hp);
+
+            // 新実装 (全域)。
+            let mut got = vec![f32::NAN; e];
+            mixed_range(&mut got, 0, &x, &g, e, hc, inv_hc);
+            for i in 0..e {
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "新実装 hc={hc} e={e} 要素 {i} が旧本体とビット不一致"
+                );
+            }
+
+            // 新実装 (分割 = rayon の par_chunks 相当。d0 > 0 の経路)。
+            let mut split = vec![f32::NAN; e];
+            let c = e.div_ceil(3);
+            for (i, m) in split.chunks_mut(c).enumerate() {
+                mixed_range(m, i * c, &x, &g, e, hc, inv_hc);
+            }
+            for i in 0..e {
+                assert_eq!(
+                    split[i].to_bits(),
+                    want[i].to_bits(),
+                    "分割 hc={hc} e={e} 要素 {i} が旧本体とビット不一致"
+                );
+            }
+
+            // 旧本体 (全域)。
+            let mut old = vec![f32::NAN; e];
+            mixed_range_old_body(&mut old, 0, &x, &g, e, hc, inv_hc);
+            for i in 0..e {
+                assert_eq!(
+                    old[i].to_bits(),
+                    want[i].to_bits(),
+                    "旧本体 hc={hc} e={e} 要素 {i} が hc_mixed と不一致 (参照側のバグ)"
+                );
+            }
+            assert!(want.iter().any(|v| *v != 0.0), "mixed が全 0 (hc={hc} e={e})");
+        }
+    }
+
+    /// task 106: decode (nt=1) の実形状で mix の要素演算と新旧 `mixed_range` を測る。
+    ///
+    /// 実行:
+    /// ```text
+    /// RAYON_NUM_THREADS=16 cargo test --release -p denno-engine --lib --features cuda \
+    ///   -- --ignored --nocapture --test-threads=1 bench_decode_mix_elements
+    /// ```
+    ///
+    /// GEMV (down/up) は [`crate::model::qwen4exp::gemv_batch`] ではなく
+    /// `tests/hc_mix_bench.rs` (`hc_mix_gemv_bf16_shape_scaling`) の実形計測を
+    /// 使う (本ベンチは要素演算の配分だけを見る)。
+    #[test]
+    #[ignore = "実形状の CPU マイクロベンチ (手動)"]
+    fn bench_decode_mix_elements() {
+        let hp = HyperParams { hc: 4, n_embd: 2560, low_rank: 320, eps: 1e-6 };
+        let (e, hc, lr) = (hp.n_embd, hp.hc, hp.low_rank);
+        let hc_dim = hc * e;
+        let reps = 50usize;
+
+        let res = HyperStreams {
+            data: (0..hc_dim).map(|i| (((i * 7) % 23) as f32 - 11.0) * 0.03).collect(),
+            hc,
+            n_embd: e,
+        };
+        let norm: Vec<f32> = (0..hc_dim).map(|i| 0.9 + ((i % 13) as f32) * 0.01).collect();
+        let lo: Vec<f32> = (0..lr).map(|i| (((i * 11) % 19) as f32 - 9.0) * 0.02).collect();
+        let inj: Vec<f32> = (0..hc).map(|i| (((i * 5) % 7) as f32 - 3.0) * 0.1).collect();
+
+        // 実経路と同じ形の入力を作っておく (計時の外)。
+        let xn = grouped_rms_norm(&res, &norm, &hp);
+        let mut gate = vec![0.0f32; hc_dim];
+        for r in 0..hc_dim {
+            let mut acc = 0.0f32;
+            for i in 0..lr {
+                acc += ((i * 31 + r * 17) % 41) as f32 * 0.01 * lo[i];
+            }
+            gate[r] = acc;
+        }
+        let inv_hc = 1.0f32 / hc as f32;
+
+        fn best(reps: usize, mut f: impl FnMut()) -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..reps {
+                let t = Instant::now();
+                f();
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            best
+        }
+        let us = |ms: f64| ms * 1e3;
+
+        println!("\n=== decode mix 要素演算 (nt=1 hc=4 n_embd={e} low_rank={lr}) ===");
+        println!("rayon threads = {}", rayon::current_num_threads());
+
+        // 1. grouped_rms_norm (1 トークン)。
+        let mut xn_buf = vec![0.0f32; hc_dim];
+        let ms = best(reps, || {
+            grouped_rms_norm_batch_into(std::slice::from_ref(&res), &norm, &mut xn_buf, &hp);
+            black_box(&xn_buf);
+        });
+        println!("grouped_rms_norm            : {:>8.3} us", us(ms));
+
+        // 2. hc_mixed_into (逐次) — 新旧。
+        let mut m_seq = vec![0.0f32; e];
+        let ms_new = best(reps, || {
+            hc_mixed_into(&xn, &gate, &mut m_seq, &hp);
+            black_box(&m_seq);
+        });
+        let ms_old = best(reps, || {
+            mixed_range_old_body(&mut m_seq, 0, &xn, &gate, e, hc, inv_hc);
+            black_box(&m_seq);
+        });
+        println!(
+            "hc_mixed_into seq 新 / 旧    : {:>8.3} us / {:>8.3} us  ({:.2}x)",
+            us(ms_new),
+            us(ms_old),
+            ms_old / ms_new
+        );
+
+        // 3. hc_mixed_into_par (実経路 = rayon) — 新旧。
+        let mut m_par = vec![0.0f32; e];
+        let ms_new = best(reps, || {
+            hc_mixed_into_par(&xn, &gate, &mut m_par, &hp);
+            black_box(&m_par);
+        });
+        #[cfg(feature = "par")]
+        let ms_old = {
+            use rayon::prelude::*;
+            let threads = rayon::current_num_threads().max(1);
+            let chunk = e.div_ceil(threads).max(1);
+            best(reps, || {
+                m_par
+                    .par_chunks_mut(chunk)
+                    .enumerate()
+                    .for_each(|(i, m)| mixed_range_old_body(m, i * chunk, &xn, &gate, e, hc, inv_hc));
+                black_box(&m_par);
+            })
+        };
+        #[cfg(not(feature = "par"))]
+        let ms_old = ms_new;
+        println!(
+            "hc_mixed_into_par 新 / 旧    : {:>8.3} us / {:>8.3} us  ({:.2}x)",
+            us(ms_new),
+            us(ms_old),
+            ms_old / ms_new
+        );
+
+        // 4. hc_lo_apply (320 silu)。
+        let mut lo_buf = lo.clone();
+        let ms = best(reps, || {
+            lo_buf.copy_from_slice(&lo);
+            hc_lo_apply(&mut lo_buf, &hp);
+            black_box(&lo_buf);
+        });
+        println!("hc_lo_apply                 : {:>8.3} us", us(ms));
+
+        // 5. hc_combine (1 トークン)。
+        let mut res_c = HyperStreams { data: res.data.clone(), hc, n_embd: e };
+        let ms = best(reps, || {
+            res_c.data.copy_from_slice(&res.data);
+            let out = hc_combine(&res_c, &xn_buf[..e], &inj, &hp);
+            black_box(&out.data);
+        });
+        println!("hc_combine (確保あり)       : {:>8.3} us", us(ms));
+
+        // 6. to_vec 1 回 (旧 fast 経路が毎呼び出し払っていた写し)。
+        let ms = best(reps, || {
+            let v = m_par.to_vec();
+            black_box(&v);
+        });
+        println!("mixed.to_vec() (10 KB)      : {:>8.3} us", us(ms));
+
+        black_box((xn_buf[0], m_seq[0], m_par[0], lo_buf[0], res_c.data[0]));
     }
 
     #[test]

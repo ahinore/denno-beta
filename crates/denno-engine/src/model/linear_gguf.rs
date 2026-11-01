@@ -233,6 +233,13 @@ static PAR_LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 #[cfg(test)]
 static PAR_TASKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// task 106: `gemv_rows_par` の F32 direct 経路 (行バッファ無し分支) が処理した行数。
+///
+/// 「F32 の行並列が direct 分岐に実際に乗った」ことの証拠。F16 / BF16 (copy 経路)
+/// や env off (旧経路) では増えない。
+#[cfg(test)]
+static F32_DIRECT_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// テスト専用: 行並列の状態 (env 上書き・カウンタ) を触るテストを直列化する。
 ///
 /// 上書きはプロセス全体で 1 個なので、crate 内の他のテスト (`qwen4exp` の
@@ -259,6 +266,18 @@ pub(crate) fn par_tasks() -> usize {
     PAR_TASKS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// テスト専用: F32 direct 経路が処理した行数 (`F32_DIRECT_ROWS`)。
+#[cfg(test)]
+pub(crate) fn f32_direct_rows() -> usize {
+    F32_DIRECT_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// テスト専用: F32 direct カウンタを 0 に戻す。
+#[cfg(test)]
+pub(crate) fn f32_direct_reset() {
+    F32_DIRECT_ROWS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[inline]
 fn note_par_launch() {
     #[cfg(test)]
@@ -277,6 +296,15 @@ fn note_par_task() {
 ///   `dequant_row_into` + 同じ順の `acc +=`)。どの行をどのスレッドが担当しても
 ///   各要素の丸め順序は変わらないので、**分割の有無でビット一致する**。
 /// - 並列領域は 1 呼び出しにつき 1 回だけ立てる (行ループの内側では立てない)。
+/// - task 106: F32 だけ行バッファを介さない。`dequant_row_into(F32)` は
+///   `f32::from_le_bytes` の恒等変換なので、重みバイトから直接
+///   `acc += from_le_bytes(w[i]) * x[i]` を `i` 昇順で回しても**値も順序も同じ**
+///   (ビット一致。[`crate::kquant::dequant_row_into`] の F32 アームと同じ変換)。
+///   行バッファの確保 (k×4 B) と 2 パス目の読み出しが消える。ルータ
+///   (`ffn_gate_inp` 512x2560 = 5.24 MB) は decode の router bucket の主体で、
+///   copy 版は重みを「読んで書いて、また読む」3 パスになるのが無駄。
+///   値の契約は [`tests::cpu_gemv_par_bitwise_on_real_shapes`] (独立参照
+///   `naive_gemv` との突き合わせ) が担う。
 fn gemv_rows_par(ty: GgmlType, blocks: &[u8], rb: usize, k: usize, x: &[f32], out: &mut [f32]) {
     use rayon::prelude::*;
     let threads = rayon::current_num_threads().max(1);
@@ -290,6 +318,21 @@ fn gemv_rows_par(ty: GgmlType, blocks: &[u8], rb: usize, k: usize, x: &[f32], ou
         .zip(out.par_chunks_mut(rows))
         .for_each(|(bb, oo)| {
             note_par_task();
+            if ty == GgmlType::F32 {
+                debug_assert_eq!(rb, k * 4, "F32 の行バイトは k*4");
+                debug_assert_eq!(x.len(), k, "gemv_rows_par: x.len() は k");
+                #[cfg(test)]
+                F32_DIRECT_ROWS.fetch_add(oo.len(), std::sync::atomic::Ordering::Relaxed);
+                for (r, slot) in oo.iter_mut().enumerate() {
+                    let wb = &bb[r * rb..(r + 1) * rb];
+                    let mut acc = 0f32;
+                    for (c, &xv) in wb.chunks_exact(4).zip(x.iter()) {
+                        acc += f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * xv;
+                    }
+                    *slot = acc;
+                }
+                return;
+            }
             let mut row = vec![0f32; k];
             for (r, slot) in oo.iter_mut().enumerate() {
                 dequant_row_into(ty, &bb[r * rb..(r + 1) * rb], &mut row);
@@ -1599,6 +1642,44 @@ mod tests {
         assert_eq!(par_launches(), 2, "2 回目で領域が 2 にならない");
     }
 
+    /// task 106: F32 の行並列 GEMV は direct 経路 (行バッファ無し) を通る。
+    ///
+    /// 「変更経路が発動した」ことの証拠 (カウンタ)。F16 (copy 経路) と
+    /// env off (旧経路 = P-MOE-G11 の copy 分割) では増えないことも固定する。
+    #[test]
+    fn cpu_gemv_par_f32_takes_direct_branch() {
+        let _g = par_test_lock();
+        let _p = ParGuard::new();
+        let (lin, x) = f32_lin(2560, 512, 11);
+        set_cpu_gemv_par_for_test(Some(true));
+        par_reset();
+        f32_direct_reset();
+        let mut out = vec![0f32; 512];
+        lin.gemv(&x, &mut out).expect("gemv");
+        assert_eq!(par_launches(), 1, "行並列が立っていない");
+        assert!(
+            f32_direct_rows() >= 512,
+            "F32 direct 経路が発火していない (rows={})",
+            f32_direct_rows()
+        );
+
+        // F16 は copy 経路のまま (direct は F32 だけ)。
+        let w16 = make_matrix(GgmlType::F16, 2560, 512, 13);
+        let lin16 = GgufLinear::from_slice(GgmlType::F16, 2560, 512, &w16).expect("f16");
+        let x16 = make_x(2560, 14);
+        f32_direct_reset();
+        let mut out16 = vec![0f32; 512];
+        lin16.gemv(&x16, &mut out16).expect("f16 gemv");
+        assert_eq!(f32_direct_rows(), 0, "F16 で F32 direct が発火した");
+
+        // env off では旧経路 (copy 分割) のまま。
+        set_cpu_gemv_par_for_test(Some(false));
+        f32_direct_reset();
+        let mut out2 = vec![0f32; 512];
+        lin.gemv(&x, &mut out2).expect("gemv off");
+        assert_eq!(f32_direct_rows(), 0, "env off で F32 direct が発火した");
+    }
+
     /// off (既定) では新経路が発動しないこと (従来経路そのまま)。
     #[test]
     fn cpu_gemv_par_off_keeps_old_path() {
@@ -1691,6 +1772,133 @@ mod tests {
                 mac / (new_ms * 1e6)
             );
         }
+    }
+
+    /// task 106: decode の router 周り (gate GEMV F32 + softmax + top-k) の内訳。
+    ///
+    /// gate GEMV は「task 65 の copy 本体」(`dequant_row_into` で行バッファに開いて
+    /// から内積) と「task 106 の direct 本体」(重みバイトから `from_le_bytes` で
+    /// 直接内積) を**同一実行内で**交互に測る。両者は `naive_gemv` (独立参照) と
+    /// `to_bits()` で一致することもここで固定する。
+    ///
+    /// softmax / select_topk は実形 (ne=512, k=10) の 1 呼び出し。
+    ///
+    /// `RAYON_NUM_THREADS=16 cargo test --release -p denno-engine --lib --features cuda \
+    ///   -- --ignored --nocapture --test-threads=1 bench_decode_router_parts`
+    #[test]
+    #[ignore = "実形状の CPU マイクロベンチ (手動)"]
+    fn bench_decode_router_parts() {
+        use crate::model::moe::select_topk;
+        use crate::tensor::softmax;
+
+        let _g = par_test_lock();
+        let _p = ParGuard::new();
+        let reps = 100usize;
+        println!(
+            "\n=== decode router 部品 (reps={reps}, rayon threads={}) ===",
+            rayon::current_num_threads()
+        );
+
+        // 旧 copy 本体 (task 65 の gemv_rows_par から F32 部だけ取り出し)。
+        fn rows_par_copy(blocks: &[u8], rb: usize, k: usize, x: &[f32], out: &mut [f32]) {
+            use rayon::prelude::*;
+            let threads = rayon::current_num_threads().max(1);
+            let rows = out.len().div_ceil(threads).max(1).min(out.len());
+            let bytes = rows * rb;
+            blocks
+                .par_chunks(bytes)
+                .zip(out.par_chunks_mut(rows))
+                .for_each(|(bb, oo)| {
+                    let mut row = vec![0f32; k];
+                    for (r, slot) in oo.iter_mut().enumerate() {
+                        crate::kquant::dequant_row_into(GgmlType::F32, &bb[r * rb..(r + 1) * rb], &mut row);
+                        let mut acc = 0f32;
+                        for i in 0..k {
+                            acc += row[i] * x[i];
+                        }
+                        *slot = acc;
+                    }
+                });
+        }
+
+        for (k, n, seed, name) in [
+            (2560usize, 512usize, 11u32, "gate_inp (router) 2560->512"),
+            (10240, 4, 17, "hc_inject 10240->4"),
+            (2560, 48, 13, "ssm_beta/alpha 2560->48"),
+        ] {
+            let (lin, x) = f32_lin(k, n, seed);
+            let blocks = lin.blocks().as_slice();
+            let rb = k * 4;
+            set_cpu_gemv_par_for_test(Some(true));
+            let (old_ms, new_ms) = best_pair(
+                reps,
+                n,
+                |out| {
+                    rows_par_copy(blocks, rb, k, &x, out);
+                    std::hint::black_box(out);
+                },
+                |out| {
+                    lin.gemv(&x, out).expect("new (direct)");
+                    std::hint::black_box(out);
+                },
+            );
+            set_cpu_gemv_par_for_test(Some(false));
+            // ビット一致 (copy 版 / direct 版 / 独立参照の 3 点)。
+            let mut a = vec![0f32; n];
+            rows_par_copy(blocks, rb, k, &x, &mut a);
+            let mut b = vec![0f32; n];
+            set_cpu_gemv_par_for_test(Some(true));
+            lin.gemv(&x, &mut b).expect("gemv");
+            set_cpu_gemv_par_for_test(Some(false));
+            let w = naive_gemv(GgmlType::F32, blocks, k, n, &x);
+            for r in 0..n {
+                assert_eq!(a[r].to_bits(), w[r].to_bits(), "{name}: copy 版が参照と違う 行 {r}");
+                assert_eq!(b[r].to_bits(), w[r].to_bits(), "{name}: direct 版が参照と違う 行 {r}");
+            }
+            let mb = blocks.len() as f64 / 1e6;
+            println!(
+                "{:<28} copy {:>8.3} us / direct {:>8.3} us  ({:.2}x, {:.1} MB)",
+                name,
+                old_ms * 1e3,
+                new_ms * 1e3,
+                if new_ms > 0.0 { old_ms / new_ms } else { 0.0 },
+                mb
+            );
+        }
+
+        // softmax 1 行 (ne=512)。実形の logits は N(0, 3.4) 程度 (moe_router_microbench と同じ入力)。
+        let ne = 512usize;
+        let probs: Vec<f32> = (0..ne)
+            .map(|i| {
+                let r = (i as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (((r >> 33) % 2001) as f32 - 1000.0) * 6e-3
+            })
+            .collect();
+        let mut p = probs.clone();
+        let ms = best_pair(reps, 1, |_| {}, |out| {
+            p.copy_from_slice(&probs);
+            softmax(&mut p);
+            std::hint::black_box(&p);
+            let _ = out;
+        })
+        .1;
+        println!("softmax ne=512              : {:>8.3} us / 呼び出し", ms * 1e3);
+
+        // select_topk 1 回 (ne=512, k=10)。probs は softmax 済みの値を使う。
+        softmax(&mut p);
+        let k_used = 10usize;
+        let (_, topk_ms) = best_pair(reps, 1, |_| {}, |out| {
+            let sel = select_topk(&p, k_used);
+            std::hint::black_box(&sel);
+            let _ = out;
+        });
+        println!(
+            "select_topk ne=512 k=10     : {:>8.3} us / 呼び出し (現行・確保あり)",
+            topk_ms * 1e3
+        );
+        assert_eq!(select_topk(&p, k_used).len(), k_used);
     }
 
     /// しきい値の根拠: 行数を 1..64 で振り、旧 (逐次寄り) と新 (行並列) を測る。

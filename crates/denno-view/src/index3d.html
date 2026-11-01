@@ -17,6 +17,7 @@
   #hud b { font-weight:600; }
   #hud .dim, #legend .dim { color:var(--dim); }
   .vram { color:var(--vram); } .ram { color:var(--ram); } .ssd { color:var(--ssd); }
+  .sel { color:#ffe14d; }
   .qsa { color:var(--qsa); } .gdn { color:var(--gdn); } .router { color:var(--router); }
   .shex { color:var(--shex); } .ple { color:var(--ple); } .gr { color:var(--gr); }
   .neu { color:var(--neu); }
@@ -65,9 +66,9 @@
        <span class="neu">neurons lit <b id="nlit">0</b></span> · fps <b id="fps">--</b></div>
   <div><span class="vram">VRAM <b id="n_vram">0</b></span> / <span class="dim">cap <b id="cap">10500</b></span> ·
        <span class="ram">RAM <b id="n_ram">0</b></span> ·
-       <span class="ssd">SSD <b id="n_ssd">0</b></span></div>
+       <span class="ssd">DISK <b id="n_ssd">0</b></span></div>
   <div id="live" class="dim">telemetry: <b id="ws_state">--</b> · prefill <b id="pf">--</b> · decode <b id="dc">--</b></div>
-  <div id="tier" class="dim">vram <b id="t_vram">--</b> / <b id="t_total">--</b> MB · ram experts <b id="t_ram">--</b> · ssd reads <b id="t_ssd">--</b></div>
+  <div id="tier" class="dim">vram <b id="t_vram">--</b> / <b id="t_total">--</b> MB · ram experts <b id="t_ram">--</b> · disk reads <b id="t_ssd">--</b></div>
   <div id="pleline" class="dim">PLE (layer 2 only): <b id="ple_v">--</b> <span class="dim">ngram 3 x 8 heads = 16 tables</span></div>
   <div id="tokline" class="dim">tokens: prompt <b id="tok_total">--</b> · fed <b id="tok_fed">--</b> ·
        prefix cache reuse <b id="tok_reuse">0</b> · kv <b id="kv_len">0</b>/<b id="kv_max">--</b> · pos <b id="kv_pos">--</b></div>
@@ -78,7 +79,9 @@
 <div id="legend" class="panel">
   <div><span class="neu">neuron</span> 2560/layer · <span class="qsa">QSA</span> 12 · <span class="gdn">GDN</span> 36</div>
   <div><span class="router">router</span> · <span class="shex">shared</span> · <span class="gr">GR r/w</span> · <span class="ple">PLE</span>(L2)</div>
-  <div>expert: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">SSD</span></div>
+  <div>expert: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">DISK</span> · <span class="sel">selected (top-10)</span></div>
+  <div>rank rail (router 上): 上 = rank 1 · 大きさ/明るさ = 重み · 色 = expert の居場所の段</div>
+  <div>heat: 選ばれた回数が多い expert ほど濃く光る (冷えるのに約 40 秒)</div>
   <div>drag: rotate · wheel: zoom · space: pause · [c] chat</div>
 </div>
 <div id="chat">
@@ -155,6 +158,7 @@ const COL = {
   qsa: new THREE.Color('#b46bff'), gdn: new THREE.Color('#00d9a0'),
   router: new THREE.Color('#ffe14d'), shex: new THREE.Color('#ff2bd6'),
   gr: new THREE.Color('#59b6ff'), ple: new THREE.Color('#7f8bff'),
+  sel: new THREE.Color('#ffe14d'),
   neuBase: new THREE.Color('#1b2f3a'), neuHot: new THREE.Color('#7ff0ff')
 };
 
@@ -175,6 +179,15 @@ const totalZ = (LAYERS - 1) * ZSTEP;
 const center = new THREE.Vector3(-4, -1.0, -totalZ * 0.32);
 const camera = new THREE.PerspectiveCamera(39, innerWidth / innerHeight, 0.1, 900);
 camera.position.set(29, 30, 47);
+if (Q.get('cam')) {   // 検証用: ?cam=x,y,z でカメラ位置、?tgt=x,y,z で注視点を固定する
+  const p = Q.get('cam').split(',').map(Number);
+  if (p.length === 3 && p.every((v) => Number.isFinite(v))) camera.position.set(p[0], p[1], p[2]);
+  const t3 = Q.get('tgt');
+  if (t3) {
+    const q = t3.split(',').map(Number);
+    if (q.length === 3 && q.every((v) => Number.isFinite(v))) center.set(q[0], q[1], q[2]);
+  }
+}
 camera.lookAt(center);
 
 const controls = new OrbitControls(camera, canvas);
@@ -223,16 +236,16 @@ function arrow(x0, y0, z0, x1, y1, z1, hex, op) {
   l.frustumCulled = false; scene.add(l); return l;
 }
 
-label('VRAM', '#00eaff', 4.2, -14.2, TIER_Y[TIER.VRAM], -3.0);
-label('RAM', '#ffb020', 4.2, -14.2, TIER_Y[TIER.RAM], -3.0);
-label('SSD', '#ff3b6b', 4.2, -14.2, TIER_Y[TIER.SSD], -3.0);
+label('VRAM', '#00eaff', 4.2, 7.4, TIER_Y[TIER.VRAM], -3.0);
+label('RAM', '#ffb020', 4.2, 7.4, TIER_Y[TIER.RAM], -3.0);
+label('DISK', '#ff3b6b', 4.2, 7.4, TIER_Y[TIER.SSD], -3.0);
 
 // ===== 1) ニューロン壁 (層あたり 2560 個の小箱、実 index と 1:1) ==========
 // LayerAct の idx は「その層の残差ストリームの index」(0..2559)。expert ではない。
 // 壁は X-Y 平面 (カメラ側を向く) に 64 列 x 40 行。index i -> col = i % 64, row = i / 64。
 const NW = 64, NH = EMB / NW;          // 40
-const NWX0 = -13.6, NWX1 = -10.4, NWY = 4.2;
-const neuGeo = new THREE.BoxGeometry(0.040, 0.158, 0.036);
+const NWX0 = -13.9, NWX1 = -9.7, NWY = 5.0;
+const neuGeo = new THREE.BoxGeometry(0.052, 0.205, 0.046);
 const walls = [];
 for (let il = 0; il < LAYERS; il++) {
   const inst = new THREE.InstancedMesh(neuGeo, new THREE.MeshBasicMaterial({ color: 0xffffff, fog: true }), EMB);
@@ -344,7 +357,10 @@ for (let il = 0; il < LAYERS; il++) {
   inst.instanceMatrix.needsUpdate = true; inst.instanceColor.needsUpdate = true;
   inst.frustumCulled = false;
   scene.add(inst);
-  slabs.push({ il, inst, y3, xz, tier: new Uint8Array(EXPERTS), act: new Float32Array(EXPERTS),
+  slabs.push({ il, inst, y3, xz, tier: new Uint8Array(EXPERTS), tierPrev: new Uint8Array(EXPERTS),
+               anim: new Float32Array(EXPERTS), fromY: new Float32Array(EXPERTS).fill(TIER_Y[0]),
+               act: new Float32Array(EXPERTS),
+               heat: new Float32Array(EXPERTS),
                used: new Float32Array(EXPERTS), dirty: new Uint8Array(EXPERTS), route: [] });
 }
 
@@ -384,6 +400,80 @@ for (let il = 0; il < LAYERS; il++) {
   R.gate.inst.setColorAt(il * 2 + 1, COL.gr.clone().multiplyScalar(0.12));
 }
 for (const k of Object.keys(R)) { R[k].inst.instanceMatrix.needsUpdate = true; R[k].inst.instanceColor.needsUpdate = true; }
+
+// ===== 4b) ランキング レール: 各層のルータが選んだ top-10 を上から順に ======
+// rank 1 が最上段。大きさと明るさは router 重みの層内相対値、色はその expert の
+// 居場所の段色 (VRAM=シアン / RAM=オレンジ / DISK=赤)。テキストは層番号 + top-4 index。
+const RANK_N = 10;
+const railInst = new THREE.InstancedMesh(
+  new THREE.BoxGeometry(0.13, 0.13, 0.13),
+  new THREE.MeshBasicMaterial({ color: 0xffffff, fog: true }), LAYERS * RANK_N);
+railInst.frustumCulled = false;
+railInst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+scene.add(railInst);
+const railTxt = [];
+const railAge = new Float32Array(LAYERS).fill(-1);   // -1 = 非表示, 秒数でフェードアウト
+const railC = new THREE.Color();
+for (let il = 0; il < LAYERS; il++) {
+  const z = zOf(il);
+  for (let r = 0; r < RANK_N; r++) {
+    m4.makeTranslation(X.router, 1.55 + (RANK_N - 1 - r) * 0.30, z);
+    railInst.setMatrixAt(il * RANK_N + r, m4);
+    railInst.setColorAt(il * RANK_N + r, COL.neuBase);
+  }
+  const s = sprite('L' + String(il).padStart(2, '0'), '#7f97a4', 1.35);
+  s.position.set(X.router, 4.95, z);
+  s.visible = false;   // ルーティング直後だけフェード表示 (48 枚重なると読めない)
+  scene.add(s); railTxt.push(s);
+}
+railInst.instanceMatrix.needsUpdate = true;
+railInst.instanceColor.needsUpdate = true;
+
+function setSpriteText(sp, txt) {
+  const t = sp.material.map, cv = t.image;
+  let g = cv.getContext('2d');
+  g.font = 'bold 34px ui-monospace, monospace';
+  const tw = Math.ceil(g.measureText(txt).width) + 16;
+  if (tw > cv.width) { cv.width = tw; g = cv.getContext('2d'); g.font = 'bold 34px ui-monospace, monospace'; }
+  else g.clearRect(0, 0, cv.width, cv.height);
+  g.fillStyle = '#7f97a4'; g.textAlign = 'left'; g.textBaseline = 'middle';
+  g.fillText(txt, 8, 34);
+  t.needsUpdate = true;
+  sp.scale.set(1.35, 1.35 * cv.height / cv.width, 1);
+}
+
+function setRail(il, experts, weights) {
+  const s = slabs[il]; if (!s) return;
+  let topW = 0;
+  for (let r = 0; r < experts.length && r < RANK_N; r++) topW = Math.max(topW, weights[r] || 0);
+  if (topW <= 0) topW = 1;
+  let txt = 'L' + String(il).padStart(2, '0');
+  for (let r = 0; r < RANK_N; r++) {
+    const i = il * RANK_N + r;
+    const y = 1.55 + (RANK_N - 1 - r) * 0.30;
+    const k = r < experts.length ? (experts[r] | 0) : -1;
+    if (k < 0 || k >= EXPERTS) {
+      m4.makeScale(0.001, 0.001, 0.001); m4.setPosition(X.router, y, zOf(il));
+      railInst.setMatrixAt(i, m4); railInst.setColorAt(i, COL.neuBase);
+      continue;
+    }
+    const wgt = (weights && weights[r]) || 0;
+    const rel = Math.min(1, wgt / topW);
+    const sc = (1.0 - r * 0.055) * (0.7 + 0.5 * rel);
+    m4.makeScale(sc, sc, sc); m4.setPosition(X.router, y, zOf(il));
+    railInst.setMatrixAt(i, m4);
+    const c = TIER_COL[s.tier[k]];   // 居場所の段色
+    const br = 0.45 + 0.85 * rel;
+    railC.setRGB(c.r * br, c.g * br, c.b * br);
+    railInst.setColorAt(i, railC);
+    if (r < 3) txt += ' ' + k;
+  }
+  railInst.instanceMatrix.needsUpdate = true;
+  railInst.instanceColor.needsUpdate = true;
+  // テキストは層番号 + top-3。ルーティング直後の 0.9 秒だけフェード表示。
+  setSpriteText(railTxt[il], txt);
+  railAge[il] = 0; railTxt[il].visible = true;
+}
 
 // ===== 5) 入出力 (Vocabulary Embedding / N-gram Embedding Layer) ==========
 const pleGroup = new THREE.Group();
@@ -506,6 +596,44 @@ const inpFlow = new THREE.Points(inpGeo, new THREE.PointsMaterial({
 inpFlow.frustumCulled = false;
 scene.add(inpFlow);
 let inpPulse = 0;
+
+// 段間移動の光の粒。箱本体は「消えて -> 出る」フェードだが、移動自体は
+// 見えるように、旧段 -> 新段へ粒を飛ばす。
+const TRANS_N = 96;
+const trGeo = new THREE.BufferGeometry();
+const trPos = new Float32Array(TRANS_N * 3), trCol = new Float32Array(TRANS_N * 3);
+trGeo.setAttribute('position', new THREE.BufferAttribute(trPos, 3));
+trGeo.setAttribute('color', new THREE.BufferAttribute(trCol, 3));
+const trPts = new THREE.Points(trGeo, new THREE.PointsMaterial({
+  size: 0.7, map: dotTex, vertexColors: true, transparent: true,
+  blending: THREE.AdditiveBlending, depthWrite: false, fog: true }));
+trPts.frustumCulled = false;
+scene.add(trPts);
+const transfers = [];   // { x, z, y0, y1, t, r, g, b }
+function spawnTransfer(x, z, y0, y1, col) {
+  if (transfers.length >= TRANS_N) transfers.shift();
+  transfers.push({ x, z, y0, y1, t: 0, r: col.r, g: col.g, b: col.b });
+}
+function updateTransfers(dt) {
+  for (let i = transfers.length - 1; i >= 0; i--) {
+    const tr = transfers[i];
+    tr.t += dt / 0.55;
+    if (tr.t >= 1) { transfers.splice(i, 1); continue; }
+    const u = tr.t, w = 1 - u;
+    const bulge = Math.sin(Math.PI * u) * 0.45;   // 直線だと箱と重なるので外側へ膨らませる
+    trPos[i * 3] = tr.x + bulge * 0.35;
+    trPos[i * 3 + 1] = w * w * tr.y0 + 2 * w * u * ((tr.y0 + tr.y1) / 2 + 1.6) + u * u * tr.y1;
+    trPos[i * 3 + 2] = tr.z + bulge * 0.35;
+    const f = Math.sin(Math.PI * u) * 1.4;
+    trCol[i * 3] = tr.r * f; trCol[i * 3 + 1] = tr.g * f; trCol[i * 3 + 2] = tr.b * f;
+  }
+  for (let i = transfers.length; i < TRANS_N; i++) {
+    trPos[i * 3] = 0; trPos[i * 3 + 1] = -999; trPos[i * 3 + 2] = 0;
+    trCol[i * 3] = trCol[i * 3 + 1] = trCol[i * 3 + 2] = 0;
+  }
+  trGeo.attributes.position.needsUpdate = true;
+  trGeo.attributes.color.needsUpdate = true;
+}
 // 2 次ベジエ: トークン列の中央 -> embedding 箱 -> layer 1 の壁の下端
 const IP0 = [-4.6, TOK_Y + 0.35, TOK_Z], IP1 = [-8.8, -3.4, 5.4], IP2 = [-12.0, -NWY - 0.4, zOf(0) + 0.3];
 
@@ -533,7 +661,7 @@ arrow(KV_X0 - 0.4, KV_Y, KV_Z, -12.4, 1.0, zOf(0) + 0.6, 0x00eaff, 0.35);
 label('KV cache (slot 0) / 48 layers', '#00eaff', 5.0, KV_X0 + 7.6, KV_Y + 0.72, KV_Z);
 label('green: prefix cache (前ターンから再利用) / amber: 今回書いた分 / 白: decode の読み出し位置', '#4d6470', 11.0, KV_X0 + 8.0, KV_Y - 0.66, KV_Z);
 
-const kv = { total: 0, fed: 0, reuse: 0, len: 0, pos: 0, busy: false, maxctx: 65536, sweep: 0, dirty: true };
+const kv = { total: 0, fed: 0, reuse: 0, len: 0, pos: 0, busy: false, maxctx: 65536, dirty: true };
 
 
 function paintKv() {
@@ -544,7 +672,9 @@ function paintKv() {
   const per = den / KVN;
   const nFill = Math.min(KVN, Math.ceil(kv.len / per));
   const nPre = Math.min(nFill, Math.floor(kv.reuse / per));
-  const head = Math.min(nFill - 1, Math.floor(kv.sweep * nFill));
+  // 白セルは実の読み出し位置 (kv.pos, Token フレーム) のみ。旧実装の左から右への
+  // 常時スイープ (kv.sweep) は実動作と無関係なので削除した。
+  const head = nFill > 0 ? Math.min(nFill - 1, Math.max(0, Math.floor(kv.pos / per))) : -1;
   for (let i = 0; i < KVN; i++) {
     let r = 0.04, g = 0.08, b = 0.11;
     if (i < nPre) { r = 0.06; g = 0.62; b = 0.36; }
@@ -765,7 +895,7 @@ function stepFly(dt) {
 // ===== post ==============================================================
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
-composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth / 2, innerHeight / 2), 0.62, 0.40, 0.45));
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth / 2, innerHeight / 2), 0.34, 0.42, 0.55));
 composer.addPass(new OutputPass());
 
 // ===== 状態 ==============================================================
@@ -799,19 +929,32 @@ function promote(il, ids) {
     lru.push(kk);
     if (s.tier[k] !== TIER.VRAM) { s.tier[k] = TIER.VRAM; s.dirty[k] = 1; }
     s.act[k] = Math.max(s.act[k], 0.5);   // 移送中は光らせる
+    s.heat[k] = Math.min(1, s.heat[k] + 0.18);   // 選ばれるたびに熱が溜まる (ヒートマップ)
   }
 }
 
 /** デモのルーティング (実テレメトリが来ないときだけ) */
 function routeLayer(il, token) {
   const s = slabs[il];
-  const cand = [];
-  for (let k = 0; k < EXPERTS; k++) cand.push(k);
-  cand.sort((a, b) => hash(b + 1, token) - hash(a + 1, token));
-  const sel = cand.slice(0, TOPK);
+  // 実モデルと同じように「良く使われる expert」が出るよう、層ごとに固定の
+  // hot pool (~6%) を用意し 7/10 をそこから、残り 3/10 を外から選ぶ。
+  // 一様ランダムだと再選がほぼ無く、ヒートマップが均一になってしまう。
+  const hot = [], cold = [];
+  for (let k = 0; k < EXPERTS; k++) {
+    if (hash(k * 3.71, il * 13.17 + 5) > 0.965) hot.push(k); else cold.push(k);
+  }
+  hot.sort((a, b) => hash(b + 1, token) - hash(a + 1, token));
+  cold.sort((a, b) => hash(b + 1, token) - hash(a + 1, token));
+  const sel = hot.slice(0, 7).concat(cold.slice(0, 3));
   s.route = sel;
-  for (let i = 0; i < sel.length; i++) s.act[sel[i]] = Math.max(s.act[sel[i]], 0.6 + 0.4 * hash(i, token));
+  const ws = [];
+  for (let i = 0; i < sel.length; i++) {
+    const w = 0.95 - i * 0.058;
+    ws.push(w);
+    s.act[sel[i]] = Math.max(s.act[sel[i]], 0.6 + 0.4 * hash(i, token));
+  }
   promote(il, sel);
+  setRail(il, sel, ws);   // デモでもランキング レールを更新 (sel は重み降順)
   while (lru.length > VRAM_CAP) {
     const kk = lru.shift();
     const l2 = (kk / EXPERTS) | 0, k2 = kk % EXPERTS;
@@ -828,19 +971,26 @@ function routeLayer(il, token) {
   }
 }
 
-function updateLayerColors(il) {
+function updateLayerColors(il, dt) {
   const s = slabs[il], col = s.inst.instanceColor.array;
   const sel = new Set(s.route);
+  const cool = dt > 0 ? Math.max(0, 1 - dt / 40) : 1;   // 熱は半減期約 28 秒で冷える
   for (let k = 0; k < EXPERTS; k++) {
+    s.heat[k] *= cool;
     const tier = s.tier[k];
     const c = TIER_COL[tier];
-    const base = tier === TIER.VRAM ? 0.55 : (tier === TIER.RAM ? 0.34 : 0.16);
+    const base = tier === TIER.VRAM ? 0.45 : (tier === TIER.RAM ? 0.26 : 0.12);
     let g = s.act[k];
-    if (sel.has(k)) g = Math.max(g, 1.0);
-    const v = base + g * 1.6;
+    if (sel.has(k)) {
+      // 選択された expert は専用色 (黄) で塗る。段の色を消して一目で分かるように。
+      const p = 0.85 + 0.15 * Math.min(1, g);
+      col[k * 3] = COL.sel.r * p; col[k * 3 + 1] = COL.sel.g * p; col[k * 3 + 2] = COL.sel.b * p;
+      continue;
+    }
+    const v = base + g * 1.15 + Math.sqrt(s.heat[k]) * 0.75;   // sqrt: 1 回の選択でも見えるように
     col[k * 3] = c.r * v; col[k * 3 + 1] = c.g * v; col[k * 3 + 2] = c.b * v;
-    if (g > 0.72) {
-      const w = Math.min(1, (g - 0.72) * 1.8);
+    if (g > 0.82 || s.heat[k] > 0.6) {
+      const w = Math.min(1, Math.max((g - 0.82) * 1.3, (s.heat[k] - 0.6) * 1.4));
       col[k * 3] += (1 - col[k * 3]) * w;
       col[k * 3 + 1] += (1 - col[k * 3 + 1]) * w;
       col[k * 3 + 2] += (1 - col[k * 3 + 2]) * w;
@@ -848,19 +998,33 @@ function updateLayerColors(il) {
   }
   s.inst.instanceColor.needsUpdate = true;
 
-  // 段の移動は補間する。瞬間移動だと SSD -> RAM -> VRAM の移送が見えないため。
+  // 段の移動は「消えて -> 出る」。旧実装は段の間を滑って移動したため、移動中の箱が
+  // SSD のデッキ上に残って見えた。フェードアウト -> 転送 -> フェードインにする。
   let moved = false;
   for (let k = 0; k < EXPERTS; k++) {
+    if (s.tier[k] !== s.tierPrev[k]) {
+      if (s.anim[k] <= 0 || s.anim[k] >= 1) {
+        s.fromY[k] = s.y3[k * 3 + 1]; s.anim[k] = 0.0001;
+        // 移動の光の粒を旧段から新段へ飛ばす (箱はフェードのまま)
+        spawnTransfer(s.xz[k * 2], s.xz[k * 2 + 1], s.fromY[k], TIER_Y[s.tier[k]], TIER_COL[s.tier[k]]);
+      }
+      s.tierPrev[k] = s.tier[k];
+    }
     const ty = TIER_Y[s.tier[k]];
-    const cy = s.y3[k * 3 + 1];
-    const d = ty - cy;
-    if (!s.dirty[k] && Math.abs(d) < 0.004) continue;
-    const ny = Math.abs(d) < 0.06 ? ty : cy + d * 0.16;
-    m4.makeTranslation(s.xz[k * 2], ny, s.xz[k * 2 + 1]);
-    s.inst.setMatrixAt(k, m4);
-    s.y3[k * 3 + 1] = ny;
-    if (s.dirty[k] && Math.abs(ny - ty) < 0.004) s.dirty[k] = 0;
-    moved = true;
+    if (s.anim[k] > 0 && s.anim[k] < 1) {
+      s.anim[k] = Math.min(1, s.anim[k] + dt / 0.55);
+      const t = s.anim[k];
+      const y = t < 0.5 ? s.fromY[k] : ty;
+      const sc = Math.max(t < 0.5 ? 1 - 2 * t : 2 * t - 1, 0.001);
+      m4.makeScale(sc, sc, sc);
+      m4.setPosition(s.xz[k * 2], y, s.xz[k * 2 + 1]);
+      s.inst.setMatrixAt(k, m4);
+      s.y3[k * 3 + 1] = y;
+      if (t >= 1) { s.anim[k] = 0; s.dirty[k] = 0; }
+      moved = true;
+    } else if (s.dirty[k]) {
+      s.dirty[k] = 0;
+    }
   }
   if (moved) s.inst.instanceMatrix.needsUpdate = true;
 }
@@ -961,6 +1125,15 @@ function step(dt, doRender) {
     }
     inpGeo.attributes.position.needsUpdate = true; inpGeo.attributes.color.needsUpdate = true;
   }
+  updateTransfers(dt);
+  // ランキング レールのテキストはルーティング直後だけ見せる (フェードアウト)
+  for (let il = 0; il < LAYERS; il++) {
+    if (railAge[il] < 0) continue;
+    railAge[il] += dt;
+    const f = 1 - railAge[il] / 0.9;
+    if (f <= 0) { railAge[il] = -1; railTxt[il].visible = false; continue; }
+    railTxt[il].material.opacity = 0.92 * f;
+  }
 
   // トークンが作られていく様子
   if (tokRamp.t < 1) {
@@ -977,9 +1150,8 @@ function step(dt, doRender) {
   }
   if (tokAny) paintTokens();
 
-  // KV の読み出し掃引 (prefill / decode のどちらでも回す)
-  kv.sweep = (kv.sweep + dt * (kv.busy ? 0.85 : 0.25)) % 1;
-  if (kv.len > 0) { kv.dirty = true; }
+  // KV の白セルは kv.pos (実の読み出し位置) だけで更新する。
+  // 旧実装の常時スイープ (kv.sweep) は実動作と無関係なので削除した。
   if (kv.dirty) paintKv();
   if (!kv.busy && inpPulse < 0.02 && kv.len === 0) inpPulse *= 0.99;
 
@@ -1004,7 +1176,7 @@ function step(dt, doRender) {
   plePulse *= 0.988;
   for (let il = 0; il < LAYERS; il++) {
     if (il !== demo.cursor && il !== PLE_LAYERS[0] && (il + demo.cursor) % 3 !== 0) continue;
-    updateLayerColors(il);
+    updateLayerColors(il, dt);
     updateRoleColors(il, il === demo.cursor ? head : 0.16);
   }
   updateBeams(demo.cursor, head);
@@ -1060,7 +1232,7 @@ const hudEl = {
   ssd: document.getElementById('t_ssd'), mode: document.getElementById('mode'),
   cur: document.getElementById('cur'), curkind: document.getElementById('curkind')
 };
-const liveState = { tokens: 0, lastStepMs: 0, prefillMs: 0, frames: 0 };
+const liveState = { tokens: 0, lastStepMs: 0, prefillMs: 0, frames: 0, pfTps: 0, dcTps: 0, pfMax: 0, dcMax: 0 };
 let replayOn = false;
 function noteLiveMode() {
   if (fly.on) return;   // フライト中の案内を消さない
@@ -1078,7 +1250,7 @@ window.onRouting = function (layer, experts, weights) {
     sel.push(k);
     s.act[k] = Math.max(s.act[k], Math.min(1, (weights && weights[i]) || 0.5));
   }
-  if (sel.length) { s.route = sel; promote(layer, sel); }
+  if (sel.length) { s.route = sel; promote(layer, sel); setRail(layer, experts, weights); }
   noteLiveMode();
 };
 
@@ -1175,7 +1347,10 @@ function handleFrame(f) {
       break;
     case 'Prefill': {
       liveState.prefillMs = f.ns / 1e6 / Math.max(1, f.prompt_tokens || 1);
-      hudEl.pf.textContent = liveState.prefillMs.toFixed(1) + ' ms/tok';
+      liveState.pfTps = 1000 / Math.max(liveState.prefillMs, 1e-9);
+      liveState.pfMax = Math.max(liveState.pfMax, liveState.pfTps);
+      hudEl.pf.textContent = liveState.prefillMs.toFixed(1) + ' ms/tok · ' +
+        liveState.pfTps.toFixed(0) + ' tok/s (max ' + liveState.pfMax.toFixed(0) + ')';
       kv.fed = f.prompt_tokens;
       kv.reuse = Math.max(0, kv.total - kv.fed);
       kv.len = kv.total;
@@ -1203,9 +1378,10 @@ function handleFrame(f) {
       break;
     case 'Step':
       liveState.lastStepMs = f.ns / 1e6;
-      hudEl.dc.textContent = liveState.lastStepMs.toFixed(0) + ' ms/tok';
-      break;
-    case 'Token':
+      liveState.dcTps = 1000 / Math.max(liveState.lastStepMs, 1e-9);
+      liveState.dcMax = Math.max(liveState.dcMax, liveState.dcTps);
+      hudEl.dc.textContent = liveState.lastStepMs.toFixed(0) + ' ms/tok · ' +
+        liveState.dcTps.toFixed(1) + ' tok/s (max ' + liveState.dcMax.toFixed(1) + ')';
       liveState.tokens++;
       break;
     case 'LayerAct':
