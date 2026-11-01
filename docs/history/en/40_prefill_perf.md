@@ -69,6 +69,7 @@ The entries are in chronological order. For readers in a hurry: (1) the ceiling 
 | P50 | 2026-10-24 | `e841db48` | Break down tail and show that att's H2D is already pinned |
 | P51 | 2026-10-24 | `ec7d4f31` | AVX2 16 lanes for GDN's host beta/alpha projection |
 | P52 | 2026-10-24 | `b6e3fa27` | Widen the q4 GEMM's per-thread tile to 8x8 |
+| task 99 | 2026-11-01 | `fab52af8` | Add IQ2_S / IQ3_XXS batch fused GEMM as opt-in (default off) |
 
 ## Gap between the ceiling (theoretical values) and measurements
 
@@ -1078,8 +1079,40 @@ The difference across the 4 arms measured alternately is **−1.8 to 2.2 s (abou
 identical between before the change and P52 (`e36644365c6746b5ee1a06720d5ad4a1`), and `GPU_VERIFY.sh`'s 3 anchors are also 3/3 MATCH,
 so the numeric path has not moved.
 
-**What worked next** — The last entry of this volume. What remains is the 2.55 s mass of `full_oproj` 15.9 / `full_qk` 15.7 TFLOP/s
+**What worked next** — The last entry of this volume as of P52. What remains is the 2.55 s mass of `full_oproj` 15.9 / `full_qk` 15.7 TFLOP/s
 (the other phases are around 30), with −1.3 s of headroom to the ceiling. We are at the stage of suspecting something other than the tile (transpose, bandwidth).
+
+### task 99: adding IQ2_S / IQ3_XXS batch fused GEMM as opt-in (2026-11-01, `fab52af8`)
+
+The remaining two types of the Swift-1.5-shaped expert gate/up. Since P80, the prefill batches of these two
+types are **already** inside the `gemm_iq` family (v1 / v2 / z) and never fall back to scalar. We added the
+dedicated kernels that switch the accumulation to the "`q8_hadd` per block" form used by task 97
+(IQ4_XS / IQ3_S) (`gemm_iq2s_avx2` / `gemm_iq3xxs_avx2`) and compared them against the z path; based on the
+result they landed as **default-off opt-in** (`DENNO_IQ2S_FAST=1` / `DENNO_IQ3XXS_FAST=1` to enable).
+
+- What changed: `fab52af8` / `crates/denno-engine/src/model/moe_expert.rs` (+ `exp_kprof.rs`). Two kernels in
+  the task 97 P97 shape (k chunk → row → block → token, `q8_hadd` per block) plus dedicated IQ2S / IQ3Xxs
+  branches in `gemm_rows_disp`. The dequant helpers are `iq2s_subblock_w` / `iq3xxs_subblock_w`
+  (every byte of the lattice index is valid, so zero extension matches the kquant reference at `to_bits()`
+  level). exp_kprof gains `K_IQ2XS=15` / `K_IQ3XXS=16` (NKER 17, KER_FUSED 11). We also fixed task 98's
+  `K_IQ4NL_M1`, which had collided with `K_IQ3S=13` at 13, to 14 (the IQ4_NL kernel and branch were not
+  touched; task 98's tests reference the constant, so no impact). Added 4 tests (accuracy + f64 ground-truth
+  contract / one-hot dequant to_bits match / row-split bitwise / fire-and-escape) and the microbenchmark
+  `bench_iq2s_iq3xxs_gemm99` (--ignored).
+- Measured (bench99, this container, 1T, rep3 min): the new kernels vs the classic scalar batch are
+  **6.55-8.73x**. Against the existing gemv_iq z (AVX-512) path, however, they reach only **0.33-0.41x** at
+  m=512 (z is 2.4-3.0x faster). At m=1 they are roughly equal (0.94-1.29x).
+- Why default off: production (Zen4) has fused these two types on z (AVX-512) since P80, and the new kernels do
+  not reach it. Defaulting to on would worsen prefill. With the default the code never branches into the new
+  path, so prefill values and speed stay bit-identical (the fallbacks v1 / v2 / z all produce the same values).
+  The fire test forces both sides: with FAST=1 it must ride the dedicated kernel, and with FAST=0 it must fall
+  back to the conventional gemv_iq path and match v1 bitwise.
+- Contract: the dequant matches the kquant reference at `to_bits()` level (one-hot, all elements). The batch
+  fusion differs from the classic scalar path by about R1 relative 1e-6 (hsum per block, hence not bitwise
+  against the v1 family). The f64 ground-truth error stays at or below classic. Row splits are bitwise stable.
+- Tests: `--features cuda --lib` 698 passed / 0 failed (--test-threads=1), `kernel_invariants`
+  24 passed / 0 failed. The A/B on the real machine (Zen4) has not been run.
+- Record: `fab52af8` (code; docs land in the following commit).
 
 ---
 
