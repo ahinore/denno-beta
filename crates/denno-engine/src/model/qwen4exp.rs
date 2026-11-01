@@ -11663,6 +11663,184 @@ mod tests {
             mix_kprof::set_for_test(false);
         }
 
+        /// task 107: decode (nt=1) の mix 実形状 (BF16, hc=4 / e=2560 / lr=320:
+        /// swift15 の実形) で `[mix-kprof]` の 1 行を出す。
+        ///
+        /// 実機の `DENNO_MIX_KPROF=1` (serve の `prof_flash_q4` が 1 トークン末尾で
+        /// 出す行) と同じ形式をコンテナで出す。重みは BF16 の決定列で、
+        /// - `mats=32`: 重み 32 組を轮回して L3 から追い出した DRAM 条件
+        /// - `mats=1`:  同じ組の再読み (L3 常駐条件)
+        /// の 2 通り。呼び出し数は 1 トークンぶん (`2 * n_layer + 1` = 129 の 3 倍)。
+        ///
+        /// 値の検査ではないので assert は行の形だけ。数値は実行ごとに動く
+        /// (共有ホスト)。`hc_mix_quant_fast` が `mix_kprof` を積むのは FORCE のとき
+        /// だけなので、env は汚さない。
+        ///
+        /// `cargo test --release -p denno-engine --lib --features cuda -- \
+        ///  --ignored --nocapture mix_kprof_decode_real_shape_dump`
+        #[test]
+        #[ignore = "実形状の CPU マイクロベンチ (手動)"]
+        fn mix_kprof_decode_real_shape_dump() {
+            use crate::model::linear_gguf::par_test_lock;
+            let _g = par_test_lock();
+            let hp = HyperParams { hc: 4, n_embd: 2560, low_rank: 320, eps: 1e-6 };
+            let (e, hc, lr) = (hp.n_embd, hp.hc, hp.low_rank);
+            let hc_dim = hc * e;
+
+            // BF16 重み (決定的。f32 -> bf16 は 1 回の丸めなのでバイト列は環境に依らない)。
+            let bf16_bytes = |k: usize, n: usize, seed: u32| -> Vec<u8> {
+                let mut b = vec![0u8; k * n * 2];
+                for (i, w) in b.chunks_exact_mut(2).enumerate() {
+                    let v = (((i.wrapping_mul(2654435761) ^ seed as usize) % 19) as f32 - 9.0) * 0.12;
+                    let bits = (v.to_bits() >> 16) as u16;
+                    w.copy_from_slice(&bits.to_le_bytes());
+                }
+                b
+            };
+            let mk = |k: usize, n: usize, seed: u32| {
+                GgufLinear::from_slice(GgmlType::Bf16, k, n, &bf16_bytes(k, n, seed))
+                    .expect("GgufLinear::from_slice (Bf16)")
+            };
+            let slots: Vec<(GgufLinear, GgufLinear, GgufLinear)> = (0..32usize)
+                .map(|s| (mk(hc_dim, lr, s as u32 * 3 + 1), mk(lr, hc_dim, s as u32 * 3 + 2), mk(hc_dim, hc, s as u32 * 3 + 3)))
+                .collect();
+            let res = HyperStreams {
+                data: (0..hc_dim).map(|i| (((i * 11) % 17) as f32 - 8.0) * 0.05).collect(),
+                hc,
+                n_embd: e,
+            };
+            let norm: Vec<f32> = (0..hc_dim).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect();
+
+            let calls = 129usize * 3; // 1 トークン = 2 * n_layer + 1 呼び出しの 3 トークンぶん
+            mix_kprof::set_for_test(true);
+            // ウォームアップ (プール起動とページ立ち上げ)。積んだ数値は捨てる。
+            for s in 0..8 {
+                let (down, up, inject) = &slots[s];
+                let _ = hc_mix_quant_fast(&res, &norm, down, up, Some(inject), &hp).expect("warm");
+            }
+            for (mats, slot_pick) in [("mats=32 (DRAM)", None), ("mats=1  (L3)", Some(0usize))] {
+                mix_kprof::reset();
+                for c in 0..calls {
+                    let idx = slot_pick.unwrap_or(c % slots.len());
+                    let (down, up, inject) = &slots[idx];
+                    let _ = hc_mix_quant_fast(&res, &norm, down, up, Some(inject), &hp)
+                        .expect("fast");
+                }
+                let line = mix_kprof::line().expect("強制 on なのに line() が None");
+                println!("\n=== decode mix 実形 {mats} calls={calls} ===\n{line}");
+                mix_kprof::reset();
+            }
+            mix_kprof::set_for_test(false);
+        }
+
+        /// task 107: decode (nt=1) の mix 実形状でカーネル幾何 (チャンク数 /
+        /// 行グループ幅 / プリフェッチ距離) の交互 A/B を取る。
+        ///
+        /// 全 variant を 1 ラウンドに交互に回して最小値を取る (共有ホストの
+        /// ラン間ドリフトを消す)。呼び出しは `hc_mix_quant_fast` 1 本道
+        /// (gn -> down -> lo -> up -> mixed -> inj) で、重み 32 組を轮回した
+        /// DRAM 条件。数値は実行ごとに動く ( assert 無しの計測テスト)。
+        ///
+        /// `cargo test --release -p denno-engine --lib --features cuda -- \
+        ///  --ignored --nocapture bench_mix_decode_call_ab`
+        #[test]
+        #[ignore = "実形状の CPU マイクロベンチ (手動)"]
+        fn bench_mix_decode_call_ab() {
+            use crate::model::linear_gguf::par_test_lock;
+            use crate::model::moe_expert::{
+                set_bf16_chunk_for_test, set_bf16_group_for_test, set_bf16_pf_for_test,
+            };
+            let _g = par_test_lock();
+            let hp = HyperParams { hc: 4, n_embd: 2560, low_rank: 320, eps: 1e-6 };
+            let (e, hc, lr) = (hp.n_embd, hp.hc, hp.low_rank);
+            let hc_dim = hc * e;
+            let bf16_bytes = |k: usize, n: usize, seed: u32| -> Vec<u8> {
+                let mut b = vec![0u8; k * n * 2];
+                for (i, w) in b.chunks_exact_mut(2).enumerate() {
+                    let v = (((i.wrapping_mul(2654435761) ^ seed as usize) % 19) as f32 - 9.0) * 0.12;
+                    let bits = (v.to_bits() >> 16) as u16;
+                    w.copy_from_slice(&bits.to_le_bytes());
+                }
+                b
+            };
+            let mk = |k: usize, n: usize, seed: u32| {
+                GgufLinear::from_slice(GgmlType::Bf16, k, n, &bf16_bytes(k, n, seed))
+                    .expect("GgufLinear::from_slice (Bf16)")
+            };
+            let slots: Vec<(GgufLinear, GgufLinear, GgufLinear)> = (0..32usize)
+                .map(|s| {
+                    (
+                        mk(hc_dim, lr, s as u32 * 3 + 1),
+                        mk(lr, hc_dim, s as u32 * 3 + 2),
+                        mk(hc_dim, hc, s as u32 * 3 + 3),
+                    )
+                })
+                .collect();
+            let res = HyperStreams {
+                data: (0..hc_dim).map(|i| (((i * 11) % 17) as f32 - 8.0) * 0.05).collect(),
+                hc,
+                n_embd: e,
+            };
+            let norm: Vec<f32> = (0..hc_dim).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect();
+            let bytes_per_call = ((hc_dim * lr + lr * hc_dim + hc_dim * hc) * 2) as f64;
+
+            // (名前, chunk, group, pf)。Some は明示値 (従来幾何は G=8/pf=0)。
+            let variants: [(&str, Option<usize>, Option<usize>, Option<usize>); 8] = [
+                ("base (G=8 pf=0)", None, Some(8), Some(0)),
+                ("default (G=4 pf=8)", None, None, None),
+                ("G=4 pf=2", None, Some(4), Some(2)),
+                ("G=4 pf=4", None, Some(4), Some(4)),
+                ("G=4 pf=12", None, Some(4), Some(12)),
+                ("G=4 pf=24", None, Some(4), Some(24)),
+                ("G=4 pf=48", None, Some(4), Some(48)),
+                ("G=4 pf=0", None, Some(4), Some(0)),
+            ];
+            let reps = 16usize;
+            let per = 43usize; // 1 variant あたりの呼び出し数 (129 の 1/3)
+            let mut best = vec![f64::INFINITY; variants.len()];
+            let mut seq = 0usize;
+            // ウォームアップ (プール / ページ)。
+            for s in 0..8 {
+                let (down, up, inject) = &slots[s];
+                let _ = hc_mix_quant_fast(&res, &norm, down, up, Some(inject), &hp).expect("warm");
+            }
+            for rep in 0..reps {
+                // 順序を rep ごとに回転する (固定順の系統バイアスを消す)。
+                for k in 0..variants.len() {
+                    let vi = (k + rep) % variants.len();
+                    let (_, chunk, group, pf) = variants[vi];
+                    set_bf16_chunk_for_test(chunk);
+                    set_bf16_group_for_test(group);
+                    set_bf16_pf_for_test(pf);
+                    let t = std::time::Instant::now();
+                    for _ in 0..per {
+                        let (down, up, inject) = &slots[seq % slots.len()];
+                        seq += 1;
+                        let _ = hc_mix_quant_fast(&res, &norm, down, up, Some(inject), &hp)
+                            .expect("fast");
+                    }
+                    let ms = t.elapsed().as_secs_f64() * 1e3 / per as f64;
+                    best[vi] = best[vi].min(ms);
+                }
+            }
+            set_bf16_chunk_for_test(None);
+            set_bf16_group_for_test(None);
+            set_bf16_pf_for_test(None);
+            println!(
+                "\n=== decode mix 実形 A/B (reps={reps} x {per} calls, DRAM 回転, bytes/call={:.2} MB) ===",
+                bytes_per_call / 1e6
+            );
+            for (i, (name, ..)) in variants.iter().enumerate() {
+                println!(
+                    "{:<26} best={:7.4} ms/call ({:5.1} GB/s)  129 呼び出し = {:6.1} ms/tok",
+                    name,
+                    best[i],
+                    bytes_per_call / (best[i] * 1e-3) / 1e9,
+                    best[i] * 129.0
+                );
+            }
+        }
+
         /// task 87: `attn_kprof` の 1 行組み立て (calls / ms / gpu 発数)。
         ///
         /// 強制 on で note を積み、serve (`prof_flash_q4`) が読む形の行が

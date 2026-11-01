@@ -2071,6 +2071,71 @@ mod tests {
         }
     }
 
+    /// task 107: BF16 融合カーネルの行グループ幅 (`DENNO_BF16_GROUP`) と
+    /// ソフトウェアプリフェッチ距離 (`DENNO_BF16_PF`) が値を変えないこと
+    /// (実形 2 形)。classic (融合 off) と to_bits で突き合わせる。
+    ///
+    /// 根拠: 行は互いに独立で、1 行の累積は (カーネルの c 昇順・レーン順の
+    /// 逐次加算) 不変。グループ化は行をまたぐ演算を作らず、prefetch は
+    /// キャッシュに読むだけ (演算を足さない)。チャンク分割との組合せ
+    /// (端数チャンク × グループ幅) は `bf16_chunk_override_bit_matches_auto`
+    /// が既定幾何のままカバーする。
+    ///
+    /// このテストは `row_par_min = usize::MAX` で**逐次**に固定する。行並列を
+    /// 発火させると [`crate::model::moe_expert::ROW_PAR_REGIONS`] (global) が
+    /// 増え、同じカウンタの差分を見る並行テスト
+    /// (`expert_loop_one_region_per_layer` 等) の邪魔になるため。
+    /// classic 参照も global フラグ (`BF16_FAST_OVERRIDE`) を立てず、
+    /// dequant + 逐次内積を直に計算する (並行テストの経路を変えない)。
+    #[test]
+    fn bf16_group_pf_bit_matches_classic() {
+        use crate::model::moe_expert::{set_bf16_group_for_test, set_bf16_pf_for_test};
+        let _g = par_test_lock();
+        let n_max = usize::MAX;
+        for (k, n, name) in [
+            (10240usize, 320usize, "hc_down 10240->320"),
+            (320usize, 10240usize, "hc_up 320->10240"),
+            (64usize, 10usize, "small n=10 (グループ端数)"),
+            (64usize, 7usize, "small n=7 (端数のみ)"),
+        ] {
+            let w = make_matrix(GgmlType::Bf16, k, n, 11);
+            let lin = GgufLinear::from_slice(GgmlType::Bf16, k, n, &w).expect("GgufLinear");
+            let x = make_x(k, 13);
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+
+            // classic 参照: `gemv_scalar_body` の 1 行の定義そのもの
+            // (dequant_row_into -> i 昇順の逐次加算)。global フラグは触らない。
+            let rb = k * 2;
+            let mut row = vec![0f32; k];
+            let mut classic = vec![0f32; n];
+            for (r, slot) in classic.iter_mut().enumerate() {
+                crate::kquant::dequant_row_into(GgmlType::Bf16, &w[r * rb..(r + 1) * rb], &mut row);
+                let mut acc = 0f32;
+                for i in 0..k {
+                    acc += row[i] * x[i];
+                }
+                *slot = acc;
+            }
+
+            for g in [1usize, 2, 4, 8] {
+                for pf in [0usize, 8, 88] {
+                    set_bf16_group_for_test(Some(g));
+                    set_bf16_pf_for_test(Some(pf));
+                    let mut got = vec![0f32; n];
+                    lin.gemv_label_par_2row("bit", &x, &mut got, n_max)
+                        .unwrap_or_else(|e| panic!("{name}: group={g} pf={pf}: {e}"));
+                    set_bf16_group_for_test(None);
+                    set_bf16_pf_for_test(None);
+                    assert_eq!(
+                        bits(&classic),
+                        bits(&got),
+                        "{name}: group={g} pf={pf} が classic とビット不一致"
+                    );
+                }
+            }
+        }
+    }
+
     /// task 93: BF16 融合 GEMV のチャンク数掃引 (`DENNO_BF16_CHUNK` の A/B 用)。
     ///
     /// 実機の乖離 (コンテナ 1 スレッド 0.107 ms vs 実機 8 スレッドで 0.238 ms) の

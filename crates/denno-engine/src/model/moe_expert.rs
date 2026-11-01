@@ -3664,6 +3664,96 @@ pub fn bf16_chunk_override() -> usize {
     *N.get_or_init(|| bf16_chunk_from_value(std::env::var("DENNO_BF16_CHUNK").ok().as_deref()))
 }
 
+/// task 107: `DENNO_BF16_GROUP` の解釈 (未設定 / 範囲外 = 4)。
+///
+/// 既定は task 107 のコンテナ実測 (decode 実形の mix 呼び出し交互 A/B、6 ラン
+/// すべてで base 比 -4..-11%) を取った 4。従来値は `DENNO_BF16_GROUP=8`。
+fn bf16_group_from_value(v: Option<&str>) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(g @ 1..=8) => g,
+        _ => 4,
+    }
+}
+
+/// テスト用の上書き (0 = env を見る / >0 = グループ幅 +1)。
+#[cfg(test)]
+static BF16_GROUP_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// テスト専用: BF16 融合カーネルの行グループ幅を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_bf16_group_for_test(v: Option<usize>) {
+    BF16_GROUP_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(g) => g + 1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_BF16_GROUP`: BF16 融合カーネルが 1 パスで交互に回す行数 (1..=8、既定 4)。
+///
+/// カーネルは G 行の累積チェーンを交互に回す。G を下げると 1 スレッドが同時に
+/// 走らせる DRAM ストリームが減る (G=8 は行 8 本が 16 B ごとに交互)。従来値は
+/// `DENNO_BF16_GROUP=8`。値には影響しない: 行は互いに独立で、1 行の累積は
+/// c 昇順・レーン順のまま (グループ化は行をまたぐ演算を作らない。
+/// [`bf16_chunk_override`] と同じ根拠)。
+pub fn bf16_group_override() -> usize {
+    #[cfg(test)]
+    match BF16_GROUP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        v => return v - 1,
+    }
+    static G: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *G.get_or_init(|| bf16_group_from_value(std::env::var("DENNO_BF16_GROUP").ok().as_deref()))
+}
+
+/// task 107: `DENNO_BF16_PF` の解釈 (未設定 / 範囲外 = 8)。
+///
+/// 既定は task 107 のコンテナ実測で最も安定していた 8 (1 行ストリームの先
+/// 128 B = 2 ライン)。off は `DENNO_BF16_PF=0`。
+fn bf16_pf_from_value(v: Option<&str>) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(p @ 1..=4096) => p,
+        _ => 8,
+    }
+}
+
+/// テスト用の上書き (0 = env を見る / >0 = 距離 +1)。
+#[cfg(test)]
+static BF16_PF_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// テスト専用: BF16 融合カーネルのプリフェッチ距離を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_bf16_pf_for_test(v: Option<usize>) {
+    BF16_PF_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(p) => p + 1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_BF16_PF`: BF16 融合カーネルのソフトウェアプリフェッチ距離
+/// (8 要素チャンク単位、既定 8 = 1 行ストリームの先 128 B)。`0` で無し
+/// (HW プリフェッチだけ)。
+///
+/// 1 スレッドが G 行のストリームを 16 B ごとに交互に読むので、DRAM 待ちが
+/// カーネルの実効帯域を決める環境 (実機) で効く可能性がある。prefetch は
+/// 値に触らない (キャッシュへの読み込みだけ)。
+pub fn bf16_pf_override() -> usize {
+    #[cfg(test)]
+    match BF16_PF_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        v => return v - 1,
+    }
+    static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *P.get_or_init(|| bf16_pf_from_value(std::env::var("DENNO_BF16_PF").ok().as_deref()))
+}
+
 /// テスト用: BF16 融合カーネルが実際に発火した回数。
 /// 「緑 = 経路が発動した証拠ではない」ので、発火の証拠としてはこのカウンタを見る。
 #[cfg(test)]
@@ -3733,6 +3823,7 @@ unsafe fn gemv_bf16_rows_avx2<const G: usize>(
     rows: usize,
     x: &[f32],
     out: &mut [f32],
+    pf: usize,
 ) {
     use std::arch::x86_64::*;
     let rb = n_in * 2;
@@ -3744,6 +3835,13 @@ unsafe fn gemv_bf16_rows_avx2<const G: usize>(
         let row0 = bp.add(r * rb);
         let mut acc = [0f32; G];
         for c in 0..nv {
+            if pf > 0 {
+                // task 107: G 行のストリームの先で読む行を張っておく (値に触らない)。
+                let cp = (c + pf).min(nv - 1);
+                for g in 0..G {
+                    _mm_prefetch(row0.add(g * rb + cp * 16) as *const i8, _MM_HINT_T0);
+                }
+            }
             let xv = _mm256_loadu_ps(xp.add(c * 8));
             for g in 0..G {
                 let w = bf16_w8(row0.add(g * rb + c * 16));
@@ -3780,24 +3878,48 @@ unsafe fn gemv_bf16_rows_avx2<const G: usize>(
 unsafe fn gemv_bf16_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
     let bp = blocks.as_ptr();
     let rb = n_in * 2;
-    let n8 = n_out & !7usize;
-    if n8 > 0 {
-        gemv_bf16_rows_avx2::<8>(bp, n_in, n8, x, out);
+    let g = bf16_group_override();
+    let pf = bf16_pf_override();
+    if g == 8 && pf == 0 {
+        // 従来幾何 (`DENNO_BF16_GROUP=8 DENNO_BF16_PF=0`) の専用経路
+        // (8 行 / 4 行 / 1 行のグループ配分)。
+        let n8 = n_out & !7usize;
+        if n8 > 0 {
+            gemv_bf16_rows_avx2::<8>(bp, n_in, n8, x, out, 0);
+        }
+        let rest = n_out - n8;
+        let n4 = rest & !3usize;
+        if n4 > 0 {
+            gemv_bf16_rows_avx2::<4>(bp.add(n8 * rb), n_in, n4, x, &mut out[n8..], 0);
+        }
+        let rest2 = rest - n4;
+        if rest2 > 0 {
+            gemv_bf16_rows_avx2::<1>(
+                bp.add((n8 + n4) * rb),
+                n_in,
+                rest2,
+                x,
+                &mut out[n8 + n4..],
+                0,
+            );
+        }
+        return;
     }
-    let rest = n_out - n8;
-    let n4 = rest & !3usize;
-    if n4 > 0 {
-        gemv_bf16_rows_avx2::<4>(bp.add(n8 * rb), n_in, n4, x, &mut out[n8..]);
+    // task 107: グループ幅 / プリフェッチつきの一般経路 (既定 G=4 / pf=8 も
+    // ここを通る)。行のグループ化と prefetch は値に触らない (1 行の累積は
+    // c 昇順・レーン順のまま。末尾の端数行は 1 行ずつ)。
+    let full = n_out - n_out % g;
+    if full > 0 {
+        match g {
+            1 => gemv_bf16_rows_avx2::<1>(bp, n_in, full, x, out, pf),
+            2 => gemv_bf16_rows_avx2::<2>(bp, n_in, full, x, out, pf),
+            4 => gemv_bf16_rows_avx2::<4>(bp, n_in, full, x, out, pf),
+            _ => gemv_bf16_rows_avx2::<8>(bp, n_in, full, x, out, pf),
+        }
     }
-    let rest2 = rest - n4;
-    if rest2 > 0 {
-        gemv_bf16_rows_avx2::<1>(
-            bp.add((n8 + n4) * rb),
-            n_in,
-            rest2,
-            x,
-            &mut out[n8 + n4..],
-        );
+    let rest = n_out - full;
+    if rest > 0 {
+        gemv_bf16_rows_avx2::<1>(bp.add(full * rb), n_in, rest, x, &mut out[full..], pf);
     }
 }
 
