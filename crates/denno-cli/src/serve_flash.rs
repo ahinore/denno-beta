@@ -440,6 +440,9 @@ impl Flash {
         let eos = self.tok.eos();
         let mut out: Vec<u32> = Vec::new();
         let mut text = String::new();
+        // 最後に decode(&out) した全文 (保留した末尾 FFFD を含む)。
+        // ループを抜けたとき text へ反映するのに使う。
+        let mut last_full: Option<String> = None;
         let mut stop_hit: Option<String> = None;
         let mut failed: Option<anyhow::Error> = None;
         // P53: decode は 1 トークンあたり全層ぶん流す (act が有効なときだけ)。
@@ -463,7 +466,17 @@ impl Flash {
             }
             out.push(id);
             let full = self.tok.decode(&out).unwrap_or_default();
+            // 未完成の UTF-8 末尾は lossy デコードで U+FFFD になる。それをそのまま
+            // emit すると、次のトークンで文字が完成したときに starts_with 照合が
+            // 壊れてその文字が欠落する (日本語のマルチバイト文字がトークン境界で
+            // 分断されたとき「�」のまま本文が消える症状)。
+            // 末尾に連続する U+FFFD は保留し、文字が完成してから出す。
+            // 本物の U+FFFD でも 1 トークン遅れで出るだけ。
             if full.len() > text.len() && full.starts_with(&text) {
+                let mut emit_end = full.len();
+                while emit_end >= text.len() + 3 && full[..emit_end].ends_with('\u{FFFD}') {
+                    emit_end -= 3;
+                }
                 // 停止語が本文に現れたら、そこまでで切る
                 let mut cut: Option<usize> = None;
                 for s in &req.stop_sequences {
@@ -479,15 +492,20 @@ impl Flash {
                         }
                     }
                     text = keep.to_string();
+                    last_full = Some(text.clone());
                     stop_hit = Some("stop_sequence".into());
                     break;
                 }
-                if let Err(e) = emit(&full[text.len()..]) {
-                    failed = Some(e);
-                    break;
+                if emit_end > text.len() {
+                    if let Err(e) = emit(&full[text.len()..emit_end]) {
+                        failed = Some(e);
+                        break;
+                    }
                 }
-                text = full;
+                text = full[..emit_end].to_string();
+                last_full = Some(full);
             } else {
+                last_full = Some(full.clone());
                 text = full;
             }
             let t_step = t_on.then(Instant::now);
@@ -571,6 +589,13 @@ impl Flash {
         }
         if let Some(e) = failed {
             return Err(e);
+        }
+        // 保留していた末尾 (文字が完成しないまま終わった FFFD を含む) を最終本文へ反映。
+        // stop_sequence で切ったときは last_full = text にしてあるので伸びない。
+        if let Some(f) = last_full {
+            if f.len() > text.len() && f.starts_with(&text) {
+                text = f;
+            }
         }
         let toks = dec.tokens().to_vec();
         self.cache = Some(Cached { dec, toks, logits });
