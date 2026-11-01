@@ -1336,7 +1336,7 @@ async function sendMsg(text) {
   const t0 = performance.now();
   let acc = '', usage = null, err = null;
   try {
-    const body = { model: 'denno', max_tokens: 512, stream: true, messages: hist.slice(-12) };
+    const body = { model: 'denno', max_tokens: 4096, stream: true, messages: hist.slice(-12) };
     const res = await fetch(CHAT_URL, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
     });
