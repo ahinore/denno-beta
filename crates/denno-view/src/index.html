@@ -103,22 +103,6 @@
                background: #14351c; border: 1px solid var(--glow); color: #7ee788; }
   #intokens .t { background: #1f3a5f; border-color: var(--acc); color: #a5d6ff; }
 
-  /* ---- チャット ---- */
-  #chatlog { max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
-  #chatlog .msg { max-width: 85%; padding: 4px 9px; border-radius: 9px; font-size: 12px;
-                  white-space: pre-wrap; word-break: break-word; }
-  #chatlog .u { align-self: flex-end; background: #1f3a5f; border: 1px solid var(--acc); color: #a5d6ff; }
-  #chatlog .a { align-self: flex-start; background: #17301f; border: 1px solid var(--glow); color: #7ee788; }
-  #chatlog .e { align-self: flex-start; color: var(--warn); font-size: 11px; }
-  #chatbar { display: flex; gap: 6px; margin-top: 6px; }
-  #chatin { flex: 1; background: var(--panel2); border: 1px solid var(--line); color: var(--fg);
-            border-radius: 6px; padding: 5px 8px; font-family: var(--mono); font-size: 12px; }
-  #chatin:focus { outline: none; border-color: var(--acc); }
-  #chatbar button { background: var(--panel2); border: 1px solid var(--line); color: var(--fg);
-                    border-radius: 6px; padding: 5px 10px; cursor: pointer; font-family: var(--mono); }
-  #chatbar button:hover:not(:disabled) { border-color: var(--acc); }
-  #chatbar button:disabled { opacity: .5; cursor: default; }
-  #chatbar .mt { width: 60px; }
   .layer .lsec { display: flex; align-items: center; gap: 2px; margin-top: 2px; flex-wrap: wrap; }
   .layer .tag { font-size: 8px; color: var(--mut); width: 26px; flex: none; }
   .layer .chip { font-size: 9px; padding: 0 3px; border: 1px solid var(--line); border-radius: 4px;
@@ -262,18 +246,6 @@
     </div>
     <h2>Output tokens</h2>
     <div id="tokens"></div>
-  </section>
-
-  <section class="panel" id="tokenpane">
-    <h2>Chat <span class="muted" style="font-size:10px">(sending a message runs the animation)</span></h2>
-    <div id="chatlog"></div>
-    <div id="chatbar">
-      <input id="chatin" type="text" placeholder="Type a message (Enter to send)" autocomplete="off">
-      <label class="muted" style="font-size:10px;align-self:center">max<br>tokens</label>
-      <input id="chatmt" class="mt" type="number" value="256" min="1" max="4096">
-      <button id="chatsend">Send</button>
-      <button id="chatclear" title="clear history">✕</button>
-    </div>
   </section>
   </div>
 
@@ -805,7 +777,6 @@ function handleFrame(f) {
   switch (f.kind) {
     case "ServerInfo": {
       srv.textContent = `${f.model_id || f.model} [${f.model}] (quant=${f.quant}, slots=${f.slots}, ctx=${f.context}, layers=${f.layers})`;
-      modelName = f.model;
       ctxLen = f.context;
       buildLayers(f.layers); buildSlots(f.slots);
       lit($("n-serve"));
@@ -818,13 +789,6 @@ function handleFrame(f) {
       statEl.textContent = "prefill…";
       lit($("n-sched")); lit($("n-step"));
       codeGo("c2");
-      // チャット送信後の最初の admit をチャットセッションとして捕捉
-      // (以後、このセッションの Token フレーム再生時にバブルへ出力する)
-      if (chatActive && chatActive.phase === "wait") {
-        chatActive.phase = "run";
-        chatActive.session = f.session;
-        chatActive.el = addBubble("a", "");
-      }
       break;
     }
     case "Prefill": {
@@ -955,16 +919,6 @@ function handleFrame(f) {
       const c5el = $(modeId("c5"));
       if (c5el) flyLine(c5el, $("var-token"), "#7ee788");
       codeGo("c5");
-      // チャット出力は emit_token (Token フレーム) の再生に同期する。
-      // アニメーションが遅い (speed=low) なら出力表示もそれに合わせて遅くなる。
-      if (chatActive && chatActive.phase === "run" && f.session === chatActive.session) {
-        chatActive.text += txt;
-        chatActive.count++;
-        chatActive.last = performance.now();
-        chatActive.el.textContent = chatActive.text;
-        $("chatlog").scrollTop = 1e9;
-        if (chatActive.expect > 0 && chatActive.count >= chatActive.expect) finishChat();
-      }
       break;
     }
     case "TopK": {
@@ -1025,9 +979,6 @@ let queue = [];
 let playAt = 0;   // 次のフレームを再生してよい時刻 (performance.now 基準)
 function drain() {
   const now = performance.now();
-  // チャット同期表示の安全弁: 応答受信済みでトークンが 4 秒進まない場合
-  // (テレメトリ無効・WS切断・GapでTokenフレーム欠落) は応答全文で確定する
-  if (chatActive && chatActive.reply !== null && now - chatActive.last > 4000) finishChat();
   if (now < playAt || !queue.length) return;
   const f = queue.shift();
   try { handleFrame(f); } catch (e) { console.error("frame error", e, f); }
@@ -1229,100 +1180,7 @@ $("rp-back").addEventListener("click", () => rpScrub(Math.max(0, rpCursor - 2)))
 $("rp-fwd").addEventListener("click", () => rpScrub(Math.min(rpFrames.length - 1, rpCursor)));
 $("rp-slider").addEventListener("input", (e) => rpScrub(parseInt(e.target.value, 10)));
 
-// ---------- チャット (view の /chat → 上流 denno /v1/messages) ----------
-let chatHistory = [];
-let chatPending = false;
-let modelName = null;  // ServerInfo で確定
-function addBubble(cls, text) {
-  const d = document.createElement("div");
-  d.className = "msg " + cls;
-  d.textContent = text;
-  const log = $("chatlog");
-  log.appendChild(d);
-  log.scrollTop = 1e9;
-  return d;
-}
-// ---------- チャット出力の Token フレーム同期 ----------
-// chatActive = 送信中のチャット。SessionAdmit でセッションを捕捉し、
-// Token フレーム (emit_token) の再生時にバブルへトークンを追記する。
-// 応答 (usage) 確定で全トークン再生後に usage 付きで確定。
-// tokenizer 未読込 / テレメトリ無効 / Token 欠落時は応答全文表示へフォールバック。
-let chatActive = null;
-function finishChat() {
-  if (!chatActive) return;
-  const c = chatActive;
-  chatActive = null;
-  const complete = c.expect > 0 && c.count >= c.expect;
-  const body = complete ? c.text : (c.reply !== null ? c.reply : c.text);
-  if (c.el) {
-    c.el.textContent = body + c.usage;
-    $("chatlog").scrollTop = 1e9;
-  } else {
-    addBubble("a", body + c.usage);
-  }
-  chatPending = false;
-  $("chatsend").disabled = false;
-}
-async function sendChat() {
-  const inp = $("chatin");
-  const text = inp.value.trim();
-  if (!text || chatPending) return;
-  inp.value = "";
-  addBubble("u", text);
-  chatHistory.push({ role: "user", content: text });
-  chatPending = true;
-  $("chatsend").disabled = true;
-  const maxTokens = Math.max(1, Math.min(4096, parseInt($("chatmt").value) || 256));
-  // tokenizer が読めていれば Token フレーム同期表示、なければ従来の即時表示
-  chatActive = TOK !== null ? {
-    phase: "wait", session: null, el: null, text: "", count: 0,
-    expect: 0, usage: "", reply: null, last: performance.now(),
-  } : null;
-  try {
-    const r = await fetch("/chat", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: modelName || "denno-dev",
-        max_tokens: maxTokens,
-        messages: chatHistory,
-      }),
-    });
-    const j = await r.json();
-    if (!r.ok) throw new Error((j.error && j.error.message) || "HTTP " + r.status);
-    const reply = (j.content || []).map((c) => c.text || "").join("");
-    chatHistory.push({ role: "assistant", content: reply });
-    if (!chatActive) {
-      const usage = j.usage ? `\n(in ${j.usage.input_tokens} / out ${j.usage.output_tokens} tok)` : "";
-      addBubble("a", reply + usage);
-      chatPending = false;
-      $("chatsend").disabled = false;
-    } else if (j.usage) {
-      chatActive.reply = reply;
-      chatActive.expect = j.usage.output_tokens;
-      chatActive.usage = `\n(in ${j.usage.input_tokens} / out ${j.usage.output_tokens} tok)`;
-      chatActive.last = performance.now();
-      // 応答到着時点で全トークン再生済みならここで確定
-      if (chatActive.phase === "run" && chatActive.count >= chatActive.expect) finishChat();
-    } else {
-      chatActive.reply = reply;
-      finishChat();
-    }
-  } catch (e) {
-    if (chatActive && chatActive.el) chatActive.el.remove();   // 空のまま残ったバブルを始末
-    chatActive = null;
-    addBubble("e", "error: " + e.message + " — removing the last message from history");
-    chatHistory.pop();
-    chatPending = false;
-    $("chatsend").disabled = false;
-  }
-}
-$("chatsend").addEventListener("click", sendChat);
-$("chatin").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
-$("chatclear").addEventListener("click", () => {
-  chatHistory = [];
-  $("chatlog").innerHTML = "";
-});
+// 旧チャット UI は /3d に統合したため削除 (2026-11-01)
 connect();
 </script>
 </body>
