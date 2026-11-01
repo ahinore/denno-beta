@@ -1285,14 +1285,30 @@ impl CudaCtx {
         n_out: usize,
         out: &mut [f32],
     ) -> Result<bool> {
-        self.moe_gemv_dev_with(ty, dev_w, x, n_in, n_out, out, moe_gemv_v3_on())
+        // P-fp16 (task 108): fast mode (`DENNO_GEMV_FP16=1`) が最優先。off なら
+        // 従来どおり v3 (`DENNO_GEMV_V3=1`) → v2 の順。env 未指定では V2 のまま
+        // で 1 バイトも挙動が変わらない。
+        let mode = if moe_gemv_fp16_on() {
+            GemvKernelMode::Fp16
+        } else if moe_gemv_v3_on() {
+            GemvKernelMode::V3
+        } else {
+            GemvKernelMode::V2
+        };
+        self.moe_gemv_dev_with(ty, dev_w, x, n_in, n_out, out, mode)
     }
 
-    /// [`Self::moe_gemv_dev`] の実体。`want_v3` のときだけ v3 (4 レーン版または
-    /// 2 レーン版) を選ぶ。k が 64 の倍数でない / v3 の PTX が読めない /
-    /// PTX が旧 ABI (引数 6 本) のときは v2 へ落ちる。
+    /// [`Self::moe_gemv_dev`] の実体。`mode` で使うカーネル一式を選ぶ。
     ///
-    /// 戻り値は「GPU で走ったか」(v2 に落ちても true)。v3 が実際に走ったかは
+    /// - [`GemvKernelMode::V2`]: ビット一致契約の既定経路。
+    /// - [`GemvKernelMode::V3`]: レーン分割版 (`kernels_moe_v3.cu`)。k が 64 の
+    ///   倍数でない / v3 の PTX が読めない / PTX が旧 ABI (引数 6 本) のときは
+    ///   v2 へ落ちる。
+    /// - [`GemvKernelMode::Fp16`]: fast mode (`kernels_moe_fp16.cu`)。対応型
+    ///   (Q8_0 / Q5_1 / Q4_K) 以外・k が 64 の倍数でない・PTX が読めない /
+    ///   旧 ABI のときは v3 (on なら) → v2 と同じ降下経路へ落ちる。
+    ///
+    /// 戻り値は「GPU で走ったか」(降下しても true)。fp16 / v3 が実際に走ったかは
     /// 呼び出し側のテストが「v2 とビット一致しないこと」で確かめる。
     #[allow(clippy::too_many_arguments)]
     fn moe_gemv_dev_with(
@@ -1303,7 +1319,7 @@ impl CudaCtx {
         n_in: usize,
         n_out: usize,
         out: &mut [f32],
-        want_v3: bool,
+        mode: GemvKernelMode,
     ) -> Result<bool> {
         use crate::kquant::GgmlType as T;
         let fs_v12 = match self.pick_moe_kernels() {
@@ -1346,32 +1362,50 @@ impl CudaCtx {
         // blockDim = rows_per_block * lanes、rows_per_block は DENNO_GEMV_V3_ROWS
         // (8/16/32/64・既定 8)。k が lanes で割り切れない / v3 の PTX が無い /
         // PTX が旧 ABI (引数 6 本) のときは v2 の 4 行/ブロック + 行ステージングへ落ちる。
-        let v3 = if want_v3 {
+        // P-fp16 (task 108): fast mode は v3 と同じ 8 引数 ABI・同じレーン分割で、
+        // 中の演算だけ fp16 dequant + half2 FMA に変える (kernels_moe_fp16.cu)。
+        // Q5_K は対象外。fp16 が使えないときは v3 (on なら) → v2 と同じ降下経路。
+        let fp16 = match mode {
+            GemvKernelMode::Fp16 if gemv_fp16_ty_ok(ty) => {
+                let lanes = moe_gemv_v3_lanes(n_in);
+                if lanes == 0 {
+                    None
+                } else {
+                    gemv_fp16_kernels().map(|k| (k.f[ki], lanes))
+                }
+            }
+            _ => None,
+        };
+        let v3 = if fp16.is_none() && matches!(mode, GemvKernelMode::V3 | GemvKernelMode::Fp16) {
             let lanes = moe_gemv_v3_lanes(n_in);
             if lanes == 0 {
                 None
             } else {
-                gemv_v3_kernels().map(|k| (k.f, lanes))
+                gemv_v3_kernels().map(|k| (k.f[ki], lanes))
             }
         } else {
             None
         };
         const MOE_ROWS_PER_BLOCK: usize = 4; // kernels_moe.cu の MOE_ROWS と一致
-        // v3 の blockDim は rows*lanes (rows=64/lanes=4 で 256)。v2 は 256 固定。
-        let (fs, rows_per_block, block_dim, shmem, lanes) = match v3 {
-            Some((f3, lanes)) => {
+        // fp16 / v3 の blockDim は rows*lanes (既定 rows=8/lanes=4 で 32)。v2 は 256 固定。
+        // rows は DENNO_GEMV_V3_ROWS を共有する (起動形状の意味は同じ)。
+        let (f, rows_per_block, block_dim, shmem, lanes) = match (fp16, v3) {
+            (Some((f, lanes)), _) => {
+                let rows = moe_gemv_v3_rows();
+                (f, rows, (rows * lanes) as u32, 0u32, lanes)
+            }
+            (None, Some((f3, lanes))) => {
                 let rows = moe_gemv_v3_rows();
                 (f3, rows, (rows * lanes) as u32, 0u32, lanes)
             }
-            None => (
-                fs_v12,
+            (None, None) => (
+                fs_v12[ki],
                 MOE_ROWS_PER_BLOCK,
                 256u32,
                 (MOE_ROWS_PER_BLOCK * rb) as u32,
                 1usize,
             ),
         };
-        let f = fs[ki];
         let grid = ((n_out + rows_per_block - 1) / rows_per_block) as u32;
         MOE_SCRATCH.with(|cell| -> Result<()> {
             let mut s = cell.borrow_mut();
@@ -1966,6 +2000,155 @@ fn gemv_v3_kernels() -> Option<&'static V3Kernels> {
 #[cfg(test)]
 pub(crate) fn moe_gemv_v3_loaded() -> bool {
     gemv_v3_kernels().is_some()
+}
+
+// ---------------------------------------------------------------------------
+// P-fp16 (task 108): fast mode の fp16 GEMV (`kernels_moe_fp16.cu`)
+// ---------------------------------------------------------------------------
+
+/// decode GEMV で使うカーネルの選択 (テストが 1 経路に固定するための口も兼ねる)。
+///
+/// - [`GemvKernelMode::V2`]: ビット一致契約の既定経路 (CPU と 1 bit も違わない)。
+/// - [`GemvKernelMode::V3`]: レーン分割 (`DENNO_GEMV_V3=1`)。加算順が変わるが
+///   dequant は f32 のまま (契約の外 = prefill のバッチ GEMM と同じ扱い)。
+/// - [`GemvKernelMode::Fp16`]: fast mode (`DENNO_GEMV_FP16=1`)。fp16 dequant +
+///   half2 FMA で **丸めも精度も変える** (2026-11-01 オペレーター承認の契約変更)。
+///   品質基準と誤差しきい値 (行列全体の相対 2e-2) は REPORT_P108.md。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GemvKernelMode {
+    V2,
+    V3,
+    Fp16,
+}
+
+/// `DENNO_GEMV_FP16` の生値 → fast mode の on/off (純関数。真理値表はテストで固定)。
+fn parse_gemv_fp16(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1") | Some("on") | Some("true"))
+}
+
+/// fast mode (`kernels_moe_fp16.cu`、fp16 dequant + half2 FMA) を使うか (既定 **off**)。
+///
+/// `DENNO_GEMV_FP16=1` のときだけ有効。v3 と同じ降下経路に乗る: 対応型は
+/// Q8_0 / Q5_1 / Q4_K の 3 つ (Q5_K は対象外)、k が 64 の倍数でない、PTX が
+/// 読めない / 旧 ABI のときは v3 (on なら) → v2 へ落ちる。env 未指定では
+/// 1 バイトも挙動が変わらない。
+pub fn moe_gemv_fp16_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_gemv_fp16(std::env::var("DENNO_GEMV_FP16").ok().as_deref()))
+}
+
+/// fp16 カーネルが対応する型か (純関数。Q5_K とそれ以外は v3 / v2 へ落ちる)。
+fn gemv_fp16_ty_ok(ty: crate::kquant::GgmlType) -> bool {
+    use crate::kquant::GgmlType as T;
+    matches!(ty, T::Q8_0 | T::Q5_1 | T::Q4K)
+}
+
+/// fp16 カーネルの引数の数 (v3 と同じ 8 本: w, x, out, n_in, n_out, row_bytes,
+/// rows_per_block, lanes)。検査は v3 と同じ `ptx_entry_params` を使う。
+const FP16_NARGS: usize = 8;
+
+/// fp16 カーネル名 (`ki` の順 = Q8_0 / Q5_1 / Q4_K。Q5_K は対象外)。
+const FP16_KERNEL_NAMES: [&str; 3] = [
+    "dno_gemv_q8_0_fp16",
+    "dno_gemv_q5_1_fp16",
+    "dno_gemv_q4k_fp16",
+];
+
+/// fp16 カーネル一式。3 本そろって初めて `Some`。
+struct Fp16Kernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: [CUfunction; 3],
+}
+
+// 生ハンドル (V3Kernels と同じ規約)。
+unsafe impl Send for Fp16Kernels {}
+unsafe impl Sync for Fp16Kernels {}
+
+static FP16_KERNELS: OnceLock<Option<Fp16Kernels>> = OnceLock::new();
+
+/// fp16 の PTX の置き場所。`DENNO_GEMV_FP16_PTX` があればそれ、無ければビルド時の
+/// クレートディレクトリ配下 `kernels/kernels_moe_fp16.ptx`。
+fn gemv_fp16_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_GEMV_FP16_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_moe_fp16.ptx"),
+    }
+}
+
+/// fp16 カーネルを取得する (初回だけ PTX を読む)。
+///
+/// 失敗は `None` をキャッシュする (= 二度と試さない)。読めなかったときは
+/// **1 行だけ**警告を出し、呼び出し側は v3 / v2 へ落ちる。呼ぶ前に必ず context を
+/// current にしておくこと (cuModuleLoadData は current context に入る)。
+fn gemv_fp16_kernels() -> Option<&'static Fp16Kernels> {
+    FP16_KERNELS
+        .get_or_init(|| {
+            let path = gemv_fp16_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[gemv-fp16] PTX が読めない ({}) : {e} → v3/v2 へ。\
+                         `bash build_ptx.sh moe_fp16` で再生成する",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            // 引数の数が合わない PTX を読むと、cuLaunchKernel が余分な引数を無視 /
+            // 足りない引数を不定のまま起動して**黙って別の行を書く**。モジュールを
+            // 読む前に ABI を確かめて弾く (v3 と同じ規約)。
+            let text = String::from_utf8_lossy(&image);
+            let mut short: Vec<&str> = Vec::new();
+            for name in FP16_KERNEL_NAMES {
+                if ptx_entry_params(&text, name) != Some(FP16_NARGS) {
+                    short.push(name);
+                }
+            }
+            if !short.is_empty() {
+                eprintln!(
+                    "[gemv-fp16] PTX の引数が {} 本でない ({}) → v3/v2 へ。\
+                     `bash build_ptx.sh moe_fp16` で再生成する",
+                    FP16_NARGS,
+                    short.join(", ")
+                );
+                return None;
+            }
+            image.push(0); // cuModuleLoadData は NUL 終端の PTX を期待する
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[gemv-fp16] cuModuleLoadData 失敗 → v3/v2 へ");
+                    return None;
+                }
+                let mut f: [CUfunction; 3] = [std::ptr::null_mut(); 3];
+                for (k, name) in FP16_KERNEL_NAMES.iter().enumerate() {
+                    let mut cname = name.as_bytes().to_vec();
+                    cname.push(0); // cuModuleGetFunction は NUL 終端の名前を期待する
+                    if (lib.module_get_function)(&mut f[k], module, cname.as_ptr() as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!("[gemv-fp16] PTX に {name} が無い → v3/v2 へ");
+                        return None;
+                    }
+                }
+                Some(Fp16Kernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+/// fp16 の PTX が読めているか (テスト専用。**context を current にしてから**呼ぶこと。
+/// 失敗を `OnceLock` に焼き付けるので、本番経路からは呼ばない)。
+#[cfg(test)]
+pub(crate) fn moe_gemv_fp16_loaded() -> bool {
+    gemv_fp16_kernels().is_some()
 }
 
 /// 一時診断: 最初の N 回だけ GEMV の内訳 (H2D / 起動 / 同期 / D2H) を stderr に出す。
@@ -13210,7 +13393,7 @@ mod tests {
             // v3 (4 レーン版) は加算順が変わるので、このテストは明示的に v2 経路へ
             // 固定する (DENNO_GEMV_V3=1 の環境でもビット一致の基準を保つ)。
             assert!(
-                ctx.moe_gemv_dev_with(ty, &dev_w, &x, n_in, n_out, &mut got, false)
+                ctx.moe_gemv_dev_with(ty, &dev_w, &x, n_in, n_out, &mut got, GemvKernelMode::V2)
                     .unwrap(),
                 "{ty:?}: GPU 経路が発動しなかった"
             );
@@ -13293,7 +13476,7 @@ mod tests {
             let dev_w = DevBuffer::from_slice(&w).unwrap();
             let mut got_v2 = vec![0f32; n_out];
             assert!(
-                ctx.moe_gemv_dev_with(ty, &dev_w, &x, n_in, n_out, &mut got_v2, false)
+                ctx.moe_gemv_dev_with(ty, &dev_w, &x, n_in, n_out, &mut got_v2, GemvKernelMode::V2)
                     .unwrap(),
                 "{ty:?}: GPU 経路 (v2) が発動しなかった"
             );
@@ -13310,7 +13493,7 @@ mod tests {
                 set_v3_rows_for_test(rows);
                 let mut got = vec![0f32; n_out];
                 assert!(
-                    ctx.moe_gemv_dev_with(ty, &dev_w, &x, n_in, n_out, &mut got, true)
+                    ctx.moe_gemv_dev_with(ty, &dev_w, &x, n_in, n_out, &mut got, GemvKernelMode::V3)
                         .unwrap(),
                     "{ty:?}: GPU 経路 (v3 lanes={lanes} rows={rows}) が発動しなかった"
                 );
@@ -13443,6 +13626,523 @@ mod tests {
         // 名前の前方一致で別カーネルを拾わない
         assert_eq!(ptx_entry_params(synth, "dno_gemv_q4k_v3_l2"), None);
         assert_eq!(ptx_entry_params("", "dno_gemv_q4k_v3"), None);
+    }
+
+    // ---- task 108: fp16 カーネルの演算列ミラー (CPU) --------------------------
+    //
+    // kernels_moe_fp16.cu の行を 1 対 1 で写したもの (索引と丸め順の検証が目的)。
+    // 実機での検証は #[ignore] の cuda_gemv_fp16_matches_cpu が担当する。
+    //
+    // f16 の 1 回丸め演算 (__hmul2 / __hfma2 / __hadd2) は「f64 で計算してから
+    // f16 へ 1 回丸める」で等価に模せる: f16 値 (仮数 11 ビット) 同士の積は
+    // 22 ビット、積和も指数差を含め f64 (仮数 53 ビット) に正確に収まるので、
+    // 最後の丸め 1 回が真の f16 FMA と同じになる。x の f32 → f16 は
+    // cvt.rn.f16x2.f32 と同じ最近接丸め (half::f16::from_f32)。
+
+    /// f64 の値を f16 に 1 回丸める (hfma2 / hmul2 / hadd2 の最終丸め)。
+    fn fp16_round(v: f64) -> f64 {
+        f64::from(half::f16::from_f64(v))
+    }
+
+    /// f16 ビット列 → f32 (正確。dno_f16_to_f32_fp16 / v3 ヘルパと同じ値)。
+    fn fp16_bits_to_f32(bits: u16) -> f32 {
+        half::f16::from_bits(bits).to_f32()
+    }
+
+    /// dno_scale_min_k4_fp16 のミラー (1 対 1)。
+    fn mirror_scale_min_k4(j: usize, q: &[u8]) -> (u32, u32) {
+        if j < 4 {
+            ((u32::from(q[j]) & 63), (u32::from(q[j + 4]) & 63))
+        } else {
+            (
+                (u32::from(q[j + 4]) & 0x0f) | ((u32::from(q[j - 4]) >> 6) << 4),
+                (u32::from(q[j + 4]) >> 4) | ((u32::from(q[j]) >> 6) << 4),
+            )
+        }
+    }
+
+    /// moe_fp16_block_sum のミラー。2 本の 8 段 hfma2 チェーン → hadd2 →
+    /// (low, high) の f32 ペアを返す (呼び出し側で f32 の加算順を再現する)。
+    /// `split_pairs` が true のときペア j の x は (xv[j], xv[16+j]) (Q5_1)、
+    /// false のとき (xv[2j], xv[2j+1]) (Q8_0 / Q4_K)。
+    fn mirror_block_sum(
+        y: &[(f64, f64); 16],
+        xv: &[f32; 32],
+        split_pairs: bool,
+    ) -> (f32, f32) {
+        let xp = |j: usize| -> (f64, f64) {
+            if split_pairs {
+                (
+                    f64::from(half::f16::from_f32(xv[j])),
+                    f64::from(half::f16::from_f32(xv[16 + j])),
+                )
+            } else {
+                (
+                    f64::from(half::f16::from_f32(xv[2 * j])),
+                    f64::from(half::f16::from_f32(xv[2 * j + 1])),
+                )
+            }
+        };
+        // ペア 0..8 のチェーン (low / high 成分ごとに f16 で 1 回丸む)
+        let (mut a0, mut a1) = (0f64, 0f64);
+        for j in 0..8 {
+            let (x0, x1) = xp(j);
+            a0 = fp16_round(y[j].0 * x0 + a0);
+            a1 = fp16_round(y[j].1 * x1 + a1);
+        }
+        // ペア 8..16 のチェーン
+        let (mut b0, mut b1) = (0f64, 0f64);
+        for j in 8..16 {
+            let (x0, x1) = xp(j);
+            b0 = fp16_round(y[j].0 * x0 + b0);
+            b1 = fp16_round(y[j].1 * x1 + b1);
+        }
+        // __hadd2(acca, accb) → __low2float / __high2float (f16 → f32 は正確)
+        (fp16_round(a0 + b0) as f32, fp16_round(a1 + b1) as f32)
+    }
+
+    /// fp16 カーネル / v3 カーネル (fp16=false) の演算列を CPU で再現する。
+    /// レーン分割とレーン間 reduce の順は .cu と同じ (v3 と fp16 で共有)。
+    fn mirror_gemv(
+        ty: crate::kquant::GgmlType,
+        w: &[u8],
+        n_in: usize,
+        n_out: usize,
+        x: &[f32],
+        fp16: bool,
+    ) -> Vec<f32> {
+        use crate::kquant::GgmlType as T;
+        let rb = gguf_row_bytes(ty, n_in).expect("row_bytes");
+        let lanes = moe_gemv_v3_lanes(n_in);
+        assert!(lanes > 0, "ミラーは lanes > 0 の k だけ");
+        let mut out = vec![0f32; n_out];
+        for row in 0..n_out {
+            let rowp = &w[row * rb..(row + 1) * rb];
+            let mut la = [0f32; 4]; // レーン別の f32 累積
+            match ty {
+                T::Q8_0 => {
+                    let nb = n_in >> 5;
+                    let per = nb / lanes;
+                    for lane in 0..lanes {
+                        let mut acc = 0f32;
+                        for b in lane * per..(lane + 1) * per {
+                            let blk = &rowp[b * 34..b * 34 + 34];
+                            let d_bits = u16::from(blk[0]) | (u16::from(blk[1]) << 8);
+                            let mut xv = [0f32; 32];
+                            xv.copy_from_slice(&x[b * 32..b * 32 + 32]);
+                            if fp16 {
+                                let d = f64::from(half::f16::from_bits(d_bits));
+                                let mut y = [(0f64, 0f64); 16];
+                                for j in 0..16 {
+                                    // __hmul2(q2, d2): dequant の積を f16 で丸める
+                                    let q0 = f64::from(i32::from(blk[2 + 2 * j] as i8));
+                                    let q1 = f64::from(i32::from(blk[3 + 2 * j] as i8));
+                                    y[j] = (fp16_round(q0 * d), fp16_round(q1 * d));
+                                }
+                                let (lo, hi) = mirror_block_sum(&y, &xv, false);
+                                acc += lo + hi; // block_sum 内の (low + high)
+                            } else {
+                                // v3: y = q*d (f32)。acc += y*xv[j] を j 昇順
+                                let d = fp16_bits_to_f32(d_bits);
+                                for j in 0..32 {
+                                    let yv = (blk[2 + j] as i8) as i32 as f32 * d;
+                                    acc += yv * xv[j];
+                                }
+                            }
+                        }
+                        la[lane] = acc;
+                    }
+                }
+                T::Q5_1 => {
+                    let nb = n_in >> 5;
+                    let per = nb / lanes;
+                    for lane in 0..lanes {
+                        let mut acc = 0f32;
+                        for b in lane * per..(lane + 1) * per {
+                            let blk = &rowp[b * 24..b * 24 + 24];
+                            let d_bits = u16::from(blk[0]) | (u16::from(blk[1]) << 8);
+                            let m_bits = u16::from(blk[2]) | (u16::from(blk[3]) << 8);
+                            let qh = u32::from(blk[4])
+                                | (u32::from(blk[5]) << 8)
+                                | (u32::from(blk[6]) << 16)
+                                | (u32::from(blk[7]) << 24);
+                            let mut xv = [0f32; 32];
+                            xv.copy_from_slice(&x[b * 32..b * 32 + 32]);
+                            if fp16 {
+                                let d = f64::from(half::f16::from_bits(d_bits));
+                                let m = f64::from(half::f16::from_bits(m_bits));
+                                let mut y = [(0f64, 0f64); 16];
+                                for j in 0..16 {
+                                    // __hfma2(q2, d2, m2): q*d + m を 1 回丸め
+                                    let xh0 = ((qh >> j) << 4) & 0x10;
+                                    let q0 = f64::from(i32::from(blk[8 + j] & 0x0f) | xh0 as i32);
+                                    let xh1 = (qh >> (j + 12)) & 0x10;
+                                    let q1 = f64::from(i32::from(blk[8 + j] >> 4) | xh1 as i32);
+                                    y[j] = (fp16_round(q0 * d + m), fp16_round(q1 * d + m));
+                                }
+                                let (lo, hi) = mirror_block_sum(&y, &xv, true);
+                                acc += lo; // Q5_1 は (acc + low) + high の順
+                                acc += hi;
+                            } else {
+                                // v3: 下位ニブル 16 要素 → 上位ニブル 16 要素の順
+                                let d = fp16_bits_to_f32(d_bits);
+                                let m = fp16_bits_to_f32(m_bits);
+                                for j in 0..16 {
+                                    let xh0 = ((qh >> j) << 4) & 0x10;
+                                    let q0 = i32::from(blk[8 + j] & 0x0f) | xh0 as i32;
+                                    let yv = q0 as f32 * d + m;
+                                    acc += yv * xv[j];
+                                }
+                                for j in 0..16 {
+                                    let xh1 = (qh >> (j + 12)) & 0x10;
+                                    let q1 = i32::from(blk[8 + j] >> 4) | xh1 as i32;
+                                    let yv = q1 as f32 * d + m;
+                                    acc += yv * xv[16 + j];
+                                }
+                            }
+                        }
+                        la[lane] = acc;
+                    }
+                }
+                T::Q4K => {
+                    let seg = n_in / lanes;
+                    for lane in 0..lanes {
+                        let mut acc = 0f32;
+                        let lo = lane * seg;
+                        let hi = lo + seg;
+                        let b0 = lo >> 8;
+                        let b1 = (hi - 1) >> 8;
+                        for b in b0..=b1 {
+                            let bstart = b << 8;
+                            let blk = &rowp[b * 144..b * 144 + 144];
+                            let d_bits = u16::from(blk[0]) | (u16::from(blk[1]) << 8);
+                            let dmin_bits = u16::from(blk[2]) | (u16::from(blk[3]) << 8);
+                            let s0 = if lo > bstart { (lo - bstart) >> 5 } else { 0 };
+                            let s1 = if hi < bstart + 256 {
+                                (hi - bstart + 31) >> 5
+                            } else {
+                                8
+                            };
+                            for s in s0..s1 {
+                                let e = s << 5;
+                                let qoff = 16 + ((e >> 6) << 5);
+                                let sh = if e & 32 != 0 { 4u32 } else { 0u32 };
+                                let (sc, mn) = mirror_scale_min_k4(s, &blk[4..]);
+                                let mut xv = [0f32; 32];
+                                xv.copy_from_slice(&x[bstart + e..bstart + e + 32]);
+                                if fp16 {
+                                    // ds / ms は f32 で計算してから f16 へ 1 回丸め
+                                    // (__float2half)。ms は事前に符号反転。
+                                    let d32 = fp16_bits_to_f32(d_bits);
+                                    let dmin32 = fp16_bits_to_f32(dmin_bits);
+                                    let ds = f64::from(half::f16::from_f32(d32 * sc as f32));
+                                    let ms =
+                                        f64::from(half::f16::from_f32(-(dmin32 * mn as f32)));
+                                    let mut y = [(0f64, 0f64); 16];
+                                    for j in 0..16 {
+                                        // __hfma2(q2, ds2, ms2): q*ds - ms を 1 回丸め
+                                        let v0 =
+                                            f64::from((u32::from(blk[qoff + 2 * j]) >> sh) & 0x0f);
+                                        let v1 = f64::from(
+                                            (u32::from(blk[qoff + 2 * j + 1]) >> sh) & 0x0f,
+                                        );
+                                        y[j] = (fp16_round(v0 * ds + ms), fp16_round(v1 * ds + ms));
+                                    }
+                                    let (lo2, hi2) = mirror_block_sum(&y, &xv, false);
+                                    acc += lo2 + hi2;
+                                } else {
+                                    // v3: y = ds * (float)v - ms。acc += y*xv[l] を l 昇順
+                                    let ds32 = fp16_bits_to_f32(d_bits) * sc as f32;
+                                    let ms32 = fp16_bits_to_f32(dmin_bits) * mn as f32;
+                                    for l in 0..32 {
+                                        let v = (u32::from(blk[qoff + l]) >> sh) & 0x0f;
+                                        let yv = ds32 * v as f32 - ms32;
+                                        acc += yv * xv[l];
+                                    }
+                                }
+                            }
+                        }
+                        la[lane] = acc;
+                    }
+                }
+                _ => unreachable!("fp16 / v3 ミラーの対象外の型 {ty:?}"),
+            }
+            // moe_fp16_reduce / moe_v3_reduce と同じ (offset 1 → lanes==4 なら offset 2)
+            out[row] = if lanes == 4 {
+                (la[0] + la[1]) + (la[2] + la[3])
+            } else {
+                la[0] + la[1]
+            };
+        }
+        out
+    }
+
+    /// task 108: fp16 カーネル (kernels_moe_fp16.cu) の演算列を CPU で模して、
+    /// CPU の逐次実装 (`expert_gemv_scalar`) との誤差を測る (GPU 無しで回る)。
+    ///
+    /// しきい値は 2e-2 相対 (行列全体の max|diff| / max|ref|。行ごとの相対は
+    /// 打ち消し合いで 0 に近い行が暴れるので使わない)。あわせて v3 (f32 の
+    /// レーン分割、加算順だけが違う) のミラーとの比較を出す = 契約変更の証跡。
+    #[test]
+    fn fp16_gemv_mirror_error_stats() {
+        use crate::kquant::GgmlType as T;
+        // 実モデルの k と、2 レーン経路 (k=320) を含む組み合わせ
+        let cases: [(T, usize, usize); 4] = [
+            (T::Q4K, 2560, 256),
+            (T::Q5_1, 640, 2560),
+            (T::Q8_0, 2560, 256),
+            (T::Q8_0, 320, 10240),
+        ];
+        for (ty, n_in, n_out) in cases {
+            // v2 のビット一致テストと同じ合成行列: d (と Q4_K の dmin、Q5_1 の m)
+            // は f16 の 1.0 固定 = NaN / Inf を作らない。scales / q は決定的乱数。
+            let rb = gguf_row_bytes(ty, n_in).expect("row_bytes");
+            let blk = ty.blck_size();
+            let mut w = vec![0u8; rb * n_out];
+            let mut s = 12345u32;
+            for r in 0..n_out {
+                let row = &mut w[r * rb..(r + 1) * rb];
+                for b in 0..(n_in / blk) {
+                    let base = b * ty.type_size();
+                    row[base] = 0x00;
+                    row[base + 1] = 0x3c;
+                    row[base + 2] = 0x00;
+                    row[base + 3] = 0x3c;
+                    for i in 4..ty.type_size() {
+                        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        row[base + i] = (s >> 16) as u8;
+                    }
+                }
+            }
+            let x = pseudo_random(n_in, 7);
+            let mut want = vec![0f32; n_out];
+            crate::model::moe_expert::expert_gemv_scalar(ty, &w, n_in, n_out, &x, &mut want)
+                .expect("cpu 参照");
+            let got_f16 = mirror_gemv(ty, &w, n_in, n_out, &x, true);
+            let got_v3 = mirror_gemv(ty, &w, n_in, n_out, &x, false);
+            let stat = |got: &[f32]| -> (f32, f32, f32) {
+                let mut maxd = 0f32;
+                let mut sum = 0f32;
+                let mut maxv = 0f32;
+                for i in 0..n_out {
+                    maxd = maxd.max((got[i] - want[i]).abs());
+                    sum += (got[i] - want[i]).abs();
+                    maxv = maxv.max(want[i].abs());
+                }
+                (maxd, sum / n_out as f32, maxv)
+            };
+            let (d16, mean16, maxv) = stat(&got_f16);
+            let (d3, mean3, _) = stat(&got_v3);
+            let rel16 = d16 / maxv.max(f32::MIN_POSITIVE);
+            let rel3 = d3 / maxv.max(f32::MIN_POSITIVE);
+            println!(
+                "{ty:?} k={n_in} n={n_out}: fp16 max|diff|={d16:e} mean|diff|={mean16:e} \
+                 max|ref|={maxv:e} rel={rel16:e} / v3 max|diff|={d3:e} mean|diff|={mean3:e} \
+                 rel={rel3:e}"
+            );
+            assert!(
+                rel16 < 2e-2,
+                "{ty:?} k={n_in}: fp16 ミラーの相対誤差 {rel16:e} >= 2e-2 \
+                 (max|diff|={d16:e}, max|ref|={maxv:e})"
+            );
+            assert!(
+                rel16 > rel3,
+                "{ty:?} k={n_in}: fp16 ({rel16:e}) が v3 ({rel3:e}) より誤差が小さい \
+                 = 契約変更 (fp16 は v3 より誤差が大きい) の前提と違う"
+            );
+            assert!(
+                got_f16.iter().all(|v| v.is_finite()),
+                "{ty:?} k={n_in}: fp16 ミラーが NaN / Inf を作った"
+            );
+        }
+    }
+
+    /// task 108: `DENNO_GEMV_FP16` の真理値表と fp16 対応型 (GPU 無しで回る)。
+    #[test]
+    fn gemv_fp16_gate_truth_table() {
+        let table: [(Option<&str>, bool); 10] = [
+            (Some("1"), true),
+            (Some("on"), true),
+            (Some("true"), true),
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("off"), false),
+            (Some("false"), false),
+            (Some("2"), false),
+            (Some("ON"), false), // 大文字は通さない (v3 と同じ厳密一致)
+        ];
+        for (raw, want) in table {
+            assert_eq!(parse_gemv_fp16(raw), want, "DENNO_GEMV_FP16={raw:?}");
+        }
+        // env の実値 (OnceLock) とも一致する
+        assert_eq!(
+            moe_gemv_fp16_on(),
+            parse_gemv_fp16(std::env::var("DENNO_GEMV_FP16").ok().as_deref())
+        );
+        // 対応型: Q8_0 / Q5_1 / Q4K。Q5_K とそれ以外は v3 / v2 へ落ちる。
+        use crate::kquant::GgmlType as T;
+        assert!(gemv_fp16_ty_ok(T::Q8_0));
+        assert!(gemv_fp16_ty_ok(T::Q5_1));
+        assert!(gemv_fp16_ty_ok(T::Q4K));
+        assert!(!gemv_fp16_ty_ok(T::Q5K));
+        assert!(!gemv_fp16_ty_ok(T::Q4_0));
+    }
+
+    /// task 108: fp16 (fast mode) GEMV が CPU の逐次実装と相対 2e-2 以内で一致し、
+    /// v3 より誤差が大きいこと (契約変更の証跡)。fp16 が実際に走ったことは
+    /// 「v2 (ビット一致経路) と 1 行も一致しないこと」で確かめる (黙って
+    /// v2 / v3 に落ちていたら検出できる)。
+    ///
+    /// 実行 (GPU のある環境):
+    ///   bash crates/denno-engine/kernels/build_ptx.sh moe_fp16
+    ///   DENNO_GEMV_FP16_PTX=$PWD/crates/denno-engine/kernels/kernels_moe_fp16.ptx \
+    ///   cargo test --release --features cuda -- --ignored cuda_gemv_fp16_matches_cpu
+    #[test]
+    #[ignore]
+    fn cuda_gemv_fp16_matches_cpu() {
+        use crate::kquant::GgmlType as T;
+        let ctx = CudaCtx::new().unwrap();
+        println!("device: {}", ctx.info());
+        assert!(
+            moe_gemv_fp16_loaded(),
+            "fp16 の PTX が読めていない (DENNO_GEMV_FP16_PTX / kernels_moe_fp16.ptx を確認。\
+             `bash build_ptx.sh moe_fp16` で再生成する)"
+        );
+        // 実モデルの k。Q8_0 320 は 2 レーン経路。Q5_K は fp16 対象外 (省略)。
+        let cases: [(T, usize, usize); 4] = [
+            (T::Q4K, 2560, 256),
+            (T::Q5_1, 640, 2560),
+            (T::Q8_0, 2560, 256),
+            (T::Q8_0, 320, 10240),
+        ];
+        for (ty, n_in, n_out) in cases {
+            let lanes = moe_gemv_v3_lanes(n_in);
+            assert!(lanes > 0, "{ty:?} k={n_in} は lanes 対象外");
+            assert!(gemv_fp16_ty_ok(ty), "{ty:?} は fp16 対象外");
+            let rb = gguf_row_bytes(ty, n_in).expect("row_bytes");
+            let blk = ty.blck_size();
+            let mut w = vec![0u8; rb * n_out];
+            let mut s = 12345u32;
+            for r in 0..n_out {
+                let row = &mut w[r * rb..(r + 1) * rb];
+                for b in 0..(n_in / blk) {
+                    let base = b * ty.type_size();
+                    row[base] = 0x00;
+                    row[base + 1] = 0x3c;
+                    row[base + 2] = 0x00;
+                    row[base + 3] = 0x3c;
+                    for i in 4..ty.type_size() {
+                        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        row[base + i] = (s >> 16) as u8;
+                    }
+                }
+            }
+            let x = pseudo_random(n_in, 7);
+            let mut want = vec![0f32; n_out];
+            crate::model::moe_expert::expert_gemv_scalar(ty, &w, n_in, n_out, &x, &mut want)
+                .expect("cpu 参照");
+            let dev_w = DevBuffer::from_slice(&w).unwrap();
+            // 基準 (v2 は CPU とビット一致する契約) が壊れていないこと。
+            let mut got_v2 = vec![0f32; n_out];
+            assert!(
+                ctx.moe_gemv_dev_with(
+                    ty,
+                    &dev_w,
+                    &x,
+                    n_in,
+                    n_out,
+                    &mut got_v2,
+                    GemvKernelMode::V2
+                )
+                .unwrap(),
+                "{ty:?}: GPU 経路 (v2) が発動しなかった"
+            );
+            for i in 0..n_out {
+                assert_eq!(
+                    got_v2[i].to_bits(),
+                    want[i].to_bits(),
+                    "{ty:?}: v2 が CPU とビット一致しない (行 {i})"
+                );
+            }
+            let mut got_v3 = vec![0f32; n_out];
+            assert!(
+                ctx.moe_gemv_dev_with(
+                    ty,
+                    &dev_w,
+                    &x,
+                    n_in,
+                    n_out,
+                    &mut got_v3,
+                    GemvKernelMode::V3
+                )
+                .unwrap(),
+                "{ty:?}: GPU 経路 (v3) が発動しなかった"
+            );
+            let mut got = vec![0f32; n_out];
+            assert!(
+                ctx.moe_gemv_dev_with(
+                    ty,
+                    &dev_w,
+                    &x,
+                    n_in,
+                    n_out,
+                    &mut got,
+                    GemvKernelMode::Fp16
+                )
+                .unwrap(),
+                "{ty:?}: GPU 経路 (fp16) が発動しなかった"
+            );
+            // fp16 が実際に走った証拠: v2 / v3 と一致する行が全てではない
+            let ndiff_v2 = (0..n_out)
+                .filter(|&i| got[i].to_bits() != got_v2[i].to_bits())
+                .count();
+            let ndiff_v3 = (0..n_out)
+                .filter(|&i| got[i].to_bits() != got_v3[i].to_bits())
+                .count();
+            assert!(
+                ndiff_v2 > 0,
+                "{ty:?}: fp16 の出力が v2 と 1 行も違わない = fp16 が走っていない \
+                 (PTX 未ロード / 対象外の型 / k={n_in} が 64 の倍数でない)"
+            );
+            // 誤差統計 (行列全体の max|diff| / max|ref| と平均。REPORT に記録する)
+            let stat = |got: &[f32]| -> (f32, f32, f32) {
+                let mut maxd = 0f32;
+                let mut sum = 0f32;
+                let mut maxv = 0f32;
+                for i in 0..n_out {
+                    maxd = maxd.max((got[i] - want[i]).abs());
+                    sum += (got[i] - want[i]).abs();
+                    maxv = maxv.max(want[i].abs());
+                }
+                (maxd, sum / n_out as f32, maxv)
+            };
+            let (d16, mean16, maxv) = stat(&got);
+            let (d3, mean3, _) = stat(&got_v3);
+            let rel16 = d16 / maxv.max(f32::MIN_POSITIVE);
+            let rel3 = d3 / maxv.max(f32::MIN_POSITIVE);
+            println!(
+                "{ty:?} k={n_in} n={n_out} lanes={lanes}: fp16 max|diff|={d16:e} \
+                 mean|diff|={mean16:e} max|ref|={maxv:e} rel={rel16:e} \
+                 (v2 と {ndiff_v2}/{n_out} 行, v3 と {ndiff_v3}/{n_out} 行が不一致) \
+                 / v3 max|diff|={d3:e} mean|diff|={mean3:e} rel={rel3:e}"
+            );
+            assert_eq!(
+                got.iter().filter(|v| !v.is_finite()).count(),
+                0,
+                "{ty:?}: fp16 が NaN / Inf を作った"
+            );
+            assert!(
+                rel16 < 2e-2,
+                "{ty:?} k={n_in}: fp16 の相対誤差 {rel16:e} >= 2e-2 \
+                 (max|diff|={d16:e}, max|ref|={maxv:e})"
+            );
+            assert!(
+                rel16 > rel3,
+                "{ty:?} k={n_in}: fp16 ({rel16:e}) <= v3 ({rel3:e}) \
+                 = 契約変更の証跡にならない"
+            );
+        }
     }
 
     /// GPU の量子化が CPU (`tensor::quantize_row_i8`) とビット一致するか
