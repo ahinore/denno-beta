@@ -929,17 +929,23 @@ function promote(il, ids) {
     lru.push(kk);
     if (s.tier[k] !== TIER.VRAM) { s.tier[k] = TIER.VRAM; s.dirty[k] = 1; }
     s.act[k] = Math.max(s.act[k], 0.5);   // 移送中は光らせる
-    s.heat[k] = Math.min(1, s.heat[k] + 0.10);   // 選ばれるたびに熱が溜まる (ヒートマップ)
+    s.heat[k] = Math.min(1, s.heat[k] + 0.18);   // 選ばれるたびに熱が溜まる (ヒートマップ)
   }
 }
 
 /** デモのルーティング (実テレメトリが来ないときだけ) */
 function routeLayer(il, token) {
   const s = slabs[il];
-  const cand = [];
-  for (let k = 0; k < EXPERTS; k++) cand.push(k);
-  cand.sort((a, b) => hash(b + 1, token) - hash(a + 1, token));
-  const sel = cand.slice(0, TOPK);
+  // 実モデルと同じように「良く使われる expert」が出るよう、層ごとに固定の
+  // hot pool (~6%) を用意し 7/10 をそこから、残り 3/10 を外から選ぶ。
+  // 一様ランダムだと再選がほぼ無く、ヒートマップが均一になってしまう。
+  const hot = [], cold = [];
+  for (let k = 0; k < EXPERTS; k++) {
+    if (hash(k * 3.71, il * 13.17 + 5) > 0.965) hot.push(k); else cold.push(k);
+  }
+  hot.sort((a, b) => hash(b + 1, token) - hash(a + 1, token));
+  cold.sort((a, b) => hash(b + 1, token) - hash(a + 1, token));
+  const sel = hot.slice(0, 7).concat(cold.slice(0, 3));
   s.route = sel;
   const ws = [];
   for (let i = 0; i < sel.length; i++) {
@@ -981,10 +987,10 @@ function updateLayerColors(il, dt) {
       col[k * 3] = COL.sel.r * p; col[k * 3 + 1] = COL.sel.g * p; col[k * 3 + 2] = COL.sel.b * p;
       continue;
     }
-    const v = base + g * 1.15 + s.heat[k] * 0.8;   // heat: 選択頻度のヒートマップ (濃くなる)
+    const v = base + g * 1.15 + Math.sqrt(s.heat[k]) * 0.75;   // sqrt: 1 回の選択でも見えるように
     col[k * 3] = c.r * v; col[k * 3 + 1] = c.g * v; col[k * 3 + 2] = c.b * v;
-    if (g > 0.82 || s.heat[k] > 0.85) {
-      const w = Math.min(1, Math.max((g - 0.82) * 1.3, (s.heat[k] - 0.85) * 2.2));
+    if (g > 0.82 || s.heat[k] > 0.6) {
+      const w = Math.min(1, Math.max((g - 0.82) * 1.3, (s.heat[k] - 0.6) * 1.4));
       col[k * 3] += (1 - col[k * 3]) * w;
       col[k * 3 + 1] += (1 - col[k * 3 + 1]) * w;
       col[k * 3 + 2] += (1 - col[k * 3 + 2]) * w;
