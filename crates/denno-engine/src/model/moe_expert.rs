@@ -2880,6 +2880,42 @@ pub fn iq4xs_fast_enabled() -> bool {
     *ON.get_or_init(|| iq4xs_fast_from_value(std::env::var("DENNO_IQ4XS_FAST").ok().as_deref()))
 }
 
+/// `DENNO_IQ3S_FAST` の値の解釈 (**既定 on**、[`iq4xs_fast_from_value`] と同じ規約)。
+fn iq3s_fast_from_value(v: Option<&str>) -> bool {
+    iq4xs_fast_from_value(v)
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+#[cfg(test)]
+static IQ3S_FAST_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト専用: IQ3_S バッチ融合経路の on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_iq3s_fast_for_test(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    IQ3S_FAST_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_IQ3S_FAST` をプロセスで 1 回だけ読む (既定 on)。IQ3_S は prefill の
+/// バッチ GEMM だけ融合 (m=1 は従来どおり classic スカラー。task 97 では後回し)。
+pub fn iq3s_fast_enabled() -> bool {
+    #[cfg(test)]
+    match IQ3S_FAST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| iq3s_fast_from_value(std::env::var("DENNO_IQ3S_FAST").ok().as_deref()))
+}
+
 /// テスト用: IQ4_XS 融合カーネルが実際に発火した回数。
 /// 「緑 = 経路が発動した証拠ではない」ので、発火の証拠としてはこのカウンタを見る。
 #[cfg(test)]
@@ -4204,6 +4240,36 @@ fn gemm_rows_disp(
             unsafe { gemm_q5k_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
             return;
         }
+        if fused && ty == GgmlType::IQ4Xs && q4k_fused_supported() && iq4xs_fast_enabled() {
+            // task 97: prefill の gate/up 残塊。バッチ融合カーネルは 1 行版
+            // ([`gemv_iq4xs_avx2`]) と累積順が違う (ブロックごとに hsum) ので
+            // ビット一致しない。`DENNO_IQ4XS_FAST=0` で下のスカラー バッチに戻る
+            // (1 行版の退避と同じゲート。スカラー バッチは classic とビット一致)。
+            gemm_fused_fired();
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                crate::model::exp_kprof::K_IQ4XS,
+            );
+            // SAFETY: 同上 (IQ4_XS は n_in%256==0 が row_bytes で保証される)。
+            unsafe { gemm_iq4xs_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
+            return;
+        }
+        if fused && ty == GgmlType::IQ3S && q4k_fused_supported() && iq3s_fast_enabled() {
+            // task 97: IQ3_S quant の prefill 最大塊。バッチ融合のみ (m=1 は後回し)。
+            // `DENNO_IQ3S_FAST=0` で下のスカラー バッチに戻る。
+            gemm_fused_fired();
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_PREFILL,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                crate::model::exp_kprof::K_IQ3S,
+            );
+            // SAFETY: 同上 (IQ3_S は n_in%256==0 が row_bytes で保証される)。
+            unsafe { gemm_iq3s_avx2(blocks, n_in, r0, r1, xs, m, out, stride) };
+            return;
+        }
         if fused && iq_kind(ty).is_some() && q4k_fused_supported() {
             // SAFETY: 既存カーネルと同じ規約 (`blocks` は全行、`out` は行 r0 の位置).
             gemm_fused_fired();
@@ -5086,6 +5152,222 @@ unsafe fn gemm_q5k_avx2_ref(
         );
         for (ri, v) in row.iter().enumerate() {
             *out.add(t * stride + ri) = *v;
+        }
+    }
+}
+
+/// IQ4_XS のバッチ融合カーネル (k ブロック版、task 97)。
+///
+/// ループ順・累計の持ち方は [`gemm_q4k_avx2`] と同じ (`k チャンク → 行 → ブロック →
+/// トークン`、(行, トークン) ごとの `total` をチャンクを跨いでブロック昇順に足す)。
+/// Q4_K と違い最小値項は無い (IQ4_XS は `d*(ls-32)*kv` だけで、`dmin*Σx` を持たない)。
+///
+/// dequant は 1 行版 ([`gemv_iq4xs_avx2`]) と同じ [`iq4xs_subblock_w`] を使い、
+/// kquant 参照と `to_bits()` 一致する (`d*(ls-32)` をスカラー積、`kv*dl` をベクトル積
+/// に分ける規約。1 ブロックのスケール読みは行に依るので行ループの内側で 1 回)。
+///
+/// 数値: ブロックごとに `q8_hadd(a0, a1)` を f32 の `total` に足すので、1 レーンの
+/// 部分和は 32 項 (Q4_K バッチと同じ粒度)。1 行版 ([`gemv_iq4xs_avx2`]) はベクタ累積
+/// を行全体で回して最後に 1 回畳むため、**累積順が違いビット一致しない**
+/// (相対 1e-6 程度。Q2_0 融合と同じ立場。精度の契約は f64 真値誤差が classic 以下)。
+///
+/// # Safety
+///
+/// [`gemm_q8_0_avx2`] と同じ。加えて IQ4_XS は `n_in % 256 == 0` が [`row_bytes`] で
+/// 保証される。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemm_iq4xs_avx2(
+    blocks: &[u8],
+    n_in: usize,
+    r0: usize,
+    r1: usize,
+    xs: &[f32],
+    m: usize,
+    out: *mut f32,
+    stride: usize,
+) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 136; // IQ4_XS 1 ブロック = 256 要素
+    const SUB: usize = 8; // 1 ブロック = 32 要素 x 8
+    const KB_MAX: usize = 4;
+
+    let nb = n_in / 256;
+    let rb = nb * BLK;
+    let bp = blocks.as_ptr();
+    let xp = xs.as_ptr();
+    let rows = r1.saturating_sub(r0);
+    if rows == 0 || m == 0 {
+        return;
+    }
+    let t16 = _mm_loadu_si128(crate::kquant::kvalues_iq4nl().as_ptr() as *const __m128i);
+
+    // (行, トークン) ごとの累計。k チャンクを跨いでブロック昇順の和を保つ。
+    let mut total = vec![0f32; rows * m];
+    let mut a0 = vec![_mm256_setzero_ps(); m];
+    let mut a1 = vec![_mm256_setzero_ps(); m];
+
+    let kb = gemm_k_blocks(256, m, KB_MAX);
+    let mut b0 = 0usize;
+    while b0 < nb {
+        let b1 = (b0 + kb).min(nb);
+        for r in r0..r1 {
+            let row = bp.add(r * rb);
+            let tot = total.as_mut_ptr().add((r - r0) * m);
+            for b in b0..b1 {
+                let p = row.add(b * BLK);
+                let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+                let sh = std::ptr::read_unaligned(p.add(2) as *const u16);
+                for t in 0..m {
+                    a0[t] = _mm256_setzero_ps();
+                    a1[t] = _mm256_setzero_ps();
+                }
+                for ib in 0..SUB {
+                    // ブロックのデコード (行に依る) は 1 ブロック 1 回、トークンで共有。
+                    let w = iq4xs_subblock_w(p, ib, sh, d, t16);
+                    let xoff = b * 256 + ib * 32;
+                    for t in 0..m {
+                        let xo = xp.add(t * n_in + xoff);
+                        a0[t] = _mm256_fmadd_ps(w[0], _mm256_loadu_ps(xo), a0[t]);
+                        a1[t] = _mm256_fmadd_ps(w[1], _mm256_loadu_ps(xo.add(8)), a1[t]);
+                        a0[t] = _mm256_fmadd_ps(w[2], _mm256_loadu_ps(xo.add(16)), a0[t]);
+                        a1[t] = _mm256_fmadd_ps(w[3], _mm256_loadu_ps(xo.add(24)), a1[t]);
+                    }
+                }
+                for t in 0..m {
+                    *tot.add(t) += q8_hadd(a0[t], a1[t]);
+                }
+            }
+        }
+        b0 = b1;
+    }
+    for t in 0..m {
+        let base = t * stride;
+        for ri in 0..rows {
+            *out.add(base + ri) = *total.get_unchecked(ri * m + t);
+        }
+    }
+}
+
+/// IQ3_S の 32 要素サブブロック `ib` (0..8) の重みベクトル 4 本を作る。
+///
+/// kquant 参照 ([`crate::kquant`] の `GgmlType::IQ3S` 分岐) と `to_bits()` 一致:
+/// - `db = d * (1 + 2*スケール nibble)` をスカラーで 1 回 (参照と同じ式)。
+/// - 格子値は `IQ3S_GRID` エントリの下位 4 バイト (LE) を i8 x4 として開き、
+///   `cvtepi8 -> f32` (正確)。乗算は参照と同じ `(db * g) * s` の値になる
+///   (符号ビット XOR は ±1 倍と同じ値。db > 0 なので db*g の ±0 は +0 のみで
+///   XOR との差は出ない)。
+/// - 符号バイトのレーン割り当てはレーン 0..4 が bit 0..4、レーン 4..8 が bit 4..8
+///   ([`iq_sign_i8`] と同じ。KMASK_IQ2XS = [1,2,4,8,16,32,64,128])。
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq3s_subblock_w(p: *const u8, ib: usize, d: f32) -> [std::arch::x86_64::__m256; 4] {
+    use std::arch::x86_64::*;
+
+    // d(2) + qs[64] + qh[8] + signs[32] + scales[4]
+    let sc = *p.add(106 + ib / 2);
+    let nib = if ib % 2 == 0 { sc & 0xf } else { sc >> 4 };
+    let dbv = _mm256_set1_ps(d * (1.0f32 + 2.0f32 * nib as f32));
+    let qh = *p.add(66 + ib) as usize;
+    let qs = p.add(2 + ib * 8);
+    let mut out = [_mm256_setzero_ps(); 4];
+    for l in 0..4usize {
+        let i1 = (*qs.add(2 * l) as usize) | ((qh << (8 - 2 * l)) & 256);
+        let i2 = (*qs.add(2 * l + 1) as usize) | ((qh << (7 - 2 * l)) & 256);
+        // 格子エントリ (u64) の下位 4 バイトに i8 x4 が入る (kquant 参照の
+        // to_le_bytes()[0..4] と同じ。LE なので u32 ロードでそのまま取れる)。
+        let g1 = crate::kquant_tables::IQ3S_GRID[i1] as u32;
+        let g2 = crate::kquant_tables::IQ3S_GRID[i2] as u32;
+        let pair = _mm_unpacklo_epi32(
+            _mm_cvtsi32_si128(g1 as i32),
+            _mm_cvtsi32_si128(g2 as i32),
+        );
+        let signed = iq_sign_i8(pair, *p.add(74 + ib * 4 + l) as i32);
+        out[l] = _mm256_mul_ps(signed, dbv);
+    }
+    out
+}
+
+/// IQ3_S (256 要素 / 110 B ブロック) のバッチ融合カーネル (k ブロック版、task 97)。
+///
+/// ループ順・累計の持ち方は [`gemm_iq4xs_avx2`] と同じ (`k チャンク → 行 → ブロック →
+/// トークン`、(行, トークン) ごとの `total` をブロック昇順で足す)。dequant は
+/// [`iq3s_subblock_w`] で kquant 参照と `to_bits()` 一致。
+///
+/// m=1 の融合 GEMV は無い (decode の IQ3_S は従来どおり classic スカラー)。
+///
+/// # Safety
+///
+/// [`gemm_q8_0_avx2`] と同じ。加えて IQ3_S は `n_in % 256 == 0` が [`row_bytes`] で
+/// 保証される。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemm_iq3s_avx2(
+    blocks: &[u8],
+    n_in: usize,
+    r0: usize,
+    r1: usize,
+    xs: &[f32],
+    m: usize,
+    out: *mut f32,
+    stride: usize,
+) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 110; // IQ3_S 1 ブロック = 256 要素
+    const SUB: usize = 8; // 1 ブロック = 32 要素 x 8
+    const KB_MAX: usize = 4;
+
+    let nb = n_in / 256;
+    let rb = nb * BLK;
+    let bp = blocks.as_ptr();
+    let xp = xs.as_ptr();
+    let rows = r1.saturating_sub(r0);
+    if rows == 0 || m == 0 {
+        return;
+    }
+
+    let mut total = vec![0f32; rows * m];
+    let mut a0 = vec![_mm256_setzero_ps(); m];
+    let mut a1 = vec![_mm256_setzero_ps(); m];
+
+    let kb = gemm_k_blocks(256, m, KB_MAX);
+    let mut b0 = 0usize;
+    while b0 < nb {
+        let b1 = (b0 + kb).min(nb);
+        for r in r0..r1 {
+            let row = bp.add(r * rb);
+            let tot = total.as_mut_ptr().add((r - r0) * m);
+            for b in b0..b1 {
+                let p = row.add(b * BLK);
+                let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+                for t in 0..m {
+                    a0[t] = _mm256_setzero_ps();
+                    a1[t] = _mm256_setzero_ps();
+                }
+                for ib in 0..SUB {
+                    let w = iq3s_subblock_w(p, ib, d);
+                    let xoff = b * 256 + ib * 32;
+                    for t in 0..m {
+                        let xo = xp.add(t * n_in + xoff);
+                        a0[t] = _mm256_fmadd_ps(w[0], _mm256_loadu_ps(xo), a0[t]);
+                        a1[t] = _mm256_fmadd_ps(w[1], _mm256_loadu_ps(xo.add(8)), a1[t]);
+                        a0[t] = _mm256_fmadd_ps(w[2], _mm256_loadu_ps(xo.add(16)), a0[t]);
+                        a1[t] = _mm256_fmadd_ps(w[3], _mm256_loadu_ps(xo.add(24)), a1[t]);
+                    }
+                }
+                for t in 0..m {
+                    *tot.add(t) += q8_hadd(a0[t], a1[t]);
+                }
+            }
+        }
+        b0 = b1;
+    }
+    for t in 0..m {
+        let base = t * stride;
+        for ri in 0..rows {
+            *out.add(base + ri) = *total.get_unchecked(ri * m + t);
         }
     }
 }
@@ -6865,6 +7147,14 @@ mod tests {
                     b[i] = pat(i, seed);
                 }
             }
+            // d(2) + qs[64] + qh[8] + signs[32] + scales[4]。
+            // 全バイトが有効 (qs の 9bit 格子インデックスは 0..511 すべて表に有る)。
+            GgmlType::IQ3S => {
+                b[0..2].copy_from_slice(&f16_bytes(0.01));
+                for i in 2..110 {
+                    b[i] = pat(i, seed);
+                }
+            }
             other => panic!("テスト対象外の型: {:?}", other),
         }
         b
@@ -8205,6 +8495,85 @@ mod tests {
             run!("Q4_K 新 (k block)", gemm_q4k_avx2, m, q4, xs, out);
             run!("Q5_1 旧 (ref)", gemm_q5_1_avx2_ref, m, q51, xs, out);
             run!("Q5_1 新 (k block)", gemm_q5_1_avx2, m, q51, xs, out);
+        }
+    }
+
+    /// task 97 マイクロベンチ: IQ4_XS バッチ融合 vs スカラー バッチ (classic)。
+    /// 同一バイナリ内で `set_iq4xs_fast_for_test` で A/B する (load average の
+    /// 変動に強い。rep の min を取る)。gate 形 (k=2560, n=640 = 実形 10 ブロック) と
+    /// down 代用形 (k=512, n=2560 — down 形 k=640 は 256 の倍数でなく IQ4_XS では
+    /// 表現不可。P89 と同じ近傍代用)。
+    ///
+    /// 実行:
+    /// `cargo test --release -p denno-engine --lib -- --ignored --nocapture bench_iq4xs_gemm97`
+    #[test]
+    #[ignore = "マイクロベンチ (IQ4_XS/IQ3_S gate/down 形, m=1/512)"]
+    fn bench_iq4xs_gemm97() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        if !q8_0_fused_supported() {
+            eprintln!("skip bench_iq4xs_gemm97: AVX2/FMA が無い");
+            return;
+        }
+        let _g = moe_test_lock();
+        let set4: fn(Option<bool>) = set_iq4xs_fast_for_test;
+        let set3: fn(Option<bool>) = set_iq3s_fast_for_test;
+        for (tname, ty, force) in
+            [("iq4xs", GgmlType::IQ4Xs, set4), ("iq3s", GgmlType::IQ3S, set3)]
+        {
+            for (name, k, n) in [("gate", 2560usize, 640usize), ("down-sub", 512usize, 2560usize)]
+            {
+                // IQ4Xs は既存の fixture (iq4_xs_weights)、IQ3S は make_expert。
+                let blocks = match ty {
+                    GgmlType::IQ4Xs => iq4_xs_weights(k, n, 11),
+                    _ => make_expert(ty, k, n, 0),
+                };
+                let rb = row_bytes(ty, k).unwrap();
+                for m in [1usize, 512] {
+                    let xs: Vec<f32> = (0..m * k)
+                        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+                        .collect();
+                    let mut out = vec![0f32; m * n];
+                    let mut run = |fused: bool| -> f64 {
+                        // ウォームアップ 1 回 + 3 rep の min。
+                        gemm_rows(ty, rb, &blocks, k, 0, n, &xs, m, out.as_mut_ptr(), n, fused);
+                        let mut best = f64::INFINITY;
+                        for _ in 0..3 {
+                            let t0 = Instant::now();
+                            gemm_rows(
+                                ty,
+                                rb,
+                                &blocks,
+                                k,
+                                0,
+                                n,
+                                &xs,
+                                m,
+                                out.as_mut_ptr(),
+                                n,
+                                fused,
+                            );
+                            best = best.min(t0.elapsed().as_secs_f64());
+                        }
+                        black_box(&out);
+                        best
+                    };
+                    force(Some(true));
+                    let t_fused = run(true);
+                    force(Some(false));
+                    let t_scalar = run(false);
+                    force(None);
+                    let macs = (m * k * n) as f64;
+                    eprintln!(
+                        "[bench97] {tname} {name} k={k} n={n} m={m:<3} | fused {:8.3} ms ({:6.1} GMAC/s) | scalar {:8.3} ms ({:6.1} GMAC/s) | {:.2}x",
+                        t_fused * 1e3,
+                        macs / t_fused / 1e9,
+                        t_scalar * 1e3,
+                        macs / t_scalar / 1e9,
+                        t_scalar / t_fused,
+                    );
+                }
+            }
         }
     }
 
@@ -10441,6 +10810,37 @@ mod exp_kprof_tests {
         x as u8
     }
 
+    /// IQ4_XS の 1 expert ぶん (`n_out * (n_in/256) * 136` バイト)。
+    /// サブブロックの 6bit スケールが `(seed + ib*9) % 64` を巡回する (iq4xs_tests の
+    /// fixture と同じ詰め方。こちらは exp_kprof の発火確認専用で値の契約は見ない)。
+    fn iq4xs_expert(n_in: usize, n_out: usize) -> Vec<u8> {
+        let nb = n_in / 256;
+        let mut v = Vec::with_capacity(n_out * nb * 136);
+        for r in 0..n_out {
+            for b in 0..nb {
+                let mut blk = vec![0u8; 136];
+                blk[0..2].copy_from_slice(&f16b(0.01 + 0.001 * (b % 7) as f32));
+                for ib in 0..8usize {
+                    let ls = ((r * 131 + b * 17 + ib * 9) % 64) as u16;
+                    let nib = (ls & 0xf) as u8;
+                    let hi2 = ((ls >> 4) & 0x3) as u8;
+                    if ib % 2 == 0 {
+                        blk[4 + ib / 2] |= nib;
+                    } else {
+                        blk[4 + ib / 2] |= nib << 4;
+                    }
+                    let sh = u16::from_le_bytes([blk[2], blk[3]]) | ((hi2 as u16) << (2 * ib));
+                    blk[2..4].copy_from_slice(&sh.to_le_bytes());
+                }
+                for (i, q) in blk.iter_mut().enumerate().skip(8) {
+                    *q = byte_at(i, (r * 131 + b * 17) as u32 + 5);
+                }
+                v.extend_from_slice(&blk);
+            }
+        }
+        v
+    }
+
     /// Q4_K の 1 expert ぶん (`n_out * (n_in/256) * 144` バイト)。
     fn q4k_expert(n_in: usize, n_out: usize) -> Vec<u8> {
         let nb = n_in / 256;
@@ -10868,6 +11268,227 @@ mod exp_kprof_tests {
             );
         }
 
+        kp::set_for_test(false);
+        kp::set_mat(kp::OTHER);
+        kp::reset();
+    }
+
+    /// task 97: prefill の IQ4_XS がバッチ融合カーネル (K_IQ4XS) に乗ること。
+    /// `DENNO_IQ4XS_FAST=0` 相当ではスカラー バッチ (K_SCALAR) に戻る
+    /// (1 行版の退避と同じゲートがバッチにも効く)。
+    #[test]
+    fn exp_kprof_prefill_iq4xs_fused_and_escape() {
+        let _g = kprof_lock();
+        let _m = moe_test_lock();
+        kp::set_for_test(false);
+        kp::reset();
+        kp::set_for_test(true);
+
+        // gate (IQ4_XS) を m=4 トークンで 1 回 (prefill のバッチ形)。
+        let (n_in, n_out, m) = (256usize, 64usize, 4usize);
+        let blocks = iq4xs_expert(n_in, n_out);
+        let xs: Vec<f32> = (0..m * n_in)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+            .collect();
+        let rb = row_bytes(GgmlType::IQ4Xs, n_in).unwrap();
+        let mut out = vec![0f32; m * n_out];
+
+        // (1) 既定 (融合 on): K_IQ4XS に乗る。
+        set_iq4xs_fast_for_test(Some(true));
+        kp::set_mat(kp::GATE);
+        gemm_rows(
+            GgmlType::IQ4Xs,
+            rb,
+            &blocks,
+            n_in,
+            0,
+            n_out,
+            &xs,
+            m,
+            out.as_mut_ptr(),
+            n_out,
+            true,
+        );
+        assert_eq!(
+            kp::ty_kernel(kp::PH_PREFILL, kp::GATE, GgmlType::IQ4Xs.id(), kp::K_IQ4XS),
+            1,
+            "prefill IQ4_XS がバッチ融合カーネルとして数えられていない"
+        );
+        assert_eq!(
+            kp::ty_kernel(kp::PH_PREFILL, kp::GATE, GgmlType::IQ4Xs.id(), kp::K_SCALAR),
+            0,
+            "融合 on なのに scalar にも数えられている"
+        );
+        let (c, b, rows) = {
+            let (c, b, rows, _) = kp::ty_stats(kp::PH_PREFILL, kp::GATE, GgmlType::IQ4Xs.id());
+            (c, b, rows)
+        };
+        assert_eq!(c, 1, "prefill IQ4_XS gate の呼び出し数");
+        assert_eq!(b, blocks.len() as u64, "prefill IQ4_XS gate のバイト数");
+        assert_eq!(rows, n_out as u64, "prefill IQ4_XS gate の行数");
+
+        // (2) 退避 (FAST=0 相当): 同じ呼び出しが K_SCALAR に落ちる。
+        set_iq4xs_fast_for_test(Some(false));
+        let mut out2 = vec![0f32; m * n_out];
+        gemm_rows(
+            GgmlType::IQ4Xs,
+            rb,
+            &blocks,
+            n_in,
+            0,
+            n_out,
+            &xs,
+            m,
+            out2.as_mut_ptr(),
+            n_out,
+            true,
+        );
+        assert_eq!(
+            kp::ty_kernel(kp::PH_PREFILL, kp::GATE, GgmlType::IQ4Xs.id(), kp::K_IQ4XS),
+            1,
+            "退避路なのに融合カーネルが増えた"
+        );
+        assert_eq!(
+            kp::ty_kernel(kp::PH_PREFILL, kp::GATE, GgmlType::IQ4Xs.id(), kp::K_SCALAR),
+            1,
+            "退避路が scalar として数えられていない"
+        );
+        // 退避路の出力は classic スカラー バッチとビット一致する。
+        let mut want = vec![0f32; m * n_out];
+        gemm_rows_scalar(
+            GgmlType::IQ4Xs,
+            rb,
+            &blocks,
+            n_in,
+            0,
+            n_out,
+            &xs,
+            m,
+            want.as_mut_ptr(),
+            n_out,
+        );
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&out2),
+            bits(&want),
+            "退避路の出力がスカラー バッチとビット不一致"
+        );
+
+        set_iq4xs_fast_for_test(None);
+        kp::set_for_test(false);
+        kp::set_mat(kp::OTHER);
+        kp::reset();
+    }
+
+    /// IQ3_S の 1 expert ぶん (`n_out * (n_in/256) * 110` バイト)。
+    /// 全バイトが有効 (格子インデックス 0..511 すべて表に有る) なので決定的
+    /// パターンをそのまま詰める。発火確認専用 (値の契約は iq3s_tests)。
+    fn iq3s_expert(n_in: usize, n_out: usize) -> Vec<u8> {
+        let nb = n_in / 256;
+        let mut v = Vec::with_capacity(n_out * nb * 110);
+        for r in 0..n_out {
+            for b in 0..nb {
+                let mut blk = vec![0u8; 110];
+                blk[0..2].copy_from_slice(&f16b(0.01 + 0.001 * (b % 7) as f32));
+                for (i, q) in blk.iter_mut().enumerate().skip(2) {
+                    *q = byte_at(i, (r * 131 + b * 17) as u32 + 7);
+                }
+                v.extend_from_slice(&blk);
+            }
+        }
+        v
+    }
+
+    /// task 97: prefill の IQ3_S がバッチ融合カーネル (K_IQ3S) に乗ること。
+    /// `DENNO_IQ3S_FAST=0` 相当ではスカラー バッチ (K_SCALAR) に戻る。
+    #[test]
+    fn exp_kprof_prefill_iq3s_fused_and_escape() {
+        let _g = kprof_lock();
+        let _m = moe_test_lock();
+        kp::set_for_test(false);
+        kp::reset();
+        kp::set_for_test(true);
+
+        let (n_in, n_out, m) = (256usize, 64usize, 4usize);
+        let blocks = iq3s_expert(n_in, n_out);
+        let xs: Vec<f32> = (0..m * n_in)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+            .collect();
+        let rb = row_bytes(GgmlType::IQ3S, n_in).unwrap();
+        let mut out = vec![0f32; m * n_out];
+
+        set_iq3s_fast_for_test(Some(true));
+        kp::set_mat(kp::GATE);
+        gemm_rows(
+            GgmlType::IQ3S,
+            rb,
+            &blocks,
+            n_in,
+            0,
+            n_out,
+            &xs,
+            m,
+            out.as_mut_ptr(),
+            n_out,
+            true,
+        );
+        assert_eq!(
+            kp::ty_kernel(kp::PH_PREFILL, kp::GATE, GgmlType::IQ3S.id(), kp::K_IQ3S),
+            1,
+            "prefill IQ3_S がバッチ融合カーネルとして数えられていない"
+        );
+        assert_eq!(
+            kp::ty_kernel(kp::PH_PREFILL, kp::GATE, GgmlType::IQ3S.id(), kp::K_SCALAR),
+            0,
+            "融合 on なのに scalar にも数えられている"
+        );
+
+        set_iq3s_fast_for_test(Some(false));
+        let mut out2 = vec![0f32; m * n_out];
+        gemm_rows(
+            GgmlType::IQ3S,
+            rb,
+            &blocks,
+            n_in,
+            0,
+            n_out,
+            &xs,
+            m,
+            out2.as_mut_ptr(),
+            n_out,
+            true,
+        );
+        assert_eq!(
+            kp::ty_kernel(kp::PH_PREFILL, kp::GATE, GgmlType::IQ3S.id(), kp::K_IQ3S),
+            1,
+            "退避路なのに融合カーネルが増えた"
+        );
+        assert_eq!(
+            kp::ty_kernel(kp::PH_PREFILL, kp::GATE, GgmlType::IQ3S.id(), kp::K_SCALAR),
+            1,
+            "退避路が scalar として数えられていない"
+        );
+        let mut want = vec![0f32; m * n_out];
+        gemm_rows_scalar(
+            GgmlType::IQ3S,
+            rb,
+            &blocks,
+            n_in,
+            0,
+            n_out,
+            &xs,
+            m,
+            want.as_mut_ptr(),
+            n_out,
+        );
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&out2),
+            bits(&want),
+            "退避路の出力がスカラー バッチとビット不一致"
+        );
+
+        set_iq3s_fast_for_test(None);
         kp::set_for_test(false);
         kp::set_mat(kp::OTHER);
         kp::reset();
@@ -11717,8 +12338,475 @@ mod iq4xs_tests {
         assert_eq!(want, got, "退避路の出力がスカラー経路とビット不一致");
         set_iq4xs_fast_for_test(None);
     }
+
+    // ---- task 97: バッチ融合 GEMM (prefill の gate/up 残塊) --------------------
+
+    /// バッチ融合カーネル ([`gemm_rows`] の IQ4_XS 分岐) は classic スカラー バッチ
+    /// ([`gemm_rows_scalar`]) と許容内で一致し、**f64 真値誤差は classic 以下**
+    /// (タスクの契約)。累積は Q4_K バッチと同じ「(行, トークン) ごとにブロック昇順」
+    /// なので、classic の逐次 f32 より部分和が育たない (1 レーン 32 項)。
+    #[test]
+    fn iq4xs_gemm_batch_matches_scalar_and_f64_accuracy() {
+        if !fused_ready("iq4xs_gemm_batch_matches_scalar_and_f64_accuracy") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq4xs_fast_for_test(Some(true));
+        // (256, 4) = 1 ブロック最小。 (2560, 640) = gate/up の実形 (10 ブロック)。
+        // (512, 2560) = down 形の代用 (down 形 k=640 は 256 の倍数でなく IQ4_XS では
+        // 表現不可。P89 と同じ近傍代用で、ブロック数 2 の短 k 長 n を見る)。
+        // m=1 は KB=4、m=15 は KB=2、m=64 は KB=1 の k チャンク分割を通る。
+        for (n_in, n_out, ms) in [
+            (256usize, 4usize, &[1usize, 512][..]),
+            (2560, 640, &[1, 15, 64][..]),
+            (512, 2560, &[15][..]),
+        ] {
+            let blocks = iq4xs_rows(n_in, n_out);
+            let rb = row_bytes(GgmlType::IQ4Xs, n_in).unwrap();
+            for &m in ms {
+                let xs: Vec<f32> = (0..m * n_in)
+                    .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+                    .collect();
+                let mut fused = vec![0f32; m * n_out];
+                gemm_rows(
+                    GgmlType::IQ4Xs,
+                    rb,
+                    &blocks,
+                    n_in,
+                    0,
+                    n_out,
+                    &xs,
+                    m,
+                    fused.as_mut_ptr(),
+                    n_out,
+                    true,
+                );
+                assert!(
+                    fused.iter().any(|v| *v != 0.0),
+                    "n_in={n_in} m={m}: 出力が全 0 (経路の生死が分からない)"
+                );
+                let mut scalar = vec![0f32; m * n_out];
+                gemm_rows_scalar(
+                    GgmlType::IQ4Xs,
+                    rb,
+                    &blocks,
+                    n_in,
+                    0,
+                    n_out,
+                    &xs,
+                    m,
+                    scalar.as_mut_ptr(),
+                    n_out,
+                );
+                let (mut d_fs, mut d_ft, mut d_st) = (0.0f32, 0.0f32, 0.0f32);
+                for r in 0..n_out {
+                    // dequant は行 1 回だけ作り直し、トークンで使い回す。
+                    let w = dequant_row(GgmlType::IQ4Xs, &blocks[r * rb..(r + 1) * rb], n_in);
+                    for t in 0..m {
+                        let xb = &xs[t * n_in..(t + 1) * n_in];
+                        let mut acc = 0.0f64;
+                        for i in 0..n_in {
+                            acc += w[i] as f64 * xb[i] as f64;
+                        }
+                        let truth = acc as f32;
+                        let fi = t * n_out + r;
+                        let diff = (fused[fi] - scalar[fi]).abs();
+                        d_fs = d_fs.max(diff);
+                        d_ft = d_ft.max((fused[fi] - truth).abs());
+                        d_st = d_st.max((scalar[fi] - truth).abs());
+                        // サニティ境界は「絶対 + 相対 1e-3」(P89 と同じ)。f32 累積の
+                        // 誤差は出力値でなく部分和の大きさに比例するので相対幅だけ
+                        // では押さえられない。精度の契約は下の f64 真値の assert。
+                        let tol = 1e-3 + 1e-3 * scalar[fi].abs();
+                        assert!(
+                            diff <= tol,
+                            "n_in={n_in} m={m} t={t} r={r}: 融合 {} とスカラー {} の差 {diff} が許容 {tol} を超える",
+                            fused[fi],
+                            scalar[fi]
+                        );
+                    }
+                }
+                assert!(
+                    d_ft <= d_st + 1e-6,
+                    "n_in={n_in} m={m}: バッチ融合の f64 真値誤差 {d_ft:.3e} が classic の {d_st:.3e} を超えた"
+                );
+                eprintln!(
+                    "IQ4_XS gemm {n_out}x{n_in} m={m}: 融合vsスカラー {d_fs:.3e} / f64真値差 融合 {d_ft:.3e} classic {d_st:.3e}"
+                );
+            }
+        }
+        set_iq4xs_fast_for_test(None);
+    }
+
+    /// バッチ経路でも dequant は kquant 参照と `to_bits()` 一致 (one-hot x、m=1)。
+    /// バッチはブロックごとに `hsum8` して f32 の total に足すが、one-hot の
+    /// 非対称項は 1 ブロックだけなので足し合わせても値は変わらない
+    /// (±0 の符号だけは縮約で落ちるので「両方 0」を同一視する。1 行版と同じ)。
+    #[test]
+    fn iq4xs_gemm_batch_dequant_bits_match_kquant() {
+        if !fused_ready("iq4xs_gemm_batch_dequant_bits_match_kquant") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq4xs_fast_for_test(Some(true));
+        for n_in in [256usize, 512] {
+            let n_out = 3usize;
+            let blocks = iq4xs_rows(n_in, n_out);
+            let rb = row_bytes(GgmlType::IQ4Xs, n_in).unwrap();
+            let mut out = vec![0.0f32; n_out];
+            for i in 0..n_in {
+                let mut x = vec![0.0f32; n_in];
+                x[i] = 1.0;
+                gemm_rows(
+                    GgmlType::IQ4Xs,
+                    rb,
+                    &blocks,
+                    n_in,
+                    0,
+                    n_out,
+                    &x,
+                    1,
+                    out.as_mut_ptr(),
+                    n_out,
+                    true,
+                );
+                let w = dequant_row(GgmlType::IQ4Xs, &blocks[0..rb], n_in);
+                let (kv, rw) = (out[0].to_bits(), w[i].to_bits());
+                assert!(
+                    kv == rw || (out[0] == 0.0 && w[i] == 0.0),
+                    "n_in={n_in} i={i}: バッチ経路の w {} ({kv:#x}) が kquant 参照 {} ({rw:#x}) と違う",
+                    out[0],
+                    w[i]
+                );
+            }
+            let w = dequant_row(GgmlType::IQ4Xs, &blocks[0..rb], n_in);
+            assert!(
+                w.iter().any(|v| *v != 0.0),
+                "参照行が全 0 (fixture が壊れた)"
+            );
+        }
+        set_iq4xs_fast_for_test(None);
+    }
+
+    /// バッチ融合 (m=1) と 1 行版融合 ([`expert_gemv`]) は**ビット一致しない**
+    /// (1 行版はベクタ累積を全ブロックで回し最後に 1 回畳む、バッチはブロックごとに
+    /// hsum。Q2_0 融合と同じ立場)。スケール正規化の相対で緩く固定する。
+    #[test]
+    fn iq4xs_gemm_batch_m1_vs_gemv_relaxed() {
+        if !fused_ready("iq4xs_gemm_batch_m1_vs_gemv_relaxed") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq4xs_fast_for_test(Some(true));
+        for (n_in, n_out) in [(256usize, 7usize), (512, 33), (2560, 640)] {
+            let x = xvec(n_in);
+            let blocks = iq4xs_rows(n_in, n_out);
+            let rb = row_bytes(GgmlType::IQ4Xs, n_in).unwrap();
+            let mut gemv = vec![0f32; n_out];
+            expert_gemv(GgmlType::IQ4Xs, &blocks, n_in, n_out, &x, &mut gemv).unwrap();
+            let mut batch = vec![0f32; n_out];
+            gemm_rows(
+                GgmlType::IQ4Xs,
+                rb,
+                &blocks,
+                n_in,
+                0,
+                n_out,
+                &x,
+                1,
+                batch.as_mut_ptr(),
+                n_out,
+                true,
+            );
+            assert!(batch.iter().any(|v| *v != 0.0), "n_in={n_in}: 出力が全 0");
+            // 出力スケールで正規化 (打ち消しで 0 に近い行で相対が暴れないように)。
+            let scale = gemv.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
+            let max_rel = batch
+                .iter()
+                .zip(&gemv)
+                .map(|(a, b)| (a - b).abs() / scale)
+                .fold(0f32, f32::max);
+            eprintln!(
+                "IQ4_XS gemv-vs-gemm n_in={n_in}: 出力スケール正規化 最大差 {max_rel:.3e}"
+            );
+            assert!(
+                max_rel < 1e-5,
+                "n_in={n_in}: バッチ m=1 が 1 行版から出力スケール相対 {max_rel:.3e} 外れた (累積順の差としては大きすぎる)"
+            );
+        }
+        set_iq4xs_fast_for_test(None);
+    }
+
+    /// 行範囲を分けて呼んでも (rayon の行チャンクと同じ形) 各行の値は
+    /// **ビット一致**する (行は独立で、(行, トークン) ごとの累積順は不変)。
+    #[test]
+    fn iq4xs_gemm_batch_row_split_bitwise() {
+        if !fused_ready("iq4xs_gemm_batch_row_split_bitwise") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq4xs_fast_for_test(Some(true));
+        let (n_in, n_out, m) = (2560usize, 640usize, 15usize);
+        let blocks = iq4xs_rows(n_in, n_out);
+        let xs: Vec<f32> = (0..m * n_in)
+            .map(|i| ((i * 53 % 211) as f32 - 105.0) / 128.0)
+            .collect();
+        let mut full = vec![0f32; m * n_out];
+        // SAFETY: 形状は check_gemm_args と同じ条件を満たし、AVX2/FMA は
+        // fused_ready が確認している。
+        unsafe { gemm_iq4xs_avx2(&blocks, n_in, 0, n_out, &xs, m, full.as_mut_ptr(), n_out) };
+        let (a, b) = (137usize, 381usize);
+        let mut part = vec![0f32; m * (b - a)];
+        // SAFETY: 同上 (行範囲 [a, b) は [0, n_out) の分割)。
+        unsafe { gemm_iq4xs_avx2(&blocks, n_in, a, b, &xs, m, part.as_mut_ptr(), b - a) };
+        assert!(full.iter().any(|v| *v != 0.0), "出力が全 0");
+        for t in 0..m {
+            for r in a..b {
+                assert_eq!(
+                    full[t * n_out + r].to_bits(),
+                    part[t * (b - a) + (r - a)].to_bits(),
+                    "t={t} r={r}: 行分割で値が変わった"
+                );
+            }
+        }
+        set_iq4xs_fast_for_test(None);
+    }
 }
 
+
+/// task 97: IQ3_S バッチ融合 GEMM ([`gemm_iq3s_avx2`]) の検証。
+///
+/// 契約は IQ4_XS バッチ (task 97) と同じ立て方:
+/// 1. dequant は kquant 参照 ([`crate::kquant::dequant_row`] の IQ3S 分岐) と
+///    `to_bits()` 一致 (one-hot x、格子インデックス 0..511 の全域を通す)。
+/// 2. バッチ融合は classic スカラー バッチと許容内で一致し、f64 真値誤差は
+///    classic 以下。
+/// 3. m=1 の融合 GEMV は無い (decode は従来どおり classic)。行分割でビット不変。
+#[cfg(test)]
+mod iq3s_tests {
+    use super::*;
+    use crate::kquant::dequant_row;
+
+    /// テスト用の決定的バイト列 (0..=255)。`mod tests` の `pat` と同じ式の写し
+    /// (あちらは非公開なので共有しない)。
+    fn pat(i: usize, seed: u32) -> u8 {
+        let mut x = (i as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(seed.wrapping_mul(40_503));
+        x ^= x >> 13;
+        x = x.wrapping_mul(0x9E37_79B1);
+        x ^= x >> 16;
+        x as u8
+    }
+
+    fn f16_bytes(v: f32) -> [u8; 2] {
+        half::f16::from_f32(v).to_le_bytes()
+    }
+
+    /// AVX2/FMA が無い環境では黙って緑にせず、理由を出して skip する。
+    fn fused_ready(what: &str) -> bool {
+        if q4k_fused_supported() {
+            return true;
+        }
+        eprintln!(
+            "skip {what}: この CPU には AVX2/FMA が無い (融合経路は選ばれずスカラーへ落ちる)"
+        );
+        false
+    }
+
+    /// IQ3_S の 1 ブロック (110 B = d f16 + qs[64] + qh[8] + signs[32] + scales[4])。
+    /// qs / qh / signs / scales は全バイトが有効 (格子インデックス 0..511 すべて表に
+    /// 有る) なので決定的パターンをそのまま詰める。d は行・ブロックでずらす。
+    fn iq3s_block(seed: u32) -> [u8; 110] {
+        let mut b = [0u8; 110];
+        b[0..2].copy_from_slice(&f16_bytes(0.01 + 0.001 * (seed % 13) as f32));
+        for i in 2..110 {
+            b[i] = pat(i, seed);
+        }
+        b
+    }
+
+    /// `n_out * (n_in / 256)` ブロックの合成 IQ3_S 行列。
+    fn iq3s_rows(n_in: usize, n_out: usize) -> Vec<u8> {
+        assert_eq!(n_in % 256, 0, "IQ3_S の行長は 256 の倍数");
+        let nb = n_in / 256;
+        let mut v = Vec::with_capacity(n_out * nb * 110);
+        for r in 0..n_out {
+            for b in 0..nb {
+                v.extend_from_slice(&iq3s_block((r * 131 + b * 17) as u32 + 7));
+            }
+        }
+        v
+    }
+
+    /// バッチ融合 vs classic スカラー バッチのサニティ + f64 真値誤差が classic 以下。
+    #[test]
+    fn iq3s_gemm_batch_matches_scalar_and_f64_accuracy() {
+        if !fused_ready("iq3s_gemm_batch_matches_scalar_and_f64_accuracy") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq3s_fast_for_test(Some(true));
+        for (n_in, n_out, ms) in [
+            (256usize, 4usize, &[1usize, 512][..]),
+            (2560, 640, &[1, 15, 64][..]),
+            (512, 2560, &[15][..]),
+        ] {
+            let blocks = iq3s_rows(n_in, n_out);
+            let rb = row_bytes(GgmlType::IQ3S, n_in).unwrap();
+            for &m in ms {
+                let xs: Vec<f32> = (0..m * n_in)
+                    .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+                    .collect();
+                let mut fused = vec![0f32; m * n_out];
+                gemm_rows(
+                    GgmlType::IQ3S,
+                    rb,
+                    &blocks,
+                    n_in,
+                    0,
+                    n_out,
+                    &xs,
+                    m,
+                    fused.as_mut_ptr(),
+                    n_out,
+                    true,
+                );
+                assert!(
+                    fused.iter().any(|v| *v != 0.0),
+                    "n_in={n_in} m={m}: 出力が全 0 (経路の生死が分からない)"
+                );
+                let mut scalar = vec![0f32; m * n_out];
+                gemm_rows_scalar(
+                    GgmlType::IQ3S,
+                    rb,
+                    &blocks,
+                    n_in,
+                    0,
+                    n_out,
+                    &xs,
+                    m,
+                    scalar.as_mut_ptr(),
+                    n_out,
+                );
+                let (mut d_fs, mut d_ft, mut d_st) = (0.0f32, 0.0f32, 0.0f32);
+                for r in 0..n_out {
+                    let w = dequant_row(GgmlType::IQ3S, &blocks[r * rb..(r + 1) * rb], n_in);
+                    for t in 0..m {
+                        let xb = &xs[t * n_in..(t + 1) * n_in];
+                        let mut acc = 0.0f64;
+                        for i in 0..n_in {
+                            acc += w[i] as f64 * xb[i] as f64;
+                        }
+                        let truth = acc as f32;
+                        let fi = t * n_out + r;
+                        let diff = (fused[fi] - scalar[fi]).abs();
+                        d_fs = d_fs.max(diff);
+                        d_ft = d_ft.max((fused[fi] - truth).abs());
+                        d_st = d_st.max((scalar[fi] - truth).abs());
+                        let tol = 1e-3 + 1e-3 * scalar[fi].abs();
+                        assert!(
+                            diff <= tol,
+                            "n_in={n_in} m={m} t={t} r={r}: 融合 {} とスカラー {} の差 {diff} が許容 {tol} を超える",
+                            fused[fi],
+                            scalar[fi]
+                        );
+                    }
+                }
+                assert!(
+                    d_ft <= d_st + 1e-6,
+                    "n_in={n_in} m={m}: バッチ融合の f64 真値誤差 {d_ft:.3e} が classic の {d_st:.3e} を超えた"
+                );
+                eprintln!(
+                    "IQ3_S gemm {n_out}x{n_in} m={m}: 融合vsスカラー {d_fs:.3e} / f64真値差 融合 {d_ft:.3e} classic {d_st:.3e}"
+                );
+            }
+        }
+        set_iq3s_fast_for_test(None);
+    }
+
+    /// dequant の to_bits 一致 (one-hot、バッチ経路 m=1)。
+    /// 格子インデックスの 9 ビット目 (qh) が立つ要素も含めて全要素を見る。
+    #[test]
+    fn iq3s_gemm_batch_dequant_bits_match_kquant() {
+        if !fused_ready("iq3s_gemm_batch_dequant_bits_match_kquant") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq3s_fast_for_test(Some(true));
+        for n_in in [256usize, 512] {
+            let n_out = 3usize;
+            let blocks = iq3s_rows(n_in, n_out);
+            let rb = row_bytes(GgmlType::IQ3S, n_in).unwrap();
+            let mut out = vec![0.0f32; n_out];
+            for i in 0..n_in {
+                let mut x = vec![0.0f32; n_in];
+                x[i] = 1.0;
+                gemm_rows(
+                    GgmlType::IQ3S,
+                    rb,
+                    &blocks,
+                    n_in,
+                    0,
+                    n_out,
+                    &x,
+                    1,
+                    out.as_mut_ptr(),
+                    n_out,
+                    true,
+                );
+                let w = dequant_row(GgmlType::IQ3S, &blocks[0..rb], n_in);
+                let (kv, rw) = (out[0].to_bits(), w[i].to_bits());
+                assert!(
+                    kv == rw || (out[0] == 0.0 && w[i] == 0.0),
+                    "n_in={n_in} i={i}: バッチ経路の w {} ({kv:#x}) が kquant 参照 {} ({rw:#x}) と違う",
+                    out[0],
+                    w[i]
+                );
+            }
+            let w = dequant_row(GgmlType::IQ3S, &blocks[0..rb], n_in);
+            assert!(
+                w.iter().any(|v| *v != 0.0),
+                "参照行が全 0 (fixture が壊れた)"
+            );
+        }
+        set_iq3s_fast_for_test(None);
+    }
+
+    /// 行範囲を分けて呼んでも各行の値はビット一致する。
+    #[test]
+    fn iq3s_gemm_batch_row_split_bitwise() {
+        if !fused_ready("iq3s_gemm_batch_row_split_bitwise") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_iq3s_fast_for_test(Some(true));
+        let (n_in, n_out, m) = (2560usize, 640usize, 15usize);
+        let blocks = iq3s_rows(n_in, n_out);
+        let xs: Vec<f32> = (0..m * n_in)
+            .map(|i| ((i * 53 % 211) as f32 - 105.0) / 128.0)
+            .collect();
+        let mut full = vec![0f32; m * n_out];
+        // SAFETY: 形状は check_gemm_args と同じ条件を満たし、AVX2/FMA は
+        // fused_ready が確認している。
+        unsafe { gemm_iq3s_avx2(&blocks, n_in, 0, n_out, &xs, m, full.as_mut_ptr(), n_out) };
+        let (a, b) = (137usize, 381usize);
+        let mut part = vec![0f32; m * (b - a)];
+        // SAFETY: 同上。
+        unsafe { gemm_iq3s_avx2(&blocks, n_in, a, b, &xs, m, part.as_mut_ptr(), b - a) };
+        assert!(full.iter().any(|v| *v != 0.0), "出力が全 0");
+        for t in 0..m {
+            for r in a..b {
+                assert_eq!(
+                    full[t * n_out + r].to_bits(),
+                    part[t * (b - a) + (r - a)].to_bits(),
+                    "t={t} r={r}: 行分割で値が変わった"
+                );
+            }
+        }
+        set_iq3s_fast_for_test(None);
+    }
+}
 
 /// task 92: BF16 融合 GEMV カーネル (`expert_gemv_bf16*`) の検証と発火確認。
 ///
