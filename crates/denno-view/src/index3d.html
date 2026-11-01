@@ -66,9 +66,9 @@
        <span class="neu">neurons lit <b id="nlit">0</b></span> · fps <b id="fps">--</b></div>
   <div><span class="vram">VRAM <b id="n_vram">0</b></span> / <span class="dim">cap <b id="cap">10500</b></span> ·
        <span class="ram">RAM <b id="n_ram">0</b></span> ·
-       <span class="ssd">SSD <b id="n_ssd">0</b></span></div>
+       <span class="ssd">DISK <b id="n_ssd">0</b></span></div>
   <div id="live" class="dim">telemetry: <b id="ws_state">--</b> · prefill <b id="pf">--</b> · decode <b id="dc">--</b></div>
-  <div id="tier" class="dim">vram <b id="t_vram">--</b> / <b id="t_total">--</b> MB · ram experts <b id="t_ram">--</b> · ssd reads <b id="t_ssd">--</b></div>
+  <div id="tier" class="dim">vram <b id="t_vram">--</b> / <b id="t_total">--</b> MB · ram experts <b id="t_ram">--</b> · disk reads <b id="t_ssd">--</b></div>
   <div id="pleline" class="dim">PLE (layer 2 only): <b id="ple_v">--</b> <span class="dim">ngram 3 x 8 heads = 16 tables</span></div>
   <div id="tokline" class="dim">tokens: prompt <b id="tok_total">--</b> · fed <b id="tok_fed">--</b> ·
        prefix cache reuse <b id="tok_reuse">0</b> · kv <b id="kv_len">0</b>/<b id="kv_max">--</b> · pos <b id="kv_pos">--</b></div>
@@ -79,7 +79,7 @@
 <div id="legend" class="panel">
   <div><span class="neu">neuron</span> 2560/layer · <span class="qsa">QSA</span> 12 · <span class="gdn">GDN</span> 36</div>
   <div><span class="router">router</span> · <span class="shex">shared</span> · <span class="gr">GR r/w</span> · <span class="ple">PLE</span>(L2)</div>
-  <div>expert: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">SSD</span> · <span class="sel">selected (top-10)</span></div>
+  <div>expert: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">DISK</span> · <span class="sel">selected (top-10)</span></div>
   <div>drag: rotate · wheel: zoom · space: pause · [c] chat</div>
 </div>
 <div id="chat">
@@ -234,9 +234,9 @@ function arrow(x0, y0, z0, x1, y1, z1, hex, op) {
   l.frustumCulled = false; scene.add(l); return l;
 }
 
-label('VRAM', '#00eaff', 4.2, -14.2, TIER_Y[TIER.VRAM], -3.0);
-label('RAM', '#ffb020', 4.2, -14.2, TIER_Y[TIER.RAM], -3.0);
-label('SSD', '#ff3b6b', 4.2, -14.2, TIER_Y[TIER.SSD], -3.0);
+label('VRAM', '#00eaff', 4.2, 7.4, TIER_Y[TIER.VRAM], -3.0);
+label('RAM', '#ffb020', 4.2, 7.4, TIER_Y[TIER.RAM], -3.0);
+label('DISK', '#ff3b6b', 4.2, 7.4, TIER_Y[TIER.SSD], -3.0);
 
 // ===== 1) ニューロン壁 (層あたり 2560 個の小箱、実 index と 1:1) ==========
 // LayerAct の idx は「その層の残差ストリームの index」(0..2559)。expert ではない。
@@ -546,7 +546,7 @@ arrow(KV_X0 - 0.4, KV_Y, KV_Z, -12.4, 1.0, zOf(0) + 0.6, 0x00eaff, 0.35);
 label('KV cache (slot 0) / 48 layers', '#00eaff', 5.0, KV_X0 + 7.6, KV_Y + 0.72, KV_Z);
 label('green: prefix cache (前ターンから再利用) / amber: 今回書いた分 / 白: decode の読み出し位置', '#4d6470', 11.0, KV_X0 + 8.0, KV_Y - 0.66, KV_Z);
 
-const kv = { total: 0, fed: 0, reuse: 0, len: 0, pos: 0, busy: false, maxctx: 65536, sweep: 0, dirty: true };
+const kv = { total: 0, fed: 0, reuse: 0, len: 0, pos: 0, busy: false, maxctx: 65536, dirty: true };
 
 
 function paintKv() {
@@ -557,7 +557,9 @@ function paintKv() {
   const per = den / KVN;
   const nFill = Math.min(KVN, Math.ceil(kv.len / per));
   const nPre = Math.min(nFill, Math.floor(kv.reuse / per));
-  const head = Math.min(nFill - 1, Math.floor(kv.sweep * nFill));
+  // 白セルは実の読み出し位置 (kv.pos, Token フレーム) のみ。旧実装の左から右への
+  // 常時スイープ (kv.sweep) は実動作と無関係なので削除した。
+  const head = nFill > 0 ? Math.min(nFill - 1, Math.max(0, Math.floor(kv.pos / per))) : -1;
   for (let i = 0; i < KVN; i++) {
     let r = 0.04, g = 0.08, b = 0.11;
     if (i < nPre) { r = 0.06; g = 0.62; b = 0.36; }
@@ -1005,9 +1007,8 @@ function step(dt, doRender) {
   }
   if (tokAny) paintTokens();
 
-  // KV の読み出し掃引 (prefill / decode のどちらでも回す)
-  kv.sweep = (kv.sweep + dt * (kv.busy ? 0.85 : 0.25)) % 1;
-  if (kv.len > 0) { kv.dirty = true; }
+  // KV の白セルは kv.pos (実の読み出し位置) だけで更新する。
+  // 旧実装の常時スイープ (kv.sweep) は実動作と無関係なので削除した。
   if (kv.dirty) paintKv();
   if (!kv.busy && inpPulse < 0.02 && kv.len === 0) inpPulse *= 0.99;
 
@@ -1088,7 +1089,7 @@ const hudEl = {
   ssd: document.getElementById('t_ssd'), mode: document.getElementById('mode'),
   cur: document.getElementById('cur'), curkind: document.getElementById('curkind')
 };
-const liveState = { tokens: 0, lastStepMs: 0, prefillMs: 0, frames: 0 };
+const liveState = { tokens: 0, lastStepMs: 0, prefillMs: 0, frames: 0, pfTps: 0, dcTps: 0, pfMax: 0, dcMax: 0 };
 let replayOn = false;
 function noteLiveMode() {
   if (fly.on) return;   // フライト中の案内を消さない
@@ -1203,7 +1204,10 @@ function handleFrame(f) {
       break;
     case 'Prefill': {
       liveState.prefillMs = f.ns / 1e6 / Math.max(1, f.prompt_tokens || 1);
-      hudEl.pf.textContent = liveState.prefillMs.toFixed(1) + ' ms/tok';
+      liveState.pfTps = 1000 / Math.max(liveState.prefillMs, 1e-9);
+      liveState.pfMax = Math.max(liveState.pfMax, liveState.pfTps);
+      hudEl.pf.textContent = liveState.prefillMs.toFixed(1) + ' ms/tok · ' +
+        liveState.pfTps.toFixed(0) + ' tok/s (max ' + liveState.pfMax.toFixed(0) + ')';
       kv.fed = f.prompt_tokens;
       kv.reuse = Math.max(0, kv.total - kv.fed);
       kv.len = kv.total;
@@ -1231,9 +1235,10 @@ function handleFrame(f) {
       break;
     case 'Step':
       liveState.lastStepMs = f.ns / 1e6;
-      hudEl.dc.textContent = liveState.lastStepMs.toFixed(0) + ' ms/tok';
-      break;
-    case 'Token':
+      liveState.dcTps = 1000 / Math.max(liveState.lastStepMs, 1e-9);
+      liveState.dcMax = Math.max(liveState.dcMax, liveState.dcTps);
+      hudEl.dc.textContent = liveState.lastStepMs.toFixed(0) + ' ms/tok · ' +
+        liveState.dcTps.toFixed(1) + ' tok/s (max ' + liveState.dcMax.toFixed(1) + ')';
       liveState.tokens++;
       break;
     case 'LayerAct':
