@@ -17,7 +17,8 @@
   #hud b { font-weight:600; }
   #hud .dim, #legend .dim { color:var(--dim); }
   .vram { color:var(--vram); } .ram { color:var(--ram); } .ssd { color:var(--ssd); }
-  .sel { color:#ffe14d; }
+  .sel { color:#ff3b30; }
+  .warm { color:#ffa020; }
   .qsa { color:var(--qsa); } .gdn { color:var(--gdn); } .router { color:var(--router); }
   .shex { color:var(--shex); } .ple { color:var(--ple); } .gr { color:var(--gr); }
   .neu { color:var(--neu); }
@@ -79,7 +80,7 @@
 <div id="legend" class="panel">
   <div><span class="neu">neuron</span> 2560/layer · <span class="qsa">QSA</span> 12 · <span class="gdn">GDN</span> 36</div>
   <div><span class="router">router</span> · <span class="shex">shared</span> · <span class="gr">GR r/w</span> · <span class="ple">PLE</span>(L2)</div>
-  <div>expert: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">DISK</span> · <span class="sel">selected (top-10)</span></div>
+  <div>expert: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">DISK</span> · <span class="sel">selected (top-10)</span> · <span class="warm">選択履歴 黄→橙</span></div>
   <div>rank rail (router 上): 上 = rank 1 · 大きさ/明るさ = 重み · 色 = expert の居場所の段</div>
   <div>heat: 選ばれた回数が多い expert ほど濃く光る (冷えるのに約 40 秒)</div>
   <div>drag: rotate · wheel: zoom · space: pause · [c] chat</div>
@@ -158,7 +159,9 @@ const COL = {
   qsa: new THREE.Color('#b46bff'), gdn: new THREE.Color('#00d9a0'),
   router: new THREE.Color('#ffe14d'), shex: new THREE.Color('#ff2bd6'),
   gr: new THREE.Color('#59b6ff'), ple: new THREE.Color('#7f8bff'),
-  sel: new THREE.Color('#ffe14d'),
+  sel: new THREE.Color('#ff3b30'),              // 今ステップの選択 (赤)
+  warm1: new THREE.Color('#ffe14d'),            // 選択直後 (黄)
+  warm2: new THREE.Color('#ff8c00'),            // 冷えた選択履歴 (オレンジ)
   neuBase: new THREE.Color('#1b2f3a'), neuHot: new THREE.Color('#7ff0ff')
 };
 
@@ -982,19 +985,24 @@ function updateLayerColors(il, dt) {
     const base = tier === TIER.VRAM ? 0.45 : (tier === TIER.RAM ? 0.26 : 0.12);
     let g = s.act[k];
     if (sel.has(k)) {
-      // 選択された expert は専用色 (黄) で塗る。段の色を消して一目で分かるように。
+      // 今ステップで選ばれた expert は赤で塗る (ルータの光線の先が赤で結ばれる)。
       const p = 0.85 + 0.15 * Math.min(1, g);
       col[k * 3] = COL.sel.r * p; col[k * 3 + 1] = COL.sel.g * p; col[k * 3 + 2] = COL.sel.b * p;
       continue;
     }
-    const v = base + g * 1.15 + Math.sqrt(s.heat[k]) * 0.75;   // sqrt: 1 回の選択でも見えるように
-    col[k * 3] = c.r * v; col[k * 3 + 1] = c.g * v; col[k * 3 + 2] = c.b * v;
-    if (g > 0.82 || s.heat[k] > 0.6) {
-      const w = Math.min(1, Math.max((g - 0.82) * 1.3, (s.heat[k] - 0.6) * 1.4));
-      col[k * 3] += (1 - col[k * 3]) * w;
-      col[k * 3 + 1] += (1 - col[k * 3 + 1]) * w;
-      col[k * 3 + 2] += (1 - col[k * 3 + 2]) * w;
+    if (s.heat[k] > 0.02) {
+      // 選択履歴のある expert は黄 -> オレンジのグラデーション。
+      // 熱が高い (選択が新しい / 頻繁) ほど黄、冷えるほどオレンジへ寄る。
+      const h = Math.min(1, s.heat[k]);
+      const mix = 1 - h;   // heat 1 = 黄, heat 0 = オレンジ
+      const v = 0.62 + g * 0.55;   // 段の明るさに依らず見えるように
+      col[k * 3]     = (COL.warm1.r + (COL.warm2.r - COL.warm1.r) * mix) * v;
+      col[k * 3 + 1] = (COL.warm1.g + (COL.warm2.g - COL.warm1.g) * mix) * v;
+      col[k * 3 + 2] = (COL.warm1.b + (COL.warm2.b - COL.warm1.b) * mix) * v;
+      continue;
     }
+    const v = base + g * 1.15;   // sqrt(heat) 項は上のグラデーションに置き換え
+    col[k * 3] = c.r * v; col[k * 3 + 1] = c.g * v; col[k * 3 + 2] = c.b * v;
   }
   s.inst.instanceColor.needsUpdate = true;
 
