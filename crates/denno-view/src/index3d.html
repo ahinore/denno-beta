@@ -81,6 +81,7 @@
   <div><span class="router">router</span> · <span class="shex">shared</span> · <span class="gr">GR r/w</span> · <span class="ple">PLE</span>(L2)</div>
   <div>expert: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">DISK</span> · <span class="sel">selected (top-10)</span></div>
   <div>rank rail (router 上): 上 = rank 1 · 大きさ/明るさ = 重み · 色 = expert の居場所の段</div>
+  <div>heat: 選ばれた回数が多い expert ほど濃く光る (冷えるのに約 40 秒)</div>
   <div>drag: rotate · wheel: zoom · space: pause · [c] chat</div>
 </div>
 <div id="chat">
@@ -359,6 +360,7 @@ for (let il = 0; il < LAYERS; il++) {
   slabs.push({ il, inst, y3, xz, tier: new Uint8Array(EXPERTS), tierPrev: new Uint8Array(EXPERTS),
                anim: new Float32Array(EXPERTS), fromY: new Float32Array(EXPERTS).fill(TIER_Y[0]),
                act: new Float32Array(EXPERTS),
+               heat: new Float32Array(EXPERTS),
                used: new Float32Array(EXPERTS), dirty: new Uint8Array(EXPERTS), route: [] });
 }
 
@@ -927,6 +929,7 @@ function promote(il, ids) {
     lru.push(kk);
     if (s.tier[k] !== TIER.VRAM) { s.tier[k] = TIER.VRAM; s.dirty[k] = 1; }
     s.act[k] = Math.max(s.act[k], 0.5);   // 移送中は光らせる
+    s.heat[k] = Math.min(1, s.heat[k] + 0.10);   // 選ばれるたびに熱が溜まる (ヒートマップ)
   }
 }
 
@@ -965,7 +968,9 @@ function routeLayer(il, token) {
 function updateLayerColors(il, dt) {
   const s = slabs[il], col = s.inst.instanceColor.array;
   const sel = new Set(s.route);
+  const cool = dt > 0 ? Math.max(0, 1 - dt / 40) : 1;   // 熱は半減期約 28 秒で冷える
   for (let k = 0; k < EXPERTS; k++) {
+    s.heat[k] *= cool;
     const tier = s.tier[k];
     const c = TIER_COL[tier];
     const base = tier === TIER.VRAM ? 0.45 : (tier === TIER.RAM ? 0.26 : 0.12);
@@ -976,10 +981,10 @@ function updateLayerColors(il, dt) {
       col[k * 3] = COL.sel.r * p; col[k * 3 + 1] = COL.sel.g * p; col[k * 3 + 2] = COL.sel.b * p;
       continue;
     }
-    const v = base + g * 1.15;
+    const v = base + g * 1.15 + s.heat[k] * 0.8;   // heat: 選択頻度のヒートマップ (濃くなる)
     col[k * 3] = c.r * v; col[k * 3 + 1] = c.g * v; col[k * 3 + 2] = c.b * v;
-    if (g > 0.82) {
-      const w = Math.min(1, (g - 0.82) * 1.3);
+    if (g > 0.82 || s.heat[k] > 0.85) {
+      const w = Math.min(1, Math.max((g - 0.82) * 1.3, (s.heat[k] - 0.85) * 2.2));
       col[k * 3] += (1 - col[k * 3]) * w;
       col[k * 3 + 1] += (1 - col[k * 3 + 1]) * w;
       col[k * 3 + 2] += (1 - col[k * 3 + 2]) * w;
