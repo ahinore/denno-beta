@@ -80,6 +80,7 @@
   <div><span class="neu">neuron</span> 2560/layer · <span class="qsa">QSA</span> 12 · <span class="gdn">GDN</span> 36</div>
   <div><span class="router">router</span> · <span class="shex">shared</span> · <span class="gr">GR r/w</span> · <span class="ple">PLE</span>(L2)</div>
   <div>expert: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">DISK</span> · <span class="sel">selected (top-10)</span></div>
+  <div>rank rail (router 上): 上 = rank 1 · 大きさ/明るさ = 重み · 色 = expert の居場所の段</div>
   <div>drag: rotate · wheel: zoom · space: pause · [c] chat</div>
 </div>
 <div id="chat">
@@ -397,6 +398,80 @@ for (let il = 0; il < LAYERS; il++) {
   R.gate.inst.setColorAt(il * 2 + 1, COL.gr.clone().multiplyScalar(0.12));
 }
 for (const k of Object.keys(R)) { R[k].inst.instanceMatrix.needsUpdate = true; R[k].inst.instanceColor.needsUpdate = true; }
+
+// ===== 4b) ランキング レール: 各層のルータが選んだ top-10 を上から順に ======
+// rank 1 が最上段。大きさと明るさは router 重みの層内相対値、色はその expert の
+// 居場所の段色 (VRAM=シアン / RAM=オレンジ / DISK=赤)。テキストは層番号 + top-4 index。
+const RANK_N = 10;
+const railInst = new THREE.InstancedMesh(
+  new THREE.BoxGeometry(0.13, 0.13, 0.13),
+  new THREE.MeshBasicMaterial({ color: 0xffffff, fog: true }), LAYERS * RANK_N);
+railInst.frustumCulled = false;
+railInst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+scene.add(railInst);
+const railTxt = [];
+const railAge = new Float32Array(LAYERS).fill(-1);   // -1 = 非表示, 秒数でフェードアウト
+const railC = new THREE.Color();
+for (let il = 0; il < LAYERS; il++) {
+  const z = zOf(il);
+  for (let r = 0; r < RANK_N; r++) {
+    m4.makeTranslation(X.router, 1.55 + (RANK_N - 1 - r) * 0.30, z);
+    railInst.setMatrixAt(il * RANK_N + r, m4);
+    railInst.setColorAt(il * RANK_N + r, COL.neuBase);
+  }
+  const s = sprite('L' + String(il).padStart(2, '0'), '#7f97a4', 1.35);
+  s.position.set(X.router, 4.95, z);
+  s.visible = false;   // ルーティング直後だけフェード表示 (48 枚重なると読めない)
+  scene.add(s); railTxt.push(s);
+}
+railInst.instanceMatrix.needsUpdate = true;
+railInst.instanceColor.needsUpdate = true;
+
+function setSpriteText(sp, txt) {
+  const t = sp.material.map, cv = t.image;
+  let g = cv.getContext('2d');
+  g.font = 'bold 34px ui-monospace, monospace';
+  const tw = Math.ceil(g.measureText(txt).width) + 16;
+  if (tw > cv.width) { cv.width = tw; g = cv.getContext('2d'); g.font = 'bold 34px ui-monospace, monospace'; }
+  else g.clearRect(0, 0, cv.width, cv.height);
+  g.fillStyle = '#7f97a4'; g.textAlign = 'left'; g.textBaseline = 'middle';
+  g.fillText(txt, 8, 34);
+  t.needsUpdate = true;
+  sp.scale.set(1.35, 1.35 * cv.height / cv.width, 1);
+}
+
+function setRail(il, experts, weights) {
+  const s = slabs[il]; if (!s) return;
+  let topW = 0;
+  for (let r = 0; r < experts.length && r < RANK_N; r++) topW = Math.max(topW, weights[r] || 0);
+  if (topW <= 0) topW = 1;
+  let txt = 'L' + String(il).padStart(2, '0');
+  for (let r = 0; r < RANK_N; r++) {
+    const i = il * RANK_N + r;
+    const y = 1.55 + (RANK_N - 1 - r) * 0.30;
+    const k = r < experts.length ? (experts[r] | 0) : -1;
+    if (k < 0 || k >= EXPERTS) {
+      m4.makeScale(0.001, 0.001, 0.001); m4.setPosition(X.router, y, zOf(il));
+      railInst.setMatrixAt(i, m4); railInst.setColorAt(i, COL.neuBase);
+      continue;
+    }
+    const wgt = (weights && weights[r]) || 0;
+    const rel = Math.min(1, wgt / topW);
+    const sc = (1.0 - r * 0.055) * (0.7 + 0.5 * rel);
+    m4.makeScale(sc, sc, sc); m4.setPosition(X.router, y, zOf(il));
+    railInst.setMatrixAt(i, m4);
+    const c = TIER_COL[s.tier[k]];   // 居場所の段色
+    const br = 0.45 + 0.85 * rel;
+    railC.setRGB(c.r * br, c.g * br, c.b * br);
+    railInst.setColorAt(i, railC);
+    if (r < 3) txt += ' ' + k;
+  }
+  railInst.instanceMatrix.needsUpdate = true;
+  railInst.instanceColor.needsUpdate = true;
+  // テキストは層番号 + top-3。ルーティング直後の 0.9 秒だけフェード表示。
+  setSpriteText(railTxt[il], txt);
+  railAge[il] = 0; railTxt[il].visible = true;
+}
 
 // ===== 5) 入出力 (Vocabulary Embedding / N-gram Embedding Layer) ==========
 const pleGroup = new THREE.Group();
@@ -863,8 +938,14 @@ function routeLayer(il, token) {
   cand.sort((a, b) => hash(b + 1, token) - hash(a + 1, token));
   const sel = cand.slice(0, TOPK);
   s.route = sel;
-  for (let i = 0; i < sel.length; i++) s.act[sel[i]] = Math.max(s.act[sel[i]], 0.6 + 0.4 * hash(i, token));
+  const ws = [];
+  for (let i = 0; i < sel.length; i++) {
+    const w = 0.95 - i * 0.058;
+    ws.push(w);
+    s.act[sel[i]] = Math.max(s.act[sel[i]], 0.6 + 0.4 * hash(i, token));
+  }
   promote(il, sel);
+  setRail(il, sel, ws);   // デモでもランキング レールを更新 (sel は重み降順)
   while (lru.length > VRAM_CAP) {
     const kk = lru.shift();
     const l2 = (kk / EXPERTS) | 0, k2 = kk % EXPERTS;
@@ -1034,6 +1115,14 @@ function step(dt, doRender) {
     inpGeo.attributes.position.needsUpdate = true; inpGeo.attributes.color.needsUpdate = true;
   }
   updateTransfers(dt);
+  // ランキング レールのテキストはルーティング直後だけ見せる (フェードアウト)
+  for (let il = 0; il < LAYERS; il++) {
+    if (railAge[il] < 0) continue;
+    railAge[il] += dt;
+    const f = 1 - railAge[il] / 0.9;
+    if (f <= 0) { railAge[il] = -1; railTxt[il].visible = false; continue; }
+    railTxt[il].material.opacity = 0.92 * f;
+  }
 
   // トークンが作られていく様子
   if (tokRamp.t < 1) {
@@ -1150,7 +1239,7 @@ window.onRouting = function (layer, experts, weights) {
     sel.push(k);
     s.act[k] = Math.max(s.act[k], Math.min(1, (weights && weights[i]) || 0.5));
   }
-  if (sel.length) { s.route = sel; promote(layer, sel); }
+  if (sel.length) { s.route = sel; promote(layer, sel); setRail(layer, experts, weights); }
   noteLiveMode();
 };
 
