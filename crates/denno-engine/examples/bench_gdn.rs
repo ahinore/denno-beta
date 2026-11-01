@@ -1,7 +1,8 @@
 //! GDN 層 1 本の単体ベンチ (27B 実形状)。
 //!
-//! モデルを起動せず、GDN スキャン 1 回のコストを測る。形状は 27B の実値
-//! (nk 16 / nv 48 / dk dv 128 / conv 4 / hidden 5120)。n=1 が decode、
+//! モデルを起動せず、GDN スキャン 1 回のコストを測る。形状は
+//! [`GdnParams::qwen4exp`] の実値 (GGUF メタデータ確定値: n_embd 2560 /
+//! nk 16 / nv 48 / dk dv 128 / conv 4)。n=1 が decode、
 //! n=300 が prefill の 1 チャンクに相当する。
 //!
 //! 使い方:
@@ -50,15 +51,11 @@ fn main() {
     let iters = arg_u(&args, "--iters", 30);
     std::env::set_var("DENNO_CUDA", "1");
 
-    let p = GdnParams {
-        n_embd: 5120,
-        n_k_heads: 16,
-        n_v_heads: 48,
-        head_k_dim: 128,
-        head_v_dim: 128,
-        d_conv: 4,
-        eps: 1e-6,
-    };
+    // 実値は GdnParams::qwen4exp に一本化する (n_embd 5120 と書いていたのは誤り。
+    // 正は 2560 = attn_qkv.weight の ne1、GGUF メタデータ flashnext_meta.txt 確定値)。
+    // n_embd は core 経路 (qkv/v スライス) と状態サイズに使われないので過去の
+    // 計測値には影響しない。
+    let p = GdnParams::qwen4exp();
     let conv_dim = p.conv_dim();
     let vd = p.value_dim();
     let (nv, dk, dv, dc) = (p.n_v_heads, p.head_k_dim, p.head_v_dim, p.d_conv);
