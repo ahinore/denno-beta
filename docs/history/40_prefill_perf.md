@@ -75,6 +75,7 @@ decode との違いは行列の行数 m がトークン数になること。
 | P50 | 2026-10-24 | `e841db48` | tail を分解し att の H2D は既に pinned と示す |
 | P51 | 2026-10-24 | `ec7d4f31` | GDN beta/alpha のホスト投影を AVX2 16 レーン化 |
 | P52 | 2026-10-24 | `b6e3fa27` | q4 GEMM の per-thread タイルを 8x8 に広げる |
+| task 99 | 2026-11-01 | `fab52af8` | IQ2_S / IQ3_XXS のバッチ融合 GEMM を opt-in で足す (既定 off) |
 
 ## 天井(理論値)と実測の差
 
@@ -1090,8 +1091,38 @@ grid 式 (`m.div_ceil(64)`, `n.div_ceil(128)`) と `Q4_GM=64` / `Q4_GN=128` / sm
 変更前と P52 で同一 (`e36644365c6746b5ee1a06720d5ad4a1`)、`GPU_VERIFY.sh` のアンカー 3 本も 3/3 MATCH
 なので、数値経路は動いていない。
 
-**次に効いたこと** — この巻の最後のエントリ。残っているのは `full_oproj` 15.9 / `full_qk` 15.7 TFLOP/s
+**次に効いたこと** — P52 の時点でこの巻の最後のエントリ。残っているのは `full_oproj` 15.9 / `full_qk` 15.7 TFLOP/s
 (他の位相は 30 前後) の 2.55 s の塊で、天井まで −1.3 s の余地がある。タイルではなく別の理由 (転置・帯域) を疑う段階。
+
+### task 99: IQ2_S / IQ3_XXS のバッチ融合 GEMM を opt-in で足す (2026-11-01, `fab52af8`)
+
+Swift-1.5 形 expert gate/up の残り 2 型。P80 以降、この 2 型の prefill バッチは `gemm_iq` 系 (v1 / v2 / z) に
+**既に入っていて**スカラーには落ちていない。task 97 (IQ4_XS / IQ3_S) と同じ「ブロックごとに `q8_hadd`」の
+累計へ置き替えた専用カーネル (`gemm_iq2s_avx2` / `gemm_iq3xxs_avx2`) を足して z 経路と比べた結果、
+**既定 off の opt-in** として入れた (`DENNO_IQ2S_FAST=1` / `DENNO_IQ3XXS_FAST=1` で発火)。
+
+- 変えたもの: `fab52af8` / `crates/denno-engine/src/model/moe_expert.rs` (+ `exp_kprof.rs`)。task 97 の
+  P97 形 (k チャンク → 行 → ブロック → トークン、ブロックごと `q8_hadd`) で 2 カーネルを追加し、
+  `gemm_rows_disp` に IQ2S / IQ3Xxs 専用分岐を置く。dequant は `iq2s_subblock_w` / `iq3xxs_subblock_w`
+  (格子 index は全バイトが有効なのでゼロ拡張で kquant 参照と `to_bits()` 一致)。exp_kprof に
+  `K_IQ2XS=15` / `K_IQ3XXS=16` を追加 (NKER 17、KER_FUSED 11)。あわせて task 98 が入れた
+  `K_IQ4NL_M1` が `K_IQ3S=13` と衝突して 13 になっていたのを 14 へ修正 (IQ4_NL のカーネルと分岐は
+  触っていない。task 98 のテストは常数参照なので影響なし)。テスト 4 本 (accuracy + f64 真値契約 /
+  one-hot dequant の to_bits 一致 / 行分割ビット一致 / 発火・退避) とマイクロベンチ
+  `bench_iq2s_iq3xxs_gemm99` (--ignored) を足した。
+- 実測 (bench99、このコンテナ、1T、rep3 min): 新カーネル vs classic スカラー バッチは **6.55-8.73x**。
+  しかし現行の gemv_iq z (AVX-512) 経路比では m=512 で **0.33-0.41x** (z が 2.4-3.0 倍速い)。
+  m=1 は 0.94-1.29x でほぼ同等。
+- なぜ既定 off か: 本番 (Zen4) は P80 以降この 2 型を z (AVX-512) で融合処理していて、新カーネルは
+  それに届かない。既定 on は prefill の悪化になる。既定では新経路へ分岐しないので、prefill の値も速度も
+  1 ビットも変わらない (戻り先の v1 / v2 / z はどれも同じ値を出す)。発火確認テストは両側を強制して、
+  FAST=1 で専用カーネルに乗ることと、FAST=0 で従来 gemv_iq 経路に落ちて v1 とビット一致することを見る。
+- 契約: dequant は kquant 参照と `to_bits()` 一致 (one-hot、全要素)。バッチ融合は classic スカラーと
+  R1 相対 1e-6 程度の差 (ブロックごとに hsum するため v1 系とは非ビット一致)。f64 真値誤差は
+  classic 以下。行分割でビット不変。
+- テスト: `--features cuda --lib` 698 passed / 0 failed (--test-threads=1)、`kernel_invariants`
+  24 passed / 0 failed。実機 (Zen4) での A/B は未実施。
+- 記録: `fab52af8` (コード)。docs はこのエントリの commit。
 
 ---
 
