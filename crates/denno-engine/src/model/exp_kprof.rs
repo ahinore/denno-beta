@@ -350,7 +350,7 @@ pub const K_Q2_0: usize = 12;
 /// カーネル実行先: IQ3_S バッチ融合 (task 97)。
 pub const K_IQ3S: usize = 13;
 /// カーネル実行先: IQ4_NL 融合 m=1 (task 98)。
-pub const K_IQ4NL_M1: usize = 13;
+pub const K_IQ4NL_M1: usize = 14;
 /// カーネル実行先の種別数。
 pub const NKER: usize = 15;
 /// カーネル実行先の名前 (レポート用)。
