@@ -1,7 +1,8 @@
 //! GDN 層 1 本の単体ベンチ (27B 実形状)。
 //!
-//! モデルを起動せず、GDN スキャン 1 回のコストを測る。形状は 27B の実値
-//! (nk 16 / nv 48 / dk dv 128 / conv 4 / hidden 5120)。n=1 が decode、
+//! モデルを起動せず、GDN スキャン 1 回のコストを測る。形状は
+//! [`GdnParams::qwen4exp`] の実値 (GGUF メタデータ確定値: n_embd 2560 /
+//! nk 16 / nv 48 / dk dv 128 / conv 4)。n=1 が decode、
 //! n=300 が prefill の 1 チャンクに相当する。
 //!
 //! 使い方:
@@ -12,7 +13,7 @@
 
 use std::time::Instant;
 
-use denno_engine::gdn::{forward_token_core, GdnCore, GdnParams, GdnState};
+use denno_engine::gdn::{forward_token_core, forward_token_core_gate, GateKind, GdnCore, GdnParams, GdnState};
 
 fn arg_u(args: &[String], name: &str, dflt: usize) -> usize {
     let mut it = args.iter();
@@ -50,15 +51,11 @@ fn main() {
     let iters = arg_u(&args, "--iters", 30);
     std::env::set_var("DENNO_CUDA", "1");
 
-    let p = GdnParams {
-        n_embd: 5120,
-        n_k_heads: 16,
-        n_v_heads: 48,
-        head_k_dim: 128,
-        head_v_dim: 128,
-        d_conv: 4,
-        eps: 1e-6,
-    };
+    // 実値は GdnParams::qwen4exp に一本化する (n_embd 5120 と書いていたのは誤り。
+    // 正は 2560 = attn_qkv.weight の ne1、GGUF メタデータ flashnext_meta.txt 確定値)。
+    // n_embd は core 経路 (qkv/v スライス) と状態サイズに使われないので過去の
+    // 計測値には影響しない。
+    let p = GdnParams::qwen4exp();
     let conv_dim = p.conv_dim();
     let vd = p.value_dim();
     let (nv, dk, dv, dc) = (p.n_v_heads, p.head_k_dim, p.head_v_dim, p.d_conv);
@@ -114,6 +111,47 @@ fn main() {
         let first_s = t.elapsed().as_secs_f64();
         let Some(y0) = first else {
             println!("n={n:>3}: GPU path not taken (CPU fallback)");
+            // P105: GPU の無い dev コンテナでは CPU の GDN コア 1 呼び出しの
+            // コストだけ測る (n=1 = decode の 1 ステップ・1 層ぶん)。
+            // 状態は毎回新規 (decode 1 ステップ = 状態を 1 歩進めるのと同じ量)。
+            if n == 1 {
+                let core = GdnCore {
+                    conv1d: &wconv,
+                    ssm_a: &ssm_a,
+                    ssm_dt: &wdt,
+                    ssm_norm: &wnorm,
+                };
+                let qk = &qkv[..p.qkv_dim()];
+                let mut best = f64::MAX;
+                let mut ref_first = None;
+                for _ in 0..3 {
+                    let mut st = GdnState::new(&p);
+                    let y = forward_token_core_gate(
+                        &p, &core, qk, &z, &beta, &alpha, &mut st, GateKind::Sigmoid,
+                    );
+                    if ref_first.is_none() {
+                        ref_first = Some(y);
+                    }
+                    let t = Instant::now();
+                    for _ in 0..iters {
+                        let mut st = GdnState::new(&p);
+                        let _ = forward_token_core_gate(
+                            &p, &core, qk, &z, &beta, &alpha, &mut st, GateKind::Sigmoid,
+                        );
+                    }
+                    let per = t.elapsed().as_secs_f64() / iters as f64;
+                    best = best.min(per);
+                }
+                println!(
+                    "      CPU n=1: {:.3} ms/call  x{layers} layers = {:.1} ms/token",
+                    best * 1e3,
+                    best * 1e3 * layers as f64
+                );
+                // P105: GDN コアの 4 区間内訳 (conv / l2 / scan / rms)。
+                // DENNO_GDN_KPROF=1 が立っていれば report() が 1 行出す。
+                denno_engine::gdn::kprof::report();
+                let _ = ref_first;
+            }
             continue;
         };
 

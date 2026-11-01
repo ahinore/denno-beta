@@ -12,11 +12,12 @@ use std::env;
 
 use denno_engine::kquant::{dequant_row, GgmlType};
 
-/// fixture が持つべきセクション数 (18 型 + K2 の TQ1_0 / IQ1_M + K3 の Q4_0_EDGE)。
-const N_SECTIONS: usize = 21;
+/// fixture が持つべきセクション数 (18 型 + K2 の TQ1_0 / IQ1_M + K3 の Q4_0_EDGE
+/// + P105 の Q2_0)。
+const N_SECTIONS: usize = 22;
 /// このテストが必ず通す型。fixture が古くて欠けていたら明示的に落とす。
 /// Q4_0 は 27B 本番が実際に serving している形式 (ggml type 2)。
-const REQUIRED: [&str; 4] = ["Q4_0", "Q4_0_EDGE", "TQ1_0", "IQ1_M"];
+const REQUIRED: [&str; 5] = ["Q4_0", "Q4_0_EDGE", "TQ1_0", "IQ1_M", "Q2_0"];
 const DEFAULT_FIXTURE: &str = "tests/data/dequant_ref.bin";
 
 fn type_from_name(name: &str) -> GgmlType {
@@ -43,6 +44,7 @@ fn type_from_name(name: &str) -> GgmlType {
         "IQ4_XS" => GgmlType::IQ4Xs,
         "IQ1_M" => GgmlType::Iq1M,
         "TQ1_0" => GgmlType::Tq1_0,
+        "Q2_0" => GgmlType::Q2_0,
         other => panic!("未知のセクション {other} (fixture とテストの型名がずれている)"),
     }
 }
@@ -423,12 +425,19 @@ fn degenerate_blocks_do_not_panic() {
     }
 }
 
-/// 未対応 ID は従来どおり None (TQ2_0 / NVFP4 / Q1_0 / Q2_0 も未実装)。
+/// 未対応 ID は従来どおり None (TQ2_0 / NVFP4 / Q1_0 など)。
+/// Q2_0 (id 42) は対応済み — `kquant_dequant_bitexact_vs_llama_cpp` が
+/// 参照実装とのビット一致を検証する。
 #[test]
 fn unsupported_ids_stay_none() {
     for id in [
-        4u32, 5, 9, 15, 24, 25, 26, 27, 28, 31, 32, 33, 35, 36, 37, 38, 40, 41, 42, 999,
+        4u32, 5, 9, 15, 24, 25, 26, 27, 28, 31, 32, 33, 35, 36, 37, 38, 40, 41, 999,
     ] {
         assert_eq!(GgmlType::from_id(id), None, "id {id} は未対応のはず");
     }
+    assert_eq!(
+        GgmlType::from_id(42),
+        Some(GgmlType::Q2_0),
+        "id 42 = Q2_0 は対応済み"
+    );
 }
