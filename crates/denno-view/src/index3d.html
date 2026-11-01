@@ -519,6 +519,44 @@ const inpFlow = new THREE.Points(inpGeo, new THREE.PointsMaterial({
 inpFlow.frustumCulled = false;
 scene.add(inpFlow);
 let inpPulse = 0;
+
+// 段間移動の光の粒。箱本体は「消えて -> 出る」フェードだが、移動自体は
+// 見えるように、旧段 -> 新段へ粒を飛ばす。
+const TRANS_N = 96;
+const trGeo = new THREE.BufferGeometry();
+const trPos = new Float32Array(TRANS_N * 3), trCol = new Float32Array(TRANS_N * 3);
+trGeo.setAttribute('position', new THREE.BufferAttribute(trPos, 3));
+trGeo.setAttribute('color', new THREE.BufferAttribute(trCol, 3));
+const trPts = new THREE.Points(trGeo, new THREE.PointsMaterial({
+  size: 0.7, map: dotTex, vertexColors: true, transparent: true,
+  blending: THREE.AdditiveBlending, depthWrite: false, fog: true }));
+trPts.frustumCulled = false;
+scene.add(trPts);
+const transfers = [];   // { x, z, y0, y1, t, r, g, b }
+function spawnTransfer(x, z, y0, y1, col) {
+  if (transfers.length >= TRANS_N) transfers.shift();
+  transfers.push({ x, z, y0, y1, t: 0, r: col.r, g: col.g, b: col.b });
+}
+function updateTransfers(dt) {
+  for (let i = transfers.length - 1; i >= 0; i--) {
+    const tr = transfers[i];
+    tr.t += dt / 0.55;
+    if (tr.t >= 1) { transfers.splice(i, 1); continue; }
+    const u = tr.t, w = 1 - u;
+    const bulge = Math.sin(Math.PI * u) * 0.45;   // 直線だと箱と重なるので外側へ膨らませる
+    trPos[i * 3] = tr.x + bulge * 0.35;
+    trPos[i * 3 + 1] = w * w * tr.y0 + 2 * w * u * ((tr.y0 + tr.y1) / 2 + 1.6) + u * u * tr.y1;
+    trPos[i * 3 + 2] = tr.z + bulge * 0.35;
+    const f = Math.sin(Math.PI * u) * 1.4;
+    trCol[i * 3] = tr.r * f; trCol[i * 3 + 1] = tr.g * f; trCol[i * 3 + 2] = tr.b * f;
+  }
+  for (let i = transfers.length; i < TRANS_N; i++) {
+    trPos[i * 3] = 0; trPos[i * 3 + 1] = -999; trPos[i * 3 + 2] = 0;
+    trCol[i * 3] = trCol[i * 3 + 1] = trCol[i * 3 + 2] = 0;
+  }
+  trGeo.attributes.position.needsUpdate = true;
+  trGeo.attributes.color.needsUpdate = true;
+}
 // 2 次ベジエ: トークン列の中央 -> embedding 箱 -> layer 1 の壁の下端
 const IP0 = [-4.6, TOK_Y + 0.35, TOK_Z], IP1 = [-8.8, -3.4, 5.4], IP2 = [-12.0, -NWY - 0.4, zOf(0) + 0.3];
 
@@ -873,7 +911,11 @@ function updateLayerColors(il, dt) {
   let moved = false;
   for (let k = 0; k < EXPERTS; k++) {
     if (s.tier[k] !== s.tierPrev[k]) {
-      if (s.anim[k] <= 0 || s.anim[k] >= 1) { s.fromY[k] = s.y3[k * 3 + 1]; s.anim[k] = 0.0001; }
+      if (s.anim[k] <= 0 || s.anim[k] >= 1) {
+        s.fromY[k] = s.y3[k * 3 + 1]; s.anim[k] = 0.0001;
+        // 移動の光の粒を旧段から新段へ飛ばす (箱はフェードのまま)
+        spawnTransfer(s.xz[k * 2], s.xz[k * 2 + 1], s.fromY[k], TIER_Y[s.tier[k]], TIER_COL[s.tier[k]]);
+      }
       s.tierPrev[k] = s.tier[k];
     }
     const ty = TIER_Y[s.tier[k]];
@@ -991,6 +1033,7 @@ function step(dt, doRender) {
     }
     inpGeo.attributes.position.needsUpdate = true; inpGeo.attributes.color.needsUpdate = true;
   }
+  updateTransfers(dt);
 
   // トークンが作られていく様子
   if (tokRamp.t < 1) {
