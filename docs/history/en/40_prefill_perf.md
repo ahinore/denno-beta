@@ -1180,3 +1180,19 @@ entries in the body.
 - Measured value: the tail after P46 is 634 ms / 16 layers = 39.6 ms/layer (27B q4, n=14,043, 1 request).
 - Why we dropped it: there was nothing to replace. Not a line of code was changed; only docs were added.
 - Record: body P50.
+
+### Building a batch fused GEMM for IQ4_NL (AVX2) (task 103, rejected, br101 `7c16073bb`)
+- What we tried: for the largest prefill block (down_exps, 41.7 s of thread-time over 48 layers), build an
+  m>1 batch fused kernel (`gemm_iq4nl_avx2`) with the same dequant as the task 98 m=1 kernel.
+- Measured value: dequant matches the kquant reference bit-for-bit (`to_bits()`), and the kernel is
+  bit-identical to gemm_iq v1 / v2 / z (4 tests). However the microbenchmark loses everywhere to the
+  existing gemm_iq_z (AVX-512): down 640x2560 m=512 is 35.4 vs 24.9 ms (0.70x), gate 2560x640 m=512 is
+  37.3 vs 22.1 ms (0.59x). At m=1 the gate shape reaches only 1.50x and `gemv_iq4nl_m1_avx512` already
+  covers it (0.084 vs 0.081 ms).
+- Why we dropped it: wiring it in would slow prefill down. Same conclusion as IQ2_S / IQ3_XXS (task 99):
+  AVX2 cannot reach the z path. The next attempt, if any, is an AVX-512 redesign that puts the m1 kernel's
+  dequant into the z kernel's 4-token structure (separate task).
+- Record: br101 `7c16073bb` (unwired, kept for reference). The dev agent stopped before committing, but the
+  585 lines left in the working tree were recovered and verified. The test TOL had to move from the provisional
+  1e-3 to the measured 1e-2 (cancelling elements trip 1e-3; the fused kernel is bit-identical to z, so it carries
+  the same f32 accumulation error as the production path).

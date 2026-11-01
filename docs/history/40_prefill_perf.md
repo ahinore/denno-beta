@@ -1189,3 +1189,28 @@ Swift-1.5 形 expert gate/up の残り 2 型。P80 以降、この 2 型の pref
 - 実測値: P46 後の tail は 634 ms / 16 層 = 39.6 ms/層 (27B q4・n=14,043・1 リクエスト)。
 - なぜ捨てたか: 置き換える対象が存在しなかった。コードは 1 行も変えず、docs だけを追加した。
 - 記録: 本文 P50。
+
+### IQ4_NL のバッチ融合 GEMM (AVX2) を作る (task 103・不採用、br101 `7c16073bb`)
+- 何を試したか: 本番 down_exps の prefill 主塊 (48 層で 41.7 s thread-time) に対し、task 98 の m=1 版と
+  同じ dequant で m>1 のバッチ融合カーネル (`gemm_iq4nl_avx2`) を作る。
+- 実測値: dequant は kquant 参照と `to_bits()` 一致、gemm_iq v1 / v2 / z ともビット一致 (テスト 4 本)。
+  しかしマイクロベンチで現行の gemm_iq_z (AVX-512) に全負け: down 640x2560 m=512 で 35.4 vs 24.9 ms
+  (0.70x)、gate 2560x640 m=512 で 37.3 vs 22.1 ms (0.59x)。m=1 は gate で 1.50x だが既に
+  `gemv_iq4nl_m1_avx512` がある (0.084 vs 0.081 ms)。
+- なぜ捨てたか: 配線すると prefill が悪化する。IQ2_S / IQ3_XXS (task 99) と同じ結論で、AVX2 では
+  z 経路に届かない。次に狙うなら m1 版の dequant を z の 4-token 構造へ載せる AVX-512 再設計 (別課題)。
+- 記録: br101 `7c16073bb` (未配線・参照保持)。dev エージェントが commit 前に停止したが、作業ツリーに
+  残っていた 585 行を回収して検証した。テストの TOL は暫定 1e-3 では打ち消し要素で落ちるため
+  実測 1e-2 に修正 (fused は z とビット一致なので z 経路と同じ f32 累積誤差を持つ)。
+
+### expert の VRAM 常駐を再試験する (2026-11-01・不採用、計測のみ)
+- 何を試したか: 重み枠 12,000 MB が dense 重みで埋まり expert が CPU 固定になっている状態に対し、
+  `DENNO_GPU_WEIGHT_MB=8000` + `DENNO_EXPERT_VRAM_MB=16000` + `DENNO_EXPERT_GPU=1` で expert を
+  VRAM に載せて GPU 経路を生かす。
+- 実測値: expert の確保は成功 (失敗 0)。しかし expert 重みは全体 48 GB あり 1/3 しか乗らず、
+  直近トークンのヒット率が 0.5 を切るためゲートが CPU 経路へフォールバックした
+  (decode experts 83.6 ms/token、CPU 経路の 78.9 と同等)。`DENNO_EXPERT_GPU_MIN_HIT=0` での強制は
+  ミス毎の H2D が支配すると見込み (2026-10-30 の実測でも decode 不変)。
+- なぜ捨てたか: VRAM 32 GB に対し expert 重み 48 GB では常駐化の前提が成立しない。2026-10-30 の
+  結論の再確認。
+- 記録: 計測のみ (コード 0 行)。ゲートのフォールバック判断は正しく動作した。

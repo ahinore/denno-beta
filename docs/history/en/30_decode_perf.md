@@ -1085,3 +1085,25 @@ to the AVX2 variant. `DENNO_IQ4NL_M1=0` returns to the classic gemv_iq (v2) path
   wall.
 - Record: this commit.
 
+
+### Promoting GEMV v3 (multi-lane) to the production default (2026-11-01, this commit)
+
+The decode GEMV lane-split kernel implemented the previous day (`kernels_moe_v3.ptx`, `DENNO_GEMV_V3=1`,
+default off back then) was promoted to the production (8098) launch environment after the operator decided
+to allow the accumulation-order change for decode. Because lanes share one row's accumulation, the kernel is
+**not bit-identical to v2** (order changes; the difference is ~1e-6 relative). k multiple of 128 uses 4 lanes,
+multiple of 64 uses 2 lanes, everything else falls back to v2 (no panic).
+
+- Implementation: `b3b52d8` / `0c8488a` (v2 kernel + pinned/async copies), `adcf70bf` (rows/block=8),
+  `c64f14490` (kept default off due to a prefill regression at the time). This commit is docs plus the launch
+  environment only (`DENNO_GEMV_V3=1` in `serve_restart.sh` and `/work/serve8098/start8098.sh`).
+- Measured (2026-11-01, production 8098, Swift-1.5 IQ3_S quant, 857 in): decode **229 → 187 ms/token**
+  (48 out), **216 → 181 (-16%)** with 128 out. Prefill unchanged at 36.9 s. Output md5 matches the previous
+  build on all three standard probes (short17 `af5f24ef0196` / mid300 `74801d3a2e5e` /
+  long1116 `c0dd104d282a`). On 8096 (same build, 1116 in / 48 out) the A/B gave decode 194 → 170 ms/token (-12%).
+- Breakdown change (48 tok, q4prof): decode attention 45.1 → 27.5 ms/token (qkv 12.8 → 4.3, out 7.6 → 2.9).
+  MoE experts stayed at 78.9 → 77.7 (expert decode remains on CPU; see the rejection entry for GPU residency).
+  Prefill per-layer numbers are within noise (mix 0.318 → 0.312, attn 0.154 → 0.154, moe 0.333 → 0.343 ms/layer/tok).
+- Pitfall: launching with inline env vars through `docker exec` silently drops some of them (GEMV_V3 was
+  missing once, which measured 229 ms/token on v2). Launch through a wrapper script that exports the env.
+- Record: this commit.

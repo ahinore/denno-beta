@@ -1055,3 +1055,25 @@ qs の 16 バイトを 1 回の読みにしてニブル抽出と 16 エントリ
   AVX2 版に落ち、スクラッチ測定では vpshufb + vpmovsxbd の shuffle uop 壁で上限 ~1.15x。
 - 記録: 本 commit。
 
+
+### GEMV v3 (4 レーン) を本番の既定に載せる (2026-11-01, 本 commit)
+
+前日 (2026-10-31) に実装した decode GEMV のレーン分割カーネル (`kernels_moe_v3.ptx`、`DENNO_GEMV_V3=1`、
+当時は既定 off) を、オペレーターの判断で「decode の加算順変更を許容する」方針に転換して本番 (8098) の
+起動環境に入れた。1 行の累積をレーンで分担するため **v2 とビット不一致** (加算順が変わり、差は 1e-6 相対)。
+k が 128 の倍数なら 4 レーン、64 の倍数なら 2 レーン、それ以外は v2 へ落ちる (panic しない)。
+
+- 実装: `b3b52d8` / `0c8488a` (v2 カーネル + pinned/async コピー)、`adcf70bf` (rows/block=8)、
+  `c64f14490` (prefill 退行のため既定 off にしていた)。本 commit は docs と起動 env のみ
+  (`serve_restart.sh` と `/work/serve8098/start8098.sh` に `DENNO_GEMV_V3=1`)。
+- 実測 (2026-11-01、8098 本番・Swift-1.5 IQ3_S quant・857 in): decode **229 → 187 ms/token** (48 出力)、
+  128 出力で **216 → 181 (-16%)**。prefill 36.9 s 不変。出力 md5 は標準 3 プローブ
+  (short17 `af5f24ef0196` / mid300 `74801d3a2e5e` / long1116 `c0dd104d282a`) すべて一致。
+  8096 (同ビルド・1116 in / 48 out) の A/B では decode 194 → 170 ms/token (-12%)。
+- 内訳の変化 (48 tok、q4prof): decode attn 45.1 → 27.5 ms/token (qkv 12.8 → 4.3、out 7.6 → 2.9)。
+  MoE experts は 78.9 → 77.7 でほぼ不変 (expert の decode は CPU 経路のまま。GPU 化は別項の棄却参照)。
+  prefill は層別で mix 0.318 → 0.312 / attn 0.154 → 0.154 / moe 0.333 → 0.343 ms/layer/tok と誤差範囲。
+- 落とし穴: `docker exec` から env をインラインで付けて起動すると、一部の env がプロセスに乗らない
+  (GEMV_V3 が欠けて v2 のまま 229 ms/tok を 1 回計測した)。起動は env を export するラッパー
+  スクリプト経由にすること。
+- 記録: 本 commit。
