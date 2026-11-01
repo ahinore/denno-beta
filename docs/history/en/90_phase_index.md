@@ -175,6 +175,7 @@ this is a table for looking up "when, in which commit, and in which volume it is
 | 2026-10-24 | P45 | `d19aa70b` | Removed the sync after the 3 passes from the device output path | 50 |
 | 2026-10-27 | P-MOE-F12 | `b43d66e` | Fused AVX2 GEMV for Q4_K in the MoE expert path | 30 |
 | 2026-10-27 | P-MOE-F13 | `5828846` | Fused GEMV for Q8_0 and in-layer phase profiling | 30 |
+| 2026-10-30 | P57 | `8c981776d` | Split Flash-Next decode by in-layer phase and show that the selected expert takes 37% | 30 |
 | 2026-10-27 | P-MOE-F14 | `58ccd86` | Fused GEMV for Q5_1 | 30 |
 | 2026-10-27 | P-MOE-F15 | `74e41d3` | Parallelized the GEMV row direction | 30 |
 | 2026-10-27 | P-MOE-F16 | `a42e144` | Parallelized the GDN delta rule over heads | 30 |
@@ -189,4 +190,5 @@ this is a table for looking up "when, in which commit, and in which volume it is
 | 2026-10-27 | P-MOE-G9 | no commit | madvise read-ahead for the selected experts makes no difference | 30 |
 | 2026-10-27 | P-MOE-G10 | not merged | Software prefetch in the GEMV row loop makes no difference | 30 |
 | 2026-10-27 | H1 | no commit | Reusing GPU scratch takes 302 → 313 ms | 30 |
+| 2026-10-30 | P58 | `787dad84e` | Match the 3D viewer to the real structure and light the per-layer neurons 1:1 | 70 |
 | 2026-11-01 | task 98 | this commit | m=1 fused GEMV for IQ4_NL (dequant bit-exact, dot product via FMA) | 30 |
