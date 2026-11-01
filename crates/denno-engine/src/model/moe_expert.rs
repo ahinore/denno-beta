@@ -1031,6 +1031,43 @@ fn expert_gemv_inner(
         }
     }
 
+    // task 98: IQ4_NL (decode m=1 の down_exps) は専用融合カーネルへ。AVX-512F が
+    // ある環境だけで zmm 版 ([`gemv_iq4nl_m1_avx512`]) を選ぶ。AVX2 版
+    // ([`gemv_iq4nl_m1_avx2`]) は 2026-11-01 の実 dispatch 実測で v2 比 0.925-0.945x
+    // (27B 実形 2 形 × 1T/8T の全部で悪化) だったため dispatch から外した (悪化を本番に
+    // 残さない規則。正しさの記録は cfg(test) のカーネルとテスト直参照に残す)。
+    // AVX-512F が無い環境は従来の gemv_iq (v2) に留まる。`DENNO_IQ4NL_M1=0` でも
+    // 同じ下の経路に戻る (退避路)。
+    if ty == GgmlType::IQ4Nl
+        && q4k_fused_supported()
+        && iq4nl_m1_enabled()
+        && iq4nl_m1_zmm_ok()
+    {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::model::exp_kprof::bump_kernel(
+                crate::model::exp_kprof::PH_DECODE,
+                crate::model::exp_kprof::cur_mat(),
+                ty.id(),
+                crate::model::exp_kprof::K_IQ4NL_M1,
+            );
+            for_each_row_chunk(
+                blocks,
+                n_out,
+                rb,
+                out,
+                par,
+                min_rows,
+                min_chunk,
+                0,
+                |b, o| unsafe { gemv_iq4nl_m1_avx512(b, n_in, o.len(), x, o) },
+            );
+            #[cfg(test)]
+            IQ4NL_M1_FUSED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+    }
+
     // IQ4_NL / Q2_0 (Swift 1.5 の ffn_down_exps) は AVX2 融合カーネルへ。
     // 2026-10-31 実測: スカラー 2788 ms/token -> 下記カーネルで短縮。
     if iq_kind(ty).is_some() && q4k_fused_supported() {
@@ -2970,6 +3007,73 @@ pub fn q2_0_fast_enabled() -> bool {
 pub(crate) static Q2_0_FUSED_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+// ---- IQ4_NL の融合 GEMV m=1 (task 98) ----------------------------------------
+//
+// 本番モデルの `ffn_down_exps` (IQ4_NL) は decode で従来の [`gemv_iq`] (v2) を
+// 通っている (9.12 GB/s / bench80)。v2 は 8 要素ごとに LUT 展開 (shuffle 1 回 +
+// `cvtepi8_epi32`) を回すので、1 ブロック 32 要素に 4 回の展開列が付く。zmm 版
+// ([`gemv_iq4nl_m1_avx512`]) は qs を 16 バイト 1 読みにして展開列をブロックあたり
+// 2 回に圧縮する。`DENNO_IQ4NL_M1=0` で classic 経路へ戻せる (退避路)。
+// AVX2 版 ([`gemv_iq4nl_m1_avx2`]) は実 v2 比 0.925-0.945x で悪化のため dispatch から
+// 外した (cfg(test) に正しさの記録として残す)。バッチ (prefill) 側の gemm_iq は触らない
+// (dev1 が別 task で扱う)。
+
+/// `DENNO_IQ4NL_M1` の値の解釈。**既定 on** ([`iq4xs_fast_from_value`] と同じ規約)。
+fn iq4nl_m1_from_value(v: Option<&str>) -> bool {
+    iq4xs_fast_from_value(v)
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+#[cfg(test)]
+static IQ4NL_M1_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト専用: IQ4_NL 融合経路の on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_iq4nl_m1_for_test(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    IQ4NL_M1_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_IQ4NL_M1` をプロセスで 1 回だけ読む (既定 on)。
+pub fn iq4nl_m1_enabled() -> bool {
+    #[cfg(test)]
+    match IQ4NL_M1_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| iq4nl_m1_from_value(std::env::var("DENNO_IQ4NL_M1").ok().as_deref()))
+}
+
+/// テスト用: IQ4_NL 融合カーネルが実際に発火した回数 ([`Q2_0_FUSED_CALLS`] と同じ)。
+#[cfg(test)]
+pub(crate) static IQ4NL_M1_FUSED_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// AVX-512F 版 ([`gemv_iq4nl_m1_avx512`]) が実行時に選べるか。
+///
+/// AVX2+FMA は分岐の外側 ([`q4k_fused_supported`]) で済んでいるので、ここでは
+/// AVX-512F だけを見る。無い CPU (AVX2 まで) は融合を使わず従来の gemv_iq (v2) に
+/// 留まる (AVX2 版は 2026-11-01 の実 dispatch 実測 0.925-0.945x で悪化のため外した)。
+fn iq4nl_m1_zmm_ok() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx512f")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 // ---- Q6_K / Q5_K の融合 GEMV (P93) ------------------------------------------
 //
 // 本番モデル (Flash-Next) の `ffn_gate_exps` / `ffn_up_exps` は層ごとに型が混在して
@@ -4012,6 +4116,148 @@ unsafe fn gemv_q2_0_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], ou
             }
         }
         out[r] = q8_hadd(a0, a1);
+    }
+}
+
+// ---- IQ4_NL の 1 トークン融合 GEMV (task 98) ----------------------------------
+//
+// [`gemv_q2_0_avx2`] (task 95) と同じ立場:
+// - dequant は `w = d * KVALUES_IQ4NL[code]`。kquant 参照 ([`crate::kquant`]
+//   `dequant_block` の IQ4_NL 分岐) と同じ 1 回の f32 乗算なので **to_bits 一致**する。
+// - 内積は `w * x` を FMA で累積するので、classic (dequant + [`dot_seq`]) とは
+//   累積順・積の丸めが違い**ビット一致しない** (相対 2e-4 以内。Q2_0 / P89 と同じ立場)。
+//
+// 実行先 (2026-11-01 の実 dispatch 実測で決めた。27B 実形 2 形、1T/8T):
+// - AVX-512F がある CPU は [`gemv_iq4nl_m1_avx512`]: qs の 16 バイトを
+//   `cvtepu8_epi32` (zmm) で 16 レーンに開き、i32 LUT を VPERMD で 1 uop で引く。
+//   1 ブロック 32 要素が zmm 2 本で閉じる。実 v2 比 **1.165-1.180x** (1T)。
+// - [`gemv_iq4nl_m1_avx2`] は実 v2 比 0.925-0.945x で悪化したため dispatch から外した
+//   (cfg(test) に正しさの記録として残す。スクラッチ比 1.15x という当初の見積りは
+//   proxy の v2 が実装より遅かった (5.7 対 9.0 GB/s) ため実経路には移転しなかった。
+//   AVX2 では vpshufb + vpmovsxbd の shuffle 系がブロックあたり 8 uop で頭打ち)。
+//
+// ニブルの取り出しは `vpshufb` / `VPERMD` の index 規約に注意:
+// `vpshufb` は selector の bit7 が立つと 0 を返し、`VPERMD` は index の下位 4 ビット
+// だけを使う (範囲外は 0)。どちらも生バイトをそのまま渡せないので AND 0x0f が必須。
+// 16 バイト読みの末尾はブロック 18 バイトのうち qs (2..18) ぴったりで行末を越えない。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn gemv_iq4nl_m1_avx512(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 18; // d(2) + qs(16)。32 要素
+    let nb = n_in / 32;
+    let rb = nb * BLK;
+    let bp = blocks.as_ptr();
+    let xp = x.as_ptr();
+    // i32 LUT 16 エントリ (64 B = zmm 1 本)。
+    let mut lut = [0i32; 16];
+    for (i, v) in lut.iter_mut().enumerate() {
+        *v = crate::kquant::kvalues_iq4nl()[i] as i32;
+    }
+    let lut = std::ptr::read(lut.as_ptr() as *const __m512i);
+    let m15 = _mm512_set1_epi32(0x0f);
+
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut a0 = _mm512_setzero_ps();
+        let mut a1 = _mm512_setzero_ps();
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let dv = _mm512_set1_ps(d);
+            // qs[0..16] を 1 回で読む。低ニブル = 要素 0..16、高ニブル = 要素 16..32。
+            let raw = _mm512_cvtepu8_epi32(_mm_loadu_si128(p.add(2) as *const __m128i));
+            let clo = _mm512_and_si512(raw, m15);
+            let chi = _mm512_and_si512(_mm512_srli_epi32::<4>(raw), m15);
+            // 表引き (VPERMD。index は下位 4 ビットで解釈されるので AND が必須)。
+            let klo = _mm512_permutexvar_epi32(clo, lut);
+            let khi = _mm512_permutexvar_epi32(chi, lut);
+            // w = d * (表値 as f32) (参照と同じ 1 回の f32 乗算)。
+            let w0 = _mm512_mul_ps(_mm512_cvtepi32_ps(klo), dv);
+            let w1 = _mm512_mul_ps(_mm512_cvtepi32_ps(khi), dv);
+            let xb = xp.add(b * 32);
+            a0 = _mm512_fmadd_ps(w0, _mm512_loadu_ps(xb), a0);
+            a1 = _mm512_fmadd_ps(w1, _mm512_loadu_ps(xb.add(16)), a1);
+        }
+        // 累積 2 本 → 16 レーン横加算 (順序はこのカーネル固定)。
+        // vextractf64x4 は AVX512F の範囲で確実に使える (extractf32x8 は DQ)。
+        let s = _mm512_add_ps(a0, a1);
+        let hi = _mm256_castpd_ps(_mm512_extractf64x4_pd::<1>(_mm512_castps_pd(s)));
+        out[r] = q8_hadd(_mm512_castps512_ps256(s), hi);
+    }
+}
+
+/// IQ4_NL 融合の AVX2 版 ([`gemv_iq4nl_m1_avx512`] と同じ契約)。
+/// 2026-11-01 の実 dispatch 実測 (このコンテナ) で v2 比 0.925-0.945x と悪化したため
+/// dispatch から外した (悪化を本番に残さない規則)。正しさの記録として cfg(test) で
+/// 残し、テストから直参照する。
+#[cfg(all(target_arch = "x86_64", test))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_iq4nl_m1_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    const BLK: usize = 18; // d(2) + qs(16)。32 要素
+    let nb = n_in / 32;
+    let rb = nb * BLK;
+    let bp = blocks.as_ptr();
+    let xp = x.as_ptr();
+    let t16 = _mm_loadu_si128(crate::kquant::kvalues_iq4nl().as_ptr() as *const __m128i);
+    // 16 エントリ表を両レーンに複製 (shuffle_epi8 は 128 ビット レーンごとに引く)。
+    let t256 = _mm256_broadcastsi128_si256(t16);
+    let m8 = _mm256_set1_epi8(0x0f);
+
+    for r in 0..n_out {
+        let row = bp.add(r * rb);
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        for b in 0..nb {
+            let p = row.add(b * BLK);
+            let d = half::f16::from_bits(std::ptr::read_unaligned(p as *const u16)).to_f32();
+            let dv = _mm256_set1_ps(d);
+            // qs[0..16] を 1 回で読む。低ニブル = 要素 0..16、高ニブル = 要素 16..32。
+            let qs = _mm_loadu_si128(p.add(2) as *const __m128i);
+            // レーン 0 = バイト 0..8 (要素 0..16 のコード元)、レーン 1 = バイト 8..16。
+            let qs256 = _mm256_set_m128i(_mm_bsrli_si128::<8>(qs), qs);
+            let lo = _mm256_and_si256(qs256, m8);
+            let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(qs256), m8);
+            // 表引き (レーンごとに 16 エントリ表を引く。結果は i8 16 バイト)。
+            let kvl = _mm256_shuffle_epi8(t256, lo); // レーン 0/1 = 要素 0..8 / 8..16
+            let kvh = _mm256_shuffle_epi8(t256, hi); // レーン 0/1 = 要素 16..24 / 24..32
+            // w = d * (表値 as f32) (参照と同じ 1 回の f32 乗算)。
+            let w0 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm256_castsi256_si128(kvl))),
+                dv,
+            );
+            let w1 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                    _mm256_extracti128_si256::<1>(kvl),
+                )),
+                dv,
+            );
+            let w2 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm256_castsi256_si128(kvh))),
+                dv,
+            );
+            let w3 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                    _mm256_extracti128_si256::<1>(kvh),
+                )),
+                dv,
+            );
+            let xb = xp.add(b * 32);
+            // 累積 4 本 (1 ブロック 4 FMA が全部独立)。FMA 依存鎖は 1 本あたり
+            // 行のブロック数ぶん (2 本構成の半分)。
+            a0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xb), a0);
+            a1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xb.add(8)), a1);
+            a2 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(xb.add(16)), a2);
+            a3 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(xb.add(24)), a3);
+        }
+        let s01 = _mm256_add_ps(a0, a1);
+        let s23 = _mm256_add_ps(a2, a3);
+        out[r] = q8_hadd(s01, s23);
     }
 }
 
@@ -10159,6 +10405,8 @@ mod tests {
 
     /// IQ 系のバッチ GEMM がモートークン GEMV とビット一致すること。
     /// (トークン方向のループ位置だけが違い、1 トークンの累積順は同じ)
+    /// 例外: Q2_0 (task 95) と IQ4_NL (task 98) の融合 m=1 GEMV は FMA 累積で
+    /// 累積順がバッチと違うため非ビット一致 (相対 1e-6 程度)。dequant はビット一致。
     #[test]
     fn fused_iq_gemm_matches_gemv_bitwise() {
         if !q4k_fused_supported() {
@@ -10206,9 +10454,11 @@ mod tests {
                 )
                 .unwrap();
                 for r in 0..n_out {
-                    if ty == GgmlType::Q2_0 {
-                        // Q2_0 の融合 m=1 GEMV は累積順が classic / バッチと違う
-                        // (P89 と同じ立場)。dequant はビット一致、内積は相対 1e-6。
+                    if matches!(ty, GgmlType::Q2_0 | GgmlType::IQ4Nl) {
+                        // Q2_0 (task 95) / IQ4_NL (task 98) の融合 m=1 GEMV は
+                        // 累積順が classic / バッチと違う (FMA、P89 と同じ立場)。
+                        // dequant はビット一致、内積は相対 1e-6 (実測は IQ4_NL で
+                        // max ~1.3e-7)。
                         let a = one[r];
                         let b = batch[t * n_out + r];
                         let diff = (a - b).abs();
@@ -11719,6 +11969,292 @@ mod exp_kprof_tests {
             gb / best[1],
             best[1] / best[0]
         );
+    }
+
+    /// task 98: IQ4_NL 融合 GEMV の検証 (dispatch は zmm 版。AVX2 版は cfg(test) の
+    /// カーネルを直参照して検証する)。
+    ///
+    /// 契約は task 95 (Q2_0) と同じ立て方:
+    /// (1) dequant は kquant 参照 (classic = dequant + `dot_seq`) と **to_bits 一致**
+    ///     (one-hot x で 1 要素ずつ見る。one-hot の内積は `w * 1.0` なので値がそのまま出る)。
+    /// (2) 内積は classic と非ビット一致 (FMA 累積) だが、classic との相対差は 2e-4 以内、
+    ///     f64 真値との誤差は 1.5e-4 以内。IQ4_NL は重みの桁が Q2_0 より広い (表値 -8..12 に対し
+    ///     Q2_0 は -1..2) ため classic 側の誤差も大きく、caps はこの fixture の実測に合わせる
+    ///     (down 形 640x2560 の実測: AVX-512 版の真値誤差 max 1.13e-4、classic 同 1.41e-4、
+    ///     融合-classic 差 max 1.76e-4。融合は row 単位では classic を超える行が
+    ///     あるが、最大誤差は classic を下回る = FMA で積の丸めが無い分、全体では精度が良い)。
+    /// (3) 発火は exp_kprof の K_IQ4NL_M1 bump で数える (AVX-512F がある環境)。
+    ///     AVX-512F が無い環境では融合を使わず v2 に留まること (AVX2 版カーネルは
+    ///     2026-11-01 実測 0.925-0.945x で悪化したため dispatch から外した) と、
+    ///     `DENNO_IQ4NL_M1=0` 相当で従来の gemv_iq (v2) に落ちること (退避路が実際に
+    ///     効くこと) も確認する。
+    #[test]
+    fn iq4nl_m1_fused_gemv_dequant_bits_and_accuracy() {
+        let _g = kprof_lock();
+        let _m = moe_test_lock();
+        if !q4k_fused_supported() {
+            eprintln!("skip iq4nl_m1_fused_gemv: この CPU には AVX2/FMA が無い");
+            return;
+        }
+        set_iq4nl_m1_for_test(Some(true));
+
+        // IQ4_NL の 1 expert ぶん (1 ブロック 18 バイト = 32 要素)。
+        // ブロック index と行で d とコードをずらす (全ブロック同一だと
+        // 出力が潰れて生死が見えない)。
+        let nl_blocks = |n_in: usize, n_out: usize| -> Vec<u8> {
+            let nb = n_in / 32;
+            let mut v = Vec::with_capacity(n_out * nb * 18);
+            for r in 0..n_out {
+                for b in 0..nb {
+                    let mut blk = vec![0u8; 18];
+                    blk[0..2].copy_from_slice(&f16b(0.01 + 0.003 * ((r + b) % 7) as f32));
+                    for i in 0..16usize {
+                        blk[2 + i] = byte_at(i, (r * 131 + b * 17) as u32 + 9);
+                    }
+                    v.extend_from_slice(&blk);
+                }
+            }
+            v
+        };
+        // f64 の参照 dequant (kquant の dequant_block IQ4_NL 分岐と同じ式)。
+        let nl_row_f64 = |bytes: &[u8], k: usize| -> Vec<f64> {
+            let kv = crate::kquant::kvalues_iq4nl();
+            let nb = k / 32;
+            let mut w = vec![0f64; k];
+            for b in 0..nb {
+                let blk = &bytes[b * 18..(b + 1) * 18];
+                let d =
+                    half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32() as f64;
+                for j in 0..16usize {
+                    // 低ニブルが要素 j、高ニブルが要素 j + 16。
+                    w[b * 32 + j] = d * kv[(blk[2 + j] & 0xf) as usize] as f64;
+                    w[b * 32 + j + 16] = d * kv[(blk[2 + j] >> 4) as usize] as f64;
+                }
+            }
+            w
+        };
+
+        // (1) dequant の to_bits 一致 (one-hot)。1 ブロック形は全 32 要素、
+        //     down 形 (n_in=640) は両端と中間の 11 点。expert_gemv の経路 (この CPU では
+        //     AVX-512 版) と、AVX2 版への直呼びの両方を見る。
+        for (name, k, n, probes) in [
+            (
+                "1 ブロック",
+                32usize,
+                96usize,
+                (0..32usize).collect::<Vec<usize>>(),
+            ),
+            (
+                "down 形",
+                640usize,
+                128usize,
+                vec![0, 1, 15, 16, 31, 32, 127, 255, 320, 511, 639],
+            ),
+        ] {
+            let blocks = nl_blocks(k, n);
+            let mut ref_out = vec![0f32; n];
+            let mut got = vec![0f32; n];
+            let mut got_avx2 = vec![0f32; n];
+            for i in probes {
+                let mut x = vec![0f32; k];
+                x[i] = 1.0;
+                expert_gemv_scalar(GgmlType::IQ4Nl, &blocks, k, n, &x, &mut ref_out).unwrap();
+                expert_gemv(GgmlType::IQ4Nl, &blocks, k, n, &x, &mut got).unwrap();
+                unsafe { gemv_iq4nl_m1_avx2(&blocks, k, n, &x, &mut got_avx2) };
+                for (label, outs) in [("経路", &got), ("avx2 直呼び", &got_avx2)] {
+                    for r in 0..n {
+                        let (kv, rw) = (outs[r].to_bits(), ref_out[r].to_bits());
+                        assert!(
+                            kv == rw || (outs[r] == 0.0 && ref_out[r] == 0.0),
+                            "{name}/{label} i={i} row {r}: 融合 {} ({kv:#x}) が classic {} ({rw:#x}) と不一致",
+                            outs[r],
+                            ref_out[r]
+                        );
+                    }
+                }
+            }
+            assert!(
+                ref_out.iter().any(|v| *v != 0.0),
+                "{name}: 参照が全 0 (fixture が壊れた)"
+            );
+        }
+
+        // (2) classic との相対誤差と f64 真値 (経路のカーネルと AVX2 版の両方)。
+        for (name, k, n) in [
+            ("down 形", 640usize, 2560usize),
+            ("1 ブロック", 32usize, 1024usize),
+            ("奇数行", 640usize, 321usize),
+            ("門番未満 (63 行)", 640usize, 63usize),
+        ] {
+            let blocks = nl_blocks(k, n);
+            let x: Vec<f32> = (0..k)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+                .collect();
+            let mut a = vec![0f32; n];
+            let mut b = vec![0f32; n];
+            let mut b_avx2 = vec![0f32; n];
+            expert_gemv_scalar(GgmlType::IQ4Nl, &blocks, k, n, &x, &mut a).unwrap();
+            expert_gemv(GgmlType::IQ4Nl, &blocks, k, n, &x, &mut b).unwrap();
+            unsafe { gemv_iq4nl_m1_avx2(&blocks, k, n, &x, &mut b_avx2) };
+            assert!(
+                b.iter().any(|v| *v != 0.0),
+                "{name}: 出力が全 0 (経路の生死が分からない)"
+            );
+            assert!(
+                b_avx2.iter().any(|v| *v != 0.0),
+                "{name}: AVX2 版の出力が全 0 (カーネルが死んでいる)"
+            );
+            let rb = row_bytes(GgmlType::IQ4Nl, k).unwrap();
+            for r in 0..n {
+                let w = nl_row_f64(&blocks[r * rb..(r + 1) * rb], k);
+                let truth: f32 = w
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(wv, xv)| wv * *xv as f64)
+                    .sum::<f64>() as f32;
+                let scale = truth.abs().max(1e-3);
+                for (label, v) in [("経路", b[r]), ("avx2 直呼び", b_avx2[r])] {
+                    let rel_fa = (v - truth).abs() / scale;
+                    let rel_fc = (a[r] - v).abs() / scale;
+                    assert!(
+                        rel_fc < 2e-4,
+                        "{name}/{label} row {r}: 融合 {} が classic {} から相対 {rel_fc} 外れた",
+                        v,
+                        a[r]
+                    );
+                    assert!(
+                        rel_fa < 1.5e-4,
+                        "{name}/{label} row {r}: 融合 {} の f64 真値 {} に対する相対誤差 {rel_fa}",
+                        v,
+                        truth
+                    );
+                }
+            }
+        }
+
+        // (3) 発火 (exp_kprof の K_IQ4NL_M1) と退避路 (M1=0 で gemv_iq v2 へ)。
+        kp::set_for_test(false);
+        kp::reset();
+        kp::set_for_test(true);
+        let (k, n) = (640usize, 64usize);
+        let blocks = nl_blocks(k, n);
+        let x: Vec<f32> = (0..k).map(|i| ((i * 53 % 211) as f32 - 105.0) / 128.0).collect();
+        let mut out = vec![0f32; n];
+        expert_gemv(GgmlType::IQ4Nl, &blocks, k, n, &x, &mut out).unwrap();
+        if iq4nl_m1_zmm_ok() {
+            assert!(
+                kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::IQ4Nl.id(), kp::K_IQ4NL_M1) >= 1,
+                "IQ4_NL が融合カーネルとして数えられていない"
+            );
+            assert_eq!(
+                kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::IQ4Nl.id(), kp::K_IQ_V2),
+                0,
+                "AVX-512F があるのに融合ではなく v2 で計算した"
+            );
+        } else {
+            // AVX-512F 無しの環境は融合を使わない (AVX2 版は実測 0.925-0.945x で
+            // 悪化のため dispatch から外した)。v2 に留まることを確認する。
+            assert!(
+                kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::IQ4Nl.id(), kp::K_IQ_V2) >= 1,
+                "AVX-512F 無しで v2 に落ちていない"
+            );
+            assert_eq!(
+                kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::IQ4Nl.id(), kp::K_IQ4NL_M1),
+                0,
+                "AVX-512F 無しで融合カーネルが発火した"
+            );
+        }
+        assert_eq!(
+            kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::IQ4Nl.id(), kp::K_SCALAR),
+            0
+        );
+        kp::reset();
+        set_iq4nl_m1_for_test(Some(false));
+        expert_gemv(GgmlType::IQ4Nl, &blocks, k, n, &x, &mut out).unwrap();
+        // 退避路は従来の gemm_iq (v2) カーネル (Q2_0 と同じ立て方)。
+        assert!(
+            kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::IQ4Nl.id(), kp::K_IQ_V2) >= 1,
+            "退避路 (M1=0) が従来の gemv_iq に落ちていない"
+        );
+        assert_eq!(
+            kp::ty_kernel(kp::PH_DECODE, kp::OTHER, GgmlType::IQ4Nl.id(), kp::K_IQ4NL_M1),
+            0,
+            "M1=0 なのに融合カーネルが発火した"
+        );
+        set_iq4nl_m1_for_test(None);
+        kp::set_for_test(false);
+        kp::reset();
+    }
+
+    /// task 98 マイクロベンチ: IQ4_NL の融合 GEMV と従来の gemv_iq (v2) を
+    /// down 実形 (n_in=640 / n_out=2560、1 expert) と gate 形 (n_in=2560 / n_out=640)
+    /// で比べる。1T / 8T はローカル rayon プールで固定 (グローバル プールは触らない)。
+    /// 重みは L2 に載る大きさ (down 形 1 expert 360 KB / gate 形 1.44 MB)。
+    ///
+    /// 実行: `cargo test --release -p denno-engine --lib \
+    ///        -- --ignored --nocapture --test-threads=1 bench_iq4nl_gemv`
+    #[test]
+    #[ignore = "task 98 マイクロベンチ (実測。通常のテストでは走らせない)"]
+    fn bench_iq4nl_gemv_fused_vs_v2() {
+        if !q4k_fused_supported() {
+            eprintln!("[bench98] AVX2/FMA が無いので計測しない");
+            return;
+        }
+        if !iq4nl_m1_zmm_ok() {
+            // AVX-512F 無しでは融合 dispatch が無効 (v2 に退避) のため比較にならない。
+            eprintln!("[bench98] AVX-512F 無し: 融合 dispatch が無効なので計測しない");
+            return;
+        }
+        let _g = kprof_lock();
+        let _m = moe_test_lock();
+        for (n_in, n_out) in [(640usize, 2560usize), (2560usize, 640usize)] {
+            let nb = n_in / 32;
+            let rb = nb * 18;
+            let mut blocks = vec![0u8; rb * n_out];
+            for r in 0..n_out {
+                for b in 0..nb {
+                    let blk = &mut blocks[r * rb + b * 18..r * rb + (b + 1) * 18];
+                    blk[0..2].copy_from_slice(&f16b(0.01 + 0.003 * ((r + b) % 7) as f32));
+                    for i in 0..16usize {
+                        blk[2 + i] = byte_at(i, (r * 131 + b * 17) as u32 + 9);
+                    }
+                }
+            }
+            let x: Vec<f32> = (0..n_in)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+                .collect();
+            let gb = blocks.len() as f64 / 1e9;
+            let mut out = vec![0f32; n_out];
+            for nt in [1usize, 8usize] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(nt)
+                    .build()
+                    .unwrap();
+                let mut best = [f64::INFINITY; 2];
+                for rep in 0..12 {
+                    for vi in 0..2usize {
+                        set_iq4nl_m1_for_test(Some(vi == 0));
+                        let t0 = std::time::Instant::now();
+                        pool.install(|| {
+                            expert_gemv(GgmlType::IQ4Nl, &blocks, n_in, n_out, &x, &mut out)
+                                .unwrap()
+                        });
+                        let dt = t0.elapsed().as_secs_f64();
+                        std::hint::black_box(&out);
+                        best[vi] = best[vi].min(dt);
+                    }
+                }
+                set_iq4nl_m1_for_test(None);
+                eprintln!(
+                    "[bench98] IQ4_NL {n_in}x{n_out} {nt}T | 融合 {:8.1} us {:6.2} GB/s | v2 {:8.1} us {:6.2} GB/s | {:.3}x",
+                    best[0] * 1e6,
+                    gb / best[0],
+                    best[1] * 1e6,
+                    gb / best[1],
+                    best[1] / best[0]
+                );
+            }
+        }
     }
 }
 

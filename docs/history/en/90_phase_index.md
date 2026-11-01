@@ -189,3 +189,4 @@ this is a table for looking up "when, in which commit, and in which volume it is
 | 2026-10-27 | P-MOE-G9 | no commit | madvise read-ahead for the selected experts makes no difference | 30 |
 | 2026-10-27 | P-MOE-G10 | not merged | Software prefetch in the GEMV row loop makes no difference | 30 |
 | 2026-10-27 | H1 | no commit | Reusing GPU scratch takes 302 → 313 ms | 30 |
+| 2026-11-01 | task 98 | this commit | m=1 fused GEMV for IQ4_NL (dequant bit-exact, dot product via FMA) | 30 |
