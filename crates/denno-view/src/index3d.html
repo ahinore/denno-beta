@@ -17,6 +17,7 @@
   #hud b { font-weight:600; }
   #hud .dim, #legend .dim { color:var(--dim); }
   .vram { color:var(--vram); } .ram { color:var(--ram); } .ssd { color:var(--ssd); }
+  .sel { color:#ffe14d; }
   .qsa { color:var(--qsa); } .gdn { color:var(--gdn); } .router { color:var(--router); }
   .shex { color:var(--shex); } .ple { color:var(--ple); } .gr { color:var(--gr); }
   .neu { color:var(--neu); }
@@ -78,7 +79,7 @@
 <div id="legend" class="panel">
   <div><span class="neu">neuron</span> 2560/layer · <span class="qsa">QSA</span> 12 · <span class="gdn">GDN</span> 36</div>
   <div><span class="router">router</span> · <span class="shex">shared</span> · <span class="gr">GR r/w</span> · <span class="ple">PLE</span>(L2)</div>
-  <div>expert: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">SSD</span></div>
+  <div>expert: <span class="vram">VRAM</span> / <span class="ram">RAM</span> / <span class="ssd">SSD</span> · <span class="sel">selected (top-10)</span></div>
   <div>drag: rotate · wheel: zoom · space: pause · [c] chat</div>
 </div>
 <div id="chat">
@@ -155,6 +156,7 @@ const COL = {
   qsa: new THREE.Color('#b46bff'), gdn: new THREE.Color('#00d9a0'),
   router: new THREE.Color('#ffe14d'), shex: new THREE.Color('#ff2bd6'),
   gr: new THREE.Color('#59b6ff'), ple: new THREE.Color('#7f8bff'),
+  sel: new THREE.Color('#ffe14d'),
   neuBase: new THREE.Color('#1b2f3a'), neuHot: new THREE.Color('#7ff0ff')
 };
 
@@ -175,6 +177,15 @@ const totalZ = (LAYERS - 1) * ZSTEP;
 const center = new THREE.Vector3(-4, -1.0, -totalZ * 0.32);
 const camera = new THREE.PerspectiveCamera(39, innerWidth / innerHeight, 0.1, 900);
 camera.position.set(29, 30, 47);
+if (Q.get('cam')) {   // 検証用: ?cam=x,y,z でカメラ位置、?tgt=x,y,z で注視点を固定する
+  const p = Q.get('cam').split(',').map(Number);
+  if (p.length === 3 && p.every((v) => Number.isFinite(v))) camera.position.set(p[0], p[1], p[2]);
+  const t3 = Q.get('tgt');
+  if (t3) {
+    const q = t3.split(',').map(Number);
+    if (q.length === 3 && q.every((v) => Number.isFinite(v))) center.set(q[0], q[1], q[2]);
+  }
+}
 camera.lookAt(center);
 
 const controls = new OrbitControls(camera, canvas);
@@ -231,8 +242,8 @@ label('SSD', '#ff3b6b', 4.2, -14.2, TIER_Y[TIER.SSD], -3.0);
 // LayerAct の idx は「その層の残差ストリームの index」(0..2559)。expert ではない。
 // 壁は X-Y 平面 (カメラ側を向く) に 64 列 x 40 行。index i -> col = i % 64, row = i / 64。
 const NW = 64, NH = EMB / NW;          // 40
-const NWX0 = -13.6, NWX1 = -10.4, NWY = 4.2;
-const neuGeo = new THREE.BoxGeometry(0.040, 0.158, 0.036);
+const NWX0 = -13.9, NWX1 = -9.7, NWY = 5.0;
+const neuGeo = new THREE.BoxGeometry(0.052, 0.205, 0.046);
 const walls = [];
 for (let il = 0; il < LAYERS; il++) {
   const inst = new THREE.InstancedMesh(neuGeo, new THREE.MeshBasicMaterial({ color: 0xffffff, fog: true }), EMB);
@@ -344,7 +355,9 @@ for (let il = 0; il < LAYERS; il++) {
   inst.instanceMatrix.needsUpdate = true; inst.instanceColor.needsUpdate = true;
   inst.frustumCulled = false;
   scene.add(inst);
-  slabs.push({ il, inst, y3, xz, tier: new Uint8Array(EXPERTS), act: new Float32Array(EXPERTS),
+  slabs.push({ il, inst, y3, xz, tier: new Uint8Array(EXPERTS), tierPrev: new Uint8Array(EXPERTS),
+               anim: new Float32Array(EXPERTS), fromY: new Float32Array(EXPERTS).fill(TIER_Y[0]),
+               act: new Float32Array(EXPERTS),
                used: new Float32Array(EXPERTS), dirty: new Uint8Array(EXPERTS), route: [] });
 }
 
@@ -765,7 +778,7 @@ function stepFly(dt) {
 // ===== post ==============================================================
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
-composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth / 2, innerHeight / 2), 0.62, 0.40, 0.45));
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth / 2, innerHeight / 2), 0.34, 0.42, 0.55));
 composer.addPass(new OutputPass());
 
 // ===== 状態 ==============================================================
@@ -828,19 +841,24 @@ function routeLayer(il, token) {
   }
 }
 
-function updateLayerColors(il) {
+function updateLayerColors(il, dt) {
   const s = slabs[il], col = s.inst.instanceColor.array;
   const sel = new Set(s.route);
   for (let k = 0; k < EXPERTS; k++) {
     const tier = s.tier[k];
     const c = TIER_COL[tier];
-    const base = tier === TIER.VRAM ? 0.55 : (tier === TIER.RAM ? 0.34 : 0.16);
+    const base = tier === TIER.VRAM ? 0.45 : (tier === TIER.RAM ? 0.26 : 0.12);
     let g = s.act[k];
-    if (sel.has(k)) g = Math.max(g, 1.0);
-    const v = base + g * 1.6;
+    if (sel.has(k)) {
+      // 選択された expert は専用色 (黄) で塗る。段の色を消して一目で分かるように。
+      const p = 0.85 + 0.15 * Math.min(1, g);
+      col[k * 3] = COL.sel.r * p; col[k * 3 + 1] = COL.sel.g * p; col[k * 3 + 2] = COL.sel.b * p;
+      continue;
+    }
+    const v = base + g * 1.15;
     col[k * 3] = c.r * v; col[k * 3 + 1] = c.g * v; col[k * 3 + 2] = c.b * v;
-    if (g > 0.72) {
-      const w = Math.min(1, (g - 0.72) * 1.8);
+    if (g > 0.82) {
+      const w = Math.min(1, (g - 0.82) * 1.3);
       col[k * 3] += (1 - col[k * 3]) * w;
       col[k * 3 + 1] += (1 - col[k * 3 + 1]) * w;
       col[k * 3 + 2] += (1 - col[k * 3 + 2]) * w;
@@ -848,19 +866,29 @@ function updateLayerColors(il) {
   }
   s.inst.instanceColor.needsUpdate = true;
 
-  // 段の移動は補間する。瞬間移動だと SSD -> RAM -> VRAM の移送が見えないため。
+  // 段の移動は「消えて -> 出る」。旧実装は段の間を滑って移動したため、移動中の箱が
+  // SSD のデッキ上に残って見えた。フェードアウト -> 転送 -> フェードインにする。
   let moved = false;
   for (let k = 0; k < EXPERTS; k++) {
+    if (s.tier[k] !== s.tierPrev[k]) {
+      if (s.anim[k] <= 0 || s.anim[k] >= 1) { s.fromY[k] = s.y3[k * 3 + 1]; s.anim[k] = 0.0001; }
+      s.tierPrev[k] = s.tier[k];
+    }
     const ty = TIER_Y[s.tier[k]];
-    const cy = s.y3[k * 3 + 1];
-    const d = ty - cy;
-    if (!s.dirty[k] && Math.abs(d) < 0.004) continue;
-    const ny = Math.abs(d) < 0.06 ? ty : cy + d * 0.16;
-    m4.makeTranslation(s.xz[k * 2], ny, s.xz[k * 2 + 1]);
-    s.inst.setMatrixAt(k, m4);
-    s.y3[k * 3 + 1] = ny;
-    if (s.dirty[k] && Math.abs(ny - ty) < 0.004) s.dirty[k] = 0;
-    moved = true;
+    if (s.anim[k] > 0 && s.anim[k] < 1) {
+      s.anim[k] = Math.min(1, s.anim[k] + dt / 0.55);
+      const t = s.anim[k];
+      const y = t < 0.5 ? s.fromY[k] : ty;
+      const sc = Math.max(t < 0.5 ? 1 - 2 * t : 2 * t - 1, 0.001);
+      m4.makeScale(sc, sc, sc);
+      m4.setPosition(s.xz[k * 2], y, s.xz[k * 2 + 1]);
+      s.inst.setMatrixAt(k, m4);
+      s.y3[k * 3 + 1] = y;
+      if (t >= 1) { s.anim[k] = 0; s.dirty[k] = 0; }
+      moved = true;
+    } else if (s.dirty[k]) {
+      s.dirty[k] = 0;
+    }
   }
   if (moved) s.inst.instanceMatrix.needsUpdate = true;
 }
@@ -1004,7 +1032,7 @@ function step(dt, doRender) {
   plePulse *= 0.988;
   for (let il = 0; il < LAYERS; il++) {
     if (il !== demo.cursor && il !== PLE_LAYERS[0] && (il + demo.cursor) % 3 !== 0) continue;
-    updateLayerColors(il);
+    updateLayerColors(il, dt);
     updateRoleColors(il, il === demo.cursor ? head : 0.16);
   }
   updateBeams(demo.cursor, head);
