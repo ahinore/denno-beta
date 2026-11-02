@@ -546,6 +546,12 @@ impl Flash {
         if spec_on {
             ngram.feed(dec.tokens());
         }
+        // P109: 受理率の計測 (DENNO_SPEC_STATS=1 のときだけ生成終了時に 1 行出す)。
+        // 加算だけなので数値経路には触れない。
+        let mut spec_steps = 0usize;
+        let mut spec_confirmed = 0usize;
+        let mut spec_accepted = 0usize;
+        let mut spec_offered = 0usize;
         let t2 = Instant::now();
         'gen: while out.len() < req.max_tokens {
             if spec_on {
@@ -566,7 +572,7 @@ impl Flash {
                 }
                 let draft = ngram.draft(dec.tokens(), spec_k);
                 let t_step = t_on.then(Instant::now);
-                let outcome = match dec.spec_verify(q0, &draft, true, eos) {
+                let outcome = match dec.spec_verify(q0, &draft, eos) {
                     Ok(o) => o,
                     Err(e) => {
                         failed = Some(e.into());
@@ -574,6 +580,10 @@ impl Flash {
                     }
                 };
                 ngram.feed(dec.tokens());
+                spec_steps += 1;
+                spec_confirmed += outcome.confirmed.len();
+                spec_accepted += outcome.n_accepted;
+                spec_offered += draft.len();
                 let pos0 = dec.tokens().len() - outcome.confirmed.len();
                 // max_tokens に収まるぶんだけ出す (はみ出した確定トークンはモデルの
                 // 状態には残るが本文には出さない = max_tokens を厳守する)。
@@ -708,6 +718,19 @@ impl Flash {
             t_prefill * 1e3 / (n_prompt - reused).max(1) as f64,
             t_decode * 1e3 / out.len().max(1) as f64
         );
+        // P109: `DENNO_SPEC_STATS=1` のときだけ spec ステップの受理率を 1 行出す
+        // (恒久診断。env 未指定では何も出さない。加算だけなので出力は変わらない)。
+        if spec_on && env_flag("DENNO_SPEC_STATS") {
+            let rate = if spec_offered > 0 {
+                spec_accepted as f64 / spec_offered as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[SPEC] steps={spec_steps} confirmed={spec_confirmed} accepted={spec_accepted} offered={spec_offered} accept={rate:.3} tok/step={:.2}",
+                spec_confirmed as f64 / spec_steps.max(1) as f64
+            );
+        }
         prof_flash("decode", out.len());
         // P78: `DENNO_PRE_KPROF=1` のときだけ、層の外の区間を 2 行で出す
         // (既定 off では `report` が空を返す = 出力ゼロ)。
