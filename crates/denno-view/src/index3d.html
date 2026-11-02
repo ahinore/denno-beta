@@ -24,12 +24,14 @@
   .neu { color:var(--neu); }
   #legend { right:14px; top:12px; text-align:right; color:var(--dim); line-height:1.75; }
   #layers { left:14px; bottom:12px; color:var(--dim); }
-  #lstrip { display:grid; grid-template-columns:repeat(48, 13px); gap:1px; margin-top:5px; pointer-events:auto; }
-  #lstrip .cell { position:relative; height:35px; }
+  #lstrip { display:grid; grid-template-columns:repeat(48, 20px); gap:1px; margin-top:5px; pointer-events:auto; }
+  #lstrip .cell { position:relative; height:150px; }
   #lstrip .cell i { position:absolute; left:0; right:0; display:block; transform-origin:bottom; transform:scaleY(0); }
-  #lstrip .cell i.v { bottom:20px; height:11px; background:var(--vram); box-shadow:0 0 5px rgba(0,234,255,.55); }
-  #lstrip .cell i.h { bottom:10px; height:9px;  background:var(--ram);  box-shadow:0 0 5px rgba(255,176,32,.45); }
-  #lstrip .cell i.n { bottom:1px;  height:8px;  background:var(--gdn);  box-shadow:0 0 5px rgba(0,217,160,.45); }
+  #lstrip .cell i.v { bottom:88px; height:56px; background:var(--vram); box-shadow:0 0 5px rgba(0,234,255,.55); }
+  #lstrip .cell i.h { bottom:52px; height:30px; background:var(--ram);  box-shadow:0 0 5px rgba(255,176,32,.45); }
+  #lstrip .cell i.n { bottom:6px;  height:38px; background:var(--gdn);  box-shadow:0 0 5px rgba(0,217,160,.45); }
+  #lstrip .cell b { position:absolute; left:0; right:0; text-align:center; font-size:7px; font-weight:700;
+                    letter-spacing:0; color:rgba(2,14,20,.92); display:none; pointer-events:none; }
   #lstrip .cell.qsa { border-left:1px solid rgba(180,107,255,.60); padding-left:1px; }
   #lstrip .cell.cur { outline:1px solid rgba(207,238,255,.85); }
   #lstrip .cell u { position:absolute; left:0; bottom:-10px; font-size:8px; letter-spacing:0;
@@ -100,7 +102,7 @@
 <div id="layers" class="panel">
   <div>layers 00-47: 上段 <span class="vram">VRAM 常駐 expert</span> / 中段 <span class="ram">加熱 (選択履歴)</span> /
        下段 <span class="gdn">最多 expert の累計選択回数</span> · 1 列 = 1 層 · 縦線 = QSA (4 層に 1 層) ·
-       現在層は白枠 · ホバーで内訳 (下段は最大層を 1.0 とする相対値)</div>
+       バー中の数値 = そのままの値 (短いバーでは省略) · 現在層は白枠 · ホバーで内訳 (下段は最大層を 1.0)</div>
   <div id="lstrip"></div>
 </div>
 <div id="chat">
@@ -1266,12 +1268,28 @@ function ensureLayerStrip() {
     const barV = document.createElement('i'); barV.className = 'v';
     const barH = document.createElement('i'); barH.className = 'h';
     const barN = document.createElement('i'); barN.className = 'n';
+    const labV = document.createElement('b'), labH = document.createElement('b'), labN = document.createElement('b');
     const lab = document.createElement('u');
     lab.textContent = 'L' + String(il).padStart(2, '0');
     if (!isQSA(il)) lab.className = 'off';
-    cell.appendChild(barV); cell.appendChild(barH); cell.appendChild(barN); cell.appendChild(lab);
+    cell.appendChild(barV); cell.appendChild(barH); cell.appendChild(barN);
+    cell.appendChild(labV); cell.appendChild(labH); cell.appendChild(labN); cell.appendChild(lab);
     lstrip.appendChild(cell);
-    lcells.push({ cell, barV, barH, barN });
+    lcells.push({ cell, barV, barH, barN, labV, labH, labN });
+  }
+}
+// バー + 数値ラベル (バーの中央に入る大きさのときだけ表示)
+const BAR_GEO = { v: [56, 88], h: [30, 52], n: [38, 6] };   // [高さ, 底位置] = CSS と対にして維持
+function setBar(bar, lab, val, kind, scale) {
+  const base = BAR_GEO[kind][0], bot = BAR_GEO[kind][1];
+  bar.style.transform = 'scaleY(' + scale.toFixed(3) + ')';
+  const px = base * scale;
+  if (val > 0 && px >= 10) {
+    lab.textContent = val;
+    lab.style.display = 'block';
+    lab.style.bottom = Math.round(bot + px / 2 - 4) + 'px';
+  } else {
+    lab.style.display = 'none';
   }
 }
 function updateLayerStrip(vcnt, hcnt, ncnt, mcnt, nmax) {
@@ -1281,9 +1299,9 @@ function updateLayerStrip(vcnt, hcnt, ncnt, mcnt, nmax) {
   // 下段 (累計選択) は層間の偏りを見るため、最多 expert の累計が最大の層を 1.0 とする相対スケール。
   for (let il = 0; il < LAYERS; il++) {
     const c = lcells[il];
-    c.barV.style.transform = 'scaleY(' + h(vcnt[il]).toFixed(3) + ')';
-    c.barH.style.transform = 'scaleY(' + h(hcnt[il]).toFixed(3) + ')';
-    c.barN.style.transform = 'scaleY(' + (nmax > 0 ? mcnt[il] / nmax : 0).toFixed(3) + ')';
+    setBar(c.barV, c.labV, vcnt[il], 'v', h(vcnt[il]));
+    setBar(c.barH, c.labH, hcnt[il], 'h', h(hcnt[il]));
+    setBar(c.barN, c.labN, mcnt[il], 'n', nmax > 0 ? mcnt[il] / nmax : 0);
     c.cell.title = 'L' + String(il).padStart(2, '0') + (isQSA(il) ? ' (QSA)' : ' (GDN)')
       + ' · VRAM ' + vcnt[il] + '/' + EXPERTS + ' · 加熱 ' + hcnt[il] + '/' + EXPERTS
       + ' · 累計選択 平均 ' + ncnt[il].toFixed(2) + ' 回/expert · 最多 expert ' + mcnt[il] + ' 回';
