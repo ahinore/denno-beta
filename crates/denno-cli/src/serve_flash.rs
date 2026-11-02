@@ -23,7 +23,10 @@ use denno_engine::gguf::GgufFile;
 use denno_engine::model::prekprof;
 use denno_engine::model::qwen4exp::{Qwen4Exp, Qwen4ExpParams, TapTokens};
 use denno_engine::model::qwen4exp_attn::FullAttn;
-use denno_engine::model::qwen4exp_decode::{DecoderConfig, Qwen4ExpDecoder};
+use denno_engine::model::qwen4exp_decode::{argmax, DecoderConfig, Qwen4ExpDecoder};
+use denno_engine::spec_ngram::{
+    NgramIndex, DEFAULT_CAND_KEEP, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_SUFFIX,
+};
 use denno_engine::model::qwen4exp_ssm::SsmAttn;
 use denno_engine::sampler::Sampler;
 use denno_engine::tok_gguf::GgufTokenizer;
@@ -307,6 +310,78 @@ fn prof_flash_q4(tag: &str, tok: usize) {
     q4prof::reset();
 }
 
+/// P109: 貪欲 (argmax) のトークン id。spec の照合は greedy が前提。
+///
+/// serve の sampler は `temperature <= 0` でも greedy にならない
+/// (`Sampler::new(None)` が temperature 1.0 扱いになる既存の挙動) ので、
+/// spec 経路では engine の argmax を直接使う。
+fn greedy_u32(logits: &[f32]) -> Result<u32> {
+    let i = argmax(logits).map_err(|e| anyhow::anyhow!("{e}"))?;
+    u32::try_from(i).map_err(|_| anyhow::anyhow!("argmax の {i} が u32 に収まらない"))
+}
+
+/// 確定トークン 1 個ぶんの本文差分処理 (P109 で spec/通常の両経路から呼ぶ)。
+///
+/// 従来の decode ループ内にあった処理をそのまま関数にしたもの
+/// (UTF-8 未完成の末尾保留・停止語の切り詰め・差分 emit)。戻り値は
+/// 「生成を続けるなら true」。停止語に当たった / emit が失敗したら false
+/// (emit の失敗は `failed` に入れる。リクエスト全体の失敗として最後に返す)。
+fn emit_confirmed(
+    tok: &GgufTokenizer,
+    out: &mut Vec<u32>,
+    text: &mut String,
+    last_full: &mut Option<String>,
+    stop_hit: &mut Option<String>,
+    failed: &mut Option<anyhow::Error>,
+    stop_sequences: &[String],
+    id: u32,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> bool {
+    out.push(id);
+    let full = tok.decode(out).unwrap_or_default();
+    // 未完成の UTF-8 末尾は lossy デコードで U+FFFD になる。それをそのまま
+    // emit すると、次のトークンで文字が完成したときに starts_with 照合が
+    // 壊れてその文字が欠落する。末尾に連続する U+FFFD は保留し、文字が
+    // 完成してから出す (本物の U+FFFD でも 1 トークン遅れで出るだけ)。
+    if full.len() > text.len() && full.starts_with(text.as_str()) {
+        let mut emit_end = full.len();
+        while emit_end >= text.len() + 3 && full[..emit_end].ends_with('\u{FFFD}') {
+            emit_end -= 3;
+        }
+        // 停止語が本文に現れたら、そこまでで切る
+        let mut cut: Option<usize> = None;
+        for s in stop_sequences {
+            if let Some(i) = full.find(s.as_str()) {
+                cut = Some(cut.map_or(i, |c: usize| c.min(i)));
+            }
+        }
+        if let Some(c) = cut {
+            let keep = &full[..c];
+            if keep.len() > text.len() {
+                if let Err(e) = emit(&keep[text.len()..]) {
+                    *failed = Some(e);
+                }
+            }
+            *text = keep.to_string();
+            *last_full = Some(text.clone());
+            *stop_hit = Some("stop_sequence".into());
+            return false;
+        }
+        if emit_end > text.len() {
+            if let Err(e) = emit(&full[text.len()..emit_end]) {
+                *failed = Some(e);
+                return false;
+            }
+        }
+        *text = full[..emit_end].to_string();
+        *last_full = Some(full);
+    } else {
+        *last_full = Some(full.clone());
+        *text = full;
+    }
+    true
+}
+
 impl Flash {
     /// モデルを組む (mmap 越し)。
     fn build_model(&self) -> Result<Qwen4Exp> {
@@ -451,8 +526,117 @@ impl Flash {
         } else {
             None
         };
+        // P109: n-gram 投機的デコード (greedy 専用、既定 off)。
+        // - `DENNO_SPEC=1` で有効
+        // - greedy (temperature <= 0) のときだけ (spec は貪欲照合が前提)
+        // - テレメトリの層活性タップ (ACT) 有効時は off (tap は Step 幅 1 前提)
+        // - `DENNO_SPEC_K` で draft の最大長 (既定 4、上限 16)
+        let spec_on = env_flag("DENNO_SPEC") && req.temperature <= 0.0 && !self.act_on();
+        let spec_k = if spec_on {
+            std::env::var("DENNO_SPEC_K")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .map(|k| k.clamp(1, 16))
+                .unwrap_or(4)
+        } else {
+            0
+        };
+        let mut ngram =
+            NgramIndex::new(DEFAULT_MAX_SUFFIX, DEFAULT_MAX_ENTRIES, DEFAULT_CAND_KEEP, spec_k);
+        if spec_on {
+            ngram.feed(dec.tokens());
+        }
         let t2 = Instant::now();
-        for _ in 0..req.max_tokens {
+        'gen: while out.len() < req.max_tokens {
+            if spec_on {
+                // P109: n-gram 投機ステップ。q0 は engine の argmax (greedy)。
+                let cand = if t_on { Some(denno_telemetry::topk_softmax(&logits, 8)) } else { None };
+                let t_s = prekprof::stamp();
+                let q0 = match greedy_u32(&logits) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                };
+                prekprof::mark(t_s, prekprof::SAMPLE);
+                prekprof::note_sample();
+                if Some(q0) == eos {
+                    break;
+                }
+                let draft = ngram.draft(dec.tokens(), spec_k);
+                let t_step = t_on.then(Instant::now);
+                let outcome = match dec.spec_verify(q0, &draft, true, eos) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        failed = Some(e.into());
+                        break;
+                    }
+                };
+                ngram.feed(dec.tokens());
+                let pos0 = dec.tokens().len() - outcome.confirmed.len();
+                // max_tokens に収まるぶんだけ出す (はみ出した確定トークンはモデルの
+                // 状態には残るが本文には出さない = max_tokens を厳守する)。
+                let room = req.max_tokens - out.len();
+                let n_emit = outcome.confirmed.len().min(room);
+                for &id in outcome.confirmed[..n_emit].iter() {
+                    if !emit_confirmed(
+                        &self.tok,
+                        &mut out,
+                        &mut text,
+                        &mut last_full,
+                        &mut stop_hit,
+                        &mut failed,
+                        &req.stop_sequences,
+                        id,
+                        &mut emit,
+                    ) {
+                        break 'gen;
+                    }
+                }
+                if t_on {
+                    if let Some(t0) = t_step {
+                        // Step の width は確定トークン数 (通常経路は 1)。
+                        self.telem.emit(Frame::Step {
+                            width: n_emit as u32,
+                            ns: t0.elapsed().as_nanos() as u64,
+                        });
+                    }
+                    for (i, &id) in outcome.confirmed[..n_emit].iter().enumerate() {
+                        self.telem.emit(Frame::Token {
+                            session: sid,
+                            token: id,
+                            pos: (pos0 + i + 1) as u32,
+                        });
+                    }
+                    if let Some(tk) = cand.as_ref() {
+                        self.telem.emit(Frame::TopK {
+                            session: sid,
+                            chosen: q0,
+                            entropy_f16: denno_telemetry::f32_to_f16_bits(tk.entropy),
+                            entries: tk
+                                .entries
+                                .iter()
+                                .map(|&(tid, p)| (tid, denno_telemetry::f32_to_f16_bits(p)))
+                                .collect(),
+                        });
+                    }
+                    self.telem.emit(Frame::KvUsage {
+                        busy: vec![true],
+                        t_lens: vec![dec.tokens().len() as u32],
+                    });
+                }
+                if n_emit < outcome.confirmed.len() {
+                    // max_tokens で満杯 (残りの確定トークンは出さない)。
+                    break;
+                }
+                if outcome.eos {
+                    break;
+                }
+                logits = outcome.logits;
+                continue;
+            }
+            // ---- 通常経路 (P108 までと同じ。emit の差分処理を helper 化) ----
             // P58: 選ぶ前の分布を top-8 で送る (3D ビューワの候補表示用)。
             // テレメトリ OFF なら計算しない。数値経路には触れない。
             let cand = if t_on { Some(denno_telemetry::topk_softmax(&logits, 8)) } else { None };
@@ -464,49 +648,18 @@ impl Flash {
             if Some(id) == eos {
                 break;
             }
-            out.push(id);
-            let full = self.tok.decode(&out).unwrap_or_default();
-            // 未完成の UTF-8 末尾は lossy デコードで U+FFFD になる。それをそのまま
-            // emit すると、次のトークンで文字が完成したときに starts_with 照合が
-            // 壊れてその文字が欠落する (日本語のマルチバイト文字がトークン境界で
-            // 分断されたとき「�」のまま本文が消える症状)。
-            // 末尾に連続する U+FFFD は保留し、文字が完成してから出す。
-            // 本物の U+FFFD でも 1 トークン遅れで出るだけ。
-            if full.len() > text.len() && full.starts_with(&text) {
-                let mut emit_end = full.len();
-                while emit_end >= text.len() + 3 && full[..emit_end].ends_with('\u{FFFD}') {
-                    emit_end -= 3;
-                }
-                // 停止語が本文に現れたら、そこまでで切る
-                let mut cut: Option<usize> = None;
-                for s in &req.stop_sequences {
-                    if let Some(i) = full.find(s.as_str()) {
-                        cut = Some(cut.map_or(i, |c: usize| c.min(i)));
-                    }
-                }
-                if let Some(c) = cut {
-                    let keep = &full[..c];
-                    if keep.len() > text.len() {
-                        if let Err(e) = emit(&keep[text.len()..]) {
-                            failed = Some(e);
-                        }
-                    }
-                    text = keep.to_string();
-                    last_full = Some(text.clone());
-                    stop_hit = Some("stop_sequence".into());
-                    break;
-                }
-                if emit_end > text.len() {
-                    if let Err(e) = emit(&full[text.len()..emit_end]) {
-                        failed = Some(e);
-                        break;
-                    }
-                }
-                text = full[..emit_end].to_string();
-                last_full = Some(full);
-            } else {
-                last_full = Some(full.clone());
-                text = full;
+            if !emit_confirmed(
+                &self.tok,
+                &mut out,
+                &mut text,
+                &mut last_full,
+                &mut stop_hit,
+                &mut failed,
+                &req.stop_sequences,
+                id,
+                &mut emit,
+            ) {
+                break;
             }
             let t_step = t_on.then(Instant::now);
             let pos = dec.tokens().len() as u32;

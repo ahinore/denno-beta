@@ -1513,6 +1513,66 @@ pub trait LayerAttn: Send {
     fn layer_major_safe(&self) -> bool {
         false
     }
+
+    /// P109: n-gram 投機的デコードの巻き戻し ([`Self::spec_restore`]) に対応するか。
+    ///
+    /// 既定は `false` (安全側 = spec の batch 経路は逐次に落ちる)。状態の持ち方が
+    /// 「長さを戻せば復元できる」実装 (full attention の KV など) だけが `true`。
+    fn spec_restorable(&self) -> bool {
+        false
+    }
+
+    /// P109: 現在の状態を保存する ([`Self::spec_restore`] と対で使う)。
+    ///
+    /// 戻り値は実装固有の型を `Box<dyn Any + Send>` に入れたもの
+    /// (FullAttn は [`SpecFullSnap`]、SsmAttn は [`SpecGdnSnap`])。restore は
+    /// スナップショットを作った同じオブジェクトにしか呼ばれないので
+    /// downcast で受ける (違う型を渡したら panic = 呼び出し側のバグ)。
+    fn spec_snapshot(&self) -> Box<dyn std::any::Any + Send> {
+        Box::new(())
+    }
+
+    /// P109: [`Self::spec_snapshot`] の状態へ戻す (検証列を棄却したとき)。
+    fn spec_restore(
+        &mut self,
+        _snap: &dyn std::any::Any,
+    ) -> std::result::Result<(), Qwen4ExpError> {
+        Ok(())
+    }
+}
+
+/// P109: [`crate::model::qwen4exp_attn::FullAttn`] の spec スナップショット。
+///
+/// KV は push でしか伸びないので、復元は「層ごとの長さを戻す」だけで足りる
+/// ([`crate::model::qwen4exp_attn::AttnCache::truncate_layer`]。領域は残る)。
+/// QSA 有効時は巻き戻しに非対応 (`spec_restorable == false`) ので使われない。
+pub struct SpecFullSnap {
+    /// 全体位置 ([`crate::model::qwen4exp_attn::FullAttn::pos`])。
+    pub pos: usize,
+    /// 層ごとの KV 長 (full attention 層以外の層も含む全層分)。
+    pub lens: Vec<usize>,
+}
+
+/// P109: [`crate::model::qwen4exp_ssm::SsmAttn`] の spec スナップショット。
+///
+/// GDN 状態 (conv / ssm) を層ごと clone して持ち、full attention 側は
+/// 委譲先の実装固有スナップショットに任せる。`prefix_cache` の GDN
+/// スナップショットと同じ (conv, ssm) 形だが依存を切るため独立の型。
+pub struct SpecGdnSnap {
+    /// 層ごとの GDN 状態 (full attention 層は `None`)。
+    pub gdn: Vec<Option<(Vec<f32>, Vec<f32>)>>,
+    /// 委譲先 (full attention 実装) のスナップショット。
+    pub full: Box<dyn std::any::Any + Send>,
+}
+
+/// P109: spec decode ([`Qwen4ExpDecoder::spec_verify`]) の巻き戻し用スナップショット。
+///
+/// モデルの状態は (1) PLE の conv 履歴と (2) attention 実装の状態
+/// (full attention の KV / ssm の GDN) の 2 箇所で進む。検証列を棄却したときは
+/// この 2 つを揃えて戻さないと次のステップが静かに壊れる。
+pub struct SpecSnapshot {
+    ple: Vec<Option<Vec<f32>>>,
+    attn: Box<dyn std::any::Any + Send>,
 }
 
 /// F1 の恒等実装。`cur` をそのまま返す (attention / ssm は F2 / F3)。
@@ -2712,10 +2772,96 @@ impl Qwen4Exp {
         ctx: &[u32],
         chunk: usize,
         tokens: TapTokens,
-        mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+        on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
         roles: Option<&mut RoleRms>,
     ) -> Result<Vec<f32>> {
-        if ctx.is_empty() {
+        // P109: 従来経路は「最後の 1 位置だけ」。本体 (`forward_prefill_batch_core`)
+        // に collect_all=false で渡すだけで、呼び出し規約も数値も不変。
+        let mut all =
+            self.forward_prefill_batch_core(ctx, chunk, tokens, on_layer, roles, false, 0)?;
+        Ok(all
+            .pop()
+            .expect("collect_all=false は最後の位置の logits を返す"))
+    }
+
+    /// P109: 検証列を 1 回の forward で回し、**検証トークンごとの logits** を返す。
+    ///
+    /// n-gram 投機的デコード ([`crate::model::qwen4exp_decode::Qwen4ExpDecoder::spec_verify`])
+    /// の検証用。`ctx` は PLE 索引の窓ぶんの履歴 (`n_hist` 個) + 検証列で、
+    /// **食うのは `ctx[n_hist..]` だけ** (履歴は窓を作るためだけで、状態は進まない)。
+    /// 戻り値 `[i]` は `ctx[n_hist..][..=i]` を食った直後の logits
+    /// (位置 i が次の 1 トークンを予測する)。`layer_major_safe` な実装は
+    /// 1 チャンクの層優先バッチで回し、そうでない実装は逐次で集める
+    /// (同じトークンを同じ順で食う)。
+    ///
+    /// 数値: 層優先バッチは prefill と同じ `gemv_batch` (P-PF-GB、FMA 融合 +
+    /// 加算順が違う) を通るので、逐次 decode ([`Self::forward_token_at`]) とは
+    /// **ビット一致しない** (prefill の数値契約は解除済み。ULP 差で greedy が
+    /// 反転することは稀)。
+    pub fn forward_verify(&mut self, ctx: &[u32], n_hist: usize) -> Result<Vec<Vec<f32>>> {
+        if ctx.len() <= n_hist {
+            return Err(one("forward_verify: 検証列が空 (ctx が履歴と同じ長さ)"));
+        }
+        if self.attn.layer_major_safe() {
+            self.forward_prefill_batch_core(
+                ctx,
+                ctx.len() - n_hist,
+                TapTokens::Last,
+                None,
+                None,
+                true,
+                n_hist,
+            )
+        } else {
+            let nt = ctx.len() - n_hist;
+            let mut out = Vec::with_capacity(nt);
+            for i in 0..nt {
+                out.push(self.forward_token_at(&ctx[n_hist..][..=i], i, nt, None, None)?);
+            }
+            Ok(out)
+        }
+    }
+
+    /// P109: spec decode の巻き戻しに対応しているか (attention 実装に委譲)。
+    pub fn spec_restorable(&self) -> bool {
+        self.attn.spec_restorable()
+    }
+
+    /// P109: PLE conv 履歴 + attention 状態のスナップショットを取る。
+    pub fn spec_snapshot(&self) -> SpecSnapshot {
+        SpecSnapshot {
+            ple: self.ple_conv_state.clone(),
+            attn: self.attn.spec_snapshot(),
+        }
+    }
+
+    /// P109: [`Qwen4Exp::spec_snapshot`] の状態へ戻す (検証列の棄却時)。
+    pub fn spec_restore(&mut self, snap: &SpecSnapshot) -> Result<()> {
+        self.ple_conv_state = snap.ple.clone();
+        self.attn
+            .spec_restore(&*snap.attn)
+            .map_err(|e| one(format!("spec_restore: {e}")))
+    }
+
+    /// 層優先のバッチ prefill の本体 (P109 で `collect_all` を追加)。
+    ///
+    /// `collect_all == true` は全位置の logits を返す (検証列の照合用)。
+    /// `false` は従来どおり最後の 1 位置だけ (既存の呼び出し側はすべてこちら)。
+    /// それ以外の引数と処理順序は P108 までの
+    /// [`Self::forward_prefill_batch_tapped`] とまったく同じ (ビット不変)。
+    fn forward_prefill_batch_core(
+        &mut self,
+        ctx: &[u32],
+        chunk: usize,
+        tokens: TapTokens,
+        mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+        roles: Option<&mut RoleRms>,
+        collect_all: bool,
+        hist: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        // P109: `hist` は「ctx の先頭 hist 個は PLE の窓を作るためだけで、
+        // 食わない」ことを示す (検証列の照合用。既存の呼び出し側は 0)。
+        if ctx.len() <= hist {
             return Err(one("ctx が空 (現在のトークンが無い)"));
         }
         #[cfg(test)]
@@ -2733,7 +2879,12 @@ impl Qwen4Exp {
         let n_layer = self.p.n_layer;
         let chunk = chunk.max(1);
         let mut last: Option<HyperStreams> = None;
-        let mut start = 0usize;
+        // P109: collect_all は全位置の最終残差を保持する (検証列の各位置の logits)。
+        let mut all_ress: Vec<HyperStreams> = Vec::new();
+        let mut start = hist;
+        if start >= ctx.len() {
+            return Err(one("ctx が空 (現在のトークンが無い)"));
+        }
         // mix の要素演算の作業域 (実形で xn/gate 20 MB ずつ)。層ループの外で 1 回だけ持つ。
         let mut mx = MixScratch::default();
         // P78: チャンクぶんの PLE を行単位でまとめて引くか (既定 on)。
@@ -2930,7 +3081,11 @@ impl Qwen4Exp {
             prekprof::mark(t_lay, prekprof::LAYER);
 
             // 次のチャンクは自分の埋め込みから始まる (残差の持ち越しは無い)。
-            last = ress.pop();
+            if collect_all {
+                all_ress.append(&mut ress);
+            } else {
+                last = ress.pop();
+            }
             start = end;
         }
 
@@ -2949,7 +3104,23 @@ impl Qwen4Exp {
             }
         }
 
-        // 4. 最終 mixer (output_norm の代わり) + 5. logits (最後のトークンだけ)
+        // 4. 最終 mixer (output_norm の代わり) + 5. logits
+        if collect_all {
+            // P109: 全位置の logits (検証列の照合用)。演算は最後の 1 位置と
+            // 同じ (hc_mix_quant + head GEMV) を位置の数だけ繰り返す。
+            let mut out = Vec::with_capacity(all_ress.len());
+            for res in &all_ress {
+                let t_fin = prekprof::stamp();
+                let cur = hc_mix_quant(res, &self.head.norm, &self.head.down, &self.head.up, None, &hp)?.0;
+                prekprof::mark(t_fin, prekprof::FINAL_NORM);
+                let mut logits = vec![0.0f32; self.head.output.n()];
+                let t_head = prekprof::stamp();
+                self.head_logits_into(&cur, &mut logits)?;
+                prekprof::mark(t_head, prekprof::HEAD);
+                out.push(logits);
+            }
+            return Ok(out);
+        }
         let res = last.ok_or_else(|| one("ctx が空 (現在のトークンが無い)"))?;
         let t_mix = headprof::stamp();
         let t_fin = prekprof::stamp();
@@ -2968,7 +3139,8 @@ impl Qwen4Exp {
         let t_head = prekprof::stamp();
         self.head_logits_into(&cur, &mut logits)?;
         prekprof::mark(t_head, prekprof::HEAD);
-        Ok(logits)
+        // P109: 本体は全位置の形で返す (従来経路は最後の 1 位置だけ)。
+        Ok(vec![logits])
     }
 }
 

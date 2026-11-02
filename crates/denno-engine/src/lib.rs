@@ -17,6 +17,7 @@ pub mod prefix_cache;
 pub mod prof;
 pub mod quant;
 pub mod sampler;
+pub mod spec_ngram;
 pub mod tensor;
 pub mod tok_gguf;
 pub mod tokenizer;
