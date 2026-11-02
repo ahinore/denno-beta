@@ -269,8 +269,8 @@ label('DISK', '#ff3b6b', 4.2, 7.4, TIER_Y[TIER.SSD], -3.0);
 // LayerAct の idx は「その層の残差ストリームの index」(0..2559)。expert ではない。
 // 壁は X-Y 平面 (カメラ側を向く) に 64 列 x 40 行。index i -> col = i % 64, row = i / 64。
 const NW = 64, NH = EMB / NW;          // 40
-const NWX0 = -13.9, NWX1 = -9.7, NWY = 5.0;
-const neuGeo = new THREE.BoxGeometry(0.052, 0.205, 0.046);
+const NWX0 = -14.3, NWX1 = -9.8, NWY = 5.7;
+const neuGeo = new THREE.BoxGeometry(0.068, 0.255, 0.058);
 const walls = [];
 for (let il = 0; il < LAYERS; il++) {
   const inst = new THREE.InstancedMesh(neuGeo, new THREE.MeshBasicMaterial({ color: 0xffffff, fog: true }), EMB);
@@ -296,7 +296,19 @@ for (let il = 0; il < LAYERS; il++) {
     color: isQSA(il) ? 0x5a3f8a : 0x1d5f5a, transparent: true, opacity: 0.55, depthWrite: false })));
   walls.push({ il, inst, act: new Float32Array(EMB), lit: 0 });
 }
+label('residual stream 2560 (heat = 発火の蓄積)', '#7fd6e8', 6.0, -12.05, NWY + 0.9, zOf(0) + 0.6);
 const hotWalls = new Set();
+
+// ヒートマップの色階調: 暗い底 -> 単発=シアン -> 複数回=アンバー -> 頻繁=濃いオレンジ
+const HEAT_T = [0, 0.35, 0.65, 1];
+const HEAT = [COL.neuBase, new THREE.Color('#00b8d4'), new THREE.Color('#ffd24d'), new THREE.Color('#ff4d1f')];
+const HEAT_WHITE = new THREE.Color('#ffffff');
+const heatTmp = new THREE.Color();
+function heatCol(a, out) {
+  if (a <= HEAT_T[1]) out.copy(HEAT[0]).lerp(HEAT[1], a / HEAT_T[1]);
+  else if (a <= HEAT_T[2]) out.copy(HEAT[1]).lerp(HEAT[2], (a - HEAT_T[1]) / (HEAT_T[2] - HEAT_T[1]));
+  else out.copy(HEAT[2]).lerp(HEAT[3], (a - HEAT_T[2]) / (HEAT_T[3] - HEAT_T[2]));
+}
 
 function paintWall(il) {
   const w = walls[il], col = w.inst.instanceColor.array;
@@ -309,11 +321,9 @@ function paintWall(il) {
       continue;
     }
     lit++;
-    const v = a * a * 0.9 + a * 0.1;
-    const wb = Math.max(0, a - 0.72) * 2.2;
-    col[o]     = COL.neuBase.r + (COL.neuHot.r - COL.neuBase.r) * v + (1 - COL.neuHot.r) * wb;
-    col[o + 1] = COL.neuBase.g + (COL.neuHot.g - COL.neuBase.g) * v + (1 - COL.neuHot.g) * wb;
-    col[o + 2] = COL.neuBase.b + (COL.neuHot.b - COL.neuBase.b) * v + (1 - COL.neuHot.b) * wb;
+    heatCol(a, heatTmp);
+    if (a > 0.95) heatTmp.lerp(HEAT_WHITE, (a - 0.95) * 6);
+    col[o] = heatTmp.r; col[o + 1] = heatTmp.g; col[o + 2] = heatTmp.b;
   }
   w.lit = lit;
   w.inst.instanceColor.needsUpdate = true;
@@ -327,7 +337,8 @@ function lightNeurons(il, idx, val) {
     const k = idx[i] | 0;
     if (k < 0 || k >= EMB) continue;
     const v = Math.max(0, Math.min(1, (val && val[i]) || 0));
-    if (v > w.act[k]) w.act[k] = v;
+    // 蓄積ヒートマップ: 発火のたびに加算 (頻繁に発火する位置ほど濃く残る)
+    w.act[k] = Math.min(1, w.act[k] + 0.15 + 0.25 * v);
   }
   paintWall(il);
   hotWalls.add(il);
@@ -358,7 +369,7 @@ for (let b = 0; b < HB; b++) {
   scene.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({
     color: 0x1d5f74, transparent: true, opacity: 0.30, blending: THREE.AdditiveBlending, depthWrite: false })));
   label('HB' + String(b).padStart(2, '0') + ' L' + (b * INTERVAL) + '-' + (b * INTERVAL + INTERVAL - 1) +
-        ' 1xQSA+3xGDN', '#3fd6ea', 3.4, -15.8, -1.5, mid);
+        ' 1xQSA+3xGDN', '#3fd6ea', 3.4, -16.6, -1.5, mid);
 }
 
 // ===== 3) expert (層ごとに 512 個を 32x16 で敷く) =========================
@@ -389,6 +400,11 @@ for (let il = 0; il < LAYERS; il++) {
                selN: new Uint32Array(EXPERTS),
                used: new Float32Array(EXPERTS), dirty: new Uint8Array(EXPERTS), route: [] });
 }
+
+// 層番号ラベル (expert グリッドの脇、4 層ごと + 最終層)
+for (let il = 0; il < LAYERS; il += 4)
+  label('L' + String(il).padStart(2, '0'), '#4d6470', 1.7, X.exp0 - 0.8, TIER_Y[0] + 0.8, zOf(il));
+label('L47', '#4d6470', 1.7, X.exp0 - 0.8, TIER_Y[0] + 0.8, zOf(LAYERS - 1));
 
 // ===== 4) 役割ブロック (mixer / gate / router / shared / GR) ==============
 function blockSet(count, makeGeo, color) {
@@ -1195,7 +1211,7 @@ function step(dt, doRender) {
       let any = 0;
       for (let i = 0; i < EMB; i++) {
         const a = w.act[i];
-        if (a > 0.004) { w.act[i] = a * (demo.on ? 0.955 : 0.90); any = 1; }
+        if (a > 0.004) { w.act[i] = a * (demo.on ? 0.975 : 0.985); any = 1; }
       }
       paintWall(il);
       nlit += w.lit;
