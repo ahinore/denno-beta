@@ -188,10 +188,10 @@ mod tests {
         let mut d = idx(3, 100, 8, 4);
         let toks: Vec<u32> = (0..12).map(|i| (i % 5) as u32).collect();
         d.feed(&toks);
-        // 繰り返し列なら最長一致 (3) で引ける。末尾が [.., 1, 2] (i=10,11) の
-        // suffix は [0,1,2] (i=7..9) に一致し、継続は [3,4,0,..]。
         let draft = d.draft(&toks, 4);
-        assert_eq!(draft, vec![3, 4, 0, 1], "{draft:?}");
+        // 末尾 3 トークンは [4,0,1] だが、このキーは登録されていない (キーは
+        // 位置 i の手前まで)。次に長い s=2 の [0,1] で引け、継続は [2,3,4,0]。
+        assert_eq!(draft, vec![2, 3, 4, 0], "{draft:?}");
     }
 
     #[test]
@@ -199,13 +199,9 @@ mod tests {
         let mut d = idx(3, 100, 8, 4);
         // 末尾 [41,42] は 1 回しか出ないが [42] の継続なら引ける。
         d.feed(&[7, 8, 41, 42, 9, 7, 8, 43]);
-        let q = [41, 42];
-        // suffix [41,42] はキーとして存在しない (feed した位置 i=5 の suffix は
-        // [8,43] / [7,8] / [7] — 41,42 は継続側にしか出ない)。
-        // 末尾を [42] にすると suffix [42] (i=3 の 1 トークン suffix) で引ける。
+        // suffix [41,42] は位置 i=4 でキーとして登録されている (cont = [9,7,8,43])。
         let draft = d.draft(&[41, 42], 4);
         assert_eq!(draft, vec![9, 7, 8, 43], "{draft:?}");
-        assert!(d.draft(&q, 4).is_empty());
     }
 
     #[test]
@@ -224,11 +220,12 @@ mod tests {
     fn fifo_eviction_drops_oldest_entry() {
         let mut d = idx(1, 3, 1, 1);
         d.feed(&[1, 10, 2, 20, 3, 30, 4]);
-        // キー [1],[2],[3] が入る。次の feed で [4] が入り [1] が追い出される。
+        // キーは全位置に登録されるので、max_draft=1 では駆逐が速く進む。
         d.feed(&[1, 10, 2, 20, 3, 30, 4, 40, 5]);
         assert_eq!(d.len(), 3, "エントリ上限 3");
         assert!(d.draft(&[1], 1).is_empty(), "最古の [1] は落ちている");
-        assert_eq!(d.draft(&[2], 1), vec![20]);
+        assert!(d.draft(&[2], 1).is_empty(), "[2] も落ちている");
+        assert_eq!(d.draft(&[30], 1), vec![4]);
         assert_eq!(d.draft(&[4], 1), vec![40]);
     }
 
