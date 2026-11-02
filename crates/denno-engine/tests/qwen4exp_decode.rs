@@ -26,7 +26,8 @@ use denno_engine::model::qwen4exp_decode::{
 use denno_engine::model::qwen4exp_attn::FullAttn;
 use denno_engine::model::qwen4exp_ssm::SsmAttn;
 use denno_engine::ple::PLE_TABLE_NAME;
-use denno_engine::spec_ngram::NgramIndex;
+use denno_engine::sampler::Sampler;
+use denno_engine::spec_ngram::{offer_draft, NgramIndex};
 
 const ALIGN: usize = 32;
 
@@ -1326,10 +1327,11 @@ fn spec_batch_stops_at_eos_without_feeding_it() {
 /// spec (n-gram 辞書駆動・serve と同じ形) の greedy 出力は spec off と一致し、
 /// 受理が起きればステップ数が減る (P109)。
 ///
-/// 検証は逐次照合 1 本の経路 (serve_flash.rs の spec ループと同じ駆動)。
-/// 旧 batch 検証 forward は数値契約違反 (nt == 1 でも逐次とビットがずれる) ので
-/// spec から外した。この経路では各ステップの logits が通常 decode とビット一致
-/// する ([`spec_seq_step_matches_normal_decode_bitwise`] も参照)。
+/// 検証は逐次照合 1 本の経路。draft の候補生成は task 112 で serve と同じ
+/// [`offer_draft`] (「q0 を含む末尾」で引く) に揃えた。旧 batch 検証 forward は
+/// 数値契約違反 (nt == 1 でも逐次とビットがずれる) ので spec から外した。
+/// この経路では各ステップの logits が通常 decode とビット一致する
+/// ([`spec_seq_step_matches_normal_decode_bitwise`] も参照)。
 #[test]
 fn spec_ngram_driven_stream_matches_off_and_accepts_drafts() {
     let dir = TempDir::new("specbat");
@@ -1349,7 +1351,7 @@ fn spec_ngram_driven_stream_matches_off_and_accepts_drafts() {
     let mut offered_total = 0usize;
     while got.len() < want.len() {
         let q0 = greedy(&logits);
-        let draft = idx.draft(on.tokens(), 4);
+        let draft = offer_draft(&idx, on.tokens(), q0, 4, &logits, 0.0);
         let st = on.spec_verify(q0, &draft, None).expect("spec_verify");
         got.extend_from_slice(&st.confirmed);
         accepted_total += st.n_accepted;
@@ -1410,5 +1412,109 @@ fn spec_ngram_step_overhead() {
     assert!(
         per < 100_000.0,
         "辞書 1 ステップが {per:.0}ns かかりすぎる (decode 1 トークンの 0.1% を超える)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 112: serve 配線の再現 (spec on/off が同じ greedy 列になること)
+// ---------------------------------------------------------------------------
+
+/// serve_flash.rs と同じ駆動で spec on / off を回し、出力と logits のビットが
+/// 一致すること (task 112)。
+///
+/// GPU 実測 (main session) の矛盾「accept=0 なのに spec on の本文が off と
+/// 違う」は 2 つの serve 固有の配線違いで起きていた:
+///
+/// 1. off 側の Sampler に `None` を渡していた (`Sampler::new` が temperature
+///    1.0 扱い) ため、temp 0 の通常経路が貪欲でなく、spec 経路 (engine の
+///    argmax) と 1 トークン目からずれる。修正後の serve は temperature を
+///    そのまま渡す (`sample()` の `temperature <= 0` は argmax)。このテストの
+///    off 側は修正後の serve と同じ `Some(0.0)` を渡す。
+/// 2. spec 側の draft が「q0 を含まない末尾」で辞書を引いていたため、
+///    `draft[0]` が q0 スロットのトークンになり、パターンが繰り返っている
+///    ときほど最初の照合で必ず壊れる (accept=0 の原因)。
+///    修正後の serve は [`offer_draft`] (q0 込みの lookup)。受理が 0 だと
+///    このテストは落ちる。
+///
+/// 棄却された draft は食わないので、`on.tokens()` は常に prompt + 確定列
+/// (GDN / KV / PLE に棄却分の状態残留は出ない。109c の逐次照合の契約)。
+#[test]
+fn serve_wiring_spec_matches_greedy_off_and_accepts_drafts() {
+    let dir = TempDir::new("servew112");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    // プロンプトに反復を含める (辞書が prompt の継続を引ける形)。
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 1, 2, 3, 4, 5];
+    let n_gen = 24usize;
+
+    // ---- off: serve の通常経路 (temp 0 = greedy。修正後の Sampler 渡し) ----
+    let mut off = make_decoder_full(&f, 128);
+    let mut sampler = Sampler::new(Some(0.0), None, None, Some(42));
+    let l0 = off.prefill(&prompt).expect("prefill off");
+    let mut logits_off = l0.clone();
+    let mut want: Vec<u32> = Vec::with_capacity(n_gen);
+    for _ in 0..n_gen {
+        let id = sampler.sample(&logits_off) as u32;
+        want.push(id);
+        logits_off = off.step(id).expect("step off");
+    }
+
+    // ---- on: serve の spec 経路 (辞書 + offer_draft + spec_verify) ----
+    let mut on = make_decoder_full(&f, 128);
+    let mut idx = NgramIndex::new(3, 100_000, 8, 4);
+    let mut logits_on = on.prefill(&prompt).expect("prefill on");
+    assert_eq!(
+        bits(&l0),
+        bits(&logits_on),
+        "prefill の logits が一致しない"
+    );
+    idx.feed(on.tokens());
+    assert!(idx.fed() >= prompt.len(), "辞書が prompt を観測していない");
+    let mut got: Vec<u32> = Vec::new();
+    let mut accepted = 0usize;
+    let mut offered = 0usize;
+    while got.len() < want.len() {
+        let q0 = greedy(&logits_on);
+        let draft = offer_draft(&idx, on.tokens(), q0, 4, &logits_on, 0.0);
+        let st = on.spec_verify(q0, &draft, None).expect("spec_verify");
+        got.extend_from_slice(&st.confirmed);
+        accepted += st.n_accepted;
+        offered += draft.len();
+        // 棄却 draft が状態に残らない (tokens は prompt + 確定列だけ)。
+        assert_eq!(
+            on.tokens(),
+            &prompt
+                .iter()
+                .copied()
+                .chain(got.iter().copied())
+                .collect::<Vec<_>>()[..],
+            "tokens が確定列と食い違う (棄却 draft の状態残留)"
+        );
+        idx.feed(on.tokens());
+        logits_on = st.logits;
+    }
+    assert_eq!(
+        got, want,
+        "spec on の greedy 出力が spec off と一致しない (temp 0 は貪欲であること)"
+    );
+    assert_eq!(
+        bits(&logits_off),
+        bits(&logits_on),
+        "最終 logits が spec off とビット不一致"
+    );
+    assert_eq!(on.tokens().len(), prompt.len() + n_gen, "食った本数が違う");
+    assert_eq!(off.tokens().len(), prompt.len() + n_gen, "off 側の本数が違う");
+    assert!(
+        offered > 0,
+        "draft が一度も出ていない (辞書が学習していない)"
+    );
+    assert!(
+        accepted > 0,
+        "draft が一度も受理されない (accepted={accepted} offered={offered})"
+    );
+    assert!(
+        idx.fed() >= prompt.len() + n_gen,
+        "辞書が生成トークンを観測していない (fed={})"
+        ,
+        idx.fed()
     );
 }

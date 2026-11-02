@@ -163,6 +163,58 @@ impl NgramIndex {
     }
 }
 
+/// serve の spec ステップが draft 候補を 1 個作るところ (task 112)。
+///
+/// - 辞書は「`q0` を含む末尾」で引く。engine 側の `spec_verify` は `q0` を
+///   先に 1 トークン食い、`draft[0]` を「`q0` の**次**の位置」の貪欲予測と
+///   照合する。`q0` を含めないで引くと、継続の先頭 (＝ `q0` スロットの
+///   トークンそのもの) が `draft[0]` になり、パターンが繰り返しているときほど
+///   最初の照合で必ず壊れる (task 112 の accept=0 の原因。旧 serve 配線)。
+/// - `min_p > 0.0` のとき、候補の先頭トークンの softmax 確率 (現在の
+///   `logits`、＝ `q0` スロットの分布) が閾値未満なら draft を出さない
+///   (空を返す)。`DENNO_SPEC_MIN_P` 相当。既定 0 は無効で、softmax も
+///   計算しない。候補の生成だけに効く (照合・feed・モデル状態には触れない)。
+///
+/// `confirmed` は確定済みトークン列 (prompt + 生成済み)、`q0` は直前の
+/// logits の argmax で**まだ食っていない**次のトークン。
+pub fn offer_draft(
+    idx: &NgramIndex,
+    confirmed: &[u32],
+    q0: u32,
+    k: usize,
+    logits: &[f32],
+    min_p: f32,
+) -> Vec<u32> {
+    let mut key: Vec<u32> = Vec::with_capacity(confirmed.len() + 1);
+    key.extend_from_slice(confirmed);
+    key.push(q0);
+    let draft = idx.draft(&key, k);
+    if draft.is_empty() || min_p <= 0.0 {
+        return draft;
+    }
+    let i = draft[0] as usize;
+    if i >= logits.len() {
+        return draft;
+    }
+    // softmax の 1 要素ぶん (max 引きで exp のオーバーフローを避ける)。
+    let mut max = f32::NEG_INFINITY;
+    for &v in logits {
+        if v > max {
+            max = v;
+        }
+    }
+    let mut total = 0.0f32;
+    for &v in logits {
+        total += (v - max).exp();
+    }
+    let p = (logits[i] - max).exp() / total;
+    if p < min_p {
+        Vec::new()
+    } else {
+        draft
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +328,54 @@ mod tests {
         d.feed(&[1, 2]);
         assert!(d.fed() >= fed1);
         assert_eq!(d.draft(&[1, 2], 2), vec![3, 4]);
+    }
+
+    /// task 112: `offer_draft` は「`q0` を含む末尾」で辞書を引くので、
+    /// `draft[0]` は `q0` の**次**の位置に揃う。`q0` を含めない旧 serve 配線
+    /// (`NgramIndex::draft` に確定列をそのまま渡す) だと、継続の先頭
+    /// (＝ `q0` スロットのトークン) が `draft[0]` になり、`spec_verify` の
+    /// 最初の照合がパターン一致のときほど必ず壊れる (accept=0 の再現)。
+    #[test]
+    fn offer_draft_aligns_draft_after_q0() {
+        let mut d = idx(3, 100, 8, 4);
+        d.feed(&[1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3]);
+        // 末尾が [...,1,2,3] で q0 = 4 (履歴では [1,2,3] の継続は [4,1,2,3])。
+        let ctx: Vec<u32> = vec![1, 2, 3, 4, 1, 2, 3];
+        let logits = [0.0f32; 8];
+        let new = offer_draft(&d, &ctx, 4, 4, &logits, 0.0);
+        assert_eq!(new, vec![1, 2, 3], "draft[0] は q0 の次 (1) に揃う: {new:?}");
+        // 旧配線 (q0 を含めない) は継続の先頭 4 = q0 そのものを draft[0] にする。
+        let old = d.draft(&ctx, 4);
+        assert_eq!(old, vec![4, 1, 2, 3], "旧配線は q0 スロットから始まる: {old:?}");
+        assert_eq!(old[0], 4, "旧配線の draft[0] は q0 と同じスロット");
+    }
+
+    /// task 112: `min_p` は候補の先頭トークンの softmax 確率で offer を落とす。
+    /// 0 は無効 (確率が低くてもそのまま出す)。フィルタは候補の生成だけに効く。
+    #[test]
+    fn offer_draft_min_p_filters_low_probability_candidates() {
+        let mut d = idx(3, 100, 8, 4);
+        d.feed(&[1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3]);
+        let ctx: Vec<u32> = vec![1, 2, 3, 4, 1, 2, 3];
+        // トークン 1 (draft[0]) の確率を下げる: p(1) = e^-5 / (7 + e^-5) ≈ 9.6e-4。
+        let mut logits = vec![0.0f32; 8];
+        logits[1] = -5.0;
+        // 無効 (0) はそのまま出す。
+        assert_eq!(
+            offer_draft(&d, &ctx, 4, 4, &logits, 0.0),
+            vec![1, 2, 3],
+            "min_p=0 はフィルタしない"
+        );
+        // 閾値未満は出さない (空 = 通常 decode にフォールバック)。
+        assert!(
+            offer_draft(&d, &ctx, 4, 4, &logits, 0.5).is_empty(),
+            "低確率の候補は出さない"
+        );
+        // 閾値以上は出す。
+        assert_eq!(
+            offer_draft(&d, &ctx, 4, 4, &logits, 0.0009),
+            vec![1, 2, 3],
+            "確率が閾値以上の候補は出す"
+        );
     }
 }

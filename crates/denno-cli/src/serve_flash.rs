@@ -25,7 +25,7 @@ use denno_engine::model::qwen4exp::{Qwen4Exp, Qwen4ExpParams, TapTokens};
 use denno_engine::model::qwen4exp_attn::FullAttn;
 use denno_engine::model::qwen4exp_decode::{argmax, DecoderConfig, Qwen4ExpDecoder};
 use denno_engine::spec_ngram::{
-    NgramIndex, DEFAULT_CAND_KEEP, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_SUFFIX,
+    offer_draft, NgramIndex, DEFAULT_CAND_KEEP, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_SUFFIX,
 };
 use denno_engine::model::qwen4exp_ssm::SsmAttn;
 use denno_engine::sampler::Sampler;
@@ -312,9 +312,11 @@ fn prof_flash_q4(tag: &str, tok: usize) {
 
 /// P109: 貪欲 (argmax) のトークン id。spec の照合は greedy が前提。
 ///
-/// serve の sampler は `temperature <= 0` でも greedy にならない
-/// (`Sampler::new(None)` が temperature 1.0 扱いになる既存の挙動) ので、
-/// spec 経路では engine の argmax を直接使う。
+/// task 112 で serve の Sampler も temperature <= 0 で greedy になった
+/// (`Sampler::new` に temperature をそのまま渡す。以前は None を渡していて
+/// temperature 1.0 扱い = temp 0 でも確率サンプリングになっていた)。
+/// `Sampler::sample` の greedy 経路と選択規則は同じ (f32 生値の `>`、
+/// 同点は添字小) だが、こちらは engine の argmax で NaN をエラーにする。
 fn greedy_u32(logits: &[f32]) -> Result<u32> {
     let i = argmax(logits).map_err(|e| anyhow::anyhow!("{e}"))?;
     u32::try_from(i).map_err(|_| anyhow::anyhow!("argmax の {i} が u32 に収まらない"))
@@ -502,16 +504,12 @@ impl Flash {
         }
 
         prof_flash("prefill", n_prompt - reused);
-        let mut sampler = Sampler::new(
-            if req.temperature <= 0.0 {
-                None
-            } else {
-                Some(req.temperature)
-            },
-            req.top_k,
-            req.top_p,
-            Some(42),
-        );
+        // task 112: temperature をそのまま渡す。temperature <= 0 は
+        // `Sampler::sample` 内の greedy 経路 (argmax、同点は添字小) になる。
+        // 以前は None を渡していて `Sampler::new` が temperature 1.0 扱いにして
+        // いたため、spec off の temp 0 が貪欲にならず、spec on (engine の
+        // argmax) と出力がずれていた (accept=0 でも不一致になる原因)。
+        let mut sampler = Sampler::new(Some(req.temperature), req.top_k, req.top_p, Some(42));
         let eos = self.tok.eos();
         let mut out: Vec<u32> = Vec::new();
         let mut text = String::new();
@@ -531,6 +529,8 @@ impl Flash {
         // - greedy (temperature <= 0) のときだけ (spec は貪欲照合が前提)
         // - テレメトリの層活性タップ (ACT) 有効時は off (tap は Step 幅 1 前提)
         // - `DENNO_SPEC_K` で draft の最大長 (既定 4、上限 16)
+        // - `DENNO_SPEC_MIN_P` で draft 候補の先頭トークン確率の下限
+        //   (既定 0 = 無効。task 112。候補の生成だけに効く)
         let spec_on = env_flag("DENNO_SPEC") && req.temperature <= 0.0 && !self.act_on();
         let spec_k = if spec_on {
             std::env::var("DENNO_SPEC_K")
@@ -540,6 +540,15 @@ impl Flash {
                 .unwrap_or(4)
         } else {
             0
+        };
+        let spec_min_p = if spec_on {
+            std::env::var("DENNO_SPEC_MIN_P")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .map(|p| p.clamp(0.0, 1.0))
+                .unwrap_or(0.0)
+        } else {
+            0.0
         };
         let mut ngram =
             NgramIndex::new(DEFAULT_MAX_SUFFIX, DEFAULT_MAX_ENTRIES, DEFAULT_CAND_KEEP, spec_k);
@@ -570,7 +579,12 @@ impl Flash {
                 if Some(q0) == eos {
                     break;
                 }
-                let draft = ngram.draft(dec.tokens(), spec_k);
+                // task 112: 辞書は「q0 を含む末尾」で引く。spec_verify は q0 を
+                // 先に食い、draft[0] を「q0 の次」の貪欲予測と照合するので、
+                // q0 を含めないで引くと継続の先頭 (= q0 スロットのトークン) が
+                // draft[0] になり、パターンが繰り返すほど最初の照合で必ず壊れる
+                // (accept=0 の原因)。min_p > 0 なら低確率の候補は出さない。
+                let draft = offer_draft(&ngram, dec.tokens(), q0, spec_k, &logits, spec_min_p);
                 let t_step = t_on.then(Instant::now);
                 let outcome = match dec.spec_verify(q0, &draft, eos) {
                     Ok(o) => o,
