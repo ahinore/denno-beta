@@ -84,6 +84,28 @@ pub fn argmax(logits: &[f32]) -> Result<usize> {
     Ok(best)
 }
 
+/// argmax の添字をトークン id (u32) に落とす (語彙は u32 に収まる前提)。
+fn tok32(i: usize) -> Result<u32> {
+    u32::try_from(i).map_err(|_| one(format!("argmax の {i} が u32 に収まらない")))
+}
+
+/// P109: [`Qwen4ExpDecoder::spec_verify`] の結果。
+#[derive(Debug, Clone)]
+pub struct SpecStep {
+    /// 確定したトークン列 (古い順)。検証列で貪欲照合に一致した draft と、
+    /// その後に貪欲で選ばれたトークン (修正トークン / 次のトークン) を含む。
+    /// **EOS は含まない** (serve 契約「EOS は食わない」)。
+    pub confirmed: Vec<u32>,
+    /// 確定列の末尾で EOS に到達した。EOS は食っていないので
+    /// [`Self::confirmed`] には含まれず、[`Self::logits`] は空。
+    pub eos: bool,
+    /// 続行するときの次の logits。`confirmed` の最後のトークンを
+    /// 食い終わった直後の値 (`eos == true` のときは空)。
+    pub logits: Vec<f32>,
+    /// draft のうち貪欲照合で受理された本数 (診断・受理率の計測用)。
+    pub n_accepted: usize,
+}
+
 /// プロンプトを食わせて N トークン貪欲に伸ばす駆動部。
 pub struct Qwen4ExpDecoder {
     model: Qwen4Exp,
@@ -388,6 +410,204 @@ impl Qwen4ExpDecoder {
         // 100 トークンごとの階層統計)。arch off ならエンジン側で即座に戻る。
         self.model.arch_emit_token();
         Ok(logits)
+    }
+
+    /// P109: 1 トークン食わせて logits を返す (spec の逐次経路用)。
+    ///
+    /// [`Self::step_inner`] と同じ窓 (末尾 `ple_window` 個)・同じ `max_ctx` 検査。
+    /// 構造テレメトリ ([`Self::step`] が 1 トークンごとに送るもの) は
+    /// spec ステップの末尾で 1 回だけ送るので、ここでは送らない。
+    fn feed_one(&mut self, token: u32) -> Result<Vec<f32>> {
+        let max = self.cfg.max_ctx;
+        if max == 0 {
+            return Err(one("max_ctx が 0 (1 トークンも食わせられない)"));
+        }
+        if self.tokens.len() >= max {
+            return Err(one(format!(
+                "max_ctx {max} を超える: すでに {} トークンを食わせた",
+                self.tokens.len()
+            )));
+        }
+        let win = self.cfg.ple_window;
+        if win == 0 {
+            return Err(one("ple_window が 0 (PLE 索引の窓が無い)"));
+        }
+        self.tokens.push(token);
+        let start = self.tokens.len().saturating_sub(win);
+        let ctx: Vec<u32> = self.tokens[start..].to_vec();
+        self.model.forward_token_at(&ctx, 0, 1, None, None)
+    }
+
+    /// P109: n-gram 投機的デコードの検証ステップ。
+    ///
+    /// 前提: 呼び出し側は直前の logits から貪欲で選んだ次のトークン `q0` を
+    /// 持っているが、まだ食わせていない ([`Self::tokens`] に含まれない)。
+    /// `draft` は n-gram 辞書が取った継続候補 (最大 k 個、空も可)。
+    ///
+    /// 動作: `q0` と `draft` を検証列として食い、位置ごとに貪欲照合する。
+    /// 一致した draft と、その後の貪欲トークン (修正トークン / 続行トークン) を
+    /// 確定列として返す。戻る時点で確定列は全部食い終わっていて、
+    /// [`Self::tokens`] とモデルの状態が一致し、`logits` はその続きを予測する。
+    ///
+    /// - `batch == true` かつ restorable ([`crate::model::qwen4exp::Qwen4Exp::spec_restorable`])
+    ///   かつ draft が空でないときは、検証列を層優先 1 forward で回す
+    ///   ([`crate::model::qwen4exp::Qwen4Exp::forward_verify`])。棄却したら
+    ///   snapshot 復元して確定列だけを re-forward する。
+    /// - それ以外は逐次: トークン順に食いながら照合するので巻き戻し不要
+    ///   (通常 decode と同じコード・同じ順序 = **ビット一致**)。
+    /// - EOS は照合で到達した時点で打ち切り。受理せず食わない
+    ///   (`confirmed` に含まれない。serve 契約どおり)。
+    /// - `draft` が `max_ctx` を超えるぶんだけ長いときは切り詰める
+    ///   (通常 decode の到達点と同じ上限)。
+    ///
+    /// 数値: batch 経路の検証 forward は prefill と同じ `gemv_batch`
+    /// (P-PF-GB、FMA 融合) を通るので逐次 decode とはビット一致しない
+    /// (prefill の数値契約は解除済み)。逐次経路と通常 decode はビット一致する。
+    pub fn spec_verify(
+        &mut self,
+        q0: u32,
+        draft: &[u32],
+        batch: bool,
+        eos: Option<u32>,
+    ) -> Result<SpecStep> {
+        let max = self.cfg.max_ctx;
+        if max == 0 {
+            return Err(one("max_ctx が 0 (1 トークンも食わせられない)"));
+        }
+        let win = self.cfg.ple_window;
+        if win == 0 {
+            return Err(one("ple_window が 0 (PLE 索引の窓が無い)"));
+        }
+        // batch 経路の条件。draft が空なら通常 decode と同じなので逐次に落とす。
+        let use_batch = batch && !draft.is_empty() && self.model.spec_restorable();
+        if !use_batch {
+            // 逐次: トークン順に食いながら照合する (巻き戻し不要)。
+            let mut confirmed: Vec<u32> = Vec::with_capacity(draft.len() + 2);
+            let mut logits = self.feed_one(q0)?;
+            confirmed.push(q0);
+            let mut n_acc = 0usize;
+            let mut eos_hit = false;
+            while n_acc < draft.len() {
+                let g = tok32(argmax(&logits)?)?;
+                if Some(g) == eos {
+                    eos_hit = true;
+                    break;
+                }
+                if g == draft[n_acc] {
+                    logits = self.feed_one(g)?;
+                    confirmed.push(g);
+                    n_acc += 1;
+                } else {
+                    // 修正トークン: draft の代わりに貪欲の結果を確定して食う。
+                    logits = self.feed_one(g)?;
+                    confirmed.push(g);
+                    break;
+                }
+            }
+            if !eos_hit && n_acc == draft.len() {
+                // 全受理: 最後の貪欲トークンを 1 個確定して食う。
+                let g = tok32(argmax(&logits)?)?;
+                if Some(g) == eos {
+                    eos_hit = true;
+                } else {
+                    logits = self.feed_one(g)?;
+                    confirmed.push(g);
+                }
+            }
+            self.model.arch_emit_token();
+            let logits = if eos_hit { Vec::new() } else { logits };
+            return Ok(SpecStep {
+                confirmed,
+                eos: eos_hit,
+                logits,
+                n_accepted: n_acc,
+            });
+        }
+
+        // ---- batch 経路: snapshot → 検証列を 1 forward → 照合 → 棄却なら復元 ----
+        // max_ctx に収まるぶんだけ draft を使う (通常 decode の到達点と同じ上限)。
+        let room = max.saturating_sub(self.tokens.len() + 1);
+        let draft = if draft.len() > room { &draft[..room] } else { draft };
+        let snap = self.model.spec_snapshot();
+        let n_before = self.tokens.len();
+        // 検証列: PLE 索引の窓 (末尾 win 個) + q0 + draft。embedding は末尾
+        // 1 トークン、PLE は末尾 win 個しか見ないので、窓を切っても値は変わらない。
+        let start = self.tokens.len().saturating_sub(win);
+        let mut col: Vec<u32> = self.tokens[start..].to_vec();
+        let col_start = col.len();
+        col.push(q0);
+        col.extend_from_slice(draft);
+        // 履歴ぶん (col_start) は PLE の窓だけに使い、検証列だけを食う。
+        // 戻り値は検証トークンごとの logits (all[j] = draft[j] を食った直後)。
+        let all = self.model.forward_verify(&col, col_start)?;
+        // forward_verify が検証列を全部食ったので tokens を同期する。
+        self.tokens.extend_from_slice(&col[col_start..]);
+
+        let mut confirmed: Vec<u32> = vec![q0];
+        let mut n_acc = 0usize;
+        let mut eos_hit = false;
+        let mut corrected: Option<u32> = None;
+        for (j, &d) in draft.iter().enumerate() {
+            let g = tok32(argmax(&all[j])?)?;
+            if Some(g) == eos {
+                eos_hit = true;
+                break;
+            }
+            if g == d {
+                confirmed.push(d);
+                n_acc += 1;
+            } else {
+                corrected = Some(g);
+                break;
+            }
+        }
+        if !eos_hit && corrected.is_none() {
+            // 全受理: 最後の位置の貪欲トークンを確定する (巻き戻し無し)。
+            let g = tok32(argmax(&all[draft.len()])?)?;
+            if Some(g) == eos {
+                eos_hit = true;
+            } else {
+                // 状態は確定列 (q0 + draft) まで進んでいる。続けて g を 1 トークン食う。
+                self.tokens.push(g);
+                let start = self.tokens.len().saturating_sub(win);
+                let ctx: Vec<u32> = self.tokens[start..].to_vec();
+                let logits = self.model.forward_token_at(&ctx, 0, 1, None, None)?;
+                confirmed.push(g);
+                self.model.arch_emit_token();
+                return Ok(SpecStep {
+                    confirmed,
+                    eos: false,
+                    logits,
+                    n_accepted: n_acc,
+                });
+            }
+        }
+        // 棄却 or EOS 到達: snapshot へ戻して確定列だけを re-forward する
+        // (検証列で余分に食った draft と KV / GDN / PLE の状態をまとめて巻き戻す)。
+        self.tokens.truncate(n_before);
+        self.model.spec_restore(&snap)?;
+        // 確定列 (EOS は含まない・食わない)。修正トークンがあれば末尾に足す。
+        if let Some(c) = corrected {
+            confirmed.push(c);
+        }
+        let start = self.tokens.len().saturating_sub(win);
+        let mut col2: Vec<u32> = self.tokens[start..].to_vec();
+        let hist2 = col2.len();
+        col2.extend_from_slice(&confirmed);
+        let mut all2 = self.model.forward_verify(&col2, hist2)?;
+        self.tokens.extend_from_slice(&confirmed);
+        self.model.arch_emit_token();
+        let logits = if eos_hit {
+            Vec::new()
+        } else {
+            all2.pop().unwrap_or_default()
+        };
+        Ok(SpecStep {
+            confirmed,
+            eos: eos_hit,
+            logits,
+            n_accepted: n_acc,
+        })
     }
 }
 

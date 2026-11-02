@@ -36,7 +36,7 @@ use crate::gguf::GgufFile;
 use crate::kquant::GgmlType;
 use crate::model::linear_gguf::{FusedLinear, GgufLinear};
 use crate::model::qwen4exp::{
-    one, IdentityAttn, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams,
+    one, IdentityAttn, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams, SpecGdnSnap,
 };
 use crate::quant::WeightBlocks;
 
@@ -639,6 +639,46 @@ impl LayerAttn for SsmAttn {
     /// GDN の conv / ssm 状態の進み方は逐次版と同じになる。
     fn layer_major_safe(&self) -> bool {
         true
+    }
+
+    /// P109: full attention 側が巻き戻しに対応しているときだけ対応
+    /// (QSA 有効の [`FullAttn`] では `false` になり、spec の batch 経路は逐次に落ちる)。
+    fn spec_restorable(&self) -> bool {
+        self.full.spec_restorable()
+    }
+
+    /// P109: GDN 状態 (conv / ssm) を層ごと clone し、full attention 側は
+    /// 委譲先の [`crate::model::qwen4exp::SpecFullSnap`] に任せる。
+    fn spec_snapshot(&self) -> Box<dyn std::any::Any + Send> {
+        Box::new(SpecGdnSnap {
+            gdn: self
+                .layers
+                .iter()
+                .map(|l| l.as_ref().map(|s| (s.state.conv.clone(), s.state.ssm.clone())))
+                .collect(),
+            full: self.full.spec_snapshot(),
+        })
+    }
+
+    /// P109: GDN 状態をスナップショットへ戻し、full attention 側へも委譲する。
+    fn spec_restore(&mut self, snap: &dyn std::any::Any) -> std::result::Result<(), Qwen4ExpError> {
+        let s = snap
+            .downcast_ref::<SpecGdnSnap>()
+            .expect("SsmAttn::spec_restore: スナップショットの型が違う");
+        if s.gdn.len() != self.layers.len() {
+            return Err(one(format!(
+                "SsmAttn::spec_restore: スナップショットの層数 {} が現在の層数 {} と違う",
+                s.gdn.len(),
+                self.layers.len()
+            )));
+        }
+        for (l, st) in self.layers.iter_mut().zip(s.gdn.iter()) {
+            if let (Some(layer), Some((conv, ssm))) = (l.as_mut(), st) {
+                layer.state.conv = conv.clone();
+                layer.state.ssm = ssm.clone();
+            }
+        }
+        self.full.spec_restore(&*s.full)
     }
 }
 

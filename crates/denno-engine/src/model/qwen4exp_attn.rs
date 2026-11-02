@@ -61,7 +61,7 @@ use crate::gguf::GgufFile;
 use crate::kquant::GgmlType;
 use crate::model::linear_gguf::{FusedLinear, GgufLinear};
 use crate::model::qwen4exp::{
-    gemv_batch, q4prof, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams,
+    gemv_batch, q4prof, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams, SpecFullSnap,
 };
 use crate::model::qwen4exp_qsa::QsaState;
 use crate::quant::WeightBlocks;
@@ -294,6 +294,10 @@ impl AttnCache {
             .copied()
             .ok_or_else(|| anyhow::anyhow!("AttnCache: 層 {layer} は範囲外 (n_layer = {})", self.len.len()))
     }
+    /// 層ごとの積まれている位置数 (P109: spec スナップショット用)。
+    pub fn lens(&self) -> &[usize] {
+        &self.len
+    }
     pub fn is_empty(&self, layer: usize) -> Result<bool> {
         Ok(self.len(layer)? == 0)
     }
@@ -349,6 +353,22 @@ impl AttnCache {
         for n in self.len.iter_mut() {
             *n = 0;
         }
+    }
+
+    /// 層 `layer` の長さを `len` に戻す (P109: spec decode の巻き戻し用)。
+    ///
+    /// KV は push でしか伸びないので、長さを戻すだけで領域は壊れない
+    /// (次の push が同じ位置に上書きする)。`len` が現在長を超えるのは
+    /// 呼び出し側のバグ (エラーにする。黙って伸ばさない)。
+    pub fn truncate_layer(&mut self, layer: usize, len: usize) -> Result<()> {
+        let cur = self.len(layer)?;
+        if len > cur {
+            bail!(
+                "AttnCache::truncate_layer: 層 {layer} の戻し先 {len} が現在長 {cur} を超える"
+            );
+        }
+        self.len[layer] = len;
+        Ok(())
     }
 }
 
@@ -1420,6 +1440,41 @@ impl FullAttn {
         self.qsa.as_ref().map_or(0, |q| q.weight_bytes())
     }
 
+    /// P109: spec decode の巻き戻しに対応するか。
+    ///
+    /// KV は「長さを戻す」だけで復元できるが、QSA は indexer にトークンごとの
+    /// 生キーを積むので長さを戻すだけでは復元できない (非対応)。
+    pub fn spec_restorable(&self) -> bool {
+        self.qsa.is_none()
+    }
+
+    /// P109: KV の層ごとの長さと pos を保存する。
+    pub fn spec_snapshot(&self) -> SpecFullSnap {
+        SpecFullSnap {
+            pos: self.pos,
+            lens: self.cache.lens().to_vec(),
+        }
+    }
+
+    /// P109: KV をスナップショット時の長さへ戻す (領域は残る)。
+    pub fn spec_restore(&mut self, snap: &SpecFullSnap) -> Result<()> {
+        if self.qsa.is_some() {
+            bail!("FullAttn::spec_restore: QSA 有効時は spec の巻き戻しに非対応");
+        }
+        if snap.lens.len() != self.cache.n_layer() {
+            bail!(
+                "FullAttn::spec_restore: スナップショットの層数 {} がキャッシュの層数 {} と違う",
+                snap.lens.len(),
+                self.cache.n_layer()
+            );
+        }
+        for (layer, &len) in snap.lens.iter().enumerate() {
+            self.cache.truncate_layer(layer, len)?;
+        }
+        self.pos = snap.pos;
+        Ok(())
+    }
+
     /// [`LayerAttn::forward`] の anyhow 版 (テストと F5 の合成から使う)。
     pub fn forward_token(&mut self, layer: usize, cur: &[f32]) -> Result<Vec<f32>> {
         if cur.len() != self.n_embd {
@@ -1615,6 +1670,24 @@ impl LayerAttn for FullAttn {
     /// 1 トークンを積むだけなので、層優先でも各層の中ではトークン順が保たれる。
     fn layer_major_safe(&self) -> bool {
         true
+    }
+
+    /// P109: QSA 無効なら KV の長さ戻しで巻き戻せる。
+    fn spec_restorable(&self) -> bool {
+        FullAttn::spec_restorable(self)
+    }
+
+    /// P109: KV の層ごとの長さと pos を [`SpecFullSnap`] で保存する。
+    fn spec_snapshot(&self) -> Box<dyn std::any::Any + Send> {
+        Box::new(FullAttn::spec_snapshot(self))
+    }
+
+    /// P109: [`SpecFullSnap`] へ戻す (KV は長さを戻すだけ。領域は残る)。
+    fn spec_restore(&mut self, snap: &dyn std::any::Any) -> std::result::Result<(), Qwen4ExpError> {
+        let s = snap
+            .downcast_ref::<SpecFullSnap>()
+            .expect("FullAttn::spec_restore: スナップショットの型が違う");
+        FullAttn::spec_restore(self, s).map_err(|e| Qwen4ExpError(vec![format!("{e:#}")]))
     }
 }
 

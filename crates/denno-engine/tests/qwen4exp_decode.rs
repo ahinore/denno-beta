@@ -23,8 +23,10 @@ use denno_engine::model::qwen4exp::{validate, Qwen4Exp, Qwen4ExpParams};
 use denno_engine::model::qwen4exp_decode::{
     argmax, DecoderConfig, Qwen4ExpDecoder, DEFAULT_PLE_WINDOW,
 };
+use denno_engine::model::qwen4exp_attn::FullAttn;
 use denno_engine::model::qwen4exp_ssm::SsmAttn;
 use denno_engine::ple::PLE_TABLE_NAME;
+use denno_engine::spec_ngram::NgramIndex;
 
 const ALIGN: usize = 32;
 
@@ -1102,4 +1104,317 @@ fn decode_logits_fingerprint_task106() {
         "[task106-fingerprint] logits={h_logits:016x} ids={h_ids:016x}"
     );
 }
+// ---------------------------------------------------------------------------
+// P109: n-gram 投機的デコード (spec_verify)
+// ---------------------------------------------------------------------------
 
+/// 合成 GGUF から full attention 入りの decoder を組む (serve と同じ構成)。
+///
+/// `make_decoder` は full 層が `IdentityAttn` (状態なし) なので、KV の巻き戻しを
+/// 見るテストはこちらを使う。
+fn make_decoder_full(f: &GgufFile, max_ctx: usize) -> Qwen4ExpDecoder {
+    let p = params(f);
+    let full = FullAttn::from_gguf_with(f, &p, max_ctx, false).expect("FullAttn::from_gguf");
+    let attn = SsmAttn::with_full(f, &p, Box::new(full)).expect("SsmAttn::with_full");
+    let m = Qwen4Exp::with_attn(f, Box::new(attn)).expect("Qwen4Exp::with_attn");
+    Qwen4ExpDecoder::new(m, DecoderConfig::new(max_ctx))
+}
+
+/// argmax の添字をトークン id に落とす (テスト用のショートカット)。
+fn greedy(logits: &[f32]) -> u32 {
+    u32::try_from(argmax(logits).expect("argmax")).expect("u32")
+}
+
+/// spec (逐次経路) の各ステップの logits は通常 decode とビット一致し、
+/// greedy 出力も一致する。
+///
+/// draft は先に通常 decode した結果 (`want`) から作る。全受理 / 途中棄却 /
+/// draft 空 (通常 decode と同じ) の 3 経路を通し、各ステップの終端で
+/// 「トークン列・logits のビット」の両方を突き合わせる。逐次経路は
+/// 通常 decode と同じコードを同じ順で通るので、1 ビットも違わないはず。
+#[test]
+fn spec_seq_step_matches_normal_decode_bitwise() {
+    let dir = TempDir::new("specseq");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    let mut off = make_decoder(&f, 64);
+    let mut on = make_decoder(&f, 64);
+
+    // 基準: 通常の貪欲 decode。生成トークン i を食った直後の logits を残す。
+    let mut logits = off.prefill(&PROMPT).expect("prefill off");
+    assert_eq!(
+        bits(&logits),
+        bits(&on.prefill(&PROMPT).expect("prefill on")),
+        "prefill の logits が一致しない"
+    );
+    let n_gen = 12usize;
+    let mut want: Vec<u32> = Vec::with_capacity(n_gen);
+    let mut off_logits: Vec<Vec<f32>> = Vec::with_capacity(n_gen);
+    for _ in 0..n_gen {
+        let id = greedy(&logits);
+        want.push(id);
+        logits = off.step(id).expect("step");
+        off_logits.push(logits.clone());
+    }
+
+    // spec (逐次): 全受理 → 途中棄却 → draft 空、の順に通す。
+    let mut got: Vec<u32> = Vec::new();
+    while got.len() < n_gen {
+        let l = got.len();
+        let q0 = want[l];
+        let draft: Vec<u32> = if l + 5 <= n_gen {
+            // 全受理させる: 正しい継続 3 個。
+            vec![want[l + 1], want[l + 2], want[l + 3]]
+        } else if l + 3 <= n_gen {
+            // 途中で棄却させる: 1 個目は正しい、2 個目は継続と違うトークン。
+            let wrong = (want[l + 2] + 1) % N_VOCAB as u32;
+            vec![want[l + 1], wrong]
+        } else {
+            Vec::new()
+        };
+        let st = on.spec_verify(q0, &draft, false, None).expect("spec_verify");
+        assert!(!st.eos);
+        got.extend_from_slice(&st.confirmed);
+        assert_eq!(
+            on.tokens(),
+            &PROMPT
+                .iter()
+                .copied()
+                .chain(got.iter().copied())
+                .collect::<Vec<_>>()[..],
+            "tokens が確定列と食い違う"
+        );
+        let upto = got.len() - 1;
+        assert_eq!(
+            bits(&st.logits),
+            bits(&off_logits[upto]),
+            "spec (seq) の logits が生成 {upto} 個目の位置でビット不一致"
+        );
+    }
+    assert_eq!(got, want, "spec (seq) の greedy 出力が通常 decode と一致しない");
+}
+
+/// 棄却時の snapshot 復元 (KV 巻き戻し) で、出力が spec off と同じ列に戻る。
+///
+/// draft を「継続と違うトークン」にして必ず棄却させ、batch 経路の
+/// 「snapshot 復元 + 確定列 re-forward」が通ることを見る。FullAttn 入り
+/// (serve と同じ構成) で組む。
+#[test]
+fn spec_batch_rejection_restores_state_and_matches_off() {
+    let dir = TempDir::new("specrej");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    let mut off = make_decoder_full(&f, 64);
+    let mut on = make_decoder_full(&f, 64);
+
+    let want = off.decode_greedy(&PROMPT, 10).expect("decode_greedy");
+    assert!(want.iter().all(|&t| (t as u64) < N_VOCAB));
+
+    let logits = on.prefill(&PROMPT).expect("prefill");
+    let q0 = greedy(&logits);
+    // 継続 (want[1]) と違うトークン 2 個 → 位置 0 で必ず棄却。
+    let wrong = (want[1] + 1) % N_VOCAB as u32;
+    let st = on
+        .spec_verify(q0, &[wrong, wrong], true, None)
+        .expect("spec_verify");
+    assert_eq!(st.n_accepted, 0, "壊した draft が受理された: {st:?}");
+    assert!(!st.eos);
+    assert_eq!(st.confirmed, vec![q0, want[1]], "q0 + 修正トークンのはず");
+    // tokens は検証列を巻き戻して確定列ぶんだけ進んでいる。
+    assert_eq!(on.tokens().len(), PROMPT.len() + st.confirmed.len());
+
+    // 以後を通常 decode で伸ばして off と同じ列に合流する
+    // (KV / GDN / PLE の復元が正しいことの間接確認。復元がずれていれば
+    //  以後の出力は大きく外れる)。
+    let mut got = st.confirmed.clone();
+    let mut lg = st.logits.clone();
+    while got.len() < want.len() {
+        let id = greedy(&lg);
+        got.push(id);
+        lg = on.step(id).expect("step");
+    }
+    assert_eq!(got, want, "棄却後の生成が spec off と一致しない");
+}
+
+/// EOS 到達で打ち切る (EOS は受理せず食わない)。
+///
+/// 打ち切った後の状態は、通常 decode で同じところまで進めた状態と
+/// ビット一致する (次の 1 トークンを逐次で食った logits のビットで証明する)。
+#[test]
+fn spec_batch_stops_at_eos_without_feeding_it() {
+    let dir = TempDir::new("speceos");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    let mut off = make_decoder_full(&f, 64);
+    let mut on = make_decoder_full(&f, 64);
+
+    let l0 = off.prefill(&PROMPT).expect("prefill off");
+    let l1 = on.prefill(&PROMPT).expect("prefill on");
+    assert_eq!(bits(&l0), bits(&l1), "prefill の logits が一致しない");
+
+    let q0 = greedy(&l0);
+    let lg_off = off.step(q0).expect("step off");
+    // off 側の続きのトークンを「EOS」として扱わせる。
+    let e = greedy(&lg_off);
+    // 棄却させる draft (継続と違うトークン)。EOS の照合が先に来るので
+    // 棄却経路の復元 + q0 の re-forward を通る。
+    let wrong = (e + 1) % N_VOCAB as u32;
+    let st = on.spec_verify(q0, &[wrong], true, Some(e)).expect("spec_verify");
+    assert!(st.eos, "EOS 到達を検知していない: {st:?}");
+    assert_eq!(st.confirmed, vec![q0], "EOS 前の確定列は q0 だけ");
+    assert!(st.logits.is_empty(), "EOS 後に logits がある");
+    assert_eq!(on.tokens().len(), PROMPT.len() + 1, "EOS を食っていない");
+    assert_eq!(off.tokens().len(), PROMPT.len() + 1, "off も q0 まで");
+
+    // 状態の一致: 両者とも「prompt + q0 まで食った」状態。次の 1 トークンを
+    // 逐次で食った logits がビット一致する (復元 + re-forward が 1 ビットも
+    // 状態を違えていないことの証拠)。
+    let st2 = on.spec_verify(e, &[], false, None).expect("spec_verify (続き)");
+    let lg2 = off.step(e).expect("step off (続き)");
+    assert_eq!(st2.confirmed.len(), 2, "draft 空は q0 + 次の 1 トークン");
+    assert_eq!(
+        bits(&st2.logits),
+        bits(&lg2),
+        "EOS 打ち切り後の状態が通常 decode とビット不一致"
+    );
+}
+
+/// spec (batch 経路) の確定トークン列は spec off (通常 decode) と一致する。
+///
+/// draft は n-gram 辞書から取る (serve と同じ形)。batch の検証 forward は
+/// prefill と同じ `gemv_batch` (P-PF-GB、FMA 融合) を通るので logits の
+/// ビット一致は主張しない — greedy の決定が変わらないことを見る。
+#[test]
+fn spec_batch_confirmed_tokens_match_off_and_seq() {
+    let dir = TempDir::new("specbat");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    let mut off = make_decoder_full(&f, 64);
+    let mut bat = make_decoder_full(&f, 64);
+    let mut seq = make_decoder_full(&f, 64);
+
+    let want = off.decode_greedy(&PROMPT, 12).expect("decode_greedy");
+
+    // batch 経路 + n-gram 辞書 (serve と同じ駆動)。
+    let mut idx = NgramIndex::new(3, 100_000, 8, 4);
+    let mut logits = bat.prefill(&PROMPT).expect("prefill");
+    idx.feed(bat.tokens());
+    let mut got: Vec<u32> = Vec::new();
+    let mut steps = 0usize;
+    let mut accepted_total = 0usize;
+    while got.len() < want.len() {
+        let q0 = greedy(&logits);
+        let draft = idx.draft(bat.tokens(), 4);
+        let st = bat.spec_verify(q0, &draft, true, None).expect("spec_verify");
+        got.extend_from_slice(&st.confirmed);
+        accepted_total += st.n_accepted;
+        assert_eq!(
+            bat.tokens().len(),
+            PROMPT.len() + got.len(),
+            "tokens が確定列と食い違う"
+        );
+        idx.feed(bat.tokens());
+        logits = st.logits;
+        steps += 1;
+    }
+    assert_eq!(got, want, "spec (batch) の greedy 出力が通常 decode と一致しない");
+    assert!(
+        steps < want.len(),
+        "draft が一度も受理されず spec ステップが減っていない (steps={steps})"
+    );
+
+    // seq 経路 (batch=false) も同じ列に合流する。
+    let mut idx2 = NgramIndex::new(3, 100_000, 8, 4);
+    let mut logits2 = seq.prefill(&PROMPT).expect("prefill");
+    idx2.feed(seq.tokens());
+    let mut got2: Vec<u32> = Vec::new();
+    while got2.len() < want.len() {
+        let q0 = greedy(&logits2);
+        let draft = idx2.draft(seq.tokens(), 4);
+        let st = seq.spec_verify(q0, &draft, false, None).expect("spec_verify");
+        got2.extend_from_slice(&st.confirmed);
+        idx2.feed(seq.tokens());
+        logits2 = st.logits;
+    }
+    assert_eq!(got2, want, "spec (seq) の greedy 出力が通常 decode と一致しない");
+    let _ = accepted_total;
+}
+
+/// 临时診断 (P109 調査・commit 前に削除): EOS 復元後の状態を段階比較する。
+#[test]
+fn zzz_diag_eos_state() {
+    let dir = TempDir::new("specdiag");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    let mut off = make_decoder_full(&f, 64);
+    let mut on = make_decoder_full(&f, 64);
+
+    let l0 = off.prefill(&PROMPT).expect("prefill off");
+    let l1 = on.prefill(&PROMPT).expect("prefill on");
+    println!("prefill bit-eq: {}", bits(&l0) == bits(&l1));
+    let q0 = greedy(&l0);
+    let lg_off = off.step(q0).expect("step off");
+    let e = greedy(&lg_off);
+    let wrong = (e + 1) % N_VOCAB as u32;
+    let st = on.spec_verify(q0, &[wrong], true, Some(e)).expect("spec_verify");
+    println!("eos={} confirmed={:?} tokens_on={} tokens_off={}", st.eos, st.confirmed, on.tokens().len(), off.tokens().len());
+
+    // 続きの 1 トークンを逐次で食って比べる (on = spec_verify seq / off = step)。
+    let st2 = on.spec_verify(e, &[], false, None).expect("spec_verify 2");
+    let lg2 = off.step(e).expect("step off 2");
+    println!("after feed-e bit-eq: {}", bits(&st2.logits) == bits(&lg2));
+
+    // さらに 3 トークン逐次で進めて、食い違いが続くか見る。
+    let mut lo = lg2.clone();
+    let mut ln = st2.logits.clone();
+    for i in 0..3 {
+        let a = greedy(&lo);
+        let b = greedy(&ln);
+        println!("step {i}: off={a} on={b} logits-eq={}", bits(&lo) == bits(&ln));
+        lo = off.step(a).expect("off step");
+        ln = on.step(b).expect("on step");
+    }
+
+}
+
+/// 临时診断 2 (P109 調査・commit 前に削除): refeed 単体と verify→restore→refeed を分ける。
+#[test]
+fn zzz_diag2_refeed_vs_verify_restore() {
+    let dir = TempDir::new("specdiag2");
+    let f = open_synth(&dir, "model.gguf", false, None);
+
+    // A: decoder (逐次のみ)。
+    let mut off = make_decoder_full(&f, 64);
+    let l0 = off.prefill(&PROMPT).expect("prefill");
+    let q0 = greedy(&l0);
+    let lg_q0 = off.step(q0).expect("step q0");
+    let e = greedy(&lg_q0);
+    let lg_e = off.step(e).expect("step e");
+
+    let build = || -> Qwen4Exp {
+        let p = params(&f);
+        let full = FullAttn::from_gguf_with(&f, &p, 64, false).expect("full");
+        let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("ssm");
+        Qwen4Exp::with_attn(&f, Box::new(attn)).expect("model")
+    };
+
+    // B: refeed 単体 (verify 経由で q0 を 1 トークンだけ食う)。
+    let mut m1 = build();
+    let lp = m1.forward_prefill_with(&PROMPT, false).expect("prefill m1");
+    assert_eq!(bits(&lp), bits(&l0), "prefill が off と不一致");
+    let col: Vec<u32> = [PROMPT[0], PROMPT[1], PROMPT[2], q0].to_vec();
+    let out = m1.forward_verify(&col, 3).expect("verify q0");
+    println!("B refeed-q0 bit-eq vs off.step(q0): {}", bits(&out[0]) == bits(&lg_q0));
+    let col2: Vec<u32> = [PROMPT[1], PROMPT[2], q0, e].to_vec();
+    let out2 = m1.forward_verify(&col2, 3).expect("verify e");
+    println!("B feed-e   bit-eq vs off.step(e): {}", bits(&out2[0]) == bits(&lg_e));
+
+    // C: verify → restore → refeed。
+    let mut m2 = build();
+    let _ = m2.forward_prefill_with(&PROMPT, false).expect("prefill m2");
+    let snap = m2.spec_snapshot();
+    let colv: Vec<u32> = [PROMPT[0], PROMPT[1], PROMPT[2], q0, e + 1].to_vec();
+    let _v = m2.forward_verify(&colv, 3).expect("verify (棄却列)");
+    m2.spec_restore(&snap);
+    let colr: Vec<u32> = [PROMPT[0], PROMPT[1], PROMPT[2], q0].to_vec();
+    let outr = m2.forward_verify(&colr, 3).expect("refeed q0");
+    println!("C restore+refeed-q0 bit-eq vs off.step(q0): {}", bits(&outr[0]) == bits(&lg_q0));
+    let colr2: Vec<u32> = [PROMPT[1], PROMPT[2], q0, e].to_vec();
+    let outr2 = m2.forward_verify(&colr2, 3).expect("refeed e");
+    println!("C feed-e   bit-eq vs off.step(e): {}", bits(&outr2[0]) == bits(&lg_e));
+}
