@@ -1532,6 +1532,20 @@ pub trait LayerAttn: Send {
         Box::new(())
     }
 
+    /// P118: 系列状態を全て消す (新しい系列の先頭に戻す)。
+    ///
+    /// **必須メソッド** (既定実装を設けない)。状態を持つ実装がうっかり
+    /// 上書き忘れても黙って通らないようにするため。実装は次のどれか:
+    /// - 状態を持たない ([`IdentityAttn`] など): 何もしない (明示的に書く)
+    /// - [`FullAttn`]: KV・pos・QSA の indexer 状態を消す
+    /// - [`SsmAttn`]: ssm 層の GDN conv/ssm を 0 に戻し、full 側へも委譲する
+    ///
+    /// 重み (uid 登録込み) は触らない — GPU 常駐の重みが再 upload されないのが
+    /// このメソッドの存在理由 (P118: serve の no-reuse 経路でモデルを使い回す)。
+    /// reset 直後の forward は新規構築直後とビット一致しなければならない
+    /// (テスト `reset_matches_fresh_decoder_bitexact`)。
+    fn reset(&mut self);
+
     /// P109: [`Self::spec_snapshot`] の状態へ戻す (検証列を棄却したとき)。
     fn spec_restore(
         &mut self,
@@ -1587,6 +1601,9 @@ impl LayerAttn for IdentityAttn {
     fn layer_major_safe(&self) -> bool {
         true
     }
+
+    /// 状態を持たない (恒等) ので、消すものも無い (明示的に書く)。
+    fn reset(&mut self) {}
 }
 
 /// GGUF テンソルから [`GgufLinear`] を作る。**mmap のスライスを共有**し、
@@ -2200,6 +2217,23 @@ impl Qwen4Exp {
         for b in self.ple_conv_state.iter_mut().flatten() {
             b.fill(0.0);
         }
+    }
+
+    /// P118: 系列状態を全て消して新しい系列の先頭に戻す。
+    ///
+    /// リセットするのは per-sequence 状態だけ ([`Self::reset_ple_conv`] の
+    /// PLE conv 履歴、attention 実装の状態 = full attention の KV / QSA / ssm の
+    /// GDN conv+ssm)。重み・expert キャッシュ・PLE の表と索引 (索引は状態を持たない)
+    /// は触らない。テレメトリの間引き状態 ([`ArchEmit`]) も既定に戻す
+    /// (数値経路には触れないが、「新規構築直後と同じ」を観測側まで揃える)。
+    ///
+    /// 数値不変の根拠: forward が読む状態はすべて「積んだ位置」に限定されており
+    /// (KV は `push` が同じ位置に上書きし、読みは層ごとの長さまで。GDN conv/ssm と
+    /// PLE conv は 0 初期化と同じ値へ戻る)、reset 後の長さは新規構築直後と同じ 0。
+    pub fn reset(&mut self) {
+        self.reset_ple_conv();
+        self.attn.reset();
+        self.arch_emit = ArchEmit::default();
     }
 
     /// 諸元（読み取り専用）。

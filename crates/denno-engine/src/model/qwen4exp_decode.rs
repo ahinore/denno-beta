@@ -135,6 +135,22 @@ impl Qwen4ExpDecoder {
         &self.cfg
     }
 
+    /// P118: 系列を打ち切って新しい系列の先頭に戻す。
+    ///
+    /// `tokens` を空にし、モデル側の per-sequence 状態 (PLE conv 履歴、
+    /// full attention の KV・pos・QSA、ssm の GDN conv/ssm) を全て消す。
+    /// 重み・expert キャッシュは触らない ([`Qwen4Exp::reset`] のドキュメント参照)。
+    ///
+    /// 契約: reset 直後のこの decoder は [`Qwen4ExpDecoder::new`] 直後と同じ
+    /// (同じ入力なら logits が `to_bits` で一致する。テスト
+    /// `reset_matches_fresh_decoder_bitexact` が逐次・バッチ prefill の両経路で
+    /// 突き合わせる)。forward が途中で失敗して半端に進んだ decoder も、
+    /// reset すればこの契約に戻る。
+    pub fn reset(&mut self) {
+        self.tokens.clear();
+        self.model.reset();
+    }
+
     /// 層数 (P54: expert 在庫スナップショットの本数)。
     pub fn n_layer(&self) -> usize {
         self.model.n_layer()

@@ -1518,3 +1518,189 @@ fn serve_wiring_spec_matches_greedy_off_and_accepts_drafts() {
         idx.fed()
     );
 }
+
+// ---------------------------------------------------------------------------
+// P118: decoder reset (系列状態を消して新規構築とビット一致させる)
+// ---------------------------------------------------------------------------
+
+/// prompt から n ステップ貪欲に伸ばし、prefill 直後と各 step の logits を返す。
+fn run_steps(d: &mut Qwen4ExpDecoder, prompt: &[u32], n: usize) -> Vec<Vec<f32>> {
+    let mut out = Vec::new();
+    let mut logits = d.prefill(prompt).expect("prefill");
+    out.push(logits.clone());
+    for _ in 0..n {
+        let id = greedy(&logits);
+        logits = d.step(id).expect("step");
+        out.push(logits.clone());
+    }
+    out
+}
+
+/// 2 つの logits 列が全ステップで `to_bits` 一致すること。
+fn assert_same_logits(a: &[Vec<f32>], b: &[Vec<f32>], tag: &str) {
+    assert_eq!(a.len(), b.len(), "{tag}: step 数が違う");
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        assert_eq!(
+            bits(x),
+            bits(y),
+            "{tag}: {i} ステップ目の logits がビット不一致"
+        );
+    }
+}
+
+/// (a) used-then-reset の decoder は新規構築とビット一致する。
+///
+/// 逐次経路 (`make_decoder` = full 層が恒等) と、serve と同じ構成
+/// (`make_decoder_full` = GDN ssm 層 + full attention 層) の両方で:
+/// - 別プロンプトを食わせてから reset → 同じプロンプト
+/// - 同じプロンプトを食わせてから reset → もう一度同じプロンプト
+/// の 2 通りを、新規構築の基準と突き合わせる。数値経路は何も変わっていない
+/// (reset は状態を消すだけ) ので、1 ビットも違わないはず。
+#[test]
+fn reset_matches_fresh_decoder_bitexact() {
+    let dir = TempDir::new("reset-a");
+    let f = open_synth(&dir, "model.gguf", false, None);
+
+    for (tag, mk_full) in [("identity-full", 0usize), ("full-attn", 1)] {
+        // 基準: 新規構築 → PROMPT → 6 step。
+        let mut fresh = if mk_full == 0 {
+            make_decoder(&f, 64)
+        } else {
+            make_decoder_full(&f, 64)
+        };
+        let want = run_steps(&mut fresh, &PROMPT, 6);
+
+        // 別プロンプト (PROMPT_B) を食わせてから reset → PROMPT。
+        let mut d = if mk_full == 0 {
+            make_decoder(&f, 64)
+        } else {
+            make_decoder_full(&f, 64)
+        };
+        let warm = run_steps(&mut d, &PROMPT_B, 4);
+        assert!(!warm.is_empty());
+        d.reset();
+        assert_eq!(d.tokens().len(), 0, "{tag}: reset 後に tokens が残っている");
+        let got = run_steps(&mut d, &PROMPT, 6);
+        assert_same_logits(&got, &want, &format!("{tag}: 別プロンプト→reset"));
+
+        // 同じプロンプトを食わせて reset → もう一度 PROMPT。
+        d.reset();
+        let got2 = run_steps(&mut d, &PROMPT, 6);
+        assert_same_logits(&got2, &want, &format!("{tag}: 同一プロンプト→reset"));
+    }
+}
+
+/// (a) のバッチ prefill 版 (serve 既定の経路)。
+///
+/// reset → `prefill_batched` の logits が新規構築の `prefill_batched` と
+/// ビット一致する。層優先バッチは KV を層ごとに一気に積むので、長い系列を
+/// 食わせたあとの reset でも積み始めが 0 に戻っていることを確認する。
+#[test]
+fn reset_matches_fresh_decoder_batched_bitexact() {
+    let dir = TempDir::new("reset-ab");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    let long_p: Vec<u32> = (0..20).map(|i| (i % 7) as u32).collect();
+
+    let mut fresh = make_decoder_full(&f, 64);
+    let want = fresh.prefill_batched(&PROMPT, true).expect("fresh batch");
+
+    let mut d = make_decoder_full(&f, 64);
+    let warm = d.prefill_batched(&long_p, true).expect("warm batch");
+    assert!(!warm.iter().all(|v| *v == 0.0), "warm の logits が全 0");
+    d.reset();
+    let got = d.prefill_batched(&PROMPT, true).expect("reset batch");
+    assert_eq!(
+        bits(&got),
+        bits(&want),
+        "バッチ prefill: reset 直後の logits が新規構築とビット不一致"
+    );
+}
+
+/// (b) 長い系列のあと短い系列、短い系列のあと長い系列。
+///
+/// 古い KV / GDN 状態が残ると、短い 2 連目で長い 1 連目の状態が読まれる
+/// (attention の可視範囲・conv の履歴が伸びる)。新規構築の短い/長い系列との
+/// ビット比較で落ちるはず。
+#[test]
+fn reset_long_then_short_and_short_then_long() {
+    let dir = TempDir::new("reset-b");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    let long_p: Vec<u32> = (0..24).map(|i| (i % 7) as u32).collect();
+    let short_p: Vec<u32> = PROMPT.to_vec();
+
+    // 基準 (新規構築)。
+    let want_short = run_steps(&mut make_decoder_full(&f, 64), &short_p, 4);
+    let want_long = run_steps(&mut make_decoder_full(&f, 64), &long_p, 4);
+
+    // 長い → reset → 短い。
+    let mut d = make_decoder_full(&f, 64);
+    run_steps(&mut d, &long_p, 4);
+    d.reset();
+    assert_same_logits(
+        &run_steps(&mut d, &short_p, 4),
+        &want_short,
+        "長い→reset→短い",
+    );
+
+    // 短い → reset → 長い。
+    let mut d2 = make_decoder_full(&f, 64);
+    run_steps(&mut d2, &short_p, 4);
+    d2.reset();
+    assert_same_logits(&run_steps(&mut d2, &long_p, 4), &want_long, "短い→reset→長い");
+}
+
+/// (c) reset を 2 回続けても新規構築とビット一致する。
+#[test]
+fn reset_twice_matches_fresh() {
+    let dir = TempDir::new("reset-c");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    let mut fresh = make_decoder_full(&f, 64);
+    let want = run_steps(&mut fresh, &PROMPT, 3);
+
+    let mut d = make_decoder_full(&f, 64);
+    run_steps(&mut d, &PROMPT_B, 3);
+    d.reset();
+    d.reset();
+    assert_eq!(d.tokens().len(), 0);
+    assert_same_logits(&run_steps(&mut d, &PROMPT, 3), &want, "reset 2 回");
+}
+
+/// (d) GDN 層と QSA (indexer 付き full attention) 層の両方を通す。
+///
+/// `DENNO_QSA=1` 相当 (`from_gguf_with(.., true)`) で組む。QSA は indexer に
+/// トークンごとの生キーを積むので、reset で消さないと 2 連目の可視 cell が
+/// 静かに壊れる。長い系列 (top-k より長い) で QSA on と QSA off の出力が
+/// 違うこと (QSA 経路が実際に効いている証拠) を確かめてから、
+/// used-then-reset が新規構築とビット一致することを見る。
+#[test]
+fn reset_with_gdn_and_qsa_layers_matches_fresh() {
+    let dir = TempDir::new("reset-d");
+    let f = open_synth(&dir, "model.gguf", false, None);
+    let long_p: Vec<u32> = (0..24).map(|i| (i % 7) as u32).collect();
+
+    // QSA on / off で出力が違う (top-k より長い系列で、QSA 経路が効いている証拠)。
+    let mk = |qsa: bool| -> Qwen4ExpDecoder {
+        let p = params(&f);
+        let full = FullAttn::from_gguf_with(&f, &p, 64, qsa).expect("FullAttn");
+        let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn::with_full");
+        let m = Qwen4Exp::with_attn(&f, Box::new(attn)).expect("Qwen4Exp::with_attn");
+        Qwen4ExpDecoder::new(m, DecoderConfig::new(64))
+    };
+    let on = run_steps(&mut mk(true), &long_p, 2);
+    let off = run_steps(&mut mk(false), &long_p, 2);
+    assert_ne!(
+        bits(&on[on.len() - 1]),
+        bits(&off[off.len() - 1]),
+        "QSA on と off で logits が一致してしまった (QSA 経路が効いていない)"
+    );
+
+    // QSA 有効のままで used-then-reset == 新規構築。
+    let want = run_steps(&mut mk(true), &long_p, 4);
+    let mut d = mk(true);
+    run_steps(&mut d, &PROMPT, 4);
+    d.reset();
+    assert_same_logits(&run_steps(&mut d, &long_p, 4), &want, "QSA: 別系列→reset");
+
+    d.reset();
+    assert_same_logits(&run_steps(&mut d, &long_p, 4), &want, "QSA: 同一系列→reset");
+}
