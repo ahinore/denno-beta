@@ -479,6 +479,23 @@ impl Drop for DevBuffer {
     }
 }
 
+/// decode GEMV 1 本ぶんの発行計画 (カーネル・起動形状・行バイト)。
+///
+/// [`CudaCtx::moe_gemv_dev_with`] から切り出した**選択だけ**の部分で、
+/// デバイスメモリには触らない。task 124 の重ね打ち経路
+/// ([`shared_gemv_begin`]) と同じカーネル・同じ引数を組むために共有する。
+struct MoeGemvPlan {
+    f: CUfunction,
+    /// 1 ブロックが受け持つ行数
+    rows_per_block: usize,
+    block_dim: u32,
+    shmem: u32,
+    lanes: usize,
+    /// 1 行のバイト数
+    rb: usize,
+    grid: u32,
+}
+
 /// CUDA コンテキスト + int8 カーネルモジュール。
 /// プロセスで1個作り、複数の線形層で共有する。
 pub struct CudaCtx {
@@ -1021,6 +1038,30 @@ impl CudaCtx {
         shmem: u32,
         args: &mut [*mut c_void],
     ) -> Result<()> {
+        self.launch_async_on(
+            std::ptr::null_mut(),
+            f,
+            grid,
+            block,
+            shmem,
+            args,
+        )
+    }
+
+    /// [`Self::launch_async`] のストリーム指定版 (task 124 の重ね打ち経路)。
+    ///
+    /// `stream` が null のときの挙動は従来と完全に同じ (同じ `dbg_launch` の
+    /// 計数・同じ `cuLaunchKernel` 引数)。
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_async_on(
+        &self,
+        stream: CUstream,
+        f: CUfunction,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shmem: u32,
+        args: &mut [*mut c_void],
+    ) -> Result<()> {
         let lib = lib()?;
         // s166 (P5): decode 1 ステップの launch 件数 (DENNO_DECODE_DBG=1・既定 OFF)
         dbg_launch(f);
@@ -1034,7 +1075,7 @@ impl CudaCtx {
                 block.1,
                 block.2,
                 shmem,
-                std::ptr::null_mut(),
+                stream,
                 args.as_mut_ptr(),
                 std::ptr::null_mut(),
             ),
@@ -1288,13 +1329,7 @@ impl CudaCtx {
         // P-fp16 (task 108): fast mode (`DENNO_GEMV_FP16=1`) が最優先。off なら
         // 従来どおり v3 (`DENNO_GEMV_V3=1`) → v2 の順。env 未指定では V2 のまま
         // で 1 バイトも挙動が変わらない。
-        let mode = if moe_gemv_fp16_on() {
-            GemvKernelMode::Fp16
-        } else if moe_gemv_v3_on() {
-            GemvKernelMode::V3
-        } else {
-            GemvKernelMode::V2
-        };
+        let mode = gemv_kernel_mode();
         self.moe_gemv_dev_with(ty, dev_w, x, n_in, n_out, out, mode)
     }
 
@@ -1310,61 +1345,37 @@ impl CudaCtx {
     ///
     /// 戻り値は「GPU で走ったか」(降下しても true)。fp16 / v3 が実際に走ったかは
     /// 呼び出し側のテストが「v2 とビット一致しないこと」で確かめる。
-    #[allow(clippy::too_many_arguments)]
-    fn moe_gemv_dev_with(
+    /// decode GEMV 1 本ぶんの発行計画 (カーネル・起動形状・行バイト)。
+    ///
+    /// [`CudaCtx::moe_gemv_dev_with`] から切り出した**選択だけ**の部分で、
+    /// デバイスメモリには触らない。task 124 の重ね打ち経路
+    /// ([`shared_gemv_begin`]) と同じカーネル・同じ引数を組むために共有する。
+
+    /// `ty` / `n_in` / `n_out` からカーネルと起動形状を決める (選択のみ)。
+    ///
+    /// 対象外の型・PTX が読めないときは `Ok(None)` (呼び出し側は CPU へ落ちる)。
+    fn plan_moe_gemv(
         &self,
         ty: crate::kquant::GgmlType,
-        dev_w: &DevBuffer,
-        x: &[f32],
         n_in: usize,
         n_out: usize,
-        out: &mut [f32],
         mode: GemvKernelMode,
-    ) -> Result<bool> {
+    ) -> Result<Option<MoeGemvPlan>> {
         use crate::kquant::GgmlType as T;
         let fs_v12 = match self.pick_moe_kernels() {
             Some(f) => f,
-            None => return Ok(false),
+            None => return Ok(None),
         };
         let (ki, rb) = match ty {
             T::Q8_0 => (0usize, (n_in / 32) * 34),
             T::Q5_1 => (1usize, (n_in / 32) * 24),
             T::Q4K => (2usize, (n_in / 256) * 144),
             T::Q5K => (3usize, (n_in / 256) * 176),
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
-        let bs = ty.blck_size();
-        if n_in == 0 || n_out == 0 || n_in % bs != 0 {
-            bail!("moe_gemv_dev: 形状が不正 (n_in={n_in}, n_out={n_out}, block={bs})");
-        }
-        if dev_w.bytes() != n_out * rb {
-            bail!(
-                "moe_gemv_dev: 重みのデバイスバイト数 {} が n_out * row_bytes = {} と違う",
-                dev_w.bytes(),
-                n_out * rb
-            );
-        }
-        if x.len() != n_in {
-            bail!("moe_gemv_dev: x の長さ {} が n_in={n_in} と違う", x.len());
-        }
-        if out.len() != n_out {
-            bail!("moe_gemv_dev: out の長さ {} が n_out={n_out} と違う", out.len());
-        }
-
-        self.make_current()?;
-        // P-pf-moe-scratch: 入出力の一時バッファは thread_local の grow-only
-        // スクラッチから取る (従来は 1 呼び出しごとに cuMemAlloc 2 本 +
-        // cuMemFree 2 本を回していた。decode 中に数万回)。
-        // 数値は不変: カーネル・引数・発行順はそのままで、x は n_in 要素・
-        // out は n_out 要素の範囲しか読み書きしない (前回の残りは読まない)。
         // P-gemv3: 1 行を lanes レーン (4 or 2) で分担する版 (kernels_moe_v3.cu)。
-        // 共有メモリ無し (行の生バイトをステージしない) ので、起動形状も v2 と違う。
-        // blockDim = rows_per_block * lanes、rows_per_block は DENNO_GEMV_V3_ROWS
-        // (8/16/32/64・既定 8)。k が lanes で割り切れない / v3 の PTX が無い /
-        // PTX が旧 ABI (引数 6 本) のときは v2 の 4 行/ブロック + 行ステージングへ落ちる。
         // P-fp16 (task 108): fast mode は v3 と同じ 8 引数 ABI・同じレーン分割で、
-        // 中の演算だけ fp16 dequant + half2 FMA に変える (kernels_moe_fp16.cu)。
-        // Q5_K は対象外。fp16 が使えないときは v3 (on なら) → v2 と同じ降下経路。
+        // 中の演算だけ fp16 dequant + half2 FMA に変える。
         let fp16 = match mode {
             GemvKernelMode::Fp16 if gemv_fp16_ty_ok(ty) => {
                 let lanes = moe_gemv_v3_lanes(n_in);
@@ -1407,6 +1418,109 @@ impl CudaCtx {
             ),
         };
         let grid = ((n_out + rows_per_block - 1) / rows_per_block) as u32;
+        Ok(Some(MoeGemvPlan {
+            f,
+            rows_per_block,
+            block_dim,
+            shmem,
+            lanes,
+            rb,
+            grid,
+        }))
+    }
+
+    /// decode GEMV を 1 本積む (task 124 の重ね打ち経路)。
+    ///
+    /// 引数の並びは [`Self::moe_gemv_dev_with`] が組むものと同一
+    /// (w, x, out, n_in, n_out, row_bytes, [rows_per_block, lanes])。
+    /// `stream` が null なら従来と同じ既定ストリーム。
+    fn launch_moe_gemv_on(
+        &self,
+        plan: &MoeGemvPlan,
+        w: CUdeviceptr,
+        x: CUdeviceptr,
+        o: CUdeviceptr,
+        n_in: usize,
+        n_out: usize,
+        stream: CUstream,
+    ) -> Result<()> {
+        let (mut pw, mut px, mut po) = (w, x, o);
+        let (mut n_in_c, mut n_out_c, mut rb_c) =
+            (n_in as c_int, n_out as c_int, plan.rb as c_int);
+        let (mut rows_c, mut lanes_c) = (plan.rows_per_block as c_int, plan.lanes as c_int);
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut n_in_c as *mut _ as *mut c_void,
+            &mut n_out_c as *mut _ as *mut c_void,
+            &mut rb_c as *mut _ as *mut c_void,
+            &mut rows_c as *mut _ as *mut c_void,
+            &mut lanes_c as *mut _ as *mut c_void,
+        ];
+        let nargs = if plan.lanes > 1 { 8 } else { 6 };
+        unsafe {
+            self.launch_async_on(
+                stream,
+                plan.f,
+                (plan.grid, 1, 1),
+                (plan.block_dim, 1, 1),
+                plan.shmem,
+                &mut args[..nargs],
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_gemv_dev_with(
+        &self,
+        ty: crate::kquant::GgmlType,
+        dev_w: &DevBuffer,
+        x: &[f32],
+        n_in: usize,
+        n_out: usize,
+        out: &mut [f32],
+        mode: GemvKernelMode,
+    ) -> Result<bool> {
+        let bs = ty.blck_size();
+        if n_in == 0 || n_out == 0 || n_in % bs != 0 {
+            bail!("moe_gemv_dev: 形状が不正 (n_in={n_in}, n_out={n_out}, block={bs})");
+        }
+        if x.len() != n_in {
+            bail!("moe_gemv_dev: x の長さ {} が n_in={n_in} と違う", x.len());
+        }
+        if out.len() != n_out {
+            bail!("moe_gemv_dev: out の長さ {} が n_out={n_out} と違う", out.len());
+        }
+        // カーネルの選択 (従来は `pick_moe_kernels` が先頭、fp16/v3 の選択が
+        // 引数検査の後だった。PTX を読む順序だけが変わり、選ばれるカーネル・
+        // 引数・丸め順は 1 つも変わらない)。
+        let Some(plan) = self.plan_moe_gemv(ty, n_in, n_out, mode)? else {
+            return Ok(false);
+        };
+        let MoeGemvPlan {
+            f,
+            rows_per_block,
+            block_dim,
+            shmem,
+            lanes,
+            rb,
+            grid,
+        } = plan;
+        if dev_w.bytes() != n_out * rb {
+            bail!(
+                "moe_gemv_dev: 重みのデバイスバイト数 {} が n_out * row_bytes = {} と違う",
+                dev_w.bytes(),
+                n_out * rb
+            );
+        }
+
+        self.make_current()?;
+        // P-pf-moe-scratch: 入出力の一時バッファは thread_local の grow-only
+        // スクラッチから取る (従来は 1 呼び出しごとに cuMemAlloc 2 本 +
+        // cuMemFree 2 本を回していた。decode 中に数万回)。
+        // 数値は不変: カーネル・引数・発行順はそのままで、x は n_in 要素・
+        // out は n_out 要素の範囲しか読み書きしない (前回の残りは読まない)。
         MOE_SCRATCH.with(|cell| -> Result<()> {
             let mut s = cell.borrow_mut();
             let s: &mut MoeScratch = &mut s;
@@ -1586,6 +1700,7 @@ impl CudaCtx {
         }
         ctx.moe_gemv_dev(ty, dev_w, x, n_in, n_out, out)
     }
+
 
     /// P39: expert を VRAM に載せてよいか (カーネルと型が対応しているか)。
     ///
@@ -2024,6 +2139,18 @@ pub(crate) enum GemvKernelMode {
 /// `DENNO_GEMV_FP16` の生値 → fast mode の on/off (純関数。真理値表はテストで固定)。
 fn parse_gemv_fp16(raw: Option<&str>) -> bool {
     matches!(raw, Some("1") | Some("on") | Some("true"))
+}
+
+/// decode GEMV が使うカーネル一式を env から決める (`moe_gemv_dev` と
+/// task 124 の重ね打ち経路で共有する)。優先順は fp16 → v3 → v2。
+pub(crate) fn gemv_kernel_mode() -> GemvKernelMode {
+    if moe_gemv_fp16_on() {
+        GemvKernelMode::Fp16
+    } else if moe_gemv_v3_on() {
+        GemvKernelMode::V3
+    } else {
+        GemvKernelMode::V2
+    }
 }
 
 /// fast mode (`kernels_moe_fp16.cu`、fp16 dequant + half2 FMA) を使うか (既定 **off**)。
@@ -6038,6 +6165,593 @@ impl Drop for GemvInterceptGuard {
     fn drop(&mut self) {
         GEMV_INTERCEPT_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+// ---------------------------------------------------------------------------
+// task 124: shared expert の gate/up を router/expert の CPU 仕事と重ねる
+// ---------------------------------------------------------------------------
+//
+// decode の shared expert は 1 層あたり 4 本の**同期** GEMV (gate / up / down /
+// gate_inp) を回し、その間 rayon のワーカーは遊んでいる (実測 6.5 ms/tok)。
+// このうち gate と up の入力は層の入口の `x` だけで決まるので、router と
+// 選択 expert の CPU 仕事を始める**前に**専用ストリームへ積んでおき、
+// shared expert の節で 1 回だけ join する。
+//
+// 規約:
+// - カーネル・引数・行の内積順は [`CudaCtx::moe_gemv_dev`] と同一
+//   ([`CudaCtx::plan_moe_gemv`] を共有する) ので、値は今の GPU 経路と
+//   1 ビットも変わらない (md5 が動いたらバグ)。
+// - 積む前に「型・形・重みが VRAM にあること・カーネルが選べること」を全部
+//   確かめる (all-or-nothing)。1 本でも駄目なら 1 つも積まずに空のハンドルを
+//   返し、呼び出し側は従来の同期経路へ落ちる (fail closed)。
+// - 入出力は専用の grow-only バッファ (thread_local)。`MOE_SCRATCH` とは
+//   共有しない — 積んだまま expert の GEMV が同じスクラッチを書き換えるため。
+// - 重みは in-flight の間 `GgufWRef` で pin する (LRU の退避で解放されない)。
+// - join し忘れたまま捨てられたら (エラー経路) Drop が drain する。drain に
+//   失敗したら以後この経路は試さない (`broken`)。バッファはモジュール所有で、
+//   呼び出し側の `Vec` を指したままにはしない (解放済み領域を触らない)。
+// ---------------------------------------------------------------------------
+
+/// 重ね打ち 1 本ぶんの依頼 (重みは `GgufLinear` の生ブロックをそのまま渡す)。
+pub struct SharedGemvJob<'a> {
+    pub uid: u64,
+    pub ty: crate::kquant::GgmlType,
+    pub blocks: &'a [u8],
+    pub k: usize,
+    pub n: usize,
+}
+
+/// 同時に積める本数の上限 (shared expert は 2 本。余裕を見て 4)。
+const SHARED_OVERLAP_MAX_JOBS: usize = 4;
+
+static OVERLAP_BEGIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static OVERLAP_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static OVERLAP_JOINED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static OVERLAP_FAILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static OVERLAP_ABORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 重ね打ち経路の計数 (プロセス通算)。テストと `DENNO_SHARED_OVERLAP` の
+/// 発火確認に使う。緑 = 経路が発動した証拠ではない、の裏取り。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SharedOverlapStats {
+    /// `shared_gemv_begin` が呼ばれた回数
+    pub begin: usize,
+    /// 実際に GPU へ積めた回数 (fake 経路も含む)
+    pub taken: usize,
+    /// join できた回数
+    pub joined: usize,
+    /// join に失敗した回数 (呼び出し側は CPU へ落ちる)
+    pub failed: usize,
+    /// join せずに捨てられた回数 (Drop が drain した)
+    pub aborted: usize,
+}
+
+/// 計数を読む。
+pub fn shared_overlap_stats() -> SharedOverlapStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    SharedOverlapStats {
+        begin: OVERLAP_BEGIN.load(Relaxed),
+        taken: OVERLAP_TAKEN.load(Relaxed),
+        joined: OVERLAP_JOINED.load(Relaxed),
+        failed: OVERLAP_FAILED.load(Relaxed),
+        aborted: OVERLAP_ABORTED.load(Relaxed),
+    }
+}
+
+/// 計数を 0 に戻す (テスト用)。
+pub fn reset_shared_overlap_stats() {
+    use std::sync::atomic::Ordering::Relaxed;
+    OVERLAP_BEGIN.store(0, Relaxed);
+    OVERLAP_TAKEN.store(0, Relaxed);
+    OVERLAP_JOINED.store(0, Relaxed);
+    OVERLAP_FAILED.store(0, Relaxed);
+    OVERLAP_ABORTED.store(0, Relaxed);
+}
+
+struct SharedSlotBuf {
+    dout: Option<DevBuffer>,
+    pin_o: Option<PinMem>,
+    n: usize,
+    /// テスト用の偽 GPU の結果 (本物の GPU が無い環境で join 経路を試す)。
+    #[cfg(test)]
+    fake: Vec<f32>,
+}
+
+impl SharedSlotBuf {
+    fn new() -> Self {
+        Self {
+            dout: None,
+            pin_o: None,
+            n: 0,
+            #[cfg(test)]
+            fake: Vec::new(),
+        }
+    }
+}
+
+/// 重ね打ち用の thread_local 状態。decode は 1 スレッドなので競合しない。
+struct SharedOverlapState {
+    stream: Option<CopyStream>,
+    /// 重みの H2D (null ストリーム) と専用ストリームの順序を取るため
+    ev_ready: Option<CopyEvent>,
+    /// 積んだ 1 群の完了
+    ev_done: Option<CopyEvent>,
+    dx: Option<DevBuffer>,
+    pin_x: Option<PinMem>,
+    slots: Vec<SharedSlotBuf>,
+    /// in-flight の間だけ重みを pin する
+    pins: Vec<GgufWRef>,
+    in_flight: usize,
+    /// 失敗して以後この経路を試さない (壊れた状態でバッファを再利用しない)
+    broken: bool,
+    #[cfg(test)]
+    fake: bool,
+}
+
+impl SharedOverlapState {
+    fn new() -> Self {
+        Self {
+            stream: None,
+            ev_ready: None,
+            ev_done: None,
+            dx: None,
+            pin_x: None,
+            slots: Vec::new(),
+            pins: Vec::new(),
+            in_flight: 0,
+            broken: false,
+            #[cfg(test)]
+            fake: false,
+        }
+    }
+}
+
+thread_local! {
+    static SHARED_OVERLAP: std::cell::RefCell<SharedOverlapState> =
+        std::cell::RefCell::new(SharedOverlapState::new());
+}
+
+#[cfg(test)]
+static SHARED_OVERLAP_FAKE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// テスト用: 本物の GPU を使わずに「積めた」ことにする (`Drop` で戻す)。
+///
+/// このコンテナには GPU が無いので、join 経路 (バッファの写し先・順序) を
+/// 検証するにはこれが要る。値は CPU の `expert_gemv` で作るので、ゲート off の
+/// 経路と**ビット一致**するはず (同じ関数・同じ順)。
+#[cfg(test)]
+pub struct SharedOverlapFakeGuard;
+
+#[cfg(test)]
+impl SharedOverlapFakeGuard {
+    pub fn new() -> Self {
+        SHARED_OVERLAP_FAKE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for SharedOverlapFakeGuard {
+    fn drop(&mut self) {
+        SHARED_OVERLAP_FAKE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+static SHARED_OVERLAP_FAIL_FINISH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// テスト用: `shared_gemv_finish` を必ず失敗させる (`Drop` で戻す)。
+///
+/// join に失敗したときに呼び出し側が従来の同期経路へ落ちること (値が変わらない
+/// こと・abort が二重に走らないこと) を GPU 無しで確かめるためのもの。
+#[cfg(test)]
+pub struct SharedOverlapFailGuard;
+
+#[cfg(test)]
+impl SharedOverlapFailGuard {
+    pub fn new() -> Self {
+        SHARED_OVERLAP_FAIL_FINISH.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for SharedOverlapFailGuard {
+    fn drop(&mut self) {
+        SHARED_OVERLAP_FAIL_FINISH.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// in-flight の操作を drain する (join し忘れ・join 失敗の後始末)。
+///
+/// 戻り値 `false` は「完了を確認できなかった」。呼び出し側は `broken` を立てる。
+fn shared_overlap_drain(s: &mut SharedOverlapState) -> bool {
+    #[cfg(test)]
+    if s.fake {
+        s.in_flight = 0;
+        s.fake = false;
+        s.pins.clear();
+        return true;
+    }
+    let pending = s.in_flight != 0 || !s.pins.is_empty();
+    s.in_flight = 0;
+    s.pins.clear();
+    if !pending {
+        return true;
+    }
+    let Some(l) = lib().ok() else {
+        return false;
+    };
+    let Some(event_sync) = l.event_sync else {
+        return false;
+    };
+    let ctx_sync = l.ctx_sync;
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        return false;
+    }
+    let ev = s.ev_done.as_ref().map(|e| e.0);
+    let mut ok = match ev {
+        Some(ev) => (unsafe { event_sync(ev) }) == CUDA_SUCCESS,
+        None => true,
+    };
+    if !ok {
+        // ストリームの完了が取れない: デバイス全体で drain する (取りこぼし防止)。
+        ok = unsafe { ctx_sync() } == CUDA_SUCCESS;
+    }
+    ok
+}
+
+/// 積んだ本数を持つハンドル。`shared_gemv_finish` を呼ばずに捨てると、
+/// Drop が GPU を drain する (エラー経路で in-flight の操作を残さない)。
+pub struct SharedPending {
+    n: usize,
+    /// 別スレッドへ移せない (Drop が同じスレッドの thread_local を drain するため)。
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl SharedPending {
+    /// 何も積んでいないハンドル (ゲート off / GPU 不発 / 失敗)。
+    pub fn none() -> Self {
+        Self {
+            n: 0,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+    /// 積んだ本数 (0 = 重ね打ちしていない)。
+    pub fn len(&self) -> usize {
+        self.n
+    }
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+}
+
+impl Drop for SharedPending {
+    fn drop(&mut self) {
+        if self.n == 0 {
+            return;
+        }
+        self.n = 0;
+        OVERLAP_ABORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = SHARED_OVERLAP.try_with(|cell| {
+            let mut s = cell.borrow_mut();
+            if !shared_overlap_drain(&mut s) {
+                s.broken = true;
+            }
+        });
+    }
+}
+
+/// 依頼の検査と発行 (GPU 操作の前に全部そろえる = all-or-nothing)。
+#[allow(clippy::too_many_arguments)]
+fn shared_overlap_enqueue(
+    s: &mut SharedOverlapState,
+    ctx: &CudaCtx,
+    l: &CudaLib,
+    x: &[f32],
+    jobs: &[SharedGemvJob<'_>],
+    plans: &[MoeGemvPlan],
+    pins: &[GgufWRef],
+    uploaded: bool,
+) -> Result<()> {
+    if s.broken || s.in_flight != 0 {
+        bail!(
+            "重ね打ちは使わない (broken={}, in_flight={})",
+            s.broken,
+            s.in_flight
+        );
+    }
+    // 1) 専用の非ブロッキングストリーム + イベント (初回だけ)。
+    //    blocking で作ると legacy (null) ストリームと暗黙に同期し、expert の
+    //    GPU GEMV や mix のカーネルと 1 バイトも重ならない。
+    if s.stream.is_none() {
+        const CU_STREAM_NON_BLOCKING: u32 = 0x01;
+        const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
+        let (Some(stream_create), Some(event_create)) = (l.stream_create, l.event_create) else {
+            bail!("cuStreamCreate / cuEventCreate が無い");
+        };
+        let mut st: CUstream = std::ptr::null_mut();
+        if unsafe { stream_create(&mut st, CU_STREAM_NON_BLOCKING) } != CUDA_SUCCESS {
+            bail!("cuStreamCreate が失敗");
+        }
+        let mut ev_ready: CUevent = std::ptr::null_mut();
+        if unsafe { event_create(&mut ev_ready, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+            unsafe {
+                if let Some(f) = l.stream_destroy {
+                    let _ = f(st);
+                }
+            }
+            bail!("cuEventCreate (ready) が失敗");
+        }
+        let mut ev_done: CUevent = std::ptr::null_mut();
+        if unsafe { event_create(&mut ev_done, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+            unsafe {
+                if let Some(f) = l.stream_destroy {
+                    let _ = f(st);
+                }
+                if let Some(f) = l.event_destroy {
+                    let _ = f(ev_ready);
+                }
+            }
+            bail!("cuEventCreate (done) が失敗");
+        }
+        s.stream = Some(CopyStream(st));
+        s.ev_ready = Some(CopyEvent(ev_ready));
+        s.ev_done = Some(CopyEvent(ev_done));
+    }
+    // 2) grow-only の入出力 (MOE_SCRATCH とは別)。
+    let bytes_x = x.len() * 4;
+    Scratch::ensure(&mut s.dx, bytes_x)?;
+    Scratch::ensure_pin(&mut s.pin_x, bytes_x)?;
+    while s.slots.len() < jobs.len() {
+        s.slots.push(SharedSlotBuf::new());
+    }
+    for (i, j) in jobs.iter().enumerate() {
+        Scratch::ensure(&mut s.slots[i].dout, j.n * 4)?;
+        Scratch::ensure_pin(&mut s.slots[i].pin_o, j.n * 4)?;
+        s.slots[i].n = j.n;
+    }
+
+    let stream = s.stream.as_ref().expect("作成済み").0;
+    let ev_ready = s.ev_ready.as_ref().expect("作成済み").0;
+    let ev_done = s.ev_done.as_ref().expect("作成済み").0;
+    // 入力は pinned へ写してから積む (呼び出し側の Vec を in-flight 中に指さない)。
+    {
+        let px = s.pin_x.as_mut().expect("ensure 済み");
+        px.as_mut_slice::<f32>()[..x.len()].copy_from_slice(x);
+    }
+    let px_ptr = s.pin_x.as_ref().expect("ensure 済み").ptr;
+    let dx = s.dx.as_ref().expect("ensure 済み").ptr();
+    let (Some(event_record), Some(stream_wait_event)) = (l.event_record, l.stream_wait_event) else {
+        bail!("cuEventRecord / cuStreamWaitEvent が無い");
+    };
+    // 3) 重みの H2D が起きた層だけ null ストリームとの順序を取る。
+    if uploaded {
+        if unsafe { event_record(ev_ready, std::ptr::null_mut()) } != CUDA_SUCCESS {
+            bail!("cuEventRecord (ready) が失敗");
+        }
+        if unsafe { stream_wait_event(stream, ev_ready, 0) } != CUDA_SUCCESS {
+            bail!("cuStreamWaitEvent が失敗");
+        }
+    }
+    // 4) x の H2D → 各 GEMV の起動 → 各 D2H を 1 本のストリームに積む。
+    if unsafe { (l.memcpy_htod_async)(dx, px_ptr as *const c_void, bytes_x, stream) } != CUDA_SUCCESS
+    {
+        bail!("cuMemcpyHtoDAsync (shared x) が失敗");
+    }
+    for (i, plan) in plans.iter().enumerate() {
+        let dout = s.slots[i].dout.as_ref().expect("ensure 済み").ptr();
+        let po = s.slots[i].pin_o.as_ref().expect("ensure 済み").ptr;
+        ctx.launch_moe_gemv_on(plan, pins[i].buf.ptr, dx, dout, jobs[i].k, jobs[i].n, stream)?;
+        if unsafe { (l.memcpy_dtoh_async)(po, dout, jobs[i].n * 4, stream) } != CUDA_SUCCESS {
+            bail!("cuMemcpyDtoHAsync (shared {i}) が失敗");
+        }
+    }
+    // 5) 完了イベント (join はこれだけを待つ)。
+    if unsafe { event_record(ev_done, stream) } != CUDA_SUCCESS {
+        bail!("cuEventRecord (done) が失敗");
+    }
+    Ok(())
+}
+
+/// shared expert の GPU GEMV を先に積む。
+///
+/// 空のハンドルが返ったら呼び出し側は従来の同期経路で計算すること。
+pub fn shared_gemv_begin(x: &[f32], jobs: &[SharedGemvJob<'_>]) -> SharedPending {
+    OVERLAP_BEGIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if jobs.is_empty() || jobs.len() > SHARED_OVERLAP_MAX_JOBS {
+        return SharedPending::none();
+    }
+    #[cfg(test)]
+    if SHARED_OVERLAP_FAKE.load(std::sync::atomic::Ordering::Relaxed) {
+        return shared_gemv_begin_fake(x, jobs);
+    }
+    if !cuda_enabled() {
+        return SharedPending::none();
+    }
+    let Some(ctx) = shared_ctx() else {
+        return SharedPending::none();
+    };
+    if ctx.make_current().is_err() {
+        return SharedPending::none();
+    }
+    let Ok(l) = lib() else {
+        return SharedPending::none();
+    };
+    if l.stream_create.is_none()
+        || l.stream_wait_event.is_none()
+        || l.event_create.is_none()
+        || l.event_record.is_none()
+        || l.event_sync.is_none()
+    {
+        return SharedPending::none();
+    }
+    let mode = gemv_kernel_mode();
+    // 計画と重み (GPU へはまだ 1 つも積まない)。
+    let mut plans = Vec::with_capacity(jobs.len());
+    let mut pins = Vec::with_capacity(jobs.len());
+    let mut uploaded = false;
+    for j in jobs {
+        if j.k == 0 || j.n == 0 || j.k != x.len() || j.k % j.ty.blck_size() != 0 {
+            return SharedPending::none();
+        }
+        let plan = match ctx.plan_moe_gemv(j.ty, j.k, j.n, mode) {
+            Ok(Some(p)) => p,
+            _ => return SharedPending::none(),
+        };
+        let existed = gguf_registry()
+            .lock()
+            .map(|g| g.map.contains_key(&j.uid))
+            .unwrap_or(false);
+        let w = match weights_for_gguf(j.uid, j.ty, j.blocks, j.k, j.n) {
+            Ok(w) => w,
+            Err(_) => return SharedPending::none(),
+        };
+        if w.buf.bytes() != j.n.saturating_mul(plan.rb) {
+            return SharedPending::none();
+        }
+        uploaded |= !existed;
+        plans.push(plan);
+        pins.push(w);
+    }
+    SHARED_OVERLAP.with(|cell| {
+        let mut s = cell.borrow_mut();
+        match shared_overlap_enqueue(&mut s, ctx, l, x, jobs, &plans, &pins, uploaded) {
+            Ok(()) => {
+                s.pins = pins;
+                s.in_flight = jobs.len();
+                OVERLAP_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                SharedPending {
+                    n: jobs.len(),
+                    _not_send: std::marker::PhantomData,
+                }
+            }
+            Err(_) => {
+                let _ = shared_overlap_drain(&mut s);
+                s.broken = true;
+                SharedPending::none()
+            }
+        }
+    })
+}
+
+/// 積んだ GEMV を join して `outs[i]` へ写す。
+///
+/// 戻り値 `false` = 「GPU の結果が取れなかった」。呼び出し側は従来の同期経路で
+/// 計算し直すこと (このとき `outs` は 1 要素も書かれていない)。
+pub fn shared_gemv_finish(p: &mut SharedPending, outs: &mut [&mut [f32]]) -> bool {
+    let n = std::mem::replace(&mut p.n, 0);
+    if n == 0 {
+        return false;
+    }
+    // テスト用: join を必ず失敗させる (呼び出し側の切り戻し経路を試す)。
+    #[cfg(test)]
+    if SHARED_OVERLAP_FAIL_FINISH.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = SHARED_OVERLAP.try_with(|cell| {
+            let mut s = cell.borrow_mut();
+            let _ = shared_overlap_drain(&mut s);
+        });
+        OVERLAP_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    SHARED_OVERLAP.with(|cell| -> bool {
+        let mut s = cell.borrow_mut();
+        if s.in_flight != n || outs.len() != n {
+            let _ = shared_overlap_drain(&mut s);
+            s.broken = true;
+            return false;
+        }
+        // テスト用の偽 GPU: 計算済みの値を書き戻すだけ (GPU には触らない)。
+        #[cfg(test)]
+        if s.fake {
+            for (i, out) in outs.iter_mut().enumerate().take(n) {
+                let v = std::mem::take(&mut s.slots[i].fake);
+                let len = v.len().min(out.len());
+                out[..len].copy_from_slice(&v[..len]);
+            }
+            s.in_flight = 0;
+            s.fake = false;
+            OVERLAP_JOINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        for (i, out) in outs.iter().enumerate().take(n) {
+            if out.len() < s.slots[i].n {
+                let _ = shared_overlap_drain(&mut s);
+                s.broken = true;
+                return false;
+            }
+        }
+        let Some(ctx) = shared_ctx() else {
+            let _ = shared_overlap_drain(&mut s);
+            s.broken = true;
+            return false;
+        };
+        if ctx.make_current().is_err() {
+            let _ = shared_overlap_drain(&mut s);
+            s.broken = true;
+            return false;
+        }
+        let Some(event_sync) = lib().ok().and_then(|l| l.event_sync) else {
+            let _ = shared_overlap_drain(&mut s);
+            s.broken = true;
+            return false;
+        };
+        let Some(ev) = s.ev_done.as_ref().map(|e| e.0) else {
+            let _ = shared_overlap_drain(&mut s);
+            s.broken = true;
+            return false;
+        };
+        if unsafe { event_sync(ev) } != CUDA_SUCCESS {
+            let _ = shared_overlap_drain(&mut s);
+            s.broken = true;
+            OVERLAP_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        for (i, out) in outs.iter_mut().enumerate().take(n) {
+            let len = s.slots[i].n;
+            let pin = s.slots[i].pin_o.as_ref().expect("ensure 済み");
+            out[..len].copy_from_slice(&pin.as_slice::<f32>()[..len]);
+        }
+        s.in_flight = 0;
+        s.pins.clear();
+        OVERLAP_JOINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    })
+}
+
+/// テスト用の偽 GPU 経路 (GPU を 1 つも触らない)。
+#[cfg(test)]
+fn shared_gemv_begin_fake(x: &[f32], jobs: &[SharedGemvJob<'_>]) -> SharedPending {
+    let mut vals = Vec::with_capacity(jobs.len());
+    for j in jobs {
+        let mut v = vec![0f32; j.n];
+        if crate::model::moe_expert::expert_gemv(j.ty, j.blocks, j.k, j.n, x, &mut v).is_err() {
+            return SharedPending::none();
+        }
+        vals.push(v);
+    }
+    SHARED_OVERLAP.with(|cell| {
+        let mut s = cell.borrow_mut();
+        while s.slots.len() < vals.len() {
+            s.slots.push(SharedSlotBuf::new());
+        }
+        for (i, v) in vals.into_iter().enumerate() {
+            s.slots[i].n = v.len();
+            s.slots[i].fake = v;
+        }
+        s.fake = true;
+        s.in_flight = jobs.len();
+        OVERLAP_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SharedPending {
+            n: jobs.len(),
+            _not_send: std::marker::PhantomData,
+        }
+    })
 }
 
 /// P-MOE-E5: GGUF ブロックのままの線形層 (m=1) を GPU で計算する。
