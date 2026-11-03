@@ -21861,7 +21861,8 @@ pub fn gdn_gpu_check_on() -> bool {
     })
 }
 
-/// 状態ストアの上限 (エントリ = 1 層ぶん ≈ 3.8 MiB)。72 = 36 層モデル 2 本ぶん。
+/// 状態ストアの上限 (エントリ = 1 層ぶん ≈ 3.3 MiB: conv 2x120 KiB + ssm 3.0 MiB
+/// + x/qkv/ba/y/out 約 100 KiB)。72 = 36 層モデル 2 本ぶん。
 /// 追い出しは最古の挿入順 (Vec の先頭)。`SsmLayer` は Drop を持たないので、
 /// 解放済みモデルのエントリはこの上限まで残る (上限到達で先頭から回収)。
 const GDN_DECODE_STORE_MAX: usize = 72;
