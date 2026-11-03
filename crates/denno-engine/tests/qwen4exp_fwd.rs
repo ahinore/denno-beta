@@ -911,6 +911,9 @@ fn layer_attn_hook_is_called_for_every_layer() {
             self.seen.lock().expect("lock").push(layer);
             Ok(cur.to_vec())
         }
+
+        /// 状態を持たない (観測だけ) ので、消すものも無い (明示的に書く)。
+        fn reset(&mut self) {}
     }
 
     let dir = TempDir::new("attn");

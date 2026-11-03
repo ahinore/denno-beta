@@ -1672,6 +1672,11 @@ impl LayerAttn for FullAttn {
         true
     }
 
+    /// P118: KV・pos・QSA を空にする (固有の [`FullAttn::reset`] へ委譲)。
+    fn reset(&mut self) {
+        FullAttn::reset(self)
+    }
+
     /// P109: QSA 無効なら KV の長さ戻しで巻き戻せる。
     fn spec_restorable(&self) -> bool {
         FullAttn::spec_restorable(self)

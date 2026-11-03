@@ -641,6 +641,17 @@ impl LayerAttn for SsmAttn {
         true
     }
 
+    /// P118: ssm 層の GDN conv/ssm を 0 に戻し、full attention 側へも委譲する。
+    ///
+    /// 積んだ位置だけを消す (`GdnState::reset` は領域を使い回す)。重みと
+    /// uid 登録は触らない (GPU 常駐の重みを再 upload させないのが目的)。
+    fn reset(&mut self) {
+        for l in self.layers.iter_mut().flatten() {
+            l.state.reset();
+        }
+        self.full.reset();
+    }
+
     /// P109: full attention 側が巻き戻しに対応しているときだけ対応
     /// (QSA 有効の [`FullAttn`] では `false` になり、spec の batch 経路は逐次に落ちる)。
     fn spec_restorable(&self) -> bool {
