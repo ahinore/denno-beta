@@ -1052,57 +1052,6 @@ fn ssm_attn_full_layer_batch_matches_sequential() {
     }
 }
 
-/// 临时診断 (P109 調査用・commit 前に削除): seq/batch の層出口を比較する。
-#[test]
-fn zzz_diag_batch_vs_seq_layer_tap() {
-    let dir = TempDir::new("fullprefill");
-    let f = open_synth(&dir, "model.gguf", false);
-    let p = validate(&f).expect("validate");
-    let max_ctx = 64usize;
-    let build = |f: &GgufFile| -> Qwen4Exp {
-        let full = FullAttn::from_gguf_with(f, &p, max_ctx, false).expect("FullAttn");
-        let attn = SsmAttn::with_full(f, &p, Box::new(full)).expect("SsmAttn");
-        Qwen4Exp::with_attn(f, Box::new(attn)).expect("model")
-    };
-
-    let ctx: Vec<u32> = (0..12u32).map(|i| i % (N_VOCAB as u32)).collect();
-
-    let mut seq = build(&f);
-    let mut tap_seq: Vec<(usize, Vec<u32>)> = Vec::new();
-    let _l_seq = seq
-        .forward_prefill_tapped(
-            &ctx,
-            false,
-            denno_engine::model::qwen4exp::TapTokens::Last,
-            |o| {
-                tap_seq.push((o.il, bits(o.res)));
-            },
-        )
-        .expect("逐次 prefill");
-    let mut bat = build(&f);
-    let mut tap_bat: Vec<(usize, Vec<u32>)> = Vec::new();
-    let _l_bat = bat
-        .forward_prefill_tapped(
-            &ctx,
-            true,
-            denno_engine::model::qwen4exp::TapTokens::Last,
-            |o| {
-                tap_bat.push((o.il, bits(o.res)));
-            },
-        )
-        .expect("バッチ prefill");
-
-    assert_eq!(tap_seq.len(), tap_bat.len());
-    for (a, b) in tap_seq.iter().zip(tap_bat.iter()) {
-        if a.1 != b.1 {
-            let n_diff = a.1.iter().zip(b.1.iter()).filter(|(x, y)| x != y).count();
-            println!("LAYER {} differs: {n_diff}/{} elements", a.0, a.1.len());
-        }
-    }
-    let l0 = &tap_seq[0].1;
-    println!("layer0 len={}", l0.len());
-}
-
 /// prefill 全体 (層優先バッチ) の logits が逐次 prefill とビット一致する。
 ///
 /// `Qwen4Exp::with_attn` に `SsmAttn + FullAttn` を入れた合成モデルで、

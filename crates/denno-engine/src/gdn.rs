@@ -131,6 +131,16 @@ impl GdnState {
             ssm: vec![0.0; p.ssm_state_len()],
         }
     }
+
+    /// conv と SSM 行列を 0 に戻す ([`GdnState::new`] 直後と同じ値)。
+    ///
+    /// 確保済みの領域はそのまま使い回す (新規確保しない)。系列の切れ目で呼ぶ。
+    /// conv / ssm は forward のたびに上書きされる作業域なので、0 戻しは
+    /// 新規構築とビット一致する (P118 の decoder reset から使う)。
+    pub fn reset(&mut self) {
+        self.conv.fill(0.0);
+        self.ssm.fill(0.0);
+    }
 }
 
 #[inline]

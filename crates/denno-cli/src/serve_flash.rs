@@ -11,7 +11,14 @@
 //! 直前のリクエストの状態 (KV / GDN / PLE の窓) を 1 つだけ保持し、次の
 //! プロンプトが**そのトークン列の続き**なら差分だけ食わせる。会話のたびに
 //! システムプロンプトを読み直さないための仕組みで、前置きが一致しないときは
-//! モデルを組み直して最初から prefill する。
+//! モデルを組み直して最初から prefill していた。
+//!
+//! P118: 前置きが一致しないときも、decoder が残っていれば `build_model` を
+//! 呼ばずに系列状態だけ消して (`Qwen4ExpDecoder::reset`) 使い回す。組み直すと
+//! `GgufLinear` に新しい uid が振られて GPU 常駐の重みを全部再 upload する
+//! (cache-miss 1 回あたり 266 本 / 3.4 秒の無駄)。reset は uid に触れないので
+//! 重みは常駐したまま、logits は新規構築とビット一致する。
+//! `DENNO_FLASH_MODEL_REUSE=0` で組み直しに戻す (既定は使い回す)。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -25,7 +32,7 @@ use denno_engine::model::qwen4exp::{Qwen4Exp, Qwen4ExpParams, TapTokens};
 use denno_engine::model::qwen4exp_attn::FullAttn;
 use denno_engine::model::qwen4exp_decode::{argmax, DecoderConfig, Qwen4ExpDecoder};
 use denno_engine::spec_ngram::{
-    NgramIndex, DEFAULT_CAND_KEEP, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_SUFFIX,
+    offer_draft, NgramIndex, DEFAULT_CAND_KEEP, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_SUFFIX,
 };
 use denno_engine::model::qwen4exp_ssm::SsmAttn;
 use denno_engine::sampler::Sampler;
@@ -78,6 +85,21 @@ struct GenReq {
 fn env_flag(k: &str) -> bool {
     matches!(std::env::var(k).as_deref(), Ok("1") | Ok("true") | Ok("yes"))
 }
+
+/// P118: `DENNO_FLASH_MODEL_REUSE` の値から「no-reuse 経路でモデルを使い回すか」
+/// を決める (純関数。真偽表テスト `model_reuse_truth_table` が規約を固定する)。
+///
+/// 既定は `true` (= 使い回す)。`0` / `false` / `no` のときだけ `false`
+/// (従来どおりリクエストごとに `build_model` する)。未設定・空・その他の値は
+/// 既定に従う (typo で黙って毎回 3.4 秒かかるより、既定の速い経路に落ちる)。
+fn model_reuse_enabled(v: Option<&str>) -> bool {
+    !matches!(v, Some("0") | Some("false") | Some("no"))
+}
+
+/// P118: テスト専用の `build_model` 呼び出しカウンタ (firing test 用)。
+/// `cfg(test)` なので本番ビルドには存在しない。数値経路には触れない。
+#[cfg(test)]
+static TEST_BUILD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl GenReq {
     fn from_json(v: &Value, default_max: usize) -> Result<Self> {
@@ -312,9 +334,11 @@ fn prof_flash_q4(tag: &str, tok: usize) {
 
 /// P109: 貪欲 (argmax) のトークン id。spec の照合は greedy が前提。
 ///
-/// serve の sampler は `temperature <= 0` でも greedy にならない
-/// (`Sampler::new(None)` が temperature 1.0 扱いになる既存の挙動) ので、
-/// spec 経路では engine の argmax を直接使う。
+/// task 112 で serve の Sampler も temperature <= 0 で greedy になった
+/// (`Sampler::new` に temperature をそのまま渡す。以前は None を渡していて
+/// temperature 1.0 扱い = temp 0 でも確率サンプリングになっていた)。
+/// `Sampler::sample` の greedy 経路と選択規則は同じ (f32 生値の `>`、
+/// 同点は添字小) だが、こちらは engine の argmax で NaN をエラーにする。
 fn greedy_u32(logits: &[f32]) -> Result<u32> {
     let i = argmax(logits).map_err(|e| anyhow::anyhow!("{e}"))?;
     u32::try_from(i).map_err(|_| anyhow::anyhow!("argmax の {i} が u32 に収まらない"))
@@ -385,6 +409,8 @@ fn emit_confirmed(
 impl Flash {
     /// モデルを組む (mmap 越し)。
     fn build_model(&self) -> Result<Qwen4Exp> {
+        #[cfg(test)]
+        TEST_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let f = GgufFile::open_split(&self.parts).context("分割 GGUF を開けない")?;
         let p = Qwen4ExpParams::from_meta(&f).context("メタデータを読めない")?;
         let full = FullAttn::from_gguf(&f, &p, self.max_ctx).context("FullAttn")?;
@@ -458,6 +484,8 @@ impl Flash {
         let sid = telem::next_session_id();
 
         // 直前の状態が使えるなら差分だけ食わせる。
+        // P118: モデルの使い回しはここで 1 回だけ読む (`DENNO_FLASH_MODEL_REUSE`)。
+        let model_reuse = model_reuse_enabled(std::env::var("DENNO_FLASH_MODEL_REUSE").ok().as_deref());
         let t1 = Instant::now();
         let mut reused = 0usize;
         let (mut dec, mut logits) = match self.cache.take() {
@@ -470,12 +498,30 @@ impl Flash {
                     (c.dec, c.logits)
                 }
             }
-            _ => {
-                // P78: mmap と attention/KV 状態の確保は「層の外」でも重い候補。
+            other => {
+                // P118: 前置きが一致しないときも、decoder が残っていれば
+                // `build_model` を呼ばずに系列状態だけ消して使い回す。
+                // 組み直すと `GgufLinear` に新しい uid が振られ、uid 引きの
+                // GPU 常駐重みが全部再 upload される (cache-miss 1 回あたり
+                // 266 本 / 3.42 秒)。reset は uid に触れないので重みは常駐した
+                // ままで、数値も新規構築とビット一致する (engine 側
+                // `reset_matches_fresh_decoder_bitexact`)。前のリクエストが
+                // 途中で失敗したときは cache が None のままなので、この経路は
+                // 通らず組み直す (半端に進んだ decoder を使い回さない)。
                 let t_model = prekprof::stamp();
-                let m = self.build_model()?;
+                let mut d = match other {
+                    Some(c) if model_reuse => {
+                        let mut d = c.dec;
+                        d.reset();
+                        d
+                    }
+                    _ => {
+                        // P78: mmap と attention/KV 状態の確保は「層の外」でも重い候補。
+                        let m = self.build_model()?;
+                        Qwen4ExpDecoder::new(m, DecoderConfig::new(self.max_ctx))
+                    }
+                };
                 prekprof::mark(t_model, prekprof::MODEL);
-                let mut d = Qwen4ExpDecoder::new(m, DecoderConfig::new(self.max_ctx));
                 let lg = self.prefill_logits(&mut d, &prompt)?;
                 (d, lg)
             }
@@ -502,16 +548,12 @@ impl Flash {
         }
 
         prof_flash("prefill", n_prompt - reused);
-        let mut sampler = Sampler::new(
-            if req.temperature <= 0.0 {
-                None
-            } else {
-                Some(req.temperature)
-            },
-            req.top_k,
-            req.top_p,
-            Some(42),
-        );
+        // task 112: temperature をそのまま渡す。temperature <= 0 は
+        // `Sampler::sample` 内の greedy 経路 (argmax、同点は添字小) になる。
+        // 以前は None を渡していて `Sampler::new` が temperature 1.0 扱いにして
+        // いたため、spec off の temp 0 が貪欲にならず、spec on (engine の
+        // argmax) と出力がずれていた (accept=0 でも不一致になる原因)。
+        let mut sampler = Sampler::new(Some(req.temperature), req.top_k, req.top_p, Some(42));
         let eos = self.tok.eos();
         let mut out: Vec<u32> = Vec::new();
         let mut text = String::new();
@@ -531,6 +573,8 @@ impl Flash {
         // - greedy (temperature <= 0) のときだけ (spec は貪欲照合が前提)
         // - テレメトリの層活性タップ (ACT) 有効時は off (tap は Step 幅 1 前提)
         // - `DENNO_SPEC_K` で draft の最大長 (既定 4、上限 16)
+        // - `DENNO_SPEC_MIN_P` で draft 候補の先頭トークン確率の下限
+        //   (既定 0 = 無効。task 112。候補の生成だけに効く)
         let spec_on = env_flag("DENNO_SPEC") && req.temperature <= 0.0 && !self.act_on();
         let spec_k = if spec_on {
             std::env::var("DENNO_SPEC_K")
@@ -541,11 +585,26 @@ impl Flash {
         } else {
             0
         };
+        let spec_min_p = if spec_on {
+            std::env::var("DENNO_SPEC_MIN_P")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .map(|p| p.clamp(0.0, 1.0))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
         let mut ngram =
             NgramIndex::new(DEFAULT_MAX_SUFFIX, DEFAULT_MAX_ENTRIES, DEFAULT_CAND_KEEP, spec_k);
         if spec_on {
             ngram.feed(dec.tokens());
         }
+        // P109: 受理率の計測 (DENNO_SPEC_STATS=1 のときだけ生成終了時に 1 行出す)。
+        // 加算だけなので数値経路には触れない。
+        let mut spec_steps = 0usize;
+        let mut spec_confirmed = 0usize;
+        let mut spec_accepted = 0usize;
+        let mut spec_offered = 0usize;
         let t2 = Instant::now();
         'gen: while out.len() < req.max_tokens {
             if spec_on {
@@ -564,9 +623,14 @@ impl Flash {
                 if Some(q0) == eos {
                     break;
                 }
-                let draft = ngram.draft(dec.tokens(), spec_k);
+                // task 112: 辞書は「q0 を含む末尾」で引く。spec_verify は q0 を
+                // 先に食い、draft[0] を「q0 の次」の貪欲予測と照合するので、
+                // q0 を含めないで引くと継続の先頭 (= q0 スロットのトークン) が
+                // draft[0] になり、パターンが繰り返すほど最初の照合で必ず壊れる
+                // (accept=0 の原因)。min_p > 0 なら低確率の候補は出さない。
+                let draft = offer_draft(&ngram, dec.tokens(), q0, spec_k, &logits, spec_min_p);
                 let t_step = t_on.then(Instant::now);
-                let outcome = match dec.spec_verify(q0, &draft, true, eos) {
+                let outcome = match dec.spec_verify(q0, &draft, eos) {
                     Ok(o) => o,
                     Err(e) => {
                         failed = Some(e.into());
@@ -574,6 +638,10 @@ impl Flash {
                     }
                 };
                 ngram.feed(dec.tokens());
+                spec_steps += 1;
+                spec_confirmed += outcome.confirmed.len();
+                spec_accepted += outcome.n_accepted;
+                spec_offered += draft.len();
                 let pos0 = dec.tokens().len() - outcome.confirmed.len();
                 // max_tokens に収まるぶんだけ出す (はみ出した確定トークンはモデルの
                 // 状態には残るが本文には出さない = max_tokens を厳守する)。
@@ -708,6 +776,19 @@ impl Flash {
             t_prefill * 1e3 / (n_prompt - reused).max(1) as f64,
             t_decode * 1e3 / out.len().max(1) as f64
         );
+        // P109: `DENNO_SPEC_STATS=1` のときだけ spec ステップの受理率を 1 行出す
+        // (恒久診断。env 未指定では何も出さない。加算だけなので出力は変わらない)。
+        if spec_on && env_flag("DENNO_SPEC_STATS") {
+            let rate = if spec_offered > 0 {
+                spec_accepted as f64 / spec_offered as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[SPEC] steps={spec_steps} confirmed={spec_confirmed} accepted={spec_accepted} offered={spec_offered} accept={rate:.3} tok/step={:.2}",
+                spec_confirmed as f64 / spec_steps.max(1) as f64
+            );
+        }
         prof_flash("decode", out.len());
         // P78: `DENNO_PRE_KPROF=1` のときだけ、層の外の区間を 2 行で出す
         // (既定 off では `report` が空を返す = 出力ゼロ)。
@@ -1193,6 +1274,11 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
 }
 
 // ---------- テスト ----------
+
+/// P118: 合成モデルで `generate()` を回す発火テスト (cfg(test) のみ)。
+#[cfg(test)]
+#[path = "serve_flash_synth.rs"]
+mod flash_synth;
 
 #[cfg(test)]
 mod flash_tests {
