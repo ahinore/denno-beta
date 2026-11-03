@@ -2380,6 +2380,11 @@ impl Qwen4Exp {
         let auto = roles.is_none() && arch_frames_enabled();
 
         let t_lay = prekprof::stamp_when(prof);
+        // task 128: GPU scan 用の decode 窓 (env に依存しない。SsmLayer::forward_token
+        // がこれを見て decode だけ GPU 経路に入る)。`nt == 1` = decode 1 トークン
+        // (逐次 prefill の末尾 1 トークンもここに入るが、値は CPU 経路と一致する
+        // 契約なので問題にしない)。off ではガードの drop が 1 回走るだけ。
+        let _gw = gdn_gpu_win::window(nt == 1);
         for il in 0..self.p.n_layer {
             // P54: 役割別 RMS は層ごとに 0 から取り直す (観測しないときは None)。
             {
@@ -4722,6 +4727,59 @@ pub mod attn_kprof {
         ] {
             c.store(0, Ordering::Relaxed);
         }
+    }
+}
+
+/// task 128: GDN (qwen4exp) の decode 窓。
+///
+/// [`Qwen4Exp::forward_token_at`] が `nt == 1` (decode) のときだけ開き、
+/// `SsmLayer::forward_token` がこの中でだけ GPU submission
+/// (`crate::cuda::gdn_decode_submit`) を使う。バッチ prefill / spec verify の
+/// 複数トークン経路は窓の外なので、従来どおり CPU で state を進める。
+///
+/// 窓はスレッドローカル + ネスト可 (内側の drop で外側の状態に戻す)。env とは
+/// 無関係 (実際に GPU を使うかは `DENNO_GDN_GPU_SCAN` が決める)。
+pub mod gdn_gpu_win {
+    use std::cell::Cell;
+
+    thread_local! {
+        static OPEN: Cell<bool> = Cell::new(false);
+        static TOK: Cell<u64> = Cell::new(0);
+    }
+
+    /// 窓が開いているか (SsmLayer が 1 トークンごとに見る)。
+    pub fn active() -> bool {
+        OPEN.with(|c| c.get())
+    }
+
+    /// 開いた decode 窓の通し番号 (1 から)。`DENNO_GDN_GPU_CHECK` が
+    /// 「最初の数トークンだけ」比較するためのカウンタ。
+    pub fn token_index() -> u64 {
+        TOK.with(|c| c.get())
+    }
+
+    /// `decode` の状態で窓を開き、drop で呼び出し前の状態へ戻すガードを返す。
+    pub fn window(decode: bool) -> GdnGpuWinGuard {
+        let prev = OPEN.with(|c| c.replace(decode));
+        if decode {
+            TOK.with(|c| c.set(c.get() + 1));
+        }
+        GdnGpuWinGuard(prev)
+    }
+
+    /// [`window`] のガード。drop で窓の状態を呼び出し前に戻す。
+    pub struct GdnGpuWinGuard(bool);
+
+    impl Drop for GdnGpuWinGuard {
+        fn drop(&mut self) {
+            OPEN.with(|c| c.set(self.0));
+        }
+    }
+
+    /// テストが窓を直接開け閉めする (guard を使わない経路の検証用)。
+    #[cfg(test)]
+    pub fn set_window_for_test(v: bool) {
+        OPEN.with(|c| c.set(v));
     }
 }
 

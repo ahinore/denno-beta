@@ -1005,6 +1005,18 @@ impl FusedLinear {
         self.ranges[i].clone()
     }
 
+    /// task 128: GPU submission 用に「1 発 GEMV の単位」を呼び出し順で列挙する。
+    ///
+    /// 連結済みのときは inner 1 本 (出力は連結バッファ全体)、分かれているときは
+    /// 元の層の順。返す参照は [`Self::range`] と同じ順序で、`range(i)` の行範囲が
+    /// その単位の出力の置き場所になる (`gemv_concat_into` と同一規約)。
+    pub fn gemv_units(&self) -> Vec<&GgufLinear> {
+        match &self.inner {
+            Some(i) => vec![i],
+            None => self.parts.iter().collect(),
+        }
+    }
+
     pub fn weight_bytes(&self) -> usize {
         match &self.inner {
             Some(i) => i.weight_bytes(),

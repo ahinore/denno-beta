@@ -619,14 +619,14 @@ let d = defines(GDN_SRC);
     );
 
     // ---- (3) ホスト側の smem 計算がカーネルと一致すること ----
-    // cuda.rs は `let shmem = ((3 * dk + dv + 5) * 4) as u32;` を 2 箇所
-    // (gdn_scan_impl / gdn_scan_batch) で、chunk 経路は `shmem_scan` の名前で
-    // 同じ式を使う (下で個別に確認する)。
+    // cuda.rs は `let shmem = ((3 * dk + dv + 5) * 4) as u32;` を 3 箇所
+    // (gdn_scan_impl / gdn_scan_batch / task 128 の gdn_decode_submit) で、
+    // chunk 経路は `shmem_scan` の名前で同じ式を使う (下で個別に確認する)。
     let host_expr = "let shmem = ((3 * dk + dv + 5) * 4) as u32;";
     let n_host = CUDA_RS.matches(host_expr).count();
     assert_eq!(
-        n_host, 2,
-        "cuda.rs の gdn smem 計算 (`{host_expr}`) が {n_host} 箇所 (期待 2): \
+        n_host, 3,
+        "cuda.rs の gdn smem 計算 (`{host_expr}`) が {n_host} 箇所 (期待 3): \
          増減したなら本テストの期待値を更新すること"
     );
     // chunk 経路は別名 (`shmem_scan`) で同じ式。
