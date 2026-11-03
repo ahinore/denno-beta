@@ -3212,7 +3212,8 @@ fn hc_mix_fast_enabled() -> bool {
 /// task 110: `DENNO_MIX_GPU` の解釈。**既定 off**。`1` / `on` / `true` / `yes`
 /// (`trim` + 小文字化。`router_gpu_from_value` と同一規約) のとき hc mix の
 /// BF16 down / up を GPU (`cuda::maybe_gpu_mix_bf16_into` = `dno_matvec_f32`
-/// 流用) で回す。失敗時は cuda 側が warn 1 行で CPU に落ちる (値はビット一致)。
+/// 流用・task 121 から長い行 k >= n は並列リダクション版 `dno_matvec_f32_r`)
+/// で回す。失敗時は cuda 側が warn 1 行で CPU に落ちる (短い行の値はビット一致)。
 fn mix_gpu_from_value(v: Option<&str>) -> bool {
     match v {
         Some(s) => matches!(
@@ -3461,9 +3462,12 @@ fn hc_mix_quant_fast(
         let hc_fast = hc_mix_fast_enabled();
         // task 110: `DENNO_MIX_GPU=1` かつ BF16 のときだけ down GEMV を GPU に奪う
         // (カーネルは dno_matvec_f32 流用・1 行 = 1 ブロック・k 昇順直列加算 = CPU
-        // 参照とビット一致)。false のときは従来どおり CPU 経路 (cuda 側が warn を
-        // 1 行だけ出す)。GPU 経路が成功すると `last_linear_ran_on_gpu` が立つので
-        // 下の `note_down` が gpu= を積む ([mix-kprof] の内訳で見える)。
+        // 参照とビット一致。task 121 から長い行 k >= n (= down 実形) は s169 の
+        // 並列リダクション版 dno_matvec_f32_r (block 256・固定木縮約・決定論) に
+        // 切り替わるためビット一致しない: 許容 絶対 1e-4 + 相対 1e-5)。false の
+        // ときは従来どおり CPU 経路 (cuda 側が warn を 1 行だけ出す)。GPU 経路が
+        // 成功すると `last_linear_ran_on_gpu` が立つので下の `note_down` が gpu= を
+        // 積む ([mix-kprof] の内訳で見える)。
         #[cfg(feature = "cuda")]
         let gpu_down = mix_gpu_enabled()
             && down.ty() == crate::kquant::GgmlType::Bf16
@@ -3498,6 +3502,8 @@ fn hc_mix_quant_fast(
         let t = mix_kprof::stamp();
         // task 110: up GEMV も down と同じ (`DENNO_MIX_GPU=1` かつ BF16 のときだけ
         // GPU に奪う。入力は hc_lo_apply 済みの `lo`、成功で `note_up` が gpu= を積む)。
+        // up 実形 (k=320 < n=10240) は短い行なので task 121 でも逐次版のまま
+        // (ビット一致)。
         #[cfg(feature = "cuda")]
         let gpu_up = mix_gpu_enabled()
             && up.ty() == crate::kquant::GgmlType::Bf16
@@ -5416,6 +5422,286 @@ fn expert_hugepage_enabled() -> bool {
     })
 }
 
+// ===========================================================================
+// task 120: decode (m=1) の expert 剪定ゲートと重み統計。
+//
+// 方針 (オペレータ 2026-11-03): 速度をビット一致より優先できるが、剪定は丸めでなく
+// 挙動を変えるので、**測定した品質数字が無い限り既定は off のまま**。ここで作るのは
+// スイッチと測定道具だけ。ゲートが全部 off のときは出力が親経路と to_bits 一致する。
+// ===========================================================================
+
+/// `DENNO_EXPERT_TOPK` の値解釈 (純粋関数)。
+///
+/// top-k のうち確率上位 `n` 個だけ残す。有効範囲は `1 <= n <= k`
+/// (`k` = `expert_used_count`)。**未設定 / 空 / 非数 / 範囲外は無効 = off**。
+/// `n == k` は有効だが切る相手が無い (経路も値も親経路と同じ)。
+fn expert_topk_from_value(v: Option<&str>, k: usize) -> Option<usize> {
+    let s = v.map(str::trim).filter(|s| !s.is_empty())?;
+    let n: usize = s.parse().ok()?;
+    if (1..=k).contains(&n) {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// `DENNO_EXPERT_MIN_W` の値解釈 (純粋関数)。
+///
+/// 再正規化後の重みが `x` 未満の expert を落とす。**0 / 未設定 / 空 / 負 /
+/// NaN / inf / 非数は無効 = off**。有限の正数だけ有効 (1.0 は「最高重みの
+/// 1 個を常に残す」の意味で有効)。
+fn expert_min_w_from_value(v: Option<&str>) -> Option<f32> {
+    let s = v.map(str::trim).filter(|s| !s.is_empty())?;
+    let x: f32 = s.parse().ok()?;
+    if x.is_finite() && x > 0.0 {
+        Some(x)
+    } else {
+        None
+    }
+}
+
+/// `DENNO_EXPERT_W_STATS` の値解釈 (純粋関数)。`DENNO_EXPERT_LOOP` と同じ厳しさ
+/// (`1` / `on` / `ON` / `true` だけ on)。
+fn expert_w_stats_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim),
+        Some("1") | Some("on") | Some("ON") | Some("true")
+    )
+}
+
+/// 測定 harness 専用の上書き (env より優先)。品質 harness
+/// (`tests/expert_prune_quality.rs`) が 1 プロセスで設定を切り替えるためのもの。
+/// `EXPERT_FLAT_DECODE_OVERRIDE` と同じ流儀。
+static EXPERT_PRUNE_OVERRIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static EXPERT_PRUNE_TOPK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static EXPERT_PRUNE_MIN_W: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static EXPERT_PRUNE_W_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 測定 harness が切り替える設定の 1 つぶん。
+///
+/// - `topk`: `DENNO_EXPERT_TOPK` 相当 (`None` = off)
+/// - `min_w`: `DENNO_EXPERT_MIN_W` 相当 (`None` = off)
+/// - `w_stats`: `DENNO_EXPERT_W_STATS` 相当
+///
+/// env で k (n_expert_used) 超過の topk を渡しても剪定は起こらない
+/// (残る相手が無いので no-op)。値の妥当性は env の純粋関数と同じ規則で
+/// 適用側が解釈する。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExpertPruneMeasurement {
+    pub topk: Option<usize>,
+    pub min_w: Option<f32>,
+    pub w_stats: bool,
+}
+
+/// 測定専用: 剪定ゲートと W 統計の収集をまとめて上書きする。
+///
+/// `Some(cfg)` は **env を無視して** cfg を使う (両ゲートの on/off も cfg で決まる)。
+/// `None` で env に戻す。プロセス全体で 1 個なので、触るテストは
+/// `moe_test_guard()` を取ること。
+pub fn set_expert_prune_measurement(o: Option<ExpertPruneMeasurement>) {
+    use std::sync::atomic::Ordering;
+    match o {
+        Some(cfg) => {
+            EXPERT_PRUNE_TOPK.store(cfg.topk.unwrap_or(0) as u32, Ordering::Relaxed);
+            EXPERT_PRUNE_MIN_W.store(
+                cfg.min_w.map(f32::to_bits).unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            EXPERT_PRUNE_W_STATS.store(cfg.w_stats, Ordering::Relaxed);
+            EXPERT_PRUNE_OVERRIDE.store(true, Ordering::Relaxed);
+        }
+        None => {
+            EXPERT_PRUNE_OVERRIDE.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 現在の剪定ゲート (`topk`, `min_w`)。プロセスで 1 回だけ env を読む。
+///
+/// 上書きが効いているときは env を見ない。`k` は呼び出し側の `n_expert_used`
+/// で、env 値の範囲判定に使う (キャッシュは生の解釈ではなく k 込みの結果。
+/// 1 プロセス 1 モデルが前提の既存ゲートと同じ前提)。
+#[inline]
+fn expert_prune_cfg(k: usize) -> (Option<usize>, Option<f32>) {
+    use std::sync::atomic::Ordering;
+    if EXPERT_PRUNE_OVERRIDE.load(Ordering::Relaxed) {
+        let t = EXPERT_PRUNE_TOPK.load(Ordering::Relaxed);
+        let w = EXPERT_PRUNE_MIN_W.load(Ordering::Relaxed);
+        return (
+            (t != 0).then(|| t as usize),
+            // min_w は有限の正数だけ保存するので bits != 0 が「あり」を意味する。
+            (w != 0).then(|| f32::from_bits(w)),
+        );
+    }
+    static ENV: std::sync::OnceLock<(Option<usize>, Option<f32>)> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| {
+        (
+            expert_topk_from_value(
+                std::env::var("DENNO_EXPERT_TOPK").ok().as_deref(),
+                k,
+            ),
+            expert_min_w_from_value(std::env::var("DENNO_EXPERT_MIN_W").ok().as_deref()),
+        )
+    })
+}
+
+/// 重み統計の収集が on か。off では呼び出し側は分岐 1 回で終わる。
+#[inline]
+fn expert_w_stats_on() -> bool {
+    use std::sync::atomic::Ordering;
+    if EXPERT_PRUNE_OVERRIDE.load(Ordering::Relaxed) {
+        return EXPERT_PRUNE_W_STATS.load(Ordering::Relaxed);
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        expert_w_stats_from_value(std::env::var("DENNO_EXPERT_W_STATS").ok().as_deref())
+    })
+}
+
+/// 重みの rank 別平均を取る深さ (rank 1..=10)。
+const EXPERT_W_RANKS: usize = 10;
+
+/// 1 リクエストぶんの重み統計の蓄積。
+///
+/// `calls` = 層呼び出し数 (`moe_ffn_quant_impl` 1 回 = decode 1 トークンの 1 層)。
+/// `rank_sum[r]` / `rank_n[r]` は「その層呼び出しの再正規化後の重みを降順に並べた
+/// ときの rank r (1 始まり) の値」の和と、rank r を持つ層呼び出し数 (expert を
+/// r 個より多く残した呼び出しだけが rank r を持つ)。
+#[derive(Debug)]
+struct ExpertWAccum {
+    calls: u64,
+    experts_total: u64,
+    rank_sum: [f64; EXPERT_W_RANKS],
+    rank_n: [u64; EXPERT_W_RANKS],
+}
+
+impl Default for ExpertWAccum {
+    fn default() -> Self {
+        Self {
+            calls: 0,
+            experts_total: 0,
+            rank_sum: [0.0; EXPERT_W_RANKS],
+            rank_n: [0; EXPERT_W_RANKS],
+        }
+    }
+}
+
+impl ExpertWAccum {
+    fn record(&mut self, weights_desc: &[f32], n_run: usize) {
+        self.calls += 1;
+        self.experts_total += n_run as u64;
+        for (r, &w) in weights_desc.iter().take(EXPERT_W_RANKS).enumerate() {
+            self.rank_sum[r] += w as f64;
+            self.rank_n[r] += 1;
+        }
+    }
+}
+
+static EXPERT_W_ACCUM: std::sync::Mutex<ExpertWAccum> = std::sync::Mutex::new(ExpertWAccum {
+    calls: 0,
+    experts_total: 0,
+    rank_sum: [0.0; EXPERT_W_RANKS],
+    rank_n: [0; EXPERT_W_RANKS],
+});
+
+/// 1 層呼び出しぶん記録する。`weights_desc` は再正規化後の重みの降順
+/// (`moe_ffn_quant_impl` のゲート適用後の列)。
+fn expert_w_stats_record(weights_desc: &[f32], n_run: usize) {
+    if !expert_w_stats_on() {
+        return;
+    }
+    let mut a = EXPERT_W_ACCUM
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    a.record(weights_desc, n_run);
+}
+
+/// 蓄積済み統計の読み取り専用スナップショット (測定 harness 用)。
+#[derive(Clone, Debug)]
+pub struct ExpertWStatsSnapshot {
+    calls: u64,
+    experts_total: u64,
+    rank_sum: [f64; EXPERT_W_RANKS],
+    rank_n: [u64; EXPERT_W_RANKS],
+}
+
+impl ExpertWStatsSnapshot {
+    /// 層呼び出し数。
+    pub fn calls(&self) -> u64 {
+        self.calls
+    }
+
+    /// 層呼び出しあたりの平均実行 expert 数 (剪定後)。
+    pub fn mean_experts_per_call(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.experts_total as f64 / self.calls as f64
+        }
+    }
+
+    /// rank `rank1` (1 始まり) の平均再正規化重み。その rank を持つ呼び出しが
+    /// 無ければ `None`。
+    pub fn mean_rank_weight(&self, rank1: usize) -> Option<f64> {
+        if rank1 == 0 || rank1 > EXPERT_W_RANKS {
+            return None;
+        }
+        let r = rank1 - 1;
+        if self.rank_n[r] == 0 {
+            None
+        } else {
+            Some(self.rank_sum[r] / self.rank_n[r] as f64)
+        }
+    }
+
+    /// `[WSTATS]` 行の本体 (1 リクエスト 1 行)。rank の無い桁は `-`。
+    pub fn line(&self) -> String {
+        let mut s = format!(
+            "calls={} mean_experts={:.2}",
+            self.calls,
+            self.mean_experts_per_call()
+        );
+        for r in 0..EXPERT_W_RANKS {
+            if self.rank_n[r] == 0 {
+                s.push_str(&format!(" w{}=-", r + 1));
+            } else {
+                s.push_str(&format!(" w{}={:.4}", r + 1, self.rank_sum[r] / self.rank_n[r] as f64));
+            }
+        }
+        s
+    }
+}
+
+/// 蓄積を取り出す (取り出すと 0 に戻る)。何も溜まっていなければ `None`。
+pub fn take_expert_w_stats() -> Option<ExpertWStatsSnapshot> {
+    let mut a = EXPERT_W_ACCUM
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if a.calls == 0 {
+        return None;
+    }
+    let snap = ExpertWStatsSnapshot {
+        calls: a.calls,
+        experts_total: a.experts_total,
+        rank_sum: a.rank_sum,
+        rank_n: a.rank_n,
+    };
+    *a = ExpertWAccum::default();
+    Some(snap)
+}
+
+/// serve のリクエスト終端から呼ぶ: `DENNO_EXPERT_W_STATS=1` (または測定 harness
+/// の上書き) で統計が溜まっていれば 1 行出して蓄積を消す。off では分岐 1 回で
+/// 何もしない。蓄積が空 (decode を 1 歩も走っていない要求) のときも出さない。
+pub fn expert_w_stats_request_end() {
+    if !expert_w_stats_on() {
+        return;
+    }
+    if let Some(s) = take_expert_w_stats() {
+        eprintln!("[WSTATS] {}", s.line());
+    }
+}
+
 /// task 67: CPU expert GEMV の作業域 (`act` / `up` / `h`) をスレッドローカルで
 /// 使い回すか (`DENNO_EXPERT_SCRATCH`)。**既定 off**。
 ///
@@ -5616,10 +5902,37 @@ fn moe_ffn_quant_impl(
     softmax(&mut probs);
 
     // 2. top-k (index 昇順で返る)
-    let sel = select_topk(&probs, k);
+    let mut sel = select_topk(&probs, k);
+
+    // task 120: decode (m=1) の expert 剪定ゲート (**既定 off**)。
+    //
+    // - `DENNO_EXPERT_TOPK=n`: top-k のうち確率上位 n 個だけ残す (1 <= n <= k。
+    //   範囲外の値は無効 = off)。n == k は切る相手が無いので何もしない。
+    // - `DENNO_EXPERT_MIN_W=x`: 再正規化後の重みが x 未満の expert を落とす
+    //   (0 / 未設定 / 無効値は off)。**最低 1 個は必ず残す** (最も重い expert)。
+    //
+    // 適用順: TOPK で切る → 残りで再正規化 → その重みで MIN_W を判定して落とす
+    // → 残りでもう一度再正規化。落とす相手が 1 個も無いときは 2 回目の再正規化を
+    // **丸ごと飛ばす** (重みの和が 1.0 に丸まるとは限らないので、やり直すと親経路
+    // からビットが動く)。残す集合は常に index 昇順に並べ替えるので、蓄積の丸め
+    // 順序 (index 昇順の逐次) は従来と同じ。ゲートが 1 つも効いていないときは
+    // 下の if に入らないので、sel / weights / sum は親経路と 1 ビットも違わない。
+    let (topk_n, min_w_x) = expert_prune_cfg(k);
+    if let Some(n) = topk_n {
+        if n < sel.len() {
+            // 確率上位 n 個を残す。安定ソートなので同点は元の並び (index 昇順) の
+            // 先頭側が残る = select_topk と同じ「同点は小さい index」の規則。
+            let mut by_prob = sel.clone();
+            by_prob.sort_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+            by_prob.truncate(n);
+            by_prob.sort_unstable();
+            sel = by_prob;
+        }
+    }
 
     // 3. 再正規化 (選択 index 昇順に逐次加算した和で割る)
-    let mut weights = vec![0.0f32; k];
+    let k_run = sel.len();
+    let mut weights = vec![0.0f32; k_run];
     let mut sum = 0.0f32;
     for &i in &sel {
         sum += probs[i];
@@ -5627,10 +5940,58 @@ fn moe_ffn_quant_impl(
     for (t, &i) in sel.iter().enumerate() {
         weights[t] = probs[i] / sum;
     }
-    // P54: router の活性 = top-k 確率和。`sum` は再正規化の分母 (= 選択 expert の
-    // 確率の和) そのものなので、追加の走査は無い。スカラーなので RMS は値そのもの。
+    if let Some(x) = min_w_x {
+        // 重みが x 未満の expert を落とす (最低 1 個は残す)。kept は昇順走査の
+        // filter なので index 昇順のまま。
+        let kept: Vec<usize> = (0..k_run).filter(|&t| weights[t] >= x).collect();
+        if kept.len() < k_run {
+            let kept: Vec<usize> = if kept.is_empty() {
+                // 全員が x 未満: 最も重い 1 個だけ残す (同点は先に見た小さい index)。
+                let mut best = 0usize;
+                for t in 1..k_run {
+                    if weights[t] > weights[best] {
+                        best = t;
+                    }
+                }
+                vec![best]
+            } else {
+                kept
+            };
+            let mut sum2 = 0.0f32;
+            for &t in &kept {
+                sum2 += weights[t];
+            }
+            let renorm: Vec<f32> = kept.iter().map(|&t| weights[t] / sum2).collect();
+            sel = kept;
+            weights = renorm;
+        }
+    }
+    // P54: router の活性 = **実際に足し込む expert** の確率和。剪定が無いときは
+    // 従来どおり再正規化の分母そのもの (同じ集合を同じ順序で足した和 = 同じビット
+    // 列)。剪定で集合が変わったときだけ残った expert で足し直す (役割テレメと
+    // RouterTopK は実際に使った expert を示す)。
+    let router_sum = if sel.len() == k {
+        sum
+    } else {
+        let mut s = 0.0f32;
+        for &i in &sel {
+            s += probs[i];
+        }
+        s
+    };
+    // P54: router の活性は「実際に足し込む expert の確率和」。剪定が無いときは
+    // 再正規化の分母 `sum` そのもの (追加の走査は無い)。スカラーなので RMS は値そのもの。
     if let Some(r) = roles.as_deref_mut() {
-        r.router = sum;
+        r.router = router_sum;
+    }
+    // task 120: `DENNO_EXPERT_W_STATS=1` (または測定 harness の上書き) のときだけ、
+    // この層呼び出しの再正規化後の重み (降順) と実行 expert 数を積む。off では
+    // この分岐で終わる (蓄積も確保も無い)。リクエスト終端で 1 行にまとめて出す
+    // ([`expert_w_stats_request_end`])。
+    if expert_w_stats_on() {
+        let mut desc = weights.clone();
+        desc.sort_by(|a, b| b.total_cmp(a));
+        expert_w_stats_record(&desc, sel.len());
     }
 
     // P56: ルータ結果 (index 昇順の expert と再正規化後の重み) を 1 フレームで送る。
@@ -9410,6 +9771,365 @@ mod tests {
         assert!(got.iter().all(|v| v.is_finite()), "非有限値が出た");
     }
 
+    // ===========================================================================
+    // task 120: decode (m=1) の expert 剪定ゲート (DENNO_EXPERT_TOPK / MIN_W) と
+    // 重み統計 (DENNO_EXPERT_W_STATS)。既定は全部 off で、off のときの経路と値は
+    // 親経路と 1 ビットも違わない。
+    // ===========================================================================
+
+    /// `DENNO_EXPERT_TOPK` の真理値表。
+    #[test]
+    fn expert_topk_gate_truth_table() {
+        let k10 = expert_topk_from_value(None, 10);
+        assert_eq!(k10, None, "未設定は off");
+        assert_eq!(expert_topk_from_value(Some(""), 10), None, "空は off");
+        assert_eq!(expert_topk_from_value(Some("   "), 10), None, "空白のみは off");
+        assert_eq!(expert_topk_from_value(Some("abc"), 10), None, "非数は off");
+        assert_eq!(expert_topk_from_value(Some("0"), 10), None, "0 は off");
+        assert_eq!(expert_topk_from_value(Some("-1"), 10), None, "負は off");
+        assert_eq!(expert_topk_from_value(Some("1.5"), 10), None, "小数は off");
+        assert_eq!(
+            expert_topk_from_value(Some("11"), 10),
+            None,
+            "k 超過は無効 = off"
+        );
+        assert_eq!(expert_topk_from_value(Some("1"), 10), Some(1));
+        assert_eq!(expert_topk_from_value(Some(" 9 "), 10), Some(9), "前後の空白は許す");
+        assert_eq!(
+            expert_topk_from_value(Some("10"), 10),
+            Some(10),
+            "n == k は有効 (切る相手が無い = 値は親経路と同じ)"
+        );
+        // k が小さいモデルでは範囲判定も働く。
+        assert_eq!(expert_topk_from_value(Some("3"), 2), None);
+        assert_eq!(expert_topk_from_value(Some("2"), 2), Some(2));
+        assert_eq!(expert_topk_from_value(Some("1"), 2), Some(1));
+    }
+
+    /// `DENNO_EXPERT_MIN_W` の真理値表。
+    #[test]
+    fn expert_min_w_gate_truth_table() {
+        assert_eq!(expert_min_w_from_value(None), None, "未設定は off");
+        assert_eq!(expert_min_w_from_value(Some("")), None, "空は off");
+        assert_eq!(expert_min_w_from_value(Some("  ")), None, "空白のみは off");
+        assert_eq!(expert_min_w_from_value(Some("0")), None, "0 は off");
+        assert_eq!(expert_min_w_from_value(Some("0.0")), None, "0.0 は off");
+        assert_eq!(expert_min_w_from_value(Some("-0.1")), None, "負は off");
+        assert_eq!(expert_min_w_from_value(Some("NaN")), None, "NaN は off");
+        assert_eq!(expert_min_w_from_value(Some("inf")), None, "inf は off");
+        assert_eq!(expert_min_w_from_value(Some("abc")), None, "非数は off");
+        assert_eq!(expert_min_w_from_value(Some("0.05")), Some(0.05));
+        assert_eq!(expert_min_w_from_value(Some(" 0.1 ")), Some(0.1), "前後の空白は許す");
+        assert_eq!(
+            expert_min_w_from_value(Some("1")),
+            Some(1.0),
+            "1.0 は「最高重みの 1 個を常に残す」の意味で有効"
+        );
+    }
+
+    /// `DENNO_EXPERT_W_STATS` の真理値表。
+    #[test]
+    fn expert_w_stats_gate_truth_table() {
+        assert!(!expert_w_stats_from_value(None), "未設定は off");
+        assert!(!expert_w_stats_from_value(Some("")), "空は off");
+        assert!(!expert_w_stats_from_value(Some("0")), "0 は off");
+        assert!(!expert_w_stats_from_value(Some("2")), "2 は off (曖昧値は拒む)");
+        assert!(!expert_w_stats_from_value(Some("yes")), "yes は off");
+        assert!(expert_w_stats_from_value(Some("1")));
+        assert!(expert_w_stats_from_value(Some("on")));
+        assert!(expert_w_stats_from_value(Some("ON")));
+        assert!(expert_w_stats_from_value(Some("true")));
+    }
+
+    /// `DENNO_EXPERT_TOPK=1` で expert が本当に 1 本だけ走ること (本数の裏取り) と、
+    /// 出力が「`n_expert_used=1` のモデル」の親経路とビット一致すること。
+    ///
+    /// top-k の確率上位 n 個 = `select_topk(probs, n)` と同じ集合なので、
+    /// ゲートで切った結果は最初から k=n のモデルと同じ選択・同じ再正規化になる
+    /// (丸め順序も同じ: index 昇順の逐次)。さらに上書きが有効でも両ゲートが
+    /// off なら親経路とビット一致する (ゲート機構そのものが値を触らない証拠)。
+    #[test]
+    fn expert_topk_gate_runs_fewer_experts_and_matches_topn_params() {
+        let _g = moe_test_guard();
+        set_expert_prune_measurement(None);
+        let dir = TempDir::new("p120_topk");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        // 親経路 (ゲート off): expert 2 本ぶん (gate/up/down = 6 GEMV)。
+        let off = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("off");
+        let before = moe_expert::any_calls();
+        let _ = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("off2");
+        assert_eq!(
+            moe_expert::any_calls() - before,
+            3 * p.n_expert_used,
+            "ゲート off で expert 本数が変わった"
+        );
+
+        // 上書きが有効だが両ゲート off → 親経路とビット一致。
+        set_expert_prune_measurement(Some(ExpertPruneMeasurement {
+            topk: None,
+            min_w: None,
+            w_stats: false,
+        }));
+        let noop = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("no-op");
+        set_expert_prune_measurement(None);
+        assert_bitwise_eq(&off, &noop, "task120: 上書き有効・両ゲート off");
+
+        // TOPK=1: expert 1 本ぶん (3 GEMV) だけ走り、k=1 のモデルとビット一致。
+        let mut p1 = cache_test_params();
+        p1.n_expert_used = 1;
+        let ref1 = moe_ffn_quant_with(&p1, &lw, &x, None, false, Route::Cpu).expect("k=1");
+        set_expert_prune_measurement(Some(ExpertPruneMeasurement {
+            topk: Some(1),
+            min_w: None,
+            w_stats: false,
+        }));
+        let before = moe_expert::any_calls();
+        let got = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("TOPK=1");
+        let calls = moe_expert::any_calls() - before;
+        set_expert_prune_measurement(None);
+        assert_eq!(
+            calls,
+            3,
+            "TOPK=1 なのに expert 1 本ぶん (3 GEMV) を走っていない ({calls})"
+        );
+        assert_bitwise_eq(&got, &ref1, "task120: TOPK=1 vs n_expert_used=1 の親経路");
+    }
+
+    /// 合成ルータ: expert 0 と 1 を同値 (全行 1.0)、2 と 3 を 0.0 にする。
+    /// `x` を全正にすると top-2 は必ず `[0, 1]` で、再正規化重みはちょうど
+    /// `(0.5, 0.5)` になる (MIN_W の閾値の両側を確定して作れる)。
+    fn p120_router_layer(f: &GgufFile, p: &Qwen4ExpParams, eq_rows: bool) -> LayerW {
+        let mut lw = cache_test_layer(f, p);
+        let mut v = Vec::with_capacity(p.n_embd * p.n_expert * 4);
+        for e in 0..p.n_expert {
+            let val: f32 = if !eq_rows {
+                // 独占ルータ: expert 0 だけ巨大、残りは 0。
+                if e == 0 {
+                    10.0
+                } else {
+                    0.0
+                }
+            } else if e < 2 {
+                1.0
+            } else {
+                0.0
+            };
+            for _ in 0..p.n_embd {
+                v.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+        lw.gate_inp = GgufLinear::new(
+            GgmlType::F32,
+            p.n_embd,
+            p.n_expert,
+            WeightBlocks::from_vec(v),
+        )
+        .expect("gate_inp (F32)");
+        lw
+    }
+
+    fn p120_flat_x(n: usize) -> Vec<f32> {
+        vec![0.05; n]
+    }
+
+    /// `DENNO_EXPERT_MIN_W` の発火: 閾値の両側で expert 本数が変わり、
+    /// 「落とす相手が無い」設定では親経路とビット一致、「1 本に絞る」設定では
+    /// `n_expert_used=1` の親経路とビット一致する。
+    #[test]
+    fn expert_min_w_gate_drops_low_weight_experts() {
+        let _g = moe_test_guard();
+        set_expert_prune_measurement(None);
+        let dir = TempDir::new("p120_minw");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = p120_router_layer(&f, &p, true);
+        let x = p120_flat_x(p.n_embd);
+
+        // 親経路: 重み (0.5, 0.5)、expert 2 本 (6 GEMV)。
+        let off = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("off");
+
+        // MIN_W=0.5: 重みは x 未満ではない (>= 0.5 を残す) → 1 本も落ちない。
+        // 2 回目の再正規化は丸ごと飛ぶので親経路とビット一致。
+        set_expert_prune_measurement(Some(ExpertPruneMeasurement {
+            topk: None,
+            min_w: Some(0.5),
+            w_stats: false,
+        }));
+        let before = moe_expert::any_calls();
+        let keep_all = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("MIN_W=0.5");
+        assert_eq!(
+            moe_expert::any_calls() - before,
+            3 * p.n_expert_used,
+            "MIN_W=0.5 で重み 0.5 の expert が落ちた (境界は「残す」側)"
+        );
+        assert_bitwise_eq(&off, &keep_all, "task120: MIN_W=0.5 (落ちる expert 無し)");
+
+        // MIN_W=0.51: 重み 0.5 は x 未満 → expert 1 が落ちて 1 本だけ残る。
+        // k=1 の親経路 (重みちょうど 1.0) とビット一致する。
+        let mut p1 = cache_test_params();
+        p1.n_expert_used = 1;
+        let ref1 = moe_ffn_quant_with(&p1, &lw, &x, None, false, Route::Cpu).expect("k=1");
+        set_expert_prune_measurement(Some(ExpertPruneMeasurement {
+            topk: None,
+            min_w: Some(0.51),
+            w_stats: false,
+        }));
+        let before = moe_expert::any_calls();
+        let got = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("MIN_W=0.51");
+        let calls = moe_expert::any_calls() - before;
+        set_expert_prune_measurement(None);
+        assert_eq!(
+            calls,
+            3,
+            "MIN_W=0.51 で expert 1 本ぶん (3 GEMV) を走っていない ({calls})"
+        );
+        assert_bitwise_eq(&got, &ref1, "task120: MIN_W=0.51 vs n_expert_used=1 の親経路");
+    }
+
+    /// 役割テレメ (P54 の router 活性) は剪定後の expert 集合を示す。
+    ///
+    /// 独占ルータ (expert 0 がほぼ 1.0) で TOPK=1 を掛けると、router の活性は
+    /// 「残った expert 1 本の確率」と一致する (ゲート off なら top-k 全員の和)。
+    #[test]
+    fn expert_router_rms_shows_kept_experts() {
+        let _g = moe_test_guard();
+        set_expert_prune_measurement(None);
+        let dir = TempDir::new("p120_router");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = p120_router_layer(&f, &p, false);
+        let x = p120_flat_x(p.n_embd);
+
+        // 期待値を手で計算 (moe_ffn_quant_impl と同じ手順: gemv → softmax → top-k)。
+        let mut probs = vec![0.0f32; p.n_expert];
+        lw.gate_inp
+            .gemv_label("gate_inp", &x, &mut probs)
+            .expect("gate_inp");
+        softmax(&mut probs);
+        let sel_full = select_topk(&probs, p.n_expert_used);
+        let mut sum_full = 0.0f32;
+        for &i in &sel_full {
+            sum_full += probs[i];
+        }
+        let sel1 = select_topk(&probs, 1);
+        assert_eq!(sel1, vec![0], "独占ルータの top-1 は expert 0");
+
+        // ゲート off: 活性 = top-k 全員の確率和。
+        let mut roles_off = RoleRms::default();
+        moe_ffn_quant_full(
+            &p, &lw, &x, None, false, Route::Cpu, Some(&mut roles_off), false,
+        )
+        .expect("off");
+        assert_eq!(roles_off.router.to_bits(), sum_full.to_bits(), "off: 活性 = top-k 確率和");
+
+        // TOPK=1: 活性 = 残った expert 0 の確率だけ。
+        set_expert_prune_measurement(Some(ExpertPruneMeasurement {
+            topk: Some(1),
+            min_w: None,
+            w_stats: false,
+        }));
+        let mut roles_on = RoleRms::default();
+        moe_ffn_quant_full(
+            &p, &lw, &x, None, false, Route::Cpu, Some(&mut roles_on), false,
+        )
+        .expect("TOPK=1");
+        set_expert_prune_measurement(None);
+        assert_eq!(
+            roles_on.router.to_bits(),
+            probs[0].to_bits(),
+            "TOPK=1: 活性 = 残った expert の確率和"
+        );
+        assert!(
+            roles_on.router > roles_off.router * 0.99,
+            "独占ルータなら top-1 の和は top-2 の和とほぼ同じはず"
+        );
+    }
+
+    /// W_STATS の蓄積と 1 行形式。off では何も溜まらず、on では層呼び出しごとに
+    /// rank 別の重みと実行 expert 数が積まれる。
+    #[test]
+    fn expert_w_stats_accum_line_and_off_cost() {
+        let _g = moe_test_guard();
+
+        // off (上書き無し・env 未設定): 記録しても溜まらない。
+        set_expert_prune_measurement(None);
+        assert!(take_expert_w_stats().is_none(), "off なのに統計がある");
+
+        set_expert_prune_measurement(Some(ExpertPruneMeasurement {
+            topk: None,
+            min_w: None,
+            w_stats: false,
+        }));
+        expert_w_stats_record(&[0.5, 0.5], 2);
+        assert!(
+            take_expert_w_stats().is_none(),
+            "w_stats=false なのに記録されている"
+        );
+
+        // on: 2 呼び出しぶん積む。rank は呼び出しが持つ expert 数まで。
+        // 値は 2 の冪 (f32 で正確) にして f64 の期待値を確定させる。
+        set_expert_prune_measurement(Some(ExpertPruneMeasurement {
+            topk: None,
+            min_w: None,
+            w_stats: true,
+        }));
+        expert_w_stats_record(&[0.5, 0.25, 0.125], 3);
+        expert_w_stats_record(&[0.625, 0.375], 2);
+        let s = take_expert_w_stats().expect("on なのに統計が無い");
+        assert_eq!(s.calls(), 2);
+        assert_eq!(s.mean_experts_per_call(), 2.5);
+        assert_eq!(s.mean_rank_weight(1), Some(0.5625), "(0.5 + 0.625) / 2");
+        assert_eq!(s.mean_rank_weight(2), Some(0.3125), "(0.25 + 0.375) / 2");
+        assert_eq!(s.mean_rank_weight(3), Some(0.125), "rank 3 は 1 呼び出しだけ");
+        assert_eq!(s.mean_rank_weight(4), None, "rank 4 を持つ呼び出しは無い");
+        assert_eq!(s.mean_rank_weight(0), None, "rank は 1 始まり");
+        assert_eq!(s.mean_rank_weight(11), None, "rank は 10 まで");
+        let line = s.line();
+        assert!(line.starts_with("calls=2 "), "{line}");
+        assert!(line.contains("mean_experts=2.50"), "{line}");
+        assert!(line.contains("w1=0.5625"), "{line}");
+        assert!(line.contains("w3=0.1250"), "{line}");
+        assert!(line.contains("w4=-"), "{line}");
+        assert!(line.contains("w10=-"), "{line}");
+        assert!(
+            take_expert_w_stats().is_none(),
+            "取り出したら蓄積が空に戻る"
+        );
+
+        // 経路発火: moe 1 回で calls=1 / experts=top-k。ゲートで切ればその本数。
+        let dir = TempDir::new("p120_wstats");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+        let _ = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("moe");
+        let s = take_expert_w_stats().expect("moe 1 回ぶんの統計");
+        assert_eq!(s.calls(), 1);
+        assert_eq!(s.mean_experts_per_call(), 2.0, "ゲート off の実行 expert 数");
+        set_expert_prune_measurement(Some(ExpertPruneMeasurement {
+            topk: Some(1),
+            min_w: None,
+            w_stats: true,
+        }));
+        let _ = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("moe TOPK=1");
+        let s = take_expert_w_stats().expect("TOPK=1 の統計");
+        set_expert_prune_measurement(None);
+        assert_eq!(s.mean_experts_per_call(), 1.0, "TOPK=1 で 1 本に減る");
+        assert_eq!(
+            s.mean_rank_weight(2),
+            None,
+            "1 本に切られた呼び出しに rank 2 は無い"
+        );
+    }
+
     /// P58: ExpertResidency は「前回の送出から変わった層だけ」送る。
     ///
     /// - 集合が同じ層は出さない (変化が無い層は沈黙する)
@@ -11992,7 +12712,12 @@ mod tests {
             // プロセス共通の ROW_PAR_REGIONS を before/after 差分で数えるテスト
             // (expert_loop_one_region_per_layer 等、moe_test_guard を取る) と
             // 同じロックで直列化する。
+            use crate::model::moe_expert::set_bf16_exact_for_test;
             let _g = moe_test_guard();
+            // task 119: 既定が FMA (逐次参照と非ビット一致) になったので、このテストは
+            // exact を強制して従来カーネル (GPU カーネル dno_matvec_f32 と同じ逐次列)
+            // との一致を見る (期待値は変えない)。
+            set_bf16_exact_for_test(Some(true));
             let cases: [(&str, usize, usize, u32, usize); 4] = [
                 ("hc_down 実形", 10240, 320, 3, HC_DOWN_ROW_PAR_MIN),
                 ("hc_up 実形", 320, 10240, 5, 0),
@@ -12012,6 +12737,7 @@ mod tests {
                     .expect("BF16 GEMV (2row 実経路)");
                 assert_bitwise_eq(&out, &want, &format!("{label} (k={k}, n={n})"));
             }
+            set_bf16_exact_for_test(None);
         }
 
         /// P84: 2 行同時カーネル ([`hc_mix_quant_fast`] の既定経路) が classic
@@ -12658,7 +13384,9 @@ mod tests {
         /// 適用できない (REPORT の判定を参照)。
         #[test]
         fn hc_mix_bf16_inject_takes_fused_kernel_bitexact() {
-            use crate::model::moe_expert::{set_bf16_fast_for_test, BF16_FUSED_CALLS};
+            use crate::model::moe_expert::{
+                set_bf16_exact_for_test, set_bf16_fast_for_test, BF16_FUSED_CALLS,
+            };
             let hc = 4usize;
             let e = 2560usize;
             let lr = 320usize;
@@ -12682,6 +13410,9 @@ mod tests {
                 n_embd: e,
             };
             let fused = || BF16_FUSED_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            // task 119: 既定が FMA (classic と非ビット一致) になったので、融合 vs
+            // classic のビット一致の契約は exact を強制して見る (期待値は変えない)。
+            set_bf16_exact_for_test(Some(true));
 
             // 融合 on (既定): inject の GEMV 1 発だけ融合カウンタが増える。
             set_bf16_fast_for_test(Some(true));
@@ -12705,6 +13436,86 @@ mod tests {
                 i_fast.iter().any(|v| *v != 0.0),
                 "inject が全 0 (経路の生死が分からない)"
             );
+            set_bf16_exact_for_test(None);
+        }
+
+        /// task 119: 既定 (FMA) の decode mix 経路が BF16 融合カーネルの FMA 版を
+        /// 通ること、と exact (DENNO_BF16_EXACT=1 相当) で通らなくなること。
+        ///
+        /// 実形の BF16 down/up/inject で `hc_mix_quant` を 1 回回し、`BF16_FMA_CALLS`
+        /// の差分で見る (緑 = 通った、ではないので counter を見る。down + up +
+        /// inject の融合入口 3 呼び出し以上)。exact を強すると FMA カウンタは増えず、
+        /// 融合入口のカウンタ (`BF16_FUSED_CALLS`) は増える = 逐次加算カーネルのまま。
+        /// mixed / inject の値差は「絶対 1e-4 + 相対 1e-5」以内 (FMA は classic と
+        /// ビット一致しない。moe_expert.rs の `bf16_tests` と同じ契約)。
+        #[test]
+        fn hc_mix_bf16_fma_fires_and_exact_gate_restores_sequential() {
+            use crate::model::moe_expert::{
+                set_bf16_exact_for_test, BF16_FMA_CALLS, BF16_FUSED_CALLS,
+            };
+            use std::sync::atomic::Ordering::Relaxed;
+            let hc = 4usize;
+            let e = 2560usize;
+            let lr = 320usize;
+            let hp = HyperParams { hc, n_embd: e, low_rank: lr, eps: 1e-6 };
+            let hc_dim = hc * e;
+            let norm: Vec<f32> = (0..hc_dim).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect();
+            let down =
+                GgufLinear::from_slice(GgmlType::Bf16, hc_dim, lr, &bf16_weights(hc_dim, lr, 3))
+                    .expect("GgufLinear::from_slice (BF16 down)");
+            let up =
+                GgufLinear::from_slice(GgmlType::Bf16, lr, hc_dim, &bf16_weights(lr, hc_dim, 5))
+                    .expect("GgufLinear::from_slice (BF16 up)");
+            let inject =
+                GgufLinear::from_slice(GgmlType::Bf16, hc_dim, hc, &bf16_weights(hc_dim, hc, 7))
+                    .expect("GgufLinear::from_slice (BF16 inject)");
+            let res = HyperStreams {
+                data: (0..hc_dim)
+                    .map(|i| (((i * 11) % 17) as f32 - 8.0) * 0.05)
+                    .collect(),
+                hc,
+                n_embd: e,
+            };
+
+            // FMA (既定相当を明示)。
+            set_bf16_exact_for_test(Some(false));
+            let fma0 = BF16_FMA_CALLS.load(Relaxed);
+            let (m_fma, i_fma) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            let fma_calls = BF16_FMA_CALLS.load(Relaxed) - fma0;
+            assert!(
+                fma_calls >= 3,
+                "FMA カーネルが mix 経路で発火していない (BF16_FMA_CALLS 増分 {fma_calls})"
+            );
+
+            // exact (DENNO_BF16_EXACT=1 相当): FMA カウンタは増えない。
+            set_bf16_exact_for_test(Some(true));
+            let fma1 = BF16_FMA_CALLS.load(Relaxed);
+            let fused0 = BF16_FUSED_CALLS.load(Relaxed);
+            let (m_ex, i_ex) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("exact");
+            assert_eq!(
+                BF16_FMA_CALLS.load(Relaxed),
+                fma1,
+                "exact で FMA カーネルが発火した"
+            );
+            assert!(
+                BF16_FUSED_CALLS.load(Relaxed) > fused0,
+                "exact で融合入口を通っていない"
+            );
+            set_bf16_exact_for_test(None);
+
+            // 許容差 (mixed / inject の両方)。絶対 1e-4 + 相対 1e-5。
+            for (tag, a, b) in [("mixed", &m_fma, &m_ex), ("inject", &i_fma, &i_ex)] {
+                for (r, (fa, ex)) in a.iter().zip(b.iter()).enumerate() {
+                    let tol = 1e-4 + 1e-5 * ex.abs();
+                    assert!(
+                        (fa - ex).abs() <= tol,
+                        "{tag} 行 {r}: FMA {fa} と exact {ex} の差が許容 {tol} を超える"
+                    );
+                }
+                assert!(a.iter().any(|v| *v != 0.0), "{tag} が全 0");
+            }
         }
 
         /// task 91: BF16 実形の GEMV が、入口 (`gemv` / `gemv_label_par_2row` (two_row)
@@ -12716,6 +13527,10 @@ mod tests {
         /// 明示版は down と同じ門番 64 を使う (up は two_row で既定門番 512 を通る)。
         #[test]
         fn hc_bf16_gemv_real_shape_bitexact_across_paths() {
+            use crate::model::moe_expert::set_bf16_exact_for_test;
+            // task 119: 既定が FMA (逐次参照 bf16_gemv_seq と非ビット一致) になったので、
+            // このテストは exact を強制して従来カーネルで見る (期待値は変えない)。
+            set_bf16_exact_for_test(Some(true));
             for (name, k, n, min) in [
                 ("down 実形", 10240usize, 320usize, HC_DOWN_ROW_PAR_MIN),
                 ("up 実形", 320usize, 10240usize, 0usize),
@@ -12762,6 +13577,7 @@ mod tests {
                 assert_bitwise_eq(&run(1), &want, &format!("BF16 {name}: 1 スレッド"));
                 assert_bitwise_eq(&run(8), &want, &format!("BF16 {name}: 8 スレッド"));
             }
+            set_bf16_exact_for_test(None);
         }
 
         /// P86: 実機で起きていたこと (GPU GEMV が hc mix の down / up を奪い、
@@ -13168,8 +13984,13 @@ mod tests {
         /// トークン 7 本・行 2 行・列 2 列があまる) の両方で確かめる。
         #[test]
         fn gemv_batch_f32_blocked_matches_gemv() {
+            use crate::model::moe_expert::set_f32_exact_for_test;
             gpu_gemm_off();
             let _g = moe_test_guard();
+            // task 119: 参照の `gemv` (decode) は既定で FMA カーネルに変わるので、
+            // トークンブロック経路 (prefill、スカラー) とのビット一致の契約は
+            // exact を強制して見る (期待値は変えない)。
+            set_f32_exact_for_test(Some(true));
             for (k, n, nt) in [(2560usize, 512usize, 512usize), (2570, 6, 71)] {
                 let mut bytes = vec![0u8; n * k * 4];
                 for i in 0..n * k {
@@ -14390,6 +15211,11 @@ mod tests {
             let _g = moe_test_guard();
             let _l = lg::par_test_lock();
             moe_expert::set_vnni_for_test(Some(false));
+            // task 119b: 既定の F32 経路は FMA カーネル (classic と非ビット一致) に
+            // なったので、off/on のビット一致の契約は exact を強制して見る (期待値は
+            // 変えない。FMA 経路の契約は linear_gguf の
+            // f32_router_fma_matches_classic_within_tolerance が見る)。
+            moe_expert::set_f32_exact_for_test(Some(true));
             let dir = TempDir::new("cpu_gemv_par_e2e");
             let path = build(&dir);
             let f = GgufFile::open(&path).expect("open");
@@ -14411,6 +15237,7 @@ mod tests {
             lg::set_cpu_gemv_par_for_test(None);
             lg::set_par_min_rows_for_test(None);
             moe_expert::set_vnni_for_test(None);
+            moe_expert::set_f32_exact_for_test(None);
 
             assert_eq!(launches_off, 0, "off で行並列が立った");
             assert!(
