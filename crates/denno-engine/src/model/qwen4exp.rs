@@ -3256,6 +3256,106 @@ pub(crate) fn set_mix_gpu_for_test(v: Option<bool>) {
     );
 }
 
+/// task 126: 短い prefill の hc mix を **1 トークン経路** (decode と同じ
+/// [`hc_mix_quant`]) で回すしきい値 (トークン数)。既定 [`PREFILL_MIX_SEQ_MAX`]。
+///
+/// prefill のバッチ経路 ([`hc_mix_quant_batch`] → [`gemv_batch`]) は、行数が
+/// [`GEMV_BATCH_MIN_ROWS`] 未満の `hc_down` (320 行) を
+/// [`gemv_rows_pertoken`] に落とす。そこは 1 行 1 トークンごとに
+/// `vec![0.0f32; k]` を確保して行全体を f32 へ開き直すので、28 トークンでは
+/// 同じ重みを 28 回デコードし、確保も 8960 回/層になる。`hc_up` (10240 行) も
+/// ブロック 1 回デコードのまま行並列に乗らない (実測 `regions=0`)。
+/// 1 層あたりの実測 (このコンテナ 16 スレッド、BF16 実形
+/// hc_dim=10240 / low_rank=320、`bench_mix_batch_real_shape`):
+///
+/// | nt | batch | 1 トークン経路 | 比 |
+/// |---|---|---|---|
+/// | 28 | 11.6 ms | 3.2 ms | batch が 3.6 倍遅い |
+/// | 64 | 9.7 ms | 7.1 ms | batch が 1.4 倍遅い |
+/// | 128 | 11.9 ms | 24.4 ms | batch が 2.0 倍速い |
+///
+/// 交点は 64〜128 の間。このコンテナ (16 スレッド) の実測なので、既定は
+/// 余裕を見て 64。
+///
+/// 実機 (GPU ラボ t126b, swift15-abl, 128 tok decode / 28・33 tok prefill,
+/// int-auto の production env): prefill 2.20-2.24 s (28 tok) →
+/// 1.40-1.46 s、2.69-2.71 s (33 tok) → 1.63-1.65 s (-35%)。
+/// per-layer mix は 0.864 → 0.278 ms/トークン。decode 84 → 84 ms/tok (+0.6%)、
+/// 出力 md5 は base と同一 (`DENNO_MIX_GPU=1` でも値は変わらなかった)。
+const PREFILL_MIX_SEQ_MAX: usize = 64;
+
+/// `DENNO_PREFILL_MIX_SEQ` の解釈。**既定 on** (t126b の実測で採択)、
+/// `0` / `off` / `false` で従来のバッチ経路に戻る (`shared_overlap_from_value`
+/// と同じ規約)。CPU ではバッチ経路とビット一致する。
+fn prefill_mix_seq_from_value(v: Option<&str>) -> bool {
+    !matches!(v, Some("0") | Some("off") | Some("false"))
+}
+
+
+/// `DENNO_PREFILL_MIX_SEQ_MAX` の解釈。未設定・数値でないときは
+/// [`PREFILL_MIX_SEQ_MAX`]。`0` は「常にバッチ経路」(ゲート off と同じ)。
+fn prefill_mix_seq_max_from_value(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(PREFILL_MIX_SEQ_MAX)
+}
+
+/// task 126: テスト用上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+static PREFILL_MIX_SEQ_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+/// task 126: テスト用のしきい値上書き (0 = env を見る)。
+static PREFILL_MIX_SEQ_MAX_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// task 126: テスト専用: ゲートの on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_prefill_mix_seq_for_test(v: Option<bool>) {
+    PREFILL_MIX_SEQ_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// task 126: テスト専用: しきい値を強制する (`0` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_prefill_mix_seq_max_for_test(v: usize) {
+    PREFILL_MIX_SEQ_MAX_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 126: 短い prefill の mix を 1 トークン経路で回してよいか
+/// (`DENNO_PREFILL_MIX_SEQ`、既定 off)。
+fn prefill_mix_seq_enabled() -> bool {
+    match PREFILL_MIX_SEQ_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        prefill_mix_seq_from_value(std::env::var("DENNO_PREFILL_MIX_SEQ").ok().as_deref())
+    })
+}
+
+/// task 126: 1 トークン経路に切り替えるトークン数の上限。
+fn prefill_mix_seq_max() -> usize {
+    let f = PREFILL_MIX_SEQ_MAX_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if f != 0 {
+        return f;
+    }
+    static M: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        prefill_mix_seq_max_from_value(std::env::var("DENNO_PREFILL_MIX_SEQ_MAX").ok().as_deref())
+    })
+}
+
+/// task 126: `nt` トークンのバッチ mix を 1 トークン経路へ振るか (純粋関数)。
+fn prefill_mix_seq_for(nt: usize) -> bool {
+    nt > 1 && nt <= prefill_mix_seq_max() && prefill_mix_seq_enabled()
+}
+
 /// head (`output`) の GEMV を**行 (語彙方向) で並列化する**門番 (行数)。
 ///
 /// `GgufLinear::gemv_label` の汎用の門番は 512 行 (`PAR_MIN_ROWS`) なので、実形
@@ -3627,18 +3727,46 @@ fn hc_mix_quant_batch(
         let (mixed, inj) = hc_mix_quant_fast(&ress[0], norm, down, up, inject, hp)?;
         return Ok((vec![mixed], inj));
     }
+    // task 126: 短い prefill は 1 トークン経路のほうが速い (しきい値の根拠は
+    // [`PREFILL_MIX_SEQ_MAX`]。既定 off)。値は CPU では batch 経路とビット一致
+    // (テスト `prefill_mix_seq_matches_batch`)、`DENNO_MIX_GPU=1` のときは
+    // decode と同じ GPU 経路になるので丸めだけが変わる (許容 1e-4 + 1e-5)。
+    if prefill_mix_seq_for(nt) {
+        let mut mixed = Vec::with_capacity(nt);
+        let mut injs = Vec::with_capacity(nt * hp.hc);
+        for r in ress.iter() {
+            let (m, i) = hc_mix_quant(r, norm, down, up, inject, hp)?;
+            mixed.push(m);
+            injs.extend_from_slice(&i);
+        }
+        return Ok((mixed, injs));
+    }
+    // task 126: batch 経路も `[mix-kprof]` に内訳を積む (`DENNO_MIX_KPROF=1` のときだけ
+    // `Instant` を取る。off は `stamp()` が `None` を返すだけ)。prefill の mix は
+    // ここを通るので、区間計測が無いと「down が重いのか up が重いのか」が読めなかった。
+    let t_all = mix_kprof::stamp();
     let xn_flat = MixScratch::take(&mut scratch.xn, nt * hc_dim);
+    let t = mix_kprof::stamp();
     hyper::grouped_rms_norm_batch_into(ress, norm, xn_flat, hp);
+    mix_kprof::mark(t, mix_kprof::GN);
 
     let lo = MixScratch::take(&mut scratch.lo, nt * dn);
+    let t = mix_kprof::stamp();
     gemv_batch(down, xn_flat, nt, lo)
         .map_err(|err| one(format!("hc_mix down (batch): {err}")))?;
+    mix_kprof::mark(t, mix_kprof::DOWN);
+    let t = mix_kprof::stamp();
     hyper::hc_lo_apply_batch(lo, nt, hp);
+    mix_kprof::mark(t, mix_kprof::LO);
 
     let gate = MixScratch::take(&mut scratch.gate, nt * un);
+    let t = mix_kprof::stamp();
     gemv_batch(up, lo, nt, gate).map_err(|err| one(format!("hc_mix up (batch): {err}")))?;
+    mix_kprof::mark(t, mix_kprof::UP);
     let mixed_flat = MixScratch::take(&mut scratch.mixed, nt * e);
+    let t = mix_kprof::stamp();
     hyper::hc_mixed_batch_into(xn_flat, gate, nt, mixed_flat, hp);
+    mix_kprof::mark(t, mix_kprof::MIXED);
     let mut mixed = Vec::with_capacity(nt);
     for t in 0..nt {
         mixed.push(mixed_flat[t * e..(t + 1) * e].to_vec());
@@ -3654,13 +3782,19 @@ fn hc_mix_quant_batch(
                 )));
             }
             let mut v = vec![0.0f32; nt * wn];
+            let t = mix_kprof::stamp();
             gemv_batch(w, xn_flat, nt, &mut v)
                 .map_err(|err| one(format!("hc_mix inject (batch): {err}")))?;
+            mix_kprof::mark(t, mix_kprof::INJ);
+            let t = mix_kprof::stamp();
             hyper::hc_inject_apply_batch(&mut v, nt, hp);
+            mix_kprof::mark(t, mix_kprof::INJ_APPLY);
             v
         }
         None => vec![0.0f32; nt * hp.hc],
     };
+    mix_kprof::mark(t_all, mix_kprof::TOTAL);
+    mix_kprof::bump_call();
     Ok((mixed, injs))
 }
 
@@ -12655,6 +12789,10 @@ mod tests {
         /// 委譲で batch 経路の値が動かないことの固定)。
         #[test]
         fn hc_mix_batch_nt1_delegates_to_seq_fast() {
+            // task 126 の 1 トークン経路ゲート (既定 on) を切って、batch 本体の
+            // 挙動だけを見る。
+            let _g = moe_test_guard();
+            set_prefill_mix_seq_for_test(Some(false));
             let (hp, norm, down, up, inject, res) = mix_q8_case(2, 32, 32);
             let make = |d: &[f32]| HyperStreams {
                 data: d.to_vec(),
@@ -12702,6 +12840,98 @@ mod tests {
             .expect("hc_mix_quant_batch (nt=2)");
             assert_eq!(calls() - before, 0, "nt=2 で委譲が発火した");
             assert_bitwise_eq(&mixed2[0], &mixed[0], "hc_mix mixed (nt=2 token 0)");
+            set_prefill_mix_seq_for_test(None);
+        }
+
+        /// task 126: `DENNO_PREFILL_MIX_SEQ` / `DENNO_PREFILL_MIX_SEQ_MAX` の解釈
+        /// (既定 on / 既定 64)。
+        #[test]
+        fn prefill_mix_seq_gate_values() {
+            assert!(prefill_mix_seq_from_value(None), "未設定は既定で有効");
+            assert!(prefill_mix_seq_from_value(Some("1")));
+            assert!(!prefill_mix_seq_from_value(Some("0")), "0 で従来経路に戻る");
+            assert!(!prefill_mix_seq_from_value(Some("off")));
+            assert!(!prefill_mix_seq_from_value(Some("false")));
+            assert_eq!(prefill_mix_seq_max_from_value(None), PREFILL_MIX_SEQ_MAX);
+            assert_eq!(prefill_mix_seq_max_from_value(Some("32")), 32);
+            assert_eq!(prefill_mix_seq_max_from_value(Some(" 16 ")), 16);
+            assert_eq!(
+                prefill_mix_seq_max_from_value(Some("abc")),
+                PREFILL_MIX_SEQ_MAX,
+                "数値でない値は既定に戻す"
+            );
+            assert_eq!(prefill_mix_seq_max_from_value(Some("0")), 0);
+        }
+
+        /// task 126: しきい値以下では 1 トークン経路に振れ、値は batch 経路と
+        /// ビット一致する (CPU)。しきい値を下回る nt では batch 本体のまま。
+        #[test]
+        fn prefill_mix_seq_matches_batch() {
+            // ゲートの上書きはプロセス全体で 1 個なので直列化する。
+            let _g = moe_test_guard();
+            let (hp, norm, down, up, inject, res) = mix_q8_case(2, 32, 32);
+            let nt = 3usize;
+            let ress: Vec<HyperStreams> = (0..nt)
+                .map(|t| HyperStreams {
+                    data: res.data.iter().map(|v| v + t as f32 * 0.01).collect(),
+                    hc: hp.hc,
+                    n_embd: hp.n_embd,
+                })
+                .collect();
+            let calls = || MIX_FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let run = || {
+                hc_mix_quant_batch(
+                    &ress,
+                    &norm,
+                    &down,
+                    &up,
+                    Some(&inject),
+                    &hp,
+                    &mut MixScratch::default(),
+                )
+                .expect("hc_mix_quant_batch")
+            };
+
+            // 基準: ゲート off = batch 本体。
+            set_prefill_mix_seq_for_test(Some(false));
+            let off = run();
+            assert!(
+                off.0.iter().flat_map(|r| r.iter()).any(|v| *v != 0.0),
+                "mixed が全 0 (経路の生死が分からない)"
+            );
+
+            // ゲート on: 1 トークン経路へ振れる (fast の呼び出しが nt 回増える)。
+            set_prefill_mix_seq_for_test(Some(true));
+            let before = calls();
+            let on = run();
+            assert_eq!(
+                calls() - before,
+                nt,
+                "1 トークン経路へ振れていない (MIX_FAST_CALLS が nt 回増えない)"
+            );
+            for t in 0..nt {
+                assert_bitwise_eq(&off.0[t], &on.0[t], &format!("mixed token {t}"));
+                assert_bitwise_eq(
+                    &off.1[t * hp.hc..(t + 1) * hp.hc],
+                    &on.1[t * hp.hc..(t + 1) * hp.hc],
+                    &format!("inject token {t}"),
+                );
+            }
+
+            // しきい値を nt 未満にすると batch 本体へ戻る。
+            set_prefill_mix_seq_max_for_test(nt - 1);
+            let before = calls();
+            let capped = run();
+            assert_eq!(
+                calls() - before,
+                0,
+                "しきい値を超えているのに 1 トークン経路へ振れた"
+            );
+            for t in 0..nt {
+                assert_bitwise_eq(&off.0[t], &capped.0[t], &format!("mixed (capped) token {t}"));
+            }
+            set_prefill_mix_seq_max_for_test(0);
+            set_prefill_mix_seq_for_test(None);
         }
 
         /// Q8_0 のダミー重み (34 B ブロック: f16 スケール + i8 x 32)。
@@ -16036,6 +16266,163 @@ mod tests {
                 "m 分布: nonempty={} mean={} max={}",
                 m_new.0, m_new.1, m_new.2
             );
+        }
+
+        /// task 126: prefill の hc mix を実形 (BF16 down/up/inject) で A/B する手動
+        /// マイクロベンチ。
+        ///
+        /// `hc_mix_quant_batch` (現行の prefill 経路) と、同じ入力をトークンごとに
+        /// `hc_mix_quant` へ渡すループ (decode と同じ 1 トークン経路) を nt 別に同じ
+        /// 回数だけ回して ms/層 を出す。このコンテナは GPU が無いので両方 CPU。
+        ///
+        /// cargo test --release -p denno-engine --features cuda --lib \
+        ///   -- --ignored --nocapture --test-threads=1 bench_mix_batch_real_shape
+        #[test]
+        #[ignore = "実形状の CPU マイクロベンチ (手動)"]
+        fn bench_mix_batch_real_shape() {
+            let hp = HyperParams {
+                hc: 4,
+                n_embd: 2560,
+                low_rank: 320,
+                eps: 1e-6,
+            };
+            let (e, hc, lr) = (hp.n_embd, hp.hc, hp.low_rank);
+            let hc_dim = hc * e;
+            // BF16 の決定的なダミー重み ([n][k] の行優先、実ファイルと同じ並び)。
+            let bf16 = |k: usize, n: usize, seed: u32| -> Vec<u8> {
+                let mut v = Vec::with_capacity(k * n * 2);
+                for i in 0..k * n {
+                    let h = (i as u32)
+                        .wrapping_mul(2654435761)
+                        .wrapping_add(seed.wrapping_mul(97));
+                    let x = (h % 2001) as f32 / 1000.0 - 1.0;
+                    v.extend_from_slice(&((x.to_bits() >> 16) as u16).to_le_bytes());
+                }
+                v
+            };
+            let down = GgufLinear::from_slice(GgmlType::Bf16, hc_dim, lr, &bf16(hc_dim, lr, 3))
+                .expect("hc_down");
+            let up = GgufLinear::from_slice(GgmlType::Bf16, lr, hc_dim, &bf16(lr, hc_dim, 5))
+                .expect("hc_up");
+            let inject = GgufLinear::from_slice(GgmlType::Bf16, hc_dim, hc, &bf16(hc_dim, hc, 7))
+                .expect("hc_inj");
+            let norm: Vec<f32> = (0..hc_dim).map(|i| 0.9 + ((i % 13) as f32) * 0.01).collect();
+            // batch 経路そのものを測る (task 126 のゲートは既定 on なので明示的に切る)。
+            set_prefill_mix_seq_for_test(Some(false));
+            println!("hc_dim={hc_dim} low_rank={lr} (BF16 down/up/inject)");
+            println!("nt\tbatch_ms\tper_tok_ms\tratio(batch/per)");
+            for &nt in &[1usize, 4, 8, 16, 28, 32, 33, 64, 128, 256, 512] {
+                let ress: Vec<HyperStreams> = (0..nt)
+                    .map(|t| HyperStreams {
+                        data: (0..hc_dim)
+                            .map(|i| (((i * 7 + t * 13) % 23) as f32 - 11.0) * 0.03)
+                            .collect(),
+                        hc,
+                        n_embd: e,
+                    })
+                    .collect();
+                let reps = (256 / nt).max(4);
+                let mut scratch = MixScratch::default();
+                let _ = hc_mix_quant_batch(
+                    &ress,
+                    &norm,
+                    &down,
+                    &up,
+                    Some(&inject),
+                    &hp,
+                    &mut scratch,
+                )
+                .expect("warmup batch");
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    let (m, i) = hc_mix_quant_batch(
+                        &ress,
+                        &norm,
+                        &down,
+                        &up,
+                        Some(&inject),
+                        &hp,
+                        &mut scratch,
+                    )
+                    .expect("batch");
+                    std::hint::black_box((&m, &i));
+                }
+                let batch_ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+                // 1 トークン経路 (decode と同じ) を nt 回。MIX_SCRATCH はスレッドローカル。
+                let t1 = std::time::Instant::now();
+                for _ in 0..reps {
+                    let mut mixed = Vec::with_capacity(nt * e);
+                    let mut injs = Vec::with_capacity(nt * hc);
+                    for t in 0..nt {
+                        let (m, i) = hc_mix_quant(
+                            &ress[t],
+                            &norm,
+                            &down,
+                            &up,
+                            Some(&inject),
+                            &hp,
+                        )
+                        .expect("pertoken");
+                        mixed.extend_from_slice(&m);
+                        injs.extend_from_slice(&i);
+                    }
+                    std::hint::black_box((&mixed, &injs));
+                }
+                let per_ms = t1.elapsed().as_secs_f64() * 1e3 / reps as f64;
+                println!(
+                    "{nt}\t{batch_ms:.3}\t{per_ms:.3}\t{:.2}",
+                    batch_ms / per_ms
+                );
+            }
+
+            // nt=28 の区間内訳 (task 126 で batch 経路にも足した [mix-kprof])。
+            let nt = 28usize;
+            let ress: Vec<HyperStreams> = (0..nt)
+                .map(|t| HyperStreams {
+                    data: (0..hc_dim)
+                        .map(|i| (((i * 7 + t * 13) % 23) as f32 - 11.0) * 0.03)
+                        .collect(),
+                    hc,
+                    n_embd: e,
+                })
+                .collect();
+            mix_kprof::set_for_test(true);
+            let mut scratch = MixScratch::default();
+            // warmup (thread-local の確保を先に済ませる)
+            let _ = hc_mix_quant_batch(
+                &ress,
+                &norm,
+                &down,
+                &up,
+                Some(&inject),
+                &hp,
+                &mut scratch,
+            )
+            .expect("warmup");
+            mix_kprof::reset();
+            let _ = hc_mix_quant_batch(
+                &ress,
+                &norm,
+                &down,
+                &up,
+                Some(&inject),
+                &hp,
+                &mut scratch,
+            )
+            .expect("batch");
+            if let Some(l) = mix_kprof::line() {
+                println!("batch(nt=28) {l}");
+            }
+            mix_kprof::reset();
+            for r in ress.iter() {
+                let _ = hc_mix_quant(r, &norm, &down, &up, Some(&inject), &hp).expect("seq");
+            }
+            if let Some(l) = mix_kprof::line() {
+                println!("seq(nt=28)   {l}");
+            }
+            mix_kprof::reset();
+            mix_kprof::set_for_test(false);
+            set_prefill_mix_seq_for_test(None);
         }
     }
 }
