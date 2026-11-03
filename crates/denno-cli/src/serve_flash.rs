@@ -28,7 +28,9 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::prekprof;
-use denno_engine::model::qwen4exp::{Qwen4Exp, Qwen4ExpParams, TapTokens};
+use denno_engine::model::qwen4exp::{
+    expert_w_stats_request_end, Qwen4Exp, Qwen4ExpParams, TapTokens,
+};
 use denno_engine::model::qwen4exp_attn::FullAttn;
 use denno_engine::model::qwen4exp_decode::{argmax, DecoderConfig, Qwen4ExpDecoder};
 use denno_engine::spec_ngram::{
@@ -789,6 +791,9 @@ impl Flash {
                 spec_confirmed as f64 / spec_steps.max(1) as f64
             );
         }
+        // task 120: `DENNO_EXPERT_W_STATS=1` のときだけ decode の重み統計を 1 行出す
+        // (リクエスト終端。env 未指定では分岐 1 回で何も出さない)。
+        expert_w_stats_request_end();
         prof_flash("decode", out.len());
         // P78: `DENNO_PRE_KPROF=1` のときだけ、層の外の区間を 2 行で出す
         // (既定 off では `report` が空を返す = 出力ゼロ)。
