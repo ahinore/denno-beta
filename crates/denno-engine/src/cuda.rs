@@ -7307,6 +7307,46 @@ fn matvec_f32_fn(ctx: &CudaCtx) -> Option<CUfunction> {
         .map(|h| h.0)
 }
 
+/// task 121: `dno_matvec_f32_r` (s169 の並列リダクション版) のハンドル。hc mix
+/// GPU 経路の長い行 (k >= n) 用。[`matvec_f32_fn`] と同一の lazy fetch 規約で、
+/// 未収録 PTX では None をキャッシュする (GPU_BROKEN にはしない = 呼び出し側が
+/// 逐次版に落ちるだけ)。生ハンドルの静的保持は Lmv32Fn / Q35Fns と同一の規約
+/// (所有権移動なし・driver がスレッド安全に管理) で Send/Sync を与える。
+#[derive(Clone, Copy)]
+struct Lmv32RFn(CUfunction);
+unsafe impl Send for Lmv32RFn {}
+unsafe impl Sync for Lmv32RFn {}
+
+static MATVEC_F32_R_FNS: OnceLock<Option<Lmv32RFn>> = OnceLock::new();
+
+/// `dno_matvec_f32_r` のハンドル (未収録 PTX では None)。1 行 = 1 ブロックで
+/// k を blockDim スレッドに分割して strided 加算し、warp shuffle の固定木
+/// (o = 16,8,4,2,1) → warp 合計を warp id 昇順に加算して縮約する (atomic 無し =
+/// 実行ごとに同一結果)。逐次版 `dno_matvec_f32` とは丸め順が違うため bit 一致は
+/// しない。launch は grid=(n,1,1) / block=(256,1,1) (s169 の
+/// chain_q35_ctl_f32 と同一幾何)。
+fn matvec_f32_r_fn(ctx: &CudaCtx) -> Option<CUfunction> {
+    MATVEC_F32_R_FNS
+        .get_or_init(|| {
+            let lib = lib().ok()?;
+            let mut f: CUfunction = std::ptr::null_mut();
+            let r = unsafe {
+                (lib.module_get_function)(
+                    &mut f,
+                    ctx.module_elem,
+                    b"dno_matvec_f32_r\0".as_ptr() as *const c_char,
+                )
+            };
+            if r != 0 {
+                None
+            } else {
+                Some(Lmv32RFn(f))
+            }
+        })
+        .as_ref()
+        .map(|h| h.0)
+}
+
 /// s49: fp32 重み (lm_head / tied embed) のデバイスキャッシュ。key はモデル
 /// ロード毎に一意 (qwen35 の mid 由来)。無ければ同期 H2D でアップロードし
 /// 初回 1 回のみ走る (eviction 無し = P17b 重みレジストリと同一方針)。
@@ -7867,12 +7907,37 @@ thread_local! {
         });
 }
 
-/// task 110: hc mix BF16 (m==1) の GEMV を GPU で実行する (CPU とビット一致)。
+/// task 121: mix GPU で並列リダクション版 (`dno_matvec_f32_r`) に切り替える
+/// 「長い行」の閾値 (k >= n × この比)。実測 (swift15-abl IQ3_S・128 tok・main) では
+/// down (k=10240, n=320) が 281 us/行列とほぼ直列 (1 ブロック = 1 行で k を 1
+/// スレッドが舐めるため並列度が n しかない) で、up (k=320, n=10240) は 55
+/// us/行列と n 側に並列度が足りている。比 1.0 = k が n 以上なら `_r` を使う。
+const MIX_REDUCE_MIN_RATIO: f64 = 1.0;
+
+/// task 121: mix GPU matvec のカーネル選択 (純関数・GPU 無しで検証可)。
+/// true = `dno_matvec_f32_r` (block 256・k をスレッド分割して warp shuffle の
+/// 固定木で縮約・決定論) / false = `dno_matvec_f32` (block 1・k 逐次)。
+/// 長い行 (k >= n × [`MIX_REDUCE_MIN_RATIO`]) だけ `_r` にする。短い行は並列度が
+/// 行数 n 側にあり逐次版で十分 (これを `_r` に変えると up が遅くなる)。
+/// 縮退形 (n == 0) は安全側で逐次版 (実際は呼び出し側の形状検査が先に弾く)。
+/// `has_r` は PTX に `_r` が無いとき false となり逐次版に落ちる (fail closed・
+/// エラーにはしない)。[`fast_reduce_enabled`] (DENNO_FAST_REDUCE) には依存しない
+/// (mix の長い行はオペレーター方針で bit 一致契約の外 = 速度優先・決定論のみ)。
+fn mix_use_reduce_kernel(k: usize, n: usize, has_r: bool) -> bool {
+    has_r && n > 0 && (k as f64) >= (n as f64) * MIX_REDUCE_MIN_RATIO
+}
+
+/// task 110 (task 121 で長い行を並列リダクション版に): hc mix BF16 (m==1) の
+/// GEMV を GPU で実行する。
 ///
 /// 戻り値 false = CPU パスを使うこと (GPU 無効・PTX 未収録・形状不一致・確保失敗・
-/// 実行エラー)。数値は CPU 経路とビット一致するので、どちらに落ちても出力は
-/// 変わらない。uid は `GgufLinear` のもの (モデルロード毎に一意) で、そのまま
-/// 常駐レジストリの key にする。bytes は BF16 の生バイト (k * n * 2)。
+/// 実行エラー)。数値は短い行 (k < n) が CPU 経路とビット一致するので、そちらは
+/// どちらに落ちても出力は変わらない。長い行 (k >= n、[`mix_use_reduce_kernel`])
+/// は s169 の並列リダクション版 `dno_matvec_f32_r` (block 256・warp shuffle の
+/// 固定木) を使い、丸め順が CPU の逐次累積と違うためビット一致は**しない**
+/// (実行ごとの決定論は保つ。オペレーター方針: 速度優先)。uid は `GgufLinear` の
+/// もの (モデルロード毎に一意) で、そのまま常駐レジストリの key にする。bytes は
+/// BF16 の生バイト (k * n * 2)。
 ///
 /// ゲート (`DENNO_MIX_GPU`、既定 off) の判定は呼び出し側 (qwen4exp の
 /// hc_mix_quant_fast) が持つ。
@@ -7921,6 +7986,14 @@ pub fn maybe_gpu_mix_bf16_into(
         mix_gpu_broken_once("kernels_elem.ptx に dno_matvec_f32 が無い (PTX 再生成が必要)");
         return false;
     };
+    // task 121: 長い行 (k >= n) は s169 の並列リダクション版 (`dno_matvec_f32_r`)
+    // を使う。逐次版は 1 ブロック = 1 行で k を 1 スレッドが舐めるため、down
+    // (k=10240, n=320) のような形で並列度が足りない (実測 281 us/行列・ほぼ DRAM
+    // 律速に達しない)。`_r` は DENNO_FAST_REDUCE と無関係にこの経路だけで選ぶ
+    // (mix の長い行はオペレーター方針で bit 一致契約の外)。PTX に `_r` が無ければ
+    // (Option が None) 逐次版に落ちる = 失敗にはしない (fail closed)。
+    let fr = matvec_f32_r_fn(ctx);
+    let use_reduce = mix_use_reduce_kernel(k, n, fr.is_some());
     // 重みの展開 + 常駐 (初回 1 回・同期 H2D)。ロック内で二重アップロード防止。
     let reg = MIX_GPU_W.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let wp = {
@@ -8000,9 +8073,16 @@ pub fn maybe_gpu_mix_bf16_into(
                 &mut kc as *mut _ as *mut c_void,
                 &mut nc as *mut _ as *mut c_void,
             ];
-            // 1 block = 1 行 (カーネルが block 内全スレッドで同一計算するため
-            // block=(1,1,1)。grid.x は 2^31-1 まで合法)。
-            ctx.launch_async(f, (n as u32, 1, 1), (1, 1, 1), 0, &mut args)?;
+            // task 121: 長い行は `_r` (1 ブロック = 1 行・block 256 で k を分割し
+            // warp shuffle の固定木で縮約・決定論)、短い行は従来どおり逐次版
+            // (カーネルが block 内全スレッドで同一計算するため block=(1,1,1)。
+            // grid.x は 2^31-1 まで合法)。
+            let (mv_fn, mv_thr): (CUfunction, u32) = if use_reduce {
+                (fr.expect("use_reduce は has_r=true を要求する"), 256)
+            } else {
+                (f, 1)
+            };
+            ctx.launch_async(mv_fn, (n as u32, 1, 1), (mv_thr, 1, 1), 0, &mut args)?;
             check(
                 (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
                 "cuMemcpyDtoHAsync",
@@ -21037,14 +21117,17 @@ mod p59_dedup_tests {
         }
     }
 
-    /// task 110: 実 GPU で hc mix BF16 GEMV を回し、CPU の BF16 経路 (AVX2 融合 =
-    /// classic とビット一致済み) と全要素ビット一致・2 回連続で同一・発動フラグ
-    /// が立つことを確かめる。実形 (down [10240->320] / up [320->10240]) + 端数 k。
+    /// task 110 + task 121: 実 GPU で hc mix BF16 GEMV を回す。短い行 (k < n) は
+    /// CPU の BF16 経路 (AVX2 融合 = classic とビット一致済み) と全要素ビット一致。
+    /// 長い行 (k >= n) は task 121 で s169 の並列リダクション版 (`dno_matvec_f32_r`
+    /// ・block 256・固定木縮約) に切り替わるためビット一致はしない — CPU との差は
+    /// 絶対 1e-4 + 相対 1e-5 以内で受け、**2 回の実行がビット同一** (決定論) のみを
+    /// 保証する。実形 (down [10240->320] / up [320->10240]) + 端数 k。
     ///
     /// 実機: `cargo test --release -p denno-engine --features cuda --lib -- --ignored cuda_mix_bf16 --nocapture`
     #[test]
     #[ignore] // GPU が必要
-    fn cuda_mix_bf16_bit_matches_classic_and_is_deterministic() {
+    fn cuda_mix_bf16_short_rows_bit_match_and_long_rows_are_deterministic() {
         let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !cuda_enabled() {
             CudaCtx::new().expect("CUDA init");
@@ -21076,12 +21159,25 @@ mod p59_dedup_tests {
                 last_linear_ran_on_gpu(),
                 "発動フラグが立っていない (k={k}, n={n})"
             );
+            // 短い行 (k < n) はビット一致。長い行 (k >= n) は task 121 で `_r`
+            // (固定木縮約・丸め順が違う) に切り替わるので許容内で受ける (PTX に
+            // `_r` が無い環境では逐次版に落ちるため diff=0 になり、これも許容内)。
+            let long_row = mix_use_reduce_kernel(k, n, true);
             for r in 0..n {
-                assert_eq!(
-                    gpu[r].to_bits(),
-                    cpu[r].to_bits(),
-                    "行 {r} (k={k}, n={n}) が CPU とビット不一致"
-                );
+                if long_row {
+                    let diff = (gpu[r] - cpu[r]).abs();
+                    let tol = 1e-4 + 1e-5 * cpu[r].abs();
+                    assert!(
+                        diff <= tol,
+                        "行 {r} (k={k}, n={n}) が CPU と許容外: diff={diff:e} tol={tol:e}"
+                    );
+                } else {
+                    assert_eq!(
+                        gpu[r].to_bits(),
+                        cpu[r].to_bits(),
+                        "行 {r} (k={k}, n={n}) が CPU とビット不一致 (短い行)"
+                    );
+                }
             }
             // 決定論 (2 回目も同一)。
             let mut gpu2 = vec![0f32; n];
@@ -21094,6 +21190,179 @@ mod p59_dedup_tests {
                 );
             }
             // 登録の解放が死なないこと (モデル差し替えの経路)。
+            mix_gpu_unregister(uid);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // task 121: 長い行 (k >= n) の hc mix GPU を s169 の並列リダクション版へ
+    // -----------------------------------------------------------------------
+
+    /// task 121: カーネル選択の真理値表 (純関数・GPU 無し)。長い行 (k >= n) だけ
+    /// `_r`、`has_r = false` (PTX 未収録) なら常に逐次版に落ちる。
+    /// DENNO_FAST_REDUCE は引数にすら現れない (= 依存しない)。
+    #[test]
+    fn mix_kernel_selection_truth_table() {
+        // 実形 (swift15 IQ3_S): down は長い行 / up は短い行。
+        assert!(mix_use_reduce_kernel(10240, 320, true), "down は長い行");
+        assert!(
+            !mix_use_reduce_kernel(320, 10240, true),
+            "up は短い行 (逐次版のまま)"
+        );
+        // PTX に `_r` が無い (has_r=false) なら常に逐次版 (fail closed・失敗しない)。
+        assert!(!mix_use_reduce_kernel(10240, 320, false));
+        assert!(!mix_use_reduce_kernel(320, 10240, false));
+        // 境界: k == n は長い行 (>=)。1 行ずれた両側。
+        assert!(mix_use_reduce_kernel(64, 64, true));
+        assert!(mix_use_reduce_kernel(65, 64, true));
+        assert!(!mix_use_reduce_kernel(64, 65, true));
+        // 縮退形も規約どおり (呼び出し側の形状検査が先に弾く)。
+        assert!(mix_use_reduce_kernel(1, 1, true));
+        assert!(!mix_use_reduce_kernel(0, 5, true));
+        assert!(!mix_use_reduce_kernel(5, 0, true));
+    }
+
+    /// task 121: `dno_matvec_f32_r` の CPU ミラー (1 行)。blockDim=256 で k を
+    /// tid 順に strided 加算し、warp 内は shuffle の固定木 (o = 16,8,4,2,1)・
+    /// warp 合計は warp id 昇順で加算する — カーネル (kernels_elem.cu s169) と
+    /// 同一の縮約順。積と加算の丸めを分離 (fma 無し) するので正規数範囲では
+    /// GPU と同じ並びになる。shuffle 木は lane 0 に流れ込む経路だけを模倣する
+    /// (src lane が範囲外のレーンの値は lane 0 に到達しない)。
+    fn matvec_f32_r_cpu_mirror_row(h: &[f32], row: &[f32], k: usize) -> f32 {
+        const NT: usize = 256; // blockDim.x (launch 側と一致)
+        let mut lanes = [0f32; NT];
+        for (tid, lane) in lanes.iter_mut().enumerate() {
+            let mut acc = 0f32;
+            let mut d = tid;
+            while d < k {
+                acc += h[d] * row[d]; // __fadd_rn(acc, __fmul_rn(h[d], row[d]))
+                d += NT;
+            }
+            *lane = acc;
+        }
+        // warp ごとの shuffle 木 (lane i は lane i+o を足す・o 降順)。
+        for w in 0..(NT / 32) {
+            let base = w * 32;
+            for o in [16usize, 8, 4, 2, 1] {
+                for i in 0..(32 - o) {
+                    lanes[base + i] += lanes[base + i + o];
+                }
+            }
+        }
+        // sh[wid] (= 各 warp の lane 0) を warp id 昇順に加算 (t = sh[0] 出発)。
+        let mut t = lanes[0];
+        for w in 1..(NT / 32) {
+            t += lanes[w * 32];
+        }
+        t
+    }
+
+    /// task 121: CPU ミラー (固定木縮約) を f64 真値と比べる (実形の両形状)。
+    /// 許容: 絶対 1e-4 + 相対 1e-5 (f64 真値基準)。両形状とも全行。
+    #[test]
+    fn mix_reduce_mirror_matches_f64_truth_on_real_shapes() {
+        for (k, n, seed) in [(10240usize, 320usize, 3u32), (320usize, 10240usize, 5u32)] {
+            let w = mix_expand_bf16(&mix_bf16_bytes(k, n, seed), k, n);
+            let h: Vec<f32> = (0..k)
+                .map(|i| (((i * 31) % 97) as f32 - 48.0) * 0.01)
+                .collect();
+            for r in 0..n {
+                let row = &w[r * k..(r + 1) * k];
+                let got = matvec_f32_r_cpu_mirror_row(&h, row, k);
+                let truth: f64 = (0..k).map(|d| h[d] as f64 * row[d] as f64).sum();
+                let diff = (got as f64 - truth).abs();
+                let tol = 1e-4 + 1e-5 * truth.abs();
+                assert!(
+                    diff <= tol,
+                    "r={r} (k={k}, n={n}): got={got:e} truth={truth:e} diff={diff:e} tol={tol:e}"
+                );
+            }
+        }
+    }
+
+    /// task 121: 実 GPU で長い行 (down) / 短い行 (up) の両方を
+    /// [`maybe_gpu_mix_bf16_into`] 経路で回し、CPU 結果 (expert_gemv_bf16) との
+    /// 最大絶対誤差と 1 call の時間を出す (main が GPU ホストで実行する用)。
+    /// 長い行は `_r` (固定木縮約) のため CPU とはビット一致しない — 許容は
+    /// 絶対 1e-4 + 相対 1e-5。2 回の実行がビット同一 (決定論) も確かめる。
+    ///
+    /// 実機: `cargo test --release -p denno-engine --features cuda --lib -- --ignored cuda_mix_bf16_reduce --nocapture`
+    #[test]
+    #[ignore] // GPU が必要
+    fn cuda_mix_bf16_reduce_long_row_selfcheck() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !cuda_enabled() {
+            CudaCtx::new().expect("CUDA init");
+            enable_for_tests();
+        }
+        let has_r = shared_ctx().and_then(matvec_f32_r_fn).is_some();
+        println!("[mix-gpu-p121] has_r(dno_matvec_f32_r in PTX) = {has_r}");
+        for (idx, (k, n, seed)) in [(10240usize, 320usize, 3u32), (320usize, 10240usize, 5u32)]
+            .iter()
+            .enumerate()
+        {
+            let (k, n) = (*k, *n);
+            let bytes = mix_bf16_bytes(k, n, *seed);
+            let x: Vec<f32> = (0..k)
+                .map(|i| (((i * 31) % 97) as f32 - 48.0) * 0.01)
+                .collect();
+            let mut cpu = vec![0f32; n];
+            crate::model::moe_expert::expert_gemv_bf16(&bytes, k, n, &x, &mut cpu)
+                .expect("CPU BF16 GEMV");
+            let uid = 0xD121_0000u64 + idx as u64;
+            let mut gpu = vec![0f32; n];
+            set_last_linear_ran_on_gpu(false);
+            assert!(
+                maybe_gpu_mix_bf16_into(uid, &bytes, k, n, &x, &mut gpu),
+                "GPU 経路が発動しない (k={k}, n={n})"
+            );
+            assert!(
+                last_linear_ran_on_gpu(),
+                "発動フラグが立っていない (k={k}, n={n})"
+            );
+            let mut max_abs = 0f64;
+            let mut max_rel = 0f64;
+            for r in 0..n {
+                let diff = (gpu[r] as f64 - cpu[r] as f64).abs();
+                let tol = 1e-4 + 1e-5 * cpu[r].abs() as f64;
+                assert!(
+                    diff <= tol,
+                    "行 {r} (k={k}, n={n}) が CPU と許容外: gpu={:e} cpu={:e} diff={diff:e} tol={tol:e}",
+                    gpu[r],
+                    cpu[r]
+                );
+                max_abs = max_abs.max(diff);
+                max_rel = max_rel.max(diff / (cpu[r].abs() as f64).max(1e-30));
+            }
+            // 決定論 (2 回目もビット同一)。
+            let mut gpu2 = vec![0f32; n];
+            assert!(maybe_gpu_mix_bf16_into(uid, &bytes, k, n, &x, &mut gpu2));
+            for r in 0..n {
+                assert_eq!(
+                    gpu[r].to_bits(),
+                    gpu2[r].to_bits(),
+                    "2 回目が不一致 (k={k}, n={n})"
+                );
+            }
+            // 1 call の時間 (H2D + GEMV + D2H + sync 込み)。ウォームアップ後に rep。
+            let mut gpu_t = vec![0f32; n];
+            for _ in 0..20 {
+                assert!(maybe_gpu_mix_bf16_into(uid, &bytes, k, n, &x, &mut gpu_t));
+            }
+            let reps = 200u32;
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                assert!(maybe_gpu_mix_bf16_into(uid, &bytes, k, n, &x, &mut gpu_t));
+            }
+            let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+            println!(
+                "[mix-gpu-p121] k={k} n={n} kernel={} max_abs_err={max_abs:.3e} max_rel_err={max_rel:.3e} {us:.1} us/call",
+                if mix_use_reduce_kernel(k, n, true) {
+                    "dno_matvec_f32_r"
+                } else {
+                    "dno_matvec_f32"
+                }
+            );
             mix_gpu_unregister(uid);
         }
     }

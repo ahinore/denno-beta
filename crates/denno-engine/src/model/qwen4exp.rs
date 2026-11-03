@@ -3212,7 +3212,8 @@ fn hc_mix_fast_enabled() -> bool {
 /// task 110: `DENNO_MIX_GPU` の解釈。**既定 off**。`1` / `on` / `true` / `yes`
 /// (`trim` + 小文字化。`router_gpu_from_value` と同一規約) のとき hc mix の
 /// BF16 down / up を GPU (`cuda::maybe_gpu_mix_bf16_into` = `dno_matvec_f32`
-/// 流用) で回す。失敗時は cuda 側が warn 1 行で CPU に落ちる (値はビット一致)。
+/// 流用・task 121 から長い行 k >= n は並列リダクション版 `dno_matvec_f32_r`)
+/// で回す。失敗時は cuda 側が warn 1 行で CPU に落ちる (短い行の値はビット一致)。
 fn mix_gpu_from_value(v: Option<&str>) -> bool {
     match v {
         Some(s) => matches!(
@@ -3461,9 +3462,12 @@ fn hc_mix_quant_fast(
         let hc_fast = hc_mix_fast_enabled();
         // task 110: `DENNO_MIX_GPU=1` かつ BF16 のときだけ down GEMV を GPU に奪う
         // (カーネルは dno_matvec_f32 流用・1 行 = 1 ブロック・k 昇順直列加算 = CPU
-        // 参照とビット一致)。false のときは従来どおり CPU 経路 (cuda 側が warn を
-        // 1 行だけ出す)。GPU 経路が成功すると `last_linear_ran_on_gpu` が立つので
-        // 下の `note_down` が gpu= を積む ([mix-kprof] の内訳で見える)。
+        // 参照とビット一致。task 121 から長い行 k >= n (= down 実形) は s169 の
+        // 並列リダクション版 dno_matvec_f32_r (block 256・固定木縮約・決定論) に
+        // 切り替わるためビット一致しない: 許容 絶対 1e-4 + 相対 1e-5)。false の
+        // ときは従来どおり CPU 経路 (cuda 側が warn を 1 行だけ出す)。GPU 経路が
+        // 成功すると `last_linear_ran_on_gpu` が立つので下の `note_down` が gpu= を
+        // 積む ([mix-kprof] の内訳で見える)。
         #[cfg(feature = "cuda")]
         let gpu_down = mix_gpu_enabled()
             && down.ty() == crate::kquant::GgmlType::Bf16
@@ -3498,6 +3502,8 @@ fn hc_mix_quant_fast(
         let t = mix_kprof::stamp();
         // task 110: up GEMV も down と同じ (`DENNO_MIX_GPU=1` かつ BF16 のときだけ
         // GPU に奪う。入力は hc_lo_apply 済みの `lo`、成功で `note_up` が gpu= を積む)。
+        // up 実形 (k=320 < n=10240) は短い行なので task 121 でも逐次版のまま
+        // (ビット一致)。
         #[cfg(feature = "cuda")]
         let gpu_up = mix_gpu_enabled()
             && up.ty() == crate::kquant::GgmlType::Bf16
