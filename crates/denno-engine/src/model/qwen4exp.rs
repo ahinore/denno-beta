@@ -5870,6 +5870,136 @@ fn moe_ffn_quant_full_opts(
     )
 }
 
+// ---------------------------------------------------------------------------
+// task 124: shared expert の gate/up を router/expert の CPU 仕事と重ねる
+// ---------------------------------------------------------------------------
+//
+// 実測 (GPU ラボ t124a、swift15-abl IQ3_S 128 tok、14T、DENNO_MIX_GPU=1):
+// decode off 86 -> on 84 ms/tok (-2.9%)、md5 は全条件で SAME
+// (a:82ab0c06 / b:624e0d4d)、prefill 2.25 -> 2.25 s、errors 0。
+// RAYON_NUM_THREADS=13 では 83 ms/tok (-4.0% vs off の 14T)。
+// [q4prof] decode の shared は 826.7 -> 308.4 ms/128tok (gate/up が CPU 仕事の
+// 裏に隠れた)。router は 956.2 -> 1142.3 = +1.45 ms/tok になるが、これは
+// 積むときの発行コスト (~30 us/層) を router の区間が抱えるため (wall time は
+// 上の decode の差がすべて)。
+
+/// `DENNO_SHARED_OVERLAP` の生値 → 重ね打ちの on/off (純関数)。**既定 on**、
+/// `0` / `off` / `false` で従来の順序 (router → expert → shared) に戻る。
+fn shared_overlap_from_value(v: Option<&str>) -> bool {
+    !matches!(v, Some("0") | Some("off") | Some("false"))
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+static SHARED_OVERLAP_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// shared expert の重ね打ちを使うか (`DENNO_SHARED_OVERLAP`、既定 on)。
+///
+/// プロセスで 1 回だけ env を読む。off のときの追加コストは atomic load 1 回。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn shared_overlap_enabled() -> bool {
+    match SHARED_OVERLAP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        shared_overlap_from_value(std::env::var("DENNO_SHARED_OVERLAP").ok().as_deref())
+    })
+}
+
+/// テスト専用: 重ね打ちの on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+fn set_shared_overlap_for_test(v: Option<bool>) {
+    let x = match v {
+        Some(false) => 1,
+        Some(true) => 2,
+        None => 0,
+    };
+    SHARED_OVERLAP_OVERRIDE.store(x, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 124: shared expert の gate/up を先に GPU へ積むハンドル。
+///
+/// `cuda` feature の有無はこの中で吸収する (`begin` は常に「積まなかった」を
+/// 返すので、feature 無しでも呼び出し側のコードは同じ形でコンパイルできる)。
+struct SharedExpertOverlap {
+    #[cfg(feature = "cuda")]
+    pending: crate::cuda::SharedPending,
+    /// 積んだときの gate/up の出力長 (join の検査用。0 = 積んでいない)
+    lens: [usize; 2],
+}
+
+impl SharedExpertOverlap {
+    fn none() -> Self {
+        Self {
+            #[cfg(feature = "cuda")]
+            pending: crate::cuda::SharedPending::none(),
+            lens: [0, 0],
+        }
+    }
+
+    /// 層の入口で呼ぶ。`x` は gate/up の入力そのもの。
+    fn begin(lw: &LayerW, x: &[f32]) -> Self {
+        #[cfg(feature = "cuda")]
+        {
+            if !shared_overlap_enabled() {
+                return Self::none();
+            }
+            let jobs = [
+                crate::cuda::SharedGemvJob {
+                    uid: lw.gate_shexp.uid(),
+                    ty: lw.gate_shexp.ty(),
+                    blocks: lw.gate_shexp.blocks().as_slice(),
+                    k: lw.gate_shexp.k(),
+                    n: lw.gate_shexp.n(),
+                },
+                crate::cuda::SharedGemvJob {
+                    uid: lw.up_shexp.uid(),
+                    ty: lw.up_shexp.ty(),
+                    blocks: lw.up_shexp.blocks().as_slice(),
+                    k: lw.up_shexp.k(),
+                    n: lw.up_shexp.n(),
+                },
+            ];
+            let pending = crate::cuda::shared_gemv_begin(x, &jobs);
+            return Self {
+                pending,
+                lens: [jobs[0].n, jobs[1].n],
+            };
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (lw, x);
+            Self::none()
+        }
+    }
+
+    /// 積んだ gate/up を join して `sact` / `sup` へ書く。
+    ///
+    /// `false` = 「GPU の結果が取れなかった」 = 呼び出し側は従来の同期経路で
+    /// 計算し直すこと。このとき `sact` / `sup` は 1 要素も書かれていない。
+    fn finish(&mut self, sact: &mut [f32], sup: &mut [f32]) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            if self.pending.is_empty() {
+                return false;
+            }
+            if sact.len() != self.lens[0] || sup.len() != self.lens[1] {
+                return false;
+            }
+            let mut outs: [&mut [f32]; 2] = [sact, sup];
+            return crate::cuda::shared_gemv_finish(&mut self.pending, &mut outs);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (&self.lens, sact, sup);
+            false
+        }
+    }
+}
+
 /// [`moe_ffn_quant_full_opts`] の本体。`flat_decode` は P70 の expert 横断平坦化
 /// (env を読まずにテストから選べるように引数で受ける)。
 ///
@@ -5893,6 +6023,10 @@ fn moe_ffn_quant_impl(
     let ne = p.n_expert;
     let k = p.n_expert_used;
     let ff = p.n_ff_exp;
+
+    // task 124: shared expert の gate/up は `x` だけで決まるので、router と
+    // 選択 expert の CPU 仕事を始める前に GPU へ積む (join は下の 5. で 1 回)。
+    let mut shed_ov = SharedExpertOverlap::begin(lw, x);
 
     // 1. ルータ
     let mut probs = vec![0.0f32; ne];
@@ -6255,14 +6389,22 @@ fn moe_ffn_quant_impl(
     let t_shared = std::time::Instant::now();
     let sff = lw.gate_shexp.n();
     let mut sact = vec![0.0f32; sff];
-    lw.gate_shexp
-        .gemv_label("shared_gate", x, &mut sact)
-        .map_err(|err| one(format!("層 {}: ffn_gate_shexp: {err}", lw.il)))?;
-    silu_inplace(&mut sact);
     let mut sup = vec![0.0f32; sff];
-    lw.up_shexp
-        .gemv_label("shared_up", x, &mut sup)
-        .map_err(|err| one(format!("層 {}: ffn_up_shexp: {err}", lw.il)))?;
+    // task 124: router の前に積んだ gate/up をここで回収する (間に合っていれば
+    // 待ちはほぼ 0)。取れなければ従来どおりこの場で同期して計算する。
+    // 従来の文の順序 (gate → silu → up → 積) は `!overlapped` 側でそのまま。
+    let overlapped = shed_ov.finish(&mut sact, &mut sup);
+    if !overlapped {
+        lw.gate_shexp
+            .gemv_label("shared_gate", x, &mut sact)
+            .map_err(|err| one(format!("層 {}: ffn_gate_shexp: {err}", lw.il)))?;
+    }
+    silu_inplace(&mut sact);
+    if !overlapped {
+        lw.up_shexp
+            .gemv_label("shared_up", x, &mut sup)
+            .map_err(|err| one(format!("層 {}: ffn_up_shexp: {err}", lw.il)))?;
+    }
     for r in 0..sff {
         sact[r] *= sup[r];
     }
@@ -9730,6 +9872,187 @@ mod tests {
             "CPU 経路で expert_gemv_any が 3 本 × top-k 回呼ばれていない (既定で GPU 経路に入った?)"
         );
         assert_bitwise_eq(&base, &got, "route=Cpu");
+    }
+
+    // ------------------------------------------------------------------
+    // task 124: shared expert の重ね打ち (gate/up を router/expert と重ねる)
+    // ------------------------------------------------------------------
+
+    /// ゲートの解釈 (純関数)。既定 on、`0` / `off` / `false` だけ off。
+    #[test]
+    fn shared_overlap_gate_from_value() {
+        assert!(shared_overlap_from_value(None), "未設定は on");
+        assert!(shared_overlap_from_value(Some("1")));
+        assert!(shared_overlap_from_value(Some("on")));
+        assert!(shared_overlap_from_value(Some("yes")));
+        assert!(shared_overlap_from_value(Some("")));
+        for v in ["0", "off", "false"] {
+            assert!(!shared_overlap_from_value(Some(v)), "{v} は off");
+        }
+    }
+
+    /// Q8_0 のダミー重み (34 B ブロック: f16 スケール + i8 x 32)。
+    #[cfg(feature = "cuda")]
+    fn overlap_q8_weights(k: usize, n: usize, seed: u32) -> Vec<u8> {
+        assert_eq!(k % 32, 0, "Q8_0 のブロックは 32 要素");
+        let mut b = vec![0u8; k * n / 32 * 34];
+        let scale = half::f16::from_f32(0.02).to_le_bytes();
+        for blk in 0..b.len() / 34 {
+            let o = blk * 34;
+            b[o..o + 2].copy_from_slice(&scale);
+            for j in 0..32usize {
+                let q = ((j as i32 + blk as i32 * 5 + seed as i32 * 7) % 13) - 6;
+                b[o + 2 + j] = q as i8 as u8;
+            }
+        }
+        b
+    }
+
+    /// task 124: shared expert だけ Q8_0 にした層。
+    ///
+    /// 実機の shared expert と同じ型。fixture 既定の F32 のままだと GPU 経路の
+    /// 対象外 (`plan_moe_gemv` が `None`) で、重ね打ちの検査にならない。
+    #[cfg(feature = "cuda")]
+    fn overlap_test_layer(f: &GgufFile, p: &Qwen4ExpParams) -> LayerW {
+        let mut lw = layer_at(f, p, 0);
+        let q8 = |k: usize, n: usize, seed: u32| {
+            GgufLinear::from_slice(GgmlType::Q8_0, k, n, &overlap_q8_weights(k, n, seed))
+                .expect("GgufLinear::from_slice (Q8_0)")
+        };
+        lw.gate_shexp = q8(p.n_embd, p.n_ff_shexp, 11);
+        lw.up_shexp = q8(p.n_embd, p.n_ff_shexp, 13);
+        lw.down_shexp = q8(p.n_ff_shexp, p.n_embd, 17);
+        lw
+    }
+
+    /// task 124: 偽 GPU を立てたままゲート on で MoE を 1 回回す。
+    #[cfg(feature = "cuda")]
+    fn shared_overlap_run(p: &Qwen4ExpParams, lw: &LayerW, x: &[f32]) -> Vec<f32> {
+        let _fake = crate::cuda::SharedOverlapFakeGuard::new();
+        set_shared_overlap_for_test(Some(true));
+        let out = moe_ffn_quant_with(p, lw, x, None, false, Route::Cpu).expect("重ね打ち経路");
+        set_shared_overlap_for_test(None);
+        out
+    }
+
+    /// task 124: ゲート on で重ね打ちが発火し (begin / taken / join が増える)、
+    /// join の写し先と順序が正しい (ゲート off の従来経路とビット一致)。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn shared_overlap_fires_and_matches_off_path() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("shared_overlap_on");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = overlap_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        // 1) ゲート off = 従来の順序。begin は 1 回も呼ばれない。
+        set_shared_overlap_for_test(Some(false));
+        let s0 = crate::cuda::shared_overlap_stats();
+        let off = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("ゲート off");
+        let s1 = crate::cuda::shared_overlap_stats();
+        set_shared_overlap_for_test(None);
+        assert_eq!(s1.begin, s0.begin, "ゲート off なのに begin が呼ばれた");
+
+        // 2) ゲート on + 偽 GPU = 重ね打ちの join 経路。
+        let on = shared_overlap_run(&p, &lw, &x);
+        let s2 = crate::cuda::shared_overlap_stats();
+        assert!(s2.begin > s1.begin, "重ね打ちの begin が発火していない");
+        assert!(
+            s2.taken > s1.taken,
+            "GPU へ積めていない (偽 GPU が効いていない)"
+        );
+        assert!(s2.joined > s1.joined, "join が発火していない");
+        assert_eq!(s2.aborted, s1.aborted, "abort が増えた");
+        assert_eq!(s2.failed, s1.failed, "join 失敗が増えた");
+        assert_bitwise_eq(&on, &off, "shared overlap (on vs off)");
+
+        // 3) ゲート on でも GPU が無ければ従来経路 (このコンテナがその状態)。
+        set_shared_overlap_for_test(Some(true));
+        let s3 = crate::cuda::shared_overlap_stats();
+        let cpu = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("GPU 無し");
+        let s4 = crate::cuda::shared_overlap_stats();
+        set_shared_overlap_for_test(None);
+        assert!(s4.begin > s3.begin, "begin が呼ばれていない");
+        assert_eq!(s4.taken, s3.taken, "GPU が無いのに積めたことになった");
+        assert_bitwise_eq(&cpu, &off, "shared overlap (GPU 無し)");
+    }
+
+    /// task 124: join が失敗したら従来の同期経路へ落ちる。
+    ///
+    /// 出力は同じ・abort が二重に走らないこと。GPU 無しでも到達できる
+    /// (偽 GPU + 失敗フック)。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn shared_overlap_join_failure_falls_back() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("shared_overlap_fail");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = overlap_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        set_shared_overlap_for_test(Some(false));
+        let off = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("ゲート off");
+        set_shared_overlap_for_test(None);
+
+        let s0 = crate::cuda::shared_overlap_stats();
+        let got = {
+            let _fake = crate::cuda::SharedOverlapFakeGuard::new();
+            let _fail = crate::cuda::SharedOverlapFailGuard::new();
+            set_shared_overlap_for_test(Some(true));
+            let r = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu);
+            set_shared_overlap_for_test(None);
+            r.expect("join 失敗でも計算できる")
+        };
+        let s1 = crate::cuda::shared_overlap_stats();
+        assert!(s1.taken > s0.taken, "偽 GPU で積めていない");
+        assert!(s1.failed > s0.failed, "join 失敗の経路が発火していない");
+        assert_eq!(
+            s1.aborted, s0.aborted,
+            "join 失敗のあとに Drop が二重に drain した"
+        );
+        assert_bitwise_eq(&got, &off, "join 失敗 → 従来経路");
+    }
+
+    /// task 124: join せずに捨てても in-flight が残らない (Drop が drain する)。
+    /// そのあとの層が普通に計算できることまで見る (壊れた状態を持ち越さない)。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn shared_overlap_drop_without_join_drains() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("shared_overlap_abort");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = overlap_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        set_shared_overlap_for_test(Some(false));
+        let off = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("ゲート off");
+        set_shared_overlap_for_test(None);
+
+        let s0 = crate::cuda::shared_overlap_stats();
+        {
+            let _fake = crate::cuda::SharedOverlapFakeGuard::new();
+            set_shared_overlap_for_test(Some(true));
+            let ov = SharedExpertOverlap::begin(&lw, &x);
+            set_shared_overlap_for_test(None);
+            assert!(!ov.pending.is_empty(), "偽 GPU で積めていない");
+            assert_eq!(ov.pending.len(), 2, "積んだ本数が 2 でない");
+            // join せずに捨てる (エラー経路の想定)
+        }
+        let s1 = crate::cuda::shared_overlap_stats();
+        assert_eq!(s1.taken, s0.taken + 1, "積めていない");
+        assert_eq!(s1.aborted, s0.aborted + 1, "Drop の drain が走っていない");
+        assert_eq!(s1.joined, s0.joined, "join していないのに joined が増えた");
+
+        // 壊れたまま残っていない: もう一度積んで join でき、値も同じ。
+        let again = shared_overlap_run(&p, &lw, &x);
+        assert_bitwise_eq(&again, &off, "abort のあとの重ね打ち");
     }
 
     /// M=1 VNNI のゲートを開けたとき、decode の CPU 経路が `expert_gemv_any` ではなく
