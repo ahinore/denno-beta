@@ -3265,7 +3265,8 @@ pub(crate) fn set_mix_gpu_for_test(v: Option<bool>) {
 /// `vec![0.0f32; k]` を確保して行全体を f32 へ開き直すので、28 トークンでは
 /// 同じ重みを 28 回デコードし、確保も 8960 回/層になる。`hc_up` (10240 行) も
 /// ブロック 1 回デコードのまま行並列に乗らない (実測 `regions=0`)。
-/// 結果、実形 (BF16 down 10240x320 / up 320x10240) の 1 層あたり:
+/// 1 層あたりの実測 (このコンテナ 16 スレッド、BF16 実形
+/// hc_dim=10240 / low_rank=320、`bench_mix_batch_real_shape`):
 ///
 /// | nt | batch | 1 トークン経路 | 比 |
 /// |---|---|---|---|
@@ -3274,14 +3275,22 @@ pub(crate) fn set_mix_gpu_for_test(v: Option<bool>) {
 /// | 128 | 11.9 ms | 24.4 ms | batch が 2.0 倍速い |
 ///
 /// 交点は 64〜128 の間。このコンテナ (16 スレッド) の実測なので、既定は
-/// 余裕を見て 64。数値は `bench_mix_batch_real_shape` で取り直せる。
+/// 余裕を見て 64。
+///
+/// 実機 (GPU ラボ t126b, swift15-abl, 128 tok decode / 28・33 tok prefill,
+/// int-auto の production env): prefill 2.20-2.24 s (28 tok) →
+/// 1.40-1.46 s、2.69-2.71 s (33 tok) → 1.63-1.65 s (-35%)。
+/// per-layer mix は 0.864 → 0.278 ms/トークン。decode 84 → 84 ms/tok (+0.6%)、
+/// 出力 md5 は base と同一 (`DENNO_MIX_GPU=1` でも値は変わらなかった)。
 const PREFILL_MIX_SEQ_MAX: usize = 64;
 
-/// `DENNO_PREFILL_MIX_SEQ` の解釈。**既定 off**。`1` のときだけ有効
-/// (`prefill_batch_from_value` と同じ規約: `"1"` 以外は無効)。
+/// `DENNO_PREFILL_MIX_SEQ` の解釈。**既定 on** (t126b の実測で採択)、
+/// `0` / `off` / `false` で従来のバッチ経路に戻る (`shared_overlap_from_value`
+/// と同じ規約)。CPU ではバッチ経路とビット一致する。
 fn prefill_mix_seq_from_value(v: Option<&str>) -> bool {
-    matches!(v, Some("1"))
+    !matches!(v, Some("0") | Some("off") | Some("false"))
 }
+
 
 /// `DENNO_PREFILL_MIX_SEQ_MAX` の解釈。未設定・数値でないときは
 /// [`PREFILL_MIX_SEQ_MAX`]。`0` は「常にバッチ経路」(ゲート off と同じ)。
@@ -12780,6 +12789,10 @@ mod tests {
         /// 委譲で batch 経路の値が動かないことの固定)。
         #[test]
         fn hc_mix_batch_nt1_delegates_to_seq_fast() {
+            // task 126 の 1 トークン経路ゲート (既定 on) を切って、batch 本体の
+            // 挙動だけを見る。
+            let _g = moe_test_guard();
+            set_prefill_mix_seq_for_test(Some(false));
             let (hp, norm, down, up, inject, res) = mix_q8_case(2, 32, 32);
             let make = |d: &[f32]| HyperStreams {
                 data: d.to_vec(),
@@ -12827,20 +12840,18 @@ mod tests {
             .expect("hc_mix_quant_batch (nt=2)");
             assert_eq!(calls() - before, 0, "nt=2 で委譲が発火した");
             assert_bitwise_eq(&mixed2[0], &mixed[0], "hc_mix mixed (nt=2 token 0)");
+            set_prefill_mix_seq_for_test(None);
         }
 
         /// task 126: `DENNO_PREFILL_MIX_SEQ` / `DENNO_PREFILL_MIX_SEQ_MAX` の解釈
-        /// (既定 off / 既定 64)。
+        /// (既定 on / 既定 64)。
         #[test]
         fn prefill_mix_seq_gate_values() {
-            assert!(!prefill_mix_seq_from_value(None), "未設定は既定で無効");
+            assert!(prefill_mix_seq_from_value(None), "未設定は既定で有効");
             assert!(prefill_mix_seq_from_value(Some("1")));
-            assert!(!prefill_mix_seq_from_value(Some("0")));
-            assert!(!prefill_mix_seq_from_value(Some("")));
-            assert!(
-                !prefill_mix_seq_from_value(Some("true")),
-                "\"1\" 以外は無効 (既定 off を崩さない)"
-            );
+            assert!(!prefill_mix_seq_from_value(Some("0")), "0 で従来経路に戻る");
+            assert!(!prefill_mix_seq_from_value(Some("off")));
+            assert!(!prefill_mix_seq_from_value(Some("false")));
             assert_eq!(prefill_mix_seq_max_from_value(None), PREFILL_MIX_SEQ_MAX);
             assert_eq!(prefill_mix_seq_max_from_value(Some("32")), 32);
             assert_eq!(prefill_mix_seq_max_from_value(Some(" 16 ")), 16);
@@ -16296,6 +16307,8 @@ mod tests {
             let inject = GgufLinear::from_slice(GgmlType::Bf16, hc_dim, hc, &bf16(hc_dim, hc, 7))
                 .expect("hc_inj");
             let norm: Vec<f32> = (0..hc_dim).map(|i| 0.9 + ((i % 13) as f32) * 0.01).collect();
+            // batch 経路そのものを測る (task 126 のゲートは既定 on なので明示的に切る)。
+            set_prefill_mix_seq_for_test(Some(false));
             println!("hc_dim={hc_dim} low_rank={lr} (BF16 down/up/inject)");
             println!("nt\tbatch_ms\tper_tok_ms\tratio(batch/per)");
             for &nt in &[1usize, 4, 8, 16, 28, 32, 33, 64, 128, 256, 512] {
@@ -16409,6 +16422,7 @@ mod tests {
             }
             mix_kprof::reset();
             mix_kprof::set_for_test(false);
+            set_prefill_mix_seq_for_test(None);
         }
     }
 }
