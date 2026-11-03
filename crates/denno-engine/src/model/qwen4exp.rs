@@ -5873,6 +5873,15 @@ fn moe_ffn_quant_full_opts(
 // ---------------------------------------------------------------------------
 // task 124: shared expert の gate/up を router/expert の CPU 仕事と重ねる
 // ---------------------------------------------------------------------------
+//
+// 実測 (GPU ラボ t124a、swift15-abl IQ3_S 128 tok、14T、DENNO_MIX_GPU=1):
+// decode off 86 -> on 84 ms/tok (-2.9%)、md5 は全条件で SAME
+// (a:82ab0c06 / b:624e0d4d)、prefill 2.25 -> 2.25 s、errors 0。
+// RAYON_NUM_THREADS=13 では 83 ms/tok (-4.0% vs off の 14T)。
+// [q4prof] decode の shared は 826.7 -> 308.4 ms/128tok (gate/up が CPU 仕事の
+// 裏に隠れた)。router は 956.2 -> 1142.3 = +1.45 ms/tok になるが、これは
+// 積むときの発行コスト (~30 us/層) を router の区間が抱えるため (wall time は
+// 上の decode の差がすべて)。
 
 /// `DENNO_SHARED_OVERLAP` の生値 → 重ね打ちの on/off (純関数)。**既定 on**、
 /// `0` / `off` / `false` で従来の順序 (router → expert → shared) に戻る。
