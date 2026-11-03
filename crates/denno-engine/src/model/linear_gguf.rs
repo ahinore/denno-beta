@@ -88,15 +88,22 @@ pub(crate) fn set_cpu_gemv_par_for_test(v: Option<bool>) {
 
 /// task 69: `DENNO_ROUTER_GPU` の値の解釈 (純関数)。**既定 off**。
 ///
-/// ルータ (`ffn_gate_inp`, f32 512x2560) だけを GPU (`dno_matvec_f32`) で回す。
-/// このカーネルは 1 行 = 1 ブロックで `s = fadd_rn(s, fmul_rn(x[d], w[d]))` を
-/// d の昇順に繰り返す (PTX に `fma.rn` も `.ftz` も無い) ので、CPU 側の
-/// `acc += row[i] * x[i]` (i 昇順・積と加算を別々に丸める) と**ビット一致**する。
+/// ルータ (`ffn_gate_inp`, f32 512x2560) だけを GPU で回す。カーネルは task 127 で
+/// 逐次版 `dno_matvec_f32` から並列リダクション版 `dno_matvec_f32_r` が既定に
+/// なった (`cuda::router_use_reduce_kernel`・`DENNO_ROUTER_GPU_REDUCE=0` で
+/// 逐次版に戻る)。逐次版は 1 行 = 1 ブロック・block 1 で d 昇順の
+/// `s = fadd_rn(s, fmul_rn(x[d], w[d]))` (PTX に `fma.rn` も `.ftz` も無い) なので、
+/// CPU 側の `acc += row[i] * x[i]` (i 昇順・積と加算を別々に丸める) と**ビット一致**
+/// する。`_r` は warp shuffle の固定木で縮約するので丸め順が違い、ビット一致しない
+/// (決定論は保つ)。
 ///
-/// ただし main の実測 (2026-10-31 03:00 JST、v3 rows=8 の decode 118 tok、3 ラン平均) では
-/// **遅くなる**: off 121.7 ms/token (17.82/18.15/18.04 s) -> on 124.5 (18.18/18.35/18.39)。
-/// 1 token あたり 48 回の同期が支配的で、CPU 16.6 ms/token の削減分を食い潰す。
-/// 既定を on に戻すときは、まず同期を減らす (層をまたいでまとめる) こと。
+/// main の実測 (2026-10-31 03:00 JST、v3 rows=8 の decode 118 tok、3 ラン平均) では
+/// **遅くなった**: off 121.7 ms/token (17.82/18.15/18.04 s) -> on 124.5
+/// (18.18/18.35/18.39)。1 token あたり 48 回の同期が支配的で、CPU 16.6 ms/token の
+/// 削減分を食い潰す。**ただしそれは逐次版 (1 ブロック = 1 スレッド) の話**で、
+/// task 127 のラボ (2026-11-03、swift15-abl IQ3_S 128 tok、t127c) では `_r` にして
+/// router 7.3 -> 2.0 ms/tok、decode 87 -> 84 ms/tok (-4.0%・md5 SAME)。
+/// 既定 off は据え置き (production は env で on にする)。
 fn router_gpu_from_value(v: Option<&str>) -> bool {
     match v {
         Some(s) => matches!(
@@ -368,7 +375,10 @@ pub struct GgufLinear {
     /// 明示的に選んだモデルだけ速い経路に載せる)。
     fast_q8: bool,
     /// task 69: ルータ (`ffn_gate_inp`) だけ true。f32 重みを VRAM に常駐させ、
-    /// `dno_matvec_f32` で計算する (ビット一致・`DENNO_ROUTER_GPU` で on/off)。
+    /// GPU の f32 matvec で計算する (`DENNO_ROUTER_GPU` で on/off・既定 off)。
+    /// task 127 から既定カーネルは `dno_matvec_f32_r` (並列リダクション・丸め順が
+    /// 違う) で、`DENNO_ROUTER_GPU_REDUCE=0` のときだけ逐次版 `dno_matvec_f32`
+    /// (CPU とビット一致) に戻る。
     router_gpu: bool,
 }
 
@@ -766,9 +776,11 @@ impl GgufLinear {
                 let rb = row_bytes_any(self.ty, self.k)?;
                 let b = self.blocks.as_slice();
                 // task 69: ルータ (`ffn_gate_inp`, 512x2560 の F32) だけ GPU 経路。
-                // カーネルは `dno_matvec_f32` (1 行 = 1 ブロック・k 昇順の逐次加算・
-                // `mul.rn`+`add.rn` で FMA 無し) なので、下の CPU 参照
+                // 逐次版 `dno_matvec_f32` (1 行 = 1 ブロック・k 昇順の逐次加算・
+                // `mul.rn`+`add.rn` で FMA 無し) なら下の CPU 参照
                 // (`acc += row[i] * x[i]` を i 昇順) と丸め順が同じ = ビット一致。
+                // task 127 から既定は並列リダクション版 `dno_matvec_f32_r`
+                // (block 256・固定木縮約) で、こちらは丸め順が違う (決定論は保つ)。
                 // 不発 (GPU 無効・予算外・失敗) はすべて CPU 参照へ落ちる。
                 #[cfg(feature = "cuda")]
                 {

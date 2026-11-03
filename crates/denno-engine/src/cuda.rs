@@ -8238,6 +8238,49 @@ pub(crate) fn router_gpu_attempts_reset() {
     ROUTER_GPU_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// task 127: ルータ GPU のカーネル選択 (純関数・GPU 無しで検証可)。
+///
+/// ルータ (`ffn_gate_inp`) の実形は 2560 -> 512 の f32 GEMV で、**k >= n の長い行**。
+/// 逐次版 `dno_matvec_f32` は 1 ブロック = 1 行・`block=(1,1,1)` なので並列度が
+/// 行数 n=512 しかなく、1 スレッドが k=2560 を昇順に舐める。task 69 の却下
+/// (2026-10-31) はこの形のまま測っていた。`_r` は 1 ブロック = 1 行のまま
+/// block 256 で k をスレッド分割し、warp shuffle の固定木で縮約する
+/// (atomic 無し = 実行ごとに同一結果)。丸め順が変わるので CPU の逐次累積とは
+/// ビット一致しない ([`mix_use_reduce_kernel`] と同じ扱い・速度優先)。
+/// `has_r` は PTX に `_r` が無いとき false となり逐次版に落ちる (fail closed)。
+fn router_use_reduce_kernel(k: usize, n: usize, has_r: bool) -> bool {
+    has_r && n > 0 && k >= n
+}
+
+/// task 127: `DENNO_ROUTER_GPU_REDUCE` の解釈 (純関数)。**既定 on**、明示的な
+/// 偽値だけ off。
+///
+/// ルータ GPU 経路の中だけで効く (`DENNO_ROUTER_GPU` 自体が既定 off なので、
+/// 何も設定しないプロセスのモデル挙動は変わらない)。`DENNO_ROUTER_GPU=1` +
+/// `DENNO_ROUTER_GPU_REDUCE=0` で逐次版 (task 69 と同じ丸め) に戻せる。
+fn router_gpu_reduce_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// ルータ GPU 経路で `_r` を使ってよいか (`DENNO_ROUTER_GPU_REDUCE`、既定 on)。
+fn router_gpu_reduce_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        router_gpu_reduce_from_value(std::env::var("DENNO_ROUTER_GPU_REDUCE").ok().as_deref())
+    })
+}
+
+/// task 127: `_r` を選んだことをプロセスで 1 回だけログる (lab のログで分岐の
+/// 発火を確認するため。`router=` の数値だけでは逐次版との区別が付かない)。
+static ROUTER_GPU_REDUCE_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// task 69: ルータ用スクラッチ。lm_head の `Scratch` と分ける (形が違うので
 /// 同じ枠を使うと毎回作り直しになる)。x = [k] f32・out = [n] f32。
 struct RouterScratch {
@@ -8390,8 +8433,10 @@ pub fn unregister_f32_weights(uid: u64) {
 /// task 69: ルータ (f32・m=1) を GPU で計算して `out` に書く。
 ///
 /// `false` = 呼び出し側は CPU 参照で計算すること (GPU 無効・PTX 未収録・予算外・
-/// 実行時エラー)。数値は CPU 経路とビット一致するので、どちらに落ちても出力は
-/// 変わらない。
+/// 実行時エラー)。逐次版 `dno_matvec_f32` のときは CPU 経路とビット一致するので
+/// どちらに落ちても出力は変わらない。task 127 で既定は並列リダクション版
+/// `dno_matvec_f32_r` (丸め順が違う = ビット一致しない・決定論は保つ。
+/// `DENNO_ROUTER_GPU_REDUCE=0` で逐次版に戻る)。
 pub fn maybe_gpu_router_gemv_into(
     uid: u64,
     bytes: &[u8],
@@ -8424,10 +8469,17 @@ pub fn maybe_gpu_router_gemv_into(
         ROUTER_GPU_BROKEN.store(true, AO::Relaxed);
         return false;
     }
-    // カーネルハンドル (未収録 PTX は None をキャッシュ = ラッチしない)
-    let Some(f) = matvec_f32_fn(ctx) else {
+    // カーネルハンドル (未収録 PTX は None をキャッシュ = ラッチしない)。
+    // task 127: ルータは k=2560 >= n=512 の長い行なので、`_r` (1 ブロック = 1 行・
+    // block 256・固定木縮約) が選べるならそちらを使う。逐次版は 1 ブロック =
+    // 1 スレッドで並列度が行数 n しかない (task 69 の却下はこの形だった)。
+    // `_r` が未収録 / `DENNO_ROUTER_GPU_REDUCE=0` なら逐次版に落ちる (fail closed)。
+    let f_seq = matvec_f32_fn(ctx);
+    let f_red = matvec_f32_r_fn(ctx);
+    let use_reduce = router_gpu_reduce_enabled() && router_use_reduce_kernel(k, n, f_red.is_some());
+    if !use_reduce && f_seq.is_none() {
         return false;
-    };
+    }
     let prof = crate::model::devprof::on();
     let up_before = if prof {
         crate::gpu_budget::weight_upload_bytes()
@@ -8488,9 +8540,21 @@ pub fn maybe_gpu_router_gemv_into(
                 &mut kc as *mut _ as *mut c_void,
                 &mut nc as *mut _ as *mut c_void,
             ];
-            // 1 block = 1 行 (カーネルが block 内全スレッドで同一計算するため
-            // block=(1,1,1))。grid.x は 2^31-1 まで合法。
-            ctx.launch_async(f, (n as u32, 1, 1), (1, 1, 1), 0, &mut args)?;
+            // task 127: 長い行 (k >= n) は `_r` (1 ブロック = 1 行・block 256 で
+            // k を分割し warp shuffle の固定木で縮約・決定論)、それ以外と
+            // ゲート off は従来どおり逐次版 (カーネルが block 内全スレッドで
+            // 同一計算するため block=(1,1,1))。grid.x は 2^31-1 まで合法。
+            let (mv_fn, mv_thr): (CUfunction, u32) = if use_reduce {
+                (f_red.expect("use_reduce は has_r=true を要求する"), 256)
+            } else {
+                (f_seq.expect("use_reduce=false は逐次版のハンドルを要求する"), 1)
+            };
+            if use_reduce && !ROUTER_GPU_REDUCE_LOGGED.swap(true, AO::Relaxed) {
+                tracing::info!(
+                    "[router-gpu] dno_matvec_f32_r を使用 (block 256・k={k} n={n})"
+                );
+            }
+            ctx.launch_async(mv_fn, (n as u32, 1, 1), (mv_thr, 1, 1), 0, &mut args)?;
             check(
                 (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
                 "cuMemcpyDtoHAsync",
@@ -14227,6 +14291,11 @@ mod tests {
     /// した行を混ぜる — その行の積は 1e-39 前後の非正規化数になるので、もし
     /// カーネルが FTZ (flush-to-zero) で走っていれば和がちょうど 0 になって落ちる。
     /// 比較は `to_bits()` (`==` は -0.0 と 0.0 を区別しない)。
+    ///
+    /// task 127: ルータの既定カーネルは `dno_matvec_f32_r` (block 256 の固定木縮約)
+    /// になり、丸め順が CPU の逐次累積と違う。`_r` のときは許容判定 + 非正規化の
+    /// 行が 0 でないことだけを見る (`DENNO_ROUTER_GPU_REDUCE=0` なら従来どおり
+    /// ビット一致)。
     #[test]
     #[ignore] // GPU が必要: cargo test --release --features cuda -- --ignored
     fn cuda_f32_gemv_bit_exact_vs_cpu() {
@@ -14300,15 +14369,34 @@ mod tests {
             );
         }
 
-        // 4. 1 要素も違わない。
+        // 4. `_r` でなければ 1 要素も違わない。`_r` は丸め順が違うので許容判定
+        //    (非正規化の行は 0 でないことを別に見る = FTZ 検出を弱めない)。
+        let use_reduce = router_gpu_reduce_enabled() && router_use_reduce_kernel(k, n, true);
         for i in 0..n {
-            assert_eq!(
-                gpu[i].to_bits(),
-                cpu[i].to_bits(),
-                "行 {i} が bit 不一致 (gpu={} cpu={})",
-                gpu[i],
-                cpu[i]
-            );
+            if use_reduce {
+                let diff = (gpu[i] - cpu[i]).abs();
+                let tol = 1e-4 + 1e-5 * cpu[i].abs();
+                assert!(
+                    diff <= tol,
+                    "行 {i} が CPU と許容外 (gpu={} cpu={} diff={diff:e} tol={tol:e})",
+                    gpu[i],
+                    cpu[i]
+                );
+                if tiny_rows.contains(&i) {
+                    assert!(
+                        gpu[i] != 0.0,
+                        "行 {i} (非正規化) が 0 = `_r` が FTZ で走っている"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    gpu[i].to_bits(),
+                    cpu[i].to_bits(),
+                    "行 {i} が bit 不一致 (gpu={} cpu={})",
+                    gpu[i],
+                    cpu[i]
+                );
+            }
         }
 
         // 5. 決定論 (同一入力の 2 回目)。
@@ -14318,7 +14406,12 @@ mod tests {
             assert_eq!(gpu2[i].to_bits(), gpu[i].to_bits(), "行 {i} が非決定論的");
         }
         println!(
-            "cuda router f32 gemv k={k} n={n}: bit exact OK (非正規化の行 {} 本)",
+            "cuda router f32 gemv k={k} n={n}: {} OK (非正規化の行 {} 本)",
+            if use_reduce {
+                "reduce (`_r`) 許容内"
+            } else {
+                "bit exact"
+            },
             tiny_rows.len()
         );
     }
@@ -21934,6 +22027,50 @@ mod p59_dedup_tests {
         assert!(mix_use_reduce_kernel(1, 1, true));
         assert!(!mix_use_reduce_kernel(0, 5, true));
         assert!(!mix_use_reduce_kernel(5, 0, true));
+    }
+
+    // -----------------------------------------------------------------------
+    // task 127: ルータ GPU のカーネル選択 (逐次版 -> 並列リダクション版)
+    // -----------------------------------------------------------------------
+
+    /// task 127: ルータは k=2560 > n=512 の長い行なので常に `_r`。
+    /// PTX 未収録 (`has_r = false`) は逐次版に落ちる (fail closed)。
+    #[test]
+    fn router_kernel_selection_truth_table() {
+        // 実形 (`ffn_gate_inp` = 2560 -> 512)。
+        assert!(
+            router_use_reduce_kernel(2560, 512, true),
+            "ルータの実形は長い行 (k >= n) なので `_r` のはず"
+        );
+        assert!(
+            !router_use_reduce_kernel(2560, 512, false),
+            "PTX に `_r` が無いときは逐次版 (fail closed)"
+        );
+        // 境界: k == n は長い行 (>=)。1 行ずれた両側。
+        assert!(router_use_reduce_kernel(64, 64, true));
+        assert!(router_use_reduce_kernel(65, 64, true));
+        assert!(!router_use_reduce_kernel(64, 65, true));
+        // 縮退形 (呼び出し側の形状検査が先に弾く)。
+        assert!(!router_use_reduce_kernel(0, 5, true));
+        assert!(!router_use_reduce_kernel(5, 0, true));
+    }
+
+    /// task 127: `DENNO_ROUTER_GPU_REDUCE` の真理値表。既定 on、明示的な偽値だけ off。
+    #[test]
+    fn router_gpu_reduce_env_values() {
+        for v in [None, Some("1"), Some("on"), Some("TRUE"), Some(" on "), Some("")] {
+            assert!(router_gpu_reduce_from_value(v), "value={v:?} は on のはず");
+        }
+        for v in [
+            Some("0"),
+            Some("off"),
+            Some("false"),
+            Some("no"),
+            Some(" OFF "),
+            Some("False"),
+        ] {
+            assert!(!router_gpu_reduce_from_value(v), "value={v:?} は off のはず");
+        }
     }
 
     /// task 121: `dno_matvec_f32_r` の CPU ミラー (1 行)。blockDim=256 で k を
