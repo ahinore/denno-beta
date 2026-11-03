@@ -9,7 +9,9 @@
 //! このファイルは `#[cfg(test)]` のときだけコンパイルされる
 //! (serve_flash.rs から `#[cfg(test)] #[path] mod flash_synth;` で include)。
 
-use super::{model_reuse_enabled, Flash, GenReq, TEST_BUILD_COUNT};
+use super::{
+    model_reuse_enabled, Flash, GenReq, TEST_BUILD_COUNT, TEST_FAIL_STEP, TEST_LAST_REUSE,
+};
 use crate::flash_telemetry::Telemetry;
 use denno_engine::gguf::GgufFile;
 use denno_engine::tok_gguf::GgufTokenizer;
@@ -689,6 +691,211 @@ fn builds() -> usize {
     TEST_BUILD_COUNT.load(Ordering::Relaxed)
 }
 
+/// task 123: env (`DENNO_FLASH_MODEL_REUSE`) と `TEST_FAIL_STEP` を書き替える
+/// テストの直列化。`cargo test -p denno-cli` は既定で並列に走るので、env や
+/// 注入スイッチを触るテスト同士が重なると build 数の assert が割れる。
+static REUSE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// task 123: K 番目の差分で失敗する emit (それまでは成功)。クライアント切断
+/// (broken pipe) の代わり。失敗のエラーはそのまま呼び出し元へ返る。
+fn fail_at(k: usize) -> impl FnMut(&str) -> anyhow::Result<()> {
+    let mut n = 0usize;
+    move |_: &str| {
+        n += 1;
+        if n == k {
+            Err(anyhow::anyhow!("emit failed (test injection {k})"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// user 1 ターンのプロンプトトークン (テンプレート済み)。
+fn prompt_toks(flash: &Flash, content: &str) -> Vec<u32> {
+    flash
+        .tok
+        .encode_messages(None, &[("user".into(), content.into())], None, false)
+        .expect("encode_messages")
+}
+
+/// task 123 (a): emit 失敗 (クライアント切断) で decoder を cache に残す。
+///
+/// 合成モデルは "hi" を 6 トークンすべて 0x09 (tab) にし、各トークンが差分
+/// 1 個 ("\t") を出す (プローブで確認した決定列。eos には当たらない)。
+/// 通常経路は emit → step の順なので、K 番目の差分で失敗すると step は
+/// K-1 回しか走らない (失敗した差分のトークンは step されず、その後も
+/// 何も step しない = 余分な step は無い)。
+#[test]
+fn disconnect_caches_consistent_decoder() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+
+    // fail_at(1): 最初の差分で失敗 → step は 0 回。toks はプロンプトのまま。
+    let dir = TempDir::new("flash-disc-a1");
+    let mut flash = build_flash(&dir);
+    let plen = prompt_toks(&flash, "hi").len();
+    let b0 = builds();
+    let err = flash.generate(&gen_req("hi"), fail_at(1)).err().expect("generate が失敗するはず");
+    assert!(
+        err.to_string().contains("emit failed (test injection"),
+        "emit のエラーがそのまま返っていない: {err}"
+    );
+    assert_eq!(builds() - b0, 1, "最初のリクエストで build_model が 1 回");
+    let c = flash.cache.as_ref().expect("emit 失敗なのに cache が空");
+    assert_eq!(c.toks, c.dec.tokens(), "toks が decoder 状態と不一致");
+    assert_eq!(
+        c.toks.len(),
+        plen,
+        "失敗した差分のトークン以降が step されていないはず"
+    );
+    assert_eq!(&c.toks[..plen], &prompt_toks(&flash, "hi")[..], "プロンプト部が変わった");
+
+    // fail_at(3): 2 差分成功 → step 2 回で止まる (3 個目は step しない)。
+    let dir2 = TempDir::new("flash-disc-a2");
+    let mut flash2 = build_flash(&dir2);
+    let err2 = flash2.generate(&gen_req("hi"), fail_at(3)).err().expect("generate が失敗するはず");
+    assert!(err2.to_string().contains("emit failed (test injection"), "err={err2}");
+    let c2 = flash2.cache.as_ref().expect("emit 失敗なのに cache が空");
+    assert_eq!(c2.toks, c2.dec.tokens());
+    assert_eq!(
+        c2.toks.len(),
+        plen + 2,
+        "成功した 2 差分ぶんだけ step しているはず"
+    );
+    assert_eq!(&c2.toks[plen..], &[9u32, 9], "合成モデルの決定列 (tab 2 個)");
+}
+
+/// task 123 (b): 切断の次に前置きが違うリクエスト → reset 経路で
+/// `build_model` なし。出力は新規構築とバイト一致。
+#[test]
+fn disconnect_then_other_prompt_reuses_model_without_rebuild() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+
+    let dir = TempDir::new("flash-disc-b");
+    let mut flash = build_flash(&dir);
+    flash.generate(&gen_req("hi"), fail_at(2)).err().expect("generate が失敗するはず");
+    assert!(flash.cache.is_some(), "切断後に cache が空");
+
+    let b1 = builds();
+    let g2 = flash.generate(&gen_req("yo"), no_emit).expect("generate 2");
+    assert_eq!(
+        builds() - b1,
+        0,
+        "別プロンプトで build_model が走った (reset 再利用になっていない)"
+    );
+    assert!(g2.n_out > 0, "生成が空 (stop={})", g2.stop_reason);
+    assert_eq!(g2.text, "\t\t\t\t\t\t", "合成モデルの決定列 (tab 6 個)");
+
+    // 新規構築 (cache 無し) との比較。出力はバイト一致のはず。
+    let dir2 = TempDir::new("flash-disc-b2");
+    let mut fresh = build_flash(&dir2);
+    let b2 = builds();
+    let f2 = fresh.generate(&gen_req("yo"), no_emit).expect("fresh generate");
+    assert_eq!(builds() - b2, 1, "新規構築で build_model が 1 回走るはず");
+    assert_eq!(g2.text, f2.text, "reset 再利用の出力が新規構築と一致しない");
+}
+
+/// task 123 (c): 切断の次に保存した toks を延長するプロンプト → 前置き一致
+/// 経路で差分 prefill (reuse > 0)。出力は新規構築の full run と一致。
+///
+/// 継続リクエストは `continue: true` (最後の assistant メッセージを閉じずに
+/// プロンプト末尾へ生テキストで継ぐ)。byte-level 語彙 (merge 無し) なので
+/// decode → encode がトークン列で戻る (プローブで全 prefix を確認済み)。
+#[test]
+fn disconnect_then_extended_prompt_reuses_prefix() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+
+    let dir = TempDir::new("flash-disc-c");
+    let mut flash = build_flash(&dir);
+    flash.generate(&gen_req("hi"), fail_at(2)).err().expect("generate が失敗するはず");
+    let plen = prompt_toks(&flash, "hi").len();
+    let stored = flash.cache.as_ref().expect("cache").toks.clone();
+    assert_eq!(stored.len(), plen + 1, "プロンプト + 成功差分 1 (tab)");
+
+    // 保存した生成部を decode し、2 倍にして延長 (保存列 + 1 トークぶん長い)。
+    let part = flash.tok.decode(&stored[plen..]).expect("decode");
+    let req2 = GenReq::from_json(
+        &serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": format!("{part}{part}")}
+            ],
+            "continue": true,
+            "max_tokens": 6,
+            "temperature": 0.0,
+        }),
+        6,
+    )
+    .expect("GenReq");
+
+    let b1 = builds();
+    let g2 = flash.generate(&req2, no_emit).expect("generate 2");
+    assert_eq!(builds() - b1, 0, "延長リクエストで build_model が走った");
+    let reuse = TEST_LAST_REUSE.load(Ordering::Relaxed);
+    assert_eq!(
+        reuse,
+        stored.len(),
+        "保存した前置き全体が再利用されていない (reuse={reuse})"
+    );
+    assert!(g2.n_out > 0, "生成が空 (stop={})", g2.stop_reason);
+
+    // 新規構築 + full prefill との比較。
+    let dir2 = TempDir::new("flash-disc-c2");
+    let mut fresh = build_flash(&dir2);
+    let f2 = fresh.generate(&req2, no_emit).expect("fresh generate");
+    assert_eq!(g2.text, f2.text, "前置き再利用の出力が新規構築と一致しない");
+    assert!(f2.n_prompt > stored.len(), "延長リクエストのプロンプトが短い");
+}
+
+/// task 123 (d): engine 側の失敗 (step) は従来どおり cache を捨てて、
+/// 次のリクエストで組み直す。失敗の注入は cfg(test) の `TEST_FAIL_STEP`
+/// (本番コード経路には存在しない) で行う。
+#[test]
+fn engine_failure_drops_decoder_and_rebuilds() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+
+    let dir = TempDir::new("flash-disc-d");
+    let mut flash = build_flash(&dir);
+    TEST_FAIL_STEP.store(true, Ordering::Relaxed);
+    let err = flash.generate(&gen_req("hi"), no_emit).err().expect("generate が失敗するはず");
+    TEST_FAIL_STEP.store(false, Ordering::Relaxed);
+    assert!(err.to_string().contains("test: step 失敗を注入"), "err={err}");
+    assert!(flash.cache.is_none(), "engine 失敗なのに cache が残った");
+
+    // 次のリクエストは組み直す (cache が無いので build_model が走る)。
+    let b1 = builds();
+    let g2 = flash.generate(&gen_req("hi"), no_emit).expect("generate 2");
+    assert_eq!(
+        builds() - b1,
+        1,
+        "engine 失敗の次で build_model が走っていない"
+    );
+    assert!(g2.n_out > 0, "生成が空 (stop={})", g2.stop_reason);
+}
+
+/// task 123 (e): gate off (`DENNO_FLASH_MODEL_REUSE=0`) では切断しても
+/// cache を残さない (従来どおり次のリクエストで組み直す)。
+#[test]
+fn gate_off_disconnect_keeps_old_behaviour() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::set_var("DENNO_FLASH_MODEL_REUSE", "0");
+
+    let dir = TempDir::new("flash-disc-e");
+    let mut flash = build_flash(&dir);
+    let err = flash.generate(&gen_req("hi"), fail_at(2)).err().expect("generate が失敗するはず");
+    assert!(err.to_string().contains("emit failed (test injection"), "err={err}");
+    assert!(flash.cache.is_none(), "gate off で切断 cache が残った");
+
+    // 従来どおり次のリクエストで組み直す。
+    let b1 = builds();
+    flash.generate(&gen_req("yo"), no_emit).expect("generate 2");
+    assert_eq!(builds() - b1, 1, "gate off で build_model が走っていない");
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+}
+
 /// (e) `model_reuse_enabled` の真偽表。
 ///
 /// 既定は on (`true`)。「0」/「false」/「no」だけが off。未設定・空・その他の
@@ -732,6 +939,8 @@ fn model_reuse_truth_table() {
 /// tests/qwen4exp_decode.rs の reset_* テストが持つ)。
 #[test]
 fn flash_no_reuse_resets_decoder_without_rebuilding() {
+    // task 123: env を書き替えるので env を触る他のテストと直列化する。
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
     let dir = TempDir::new("flash-reuse");
     let mut flash = build_flash(&dir);
     std::env::remove_var("DENNO_FLASH_MODEL_REUSE");

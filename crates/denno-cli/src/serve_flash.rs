@@ -19,6 +19,12 @@
 //! (cache-miss 1 回あたり 266 本 / 3.4 秒の無駄)。reset は uid に触れないので
 //! 重みは常駐したまま、logits は新規構築とビット一致する。
 //! `DENNO_FLASH_MODEL_REUSE=0` で組み直しに戻す (既定は使い回す)。
+//!
+//! task 123: クライアント切断 (emit = HTTP 応答の差分書き出しの失敗、broken
+//! pipe など) のときも decoder を `self.cache` に残す。engine 側の失敗
+//! (prefill / forward step) のときは従来どおり捨てる。切断の直後のリクエストは
+//! 組み直さないので、GPU 重みの再 upload (266 本 / 約 3 秒) が避けられ、
+//! TTFT が 5.0 秒 → 通常の reuse=0 prefill と同じ (推定 2.3 秒) に戻る。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -102,6 +108,34 @@ fn model_reuse_enabled(v: Option<&str>) -> bool {
 /// `cfg(test)` なので本番ビルドには存在しない。数値経路には触れない。
 #[cfg(test)]
 static TEST_BUILD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// task 123: テスト専用の直近リクエストの再利用トークン数 (firing test 用)。
+/// `cfg(test)` なので本番ビルドには存在しない。数値経路には触れない。
+#[cfg(test)]
+static TEST_LAST_REUSE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// task 123: テスト専用の engine 側 step 失敗の注入スイッチ (firing test 用)。
+/// `cfg(test)` なので本番ビルドには存在しない。数値経路には触れない。
+#[cfg(test)]
+static TEST_FAIL_STEP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// task 123: 生成ループ中の失敗の種別。
+///
+/// - [`GenFail::Client`] — emit (HTTP 応答の差分書き出し) の失敗 = クライアント
+///   切断 (broken pipe など)。decoder は一貫している (emit は step の**前に**
+///   呼ばれるので、失敗した差分のトークンはまだ step していない。spec 経路は
+///   `spec_verify` が確定トークンを先に step するが、`tokens` と内部状態は
+///   常に一致する)。生成を即やめて `self.cache` に保存し、次のリクエストが
+///   使い回す / reset できるようにする。呼び出し元には今日どおり同じエラーを
+///   返す。
+/// - [`GenFail::Engine`] — prefill / forward step の失敗。半端に進んだ decoder
+///   は信用できない (`Qwen4ExpDecoder::step` は forward が途中で失敗すると
+///   `tokens` にそのトークンを残す) ので、今日どおり捨てて次のリクエストで
+///   組み直す。
+enum GenFail {
+    Client(anyhow::Error),
+    Engine(anyhow::Error),
+}
 
 impl GenReq {
     fn from_json(v: &Value, default_max: usize) -> Result<Self> {
@@ -351,14 +385,16 @@ fn greedy_u32(logits: &[f32]) -> Result<u32> {
 /// 従来の decode ループ内にあった処理をそのまま関数にしたもの
 /// (UTF-8 未完成の末尾保留・停止語の切り詰め・差分 emit)。戻り値は
 /// 「生成を続けるなら true」。停止語に当たった / emit が失敗したら false
-/// (emit の失敗は `failed` に入れる。リクエスト全体の失敗として最後に返す)。
+/// (emit の失敗は `failed` に [`GenFail::Client`] として入れる。クライアント
+/// 切断なので decoder は一貫したまま残る。リクエスト全体の失敗として
+/// 最後に返す)。
 fn emit_confirmed(
     tok: &GgufTokenizer,
     out: &mut Vec<u32>,
     text: &mut String,
     last_full: &mut Option<String>,
     stop_hit: &mut Option<String>,
-    failed: &mut Option<anyhow::Error>,
+    failed: &mut Option<GenFail>,
     stop_sequences: &[String],
     id: u32,
     emit: &mut dyn FnMut(&str) -> Result<()>,
@@ -385,7 +421,7 @@ fn emit_confirmed(
             let keep = &full[..c];
             if keep.len() > text.len() {
                 if let Err(e) = emit(&keep[text.len()..]) {
-                    *failed = Some(e);
+                    *failed = Some(GenFail::Client(e));
                 }
             }
             *text = keep.to_string();
@@ -395,7 +431,7 @@ fn emit_confirmed(
         }
         if emit_end > text.len() {
             if let Err(e) = emit(&full[text.len()..emit_end]) {
-                *failed = Some(e);
+                *failed = Some(GenFail::Client(e));
                 return false;
             }
         }
@@ -508,8 +544,11 @@ impl Flash {
                 // 266 本 / 3.42 秒)。reset は uid に触れないので重みは常駐した
                 // ままで、数値も新規構築とビット一致する (engine 側
                 // `reset_matches_fresh_decoder_bitexact`)。前のリクエストが
-                // 途中で失敗したときは cache が None のままなので、この経路は
-                // 通らず組み直す (半端に進んだ decoder を使い回さない)。
+                // engine 側の失敗 (prefill / step) で落ちたときは cache が
+                // None のままなので、この経路は通らず組み直す (半端に進んだ
+                // decoder を使い回さない)。クライアント切断 (emit 失敗) の
+                // ときは task 123 で cache が残るので、この reset 経路で
+                // 重みの再 upload なしに使い回す。
                 let t_model = prekprof::stamp();
                 let mut d = match other {
                     Some(c) if model_reuse => {
@@ -529,6 +568,9 @@ impl Flash {
             }
         };
         let t_prefill = t1.elapsed().as_secs_f64();
+        // task 123: テスト用の再利用トークン数の記録 (cfg(test) のみ)。
+        #[cfg(test)]
+        TEST_LAST_REUSE.store(reused, std::sync::atomic::Ordering::Relaxed);
 
         if t_on {
             self.telem.emit(Frame::SessionAdmit {
@@ -563,7 +605,7 @@ impl Flash {
         // ループを抜けたとき text へ反映するのに使う。
         let mut last_full: Option<String> = None;
         let mut stop_hit: Option<String> = None;
-        let mut failed: Option<anyhow::Error> = None;
+        let mut failed: Option<GenFail> = None;
         // P53: decode は 1 トークンあたり全層ぶん流す (act が有効なときだけ)。
         let mut act = if self.act_on() {
             Some(ActTap::new(&self.telem, false))
@@ -616,7 +658,7 @@ impl Flash {
                 let q0 = match greedy_u32(&logits) {
                     Ok(v) => v,
                     Err(e) => {
-                        failed = Some(e);
+                        failed = Some(GenFail::Engine(e));
                         break;
                     }
                 };
@@ -635,10 +677,15 @@ impl Flash {
                 let outcome = match dec.spec_verify(q0, &draft, eos) {
                     Ok(o) => o,
                     Err(e) => {
-                        failed = Some(e.into());
+                        failed = Some(GenFail::Engine(e.into()));
                         break;
                     }
                 };
+                // task 123: emit 失敗で抜けるときも logits を decoder 状態に
+                // 揃える (spec_verify は確定トークンを先に step するので、古い
+                // logits のままだと cache の logits と decoder がずれる)。
+                // 成功終端で代入していたのを前倒ししただけで、値は同じ。
+                logits = outcome.logits;
                 ngram.feed(dec.tokens());
                 spec_steps += 1;
                 spec_confirmed += outcome.confirmed.len();
@@ -703,7 +750,6 @@ impl Flash {
                 if outcome.eos {
                     break;
                 }
-                logits = outcome.logits;
                 continue;
             }
             // ---- 通常経路 (P108 までと同じ。emit の差分処理を helper 化) ----
@@ -733,6 +779,13 @@ impl Flash {
             }
             let t_step = t_on.then(Instant::now);
             let pos = dec.tokens().len() as u32;
+            // task 123: engine 側失敗の注入 (cfg(test) のみ。本番では存在しない)。
+            // emit 成功後・step 前に落として、cache が残らないことを確かめる。
+            #[cfg(test)]
+            if TEST_FAIL_STEP.load(std::sync::atomic::Ordering::Relaxed) {
+                failed = Some(GenFail::Engine(anyhow::anyhow!("test: step 失敗を注入")));
+                break;
+            }
             let stepped = match act.as_mut() {
                 Some(tap) => dec.step_tapped(id, |o| tap.on_layer(o)),
                 None => dec.step(id),
@@ -740,7 +793,7 @@ impl Flash {
             match stepped {
                 Ok(lg) => logits = lg,
                 Err(e) => {
-                    failed = Some(e.into());
+                    failed = Some(GenFail::Engine(e.into()));
                     break;
                 }
             }
@@ -826,7 +879,26 @@ impl Flash {
                 output_tokens: out.len() as u32,
             });
         }
-        if let Some(e) = failed {
+        // task 123: 失敗の種別で後始末を分ける。
+        // - Client (emit 断線): decoder は完了した step まで一貫している
+        //   (通常経路は emit → step の順なので、失敗した差分のトークンはまだ
+        //   step していない。spec 経路は spec_verify が確定トークンを先に
+        //   step するが、tokens と内部状態は一致している) ので cache に保存
+        //   する。次のリクエストが前置きを延長していれば差分 prefill で
+        //   使い回し、一致しなければ reset する (どちらも build_model は
+        //   走らない)。gate (`DENNO_FLASH_MODEL_REUSE=0`) off のときは従来
+        //   どおり捨てる (gate off は前置き一致経路も使わない、という今日の
+        //   挙動を保つ)。
+        // - Engine: 半端に進んだ decoder は信用しない。従来どおり捨てる
+        //   (cache は None のまま = 次のリクエストで組み直す)。
+        if let Some(GenFail::Client(e)) = failed {
+            if model_reuse {
+                let toks = dec.tokens().to_vec();
+                self.cache = Some(Cached { dec, toks, logits });
+            }
+            return Err(e);
+        }
+        if let Some(GenFail::Engine(e)) = failed {
             return Err(e);
         }
         // 保留していた末尾 (文字が完成しないまま終わった FFFD を含む) を最終本文へ反映。
