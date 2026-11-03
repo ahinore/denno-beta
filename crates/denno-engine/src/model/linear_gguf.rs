@@ -323,6 +323,16 @@ fn gemv_rows_par(ty: GgmlType, blocks: &[u8], rb: usize, k: usize, x: &[f32], ou
                 debug_assert_eq!(x.len(), k, "gemv_rows_par: x.len() は k");
                 #[cfg(test)]
                 F32_DIRECT_ROWS.fetch_add(oo.len(), std::sync::atomic::Ordering::Relaxed);
+                // task 119b: F32 (ルータ `ffn_gate_inp` 2560->512 の実型) の decode
+                // 経路は**ここ**を通る (`DENNO_CPU_GEMV_PAR` が既定 on で、旧 task 119
+                // の intercept が置かれていた下の feature="par" 分岐には届かなかった)。
+                // AVX2+FMA の行カーネルへ (classic の逐次 dot とは丸め順が違うので
+                // ビット一致しない。`DENNO_F32_EXACT=1` / AVX2+FMA 無しは下の
+                // classic のまま)。チャンク (bb, oo) は行境界で切られているので
+                // `gemv_f32_router` の長さ契約 (bb.len() >= oo.len() * k * 4) を満たす。
+                if crate::model::moe_expert::gemv_f32_router(bb, k, oo, x) {
+                    return;
+                }
                 for (r, slot) in oo.iter_mut().enumerate() {
                     let wb = &bb[r * rb..(r + 1) * rb];
                     let mut acc = 0f32;
@@ -835,6 +845,16 @@ impl GgufLinear {
                     let bytes = rows * rb;
                     b.par_chunks(bytes).zip(out.par_chunks_mut(rows)).for_each(
                         |(bb, oo)| {
+                            // task 119: F32 (ルータ `ffn_gate_inp` の実型) は AVX2+FMA の
+                            // 行カーネルへ (classic の逐次 dot とは丸め順が違う。
+                            // `DENNO_F32_EXACT=1` / AVX2+FMA 無しは下の classic のまま)。
+                            // BF16 は上で融合カーネルに intercept されるのでここには
+                            // 来ない。F16 は classic のまま。
+                            if self.ty == GgmlType::F32
+                                && crate::model::moe_expert::gemv_f32_router(bb, self.k, oo, x)
+                            {
+                                return;
+                            }
                             let mut row = vec![0f32; self.k];
                             for (r, slot) in oo.iter_mut().enumerate() {
                                 dequant_row_into(self.ty, &bb[r * rb..(r + 1) * rb], &mut row);
@@ -1515,8 +1535,14 @@ mod tests {
     /// 実形状 4 本で旧経路と新経路がビット一致し、期待どおりの側に落ちること。
     #[test]
     fn cpu_gemv_par_bitwise_on_real_shapes() {
+        use crate::model::moe_expert::set_f32_exact_for_test;
         let _g = par_test_lock();
         let _p = ParGuard::new();
+        // task 119b: 既定の F32 経路は FMA カーネル (classic と非ビット一致) に
+        // なったので、このテストの「分割の有無でビット一致」の契約は exact を
+        // 強制して見る (期待値は変えない。FMA 経路の契約は
+        // `f32_router_fma_matches_classic_within_tolerance` が見る)。
+        set_f32_exact_for_test(Some(true));
         // (k, n, seed, 名前, 並列化されるか)
         let cases = [
             (2560usize, 512usize, 11u32, "router (ffn_gate_inp)", true),
@@ -1570,6 +1596,7 @@ mod tests {
                 assert_eq!(new[r].to_bits(), want[r].to_bits(), "{name}: 参照と違う 行 {r}");
             }
         }
+        set_f32_exact_for_test(None);
     }
 
     /// 1 行だけの形は並列化しない側に落ち、値は逐次と一致する。
@@ -2027,9 +2054,14 @@ mod tests {
     /// とビット一致するはず。env 掃引の前にここで固定する。
     #[test]
     fn bf16_chunk_override_bit_matches_auto() {
-        use crate::model::moe_expert::{set_bf16_chunk_for_test, set_bf16_fast_for_test};
+        use crate::model::moe_expert::{
+            set_bf16_chunk_for_test, set_bf16_exact_for_test, set_bf16_fast_for_test,
+        };
         use crate::model::qwen4exp::HC_DOWN_ROW_PAR_MIN;
         let _g = par_test_lock();
+        // task 119: 既定の BF16 カーネルが FMA (classic と非ビット一致) になったので、
+        // classic とのビット一致の契約は exact を強制して見る (期待値は変えない)。
+        set_bf16_exact_for_test(Some(true));
         for (k, n, min, name) in [
             (10240usize, 320usize, HC_DOWN_ROW_PAR_MIN, "hc_down 10240->320"),
             (320usize, 10240usize, 0usize, "hc_up 320->10240"),
@@ -2071,6 +2103,7 @@ mod tests {
                 );
             }
         }
+        set_bf16_exact_for_test(None);
     }
 
     /// task 107: BF16 融合カーネルの行グループ幅 (`DENNO_BF16_GROUP`) と
@@ -2087,12 +2120,17 @@ mod tests {
     /// 発火させると [`crate::model::moe_expert::ROW_PAR_REGIONS`] (global) が
     /// 増え、同じカウンタの差分を見る並行テスト
     /// (`expert_loop_one_region_per_layer` 等) の邪魔になるため。
-    /// classic 参照も global フラグ (`BF16_FAST_OVERRIDE`) を立てず、
-    /// dequant + 逐次内積を直に計算する (並行テストの経路を変えない)。
+    /// classic 参照は dequant + 逐次内積を直に計算する (並行テストの経路を
+    /// 変えない)。task 119 から既定の融合カーネルが FMA (classic と非ビット一致)
+    /// になったため、classic との一致の契約は exact を強制して見る
+    /// (`BF16_EXACT_OVERRIDE` を立てる。テスト終わりに戻す)。
     #[test]
     fn bf16_group_pf_bit_matches_classic() {
-        use crate::model::moe_expert::{set_bf16_group_for_test, set_bf16_pf_for_test};
+        use crate::model::moe_expert::{
+            set_bf16_exact_for_test, set_bf16_group_for_test, set_bf16_pf_for_test,
+        };
         let _g = par_test_lock();
+        set_bf16_exact_for_test(Some(true));
         let n_max = usize::MAX;
         for (k, n, name) in [
             (10240usize, 320usize, "hc_down 10240->320"),
@@ -2135,6 +2173,240 @@ mod tests {
                     );
                 }
             }
+        }
+        set_bf16_exact_for_test(None);
+    }
+
+    /// task 119: ルータ (F32) の FMA 行カーネル。classic (逐次加算) とはビット
+    /// 一致しないが「絶対 1e-4 + 相対 1e-5」以内で、f64 真値誤差は classic 以下
+    /// + 余裕 (task 117 の gemv テストと同じ立て方)。発火は `F32_FMA_CALLS`、
+    /// `DENNO_F32_EXACT=1` 相当では発火しない。ルータ実形 (512 行 x 2560 列) と
+    /// par ブランチの下限 (64 行 x 256 列) を見る。
+    #[test]
+    #[cfg(feature = "par")]
+    fn f32_router_fma_matches_classic_within_tolerance() {
+        use crate::model::moe_expert::{set_f32_exact_for_test, F32_FMA_CALLS};
+        let _g = par_test_lock();
+        for (name, k, n) in [("ルータ実形", 2560usize, 512usize), ("par 下限", 256, 64)] {
+            let w = make_matrix(GgmlType::F32, k, n, 5);
+            let lin = GgufLinear::from_slice(GgmlType::F32, k, n, &w).expect("GgufLinear");
+            let x = make_x(k, 9);
+            // FMA (既定)。入口は decode 経路と同じ `gemv_label("gate_inp", ...)`
+            // (`moe_ffn_quant_impl` の `lw.gate_inp.gemv_label`)。
+            let mut fma = vec![0f32; n];
+            let before = F32_FMA_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            lin.gemv_label("gate_inp", &x, &mut fma).expect("gemv_label (FMA)");
+            assert!(
+                F32_FMA_CALLS.load(std::sync::atomic::Ordering::Relaxed) > before,
+                "{name}: F32 FMA カーネルが発火していない"
+            );
+            assert!(fma.iter().any(|v| *v != 0.0), "{name}: 出力が全 0");
+            // classic (DENNO_F32_EXACT=1 相当)。発火しないことも見る。
+            set_f32_exact_for_test(Some(true));
+            let before2 = F32_FMA_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let mut classic = vec![0f32; n];
+            lin.gemv(&x, &mut classic).expect("gemv (classic)");
+            set_f32_exact_for_test(Some(false));
+            assert_eq!(
+                F32_FMA_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+                before2,
+                "{name}: exact で FMA カーネルが発火した"
+            );
+            // f64 真値 + 許容差。
+            let rb = k * 4;
+            let (mut d_fc, mut d_ft, mut d_ct) = (0.0f32, 0.0f32, 0.0f32);
+            for r in 0..n {
+                let row = &w[r * rb..(r + 1) * rb];
+                let mut acc = 0.0f64;
+                for i in 0..k {
+                    let wf = f32::from_le_bytes([
+                        row[i * 4],
+                        row[i * 4 + 1],
+                        row[i * 4 + 2],
+                        row[i * 4 + 3],
+                    ]);
+                    acc += wf as f64 * x[i] as f64;
+                }
+                let truth = acc as f32;
+                let diff = (fma[r] - classic[r]).abs();
+                d_fc = d_fc.max(diff);
+                d_ft = d_ft.max((fma[r] - truth).abs());
+                d_ct = d_ct.max((classic[r] - truth).abs());
+                let tol = 1e-4 + 1e-5 * classic[r].abs();
+                assert!(
+                    diff <= tol,
+                    "{name} 行 {r}: FMA {} と classic {} の差 {diff} が許容 {tol} を超える",
+                    fma[r],
+                    classic[r]
+                );
+            }
+            assert!(
+                d_ft <= d_ct + 1e-4,
+                "{name}: FMA の f64 真値誤差 {d_ft:.3e} が classic の {d_ct:.3e} を大きく超えた"
+            );
+            eprintln!(
+                "F32 router {name} {n}x{k}: FMAvsClassic {d_fc:.3e} / f64真値差 FMA {d_ft:.3e} classic {d_ct:.3e}"
+            );
+        }
+        set_f32_exact_for_test(None);
+    }
+
+    /// task 119: BF16 FMA カーネルのマイクロベンチ (実形 2 形)。
+    ///
+    /// up 実形 (2560 行 x 640 列) と down 実形 (640 行 x 2560 列 — 同バイト数で
+    /// 行長が逆) で、hot (同じ行列の再読み = L2/L3 条件) と cold (16 行列を轮回 =
+    /// DRAM 条件)、exact (逐次加算) vs FMA、累積器数 (`DENNO_BF16_ACC`) /
+    /// グループ幅 (`DENNO_BF16_GROUP`) / プリフェッチ (`DENNO_BF16_PF`) の掃引、
+    /// 1T / 8T / 16T を交互に回して最小値を取る (共有ホストのラン間ドリフトを
+    /// 消す)。数値はこの共有コンテナでの**相対比較用** (実機の絶対値はメイン
+    /// セッションの計測)。GB/s は重みの読み量基準。
+    ///
+    /// `cargo test --release -p denno-engine --lib --features cuda -- --ignored --nocapture bench_bf16_fma`
+    #[test]
+    #[ignore = "実形状の CPU マイクロベンチ (手動)"]
+    fn bench_bf16_fma() {
+        use crate::model::moe_expert::{
+            expert_gemv_bf16, set_bf16_acc_for_test, set_bf16_exact_for_test,
+            set_bf16_group_for_test, set_bf16_pf_for_test, set_f32_exact_for_test,
+        };
+        let _g = par_test_lock();
+        let bf16_bytes = |k: usize, n: usize, seed: u32| -> Vec<u8> {
+            let mut b = vec![0u8; k * n * 2];
+            for (i, w) in b.chunks_exact_mut(2).enumerate() {
+                let v = (((i.wrapping_mul(2654435761) ^ seed as usize) % 19) as f32 - 9.0) * 0.12;
+                let bits = (v.to_bits() >> 16) as u16;
+                w.copy_from_slice(&bits.to_le_bytes());
+            }
+            b
+        };
+        let mk = |k: usize, n: usize, seed: u32| {
+            GgufLinear::from_slice(GgmlType::Bf16, k, n, &bf16_bytes(k, n, seed))
+                .expect("GgufLinear::from_slice (Bf16)")
+        };
+        // (名前, exact, group, pf, acc)。group/pf/acc は FMA 側の掃引
+        // (exact は従来カーネルの参照。group/pf/acc は無視される)。
+        let variants: [(&str, bool, Option<usize>, Option<usize>, Option<usize>); 10] = [
+            ("exact (G4 pf8)", true, Some(4), Some(8), None),
+            ("fma G4 A1 pf0", false, Some(4), Some(0), Some(1)),
+            ("fma G4 A1 pf8", false, Some(4), Some(8), Some(1)),
+            ("fma G4 A2 pf0", false, Some(4), Some(0), Some(2)),
+            ("fma G4 A2 pf8", false, Some(4), Some(8), Some(2)),
+            ("fma G4 A4 pf0", false, Some(4), Some(0), Some(4)),
+            ("fma G2 A2 pf0", false, Some(2), Some(0), Some(2)),
+            ("fma G2 A4 pf0", false, Some(2), Some(0), Some(4)),
+            ("fma G8 A1 pf0", false, Some(8), Some(0), Some(1)),
+            ("fma G1 A4 pf0", false, Some(1), Some(0), Some(4)),
+        ];
+        let reps = 8usize;
+        let mats_cold = 16usize;
+        for (shape, k, n) in [("up 2560x640", 640usize, 2560usize), ("down 640x2560", 2560, 640)] {
+            let hot = mk(k, n, 7);
+            let cold: Vec<GgufLinear> =
+                (0..mats_cold).map(|m| mk(k, n, (m as u32 + 1) * 37)).collect();
+            let x = make_x(k, 13);
+            let bytes = (k * n * 2) as f64;
+            println!("\n=== {shape} (reps={reps}, cold mats={mats_cold}) ===");
+            for th in [1usize, 8, 16] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(th)
+                    .build()
+                    .expect("thread pool");
+                for (tname, mats) in [("hot", 1usize), ("cold", mats_cold)] {
+                    // ウォームアップ (プール / ページ)。
+                    pool.install(|| {
+                        let mut warm = vec![0f32; n];
+                        expert_gemv_bf16(hot.blocks().as_slice(), k, n, &x, &mut warm)
+                            .expect("warm");
+                    });
+                    let mut best = vec![f64::INFINITY; variants.len()];
+                    for rep in 0..reps {
+                        for vi in 0..variants.len() {
+                            let vj = (vi + rep) % variants.len();
+                            let (_, exact, group, pf, acc) = variants[vj];
+                            set_bf16_exact_for_test(Some(exact));
+                            set_bf16_group_for_test(group);
+                            set_bf16_pf_for_test(pf);
+                            set_bf16_acc_for_test(acc);
+                            let t = std::time::Instant::now();
+                            pool.install(|| {
+                                if mats == 1 {
+                                    // hot: 同じ行列の再読み (L2/L3 条件)。
+                                    let mut out = vec![0f32; n];
+                                    expert_gemv_bf16(hot.blocks().as_slice(), k, n, &x, &mut out)
+                                        .expect("hot");
+                                    std::hint::black_box(&out);
+                                } else {
+                                    // cold: 独立な行列を轮回 (DRAM 条件)。
+                                    for c in &cold {
+                                        let mut out = vec![0f32; n];
+                                        expert_gemv_bf16(
+                                            c.blocks().as_slice(),
+                                            k,
+                                            n,
+                                            &x,
+                                            &mut out,
+                                        )
+                                        .expect("cold");
+                                        std::hint::black_box(&out);
+                                    }
+                                }
+                            });
+                            set_bf16_exact_for_test(None);
+                            set_bf16_group_for_test(None);
+                            set_bf16_pf_for_test(None);
+                            set_bf16_acc_for_test(None);
+                            // cold は mats 本ぶんの和なので 1 呼び出しに割り戻す。
+                            let per_call =
+                                t.elapsed().as_secs_f64() * 1e3 / mats as f64;
+                            best[vj] = best[vj].min(per_call);
+                        }
+                    }
+                    for (i, (name, ..)) in variants.iter().enumerate() {
+                        println!(
+                            "  {th:2}T {tname:<4} {:<14} best={:8.4} ms/call ({:6.1} GB/s)",
+                            name,
+                            best[i],
+                            bytes / (best[i] * 1e-3) / 1e9
+                        );
+                    }
+                }
+            }
+        }
+        // 参考: ルータ (F32) の classic vs FMA (実形 512 行 x 2560 列)。
+        let w32 = make_matrix(GgmlType::F32, 2560, 512, 5);
+        let lin32 = GgufLinear::from_slice(GgmlType::F32, 2560, 512, &w32).expect("GgufLinear");
+        let x32 = make_x(2560, 9);
+        let bytes32 = (2560 * 512 * 4) as f64;
+        println!("\n=== router F32 512x2560 (参考, gemv 経路) ===");
+        for th in [1usize, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(th)
+                .build()
+                .expect("thread pool");
+            let mut best = [f64::INFINITY; 2];
+            for rep in 0..reps {
+                for vi in 0..2usize {
+                    set_f32_exact_for_test(Some(vi == 0));
+                    let t = std::time::Instant::now();
+                    pool.install(|| {
+                        let mut out = vec![0f32; 512];
+                        lin32.gemv(&x32, &mut out).expect("router gemv");
+                        std::hint::black_box(&out);
+                    });
+                    best[vi] = best[vi].min(t.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            set_f32_exact_for_test(None);
+            println!(
+                "  {th:2}T classic        best={:8.4} ms ({:6.1} GB/s)",
+                best[0],
+                bytes32 / (best[0] * 1e-3) / 1e9
+            );
+            println!(
+                "  {th:2}T fma (G2 A2)   best={:8.4} ms ({:6.1} GB/s)",
+                best[1],
+                bytes32 / (best[1] * 1e-3) / 1e9
+            );
         }
     }
 

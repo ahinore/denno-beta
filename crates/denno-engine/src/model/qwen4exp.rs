@@ -11992,7 +11992,12 @@ mod tests {
             // プロセス共通の ROW_PAR_REGIONS を before/after 差分で数えるテスト
             // (expert_loop_one_region_per_layer 等、moe_test_guard を取る) と
             // 同じロックで直列化する。
+            use crate::model::moe_expert::set_bf16_exact_for_test;
             let _g = moe_test_guard();
+            // task 119: 既定が FMA (逐次参照と非ビット一致) になったので、このテストは
+            // exact を強制して従来カーネル (GPU カーネル dno_matvec_f32 と同じ逐次列)
+            // との一致を見る (期待値は変えない)。
+            set_bf16_exact_for_test(Some(true));
             let cases: [(&str, usize, usize, u32, usize); 4] = [
                 ("hc_down 実形", 10240, 320, 3, HC_DOWN_ROW_PAR_MIN),
                 ("hc_up 実形", 320, 10240, 5, 0),
@@ -12012,6 +12017,7 @@ mod tests {
                     .expect("BF16 GEMV (2row 実経路)");
                 assert_bitwise_eq(&out, &want, &format!("{label} (k={k}, n={n})"));
             }
+            set_bf16_exact_for_test(None);
         }
 
         /// P84: 2 行同時カーネル ([`hc_mix_quant_fast`] の既定経路) が classic
@@ -12658,7 +12664,9 @@ mod tests {
         /// 適用できない (REPORT の判定を参照)。
         #[test]
         fn hc_mix_bf16_inject_takes_fused_kernel_bitexact() {
-            use crate::model::moe_expert::{set_bf16_fast_for_test, BF16_FUSED_CALLS};
+            use crate::model::moe_expert::{
+                set_bf16_exact_for_test, set_bf16_fast_for_test, BF16_FUSED_CALLS,
+            };
             let hc = 4usize;
             let e = 2560usize;
             let lr = 320usize;
@@ -12682,6 +12690,9 @@ mod tests {
                 n_embd: e,
             };
             let fused = || BF16_FUSED_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            // task 119: 既定が FMA (classic と非ビット一致) になったので、融合 vs
+            // classic のビット一致の契約は exact を強制して見る (期待値は変えない)。
+            set_bf16_exact_for_test(Some(true));
 
             // 融合 on (既定): inject の GEMV 1 発だけ融合カウンタが増える。
             set_bf16_fast_for_test(Some(true));
@@ -12705,6 +12716,86 @@ mod tests {
                 i_fast.iter().any(|v| *v != 0.0),
                 "inject が全 0 (経路の生死が分からない)"
             );
+            set_bf16_exact_for_test(None);
+        }
+
+        /// task 119: 既定 (FMA) の decode mix 経路が BF16 融合カーネルの FMA 版を
+        /// 通ること、と exact (DENNO_BF16_EXACT=1 相当) で通らなくなること。
+        ///
+        /// 実形の BF16 down/up/inject で `hc_mix_quant` を 1 回回し、`BF16_FMA_CALLS`
+        /// の差分で見る (緑 = 通った、ではないので counter を見る。down + up +
+        /// inject の融合入口 3 呼び出し以上)。exact を強すると FMA カウンタは増えず、
+        /// 融合入口のカウンタ (`BF16_FUSED_CALLS`) は増える = 逐次加算カーネルのまま。
+        /// mixed / inject の値差は「絶対 1e-4 + 相対 1e-5」以内 (FMA は classic と
+        /// ビット一致しない。moe_expert.rs の `bf16_tests` と同じ契約)。
+        #[test]
+        fn hc_mix_bf16_fma_fires_and_exact_gate_restores_sequential() {
+            use crate::model::moe_expert::{
+                set_bf16_exact_for_test, BF16_FMA_CALLS, BF16_FUSED_CALLS,
+            };
+            use std::sync::atomic::Ordering::Relaxed;
+            let hc = 4usize;
+            let e = 2560usize;
+            let lr = 320usize;
+            let hp = HyperParams { hc, n_embd: e, low_rank: lr, eps: 1e-6 };
+            let hc_dim = hc * e;
+            let norm: Vec<f32> = (0..hc_dim).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect();
+            let down =
+                GgufLinear::from_slice(GgmlType::Bf16, hc_dim, lr, &bf16_weights(hc_dim, lr, 3))
+                    .expect("GgufLinear::from_slice (BF16 down)");
+            let up =
+                GgufLinear::from_slice(GgmlType::Bf16, lr, hc_dim, &bf16_weights(lr, hc_dim, 5))
+                    .expect("GgufLinear::from_slice (BF16 up)");
+            let inject =
+                GgufLinear::from_slice(GgmlType::Bf16, hc_dim, hc, &bf16_weights(hc_dim, hc, 7))
+                    .expect("GgufLinear::from_slice (BF16 inject)");
+            let res = HyperStreams {
+                data: (0..hc_dim)
+                    .map(|i| (((i * 11) % 17) as f32 - 8.0) * 0.05)
+                    .collect(),
+                hc,
+                n_embd: e,
+            };
+
+            // FMA (既定相当を明示)。
+            set_bf16_exact_for_test(Some(false));
+            let fma0 = BF16_FMA_CALLS.load(Relaxed);
+            let (m_fma, i_fma) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("fast");
+            let fma_calls = BF16_FMA_CALLS.load(Relaxed) - fma0;
+            assert!(
+                fma_calls >= 3,
+                "FMA カーネルが mix 経路で発火していない (BF16_FMA_CALLS 増分 {fma_calls})"
+            );
+
+            // exact (DENNO_BF16_EXACT=1 相当): FMA カウンタは増えない。
+            set_bf16_exact_for_test(Some(true));
+            let fma1 = BF16_FMA_CALLS.load(Relaxed);
+            let fused0 = BF16_FUSED_CALLS.load(Relaxed);
+            let (m_ex, i_ex) =
+                hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp).expect("exact");
+            assert_eq!(
+                BF16_FMA_CALLS.load(Relaxed),
+                fma1,
+                "exact で FMA カーネルが発火した"
+            );
+            assert!(
+                BF16_FUSED_CALLS.load(Relaxed) > fused0,
+                "exact で融合入口を通っていない"
+            );
+            set_bf16_exact_for_test(None);
+
+            // 許容差 (mixed / inject の両方)。絶対 1e-4 + 相対 1e-5。
+            for (tag, a, b) in [("mixed", &m_fma, &m_ex), ("inject", &i_fma, &i_ex)] {
+                for (r, (fa, ex)) in a.iter().zip(b.iter()).enumerate() {
+                    let tol = 1e-4 + 1e-5 * ex.abs();
+                    assert!(
+                        (fa - ex).abs() <= tol,
+                        "{tag} 行 {r}: FMA {fa} と exact {ex} の差が許容 {tol} を超える"
+                    );
+                }
+                assert!(a.iter().any(|v| *v != 0.0), "{tag} が全 0");
+            }
         }
 
         /// task 91: BF16 実形の GEMV が、入口 (`gemv` / `gemv_label_par_2row` (two_row)
@@ -12716,6 +12807,10 @@ mod tests {
         /// 明示版は down と同じ門番 64 を使う (up は two_row で既定門番 512 を通る)。
         #[test]
         fn hc_bf16_gemv_real_shape_bitexact_across_paths() {
+            use crate::model::moe_expert::set_bf16_exact_for_test;
+            // task 119: 既定が FMA (逐次参照 bf16_gemv_seq と非ビット一致) になったので、
+            // このテストは exact を強制して従来カーネルで見る (期待値は変えない)。
+            set_bf16_exact_for_test(Some(true));
             for (name, k, n, min) in [
                 ("down 実形", 10240usize, 320usize, HC_DOWN_ROW_PAR_MIN),
                 ("up 実形", 320usize, 10240usize, 0usize),
@@ -12762,6 +12857,7 @@ mod tests {
                 assert_bitwise_eq(&run(1), &want, &format!("BF16 {name}: 1 スレッド"));
                 assert_bitwise_eq(&run(8), &want, &format!("BF16 {name}: 8 スレッド"));
             }
+            set_bf16_exact_for_test(None);
         }
 
         /// P86: 実機で起きていたこと (GPU GEMV が hc mix の down / up を奪い、
@@ -13168,8 +13264,13 @@ mod tests {
         /// トークン 7 本・行 2 行・列 2 列があまる) の両方で確かめる。
         #[test]
         fn gemv_batch_f32_blocked_matches_gemv() {
+            use crate::model::moe_expert::set_f32_exact_for_test;
             gpu_gemm_off();
             let _g = moe_test_guard();
+            // task 119: 参照の `gemv` (decode) は既定で FMA カーネルに変わるので、
+            // トークンブロック経路 (prefill、スカラー) とのビット一致の契約は
+            // exact を強制して見る (期待値は変えない)。
+            set_f32_exact_for_test(Some(true));
             for (k, n, nt) in [(2560usize, 512usize, 512usize), (2570, 6, 71)] {
                 let mut bytes = vec![0u8; n * k * 4];
                 for i in 0..n * k {
@@ -14390,6 +14491,11 @@ mod tests {
             let _g = moe_test_guard();
             let _l = lg::par_test_lock();
             moe_expert::set_vnni_for_test(Some(false));
+            // task 119b: 既定の F32 経路は FMA カーネル (classic と非ビット一致) に
+            // なったので、off/on のビット一致の契約は exact を強制して見る (期待値は
+            // 変えない。FMA 経路の契約は linear_gguf の
+            // f32_router_fma_matches_classic_within_tolerance が見る)。
+            moe_expert::set_f32_exact_for_test(Some(true));
             let dir = TempDir::new("cpu_gemv_par_e2e");
             let path = build(&dir);
             let f = GgufFile::open(&path).expect("open");
@@ -14411,6 +14517,7 @@ mod tests {
             lg::set_cpu_gemv_par_for_test(None);
             lg::set_par_min_rows_for_test(None);
             moe_expert::set_vnni_for_test(None);
+            moe_expert::set_f32_exact_for_test(None);
 
             assert_eq!(launches_off, 0, "off で行並列が立った");
             assert!(

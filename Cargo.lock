@@ -463,6 +463,7 @@ dependencies = [
  "denno-server",
  "denno-telemetry",
  "futures-util",
+ "rayon",
  "serde",
  "serde_json",
  "tokio",

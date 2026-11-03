@@ -1149,7 +1149,42 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
+/// task 119b: `RAYON_NUM_THREADS` 未設定のときの既定 rayon スレッド数 (純粋関数)。
+///
+/// `max(1, 論理 CPU - 2)`。rayon ワーカ + メインスレッドが論理 CPU 全数を埋めると
+/// オーバーサブスクライブになる (メインセッション実測, swift15-abl IQ3_S 128 tok:
+/// decode 16T 118 / 14T 114 / 12T 113 / 10T 112.5 ms/tok、prefill 28 tok は
+/// 16T 2.5 s / 14T 2.55 s / 12T 2.77 s。14 が折れ点)。`RAYON_NUM_THREADS` が
+/// 設定されているときはこの関数は使われない (そちらが勝つ)。
+fn default_rayon_threads(logical_cpus: usize) -> usize {
+    logical_cpus.saturating_sub(2).max(1)
+}
+
+/// task 119b: rayon の大域プールを既定スレッド数で立てる (初回使用の前)。
+///
+/// `RAYON_NUM_THREADS` が設定済み (空でない) なら何もしない (rayon が env を読む)。
+/// 未設定なら [`default_rayon_threads`] で `build_global` する。既にプールが立って
+/// いる (二重呼び出し) 場合のエラーは無視する。[`run`] の最初で呼ぶ。
+fn ensure_rayon_pool() {
+    if std::env::var_os("RAYON_NUM_THREADS").is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let n = default_rayon_threads(cpus);
+    if rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build_global()
+        .is_ok()
+    {
+        eprintln!("[flash] rayon pool: {n} threads (論理 CPU {cpus} - 2)");
+    }
+}
+
 pub fn run(cfg: FlashConfig) -> Result<()> {
+    // task 119b: プールの初回使用 (モデル読み込み) の前に既定スレッド数を決める。
+    ensure_rayon_pool();
     let parts = shards(&cfg.dir)?;
     eprintln!(
         "[flash] {} 分割ファイル: {:?}",
@@ -1408,5 +1443,16 @@ mod flash_tests {
             &[("upgrade", "websocket"), ("sec-websocket-key", "abc")],
         );
         assert_eq!(ws_upgrade_key(&post, "/v1/telemetry/ws"), None);
+    }
+
+    /// task 119b: rayon 既定スレッド数の純粋関数 (max(1, 論理 CPU - 2))。
+    #[test]
+    fn default_rayon_threads_is_cpus_minus_two_floor_one() {
+        assert_eq!(default_rayon_threads(16), 14);
+        assert_eq!(default_rayon_threads(14), 12);
+        assert_eq!(default_rayon_threads(3), 1);
+        assert_eq!(default_rayon_threads(2), 1);
+        assert_eq!(default_rayon_threads(1), 1);
+        assert_eq!(default_rayon_threads(0), 1);
     }
 }

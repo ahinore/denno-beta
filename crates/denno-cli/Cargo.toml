@@ -20,6 +20,9 @@ serde.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = "2"
+# task 119b: serve_flash 起動時の rayon 大域プールの既定スレッド数
+# (RAYON_NUM_THREADS 未設定のとき論理 CPU - 2)。
+rayon = "1"
 
 [dev-dependencies]
 # P51: 実クライアント (denno-view が使うのと同じ tokio-tungstenite) での

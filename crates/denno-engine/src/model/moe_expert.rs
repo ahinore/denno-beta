@@ -3819,6 +3819,110 @@ pub fn bf16_pf_override() -> usize {
 pub(crate) static BF16_FUSED_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// テスト用: task 119 の FMA カーネルが実際に発火した回数 (融合入口 1 呼び出し =
+/// 行チャンクごとに 1 増える)。exact ([`bf16_exact_enabled`]) では増えないので、
+/// 「FMA 経路が通った / 通らなかった」の証拠に使う。
+#[cfg(test)]
+pub(crate) static BF16_FMA_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// task 119: `DENNO_BF16_EXACT` の値の解釈 (既定 off = FMA 経路)。
+///
+/// 値の表は `linear_gguf` の `router_gpu_from_value` と同じ (`1` / `on` / `true` /
+/// `yes` だけ on。前後の空白と大文字小文字を無視)。純粋な値解析 (env を読まない)。
+fn bf16_exact_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+    }
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+#[cfg(test)]
+static BF16_EXACT_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト専用: BF16 の exact (逐次加算) カーネルを強制する (`None` で env に戻す)。
+///
+/// task 119 で既定が FMA (classic と丸め順序が違う) になったため、classic との
+/// ビット一致を要求する既存テストはこれを `Some(true)` にして従来カーネルで
+/// 走らせる (期待値は変えない)。
+#[cfg(test)]
+pub(crate) fn set_bf16_exact_for_test(v: Option<bool>) {
+    BF16_EXACT_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_BF16_EXACT`: `1` で task 92/107 の逐次加算カーネル (classic とビット
+/// 一致) に戻す。既定 (未設定) は task 119 の FMA 経路
+/// ([`gemv_bf16_rows_fma_avx2`]。丸め順序が変わる。契約は「絶対 1e-4 + 相対
+/// 1e-5」と f64 真値誤差が exact 以下+余裕。`bf16_tests` のテスト)。
+/// プロセスで 1 回だけ読む。
+pub fn bf16_exact_enabled() -> bool {
+    #[cfg(test)]
+    match BF16_EXACT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| bf16_exact_from_value(std::env::var("DENNO_BF16_EXACT").ok().as_deref()))
+}
+
+/// task 119: `DENNO_BF16_ACC` の解釈 (未設定 / 範囲外 = 既定)。
+///
+/// FMA カーネルが 1 行で同時に回すベクトル累積器の本数 (1..=4)。2 以上は
+/// FMA レイテンシ (Zen 4 で ~5 サイクル) を隠すのに使い、G (交互に回す行数) が
+/// 小さいほど効く。既定はコンテナのマイクロベンチ (`bench_bf16_fma`) で
+/// 最も安定していた値。累積器は k をブロック分割するので値が変わる
+/// (許容差の契約は exact と同じ)。
+fn bf16_acc_from_value(v: Option<&str>) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(a @ 1..=4) => a,
+        _ => 2,
+    }
+}
+
+/// テスト用の上書き (0 = env を見る / >0 = 累積器数 +1)。
+#[cfg(test)]
+static BF16_ACC_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// テスト専用: FMA カーネルの累積器数を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_bf16_acc_for_test(v: Option<usize>) {
+    BF16_ACC_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(a) => a + 1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_BF16_ACC`: FMA カーネルの 1 行あたり累積器数 (1..=4、既定 2)。
+///
+/// 値には影響しない性質 (行の独立性・チャンク不変性) は保たれる。累積器の
+/// 分割は k のブロック分割なので、A を変えると 1 行の部分和の区切りが変わる
+/// (= 値が変わる。exact / classic とのビット一致は要求しない)。
+pub fn bf16_acc_override() -> usize {
+    #[cfg(test)]
+    match BF16_ACC_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        v => return v - 1,
+    }
+    static A: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *A.get_or_init(|| bf16_acc_from_value(std::env::var("DENNO_BF16_ACC").ok().as_deref()))
+}
+
 /// bf16 16 バイト (8 要素) を f32 の 8 レーンへ開く。
 ///
 /// bf16 は f32 の上位 16 bit なので、`u16` を `u32` に広げて 16 bit 左シフトする
@@ -3922,19 +4026,175 @@ unsafe fn gemv_bf16_rows_avx2<const G: usize>(
     }
 }
 
-/// BF16 の 1 expert ぶんの融合 GEMV ([`gemv_bf16_rows_avx2`] の行グループ配分)。
+/// task 119: FMA の 8 レーン水平和 (exact モードと違いレーン順の規約は無いので、
+/// 標準的な縮約でよい。`bf16_seq_add8` の 8 逐次加算の代わりに 1 行 1 回だけ)。
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn fma_hsum8(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    let s2 = _mm_add_ps(s, _mm_movehl_ps(s, s)); // [0+2, 1+3, -, -]
+    let s3 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 0x11)); // [0..3 の和, ..]
+    _mm_cvtss_f32(s3)
+}
+
+/// task 119: [`gemv_bf16_rows_avx2`] の FMA 版。`G` 行を同じ k 位置で交互に回し、
+/// 行ごとに `A` 本のベクトル累積器で `_mm256_fmadd_ps` する (レーン並列 + FMA。
+/// 逐次加算チェーンを持たないので classic / exact とは丸め順序が違う = ビット
+/// 不一致。契約は「絶対 1e-4 + 相対 1e-5」と f64 真値誤差が exact 以下+余裕)。
 ///
-/// 8 行ずつ交互に回し、残りを 4 行 / 1 行で処理する。グループの分け方は
-/// 値に影響しない (行は独立で、1 行の累積順序はグループの大きさに依らない)。
+/// 累積器は k を `A` 分割の**ブロック**で割り当てる (累積器 `a` がチャンク
+/// `[a*nv/A, (a+1)*nv/A)` を担当。c 昇順なので各累積器の部分和の項の順序は
+/// 逐次と同じ。ストライド分割より誤差の形が classic に近い)。`A=1` では
+/// `c * A / nv == 0` で常に累積器 0 になる (専用枝は要らない)。
+///
+/// x の 8 要素ロードは G 行で共有する ([`gemv_bf16_rows_avx2`] と同じ)。水和は
+/// 行の終わりに 1 回 ([`fma_hsum8`]。旧カーネルは 8 要素チャンクごとに 8 回の
+/// `_mm_add_ss` だったのが、ここでは 1 行 = `A-1` 回の `add_ps` + 水和 1 回)。
+/// k の 8 の端数はスカラー尾で `i` 昇順に足す (exact と同じ扱い)。
+///
+/// # Safety
+///
+/// - [`gemv_bf16_rows_avx2`] と同じ (`bp` から `rows * n_in * 2` バイト以上が
+///   読めること、`x.len() >= n_in`、`out.len() >= rows`、`rows` は `G` の倍数)。
+/// - 実行 CPU が AVX2 + FMA を持つこと ([`q4k_fused_supported`] で確認する)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_bf16_rows_fma_avx2<const G: usize, const A: usize>(
+    bp: *const u8,
+    n_in: usize,
+    rows: usize,
+    x: &[f32],
+    out: &mut [f32],
+    pf: usize,
+) {
+    use std::arch::x86_64::*;
+    let rb = n_in * 2;
+    let xp = x.as_ptr();
+    let nv = n_in / 8; // 8 要素チャンク数
+    let tail = nv * 8;
+    let mut r = 0usize;
+    while r + G <= rows {
+        let row0 = bp.add(r * rb);
+        let mut acc = [[_mm256_setzero_ps(); A]; G];
+        for c in 0..nv {
+            if pf > 0 {
+                // task 107 の prefetch をそのまま使う (G 行のストリームの先で
+                // 読む行を張る。値に触らない)。
+                let cp = (c + pf).min(nv - 1);
+                for g in 0..G {
+                    _mm_prefetch(row0.add(g * rb + cp * 16) as *const i8, _MM_HINT_T0);
+                }
+            }
+            let xv = _mm256_loadu_ps(xp.add(c * 8));
+            let a = c * A / nv;
+            for g in 0..G {
+                let w = bf16_w8(row0.add(g * rb + c * 16));
+                acc[g][a] = _mm256_fmadd_ps(w, xv, acc[g][a]);
+            }
+        }
+        for g in 0..G {
+            let row = row0.add(g * rb);
+            let mut v = acc[g][0];
+            for a in 1..A {
+                v = _mm256_add_ps(v, acc[g][a]);
+            }
+            let mut sum = fma_hsum8(v);
+            for j in tail..n_in {
+                let w = f32::from_bits(
+                    (u16::from_le_bytes([*row.add(j * 2), *row.add(j * 2 + 1)]) as u32) << 16,
+                );
+                sum += w * *xp.add(j);
+            }
+            out[r + g] = sum;
+        }
+        r += G;
+    }
+}
+
+/// BF16 の 1 expert ぶんの融合 GEMV (task 119 の dispatcher)。
+///
+/// 既定は FMA 経路 ([`gemv_bf16_rows_fma_avx2`]。レーン並列 + FMA のベクトル
+/// 累積器。classic とは丸め順序が違う = ビット不一致。契約は「絶対 1e-4 + 相対
+/// 1e-5」と f64 真値誤差が exact 以下+余裕)。`DENNO_BF16_EXACT=1` では task
+/// 92/107 の逐次加算カーネル ([`gemv_bf16_avx2_exact`]。classic とビット一致)
+/// に戻る。行グループ (`DENNO_BF16_GROUP`) / プリフェッチ (`DENNO_BF16_PF`) /
+/// 累積器数 (`DENNO_BF16_ACC`) の各ノブは FMA 経路でも有効。
 ///
 /// # Safety
 ///
 /// - `check_gemv_args` と同じ条件 (`blocks.len() == n_out * n_in * 2`、
 ///   `x.len() == n_in`、`out.len() == n_out`) を呼び出し側が検証済みであること。
-/// - 実行 CPU が AVX2 を持つこと ([`q4k_fused_supported`] で確認する)。
+/// - 実行 CPU が AVX2 (+FMA) を持つこと ([`q4k_fused_supported`] で確認する)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn gemv_bf16_avx2(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
+    if bf16_exact_enabled() {
+        // SAFETY: 呼び出し側の前提 (長さ検証済み + q4k_fused_supported の実行時
+        // 確認) は exact 経路でも同じ (exact は AVX2 だけで動く)。
+        unsafe { gemv_bf16_avx2_exact(blocks, n_in, n_out, x, out) };
+        return;
+    }
+    let bp = blocks.as_ptr();
+    let rb = n_in * 2;
+    let g = bf16_group_override();
+    let pf = bf16_pf_override();
+    #[cfg(test)]
+    BF16_FMA_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 有効 G は従来の一般経路と同じ丸め (3/5/6/7 は 8)。累積器数は ymm 16 本に
+    // 収めるため G が大きいほど絞る (G>=8: 1 / G=4: 2 / G<=2: 4)。
+    let ga = match g {
+        1 => 1,
+        2 => 2,
+        4 => 4,
+        _ => 8,
+    };
+    let a = bf16_acc_override().min(if ga >= 8 {
+        1
+    } else if ga == 4 {
+        2
+    } else {
+        4
+    });
+    let full = n_out - n_out % ga;
+    if full > 0 {
+        match (ga, a) {
+            (1, 1) => gemv_bf16_rows_fma_avx2::<1, 1>(bp, n_in, full, x, out, pf),
+            (1, 2) => gemv_bf16_rows_fma_avx2::<1, 2>(bp, n_in, full, x, out, pf),
+            (1, 3) => gemv_bf16_rows_fma_avx2::<1, 3>(bp, n_in, full, x, out, pf),
+            (1, _) => gemv_bf16_rows_fma_avx2::<1, 4>(bp, n_in, full, x, out, pf),
+            (2, 1) => gemv_bf16_rows_fma_avx2::<2, 1>(bp, n_in, full, x, out, pf),
+            (2, 2) => gemv_bf16_rows_fma_avx2::<2, 2>(bp, n_in, full, x, out, pf),
+            (2, 3) => gemv_bf16_rows_fma_avx2::<2, 3>(bp, n_in, full, x, out, pf),
+            (2, _) => gemv_bf16_rows_fma_avx2::<2, 4>(bp, n_in, full, x, out, pf),
+            (4, 1) => gemv_bf16_rows_fma_avx2::<4, 1>(bp, n_in, full, x, out, pf),
+            _ => gemv_bf16_rows_fma_avx2::<4, 2>(bp, n_in, full, x, out, pf),
+        }
+    }
+    let rest = n_out - full;
+    if rest > 0 {
+        // 端数行は 1 行ずつ (G=1。1 行の演算列はグループ内の 1 行と同じなので
+        // 行グループ / チャンクの割り方で値は動かない)。
+        match a {
+            1 => gemv_bf16_rows_fma_avx2::<1, 1>(bp.add(full * rb), n_in, rest, x, &mut out[full..], pf),
+            2 => gemv_bf16_rows_fma_avx2::<1, 2>(bp.add(full * rb), n_in, rest, x, &mut out[full..], pf),
+            3 => gemv_bf16_rows_fma_avx2::<1, 3>(bp.add(full * rb), n_in, rest, x, &mut out[full..], pf),
+            _ => gemv_bf16_rows_fma_avx2::<1, 4>(bp.add(full * rb), n_in, rest, x, &mut out[full..], pf),
+        }
+    }
+}
+
+/// [`gemv_bf16_avx2`] の exact 版 (task 92/107 の逐次加算カーネル。classic と
+/// ビット一致)。task 119 からは `DENNO_BF16_EXACT=1` (テスト上書き) のときだけ
+/// 呼ばれる。本体は task 107 時点から変えていない (8 行ずつ交互に回し、残りを
+/// 4 行 / 1 行で処理する。グループの分け方は値に影響しない)。
+///
+/// # Safety
+///
+/// [`gemv_bf16_avx2`] と同じ。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn gemv_bf16_avx2_exact(blocks: &[u8], n_in: usize, n_out: usize, x: &[f32], out: &mut [f32]) {
     let bp = blocks.as_ptr();
     let rb = n_in * 2;
     let g = bf16_group_override();
@@ -4119,6 +4379,163 @@ pub(crate) fn expert_gemv_bf16_min_2row(
         PAR_MIN_CHUNK_ROWS_TIGHT,
         true,
     )
+}
+
+// ---- task 119: F32 (ルータ ffn_gate_inp の実型) の FMA 行カーネル ------------
+//
+// decode で残っていた「classic とビット一致のためだけに逐次 dot のまま」の
+// 最後のカーネル。ルータは `gemv()` (m=1) で `feature = "par"` の行チャンク
+// (linear_gguf) に入り、各チャンクで dequant + `acc += row[i] * x[i]` の逐次
+// 加算を回していた (実測 16T 9.3 ms/tok / 1T 39 ms)。丸め順序は classic の
+// 逐次 dot と同じに保たれていたが、このカーネルは bit identity の理由がない
+// (出力は softmax + top-k に入るだけ) ので、BF16 と同じ方針で FMA 化する。
+
+/// テスト用: task 119 の F32 (ルータ) FMA カーネルが発火した回数。
+#[cfg(test)]
+pub(crate) static F32_FMA_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// task 119: `DENNO_F32_EXACT` の値の解釈 (既定 off = FMA 経路)。
+/// [`bf16_exact_from_value`] と同じ表 (純粋な値解析)。
+fn f32_exact_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+    }
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+#[cfg(test)]
+static F32_EXACT_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト専用: F32 (ルータ) の classic (逐次加算) 経路を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_f32_exact_for_test(v: Option<bool>) {
+    F32_EXACT_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// `DENNO_F32_EXACT`: `1` でルータの classic (逐次加算) 経路に戻す。既定
+/// (未設定) は task 119 の FMA 行カーネル ([`gemv_f32_router`]。丸め順序が
+/// 変わる。許容差の契約は linear_gguf のテスト)。プロセスで 1 回だけ読む。
+pub fn f32_exact_enabled() -> bool {
+    #[cfg(test)]
+    match F32_EXACT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| f32_exact_from_value(std::env::var("DENNO_F32_EXACT").ok().as_deref()))
+}
+
+/// task 119: F32 行の FMA 版 G 行交互カーネル ([`gemv_bf16_rows_fma_avx2`] の
+/// F32 版。重みは 4 B の f32 をそのまま 32 B ロードするので dequant が要らない)。
+/// 累積器は k のブロック分割 (BF16 版と同じ)。プリフェッチは持たない (行が
+/// 10 KB (k=2560) と長く、HW プリフェッチで足りる。BF16 は行が 16 B ずつの
+/// 交互読みだったのでソフト.prefetch が効いていた)。
+///
+/// # Safety
+///
+/// - `bp` から `rows * n_in * 4` バイト以上が読めること、`x.len() >= n_in`、
+///   `out.len() >= rows` であること (呼び出し側が保証)。
+/// - `rows` は `G` の倍数であること。
+/// - 実行 CPU が AVX2 + FMA を持つこと ([`q4k_fused_supported`] で確認する)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn gemv_f32_rows_fma_avx2<const G: usize, const A: usize>(
+    bp: *const u8,
+    n_in: usize,
+    rows: usize,
+    x: &[f32],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let rb = n_in * 4;
+    let xp = x.as_ptr();
+    let nv = n_in / 8;
+    let tail = nv * 8;
+    let mut r = 0usize;
+    while r + G <= rows {
+        let row0 = bp.add(r * rb);
+        let mut acc = [[_mm256_setzero_ps(); A]; G];
+        for c in 0..nv {
+            let xv = _mm256_loadu_ps(xp.add(c * 8));
+            let a = c * A / nv;
+            for g in 0..G {
+                let w = _mm256_loadu_ps(row0.add(g * rb + c * 32) as *const f32);
+                acc[g][a] = _mm256_fmadd_ps(w, xv, acc[g][a]);
+            }
+        }
+        for g in 0..G {
+            let row = row0.add(g * rb) as *const f32;
+            let mut v = acc[g][0];
+            for a in 1..A {
+                v = _mm256_add_ps(v, acc[g][a]);
+            }
+            let mut sum = fma_hsum8(v);
+            for j in tail..n_in {
+                sum += *row.add(j) * *xp.add(j);
+            }
+            out[r + g] = sum;
+        }
+        r += G;
+    }
+}
+
+/// task 119: F32 行の GEMV (ルータ `ffn_gate_inp` の decode 経路用)。
+///
+/// AVX2+FMA があって exact ゲートが off のときだけ FMA 行カーネル (G=2 / A=2。
+/// k=2560 の 1 行 10 KB を 2 本交互に読み、FMA レイテンシを 4 チェーンで隠す)
+/// で埋めて `true` を返す。それ以外は `false` を返すだけで何も書かない
+/// (呼び出し側の従来のスカラー経路がそのまま走る)。
+///
+/// FMA カーネルは累積順が classic (逐次加算) と違うので**ビット一致しない**。
+/// `DENNO_F32_EXACT=1` で呼び出し側が classic を使う。
+///
+/// # Safety
+///
+/// `blocks.len() >= out.len() * n_in * 4`、`x.len() == n_in`、`out.len() == rows`
+/// であること (呼び出し側の行チャンク分割が保証)。
+pub(crate) fn gemv_f32_router(blocks: &[u8], n_in: usize, out: &mut [f32], x: &[f32]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if q4k_fused_supported() && !f32_exact_enabled() {
+            let rows = out.len();
+            let bp = blocks.as_ptr();
+            let rb = n_in * 4;
+            let full = rows - rows % 2;
+            #[cfg(test)]
+            F32_FMA_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: 呼び出し側 (linear_gguf の par 行チャンク) が blocks と out の
+            // 長さを検証済みで、q4k_fused_supported() が AVX2+FMA を確認している。
+            unsafe {
+                if full > 0 {
+                    gemv_f32_rows_fma_avx2::<2, 2>(bp, n_in, full, x, out);
+                }
+                if full < rows {
+                    gemv_f32_rows_fma_avx2::<1, 2>(
+                        bp.add(full * rb),
+                        n_in,
+                        rows - full,
+                        x,
+                        &mut out[full..],
+                    );
+                }
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /// expert テンソルの量子型で GEMV を振り分ける (P-MOE-G1 で追加)。
@@ -14692,6 +15109,57 @@ mod bf16_tests {
             .collect()
     }
 
+    /// task 119b: (7) 専用の有限フィクスチャ。
+    ///
+    /// 共有の [`bf16_rows`] は特殊値に bf16 最大域 (~3.4e38) を含むため、通常域の
+    /// 重みとの部分和が f32 で ±inf に達し、FMA vs exact の差が NaN (inf - inf)
+    /// になる。x を 1e6 に下げても 3.4e38 の特殊値 2 個で overflow するので、
+    /// このテストは重みも有限域に置き換える (0 / -0 / ±1 / ±0.5 / 最小正規 +
+    /// 通常域 ±0.9。ビット保存の特殊値契約は [`bf16_rows`] を使う他のテストが
+    /// 見る)。許容差は緩めない。
+    fn bf16_rows_finite(n_in: usize, n_out: usize) -> Vec<u8> {
+        let mut v = vec![0u8; n_out * n_in * 2];
+        let specials = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            f32::from_bits(0x0080_0000), // f32 最小正規 (bf16 に落としても表現できる)
+        ];
+        for r in 0..n_out {
+            for i in 0..n_in {
+                let w = if (r.wrapping_mul(n_in) + i) % 211 == 0 {
+                    specials[(r + i) % specials.len()]
+                } else {
+                    let h = ((i.wrapping_mul(2_654_435_761)) ^ (r.wrapping_mul(40_503))) & 0xFF_FFFF;
+                    // 現実域 (±0.9)。値そのものではなく格納後の bf16 バイトを
+                    // 全経路が読むので、bf16 への切り捨てがテストに影響しない。
+                    (h as f32 / 8_388_608.0 - 1.0) * 0.9
+                };
+                let bits = bf16_of(w);
+                v[(r * n_in + i) * 2..(r * n_in + i) * 2 + 2].copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        v
+    }
+
+    /// task 119b: (7) 専用の現実的な x (隠れ状態域 ±1.5 前後 + たまに 0)。
+    /// 共有の [`xvec`] は 1e6 を含み (重み最大域と積で f32 が溢れる)、
+    /// このテストの許容差契約の範囲外。
+    fn xvec_real(n_in: usize) -> Vec<f32> {
+        (0..n_in)
+            .map(|i| {
+                if i % 17 == 0 {
+                    0.0
+                } else {
+                    (((i * 37) % 97) as f32 - 48.0) / 32.0
+                }
+            })
+            .collect()
+    }
+
     /// (1) 融合カーネルが classic ([`expert_gemv_scalar`]) と `to_bits()` 一致する。
     ///     発火もカウンタで確認する。実形 2 形 + 端数 (k % 8 != 0 / 奇数行) を含む。
     #[test]
@@ -14701,6 +15169,9 @@ mod bf16_tests {
         }
         let _g = moe_test_lock();
         set_bf16_fast_for_test(Some(true));
+        // task 119: 既定が FMA (classic と非ビット一致) になったので、このテストは
+        // exact を強制して従来カーネル (classic とビット一致) で見る (期待値は変えない)。
+        set_bf16_exact_for_test(Some(true));
         // (k, n): down 実形 / up 実形 / 奇数行 / k 端数 / 最小形。
         let shapes = [
             ("down 実形", 10240usize, 320usize),
@@ -14737,6 +15208,7 @@ mod bf16_tests {
                 );
             }
         }
+        set_bf16_exact_for_test(None);
         set_bf16_fast_for_test(None);
     }
 
@@ -14873,6 +15345,183 @@ mod bf16_tests {
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&a), bits(&b), "退避路の出力が classic とビット不一致");
         set_bf16_fast_for_test(None);
+    }
+
+    /// (6) task 119: `DENNO_BF16_EXACT` の値の表 (純粋な値解析。env を読まない)。
+    /// F32 (ルータ) 側と累積器数 (`DENNO_BF16_ACC`) の表も同じ場所で固定する。
+    #[test]
+    fn bf16_exact_gate_truth_table() {
+        assert!(!bf16_exact_from_value(None), "未設定は FMA (既定)");
+        assert!(!bf16_exact_from_value(Some("")));
+        assert!(!bf16_exact_from_value(Some("0")));
+        assert!(!bf16_exact_from_value(Some("false")));
+        assert!(!bf16_exact_from_value(Some("OFF")));
+        assert!(!bf16_exact_from_value(Some("2")));
+        assert!(bf16_exact_from_value(Some("1")));
+        assert!(bf16_exact_from_value(Some("on")));
+        assert!(bf16_exact_from_value(Some("TRUE")));
+        assert!(bf16_exact_from_value(Some(" yes ")));
+        // F32 (ルータ) 側も同じ表。
+        assert!(!f32_exact_from_value(None));
+        assert!(f32_exact_from_value(Some("1")));
+        assert!(!f32_exact_from_value(Some("off")));
+        // 累積器数の表 (1..=4 だけ受ける。範囲外は既定)。
+        assert_eq!(bf16_acc_from_value(None), 2);
+        assert_eq!(bf16_acc_from_value(Some("0")), 2);
+        assert_eq!(bf16_acc_from_value(Some("5")), 2);
+        assert_eq!(bf16_acc_from_value(Some("1")), 1);
+        assert_eq!(bf16_acc_from_value(Some(" 4 ")), 4);
+    }
+
+    /// (7) task 119: FMA カーネル (既定) vs exact (逐次加算) vs f64 真値。
+    ///
+    /// task の実形 2 形 (up は 2560 行 x 640 列 / down は 640 行 x 2560 列。
+    /// 同バイト数で行長が逆) で比べる。FMA は累積順が違うので classic と
+    /// ビット一致しない。契約は「絶対 1e-4 + 相対 1e-5」(task 95/98/117 の
+    /// gemv テストと同じ立て方) と、f64 真値誤差が exact より大幅に悪くならない
+    /// こと。発火は `BF16_FMA_CALLS` で見る (exact では増えない)。
+    #[test]
+    fn bf16_fma_matches_exact_within_tolerance() {
+        if !fused_ready("bf16_fma_matches_exact_within_tolerance") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_bf16_exact_for_test(Some(false));
+        for (name, k, n) in [("up 実形", 640usize, 2560usize), ("down 実形", 2560, 640)] {
+            // task 119b: 共有 fixture は bf16 最大域 (~3.4e38) の特殊値を含み部分和が
+            // f32 で ±inf になった (inf - inf = NaN で契約が判定できない)。
+            // このテストは有限域の fixture + 現実域の x で契約を見る (許容差は変えない)。
+            let blocks = bf16_rows_finite(k, n);
+            let x = xvec_real(k);
+            let mut fma = vec![0.0f32; n];
+            let before = BF16_FMA_CALLS.load(Relaxed);
+            expert_gemv_bf16(&blocks, k, n, &x, &mut fma).unwrap();
+            assert!(
+                BF16_FMA_CALLS.load(Relaxed) > before,
+                "{name}: FMA カーネルが発火していない"
+            );
+            assert!(fma.iter().any(|v| *v != 0.0), "{name}: 出力が全 0");
+            // exact (DENNO_BF16_EXACT=1 相当の逐次加算カーネル) と classic。
+            set_bf16_exact_for_test(Some(true));
+            let mut exact = vec![0.0f32; n];
+            expert_gemv_bf16(&blocks, k, n, &x, &mut exact).unwrap();
+            set_bf16_exact_for_test(Some(false));
+            let mut classic = vec![0.0f32; n];
+            expert_gemv_scalar(GgmlType::Bf16, &blocks, k, n, &x, &mut classic).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&exact),
+                bits(&classic),
+                "{name}: exact カーネルが classic とビット不一致"
+            );
+            // f64 真値: bf16 を正確に f32 に開いて f64 で累積 (積は f64 で正確)。
+            let rb = k * 2;
+            let (mut d_fe, mut d_ft, mut d_et) = (0.0f32, 0.0f32, 0.0f32);
+            for r in 0..n {
+                let row = &blocks[r * rb..(r + 1) * rb];
+                let mut acc = 0.0f64;
+                for i in 0..k {
+                    let w = f32::from_bits(
+                        (u16::from_le_bytes([row[i * 2], row[i * 2 + 1]]) as u32) << 16,
+                    );
+                    acc += w as f64 * x[i] as f64;
+                }
+                let truth = acc as f32;
+                let diff = (fma[r] - exact[r]).abs();
+                d_fe = d_fe.max(diff);
+                d_ft = d_ft.max((fma[r] - truth).abs());
+                d_et = d_et.max((exact[r] - truth).abs());
+                // 許容は「絶対 1e-4 + 相対 1e-5」(task 95/98/117 の gemv テストと同じ)。
+                let tol = 1e-4 + 1e-5 * exact[r].abs();
+                assert!(
+                    diff <= tol,
+                    "{name} 行 {r}: FMA {} と exact {} の差 {diff} が許容 {tol} を超える",
+                    fma[r],
+                    exact[r]
+                );
+            }
+            assert!(
+                d_ft <= d_et + 1e-4,
+                "{name}: FMA の f64 真値誤差 {d_ft:.3e} が exact の {d_et:.3e} を大きく超えた"
+            );
+            eprintln!(
+                "BF16 FMA {name} {n}x{k}: FMAvsExact {d_fe:.3e} / f64真値差 FMA {d_ft:.3e} exact {d_et:.3e}"
+            );
+        }
+        set_bf16_exact_for_test(None);
+    }
+
+    /// (8) task 119: FMA カーネルは行の割り方 (行並列 / チャンク / グループ /
+    /// プリフェッチ) で値が動かない (行は独立で、1 行の演算列はどの割り方でも
+    /// 同じ)。par が実際に発火する形も含む。累積器数 (`DENNO_BF16_ACC`) だけは
+    /// 1 行の部分和の区切りを変えるので除外する。
+    #[test]
+    #[cfg(feature = "par")]
+    fn bf16_fma_row_split_bit_identical() {
+        if !fused_ready("bf16_fma_row_split_bit_identical") {
+            return;
+        }
+        let _g = moe_test_lock();
+        set_bf16_exact_for_test(Some(false));
+        let (k, n) = (640usize, 2560usize); // up 実形 (2560 行 x 640 列)
+        let blocks = bf16_rows(k, n);
+        let x = xvec(k);
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        let mut base = vec![0.0f32; n];
+        expert_gemv_bf16(&blocks, k, n, &x, &mut base).unwrap();
+        let base = bits(&base);
+
+        // 2 行指定 / 行並列しきい値 / 逐次 (usize::MAX = par を立てない)。
+        let mut two = vec![0.0f32; n];
+        expert_gemv_bf16_2row(&blocks, k, n, &x, &mut two).unwrap();
+        assert_eq!(bits(&two), base, "2 行指定が 1 行版とビット不一致");
+        for min_rows in [64usize, usize::MAX] {
+            let mut m = vec![0.0f32; n];
+            expert_gemv_bf16_min(&blocks, k, n, &x, &mut m, min_rows).unwrap();
+            assert_eq!(
+                bits(&m),
+                base,
+                "min_rows={min_rows} ({}並列) が 1 行版とビット不一致",
+                if min_rows == usize::MAX { "逐次" } else { "行" }
+            );
+        }
+        // チャンク数 (端数が出る N も含む)。
+        for chunk in [1usize, 3, 7, 64] {
+            set_bf16_chunk_for_test(Some(chunk));
+            let mut got = vec![0.0f32; n];
+            expert_gemv_bf16(&blocks, k, n, &x, &mut got).unwrap();
+            set_bf16_chunk_for_test(None);
+            assert_eq!(bits(&got), base, "chunk={chunk} が 1 行版とビット不一致");
+        }
+        // グループ幅 x プリフェッチ。
+        for g in [1usize, 2, 4, 8] {
+            for pf in [0usize, 8, 88] {
+                set_bf16_group_for_test(Some(g));
+                set_bf16_pf_for_test(Some(pf));
+                let mut got = vec![0.0f32; n];
+                expert_gemv_bf16(&blocks, k, n, &x, &mut got).unwrap();
+                set_bf16_group_for_test(None);
+                set_bf16_pf_for_test(None);
+                assert_eq!(
+                    bits(&got),
+                    base,
+                    "group={g} pf={pf} が 1 行版とビット不一致"
+                );
+            }
+        }
+        // スレッド数 (行チャンクの分割数)。
+        for threads in [1usize, 2, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            let mut got = vec![0.0f32; n];
+            pool.install(|| {
+                expert_gemv_bf16_min(&blocks, k, n, &x, &mut got, 1).unwrap();
+            });
+            assert_eq!(bits(&got), base, "{threads} スレッドでビット不一致");
+        }
+        set_bf16_exact_for_test(None);
     }
 }
 
