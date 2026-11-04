@@ -669,7 +669,9 @@ impl Flash {
         'gen: while out.len() < req.max_tokens {
             if spec_on {
                 // P109: n-gram 投機ステップ。q0 は engine の argmax (greedy)。
+                let d_topk = q4prof::dstamp();
                 let cand = if t_on { Some(denno_telemetry::topk_softmax(&logits, 8)) } else { None };
+                q4prof::dmark(q4prof::D_TOPK, d_topk);
                 let t_s = prekprof::stamp();
                 let d_sample = q4prof::dstamp();
                 let q0 = match greedy_u32(&logits) {
@@ -773,7 +775,9 @@ impl Flash {
             // ---- 通常経路 (P108 までと同じ。emit の差分処理を helper 化) ----
             // P58: 選ぶ前の分布を top-8 で送る (3D ビューワの候補表示用)。
             // テレメトリ OFF なら計算しない。数値経路には触れない。
+            let d_topk = q4prof::dstamp();
             let cand = if t_on { Some(denno_telemetry::topk_softmax(&logits, 8)) } else { None };
+            q4prof::dmark(q4prof::D_TOPK, d_topk);
             // P78: サンプリングは decode 側 (prefill wall の外)。
             let t_s = prekprof::stamp();
             let d_sample = q4prof::dstamp();

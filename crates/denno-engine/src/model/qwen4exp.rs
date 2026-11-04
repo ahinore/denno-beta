@@ -4029,8 +4029,10 @@ pub mod q4prof {
     pub const D_ARCH: usize = 9;
     /// 区間: テレメトリのフレーム送出 (Step / Token / KvUsage)。
     pub const D_TELEM: usize = 10;
+    /// 区間: 選ぶ前の分布の top-k (テレメトリ用、`topk_softmax`)。
+    pub const D_TOPK: usize = 11;
     /// 区間の数。
-    pub const D_NSLOT: usize = 11;
+    pub const D_NSLOT: usize = 12;
     /// 区間の名前 (`[q4prof] decode outside` の列名、[`D_EMBED`] の順)。
     pub const D_NAMES: [&str; D_NSLOT] = [
         "embed",
@@ -4044,6 +4046,7 @@ pub mod q4prof {
         "step",
         "arch",
         "telem",
+        "topk",
     ];
 
     static D_NS: [AtomicU64; D_NSLOT] = [const { AtomicU64::new(0) }; D_NSLOT];
