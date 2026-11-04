@@ -16,6 +16,7 @@ pub mod moe_expert;
 pub mod moe_grouped;
 pub mod moe_grouped_gpu;
 pub mod prekprof;
+pub mod q4ledger;
 pub mod qwen35;
 pub mod qwen4exp;
 pub mod qwen4exp_attn;

@@ -996,3 +996,44 @@ extern "C" __global__ void dno_matvec_f32_r(
     }
 }
 
+// task 138: dno_matvec_f32_r の出力に hc_lo_apply (silu(v * inv_hc)) を畳み込む版。
+//
+// hc mix の decode 経路は down GEMV -> ホストで lo_apply -> up GEMV の 2 往復を
+// していた。down の出力 (low_rank 本) は lo_apply の入力そのものなので、その
+// silu を down の書き出しに畳むと down -> up を device 内で続けられ、往復が 1 回
+// 減る。丸めは CPU の `*v = *v / (1.0 + (-*v).exp())` と同一 (dno_expf は glibc
+// expf のビット一致実装・-fmad=false) なので dno_matvec_f32_r + ホスト lo_apply
+// と同じ値になる。
+//
+// grid = (n, 1, 1), block = (256, 1, 1)。
+extern "C" __global__ void dno_matvec_f32_r_silu(
+    const float *__restrict__ h,   // [k]
+    const float *__restrict__ w,   // [n, k] row-major
+    float *__restrict__ out,       // [n]
+    int k, int n, float inv_hc) {
+    const int j = blockIdx.x;
+    if (j >= n) return;
+    const float *row = w + (size_t)j * k;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    float s = 0.0f;
+    for (int d = tid; d < k; d += nt) {
+        s = __fadd_rn(s, __fmul_rn(h[d], row[d]));
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        s = __fadd_rn(s, __shfl_down_sync(0xffffffffu, s, o));
+    }
+    __shared__ float sh[32];
+    const int wid = tid >> 5;
+    if ((tid & 31) == 0) sh[wid] = s;
+    __syncthreads();
+    if (tid == 0) {
+        float t = sh[0];
+        for (int i = 1; i < (nt >> 5); ++i) t = __fadd_rn(t, sh[i]);
+        // hc_lo_apply: v = v * (1/hc) してから silu (tensor::silu_inplace と同順)。
+        const float v = __fmul_rn(t, inv_hc);
+        out[j] = __fdiv_rn(v, __fadd_rn(1.0f, dno_expf(-v)));
+    }
+}
+
