@@ -1394,6 +1394,13 @@ impl AttnLayer {
         pos: usize,
         cells: Option<&[usize]>,
     ) -> Result<Vec<f32>> {
+        // task 132: full attention 層の decode 時間を q4prof の A_FULL に積む
+        // (範囲は prefill の `forward_batch` と同じ = 投影から出力投影まで)。
+        // attend 本体には触らない (task 133 の GPU 化と衝突しないよう、
+        // タイマーはこの関数の頭と末尾だけ)。task 133 側も同じ場所で
+        // stamp していたので、merge で二重に取らないようここ 1 箇所に寄せた
+        // (A_FULL への加算も末尾の 1 回だけ)。
+        let t_all = q4prof::stamp();
         if cur.len() != self.n_embd {
             bail!(
                 "AttnLayer::forward_token: 入力長 {} が n_embd = {} と違う",
@@ -1403,7 +1410,6 @@ impl AttnLayer {
         }
         // task 133: full 層の合計 (`[q4prof] ... full=`) を decode でも積む。
         // 計測は DENNO_Q4_PROFILE / DENNO_PF_ATT_DBG のときだけ (stamp が None)。
-        let t_all = q4prof::stamp();
         // task 72: q / k / v は同じ入力 cur を取るので 1 回の GEMV で得る。
         // 行は独立なので、個別に投影した場合とビット一致する。
         let proj = self.project_qkv_concat(cur)?;
