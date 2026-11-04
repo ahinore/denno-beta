@@ -9,7 +9,7 @@
 //! 「テンプレート文字列から ChatML の固定断片を取り出して組み立てる」経路も持つ
 //! (`ChatFragments`)。
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::gguf::{GgufFile, GgufValue};
 
@@ -24,6 +24,12 @@ const QWEN_SPLIT_PATTERN: &str = concat!(
 const TT_UNKNOWN: u32 = 2;
 const TT_CONTROL: u32 = 3;
 const TT_USER_DEFINED: u32 = 4;
+
+/// task 131: [`GgufTokenizer::splice_after_content`] の目印。
+///
+/// chat_template の `|trim` を通っても消えない非空白文字だけで作り、描画結果の
+/// 中で位置が一意に決まるようにする (私用面の文字は通常の本文に出てこない)。
+const SPLICE_MARK: &str = "\u{10FFF0}DENNO-SPLICE-131\u{10FFF1}";
 
 /// GGUF メタデータから組んだトークナイザ。
 pub struct GgufTokenizer {
@@ -265,18 +271,50 @@ impl GgufTokenizer {
         tools: Option<&serde_json::Value>,
         enable_thinking: bool,
     ) -> Result<Vec<u32>> {
-        let fallback = || -> Result<Vec<u32>> {
-            let last = messages
-                .iter()
-                .rev()
-                .find(|(r, _)| r == "user")
-                .map(|(_, t)| t.as_str())
-                .unwrap_or("");
-            self.encode_chat(system, last)
-        };
-        let Some(tpl) = &self.chat_template else {
-            return fallback();
-        };
+        Ok(self
+            .encode_messages_ex(system, messages, tools, enable_thinking)?
+            .0)
+    }
+
+    /// [`Self::encode_messages`] の「描画経路を使ったか」付き版。
+    ///
+    /// 戻り値の bool は、プロンプト文字列が [`Self::render_messages`] の
+    /// 結果と一致するか (= chat_template の描画に成功したか)。false のときは
+    /// 1 ターン形 ([`Self::encode_chat`]) へ落ちており、メッセージ列を
+    /// そのまま描画した文字列とは対応しない。task 131 の splice はこの
+    /// 区別が要る (キャッシュ済みトークンが描画結果と対応している前提を
+    /// 置けるかどうか)。
+    pub fn encode_messages_ex(
+        &self,
+        system: Option<&str>,
+        messages: &[(String, String)],
+        tools: Option<&serde_json::Value>,
+        enable_thinking: bool,
+    ) -> Result<(Vec<u32>, bool)> {
+        if let Some(s) = self.render_messages(system, messages, tools, enable_thinking) {
+            return Ok((self.encode(&s)?, true));
+        }
+        let last = messages
+            .iter()
+            .rev()
+            .find(|(r, _)| r == "user")
+            .map(|(_, t)| t.as_str())
+            .unwrap_or("");
+        Ok((self.encode_chat(system, last)?, false))
+    }
+
+    /// メッセージ列を chat_template で描画した文字列 (minijinja)。
+    ///
+    /// テンプレートが無い / 描画に失敗 / 空出力なら `None`。トークン化はしない
+    /// (呼び出し側が部分文字列だけを encode できるようにするため。task 131)。
+    pub fn render_messages(
+        &self,
+        system: Option<&str>,
+        messages: &[(String, String)],
+        tools: Option<&serde_json::Value>,
+        enable_thinking: bool,
+    ) -> Option<String> {
+        let tpl = self.chat_template.as_ref()?;
         let mut msgs: Vec<serde_json::Value> = Vec::new();
         if let Some(sys) = system {
             if !sys.is_empty() {
@@ -304,17 +342,69 @@ impl GgufTokenizer {
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
         match env.render_str(tpl, ctx) {
-            Ok(s) if !s.is_empty() => self.encode(&s),
-            Ok(_) => fallback(),
+            Ok(s) if !s.is_empty() => Some(s),
+            Ok(_) => None,
             Err(e) => {
                 tracing::warn!("chat_template の描画に失敗、1 ターンに落とす: {e}");
-                fallback()
+                None
             }
         }
     }
 
+    /// task 131: `messages[n]` の content を sentinel に差し替えて描画し、
+    /// sentinel より後ろだけをトークン化して `cached` の後ろに継ぐ。
+    ///
+    /// テンプレートは assistant の content を `|trim` することが多く、生成
+    /// テキストの末尾/先頭の空白は再描画で落ちる。落ちたぶんだけ
+    /// 「前回食ったトークン列」と次ターンのプロンプトがずれて prefix cache が
+    /// 効かなくなる。ここでは落ちた分を `cached` (= 前回食った列) のまま残し、
+    /// content より後ろ (`<|im_end|>` 以降) だけを新しく食う。
+    ///
+    /// `cached` の文字列が `messages[..n]` の描画結果と対応していることは
+    /// 呼び出し側が保証する。`n` が範囲外・描画失敗・sentinel が一意でない
+    /// ときは `None` (呼び出し側は full prefill に落ちる)。
+    pub fn splice_after_content(
+        &self,
+        system: Option<&str>,
+        messages: &[(String, String)],
+        tools: Option<&serde_json::Value>,
+        enable_thinking: bool,
+        n: usize,
+        cached: &[u32],
+    ) -> Result<Option<Vec<u32>>> {
+        if n >= messages.len() {
+            return Ok(None);
+        }
+        let mut msgs = messages.to_vec();
+        msgs[n].1 = SPLICE_MARK.to_string();
+        let Some(rendered) = self.render_messages(system, &msgs, tools, enable_thinking) else {
+            return Ok(None);
+        };
+        let Some(pos) = rendered.find(SPLICE_MARK) else {
+            return Ok(None);
+        };
+        let post = &rendered[pos + SPLICE_MARK.len()..];
+        if post.contains(SPLICE_MARK) {
+            return Ok(None);
+        }
+        let suffix = self
+            .encode(post)
+            .context("splice の後続をトークン化できない")?;
+        let mut p = Vec::with_capacity(cached.len() + suffix.len());
+        p.extend_from_slice(cached);
+        p.extend_from_slice(&suffix);
+        Ok(Some(p))
+    }
+
     pub fn eos(&self) -> Option<u32> {
         self.eos
+    }
+
+    /// トークン 1 個の語彙上の文字列 (特殊トークンもそのまま返す)。
+    ///
+    /// 診断ログ用 (task 131 の `[flash] prefix miss:` の 1 行)。
+    pub fn token_text(&self, id: u32) -> Option<String> {
+        self.tok.id_to_token(id)
     }
 
     pub fn bos(&self) -> Option<u32> {

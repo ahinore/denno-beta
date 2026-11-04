@@ -1,0 +1,14 @@
+[
+{
+"role": "user",
+"content": "Write Python pandas code for time series anomaly detection, with explanations."
+},
+{
+"role": "assistant",
+"content": "# Time Series Anomaly Detection with Pandas\n\nBelow is a comprehensive guide to time series anomaly detection using Python and Pandas, covering multiple approaches from simple statistical methods to more advanced techniques.\n\n## Full Implementation\n\n```python\nimport pandas as pd\nimport numpy as np\nimport matplotlib.pyplot as plt\nfrom scipy import stats\n\n# ============================================================\n# 1. SETUP: Generate Sample Time Series Data\n# ============================================================\n\ndef generate_sample_data(n_points=1000, anomaly_ratio=0.05, seed=42):\n    \"\"\"\n    Generate synthetic time series data with injected anomalies.\n    \n    Parameters:\n        n_points: Number of data points\n        anomaly_ratio: Fraction of points that are anomalies\n        seed: Random seed for reproducibility\n    \n    Returns:\n        DataFrame with 'timestamp' and 'value' columns\n    \"\"\"\n    np.random.seed(seed)\n    \n    # Create a regular time index (hourly data)"
+},
+{
+"role": "user",
+"content": "Continue with more code."
+}
+]

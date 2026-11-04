@@ -10,7 +10,8 @@
 //! (serve_flash.rs から `#[cfg(test)] #[path] mod flash_synth;` で include)。
 
 use super::{
-    model_reuse_enabled, Flash, GenReq, TEST_BUILD_COUNT, TEST_FAIL_STEP, TEST_LAST_REUSE,
+    model_reuse_enabled, prefix_miss_line, prefix_splice_enabled, Flash, GenReq, TEST_BUILD_COUNT,
+    TEST_FAIL_STEP, TEST_LAST_REUSE,
 };
 use crate::flash_telemetry::Telemetry;
 use denno_engine::gguf::GgufFile;
@@ -348,9 +349,13 @@ const VALUE_DIM: u64 = SSM_INNER;
 const CONV_DIM: u64 = 2 * KEY_DIM + VALUE_DIM;
 
 /// Qwen 系 chat_template の縮小版 (minijinja で描画できる)。
+///
+/// task 131: 本番テンプレートと同じく content を `|trim` する。生成テキストの
+/// 末尾の空白がここで落ちるのが prefix 不一致の原因なので、縮小版でも同じ
+/// 挙動にしてテストで再現する。
 const CHAT_TPL: &str = concat!(
     "{%- for m in messages %}",
-    "{{- '<|im_start|>' + m.role + '\\n' + m.content + '<|im_end|>\\n' }}",
+    "{{- '<|im_start|>' + m.role + '\\n' + m.content|trim + '<|im_end|>\\n' }}",
     "{%- endfor %}",
     "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}",
 );
@@ -660,7 +665,7 @@ fn build_flash(dir: &TempDir) -> Flash {
     );
     Flash {
         parts: vec![path],
-        max_ctx: 64,
+        max_ctx: 128,
         name: "synth".into(),
         default_max: 6,
         tok,
@@ -983,4 +988,191 @@ fn flash_no_reuse_resets_decoder_without_rebuilding() {
     let g5 = flash.generate(&gen_req("yo"), no_emit).expect("generate 5");
     assert_eq!(builds() - b0, 2, "同一プロンプトで build_model が増えた");
     assert_eq!(g5.text, g2.text, "同一プロンプトの繰り返しで出力が変わった");
+}
+
+// ---------------------------------------------------------------------------
+// task 131: 生成テキスト末尾の空白と prefix cache
+// ---------------------------------------------------------------------------
+
+/// N メッセージの要求 (temperature 0 = 貪欲、max_tokens 6)。
+fn gen_req_msgs(msgs: &[(&str, &str)]) -> GenReq {
+    let v: Vec<serde_json::Value> = msgs
+        .iter()
+        .map(|(r, c)| serde_json::json!({"role": r, "content": c}))
+        .collect();
+    GenReq::from_json(
+        &serde_json::json!({"messages": v, "max_tokens": 6, "temperature": 0.0}),
+        6,
+    )
+    .expect("GenReq")
+}
+
+/// `DENNO_FLASH_PREFIX_SPLICE` の真偽表 (model_reuse と同じ規約)。
+#[test]
+fn prefix_splice_truth_table() {
+    let cases: &[(&str, Option<&str>, bool)] = &[
+        ("unset", None, true),
+        ("empty", Some(""), true),
+        ("0", Some("0"), false),
+        ("false", Some("false"), false),
+        ("no", Some("no"), false),
+        ("1", Some("1"), true),
+        ("true", Some("true"), true),
+        ("yes", Some("yes"), true),
+        ("other", Some("ON"), true),
+        ("00", Some("00"), true),
+    ];
+    for (tag, v, want) in cases {
+        assert_eq!(
+            prefix_splice_enabled(*v),
+            *want,
+            "DENNO_FLASH_PREFIX_SPLICE={tag}"
+        );
+    }
+}
+
+/// 不一致の 1 行ログ: 最初の不一致位置と両側のトークンを出し、1 行を保つ。
+#[test]
+fn prefix_miss_line_reports_first_mismatch() {
+    let dir = TempDir::new("flash-missline");
+    let flash = build_flash(&dir);
+    let line = prefix_miss_line(&flash.tok, &[1, 2, 3, 10], &[1, 2, 9]);
+    assert!(
+        line.starts_with("[flash] prefix miss: cache=4 prompt=3 lcp=2 "),
+        "{line}"
+    );
+    assert!(line.contains("cached_tok=3("), "不一致トークンが無い: {line}");
+    assert!(line.contains("prompt_tok=9("), "不一致トークンが無い: {line}");
+    assert!(!line.contains('\n'), "1 行でない: {line:?}");
+
+    // 短い方で頭打ち (prompt が cache の接頭辞) でも落ちない。
+    let line2 = prefix_miss_line(&flash.tok, &[1, 2, 3], &[1, 2, 3]);
+    assert!(line2.contains("lcp=3"), "{line2}");
+    assert!(line2.contains("cached_tok=-"), "{line2}");
+}
+
+/// task 131: 生成テキストの末尾が空白で、テンプレートの `|trim` に落とされても
+/// 前置きを捨てない (splice)。
+///
+/// 合成モデルは "hi" に tab 6 個を返す。クライアントはその本文をそのまま
+/// 返送するので、テンプレートが trim して 0 文字になったぶんだけ前回の
+/// プロンプトとずれる。ここで reuse=0 になっていたのが本番の 18.19 秒 miss。
+#[test]
+fn trimmed_assistant_tail_keeps_reuse_by_splice() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+
+    let dir = TempDir::new("flash-splice");
+    let mut flash = build_flash(&dir);
+    let b0 = builds();
+    let g1 = flash.generate(&gen_req("hi"), no_emit).expect("generate 1");
+    assert_eq!(g1.text, "\t\t\t\t\t\t", "合成モデルの決定列 (tab 6 個)");
+
+    let c1 = flash.cache.as_ref().expect("cache").toks.clone();
+    assert_eq!(c1.len(), g1.n_prompt + 6, "プロンプト + 生成 6");
+    let echo = g1.text.clone();
+    assert_eq!(echo.trim(), "", "この再現には末尾が空白の生成が要る");
+
+    // 2 ターン目: 生の本文 (tab 6 個) を返送。
+    let req2 = gen_req_msgs(&[("user", "hi"), ("assistant", &echo), ("user", "yo")]);
+    let b1 = builds();
+    let g2 = flash.generate(&req2, no_emit).expect("generate 2");
+    assert_eq!(builds() - b1, 0, "splice 経路で build_model が走った");
+    let reuse = TEST_LAST_REUSE.load(Ordering::Relaxed);
+    assert_eq!(
+        reuse,
+        c1.len(),
+        "生成テキストを前置きに残せていない (reuse={reuse}, cache={})",
+        c1.len()
+    );
+    // trim して組んだプロンプトより、食った生成トークン 6 個ぶん長い。
+    let trimmed = flash
+        .tok
+        .encode_messages(
+            None,
+            &[
+                ("user".into(), "hi".into()),
+                ("assistant".into(), "".into()),
+                ("user".into(), "yo".into()),
+            ],
+            None,
+            false,
+        )
+        .expect("encode trimmed");
+    assert_eq!(
+        g2.n_prompt,
+        trimmed.len() + 6,
+        "生の生成テキストがプロンプトに残っていない"
+    );
+    assert_eq!(g2.text, "\t\t\t\t\t\t", "2 ターン目の出力");
+
+    // 3 ターン目: splice の続きでもう一度 splice できること。
+    let c2len = flash.cache.as_ref().expect("cache").toks.len();
+    let req3 = gen_req_msgs(&[
+        ("user", "hi"),
+        ("assistant", &echo),
+        ("user", "yo"),
+        ("assistant", &g2.text),
+        ("user", "zz"),
+    ]);
+    let g3 = flash.generate(&req3, no_emit).expect("generate 3");
+    assert_eq!(
+        TEST_LAST_REUSE.load(Ordering::Relaxed),
+        c2len,
+        "splice の次のターンで前置きが再利用されていない"
+    );
+    assert_eq!(builds() - b0, 1, "build_model は最初の 1 回だけのはず");
+    assert!(g3.n_out > 0, "生成が空 (stop={})", g3.stop_reason);
+}
+
+/// task 131: 返送された本文が食った生成トークンと違うときは splice せず、
+/// 従来どおり full prefill に落ちる (安全側)。出力は新規構築と一致。
+#[test]
+fn changed_assistant_echo_falls_back_to_full_prefill() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+
+    let dir = TempDir::new("flash-splice-fb");
+    let mut flash = build_flash(&dir);
+    flash.generate(&gen_req("hi"), no_emit).expect("generate 1");
+
+    // 本文を trim した (= クライアントが空白を落とした) 返送。
+    let req2 = gen_req_msgs(&[("user", "hi"), ("assistant", ""), ("user", "yo")]);
+    let b1 = builds();
+    let g2 = flash.generate(&req2, no_emit).expect("generate 2");
+    assert_eq!(
+        TEST_LAST_REUSE.load(Ordering::Relaxed),
+        0,
+        "本文が違うのに reuse した"
+    );
+    assert_eq!(builds() - b1, 0, "full prefill で build_model が走った (reset 経路のはず)");
+    assert!(g2.n_out > 0, "生成が空 (stop={})", g2.stop_reason);
+
+    // 新規構築 + full prefill と同じ出力。
+    let dir2 = TempDir::new("flash-splice-fb2");
+    let mut fresh = build_flash(&dir2);
+    let f2 = fresh.generate(&req2, no_emit).expect("fresh generate");
+    assert_eq!(g2.text, f2.text, "fallback の出力が新規構築と一致しない");
+}
+
+/// task 131: gate off (`DENNO_FLASH_PREFIX_SPLICE=0`) では splice しない
+/// (従来どおり reuse=0 の full prefill。モデルの組み直しはしない)。
+#[test]
+fn prefix_splice_gate_off_keeps_full_prefill() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::set_var("DENNO_FLASH_PREFIX_SPLICE", "0");
+
+    let dir = TempDir::new("flash-splice-off");
+    let mut flash = build_flash(&dir);
+    let g1 = flash.generate(&gen_req("hi"), no_emit).expect("generate 1");
+    let b1 = builds();
+    let req2 = gen_req_msgs(&[("user", "hi"), ("assistant", &g1.text), ("user", "yo")]);
+    let g2 = flash.generate(&req2, no_emit).expect("generate 2");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+    assert_eq!(TEST_LAST_REUSE.load(Ordering::Relaxed), 0, "gate off で reuse した");
+    assert_eq!(builds() - b1, 0, "gate off で build_model が走った");
+    assert!(g2.n_out > 0, "生成が空 (stop={})", g2.stop_reason);
 }

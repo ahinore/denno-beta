@@ -25,6 +25,14 @@
 //! (prefill / forward step) のときは従来どおり捨てる。切断の直後のリクエストは
 //! 組み直さないので、GPU 重みの再 upload (266 本 / 約 3 秒) が避けられ、
 //! TTFT が 5.0 秒 → 通常の reuse=0 prefill と同じ (推定 2.3 秒) に戻る。
+//!
+//! task 131: chat_template が assistant の content を `|trim` するため、
+//! 生成テキスト末尾の空白は次ターンのプロンプトから落ちる。そこで前置きが
+//! 1 トークンだけずれて reuse=0 (= full prefill) になっていた (本番 462
+//! トークンで 18.19 秒)。前置きが一致しないときは、前回の生成トークンを
+//! そのまま前置きに残して後ろだけ食う splice を試す (既定 on、
+//! `DENNO_FLASH_PREFIX_SPLICE=0` で切れる)。splice できないときは従来どおり
+//! full prefill に落ち、`[flash] prefix miss: ...` を 1 行出す。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -275,6 +283,67 @@ struct Cached {
     dec: Qwen4ExpDecoder,
     toks: Vec<u32>,
     logits: Vec<f32>,
+    /// `toks` のうちプロンプト部の長さ (`toks[prompt_len..]` が生成部)。
+    /// task 131 の splice が「生成テキスト」を取り出すのに使う。
+    prompt_len: usize,
+    /// プロンプトが chat_template の描画結果と対応しているか
+    /// (`encode_messages_ex` の bool)。描画に落ちたプロンプトは splice できない。
+    from_render: bool,
+    /// このキャッシュを生んだリクエストの入力 (task 131 の splice 判定用)。
+    req: CachedReq,
+}
+
+/// キャッシュを生んだリクエストのうち、プロンプト構築に効く入力だけを持つ。
+///
+/// 次ターンのリクエストが「この入力 + 生成テキストの返送 + 続き」に一致する
+/// ときだけ splice する (テンプレート描画はこの 4 つだけで決まる)。
+#[derive(Clone, PartialEq)]
+struct CachedReq {
+    system: Option<String>,
+    messages: Vec<(String, String)>,
+    tools: Option<Value>,
+    enable_thinking: bool,
+    /// `continue: true` のプロンプトは描画結果と対応しないので splice しない。
+    cont: bool,
+}
+
+/// task 131: `DENNO_FLASH_PREFIX_SPLICE` の値から splice を試すかを決める
+/// (純関数。真偽表テスト `prefix_splice_truth_table` が規約を固定する)。
+///
+/// 既定は `true`。`0` / `false` / `no` のときだけ `false` (従来どおり
+/// 前置きが 1 トークンでもずれたら full prefill)。未設定・空・その他の値は
+/// 既定に従う ([`model_reuse_enabled`] と同じ規約)。
+fn prefix_splice_enabled(v: Option<&str>) -> bool {
+    !matches!(v, Some("0") | Some("false") | Some("no"))
+}
+
+/// 2 列の最初の不一致位置 (短い方の長さで頭打ち)。
+fn first_mismatch(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// task 131: 前置きが一致せず reuse=0 になったときの 1 行 (原因追跡用)。
+///
+/// 本番で「なぜ reuse=0 になったか」を後から説明できるように、最初の不一致
+/// 位置とその両側のトークン (id と短い復号) を出す。1 行を保つため
+/// 復号は `{:?}` でエスケープする (改行は `\n` になる)。
+fn prefix_miss_line(tok: &GgufTokenizer, cached: &[u32], prompt: &[u32]) -> String {
+    let lcp = first_mismatch(cached, prompt);
+    let show = |t: Option<&u32>| match t {
+        Some(&id) => match tok.token_text(id) {
+            Some(s) => format!("{id}({s:?})"),
+            None => format!("{id}(?)"),
+        },
+        None => "-".to_string(),
+    };
+    format!(
+        "[flash] prefix miss: cache={} prompt={} lcp={} cached_tok={} prompt_tok={}",
+        cached.len(),
+        prompt.len(),
+        lcp,
+        show(cached.get(lcp)),
+        show(prompt.get(lcp))
+    )
 }
 
 struct Flash {
@@ -445,6 +514,64 @@ fn emit_confirmed(
 }
 
 impl Flash {
+    /// task 131: 生成テキストをそのまま前置きに残したプロンプトを組む。
+    ///
+    /// 原因: chat_template が assistant の content を `|trim` するので、
+    /// 生成テキストの末尾の空白 (や先頭の空白) は次ターンのプロンプトから
+    /// 落ちる。落ちたぶんだけキャッシュの前置きと末尾でずれて reuse=0 になり、
+    /// 毎回 full prefill になる (本番 462 トークンで 18.19 秒)。
+    ///
+    /// ここでは「前回のリクエスト入力 + 我々が返した本文の返送 + 続き」に
+    /// 一致するときだけ、テンプレートを sentinel 付きで描き直し、sentinel
+    /// より後ろ (= `<|im_end|>` 以降) だけをトークン化して、キャッシュ済み
+    /// トークンに継ぐ。プロンプトの文字列はテンプレート描画に生成テキストを
+    /// そのまま差し込んだものになるので、モデルは自分が生成した列をそのまま
+    /// 見る (trim された分だけが違う)。
+    ///
+    /// 一致しないときは `None`。呼び出し側は従来どおり full prefill に落ちる:
+    /// - クライアントが本文を変えた (trim / 編集 / 打ち切り)
+    /// - stop_sequence や max_tokens (spec) で「食ったトークン」と返した本文が違う
+    /// - `continue: true` の経路、テンプレート描画に落ちたプロンプト
+    fn splice_prompt(&self, c: &Cached, req: &GenReq) -> Result<Option<Vec<u32>>> {
+        if !c.from_render || c.prompt_len > c.toks.len() || c.req.cont || req.cont {
+            return Ok(None);
+        }
+        if c.req.system != req.system
+            || c.req.tools != req.tools
+            || c.req.enable_thinking != req.enable_thinking
+        {
+            return Ok(None);
+        }
+        // 前回のメッセージ列がそのまま前置きで、その直後に assistant の返送がある。
+        let n = c.req.messages.len();
+        if req.messages.len() <= n || req.messages[..n] != c.req.messages[..] {
+            return Ok(None);
+        }
+        let (role, text) = &req.messages[n];
+        if role != "assistant" {
+            return Ok(None);
+        }
+        // 実際に食った生成トークンの復号と、返送された本文が完全一致するときだけ。
+        let gen_text = self.tok.decode(&c.toks[c.prompt_len..]).unwrap_or_default();
+        if gen_text.is_empty() || *text != gen_text {
+            return Ok(None);
+        }
+        // テンプレートを sentinel 付きで描き、sentinel より後ろだけを食う
+        // (描画と分割の実体は tokenizer 側。engine の test が実テンプレートで固定する)。
+        let spliced = self.tok.splice_after_content(
+            req.system.as_deref(),
+            &req.messages,
+            req.tools.as_ref(),
+            req.enable_thinking,
+            n,
+            &c.toks,
+        )?;
+        if let Some(p) = spliced.as_ref() {
+            debug_assert_eq!(&p[..c.toks.len()], &c.toks[..], "splice が前置きを壊した");
+        }
+        Ok(spliced)
+    }
+
     /// モデルを組む (mmap 越し)。
     fn build_model(&self) -> Result<Qwen4Exp> {
         #[cfg(test)]
@@ -493,15 +620,26 @@ impl Flash {
             };
         let mut prompt = self
             .tok
-            .encode_messages(
+            .encode_messages_ex(
                 req.system.as_deref(),
                 msgs_for_tpl,
                 req.tools.as_ref(),
                 req.enable_thinking,
             )
             .context("プロンプトを組めない")?;
+        let is_cont = partial.is_some();
         if let Some(p) = partial {
-            prompt.extend(self.tok.encode(&p).context("継続テキストをトークン化できない")?);
+            prompt.0.extend(
+                self.tok
+                    .encode(&p)
+                    .context("継続テキストをトークン化できない")?,
+            );
+        }
+        let (mut prompt, mut prompt_from_render) = prompt;
+        if is_cont {
+            // continue 経路のプロンプトは描画結果 + 生テキストなので、
+            // メッセージ列の描画とは対応しない (splice 不可)。
+            prompt_from_render = false;
         }
         prekprof::mark(t_tok, prekprof::TOKENIZE);
         if prompt.is_empty() {
@@ -514,8 +652,6 @@ impl Flash {
                 self.max_ctx
             );
         }
-        let n_prompt = prompt.len();
-
         // P51: テレメトリ (観測のみ)。無効時はこの bool 1 個を見るだけで、
         // Instant も確保もしない。セッション ID は OFF でも採番する (原子加算 1 回)。
         let t_on = self.telem.on();
@@ -524,9 +660,16 @@ impl Flash {
         // 直前の状態が使えるなら差分だけ食わせる。
         // P118: モデルの使い回しはここで 1 回だけ読む (`DENNO_FLASH_MODEL_REUSE`)。
         let model_reuse = model_reuse_enabled(std::env::var("DENNO_FLASH_MODEL_REUSE").ok().as_deref());
+        // task 131: テンプレートが assistant の content を `|trim` するため、
+        // 生成テキスト末尾の空白は次ターンのプロンプトから落ちる。落ちたぶん
+        // だけキャッシュの前置きとずれて reuse=0 (本番 462 トークンで 18 秒) に
+        // なっていた。生成済みトークンをそのまま前置きに残す経路を既定で試す。
+        let splice_on = model_reuse
+            && prefix_splice_enabled(std::env::var("DENNO_FLASH_PREFIX_SPLICE").ok().as_deref());
         let t1 = Instant::now();
         let mut reused = 0usize;
-        let (mut dec, mut logits) = match self.cache.take() {
+        let cached = self.cache.take();
+        let (mut dec, mut logits) = match cached {
             Some(mut c) if c.toks.len() <= prompt.len() && prompt[..c.toks.len()] == c.toks[..] => {
                 reused = c.toks.len();
                 if reused < prompt.len() {
@@ -537,37 +680,75 @@ impl Flash {
                 }
             }
             other => {
-                // P118: 前置きが一致しないときも、decoder が残っていれば
-                // `build_model` を呼ばずに系列状態だけ消して使い回す。
-                // 組み直すと `GgufLinear` に新しい uid が振られ、uid 引きの
-                // GPU 常駐重みが全部再 upload される (cache-miss 1 回あたり
-                // 266 本 / 3.42 秒)。reset は uid に触れないので重みは常駐した
-                // ままで、数値も新規構築とビット一致する (engine 側
-                // `reset_matches_fresh_decoder_bitexact`)。前のリクエストが
-                // engine 側の失敗 (prefill / step) で落ちたときは cache が
-                // None のままなので、この経路は通らず組み直す (半端に進んだ
-                // decoder を使い回さない)。クライアント切断 (emit 失敗) の
-                // ときは task 123 で cache が残るので、この reset 経路で
-                // 重みの再 upload なしに使い回す。
-                let t_model = prekprof::stamp();
-                let mut d = match other {
-                    Some(c) if model_reuse => {
-                        let mut d = c.dec;
-                        d.reset();
-                        d
-                    }
-                    _ => {
-                        // P78: mmap と attention/KV 状態の確保は「層の外」でも重い候補。
-                        let m = self.build_model()?;
-                        Qwen4ExpDecoder::new(m, DecoderConfig::new(self.max_ctx))
-                    }
+                // task 131: 生成テキストを前置きに残す splice (前置きが末尾で
+                // ずれたときだけ)。成立しなければ従来どおり full prefill。
+                let spliced = match (other.as_ref(), splice_on) {
+                    (Some(c), true) => self.splice_prompt(c, req)?,
+                    _ => None,
                 };
-                prekprof::mark(t_model, prekprof::MODEL);
-                let lg = self.prefill_logits(&mut d, &prompt)?;
-                (d, lg)
+                let mut other = other;
+                if let Some(np) = spliced {
+                    let mut c = other.take().expect("splice は cache があるときだけ返る");
+                    if np.len() >= self.max_ctx {
+                        bail!(
+                            "プロンプト {} トークンが上限 {} に収まらない",
+                            np.len(),
+                            self.max_ctx
+                        );
+                    }
+                    reused = c.toks.len();
+                    prompt = np;
+                    let lg = self.prefill_logits(&mut c.dec, &prompt[reused..])?;
+                    (c.dec, lg)
+                } else {
+                    // 落ちた原因を 1 行残す (空でないキャッシュで reuse=0 のときだけ)。
+                    if let Some(c) = other.as_ref() {
+                        if !c.toks.is_empty() {
+                            eprintln!("{}", prefix_miss_line(&self.tok, &c.toks, &prompt));
+                        }
+                    }
+                    // P118: 前置きが一致しないときも、decoder が残っていれば
+                    // `build_model` を呼ばずに系列状態だけ消して使い回す。
+                    // 組み直すと `GgufLinear` に新しい uid が振られ、uid 引きの
+                    // GPU 常駐重みが全部再 upload される (cache-miss 1 回あたり
+                    // 266 本 / 3.42 秒)。reset は uid に触れないので重みは常駐した
+                    // ままで、数値も新規構築とビット一致する (engine 側
+                    // `reset_matches_fresh_decoder_bitexact`)。前のリクエストが
+                    // engine 側の失敗 (prefill / step) で落ちたときは cache が
+                    // None のままなので、この経路は通らず組み直す (半端に進んだ
+                    // decoder を使い回さない)。クライアント切断 (emit 失敗) の
+                    // ときは task 123 で cache が残るので、この reset 経路で
+                    // 重みの再 upload なしに使い回す。
+                    let t_model = prekprof::stamp();
+                    let mut d = match other {
+                        Some(c) if model_reuse => {
+                            let mut d = c.dec;
+                            d.reset();
+                            d
+                        }
+                        _ => {
+                            // P78: mmap と attention/KV 状態の確保は「層の外」でも重い候補。
+                            let m = self.build_model()?;
+                            Qwen4ExpDecoder::new(m, DecoderConfig::new(self.max_ctx))
+                        }
+                    };
+                    prekprof::mark(t_model, prekprof::MODEL);
+                    let lg = self.prefill_logits(&mut d, &prompt)?;
+                    (d, lg)
+                }
             }
         };
         let t_prefill = t1.elapsed().as_secs_f64();
+        let n_prompt = prompt.len();
+        // 次のリクエストが同じ入力を送ってきたら splice できるように、
+        // このリクエストのプロンプト構築入力を残す (task 131)。
+        let req_sig = CachedReq {
+            system: req.system.clone(),
+            messages: req.messages.clone(),
+            tools: req.tools.clone(),
+            enable_thinking: req.enable_thinking,
+            cont: req.cont,
+        };
         // task 123: テスト用の再利用トークン数の記録 (cfg(test) のみ)。
         #[cfg(test)]
         TEST_LAST_REUSE.store(reused, std::sync::atomic::Ordering::Relaxed);
@@ -894,7 +1075,14 @@ impl Flash {
         if let Some(GenFail::Client(e)) = failed {
             if model_reuse {
                 let toks = dec.tokens().to_vec();
-                self.cache = Some(Cached { dec, toks, logits });
+                self.cache = Some(Cached {
+                    dec,
+                    toks,
+                    logits,
+                    prompt_len: n_prompt,
+                    from_render: prompt_from_render,
+                    req: req_sig.clone(),
+                });
             }
             return Err(e);
         }
@@ -909,7 +1097,14 @@ impl Flash {
             }
         }
         let toks = dec.tokens().to_vec();
-        self.cache = Some(Cached { dec, toks, logits });
+        self.cache = Some(Cached {
+            dec,
+            toks,
+            logits,
+            prompt_len: n_prompt,
+            from_render: prompt_from_render,
+            req: req_sig,
+        });
         Ok(GenOut {
             text,
             n_prompt,
