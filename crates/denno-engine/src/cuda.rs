@@ -10949,8 +10949,10 @@ const Q4_GPU_ATTN_MIN_DEFAULT: usize = 64;
 const Q4_GPU_ATTN_MIRROR_MB_DEFAULT: usize = 3584;
 
 /// task 134: `DENNO_Q4_GPU_ATTN_PF` の既定 (prefill の full attention を GPU へ)。
-/// lab 前は off。判定 (ADOPT) に応じて切り替える。
-const Q4_GPU_ATTN_PF_DEFAULT: bool = false;
+/// lab t134a (SCENARIO=depth, 4 runs) で c2000 cold prefill 134.83 -> 110.59 s
+/// (-18.0%)、c2000 turn2 +0.7%、短いプロンプト 0.0%、decode -1.2%、
+/// md5 は 4 本とも同一・text sane。目標 (c2000 cold 15% 減) を満たしたので既定 on。
+const Q4_GPU_ATTN_PF_DEFAULT: bool = true;
 /// `DENNO_Q4_GPU_ATTN_PF_MIN` の既定 = 1 チャンクの行数の下限。
 /// カーネルの構造上の下限 (`attn_prefill_gpu_supported` の n >= gemm_min_m() =
 /// 256) と同じにしてある。これ未満の尾チャンクは CPU のまま。
@@ -14561,8 +14563,10 @@ mod q4_attn_tests {
     /// 短いプロンプト・小さいチャンクを CPU に残す 2 段の下限を見る。
     #[test]
     fn q4_pf_gate_values_and_thresholds() {
-        assert!(!parse_q4_gpu_attn_pf(None), "未設定は既定 (lab 前は off)");
+        // 既定は on (lab t134a で目標達成)。明示の偽値だけ off。
         assert_eq!(parse_q4_gpu_attn_pf(None), Q4_GPU_ATTN_PF_DEFAULT);
+        assert!(Q4_GPU_ATTN_PF_DEFAULT, "lab の判定で既定 on");
+        assert!(parse_q4_gpu_attn_pf(None), "未設定は既定 (on)");
         assert!(!parse_q4_gpu_attn_pf(Some("0")));
         assert!(!parse_q4_gpu_attn_pf(Some("off")));
         assert!(!parse_q4_gpu_attn_pf(Some("false")));
