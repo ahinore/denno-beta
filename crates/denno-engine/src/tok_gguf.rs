@@ -37,6 +37,9 @@ pub struct GgufTokenizer {
     chat_template: Option<String>,
     bos: Option<u32>,
     eos: Option<u32>,
+    /// task 141: control / user_defined の id (`tokenizer.ggml.token_type`)。
+    /// [`GgufTokenizer::align_trimmed_prefix`] が「content の終わり」を判定するのに使う。
+    special: std::collections::HashSet<u32>,
 }
 
 impl GgufTokenizer {
@@ -90,6 +93,7 @@ impl GgufTokenizer {
         // normalized:false が要点 (特殊トークンが事前分割でバラされない)。
         let mut added: Vec<serde_json::Value> = Vec::new();
         let mut unk: Option<String> = None;
+        let mut special: std::collections::HashSet<u32> = std::collections::HashSet::new();
         if let Some(v) = f.get("tokenizer.ggml.token_type") {
             let GgufValue::Arr(types) = v else {
                 bail!("tokenizer.ggml.token_type が配列でない");
@@ -108,15 +112,18 @@ impl GgufTokenizer {
                     as u32;
                 match ty {
                     TT_UNKNOWN => unk = Some(tokens[id].clone()),
-                    TT_CONTROL | TT_USER_DEFINED => added.push(serde_json::json!({
-                        "id": id,
-                        "content": tokens[id],
-                        "single_word": false,
-                        "lstrip": false,
-                        "rstrip": false,
-                        "normalized": false,
-                        "special": true,
-                    })),
+                    TT_CONTROL | TT_USER_DEFINED => {
+                        special.insert(id as u32);
+                        added.push(serde_json::json!({
+                            "id": id,
+                            "content": tokens[id],
+                            "single_word": false,
+                            "lstrip": false,
+                            "rstrip": false,
+                            "normalized": false,
+                            "special": true,
+                        }))
+                    }
                     _ => {}
                 }
             }
@@ -177,6 +184,7 @@ impl GgufTokenizer {
             chat_template,
             bos,
             eos,
+            special,
         })
     }
 
@@ -394,6 +402,71 @@ impl GgufTokenizer {
         p.extend_from_slice(cached);
         p.extend_from_slice(&suffix);
         Ok(Some(p))
+    }
+
+    /// task 141: 描画済みプロンプト `prompt` をキャッシュ済みトークン列 `cached` に
+    /// 整列し、食い残しの開始位置 `i` を返す (`cached` はそのまま前置きに残す)。
+    ///
+    /// task 131 の [`Self::splice_after_content`] は「最後に返した assistant の直後」
+    /// しか継げなかった。テンプレートは assistant の content を毎ターン `|trim`
+    /// するので、一度 splice したキャッシュは古い assistant の末尾空白を抱えた
+    /// ままになり、次の描画とはその位置でずれる (本番 4 ターン目の
+    /// `lcp=443 cached_tok=220(" ") prompt_tok=<|im_end|>`)。ここでは描画済みの
+    /// トークン列そのものを突き合わせ、**キャッシュ側にだけ残っている空白トークン**
+    /// を吸収して先へ進む。吸収するのは
+    ///
+    /// - 空白だけに復号できるトークン (特殊トークンは `decode` が空なので不可)
+    /// - その連続の直後が特殊トークン (= メッセージ content の終わり) のとき
+    ///
+    /// に限る。テンプレートの `|trim` が落とすのは content の端の空白だけなので、
+    /// これ以外の不一致 (本文の変更・別の会話) は必ず `None` になる。
+    ///
+    /// 戻り値は「食う」開始位置 (`prompt[i..]` をキャッシュの後ろに継ぐ)。
+    /// 食うものが無い形 (プロンプトがキャッシュ以下) は `None`。
+    pub fn align_trimmed_prefix(&self, cached: &[u32], prompt: &[u32]) -> Option<usize> {
+        let mut j = 0usize;
+        let mut i = 0usize;
+        while j < cached.len() {
+            if i < prompt.len() && cached[j] == prompt[i] {
+                j += 1;
+                i += 1;
+                continue;
+            }
+            // 食い違い: キャッシュ側の空白連続を吸収できるか。吸収した直後に
+            // 来るのが content の終端 (特殊トークン) のときだけ許す。連続が
+            // キャッシュの末尾まで続く場合は、描画側の次のトークンが終端。
+            let start = j;
+            while j < cached.len() && self.is_blank_token(cached[j]) {
+                j += 1;
+            }
+            let next = cached.get(j).or_else(|| prompt.get(i));
+            let run = j - start;
+            if run == 0 || !next.is_some_and(|&t| self.is_special_token(t)) {
+                return None;
+            }
+        }
+        if i < prompt.len() {
+            Some(i)
+        } else {
+            // 完全一致 (食うものが無い) だけ許す。プロンプトが短くなった形は不可。
+            (prompt.len() == cached.len()).then_some(i)
+        }
+    }
+
+    /// task 141: トークン 1 個が空白だけに復号できるか。
+    ///
+    /// 特殊トークン (`<|im_end|>` など) は `decode` が空文字列を返すので false。
+    /// 単体で UTF-8 にならないバイトトークンも false (吸収しない)。
+    fn is_blank_token(&self, id: u32) -> bool {
+        match self.decode(&[id]) {
+            Ok(s) => !s.is_empty() && s.chars().all(char::is_whitespace),
+            Err(_) => false,
+        }
+    }
+
+    /// task 141: control / user_defined のトークンか (`<|im_end|>` など)。
+    fn is_special_token(&self, id: u32) -> bool {
+        self.special.contains(&id)
     }
 
     pub fn eos(&self) -> Option<u32> {
