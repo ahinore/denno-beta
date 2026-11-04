@@ -43,7 +43,7 @@ use anyhow::{bail, Context, Result};
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::prekprof;
 use denno_engine::model::qwen4exp::{
-    expert_w_stats_request_end, Qwen4Exp, Qwen4ExpParams, TapTokens,
+    expert_w_stats_request_end, q4prof, Qwen4Exp, Qwen4ExpParams, TapTokens,
 };
 use denno_engine::model::qwen4exp_attn::FullAttn;
 use denno_engine::model::qwen4exp_decode::{argmax, DecoderConfig, Qwen4ExpDecoder};
@@ -366,18 +366,18 @@ struct Flash {
 /// - `q4prof`: Flash-Next の層内フェーズを 1 行にまとめて出す。
 ///
 /// どちらも既定 off では分岐 1 回だけで、数値経路には触れない。
-fn prof_flash(tag: &str, tok: usize) {
+fn prof_flash(tag: &str, tok: usize, wall_ns: u64) {
     for line in denno_engine::model::devprof::report(tag, tok) {
         eprintln!("{line}");
     }
-    prof_flash_q4(tag, tok);
+    prof_flash_q4(tag, tok, wall_ns);
 }
 
 /// `q4prof` は 27B の `DENNO_PROFILE` (表 C) とは別系統で、このモデル専用の軽量な
 /// カウンタ。以前はテストからしか読めず serve では取れなかったので、リクエストの
 /// 区切り (prefill 終端 / decode 終端) でここから出す。既定 off では
 /// `enabled()` の分岐 1 回だけで、数値経路には触れない。
-fn prof_flash_q4(tag: &str, tok: usize) {
+fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
     use denno_engine::model::qwen4exp::{moe_sub_take, q4prof};
     // decode の GDN コア内訳 (`DENNO_GDN_KPROF=1` のときだけ 1 行)。
     // q4prof とは独立に出す (`DENNO_Q4_PROFILE` を立てなくても読める)。
@@ -441,6 +441,13 @@ fn prof_flash_q4(tag: &str, tok: usize) {
     eprintln!(
         "[q4prof] {tag} ms moe router={rtr:.1} experts={exp:.1} shared={shx:.1} | attn qkv={qkv:.1} gate={gate:.1} gdn={gdn:.1} out={aout:.1} full={full:.1}"
     );
+    // task 132: decode の層の外の内訳 (decode の壁時計 − 層実行 を、個別に
+    // 測った区間に割る)。prefill は `DENNO_PRE_KPROF` の [pre-kprof] が持つ。
+    if tag == "decode" {
+        if let Some(line) = q4prof::decode_outside_line(tok, wall_ns) {
+            eprintln!("{line}");
+        }
+    }
     q4prof::reset();
 }
 
@@ -476,7 +483,10 @@ fn emit_confirmed(
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> bool {
     out.push(id);
+    // task 132: detokenize と SSE write を層の外の内訳として別々に測る。
+    let d_detok = q4prof::dstamp();
     let full = tok.decode(out).unwrap_or_default();
+    q4prof::dmark(q4prof::D_DETOK, d_detok);
     // 未完成の UTF-8 末尾は lossy デコードで U+FFFD になる。それをそのまま
     // emit すると、次のトークンで文字が完成したときに starts_with 照合が
     // 壊れてその文字が欠落する。末尾に連続する U+FFFD は保留し、文字が
@@ -496,7 +506,10 @@ fn emit_confirmed(
         if let Some(c) = cut {
             let keep = &full[..c];
             if keep.len() > text.len() {
-                if let Err(e) = emit(&keep[text.len()..]) {
+                let d_emit = q4prof::dstamp();
+                let r = emit(&keep[text.len()..]);
+                q4prof::dmark(q4prof::D_EMIT, d_emit);
+                if let Err(e) = r {
                     *failed = Some(GenFail::Client(e));
                 }
             }
@@ -506,7 +519,10 @@ fn emit_confirmed(
             return false;
         }
         if emit_end > text.len() {
-            if let Err(e) = emit(&full[text.len()..emit_end]) {
+            let d_emit = q4prof::dstamp();
+            let r = emit(&full[text.len()..emit_end]);
+            q4prof::dmark(q4prof::D_EMIT, d_emit);
+            if let Err(e) = r {
                 *failed = Some(GenFail::Client(e));
                 return false;
             }
@@ -779,7 +795,7 @@ impl Flash {
             });
         }
 
-        prof_flash("prefill", n_prompt - reused);
+        prof_flash("prefill", n_prompt - reused, (t_prefill * 1e9) as u64);
         // task 112: temperature をそのまま渡す。temperature <= 0 は
         // `Sampler::sample` 内の greedy 経路 (argmax、同点は添字小) になる。
         // 以前は None を渡していて `Sampler::new` が temperature 1.0 扱いにして
@@ -841,8 +857,11 @@ impl Flash {
         'gen: while out.len() < req.max_tokens {
             if spec_on {
                 // P109: n-gram 投機ステップ。q0 は engine の argmax (greedy)。
+                let d_topk = q4prof::dstamp();
                 let cand = if t_on { Some(denno_telemetry::topk_softmax(&logits, 8)) } else { None };
+                q4prof::dmark(q4prof::D_TOPK, d_topk);
                 let t_s = prekprof::stamp();
+                let d_sample = q4prof::dstamp();
                 let q0 = match greedy_u32(&logits) {
                     Ok(v) => v,
                     Err(e) => {
@@ -851,6 +870,7 @@ impl Flash {
                     }
                 };
                 prekprof::mark(t_s, prekprof::SAMPLE);
+                q4prof::dmark(q4prof::D_SAMPLE, d_sample);
                 prekprof::note_sample();
                 if Some(q0) == eos {
                     break;
@@ -943,11 +963,15 @@ impl Flash {
             // ---- 通常経路 (P108 までと同じ。emit の差分処理を helper 化) ----
             // P58: 選ぶ前の分布を top-8 で送る (3D ビューワの候補表示用)。
             // テレメトリ OFF なら計算しない。数値経路には触れない。
+            let d_topk = q4prof::dstamp();
             let cand = if t_on { Some(denno_telemetry::topk_softmax(&logits, 8)) } else { None };
+            q4prof::dmark(q4prof::D_TOPK, d_topk);
             // P78: サンプリングは decode 側 (prefill wall の外)。
             let t_s = prekprof::stamp();
+            let d_sample = q4prof::dstamp();
             let id = sampler.sample(&logits) as u32;
             prekprof::mark(t_s, prekprof::SAMPLE);
+            q4prof::dmark(q4prof::D_SAMPLE, d_sample);
             prekprof::note_sample();
             if Some(id) == eos {
                 break;
@@ -985,6 +1009,9 @@ impl Flash {
                     break;
                 }
             }
+            // task 132: テレメトリのフレーム送出 (Step / Token / TopK / KvUsage)
+            // も層の外。on でなければブロックごと無い (タイマーは 1 回だけ)。
+            let d_telem = q4prof::dstamp();
             if let Some(t0) = t_step {
                 self.telem.emit(Frame::Step {
                     width: 1,
@@ -1008,6 +1035,7 @@ impl Flash {
                     t_lens: vec![dec.tokens().len() as u32],
                 });
             }
+            q4prof::dmark(q4prof::D_TELEM, d_telem);
         }
         if let Some(tap) = act.as_ref() {
             tap.report_summary("decode");
@@ -1035,7 +1063,7 @@ impl Flash {
         // task 120: `DENNO_EXPERT_W_STATS=1` のときだけ decode の重み統計を 1 行出す
         // (リクエスト終端。env 未指定では分岐 1 回で何も出さない)。
         expert_w_stats_request_end();
-        prof_flash("decode", out.len());
+        prof_flash("decode", out.len(), (t_decode * 1e9) as u64);
         // P78: `DENNO_PRE_KPROF=1` のときだけ、層の外の区間を 2 行で出す
         // (既定 off では `report` が空を返す = 出力ゼロ)。
         for line in
