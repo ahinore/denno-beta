@@ -11237,15 +11237,16 @@ pub(crate) enum Q4AttnKernel {
     Split,
 }
 
-/// `DENNO_Q4_GPU_ATTN_KERNEL` の既定 (`dno_attention` = 従来動作)。
+/// `DENNO_Q4_GPU_ATTN_KERNEL` の既定。
 ///
-/// lab t135a (depth) の実測: `pf` (prefill カーネルを n=1 で使う) は 3,954 文脈で
-/// 1 呼び出し 2,269 us / 従来 586 us = 3.9 倍遅く、c2000 turn2 decode は
-/// 96 -> 117 ms/tok だった。n=1 でも PF_BQ=64 行ぶんの無効行を計算するため。
-/// `split` (新カーネル) は lab の PTX 再生成が動かず (`ptx=none`・
-/// `[q4attn] split calls=0 fallback=N`) 測れていないので既定にしない。
-/// 再生成後に `DENNO_Q4_GPU_ATTN_KERNEL=split` で測る (REPORT_P135.md)。
-const Q4_GPU_ATTN_KERNEL_DEFAULT: Q4AttnKernel = Q4AttnKernel::Decode;
+/// lab t139a (depth, ptx=elem) の実測で `split` (`dno_attention_decode`) が
+/// 3,954 文脈の 1 呼び出しを 571 us -> 7.6 us にし、c2000 turn2 decode を
+/// 93 -> 86 ms/tok にした (`[q4attn] split calls=1116 fallback=0`)。
+/// 短いプロンプトも 80 -> 80/81 ms/tok・md5 SAME なので既定にする。
+/// PTX にカーネルが無いビルドでは fail closed で `dno_attention` に落ちる。
+/// `pf` (prefill カーネルを n=1 で使う) は lab t135a で 3.9 倍遅かったので
+/// 既定にはしない (`DENNO_Q4_GPU_ATTN_KERNEL=pf` で選べる)。
+const Q4_GPU_ATTN_KERNEL_DEFAULT: Q4AttnKernel = Q4AttnKernel::Split;
 
 /// t の分割数 (`DENNO_Q4_GPU_ATTN_SPLIT`, 1..=64)。
 ///
