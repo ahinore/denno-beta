@@ -537,6 +537,11 @@ pub struct CudaCtx {
     f_attn: CUfunction,
     // P17j: prefill attention (flash 風 online softmax・exactness 緩和・ユーザー承認)
     f_attn_pf: CUfunction,
+    /// task 135: t を分割する decode attention (`dno_attention_decode`) と、
+    /// 部分和を畳む `dno_attention_decode_combine`。PTX に無ければ None で
+    /// 従来の `dno_attention` 経路に落ちる (fail closed・古い PTX でも起動可)。
+    f_attn_dec: Option<CUfunction>,
+    f_attn_dec_cb: Option<CUfunction>,
     // s48 (C1-a): dno_attention_prefill の動的 smem 上限 (bytes)。opt-in 成功時は
     // デバイスの opt-in 上限・失敗時は 48KB 既定 (ATTN_PF_DYN_SMEM にも反映)。
     attn_pf_dyn_smem: usize,
@@ -756,6 +761,25 @@ impl CudaCtx {
                 (lib.module_get_function)(&mut f_attn_pf, module_elem, b"dno_attention_prefill\0".as_ptr() as *const c_char),
                 "cuModuleGetFunction(dno_attention_prefill)",
             )?;
+            // task 135: t 分割の decode attention。古い PTX (未再生成) でも
+            // CudaCtx 生成を壊さないよう Option (無ければ従来の decode 経路)。
+            let mut f_attn_dec: CUfunction = std::ptr::null_mut();
+            let mut f_attn_dec_cb: CUfunction = std::ptr::null_mut();
+            let f_attn_dec = if (lib.module_get_function)(
+                &mut f_attn_dec,
+                module_elem,
+                b"dno_attention_decode\0".as_ptr() as *const c_char,
+            ) == 0
+                && (lib.module_get_function)(
+                    &mut f_attn_dec_cb,
+                    module_elem,
+                    b"dno_attention_decode_combine\0".as_ptr() as *const c_char,
+                ) == 0
+            {
+                Some((f_attn_dec, f_attn_dec_cb))
+            } else {
+                None
+            };
             // s48 (C1-a): 動的 smem の opt-in 試行。デバイスの opt-in 上限を取得し、
             // 48KB を超えるなら dno_attention_prefill へ設定する (qwen35 dh=256 =
             // 84.8KB を通すため)。失敗しても ctx 生成は続行 (48KB 既定のまま =
@@ -990,6 +1014,8 @@ impl CudaCtx {
                 f_expf,
                 f_attn,
                 f_attn_pf,
+                f_attn_dec: f_attn_dec.map(|(a, _)| a),
+                f_attn_dec_cb: f_attn_dec.map(|(_, b)| b),
                 attn_pf_dyn_smem,
                 f_rope,
                 f_rope_pf,
@@ -9218,16 +9244,26 @@ pub fn prefill_chain_gpu_supported(e: usize, dh: usize, t_total: usize) -> bool 
 ///   cuFuncSetAttribute opt-in が成功している場合だけ true (失敗なら false =
 ///   CPU attend フォールバック・llama は影響を受けない)
 pub fn attn_prefill_gpu_supported(n: usize, dh: usize, t_total: usize) -> bool {
+    attn_prefill_gpu_supported_min(n, dh, t_total, gemm_min_m())
+}
+
+/// task 135: 行数の下限だけを呼び出し側が決められる版。
+///
+/// qwen4exp の prefill attention は attention 専用の下限
+/// [`ATTN_Q4_PF_MIN_ROWS`] を使う (`gemm_min_m()` は GEMM の帯域しきい値で、
+/// attention のカーネル制約ではない)。qwen35 は従来どおり
+/// [`attn_prefill_gpu_supported`] (= この関数を `gemm_min_m()` で呼ぶ) を通るので
+/// 挙動は変わらない。
+pub fn attn_prefill_gpu_supported_min(
+    n: usize,
+    dh: usize,
+    t_total: usize,
+    min_rows: usize,
+) -> bool {
     if !cuda_enabled() || !gpu_attention_enabled() {
         return false;
     }
-    if n == 0 || t_total == 0 || n < gemm_min_m() {
-        return false;
-    }
-    if dh < ATTN_PF_BQ || dh > 1024 {
-        return false;
-    }
-    if attn_pf_sh_f(dh) * 4 > attn_pf_dynamic_smem_limit() {
+    if !attn_prefill_shape_ok(n, dh, t_total, min_rows) {
         return false;
     }
     // opt-in の結果 (ATTN_PF_DYN_SMEM) は CudaCtx 生成時に確定する。ここまで到達
@@ -9235,6 +9271,28 @@ pub fn attn_prefill_gpu_supported(n: usize, dh: usize, t_total: usize) -> bool {
     // chain_attention_prefill 内部でも生成されるため前倒しで生成するだけ = 新規
     // の副作用は無い)。生成失敗なら CPU フォールバック (GPU_BROKEN にはしない)。
     if shared_ctx().is_none() {
+        return false;
+    }
+    true
+}
+
+/// [`attn_prefill_gpu_supported_min`] の純関数部分 (env もデバイスも読まない)。
+///
+/// `min_rows` だけが差し替え可能で、それ以外 (n > 0・t_total >= n・dh の範囲・
+/// 動的 smem の上限) は従来のゲートと同一。
+pub(crate) fn attn_prefill_shape_ok(
+    n: usize,
+    dh: usize,
+    t_total: usize,
+    min_rows: usize,
+) -> bool {
+    if n == 0 || t_total == 0 || n < min_rows || t_total < n {
+        return false;
+    }
+    if dh < ATTN_PF_BQ || dh > 1024 {
+        return false;
+    }
+    if attn_pf_sh_f(dh) * 4 > attn_pf_dynamic_smem_limit() {
         return false;
     }
     true
@@ -10958,10 +11016,24 @@ const Q4_GPU_ATTN_MIRROR_MB_DEFAULT: usize = 3584;
 /// greedy が動いた。c2000 と短文は同一)。目標 (c2000 15% / c8000 35%) を
 /// 満たしたので既定 on。
 const Q4_GPU_ATTN_PF_DEFAULT: bool = true;
+/// task 135: attention 自身の構造上の下限 (1 チャンクの行数)。
+///
+/// 従来は `attn_prefill_gpu_supported` が `gemm_min_m()` (既定 256) を借りて
+/// いたため、next turn の 19 行チャンクや長い prefill の尾チャンク (194 行) が
+/// CPU に落ちていた。GEMM の 256 は「CPU sgemm の方が速い帯域」の話で、
+/// attention のカーネル制約ではない (制約は dh >= ATTN_PF_BQ と smem だけ)。
+/// 8 行あれば 1 タイル (PF_BQ=64 行) の中で無効行が増えても GPU が勝つ
+/// (推定: 3,954 文脈で 1 層 19 行の CPU 36 ms に対し GPU 0.4 ms 未満)。
+const ATTN_Q4_PF_MIN_ROWS: usize = 8;
+
 /// `DENNO_Q4_GPU_ATTN_PF_MIN` の既定 = 1 チャンクの行数の下限。
-/// カーネルの構造上の下限 (`attn_prefill_gpu_supported` の n >= gemm_min_m() =
-/// 256) と同じにしてある。これ未満の尾チャンクは CPU のまま。
-const Q4_GPU_ATTN_PF_MIN_DEFAULT: usize = 256;
+///
+/// task 135: カーネルの構造上の下限を `gemm_min_m()` (256) から attention 専用の
+/// [`ATTN_Q4_PF_MIN_ROWS`] へ移した。GEMM の帯域しきい値 (m >= 256) は GEMM の
+/// 話で、attention は n=19 の next turn チャンクでも GPU の方が速い
+/// (lab t135a の実測は REPORT 参照)。qwen35 は従来の `attn_prefill_gpu_supported`
+/// (n >= gemm_min_m()) のまま。
+const Q4_GPU_ATTN_PF_MIN_DEFAULT: usize = ATTN_Q4_PF_MIN_ROWS;
 /// `DENNO_Q4_GPU_ATTN_PF_MIN_KV` の既定 = 文脈長 (t_total) の下限。
 /// 短いプロンプト (数百 token) は CPU のままにする。
 const Q4_GPU_ATTN_PF_MIN_KV_DEFAULT: usize = 512;
@@ -11147,6 +11219,134 @@ fn q4_gpu_attn_pf_min_kv() -> usize {
             std::env::var("DENNO_Q4_GPU_ATTN_PF_MIN_KV").ok().as_deref(),
             Q4_GPU_ATTN_PF_MIN_KV_DEFAULT,
         )
+    })
+}
+
+// ---- task 135: decode のカーネル選択と t 分割 -----------------------------
+
+/// decode 経路で使うカーネル (`DENNO_Q4_GPU_ATTN_KERNEL`)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Q4AttnKernel {
+    /// 既存 `dno_attention` (1 q head = 1 block・dno_expf)。qwen35 もこれ。
+    Decode,
+    /// 既存 `dno_attention_prefill` を n=1・pos0=t_total-1 で使う (exp2f)。
+    Prefill,
+    /// task 135 で追加した `dno_attention_decode` (t を分割・exp2f)。
+    Split,
+}
+
+/// `DENNO_Q4_GPU_ATTN_KERNEL` の既定。
+///
+/// lab t135a / t135b の実測で決める (REPORT_P135.md 参照)。lab 前は従来動作
+/// (既存 `dno_attention`) のまま = 既定で何も変わらない。
+const Q4_GPU_ATTN_KERNEL_DEFAULT: Q4AttnKernel = Q4AttnKernel::Decode;
+
+/// t の分割数 (`DENNO_Q4_GPU_ATTN_SPLIT`, 1..=64)。
+///
+/// 1 呼び出しの block 数は heads x 分割数。qwen4exp は heads=24 なので 8 分割で
+/// 192 block (SM 170 前後) になり、t=14k でも全 SM が働く。
+const Q4_GPU_ATTN_SPLIT_DEFAULT: usize = 8;
+
+/// `dno_attention_decode` の 1 タイルの key 数。`.cu` の `DNO_DEC_BK` と一致
+/// させること (動的 smem の見積りに使う)。
+const ATTN_DEC_BK: usize = 8;
+
+/// `dno_attention_decode` の動的 smem (float 数)。q + 生スコア + 確率 + corr。
+fn q4_dec_sh_f(dh: usize) -> usize {
+    dh + 2 * ATTN_DEC_BK + 1
+}
+
+/// `DENNO_Q4_GPU_ATTN_KERNEL` の解釈 (純関数・env を読まない)。
+fn parse_q4_gpu_attn_kernel(v: Option<&str>) -> Q4AttnKernel {
+    match v.map(str::trim) {
+        Some("decode") | Some("dno") => Q4AttnKernel::Decode,
+        Some("pf") | Some("prefill") => Q4AttnKernel::Prefill,
+        Some("split") | Some("dec") => Q4AttnKernel::Split,
+        _ => Q4_GPU_ATTN_KERNEL_DEFAULT,
+    }
+}
+
+/// `DENNO_Q4_GPU_ATTN_SPLIT` の解釈 (純関数)。1..=64 に丸める。
+fn parse_q4_gpu_attn_split(v: Option<&str>) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(n) => n.clamp(1, 64),
+        None => Q4_GPU_ATTN_SPLIT_DEFAULT,
+    }
+}
+
+/// `t_total` と分割数から (実際の分割数, 1 分割あたりの key 数) を返す (純関数)。
+///
+/// 空の分割を作らない (空の分割は m = -inf になるだけで combine は 0 寄与だが、
+/// 無駄な block を増やさない)。カーネル側の `chunk = ceil(t_total / n_split)` と
+/// 同じ式で、ホストとカーネルが同じ分割を見る。
+pub(crate) fn q4_dec_split(t_total: usize, n_split: usize) -> (usize, usize) {
+    let n = n_split.max(1);
+    if t_total == 0 {
+        return (1, 1);
+    }
+    let chunk = t_total.div_ceil(n).max(1);
+    (t_total.div_ceil(chunk).max(1), chunk)
+}
+
+#[cfg(test)]
+static Q4_ATTN_KERNEL_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+#[cfg(test)]
+static Q4_ATTN_SPLIT_FORCE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// テスト用: decode のカーネル選択を差し替える (`None` で env の解釈に戻す)。
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_q4_gpu_attn_kernel_for_test(k: Option<Q4AttnKernel>) {
+    Q4_ATTN_KERNEL_FORCE.store(
+        match k {
+            Some(Q4AttnKernel::Decode) => 0,
+            Some(Q4AttnKernel::Prefill) => 1,
+            Some(Q4AttnKernel::Split) => 2,
+            None => -1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// テスト用: 分割数を差し替える (`None` で env の解釈に戻す)。
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_q4_gpu_attn_split_for_test(n: Option<usize>) {
+    Q4_ATTN_SPLIT_FORCE.store(n.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// decode 経路のカーネル (`DENNO_Q4_GPU_ATTN_KERNEL`)。未設定・不正値は既定。
+pub(crate) fn q4_gpu_attn_kernel() -> Q4AttnKernel {
+    #[cfg(test)]
+    {
+        let f = Q4_ATTN_KERNEL_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f >= 0 {
+            return match f {
+                1 => Q4AttnKernel::Prefill,
+                2 => Q4AttnKernel::Split,
+                _ => Q4AttnKernel::Decode,
+            };
+        }
+    }
+    static K: OnceLock<Q4AttnKernel> = OnceLock::new();
+    *K.get_or_init(|| {
+        parse_q4_gpu_attn_kernel(std::env::var("DENNO_Q4_GPU_ATTN_KERNEL").ok().as_deref())
+    })
+}
+
+/// t の分割数 (`DENNO_Q4_GPU_ATTN_SPLIT`)。
+fn q4_gpu_attn_split() -> usize {
+    #[cfg(test)]
+    {
+        let f = Q4_ATTN_SPLIT_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f != usize::MAX {
+            return f.clamp(1, 64);
+        }
+    }
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        parse_q4_gpu_attn_split(std::env::var("DENNO_Q4_GPU_ATTN_SPLIT").ok().as_deref())
     })
 }
 
@@ -11432,6 +11632,8 @@ struct Q4AttnScratch {
     q: Option<DevBuffer>,
     sc: Option<DevBuffer>,
     out: Option<DevBuffer>,
+    /// task 135: t 分割 decode の部分和 `[heads, n_split, dh + 2]`
+    part: Option<DevBuffer>,
 }
 
 thread_local! {
@@ -11439,6 +11641,7 @@ thread_local! {
         q: None,
         sc: None,
         out: None,
+        part: None,
     });
 }
 
@@ -11476,6 +11679,11 @@ pub struct Q4AttnCall<'a> {
 ///
 /// 戻り `Some(out)` = `[heads * dh]` の attention 出力 (CPU とは丸め順が違う)。
 /// `None` = この呼び出しでは GPU を使わない (呼び出し側は CPU 経路へ)。
+///
+/// task 135: どのカーネルを使うかは `DENNO_Q4_GPU_ATTN_KERNEL` で選ぶ
+/// (`decode` = 既存 `dno_attention` / `pf` = `dno_attention_prefill` を n=1 で /
+/// `split` = t 分割の `dno_attention_decode`)。既定は
+/// [`Q4_GPU_ATTN_KERNEL_DEFAULT`]。
 pub fn q4_attn_decode(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
     if !cuda_enabled() || !gpu_attention_enabled() || !q4_gpu_attn_enabled() {
         return None;
@@ -11483,6 +11691,24 @@ pub fn q4_attn_decode(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
     if a.len < q4_gpu_attn_min() {
         return None;
     }
+    match q4_gpu_attn_kernel() {
+        Q4AttnKernel::Decode => q4_attn_decode_single(a),
+        Q4AttnKernel::Prefill => q4_attn_decode_via_prefill(a),
+        // 新カーネルが PTX に無い (未再生成)・形状が合わないときは従来の
+        // `dno_attention` で回す。数値の契約は同じ緩和枠なので、経路が変わっても
+        // 「静かに遅いだけ」で済む。落ちた回数は [q4attn] の split fallback で見る。
+        Q4AttnKernel::Split => match q4_attn_decode_split(a) {
+            Some(v) => Some(v),
+            None => {
+                q4attn_kprof::note_split_fallback();
+                q4_attn_decode_single(a)
+            }
+        },
+    }
+}
+
+/// 既存 `dno_attention` (1 q head = 1 block・dno_expf) の decode 経路。
+fn q4_attn_decode_single(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
     // dno_attention の制約 (kernels_elem.cu)。外れたら CPU へ静かに落ちる。
     // blockDim = dh の木縮約は 2 の冪でしか正しくない。
     if a.heads == 0
@@ -11576,6 +11802,133 @@ pub fn q4_attn_decode(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
     Some(out)
 }
 
+/// task 135 step 3: decode 1 トークンを t 分割カーネル (`dno_attention_decode`
+/// + `dno_attention_decode_combine`) で回す。
+///
+/// 既存 `dno_attention` は 1 q head = 1 block なので 24 block しか立たず、
+/// t=14k では 1 SM あたりの帯域が上限になる。ここでは t を
+/// `DENNO_Q4_GPU_ATTN_SPLIT` (既定 8) 個に固定分割し、heads x 分割数の block で
+/// 全 SM を使う。分割は `t_total` と分割数だけで決まる固定分割・縮約順は昇順・
+/// 原子操作なしなので**決定論** (CPU とのビット一致はしない: attention の緩和枠)。
+///
+/// 2 発目 (combine) は部分和 (m, l, acc) を split 昇順に畳むだけの小さな
+/// カーネル。部分和バッファは VRAM 上に置いたまま (D2H しない)。
+fn q4_attn_decode_split(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
+    if a.heads == 0
+        || a.group == 0
+        || a.heads % a.group != 0
+        || a.dh == 0
+        || a.dh > 1024
+        || a.len == 0
+        || a.len > 65535
+        || a.layer >= a.n_layer
+    {
+        return None;
+    }
+    let n_kv = a.heads / a.group;
+    if a.kv_dim != n_kv * a.dh || a.q.len() != a.heads * a.dh {
+        return None;
+    }
+    let rows = a.len.checked_mul(a.kv_dim)?;
+    if a.k.len() < rows || a.v.len() < rows {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+    let (f_dec, f_cb) = (ctx.f_attn_dec?, ctx.f_attn_dec_cb?);
+    let (n_split, _chunk) = q4_dec_split(a.len, q4_gpu_attn_split());
+
+    // ミラー同期は decode / prefill と同一の台帳 (1 行追記)。
+    let (kptr, vptr) = q4ok(q4_attn_mirror_prepare(
+        a.cache_id,
+        a.n_layer,
+        a.kv_dim,
+        a.layer,
+        a.layer_gen,
+        a.len,
+        a.k,
+        a.v,
+        false,
+    ))?;
+
+    let qd = a.heads * a.dh;
+    let mut kv_dim_c = a.kv_dim as c_int;
+    let mut t_c = a.len as c_int;
+    let mut group_c = a.group as c_int;
+    let mut dh_c = a.dh as c_int;
+    let mut scale_c = a.scale;
+    let mut nsplit_c = n_split as c_int;
+    let shmem = (q4_dec_sh_f(a.dh) * 4) as u32;
+    let out = Q4ATTN_SCRATCH.with(|cell| -> Option<Vec<f32>> {
+        let mut s = cell.borrow_mut();
+        let qbytes = qd.checked_mul(4)?;
+        let part_bytes = a
+            .heads
+            .checked_mul(n_split)?
+            .checked_mul(a.dh.checked_add(2)?)?
+            .checked_mul(4)?;
+        q4ok(Scratch::ensure(&mut s.q, qbytes))?;
+        q4ok(Scratch::ensure(&mut s.out, qbytes))?;
+        q4ok(Scratch::ensure(&mut s.part, part_bytes))?;
+        let th = q4attn_kprof::stamp();
+        q4ok(s.q.as_ref().expect("ensure 済み").copy_from(a.q))?;
+        q4attn_kprof::note_q(th, qbytes);
+        let mut qptr = s.q.as_ref().expect("ensure 済み").ptr();
+        let mut aptr = s.out.as_ref().expect("ensure 済み").ptr();
+        let mut partptr = s.part.as_ref().expect("ensure 済み").ptr();
+        let mut kptr_c = kptr;
+        let mut vptr_c = vptr;
+        let mut args: Vec<*mut c_void> = vec![
+            &mut qptr as *mut _ as *mut c_void,
+            &mut kptr_c as *mut _ as *mut c_void,
+            &mut vptr_c as *mut _ as *mut c_void,
+            &mut partptr as *mut _ as *mut c_void,
+            &mut kv_dim_c as *mut _ as *mut c_void,
+            &mut t_c as *mut _ as *mut c_void,
+            &mut group_c as *mut _ as *mut c_void,
+            &mut dh_c as *mut _ as *mut c_void,
+            &mut scale_c as *mut _ as *mut c_void,
+            &mut nsplit_c as *mut _ as *mut c_void,
+        ];
+        let tl = q4attn_kprof::stamp();
+        q4ok(unsafe {
+            ctx.launch_async(
+                f_dec,
+                // split が最速次元 (同じ split の head 群が同時に走り K/V を L2 共有)
+                (n_split as u32, a.heads as u32, 1),
+                (a.dh as u32, 1, 1),
+                shmem,
+                &mut args,
+            )
+        })?;
+        let mut args2: Vec<*mut c_void> = vec![
+            &mut partptr as *mut _ as *mut c_void,
+            &mut aptr as *mut _ as *mut c_void,
+            &mut nsplit_c as *mut _ as *mut c_void,
+            &mut dh_c as *mut _ as *mut c_void,
+        ];
+        q4ok(unsafe {
+            ctx.launch_async(
+                f_cb,
+                (a.heads as u32, 1, 1),
+                (a.dh as u32, 1, 1),
+                0,
+                &mut args2,
+            )
+        })?;
+        q4attn_kprof::note_launch(tl);
+        let tw = q4attn_kprof::stamp();
+        q4ok(ctx.sync())?;
+        q4attn_kprof::note_wait(tw);
+        let td = q4attn_kprof::stamp();
+        let outv = q4ok(s.out.as_ref().expect("ensure 済み").to_vec::<f32>(qd))?;
+        q4attn_kprof::note_d2h(td, qbytes);
+        q4attn_kprof::note_call();
+        q4attn_kprof::note_split_call();
+        Some(outv)
+    })?;
+    Some(out)
+}
+
 /// qwen4exp full attention の prefill 1 チャンクぶんの入力。
 ///
 /// q は CPU 側で QK-norm + rope 済み、K/V はチャンクを push 済みのホスト
@@ -11626,15 +11979,71 @@ pub fn q4_attn_prefill(a: &Q4AttnPfCall<'_>) -> Option<Vec<f32>> {
     if !cuda_enabled() || !gpu_attention_enabled() {
         return None;
     }
-    // 発動ゲート (env + 2 段のしきい値) と、qwen35 prefill と同じ構造ゲート
-    // (n >= gemm_min_m() / dh / 動的 smem / ctx)。どれかで落ちたら静かに CPU。
+    // 発動ゲート (env + 2 段のしきい値) と shape ゲート。行数の下限は attention
+    // 専用の ATTN_Q4_PF_MIN_ROWS を使う (GEMM の gemm_min_m() は借りない)。
     if !q4_attn_pf_eligible(a.n, a.t_total) {
         return None;
     }
+    if !attn_prefill_gpu_supported_min(a.n, a.dh, a.t_total, ATTN_Q4_PF_MIN_ROWS) {
+        return None;
+    }
+    q4_attn_prefill_launch(a, false, ATTN_Q4_PF_MIN_ROWS)
+}
+
+/// decode 1 トークンを `dno_attention_prefill` で回す (task 135 step 1)。
+///
+/// n=1・pos0=t_total-1 で同じカーネルに入れる。`dno_attention` との違いは exp が
+/// exp2f であることだけで、行方向は PF_BQ=64 行のうち 63 行が無効なので
+/// block 数は heads のまま = t 分割の効果は無い (分割は step 3 の
+/// `dno_attention_decode`)。ゲートは decode のもの (`DENNO_Q4_GPU_ATTN*`) を使う。
+fn q4_attn_decode_via_prefill(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
+    if a.dh < ATTN_PF_BQ || a.dh > 1024 || a.len == 0 || a.len > 65535 {
+        return None;
+    }
+    if a.heads == 0 || a.group == 0 || a.heads % a.group != 0 || a.layer >= a.n_layer {
+        return None;
+    }
+    let n_kv = a.heads / a.group;
+    if a.kv_dim != n_kv * a.dh || a.q.len() != a.heads * a.dh {
+        return None;
+    }
+    let rows = a.len.checked_mul(a.kv_dim)?;
+    if a.k.len() < rows || a.v.len() < rows {
+        return None;
+    }
+    let call = Q4AttnPfCall {
+        cache_id: a.cache_id,
+        n_layer: a.n_layer,
+        layer: a.layer,
+        layer_gen: a.layer_gen,
+        t_total: a.len,
+        pos0: a.len - 1,
+        n: 1,
+        kv_dim: a.kv_dim,
+        heads: a.heads,
+        group: a.group,
+        dh: a.dh,
+        scale: a.scale,
+        q: a.q,
+        k: a.k,
+        v: a.v,
+    };
+    q4_attn_prefill_launch(&call, true, 1)
+}
+
+/// [`q4_attn_prefill`] / [`q4_attn_decode_via_prefill`] の実体 (ゲート済み)。
+///
+/// `dec` は計測の振り分けだけ (数値・転送内容・起動形状は同じ)。`min_rows` は
+/// 形状ゲートの行数の下限で、decode は 1 行から通す。
+fn q4_attn_prefill_launch(
+    a: &Q4AttnPfCall<'_>,
+    dec: bool,
+    min_rows: usize,
+) -> Option<Vec<f32>> {
     if a.pos0.checked_add(a.n)? != a.t_total || a.layer >= a.n_layer {
         return None;
     }
-    if !attn_prefill_gpu_supported(a.n, a.dh, a.t_total) {
+    if !attn_prefill_shape_ok(a.n, a.dh, a.t_total, min_rows) {
         return None;
     }
     // カーネルの int 引数 (t_total は 65,535 までに抑える: qwen35 と同じ上限)。
@@ -11665,7 +12074,7 @@ pub fn q4_attn_prefill(a: &Q4AttnPfCall<'_>) -> Option<Vec<f32>> {
         a.t_total,
         a.k,
         a.v,
-        true,
+        !dec,
     ))?;
 
     let mut heads_c = a.heads as c_int;
@@ -11684,7 +12093,11 @@ pub fn q4_attn_prefill(a: &Q4AttnPfCall<'_>) -> Option<Vec<f32>> {
         q4ok(Scratch::ensure(&mut s.out, qbytes))?;
         let th = q4attn_kprof::stamp();
         q4ok(s.q.as_ref().expect("ensure 済み").copy_from(a.q))?;
-        q4attn_kprof::note_pf_q(th, qbytes);
+        if dec {
+            q4attn_kprof::note_q(th, qbytes);
+        } else {
+            q4attn_kprof::note_pf_q(th, qbytes);
+        }
         let mut qptr = s.q.as_ref().expect("ensure 済み").ptr();
         let mut aptr = s.out.as_ref().expect("ensure 済み").ptr();
         let mut kptr_c = kptr;
@@ -11714,14 +12127,27 @@ pub fn q4_attn_prefill(a: &Q4AttnPfCall<'_>) -> Option<Vec<f32>> {
                 &mut args,
             )
         })?;
-        q4attn_kprof::note_pf_launch(tl);
+        if dec {
+            q4attn_kprof::note_launch(tl);
+        } else {
+            q4attn_kprof::note_pf_launch(tl);
+        }
         let tw = q4attn_kprof::stamp();
         q4ok(ctx.sync())?;
-        q4attn_kprof::note_pf_wait(tw);
+        if dec {
+            q4attn_kprof::note_wait(tw);
+        } else {
+            q4attn_kprof::note_pf_wait(tw);
+        }
         let td = q4attn_kprof::stamp();
         let outv = q4ok(s.out.as_ref().expect("ensure 済み").to_vec::<f32>(a.n * qd))?;
-        q4attn_kprof::note_pf_d2h(td, qbytes);
-        q4attn_kprof::note_pf_call();
+        if dec {
+            q4attn_kprof::note_d2h(td, qbytes);
+            q4attn_kprof::note_call();
+        } else {
+            q4attn_kprof::note_pf_d2h(td, qbytes);
+            q4attn_kprof::note_pf_call();
+        }
         Some(outv)
     })?;
     Some(out)
@@ -11843,6 +12269,26 @@ pub mod q4attn_kprof {
     /// prefill の出力 D2H の累計時間
     pub static PF_D2H_NS: AtomicU64 = AtomicU64::new(0);
 
+    // ---- task 135: t 分割 decode のカウンタ --------------------------------
+    /// `dno_attention_decode` を回した回数 (= layer x decode token)
+    pub static SPLIT_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// split を選んだが新カーネルが使えず従来 `dno_attention` へ落ちた回数。
+    /// PTX 未再生成・形状不一致の検出用 (この値が 0 でない run の decode は
+    /// split の効果を含まない)。
+    pub static SPLIT_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn note_split_call() {
+        if on() {
+            SPLIT_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn note_split_fallback() {
+        if on() {
+            SPLIT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn note_pf_h2d(t: Option<std::time::Instant>, bytes: usize) {
         if !on() {
             return;
@@ -11918,7 +12364,8 @@ pub mod q4attn_kprof {
              per-call h2d={:.1}us launch={:.1}us wait={:.1}us d2h={:.1}us | \
              mirror={entries} entries {:.0}MB / {}MB | \
              pf calls={pf_calls} h2d={:.1}MB q={:.1}MB out={:.1}MB | \
-             pf h2d={:.1}ms launch={:.1}ms wait={:.1}ms d2h={:.1}ms",
+             pf h2d={:.1}ms launch={:.1}ms wait={:.1}ms d2h={:.1}ms | \
+             split calls={} fallback={}",
             mb(SEED_BYTES.load(Ordering::Relaxed)),
             mb(ROW_BYTES.load(Ordering::Relaxed)),
             mb(Q_BYTES.load(Ordering::Relaxed)),
@@ -11941,6 +12388,8 @@ pub mod q4attn_kprof {
             ms(PF_LAUNCH_NS.load(Ordering::Relaxed)),
             ms(PF_WAIT_NS.load(Ordering::Relaxed)),
             ms(PF_D2H_NS.load(Ordering::Relaxed)),
+            SPLIT_CALLS.load(Ordering::Relaxed),
+            SPLIT_FALLBACKS.load(Ordering::Relaxed),
         ))
     }
 
@@ -11957,6 +12406,8 @@ pub mod q4attn_kprof {
             &LAUNCH_NS,
             &WAIT_NS,
             &D2H_NS,
+            &SPLIT_CALLS,
+            &SPLIT_FALLBACKS,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -14382,6 +14833,18 @@ mod q4_attn_tests {
     use super::*;
     use crate::model::qwen4exp_attn::AttnCache;
 
+    /// 決定論的 LCG 乱数 (`tests::pseudo_random` と同じ式)。このモジュールは
+    /// GPU 無しでも回るので自前で持つ。
+    fn pseudo_random(len: usize, seed: u32) -> Vec<f32> {
+        let mut x = seed;
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((x >> 16) % 2000) as f32 / 1000.0 - 1.0
+            })
+            .collect()
+    }
+
     /// テスト用の「デバイスミラー」。本番の DevBuffer の代わりに Vec<f32> を持ち、
     /// cap 成長は D2D と同じく先頭 `keep` 行を温存する。
     struct SimMirror {
@@ -14602,8 +15065,11 @@ mod q4_attn_tests {
         assert!(g(true, 256, 512, 256, 512), "両方の下限ちょうどが弾かれた");
         assert!(!g(true, 0, 512, 0, 0), "n = 0 を通した");
         assert!(!g(true, 512, 100, 0, 0), "t_total < n を通した (位置の整合)");
-        // 既定値の関係: 構造ゲート (n >= gemm_min_m() = 256) と同じ下限。
-        assert_eq!(Q4_GPU_ATTN_PF_MIN_DEFAULT, 256);
+        // 既定値の関係: task 135 で行数の下限は attention 専用の値になった
+        // (GEMM の gemm_min_m() = 256 は借りない)。
+        assert_eq!(Q4_GPU_ATTN_PF_MIN_DEFAULT, ATTN_Q4_PF_MIN_ROWS);
+        assert_eq!(Q4_GPU_ATTN_PF_MIN_DEFAULT, 8);
+        assert!(ATTN_Q4_PF_MIN_ROWS < gemm_min_m());
         assert!(Q4_GPU_ATTN_PF_MIN_KV_DEFAULT > Q4_GPU_ATTN_MIN_DEFAULT);
     }
 
@@ -14874,6 +15340,274 @@ mod q4_attn_tests {
 
         set_q4_gpu_attn_for_test(None);
         set_q4_gpu_attn_min_for_test(None);
+    }
+
+    /// task 135: decode カーネルの選択と t 分割数の解釈 (純関数)。
+    #[test]
+    fn q4_attn_kernel_and_split_parsing() {
+        assert_eq!(parse_q4_gpu_attn_kernel(None), Q4_GPU_ATTN_KERNEL_DEFAULT);
+        assert_eq!(
+            parse_q4_gpu_attn_kernel(Some("decode")),
+            Q4AttnKernel::Decode
+        );
+        assert_eq!(parse_q4_gpu_attn_kernel(Some("dno")), Q4AttnKernel::Decode);
+        assert_eq!(parse_q4_gpu_attn_kernel(Some("pf")), Q4AttnKernel::Prefill);
+        assert_eq!(
+            parse_q4_gpu_attn_kernel(Some("prefill")),
+            Q4AttnKernel::Prefill
+        );
+        assert_eq!(parse_q4_gpu_attn_kernel(Some("split")), Q4AttnKernel::Split);
+        assert_eq!(parse_q4_gpu_attn_kernel(Some("dec")), Q4AttnKernel::Split);
+        assert_eq!(
+            parse_q4_gpu_attn_kernel(Some("x")),
+            Q4_GPU_ATTN_KERNEL_DEFAULT
+        );
+        assert_eq!(parse_q4_gpu_attn_split(None), Q4_GPU_ATTN_SPLIT_DEFAULT);
+        assert_eq!(parse_q4_gpu_attn_split(Some("16")), 16);
+        assert_eq!(parse_q4_gpu_attn_split(Some("1")), 1);
+        assert_eq!(parse_q4_gpu_attn_split(Some("0")), 1, "0 は 1 に丸める");
+        assert_eq!(parse_q4_gpu_attn_split(Some("9999")), 64, "上限は 64");
+        assert_eq!(
+            parse_q4_gpu_attn_split(Some("x")),
+            Q4_GPU_ATTN_SPLIT_DEFAULT
+        );
+    }
+
+    /// task 135: t の固定分割 (ホストとカーネルが同じ式を使う)。
+    #[test]
+    fn q4_dec_split_is_fixed_and_covers_all_keys() {
+        assert_eq!(q4_dec_split(14018, 8), (8, 1753));
+        assert_eq!(q4_dec_split(3954, 8), (8, 495));
+        assert_eq!(q4_dec_split(28, 8), (7, 4));
+        assert_eq!(q4_dec_split(1, 8), (1, 1));
+        assert_eq!(q4_dec_split(0, 8), (1, 1));
+        // 昇順・重複なしで [0, t_total) を覆い、空の分割を作らない。
+        for t in [1usize, 2, 7, 8, 9, 17, 64, 65, 1000, 14018] {
+            for n in [1usize, 2, 3, 8, 16, 64] {
+                let (ns, chunk) = q4_dec_split(t, n);
+                assert!(ns >= 1 && chunk >= 1, "t={t} n={n}");
+                assert!((ns - 1) * chunk < t, "最後の分割が空 (t={t} n={n})");
+                assert!(ns * chunk >= t, "区間が足りない (t={t} n={n})");
+                assert!(ns <= n, "分割数が要求を超えた (t={t} n={n})");
+            }
+        }
+    }
+
+    /// task 135: attention 専用の構造下限 (行数) と、qwen35 が従来の
+    /// `gemm_min_m()` のままであること。
+    #[test]
+    fn attn_prefill_shape_min_rows_for_qwen4exp_only() {
+        // dh=64 は 23.4KB で 48KB 既定上限に収まる (dh=256 は実機の opt-in が要る)。
+        let dh = 64usize;
+        // attention 専用の下限 8 行: next turn の 19 行・尾チャンクの 194/242 行が通る。
+        assert!(attn_prefill_shape_ok(19, dh, 3954, ATTN_Q4_PF_MIN_ROWS));
+        assert!(attn_prefill_shape_ok(194, dh, 14018, ATTN_Q4_PF_MIN_ROWS));
+        assert!(attn_prefill_shape_ok(242, dh, 3826, ATTN_Q4_PF_MIN_ROWS));
+        assert!(attn_prefill_shape_ok(8, dh, 512, ATTN_Q4_PF_MIN_ROWS));
+        assert!(!attn_prefill_shape_ok(7, dh, 3954, ATTN_Q4_PF_MIN_ROWS));
+        // 従来の GEMM 下限 (gemm_min_m() = 256) では同じ行数が落ちる = 変更点。
+        assert!(!attn_prefill_shape_ok(19, dh, 3954, gemm_min_m()));
+        assert!(!attn_prefill_shape_ok(242, dh, 3826, gemm_min_m()));
+        // 形状の制約は従来どおり (dh >= ATTN_PF_BQ・t_total >= n・n > 0)。
+        assert!(!attn_prefill_shape_ok(19, 32, 3954, ATTN_Q4_PF_MIN_ROWS));
+        assert!(!attn_prefill_shape_ok(19, dh, 18, ATTN_Q4_PF_MIN_ROWS));
+        assert!(!attn_prefill_shape_ok(0, dh, 3954, ATTN_Q4_PF_MIN_ROWS));
+        // 本番 qwen4exp の dh=256 は 84.8KB (実機では CudaCtx 生成時に opt-in)。
+        assert_eq!(attn_pf_sh_f(256) * 4, 84_800);
+    }
+
+    /// task 135: 分割 attention のアルゴリズム (部分 online softmax + combine) を
+    /// CPU で書き下し、通常の softmax 参照と一致することを見る。カーネル自体は
+    /// GPU が要る (`q4_attn_decode_split_matches_cpu` は --ignored)。
+    fn split_attention_cpu_ref(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        len: usize,
+        kv_dim: usize,
+        heads: usize,
+        group: usize,
+        dh: usize,
+        scale: f32,
+        n_split: usize,
+    ) -> Vec<f32> {
+        let (ns, chunk) = q4_dec_split(len, n_split);
+        let mut out = vec![0f32; heads * dh];
+        for h in 0..heads {
+            let off = (h / group) * dh;
+            let mut part = vec![0f32; ns * (dh + 2)];
+            for sp in 0..ns {
+                let jlo = sp * chunk;
+                let jhi = ((sp + 1) * chunk).min(len);
+                let mut acc = vec![0f32; dh];
+                let mut m_run = f32::NEG_INFINITY;
+                let mut l_run = 0f32;
+                let mut j0 = jlo;
+                while j0 < jhi {
+                    let nk = (jhi - j0).min(ATTN_DEC_BK);
+                    let mut ss = [0f32; ATTN_DEC_BK];
+                    for kk in 0..nk {
+                        let krow = &k[(j0 + kk) * kv_dim + off..][..dh];
+                        let mut s = 0f32;
+                        for d in 0..dh {
+                            s += q[h * dh + d] * krow[d];
+                        }
+                        ss[kk] = s * scale;
+                    }
+                    let mut mx = m_run;
+                    for kk in 0..nk {
+                        mx = mx.max(ss[kk]);
+                    }
+                    let corr = ((m_run - mx) * std::f32::consts::LOG2_E).exp2();
+                    let mut l = l_run * corr;
+                    let mut pp = [0f32; ATTN_DEC_BK];
+                    for kk in 0..nk {
+                        pp[kk] = ((ss[kk] - mx) * std::f32::consts::LOG2_E).exp2();
+                        l += pp[kk];
+                    }
+                    for a in acc.iter_mut() {
+                        *a *= corr;
+                    }
+                    for kk in 0..nk {
+                        let vrow = &v[(j0 + kk) * kv_dim + off..][..dh];
+                        for d in 0..dh {
+                            acc[d] = pp[kk].mul_add(vrow[d], acc[d]);
+                        }
+                    }
+                    l_run = l;
+                    m_run = mx;
+                    j0 += ATTN_DEC_BK;
+                }
+                part[sp * (dh + 2)] = m_run;
+                part[sp * (dh + 2) + 1] = l_run;
+                part[sp * (dh + 2) + 2..][..dh].copy_from_slice(&acc);
+            }
+            // combine (split 昇順)
+            let mut mg = f32::NEG_INFINITY;
+            for sp in 0..ns {
+                mg = mg.max(part[sp * (dh + 2)]);
+            }
+            for d in 0..dh {
+                let mut denom = 0f32;
+                let mut num = 0f32;
+                for sp in 0..ns {
+                    let p = &part[sp * (dh + 2)..][..dh + 2];
+                    let e = ((p[0] - mg) * std::f32::consts::LOG2_E).exp2();
+                    denom = p[1].mul_add(e, denom);
+                    num = p[2 + d].mul_add(e, num);
+                }
+                out[h * dh + d] = if denom > 0.0 { num / denom } else { 0.0 };
+            }
+        }
+        out
+    }
+
+    /// task 135: 分割数・分割位置を変えても dense な softmax と同じ値になる
+    /// (アルゴリズムの検証。カーネルの丸め順とは無関係)。
+    #[test]
+    fn q4_attn_split_algorithm_matches_dense_softmax() {
+        let (heads, n_kv, dh) = (4usize, 2usize, 16usize);
+        let group = heads / n_kv;
+        let kv_dim = n_kv * dh;
+        let scale = 1.0 / (dh as f32).sqrt();
+        for len in [1usize, 7, 8, 9, 33, 257] {
+            let q = pseudo_random(heads * dh, 7 + len as u32);
+            let k = pseudo_random(len * kv_dim, 11 + len as u32);
+            let v = pseudo_random(len * kv_dim, 13 + len as u32);
+            let want = cpu_reference(&q, &k, &v, len, kv_dim, heads, group, dh, scale);
+            for n_split in [1usize, 2, 3, 8, 16] {
+                let got = split_attention_cpu_ref(
+                    &q, &k, &v, len, kv_dim, heads, group, dh, scale, n_split,
+                );
+                let maxd = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    maxd < 1e-5,
+                    "len={len} n_split={n_split} の分割和が dense softmax と違う: maxabs={maxd}"
+                );
+            }
+        }
+    }
+
+    /// task 135: t 分割 decode attention を CPU 参照と突き合わせる (GPU が要る)。
+    /// 決定論 (同一入力でビット一致) と分割数を変えても近いことも見る。
+    /// `cargo test --release --features cuda -p denno-engine --lib
+    /// q4_attn_decode_split -- --ignored --test-threads=1` でだけ回す。
+    #[test]
+    #[ignore = "GPU が必要"]
+    fn q4_attn_decode_split_matches_cpu() {
+        let _g = test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let _ = CudaCtx::new().expect("GPU が無い");
+        set_q4_gpu_attn_for_test(Some(true));
+        set_q4_gpu_attn_min_for_test(Some(0));
+        set_q4_gpu_attn_kernel_for_test(Some(Q4AttnKernel::Split));
+        set_q4_gpu_attn_split_for_test(Some(8));
+
+        let (heads, n_kv, dh) = (4usize, 2usize, 64usize);
+        let group = heads / n_kv;
+        let kv_dim = n_kv * dh;
+        let mut cache = AttnCache::new(1, n_kv, dh, 4096).unwrap();
+        let mut lcg = {
+            let mut s = 4242u64;
+            move || {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 33) as f32 / (1u64 << 30) as f32) - 1.0
+            }
+        };
+        for _ in 0..1000 {
+            let k: Vec<f32> = (0..kv_dim).map(|_| lcg()).collect();
+            let v: Vec<f32> = (0..kv_dim).map(|_| lcg()).collect();
+            cache.push(0, &k, &v).unwrap();
+        }
+        let len = cache.len(0).unwrap();
+        let scale = 1.0 / (dh as f32).sqrt();
+        let q: Vec<f32> = (0..heads * dh).map(|_| lcg()).collect();
+        let call = Q4AttnCall {
+            cache_id: cache.id(),
+            n_layer: 1,
+            layer: 0,
+            layer_gen: cache.gen(0).unwrap(),
+            len,
+            kv_dim,
+            heads,
+            group,
+            dh,
+            scale,
+            q: &q,
+            k: cache.k(0).unwrap(),
+            v: cache.v(0).unwrap(),
+        };
+        let want = cpu_reference(&q, cache.k(0).unwrap(), cache.v(0).unwrap(), len, kv_dim, heads, group, dh, scale);
+        let got = q4_attn_decode(&call).expect("split 経路が発動していない");
+        let maxd = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(maxd < 1e-4, "split decode が CPU 参照と違う: maxabs={maxd}");
+        // 決定論 (同一入力の 2 回目はビット一致)
+        let got2 = q4_attn_decode(&call).expect("split 経路が発動していない");
+        assert_eq!(got, got2, "split decode が非決定論的");
+        // 分割数を変えても値は近い (丸め順だけが変わる)
+        set_q4_gpu_attn_split_for_test(Some(3));
+        let got3 = q4_attn_decode(&call).expect("split 経路が発動していない");
+        let maxd3 = got3
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(maxd3 < 1e-4, "分割数 3 で値が違う: maxabs={maxd3}");
+
+        set_q4_gpu_attn_kernel_for_test(None);
+        set_q4_gpu_attn_split_for_test(None);
+        set_q4_gpu_attn_min_for_test(None);
+        set_q4_gpu_attn_for_test(None);
     }
 
     /// テスト用の CPU 参照 (dno_attention と同じ式・同じ順序)。
