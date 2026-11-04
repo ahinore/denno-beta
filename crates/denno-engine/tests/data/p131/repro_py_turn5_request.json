@@ -1,0 +1,38 @@
+[
+{
+"role": "user",
+"content": "Write Python pandas code for time series anomaly detection, with explanations."
+},
+{
+"role": "assistant",
+"content": "# Time Series Anomaly Detection with Pandas\n\nBelow is a comprehensive guide to time series anomaly detection using Python and Pandas, covering multiple approaches from simple statistical methods to more advanced techniques.\n\n## Full Implementation\n\n```python\nimport pandas as pd\nimport numpy as np\nimport matplotlib.pyplot as plt\nfrom scipy import stats\n\n# ============================================================\n# 1. SETUP: Generate Sample Time Series Data\n# ============================================================\n\ndef generate_sample_data(n_points=1000, anomaly_ratio=0.05, seed=42):\n    \"\"\"\n    Generate synthetic time series data with injected anomalies.\n    \n    Parameters:\n        n_points: Number of data points\n        anomaly_ratio: Fraction of points that are anomalies\n        seed: Random seed for reproducibility\n    \n    Returns:\n        DataFrame with 'timestamp' and 'value' columns\n    \"\"\"\n    np.random.seed(seed)\n    \n    # Create a regular time index (hourly data)"
+},
+{
+"role": "user",
+"content": "Continue with more code."
+},
+{
+"role": "assistant",
+"content": "```python\n    # Generate timestamps\n    timestamps = pd.date_range(start='2023-01-01', periods=n_points, freq='H')\n    \n    # Base signal: trend + seasonality + noise\n    t = np.arange(n_points)\n    trend = 0.02 * t                          # Linear trend\n    seasonality = 5 * np.sin(2 * np.pi * t / 24)  # Daily seasonality\n    noise = np.random.normal(0, 0.5, n_points)     # Gaussian noise\n    \n    values = trend + seasonality + noise\n    \n    # Inject anomalies\n    n_anomalies = int(n_points * anomaly_ratio)\n    anomaly_indices = np.random.choice(n_points, size=n_anomalies, replace=False)\n    \n    # Anomalies are extreme deviations (both positive and negative)\n    anomaly_magnitudes = np.random.choice([-1, "
+},
+{
+"role": "user",
+"content": "Continue with more code."
+},
+{
+"role": "assistant",
+"content": "```python\n    anomaly_magnitudes = np.random.choice([-1, 1], size=n_anomalies)\n    anomaly_strengths = np.random.uniform(5, 15, size=n_anomalies)\n    values[anomaly_indices] += anomaly_magnitudes * anomaly_strengths\n    \n    df = pd.DataFrame({\n        'timestamp': timestamps,\n        'value': values\n    })\n    \n    return df, anomaly_indices\n\n\n# ============================================================\n# 2. METHOD 1: Z-Score Based Anomaly Detection\n# ============================================================\n\ndef detect_anomalies_zscore(df, column='value', threshold=3.0, window=None):\n    \"\"\"\n    Detect anomalies using Z-score (standard deviation from mean).\n    \n    Parameters:\n        df: DataFrame with time series data\n        column: Column name containing the time series values\n        threshold: Number of standard deviations to flag as anomaly\n        window: If provided"
+},
+{
+"role": "user",
+"content": "Continue with more code."
+},
+{
+"role": "assistant",
+"content": "```python\n        window: If provided, use rolling window for local mean/std (adaptive)\n    \n    Returns:\n        DataFrame with added 'z_score' and 'is_anomaly' columns\n    \"\"\"\n    df_result = df.copy()\n    \n    if window is not None:\n        # Rolling Z-score: adapts to local trends and seasonality\n        rolling_mean = df_result[column].rolling(window=window, min_periods=1).mean()\n        rolling_std = df_result[column].rolling(window=window, min_periods=1).std()\n        # Avoid division by zero\n        rolling_std = rolling_std.replace(0, np.nan)\n        df_result['z_score'] = (df_result[column] - rolling_mean) / rolling_std\n    else:\n        # Global Z-score: assumes stationary data\n        mean = df_result[column].mean()\n        std = df_result[column].std()\n        df_result['z_score"
+},
+{
+"role": "user",
+"content": "Continue with more code."
+}
+]
