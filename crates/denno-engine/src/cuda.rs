@@ -11019,20 +11019,22 @@ const Q4_GPU_ATTN_PF_DEFAULT: bool = true;
 /// task 135: attention 自身の構造上の下限 (1 チャンクの行数)。
 ///
 /// 従来は `attn_prefill_gpu_supported` が `gemm_min_m()` (既定 256) を借りて
-/// いたため、next turn の 19 行チャンクや長い prefill の尾チャンク (194 行) が
-/// CPU に落ちていた。GEMM の 256 は「CPU sgemm の方が速い帯域」の話で、
+/// いたため、next turn の 19 行チャンクや長い prefill の尾チャンク (194 / 242 行)
+/// が CPU に落ちていた。GEMM の 256 は「CPU sgemm の方が速い帯域」の話で、
 /// attention のカーネル制約ではない (制約は dh >= ATTN_PF_BQ と smem だけ)。
-/// 8 行あれば 1 タイル (PF_BQ=64 行) の中で無効行が増えても GPU が勝つ
-/// (推定: 3,954 文脈で 1 層 19 行の CPU 36 ms に対し GPU 0.4 ms 未満)。
+///
+/// lab t135a / t135b (depth, depth8k) の実測: 8 行で next turn prefill が
+/// c2000 1.41 -> 1.03 s、c8000 2.53 -> 1.10 s (19 行・14k 文脈で 1 層 127 ms ->
+/// 10 ms)、cold prefill も尾チャンクが乗って -3.3% / -3.9%。decode と短い
+/// プロンプトはノイズ内 (±2%)、md5 は 6 本とも同一。7 行以下は CPU に残す。
 const ATTN_Q4_PF_MIN_ROWS: usize = 8;
 
 /// `DENNO_Q4_GPU_ATTN_PF_MIN` の既定 = 1 チャンクの行数の下限。
 ///
 /// task 135: カーネルの構造上の下限を `gemm_min_m()` (256) から attention 専用の
-/// [`ATTN_Q4_PF_MIN_ROWS`] へ移した。GEMM の帯域しきい値 (m >= 256) は GEMM の
-/// 話で、attention は n=19 の next turn チャンクでも GPU の方が速い
-/// (lab t135a の実測は REPORT 参照)。qwen35 は従来の `attn_prefill_gpu_supported`
-/// (n >= gemm_min_m()) のまま。
+/// [`ATTN_Q4_PF_MIN_ROWS`] へ移した。qwen35 は従来の
+/// `attn_prefill_gpu_supported` (n >= gemm_min_m()) のまま。
+/// 実測は [`ATTN_Q4_PF_MIN_ROWS`] の doc と REPORT_P135.md。
 const Q4_GPU_ATTN_PF_MIN_DEFAULT: usize = ATTN_Q4_PF_MIN_ROWS;
 /// `DENNO_Q4_GPU_ATTN_PF_MIN_KV` の既定 = 文脈長 (t_total) の下限。
 /// 短いプロンプト (数百 token) は CPU のままにする。
@@ -11235,10 +11237,14 @@ pub(crate) enum Q4AttnKernel {
     Split,
 }
 
-/// `DENNO_Q4_GPU_ATTN_KERNEL` の既定。
+/// `DENNO_Q4_GPU_ATTN_KERNEL` の既定 (`dno_attention` = 従来動作)。
 ///
-/// lab t135a / t135b の実測で決める (REPORT_P135.md 参照)。lab 前は従来動作
-/// (既存 `dno_attention`) のまま = 既定で何も変わらない。
+/// lab t135a (depth) の実測: `pf` (prefill カーネルを n=1 で使う) は 3,954 文脈で
+/// 1 呼び出し 2,269 us / 従来 586 us = 3.9 倍遅く、c2000 turn2 decode は
+/// 96 -> 117 ms/tok だった。n=1 でも PF_BQ=64 行ぶんの無効行を計算するため。
+/// `split` (新カーネル) は lab の PTX 再生成が動かず (`ptx=none`・
+/// `[q4attn] split calls=0 fallback=N`) 測れていないので既定にしない。
+/// 再生成後に `DENNO_Q4_GPU_ATTN_KERNEL=split` で測る (REPORT_P135.md)。
 const Q4_GPU_ATTN_KERNEL_DEFAULT: Q4AttnKernel = Q4AttnKernel::Decode;
 
 /// t の分割数 (`DENNO_Q4_GPU_ATTN_SPLIT`, 1..=64)。
@@ -11999,6 +12005,9 @@ pub fn q4_attn_prefill(a: &Q4AttnPfCall<'_>) -> Option<Vec<f32>> {
 /// exp2f であることだけで、行方向は PF_BQ=64 行のうち 63 行が無効なので
 /// block 数は heads のまま = t 分割の効果は無い (分割は step 3 の
 /// `dno_attention_decode`)。ゲートは decode のもの (`DENNO_Q4_GPU_ATTN*`) を使う。
+///
+/// 実測 (lab t135a): 3,954 文脈で 1 呼び出し 2,269 us = 従来 `dno_attention` の
+/// 586 us の 3.9 倍。**この経路は遅い** (64 行の無効行を計算する)。既定にはしない。
 fn q4_attn_decode_via_prefill(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
     if a.dh < ATTN_PF_BQ || a.dh > 1024 || a.len == 0 || a.len > 65535 {
         return None;
