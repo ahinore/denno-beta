@@ -23474,6 +23474,15 @@ mod p58_scratch_arena_tests {
 // (再生成前の PTX は gdn.cu より古く、P55 の `dno_gdn_chunk_pre_sm` も
 // 未収録だった)。旧 PTX を読んだ場合だけ `CudaCtx::f_gdn_scan_sig` が None に
 // なり、この経路は発動しない (計測を 1 つも積まずに CPU 経路)。
+//
+// **task 137 のラボ (t137c) で分かった残件**: 経路は発動し、数値も合う
+// (tok=1 の層 0..9 で maxabs out <= 1.8e-7 / conv 0 / ssm <= 2.4e-7、
+// 出力テキストの md5 は CPU と同一) が、**最初の decode トークンの直後の
+// submission で CUDA error 700** になり、ラッチで以後 CPU に落ちる。
+// 失敗は scan 発行前 (「submission の発行に失敗」) かつ同期 H2D の 700 なので、
+// 直前に積んだ GEMV launch (dev→dev) が疑わしい (推定。scan カーネル自体は
+// 数値が合っている)。br114 の a4a0c617f も同じ 700 を記録しており、
+// task 114 から続く既知の未解決事項。ゲートは既定 off のまま。
 
 /// GPU decode scan のゲート (`DENNO_GDN_GPU_SCAN=1|on|true`。既定 off)。
 ///

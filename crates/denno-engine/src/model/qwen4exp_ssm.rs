@@ -63,8 +63,12 @@ fn next_device_nonce() -> u64 {
 const GDN_CHECK_TOKENS: u64 = 3;
 
 /// 出す行の上限 (層 × トークンで増えるので頭打ちにする)。
+///
+/// task 137: 8 では 1 トークン目の 8 層 (li=0..7) しか見えず、9 層目以降で
+/// 起きた失敗を隠した。36 層を 1 トークンぶん覆える 40 にする (診断専用・
+/// CPU 参照の計算は上限に関係なく走るので、増えるのはログ行だけ)。
 #[cfg(feature = "cuda")]
-const GDN_CHECK_MAX_LINES: u64 = 8;
+const GDN_CHECK_MAX_LINES: u64 = 40;
 
 #[cfg(feature = "cuda")]
 static GDN_CHECK_LINES: AtomicU64 = AtomicU64::new(0);
