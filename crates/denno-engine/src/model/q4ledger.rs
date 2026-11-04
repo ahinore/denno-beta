@@ -22,7 +22,7 @@
 //! 出力は `serve_flash::prof_flash_q4` が decode のリクエスト終端で 1 回
 //! ([`line`])。値は **1 トークンあたり**に割って出す。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -51,7 +51,7 @@ fn on() -> bool {
 
 /// テストが env を立てずに台帳を通すための強制フラグ (env は `OnceLock`)。
 #[cfg(test)]
-static FORCE_ON: AtomicBool = AtomicBool::new(false);
+static FORCE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 台帳をテストから強制する (`false` で env の解釈に戻る)。
 #[cfg(test)]
