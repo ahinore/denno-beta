@@ -11818,6 +11818,9 @@ fn q4_attn_decode_split(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
         || a.group == 0
         || a.heads % a.group != 0
         || a.dh == 0
+        // blockDim = dh で 1 warp 以上が要る (warp が key を分担するため
+        // dh < 32 だと nwarp = 0 になり分担ループが回らない)。実運用は dh=256。
+        || a.dh < 32
         || a.dh > 1024
         || a.len == 0
         || a.len > 65535
