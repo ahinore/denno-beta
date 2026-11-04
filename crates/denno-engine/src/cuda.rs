@@ -10948,6 +10948,24 @@ const Q4_GPU_ATTN_MIN_DEFAULT: usize = 64;
 /// ミラー上限の既定 (MiB)。65,536 行をフルに使って 3,072 MiB。
 const Q4_GPU_ATTN_MIRROR_MB_DEFAULT: usize = 3584;
 
+/// task 134: `DENNO_Q4_GPU_ATTN_PF` の既定 (prefill の full attention を GPU へ)。
+///
+/// lab t134a (SCENARIO=depth) で c2000 cold prefill 134.83 -> 110.59 s (-18.0%)、
+/// c2000 turn2 +0.7%、短いプロンプト 0.0%、decode -1.2%、md5 は 4 本とも同一。
+/// lab t134b (SCENARIO=depth8k) で c2000 cold -18.1%、c8000 cold
+/// 758.94 -> 379.20 s (-50.0%)、c8000 turn2 2.53 -> 2.53 s (+0.0%)、decode 不変、
+/// errors 0、text sane。md5 は c8000 の 2 本だけ DIFF (GPU attention の丸め順で
+/// greedy が動いた。c2000 と短文は同一)。目標 (c2000 15% / c8000 35%) を
+/// 満たしたので既定 on。
+const Q4_GPU_ATTN_PF_DEFAULT: bool = true;
+/// `DENNO_Q4_GPU_ATTN_PF_MIN` の既定 = 1 チャンクの行数の下限。
+/// カーネルの構造上の下限 (`attn_prefill_gpu_supported` の n >= gemm_min_m() =
+/// 256) と同じにしてある。これ未満の尾チャンクは CPU のまま。
+const Q4_GPU_ATTN_PF_MIN_DEFAULT: usize = 256;
+/// `DENNO_Q4_GPU_ATTN_PF_MIN_KV` の既定 = 文脈長 (t_total) の下限。
+/// 短いプロンプト (数百 token) は CPU のままにする。
+const Q4_GPU_ATTN_PF_MIN_KV_DEFAULT: usize = 512;
+
 /// `DENNO_Q4_GPU_ATTN` の解釈 (純関数・env を読まない)。
 fn parse_q4_gpu_attn(v: Option<&str>) -> bool {
     match v.map(str::trim) {
@@ -11030,6 +11048,135 @@ fn q4_gpu_attn_min() -> usize {
     *MIN.get_or_init(|| {
         parse_q4_gpu_attn_min(std::env::var("DENNO_Q4_GPU_ATTN_MIN").ok().as_deref())
     })
+}
+
+// ---- task 134: prefill の full attention を GPU へ -------------------------
+
+/// `DENNO_Q4_GPU_ATTN_PF` の解釈 (純関数・env を読まない)。未設定は既定。
+fn parse_q4_gpu_attn_pf(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some("0") | Some("off") | Some("false") => false,
+        Some("1") | Some("on") | Some("true") => true,
+        _ => Q4_GPU_ATTN_PF_DEFAULT,
+    }
+}
+
+/// 正整数 env の解釈 (未設定・不正値は既定)。
+fn parse_usize_default(v: Option<&str>, default: usize) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(test)]
+static Q4_ATTN_PF_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+#[cfg(test)]
+static Q4_ATTN_PF_MIN_FORCE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+#[cfg(test)]
+static Q4_ATTN_PF_MIN_KV_FORCE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// テスト用: prefill ゲートを env を介さず差し替える (`None` で env の解釈に戻す)。
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_q4_gpu_attn_pf_for_test(on: Option<bool>) {
+    Q4_ATTN_PF_FORCE.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// テスト用: prefill のしきい値 (行数・文脈長) を差し替える
+/// (`None` で env の解釈に戻す)。
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_q4_gpu_attn_pf_min_for_test(rows: Option<usize>, kv: Option<usize>) {
+    Q4_ATTN_PF_MIN_FORCE.store(rows.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+    Q4_ATTN_PF_MIN_KV_FORCE.store(kv.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// prefill の full attention GPU 経路が有効か (`DENNO_Q4_GPU_ATTN_PF`)。
+fn q4_gpu_attn_pf_enabled() -> bool {
+    #[cfg(test)]
+    {
+        let f = Q4_ATTN_PF_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f >= 0 {
+            return f == 1;
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_q4_gpu_attn_pf(std::env::var("DENNO_Q4_GPU_ATTN_PF").ok().as_deref())
+    })
+}
+
+/// 1 チャンクの行数の下限 (`DENNO_Q4_GPU_ATTN_PF_MIN`)。
+fn q4_gpu_attn_pf_min_rows() -> usize {
+    #[cfg(test)]
+    {
+        let f = Q4_ATTN_PF_MIN_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f != usize::MAX {
+            return f;
+        }
+    }
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        parse_usize_default(
+            std::env::var("DENNO_Q4_GPU_ATTN_PF_MIN").ok().as_deref(),
+            Q4_GPU_ATTN_PF_MIN_DEFAULT,
+        )
+    })
+}
+
+/// 文脈長 (チャンク終端の位置数) の下限 (`DENNO_Q4_GPU_ATTN_PF_MIN_KV`)。
+fn q4_gpu_attn_pf_min_kv() -> usize {
+    #[cfg(test)]
+    {
+        let f = Q4_ATTN_PF_MIN_KV_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f != usize::MAX {
+            return f;
+        }
+    }
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        parse_usize_default(
+            std::env::var("DENNO_Q4_GPU_ATTN_PF_MIN_KV").ok().as_deref(),
+            Q4_GPU_ATTN_PF_MIN_KV_DEFAULT,
+        )
+    })
+}
+
+/// prefill の attention を GPU で回してよいか (env としきい値だけ。
+/// デバイス・形状の制約は [`attn_prefill_gpu_supported`] 側で見る)。
+///
+/// 短いプロンプトを CPU に残すための 2 段のしきい値:
+/// `n` (チャンクのトークン数) と `t_total` (チャンク終端の位置数)。
+pub(crate) fn q4_attn_pf_eligible(n: usize, t_total: usize) -> bool {
+    q4_attn_pf_gate_values(
+        q4_gpu_attn_pf_enabled(),
+        n,
+        t_total,
+        q4_gpu_attn_pf_min_rows(),
+        q4_gpu_attn_pf_min_kv(),
+    )
+}
+
+/// [`q4_attn_pf_eligible`] の判定そのもの (純関数。env もデバイスも読まない)。
+pub(crate) fn q4_attn_pf_gate_values(
+    on: bool,
+    n: usize,
+    t_total: usize,
+    min_rows: usize,
+    min_kv: usize,
+) -> bool {
+    if !on || n == 0 || t_total < n {
+        return false;
+    }
+    n >= min_rows && t_total >= min_kv
 }
 
 /// 失敗は静かに CPU へ戻す (GPU_BROKEN は立てない)。
@@ -11175,36 +11322,110 @@ fn q4_attn_grow(m: &mut Q4AttnMirror, new_cap: usize, kv_dim: usize) -> Result<(
     Ok(())
 }
 
-/// 層 `a.layer` の行 `[0..a.len)` をミラーへ同期し、K/V のデバイスポインタを返す。
+/// 層 `layer` の行 `[0..len)` をミラーへ同期し、K/V のデバイスポインタを返す。
+///
+/// task 134: decode (1 トークン) と prefill (1 チャンク) で同じ関数を使う。
+/// `len` が decode なら積んだ本数、prefill ならチャンク終端 (`pos0 + n`)。
+#[allow(clippy::too_many_arguments)]
 fn q4_attn_mirror_sync(
     m: &mut Q4AttnMirror,
-    a: &Q4AttnCall<'_>,
+    layer: usize,
+    len: usize,
+    gen: u64,
+    kv_dim: usize,
+    k: &[f32],
+    v: &[f32],
+    pf: bool,
 ) -> Result<(CUdeviceptr, CUdeviceptr)> {
-    let new_cap = q4_mirror_cap(a.len, m.state.cap);
+    let new_cap = q4_mirror_cap(len, m.state.cap);
     if new_cap > m.state.cap {
-        q4_attn_grow(m, new_cap, a.kv_dim)?;
+        q4_attn_grow(m, new_cap, kv_dim)?;
     }
-    if m.k[a.layer].is_none() || m.v[a.layer].is_none() {
-        let bytes = m.state.cap * a.kv_dim * 4;
-        m.k[a.layer] = Some(DevBuffer::alloc(bytes)?);
-        m.v[a.layer] = Some(DevBuffer::alloc(bytes)?);
+    if m.k[layer].is_none() || m.v[layer].is_none() {
+        let bytes = m.state.cap * kv_dim * 4;
+        m.k[layer] = Some(DevBuffer::alloc(bytes)?);
+        m.v[layer] = Some(DevBuffer::alloc(bytes)?);
     }
-    let have = q4_mirror_have(&m.state, a.layer, a.len, a.layer_gen);
-    if have < a.len {
-        let off = have * a.kv_dim;
-        let end = a.len * a.kv_dim;
+    let have = q4_mirror_have(&m.state, layer, len, gen);
+    if have < len {
+        let off = have * kv_dim;
+        let end = len * kv_dim;
         let t = q4attn_kprof::stamp();
-        let kb = m.k[a.layer].as_ref().expect("直前に確保した");
-        let vb = m.v[a.layer].as_ref().expect("直前に確保した");
-        kb.copy_from_at(off * 4, &a.k[off..end])?;
-        vb.copy_from_at(off * 4, &a.v[off..end])?;
-        q4attn_kprof::note_h2d(t, have == 0, (end - off) * 4 * 2);
+        let kb = m.k[layer].as_ref().expect("直前に確保した");
+        let vb = m.v[layer].as_ref().expect("直前に確保した");
+        kb.copy_from_at(off * 4, &k[off..end])?;
+        vb.copy_from_at(off * 4, &v[off..end])?;
+        if pf {
+            q4attn_kprof::note_pf_h2d(t, (end - off) * 4 * 2);
+        } else {
+            q4attn_kprof::note_h2d(t, have == 0, (end - off) * 4 * 2);
+        }
     }
-    q4_mirror_note(&mut m.state, a.layer, a.len, a.layer_gen);
+    q4_mirror_note(&mut m.state, layer, len, gen);
     Ok((
-        m.k[a.layer].as_ref().expect("確保済み").ptr(),
-        m.v[a.layer].as_ref().expect("確保済み").ptr(),
+        m.k[layer].as_ref().expect("確保済み").ptr(),
+        m.v[layer].as_ref().expect("確保済み").ptr(),
     ))
+}
+
+/// ミラーのエントリ (鍵 = `AttnCache::id()`) を引き、層の行 `[0..len)` を
+/// 同期して K/V のデバイスポインタを返す。予算超過分は LRU で落とす。
+///
+/// 失敗したらそのエントリごと捨てる (中途半端なミラーを持たない = 次回は
+/// 全行シードから)。task 133 の decode と task 134 の prefill の共通経路。
+/// `pf` は計測の振り分けだけ (数値・転送内容は同じ)。
+#[allow(clippy::too_many_arguments)]
+fn q4_attn_mirror_prepare(
+    cache_id: u64,
+    n_layer: usize,
+    kv_dim: usize,
+    layer: usize,
+    gen: u64,
+    len: usize,
+    k: &[f32],
+    v: &[f32],
+    pf: bool,
+) -> Result<(CUdeviceptr, CUdeviceptr)> {
+    let mirrors = Q4_ATTN_MIRRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut ms = match mirrors.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let now = std::time::Instant::now();
+    // 予算超過分を LRU で落とす (自分は落とさない)。
+    let mut meta: Vec<MirrorMeta> = ms
+        .iter()
+        .map(|(k, m, t)| MirrorMeta {
+            key: *k,
+            bytes: m.bytes(),
+            last: *t,
+            pending: false,
+        })
+        .collect();
+    let evicted = lru_evict_keys(&mut meta, q4_attn_mirror_limit_bytes(), cache_id);
+    if !evicted.is_empty() {
+        ms.retain(|(k, _, _)| !evicted.contains(k));
+    }
+    let idx = match ms.iter().position(|(k, _, _)| *k == cache_id) {
+        Some(i) => {
+            ms[i].2 = now;
+            i
+        }
+        None => {
+            ms.push((cache_id, Q4AttnMirror::new(n_layer, kv_dim), now));
+            ms.len() - 1
+        }
+    };
+    if ms[idx].1.kv_dim != kv_dim || ms[idx].1.state.len.len() != n_layer {
+        ms[idx].1 = Q4AttnMirror::new(n_layer, kv_dim);
+    }
+    match q4_attn_mirror_sync(&mut ms[idx].1, layer, len, gen, kv_dim, k, v, pf) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            ms.retain(|(k, _, _)| *k != cache_id);
+            Err(e)
+        }
+    }
 }
 
 struct Q4AttnScratch {
@@ -11286,50 +11507,17 @@ pub fn q4_attn_decode(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
     let ctx = chain_ctx()?;
 
     // ミラー同期 (この層の K/V を len 行まで)。失敗したらエントリごと捨てて CPU。
-    let (kptr, vptr) = {
-        let mirrors = Q4_ATTN_MIRRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
-        let mut ms = match mirrors.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        };
-        let now = std::time::Instant::now();
-        // 予算超過分を LRU で落とす (自分は落とさない)。
-        let mut meta: Vec<MirrorMeta> = ms
-            .iter()
-            .map(|(k, m, t)| MirrorMeta {
-                key: *k,
-                bytes: m.bytes(),
-                last: *t,
-                pending: false,
-            })
-            .collect();
-        let evicted = lru_evict_keys(&mut meta, q4_attn_mirror_limit_bytes(), a.cache_id);
-        if !evicted.is_empty() {
-            ms.retain(|(k, _, _)| !evicted.contains(k));
-        }
-        let idx = match ms.iter().position(|(k, _, _)| *k == a.cache_id) {
-            Some(i) => {
-                ms[i].2 = now;
-                i
-            }
-            None => {
-                ms.push((a.cache_id, Q4AttnMirror::new(a.n_layer, a.kv_dim), now));
-                ms.len() - 1
-            }
-        };
-        if ms[idx].1.kv_dim != a.kv_dim || ms[idx].1.state.len.len() != a.n_layer {
-            ms[idx].1 = Q4AttnMirror::new(a.n_layer, a.kv_dim);
-        }
-        match q4_attn_mirror_sync(&mut ms[idx].1, a) {
-            Ok(p) => p,
-            Err(e) => {
-                // 中途半端なミラーは持たない (次回は全行シードから)。
-                ms.retain(|(k, _, _)| *k != a.cache_id);
-                q4_attn_fail(e);
-                return None;
-            }
-        }
-    };
+    let (kptr, vptr) = q4ok(q4_attn_mirror_prepare(
+        a.cache_id,
+        a.n_layer,
+        a.kv_dim,
+        a.layer,
+        a.layer_gen,
+        a.len,
+        a.k,
+        a.v,
+        false,
+    ))?;
 
     // カーネル起動 (スクラッチはスレッドローカル grow-only)。
     let qd = a.heads * a.dh;
@@ -11383,6 +11571,157 @@ pub fn q4_attn_decode(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
         let outv = q4ok(s.out.as_ref().expect("ensure 済み").to_vec::<f32>(qd))?;
         q4attn_kprof::note_d2h(td, qbytes);
         q4attn_kprof::note_call();
+        Some(outv)
+    })?;
+    Some(out)
+}
+
+/// qwen4exp full attention の prefill 1 チャンクぶんの入力。
+///
+/// q は CPU 側で QK-norm + rope 済み、K/V はチャンクを push 済みのホスト
+/// キャッシュ (層 `layer` の `[0, t_total)`)。
+pub struct Q4AttnPfCall<'a> {
+    /// `AttnCache::id()` (ミラーの鍵。decode と同じ台帳を共有する)
+    pub cache_id: u64,
+    /// キャッシュの層数
+    pub n_layer: usize,
+    /// この層
+    pub layer: usize,
+    /// `AttnCache::gen(layer)` (内容世代)
+    pub layer_gen: u64,
+    /// チャンク終端の位置数 (= pos0 + n)。ミラーはここまで同期する
+    pub t_total: usize,
+    /// チャンク先頭の位置 (最初のクエリ行の絶対位置)
+    pub pos0: usize,
+    /// チャンクのトークン数 (クエリ行数)
+    pub n: usize,
+    /// 1 行の長さ = n_head_kv * head_dim
+    pub kv_dim: usize,
+    /// q head 数
+    pub heads: usize,
+    /// q head / kv head
+    pub group: usize,
+    /// head_dim
+    pub dh: usize,
+    /// qk scale (softmax 前の乗数)
+    pub scale: f32,
+    /// rope 済み q `[n * heads * dh]` (トークン順・head 順)
+    pub q: &'a [f32],
+    /// 層の K 行 `[t_total * kv_dim]`
+    pub k: &'a [f32],
+    /// 層の V 行 `[t_total * kv_dim]`
+    pub v: &'a [f32],
+}
+
+/// qwen4exp full attention (prefill の 1 チャンク) を GPU で回す。
+///
+/// `dno_attention_prefill` (flash 風 online softmax・固定タイル) を 1 発打ち、
+/// `[n, heads*dh]` を返す。因果性はカーネル内で `pos0` を使って閉じる
+/// (クエリ行 `i` は `0..=pos0+i`)。マスクされたキーはスコアが -inf で
+/// exp2 が厳密に 0 になるため、**チャンクの切り方に依存しない** (行チャンク不変)。
+///
+/// 戻り `Some(out)` = GPU の出力 (CPU とは丸め順が違う。決定論は維持)。
+/// `None` = この呼び出しでは GPU を使わない (呼び出し側は CPU 経路へ)。
+pub fn q4_attn_prefill(a: &Q4AttnPfCall<'_>) -> Option<Vec<f32>> {
+    if !cuda_enabled() || !gpu_attention_enabled() {
+        return None;
+    }
+    // 発動ゲート (env + 2 段のしきい値) と、qwen35 prefill と同じ構造ゲート
+    // (n >= gemm_min_m() / dh / 動的 smem / ctx)。どれかで落ちたら静かに CPU。
+    if !q4_attn_pf_eligible(a.n, a.t_total) {
+        return None;
+    }
+    if a.pos0.checked_add(a.n)? != a.t_total || a.layer >= a.n_layer {
+        return None;
+    }
+    if !attn_prefill_gpu_supported(a.n, a.dh, a.t_total) {
+        return None;
+    }
+    // カーネルの int 引数 (t_total は 65,535 までに抑える: qwen35 と同じ上限)。
+    if a.t_total > 65535 || a.heads == 0 || a.group == 0 || a.heads % a.group != 0 {
+        return None;
+    }
+    let n_kv = a.heads / a.group;
+    if a.kv_dim != n_kv * a.dh {
+        return None;
+    }
+    let qd = a.heads.checked_mul(a.dh)?;
+    if a.q.len() != a.n.checked_mul(qd)? {
+        return None;
+    }
+    let rows = a.t_total.checked_mul(a.kv_dim)?;
+    if a.k.len() < rows || a.v.len() < rows {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+
+    // ミラー同期 (decode と同一の台帳・再同期規則)。チャンクの追記だけを送る。
+    let (kptr, vptr) = q4ok(q4_attn_mirror_prepare(
+        a.cache_id,
+        a.n_layer,
+        a.kv_dim,
+        a.layer,
+        a.layer_gen,
+        a.t_total,
+        a.k,
+        a.v,
+        true,
+    ))?;
+
+    let mut heads_c = a.heads as c_int;
+    let mut n_c = a.n as c_int;
+    let mut pos0_c = a.pos0 as c_int;
+    let mut kv_dim_c = a.kv_dim as c_int;
+    let mut t_c = a.t_total as c_int;
+    let mut group_c = a.group as c_int;
+    let mut dh_c = a.dh as c_int;
+    let mut scale_c = a.scale;
+    let shmem = (attn_pf_sh_f(a.dh) * 4) as u32;
+    let out = Q4ATTN_SCRATCH.with(|cell| -> Option<Vec<f32>> {
+        let mut s = cell.borrow_mut();
+        let qbytes = a.n.checked_mul(qd)?.checked_mul(4)?;
+        q4ok(Scratch::ensure(&mut s.q, qbytes))?;
+        q4ok(Scratch::ensure(&mut s.out, qbytes))?;
+        let th = q4attn_kprof::stamp();
+        q4ok(s.q.as_ref().expect("ensure 済み").copy_from(a.q))?;
+        q4attn_kprof::note_pf_q(th, qbytes);
+        let mut qptr = s.q.as_ref().expect("ensure 済み").ptr();
+        let mut aptr = s.out.as_ref().expect("ensure 済み").ptr();
+        let mut kptr_c = kptr;
+        let mut vptr_c = vptr;
+        let mut args: Vec<*mut c_void> = vec![
+            &mut qptr as *mut _ as *mut c_void,
+            &mut kptr_c as *mut _ as *mut c_void,
+            &mut vptr_c as *mut _ as *mut c_void,
+            &mut aptr as *mut _ as *mut c_void,
+            &mut heads_c as *mut _ as *mut c_void,
+            &mut n_c as *mut _ as *mut c_void,
+            &mut pos0_c as *mut _ as *mut c_void,
+            &mut kv_dim_c as *mut _ as *mut c_void,
+            &mut t_c as *mut _ as *mut c_void,
+            &mut group_c as *mut _ as *mut c_void,
+            &mut dh_c as *mut _ as *mut c_void,
+            &mut scale_c as *mut _ as *mut c_void,
+        ];
+        let tl = q4attn_kprof::stamp();
+        q4ok(unsafe {
+            ctx.launch_async(
+                ctx.f_attn_pf,
+                // qwen35 prefill と同一の形状: (行ブロック, head)。
+                (a.n.div_ceil(ATTN_PF_BQ) as u32, a.heads as u32, 1),
+                (a.dh as u32, 1, 1),
+                shmem,
+                &mut args,
+            )
+        })?;
+        q4attn_kprof::note_pf_launch(tl);
+        let tw = q4attn_kprof::stamp();
+        q4ok(ctx.sync())?;
+        q4attn_kprof::note_pf_wait(tw);
+        let td = q4attn_kprof::stamp();
+        let outv = q4ok(s.out.as_ref().expect("ensure 済み").to_vec::<f32>(a.n * qd))?;
+        q4attn_kprof::note_pf_d2h(td, qbytes);
+        q4attn_kprof::note_pf_call();
         Some(outv)
     })?;
     Some(out)
@@ -11483,21 +11822,103 @@ pub mod q4attn_kprof {
         }
     }
 
+    // ---- task 134: prefill (1 チャンク = 1 層 1 呼び出し) -------------------
+
+    /// prefill でカーネルを回した回数 (= layer x chunk)
+    pub static PF_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// prefill で K/V ミラーへ送ったバイト数 (チャンクの追記)
+    pub static PF_H2D_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// prefill の q の H2D バイト数
+    pub static PF_Q_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// prefill の出力 D2H バイト数
+    pub static PF_OUT_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// prefill の K/V 追記 H2D の累計時間
+    pub static PF_H2D_NS: AtomicU64 = AtomicU64::new(0);
+    /// prefill の q の H2D 累計時間
+    pub static PF_Q_NS: AtomicU64 = AtomicU64::new(0);
+    /// prefill の launch 発行の累計時間
+    pub static PF_LAUNCH_NS: AtomicU64 = AtomicU64::new(0);
+    /// prefill のカーネル待ちの累計時間
+    pub static PF_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    /// prefill の出力 D2H の累計時間
+    pub static PF_D2H_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn note_pf_h2d(t: Option<std::time::Instant>, bytes: usize) {
+        if !on() {
+            return;
+        }
+        PF_H2D_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        add_ns(t, &PF_H2D_NS);
+    }
+
+    pub(crate) fn note_pf_q(t: Option<std::time::Instant>, bytes: usize) {
+        if !on() {
+            return;
+        }
+        PF_Q_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        add_ns(t, &PF_Q_NS);
+    }
+
+    pub(crate) fn note_pf_launch(t: Option<std::time::Instant>) {
+        if on() {
+            add_ns(t, &PF_LAUNCH_NS);
+        }
+    }
+
+    pub(crate) fn note_pf_wait(t: Option<std::time::Instant>) {
+        if on() {
+            add_ns(t, &PF_WAIT_NS);
+        }
+    }
+
+    pub(crate) fn note_pf_d2h(t: Option<std::time::Instant>, bytes: usize) {
+        if !on() {
+            return;
+        }
+        PF_OUT_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        add_ns(t, &PF_D2H_NS);
+    }
+
+    pub(crate) fn note_pf_call() {
+        if on() {
+            PF_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// prefill ぶんの累計を 0 に戻す。
+    pub fn reset_pf() {
+        for c in [
+            &PF_CALLS,
+            &PF_H2D_BYTES,
+            &PF_Q_BYTES,
+            &PF_OUT_BYTES,
+            &PF_H2D_NS,
+            &PF_LAUNCH_NS,
+            &PF_WAIT_NS,
+            &PF_D2H_NS,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// 1 リクエストぶんの 1 行 (呼び出しが 0 なら `None`)。
     pub fn line() -> Option<String> {
         let calls = CALLS.load(Ordering::Relaxed);
-        if calls == 0 {
+        let pf_calls = PF_CALLS.load(Ordering::Relaxed);
+        if calls == 0 && pf_calls == 0 {
             return None;
         }
         let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
         let ms = |ns: u64| ns as f64 / 1e6;
-        let us = |ns: u64| ns as f64 / 1e3 / calls as f64;
+        let us = |ns: u64| ns as f64 / 1e3 / calls.max(1) as f64;
         let (entries, used, limit) = super::q4_attn_mirror_stats().unwrap_or((0, 0, 0));
         Some(format!(
             "[q4attn] calls={calls} h2d seed={:.1}MB row={:.1}MB q={:.1}MB | out={:.1}MB | \
              h2d={:.1}ms q={:.1}ms launch={:.1}ms wait={:.1}ms d2h={:.1}ms | \
              per-call h2d={:.1}us launch={:.1}us wait={:.1}us d2h={:.1}us | \
-             mirror={entries} entries {:.0}MB / {}MB",
+             mirror={entries} entries {:.0}MB / {}MB | \
+             pf calls={pf_calls} h2d={:.1}MB q={:.1}MB out={:.1}MB | \
+             pf h2d={:.1}ms launch={:.1}ms wait={:.1}ms d2h={:.1}ms",
             mb(SEED_BYTES.load(Ordering::Relaxed)),
             mb(ROW_BYTES.load(Ordering::Relaxed)),
             mb(Q_BYTES.load(Ordering::Relaxed)),
@@ -11513,6 +11934,13 @@ pub mod q4attn_kprof {
             us(D2H_NS.load(Ordering::Relaxed)),
             mb(used as u64),
             limit / (1024 * 1024),
+            mb(PF_H2D_BYTES.load(Ordering::Relaxed)),
+            mb(PF_Q_BYTES.load(Ordering::Relaxed)),
+            mb(PF_OUT_BYTES.load(Ordering::Relaxed)),
+            ms(PF_H2D_NS.load(Ordering::Relaxed)),
+            ms(PF_LAUNCH_NS.load(Ordering::Relaxed)),
+            ms(PF_WAIT_NS.load(Ordering::Relaxed)),
+            ms(PF_D2H_NS.load(Ordering::Relaxed)),
         ))
     }
 
@@ -11532,6 +11960,8 @@ pub mod q4attn_kprof {
         ] {
             c.store(0, Ordering::Relaxed);
         }
+        // task 134: prefill の累計も同じリクエスト境界で戻す。
+        reset_pf();
     }
 }
 
@@ -14132,6 +14562,213 @@ mod q4_attn_tests {
         assert_eq!(parse_q4_gpu_attn_min(Some("x")), Q4_GPU_ATTN_MIN_DEFAULT);
         assert_eq!(q4_attn_mirror_limit_from(None), 3584 * 1024 * 1024);
         assert_eq!(q4_attn_mirror_limit_from(Some(16)), 16 * 1024 * 1024);
+    }
+
+    /// task 134: prefill ゲートの解釈としきい値 (純関数)。
+    /// 短いプロンプト・小さいチャンクを CPU に残す 2 段の下限を見る。
+    #[test]
+    fn q4_pf_gate_values_and_thresholds() {
+        // 既定は on (lab t134a で目標達成)。明示の偽値だけ off。
+        assert_eq!(parse_q4_gpu_attn_pf(None), Q4_GPU_ATTN_PF_DEFAULT);
+        assert!(Q4_GPU_ATTN_PF_DEFAULT, "lab の判定で既定 on");
+        assert!(parse_q4_gpu_attn_pf(None), "未設定は既定 (on)");
+        assert!(!parse_q4_gpu_attn_pf(Some("0")));
+        assert!(!parse_q4_gpu_attn_pf(Some("off")));
+        assert!(!parse_q4_gpu_attn_pf(Some("false")));
+        assert!(parse_q4_gpu_attn_pf(Some("1")));
+        assert!(parse_q4_gpu_attn_pf(Some("on")));
+        assert!(parse_q4_gpu_attn_pf(Some("true")));
+        assert_eq!(
+            parse_usize_default(None, Q4_GPU_ATTN_PF_MIN_DEFAULT),
+            Q4_GPU_ATTN_PF_MIN_DEFAULT
+        );
+        assert_eq!(parse_usize_default(Some("512"), 256), 512);
+        assert_eq!(parse_usize_default(Some("x"), 256), 256);
+        assert_eq!(q4_attn_mirror_limit_from(None), 3584 * 1024 * 1024);
+
+        // (on, n, t_total, min_rows, min_kv)
+        let g = |on: bool, n: usize, t: usize, mr: usize, mk: usize| {
+            q4_attn_pf_gate_values(on, n, t, mr, mk)
+        };
+        // 短いプロンプト (26 token) は既定のしきい値で CPU。env ゲート自身は
+        // しきい値だけを見るので、0 を渡せば通る (26 token を弾くのは構造ゲート
+        // `attn_prefill_gpu_supported` の n >= gemm_min_m() 側)。
+        assert!(!g(false, 512, 4096, 256, 512), "off で通った");
+        assert!(g(true, 26, 26, 0, 0), "しきい値 0 なら env ゲートは通す");
+        assert!(!g(true, 26, 26, 256, 512), "短いプロンプトが既定のしきい値で通った");
+        assert!(!g(true, 512, 256, 256, 512), "文脈長が下限未満で通った");
+        assert!(!g(true, 128, 4096, 256, 512), "チャンク行数が下限未満で通った");
+        assert!(g(true, 512, 1024, 256, 512), "通常のチャンクが弾かれた");
+        assert!(g(true, 256, 512, 256, 512), "両方の下限ちょうどが弾かれた");
+        assert!(!g(true, 0, 512, 0, 0), "n = 0 を通した");
+        assert!(!g(true, 512, 100, 0, 0), "t_total < n を通した (位置の整合)");
+        // 既定値の関係: 構造ゲート (n >= gemm_min_m() = 256) と同じ下限。
+        assert_eq!(Q4_GPU_ATTN_PF_MIN_DEFAULT, 256);
+        assert!(Q4_GPU_ATTN_PF_MIN_KV_DEFAULT > Q4_GPU_ATTN_MIN_DEFAULT);
+    }
+
+    /// task 134: prefill がチャンクを積んだ後、**最初の decode トークンは
+    /// 1 行だけ**送る (全行シードに戻らない)。prefill と decode が同じ台帳
+    /// (`q4_mirror_*`) を共有していることの固定。
+    #[test]
+    fn q4_mirror_prefill_then_decode_syncs_one_row() {
+        let mut st = Q4MirrorState {
+            cap: 0,
+            len: vec![0; 2],
+            gen: vec![0; 2],
+        };
+        // チャンク 1 (512 行) / チャンク 2 (1,024 行) を prefill の規則で積む。
+        assert_eq!(q4_mirror_have(&st, 0, 512, 0), 0, "初回は全行シード");
+        q4_mirror_note(&mut st, 0, 512, 0);
+        assert_eq!(q4_mirror_have(&st, 0, 1024, 0), 512, "2 チャンク目は追記 512 行");
+        q4_mirror_note(&mut st, 0, 1024, 0);
+        // prefill 直後: 全行そろっている。
+        assert_eq!(q4_mirror_have(&st, 0, 1024, 0), 1024);
+        // 最初の decode トークン (len = 1,025) は 1 行だけ。
+        assert_eq!(q4_mirror_have(&st, 0, 1025, 0), 1024);
+        // 使っていない層 (ssm) は 0 のまま = 確保もしない。
+        assert_eq!(q4_mirror_have(&st, 1, 1025, 0), 0);
+        // clear_all / truncate 相当 (世代 +1) は全行シードに戻る。
+        assert_eq!(q4_mirror_have(&st, 0, 1025, 1), 0);
+        // cap は t_total で倍々に育つ (prefill でも同じ規則)。
+        assert_eq!(q4_mirror_cap(1024, 0), 1024);
+        assert_eq!(q4_mirror_cap(1025, 1024), 2048);
+    }
+
+    /// GPU が要る実機テスト (task 134)。prefill の 1 チャンクを CPU 参照と
+    /// 突き合わせ、その直後の decode 1 トークンも同じミラーで合うことを見る。
+    /// `cargo test --release --features cuda -p denno-engine --lib
+    /// q4_gpu_attn_prefill -- --ignored --test-threads=1` でだけ回す。
+    #[test]
+    #[ignore = "GPU が必要"]
+    fn q4_gpu_attn_prefill_matches_cpu_and_decode() {
+        let _g = test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let _ = CudaCtx::new().expect("GPU が無い");
+        set_q4_gpu_attn_pf_for_test(Some(true));
+        set_q4_gpu_attn_pf_min_for_test(Some(0), Some(0));
+        set_q4_gpu_attn_for_test(Some(true));
+        set_q4_gpu_attn_min_for_test(Some(0));
+
+        // dh >= ATTN_PF_BQ (= 64) がカーネルの下限。smem は 23.4 KB で opt-in 不要。
+        let (heads, n_kv, dh, n_layer, max_ctx) = (4usize, 2usize, 64usize, 1usize, 1024usize);
+        let group = heads / n_kv;
+        let kv_dim = n_kv * dh;
+        let mut cache = AttnCache::new(n_layer, n_kv, dh, max_ctx).unwrap();
+        let mut lcg = {
+            let mut s = 999u64;
+            move || {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 33) as f32 / (1u64 << 30) as f32) - 1.0
+            }
+        };
+        let push = |cache: &mut AttnCache, lcg: &mut dyn FnMut() -> f32| {
+            let k: Vec<f32> = (0..kv_dim).map(|_| lcg()).collect();
+            let v: Vec<f32> = (0..kv_dim).map(|_| lcg()).collect();
+            cache.push(0, &k, &v).unwrap();
+        };
+        let scale = 1.0 / (dh as f32).sqrt();
+
+        // 2 チャンク (300 + 300 行)。n >= gemm_min_m() = 256 が必要。
+        let mut base = 0usize;
+        for chunk in [300usize, 300] {
+            for _ in 0..chunk {
+                push(&mut cache, &mut lcg);
+            }
+            let t_total = base + chunk;
+            let qs: Vec<f32> = (0..chunk * heads * dh).map(|_| lcg()).collect();
+            let call = Q4AttnPfCall {
+                cache_id: cache.id(),
+                n_layer,
+                layer: 0,
+                layer_gen: cache.gen(0).unwrap(),
+                t_total,
+                pos0: base,
+                n: chunk,
+                kv_dim,
+                heads,
+                group,
+                dh,
+                scale,
+                q: &qs,
+                k: cache.k(0).unwrap(),
+                v: cache.v(0).unwrap(),
+            };
+            let got = q4_attn_prefill(&call).expect("prefill の GPU 経路が発動していない");
+            assert_eq!(got.len(), chunk * heads * dh);
+            for t in 0..chunk {
+                let qrow = &qs[t * heads * dh..(t + 1) * heads * dh];
+                let want = cpu_reference(
+                    qrow,
+                    cache.k(0).unwrap(),
+                    cache.v(0).unwrap(),
+                    base + t + 1,
+                    kv_dim,
+                    heads,
+                    group,
+                    dh,
+                    scale,
+                );
+                for i in 0..heads * dh {
+                    let tol = 1e-4 + 1e-5 * want[i].abs();
+                    assert!(
+                        (got[t * heads * dh + i] - want[i]).abs() <= tol,
+                        "chunk {chunk} 行 {t} 要素 {i}: GPU {} vs CPU {} (許容 {tol})",
+                        got[t * heads * dh + i],
+                        want[i]
+                    );
+                }
+            }
+            base = t_total;
+        }
+
+        // prefill の直後に decode 1 トークン (全行シードし直さずに合うか)。
+        push(&mut cache, &mut lcg);
+        let len = base + 1;
+        let q: Vec<f32> = (0..heads * dh).map(|_| lcg()).collect();
+        let dcall = Q4AttnCall {
+            cache_id: cache.id(),
+            n_layer,
+            layer: 0,
+            layer_gen: cache.gen(0).unwrap(),
+            len,
+            kv_dim,
+            heads,
+            group,
+            dh,
+            scale,
+            q: &q,
+            k: cache.k(0).unwrap(),
+            v: cache.v(0).unwrap(),
+        };
+        let got = q4_attn_decode(&dcall).expect("decode の GPU 経路が発動していない");
+        let want = cpu_reference(
+            &q,
+            cache.k(0).unwrap(),
+            cache.v(0).unwrap(),
+            len,
+            kv_dim,
+            heads,
+            group,
+            dh,
+            scale,
+        );
+        for i in 0..heads * dh {
+            let tol = 1e-4 + 1e-5 * want[i].abs();
+            assert!(
+                (got[i] - want[i]).abs() <= tol,
+                "prefill 直後の decode 要素 {i}: GPU {} vs CPU {} (許容 {tol})",
+                got[i],
+                want[i]
+            );
+        }
+
+        set_q4_gpu_attn_pf_for_test(None);
+        set_q4_gpu_attn_pf_min_for_test(None, None);
+        set_q4_gpu_attn_for_test(None);
+        set_q4_gpu_attn_min_for_test(None);
     }
 
     /// ミラーの VRAM 上限: 65,536 行でも 3.3 GB 未満 (使用層 12 本のとき)。

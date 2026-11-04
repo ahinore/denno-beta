@@ -15672,6 +15672,75 @@ mod tests {
             moe_expert::set_vnni_for_test(None);
         }
 
+        /// task 134: prefill の full attention が GPU の分岐に入り、**短い
+        /// チャンクは構造ゲートで CPU に落ちる**ことを固定する。
+        ///
+        /// 実モデルと同じ構成 (`SsmAttn` が `FullAttn` へ委譲する) を組む。
+        /// dev コンテナ (GPU 無し) では `q4_attn_prefill` が `None` を返すので、
+        /// 分岐に入ったことは `attend_batch_gpu_tries` の増分で見る (緑 = 発動の
+        /// 証拠ではない)。GPU が発動していないので値は逐次経路とビット一致する。
+        #[cfg(feature = "cuda")]
+        #[test]
+        fn prefill_gpu_attn_tries_then_falls_back_on_short_chunk() {
+            use crate::model::qwen4exp_attn::{
+                attend_batch_gpu_calls, attend_batch_gpu_tries, FullAttn,
+            };
+            use crate::model::qwen4exp_ssm::SsmAttn;
+            let _g = moe_test_guard();
+            moe_expert::set_vnni_for_test(Some(false));
+            let dir = TempDir::new("h2gpuattnpf");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("合成モデルを開けない");
+            let p = Qwen4ExpParams::from_meta(&f).expect("from_meta");
+            let ctx: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+
+            // 1 回ぶんのバッチ prefill (毎回モデルを組み直す)。
+            // 戻り = (logits, GPU 分岐に入った回数, GPU 出力を採用した回数)。
+            let run_full = |chunk: usize| -> (Vec<f32>, usize, usize) {
+                let full = FullAttn::from_gguf(&f, &p, 128).expect("FullAttn");
+                let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
+                let mut m = Qwen4Exp::with_attn(&f, Box::new(attn)).expect("モデルを組めない");
+                let t0 = attend_batch_gpu_tries();
+                let g0 = attend_batch_gpu_calls();
+                let out = m
+                    .forward_prefill_batch(&ctx, chunk)
+                    .expect("バッチ prefill");
+                (
+                    out,
+                    attend_batch_gpu_tries() - t0,
+                    attend_batch_gpu_calls() - g0,
+                )
+            };
+
+            // ゲート off (既定) では分岐に入らない。
+            crate::cuda::set_q4_gpu_attn_pf_for_test(Some(false));
+            let (off, off_tries, _) = run_full(6);
+            assert_eq!(off_tries, 0, "ゲート off なのに GPU の分岐に入った");
+            assert!(
+                off.iter().any(|&v| v != off[0]),
+                "logits が全要素同値 (経路の生死が分からない)"
+            );
+
+            // しきい値を 0 にして分岐を開ける。6 行のチャンクは構造ゲート
+            // (`attn_prefill_gpu_supported` の n >= gemm_min_m() = 256) で CPU。
+            crate::cuda::set_q4_gpu_attn_pf_for_test(Some(true));
+            crate::cuda::set_q4_gpu_attn_pf_min_for_test(Some(0), Some(0));
+            let (on, on_tries, on_calls) = run_full(6);
+            assert!(
+                on_tries > 0,
+                "ゲートを開けたのに GPU の分岐に入っていない (配線が届いていない)"
+            );
+            assert_eq!(
+                on_calls, 0,
+                "6 行のチャンクで GPU が発動した (短いチャンクの下限が効いていない)"
+            );
+            assert_bitwise_eq(&off, &on, "GPU 分岐のフォールバック");
+
+            crate::cuda::set_q4_gpu_attn_pf_for_test(None);
+            crate::cuda::set_q4_gpu_attn_pf_min_for_test(None, None);
+            moe_expert::set_vnni_for_test(None);
+        }
+
         /// `DENNO_PLE_BATCH` の解釈: **既定 on**、`0` / `false` / `off` だけ無効。
         #[test]
         fn ple_batch_gate_defaults_on() {
