@@ -9055,13 +9055,28 @@ fn mix_gpu_weight(uid: u64, bytes: &[u8], k: usize, n: usize) -> Result<CUdevice
     }
 }
 
-/// task 138: `DENNO_MIX_UP_REDUCE=1` のとき、チェーン経路の up GEMV に
-/// 並列リダクション版 (`dno_matvec_f32_r`) を使う (既定は従来と同じ逐次版)。
+/// task 138: `DENNO_MIX_UP_REDUCE` の値を解釈する (純関数・テスト用)。
+/// **既定 on** で、明示的な偽値だけ切る (切ると逐次版 = 従来の丸め順)。
+fn mix_up_reduce_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// task 138: チェーン経路の up GEMV に並列リダクション版 (`dno_matvec_f32_r`)
+/// を使う (`DENNO_MIX_UP_REDUCE`、**既定 on**。`=0` で逐次版に戻る)。
 /// up の形は k < n (320 x 5120) で、逐次版は 1 ブロック 1 スレッドのため
-/// 並列度が n 側にしか無い。丸め順が変わるので既定 off。
+/// 並列度が n 側にしか無い。lab t138b の実測で mix の同期待ちが
+/// 6.42 → 4.65 ms/tok になった (丸め順が変わるが決定論は保つ)。
 fn mix_up_reduce_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DENNO_MIX_UP_REDUCE").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| {
+        mix_up_reduce_from_value(std::env::var("DENNO_MIX_UP_REDUCE").ok().as_deref())
+    })
 }
 
 /// task 138: hc mix (BF16) の **down → lo_apply → up を 1 回の同期に畳む**。
@@ -16007,6 +16022,18 @@ mod q4_attn_tests {
 mod tests {
     use super::*;
     use crate::tensor;
+
+    /// task 138: `DENNO_MIX_UP_REDUCE` は既定 on。明示的な偽値だけ逐次版へ戻す。
+    #[test]
+    fn mix_up_reduce_defaults_on() {
+        assert!(mix_up_reduce_from_value(None), "未設定は on のはず");
+        for v in [Some("1"), Some("on"), Some("true"), Some(" yes ")] {
+            assert!(mix_up_reduce_from_value(v), "value={v:?} は on のはず");
+        }
+        for v in [Some("0"), Some("off"), Some("OFF"), Some("false"), Some("no")] {
+            assert!(!mix_up_reduce_from_value(v), "value={v:?} は off のはず");
+        }
+    }
 
     /// 決定論的 LCG 乱数 (tensor.rs のテストと同一方式)
     fn pseudo_random(len: usize, seed: u32) -> Vec<f32> {

@@ -3280,19 +3280,20 @@ fn mix_gpu_enabled() -> bool {
 }
 
 /// task 138: `DENNO_MIX_CHAIN` の値を解釈する (純関数・テスト用)。
-/// [`mix_gpu_from_value`] と同じ規約 (`trim` + 小文字化・明示的な真値だけ on)。
+/// **既定 on** で、明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
 fn mix_chain_from_value(v: Option<&str>) -> bool {
     match v {
-        Some(s) => matches!(
+        Some(s) => !matches!(
             s.trim().to_ascii_lowercase().as_str(),
-            "1" | "on" | "true" | "yes"
+            "0" | "off" | "false" | "no"
         ),
-        None => false,
+        None => true,
     }
 }
 
 /// task 138: hc mix の down → lo_apply → up を 1 往復に畳む経路
-/// (`DENNO_MIX_CHAIN`、既定 off)。`DENNO_MIX_GPU` が on のときだけ意味を持つ。
+/// (`DENNO_MIX_CHAIN`、**既定 on**。`=0` で従来の 2 往復に戻る)。
+/// `DENNO_MIX_GPU` が on のときだけ意味を持つ。
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn mix_chain_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3619,7 +3620,7 @@ fn hc_mix_quant_fast(
         mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_DOWN);
         let hc_fast = hc_mix_fast_enabled();
         // task 138: down → lo_apply → up を 1 回の同期に畳む経路
-        // (`DENNO_MIX_GPU` と `DENNO_MIX_CHAIN` が両方 on で、両方 BF16 のときだけ)。
+        // (`DENNO_MIX_GPU` on・既定 on の `DENNO_MIX_CHAIN`・両方 BF16 のとき)。
         // 丸めは従来の GPU 経路と同じ (silu は dno_expf = glibc expf のビット一致
         // 実装) なので、通れば logits は従来とビット一致する。不発なら下の
         // 2 往復経路へそのまま落ちる。
@@ -13498,20 +13499,14 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
 
-        /// task 138: `DENNO_MIX_CHAIN` の真理値表 (既定 off・明示的な真値だけ on)。
+        /// task 138: `DENNO_MIX_CHAIN` は既定 on。明示的な偽値だけ切る。
         #[test]
-        fn mix_chain_gate_defaults_off() {
+        fn mix_chain_gate_defaults_on() {
+            assert!(mix_chain_from_value(None), "未設定は on のはず");
             for v in [Some("1"), Some("on"), Some("ON"), Some("true"), Some(" yes ")] {
                 assert!(mix_chain_from_value(v), "value={v:?} は on のはず");
             }
-            for v in [
-                None,
-                Some(""),
-                Some("0"),
-                Some("off"),
-                Some("false"),
-                Some("no"),
-            ] {
+            for v in [Some("0"), Some("off"), Some("OFF"), Some("false"), Some("no")] {
                 assert!(!mix_chain_from_value(v), "value={v:?} は off のはず");
             }
         }
