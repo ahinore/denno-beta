@@ -570,9 +570,9 @@ pub struct CudaCtx {
     /// 取得でき、無ければ None で従来の 3 launch 経路を使う。
     f_gdn_chunk_scan_hoist: Option<CUfunction>,
     /// task 128: qwen4exp (sigmoid 出力ゲート) の decode 用 scan
-    /// (`dno_gdn_scan_sig`)。コミット済みの `kernels_gdn.ptx` には未収録なので
-    /// 現状は None になり、[`gdn_decode_submit`] は計測を積まずに CPU 経路へ
-    /// 落ちる (fail-closed。PTX を再生成すれば Some になる)。
+    /// (`dno_gdn_scan_sig`)。task 137 で gdn.cu に追加し `kernels_gdn.ptx` を
+    /// 再生成したので、通常は Some になる。読めないとき (旧 PTX) は
+    /// [`gdn_decode_submit`] が計測を積まずに CPU 経路へ落ちる (fail-closed)。
     f_gdn_scan_sig: Option<CUfunction>,
     // P-MOE-E1: Flash-Next の expert GEMV (Q8_0 / Q5_1 / Q4_K / Q5_K) を積んだ
     // モジュール。PTX の読み込みに失敗しても起動は壊さず `f_moe = None` にして、
@@ -847,9 +847,9 @@ impl CudaCtx {
             };
 
             // task 128: qwen4exp の decode 用 scan (sigmoid 出力ゲート) も
-            // 「あれば使う」。int-auto のコミット済み PTX には未収録なので、
-            // ここは None になり GPU decode scan 経路は発動しない
-            // (fail-closed = CPU 経路。PTX 再生成で Some になる)。
+            // 「あれば使う」。task 137 で PTX を再生成したので通常は取れる。
+            // 取れないとき (旧 PTX) は GPU decode scan 経路を発動させない
+            // (fail-closed = CPU 経路)。
             let mut f_gdn_scan_sig: CUfunction = std::ptr::null_mut();
             let sig_r = (lib.module_get_function)(
                 &mut f_gdn_scan_sig,
@@ -23416,12 +23416,11 @@ mod p58_scratch_arena_tests {
 // scan を発行した後の失敗だけは状態を回復して返し、回復も失敗したら poisoned
 // (呼び出し側は要求を落とす)。
 //
-// **未解決のブロッカー (task 128 の結論)**: このカーネル `dno_gdn_scan_sig`
-// (gdn.cu の sigmoid 出力ゲート版) は br114 のブランチにしか無く、int-auto の
-// コミット済み `kernels_gdn.ptx` には入っていない。.cu / .ptx は本タスクで
-// 編集禁止なので、`CudaCtx::f_gdn_scan_sig` は None のまま = この経路は
-// 発動しない (計測を 1 つも積まずに CPU 経路)。PTX 再生成のコマンドは
-// REPORT_P128.md §5。
+// **task 137 で解消**: このカーネル `dno_gdn_scan_sig` (gdn.cu の sigmoid
+// 出力ゲート版) を gdn.cu へ追加し、`kernels_gdn.ptx` を再生成した
+// (再生成前の PTX は gdn.cu より古く、P55 の `dno_gdn_chunk_pre_sm` も
+// 未収録だった)。旧 PTX を読んだ場合だけ `CudaCtx::f_gdn_scan_sig` が None に
+// なり、この経路は発動しない (計測を 1 つも積まずに CPU 経路)。
 
 /// GPU decode scan のゲート (`DENNO_GDN_GPU_SCAN=1|on|true`。既定 off)。
 ///
@@ -23935,7 +23934,7 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
     let Some(f_scan) = ctx.f_gdn_scan_sig else {
         // コミット済み PTX に dno_gdn_scan_sig が無い (再生成待ち)。
         gdn_note_once(
-            "dno_gdn_scan_sig が PTX に無い (kernels_gdn.ptx 再生成待ち) → CPU 経路",
+            "dno_gdn_scan_sig が使う PTX に無い (旧 kernels_gdn.ptx) → CPU 経路",
         );
         return GdnDecodeRes::cpu();
     };
