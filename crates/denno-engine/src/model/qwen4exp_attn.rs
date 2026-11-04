@@ -2175,4 +2175,49 @@ mod p49 {
         q4prof::reset();
         q4prof::set_att_dbg_for_test(false);
     }
+
+    /// task 136: full 層の合計 (`A_FULL`) は 1 回の forward で 1 回だけ積む。
+    ///
+    /// br132 (decode の層の外) と task 133 (GPU の full 合計) は同じ関数の頭で
+    /// `t_all` を取っていたので、単純に merge すると片方が影になり、あとで
+    /// どちらかを消すと二重計上へ戻る。ソースの形をここで固定する
+    /// (値そのものは lab の「attn の内訳が attn 合計に収まる」で見る)。
+    #[test]
+    fn a_full_is_added_once_per_forward() {
+        let src = include_str!("qwen4exp_attn.rs");
+        let slice = |start: &str, end: &str| -> &'static str {
+            let i = src.find(start).unwrap_or_else(|| panic!("{start} が無い"));
+            let rest = &src[i..];
+            let j = rest
+                .find(end)
+                .unwrap_or_else(|| panic!("{end} が {start} の後に無い"));
+            &rest[..j]
+        };
+
+        // decode (`forward_token_impl`): stamp 1 本 / A_FULL 加算 1 回。
+        let dec = slice("fn forward_token_impl(", "\n    /// 1 トークンあたりの重みバイト数");
+        assert_eq!(
+            dec.matches("q4prof::stamp()").count(),
+            1,
+            "decode の full タイマーが 1 本でない (影になった stamp が残っている)"
+        );
+        assert_eq!(
+            dec.matches("q4prof::add(&q4prof::A_FULL").count(),
+            1,
+            "decode の A_FULL 加算が 1 回でない"
+        );
+
+        // prefill のチャンク (`forward_batch`) も 1 回だけ。
+        let pf = slice("pub fn forward_batch(", "\nimpl LayerAttn for FullAttn");
+        assert_eq!(
+            pf.matches("q4prof::add(&q4prof::A_FULL").count(),
+            1,
+            "prefill の A_FULL 加算が 1 回でない"
+        );
+        assert_eq!(
+            pf.matches("let t_all = q4prof::stamp();").count(),
+            1,
+            "prefill の full タイマーが 1 本でない"
+        );
+    }
 }
