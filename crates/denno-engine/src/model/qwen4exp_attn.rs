@@ -256,7 +256,18 @@ pub struct AttnCache {
     n_head_kv: usize,
     head_dim: usize,
     max_ctx: usize,
+    /// task 133: このキャッシュの一意な ID (プロセス内で単調増加)。
+    /// GPU ミラー (cuda::q4_attn_decode) の鍵にする。作り直しで ID が変わるので、
+    /// 同じアドレスに別のキャッシュが載っても古いミラーを引かない。
+    id: u64,
+    /// task 133: 層ごとの内容世代。**行の中身が別物になった**ときだけ進める
+    /// (`clear` / `clear_all` / `truncate_layer`)。push は追記なので進めない。
+    /// GPU ミラーは gen が変わった層を全行 H2D し直す。
+    gen: Vec<u64>,
 }
+
+/// task 133: [`AttnCache`] の ID 採番 (1 始まり。0 は「未設定」に使わない)。
+static NEXT_ATTN_CACHE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl AttnCache {
     /// `n_layer` 層ぶんの空きを作る。`max_ctx == 0` は不正。
@@ -274,7 +285,23 @@ impl AttnCache {
             n_head_kv,
             head_dim,
             max_ctx,
+            id: NEXT_ATTN_CACHE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            gen: vec![0; n_layer],
         })
+    }
+
+    /// task 133: GPU ミラーの鍵にする一意な ID (プロセス内で単調増加)。
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// task 133: 層 `layer` の内容世代。`clear` / `clear_all` / `truncate_layer`
+    /// で進む (行の中身が別物になった合図)。
+    pub fn gen(&self, layer: usize) -> Result<u64> {
+        self.gen
+            .get(layer)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("AttnCache: 層 {layer} は範囲外 (n_layer = {})", self.gen.len()))
     }
 
     /// 1 位置ぶんの行長 = `n_head_kv * head_dim`
@@ -345,13 +372,16 @@ impl AttnCache {
     pub fn clear(&mut self, layer: usize) -> Result<()> {
         self.len(layer)?;
         self.len[layer] = 0;
+        // task 133: 行の中身が別物になった (GPU ミラーは全行を H2D し直す)。
+        self.gen[layer] = self.gen[layer].wrapping_add(1);
         Ok(())
     }
 
     /// 全層を空にする。
     pub fn clear_all(&mut self) {
-        for n in self.len.iter_mut() {
+        for (n, g) in self.len.iter_mut().zip(self.gen.iter_mut()) {
             *n = 0;
+            *g = g.wrapping_add(1);
         }
     }
 
@@ -368,6 +398,10 @@ impl AttnCache {
             );
         }
         self.len[layer] = len;
+        if len != cur {
+            // task 133: 同じ位置に次の push が別の行を書く → ミラーは全行し直し。
+            self.gen[layer] = self.gen[layer].wrapping_add(1);
+        }
         Ok(())
     }
 }
@@ -669,6 +703,37 @@ impl AttnLayer {
     ) -> Result<Vec<f32>> {
         let len = cache.len(layer)?;
         self.attend_impl_mode(q, cache, layer, None, len, gqa_fast)
+    }
+
+    /// [`AttnLayer::attend`] の decode 版 (task 133)。
+    ///
+    /// GPU (cuda::q4_attn_decode) が使えればそちらで回し、使えない・制約に
+    /// 合わない・転送や起動に失敗したときは従来の CPU 経路へ落ちる
+    /// (fail closed)。GPU 側の丸め順は CPU と違うのでビット一致はしない
+    /// (attention は P17g から exactness 契約を緩和済み)。
+    fn attend_decode(&self, q: &[f32], cache: &AttnCache, layer: usize) -> Result<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        {
+            let call = crate::cuda::Q4AttnCall {
+                cache_id: cache.id(),
+                n_layer: cache.n_layer(),
+                layer,
+                layer_gen: cache.gen(layer)?,
+                len: cache.len(layer)?,
+                kv_dim: cache.row(),
+                heads: self.n_head,
+                group: self.heads_per_kv(),
+                dh: self.head_dim,
+                scale: self.kq_scale,
+                q,
+                k: cache.k(layer)?,
+                v: cache.v(layer)?,
+            };
+            if let Some(out) = crate::cuda::q4_attn_decode(&call) {
+                return Ok(out);
+            }
+        }
+        self.attend(q, cache, layer)
     }
 
     /// 見る cell を `cells` に限定した attention (QSA の選択結果を食わせる口)。
@@ -1285,6 +1350,9 @@ impl AttnLayer {
                 self.n_embd
             );
         }
+        // task 133: full 層の合計 (`[q4prof] ... full=`) を decode でも積む。
+        // 計測は DENNO_Q4_PROFILE / DENNO_PF_ATT_DBG のときだけ (stamp が None)。
+        let t_all = q4prof::stamp();
         // task 72: q / k / v は同じ入力 cur を取るので 1 回の GEMV で得る。
         // 行は独立なので、個別に投影した場合とビット一致する。
         let proj = self.project_qkv_concat(cur)?;
@@ -1298,11 +1366,15 @@ impl AttnLayer {
         // 積んでから全 len に対して attention (参照実装の KV 書き込みと同じ順)。
         cache.push(layer, &k, &v)?;
         let attn = match cells {
-            None => self.attend(&q, cache, layer)?,
+            None => self.attend_decode(&q, cache, layer)?,
             Some(c) => self.attend_visible(&q, cache, layer, c)?,
         };
         let gated = self.gate_mul(&attn, &gate)?;
-        self.project_out(&gated)
+        let out = self.project_out(&gated)?;
+        if let Some(t) = t_all {
+            q4prof::add(&q4prof::A_FULL, t);
+        }
+        Ok(out)
     }
 
     /// 1 トークンあたりの重みバイト数 (量子化ブロック + norm)。

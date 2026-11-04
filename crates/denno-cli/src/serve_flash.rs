@@ -330,6 +330,13 @@ fn prof_flash_q4(tag: &str, tok: usize) {
         eprintln!("{line}");
         denno_engine::model::qwen4exp::attn_kprof::reset();
     }
+    // task 133: decode の full attention を GPU で回したぶんの内訳
+    // (`DENNO_Q4_PROFILE` / `DENNO_PF_ATT_DBG` のときだけ 1 行)。
+    // 遅延シード / 追記の H2D、launch、カーネル待ち、D2H、ミラー使用量が読める。
+    if let Some(line) = q4prof::attn_gpu_line() {
+        eprintln!("{line}");
+        q4prof::attn_gpu_reset();
+    }
     // expert GEMV の型別内訳 (`DENNO_EXP_KPROF=1` のときだけ 1 レポート)。
     // task 95: prefill 終端では積むだけにして、decode 終端 (= リクエストの終端) で
     // decode (m=1) と prefill (m>1) を分けた 1 レポートを出して reset する

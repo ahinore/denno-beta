@@ -4189,6 +4189,23 @@ pub mod q4prof {
         (f(&A_QKV), f(&A_GATE), f(&A_GDN), f(&A_OUT), f(&A_FULL))
     }
 
+    /// task 133: full attention の GPU 実行内訳 (`cuda::q4attn_kprof` の 1 行)。
+    /// cuda feature 無しのビルドは常に `None` (GPU 経路が無い)。
+    #[cfg(feature = "cuda")]
+    pub fn attn_gpu_line() -> Option<String> {
+        crate::cuda::q4attn_kprof::line()
+    }
+    #[cfg(not(feature = "cuda"))]
+    pub fn attn_gpu_line() -> Option<String> {
+        None
+    }
+
+    /// task 133: [`attn_gpu_line`] の累計を 0 に戻す。
+    pub fn attn_gpu_reset() {
+        #[cfg(feature = "cuda")]
+        crate::cuda::q4attn_kprof::reset();
+    }
+
     pub fn reset() {
         for c in [&PLE, &MIX, &ATTN, &MOE, &A_QKV, &A_GATE, &A_GDN, &A_OUT, &A_FULL] {
             c.store(0, Ordering::Relaxed);
