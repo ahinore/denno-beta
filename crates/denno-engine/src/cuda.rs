@@ -10927,10 +10927,18 @@ pub fn chain_attention(
 //   `None` を返し、呼び出し側は CPU 経路へ落ちる (fail closed)。ここで
 //   `GPU_BROKEN` は立てない — attention だけの問題で他の GPU 経路
 //   (GEMV / mix / router / expert) を巻き込まない。
+//
+// 実測 (lab t133b, swift15-abl IQ3_S, PROFILE=1, off -> on):
+//   decode ms/tok: a/b 81 -> 80、c2000_cold 122 -> 96、c2000_turn2 124 -> 95、
+//   c8000_cold 210 -> 121、c8000_turn2 208 -> 121 (prefill は ±1.8% 以内)。
+//   6 プロンプトの出力 md5 は off と同一。1 層 1 呼び出しの内訳は
+//   28 tok で 84 us、3,954 で 637 us、14,018 で 2.09 ms
+//   (14k はカーネル待ち 2.03 ms が支配的。1 head = 1 block で占有率が低い)。
 // ---------------------------------------------------------------------------
 
-/// `DENNO_Q4_GPU_ATTN` の既定。task 133 の lab (t133a) で c2000 の decode が
-/// -24.5% / -25.1%、a/b (28/33 token) は MIN で CPU のままなので既定 on。
+/// `DENNO_Q4_GPU_ATTN` の既定。lab t133b (最終コード) で a/b 81 -> 80、
+/// c2000 122/124 -> 96/95、c8000 210/208 -> 121/121、md5 は 6 本とも同一。
+/// 短いプロンプトは MIN で CPU のままなので既定 on。
 const Q4_GPU_ATTN_DEFAULT: bool = true;
 /// `DENNO_Q4_GPU_ATTN_MIN` の既定 (この KV 本数未満は CPU 経路のまま)。
 /// 実測の交叉は約 23 token (推定: 1 呼び出しの固定費 79 us x 12 → 0.95 ms/token と
