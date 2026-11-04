@@ -24296,6 +24296,23 @@ fn parse_gdn_submit_sync(raw: Option<&str>) -> bool {
     matches!(raw, Some("1") | Some("on") | Some("true"))
 }
 
+/// task 140 の診断 (`DENNO_GDN_SUBMIT_DUMP=1`。既定 off)。
+///
+/// on のとき [`gdn_decode_submit`] は **decode 窓の 1 トークン目だけ**、層ごとに
+/// 1 行の plan ダンプ (型・k/n・行バイト・実バイト数・行オフセット・起動形状・
+/// ポインタ) を出す。t140a のラボでは `qkv_gemv[0]` が li=41 で
+/// error 700 になったが、同じ重み・同じ形状は intercept 経路で正常に走っており、
+/// 引数のどこが違うかをログから確定できなかった。診断専用 (数値経路は不変)。
+pub fn gdn_submit_dump_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_gdn_submit_dump(std::env::var("DENNO_GDN_SUBMIT_DUMP").ok().as_deref()))
+}
+
+/// `DENNO_GDN_SUBMIT_DUMP` の生値 → on/off (純関数)。
+fn parse_gdn_submit_dump(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1") | Some("on") | Some("true"))
+}
+
 /// 状態ストアの上限 (エントリ = 1 層ぶん ≈ 3.3 MiB: conv 2x120 KiB + ssm 3.0 MiB
 /// + x/qkv/ba/y/out 約 100 KiB)。72 = 36 層モデル 2 本ぶん。
 /// 追い出しは最古の挿入順 (Vec の先頭)。`SsmLayer` は Drop を持たないので、
@@ -24856,6 +24873,17 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
             gdn_note_once("入力長が寸法と違う (バグの疑い) → CPU 経路");
             return GdnDecodeRes::cpu();
         }
+        // task 140: qkv GEMV の出力は `e.qkv` の行オフセットへ書く。合計が
+        // qkv_total を越えるとデバイスバッファの外へ書いて CUDA error 700 になる
+        // (t140a で実際に踏んだ)。ここで fail-closed に落とす。
+        if req
+            .qkv_units
+            .iter()
+            .any(|(u, row)| row.saturating_add(u.n) > req.qkv_total)
+        {
+            gdn_note_once("qkv GEMV の出力行範囲が qkv_total を越える (バグの疑い) → CPU 経路");
+            return GdnDecodeRes::cpu();
+        }
     }
 
     // ---- シード (ホストが正のときだけ。sync H2D 1 回 = トークン初回のみ) ----
@@ -24870,6 +24898,69 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
             gdn_note_once(&format!("状態のシードに失敗 → CPU 経路: {err:#}"));
             return gdn_scan_record_failure(GdnDecodeRes::cpu());
         }
+    }
+
+    // ---- 診断ダンプ (DENNO_GDN_SUBMIT_DUMP=1・既定 off) ----------------------
+    // 1 トークン目だけ層ごとに 1 行。off のときは分岐 1 回で何も出さない。
+    if gdn_submit_dump_on() && req.tok <= 1 {
+        let (_, e) = &store_lock[idx];
+        let mut s = format!(
+            "[gdn-dump] li={} tok={} mode={:?} nv={} nk={} dk={} dv={} conv_dim={} qkv_total={} \
+             qkv_row_start={} z_row_start={} \
+             buf(x={} qkv={} ba={} y={} out={} conv={} ssm={}) seeded={} cur={}",
+            req.li,
+            req.tok,
+            mode,
+            req.nv,
+            req.nk,
+            req.dk,
+            req.dv,
+            req.conv_dim,
+            req.qkv_total,
+            req.qkv_row_start,
+            req.z_row_start,
+            e.x.bytes(),
+            e.qkv.bytes(),
+            e.ba.bytes(),
+            e.y.bytes(),
+            e.out.bytes(),
+            e.conv[e.cur].bytes(),
+            e.ssm.bytes(),
+            seeded_needed,
+            e.cur
+        );
+        for (i, ((u, row), cfg)) in req.qkv_units.iter().zip(qcfg.iter()).enumerate() {
+            s.push_str(&format!(
+                " | u{i} ty={:?} k={} n={} row={} rb={} w={}B off={}B f={:?} rows={} blk={} grid={} shmem={} lanes={}",
+                u.ty,
+                u.k,
+                u.n,
+                row,
+                cfg.rb,
+                qw[i].buf.bytes(),
+                *row * 4,
+                cfg.f,
+                cfg.rows_per_block,
+                cfg.block_dim,
+                cfg.grid,
+                cfg.shmem,
+                cfg.lanes
+            ));
+        }
+        s.push_str(&format!(
+            " | out ty={:?} k={} n={} rb={} w={}B rows={} blk={} grid={} shmem={} lanes={}",
+            req.out_unit.ty,
+            req.out_unit.k,
+            req.out_unit.n,
+            ocfg.rb,
+            ow.buf.bytes(),
+            ocfg.rows_per_block,
+            ocfg.block_dim,
+            ocfg.grid,
+            ocfg.shmem,
+            ocfg.lanes
+        ));
+        tracing::info!("{s}");
     }
 
     // ---- submission (発行を積んで最後の D2H で 1 回だけ待つ) ----------------
@@ -25095,7 +25186,8 @@ mod gdn_decode_scan_tests {
         }
     }
 
-    /// task 140: `DENNO_GDN_SUBMIT_SYNC` の真理値表 (純関数)。既定は off。
+    /// task 140: `DENNO_GDN_SUBMIT_SYNC` / `DENNO_GDN_SUBMIT_DUMP` の真理値表
+    /// (純関数)。既定はどちらも off。
     #[test]
     fn gdn_submit_sync_truth_table() {
         for (raw, want) in [
@@ -25112,6 +25204,11 @@ mod gdn_decode_scan_tests {
                 parse_gdn_submit_sync(raw),
                 want,
                 "DENNO_GDN_SUBMIT_SYNC={raw:?} の解釈が違う"
+            );
+            assert_eq!(
+                parse_gdn_submit_dump(raw),
+                want,
+                "DENNO_GDN_SUBMIT_DUMP={raw:?} の解釈が違う"
             );
         }
     }

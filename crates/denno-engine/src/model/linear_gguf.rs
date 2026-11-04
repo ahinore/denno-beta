@@ -1017,6 +1017,24 @@ impl FusedLinear {
         }
     }
 
+    /// task 140: [`Self::gemv_units`] の `i` 番目の単位を、出力バッファ (`n()` 要素)
+    /// の**何行目から**書くか。
+    ///
+    /// 連結済みのときは単位 = 連結バッファ全体なので **必ず 0**
+    /// ([`Self::gemv_concat_into`] が `inner.gemv_label(label, x, buf)` で先頭から
+    /// 書くのと同じ)。**`range(0).start` を代用してはいけない**: 写しなし連結は
+    /// ファイル上の並び (`ranges`) を保存するので、gate が qkv より前に置かれた
+    /// 層では `range(0).start != 0` になる (その値は「qkv の行が連結バッファの
+    /// どこにあるか」であって「出力をどこから書くか」ではない)。
+    ///
+    /// 連結していないときは単位 = 元の層なので、その行範囲の先頭。
+    pub fn gemv_unit_out_offset(&self, i: usize) -> usize {
+        match &self.inner {
+            Some(_) => 0,
+            None => self.ranges[i].start,
+        }
+    }
+
     pub fn weight_bytes(&self) -> usize {
         match &self.inner {
             Some(i) => i.weight_bytes(),
@@ -1379,6 +1397,67 @@ mod tests {
     #[test]
     fn q8_0_matches_naive() {
         check(GgmlType::Q8_0);
+    }
+
+    /// task 140: 連結済み (`inner`) の GEMV 出力は**連結バッファの先頭から**
+    /// 書かれる (`gemv_concat_into` の `inner.gemv_label(label, x, buf)`) ので、
+    /// 単位の出力オフセットは 0。写しなし連結はファイル順を `ranges` に保存する
+    /// ため `range(0).start` は 0 にならないことがある (gate が qkv より前)。
+    /// ここでは「gate 2 行 → qkv 3 行」のファイル順を再現して、
+    /// (1) `gemv_concat_into` が部を `ranges` の位置へ書くこと、
+    /// (2) `gemv_unit_out_offset` が 0 を返すこと (= 旧 `range(0).start` の 2 は誤り)
+    /// を固定する。
+    #[test]
+    fn fused_gemv_writes_whole_buffer_from_row_zero() {
+        let (k, n_qkv, n_gate) = (K, 3usize, 2usize);
+        let qkv = make_matrix(GgmlType::Q8_0, k, n_qkv, 31);
+        let gate = make_matrix(GgmlType::Q8_0, k, n_gate, 41);
+        // 連結バッファの行順 = ファイル順 (gate が先、qkv が後)。
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&gate);
+        bytes.extend_from_slice(&qkv);
+        let inner = GgufLinear::from_slice(GgmlType::Q8_0, k, n_qkv + n_gate, &bytes)
+            .expect("inner");
+        let fused = FusedLinear {
+            inner: Some(inner),
+            parts: Vec::new(),
+            splits: vec![n_qkv, n_qkv + n_gate],
+            // 呼び出し順 0 = qkv は 2..5 行、1 = gate は 0..2 行。
+            ranges: vec![n_gate..n_gate + n_qkv, 0..n_gate],
+            zero_copy: true,
+        };
+        assert!(fused.is_fused());
+        assert_eq!(fused.gemv_units().len(), 1, "連結済みは 1 発");
+        assert_eq!(fused.range(0).start, n_gate, "qkv は 2 行目から (ファイル順)");
+        assert_eq!(fused.range(1).start, 0, "gate は先頭 (ファイル順)");
+        // 出力オフセットは 0 (バッファ全体を先頭から書く)。
+        assert_eq!(
+            fused.gemv_unit_out_offset(0),
+            0,
+            "連結済みの出力は先頭から (range(0).start を代用しない)"
+        );
+
+        // 実際の GEMV が部を ranges の位置へ書くことを数値で固定する。
+        let x = make_x(k, 11);
+        let mut buf = vec![0f32; fused.n()];
+        fused.gemv_concat_into("qkv", &x, &mut buf).expect("gemv");
+        let want_qkv = naive_gemv(GgmlType::Q8_0, &qkv, k, n_qkv, &x);
+        let want_gate = naive_gemv(GgmlType::Q8_0, &gate, k, n_gate, &x);
+        for i in 0..n_qkv {
+            assert_eq!(buf[n_gate + i].to_bits(), want_qkv[i].to_bits(), "qkv 行 {i}");
+        }
+        for i in 0..n_gate {
+            assert_eq!(buf[i].to_bits(), want_gate[i].to_bits(), "gate 行 {i}");
+        }
+
+        // 未連結のときは単位 = 部なので、出力オフセットはその行範囲の先頭。
+        let p0 = GgufLinear::from_slice(GgmlType::Q8_0, k, n_qkv, &qkv).expect("p0");
+        let p1 = GgufLinear::from_slice(GgmlType::Q8_0, k, n_gate, &gate).expect("p1");
+        let sep = FusedLinear::separate(vec![p0, p1]);
+        assert_eq!(sep.gemv_units().len(), 2);
+        assert_eq!(sep.gemv_unit_out_offset(0), 0);
+        assert_eq!(sep.gemv_unit_out_offset(1), n_qkv);
+        assert_eq!(sep.gemv_unit_out_offset(1), sep.range(1).start);
     }
 
     #[test]

@@ -405,8 +405,16 @@ impl SsmLayer {
     }
 
     /// task 128: qkv_gate の「1 発 GEMV の単位」を呼び出し順で列挙する
-    /// ([`FusedLinear::gemv_units`] + 行オフセット = [`FusedLinear::range`] の
-    /// 起点。連結バッファ内の置き場所は `gemv_concat_into` と同一規約)。
+    /// ([`FusedLinear::gemv_units`] + 出力の行オフセット =
+    /// [`FusedLinear::gemv_unit_out_offset`]。連結バッファ内の置き場所は
+    /// `gemv_concat_into` と同一規約)。
+    ///
+    /// task 140: 以前は行オフセットに `range(i).start` を使っていた。連結済みの
+    /// ときの単位は連結バッファ全体 (先頭から書く) なので、gate が qkv より前に
+    /// 置かれた層 (写しなし連結はファイル順を `ranges` に保存する) では
+    /// `range(0).start != 0` になり、qkv GEMV の出力が **バッファの終端を越えた
+    /// 位置**へ書かれていた (t140a のラボで li=41 の qkv_gemv[0] が CUDA error
+    /// 700。同じ重み・同じ形状は intercept 経路では正常)。
     #[cfg(feature = "cuda")]
     fn gdn_qkv_units(&self) -> Vec<(crate::cuda::GdnGgufUnit<'_>, usize)> {
         self.qkv_gate
@@ -422,7 +430,7 @@ impl SsmLayer {
                         k: u.k(),
                         n: u.n(),
                     },
-                    self.qkv_gate.range(i).start,
+                    self.qkv_gate.gemv_unit_out_offset(i),
                 )
             })
             .collect()
