@@ -574,6 +574,141 @@ extern "C" __global__ void dno_attention_prefill(
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 135: decode attention の t 分割版 (`dno_attention_decode`)。
+//
+// 動機 (lab t133b の実測): 既存 `dno_attention` は 1 q head = 1 block なので
+// 24 block しか立たず、t=14,018 では 1 呼び出し 2.09 ms かかっていた。
+// 帯域は「同時に走る block 数 x 1 SM の帯域」で頭打ちになるため、t を
+// 分割して block を増やすのが効く。さらに softmax の exp は prefill と同じ
+// exp2f (MUFU.EX2) を使う (dno_expf は f64 主体で 1/64 レート)。
+//
+// 契約: exactness は attention の緩和枠 (P17g・ユーザー承認)。**決定論は維持**
+// (分割は t_total と n_split だけで決まる固定分割・縮約順は常に昇順・原子操作
+// なし)。CPU とのビット一致はしない。
+//
+// 2 カーネル構成 (cross-block の縮約を固定順で行うため):
+//   1) dno_attention_decode        … 各 (split, head) が分担範囲の online softmax
+//                                    と部分出力を `part[h, sp, dh+2]` に書く
+//   2) dno_attention_decode_combine … part を split 昇順に畳んで att を書く
+//      part の並びは [m, l, acc[0..dh]] (m = 部分最大, l = 部分和)。
+//      空の split は m = -inf, l = 0, acc = 0 を書き、combine で寄与 0 になる。
+//
+// grid 1 = (n_split, heads) / block 1 = (dh)。head は blockIdx.y、split は
+// blockIdx.x (最速次元) なので、同じ split の head 群が同時に走り K/V を L2 で
+// 共有する。block 内のスコアは key ごとに 1 warp が lane ストライドで dot し、
+// warp 内 shfl 縮約 (16,8,4,2,1 の固定順) で 1 スカラーにする。
+// online softmax の状態更新 (max・corr・p) は thread 0 が固定順で行い、
+// smem 経由で全スレッドに配る (全スレッドが同じ値を同じ順で使う = 決定論)。
+// ---------------------------------------------------------------------------
+#define DNO_DEC_BK 8  // 1 タイルの key 数 (ホスト側 ATTN_DEC_BK と一致させる)
+
+extern "C" __global__ void dno_attention_decode(
+    const float *__restrict__ q,    // [heads * dh]
+    const float *__restrict__ kc,   // [t_total, kv_dim]
+    const float *__restrict__ vc,   // [t_total, kv_dim]
+    float *__restrict__ part,       // [heads, n_split, dh + 2]
+    int kv_dim, int t_total, int group, int dh, float scale, int n_split) {
+    extern __shared__ float sh[];
+    float *q_sm = sh;                    // [dh]
+    float *s_sm = q_sm + dh;             // [DNO_DEC_BK] 生スコア
+    float *p_sm = s_sm + DNO_DEC_BK;     // [DNO_DEC_BK] 確率
+    float *corr_sm = p_sm + DNO_DEC_BK;  // [1] 前タイルの再スケール係数
+
+    const int h = blockIdx.y;
+    const int sp = blockIdx.x;
+    const int kh_off = (h / group) * dh;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int nwarp = (int)(blockDim.x >> 5);
+    // t の固定分割: 先頭から chunk 個ずつ。split 数はホストが決める。
+    const int chunk = (t_total + n_split - 1) / n_split;
+    int jlo = sp * chunk;
+    int jhi = jlo + chunk;
+    if (jhi > t_total) jhi = t_total;
+    if (jlo > t_total) jlo = t_total;
+
+    for (int i = tid; i < dh; i += (int)blockDim.x) q_sm[i] = q[(size_t)h * dh + i];
+    __syncthreads();
+
+    float acc = 0.0f;    // このスレッドが持つ出力次元 d = tid
+    float m_run = -INFINITY;
+    float l_run = 0.0f;
+
+    for (int j0 = jlo; j0 < jhi; j0 += DNO_DEC_BK) {
+        const int nk = min(DNO_DEC_BK, jhi - j0);
+        // --- スコア: key kk を warp が 1 本ずつ担当 (dh を lane でストライド) ---
+        for (int kk = warp; kk < nk; kk += nwarp) {
+            const float *krow = kc + (size_t)(j0 + kk) * kv_dim + kh_off;
+            float s = 0.0f;
+            for (int i = lane; i < dh; i += 32) s = fmaf(q_sm[i], krow[i], s);
+            s += __shfl_down_sync(0xffffffffu, s, 16);
+            s += __shfl_down_sync(0xffffffffu, s, 8);
+            s += __shfl_down_sync(0xffffffffu, s, 4);
+            s += __shfl_down_sync(0xffffffffu, s, 2);
+            s += __shfl_down_sync(0xffffffffu, s, 1);
+            if (lane == 0) s_sm[kk] = s * scale;
+        }
+        __syncthreads();
+        // --- online softmax (thread 0 が固定順で更新し smem で配る) ---
+        if (tid == 0) {
+            float mx = m_run;
+            for (int kk = 0; kk < nk; ++kk) mx = fmaxf(mx, s_sm[kk]);
+            const float corr = exp2f((m_run - mx) * LOG2E_F);
+            float l = l_run * corr;
+            for (int kk = 0; kk < nk; ++kk) {
+                const float p = exp2f((s_sm[kk] - mx) * LOG2E_F);
+                p_sm[kk] = p;
+                l += p;
+            }
+            l_run = l;
+            m_run = mx;
+            corr_sm[0] = corr;
+        }
+        __syncthreads();
+        // --- probs @ V (kk 昇順の FMA・corr は全スレッドで同一値) ---
+        const float corr = corr_sm[0];
+        acc *= corr;
+        for (int kk = 0; kk < nk; ++kk) {
+            acc = fmaf(p_sm[kk], vc[(size_t)(j0 + kk) * kv_dim + kh_off + tid], acc);
+        }
+        __syncthreads();  // 次タイルが p_sm / s_sm を上書きする前の壁
+    }
+
+    float *pp = part + ((size_t)h * n_split + sp) * (dh + 2);
+    if (tid == 0) {
+        pp[0] = m_run;
+        pp[1] = l_run;
+    }
+    pp[2 + tid] = acc;
+}
+
+// part を split 昇順に畳む。grid = (heads)、block = (dh)。
+// 分割数・head 数はホストが決める (どちらも固定なので順序は決定論的)。
+extern "C" __global__ void dno_attention_decode_combine(
+    const float *__restrict__ part,  // [heads, n_split, dh + 2]
+    float *__restrict__ att,         // [heads * dh]
+    int n_split, int dh) {
+    const int h = blockIdx.x;
+    const int tid = threadIdx.x;
+    const size_t stride = (size_t)(dh + 2);
+    const float *base = part + (size_t)h * n_split * stride;
+    float mg = -INFINITY;
+    for (int sp = 0; sp < n_split; ++sp) mg = fmaxf(mg, base[(size_t)sp * stride]);
+    float denom = 0.0f;
+    float num = 0.0f;
+    for (int sp = 0; sp < n_split; ++sp) {
+        const float *pp = base + (size_t)sp * stride;
+        // 空 split は m = -inf → e = exp2f(-inf) = 0 で寄与しない。
+        const float e = exp2f((pp[0] - mg) * LOG2E_F);
+        denom = fmaf(pp[1], e, denom);
+        num = fmaf(pp[2 + tid], e, num);
+    }
+    att[(size_t)h * dh + tid] = (denom > 0.0f) ? __fdiv_rn(num, denom) : 0.0f;
+}
+
+// ---------------------------------------------------------------------------
 // P17h: decode 用 qkv rope (qkv bias 対応)。CPU tensor::rope_row とビット一致
 // させるため cos/sin はホスト (同一プロセスの glibc sinf/cosf) で計算した
 // テーブルを渡し、演算は -fmad=false の mul.rn/add.rn/sub.rn (Rust のスカラー

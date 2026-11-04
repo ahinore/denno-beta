@@ -15924,7 +15924,8 @@ mod tests {
             );
 
             // しきい値を 0 にして分岐を開ける。6 行のチャンクは構造ゲート
-            // (`attn_prefill_gpu_supported` の n >= gemm_min_m() = 256) で CPU。
+            // (`attn_prefill_shape_ok` の行数下限 ATTN_Q4_PF_MIN_ROWS = 8、
+            // task 135 以前は gemm_min_m() = 256) で CPU。
             crate::cuda::set_q4_gpu_attn_pf_for_test(Some(true));
             crate::cuda::set_q4_gpu_attn_pf_min_for_test(Some(0), Some(0));
             let (on, on_tries, on_calls) = run_full(6);
