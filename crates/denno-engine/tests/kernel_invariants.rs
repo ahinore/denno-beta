@@ -809,6 +809,83 @@ fn gdn_scan_sig_differs_from_scan_only_in_output_gate() {
     );
 }
 
+/// task 137: コミット済み `kernels_gdn.ptx` の entry 集合が `gdn.cu` の
+/// `__global__` カーネル集合と一致すること。
+///
+/// P55 は gdn.cu に `dno_gdn_chunk_pre_sm` を足して PTX を再生成しなかった
+/// (task 137 で発覚。PTX は `include_bytes!` で binary に焼かれるので、
+/// 再生成を忘れるとホストはカーネルを取れず、fail-closed で黙って CPU 経路に
+/// 落ちる = 速度だけが静かに失われる)。集合の一致を静的に固定する。
+#[test]
+fn gdn_ptx_entries_match_cu_kernels() {
+    const PTX: &str = include_str!("../kernels/kernels_gdn.ptx");
+    // gdn.cu 側は `__global__ void` と名前が別行に分かれるカーネルがあり
+    // (`dno_gdn_chunk_pre_l4` は間にコメントと `__launch_bounds__` が入る)、
+    // 行ではなくコメント除去後のソース全体を走査する。
+    let code: String = GDN_SRC
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut cu: Vec<String> = Vec::new();
+    let mut idx = 0usize;
+    while let Some(i) = code[idx..].find("__global__ void") {
+        let start = idx + i + "__global__ void".len();
+        // 修飾 (`__launch_bounds__(...)`) を読み飛ばしてから名前を取る。
+        let mut rest = code[start..].trim_start();
+        if rest.starts_with("__launch_bounds__") {
+            rest = rest[rest.find(')').map(|p| p + 1).unwrap_or(rest.len())..].trim_start();
+        }
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            cu.push(name);
+        }
+        idx = start;
+    }
+    let mut ptx: Vec<String> = PTX
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix(".visible .entry "))
+        .map(|rest| rest.split('(').next().unwrap_or("").trim().to_string())
+        .collect();
+    cu.sort();
+    ptx.sort();
+    assert_eq!(
+        ptx, cu,
+        "kernels_gdn.ptx の entry 集合が gdn.cu のカーネル集合と違う (PTX 再生成が必要)"
+    );
+}
+
+/// task 137: PTX の `dno_gdn_scan_sig` が `dno_gdn_scan` と同じ引数個数で
+/// 入っていること (ホストは両方に同じ 23 引数を渡す)。
+#[test]
+fn gdn_ptx_scan_sig_has_same_params_as_scan() {
+    const PTX: &str = include_str!("../kernels/kernels_gdn.ptx");
+    fn nparams(ptx: &str, name: &str) -> Option<usize> {
+        let start = ptx.find(&format!(".visible .entry {name}("))?;
+        let mut n = 0usize;
+        for line in ptx[start..].lines().skip(1) {
+            let t = line.trim();
+            if t.starts_with(')') {
+                return Some(n);
+            }
+            if t.starts_with(".param ") {
+                n += 1;
+            }
+        }
+        None
+    }
+    let base = nparams(PTX, "dno_gdn_scan");
+    let sig = nparams(PTX, "dno_gdn_scan_sig");
+    assert_eq!(base, Some(23), "dno_gdn_scan の引数個数が 23 でない");
+    assert_eq!(
+        sig, base,
+        "dno_gdn_scan_sig の引数個数が dno_gdn_scan と違う (PTX 再生成が必要)"
+    );
+}
+
 /// s100 (P3-3): `kernels/gdn.cu` のローカル列配列 (`Scol` / `Wcol` / `Mcol` /
 /// `next`) の境界。これらは固定長 [256] のレジスタ配列で、ループは `dk` まで
 /// 回る。dk を 256 より大きくするとスタックオーバーラン (不正メモリアクセス)

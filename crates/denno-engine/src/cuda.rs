@@ -856,9 +856,20 @@ impl CudaCtx {
                 module_gdn,
                 b"dno_gdn_scan_sig\0".as_ptr() as *const c_char,
             );
-            let f_gdn_scan_sig = if sig_r == CUDA_SUCCESS {
+            // task 137: 取れただけでは足りない。ホストは 23 引数を渡すので、
+            // PTX 側の引数個数が dno_gdn_scan と違えば起動しない (ABI 検査)。
+            let sig_abi_ok = std::str::from_utf8(PTX_GDN)
+                .map(gdn_scan_sig_abi_ok)
+                .unwrap_or(false);
+            let f_gdn_scan_sig = if sig_r == CUDA_SUCCESS && sig_abi_ok {
                 Some(f_gdn_scan_sig)
             } else {
+                if sig_r == CUDA_SUCCESS && !sig_abi_ok {
+                    tracing::warn!(
+                        "[gdn-gpu-scan] dno_gdn_scan_sig の引数個数が dno_gdn_scan と違う \
+                         (PTX とホストの不整合) → CPU 経路"
+                    );
+                }
                 None
             };
 
@@ -2041,6 +2052,25 @@ fn ptx_entry_params(ptx: &str, name: &str) -> Option<usize> {
         return None;
     }
     None
+}
+
+/// task 137: `dno_gdn_scan_sig` の ABI (引数の個数) が `dno_gdn_scan` と
+/// 同じであること。両者はゲート式 1 行以外が同一のカーネルなので、引数の
+/// 個数も同じでなければならない (現状 23)。
+///
+/// 個数が食い違う PTX を cuLaunchKernel で起動すると、足りない引数は**不定**の
+/// まま読まれ、エラーも NaN も出ずに別の行を書く。ホストの起動コードと PTX が
+/// ずれたとき (PTX 再生成の取り違え) に黙って壊れないよう、モジュールロード時に
+/// ここで弾いて CPU 経路へ落とす。GPU 無しでテストできる
+/// (`gdn_scan_sig_abi_matches_scan_in_committed_ptx`)。
+fn gdn_scan_sig_abi_ok(ptx: &str) -> bool {
+    match (
+        ptx_entry_params(ptx, "dno_gdn_scan"),
+        ptx_entry_params(ptx, "dno_gdn_scan_sig"),
+    ) {
+        (Some(base), Some(sig)) => sig == base,
+        _ => false,
+    }
 }
 
 /// v3 のカーネル一式。4 本そろって初めて `Some`。
@@ -16379,6 +16409,29 @@ mod tests {
             Some("1") | Some("on") | Some("true")
         );
         assert_eq!(moe_gemv_v3_on(), env_on, "DENNO_GEMV_V3 の真理値表");
+    }
+
+    /// task 137: コミット済み `kernels_gdn.ptx` の `dno_gdn_scan_sig` が
+    /// `dno_gdn_scan` と同じ引数個数 (23) で入っていること。
+    ///
+    /// ホスト (`gdn_decode_submit`) は 23 引数を渡す。PTX が古い (カーネルが
+    /// 無い / 別ソース由来) と GPU decode scan 経路は **黙って** CPU に落ちる
+    /// (速度だけが失われる) ので、ここで静的に固定する。
+    #[test]
+    fn gdn_scan_sig_abi_matches_scan_in_committed_ptx() {
+        let text = std::str::from_utf8(PTX_GDN).expect("kernels_gdn.ptx が UTF-8 でない");
+        assert_eq!(
+            ptx_entry_params(text, "dno_gdn_scan"),
+            Some(23),
+            "dno_gdn_scan の引数個数が 23 でない (ホストの起動コードと不一致)"
+        );
+        assert_eq!(
+            ptx_entry_params(text, "dno_gdn_scan_sig"),
+            Some(23),
+            "コミット済み kernels_gdn.ptx に dno_gdn_scan_sig が 23 引数で入っていない \
+             (PTX 再生成が必要)"
+        );
+        assert!(gdn_scan_sig_abi_ok(text), "ABI 検査が committed PTX で成立しない");
     }
 
     /// PTX の引数の数え方 (GPU 無しで回る)。nvcc が実際に出す
