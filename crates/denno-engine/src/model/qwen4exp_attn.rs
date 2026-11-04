@@ -433,6 +433,27 @@ pub fn attend_batch_par_calls() -> usize {
     ATTN_BATCH_PAR_CALLS.load(AtomicOrdering::Relaxed)
 }
 
+/// task 134: [`AttnLayer::attend_batch`] が GPU 経路を**試した**回数
+/// (発動ゲートを通った回数)。
+///
+/// 緑 = 経路が発動した証拠ではないので、テストが「GPU の分岐に入った」ことを
+/// これで見る。dev コンテナ (GPU 無し) ではこの後 `q4_attn_prefill` が `None` を
+/// 返して CPU に落ちる。
+static ATTN_BATCH_GPU_TRIES: AtomicUsize = AtomicUsize::new(0);
+
+/// [`ATTN_BATCH_GPU_TRIES`] の読み出し。
+pub fn attend_batch_gpu_tries() -> usize {
+    ATTN_BATCH_GPU_TRIES.load(AtomicOrdering::Relaxed)
+}
+
+/// task 134: [`AttnLayer::attend_batch`] が GPU の出力を採用した回数。
+static ATTN_BATCH_GPU_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// [`ATTN_BATCH_GPU_CALLS`] の読み出し。
+pub fn attend_batch_gpu_calls() -> usize {
+    ATTN_BATCH_GPU_CALLS.load(AtomicOrdering::Relaxed)
+}
+
 /// トークン方向の並列化を始める最小 `nt` (既定 8)。
 ///
 /// 1 トークンぶんの計算は head_dim 256 × 24 head × 位置数で、nt が 1 桁だと
@@ -995,6 +1016,36 @@ impl AttnLayer {
         ATTN_BATCH_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
         let kb = cache.k(layer)?;
         let vb = cache.v(layer)?;
+
+        // task 134: チャンク attention を GPU (dno_attention_prefill) へ。
+        // ミラーは task 133 の decode と同じ台帳・同じ再同期規則で、チャンクの
+        // 追記行だけを H2D する。ゲート・形状・転送のどれかで落ちたら下の CPU
+        // 経路へ静かに戻る (数値は CPU と丸め順だけが違う。決定論は維持)。
+        #[cfg(feature = "cuda")]
+        if crate::cuda::q4_attn_pf_eligible(nt, len) {
+            ATTN_BATCH_GPU_TRIES.fetch_add(1, AtomicOrdering::Relaxed);
+            let call = crate::cuda::Q4AttnPfCall {
+                cache_id: cache.id(),
+                n_layer: cache.n_layer(),
+                layer,
+                layer_gen: cache.gen(layer)?,
+                t_total: len,
+                pos0: base,
+                n: nt,
+                kv_dim: row,
+                heads: self.n_head,
+                group: self.heads_per_kv(),
+                dh: self.head_dim,
+                scale: self.kq_scale,
+                q: qs,
+                k: kb,
+                v: vb,
+            };
+            if let Some(out) = crate::cuda::q4_attn_prefill(&call) {
+                ATTN_BATCH_GPU_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+                return Ok(out);
+            }
+        }
 
         // 作業バッファは 1 トークンぶん (1 kv head を共有する q head 数 × 可視位置の最大)。
         let scratch_len = self.heads_per_kv() * len;
