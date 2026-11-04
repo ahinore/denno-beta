@@ -24341,12 +24341,16 @@ struct GdnDecodeLayerDev {
     wa: DevBuffer,
     wdt: DevBuffer,
     wnorm: DevBuffer,
-    /// 層入力 cur [n_embd]。
-    x: DevBuffer,
+    /// 層入力 cur [n_embd] と beta/alpha [2 * nv] を**1 本に連結**した staging。
+    ///
+    /// task 140: 以前は `x` と `ba` の 2 本で、層ごとに同期 H2D を 3 回
+    /// (x / beta / alpha) 積んでいた。cuMemcpyHtoD は既定ストリームの完了を待つ
+    /// ので、36 層 × 3 回の待ちが submission の主要コストだった (実測 t140b:
+    /// gdn bucket 6.9 ms/tok)。1 本にまとめて H2D を 1 回にする (転送する値・
+    /// 並び・カーネルへ渡すポインタは同一)。
+    xba: DevBuffer,
     /// qkv_gate の全出力 ([qkv 行 + z 行]。ユニットは行範囲へ書く)。
     qkv: DevBuffer,
-    /// beta/alpha 連結 [2 * nv]。
-    ba: DevBuffer,
     /// scan 出力 y [vd]。
     y: DevBuffer,
     /// attn_out GEMV の出力 [n_embd]。
@@ -24369,6 +24373,13 @@ struct GdnDecodeLayerDev {
 
 static GDN_DECODE_STORE: std::sync::Mutex<Vec<(GdnDecodeKey, GdnDecodeLayerDev)>> =
     std::sync::Mutex::new(Vec::new());
+
+// task 140: 層ごとの H2D staging (cur | beta | alpha を 1 本に詰める)。
+// grow-only で使い回す (36 層 × 128 トークンで数万回呼ばれるため、毎回の
+// Vec 確保を避ける)。中身は毎回 clear してから詰め直す。
+thread_local! {
+    static GDN_STAGE: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// `gdn_decode_submit` の入力 1 行分 (GGUF ブロックのままの重み 1 本)。
 ///
@@ -24550,9 +24561,8 @@ fn gdn_decode_entry_ensure_locked(
         wa: DevBuffer::from_slice(req.wa)?,
         wdt: DevBuffer::from_slice(req.wdt)?,
         wnorm: DevBuffer::from_slice(req.wnorm)?,
-        x: DevBuffer::alloc(req.n_embd * 4)?,
+        xba: DevBuffer::alloc((req.n_embd + req.nv * 2) * 4)?,
         qkv: DevBuffer::alloc(req.qkv_total * 4)?,
-        ba: DevBuffer::alloc(req.nv * 2 * 4)?,
         y: DevBuffer::alloc(req.nv * req.dv * 4)?,
         out: DevBuffer::alloc(req.n_embd * 4)?,
         n_embd: req.n_embd,
@@ -24907,7 +24917,7 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         let mut s = format!(
             "[gdn-dump] li={} tok={} mode={:?} nv={} nk={} dk={} dv={} conv_dim={} qkv_total={} \
              qkv_row_start={} z_row_start={} \
-             buf(x={} qkv={} ba={} y={} out={} conv={} ssm={}) seeded={} cur={}",
+             buf(xba={} qkv={} y={} out={} conv={} ssm={}) seeded={} cur={}",
             req.li,
             req.tok,
             mode,
@@ -24919,9 +24929,8 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
             req.qkv_total,
             req.qkv_row_start,
             req.z_row_start,
-            e.x.bytes(),
+            e.xba.bytes(),
             e.qkv.bytes(),
-            e.ba.bytes(),
             e.y.bytes(),
             e.out.bytes(),
             e.conv[e.cur].bytes(),
@@ -24986,28 +24995,38 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
     }
     let run = || -> Result<(Vec<f32>, Option<(Vec<f32>, Vec<f32>)>)> {
         let (_, e) = &store_lock[idx];
-        e.x.copy_from(req.cur)?;
-        stage_sync!("x_h2d");
+        // task 140: cur / beta / alpha を 1 本の staging に詰めて **H2D 1 回**で
+        // 上げる (以前は同期 H2D 3 回。値・並びは同一で、カーネルへ渡す
+        // ポインタだけが xba の先頭/中間を指す)。
+        GDN_STAGE.with(|cell| -> Result<()> {
+            let mut st = cell.borrow_mut();
+            st.clear();
+            st.extend_from_slice(req.cur);
+            st.extend_from_slice(req.beta);
+            st.extend_from_slice(req.alpha);
+            e.xba.copy_from(st.as_slice())
+        })?;
+        stage_sync!("xba_h2d");
+        let px = e.xba.ptr();
+        let pb = px + (req.n_embd * 4) as CUdeviceptr;
+        let pa = pb + (req.nv * 4) as CUdeviceptr;
         for (i, ((u, row), cfg)) in req.qkv_units.iter().zip(qcfg.iter()).enumerate() {
             gdn_launch_gemv_dev(
                 ctx,
                 cfg,
                 &qw[i].buf,
-                e.x.ptr(),
+                px,
                 e.qkv.ptr() + (*row * 4) as CUdeviceptr,
                 u.k,
                 u.n,
             )?;
             stage_sync!(format!("qkv_gemv[{i}]"));
         }
-        e.ba.copy_from_at(0, req.beta)?;
-        e.ba.copy_from_at(req.nv * 4, req.alpha)?;
-        stage_sync!("ba_h2d");
         let (mut pq, mut pz) = (
             e.qkv.ptr() + (req.qkv_row_start * 4) as CUdeviceptr,
             e.qkv.ptr() + (req.z_row_start * 4) as CUdeviceptr,
         );
-        let (mut pb, mut pa) = (e.ba.ptr(), e.ba.ptr() + (req.nv * 4) as CUdeviceptr);
+        let (mut pb, mut pa) = (pb, pa);
         let (mut pci, mut pco) = (e.conv[cur_face].ptr(), e.conv[out_face].ptr());
         let (mut psi, mut pso) = (e.ssm.ptr(), e.ssm.ptr());
         let (mut pwc, mut pwa) = (e.wconv.ptr(), e.wa.ptr());
