@@ -29,7 +29,9 @@
 //! は末尾 `n_gram` 個を反転してから `gather` に渡す (P-MOE-F7 で修正済み)。
 //! このモジュールは古い順のまま渡してよい。
 
-use crate::model::qwen4exp::{one, LayerOut, Qwen4Exp, Qwen4ExpError, RoleRms, TapTokens};
+use crate::model::qwen4exp::{
+    one, q4prof, LayerOut, Qwen4Exp, Qwen4ExpError, RoleRms, TapTokens,
+};
 
 /// `qwen4exp.rs` と同じ「1 行 1 件」のエラー型を使う。
 type Result<T> = std::result::Result<T, Qwen4ExpError>;
@@ -417,16 +419,21 @@ impl Qwen4ExpDecoder {
             return Err(one("ple_window が 0 (PLE 索引の窓が無い)"));
         }
 
+        // task 132: step の入口 (push と窓の組み立て) を層の外として測る。
+        let d_step = q4prof::dstamp();
         self.tokens.push(token);
 
         // 末尾 `win` 個を古い順のまま渡す (窓を切っても末尾の意味は変わらない)。
         let start = self.tokens.len().saturating_sub(win);
         let ctx: Vec<u32> = self.tokens[start..].to_vec();
+        q4prof::dmark(q4prof::D_STEP, d_step);
 
         let logits = self.model.forward_token_at(&ctx, 0, 1, on_layer, roles)?;
         // P58: decode 1 トークンぶんの構造テレメトリ (変化した expert 在庫と
         // 100 トークンごとの階層統計)。arch off ならエンジン側で即座に戻る。
+        let d_arch = q4prof::dstamp();
         self.model.arch_emit_token();
+        q4prof::dmark(q4prof::D_ARCH, d_arch);
         Ok(logits)
     }
 

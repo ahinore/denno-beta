@@ -1278,6 +1278,11 @@ impl AttnLayer {
         pos: usize,
         cells: Option<&[usize]>,
     ) -> Result<Vec<f32>> {
+        // task 132: full attention 層の decode 時間を q4prof の A_FULL に積む
+        // (範囲は prefill の `forward_batch` と同じ = 投影から出力投影まで)。
+        // attend 本体には触らない (task 133 の GPU 化と衝突しないよう、
+        // タイマーはこの関数の頭と末尾だけ)。
+        let t_all = q4prof::stamp();
         if cur.len() != self.n_embd {
             bail!(
                 "AttnLayer::forward_token: 入力長 {} が n_embd = {} と違う",
@@ -1302,7 +1307,11 @@ impl AttnLayer {
             Some(c) => self.attend_visible(&q, cache, layer, c)?,
         };
         let gated = self.gate_mul(&attn, &gate)?;
-        self.project_out(&gated)
+        let out = self.project_out(&gated)?;
+        if let Some(t) = t_all {
+            q4prof::add(&q4prof::A_FULL, t);
+        }
+        Ok(out)
     }
 
     /// 1 トークンあたりの重みバイト数 (量子化ブロック + norm)。

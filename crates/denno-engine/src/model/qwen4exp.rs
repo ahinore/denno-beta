@@ -2362,13 +2362,19 @@ impl Qwen4Exp {
         let hp = self.hp();
         // P78: 逐次 prefill の中だけ層の外を区間計測する (decode では false)。
         let prof = prekprof::measuring();
+        // task 132: decode の層の外の内訳 (`DENNO_Q4_PROFILE`)。無効なら
+        // `dstamp` は None を返すだけで、区間は積まれない。
         let t_emb = prekprof::stamp_when(prof);
+        let d_emb = q4prof::dstamp();
         let mut res = self.forward_embed(ctx, &hp)?;
         prekprof::mark(t_emb, prekprof::EMBED);
+        q4prof::dmark(q4prof::D_EMBED, d_emb);
         let t_ple = prekprof::stamp_when(prof);
+        let d_ple = q4prof::dstamp();
         let f0 = if prof { prekprof::faults() } else { None };
         let ple_emb = self.gather_ple(ctx)?;
         prekprof::mark(t_ple, prekprof::PLE);
+        q4prof::dmark(q4prof::D_PLE, d_ple);
         if prof {
             prekprof::note_fault_delta(f0);
         }
@@ -2380,6 +2386,7 @@ impl Qwen4Exp {
         let auto = roles.is_none() && arch_frames_enabled();
 
         let t_lay = prekprof::stamp_when(prof);
+        let d_lay = q4prof::dstamp();
         for il in 0..self.p.n_layer {
             // P54: 役割別 RMS は層ごとに 0 から取り直す (観測しないときは None)。
             {
@@ -2418,8 +2425,10 @@ impl Qwen4Exp {
 
         // 4. 最終 mixer (output_norm の代わり) + 5. logits
         prekprof::mark(t_lay, prekprof::LAYER);
+        q4prof::dmark(q4prof::D_LAYER, d_lay);
         let t_mix = headprof::stamp();
         let t_fin = prekprof::stamp_when(prof);
+        let d_fin = q4prof::dstamp();
         let cur = hc_mix_quant(
             &res,
             &self.head.norm,
@@ -2431,10 +2440,13 @@ impl Qwen4Exp {
         .0;
         headprof::mark(headprof::MIX, t_mix, 0);
         prekprof::mark(t_fin, prekprof::FINAL_NORM);
+        q4prof::dmark(q4prof::D_FINAL, d_fin);
         let mut logits = vec![0.0f32; self.head.output.n()];
         let t_head = prekprof::stamp_when(prof);
+        let d_head = q4prof::dstamp();
         self.head_logits_into(&cur, &mut logits)?;
         prekprof::mark(t_head, prekprof::HEAD);
+        q4prof::dmark(q4prof::D_HEAD, d_head);
         Ok(logits)
     }
 
@@ -3989,6 +4001,53 @@ pub mod q4prof {
     pub static A_OUT: AtomicU64 = AtomicU64::new(0);
     pub static A_FULL: AtomicU64 = AtomicU64::new(0);
 
+    // ---- decode の「層の外」内訳 (task 132) --------------------------------
+    //
+    // decode の壁時計 (serve が測る) から層実行 (D_LAYER) を引いた残りを、
+    // それぞれ実際に取ったタイマーで割る。合計から逆算した値を区間として
+    // 出さない (差は `unexplained` の 1 列だけ)。
+
+    /// 区間: embedding の行 gather (`Qwen4Exp::forward_embed`)。
+    pub const D_EMBED: usize = 0;
+    /// 区間: PLE の n-gram 索引 → 表の pread (`Qwen4Exp::gather_ple`)。
+    pub const D_PLE: usize = 1;
+    /// 区間: 層ループの wall (中の mix/attn/moe は [`MIX`] / [`ATTN`] / [`MOE`])。
+    pub const D_LAYER: usize = 2;
+    /// 区間: head の mixer (最終 norm 相当、`hc_mix_quant`)。
+    pub const D_FINAL: usize = 3;
+    /// 区間: `output` の GEMV。
+    pub const D_HEAD: usize = 4;
+    /// 区間: decode のサンプリング (`Sampler::sample`)。
+    pub const D_SAMPLE: usize = 5;
+    /// 区間: detokenize (`tok.decode`)。
+    pub const D_DETOK: usize = 6;
+    /// 区間: SSE への書き出し (`emit` の呼び出し)。
+    pub const D_EMIT: usize = 7;
+    /// 区間: step の入口 (`tokens.push` と窓の `ctx` の組み立て)。
+    pub const D_STEP: usize = 8;
+    /// 区間: 構造テレメトリの送出 (`arch_emit_token`)。
+    pub const D_ARCH: usize = 9;
+    /// 区間: テレメトリのフレーム送出 (Step / Token / KvUsage)。
+    pub const D_TELEM: usize = 10;
+    /// 区間の数。
+    pub const D_NSLOT: usize = 11;
+    /// 区間の名前 (`[q4prof] decode outside` の列名、[`D_EMBED`] の順)。
+    pub const D_NAMES: [&str; D_NSLOT] = [
+        "embed",
+        "ple",
+        "layer",
+        "final_norm",
+        "head",
+        "sample",
+        "detok",
+        "emit",
+        "step",
+        "arch",
+        "telem",
+    ];
+
+    static D_NS: [AtomicU64; D_NSLOT] = [const { AtomicU64::new(0) }; D_NSLOT];
+
     fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("DENNO_Q4_PROFILE").is_some())
@@ -4013,6 +4072,17 @@ pub mod q4prof {
     #[cfg(test)]
     static FORCE_ATT_DBG: AtomicBool = AtomicBool::new(false);
 
+    /// テストが env を立てずに [`enabled`] の経路を通すための強制フラグ
+    /// (task 132 の層の外内訳を --lib で発火させる)。
+    #[cfg(test)]
+    static FORCE_ON: AtomicBool = AtomicBool::new(false);
+
+    /// 計測をテストから強制する (`false` で env の解釈に戻る)。
+    #[cfg(test)]
+    pub fn set_for_test(v: bool) {
+        FORCE_ON.store(v, Ordering::Relaxed);
+    }
+
     /// 層別内訳をテストから強制する (`None` で env の値に戻す)。
     #[cfg(test)]
     pub fn set_att_dbg_for_test(v: bool) {
@@ -4022,8 +4092,9 @@ pub mod q4prof {
     /// 時間を取るか (Q4_PROFILE か PF_ATT_DBG のどちらかが有効)。
     #[inline]
     pub fn timed() -> bool {
-        static T: OnceLock<bool> = OnceLock::new();
-        *T.get_or_init(|| on() || att_dbg())
+        // テストの強制フラグを立てた後に古い値を掴まないようキャッシュしない
+        // (`enabled` / `att_dbg` はどちらも OnceLock + atomic load 1 回)。
+        enabled() || att_dbg()
     }
 
     // ---- 層別内訳 (DENNO_PF_ATT_DBG) -------------------------------------
@@ -4160,6 +4231,10 @@ pub mod q4prof {
 
     #[inline]
     pub fn enabled() -> bool {
+        #[cfg(test)]
+        if FORCE_ON.load(Ordering::Relaxed) {
+            return true;
+        }
         static E: OnceLock<bool> = OnceLock::new();
         *E.get_or_init(on)
     }
@@ -4189,16 +4264,140 @@ pub mod q4prof {
         (f(&A_QKV), f(&A_GATE), f(&A_GDN), f(&A_OUT), f(&A_FULL))
     }
 
+    // ---- decode の層の外 (task 132) --------------------------------------
+
+    /// 層の外の区間用の `Instant`。計測が要るときだけ取る (既定 off では `None`)。
+    #[inline]
+    pub fn dstamp() -> Option<std::time::Instant> {
+        if enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    }
+
+    /// 層の外の区間 `slot` に `t` からの経過を足す (`None` は no-op)。
+    #[inline]
+    pub fn dmark(slot: usize, t: Option<std::time::Instant>) {
+        if let Some(t) = t {
+            dadd_ns(slot, t.elapsed().as_nanos() as u64);
+        }
+    }
+
+    /// 層の外の区間 `slot` に ns を直接足す (外で測った値を渡す用)。
+    #[inline]
+    pub fn dadd_ns(slot: usize, ns: u64) {
+        if enabled() {
+            D_NS[slot].fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// 層の外の区間 `slot` の累積 (ns)。テストとレポート用。
+    #[inline]
+    pub fn dns(slot: usize) -> u64 {
+        D_NS[slot].load(Ordering::Relaxed)
+    }
+
+    /// decode の層の外の内訳 1 行。`total_ns` は decode の壁時計 (`serve_flash`
+    /// が測る t2..t_decode)。区間はすべて個別のタイマーで、合計との差だけを
+    /// `unexplained` として出す。無効時は `None` (出力ゼロ)。
+    pub fn decode_outside_line(tok: usize, total_ns: u64) -> Option<String> {
+        if !enabled() {
+            return None;
+        }
+        let ms = |s: usize| dns(s) as f64 / 1e6;
+        let inside: u64 = D_NS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        let total = total_ns as f64 / 1e6;
+        let un = total - inside as f64 / 1e6;
+        let d = tok.max(1) as f64;
+        let mut s = format!(
+            "[q4prof] decode outside tok={tok} total={total:.1}ms layer={:.1}",
+            ms(D_LAYER)
+        );
+        for i in 0..D_NSLOT {
+            if i == D_LAYER {
+                continue;
+            }
+            s.push_str(&format!(" | {} {:.1}", D_NAMES[i], ms(i)));
+        }
+        s.push_str(&format!(
+            " | unexplained {un:.1}ms ({:.3} ms/tok, layer {:.3} ms/tok)",
+            un / d,
+            ms(D_LAYER) / d
+        ));
+        Some(s)
+    }
+
     pub fn reset() {
         for c in [&PLE, &MIX, &ATTN, &MOE, &A_QKV, &A_GATE, &A_GDN, &A_OUT, &A_FULL] {
             c.store(0, Ordering::Relaxed);
         }
         N_LAYER.store(0, Ordering::Relaxed);
+        for c in D_NS.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
         for c in LAYER_NS.iter() {
             c.store(0, Ordering::Relaxed);
         }
         for c in LAYER_NT.iter() {
             c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// グローバルカウンタを共有するので、テストは 1 本ずつ回す
+        /// (`prekprof` / `mix_kprof` と同じロック)。
+        fn lock() -> std::sync::MutexGuard<'static, ()> {
+            crate::model::moe_expert::moe_test_lock()
+        }
+
+        /// 無効時は Instant も取らず、レポートも出ない (既定 off の契約)。
+        #[test]
+        fn decode_outside_off_is_noop() {
+            let _g = lock();
+            set_for_test(false);
+            reset();
+            assert!(dstamp().is_none(), "off で Instant を取った");
+            dmark(D_EMBED, Some(std::time::Instant::now()));
+            dadd_ns(D_HEAD, 1_000_000);
+            assert_eq!(dns(D_HEAD), 0, "off なのに積まれた");
+            assert!(
+                decode_outside_line(4, 10_000_000).is_none(),
+                "off でレポートが出た"
+            );
+            reset();
+        }
+
+        /// 区間はそれぞれ独立に積まれ、合計との差だけが unexplained になる。
+        /// (配線そのものは呼び出し側 — ここでは行の組み立てと無効時の
+        /// no-op を固定する。)
+        #[test]
+        fn decode_outside_line_reports_slots_and_residual() {
+            let _g = lock();
+            set_for_test(true);
+            reset();
+            dadd_ns(D_EMBED, 1_000_000);
+            dadd_ns(D_LAYER, 6_000_000);
+            dadd_ns(D_SAMPLE, 500_000);
+            let line = decode_outside_line(2, 10_000_000).expect("on なのにレポートが出ない");
+            assert!(line.starts_with("[q4prof] decode outside tok=2"), "{line}");
+            assert!(line.contains("total=10.0ms"), "{line}");
+            assert!(line.contains("layer=6.0"), "{line}");
+            assert!(line.contains("embed 1.0"), "{line}");
+            assert!(line.contains("sample 0.5"), "{line}");
+            // 10 - 7.5 = 2.5 ms が説明できない分。
+            assert!(line.contains("unexplained 2.5ms"), "{line}");
+            // 列が欠けない (全スロットの名前が出る)。
+            for name in D_NAMES {
+                assert!(line.contains(name), "{name} が行に無い: {line}");
+            }
+            // ms/tok はトークン数で割る (2.5 ms / 2 tok = 1.25)。
+            assert!(line.contains("1.250 ms/tok"), "{line}");
+            reset();
+            set_for_test(false);
         }
     }
 }
@@ -4731,8 +4930,8 @@ pub mod mix_kprof {
 /// **その 1 発の実行先** (GPU intercept か CPU) が取る (GPU 経路は同期 GEMV =
 /// 帰ってきた時点で計算済み)。cuda feature 無しのビルドでは常に CPU 扱い。
 ///
-/// full 層 12 本の投影は q4prof にも未計上 (`A_FULL` は decode で積まない) なので、
-/// ここにも積まない — 内訳の合計が実測行と一致することを保つ。
+/// full 層 12 本は task 132 から `A_FULL` (decode も計上) が持つので、ここには
+/// 積まない — qkv / gate / gdn / out + full が実測行の attn 合計になる。
 ///
 /// 出力は `serve_flash::prof_flash_q4` が prefill / decode の区切りで 1 行出して
 /// [`reset`] する (`mix_kprof` と同じ規約・`DENNO_Q4_PROFILE` とは独立に
