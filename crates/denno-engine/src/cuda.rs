@@ -10949,9 +10949,14 @@ const Q4_GPU_ATTN_MIN_DEFAULT: usize = 64;
 const Q4_GPU_ATTN_MIRROR_MB_DEFAULT: usize = 3584;
 
 /// task 134: `DENNO_Q4_GPU_ATTN_PF` の既定 (prefill の full attention を GPU へ)。
-/// lab t134a (SCENARIO=depth, 4 runs) で c2000 cold prefill 134.83 -> 110.59 s
-/// (-18.0%)、c2000 turn2 +0.7%、短いプロンプト 0.0%、decode -1.2%、
-/// md5 は 4 本とも同一・text sane。目標 (c2000 cold 15% 減) を満たしたので既定 on。
+///
+/// lab t134a (SCENARIO=depth) で c2000 cold prefill 134.83 -> 110.59 s (-18.0%)、
+/// c2000 turn2 +0.7%、短いプロンプト 0.0%、decode -1.2%、md5 は 4 本とも同一。
+/// lab t134b (SCENARIO=depth8k) で c2000 cold -18.1%、c8000 cold
+/// 758.94 -> 379.20 s (-50.0%)、c8000 turn2 2.53 -> 2.53 s (+0.0%)、decode 不変、
+/// errors 0、text sane。md5 は c8000 の 2 本だけ DIFF (GPU attention の丸め順で
+/// greedy が動いた。c2000 と短文は同一)。目標 (c2000 15% / c8000 35%) を
+/// 満たしたので既定 on。
 const Q4_GPU_ATTN_PF_DEFAULT: bool = true;
 /// `DENNO_Q4_GPU_ATTN_PF_MIN` の既定 = 1 チャンクの行数の下限。
 /// カーネルの構造上の下限 (`attn_prefill_gpu_supported` の n >= gemm_min_m() =
