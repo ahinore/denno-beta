@@ -11242,7 +11242,9 @@ pub(crate) enum Q4AttnKernel {
 /// lab t139a (depth, ptx=elem) の実測で `split` (`dno_attention_decode`) が
 /// 3,954 文脈の 1 呼び出しを 571 us -> 7.6 us にし、c2000 turn2 decode を
 /// 93 -> 86 ms/tok にした (`[q4attn] split calls=1116 fallback=0`)。
-/// 短いプロンプトも 80 -> 80/81 ms/tok・md5 SAME なので既定にする。
+/// lab t139b (depth8k, PTX は commit 済みのもの) でも c8000 turn2 decode が
+/// 119 -> 93 ms/tok (-21.8%)、c2000 turn2 が 96 -> 86、短いプロンプトは
+/// 81 -> 81 で md5 は 6 本とも SAME。既定にする。
 /// PTX にカーネルが無いビルドでは fail closed で `dno_attention` に落ちる。
 /// `pf` (prefill カーネルを n=1 で使う) は lab t135a で 3.9 倍遅かったので
 /// 既定にはしない (`DENNO_Q4_GPU_ATTN_KERNEL=pf` で選べる)。
