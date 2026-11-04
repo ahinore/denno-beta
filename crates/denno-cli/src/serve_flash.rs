@@ -423,6 +423,16 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         eprintln!("{line}");
         denno_engine::model::gemm_iq_kprof::reset();
     }
+    // task 138: decode 1 トークンの GPU 往復台帳 (`DENNO_Q4_PROFILE`)。
+    // 区間ごとの発行数・同期回数と待ち・H2D/D2H バイト・壁時計を 1 行ずつ。
+    // 値は 1 トークンあたり (この窓の decode トークン数で割る)。
+    // 窓は prefill 終端でも切る (prefill の転送を decode の数字に混ぜない)。
+    if tag == "decode" {
+        for line in denno_engine::model::q4ledger::line(tok) {
+            eprintln!("{line}");
+        }
+    }
+    denno_engine::model::q4ledger::reset();
     if !q4prof::enabled() {
         return;
     }

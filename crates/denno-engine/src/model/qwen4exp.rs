@@ -44,6 +44,7 @@ use crate::model::linear_gguf::GgufLinear;
 use crate::model::moe::{select_topk, select_topk_into};
 use crate::model::moe_expert::{self, ExpertSlice};
 use crate::model::prekprof;
+use crate::model::q4ledger;
 use crate::ple::{PleNgram, PleTable, PLE_TABLE_NAME};
 use crate::quant::WeightBlocks;
 use crate::tensor::{silu_inplace, softmax};
@@ -2429,15 +2430,19 @@ impl Qwen4Exp {
         let t_mix = headprof::stamp();
         let t_fin = prekprof::stamp_when(prof);
         let d_fin = q4prof::dstamp();
-        let cur = hc_mix_quant(
-            &res,
-            &self.head.norm,
-            &self.head.down,
-            &self.head.up,
-            None,
-            &hp,
-        )?
-        .0;
+        let cur = {
+            // task 138: 台帳の区間 (最終 mixer の mix)。
+            let _l = q4ledger::enter(q4ledger::MIX);
+            hc_mix_quant(
+                &res,
+                &self.head.norm,
+                &self.head.down,
+                &self.head.up,
+                None,
+                &hp,
+            )?
+            .0
+        };
         headprof::mark(headprof::MIX, t_mix, 0);
         prekprof::mark(t_fin, prekprof::FINAL_NORM);
         q4prof::dmark(q4prof::D_FINAL, d_fin);
@@ -2586,19 +2591,35 @@ impl Qwen4Exp {
 
         // 3.2-3.4 attention 入口 → attn → 出口
         let t_mix = std::time::Instant::now();
-        let (cur, inject) = hc_mix_quant(
-            res,
-            &lw.hc_attn_norm,
-            &lw.hc_attn_down,
-            &lw.hc_attn_up,
-            Some(&lw.hc_attn_inject),
-            hp,
-        )?;
+        let (cur, inject) = {
+            // task 138: 台帳の区間 (mix)。off では stamp を取らないだけ。
+            let _l = q4ledger::enter(q4ledger::MIX);
+            hc_mix_quant(
+                res,
+                &lw.hc_attn_norm,
+                &lw.hc_attn_down,
+                &lw.hc_attn_up,
+                Some(&lw.hc_attn_inject),
+                hp,
+            )?
+        };
         q4prof::add(&q4prof::MIX, t_mix);
         hook("hc_mixed_attn", il, &cur)?;
         hook("hc_inject_attn", il, &inject)?;
         let t_attn = std::time::Instant::now();
-        let cur = self.attn.forward(il, &cur)?;
+        let cur = {
+            // task 138: 層種別で full / ssm に分ける (台帳 on のときだけ引く)。
+            let item = if q4ledger::enabled() {
+                match self.p.layer_kind(il) {
+                    Ok(LayerKind::FullAttn) => q4ledger::FULL,
+                    _ => q4ledger::SSM,
+                }
+            } else {
+                q4ledger::OTHER
+            };
+            let _l = q4ledger::enter(item);
+            self.attn.forward(il, &cur)?
+        };
         q4prof::add(&q4prof::ATTN, t_attn);
         if cur.len() != e {
             return Err(one(format!(
@@ -2621,14 +2642,18 @@ impl Qwen4Exp {
 
         // 3.5-3.7 ffn 入口 → MoE FFN → 出口
         let t_mix = std::time::Instant::now();
-        let (cur, inject) = hc_mix_quant(
-            res,
-            &lw.hc_ffn_norm,
-            &lw.hc_ffn_down,
-            &lw.hc_ffn_up,
-            Some(&lw.hc_ffn_inject),
-            hp,
-        )?;
+        let (cur, inject) = {
+            // task 138: 台帳の区間 (mix)。
+            let _l = q4ledger::enter(q4ledger::MIX);
+            hc_mix_quant(
+                res,
+                &lw.hc_ffn_norm,
+                &lw.hc_ffn_down,
+                &lw.hc_ffn_up,
+                Some(&lw.hc_ffn_inject),
+                hp,
+            )?
+        };
         q4prof::add(&q4prof::MIX, t_mix);
         hook("hc_mixed_ffn", il, &cur)?;
         let t_moe = std::time::Instant::now();
@@ -6379,7 +6404,14 @@ fn moe_ffn_quant_impl(
 
     // task 124: shared expert の gate/up は `x` だけで決まるので、router と
     // 選択 expert の CPU 仕事を始める前に GPU へ積む (join は下の 5. で 1 回)。
-    let mut shed_ov = SharedExpertOverlap::begin(lw, x);
+    // task 138: この発行は台帳では shared に数える。
+    let mut shed_ov = {
+        let _l = q4ledger::enter(q4ledger::SHARED);
+        SharedExpertOverlap::begin(lw, x)
+    };
+
+    // task 138: 台帳の区間 (router)。gate_inp の GEMV から top-k の確定まで。
+    let _l_router = q4ledger::enter(q4ledger::ROUTER);
 
     // 1. ルータ
     let mut probs = vec![0.0f32; ne];
@@ -6487,6 +6519,9 @@ fn moe_ffn_quant_impl(
     if emit_router {
         emit_router_topk(lw.il, &sel, &weights);
     }
+
+    // task 138: router の区間はここまで (expert の CPU 仕事は台帳の外 = other)。
+    drop(_l_router);
 
     // 3.5 選択 expert の重みを先に読み始める (I/O と計算を重ねる)。
     //     1 トークンで 48 層 × 11 行列 × 921 KB を触るので、フォルト待ちが支配的になる。
@@ -6739,6 +6774,8 @@ fn moe_ffn_quant_impl(
 
     // 5. shared expert (係数は sigmoid(gate_inp_shexp @ x))
     moe_sub_add(1, t_experts.elapsed());
+    // task 138: 台帳の区間 (shared)。join・down・gate_inp の GEMV を含む。
+    let _l_shared = q4ledger::enter(q4ledger::SHARED);
     let t_shared = std::time::Instant::now();
     let sff = lw.gate_shexp.n();
     let mut sact = vec![0.0f32; sff];
@@ -16038,6 +16075,51 @@ mod tests {
             prekprof::reset();
             prekprof::set_for_test(false);
             moe_expert::set_vnni_for_test(None);
+        }
+
+        /// task 138: decode の台帳が**実際に** mix / ssm / full / router / shared に
+        /// 積まれること (配線の生死)。GPU 無しでも壁時計は積まれる。
+        #[test]
+        fn q4ledger_records_decode_items() {
+            let _g = moe_test_guard();
+            let dir = TempDir::new("q4ledger_items");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("合成モデルを開けない");
+            let ctx: Vec<u32> = vec![1, 2, 3, 4];
+            let mut m = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+
+            q4ledger::set_for_test(true);
+            q4ledger::reset();
+            let _ = m.forward_token(&ctx).expect("decode");
+
+            for (i, name) in [q4ledger::MIX, q4ledger::SSM, q4ledger::FULL]
+                .iter()
+                .map(|&i| (i, q4ledger::NAMES[i]))
+            {
+                assert!(
+                    q4ledger::row(i).wall_ns > 0,
+                    "{name} の区間が積まれていない (配線が無い)"
+                );
+            }
+            for (i, name) in [q4ledger::ROUTER, q4ledger::SHARED]
+                .iter()
+                .map(|&i| (i, q4ledger::NAMES[i]))
+            {
+                assert!(
+                    q4ledger::row(i).wall_ns > 0,
+                    "{name} の区間が積まれていない (moe の中の配線が無い)"
+                );
+            }
+            // 行は 1 行のヘッダ + 列見出し + 積まれた item の数だけ出る。
+            let lines = q4ledger::line(1);
+            assert!(lines.len() >= 3, "{lines:?}");
+            assert!(
+                lines.iter().any(|l| l.contains(" router ")),
+                "router の行が無い: {lines:?}"
+            );
+
+            q4ledger::reset();
+            q4ledger::set_for_test(false);
         }
 
         /// task 65: 合成モデルの 1 回の prefill で `DENNO_CPU_GEMV_PAR` の

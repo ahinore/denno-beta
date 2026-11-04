@@ -176,6 +176,63 @@ unsafe fn sym_opt(handle: *mut c_void, name: &'static str) -> Option<*mut c_void
     }
 }
 
+// task 138: H2D / D2H の全呼び出しを台帳 (`DENNO_Q4_PROFILE`) へ数える trampoline。
+//
+// コピーは cuda.rs の数十箇所から素の関数ポインタで呼ばれているので、呼び出し側を
+// 触らずに**全部**を数えるため、`CudaLib` に入れるポインタ自体を差し替える。
+// 実関数はここに 1 度だけ保存し、trampoline が転送バイト数と所要時間を積む。
+// 台帳 off では `stamp()` が `None` を返すだけで、転送そのものは従来と同一。
+static REAL_HTOD: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static REAL_DTOH: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static REAL_HTOD_ASYNC: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static REAL_DTOH_ASYNC: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+unsafe extern "C" fn ledger_htod(d: CUdeviceptr, s: *const c_void, n: usize) -> CUresult {
+    let t = crate::model::q4ledger::stamp();
+    let f: FnCuMemcpyHtoDV2 = std::mem::transmute(REAL_HTOD.load(Ordering::Relaxed));
+    let r = f(d, s, n);
+    crate::model::q4ledger::note_h2d(n, t);
+    r
+}
+
+unsafe extern "C" fn ledger_dtoh(d: *mut c_void, s: CUdeviceptr, n: usize) -> CUresult {
+    let t = crate::model::q4ledger::stamp();
+    let f: FnCuMemcpyDtoHV2 = std::mem::transmute(REAL_DTOH.load(Ordering::Relaxed));
+    let r = f(d, s, n);
+    crate::model::q4ledger::note_d2h(n, t);
+    r
+}
+
+unsafe extern "C" fn ledger_htod_async(
+    d: CUdeviceptr,
+    s: *const c_void,
+    n: usize,
+    st: CUstream,
+) -> CUresult {
+    let t = crate::model::q4ledger::stamp();
+    let f: FnCuMemcpyHtoDAsyncV2 = std::mem::transmute(REAL_HTOD_ASYNC.load(Ordering::Relaxed));
+    let r = f(d, s, n, st);
+    crate::model::q4ledger::note_h2d(n, t);
+    r
+}
+
+unsafe extern "C" fn ledger_dtoh_async(
+    d: *mut c_void,
+    s: CUdeviceptr,
+    n: usize,
+    st: CUstream,
+) -> CUresult {
+    let t = crate::model::q4ledger::stamp();
+    let f: FnCuMemcpyDtoHAsyncV2 = std::mem::transmute(REAL_DTOH_ASYNC.load(Ordering::Relaxed));
+    let r = f(d, s, n, st);
+    crate::model::q4ledger::note_d2h(n, t);
+    r
+}
+
 unsafe fn open_libcuda() -> Result<CudaLib> {
     let name = b"libcuda.so.1\0";
     let handle = dlopen(name.as_ptr() as *const c_char, RTLD_NOW);
@@ -197,13 +254,31 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
         mem_free: std::mem::transmute(sym(handle, "cuMemFree_v2")?),
         mem_get_info: sym_opt(handle, "cuMemGetInfo_v2")
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuMemGetInfo>(p) }),
-        memcpy_htod: std::mem::transmute(sym(handle, "cuMemcpyHtoD_v2")?),
-        memcpy_dtoh: std::mem::transmute(sym(handle, "cuMemcpyDtoH_v2")?),
+        memcpy_htod: {
+            let p: FnCuMemcpyHtoDV2 = std::mem::transmute(sym(handle, "cuMemcpyHtoD_v2")?);
+            REAL_HTOD.store(p as *mut c_void, Ordering::Relaxed);
+            ledger_htod
+        },
+        memcpy_dtoh: {
+            let p: FnCuMemcpyDtoHV2 = std::mem::transmute(sym(handle, "cuMemcpyDtoH_v2")?);
+            REAL_DTOH.store(p as *mut c_void, Ordering::Relaxed);
+            ledger_dtoh
+        },
         memset_d32_async: std::mem::transmute(sym(handle, "cuMemsetD32Async")?),
         mem_host_alloc: std::mem::transmute(sym(handle, "cuMemHostAlloc")?),
         mem_host_free: std::mem::transmute(sym(handle, "cuMemFreeHost")?),
-        memcpy_htod_async: std::mem::transmute(sym(handle, "cuMemcpyHtoDAsync_v2")?),
-        memcpy_dtoh_async: std::mem::transmute(sym(handle, "cuMemcpyDtoHAsync_v2")?),
+        memcpy_htod_async: {
+            let p: FnCuMemcpyHtoDAsyncV2 =
+                std::mem::transmute(sym(handle, "cuMemcpyHtoDAsync_v2")?);
+            REAL_HTOD_ASYNC.store(p as *mut c_void, Ordering::Relaxed);
+            ledger_htod_async
+        },
+        memcpy_dtoh_async: {
+            let p: FnCuMemcpyDtoHAsyncV2 =
+                std::mem::transmute(sym(handle, "cuMemcpyDtoHAsync_v2")?);
+            REAL_DTOH_ASYNC.store(p as *mut c_void, Ordering::Relaxed);
+            ledger_dtoh_async
+        },
         memcpy_dtod_async: std::mem::transmute(sym(handle, "cuMemcpyDtoDAsync_v2")?),
         memcpy_dtod: std::mem::transmute(sym(handle, "cuMemcpyDtoD_v2")?),
         device_get_attribute: sym_opt(handle, "cuDeviceGetAttribute")
@@ -1091,7 +1166,9 @@ impl CudaCtx {
         let lib = lib()?;
         // s166 (P5): decode 1 ステップの launch 件数 (DENNO_DECODE_DBG=1・既定 OFF)
         dbg_launch(f);
-        check(
+        // task 138: 台帳 (DENNO_Q4_PROFILE) への発行 1 件の計上。off は stamp が None。
+        let tl = crate::model::q4ledger::stamp();
+        let r = check(
             (lib.launch)(
                 f,
                 grid.0,
@@ -1106,13 +1183,19 @@ impl CudaCtx {
                 std::ptr::null_mut(),
             ),
             "cuLaunchKernel",
-        )
+        );
+        crate::model::q4ledger::note_launch(tl);
+        r
     }
 
     /// デフォルトストリームの同期 (エンキュー済み全操作の完了待ち)
     pub fn sync(&self) -> Result<()> {
         let lib = lib()?;
-        unsafe { check((lib.ctx_sync)(), "cuCtxSynchronize") }
+        // task 138: 台帳へ待ち時間を積む (off は stamp が None で計測しない)。
+        let t = crate::model::q4ledger::stamp();
+        let r = unsafe { check((lib.ctx_sync)(), "cuCtxSynchronize") };
+        crate::model::q4ledger::note_sync(t);
+        r
     }
 
     /// 呼び出しスレッドに primary context を current として設定する。
