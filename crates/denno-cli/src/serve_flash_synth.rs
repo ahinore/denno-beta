@@ -10,8 +10,8 @@
 //! (serve_flash.rs から `#[cfg(test)] #[path] mod flash_synth;` で include)。
 
 use super::{
-    model_reuse_enabled, prefix_miss_line, prefix_splice_enabled, Flash, GenReq, TEST_BUILD_COUNT,
-    TEST_FAIL_STEP, TEST_LAST_REUSE,
+    echo_matches, model_reuse_enabled, prefix_miss_line, prefix_splice_enabled, Flash, GenReq,
+    TEST_BUILD_COUNT, TEST_FAIL_STEP, TEST_LAST_REUSE,
 };
 use crate::flash_telemetry::Telemetry;
 use denno_engine::gguf::GgufFile;
@@ -1175,4 +1175,90 @@ fn prefix_splice_gate_off_keeps_full_prefill() {
     assert_eq!(TEST_LAST_REUSE.load(Ordering::Relaxed), 0, "gate off で reuse した");
     assert_eq!(builds() - b1, 0, "gate off で build_model が走った");
     assert!(g2.n_out > 0, "生成が空 (stop={})", g2.stop_reason);
+}
+
+
+/// task 141: 合成モデルは常に tab 6 個 (= テンプレートの `|trim` で消える本文) を
+/// 返すので、どのターンも「返信が空白だけ」の会話になる。合成モデルの
+/// max_ctx=128 に収まる 4 ターンで、毎ターン前置きを全長再利用すること
+/// (古い assistant の空白も吸収する)。6 ターンの固定は実トークナイザの
+/// `p131_prefix_repro::six_turn_conversation_reuses_prefix_every_turn` が持つ。
+#[test]
+fn six_turn_conversation_reuses_prefix_in_serve() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+
+    let dir = TempDir::new("flash-6turn");
+    let mut flash = build_flash(&dir);
+    let b0 = builds();
+    let mut msgs: Vec<(String, String)> = Vec::new();
+    let mut cache_len = 0usize;
+    for i in 0..4 {
+        msgs.push(("user".to_string(), format!("q{i}")));
+        let pairs: Vec<(&str, &str)> = msgs.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
+        let req = gen_req_msgs(&pairs);
+        let g = flash.generate(&req, no_emit).expect("generate");
+        let reuse = TEST_LAST_REUSE.load(Ordering::Relaxed);
+        if i == 0 {
+            assert_eq!(reuse, 0, "1 ターン目で reuse した");
+        } else {
+            assert_eq!(reuse, cache_len, "turn{} で前置きを全長再利用していない", i + 1);
+        }
+        assert_eq!(g.text, "\t\t\t\t\t\t", "合成モデルの決定列 (tab 6 個)");
+        cache_len = flash.cache.as_ref().expect("cache").toks.len();
+        msgs.push(("assistant".to_string(), g.text));
+    }
+    // モデルの組み直しは最初の 1 回だけ。
+    assert_eq!(builds() - b0, 1, "build_model が複数回走った");
+}
+
+/// task 141: 履歴の先頭が違う会話は前置きを再利用しない (誤って整列しない)。
+#[test]
+fn different_history_does_not_reuse_prefix() {
+    let _g = REUSE_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("DENNO_FLASH_MODEL_REUSE");
+    std::env::remove_var("DENNO_FLASH_PREFIX_SPLICE");
+
+    let dir = TempDir::new("flash-otherconv");
+    let mut flash = build_flash(&dir);
+    let g1 = flash.generate(&gen_req("hi"), no_emit).expect("generate 1");
+    let req2 = gen_req_msgs(&[("user", "yo"), ("assistant", &g1.text), ("user", "zz")]);
+    let g2 = flash.generate(&req2, no_emit).expect("generate 2");
+    assert_eq!(
+        TEST_LAST_REUSE.load(Ordering::Relaxed),
+        0,
+        "別の会話で前置きを再利用した"
+    );
+    // 新規構築 + full prefill と同じ出力。
+    let dir2 = TempDir::new("flash-otherconv2");
+    let mut fresh = build_flash(&dir2);
+    let f2 = fresh.generate(&req2, no_emit).expect("fresh generate");
+    assert_eq!(g2.text, f2.text, "別会話の出力が新規構築と一致しない");
+}
+
+/// task 141: 返送本文の照合は「食った生成の復号」か、その端の空白を落としたもの。
+/// 空文字は不可 (内容ごと落とした可能性を区別できない)。
+#[test]
+fn echo_matches_allows_client_trim() {
+    let dir = TempDir::new("flash-echo");
+    let flash = build_flash(&dir);
+    let gen = flash.tok.encode("  hello \n").expect("encode");
+    let text = flash.tok.decode(&gen).expect("decode");
+    assert_eq!(text, "  hello \n", "合成トークナイザの往復");
+    assert!(echo_matches(&flash.tok, &gen, &text), "生の本文を拒否した");
+    assert!(
+        echo_matches(&flash.tok, &gen, text.trim()),
+        "trim した本文を拒否した"
+    );
+    assert!(
+        echo_matches(&flash.tok, &gen, text.trim_end()),
+        "trim_end した本文を拒否した"
+    );
+    assert!(!echo_matches(&flash.tok, &gen, ""), "空文字を通した");
+    assert!(!echo_matches(&flash.tok, &gen, "hello!"), "本文の変更を通した");
+    assert!(
+        !echo_matches(&flash.tok, &gen, "  hell0 "),
+        "途中の変更を通した"
+    );
 }

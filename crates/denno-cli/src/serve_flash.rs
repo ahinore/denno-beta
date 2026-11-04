@@ -33,6 +33,17 @@
 //! そのまま前置きに残して後ろだけ食う splice を試す (既定 on、
 //! `DENNO_FLASH_PREFIX_SPLICE=0` で切れる)。splice できないときは従来どおり
 //! full prefill に落ち、`[flash] prefix miss: ...` を 1 行出す。
+//!
+//! task 141: その splice は「最後に返した assistant の直後」を継ぐ形だったので、
+//! 一度 splice したキャッシュは古い assistant の末尾空白を抱えたままになり、
+//! 以降の描画とはその位置 (本番 443) でずれ続ける。いまは描画済みプロンプトと
+//! キャッシュをトークン単位で突き合わせ、キャッシュ側にだけ残っている空白
+//! (`|trim` が落とした分) を吸収して食い残しを求める
+//! ([`GgufTokenizer::align_trimmed_prefix`])。何ターン前の assistant でも同じ
+//! 扱いになり、空白以外の不一致は full prefill のまま。整列できない形
+//! (content が空白で *始まる* など、`|trim` が先頭も落とすケース) は従来の
+//! sentinel splice に落ちる。返送本文の照合も、テンプレートが端の空白を
+//! 落とすのに合わせて端の空白差を許す。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -346,6 +357,23 @@ fn prefix_miss_line(tok: &GgufTokenizer, cached: &[u32], prompt: &[u32]) -> Stri
     )
 }
 
+/// task 141: 返送された本文が「食った生成トークンの復号」と同じ会話か。
+///
+/// テンプレートは assistant の content を `|trim` するので、両端の空白は
+/// 描画に残らない。クライアントが端の空白を落として返しても同じ会話として
+/// 扱う (描画結果が同じになるため)。空文字は不可 (内容ごと落とした可能性を
+/// 区別できないので full prefill に落とす)。
+fn echo_matches(tok: &GgufTokenizer, gen: &[u32], echo: &str) -> bool {
+    if echo.is_empty() {
+        return false;
+    }
+    let gen_text = tok.decode(gen).unwrap_or_default();
+    if gen_text.is_empty() {
+        return false;
+    }
+    echo.trim() == gen_text.trim()
+}
+
 struct Flash {
     parts: Vec<PathBuf>,
     max_ctx: usize,
@@ -537,25 +565,23 @@ fn emit_confirmed(
 }
 
 impl Flash {
-    /// task 131: 生成テキストをそのまま前置きに残したプロンプトを組む。
+    /// task 141: 描画済みプロンプトをキャッシュに整列し、食い残しだけを継いだ
+    /// プロンプトを返す。
     ///
-    /// 原因: chat_template が assistant の content を `|trim` するので、
-    /// 生成テキストの末尾の空白 (や先頭の空白) は次ターンのプロンプトから
-    /// 落ちる。落ちたぶんだけキャッシュの前置きと末尾でずれて reuse=0 になり、
-    /// 毎回 full prefill になる (本番 462 トークンで 18.19 秒)。
+    /// 原因 (task 131): chat_template が assistant の content を `|trim` するので、
+    /// 生成テキストの末尾の空白は次ターンの描画から落ちる。task 131 の splice は
+    /// 「最後に返した assistant の直後」だけを継いでいたため、一度 splice した
+    /// キャッシュは古い assistant の末尾空白を抱えたままになり、以降の描画とは
+    /// その位置 (本番 4 ターン目で lcp=443) でずれ続けていた。
     ///
-    /// ここでは「前回のリクエスト入力 + 我々が返した本文の返送 + 続き」に
-    /// 一致するときだけ、テンプレートを sentinel 付きで描き直し、sentinel
-    /// より後ろ (= `<|im_end|>` 以降) だけをトークン化して、キャッシュ済み
-    /// トークンに継ぐ。プロンプトの文字列はテンプレート描画に生成テキストを
-    /// そのまま差し込んだものになるので、モデルは自分が生成した列をそのまま
-    /// 見る (trim された分だけが違う)。
+    /// ここでは描画済みトークン列 `prompt` そのものをキャッシュと突き合わせ、
+    /// キャッシュ側にだけ残っている空白トークン (= `|trim` が落とした分) を
+    /// 吸収する。吸収は [`GgufTokenizer::align_trimmed_prefix`] が「空白だけ」かつ
+    /// 「直後が content の終端 (特殊トークン)」に限って行うので、本文が変わった
+    /// 場合や別の会話は必ず full prefill に落ちる。
     ///
-    /// 一致しないときは `None`。呼び出し側は従来どおり full prefill に落ちる:
-    /// - クライアントが本文を変えた (trim / 編集 / 打ち切り)
-    /// - stop_sequence や max_tokens (spec) で「食ったトークン」と返した本文が違う
-    /// - `continue: true` の経路、テンプレート描画に落ちたプロンプト
-    fn splice_prompt(&self, c: &Cached, req: &GenReq) -> Result<Option<Vec<u32>>> {
+    /// 返り値は `c.toks ++ prompt[i..]`。`None` のとき呼び出し側は full prefill。
+    fn splice_prompt(&self, c: &Cached, req: &GenReq, prompt: &[u32]) -> Result<Option<Vec<u32>>> {
         if !c.from_render || c.prompt_len > c.toks.len() || c.req.cont || req.cont {
             return Ok(None);
         }
@@ -574,13 +600,25 @@ impl Flash {
         if role != "assistant" {
             return Ok(None);
         }
-        // 実際に食った生成トークンの復号と、返送された本文が完全一致するときだけ。
-        let gen_text = self.tok.decode(&c.toks[c.prompt_len..]).unwrap_or_default();
-        if gen_text.is_empty() || *text != gen_text {
+        // 実際に食った生成トークンの復号と、返送された本文が同じ会話のときだけ。
+        if !echo_matches(&self.tok, &c.toks[c.prompt_len..], text) {
             return Ok(None);
         }
-        // テンプレートを sentinel 付きで描き、sentinel より後ろだけを食う
-        // (描画と分割の実体は tokenizer 側。engine の test が実テンプレートで固定する)。
+        // 1. 描画済みプロンプトをキャッシュに整列する (空白の吸収だけを許す)。
+        //    整列できれば、食うのは描画の食い残しだけになり、前置きが描画と
+        //    対応していることも検証できる。何ターン前の assistant の末尾空白でも
+        //    同じ扱いになる (task 141)。
+        if let Some(i) = self.tok.align_trimmed_prefix(&c.toks, prompt) {
+            if i < prompt.len() {
+                let mut p = Vec::with_capacity(c.toks.len() + prompt.len() - i);
+                p.extend_from_slice(&c.toks);
+                p.extend_from_slice(&prompt[i..]);
+                return Ok(Some(p));
+            }
+        }
+        // 2. 整列できないとき (assistant の content が空白で *始まる* 場合など、
+        //    `|trim` が先頭も落とすケース) は、これまでどおり sentinel を置いて
+        //    content より後ろだけを継ぐ。前置きはキャッシュのまま。
         let spliced = self.tok.splice_after_content(
             req.system.as_deref(),
             &req.messages,
@@ -703,10 +741,10 @@ impl Flash {
                 }
             }
             other => {
-                // task 131: 生成テキストを前置きに残す splice (前置きが末尾で
-                // ずれたときだけ)。成立しなければ従来どおり full prefill。
-                let spliced = match (other.as_ref(), splice_on) {
-                    (Some(c), true) => self.splice_prompt(c, req)?,
+                // task 131/141: 描画済みプロンプトをキャッシュに整列し、
+                // 食い残しだけを食う (成立しなければ従来どおり full prefill)。
+                let spliced = match (other.as_ref(), splice_on && prompt_from_render) {
+                    (Some(c), true) => self.splice_prompt(c, req, &prompt)?,
                     _ => None,
                 };
                 let mut other = other;
