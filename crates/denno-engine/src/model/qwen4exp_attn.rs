@@ -1394,6 +1394,13 @@ impl AttnLayer {
         pos: usize,
         cells: Option<&[usize]>,
     ) -> Result<Vec<f32>> {
+        // task 132: full attention 層の decode 時間を q4prof の A_FULL に積む
+        // (範囲は prefill の `forward_batch` と同じ = 投影から出力投影まで)。
+        // attend 本体には触らない (task 133 の GPU 化と衝突しないよう、
+        // タイマーはこの関数の頭と末尾だけ)。task 133 側も同じ場所で
+        // stamp していたので、merge で二重に取らないようここ 1 箇所に寄せた
+        // (A_FULL への加算も末尾の 1 回だけ)。
+        let t_all = q4prof::stamp();
         if cur.len() != self.n_embd {
             bail!(
                 "AttnLayer::forward_token: 入力長 {} が n_embd = {} と違う",
@@ -1403,7 +1410,6 @@ impl AttnLayer {
         }
         // task 133: full 層の合計 (`[q4prof] ... full=`) を decode でも積む。
         // 計測は DENNO_Q4_PROFILE / DENNO_PF_ATT_DBG のときだけ (stamp が None)。
-        let t_all = q4prof::stamp();
         // task 72: q / k / v は同じ入力 cur を取るので 1 回の GEMV で得る。
         // 行は独立なので、個別に投影した場合とビット一致する。
         let proj = self.project_qkv_concat(cur)?;
@@ -2168,5 +2174,50 @@ mod p49 {
         // 内訳は Q4_PROFILE の束 (A_FULL) を汚さない
         q4prof::reset();
         q4prof::set_att_dbg_for_test(false);
+    }
+
+    /// task 136: full 層の合計 (`A_FULL`) は 1 回の forward で 1 回だけ積む。
+    ///
+    /// br132 (decode の層の外) と task 133 (GPU の full 合計) は同じ関数の頭で
+    /// `t_all` を取っていたので、単純に merge すると片方が影になり、あとで
+    /// どちらかを消すと二重計上へ戻る。ソースの形をここで固定する
+    /// (値そのものは lab の「attn の内訳が attn 合計に収まる」で見る)。
+    #[test]
+    fn a_full_is_added_once_per_forward() {
+        let src = include_str!("qwen4exp_attn.rs");
+        let slice = |start: &str, end: &str| -> &'static str {
+            let i = src.find(start).unwrap_or_else(|| panic!("{start} が無い"));
+            let rest = &src[i..];
+            let j = rest
+                .find(end)
+                .unwrap_or_else(|| panic!("{end} が {start} の後に無い"));
+            &rest[..j]
+        };
+
+        // decode (`forward_token_impl`): stamp 1 本 / A_FULL 加算 1 回。
+        let dec = slice("fn forward_token_impl(", "\n    /// 1 トークンあたりの重みバイト数");
+        assert_eq!(
+            dec.matches("q4prof::stamp()").count(),
+            1,
+            "decode の full タイマーが 1 本でない (影になった stamp が残っている)"
+        );
+        assert_eq!(
+            dec.matches("q4prof::add(&q4prof::A_FULL").count(),
+            1,
+            "decode の A_FULL 加算が 1 回でない"
+        );
+
+        // prefill のチャンク (`forward_batch`) も 1 回だけ。
+        let pf = slice("pub fn forward_batch(", "\nimpl LayerAttn for FullAttn");
+        assert_eq!(
+            pf.matches("q4prof::add(&q4prof::A_FULL").count(),
+            1,
+            "prefill の A_FULL 加算が 1 回でない"
+        );
+        assert_eq!(
+            pf.matches("let t_all = q4prof::stamp();").count(),
+            1,
+            "prefill の full タイマーが 1 本でない"
+        );
     }
 }
