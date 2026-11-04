@@ -10929,10 +10929,14 @@ pub fn chain_attention(
 //   (GEMV / mix / router / expert) を巻き込まない。
 // ---------------------------------------------------------------------------
 
-/// `DENNO_Q4_GPU_ATTN` の既定 (task 133 の lab 結果で決める)。
-const Q4_GPU_ATTN_DEFAULT: bool = false;
+/// `DENNO_Q4_GPU_ATTN` の既定。task 133 の lab (t133a) で c2000 の decode が
+/// -24.5% / -25.1%、a/b (28/33 token) は MIN で CPU のままなので既定 on。
+const Q4_GPU_ATTN_DEFAULT: bool = true;
 /// `DENNO_Q4_GPU_ATTN_MIN` の既定 (この KV 本数未満は CPU 経路のまま)。
-const Q4_GPU_ATTN_MIN_DEFAULT: usize = 0;
+/// 実測の交叉は約 23 token (推定: 1 呼び出しの固定費 79 us x 12 → 0.95 ms/token と
+/// 短 context の CPU scan 1.04 ms/token が 28 token 付近で並ぶ)。
+/// 短いプロンプト (lab の a/b = 28/33) を確実に CPU のままにするため 64 にする。
+const Q4_GPU_ATTN_MIN_DEFAULT: usize = 64;
 /// ミラー上限の既定 (MiB)。65,536 行をフルに使って 3,072 MiB。
 const Q4_GPU_ATTN_MIRROR_MB_DEFAULT: usize = 3584;
 
@@ -11080,6 +11084,15 @@ pub(crate) fn q4_mirror_note(st: &mut Q4MirrorState, li: usize, len: usize, gen:
     }
 }
 
+/// ミラーの使用バイト数 `cap 行 x kv_dim x 4 B x K/V x 使った層数`。
+/// 使っていない層 (ssm 層) は確保しないので、その分は数えない。
+pub(crate) fn q4_mirror_bytes(cap: usize, kv_dim: usize, used_layers: usize) -> usize {
+    cap.saturating_mul(kv_dim)
+        .saturating_mul(4)
+        .saturating_mul(2)
+        .saturating_mul(used_layers)
+}
+
 struct Q4AttnMirror {
     kv_dim: usize,
     state: Q4MirrorState,
@@ -11125,14 +11138,20 @@ pub fn q4_attn_mirror_stats() -> Option<(usize, usize, usize)> {
     Some((ms.len(), used, q4_attn_mirror_limit_bytes()))
 }
 
-/// cap 成長: 全層のバッファを `new_cap` 行で作り直し、旧バッファの有効行を
-/// D2D で温存する (再シードしない)。失敗したら呼び出し側がエントリごと捨てる。
+/// cap 成長: **既に使った層だけ**バッファを作り直し、旧バッファの有効行を
+/// D2D で温存する (再シードしない)。まだ使っていない層 (ssm 層) は確保しない
+/// — AttnCache は全 48 層ぶんの枠を持つが、full attention は 12 層だけなので、
+/// ここで絞らないと VRAM が 4 倍になる (65,536 行で 12 GiB)。
+/// 失敗したら呼び出し側がエントリごと捨てる。
 fn q4_attn_grow(m: &mut Q4AttnMirror, new_cap: usize, kv_dim: usize) -> Result<()> {
     let bytes = new_cap
         .checked_mul(kv_dim)
         .and_then(|v| v.checked_mul(4))
         .ok_or_else(|| anyhow!("q4 attn mirror: cap {new_cap} が大きすぎる"))?;
     for l in 0..m.state.len.len() {
+        if m.k[l].is_none() && m.v[l].is_none() {
+            continue; // まだ使っていない層 (full attention でない層)
+        }
         let keep = m.state.len[l].min(new_cap);
         for slot in [&mut m.k[l], &mut m.v[l]] {
             let nb = DevBuffer::alloc(bytes)?;
@@ -14105,6 +14124,27 @@ mod q4_attn_tests {
         assert_eq!(parse_q4_gpu_attn_min(Some("x")), Q4_GPU_ATTN_MIN_DEFAULT);
         assert_eq!(q4_attn_mirror_limit_from(None), 3584 * 1024 * 1024);
         assert_eq!(q4_attn_mirror_limit_from(Some(16)), 16 * 1024 * 1024);
+    }
+
+    /// ミラーの VRAM 上限: 65,536 行でも 3.3 GB 未満 (使用層 12 本のとき)。
+    /// 48 層ぶん確保すると 4 倍になり上限を割る — q4_attn_grow が未使用層を
+    /// 飛ばす理由をここで固定する。
+    #[test]
+    fn q4_mirror_bytes_bounds_vram_at_max_ctx() {
+        let (cap, kv_dim, full_layers, n_layer) = (65_536usize, 512usize, 12usize, 48usize);
+        let used = q4_mirror_bytes(cap, kv_dim, full_layers);
+        assert_eq!(used, 3_221_225_472, "65,536 行 x 512 x 4 B x K/V x 12 層");
+        assert!(used < 3_300_000_000, "3.3 GB 未満でない: {used}");
+        assert!(
+            used <= q4_attn_mirror_limit_from(None),
+            "既定のミラー上限 ({}) を超える: {used}",
+            q4_attn_mirror_limit_from(None)
+        );
+        // 未使用層まで確保すると 4 倍 (= 12 GiB) で上限を割る — これを避けるのが
+        // q4_attn_grow のスキップ
+        let all = q4_mirror_bytes(cap, kv_dim, n_layer);
+        assert_eq!(all, 4 * used);
+        assert!(all > q4_attn_mirror_limit_from(None));
     }
 
     /// GPU が要る実機テスト。`cargo test --release --features cuda -p denno-engine
