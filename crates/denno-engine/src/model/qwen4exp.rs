@@ -3279,6 +3279,26 @@ fn mix_gpu_enabled() -> bool {
     *ON.get_or_init(|| mix_gpu_from_value(std::env::var("DENNO_MIX_GPU").ok().as_deref()))
 }
 
+/// task 138: `DENNO_MIX_CHAIN` の値を解釈する (純関数・テスト用)。
+/// [`mix_gpu_from_value`] と同じ規約 (`trim` + 小文字化・明示的な真値だけ on)。
+fn mix_chain_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+        None => false,
+    }
+}
+
+/// task 138: hc mix の down → lo_apply → up を 1 往復に畳む経路
+/// (`DENNO_MIX_CHAIN`、既定 off)。`DENNO_MIX_GPU` が on のときだけ意味を持つ。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn mix_chain_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| mix_chain_from_value(std::env::var("DENNO_MIX_CHAIN").ok().as_deref()))
+}
+
 /// task 110: テスト専用: hc mix GPU 経路の on/off を強制する (`None` で env に戻す)。
 /// 上書きはプロセス全体で 1 個なので、触るテストは直列化する (下の MIX_GPU_GUARD)。
 #[cfg(test)]
@@ -3594,77 +3614,110 @@ fn hc_mix_quant_fast(
         mix_kprof::mark(t, mix_kprof::GN);
 
         let lo = MixScratch::take(lo, down.n());
+        let gate = MixScratch::take(gate, up.n());
         let t = mix_kprof::stamp();
         mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_DOWN);
         let hc_fast = hc_mix_fast_enabled();
-        // task 110: `DENNO_MIX_GPU=1` かつ BF16 のときだけ down GEMV を GPU に奪う
-        // (カーネルは dno_matvec_f32 流用・1 行 = 1 ブロック・k 昇順直列加算 = CPU
-        // 参照とビット一致。task 121 から長い行 k >= n (= down 実形) は s169 の
-        // 並列リダクション版 dno_matvec_f32_r (block 256・固定木縮約・決定論) に
-        // 切り替わるためビット一致しない: 許容 絶対 1e-4 + 相対 1e-5)。false の
-        // ときは従来どおり CPU 経路 (cuda 側が warn を 1 行だけ出す)。GPU 経路が
-        // 成功すると `last_linear_ran_on_gpu` が立つので下の `note_down` が gpu= を
-        // 積む ([mix-kprof] の内訳で見える)。
+        // task 138: down → lo_apply → up を 1 回の同期に畳む経路
+        // (`DENNO_MIX_GPU` と `DENNO_MIX_CHAIN` が両方 on で、両方 BF16 のときだけ)。
+        // 丸めは従来の GPU 経路と同じ (silu は dno_expf = glibc expf のビット一致
+        // 実装) なので、通れば logits は従来とビット一致する。不発なら下の
+        // 2 往復経路へそのまま落ちる。
         #[cfg(feature = "cuda")]
-        let gpu_down = mix_gpu_enabled()
+        let gpu_chain = mix_gpu_enabled()
+            && mix_chain_enabled()
             && down.ty() == crate::kquant::GgmlType::Bf16
-            && crate::cuda::maybe_gpu_mix_bf16_into(
+            && up.ty() == crate::kquant::GgmlType::Bf16
+            && crate::cuda::maybe_gpu_mix_bf16_chain_into(
                 down.uid(),
                 down.blocks().as_slice(),
                 down.k(),
                 down.n(),
-                xn,
-                lo,
-            );
-        #[cfg(not(feature = "cuda"))]
-        let gpu_down = false;
-        if !gpu_down {
-            if hc_fast {
-                down.gemv_label_par_2row("hc_down", xn, lo, HC_DOWN_ROW_PAR_MIN)
-            } else {
-                down.gemv_label_par("hc_down", xn, lo, HC_DOWN_ROW_PAR_MIN)
-            }
-            .map_err(|err| one(format!("hc_mix down: {err}")))?;
-        }
-        // task 88: down GEMV 1 発の実行先と dtype (区間計測と同じ `Instant` を再利用)。
-        mix_kprof::gemv::note_down(t, down.ty());
-        mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_UP);
-        mix_kprof::mark(t, mix_kprof::DOWN);
-
-        let t = mix_kprof::stamp();
-        hyper::hc_lo_apply(lo, hp);
-        mix_kprof::mark(t, mix_kprof::LO);
-
-        let gate = MixScratch::take(gate, up.n());
-        let t = mix_kprof::stamp();
-        // task 110: up GEMV も down と同じ (`DENNO_MIX_GPU=1` かつ BF16 のときだけ
-        // GPU に奪う。入力は hc_lo_apply 済みの `lo`、成功で `note_up` が gpu= を積む)。
-        // up 実形 (k=320 < n=10240) は短い行なので task 121 でも逐次版のまま
-        // (ビット一致)。
-        #[cfg(feature = "cuda")]
-        let gpu_up = mix_gpu_enabled()
-            && up.ty() == crate::kquant::GgmlType::Bf16
-            && crate::cuda::maybe_gpu_mix_bf16_into(
                 up.uid(),
                 up.blocks().as_slice(),
                 up.k(),
                 up.n(),
-                lo,
+                1.0f32 / hp.hc as f32,
+                xn,
                 gate,
             );
         #[cfg(not(feature = "cuda"))]
-        let gpu_up = false;
-        if !gpu_up {
-            if hc_fast {
-                up.gemv_label_par_2row("hc_up", lo, gate, 0)
-            } else {
-                up.gemv_label("hc_up", lo, gate)
+        let gpu_chain = false;
+        if gpu_chain {
+            // 内訳は down/up の 2 区間に同じ区間を積む (合計は chain 1 回のまま)。
+            mix_kprof::gemv::note_down(t, down.ty());
+            mix_kprof::gemv::note_up(t, up.ty());
+            mix_kprof::rowpar::set_label(mix_kprof::rowpar::NONE);
+            mix_kprof::mark(t, mix_kprof::DOWN);
+        } else {
+            // task 110: `DENNO_MIX_GPU=1` かつ BF16 のときだけ down GEMV を GPU に奪う
+            // (カーネルは dno_matvec_f32 流用・1 行 = 1 ブロック・k 昇順直列加算 = CPU
+            // 参照とビット一致。task 121 から長い行 k >= n (= down 実形) は s169 の
+            // 並列リダクション版 dno_matvec_f32_r (block 256・固定木縮約・決定論) に
+            // 切り替わるためビット一致しない: 許容 絶対 1e-4 + 相対 1e-5)。false の
+            // ときは従来どおり CPU 経路 (cuda 側が warn を 1 行だけ出す)。GPU 経路が
+            // 成功すると `last_linear_ran_on_gpu` が立つので下の `note_down` が gpu= を
+            // 積む ([mix-kprof] の内訳で見える)。
+            #[cfg(feature = "cuda")]
+            let gpu_down = mix_gpu_enabled()
+                && down.ty() == crate::kquant::GgmlType::Bf16
+                && crate::cuda::maybe_gpu_mix_bf16_into(
+                    down.uid(),
+                    down.blocks().as_slice(),
+                    down.k(),
+                    down.n(),
+                    xn,
+                    lo,
+                );
+            #[cfg(not(feature = "cuda"))]
+            let gpu_down = false;
+            if !gpu_down {
+                if hc_fast {
+                    down.gemv_label_par_2row("hc_down", xn, lo, HC_DOWN_ROW_PAR_MIN)
+                } else {
+                    down.gemv_label_par("hc_down", xn, lo, HC_DOWN_ROW_PAR_MIN)
+                }
+                .map_err(|err| one(format!("hc_mix down: {err}")))?;
             }
-            .map_err(|err| one(format!("hc_mix up: {err}")))?;
+            // task 88: down GEMV 1 発の実行先と dtype (区間計測と同じ `Instant` を再利用)。
+            mix_kprof::gemv::note_down(t, down.ty());
+            mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_UP);
+            mix_kprof::mark(t, mix_kprof::DOWN);
+
+            let t = mix_kprof::stamp();
+            hyper::hc_lo_apply(lo, hp);
+            mix_kprof::mark(t, mix_kprof::LO);
+
+            let t = mix_kprof::stamp();
+            // task 110: up GEMV も down と同じ (`DENNO_MIX_GPU=1` かつ BF16 のときだけ
+            // GPU に奪う。入力は hc_lo_apply 済みの `lo`、成功で `note_up` が gpu= を積む)。
+            // up 実形 (k=320 < n=10240) は短い行なので task 121 でも逐次版のまま
+            // (ビット一致)。
+            #[cfg(feature = "cuda")]
+            let gpu_up = mix_gpu_enabled()
+                && up.ty() == crate::kquant::GgmlType::Bf16
+                && crate::cuda::maybe_gpu_mix_bf16_into(
+                    up.uid(),
+                    up.blocks().as_slice(),
+                    up.k(),
+                    up.n(),
+                    lo,
+                    gate,
+                );
+            #[cfg(not(feature = "cuda"))]
+            let gpu_up = false;
+            if !gpu_up {
+                if hc_fast {
+                    up.gemv_label_par_2row("hc_up", lo, gate, 0)
+                } else {
+                    up.gemv_label("hc_up", lo, gate)
+                }
+                .map_err(|err| one(format!("hc_mix up: {err}")))?;
+            }
+            mix_kprof::gemv::note_up(t, up.ty());
+            mix_kprof::rowpar::set_label(mix_kprof::rowpar::NONE);
+            mix_kprof::mark(t, mix_kprof::UP);
         }
-        mix_kprof::gemv::note_up(t, up.ty());
-        mix_kprof::rowpar::set_label(mix_kprof::rowpar::NONE);
-        mix_kprof::mark(t, mix_kprof::UP);
 
         let t = mix_kprof::stamp();
         // task 106: 合成は戻り値に直接書く (scratch へ書いて `to_vec()` で写す
@@ -13443,6 +13496,24 @@ mod tests {
             MIX_GPU_TEST_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// task 138: `DENNO_MIX_CHAIN` の真理値表 (既定 off・明示的な真値だけ on)。
+        #[test]
+        fn mix_chain_gate_defaults_off() {
+            for v in [Some("1"), Some("on"), Some("ON"), Some("true"), Some(" yes ")] {
+                assert!(mix_chain_from_value(v), "value={v:?} は on のはず");
+            }
+            for v in [
+                None,
+                Some(""),
+                Some("0"),
+                Some("off"),
+                Some("false"),
+                Some("no"),
+            ] {
+                assert!(!mix_chain_from_value(v), "value={v:?} は off のはず");
+            }
         }
 
         /// task 110: `DENNO_MIX_GPU` の真理値表。既定 off、明示的な真値だけ on
