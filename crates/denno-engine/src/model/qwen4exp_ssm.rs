@@ -441,6 +441,7 @@ impl SsmLayer {
         crate::cuda::GdnDecodeReq {
             nonce: self.nonce,
             li: self.il,
+            tok: crate::model::qwen4exp::gdn_gpu_win::token_index(),
             n_embd: self.p.n_embd,
             qkv_total: self.qkv_gate.n(),
             qkv_row_start: self.qkv_gate.range(0).start,

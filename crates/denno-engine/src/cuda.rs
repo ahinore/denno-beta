@@ -24278,6 +24278,24 @@ pub fn gdn_gpu_check_on() -> bool {
     })
 }
 
+/// task 140 の診断 (`DENNO_GDN_SUBMIT_SYNC=1`。既定 off)。
+///
+/// on のとき [`gdn_decode_submit`] は submission の**各段の直後**に
+/// `cuCtxSynchronize` を挟み、失敗したらその段の名前をエラーに付ける。
+/// error 700 は「違反した launch の後、次にホストと同期する API が返す」ため、
+/// 段ごとに同期しないとどの launch が壊れたかを切り分けられない (task 137 の
+/// t137c は「scan 発行前」までしか絞れなかった)。**診断専用**で、on のときは
+/// 段数ぶん同期するので decode は大幅に遅くなる。数値経路は変えない。
+pub fn gdn_submit_sync_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_gdn_submit_sync(std::env::var("DENNO_GDN_SUBMIT_SYNC").ok().as_deref()))
+}
+
+/// `DENNO_GDN_SUBMIT_SYNC` の生値 → on/off (純関数。真理値表はテストで固定)。
+fn parse_gdn_submit_sync(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1") | Some("on") | Some("true"))
+}
+
 /// 状態ストアの上限 (エントリ = 1 層ぶん ≈ 3.3 MiB: conv 2x120 KiB + ssm 3.0 MiB
 /// + x/qkv/ba/y/out 約 100 KiB)。72 = 36 層モデル 2 本ぶん。
 /// 追い出しは最古の挿入順 (Vec の先頭)。`SsmLayer` は Drop を持たないので、
@@ -24354,6 +24372,8 @@ pub struct GdnDecodeReq<'a> {
     pub nonce: u64,
     /// 層番号 (診断ログ用)。
     pub li: usize,
+    /// decode 窓の通し番号 (`gdn_gpu_win::token_index()`。診断ログ用)。
+    pub tok: u64,
     pub n_embd: usize,
     /// qkv_gate の全出力行数 (qkv 行 + z 行の合計)。
     pub qkv_total: usize,
@@ -24860,9 +24880,23 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
     };
     let scan_launched = std::cell::Cell::new(false);
     let (dk, dv) = (req.dk, req.dv);
+    let sync_dbg = gdn_submit_sync_on();
+    // 診断 (`DENNO_GDN_SUBMIT_SYNC=1`): 段ごとに同期し、失敗した段を名前に残す。
+    // 700 は「壊れた launch の後、次にホストと同期する API」が返すので、これが
+    // 無いと段を特定できない (off のときは 1 バイトも挙動が変わらない)。
+    macro_rules! stage_sync {
+        ($name:expr) => {
+            if sync_dbg {
+                if let Err(e) = ctx.sync() {
+                    return Err(anyhow!("段 {} で失敗: {e:#}", $name));
+                }
+            }
+        };
+    }
     let run = || -> Result<(Vec<f32>, Option<(Vec<f32>, Vec<f32>)>)> {
         let (_, e) = &store_lock[idx];
         e.x.copy_from(req.cur)?;
+        stage_sync!("x_h2d");
         for (i, ((u, row), cfg)) in req.qkv_units.iter().zip(qcfg.iter()).enumerate() {
             gdn_launch_gemv_dev(
                 ctx,
@@ -24873,9 +24907,11 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
                 u.k,
                 u.n,
             )?;
+            stage_sync!(format!("qkv_gemv[{i}]"));
         }
         e.ba.copy_from_at(0, req.beta)?;
         e.ba.copy_from_at(req.nv * 4, req.alpha)?;
+        stage_sync!("ba_h2d");
         let (mut pq, mut pz) = (
             e.qkv.ptr() + (req.qkv_row_start * 4) as CUdeviceptr,
             e.qkv.ptr() + (req.z_row_start * 4) as CUdeviceptr,
@@ -24935,7 +24971,9 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
             )?;
         }
         scan_launched.set(true);
+        stage_sync!("scan");
         gdn_launch_gemv_dev(ctx, &ocfg, &ow.buf, e.y.ptr(), e.out.ptr(), req.nv * req.dv, req.n_embd)?;
+        stage_sync!("out_gemv");
         let out = e.out.to_vec::<f32>(req.n_embd)?;
         // 診断 (DENNO_GDN_GPU_CHECK): scan 後のデバイス状態も読む。
         let state_dev = if check {
@@ -24964,7 +25002,10 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
             if !scan_launched.get() {
                 // scan 発行前の失敗: デバイス状態はホストと等価 (シード済みなら
                 // ホストの写しだけ)。ホスト state は無傷なのでそのまま CPU へ。
-                gdn_note_once(&format!("submission の発行に失敗 → CPU 経路: {err:#}"));
+                gdn_note_once(&format!(
+                    "submission の発行に失敗 (li={} tok={}) → CPU 経路: {err:#}",
+                    req.li, req.tok
+                ));
                 return gdn_scan_record_failure(GdnDecodeRes::cpu());
             }
             // scan 発行後の失敗: 新状態はデバイスの書き込み面にある。回復を
@@ -25022,6 +25063,7 @@ mod gdn_decode_scan_tests {
         GdnDecodeReq {
             nonce: 0xBEEF,
             li: 3,
+            tok: 1,
             n_embd: 0,
             qkv_total: 0,
             qkv_row_start: 0,
@@ -25050,6 +25092,27 @@ mod gdn_decode_scan_tests {
             conv_dim: 0,
             d_conv: 4,
             eps: 1e-6,
+        }
+    }
+
+    /// task 140: `DENNO_GDN_SUBMIT_SYNC` の真理値表 (純関数)。既定は off。
+    #[test]
+    fn gdn_submit_sync_truth_table() {
+        for (raw, want) in [
+            (None, false),
+            (Some("0"), false),
+            (Some(""), false),
+            (Some("off"), false),
+            (Some("yes"), false),
+            (Some("1"), true),
+            (Some("on"), true),
+            (Some("true"), true),
+        ] {
+            assert_eq!(
+                parse_gdn_submit_sync(raw),
+                want,
+                "DENNO_GDN_SUBMIT_SYNC={raw:?} の解釈が違う"
+            );
         }
     }
 
