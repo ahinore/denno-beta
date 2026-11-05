@@ -473,6 +473,22 @@ impl DevBuffer {
         Ok(out)
     }
 
+    /// デバイス → ホスト (呼び出し側のバッファへ直接。毎層 5 MB を
+    /// `Vec` に取り直すとページフォルトだけで数 ms かかるため)。
+    pub fn to_slice<T: Copy>(&self, out: &mut [T]) -> Result<()> {
+        let bytes = std::mem::size_of_val(out);
+        assert!(bytes <= self.bytes, "DevBuffer::to_slice: size overflow");
+        if bytes > 0 {
+            unsafe {
+                check(
+                    (lib()?.memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, self.ptr, bytes),
+                    "cuMemcpyDtoH",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// 既存バッファへホストから上書きコピー
     pub fn copy_from<T: Copy>(&self, data: &[T]) -> Result<()> {
         let bytes = std::mem::size_of_val(data);
@@ -3794,6 +3810,8 @@ struct ExpPfKernels {
     fns: [CUfunction; crate::model::exp_pf::SLOTS],
     /// silu(g) * u
     silu: CUfunction,
+    /// ヒット行の加重和 (h → nt×e)
+    accum: CUfunction,
 }
 
 unsafe impl Send for ExpPfKernels {}
@@ -3867,7 +3885,23 @@ fn exp_pf_kernels() -> Option<&'static ExpPfKernels> {
                     return None;
                 }
             }
-            Some(ExpPfKernels { module, fns, silu })
+            let mut accum: CUfunction = std::ptr::null_mut();
+            let mut cname = crate::model::exp_pf::ACCUM_KERNEL.as_bytes().to_vec();
+            cname.push(0);
+            unsafe {
+                if (lib.module_get_function)(&mut accum, module, cname.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[exp-pf] PTX に accum が無い → CPU 経路へ");
+                    return None;
+                }
+            }
+            Some(ExpPfKernels {
+                module,
+                fns,
+                silu,
+                accum,
+            })
         })
         .as_ref()
 }
@@ -3899,6 +3933,9 @@ struct PfScratch {
     seg: Option<DevBuffer>,
     rows_gu: Option<DevBuffer>,
     rows_id: Option<DevBuffer>,
+    od: Option<DevBuffer>,
+    prow: Option<DevBuffer>,
+    wdev: Option<DevBuffer>,
 }
 
 impl PfScratch {
@@ -3915,6 +3952,9 @@ impl PfScratch {
             seg: None,
             rows_gu: None,
             rows_id: None,
+            od: None,
+            prow: None,
+            wdev: None,
         }
     }
 }
@@ -3941,24 +3981,31 @@ pub fn moe_experts_iq_pf_layer(
     pd: &[u64],
     seg: &[u32],
     rows_gu: &[u32],
+    prow: &[u32],
+    wdev: &[f32],
     xs: &[f32],
     n_in: usize,
     ff: usize,
     e: usize,
-    out_h: &mut [f32],
+    nt: usize,
+    out_delta: &mut [f32],
 ) -> Result<bool> {
     if PF_DEAD.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(false);
     }
     let nseg = pg.len();
     let total_rows = rows_gu.len();
+    let nh = nt * e;
     if nseg == 0
         || total_rows == 0
+        || nt == 0
         || pu.len() != nseg
         || pd.len() != nseg
         || seg.len() != nseg * 4
+        || prow.len() % nt != 0
+        || wdev.len() != prow.len()
         || xs.len() % n_in != 0
-        || out_h.len() < total_rows * e
+        || out_delta.len() < nh
     {
         return Ok(false);
     }
@@ -3989,27 +4036,29 @@ pub fn moe_experts_iq_pf_layer(
     };
     ctx.make_current()?;
 
-    // 行の総数 × 行列の幅。g / u / act は total_rows × ff、h は total_rows × e。
+    // 行の総数 × 行列の幅。g / u / act は total_rows × ff、h / od は行と nt。
     let ng = total_rows * ff;
-    let nh = total_rows * e;
     let mut alloc = || -> Result<bool> {
         PF_SCRATCH.with(|cell| -> Result<bool> {
+            let t_kern = std::time::Instant::now();
             let mut sc = cell.borrow_mut();
             MoeScratch::ensure(&mut sc.x, xs.len() * 4)?;
             MoeScratch::ensure(&mut sc.g, ng * 4)?;
             MoeScratch::ensure(&mut sc.u, ng * 4)?;
             MoeScratch::ensure(&mut sc.act, ng * 4)?;
-            MoeScratch::ensure(&mut sc.h, nh * 4)?;
+            MoeScratch::ensure(&mut sc.h, total_rows * e * 4)?;
+            MoeScratch::ensure(&mut sc.od, nh * 4)?;
             MoeScratch::ensure(&mut sc.pg, nseg * 8)?;
             MoeScratch::ensure(&mut sc.pu, nseg * 8)?;
             MoeScratch::ensure(&mut sc.pd, nseg * 8)?;
             MoeScratch::ensure(&mut sc.seg, nseg * 16)?;
             MoeScratch::ensure(&mut sc.rows_gu, total_rows * 4)?;
             MoeScratch::ensure(&mut sc.rows_id, total_rows * 4)?;
+            MoeScratch::ensure(&mut sc.prow, prow.len() * 4)?;
+            MoeScratch::ensure(&mut sc.wdev, wdev.len() * 4)?;
             {
                 let xb = sc.x.as_ref().expect("確保済み");
                 xb.copy_from(xs)?;
-                dbg_htod(xs.len() * 4);
                 sc.pg.as_ref().expect("確保済み").copy_from(pg)?;
                 sc.pu.as_ref().expect("確保済み").copy_from(pu)?;
                 sc.pd.as_ref().expect("確保済み").copy_from(pd)?;
@@ -4017,7 +4066,15 @@ pub fn moe_experts_iq_pf_layer(
                 sc.rows_gu.as_ref().expect("確保済み").copy_from(rows_gu)?;
                 let id: Vec<u32> = exp_pf::identity_rows(total_rows);
                 sc.rows_id.as_ref().expect("確保済み").copy_from(&id)?;
-                dbg_htod(nseg * 8 * 3 + nseg * 16 + total_rows * 4 * 2);
+                sc.prow.as_ref().expect("確保済み").copy_from(prow)?;
+                sc.wdev.as_ref().expect("確保済み").copy_from(wdev)?;
+                dbg_htod(
+                    xs.len() * 4
+                        + nseg * 8 * 3
+                        + nseg * 16
+                        + total_rows * 4 * 2
+                        + prow.len() * 8,
+                );
             }
             let segb = sc.seg.as_ref().expect("確保済み");
             let rg = sc.rows_gu.as_ref().expect("確保済み");
@@ -4027,6 +4084,7 @@ pub fn moe_experts_iq_pf_layer(
             let u = sc.u.as_ref().expect("確保済み");
             let act = sc.act.as_ref().expect("確保済み");
             let h = sc.h.as_ref().expect("確保済み");
+            let od = sc.od.as_ref().expect("確保済み");
             unsafe {
                 // gate と up (同じ行表・同じ入力)。
                 let rb_g = exp_pf::row_bytes(ty_g, n_in).unwrap_or(0);
@@ -4126,11 +4184,41 @@ pub fn moe_experts_iq_pf_layer(
                         &mut args,
                     )?;
                 }
+                // ヒット行の加重和 (h をホストへ戻さない): od = sum_j w * h[row_j]
+                let nt_l = nt;
+                {
+                    let kk = prow.len() / nt;
+                    let mut ph = h.ptr;
+                    let mut pprow = sc.prow.as_ref().expect("確保済み").ptr;
+                    let mut pw = sc.wdev.as_ref().expect("確保済み").ptr;
+                    let mut pod = od.ptr;
+                    let (mut pk, mut pe, mut pn) =
+                        (kk as c_int, e as c_int, nt_l as c_int);
+                    let mut args = [
+                        &mut ph as *mut _ as *mut c_void,
+                        &mut pprow as *mut _ as *mut c_void,
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut pod as *mut _ as *mut c_void,
+                        &mut pk as *mut _ as *mut c_void,
+                        &mut pe as *mut _ as *mut c_void,
+                        &mut pn as *mut _ as *mut c_void,
+                    ];
+                    let threads = 256usize;
+                    ctx.launch_async(
+                        kernels.accum,
+                        (nt_l.max(1) as u32, 1, 1),
+                        (threads as u32, 1, 1),
+                        0,
+                        &mut args,
+                    )?;
+                }
                 ctx.sync()?;
             }
-            let got: Vec<f32> = sc.h.as_ref().expect("確保済み").to_vec(nh)?;
+            exp_pf::note_kernel_ns(t_kern.elapsed().as_nanos() as u64);
+            let t_d2h = std::time::Instant::now();
+            od.to_slice(&mut out_delta[..nh])?;
+            exp_pf::note_d2h_ns(t_d2h.elapsed().as_nanos() as u64);
             dbg_d2h(nh * 4);
-            out_h[..nh].copy_from_slice(&got);
             Ok(true)
         })
     };

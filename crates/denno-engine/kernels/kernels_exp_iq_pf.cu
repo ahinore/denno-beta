@@ -245,12 +245,17 @@ extern "C" __global__ void NAME(                                                
             _Pragma("unroll")                                                      \
             for (int r = 0; r < PF_MR; ++r) {                                      \
                 if (r < nr) {                                                      \
-                    const float* xp = xbase + (size_t)tk[r] * (size_t)n_in + xoff;  \
-                    _Pragma("unroll")                                              \
-                    for (int j = 0; j < 8; ++j) {                                  \
-                        const float xv = xp[j];                                    \
-                        acc0[r] += w0[j] * xv;                                     \
-                        acc1[r] += w1[j] * xv;                                     \
+                    const float4* xq = reinterpret_cast<const float4*>(xbase        \
+                        + (size_t)tk[r] * (size_t)n_in + xoff);                     \
+                    const float4 xa = xq[0];                                        \
+                    const float4 xb4 = xq[1];                                       \
+                    float xv[8];                                                    \
+                    xv[0] = xa.x; xv[1] = xa.y; xv[2] = xa.z; xv[3] = xa.w;         \
+                    xv[4] = xb4.x; xv[5] = xb4.y; xv[6] = xb4.z; xv[7] = xb4.w;     \
+                    _Pragma("unroll")                                               \
+                    for (int j = 0; j < 8; ++j) {                                   \
+                        acc0[r] += w0[j] * xv[j];                                   \
+                        acc1[r] += w1[j] * xv[j];                                   \
                     }                                                              \
                 }                                                                  \
             }                                                                      \
@@ -321,9 +326,16 @@ extern "C" __global__ void dno_exp_pf_iq4nl(
             _Pragma("unroll")
             for (int r = 0; r < PF_MR; ++r) {
                 if (r < nr) {
-                    const float* xp = xbase + (size_t)tk[r] * (size_t)n_in + xoff;
+                    const float4* xq = reinterpret_cast<const float4*>(
+                        xbase + (size_t)tk[r] * (size_t)n_in + xoff);
                     #pragma unroll
-                    for (int j = 0; j < 32; ++j) acc[r] += w[j] * xp[j];
+                    for (int v = 0; v < 8; ++v) {
+                        const float4 x4 = xq[v];
+                        acc[r] += w[4 * v + 0] * x4.x;
+                        acc[r] += w[4 * v + 1] * x4.y;
+                        acc[r] += w[4 * v + 2] * x4.z;
+                        acc[r] += w[4 * v + 3] * x4.w;
+                    }
                 }
             }
         }
@@ -381,9 +393,16 @@ extern "C" __global__ void dno_exp_pf_q2_0(
             _Pragma("unroll")
             for (int r = 0; r < PF_MR; ++r) {
                 if (r < nr) {
-                    const float* xp = xbase + (size_t)tk[r] * (size_t)n_in + xoff;
+                    const float4* xq = reinterpret_cast<const float4*>(
+                        xbase + (size_t)tk[r] * (size_t)n_in + xoff);
                     #pragma unroll
-                    for (int j = 0; j < 64; ++j) acc[r] += w[j] * xp[j];
+                    for (int v = 0; v < 16; ++v) {
+                        const float4 x4 = xq[v];
+                        acc[r] += w[4 * v + 0] * x4.x;
+                        acc[r] += w[4 * v + 1] * x4.y;
+                        acc[r] += w[4 * v + 2] * x4.z;
+                        acc[r] += w[4 * v + 3] * x4.w;
+                    }
                 }
             }
         }
@@ -396,6 +415,33 @@ extern "C" __global__ void dno_exp_pf_q2_0(
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ヒット行の加重和: od[t*e + i] = sum_j w[t*k + j] * h[prow[t*k + j] * e + i]
+//
+// h (全行 × e) をホストへ戻すと 1 層 42 MB になり、pageable D2H (実測 ~2 GB/s)
+// が prefill の 1/4 を食う。トークンごとに j 昇順で足して nt x e だけ返す。
+// ミスの対は呼び出し側が w = 0 にしてある (0 を足すので値は変わらない)。
+// 1 block = 1 トークン、i は blockDim で割る。
+// ---------------------------------------------------------------------------
+extern "C" __global__ void dno_exp_pf_accum(
+    const float* __restrict__ h,
+    const unsigned int* __restrict__ prow,
+    const float* __restrict__ w,
+    float* __restrict__ od,
+    int k, int e, int ntok)
+{
+    const int t = (int)blockIdx.x;
+    if (t >= ntok) return;
+    for (int i = (int)threadIdx.x; i < e; i += (int)blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < k; ++j) {
+            const int idx = t * k + j;
+            acc += w[idx] * h[(size_t)prow[idx] * (size_t)e + (size_t)i];
+        }
+        od[(size_t)t * (size_t)e + (size_t)i] = acc;
     }
 }
 

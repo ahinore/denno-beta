@@ -9420,7 +9420,21 @@ fn moe_experts_iq_pf_batch(
         ptr_table(ExpertMatrix::Up),
         ptr_table(ExpertMatrix::Down),
     );
-    let mut h = vec![0.0f32; plan.total_rows * e];
+    // 加重和の表: 対 (t*k + j) → h の行。ミスした対は重み 0 にする
+    // (GPU は j 昇順に全部足すので、0 を足しても値は変わらない)。
+    let mut prow = vec![0u32; nt * k];
+    let mut wdev = vec![0.0f32; nt * k];
+    for (s, &ei) in plan.experts.iter().enumerate() {
+        let off = plan.seg[s * 4 + 1] as usize;
+        for (idx, &(t, j)) in by_expert[ei].iter().enumerate() {
+            prow[t * k + j] = (off + idx) as u32;
+            wdev[t * k + j] = weights[t * k + j];
+        }
+    }
+    // 加重和の出力 (nt × e) は層をまたいで使い回す (毎層 5 MB を確保すると
+    // ページフォルトだけで数 ms かかる)。
+    let mut od = PF_OD.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    od.resize(nt * e, 0.0f32);
     let t_gpu = std::time::Instant::now();
     let ran = {
         // 台帳の `exp_iq` 行 (decode と同じ区間) に prefill の GPU 往復を積む。
@@ -9434,11 +9448,14 @@ fn moe_experts_iq_pf_batch(
             &pd,
             &plan.seg,
             &plan.rows,
+            &prow,
+            &wdev,
             xs,
             e,
             ff,
             e,
-            &mut h,
+            nt,
+            &mut od,
         ) {
             Ok(v) => v,
             Err(err) => {
@@ -9448,6 +9465,7 @@ fn moe_experts_iq_pf_batch(
             }
         }
     };
+    PF_OD.with(|c| *c.borrow_mut() = std::mem::take(&mut od));
     if !ran {
         return Ok(None);
     }
@@ -9456,16 +9474,20 @@ fn moe_experts_iq_pf_batch(
     if std::env::var_os("DENNO_EXP_PF_DBG").is_some() {
         // 層ごとの内訳 (lab で「1 チャンク 1 層あたり何 ms か」を直接読むため)。
         eprintln!(
-            "[exp-pf-dbg] layer={} nt={} nseg={} rows={} hits={} gpu_ms={:.3} d2h_MB={:.2} \
-             miss_rows={}",
+            "[exp-pf-dbg] layer={} nt={} nseg={} rows={} hits={} gpu_ms={:.3} \
+             d2h_MB={:.2} miss_rows={}",
             lw.il,
             nt,
             plan.nseg(),
             plan.total_rows,
             hits,
             gpu_ns as f64 / 1e6,
-            (plan.total_rows * e * 4) as f64 / 1e6,
-            by_expert.iter().filter(|p| !p.is_empty()).map(|p| p.len()).sum::<usize>()
+            (nt * e * 4) as f64 / 1e6,
+            by_expert
+                .iter()
+                .filter(|p| !p.is_empty())
+                .map(|p| p.len())
+                .sum::<usize>()
                 - plan.total_rows,
         );
     }
@@ -9492,46 +9514,21 @@ fn moe_experts_iq_pf_batch(
         moe_expert::vnni_enabled(),
     )?;
 
-    // 2. ヒットの寄与を index 昇順で足す (トークン並列。1 トークンの中は昇順)。
+    // 2. ヒットの寄与 (GPU がトークンごとに j 昇順で足したもの) を加える。
     let t_add = std::time::Instant::now();
-    {
-        let ntok = out.len() / e.max(1);
-        // (h の行, weights の添字)。expert 昇順に積むので 1 トークン内は昇順。
-        let mut by_token: Vec<Vec<(u32, u32)>> = vec![Vec::new(); ntok];
-        for (s, &ei) in plan.experts.iter().enumerate() {
-            let off = plan.seg[s * 4 + 1] as usize;
-            for (idx, &(t, j)) in by_expert[ei].iter().enumerate() {
-                by_token[t].push(((off + idx) as u32, (t * k + j) as u32));
-            }
-        }
-        let add_one = |(t, o): (usize, &mut [f32])| {
-            for &(row, wi) in &by_token[t] {
-                let pe = weights[wi as usize];
-                let hh = &h[row as usize * e..(row as usize + 1) * e];
-                for d in 0..e {
-                    o[d] += pe * hh[d];
-                }
-            }
-        };
-        let parts: Vec<&mut [f32]> = out.chunks_mut(e.max(1)).collect();
-        #[cfg(feature = "par")]
-        {
-            use rayon::prelude::*;
-            parts
-                .into_par_iter()
-                .enumerate()
-                .for_each(add_one);
-        }
-        #[cfg(not(feature = "par"))]
-        {
-            parts.into_iter().enumerate().for_each(add_one);
-        }
+    for (o, d) in out.iter_mut().zip(od.iter()) {
+        *o += *d;
     }
     crate::model::exp_pf::note_add_ns(t_add.elapsed().as_nanos() as u64);
 
     // 3. ミスを次のチャンクのために上げる (空きがある間だけ・上限つき)。
     iq_pf_warm_misses(lw, by_expert, &pick, e, ff, p.n_layer);
     Ok(Some(hits))
+}
+
+thread_local! {
+    /// 加重和の出力 (nt × e)。層ごとに作り直さない (ページフォルトを避ける)。
+    static PF_OD: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// task 148: prefill のミス expert を **チャンク予算つき**で VRAM へ上げる。

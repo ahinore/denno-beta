@@ -191,6 +191,12 @@ pub fn kernel_name(slot: usize) -> Option<&'static str> {
 /// silu カーネルの名前 (このモジュール専用。decode の silu とは別モジュール)。
 pub const SILU_KERNEL: &str = "dno_exp_pf_silu_mul";
 
+/// ヒット行の加重和カーネルの名前 (`od[t*e+i] = sum_j w[t*k+j] * h[row_j*e+i]`)。
+///
+/// これを GPU で回すことで、1 層あたりホストへ戻す量が「全行 × e」から
+/// 「nt × e」になる (42 MB → 5.2 MB)。
+pub const ACCUM_KERNEL: &str = "dno_exp_pf_accum";
+
 /// 起動形。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PfLaunch {
@@ -293,6 +299,8 @@ static LAYERS: AtomicU64 = AtomicU64::new(0);
 static EXPERTS: AtomicU64 = AtomicU64::new(0);
 static ROWS: AtomicU64 = AtomicU64::new(0);
 static GPU_NS: AtomicU64 = AtomicU64::new(0);
+static KERNEL_NS: AtomicU64 = AtomicU64::new(0);
+static D2H_NS: AtomicU64 = AtomicU64::new(0);
 static ADD_NS: AtomicU64 = AtomicU64::new(0);
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
 static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
@@ -310,6 +318,16 @@ pub fn note_layer(rows: u32, experts: u32, gpu_ns: u64) {
     ROWS.fetch_add(rows as u64, Ordering::Relaxed);
     EXPERTS.fetch_add(experts as u64, Ordering::Relaxed);
     GPU_NS.fetch_add(gpu_ns, Ordering::Relaxed);
+}
+
+/// 1 層ぶんの発行〜同期 (カーネル本体) の時間を積む。
+pub fn note_kernel_ns(ns: u64) {
+    KERNEL_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// 1 層ぶんの D2H (加重和の nt×e) の時間を積む。
+pub fn note_d2h_ns(ns: u64) {
+    D2H_NS.fetch_add(ns, Ordering::Relaxed);
 }
 
 /// ヒット寄与の足し込み (ホスト側) の時間を積む。
@@ -354,11 +372,13 @@ pub fn stats_line() -> Option<String> {
     };
     Some(format!(
         "[exp-pf] lookups={lk} hit_rate={hr:.3} gpu_layers={layers} skip_layers={} experts={} \
-         rows={} gpu_ms={:.1} add_ms={:.1} uploads={} up_ms={:.1} {vram}",
+         rows={} gpu_ms={:.1} kern_ms={:.1} d2h_ms={:.1} add_ms={:.1} uploads={} up_ms={:.1} {vram}",
         SKIP_LAYERS.load(Ordering::Relaxed),
         EXPERTS.load(Ordering::Relaxed),
         ROWS.load(Ordering::Relaxed),
         GPU_NS.load(Ordering::Relaxed) as f64 / 1e6,
+        KERNEL_NS.load(Ordering::Relaxed) as f64 / 1e6,
+        D2H_NS.load(Ordering::Relaxed) as f64 / 1e6,
         ADD_NS.load(Ordering::Relaxed) as f64 / 1e6,
         UPLOADS.load(Ordering::Relaxed),
         UPLOAD_NS.load(Ordering::Relaxed) as f64 / 1e6,
@@ -370,7 +390,16 @@ pub fn stats_reset() {
     for c in [
         &LOOKUPS,
         &HITS,
-        &LAYERS, &EXPERTS, &ROWS, &GPU_NS, &ADD_NS, &UPLOADS, &UPLOAD_NS, &SKIP_LAYERS,
+        &LAYERS,
+        &EXPERTS,
+        &ROWS,
+        &GPU_NS,
+        &KERNEL_NS,
+        &D2H_NS,
+        &ADD_NS,
+        &UPLOADS,
+        &UPLOAD_NS,
+        &SKIP_LAYERS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -513,6 +542,10 @@ mod tests {
             cu.contains(&format!("__global__ void {SILU_KERNEL}(")),
             "{SILU_KERNEL} が kernels_exp_iq_pf.cu に無い"
         );
+        assert!(
+            cu.contains(&format!("__global__ void {ACCUM_KERNEL}(")),
+            "{ACCUM_KERNEL} が kernels_exp_iq_pf.cu に無い"
+        );
         // 起動形の定数が .cu と揃っていること (片方だけ変えると行が落ちる)。
         assert!(cu.contains("#define PF_MR 16"), "PF_MR が 16 でない");
         assert!(cu.contains("#define PF_OUTS 2"), "PF_OUTS が 2 でない");
@@ -551,5 +584,6 @@ mod tests {
             assert_eq!(count(name), Some(9), "{name} の引数の数が .cu と違う");
         }
         assert_eq!(count(SILU_KERNEL), Some(4), "{SILU_KERNEL} の引数の数");
+        assert_eq!(count(ACCUM_KERNEL), Some(7), "{ACCUM_KERNEL} の引数の数");
     }
 }

@@ -448,6 +448,11 @@ pub fn line_prefill(tok: usize) -> Vec<String> {
         }
         push_row(NAMES[i], rows[i].wall_ns, Some(&rows[i]));
     }
+    // task 148: `exp_iq` は `experts` の**内側**なので合計には入れない (二重計上
+    // になる)。prefill でも「GPU の起動・同期・コピー」を読めるように 1 行だけ足す。
+    if rows[EXPERT].wall_ns > 0 || rows[EXPERT].launches > 0 || rows[EXPERT].syncs > 0 {
+        push_row(NAMES[EXPERT], rows[EXPERT].wall_ns, Some(&rows[EXPERT]));
+    }
     // 残差 (層の外 = embed / PLE / 最終 mixer / head / 未計測)。
     push_row(NAMES[OTHER], other_ns, Some(&rows[OTHER]));
     out
