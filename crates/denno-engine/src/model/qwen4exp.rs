@@ -2781,6 +2781,10 @@ impl Qwen4Exp {
     ) -> Result<Vec<f32>> {
         // P78: 層の外の区間計測の分母 (prefill 回数とトークン数)。
         prekprof::note_prefill(ctx.len());
+        // task 145: prefill の台帳。全体を `other` で包み、層の中の区間
+        // (mix / attn / router / shared / experts) は内側のガードで上書きする。
+        // したがって `other` は「どこにも割っていない残り」= 層の外と未計測分。
+        let _pf_all = q4ledger::enter(q4ledger::OTHER);
         let logits = if batch && self.attn.layer_major_safe() {
             self.forward_prefill_batch_tapped(ctx, prefill_batch_chunk(), tokens, on_layer, roles)?
         } else {
@@ -3039,19 +3043,35 @@ impl Qwen4Exp {
 
                 // 3.2-3.4 attention 入口 (バッチ) → attn (トークン順) → 出口
                 let t_mix = std::time::Instant::now();
-                let (curs, injs) = hc_mix_quant_batch(
-                    &ress,
-                    &lw.hc_attn_norm,
-                    &lw.hc_attn_down,
-                    &lw.hc_attn_up,
-                    Some(&lw.hc_attn_inject),
-                    &hp,
-                    &mut mx,
-                )?;
+                let (curs, injs) = {
+                    // task 145: 台帳の区間 (mix)。
+                    let _l = q4ledger::enter(q4ledger::MIX);
+                    hc_mix_quant_batch(
+                        &ress,
+                        &lw.hc_attn_norm,
+                        &lw.hc_attn_down,
+                        &lw.hc_attn_up,
+                        Some(&lw.hc_attn_inject),
+                        &hp,
+                        &mut mx,
+                    )?
+                };
                 q4prof::add(&q4prof::MIX, t_mix);
                 let t_attn = std::time::Instant::now();
                 // 投影をチャンクでまとめる実装 (ssm 層) はここで GPU 往復を減らす。
-                let outs = self.attn.forward_batch(il, &curs)?;
+                let outs = {
+                    // task 145: 台帳の区間。層種別で full / ssm に分ける。
+                    let item = if q4ledger::enabled() {
+                        match self.p.layer_kind(il) {
+                            Ok(LayerKind::FullAttn) => q4ledger::FULL,
+                            _ => q4ledger::SSM,
+                        }
+                    } else {
+                        q4ledger::OTHER
+                    };
+                    let _l = q4ledger::enter(item);
+                    self.attn.forward_batch(il, &curs)?
+                };
                 for o in &outs {
                     if o.len() != e {
                         return Err(one(format!(
@@ -3082,15 +3102,19 @@ impl Qwen4Exp {
 
                 // 3.5-3.7 ffn 入口 (バッチ) → MoE FFN (バッチ) → 出口
                 let t_mix = std::time::Instant::now();
-                let (curs, injs) = hc_mix_quant_batch(
-                    &ress,
-                    &lw.hc_ffn_norm,
-                    &lw.hc_ffn_down,
-                    &lw.hc_ffn_up,
-                    Some(&lw.hc_ffn_inject),
-                    &hp,
-                    &mut mx,
-                )?;
+                let (curs, injs) = {
+                    // task 145: 台帳の区間 (mix)。
+                    let _l = q4ledger::enter(q4ledger::MIX);
+                    hc_mix_quant_batch(
+                        &ress,
+                        &lw.hc_ffn_norm,
+                        &lw.hc_ffn_down,
+                        &lw.hc_ffn_up,
+                        Some(&lw.hc_ffn_inject),
+                        &hp,
+                        &mut mx,
+                    )?
+                };
                 q4prof::add(&q4prof::MIX, t_mix);
                 let flat = flatten_rows(&curs, e)?;
                 let t_moe = std::time::Instant::now();
@@ -6710,6 +6734,8 @@ fn moe_ffn_quant_impl(
 
     moe_sub_add(0, t_router.elapsed());
     let t_experts = std::time::Instant::now();
+    // task 145: 台帳の区間 (experts)。選択 expert の寄与計算だけ。
+    let _l_experts = q4ledger::enter(q4ledger::EXPERTS);
 
     if loop_new {
         // P64: 1 層ぶんの寄与を 1 つの並列領域で計算し、足し込みは index 昇順の
@@ -8937,6 +8963,8 @@ fn moe_ffn_quant_batch_full(
     }
 
     // 1. ルータ (バッチ)
+    // task 145: 台帳の区間 (router)。gate_inp の GEMV から top-k の確定まで。
+    let _l_router = q4ledger::enter(q4ledger::ROUTER);
     let t_router = std::time::Instant::now();
     let mut probs = vec![0.0f32; nt * ne];
     gemv_batch(&lw.gate_inp, xs, nt, &mut probs)
@@ -9024,6 +9052,8 @@ fn moe_ffn_quant_batch_full(
     //    `position()` で作っていた順 (トークン昇順, 同トークン内は j 昇順) と一致する。
     //    件数を先に数えて容量を確保するので、push のたびの再確保は無い。
     let t_experts = std::time::Instant::now();
+    // task 145: 台帳の区間 (experts)。選択 expert の寄与計算だけ。
+    let _l_experts = q4ledger::enter(q4ledger::EXPERTS);
     let mut out = vec![0.0f32; nt * e];
     let mut counts = vec![0usize; ne];
     for &ei in &sels {
@@ -9111,6 +9141,8 @@ fn moe_ffn_quant_batch_full(
 
     // 5. shared expert (バッチ)。係数は sigmoid(gate_inp_shexp @ x)
     moe_sub_add(1, t_experts.elapsed());
+    // task 145: 台帳の区間 (shared)。
+    let _l_shared = q4ledger::enter(q4ledger::SHARED);
     let t_shared = std::time::Instant::now();
     let sff = lw.gate_shexp.n();
     let mut sact = vec![0.0f32; nt * sff];
@@ -16240,6 +16272,52 @@ mod tests {
             assert!(
                 lines.iter().any(|l| l.contains(" router ")),
                 "router の行が無い: {lines:?}"
+            );
+
+            q4ledger::reset();
+            q4ledger::set_for_test(false);
+        }
+
+        /// task 145: prefill の台帳が**実際に** experts を含む各区間に積まれ、
+        /// 全体 (`other`) が残りを吸うこと (配線の生死)。GPU 無しでも壁時計は積まれる。
+        #[test]
+        fn q4ledger_records_prefill_items() {
+            let _g = moe_test_guard();
+            let dir = TempDir::new("q4ledger_prefill");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("合成モデルを開けない");
+            let ctx: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+            let mut m = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+
+            q4ledger::set_for_test(true);
+            q4ledger::reset();
+            let _ = m.forward_prefill_with(&ctx, true).expect("batch prefill");
+
+            for i in [
+                q4ledger::MIX,
+                q4ledger::SSM,
+                q4ledger::FULL,
+                q4ledger::ROUTER,
+                q4ledger::SHARED,
+                q4ledger::EXPERTS,
+            ] {
+                assert!(
+                    q4ledger::row(i).wall_ns > 0,
+                    "{} の区間が積まれていない (prefill の配線が無い)",
+                    q4ledger::NAMES[i]
+                );
+            }
+            // 全体を包む `other` も必ず積まれる (層の外があるため)。
+            assert!(
+                q4ledger::row(q4ledger::OTHER).wall_ns > 0,
+                "other の区間が積まれていない"
+            );
+            let lines = q4ledger::line_prefill(6);
+            assert!(lines.len() >= 4, "{lines:?}");
+            assert!(lines[0].starts_with("[q4ledger-pf] tok=6"), "{}", lines[0]);
+            assert!(
+                lines.iter().any(|l| l.contains(" experts ")),
+                "experts の行が無い: {lines:?}"
             );
 
             q4ledger::reset();

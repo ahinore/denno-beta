@@ -459,6 +459,12 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         for line in denno_engine::model::q4ledger::line(tok) {
             eprintln!("{line}");
         }
+    } else {
+        // task 145: prefill の台帳 (区間ごとの合計 ms と割合)。decode と同じ
+        // 区間名を使うが、こちらは合計 (prefill 1 回 = tok トークン)。
+        for line in denno_engine::model::q4ledger::line_prefill(tok) {
+            eprintln!("{line}");
+        }
     }
     denno_engine::model::q4ledger::reset();
     if !q4prof::enabled() {

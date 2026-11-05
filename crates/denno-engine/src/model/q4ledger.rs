@@ -20,7 +20,8 @@
 //! `enabled()` の分岐 1 回で戻る。
 //!
 //! 出力は `serve_flash::prof_flash_q4` が decode のリクエスト終端で 1 回
-//! ([`line`])。値は **1 トークンあたり**に割って出す。
+//! ([`line`])、prefill の終端で 1 回 ([`line_prefill`])。decode は **1 トークン
+//! あたり**、prefill は **合計と割合**で出す (task 145)。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -36,12 +37,21 @@ pub const SHARED: usize = 2;
 pub const FULL: usize = 3;
 /// 区間: ssm 層の attention (qkv / gate / GDN / out)。
 pub const SSM: usize = 4;
+/// 区間: 選択 expert の本体 (task 145: prefill の expert を分離)。
+///
+/// prefill のバッチ経路では「重みの前置き (prefetch) を除いた、選択 expert の
+/// 寄与計算」= `moe_experts_flat` / `moe_experts_legacy` / grouped GEMM の区間。
+pub const EXPERTS: usize = 5;
 /// 区間: 上のどれでもない (embed / ple / expert 本体 / head / サンプラ)。
-pub const OTHER: usize = 5;
+///
+/// prefill では層ループの外側 (embed / PLE / 最終 mixer / head) と、層の中で
+/// まだ区間に割っていない部分がここに入る。`forward_prefill_inner` が全体を
+/// この区間で包むので、prefill では「全項目の和 = prefill の壁時計」になる。
+pub const OTHER: usize = 6;
 /// 区間の数。
-pub const N: usize = 6;
+pub const N: usize = 7;
 /// 区間の名前 ([`MIX`] の順)。
-pub const NAMES: [&str; N] = ["mix", "router", "shared", "full", "ssm", "other"];
+pub const NAMES: [&str; N] = ["mix", "router", "shared", "full", "ssm", "experts", "other"];
 
 fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -320,6 +330,72 @@ pub fn line(tok: usize) -> Vec<String> {
     out
 }
 
+/// prefill 1 回ぶんの台帳 (`tok` = その prefill のトークン数)。
+///
+/// [`line`] は decode の 1 トークンあたりに割った値だが、prefill は
+/// 「1 チャンク = 数百トークン」で区間の内訳を**合計 ms** で読みたいので
+/// こちらは合計と割合を出す。`forward_prefill_inner` が全体を [`OTHER`] で
+/// 包むので、全項目の `wall` の和 = prefill の壁時計 (層の外も含む)。
+///
+/// 列: `wall` (ms) / 割合 / `launch` (発行そのものの時間と回数) /
+/// `sync` (待ち時間と回数) / `gpu` (sync から空 sync 分を引いた残り) /
+/// `cpu` (wall - launch - sync - コピー) / `h2d` `d2h` (MB と回数)。
+pub fn line_prefill(tok: usize) -> Vec<String> {
+    if !enabled() {
+        return Vec::new();
+    }
+    let floor_ns = sync_floor_ns().unwrap_or(0);
+    let rows: Vec<Row> = (0..N).map(row).collect();
+    let t = |f: fn(&Row) -> u64| -> u64 { rows.iter().map(f).sum() };
+    let total_wall = t(|r| r.wall_ns);
+    let total_launch = t(|r| r.launches);
+    let total_syncs = t(|r| r.syncs);
+    let total_h2d: u64 = t(|r| r.h2d_bytes);
+    let total_d2h: u64 = t(|r| r.d2h_bytes);
+    let d = total_wall.max(1) as f64;
+
+    let mut out = vec![format!(
+        "[q4ledger-pf] tok={tok} wall={:.1}ms launches={total_launch} syncs={total_syncs} \
+         h2d={:.1}MB d2h={:.1}MB sync_floor={:.1}us",
+        total_wall as f64 / 1e6,
+        total_h2d as f64 / 1e6,
+        total_d2h as f64 / 1e6,
+        floor_ns as f64 / 1e3,
+    )];
+    out.push(
+        "[q4ledger-pf]   item   wall_ms  share  launch_ms/cnt  sync_ms/cnt  gpu_ms  cpu_ms  \
+         h2d_MB/cnt  d2h_MB/cnt"
+            .to_string(),
+    );
+    for (i, r) in rows.iter().enumerate() {
+        if r.wall_ns == 0 && r.launches == 0 && r.syncs == 0 {
+            continue;
+        }
+        let ms = |ns: u64| ns as f64 / 1e6;
+        let gpu_ns = r.sync_ns.saturating_sub(r.syncs.saturating_mul(floor_ns));
+        let busy_ns = r.launch_ns + r.sync_ns + r.h2d_ns + r.d2h_ns;
+        let cpu_ns = r.wall_ns.saturating_sub(busy_ns);
+        out.push(format!(
+            "[q4ledger-pf]   {:<7} {:>8.1} {:>5.1}%  {:>8.2}/{:<6} {:>8.2}/{:<6} {:>7.1} {:>7.1}  \
+             {:>8.2}/{:<6} {:>8.2}/{:<6}",
+            NAMES[i],
+            ms(r.wall_ns),
+            r.wall_ns as f64 * 100.0 / d,
+            ms(r.launch_ns),
+            r.launches,
+            ms(r.sync_ns),
+            r.syncs,
+            ms(gpu_ns),
+            ms(cpu_ns),
+            r.h2d_bytes as f64 / 1e6,
+            r.h2d_calls,
+            r.d2h_bytes as f64 / 1e6,
+            r.d2h_calls,
+        ));
+    }
+    out
+}
+
 /// 積算を 0 に戻す (リクエスト境界。`serve_flash` が [`line`] の直後に呼ぶ)。
 pub fn reset() {
     for r in ROWS.iter() {
@@ -448,6 +524,63 @@ mod tests {
         assert!(sync_floor_ns().is_some());
         reset();
         assert_eq!(sync_floor_ns(), None);
+        set_for_test(false);
+    }
+
+    /// prefill の台帳は合計 ms と割合で、experts が other と別に出る (task 145)。
+    #[test]
+    fn prefill_line_totals_and_experts() {
+        let _g = lock();
+        set_for_test(true);
+        reset();
+        // 全体の外側 (other) の中で experts が動いた形を作る。
+        {
+            let _all = enter(OTHER);
+            {
+                let _e = enter(EXPERTS);
+                for _ in 0..4 {
+                    note_launch(Some(Instant::now()));
+                }
+            }
+            {
+                let _m = enter(MIX);
+                for _ in 0..2 {
+                    note_launch(Some(Instant::now()));
+                }
+            }
+        }
+        let lines = line_prefill(512);
+        assert!(!lines.is_empty(), "on なのに prefill の台帳が出ない");
+        let head = &lines[0];
+        assert!(head.starts_with("[q4ledger-pf] tok=512"), "{head}");
+        assert!(head.contains("wall="), "{head}");
+        assert!(head.contains("sync_floor="), "{head}");
+        let exp = lines
+            .iter()
+            .find(|l| l.contains(" experts "))
+            .expect("experts の行が無い");
+        assert!(exp.contains("%"), "{exp}");
+        // other は外側のガードなので、内側 (experts / mix) の時間を含まない。
+        let other = lines
+            .iter()
+            .find(|l| l.contains(" other "))
+            .expect("other の行が無い");
+        assert!(other.contains("%"), "{other}");
+        assert!(other.contains("experts") == false, "{other}");
+        // 全項目の wall の和 = 全体 (other が残りを吸う)。
+        let sum: u64 = (0..N).map(|i| row(i).wall_ns).sum();
+        let total: u64 = lines[0]
+            .split("wall=")
+            .nth(1)
+            .and_then(|s| s.split("ms").next())
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|v| (v * 1e6) as u64)
+            .expect("wall の値が読めない");
+        assert!(
+            sum.abs_diff(total) < 1_000_000,
+            "項目の和 {sum} と全体 {total} が合わない"
+        );
+        reset();
         set_for_test(false);
     }
 }
