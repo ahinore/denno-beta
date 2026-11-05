@@ -568,6 +568,20 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
         self.stats.upload_bytes += bytes as u64;
     }
 
+    /// 複数の key の最終使用時刻を「今」にする (**H2D しない**)。
+    ///
+    /// 渡した順に新しくなる (最後の要素が一番新しく、最後に追い出される)。
+    /// task 146 の事前ロードが、載せ終わったあとに「回数の少ない順」へ並べ直す
+    /// ために使う。載っていない key は黙って飛ばす。
+    pub fn touch_many(&mut self, keys: &[K]) {
+        for k in keys {
+            if let Some(s) = self.entries.get_mut(k) {
+                self.clock = self.clock.saturating_add(1);
+                s.last_use = self.clock;
+            }
+        }
+    }
+
     /// 登録簿から外す (値は呼び出し側へ返す)。
     pub fn remove(&mut self, key: &K) -> Option<V> {
         let slot = self.entries.remove(key)?;
@@ -894,7 +908,7 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 #[cfg(feature = "cuda")]
 pub use gpu::{
     acquire, acquire_soft, cache_usage, check_enabled, fallbacks, init, lookup, note_check,
-    take_alloc_error, take_check, Acquired, CheckAcc, ExpertDev, ExpertShape,
+    take_alloc_error, take_check, touch_many, Acquired, CheckAcc, ExpertDev, ExpertShape,
 };
 
 #[cfg(feature = "cuda")]
@@ -991,6 +1005,19 @@ mod gpu {
     /// 直前の確保失敗の理由を取り出す (`acquire_soft` の停止理由を 1 行に出すため)。
     pub fn take_alloc_error() -> Option<String> {
         LAST_ALLOC_ERR.lock().ok()?.take()
+    }
+
+    /// 載っている expert の LRU 順を「渡した順に新しい」へ並べ直す (H2D しない)。
+    ///
+    /// task 146: 事前ロードの最後に、回数の少ない順で呼んで「一番よく使う expert が
+    /// 一番追い出されにくい」状態にする。未初期化・ロック破損なら何もしない。
+    pub fn touch_many(keys: &[ExpertKey]) {
+        let Some(c) = CACHE.get() else {
+            return;
+        };
+        if let Ok(mut g) = c.lock() {
+            g.touch_many(keys);
+        }
     }
 
     /// 上限 `cap_bytes` で LRU を作る (プロセスで 1 回)。2 回目以降は無視する。
@@ -1356,6 +1383,27 @@ mod tests {
         assert_eq!(c.stats().evictions, 1);
         assert_eq!(c.stats().hits, 1);
         assert_eq!(c.stats().misses, 4, "insert した回数 (1,2,3,4)");
+    }
+
+    /// task 146: `touch_many` は H2D もバイト会計も変えず、追い出し順だけ変える。
+    #[test]
+    fn touch_many_reorders_without_uploading() {
+        let mut c: VramLru<u8, String> = VramLru::new(400);
+        for i in 1..=4u8 {
+            c.make_room(100).unwrap();
+            c.insert(i, 100, format!("{i}"));
+        }
+        let (used, misses) = (c.used_bytes(), c.stats().misses);
+        // 3 -> 2 の順に触る = 3 が一番新しく、1 が一番古い
+        c.touch_many(&[3, 2]);
+        assert_eq!(c.used_bytes(), used, "バイト数は変わらない");
+        assert_eq!(c.stats().misses, misses, "H2D (insert) は起きない");
+        let ev = c.make_room(100).unwrap();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].0, 1, "触っていない 1 が最初に追い出される");
+        // 載っていない key は黙って飛ばす
+        c.touch_many(&[99]);
+        assert_eq!(c.used_bytes(), used - 100);
     }
 
     /// どの並びで入れても `used_bytes` は上限を超えない。

@@ -7699,9 +7699,11 @@ pub fn expert_identity_bytes(f: &GgufFile, p: &Qwen4ExpParams) -> u64 {
 ///   されていること ([`crate::model::exp_stats::enabled`])。呼ばれても、ファイルが
 ///   無い・壊れている・版違い・別モデルなら **何も載せずに 1 行だけ返す**。
 ///   起動もリクエストも落とさない。
-/// - **回数の少ない順に載せる**。LRU は末尾 (= 最も昔に触ったもの) から追い出す
-///   ので、最後に載った「一番よく使う expert」が一番追い出されにくい。
-///   予算 (`Deno_EXPERT_VRAM_MB` - 予備) に届いたら止める。
+/// - **回数の多い順に載せ、載せ終わったら少ない順に touch し直す**。
+///   途中で切れても (最初のリクエストが来て decode に譲った場合) 上位が載って
+///   いるようにするため。touch は H2D しないので、完了後は「一番よく使う expert が
+///   一番最後に触られて = 一番追い出されにくい」になる。予算
+///   (`DENNO_EXPERT_VRAM_MB` - 予備) に届いたら止める。
 /// - decode 中 (`exp_stats::busy()`) は載せない。2 ms 寝て待ち、空いたら続きから。
 ///   1 本の H2D は 0.3 ms 程度だが、LRU のロックを持つ間 decode の `lookup` が
 ///   待つので、そもそも重ならないようにしてある。
@@ -7814,7 +7816,13 @@ pub fn preload_experts_from_stats(
     let _ = expert_vram::take_alloc_error();
     // 止まった理由 (None = 最後まで載せた)。
     let mut stop: Option<String> = None;
-    for (layer, expert) in plan {
+    // 載せた順 (最後に touch を掛け直して「一番よく使う = 最後に使った」にする)。
+    let mut loaded_keys: Vec<ExpertKey> = Vec::new();
+    // **回数の多い順**に載せる (lab t146b: 昇順だと予算で切れたときに下位だけが
+    // 載り、最初のリクエストのヒット率が素の 0.51 より悪くなりうる)。
+    // 全部載せ終わったら昇順 (= 少ない順) に touch し直して、追い出されにくさを
+    // 回数の順に戻す (touch は H2D しない)。
+    for (layer, expert) in plan.into_iter().rev() {
         let (li, ei) = (layer as usize, expert as usize);
         let Some((g, u, d)) = layers.get(li) else {
             continue;
@@ -7858,7 +7866,10 @@ pub fn preload_experts_from_stats(
             Ok([g.slice(ei)?, u.slice(ei)?, d.slice(ei)?])
         });
         match got {
-            Ok(Some(_)) => loaded += 1,
+            Ok(Some(_)) => {
+                loaded += 1;
+                loaded_keys.push(key);
+            }
             // 型が未対応・確保失敗はそこで止める。理由は 1 行に残す。
             Ok(None) => {
                 stop = Some(match expert_vram::take_alloc_error() {
@@ -7872,6 +7883,13 @@ pub fn preload_experts_from_stats(
                 break;
             }
         }
+    }
+    // 載せたものを「少ない順」に触り直す (H2D なし)。これで LRU の末尾 (= 最初に
+    // 追い出される) が一番使わない expert になり、task の「most used are evicted
+    // last」になる。載せ終わる前に止まった場合も、載っている範囲で同じ性質になる。
+    loaded_keys.reverse();
+    if !loaded_keys.is_empty() {
+        expert_vram::touch_many(&loaded_keys);
     }
     let secs = t0.elapsed().as_secs_f64();
     let used = expert_vram::cache_usage().map_or(0, |(u, _)| u);

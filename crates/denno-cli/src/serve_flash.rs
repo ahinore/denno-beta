@@ -1605,6 +1605,42 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     let batch = std::env::var("DENNO_PREFILL_BATCH").ok().as_deref() != Some("0");
     let chunk = std::env::var("DENNO_PREFILL_BATCH_CHUNK").unwrap_or_else(|_| "8".into());
 
+    // task 146: (層, expert) の使用回数と、起動時の事前ロード。
+    // `DENNO_EXPERT_IQ_GPU=1` かつ `DENNO_EXPERT_IQ_STATS_FILE` が設定されている
+    // ときだけ動く。**起動時のモデル構築より前に起こす**のが大事で、構築 (数秒) の
+    // 間に上位 expert を載せておかないと、最初のリクエストが来た時点で数本しか
+    // 載っていない (lab t146b: 昇順で下位 3,212 本しか載らず、ヒット率が素と同じ)。
+    // どちらも背景スレッドなので `/v1/models` が返るまでの時間は変わらない。
+    let _stats_guard = if denno_engine::model::exp_stats::enabled() {
+        let dir_name = cfg
+            .dir
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        denno_engine::model::exp_stats::set_identity(&dir_name, expert_bytes, n_layer, n_expert);
+        // 事前ロード: 回数の多い順に VRAM へ載せる。decode 中は譲る。
+        let parts_pre = parts.clone();
+        std::thread::spawn(move || {
+            if let Some(line) =
+                denno_engine::model::qwen4exp::preload_experts_from_stats(&parts_pre, &dir_name)
+            {
+                eprintln!("{line}");
+            }
+        });
+        // 保存: 新しい回数があるときだけ、20 秒ごとに原子的に書く (decode の外)。
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(
+                denno_engine::model::exp_stats::SAVE_PERIOD_SECS,
+            ));
+            if let Some(line) = denno_engine::model::exp_stats::save_now() {
+                eprintln!("{line}");
+            }
+        });
+        Some(StatsSaveOnExit)
+    } else {
+        None
+    };
+
     // P51: 推論テレメトリ (denno-view が購読する WS)。既定で有効で、
     // `DENNO_TELEMETRY=0` のときだけ無効。無効時はチャネルもスレッドも作らない。
     let telem_on = std::env::var("DENNO_TELEMETRY").ok().as_deref() != Some("0");
@@ -1674,45 +1710,6 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
         flash.batch,
         chunk
     );
-
-    // task 146: (層, expert) の使用回数と、起動時の事前ロード。
-    // `DENNO_EXPERT_IQ_GPU=1` かつ `DENNO_EXPERT_IQ_STATS_FILE` が設定されている
-    // ときだけ動く。どちらも背景スレッドなので、`/v1/models` が返るまでの時間は
-    // 変わらない (待つのは listen の bind だけ)。
-    let _stats_guard = if denno_engine::model::exp_stats::enabled() {
-        let dir_name = cfg
-            .dir
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        denno_engine::model::exp_stats::set_identity(
-            &dir_name,
-            expert_bytes,
-            n_layer,
-            n_expert,
-        );
-        // 事前ロード: 記録した回数の少ない順に VRAM へ載せる。decode 中は譲る。
-        let parts_pre = flash.parts.clone();
-        std::thread::spawn(move || {
-            if let Some(line) =
-                denno_engine::model::qwen4exp::preload_experts_from_stats(&parts_pre, &dir_name)
-            {
-                eprintln!("{line}");
-            }
-        });
-        // 保存: 新しい回数があるときだけ、20 秒ごとに原子的に書く (decode の外)。
-        std::thread::spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(
-                denno_engine::model::exp_stats::SAVE_PERIOD_SECS,
-            ));
-            if let Some(line) = denno_engine::model::exp_stats::save_now() {
-                eprintln!("{line}");
-            }
-        });
-        Some(StatsSaveOnExit)
-    } else {
-        None
-    };
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = TcpListener::bind(&addr).with_context(|| format!("{addr} を listen できない"))?;
