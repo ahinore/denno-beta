@@ -1723,6 +1723,11 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                     eprintln!("[flash] リクエスト失敗: {e:#}");
                 }
                 eprintln!("[flash] request done {:.1}s", t.elapsed().as_secs_f64());
+                // task 149: リクエスト境界。prefill の一時領域 (arena) を返し、
+                // 確保の内訳を 1 表だけ出す (1 本目と長い文脈の最初の 1 回)。
+                // `DENNO_SCRATCH_FREE=0` / `DENNO_Q4_PROFILE` なしでは何もしない。
+                let ctx_tokens = flash.cache.as_ref().map(|c| c.toks.len()).unwrap_or(0);
+                denno_engine::mem_audit::request_boundary(ctx_tokens, 4096);
                 // P-pf-arena: 重み登録の成否をリクエスト単位で 1 行 (登録を試みた
                 // ときだけ)。GPU_BROKEN のラッチはプロセス寿命なので reset しない。
                 let st = denno_engine::gpu_budget::weight_upload_stats();

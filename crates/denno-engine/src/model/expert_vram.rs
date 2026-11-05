@@ -746,14 +746,20 @@ pub fn effective_expert_cap(env_cap: usize) -> usize {
     if !crate::mem_audit::card_budget_on() {
         return env_cap;
     }
-    let Some((_, total_mb)) = crate::cuda::dev_mem_mb() else {
+    let Some((free_mb, _total_mb)) = crate::cuda::dev_mem_mb() else {
         return env_cap;
     };
-    let total = total_mb.saturating_mul(1 << 20);
+    // task 149: 台帳の合計ではなく**いまの空き**から引く。CUDA context / JIT の
+    // 実バイト数はドライバが公開せず、prefill の一時バッファは一瞬しか生きない。
+    // 空きを直接使えばその両方が自動的に効く (確保のたびに引き直す)。
+    let free = free_mb.saturating_mul(1 << 20);
     let reserve = (crate::mem_audit::vram_reserve_mb() as usize).saturating_mul(1 << 20);
-    let others = crate::mem_audit::live_bytes()
-        .saturating_sub(crate::mem_audit::experts_live_bytes());
-    crate::mem_audit::card_expert_cap(env_cap, total, reserve, others)
+    crate::mem_audit::card_expert_cap_from_free(
+        env_cap,
+        crate::mem_audit::experts_live_bytes(),
+        free,
+        reserve,
+    )
 }
 
 /// CUDA 無しのビルドでは VRAM 予算そのものが無い (`env_cap` をそのまま返す)。

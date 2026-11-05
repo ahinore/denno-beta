@@ -248,35 +248,71 @@ pub fn print_table(reason: &str, dev: Option<(usize, usize)>) {
     );
 }
 
+/// リクエスト境界の後始末 (serve-flash / engine の両方から呼ぶ)。
+///
+/// 1. その時点の確保の内訳を表に出す ([`request_end`]。1 本目と長い文脈の 1 回だけ)。
+/// 2. prefill の arena チャンクを返す (`cuda::pf_scratch_release`。
+///    `DENNO_SCRATCH_FREE=0` で従来どおり)。
+///
+/// denno-engine を cuda 無しでビルドしたときは両方とも no-op。
+pub fn request_boundary(ctx_tokens: usize, long_ctx: usize) {
+    #[cfg(feature = "cuda")]
+    {
+        request_end(ctx_tokens, long_ctx, crate::cuda::dev_mem_mb());
+        crate::cuda::pf_scratch_release();
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (ctx_tokens, long_ctx);
+    }
+}
+
 static REQ_N: AtomicUsize = AtomicUsize::new(0);
-static LONG_DONE: AtomicBool = AtomicBool::new(false);
+static DONE_4K: AtomicBool = AtomicBool::new(false);
+static DONE_12K: AtomicBool = AtomicBool::new(false);
+
+/// 表を出す文脈長の段 (1 段目: 3,826 token 級 / 2 段目: 14,018 token 級)。
+/// lab の depth8k は 3,826 と 14,018 なので、両方が 1 回ずつ入るように取る。
+pub const CTX_STAGE_1: usize = 3072;
+pub const CTX_STAGE_2: usize = 12288;
 
 /// このリクエストの後で表を出すか (純関数)。
 ///
-/// 出すのは **1 本目の後** と、**長い文脈 (`ctx >= long_ctx`) の最初の 1 回**
-/// だけ (`long_done` が既に真なら出さない)。毎リクエスト出すとログが埋まる。
-pub fn should_print_after(n: usize, ctx: usize, long_ctx: usize, long_done: bool) -> bool {
-    n == 1 || (ctx >= long_ctx && !long_done)
+/// - 1 本目の後は必ず出す。
+/// - 長い文脈は段ごとに 1 回だけ (`CTX_STAGE_1` / `CTX_STAGE_2`)。
+///   戻り値は「2 段目か」。
+/// - 毎リクエスト出すとログが埋まるので、これで最大 3 表。
+pub fn print_decision(n: usize, ctx: usize, done_4k: bool, done_12k: bool) -> Option<bool> {
+    if n == 1 {
+        return Some(false);
+    }
+    if ctx >= CTX_STAGE_2 && !done_12k {
+        return Some(true);
+    }
+    if ctx >= CTX_STAGE_1 && !done_4k {
+        return Some(false);
+    }
+    None
 }
 
-/// リクエスト完了時に呼ぶ。**1 本目の後**と、**長い文脈 (>= `long_ctx`) の
-/// 最初の 1 回**だけ表を出す (毎リクエスト出すとログが埋まる)。
-pub fn request_end(ctx_tokens: usize, long_ctx: usize, dev: Option<(usize, usize)>) {
+/// リクエスト完了時に呼ぶ。1 本目の後と、長い文脈の段ごとに 1 回だけ表を出す。
+pub fn request_end(ctx_tokens: usize, _long_ctx: usize, dev: Option<(usize, usize)>) {
     if !audit_on() {
         return;
     }
     let n = REQ_N.fetch_add(1, Ordering::Relaxed) + 1;
-    let long_done = LONG_DONE.load(Ordering::Relaxed);
-    if !should_print_after(n, ctx_tokens, long_ctx, long_done) {
+    let d4 = DONE_4K.load(Ordering::Relaxed);
+    let d12 = DONE_12K.load(Ordering::Relaxed);
+    let Some(is_stage2) = print_decision(n, ctx_tokens, d4, d12) else {
         return;
+    };
+    if ctx_tokens >= CTX_STAGE_1 {
+        DONE_4K.store(true, Ordering::Relaxed);
     }
-    if ctx_tokens >= long_ctx {
-        LONG_DONE.store(true, Ordering::Relaxed);
+    if ctx_tokens >= CTX_STAGE_2 || is_stage2 {
+        DONE_12K.store(true, Ordering::Relaxed);
     }
-    print_table(
-        &format!("request #{n} の後 (ctx={ctx_tokens})"),
-        dev,
-    );
+    print_table(&format!("request #{n} の後 (ctx={ctx_tokens})"), dev);
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +364,30 @@ pub fn vram_reserve_mb() -> u64 {
 /// 「予算を本物にする」という変更の本体)。`env_cap > 0` なら小さい方を採る。
 pub fn card_expert_cap(env_cap: usize, total: usize, reserve: usize, others: usize) -> usize {
     let card = total.saturating_sub(reserve).saturating_sub(others);
+    if env_cap == 0 {
+        card
+    } else {
+        env_cap.min(card)
+    }
+}
+
+/// expert の実効上限を**いまの空き**から引く (純関数)。
+///
+/// `card_expert_cap` の `total - others` は `free + residual` (residual =
+/// context + JIT + 断片) に等しいが、prefill の一時バッファのように
+/// 台帳に載らない/一瞬だけ載る分を `free` はそのまま含む。CUDA context と
+/// JIT の実バイトはドライバが公開しないので、**空き**を直接使うほうが確実。
+///
+/// `experts_live` は現在 LRU が持っているバイト数。`cap` を
+/// 「expert 使用量 + (空き - 余裕)」にすると、確保のたびに
+/// 「入れても余裕が残る」ところまでしか expert を増やさない。
+pub fn card_expert_cap_from_free(
+    env_cap: usize,
+    experts_live: usize,
+    free: usize,
+    reserve: usize,
+) -> usize {
+    let card = experts_live.saturating_add(free.saturating_sub(reserve));
     if env_cap == 0 {
         card
     } else {
@@ -432,13 +492,18 @@ mod tests {
         set_force(None);
     }
 
-    /// 表を出すタイミングは「1 本目の後」と「長い文脈の最初の 1 回」だけ。
+    /// 表を出すタイミングは「1 本目の後」と「長い文脈の段ごとに 1 回」。
     #[test]
-    fn table_is_printed_once_for_first_and_once_for_long() {
-        assert!(should_print_after(1, 20, 4096, false), "1 本目は必ず");
-        assert!(!should_print_after(2, 20, 4096, false), "短い 2 本目は出さない");
-        assert!(should_print_after(3, 4096, 4096, false), "長い文脈の最初");
-        assert!(!should_print_after(4, 8000, 4096, true), "2 回目以降は出さない");
+    fn table_prints_at_first_and_each_context_stage_once() {
+        assert_eq!(print_decision(1, 20, false, false), Some(false), "1 本目は必ず");
+        assert_eq!(print_decision(2, 20, false, false), None, "短い 2 本目は出さない");
+        assert_eq!(print_decision(3, 3826, false, false), Some(false), "3.8k で 1 回");
+        assert_eq!(print_decision(4, 3900, true, false), None, "同じ段は出さない");
+        assert_eq!(print_decision(5, 14018, true, false), Some(true), "14k で 1 回");
+        assert_eq!(print_decision(7, 3072, true, true), None, "段 1 も 1 回だけ");
+        assert_eq!(print_decision(6, 14018, true, true), None, "2 回目以降は出さない");
+        // 14k に一気に飛んでも段 2 だけ 1 回。
+        assert_eq!(print_decision(2, 14018, false, false), Some(true));
     }
 
     /// 表の印刷は計測 OFF では何もしない (パニックしないことも見る)。
@@ -476,6 +541,28 @@ mod tests {
         assert_eq!(cap3, total - reserve - others);
         // 他が総量を超えても 0 で止まる (アンダーフローしない)。
         assert_eq!(card_expert_cap(0, total, reserve, total * 2), 0);
+    }
+
+    #[test]
+    fn card_cap_from_free_keeps_the_reserve() {
+        let reserve = 1024usize << 20;
+        // 空きが余裕ちょうど: これ以上 expert を増やさない。
+        assert_eq!(
+            card_expert_cap_from_free(0, 10 << 30, reserve, reserve),
+            10 << 30
+        );
+        // 空きが余裕より 2 GiB 多い: 2 GiB だけ増やせる。
+        assert_eq!(
+            card_expert_cap_from_free(0, 10 << 30, reserve + (2 << 30), reserve),
+            (12 << 30)
+        );
+        // env が小さければ env。
+        assert_eq!(
+            card_expert_cap_from_free(22 << 30, 20 << 30, 8 << 30, reserve),
+            22 << 30
+        );
+        // 空きが余裕を割っていても 0 で止まる (アンダーフローしない)。
+        assert_eq!(card_expert_cap_from_free(0, 10 << 30, 0, reserve), 10 << 30);
     }
 
     #[test]

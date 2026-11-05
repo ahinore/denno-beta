@@ -405,25 +405,39 @@ impl DevBuffer {
                 })
             }
             Err(e) => {
-                // task 149: 他の常駐 (attention のミラー・重み・arena) が原因で
-                // 落ちたときは、expert を追い出して 1 回だけやり直す。追い出せ
-                // なかった (LRU が空 / ロック中) ならそのまま失敗を返す。
-                let freed = crate::model::expert_vram::emergency_free(bytes);
-                if freed == 0 {
-                    return Err(e);
+                // task 149: 他の常駐 (attention のミラー・重み・prefill の
+                // 一時バッファ) が原因で落ちたときは、expert を追い出して
+                // やり直す。1 回目は要求 + 64 MiB、2 回目は全部追い出す
+                // (driver の内部確保ぶんの余裕を残す)。
+                let mut last = e;
+                for margin in [64usize << 20, usize::MAX] {
+                    let want = if margin == usize::MAX {
+                        usize::MAX
+                    } else {
+                        bytes.saturating_add(margin)
+                    };
+                    let freed = crate::model::expert_vram::emergency_free(want);
+                    if freed == 0 {
+                        break;
+                    }
+                    tracing::warn!(
+                        "task149: 確保失敗 → expert を {} MiB 追い出して再試行 ({last:#})",
+                        freed >> 20
+                    );
+                    match Self::raw_alloc(bytes) {
+                        Ok(ptr) => {
+                            crate::mem_audit::note_alloc(tag, bytes.max(1));
+                            return Ok(Self {
+                                ptr,
+                                bytes,
+                                owned: true,
+                                tag,
+                            });
+                        }
+                        Err(e2) => last = e2,
+                    }
                 }
-                tracing::warn!(
-                    "task149: 確保失敗 → expert を {} MiB 追い出して再試行 ({e:#})",
-                    freed >> 20
-                );
-                let ptr = Self::raw_alloc(bytes)?;
-                crate::mem_audit::note_alloc(tag, bytes.max(1));
-                Ok(Self {
-                    ptr,
-                    bytes,
-                    owned: true,
-                    tag,
-                })
+                Err(last)
             }
         }
     }
