@@ -39,11 +39,79 @@ use crate::model::qwen4exp::{
     one, IdentityAttn, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams, SpecGdnSnap,
 };
 use crate::quant::WeightBlocks;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// task 128: SsmLayer インスタンスごとの通し番号 (デバイス状態ストアの鍵)。
+///
+/// アドレス再利用 (ABA) で別モデルのデバイス状態を流用しないための identity。
+/// 構築時 (`from_gguf_with` とテストの構造体リテラル) に 1 回発号する。
+static DEVICE_NONCE: AtomicU64 = AtomicU64::new(1);
+
+/// task 128: SsmLayer インスタンスごとの nonce を発号する (構築時に 1 回だけ)。
+fn next_device_nonce() -> u64 {
+    DEVICE_NONCE.fetch_add(1, Ordering::Relaxed)
+}
+
+// ---- task 128 の診断 (`DENNO_GDN_GPU_CHECK=1`。既定 off・診断専用) ----------
+//
+// decode の最初の数トークンだけ、GPU の層出力と scan 後の状態 (conv / ssm) を
+// CPU 参照と突き合わせて 1 行ずつ出す。数値経路からは読まない (env 未指定では
+// `gdn_gpu_check_on()` の static read 1 回だけ)。
+
+/// 突き合わせる decode トークン数 (1 始まりの窓番号で判定)。
+#[cfg(feature = "cuda")]
+const GDN_CHECK_TOKENS: u64 = 3;
+
+/// 出す行の上限 (層 × トークンで増えるので頭打ちにする)。
+///
+/// task 137: 8 では 1 トークン目の 8 層 (li=0..7) しか見えず、9 層目以降で
+/// 起きた失敗を隠した。36 層を 1 トークンぶん覆える 40 にする (診断専用・
+/// CPU 参照の計算は上限に関係なく走るので、増えるのはログ行だけ)。
+#[cfg(feature = "cuda")]
+const GDN_CHECK_MAX_LINES: u64 = 40;
+
+#[cfg(feature = "cuda")]
+static GDN_CHECK_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// 2 つの f32 列の (最大絶対差, 最初に許容を超えた (添字, gpu, cpu))。
+///
+/// 許容は絶対 1e-4 + 相対 1e-5 (AGENTS.md の標準)。
+#[cfg(feature = "cuda")]
+fn gdn_check_diff(gpu: &[f32], cpu: &[f32]) -> (f64, Option<(usize, f32, f32)>) {
+    let n = gpu.len().min(cpu.len());
+    let mut max_abs = 0f64;
+    let mut first = None;
+    for i in 0..n {
+        let d = (gpu[i] as f64 - cpu[i] as f64).abs();
+        if d > max_abs {
+            max_abs = d;
+        }
+        let tol = 1e-4 + 1e-5 * (cpu[i].abs() as f64);
+        if d > tol && first.is_none() {
+            first = Some((i, gpu[i], cpu[i]));
+        }
+    }
+    (max_abs, first)
+}
+
+/// [`gdn_check_diff`] の第 2 要素をログ用の短い文字列にする。
+#[cfg(feature = "cuda")]
+fn fmt_first(v: &Option<(usize, f32, f32)>) -> String {
+    match v {
+        None => "none".to_string(),
+        Some((i, g, c)) => format!("[{i}] gpu={g:e} cpu={c:e}"),
+    }
+}
 
 /// ssm 層 1 本ぶんの重みと状態。
 pub struct SsmLayer {
     /// 層番号 (`blk.{il}.*`)。診断ダンプのゲートに使う。
     pub il: usize,
+    /// task 128: デバイス状態ストア (`cuda::gdn_decode_submit`) の鍵。
+    /// 構築時に 1 回発号する (アドレス再利用で別インスタンスのデバイス状態を
+    /// 流用しない。cuda.rs の `GdnDecodeKey` 参照)。
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    nonce: u64,
     /// GDN のハイパーパラメータ (`GdnParams::qwen4exp()`)。
     pub p: GdnParams,
     /// [2560 -> 10240] q/k/v の融合投影 (出力順は [q 2048][k 2048][v 6144]) と
@@ -125,6 +193,7 @@ impl SsmLayer {
         let state = GdnState::new(&p);
         Ok(Self {
             il,
+            nonce: next_device_nonce(),
             p,
             qkv_gate,
             beta_alpha,
@@ -147,6 +216,39 @@ impl SsmLayer {
             );
         }
         let prof = crate::model::qwen4exp::q4prof::enabled();
+
+        // task 128: decode 窓 (`gdn_gpu_win`。`forward_token_at` が nt == 1 で開ける)
+        // の中では、qkv_gate GEMV → GDN scan → attn_out GEMV を 1 つの GPU
+        // submission (`crate::cuda::gdn_decode_submit`) にまとめて出す
+        // (beta/alpha だけ CPU f32 で先に計算する)。`Some(out)` で GPU 完走
+        // (この層の CPU scan は省略)、`None` で従来の CPU 経路に落ちる
+        // (fail-closed)。off / 窓の外 / cuda feature 無しでは何も呼ばれない。
+        #[cfg(feature = "cuda")]
+        if crate::model::qwen4exp::gdn_gpu_win::active() && crate::cuda::gdn_gpu_scan_on() {
+            if let Some(out) = self.forward_token_gpu(cur, prof)? {
+                return Ok(out);
+            }
+        }
+
+        // task 128: CPU 経路が state を読む前に、デバイスが正ならホストへ回復する
+        // (直前の decode トークンを GPU が処理して device_authoritative になった
+        // あとに、GPU が decline した / 窓が閉じた (バッチ prefill・spec verify)
+        // とき)。HostCurrent = エントリ無し or ホスト正で no-op。
+        #[cfg(feature = "cuda")]
+        if crate::cuda::gdn_gpu_scan_on() {
+            match crate::cuda::gdn_decode_state_take(self.nonce, self.il) {
+                crate::cuda::GdnDecodeFlush::HostCurrent => {}
+                crate::cuda::GdnDecodeFlush::Recovered(conv, ssm) => {
+                    self.state.conv = conv;
+                    self.state.ssm = ssm;
+                }
+                crate::cuda::GdnDecodeFlush::Lost => bail!(
+                    "SsmLayer::forward_token: gdn decode 状態の回復 (D2H) に失敗 (li={}) → 要求を落とす",
+                    self.il
+                ),
+            }
+        }
+
         let t = std::time::Instant::now();
         // task 72: qkv と z (出力ゲート) は同じ入力 cur を取るので 1 本の GEMV に
         // まとめる。行は独立・1 行の中の加算順は連結しても変わらないので、
@@ -209,6 +311,253 @@ impl SsmLayer {
         Ok(out)
     }
 
+
+    /// task 128: decode 窓内の GPU submission 経路 ([`Self::forward_token`] だけが
+    /// 呼ぶ。窓 + `DENNO_GDN_GPU_SCAN` の確認は呼び出し側)。
+    ///
+    /// - `Ok(Some(out))`: GPU で qkv_gate GEMV → scan → attn_out GEMV まで完走。
+    ///   state はデバイス正本 (ホストは 1 トークン古い)。計測はここで積む。
+    /// - `Ok(None)`: GPU が decline した (発行前の失敗)。呼び出し側は CPU 経路へ
+    ///   落ちる。**計測は 1 つも積まない** (CPU 経路が同じ区間を積むので二重に
+    ///   数えない。beta/alpha だけ二度計算になるが F32 の 2560x48 で微細)。
+    /// - scan 発行後の失敗で状態回復できたときは、ホスト state へ写して `Ok(None)`
+    ///   を返す (scan 出力 y が失われるので CPU で計算し直す)。
+    /// - `Err`: 状態回復にも失敗した (poisoned)。要求を落とす。
+    #[cfg(feature = "cuda")]
+    fn forward_token_gpu(&mut self, cur: &[f32], prof: bool) -> Result<Option<Vec<f32>>> {
+        // task 128 の診断 (`DENNO_GDN_GPU_CHECK=1`): 最初の数トークンだけ
+        // CPU 参照と突き合わせる。参照を作る前にホスト state を最新化する
+        // (直前のトークンを GPU が処理していればホストは 1 トークン古い)。
+        let check = crate::cuda::gdn_gpu_check_on()
+            && crate::model::qwen4exp::gdn_gpu_win::token_index() <= GDN_CHECK_TOKENS;
+        let mut ref_state = if check {
+            if let crate::cuda::GdnDecodeFlush::Recovered(conv, ssm) =
+                crate::cuda::gdn_decode_state_take(self.nonce, self.il)
+            {
+                self.state.conv = conv;
+                self.state.ssm = ssm;
+            }
+            Some(self.state.clone())
+        } else {
+            None
+        };
+
+        // beta/alpha は CPU F32 のまま (GPU 経路でも値を変えない。Req の契約)。
+        let t_ba = std::time::Instant::now();
+        let mut ba = vec![0f32; self.beta_alpha.n()];
+        self.beta_alpha.gemv_concat_into("ssm_beta", cur, &mut ba)?;
+        let beta = &ba[self.beta_alpha.range(0)];
+        let alpha = &ba[self.beta_alpha.range(1)];
+
+        let qkv_units = self.gdn_qkv_units();
+        let t_sub = std::time::Instant::now();
+        let res = {
+            let req = self.gdn_decode_req(cur, beta, alpha, &qkv_units);
+            crate::cuda::gdn_decode_submit(&req)
+        };
+        match res {
+            crate::cuda::GdnDecodeRes { poisoned: true, .. } => bail!(
+                "SsmLayer::forward_token: gdn decode submission の状態回復に失敗 (li={}) → 要求を落とす",
+                self.il
+            ),
+            crate::cuda::GdnDecodeRes {
+                out: Some(out),
+                state_dev,
+                ..
+            } => {
+                // 診断: CPU 参照 (qkv GEMV → scan → attn_out) と突き合わせる。
+                if let (Some(mut st), Some((conv_gpu, ssm_gpu))) = (ref_state.take(), state_dev) {
+                    self.gdn_check_report(cur, &mut st, &out, &conv_gpu, &ssm_gpu, beta, alpha);
+                }
+                if prof {
+                    crate::model::qwen4exp::q4prof::add(
+                        &crate::model::qwen4exp::q4prof::A_GATE,
+                        t_ba,
+                    );
+                    crate::model::qwen4exp::q4prof::add(
+                        &crate::model::qwen4exp::q4prof::A_GDN,
+                        t_sub,
+                    );
+                }
+                crate::model::qwen4exp::attn_kprof::note_gate(t_ba);
+                // GPU 側の qkv / attn_out が GPU で走ったことを attn_kprof に見せる
+                // (時間はこの submission の壁時計からは切り分けられないので ~0 を
+                // 積む。合計 ms は scan バケット側 (q4prof A_GDN) が持つ)。
+                crate::cuda::set_last_linear_ran_on_gpu(true);
+                let t_mark = std::time::Instant::now();
+                crate::model::qwen4exp::attn_kprof::note_qkv(t_mark);
+                crate::model::qwen4exp::attn_kprof::note_out(t_mark);
+                Ok(Some(out))
+            }
+            crate::cuda::GdnDecodeRes {
+                out: None,
+                state_back: Some((conv, ssm)),
+                ..
+            } => {
+                // scan 発行後の失敗: 新状態 (デバイス正本だったぶんを含む) を
+                // ホストへ戻して CPU 経路へ落ちる。このトークンは CPU で計算し直す。
+                self.state.conv = conv;
+                self.state.ssm = ssm;
+                Ok(None)
+            }
+            crate::cuda::GdnDecodeRes { out: None, .. } => Ok(None),
+        }
+    }
+
+    /// task 128: qkv_gate の「1 発 GEMV の単位」を呼び出し順で列挙する
+    /// ([`FusedLinear::gemv_units`] + 出力の行オフセット =
+    /// [`FusedLinear::gemv_unit_out_offset`]。連結バッファ内の置き場所は
+    /// `gemv_concat_into` と同一規約)。
+    ///
+    /// task 140: 以前は行オフセットに `range(i).start` を使っていた。連結済みの
+    /// ときの単位は連結バッファ全体 (先頭から書く) なので、gate が qkv より前に
+    /// 置かれた層 (写しなし連結はファイル順を `ranges` に保存する) では
+    /// `range(0).start != 0` になり、qkv GEMV の出力が **バッファの終端を越えた
+    /// 位置**へ書かれていた (t140a のラボで li=41 の qkv_gemv[0] が CUDA error
+    /// 700。同じ重み・同じ形状は intercept 経路では正常)。
+    #[cfg(feature = "cuda")]
+    fn gdn_qkv_units(&self) -> Vec<(crate::cuda::GdnGgufUnit<'_>, usize)> {
+        self.qkv_gate
+            .gemv_units()
+            .iter()
+            .enumerate()
+            .map(|(i, u)| {
+                (
+                    crate::cuda::GdnGgufUnit {
+                        uid: u.uid(),
+                        ty: u.ty(),
+                        blocks: u.blocks().as_slice(),
+                        k: u.k(),
+                        n: u.n(),
+                    },
+                    self.qkv_gate.gemv_unit_out_offset(i),
+                )
+            })
+            .collect()
+    }
+
+    /// task 128: [`crate::cuda::gdn_decode_submit`] への要求を組む
+    /// (field の意味は cuda.rs の `GdnDecodeReq` doc)。
+    #[cfg(feature = "cuda")]
+    fn gdn_decode_req<'a>(
+        &'a self,
+        cur: &'a [f32],
+        beta: &'a [f32],
+        alpha: &'a [f32],
+        qkv_units: &'a [(crate::cuda::GdnGgufUnit<'a>, usize)],
+    ) -> crate::cuda::GdnDecodeReq<'a> {
+        crate::cuda::GdnDecodeReq {
+            nonce: self.nonce,
+            li: self.il,
+            tok: crate::model::qwen4exp::gdn_gpu_win::token_index(),
+            n_embd: self.p.n_embd,
+            qkv_total: self.qkv_gate.n(),
+            qkv_row_start: self.qkv_gate.range(0).start,
+            z_row_start: self.qkv_gate.range(1).start,
+            qkv_units,
+            out_unit: crate::cuda::GdnGgufUnit {
+                uid: self.w_out.uid(),
+                ty: self.w_out.ty(),
+                blocks: self.w_out.blocks().as_slice(),
+                k: self.w_out.k(),
+                n: self.w_out.n(),
+            },
+            cur,
+            beta,
+            alpha,
+            conv_host: &self.state.conv,
+            ssm_host: &self.state.ssm,
+            wconv: &self.conv1d,
+            wa: &self.ssm_a,
+            wdt: &self.ssm_dt,
+            wnorm: &self.ssm_norm,
+            nk: self.p.n_k_heads,
+            nv: self.p.n_v_heads,
+            dk: self.p.head_k_dim,
+            dv: self.p.head_v_dim,
+            conv_dim: self.p.conv_dim(),
+            d_conv: self.p.d_conv,
+            eps: self.p.eps,
+        }
+    }
+
+    /// task 128 の診断 (`DENNO_GDN_GPU_CHECK=1`): このトークンの GPU 結果
+    /// (層出力 / scan 後の conv・ssm) を CPU 参照と突き合わせ、最大差と
+    /// **最初に違った要素**を 1 行で出す。
+    ///
+    /// 比較の許容は絶対 1e-4 + 相対 1e-5 (AGENTS.md の標準)。行数は
+    /// `GDN_CHECK_MAX_LINES` で頭打ちにする (診断でログを埋めない)。
+    #[cfg(feature = "cuda")]
+    fn gdn_check_report(
+        &self,
+        cur: &[f32],
+        st: &mut GdnState,
+        out_gpu: &[f32],
+        conv_gpu: &[f32],
+        ssm_gpu: &[f32],
+        beta: &[f32],
+        alpha: &[f32],
+    ) {
+        let n = GDN_CHECK_LINES.fetch_add(1, Ordering::Relaxed);
+        if n >= GDN_CHECK_MAX_LINES {
+            return;
+        }
+        // CPU 参照 (通常の CPU 経路と同じ呼び出し: qkv GEMV は intercept 込み)。
+        let mut qkvg = vec![0f32; self.qkv_gate.n()];
+        if let Err(e) = self.qkv_gate.gemv_concat_into("qkv", cur, &mut qkvg) {
+            tracing::info!("[gdn-gpu-check] li={} CPU 参照の GEMV に失敗: {e:#}", self.il);
+            return;
+        }
+        let qkv = &qkvg[self.qkv_gate.range(0)];
+        let z = &qkvg[self.qkv_gate.range(1)];
+        let cw = GdnCore {
+            conv1d: &self.conv1d,
+            ssm_a: &self.ssm_a,
+            ssm_dt: &self.ssm_dt,
+            ssm_norm: &self.ssm_norm,
+        };
+        let y = gdn::forward_token_core_gate(
+            &self.p,
+            &cw,
+            qkv,
+            z,
+            beta,
+            alpha,
+            st,
+            gdn::GateKind::Sigmoid,
+        );
+        let mut out_cpu = vec![0f32; self.p.n_embd];
+        if let Err(e) = self.w_out.gemv_label("attn_out", &y, &mut out_cpu) {
+            tracing::info!("[gdn-gpu-check] li={} CPU 参照の attn_out に失敗: {e:#}", self.il);
+            return;
+        }
+        let (max_out, first_out) = gdn_check_diff(out_gpu, &out_cpu);
+        let (max_conv, first_conv) = gdn_check_diff(conv_gpu, &st.conv);
+        let (max_ssm, first_ssm) = gdn_check_diff(ssm_gpu, &st.ssm);
+        tracing::info!(
+            "[gdn-gpu-check] tok={} li={} maxabs out={max_out:.3e} conv={max_conv:.3e} ssm={max_ssm:.3e} first out={} conv={} ssm={}",
+            crate::model::qwen4exp::gdn_gpu_win::token_index(),
+            self.il,
+            fmt_first(&first_out),
+            fmt_first(&first_conv),
+            fmt_first(&first_ssm),
+        );
+    }
+
+    /// task 128: 系列の切れ目で GDN 状態を 0 に戻す ([`SsmAttn::reset`] が呼ぶ)。
+    ///
+    /// ホスト state を 0 にすると同時に、**デバイス側のコピーを無効化する**
+    /// (`gdn_decode_state_invalidate`)。無効化を落とすと、次の CPU 経路
+    /// (prefill の `forward_batch`) の `take` が前の系列の状態をホストへ戻し、
+    /// モデル使い回しで系列を跨いで状態が化ける。
+    pub fn reset_state(&mut self) {
+        #[cfg(feature = "cuda")]
+        if crate::cuda::gdn_gpu_scan_on() {
+            crate::cuda::gdn_decode_state_invalidate_counted(self.nonce, self.il);
+        }
+        self.state.reset();
+    }
+
     /// チャンクぶんの入力をまとめて回す (バッチ prefill 用)。
     ///
     /// 変えるのは行列積と GDN 本体の呼び方だけ:
@@ -250,6 +599,23 @@ impl SsmLayer {
         let nh = self.p.n_v_heads;
 
         let t = crate::model::qwen4exp::q4prof::stamp();
+        // task 128: バッチ経路 (prefill / spec verify) が state を上書きする前に、
+        // デバイスが正ならホストへ回復する (GPU decode のあとにバッチ経路が来ると
+        // ここで戻る。HostCurrent は no-op。ゲート off では呼ばれない)。
+        #[cfg(feature = "cuda")]
+        if crate::cuda::gdn_gpu_scan_on() {
+            match crate::cuda::gdn_decode_state_take(self.nonce, self.il) {
+                crate::cuda::GdnDecodeFlush::HostCurrent => {}
+                crate::cuda::GdnDecodeFlush::Recovered(conv, ssm) => {
+                    self.state.conv = conv;
+                    self.state.ssm = ssm;
+                }
+                crate::cuda::GdnDecodeFlush::Lost => bail!(
+                    "SsmLayer::forward_batch: gdn decode 状態の回復 (D2H) に失敗 (li={}) → 要求を落とす",
+                    self.il
+                ),
+            }
+        }
         // task 72: qkv と z、beta と alpha をそれぞれ 1 回のバッチ GEMV にまとめる。
         // トークンごとの値は個別に呼んだ場合と同じ (行の独立)。
         let mut qkv = vec![0f32; nt * qd];
@@ -647,7 +1013,11 @@ impl LayerAttn for SsmAttn {
     /// uid 登録は触らない (GPU 常駐の重みを再 upload させないのが目的)。
     fn reset(&mut self) {
         for l in self.layers.iter_mut().flatten() {
-            l.state.reset();
+            // task 128: reset はホスト state を 0 に戻す。デバイス側のコピーが
+            // 正本のまま残ると、次の prefill の `take` が **古い状態** をホストへ
+            // 戻してしまい、系列を跨いで状態が化ける (br114 で全トークンが同じ
+            // 壊れ方をした `!!!!` の原因)。必ずデバイスを無効化する。
+            l.reset_state();
         }
         self.full.reset();
     }
@@ -665,7 +1035,32 @@ impl LayerAttn for SsmAttn {
             gdn: self
                 .layers
                 .iter()
-                .map(|l| l.as_ref().map(|s| (s.state.conv.clone(), s.state.ssm.clone())))
+                .map(|l| {
+                    l.as_ref().map(|s| {
+                        // task 128: デバイスが正なら (直前の decode トークンを GPU が
+                        // 処理した直後なら) スナップショットはデバイスの値を取る。
+                        // 読み取り専用 (正本フラグを動かさない) なので、snapshot の
+                        // あとも decode を続けるときデバイスは再シード不要。
+                        // Lost = D2H 失敗 (GPU 不調)。エラーを記録してホストの値で
+                        // 代替する (GPU が壊れたままなら次の submit が要求を落とす)。
+                        #[cfg(feature = "cuda")]
+                        if crate::cuda::gdn_gpu_scan_on() {
+                            match crate::cuda::gdn_decode_state_read(s.nonce, s.il) {
+                                crate::cuda::GdnDecodeRead::Device(conv, ssm) => {
+                                    return (conv, ssm);
+                                }
+                                crate::cuda::GdnDecodeRead::Lost => {
+                                    tracing::error!(
+                                        "[gdn-gpu-scan] snapshot の状態読み取り (D2H) に失敗 (li={}) → ホスト state で代替",
+                                        s.il
+                                    );
+                                }
+                                crate::cuda::GdnDecodeRead::HostCurrent => {}
+                            }
+                        }
+                        (s.state.conv.clone(), s.state.ssm.clone())
+                    })
+                })
                 .collect(),
             full: self.full.spec_snapshot(),
         })
@@ -687,6 +1082,13 @@ impl LayerAttn for SsmAttn {
             if let (Some(layer), Some((conv, ssm))) = (l.as_mut(), st) {
                 layer.state.conv = conv.clone();
                 layer.state.ssm = ssm.clone();
+                // task 128: ホスト state をスナップショットで上書きしたので、デバイス
+                // 側のコピー (あれば) はもう正でない。次の decode 1 トークン目で
+                // ホストから再シードする。
+                #[cfg(feature = "cuda")]
+                if crate::cuda::gdn_gpu_scan_on() {
+                    crate::cuda::gdn_decode_state_invalidate(layer.nonce, layer.il);
+                }
             }
         }
         self.full.spec_restore(&*s.full)
@@ -747,6 +1149,7 @@ mod tests {
         let vd = p.value_dim();
         let layer = SsmLayer {
             il: 0,
+            nonce: next_device_nonce(),
             p: p.clone(),
             qkv_gate: FusedLinear::concat(vec![
                 f32_linear(p.n_embd, p.qkv_dim(), &mut rnd),
@@ -927,5 +1330,197 @@ mod tests {
         assert!(line.contains("out calls=3"), "out が積まれていない: {line}");
         crate::model::qwen4exp::attn_kprof::reset();
         crate::model::qwen4exp::attn_kprof::set_for_test(false);
+    }
+
+    // ---- task 128: GPU scan の差し込み (CPU で確認できる分) ----------------
+
+    /// task 128 のテストで立てた強制フラグを panic でも必ず戻す。
+    #[cfg(feature = "cuda")]
+    struct GdnGpuScanGuard;
+    #[cfg(feature = "cuda")]
+    impl GdnGpuScanGuard {
+        fn new() -> Self {
+            crate::cuda::gdn_gpu_scan_set_for_test(false);
+            crate::model::qwen4exp::gdn_gpu_win::set_window_for_test(false);
+            crate::cuda::gdn_invalidate_calls_reset_for_test();
+            Self
+        }
+    }
+    #[cfg(feature = "cuda")]
+    impl Drop for GdnGpuScanGuard {
+        fn drop(&mut self) {
+            crate::cuda::gdn_gpu_scan_set_for_test(false);
+            crate::model::qwen4exp::gdn_gpu_win::set_window_for_test(false);
+        }
+    }
+
+    /// task 128: ゲート off (既定) では decode 窓を開けても経路が 1 バイトも
+    /// 変わらない。GPU 分岐にも state 回復にも入らない (ストアは確保されない)。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gdn_gpu_scan_off_window_open_bit_identical() {
+        let _g = GdnGpuScanGuard::new();
+        let (mut win, p) = small_layer();
+        let (mut base, _) = small_layer();
+        let curs = inputs(&p, 5);
+        for (t, c) in curs.iter().enumerate() {
+            crate::model::qwen4exp::gdn_gpu_win::set_window_for_test(true);
+            let a = win.forward_token(c).expect("窓あり");
+            crate::model::qwen4exp::gdn_gpu_win::set_window_for_test(false);
+            let b = base.forward_token(c).expect("窓なし");
+            assert_eq!(bits(&a), bits(&b), "トークン {t}: ゲート off で窓の有無が違う");
+        }
+        assert_eq!(bits(&win.state.ssm), bits(&base.state.ssm), "ssm 状態");
+        assert_eq!(bits(&win.state.conv), bits(&base.state.conv), "conv 状態");
+        assert_eq!(
+            crate::cuda::gdn_decode_state_entry_count(),
+            0,
+            "ゲート off なのにデバイス状態ストアが確保された"
+        );
+        assert_eq!(
+            crate::cuda::gdn_invalidate_calls_for_test(),
+            0,
+            "ゲート off なのに reset の無効化が走った"
+        );
+    }
+
+    /// task 128: ゲート強制 on + CUDA 無しのコンテナでは、decode 窓の中でも CPU
+    /// 経路に落ちる (fail-closed)。出力は窓なしの CPU 経路とビット一致し、
+    /// デバイス状態ストアも確保されない (submit が cuda_enabled で戻る)。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gdn_gpu_scan_on_no_cuda_falls_back() {
+        let _g = GdnGpuScanGuard::new();
+        crate::cuda::gdn_gpu_scan_set_for_test(true);
+        let (mut layer, p) = small_layer();
+        let (mut base, _) = small_layer();
+        let cur = inputs(&p, 1).remove(0);
+
+        crate::model::qwen4exp::gdn_gpu_win::set_window_for_test(true);
+        let got = layer.forward_token(&cur).expect("窓あり + ゲート on");
+        crate::model::qwen4exp::gdn_gpu_win::set_window_for_test(false);
+
+        let want = base.forward_token(&cur).expect("窓なし");
+        assert_eq!(bits(&got), bits(&want), "CPU フォールバックが基準と違う");
+        assert_eq!(
+            crate::cuda::gdn_decode_state_entry_count(),
+            0,
+            "CUDA 無しでデバイス状態ストアが確保された"
+        );
+        assert_eq!(bits(&layer.state.ssm), bits(&base.state.ssm), "ssm 状態");
+        assert_eq!(bits(&layer.state.conv), bits(&base.state.conv), "conv 状態");
+    }
+
+    /// task 128: `reset_state` が (ゲート on のとき) デバイス側のコピーを無効化し、
+    /// ホスト state は 0 に戻ること。ゲート off では無効化を呼ばない。
+    ///
+    /// 無効化を落とすと、reset 後の CPU 経路 (prefill の take) が前の系列の
+    /// 状態をホストへ戻してしまう — これが br114 の `!!!!` の原因。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gdn_reset_state_invalidates_device_copy() {
+        let _g = GdnGpuScanGuard::new();
+        let (mut layer, p) = small_layer();
+        let cur = inputs(&p, 2);
+        for c in &cur {
+            let _ = layer.forward_token(c).expect("forward_token");
+        }
+        assert!(layer.state.ssm.iter().any(|&v| v != 0.0), "状態が進んでいない");
+
+        // ゲート off: 無効化は走らない (ストアが存在しないので no-op のまま)。
+        layer.reset_state();
+        assert_eq!(crate::cuda::gdn_invalidate_calls_for_test(), 0);
+        assert!(layer.state.conv.iter().all(|&v| v == 0.0), "conv が 0 でない");
+        assert!(layer.state.ssm.iter().all(|&v| v == 0.0), "ssm が 0 でない");
+
+        // ゲート on: reset のたびに無効化が 1 回走る。
+        crate::cuda::gdn_gpu_scan_set_for_test(true);
+        for c in &cur {
+            let _ = layer.forward_token(c).expect("forward_token (ゲート on)");
+        }
+        layer.reset_state();
+        assert_eq!(
+            crate::cuda::gdn_invalidate_calls_for_test(),
+            1,
+            "ゲート on の reset で無効化が走っていない"
+        );
+        assert!(layer.state.ssm.iter().all(|&v| v == 0.0), "ssm が 0 でない");
+    }
+
+    /// task 128: Req 組み立てが実モデルの寸法と一致すること (qwen4exp 実形:
+    /// n_embd 2560 / qkv 10240 + gate 6144 / out [6144, 2560] / nk 16 / nv 48 /
+    /// dk = dv 128 / conv 4)。重みは実モデルと同じ Q8_0 (ゼロブロック) で、
+    /// qkv+gate が 1 本に融合した実形を再現する。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gdn_decode_req_matches_real_model_dims() {
+        let _g = GdnGpuScanGuard::new();
+        let p = GdnParams::qwen4exp();
+        let q8_zero = |k: usize, n: usize| {
+            let blocks = k * n / 32;
+            GgufLinear::new(
+                GgmlType::Q8_0,
+                k,
+                n,
+                WeightBlocks::from_vec(vec![0u8; blocks * 34]),
+            )
+            .expect("Q8_0 linear")
+        };
+        let mut rnd = lcg_rng(0x5150_4154_4153_4b45);
+        let layer = SsmLayer {
+            il: 7,
+            nonce: next_device_nonce(),
+            p: p.clone(),
+            qkv_gate: FusedLinear::concat(vec![
+                q8_zero(p.n_embd, p.qkv_dim()),
+                q8_zero(p.n_embd, p.value_dim()),
+            ]),
+            beta_alpha: FusedLinear::concat(vec![
+                f32_linear(p.n_embd, p.n_v_heads, &mut rnd),
+                f32_linear(p.n_embd, p.n_v_heads, &mut rnd),
+            ]),
+            w_out: q8_zero(p.value_dim(), p.n_embd),
+            conv1d: vec![0f32; p.conv_dim() * p.d_conv],
+            ssm_a: vec![-0.05; p.n_v_heads],
+            ssm_dt: vec![0.0; p.n_v_heads],
+            ssm_norm: vec![1.0; p.head_v_dim],
+            state: GdnState::new(&p),
+        };
+        assert!(
+            layer.qkv_gate.is_fused(),
+            "実モデルと同じ Q8_0+Q8_0 が融合していない"
+        );
+
+        let cur = vec![0.5f32; p.n_embd];
+        let beta = vec![0.25f32; p.n_v_heads];
+        let alpha = vec![0.75f32; p.n_v_heads];
+        let qkv_units = layer.gdn_qkv_units();
+        let req = layer.gdn_decode_req(&cur, &beta, &alpha, &qkv_units);
+
+        assert!(req.nonce != 0, "nonce が未発号");
+        assert_eq!(req.li, 7);
+        assert_eq!(req.n_embd, 2560);
+        assert_eq!(req.qkv_total, 16384, "qkv 10240 + gate 6144");
+        assert_eq!(req.qkv_row_start, 0);
+        assert_eq!(req.z_row_start, 10240, "z は qkv 行数のあと");
+        assert_eq!(req.qkv_units.len(), 1, "実モデルは qkv+gate 連結 1 発");
+        let (u, row) = &req.qkv_units[0];
+        assert_eq!(*row, 0);
+        assert_eq!((u.k, u.n), (2560, 16384));
+        assert_eq!(u.ty, GgmlType::Q8_0);
+        assert_eq!((req.out_unit.k, req.out_unit.n), (6144, 2560));
+        assert_eq!(req.cur.len(), 2560);
+        assert_eq!(req.beta.len(), 48);
+        assert_eq!(req.alpha.len(), 48);
+        assert_eq!(req.conv_host.len(), 10240 * 3, "conv [conv_dim][d_conv-1]");
+        assert_eq!(req.ssm_host.len(), 48 * 128 * 128, "ssm [nv][dk][dv]");
+        assert_eq!(req.wconv.len(), 10240 * 4);
+        assert_eq!(req.wa.len(), 48);
+        assert_eq!(req.wdt.len(), 48);
+        assert_eq!(req.wnorm.len(), 128);
+        assert_eq!((req.nk, req.nv), (16, 48));
+        assert_eq!((req.dk, req.dv), (128, 128));
+        assert_eq!((req.conv_dim, req.d_conv), (10240, 4));
+        assert_eq!(req.eps, 1e-6f32);
     }
 }

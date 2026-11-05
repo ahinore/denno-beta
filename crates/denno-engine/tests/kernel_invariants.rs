@@ -550,10 +550,12 @@ let d = defines(GDN_SRC);
     // o_sh の後のスカラー領域 (5 floats)。sc の基点が o_sh + dv であること。
     let sc_decl_3 = "float* sc = sh + 3 * dk + dv;";
     let sc_decl_2 = "float* sc = sh + 2 * dk;";
+    // task 137 が qwen4exp の decode 用 scan (`dno_gdn_scan_sig`) を足したので
+    // 4 本になった (レイアウト宣言は dno_gdn_scan と 1 行も変えていない)。
     assert_eq!(
         GDN_SRC.matches(sc_decl_3).count(),
-        3,
-        "gdn.cu の sc (q/k/v/o 付きレイアウト) が 3 カーネルで揃っていない"
+        4,
+        "gdn.cu の sc (q/k/v/o 付きレイアウト) が 4 カーネルで揃っていない"
     );
     assert_eq!(
         GDN_SRC.matches(sc_decl_2).count(),
@@ -562,11 +564,12 @@ let d = defines(GDN_SRC);
     );
 
     // ---- (2) scalars[5] の割り当て ----
+    // task 137 が dno_gdn_scan_sig を足したので 4 本 (割り当ては同一)。
     assert_eq!(
         GDN_SRC
             .matches("sc[0]=q_inv sc[1]=k_inv sc[2]=eg sc[3]=beta sc[4]=o_inv")
             .count(),
-        3,
+        4,
         "gdn.cu の sc[] の意味 (index 割り当て) が変わった: \
          dno_gdn_step の sc[2]/sc[3]/sc[4] とホストの順序を確認すること"
     );
@@ -619,14 +622,14 @@ let d = defines(GDN_SRC);
     );
 
     // ---- (3) ホスト側の smem 計算がカーネルと一致すること ----
-    // cuda.rs は `let shmem = ((3 * dk + dv + 5) * 4) as u32;` を 2 箇所
-    // (gdn_scan_impl / gdn_scan_batch) で、chunk 経路は `shmem_scan` の名前で
-    // 同じ式を使う (下で個別に確認する)。
+    // cuda.rs は `let shmem = ((3 * dk + dv + 5) * 4) as u32;` を 3 箇所
+    // (gdn_scan_impl / gdn_scan_batch / task 128 の gdn_decode_submit) で、
+    // chunk 経路は `shmem_scan` の名前で同じ式を使う (下で個別に確認する)。
     let host_expr = "let shmem = ((3 * dk + dv + 5) * 4) as u32;";
     let n_host = CUDA_RS.matches(host_expr).count();
     assert_eq!(
-        n_host, 2,
-        "cuda.rs の gdn smem 計算 (`{host_expr}`) が {n_host} 箇所 (期待 2): \
+        n_host, 3,
+        "cuda.rs の gdn smem 計算 (`{host_expr}`) が {n_host} 箇所 (期待 3): \
          増減したなら本テストの期待値を更新すること"
     );
     // chunk 経路は別名 (`shmem_scan`) で同じ式。
@@ -734,6 +737,155 @@ fn gdn_pre_sm_keeps_step_order_of_local_version() {
         "共有メモリ版 pass 1 の演算列 (decay/内積/更新の順序) が旧版と違う"
     );
 }
+/// `__global__ void NAME(` から **列 0 の `}`** (関数の終端) までを、
+/// コメント行と空行を除いた trim 済み行リストで返す。task 137 の
+/// `dno_gdn_scan` vs `dno_gdn_scan_sig` の本文比較だけが使う
+/// (`kernel_body_lines` は次の `__global__` までを取るので、間に別の
+/// device ヘルパがあると末尾が混ざる)。
+fn kernel_lines_to_close(src: &str, name: &str) -> Vec<String> {
+    let pat = format!("__global__ void {name}(");
+    let start = src
+        .find(&pat)
+        .unwrap_or_else(|| panic!("gdn.cu にカーネル {name} が無い"));
+    let mut out = Vec::new();
+    for line in src[start..].lines() {
+        let s = line.trim();
+        if s.is_empty() || s.starts_with("//") {
+            continue;
+        }
+        out.push(s.to_string());
+        // 関数の終端はインデントされていない閉じ括弧 (内側の塊は字下げされる)。
+        if line.starts_with('}') {
+            break;
+        }
+    }
+    out
+}
+
+/// task 137: qwen4exp 用の `dno_gdn_scan_sig` が `dno_gdn_scan` と
+/// **関数名と最終行のゲート式の 2 行だけ** 違うことを固定する。
+///
+/// この 2 行以外が動くと「dno_gdn_scan と同じ演算列 (丸め順・同期・列担当) で
+/// ゲートだけ sigmoid」という移植の根拠が消える。GPU 無しでも静的に検査できる。
+#[test]
+fn gdn_scan_sig_differs_from_scan_only_in_output_gate() {
+    let plain = kernel_lines_to_close(GDN_SRC, "dno_gdn_scan");
+    let sig = kernel_lines_to_close(GDN_SRC, "dno_gdn_scan_sig");
+    assert_eq!(
+        plain.len(),
+        sig.len(),
+        "dno_gdn_scan と dno_gdn_scan_sig の本文行数が違う ({} vs {})",
+        plain.len(),
+        sig.len()
+    );
+    let diffs: Vec<(&str, &str)> = plain
+        .iter()
+        .zip(sig.iter())
+        .filter(|(a, b)| a != b)
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    assert_eq!(
+        diffs.len(),
+        2,
+        "dno_gdn_scan と dno_gdn_scan_sig の差分が 2 行でない: {diffs:?}"
+    );
+    assert!(
+        diffs[0].0.contains("void dno_gdn_scan(") && diffs[0].1.contains("void dno_gdn_scan_sig("),
+        "1 つ目の差分が関数名でない: {:?}",
+        diffs[0]
+    );
+    let (silu, sigmoid) = diffs[1];
+    assert!(
+        silu.contains("y_out[zo]") && sigmoid.contains("y_out[zo]"),
+        "2 つ目の差分が出力ゲートの行でない: {silu} / {sigmoid}"
+    );
+    assert!(
+        silu.ends_with("(zv / (1.0f + expf(-zv)));"),
+        "dno_gdn_scan のゲートが silu(z) = z*sigmoid(z) でない: {silu}"
+    );
+    assert!(
+        sigmoid.ends_with("(1.0f / (1.0f + expf(-zv)));"),
+        "dno_gdn_scan_sig のゲートが sigmoid(z) でない: {sigmoid}"
+    );
+}
+
+/// task 137: コミット済み `kernels_gdn.ptx` の entry 集合が `gdn.cu` の
+/// `__global__` カーネル集合と一致すること。
+///
+/// P55 は gdn.cu に `dno_gdn_chunk_pre_sm` を足して PTX を再生成しなかった
+/// (task 137 で発覚。PTX は `include_bytes!` で binary に焼かれるので、
+/// 再生成を忘れるとホストはカーネルを取れず、fail-closed で黙って CPU 経路に
+/// 落ちる = 速度だけが静かに失われる)。集合の一致を静的に固定する。
+#[test]
+fn gdn_ptx_entries_match_cu_kernels() {
+    const PTX: &str = include_str!("../kernels/kernels_gdn.ptx");
+    // gdn.cu 側は `__global__ void` と名前が別行に分かれるカーネルがあり
+    // (`dno_gdn_chunk_pre_l4` は間にコメントと `__launch_bounds__` が入る)、
+    // 行ではなくコメント除去後のソース全体を走査する。
+    let code: String = GDN_SRC
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut cu: Vec<String> = Vec::new();
+    let mut idx = 0usize;
+    while let Some(i) = code[idx..].find("__global__ void") {
+        let start = idx + i + "__global__ void".len();
+        // 修飾 (`__launch_bounds__(...)`) を読み飛ばしてから名前を取る。
+        let mut rest = code[start..].trim_start();
+        if rest.starts_with("__launch_bounds__") {
+            rest = rest[rest.find(')').map(|p| p + 1).unwrap_or(rest.len())..].trim_start();
+        }
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            cu.push(name);
+        }
+        idx = start;
+    }
+    let mut ptx: Vec<String> = PTX
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix(".visible .entry "))
+        .map(|rest| rest.split('(').next().unwrap_or("").trim().to_string())
+        .collect();
+    cu.sort();
+    ptx.sort();
+    assert_eq!(
+        ptx, cu,
+        "kernels_gdn.ptx の entry 集合が gdn.cu のカーネル集合と違う (PTX 再生成が必要)"
+    );
+}
+
+/// task 137: PTX の `dno_gdn_scan_sig` が `dno_gdn_scan` と同じ引数個数で
+/// 入っていること (ホストは両方に同じ 23 引数を渡す)。
+#[test]
+fn gdn_ptx_scan_sig_has_same_params_as_scan() {
+    const PTX: &str = include_str!("../kernels/kernels_gdn.ptx");
+    fn nparams(ptx: &str, name: &str) -> Option<usize> {
+        let start = ptx.find(&format!(".visible .entry {name}("))?;
+        let mut n = 0usize;
+        for line in ptx[start..].lines().skip(1) {
+            let t = line.trim();
+            if t.starts_with(')') {
+                return Some(n);
+            }
+            if t.starts_with(".param ") {
+                n += 1;
+            }
+        }
+        None
+    }
+    let base = nparams(PTX, "dno_gdn_scan");
+    let sig = nparams(PTX, "dno_gdn_scan_sig");
+    assert_eq!(base, Some(23), "dno_gdn_scan の引数個数が 23 でない");
+    assert_eq!(
+        sig, base,
+        "dno_gdn_scan_sig の引数個数が dno_gdn_scan と違う (PTX 再生成が必要)"
+    );
+}
+
 /// s100 (P3-3): `kernels/gdn.cu` のローカル列配列 (`Scol` / `Wcol` / `Mcol` /
 /// `next`) の境界。これらは固定長 [256] のレジスタ配列で、ループは `dk` まで
 /// 回る。dk を 256 より大きくするとスタックオーバーラン (不正メモリアクセス)
@@ -741,7 +893,8 @@ fn gdn_pre_sm_keeps_step_order_of_local_version() {
 #[test]
 fn gdn_kernel_column_arrays_fit_host_limits() {
     // カーネル側: 固定長 256 の列配列
-    for (name, count) in [("Scol", 3usize), ("Wcol", 1), ("Mcol", 1), ("next", 1)] {
+    // (task 137 が dno_gdn_scan_sig を足したので Scol は 4 本)
+    for (name, count) in [("Scol", 4usize), ("Wcol", 1), ("Mcol", 1), ("next", 1)] {
         let decl = format!("float {name}[256];");
         let n = GDN_SRC.matches(&decl).count();
         assert_eq!(
@@ -859,10 +1012,11 @@ fn gdn_kernel_conv_channel_index_covers_all_channels() {
     );
     // ローリング (新 state = 直近 d_conv-1 入力) が d_conv=4 版だけであること:
     // 3 要素のシフトが 3 本 (q/k/v) そろっていること。
+    // task 137 が dno_gdn_scan_sig (dno_gdn_scan と同一の conv 窓) を足したので 4 本。
     assert_eq!(
         count_in_code(GDN_SRC, "inq[0] = inq[1]; inq[1] = inq[2]; inq[2] = xq;"),
-        3,
-        "conv ウィンドウのローリング (3 変種) が揃っていない"
+        4,
+        "conv ウィンドウのローリング (4 変種) が揃っていない"
     );
 }
 
