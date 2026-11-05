@@ -600,6 +600,29 @@ mod tests {
         );
     }
 
+    /// コミット済みの PTX が .cu と同じ引数の数を持つ (ABI の取り違えは実機で
+    /// しか分からないので、PTX の `.param` 行を数えて固定する)。
+    #[test]
+    fn committed_ptx_has_expected_params() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+        let Ok(ptx) = std::fs::read_to_string(dir.join("kernels_exp_iq.ptx")) else {
+            // PTX 未生成のツリーでは何も言えない (カーネル無し = CPU へ落ちるだけ)。
+            return;
+        };
+        let count = |name: &str| -> Option<usize> {
+            let head = format!(".visible .entry {name}(");
+            let i = ptx.find(&head)?;
+            let rest = &ptx[i + head.len()..];
+            let end = rest.find(')').unwrap_or(rest.len());
+            Some(rest[..end].matches(".param").count())
+        };
+        for i in 0..SLOTS {
+            let name = kernel_name(i).expect("slot");
+            assert_eq!(count(name), Some(8), "{name} の引数の数が .cu と違う");
+        }
+        assert_eq!(count(SILU_KERNEL), Some(4), "{SILU_KERNEL} の引数の数");
+    }
+
     /// ゲートは既定 off、`DENNO_EXPERT_IQ_UPLOAD` の既定は 8。
     #[test]
     fn env_parsing() {

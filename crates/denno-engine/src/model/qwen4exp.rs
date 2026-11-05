@@ -6812,38 +6812,56 @@ fn moe_ffn_quant_impl(
         if let Some((hs, hits)) = iq_batched {
             // GPU で回せた expert はその寄与、回せなかった expert は CPU で 3 行列。
             // 足し込みは今までと同じ **expert index 昇順の逐次** (同じ位置で同じ重み)。
+            //
+            // `vram_mode` では `parallel` が false になる (P39 の設計) ので、ミスを
+            // そのまま逐次で計算すると base の並列経路より遅い。ミスだけを取り出して
+            // **base と同じ expert 並列** (`expert_contribs_par`) で計算する。
             gpu_hits = hits;
-            with_expert_scratch(ff, e, |s| -> Result<()> {
-                let act = &mut s.act[..ff];
-                let up = &mut s.up[..ff];
-                let h = &mut s.h[..e];
-                for (t, &ei) in sel.iter().enumerate() {
-                    let pe = weights[t];
-                    match hs[t].as_deref() {
-                        Some(v) => {
-                            debug_assert_eq!(v.len(), e, "GPU の寄与長が e と違う");
-                            for j in 0..e {
-                                out[j] += pe * v[j];
-                            }
-                        }
-                        None => {
-                            // ミス: 従来と同じ CPU 経路 (mmap 直読み。vram_mode では
-                            // RAM キャッシュを使わない = `cache` は None)。
-                            lw.gate_exps.gemv(ei, x, act)?;
-                            silu_inplace(act);
-                            lw.up_exps.gemv(ei, x, up)?;
-                            for r in 0..ff {
-                                act[r] *= up[r];
-                            }
-                            lw.down_exps.gemv(ei, act, h)?;
-                            for j in 0..e {
-                                out[j] += pe * h[j];
-                            }
-                        }
+            let miss_pos: Vec<usize> = (0..sel.len()).filter(|&t| hs[t].is_none()).collect();
+            #[cfg(feature = "par")]
+            let miss_h: Vec<Vec<f32>> = if miss_pos.is_empty() {
+                Vec::new()
+            } else {
+                let ids: Vec<usize> = miss_pos.iter().map(|&t| sel[t]).collect();
+                expert_contribs_par(lw, &ids, x, e, ff, None)?
+            };
+            #[cfg(not(feature = "par"))]
+            let miss_h: Vec<Vec<f32>> = {
+                let mut v = Vec::with_capacity(miss_pos.len());
+                let mut act = vec![0.0f32; ff];
+                let mut up = vec![0.0f32; ff];
+                let mut h = vec![0.0f32; e];
+                for &t in &miss_pos {
+                    let ei = sel[t];
+                    lw.gate_exps.gemv(ei, x, &mut act)?;
+                    silu_inplace(&mut act);
+                    lw.up_exps.gemv(ei, x, &mut up)?;
+                    for r in 0..ff {
+                        act[r] *= up[r];
                     }
+                    lw.down_exps.gemv(ei, &act, &mut h)?;
+                    v.push(h.clone());
                 }
-                Ok(())
-            })?;
+                v
+            };
+            let mut mi = 0usize;
+            for (t, &_ei) in sel.iter().enumerate() {
+                let pe = weights[t];
+                let v: &[f32] = match hs[t].as_deref() {
+                    Some(v) => {
+                        debug_assert_eq!(v.len(), e, "GPU の寄与長が e と違う");
+                        v
+                    }
+                    None => {
+                        let v = &miss_h[mi];
+                        mi += 1;
+                        v
+                    }
+                };
+                for j in 0..e {
+                    out[j] += pe * v[j];
+                }
+            }
         } else if let Some((hs, hits)) = batched {
             // P45: 層一括経路も「何本が載っていたか」を返す (ゲートの 1 サンプル)。
             gpu_hits = hits;
