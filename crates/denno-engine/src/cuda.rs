@@ -649,6 +649,11 @@ pub struct CudaCtx {
     /// PTX はコミット済みの `kernels_gdn.ptx` に含まれる (再生成済み) 場合のみ
     /// 取得でき、無ければ None で従来の 3 launch 経路を使う。
     f_gdn_chunk_scan_hoist: Option<CUfunction>,
+    /// task 128: qwen4exp (sigmoid 出力ゲート) の decode 用 scan
+    /// (`dno_gdn_scan_sig`)。task 137 で gdn.cu に追加し `kernels_gdn.ptx` を
+    /// 再生成したので、通常は Some になる。読めないとき (旧 PTX) は
+    /// [`gdn_decode_submit`] が計測を積まずに CPU 経路へ落ちる (fail-closed)。
+    f_gdn_scan_sig: Option<CUfunction>,
     // P-MOE-E1: Flash-Next の expert GEMV (Q8_0 / Q5_1 / Q4_K / Q5_K) を積んだ
     // モジュール。PTX の読み込みに失敗しても起動は壊さず `f_moe = None` にして、
     // 呼び出し側 (`moe_gemv`) が Ok(false) を返して CPU 参照へ落ちる。
@@ -940,6 +945,33 @@ impl CudaCtx {
                 None
             };
 
+            // task 128: qwen4exp の decode 用 scan (sigmoid 出力ゲート) も
+            // 「あれば使う」。task 137 で PTX を再生成したので通常は取れる。
+            // 取れないとき (旧 PTX) は GPU decode scan 経路を発動させない
+            // (fail-closed = CPU 経路)。
+            let mut f_gdn_scan_sig: CUfunction = std::ptr::null_mut();
+            let sig_r = (lib.module_get_function)(
+                &mut f_gdn_scan_sig,
+                module_gdn,
+                b"dno_gdn_scan_sig\0".as_ptr() as *const c_char,
+            );
+            // task 137: 取れただけでは足りない。ホストは 23 引数を渡すので、
+            // PTX 側の引数個数が dno_gdn_scan と違えば起動しない (ABI 検査)。
+            let sig_abi_ok = std::str::from_utf8(PTX_GDN)
+                .map(gdn_scan_sig_abi_ok)
+                .unwrap_or(false);
+            let f_gdn_scan_sig = if sig_r == CUDA_SUCCESS && sig_abi_ok {
+                Some(f_gdn_scan_sig)
+            } else {
+                if sig_r == CUDA_SUCCESS && !sig_abi_ok {
+                    tracing::warn!(
+                        "[gdn-gpu-scan] dno_gdn_scan_sig の引数個数が dno_gdn_scan と違う \
+                         (PTX とホストの不整合) → CPU 経路"
+                    );
+                }
+                None
+            };
+
             // s239 (P36): 4 レーン版 pass 1 も「あれば使う」(同じ理由)。
             let mut f_gdn_chunk_pre_l4: CUfunction = std::ptr::null_mut();
             let l4_r = (lib.module_get_function)(
@@ -1104,6 +1136,7 @@ impl CudaCtx {
                 f_gdn_chunk_state,
                 f_gdn_chunk_scan,
                 f_gdn_chunk_scan_hoist,
+                f_gdn_scan_sig,
                 module_moe,
                 f_moe,
                 f_moe2,
@@ -2128,6 +2161,25 @@ fn ptx_entry_params(ptx: &str, name: &str) -> Option<usize> {
         return None;
     }
     None
+}
+
+/// task 137: `dno_gdn_scan_sig` の ABI (引数の個数) が `dno_gdn_scan` と
+/// 同じであること。両者はゲート式 1 行以外が同一のカーネルなので、引数の
+/// 個数も同じでなければならない (現状 23)。
+///
+/// 個数が食い違う PTX を cuLaunchKernel で起動すると、足りない引数は**不定**の
+/// まま読まれ、エラーも NaN も出ずに別の行を書く。ホストの起動コードと PTX が
+/// ずれたとき (PTX 再生成の取り違え) に黙って壊れないよう、モジュールロード時に
+/// ここで弾いて CPU 経路へ落とす。GPU 無しでテストできる
+/// (`gdn_scan_sig_abi_matches_scan_in_committed_ptx`)。
+fn gdn_scan_sig_abi_ok(ptx: &str) -> bool {
+    match (
+        ptx_entry_params(ptx, "dno_gdn_scan"),
+        ptx_entry_params(ptx, "dno_gdn_scan_sig"),
+    ) {
+        (Some(base), Some(sig)) => sig == base,
+        _ => false,
+    }
 }
 
 /// v3 のカーネル一式。4 本そろって初めて `Some`。
@@ -17465,6 +17517,29 @@ mod tests {
         assert_eq!(moe_gemv_v3_on(), env_on, "DENNO_GEMV_V3 の真理値表");
     }
 
+    /// task 137: コミット済み `kernels_gdn.ptx` の `dno_gdn_scan_sig` が
+    /// `dno_gdn_scan` と同じ引数個数 (23) で入っていること。
+    ///
+    /// ホスト (`gdn_decode_submit`) は 23 引数を渡す。PTX が古い (カーネルが
+    /// 無い / 別ソース由来) と GPU decode scan 経路は **黙って** CPU に落ちる
+    /// (速度だけが失われる) ので、ここで静的に固定する。
+    #[test]
+    fn gdn_scan_sig_abi_matches_scan_in_committed_ptx() {
+        let text = std::str::from_utf8(PTX_GDN).expect("kernels_gdn.ptx が UTF-8 でない");
+        assert_eq!(
+            ptx_entry_params(text, "dno_gdn_scan"),
+            Some(23),
+            "dno_gdn_scan の引数個数が 23 でない (ホストの起動コードと不一致)"
+        );
+        assert_eq!(
+            ptx_entry_params(text, "dno_gdn_scan_sig"),
+            Some(23),
+            "コミット済み kernels_gdn.ptx に dno_gdn_scan_sig が 23 引数で入っていない \
+             (PTX 再生成が必要)"
+        );
+        assert!(gdn_scan_sig_abi_ok(text), "ABI 検査が committed PTX で成立しない");
+    }
+
     /// PTX の引数の数え方 (GPU 無しで回る)。nvcc が実際に出す
     /// `kernels_moe_v2.ptx` で 6 本を数えられること = パーサの前提の裏取り。
     #[test]
@@ -24459,6 +24534,1219 @@ mod p58_scratch_arena_tests {
         assert!(!parse_scratch_arena(Some(" 0 ")));
         assert!(!parse_scratch_arena(Some("false")));
         assert!(!parse_scratch_arena(Some("off")));
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// task 128: GDN (qwen4exp) decode の GPU 常駐スキャン (DENNO_GDN_GPU_SCAN)
+// ---------------------------------------------------------------------------
+//
+// br114 (a4a0c617f) の設計を int-auto の API (`CudaCtx::plan_moe_gemv` +
+// `launch_async`) へ移植したもの。1 トークン 1 層ぶんの
+//   [qkv(+z) の GEMV] → [dno_gdn_scan_sig] → [attn_out の GEMV]
+// を 1 つの submission にまとめ、層の状態 (conv / ssm) をデバイス常駐にする
+// (デバイスが正本。ホスト `SsmLayer::state` は 1 トークン以上古い)。
+//
+// バッファの中身 (token 1 / token 2 の各段階。REPORT_P128.md と対):
+//   x      [n_embd]            層入力 (ホスト→H2D、毎トークン)
+//   qkv    [qkv_total]         [qkv 行 | z 行] の 1 本 (GEMV 出力。毎トークン)
+//   ba     [2*nv]              [beta | alpha] (CPU F32 GEMV → H2D、毎トークン)
+//   conv   [conv_dim][cs]      cs = d_conv-1 = 3。**ping-pong 2 面**。
+//                              q/k チャネルは nk < nv のとき複数の v-head が
+//                              同じチャネルを読むので in-place にできない。
+//   ssm    [nv][dk][dv]        1 面。各スレッドが自分の列を先頭で全読みして
+//                              から書くので in == out で安全。
+//   y      [nv*dv]             scan 出力 (gate 済み)
+//   out    [n_embd]            attn_out GEMV の出力 (= 層出力)
+//
+// ホスト state との契約:
+//   (a) デバイスが正の間ホストは古い。CPU 経路が state を読む前に必ず
+//       [`gdn_decode_state_take`] (同期 D2H) で回復する。
+//   (b) ホスト側で state を書き換えたら (reset / spec_restore) 必ず
+//       [`gdn_decode_state_invalidate`] でデバイスを無効化する。
+//       **task 128 の修正点**: br114 は reset でこれを落としていた。モデル
+//       使い回し (`DENNO_FLASH_MODEL_REUSE=1`) で前置きが変わると reset が走り、
+//       次の prefill の take が **前のリクエストの状態** をホストへ戻すため、
+//       全トークンが同じ壊れ方をする (安定 md5 の `!!!!`)。
+//   (c) ホストが正のときだけシード (H2D) する。
+//
+// 失敗はすべて fail-closed (`out: None` → 呼び出し側は CPU 経路)。
+// scan を発行した後の失敗だけは状態を回復して返し、回復も失敗したら poisoned
+// (呼び出し側は要求を落とす)。
+//
+// **task 137 で解消**: このカーネル `dno_gdn_scan_sig` (gdn.cu の sigmoid
+// 出力ゲート版) を gdn.cu へ追加し、`kernels_gdn.ptx` を再生成した
+// (再生成前の PTX は gdn.cu より古く、P55 の `dno_gdn_chunk_pre_sm` も
+// 未収録だった)。旧 PTX を読んだ場合だけ `CudaCtx::f_gdn_scan_sig` が None に
+// なり、この経路は発動しない (計測を 1 つも積まずに CPU 経路)。
+// **task 140 のラボ (t140a) で確認**: 今の gdn.cu から nvcc で再生成した
+// `kernels_gdn.ptx` は、コミット済みのものと byte 一致 (9965 行 /
+// md5 b580964cfe78ad8d10beab3b7682ea3c)。つまり t137c が使った PTX は
+// 正しい再生成物であり、当時の 700 は PTX ではなくホスト側のバグだった。
+//
+// **task 137 のラボ (t137c) で分かった残件**: 経路は発動し、数値も合う
+// (tok=1 の層 0..9 で maxabs out <= 1.8e-7 / conv 0 / ssm <= 2.4e-7、出力
+// テキストの md5 は CPU と同一) が、**最初の decode トークンの直後の
+// submission で CUDA error 700** になり、ラッチで以後 CPU に落ちる。
+//
+// **task 140 で原因を特定**: 700 は `qkv_gemv[0]` (li=41 tok=1) で起きていた。
+// `gdn_qkv_units` が GEMV の出力行オフセットに `FusedLinear::range(i).start` を
+// 使っていたのが誤りで、連結済みの qkv_gate では単位 = 連結バッファ全体
+// (先頭から書く) なのに、gate が qkv より前に置かれた層 (写しなし連結が
+// ファイル順を `ranges` に保存するため `range(0).start = 6144`) では
+// 16384 行を 6144 行目から書いて **e.qkv の終端を 24 KiB 越えて**いた
+// (ラボのダンプで li=13/38/41/46 が該当)。同じ層が 41 番目で初めて
+// 未マップの VA に当たり 700 → ラッチ、以後 129% 遅い状態になっていた。
+// 修正後 (t140b/t140c) は errors 0・md5 SAME・テキスト正常で、
+// 短 decode -1.9%、2k 文脈 -4.2..-4.8% (t140c の VERDICT)。
+// ただしタスクの採否目標 (短 decode 3% 以上) に届かないので**既定 off のまま**。
+//
+// **task 142 で既定 on にした**: 上の目標 (短 decode 3%) は「利得が文脈長で
+// 伸びる」ことを知る前に置かれたものだった。文脈 2k / 8k で目標を取り直し、
+// int-auto 065cf20 (task 141 まで) に br140 をマージした t142a で
+// 短 -5.1% / c2000 next -5.6% / c8000 next -6.7% / prefill 2% 以内 /
+// errors 0 / md5 6 本 SAME を確認した (詳細は [`gdn_gpu_scan_on`] の doc)。
+
+/// task 142 のラボ (t142a) で採否目標を満たしたので**既定 on**。
+/// `DENNO_GDN_GPU_SCAN=0|off|false|no` で off に戻せる (未設定・空は on)。
+///
+/// t142a (int-auto 065cf20 + task 141 までのマージ、depth8k、PROFILE=1、2 ラウンド交互):
+/// decode は短 -5.1%、c2000 next turn -5.6%、c8000 next turn -6.7%、prefill は
+/// -0.7%..+1.5% (全て 2% 以内)、errors 0、md5 は 6 本とも SAME。q4prof の gdn 項目は
+/// on で +116 ms/128tok (短)・+103 (c2000)・+12 (c8000) と増えるが、これは GPU scan の
+/// 待ちが attn.gate に移り、qkv/out の GEMV が同じ submission に入るため (層 wall は
+/// 短 -4.2%、c2000 -4.5%、c8000 -6.9%)。
+///
+/// t142b (既定 on 版の確認、def vs `DENNO_GDN_GPU_SCAN=0`): def が全 5 点で off 以上
+/// (短 -3.8%、c2000_cold -3.7%、c2000_turn2 -1.3%、c8000 -5.6%)、errors 0、md5 SAME。
+/// c2000_turn2 の 1.3% は 2 ラウンド目が同値でノイズ帯 (<2%)。prefill は
+/// -0.4..-2.0% で t142a と符号が逆 (ノイズ)。
+///
+/// off のときは `SsmLayer::forward_token` / `forward_batch` / `reset_state` の分岐
+/// (この static read) 以外に何も変わらない。テストは
+/// [`gdn_gpu_scan_set_for_test`] で env 無しに on/off を強制できる
+/// (env はプロセスで 1 回しか読めないため)。
+pub fn gdn_gpu_scan_on() -> bool {
+    #[cfg(test)]
+    match GDN_GPU_SCAN_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_gdn_gpu_scan(std::env::var("DENNO_GDN_GPU_SCAN").ok().as_deref()))
+}
+
+/// `DENNO_GDN_GPU_SCAN` の生値 → on/off (純関数)。**未設定は on** (task 142 で採用)。
+/// 明示的な `0|off|false|no` (前後空白と大小文字は無視) だけ off。
+fn parse_gdn_gpu_scan(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+    }
+}
+
+/// テスト強制の値 (0 = env の解釈、1 = 強制 on、2 = 強制 off)。
+#[cfg(test)]
+static GDN_GPU_SCAN_FORCE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// テストが env を立てずにゲートを強制する (`true` = 強制 on、`false` = 強制 off)。
+///
+/// 既定が on になったので、off 経路を見るテストは `false` で明示的に落とす。
+#[cfg(test)]
+pub fn gdn_gpu_scan_set_for_test(v: bool) {
+    GDN_GPU_SCAN_FORCE.store(if v { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// テストが強制を解除して env の解釈 (既定 on) に戻す。
+#[cfg(test)]
+pub fn gdn_gpu_scan_reset_force_for_test() {
+    GDN_GPU_SCAN_FORCE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// CPU vs GPU の状態突き合わせ (`DENNO_GDN_GPU_CHECK=1`。診断専用・既定 off)。
+///
+/// on のとき [`gdn_decode_submit`] は層出力に加えて **scan 後の conv/ssm** を
+/// D2H して返す (毎層 1 往復 = 遅い。診断専用なので既定 off)。比較そのものは
+/// 呼び出し側 (`SsmLayer::forward_token`) が CPU 参照と行い、最初に違った層と
+/// 要素を 1 行だけ出す。
+pub fn gdn_gpu_check_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("DENNO_GDN_GPU_CHECK").as_deref(),
+            Ok("1") | Ok("on") | Ok("true")
+        )
+    })
+}
+
+/// task 140 の診断 (`DENNO_GDN_SUBMIT_SYNC=1`。既定 off)。
+///
+/// on のとき [`gdn_decode_submit`] は submission の**各段の直後**に
+/// `cuCtxSynchronize` を挟み、失敗したらその段の名前をエラーに付ける。
+/// error 700 は「違反した launch の後、次にホストと同期する API が返す」ため、
+/// 段ごとに同期しないとどの launch が壊れたかを切り分けられない (task 137 の
+/// t137c は「scan 発行前」までしか絞れなかった)。**診断専用**で、on のときは
+/// 段数ぶん同期するので decode は大幅に遅くなる。数値経路は変えない。
+pub fn gdn_submit_sync_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_gdn_submit_sync(std::env::var("DENNO_GDN_SUBMIT_SYNC").ok().as_deref()))
+}
+
+/// `DENNO_GDN_SUBMIT_SYNC` の生値 → on/off (純関数。真理値表はテストで固定)。
+fn parse_gdn_submit_sync(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1") | Some("on") | Some("true"))
+}
+
+/// task 140 の診断 (`DENNO_GDN_SUBMIT_DUMP=1`。既定 off)。
+///
+/// on のとき [`gdn_decode_submit`] は **decode 窓の 1 トークン目だけ**、層ごとに
+/// 1 行の plan ダンプ (型・k/n・行バイト・実バイト数・行オフセット・起動形状・
+/// ポインタ) を出す。t140a のラボでは `qkv_gemv[0]` が li=41 で
+/// error 700 になったが、同じ重み・同じ形状は intercept 経路で正常に走っており、
+/// 引数のどこが違うかをログから確定できなかった。診断専用 (数値経路は不変)。
+pub fn gdn_submit_dump_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_gdn_submit_dump(std::env::var("DENNO_GDN_SUBMIT_DUMP").ok().as_deref()))
+}
+
+/// `DENNO_GDN_SUBMIT_DUMP` の生値 → on/off (純関数)。
+fn parse_gdn_submit_dump(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1") | Some("on") | Some("true"))
+}
+
+/// 状態ストアの上限 (エントリ = 1 層ぶん ≈ 3.3 MiB: conv 2x120 KiB + ssm 3.0 MiB
+/// + x/qkv/ba/y/out 約 100 KiB)。72 = 36 層モデル 2 本ぶん。
+/// 追い出しは最古の挿入順 (Vec の先頭)。`SsmLayer` は Drop を持たないので、
+/// 解放済みモデルのエントリはこの上限まで残る (上限到達で先頭から回収)。
+const GDN_DECODE_STORE_MAX: usize = 72;
+
+/// ストアの鍵。`nonce` は `SsmLayer` インスタンスごとの通し番号
+/// (構築時に 1 回発行) — アドレス再利用 (ABA) で別モデルのデバイス状態を
+/// 流用しないための identity。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GdnDecodeKey {
+    nonce: u64,
+    li: u32,
+}
+
+/// 層 1 本ぶんのデバイス常駐バッファ (lazy に 1 回だけ確保)。
+struct GdnDecodeLayerDev {
+    /// conv 状態 [conv_dim * cs] の ping-pong (両面とも同じレイアウト)。
+    conv: [DevBuffer; 2],
+    /// ssm 状態 [nv * dk * dv] (in-place 更新)。
+    ssm: DevBuffer,
+    /// 現在の読み出し面 (書き込み面は 1-cur)。
+    cur: usize,
+    /// 小さい f32 重み (構築時に 1 回だけ上げる)。
+    wconv: DevBuffer,
+    wa: DevBuffer,
+    wdt: DevBuffer,
+    wnorm: DevBuffer,
+    /// 層入力 cur [n_embd] と beta/alpha [2 * nv] を**1 本に連結**した staging。
+    ///
+    /// task 140: 以前は `x` と `ba` の 2 本で、層ごとに同期 H2D を 3 回
+    /// (x / beta / alpha) 積んでいた。cuMemcpyHtoD は既定ストリームの完了を待つ
+    /// ので、36 層 × 3 回の待ちが submission の主要コストだった (実測 t140b:
+    /// gdn bucket 6.9 ms/tok)。1 本にまとめて H2D を 1 回にする (転送する値・
+    /// 並び・カーネルへ渡すポインタは同一)。
+    xba: DevBuffer,
+    /// qkv_gate の全出力 ([qkv 行 + z 行]。ユニットは行範囲へ書く)。
+    qkv: DevBuffer,
+    /// scan 出力 y [vd]。
+    y: DevBuffer,
+    /// attn_out GEMV の出力 [n_embd]。
+    out: DevBuffer,
+    /// 寸法 (初回確定。以後の要求が違ったら fail-closed)。
+    n_embd: usize,
+    qkv_total: usize,
+    vd: usize,
+    conv_len: usize,
+    ssm_len: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    nk: usize,
+    conv_dim: usize,
+    d_conv: usize,
+    /// true = デバイスが正 (ホスト state は 1 トークン以上古い)。
+    device_authoritative: bool,
+}
+
+static GDN_DECODE_STORE: std::sync::Mutex<Vec<(GdnDecodeKey, GdnDecodeLayerDev)>> =
+    std::sync::Mutex::new(Vec::new());
+
+// task 140: 層ごとの H2D staging (cur | beta | alpha を 1 本に詰める)。
+// grow-only で使い回す (36 層 × 128 トークンで数万回呼ばれるため、毎回の
+// Vec 確保を避ける)。中身は毎回 clear してから詰め直す。
+thread_local! {
+    static GDN_STAGE: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `gdn_decode_submit` の入力 1 行分 (GGUF ブロックのままの重み 1 本)。
+///
+/// cuda.rs は [`crate::model::linear_gguf::GgufLinear`] を import しない
+/// (`maybe_gpu_gguf_gemv_into` と同じ分離)。呼び出し側が uid / ty / ブロック /
+/// k / n を写して渡す。
+pub struct GdnGgufUnit<'a> {
+    pub uid: u64,
+    pub ty: crate::kquant::GgmlType,
+    pub blocks: &'a [u8],
+    pub k: usize,
+    pub n: usize,
+}
+
+/// `gdn_decode_submit` のリクエスト。
+pub struct GdnDecodeReq<'a> {
+    /// SsmLayer インスタンスの nonce (ストアの鍵)。
+    pub nonce: u64,
+    /// 層番号 (診断ログ用)。
+    pub li: usize,
+    /// decode 窓の通し番号 (`gdn_gpu_win::token_index()`。診断ログ用)。
+    pub tok: u64,
+    pub n_embd: usize,
+    /// qkv_gate の全出力行数 (qkv 行 + z 行の合計)。
+    pub qkv_total: usize,
+    /// scan へ渡す qkv 領域の行起点 (`FusedLinear::range(0).start`。実モデルは 0)。
+    pub qkv_row_start: usize,
+    /// scan へ渡す z 領域の行起点 (`FusedLinear::range(1).start`。実モデルは qkv 行数)。
+    pub z_row_start: usize,
+    /// qkv_gate の GEMV 単位 (連結済みなら 1 本) と出力行オフセットの組。
+    pub qkv_units: &'a [(GdnGgufUnit<'a>, usize)],
+    /// attn_out 投影 (y [vd] → out [n_embd])。
+    pub out_unit: GdnGgufUnit<'a>,
+    /// 層入力 (ホスト)。
+    pub cur: &'a [f32],
+    /// beta / alpha (ホスト f32。CPU の F32 GEMV で計算済み)。
+    pub beta: &'a [f32],
+    pub alpha: &'a [f32],
+    /// ホスト正本の状態 (デバイスが古いときのシードに使う)。
+    pub conv_host: &'a [f32],
+    pub ssm_host: &'a [f32],
+    /// 小さい f32 重み (初回だけデバイスへ上げる)。
+    pub wconv: &'a [f32],
+    pub wa: &'a [f32],
+    pub wdt: &'a [f32],
+    pub wnorm: &'a [f32],
+    /// GDN の寸法 ([`crate::gdn::GdnParams`] から)。
+    pub nk: usize,
+    pub nv: usize,
+    pub dk: usize,
+    pub dv: usize,
+    pub conv_dim: usize,
+    pub d_conv: usize,
+    pub eps: f32,
+}
+
+/// `gdn_decode_submit` の結果。
+pub struct GdnDecodeRes {
+    /// attn_out 投影まで済んだ層出力。`None` = GPU で完走できなかった
+    /// (呼び出し側は従来の CPU 経路に落ちること。fail-closed)。
+    pub out: Option<Vec<f32>>,
+    /// scan 発行後に落ちたときの状態回復 (conv, ssm)。`Some` なら呼び出し側は
+    /// この値をホスト state へ写してから CPU 経路に落ちること。
+    pub state_back: Option<(Vec<f32>, Vec<f32>)>,
+    /// scan を発行した後に回復にも失敗した (GPU が壊れた)。ホスト state は
+    /// 1 トークン以上古い — 呼び出し側は要求を落とすこと。
+    pub poisoned: bool,
+    /// `DENNO_GDN_GPU_CHECK=1` のときだけ: このトークンを終えたデバイス状態
+    /// (conv[書き込み面], ssm)。CPU 参照との突き合わせに使う (診断専用)。
+    pub state_dev: Option<(Vec<f32>, Vec<f32>)>,
+}
+
+impl GdnDecodeRes {
+    fn cpu() -> Self {
+        GdnDecodeRes {
+            out: None,
+            state_back: None,
+            poisoned: false,
+            state_dev: None,
+        }
+    }
+}
+
+/// GPU 経路が 1 回だけ出す注記 (同じ理由の反復ログを防ぐ)。
+fn gdn_note_once(msg: &str) {
+    static DONE: OnceLock<()> = OnceLock::new();
+    if DONE.set(()).is_ok() {
+        tracing::info!("[gdn-gpu-scan] {msg}");
+    }
+}
+
+/// task 114c: decode scan 経路の process-local 不使用ラッチ。
+///
+/// 実機 (8096) では fused submission の 1 回目の失敗のあともトークン毎に再発行が
+/// 続き、失敗した launch の**遅延報告** (CUDA error 700 =
+/// LAUNCH_OUT_OF_RESOURCES は同期点で後から返ることがある) をコンテキストに
+/// 貯め続けた。保留エラーは scan 経路の外の最初の同期点 (gguf gemv intercept の
+/// H2D など) からも返るので、結果として intercept 経路まで CPU フォールバックに
+/// なっていた (21.7s → 66.8s)。そこで GPU 側の失敗を 1 回でも見たら、以後この
+/// プロセスでは decode scan を**発行しない** (launch を積まない = 新しい保留
+/// エラーを作らない)。intercept 側は自分の同期で保留エラーを 1 度返せば回復する
+/// (700 は文脈破壊エラーではない)。
+///
+/// ラッチは **GPU_BROKEN とは独立** — scan の失敗で他の GPU 経路 (intercept /
+/// router / prefill chain) を止めない。
+static GDN_SCAN_UNAVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// GPU 側の失敗を記録する。戻り値は「この呼び出しで立った」(初回だけ true)。
+fn gdn_scan_mark_unavailable() -> bool {
+    !GDN_SCAN_UNAVAILABLE.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// ラッチの状態 (テスト用)。
+#[cfg(test)]
+fn gdn_scan_unavailable_for_test() -> bool {
+    GDN_SCAN_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// テストがラッチを戻す (guard の Drop から呼んで panic でも復帰させる)。
+#[cfg(test)]
+fn gdn_scan_unavailable_reset_for_test() {
+    GDN_SCAN_UNAVAILABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// GPU 側の失敗を記録してから応答を返す (ラッチが初めて立ったときだけ案内を
+/// 1 行出す)。`res` は呼び出し側が組み立てたものをそのまま返す。
+fn gdn_scan_record_failure(res: GdnDecodeRes) -> GdnDecodeRes {
+    if gdn_scan_mark_unavailable() {
+        tracing::info!(
+            "[gdn-gpu-scan] GPU 側の失敗 → このプロセスでは decode scan 経路を不使用にする (intercept 経路には影響しない)"
+        );
+    }
+    res
+}
+
+/// ストアに鍵のエントリを用意する (無ければ確保して入れる。上限到達で先頭を捨てる)。
+///
+/// 呼び出し側が `GDN_DECODE_STORE` のロックを保持している間にだけ呼ぶこと。
+fn gdn_decode_entry_ensure_locked(
+    store: &mut Vec<(GdnDecodeKey, GdnDecodeLayerDev)>,
+    req: &GdnDecodeReq,
+) -> Result<usize> {
+    let key = GdnDecodeKey {
+        nonce: req.nonce,
+        li: req.li as u32,
+    };
+    if let Some(i) = store.iter().position(|(k, _)| *k == key) {
+        return Ok(i);
+    }
+    // VRAM の目安 (空きが明らかに足りないなら確保前に落ちる)。
+    let cs = req.d_conv - 1;
+    let bytes = (req.conv_dim * cs * 2
+        + req.conv_dim * req.d_conv
+        + req.nv * 2
+        + req.dv
+        + req.n_embd * 2
+        + req.qkv_total
+        + req.nv * 2
+        + req.nv * req.dv
+        + req.nv * req.dk * req.dv)
+        * 4;
+    if let Some((free, _total)) = dev_mem_mb() {
+        if (free << 20) < bytes + (16 << 20) {
+            bail!(
+                "gdn decode state: 空き VRAM 不足 (必要 {:.1} MiB / 空き {free} MiB)",
+                bytes as f64 / (1 << 20) as f64
+            );
+        }
+    }
+    let e = GdnDecodeLayerDev {
+        conv: [
+            DevBuffer::alloc(req.conv_dim * cs * 4)?,
+            DevBuffer::alloc(req.conv_dim * cs * 4)?,
+        ],
+        ssm: DevBuffer::alloc(req.nv * req.dk * req.dv * 4)?,
+        cur: 0,
+        wconv: DevBuffer::from_slice(req.wconv)?,
+        wa: DevBuffer::from_slice(req.wa)?,
+        wdt: DevBuffer::from_slice(req.wdt)?,
+        wnorm: DevBuffer::from_slice(req.wnorm)?,
+        xba: DevBuffer::alloc((req.n_embd + req.nv * 2) * 4)?,
+        qkv: DevBuffer::alloc(req.qkv_total * 4)?,
+        y: DevBuffer::alloc(req.nv * req.dv * 4)?,
+        out: DevBuffer::alloc(req.n_embd * 4)?,
+        n_embd: req.n_embd,
+        qkv_total: req.qkv_total,
+        vd: req.nv * req.dv,
+        conv_len: req.conv_dim * cs,
+        ssm_len: req.nv * req.dk * req.dv,
+        nv: req.nv,
+        dk: req.dk,
+        dv: req.dv,
+        nk: req.nk,
+        conv_dim: req.conv_dim,
+        d_conv: req.d_conv,
+        device_authoritative: false,
+    };
+    if store.len() >= GDN_DECODE_STORE_MAX {
+        store.remove(0);
+    }
+    store.push((key, e));
+    Ok(store.len() - 1)
+}
+
+/// ストアのエントリ数 (テスト・診断用)。env off / GPU 不在では増えない
+/// (確保は submit の中でだけ起きる = lazy)。
+pub fn gdn_decode_state_entry_count() -> usize {
+    GDN_DECODE_STORE.lock().map(|s| s.len()).unwrap_or(0)
+}
+
+/// デバイスが正のとき、層の状態を同期 D2H でホストへ回復する。
+///
+/// CPU 経路 (prefill / spec verify のバッチ・spec snapshot・CPU フォールバック)
+/// が state を読む**前**に呼ぶこと。`HostCurrent` = デバイスは正でない
+/// (何もしないでよい)。`Recovered` = 呼び出し側はホスト state へ写すこと。
+/// `Lost` = D2H に失敗した (呼び出し側は要求を落とすこと)。
+pub enum GdnDecodeFlush {
+    HostCurrent,
+    Recovered(Vec<f32>, Vec<f32>),
+    Lost,
+}
+
+pub fn gdn_decode_state_take(nonce: u64, li: usize) -> GdnDecodeFlush {
+    let mut store = match GDN_DECODE_STORE.lock() {
+        Ok(s) => s,
+        Err(_) => return GdnDecodeFlush::Lost,
+    };
+    let key = GdnDecodeKey {
+        nonce,
+        li: li as u32,
+    };
+    let Some((_, e)) = store.iter_mut().find(|(k, _)| *k == key) else {
+        return GdnDecodeFlush::HostCurrent;
+    };
+    if !e.device_authoritative {
+        return GdnDecodeFlush::HostCurrent;
+    }
+    match (
+        e.conv[e.cur].to_vec::<f32>(e.conv_len),
+        e.ssm.to_vec::<f32>(e.ssm_len),
+    ) {
+        (Ok(conv), Ok(ssm)) => {
+            e.device_authoritative = false;
+            GdnDecodeFlush::Recovered(conv, ssm)
+        }
+        (Err(err), _) | (_, Err(err)) => {
+            tracing::error!("[gdn-gpu-scan] 状態回復 (D2H) に失敗 (li={li}): {err:#}");
+            GdnDecodeFlush::Lost
+        }
+    }
+}
+
+/// デバイスが正のとき、層の状態を**読み取り専用**で同期 D2H する
+/// ([`gdn_decode_state_take`] と違い正本フラグを動かさない)。
+pub enum GdnDecodeRead {
+    HostCurrent,
+    Device(Vec<f32>, Vec<f32>),
+    Lost,
+}
+
+pub fn gdn_decode_state_read(nonce: u64, li: usize) -> GdnDecodeRead {
+    let store = match GDN_DECODE_STORE.lock() {
+        Ok(s) => s,
+        Err(_) => return GdnDecodeRead::Lost,
+    };
+    let key = GdnDecodeKey {
+        nonce,
+        li: li as u32,
+    };
+    let Some((_, e)) = store.iter().find(|(k, _)| *k == key) else {
+        return GdnDecodeRead::HostCurrent;
+    };
+    if !e.device_authoritative {
+        return GdnDecodeRead::HostCurrent;
+    }
+    match (
+        e.conv[e.cur].to_vec::<f32>(e.conv_len),
+        e.ssm.to_vec::<f32>(e.ssm_len),
+    ) {
+        (Ok(conv), Ok(ssm)) => GdnDecodeRead::Device(conv, ssm),
+        (Err(err), _) | (_, Err(err)) => {
+            tracing::error!("[gdn-gpu-scan] 状態読み取り (D2H) に失敗 (li={li}): {err:#}");
+            GdnDecodeRead::Lost
+        }
+    }
+}
+
+/// デバイスのコピーを捨ててホストを正にする (reset / spec_restore が state を
+/// 上書きしたあと)。D2H を行わない (デバイスの内容はもう要らない)。
+pub fn gdn_decode_state_invalidate(nonce: u64, li: usize) {
+    if let Ok(mut store) = GDN_DECODE_STORE.lock() {
+        let key = GdnDecodeKey {
+            nonce,
+            li: li as u32,
+        };
+        if let Some((_, e)) = store.iter_mut().find(|(k, _)| *k == key) {
+            e.device_authoritative = false;
+        }
+    }
+}
+
+/// task 128 の診断: `reset` の無効化が実際に走った回数 (テストが分岐の発火を
+/// 数えるためだけのもの。数値経路からは読まない)。
+#[cfg(test)]
+static GDN_INVALIDATE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub fn gdn_invalidate_calls_for_test() -> u64 {
+    GDN_INVALIDATE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn gdn_invalidate_calls_reset_for_test() {
+    GDN_INVALIDATE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`gdn_decode_state_invalidate`] の記帳付き版 (呼び出し側はこちらを使う)。
+pub fn gdn_decode_state_invalidate_counted(nonce: u64, li: usize) {
+    #[cfg(test)]
+    GDN_INVALIDATE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    gdn_decode_state_invalidate(nonce, li);
+}
+
+/// GEMV を「デバイス入力 → デバイス出力」で 1 発積む (同期しない)。
+///
+/// 引数の組み立ては [`CudaCtx::moe_gemv_dev_with`] と同一 (同じ計画・同じ ABI)。
+fn gdn_launch_gemv_dev(
+    ctx: &CudaCtx,
+    plan: &MoeGemvPlan,
+    dev_w: &DevBuffer,
+    x_dev: CUdeviceptr,
+    out_dev: CUdeviceptr,
+    n_in: usize,
+    n_out: usize,
+) -> Result<()> {
+    let (f, rows_per_block, block_dim, shmem, lanes, rb, grid) = (
+        plan.f,
+        plan.rows_per_block,
+        plan.block_dim,
+        plan.shmem,
+        plan.lanes,
+        plan.rb,
+        plan.grid,
+    );
+    if dev_w.bytes() != n_out * rb {
+        bail!(
+            "gdn gemv: 重みのデバイスバイト数 {} が n_out * row_bytes = {} と違う",
+            dev_w.bytes(),
+            n_out * rb
+        );
+    }
+    let (mut pw, mut px, mut po) = (dev_w.ptr(), x_dev, out_dev);
+    let (mut n_in_c, mut n_out_c, mut rb_c) = (n_in as c_int, n_out as c_int, rb as c_int);
+    // v3 / fp16 は rows_per_block と lanes を余分に渡す (v2 は 6 本のまま)。
+    let (mut rows_c, mut lanes_c) = (rows_per_block as c_int, lanes as c_int);
+    let mut args = [
+        &mut pw as *mut _ as *mut c_void,
+        &mut px as *mut _ as *mut c_void,
+        &mut po as *mut _ as *mut c_void,
+        &mut n_in_c as *mut _ as *mut c_void,
+        &mut n_out_c as *mut _ as *mut c_void,
+        &mut rb_c as *mut _ as *mut c_void,
+        &mut rows_c as *mut _ as *mut c_void,
+        &mut lanes_c as *mut _ as *mut c_void,
+    ];
+    let nargs = if lanes > 1 { 8 } else { 6 };
+    unsafe {
+        ctx.launch_async(
+            f,
+            (grid, 1, 1),
+            (block_dim, 1, 1),
+            shmem,
+            &mut args[..nargs],
+        )
+    }
+}
+
+/// デコードの ssm 層 1 層ぶんを 1 つの GPU submission にまとめる。
+///
+/// 成功なら `out: Some(層出力)` を返す。失敗なら `out: None` で従来の CPU
+/// 経路に落ちる (fail-closed)。scan を発行したあとの失敗では状態を回復して
+/// `state_back` / `poisoned` で通知する。
+///
+/// sync 発数: 成功時は最後の D2H の 1 回だけ (check モードでは状態の D2H が
+/// 増える)。途中の H2D はすべて同期コピーだが、発行時点で stream は空なので
+/// 待ちにならない (前層の終点で同期済み)。
+pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
+    if GDN_SCAN_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        // 1 回でも GPU 側で失敗した後は CUDA に触れない (発行しない)。
+        return GdnDecodeRes::cpu();
+    }
+    if !gdn_gpu_scan_on() || !cuda_enabled() {
+        return GdnDecodeRes::cpu();
+    }
+    // dno_gdn_scan_sig の前提 (gdn.cu 冒頭コメント・ホスト側 assert と同一)。
+    if req.dk != req.dv || req.d_conv != 4 || req.dk > 256 {
+        gdn_note_once("前提外の寸法 (dk != dv / d_conv != 4 / dk > 256) → CPU 経路");
+        return GdnDecodeRes::cpu();
+    }
+    let Some(ctx) = shared_ctx() else {
+        return GdnDecodeRes::cpu();
+    };
+    if let Err(e) = ctx.make_current() {
+        tracing::error!("CUDA cuCtxSetCurrent failed (gdn decode): {e:#}");
+        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        return GdnDecodeRes::cpu();
+    }
+    let Some(f_scan) = ctx.f_gdn_scan_sig else {
+        // コミット済み PTX に dno_gdn_scan_sig が無い (再生成待ち)。
+        gdn_note_once(
+            "dno_gdn_scan_sig が使う PTX に無い (旧 kernels_gdn.ptx) → CPU 経路",
+        );
+        return GdnDecodeRes::cpu();
+    };
+    // GEMV のカーネル選択は intercept 経路と同じ規約 (fp16 → v3 → v2)。
+    let mode = gemv_kernel_mode();
+    let mut qcfg = Vec::with_capacity(req.qkv_units.len());
+    for (u, _) in req.qkv_units {
+        match ctx.plan_moe_gemv(u.ty, u.k, u.n, mode) {
+            Ok(Some(c)) => qcfg.push(c),
+            _ => return GdnDecodeRes::cpu(),
+        }
+    }
+    let ocfg = match ctx.plan_moe_gemv(req.out_unit.ty, req.out_unit.k, req.out_unit.n, mode) {
+        Ok(Some(c)) => c,
+        _ => return GdnDecodeRes::cpu(),
+    };
+    // 重みは常駐登録簿から (intercept 経路と同じ uid → 同じ VRAM を共有)。
+    let mut qw = Vec::with_capacity(req.qkv_units.len());
+    for (u, _) in req.qkv_units {
+        match weights_for_gguf(u.uid, u.ty, u.blocks, u.k, u.n) {
+            Ok(w) => qw.push(w),
+            Err(e) => {
+                gdn_note_once(&format!("qkv_gate の重み登録に失敗 → CPU 経路: {e:#}"));
+                return gdn_scan_record_failure(GdnDecodeRes::cpu());
+            }
+        }
+    }
+    let ow = match weights_for_gguf(
+        req.out_unit.uid,
+        req.out_unit.ty,
+        req.out_unit.blocks,
+        req.out_unit.k,
+        req.out_unit.n,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            gdn_note_once(&format!("attn_out の重み登録に失敗 → CPU 経路: {e:#}"));
+            return gdn_scan_record_failure(GdnDecodeRes::cpu());
+        }
+    };
+    let mut store_lock = match GDN_DECODE_STORE.lock() {
+        Ok(s) => s,
+        Err(_) => return GdnDecodeRes::cpu(),
+    };
+    let idx = match gdn_decode_entry_ensure_locked(&mut store_lock, req) {
+        Ok(i) => i,
+        Err(e) => {
+            gdn_note_once(&format!("状態バッファの確保に失敗 → CPU 経路: {e:#}"));
+            return gdn_scan_record_failure(GdnDecodeRes::cpu());
+        }
+    };
+    {
+        let (_, e) = &store_lock[idx];
+        if (
+            e.n_embd,
+            e.qkv_total,
+            e.vd,
+            e.conv_len,
+            e.ssm_len,
+            e.nv,
+            e.dk,
+            e.dv,
+            e.nk,
+            e.conv_dim,
+            e.d_conv,
+        ) != (
+            req.n_embd,
+            req.qkv_total,
+            req.nv * req.dv,
+            req.conv_dim * (req.d_conv - 1),
+            req.nv * req.dk * req.dv,
+            req.nv,
+            req.dk,
+            req.dv,
+            req.nk,
+            req.conv_dim,
+            req.d_conv,
+        ) {
+            gdn_note_once("寸法が確保済みエントリと違う (バグの疑い) → CPU 経路");
+            return GdnDecodeRes::cpu();
+        }
+        if req.cur.len() != req.n_embd
+            || req.conv_host.len() != e.conv_len
+            || req.ssm_host.len() != e.ssm_len
+            || req.beta.len() != req.nv
+            || req.alpha.len() != req.nv
+        {
+            gdn_note_once("入力長が寸法と違う (バグの疑い) → CPU 経路");
+            return GdnDecodeRes::cpu();
+        }
+        // task 140: qkv GEMV の出力は `e.qkv` の行オフセットへ書く。合計が
+        // qkv_total を越えるとデバイスバッファの外へ書いて CUDA error 700 になる
+        // (t140a で実際に踏んだ)。ここで fail-closed に落とす。
+        if req
+            .qkv_units
+            .iter()
+            .any(|(u, row)| row.saturating_add(u.n) > req.qkv_total)
+        {
+            gdn_note_once("qkv GEMV の出力行範囲が qkv_total を越える (バグの疑い) → CPU 経路");
+            return GdnDecodeRes::cpu();
+        }
+    }
+
+    // ---- シード (ホストが正のときだけ。sync H2D 1 回 = トークン初回のみ) ----
+    let seeded_needed = !store_lock[idx].1.device_authoritative;
+    if seeded_needed {
+        let (_, e) = &store_lock[idx];
+        if let Err(err) = (|| -> Result<()> {
+            e.conv[e.cur].copy_from(req.conv_host)?;
+            e.ssm.copy_from(req.ssm_host)?;
+            Ok(())
+        })() {
+            gdn_note_once(&format!("状態のシードに失敗 → CPU 経路: {err:#}"));
+            return gdn_scan_record_failure(GdnDecodeRes::cpu());
+        }
+    }
+
+    // ---- 診断ダンプ (DENNO_GDN_SUBMIT_DUMP=1・既定 off) ----------------------
+    // 1 トークン目だけ層ごとに 1 行。off のときは分岐 1 回で何も出さない。
+    if gdn_submit_dump_on() && req.tok <= 1 {
+        let (_, e) = &store_lock[idx];
+        let mut s = format!(
+            "[gdn-dump] li={} tok={} mode={:?} nv={} nk={} dk={} dv={} conv_dim={} qkv_total={} \
+             qkv_row_start={} z_row_start={} \
+             buf(xba={} qkv={} y={} out={} conv={} ssm={}) seeded={} cur={}",
+            req.li,
+            req.tok,
+            mode,
+            req.nv,
+            req.nk,
+            req.dk,
+            req.dv,
+            req.conv_dim,
+            req.qkv_total,
+            req.qkv_row_start,
+            req.z_row_start,
+            e.xba.bytes(),
+            e.qkv.bytes(),
+            e.y.bytes(),
+            e.out.bytes(),
+            e.conv[e.cur].bytes(),
+            e.ssm.bytes(),
+            seeded_needed,
+            e.cur
+        );
+        for (i, ((u, row), cfg)) in req.qkv_units.iter().zip(qcfg.iter()).enumerate() {
+            s.push_str(&format!(
+                " | u{i} ty={:?} k={} n={} row={} rb={} w={}B off={}B f={:?} rows={} blk={} grid={} shmem={} lanes={}",
+                u.ty,
+                u.k,
+                u.n,
+                row,
+                cfg.rb,
+                qw[i].buf.bytes(),
+                *row * 4,
+                cfg.f,
+                cfg.rows_per_block,
+                cfg.block_dim,
+                cfg.grid,
+                cfg.shmem,
+                cfg.lanes
+            ));
+        }
+        s.push_str(&format!(
+            " | out ty={:?} k={} n={} rb={} w={}B rows={} blk={} grid={} shmem={} lanes={}",
+            req.out_unit.ty,
+            req.out_unit.k,
+            req.out_unit.n,
+            ocfg.rb,
+            ow.buf.bytes(),
+            ocfg.rows_per_block,
+            ocfg.block_dim,
+            ocfg.grid,
+            ocfg.shmem,
+            ocfg.lanes
+        ));
+        tracing::info!("{s}");
+    }
+
+    // ---- submission (発行を積んで最後の D2H で 1 回だけ待つ) ----------------
+    let check = gdn_gpu_check_on();
+    let (cur_face, out_face) = {
+        let (_, e) = &store_lock[idx];
+        (e.cur, 1 - e.cur)
+    };
+    let scan_launched = std::cell::Cell::new(false);
+    let (dk, dv) = (req.dk, req.dv);
+    let sync_dbg = gdn_submit_sync_on();
+    // 診断 (`DENNO_GDN_SUBMIT_SYNC=1`): 段ごとに同期し、失敗した段を名前に残す。
+    // 700 は「壊れた launch の後、次にホストと同期する API」が返すので、これが
+    // 無いと段を特定できない (off のときは 1 バイトも挙動が変わらない)。
+    macro_rules! stage_sync {
+        ($name:expr) => {
+            if sync_dbg {
+                if let Err(e) = ctx.sync() {
+                    return Err(anyhow!("段 {} で失敗: {e:#}", $name));
+                }
+            }
+        };
+    }
+    let run = || -> Result<(Vec<f32>, Option<(Vec<f32>, Vec<f32>)>)> {
+        let (_, e) = &store_lock[idx];
+        // task 140: cur / beta / alpha を 1 本の staging に詰めて **H2D 1 回**で
+        // 上げる (以前は同期 H2D 3 回。値・並びは同一で、カーネルへ渡す
+        // ポインタだけが xba の先頭/中間を指す)。
+        GDN_STAGE.with(|cell| -> Result<()> {
+            let mut st = cell.borrow_mut();
+            st.clear();
+            st.extend_from_slice(req.cur);
+            st.extend_from_slice(req.beta);
+            st.extend_from_slice(req.alpha);
+            e.xba.copy_from(st.as_slice())
+        })?;
+        stage_sync!("xba_h2d");
+        let px = e.xba.ptr();
+        let pb = px + (req.n_embd * 4) as CUdeviceptr;
+        let pa = pb + (req.nv * 4) as CUdeviceptr;
+        for (i, ((u, row), cfg)) in req.qkv_units.iter().zip(qcfg.iter()).enumerate() {
+            gdn_launch_gemv_dev(
+                ctx,
+                cfg,
+                &qw[i].buf,
+                px,
+                e.qkv.ptr() + (*row * 4) as CUdeviceptr,
+                u.k,
+                u.n,
+            )?;
+            stage_sync!(format!("qkv_gemv[{i}]"));
+        }
+        let (mut pq, mut pz) = (
+            e.qkv.ptr() + (req.qkv_row_start * 4) as CUdeviceptr,
+            e.qkv.ptr() + (req.z_row_start * 4) as CUdeviceptr,
+        );
+        let (mut pb, mut pa) = (pb, pa);
+        let (mut pci, mut pco) = (e.conv[cur_face].ptr(), e.conv[out_face].ptr());
+        let (mut psi, mut pso) = (e.ssm.ptr(), e.ssm.ptr());
+        let (mut pwc, mut pwa) = (e.wconv.ptr(), e.wa.ptr());
+        let (mut pwd, mut pwn) = (e.wdt.ptr(), e.wnorm.ptr());
+        let mut py = e.y.ptr();
+        let (mut ni, mut nki, mut nvi, mut dki, mut dvi) = (
+            1 as c_int,
+            req.nk as c_int,
+            req.nv as c_int,
+            req.dk as c_int,
+            req.dv as c_int,
+        );
+        let (mut cdi, mut dci, mut csi) = (
+            req.conv_dim as c_int,
+            req.d_conv as c_int,
+            (req.d_conv - 1) as c_int,
+        );
+        let (mut epsi, mut qsi) = (req.eps, 1.0f32 / (req.dk as f32).sqrt());
+        let mut args = [
+            &mut pq as *mut _ as *mut c_void,
+            &mut pz as *mut _ as *mut c_void,
+            &mut pb as *mut _ as *mut c_void,
+            &mut pa as *mut _ as *mut c_void,
+            &mut pci as *mut _ as *mut c_void,
+            &mut psi as *mut _ as *mut c_void,
+            &mut pwc as *mut _ as *mut c_void,
+            &mut pwa as *mut _ as *mut c_void,
+            &mut pwd as *mut _ as *mut c_void,
+            &mut pwn as *mut _ as *mut c_void,
+            &mut py as *mut _ as *mut c_void,
+            &mut pco as *mut _ as *mut c_void,
+            &mut pso as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut nki as *mut _ as *mut c_void,
+            &mut nvi as *mut _ as *mut c_void,
+            &mut dki as *mut _ as *mut c_void,
+            &mut dvi as *mut _ as *mut c_void,
+            &mut cdi as *mut _ as *mut c_void,
+            &mut dci as *mut _ as *mut c_void,
+            &mut csi as *mut _ as *mut c_void,
+            &mut epsi as *mut _ as *mut c_void,
+            &mut qsi as *mut _ as *mut c_void,
+        ];
+        let shmem = ((3 * dk + dv + 5) * 4) as u32;
+        unsafe {
+            ctx.launch_async(
+                f_scan,
+                (req.nv as u32, 1, 1),
+                (req.dk as u32, 1, 1),
+                shmem,
+                &mut args,
+            )?;
+        }
+        scan_launched.set(true);
+        stage_sync!("scan");
+        gdn_launch_gemv_dev(ctx, &ocfg, &ow.buf, e.y.ptr(), e.out.ptr(), req.nv * req.dv, req.n_embd)?;
+        stage_sync!("out_gemv");
+        let out = e.out.to_vec::<f32>(req.n_embd)?;
+        // 診断 (DENNO_GDN_GPU_CHECK): scan 後のデバイス状態も読む。
+        let state_dev = if check {
+            let conv = e.conv[out_face].to_vec::<f32>(e.conv_len)?;
+            let ssm = e.ssm.to_vec::<f32>(e.ssm_len)?;
+            Some((conv, ssm))
+        } else {
+            None
+        };
+        Ok((out, state_dev))
+    };
+    let r = run();
+    match r {
+        Ok((out, state_dev)) => {
+            let (_, e) = &mut store_lock[idx];
+            e.cur = out_face;
+            e.device_authoritative = true;
+            GdnDecodeRes {
+                out: Some(out),
+                state_back: None,
+                poisoned: false,
+                state_dev,
+            }
+        }
+        Err(err) => {
+            if !scan_launched.get() {
+                // scan 発行前の失敗: デバイス状態はホストと等価 (シード済みなら
+                // ホストの写しだけ)。ホスト state は無傷なのでそのまま CPU へ。
+                gdn_note_once(&format!(
+                    "submission の発行に失敗 (li={} tok={}) → CPU 経路: {err:#}",
+                    req.li, req.tok
+                ));
+                return gdn_scan_record_failure(GdnDecodeRes::cpu());
+            }
+            // scan 発行後の失敗: 新状態はデバイスの書き込み面にある。回復を
+            // 試みて、成功ならホストへ写させる。失敗したら poisoned。
+            let (_, e) = &mut store_lock[idx];
+            match (
+                e.conv[out_face].to_vec::<f32>(e.conv_len),
+                e.ssm.to_vec::<f32>(e.ssm_len),
+            ) {
+                (Ok(conv), Ok(ssm)) => {
+                    e.device_authoritative = false;
+                    gdn_note_once(&format!(
+                        "submission の後段で失敗 (状態は回復済み) → CPU 経路: {err:#}"
+                    ));
+                    gdn_scan_record_failure(GdnDecodeRes {
+                        out: None,
+                        state_back: Some((conv, ssm)),
+                        poisoned: false,
+                        state_dev: None,
+                    })
+                }
+                _ => {
+                    tracing::error!(
+                        "[gdn-gpu-scan] scan 発行後の失敗かつ状態回復も失敗 (li={}) → 要求を落とすこと: {err:#}",
+                        req.li
+                    );
+                    gdn_scan_record_failure(GdnDecodeRes {
+                        out: None,
+                        state_back: None,
+                        poisoned: true,
+                        state_dev: None,
+                    })
+                }
+            }
+        }
+    }
+}
+
+// ---- task 128: GPU 不要の CPU テスト (ゲート off / ラッチ / Req 組み立て) ----
+
+#[cfg(test)]
+mod gdn_decode_scan_tests {
+    use super::*;
+
+    /// テストが立てたフラグ (ラッチ / scan ゲート / GPU 強制) を panic でも戻す。
+    struct LatchGuard;
+    impl Drop for LatchGuard {
+        fn drop(&mut self) {
+            gdn_scan_unavailable_reset_for_test();
+            gdn_gpu_scan_set_for_test(false);
+        }
+    }
+
+    fn empty_req<'a>(units: &'a [(GdnGgufUnit<'a>, usize)]) -> GdnDecodeReq<'a> {
+        GdnDecodeReq {
+            nonce: 0xBEEF,
+            li: 3,
+            tok: 1,
+            n_embd: 0,
+            qkv_total: 0,
+            qkv_row_start: 0,
+            z_row_start: 0,
+            qkv_units: units,
+            out_unit: GdnGgufUnit {
+                uid: 0,
+                ty: crate::kquant::GgmlType::Q8_0,
+                blocks: &[],
+                k: 0,
+                n: 0,
+            },
+            cur: &[],
+            beta: &[],
+            alpha: &[],
+            conv_host: &[],
+            ssm_host: &[],
+            wconv: &[],
+            wa: &[],
+            wdt: &[],
+            wnorm: &[],
+            nk: 0,
+            nv: 0,
+            dk: 0,
+            dv: 0,
+            conv_dim: 0,
+            d_conv: 4,
+            eps: 1e-6,
+        }
+    }
+
+    /// task 140: `DENNO_GDN_SUBMIT_SYNC` / `DENNO_GDN_SUBMIT_DUMP` の真理値表
+    /// (純関数)。既定はどちらも off。
+    #[test]
+    fn gdn_submit_sync_truth_table() {
+        for (raw, want) in [
+            (None, false),
+            (Some("0"), false),
+            (Some(""), false),
+            (Some("off"), false),
+            (Some("yes"), false),
+            (Some("1"), true),
+            (Some("on"), true),
+            (Some("true"), true),
+        ] {
+            assert_eq!(
+                parse_gdn_submit_sync(raw),
+                want,
+                "DENNO_GDN_SUBMIT_SYNC={raw:?} の解釈が違う"
+            );
+            assert_eq!(
+                parse_gdn_submit_dump(raw),
+                want,
+                "DENNO_GDN_SUBMIT_DUMP={raw:?} の解釈が違う"
+            );
+        }
+    }
+
+    /// task 142: `DENNO_GDN_GPU_SCAN` の真理値表。**未設定は on** (task 142 で採用)、
+    /// 明示的な `0|off|false|no` (空白・大小文字は無視) だけ off。
+    #[test]
+    fn gdn_gpu_scan_truth_table_default_on() {
+        for (raw, want) in [
+            (None, true),
+            (Some(""), true),
+            (Some(" "), true),
+            (Some("1"), true),
+            (Some("on"), true),
+            (Some("true"), true),
+            (Some("YES"), true),
+            (Some("0"), false),
+            (Some("off"), false),
+            (Some("false"), false),
+            (Some(" OFF "), false),
+            (Some("no"), false),
+        ] {
+            assert_eq!(
+                parse_gdn_gpu_scan(raw),
+                want,
+                "DENNO_GDN_GPU_SCAN={raw:?} の解釈が違う"
+            );
+        }
+    }
+
+    /// task 142: env を立てなくてもゲートは on に解決し、強制 off で落ちること
+    /// (既定の解決と両方向の強制を数える)。
+    #[test]
+    fn gdn_gpu_scan_default_on_and_forced_off() {
+        let _g = test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gdn_gpu_scan_set_for_test(false);
+        assert!(!gdn_gpu_scan_on(), "強制 off が効いていない");
+        gdn_gpu_scan_set_for_test(true);
+        assert!(gdn_gpu_scan_on(), "強制 on が効いていない");
+        gdn_gpu_scan_reset_force_for_test();
+        if std::env::var_os("DENNO_GDN_GPU_SCAN").is_none() {
+            assert!(gdn_gpu_scan_on(), "env 未設定の既定が on でない");
+        }
+        // 後続テストのために強制 off に戻す (LatchGuard と同じ状態)。
+        gdn_gpu_scan_set_for_test(false);
+    }
+
+    /// GPU 側の失敗ラッチ: (1) 初回だけ「立った」が true で以後冪等、(2) ラッチは
+    /// GPU_BROKEN を立てない = intercept 経路に影響しない、(3) ラッチがあると
+    /// submit は CUDA / デバイス状態ストアに触れずに即 CPU 経路を返す。
+    #[test]
+    fn gdn_scan_latch_blocks_submit_without_cuda_and_spares_gpu_broken() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lg = LatchGuard;
+        gdn_scan_unavailable_reset_for_test();
+
+        assert!(!gdn_scan_unavailable_for_test(), "初期状態は立っていない");
+        assert!(gdn_scan_mark_unavailable(), "初回は立った");
+        assert!(!gdn_scan_mark_unavailable(), "2 度目は既に立っている (冪等)");
+        assert!(!gpu_broken_flag(), "ラッチは GPU_BROKEN を立てない");
+
+        gdn_gpu_scan_set_for_test(true);
+        let units: [(GdnGgufUnit<'_>, usize); 0] = [];
+        let req = empty_req(&units);
+        let res = gdn_decode_submit(&req);
+        assert!(res.out.is_none(), "ラッチで即 CPU 経路");
+        assert!(!res.poisoned, "ラッチは要求を落とさない");
+        assert!(res.state_back.is_none());
+        assert!(res.state_dev.is_none());
+        assert_eq!(
+            gdn_decode_state_entry_count(),
+            0,
+            "ラッチ経路はストアに触れない"
+        );
+
+        // ラッチを戻した同一 req でも、GPU 無しのコンテナでは同じく cpu() で
+        // ストアは増えない (decline と latch が外から同じ結果 = 契約不変)。
+        gdn_scan_unavailable_reset_for_test();
+        let res2 = gdn_decode_submit(&req);
+        assert!(res2.out.is_none());
+        assert_eq!(gdn_decode_state_entry_count(), 0);
+    }
+
+    /// ゲート強制 off では submit が CUDA に触れず、ストアも増えない。
+    #[test]
+    fn gdn_scan_gate_off_never_touches_store() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lg = LatchGuard;
+        gdn_scan_unavailable_reset_for_test();
+        assert!(!gdn_gpu_scan_on(), "強制 off が効いていない");
+        let units: [(GdnGgufUnit<'_>, usize); 0] = [];
+        let req = empty_req(&units);
+        let res = gdn_decode_submit(&req);
+        assert!(res.out.is_none());
+        assert!(!res.poisoned);
+        assert_eq!(gdn_decode_state_entry_count(), 0, "ゲート off でストアが増えた");
+    }
+
+    /// task 128: reset の無効化が分岐として発火すること (数える)。
+    /// `gdn_decode_state_invalidate_counted` は reset 経路から呼ばれる。
+    #[test]
+    fn gdn_invalidate_counted_increments() {
+        let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lg = LatchGuard;
+        gdn_invalidate_calls_reset_for_test();
+        assert_eq!(gdn_invalidate_calls_for_test(), 0);
+        gdn_decode_state_invalidate_counted(0xABC, 5);
+        assert_eq!(gdn_invalidate_calls_for_test(), 1, "記帳されていない");
+        // ストアにエントリが無くても panic しない (no-op)。
+        assert_eq!(gdn_decode_state_entry_count(), 0);
     }
 }
 
