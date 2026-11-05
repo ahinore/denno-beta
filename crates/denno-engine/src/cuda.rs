@@ -388,12 +388,21 @@ pub struct DevBuffer {
 impl DevBuffer {
     /// task 149: タグ付きの確保。確保に失敗したら expert の LRU を 1 回追い出して
     /// 再試行する (「確保失敗で expert を CPU に固定する」経路を通常経路にしない)。
+    ///
+    /// ここで `DevBuffer` を一度作ってから詰め替えないこと — `Drop` が
+    /// `cuMemFree` を呼ぶので、確保した領域がその場で解放されてしまう
+    /// (lab t149a で実際に踏んだ)。`raw_alloc` は生のポインタだけを返す。
     #[track_caller]
     fn alloc_tagged(bytes: usize, tag: &'static str) -> Result<Self> {
         match Self::raw_alloc(bytes) {
-            Ok(b) => {
+            Ok(ptr) => {
                 crate::mem_audit::note_alloc(tag, bytes.max(1));
-                Ok(Self { tag, ..b })
+                Ok(Self {
+                    ptr,
+                    bytes,
+                    owned: true,
+                    tag,
+                })
             }
             Err(e) => {
                 // task 149: 他の常駐 (attention のミラー・重み・arena) が原因で
@@ -407,15 +416,21 @@ impl DevBuffer {
                     "task149: 確保失敗 → expert を {} MiB 追い出して再試行 ({e:#})",
                     freed >> 20
                 );
-                let b = Self::raw_alloc(bytes)?;
+                let ptr = Self::raw_alloc(bytes)?;
                 crate::mem_audit::note_alloc(tag, bytes.max(1));
-                Ok(Self { tag, ..b })
+                Ok(Self {
+                    ptr,
+                    bytes,
+                    owned: true,
+                    tag,
+                })
             }
         }
     }
 
+    /// `cuMemAlloc` を 1 回だけ呼ぶ (返すのは生のポインタ。`Drop` を通さない)。
     #[track_caller]
-    fn raw_alloc(bytes: usize) -> Result<Self> {
+    fn raw_alloc(bytes: usize) -> Result<CUdeviceptr> {
         let mut ptr: CUdeviceptr = 0;
         let res = unsafe { (lib()?.mem_alloc)(&mut ptr, bytes) };
         if res != CUDA_SUCCESS {
@@ -439,7 +454,7 @@ impl DevBuffer {
                 }
             }
         }
-        Ok(Self { ptr, bytes, owned: true, tag: crate::mem_audit::TAG_OTHER })
+        Ok(ptr)
     }
 
     #[track_caller]
