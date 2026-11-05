@@ -4422,11 +4422,15 @@ pub fn pf_scratch_begin(rows: usize) {
     }
 }
 
-/// task 149: `DENNO_SCRATCH_FREE` の解釈。未設定 = 有効 (リクエスト終了で返す)。
+/// task 149: `DENNO_SCRATCH_FREE` の解釈。既定 **off** (明示的に 1/true/on で有効)。
+///
+/// lab t149c の flash では arena が 1 度も確保されず (tag `scratch arena` が
+/// 表に出ない)、解放しても 1 MiB も変わらなかった。qwen35 側の経路には効く
+/// 可能性があるが未測定なので、既定では従来どおり保持する。
 fn parse_scratch_free(raw: Option<&str>) -> bool {
-    !matches!(
+    matches!(
         raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("0") | Some("false") | Some("off")
+        Some("1") | Some("true") | Some("on")
     )
 }
 
@@ -25164,16 +25168,16 @@ mod p53_qk_overlap_tests {
 mod p58_scratch_arena_tests {
     use super::*;
 
-    /// task 149: リクエスト終了時の解放は既定で有効、`0/false/off` で切り戻せる。
+    /// task 149: リクエスト終了時の解放は既定 off (lab で効果が無かったため)。
     #[test]
     fn scratch_free_env_gate() {
-        assert!(parse_scratch_free(None), "未設定 = 有効");
-        assert!(parse_scratch_free(Some("1")));
-        assert!(parse_scratch_free(Some("true")));
+        assert!(!parse_scratch_free(None), "未設定 = off (従来どおり保持)");
         assert!(!parse_scratch_free(Some("0")));
-        assert!(!parse_scratch_free(Some(" 0 ")));
         assert!(!parse_scratch_free(Some("false")));
         assert!(!parse_scratch_free(Some("OFF")));
+        assert!(parse_scratch_free(Some("1")));
+        assert!(parse_scratch_free(Some(" true ")));
+        assert!(parse_scratch_free(Some("on")));
     }
 
     /// 27B q4・n=14,240 の prefill で実際に切り出される 12 スロット

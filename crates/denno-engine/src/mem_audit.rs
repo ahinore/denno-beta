@@ -342,8 +342,14 @@ pub fn card_budget_on() -> bool {
     })
 }
 
-/// 既定値。lab の結果で採否を決めてから切り替える。
-pub const CARD_BUDGET_DEFAULT: bool = true;
+/// 既定値。lab t149c の結果で **no** にした (`REPORT_P149.md`)。
+///
+/// 予算はカードの実情に合い、24,000/28,000 でも確保失敗が出なくなったが、
+/// (a) expert 以外の常駐は 1 MiB も減っていない、(b) expert の実効常駐量は
+/// 21,427 MiB で従来の 22,000 MiB より少ない、(c) 28 token の prefill が
+/// +3.3% (確保のたびの `cuMemGetInfo` が主因と推定) なので、任務の採否条件
+/// (3 GB 減または実効予算の増加、かつ prefill 2% 以内) を満たさない。
+pub const CARD_BUDGET_DEFAULT: bool = false;
 
 /// `DENNO_VRAM_RESERVE_MB` (MiB)。
 pub fn vram_reserve_mb() -> u64 {
