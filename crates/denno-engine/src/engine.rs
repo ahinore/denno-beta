@@ -729,6 +729,16 @@ impl Engine {
         }
         #[cfg(feature = "cuda")]
         crate::cuda::log_gpu_kv_mirror_usage();
+        // task 149: リクエストが終わったら prefill の一時領域 (arena) を返し、
+        // 確保の内訳を 1 表だけ出す (1 本目の後と、長い文脈の最初の 1 回)。
+        // `DENNO_SCRATCH_FREE=0` / `DENNO_Q4_PROFILE` なしでは従来どおり何もしない。
+        #[cfg(feature = "cuda")]
+        {
+            let ctx_tokens = slot_opt.map(|s| self.caches[s].len()).unwrap_or(0);
+            // 解放**前**の内訳を出す (arena が何 GiB 残っているかが読める)。
+            crate::mem_audit::request_end(ctx_tokens, 4096, crate::cuda::dev_mem_mb());
+            crate::cuda::pf_scratch_release();
+        }
     }
 
     /// P58-4: スロット会計の解放 (予約・busy・必要なら KV ミラー行の破棄)。

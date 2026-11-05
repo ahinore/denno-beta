@@ -608,6 +608,36 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
         v.sort_by_key(|(_, t)| *t);
         v.into_iter().map(|(k, _)| k).collect()
     }
+
+    /// task 149: 上限を差し替える (カード実容量からの予算を毎回反映するため)。
+    ///
+    /// 呼び出し側は差し替えた直後に [`VramLru::make_room`] を通すこと
+    /// (ここでは 1 本も追い出さない)。
+    pub fn set_cap(&mut self, cap: usize) {
+        self.cap_bytes = cap;
+    }
+
+    /// task 149: `want` バイト以上が空くまで、最終使用が古い順に**全部**追い出し、
+    /// 追い出した `(key, value)` を返す (呼び出し側が drop すれば VRAM が空く)。
+    ///
+    /// 予算 (`cap`) では追い出せない状況 — カードが他の常駐で埋まっている —
+    /// のための最終手段。[`VramLru::make_room`] と違い `pinned_bytes` は動かさない。
+    pub fn evict_until_free(&mut self, want: usize) -> Vec<(K, V)> {
+        let mut out = Vec::new();
+        let mut freed = 0usize;
+        for k in self.lru_keys() {
+            if freed >= want {
+                break;
+            }
+            let had = self.entries.get(&k).map(|s| s.bytes).unwrap_or(0);
+            if let Some(v) = self.remove(&k) {
+                freed = freed.saturating_add(had);
+                out.push((k, v));
+            }
+        }
+        self.stats.evictions = self.stats.evictions.saturating_add(out.len() as u64);
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +705,61 @@ pub fn release_external(bytes: usize) {
     {
         let _ = bytes;
     }
+}
+
+/// task 149: デバイス確保が失敗したときの**最終手段**。expert の LRU を古い順に
+/// 追い出して `need` バイト以上を空け、空けたバイト数を返す。
+///
+/// 呼び出し元は [`crate::cuda::DevBuffer`] の確保失敗経路。ここで追い出せば
+/// 1 回だけやり直せるので、「確保失敗 → expert を CPU に固定」という
+/// プロセス寿命のラッチを通常経路にしない。LRU のロックが取れないとき
+/// (expert の確保がロック保持中に走っている) は 0 を返して何もしない。
+pub fn emergency_free(need: usize) -> usize {
+    #[cfg(feature = "cuda")]
+    {
+        gpu::emergency_free(need)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = need;
+        0
+    }
+}
+
+/// task 149: 確保に失敗したあと「LRU を追い出して再試行」するかの判定 (純関数)。
+///
+/// - 再試行は **1 回だけ** (`attempt == 0`)。
+/// - 追い出しが 1 バイトも無ければ再試行しない (同じ失敗を繰り返さない)。
+///
+/// この順序 (失敗 → 追い出し → 再試行) が「確保失敗で expert を CPU に固定する」
+/// ラッチを通常経路にしないための契約。
+pub fn should_retry_after_fail(attempt: usize, freed: usize) -> bool {
+    attempt == 0 && freed > 0
+}
+
+/// task 149: expert LRU の実効上限 (カード実容量 - 余裕 - expert 以外の常駐)。
+///
+/// `DENNO_VRAM_BUDGET_CARD=0` のときは `env_cap` をそのまま返す = 従来の挙動。
+/// 予算が 0 (無制限) でもカード側の上限は返る (「予算を本物にする」の本体)。
+#[cfg(feature = "cuda")]
+pub fn effective_expert_cap(env_cap: usize) -> usize {
+    if !crate::mem_audit::card_budget_on() {
+        return env_cap;
+    }
+    let Some((_, total_mb)) = crate::cuda::dev_mem_mb() else {
+        return env_cap;
+    };
+    let total = total_mb.saturating_mul(1 << 20);
+    let reserve = (crate::mem_audit::vram_reserve_mb() as usize).saturating_mul(1 << 20);
+    let others = crate::mem_audit::live_bytes()
+        .saturating_sub(crate::mem_audit::experts_live_bytes());
+    crate::mem_audit::card_expert_cap(env_cap, total, reserve, others)
+}
+
+/// CUDA 無しのビルドでは VRAM 予算そのものが無い (`env_cap` をそのまま返す)。
+#[cfg(not(feature = "cuda"))]
+pub fn effective_expert_cap(env_cap: usize) -> usize {
+    env_cap
 }
 
 /// 予算の消費量 `(使用中バイト, ピン留めバイト, 予算バイト)`。1 つも設定が無ければ `None`。
@@ -993,12 +1078,19 @@ mod gpu {
     }
 
     static CACHE: OnceLock<Mutex<VramLru<ExpertKey, Arc<ExpertDev>>>> = OnceLock::new();
+    /// task 149: `DENNO_EXPERT_VRAM_MB` の生値 (バイト)。カード予算の計算元。
+    static ENV_CAP: OnceLock<usize> = OnceLock::new();
     /// 全 evict 後も確保できなかった回数 (診断用)
     static FALLBACKS: AtomicU64 = AtomicU64::new(0);
     /// 1 本が上限より大きいことを 1 回だけ言うためのラッチ
     static OVERSIZE_LOGGED: AtomicBool = AtomicBool::new(false);
     /// 確保失敗で VRAM 経路を諦めた (プロセス寿命)
     static ALLOC_DEAD: AtomicBool = AtomicBool::new(false);
+    /// task 149: 連続で確保に失敗した回数。`ALLOC_FAIL_LATCH` 回で初めて
+    /// `ALLOC_DEAD` を立てる (1 回の失敗で decode 全体を CPU に落とさない)。
+    static ALLOC_FAIL_STREAK: AtomicU64 = AtomicU64::new(0);
+    /// task 149: 諦めるまでの連続失敗回数。
+    const ALLOC_FAIL_LATCH: u64 = 64;
     /// 直近の確保失敗の理由 (診断用。1 回 take したら消える)
     static LAST_ALLOC_ERR: Mutex<Option<String>> = Mutex::new(None);
 
@@ -1022,7 +1114,60 @@ mod gpu {
 
     /// 上限 `cap_bytes` で LRU を作る (プロセスで 1 回)。2 回目以降は無視する。
     pub fn init(cap_bytes: usize) {
-        let _ = CACHE.set(Mutex::new(VramLru::new(cap_bytes)));
+        let _ = ENV_CAP.set(cap_bytes);
+        // task 149: 起動時点の実効上限 (カード実容量 - 余裕 - 他の常駐) で作る。
+        // 以後も確保のたびに引き直す (`DENNO_VRAM_BUDGET_CARD=0` なら env のまま)。
+        let _ = CACHE.set(Mutex::new(VramLru::new(super::effective_expert_cap(cap_bytes))));
+    }
+
+    /// `DENNO_EXPERT_VRAM_MB` の生値 (バイト)。実効上限の計算に使う。
+    fn env_cap() -> usize {
+        ENV_CAP.get().copied().unwrap_or(0)
+    }
+
+    /// task 149: LRU の上限をカードの実情へ合わせ直す。
+    fn refresh_cap(g: &mut VramLru<ExpertKey, Arc<ExpertDev>>) {
+        g.set_cap(super::effective_expert_cap(env_cap()));
+    }
+
+    /// task 149: 確保失敗時の最終手段 (LRU を古い順に追い出して `need` を空ける)。
+    ///
+    /// `try_lock` なので、expert の確保が LRU のロック保持中に走っている場合は
+    /// 何もしない (呼び出し側 = [`acquire_opts`] が自分で追い出して再試行する)。
+    pub fn emergency_free(need: usize) -> usize {
+        let Some(c) = CACHE.get() else {
+            return 0;
+        };
+        let Ok(mut g) = c.try_lock() else {
+            return 0;
+        };
+        let evicted = g.evict_until_free(need);
+        let freed: usize = evicted.iter().map(|(_, v)| v.bytes()).sum();
+        drop(evicted); // DevBuffer が落ちて VRAM が空く
+        freed
+    }
+
+    /// task 149: expert 1 本 (gate/up/down) を**左から順に**確保する。
+    ///
+    /// 失敗した時点で先に確保したぶんはこの関数を抜けるときに drop され、
+    /// VRAM が戻る (従来の closure 3 連と同じ順序・同じ後始末)。
+    fn alloc_three(
+        pinned: bool,
+        gb: &[u8],
+        ub: &[u8],
+        db: &[u8],
+    ) -> anyhow::Result<[DevBuffer; 3]> {
+        let one = |b: &[u8]| -> anyhow::Result<DevBuffer> {
+            if pinned {
+                crate::cuda::from_slice_pinned(b)
+            } else {
+                DevBuffer::from_slice_tagged(b, crate::mem_audit::TAG_EXPERTS)
+            }
+        };
+        let gate = one(gb)?;
+        let up = one(ub)?;
+        let down = one(db)?;
+        Ok([gate, up, down])
     }
 
     /// (使用中バイト, 上限バイト)。未初期化なら `None`。
@@ -1033,10 +1178,17 @@ mod gpu {
     }
 
     /// (LRU 使用中バイト, 外部予約バイト, 上限バイト)。未初期化なら `None`。
+    ///
+    /// task 149: 上限は「env の値」ではなく**いまの実効上限**を返す
+    /// (カード予算が有効なら、他の常駐が増えた分だけ小さくなる)。
     pub fn budget_usage() -> Option<(usize, usize, usize)> {
         let c = CACHE.get()?;
         let g = c.lock().ok()?;
-        Some((g.used_bytes(), g.pinned_bytes(), g.cap_bytes()))
+        Some((
+            g.used_bytes(),
+            g.pinned_bytes(),
+            super::effective_expert_cap(env_cap()),
+        ))
     }
 
     /// P60: 予算が初期化されているか (= [`reserve_external`] が会計に載るか)。
@@ -1086,6 +1238,9 @@ mod gpu {
                 })
             }
         };
+        // task 149: 予約の前に上限をカードの実情へ合わせる (他の常駐が増えていれば
+        // その分だけ expert が譲る)。
+        refresh_cap(&mut g);
         let evicted = g.reserve_pinned(bytes).ok()?;
         drop(evicted); // ここで DevBuffer が落ちて VRAM が空く
         Some(ExternalReserve {
@@ -1233,6 +1388,9 @@ mod gpu {
         }
 
         // 追い出してから確保する (cuMemAlloc の失敗を通常経路にしない)。
+        // task 149: 上限は毎回カードの実情へ合わせ直す (他の常駐が増えていれば
+        // その分だけ expert が譲る = 予算を本物にする)。
+        refresh_cap(&mut g);
         let evicted = match g.make_room(want) {
             Ok(v) => v,
             Err(e) => {
@@ -1251,35 +1409,60 @@ mod gpu {
         // task 144: H2D は pinned staging 経由が既定 (lab t144b の実測で pageable は
         // 2.4 GB/s しか出ず、expert 1 本の転送が CPU 計算の 10 倍かかっていた)。
         let pinned = crate::cuda::expert_pin_h2d();
-        let alloc = |b: &[u8]| match if pinned {
-            crate::cuda::from_slice_pinned(b)
-        } else {
-            DevBuffer::from_slice(b)
-        } {
-            Ok(d) => Some(d),
-            Err(e) => {
-                // task 146: 事前ロード (latch_on_fail = false) はプロセス寿命の
-                // CPU 固定を立てない。起動順の事故で decode 全体を失わないため。
-                // 理由は 1 行で出せるように控える (呼び出し側が take する)。
-                if latch_on_fail && !ALLOC_DEAD.swap(true, Ordering::Relaxed) {
-                    tracing::error!(
-                        "expert VRAM: 確保に失敗したので以後 CPU 経路に固定する: {e:#}"
+        // task 149: 確保に失敗したら LRU を (予算ではなく) 実メモリの都合で
+        // 追い出して 1 回だけやり直す。**それでも駄目ならこの expert だけ CPU**
+        // にし、プロセス寿命のラッチ (`ALLOC_DEAD`) は立てない — 次の expert /
+        // 次のトークンでまた試す。連続で失敗し続けたときだけ、ログを 1 行出して
+        // 諦める (無限に 2 MB の確保を試し続けないため)。
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut bufs: Option<[DevBuffer; 3]> = None;
+        for attempt in 0..2 {
+            match alloc_three(pinned, gb, ub, db) {
+                Ok(b) => {
+                    bufs = Some(b);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    // 予算の残りではなく実メモリが足りない。全部追い出して再試行。
+                    if attempt != 0 {
+                        break;
+                    }
+                    let ev = g.evict_until_free(want);
+                    let freed: usize = ev.iter().map(|(_, v)| v.bytes()).sum();
+                    drop(ev); // DevBuffer が落ちて VRAM が空く
+                    if !super::should_retry_after_fail(attempt, freed) {
+                        break;
+                    }
+                    tracing::warn!(
+                        "task149: expert の確保失敗 → LRU を {} MiB 追い出して再試行",
+                        freed >> 20
                     );
                 }
-                if let Ok(mut slot) = LAST_ALLOC_ERR.lock() {
-                    if slot.is_none() {
-                        *slot = Some(format!("{e:#}"));
-                    }
-                }
-                None
             }
-        };
-        // 3 本は左から順に評価される。失敗した時点で先に確保したぶんは
-        // この関数を抜けるときに drop されて VRAM が戻る。
-        let (Some(gate), Some(up), Some(down)) = (alloc(gb), alloc(ub), alloc(db)) else {
+        }
+        let Some([gate, up, down]) = bufs else {
             FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            let n = ALLOC_FAIL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+            let msg = last_err
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_else(|| "確保に失敗 (理由不明)".to_string());
+            if let Ok(mut slot) = LAST_ALLOC_ERR.lock() {
+                if slot.is_none() {
+                    *slot = Some(msg.clone());
+                }
+            }
+            if latch_on_fail && n >= ALLOC_FAIL_LATCH && !ALLOC_DEAD.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    "expert VRAM: 連続 {n} 回の確保失敗 → 以後 CPU 経路に固定する: {msg}"
+                );
+            }
             return Ok(None);
         };
+        ALLOC_FAIL_STREAK.store(0, Ordering::Relaxed);
+        if ALLOC_DEAD.load(Ordering::Relaxed) {
+            ALLOC_DEAD.store(false, Ordering::Relaxed);
+        }
 
         let dev = Arc::new(ExpertDev {
             bufs: [gate, up, down],
@@ -1358,6 +1541,81 @@ mod gpu {
 mod tests {
     use super::*;
     use crate::model::expert_cache::ExpertKey;
+
+    // ---- task 149: 確保失敗 → 追い出し → 再試行の順序 ----------------------
+
+    /// 失敗のあと LRU を古い順に追い出し、1 回だけやり直す。
+    ///
+    /// 実機の `cuMemAlloc` は呼べないので、確保だけを偽物にした**同じ順序**を
+    /// ここで回す (追い出しは本物の [`VramLru`]・本物の [`should_retry_after_fail`])。
+    #[test]
+    fn alloc_failure_evicts_oldest_then_retries_once() {
+        let mut lru: VramLru<u16, usize> = VramLru::new(10_000);
+        for (i, k) in [7u16, 8, 9].iter().enumerate() {
+            lru.make_room(2_000).unwrap();
+            lru.insert(*k, 2_000, i); // 7 が一番古い
+        }
+        let mut fail_left = 1u32; // 最初の 1 回だけ「実メモリが足りない」
+        let mut tries = 0u32;
+        let mut ok = false;
+        for attempt in 0..2 {
+            tries += 1;
+            if fail_left == 0 {
+                ok = true;
+                break;
+            }
+            fail_left -= 1;
+            if attempt != 0 {
+                break;
+            }
+            let ev = lru.evict_until_free(2_000);
+            let freed: usize = ev.len() * 2_000; // この模擬では 1 本 = 2,000 B
+            let evicted: Vec<u16> = ev.iter().map(|(k, _)| *k).collect();
+            drop(ev);
+            assert_eq!(evicted, vec![7], "最終使用が最も古い 7 だけ追い出す");
+            assert!(!should_retry_after_fail(attempt, 0), "空なら再試行しない");
+            if !should_retry_after_fail(attempt, freed) {
+                break;
+            }
+        }
+        assert!(ok, "追い出したあとの再試行で成功する");
+        assert_eq!(tries, 2, "試行は 2 回まで");
+        assert_eq!(lru.len(), 2, "追い出した 1 本だけが消える");
+        assert_eq!(lru.used_bytes(), 4_000);
+    }
+
+    /// 追い出せるものが無ければ再試行しない (= 2 回目の失敗で止まる)。
+    #[test]
+    fn no_retry_without_evictable_experts() {
+        let mut lru: VramLru<u16, usize> = VramLru::new(10_000);
+        lru.make_room(2_000).unwrap();
+        lru.insert(1, 2_000, 0);
+        let ev = lru.evict_until_free(2_000);
+        drop(ev);
+        assert_eq!(lru.len(), 0);
+        // 2 回目の失敗では追い出しを試みない (空振りを繰り返さない)。
+        assert!(!should_retry_after_fail(1, 2_000));
+        assert!(!should_retry_after_fail(0, 0));
+        assert!(should_retry_after_fail(0, 1));
+    }
+
+    /// `evict_until_free` は必要な量に達したら止まる (全部は落とさない)。
+    #[test]
+    fn evict_until_free_stops_when_enough() {
+        let mut c: VramLru<u8, usize> = VramLru::new(10_000);
+        for i in 0..5u8 {
+            c.make_room(100).unwrap();
+            c.insert(i, 100, i as usize);
+        }
+        let ev = c.evict_until_free(250);
+        let keys: Vec<u8> = ev.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![0, 1, 2], "古い順に 3 本で 300 >= 250");
+        assert_eq!(c.len(), 2);
+        // 全部要求すると空になる。
+        let ev = c.evict_until_free(usize::MAX);
+        assert_eq!(ev.len(), 2);
+        assert!(c.is_empty());
+    }
 
     /// 追い出しは「最終使用が最も古い」1 本から。
     #[test]
