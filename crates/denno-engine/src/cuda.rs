@@ -3876,6 +3876,58 @@ impl Drop for PinMem {
     }
 }
 
+thread_local! {
+    /// task 144: expert の H2D 用の pinned staging (1 本ぶん。grow-only)。
+    static EXPERT_PIN: std::cell::RefCell<Option<PinMem>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `DENNO_EXPERT_PIN_H2D`: expert の H2D を pinned staging 経由にするか。
+///
+/// 既定 **on** (`"0"` / `"off"` / `"false"` で従来の pageable コピー)。
+/// 転送するバイト列は同じで、変わるのは運び方だけ (モデルの数値には触らない)。
+pub fn expert_pin_h2d() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("DENNO_EXPERT_PIN_H2D").ok().as_deref(),
+            Some("0") | Some("off") | Some("false")
+        )
+    })
+}
+
+/// pinned staging 経由でホストのスライスを VRAM へ上げる (task 144)。
+///
+/// ページャブルなメモリからの `cuMemcpyHtoD` は driver が内部で staging するため、
+/// lab t144b の実測では **2.4 GB/s** しか出なかった (expert 1 本 2.05 MB で
+/// 0.86 ms)。pinned メモリへ 1 回コピーしてから H2D すると速い。
+/// デバイスへ渡るバイト列は [`DevBuffer::from_slice`] と同一 (1 bit も変えない)。
+pub fn from_slice_pinned<T: Copy>(data: &[T]) -> Result<DevBuffer> {
+    let bytes = std::mem::size_of_val(data);
+    let buf = DevBuffer::alloc(bytes.max(1))?;
+    if bytes == 0 {
+        return Ok(buf);
+    }
+    EXPERT_PIN.with(|cell| -> Result<()> {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().map(|p| p.bytes).unwrap_or(0) < bytes {
+            *slot = Some(PinMem::alloc(bytes)?);
+        }
+        let pin = slot.as_ref().expect("確保済み");
+        unsafe {
+            // ホスト側の 1 回コピー (pinned は DMA 可能な常駐メモリ)。
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, pin.ptr as *mut u8, bytes);
+            check(
+                (lib()?.memcpy_htod)(buf.ptr, pin.ptr, bytes),
+                "cuMemcpyHtoD (pinned)",
+            )?;
+        }
+        dbg_htod(bytes);
+        Ok(())
+    })?;
+    Ok(buf)
+}
+
 /// s167 (P6): 専用コピーストリーム (h2 の D2H を qkv/z GEMM と重ねる)。
 /// driver オブジェクトはコンテキストに属するので Drop で明示的に破棄する
 /// (スレッド終了時に解放。`stream_destroy` が無い driver ではリークするだけで、

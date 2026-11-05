@@ -1184,7 +1184,14 @@ mod gpu {
         drop(evicted); // ここで DevBuffer が落ちて VRAM が空く
 
         let [gb, ub, db] = load()?;
-        let alloc = |b: &[u8]| match DevBuffer::from_slice(b) {
+        // task 144: H2D は pinned staging 経由が既定 (lab t144b の実測で pageable は
+        // 2.4 GB/s しか出ず、expert 1 本の転送が CPU 計算の 10 倍かかっていた)。
+        let pinned = crate::cuda::expert_pin_h2d();
+        let alloc = |b: &[u8]| match if pinned {
+            crate::cuda::from_slice_pinned(b)
+        } else {
+            DevBuffer::from_slice(b)
+        } {
             Ok(d) => Some(d),
             Err(e) => {
                 if !ALLOC_DEAD.swap(true, Ordering::Relaxed) {

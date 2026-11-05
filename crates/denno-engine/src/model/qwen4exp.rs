@@ -6922,7 +6922,7 @@ fn moe_ffn_quant_impl(
         // ヒット率が永久に 0 のままになる)。
         #[cfg(feature = "cuda")]
         if vram_mode && iq_mode {
-            iq_warm_misses(lw, &sel, x.len(), e, ff);
+            iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
         }
     }
 
@@ -7399,21 +7399,28 @@ fn moe_experts_iq_gpu_batched(
 ///
 /// 失敗 (確保失敗・型未対応) は静かに諦める (リクエストは落とさない)。
 #[cfg(feature = "cuda")]
-fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize) {
+fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize, n_layer: usize) {
     use crate::model::expert_vram::ExpertShape;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     static LEFT: AtomicUsize = AtomicUsize::new(0);
     static DEAD: AtomicBool = AtomicBool::new(false);
+    /// このトークンで上げ直す担当層の開始位置 (層に均すための回転)。
+    static OFFSET: AtomicUsize = AtomicUsize::new(0);
     if DEAD.load(Ordering::Relaxed) {
         return;
     }
+    let budget = crate::model::exp_iq::upload_per_token();
+    let nl = n_layer.max(1);
     if lw.il == 0 {
-        LEFT.store(crate::model::exp_iq::upload_per_token(), Ordering::Relaxed);
-    }
-    let mut left = LEFT.load(Ordering::Relaxed);
-    if left == 0 {
-        return;
+        // 予算 `budget` 本/token を層に均す: 1 トークンに budget 層ぶんを担当し、
+        // 次のトークンはその続きから (前は層 0 に全部積んで層 1 以降が永久に
+        // 当たらなかった)。budget >= n_layer なら全層が毎トークン担当。
+        OFFSET.store(
+            (OFFSET.load(Ordering::Relaxed) + budget.max(1)) % nl,
+            Ordering::Relaxed,
+        );
+        LEFT.store(budget, Ordering::Relaxed);
     }
     let shapes = [
         ExpertShape {
@@ -7432,34 +7439,50 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize)
             n: e,
         },
     ];
+    let key_of = |ei: usize| ExpertKey {
+        layer: lw.il as u16,
+        expert: ei as u16,
+    };
+
+    // 1. 参照とヒットは**全層**で数える (担当外の層も数えないとヒット率が偏る)。
     let mut hits = 0u32;
+    let mut miss: Vec<usize> = Vec::new();
     for &ei in sel {
-        let key = ExpertKey {
-            layer: lw.il as u16,
-            expert: ei as u16,
-        };
-        match expert_vram::lookup(key, shapes) {
-            Ok(Some(_)) => {
-                hits += 1;
-                continue;
-            }
-            Ok(None) => {}
+        match expert_vram::lookup(key_of(ei), shapes) {
+            Ok(Some(_)) => hits += 1,
+            Ok(None) => miss.push(ei),
             Err(_) => break,
         }
-        // ここから先はミス。予算が無ければ数えるだけ (次のトークンで上げ直す)。
-        if left == 0 {
-            continue;
+    }
+    crate::model::exp_iq::note_lookup(sel.len() as u32, hits);
+
+    // 2. 上げ直しは担当層だけ、予算の範囲で。
+    let off = OFFSET.load(Ordering::Relaxed) % nl;
+    let served = budget >= nl || (lw.il + nl - off) % nl < budget;
+    if !served || budget == 0 {
+        return;
+    }
+    // 1 層あたりの上限: budget >= n_layer のときは均等割 (1 層に集中させない)。
+    let quota = if budget >= nl { budget / nl } else { 1 };
+    let mut left = LEFT.load(Ordering::Relaxed);
+    let mut can = left.min(quota);
+    for ei in miss {
+        if can == 0 {
+            break;
         }
-        let got = expert_vram::acquire(key, shapes, || {
+        let t = std::time::Instant::now();
+        let got = expert_vram::acquire(key_of(ei), shapes, || {
             Ok([
                 lw.gate_exps.slice(ei)?,
                 lw.up_exps.slice(ei)?,
                 lw.down_exps.slice(ei)?,
             ])
         });
+        crate::model::exp_iq::note_upload_ns(t.elapsed().as_nanos() as u64);
         match got {
             Ok(Some(_)) => {
                 left -= 1;
+                can -= 1;
                 LEFT.store(left, Ordering::Relaxed);
                 crate::model::exp_iq::note_upload();
             }
@@ -7470,7 +7493,6 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize)
             }
         }
     }
-    crate::model::exp_iq::note_lookup(sel.len() as u32, hits);
 }
 
 /// `cuda` feature 無しでは層一括経路は無い (常に `None` = per-expert 経路)。

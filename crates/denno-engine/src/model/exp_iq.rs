@@ -178,6 +178,14 @@ pub fn note_upload() {
     UPLOADS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// 上げ直しに使ったホスト時間 (ns)。acquire = ページフォルト + H2D。
+static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
+
+/// 上げ直しのホスト時間を積む。
+pub fn note_upload_ns(ns: u64) {
+    UPLOAD_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
 /// 1 リクエストぶんの 1 行。ゲートが off / 参照 0 件なら `None`。
 pub fn stats_line() -> Option<String> {
     if !iq_gpu_enabled() {
@@ -200,15 +208,16 @@ pub fn stats_line() -> Option<String> {
         ),
         None => "vram=-".to_string(),
     };
+    let up_ms = UPLOAD_NS.load(Ordering::Relaxed) as f64 / 1e6;
     Some(format!(
-        "[exp-iq] lookups={l} hits={h} hit_rate={:.3} gpu_layers={layers} gpu_experts={exps} uploads={up} {vram}",
+        "[exp-iq] lookups={l} hits={h} hit_rate={:.3} gpu_layers={layers} gpu_experts={exps} uploads={up} up_ms={up_ms:.1} {vram}",
         h as f64 / l as f64
     ))
 }
 
 /// 積算を 0 に戻す (リクエスト終端)。
 pub fn stats_reset() {
-    for c in [&LOOKUPS, &HITS, &GPU_LAYERS, &GPU_EXPERTS, &UPLOADS] {
+    for c in [&LOOKUPS, &HITS, &GPU_LAYERS, &GPU_EXPERTS, &UPLOADS, &UPLOAD_NS] {
         c.store(0, Ordering::Relaxed);
     }
 }
