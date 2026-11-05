@@ -16863,8 +16863,8 @@ mod tests {
             assert!(lines.len() >= 4, "{lines:?}");
             assert!(lines[0].starts_with("[q4ledger-pf] tok=6"), "{}", lines[0]);
             assert!(
-                lines.iter().any(|l| l.contains(" exp_pf ")),
-                "exp_pf の行が無い: {lines:?}"
+                lines.iter().any(|l| l.contains(" experts ")),
+                "experts の行が無い: {lines:?}"
             );
             // 名前付き区間の和は全体を超えない (二重計上しない) かつ other が残差。
             let total = q4ledger::prefill_wall_ns();

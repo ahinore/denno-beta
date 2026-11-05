@@ -37,11 +37,12 @@ pub const SHARED: usize = 2;
 pub const FULL: usize = 3;
 /// 区間: ssm 層の attention (qkv / gate / GDN / out)。
 pub const SSM: usize = 4;
-/// 区間: prefill のバッチ経路で選ばれた expert の本体 (task 145)。
+/// 区間: 選択 expert の寄与計算 (task 145)。decode と prefill の両方で立つ。
 ///
 /// prefill のバッチ経路では「重みの前置き (prefetch) を除いた、選択 expert の
 /// 寄与計算」= `moe_experts_flat` / `moe_experts_legacy` / grouped GEMM の区間。
-/// 台帳の名前は `exp_pf` (prefill のバッチ経路)。
+/// decode では CPU ミスぶんと [`EXPERT`] (IQ の層一括 GEMV) の**両方**を含む
+/// (IQ の GPU 区間はこの内側に入る)。台帳の名前は `experts`。
 pub const EXPERTS: usize = 5;
 /// 区間: 上のどれでもない (embed / ple / 層の外 / head / サンプラ)。
 ///
@@ -53,15 +54,15 @@ pub const OTHER: usize = 6;
 ///
 /// 「1 層あたり何 us か」を台帳から直接読むための区間。ミスして CPU で計算した
 /// expert はこの区間の外 (呼び出し側のループ) なので、**GPU で回したぶんだけ**が
-/// ここに積まれる。decode の IQ 経路だけが通り、台帳の名前は `exp_iq`
-/// (prefill は上の `EXPERTS` = `exp_pf`)。
+/// ここに積まれる。decode の IQ 経路だけが通り、decode では [`EXPERTS`] の
+/// 内側 (ネスト) に入る。台帳の名前は `exp_iq`。
 pub const EXPERT: usize = 7;
 /// 区間の数。
 pub const N: usize = 8;
-/// 区間の名前 ([`MIX`] の順)。`exp_pf` (prefill のバッチ expert) と
-/// `exp_iq` (task 144 の IQ 層一括 GEMV) は別の行。
+/// 区間の名前 ([`MIX`] の順)。`experts` (選択 expert の寄与全体) と
+/// `exp_iq` (task 144 の IQ 層一括 GEMV、decode では `experts` の内側) は別の行。
 pub const NAMES: [&str; N] = [
-    "mix", "router", "shared", "full", "ssm", "exp_pf", "other", "exp_iq",
+    "mix", "router", "shared", "full", "ssm", "experts", "other", "exp_iq",
 ];
 
 fn on() -> bool {
@@ -614,16 +615,16 @@ mod tests {
         assert!(head.contains("sync_floor="), "{head}");
         let exp = lines
             .iter()
-            .find(|l| l.contains(" exp_pf "))
-            .expect("exp_pf の行が無い");
+            .find(|l| l.contains(" experts "))
+            .expect("experts の行が無い");
         assert!(exp.contains("%"), "{exp}");
-        // other は外側のガードなので、内側 (exp_pf / mix) の時間を含まない。
+        // other は外側のガードなので、内側 (experts / mix) の時間を含まない。
         let other = lines
             .iter()
             .find(|l| l.contains(" other "))
             .expect("other の行が無い");
         assert!(other.contains("%"), "{other}");
-        assert!(other.contains("exp_pf") == false, "{other}");
+        assert!(other.contains("experts") == false, "{other}");
         // 全項目の wall の和 = 全体 (other が残りを吸う)。
         let sum: u64 = (0..N).map(|i| row(i).wall_ns).sum();
         let total: u64 = lines[0]
