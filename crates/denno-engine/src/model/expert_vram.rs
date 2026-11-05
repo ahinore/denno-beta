@@ -893,8 +893,8 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 
 #[cfg(feature = "cuda")]
 pub use gpu::{
-    acquire, cache_usage, check_enabled, fallbacks, init, lookup, note_check, take_check, Acquired,
-    CheckAcc, ExpertDev, ExpertShape,
+    acquire, cache_usage, check_enabled, fallbacks, init, lookup, lookup_many, note_check,
+    take_check, Acquired, CheckAcc, ExpertDev, ExpertShape,
 };
 
 #[cfg(feature = "cuda")]
@@ -1099,6 +1099,40 @@ mod gpu {
             );
         }
         Ok(Some(Arc::clone(dev)))
+    }
+
+    /// [`lookup`] の複数版 (task 148)。ロックを 1 回だけ取り、prefill の 1 層ぶん
+    /// (数百本) の参照をまとめて引く。
+    ///
+    /// 載っている expert は LRU の先頭へ移す (prefill でも「最近使った」を保つ)。
+    /// 形が登録済みと違う鍵があれば [`lookup`] と同じくエラー。
+    pub fn lookup_many(
+        keys: &[ExpertKey],
+        shapes: [ExpertShape; 3],
+    ) -> Result<Vec<Option<Arc<ExpertDev>>>> {
+        let Some(cache) = CACHE.get() else {
+            return Ok(vec![None; keys.len()]);
+        };
+        let mut g = cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("expert VRAM LRU のロックが poisoned"))?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(dev) = g.get_mut(key) else {
+                out.push(None);
+                continue;
+            };
+            if dev.shapes != shapes {
+                bail!(
+                    "expert VRAM: 同じ鍵 {:?} に別の形が来た (登録済み {:?} / 今回 {:?})",
+                    key,
+                    dev.shapes,
+                    shapes
+                );
+            }
+            out.push(Some(Arc::clone(dev)));
+        }
+        Ok(out)
     }
 
     /// [`acquire`] の結果。`hit` は「すでに VRAM に載っていたか」(P45 のゲートが
