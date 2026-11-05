@@ -40,6 +40,29 @@
 //! 1 層あたり GPU wall 151 us / kernel 76 us (9.3 expert)。**GATE 1 の 400 us は
 //! 2.6 倍の余裕で通る**。上げ直しは pageable H2D で 0.27〜0.31 ms/本
 //! (pinned staging は 0.34〜0.42 で負け)。既定 off のまま。
+//!
+//! # ラボ実測 (task 147: int-auto にマージ後、8098 停止で GPU 単独)
+//!
+//! SCENARIO=depth8k, commit 47c0e5128 (t147a / t147b)。`DENNO_EXPERT_IQ_GPU=1
+//! DENNO_EXPERT_GPU_MIN_HIT=0`、production env (`DENNO_GPU_WEIGHT_MB=12000` なので
+//! 予算は `DENNO_EXPERT_VRAM_MB + 12000` MiB)。decode は**温まった後**の値
+//! (28 tok は 2 本目のリクエスト):
+//!
+//! | cond | decode ms/tok 28 / 3,954 / 14,139 | hit rate | VRAM 実測 |
+//! | --- | --- | --- | --- |
+//! | base | 74 / 76 / 83 | - | - |
+//! | v14 | 58 / 68 / 66 | 0.911 / 0.848 / 0.915 | 13,999 MiB |
+//! | v20 | 47 / 58 / 57 | 0.990 / 0.922 / 0.963 | 19,999 MiB |
+//! | v22 | 47 / 55 / 58 | 0.990 / 0.944 / 0.972 | 21,997 MiB |
+//! | v24 | 47 / 55 / 139 | - (14k prefill で OOM) | 22,735 MiB で停止 |
+//!
+//! 24,000 と 26,000 は 14,018 トークンの prefill 中に `cuMemAlloc` が失敗し
+//! (空き 9 MiB / 総 32,110 MiB)、以後 q4 attention まで CPU に落ちて
+//! 132〜140 ms/tok・md5 DIFF になった。22,000 は 14k で 9 MiB まで埋まり、
+//! リクエスト境界で 0 byte の上げ直しが 1 回失敗して以後アップロードが止まる
+//! (decode は 57〜58 ms/tok のまま)。20,000 は 2 ラウンドとも確保失敗なし。
+//! **production には 20,000 を推奨** (14k で headroom 2 GB、decode は 22,000 と
+//! 同等、3,954 で 5% 遅いだけ)。md5 は base と全条件で SAME (24k/26k の 14k のみ DIFF)。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
