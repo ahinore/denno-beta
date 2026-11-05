@@ -2781,10 +2781,10 @@ impl Qwen4Exp {
     ) -> Result<Vec<f32>> {
         // P78: 層の外の区間計測の分母 (prefill 回数とトークン数)。
         prekprof::note_prefill(ctx.len());
-        // task 145: prefill の台帳。全体を `other` で包み、層の中の区間
-        // (mix / attn / router / shared / experts) は内側のガードで上書きする。
-        // したがって `other` は「どこにも割っていない残り」= 層の外と未計測分。
-        let _pf_all = q4ledger::enter(q4ledger::OTHER);
+        // task 145: prefill の台帳。全体の壁時計を 1 本で測り、層の中の区間
+        // (mix / attn / router / shared / experts) は内側のガードで積む。
+        // `other` は「全体 − 名前付き区間の和」の残差として `line_prefill` が出す。
+        let _pf_total = q4ledger::total();
         let logits = if batch && self.attn.layer_major_safe() {
             self.forward_prefill_batch_tapped(ctx, prefill_batch_chunk(), tokens, on_layer, roles)?
         } else {
@@ -3327,6 +3327,104 @@ fn mix_chain_from_value(v: Option<&str>) -> bool {
 fn mix_chain_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| mix_chain_from_value(std::env::var("DENNO_MIX_CHAIN").ok().as_deref()))
+}
+
+/// task 145: `DENNO_MIX_BATCH_GPU` の解釈 (純関数)。**既定 off**。
+/// `1` / `on` / `true` / `yes` のときだけ、prefill のバッチ mix (BF16 の
+/// down / up) を GPU の `dno_gemm_f32_mt` に載せる。
+fn mix_batch_gpu_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+        None => false,
+    }
+}
+
+/// task 145: テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+static MIX_BATCH_GPU_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// task 145: prefill のバッチ mix を GPU で回してよいか (既定 off)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn mix_batch_gpu_enabled() -> bool {
+    match MIX_BATCH_GPU_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        mix_batch_gpu_from_value(std::env::var("DENNO_MIX_BATCH_GPU").ok().as_deref())
+    })
+}
+
+/// task 145: テスト専用: バッチ mix の GPU 経路を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_mix_batch_gpu_for_test(v: Option<bool>) {
+    MIX_BATCH_GPU_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// task 145: バッチ mix の GPU 経路を試す最小トークン数。
+///
+/// チャンク 8/16 のような小さい塊では 1 呼び出しあたりの H2D + 起動 + 同期 +
+/// D2H が計算量を上回る (decode 側の `DENNO_MIX_GPU` は 1 トークン経路、
+/// こちらは「層優先バッチ」専用)。既定チャンクは 512 なので通常は通る。
+const MIX_BATCH_GPU_MIN_TOK: usize = 64;
+
+/// task 145: 1 呼び出しの積 (nt × n × k) の下限。inject (n=hc=4) のような
+/// 小さい行列を GPU に載せないための門番。
+const MIX_BATCH_GPU_MIN_MAC: usize = 4_000_000;
+
+/// task 145: バッチ mix を GPU に載せるかの判定 (純関数・GPU 無しで検証できる)。
+///
+/// 条件: ゲート on / BF16 / nt >= [`MIX_BATCH_GPU_MIN_TOK`] /
+/// 積 nt×n×k >= [`MIX_BATCH_GPU_MIN_MAC`]。
+fn mix_batch_gpu_ok(
+    ty: crate::kquant::GgmlType,
+    k: usize,
+    n: usize,
+    nt: usize,
+    enabled: bool,
+) -> bool {
+    enabled
+        && ty == crate::kquant::GgmlType::Bf16
+        && nt >= MIX_BATCH_GPU_MIN_TOK
+        && nt.saturating_mul(n).saturating_mul(k) >= MIX_BATCH_GPU_MIN_MAC
+}
+
+/// task 145: prefill のバッチ mix の 1 行列を GPU で回す (BF16 のときだけ)。
+///
+/// `true` = GPU が計算した (out は GPU の結果で置き換え済み)。`false` は
+/// 呼び出し側が CPU の [`gemv_batch`] へ落ちること。
+#[cfg(feature = "cuda")]
+fn mix_batch_gpu(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]) -> bool {
+    if !mix_batch_gpu_ok(w.ty(), w.k(), w.n(), nt, mix_batch_gpu_enabled()) {
+        return false;
+    }
+    crate::cuda::maybe_gpu_mix_bf16_batch_into(
+        w.uid(),
+        w.blocks().as_slice(),
+        w.k(),
+        w.n(),
+        xs,
+        nt,
+        outs,
+    )
+}
+
+/// cuda feature 無しでは常に CPU。
+#[cfg(not(feature = "cuda"))]
+fn mix_batch_gpu(w: &GgufLinear, _xs: &[f32], nt: usize, _outs: &mut [f32]) -> bool {
+    let _ = mix_batch_gpu_ok(w.ty(), w.k(), w.n(), nt, mix_batch_gpu_enabled());
+    false
 }
 
 /// task 110: テスト専用: hc mix GPU 経路の on/off を強制する (`None` で env に戻す)。
@@ -3872,8 +3970,12 @@ fn hc_mix_quant_batch(
 
     let lo = MixScratch::take(&mut scratch.lo, nt * dn);
     let t = mix_kprof::stamp();
-    gemv_batch(down, xn_flat, nt, lo)
-        .map_err(|err| one(format!("hc_mix down (batch): {err}")))?;
+    // task 145: BF16 の down / up は GPU の m トークン GEMM を先に試す
+    // (`DENNO_MIX_BATCH_GPU=1` のときだけ。失敗・不発なら CPU バッチへ)。
+    if !mix_batch_gpu(down, xn_flat, nt, lo) {
+        gemv_batch(down, xn_flat, nt, lo)
+            .map_err(|err| one(format!("hc_mix down (batch): {err}")))?;
+    }
     mix_kprof::mark(t, mix_kprof::DOWN);
     let t = mix_kprof::stamp();
     hyper::hc_lo_apply_batch(lo, nt, hp);
@@ -3881,7 +3983,9 @@ fn hc_mix_quant_batch(
 
     let gate = MixScratch::take(&mut scratch.gate, nt * un);
     let t = mix_kprof::stamp();
-    gemv_batch(up, lo, nt, gate).map_err(|err| one(format!("hc_mix up (batch): {err}")))?;
+    if !mix_batch_gpu(up, lo, nt, gate) {
+        gemv_batch(up, lo, nt, gate).map_err(|err| one(format!("hc_mix up (batch): {err}")))?;
+    }
     mix_kprof::mark(t, mix_kprof::UP);
     let mixed_flat = MixScratch::take(&mut scratch.mixed, nt * e);
     let t = mix_kprof::stamp();
@@ -6912,6 +7016,8 @@ fn moe_ffn_quant_impl(
 
     // 5. shared expert (係数は sigmoid(gate_inp_shexp @ x))
     moe_sub_add(1, t_experts.elapsed());
+    // 区間を閉じる (shared の時間を experts に二重計上しない)。
+    drop(_l_experts);
     // task 138: 台帳の区間 (shared)。join・down・gate_inp の GEMV を含む。
     let _l_shared = q4ledger::enter(q4ledger::SHARED);
     let t_shared = std::time::Instant::now();
@@ -9018,7 +9124,8 @@ fn moe_ffn_quant_batch_full(
         }
     }
     moe_sub_add(0, t_router.elapsed());
-
+    // 区間を閉じる (experts の時間を router に二重計上しない)。
+    drop(_l_router);
     // P56: RouterTopK は**チャンク末尾の 1 トークンだけ**送る。
     //
     // 理由: 全トークンを送ると 1 プロンプトで nt × n_layer 枚 (512 トークン ×
@@ -9141,6 +9248,8 @@ fn moe_ffn_quant_batch_full(
 
     // 5. shared expert (バッチ)。係数は sigmoid(gate_inp_shexp @ x)
     moe_sub_add(1, t_experts.elapsed());
+    // 区間を閉じる (shared の時間を experts に二重計上しない)。
+    drop(_l_experts);
     // task 145: 台帳の区間 (shared)。
     let _l_shared = q4ledger::enter(q4ledger::SHARED);
     let t_shared = std::time::Instant::now();
@@ -13601,6 +13710,65 @@ mod tests {
             }
         }
 
+        /// task 145: `DENNO_MIX_BATCH_GPU` の真理値表と、バッチ mix の門番
+        /// (BF16 / nt >= 64 / 積 >= 4M) の境界。GPU 無しでも検証できる。
+        #[test]
+        fn mix_batch_gpu_gate_and_thresholds() {
+            for v in [Some("1"), Some("on"), Some("ON"), Some("true"), Some(" yes ")] {
+                assert!(mix_batch_gpu_from_value(v), "value={v:?} は on のはず");
+            }
+            for v in [None, Some(""), Some("0"), Some("off"), Some("false"), Some("no")] {
+                assert!(!mix_batch_gpu_from_value(v), "value={v:?} は off のはず");
+            }
+            let _l = mix_gpu_test_lock();
+            set_mix_batch_gpu_for_test(Some(false));
+            assert!(!mix_batch_gpu_enabled(), "off の上書きが効いていない");
+            set_mix_batch_gpu_for_test(Some(true));
+            assert!(mix_batch_gpu_enabled(), "on の上書きが効いていない");
+            set_mix_batch_gpu_for_test(None);
+
+            // 門番: 既定 off は何も通さない。
+            use crate::kquant::GgmlType as T;
+            assert!(!mix_batch_gpu_ok(T::Bf16, 10240, 320, 512, false));
+            // 実形 (down k=10240 n=320 nt=512) は通る。
+            assert!(mix_batch_gpu_ok(T::Bf16, 10240, 320, 512, true));
+            // up (k=320 n=10240 nt=512) も通る。
+            assert!(mix_batch_gpu_ok(T::Bf16, 320, 10240, 512, true));
+            // BF16 以外は通さない。
+            assert!(!mix_batch_gpu_ok(T::Q8_0, 10240, 320, 512, true));
+            // nt が小さい (decode 級) は通さない。
+            assert!(!mix_batch_gpu_ok(T::Bf16, 10240, 320, 63, true));
+            assert!(mix_batch_gpu_ok(T::Bf16, 10240, 320, 64, true));
+            // inject 級でも積が足りない形 (k=2560 n=4 nt=64 = 655k) は通さない。
+            assert!(!mix_batch_gpu_ok(T::Bf16, 2560, 4, 64, true));
+        }
+
+        /// task 145: ゲートを on にしても GPU が無い / 未対応なら CPU バッチと
+        /// 同じ値になる (戻り経路の健全性)。合成モデルの prefill を 2 回組み直して
+        /// 比べる (PLE の conv 履歴が進むので同じ個体で 2 回は回さない)。
+        #[test]
+        fn mix_batch_gpu_falls_back_to_cpu_identically() {
+            let _g = moe_test_guard();
+            let _l = mix_gpu_test_lock();
+            let dir = TempDir::new("mix_batch_gpu_fallback");
+            let path = build(&dir);
+            let ctx: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+
+            set_mix_batch_gpu_for_test(Some(false));
+            let mut m1 = Qwen4Exp::new(&GgufFile::open(&path).expect("open")).expect("new");
+            let off = m1.forward_prefill_with(&ctx, true).expect("prefill (off)");
+
+            set_mix_batch_gpu_for_test(Some(true));
+            let mut m2 = Qwen4Exp::new(&GgufFile::open(&path).expect("open")).expect("new");
+            let on = m2.forward_prefill_with(&ctx, true).expect("prefill (on)");
+
+            set_mix_batch_gpu_for_test(None);
+            assert_eq!(off.len(), on.len(), "logits の長さが違う");
+            for (i, (a, b)) in off.iter().zip(on.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "logits[{i}] が違う ({a} != {b})");
+            }
+        }
+
         /// task 110: `DENNO_MIX_GPU` の真理値表。既定 off、明示的な真値だけ on
         /// (`router_gpu_from_value` と同一規約)。
         #[test]
@@ -16307,10 +16475,10 @@ mod tests {
                     q4ledger::NAMES[i]
                 );
             }
-            // 全体を包む `other` も必ず積まれる (層の外があるため)。
+            // 全体の壁時計は別 1 本で測る (`other` は残差なので 0 でもよい)。
             assert!(
-                q4ledger::row(q4ledger::OTHER).wall_ns > 0,
-                "other の区間が積まれていない"
+                q4ledger::row(q4ledger::OTHER).launches == 0,
+                "prefill は other の区間を使わない (残差で出す)"
             );
             let lines = q4ledger::line_prefill(6);
             assert!(lines.len() >= 4, "{lines:?}");
@@ -16318,6 +16486,29 @@ mod tests {
             assert!(
                 lines.iter().any(|l| l.contains(" experts ")),
                 "experts の行が無い: {lines:?}"
+            );
+            // 名前付き区間の和は全体を超えない (二重計上しない) かつ other が残差。
+            let total = q4ledger::prefill_wall_ns();
+            assert!(total > 0, "全体の壁時計が積まれていない");
+            let sum: u64 = [
+                q4ledger::MIX,
+                q4ledger::SSM,
+                q4ledger::FULL,
+                q4ledger::ROUTER,
+                q4ledger::SHARED,
+                q4ledger::EXPERTS,
+            ]
+            .iter()
+            .map(|&i| q4ledger::row(i).wall_ns)
+            .sum();
+            assert!(
+                sum <= total,
+                "区間の和 {sum} が全体 {total} を超えた (二重計上)"
+            );
+            // `other` の行は残差として必ず出る (0 でも出る)。
+            assert!(
+                lines.last().unwrap().contains(" other "),
+                "other (残差) の行が無い: {lines:?}"
             );
 
             q4ledger::reset();

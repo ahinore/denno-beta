@@ -1037,3 +1037,71 @@ extern "C" __global__ void dno_matvec_f32_r_silu(
     }
 }
 
+
+// task 145: prefill の hc mix (f32 に展開した重み) を m トークンまとめて回す GEMM。
+//
+//   y[t * n + r] = sum_{i=0}^{k-1} w[r * k + i] * x[t * k + i]
+//
+// 1 ブロック = GEMM_MT_ROWS(16) 行 × GEMM_MT_TOKS(32) トークン。k を 32 要素ずつ
+// 共有メモリへ積み、各スレッドが 2 トークンぶんの出力を k 昇順に積む。
+// 丸め順は固定 (タイル昇順・タイル内 kk 昇順) なので実行ごとに同一。
+//
+// 数値: FMA (__fmaf_rn) を使う。prefill のバッチ行列積は速度優先の契約なので、
+// CPU の mul+add 逐次とは最後の 1 ulp が動きうる。このファイルは -fmad=false で
+// 落とすが、明示 intrinsic の FMA はそのまま残る。
+//
+// 起動: grid = (ceil(n/16), ceil(nt/32), 1) / block = (16, 16, 1) / smem なし
+// (共有メモリは静的 16*33 + 32*33 floats = 6.3 KB)。
+extern "C" __global__ void dno_gemm_f32_mt(
+    const float *__restrict__ w,
+    const float *__restrict__ x,
+    float *__restrict__ y,
+    const int nt,
+    const int k,
+    const int n)
+{
+    __shared__ float ws[16][33];  // 重み: 16 行 × k タイル 32 (端数は 0 埋め)
+    __shared__ float xs[32][33];  // 入力: 32 トークン × k タイル 32
+
+    const int lr = threadIdx.x;              // 0..15 (行)
+    const int lt = threadIdx.y;              // 0..15 (トークン lt と lt+16)
+    const int tid = lt * 16 + lr;
+    const int row = blockIdx.x * 16 + lr;
+    const int tok0 = blockIdx.y * 32;
+    const int tok_a = tok0 + lt;
+    const int tok_b = tok0 + lt + 16;
+
+    float acc_a = 0.0f;
+    float acc_b = 0.0f;
+    for (int k0 = 0; k0 < k; k0 += 32) {
+        // 重みタイル: 1 スレッド 2 要素 (行は tid の下位 4 bit)。
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int kk = lt * 2 + j;
+            const int src = k0 + kk;
+            ws[lr][kk] = (row < n && src < k) ? w[(size_t)row * k + src] : 0.0f;
+        }
+        // 入力タイル: 1 スレッド 4 要素 (32 トークン × 32 列 = 1024)。
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int idx = tid + j * 256;
+            const int t = idx >> 5;
+            const int kk = idx & 31;
+            const int src = k0 + kk;
+            const int tk = tok0 + t;
+            xs[t][kk] = (tk < nt && src < k) ? x[(size_t)tk * k + src] : 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < 32; ++kk) {
+            const float wv = ws[lr][kk];
+            acc_a = __fmaf_rn(wv, xs[lt][kk], acc_a);
+            acc_b = __fmaf_rn(wv, xs[lt + 16][kk], acc_b);
+        }
+        __syncthreads();
+    }
+    if (row < n) {
+        if (tok_a < nt) y[(size_t)tok_a * n + row] = acc_a;
+        if (tok_b < nt) y[(size_t)tok_b * n + row] = acc_b;
+    }
+}

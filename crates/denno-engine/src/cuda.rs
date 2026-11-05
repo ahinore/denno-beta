@@ -9080,8 +9080,175 @@ pub fn maybe_gpu_mix_bf16_into(
     }
 }
 
-/// task 138: hc mix BF16 の重みを f32 展開して VRAM に常駐させ、ポインタを返す。
+/// task 145: `dno_gemm_f32_mt` (f32 重み × m トークンの GEMM) のハンドル。
 ///
+/// kernels_elem.ptx に未収録なら None をキャッシュする (呼び出し側は CPU の
+/// バッチ経路へ落ちるだけで、失敗にはしない = fail closed)。
+#[derive(Clone, Copy)]
+struct LgemmMtFn(CUfunction);
+unsafe impl Send for LgemmMtFn {}
+unsafe impl Sync for LgemmMtFn {}
+
+static GEMM_F32_MT_FNS: OnceLock<Option<LgemmMtFn>> = OnceLock::new();
+
+fn gemm_f32_mt_fn(ctx: &CudaCtx) -> Option<CUfunction> {
+    GEMM_F32_MT_FNS
+        .get_or_init(|| {
+            let lib = lib().ok()?;
+            let mut f: CUfunction = std::ptr::null_mut();
+            let r = unsafe {
+                (lib.module_get_function)(
+                    &mut f,
+                    ctx.module_elem,
+                    b"dno_gemm_f32_mt\0".as_ptr() as *const c_char,
+                )
+            };
+            if r != 0 {
+                None
+            } else {
+                Some(LgemmMtFn(f))
+            }
+        })
+        .as_ref()
+        .map(|h| h.0)
+}
+
+/// task 145 のカーネル幾何 (kernels_elem.cu の `dno_gemm_f32_mt` と 1:1)。
+pub const GEMM_MT_ROWS: usize = 16;
+/// 1 ブロックが担当するトークン数。
+pub const GEMM_MT_TOKS: usize = 32;
+
+/// task 145: prefill の hc mix (BF16 重み) を **m トークンまとめて** GPU で回す。
+///
+/// `out[t * n + r] = dot(bf16 を f32 展開した行 r, xs[t])`。
+/// 重みは decode の mix GPU 経路と**同じ常駐バッファ** ([`mix_gpu_weight`]) を
+/// 使うので、既に載っていれば転送は起きない。1 呼び出し = H2D 1 回 + 起動 1 回 +
+/// 同期 1 回 + D2H 1 回。数値は FMA + タイル順なので CPU の mul+add 逐次とは
+/// ビット一致しない (prefill のバッチ行列積は速度優先の契約)。
+///
+/// `false` = GPU でやらなかった (呼び出し側は CPU バッチへ)。
+pub fn maybe_gpu_mix_bf16_batch_into(
+    uid: u64,
+    bytes: &[u8],
+    k: usize,
+    n: usize,
+    xs: &[f32],
+    nt: usize,
+    out: &mut [f32],
+) -> bool {
+    if !cuda_enabled() || MIX_GPU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if k == 0
+        || n == 0
+        || nt < 2
+        || xs.len() != nt * k
+        || out.len() != nt * n
+        || bytes.len() != k.saturating_mul(n).saturating_mul(2)
+        || k > i32::MAX as usize
+        || n > i32::MAX as usize
+        || nt > i32::MAX as usize
+    {
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if let Err(e) = ctx.make_current() {
+        mix_gpu_broken_once(&format!("cuCtxSetCurrent (batch): {e:#}"));
+        return false;
+    }
+    let Some(f) = gemm_f32_mt_fn(ctx) else {
+        // PTX 未収録 (PTX=elem の再生成待ち)。ラッチはしない。
+        return false;
+    };
+    let wp = match mix_gpu_weight(uid, bytes, k, n) {
+        Ok(p) => p,
+        Err(e) => {
+            mix_gpu_broken_once(&format!("batch の重み常駐に失敗: {e:#}"));
+            return false;
+        }
+    };
+    let lib = match lib() {
+        Ok(l) => l,
+        Err(e) => {
+            mix_gpu_broken_once(&format!("CUDA lib load failed (batch): {e:#}"));
+            return false;
+        }
+    };
+    let r = MIX_GPU_SC.with(|cell| -> Result<()> {
+        let mut s = cell.borrow_mut();
+        let MixGpuScratch {
+            x: dx,
+            out: dout,
+            hx,
+            ho,
+            ..
+        } = &mut *s;
+        let bytes_x = nt * k * 4;
+        let bytes_out = nt * n * 4;
+        Scratch::ensure(dx, bytes_x)?;
+        Scratch::ensure(dout, bytes_out)?;
+        Scratch::ensure_pin(hx, bytes_x)?;
+        Scratch::ensure_pin(ho, bytes_out)?;
+        let (dx, dout) = (dx.as_ref().unwrap(), dout.as_ref().unwrap());
+        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        hx.as_mut_slice::<f32>()[..nt * k].copy_from_slice(xs);
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(
+                    dx.ptr(),
+                    hx.ptr as *const c_void,
+                    bytes_x,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyHtoDAsync (mix batch)",
+            )?;
+            let (mut pw, mut px, mut po) = (wp, dx.ptr(), dout.ptr());
+            let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, k as c_int, n as c_int);
+            let mut args = [
+                &mut pw as *mut _ as *mut c_void,
+                &mut px as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut nt_c as *mut _ as *mut c_void,
+                &mut k_c as *mut _ as *mut c_void,
+                &mut n_c as *mut _ as *mut c_void,
+            ];
+            let grid = (
+                ((n + GEMM_MT_ROWS - 1) / GEMM_MT_ROWS) as u32,
+                ((nt + GEMM_MT_TOKS - 1) / GEMM_MT_TOKS) as u32,
+                1,
+            );
+            ctx.launch_async(
+                f,
+                grid,
+                (GEMM_MT_ROWS as u32, 16, 1),
+                0,
+                &mut args,
+            )?;
+            check(
+                (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync (mix batch)",
+            )?;
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        }
+        ctx.sync()?;
+        out[..nt * n].copy_from_slice(&ho.as_slice::<f32>()[..nt * n]);
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            set_last_linear_ran_on_gpu(true);
+            true
+        }
+        Err(e) => {
+            mix_gpu_broken_once(&format!("hc mix BF16 batch GEMM failed: {e:#}"));
+            false
+        }
+    }
+}
+
+
 /// `MIX_GPU_W` の登録・形状検査・初回の同期 H2D を 1 箇所にまとめたもの
 /// ([`maybe_gpu_mix_bf16_into`] と同じ規約)。uid は `GgufLinear` のもの。
 fn mix_gpu_weight(uid: u64, bytes: &[u8], k: usize, n: usize) -> Result<CUdeviceptr> {
