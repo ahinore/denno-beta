@@ -7590,6 +7590,20 @@ fn expert_miss_contribs_into(
     }
 }
 
+/// task 150: ミスの寄与を「何本ぶん書くか」(`overlap` でなければ 0)。
+///
+/// `miss_h` の確保長と [`scatter_contribs`] に渡す表を**同じ値**から作るための
+/// 唯一の入口 (片方だけ `miss_pos.len()` を使うと長さ検査で落ちる。lab t150a で
+/// CHAIN2=0 の全リクエストがこれで落ちた)。
+#[cfg(feature = "cuda")]
+fn miss_slots(overlap: bool, n_miss: usize) -> usize {
+    if overlap {
+        n_miss
+    } else {
+        0
+    }
+}
+
 /// task 150: GPU のヒット (`pos` / `h`) と CPU ミス (`miss_pos` / `miss_h`) の寄与を
 /// `sel` の並び (`hs`) へ戻す。
 ///
@@ -7727,7 +7741,11 @@ fn moe_experts_iq_gpu_batched(
     }
     let miss_pos: Vec<usize> = (0..sel.len()).filter(|&t| !is_hit[t]).collect();
     let miss_ids: Vec<usize> = miss_pos.iter().map(|&t| sel[t]).collect();
-    let mut miss_h = vec![0.0f32; miss_pos.len() * e];
+    // ミスの寄与を書き込む先は overlap のときだけ。確保長と scatter に渡す表は
+    // 必ず同じ値から作る ([`miss_slots`])。
+    let n_miss_used = miss_slots(overlap, miss_pos.len());
+    let miss_slice: &[usize] = &miss_pos[..n_miss_used];
+    let mut miss_h = vec![0.0f32; n_miss_used * e];
     let ran = if overlap {
         // 台帳の exp_iq 区間は取らない (同期が CPU ミスの後ろへ移るので、GPU の
         // 待ちだけを切り出せない)。起動と同期は `experts` 行に入る。
@@ -7777,7 +7795,6 @@ fn moe_experts_iq_gpu_batched(
     let mut hs: Vec<Option<Vec<f32>>> = vec![None; sel.len()];
     // task 150: overlap のときはミスも CPU で計算済みなので、両方をここで揃える
     // (呼び出し側は `None` を見ない = CPU を二度回さない)。
-    let miss_slice: &[usize] = if overlap { miss_pos.as_slice() } else { &[] };
     scatter_contribs(&mut hs, &pos, &h, miss_slice, &miss_h, e)?;
 
     // 3. DENNO_EXPERT_GPU_CHECK=1: CPU の 3 行列と突き合わせる (層ごとに 1 行)。
@@ -14676,6 +14693,11 @@ mod tests {
             let mut hs3: Vec<Option<Vec<f32>>> = vec![None; 5];
             assert!(scatter_contribs(&mut hs3, &pos, &h[..2], &[], &[], e).is_err());
             assert!(scatter_contribs(&mut hs3, &[5], &h[..2], &[], &[], e).is_err());
+            // 表が空なのにバッファだけ非空 → Err (lab t150a で CHAIN2=0 が踏んだ形)。
+            assert!(scatter_contribs(&mut hs3, &[0], &h[..2], &[], &h[..4], e).is_err());
+            // miss_slots が確保長の唯一の入口: overlap off は 0 本。
+            assert_eq!(miss_slots(false, 4), 0);
+            assert_eq!(miss_slots(true, 4), 4);
         }
 
         /// task 150: `dno_hc_mixed_f32` の 1 要素を .cu の行順で写したミラー。
