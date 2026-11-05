@@ -229,8 +229,13 @@ extern "C" __global__ void NAME(                                                
         const int nr = (int)(left < (unsigned int)PF_MR ? left : (unsigned int)PF_MR); \
         float acc0[PF_MR];                                                         \
         float acc1[PF_MR];                                                         \
+        unsigned int tk[PF_MR];                                                    \
         _Pragma("unroll")                                                          \
-        for (int r = 0; r < PF_MR; ++r) { acc0[r] = 0.0f; acc1[r] = 0.0f; }        \
+        for (int r = 0; r < PF_MR; ++r) {                                          \
+            acc0[r] = 0.0f;                                                        \
+            acc1[r] = 0.0f;                                                        \
+            tk[r] = (r < nr) ? rows[s.ro + r0 + (unsigned int)r] : 0u;             \
+        }                                                                          \
         for (int b = 0; b < nb; ++b) {                                             \
             float w0[8];                                                           \
             float w1[8];                                                           \
@@ -240,8 +245,7 @@ extern "C" __global__ void NAME(                                                
             _Pragma("unroll")                                                      \
             for (int r = 0; r < PF_MR; ++r) {                                      \
                 if (r < nr) {                                                      \
-                    const unsigned int tk = rows[s.ro + r0 + (unsigned int)r];      \
-                    const float* xp = xbase + (size_t)tk * (size_t)n_in + xoff;     \
+                    const float* xp = xbase + (size_t)tk[r] * (size_t)n_in + xoff;  \
                     _Pragma("unroll")                                              \
                     for (int j = 0; j < 8; ++j) {                                  \
                         const float xv = xp[j];                                    \
@@ -296,8 +300,12 @@ extern "C" __global__ void dno_exp_pf_iq4nl(
         const unsigned int left = s.m - r0;
         const int nr = (int)(left < (unsigned int)PF_MR ? left : (unsigned int)PF_MR);
         float acc[PF_MR];
+        unsigned int tk[PF_MR];
         _Pragma("unroll")
-        for (int r = 0; r < PF_MR; ++r) acc[r] = 0.0f;
+        for (int r = 0; r < PF_MR; ++r) {
+            acc[r] = 0.0f;
+            tk[r] = (r < nr) ? rows[s.ro + r0 + (unsigned int)r] : 0u;
+        }
         for (int b = lane; b < nb; b += 32) {
             const unsigned char* blk = rowp + (size_t)b * 18u;
             const float d = pf_f16(blk);
@@ -313,8 +321,7 @@ extern "C" __global__ void dno_exp_pf_iq4nl(
             _Pragma("unroll")
             for (int r = 0; r < PF_MR; ++r) {
                 if (r < nr) {
-                    const unsigned int tk = rows[s.ro + r0 + (unsigned int)r];
-                    const float* xp = xbase + (size_t)tk * (size_t)n_in + xoff;
+                    const float* xp = xbase + (size_t)tk[r] * (size_t)n_in + xoff;
                     #pragma unroll
                     for (int j = 0; j < 32; ++j) acc[r] += w[j] * xp[j];
                 }
@@ -355,8 +362,12 @@ extern "C" __global__ void dno_exp_pf_q2_0(
         const unsigned int left = s.m - r0;
         const int nr = (int)(left < (unsigned int)PF_MR ? left : (unsigned int)PF_MR);
         float acc[PF_MR];
+        unsigned int tk[PF_MR];
         _Pragma("unroll")
-        for (int r = 0; r < PF_MR; ++r) acc[r] = 0.0f;
+        for (int r = 0; r < PF_MR; ++r) {
+            acc[r] = 0.0f;
+            tk[r] = (r < nr) ? rows[s.ro + r0 + (unsigned int)r] : 0u;
+        }
         for (int b = lane; b < nb; b += 32) {
             const unsigned char* blk = rowp + (size_t)b * 18u;
             const float d = pf_f16(blk);
@@ -370,8 +381,7 @@ extern "C" __global__ void dno_exp_pf_q2_0(
             _Pragma("unroll")
             for (int r = 0; r < PF_MR; ++r) {
                 if (r < nr) {
-                    const unsigned int tk = rows[s.ro + r0 + (unsigned int)r];
-                    const float* xp = xbase + (size_t)tk * (size_t)n_in + xoff;
+                    const float* xp = xbase + (size_t)tk[r] * (size_t)n_in + xoff;
                     #pragma unroll
                     for (int j = 0; j < 64; ++j) acc[r] += w[j] * xp[j];
                 }
