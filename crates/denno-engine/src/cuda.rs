@@ -3989,6 +3989,7 @@ pub fn moe_experts_iq_pf_layer(
     e: usize,
     nt: usize,
     out_delta: &mut [f32],
+    cpu_miss: &mut dyn FnMut() -> Result<()>,
 ) -> Result<bool> {
     if PF_DEAD.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(false);
@@ -4038,9 +4039,11 @@ pub fn moe_experts_iq_pf_layer(
 
     // 行の総数 × 行列の幅。g / u / act は total_rows × ff、h / od は行と nt。
     let ng = total_rows * ff;
+    // CPU ミス (呼び出し側の flat) が落ちたか。落ちた場合は `out` が途中まで
+    // 書かれているので **CPU 経路へ戻してはいけない** (Err で伝える)。
+    let cpu_failed = std::cell::Cell::new(false);
     let mut alloc = || -> Result<bool> {
         PF_SCRATCH.with(|cell| -> Result<bool> {
-            let t_kern = std::time::Instant::now();
             let mut sc = cell.borrow_mut();
             MoeScratch::ensure(&mut sc.x, xs.len() * 4)?;
             MoeScratch::ensure(&mut sc.g, ng * 4)?;
@@ -4085,6 +4088,7 @@ pub fn moe_experts_iq_pf_layer(
             let act = sc.act.as_ref().expect("確保済み");
             let h = sc.h.as_ref().expect("確保済み");
             let od = sc.od.as_ref().expect("確保済み");
+            let t_launch = std::time::Instant::now();
             unsafe {
                 // gate と up (同じ行表・同じ入力)。
                 let rb_g = exp_pf::row_bytes(ty_g, n_in).unwrap_or(0);
@@ -4212,9 +4216,17 @@ pub fn moe_experts_iq_pf_layer(
                         &mut args,
                     )?;
                 }
-                ctx.sync()?;
             }
-            exp_pf::note_kernel_ns(t_kern.elapsed().as_nanos() as u64);
+            exp_pf::note_kernel_ns(t_launch.elapsed().as_nanos() as u64);
+            // GPU の計算が走っている間に CPU のミスを計算する (重ねる)。
+            // 層あたり GPU 5.6 ms / CPU 57 ms なので、待ちはほぼ消える。
+            if let Err(e) = (cpu_miss)() {
+                cpu_failed.set(true);
+                return Err(e);
+            }
+            let t_sync = std::time::Instant::now();
+            unsafe { ctx.sync()?; }
+            exp_pf::note_kernel_ns(t_sync.elapsed().as_nanos() as u64);
             let t_d2h = std::time::Instant::now();
             od.to_slice(&mut out_delta[..nh])?;
             exp_pf::note_d2h_ns(t_d2h.elapsed().as_nanos() as u64);
@@ -4225,6 +4237,10 @@ pub fn moe_experts_iq_pf_layer(
     match alloc() {
         Ok(v) => Ok(v),
         Err(e) => {
+            if cpu_failed.get() {
+                // CPU ミスの失敗は隠さない (out は途中まで書かれている)。
+                return Err(e);
+            }
             // 確保失敗はこのプロセスで 1 回だけ記録し、以後は CPU に固定する。
             if !PF_DEAD.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::error!("[exp-pf] 作業域を確保できないので以後 CPU 経路: {e:#}");

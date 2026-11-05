@@ -9435,10 +9435,34 @@ fn moe_experts_iq_pf_batch(
     // ページフォルトだけで数 ms かかる)。
     let mut od = PF_OD.with(|c| std::mem::take(&mut *c.borrow_mut()));
     od.resize(nt * e, 0.0f32);
+    // ミスは CPU の flat 経路で計算する。cuda 側は GPU を**起動した直後**に
+    // これを呼ぶので、カーネルが走っている間に CPU が進む
+    // (層あたり GPU ~6 ms / CPU ~57 ms)。
+    let mut miss_be: Vec<Vec<(usize, usize)>> = Vec::with_capacity(by_expert.len());
+    for (ei, picks) in by_expert.iter().enumerate() {
+        if pick[ei] {
+            miss_be.push(Vec::new());
+        } else {
+            miss_be.push(picks.clone());
+        }
+    }
     let t_gpu = std::time::Instant::now();
     let ran = {
-        // 台帳の `exp_iq` 行 (decode と同じ区間) に prefill の GPU 往復を積む。
-        let _l = q4ledger::enter(q4ledger::EXPERT);
+        let mut cpu_miss = || -> anyhow::Result<()> {
+            moe_experts_flat(
+                lw,
+                &miss_be,
+                weights,
+                k,
+                xs,
+                e,
+                ff,
+                MOE_FLAT_ROWS,
+                out,
+                moe_expert::vnni_enabled(),
+            )
+            .map_err(|e| anyhow::anyhow!("{e:?}"))
+        };
         match crate::cuda::moe_experts_iq_pf_layer(
             lw.gate_exps.ty,
             lw.up_exps.ty,
@@ -9456,12 +9480,13 @@ fn moe_experts_iq_pf_batch(
             e,
             nt,
             &mut od,
+            &mut cpu_miss,
         ) {
             Ok(v) => v,
             Err(err) => {
-                // ここまでは `out` を触っていない。CPU 経路へ落とす。
-                eprintln!("[exp-pf] 層 {}: GPU 経路を諦めて CPU: {err:#}", lw.il);
-                false
+                // cuda 側は「CPU ミスの計算そのものが落ちた」ときだけ Err を返す
+                // (`out` は途中まで書かれている)。隠さずに層を落とす。
+                return Err(one(format!("層 {}: IQ prefill: {err:#}", lw.il)));
             }
         }
     };
@@ -9491,28 +9516,6 @@ fn moe_experts_iq_pf_batch(
                 - plan.total_rows,
         );
     }
-
-    // 1. ミスは CPU (base と同じ flat 経路)。ここから `out` を書く。
-    let mut miss_be: Vec<Vec<(usize, usize)>> = Vec::with_capacity(by_expert.len());
-    for (ei, picks) in by_expert.iter().enumerate() {
-        if pick[ei] {
-            miss_be.push(Vec::new());
-        } else {
-            miss_be.push(picks.clone());
-        }
-    }
-    moe_experts_flat(
-        lw,
-        &miss_be,
-        weights,
-        k,
-        xs,
-        e,
-        ff,
-        MOE_FLAT_ROWS,
-        out,
-        moe_expert::vnni_enabled(),
-    )?;
 
     // 2. ヒットの寄与 (GPU がトークンごとに j 昇順で足したもの) を加える。
     let t_add = std::time::Instant::now();
