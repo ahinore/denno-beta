@@ -9393,7 +9393,9 @@ fn moe_experts_iq_pf_batch(
     if keys.is_empty() {
         return Ok(None);
     }
-    let got = expert_vram::lookup_many(&keys, shapes)
+    // **触らない**参照 (`get_mut` で LRU を塗り替えると、その後の decode の
+    // ヒット率が落ちる: lab t148c の 14k で 0.966 → 0.866)。
+    let got = expert_vram::peek_many(&keys, shapes)
         .map_err(|err| one(format!("層 {}: expert VRAM 参照: {err:#}", lw.il)))?;
     let mut pick = vec![false; by_expert.len()];
     let mut devs: Vec<std::sync::Arc<expert_vram::ExpertDev>> = Vec::new();

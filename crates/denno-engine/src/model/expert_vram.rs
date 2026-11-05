@@ -472,6 +472,16 @@ impl<K: Eq + Hash + Copy, V> VramLru<K, V> {
         self.stats
     }
 
+    /// 参照だけ (最終使用を更新しない)。
+    ///
+    /// task 148: prefill は 1 チャンクで全層の expert を引くので、`get_mut` で
+    /// 触ると LRU の順序が prefill の走査順に塗り替えられ、**その後の decode の
+    /// ヒット率が落ちる** (lab t148c: 14k で 0.966 → 0.866、CPU expert 15.0 →
+    /// 26.9 ms/tok)。見るだけの経路はこちらを使う。
+    pub fn peek(&self, key: &K) -> Option<&V> {
+        self.entries.get(key).map(|s| &s.value)
+    }
+
     /// ヒットしたら最終使用を更新して値を返す。ミスは数えない
     /// (ミスは [`VramLru::insert`] で数える)。
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
@@ -893,7 +903,7 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 
 #[cfg(feature = "cuda")]
 pub use gpu::{
-    acquire, cache_usage, check_enabled, fallbacks, init, lookup, lookup_many, note_check,
+    acquire, cache_usage, check_enabled, fallbacks, init, lookup, lookup_many, note_check, peek_many,
     take_check, Acquired, CheckAcc, ExpertDev, ExpertShape,
 };
 
@@ -1119,6 +1129,37 @@ mod gpu {
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             let Some(dev) = g.get_mut(key) else {
+                out.push(None);
+                continue;
+            };
+            if dev.shapes != shapes {
+                bail!(
+                    "expert VRAM: 同じ鍵 {:?} に別の形が来た (登録済み {:?} / 今回 {:?})",
+                    key,
+                    dev.shapes,
+                    shapes
+                );
+            }
+            out.push(Some(Arc::clone(dev)));
+        }
+        Ok(out)
+    }
+
+    /// [`lookup_many`] の**触らない**版 (task 148)。prefill が見るだけで
+    /// LRU の順序を変えないための経路。形が違う鍵はエラー。
+    pub fn peek_many(
+        keys: &[ExpertKey],
+        shapes: [ExpertShape; 3],
+    ) -> Result<Vec<Option<Arc<ExpertDev>>>> {
+        let Some(cache) = CACHE.get() else {
+            return Ok(vec![None; keys.len()]);
+        };
+        let g = cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("expert VRAM LRU のロックが poisoned"))?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(dev) = g.peek(key) else {
                 out.push(None);
                 continue;
             };
