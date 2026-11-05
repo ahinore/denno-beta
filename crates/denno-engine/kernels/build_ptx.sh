@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16)
+targets_all=(int8 elem gdn moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq)
 
 # 名前 -> "ソース|fmad" (fmad: nofmad = -fmad=false / fmad = 既定)。未知は 1。
 spec() {
@@ -38,6 +38,10 @@ spec() {
         moe_v2)       echo "kernels_moe_v2.cu|nofmad" ;;
         moe_v3)       echo "kernels_moe_v3.cu|nofmad" ;;
         moe_fp16)     echo "kernels_moe_fp16.cu|nofmad" ;;
+        # task 144: IQ 系 (IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL / Q2_0) の
+        # expert GEMV。数値契約は CPU とビット一致ではない (1 行を 32 レーンで
+        # 分割して足す) ので FMA を許可する。
+        exp_iq)       echo "kernels_exp_iq.cu|fmad" ;;
         gemm)         echo "kernels_gemm.cu|fmad" ;;
         gemm_grouped) echo "kernels_gemm_grouped.cu|fmad" ;;
         *)            return 1 ;;

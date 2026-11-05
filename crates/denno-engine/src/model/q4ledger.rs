@@ -36,12 +36,18 @@ pub const SHARED: usize = 2;
 pub const FULL: usize = 3;
 /// 区間: ssm 層の attention (qkv / gate / GDN / out)。
 pub const SSM: usize = 4;
-/// 区間: 上のどれでもない (embed / ple / expert 本体 / head / サンプラ)。
+/// 区間: 上のどれでもない (embed / ple / head / サンプラ)。
 pub const OTHER: usize = 5;
+/// task 144: IQ 系 expert の層一括 GEMV (`kernels_exp_iq`)。
+///
+/// 「1 層あたり何 us か」を台帳から直接読むための区間。ミスして CPU で計算した
+/// expert はこの区間の外 (呼び出し側のループ) なので、**GPU で回したぶんだけ**が
+/// ここに積まれる。
+pub const EXPERT: usize = 6;
 /// 区間の数。
-pub const N: usize = 6;
+pub const N: usize = 7;
 /// 区間の名前 ([`MIX`] の順)。
-pub const NAMES: [&str; N] = ["mix", "router", "shared", "full", "ssm", "other"];
+pub const NAMES: [&str; N] = ["mix", "router", "shared", "full", "ssm", "other", "expert"];
 
 fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
