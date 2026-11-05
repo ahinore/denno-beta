@@ -3329,16 +3329,18 @@ fn mix_chain_enabled() -> bool {
     *ON.get_or_init(|| mix_chain_from_value(std::env::var("DENNO_MIX_CHAIN").ok().as_deref()))
 }
 
-/// task 145: `DENNO_MIX_BATCH_GPU` の解釈 (純関数)。**既定 off**。
-/// `1` / `on` / `true` / `yes` のときだけ、prefill のバッチ mix (BF16 の
-/// down / up) を GPU の `dno_gemm_f32_mt` に載せる。
+/// task 145: `DENNO_MIX_BATCH_GPU` の解釈 (純関数)。**既定 on**。
+/// 明示的な偽値 (`0` / `off` / `false` / `no`) のときだけ切る。
+/// on のとき、prefill のバッチ mix (BF16 の down / up) を GPU の
+/// `dno_gemm_f32_mt` に載せる (ラボ t145b: depth の cold prefill
+/// 108.7 → 91.9 s、decode と短文と md5 は不変)。
 fn mix_batch_gpu_from_value(v: Option<&str>) -> bool {
     match v {
-        Some(s) => matches!(
+        Some(s) => !matches!(
             s.trim().to_ascii_lowercase().as_str(),
-            "1" | "on" | "true" | "yes"
+            "0" | "off" | "false" | "no"
         ),
-        None => false,
+        None => true,
     }
 }
 
@@ -13710,14 +13712,14 @@ mod tests {
             }
         }
 
-        /// task 145: `DENNO_MIX_BATCH_GPU` の真理値表と、バッチ mix の門番
-        /// (BF16 / nt >= 64 / 積 >= 4M) の境界。GPU 無しでも検証できる。
+        /// task 145: `DENNO_MIX_BATCH_GPU` の真理値表 (既定 on) と、バッチ mix の
+        /// 門番 (BF16 / nt >= 64 / 積 >= 4M) の境界。GPU 無しでも検証できる。
         #[test]
         fn mix_batch_gpu_gate_and_thresholds() {
-            for v in [Some("1"), Some("on"), Some("ON"), Some("true"), Some(" yes ")] {
+            for v in [None, Some(""), Some("1"), Some("on"), Some("ON"), Some("true"), Some(" yes ")] {
                 assert!(mix_batch_gpu_from_value(v), "value={v:?} は on のはず");
             }
-            for v in [None, Some(""), Some("0"), Some("off"), Some("false"), Some("no")] {
+            for v in [Some("0"), Some("off"), Some("false"), Some("no")] {
                 assert!(!mix_batch_gpu_from_value(v), "value={v:?} は off のはず");
             }
             let _l = mix_gpu_test_lock();

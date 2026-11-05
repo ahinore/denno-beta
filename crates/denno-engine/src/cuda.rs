@@ -9179,31 +9179,17 @@ pub fn maybe_gpu_mix_bf16_batch_into(
     let r = MIX_GPU_SC.with(|cell| -> Result<()> {
         let mut s = cell.borrow_mut();
         let MixGpuScratch {
-            x: dx,
-            out: dout,
-            hx,
-            ho,
-            ..
+            x: dx, out: dout, ..
         } = &mut *s;
         let bytes_x = nt * k * 4;
         let bytes_out = nt * n * 4;
         Scratch::ensure(dx, bytes_x)?;
         Scratch::ensure(dout, bytes_out)?;
-        Scratch::ensure_pin(hx, bytes_x)?;
-        Scratch::ensure_pin(ho, bytes_out)?;
         let (dx, dout) = (dx.as_ref().unwrap(), dout.as_ref().unwrap());
-        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
-        hx.as_mut_slice::<f32>()[..nt * k].copy_from_slice(xs);
+        // s68 の実測 (pinned 経由 + memcpy は pageable 直の 4 倍遅い) に従い、
+        // ホスト側のコピーを挟まず呼び出し元のスライス / 出力先へ直接発行する。
+        dx.copy_from(xs)?;
         unsafe {
-            check(
-                (lib.memcpy_htod_async)(
-                    dx.ptr(),
-                    hx.ptr as *const c_void,
-                    bytes_x,
-                    std::ptr::null_mut(),
-                ),
-                "cuMemcpyHtoDAsync (mix batch)",
-            )?;
             let (mut pw, mut px, mut po) = (wp, dx.ptr(), dout.ptr());
             let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, k as c_int, n as c_int);
             let mut args = [
@@ -9219,21 +9205,19 @@ pub fn maybe_gpu_mix_bf16_batch_into(
                 ((nt + GEMM_MT_TOKS - 1) / GEMM_MT_TOKS) as u32,
                 1,
             );
-            ctx.launch_async(
-                f,
-                grid,
-                (GEMM_MT_ROWS as u32, 16, 1),
-                0,
-                &mut args,
-            )?;
+            ctx.launch_async(f, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)?;
+            ctx.sync()?;
+            // D2H は同期コピーで `out` へ直接 (中間 Vec / pinned を作らない)。
             check(
-                (lib.memcpy_dtoh_async)(ho.ptr, dout.ptr(), bytes_out, std::ptr::null_mut()),
-                "cuMemcpyDtoHAsync (mix batch)",
+                (lib.memcpy_dtoh)(
+                    out.as_mut_ptr() as *mut c_void,
+                    dout.ptr(),
+                    bytes_out,
+                ),
+                "cuMemcpyDtoH (mix batch)",
             )?;
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
-        ctx.sync()?;
-        out[..nt * n].copy_from_slice(&ho.as_slice::<f32>()[..nt * n]);
         Ok(())
     });
     match r {
