@@ -24618,6 +24618,11 @@ mod p58_scratch_arena_tests {
 /// 待ちが attn.gate に移り、qkv/out の GEMV が同じ submission に入るため (層 wall は
 /// 短 -4.2%、c2000 -4.5%、c8000 -6.9%)。
 ///
+/// t142b (既定 on 版の確認、def vs `DENNO_GDN_GPU_SCAN=0`): def が全 5 点で off 以上
+/// (短 -3.8%、c2000_cold -3.7%、c2000_turn2 -1.3%、c8000 -5.6%)、errors 0、md5 SAME。
+/// c2000_turn2 の 1.3% は 2 ラウンド目が同値でノイズ帯 (<2%)。prefill は
+/// -0.4..-2.0% で t142a と符号が逆 (ノイズ)。
+///
 /// off のときは `SsmLayer::forward_token` / `forward_batch` / `reset_state` の分岐
 /// (この static read) 以外に何も変わらない。テストは
 /// [`gdn_gpu_scan_set_for_test`] で env 無しに on/off を強制できる
