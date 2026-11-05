@@ -1354,7 +1354,7 @@ mod tests {
         }
     }
 
-    /// task 128: ゲート off (既定) では decode 窓を開けても経路が 1 バイトも
+    /// task 128: ゲート強制 off では decode 窓を開けても経路が 1 バイトも
     /// 変わらない。GPU 分岐にも state 回復にも入らない (ストアは確保されない)。
     #[cfg(feature = "cuda")]
     #[test]

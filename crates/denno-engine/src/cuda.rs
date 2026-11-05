@@ -24601,34 +24601,67 @@ mod p58_scratch_arena_tests {
 // 修正後 (t140b/t140c) は errors 0・md5 SAME・テキスト正常で、
 // 短 decode -1.9%、2k 文脈 -4.2..-4.8% (t140c の VERDICT)。
 // ただしタスクの採否目標 (短 decode 3% 以上) に届かないので**既定 off のまま**。
+//
+// **task 142 で既定 on にした**: 上の目標 (短 decode 3%) は「利得が文脈長で
+// 伸びる」ことを知る前に置かれたものだった。文脈 2k / 8k で目標を取り直し、
+// int-auto 065cf20 (task 141 まで) に br140 をマージした t142a で
+// 短 -5.1% / c2000 next -5.6% / c8000 next -6.7% / prefill 2% 以内 /
+// errors 0 / md5 6 本 SAME を確認した (詳細は [`gdn_gpu_scan_on`] の doc)。
 
-/// GPU decode scan のゲート (`DENNO_GDN_GPU_SCAN=1|on|true`。既定 off)。
+/// task 142 のラボ (t142a) で採否目標を満たしたので**既定 on**。
+/// `DENNO_GDN_GPU_SCAN=0|off|false|no` で off に戻せる (未設定・空は on)。
 ///
-/// off のときは `SsmLayer::forward_token` の分岐 1 回 (この static read) 以外に
-/// 何も変わらない。テストは [`gdn_gpu_scan_set_for_test`] で env 無しに強制できる
+/// t142a (int-auto 065cf20 + task 141 までのマージ、depth8k、PROFILE=1、2 ラウンド交互):
+/// decode は短 -5.1%、c2000 next turn -5.6%、c8000 next turn -6.7%、prefill は
+/// -0.7%..+1.5% (全て 2% 以内)、errors 0、md5 は 6 本とも SAME。q4prof の gdn 項目は
+/// on で +116 ms/128tok (短)・+103 (c2000)・+12 (c8000) と増えるが、これは GPU scan の
+/// 待ちが attn.gate に移り、qkv/out の GEMV が同じ submission に入るため (層 wall は
+/// 短 -4.2%、c2000 -4.5%、c8000 -6.9%)。
+///
+/// off のときは `SsmLayer::forward_token` / `forward_batch` / `reset_state` の分岐
+/// (この static read) 以外に何も変わらない。テストは
+/// [`gdn_gpu_scan_set_for_test`] で env 無しに on/off を強制できる
 /// (env はプロセスで 1 回しか読めないため)。
 pub fn gdn_gpu_scan_on() -> bool {
     #[cfg(test)]
-    if GDN_GPU_SCAN_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
+    match GDN_GPU_SCAN_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("DENNO_GDN_GPU_SCAN").as_deref(),
-            Ok("1") | Ok("on") | Ok("true")
-        )
-    })
+    *ON.get_or_init(|| parse_gdn_gpu_scan(std::env::var("DENNO_GDN_GPU_SCAN").ok().as_deref()))
 }
 
-#[cfg(test)]
-static GDN_GPU_SCAN_FORCE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// `DENNO_GDN_GPU_SCAN` の生値 → on/off (純関数)。**未設定は on** (task 142 で採用)。
+/// 明示的な `0|off|false|no` (前後空白と大小文字は無視) だけ off。
+fn parse_gdn_gpu_scan(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+    }
+}
 
-/// テストが env を立てずにゲートを強制する (`false` で env の解釈に戻す)。
+/// テスト強制の値 (0 = env の解釈、1 = 強制 on、2 = 強制 off)。
+#[cfg(test)]
+static GDN_GPU_SCAN_FORCE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// テストが env を立てずにゲートを強制する (`true` = 強制 on、`false` = 強制 off)。
+///
+/// 既定が on になったので、off 経路を見るテストは `false` で明示的に落とす。
 #[cfg(test)]
 pub fn gdn_gpu_scan_set_for_test(v: bool) {
-    GDN_GPU_SCAN_FORCE.store(v, std::sync::atomic::Ordering::Relaxed);
+    GDN_GPU_SCAN_FORCE.store(if v { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// テストが強制を解除して env の解釈 (既定 on) に戻す。
+#[cfg(test)]
+pub fn gdn_gpu_scan_reset_force_for_test() {
+    GDN_GPU_SCAN_FORCE.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// CPU vs GPU の状態突き合わせ (`DENNO_GDN_GPU_CHECK=1`。診断専用・既定 off)。
@@ -25601,6 +25634,51 @@ mod gdn_decode_scan_tests {
         }
     }
 
+    /// task 142: `DENNO_GDN_GPU_SCAN` の真理値表。**未設定は on** (task 142 で採用)、
+    /// 明示的な `0|off|false|no` (空白・大小文字は無視) だけ off。
+    #[test]
+    fn gdn_gpu_scan_truth_table_default_on() {
+        for (raw, want) in [
+            (None, true),
+            (Some(""), true),
+            (Some(" "), true),
+            (Some("1"), true),
+            (Some("on"), true),
+            (Some("true"), true),
+            (Some("YES"), true),
+            (Some("0"), false),
+            (Some("off"), false),
+            (Some("false"), false),
+            (Some(" OFF "), false),
+            (Some("no"), false),
+        ] {
+            assert_eq!(
+                parse_gdn_gpu_scan(raw),
+                want,
+                "DENNO_GDN_GPU_SCAN={raw:?} の解釈が違う"
+            );
+        }
+    }
+
+    /// task 142: env を立てなくてもゲートは on に解決し、強制 off で落ちること
+    /// (既定の解決と両方向の強制を数える)。
+    #[test]
+    fn gdn_gpu_scan_default_on_and_forced_off() {
+        let _g = test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gdn_gpu_scan_set_for_test(false);
+        assert!(!gdn_gpu_scan_on(), "強制 off が効いていない");
+        gdn_gpu_scan_set_for_test(true);
+        assert!(gdn_gpu_scan_on(), "強制 on が効いていない");
+        gdn_gpu_scan_reset_force_for_test();
+        if std::env::var_os("DENNO_GDN_GPU_SCAN").is_none() {
+            assert!(gdn_gpu_scan_on(), "env 未設定の既定が on でない");
+        }
+        // 後続テストのために強制 off に戻す (LatchGuard と同じ状態)。
+        gdn_gpu_scan_set_for_test(false);
+    }
+
     /// GPU 側の失敗ラッチ: (1) 初回だけ「立った」が true で以後冪等、(2) ラッチは
     /// GPU_BROKEN を立てない = intercept 経路に影響しない、(3) ラッチがあると
     /// submit は CUDA / デバイス状態ストアに触れずに即 CPU 経路を返す。
@@ -25637,13 +25715,13 @@ mod gdn_decode_scan_tests {
         assert_eq!(gdn_decode_state_entry_count(), 0);
     }
 
-    /// ゲート off (既定) では submit が CUDA に触れず、ストアも増えない。
+    /// ゲート強制 off では submit が CUDA に触れず、ストアも増えない。
     #[test]
     fn gdn_scan_gate_off_never_touches_store() {
         let _g = test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _lg = LatchGuard;
         gdn_scan_unavailable_reset_for_test();
-        assert!(!gdn_gpu_scan_on(), "ゲートが既定で off でない");
+        assert!(!gdn_gpu_scan_on(), "強制 off が効いていない");
         let units: [(GdnGgufUnit<'_>, usize); 0] = [];
         let req = empty_req(&units);
         let res = gdn_decode_submit(&req);
