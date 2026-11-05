@@ -24,6 +24,22 @@
 //! [`dequant_mirror`] / [`dot_mirror`] はカーネルと同じ索引・同じ累積順を Rust で
 //! 書き下したもの。GPU の無いコンテナでも「要素 → バイト」の対応が正しいことを
 //! `kquant::dequant_row` とのビット一致で確かめられる。
+//!
+//! # ラボ実測 (task 144, swift15-abl IQ3_S, 14 T, 8098 同居)
+//!
+//! `DENNO_EXPERT_IQ_GPU=1 DENNO_EXPERT_VRAM_MB=14000 DENNO_EXPERT_GPU_MIN_HIT=0`,
+//! SCENARIO=depth, commit 9c8fe9b5d (t144e):
+//!
+//! | cond | decode ms/tok | prefill s | md5 |
+//! | --- | --- | --- | --- |
+//! | base | 74 | 1.39 / 108.01 | 基準 |
+//! | on | 63 | 1.38 / 107.93 | SAME |
+//!
+//! リクエスト別 (base -> on): a1 74->63, b 75->73, a2 74->58 (ヒット率 0.889),
+//! c2000_cold 76->72, c2000_turn2 76->66。VRAM は 1 リクエストで 14 GB まで埋まる。
+//! 1 層あたり GPU wall 151 us / kernel 76 us (9.3 expert)。**GATE 1 の 400 us は
+//! 2.6 倍の余裕で通る**。上げ直しは pageable H2D で 0.27〜0.31 ms/本
+//! (pinned staging は 0.34〜0.42 で負け)。既定 off のまま。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
