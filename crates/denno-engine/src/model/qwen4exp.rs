@@ -7760,6 +7760,13 @@ pub fn preload_experts_from_stats(
     };
     let reserve = exp_stats::preload_reserve_bytes();
     let mut target = cap.saturating_sub(reserve);
+    // このスレッドで CUDA の current context を張る。CUDA の current context は
+    // スレッドローカルなので、これをしないと最初の cuMemAlloc が error 201
+    // (INVALID_CONTEXT) で落ちる (lab t146a で実際に踏んだ: ALLOC_DEAD が立って
+    // decode が全部 CPU になった)。物理容量の取得も context が要る。
+    if !crate::cuda::make_current_on_this_thread() {
+        return Some("[exp-preload] off: CUDA の context をこのスレッドに張れない".to_string());
+    }
     // 実カードの容量でも丸める: dense 重みの予算 (`DENNO_GPU_WEIGHT_MB`) と
     // 予備を引いたぶんまで。`DENNO_EXPERT_VRAM_MB` を大きく設定しても、
     // 起動直後に VRAM を埋め切って後続の重み upload を失敗させない。
@@ -7802,8 +7809,11 @@ pub fn preload_experts_from_stats(
 
     let n_plan = plan.len();
     let mut loaded = 0usize;
-    let mut stopped = false;
     let mut paused_ms = 0f64;
+    // 前の失敗理由が残っていれば捨てる (停止理由の取り違えを防ぐ)。
+    let _ = expert_vram::take_alloc_error();
+    // 止まった理由 (None = 最後まで載せた)。
+    let mut stop: Option<String> = None;
     for (layer, expert) in plan {
         let (li, ei) = (layer as usize, expert as usize);
         let Some((g, u, d)) = layers.get(li) else {
@@ -7826,16 +7836,13 @@ pub fn preload_experts_from_stats(
                 n: d.n_out,
             },
         ];
-        let want = match shapes.iter().try_fold(0usize, |a, s| s.bytes().map(|b| a + b)) {
-            Ok(w) => w,
-            Err(_) => {
-                stopped = true;
-                break;
-            }
+        let Ok(want) = shapes.iter().try_fold(0usize, |a, s| s.bytes().map(|b| a + b)) else {
+            stop = Some("expert のバイト数が求まらない".to_string());
+            break;
         };
         let used = expert_vram::cache_usage().map_or(0, |(u, _)| u);
         if exp_stats::budget_full(used, want, target) {
-            stopped = true;
+            stop = Some(format!("予算 (target {} MiB) に到達", target >> 20));
             break;
         }
         // decode 中は譲る (リクエストを待たせない)。
@@ -7846,18 +7853,22 @@ pub fn preload_experts_from_stats(
             }
             paused_ms += t.elapsed().as_secs_f64() * 1e3;
         }
-        let key = ExpertKey {
-            layer,
-            expert,
-        };
-        let got = expert_vram::acquire(key, shapes, || {
+        let key = ExpertKey { layer, expert };
+        let got = expert_vram::acquire_soft(key, shapes, || {
             Ok([g.slice(ei)?, u.slice(ei)?, d.slice(ei)?])
         });
         match got {
             Ok(Some(_)) => loaded += 1,
-            // 型が未対応・確保失敗 (予算超過) はそこで止める。
-            Ok(None) | Err(_) => {
-                stopped = true;
+            // 型が未対応・確保失敗はそこで止める。理由は 1 行に残す。
+            Ok(None) => {
+                stop = Some(match expert_vram::take_alloc_error() {
+                    Some(e) => format!("確保に失敗: {e}"),
+                    None => "この expert は GPU に載せられない (型・予算)".to_string(),
+                });
+                break;
+            }
+            Err(e) => {
+                stop = Some(format!("{e:#}"));
                 break;
             }
         }
@@ -7865,12 +7876,14 @@ pub fn preload_experts_from_stats(
     let secs = t0.elapsed().as_secs_f64();
     let used = expert_vram::cache_usage().map_or(0, |(u, _)| u);
     Some(format!(
-        "[exp-preload] loaded={loaded} experts {used}MiB/{cap}MiB in {secs:.2}s \
+        "[exp-preload] loaded={loaded} experts {used}MiB/{}MiB in {secs:.2}s \
          (plan={n_plan} target={}MiB reserve={}MiB phys={:?}MiB paused={paused_ms:.0}ms \
-         stopped={stopped} key_rate={:.3})",
+         stop={:?} key_rate={:.3})",
+        cap >> 20,
         target >> 20,
         reserve >> 20,
         physical.map(|p| p >> 20),
+        stop,
         loaded as f64 / n_plan.max(1) as f64
     ))
 }

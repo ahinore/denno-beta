@@ -4916,6 +4916,27 @@ fn shared_ctx() -> Option<&'static CudaCtx> {
         .as_ref()
 }
 
+/// このスレッドの current context を共有 CudaCtx にする (必要なら初期化もする)。
+///
+/// CUDA の current context は**スレッドローカル**なので、推論スレッド以外
+/// (起動時の事前ロードなど) から `DevBuffer` を確保するには、そのスレッドで
+/// 1 回これを呼ぶ必要がある。呼ばないと `cuMemAlloc` が error 201
+/// (INVALID_CONTEXT) で落ちる (P17c と同じ穴)。
+///
+/// 戻り値: 設定できたら true。CUDA が無効・初期化失敗なら false。
+pub fn make_current_on_this_thread() -> bool {
+    match shared_ctx() {
+        Some(ctx) => match ctx.make_current() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("CUDA cuCtxSetCurrent failed (このスレッド): {e:#}");
+                false
+            }
+        },
+        None => false,
+    }
+}
+
 /// int8 重みの VRAM レジストリ (キー = Quant8Linear.uid)。
 /// uid は Linear 構築時に採番されるため、Vec アドレスの再利用で別内容の重みが
 /// 同一キーに現れることはない。Clone は uid を共有するが内容が同一なので安全。

@@ -893,8 +893,8 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 
 #[cfg(feature = "cuda")]
 pub use gpu::{
-    acquire, cache_usage, check_enabled, fallbacks, init, lookup, note_check, take_check, Acquired,
-    CheckAcc, ExpertDev, ExpertShape,
+    acquire, acquire_soft, cache_usage, check_enabled, fallbacks, init, lookup, note_check,
+    take_alloc_error, take_check, Acquired, CheckAcc, ExpertDev, ExpertShape,
 };
 
 #[cfg(feature = "cuda")]
@@ -985,6 +985,13 @@ mod gpu {
     static OVERSIZE_LOGGED: AtomicBool = AtomicBool::new(false);
     /// 確保失敗で VRAM 経路を諦めた (プロセス寿命)
     static ALLOC_DEAD: AtomicBool = AtomicBool::new(false);
+    /// 直近の確保失敗の理由 (診断用。1 回 take したら消える)
+    static LAST_ALLOC_ERR: Mutex<Option<String>> = Mutex::new(None);
+
+    /// 直前の確保失敗の理由を取り出す (`acquire_soft` の停止理由を 1 行に出すため)。
+    pub fn take_alloc_error() -> Option<String> {
+        LAST_ALLOC_ERR.lock().ok()?.take()
+    }
 
     /// 上限 `cap_bytes` で LRU を作る (プロセスで 1 回)。2 回目以降は無視する。
     pub fn init(cap_bytes: usize) {
@@ -1125,6 +1132,36 @@ mod gpu {
     where
         F: FnOnce() -> Result<[&'a [u8]; 3]>,
     {
+        acquire_opts(key, shapes, load, true)
+    }
+
+    /// 1 本を VRAM へ上げる (事前ロード用)。`acquire_opts` の非ラッチ版。
+    pub fn acquire_soft<'a, F>(
+        key: ExpertKey,
+        shapes: [ExpertShape; 3],
+        load: F,
+    ) -> Result<Option<Acquired>>
+    where
+        F: FnOnce() -> Result<[&'a [u8]; 3]>,
+    {
+        acquire_opts(key, shapes, load, false)
+    }
+
+    /// [`acquire`] の本体。`latch_on_fail == false` では、確保に失敗しても
+    /// `ALLOC_DEAD` (プロセス寿命の CPU 固定) を立てない。
+    ///
+    /// task 146: 起動時の事前ロードはこれを使う。事前ロードの 1 回の失敗で
+    /// decode 全体が CPU に落ちるのは、起動順の事故 (context が current でない、
+    /// 一時的な断片化) に対して代償が大きすぎる。
+    pub fn acquire_opts<'a, F>(
+        key: ExpertKey,
+        shapes: [ExpertShape; 3],
+        load: F,
+        latch_on_fail: bool,
+    ) -> Result<Option<Acquired>>
+    where
+        F: FnOnce() -> Result<[&'a [u8]; 3]>,
+    {
         if ALLOC_DEAD.load(Ordering::Relaxed) {
             return Ok(None);
         }
@@ -1194,10 +1231,18 @@ mod gpu {
         } {
             Ok(d) => Some(d),
             Err(e) => {
-                if !ALLOC_DEAD.swap(true, Ordering::Relaxed) {
+                // task 146: 事前ロード (latch_on_fail = false) はプロセス寿命の
+                // CPU 固定を立てない。起動順の事故で decode 全体を失わないため。
+                // 理由は 1 行で出せるように控える (呼び出し側が take する)。
+                if latch_on_fail && !ALLOC_DEAD.swap(true, Ordering::Relaxed) {
                     tracing::error!(
                         "expert VRAM: 確保に失敗したので以後 CPU 経路に固定する: {e:#}"
                     );
+                }
+                if let Ok(mut slot) = LAST_ALLOC_ERR.lock() {
+                    if slot.is_none() {
+                        *slot = Some(format!("{e:#}"));
+                    }
                 }
                 None
             }
