@@ -3332,8 +3332,16 @@ fn mix_chain_enabled() -> bool {
 /// task 145: `DENNO_MIX_BATCH_GPU` の解釈 (純関数)。**既定 on**。
 /// 明示的な偽値 (`0` / `off` / `false` / `no`) のときだけ切る。
 /// on のとき、prefill のバッチ mix (BF16 の down / up) を GPU の
-/// `dno_gemm_f32_mt` に載せる (ラボ t145b: depth の cold prefill
-/// 108.7 → 91.9 s、decode と短文と md5 は不変)。
+/// `dno_gemm_f32_mt` に載せる。
+///
+/// ラボの実測 (swift15-abl IQ3_S, 14T, production env):
+/// - t145b (depth, PTX=elem): c2000 cold 108.68 → 91.91 s (-15.4%)、
+///   next turn 0.98 → 0.97 s、短文 1.35 → 1.35 s、decode 78 → 76 ms/tok、
+///   md5 全一致。
+/// - t145c (depth8k, 既定 on vs off): c2000 cold 107.87 → 89.00 s、
+///   c8000 cold 366.49 → 328.64 s、next turn 0.98/1.04 → 0.97/1.04 s、
+///   decode 74-83 ms/tok で不変、md5 全一致・errors 0。
+/// - 台帳の mix 区間は 27.0 → 8.6 s (3,826 tok) / 74.1 → 31.0 s (14,018 tok)。
 fn mix_batch_gpu_from_value(v: Option<&str>) -> bool {
     match v {
         Some(s) => !matches!(
