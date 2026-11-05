@@ -6785,6 +6785,11 @@ fn moe_ffn_quant_impl(
     // task 138: router の区間はここまで (expert の CPU 仕事は台帳の外 = other)。
     drop(_l_router);
 
+    // task 146: (層, expert) の使用回数を積む (起動時の事前ロード用)。
+    // ゲート off では `stats_path()` の atomic load 1 回で返る。
+    // decode 1 トークン = 48 層 x 10 本 = 480 回の `fetch_add` (Relaxed)。
+    crate::model::exp_stats::observe_layer(p.n_layer, p.n_expert, lw.il, &sel);
+
     // 3.5 選択 expert の重みを先に読み始める (I/O と計算を重ねる)。
     //     1 トークンで 48 層 × 11 行列 × 921 KB を触るので、フォルト待ちが支配的になる。
     //     キャッシュ経路は pread で必要ぶんだけ読むので、mmap のページフォルトを
@@ -7669,7 +7674,216 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
     }
 }
 
-/// `cuda` feature 無しでは層一括経路は無い (常に `None` = per-expert 経路)。
+/// task 146: 全層の expert 3 行列の合計バイト数 (使用回数ファイルのモデル同一性)。
+///
+/// テンソルのヘッダだけを見るので mmap のページは触らない。名前・層数が変わった
+/// モデルの記録を取り違えないための値。
+pub fn expert_identity_bytes(f: &GgufFile, p: &Qwen4ExpParams) -> u64 {
+    let mut total = 0u64;
+    for il in 0..p.n_layer {
+        for m in ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"] {
+            let name = format!("blk.{il}.{m}");
+            if let Some((_, _, len)) = f.tensor_mapping_parts(&name) {
+                total = total.saturating_add(len as u64);
+            }
+        }
+    }
+    total
+}
+
+/// task 146: 記録した使用回数の上位から VRAM へ事前ロードする (起動時の背景スレッド)。
+///
+/// 呼び出し側 ([`crate::model::exp_stats`] と CLI) の契約:
+///
+/// - ゲートは `DENNO_EXPERT_IQ_GPU=1` かつ `DENNO_EXPERT_IQ_STATS_FILE` が設定
+///   されていること ([`crate::model::exp_stats::enabled`])。呼ばれても、ファイルが
+///   無い・壊れている・版違い・別モデルなら **何も載せずに 1 行だけ返す**。
+///   起動もリクエストも落とさない。
+/// - **回数の少ない順に載せる**。LRU は末尾 (= 最も昔に触ったもの) から追い出す
+///   ので、最後に載った「一番よく使う expert」が一番追い出されにくい。
+///   予算 (`Deno_EXPERT_VRAM_MB` - 予備) に届いたら止める。
+/// - decode 中 (`exp_stats::busy()`) は載せない。2 ms 寝て待ち、空いたら続きから。
+///   1 本の H2D は 0.3 ms 程度だが、LRU のロックを持つ間 decode の `lookup` が
+///   待つので、そもそも重ならないようにしてある。
+///
+/// 戻り値は 1 行のログ (呼び出し側が `eprintln!` する)。
+#[cfg(feature = "cuda")]
+pub fn preload_experts_from_stats(
+    parts: &[std::path::PathBuf],
+    dir_name: &str,
+) -> Option<String> {
+    use crate::model::exp_stats;
+    use crate::model::expert_vram::ExpertShape;
+    use std::time::{Duration, Instant};
+
+    let path = exp_stats::stats_path()?;
+    let t0 = Instant::now();
+    let f = match GgufFile::open_split(parts) {
+        Ok(f) => f,
+        Err(e) => return Some(format!("[exp-preload] off: GGUF を開けない: {e}")),
+    };
+    let p = match Qwen4ExpParams::from_meta(&f) {
+        Ok(p) => p,
+        Err(e) => return Some(format!("[exp-preload] off: メタデータを読めない: {e}")),
+    };
+    let total_bytes = expert_identity_bytes(&f, &p);
+    let zeros = |dir: &str| {
+        exp_stats::Counts::zeros(dir, total_bytes, p.n_layer as u32, p.n_expert as u32)
+    };
+    let counts = match exp_stats::load_file(path, dir_name, total_bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            // 記録は使わないが、このセッションの回数は保存したいので履歴を据える。
+            exp_stats::install_prior(&zeros(dir_name));
+            return Some(format!("[exp-preload] off: {e}"));
+        }
+    };
+    if counts.n_layer as usize != p.n_layer || counts.n_expert as usize != p.n_expert {
+        exp_stats::install_prior(&zeros(dir_name));
+        return Some(format!(
+            "[exp-preload] off: 記録の形が違う ({}x{} / 今回 {}x{})",
+            counts.n_layer, counts.n_expert, p.n_layer, p.n_expert
+        ));
+    }
+    exp_stats::install_prior(&counts);
+    let plan = exp_stats::preload_order(&counts);
+    if plan.is_empty() {
+        return Some("[exp-preload] off: 記録が空 (回数 0)".to_string());
+    }
+    // VRAM 予算をここで初期化する (初回の MoE 呼び出しと同じ 1 回きりの決定)。
+    let _ = expert_route();
+    let Some((_, cap)) = expert_vram::cache_usage() else {
+        return Some(
+            "[exp-preload] off: expert の VRAM 予算が無い (DENNO_EXPERT_VRAM_MB=0 / cuda 無効)"
+                .to_string(),
+        );
+    };
+    let reserve = exp_stats::preload_reserve_bytes();
+    let mut target = cap.saturating_sub(reserve);
+    // 実カードの容量でも丸める: dense 重みの予算 (`DENNO_GPU_WEIGHT_MB`) と
+    // 予備を引いたぶんまで。`DENNO_EXPERT_VRAM_MB` を大きく設定しても、
+    // 起動直後に VRAM を埋め切って後続の重み upload を失敗させない。
+    // (t147a: 24,000 + 重み 12,000 は 32 GB のカードに収まらず 14k prefill で OOM)
+    let weight_cap = crate::gpu_budget::weight_cap_bytes() as usize;
+    let physical = crate::cuda::dev_mem_mb().map(|(_, total_mb)| {
+        (total_mb << 20)
+            .saturating_sub(weight_cap)
+            .saturating_sub(reserve)
+    });
+    if let Some(p) = physical {
+        target = target.min(p);
+    }
+    if reserve >= cap {
+        return Some(format!(
+            "[exp-preload] off: 予算 {} MiB が予備 {} MiB 以下",
+            cap >> 20,
+            reserve >> 20
+        ));
+    }
+    // 層ごとの読み口 (mmap のスライスだけ。ページは触らない)。
+    let mut layers: Vec<(ExpertW, ExpertW, ExpertW)> = Vec::with_capacity(p.n_layer);
+    for il in 0..p.n_layer {
+        let load = |m: &str| ExpertW::load(&f, &format!("blk.{il}.{m}"), &p);
+        match (
+            load("ffn_gate_exps.weight"),
+            load("ffn_up_exps.weight"),
+            load("ffn_down_exps.weight"),
+        ) {
+            (Ok(g), Ok(u), Ok(d)) => layers.push((g, u, d)),
+            (e, _, _) => {
+                let msg = match e {
+                    Err(err) => format!("{err}"),
+                    Ok(_) => "読み口を開けない".to_string(),
+                };
+                return Some(format!("[exp-preload] off: 層 {il}: {msg}"));
+            }
+        }
+    }
+
+    let n_plan = plan.len();
+    let mut loaded = 0usize;
+    let mut stopped = false;
+    let mut paused_ms = 0f64;
+    for (layer, expert) in plan {
+        let (li, ei) = (layer as usize, expert as usize);
+        let Some((g, u, d)) = layers.get(li) else {
+            continue;
+        };
+        let shapes = [
+            ExpertShape {
+                ty: g.ty,
+                k: g.n_in,
+                n: g.n_out,
+            },
+            ExpertShape {
+                ty: u.ty,
+                k: u.n_in,
+                n: u.n_out,
+            },
+            ExpertShape {
+                ty: d.ty,
+                k: d.n_in,
+                n: d.n_out,
+            },
+        ];
+        let want = match shapes.iter().try_fold(0usize, |a, s| s.bytes().map(|b| a + b)) {
+            Ok(w) => w,
+            Err(_) => {
+                stopped = true;
+                break;
+            }
+        };
+        let used = expert_vram::cache_usage().map_or(0, |(u, _)| u);
+        if exp_stats::budget_full(used, want, target) {
+            stopped = true;
+            break;
+        }
+        // decode 中は譲る (リクエストを待たせない)。
+        if exp_stats::busy() {
+            let t = Instant::now();
+            while exp_stats::busy() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            paused_ms += t.elapsed().as_secs_f64() * 1e3;
+        }
+        let key = ExpertKey {
+            layer,
+            expert,
+        };
+        let got = expert_vram::acquire(key, shapes, || {
+            Ok([g.slice(ei)?, u.slice(ei)?, d.slice(ei)?])
+        });
+        match got {
+            Ok(Some(_)) => loaded += 1,
+            // 型が未対応・確保失敗 (予算超過) はそこで止める。
+            Ok(None) | Err(_) => {
+                stopped = true;
+                break;
+            }
+        }
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let used = expert_vram::cache_usage().map_or(0, |(u, _)| u);
+    Some(format!(
+        "[exp-preload] loaded={loaded} experts {used}MiB/{cap}MiB in {secs:.2}s \
+         (plan={n_plan} target={}MiB reserve={}MiB phys={:?}MiB paused={paused_ms:.0}ms \
+         stopped={stopped} key_rate={:.3})",
+        target >> 20,
+        reserve >> 20,
+        physical.map(|p| p >> 20),
+        loaded as f64 / n_plan.max(1) as f64
+    ))
+}
+
+/// `cuda` feature 無しでは VRAM へ載せられない (常に `None` = 何もしない)。
+#[cfg(not(feature = "cuda"))]
+pub fn preload_experts_from_stats(
+    _parts: &[std::path::PathBuf],
+    _dir_name: &str,
+) -> Option<String> {
+    None
+}
+
 #[cfg(not(feature = "cuda"))]
 fn moe_experts_gpu_batched(
     _lw: &LayerW,
@@ -10866,6 +11080,48 @@ mod tests {
         // off では stamp を取らない (計測ゼロ)。
         headprof::set_for_test(false);
         assert!(headprof::stamp().is_none(), "off なのに stamp が Some");
+    }
+
+    /// task 146: decode 経路 (`moe_ffn_quant_impl`) が選択 expert を数えている。
+    ///
+    /// ゲートを強制 on にして 1 層 1 トークン回し、積まれたセル数が top-k と
+    /// 一致することを見る (「緑 = 分岐が発火した証拠ではない」の裏取り)。
+    #[test]
+    fn exp_stats_counts_selected_experts_on_decode_path() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("exp_stats_count");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        let _on = crate::model::exp_stats::enable_for_test();
+        let before: u64 = crate::model::exp_stats::session()
+            .map(|c| c.snapshot().iter().map(|v| *v as u64).sum())
+            .unwrap_or(0);
+        let _ = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("Cpu 経路");
+        let cells = crate::model::exp_stats::session().expect("カウンタが作られていない");
+        let snap = cells.snapshot();
+        let after: u64 = snap.iter().map(|v| *v as u64).sum();
+        assert_eq!(
+            after - before,
+            p.n_expert_used as u64,
+            "1 層 1 トークンで top-k 本ぶん積まれていない"
+        );
+        let (nl, ne) = cells.dims();
+        assert_eq!((nl, ne), (p.n_layer, p.n_expert));
+        // 積まれたのは層 0 のセルだけ (合成モデルは層 0 だけ回す)
+        let layers: Vec<usize> = snap
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v > 0)
+            .map(|(i, _)| i / ne)
+            .collect();
+        assert!(
+            layers.iter().all(|l| *l == 0),
+            "層 0 以外に積まれた: {layers:?}"
+        );
     }
 
     /// P39: `DENNO_EXPERT_GPU` が未設定 (= 経路 Cpu) のときは従来の
