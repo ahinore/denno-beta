@@ -1037,6 +1037,36 @@ extern "C" __global__ void dno_matvec_f32_r_silu(
     }
 }
 
+// task 150: hc_mixed (hyper::hc_mixed_into_par の要素式をそのまま焼く)。
+//
+//   out[d] = (1/hc) * Σ_{s=0..hc-1} x[s*e+d] * sigmoid(g[s*e+d])
+//   sigmoid(v) = 1 / (1 + exp(-v))、加算は s 昇順、1/hc は和の後。
+//
+// CPU の hyper::sigmoid は `1.0 / (1.0 + (-v).exp())` なので、dno_expf
+// (glibc expf のビット一致実装) と __fdiv_rn/__fadd_rn/__fmul_rn で **ビット一致**
+// する (要素ごとに独立で縮約が無い)。mix の host 側 hc_mixed を置き換えると
+// 1 トークン 97 回の sigmoid 計算 (10 KB 級) が GPU 側へ移る。
+// grid = ceil(e / block), block = 256。
+extern "C" __global__ void dno_hc_mixed_f32(
+    const float *__restrict__ x,   // [hc][e]
+    const float *__restrict__ g,   // [hc][e]
+    float *__restrict__ out,       // [e]
+    int e, int hc, float inv_hc) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= e) return;
+    // s = 0
+    float acc = __fmul_rn(
+        x[d], __fdiv_rn(1.0f, __fadd_rn(1.0f, dno_expf(-g[d]))));
+    // s = 1..hc-1 (s の昇順・1 要素ずつ丸める)
+    for (int s = 1; s < hc; ++s) {
+        const size_t i = (size_t)s * (size_t)e + (size_t)d;
+        acc = __fadd_rn(
+            acc,
+            __fmul_rn(x[i], __fdiv_rn(1.0f, __fadd_rn(1.0f, dno_expf(-g[i])))));
+    }
+    out[d] = __fmul_rn(acc, inv_hc);
+}
+
 
 // task 145: prefill の hc mix (f32 に展開した重み) を m トークンまとめて回す GEMM。
 //

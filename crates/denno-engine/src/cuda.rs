@@ -9475,6 +9475,8 @@ struct MixGpuScratch {
     /// task 138: チェーン経路の down 出力 (lo_apply 済み) を device に置く場所。
     lo: Option<DevBuffer>,
     out: Option<DevBuffer>,
+    /// task 150: chain2 の hc_mixed 出力 ([e]) を device に置く場所。
+    mixed: Option<DevBuffer>,
     hx: Option<PinMem>,
     ho: Option<PinMem>,
 }
@@ -9485,6 +9487,7 @@ thread_local! {
             x: None,
             lo: None,
             out: None,
+            mixed: None,
             hx: None,
             ho: None,
         });
@@ -9986,6 +9989,7 @@ pub fn maybe_gpu_mix_bf16_chain_into(
             x: dx,
             lo: dlo,
             out: dout,
+            mixed: _,
             hx,
             ho,
         } = &mut *s;
@@ -10061,6 +10065,230 @@ pub fn maybe_gpu_mix_bf16_chain_into(
         }
         Err(e) => {
             mix_gpu_broken_once(&format!("hc mix chain failed: {e:#}"));
+            false
+        }
+    }
+}
+
+/// task 150: `dno_hc_mixed_f32` (hc_mixed の device 版) を PTX から取る。
+/// 未収録 (旧 PTX) は `None` を返し、呼び出し側は従来経路へ落ちる (ラッチしない)。
+fn hc_mixed_f32_fn(ctx: &CudaCtx) -> Option<CUfunction> {
+    struct HcMixedFn(CUfunction);
+    unsafe impl Send for HcMixedFn {}
+    unsafe impl Sync for HcMixedFn {}
+    static FN: OnceLock<Option<HcMixedFn>> = OnceLock::new();
+    FN.get_or_init(|| {
+        let lib = lib().ok()?;
+        let mut f: CUfunction = std::ptr::null_mut();
+        let r = unsafe {
+            (lib.module_get_function)(
+                &mut f,
+                ctx.module_elem,
+                b"dno_hc_mixed_f32\0".as_ptr() as *const c_char,
+            )
+        };
+        if r != 0 {
+            None
+        } else {
+            Some(HcMixedFn(f))
+        }
+    })
+    .as_ref()
+    .map(|h| h.0)
+}
+
+/// task 150: hc mix の **down → lo_apply → up → hc_mixed** を 1 回の同期に畳む。
+///
+/// task 138 の [`maybe_gpu_mix_bf16_chain_into`] は up までを GPU で閉じ、`hc_mixed`
+/// (ストリームごとの sigmoid と加算) はホストで計算していた。ここでは `hc_mixed` も
+/// device の `dno_hc_mixed_f32` で閉じ、ホストへ返すのは `mixed[e]` だけにする
+/// (従来は `gate[hc*e]` を返してホストで計算 = D2H も 4 倍)。
+///
+/// 丸めは CPU の `hyper::hc_mixed_into_par` と同一 (dno_expf + `__f*_rn`・要素独立)
+/// なので値はビット一致する。戻り値 `false` = 従来経路を使うこと (GPU 無効・PTX
+/// 未収録・形状不一致・確保失敗・実行エラー)。
+///
+/// `x` は `[k1]` (= `[hc][e]`)、`out` は `[e]`。
+#[allow(clippy::too_many_arguments)]
+pub fn maybe_gpu_mix_bf16_chain2_into(
+    down_uid: u64,
+    down_bytes: &[u8],
+    k1: usize,
+    n1: usize,
+    up_uid: u64,
+    up_bytes: &[u8],
+    k2: usize,
+    n2: usize,
+    inv_hc: f32,
+    e: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> bool {
+    use std::sync::atomic::Ordering as AO;
+    if !cuda_enabled() || MIX_GPU_BROKEN.load(AO::Relaxed) {
+        return false;
+    }
+    if k1 == 0
+        || n1 == 0
+        || n2 == 0
+        || e == 0
+        || k2 != n1
+        || n2 % e != 0
+        || n2 / e > 64
+        || x.len() != k1
+        || out.len() != e
+        || n2 != k1
+        || k1 < n1
+        || down_bytes.len() != k1.saturating_mul(n1).saturating_mul(2)
+        || up_bytes.len() != n1.saturating_mul(n2).saturating_mul(2)
+        || k1 > i32::MAX as usize
+        || n1 > i32::MAX as usize
+        || n2 > i32::MAX as usize
+        || e > i32::MAX as usize
+    {
+        return false;
+    }
+    let hc = n2 / e;
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if let Err(e) = ctx.make_current() {
+        mix_gpu_broken_once(&format!("cuCtxSetCurrent: {e:#}"));
+        return false;
+    }
+    let (Some(f_down), Some(f_mixed)) = (matvec_f32_r_silu_fn(ctx), hc_mixed_f32_fn(ctx)) else {
+        return false;
+    };
+    let up_reduce = mix_up_reduce_enabled();
+    let f_up = if up_reduce {
+        match matvec_f32_r_fn(ctx) {
+            Some(f) => f,
+            None => return false,
+        }
+    } else {
+        match matvec_f32_fn(ctx) {
+            Some(f) => f,
+            None => return false,
+        }
+    };
+    let up_thr: u32 = if up_reduce { 256 } else { 1 };
+    let wp1 = match mix_gpu_weight(down_uid, down_bytes, k1, n1) {
+        Ok(p) => p,
+        Err(e) => {
+            mix_gpu_broken_once(&format!("down 重みの常駐に失敗: {e:#}"));
+            return false;
+        }
+    };
+    let wp2 = match mix_gpu_weight(up_uid, up_bytes, n1, n2) {
+        Ok(p) => p,
+        Err(e) => {
+            mix_gpu_broken_once(&format!("up 重みの常駐に失敗: {e:#}"));
+            return false;
+        }
+    };
+    let lib = match lib() {
+        Ok(l) => l,
+        Err(e) => {
+            mix_gpu_broken_once(&format!("CUDA lib load failed: {e:#}"));
+            return false;
+        }
+    };
+    const MIXED_THREADS: usize = 256;
+    let r = MIX_GPU_SC.with(|cell| -> Result<()> {
+        let mut s = cell.borrow_mut();
+        let MixGpuScratch {
+            x: dx,
+            lo: dlo,
+            out: dout,
+            mixed: dm,
+            hx,
+            ho,
+        } = &mut *s;
+        Scratch::ensure(dx, k1 * 4)?;
+        Scratch::ensure(dlo, n1 * 4)?;
+        Scratch::ensure(dout, n2 * 4)?;
+        Scratch::ensure(dm, e * 4)?;
+        Scratch::ensure_pin(hx, k1 * 4)?;
+        Scratch::ensure_pin(ho, e * 4)?;
+        let (dx, dlo, dout, dm) = (
+            dx.as_ref().unwrap(),
+            dlo.as_ref().unwrap(),
+            dout.as_ref().unwrap(),
+            dm.as_ref().unwrap(),
+        );
+        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        hx.as_mut_slice::<f32>()[..k1].copy_from_slice(x);
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(
+                    dx.ptr(),
+                    hx.ptr as *const c_void,
+                    k1 * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyHtoDAsync (mix chain2)",
+            )?;
+            // down + lo_apply (silu 込み) → lo はデバイスに残る。
+            let (mut ph, mut pw, mut po) = (dx.ptr(), wp1, dlo.ptr());
+            let (mut kc, mut nc) = (k1 as c_int, n1 as c_int);
+            let mut invc = inv_hc;
+            let mut args = [
+                &mut ph as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+                &mut invc as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(f_down, (n1 as u32, 1, 1), (256, 1, 1), 0, &mut args)?;
+            // up: 入力は lo_apply 済みの lo (同じ既定ストリームなので順序保証)。
+            let (mut ph2, mut pw2, mut po2) = (dlo.ptr(), wp2, dout.ptr());
+            let (mut kc2, mut nc2) = (n1 as c_int, n2 as c_int);
+            let mut args2 = [
+                &mut ph2 as *mut _ as *mut c_void,
+                &mut pw2 as *mut _ as *mut c_void,
+                &mut po2 as *mut _ as *mut c_void,
+                &mut kc2 as *mut _ as *mut c_void,
+                &mut nc2 as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(f_up, (n2 as u32, 1, 1), (up_thr, 1, 1), 0, &mut args2)?;
+            // hc_mixed: xn (= dx) と gate (= dout) から mixed を作る。
+            let (mut px, mut pg, mut pm) = (dx.ptr(), dout.ptr(), dm.ptr());
+            let (mut ec, mut hcc) = (e as c_int, hc as c_int);
+            let mut invc2 = inv_hc;
+            let mut args3 = [
+                &mut px as *mut _ as *mut c_void,
+                &mut pg as *mut _ as *mut c_void,
+                &mut pm as *mut _ as *mut c_void,
+                &mut ec as *mut _ as *mut c_void,
+                &mut hcc as *mut _ as *mut c_void,
+                &mut invc2 as *mut _ as *mut c_void,
+            ];
+            let grid = (e.div_ceil(MIXED_THREADS).max(1) as u32, 1, 1);
+            ctx.launch_async(
+                f_mixed,
+                grid,
+                (MIXED_THREADS as u32, 1, 1),
+                0,
+                &mut args3,
+            )?;
+            check(
+                (lib.memcpy_dtoh_async)(ho.ptr, dm.ptr(), e * 4, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync (mix chain2)",
+            )?;
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        }
+        ctx.sync()?;
+        out.copy_from_slice(&ho.as_slice::<f32>()[..e]);
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            set_last_linear_ran_on_gpu(true);
+            true
+        }
+        Err(e) => {
+            mix_gpu_broken_once(&format!("hc mix chain2 failed: {e:#}"));
             false
         }
     }

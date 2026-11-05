@@ -3369,6 +3369,27 @@ fn chain2_exp_active(chain2: bool, exp_flag: bool) -> bool {
     chain2 && exp_flag
 }
 
+/// task 150: `DENNO_DECODE_CHAIN2_MIX` の値を解釈する (純関数・テスト用)。
+/// 部分ゲート `DENNO_DECODE_CHAIN2_EXP` と同じ規則 (既定 on・明示的な偽値だけ切る)。
+fn decode_chain2_mix_from_value(v: Option<&str>) -> bool {
+    decode_chain2_exp_from_value(v)
+}
+
+/// task 150: hc mix の hc_mixed まで GPU で閉じる (`DENNO_DECODE_CHAIN2_MIX`、
+/// 既定 on)。`DENNO_DECODE_CHAIN2` が on のときだけ意味を持つ。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn decode_chain2_mix_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    chain2_exp_active(
+        decode_chain2_enabled(),
+        *ON.get_or_init(|| {
+            decode_chain2_mix_from_value(
+                std::env::var("DENNO_DECODE_CHAIN2_MIX").ok().as_deref(),
+            )
+        }),
+    )
+}
+
 /// task 150: 選択 expert の IQ 層一括 GEMV を CPU ミスと重ねる
 /// (`DENNO_DECODE_CHAIN2_EXP`、既定 on)。`DENNO_DECODE_CHAIN2` が on のときだけ
 /// 意味を持つ (束ねゲート off では従来どおり GEMV の完了を待ってから CPU を回す)。
@@ -3812,13 +3833,47 @@ fn hc_mix_quant_fast(
         let t = mix_kprof::stamp();
         mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_DOWN);
         let hc_fast = hc_mix_fast_enabled();
+        // task 150: down → lo_apply → up → **hc_mixed** まで GPU で閉じる経路
+        // (`DENNO_DECODE_CHAIN2` + `DENNO_DECODE_CHAIN2_MIX`、両方 BF16 のとき)。
+        // 従来 (task 138 の chain) は up の出力 gate[hc*e] を D2H してホストで
+        // sigmoid 4 本 x e の加算を回していた (実測 34 us/回 x 97 回/token)。
+        // ここでは dno_hc_mixed_f32 が同じ丸め順で mixed[e] を作るので、D2H は
+        // 1/hc になり、ホストの計算は無くなる (値はビット一致)。
+        let mut chain2_mixed: Option<Vec<f32>> = None;
+        #[cfg(feature = "cuda")]
+        if mix_gpu_enabled()
+            && mix_chain_enabled()
+            && decode_chain2_mix_enabled()
+            && down.ty() == crate::kquant::GgmlType::Bf16
+            && up.ty() == crate::kquant::GgmlType::Bf16
+        {
+            let mut m = vec![0.0f32; e];
+            if crate::cuda::maybe_gpu_mix_bf16_chain2_into(
+                down.uid(),
+                down.blocks().as_slice(),
+                down.k(),
+                down.n(),
+                up.uid(),
+                up.blocks().as_slice(),
+                up.k(),
+                up.n(),
+                1.0f32 / hp.hc as f32,
+                e,
+                xn,
+                &mut m,
+            ) {
+                chain2_mixed = Some(m);
+            }
+        }
+        let gpu_chain2 = chain2_mixed.is_some();
         // task 138: down → lo_apply → up を 1 回の同期に畳む経路
         // (`DENNO_MIX_GPU` on・既定 on の `DENNO_MIX_CHAIN`・両方 BF16 のとき)。
         // 丸めは従来の GPU 経路と同じ (silu は dno_expf = glibc expf のビット一致
         // 実装) なので、通れば logits は従来とビット一致する。不発なら下の
         // 2 往復経路へそのまま落ちる。
         #[cfg(feature = "cuda")]
-        let gpu_chain = mix_gpu_enabled()
+        let gpu_chain = !gpu_chain2
+            && mix_gpu_enabled()
             && mix_chain_enabled()
             && down.ty() == crate::kquant::GgmlType::Bf16
             && up.ty() == crate::kquant::GgmlType::Bf16
@@ -3837,7 +3892,14 @@ fn hc_mix_quant_fast(
             );
         #[cfg(not(feature = "cuda"))]
         let gpu_chain = false;
-        if gpu_chain {
+        if gpu_chain2 {
+            // chain2 は down/up/hc_mixed を 1 回の同期で閉じる (内訳は chain と同じ
+            // 規則で down に積む)。
+            mix_kprof::gemv::note_down(t, down.ty());
+            mix_kprof::gemv::note_up(t, up.ty());
+            mix_kprof::rowpar::set_label(mix_kprof::rowpar::NONE);
+            mix_kprof::mark(t, mix_kprof::DOWN);
+        } else if gpu_chain {
             // 内訳は down/up の 2 区間に同じ区間を積む (合計は chain 1 回のまま)。
             mix_kprof::gemv::note_down(t, down.ty());
             mix_kprof::gemv::note_up(t, up.ty());
@@ -3917,8 +3979,16 @@ fn hc_mix_quant_fast(
         // task 106: 合成は戻り値に直接書く (scratch へ書いて `to_vec()` で写す
         // 旧形から、10 KB の写しを消す。同じ [`hyper::hc_mixed_into_par`] なので
         // 値はビット一致)。`mixed` scratch は batch 経路 (`hc_mix_quant_batch`) 専用。
-        let mut out = vec![0.0f32; e];
-        hyper::hc_mixed_into_par(xn, gate, &mut out, hp);
+        // task 150: chain2 が通ったときは GPU が mixed まで作っている (ホストの
+        // hc_mixed は回さない)。
+        let mut out = match chain2_mixed {
+            Some(m) => m,
+            None => {
+                let mut out = vec![0.0f32; e];
+                hyper::hc_mixed_into_par(xn, gate, &mut out, hp);
+                out
+            }
+        };
         mix_kprof::mark(t, mix_kprof::MIXED);
 
         let inj = match inject {
@@ -14574,6 +14644,10 @@ mod tests {
                 assert!(!chain2_exp_active(false, exp), "束ねゲート off で on になった");
                 assert_eq!(chain2_exp_active(true, exp), exp);
             }
+            // MIX の部分ゲートも EXP と同じ規則 (既定 on)。
+            assert!(decode_chain2_mix_from_value(None));
+            assert!(!decode_chain2_mix_from_value(Some("0")));
+            assert!(decode_chain2_mix_from_value(Some("on")));
         }
 
         /// task 150: ヒットとミスの寄与を `sel` の並びへ戻す (位置の取り違え・
@@ -14602,6 +14676,42 @@ mod tests {
             let mut hs3: Vec<Option<Vec<f32>>> = vec![None; 5];
             assert!(scatter_contribs(&mut hs3, &pos, &h[..2], &[], &[], e).is_err());
             assert!(scatter_contribs(&mut hs3, &[5], &h[..2], &[], &[], e).is_err());
+        }
+
+        /// task 150: `dno_hc_mixed_f32` の 1 要素を .cu の行順で写したミラー。
+        /// CPU の `hc_mixed_into` と **ビット一致** することを固定する
+        /// (sigmoid は 1/(1+exp(-v))・加算は s 昇順・1/hc は和の後)。
+        #[test]
+        #[cfg(feature = "cuda")]
+        fn hc_mixed_kernel_mirror_matches_cpu() {
+            fn sig(v: f32) -> f32 {
+                1.0 / (1.0 + (-v).exp())
+            }
+            for (hc, e) in [(1usize, 1usize), (4, 7), (4, 2560), (2, 96)] {
+                let hp = HyperParams {
+                    hc,
+                    n_embd: e,
+                    low_rank: 320,
+                    eps: 1e-6,
+                };
+                let n = hc * e;
+                let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.017).sin() * 3.0).collect();
+                let g: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.011).cos() * 5.0).collect();
+                let mut want = vec![0.0f32; e];
+                hyper::hc_mixed_into(&x, &g, &mut want, &hp);
+                // dno_hc_mixed_f32 の 1 スレッド分 (s = 0 で代入、s >= 1 で加算)。
+                let inv_hc = 1.0f32 / hc as f32;
+                let mut got = vec![0.0f32; e];
+                for (d, slot) in got.iter_mut().enumerate() {
+                    let mut acc = x[d] * sig(g[d]);
+                    for s in 1..hc {
+                        let i = s * e + d;
+                        acc += x[i] * sig(g[i]);
+                    }
+                    *slot = acc * inv_hc;
+                }
+                assert_eq!(want, got, "hc={hc} e={e} で CPU と一致しない");
+            }
         }
 
         /// task 145: `DENNO_MIX_BATCH_GPU` の真理値表 (既定 on) と、バッチ mix の
