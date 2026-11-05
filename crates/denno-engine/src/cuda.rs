@@ -3551,6 +3551,8 @@ struct IqScratch {
     pd: Option<DevBuffer>,
     sgu: Option<DevBuffer>,
     sgd: Option<DevBuffer>,
+    /// task 150: `h` の D2H を非同期で受ける pinned staging (overlap 経路だけ)。
+    hpin: Option<PinMem>,
 }
 
 impl IqScratch {
@@ -3566,6 +3568,7 @@ impl IqScratch {
             pd: None,
             sgu: None,
             sgd: None,
+            hpin: None,
         }
     }
 }
@@ -3598,6 +3601,71 @@ pub fn moe_experts_iq_layer(
     e: usize,
     out_h: &mut [f32],
 ) -> Result<bool> {
+    iq_layer_run(
+        ty_g, ty_u, ty_d, pg, pu, pd, seg_gu, seg_d, x, n_in, ff, e, out_h, false, || Ok(()),
+    )
+}
+
+/// task 150: [`moe_experts_iq_layer`] の**重ね打ち版**。
+///
+/// 発行するカーネル・引数・順序・値は逐次版と 1 つも変わらない。違うのは待ち方だけで、
+/// **D2H を非同期で出してから `cpu_miss` を実行し、最後に 1 回だけ同期する**。
+/// decode では 1 層あたり GPU 5〜6 ms 待つのに CPU ミスが 57 ms あるので (lab t148b)、
+/// 待ちを CPU の仕事の裏へ隠せる。`cpu_miss` は GPU の作業域に触れてはいけない
+/// (呼び出し側はミス expert の CPU 寄与だけを書く)。
+///
+/// `Ok(false)` = GPU でやらなかった (どの起動よりも前に落ちた)。このとき
+/// `cpu_miss` は**呼ばれない**ので、呼び出し側は従来どおり全 expert を CPU で
+/// 計算し直せる。`cpu_miss` が `Err` を返したときは**そのまま Err を返す**
+/// (起動済みで `out_h` の一部が確定しているため CPU 経路へは戻さない)。
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts_iq_layer_overlap<F>(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    ty_d: crate::kquant::GgmlType,
+    pg: &[u64],
+    pu: &[u64],
+    pd: &[u64],
+    seg_gu: &[u32],
+    seg_d: &[u32],
+    x: &[f32],
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    out_h: &mut [f32],
+    cpu_miss: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Result<()>,
+{
+    iq_layer_run(
+        ty_g, ty_u, ty_d, pg, pu, pd, seg_gu, seg_d, x, n_in, ff, e, out_h, true, cpu_miss,
+    )
+}
+
+/// [`moe_experts_iq_layer`] と [`moe_experts_iq_layer_overlap`] の共通本体。
+/// `overlap == false` のときの順序・API 呼び出しは task 144 の実装と同一。
+#[allow(clippy::too_many_arguments)]
+fn iq_layer_run<F>(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    ty_d: crate::kquant::GgmlType,
+    pg: &[u64],
+    pu: &[u64],
+    pd: &[u64],
+    seg_gu: &[u32],
+    seg_d: &[u32],
+    x: &[f32],
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    out_h: &mut [f32],
+    overlap: bool,
+    middle: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Result<()>,
+{
     let nseg = pg.len();
     if nseg == 0
         || pu.len() != nseg
@@ -3658,6 +3726,10 @@ pub fn moe_experts_iq_layer(
         MoeScratch::ensure(&mut sc.pd, nseg * 8)?;
         MoeScratch::ensure(&mut sc.sgu, seg_gu.len() * 4)?;
         MoeScratch::ensure(&mut sc.sgd, seg_d.len() * 4)?;
+        // task 150: overlap 経路だけ pinned staging を用意する (grow-only)。
+        if overlap {
+            Scratch::ensure_pin(&mut sc.hpin, nh * 4)?;
+        }
         {
             let xb = sc.x.as_ref().expect("確保済み");
             xb.copy_from(&x[..n_in])?;
@@ -3758,15 +3830,121 @@ pub fn moe_experts_iq_layer(
                     &mut args,
                 )?;
             }
-            // 4. 同期は 1 回だけ (層あたり)
-            ctx.sync()?;
+            // 4. 同期は 1 回だけ (層あたり)。task 150 の overlap 経路では D2H を
+            //    非同期で先に出し、`middle` (CPU ミス) を挟んでから同期する。
+            //    カーネル・引数・発行順は逐次版と同一 (変わるのは待つ位置だけ)。
+            if overlap {
+                // `h` の借用をここで切る (pinned は別 field なので `sc` を丸ごと
+                // 借り直さないよう、アドレスを先に写す)。
+                let h_ptr = h.ptr;
+                let pin = sc.hpin.as_mut().expect("確保済み");
+                check(
+                    (lib()?.memcpy_dtoh_async)(pin.ptr, h_ptr, nh * 4, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (iq layer overlap)",
+                )?;
+                crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+            } else {
+                ctx.sync()?;
+            }
         }
-        let got: Vec<f32> = sc.h.as_ref().expect("確保済み").to_vec(nh)?;
+        if overlap {
+            // ここから下はデバイスの完了を待たずに走る (GPU と CPU の重ね打ち)。
+            middle()?;
+            ctx.sync()?;
+            let pin = sc.hpin.as_ref().expect("確保済み");
+            out_h[..nh].copy_from_slice(&pin.as_slice::<f32>()[..nh]);
+        } else {
+            let got: Vec<f32> = sc.h.as_ref().expect("確保済み").to_vec(nh)?;
+            out_h[..nh].copy_from_slice(&got);
+            middle()?;
+        }
         dbg_d2h(nh * 4);
-        out_h[..nh].copy_from_slice(&got);
         Ok(())
     })?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod iq_overlap_tests {
+    //! task 150: 重ね打ち経路の**契約**を GPU 無しで固定する。
+    use super::*;
+    use crate::kquant::GgmlType;
+
+    /// 形状が不正なら起動前に `Ok(false)` を返し、**CPU ミスのコールバックを
+    /// 呼ばない** (呼び出し側は全 expert を CPU で計算し直せる)。呼んでしまうと
+    /// 二重計算になるうえ、`out_h` が途中まで書かれた状態で CPU 経路へ戻すことになる。
+    #[test]
+    fn overlap_skips_cpu_miss_when_it_does_not_launch() {
+        let called = std::cell::Cell::new(0u32);
+        let mut out = vec![0.0f32; 4];
+        // seg_gu の長さが 4 の倍数でない → 起動計画より前に落ちる。
+        let r = moe_experts_iq_layer_overlap(
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            &[0u64],
+            &[0u64],
+            &[0u64],
+            &[0u32, 1, 0, 0, 0],
+            &[0u32, 1, 0, 0, 0, 0, 0, 0],
+            &[0.0f32; 8],
+            8,
+            16,
+            4,
+            &mut out,
+            || {
+                called.set(called.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("形状検査は Err ではなく Ok(false)");
+        assert!(!r, "不正な形状で GPU 経路を選んではいけない");
+        assert_eq!(called.get(), 0, "起動しないのに CPU ミスを走らせた");
+        assert!(out.iter().all(|&v| v == 0.0), "out を書いてはいけない");
+    }
+
+    /// 逐次版と重ね打ち版は同じ入口 (`iq_layer_run`) を通る。GPU の無い環境では
+    /// どちらも `Ok(false)` で、値は 1 つも書かれない。
+    #[test]
+    fn both_entries_fall_back_without_cuda() {
+        let mut out_a = vec![7.0f32; 4];
+        let mut out_b = vec![7.0f32; 4];
+        let a = moe_experts_iq_layer(
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            &[0u64],
+            &[0u64],
+            &[0u64],
+            &[0u32, 0, 0, 0],
+            &[0u32, 0, 0, 0],
+            &[0.0f32; 8],
+            8,
+            16,
+            4,
+            &mut out_a,
+        )
+        .expect("逐次版");
+        let b = moe_experts_iq_layer_overlap(
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            &[0u64],
+            &[0u64],
+            &[0u64],
+            &[0u32, 0, 0, 0],
+            &[0u32, 0, 0, 0],
+            &[0.0f32; 8],
+            8,
+            16,
+            4,
+            &mut out_b,
+            || Ok(()),
+        )
+        .expect("重ね打ち版");
+        assert_eq!(a, b, "同じ入口なのに戻り値が違う");
+        assert_eq!(out_a, out_b, "out の扱いが違う");
+    }
 }
 
 #[cfg(test)]

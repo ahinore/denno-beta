@@ -3329,6 +3329,62 @@ fn mix_chain_enabled() -> bool {
     *ON.get_or_init(|| mix_chain_from_value(std::env::var("DENNO_MIX_CHAIN").ok().as_deref()))
 }
 
+/// task 150: `DENNO_DECODE_CHAIN2` の値を解釈する (純関数・テスト用)。
+/// **既定 off** (採用が決まったら既定 on へ反転する)。`1` / `on` / `true` / `yes`
+/// だけが真で、それ以外の値は偽。
+fn decode_chain2_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => false,
+    }
+}
+
+/// task 150: decode の GPU 往復を減らす束ねゲート (`DENNO_DECODE_CHAIN2`、既定 off)。
+///
+/// 中の変更は部分ゲートで個別に切れる:
+/// - [`decode_chain2_exp_enabled`]: 選択 expert の IQ 層一括 GEMV を CPU ミスと重ねる。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn decode_chain2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        decode_chain2_from_value(std::env::var("DENNO_DECODE_CHAIN2").ok().as_deref())
+    })
+}
+
+/// task 150: `DENNO_DECODE_CHAIN2_EXP` の値を解釈する (純関数・テスト用)。
+/// **既定 on** で、明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
+fn decode_chain2_exp_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// task 150: 束ねゲートと部分ゲートの合成 (純関数・テスト用)。
+/// 部分ゲートは束ねゲートが on のときだけ効く。
+fn chain2_exp_active(chain2: bool, exp_flag: bool) -> bool {
+    chain2 && exp_flag
+}
+
+/// task 150: 選択 expert の IQ 層一括 GEMV を CPU ミスと重ねる
+/// (`DENNO_DECODE_CHAIN2_EXP`、既定 on)。`DENNO_DECODE_CHAIN2` が on のときだけ
+/// 意味を持つ (束ねゲート off では従来どおり GEMV の完了を待ってから CPU を回す)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn decode_chain2_exp_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    chain2_exp_active(
+        decode_chain2_enabled(),
+        *ON.get_or_init(|| {
+            decode_chain2_exp_from_value(
+                std::env::var("DENNO_DECODE_CHAIN2_EXP").ok().as_deref(),
+            )
+        }),
+    )
+}
+
 /// task 145: `DENNO_MIX_BATCH_GPU` の解釈 (純関数)。**既定 on**。
 /// 明示的な偽値 (`0` / `off` / `false` / `no`) のときだけ切る。
 /// on のとき、prefill のバッチ mix (BF16 の down / up) を GPU の
@@ -7426,6 +7482,82 @@ fn iq_expert_mode(lw: &LayerW) -> bool {
         .all(|t| crate::model::exp_iq::supported(*t))
 }
 
+/// task 150: ミスした expert の寄与を `dst` (`sel.len() * e`) へ直接書く。
+///
+/// 1 expert の計算は [`expert_contribs_par`] と同じ [`ExpertW::gemv_seq`] を同じ順で
+/// 通るので、寄与はビット一致する (足し込みは呼び出し側が index 昇順の逐次)。
+/// `par` 無しのビルドでは逐次で同じものを書く。
+#[cfg(feature = "cuda")]
+fn expert_miss_contribs_into(
+    lw: &LayerW,
+    sel: &[usize],
+    x: &[f32],
+    e: usize,
+    ff: usize,
+    dst: &mut [f32],
+) -> Result<()> {
+    debug_assert_eq!(dst.len(), sel.len() * e, "dst は sel.len()*e");
+    #[cfg(feature = "par")]
+    {
+        expert_contribs_par_into(lw, sel, x, e, ff, None, dst)
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        // par 無しのビルドでも同じ寄与 (1 expert = gemv_seq を 3 回)。
+        let mut act = vec![0.0f32; ff];
+        let mut up = vec![0.0f32; ff];
+        for (t, &ei) in sel.iter().enumerate() {
+            let h = &mut dst[t * e..(t + 1) * e];
+            lw.gate_exps.gemv_seq(ei, x, &mut act)?;
+            silu_inplace(&mut act);
+            lw.up_exps.gemv_seq(ei, x, &mut up)?;
+            for r in 0..ff {
+                act[r] *= up[r];
+            }
+            lw.down_exps.gemv_seq(ei, &act, h)?;
+        }
+        Ok(())
+    }
+}
+
+/// task 150: GPU のヒット (`pos` / `h`) と CPU ミス (`miss_pos` / `miss_h`) の寄与を
+/// `sel` の並び (`hs`) へ戻す。
+///
+/// 位置と寄与の対応が 1 つずれると静かに別の expert の値を足すことになるので、
+/// 長さと範囲を検査して落とす (どちらも呼び出し側の作った表なので、ここが最後の砦)。
+#[cfg(feature = "cuda")]
+fn scatter_contribs(
+    hs: &mut [Option<Vec<f32>>],
+    pos: &[usize],
+    h: &[f32],
+    miss_pos: &[usize],
+    miss_h: &[f32],
+    e: usize,
+) -> Result<()> {
+    if e == 0 || h.len() != pos.len() * e || miss_h.len() != miss_pos.len() * e {
+        return Err(one(format!(
+            "expert 寄与の長さが合わない (h {} / pos {} / miss {} / miss_pos {} / e {e})",
+            h.len(),
+            pos.len(),
+            miss_h.len(),
+            miss_pos.len()
+        )));
+    }
+    for (i, &t) in pos.iter().enumerate() {
+        let slot = hs
+            .get_mut(t)
+            .ok_or_else(|| one(format!("hit 位置 {t} が hs の範囲外")))?;
+        *slot = Some(h[i * e..(i + 1) * e].to_vec());
+    }
+    for (i, &t) in miss_pos.iter().enumerate() {
+        let slot = hs
+            .get_mut(t)
+            .ok_or_else(|| one(format!("miss 位置 {t} が hs の範囲外")))?;
+        *slot = Some(miss_h[i * e..(i + 1) * e].to_vec());
+    }
+    Ok(())
+}
+
 /// task 144: IQ 系の型を **ヒットだけ GPU / ミスは CPU** で回す層一括経路。
 ///
 /// # 何が違うか
@@ -7514,7 +7646,41 @@ fn moe_experts_iq_gpu_batched(
     let seg_gu = crate::model::expert_batch::seg_table_shared_x(&ids, ff);
     let seg_d = crate::model::expert_batch::seg_table_per_act(&ids, ff, e);
     let mut h = vec![0.0f32; devs.len() * e];
-    let ran = {
+    // task 150 (`DENNO_DECODE_CHAIN2_EXP`): ミス (VRAM に載っていない expert) の寄与を
+    // GPU の完了前に CPU で計算し、同期をその裏へ隠す。ミスの位置と id を先に作り、
+    // overlap 経路ではコールバックの中で `miss_h` へ書かせる (足し込みは従来どおり
+    // 呼び出し側が index 昇順の逐次)。
+    let overlap = decode_chain2_exp_enabled();
+    let mut is_hit = vec![false; sel.len()];
+    for &t in pos.iter() {
+        is_hit[t] = true;
+    }
+    let miss_pos: Vec<usize> = (0..sel.len()).filter(|&t| !is_hit[t]).collect();
+    let miss_ids: Vec<usize> = miss_pos.iter().map(|&t| sel[t]).collect();
+    let mut miss_h = vec![0.0f32; miss_pos.len() * e];
+    let ran = if overlap {
+        // 台帳の exp_iq 区間は取らない (同期が CPU ミスの後ろへ移るので、GPU の
+        // 待ちだけを切り出せない)。起動と同期は `experts` 行に入る。
+        crate::cuda::moe_experts_iq_layer_overlap(
+            lw.gate_exps.ty,
+            lw.up_exps.ty,
+            lw.down_exps.ty,
+            &pg,
+            &pu,
+            &pd,
+            &seg_gu,
+            &seg_d,
+            x,
+            x.len(),
+            ff,
+            e,
+            &mut h,
+            || {
+                expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_h)
+                    .map_err(anyhow::Error::from)
+            },
+        )
+    } else {
         // task 138 の台帳に「1 層あたりの GPU 時間」を積む (DENNO_Q4_PROFILE=1 のときだけ)。
         let _l = crate::model::q4ledger::enter(crate::model::q4ledger::EXPERT);
         crate::cuda::moe_experts_iq_layer(
@@ -7532,16 +7698,17 @@ fn moe_experts_iq_gpu_batched(
             e,
             &mut h,
         )
-        .map_err(|err| one(format!("層 {}: IQ 層一括 GEMV: {err:#}", lw.il)))?
-    };
+    }
+    .map_err(|err| one(format!("層 {}: IQ 層一括 GEMV: {err:#}", lw.il)))?;
     if !ran {
         return Ok(None);
     }
 
     let mut hs: Vec<Option<Vec<f32>>> = vec![None; sel.len()];
-    for (i, &t) in pos.iter().enumerate() {
-        hs[t] = Some(h[i * e..(i + 1) * e].to_vec());
-    }
+    // task 150: overlap のときはミスも CPU で計算済みなので、両方をここで揃える
+    // (呼び出し側は `None` を見ない = CPU を二度回さない)。
+    let miss_slice: &[usize] = if overlap { miss_pos.as_slice() } else { &[] };
+    scatter_contribs(&mut hs, &pos, &h, miss_slice, &miss_h, e)?;
 
     // 3. DENNO_EXPERT_GPU_CHECK=1: CPU の 3 行列と突き合わせる (層ごとに 1 行)。
     if expert_vram::check_enabled() {
@@ -14374,6 +14541,67 @@ mod tests {
             for v in [Some("0"), Some("off"), Some("OFF"), Some("false"), Some("no")] {
                 assert!(!mix_chain_from_value(v), "value={v:?} は off のはず");
             }
+        }
+
+        /// task 150: `DENNO_DECODE_CHAIN2` は既定 off (採用が決まったら反転する)、
+        /// 部分ゲート `DENNO_DECODE_CHAIN2_EXP` は既定 on。部分ゲートは束ねゲートが
+        /// on のときだけ効く (純関数で固定する)。
+        #[test]
+        fn decode_chain2_gates_truth_table() {
+            assert!(!decode_chain2_from_value(None), "未設定は off のはず");
+            for v in [Some("1"), Some("on"), Some("ON"), Some(" true "), Some("yes")] {
+                assert!(decode_chain2_from_value(v), "value={v:?} は on のはず");
+            }
+            for v in [
+                Some("0"),
+                Some("off"),
+                Some("false"),
+                Some("no"),
+                Some(""),
+                Some("2"),
+            ] {
+                assert!(!decode_chain2_from_value(v), "value={v:?} は off のはず");
+            }
+            assert!(decode_chain2_exp_from_value(None), "未設定は on のはず");
+            for v in [Some("1"), Some("on"), Some("ON"), Some(" yes "), Some("")] {
+                assert!(decode_chain2_exp_from_value(v), "value={v:?} は on のはず");
+            }
+            for v in [Some("0"), Some("off"), Some("false"), Some("no")] {
+                assert!(!decode_chain2_exp_from_value(v), "value={v:?} は off のはず");
+            }
+            // 合成: 束ねゲートが off なら部分ゲートの値に依らず off。
+            for exp in [false, true] {
+                assert!(!chain2_exp_active(false, exp), "束ねゲート off で on になった");
+                assert_eq!(chain2_exp_active(true, exp), exp);
+            }
+        }
+
+        /// task 150: ヒットとミスの寄与を `sel` の並びへ戻す (位置の取り違え・
+        /// 長さの不一致を静かに通さない)。
+        #[test]
+        #[cfg(feature = "cuda")]
+        fn scatter_contribs_places_hits_and_misses() {
+            let e = 2usize;
+            let pos = [0usize, 3];
+            let h = [10.0f32, 11.0, 40.0, 41.0];
+            let miss_pos = [1usize, 2, 4];
+            let miss_h = [20.0f32, 21.0, 30.0, 31.0, 50.0, 51.0];
+            let mut hs: Vec<Option<Vec<f32>>> = vec![None; 5];
+            scatter_contribs(&mut hs, &pos, &h, &miss_pos, &miss_h, e).expect("scatter");
+            assert_eq!(hs[0].as_deref(), Some(&[10.0f32, 11.0][..]));
+            assert_eq!(hs[1].as_deref(), Some(&[20.0f32, 21.0][..]));
+            assert_eq!(hs[2].as_deref(), Some(&[30.0f32, 31.0][..]));
+            assert_eq!(hs[3].as_deref(), Some(&[40.0f32, 41.0][..]));
+            assert_eq!(hs[4].as_deref(), Some(&[50.0f32, 51.0][..]));
+            // ミスを渡さなければヒットだけが埋まる (従来経路と同じ形)。
+            let mut hs2: Vec<Option<Vec<f32>>> = vec![None; 5];
+            scatter_contribs(&mut hs2, &pos, &h, &[], &[], e).expect("scatter hits only");
+            assert!(hs2[0].is_some() && hs2[3].is_some());
+            assert!(hs2[1].is_none() && hs2[2].is_none() && hs2[4].is_none());
+            // 長さが合わない / 範囲外は Err (別の expert の値を足さない)。
+            let mut hs3: Vec<Option<Vec<f32>>> = vec![None; 5];
+            assert!(scatter_contribs(&mut hs3, &pos, &h[..2], &[], &[], e).is_err());
+            assert!(scatter_contribs(&mut hs3, &[5], &h[..2], &[], &[], e).is_err());
         }
 
         /// task 145: `DENNO_MIX_BATCH_GPU` の真理値表 (既定 on) と、バッチ mix の
