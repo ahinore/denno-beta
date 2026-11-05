@@ -1,6 +1,7 @@
 //! モデルファミリー抽象とディスパッチ
 
 pub mod devprof;
+pub mod exp_iq;
 pub mod expert_batch;
 pub mod expert_cache;
 pub mod exp_kprof;

@@ -126,11 +126,23 @@ pub enum Route {
 
 /// 経路の決定 (純粋関数)。env を読む部分から切り離してテストできるようにしてある。
 ///
-/// VRAM 経路は「`DENNO_EXPERT_GPU` が真」かつ「`DENNO_EXPERT_VRAM_MB` > 0」かつ
+/// VRAM 経路は「(`DENNO_EXPERT_GPU` が真 **または** task 144 の
+/// `DENNO_EXPERT_IQ_GPU` が真)」かつ「`DENNO_EXPERT_VRAM_MB` > 0」かつ
 /// 「CUDA が有効」の 3 つが揃ったときだけ。`VRAM_MB=0` で GPU だけ立てても
 /// 毎回 3 MB を H2D するだけなので、そちらは明示的に無効にしてある。
-pub fn resolve_route(gpu: Option<&str>, vram_mb: usize, gpu_available: bool) -> Route {
-    if !flag_on(gpu) || vram_mb == 0 || !gpu_available {
+///
+/// `iq_gate` は task 144 で足した IQ 系カーネルのゲート。旧来の 4 型
+/// (Q8_0 / Q5_1 / Q4_K / Q5_K) を読む `DENNO_EXPERT_GPU` とは独立に、
+/// **IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL / Q2_0** の expert を VRAM に
+/// 載せるための入口。`DENNO_EXPERT_GPU` は「既定 off のまま」なので、
+/// 本番のモデルではこちらだけで経路が立つ。
+pub fn resolve_route(
+    gpu: Option<&str>,
+    vram_mb: usize,
+    gpu_available: bool,
+    iq_gate: bool,
+) -> Route {
+    if (!flag_on(gpu) && !iq_gate) || vram_mb == 0 || !gpu_available {
         return Route::Cpu;
     }
     Route::Vram
@@ -881,7 +893,7 @@ pub fn resident_by_layer() -> Vec<(u16, Vec<u16>)> {
 
 #[cfg(feature = "cuda")]
 pub use gpu::{
-    acquire, cache_usage, check_enabled, fallbacks, init, note_check, take_check, Acquired,
+    acquire, cache_usage, check_enabled, fallbacks, init, lookup, note_check, take_check, Acquired,
     CheckAcc, ExpertDev, ExpertShape,
 };
 
@@ -1063,6 +1075,32 @@ mod gpu {
         FALLBACKS.load(Ordering::Relaxed)
     }
 
+    /// task 144: **載っているときだけ** expert を返す (ミスで H2D しない)。
+    ///
+    /// 層一括の IQ 経路は「ヒットした expert だけ GPU、ミスは CPU」で回すので、
+    /// ミスのときに 2 MB を同期で上げる [`acquire`] とは別の入口が要る。
+    /// 形が登録済みと違えばエラー (黙って別の重みで計算しない)。
+    pub fn lookup(key: ExpertKey, shapes: [ExpertShape; 3]) -> Result<Option<Arc<ExpertDev>>> {
+        let Some(cache) = CACHE.get() else {
+            return Ok(None);
+        };
+        let mut g = cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("expert VRAM LRU のロックが poisoned"))?;
+        let Some(dev) = g.get_mut(&key) else {
+            return Ok(None);
+        };
+        if dev.shapes != shapes {
+            bail!(
+                "expert VRAM: 同じ鍵 {:?} に別の形が来た (登録済み {:?} / 今回 {:?})",
+                key,
+                dev.shapes,
+                shapes
+            );
+        }
+        Ok(Some(Arc::clone(dev)))
+    }
+
     /// [`acquire`] の結果。`hit` は「すでに VRAM に載っていたか」(P45 のゲートが
     /// ヒット率として数える)。
     pub struct Acquired {
@@ -1114,9 +1152,16 @@ mod gpu {
 
         // 載せる前に「型・カーネルが対応しているか」を確かめる。載せてから
         // `false` で落ちると VRAM が無駄に埋まる。
+        //
+        // task 144: 旧来の 4 型 (Q8_0 / Q5_1 / Q4_K / Q5_K) に加えて、IQ 系の
+        // 6 型 (IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL / Q2_0) も
+        // `kernels_exp_iq.ptx` があれば載せてよい (`DENNO_EXPERT_IQ_GPU=1` のときだけ
+        // `moe_gemv_iq_ready` が真になる)。ゲートが off なら従来どおり false。
         let mut want = 0usize;
         for s in shapes {
-            if !crate::cuda::CudaCtx::moe_gemv_dev_ready(s.ty, s.k) {
+            if !crate::cuda::CudaCtx::moe_gemv_dev_ready(s.ty, s.k)
+                && !crate::cuda::moe_gemv_iq_ready(s.ty, s.k)
+            {
                 FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 return Ok(None);
             }
@@ -1139,7 +1184,14 @@ mod gpu {
         drop(evicted); // ここで DevBuffer が落ちて VRAM が空く
 
         let [gb, ub, db] = load()?;
-        let alloc = |b: &[u8]| match DevBuffer::from_slice(b) {
+        // task 144: H2D は pinned staging 経由が既定 (lab t144b の実測で pageable は
+        // 2.4 GB/s しか出ず、expert 1 本の転送が CPU 計算の 10 倍かかっていた)。
+        let pinned = crate::cuda::expert_pin_h2d();
+        let alloc = |b: &[u8]| match if pinned {
+            crate::cuda::from_slice_pinned(b)
+        } else {
+            DevBuffer::from_slice(b)
+        } {
             Ok(d) => Some(d),
             Err(e) => {
                 if !ALLOC_DEAD.swap(true, Ordering::Relaxed) {
@@ -1332,25 +1384,38 @@ mod tests {
     /// 経路の決定表: GPU フラグ・上限・CUDA 可用性の 3 条件がすべて要る。
     #[test]
     fn route_needs_flag_cap_and_cuda() {
-        assert_eq!(resolve_route(None, 4096, true), Route::Cpu, "未設定は従来どおり");
-        assert_eq!(resolve_route(Some("0"), 4096, true), Route::Cpu);
-        assert_eq!(resolve_route(Some(""), 4096, true), Route::Cpu);
-        assert_eq!(resolve_route(Some("off"), 4096, true), Route::Cpu);
         assert_eq!(
-            resolve_route(Some("1"), 0, true),
+            resolve_route(None, 4096, true, false),
+            Route::Cpu,
+            "未設定は従来どおり"
+        );
+        assert_eq!(resolve_route(Some("0"), 4096, true, false), Route::Cpu);
+        assert_eq!(resolve_route(Some(""), 4096, true, false), Route::Cpu);
+        assert_eq!(resolve_route(Some("off"), 4096, true, false), Route::Cpu);
+        assert_eq!(
+            resolve_route(Some("1"), 0, true, false),
             Route::Cpu,
             "上限 0 は完全に従来経路"
         );
         assert_eq!(
-            resolve_route(Some("1"), 4096, false),
+            resolve_route(Some("1"), 4096, false, false),
             Route::Cpu,
             "CUDA が無効なら GPU 経路に入らない"
         );
-        assert_eq!(resolve_route(Some("1"), 4096, true), Route::Vram);
-        assert_eq!(resolve_route(Some("true"), 1, true), Route::Vram);
-        assert_eq!(resolve_route(Some("on"), 1, true), Route::Vram);
-        assert_eq!(resolve_route(Some(" 1 "), 1, true), Route::Vram);
-        assert_eq!(resolve_route(Some("2"), 1, true), Route::Cpu);
+        assert_eq!(resolve_route(Some("1"), 4096, true, false), Route::Vram);
+        assert_eq!(resolve_route(Some("true"), 1, true, false), Route::Vram);
+        assert_eq!(resolve_route(Some("on"), 1, true, false), Route::Vram);
+        assert_eq!(resolve_route(Some(" 1 "), 1, true, false), Route::Vram);
+        assert_eq!(resolve_route(Some("2"), 1, true, false), Route::Cpu);
+        // task 144: IQ ゲート単独でも VRAM 経路に入る (DENNO_EXPERT_GPU は off のまま)。
+        assert_eq!(resolve_route(None, 14000, true, true), Route::Vram);
+        assert_eq!(resolve_route(Some("0"), 14000, true, true), Route::Vram);
+        assert_eq!(
+            resolve_route(None, 0, true, true),
+            Route::Cpu,
+            "VRAM 上限 0 は IQ ゲートでも無効"
+        );
+        assert_eq!(resolve_route(None, 14000, false, true), Route::Cpu);
     }
 
     /// `DENNO_EXPERT_VRAM_MB` の解釈。

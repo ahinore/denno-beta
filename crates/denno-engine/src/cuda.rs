@@ -3413,6 +3413,362 @@ pub fn moe_gemv_seg_one(
     Ok(true)
 }
 
+// ===========================================================================
+// task 144: IQ 系 expert の層一括 GEMV (`kernels_exp_iq.cu` → `kernels_exp_iq.ptx`)
+// ===========================================================================
+//
+// # なぜ要るか
+//
+// P39/P43 の VRAM 常駐経路は `gguf_row_bytes` が返す 4 型 (Q8_0 / Q5_1 / Q4_K /
+// Q5_K) しか GPU で読めない。本番の expert は IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS /
+// IQ4_NL / Q2_0 なので `moe_gemv_dev_ready` が**型の判定で** false になり、
+// `expert_vram::acquire` は 1 本も載せず、480 expert 全部が CPU で回っていた
+// (実測 99〜108 ms/tok、VRAM 使用 0 MiB)。`f_moe` (PTX モジュール) は正常だった。
+//
+// # 何をするか
+//
+// 1 層ぶんの expert FFN を **4 起動 + 1 同期**で回す:
+//
+//   gate 1 起動 → up 1 起動 → silu_mul 1 起動 → down 1 起動 → sync → D2H(h)
+//
+// 1 行 = 1 warp (32 レーン) で k 方向を分割して足すので、CPU とは丸め順が違う
+// (task 144 はビット一致を要求しない)。起動形が同じなら値は決定的。
+//
+// ゲート `DENNO_EXPERT_IQ_GPU` が off のときは [`moe_gemv_iq_ready`] が false を
+// 返すので、この経路は選ばれない (md5 はベースラインと一致する)。
+
+/// カーネル一式 (PTX を起動時に 1 回だけ読む)。
+struct ExpIqKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    /// 型ごとの GEMV ([`crate::model::exp_iq::slot`] の順)
+    fns: [CUfunction; crate::model::exp_iq::SLOTS],
+    /// silu(g) * u
+    silu: CUfunction,
+}
+
+// 生ハンドル (context / module / function)。CudaCtx と同じ規約。
+unsafe impl Send for ExpIqKernels {}
+unsafe impl Sync for ExpIqKernels {}
+
+static EXP_IQ_KERNELS: OnceLock<Option<ExpIqKernels>> = OnceLock::new();
+
+/// PTX の置き場所。`DENNO_EXP_IQ_PTX` があればそれ、無ければクレート配下
+/// `kernels/kernels_exp_iq.ptx`。
+fn exp_iq_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_EXP_IQ_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_iq.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける
+/// (= 二度と試さない。呼び出し側は CPU へ落ちる)。
+fn exp_iq_kernels() -> Option<&'static ExpIqKernels> {
+    EXP_IQ_KERNELS
+        .get_or_init(|| {
+            let path = exp_iq_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[exp-iq] PTX が読めない ({}) : {e} → CPU 経路へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0);
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[exp-iq] cuModuleLoadData 失敗 → CPU 経路へ");
+                    return None;
+                }
+            }
+            let mut fns: [CUfunction; crate::model::exp_iq::SLOTS] =
+                [std::ptr::null_mut(); crate::model::exp_iq::SLOTS];
+            for (i, f) in fns.iter_mut().enumerate() {
+                let name = crate::model::exp_iq::kernel_name(i)?;
+                let mut cname = name.as_bytes().to_vec();
+                cname.push(0);
+                unsafe {
+                    if (lib.module_get_function)(f, module, cname.as_ptr() as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!("[exp-iq] PTX に {name} が無い → CPU 経路へ");
+                        return None;
+                    }
+                }
+            }
+            let mut silu: CUfunction = std::ptr::null_mut();
+            let mut cname = crate::model::exp_iq::SILU_KERNEL.as_bytes().to_vec();
+            cname.push(0);
+            unsafe {
+                if (lib.module_get_function)(&mut silu, module, cname.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[exp-iq] PTX に silu が無い → CPU 経路へ");
+                    return None;
+                }
+            }
+            Some(ExpIqKernels { module, fns, silu })
+        })
+        .as_ref()
+}
+
+/// この型・この k を GPU で回せるか。
+///
+/// `DENNO_EXPERT_IQ_GPU` が off・未対応の型・PTX 不在のいずれでも false。
+/// **載せる前**の判定 (`expert_vram::acquire`) に使う (載せてから落ちると VRAM が
+/// 無駄に埋まる)。
+pub fn moe_gemv_iq_ready(ty: crate::kquant::GgmlType, k: usize) -> bool {
+    if !cuda_enabled() || !crate::model::exp_iq::iq_gpu_enabled() {
+        return false;
+    }
+    if !crate::model::exp_iq::supported(ty)
+        || crate::model::exp_iq::row_bytes(ty, k).is_none()
+    {
+        return false;
+    }
+    exp_iq_kernels().is_some()
+}
+
+/// 1 層ぶんの作業域 (grow-only。スレッドローカル)。
+struct IqScratch {
+    x: Option<DevBuffer>,
+    g: Option<DevBuffer>,
+    u: Option<DevBuffer>,
+    act: Option<DevBuffer>,
+    h: Option<DevBuffer>,
+    pg: Option<DevBuffer>,
+    pu: Option<DevBuffer>,
+    pd: Option<DevBuffer>,
+    sgu: Option<DevBuffer>,
+    sgd: Option<DevBuffer>,
+}
+
+impl IqScratch {
+    fn new() -> Self {
+        IqScratch {
+            x: None,
+            g: None,
+            u: None,
+            act: None,
+            h: None,
+            pg: None,
+            pu: None,
+            pd: None,
+            sgu: None,
+            sgd: None,
+        }
+    }
+}
+
+thread_local! {
+    static IQ_SCRATCH: std::cell::RefCell<IqScratch> =
+        std::cell::RefCell::new(IqScratch::new());
+}
+
+/// 1 層ぶんの expert FFN を GPU で回す (gate/up は IQ, down は IQ4_NL/Q2_0)。
+///
+/// `pg` / `pu` / `pd` は segment ごとの重み先頭 (デバイスアドレス)、
+/// `seg_gu` は gate/up 用 (`x_off = 0`)、`seg_d` は down 用 (`x_off = s*ff`)。
+/// `out_h` は `nseg * e` 要素。呼び出し側は結果を expert index 昇順で足し込む。
+///
+/// `Ok(false)` は「GPU でやらなかった」= 呼び出し側は CPU 経路へ (fail closed)。
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts_iq_layer(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    ty_d: crate::kquant::GgmlType,
+    pg: &[u64],
+    pu: &[u64],
+    pd: &[u64],
+    seg_gu: &[u32],
+    seg_d: &[u32],
+    x: &[f32],
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    out_h: &mut [f32],
+) -> Result<bool> {
+    let nseg = pg.len();
+    if nseg == 0
+        || pu.len() != nseg
+        || pd.len() != nseg
+        || !seg_gu.len().is_multiple_of(4)
+        || !seg_d.len().is_multiple_of(4)
+        || seg_gu.len() / 4 != nseg
+        || seg_d.len() / 4 != nseg
+    {
+        return Ok(false);
+    }
+    if !moe_gemv_iq_ready(ty_g, n_in)
+        || !moe_gemv_iq_ready(ty_u, n_in)
+        || !moe_gemv_iq_ready(ty_d, ff)
+    {
+        return Ok(false);
+    }
+    let (Some(plan_g), Some(plan_d)) = (
+        crate::model::exp_iq::launch_plan(nseg, ff),
+        crate::model::exp_iq::launch_plan(nseg, e),
+    ) else {
+        return Ok(false);
+    };
+    if x.len() < n_in || out_h.len() < nseg * e {
+        bail!(
+            "moe_experts_iq_layer: 入出力長が足りない (x={}/{n_in}, out={}/{})",
+            x.len(),
+            out_h.len(),
+            nseg * e
+        );
+    }
+    let Some(ctx) = shared_ctx() else {
+        return Ok(false);
+    };
+    let Some(kernels) = exp_iq_kernels() else {
+        return Ok(false);
+    };
+    let (Some(slot_g), Some(slot_u), Some(slot_d)) = (
+        crate::model::exp_iq::slot(ty_g),
+        crate::model::exp_iq::slot(ty_u),
+        crate::model::exp_iq::slot(ty_d),
+    ) else {
+        return Ok(false);
+    };
+    ctx.make_current()?;
+
+    let ng = nseg * ff;
+    let nh = nseg * e;
+    IQ_SCRATCH.with(|cell| -> Result<()> {
+        let mut sc = cell.borrow_mut();
+        MoeScratch::ensure(&mut sc.x, n_in * 4)?;
+        MoeScratch::ensure(&mut sc.g, ng * 4)?;
+        MoeScratch::ensure(&mut sc.u, ng * 4)?;
+        MoeScratch::ensure(&mut sc.act, ng * 4)?;
+        MoeScratch::ensure(&mut sc.h, nh * 4)?;
+        MoeScratch::ensure(&mut sc.pg, nseg * 8)?;
+        MoeScratch::ensure(&mut sc.pu, nseg * 8)?;
+        MoeScratch::ensure(&mut sc.pd, nseg * 8)?;
+        MoeScratch::ensure(&mut sc.sgu, seg_gu.len() * 4)?;
+        MoeScratch::ensure(&mut sc.sgd, seg_d.len() * 4)?;
+        {
+            let xb = sc.x.as_ref().expect("確保済み");
+            xb.copy_from(&x[..n_in])?;
+            dbg_htod(n_in * 4);
+            sc.pg.as_ref().expect("確保済み").copy_from(pg)?;
+            sc.pu.as_ref().expect("確保済み").copy_from(pu)?;
+            sc.pd.as_ref().expect("確保済み").copy_from(pd)?;
+            dbg_htod(nseg * 8 * 3);
+            sc.sgu.as_ref().expect("確保済み").copy_from(seg_gu)?;
+            sc.sgd.as_ref().expect("確保済み").copy_from(seg_d)?;
+            dbg_htod((seg_gu.len() + seg_d.len()) * 4);
+        }
+        let xb = sc.x.as_ref().expect("確保済み");
+        let g = sc.g.as_ref().expect("確保済み");
+        let u = sc.u.as_ref().expect("確保済み");
+        let act = sc.act.as_ref().expect("確保済み");
+        let h = sc.h.as_ref().expect("確保済み");
+        unsafe {
+            // 1. gate と up (同じ segment 表 = 同じ入力 x)
+            let rb_g = crate::model::exp_iq::row_bytes(ty_g, n_in).unwrap_or(0);
+            let rb_u = crate::model::exp_iq::row_bytes(ty_u, n_in).unwrap_or(0);
+            for (f, ptrs, buf, rb) in [
+                (kernels.fns[slot_g], sc.pg.as_ref().expect("確保済み"), g, rb_g),
+                (kernels.fns[slot_u], sc.pu.as_ref().expect("確保済み"), u, rb_u),
+            ] {
+                let mut pw = ptrs.ptr;
+                let mut px = xb.ptr;
+                let mut po = buf.ptr;
+                let mut ps = sc.sgu.as_ref().expect("確保済み").ptr;
+                let (mut ns, mut ni, mut no, mut rb) = (
+                    nseg as c_int,
+                    n_in as c_int,
+                    ff as c_int,
+                    rb as c_int,
+                );
+                let mut args = [
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut px as *mut _ as *mut c_void,
+                    &mut po as *mut _ as *mut c_void,
+                    &mut ps as *mut _ as *mut c_void,
+                    &mut ns as *mut _ as *mut c_void,
+                    &mut ni as *mut _ as *mut c_void,
+                    &mut no as *mut _ as *mut c_void,
+                    &mut rb as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(f, plan_g.grid, plan_g.block, 0, &mut args)?;
+            }
+            // 2. act = silu(g) * u
+            {
+                let n = ng as c_int;
+                let threads = 256usize;
+                let blocks = ng.div_ceil(threads) as u32;
+                let mut pgg = g.ptr;
+                let mut puu = u.ptr;
+                let mut paa = act.ptr;
+                let mut pn = n;
+                let mut args = [
+                    &mut pgg as *mut _ as *mut c_void,
+                    &mut puu as *mut _ as *mut c_void,
+                    &mut paa as *mut _ as *mut c_void,
+                    &mut pn as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(
+                    kernels.silu,
+                    (blocks.max(1), 1, 1),
+                    (threads as u32, 1, 1),
+                    0,
+                    &mut args,
+                )?;
+            }
+            // 3. down (expert ごとの act を読む)
+            {
+                let mut pw = sc.pd.as_ref().expect("確保済み").ptr;
+                let mut px = act.ptr;
+                let mut po = h.ptr;
+                let mut ps = sc.sgd.as_ref().expect("確保済み").ptr;
+                let (mut ns, mut ni, mut no, mut rb) = (
+                    nseg as c_int,
+                    ff as c_int,
+                    e as c_int,
+                    crate::model::exp_iq::row_bytes(ty_d, ff).unwrap_or(0) as c_int,
+                );
+                let mut args = [
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut px as *mut _ as *mut c_void,
+                    &mut po as *mut _ as *mut c_void,
+                    &mut ps as *mut _ as *mut c_void,
+                    &mut ns as *mut _ as *mut c_void,
+                    &mut ni as *mut _ as *mut c_void,
+                    &mut no as *mut _ as *mut c_void,
+                    &mut rb as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(
+                    kernels.fns[slot_d],
+                    plan_d.grid,
+                    plan_d.block,
+                    0,
+                    &mut args,
+                )?;
+            }
+            // 4. 同期は 1 回だけ (層あたり)
+            ctx.sync()?;
+        }
+        let got: Vec<f32> = sc.h.as_ref().expect("確保済み").to_vec(nh)?;
+        dbg_d2h(nh * 4);
+        out_h[..nh].copy_from_slice(&got);
+        Ok(())
+    })?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod grouped_tests {
     //! P40: 起動形の純関数 (GPU 無しでも検証できる部分)。
@@ -3518,6 +3874,60 @@ impl Drop for PinMem {
             let _ = (lib().unwrap().mem_host_free)(self.ptr);
         }
     }
+}
+
+thread_local! {
+    /// task 144: expert の H2D 用の pinned staging (1 本ぶん。grow-only)。
+    static EXPERT_PIN: std::cell::RefCell<Option<PinMem>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `DENNO_EXPERT_PIN_H2D=1`: expert の H2D を pinned staging 経由にするか。
+///
+/// 既定 **off**。lab t144d の実測では、この環境の pageable `cuMemcpyHtoD` の方が
+/// 速かった (1 本 2.05 MB で pinned 0.34〜0.42 ms / pageable 0.27〜0.30 ms。
+/// driver が内部で staging を持つため、自前で pinned へ写すと memcpy が余分)。
+/// 転送するバイト列はどちらも同じ (モデルの数値には触らない)。
+pub fn expert_pin_h2d() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("DENNO_EXPERT_PIN_H2D").ok().as_deref(),
+            Some("1") | Some("true") | Some("on")
+        )
+    })
+}
+
+/// pinned staging 経由でホストのスライスを VRAM へ上げる (task 144)。
+///
+/// ページャブルなメモリからの `cuMemcpyHtoD` は driver が内部で staging するため、
+/// lab t144b の実測では **2.4 GB/s** しか出なかった (expert 1 本 2.05 MB で
+/// 0.86 ms)。pinned メモリへ 1 回コピーしてから H2D すると速い。
+/// デバイスへ渡るバイト列は [`DevBuffer::from_slice`] と同一 (1 bit も変えない)。
+pub fn from_slice_pinned<T: Copy>(data: &[T]) -> Result<DevBuffer> {
+    let bytes = std::mem::size_of_val(data);
+    let buf = DevBuffer::alloc(bytes.max(1))?;
+    if bytes == 0 {
+        return Ok(buf);
+    }
+    EXPERT_PIN.with(|cell| -> Result<()> {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().map(|p| p.bytes).unwrap_or(0) < bytes {
+            *slot = Some(PinMem::alloc(bytes)?);
+        }
+        let pin = slot.as_ref().expect("確保済み");
+        unsafe {
+            // ホスト側の 1 回コピー (pinned は DMA 可能な常駐メモリ)。
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, pin.ptr as *mut u8, bytes);
+            check(
+                (lib()?.memcpy_htod)(buf.ptr, pin.ptr, bytes),
+                "cuMemcpyHtoD (pinned)",
+            )?;
+        }
+        dbg_htod(bytes);
+        Ok(())
+    })?;
+    Ok(buf)
 }
 
 /// s167 (P6): 専用コピーストリーム (h2 の D2H を qkv/z GEMM と重ねる)。

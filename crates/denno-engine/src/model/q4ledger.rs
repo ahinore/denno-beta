@@ -37,21 +37,33 @@ pub const SHARED: usize = 2;
 pub const FULL: usize = 3;
 /// 区間: ssm 層の attention (qkv / gate / GDN / out)。
 pub const SSM: usize = 4;
-/// 区間: 選択 expert の本体 (task 145: prefill の expert を分離)。
+/// 区間: 選択 expert の寄与計算 (task 145)。decode と prefill の両方で立つ。
 ///
 /// prefill のバッチ経路では「重みの前置き (prefetch) を除いた、選択 expert の
 /// 寄与計算」= `moe_experts_flat` / `moe_experts_legacy` / grouped GEMM の区間。
+/// decode では CPU ミスぶんと [`EXPERT`] (IQ の層一括 GEMV) の**両方**を含む
+/// (IQ の GPU 区間はこの内側に入る)。台帳の名前は `experts`。
 pub const EXPERTS: usize = 5;
-/// 区間: 上のどれでもない (embed / ple / expert 本体 / head / サンプラ)。
+/// 区間: 上のどれでもない (embed / ple / 層の外 / head / サンプラ)。
 ///
 /// prefill では層ループの外側 (embed / PLE / 最終 mixer / head) と、層の中で
 /// まだ区間に割っていない部分がここに入る。`forward_prefill_inner` が全体を
 /// この区間で包むので、prefill では「全項目の和 = prefill の壁時計」になる。
 pub const OTHER: usize = 6;
+/// task 144: IQ 系 expert の層一括 GEMV (`kernels_exp_iq`)。
+///
+/// 「1 層あたり何 us か」を台帳から直接読むための区間。ミスして CPU で計算した
+/// expert はこの区間の外 (呼び出し側のループ) なので、**GPU で回したぶんだけ**が
+/// ここに積まれる。decode の IQ 経路だけが通り、decode では [`EXPERTS`] の
+/// 内側 (ネスト) に入る。台帳の名前は `exp_iq`。
+pub const EXPERT: usize = 7;
 /// 区間の数。
-pub const N: usize = 7;
-/// 区間の名前 ([`MIX`] の順)。
-pub const NAMES: [&str; N] = ["mix", "router", "shared", "full", "ssm", "experts", "other"];
+pub const N: usize = 8;
+/// 区間の名前 ([`MIX`] の順)。`experts` (選択 expert の寄与全体) と
+/// `exp_iq` (task 144 の IQ 層一括 GEMV、decode では `experts` の内側) は別の行。
+pub const NAMES: [&str; N] = [
+    "mix", "router", "shared", "full", "ssm", "experts", "other", "exp_iq",
+];
 
 fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
