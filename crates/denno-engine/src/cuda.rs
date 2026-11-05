@@ -3882,16 +3882,18 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// `DENNO_EXPERT_PIN_H2D`: expert の H2D を pinned staging 経由にするか。
+/// `DENNO_EXPERT_PIN_H2D=1`: expert の H2D を pinned staging 経由にするか。
 ///
-/// 既定 **on** (`"0"` / `"off"` / `"false"` で従来の pageable コピー)。
-/// 転送するバイト列は同じで、変わるのは運び方だけ (モデルの数値には触らない)。
+/// 既定 **off**。lab t144d の実測では、この環境の pageable `cuMemcpyHtoD` の方が
+/// 速かった (1 本 2.05 MB で pinned 0.34〜0.42 ms / pageable 0.27〜0.30 ms。
+/// driver が内部で staging を持つため、自前で pinned へ写すと memcpy が余分)。
+/// 転送するバイト列はどちらも同じ (モデルの数値には触らない)。
 pub fn expert_pin_h2d() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        !matches!(
+        matches!(
             std::env::var("DENNO_EXPERT_PIN_H2D").ok().as_deref(),
-            Some("0") | Some("off") | Some("false")
+            Some("1") | Some("true") | Some("on")
         )
     })
 }

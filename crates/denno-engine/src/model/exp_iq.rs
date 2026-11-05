@@ -38,11 +38,40 @@ pub const EXPERT_IQ_GPU_ENV: &str = "DENNO_EXPERT_IQ_GPU";
 /// 上げる。0 で「上げ直さない」(= 最初に載ったものだけがヒットする)。
 pub const EXPERT_IQ_UPLOAD_ENV: &str = "DENNO_EXPERT_IQ_UPLOAD";
 
-/// [`EXPERT_IQ_UPLOAD_ENV`] の既定値 (1 トークンあたり)。
+/// `DENNO_EXPERT_IQ_UPLOAD_FULL`: LRU が埋まっているときの 1 トークンあたりの上限。
 ///
-/// 1 本 = 約 2.05 MB。8 本で 16.4 MB / トークン = H2D で約 2 ms。
-/// ヒット率が 0.5 を超えれば目標 (65 ms/tok) に届くので、詰め込みすぎない。
-pub const DEFAULT_UPLOAD_PER_TOKEN: usize = 8;
+/// 埋まっている (= 追い出しが起きる) 状態では、ミスの挿入は「その expert がまた
+/// 来るか」の賭けになる。lab t144d の実測では 48 本/token を入れ続けると 1 本
+/// 0.27 ms の H2D が 7 ms/token になり、GPU の節約 (約 25 ms) を一部食っていた。
+pub const EXPERT_IQ_UPLOAD_FULL_ENV: &str = "DENNO_EXPERT_IQ_UPLOAD_FULL";
+
+/// [`EXPERT_IQ_UPLOAD_FULL_ENV`] の既定値。
+pub const DEFAULT_UPLOAD_WHEN_FULL: usize = 16;
+
+/// `DENNO_EXPERT_IQ_MIN_HITS`: 1 層を GPU で回すのに要るヒット本数 (既定 4)。
+///
+/// 1 層 1 同期の実測が 74 us、1 expert あたりの CPU 計算が約 81 us・GPU が約 7 us
+/// なので、4 本未満では同期の方が高い。0 で常に GPU。
+pub const EXPERT_IQ_MIN_HITS_ENV: &str = "DENNO_EXPERT_IQ_MIN_HITS";
+
+/// [`EXPERT_IQ_MIN_HITS_ENV`] の既定値。
+pub const DEFAULT_MIN_HITS_PER_LAYER: usize = 4;
+
+/// 1 層を GPU で回すのに要るヒット本数 (プロセスで 1 回だけ env を読む)。
+pub fn min_hits_per_layer() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var(EXPERT_IQ_MIN_HITS_ENV).ok() {
+        Some(s) if !s.trim().is_empty() => s.trim().parse().unwrap_or(DEFAULT_MIN_HITS_PER_LAYER),
+        _ => DEFAULT_MIN_HITS_PER_LAYER,
+    })
+}
+
+/// [`EXPERT_IQ_UPLOAD_ENV`] の既定値 (1 トークンあたり、LRU に空きがあるとき)。
+///
+/// 1 本 = 約 2.05 MB、H2D は実測 0.27 ms (pageable)。空きがある間は詰め込む
+/// (lab t144d: 8 本/token では 1 ラウンド (約 530 decode トークン) でヒット率が
+/// 0.5 までしか上がらず decode 83 ms、48 本/token なら 0.88 まで上がって 68 ms)。
+pub const DEFAULT_UPLOAD_PER_TOKEN: usize = 48;
 
 /// カーネルのスロット数 (型の数)。
 pub const SLOTS: usize = 6;
@@ -70,6 +99,19 @@ pub fn upload_from_value(v: Option<&str>) -> usize {
 pub fn upload_per_token() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| upload_from_value(std::env::var(EXPERT_IQ_UPLOAD_ENV).ok().as_deref()))
+}
+
+/// LRU が埋まっているときの上限 (プロセスで 1 回だけ env を読む)。
+pub fn upload_when_full() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        match std::env::var(EXPERT_IQ_UPLOAD_FULL_ENV).ok() {
+            Some(s) if !s.trim().is_empty() => {
+                s.trim().parse().unwrap_or(DEFAULT_UPLOAD_WHEN_FULL)
+            }
+            _ => DEFAULT_UPLOAD_WHEN_FULL,
+        }
+    })
 }
 
 /// 型 → カーネルのスロット。未対応は `None` (呼び出し側は CPU へ = fail closed)。

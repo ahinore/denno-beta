@@ -7348,6 +7348,13 @@ fn moe_experts_iq_gpu_batched(
         return Ok(None);
     }
     let hits = devs.len() as u32;
+    // task 144: 1 層 1 同期は実測 74 us (ledger t144d)。ヒットが数本しか無い層を
+    // GPU で回すと、節約 (1 本 0.07 ms) より同期の方が高くつく。閾値未満は
+    // **全 expert を CPU 並列**へ回す (呼び出し側は `None` を見て CPU を回す)。
+    let min_hits = crate::model::exp_iq::min_hits_per_layer();
+    if (hits as usize) < min_hits {
+        return Ok(Some((vec![None; sel.len()], 0)));
+    }
     crate::model::exp_iq::note_gpu_layer(hits);
 
     // 2. gate/up (2 起動) -> silu -> down (1 起動) -> 同期 1 回 (cuda 側)。
@@ -7428,7 +7435,14 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
     if DEAD.load(Ordering::Relaxed) {
         return;
     }
-    let budget = crate::model::exp_iq::upload_per_token();
+    // LRU に空きがあるうちは詰め込み、埋まったら控えめにする (lab t144d:
+    // 埋まってからも 48 本/token 入れると H2D が 7 ms/token かかり、節約を食う)。
+    let budget = match expert_vram::cache_usage() {
+        Some((used, cap)) if cap > 0 && used.saturating_add(32 << 20) >= cap => {
+            crate::model::exp_iq::upload_when_full()
+        }
+        _ => crate::model::exp_iq::upload_per_token(),
+    };
     let nl = n_layer.max(1);
     if lw.il == 0 {
         // 予算 `budget` 本/token を層に均す: 1 トークンに budget 層ぶんを担当し、
