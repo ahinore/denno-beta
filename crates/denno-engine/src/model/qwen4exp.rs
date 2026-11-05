@@ -3330,16 +3330,21 @@ fn mix_chain_enabled() -> bool {
 }
 
 /// task 150: `DENNO_DECODE_CHAIN2` の値を解釈する (純関数・テスト用)。
-/// **既定 off** (採用が決まったら既定 on へ反転する)。`1` / `on` / `true` / `yes`
-/// だけが真で、それ以外の値は偽。
+/// **既定 on** (`DENNO_MIX_CHAIN` と同じ規則。明示的な偽値 `0` / `off` / `false` /
+/// `no` だけ切る)。lab t150b で目標を満たしたため t150 の最終コミットで既定を
+/// off から on へ反転した (採用条件は REPORT_P150.md)。
 fn decode_chain2_from_value(v: Option<&str>) -> bool {
-    match v.map(|s| s.trim().to_ascii_lowercase()) {
-        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
-        None => false,
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
     }
 }
 
-/// task 150: decode の GPU 往復を減らす束ねゲート (`DENNO_DECODE_CHAIN2`、既定 off)。
+/// task 150: decode の GPU 往復を減らす束ねゲート (`DENNO_DECODE_CHAIN2`、
+/// lab t150b で採用・**既定 on**)。
 ///
 /// 中の変更は部分ゲートで個別に切れる:
 /// - [`decode_chain2_exp_enabled`]: 選択 expert の IQ 層一括 GEMV を CPU ミスと重ねる。
@@ -14630,23 +14635,24 @@ mod tests {
             }
         }
 
-        /// task 150: `DENNO_DECODE_CHAIN2` は既定 off (採用が決まったら反転する)、
-        /// 部分ゲート `DENNO_DECODE_CHAIN2_EXP` は既定 on。部分ゲートは束ねゲートが
-        /// on のときだけ効く (純関数で固定する)。
+        /// task 150: `DENNO_DECODE_CHAIN2` は lab t150b で採用して既定 on、
+        /// 部分ゲート `DENNO_DECODE_CHAIN2_EXP` / `_MIX` も既定 on。部分ゲートは
+        /// 束ねゲートが on のときだけ効く (純関数で固定する)。
         #[test]
         fn decode_chain2_gates_truth_table() {
-            assert!(!decode_chain2_from_value(None), "未設定は off のはず");
-            for v in [Some("1"), Some("on"), Some("ON"), Some(" true "), Some("yes")] {
+            // lab t150b で採用 → 既定 on (明示的な偽値だけ切る)。
+            assert!(decode_chain2_from_value(None), "未設定は on のはず");
+            for v in [
+                Some("1"),
+                Some("on"),
+                Some("ON"),
+                Some(" true "),
+                Some("yes"),
+                Some(""),
+            ] {
                 assert!(decode_chain2_from_value(v), "value={v:?} は on のはず");
             }
-            for v in [
-                Some("0"),
-                Some("off"),
-                Some("false"),
-                Some("no"),
-                Some(""),
-                Some("2"),
-            ] {
+            for v in [Some("0"), Some("off"), Some("OFF"), Some("false"), Some("no")] {
                 assert!(!decode_chain2_from_value(v), "value={v:?} は off のはず");
             }
             assert!(decode_chain2_exp_from_value(None), "未設定は on のはず");
