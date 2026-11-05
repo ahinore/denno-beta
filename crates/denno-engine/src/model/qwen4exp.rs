@@ -5725,7 +5725,14 @@ fn expert_route() -> Route {
             std::env::var(expert_vram::EXPERT_VRAM_MB_ENV).ok().as_deref(),
         );
         let gpu = std::env::var(expert_vram::EXPERT_GPU_ENV).ok();
-        let route = expert_vram::resolve_route(gpu.as_deref(), mb, expert_vram::gpu_available());
+        // task 144: IQ 系の型 (本番の expert) を GPU で回すゲート。既定 off。
+        let iq = crate::model::exp_iq::iq_gpu_enabled();
+        let route = expert_vram::resolve_route(
+            gpu.as_deref(),
+            mb,
+            expert_vram::gpu_available(),
+            iq,
+        );
         match route {
             Route::Vram => {
                 #[cfg(feature = "cuda")]
@@ -5734,18 +5741,23 @@ fn expert_route() -> Route {
                     let min_hit = expert_min_hit();
                     eprintln!(
                         "[flash] expert GPU: ON (VRAM {} MiB, 既定の CPU 経路は使わない / \
-                         ヒット率 < {} のトークンは CPU: DENNO_EXPERT_GPU_MIN_HIT)",
-                        mb, min_hit
+                         ヒット率 < {} のトークンは CPU: DENNO_EXPERT_GPU_MIN_HIT / \
+                         IQ ゲート {} / 上げ直し {}/tok)",
+                        mb,
+                        min_hit,
+                        if iq { "on" } else { "off" },
+                        crate::model::exp_iq::upload_per_token()
                     );
                 }
             }
             Route::Cpu => {
                 // 「GPU を要求したのに CPU で回っている」を取りこぼさないように 1 行出す
                 // (未設定なら何も出さない = 従来のログと同一)。
-                if expert_vram::flag_on(gpu.as_deref()) {
+                if expert_vram::flag_on(gpu.as_deref()) || iq {
                     eprintln!(
-                        "[flash] expert GPU: OFF (DENNO_EXPERT_GPU={:?} / VRAM {} MiB / cuda={}) → CPU 経路",
+                        "[flash] expert GPU: OFF (DENNO_EXPERT_GPU={:?} / DENNO_EXPERT_IQ_GPU={} / VRAM {} MiB / cuda={}) → CPU 経路",
                         gpu.as_deref().unwrap_or(""),
+                        iq,
                         mb,
                         expert_vram::gpu_available()
                     );
@@ -6914,12 +6926,83 @@ fn moe_ffn_quant_impl(
         // per-expert のループを回さない。足し込みは下の per-expert 経路と同一の
         // 「index 昇順の逐次」なので、丸めの順序は変わらない。
         // P45: ゲートが CPU と決めたトークンは層一括経路も呼ばない (`use_gpu` が false)。
-        let batched = if use_gpu {
+        // task 144: IQ 型の層一括経路 (ヒットだけ GPU / ミスは CPU)。ゲートが on で
+        // 3 行列とも IQ カーネルが読める型のときだけこの経路にする。
+        // **旧い層一括経路は呼ばない**: そちらは `acquire` でミスを同期 H2D するので、
+        // 呼ぶと毎層 20 MB を上げてから型不一致で CPU に落ちる (二重の無駄)。
+        #[cfg(feature = "cuda")]
+        let iq_mode = crate::model::exp_iq::iq_gpu_enabled() && iq_expert_mode(lw);
+        #[cfg(not(feature = "cuda"))]
+        let iq_mode = false;
+
+        #[cfg(feature = "cuda")]
+        let iq_batched = if use_gpu && iq_mode {
+            moe_experts_iq_gpu_batched(lw, &sel, x, e, ff)?
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let iq_batched: Option<(Vec<Option<Vec<f32>>>, u32)> = None;
+
+        let batched = if use_gpu && !iq_mode {
             moe_experts_gpu_batched(lw, &sel, x, e, ff)?
         } else {
             None
         };
-        if let Some((hs, hits)) = batched {
+        if let Some((hs, hits)) = iq_batched {
+            // GPU で回せた expert はその寄与、回せなかった expert は CPU で 3 行列。
+            // 足し込みは今までと同じ **expert index 昇順の逐次** (同じ位置で同じ重み)。
+            //
+            // `vram_mode` では `parallel` が false になる (P39 の設計) ので、ミスを
+            // そのまま逐次で計算すると base の並列経路より遅い。ミスだけを取り出して
+            // **base と同じ expert 並列** (`expert_contribs_par`) で計算する。
+            gpu_hits = hits;
+            let miss_pos: Vec<usize> = (0..sel.len()).filter(|&t| hs[t].is_none()).collect();
+            #[cfg(feature = "par")]
+            let miss_h: Vec<Vec<f32>> = if miss_pos.is_empty() {
+                Vec::new()
+            } else {
+                let ids: Vec<usize> = miss_pos.iter().map(|&t| sel[t]).collect();
+                expert_contribs_par(lw, &ids, x, e, ff, None)?
+            };
+            #[cfg(not(feature = "par"))]
+            let miss_h: Vec<Vec<f32>> = {
+                let mut v = Vec::with_capacity(miss_pos.len());
+                let mut act = vec![0.0f32; ff];
+                let mut up = vec![0.0f32; ff];
+                let mut h = vec![0.0f32; e];
+                for &t in &miss_pos {
+                    let ei = sel[t];
+                    lw.gate_exps.gemv(ei, x, &mut act)?;
+                    silu_inplace(&mut act);
+                    lw.up_exps.gemv(ei, x, &mut up)?;
+                    for r in 0..ff {
+                        act[r] *= up[r];
+                    }
+                    lw.down_exps.gemv(ei, &act, &mut h)?;
+                    v.push(h.clone());
+                }
+                v
+            };
+            let mut mi = 0usize;
+            for (t, &_ei) in sel.iter().enumerate() {
+                let pe = weights[t];
+                let v: &[f32] = match hs[t].as_deref() {
+                    Some(v) => {
+                        debug_assert_eq!(v.len(), e, "GPU の寄与長が e と違う");
+                        v
+                    }
+                    None => {
+                        let v = &miss_h[mi];
+                        mi += 1;
+                        v
+                    }
+                };
+                for j in 0..e {
+                    out[j] += pe * v[j];
+                }
+            }
+        } else if let Some((hs, hits)) = batched {
             // P45: 層一括経路も「何本が載っていたか」を返す (ゲートの 1 サンプル)。
             gpu_hits = hits;
             debug_assert_eq!(hs.len(), sel.len(), "寄与の本数が選択 expert と違う");
@@ -6991,6 +7074,13 @@ fn moe_ffn_quant_impl(
         // P45: 1 トークンぶんの実測をゲートへ積む (CPU のトークンはサンプルにしない)。
         if use_gpu {
             expert_gate_record(gpu_hits, sel.len() as u32);
+        }
+        // task 144: ミスした expert を上限つきで VRAM へ戻す (次のトークンのため)。
+        // GPU に倒したトークンだけでなく CPU のトークンでも積む (載せないと
+        // ヒット率が永久に 0 のままになる)。
+        #[cfg(feature = "cuda")]
+        if vram_mode && iq_mode {
+            iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
         }
     }
 
@@ -7094,6 +7184,22 @@ fn moe_expert_gpu(
     h: &mut [f32],
 ) -> Result<Option<bool>> {
     use crate::model::expert_vram::ExpertShape;
+
+    // task 144: IQ 系の型は層一括経路 (`kernels_exp_iq`) だけが読める。per-expert の
+    // 旧経路 (`kernels_moe.ptx`) は 4 型 (Q8_0/Q5_1/Q4_K/Q5_K) しか読めないので、
+    // VRAM に載っていても `dev.gemv` が false を返してエラーになる。CPU へ落とす
+    // (呼び出し側は `gpu.is_none()` を見て CPU 経路を回す)。
+    if crate::model::exp_iq::iq_gpu_enabled()
+        && [
+            lw.gate_exps.ty,
+            lw.up_exps.ty,
+            lw.down_exps.ty,
+        ]
+        .iter()
+        .any(|t| crate::model::exp_iq::supported(*t))
+    {
+        return Ok(None);
+    }
 
     let shapes = [
         ExpertShape {
@@ -7298,6 +7404,269 @@ fn moe_experts_gpu_batched(
         }
     }
     Ok(Some((hs, hits)))
+}
+
+/// task 144: この層の 3 行列が全部 IQ カーネルで読める型か (かつゲートが on)。
+///
+/// 型はテンソル単位で決まるので層ごとに同じ値になるが、層ごとに呼んで安い。
+#[cfg(feature = "cuda")]
+fn iq_expert_mode(lw: &LayerW) -> bool {
+    crate::model::exp_iq::iq_gpu_enabled()
+        && [
+            lw.gate_exps.ty,
+            lw.up_exps.ty,
+            lw.down_exps.ty,
+        ]
+        .iter()
+        .all(|t| crate::model::exp_iq::supported(*t))
+}
+
+/// task 144: IQ 系の型を **ヒットだけ GPU / ミスは CPU** で回す層一括経路。
+///
+/// # 何が違うか
+///
+/// P43 の [`moe_experts_gpu_batched`] は「全 expert が VRAM に載らなければ `None`」
+/// だった (ミスは同期 H2D で積んでいた)。本番の VRAM 予算 (14〜22 GB) では 1 本が
+/// 約 2.05 MB でも全 24,576 本 (48 層 x 512) は入らないので、**ミスを GPU の待ちに
+/// しない**方が速い。ここでは
+///
+/// - 載っている expert だけを segment 表に載せ、`kernels_exp_iq` で 1 層 4 起動 +
+///   1 同期で回す (gate/up/silu/down)。
+/// - 載っていない expert は `None` を返し、呼び出し側が CPU で計算する
+///   (合計の順序は今と同じ expert index 昇順の逐次)。
+/// - ミスの H2D は [`iq_warm_misses`] がトークンあたりの上限つきで行う。
+///
+/// 戻り値: `Some((hs, hits))` の `hs[t]` は `sel[t]` の寄与 (GPU で回したものだけ
+/// `Some`)。GPU のカーネルが無い / 型が未対応 / 1 本も載っていないなら `None`
+/// (呼び出し側は per-expert = CPU 経路へ)。
+#[cfg(feature = "cuda")]
+fn moe_experts_iq_gpu_batched(
+    lw: &LayerW,
+    sel: &[usize],
+    x: &[f32],
+    e: usize,
+    ff: usize,
+) -> Result<Option<(Vec<Option<Vec<f32>>>, u32)>> {
+    use crate::model::expert_vram::ExpertShape;
+
+    if sel.is_empty() {
+        return Ok(None);
+    }
+    let shapes = [
+        ExpertShape {
+            ty: lw.gate_exps.ty,
+            k: x.len(),
+            n: ff,
+        },
+        ExpertShape {
+            ty: lw.up_exps.ty,
+            k: x.len(),
+            n: ff,
+        },
+        ExpertShape {
+            ty: lw.down_exps.ty,
+            k: ff,
+            n: e,
+        },
+    ];
+    // 1. 載っている expert だけ集める (H2D しない)。
+    let mut devs = Vec::with_capacity(sel.len());
+    let mut ids: Vec<u16> = Vec::with_capacity(sel.len());
+    let mut pos: Vec<usize> = Vec::with_capacity(sel.len());
+    for (t, &ei) in sel.iter().enumerate() {
+        let key = ExpertKey {
+            layer: lw.il as u16,
+            expert: ei as u16,
+        };
+        let got = expert_vram::lookup(key, shapes)
+            .map_err(|err| one(format!("層 {}: expert {ei}: VRAM 参照: {err:#}", lw.il)))?;
+        if let Some(dev) = got {
+            devs.push(dev);
+            ids.push(ei as u16);
+            pos.push(t);
+        }
+    }
+    if devs.is_empty() {
+        return Ok(None);
+    }
+    let hits = devs.len() as u32;
+    // task 144: 1 層 1 同期は実測 74 us (ledger t144d)。ヒットが数本しか無い層を
+    // GPU で回すと、節約 (1 本 0.07 ms) より同期の方が高くつく。閾値未満は
+    // **全 expert を CPU 並列**へ回す (呼び出し側は `None` を見て CPU を回す)。
+    let min_hits = crate::model::exp_iq::min_hits_per_layer();
+    if (hits as usize) < min_hits {
+        return Ok(Some((vec![None; sel.len()], 0)));
+    }
+    crate::model::exp_iq::note_gpu_layer(hits);
+
+    // 2. gate/up (2 起動) -> silu -> down (1 起動) -> 同期 1 回 (cuda 側)。
+    let ptr_table = |m: ExpertMatrix| -> Vec<u64> { devs.iter().map(|d| d.ptr(m)).collect() };
+    let (pg, pu, pd) = (
+        ptr_table(ExpertMatrix::Gate),
+        ptr_table(ExpertMatrix::Up),
+        ptr_table(ExpertMatrix::Down),
+    );
+    let seg_gu = crate::model::expert_batch::seg_table_shared_x(&ids, ff);
+    let seg_d = crate::model::expert_batch::seg_table_per_act(&ids, ff, e);
+    let mut h = vec![0.0f32; devs.len() * e];
+    let ran = {
+        // task 138 の台帳に「1 層あたりの GPU 時間」を積む (DENNO_Q4_PROFILE=1 のときだけ)。
+        let _l = crate::model::q4ledger::enter(crate::model::q4ledger::EXPERT);
+        crate::cuda::moe_experts_iq_layer(
+            lw.gate_exps.ty,
+            lw.up_exps.ty,
+            lw.down_exps.ty,
+            &pg,
+            &pu,
+            &pd,
+            &seg_gu,
+            &seg_d,
+            x,
+            x.len(),
+            ff,
+            e,
+            &mut h,
+        )
+        .map_err(|err| one(format!("層 {}: IQ 層一括 GEMV: {err:#}", lw.il)))?
+    };
+    if !ran {
+        return Ok(None);
+    }
+
+    let mut hs: Vec<Option<Vec<f32>>> = vec![None; sel.len()];
+    for (i, &t) in pos.iter().enumerate() {
+        hs[t] = Some(h[i * e..(i + 1) * e].to_vec());
+    }
+
+    // 3. DENNO_EXPERT_GPU_CHECK=1: CPU の 3 行列と突き合わせる (層ごとに 1 行)。
+    if expert_vram::check_enabled() {
+        let mut act_c = vec![0.0f32; ff];
+        let mut up_c = vec![0.0f32; ff];
+        let mut h_c = vec![0.0f32; e];
+        for (i, &t) in pos.iter().enumerate() {
+            let ei = sel[t];
+            lw.gate_exps.gemv(ei, x, &mut act_c)?;
+            silu_inplace(&mut act_c);
+            lw.up_exps.gemv(ei, x, &mut up_c)?;
+            for r in 0..ff {
+                act_c[r] *= up_c[r];
+            }
+            lw.down_exps.gemv(ei, &act_c, &mut h_c)?;
+            expert_vram::note_check(&h[i * e..(i + 1) * e], &h_c);
+        }
+    }
+    Ok(Some((hs, hits)))
+}
+
+/// task 144: ミスした expert を **トークンあたりの上限つき**で VRAM へ上げ直す。
+///
+/// ミスは CPU で計算済みなので、ここでやるのは次のトークンのための H2D だけ。
+/// 上限 (`DENNO_EXPERT_IQ_UPLOAD`、既定 8 本 = 約 16 MB) を超えたら何もしない。
+/// 予算は層 0 (トークン先頭) で戻す。載っている expert は予算を食わない。
+///
+/// 失敗 (確保失敗・型未対応) は静かに諦める (リクエストは落とさない)。
+#[cfg(feature = "cuda")]
+fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize, n_layer: usize) {
+    use crate::model::expert_vram::ExpertShape;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    static LEFT: AtomicUsize = AtomicUsize::new(0);
+    static DEAD: AtomicBool = AtomicBool::new(false);
+    /// このトークンで上げ直す担当層の開始位置 (層に均すための回転)。
+    static OFFSET: AtomicUsize = AtomicUsize::new(0);
+    if DEAD.load(Ordering::Relaxed) {
+        return;
+    }
+    // LRU に空きがあるうちは詰め込み、埋まったら控えめにする (lab t144d:
+    // 埋まってからも 48 本/token 入れると H2D が 7 ms/token かかり、節約を食う)。
+    let budget = match expert_vram::cache_usage() {
+        Some((used, cap)) if cap > 0 && used.saturating_add(32 << 20) >= cap => {
+            crate::model::exp_iq::upload_when_full()
+        }
+        _ => crate::model::exp_iq::upload_per_token(),
+    };
+    let nl = n_layer.max(1);
+    if lw.il == 0 {
+        // 予算 `budget` 本/token を層に均す: 1 トークンに budget 層ぶんを担当し、
+        // 次のトークンはその続きから (前は層 0 に全部積んで層 1 以降が永久に
+        // 当たらなかった)。budget >= n_layer なら全層が毎トークン担当。
+        OFFSET.store(
+            (OFFSET.load(Ordering::Relaxed) + budget.max(1)) % nl,
+            Ordering::Relaxed,
+        );
+        LEFT.store(budget, Ordering::Relaxed);
+    }
+    let shapes = [
+        ExpertShape {
+            ty: lw.gate_exps.ty,
+            k: x_len,
+            n: ff,
+        },
+        ExpertShape {
+            ty: lw.up_exps.ty,
+            k: x_len,
+            n: ff,
+        },
+        ExpertShape {
+            ty: lw.down_exps.ty,
+            k: ff,
+            n: e,
+        },
+    ];
+    let key_of = |ei: usize| ExpertKey {
+        layer: lw.il as u16,
+        expert: ei as u16,
+    };
+
+    // 1. 参照とヒットは**全層**で数える (担当外の層も数えないとヒット率が偏る)。
+    let mut hits = 0u32;
+    let mut miss: Vec<usize> = Vec::new();
+    for &ei in sel {
+        match expert_vram::lookup(key_of(ei), shapes) {
+            Ok(Some(_)) => hits += 1,
+            Ok(None) => miss.push(ei),
+            Err(_) => break,
+        }
+    }
+    crate::model::exp_iq::note_lookup(sel.len() as u32, hits);
+
+    // 2. 上げ直しは担当層だけ、予算の範囲で。
+    let off = OFFSET.load(Ordering::Relaxed) % nl;
+    let served = budget >= nl || (lw.il + nl - off) % nl < budget;
+    if !served || budget == 0 {
+        return;
+    }
+    // 1 層あたりの上限: budget >= n_layer のときは均等割 (1 層に集中させない)。
+    let quota = if budget >= nl { budget / nl } else { 1 };
+    let mut left = LEFT.load(Ordering::Relaxed);
+    let mut can = left.min(quota);
+    for ei in miss {
+        if can == 0 {
+            break;
+        }
+        let t = std::time::Instant::now();
+        let got = expert_vram::acquire(key_of(ei), shapes, || {
+            Ok([
+                lw.gate_exps.slice(ei)?,
+                lw.up_exps.slice(ei)?,
+                lw.down_exps.slice(ei)?,
+            ])
+        });
+        crate::model::exp_iq::note_upload_ns(t.elapsed().as_nanos() as u64);
+        match got {
+            Ok(Some(_)) => {
+                left -= 1;
+                can -= 1;
+                LEFT.store(left, Ordering::Relaxed);
+                crate::model::exp_iq::note_upload();
+            }
+            // 確保失敗・型未対応は以後やらない (リクエストは落とさない)。
+            _ => {
+                DEAD.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
 }
 
 /// `cuda` feature 無しでは層一括経路は無い (常に `None` = per-expert 経路)。
@@ -16494,8 +16863,8 @@ mod tests {
             assert!(lines.len() >= 4, "{lines:?}");
             assert!(lines[0].starts_with("[q4ledger-pf] tok=6"), "{}", lines[0]);
             assert!(
-                lines.iter().any(|l| l.contains(" experts ")),
-                "experts の行が無い: {lines:?}"
+                lines.iter().any(|l| l.contains(" exp_pf ")),
+                "exp_pf の行が無い: {lines:?}"
             );
             // 名前付き区間の和は全体を超えない (二重計上しない) かつ other が残差。
             let total = q4ledger::prefill_wall_ns();

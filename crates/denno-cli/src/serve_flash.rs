@@ -467,6 +467,12 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
         }
     }
     denno_engine::model::q4ledger::reset();
+    // task 144: IQ expert のヒット率 / GPU で回した層と本数 / 上げ直し / VRAM
+    // (`DENNO_EXPERT_IQ_GPU=1` のときだけ 1 行)。リクエスト単位で読む。
+    if let Some(line) = denno_engine::model::exp_iq::stats_line() {
+        eprintln!("{line}");
+    }
+    denno_engine::model::exp_iq::stats_reset();
     if !q4prof::enabled() {
         return;
     }
