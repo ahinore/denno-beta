@@ -1494,6 +1494,7 @@ pub fn forward_batch_core_gate(
 
     // ---- (a) conv1d + silu (全トークン一括) --------------------------------
     // 作業域は grow-only (前のチャンクの残りが入っている) ので、長さを明示する。
+    let _sub_conv = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_CONV);
     let mut cv = conv_scratch(nt * cd);
     conv_silu_all(p, cw, qkv, &conv_st, &mut cv[..nt * cd], nt);
 
@@ -1504,16 +1505,20 @@ pub fn forward_batch_core_gate(
             st.conv[c * cs + i] = conv_in_at(qkv, &conv_st, cd, cs, tau, c);
         }
     }
+    drop(_sub_conv);
 
     // ---- (b) beta / alpha の変換 -----------------------------------------
+    let _sub_gate = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_GATE);
     let mut egt = vec![0.0f32; nt * nv];
     let mut bt = vec![0.0f32; nt * nv];
     gate_table(p, cw, beta_raw, alpha, nt, &mut egt, &mut bt);
+    drop(_sub_gate);
 
     // ---- (c)(d) スキャン + gated RMS norm ---------------------------------
     let mut yh = yh_scratch(nt * vd);
     let mut y = vec![0.0f32; nt * vd];
     let group = batch_head_group(nv);
+    let _sub_scan = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_SCAN);
     scan_gate_all(
         p,
         cw,

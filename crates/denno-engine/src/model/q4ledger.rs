@@ -444,6 +444,88 @@ pub fn sync_floor_ns() -> Option<u64> {
     }
 }
 
+/// prefill の「cpu」列 (wall - launch - sync - copy) の中身を名前で割るための
+/// 副区間 (task 154)。区間は**親** (`MIX` / `SSM` / `FULL` / `OTHER` / ...) ごとに
+/// 積むので、「mix の 18.7 s のうち norm がいくつで gating がいくつか」が読める。
+///
+/// 親は [`sub`] を開いた時点の [`CUR`] で決まる。ネストは許すが、親子の関係は
+/// 持たない (合計は親の wall を超えうる)。[`line_prefill`] は親ごとに 1 行で出す。
+pub const SUB_NORM: usize = 0;
+/// 残差の合成 (`hc_combine`) と mix の要素演算 (`hc_lo_apply` / `hc_mixed` / inject)。
+pub const SUB_ELEM: usize = 1;
+/// ホスト側の行列積 (GPU に載らなかったバッチ GEMV・F32/F16/BF16 の経路)。
+pub const SUB_GEMM_CPU: usize = 2;
+/// 重みの f32 展開 (上の gemm_cpu の内側にも入る)。
+pub const SUB_DEQUANT: usize = 3;
+/// GDN の depthwise conv1d + silu (状態の末尾コピーを含む)。
+pub const SUB_CONV: usize = 4;
+/// GDN のデルタ則スキャン + q/k の L2 正規化 + 出力の gated RMS norm。
+pub const SUB_SCAN: usize = 5;
+/// GDN の beta / alpha 変換 (`gate_table`)。
+pub const SUB_GATE: usize = 6;
+/// PLE の注入 (gather した行の射影・RMS・conv・silu)。
+pub const SUB_PLE: usize = 7;
+/// 埋め込み行のデコード。
+pub const SUB_EMBED: usize = 8;
+/// レイアウト変換 (行の flatten / transpose / 連結コピー)。
+pub const SUB_LAYOUT: usize = 9;
+/// ルータの softmax / top-k (ホスト)。
+pub const SUB_SOFTMAX: usize = 10;
+/// 副区間の数。
+pub const SUB_N: usize = 11;
+/// 副区間の名前 ([`SUB_NORM`] の順)。
+pub const SUB_NAMES: [&str; SUB_N] = [
+    "norm",
+    "elem",
+    "gemm_cpu",
+    "dequant",
+    "conv",
+    "scan",
+    "gate",
+    "ple",
+    "embed",
+    "layout",
+    "softmax",
+];
+
+/// 親 × 副区間の壁時計 (ns)。
+static SUBS: [[AtomicU64; SUB_N]; N] = [const { [const { AtomicU64::new(0) }; SUB_N] }; N];
+
+/// 副区間を開く。`drop` で親の行に壁時計を積む (off では何もしない)。
+pub fn sub(item: usize) -> SubScope {
+    if !enabled() || item >= SUB_N {
+        return SubScope {
+            parent: 0,
+            item: 0,
+            t: None,
+        };
+    }
+    SubScope {
+        parent: cur(),
+        item,
+        t: Some(Instant::now()),
+    }
+}
+
+/// [`sub`] が返すガード。
+pub struct SubScope {
+    parent: usize,
+    item: usize,
+    t: Option<Instant>,
+}
+
+impl Drop for SubScope {
+    fn drop(&mut self) {
+        let Some(t) = self.t else { return };
+        SUBS[self.parent][self.item].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// 親 `parent` の副区間 `item` の積算 (ns)。テストと [`line_prefill`] 用。
+pub fn sub_ns(parent: usize, item: usize) -> u64 {
+    SUBS[parent.min(N - 1)][item.min(SUB_N - 1)].load(Ordering::Relaxed)
+}
+
 /// 台帳を 1 つの文字列群にする (`tok` = その窓の decode トークン数、
 /// `wall_ns` = decode ループ全体の壁時計 = リクエストのループ入口から
 /// 最後のトークンを出し終えるまで)。
@@ -648,6 +730,33 @@ pub fn line_prefill(tok: usize) -> Vec<String> {
     }
     // 残差 (層の外 = embed / PLE / 最終 mixer / head / 未計測)。
     push_row(NAMES[OTHER], other_ns, Some(&rows[OTHER]));
+    // task 154: 親ごとの副区間 (cpu = wall - launch - sync - copy の中身)。
+    // 0 でないものだけ出し、`*` は「他の副区間の内側にも入る」もの (dequant は
+    // gemm_cpu の内側、grms は scan の内側)。合計は親の wall を超えうる。
+    let nested = [SUB_DEQUANT];
+    for &p in &[MIX, ROUTER, SHARED, FULL, SSM, EXPERTS, OTHER] {
+        let mut parts: Vec<String> = Vec::new();
+        let mut sum = 0u64;
+        for i in 0..SUB_N {
+            let ns = SUBS[p][i].load(Ordering::Relaxed);
+            if ns == 0 {
+                continue;
+            }
+            sum += ns;
+            let mark = if nested.contains(&i) { "*" } else { "" };
+            parts.push(format!("{}{}={:.1}", SUB_NAMES[i], mark, ms(ns)));
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        out.push(format!(
+            "[q4ledger-pf]   sub {:<7} sum={:>8.1} of {:>8.1}ms  {}",
+            NAMES[p],
+            ms(sum),
+            ms(rows[p].wall_ns),
+            parts.join(" ")
+        ));
+    }
     out
 }
 
@@ -674,6 +783,11 @@ pub fn reset() {
     PREFILL_WALL_NS.store(0, Ordering::Relaxed);
     #[cfg(feature = "cuda")]
     crate::cuda::tline::reset();
+    for row in SUBS.iter() {
+        for c in row.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -782,6 +896,55 @@ mod tests {
         assert!(sync_floor_ns().is_some());
         reset();
         assert_eq!(sync_floor_ns(), None);
+        set_for_test(false);
+    }
+
+    /// task 154: 副区間は親ごとに積まれ、`line_prefill` が親ごとに 1 行出す。
+    /// off では 1 ns も積まない (既定 off の契約)。
+    #[test]
+    fn sub_buckets_are_per_parent_and_printed() {
+        let _g = lock();
+        set_for_test(true);
+        reset();
+        {
+            let _m = enter(MIX);
+            {
+                let _s = sub(SUB_NORM);
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            {
+                let _s = sub(SUB_ELEM);
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+        {
+            let _o = enter(OTHER);
+            let _s = sub(SUB_ELEM);
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        assert!(sub_ns(MIX, SUB_NORM) > 0, "mix/norm が積まれていない");
+        assert!(sub_ns(MIX, SUB_ELEM) > 0, "mix/elem が積まれていない");
+        assert!(sub_ns(OTHER, SUB_ELEM) > 0, "other/elem が積まれていない");
+        assert_eq!(sub_ns(OTHER, SUB_NORM), 0, "親が混ざっている");
+        let lines = line_prefill(512);
+        assert!(
+            lines.iter().any(|l| l.contains("sub mix") && l.contains("norm=")),
+            "mix の副区間の行が無い: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("sub other") && l.contains("elem=")),
+            "other の副区間の行が無い"
+        );
+        reset();
+        assert_eq!(sub_ns(MIX, SUB_NORM), 0, "reset で消えない");
+        // off では積まない。
+        set_for_test(false);
+        {
+            let _m = enter(MIX);
+            let _s = sub(SUB_NORM);
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+        assert_eq!(sub_ns(MIX, SUB_NORM), 0, "off なのに積まれた");
         set_for_test(false);
     }
 
