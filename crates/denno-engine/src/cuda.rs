@@ -21726,6 +21726,86 @@ pub fn gdn_scan_batch(
     li: usize,
     kv: u64,
 ) -> Option<Vec<f32>> {
+    gdn_scan_batch_inner(
+        qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv, d_conv,
+        eps, q_scale, li, kv, false,
+    )
+}
+
+/// task 154: qwen4exp (出力ゲートが **sigmoid**) の prefill 用スキャン。
+///
+/// [`gdn_scan_batch`] との違いは 1 点だけ: 単発カーネルを sigmoid 版
+/// (`dno_gdn_scan_sig`、task 137 で decode 用に追加済み) にする。
+/// **chunked 経路 (silu 固定) は受けない**: n >= [`GDN_CHUNK_MIN_TOKENS`] では
+/// `None` を返して呼び出し側が CPU へ落ちる (prefill のチャンクは既定 512 なので
+/// 通常は単発経路に入る)。
+///
+/// 数値: 同じ CPU 参照 (`gdn::forward_batch_core_gate`) を GPU で回すだけで、
+/// 加算順はカーネル側の固定順 (t 昇順・i 昇順) なので決定論。CPU とは
+/// conv/L2/デルタ則の丸めが揃わず 1 ulp 単位でずれうる (decode で既に既定 on)。
+///
+/// 前提: `dk == dv && dk <= 256 && d_conv == 4` (`dno_gdn_scan_sig` のレジスタ
+/// 配列 `Scol[256]` と、列 thread を q/k/v で共有する実装の制約)。
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_scan_batch_sig(
+    qkv: &[f32],
+    z: &[f32],
+    beta: &[f32],
+    alpha: &[f32],
+    conv_st: &mut [f32],
+    ssm_st: &mut [f32],
+    wconv: &[f32],
+    wa: &[f32],
+    wdt: &[f32],
+    wnorm: &[f32],
+    n: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    eps: f32,
+    q_scale: f32,
+    li: usize,
+    kv: u64,
+) -> Option<Vec<f32>> {
+    // 形状の前提はカーネル側の制約 (受けないときは CPU へ)。
+    if n == 0 || n >= GDN_CHUNK_MIN_TOKENS || nk == 0 || nv == 0 || dk != dv || dk > 256
+        || d_conv != 4
+    {
+        return None;
+    }
+    gdn_scan_batch_inner(
+        qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv, d_conv,
+        eps, q_scale, li, kv, true,
+    )
+}
+
+/// [`gdn_scan_batch`] / [`gdn_scan_batch_sig`] の共通本体 (`sig` でカーネルを選ぶ)。
+#[allow(clippy::too_many_arguments)]
+fn gdn_scan_batch_inner(
+    qkv: &[f32],
+    z: &[f32],
+    beta: &[f32],
+    alpha: &[f32],
+    conv_st: &mut [f32],
+    ssm_st: &mut [f32],
+    wconv: &[f32],
+    wa: &[f32],
+    wdt: &[f32],
+    wnorm: &[f32],
+    n: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    eps: f32,
+    q_scale: f32,
+    li: usize,
+    kv: u64,
+    sig: bool,
+) -> Option<Vec<f32>> {
     if !cuda_enabled() {
         return None;
     }
@@ -21735,9 +21815,19 @@ pub fn gdn_scan_batch(
         GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
+    // task 154: sigmoid 版は単発カーネルだけ (chunked は silu 固定)。
+    let f_scan = if sig {
+        match ctx.f_gdn_scan_sig {
+            Some(f) => f,
+            // 旧 PTX (sig 未収録) では黙って CPU へ。ラッチはしない。
+            None => return None,
+        }
+    } else {
+        ctx.f_gdn
+    };
     // A1-r2: 長 prefill は chunked 3 カーネルへ。chunked は dk==dv / d_conv==4
     // 前提のカーネルのため、非成立時は従来の単発カーネルにフォールバック。
-    let chunked = n >= GDN_CHUNK_MIN_TOKENS && dk == dv && d_conv == 4;
+    let chunked = !sig && n >= GDN_CHUNK_MIN_TOKENS && dk == dv && d_conv == 4;
     let result = if chunked {
         gdn_scan_chunked_impl(
             ctx,
@@ -21762,8 +21852,8 @@ pub fn gdn_scan_batch(
         )
     } else {
         gdn_scan_impl(
-            ctx, qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv,
-            d_conv, eps, q_scale, li, kv,
+            ctx, f_scan, sig, qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk,
+            nv, dk, dv, d_conv, eps, q_scale, li, kv,
         )
     };
     match result {
@@ -21781,6 +21871,8 @@ pub fn gdn_scan_batch(
 #[allow(clippy::too_many_arguments)]
 fn gdn_scan_impl(
     ctx: &CudaCtx,
+    f_scan: CUfunction,
+    force_writeback: bool,
     qkv: &[f32],
     z: &[f32],
     beta: &[f32],
@@ -21886,7 +21978,7 @@ fn gdn_scan_impl(
     ];
     let shmem = ((3 * dk + dv + 5) * 4) as u32;
     unsafe {
-        ctx.launch_async(ctx.f_gdn, (nv as u32, 1, 1), (dk as u32, 1, 1), shmem, &mut args)?;
+        ctx.launch_async(f_scan, (nv as u32, 1, 1), (dk as u32, 1, 1), shmem, &mut args)?;
     }
     q.lap(crate::prof::D2H_GDN_PF_SYNC);
     ctx.sync()?;
@@ -21898,7 +21990,10 @@ fn gdn_scan_impl(
     })?;
     // s131: 状態はホストへ落とさずデバイス正本へ D2D で戻す。
     gdn_state_commit(li, dp.conv_out, dp.ssm_out, conv_dim * cs, nv, dk * dv)?;
-    if !gdn_devstate() {
+    // task 154: prefill の sigmoid 経路は毎回ホストへ書き戻す。prefill のあとに
+    // decode (別ストア) や CPU 経路がホスト state を seed にするので、デバイス正本の
+    // ままだと 1 チャンク前の状態から走り出す。10.7 MB/層チャンクの D2H を払う。
+    if force_writeback || !gdn_devstate() {
         gdn_host_writeback(conv_st, ssm_st)?;
     }
     crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);

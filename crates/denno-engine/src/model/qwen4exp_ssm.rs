@@ -674,6 +674,59 @@ impl SsmLayer {
                 ys.extend_from_slice(&y);
             }
             ys
+        } else if crate::model::qwen4exp::pf_gdn_gpu_on() {
+            // task 154: GDN コアを GPU の sigmoid スキャン (task 137 のカーネル) で回す。
+            // チャンクは 512 トークン (< CHUNK_MIN_TOKENS=2048) なので単発カーネル。
+            // 状態はカーネルが更新し、`gdn_scan_impl` がホストへも書き戻す
+            // (次の decode / CPU 経路がホスト state を seed にするため)。
+            // `kv = 0` は「このプロセスの prefill 用スロット」の意味。層ごとに
+            // 別の鍵にすると GDN_STATE が毎層 invalidate されて state を H2D し直す。
+            #[cfg(feature = "cuda")]
+            let gpu: Option<Vec<f32>> = {
+                let nk = self.p.n_k_heads;
+                let nv = self.p.n_v_heads;
+                let dk = self.p.head_k_dim;
+                let dv = self.p.head_v_dim;
+                let q_scale = 1.0f32 / (dk as f32).sqrt();
+                crate::cuda::gdn_scan_batch_sig(
+                    &qkv,
+                    &z,
+                    &beta_raw,
+                    &alpha,
+                    &mut self.state.conv,
+                    &mut self.state.ssm,
+                    &self.conv1d,
+                    &self.ssm_a,
+                    &self.ssm_dt,
+                    &self.ssm_norm,
+                    nt,
+                    nk,
+                    nv,
+                    dk,
+                    dv,
+                    self.p.d_conv,
+                    self.p.eps,
+                    q_scale,
+                    self.il,
+                    0,
+                )
+            };
+            #[cfg(not(feature = "cuda"))]
+            let gpu: Option<Vec<f32>> = None;
+            match gpu {
+                Some(y) => y,
+                // 前提外 (dk != dv / 旧 PTX / GPU 無効) は従来の CPU へ。
+                None => gdn::forward_batch_core_gate(
+                    &self.p,
+                    &cw,
+                    &qkv,
+                    &z,
+                    &beta_raw,
+                    &alpha,
+                    &mut self.state,
+                    gdn::GateKind::Sigmoid,
+                ),
+            }
         } else {
             gdn::forward_batch_core_gate(
                 &self.p,
@@ -1205,6 +1258,35 @@ mod tests {
             assert_eq!(bits(&seq.state.ssm), bits(&bat.state.ssm), "nt={nt}: ssm 状態");
             assert_eq!(bits(&seq.state.conv), bits(&bat.state.conv), "nt={nt}: conv 状態");
         }
+    }
+
+    /// task 154: `DENNO_PF_GDN_GPU` を強制 on にしても、GPU が無い環境では
+    /// 従来の CPU 経路へ落ちて出力・状態ともビット一致する (ゲートは分岐だけ)。
+    #[test]
+    fn pf_gdn_gate_on_without_cuda_falls_back_bitexact() {
+        let (mut seq, p) = small_layer();
+        let (mut bat, _) = small_layer();
+        let curs = inputs(&p, 7);
+        let want: Vec<Vec<f32>> = curs
+            .iter()
+            .map(|c| seq.forward_token(c).expect("forward_token"))
+            .collect();
+        crate::model::qwen4exp::set_pf_sub_for_test(crate::model::qwen4exp::PF_SUB_GDN, Some(true));
+        assert!(
+            crate::model::qwen4exp::pf_gdn_gpu_on(),
+            "副ゲートの上書きが効いていない"
+        );
+        let got = bat.forward_batch(&curs).expect("forward_batch");
+        crate::model::qwen4exp::set_pf_sub_for_test(crate::model::qwen4exp::PF_SUB_GDN, None);
+        for t in 0..7 {
+            assert_eq!(
+                bits(&got[t]),
+                bits(&want[t]),
+                "トークン {t} がビット不一致 (GPU フォールバック)"
+            );
+        }
+        assert_eq!(bits(&seq.state.ssm), bits(&bat.state.ssm), "ssm 状態");
+        assert_eq!(bits(&seq.state.conv), bits(&bat.state.conv), "conv 状態");
     }
 
     /// チャンクの切り方を変えても同じ (状態の持ち越しが正しい)。

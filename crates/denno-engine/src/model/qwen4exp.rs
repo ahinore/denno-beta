@@ -8908,6 +8908,81 @@ fn prefill_batch_chunk() -> usize {
     })
 }
 
+// ---------------------------------------------------------------------------
+// task 154: prefill の GPU 常駐 (`DENNO_PF_RESIDENT`)
+// ---------------------------------------------------------------------------
+//
+// 動機 (lab t151c の 14,018 トークン prefill の台帳): h2d 111 GB / d2h 168 GB /
+// sync 36,208 回。host 側 (cpu 列) が約 150 s で、内訳は GDN コア (ssm)、
+// hc mix の要素演算、hc combine、PLE、埋め込み。ここでは
+//
+// - `DENNO_PF_GDN_GPU`: ssm 層の GDN コアを GPU の sigmoid スキャンで回す
+// - `DENNO_PF_MIX_DEV`: hc mix (norm → down → lo → up → mixed → inject) と
+//   hc combine をデバイス上の 1 連鎖で回し、活性をチャンク中 GPU に置く
+//
+// の 2 つを 1 つの master ゲートで束ねる。既定は off (lab の採否で決める)。
+
+/// master ゲートの解釈 (純関数)。明示的な真値だけ on。
+pub(crate) fn pf_on_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+        None => false,
+    }
+}
+
+/// task 154: prefill を GPU 常駐にするか (`DENNO_PF_RESIDENT`、既定 off)。
+pub(crate) fn pf_resident_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_on_from_value(std::env::var("DENNO_PF_RESIDENT").ok().as_deref()))
+}
+
+/// 副ゲートの上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。テスト用。
+static PF_SUB_OVERRIDE: [std::sync::atomic::AtomicU8; 2] =
+    [const { std::sync::atomic::AtomicU8::new(0) }; 2];
+
+/// 副ゲートの番号: 0 = GDN、1 = mix/combine。
+pub(crate) const PF_SUB_GDN: usize = 0;
+/// 副ゲートの番号: mix/combine。
+pub(crate) const PF_SUB_MIX: usize = 1;
+
+/// task 154: テスト専用: 副ゲートの on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_pf_sub_for_test(which: usize, v: Option<bool>) {
+    PF_SUB_OVERRIDE[which].store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn pf_sub_on(which: usize, env: &str) -> bool {
+    match PF_SUB_OVERRIDE[which].load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    match std::env::var(env) {
+        Ok(v) => pf_on_from_value(Some(&v)),
+        Err(_) => pf_resident_on(),
+    }
+}
+
+/// ssm 層の GDN コアを GPU スキャンで回すか (`DENNO_PF_GDN_GPU`、未設定は master)。
+pub(crate) fn pf_gdn_gpu_on() -> bool {
+    pf_sub_on(PF_SUB_GDN, "DENNO_PF_GDN_GPU")
+}
+
+/// hc mix と hc combine をデバイス連鎖で回すか (`DENNO_PF_MIX_DEV`、未設定は master)。
+pub(crate) fn pf_mix_dev_on() -> bool {
+    pf_sub_on(PF_SUB_MIX, "DENNO_PF_MIX_DEV")
+}
+
 /// `DENNO_PLE_BATCH` の値の解釈 (純粋関数)。**既定 on**。
 ///
 /// `0` / `false` / `off` のときだけ無効 (トークンごとに 1 回ずつ引く旧経路)。
@@ -15393,6 +15468,18 @@ mod tests {
                     *slot = acc * inv_hc;
                 }
                 assert_eq!(want, got, "hc={hc} e={e} で CPU と一致しない");
+            }
+        }
+
+        /// task 154: `DENNO_PF_RESIDENT` / 副ゲートの真理値表 (既定 off)。
+        #[test]
+        fn pf_gate_truth_table() {
+            assert!(!pf_on_from_value(None), "未設定は off");
+            for v in ["0", "off", "false", "no", "", " 0 "] {
+                assert!(!pf_on_from_value(Some(v)), "{v:?} が on になった");
+            }
+            for v in ["1", "on", "true", "yes", " ON "] {
+                assert!(pf_on_from_value(Some(v)), "{v:?} が off になった");
             }
         }
 
