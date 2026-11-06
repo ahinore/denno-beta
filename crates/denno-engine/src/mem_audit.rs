@@ -35,6 +35,8 @@ pub const TAG_LMHEAD: &str = "w:lm_head";
 pub const TAG_ROUTER: &str = "w:router";
 /// hc mix の f32 展開済み重み (task 110)
 pub const TAG_MIX_F32: &str = "w:mix_f32";
+/// hc mix の BF16 生バイト常駐 (task 152。f32 展開しない経路)
+pub const TAG_MIX_BF16: &str = "w:mix_bf16";
 /// GDN の重み (層ごとに差し替える 3 本)
 pub const TAG_GDN_W: &str = "w:gdn";
 /// expert の LRU (decode のヒット/ミス)
@@ -259,6 +261,8 @@ pub fn request_boundary(ctx_tokens: usize, long_ctx: usize) {
     #[cfg(feature = "cuda")]
     {
         request_end(ctx_tokens, long_ctx, crate::cuda::dev_mem_mb());
+        // task 152: 次のリクエストのカード予算は新しい値を出す (キャッシュを捨てる)。
+        crate::cuda::dev_mem_refresh();
         crate::cuda::pf_scratch_release();
     }
     #[cfg(not(feature = "cuda"))]

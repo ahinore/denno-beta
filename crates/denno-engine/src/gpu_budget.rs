@@ -200,6 +200,70 @@ pub fn flash_budget_from_gguf(f: &GgufFile, p: &Qwen4ExpParams, max_ctx: usize) 
     )
 }
 
+/// task 152: 分割 GGUF の**全パート**を数えた予算 (起動時に 1 回)。
+///
+/// [`flash_budget_from_gguf`] は渡された `GgufFile` のテンソル表を数える。lab
+/// t149c の実測では、2 分割モデルに対して `weights=445 MiB (74 本)` と出て、
+/// 実際に VRAM へ上がった dense 重み (`[mem-audit] w:gguf 266 本 3,297 MiB`) の
+/// 13% しか数えていなかった (REPORT_P149.md)。ここでは**パートを 1 本ずつ開いて**
+/// 数え上げるので、パート数にも分割のされ方にも依存せず全部が入る。
+///
+/// 失敗したら `Err` を返す (呼び出し側はログを諦めて続行してよい。予算は表示だけ)。
+pub fn flash_budget_from_parts(
+    paths: &[std::path::PathBuf],
+    p: &Qwen4ExpParams,
+    max_ctx: usize,
+) -> anyhow::Result<FlashBudget> {
+    let mut totals = WeightTotals::default();
+    let mut q4_present = false;
+    for path in paths {
+        let f = GgufFile::open(path)?;
+        let t = classify_weights(
+            f.tensors
+                .values()
+                .map(|t| (t.name.as_str(), t.ty, t.dims, t.nbytes)),
+        );
+        totals = merge_totals(totals, t);
+        if !q4_present {
+            q4_present = f
+                .tensors
+                .values()
+                .any(|t| t.ty == GgmlType::Q4_0 && !is_expert_weight(&t.name));
+        }
+    }
+    let kv_dim = p.n_head_kv.saturating_mul(p.n_embd_head_k);
+    Ok(flash_budget(
+        totals,
+        n_full_layers(p.n_layer, p.full_attn_interval),
+        kv_dim,
+        max_ctx,
+        q4_present,
+    ))
+}
+
+/// パートごとの集計を 1 つに足す (純関数)。本数とバイト数は和、`max_k` / `max_n`
+/// は最大値 (1 回の GEMV の staging 見積りはパートをまたがない)。
+pub fn merge_totals(a: WeightTotals, b: WeightTotals) -> WeightTotals {
+    WeightTotals {
+        dev_bytes: a.dev_bytes + b.dev_bytes,
+        dev_tensors: a.dev_tensors + b.dev_tensors,
+        host_bytes: a.host_bytes + b.host_bytes,
+        host_tensors: a.host_tensors + b.host_tensors,
+        expert_bytes: a.expert_bytes + b.expert_bytes,
+        expert_tensors: a.expert_tensors + b.expert_tensors,
+        max_k: a.max_k.max(b.max_k),
+        max_n: a.max_n.max(b.max_n),
+    }
+}
+
+/// task 152: 予算 1 行に「何パート・何テンソルを数えたか」を足す。
+///
+/// `[flash] vram budget: ...` の形は変えない (既存のテストと目視のため) ので、
+/// 末尾に `parts=` / `device_tensors=` を足すだけにする。
+pub fn budget_line_with_parts(b: &FlashBudget, parts: usize) -> String {
+    format!("{} parts={parts}", budget_line(b))
+}
+
 /// MiB (四捨五入)。
 fn mib(bytes: u64) -> u64 {
     bytes.saturating_add(1 << 19) >> 20
@@ -709,6 +773,59 @@ mod tests {
 
     fn t(name: &str, ty: GgmlType, k: u64, n: u64, bytes: u64) -> (String, GgmlType, [u64; 4], u64) {
         (name.to_string(), ty, [k, n, 1, 1], bytes)
+    }
+
+    /// task 152: パートの集計は和になる (本数・バイト数)、staging は最大値。
+    #[test]
+    fn merge_totals_sums_parts() {
+        let a = WeightTotals {
+            dev_bytes: 100,
+            dev_tensors: 2,
+            host_bytes: 10,
+            host_tensors: 1,
+            expert_bytes: 1000,
+            expert_tensors: 1,
+            max_k: 2560,
+            max_n: 640,
+        };
+        let b = WeightTotals {
+            dev_bytes: 50,
+            dev_tensors: 1,
+            host_bytes: 5,
+            host_tensors: 2,
+            expert_bytes: 2000,
+            expert_tensors: 3,
+            max_k: 1280,
+            max_n: 10240,
+        };
+        let m = merge_totals(a, b);
+        assert_eq!(m.dev_bytes, 150, "バイト数は和");
+        assert_eq!(m.dev_tensors, 3, "本数は和");
+        assert_eq!(m.host_bytes, 15);
+        assert_eq!(m.host_tensors, 3);
+        assert_eq!(m.expert_bytes, 3000);
+        assert_eq!(m.expert_tensors, 4);
+        assert_eq!(m.max_k, 2560, "max は最大値");
+        assert_eq!(m.max_n, 10240);
+    }
+
+    /// task 152: 予算 1 行は既存の形を保ったまま `parts=` を足す。
+    #[test]
+    fn budget_line_with_parts_appends_parts() {
+        let b = FlashBudget {
+            max_ctx: 65536,
+            weights_dev: 3_297 << 20,
+            weights_dev_tensors: 266,
+            staging_peak: 0,
+            arena_dev: 0,
+            kv_host_max: 0,
+            host_weights: 0,
+            experts_ram: 0,
+        };
+        let line = budget_line_with_parts(&b, 2);
+        assert!(line.starts_with("[flash] vram budget: max_ctx=65536"), "{line}");
+        assert!(line.contains("weights=3297 MiB (266 本)"), "{line}");
+        assert!(line.ends_with("parts=2"), "{line}");
     }
 
     #[test]

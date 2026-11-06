@@ -37,8 +37,8 @@
 use anyhow::{anyhow, bail, Result};
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 type CUresult = i32;
@@ -331,6 +331,88 @@ pub fn dev_mem_mb() -> Option<(usize, usize)> {
     Some((free >> 20, total >> 20))
 }
 
+// ---------------------------------------------------------------------------
+// task 152: cuMemGetInfo のキャッシュ
+// ---------------------------------------------------------------------------
+// task 149 のカード予算 (`DENNO_VRAM_BUDGET_CARD`) は expert を 1 本載せるたびに
+// cuMemGetInfo を呼んでいた。lab t149c では 28 token の prefill が +3.3% 悪化して
+// おり、その主因と推定された (REPORT_P149.md)。ドライバによっては 1 回が
+// 数十〜数百 us かかるので、**64 MiB ぶんの増減か 2 秒経過まで**は同じ値を返す。
+//
+// 予算は「余裕 (既定 1,024 MiB)」を残して切るので、最大 64 MiB の古さは
+// 判定を変えない。確保に失敗したときは従来どおり追い出して再試行する
+// (br149 の経路) ので、古い値で足りなくてもラッチしない。
+
+/// キャッシュを捨てる「台帳の増減」の閾値 (MiB)。
+pub const MEM_CACHE_DRIFT_MB: usize = 64;
+/// キャッシュの最大 age (ミリ秒)。
+pub const MEM_CACHE_MAX_MS: u128 = 2000;
+
+struct MemCache {
+    free_mb: usize,
+    total_mb: usize,
+    live_at: usize,
+    at: std::time::Instant,
+}
+
+static MEM_CACHE: Mutex<Option<MemCache>> = Mutex::new(None);
+
+/// キャッシュを捨てて次の [`dev_mem_mb_cached`] で引き直させる。
+pub fn dev_mem_refresh() {
+    if let Ok(mut g) = MEM_CACHE.lock() {
+        *g = None;
+    }
+}
+
+/// キャッシュを引き直すかの判定 (純関数)。
+///
+/// `live_delta` は前回の取得から動いた台帳の合計バイト (絶対値)、`age_ms` は
+/// 前回の取得からの経過ミリ秒。どちらかが閾値を超えたら引き直す。
+pub fn mem_cache_should_refresh(live_delta: usize, age_ms: u128) -> bool {
+    live_delta >= MEM_CACHE_DRIFT_MB << 20 || age_ms >= MEM_CACHE_MAX_MS
+}
+
+/// [`dev_mem_mb`] のキャッシュ版 (task 152)。
+///
+/// 引き直すのは次のいずれか:
+/// - まだ 1 度も引いていない / [`dev_mem_refresh`] の後
+/// - 前回の取得から台帳の合計が [`MEM_CACHE_DRIFT_MB`] 以上動いた
+/// - 前回の取得から [`MEM_CACHE_MAX_MS`] 以上経った
+///
+/// 引けなかったときは古い値ではなく `None` を返す (未取得のままなら `None`)。
+pub fn dev_mem_mb_cached() -> Option<(usize, usize)> {
+    let live = crate::mem_audit::live_bytes();
+    let mut g = match MEM_CACHE.lock() {
+        Ok(g) => g,
+        Err(_) => return dev_mem_mb(),
+    };
+    let refresh = match g.as_ref() {
+        None => true,
+        Some(c) => mem_cache_should_refresh(
+            live.abs_diff(c.live_at),
+            c.at.elapsed().as_millis(),
+        ),
+    };
+    if refresh {
+        match dev_mem_mb() {
+            Some((free, total)) => {
+                *g = Some(MemCache {
+                    free_mb: free,
+                    total_mb: total,
+                    live_at: live,
+                    at: std::time::Instant::now(),
+                });
+            }
+            None => {
+                if g.is_none() {
+                    return None;
+                }
+            }
+        }
+    }
+    g.as_ref().map(|c| (c.free_mb, c.total_mb))
+}
+
 /// `DENNO_MEM_DBG=1` のときだけ確保/解放をログる (既定は完全に無効)。
 fn mem_dbg() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -474,6 +556,67 @@ impl DevBuffer {
     #[track_caller]
     fn alloc(bytes: usize) -> Result<Self> {
         Self::alloc_tagged(bytes, crate::mem_audit::TAG_OTHER)
+    }
+
+    /// task 152: slab のチャンクを 1 本確保する (台帳のタグは expert 側)。
+    #[track_caller]
+    pub(crate) fn slab_chunk(bytes: usize) -> Result<Self> {
+        Self::alloc_tagged(bytes.max(1), crate::mem_audit::TAG_EXPERTS)
+    }
+
+    /// task 152: このバッファの一部を指す**非所有**ビュー (drop で解放しない)。
+    pub(crate) fn view_at(&self, offset: usize, bytes: usize) -> Self {
+        assert!(
+            offset.saturating_add(bytes) <= self.bytes,
+            "DevBuffer::view_at: 範囲外 (offset={offset}, bytes={bytes}, len={})",
+            self.bytes
+        );
+        Self::view(self.ptr + offset as CUdeviceptr, bytes)
+    }
+
+    /// task 152: 同じ領域を指す非所有ビューを作り直す (所有側は drop しない)。
+    pub(crate) fn alias(&self) -> Self {
+        Self::view(self.ptr, self.bytes)
+    }
+
+    /// task 152: `offset` の位置へ pinned staging 経由で H2D する。
+    ///
+    /// [`from_slice_pinned`] と同じ経路 (ホスト 1 回コピー + `cuMemcpyHtoD`) なので、
+    /// slab のスロットへ上げる転送速度は per-expert 確保のときと変わらない。
+    pub(crate) fn upload_pinned_at(&self, offset: usize, data: &[u8]) -> Result<()> {
+        let bytes = data.len();
+        if bytes == 0 {
+            return Ok(());
+        }
+        assert!(
+            offset.saturating_add(bytes) <= self.bytes,
+            "DevBuffer::upload_pinned_at: 範囲外 (offset={offset}, bytes={bytes}, len={})",
+            self.bytes
+        );
+        EXPERT_PIN.with(|cell| -> Result<()> {
+            let mut slot = cell.borrow_mut();
+            if slot.as_ref().map(|p| p.bytes).unwrap_or(0) < bytes {
+                *slot = Some(PinMem::alloc(bytes)?);
+            }
+            let pin = slot.as_ref().expect("確保済み");
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    pin.ptr as *mut u8,
+                    bytes,
+                );
+                check(
+                    (lib()?.memcpy_htod)(
+                        self.ptr + offset as CUdeviceptr,
+                        pin.ptr,
+                        bytes,
+                    ),
+                    "cuMemcpyHtoD (pinned slab)",
+                )?;
+            }
+            dbg_htod(bytes);
+            Ok(())
+        })
     }
 
     /// s165: 既存のデバイス領域の一部を指す**非所有**ビュー。連結重み
@@ -3639,6 +3782,8 @@ struct IqScratch {
     pd: Option<DevBuffer>,
     sgu: Option<DevBuffer>,
     sgd: Option<DevBuffer>,
+    /// task 150: `h` の D2H を非同期で受ける pinned staging (overlap 経路だけ)。
+    hpin: Option<PinMem>,
 }
 
 impl IqScratch {
@@ -3654,6 +3799,7 @@ impl IqScratch {
             pd: None,
             sgu: None,
             sgd: None,
+            hpin: None,
         }
     }
 }
@@ -3686,6 +3832,71 @@ pub fn moe_experts_iq_layer(
     e: usize,
     out_h: &mut [f32],
 ) -> Result<bool> {
+    iq_layer_run(
+        ty_g, ty_u, ty_d, pg, pu, pd, seg_gu, seg_d, x, n_in, ff, e, out_h, false, || Ok(()),
+    )
+}
+
+/// task 150: [`moe_experts_iq_layer`] の**重ね打ち版**。
+///
+/// 発行するカーネル・引数・順序・値は逐次版と 1 つも変わらない。違うのは待ち方だけで、
+/// **D2H を非同期で出してから `cpu_miss` を実行し、最後に 1 回だけ同期する**。
+/// decode では 1 層あたり GPU 5〜6 ms 待つのに CPU ミスが 57 ms あるので (lab t148b)、
+/// 待ちを CPU の仕事の裏へ隠せる。`cpu_miss` は GPU の作業域に触れてはいけない
+/// (呼び出し側はミス expert の CPU 寄与だけを書く)。
+///
+/// `Ok(false)` = GPU でやらなかった (どの起動よりも前に落ちた)。このとき
+/// `cpu_miss` は**呼ばれない**ので、呼び出し側は従来どおり全 expert を CPU で
+/// 計算し直せる。`cpu_miss` が `Err` を返したときは**そのまま Err を返す**
+/// (起動済みで `out_h` の一部が確定しているため CPU 経路へは戻さない)。
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts_iq_layer_overlap<F>(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    ty_d: crate::kquant::GgmlType,
+    pg: &[u64],
+    pu: &[u64],
+    pd: &[u64],
+    seg_gu: &[u32],
+    seg_d: &[u32],
+    x: &[f32],
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    out_h: &mut [f32],
+    cpu_miss: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Result<()>,
+{
+    iq_layer_run(
+        ty_g, ty_u, ty_d, pg, pu, pd, seg_gu, seg_d, x, n_in, ff, e, out_h, true, cpu_miss,
+    )
+}
+
+/// [`moe_experts_iq_layer`] と [`moe_experts_iq_layer_overlap`] の共通本体。
+/// `overlap == false` のときの順序・API 呼び出しは task 144 の実装と同一。
+#[allow(clippy::too_many_arguments)]
+fn iq_layer_run<F>(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    ty_d: crate::kquant::GgmlType,
+    pg: &[u64],
+    pu: &[u64],
+    pd: &[u64],
+    seg_gu: &[u32],
+    seg_d: &[u32],
+    x: &[f32],
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    out_h: &mut [f32],
+    overlap: bool,
+    middle: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Result<()>,
+{
     let nseg = pg.len();
     if nseg == 0
         || pu.len() != nseg
@@ -3746,6 +3957,10 @@ pub fn moe_experts_iq_layer(
         MoeScratch::ensure_tagged(&mut sc.pd, nseg * 8, crate::mem_audit::TAG_GDN_SC)?;
         MoeScratch::ensure_tagged(&mut sc.sgu, seg_gu.len() * 4, crate::mem_audit::TAG_GDN_SC)?;
         MoeScratch::ensure_tagged(&mut sc.sgd, seg_d.len() * 4, crate::mem_audit::TAG_GDN_SC)?;
+        // task 150: overlap 経路だけ pinned staging を用意する (grow-only)。
+        if overlap {
+            Scratch::ensure_pin(&mut sc.hpin, nh * 4)?;
+        }
         {
             let xb = sc.x.as_ref().expect("確保済み");
             xb.copy_from(&x[..n_in])?;
@@ -3846,15 +4061,121 @@ pub fn moe_experts_iq_layer(
                     &mut args,
                 )?;
             }
-            // 4. 同期は 1 回だけ (層あたり)
-            ctx.sync()?;
+            // 4. 同期は 1 回だけ (層あたり)。task 150 の overlap 経路では D2H を
+            //    非同期で先に出し、`middle` (CPU ミス) を挟んでから同期する。
+            //    カーネル・引数・発行順は逐次版と同一 (変わるのは待つ位置だけ)。
+            if overlap {
+                // `h` の借用をここで切る (pinned は別 field なので `sc` を丸ごと
+                // 借り直さないよう、アドレスを先に写す)。
+                let h_ptr = h.ptr;
+                let pin = sc.hpin.as_mut().expect("確保済み");
+                check(
+                    (lib()?.memcpy_dtoh_async)(pin.ptr, h_ptr, nh * 4, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (iq layer overlap)",
+                )?;
+                crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+            } else {
+                ctx.sync()?;
+            }
         }
-        let got: Vec<f32> = sc.h.as_ref().expect("確保済み").to_vec(nh)?;
+        if overlap {
+            // ここから下はデバイスの完了を待たずに走る (GPU と CPU の重ね打ち)。
+            middle()?;
+            ctx.sync()?;
+            let pin = sc.hpin.as_ref().expect("確保済み");
+            out_h[..nh].copy_from_slice(&pin.as_slice::<f32>()[..nh]);
+        } else {
+            let got: Vec<f32> = sc.h.as_ref().expect("確保済み").to_vec(nh)?;
+            out_h[..nh].copy_from_slice(&got);
+            middle()?;
+        }
         dbg_d2h(nh * 4);
-        out_h[..nh].copy_from_slice(&got);
         Ok(())
     })?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod iq_overlap_tests {
+    //! task 150: 重ね打ち経路の**契約**を GPU 無しで固定する。
+    use super::*;
+    use crate::kquant::GgmlType;
+
+    /// 形状が不正なら起動前に `Ok(false)` を返し、**CPU ミスのコールバックを
+    /// 呼ばない** (呼び出し側は全 expert を CPU で計算し直せる)。呼んでしまうと
+    /// 二重計算になるうえ、`out_h` が途中まで書かれた状態で CPU 経路へ戻すことになる。
+    #[test]
+    fn overlap_skips_cpu_miss_when_it_does_not_launch() {
+        let called = std::cell::Cell::new(0u32);
+        let mut out = vec![0.0f32; 4];
+        // seg_gu の長さが 4 の倍数でない → 起動計画より前に落ちる。
+        let r = moe_experts_iq_layer_overlap(
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            &[0u64],
+            &[0u64],
+            &[0u64],
+            &[0u32, 1, 0, 0, 0],
+            &[0u32, 1, 0, 0, 0, 0, 0, 0],
+            &[0.0f32; 8],
+            8,
+            16,
+            4,
+            &mut out,
+            || {
+                called.set(called.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("形状検査は Err ではなく Ok(false)");
+        assert!(!r, "不正な形状で GPU 経路を選んではいけない");
+        assert_eq!(called.get(), 0, "起動しないのに CPU ミスを走らせた");
+        assert!(out.iter().all(|&v| v == 0.0), "out を書いてはいけない");
+    }
+
+    /// 逐次版と重ね打ち版は同じ入口 (`iq_layer_run`) を通る。GPU の無い環境では
+    /// どちらも `Ok(false)` で、値は 1 つも書かれない。
+    #[test]
+    fn both_entries_fall_back_without_cuda() {
+        let mut out_a = vec![7.0f32; 4];
+        let mut out_b = vec![7.0f32; 4];
+        let a = moe_experts_iq_layer(
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            &[0u64],
+            &[0u64],
+            &[0u64],
+            &[0u32, 0, 0, 0],
+            &[0u32, 0, 0, 0],
+            &[0.0f32; 8],
+            8,
+            16,
+            4,
+            &mut out_a,
+        )
+        .expect("逐次版");
+        let b = moe_experts_iq_layer_overlap(
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            &[0u64],
+            &[0u64],
+            &[0u64],
+            &[0u32, 0, 0, 0],
+            &[0u32, 0, 0, 0],
+            &[0.0f32; 8],
+            8,
+            16,
+            4,
+            &mut out_b,
+            || Ok(()),
+        )
+        .expect("重ね打ち版");
+        assert_eq!(a, b, "同じ入口なのに戻り値が違う");
+        assert_eq!(out_a, out_b, "out の扱いが違う");
+    }
 }
 
 #[cfg(test)]
@@ -8847,6 +9168,106 @@ fn matvec_f32_r_silu_fn(ctx: &CudaCtx) -> Option<CUfunction> {
         .map(|h| h.0)
 }
 
+// ---------------------------------------------------------------------------
+// task 152: BF16 のまま読む mix カーネルのハンドル (未収録 PTX は None)
+// ---------------------------------------------------------------------------
+// 追加カーネルは kernels_elem.cu の末尾 (dno_matvec_bf16 / _r / _r_silu /
+// dno_gemm_bf16_mt)。未収録 (古い PTX) のときは None をキャッシュし、呼び出し側は
+// **f32 展開経路**に落ちる (ラッチしない = 失敗にしない)。モジュールは f32 版と
+// 同じ `module_elem`。
+
+/// task 152: `dno_matvec_bf16` のハンドル。
+fn matvec_bf16_fn(ctx: &CudaCtx) -> Option<CUfunction> {
+    static FN: OnceLock<Option<Lmv32Fn>> = OnceLock::new();
+    FN.get_or_init(|| {
+        let lib = lib().ok()?;
+        let mut f: CUfunction = std::ptr::null_mut();
+        let r = unsafe {
+            (lib.module_get_function)(
+                &mut f,
+                ctx.module_elem,
+                b"dno_matvec_bf16\0".as_ptr() as *const c_char,
+            )
+        };
+        if r != 0 {
+            None
+        } else {
+            Some(Lmv32Fn(f))
+        }
+    })
+    .as_ref()
+    .map(|h| h.0)
+}
+
+/// task 152: `dno_matvec_bf16_r` のハンドル。
+fn matvec_bf16_r_fn(ctx: &CudaCtx) -> Option<CUfunction> {
+    static FN: OnceLock<Option<Lmv32RFn>> = OnceLock::new();
+    FN.get_or_init(|| {
+        let lib = lib().ok()?;
+        let mut f: CUfunction = std::ptr::null_mut();
+        let r = unsafe {
+            (lib.module_get_function)(
+                &mut f,
+                ctx.module_elem,
+                b"dno_matvec_bf16_r\0".as_ptr() as *const c_char,
+            )
+        };
+        if r != 0 {
+            None
+        } else {
+            Some(Lmv32RFn(f))
+        }
+    })
+    .as_ref()
+    .map(|h| h.0)
+}
+
+/// task 152: `dno_matvec_bf16_r_silu` のハンドル。
+fn matvec_bf16_r_silu_fn(ctx: &CudaCtx) -> Option<CUfunction> {
+    static FN: OnceLock<Option<Lmv32RSiluFn>> = OnceLock::new();
+    FN.get_or_init(|| {
+        let lib = lib().ok()?;
+        let mut f: CUfunction = std::ptr::null_mut();
+        let r = unsafe {
+            (lib.module_get_function)(
+                &mut f,
+                ctx.module_elem,
+                b"dno_matvec_bf16_r_silu\0".as_ptr() as *const c_char,
+            )
+        };
+        if r != 0 {
+            None
+        } else {
+            Some(Lmv32RSiluFn(f))
+        }
+    })
+    .as_ref()
+    .map(|h| h.0)
+}
+
+/// task 152: `dno_gemm_bf16_mt` のハンドル (prefill の m トークン一括)。
+fn gemm_bf16_mt_fn(ctx: &CudaCtx) -> Option<CUfunction> {
+    static FN: OnceLock<Option<LgemmMtFn>> = OnceLock::new();
+    FN.get_or_init(|| {
+        let lib = lib().ok()?;
+        let mut f: CUfunction = std::ptr::null_mut();
+        let r = unsafe {
+            (lib.module_get_function)(
+                &mut f,
+                ctx.module_elem,
+                b"dno_gemm_bf16_mt\0".as_ptr() as *const c_char,
+            )
+        };
+        if r != 0 {
+            None
+        } else {
+            Some(LgemmMtFn(f))
+        }
+    })
+    .as_ref()
+    .map(|h| h.0)
+}
+
 /// s49: fp32 重み (lm_head / tied embed) のデバイスキャッシュ。key はモデル
 /// ロード毎に一意 (qwen35 の mid 由来)。無ければ同期 H2D でアップロードし
 /// 初回 1 回のみ走る (eviction 無し = P17b 重みレジストリと同一方針)。
@@ -9442,10 +9863,39 @@ fn mix_expand_bf16(bytes: &[u8], k: usize, n: usize) -> Vec<f32> {
 
 /// task 110: 展開済み f32 重みの常駐エントリ (s49 の LMV32_W と同じ方針:
 /// eviction 無し・uid key。解放は [`mix_gpu_unregister`] が `GgufLinear::drop` から)。
+///
+/// task 152: `bf16 == true` のときは `buf` が **BF16 の生バイト** (k*n*2 B) で、
+/// カーネルは `dno_matvec_bf16*` / `dno_gemm_bf16_mt` を使う。f32 展開しないので
+/// 常駐が半分になる (lab t149c の w:mix_f32 2,425 MiB のうち約 1,200 MiB が戻る)。
 struct MixGpuW {
     buf: DevBuffer,
     k: usize,
     n: usize,
+    bf16: bool,
+}
+
+/// task 152: 常駐重みのポインタ (モードは呼び出し側が先に決めている)。
+#[derive(Clone, Copy)]
+struct MixW {
+    ptr: CUdeviceptr,
+}
+
+/// task 152: `DENNO_MIX_BF16` の解釈 (純関数)。明示的な真値だけ on。
+/// 既定は [`MIX_BF16_DEFAULT`] (lab の採否で決める)。
+fn mix_bf16_from_value(v: Option<&str>, default_on: bool) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) if matches!(s.as_str(), "1" | "true" | "on" | "yes") => true,
+        Some(s) if matches!(s.as_str(), "0" | "false" | "off" | "no") => false,
+        _ => default_on,
+    }
+}
+
+/// task 152: BF16 のまま読むカーネルを使うか (`DENNO_MIX_BF16`)。
+fn mix_bf16_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        mix_bf16_from_value(std::env::var("DENNO_MIX_BF16").ok().as_deref(), MIX_BF16_DEFAULT)
+    })
 }
 
 static MIX_GPU_W: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, MixGpuW>>> =
@@ -9459,6 +9909,8 @@ struct MixGpuScratch {
     /// task 138: チェーン経路の down 出力 (lo_apply 済み) を device に置く場所。
     lo: Option<DevBuffer>,
     out: Option<DevBuffer>,
+    /// task 150: chain2 の hc_mixed 出力 ([e]) を device に置く場所。
+    mixed: Option<DevBuffer>,
     hx: Option<PinMem>,
     ho: Option<PinMem>,
 }
@@ -9469,6 +9921,7 @@ thread_local! {
             x: None,
             lo: None,
             out: None,
+            mixed: None,
             hx: None,
             ho: None,
         });
@@ -9549,7 +10002,15 @@ pub fn maybe_gpu_mix_bf16_into(
         return false;
     }
     // カーネルハンドル (lazy fetch)。未収録 PTX は 1 行 warn して CPU に落とす。
-    let Some(f) = matvec_f32_fn(ctx) else {
+    // task 152: `DENNO_MIX_BF16=1` かつ BF16 カーネルが PTX にあれば、重みを f32 に
+    // 展開せず BF16 のまま読む (常駐が半分)。無ければ従来の f32 展開経路。
+    let want_bf16 = mix_bf16_enabled() && matvec_bf16_fn(ctx).is_some();
+    let (f_seq, f_red) = if want_bf16 {
+        (matvec_bf16_fn(ctx), matvec_bf16_r_fn(ctx))
+    } else {
+        (matvec_f32_fn(ctx), matvec_f32_r_fn(ctx))
+    };
+    let Some(f) = f_seq else {
         mix_gpu_broken_once("kernels_elem.ptx に dno_matvec_f32 が無い (PTX 再生成が必要)");
         return false;
     };
@@ -9559,42 +10020,14 @@ pub fn maybe_gpu_mix_bf16_into(
     // 律速に達しない)。`_r` は DENNO_FAST_REDUCE と無関係にこの経路だけで選ぶ
     // (mix の長い行はオペレーター方針で bit 一致契約の外)。PTX に `_r` が無ければ
     // (Option が None) 逐次版に落ちる = 失敗にはしない (fail closed)。
-    let fr = matvec_f32_r_fn(ctx);
+    let fr = f_red;
     let use_reduce = mix_use_reduce_kernel(k, n, fr.is_some());
     // 重みの展開 + 常駐 (初回 1 回・同期 H2D)。ロック内で二重アップロード防止。
-    let reg = MIX_GPU_W.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let wp = {
-        let mut map = match reg.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                mix_gpu_broken_once("hc mix weight registry poisoned");
-                return false;
-            }
-        };
-        match map.get(&uid) {
-            Some(w) if w.k == k && w.n == n => w.buf.ptr(),
-            Some(_) => {
-                mix_gpu_broken_once(&format!("uid 重複: uid={uid} に別の形状 (k={k}, n={n})"));
-                return false;
-            }
-            None => {
-                let host = mix_expand_bf16(bytes, k, n);
-                match DevBuffer::from_slice_tagged(&host, crate::mem_audit::TAG_MIX_F32) {
-                    Ok(buf) => {
-                        tracing::info!(
-                            "[mix-gpu] uid={uid} bf16 mix k={k} n={n} {:.1} MB (f32 展開済み・常駐)",
-                            (k * n * 4) as f64 / 1e6
-                        );
-                        let p = buf.ptr();
-                        map.insert(uid, MixGpuW { buf, k, n });
-                        p
-                    }
-                    Err(e) => {
-                        mix_gpu_broken_once(&format!("f32 展開重みの VRAM 確保に失敗: {e:#}"));
-                        return false;
-                    }
-                }
-            }
+    let wp = match mix_gpu_weight(uid, bytes, k, n, want_bf16) {
+        Ok(w) => w.ptr,
+        Err(e) => {
+            mix_gpu_broken_once(&format!("hc mix 重みの常駐に失敗: {e:#}"));
+            return false;
         }
     };
     let lib = match lib() {
@@ -9751,12 +10184,19 @@ pub fn maybe_gpu_mix_bf16_batch_into(
         mix_gpu_broken_once(&format!("cuCtxSetCurrent (batch): {e:#}"));
         return false;
     }
-    let Some(f) = gemm_f32_mt_fn(ctx) else {
+    // task 152: BF16 カーネルがあれば重みを BF16 のまま置く (常駐が半分)。
+    let want_bf16 = mix_bf16_enabled() && gemm_bf16_mt_fn(ctx).is_some();
+    let f = if want_bf16 {
+        gemm_bf16_mt_fn(ctx)
+    } else {
+        gemm_f32_mt_fn(ctx)
+    };
+    let Some(f) = f else {
         // PTX 未収録 (PTX=elem の再生成待ち)。ラッチはしない。
         return false;
     };
-    let wp = match mix_gpu_weight(uid, bytes, k, n) {
-        Ok(p) => p,
+    let wp = match mix_gpu_weight(uid, bytes, k, n, want_bf16) {
+        Ok(w) => w.ptr,
         Err(e) => {
             mix_gpu_broken_once(&format!("batch の重み常駐に失敗: {e:#}"));
             return false;
@@ -9826,27 +10266,57 @@ pub fn maybe_gpu_mix_bf16_batch_into(
 }
 
 
+/// task 152: BF16 のまま読む mix カーネルの既定値。
+///
+/// lab の採否で決める (`REPORT_P152.md`)。off でも `DENNO_MIX_BF16=1` で試せる。
+const MIX_BF16_DEFAULT: bool = false;
+
 /// `MIX_GPU_W` の登録・形状検査・初回の同期 H2D を 1 箇所にまとめたもの
 /// ([`maybe_gpu_mix_bf16_into`] と同じ規約)。uid は `GgufLinear` のもの。
-fn mix_gpu_weight(uid: u64, bytes: &[u8], k: usize, n: usize) -> Result<CUdeviceptr> {
+///
+/// task 152: `want_bf16` のときは生バイト (BF16) をそのまま上げる。既に逆の
+/// モードで載っている uid を要求されたら **エラー**にする (黙って別解釈の
+/// バイト列で計算しない。呼び出し側は CPU へ落ちる)。
+fn mix_gpu_weight(uid: u64, bytes: &[u8], k: usize, n: usize, want_bf16: bool) -> Result<MixW> {
     let reg = MIX_GPU_W.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut map = match reg.lock() {
         Ok(g) => g,
         Err(_) => bail!("hc mix weight registry poisoned"),
     };
     match map.get(&uid) {
-        Some(w) if w.k == k && w.n == n => Ok(w.buf.ptr()),
-        Some(_) => bail!("uid 重複: uid={uid} に別の形状 (k={k}, n={n})"),
+        Some(w) if w.k == k && w.n == n && w.bf16 == want_bf16 => Ok(MixW {
+            ptr: w.buf.ptr(),
+        }),
+        Some(_) => bail!("uid 重複: uid={uid} に別の形状/モード (k={k}, n={n}, bf16={want_bf16})"),
         None => {
-            let host = mix_expand_bf16(bytes, k, n);
-            let buf = DevBuffer::from_slice_tagged(&host, crate::mem_audit::TAG_MIX_F32)?;
+            let (buf, tag) = if want_bf16 {
+                match DevBuffer::from_slice_tagged(bytes, crate::mem_audit::TAG_MIX_BF16) {
+                    Ok(b) => (b, crate::mem_audit::TAG_MIX_BF16),
+                    Err(e) => bail!("BF16 のままの mix 重みを VRAM に置けない: {e:#}"),
+                }
+            } else {
+                let host = mix_expand_bf16(bytes, k, n);
+                match DevBuffer::from_slice_tagged(&host, crate::mem_audit::TAG_MIX_F32) {
+                    Ok(b) => (b, crate::mem_audit::TAG_MIX_F32),
+                    Err(e) => bail!("f32 展開重みの VRAM 確保に失敗: {e:#}"),
+                }
+            };
             tracing::info!(
-                "[mix-gpu] uid={uid} bf16 mix k={k} n={n} {:.1} MB (f32 展開済み・常駐)",
-                (k * n * 4) as f64 / 1e6
+                "[mix-gpu] uid={uid} bf16 mix k={k} n={n} {:.1} MB ({}・常駐)",
+                buf.bytes() as f64 / 1e6,
+                if want_bf16 { "BF16 のまま" } else { "f32 展開済み" }
             );
             let p = buf.ptr();
-            map.insert(uid, MixGpuW { buf, k, n });
-            Ok(p)
+            debug_assert_eq!(
+                tag,
+                if want_bf16 {
+                    crate::mem_audit::TAG_MIX_BF16
+                } else {
+                    crate::mem_audit::TAG_MIX_F32
+                }
+            );
+            map.insert(uid, MixGpuW { buf, k, n, bf16: want_bf16 });
+            Ok(MixW { ptr: p })
         }
     }
 }
@@ -9927,31 +10397,41 @@ pub fn maybe_gpu_mix_bf16_chain_into(
         return false;
     }
     // down は silu 込みの並列リダクション版。未収録 PTX は従来経路へ (ラッチしない)。
-    let Some(f_down) = matvec_f32_r_silu_fn(ctx) else {
+    // task 152: BF16 カーネルがあれば重みは BF16 のまま (常駐が半分)。
+    let want_bf16 = mix_bf16_enabled() && matvec_bf16_r_silu_fn(ctx).is_some();
+    let f_down = if want_bf16 {
+        matvec_bf16_r_silu_fn(ctx)
+    } else {
+        matvec_f32_r_silu_fn(ctx)
+    };
+    let Some(f_down) = f_down else {
         return false;
     };
     let up_reduce = mix_up_reduce_enabled();
     let f_up = if up_reduce {
-        match matvec_f32_r_fn(ctx) {
-            Some(f) => f,
-            None => return false,
+        if want_bf16 {
+            matvec_bf16_r_fn(ctx)
+        } else {
+            matvec_f32_r_fn(ctx)
         }
+    } else if want_bf16 {
+        matvec_bf16_fn(ctx)
     } else {
-        match matvec_f32_fn(ctx) {
-            Some(f) => f,
-            None => return false,
-        }
+        matvec_f32_fn(ctx)
+    };
+    let Some(f_up) = f_up else {
+        return false;
     };
     let up_thr: u32 = if up_reduce { 256 } else { 1 };
-    let wp1 = match mix_gpu_weight(down_uid, down_bytes, k1, n1) {
-        Ok(p) => p,
+    let wp1 = match mix_gpu_weight(down_uid, down_bytes, k1, n1, want_bf16) {
+        Ok(w) => w.ptr,
         Err(e) => {
             mix_gpu_broken_once(&format!("down 重みの常駐に失敗: {e:#}"));
             return false;
         }
     };
-    let wp2 = match mix_gpu_weight(up_uid, up_bytes, n1, n2) {
-        Ok(p) => p,
+    let wp2 = match mix_gpu_weight(up_uid, up_bytes, n1, n2, want_bf16) {
+        Ok(w) => w.ptr,
         Err(e) => {
             mix_gpu_broken_once(&format!("up 重みの常駐に失敗: {e:#}"));
             return false;
@@ -9970,6 +10450,7 @@ pub fn maybe_gpu_mix_bf16_chain_into(
             x: dx,
             lo: dlo,
             out: dout,
+            mixed: _,
             hx,
             ho,
         } = &mut *s;
@@ -10045,6 +10526,243 @@ pub fn maybe_gpu_mix_bf16_chain_into(
         }
         Err(e) => {
             mix_gpu_broken_once(&format!("hc mix chain failed: {e:#}"));
+            false
+        }
+    }
+}
+
+/// task 150: `dno_hc_mixed_f32` (hc_mixed の device 版) を PTX から取る。
+/// 未収録 (旧 PTX) は `None` を返し、呼び出し側は従来経路へ落ちる (ラッチしない)。
+fn hc_mixed_f32_fn(ctx: &CudaCtx) -> Option<CUfunction> {
+    struct HcMixedFn(CUfunction);
+    unsafe impl Send for HcMixedFn {}
+    unsafe impl Sync for HcMixedFn {}
+    static FN: OnceLock<Option<HcMixedFn>> = OnceLock::new();
+    FN.get_or_init(|| {
+        let lib = lib().ok()?;
+        let mut f: CUfunction = std::ptr::null_mut();
+        let r = unsafe {
+            (lib.module_get_function)(
+                &mut f,
+                ctx.module_elem,
+                b"dno_hc_mixed_f32\0".as_ptr() as *const c_char,
+            )
+        };
+        if r != 0 {
+            None
+        } else {
+            Some(HcMixedFn(f))
+        }
+    })
+    .as_ref()
+    .map(|h| h.0)
+}
+
+/// task 150: hc mix の **down → lo_apply → up → hc_mixed** を 1 回の同期に畳む。
+///
+/// task 138 の [`maybe_gpu_mix_bf16_chain_into`] は up までを GPU で閉じ、`hc_mixed`
+/// (ストリームごとの sigmoid と加算) はホストで計算していた。ここでは `hc_mixed` も
+/// device の `dno_hc_mixed_f32` で閉じ、ホストへ返すのは `mixed[e]` だけにする
+/// (従来は `gate[hc*e]` を返してホストで計算 = D2H も 4 倍)。
+///
+/// 丸めは CPU の `hyper::hc_mixed_into_par` と同一 (dno_expf + `__f*_rn`・要素独立)
+/// なので値はビット一致する。戻り値 `false` = 従来経路を使うこと (GPU 無効・PTX
+/// 未収録・形状不一致・確保失敗・実行エラー)。
+///
+/// `x` は `[k1]` (= `[hc][e]`)、`out` は `[e]`。
+#[allow(clippy::too_many_arguments)]
+pub fn maybe_gpu_mix_bf16_chain2_into(
+    down_uid: u64,
+    down_bytes: &[u8],
+    k1: usize,
+    n1: usize,
+    up_uid: u64,
+    up_bytes: &[u8],
+    k2: usize,
+    n2: usize,
+    inv_hc: f32,
+    e: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> bool {
+    use std::sync::atomic::Ordering as AO;
+    if !cuda_enabled() || MIX_GPU_BROKEN.load(AO::Relaxed) {
+        return false;
+    }
+    if k1 == 0
+        || n1 == 0
+        || n2 == 0
+        || e == 0
+        || k2 != n1
+        || n2 % e != 0
+        || n2 / e > 64
+        || x.len() != k1
+        || out.len() != e
+        || n2 != k1
+        || k1 < n1
+        || down_bytes.len() != k1.saturating_mul(n1).saturating_mul(2)
+        || up_bytes.len() != n1.saturating_mul(n2).saturating_mul(2)
+        || k1 > i32::MAX as usize
+        || n1 > i32::MAX as usize
+        || n2 > i32::MAX as usize
+        || e > i32::MAX as usize
+    {
+        return false;
+    }
+    let hc = n2 / e;
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if let Err(e) = ctx.make_current() {
+        mix_gpu_broken_once(&format!("cuCtxSetCurrent: {e:#}"));
+        return false;
+    }
+    let Some(f_mixed) = hc_mixed_f32_fn(ctx) else {
+        return false;
+    };
+    // task 152: BF16 カーネルがあれば重みは BF16 のまま (常駐が半分)。
+    let want_bf16 = mix_bf16_enabled() && matvec_bf16_r_silu_fn(ctx).is_some();
+    let f_down = if want_bf16 {
+        matvec_bf16_r_silu_fn(ctx)
+    } else {
+        matvec_f32_r_silu_fn(ctx)
+    };
+    let Some(f_down) = f_down else {
+        return false;
+    };
+    let up_reduce = mix_up_reduce_enabled();
+    let f_up = if up_reduce {
+        if want_bf16 {
+            matvec_bf16_r_fn(ctx)
+        } else {
+            matvec_f32_r_fn(ctx)
+        }
+    } else if want_bf16 {
+        matvec_bf16_fn(ctx)
+    } else {
+        matvec_f32_fn(ctx)
+    };
+    let Some(f_up) = f_up else {
+        return false;
+    };
+    let up_thr: u32 = if up_reduce { 256 } else { 1 };
+    let wp1 = match mix_gpu_weight(down_uid, down_bytes, k1, n1, want_bf16) {
+        Ok(w) => w.ptr,
+        Err(e) => {
+            mix_gpu_broken_once(&format!("down 重みの常駐に失敗: {e:#}"));
+            return false;
+        }
+    };
+    let wp2 = match mix_gpu_weight(up_uid, up_bytes, n1, n2, want_bf16) {
+        Ok(w) => w.ptr,
+        Err(e) => {
+            mix_gpu_broken_once(&format!("up 重みの常駐に失敗: {e:#}"));
+            return false;
+        }
+    };
+    let lib = match lib() {
+        Ok(l) => l,
+        Err(e) => {
+            mix_gpu_broken_once(&format!("CUDA lib load failed: {e:#}"));
+            return false;
+        }
+    };
+    const MIXED_THREADS: usize = 256;
+    let r = MIX_GPU_SC.with(|cell| -> Result<()> {
+        let mut s = cell.borrow_mut();
+        let MixGpuScratch {
+            x: dx,
+            lo: dlo,
+            out: dout,
+            mixed: dm,
+            hx,
+            ho,
+        } = &mut *s;
+        Scratch::ensure(dx, k1 * 4)?;
+        Scratch::ensure(dlo, n1 * 4)?;
+        Scratch::ensure(dout, n2 * 4)?;
+        Scratch::ensure(dm, e * 4)?;
+        Scratch::ensure_pin(hx, k1 * 4)?;
+        Scratch::ensure_pin(ho, e * 4)?;
+        let (dx, dlo, dout, dm) = (
+            dx.as_ref().unwrap(),
+            dlo.as_ref().unwrap(),
+            dout.as_ref().unwrap(),
+            dm.as_ref().unwrap(),
+        );
+        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        hx.as_mut_slice::<f32>()[..k1].copy_from_slice(x);
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(
+                    dx.ptr(),
+                    hx.ptr as *const c_void,
+                    k1 * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyHtoDAsync (mix chain2)",
+            )?;
+            // down + lo_apply (silu 込み) → lo はデバイスに残る。
+            let (mut ph, mut pw, mut po) = (dx.ptr(), wp1, dlo.ptr());
+            let (mut kc, mut nc) = (k1 as c_int, n1 as c_int);
+            let mut invc = inv_hc;
+            let mut args = [
+                &mut ph as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+                &mut invc as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(f_down, (n1 as u32, 1, 1), (256, 1, 1), 0, &mut args)?;
+            // up: 入力は lo_apply 済みの lo (同じ既定ストリームなので順序保証)。
+            let (mut ph2, mut pw2, mut po2) = (dlo.ptr(), wp2, dout.ptr());
+            let (mut kc2, mut nc2) = (n1 as c_int, n2 as c_int);
+            let mut args2 = [
+                &mut ph2 as *mut _ as *mut c_void,
+                &mut pw2 as *mut _ as *mut c_void,
+                &mut po2 as *mut _ as *mut c_void,
+                &mut kc2 as *mut _ as *mut c_void,
+                &mut nc2 as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(f_up, (n2 as u32, 1, 1), (up_thr, 1, 1), 0, &mut args2)?;
+            // hc_mixed: xn (= dx) と gate (= dout) から mixed を作る。
+            let (mut px, mut pg, mut pm) = (dx.ptr(), dout.ptr(), dm.ptr());
+            let (mut ec, mut hcc) = (e as c_int, hc as c_int);
+            let mut invc2 = inv_hc;
+            let mut args3 = [
+                &mut px as *mut _ as *mut c_void,
+                &mut pg as *mut _ as *mut c_void,
+                &mut pm as *mut _ as *mut c_void,
+                &mut ec as *mut _ as *mut c_void,
+                &mut hcc as *mut _ as *mut c_void,
+                &mut invc2 as *mut _ as *mut c_void,
+            ];
+            let grid = (e.div_ceil(MIXED_THREADS).max(1) as u32, 1, 1);
+            ctx.launch_async(
+                f_mixed,
+                grid,
+                (MIXED_THREADS as u32, 1, 1),
+                0,
+                &mut args3,
+            )?;
+            check(
+                (lib.memcpy_dtoh_async)(ho.ptr, dm.ptr(), e * 4, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync (mix chain2)",
+            )?;
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        }
+        ctx.sync()?;
+        out.copy_from_slice(&ho.as_slice::<f32>()[..e]);
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            set_last_linear_ran_on_gpu(true);
+            true
+        }
+        Err(e) => {
+            mix_gpu_broken_once(&format!("hc mix chain2 failed: {e:#}"));
             false
         }
     }
@@ -16861,6 +17579,36 @@ mod q4_attn_tests {
 mod tests {
     use super::*;
     use crate::tensor;
+
+    /// task 152: `DENNO_MIX_BF16` の真理値表。既定は off (lab の採否で決める)。
+    #[test]
+    fn mix_bf16_gate_truth_table() {
+        assert!(!mix_bf16_from_value(None, false), "既定 off");
+        assert!(mix_bf16_from_value(None, true), "既定 on を渡せば on");
+        for v in [Some("1"), Some("on"), Some(" TRUE "), Some("yes")] {
+            assert!(mix_bf16_from_value(v, false), "value={v:?} は on のはず");
+        }
+        for v in [Some("0"), Some("off"), Some("false"), Some("no")] {
+            assert!(!mix_bf16_from_value(v, true), "value={v:?} は off のはず");
+        }
+        assert!(!MIX_BF16_DEFAULT, "現時点の既定は off (採否は REPORT_P152)");
+    }
+
+    /// task 152: cuMemGetInfo のキャッシュ判定 (64 MiB の増減 / 2 秒)。
+    #[test]
+    fn mem_cache_refresh_rule() {
+        assert!(!mem_cache_should_refresh(0, 0), "変化なし・直後は引き直さない");
+        assert!(!mem_cache_should_refresh(
+            (MEM_CACHE_DRIFT_MB << 20) - 1,
+            MEM_CACHE_MAX_MS - 1
+        ));
+        assert!(mem_cache_should_refresh(MEM_CACHE_DRIFT_MB << 20, 0), "64 MiB 動いた");
+        assert!(mem_cache_should_refresh(0, MEM_CACHE_MAX_MS), "2 秒経った");
+        assert!(
+            mem_cache_should_refresh((MEM_CACHE_DRIFT_MB << 20) + 1, 0),
+            "64 MiB 超"
+        );
+    }
 
     /// task 138: `DENNO_MIX_UP_REDUCE` は既定 on。明示的な偽値だけ逐次版へ戻す。
     #[test]

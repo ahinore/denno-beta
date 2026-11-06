@@ -1594,8 +1594,15 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     let expert_bytes;
     {
         let p = Qwen4ExpParams::from_meta(&f).context("メタデータを読めない")?;
-        let budget = denno_engine::gpu_budget::flash_budget_from_gguf(&f, &p, cfg.max_ctx);
-        eprintln!("{}", denno_engine::gpu_budget::budget_line(&budget));
+        // task 152: **全パート**を数える。t149c の `[flash] vram budget` は 2 分割の
+        // part-1 しか数えておらず、実際に VRAM へ上がった dense 重みの 13% だった。
+        match denno_engine::gpu_budget::flash_budget_from_parts(&parts, &p, cfg.max_ctx) {
+            Ok(b) => eprintln!(
+                "{}",
+                denno_engine::gpu_budget::budget_line_with_parts(&b, parts.len())
+            ),
+            Err(e) => eprintln!("[flash] vram budget: 全パートを数えられない: {e:#}"),
+        }
         n_layer = p.n_layer;
         n_expert = p.n_expert;
         // task 146: 使用回数ファイルのモデル同一性 (全層の expert 3 行列の合計バイト)。

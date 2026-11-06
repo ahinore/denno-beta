@@ -746,7 +746,9 @@ pub fn effective_expert_cap(env_cap: usize) -> usize {
     if !crate::mem_audit::card_budget_on() {
         return env_cap;
     }
-    let Some((free_mb, _total_mb)) = crate::cuda::dev_mem_mb() else {
+    // task 152: キャッシュ版 (64 MiB の増減 / 2 秒で引き直す)。expert 1 本ごとに
+    // cuMemGetInfo を呼ばない。
+    let Some((free_mb, _total_mb)) = crate::cuda::dev_mem_mb_cached() else {
         return env_cap;
     };
     // task 149: 台帳の合計ではなく**いまの空き**から引く。CUDA context / JIT の
@@ -1038,15 +1040,32 @@ mod gpu {
         }
     }
 
-    /// expert 1 本ぶん (gate / up / down の 3 行列) のデバイスバッファ。
+    /// expert 1 本ぶん (gate / up / down の 3 行列) の置き場所。
+    ///
+    /// task 152: slab 経路では 1 本の大きな確保 (チャンク) から切り出した
+    /// **スロット**に入る。スロットを drop しても `cuMemFree` は呼ばず、空きリストへ
+    /// 返すだけ (断片化が戻らない)。
+    pub enum ExpertBufs {
+        /// 従来の per-expert 確保 (3 本)。
+        Direct([DevBuffer; 3]),
+        /// slab のスロット。`offs` はスロット先頭からの 3 行列のオフセット。
+        Slab {
+            slot: crate::model::expert_slab::SlabSlot<DevBuffer>,
+            offs: [usize; 3],
+        },
+    }
+
+    /// expert 1 本ぶん (gate / up / down の 3 行列) のデバイス上の実体。
     pub struct ExpertDev {
-        bufs: [DevBuffer; 3],
+        bufs: ExpertBufs,
         shapes: [ExpertShape; 3],
+        /// 3 行列の合計バイト数 (LRU の会計に使う)。
+        bytes: usize,
     }
 
     impl ExpertDev {
         pub fn bytes(&self) -> usize {
-            self.bufs.iter().map(|b| b.bytes()).sum()
+            self.bytes
         }
 
         pub fn shapes(&self) -> [ExpertShape; 3] {
@@ -1055,10 +1074,27 @@ mod gpu {
 
         /// 行列 `m` の重みのデバイスアドレス (P43: 層一括 GEMV のポインタ表に載せる)。
         ///
-        /// 1 本の `DevBuffer` の先頭そのもの。呼び出し側は**計算が終わるまで
-        /// `Arc<ExpertDev>` を保持する**こと (保持している間は追い出されても実体が残る)。
+        /// 呼び出し側は**計算が終わるまで `Arc<ExpertDev>` を保持する**こと
+        /// (保持している間は追い出されても実体が残る)。
         pub fn ptr(&self, m: ExpertMatrix) -> u64 {
-            self.bufs[m.index()].ptr()
+            let i = m.index();
+            match &self.bufs {
+                ExpertBufs::Direct(b) => b[i].ptr(),
+                ExpertBufs::Slab { slot, offs } => {
+                    slot.handle().ptr() + (slot.offset() + offs[i]) as u64
+                }
+            }
+        }
+
+        /// 行列 `m` の非所有ビュー (カーネルへ渡す `&DevBuffer`)。
+        fn view(&self, m: ExpertMatrix) -> Result<DevBuffer> {
+            let i = m.index();
+            Ok(match &self.bufs {
+                ExpertBufs::Direct(b) => b[i].alias(),
+                ExpertBufs::Slab { slot, offs } => {
+                    slot.handle().view_at(slot.offset() + offs[i], self.shapes[i].bytes()?)
+                }
+            })
         }
 
         /// 行列 `m` の GEMV。`x` は行列の入力長、`out` は出力長でなければならない
@@ -1070,7 +1106,8 @@ mod gpu {
         pub fn gemv(&self, m: ExpertMatrix, x: &[f32], out: &mut [f32]) -> Result<()> {
             let i = m.index();
             let s = self.shapes[i];
-            if !crate::cuda::CudaCtx::moe_gemv_dev_buf(s.ty, &self.bufs[i], x, s.k, s.n, out)? {
+            let view = self.view(m)?;
+            if !crate::cuda::CudaCtx::moe_gemv_dev_buf(s.ty, &view, x, s.k, s.n, out)? {
                 bail!(
                     "expert GEMV: moe_gemv_dev が false を返した (matrix={}, ty={:?}, k={}, n={})",
                     m.name(),
@@ -1090,6 +1127,8 @@ mod gpu {
     static FALLBACKS: AtomicU64 = AtomicU64::new(0);
     /// 1 本が上限より大きいことを 1 回だけ言うためのラッチ
     static OVERSIZE_LOGGED: AtomicBool = AtomicBool::new(false);
+    /// task 152: slab のチャンク確保に失敗したことを 1 回だけ言うためのラッチ
+    static SLAB_FAIL_LOGGED: AtomicBool = AtomicBool::new(false);
     /// 確保失敗で VRAM 経路を諦めた (プロセス寿命)
     static ALLOC_DEAD: AtomicBool = AtomicBool::new(false);
     /// task 149: 連続で確保に失敗した回数。`ALLOC_FAIL_LATCH` 回で初めて
@@ -1383,14 +1422,17 @@ mod gpu {
         // `kernels_exp_iq.ptx` があれば載せてよい (`DENNO_EXPERT_IQ_GPU=1` のときだけ
         // `moe_gemv_iq_ready` が真になる)。ゲートが off なら従来どおり false。
         let mut want = 0usize;
-        for s in shapes {
+        // task 152: 3 行列のバイト数 (slab のスロット配分に使う)。
+        let mut mbytes = [0usize; 3];
+        for (i, s) in shapes.iter().enumerate() {
             if !crate::cuda::CudaCtx::moe_gemv_dev_ready(s.ty, s.k)
                 && !crate::cuda::moe_gemv_iq_ready(s.ty, s.k)
             {
                 FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 return Ok(None);
             }
-            want = want.saturating_add(s.bytes()?);
+            mbytes[i] = s.bytes()?;
+            want = want.saturating_add(mbytes[i]);
         }
 
         // 追い出してから確保する (cuMemAlloc の失敗を通常経路にしない)。
@@ -1421,11 +1463,51 @@ mod gpu {
         // 次のトークンでまた試す。連続で失敗し続けたときだけ、ログを 1 行出して
         // 諦める (無限に 2 MB の確保を試し続けないため)。
         let mut last_err: Option<anyhow::Error> = None;
-        let mut bufs: Option<[DevBuffer; 3]> = None;
+        let mut bufs: Option<ExpertBufs> = None;
+        // task 152: slab のスロットを 1 本だけ用意して使い回す (再試行でも同じ場所)。
+        // チャンクの確保に失敗したら per-expert 確保へ落ちる (このトークンだけ遅い)。
+        let (slot_bytes, offs) = if crate::model::expert_slab::slab_enabled() {
+            let (offs, slot_bytes) =
+                crate::model::expert_slab::slot_layout([mbytes[0], mbytes[1], mbytes[2]]);
+            (slot_bytes, offs)
+        } else {
+            (0, [0usize; 3])
+        };
+        let mut slot: Option<crate::model::expert_slab::SlabSlot<DevBuffer>> = None;
+        let mut slab_failed = !crate::model::expert_slab::slab_enabled();
         for attempt in 0..2 {
-            match alloc_three(pinned, gb, ub, db) {
-                Ok(b) => {
-                    bufs = Some(b);
+            if !slab_failed && slot.is_none() {
+                match crate::model::expert_slab::alloc_slot(slot_bytes) {
+                    Ok(s) => slot = Some(s),
+                    Err(e) => {
+                        slab_failed = true;
+                        if !SLAB_FAIL_LOGGED.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(
+                                "task152: slab のチャンクを確保できないので per-expert 確保へ: {e:#}"
+                            );
+                        }
+                    }
+                }
+            }
+            let mut direct: Option<[DevBuffer; 3]> = None;
+            let r: Result<()> = match slot.as_ref() {
+                Some(s) => {
+                    let base = s.offset();
+                    let h = s.handle();
+                    h.upload_pinned_at(base + offs[0], gb)
+                        .and_then(|_| h.upload_pinned_at(base + offs[1], ub))
+                        .and_then(|_| h.upload_pinned_at(base + offs[2], db))
+                }
+                None => alloc_three(pinned, gb, ub, db).map(|b| direct = Some(b)),
+            };
+            match r {
+                Ok(()) => {
+                    bufs = Some(match slot.take() {
+                        Some(s) => ExpertBufs::Slab { slot: s, offs },
+                        None => ExpertBufs::Direct(
+                            direct.take().expect("alloc_three が成功した"),
+                        ),
+                    });
                     break;
                 }
                 Err(e) => {
@@ -1447,7 +1529,7 @@ mod gpu {
                 }
             }
         }
-        let Some([gate, up, down]) = bufs else {
+        let Some(bufs) = bufs else {
             FALLBACKS.fetch_add(1, Ordering::Relaxed);
             let n = ALLOC_FAIL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
             let msg = last_err
@@ -1471,8 +1553,9 @@ mod gpu {
         }
 
         let dev = Arc::new(ExpertDev {
-            bufs: [gate, up, down],
+            bufs,
             shapes,
+            bytes: want,
         });
         g.insert(key, want, Arc::clone(&dev));
         Ok(Some(Acquired { dev, hit: false }))
