@@ -10266,10 +10266,12 @@ pub fn maybe_gpu_mix_bf16_batch_into(
 }
 
 
-/// task 152: BF16 のまま読む mix カーネルの既定値。
+/// task 152: BF16 のまま読む mix カーネルの既定値 (**on**)。
 ///
-/// lab の採否で決める (`REPORT_P152.md`)。off でも `DENNO_MIX_BF16=1` で試せる。
-const MIX_BF16_DEFAULT: bool = false;
+/// lab t152b の g22 条件で採否 OK (`REPORT_P152.md`)。`w:mix_f32` 2,425 MiB ->
+/// `w:mix_bf16` 1,213 MiB、md5 は全条件 SAME (f32 版と同じ演算列)。
+/// `DENNO_MIX_BF16=0` で従来の f32 展開経路に戻せる。
+const MIX_BF16_DEFAULT: bool = true;
 
 /// `MIX_GPU_W` の登録・形状検査・初回の同期 H2D を 1 箇所にまとめたもの
 /// ([`maybe_gpu_mix_bf16_into`] と同じ規約)。uid は `GgufLinear` のもの。
@@ -17591,7 +17593,7 @@ mod tests {
         for v in [Some("0"), Some("off"), Some("false"), Some("no")] {
             assert!(!mix_bf16_from_value(v, true), "value={v:?} は off のはず");
         }
-        assert!(!MIX_BF16_DEFAULT, "現時点の既定は off (採否は REPORT_P152)");
+        assert!(MIX_BF16_DEFAULT, "lab t152b で採用 → 既定 on");
     }
 
     /// task 152: cuMemGetInfo のキャッシュ判定 (64 MiB の増減 / 2 秒)。

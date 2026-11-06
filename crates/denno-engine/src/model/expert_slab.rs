@@ -59,8 +59,10 @@ pub fn slab_enabled() -> bool {
     *ON.get_or_init(|| slab_from_value(std::env::var(SLAB_ENV).ok().as_deref(), SLAB_DEFAULT))
 }
 
-/// 既定値。lab t152a/t152b の結果で決める (`REPORT_P152.md`)。
-pub const SLAB_DEFAULT: bool = false;
+/// 既定値 (**on**)。lab t152b (e24d69021) の g22 条件で採否 OK:
+/// 22,000 MiB で 3,954 / 14,139 token の decode が -5.8% / -5.7%、prefill は
+/// 長文で -0.2〜-1.3%、md5 SAME、errors 0 (`REPORT_P152.md`)。
+pub const SLAB_DEFAULT: bool = true;
 
 /// [`SLAB_CHUNK_MB_ENV`] を MiB で読む (0・不正値は既定)。
 pub fn chunk_mb_from_value(v: Option<&str>) -> usize {
