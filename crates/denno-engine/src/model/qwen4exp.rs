@@ -2638,15 +2638,23 @@ impl Qwen4Exp {
         }
         hook("attn_out", il, &cur)?;
         // P54: 層の種別で attn (full attention) と gdn (ssm) のどちらに入れるかが決まる。
-        if let Some(r) = roles.as_deref_mut() {
-            let v = rms_of(&cur);
-            if matches!(self.p.layer_kind(il), Ok(LayerKind::FullAttn)) {
-                r.attn = v;
-            } else {
-                r.gdn = v;
+        // task 153: 台帳の区間 (roles)。2560 要素の RMS と役割の詰め直し。
+        if roles.is_some() {
+            let _l = q4ledger::enter(q4ledger::ROLES);
+            if let Some(r) = roles.as_deref_mut() {
+                let v = rms_of(&cur);
+                if matches!(self.p.layer_kind(il), Ok(LayerKind::FullAttn)) {
+                    r.attn = v;
+                } else {
+                    r.gdn = v;
+                }
             }
         }
-        *res = hyper::hc_combine(res, &cur, &inject, hp);
+        {
+            // task 153: 台帳の区間 (combine)。hyper connection の足し込み。
+            let _l = q4ledger::enter(q4ledger::COMBINE);
+            *res = hyper::hc_combine(res, &cur, &inject, hp);
+        }
         hook("res_after_attn", il, &res.data)?;
 
         // 3.5-3.7 ffn 入口 → MoE FFN → 出口
@@ -2676,13 +2684,21 @@ impl Qwen4Exp {
         )?;
         q4prof::add(&q4prof::MOE, t_moe);
         hook("ffn_out", il, &cur)?;
-        *res = hyper::hc_combine(res, &cur, &inject, hp);
+        {
+            // task 153: 台帳の区間 (combine)。
+            let _l = q4ledger::enter(q4ledger::COMBINE);
+            *res = hyper::hc_combine(res, &cur, &inject, hp);
+        }
         // P58: 層の役割別活性 (kind 13)。`emit_router` は「このトークンが forward
         // 呼び出しの末尾か」の意味も持つ (decode は常に真、逐次 prefill は末尾の
         // 1 トークンだけ)。読むだけなので数値経路には触れない。
         if emit_router {
-            if let Some(r) = roles.as_deref() {
-                emit_role_act(il, r);
+            if roles.as_deref().is_some() {
+                // task 153: 台帳の区間 (roles)。RoleAct フレームの組み立てと送出。
+                let _l = q4ledger::enter(q4ledger::ROLES);
+                if let Some(r) = roles.as_deref() {
+                    emit_role_act(il, r);
+                }
             }
         }
         Ok(())

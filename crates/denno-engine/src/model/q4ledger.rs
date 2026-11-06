@@ -75,16 +75,22 @@ pub const DETOK: usize = 12;
 pub const TELEM: usize = 13;
 /// task 153: engine の 1 ステップ全体 (`forward_token_at` + 構造テレメトリ)。
 ///
-/// 層の中の名前付き区間に入らなかった時間 (hc_combine / hooks / arch など) は
+/// 層の中の名前付き区間に入らなかった時間 (hooks / arch など) は
 /// この行の残差として出る。台帳の名前は `step`。
 pub const STEP: usize = 14;
+/// task 153: 層の出口の `hc_combine` (hyper connection の足し込み)。
+///
+/// 1 層 2 回 (attn の後 / ffn の後)。40 KB の確保と 10240 要素の写しがある。
+pub const COMBINE: usize = 15;
+/// task 153: 層ごとの役割 RMS と構造テレメトリ (`emit_role_act`)。
+pub const ROLES: usize = 16;
 /// 区間の数。
-pub const N: usize = 15;
+pub const N: usize = 17;
 /// 区間の名前 ([`MIX`] の順)。`experts` (選択 expert の寄与全体) と
 /// `exp_iq` (task 144 の IQ 層一括 GEMV、decode では `experts` の内側) は別の行。
 pub const NAMES: [&str; N] = [
     "mix", "router", "shared", "full", "ssm", "experts", "other", "exp_iq", "head", "tap",
-    "sample", "topk", "detok", "telem", "step",
+    "sample", "topk", "detok", "telem", "step", "combine", "roles",
 ];
 
 fn on() -> bool {
