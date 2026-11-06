@@ -743,6 +743,10 @@ pub fn lazy_enabled() -> bool {
 /// task 155: 読む相手が 1 つ以上いるか。
 ///
 /// `DENNO_TELEM_LAZY=0` のときは常に `true` (= 従来どおり作る)。
+///
+/// 実測 (GPU ラボ t155a、14,139、plain): 購読者 0 人で topk 1.00 → 0、
+/// arch 0.46 → 0、tap 0.44 → 0、roles 0.16 → 0 ms/tok (**-2.06 ms/tok**)。
+/// ビューワが繋がっている間の出力は従来と同一。
 pub fn has_clients() -> bool {
     CLIENTS.load(Ordering::Relaxed) > 0 || !lazy_enabled()
 }

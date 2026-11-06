@@ -6927,6 +6927,10 @@ fn set_shared_tail_for_test(v: Option<bool>) {
 /// その完了を待つ間に `gate_inp_shexp` (1 行) を null ストリームで回す。
 /// 積めなかったとき (型が未対応 / GPU 不発 / 予算外) は `finish` が `false` を
 /// 返すので、呼び出し側は従来どおり同期の `gemv_label` に落ちること。
+///
+/// 実測 (GPU ラボ t155a、14,139、plain): shared 2.55 → 2.32 ms/tok (-0.23)、
+/// null ストリームの sync 1.12 → 0。**md5 は SAME** (選ばれた GEMV カーネルは
+/// CPU の逐次加算と同じ値だった)。
 struct SharedDownOverlap {
     #[cfg(feature = "cuda")]
     pending: crate::cuda::SharedPending,

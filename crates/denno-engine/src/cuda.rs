@@ -5028,6 +5028,12 @@ const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
 /// null ストリームに打ったイベントだけを待つ。発行済みのカーネル・引数・順序は
 /// 1 つも変えない (変わるのは待つ範囲だけ)。
 ///
+/// 実測 (GPU ラボ t155a、swift15-abl IQ3_S、14T、plain = TLINE なし、全ゲート on と
+/// off の A/B): decode 46 → 42 ms/tok (短い) / 44 → 38 (3,954) / 47 → 41 (14,139)、
+/// prefill +1.1%、md5 は 6 本とも SAME、errors 0。14,139 の台帳は
+/// router 4.09 → 1.61 ms/tok (48 層で 52 us/層の同期固定費が消えた)、
+/// experts 10.37 → 10.18。**この待ちはモデルの値を 1 ビットも変えない。**
+///
 /// 戻り値 `false` = イベントが使えない。呼び出し側は従来どおり `ctx.sync()` に
 /// 落ちること (待たずに進んではいけない)。
 pub fn sync_default_stream() -> bool {
