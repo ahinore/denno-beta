@@ -263,8 +263,19 @@ pub fn enter(item: usize) -> Scope {
         prev,
         item,
         t: Some(Instant::now()),
-        ev: tline_ev_begin(),
+        ev: tline_row(item).then(tline_ev_begin).flatten(),
     }
+}
+
+/// task 155: その行が時系列のイベントを打つか。
+///
+/// task 155 で足した診断行 (`hooks` / `qprof` / `arch` / `loop`) は GPU 仕事を
+/// 持たないので**イベントを打たない**。イベントのプール (60 万本) は 128 トークンの
+/// 窓で 7 割方埋まっており (t153c で ~35 万)、診断行の span (実測 ~290/tok) を足すと
+/// 窓の途中で記録が止まって以後の `[q4tline]` が出なくなる (t155b で実際に起きた)。
+#[inline]
+fn tline_row(item: usize) -> bool {
+    item < HOOKS
 }
 
 /// 区間の入口イベント (時系列 off / cuda 無しでは `None`)。

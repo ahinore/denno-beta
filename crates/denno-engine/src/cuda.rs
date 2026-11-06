@@ -251,8 +251,11 @@ pub(crate) mod tline {
     use super::*;
     use std::cell::RefCell;
 
-    /// プールの上限 (128 トークン x 約 2,400 本 = 約 31 万本を収める)。
-    const MAX_EVENTS: usize = 400_000;
+    /// プールの上限 (128 トークンの窓 x 約 3,000 本 = 約 38 万本を収める)。
+    ///
+    /// task 155: 400_000 だと診断行を足したときに窓の途中で尽きて以後の記録が
+    /// 止まる (t155b で発生)。60 万本まで許す。
+    const MAX_EVENTS: usize = 600_000;
 
     struct Pool {
         /// 計時イベント (grow-only)。
