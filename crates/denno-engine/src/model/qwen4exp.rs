@@ -2454,7 +2454,11 @@ impl Qwen4Exp {
         let mut logits = vec![0.0f32; self.head.output.n()];
         let t_head = prekprof::stamp_when(prof);
         let d_head = q4prof::dstamp();
-        self.head_logits_into(&cur, &mut logits)?;
+        {
+            // task 153: 台帳の区間 (head)。最終 head GEMV と logits の D2H。
+            let _l = q4ledger::enter(q4ledger::HEAD);
+            self.head_logits_into(&cur, &mut logits)?;
+        }
         prekprof::mark(t_head, prekprof::HEAD);
         q4prof::dmark(q4prof::D_HEAD, d_head);
         Ok(logits)
@@ -6130,6 +6134,62 @@ fn expert_flat_decode_from_value(v: Option<&str>) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 153: VRAM ミス expert の寄与を行まで平坦化して並列化する
+// ---------------------------------------------------------------------------
+//
+// IQ の層一括 GEMV (task 144) が on のとき、VRAM に載っていない expert だけを
+// CPU で計算する。ヒット率が高い (実測 0.95〜0.99) のでミスは 1 層あたり 0〜3 本に
+// なり、`expert_contribs_par_into` (1 expert = 1 rayon タスク) では**1 スレッド
+// しか働かない**。実測 (lab t152c def23): experts の cpu が 14k で 5.6 ms/token、
+// 3.9k で 8.9 ms/token (台帳の最大のホスト項)。
+//
+// ここではミス集合を行チャンクまで割って 1 本のタスク列にする
+// ([`expert_contribs_flat_decode_into`] の再利用)。1 行の計算は
+// `gemv_rows_seq` = `gemv_seq` と同じカーネル・同じ順なので**ビット一致**する。
+
+/// task 153: ミス expert の寄与を行並列にするか (`DENNO_EXP_MISS_FLAT`)。
+///
+/// **既定 on** (`0` / `off` / `false` / `no` で従来の expert 単位の並列へ戻る)。
+fn expert_miss_flat_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("0") | Some("off") | Some("false") | Some("no") => false,
+        _ => true,
+    }
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+static EXPERT_MISS_FLAT_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// task 153: [`expert_miss_flat_from_value`] のゲート (プロセスで 1 回だけ env を読む)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn expert_miss_flat_enabled() -> bool {
+    match EXPERT_MISS_FLAT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        expert_miss_flat_from_value(std::env::var("DENNO_EXP_MISS_FLAT").ok().as_deref())
+    })
+}
+
+/// テスト専用: ミス平坦化の on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_expert_miss_flat_for_test(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    EXPERT_MISS_FLAT_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// task 67: 選択 expert の mmap 先読み (`MADV_WILLNEED`) の on/off
 /// (`DENNO_EXPERT_PREFETCH`)。**既定 off** (task 67 の実測で on が遅かった)。
 ///
@@ -7574,6 +7634,15 @@ fn expert_miss_contribs_into(
     debug_assert_eq!(dst.len(), sel.len() * e, "dst は sel.len()*e");
     #[cfg(feature = "par")]
     {
+        // task 153: ミスは 1 層 0〜3 本なので expert 単位の並列では 1 スレッドしか
+        // 働かない。行まで平坦化して全スレッドへ配る (値は gemv_rows_seq =
+        // gemv_seq とビット一致)。`DENNO_EXP_MISS_FLAT=0` で従来経路へ戻る。
+        if expert_miss_flat_enabled() {
+            if sel.is_empty() {
+                return Ok(());
+            }
+            return expert_contribs_flat_decode_into(lw, sel, x, e, ff, dst, DECODE_FLAT_ROWS);
+        }
         expert_contribs_par_into(lw, sel, x, e, ff, None, dst)
     }
     #[cfg(not(feature = "par"))]
@@ -12586,6 +12655,49 @@ mod tests {
         assert!(expert_flat_decode_enabled(), "上書きを外したら既定 (on) に戻る");
     }
 
+    /// task 153: ミス expert の寄与を行まで平坦化しても、expert 並列と 1 ビットも
+    /// 変わらない (ミスは 1 層 0〜3 本なので、ここが実際に通る形で固定する)。
+    #[test]
+    #[cfg(all(feature = "par", feature = "cuda"))]
+    fn miss_flat_matches_expert_parallel() {
+        gpu_gemm_off();
+        let _g = moe_test_guard();
+        let dir = TempDir::new("p153miss");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+        // 1 本 (ヒット率が高いときの典型) と 2 本 (まとめてミスしたとき)。
+        for sel in [vec![2usize], vec![0usize, 3]] {
+            let mut a = vec![0.0f32; sel.len() * p.n_embd];
+            let mut b = vec![0.0f32; sel.len() * p.n_embd];
+            set_expert_miss_flat_for_test(Some(false));
+            expert_miss_contribs_into(&lw, &sel, &x, p.n_embd, p.n_ff_exp, &mut a)
+                .expect("expert 並列");
+            set_expert_miss_flat_for_test(Some(true));
+            expert_miss_contribs_into(&lw, &sel, &x, p.n_embd, p.n_ff_exp, &mut b)
+                .expect("行平坦化");
+            let ab: Vec<u32> = a.iter().map(|v| v.to_bits()).collect();
+            let bb: Vec<u32> = b.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(ab, bb, "sel={sel:?} で値が違う");
+            assert!(ab.iter().any(|&v| v != 0), "sel={sel:?}: 0 のまま (計算していない)");
+        }
+        set_expert_miss_flat_for_test(None);
+        assert!(expert_miss_flat_enabled(), "既定 (env 未設定) は on");
+    }
+
+    /// task 153: `DENNO_EXP_MISS_FLAT` の値解釈 (既定 on、明示的な偽値だけ off)。
+    #[test]
+    fn expert_miss_flat_env_values() {
+        for v in [None, Some("1"), Some("on"), Some("true"), Some(""), Some("yes")] {
+            assert!(expert_miss_flat_from_value(v), "{v:?} は on のはず");
+        }
+        for v in [Some("0"), Some("off"), Some("OFF"), Some("false"), Some("no"), Some(" 0 ")] {
+            assert!(!expert_miss_flat_from_value(v), "{v:?} は off のはず");
+        }
+    }
+
     /// P70: expert 横断の平坦化経路は、従来の expert 並列と**ビット一致**する
     /// (層 1 回ぶんを丸ごと比較 = ルータ・shared expert も同じ経路)。
     #[test]
@@ -17467,7 +17579,7 @@ mod tests {
                 );
             }
             // 行は 1 行のヘッダ + 列見出し + 積まれた item の数だけ出る。
-            let lines = q4ledger::line(1);
+            let lines = q4ledger::line(1, 0);
             assert!(lines.len() >= 3, "{lines:?}");
             assert!(
                 lines.iter().any(|l| l.contains(" router ")),
