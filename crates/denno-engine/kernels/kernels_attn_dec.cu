@@ -4,16 +4,20 @@
 //   full attention 12 層は 14,139 文脈で 1 層 631 us、実効 101 GB/s。カードは
 //   1.8 TB/s なので、K/V を 1 回だけ読む形にすれば 1 層 80-160 us が射程に入る。
 //   既存 `dno_attention_decode` (kernels_elem.cu) は 1 block = (split, q head) で
-//   GQA の 6 q head が同じ KV 行を 6 回読み、block も 4 warp しか無いので
-//   レイテンシ律速になっている。
+//   GQA の group 本の q head が同じ KV 行を group 回読み、block も 4 warp しか
+//   無いのでレイテンシ律速になっている。
 //
 // 設計:
 //   - grid = (n_split, n_kv)。1 block = (kv head, t の分割)。
 //   - block の 1 warp = その kv head を共有する q head 1 本 (blockDim = 32*group)。
 //     q はレジスタに 1 回だけ読み、online softmax の状態 (m, l, acc) も warp 内で
-//     閉じる = **block 内の同期が 0 回**。warp 同士は同じ行を L1 で共有する。
-//   - K/V の行は 16 バイト (float4) で読む。1 warp の 1 命令が dh 要素 (dh=128 なら
-//     ちょうど 512 バイト = 1 行) を覆う。
+//     閉じる = **block 内の同期が 0 回**。warp 同士は同じ行を L1 で共有する
+//     (DRAM からは 1 行 1 回)。
+//   - K/V の行は 16 バイト (float4) で読む。1 warp の 1 命令が 128 要素を覆う。
+//   - **2 段のソフトウェアパイプライン**: key j を計算している間に key j+1 の
+//     K と V を読む。実測 (lab t160a) では素直な実装だと 1 key = K の待ち +
+//     V の待ちの 2 回の DRAM レイテンシになり、14k で 258 us (212 GB/s) だった。
+//     K と V を同じ反復で出し、さらに 1 key 先を読むことで待ちを計算の裏へ隠す。
 //   - 分割は (t_total, n_split) だけで決まる固定分割、縮約は split 昇順なので
 //     **決定論** (原子操作なし)。CPU とのビット一致はしない (attention の緩和枠)。
 //   - 途中結果は part[(kv head, split, q head)] に [m, l, acc(dh)] で書く。
@@ -32,6 +36,63 @@
 #endif
 
 #define DNO_FD_LOG2E 1.4426950408889634f
+
+// key 1 本ぶんの K と V をまとめてレジスタへ読む (2 つの独立ロードを同時に出す)。
+#define DNO_FD_LOAD(JJ, KBUF, VBUF)                                              \
+    do {                                                                         \
+        const float *krow_ = kc + (size_t)(JJ) * kv_dim + kh_off;                \
+        const float *vrow_ = vc + (size_t)(JJ) * kv_dim + kh_off;                \
+        _Pragma("unroll") for (int b_ = 0; b_ < DNO_FD_MAXB; ++b_) {             \
+            const int i_ = b_ * 128 + lane * 4;                                  \
+            if (i_ < dh) {                                                       \
+                KBUF[b_] = *reinterpret_cast<const float4 *>(krow_ + i_);        \
+                VBUF[b_] = *reinterpret_cast<const float4 *>(vrow_ + i_);        \
+            }                                                                    \
+        }                                                                        \
+    } while (0)
+
+// 読み込み済みの K/V で 1 key ぶんの online softmax と acc 更新を行う。
+#define DNO_FD_KEY(KBUF, VBUF)                                                   \
+    do {                                                                         \
+        float s_ = 0.0f;                                                         \
+        _Pragma("unroll") for (int b_ = 0; b_ < DNO_FD_MAXB; ++b_) {              \
+            const int i_ = b_ * 128 + lane * 4;                                  \
+            if (i_ < dh) {                                                       \
+                s_ = fmaf(qv[b_].x, KBUF[b_].x, s_);                              \
+                s_ = fmaf(qv[b_].y, KBUF[b_].y, s_);                              \
+                s_ = fmaf(qv[b_].z, KBUF[b_].z, s_);                              \
+                s_ = fmaf(qv[b_].w, KBUF[b_].w, s_);                              \
+            }                                                                    \
+        }                                                                        \
+        /* lane 内和を xor 縮約 (全 lane がビット同一の値を受け取る) */            \
+        s_ += __shfl_xor_sync(0xffffffffu, s_, 16);                              \
+        s_ += __shfl_xor_sync(0xffffffffu, s_, 8);                               \
+        s_ += __shfl_xor_sync(0xffffffffu, s_, 4);                               \
+        s_ += __shfl_xor_sync(0xffffffffu, s_, 2);                               \
+        s_ += __shfl_xor_sync(0xffffffffu, s_, 1);                               \
+        const float sc_ = s_ * scale;                                            \
+        /* warp 内で一様な分岐 (sc も m_run も warp で同じ値) */                  \
+        float corr_;                                                             \
+        float p_;                                                                \
+        if (sc_ > m_run) {                                                       \
+            corr_ = exp2f((m_run - sc_) * DNO_FD_LOG2E);                         \
+            m_run = sc_;                                                         \
+            p_ = 1.0f; /* exp2f(0) と厳密に同じ */                               \
+        } else {                                                                 \
+            corr_ = 1.0f;                                                        \
+            p_ = exp2f((sc_ - m_run) * DNO_FD_LOG2E);                            \
+        }                                                                        \
+        l_run = l_run * corr_ + p_;                                               \
+        _Pragma("unroll") for (int b_ = 0; b_ < DNO_FD_MAXB; ++b_) {              \
+            const int i_ = b_ * 128 + lane * 4;                                  \
+            if (i_ < dh) {                                                       \
+                acc[b_].x = acc[b_].x * corr_ + p_ * VBUF[b_].x;                 \
+                acc[b_].y = acc[b_].y * corr_ + p_ * VBUF[b_].y;                 \
+                acc[b_].z = acc[b_].z * corr_ + p_ * VBUF[b_].z;                 \
+                acc[b_].w = acc[b_].w * corr_ + p_ * VBUF[b_].w;                 \
+            }                                                                    \
+        }                                                                        \
+    } while (0)
 
 // decode の 1 トークンぶん attention の部分和。
 //   q     [heads * dh]   (q head 順、rope 済み)
@@ -80,54 +141,24 @@ extern "C" __global__ void dno_attn_flashdec(
     float m_run = -3.402823466e+38f;
     float l_run = 0.0f;
 
-    for (int j = jlo; j < jhi; ++j) {
-        const float *krow = kc + (size_t)j * kv_dim + kh_off;
-        float s = 0.0f;
-#pragma unroll
-        for (int b = 0; b < DNO_FD_MAXB; ++b) {
-            const int i = b * 128 + lane * 4;
-            if (i < dh) {
-                const float4 kv = *reinterpret_cast<const float4 *>(krow + i);
-                s = fmaf(qv[b].x, kv.x, s);
-                s = fmaf(qv[b].y, kv.y, s);
-                s = fmaf(qv[b].z, kv.z, s);
-                s = fmaf(qv[b].w, kv.w, s);
-            }
-        }
-        // lane 内和を xor 縮約 (全 lane がビット同一の値を受け取る)
-        s += __shfl_xor_sync(0xffffffffu, s, 16);
-        s += __shfl_xor_sync(0xffffffffu, s, 8);
-        s += __shfl_xor_sync(0xffffffffu, s, 4);
-        s += __shfl_xor_sync(0xffffffffu, s, 2);
-        s += __shfl_xor_sync(0xffffffffu, s, 1);
-
-        const float sc = s * scale;
-        // warp 内で一様な分岐 (sc も m_run も warp で同じ値)
-        float corr;
-        float p;
-        if (sc > m_run) {
-            corr = exp2f((m_run - sc) * DNO_FD_LOG2E);
-            m_run = sc;
-            p = 1.0f;  // exp2f(0) と厳密に同じ
-        } else {
-            corr = 1.0f;
-            p = exp2f((sc - m_run) * DNO_FD_LOG2E);
-        }
-        l_run = l_run * corr + p;
-
-        const float *vrow = vc + (size_t)j * kv_dim + kh_off;
-#pragma unroll
-        for (int b = 0; b < DNO_FD_MAXB; ++b) {
-            const int i = b * 128 + lane * 4;
-            if (i < dh) {
-                const float4 vv = *reinterpret_cast<const float4 *>(vrow + i);
-                acc[b].x = acc[b].x * corr + p * vv.x;
-                acc[b].y = acc[b].y * corr + p * vv.y;
-                acc[b].z = acc[b].z * corr + p * vv.z;
-                acc[b].w = acc[b].w * corr + p * vv.w;
-            }
-        }
+    // 2 段パイプライン: j を A、j+1 を B に持ち、j の計算中に j+1 の K/V が飛ぶ。
+    float4 kA[DNO_FD_MAXB], vA[DNO_FD_MAXB];
+    float4 kB[DNO_FD_MAXB], vB[DNO_FD_MAXB];
+    int j = jlo;
+    if (j < jhi) DNO_FD_LOAD(j, kA, vA);
+    if (j + 1 < jhi) DNO_FD_LOAD(j + 1, kB, vB);
+    while (j < jhi) {
+        DNO_FD_KEY(kA, vA);
+        ++j;
+        if (j < jhi) DNO_FD_LOAD(j + 1, kA, vA);  // 次の次を A の枠へ (j は B を使う)
+        if (j >= jhi) break;
+        DNO_FD_KEY(kB, vB);
+        ++j;
+        if (j < jhi) DNO_FD_LOAD(j + 1, kB, vB);
     }
+    // 上のループは A が j, B が j+1 の順に使うので、j+1 を A の枠へ読むのは
+    // 「j+2 を A に入れる」と同義 (A は j で使い終わっている)。末尾の半端は
+    // ループの j < jhi 判定で落ちる。
 
     // 部分和 (acc は m_run を基準にした未正規化の和)。空 split は m = -FLT_MAX。
     float *pp = part + ((size_t)(kh * n_split + sp) * group + hh) * (size_t)(dh + 2);

@@ -6426,23 +6426,36 @@ fn attn_flashdec_kernel_matches_host() {
     );
 
     // ---- GQA: 同じ kv head の行を 1 回だけ読む (q はレジスタ) ----
+    // K/V のロードはマクロ (DNO_FD_LOAD) にあるので、カーネル本体ではなく
+    // ファイル全体で見る。
     for pat in [
         "reinterpret_cast<const float4 *>(qp + i)",
-        "reinterpret_cast<const float4 *>(krow + i)",
-        "reinterpret_cast<const float4 *>(vrow + i)",
+        "reinterpret_cast<const float4 *>(krow_ + i_)",
+        "reinterpret_cast<const float4 *>(vrow_ + i_)",
     ] {
-        assert!(dec.contains(pat), "16 バイトのベクトル読みが無い: {pat}");
+        assert!(ATTN_DEC_SRC.contains(pat), "16 バイトのベクトル読みが無い: {pat}");
     }
     // K/V の行頭は kv head のオフセット (kh * dh) から。q は warp の head。
     assert!(dec.contains("const int kh_off = kh * dh;"));
-    assert!(dec.contains("const float *krow = kc + (size_t)j * kv_dim + kh_off;"));
-    assert!(dec.contains("const float *vrow = vc + (size_t)j * kv_dim + kh_off;"));
+    assert!(ATTN_DEC_SRC.contains("const float *krow_ = kc + (size_t)(JJ) * kv_dim + kh_off;"));
+    assert!(ATTN_DEC_SRC.contains("const float *vrow_ = vc + (size_t)(JJ) * kv_dim + kh_off;"));
+    // 2 段のソフトウェアパイプライン (K と V を同じ反復で出し、1 key 先を読む)。
+    // これが無いと 1 key = K 待ち + V 待ちの 2 回の DRAM レイテンシになる
+    // (lab t160a: 258 us/layer = 212 GB/s)。
+    assert!(
+        dec.contains("if (j + 1 < jhi) DNO_FD_LOAD(j + 1, kB, vB);"),
+        "パイプラインの先行ロードが無い (レイテンシ律速に戻る)"
+    );
+    assert!(
+        dec.contains("if (j < jhi) DNO_FD_LOAD(j + 1, kA, vA);"),
+        "パイプラインの 2 本目の先行ロードが無い"
+    );
     // 1 key = 1 回のスコア (tile 無し)・warp 内で閉じた online softmax。
     assert!(
-        dec.contains("s += __shfl_xor_sync(0xffffffffu, s, 16);"),
+        ATTN_DEC_SRC.contains("s_ += __shfl_xor_sync(0xffffffffu, s_, 16);"),
         "xor 縮約が無い (全 lane が同じスコアを持つ前提が崩れる)"
     );
-    assert!(!dec.contains("__syncthreads"), "flashdec の block 内同期が増えた");
+    assert!(!ATTN_DEC_SRC.contains("__syncthreads"), "flashdec の block 内同期が増えた");
 
     // ---- 分割の式: カーネルとホストが同じ ----
     assert!(
@@ -6455,8 +6468,8 @@ fn attn_flashdec_kernel_matches_host() {
     );
     assert_eq!(
         rust_const("ATTN_FDEC_SPLIT_MAX"),
-        64,
-        "分割数の上限は 64 (combine は split 昇順のループ)"
+        256,
+        "分割数の上限 (block 数 = n_split x n_kv。小さいと SM を埋められない)"
     );
 
     // ---- build_ptx.sh: 対象と -fmad=false (既存 attention と同じ丸め) ----

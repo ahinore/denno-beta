@@ -13929,9 +13929,12 @@ const ATTN_FDEC_MAXB: usize = 4;
 /// part 1 エントリの float 数 = dh + 2 (先頭 2 つが m, l)。`.cu` と一致させる。
 const ATTN_FDEC_PART_EXTRA: usize = 2;
 /// 分割数の上限 (`.cu` の grid.x と combine のループ上限)。
-const ATTN_FDEC_SPLIT_MAX: usize = 64;
+/// lab t160a: n_kv = 2 のモデルでは 56 分割 = 112 block でしかなく SM 170 を
+/// 埋められなかった (14k で 258 us = 212 GB/s)。分割数は block 数そのものなので
+/// 256 まで許す (combine は split 昇順の逐次ループなので上限だけが制約)。
+const ATTN_FDEC_SPLIT_MAX: usize = 256;
 /// 1 分割あたりの key 数の既定 (`DENNO_ATTN_FLASHDEC_CHUNK`)。
-const ATTN_FLASHDEC_CHUNK_DEFAULT: usize = 256;
+const ATTN_FLASHDEC_CHUNK_DEFAULT: usize = 64;
 /// 1 分割の key 数の下限 (これ未満に割ると block だけ増えて無駄)。
 const ATTN_FLASHDEC_CHUNK_MIN: usize = 32;
 
@@ -18698,6 +18701,10 @@ mod q4_attn_tests {
         assert_eq!(q4_fdec_split(3954, 256), (16, 248));
         assert_eq!(q4_fdec_split(1, 256), (1, 1));
         assert_eq!(q4_fdec_split(0, 256), (1, 1));
+        // 既定 chunk では 14k で SM 170 を埋めるだけの block が出ること
+        // (n_kv = 2 のモデルで block 数 = n_split x 2)。
+        let (ns, _) = q4_fdec_split(14139, ATTN_FLASHDEC_CHUNK_DEFAULT);
+        assert!(ns * 2 >= 340, "14k の block が足りない: {ns} x 2");
     }
 
     /// task 160: flash decoding のゲートの解釈 (純関数)。
