@@ -1031,7 +1031,15 @@ impl Flash {
             // P58: 選ぶ前の分布を top-8 で送る (3D ビューワの候補表示用)。
             // テレメトリ OFF なら計算しない。数値経路には触れない。
             let d_topk = q4prof::dstamp();
-            let cand = if t_on { Some(denno_telemetry::topk_softmax(&logits, 8)) } else { None };
+            let cand = {
+                // task 153: 台帳の区間 (topk)。テレメトリ用の top-8 を選ぶだけの時間。
+                let _l = q4ledger::enter(q4ledger::TOPK);
+                if t_on {
+                    Some(denno_telemetry::topk_softmax(&logits, 8))
+                } else {
+                    None
+                }
+            };
             q4prof::dmark(q4prof::D_TOPK, d_topk);
             // P78: サンプリングは decode 側 (prefill wall の外)。
             let t_s = prekprof::stamp();
@@ -1048,17 +1056,22 @@ impl Flash {
             if Some(id) == eos {
                 break;
             }
-            if !emit_confirmed(
-                &self.tok,
-                &mut out,
-                &mut text,
-                &mut last_full,
-                &mut stop_hit,
-                &mut failed,
-                &req.stop_sequences,
-                id,
-                &mut emit,
-            ) {
+            let ok = {
+                // task 153: 台帳の区間 (detok)。出力トークンの切り出しと本文への反映。
+                let _l = q4ledger::enter(q4ledger::DETOK);
+                emit_confirmed(
+                    &self.tok,
+                    &mut out,
+                    &mut text,
+                    &mut last_full,
+                    &mut stop_hit,
+                    &mut failed,
+                    &req.stop_sequences,
+                    id,
+                    &mut emit,
+                )
+            };
+            if !ok {
                 break;
             }
             let t_step = t_on.then(Instant::now);
@@ -1095,6 +1108,8 @@ impl Flash {
             // も層の外。on でなければブロックごと無い (タイマーは 1 回だけ)。
             let d_telem = q4prof::dstamp();
             if let Some(t0) = t_step {
+                // task 153: 台帳の区間 (telem)。WS クライアントへのフレーム組み立てと送出。
+                let _l = q4ledger::enter(q4ledger::TELEM);
                 self.telem.emit(Frame::Step {
                     width: 1,
                     ns: t0.elapsed().as_nanos() as u64,

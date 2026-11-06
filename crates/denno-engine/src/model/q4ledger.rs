@@ -474,15 +474,21 @@ pub fn line(tok: usize, wall_ns: u64) -> Vec<String> {
         ));
     }
     // task 153: イベント時系列 (GPU の span / busy / idle)。`DENNO_Q4_TLINE` のときだけ。
-    // `items` は上の表の wall の和 (= 名前付き区間で覆った時間)、`outside` は
-    // リクエストのループ入口から測った全体との差。
+    //
+    // 台帳の行は**入れ子を外側にも積む** (外側の wall は内側を含む) ので、全部を
+    // 足すと二重計上になる。ここでは「トップレベルの区間」(= serve_flash の
+    // decode ループが開く区間) だけで `items` を作り、残りを `outside` とする。
+    // 起動の対応 (busy / launches) と sync/コピーの待ちは**最内側**に付くので、
+    // 全行の和が正しい総量になる。
     #[cfg(feature = "cuda")]
     if tline_on() && wall_ns > 0 {
         if let Some(tl) = crate::cuda::tline::items(N) {
+            const TOP: [usize; 5] = [STEP, SAMPLE, TOPK, DETOK, TELEM];
             let total_ms = wall_ns as f64 / 1e6 / d;
-            let items_ms = t(|r| r.wall_ns) as f64 / 1e6 / d;
+            let items_ns: u64 = TOP.iter().map(|&i| rows[i].wall_ns).sum();
+            let items_ms = items_ns as f64 / 1e6 / d;
             let wait_ms = t(|r| r.sync_ns + r.h2d_ns + r.d2h_ns) as f64 / 1e6 / d;
-            let span_ms: f64 = tl.iter().map(|i| i.span_ms).sum::<f64>() / d;
+            let span_ms: f64 = TOP.iter().map(|&i| tl[i].span_ms).sum::<f64>() / d;
             let busy_ms: f64 = tl.iter().map(|i| i.busy_ms).sum::<f64>() / d;
             let n_launch: u64 = tl.iter().map(|i| i.launches).sum();
             out.push(format!(
@@ -495,7 +501,7 @@ pub fn line(tok: usize, wall_ns: u64) -> Vec<String> {
                 n_launch as f64 / d,
             ));
             out.push(
-                "[q4tline]   item host wait cpu gpu_span gpu_busy gpu_idle n  (ms/tok)"
+                "[q4tline]   item host wait cpu gpu_span gpu_busy gpu_idle n k  (ms/tok・行は入れ子を含む)"
                     .to_string(),
             );
             for (i, r) in rows.iter().enumerate() {
