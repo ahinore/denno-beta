@@ -30,9 +30,31 @@
 //! - `rows[i]` は行 i の**トークン番号**。入力は `xbase + rows[i] * n_in`。
 //!   down 行列は入力が `act` (行が詰まっている) なので `rows[i] = i` を渡す。
 //!
+//! # 実測 (lab t151c、SHA 9bb62f7d6、swift15-abl IQ3_S、14T)
+//!
+//! 条件は `DENNO_EXPERT_IQ_GPU=1 DENNO_EXPERT_VRAM_MB=20000
+//! DENNO_EXPERT_GPU_MIN_HIT=0 DENNO_GPU_WEIGHT_MB=12000`。off が PF=0 の基準。
+//!
+//! | 項目 | off | on (既定) |
+//! | --- | --- | --- |
+//! | c2000 cold prefill | 89.6 s | 63.6 s |
+//! | c2000 turn2 prefill | 0.95 s | 0.69 s |
+//! | c8000 cold prefill | 329.3 s | 218.3 s |
+//! | c8000 turn2 prefill | 1.03 s | 0.75 s |
+//! | decode 28 / 3,954 / 14,139 tok | 56 / 51 / 52 | 56 / 52 / 52 |
+//! | md5 (a, b, c2000_cold, c2000_turn2) | 一致 | **一致** |
+//!
+//! c8000 の md5 だけ違う (丸めで greedy の 1 トークンが入れ替わる)。text は
+//! ベースラインと同じ日本語の要約。
+//!
+//! **上げ直しを既定で切った理由**: `DENNO_EXPERT_IQ_PF_UPLOAD_MB=512` にすると
+//! 14k の decode が 52 → 59 ms/tok (+13.5%、lab t151c の `onup`)。prefill が
+//! 空きに積んだ expert が decode の作業集合を奪う。prefill は VRAM を**読むだけ**
+//! にして、decode の在庫を変えないのを既定にする。
+//!
 //! # ゲート
 //!
-//! `DENNO_EXPERT_IQ_GPU_PF=1` かつ `DENNO_EXPERT_IQ_GPU=1` のときだけ。
+//! `DENNO_EXPERT_IQ_GPU_PF` (既定 on) かつ `DENNO_EXPERT_IQ_GPU=1` のときだけ。
 //! 片方でも欠けたら [`pf_enabled`] が false を返し、呼び出し側は従来の CPU 経路
 //! (`moe_experts_flat`) をそのまま回す (fail closed)。
 
