@@ -44,6 +44,30 @@ pub fn is_device_weight(ty: GgmlType) -> bool {
     )
 }
 
+/// 読み込み時に **Q8_0 へ作り直される**型か
+/// (`model::linear_gguf::maybe_requant` と同じ判定。
+/// `DENNO_REQUANT_Q8=0` で無効化できるが、ここでは既定の on で見積る)。
+///
+/// task 152: これが `vram budget` の `weights=` を 7.4 倍過小に見せていた正体。
+/// lab t149c/t152c の実測では、2 分割モデルの `weights=445 MiB (74 本)` に対し、
+/// 実際に VRAM へ上がった dense 重みは 266 本 3,297 MiB だった。差分の 192 本は
+/// **IQ3_S などの dense 重みで、ロード時に Q8_0 へ作り直されてから** GPU 登録簿に
+/// 入る (だから `nbytes` ではなく Q8_0 の行長で見積る必要がある)。
+///
+/// (「2 分割の part-1 しか数えていない」という t149 の推測は外れ。パートごとに
+///  開いて数えても同じ 445 MiB になった = part-1/2 の問題ではない。)
+pub fn is_requantized_to_q8(ty: GgmlType) -> bool {
+    !is_device_weight(ty) && !matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16)
+}
+
+/// Q8_0 の行バイト数 (`cuda::gguf_row_bytes` の Q8_0 と同じ式)。
+pub fn q8_0_row_bytes(k: u64) -> Option<u64> {
+    if k == 0 || k % 32 != 0 {
+        return None;
+    }
+    Some((k / 32) * 34)
+}
+
 /// MoE の expert 行列か (`ffn_gate_exps.weight` など)。
 ///
 /// expert は `ExpertW` (mmap / SSD pread) のままで、`expert_gemv_any` が CPU で
@@ -93,6 +117,20 @@ where
             t.dev_tensors += 1;
             t.max_k = t.max_k.max(dims[0]);
             t.max_n = t.max_n.max(dims[1]);
+        } else if is_requantized_to_q8(ty) {
+            // task 152: Q8_0 へ作り直してからデバイスへ載る。見積りは Q8_0 の行長。
+            match q8_0_row_bytes(dims[0]) {
+                Some(rb) if dims[1] > 0 => {
+                    t.dev_bytes += rb.saturating_mul(dims[1]);
+                    t.dev_tensors += 1;
+                    t.max_k = t.max_k.max(dims[0]);
+                    t.max_n = t.max_n.max(dims[1]);
+                }
+                _ => {
+                    t.host_bytes += nbytes;
+                    t.host_tensors += 1;
+                }
+            }
         } else {
             t.host_bytes += nbytes;
             t.host_tensors += 1;
@@ -198,6 +236,70 @@ pub fn flash_budget_from_gguf(f: &GgufFile, p: &Qwen4ExpParams, max_ctx: usize) 
         max_ctx,
         q4_present,
     )
+}
+
+/// task 152: 分割 GGUF の**全パート**を数えた予算 (起動時に 1 回)。
+///
+/// [`flash_budget_from_gguf`] は渡された `GgufFile` のテンソル表を数える。lab
+/// t149c の実測では、2 分割モデルに対して `weights=445 MiB (74 本)` と出て、
+/// 実際に VRAM へ上がった dense 重み (`[mem-audit] w:gguf 266 本 3,297 MiB`) の
+/// 13% しか数えていなかった (REPORT_P149.md)。ここでは**パートを 1 本ずつ開いて**
+/// 数え上げるので、パート数にも分割のされ方にも依存せず全部が入る。
+///
+/// 失敗したら `Err` を返す (呼び出し側はログを諦めて続行してよい。予算は表示だけ)。
+pub fn flash_budget_from_parts(
+    paths: &[std::path::PathBuf],
+    p: &Qwen4ExpParams,
+    max_ctx: usize,
+) -> anyhow::Result<FlashBudget> {
+    let mut totals = WeightTotals::default();
+    let mut q4_present = false;
+    for path in paths {
+        let f = GgufFile::open(path)?;
+        let t = classify_weights(
+            f.tensors
+                .values()
+                .map(|t| (t.name.as_str(), t.ty, t.dims, t.nbytes)),
+        );
+        totals = merge_totals(totals, t);
+        if !q4_present {
+            q4_present = f
+                .tensors
+                .values()
+                .any(|t| t.ty == GgmlType::Q4_0 && !is_expert_weight(&t.name));
+        }
+    }
+    let kv_dim = p.n_head_kv.saturating_mul(p.n_embd_head_k);
+    Ok(flash_budget(
+        totals,
+        n_full_layers(p.n_layer, p.full_attn_interval),
+        kv_dim,
+        max_ctx,
+        q4_present,
+    ))
+}
+
+/// パートごとの集計を 1 つに足す (純関数)。本数とバイト数は和、`max_k` / `max_n`
+/// は最大値 (1 回の GEMV の staging 見積りはパートをまたがない)。
+pub fn merge_totals(a: WeightTotals, b: WeightTotals) -> WeightTotals {
+    WeightTotals {
+        dev_bytes: a.dev_bytes + b.dev_bytes,
+        dev_tensors: a.dev_tensors + b.dev_tensors,
+        host_bytes: a.host_bytes + b.host_bytes,
+        host_tensors: a.host_tensors + b.host_tensors,
+        expert_bytes: a.expert_bytes + b.expert_bytes,
+        expert_tensors: a.expert_tensors + b.expert_tensors,
+        max_k: a.max_k.max(b.max_k),
+        max_n: a.max_n.max(b.max_n),
+    }
+}
+
+/// task 152: 予算 1 行に「何パート・何テンソルを数えたか」を足す。
+///
+/// `[flash] vram budget: ...` の形は変えない (既存のテストと目視のため) ので、
+/// 末尾に `parts=` / `device_tensors=` を足すだけにする。
+pub fn budget_line_with_parts(b: &FlashBudget, parts: usize) -> String {
+    format!("{} parts={parts}", budget_line(b))
 }
 
 /// MiB (四捨五入)。
@@ -711,6 +813,59 @@ mod tests {
         (name.to_string(), ty, [k, n, 1, 1], bytes)
     }
 
+    /// task 152: パートの集計は和になる (本数・バイト数)、staging は最大値。
+    #[test]
+    fn merge_totals_sums_parts() {
+        let a = WeightTotals {
+            dev_bytes: 100,
+            dev_tensors: 2,
+            host_bytes: 10,
+            host_tensors: 1,
+            expert_bytes: 1000,
+            expert_tensors: 1,
+            max_k: 2560,
+            max_n: 640,
+        };
+        let b = WeightTotals {
+            dev_bytes: 50,
+            dev_tensors: 1,
+            host_bytes: 5,
+            host_tensors: 2,
+            expert_bytes: 2000,
+            expert_tensors: 3,
+            max_k: 1280,
+            max_n: 10240,
+        };
+        let m = merge_totals(a, b);
+        assert_eq!(m.dev_bytes, 150, "バイト数は和");
+        assert_eq!(m.dev_tensors, 3, "本数は和");
+        assert_eq!(m.host_bytes, 15);
+        assert_eq!(m.host_tensors, 3);
+        assert_eq!(m.expert_bytes, 3000);
+        assert_eq!(m.expert_tensors, 4);
+        assert_eq!(m.max_k, 2560, "max は最大値");
+        assert_eq!(m.max_n, 10240);
+    }
+
+    /// task 152: 予算 1 行は既存の形を保ったまま `parts=` を足す。
+    #[test]
+    fn budget_line_with_parts_appends_parts() {
+        let b = FlashBudget {
+            max_ctx: 65536,
+            weights_dev: 3_297 << 20,
+            weights_dev_tensors: 266,
+            staging_peak: 0,
+            arena_dev: 0,
+            kv_host_max: 0,
+            host_weights: 0,
+            experts_ram: 0,
+        };
+        let line = budget_line_with_parts(&b, 2);
+        assert!(line.starts_with("[flash] vram budget: max_ctx=65536"), "{line}");
+        assert!(line.contains("weights=3297 MiB (266 本)"), "{line}");
+        assert!(line.ends_with("parts=2"), "{line}");
+    }
+
     #[test]
     fn device_set_matches_cuda_registry() {
         // cuda.rs::gguf_row_bytes が Some を返す 4 型だけがデバイス常駐になる。
@@ -731,6 +886,30 @@ mod tests {
         ] {
             assert!(!is_device_weight(ty), "{ty:?} は載らない側のはず");
         }
+    }
+
+    /// task 152: IQ 系の dense 重みは Q8_0 へ作り直されてからデバイスに載る。
+    /// 見積りは `n * Q8_0 行長` で、元の `nbytes` ではない。
+    #[test]
+    fn requantized_iq_tensors_count_as_device_q8() {
+        // k=2048 (32 の倍数), n=1024, IQ3_S の nbytes は Q8_0 より小さい。
+        let iq = t("blk.0.attn_q.weight", GgmlType::IQ3S, 2048, 1024, 900_000);
+        let w = classify_weights([(iq.0.as_str(), iq.1, iq.2, iq.3)]);
+        assert_eq!(w.dev_tensors, 1, "Q8_0 へ作り直すのでデバイス側");
+        assert_eq!(w.dev_bytes, 1024 * (2048 / 32 * 34), "Q8_0 の行長で見積る");
+        assert_eq!(w.host_tensors, 0, "mmap の生バイトはホスト側に数えない");
+        assert_eq!(w.max_k, 2048);
+        assert_eq!(w.max_n, 1024);
+        // F32 / BF16 は作り直さない (CPU 側のまま)。
+        let f32t = t("blk.0.ffn_gate_inp.weight", GgmlType::F32, 2048, 512, 4 << 20);
+        let w2 = classify_weights([(f32t.0.as_str(), f32t.1, f32t.2, f32t.3)]);
+        assert_eq!(w2.host_tensors, 1);
+        assert_eq!(w2.dev_bytes, 0);
+        // k が 32 の倍数でない IQ は作り直せない (CPU 側)。
+        let odd = t("x.weight", GgmlType::IQ3S, 1000, 8, 10_000);
+        let w3 = classify_weights([(odd.0.as_str(), odd.1, odd.2, odd.3)]);
+        assert_eq!(w3.host_tensors, 1, "k%32!=0 は requant できない");
+        assert_eq!(w3.dev_bytes, 0);
     }
 
     #[test]
