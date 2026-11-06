@@ -22471,15 +22471,33 @@ pub fn gdn_scan_batch_sig(
     kv: u64,
 ) -> Option<Vec<f32>> {
     // 形状の前提はカーネル側の制約 (受けないときは CPU へ)。
-    if n == 0 || n >= GDN_CHUNK_MIN_TOKENS || nk == 0 || nv == 0 || dk != dv || dk > 256
-        || d_conv != 4
-    {
+    // 短い列は CPU のほうが速い: 1 回のカーネル起動 + 層状態の書き戻し
+    // (10.7 MB/層) が、19 トークン程度の CPU スキャンより高い (lab t154e:
+    // next turn の prefill が +5.6% になった)。境界は常駐 mix と同じ 64。
+    if !gdn_sig_accepts(n, nk, nv, dk, dv, d_conv) {
         return None;
     }
     gdn_scan_batch_inner(
         qkv, z, beta, alpha, conv_st, ssm_st, wconv, wa, wdt, wnorm, n, nk, nv, dk, dv, d_conv,
         eps, q_scale, li, kv, true,
     )
+}
+
+/// task 154: シグモイド版スキャンが受ける形か (純関数。GPU を呼ばない)。
+///
+/// - `n < `[`GDN_SIG_MIN_TOKENS`]: 短い列は CPU のほうが速い (1 回のカーネル起動と
+///   層状態の書き戻し 10.7 MB/層が、19 トークン程度の CPU スキャンより高い。
+///   lab t154e: next turn の prefill が +5.6% になった)。境界は常駐 mix と同じ 64。
+/// - `n >= `[`GDN_CHUNK_MIN_TOKENS`]: 長い列は 3-pass の chunked 経路が受ける。
+/// - 残りは `dno_gdn_scan_sig` のレジスタ配列 (`Scol[256]`) と列共有の制約。
+fn gdn_sig_accepts(n: usize, nk: usize, nv: usize, dk: usize, dv: usize, d_conv: usize) -> bool {
+    n >= GDN_SIG_MIN_TOKENS
+        && n < GDN_CHUNK_MIN_TOKENS
+        && nk != 0
+        && nv != 0
+        && dk == dv
+        && dk <= 256
+        && d_conv == 4
 }
 
 /// [`gdn_scan_batch`] / [`gdn_scan_batch_sig`] の共通本体 (`sig` でカーネルを選ぶ)。
@@ -22566,6 +22584,11 @@ fn gdn_scan_batch_inner(
         }
     }
 }
+
+/// task 154: シグモイド版スキャンを受ける最小トークン数。
+///
+/// これ未満は CPU スキャンのほうが速い (起動 + 層状態の D2H が固定費)。
+pub(crate) const GDN_SIG_MIN_TOKENS: usize = 64;
 
 /// 実装 (同期コピー + 1 launch + 1 同期。prefill はリクエストあたり層数回しか
 /// 呼ばれないためピン留めパイプライン化の恩恵は小さい)。
@@ -26470,6 +26493,28 @@ mod b20_stage1_tests {
 
         // 7) 桁あふれは checked_mul で None
         assert!(!sup(&w, n_ok, (usize::MAX, nv, dk, dv, dc)), "conv_dim の桁あふれは受けない");
+    }
+
+    /// task 154: `gdn_scan_batch_sig` の入口 ([`gdn_sig_accepts`]) の境界。
+    /// GPU を呼ばないので、この判定だけで「19 トークンの next turn が CPU へ落ちる」
+    /// ことを固定できる。
+    #[test]
+    fn gdn_sig_accepts_short_columns_decline() {
+        // 実形に近い寸法 (nk=8, nv=8, dk=dv=128, d_conv=4)。
+        let ok = |n: usize| gdn_sig_accepts(n, 8, 8, 128, 128, 4);
+        assert!(ok(GDN_SIG_MIN_TOKENS), "境界ちょうど (64) は受ける");
+        assert!(ok(GDN_SIG_MIN_TOKENS + 1));
+        assert!(ok(GDN_CHUNK_MIN_TOKENS - 1), "chunked の手前までは受ける");
+        assert!(!ok(GDN_CHUNK_MIN_TOKENS), "chunked 側 (n >= 2048) は受けない");
+        assert!(!ok(19), "next turn の 19 トークンは受けない (CPU のほうが速い)");
+        assert!(!ok(GDN_SIG_MIN_TOKENS - 1), "63 は受けない");
+        assert!(!ok(0));
+        // 形の制約は据え置き (64 以上でも落ちる = 短列ガードで緩んでいない)。
+        assert!(!gdn_sig_accepts(64, 0, 8, 128, 128, 4), "nk == 0 は受けない");
+        assert!(!gdn_sig_accepts(64, 8, 0, 128, 128, 4), "nv == 0 は受けない");
+        assert!(!gdn_sig_accepts(64, 8, 8, 128, 64, 4), "dk != dv は受けない");
+        assert!(!gdn_sig_accepts(64, 8, 8, 512, 512, 4), "dk > 256 は受けない");
+        assert!(!gdn_sig_accepts(64, 8, 8, 128, 128, 3), "d_conv != 4 は受けない");
     }
 }
 
