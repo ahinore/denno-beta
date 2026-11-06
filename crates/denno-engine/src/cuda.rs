@@ -233,6 +233,216 @@ unsafe extern "C" fn ledger_dtoh_async(
     r
 }
 
+// ---------------- task 153: decode のイベント時系列 (DENNO_Q4_TLINE) ----------------
+//
+// `DENNO_Q4_PROFILE` の台帳は「ホストがどこで待ったか」しか見ていない。ここでは
+// **ストリームに計時イベントを打って**、区間ごとの GPU 実行時間 (busy) と、GPU が
+// ホスト待ちで空いていた時間 (idle) を分けて読む。
+//
+// - 区間 (`q4ledger::enter`) の入口と出口で 1 本ずつイベントを打ち、その 2 本の
+//   `cuEventElapsedTime` を「GPU の span」として積む。
+// - `DENNO_Q4_TLINE_K=1` のときは**起動ごと**にも前後 1 本ずつ打ち、その差を
+//   カーネルの実行時間として積む (span - busy = その区間の GPU idle)。
+// - イベントはプールして伸ばすだけ (grow-only)。読むのはリクエスト終端の 1 回だけ。
+//   ホットパスに足すのは `cuEventRecord` の呼び出しだけで、同期は 1 本も足さない。
+// - 記録は decode の窓 (`q4ledger::tline_begin` .. `tline_end`) だけ。上限
+//   (`MAX_EVENTS`) を超えたら静かに止める (台帳の数字はそのまま残る)。
+pub(crate) mod tline {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// プールの上限 (128 トークン x 約 2,400 本 = 約 31 万本を収める)。
+    const MAX_EVENTS: usize = 400_000;
+
+    struct Pool {
+        /// 計時イベント (grow-only)。
+        evs: Vec<CUevent>,
+        /// この窓で使ったイベント数 (= 次の記録位置)。
+        used: usize,
+        /// 区間: (item, 入口イベント, 出口イベント)。
+        spans: Vec<(u8, u32, u32)>,
+        /// 起動: (item, 前イベント, 後イベント)。K ゲートのときだけ積む。
+        launch: Vec<(u8, u32, u32)>,
+        /// 作れなかった (以後は静かに止める)。
+        dead: bool,
+    }
+
+    impl Pool {
+        const fn new() -> Self {
+            Self {
+                evs: Vec::new(),
+                used: 0,
+                spans: Vec::new(),
+                launch: Vec::new(),
+                dead: false,
+            }
+        }
+    }
+
+    thread_local! {
+        static P: RefCell<Pool> = const { RefCell::new(Pool::new()) };
+    }
+
+    /// 区間ごとの GPU 時間 (ms)。`span` は入口から出口までの GPU 時間
+    /// (ホスト待ちで GPU が空いていた分を含む)、`busy` は起動ごとの実行時間の和。
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct Item {
+        pub span_ms: f64,
+        pub busy_ms: f64,
+        pub spans: u64,
+        pub launches: u64,
+    }
+
+    /// 起動ごとのイベントを打つか (`DENNO_Q4_TLINE_K=1`)。
+    pub(super) fn k_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DENNO_Q4_TLINE_K").is_some())
+    }
+
+    fn grow(p: &mut Pool, want: usize) -> bool {
+        let Some(create) = lib().ok().and_then(|l| l.event_create) else {
+            return false;
+        };
+        while p.evs.len() < want {
+            let mut ev: CUevent = std::ptr::null_mut();
+            // CU_EVENT_DEFAULT (0) = 計時有効。作れなければ計測を諦める。
+            if unsafe { create(&mut ev, 0) } != CUDA_SUCCESS || ev.is_null() {
+                return false;
+            }
+            p.evs.push(ev);
+        }
+        true
+    }
+
+    /// 既定ストリームにイベントを 1 本打ち、その通し番号を返す。
+    fn mark() -> Option<u32> {
+        P.with(|c| {
+            let mut p = c.borrow_mut();
+            if p.dead {
+                return None;
+            }
+            if p.used >= MAX_EVENTS {
+                p.dead = true;
+                return None;
+            }
+            if p.used >= p.evs.len() {
+                let want = p.evs.len() + 2048;
+                if !grow(&mut p, want) {
+                    p.dead = true;
+                    return None;
+                }
+            }
+            let Some(rec) = lib().ok().and_then(|l| l.event_record) else {
+                p.dead = true;
+                return None;
+            };
+            let ev = p.evs[p.used];
+            if unsafe { rec(ev, std::ptr::null_mut()) } != CUDA_SUCCESS {
+                p.dead = true;
+                return None;
+            }
+            let i = p.used as u32;
+            p.used += 1;
+            Some(i)
+        })
+    }
+
+    /// 区間の入口イベント。時系列が off なら `None` (分岐 1 回)。
+    pub fn span_begin() -> Option<u32> {
+        if !crate::model::q4ledger::tline_active() {
+            return None;
+        }
+        mark()
+    }
+
+    /// 窓の入口で 1 回だけ呼ぶ。イベントは**このスレッドの** current context に
+    /// 対して打つので、リクエストのスレッドで context を張っておく
+    /// (engine の GPU 入口は毎回 `make_current` するが、最初の `enter` はその前)。
+    pub fn prepare() {
+        if !crate::model::q4ledger::tline_active() {
+            return;
+        }
+        if let Some(ctx) = shared_ctx() {
+            let _ = ctx.make_current();
+        }
+        // 1 本だけ打って捨てる (作れない構成なら以後の記録を止める)。
+        let _ = mark();
+        reset();
+    }
+
+    /// 区間の出口イベントを打って span を積む。
+    pub fn span_end(item: usize, a: u32) {
+        if let Some(b) = mark() {
+            P.with(|c| c.borrow_mut().spans.push((item as u8, a, b)));
+        }
+    }
+
+    /// 起動の直前イベント (K ゲートのときだけ)。
+    pub fn launch_begin() -> Option<u32> {
+        if !crate::model::q4ledger::tline_active() || !k_on() {
+            return None;
+        }
+        mark()
+    }
+
+    /// 起動の直後イベントを打って (item, 前, 後) を積む。
+    pub fn launch_end(item: usize, a: u32) {
+        if let Some(b) = mark() {
+            P.with(|c| c.borrow_mut().launch.push((item as u8, a, b)));
+        }
+    }
+
+    fn elapsed(a: u32, b: u32) -> Option<f32> {
+        let f = lib().ok().and_then(|l| l.event_elapsed_time)?;
+        P.with(|c| {
+            let p = c.borrow();
+            let ea = *p.evs.get(a as usize)?;
+            let eb = *p.evs.get(b as usize)?;
+            let mut ms = 0.0f32;
+            if unsafe { f(&mut ms, ea, eb) } != CUDA_SUCCESS || !ms.is_finite() || ms < 0.0 {
+                return None;
+            }
+            Some(ms)
+        })
+    }
+
+    /// 区間ごとの GPU 時間を読む (区間の数だけ返す)。1 本も打っていなければ `None`。
+    pub fn items(n: usize) -> Option<Vec<Item>> {
+        P.with(|c| {
+            let p = c.borrow();
+            if p.spans.is_empty() && p.launch.is_empty() {
+                return None;
+            }
+            let mut out = vec![Item::default(); n];
+            for &(item, a, b) in p.spans.iter() {
+                let i = (item as usize).min(n.saturating_sub(1));
+                if let Some(ms) = elapsed(a, b) {
+                    out[i].span_ms += ms as f64;
+                    out[i].spans += 1;
+                }
+            }
+            for &(item, a, b) in p.launch.iter() {
+                let i = (item as usize).min(n.saturating_sub(1));
+                if let Some(ms) = elapsed(a, b) {
+                    out[i].busy_ms += ms as f64;
+                    out[i].launches += 1;
+                }
+            }
+            Some(out)
+        })
+    }
+
+    /// 窓の記録を捨てる (イベント自体は次の窓で使い回す)。
+    pub fn reset() {
+        P.with(|c| {
+            let mut p = c.borrow_mut();
+            p.used = 0;
+            p.spans.clear();
+            p.launch.clear();
+        });
+    }
+}
+
 unsafe fn open_libcuda() -> Result<CudaLib> {
     let name = b"libcuda.so.1\0";
     let handle = dlopen(name.as_ptr() as *const c_char, RTLD_NOW);
@@ -1441,6 +1651,8 @@ impl CudaCtx {
         dbg_launch(f);
         // task 138: 台帳 (DENNO_Q4_PROFILE) への発行 1 件の計上。off は stamp が None。
         let tl = crate::model::q4ledger::stamp();
+        // task 153: イベント時系列 (DENNO_Q4_TLINE + _K)。off は None で分岐 1 回。
+        let ev0 = tline::launch_begin();
         let r = check(
             (lib.launch)(
                 f,
@@ -1457,6 +1669,9 @@ impl CudaCtx {
             ),
             "cuLaunchKernel",
         );
+        if let Some(a) = ev0 {
+            tline::launch_end(crate::model::q4ledger::current(), a);
+        }
         crate::model::q4ledger::note_launch(tl);
         r
     }

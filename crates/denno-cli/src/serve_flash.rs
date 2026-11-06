@@ -53,6 +53,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use denno_engine::gguf::GgufFile;
 use denno_engine::model::prekprof;
+use denno_engine::model::q4ledger;
 use denno_engine::model::qwen4exp::{
     expert_w_stats_request_end, q4prof, Qwen4Exp, Qwen4ExpParams, TapTokens,
 };
@@ -456,7 +457,7 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
     // 値は 1 トークンあたり (この窓の decode トークン数で割る)。
     // 窓は prefill 終端でも切る (prefill の転送を decode の数字に混ぜない)。
     if tag == "decode" {
-        for line in denno_engine::model::q4ledger::line(tok) {
+        for line in denno_engine::model::q4ledger::line(tok, wall_ns) {
             eprintln!("{line}");
         }
     } else {
@@ -923,6 +924,9 @@ impl Flash {
         let mut spec_accepted = 0usize;
         let mut spec_offered = 0usize;
         let t2 = Instant::now();
+        // task 153: decode の窓で CUDA イベントの時系列を取る (`DENNO_Q4_TLINE`)。
+        // off では atomic load 1 回で、イベントは 1 本も打たない。
+        q4ledger::tline_begin();
         'gen: while out.len() < req.max_tokens {
             if spec_on {
                 // P109: n-gram 投機ステップ。q0 は engine の argmax (greedy)。
@@ -1033,29 +1037,47 @@ impl Flash {
             // P58: 選ぶ前の分布を top-8 で送る (3D ビューワの候補表示用)。
             // テレメトリ OFF なら計算しない。数値経路には触れない。
             let d_topk = q4prof::dstamp();
-            let cand = if t_on { Some(denno_telemetry::topk_softmax(&logits, 8)) } else { None };
+            let cand = {
+                // task 153: 台帳の区間 (topk)。テレメトリ用の top-8 を選ぶだけの時間。
+                let _l = q4ledger::enter(q4ledger::TOPK);
+                if t_on {
+                    Some(denno_telemetry::topk_softmax(&logits, 8))
+                } else {
+                    None
+                }
+            };
             q4prof::dmark(q4prof::D_TOPK, d_topk);
             // P78: サンプリングは decode 側 (prefill wall の外)。
             let t_s = prekprof::stamp();
             let d_sample = q4prof::dstamp();
-            let id = sampler.sample(&logits) as u32;
+            // task 153: 台帳の区間 (sample) と (step)。step の中の名前付き区間は
+            // 入れ子で入るので、step 行は「層と層の外のうち名前が付いていない分」になる。
+            let id = {
+                let _l = q4ledger::enter(q4ledger::SAMPLE);
+                sampler.sample(&logits) as u32
+            };
             prekprof::mark(t_s, prekprof::SAMPLE);
             q4prof::dmark(q4prof::D_SAMPLE, d_sample);
             prekprof::note_sample();
             if Some(id) == eos {
                 break;
             }
-            if !emit_confirmed(
-                &self.tok,
-                &mut out,
-                &mut text,
-                &mut last_full,
-                &mut stop_hit,
-                &mut failed,
-                &req.stop_sequences,
-                id,
-                &mut emit,
-            ) {
+            let ok = {
+                // task 153: 台帳の区間 (detok)。出力トークンの切り出しと本文への反映。
+                let _l = q4ledger::enter(q4ledger::DETOK);
+                emit_confirmed(
+                    &self.tok,
+                    &mut out,
+                    &mut text,
+                    &mut last_full,
+                    &mut stop_hit,
+                    &mut failed,
+                    &req.stop_sequences,
+                    id,
+                    &mut emit,
+                )
+            };
+            if !ok {
                 break;
             }
             let t_step = t_on.then(Instant::now);
@@ -1068,8 +1090,18 @@ impl Flash {
                 break;
             }
             let stepped = match act.as_mut() {
-                Some(tap) => dec.step_tapped(id, |o| tap.on_layer(o)),
-                None => dec.step(id),
+                Some(tap) => {
+                    let _l = q4ledger::enter(q4ledger::STEP);
+                    dec.step_tapped(id, |o| {
+                        // task 153: 層ごとの活性タップ (LayerAct の組み立て) を区間にする。
+                        let _t = q4ledger::enter(q4ledger::TAP);
+                        tap.on_layer(o)
+                    })
+                }
+                None => {
+                    let _l = q4ledger::enter(q4ledger::STEP);
+                    dec.step(id)
+                }
             };
             match stepped {
                 Ok(lg) => logits = lg,
@@ -1082,6 +1114,8 @@ impl Flash {
             // も層の外。on でなければブロックごと無い (タイマーは 1 回だけ)。
             let d_telem = q4prof::dstamp();
             if let Some(t0) = t_step {
+                // task 153: 台帳の区間 (telem)。WS クライアントへのフレーム組み立てと送出。
+                let _l = q4ledger::enter(q4ledger::TELEM);
                 self.telem.emit(Frame::Step {
                     width: 1,
                     ns: t0.elapsed().as_nanos() as u64,
@@ -1132,6 +1166,8 @@ impl Flash {
         // task 120: `DENNO_EXPERT_W_STATS=1` のときだけ decode の重み統計を 1 行出す
         // (リクエスト終端。env 未指定では分岐 1 回で何も出さない)。
         expert_w_stats_request_end();
+        // task 153: 時系列の記録を閉じる (decode の台帳を出す直前に 1 回)。
+        q4ledger::tline_end();
         prof_flash("decode", out.len(), (t_decode * 1e9) as u64);
         // P78: `DENNO_PRE_KPROF=1` のときだけ、層の外の区間を 2 行で出す
         // (既定 off では `report` が空を返す = 出力ゼロ)。

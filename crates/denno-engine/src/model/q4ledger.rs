@@ -50,19 +50,47 @@ pub const EXPERTS: usize = 5;
 /// まだ区間に割っていない部分がここに入る。`forward_prefill_inner` が全体を
 /// この区間で包むので、prefill では「全項目の和 = prefill の壁時計」になる。
 pub const OTHER: usize = 6;
-/// task 144: IQ 系 expert の層一括 GEMV (`kernels_exp_iq`)。
+/// 区間: IQ 系 expert の層一括 GEMV (`kernels_exp_iq`)。
 ///
 /// 「1 層あたり何 us か」を台帳から直接読むための区間。ミスして CPU で計算した
 /// expert はこの区間の外 (呼び出し側のループ) なので、**GPU で回したぶんだけ**が
 /// ここに積まれる。decode の IQ 経路だけが通り、decode では [`EXPERTS`] の
 /// 内側 (ネスト) に入る。台帳の名前は `exp_iq`。
 pub const EXPERT: usize = 7;
+/// task 153: 層の外の head (最終 head GEMV と logits の D2H)。
+///
+/// `forward_token_at` の末尾だけが通る。台帳の名前は `head`。
+pub const HEAD: usize = 8;
+/// task 153: 層ごとの活性タップ (`ActTap::on_layer` = LayerAct フレームの組み立て)。
+///
+/// decode の層ループの中で 1 層 1 回呼ばれる。台帳の名前は `tap`。
+pub const TAP: usize = 9;
+/// task 153: サンプラ 1 回 (`Sampler::sample`)。名前は `sample`。
+pub const SAMPLE: usize = 10;
+/// task 153: テレメトリ用の top-8 softmax (`topk_softmax`)。名前は `topk`。
+pub const TOPK: usize = 11;
+/// task 153: 出力トークンの切り出しと本文への反映 (`emit_confirmed`)。名前は `detok`。
+pub const DETOK: usize = 12;
+/// task 153: テレメトリのフレーム送出 (`Frame::Step` / `Token` / `TopK` / `KvUsage`)。
+pub const TELEM: usize = 13;
+/// task 153: engine の 1 ステップ全体 (`forward_token_at` + 構造テレメトリ)。
+///
+/// 層の中の名前付き区間に入らなかった時間 (hooks / arch など) は
+/// この行の残差として出る。台帳の名前は `step`。
+pub const STEP: usize = 14;
+/// task 153: 層の出口の `hc_combine` (hyper connection の足し込み)。
+///
+/// 1 層 2 回 (attn の後 / ffn の後)。40 KB の確保と 10240 要素の写しがある。
+pub const COMBINE: usize = 15;
+/// task 153: 層ごとの役割 RMS と構造テレメトリ (`emit_role_act`)。
+pub const ROLES: usize = 16;
 /// 区間の数。
-pub const N: usize = 8;
+pub const N: usize = 17;
 /// 区間の名前 ([`MIX`] の順)。`experts` (選択 expert の寄与全体) と
 /// `exp_iq` (task 144 の IQ 層一括 GEMV、decode では `experts` の内側) は別の行。
 pub const NAMES: [&str; N] = [
-    "mix", "router", "shared", "full", "ssm", "experts", "other", "exp_iq",
+    "mix", "router", "shared", "full", "ssm", "experts", "other", "exp_iq", "head", "tap",
+    "sample", "topk", "detok", "telem", "step", "combine", "roles",
 ];
 
 fn on() -> bool {
@@ -162,9 +190,56 @@ thread_local! {
     static CUR: std::cell::Cell<usize> = const { std::cell::Cell::new(OTHER) };
 }
 
+/// いま開いている区間 (イベント時系列が起動を区間に割り当てるのに使う)。
+#[inline]
+pub fn current() -> usize {
+    CUR.with(|c| c.get())
+}
+
+/// task 153: CUDA イベントの時系列を取るか (`DENNO_Q4_TLINE` があるとき)。
+fn tline_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DENNO_Q4_TLINE").is_some())
+}
+
+/// 時系列の記録が開いているか (decode の窓の間だけ真)。
+static TLINE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 時系列が記録中か (イベント 1 本ぶんの分岐)。
+#[inline]
+pub fn tline_active() -> bool {
+    TLINE_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// decode の窓を開ける (`serve_flash` が prefill の台帳を出した直後に 1 回)。
+pub fn tline_begin() {
+    if enabled() && tline_on() {
+        TLINE_ACTIVE.store(true, Ordering::Relaxed);
+        tline_prepare();
+    }
+}
+
+/// 窓の入口の用意 (cuda 無しは何もしない)。
+#[cfg(feature = "cuda")]
+#[inline]
+fn tline_prepare() {
+    crate::cuda::tline::prepare();
+}
+
+/// 窓の入口の用意 (cuda 無しは何もしない)。
+#[cfg(not(feature = "cuda"))]
+#[inline]
+fn tline_prepare() {}
+
+/// decode の窓を閉じる (decode の台帳を出す直前に 1 回)。
+pub fn tline_end() {
+    TLINE_ACTIVE.store(false, Ordering::Relaxed);
+}
+
 /// 区間を開く。戻り値の drop で壁時計を積み、前の区間へ戻す。
 ///
 /// off のときは `Instant` を取らず、[`CUR`] にも触らない (no-op)。
+/// task 153: `DENNO_Q4_TLINE` のときは入口でイベントを 1 本打つ。
 pub fn enter(item: usize) -> Scope {
     if !enabled() || item >= N {
         return Scope::none();
@@ -174,7 +249,36 @@ pub fn enter(item: usize) -> Scope {
         prev,
         item,
         t: Some(Instant::now()),
+        ev: tline_ev_begin(),
     }
+}
+
+/// 区間の入口イベント (時系列 off / cuda 無しでは `None`)。
+#[cfg(feature = "cuda")]
+#[inline]
+fn tline_ev_begin() -> Option<u32> {
+    crate::cuda::tline::span_begin()
+}
+
+/// 区間の入口イベント (cuda 無しは常に `None`)。
+#[cfg(not(feature = "cuda"))]
+#[inline]
+fn tline_ev_begin() -> Option<u32> {
+    None
+}
+
+/// 区間の出口イベントを打って span を積む。
+#[cfg(feature = "cuda")]
+#[inline]
+fn tline_ev_end(item: usize, a: u32) {
+    crate::cuda::tline::span_end(item, a);
+}
+
+/// 区間の出口 (cuda 無しは何もしない)。
+#[cfg(not(feature = "cuda"))]
+#[inline]
+fn tline_ev_end(item: usize, a: u32) {
+    let _ = (item, a);
 }
 
 /// [`enter`] が返すガード。
@@ -182,6 +286,8 @@ pub struct Scope {
     prev: usize,
     item: usize,
     t: Option<Instant>,
+    /// task 153: 入口イベントの通し番号 (時系列 off は `None`)。
+    ev: Option<u32>,
 }
 
 impl Scope {
@@ -190,6 +296,7 @@ impl Scope {
             prev: OTHER,
             item: OTHER,
             t: None,
+            ev: None,
         }
     }
 }
@@ -200,6 +307,9 @@ impl Drop for Scope {
         ROWS[self.item]
             .wall_ns
             .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Some(a) = self.ev {
+            tline_ev_end(self.item, a);
+        }
         CUR.with(|c| c.set(self.prev));
     }
 }
@@ -309,10 +419,12 @@ pub fn sync_floor_ns() -> Option<u64> {
     }
 }
 
-/// 台帳を 1 つの文字列群にする (`tok` = その窓の decode トークン数)。
+/// 台帳を 1 つの文字列群にする (`tok` = その窓の decode トークン数、
+/// `wall_ns` = decode ループ全体の壁時計 = リクエストのループ入口から
+/// 最後のトークンを出し終えるまで)。
 ///
 /// 値は 1 トークンあたり。無効時は空 (出力ゼロ)。
-pub fn line(tok: usize) -> Vec<String> {
+pub fn line(tok: usize, wall_ns: u64) -> Vec<String> {
     if !enabled() {
         return Vec::new();
     }
@@ -366,6 +478,62 @@ pub fn line(tok: usize) -> Vec<String> {
             r.d2h_bytes as f64 / 1e6 / d,
             r.d2h_calls as f64 / d,
         ));
+    }
+    // task 153: イベント時系列 (GPU の span / busy / idle)。`DENNO_Q4_TLINE` のときだけ。
+    //
+    // 台帳の行は**入れ子を外側にも積む** (外側の wall は内側を含む) ので、全部を
+    // 足すと二重計上になる。ここでは「トップレベルの区間」(= serve_flash の
+    // decode ループが開く区間) だけで `items` を作り、残りを `outside` とする。
+    // 起動の対応 (busy / launches) と sync/コピーの待ちは**最内側**に付くので、
+    // 全行の和が正しい総量になる。
+    #[cfg(feature = "cuda")]
+    if tline_on() && wall_ns > 0 {
+        if let Some(tl) = crate::cuda::tline::items(N) {
+            const TOP: [usize; 5] = [STEP, SAMPLE, TOPK, DETOK, TELEM];
+            let total_ms = wall_ns as f64 / 1e6 / d;
+            let items_ns: u64 = TOP.iter().map(|&i| rows[i].wall_ns).sum();
+            let items_ms = items_ns as f64 / 1e6 / d;
+            let wait_ms = t(|r| r.sync_ns + r.h2d_ns + r.d2h_ns) as f64 / 1e6 / d;
+            let span_ms: f64 = TOP.iter().map(|&i| tl[i].span_ms).sum::<f64>() / d;
+            let busy_ms: f64 = tl.iter().map(|i| i.busy_ms).sum::<f64>() / d;
+            let n_launch: u64 = tl.iter().map(|i| i.launches).sum();
+            out.push(format!(
+                "[q4tline] tok={tok} token={total_ms:.2}ms items={items_ms:.2}ms outside={:.2}ms \
+                 | gpu_span={span_ms:.2}ms gpu_busy={busy_ms:.2}ms gpu_idle={:.2}ms \
+                 host_wait={wait_ms:.2}ms host_busy={:.2}ms launches={}",
+                total_ms - items_ms,
+                (span_ms - busy_ms).max(0.0),
+                (total_ms - wait_ms).max(0.0),
+                n_launch as f64 / d,
+            ));
+            out.push(
+                "[q4tline]   item host wait cpu gpu_span gpu_busy gpu_idle n k  (ms/tok・行は入れ子を含む)"
+                    .to_string(),
+            );
+            for (i, r) in rows.iter().enumerate() {
+                let it = tl[i];
+                if r.wall_ns == 0 && it.spans == 0 && it.launches == 0 {
+                    continue;
+                }
+                let ms = |ns: u64| ns as f64 / 1e6 / d;
+                let wait = ms(r.sync_ns + r.h2d_ns + r.d2h_ns);
+                let busy_host = ms(
+                    r.wall_ns
+                        .saturating_sub(r.launch_ns + r.sync_ns + r.h2d_ns + r.d2h_ns),
+                );
+                let span = it.span_ms / d;
+                let busy = it.busy_ms / d;
+                out.push(format!(
+                    "[q4tline]   {:<6} host={:.2} wait={wait:.2} cpu={busy_host:.2} \
+                     gpu_span={span:.2} gpu_busy={busy:.2} gpu_idle={:.2} n={:<5} k={:<5}",
+                    NAMES[i],
+                    ms(r.wall_ns),
+                    (span - busy).max(0.0),
+                    it.spans,
+                    it.launches,
+                ));
+            }
+        }
     }
     out
 }
@@ -479,6 +647,8 @@ pub fn reset() {
     }
     SYNC_MIN_NS.store(u64::MAX, Ordering::Relaxed);
     PREFILL_WALL_NS.store(0, Ordering::Relaxed);
+    #[cfg(feature = "cuda")]
+    crate::cuda::tline::reset();
 }
 
 #[cfg(test)]
@@ -504,7 +674,7 @@ mod tests {
             note_d2h(512, stamp());
         }
         assert_eq!(row(MIX), Row::default(), "off なのに積まれた");
-        assert!(line(8).is_empty(), "off でレポートが出た");
+        assert!(line(8, 0).is_empty(), "off でレポートが出た");
         assert_eq!(sync_floor_ns(), None);
     }
 
@@ -560,7 +730,7 @@ mod tests {
                 note_h2d(2_000_000, Some(Instant::now()));
             }
         }
-        let lines = line(2);
+        let lines = line(2, 3_000_000);
         assert!(!lines.is_empty(), "on なのにレポートが出ない");
         let head = &lines[0];
         assert!(head.starts_with("[q4ledger] tok=2"), "{head}");
