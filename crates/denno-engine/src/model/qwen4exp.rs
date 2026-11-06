@@ -2478,6 +2478,7 @@ impl Qwen4Exp {
             None => return Err(one("ctx が空 (現在のトークンが無い)")),
         };
         let e = self.p.n_embd;
+        let _sub = q4ledger::sub(q4ledger::SUB_EMBED);
         let emb = self
             .tok_embd
             .dequant_row(token as usize)
@@ -2848,6 +2849,12 @@ impl Qwen4Exp {
         } else {
             self.prefill_seq(ctx, tokens, on_layer, roles)?
         };
+        // task 154: prefill の GPU スキャンが持つ層状態のバッファ (約 385 MB) を
+        // VRAM へ返す。ホスト状態は毎回書き戻してあるので、次はホストから seed する。
+        #[cfg(feature = "cuda")]
+        if pf_gdn_gpu_on() {
+            crate::cuda::gdn_state_release();
+        }
         // P58: 1 リクエスト 1 回の階層統計 (prefill 終了時)。arch off なら即座に戻る。
         self.arch_emit_prefill_done();
         Ok(logits)
@@ -2981,6 +2988,403 @@ impl Qwen4Exp {
             .map_err(|e| one(format!("spec_restore: {e}")))
     }
 
+/// task 154: 常駐経路を使う最小トークン数 (これ未満は従来の CPU バッチ)。
+///
+/// 28 トークンの prefill は mix の要素演算が数百 us で、GEMM 7 発 + 1 同期 +
+/// 往復の固定費と釣り合わない。境界は task 145 のバッチ mix GPU と同じ 64。
+const PF_RESIDENT_MIN_TOK: usize = 64;
+
+/// task 154: 常駐経路を採らなかった理由を 1 回だけ出す (既定は黙って従来経路)。
+#[cfg(feature = "cuda")]
+fn pf_note_decline(reason: &str) {
+    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // tracing はこのモジュールのログを拾わない設定があるため eprintln にする。
+        eprintln!("[pf] resident を見送り: {reason} → 従来経路");
+    }
+}
+
+/// task 154: 常駐連鎖の失敗を要求エラーにする (途中で従来経路へ落ちると
+/// attention の KV/GDN 状態が二重に進むため、黙って切り替えない)。
+#[cfg(feature = "cuda")]
+fn pf_bail(msg: &str) -> Result<()> {
+    Err(one(format!("prefill 常駐 (DENNO_PF_RESIDENT): {msg}")))
+}
+
+/// task 154: `GgufLinear` を常駐連鎖の行列記述へ。
+#[cfg(feature = "cuda")]
+fn pf_lin(w: &GgufLinear) -> crate::cuda::PfLin<'_> {
+    crate::cuda::PfLin {
+        uid: w.uid(),
+        ty: w.ty(),
+        blocks: w.blocks().as_slice(),
+        k: w.k(),
+        n: w.n(),
+    }
+}
+
+/// task 154: この層の hc mix 6 本が常駐連鎖で回せるか (形と型)。
+///
+/// 連鎖が使う GEMM は BF16 (model の mix 本体) と F32 (inject 級) の 2 つ。
+/// 1 本でも条件を外れたら層を進める前に従来経路へ戻す (途中で落ちない)。
+fn pf_layer_ready(lw: &LayerW, e: usize, hc: usize, lr: usize) -> bool {
+    let hc_dim = hc * e;
+    Self::pf_lin_ok(&lw.hc_attn_down, hc_dim, lr)
+        && Self::pf_lin_ok(&lw.hc_attn_up, lr, hc_dim)
+        && Self::pf_lin_ok(&lw.hc_attn_inject, hc_dim, hc)
+        && Self::pf_lin_ok(&lw.hc_ffn_down, hc_dim, lr)
+        && Self::pf_lin_ok(&lw.hc_ffn_up, lr, hc_dim)
+        && Self::pf_lin_ok(&lw.hc_ffn_inject, hc_dim, hc)
+}
+
+/// task 154: 常駐連鎖が 1 本の行列を扱えるか (型と形)。
+///
+/// 実モデルでは mix の down / up が BF16、inject が F32 か Q8_0 (requant) で来る。
+/// ここを狭くしすぎると**層を 1 つも進めずに**従来経路へ落ちる (lab t154b/t154c で
+/// 実際に踏んだ) ので、pf_weight が常駐できる型をそのまま並べる。
+fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
+    use crate::kquant::GgmlType as T;
+    matches!(
+        w.ty(),
+        T::Bf16 | T::F32 | T::Q8_0 | T::Q5_1 | T::Q4K | T::Q5K
+    ) && w.k() == k
+        && w.n() == n
+}
+
+    /// task 154: デバイス常駐の prefill 本体 (`DENNO_PF_RESIDENT` の mix 側)。
+    ///
+    /// 従来の [`Self::forward_prefill_batch_core`] との違いは hc mix と hc combine
+    /// だけ:
+    ///
+    /// - チャンクの残差 `res` は開始時に 1 回だけ H2D し、層をまたいでデバイスに置く
+    /// - mix 1 段 (norm → down GEMM → lo → up GEMM → mixed → inject) をデバイスの
+    ///   1 連鎖で回し、ホストへは `mixed` (`[nt][n_embd]`) だけ落とす
+    /// - hc combine (`res += block_out * 2*sigmoid(inject)`) もデバイスで回す
+    ///
+    /// CPU が計算するもの (attention / MoE / PLE) は従来どおりで、その入出力だけが
+    /// 往復する。数値は `DENNO_MIX_BATCH_GPU=1` の既存経路と同じ (同じ GEMM カーネル・
+    /// 同じ要素演算の順序)。
+    ///
+    /// 実行できないときは **層を 1 つも進めずに** `Ok(None)` を返す (呼び出し側が
+    /// 従来経路をそのまま走らせる)。開始後に失敗したら `Err` にする — attention の
+    /// KV/GDN 状態は既に進んでいるので、黙って従来経路へ落ちると状態が二重に進む。
+    #[cfg(feature = "cuda")]
+    fn forward_prefill_batch_resident(
+        &mut self,
+        ctx: &[u32],
+        chunk: usize,
+        tokens: TapTokens,
+        mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+        mut roles: Option<&mut RoleRms>,
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        let hp = self.hp();
+        let e = self.p.n_embd;
+        let hc = hp.hc;
+        let lr = hp.low_rank;
+        let hc_dim = hc * e;
+        let n_layer = self.p.n_layer;
+        let chunk = chunk.max(1);
+        if ctx.is_empty() {
+            return Err(one("ctx が空 (現在のトークンが無い)"));
+        }
+        // 形と重みの前提は**層を進める前に**全部見る (途中で落ちると状態が進む)。
+        if hc == 0 || e == 0 || lr == 0 || hc_dim > (1 << 20) {
+            Self::pf_note_decline("形が常駐連鎖の前提外");
+            return Ok(None);
+        }
+        for il in 0..n_layer {
+            if !Self::pf_layer_ready(&self.layers[il], e, hc, lr) {
+                Self::pf_note_decline("層の重みが常駐連鎖の前提外 (型/形)");
+            return Ok(None);
+            }
+        }
+        let first_nt = chunk.min(ctx.len());
+        // 短いプロンプトは従来の CPU 経路のほうが速い (GEMM の起動と往復が勝つ)。
+        // 判定は「このリクエストの最初のチャンク」で 1 回だけ行う。
+        if first_nt < Self::PF_RESIDENT_MIN_TOK {
+            Self::pf_note_decline("64 トークン未満");
+            return Ok(None);
+        }
+        if !crate::cuda::pf_begin(first_nt, hc, e, lr) {
+            Self::pf_note_decline("作業域/PTX/GPU の前提外");
+            return Ok(None);
+        }
+        // P78: チャンクぶんの PLE は行単位でまとめて引く (従来と同じ)。
+        let ple_batch = ple_batch_enabled();
+        let mut last: Option<HyperStreams> = None;
+        let mut start = 0usize;
+        while start < ctx.len() {
+            let end = (start + chunk).min(ctx.len());
+            let nt = end - start;
+            let mut ress: Vec<HyperStreams> = Vec::with_capacity(nt);
+            let t_emb = prekprof::stamp();
+            for i in start..end {
+                ress.push(self.forward_embed(&ctx[..=i], &hp)?);
+            }
+            prekprof::mark(t_emb, prekprof::EMBED);
+            let t_ple = prekprof::stamp();
+            let ples: Vec<Option<Vec<f32>>> = if ple_batch {
+                self.gather_ple_many(&ctx[..end], start)?
+            } else {
+                let mut v: Vec<Option<Vec<f32>>> = Vec::with_capacity(nt);
+                for i in start..end {
+                    v.push(self.gather_ple(&ctx[..=i])?);
+                }
+                v
+            };
+            prekprof::mark(t_ple, prekprof::PLE);
+            // 残差をデバイスへ (チャンクで 1 回)。
+            let mut res_flat: Vec<f32> = Vec::with_capacity(nt * hc_dim);
+            for r in &ress {
+                res_flat.extend_from_slice(&r.data);
+            }
+            if !crate::cuda::pf_upload_res(&res_flat) {
+                Self::pf_bail("res の H2D に失敗")?;
+            }
+            let mut mixed_flat = vec![0.0f32; nt * e];
+            let t_lay = prekprof::stamp();
+            for il in 0..n_layer {
+                let lw = &self.layers[il];
+                if q4prof::enabled() {
+                    q4prof::N_LAYER.fetch_add(nt as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(d) = roles.as_deref_mut() {
+                    *d = RoleRms::default();
+                }
+                // 3.1 PLE 注入 (層 1 のみ)。conv 履歴はトークン順に進める。
+                // ホストで回すので、この層だけ res を往復する。
+                if let Some(pw) = &lw.ple {
+                    let mut back = vec![0.0f32; nt * hc_dim];
+                    if !crate::cuda::pf_download_res(&mut back) {
+                        Self::pf_bail("PLE 層の res の D2H に失敗")?;
+                    }
+                    // task 154: 射影 (key / value) はチャンクでまとめて回す。
+                    // 残り (RMS / gating / conv) はトークン順で、値は 1 個ずつ
+                    // 回すのとビット一致 (gemv_batch_cpu は逐次版と同じカーネル)。
+                    let mut rows: Vec<&[f32]> = Vec::with_capacity(nt);
+                    for t in 0..nt {
+                        rows.push(
+                            ples[t]
+                                .as_deref()
+                                .ok_or_else(|| one(format!("層 {il}: PLE の行が無い")))?,
+                        );
+                    }
+                    let mut streams: Vec<HyperStreams> = (0..nt)
+                        .map(|t| HyperStreams {
+                            data: back[t * hc_dim..(t + 1) * hc_dim].to_vec(),
+                            hc,
+                            n_embd: e,
+                        })
+                        .collect();
+                    let mut contrib = 0.0f32;
+                    let want = roles.is_some();
+                    let hist = self.ple_conv_state[il]
+                        .as_mut()
+                        .ok_or_else(|| one(format!("層 {il}: PLE の conv 履歴が無い")))?;
+                    ple_inject_batch(
+                        &self.p,
+                        pw,
+                        &rows,
+                        &mut streams,
+                        &hp,
+                        hist,
+                        want.then_some(&mut contrib),
+                    )?;
+                    if want {
+                        if let Some(r) = roles.as_deref_mut() {
+                            r.ple = contrib;
+                        }
+                    }
+                    for t in 0..nt {
+                        back[t * hc_dim..(t + 1) * hc_dim].copy_from_slice(&streams[t].data);
+                    }
+                    if !crate::cuda::pf_upload_res(&back) {
+                        Self::pf_bail("PLE 層の res の H2D に失敗")?;
+                    }
+                }
+
+                // 3.2-3.4 attention 入口 (デバイス mix) → attn (CPU) → combine (デバイス)
+                let t_mix = std::time::Instant::now();
+                {
+                    let _l = q4ledger::enter(q4ledger::MIX);
+                    if !crate::cuda::pf_mix(
+                        &lw.hc_attn_norm,
+                        Self::pf_lin(&lw.hc_attn_down),
+                        Self::pf_lin(&lw.hc_attn_up),
+                        Self::pf_lin(&lw.hc_attn_inject),
+                        nt,
+                        hc,
+                        e,
+                        lr,
+                        hp.eps,
+                    ) {
+                        Self::pf_bail("attn mix の連鎖に失敗")?;
+                    }
+                    if !crate::cuda::pf_take_mixed(&mut mixed_flat) {
+                        Self::pf_bail("attn mix の mixed D2H に失敗")?;
+                    }
+                }
+                q4prof::add(&q4prof::MIX, t_mix);
+                let curs: Vec<Vec<f32>> = mixed_flat.chunks_exact(e).map(|c| c.to_vec()).collect();
+                let t_attn = std::time::Instant::now();
+                let outs = {
+                    let item = if q4ledger::enabled() {
+                        match self.p.layer_kind(il) {
+                            Ok(LayerKind::FullAttn) => q4ledger::FULL,
+                            _ => q4ledger::SSM,
+                        }
+                    } else {
+                        q4ledger::OTHER
+                    };
+                    let _l = q4ledger::enter(item);
+                    self.attn.forward_batch(il, &curs)?
+                };
+                for o in &outs {
+                    if o.len() != e {
+                        return Err(one(format!(
+                            "層 {il}: attention の出力長 {} が n_embd {e} と違う",
+                            o.len()
+                        )));
+                    }
+                }
+                q4prof::add(&q4prof::ATTN, t_attn);
+                if outs.len() != nt {
+                    return Err(one(format!(
+                        "層 {il}: attention の出力本数 {} が nt {nt} と違う",
+                        outs.len()
+                    )));
+                }
+                let flat_outs = flatten_rows(&outs, e)?;
+                if let Some(r) = roles.as_deref_mut() {
+                    let t = nt - 1;
+                    let v = rms_of(&flat_outs[t * e..(t + 1) * e]);
+                    if matches!(self.p.layer_kind(il), Ok(LayerKind::FullAttn)) {
+                        r.attn = v;
+                    } else {
+                        r.gdn = v;
+                    }
+                }
+                if !crate::cuda::pf_combine(&flat_outs, nt, hc, e) {
+                    Self::pf_bail("attn の combine に失敗")?;
+                }
+
+                // 3.5-3.7 ffn 入口 (デバイス mix) → MoE (CPU/GPU) → combine (デバイス)
+                let t_mix = std::time::Instant::now();
+                {
+                    let _l = q4ledger::enter(q4ledger::MIX);
+                    if !crate::cuda::pf_mix(
+                        &lw.hc_ffn_norm,
+                        Self::pf_lin(&lw.hc_ffn_down),
+                        Self::pf_lin(&lw.hc_ffn_up),
+                        Self::pf_lin(&lw.hc_ffn_inject),
+                        nt,
+                        hc,
+                        e,
+                        lr,
+                        hp.eps,
+                    ) {
+                        Self::pf_bail("ffn mix の連鎖に失敗")?;
+                    }
+                    if !crate::cuda::pf_take_mixed(&mut mixed_flat) {
+                        Self::pf_bail("ffn mix の mixed D2H に失敗")?;
+                    }
+                }
+                q4prof::add(&q4prof::MIX, t_mix);
+                let t_moe = std::time::Instant::now();
+                let ffn = moe_ffn_quant_batch_tapped(
+                    &self.p,
+                    lw,
+                    &mixed_flat,
+                    nt,
+                    self.expert_cache.as_ref(),
+                    roles.as_deref_mut(),
+                    true,
+                )?;
+                q4prof::add(&q4prof::MOE, t_moe);
+                if ffn.len() != nt * e {
+                    return Err(one(format!(
+                        "層 {il}: MoE の出力長 {} が nt {nt} * n_embd {e} と違う",
+                        ffn.len()
+                    )));
+                }
+                if !crate::cuda::pf_combine(&ffn, nt, hc, e) {
+                    Self::pf_bail("ffn の combine に失敗")?;
+                }
+                if end == ctx.len() {
+                    if let Some(r) = roles.as_deref() {
+                        emit_role_act(il, r);
+                    }
+                }
+                // 層の出口フック (TapTokens::Last のみ): 残差 1 行だけ D2H して渡す。
+                if let Some(h) = on_layer.as_deref_mut() {
+                    let t = nt - 1;
+                    let mut row = vec![0.0f32; hc_dim];
+                    if !crate::cuda::pf_download_res_row(t, hc_dim, &mut row) {
+                        Self::pf_bail("層の出口フック用の res D2H に失敗")?;
+                    }
+                    h(&LayerOut {
+                        il,
+                        t,
+                        nt,
+                        n_embd: e,
+                        res: &row,
+                        roles: roles.as_deref(),
+                    })?;
+                }
+            }
+            prekprof::mark(t_lay, prekprof::LAYER);
+            // 最終チャンクだけ、最終 mixer 用に残差をホストへ戻す。
+            if end == ctx.len() {
+                if !crate::cuda::pf_download_res(&mut res_flat) {
+                    Self::pf_bail("最終チャンクの res の D2H に失敗")?;
+                }
+                ress.clear();
+                for t in 0..nt {
+                    ress.push(HyperStreams {
+                        data: res_flat[t * hc_dim..(t + 1) * hc_dim].to_vec(),
+                        hc,
+                        n_embd: e,
+                    });
+                }
+                last = ress.pop();
+            }
+            start = end;
+        }
+        crate::cuda::pf_release();
+        let res = last.ok_or_else(|| one("ctx が空 (現在のトークンが無い)"))?;
+        let t_mix = headprof::stamp();
+        let t_fin = prekprof::stamp();
+        let cur = hc_mix_quant(
+            &res,
+            &self.head.norm,
+            &self.head.down,
+            &self.head.up,
+            None,
+            &hp,
+        )?
+        .0;
+        headprof::mark(headprof::MIX, t_mix, 0);
+        prekprof::mark(t_fin, prekprof::FINAL_NORM);
+        let mut logits = vec![0.0f32; self.head.output.n()];
+        let t_head = prekprof::stamp();
+        self.head_logits_into(&cur, &mut logits)?;
+        prekprof::mark(t_head, prekprof::HEAD);
+        Ok(Some(vec![logits]))
+    }
+
+    /// cuda feature 無しでは常に従来経路 (`Ok(None)`)。
+    #[cfg(not(feature = "cuda"))]
+    fn forward_prefill_batch_resident(
+        &mut self,
+        _ctx: &[u32],
+        _chunk: usize,
+        _tokens: TapTokens,
+        _on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
+        _roles: Option<&mut RoleRms>,
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        Ok(None)
+    }
+
     /// 層優先のバッチ prefill の本体 (P109 で `collect_all` を追加)。
     ///
     /// `collect_all == true` は全位置の logits を返す (検証列の照合用)。
@@ -3016,6 +3420,43 @@ impl Qwen4Exp {
         let e = self.p.n_embd;
         let n_layer = self.p.n_layer;
         let chunk = chunk.max(1);
+        // task 154: hc mix / combine のデバイス常駐 (`DENNO_PF_RESIDENT`)。
+        // 観測フック付き (`on_layer`) と全位置 logits (`collect_all`) は
+        // 従来経路だけが受ける (常駐経路は層の出口をホストへ出さない)。
+        // 層の出口フックは `TapTokens::Last` だけ受ける (残差 1 行を D2H する)。
+        let pf_hook_ok = on_layer.is_none() || matches!(tokens, TapTokens::Last);
+        if pf_mix_dev_on() {
+            // 入口の状態を 1 回だけ出す (台帳だけでは「不発」の理由が読めないため)。
+            static ONCE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[pf] resident 入口: hook={} all={} ctx={} chunk={} gate={}",
+                    on_layer.is_some(),
+                    matches!(tokens, TapTokens::All),
+                    ctx.len(),
+                    chunk,
+                    pf_hook_ok
+                );
+            }
+        }
+        if pf_mix_dev_on() && pf_hook_ok && !collect_all {
+            // `as_deref_mut` だと外側の寿命に固定されて 2 回目で E0499 になる
+            // (`prefill_seq` と同じく短い寿命で借り直す)。
+            let hook: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>> = match &mut on_layer {
+                Some(f) => Some(&mut **f),
+                None => None,
+            };
+            if let Some(out) = self.forward_prefill_batch_resident(
+                ctx,
+                chunk,
+                tokens,
+                hook,
+                roles.as_deref_mut(),
+            )? {
+                return Ok(out);
+            }
+        }
         let mut last: Option<HyperStreams> = None;
         // P109: collect_all は全位置の最終残差を保持する (検証列の各位置の logits)。
         let mut all_ress: Vec<HyperStreams> = Vec::new();
@@ -4240,27 +4681,111 @@ fn ple_inject(
     res: &HyperStreams,
     hp: &HyperParams,
     hist_buf: &mut Vec<f32>,
+    contrib_rms: Option<&mut f32>,
+) -> Result<HyperStreams> {
+    // task 154: 台帳の副区間 (PLE 注入)。
+    let _sub = q4ledger::sub(q4ledger::SUB_PLE);
+    let mut key = vec![0.0f32; pw.key.n()];
+    pw.key
+        .gemv_label("ple", ple_emb, &mut key)
+        .map_err(|err| one(format!("ple_key: {err}")))?;
+    let mut value = vec![0.0f32; pw.value.n()];
+    pw.value
+        .gemv_label("ple", ple_emb, &mut value)
+        .map_err(|err| one(format!("ple_value: {err}")))?;
+    ple_inject_from_kv(p, pw, key, value, res, hp, hist_buf, contrib_rms)
+}
+
+/// task 154: チャンクぶんの PLE 注入。**射影 (key / value) だけ**をチャンクで
+/// まとめて [`gemv_batch_cpu`] に流し、残り (RMS → gating → conv → 加算) は
+/// トークン順に 1 個ずつ [`ple_inject_from_kv`] で回す。
+///
+/// 値はトークンごとの [`ple_inject`] とビット一致する:
+/// - 射影は行が独立で、CPU バッチ経路は逐次版と同じカーネル・同じ加算順
+/// - 残りは同じ関数をトークン順に呼ぶだけ (conv 履歴の進み方も同じ)
+///
+/// `last_rms` はチャンク末尾のトークンの寄与 RMS を書く (観測用)。
+#[allow(clippy::too_many_arguments)]
+fn ple_inject_batch(
+    p: &Qwen4ExpParams,
+    pw: &PleW,
+    ple_rows: &[&[f32]],
+    ress: &mut [HyperStreams],
+    hp: &HyperParams,
+    hist_buf: &mut Vec<f32>,
+    mut last_rms: Option<&mut f32>,
+) -> Result<()> {
+    let nt = ple_rows.len();
+    if nt == 0 || ress.len() != nt {
+        return Err(one(format!(
+            "ple_inject_batch: トークン数が違う (rows={nt} res={})",
+            ress.len()
+        )));
+    }
+    let _sub = q4ledger::sub(q4ledger::SUB_PLE);
+    let e = p.n_embd;
+    let hc_dim = p.hc_dim();
+    let kdim = ple_rows.first().map(|r| r.len()).unwrap_or(0);
+    if ple_rows.iter().any(|r| r.len() != kdim) {
+        return Err(one("ple_inject_batch: ple_emb の長さが揃っていない"));
+    }
+    let mut flat = Vec::with_capacity(nt * kdim);
+    for r in ple_rows {
+        flat.extend_from_slice(r);
+    }
+    let mut key = vec![0.0f32; nt * hc_dim];
+    gemv_batch_cpu(&pw.key, &flat, nt, &mut key)
+        .map_err(|err| one(format!("ple_key (batch): {err}")))?;
+    let mut value = vec![0.0f32; nt * e];
+    gemv_batch_cpu(&pw.value, &flat, nt, &mut value)
+        .map_err(|err| one(format!("ple_value (batch): {err}")))?;
+    for t in 0..nt {
+        let want = last_rms.is_some() && t + 1 == nt;
+        let mut contrib = 0.0f32;
+        let out = ple_inject_from_kv(
+            p,
+            pw,
+            key[t * hc_dim..(t + 1) * hc_dim].to_vec(),
+            value[t * e..(t + 1) * e].to_vec(),
+            &ress[t],
+            hp,
+            hist_buf,
+            want.then_some(&mut contrib),
+        )?;
+        if want {
+            if let Some(d) = last_rms.as_deref_mut() {
+                *d = contrib;
+            }
+        }
+        ress[t] = out;
+    }
+    Ok(())
+}
+
+/// task 154: 射影済みの key / value から PLE の残り (RMS → gating → conv → 加算)。
+///
+/// [`ple_inject`] の GEMV をチャンクでまとめるために切り出した。値は
+/// 1 トークンずつ回すのとビット一致する (射影は行独立)。
+#[allow(clippy::too_many_arguments)]
+fn ple_inject_from_kv(
+    p: &Qwen4ExpParams,
+    pw: &PleW,
+    key: Vec<f32>,
+    value: Vec<f32>,
+    res: &HyperStreams,
+    hp: &HyperParams,
+    hist_buf: &mut Vec<f32>,
     mut contrib_rms: Option<&mut f32>,
 ) -> Result<HyperStreams> {
     let e = p.n_embd;
     let hc = p.n_hc;
     let hc_dim = p.hc_dim();
-
-    // 1. key / value
-    let mut key = vec![0.0f32; pw.key.n()];
-    pw.key
-        .gemv_label("ple", ple_emb, &mut key)
-        .map_err(|err| one(format!("ple_key: {err}")))?;
     if key.len() != hc_dim {
         return Err(one(format!(
             "ple_key: 出力長 {} が hc_dim {hc_dim} と違う",
             key.len()
         )));
     }
-    let mut value = vec![0.0f32; pw.value.n()];
-    pw.value
-        .gemv_label("ple", ple_emb, &mut value)
-        .map_err(|err| one(format!("ple_value: {err}")))?;
     if value.len() != e {
         return Err(one(format!(
             "ple_value: 出力長 {} が n_embd {e} と違う",
@@ -8512,6 +9037,7 @@ fn gemv_rows_batch(
     nt: usize,
     outs: &mut [f32],
 ) -> Result<()> {
+    let _sub = q4ledger::sub(q4ledger::SUB_GEMM_CPU);
     if nt == 0 {
         return Ok(());
     }
@@ -8872,6 +9398,31 @@ fn gpu_gemm_into(_w: &GgufLinear, _xs: &[f32], _nt: usize, _outs: &mut [f32]) ->
 /// attn 1.04 → 1.20, moe 1.70 → 1.75 ms/層)。呼び出しごとの H2D + 起動 + 同期 +
 /// D2H が、この行列サイズ (k=320〜10240) では計算量を上回る。CPU 参照のままにする。
 pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]) -> Result<()> {
+    gemv_batch_inner(w, xs, nt, outs, false)
+}
+
+/// [`gemv_batch`] の **CPU 固定**版 (task 154)。
+///
+/// 量子型でも GPU GEMM を試さず、逐次版と同じカーネル・同じ加算順で回す。
+/// トークン方向にだけ並列化するので、1 トークンずつ `gemv` を呼ぶのと
+/// **ビット一致**する。PLE の射影 (チャンクでまとめたいが数値を動かしたくない)
+/// に使う。
+pub(crate) fn gemv_batch_cpu(
+    w: &GgufLinear,
+    xs: &[f32],
+    nt: usize,
+    outs: &mut [f32],
+) -> Result<()> {
+    gemv_batch_inner(w, xs, nt, outs, true)
+}
+
+fn gemv_batch_inner(
+    w: &GgufLinear,
+    xs: &[f32],
+    nt: usize,
+    outs: &mut [f32],
+    cpu_only: bool,
+) -> Result<()> {
     let (k, n) = (w.k(), w.n());
     match w.ty() {
         GgmlType::Q8_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K => {
@@ -8880,7 +9431,7 @@ pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]
             // `DENNO_GPU_GEMM=0` で切れる。false なら CPU バッチへ落ちる。
             // P39: cfg は `gpu_gemm_into` 側に閉じている (`cuda` feature 無しでは
             // 常に false を返す) ので、ここに cfg は要らない。
-            if gpu_gemm_into(w, xs, nt, outs) {
+            if !cpu_only && gpu_gemm_into(w, xs, nt, outs) {
                 #[cfg(test)]
                 GEMV_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(());
@@ -8903,6 +9454,7 @@ pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]
         // トークンブロックで使い回す」経路へ流す。値は逐次版と同じ規則
         // (行内は i 昇順の逐次加算) で、型ごとの分岐を増やさない。
         GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => {
+            let _sub = q4ledger::sub(q4ledger::SUB_GEMM_CPU);
             if nt == 0 {
                 return Ok(());
             }
@@ -8947,6 +9499,7 @@ pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]
         // IQ2_S / Q2_0 / IQ4_NL 等) は、無量子型と同じ「行を f32 に開いて
         // トークンブロックで使い回す」経路へ流す (型ごとの分岐を増やさない)。
         ty if crate::kquant::dequant_supported(ty) => {
+            let _sub = q4ledger::sub(q4ledger::SUB_GEMM_CPU);
             if nt == 0 {
                 return Ok(());
             }
@@ -8977,6 +9530,7 @@ pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]
 
 /// 重みを 1 行ずつ f32 へ開く (行は独立なので rayon で分割してよい)。
 fn dequant_rows_f32(ty: GgmlType, bytes: &[u8], rb: usize, k: usize, n: usize) -> Vec<f32> {
+    let _sub = q4ledger::sub(q4ledger::SUB_DEQUANT);
     let mut wf = vec![0.0f32; n * k];
     #[cfg(feature = "par")]
     {
@@ -9070,6 +9624,7 @@ fn expert_gemv_batch(
 
 /// 行のベクタを 1 本の平坦な配列に連結する ([`gemv_batch`] の入力形式)。
 fn flatten_rows(rows: &[Vec<f32>], width: usize) -> Result<Vec<f32>> {
+    let _sub = q4ledger::sub(q4ledger::SUB_LAYOUT);
     let mut out = Vec::with_capacity(rows.len() * width);
     for (t, r) in rows.iter().enumerate() {
         if r.len() != width {
@@ -9144,6 +9699,100 @@ fn prefill_batch_chunk() -> usize {
             .map(|n| n.clamp(1, 512))
             .unwrap_or(512)
     })
+}
+
+// ---------------------------------------------------------------------------
+// task 154: prefill の GPU 常駐 (`DENNO_PF_RESIDENT`)
+// ---------------------------------------------------------------------------
+//
+// 動機 (lab t151c の 14,018 トークン prefill の台帳): h2d 111 GB / d2h 168 GB /
+// sync 36,208 回。host 側 (cpu 列) が約 150 s で、内訳は GDN コア (ssm)、
+// hc mix の要素演算、hc combine、PLE、埋め込み。ここでは
+//
+// - `DENNO_PF_GDN_GPU`: ssm 層の GDN コアを GPU の sigmoid スキャンで回す
+// - `DENNO_PF_MIX_DEV`: hc mix (norm → down → lo → up → mixed → inject) と
+//   hc combine をデバイス上の 1 連鎖で回し、活性をチャンク中 GPU に置く
+//
+// の 2 つを 1 つの master ゲートで束ねる。**既定 on** (lab t154e で採用。
+// `DENNO_PF_RESIDENT=0` で従来経路に戻る)。
+
+/// 副ゲートの解釈 (純関数)。明示的な真値だけ on (未設定は master を見る)。
+pub(crate) fn pf_on_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+        None => false,
+    }
+}
+
+/// task 154: master ゲート (`DENNO_PF_RESIDENT`) の解釈 (純関数)。**既定 on**。
+///
+/// `0` / `off` / `false` / `no` のときだけ無効。未設定と空文字は既定 (on)。
+/// lab t154e (base = このゲート off) の実測: cold prefill 3,826 tok
+/// 63.05 -> 49.52 s (-21.5%)、14,018 tok 210.39 -> 153.69 s (-26.9%)、decode
+/// 54 -> 53 ms/tok。`DENNO_PF_RESIDENT=0` で従来経路に戻せる。
+pub(crate) fn pf_resident_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => true,
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+    }
+}
+
+/// task 154: prefill を GPU 常駐にするか (`DENNO_PF_RESIDENT`、既定 on)。
+pub(crate) fn pf_resident_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_resident_from_value(std::env::var("DENNO_PF_RESIDENT").ok().as_deref())
+    })
+}
+
+/// 副ゲートの上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。テスト用。
+static PF_SUB_OVERRIDE: [std::sync::atomic::AtomicU8; 2] =
+    [const { std::sync::atomic::AtomicU8::new(0) }; 2];
+
+/// 副ゲートの番号: 0 = GDN、1 = mix/combine。
+pub(crate) const PF_SUB_GDN: usize = 0;
+/// 副ゲートの番号: mix/combine。
+pub(crate) const PF_SUB_MIX: usize = 1;
+
+/// task 154: テスト専用: 副ゲートの on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_pf_sub_for_test(which: usize, v: Option<bool>) {
+    PF_SUB_OVERRIDE[which].store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn pf_sub_on(which: usize, env: &str) -> bool {
+    match PF_SUB_OVERRIDE[which].load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    match std::env::var(env) {
+        Ok(v) => pf_on_from_value(Some(&v)),
+        Err(_) => pf_resident_on(),
+    }
+}
+
+/// ssm 層の GDN コアを GPU スキャンで回すか (`DENNO_PF_GDN_GPU`、未設定は master)。
+pub(crate) fn pf_gdn_gpu_on() -> bool {
+    pf_sub_on(PF_SUB_GDN, "DENNO_PF_GDN_GPU")
+}
+
+/// hc mix と hc combine をデバイス連鎖で回すか (`DENNO_PF_MIX_DEV`、未設定は master)。
+pub(crate) fn pf_mix_dev_on() -> bool {
+    pf_sub_on(PF_SUB_MIX, "DENNO_PF_MIX_DEV")
 }
 
 /// `DENNO_PLE_BATCH` の値の解釈 (純粋関数)。**既定 on**。
@@ -10702,6 +11351,8 @@ fn moe_ffn_quant_batch_full(
         .map_err(|err| one(format!("層 {}: ffn_gate_inp (batch): {err}", lw.il)))?;
 
     // 2. トークンごとの softmax (行は独立なので並列化しても値は変わらない)
+    // task 154: 台帳の副区間 (softmax + top-k)。
+    let _sub_sm = q4ledger::sub(q4ledger::SUB_SOFTMAX);
     #[cfg(feature = "par")]
     {
         use rayon::prelude::*;
@@ -10748,6 +11399,7 @@ fn moe_ffn_quant_batch_full(
             renorm(pr, &sels[t * k..(t + 1) * k], &mut weights[t * k..(t + 1) * k]);
         }
     }
+    drop(_sub_sm);
     moe_sub_add(0, t_router.elapsed());
     // 区間を閉じる (experts の時間を router に二重計上しない)。
     drop(_l_router);
@@ -15713,6 +16365,28 @@ mod tests {
             }
         }
 
+        /// task 154: `DENNO_PF_RESIDENT` (master。既定 on) と副ゲートの真理値表。
+        #[test]
+        fn pf_gate_truth_table() {
+            // master: 未設定と空文字は既定 (on)、明示的な偽値だけ off。
+            assert!(pf_resident_from_value(None), "未設定は on (lab t154e で採用)");
+            assert!(pf_resident_from_value(Some("")), "空文字は既定 (on)");
+            for v in ["0", "off", "false", "no", " OFF ", " 0 "] {
+                assert!(!pf_resident_from_value(Some(v)), "{v:?} が on になった");
+            }
+            for v in ["1", "on", "true", "yes", " ON "] {
+                assert!(pf_resident_from_value(Some(v)), "{v:?} が off になった");
+            }
+            // 副ゲート: 未設定は master を見るので、ここでは明示値だけを固定する。
+            assert!(!pf_on_from_value(None), "未設定は off (副ゲートは master に従う)");
+            for v in ["0", "off", "false", "no", "", " 0 "] {
+                assert!(!pf_on_from_value(Some(v)), "{v:?} が on になった");
+            }
+            for v in ["1", "on", "true", "yes", " ON "] {
+                assert!(pf_on_from_value(Some(v)), "{v:?} が off になった");
+            }
+        }
+
         /// task 145: `DENNO_MIX_BATCH_GPU` の真理値表 (既定 on) と、バッチ mix の
         /// 門番 (BF16 / nt >= 64 / 積 >= 4M) の境界。GPU 無しでも検証できる。
         #[test]
@@ -15766,6 +16440,124 @@ mod tests {
             let on = m2.forward_prefill_with(&ctx, true).expect("prefill (on)");
 
             set_mix_batch_gpu_for_test(None);
+            assert_eq!(off.len(), on.len(), "logits の長さが違う");
+            for (i, (a, b)) in off.iter().zip(on.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "logits[{i}] が違う ({a} != {b})");
+            }
+        }
+
+        /// task 154: `pf_lin_ok` は常駐連鎖が扱える型 (BF16 / F32 / 量子 4 種) を
+        /// 受け、形が違えば落とす。lab t154b/t154c では inject (Q8_0) を弾いて
+        /// 常駐経路が丸ごと不発になったので、型の受容をここで固定する。
+        #[test]
+        fn pf_lin_ok_accepts_quant_and_rejects_shape() {
+            use crate::kquant::GgmlType as T;
+            use crate::model::linear_gguf::GgufLinear;
+            let k = 64usize;
+            let n = 2usize;
+            let ty_bytes = |ty: T| -> Vec<u8> {
+                match ty {
+                    T::F32 => vec![0u8; k * n * 4],
+                    T::Bf16 => vec![0u8; k * n * 2],
+                    T::Q8_0 => vec![0u8; (k / 32) * 34 * n],
+                    T::Q5_1 => vec![0u8; (k / 32) * 24 * n],
+                    T::Q4K | T::Q5K => vec![0u8; (k / 256).max(1) * 144 * n + 4096],
+                    _ => Vec::new(),
+                }
+            };
+            for ty in [T::F32, T::Bf16, T::Q8_0, T::Q5_1] {
+                let l = GgufLinear::from_slice(ty, k, n, &ty_bytes(ty)).expect("linear");
+                assert!(Qwen4Exp::pf_lin_ok(&l, k, n), "{ty:?} が弾かれた");
+                assert!(!Qwen4Exp::pf_lin_ok(&l, k, n + 1), "{ty:?}: 形違いを通した");
+                assert!(!Qwen4Exp::pf_lin_ok(&l, k + 32, n), "{ty:?}: k 違いを通した");
+            }
+        }
+
+        /// task 154: PLE の射影をチャンクでまとめても値はビット一致する
+        /// (`gemv_batch_cpu` は逐次版と同じカーネル・同じ加算順)。
+        #[test]
+        fn ple_inject_batch_matches_per_token_bits() {
+            let _g = moe_test_guard();
+            let dir = TempDir::new("ple_inject_batch");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("open");
+            let m = Qwen4Exp::new(&f).expect("new");
+            let il = PLE_LAYER;
+            let pw = m.layers[il].ple.as_ref().expect("PLE 層");
+            let hp = m.hp();
+            let e = m.p.n_embd;
+            let hc = hp.hc;
+            let hc_dim = hc * e;
+            let nt = 5usize;
+            let mut rnd = 0x1234_5678u64;
+            let mut next = move || {
+                rnd = rnd
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((rnd >> 33) as f32) / (u32::MAX as f32) - 0.5
+            };
+            let base: Vec<f32> = (0..nt * hc_dim).map(|_| 0.2 * next()).collect();
+            let emb_len = pw.key.k();
+            let emb: Vec<f32> = (0..nt * emb_len).map(|_| 0.2 * next()).collect();
+            let mk = |data: &[f32]| -> Vec<HyperStreams> {
+                (0..nt)
+                    .map(|t| HyperStreams {
+                        data: data[t * hc_dim..(t + 1) * hc_dim].to_vec(),
+                        hc,
+                        n_embd: e,
+                    })
+                    .collect()
+            };
+            let mut a = mk(&base);
+            let mut b = mk(&base);
+            let hist_len = (pw.kern - 1) * m.p.ple_ngram_size * hc_dim;
+            let mut hist_a: Vec<f32> = (0..hist_len)
+                .map(|i| 0.05 * (((i * 7) % 13) as f32 - 6.0))
+                .collect();
+            let mut hist_b = hist_a.clone();
+            for t in 0..nt {
+                let pe = &emb[t * emb_len..(t + 1) * emb_len];
+                a[t] = ple_inject(&m.p, pw, pe, &a[t], &hp, &mut hist_a, None).expect("逐次");
+            }
+            let rows: Vec<&[f32]> = (0..nt).map(|t| &emb[t * emb_len..(t + 1) * emb_len]).collect();
+            ple_inject_batch(&m.p, pw, &rows, &mut b, &hp, &mut hist_b, None).expect("バッチ");
+            for t in 0..nt {
+                let want: Vec<u32> = a[t].data.iter().map(|v| v.to_bits()).collect();
+                let got: Vec<u32> = b[t].data.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(want, got, "トークン {t} の出力がビット不一致");
+            }
+            let want: Vec<u32> = hist_a.iter().map(|v| v.to_bits()).collect();
+            let got: Vec<u32> = hist_b.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(want, got, "conv 履歴がビット不一致");
+        }
+
+        /// task 154: 常駐ゲートを on にしても、GPU / PTX / 形の前提が無ければ
+        /// 常駐経路は **層を 1 つも進めずに** 従来経路へ戻る (logits はビット一致・
+        /// attention の状態も 1 回ぶんだけ進む)。
+        #[test]
+        fn pf_resident_declines_identically_without_gpu() {
+            let _g = moe_test_guard();
+            let dir = TempDir::new("pf_resident_fallback");
+            let path = build(&dir);
+            let ctx: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+
+            for w in [PF_SUB_GDN, PF_SUB_MIX] {
+                set_pf_sub_for_test(w, Some(false));
+            }
+            let mut m1 = Qwen4Exp::new(&GgufFile::open(&path).expect("open")).expect("new");
+            let off = m1.forward_prefill_with(&ctx, true).expect("prefill (off)");
+
+            for w in [PF_SUB_GDN, PF_SUB_MIX] {
+                set_pf_sub_for_test(w, Some(true));
+            }
+            // master は既定 on (真理値表は `pf_gate_truth_table`)。GPU / PTX が無い
+            // この環境では入口の `pf_begin` が false を返し、層を進めずに従来経路へ
+            // 落ちる。ここで見るのは「落ちたときの logits が off と同一」であること。
+            let mut m2 = Qwen4Exp::new(&GgufFile::open(&path).expect("open")).expect("new");
+            let on = m2.forward_prefill_with(&ctx, true).expect("prefill (on)");
+            for w in [PF_SUB_GDN, PF_SUB_MIX] {
+                set_pf_sub_for_test(w, None);
+            }
             assert_eq!(off.len(), on.len(), "logits の長さが違う");
             for (i, (a, b)) in off.iter().zip(on.iter()).enumerate() {
                 assert_eq!(a.to_bits(), b.to_bits(), "logits[{i}] が違う ({a} != {b})");
