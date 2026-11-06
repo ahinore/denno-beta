@@ -6,6 +6,7 @@ pub mod exp_pf;
 pub mod expert_batch;
 pub mod expert_cache;
 pub mod exp_kprof;
+pub mod exp_stats;
 pub mod expert_vram;
 pub mod gemm_iq_kprof;
 pub mod gpt2;

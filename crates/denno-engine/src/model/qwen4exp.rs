@@ -3329,6 +3329,88 @@ fn mix_chain_enabled() -> bool {
     *ON.get_or_init(|| mix_chain_from_value(std::env::var("DENNO_MIX_CHAIN").ok().as_deref()))
 }
 
+/// task 150: `DENNO_DECODE_CHAIN2` の値を解釈する (純関数・テスト用)。
+/// **既定 on** (`DENNO_MIX_CHAIN` と同じ規則。明示的な偽値 `0` / `off` / `false` /
+/// `no` だけ切る)。lab t150b で目標を満たしたため t150 の最終コミットで既定を
+/// off から on へ反転した (採用条件は REPORT_P150.md)。
+fn decode_chain2_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// task 150: decode の GPU 往復を減らす束ねゲート (`DENNO_DECODE_CHAIN2`、
+/// lab t150b で採用・**既定 on**)。
+///
+/// 中の変更は部分ゲートで個別に切れる:
+/// - [`decode_chain2_exp_enabled`]: 選択 expert の IQ 層一括 GEMV を CPU ミスと重ねる。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn decode_chain2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        decode_chain2_from_value(std::env::var("DENNO_DECODE_CHAIN2").ok().as_deref())
+    })
+}
+
+/// task 150: `DENNO_DECODE_CHAIN2_EXP` の値を解釈する (純関数・テスト用)。
+/// **既定 on** で、明示的な偽値 (`0` / `off` / `false` / `no`) だけ切る。
+fn decode_chain2_exp_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// task 150: 束ねゲートと部分ゲートの合成 (純関数・テスト用)。
+/// 部分ゲートは束ねゲートが on のときだけ効く。
+fn chain2_exp_active(chain2: bool, exp_flag: bool) -> bool {
+    chain2 && exp_flag
+}
+
+/// task 150: `DENNO_DECODE_CHAIN2_MIX` の値を解釈する (純関数・テスト用)。
+/// 部分ゲート `DENNO_DECODE_CHAIN2_EXP` と同じ規則 (既定 on・明示的な偽値だけ切る)。
+fn decode_chain2_mix_from_value(v: Option<&str>) -> bool {
+    decode_chain2_exp_from_value(v)
+}
+
+/// task 150: hc mix の hc_mixed まで GPU で閉じる (`DENNO_DECODE_CHAIN2_MIX`、
+/// 既定 on)。`DENNO_DECODE_CHAIN2` が on のときだけ意味を持つ。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn decode_chain2_mix_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    chain2_exp_active(
+        decode_chain2_enabled(),
+        *ON.get_or_init(|| {
+            decode_chain2_mix_from_value(
+                std::env::var("DENNO_DECODE_CHAIN2_MIX").ok().as_deref(),
+            )
+        }),
+    )
+}
+
+/// task 150: 選択 expert の IQ 層一括 GEMV を CPU ミスと重ねる
+/// (`DENNO_DECODE_CHAIN2_EXP`、既定 on)。`DENNO_DECODE_CHAIN2` が on のときだけ
+/// 意味を持つ (束ねゲート off では従来どおり GEMV の完了を待ってから CPU を回す)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn decode_chain2_exp_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    chain2_exp_active(
+        decode_chain2_enabled(),
+        *ON.get_or_init(|| {
+            decode_chain2_exp_from_value(
+                std::env::var("DENNO_DECODE_CHAIN2_EXP").ok().as_deref(),
+            )
+        }),
+    )
+}
+
 /// task 145: `DENNO_MIX_BATCH_GPU` の解釈 (純関数)。**既定 on**。
 /// 明示的な偽値 (`0` / `off` / `false` / `no`) のときだけ切る。
 /// on のとき、prefill のバッチ mix (BF16 の down / up) を GPU の
@@ -3756,13 +3838,47 @@ fn hc_mix_quant_fast(
         let t = mix_kprof::stamp();
         mix_kprof::rowpar::set_label(mix_kprof::rowpar::L_DOWN);
         let hc_fast = hc_mix_fast_enabled();
+        // task 150: down → lo_apply → up → **hc_mixed** まで GPU で閉じる経路
+        // (`DENNO_DECODE_CHAIN2` + `DENNO_DECODE_CHAIN2_MIX`、両方 BF16 のとき)。
+        // 従来 (task 138 の chain) は up の出力 gate[hc*e] を D2H してホストで
+        // sigmoid 4 本 x e の加算を回していた (実測 34 us/回 x 97 回/token)。
+        // ここでは dno_hc_mixed_f32 が同じ丸め順で mixed[e] を作るので、D2H は
+        // 1/hc になり、ホストの計算は無くなる (値はビット一致)。
+        let mut chain2_mixed: Option<Vec<f32>> = None;
+        #[cfg(feature = "cuda")]
+        if mix_gpu_enabled()
+            && mix_chain_enabled()
+            && decode_chain2_mix_enabled()
+            && down.ty() == crate::kquant::GgmlType::Bf16
+            && up.ty() == crate::kquant::GgmlType::Bf16
+        {
+            let mut m = vec![0.0f32; e];
+            if crate::cuda::maybe_gpu_mix_bf16_chain2_into(
+                down.uid(),
+                down.blocks().as_slice(),
+                down.k(),
+                down.n(),
+                up.uid(),
+                up.blocks().as_slice(),
+                up.k(),
+                up.n(),
+                1.0f32 / hp.hc as f32,
+                e,
+                xn,
+                &mut m,
+            ) {
+                chain2_mixed = Some(m);
+            }
+        }
+        let gpu_chain2 = chain2_mixed.is_some();
         // task 138: down → lo_apply → up を 1 回の同期に畳む経路
         // (`DENNO_MIX_GPU` on・既定 on の `DENNO_MIX_CHAIN`・両方 BF16 のとき)。
         // 丸めは従来の GPU 経路と同じ (silu は dno_expf = glibc expf のビット一致
         // 実装) なので、通れば logits は従来とビット一致する。不発なら下の
         // 2 往復経路へそのまま落ちる。
         #[cfg(feature = "cuda")]
-        let gpu_chain = mix_gpu_enabled()
+        let gpu_chain = !gpu_chain2
+            && mix_gpu_enabled()
             && mix_chain_enabled()
             && down.ty() == crate::kquant::GgmlType::Bf16
             && up.ty() == crate::kquant::GgmlType::Bf16
@@ -3781,7 +3897,14 @@ fn hc_mix_quant_fast(
             );
         #[cfg(not(feature = "cuda"))]
         let gpu_chain = false;
-        if gpu_chain {
+        if gpu_chain2 {
+            // chain2 は down/up/hc_mixed を 1 回の同期で閉じる (内訳は chain と同じ
+            // 規則で down に積む)。
+            mix_kprof::gemv::note_down(t, down.ty());
+            mix_kprof::gemv::note_up(t, up.ty());
+            mix_kprof::rowpar::set_label(mix_kprof::rowpar::NONE);
+            mix_kprof::mark(t, mix_kprof::DOWN);
+        } else if gpu_chain {
             // 内訳は down/up の 2 区間に同じ区間を積む (合計は chain 1 回のまま)。
             mix_kprof::gemv::note_down(t, down.ty());
             mix_kprof::gemv::note_up(t, up.ty());
@@ -3861,8 +3984,16 @@ fn hc_mix_quant_fast(
         // task 106: 合成は戻り値に直接書く (scratch へ書いて `to_vec()` で写す
         // 旧形から、10 KB の写しを消す。同じ [`hyper::hc_mixed_into_par`] なので
         // 値はビット一致)。`mixed` scratch は batch 経路 (`hc_mix_quant_batch`) 専用。
-        let mut out = vec![0.0f32; e];
-        hyper::hc_mixed_into_par(xn, gate, &mut out, hp);
+        // task 150: chain2 が通ったときは GPU が mixed まで作っている (ホストの
+        // hc_mixed は回さない)。
+        let mut out = match chain2_mixed {
+            Some(m) => m,
+            None => {
+                let mut out = vec![0.0f32; e];
+                hyper::hc_mixed_into_par(xn, gate, &mut out, hp);
+                out
+            }
+        };
         mix_kprof::mark(t, mix_kprof::MIXED);
 
         let inj = match inject {
@@ -6785,6 +6916,11 @@ fn moe_ffn_quant_impl(
     // task 138: router の区間はここまで (expert の CPU 仕事は台帳の外 = other)。
     drop(_l_router);
 
+    // task 146: (層, expert) の使用回数を積む (起動時の事前ロード用)。
+    // ゲート off では `stats_path()` の atomic load 1 回で返る。
+    // decode 1 トークン = 48 層 x 10 本 = 480 回の `fetch_add` (Relaxed)。
+    crate::model::exp_stats::observe_layer(p.n_layer, p.n_expert, lw.il, &sel);
+
     // 3.5 選択 expert の重みを先に読み始める (I/O と計算を重ねる)。
     //     1 トークンで 48 層 × 11 行列 × 921 KB を触るので、フォルト待ちが支配的になる。
     //     キャッシュ経路は pread で必要ぶんだけ読むので、mmap のページフォルトを
@@ -7421,6 +7557,96 @@ fn iq_expert_mode(lw: &LayerW) -> bool {
         .all(|t| crate::model::exp_iq::supported(*t))
 }
 
+/// task 150: ミスした expert の寄与を `dst` (`sel.len() * e`) へ直接書く。
+///
+/// 1 expert の計算は [`expert_contribs_par`] と同じ [`ExpertW::gemv_seq`] を同じ順で
+/// 通るので、寄与はビット一致する (足し込みは呼び出し側が index 昇順の逐次)。
+/// `par` 無しのビルドでは逐次で同じものを書く。
+#[cfg(feature = "cuda")]
+fn expert_miss_contribs_into(
+    lw: &LayerW,
+    sel: &[usize],
+    x: &[f32],
+    e: usize,
+    ff: usize,
+    dst: &mut [f32],
+) -> Result<()> {
+    debug_assert_eq!(dst.len(), sel.len() * e, "dst は sel.len()*e");
+    #[cfg(feature = "par")]
+    {
+        expert_contribs_par_into(lw, sel, x, e, ff, None, dst)
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        // par 無しのビルドでも同じ寄与 (1 expert = gemv_seq を 3 回)。
+        let mut act = vec![0.0f32; ff];
+        let mut up = vec![0.0f32; ff];
+        for (t, &ei) in sel.iter().enumerate() {
+            let h = &mut dst[t * e..(t + 1) * e];
+            lw.gate_exps.gemv_seq(ei, x, &mut act)?;
+            silu_inplace(&mut act);
+            lw.up_exps.gemv_seq(ei, x, &mut up)?;
+            for r in 0..ff {
+                act[r] *= up[r];
+            }
+            lw.down_exps.gemv_seq(ei, &act, h)?;
+        }
+        Ok(())
+    }
+}
+
+/// task 150: ミスの寄与を「何本ぶん書くか」(`overlap` でなければ 0)。
+///
+/// `miss_h` の確保長と [`scatter_contribs`] に渡す表を**同じ値**から作るための
+/// 唯一の入口 (片方だけ `miss_pos.len()` を使うと長さ検査で落ちる。lab t150a で
+/// CHAIN2=0 の全リクエストがこれで落ちた)。
+#[cfg(feature = "cuda")]
+fn miss_slots(overlap: bool, n_miss: usize) -> usize {
+    if overlap {
+        n_miss
+    } else {
+        0
+    }
+}
+
+/// task 150: GPU のヒット (`pos` / `h`) と CPU ミス (`miss_pos` / `miss_h`) の寄与を
+/// `sel` の並び (`hs`) へ戻す。
+///
+/// 位置と寄与の対応が 1 つずれると静かに別の expert の値を足すことになるので、
+/// 長さと範囲を検査して落とす (どちらも呼び出し側の作った表なので、ここが最後の砦)。
+#[cfg(feature = "cuda")]
+fn scatter_contribs(
+    hs: &mut [Option<Vec<f32>>],
+    pos: &[usize],
+    h: &[f32],
+    miss_pos: &[usize],
+    miss_h: &[f32],
+    e: usize,
+) -> Result<()> {
+    if e == 0 || h.len() != pos.len() * e || miss_h.len() != miss_pos.len() * e {
+        return Err(one(format!(
+            "expert 寄与の長さが合わない (h {} / pos {} / miss {} / miss_pos {} / e {e})",
+            h.len(),
+            pos.len(),
+            miss_h.len(),
+            miss_pos.len()
+        )));
+    }
+    for (i, &t) in pos.iter().enumerate() {
+        let slot = hs
+            .get_mut(t)
+            .ok_or_else(|| one(format!("hit 位置 {t} が hs の範囲外")))?;
+        *slot = Some(h[i * e..(i + 1) * e].to_vec());
+    }
+    for (i, &t) in miss_pos.iter().enumerate() {
+        let slot = hs
+            .get_mut(t)
+            .ok_or_else(|| one(format!("miss 位置 {t} が hs の範囲外")))?;
+        *slot = Some(miss_h[i * e..(i + 1) * e].to_vec());
+    }
+    Ok(())
+}
+
 /// task 144: IQ 系の型を **ヒットだけ GPU / ミスは CPU** で回す層一括経路。
 ///
 /// # 何が違うか
@@ -7509,7 +7735,45 @@ fn moe_experts_iq_gpu_batched(
     let seg_gu = crate::model::expert_batch::seg_table_shared_x(&ids, ff);
     let seg_d = crate::model::expert_batch::seg_table_per_act(&ids, ff, e);
     let mut h = vec![0.0f32; devs.len() * e];
-    let ran = {
+    // task 150 (`DENNO_DECODE_CHAIN2_EXP`): ミス (VRAM に載っていない expert) の寄与を
+    // GPU の完了前に CPU で計算し、同期をその裏へ隠す。ミスの位置と id を先に作り、
+    // overlap 経路ではコールバックの中で `miss_h` へ書かせる (足し込みは従来どおり
+    // 呼び出し側が index 昇順の逐次)。
+    let overlap = decode_chain2_exp_enabled();
+    let mut is_hit = vec![false; sel.len()];
+    for &t in pos.iter() {
+        is_hit[t] = true;
+    }
+    let miss_pos: Vec<usize> = (0..sel.len()).filter(|&t| !is_hit[t]).collect();
+    let miss_ids: Vec<usize> = miss_pos.iter().map(|&t| sel[t]).collect();
+    // ミスの寄与を書き込む先は overlap のときだけ。確保長と scatter に渡す表は
+    // 必ず同じ値から作る ([`miss_slots`])。
+    let n_miss_used = miss_slots(overlap, miss_pos.len());
+    let miss_slice: &[usize] = &miss_pos[..n_miss_used];
+    let mut miss_h = vec![0.0f32; n_miss_used * e];
+    let ran = if overlap {
+        // 台帳の exp_iq 区間は取らない (同期が CPU ミスの後ろへ移るので、GPU の
+        // 待ちだけを切り出せない)。起動と同期は `experts` 行に入る。
+        crate::cuda::moe_experts_iq_layer_overlap(
+            lw.gate_exps.ty,
+            lw.up_exps.ty,
+            lw.down_exps.ty,
+            &pg,
+            &pu,
+            &pd,
+            &seg_gu,
+            &seg_d,
+            x,
+            x.len(),
+            ff,
+            e,
+            &mut h,
+            || {
+                expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_h)
+                    .map_err(anyhow::Error::from)
+            },
+        )
+    } else {
         // task 138 の台帳に「1 層あたりの GPU 時間」を積む (DENNO_Q4_PROFILE=1 のときだけ)。
         let _l = crate::model::q4ledger::enter(crate::model::q4ledger::EXPERT);
         crate::cuda::moe_experts_iq_layer(
@@ -7527,16 +7791,16 @@ fn moe_experts_iq_gpu_batched(
             e,
             &mut h,
         )
-        .map_err(|err| one(format!("層 {}: IQ 層一括 GEMV: {err:#}", lw.il)))?
-    };
+    }
+    .map_err(|err| one(format!("層 {}: IQ 層一括 GEMV: {err:#}", lw.il)))?;
     if !ran {
         return Ok(None);
     }
 
     let mut hs: Vec<Option<Vec<f32>>> = vec![None; sel.len()];
-    for (i, &t) in pos.iter().enumerate() {
-        hs[t] = Some(h[i * e..(i + 1) * e].to_vec());
-    }
+    // task 150: overlap のときはミスも CPU で計算済みなので、両方をここで揃える
+    // (呼び出し側は `None` を見ない = CPU を二度回さない)。
+    scatter_contribs(&mut hs, &pos, &h, miss_slice, &miss_h, e)?;
 
     // 3. DENNO_EXPERT_GPU_CHECK=1: CPU の 3 行列と突き合わせる (層ごとに 1 行)。
     if expert_vram::check_enabled() {
@@ -7669,7 +7933,247 @@ fn iq_warm_misses(lw: &LayerW, sel: &[usize], x_len: usize, e: usize, ff: usize,
     }
 }
 
-/// `cuda` feature 無しでは層一括経路は無い (常に `None` = per-expert 経路)。
+/// task 146: 全層の expert 3 行列の合計バイト数 (使用回数ファイルのモデル同一性)。
+///
+/// テンソルのヘッダだけを見るので mmap のページは触らない。名前・層数が変わった
+/// モデルの記録を取り違えないための値。
+pub fn expert_identity_bytes(f: &GgufFile, p: &Qwen4ExpParams) -> u64 {
+    let mut total = 0u64;
+    for il in 0..p.n_layer {
+        for m in ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"] {
+            let name = format!("blk.{il}.{m}");
+            if let Some((_, _, len)) = f.tensor_mapping_parts(&name) {
+                total = total.saturating_add(len as u64);
+            }
+        }
+    }
+    total
+}
+
+/// task 146: 記録した使用回数の上位から VRAM へ事前ロードする (起動時の背景スレッド)。
+///
+/// 呼び出し側 ([`crate::model::exp_stats`] と CLI) の契約:
+///
+/// - ゲートは `DENNO_EXPERT_IQ_GPU=1` かつ `DENNO_EXPERT_IQ_STATS_FILE` が設定
+///   されていること ([`crate::model::exp_stats::enabled`])。呼ばれても、ファイルが
+///   無い・壊れている・版違い・別モデルなら **何も載せずに 1 行だけ返す**。
+///   起動もリクエストも落とさない。
+/// - **回数の多い順に載せ、載せ終わったら少ない順に touch し直す**。
+///   途中で切れても (最初のリクエストが来て decode に譲った場合) 上位が載って
+///   いるようにするため。touch は H2D しないので、完了後は「一番よく使う expert が
+///   一番最後に触られて = 一番追い出されにくい」になる。予算
+///   (`DENNO_EXPERT_VRAM_MB` - 予備) に届いたら止める。
+/// - decode 中 (`exp_stats::busy()`) は載せない。2 ms 寝て待ち、空いたら続きから。
+///   1 本の H2D は 0.3 ms 程度だが、LRU のロックを持つ間 decode の `lookup` が
+///   待つので、そもそも重ならないようにしてある。
+///
+/// 戻り値は 1 行のログ (呼び出し側が `eprintln!` する)。
+#[cfg(feature = "cuda")]
+pub fn preload_experts_from_stats(
+    parts: &[std::path::PathBuf],
+    dir_name: &str,
+) -> Option<String> {
+    use crate::model::exp_stats;
+    use crate::model::expert_vram::ExpertShape;
+    use std::time::{Duration, Instant};
+
+    let path = exp_stats::stats_path()?;
+    let t0 = Instant::now();
+    let f = match GgufFile::open_split(parts) {
+        Ok(f) => f,
+        Err(e) => return Some(format!("[exp-preload] off: GGUF を開けない: {e}")),
+    };
+    let p = match Qwen4ExpParams::from_meta(&f) {
+        Ok(p) => p,
+        Err(e) => return Some(format!("[exp-preload] off: メタデータを読めない: {e}")),
+    };
+    let total_bytes = expert_identity_bytes(&f, &p);
+    let zeros = |dir: &str| {
+        exp_stats::Counts::zeros(dir, total_bytes, p.n_layer as u32, p.n_expert as u32)
+    };
+    let counts = match exp_stats::load_file(path, dir_name, total_bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            // 記録は使わないが、このセッションの回数は保存したいので履歴を据える。
+            exp_stats::install_prior(&zeros(dir_name));
+            return Some(format!("[exp-preload] off: {e}"));
+        }
+    };
+    if counts.n_layer as usize != p.n_layer || counts.n_expert as usize != p.n_expert {
+        exp_stats::install_prior(&zeros(dir_name));
+        return Some(format!(
+            "[exp-preload] off: 記録の形が違う ({}x{} / 今回 {}x{})",
+            counts.n_layer, counts.n_expert, p.n_layer, p.n_expert
+        ));
+    }
+    exp_stats::install_prior(&counts);
+    let plan = exp_stats::preload_order(&counts);
+    if plan.is_empty() {
+        return Some("[exp-preload] off: 記録が空 (回数 0)".to_string());
+    }
+    // VRAM 予算をここで初期化する (初回の MoE 呼び出しと同じ 1 回きりの決定)。
+    let _ = expert_route();
+    let Some((_, cap)) = expert_vram::cache_usage() else {
+        return Some(
+            "[exp-preload] off: expert の VRAM 予算が無い (DENNO_EXPERT_VRAM_MB=0 / cuda 無効)"
+                .to_string(),
+        );
+    };
+    let reserve = exp_stats::preload_reserve_bytes();
+    let mut target = cap.saturating_sub(reserve);
+    // このスレッドで CUDA の current context を張る。CUDA の current context は
+    // スレッドローカルなので、これをしないと最初の cuMemAlloc が error 201
+    // (INVALID_CONTEXT) で落ちる (lab t146a で実際に踏んだ: ALLOC_DEAD が立って
+    // decode が全部 CPU になった)。物理容量の取得も context が要る。
+    if !crate::cuda::make_current_on_this_thread() {
+        return Some("[exp-preload] off: CUDA の context をこのスレッドに張れない".to_string());
+    }
+    // 実カードの容量でも丸める: dense 重みの予算 (`DENNO_GPU_WEIGHT_MB`) と
+    // 予備を引いたぶんまで。`DENNO_EXPERT_VRAM_MB` を大きく設定しても、
+    // 起動直後に VRAM を埋め切って後続の重み upload を失敗させない。
+    // (t147a: 24,000 + 重み 12,000 は 32 GB のカードに収まらず 14k prefill で OOM)
+    let weight_cap = crate::gpu_budget::weight_cap_bytes() as usize;
+    let physical = crate::cuda::dev_mem_mb().map(|(_, total_mb)| {
+        (total_mb << 20)
+            .saturating_sub(weight_cap)
+            .saturating_sub(reserve)
+    });
+    if let Some(p) = physical {
+        target = target.min(p);
+    }
+    if reserve >= cap {
+        return Some(format!(
+            "[exp-preload] off: 予算 {} MiB が予備 {} MiB 以下",
+            cap >> 20,
+            reserve >> 20
+        ));
+    }
+    // 層ごとの読み口 (mmap のスライスだけ。ページは触らない)。
+    let mut layers: Vec<(ExpertW, ExpertW, ExpertW)> = Vec::with_capacity(p.n_layer);
+    for il in 0..p.n_layer {
+        let load = |m: &str| ExpertW::load(&f, &format!("blk.{il}.{m}"), &p);
+        match (
+            load("ffn_gate_exps.weight"),
+            load("ffn_up_exps.weight"),
+            load("ffn_down_exps.weight"),
+        ) {
+            (Ok(g), Ok(u), Ok(d)) => layers.push((g, u, d)),
+            (e, _, _) => {
+                let msg = match e {
+                    Err(err) => format!("{err}"),
+                    Ok(_) => "読み口を開けない".to_string(),
+                };
+                return Some(format!("[exp-preload] off: 層 {il}: {msg}"));
+            }
+        }
+    }
+
+    let n_plan = plan.len();
+    let mut loaded = 0usize;
+    let mut paused_ms = 0f64;
+    // 前の失敗理由が残っていれば捨てる (停止理由の取り違えを防ぐ)。
+    let _ = expert_vram::take_alloc_error();
+    // 止まった理由 (None = 最後まで載せた)。
+    let mut stop: Option<String> = None;
+    // 載せた順 (最後に touch を掛け直して「一番よく使う = 最後に使った」にする)。
+    let mut loaded_keys: Vec<ExpertKey> = Vec::new();
+    // **回数の多い順**に載せる (lab t146b: 昇順だと予算で切れたときに下位だけが
+    // 載り、最初のリクエストのヒット率が素の 0.51 より悪くなりうる)。
+    // 全部載せ終わったら昇順 (= 少ない順) に touch し直して、追い出されにくさを
+    // 回数の順に戻す (touch は H2D しない)。
+    for (layer, expert) in plan.into_iter().rev() {
+        let (li, ei) = (layer as usize, expert as usize);
+        let Some((g, u, d)) = layers.get(li) else {
+            continue;
+        };
+        let shapes = [
+            ExpertShape {
+                ty: g.ty,
+                k: g.n_in,
+                n: g.n_out,
+            },
+            ExpertShape {
+                ty: u.ty,
+                k: u.n_in,
+                n: u.n_out,
+            },
+            ExpertShape {
+                ty: d.ty,
+                k: d.n_in,
+                n: d.n_out,
+            },
+        ];
+        let Ok(want) = shapes.iter().try_fold(0usize, |a, s| s.bytes().map(|b| a + b)) else {
+            stop = Some("expert のバイト数が求まらない".to_string());
+            break;
+        };
+        let used = expert_vram::cache_usage().map_or(0, |(u, _)| u);
+        if exp_stats::budget_full(used, want, target) {
+            stop = Some(format!("予算 (target {} MiB) に到達", target >> 20));
+            break;
+        }
+        // decode 中は譲る (リクエストを待たせない)。
+        if exp_stats::busy() {
+            let t = Instant::now();
+            while exp_stats::busy() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            paused_ms += t.elapsed().as_secs_f64() * 1e3;
+        }
+        let key = ExpertKey { layer, expert };
+        let got = expert_vram::acquire_soft(key, shapes, || {
+            Ok([g.slice(ei)?, u.slice(ei)?, d.slice(ei)?])
+        });
+        match got {
+            Ok(Some(_)) => {
+                loaded += 1;
+                loaded_keys.push(key);
+            }
+            // 型が未対応・確保失敗はそこで止める。理由は 1 行に残す。
+            Ok(None) => {
+                stop = Some(match expert_vram::take_alloc_error() {
+                    Some(e) => format!("確保に失敗: {e}"),
+                    None => "この expert は GPU に載せられない (型・予算)".to_string(),
+                });
+                break;
+            }
+            Err(e) => {
+                stop = Some(format!("{e:#}"));
+                break;
+            }
+        }
+    }
+    // 載せたものを「少ない順」に触り直す (H2D なし)。これで LRU の末尾 (= 最初に
+    // 追い出される) が一番使わない expert になり、task の「most used are evicted
+    // last」になる。載せ終わる前に止まった場合も、載っている範囲で同じ性質になる。
+    loaded_keys.reverse();
+    if !loaded_keys.is_empty() {
+        expert_vram::touch_many(&loaded_keys);
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let used = expert_vram::cache_usage().map_or(0, |(u, _)| u);
+    Some(format!(
+        "[exp-preload] loaded={loaded} experts {used}MiB/{}MiB in {secs:.2}s \
+         (plan={n_plan} target={}MiB reserve={}MiB phys={:?}MiB paused={paused_ms:.0}ms \
+         stop={:?} key_rate={:.3})",
+        cap >> 20,
+        target >> 20,
+        reserve >> 20,
+        physical.map(|p| p >> 20),
+        stop,
+        loaded as f64 / n_plan.max(1) as f64
+    ))
+}
+
+/// `cuda` feature 無しでは VRAM へ載せられない (常に `None` = 何もしない)。
+#[cfg(not(feature = "cuda"))]
+pub fn preload_experts_from_stats(
+    _parts: &[std::path::PathBuf],
+    _dir_name: &str,
+) -> Option<String> {
+    None
+}
+
 #[cfg(not(feature = "cuda"))]
 fn moe_experts_gpu_batched(
     _lw: &LayerW,
@@ -11195,6 +11699,48 @@ mod tests {
         assert!(headprof::stamp().is_none(), "off なのに stamp が Some");
     }
 
+    /// task 146: decode 経路 (`moe_ffn_quant_impl`) が選択 expert を数えている。
+    ///
+    /// ゲートを強制 on にして 1 層 1 トークン回し、積まれたセル数が top-k と
+    /// 一致することを見る (「緑 = 分岐が発火した証拠ではない」の裏取り)。
+    #[test]
+    fn exp_stats_counts_selected_experts_on_decode_path() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("exp_stats_count");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        let _on = crate::model::exp_stats::enable_for_test();
+        let before: u64 = crate::model::exp_stats::session()
+            .map(|c| c.snapshot().iter().map(|v| *v as u64).sum())
+            .unwrap_or(0);
+        let _ = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu).expect("Cpu 経路");
+        let cells = crate::model::exp_stats::session().expect("カウンタが作られていない");
+        let snap = cells.snapshot();
+        let after: u64 = snap.iter().map(|v| *v as u64).sum();
+        assert_eq!(
+            after - before,
+            p.n_expert_used as u64,
+            "1 層 1 トークンで top-k 本ぶん積まれていない"
+        );
+        let (nl, ne) = cells.dims();
+        assert_eq!((nl, ne), (p.n_layer, p.n_expert));
+        // 積まれたのは層 0 のセルだけ (合成モデルは層 0 だけ回す)
+        let layers: Vec<usize> = snap
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v > 0)
+            .map(|(i, _)| i / ne)
+            .collect();
+        assert!(
+            layers.iter().all(|l| *l == 0),
+            "層 0 以外に積まれた: {layers:?}"
+        );
+    }
+
     /// P39: `DENNO_EXPERT_GPU` が未設定 (= 経路 Cpu) のときは従来の
     /// `moe_expert::expert_gemv_any` が expert 1 本あたり 3 回 (gate / up / down)
     /// 呼ばれる。GPU 経路が既定で発動しないことを**呼び出し回数**で確かめる
@@ -14413,6 +14959,113 @@ mod tests {
             }
             for v in [Some("0"), Some("off"), Some("OFF"), Some("false"), Some("no")] {
                 assert!(!mix_chain_from_value(v), "value={v:?} は off のはず");
+            }
+        }
+
+        /// task 150: `DENNO_DECODE_CHAIN2` は lab t150b で採用して既定 on、
+        /// 部分ゲート `DENNO_DECODE_CHAIN2_EXP` / `_MIX` も既定 on。部分ゲートは
+        /// 束ねゲートが on のときだけ効く (純関数で固定する)。
+        #[test]
+        fn decode_chain2_gates_truth_table() {
+            // lab t150b で採用 → 既定 on (明示的な偽値だけ切る)。
+            assert!(decode_chain2_from_value(None), "未設定は on のはず");
+            for v in [
+                Some("1"),
+                Some("on"),
+                Some("ON"),
+                Some(" true "),
+                Some("yes"),
+                Some(""),
+            ] {
+                assert!(decode_chain2_from_value(v), "value={v:?} は on のはず");
+            }
+            for v in [Some("0"), Some("off"), Some("OFF"), Some("false"), Some("no")] {
+                assert!(!decode_chain2_from_value(v), "value={v:?} は off のはず");
+            }
+            assert!(decode_chain2_exp_from_value(None), "未設定は on のはず");
+            for v in [Some("1"), Some("on"), Some("ON"), Some(" yes "), Some("")] {
+                assert!(decode_chain2_exp_from_value(v), "value={v:?} は on のはず");
+            }
+            for v in [Some("0"), Some("off"), Some("false"), Some("no")] {
+                assert!(!decode_chain2_exp_from_value(v), "value={v:?} は off のはず");
+            }
+            // 合成: 束ねゲートが off なら部分ゲートの値に依らず off。
+            for exp in [false, true] {
+                assert!(!chain2_exp_active(false, exp), "束ねゲート off で on になった");
+                assert_eq!(chain2_exp_active(true, exp), exp);
+            }
+            // MIX の部分ゲートも EXP と同じ規則 (既定 on)。
+            assert!(decode_chain2_mix_from_value(None));
+            assert!(!decode_chain2_mix_from_value(Some("0")));
+            assert!(decode_chain2_mix_from_value(Some("on")));
+        }
+
+        /// task 150: ヒットとミスの寄与を `sel` の並びへ戻す (位置の取り違え・
+        /// 長さの不一致を静かに通さない)。
+        #[test]
+        #[cfg(feature = "cuda")]
+        fn scatter_contribs_places_hits_and_misses() {
+            let e = 2usize;
+            let pos = [0usize, 3];
+            let h = [10.0f32, 11.0, 40.0, 41.0];
+            let miss_pos = [1usize, 2, 4];
+            let miss_h = [20.0f32, 21.0, 30.0, 31.0, 50.0, 51.0];
+            let mut hs: Vec<Option<Vec<f32>>> = vec![None; 5];
+            scatter_contribs(&mut hs, &pos, &h, &miss_pos, &miss_h, e).expect("scatter");
+            assert_eq!(hs[0].as_deref(), Some(&[10.0f32, 11.0][..]));
+            assert_eq!(hs[1].as_deref(), Some(&[20.0f32, 21.0][..]));
+            assert_eq!(hs[2].as_deref(), Some(&[30.0f32, 31.0][..]));
+            assert_eq!(hs[3].as_deref(), Some(&[40.0f32, 41.0][..]));
+            assert_eq!(hs[4].as_deref(), Some(&[50.0f32, 51.0][..]));
+            // ミスを渡さなければヒットだけが埋まる (従来経路と同じ形)。
+            let mut hs2: Vec<Option<Vec<f32>>> = vec![None; 5];
+            scatter_contribs(&mut hs2, &pos, &h, &[], &[], e).expect("scatter hits only");
+            assert!(hs2[0].is_some() && hs2[3].is_some());
+            assert!(hs2[1].is_none() && hs2[2].is_none() && hs2[4].is_none());
+            // 長さが合わない / 範囲外は Err (別の expert の値を足さない)。
+            let mut hs3: Vec<Option<Vec<f32>>> = vec![None; 5];
+            assert!(scatter_contribs(&mut hs3, &pos, &h[..2], &[], &[], e).is_err());
+            assert!(scatter_contribs(&mut hs3, &[5], &h[..2], &[], &[], e).is_err());
+            // 表が空なのにバッファだけ非空 → Err (lab t150a で CHAIN2=0 が踏んだ形)。
+            assert!(scatter_contribs(&mut hs3, &[0], &h[..2], &[], &h[..4], e).is_err());
+            // miss_slots が確保長の唯一の入口: overlap off は 0 本。
+            assert_eq!(miss_slots(false, 4), 0);
+            assert_eq!(miss_slots(true, 4), 4);
+        }
+
+        /// task 150: `dno_hc_mixed_f32` の 1 要素を .cu の行順で写したミラー。
+        /// CPU の `hc_mixed_into` と **ビット一致** することを固定する
+        /// (sigmoid は 1/(1+exp(-v))・加算は s 昇順・1/hc は和の後)。
+        #[test]
+        #[cfg(feature = "cuda")]
+        fn hc_mixed_kernel_mirror_matches_cpu() {
+            fn sig(v: f32) -> f32 {
+                1.0 / (1.0 + (-v).exp())
+            }
+            for (hc, e) in [(1usize, 1usize), (4, 7), (4, 2560), (2, 96)] {
+                let hp = HyperParams {
+                    hc,
+                    n_embd: e,
+                    low_rank: 320,
+                    eps: 1e-6,
+                };
+                let n = hc * e;
+                let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.017).sin() * 3.0).collect();
+                let g: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.011).cos() * 5.0).collect();
+                let mut want = vec![0.0f32; e];
+                hyper::hc_mixed_into(&x, &g, &mut want, &hp);
+                // dno_hc_mixed_f32 の 1 スレッド分 (s = 0 で代入、s >= 1 で加算)。
+                let inv_hc = 1.0f32 / hc as f32;
+                let mut got = vec![0.0f32; e];
+                for (d, slot) in got.iter_mut().enumerate() {
+                    let mut acc = x[d] * sig(g[d]);
+                    for s in 1..hc {
+                        let i = s * e + d;
+                        acc += x[i] * sig(g[i]);
+                    }
+                    *slot = acc * inv_hc;
+                }
+                assert_eq!(want, got, "hc={hc} e={e} で CPU と一致しない");
             }
         }
 

@@ -694,6 +694,9 @@ impl Flash {
 
     /// 生成して、確定した本文を返す。`emit` は差分テキストを受け取る。
     fn generate(&mut self, req: &GenReq, mut emit: impl FnMut(&str) -> Result<()>) -> Result<GenOut> {
+        // task 146: 背景の事前ロードに「いま推論中」を知らせる (ロックを奪い合わない)。
+        // ガードは戻るとき (失敗経路も) に下ろす。
+        let _busy = denno_engine::model::exp_stats::busy_guard();
         // P78: 層の外の内訳 (tokenize は prefill wall の外なので別に積む)。
         let t_tok = prekprof::stamp();
         // 継続生成 (continue: true): 最後が assistant なら、その分を閉じずに
@@ -1206,6 +1209,10 @@ impl Flash {
             from_render: prompt_from_render,
             req: req_sig,
         });
+        // task 146: リクエスト終端で使用回数を書く (decode の外・原子的)。
+        if let Some(line) = denno_engine::model::exp_stats::save_now() {
+            eprintln!("{line}");
+        }
         Ok(GenOut {
             text,
             n_prompt,
@@ -1555,6 +1562,20 @@ fn ensure_rayon_pool() {
     }
 }
 
+/// task 146: `run` が正常に戻るときに使用回数を書き残す (Drop)。
+///
+/// SIGKILL・電源断では走らないので、通常はリクエスト終端と 20 秒ごとの保存が
+/// 正規の経路 (こちらは最後の 1 回を確実にするための保険)。
+struct StatsSaveOnExit;
+
+impl Drop for StatsSaveOnExit {
+    fn drop(&mut self) {
+        if let Some(line) = denno_engine::model::exp_stats::save_now() {
+            eprintln!("{line}");
+        }
+    }
+}
+
 pub fn run(cfg: FlashConfig) -> Result<()> {
     // task 119b: プールの初回使用 (モデル読み込み) の前に既定スレッド数を決める。
     ensure_rayon_pool();
@@ -1575,15 +1596,56 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     // max_ctx に比例するのはホスト側の KV だけ (式は gpu_budget の doc)。
     // P51: テレメトリの ServerInfo 用 (層数)。モデルは実行中に変わらない。
     let n_layer;
+    let n_expert;
+    let expert_bytes;
     {
         let p = Qwen4ExpParams::from_meta(&f).context("メタデータを読めない")?;
         let budget = denno_engine::gpu_budget::flash_budget_from_gguf(&f, &p, cfg.max_ctx);
         eprintln!("{}", denno_engine::gpu_budget::budget_line(&budget));
         n_layer = p.n_layer;
+        n_expert = p.n_expert;
+        // task 146: 使用回数ファイルのモデル同一性 (全層の expert 3 行列の合計バイト)。
+        expert_bytes = denno_engine::model::qwen4exp::expert_identity_bytes(&f, &p);
     }
     drop(f);
     let batch = std::env::var("DENNO_PREFILL_BATCH").ok().as_deref() != Some("0");
     let chunk = std::env::var("DENNO_PREFILL_BATCH_CHUNK").unwrap_or_else(|_| "8".into());
+
+    // task 146: (層, expert) の使用回数と、起動時の事前ロード。
+    // `DENNO_EXPERT_IQ_GPU=1` かつ `DENNO_EXPERT_IQ_STATS_FILE` が設定されている
+    // ときだけ動く。**起動時のモデル構築より前に起こす**のが大事で、構築 (数秒) の
+    // 間に上位 expert を載せておかないと、最初のリクエストが来た時点で数本しか
+    // 載っていない (lab t146b: 昇順で下位 3,212 本しか載らず、ヒット率が素と同じ)。
+    // どちらも背景スレッドなので `/v1/models` が返るまでの時間は変わらない。
+    let _stats_guard = if denno_engine::model::exp_stats::enabled() {
+        let dir_name = cfg
+            .dir
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        denno_engine::model::exp_stats::set_identity(&dir_name, expert_bytes, n_layer, n_expert);
+        // 事前ロード: 回数の多い順に VRAM へ載せる。decode 中は譲る。
+        let parts_pre = parts.clone();
+        std::thread::spawn(move || {
+            if let Some(line) =
+                denno_engine::model::qwen4exp::preload_experts_from_stats(&parts_pre, &dir_name)
+            {
+                eprintln!("{line}");
+            }
+        });
+        // 保存: 新しい回数があるときだけ、20 秒ごとに原子的に書く (decode の外)。
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(
+                denno_engine::model::exp_stats::SAVE_PERIOD_SECS,
+            ));
+            if let Some(line) = denno_engine::model::exp_stats::save_now() {
+                eprintln!("{line}");
+            }
+        });
+        Some(StatsSaveOnExit)
+    } else {
+        None
+    };
 
     // P51: 推論テレメトリ (denno-view が購読する WS)。既定で有効で、
     // `DENNO_TELEMETRY=0` のときだけ無効。無効時はチャネルもスレッドも作らない。
