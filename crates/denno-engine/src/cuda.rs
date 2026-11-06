@@ -686,6 +686,22 @@ impl DevBuffer {
         Ok(out)
     }
 
+    /// デバイス → ホスト (呼び出し側のバッファへ直接。毎層 5 MB を
+    /// `Vec` に取り直すとページフォルトだけで数 ms かかるため)。
+    pub fn to_slice<T: Copy>(&self, out: &mut [T]) -> Result<()> {
+        let bytes = std::mem::size_of_val(out);
+        assert!(bytes <= self.bytes, "DevBuffer::to_slice: size overflow");
+        if bytes > 0 {
+            unsafe {
+                check(
+                    (lib()?.memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, self.ptr, bytes),
+                    "cuMemcpyDtoH",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// 既存バッファへホストから上書きコピー
     pub fn copy_from<T: Copy>(&self, data: &[T]) -> Result<()> {
         let bytes = std::mem::size_of_val(data);
@@ -4093,6 +4109,413 @@ where
         Ok(())
     })?;
     Ok(true)
+}
+
+// ===========================================================================
+// task 148: prefill の m 行 expert GEMV (`kernels_exp_iq_pf.cu`)
+// ===========================================================================
+//
+// decode の層一括 GEMV (`kernels_exp_iq`) は 1 起動 = 1 行。prefill は 512 トークンの
+// チャンクで 1 expert あたり平均 20 行を受けるので、**同じ重みの読みで 16 行ずつ
+// まとめて**積むカーネルを別モジュールに持つ (`exp_pf::ROWS_PER_LAUNCH`)。
+//
+//   gate 1 起動 → up 1 起動 → silu_mul 1 起動 → down 1 起動 → sync 1 回 → D2H(h)
+//
+// 1 行ぶんの累積順は decode と同一なので、同じ行を m=1 と m 行で回すとビット一致
+// する。行の対応は `seg` (m / rows の先頭) と `rows` (行 → トークン番号) で決まる。
+//
+// 予算: 作業域は層ごとに grow-only で使い回す。確保に失敗したら **そのプロセスでは
+// 以後この経路を試さない** (PF_DEAD)。prefill の途中で毎層 cuMemAlloc を叩いて
+// attention 用の領域を削る、という事故を避ける (t147a の 26 GB で起きたのはこれ)。
+
+/// カーネル一式 (PTX を起動時に 1 回だけ読む)。
+struct ExpPfKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    /// 型ごとの m 行 GEMV ([`crate::model::exp_pf::kernel_name`] の順)
+    fns: [CUfunction; crate::model::exp_pf::SLOTS],
+    /// silu(g) * u
+    silu: CUfunction,
+}
+
+unsafe impl Send for ExpPfKernels {}
+unsafe impl Sync for ExpPfKernels {}
+
+static EXP_PF_KERNELS: OnceLock<Option<ExpPfKernels>> = OnceLock::new();
+
+/// 確保に失敗したら立てる (以後このプロセスでは prefill の GPU 経路を使わない)。
+static PF_DEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// PTX の置き場所。`DENNO_EXP_PF_PTX` があればそれ、無ければクレート配下
+/// `kernels/kernels_exp_iq_pf.ptx`。
+fn exp_pf_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_EXP_PF_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_exp_iq_pf.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+fn exp_pf_kernels() -> Option<&'static ExpPfKernels> {
+    EXP_PF_KERNELS
+        .get_or_init(|| {
+            let path = exp_pf_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[exp-pf] PTX が読めない ({}) : {e} → CPU 経路へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0);
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[exp-pf] cuModuleLoadData 失敗 → CPU 経路へ");
+                    return None;
+                }
+            }
+            let mut fns: [CUfunction; crate::model::exp_pf::SLOTS] =
+                [std::ptr::null_mut(); crate::model::exp_pf::SLOTS];
+            for (i, f) in fns.iter_mut().enumerate() {
+                let name = crate::model::exp_pf::kernel_name(i)?;
+                let mut cname = name.as_bytes().to_vec();
+                cname.push(0);
+                unsafe {
+                    if (lib.module_get_function)(f, module, cname.as_ptr() as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!("[exp-pf] PTX に {name} が無い → CPU 経路へ");
+                        return None;
+                    }
+                }
+            }
+            let mut silu: CUfunction = std::ptr::null_mut();
+            let mut cname = crate::model::exp_pf::SILU_KERNEL.as_bytes().to_vec();
+            cname.push(0);
+            unsafe {
+                if (lib.module_get_function)(&mut silu, module, cname.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[exp-pf] PTX に silu が無い → CPU 経路へ");
+                    return None;
+                }
+            }
+            Some(ExpPfKernels { module, fns, silu })
+        })
+        .as_ref()
+}
+
+/// この型・この k を m 行カーネルで回せるか (`DENNO_EXPERT_IQ_GPU_PF` と
+/// `DENNO_EXPERT_IQ_GPU` の両方が on のときだけ真)。
+pub fn moe_gemv_iq_pf_ready(ty: crate::kquant::GgmlType, k: usize) -> bool {
+    if !cuda_enabled() || !crate::model::exp_pf::pf_enabled() {
+        return false;
+    }
+    if !crate::model::exp_pf::supported(ty) || crate::model::exp_pf::row_bytes(ty, k).is_none() {
+        return false;
+    }
+    exp_pf_kernels().is_some()
+}
+
+use crate::model::exp_pf;
+
+/// 1 層ぶんの作業域 (grow-only。スレッドローカル)。
+struct PfScratch {
+    x: Option<DevBuffer>,
+    g: Option<DevBuffer>,
+    u: Option<DevBuffer>,
+    act: Option<DevBuffer>,
+    h: Option<DevBuffer>,
+    pg: Option<DevBuffer>,
+    pu: Option<DevBuffer>,
+    pd: Option<DevBuffer>,
+    seg: Option<DevBuffer>,
+    rows_gu: Option<DevBuffer>,
+    rows_id: Option<DevBuffer>,
+}
+
+impl PfScratch {
+    fn new() -> Self {
+        PfScratch {
+            x: None,
+            g: None,
+            u: None,
+            act: None,
+            h: None,
+            pg: None,
+            pu: None,
+            pd: None,
+            seg: None,
+            rows_gu: None,
+            rows_id: None,
+        }
+    }
+}
+
+thread_local! {
+    static PF_SCRATCH: std::cell::RefCell<PfScratch> =
+        std::cell::RefCell::new(PfScratch::new());
+}
+
+/// 1 層ぶんの expert FFN を m 行カーネルで回す。
+///
+/// `seg` は 4 語 × nseg (m / rows の先頭 / 0 / 0)、`rows_gu` は行 → トークン番号
+/// (`exp_pf::build_plan`)、`out_h` は `total_rows * e` 要素 (GPU の行を**そのまま**
+/// 返す)。
+/// 呼び出し側は「トークンごとに expert index 昇順で 1 本ずつ」足し込む
+/// ([`crate::model::qwen4exp`] の `exp_pf_add_all`)。
+///
+/// task 151: 以前は加重和を GPU (`dno_exp_pf_accum`) で閉じて `nt × e` だけ
+/// 返していたが、**和の順序がヒット/ミスの内訳に依存する**ため、同じ入力でも
+/// VRAM の中身が違うと出力が変わった (lab t148b/t148c の `a1 != a2`)。丸めを
+/// 一致させるには 1 本ずつ同じ順で足す必要があるので、行を返す形へ戻した。
+///
+/// `Ok(false)` は「GPU でやらなかった」= 呼び出し側は CPU 経路へ (fail closed)。
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts_iq_pf_layer(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    ty_d: crate::kquant::GgmlType,
+    pg: &[u64],
+    pu: &[u64],
+    pd: &[u64],
+    seg: &[u32],
+    rows_gu: &[u32],
+    xs: &[f32],
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    out_h: &mut [f32],
+    cpu_miss: &mut dyn FnMut() -> Result<()>,
+) -> Result<bool> {
+    if PF_DEAD.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(false);
+    }
+    let nseg = pg.len();
+    let total_rows = rows_gu.len();
+    let nh = total_rows * e;
+    if nseg == 0
+        || total_rows == 0
+        || pu.len() != nseg
+        || pd.len() != nseg
+        || seg.len() != nseg * 4
+        || xs.len() % n_in != 0
+        || out_h.len() < nh
+    {
+        return Ok(false);
+    }
+    if !moe_gemv_iq_pf_ready(ty_g, n_in)
+        || !moe_gemv_iq_pf_ready(ty_u, n_in)
+        || !moe_gemv_iq_pf_ready(ty_d, ff)
+    {
+        return Ok(false);
+    }
+    let (Some(slot_g), Some(slot_u), Some(slot_d)) = (
+        exp_pf::slot(ty_g),
+        exp_pf::slot(ty_u),
+        exp_pf::slot(ty_d),
+    ) else {
+        return Ok(false);
+    };
+    let (Some(plan_g), Some(plan_d)) = (
+        exp_pf::launch_plan(slot_g, nseg, ff),
+        exp_pf::launch_plan(slot_d, nseg, e),
+    ) else {
+        return Ok(false);
+    };
+    let Some(ctx) = shared_ctx() else {
+        return Ok(false);
+    };
+    let Some(kernels) = exp_pf_kernels() else {
+        return Ok(false);
+    };
+    ctx.make_current()?;
+
+    // 行の総数 × 行列の幅。g / u / act は total_rows × ff、h は total_rows × e。
+    let ng = total_rows * ff;
+    // CPU ミス (呼び出し側の flat) が落ちたか。落ちた場合は `out` が途中まで
+    // 書かれているので **CPU 経路へ戻してはいけない** (Err で伝える)。
+    let cpu_failed = std::cell::Cell::new(false);
+    let mut alloc = || -> Result<bool> {
+        PF_SCRATCH.with(|cell| -> Result<bool> {
+            let mut sc = cell.borrow_mut();
+            MoeScratch::ensure(&mut sc.x, xs.len() * 4)?;
+            MoeScratch::ensure(&mut sc.g, ng * 4)?;
+            MoeScratch::ensure(&mut sc.u, ng * 4)?;
+            MoeScratch::ensure(&mut sc.act, ng * 4)?;
+            MoeScratch::ensure(&mut sc.h, nh * 4)?;
+            MoeScratch::ensure(&mut sc.pg, nseg * 8)?;
+            MoeScratch::ensure(&mut sc.pu, nseg * 8)?;
+            MoeScratch::ensure(&mut sc.pd, nseg * 8)?;
+            MoeScratch::ensure(&mut sc.seg, nseg * 16)?;
+            MoeScratch::ensure(&mut sc.rows_gu, total_rows * 4)?;
+            MoeScratch::ensure(&mut sc.rows_id, total_rows * 4)?;
+            {
+                let xb = sc.x.as_ref().expect("確保済み");
+                xb.copy_from(xs)?;
+                sc.pg.as_ref().expect("確保済み").copy_from(pg)?;
+                sc.pu.as_ref().expect("確保済み").copy_from(pu)?;
+                sc.pd.as_ref().expect("確保済み").copy_from(pd)?;
+                sc.seg.as_ref().expect("確保済み").copy_from(seg)?;
+                sc.rows_gu.as_ref().expect("確保済み").copy_from(rows_gu)?;
+                let id: Vec<u32> = exp_pf::identity_rows(total_rows);
+                sc.rows_id.as_ref().expect("確保済み").copy_from(&id)?;
+                dbg_htod(
+                    xs.len() * 4
+                        + nseg * 8 * 3
+                        + nseg * 16
+                        + total_rows * 4 * 2,
+                );
+            }
+            let segb = sc.seg.as_ref().expect("確保済み");
+            let rg = sc.rows_gu.as_ref().expect("確保済み");
+            let rid = sc.rows_id.as_ref().expect("確保済み");
+            let xb = sc.x.as_ref().expect("確保済み");
+            let g = sc.g.as_ref().expect("確保済み");
+            let u = sc.u.as_ref().expect("確保済み");
+            let act = sc.act.as_ref().expect("確保済み");
+            let h = sc.h.as_ref().expect("確保済み");
+            let t_launch = std::time::Instant::now();
+            unsafe {
+                // gate と up (同じ行表・同じ入力)。
+                let rb_g = exp_pf::row_bytes(ty_g, n_in).unwrap_or(0);
+                let rb_u = exp_pf::row_bytes(ty_u, n_in).unwrap_or(0);
+                for (f, ptrs, buf, rb, plan) in [
+                    (
+                        kernels.fns[slot_g],
+                        sc.pg.as_ref().expect("確保済み"),
+                        g,
+                        rb_g,
+                        plan_g,
+                    ),
+                    (
+                        kernels.fns[slot_u],
+                        sc.pu.as_ref().expect("確保済み"),
+                        u,
+                        rb_u,
+                        plan_g,
+                    ),
+                ] {
+                    let mut pw = ptrs.ptr;
+                    let mut px = xb.ptr;
+                    let mut po = buf.ptr;
+                    let mut ps = segb.ptr;
+                    let mut pr = rg.ptr;
+                    let (mut ns, mut ni, mut no, mut rb) = (
+                        nseg as c_int,
+                        n_in as c_int,
+                        ff as c_int,
+                        rb as c_int,
+                    );
+                    let mut args = [
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut px as *mut _ as *mut c_void,
+                        &mut po as *mut _ as *mut c_void,
+                        &mut ps as *mut _ as *mut c_void,
+                        &mut pr as *mut _ as *mut c_void,
+                        &mut ns as *mut _ as *mut c_void,
+                        &mut ni as *mut _ as *mut c_void,
+                        &mut no as *mut _ as *mut c_void,
+                        &mut rb as *mut _ as *mut c_void,
+                    ];
+                    ctx.launch_async(f, plan.grid, plan.block, 0, &mut args)?;
+                }
+                // act = silu(g) * u
+                {
+                    let n = ng as c_int;
+                    let threads = 256usize;
+                    let blocks = ng.div_ceil(threads) as u32;
+                    let mut pgg = g.ptr;
+                    let mut puu = u.ptr;
+                    let mut paa = act.ptr;
+                    let mut pn = n;
+                    let mut args = [
+                        &mut pgg as *mut _ as *mut c_void,
+                        &mut puu as *mut _ as *mut c_void,
+                        &mut paa as *mut _ as *mut c_void,
+                        &mut pn as *mut _ as *mut c_void,
+                    ];
+                    ctx.launch_async(
+                        kernels.silu,
+                        (blocks.max(1), 1, 1),
+                        (threads as u32, 1, 1),
+                        0,
+                        &mut args,
+                    )?;
+                }
+                // down (入力は act の行が詰まった形 = rows_id)
+                {
+                    let mut pw = sc.pd.as_ref().expect("確保済み").ptr;
+                    let mut px = act.ptr;
+                    let mut po = h.ptr;
+                    let mut ps = segb.ptr;
+                    let mut pr = rid.ptr;
+                    let (mut ns, mut ni, mut no, mut rb) = (
+                        nseg as c_int,
+                        ff as c_int,
+                        e as c_int,
+                        exp_pf::row_bytes(ty_d, ff).unwrap_or(0) as c_int,
+                    );
+                    let mut args = [
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut px as *mut _ as *mut c_void,
+                        &mut po as *mut _ as *mut c_void,
+                        &mut ps as *mut _ as *mut c_void,
+                        &mut pr as *mut _ as *mut c_void,
+                        &mut ns as *mut _ as *mut c_void,
+                        &mut ni as *mut _ as *mut c_void,
+                        &mut no as *mut _ as *mut c_void,
+                        &mut rb as *mut _ as *mut c_void,
+                    ];
+                    ctx.launch_async(
+                        kernels.fns[slot_d],
+                        plan_d.grid,
+                        plan_d.block,
+                        0,
+                        &mut args,
+                    )?;
+                }
+            }
+            exp_pf::note_kernel_ns(t_launch.elapsed().as_nanos() as u64);
+            // GPU の計算が走っている間に CPU のミスを計算する (重ねる)。
+            // 層あたり GPU 5.6 ms / CPU 57 ms なので、待ちはほぼ消える。
+            if let Err(e) = (cpu_miss)() {
+                cpu_failed.set(true);
+                return Err(e);
+            }
+            let t_sync = std::time::Instant::now();
+            unsafe { ctx.sync()?; }
+            exp_pf::note_kernel_ns(t_sync.elapsed().as_nanos() as u64);
+            let t_d2h = std::time::Instant::now();
+            h.to_slice(&mut out_h[..nh])?;
+            exp_pf::note_d2h_ns(t_d2h.elapsed().as_nanos() as u64);
+            dbg_d2h(nh * 4);
+            Ok(true)
+        })
+    };
+    match alloc() {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if cpu_failed.get() {
+                // CPU ミスの失敗は隠さない (out は途中まで書かれている)。
+                return Err(e);
+            }
+            // 確保失敗はこのプロセスで 1 回だけ記録し、以後は CPU に固定する。
+            if !PF_DEAD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::error!("[exp-pf] 作業域を確保できないので以後 CPU 経路: {e:#}");
+            }
+            Ok(false)
+        }
+    }
 }
 
 #[cfg(test)]

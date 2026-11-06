@@ -2,6 +2,7 @@
 
 pub mod devprof;
 pub mod exp_iq;
+pub mod exp_pf;
 pub mod expert_batch;
 pub mod expert_cache;
 pub mod expert_slab;
