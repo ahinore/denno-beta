@@ -1189,7 +1189,11 @@ mod gpu {
         let evicted = g.evict_until_free(need);
         let freed: usize = evicted.iter().map(|(_, v)| v.bytes()).sum();
         drop(evicted); // DevBuffer が落ちて VRAM が空く
-        freed
+        // task 152: slab ではスロットを返してもデバイスメモリは戻らない。空に
+        // なったチャンクを落として**実メモリ**を返す (lab t152a の g24 は
+        // これが無くて 14k で q4 attention が CPU に落ちた)。
+        let released = crate::model::expert_slab::release_empty(need);
+        freed.saturating_add(released)
     }
 
     /// task 149: expert 1 本 (gate/up/down) を**左から順に**確保する。

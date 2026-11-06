@@ -251,6 +251,46 @@ impl<H> Slab<H> {
         }
     }
 
+    /// **空になったチャンク**を落としてデバイスメモリを返す (`need` バイトまで)。
+    ///
+    /// task 152: slab ではスロットを返しても `cuMemFree` しないので、LRU の
+    /// eviction だけでは**実メモリが戻らない**。注意深い消費者 (attention の
+    /// ミラー・prefill の一時バッファ) が確保に失敗したとき、ここで空チャンクを
+    /// 解放して場所を作る (lab t152a の g24 はこれが無くて 14k で CPU attention に
+    /// 落ちた)。
+    ///
+    /// 使用中のスロットがあるチャンクは落とさない (`SlabSlot` が `Arc` で保持して
+    /// いるので、落とすと重みが消える)。`need == 0` は何もしない。
+    /// 戻り値は解放したバイト数。
+    pub fn release_empty(&self, need: usize) -> usize {
+        if need == 0 {
+            return 0;
+        }
+        let mut chunks = match self.chunks.lock() {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let mut freed = 0usize;
+        let mut i = 0usize;
+        while i < chunks.len() {
+            let empty = chunks[i].used() == 0;
+            if empty {
+                let bytes = chunks[i].slot_bytes.saturating_mul(chunks[i].n_slots);
+                // ここで Arc を落とす。スロットが 1 本も無いので参照は自分だけ
+                // (チャンク表のロックを持っているので、他のスレッドが空きを
+                //  取り出すことはない)。
+                chunks.remove(i);
+                freed = freed.saturating_add(bytes);
+                if freed >= need {
+                    break;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        freed
+    }
+
     /// `(使用中スロット, 全スロット)` (診断用)。
     pub fn slots(&self) -> (usize, usize) {
         match self.chunks.lock() {
@@ -279,12 +319,29 @@ mod gpu {
         slab().alloc(slot_bytes, DevBuffer::slab_chunk)
     }
 
+    /// 空チャンクを落として `need` バイトまで実メモリを返す。
+    pub fn release_empty(need: usize) -> usize {
+        slab().release_empty(need)
+    }
+
     /// `(使用中スロット, 全スロット, 確保済みバイト)` (診断用)。
     pub fn stats() -> (usize, usize, usize) {
         let s = slab();
         let (u, t) = s.slots();
         (u, t, s.allocated_bytes())
     }
+}
+
+/// 空チャンクを落として `need` バイトまで実メモリを返す (cuda feature のときだけ)。
+#[cfg(feature = "cuda")]
+pub fn release_empty(need: usize) -> usize {
+    gpu::release_empty(need)
+}
+
+/// cuda feature 無しでは何も解放しない (slab 経路が無い)。
+#[cfg(not(feature = "cuda"))]
+pub fn release_empty(_need: usize) -> usize {
+    0
 }
 
 /// `(使用中スロット, 全スロット, 確保済みバイト)` (診断用。cuda 無しは 0)。
@@ -394,6 +451,43 @@ mod tests {
         assert_ne!(a.handle(), b.handle());
         let (u, t) = s.slots();
         assert_eq!((u, t), (2, 2));
+    }
+
+    /// task 152: 空チャンクだけが解放される (使用中のチャンクは残る)。
+    #[test]
+    fn release_empty_frees_only_empty_chunks() {
+        let s: Slab<u32> = Slab::new();
+        let made = std::cell::Cell::new(0u32);
+        let mut mk = |_: usize| {
+            made.set(made.get() + 1);
+            Ok(made.get())
+        };
+        let a = s.alloc(4096, &mut mk).unwrap();
+        // 2 本目は同じチャンクの別スロット (まだ空きがある)。
+        let b = s.alloc(4096, &mut mk).unwrap();
+        assert_eq!(made.get(), 1);
+        assert_eq!(s.release_empty(1 << 20), 0, "使用中があるので解放しない");
+        assert_eq!(s.chunk_count(), 1);
+        drop(b);
+        // b を返しただけでは a が使っているのでまだ解放しない。
+        assert_eq!(s.release_empty(1 << 20), 0);
+        drop(a);
+        let freed = s.release_empty(1);
+        assert!(freed >= 4096, "空になったら解放する: {freed}");
+        assert_eq!(s.chunk_count(), 0);
+        // 解放後に確保すると新しいチャンクを作る。
+        let c = s.alloc(4096, &mut mk).unwrap();
+        assert_eq!(made.get(), 2);
+        assert_eq!(*c.handle(), 2);
+    }
+
+    #[test]
+    fn release_empty_zero_is_a_noop() {
+        let s: Slab<u32> = Slab::new();
+        let a = s.alloc(4096, |_| Ok(1u32)).unwrap();
+        drop(a);
+        assert_eq!(s.release_empty(0), 0, "need=0 は何もしない");
+        assert_eq!(s.chunk_count(), 1);
     }
 
     #[test]
