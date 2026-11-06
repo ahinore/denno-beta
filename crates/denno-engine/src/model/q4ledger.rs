@@ -84,13 +84,27 @@ pub const STEP: usize = 14;
 pub const COMBINE: usize = 15;
 /// task 153: 層ごとの役割 RMS と構造テレメトリ (`emit_role_act`)。
 pub const ROLES: usize = 16;
+/// task 155: 層の中の**フック呼び出し** (`hook("hc_mixed_attn", ...)` など 7 回/層)。
+///
+/// 購読者が居ないときは呼び出し自体を飛ばす (`DENNO_HOOK_SKIP` 既定 on) ので、
+/// 通常は 0 付近になる。台帳の名前は `hooks`。
+pub const HOOKS: usize = 17;
+/// task 155: `q4prof::add` (3 回/層) の区間。名前は `qprof`。
+pub const QPROF: usize = 18;
+/// task 155: `arch_emit_token` (構造テレメトリの組み立て) の区間。名前は `arch`。
+pub const ARCH: usize = 19;
+/// task 155: 層ループの端 (層の入口の役割リセット / 出口の `LayerOut` 組み立てと
+/// `on_layer` 呼び出し) と、MoE の中で router と experts の間に落ちる部分
+/// (使用回数の記録 / ゲート判定 / 作業域の確保)。名前は `loop`。
+pub const LOOP: usize = 20;
 /// 区間の数。
-pub const N: usize = 17;
+pub const N: usize = 21;
 /// 区間の名前 ([`MIX`] の順)。`experts` (選択 expert の寄与全体) と
 /// `exp_iq` (task 144 の IQ 層一括 GEMV、decode では `experts` の内側) は別の行。
 pub const NAMES: [&str; N] = [
     "mix", "router", "shared", "full", "ssm", "experts", "other", "exp_iq", "head", "tap",
-    "sample", "topk", "detok", "telem", "step", "combine", "roles",
+    "sample", "topk", "detok", "telem", "step", "combine", "roles", "hooks", "qprof", "arch",
+    "loop",
 ];
 
 fn on() -> bool {

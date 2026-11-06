@@ -679,11 +679,21 @@ impl Flash {
         self.telem.on() && denno_telemetry::act_enabled()
     }
 
+    /// task 155: 層活性の**タップを作るか**。
+    ///
+    /// [`Self::act_on`] に加えて「WS の購読者が 1 人以上いる」ことを要求する。
+    /// ビューワが居ないときの層活性 (decode は 48 層 × トークンごと) は誰も
+    /// 読まないので、組み立ても送出もしない。`act_on` 自体は変えない
+    /// (spec の可否など、タップ以外の判断に使われているため)。
+    fn tap_on(&self) -> bool {
+        self.act_on() && self.telem.has_clients()
+    }
+
     /// P53: prefill の logits。act が有効なら層の出口をタップする
     /// (`TapTokens::Last` = チャンク末尾の 1 トークンだけ)。無効時は従来の
     /// `prefill_batched` をそのまま呼ぶ (フックを付けないので数値経路は不変)。
     fn prefill_logits(&self, dec: &mut Qwen4ExpDecoder, prompt: &[u32]) -> Result<Vec<f32>> {
-        if !self.act_on() {
+        if !self.tap_on() {
             return Ok(dec.prefill_batched(prompt, self.batch)?);
         }
         let mut tap = ActTap::new(&self.telem, true);
@@ -880,8 +890,9 @@ impl Flash {
         let mut last_full: Option<String> = None;
         let mut stop_hit: Option<String> = None;
         let mut failed: Option<GenFail> = None;
-        // P53: decode は 1 トークンあたり全層ぶん流す (act が有効なときだけ)。
-        let mut act = if self.act_on() {
+        // P53: decode は 1 トークンあたり全層ぶん流す (act が有効で、かつ
+        // ビューワが繋がっているときだけ)。
+        let mut act = if self.tap_on() {
             Some(ActTap::new(&self.telem, false))
         } else {
             None
@@ -931,7 +942,14 @@ impl Flash {
             if spec_on {
                 // P109: n-gram 投機ステップ。q0 は engine の argmax (greedy)。
                 let d_topk = q4prof::dstamp();
-                let cand = if t_on { Some(denno_telemetry::topk_softmax(&logits, 8)) } else { None };
+                // task 155: top-8 はビューワ (WS) が繋がっているときだけ作る。
+                // 読む相手が居ないときの出力は従来と同じ (誰も受け取らない)。
+                let cand =
+                    if t_on && self.telem.has_clients() {
+                        Some(denno_telemetry::topk_softmax(&logits, 8))
+                    } else {
+                        None
+                    };
                 q4prof::dmark(q4prof::D_TOPK, d_topk);
                 let t_s = prekprof::stamp();
                 let d_sample = q4prof::dstamp();
@@ -1039,8 +1057,11 @@ impl Flash {
             let d_topk = q4prof::dstamp();
             let cand = {
                 // task 153: 台帳の区間 (topk)。テレメトリ用の top-8 を選ぶだけの時間。
+                // task 155: ビューワ (WS) が繋がっていないときは作らない
+                // (248k logits の 1 パスが毎トークン ~1 ms かかる)。繋がって
+                // いる間の出力は従来と同一。
                 let _l = q4ledger::enter(q4ledger::TOPK);
-                if t_on {
+                if t_on && self.telem.has_clients() {
                     Some(denno_telemetry::topk_softmax(&logits, 8))
                 } else {
                     None

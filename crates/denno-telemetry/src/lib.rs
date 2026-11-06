@@ -17,7 +17,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicI8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -711,9 +711,61 @@ pub fn next_session_id() -> u32 {
     SESSION_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-/// フレームを送出する。非ブロッキング。満杯/切断時はドロップして計上。
-/// enabled() でない場合は即座に戻る (フレーム生成コストすら掛けないよう
-/// 呼び出し側も enabled() ガードを推奨)。
+// task 155: 送出先 (WS) の購読者数。ビューワが 1 つも繋がっていないときは、
+// フレームを作る側 (層の役割 RMS / top-8) が組み立てごと飛ばせる。
+// 値は serve 側が接続/切断のたびに更新する。
+static CLIENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// task 155: テレメトリの購読者 (WS クライアント) 数を記録する。
+pub fn set_clients(n: usize) {
+    CLIENTS.store(n, Ordering::Relaxed);
+}
+
+/// task 155: いまの購読者数。
+pub fn clients() -> usize {
+    CLIENTS.load(Ordering::Relaxed)
+}
+
+/// task 155: `DENNO_TELEM_LAZY` の値解釈 (純関数・テスト用)。
+///
+/// **既定 on** = 購読者 (WS) が居ないときは top-8 / 層活性 / arch フレームを
+/// 組み立てない。`0` / `off` / `false` で従来どおり常に組み立てる (A/B 用)。
+pub fn lazy_from_value(v: Option<&str>) -> bool {
+    !matches!(v, Some("0") | Some("off") | Some("false"))
+}
+
+/// task 155: 購読者が居ないときに重い観測を省くか (`DENNO_TELEM_LAZY`)。
+pub fn lazy_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| lazy_from_value(std::env::var("DENNO_TELEM_LAZY").ok().as_deref()))
+}
+
+/// task 155: 読む相手が 1 つ以上いるか。
+///
+/// `DENNO_TELEM_LAZY=0` のときは常に `true` (= 従来どおり作る)。
+pub fn has_clients() -> bool {
+    CLIENTS.load(Ordering::Relaxed) > 0 || !lazy_enabled()
+}
+
+/// テスト専用: 購読者数を一時的に変え、Drop で元に戻す (panic でも戻る)。
+#[doc(hidden)]
+pub struct ClientsGuard(usize);
+
+#[doc(hidden)]
+impl ClientsGuard {
+    pub fn new(n: usize) -> Self {
+        let old = clients();
+        set_clients(n);
+        Self(old)
+    }
+}
+
+impl Drop for ClientsGuard {
+    fn drop(&mut self) {
+        set_clients(self.0);
+    }
+}
+
 /// 送出ハブを 1 回だけ組む。`TX` と `RX` の初期化が競合すると、
 /// 片方だけ別チャネルを掴んで永久に空になるため、初期化を直列化する。
 /// `RX` を先に埋めてから `TX` を公開する。
@@ -732,6 +784,9 @@ fn hub() -> &'static std::sync::mpsc::SyncSender<Frame> {
     TX.get().expect("hub: TX を直前に set した")
 }
 
+/// フレームを送出する。非ブロッキング。満杯/切断時はドロップして計上。
+/// enabled() でない場合は即座に戻る (フレーム生成コストすら掛けないよう
+/// 呼び出し側も enabled() ガードを推奨)。
 pub fn emit(frame: Frame) {
     if !enabled() {
         return;
