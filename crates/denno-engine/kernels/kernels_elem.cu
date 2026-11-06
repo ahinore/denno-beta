@@ -1135,3 +1135,157 @@ extern "C" __global__ void dno_gemm_f32_mt(
         if (tok_b < nt) y[(size_t)tok_b * n + row] = acc_b;
     }
 }
+
+
+// ===========================================================================
+// task 152: BF16 重みをそのまま読む hc mix の matvec / GEMM
+// ===========================================================================
+// 目的: hc mix の重み (BF16) を f32 に展開して VRAM に常駐するのをやめる
+// (lab t149c: w:mix_f32 2,425 MiB。BF16 のままなら半分)。
+//
+// 数値: BF16 -> f32 は **上位 16bit の複製** (`__uint_as_float((uint32_t)w << 16)`)
+// で、CPU の `kquant::dequant_row_into(Bf16)` と同一 (情報落ちなし)。よって
+// 以下のカーネルは同形の f32 版 (`dno_matvec_f32*` / `dno_gemm_f32_mt`) と
+// **同じ演算列**を通るので、f32 版と同じ値になる (積と加算の丸めは __*_rn で分離、
+// 縮約木も同一)。f32 版が CPU とビット一致する範囲では BF16 版もビット一致する。
+//
+// f32 版は既存の契約 (task 121 の `_r` 選択など) をそのまま持つので、既存の
+// カーネルは 1 バイトも変えず、bf16 版を**追加**する。
+
+__device__ __forceinline__ float dno_bf16_to_f32(uint16_t b) {
+    return __uint_as_float((uint32_t)b << 16);
+}
+
+// dno_matvec_f32 の BF16 重み版 (逐次・1 ブロック = 1 行)。grid=(n,1,1), block=(1,1,1)。
+extern "C" __global__ void dno_matvec_bf16(
+    const float *__restrict__ h,      // [k]
+    const uint16_t *__restrict__ w,   // [n, k] row-major (BF16)
+    float *__restrict__ out,          // [n]
+    int k, int n) {
+    const int j = blockIdx.x;
+    if (j >= n) return;
+    const uint16_t *row = w + (size_t)j * k;
+    float s = 0.0f;
+    for (int d = 0; d < k; ++d) {
+        s = __fadd_rn(s, __fmul_rn(h[d], dno_bf16_to_f32(row[d])));
+    }
+    out[j] = s;
+}
+
+// dno_matvec_f32_r の BF16 重み版 (1 ブロック = 1 行・block 256・固定木の縮約)。
+extern "C" __global__ void dno_matvec_bf16_r(
+    const float *__restrict__ h,      // [k]
+    const uint16_t *__restrict__ w,   // [n, k] row-major (BF16)
+    float *__restrict__ out,          // [n]
+    int k, int n) {
+    const int j = blockIdx.x;
+    if (j >= n) return;
+    const uint16_t *row = w + (size_t)j * k;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    float s = 0.0f;
+    for (int d = tid; d < k; d += nt) {
+        s = __fadd_rn(s, __fmul_rn(h[d], dno_bf16_to_f32(row[d])));
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        s = __fadd_rn(s, __shfl_down_sync(0xffffffffu, s, o));
+    }
+    __shared__ float sh[32];
+    const int wid = tid >> 5;
+    if ((tid & 31) == 0) sh[wid] = s;
+    __syncthreads();
+    if (tid == 0) {
+        float t = sh[0];
+        for (int i = 1; i < (nt >> 5); ++i) t = __fadd_rn(t, sh[i]);
+        out[j] = t;
+    }
+}
+
+// dno_matvec_f32_r_silu の BF16 重み版 (down + hc_lo_apply の融合)。
+extern "C" __global__ void dno_matvec_bf16_r_silu(
+    const float *__restrict__ h,      // [k]
+    const uint16_t *__restrict__ w,   // [n, k] row-major (BF16)
+    float *__restrict__ out,          // [n]
+    int k, int n, float inv_hc) {
+    const int j = blockIdx.x;
+    if (j >= n) return;
+    const uint16_t *row = w + (size_t)j * k;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    float s = 0.0f;
+    for (int d = tid; d < k; d += nt) {
+        s = __fadd_rn(s, __fmul_rn(h[d], dno_bf16_to_f32(row[d])));
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        s = __fadd_rn(s, __shfl_down_sync(0xffffffffu, s, o));
+    }
+    __shared__ float sh[32];
+    const int wid = tid >> 5;
+    if ((tid & 31) == 0) sh[wid] = s;
+    __syncthreads();
+    if (tid == 0) {
+        float t = sh[0];
+        for (int i = 1; i < (nt >> 5); ++i) t = __fadd_rn(t, sh[i]);
+        const float v = __fmul_rn(t, inv_hc);
+        out[j] = __fdiv_rn(v, __fadd_rn(1.0f, dno_expf(-v)));
+    }
+}
+
+// dno_gemm_f32_mt の BF16 重み版 (prefill の m トークン一括)。タイル順・FMA の
+// 位置は f32 版と 1:1 (重みを共有メモリへ積むときに bf16 -> f32 するだけ)。
+// 起動: grid = (ceil(n/16), ceil(nt/32), 1) / block = (16, 16, 1)。
+extern "C" __global__ void dno_gemm_bf16_mt(
+    const uint16_t *__restrict__ w,
+    const float *__restrict__ x,
+    float *__restrict__ y,
+    const int nt,
+    const int k,
+    const int n)
+{
+    __shared__ float ws[16][33];
+    __shared__ float xs[32][33];
+
+    const int lr = threadIdx.x;
+    const int lt = threadIdx.y;
+    const int tid = lt * 16 + lr;
+    const int row = blockIdx.x * 16 + lr;
+    const int tok0 = blockIdx.y * 32;
+    const int tok_a = tok0 + lt;
+    const int tok_b = tok0 + lt + 16;
+
+    float acc_a = 0.0f;
+    float acc_b = 0.0f;
+    for (int k0 = 0; k0 < k; k0 += 32) {
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int kk = lt * 2 + j;
+            const int src = k0 + kk;
+            ws[lr][kk] = (row < n && src < k)
+                             ? dno_bf16_to_f32(w[(size_t)row * k + src])
+                             : 0.0f;
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int idx = tid + j * 256;
+            const int t = idx >> 5;
+            const int kk = idx & 31;
+            const int src = k0 + kk;
+            const int tk = tok0 + t;
+            xs[t][kk] = (tk < nt && src < k) ? x[(size_t)tk * k + src] : 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < 32; ++kk) {
+            const float wv = ws[lr][kk];
+            acc_a = __fmaf_rn(wv, xs[lt][kk], acc_a);
+            acc_b = __fmaf_rn(wv, xs[lt + 16][kk], acc_b);
+        }
+        __syncthreads();
+    }
+    if (row < n) {
+        if (tok_a < nt) y[(size_t)tok_a * n + row] = acc_a;
+        if (tok_b < nt) y[(size_t)tok_b * n + row] = acc_b;
+    }
+}

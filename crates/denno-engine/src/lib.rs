@@ -11,6 +11,7 @@ pub mod kquant;
 pub mod kquant_tables;
 pub mod kv_cache;
 pub mod load;
+pub mod mem_audit;
 pub mod model;
 pub mod ple;
 pub mod prefix_cache;

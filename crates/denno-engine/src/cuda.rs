@@ -37,8 +37,8 @@
 use anyhow::{anyhow, bail, Result};
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 type CUresult = i32;
@@ -331,6 +331,88 @@ pub fn dev_mem_mb() -> Option<(usize, usize)> {
     Some((free >> 20, total >> 20))
 }
 
+// ---------------------------------------------------------------------------
+// task 152: cuMemGetInfo のキャッシュ
+// ---------------------------------------------------------------------------
+// task 149 のカード予算 (`DENNO_VRAM_BUDGET_CARD`) は expert を 1 本載せるたびに
+// cuMemGetInfo を呼んでいた。lab t149c では 28 token の prefill が +3.3% 悪化して
+// おり、その主因と推定された (REPORT_P149.md)。ドライバによっては 1 回が
+// 数十〜数百 us かかるので、**64 MiB ぶんの増減か 2 秒経過まで**は同じ値を返す。
+//
+// 予算は「余裕 (既定 1,024 MiB)」を残して切るので、最大 64 MiB の古さは
+// 判定を変えない。確保に失敗したときは従来どおり追い出して再試行する
+// (br149 の経路) ので、古い値で足りなくてもラッチしない。
+
+/// キャッシュを捨てる「台帳の増減」の閾値 (MiB)。
+pub const MEM_CACHE_DRIFT_MB: usize = 64;
+/// キャッシュの最大 age (ミリ秒)。
+pub const MEM_CACHE_MAX_MS: u128 = 2000;
+
+struct MemCache {
+    free_mb: usize,
+    total_mb: usize,
+    live_at: usize,
+    at: std::time::Instant,
+}
+
+static MEM_CACHE: Mutex<Option<MemCache>> = Mutex::new(None);
+
+/// キャッシュを捨てて次の [`dev_mem_mb_cached`] で引き直させる。
+pub fn dev_mem_refresh() {
+    if let Ok(mut g) = MEM_CACHE.lock() {
+        *g = None;
+    }
+}
+
+/// キャッシュを引き直すかの判定 (純関数)。
+///
+/// `live_delta` は前回の取得から動いた台帳の合計バイト (絶対値)、`age_ms` は
+/// 前回の取得からの経過ミリ秒。どちらかが閾値を超えたら引き直す。
+pub fn mem_cache_should_refresh(live_delta: usize, age_ms: u128) -> bool {
+    live_delta >= MEM_CACHE_DRIFT_MB << 20 || age_ms >= MEM_CACHE_MAX_MS
+}
+
+/// [`dev_mem_mb`] のキャッシュ版 (task 152)。
+///
+/// 引き直すのは次のいずれか:
+/// - まだ 1 度も引いていない / [`dev_mem_refresh`] の後
+/// - 前回の取得から台帳の合計が [`MEM_CACHE_DRIFT_MB`] 以上動いた
+/// - 前回の取得から [`MEM_CACHE_MAX_MS`] 以上経った
+///
+/// 引けなかったときは古い値ではなく `None` を返す (未取得のままなら `None`)。
+pub fn dev_mem_mb_cached() -> Option<(usize, usize)> {
+    let live = crate::mem_audit::live_bytes();
+    let mut g = match MEM_CACHE.lock() {
+        Ok(g) => g,
+        Err(_) => return dev_mem_mb(),
+    };
+    let refresh = match g.as_ref() {
+        None => true,
+        Some(c) => mem_cache_should_refresh(
+            live.abs_diff(c.live_at),
+            c.at.elapsed().as_millis(),
+        ),
+    };
+    if refresh {
+        match dev_mem_mb() {
+            Some((free, total)) => {
+                *g = Some(MemCache {
+                    free_mb: free,
+                    total_mb: total,
+                    live_at: live,
+                    at: std::time::Instant::now(),
+                });
+            }
+            None => {
+                if g.is_none() {
+                    return None;
+                }
+            }
+        }
+    }
+    g.as_ref().map(|c| (c.free_mb, c.total_mb))
+}
+
 /// `DENNO_MEM_DBG=1` のときだけ確保/解放をログる (既定は完全に無効)。
 fn mem_dbg() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -381,11 +463,70 @@ pub struct DevBuffer {
     /// s165: false = 他のバッファの一部を指す**非所有**ビュー。drop で解放しない
     /// (所有者は元のバッファ)。重みレジストリの行範囲エイリアス専用。
     owned: bool,
+    /// task 149: 台帳のタグ ([`crate::mem_audit`])。解放時に同じタグで戻す。
+    tag: &'static str,
 }
 
 impl DevBuffer {
+    /// task 149: タグ付きの確保。確保に失敗したら expert の LRU を 1 回追い出して
+    /// 再試行する (「確保失敗で expert を CPU に固定する」経路を通常経路にしない)。
+    ///
+    /// ここで `DevBuffer` を一度作ってから詰め替えないこと — `Drop` が
+    /// `cuMemFree` を呼ぶので、確保した領域がその場で解放されてしまう
+    /// (lab t149a で実際に踏んだ)。`raw_alloc` は生のポインタだけを返す。
     #[track_caller]
-    fn alloc(bytes: usize) -> Result<Self> {
+    fn alloc_tagged(bytes: usize, tag: &'static str) -> Result<Self> {
+        match Self::raw_alloc(bytes) {
+            Ok(ptr) => {
+                crate::mem_audit::note_alloc(tag, bytes.max(1));
+                Ok(Self {
+                    ptr,
+                    bytes,
+                    owned: true,
+                    tag,
+                })
+            }
+            Err(e) => {
+                // task 149: 他の常駐 (attention のミラー・重み・prefill の
+                // 一時バッファ) が原因で落ちたときは、expert を追い出して
+                // やり直す。1 回目は要求 + 64 MiB、2 回目は全部追い出す
+                // (driver の内部確保ぶんの余裕を残す)。
+                let mut last = e;
+                for margin in [64usize << 20, usize::MAX] {
+                    let want = if margin == usize::MAX {
+                        usize::MAX
+                    } else {
+                        bytes.saturating_add(margin)
+                    };
+                    let freed = crate::model::expert_vram::emergency_free(want);
+                    if freed == 0 {
+                        break;
+                    }
+                    tracing::warn!(
+                        "task149: 確保失敗 → expert を {} MiB 追い出して再試行 ({last:#})",
+                        freed >> 20
+                    );
+                    match Self::raw_alloc(bytes) {
+                        Ok(ptr) => {
+                            crate::mem_audit::note_alloc(tag, bytes.max(1));
+                            return Ok(Self {
+                                ptr,
+                                bytes,
+                                owned: true,
+                                tag,
+                            });
+                        }
+                        Err(e2) => last = e2,
+                    }
+                }
+                Err(last)
+            }
+        }
+    }
+
+    /// `cuMemAlloc` を 1 回だけ呼ぶ (返すのは生のポインタ。`Drop` を通さない)。
+    #[track_caller]
+    fn raw_alloc(bytes: usize) -> Result<CUdeviceptr> {
         let mut ptr: CUdeviceptr = 0;
         let res = unsafe { (lib()?.mem_alloc)(&mut ptr, bytes) };
         if res != CUDA_SUCCESS {
@@ -409,7 +550,73 @@ impl DevBuffer {
                 }
             }
         }
-        Ok(Self { ptr, bytes, owned: true })
+        Ok(ptr)
+    }
+
+    #[track_caller]
+    fn alloc(bytes: usize) -> Result<Self> {
+        Self::alloc_tagged(bytes, crate::mem_audit::TAG_OTHER)
+    }
+
+    /// task 152: slab のチャンクを 1 本確保する (台帳のタグは expert 側)。
+    #[track_caller]
+    pub(crate) fn slab_chunk(bytes: usize) -> Result<Self> {
+        Self::alloc_tagged(bytes.max(1), crate::mem_audit::TAG_EXPERTS)
+    }
+
+    /// task 152: このバッファの一部を指す**非所有**ビュー (drop で解放しない)。
+    pub(crate) fn view_at(&self, offset: usize, bytes: usize) -> Self {
+        assert!(
+            offset.saturating_add(bytes) <= self.bytes,
+            "DevBuffer::view_at: 範囲外 (offset={offset}, bytes={bytes}, len={})",
+            self.bytes
+        );
+        Self::view(self.ptr + offset as CUdeviceptr, bytes)
+    }
+
+    /// task 152: 同じ領域を指す非所有ビューを作り直す (所有側は drop しない)。
+    pub(crate) fn alias(&self) -> Self {
+        Self::view(self.ptr, self.bytes)
+    }
+
+    /// task 152: `offset` の位置へ pinned staging 経由で H2D する。
+    ///
+    /// [`from_slice_pinned`] と同じ経路 (ホスト 1 回コピー + `cuMemcpyHtoD`) なので、
+    /// slab のスロットへ上げる転送速度は per-expert 確保のときと変わらない。
+    pub(crate) fn upload_pinned_at(&self, offset: usize, data: &[u8]) -> Result<()> {
+        let bytes = data.len();
+        if bytes == 0 {
+            return Ok(());
+        }
+        assert!(
+            offset.saturating_add(bytes) <= self.bytes,
+            "DevBuffer::upload_pinned_at: 範囲外 (offset={offset}, bytes={bytes}, len={})",
+            self.bytes
+        );
+        EXPERT_PIN.with(|cell| -> Result<()> {
+            let mut slot = cell.borrow_mut();
+            if slot.as_ref().map(|p| p.bytes).unwrap_or(0) < bytes {
+                *slot = Some(PinMem::alloc(bytes)?);
+            }
+            let pin = slot.as_ref().expect("確保済み");
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    pin.ptr as *mut u8,
+                    bytes,
+                );
+                check(
+                    (lib()?.memcpy_htod)(
+                        self.ptr + offset as CUdeviceptr,
+                        pin.ptr,
+                        bytes,
+                    ),
+                    "cuMemcpyHtoD (pinned slab)",
+                )?;
+            }
+            dbg_htod(bytes);
+            Ok(())
+        })
     }
 
     /// s165: 既存のデバイス領域の一部を指す**非所有**ビュー。連結重み
@@ -417,14 +624,20 @@ impl DevBuffer {
     /// (同じ重みを VRAM へ 2 度上げない)。drop では解放しない。
     /// `bytes` はビュー自身の長さ (所有側の範囲内であることは呼び出し側が保証)。
     fn view(ptr: CUdeviceptr, bytes: usize) -> Self {
-        Self { ptr, bytes, owned: false }
+        Self { ptr, bytes, owned: false, tag: crate::mem_audit::TAG_OTHER }
     }
 
     /// ホストのスライスをデバイスへコピーして確保
     #[track_caller]
     pub fn from_slice<T: Copy>(data: &[T]) -> Result<Self> {
+        Self::from_slice_tagged(data, crate::mem_audit::TAG_OTHER)
+    }
+
+    /// [`DevBuffer::from_slice`] のタグ付き版 (task 149 の台帳用)。
+    #[track_caller]
+    pub fn from_slice_tagged<T: Copy>(data: &[T], tag: &'static str) -> Result<Self> {
         let bytes = std::mem::size_of_val(data);
-        let buf = Self::alloc(bytes.max(1))?;
+        let buf = Self::alloc_tagged(bytes.max(1), tag)?;
         if bytes > 0 {
             unsafe {
                 check(
@@ -561,6 +774,8 @@ impl Drop for DevBuffer {
             unsafe {
                 let _ = (lib().unwrap().mem_free)(self.ptr);
             }
+            // task 149: 台帳から戻す (確保と同じタグ・同じバイト数)。
+            crate::mem_audit::note_free(self.tag, self.bytes.max(1));
             if mem_dbg() {
                 if let Some((f, t)) = dev_mem_mb() {
                     tracing::info!(target: "denno_engine::mem", "free {} KiB free={} MiB total={} MiB", self.bytes >> 10, f, t);
@@ -1115,6 +1330,15 @@ impl CudaCtx {
                     }
                 }
             }
+
+            // task 149: どのモジュールをどれだけの PTX から JIT したかを台帳に残す
+            // (JIT 後のコード量はドライバが公開しないので、ここでは PTX の大きさ)。
+            crate::mem_audit::note_module("int8", PTX.len());
+            crate::mem_audit::note_module("elem", PTX_ELEM.len());
+            crate::mem_audit::note_module("gdn", PTX_GDN.len());
+            crate::mem_audit::note_module("moe", PTX_MOE.len());
+            crate::mem_audit::note_module("moe_v2", PTX_MOE_V2.len());
+            crate::mem_audit::note_module("gemm_q", PTX_GEMM_Q.len());
 
             Ok(Self {
                 device: dev,
@@ -1682,8 +1906,8 @@ impl CudaCtx {
         MOE_SCRATCH.with(|cell| -> Result<()> {
             let mut s = cell.borrow_mut();
             let s: &mut MoeScratch = &mut s;
-            MoeScratch::ensure(&mut s.x, n_in * 4)?;
-            MoeScratch::ensure(&mut s.o, n_out * 4)?;
+            MoeScratch::ensure_tagged(&mut s.x, n_in * 4, crate::mem_audit::TAG_GEMV)?;
+            MoeScratch::ensure_tagged(&mut s.o, n_out * 4, crate::mem_audit::TAG_GEMV)?;
             let async_on = gemv_async_on();
             if async_on {
                 MoeScratch::ensure_pin(&mut s.pin_x, n_in * 4)?;
@@ -1936,8 +2160,8 @@ impl CudaCtx {
         let grid = ((n_out + ROWS - 1) / ROWS) as u32;
         MOE_SCRATCH.with(|cell| -> Result<()> {
             let mut s = cell.borrow_mut();
-            MoeScratch::ensure(&mut s.x, nt * n_in * 4)?;
-            MoeScratch::ensure(&mut s.o, nt * n_out * 4)?;
+            MoeScratch::ensure_tagged(&mut s.x, nt * n_in * 4, crate::mem_audit::TAG_GEMV)?;
+            MoeScratch::ensure_tagged(&mut s.o, nt * n_out * 4, crate::mem_audit::TAG_GEMV)?;
             let xb = s.x.as_ref().expect("x は ensure 済み");
             let ob = s.o.as_ref().expect("o は ensure 済み");
             xb.copy_from(x)?;
@@ -2493,9 +2717,13 @@ fn moe_scratch_alloc_bytes(cur: usize, want: usize) -> Option<usize> {
 
 impl MoeScratch {
     fn ensure(cap: &mut Option<DevBuffer>, want: usize) -> Result<()> {
+        Self::ensure_tagged(cap, want, crate::mem_audit::TAG_OTHER)
+    }
+    /// task 149: 台帳のタグ付き [`Self::ensure`]。
+    fn ensure_tagged(cap: &mut Option<DevBuffer>, want: usize, tag: &'static str) -> Result<()> {
         let cur = cap.as_ref().map(|b| b.bytes()).unwrap_or(0);
         if let Some(bytes) = moe_scratch_alloc_bytes(cur, want) {
-            *cap = Some(DevBuffer::alloc(bytes)?);
+            *cap = Some(DevBuffer::alloc_tagged(bytes, tag)?);
         }
         Ok(())
     }
@@ -2936,7 +3164,10 @@ pub fn moe_grouped_gemm_layer(
             sc.reserved = None;
             match crate::model::expert_vram::reserve_external(packed.len()) {
                 Some(r) => {
-                    sc.packed = Some(DevBuffer::alloc(packed.len().max(1))?);
+                    sc.packed = Some(DevBuffer::alloc_tagged(
+                        packed.len().max(1),
+                        crate::mem_audit::TAG_GROUPED_PACKED,
+                    )?);
                     sc.reserved = Some(r);
                     sc.key = key;
                     sc.packed_len = packed.len();
@@ -2962,11 +3193,11 @@ pub fn moe_grouped_gemm_layer(
             dbg_htod(packed.len());
         }
         // 2. segment 表 / 入力 / 中間 / 出力
-        MoeScratch::ensure(&mut sc.seg, seg_words * 4)?;
-        MoeScratch::ensure(&mut sc.seg_dn, seg_words * 4)?;
-        MoeScratch::ensure(&mut sc.x, n_x * 4)?;
-        MoeScratch::ensure(&mut sc.act, n_act * 4)?;
-        MoeScratch::ensure(&mut sc.h, n_h * 4)?;
+        MoeScratch::ensure_tagged(&mut sc.seg, seg_words * 4, crate::mem_audit::TAG_GROUPED)?;
+        MoeScratch::ensure_tagged(&mut sc.seg_dn, seg_words * 4, crate::mem_audit::TAG_GROUPED)?;
+        MoeScratch::ensure_tagged(&mut sc.x, n_x * 4, crate::mem_audit::TAG_GROUPED)?;
+        MoeScratch::ensure_tagged(&mut sc.act, n_act * 4, crate::mem_audit::TAG_GROUPED)?;
+        MoeScratch::ensure_tagged(&mut sc.h, n_h * 4, crate::mem_audit::TAG_GROUPED)?;
         {
             let sb = sc.seg.as_ref().expect("確保済み");
             sb.copy_from(seg_gu)?;
@@ -3281,13 +3512,13 @@ fn moe_gemv_seg_run(jobs: &mut [SegJob<'_>], seg: &[u32], m_max: usize, x: &[f32
         let mut sc = cell.borrow_mut();
         // 1. ポインタ表 / segment 表 / 入力 (すべて起動より前に H2D)
         for (i, job) in jobs.iter().enumerate() {
-            MoeScratch::ensure(&mut sc.ptr[i], job.wptrs.len() * 8)?;
+            MoeScratch::ensure_tagged(&mut sc.ptr[i], job.wptrs.len() * 8, crate::mem_audit::TAG_SEG)?;
             let pb = sc.ptr[i].as_ref().expect("確保済み");
             pb.copy_from(job.wptrs)?;
             dbg_htod(job.wptrs.len() * 8);
         }
-        MoeScratch::ensure(&mut sc.seg, seg.len() * 4)?;
-        MoeScratch::ensure(&mut sc.x, x.len() * 4)?;
+        MoeScratch::ensure_tagged(&mut sc.seg, seg.len() * 4, crate::mem_audit::TAG_SEG)?;
+        MoeScratch::ensure_tagged(&mut sc.x, x.len() * 4, crate::mem_audit::TAG_SEG)?;
         {
             let sb = sc.seg.as_ref().expect("確保済み");
             sb.copy_from(seg)?;
@@ -3297,7 +3528,7 @@ fn moe_gemv_seg_run(jobs: &mut [SegJob<'_>], seg: &[u32], m_max: usize, x: &[f32
             dbg_htod(x.len() * 4);
         }
         for (i, job) in jobs.iter().enumerate() {
-            MoeScratch::ensure(&mut sc.out[i], job.out.len() * 4)?;
+            MoeScratch::ensure_tagged(&mut sc.out[i], job.out.len() * 4, crate::mem_audit::TAG_SEG)?;
         }
         // 2. 起動 (job ごと。まだ同期しない)
         let seg_buf = sc.seg.as_ref().expect("確保済み");
@@ -3732,16 +3963,16 @@ where
     let nh = nseg * e;
     IQ_SCRATCH.with(|cell| -> Result<()> {
         let mut sc = cell.borrow_mut();
-        MoeScratch::ensure(&mut sc.x, n_in * 4)?;
-        MoeScratch::ensure(&mut sc.g, ng * 4)?;
-        MoeScratch::ensure(&mut sc.u, ng * 4)?;
-        MoeScratch::ensure(&mut sc.act, ng * 4)?;
-        MoeScratch::ensure(&mut sc.h, nh * 4)?;
-        MoeScratch::ensure(&mut sc.pg, nseg * 8)?;
-        MoeScratch::ensure(&mut sc.pu, nseg * 8)?;
-        MoeScratch::ensure(&mut sc.pd, nseg * 8)?;
-        MoeScratch::ensure(&mut sc.sgu, seg_gu.len() * 4)?;
-        MoeScratch::ensure(&mut sc.sgd, seg_d.len() * 4)?;
+        MoeScratch::ensure_tagged(&mut sc.x, n_in * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.g, ng * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.u, ng * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.act, ng * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.h, nh * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.pg, nseg * 8, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.pu, nseg * 8, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.pd, nseg * 8, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.sgu, seg_gu.len() * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.sgd, seg_d.len() * 4, crate::mem_audit::TAG_GDN_SC)?;
         // task 150: overlap 経路だけ pinned staging を用意する (grow-only)。
         if overlap {
             Scratch::ensure_pin(&mut sc.hpin, nh * 4)?;
@@ -4507,7 +4738,7 @@ pub fn expert_pin_h2d() -> bool {
 /// デバイスへ渡るバイト列は [`DevBuffer::from_slice`] と同一 (1 bit も変えない)。
 pub fn from_slice_pinned<T: Copy>(data: &[T]) -> Result<DevBuffer> {
     let bytes = std::mem::size_of_val(data);
-    let buf = DevBuffer::alloc(bytes.max(1))?;
+    let buf = DevBuffer::alloc_tagged(bytes.max(1), crate::mem_audit::TAG_EXPERTS)?;
     if bytes == 0 {
         return Ok(buf);
     }
@@ -4590,8 +4821,12 @@ thread_local! {
 
 impl Scratch {
     fn ensure(cap: &mut Option<DevBuffer>, bytes: usize) -> Result<()> {
+        Self::ensure_tagged(cap, bytes, crate::mem_audit::TAG_OTHER)
+    }
+    /// task 149: 台帳のタグ付き [`Self::ensure`]。
+    fn ensure_tagged(cap: &mut Option<DevBuffer>, bytes: usize, tag: &'static str) -> Result<()> {
         if cap.as_ref().map(|b| b.bytes()).unwrap_or(0) < bytes {
-            *cap = Some(DevBuffer::alloc(bytes)?);
+            *cap = Some(DevBuffer::alloc_tagged(bytes, tag)?);
         }
         Ok(())
     }
@@ -4605,13 +4840,13 @@ impl Scratch {
     /// P58-3: arena から切り出す版の [`Self::ensure`]。既に十分な容量を持つ
     /// バッファが入っていれば何もしない (arena のビューでも個別確保でも同じ)。
     /// arena が無効・確保に失敗したときは従来どおり個別に確保する (fail-open)。
-    fn ensure_arena(cap: &mut Option<DevBuffer>, key: u32, bytes: usize) -> Result<()> {
+    fn ensure_arena(cap: &mut Option<DevBuffer>, key: u32, bytes: usize, tag: &'static str) -> Result<()> {
         if cap.as_ref().map(|b| b.bytes()).unwrap_or(0) >= bytes {
             return Ok(());
         }
-        *cap = Some(match arena_alloc(key, bytes) {
+        *cap = Some(match arena_alloc(key, bytes, tag) {
             Some(b) => b,
-            None => DevBuffer::alloc(bytes)?,
+            None => DevBuffer::alloc_tagged(bytes, tag)?,
         });
         Ok(())
     }
@@ -4801,7 +5036,7 @@ fn arena_state() -> &'static std::sync::Mutex<ArenaState> {
 
 /// arena から `bytes` バイトを切り出し、**非所有ビュー**として返す。
 /// `None` = arena 無効・チャンク確保失敗 (呼び出し側は従来の `DevBuffer::alloc`)。
-fn arena_alloc(key: u32, bytes: usize) -> Option<DevBuffer> {
+fn arena_alloc(key: u32, bytes: usize, tag: &'static str) -> Option<DevBuffer> {
     if !arena_enabled() {
         return None;
     }
@@ -4811,7 +5046,7 @@ fn arena_alloc(key: u32, bytes: usize) -> Option<DevBuffer> {
         Ok(v) => v,
         Err(want) => {
             let want = want.max(ARENA_CHUNK);
-            let buf = match DevBuffer::alloc(want) {
+            let buf = match DevBuffer::alloc_tagged(want, crate::mem_audit::TAG_ARENA) {
                 Ok(b) => b,
                 Err(e) => {
                     if arena_dbg() {
@@ -4904,7 +5139,7 @@ pub fn pf_scratch_begin(rows: usize) {
         g.bufs.clear(); // 古い方を先に解放する (cuMemFree)
         g.plan.reset();
         let alloc = if target > 0 {
-            match DevBuffer::alloc(target) {
+            match DevBuffer::alloc_tagged(target, crate::mem_audit::TAG_ARENA) {
                 Ok(b) => {
                     g.bufs.push(b);
                     g.plan.add_chunk(target);
@@ -4929,6 +5164,76 @@ pub fn pf_scratch_begin(rows: usize) {
             "scratch arena: 境界 rows={rows} 解放 {freed} 本 / 事前確保 {alloc} B (推定 {target} B)"
         );
     }
+}
+
+/// task 149: `DENNO_SCRATCH_FREE` の解釈。既定 **off** (明示的に 1/true/on で有効)。
+///
+/// lab t149c の flash では arena が 1 度も確保されず (tag `scratch arena` が
+/// 表に出ない)、解放しても 1 MiB も変わらなかった。qwen35 側の経路には効く
+/// 可能性があるが未測定なので、既定では従来どおり保持する。
+fn parse_scratch_free(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// task 149: `DENNO_SCRATCH_FREE` が有効か (プロセスで 1 回読む)。
+fn scratch_free_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_scratch_free(std::env::var("DENNO_SCRATCH_FREE").ok().as_deref()))
+}
+
+/// task 149: リクエスト終了時に prefill の arena チャンクを**解放する**。
+///
+/// prefill の一時領域はリクエストを跨いで内容を保持しない (`pf_scratch_begin` の
+/// 契約と同じ) ので、decode の間に何 GiB も抱えたままにしない。次に prefill が
+/// 走るときは `pf_scratch_begin` / `arena_alloc` が同じ手順で確保し直すため、
+/// **ピークは変わらない** (従来も境界で「解放してから確保」していた)。
+///
+/// 他スレッドの予約が残っているときは何もしない (並行リクエストのビューを壊さない)。
+/// 数値には触らない。
+pub fn pf_scratch_release() -> usize {
+    if !arena_enabled() || !scratch_free_enabled() {
+        return 0;
+    }
+    let tid = arena_tid();
+    let Some(arena) = ARENA.get() else {
+        return 0;
+    };
+    let Ok(mut g) = arena.lock() else {
+        return 0;
+    };
+    if g.plan.slots.keys().any(|(t, _)| *t != tid) {
+        return 0;
+    }
+    if g.bufs.is_empty() {
+        return 0;
+    }
+    // ビューを先に落としてから解放する (dangling を作らない)。非同期コピーが
+    // 残っていても解放済み領域を読まないよう、境界の 1 回だけ GPU を止める。
+    drop_arena_views();
+    if let Some(ctx) = shared_ctx() {
+        if ctx.make_current().is_ok() {
+            let _ = ctx.sync();
+        }
+    }
+    let n = g.bufs.len();
+    let bytes = g.plan.capacity();
+    g.bufs.clear(); // ここで cuMemFree
+    g.plan.reset();
+    if arena_dbg() {
+        eprintln!("scratch arena: リクエスト終了で {n} 本 / {bytes} B を解放");
+    }
+    if crate::mem_audit::audit_on() {
+        let free = dev_mem_mb().map(|(f, _)| f).unwrap_or(0);
+        tracing::info!(
+            "[mem-audit] prefill arena を {n} 本 {} MiB 解放 (dev free {} MiB)",
+            bytes >> 20,
+            free
+        );
+    }
+    bytes
 }
 
 /// arena の現在値 (診断・テスト用): (チャンク本数, 総容量, 切り出し回数, 成長回数)。
@@ -7275,7 +7580,7 @@ fn weights_for_gguf(
     if freed_n > 0 {
         crate::gpu_budget::note_weight_evicted(freed_n, freed);
     }
-    let buf = match DevBuffer::from_slice(blocks) {
+    let buf = match DevBuffer::from_slice_tagged(blocks, crate::mem_audit::TAG_WEIGHTS) {
         Ok(b) => b,
         Err(e) => {
             // 記帳だけ進んで実体が無い状態を残さない。
@@ -8816,8 +9121,8 @@ fn q4_dispatch_tile(
         let Scratch { x, out: dout, hx, ho, .. } = &mut *s;
         let bytes_x = m * k * 4;
         let bytes_out = m * n * 4;
-        Scratch::ensure_arena(x, ARENA_KEY_Q4_X, bytes_x)?;
-        Scratch::ensure_arena(dout, ARENA_KEY_Q4_OUT, bytes_out)?;
+        Scratch::ensure_arena(x, ARENA_KEY_Q4_X, bytes_x, crate::mem_audit::TAG_GEMM)?;
+        Scratch::ensure_arena(dout, ARENA_KEY_Q4_OUT, bytes_out, crate::mem_audit::TAG_GEMM)?;
         split_mark(&mut t, crate::prof::Q4P_OUT_ALLOC);
         // s153 (Task B14): クロック読みは 1 回 (`lin_stage_taken_ns`)。読んだ ns を
         // そのまま表 C へ積むので、子の和が親 (`sl_lin`) を超えず、
@@ -9286,6 +9591,106 @@ fn matvec_f32_r_silu_fn(ctx: &CudaCtx) -> Option<CUfunction> {
         .map(|h| h.0)
 }
 
+// ---------------------------------------------------------------------------
+// task 152: BF16 のまま読む mix カーネルのハンドル (未収録 PTX は None)
+// ---------------------------------------------------------------------------
+// 追加カーネルは kernels_elem.cu の末尾 (dno_matvec_bf16 / _r / _r_silu /
+// dno_gemm_bf16_mt)。未収録 (古い PTX) のときは None をキャッシュし、呼び出し側は
+// **f32 展開経路**に落ちる (ラッチしない = 失敗にしない)。モジュールは f32 版と
+// 同じ `module_elem`。
+
+/// task 152: `dno_matvec_bf16` のハンドル。
+fn matvec_bf16_fn(ctx: &CudaCtx) -> Option<CUfunction> {
+    static FN: OnceLock<Option<Lmv32Fn>> = OnceLock::new();
+    FN.get_or_init(|| {
+        let lib = lib().ok()?;
+        let mut f: CUfunction = std::ptr::null_mut();
+        let r = unsafe {
+            (lib.module_get_function)(
+                &mut f,
+                ctx.module_elem,
+                b"dno_matvec_bf16\0".as_ptr() as *const c_char,
+            )
+        };
+        if r != 0 {
+            None
+        } else {
+            Some(Lmv32Fn(f))
+        }
+    })
+    .as_ref()
+    .map(|h| h.0)
+}
+
+/// task 152: `dno_matvec_bf16_r` のハンドル。
+fn matvec_bf16_r_fn(ctx: &CudaCtx) -> Option<CUfunction> {
+    static FN: OnceLock<Option<Lmv32RFn>> = OnceLock::new();
+    FN.get_or_init(|| {
+        let lib = lib().ok()?;
+        let mut f: CUfunction = std::ptr::null_mut();
+        let r = unsafe {
+            (lib.module_get_function)(
+                &mut f,
+                ctx.module_elem,
+                b"dno_matvec_bf16_r\0".as_ptr() as *const c_char,
+            )
+        };
+        if r != 0 {
+            None
+        } else {
+            Some(Lmv32RFn(f))
+        }
+    })
+    .as_ref()
+    .map(|h| h.0)
+}
+
+/// task 152: `dno_matvec_bf16_r_silu` のハンドル。
+fn matvec_bf16_r_silu_fn(ctx: &CudaCtx) -> Option<CUfunction> {
+    static FN: OnceLock<Option<Lmv32RSiluFn>> = OnceLock::new();
+    FN.get_or_init(|| {
+        let lib = lib().ok()?;
+        let mut f: CUfunction = std::ptr::null_mut();
+        let r = unsafe {
+            (lib.module_get_function)(
+                &mut f,
+                ctx.module_elem,
+                b"dno_matvec_bf16_r_silu\0".as_ptr() as *const c_char,
+            )
+        };
+        if r != 0 {
+            None
+        } else {
+            Some(Lmv32RSiluFn(f))
+        }
+    })
+    .as_ref()
+    .map(|h| h.0)
+}
+
+/// task 152: `dno_gemm_bf16_mt` のハンドル (prefill の m トークン一括)。
+fn gemm_bf16_mt_fn(ctx: &CudaCtx) -> Option<CUfunction> {
+    static FN: OnceLock<Option<LgemmMtFn>> = OnceLock::new();
+    FN.get_or_init(|| {
+        let lib = lib().ok()?;
+        let mut f: CUfunction = std::ptr::null_mut();
+        let r = unsafe {
+            (lib.module_get_function)(
+                &mut f,
+                ctx.module_elem,
+                b"dno_gemm_bf16_mt\0".as_ptr() as *const c_char,
+            )
+        };
+        if r != 0 {
+            None
+        } else {
+            Some(LgemmMtFn(f))
+        }
+    })
+    .as_ref()
+    .map(|h| h.0)
+}
+
 /// s49: fp32 重み (lm_head / tied embed) のデバイスキャッシュ。key はモデル
 /// ロード毎に一意 (qwen35 の mid 由来)。無ければ同期 H2D でアップロードし
 /// 初回 1 回のみ走る (eviction 無し = P17b 重みレジストリと同一方針)。
@@ -9339,7 +9744,7 @@ pub fn maybe_gpu_matvec_f32(
         };
         match map.get(&key) {
             Some(b) if b.bytes() == w.len() * 4 => b.ptr(),
-            _ => match DevBuffer::from_slice(w) {
+            _ => match DevBuffer::from_slice_tagged(w, crate::mem_audit::TAG_LMHEAD) {
                 Ok(buf) => {
                     tracing::info!(
                         "CUDA fp32 lm_head weight upload: k={k} n={n} ({:.1} MB)",
@@ -9587,7 +9992,7 @@ fn weights_for_f32(uid: u64, bytes: &[u8], k: usize, n: usize) -> Result<GgufWRe
     for c in bytes.chunks_exact(4) {
         host.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
     }
-    let buf = match DevBuffer::from_slice(&host) {
+    let buf = match DevBuffer::from_slice_tagged(&host, crate::mem_audit::TAG_ROUTER) {
         Ok(b) => b,
         Err(e) => {
             g.lru.note_remove(uid);
@@ -9881,10 +10286,39 @@ fn mix_expand_bf16(bytes: &[u8], k: usize, n: usize) -> Vec<f32> {
 
 /// task 110: 展開済み f32 重みの常駐エントリ (s49 の LMV32_W と同じ方針:
 /// eviction 無し・uid key。解放は [`mix_gpu_unregister`] が `GgufLinear::drop` から)。
+///
+/// task 152: `bf16 == true` のときは `buf` が **BF16 の生バイト** (k*n*2 B) で、
+/// カーネルは `dno_matvec_bf16*` / `dno_gemm_bf16_mt` を使う。f32 展開しないので
+/// 常駐が半分になる (lab t149c の w:mix_f32 2,425 MiB のうち約 1,200 MiB が戻る)。
 struct MixGpuW {
     buf: DevBuffer,
     k: usize,
     n: usize,
+    bf16: bool,
+}
+
+/// task 152: 常駐重みのポインタ (モードは呼び出し側が先に決めている)。
+#[derive(Clone, Copy)]
+struct MixW {
+    ptr: CUdeviceptr,
+}
+
+/// task 152: `DENNO_MIX_BF16` の解釈 (純関数)。明示的な真値だけ on。
+/// 既定は [`MIX_BF16_DEFAULT`] (lab の採否で決める)。
+fn mix_bf16_from_value(v: Option<&str>, default_on: bool) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) if matches!(s.as_str(), "1" | "true" | "on" | "yes") => true,
+        Some(s) if matches!(s.as_str(), "0" | "false" | "off" | "no") => false,
+        _ => default_on,
+    }
+}
+
+/// task 152: BF16 のまま読むカーネルを使うか (`DENNO_MIX_BF16`)。
+fn mix_bf16_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        mix_bf16_from_value(std::env::var("DENNO_MIX_BF16").ok().as_deref(), MIX_BF16_DEFAULT)
+    })
 }
 
 static MIX_GPU_W: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, MixGpuW>>> =
@@ -9991,7 +10425,15 @@ pub fn maybe_gpu_mix_bf16_into(
         return false;
     }
     // カーネルハンドル (lazy fetch)。未収録 PTX は 1 行 warn して CPU に落とす。
-    let Some(f) = matvec_f32_fn(ctx) else {
+    // task 152: `DENNO_MIX_BF16=1` かつ BF16 カーネルが PTX にあれば、重みを f32 に
+    // 展開せず BF16 のまま読む (常駐が半分)。無ければ従来の f32 展開経路。
+    let want_bf16 = mix_bf16_enabled() && matvec_bf16_fn(ctx).is_some();
+    let (f_seq, f_red) = if want_bf16 {
+        (matvec_bf16_fn(ctx), matvec_bf16_r_fn(ctx))
+    } else {
+        (matvec_f32_fn(ctx), matvec_f32_r_fn(ctx))
+    };
+    let Some(f) = f_seq else {
         mix_gpu_broken_once("kernels_elem.ptx に dno_matvec_f32 が無い (PTX 再生成が必要)");
         return false;
     };
@@ -10001,42 +10443,14 @@ pub fn maybe_gpu_mix_bf16_into(
     // 律速に達しない)。`_r` は DENNO_FAST_REDUCE と無関係にこの経路だけで選ぶ
     // (mix の長い行はオペレーター方針で bit 一致契約の外)。PTX に `_r` が無ければ
     // (Option が None) 逐次版に落ちる = 失敗にはしない (fail closed)。
-    let fr = matvec_f32_r_fn(ctx);
+    let fr = f_red;
     let use_reduce = mix_use_reduce_kernel(k, n, fr.is_some());
     // 重みの展開 + 常駐 (初回 1 回・同期 H2D)。ロック内で二重アップロード防止。
-    let reg = MIX_GPU_W.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let wp = {
-        let mut map = match reg.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                mix_gpu_broken_once("hc mix weight registry poisoned");
-                return false;
-            }
-        };
-        match map.get(&uid) {
-            Some(w) if w.k == k && w.n == n => w.buf.ptr(),
-            Some(_) => {
-                mix_gpu_broken_once(&format!("uid 重複: uid={uid} に別の形状 (k={k}, n={n})"));
-                return false;
-            }
-            None => {
-                let host = mix_expand_bf16(bytes, k, n);
-                match DevBuffer::from_slice(&host) {
-                    Ok(buf) => {
-                        tracing::info!(
-                            "[mix-gpu] uid={uid} bf16 mix k={k} n={n} {:.1} MB (f32 展開済み・常駐)",
-                            (k * n * 4) as f64 / 1e6
-                        );
-                        let p = buf.ptr();
-                        map.insert(uid, MixGpuW { buf, k, n });
-                        p
-                    }
-                    Err(e) => {
-                        mix_gpu_broken_once(&format!("f32 展開重みの VRAM 確保に失敗: {e:#}"));
-                        return false;
-                    }
-                }
-            }
+    let wp = match mix_gpu_weight(uid, bytes, k, n, want_bf16) {
+        Ok(w) => w.ptr,
+        Err(e) => {
+            mix_gpu_broken_once(&format!("hc mix 重みの常駐に失敗: {e:#}"));
+            return false;
         }
     };
     let lib = match lib() {
@@ -10193,12 +10607,19 @@ pub fn maybe_gpu_mix_bf16_batch_into(
         mix_gpu_broken_once(&format!("cuCtxSetCurrent (batch): {e:#}"));
         return false;
     }
-    let Some(f) = gemm_f32_mt_fn(ctx) else {
+    // task 152: BF16 カーネルがあれば重みを BF16 のまま置く (常駐が半分)。
+    let want_bf16 = mix_bf16_enabled() && gemm_bf16_mt_fn(ctx).is_some();
+    let f = if want_bf16 {
+        gemm_bf16_mt_fn(ctx)
+    } else {
+        gemm_f32_mt_fn(ctx)
+    };
+    let Some(f) = f else {
         // PTX 未収録 (PTX=elem の再生成待ち)。ラッチはしない。
         return false;
     };
-    let wp = match mix_gpu_weight(uid, bytes, k, n) {
-        Ok(p) => p,
+    let wp = match mix_gpu_weight(uid, bytes, k, n, want_bf16) {
+        Ok(w) => w.ptr,
         Err(e) => {
             mix_gpu_broken_once(&format!("batch の重み常駐に失敗: {e:#}"));
             return false;
@@ -10268,27 +10689,59 @@ pub fn maybe_gpu_mix_bf16_batch_into(
 }
 
 
+/// task 152: BF16 のまま読む mix カーネルの既定値 (**on**)。
+///
+/// lab t152b の g22 条件で採否 OK (`REPORT_P152.md`)。`w:mix_f32` 2,425 MiB ->
+/// `w:mix_bf16` 1,213 MiB、md5 は全条件 SAME (f32 版と同じ演算列)。
+/// `DENNO_MIX_BF16=0` で従来の f32 展開経路に戻せる。
+const MIX_BF16_DEFAULT: bool = true;
+
 /// `MIX_GPU_W` の登録・形状検査・初回の同期 H2D を 1 箇所にまとめたもの
 /// ([`maybe_gpu_mix_bf16_into`] と同じ規約)。uid は `GgufLinear` のもの。
-fn mix_gpu_weight(uid: u64, bytes: &[u8], k: usize, n: usize) -> Result<CUdeviceptr> {
+///
+/// task 152: `want_bf16` のときは生バイト (BF16) をそのまま上げる。既に逆の
+/// モードで載っている uid を要求されたら **エラー**にする (黙って別解釈の
+/// バイト列で計算しない。呼び出し側は CPU へ落ちる)。
+fn mix_gpu_weight(uid: u64, bytes: &[u8], k: usize, n: usize, want_bf16: bool) -> Result<MixW> {
     let reg = MIX_GPU_W.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut map = match reg.lock() {
         Ok(g) => g,
         Err(_) => bail!("hc mix weight registry poisoned"),
     };
     match map.get(&uid) {
-        Some(w) if w.k == k && w.n == n => Ok(w.buf.ptr()),
-        Some(_) => bail!("uid 重複: uid={uid} に別の形状 (k={k}, n={n})"),
+        Some(w) if w.k == k && w.n == n && w.bf16 == want_bf16 => Ok(MixW {
+            ptr: w.buf.ptr(),
+        }),
+        Some(_) => bail!("uid 重複: uid={uid} に別の形状/モード (k={k}, n={n}, bf16={want_bf16})"),
         None => {
-            let host = mix_expand_bf16(bytes, k, n);
-            let buf = DevBuffer::from_slice(&host)?;
+            let (buf, tag) = if want_bf16 {
+                match DevBuffer::from_slice_tagged(bytes, crate::mem_audit::TAG_MIX_BF16) {
+                    Ok(b) => (b, crate::mem_audit::TAG_MIX_BF16),
+                    Err(e) => bail!("BF16 のままの mix 重みを VRAM に置けない: {e:#}"),
+                }
+            } else {
+                let host = mix_expand_bf16(bytes, k, n);
+                match DevBuffer::from_slice_tagged(&host, crate::mem_audit::TAG_MIX_F32) {
+                    Ok(b) => (b, crate::mem_audit::TAG_MIX_F32),
+                    Err(e) => bail!("f32 展開重みの VRAM 確保に失敗: {e:#}"),
+                }
+            };
             tracing::info!(
-                "[mix-gpu] uid={uid} bf16 mix k={k} n={n} {:.1} MB (f32 展開済み・常駐)",
-                (k * n * 4) as f64 / 1e6
+                "[mix-gpu] uid={uid} bf16 mix k={k} n={n} {:.1} MB ({}・常駐)",
+                buf.bytes() as f64 / 1e6,
+                if want_bf16 { "BF16 のまま" } else { "f32 展開済み" }
             );
             let p = buf.ptr();
-            map.insert(uid, MixGpuW { buf, k, n });
-            Ok(p)
+            debug_assert_eq!(
+                tag,
+                if want_bf16 {
+                    crate::mem_audit::TAG_MIX_BF16
+                } else {
+                    crate::mem_audit::TAG_MIX_F32
+                }
+            );
+            map.insert(uid, MixGpuW { buf, k, n, bf16: want_bf16 });
+            Ok(MixW { ptr: p })
         }
     }
 }
@@ -10369,31 +10822,41 @@ pub fn maybe_gpu_mix_bf16_chain_into(
         return false;
     }
     // down は silu 込みの並列リダクション版。未収録 PTX は従来経路へ (ラッチしない)。
-    let Some(f_down) = matvec_f32_r_silu_fn(ctx) else {
+    // task 152: BF16 カーネルがあれば重みは BF16 のまま (常駐が半分)。
+    let want_bf16 = mix_bf16_enabled() && matvec_bf16_r_silu_fn(ctx).is_some();
+    let f_down = if want_bf16 {
+        matvec_bf16_r_silu_fn(ctx)
+    } else {
+        matvec_f32_r_silu_fn(ctx)
+    };
+    let Some(f_down) = f_down else {
         return false;
     };
     let up_reduce = mix_up_reduce_enabled();
     let f_up = if up_reduce {
-        match matvec_f32_r_fn(ctx) {
-            Some(f) => f,
-            None => return false,
+        if want_bf16 {
+            matvec_bf16_r_fn(ctx)
+        } else {
+            matvec_f32_r_fn(ctx)
         }
+    } else if want_bf16 {
+        matvec_bf16_fn(ctx)
     } else {
-        match matvec_f32_fn(ctx) {
-            Some(f) => f,
-            None => return false,
-        }
+        matvec_f32_fn(ctx)
+    };
+    let Some(f_up) = f_up else {
+        return false;
     };
     let up_thr: u32 = if up_reduce { 256 } else { 1 };
-    let wp1 = match mix_gpu_weight(down_uid, down_bytes, k1, n1) {
-        Ok(p) => p,
+    let wp1 = match mix_gpu_weight(down_uid, down_bytes, k1, n1, want_bf16) {
+        Ok(w) => w.ptr,
         Err(e) => {
             mix_gpu_broken_once(&format!("down 重みの常駐に失敗: {e:#}"));
             return false;
         }
     };
-    let wp2 = match mix_gpu_weight(up_uid, up_bytes, n1, n2) {
-        Ok(p) => p,
+    let wp2 = match mix_gpu_weight(up_uid, up_bytes, n1, n2, want_bf16) {
+        Ok(w) => w.ptr,
         Err(e) => {
             mix_gpu_broken_once(&format!("up 重みの常駐に失敗: {e:#}"));
             return false;
@@ -10579,31 +11042,44 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
         mix_gpu_broken_once(&format!("cuCtxSetCurrent: {e:#}"));
         return false;
     }
-    let (Some(f_down), Some(f_mixed)) = (matvec_f32_r_silu_fn(ctx), hc_mixed_f32_fn(ctx)) else {
+    let Some(f_mixed) = hc_mixed_f32_fn(ctx) else {
+        return false;
+    };
+    // task 152: BF16 カーネルがあれば重みは BF16 のまま (常駐が半分)。
+    let want_bf16 = mix_bf16_enabled() && matvec_bf16_r_silu_fn(ctx).is_some();
+    let f_down = if want_bf16 {
+        matvec_bf16_r_silu_fn(ctx)
+    } else {
+        matvec_f32_r_silu_fn(ctx)
+    };
+    let Some(f_down) = f_down else {
         return false;
     };
     let up_reduce = mix_up_reduce_enabled();
     let f_up = if up_reduce {
-        match matvec_f32_r_fn(ctx) {
-            Some(f) => f,
-            None => return false,
+        if want_bf16 {
+            matvec_bf16_r_fn(ctx)
+        } else {
+            matvec_f32_r_fn(ctx)
         }
+    } else if want_bf16 {
+        matvec_bf16_fn(ctx)
     } else {
-        match matvec_f32_fn(ctx) {
-            Some(f) => f,
-            None => return false,
-        }
+        matvec_f32_fn(ctx)
+    };
+    let Some(f_up) = f_up else {
+        return false;
     };
     let up_thr: u32 = if up_reduce { 256 } else { 1 };
-    let wp1 = match mix_gpu_weight(down_uid, down_bytes, k1, n1) {
-        Ok(p) => p,
+    let wp1 = match mix_gpu_weight(down_uid, down_bytes, k1, n1, want_bf16) {
+        Ok(w) => w.ptr,
         Err(e) => {
             mix_gpu_broken_once(&format!("down 重みの常駐に失敗: {e:#}"));
             return false;
         }
     };
-    let wp2 = match mix_gpu_weight(up_uid, up_bytes, n1, n2) {
-        Ok(p) => p,
+    let wp2 = match mix_gpu_weight(up_uid, up_bytes, n1, n2, want_bf16) {
+        Ok(w) => w.ptr,
         Err(e) => {
             mix_gpu_broken_once(&format!("up 重みの常駐に失敗: {e:#}"));
             return false;
@@ -11132,7 +11608,12 @@ fn chain_ensure_buf(slot: usize, bytes: usize) -> Result<(), anyhow::Error> {
         // サイズ以下なら同じオフセットが返るので、リクエストごとの
         // cuMemAlloc / cuMemFree が消える。arena 無効・失敗時は従来の個別確保
         // (fail-open・数値不変)。
-        Scratch::ensure_arena(&mut s.bufs[slot], ARENA_KEY_CHAIN + slot as u32, bytes)
+        Scratch::ensure_arena(
+            &mut s.bufs[slot],
+            ARENA_KEY_CHAIN + slot as u32,
+            bytes,
+            crate::mem_audit::TAG_CHAIN,
+        )
             .map_err(chain_err)
     })
 }
@@ -11413,7 +11894,7 @@ pub fn chain_rmsnorm_cached(
             None => true,
         };
         if stale {
-            let buf = ok(DevBuffer::from_slice(w))?;
+            let buf = ok(DevBuffer::from_slice_tagged(w, crate::mem_audit::TAG_CHAIN))?;
             s.rms_w.insert((key, pin_id), buf);
         }
         let wdev = s.rms_w.get(&(key, pin_id))?.ptr();
@@ -12676,8 +13157,16 @@ fn with_mirror_ext<T>(
         // 使う層の分だけ確保する (grow-only・容量は cap 行で固定)
         let bytes = m.cap * kv_dim * 4;
         let before = m.layers[li].0.as_ref().map(|b| b.bytes()).unwrap_or(0);
-        ok(Scratch::ensure(&mut m.layers[li].0, bytes))?;
-        ok(Scratch::ensure(&mut m.layers[li].1, bytes))?;
+        ok(Scratch::ensure_tagged(
+            &mut m.layers[li].0,
+            bytes,
+            crate::mem_audit::TAG_KV_MIRROR,
+        ))?;
+        ok(Scratch::ensure_tagged(
+            &mut m.layers[li].1,
+            bytes,
+            crate::mem_audit::TAG_KV_MIRROR,
+        ))?;
         if before < bytes {
             // バッファを伸ばした = 行内容は失われた (ensure は新規確保) → 全再シード
             m.len[li] = 0;
@@ -12744,8 +13233,16 @@ pub fn chain_attention(
     // q / scores スクラッチ (スレッドローカル — chain は 1 スレッド 1 セッション)
     CHAIN.with(|cell| -> Option<()> {
         let mut s = cell.borrow_mut();
-        ok(Scratch::ensure(&mut s.attn_q, q.len() * 4))?;
-        ok(Scratch::ensure(&mut s.attn_sc, heads * t_total * 4))?;
+        ok(Scratch::ensure_tagged(
+            &mut s.attn_q,
+            q.len() * 4,
+            crate::mem_audit::TAG_CHAIN,
+        ))?;
+        ok(Scratch::ensure_tagged(
+            &mut s.attn_sc,
+            heads * t_total * 4,
+            crate::mem_audit::TAG_CHAIN,
+        ))?;
         ok(s.attn_q.as_ref().unwrap().copy_from(q))?;
         let mut qptr = s.attn_q.as_ref().unwrap().ptr();
         let mut scptr = s.attn_sc.as_ref().unwrap().ptr();
@@ -13326,7 +13823,7 @@ fn q4_attn_grow(m: &mut Q4AttnMirror, new_cap: usize, kv_dim: usize) -> Result<(
         }
         let keep = m.state.len[l].min(new_cap);
         for slot in [&mut m.k[l], &mut m.v[l]] {
-            let nb = DevBuffer::alloc(bytes)?;
+            let nb = DevBuffer::alloc_tagged(bytes, crate::mem_audit::TAG_ATTN_MIRROR)?;
             if keep > 0 {
                 if let Some(old) = slot.as_ref() {
                     nb.copy_from_dev(old.ptr(), keep * kv_dim)?;
@@ -13360,8 +13857,14 @@ fn q4_attn_mirror_sync(
     }
     if m.k[layer].is_none() || m.v[layer].is_none() {
         let bytes = m.state.cap * kv_dim * 4;
-        m.k[layer] = Some(DevBuffer::alloc(bytes)?);
-        m.v[layer] = Some(DevBuffer::alloc(bytes)?);
+        m.k[layer] = Some(DevBuffer::alloc_tagged(
+            bytes,
+            crate::mem_audit::TAG_ATTN_MIRROR,
+        )?);
+        m.v[layer] = Some(DevBuffer::alloc_tagged(
+            bytes,
+            crate::mem_audit::TAG_ATTN_MIRROR,
+        )?);
     }
     let have = q4_mirror_have(&m.state, layer, len, gen);
     if have < len {
@@ -15801,7 +16304,7 @@ fn q35_w_dev(mid: u64, li: usize, tag: u8, w: &[f32]) -> Option<CUdeviceptr> {
                 return Some(b.ptr());
             }
         }
-        let buf = ok(DevBuffer::from_slice(w))?;
+        let buf = ok(DevBuffer::from_slice_tagged(w, crate::mem_audit::TAG_CHAIN))?;
         let p = buf.ptr();
         s.q35_w_cache.insert((mid, li, tag), buf);
         Some(p)
@@ -16334,10 +16837,26 @@ pub fn chain_q35_gdn_scan(
                     ssm: [None, None],
                     cur: 0,
                 };
-                ok(Scratch::ensure(&mut g.conv[0], conv_dim * cs * 4))?;
-                ok(Scratch::ensure(&mut g.conv[1], conv_dim * cs * 4))?;
-                ok(Scratch::ensure(&mut g.ssm[0], nv * dk * dv * 4))?;
-                ok(Scratch::ensure(&mut g.ssm[1], nv * dk * dv * 4))?;
+                ok(Scratch::ensure_tagged(
+                    &mut g.conv[0],
+                    conv_dim * cs * 4,
+                    crate::mem_audit::TAG_GDN_MIRROR,
+                ))?;
+                ok(Scratch::ensure_tagged(
+                    &mut g.conv[1],
+                    conv_dim * cs * 4,
+                    crate::mem_audit::TAG_GDN_MIRROR,
+                ))?;
+                ok(Scratch::ensure_tagged(
+                    &mut g.ssm[0],
+                    nv * dk * dv * 4,
+                    crate::mem_audit::TAG_GDN_MIRROR,
+                ))?;
+                ok(Scratch::ensure_tagged(
+                    &mut g.ssm[1],
+                    nv * dk * dv * 4,
+                    crate::mem_audit::TAG_GDN_MIRROR,
+                ))?;
                 m.gdn[li] = Some(g);
             }
             let gd = m.gdn[li].as_mut().unwrap();
@@ -17485,6 +18004,36 @@ mod q4_attn_tests {
 mod tests {
     use super::*;
     use crate::tensor;
+
+    /// task 152: `DENNO_MIX_BF16` の真理値表。既定は off (lab の採否で決める)。
+    #[test]
+    fn mix_bf16_gate_truth_table() {
+        assert!(!mix_bf16_from_value(None, false), "既定 off");
+        assert!(mix_bf16_from_value(None, true), "既定 on を渡せば on");
+        for v in [Some("1"), Some("on"), Some(" TRUE "), Some("yes")] {
+            assert!(mix_bf16_from_value(v, false), "value={v:?} は on のはず");
+        }
+        for v in [Some("0"), Some("off"), Some("false"), Some("no")] {
+            assert!(!mix_bf16_from_value(v, true), "value={v:?} は off のはず");
+        }
+        assert!(MIX_BF16_DEFAULT, "lab t152b で採用 → 既定 on");
+    }
+
+    /// task 152: cuMemGetInfo のキャッシュ判定 (64 MiB の増減 / 2 秒)。
+    #[test]
+    fn mem_cache_refresh_rule() {
+        assert!(!mem_cache_should_refresh(0, 0), "変化なし・直後は引き直さない");
+        assert!(!mem_cache_should_refresh(
+            (MEM_CACHE_DRIFT_MB << 20) - 1,
+            MEM_CACHE_MAX_MS - 1
+        ));
+        assert!(mem_cache_should_refresh(MEM_CACHE_DRIFT_MB << 20, 0), "64 MiB 動いた");
+        assert!(mem_cache_should_refresh(0, MEM_CACHE_MAX_MS), "2 秒経った");
+        assert!(
+            mem_cache_should_refresh((MEM_CACHE_DRIFT_MB << 20) + 1, 0),
+            "64 MiB 超"
+        );
+    }
 
     /// task 138: `DENNO_MIX_UP_REDUCE` は既定 on。明示的な偽値だけ逐次版へ戻す。
     #[test]
@@ -20959,10 +21508,26 @@ mod tests {
                     ssm: [None, None],
                     cur: 0,
                 };
-                ok(Scratch::ensure(&mut g.conv[0], conv_len * 4))?;
-                ok(Scratch::ensure(&mut g.conv[1], conv_len * 4))?;
-                ok(Scratch::ensure(&mut g.ssm[0], ssm_len * 4))?;
-                ok(Scratch::ensure(&mut g.ssm[1], ssm_len * 4))?;
+                ok(Scratch::ensure_tagged(
+                    &mut g.conv[0],
+                    conv_len * 4,
+                    crate::mem_audit::TAG_GDN_MIRROR,
+                ))?;
+                ok(Scratch::ensure_tagged(
+                    &mut g.conv[1],
+                    conv_len * 4,
+                    crate::mem_audit::TAG_GDN_MIRROR,
+                ))?;
+                ok(Scratch::ensure_tagged(
+                    &mut g.ssm[0],
+                    ssm_len * 4,
+                    crate::mem_audit::TAG_GDN_MIRROR,
+                ))?;
+                ok(Scratch::ensure_tagged(
+                    &mut g.ssm[1],
+                    ssm_len * 4,
+                    crate::mem_audit::TAG_GDN_MIRROR,
+                ))?;
                 m.gdn[0] = Some(g);
             }
             let gd = m.gdn[0].as_mut().unwrap();
@@ -25776,6 +26341,18 @@ mod p53_qk_overlap_tests {
 mod p58_scratch_arena_tests {
     use super::*;
 
+    /// task 149: リクエスト終了時の解放は既定 off (lab で効果が無かったため)。
+    #[test]
+    fn scratch_free_env_gate() {
+        assert!(!parse_scratch_free(None), "未設定 = off (従来どおり保持)");
+        assert!(!parse_scratch_free(Some("0")));
+        assert!(!parse_scratch_free(Some("false")));
+        assert!(!parse_scratch_free(Some("OFF")));
+        assert!(parse_scratch_free(Some("1")));
+        assert!(parse_scratch_free(Some(" true ")));
+        assert!(parse_scratch_free(Some("on")));
+    }
+
     /// 27B q4・n=14,240 の prefill で実際に切り出される 12 スロット
     /// (`chain_ensure_buf` が要求するバイト数と同じ式)。
     fn chain_slot_bytes(rows: usize) -> [usize; 12] {
@@ -26370,19 +26947,25 @@ fn gdn_decode_entry_ensure_locked(
     }
     let e = GdnDecodeLayerDev {
         conv: [
-            DevBuffer::alloc(req.conv_dim * cs * 4)?,
-            DevBuffer::alloc(req.conv_dim * cs * 4)?,
+            DevBuffer::alloc_tagged(req.conv_dim * cs * 4, crate::mem_audit::TAG_GDN_MIRROR)?,
+            DevBuffer::alloc_tagged(req.conv_dim * cs * 4, crate::mem_audit::TAG_GDN_MIRROR)?,
         ],
-        ssm: DevBuffer::alloc(req.nv * req.dk * req.dv * 4)?,
+        ssm: DevBuffer::alloc_tagged(
+            req.nv * req.dk * req.dv * 4,
+            crate::mem_audit::TAG_GDN_MIRROR,
+        )?,
         cur: 0,
-        wconv: DevBuffer::from_slice(req.wconv)?,
-        wa: DevBuffer::from_slice(req.wa)?,
-        wdt: DevBuffer::from_slice(req.wdt)?,
-        wnorm: DevBuffer::from_slice(req.wnorm)?,
-        xba: DevBuffer::alloc((req.n_embd + req.nv * 2) * 4)?,
-        qkv: DevBuffer::alloc(req.qkv_total * 4)?,
-        y: DevBuffer::alloc(req.nv * req.dv * 4)?,
-        out: DevBuffer::alloc(req.n_embd * 4)?,
+        wconv: DevBuffer::from_slice_tagged(req.wconv, crate::mem_audit::TAG_GDN_W)?,
+        wa: DevBuffer::from_slice_tagged(req.wa, crate::mem_audit::TAG_GDN_W)?,
+        wdt: DevBuffer::from_slice_tagged(req.wdt, crate::mem_audit::TAG_GDN_W)?,
+        wnorm: DevBuffer::from_slice_tagged(req.wnorm, crate::mem_audit::TAG_GDN_W)?,
+        xba: DevBuffer::alloc_tagged(
+            (req.n_embd + req.nv * 2) * 4,
+            crate::mem_audit::TAG_GDN_SC,
+        )?,
+        qkv: DevBuffer::alloc_tagged(req.qkv_total * 4, crate::mem_audit::TAG_GDN_SC)?,
+        y: DevBuffer::alloc_tagged(req.nv * req.dv * 4, crate::mem_audit::TAG_GDN_SC)?,
+        out: DevBuffer::alloc_tagged(req.n_embd * 4, crate::mem_audit::TAG_GDN_SC)?,
         n_embd: req.n_embd,
         qkv_total: req.qkv_total,
         vd: req.nv * req.dv,

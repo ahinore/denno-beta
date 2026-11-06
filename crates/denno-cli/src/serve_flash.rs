@@ -1600,8 +1600,15 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
     let expert_bytes;
     {
         let p = Qwen4ExpParams::from_meta(&f).context("メタデータを読めない")?;
-        let budget = denno_engine::gpu_budget::flash_budget_from_gguf(&f, &p, cfg.max_ctx);
-        eprintln!("{}", denno_engine::gpu_budget::budget_line(&budget));
+        // task 152: **全パート**を数える。t149c の `[flash] vram budget` は 2 分割の
+        // part-1 しか数えておらず、実際に VRAM へ上がった dense 重みの 13% だった。
+        match denno_engine::gpu_budget::flash_budget_from_parts(&parts, &p, cfg.max_ctx) {
+            Ok(b) => eprintln!(
+                "{}",
+                denno_engine::gpu_budget::budget_line_with_parts(&b, parts.len())
+            ),
+            Err(e) => eprintln!("[flash] vram budget: 全パートを数えられない: {e:#}"),
+        }
         n_layer = p.n_layer;
         n_expert = p.n_expert;
         // task 146: 使用回数ファイルのモデル同一性 (全層の expert 3 行列の合計バイト)。
@@ -1729,6 +1736,11 @@ pub fn run(cfg: FlashConfig) -> Result<()> {
                     eprintln!("[flash] リクエスト失敗: {e:#}");
                 }
                 eprintln!("[flash] request done {:.1}s", t.elapsed().as_secs_f64());
+                // task 149: リクエスト境界。prefill の一時領域 (arena) を返し、
+                // 確保の内訳を 1 表だけ出す (1 本目と長い文脈の最初の 1 回)。
+                // `DENNO_SCRATCH_FREE=0` / `DENNO_Q4_PROFILE` なしでは何もしない。
+                let ctx_tokens = flash.cache.as_ref().map(|c| c.toks.len()).unwrap_or(0);
+                denno_engine::mem_audit::request_boundary(ctx_tokens, 4096);
                 // P-pf-arena: 重み登録の成否をリクエスト単位で 1 行 (登録を試みた
                 // ときだけ)。GPU_BROKEN のラッチはプロセス寿命なので reset しない。
                 let st = denno_engine::gpu_budget::weight_upload_stats();

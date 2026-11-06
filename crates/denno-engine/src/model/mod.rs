@@ -5,6 +5,7 @@ pub mod exp_iq;
 pub mod exp_pf;
 pub mod expert_batch;
 pub mod expert_cache;
+pub mod expert_slab;
 pub mod exp_kprof;
 pub mod exp_stats;
 pub mod expert_vram;
