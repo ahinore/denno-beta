@@ -389,6 +389,38 @@ pub fn hc_combine(
     HyperStreams { data, hc, n_embd: e }
 }
 
+/// task 155: [`hc_combine`] の**作業域を使い回す**版。
+///
+/// `residual` をその場で書き換える。1 要素の更新は自分自身の要素と `block_out`
+/// だけで決まる (`out = res + bo * w[s]`) ので、読み書きが同じ添字に閉じており
+/// **逐次版とビット一致**する。確保 (hc*n_embd の Vec) と写しが消える。
+pub fn hc_combine_inplace(
+    residual: &mut HyperStreams,
+    block_out: &[f32],
+    inject: &[f32],
+    p: &HyperParams,
+) {
+    let e = p.n_embd;
+    let hc = p.hc;
+    assert_eq!(residual.hc, hc, "residual.hc が hc と一致しない");
+    assert_eq!(residual.n_embd, e, "residual.n_embd が n_embd と一致しない");
+    assert_eq!(
+        residual.data.len(),
+        hc * e,
+        "residual.data.len() は hc*n_embd と一致する必要がある"
+    );
+    assert_eq!(block_out.len(), e, "block_out は [n_embd]");
+    assert_eq!(inject.len(), hc, "inject は [hc]");
+
+    for s in 0..hc {
+        let ws = 2.0f32 * sigmoid(inject[s]);
+        let row = &mut residual.data[s * e..(s + 1) * e];
+        for d in 0..e {
+            row[d] = row[d] + block_out[d] * ws;
+        }
+    }
+}
+
 /// 最終段。`output_norm` は無く、head の mixer がそれを担う。
 /// `hc_mix` と同じ手順で `mixed` を作って返す (combine はしない)。
 pub fn hc_head(
@@ -804,6 +836,53 @@ mod tests {
             HC_BATCH_PAR_CALLS.load(std::sync::atomic::Ordering::Relaxed) > par0,
             "rayon 経路に入っていない (e >= MIXED_PAR_MIN_E の分岐が死んでいる)"
         );
+    }
+
+    /// task 155: [`hc_combine_inplace`] が [`hc_combine`] と**ビット一致**する。
+    ///
+    /// 作業域を使い回しても、1 要素の更新が自分自身と `block_out` だけで閉じる
+    /// (読み書きが同じ添字) ので、確保ありの版と同じ値になる。
+    #[test]
+    fn hc_combine_inplace_matches_bitwise() {
+        for &(hc, e) in &[(4usize, 2560usize), (4, 37), (1, 7), (2, 1031)] {
+            let hp = HyperParams {
+                hc,
+                n_embd: e,
+                low_rank: 2,
+                eps: 1e-6,
+            };
+            let data: Vec<f32> = (0..hc * e)
+                .map(|i| (((i * 17) % 23) as f32 - 11.0) * 0.031)
+                .collect();
+            let block: Vec<f32> = (0..e)
+                .map(|i| (((i * 5) % 19) as f32 - 9.0) * 0.017)
+                .collect();
+            let inject: Vec<f32> = (0..hc).map(|i| ((i * 3) % 7) as f32 * 0.11 - 0.3).collect();
+            let res = HyperStreams {
+                data: data.clone(),
+                hc,
+                n_embd: e,
+            };
+            let want = hc_combine(&res, &block, &inject, &hp);
+            let mut got = HyperStreams {
+                data,
+                hc,
+                n_embd: e,
+            };
+            hc_combine_inplace(&mut got, &block, &inject, &hp);
+            assert_eq!(got.data.len(), want.data.len());
+            for i in 0..want.data.len() {
+                assert_eq!(
+                    got.data[i].to_bits(),
+                    want.data[i].to_bits(),
+                    "hc_combine_inplace: hc={hc} e={e} 要素 {i} がビット一致しない"
+                );
+            }
+            assert!(
+                want.data.iter().any(|v| *v != 0.0),
+                "combine が全 0 (hc={hc} e={e})"
+            );
+        }
     }
 
     /// task 106 以前の [`mixed_range`] 本体 (d 外側 / s 内側・添字アクセス)。

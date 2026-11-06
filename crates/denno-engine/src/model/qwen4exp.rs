@@ -2395,8 +2395,11 @@ impl Qwen4Exp {
         let _gw = gdn_gpu_win::window(nt == 1);
         for il in 0..self.p.n_layer {
             // P54: 役割別 RMS は層ごとに 0 から取り直す (観測しないときは None)。
+            // task 155: 層の入口の下ごしらえを台帳の `loop` 行に分ける。
+            let mut rr: Option<&mut RoleRms>;
             {
-                let mut rr: Option<&mut RoleRms> = if auto {
+                let _l = q4ledger::enter(q4ledger::LOOP);
+                rr = if auto {
                     Some(&mut auto_roles)
                 } else {
                     roles.as_deref_mut()
@@ -2404,20 +2407,24 @@ impl Qwen4Exp {
                 if let Some(d) = rr.as_deref_mut() {
                     *d = RoleRms::default();
                 }
-                // P56: RouterTopK はこの呼び出しの最終トークンだけ (`t + 1 == nt`)。
-                // decode は (0, 1) なので常に真、逐次 prefill は末尾の 1 トークンだけ。
-                // P58 の RoleAct も同じ規則。
-                self.run_layer(
-                    il,
-                    &mut res,
-                    ple_emb.as_ref(),
-                    &hp,
-                    &mut |_, _, _| Ok(()),
-                    rr.as_deref_mut(),
-                    t + 1 == nt,
-                )?;
             }
+            // P56: RouterTopK はこの呼び出しの最終トークンだけ (`t + 1 == nt`)。
+            // decode は (0, 1) なので常に真、逐次 prefill は末尾の 1 トークンだけ。
+            // P58 の RoleAct も同じ規則。
+            self.run_layer(
+                il,
+                &mut res,
+                ple_emb.as_ref(),
+                &hp,
+                // task 155: 中間値を見るフックは decode では誰も登録しない
+                // (層の観測は `on_layer` 側)。呼び出しごと飛ばす。
+                None,
+                rr,
+                t + 1 == nt,
+            )?;
             if let Some(h) = on_layer.as_deref_mut() {
+                // task 155: 層の出口 (`LayerOut` の組み立てと `on_layer`) を `loop` 行に。
+                let _l = q4ledger::enter(q4ledger::LOOP);
                 h(&LayerOut {
                     il,
                     t,
@@ -2563,12 +2570,29 @@ impl Qwen4Exp {
         res: &mut HyperStreams,
         ple_emb: Option<&Vec<f32>>,
         hp: &HyperParams,
-        hook: &mut dyn FnMut(&str, usize, &[f32]) -> Result<()>,
+        hook: Option<&mut dyn FnMut(&str, usize, &[f32]) -> Result<()>>,
         mut roles: Option<&mut RoleRms>,
         emit_router: bool,
     ) -> Result<()> {
         let e = self.p.n_embd;
         let lw = &self.layers[il];
+        // task 155: 購読者が居ないフックは**呼び出しごと**飛ばす。`None` は
+        // 「このランでは誰も層の中間値を見ない」= decode の通常経路。
+        let mut hook = hook;
+        macro_rules! hook_at {
+            ($name:expr) => {
+                if let Some(h) = hook.as_mut() {
+                    let _l = q4ledger::enter(q4ledger::HOOKS);
+                    h($name, il, &res.data)?;
+                }
+            };
+            ($name:expr, $vals:expr) => {
+                if let Some(h) = hook.as_mut() {
+                    let _l = q4ledger::enter(q4ledger::HOOKS);
+                    h($name, il, $vals)?;
+                }
+            };
+        }
 
         if q4prof::enabled() {
             q4prof::N_LAYER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2595,7 +2619,7 @@ impl Qwen4Exp {
             if let Some(r) = roles.as_deref_mut() {
                 r.ple = contrib;
             }
-            hook("ple_after", il, &res.data)?;
+            hook_at!("ple_after");
         }
 
         // 3.2-3.4 attention 入口 → attn → 出口
@@ -2612,9 +2636,12 @@ impl Qwen4Exp {
                 hp,
             )?
         };
-        q4prof::add(&q4prof::MIX, t_mix);
-        hook("hc_mixed_attn", il, &cur)?;
-        hook("hc_inject_attn", il, &inject)?;
+        {
+            let _l = q4ledger::enter(q4ledger::QPROF);
+            q4prof::add(&q4prof::MIX, t_mix);
+        }
+        hook_at!("hc_mixed_attn", &cur);
+        hook_at!("hc_inject_attn", &inject);
         let t_attn = std::time::Instant::now();
         let cur = {
             // task 138: 層種別で full / ssm に分ける (台帳 on のときだけ引く)。
@@ -2629,14 +2656,17 @@ impl Qwen4Exp {
             let _l = q4ledger::enter(item);
             self.attn.forward(il, &cur)?
         };
-        q4prof::add(&q4prof::ATTN, t_attn);
+        {
+            let _l = q4ledger::enter(q4ledger::QPROF);
+            q4prof::add(&q4prof::ATTN, t_attn);
+        }
         if cur.len() != e {
             return Err(one(format!(
                 "層 {il}: attention の出力長 {} が n_embd {e} と違う",
                 cur.len()
             )));
         }
-        hook("attn_out", il, &cur)?;
+        hook_at!("attn_out", &cur);
         // P54: 層の種別で attn (full attention) と gdn (ssm) のどちらに入れるかが決まる。
         // task 153: 台帳の区間 (roles)。2560 要素の RMS と役割の詰め直し。
         if roles.is_some() {
@@ -2652,10 +2682,11 @@ impl Qwen4Exp {
         }
         {
             // task 153: 台帳の区間 (combine)。hyper connection の足し込み。
+            // task 155: 作業域を使い回す (`hc_combine` と同じ式・同じ順)。
             let _l = q4ledger::enter(q4ledger::COMBINE);
-            *res = hyper::hc_combine(res, &cur, &inject, hp);
+            hyper::hc_combine_inplace(res, &cur, &inject, hp);
         }
-        hook("res_after_attn", il, &res.data)?;
+        hook_at!("res_after_attn");
 
         // 3.5-3.7 ffn 入口 → MoE FFN → 出口
         let t_mix = std::time::Instant::now();
@@ -2671,8 +2702,11 @@ impl Qwen4Exp {
                 hp,
             )?
         };
-        q4prof::add(&q4prof::MIX, t_mix);
-        hook("hc_mixed_ffn", il, &cur)?;
+        {
+            let _l = q4ledger::enter(q4ledger::QPROF);
+            q4prof::add(&q4prof::MIX, t_mix);
+        }
+        hook_at!("hc_mixed_ffn", &cur);
         let t_moe = std::time::Instant::now();
         let cur = moe_ffn_quant_tapped(
             &self.p,
@@ -2682,12 +2716,16 @@ impl Qwen4Exp {
             roles.as_deref_mut(),
             emit_router,
         )?;
-        q4prof::add(&q4prof::MOE, t_moe);
-        hook("ffn_out", il, &cur)?;
+        {
+            let _l = q4ledger::enter(q4ledger::QPROF);
+            q4prof::add(&q4prof::MOE, t_moe);
+        }
+        hook_at!("ffn_out", &cur);
         {
             // task 153: 台帳の区間 (combine)。
+            // task 155: 作業域を使い回す (`hc_combine` と同じ式・同じ順)。
             let _l = q4ledger::enter(q4ledger::COMBINE);
-            *res = hyper::hc_combine(res, &cur, &inject, hp);
+            hyper::hc_combine_inplace(res, &cur, &inject, hp);
         }
         // P58: 層の役割別活性 (kind 13)。`emit_router` は「このトークンが forward
         // 呼び出しの末尾か」の意味も持つ (decode は常に真、逐次 prefill は末尾の
@@ -2725,7 +2763,7 @@ impl Qwen4Exp {
                     }
                     Ok(())
                 };
-                self.run_layer(il, &mut res, ple_emb.as_ref(), &hp, &mut hook, None, false)?;
+                self.run_layer(il, &mut res, ple_emb.as_ref(), &hp, Some(&mut hook), None, false)?;
             }
         }
         Ok(())
@@ -5677,7 +5715,9 @@ fn emit_router_topk(layer: usize, sel: &[usize], weights: &[f32]) {
 /// (どちらもプロセスで 1 回だけ env を読む。既定はどちらも off)。off のときは
 /// フレームを作らないので、送出バイトも確保もゼロ。
 fn arch_frames_enabled() -> bool {
-    denno_telemetry::enabled() && denno_telemetry::arch_enabled()
+    // task 155: 購読者 (WS クライアント) が 1 つも居ないときは、フレームを
+    // 組み立てない (役割 RMS も取らない)。読む相手が居る場合の出力は不変。
+    denno_telemetry::enabled() && denno_telemetry::arch_enabled() && denno_telemetry::has_clients()
 }
 
 /// P58: 1 層ぶんの役割別活性 (kind 13) を送る。
@@ -6847,6 +6887,114 @@ impl SharedExpertOverlap {
     }
 }
 
+/// task 155: `DENNO_SHARED_TAIL` の値解釈 (純関数・テスト用)。**既定 on**、
+/// `0` / `off` / `false` で従来の順序 (down → gate_inp の 2 往復) に戻る。
+fn shared_tail_from_value(v: Option<&str>) -> bool {
+    !matches!(v, Some("0") | Some("off") | Some("false"))
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+static SHARED_TAIL_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// task 155: shared expert の **down** をサイドストリームへ先に積むか
+/// (`DENNO_SHARED_TAIL`、既定 on)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn shared_tail_enabled() -> bool {
+    match SHARED_TAIL_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| shared_tail_from_value(std::env::var("DENNO_SHARED_TAIL").ok().as_deref()))
+}
+
+/// テスト専用: 上書きを設定する (`None` で env に戻す)。
+#[cfg(test)]
+fn set_shared_tail_for_test(v: Option<bool>) {
+    let x = match v {
+        Some(false) => 1,
+        Some(true) => 2,
+        None => 0,
+    };
+    SHARED_TAIL_OVERRIDE.store(x, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 155: shared expert の **down** を先に GPU (サイドストリーム) へ積むハンドル。
+///
+/// 狙いは層あたりの往復を 1 回減らすこと: down (n_embd 行) を非同期で積み、
+/// その完了を待つ間に `gate_inp_shexp` (1 行) を null ストリームで回す。
+/// 積めなかったとき (型が未対応 / GPU 不発 / 予算外) は `finish` が `false` を
+/// 返すので、呼び出し側は従来どおり同期の `gemv_label` に落ちること。
+///
+/// 実測 (GPU ラボ t155a、14,139、plain): shared 2.55 → 2.32 ms/tok (-0.23)、
+/// null ストリームの sync 1.12 → 0。**md5 は SAME** (選ばれた GEMV カーネルは
+/// CPU の逐次加算と同じ値だった)。
+struct SharedDownOverlap {
+    #[cfg(feature = "cuda")]
+    pending: crate::cuda::SharedPending,
+    /// 期待する出力長 (join の検査用。0 = 積んでいない)
+    n: usize,
+}
+
+impl SharedDownOverlap {
+    fn none() -> Self {
+        Self {
+            #[cfg(feature = "cuda")]
+            pending: crate::cuda::SharedPending::none(),
+            n: 0,
+        }
+    }
+
+    /// `act` は down の入力 (`silu(gate) * up`)、`n` は down の出力長。
+    fn begin(lw: &LayerW, act: &[f32], n: usize) -> Self {
+        #[cfg(feature = "cuda")]
+        {
+            // 同じサイドストリームの状態を使うので、`DENNO_SHARED_OVERLAP=0`
+            // (重ね打ちそのものが off) のときは積まない。
+            if !shared_tail_enabled() || !shared_overlap_enabled() {
+                return Self::none();
+            }
+            let jobs = [crate::cuda::SharedGemvJob {
+                uid: lw.down_shexp.uid(),
+                ty: lw.down_shexp.ty(),
+                blocks: lw.down_shexp.blocks().as_slice(),
+                k: lw.down_shexp.k(),
+                n: lw.down_shexp.n(),
+            }];
+            let pending = crate::cuda::shared_gemv_begin(act, &jobs);
+            return Self {
+                pending,
+                n: jobs[0].n,
+            };
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (lw, act, n);
+            Self::none()
+        }
+    }
+
+    /// 積んだ down の結果を `out` へ書く。`false` = 取れなかった (呼び出し側が
+    /// 従来の同期経路で計算し直す)。
+    fn finish(&mut self, out: &mut [f32]) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            if self.pending.is_empty() || out.len() != self.n {
+                return false;
+            }
+            let mut outs: [&mut [f32]; 1] = [out];
+            return crate::cuda::shared_gemv_finish(&mut self.pending, &mut outs);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (&self.n, out);
+            false
+        }
+    }
+}
+
 /// [`moe_ffn_quant_full_opts`] の本体。`flat_decode` は P70 の expert 横断平坦化
 /// (env を読まずにテストから選べるように引数で受ける)。
 ///
@@ -6992,6 +7140,11 @@ fn moe_ffn_quant_impl(
     // task 138: router の区間はここまで (expert の CPU 仕事は台帳の外 = other)。
     drop(_l_router);
 
+    // task 155: router と experts の間の下ごしらえ (使用回数の記録 / ゲート判定 /
+    // 出力の確保 / 経路フラグ) を台帳の `loop` 行に分ける。以前は `step` の残差に
+    // 紛れていた部分。
+    let _l_loop = q4ledger::enter(q4ledger::LOOP);
+
     // task 146: (層, expert) の使用回数を積む (起動時の事前ロード用)。
     // ゲート off では `stats_path()` の atomic load 1 回で返る。
     // decode 1 トークン = 48 層 x 10 本 = 480 回の `fetch_add` (Relaxed)。
@@ -7070,6 +7223,8 @@ fn moe_ffn_quant_impl(
         false
     };
 
+    // task 155: `loop` 区間はここまで (experts の区間とは重ねない)。
+    drop(_l_loop);
     moe_sub_add(0, t_router.elapsed());
     let t_experts = std::time::Instant::now();
     // task 145: 台帳の区間 (experts)。選択 expert の寄与計算だけ。
@@ -7355,13 +7510,19 @@ fn moe_ffn_quant_impl(
         sact[r] *= sup[r];
     }
     let mut sh = vec![0.0f32; e];
-    lw.down_shexp
-        .gemv_label("shared_down", &sact, &mut sh)
-        .map_err(|err| one(format!("層 {}: ffn_down_shexp: {err}", lw.il)))?;
+    // task 155: down は**サイドストリーム**に先に積み、その完了を待つ間に
+    // gate_inp (null ストリーム) を回す (層あたり 2 往復 → 1 往復)。
+    // 積めない型/環境では `finish` が false を返すので従来の同期経路に戻る。
+    let mut sdown = SharedDownOverlap::begin(lw, &sact, e);
     let mut sg = vec![0.0f32; lw.gate_inp_shexp.n()];
     lw.gate_inp_shexp
         .gemv_label("shared_gate_inp", x, &mut sg)
         .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp: {err}", lw.il)))?;
+    if !sdown.finish(&mut sh) {
+        lw.down_shexp
+            .gemv_label("shared_down", &sact, &mut sh)
+            .map_err(|err| one(format!("層 {}: ffn_down_shexp: {err}", lw.il)))?;
+    }
     let sgw = hyper::sigmoid(sg[0]);
     for j in 0..e {
         out[j] += sh[j] * sgw;
@@ -12006,6 +12167,45 @@ mod tests {
             layers.iter().all(|l| *l == 0),
             "層 0 以外に積まれた: {layers:?}"
         );
+    }
+
+    /// task 155: `DENNO_SHARED_TAIL` の解釈と、GPU が無いときのフォールバック。
+    ///
+    /// サイドストリームに積めない環境では `finish` が false を返し、呼び出し側は
+    /// 従来の同期経路に落ちる (出力には 1 要素も触らない)。
+    #[test]
+    fn shared_tail_env_and_cpu_fallback() {
+        for v in [None, Some("1"), Some("on"), Some("true")] {
+            assert!(shared_tail_from_value(v), "{v:?} は on のはず");
+        }
+        for v in [Some("0"), Some("off"), Some("false")] {
+            assert!(!shared_tail_from_value(v), "{v:?} は off のはず");
+        }
+        let _g = moe_test_guard();
+        let dir = TempDir::new("shared_tail");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let act = cache_test_x(lw.down_shexp.k());
+        let mut out = vec![7.0f32; p.n_embd];
+
+        // 強制 on でも GPU が無ければ積めない → false (フォールバック)。
+        set_shared_tail_for_test(Some(true));
+        let mut ov = SharedDownOverlap::begin(&lw, &act, p.n_embd);
+        assert!(
+            !ov.finish(&mut out),
+            "GPU 無しでサイドストリームに積めてしまった"
+        );
+        assert!(
+            out.iter().all(|&v| v == 7.0),
+            "フォールバック時に出力を触っている"
+        );
+        // ゲート off も同じ (積まない)。
+        set_shared_tail_for_test(Some(false));
+        let mut ov = SharedDownOverlap::begin(&lw, &act, p.n_embd);
+        assert!(!ov.finish(&mut out));
+        set_shared_tail_for_test(None);
     }
 
     /// P39: `DENNO_EXPERT_GPU` が未設定 (= 経路 Cpu) のときは従来の
@@ -18242,6 +18442,17 @@ mod tests {
                     "{name} の区間が積まれていない (moe の中の配線が無い)"
                 );
             }
+            // task 155: 層ループの端 (`loop`) は decode でも必ず積まれる。
+            assert!(
+                q4ledger::row(q4ledger::LOOP).wall_ns > 0,
+                "loop の区間が積まれていない (層ループの配線が無い)"
+            );
+            // task 155: decode の通常経路はフックを登録しないので `hooks` は 0。
+            assert_eq!(
+                q4ledger::row(q4ledger::HOOKS).wall_ns,
+                0,
+                "購読者の居ないフックが呼ばれている"
+            );
             // 行は 1 行のヘッダ + 列見出し + 積まれた item の数だけ出る。
             let lines = q4ledger::line(1, 0);
             assert!(lines.len() >= 3, "{lines:?}");
@@ -18250,6 +18461,33 @@ mod tests {
                 "router の行が無い: {lines:?}"
             );
 
+            q4ledger::reset();
+            q4ledger::set_for_test(false);
+        }
+
+        /// task 155: フックを登録した経路 (`debug_layer`) では `hooks` 行が積まれる。
+        ///
+        /// 購読者が居ないときに呼び出しを飛ばす分岐の**生きている側**が配線されて
+        /// いることの確認 (片側だけテストすると「常に飛ばす」実装でも通る)。
+        #[test]
+        fn q4ledger_hooks_row_fires_when_subscribed() {
+            let _g = moe_test_guard();
+            let dir = TempDir::new("q4ledger_hooks");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("合成モデルを開けない");
+            let ctx: Vec<u32> = vec![1, 2, 3];
+            let mut m = Qwen4Exp::new(&f).expect("Qwen4Exp::new");
+
+            q4ledger::set_for_test(true);
+            q4ledger::reset();
+            let mut n = 0usize;
+            m.debug_layer(&ctx, 0, &mut |_, _| n += 1)
+                .expect("debug_layer");
+            assert!(n > 0, "フックの sink が 1 回も呼ばれていない");
+            assert!(
+                q4ledger::row(q4ledger::HOOKS).wall_ns > 0,
+                "hooks の区間が積まれていない (購読側の配線が無い)"
+            );
             q4ledger::reset();
             q4ledger::set_for_test(false);
         }
@@ -18386,6 +18624,9 @@ mod tests {
 
             let prev_on = denno_telemetry::enabled();
             let prev_arch = denno_telemetry::arch_enabled();
+            // task 155: arch フレームは購読者 (WS) が居るときだけ組み立てる。
+            // このテストは組み立て側を見るので、ビューワ 1 人ぶんを立てる。
+            let _cg = denno_telemetry::ClientsGuard::new(1);
             denno_telemetry::set_enabled_for_tests(true);
             denno_telemetry::set_arch_for_tests(true);
             while denno_telemetry::try_recv_nowait().is_some() {}
@@ -18443,6 +18684,9 @@ mod tests {
 
             let prev_on = denno_telemetry::enabled();
             let prev_arch = denno_telemetry::arch_enabled();
+            // task 155: arch フレームは購読者 (WS) が居るときだけ組み立てる。
+            // このテストは組み立て側を見るので、ビューワ 1 人ぶんを立てる。
+            let _cg = denno_telemetry::ClientsGuard::new(1);
 
             // (0) テレメトリ自体が off → arch が on でも 0 枚
             denno_telemetry::set_enabled_for_tests(false);
@@ -18611,6 +18855,9 @@ mod tests {
 
             let prev_on = denno_telemetry::enabled();
             let prev_arch = denno_telemetry::arch_enabled();
+            // task 155: arch フレームは購読者 (WS) が居るときだけ組み立てる。
+            // このテストは組み立て側を見るので、ビューワ 1 人ぶんを立てる。
+            let _cg = denno_telemetry::ClientsGuard::new(1);
             denno_telemetry::set_enabled_for_tests(true);
             denno_telemetry::set_arch_for_tests(true);
             while denno_telemetry::try_recv_nowait().is_some() {}

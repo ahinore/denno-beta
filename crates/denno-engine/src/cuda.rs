@@ -251,8 +251,11 @@ pub(crate) mod tline {
     use super::*;
     use std::cell::RefCell;
 
-    /// プールの上限 (128 トークン x 約 2,400 本 = 約 31 万本を収める)。
-    const MAX_EVENTS: usize = 400_000;
+    /// プールの上限 (128 トークンの窓 x 約 3,000 本 = 約 38 万本を収める)。
+    ///
+    /// task 155: 400_000 だと診断行を足したときに窓の途中で尽きて以後の記録が
+    /// 止まる (t155b で発生)。60 万本まで許す。
+    const MAX_EVENTS: usize = 600_000;
 
     struct Pool {
         /// 計時イベント (grow-only)。
@@ -1685,7 +1688,6 @@ impl CudaCtx {
         crate::model::q4ledger::note_sync(t);
         r
     }
-
     /// 呼び出しスレッドに primary context を current として設定する。
     /// CUDA の current context は**スレッドローカル** (P17c の教訓: libtest は
     /// テスト毎に新スレッドを立てるため、初期化スレッドで 1 回だけ設定したのでは
@@ -4306,13 +4308,16 @@ where
                 )?;
                 crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
             } else {
-                ctx.sync()?;
+                // task 155: 逐次版も null ストリームぶんだけをイベントで待つ。
+                sync_default_or_ctx(ctx, dec_overlap_enabled())?;
             }
         }
         if overlap {
             // ここから下はデバイスの完了を待たずに走る (GPU と CPU の重ね打ち)。
             middle()?;
-            ctx.sync()?;
+            // task 155: 待つのは null ストリーム (この層の expert GEMV と D2H)
+            // だけ。shared expert のサイドストリームは join まで待たない。
+            sync_default_or_ctx(ctx, dec_overlap_enabled())?;
             let pin = sc.hpin.as_ref().expect("確保済み");
             out_h[..nh].copy_from_slice(&pin.as_slice::<f32>()[..nh]);
         } else {
@@ -5008,6 +5013,97 @@ impl Drop for CopyEvent {
             }
         }
     }
+}
+
+thread_local! {
+    /// task 155: 既定 (null) ストリームの完了待ちに使うイベント (スレッドごとに 1 本)。
+    static DEF_EV: std::cell::RefCell<Option<CopyEvent>> = const { std::cell::RefCell::new(None) };
+}
+
+/// task 155: `cuEventCreate` の `CU_EVENT_DISABLE_TIMING`。
+const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
+
+/// task 155: 既定 (null) ストリームの完了だけを**イベント 1 本**で待つ。
+///
+/// [`CudaCtx::sync`] の `cuCtxSynchronize` はコンテキスト**全体**を待つので、
+/// 重ね打ち用のサイドストリーム (shared expert の gate/up) まで待ってしまう。
+/// ホストがその結果を要るのは層のずっと後 (shared の join) なので、ここでは
+/// null ストリームに打ったイベントだけを待つ。発行済みのカーネル・引数・順序は
+/// 1 つも変えない (変わるのは待つ範囲だけ)。
+///
+/// 実測 (GPU ラボ t155a、swift15-abl IQ3_S、14T、plain = TLINE なし、全ゲート on と
+/// off の A/B): decode 46 → 42 ms/tok (短い) / 44 → 38 (3,954) / 47 → 41 (14,139)、
+/// prefill +1.1%、md5 は 6 本とも SAME、errors 0。14,139 の台帳は
+/// router 4.09 → 1.61 ms/tok (48 層で 52 us/層の同期固定費が消えた)、
+/// experts 10.37 → 10.18。**この待ちはモデルの値を 1 ビットも変えない。**
+///
+/// t155c (TLINE=1 / TLINE_K=1 を両条件に): token 47.06 → 42.29 (3,954) /
+/// 49.83 → 44.50 (14,139)。host_wait 25.09 → 22.32 / 29.11 → 26.39 (router の
+/// wait が 2.68 → 0.97 / 2.72 → 0.99)、gpu_idle 28.61 → 24.17 / 27.33 → 22.32、
+/// gpu_busy は 18.44 → 18.12 / 22.50 → 22.18 で**動かない** (仕事量は同じ)。
+///
+/// 戻り値 `false` = イベントが使えない。呼び出し側は従来どおり `ctx.sync()` に
+/// 落ちること (待たずに進んではいけない)。
+pub fn sync_default_stream() -> bool {
+    let Ok(l) = lib() else { return false };
+    let (Some(create), Some(record), Some(esync)) =
+        (l.event_create, l.event_record, l.event_sync)
+    else {
+        return false;
+    };
+    DEF_EV.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let mut ev: CUevent = std::ptr::null_mut();
+            if unsafe { create(&mut ev, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+                return false;
+            }
+            *slot = Some(CopyEvent(ev));
+        }
+        let ev = slot.as_ref().expect("直前に作った").0;
+        let t = crate::model::q4ledger::stamp();
+        let ok = unsafe { record(ev, std::ptr::null_mut()) } == CUDA_SUCCESS
+            && unsafe { esync(ev) } == CUDA_SUCCESS;
+        if ok {
+            crate::model::q4ledger::note_sync(t);
+        }
+        ok
+    })
+}
+
+/// [`sync_default_stream`] が使えない環境用の包み (失敗したら `ctx.sync()`)。
+///
+/// `scoped == false` (`DENNO_DEC_OVERLAP=0` / `DENNO_ROUTER_FUSED=0`) は従来どおり
+/// コンテキスト全体を待つ。
+fn sync_default_or_ctx(ctx: &CudaCtx, scoped: bool) -> Result<()> {
+    if scoped && sync_default_stream() {
+        return Ok(());
+    }
+    ctx.sync()
+}
+
+/// task 155: `DENNO_ROUTER_FUSED` の値解釈 (純関数・テスト用)。
+/// **既定 on**、`0` / `off` / `false` でルータの待ちを従来 (cuCtxSynchronize) に戻す。
+pub fn router_fused_from_value(v: Option<&str>) -> bool {
+    !matches!(v, Some("0") | Some("off") | Some("false"))
+}
+
+/// task 155: ルータの待ちを null ストリームのイベントに絞るか (`DENNO_ROUTER_FUSED`)。
+pub fn router_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| router_fused_from_value(std::env::var("DENNO_ROUTER_FUSED").ok().as_deref()))
+}
+
+/// task 155: `DENNO_DEC_OVERLAP` の値解釈 (純関数・テスト用)。
+/// **既定 on**、`0` / `off` / `false` で expert の待ちを従来に戻す。
+pub fn dec_overlap_from_value(v: Option<&str>) -> bool {
+    !matches!(v, Some("0") | Some("off") | Some("false"))
+}
+
+/// task 155: expert の完了待ちを null ストリームに絞るか (`DENNO_DEC_OVERLAP`)。
+pub fn dec_overlap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| dec_overlap_from_value(std::env::var("DENNO_DEC_OVERLAP").ok().as_deref()))
 }
 
 /// 1 スレッド分の再利用スクラッチ (grow-only)。scheduler ワーカーは単一スレッド
@@ -10406,7 +10502,9 @@ pub fn maybe_gpu_router_gemv_into(
             )?;
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
-        ctx.sync()?;
+        // task 155: 待つのは null ストリームのぶんだけ (重ね打ち中の shared
+        // expert のサイドストリームは待たない)。イベントが無ければ従来どおり。
+        sync_default_or_ctx(ctx, router_fused_enabled())?;
         out.copy_from_slice(&ho.as_slice::<f32>()[..n]);
         Ok(())
     });

@@ -432,7 +432,11 @@ impl Qwen4ExpDecoder {
         // P58: decode 1 トークンぶんの構造テレメトリ (変化した expert 在庫と
         // 100 トークンごとの階層統計)。arch off ならエンジン側で即座に戻る。
         let d_arch = q4prof::dstamp();
-        self.model.arch_emit_token();
+        {
+            // task 155: 台帳の区間 (arch)。購読者が居ないときは組み立てごと飛ばす。
+            let _l = crate::model::q4ledger::enter(crate::model::q4ledger::ARCH);
+            self.model.arch_emit_token();
+        }
         q4prof::dmark(q4prof::D_ARCH, d_arch);
         Ok(logits)
     }

@@ -21,7 +21,7 @@
 
 use std::io::{BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -49,10 +49,21 @@ struct Client {
 struct Shared {
     clients: Mutex<Vec<Client>>,
     next_id: AtomicU64,
+    /// task 155: 登録済みクライアント数 (ロックを取らずに読むための写し)。
+    /// `clients` を書き換えるたびに更新する。
+    n_clients: AtomicUsize,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// task 155: `clients` を書き換えた**後**に件数の写しを更新する
+/// (ロックを取るので、`clients` のロックを握ったまま呼ばないこと)。
+fn sync_client_count(shared: &Shared) {
+    let n = lock(&shared.clients).len();
+    shared.n_clients.store(n, Ordering::Relaxed);
+    denno_telemetry::set_clients(n);
 }
 
 /// テレメトリの送信側 + WS クライアント登録。
@@ -75,6 +86,7 @@ impl Telemetry {
         let shared = Arc::new(Shared {
             clients: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
+            n_clients: AtomicUsize::new(0),
         });
         let dropped = Arc::new(AtomicU64::new(0));
         if !on {
@@ -92,6 +104,15 @@ impl Telemetry {
 
     pub fn on(&self) -> bool {
         self.on
+    }
+
+    /// task 155: WS クライアントが 1 つ以上いるか。
+    ///
+    /// ビューワが繋がっていないときは top-8 の softmax など「読む相手の居ない」
+    /// 計算を飛ばす。繋がっている間の出力は従来と同一。`DENNO_TELEM_LAZY=0` で
+    /// 常に作る (従来) に戻る。
+    pub fn has_clients(&self) -> bool {
+        self.shared.n_clients.load(Ordering::Relaxed) > 0 || !denno_telemetry::lazy_enabled()
     }
 
     /// 推論側から 1 フレーム送る。**待たない**。満杯/切断は捨てて計上する。
@@ -197,6 +218,7 @@ impl Telemetry {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let writer = stream.try_clone()?;
         lock(&self.shared.clients).push(Client { id, stream: writer });
+        sync_client_count(&self.shared);
         spawn_reader(id, reader, stream, self.shared.clone());
         Ok(())
     }
@@ -222,6 +244,7 @@ fn spawn_reader(
             }
             let _ = stream.shutdown(Shutdown::Both);
             lock(&shared.clients).retain(|c| c.id != id);
+            sync_client_count(&shared);
         });
 }
 
@@ -248,6 +271,7 @@ fn broadcast(shared: &Shared, payload: &[u8]) {
     }
     if !dead.is_empty() {
         lock(&shared.clients).retain(|c| !dead.contains(&c.id));
+        sync_client_count(shared);
     }
 }
 
