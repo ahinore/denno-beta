@@ -2467,6 +2467,7 @@ impl Qwen4Exp {
             None => return Err(one("ctx が空 (現在のトークンが無い)")),
         };
         let e = self.p.n_embd;
+        let _sub = q4ledger::sub(q4ledger::SUB_EMBED);
         let emb = self
             .tok_embd
             .dequant_row(token as usize)
@@ -4187,6 +4188,8 @@ fn ple_inject(
     let e = p.n_embd;
     let hc = p.n_hc;
     let hc_dim = p.hc_dim();
+    // task 154: 台帳の副区間 (PLE 注入)。
+    let _sub = q4ledger::sub(q4ledger::SUB_PLE);
 
     // 1. key / value
     let mut key = vec![0.0f32; pw.key.n()];
@@ -8266,6 +8269,7 @@ fn gemv_rows_batch(
     nt: usize,
     outs: &mut [f32],
 ) -> Result<()> {
+    let _sub = q4ledger::sub(q4ledger::SUB_GEMM_CPU);
     if nt == 0 {
         return Ok(());
     }
@@ -8657,6 +8661,7 @@ pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]
         // トークンブロックで使い回す」経路へ流す。値は逐次版と同じ規則
         // (行内は i 昇順の逐次加算) で、型ごとの分岐を増やさない。
         GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => {
+            let _sub = q4ledger::sub(q4ledger::SUB_GEMM_CPU);
             if nt == 0 {
                 return Ok(());
             }
@@ -8701,6 +8706,7 @@ pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]
         // IQ2_S / Q2_0 / IQ4_NL 等) は、無量子型と同じ「行を f32 に開いて
         // トークンブロックで使い回す」経路へ流す (型ごとの分岐を増やさない)。
         ty if crate::kquant::dequant_supported(ty) => {
+            let _sub = q4ledger::sub(q4ledger::SUB_GEMM_CPU);
             if nt == 0 {
                 return Ok(());
             }
@@ -8731,6 +8737,7 @@ pub(crate) fn gemv_batch(w: &GgufLinear, xs: &[f32], nt: usize, outs: &mut [f32]
 
 /// 重みを 1 行ずつ f32 へ開く (行は独立なので rayon で分割してよい)。
 fn dequant_rows_f32(ty: GgmlType, bytes: &[u8], rb: usize, k: usize, n: usize) -> Vec<f32> {
+    let _sub = q4ledger::sub(q4ledger::SUB_DEQUANT);
     let mut wf = vec![0.0f32; n * k];
     #[cfg(feature = "par")]
     {
@@ -8824,6 +8831,7 @@ fn expert_gemv_batch(
 
 /// 行のベクタを 1 本の平坦な配列に連結する ([`gemv_batch`] の入力形式)。
 fn flatten_rows(rows: &[Vec<f32>], width: usize) -> Result<Vec<f32>> {
+    let _sub = q4ledger::sub(q4ledger::SUB_LAYOUT);
     let mut out = Vec::with_capacity(rows.len() * width);
     for (t, r) in rows.iter().enumerate() {
         if r.len() != width {
@@ -10456,6 +10464,8 @@ fn moe_ffn_quant_batch_full(
         .map_err(|err| one(format!("層 {}: ffn_gate_inp (batch): {err}", lw.il)))?;
 
     // 2. トークンごとの softmax (行は独立なので並列化しても値は変わらない)
+    // task 154: 台帳の副区間 (softmax + top-k)。
+    let _sub_sm = q4ledger::sub(q4ledger::SUB_SOFTMAX);
     #[cfg(feature = "par")]
     {
         use rayon::prelude::*;
@@ -10502,6 +10512,7 @@ fn moe_ffn_quant_batch_full(
             renorm(pr, &sels[t * k..(t + 1) * k], &mut weights[t * k..(t + 1) * k]);
         }
     }
+    drop(_sub_sm);
     moe_sub_add(0, t_router.elapsed());
     // 区間を閉じる (experts の時間を router に二重計上しない)。
     drop(_l_router);
