@@ -44,6 +44,30 @@ pub fn is_device_weight(ty: GgmlType) -> bool {
     )
 }
 
+/// 読み込み時に **Q8_0 へ作り直される**型か
+/// (`model::linear_gguf::maybe_requant` と同じ判定。
+/// `DENNO_REQUANT_Q8=0` で無効化できるが、ここでは既定の on で見積る)。
+///
+/// task 152: これが `vram budget` の `weights=` を 7.4 倍過小に見せていた正体。
+/// lab t149c/t152c の実測では、2 分割モデルの `weights=445 MiB (74 本)` に対し、
+/// 実際に VRAM へ上がった dense 重みは 266 本 3,297 MiB だった。差分の 192 本は
+/// **IQ3_S などの dense 重みで、ロード時に Q8_0 へ作り直されてから** GPU 登録簿に
+/// 入る (だから `nbytes` ではなく Q8_0 の行長で見積る必要がある)。
+///
+/// (「2 分割の part-1 しか数えていない」という t149 の推測は外れ。パートごとに
+///  開いて数えても同じ 445 MiB になった = part-1/2 の問題ではない。)
+pub fn is_requantized_to_q8(ty: GgmlType) -> bool {
+    !is_device_weight(ty) && !matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16)
+}
+
+/// Q8_0 の行バイト数 (`cuda::gguf_row_bytes` の Q8_0 と同じ式)。
+pub fn q8_0_row_bytes(k: u64) -> Option<u64> {
+    if k == 0 || k % 32 != 0 {
+        return None;
+    }
+    Some((k / 32) * 34)
+}
+
 /// MoE の expert 行列か (`ffn_gate_exps.weight` など)。
 ///
 /// expert は `ExpertW` (mmap / SSD pread) のままで、`expert_gemv_any` が CPU で
@@ -93,6 +117,20 @@ where
             t.dev_tensors += 1;
             t.max_k = t.max_k.max(dims[0]);
             t.max_n = t.max_n.max(dims[1]);
+        } else if is_requantized_to_q8(ty) {
+            // task 152: Q8_0 へ作り直してからデバイスへ載る。見積りは Q8_0 の行長。
+            match q8_0_row_bytes(dims[0]) {
+                Some(rb) if dims[1] > 0 => {
+                    t.dev_bytes += rb.saturating_mul(dims[1]);
+                    t.dev_tensors += 1;
+                    t.max_k = t.max_k.max(dims[0]);
+                    t.max_n = t.max_n.max(dims[1]);
+                }
+                _ => {
+                    t.host_bytes += nbytes;
+                    t.host_tensors += 1;
+                }
+            }
         } else {
             t.host_bytes += nbytes;
             t.host_tensors += 1;
@@ -848,6 +886,30 @@ mod tests {
         ] {
             assert!(!is_device_weight(ty), "{ty:?} は載らない側のはず");
         }
+    }
+
+    /// task 152: IQ 系の dense 重みは Q8_0 へ作り直されてからデバイスに載る。
+    /// 見積りは `n * Q8_0 行長` で、元の `nbytes` ではない。
+    #[test]
+    fn requantized_iq_tensors_count_as_device_q8() {
+        // k=2048 (32 の倍数), n=1024, IQ3_S の nbytes は Q8_0 より小さい。
+        let iq = t("blk.0.attn_q.weight", GgmlType::IQ3S, 2048, 1024, 900_000);
+        let w = classify_weights([(iq.0.as_str(), iq.1, iq.2, iq.3)]);
+        assert_eq!(w.dev_tensors, 1, "Q8_0 へ作り直すのでデバイス側");
+        assert_eq!(w.dev_bytes, 1024 * (2048 / 32 * 34), "Q8_0 の行長で見積る");
+        assert_eq!(w.host_tensors, 0, "mmap の生バイトはホスト側に数えない");
+        assert_eq!(w.max_k, 2048);
+        assert_eq!(w.max_n, 1024);
+        // F32 / BF16 は作り直さない (CPU 側のまま)。
+        let f32t = t("blk.0.ffn_gate_inp.weight", GgmlType::F32, 2048, 512, 4 << 20);
+        let w2 = classify_weights([(f32t.0.as_str(), f32t.1, f32t.2, f32t.3)]);
+        assert_eq!(w2.host_tensors, 1);
+        assert_eq!(w2.dev_bytes, 0);
+        // k が 32 の倍数でない IQ は作り直せない (CPU 側)。
+        let odd = t("x.weight", GgmlType::IQ3S, 1000, 8, 10_000);
+        let w3 = classify_weights([(odd.0.as_str(), odd.1, odd.2, odd.3)]);
+        assert_eq!(w3.host_tensors, 1, "k%32!=0 は requant できない");
+        assert_eq!(w3.dev_bytes, 0);
     }
 
     #[test]
