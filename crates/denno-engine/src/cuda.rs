@@ -10936,6 +10936,39 @@ pub fn pf_download_res(out: &mut [f32]) -> bool {
     })
 }
 
+/// task 154: 残差の **1 行だけ** をホストへ戻す (層の出口フック用)。
+///
+/// `t` はチャンク内のトークン番号、`out` は `[hc*e]`。
+pub fn pf_download_res_row(t: usize, hc_dim: usize, out: &mut [f32]) -> bool {
+    if out.len() != hc_dim {
+        return false;
+    }
+    PF_DEV.with(|cell| -> bool {
+        let d = cell.borrow();
+        match d.res.as_ref() {
+            Some(b) if b.bytes() >= (t + 1) * hc_dim * 4 => {
+                let bytes = hc_dim * 4;
+                let src = b.ptr() + (t * hc_dim * 4) as u64;
+                match lib() {
+                    Ok(l) => unsafe {
+                        check(
+                            (l.memcpy_dtoh)(
+                                out.as_mut_ptr() as *mut c_void,
+                                src,
+                                bytes,
+                            ),
+                            "cuMemcpyDtoH (res row)",
+                        )
+                        .is_ok()
+                    },
+                    Err(_) => false,
+                }
+            }
+            _ => false,
+        }
+    })
+}
+
 /// task 154: デバイスの `mixed` (`[nt][n_embd]`) をホストへ戻す。
 pub fn pf_take_mixed(out: &mut [f32]) -> bool {
     PF_DEV.with(|cell| -> bool {

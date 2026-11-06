@@ -2941,7 +2941,8 @@ const PF_RESIDENT_MIN_TOK: usize = 64;
 fn pf_note_decline(reason: &str) {
     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::info!("[pf] resident を見送り: {reason} → 従来経路");
+        // tracing はこのモジュールのログを拾わない設定があるため eprintln にする。
+        eprintln!("[pf] resident を見送り: {reason} → 従来経路");
     }
 }
 
@@ -3015,6 +3016,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         ctx: &[u32],
         chunk: usize,
         tokens: TapTokens,
+        mut on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
         mut roles: Option<&mut RoleRms>,
     ) -> Result<Option<Vec<Vec<f32>>>> {
         let hp = self.hp();
@@ -3255,6 +3257,22 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                         emit_role_act(il, r);
                     }
                 }
+                // 層の出口フック (TapTokens::Last のみ): 残差 1 行だけ D2H して渡す。
+                if let Some(h) = on_layer.as_deref_mut() {
+                    let t = nt - 1;
+                    let mut row = vec![0.0f32; hc_dim];
+                    if !crate::cuda::pf_download_res_row(t, hc_dim, &mut row) {
+                        Self::pf_bail("層の出口フック用の res D2H に失敗")?;
+                    }
+                    h(&LayerOut {
+                        il,
+                        t,
+                        nt,
+                        n_embd: e,
+                        res: &row,
+                        roles: roles.as_deref(),
+                    })?;
+                }
             }
             prekprof::mark(t_lay, prekprof::LAYER);
             // 最終チャンクだけ、最終 mixer 用に残差をホストへ戻す。
@@ -3272,7 +3290,6 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 }
                 last = ress.pop();
             }
-            let _ = tokens;
             start = end;
         }
         crate::cuda::pf_release();
@@ -3304,6 +3321,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         _ctx: &[u32],
         _chunk: usize,
         _tokens: TapTokens,
+        _on_layer: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>>,
         _roles: Option<&mut RoleRms>,
     ) -> Result<Option<Vec<Vec<f32>>>> {
         Ok(None)
@@ -3347,10 +3365,37 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         // task 154: hc mix / combine のデバイス常駐 (`DENNO_PF_RESIDENT`)。
         // 観測フック付き (`on_layer`) と全位置 logits (`collect_all`) は
         // 従来経路だけが受ける (常駐経路は層の出口をホストへ出さない)。
-        if pf_mix_dev_on() && on_layer.is_none() && !collect_all {
-            if let Some(out) =
-                self.forward_prefill_batch_resident(ctx, chunk, tokens, roles.as_deref_mut())?
-            {
+        // 層の出口フックは `TapTokens::Last` だけ受ける (残差 1 行を D2H する)。
+        let pf_hook_ok = on_layer.is_none() || matches!(tokens, TapTokens::Last);
+        if pf_mix_dev_on() {
+            // 入口の状態を 1 回だけ出す (台帳だけでは「不発」の理由が読めないため)。
+            static ONCE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[pf] resident 入口: hook={} all={} ctx={} chunk={} gate={}",
+                    on_layer.is_some(),
+                    matches!(tokens, TapTokens::All),
+                    ctx.len(),
+                    chunk,
+                    pf_hook_ok
+                );
+            }
+        }
+        if pf_mix_dev_on() && pf_hook_ok && !collect_all {
+            // `as_deref_mut` だと外側の寿命に固定されて 2 回目で E0499 になる
+            // (`prefill_seq` と同じく短い寿命で借り直す)。
+            let hook: Option<&mut dyn FnMut(&LayerOut<'_>) -> Result<()>> = match &mut on_layer {
+                Some(f) => Some(&mut **f),
+                None => None,
+            };
+            if let Some(out) = self.forward_prefill_batch_resident(
+                ctx,
+                chunk,
+                tokens,
+                hook,
+                roles.as_deref_mut(),
+            )? {
                 return Ok(out);
             }
         }
