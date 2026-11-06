@@ -52,11 +52,16 @@ pub const EXPERT_IQ_PF_ENV: &str = "DENNO_EXPERT_IQ_GPU_PF";
 /// 数本しか無い層は CPU のままの方が安い。
 pub const EXPERT_IQ_PF_MIN_HITS_ENV: &str = "DENNO_EXPERT_IQ_PF_MIN_HITS";
 
-/// `DENNO_EXPERT_IQ_PF_UPLOAD_MB`: 1 チャンクで VRAM へ上げ直す上限 (MiB、既定 512)。
+/// `DENNO_EXPERT_IQ_PF_UPLOAD_MB`: 1 チャンクで VRAM へ上げ直す上限 (MiB、**既定 0**)。
 ///
 /// **LRU に空きがある間だけ**使う。埋まっているときの上げ直しは「1 本上げるために
 /// 1 本追い出す」= 次のチャンクで同じだけミスが増えるだけで、H2D の時間が純損に
 /// なる (ミス 1 本の CPU 計算 0.5 ms に対し H2D 0.27 ms)。
+///
+/// task 151: **既定 0 にした**。空きに積んだ expert は decode が使うはずだった
+/// スロットを奪い、次の decode のヒット率が下がる (lab t151b: 14k の decode が
+/// +17.3%)。prefill は VRAM を **読むだけ** (peek) にして、decode の作業集合を
+/// 変えないのを既定にする。
 pub const EXPERT_IQ_PF_UPLOAD_MB_ENV: &str = "DENNO_EXPERT_IQ_PF_UPLOAD_MB";
 
 /// `DENNO_EXPERT_IQ_PF_UPLOAD_ROWS`: 上げ直すミスの最小行数 (既定 8)。
@@ -69,8 +74,8 @@ pub const EXPERT_IQ_PF_UPLOAD_ROWS_ENV: &str = "DENNO_EXPERT_IQ_PF_UPLOAD_ROWS";
 /// [`EXPERT_IQ_PF_MIN_HITS_ENV`] の既定値。
 pub const DEFAULT_MIN_HITS: usize = 4;
 
-/// [`EXPERT_IQ_PF_UPLOAD_MB_ENV`] の既定値。
-pub const DEFAULT_UPLOAD_MB: usize = 512;
+/// [`EXPERT_IQ_PF_UPLOAD_MB_ENV`] の既定値 (0 = 上げ直さない)。
+pub const DEFAULT_UPLOAD_MB: usize = 0;
 
 /// [`EXPERT_IQ_PF_UPLOAD_ROWS_ENV`] の既定値。
 pub const DEFAULT_UPLOAD_ROWS: usize = 8;
@@ -102,9 +107,10 @@ pub const SLOTS: usize = 6;
 
 /// 既定で有効か (タスクの採否で決める)。
 ///
-/// **false のまま**: `DENNO_EXPERT_IQ_GPU_PF` 未設定では従来の CPU 経路。
-/// 採用時はここを true にする (gate `DENNO_EXPERT_IQ_GPU=1` の内側で既定 on)。
-pub const DEFAULT_ON: bool = false;
+/// **true** (lab t151c で採用): `DENNO_EXPERT_IQ_GPU_PF` 未設定でも
+/// `DENNO_EXPERT_IQ_GPU=1` なら prefill の選択 expert を GPU で回す。
+/// `DENNO_EXPERT_IQ_GPU_PF=0` で従来の CPU 経路へ戻せる。
+pub const DEFAULT_ON: bool = true;
 
 /// `DENNO_EXPERT_IQ_GPU_PF` の解釈 (純関数)。`0` / `off` / `false` だけが偽で、
 /// 未設定は [`DEFAULT_ON`]。**`iq_on` が false なら常に false**。
@@ -599,6 +605,11 @@ mod tests {
         assert!(!pf_from_value(true, Some("0")));
         assert!(!pf_from_value(true, Some("off")));
         assert!(!pf_from_value(true, Some("false")));
+        // task 151: lab t151c で採用。未設定でも `DENNO_EXPERT_IQ_GPU=1` なら on。
+        assert!(DEFAULT_ON, "既定 off に戻っている");
+        assert!(pf_from_value(true, None), "未設定は既定 (on) でない");
+        assert_eq!(DEFAULT_UPLOAD_MB, 0, "既定で prefill が LRU に積んでいる");
+        assert_eq!(upload_mb(), 0, "既定の上げ直しが 0 でない");
     }
 
     /// 上げ直しの予算は MB から本数へ (1 本 2.05 MB)。
