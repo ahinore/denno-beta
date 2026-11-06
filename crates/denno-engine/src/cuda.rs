@@ -5528,6 +5528,24 @@ pub fn gdn_scan_state_invalidate() {
     GDN_STATE.with(|c| c.borrow_mut().invalidate());
 }
 
+/// task 154: prefill の GPU スキャンが確保した層状態のバッファを VRAM へ返す。
+///
+/// 36 層ぶん (conv 172 KB + ssm 10.5 MB) で約 385 MB。prefill が終わったら
+/// ホスト側の状態が正本なので、デバイス側を持ち続ける理由が無い (expert の
+/// カード予算を圧迫して decode のヒット率を落とす)。次に使うときは
+/// `gdn_state_begin` がホストから seed し直す。
+pub fn gdn_state_release() {
+    GDN_STATE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.invalidate();
+        c.ensure_layers(0);
+        c.cur_kv = None;
+        c.rows = 0;
+        c.cols = 0;
+        c.conv_len = 0;
+    });
+}
+
 // s131: デバイス正本を使うか。`DENNO_GDN_DEVSTATE=0` で従来動作 (毎回ホストと
 // 往復) に戻す。切り分け用で、既定は有効。
 fn gdn_devstate() -> bool {
@@ -10939,12 +10957,24 @@ pub fn pf_take_mixed(out: &mut [f32]) -> bool {
 /// F32 はそのままのバイト列を置く (1 本 40 KB)。
 static PF_F32_W: OnceLock<Mutex<std::collections::HashMap<u64, DevBuffer>>> = OnceLock::new();
 
-/// 重み 1 本を常駐させ、`(デバイスポインタ, BF16 のままか)` を返す。
+/// 常駐した重み 1 本の種類 (どの GEMM カーネルで叩くか)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PfWKind {
+    /// `dno_gemm_bf16_mt` (BF16 のまま)。
+    Bf16,
+    /// `dno_gemm_f32_mt` (f32 に展開済み / 元から F32)。
+    F32,
+    /// `dno_gemm_q8_0` 系 (`f_gemm_q` の添字, 1 行の生バイト数, 量子ブロック長)。
+    Quant(usize, usize, usize),
+}
+
+/// 重み 1 本を常駐させる。
 ///
 /// - BF16: [`mix_gpu_weight`] (task 152。`want_bf16` が偽なら f32 に展開)
-/// - F32:  そのままのバイト列
+/// - F32:  そのままのバイト列 (40 KB 級の inject 用)
+/// - Q8_0 / Q5_1 / Q4K / Q5K: [`weights_for_gguf`] (量子のまま)
 /// - それ以外: `None` (呼び出し側は層を進める前に従来経路へ)
-fn pf_weight(l: PfLin<'_>, want_bf16: bool) -> Option<(CUdeviceptr, bool)> {
+fn pf_weight(l: PfLin<'_>, want_bf16: bool) -> Option<(CUdeviceptr, PfWKind)> {
     use crate::kquant::GgmlType as T;
     match l.ty {
         T::Bf16 => {
@@ -10952,7 +10982,10 @@ fn pf_weight(l: PfLin<'_>, want_bf16: bool) -> Option<(CUdeviceptr, bool)> {
                 return None;
             }
             match mix_gpu_weight(l.uid, l.blocks, l.k, l.n, want_bf16) {
-                Ok(w) => Some((w.ptr, want_bf16)),
+                Ok(w) => Some((
+                    w.ptr,
+                    if want_bf16 { PfWKind::Bf16 } else { PfWKind::F32 },
+                )),
                 Err(e) => {
                     tracing::info!("[pf] 重みの常駐に失敗 (uid={}): {e:#}", l.uid);
                     None
@@ -10970,14 +11003,36 @@ fn pf_weight(l: PfLin<'_>, want_bf16: bool) -> Option<(CUdeviceptr, bool)> {
                 Err(_) => return None,
             };
             if let Some(b) = m.get(&l.uid) {
-                return Some((b.ptr(), false));
+                return Some((b.ptr(), PfWKind::F32));
             }
             let b = DevBuffer::from_slice_tagged(l.blocks, crate::mem_audit::TAG_OTHER).ok()?;
             let p = b.ptr();
             m.insert(l.uid, b);
-            Some((p, false))
+            Some((p, PfWKind::F32))
         }
-        _ => None,
+        ty => {
+            let (slot, blk) = match ty {
+                T::Q8_0 => (0, 32usize),
+                T::Q5_1 => (1, 32usize),
+                T::Q4K => (2, 256usize),
+                T::Q5K => (3, 256usize),
+                _ => return None,
+            };
+            if l.k % blk != 0 {
+                return None;
+            }
+            let rb = gguf_row_bytes(ty, l.k)?;
+            if l.blocks.len() != l.n.checked_mul(rb)? {
+                return None;
+            }
+            match weights_for_gguf(l.uid, ty, l.blocks, l.k, l.n) {
+                Ok(w) => Some((w.buf.ptr(), PfWKind::Quant(slot, rb, blk))),
+                Err(e) => {
+                    tracing::info!("[pf] 量子重みの常駐に失敗 (uid={}): {e:#}", l.uid);
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -11042,13 +11097,13 @@ pub fn pf_mix(
     if f_f32.is_none() {
         return pf_fail("f32 GEMM カーネルが無い");
     }
-    let Some((pd, pd_bf16)) = pf_weight(down, want_bf16) else {
+    let Some((pd, pd_k)) = pf_weight(down, want_bf16) else {
         return false;
     };
-    let Some((pu, pu_bf16)) = pf_weight(up, want_bf16) else {
+    let Some((pu, pu_k)) = pf_weight(up, want_bf16) else {
         return false;
     };
-    let Some((pi, pi_bf16)) = pf_weight(inject, want_bf16) else {
+    let Some((pi, pi_k)) = pf_weight(inject, want_bf16) else {
         return false;
     };
     let r = PF_DEV.with(|cell| -> Result<(), String> {
@@ -11099,35 +11154,75 @@ pub fn pf_mix(
                     y: CUdeviceptr,
                     kk: usize,
                     nn: usize,
-                    as_bf16: bool|
+                    kind: PfWKind|
          -> Result<(), String> {
-            let f = if as_bf16 {
-                f_bf16.ok_or_else(|| "bf16 GEMM カーネルが無い".to_string())?
-            } else {
-                f_f32.ok_or_else(|| "f32 GEMM カーネルが無い".to_string())?
-            };
-            let (mut pw, mut px, mut py) = (w, x, y);
-            let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, kk as c_int, nn as c_int);
-            let mut args = [
-                &mut pw as *mut _ as *mut c_void,
-                &mut px as *mut _ as *mut c_void,
-                &mut py as *mut _ as *mut c_void,
-                &mut nt_c as *mut _ as *mut c_void,
-                &mut k_c as *mut _ as *mut c_void,
-                &mut n_c as *mut _ as *mut c_void,
-            ];
-            let grid = (
-                ((nn + GEMM_MT_ROWS - 1) / GEMM_MT_ROWS) as u32,
-                ((nt + GEMM_MT_TOKS - 1) / GEMM_MT_TOKS) as u32,
-                1,
-            );
-            unsafe {
-                ctx.launch_async(f, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)
-                    .map_err(|e| format!("gemm launch: {e:#}"))?;
+            match kind {
+                PfWKind::Bf16 | PfWKind::F32 => {
+                    let f = if kind == PfWKind::Bf16 {
+                        f_bf16.ok_or_else(|| "bf16 GEMM カーネルが無い".to_string())?
+                    } else {
+                        f_f32.ok_or_else(|| "f32 GEMM カーネルが無い".to_string())?
+                    };
+                    let (mut pw, mut px, mut py) = (w, x, y);
+                    let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, kk as c_int, nn as c_int);
+                    let mut args = [
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut px as *mut _ as *mut c_void,
+                        &mut py as *mut _ as *mut c_void,
+                        &mut nt_c as *mut _ as *mut c_void,
+                        &mut k_c as *mut _ as *mut c_void,
+                        &mut n_c as *mut _ as *mut c_void,
+                    ];
+                    let grid = (
+                        ((nn + GEMM_MT_ROWS - 1) / GEMM_MT_ROWS) as u32,
+                        ((nt + GEMM_MT_TOKS - 1) / GEMM_MT_TOKS) as u32,
+                        1,
+                    );
+                    unsafe {
+                        ctx.launch_async(f, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)
+                            .map_err(|e| format!("gemm launch: {e:#}"))?;
+                    }
+                }
+                PfWKind::Quant(slot, rb, blk) => {
+                    // 量子 GEMM は 1 起動 128 トークンまで (`moe_gemm_dev` と同じ)。
+                    let f = ctx
+                        .f_gemm_q
+                        .ok_or_else(|| "量子 GEMM カーネルが無い".to_string())?[slot];
+                    const ROWS: usize = 16;
+                    const NTG_MAX: usize = 8;
+                    if kk % blk != 0 {
+                        return Err("量子 GEMM のブロック形が合わない".into());
+                    }
+                    let shmem = (ROWS * blk * 4) as u32;
+                    let mut t0 = 0usize;
+                    while t0 < nt {
+                        let m = (nt - t0).min(ROWS * NTG_MAX);
+                        let xo = (t0 * kk * 4) as u64;
+                        let yo = (t0 * nn * 4) as u64;
+                        let (mut pw, mut px, mut py) = (w, x + xo, y + yo);
+                        let (mut m_c, mut ni_c, mut no_c, mut rb_c) =
+                            (m as c_int, kk as c_int, nn as c_int, rb as c_int);
+                        let mut args = [
+                            &mut pw as *mut _ as *mut c_void,
+                            &mut px as *mut _ as *mut c_void,
+                            &mut py as *mut _ as *mut c_void,
+                            &mut m_c as *mut _ as *mut c_void,
+                            &mut ni_c as *mut _ as *mut c_void,
+                            &mut no_c as *mut _ as *mut c_void,
+                            &mut rb_c as *mut _ as *mut c_void,
+                        ];
+                        let grid = (((nn + ROWS - 1) / ROWS) as u32, 1, 1);
+                        unsafe {
+                            ctx.launch_async(f, grid, (ROWS as u32, 16, 1), shmem, &mut args)
+                                .map_err(|e| format!("q gemm launch: {e:#}"))?;
+                        }
+                        t0 += m;
+                    }
+                }
             }
             Ok(())
         };
-        gemm(pd, px, pl, hc_dim, lr, pd_bf16)?;
+        gemm(pd, px, pl, hc_dim, lr, pd_k)?;
         // 3. lo apply (in-place, nt*low_rank 要素)
         {
             let mut total = (nt * lr) as i64;
@@ -11144,7 +11239,7 @@ pub fn pf_mix(
             }
         }
         // 4. up GEMM (lo → gate)
-        gemm(pu, pl, pg, lr, hc_dim, pu_bf16)?;
+        gemm(pu, pl, pg, lr, hc_dim, pu_k)?;
         // 5. mixed (xn, gate → mixed)
         {
             let (mut e_c, mut hc_c) = (e as i32, hc as i32);
@@ -11164,7 +11259,7 @@ pub fn pf_mix(
             }
         }
         // 6. inject GEMM (xn → inj) + 1/hc
-        gemm(pi, px, pj, hc_dim, hc, pi_bf16)?;
+        gemm(pi, px, pj, hc_dim, hc, pi_k)?;
         {
             let mut n_c = (nt * hc) as i32;
             let mut inv_c = inv_hc;

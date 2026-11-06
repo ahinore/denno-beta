@@ -2791,6 +2791,12 @@ impl Qwen4Exp {
         } else {
             self.prefill_seq(ctx, tokens, on_layer, roles)?
         };
+        // task 154: prefill の GPU スキャンが持つ層状態のバッファ (約 385 MB) を
+        // VRAM へ返す。ホスト状態は毎回書き戻してあるので、次はホストから seed する。
+        #[cfg(feature = "cuda")]
+        if pf_gdn_gpu_on() {
+            crate::cuda::gdn_state_release();
+        }
         // P58: 1 リクエスト 1 回の階層統計 (prefill 終了時)。arch off なら即座に戻る。
         self.arch_emit_prefill_done();
         Ok(logits)

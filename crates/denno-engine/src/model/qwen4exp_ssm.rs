@@ -555,6 +555,10 @@ impl SsmLayer {
         if crate::cuda::gdn_gpu_scan_on() {
             crate::cuda::gdn_decode_state_invalidate_counted(self.nonce, self.il);
         }
+        // task 154: prefill の GPU スキャンも同じ鍵で状態を持つので、系列の切れ目で
+        // デバイス側を捨てる (捨てないと次の系列が前の系列の状態から走り出す)。
+        #[cfg(feature = "cuda")]
+        crate::cuda::gdn_state_release();
         self.state.reset();
     }
 
