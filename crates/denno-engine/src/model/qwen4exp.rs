@@ -2936,6 +2936,15 @@ impl Qwen4Exp {
 /// 往復の固定費と釣り合わない。境界は task 145 のバッチ mix GPU と同じ 64。
 const PF_RESIDENT_MIN_TOK: usize = 64;
 
+/// task 154: 常駐経路を採らなかった理由を 1 回だけ出す (既定は黙って従来経路)。
+#[cfg(feature = "cuda")]
+fn pf_note_decline(reason: &str) {
+    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!("[pf] resident を見送り: {reason} → 従来経路");
+    }
+}
+
 /// task 154: 常駐連鎖の失敗を要求エラーにする (途中で従来経路へ落ちると
 /// attention の KV/GDN 状態が二重に進むため、黙って切り替えない)。
 #[cfg(feature = "cuda")]
@@ -2960,17 +2969,27 @@ fn pf_lin(w: &GgufLinear) -> crate::cuda::PfLin<'_> {
 /// 連鎖が使う GEMM は BF16 (model の mix 本体) と F32 (inject 級) の 2 つ。
 /// 1 本でも条件を外れたら層を進める前に従来経路へ戻す (途中で落ちない)。
 fn pf_layer_ready(lw: &LayerW, e: usize, hc: usize, lr: usize) -> bool {
-    use crate::kquant::GgmlType as T;
     let hc_dim = hc * e;
-    let ok = |w: &GgufLinear, k: usize, n: usize| {
-        matches!(w.ty(), T::Bf16 | T::F32) && w.k() == k && w.n() == n
-    };
-    ok(&lw.hc_attn_down, hc_dim, lr)
-        && ok(&lw.hc_attn_up, lr, hc_dim)
-        && ok(&lw.hc_attn_inject, hc_dim, hc)
-        && ok(&lw.hc_ffn_down, hc_dim, lr)
-        && ok(&lw.hc_ffn_up, lr, hc_dim)
-        && ok(&lw.hc_ffn_inject, hc_dim, hc)
+    Self::pf_lin_ok(&lw.hc_attn_down, hc_dim, lr)
+        && Self::pf_lin_ok(&lw.hc_attn_up, lr, hc_dim)
+        && Self::pf_lin_ok(&lw.hc_attn_inject, hc_dim, hc)
+        && Self::pf_lin_ok(&lw.hc_ffn_down, hc_dim, lr)
+        && Self::pf_lin_ok(&lw.hc_ffn_up, lr, hc_dim)
+        && Self::pf_lin_ok(&lw.hc_ffn_inject, hc_dim, hc)
+}
+
+/// task 154: 常駐連鎖が 1 本の行列を扱えるか (型と形)。
+///
+/// 実モデルでは mix の down / up が BF16、inject が F32 か Q8_0 (requant) で来る。
+/// ここを狭くしすぎると**層を 1 つも進めずに**従来経路へ落ちる (lab t154b/t154c で
+/// 実際に踏んだ) ので、pf_weight が常駐できる型をそのまま並べる。
+fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
+    use crate::kquant::GgmlType as T;
+    matches!(
+        w.ty(),
+        T::Bf16 | T::F32 | T::Q8_0 | T::Q5_1 | T::Q4K | T::Q5K
+    ) && w.k() == k
+        && w.n() == n
 }
 
     /// task 154: デバイス常駐の prefill 本体 (`DENNO_PF_RESIDENT` の mix 側)。
@@ -3010,20 +3029,24 @@ fn pf_layer_ready(lw: &LayerW, e: usize, hc: usize, lr: usize) -> bool {
         }
         // 形と重みの前提は**層を進める前に**全部見る (途中で落ちると状態が進む)。
         if hc == 0 || e == 0 || lr == 0 || hc_dim > (1 << 20) {
+            Self::pf_note_decline("形が常駐連鎖の前提外");
             return Ok(None);
         }
         for il in 0..n_layer {
             if !Self::pf_layer_ready(&self.layers[il], e, hc, lr) {
-                return Ok(None);
+                Self::pf_note_decline("層の重みが常駐連鎖の前提外 (型/形)");
+            return Ok(None);
             }
         }
         let first_nt = chunk.min(ctx.len());
         // 短いプロンプトは従来の CPU 経路のほうが速い (GEMM の起動と往復が勝つ)。
         // 判定は「このリクエストの最初のチャンク」で 1 回だけ行う。
         if first_nt < Self::PF_RESIDENT_MIN_TOK {
+            Self::pf_note_decline("64 トークン未満");
             return Ok(None);
         }
         if !crate::cuda::pf_begin(first_nt, hc, e, lr) {
+            Self::pf_note_decline("作業域/PTX/GPU の前提外");
             return Ok(None);
         }
         // P78: チャンクぶんの PLE は行単位でまとめて引く (従来と同じ)。
@@ -16018,6 +16041,33 @@ mod tests {
             assert_eq!(off.len(), on.len(), "logits の長さが違う");
             for (i, (a, b)) in off.iter().zip(on.iter()).enumerate() {
                 assert_eq!(a.to_bits(), b.to_bits(), "logits[{i}] が違う ({a} != {b})");
+            }
+        }
+
+        /// task 154: `pf_lin_ok` は常駐連鎖が扱える型 (BF16 / F32 / 量子 4 種) を
+        /// 受け、形が違えば落とす。lab t154b/t154c では inject (Q8_0) を弾いて
+        /// 常駐経路が丸ごと不発になったので、型の受容をここで固定する。
+        #[test]
+        fn pf_lin_ok_accepts_quant_and_rejects_shape() {
+            use crate::kquant::GgmlType as T;
+            use crate::model::linear_gguf::GgufLinear;
+            let k = 64usize;
+            let n = 2usize;
+            let ty_bytes = |ty: T| -> Vec<u8> {
+                match ty {
+                    T::F32 => vec![0u8; k * n * 4],
+                    T::Bf16 => vec![0u8; k * n * 2],
+                    T::Q8_0 => vec![0u8; (k / 32) * 34 * n],
+                    T::Q5_1 => vec![0u8; (k / 32) * 24 * n],
+                    T::Q4K | T::Q5K => vec![0u8; (k / 256).max(1) * 144 * n + 4096],
+                    _ => Vec::new(),
+                }
+            };
+            for ty in [T::F32, T::Bf16, T::Q8_0, T::Q5_1] {
+                let l = GgufLinear::from_slice(ty, k, n, &ty_bytes(ty)).expect("linear");
+                assert!(Qwen4Exp::pf_lin_ok(&l, k, n), "{ty:?} が弾かれた");
+                assert!(!Qwen4Exp::pf_lin_ok(&l, k, n + 1), "{ty:?}: 形違いを通した");
+                assert!(!Qwen4Exp::pf_lin_ok(&l, k + 32, n), "{ty:?}: k 違いを通した");
             }
         }
 
