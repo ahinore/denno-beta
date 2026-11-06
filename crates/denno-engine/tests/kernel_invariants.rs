@@ -6361,3 +6361,166 @@ fn prefill_full_qk_d2h_lands_in_pinned_staging() {
         "full_attn_host_side が pre_qk (pinned スライス) を読んでいない"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 160: decode の flash decoding (`kernels_attn_dec.cu`)
+// ---------------------------------------------------------------------------
+
+const ATTN_DEC_SRC: &str = include_str!("../kernels/kernels_attn_dec.cu");
+const BUILD_PTX_SH: &str = include_str!("../kernels/build_ptx.sh");
+
+/// task 160: `kernels_attn_dec.cu` とホスト (`src/cuda.rs`) の前提が一致すること。
+///
+/// GPU 無しでも検査できる範囲に限る:
+///  - 1 lane が持つ float4 の数 (`DNO_FD_MAXB` / `ATTN_FDEC_MAXB`)
+///  - part の 1 エントリの形 (`[m, l, acc(dh)]` と `dh + 2`)
+///  - block の形 (warp = q head、block = 32 * group) と grid (split, kv head)
+///  - K/V が 16 バイト (float4) で読まれること
+///  - 分割の式 (ホストの `div_ceil` とカーネルの `(t_total + n_split - 1) / n_split`)
+///  - build_ptx.sh の対象と -fmad=false
+#[test]
+fn attn_flashdec_kernel_matches_host() {
+    let d = defines(ATTN_DEC_SRC);
+    let maxb = eval_define("DNO_FD_MAXB", &d);
+    assert_eq!(maxb, 4, "DNO_FD_MAXB が 4 でない (ホストの ATTN_FDEC_MAXB と同時に更新)");
+    assert_eq!(rust_const("ATTN_FDEC_MAXB"), maxb, "ATTN_FDEC_MAXB がカーネルと不一致");
+    assert_eq!(rust_const("ATTN_FDEC_PART_EXTRA"), 2, "part の m,l は 2 要素");
+
+    // ---- part の形: [m, l, acc(dh)] (stride = dh + 2) ----
+    let dec = kernel_body(ATTN_DEC_SRC, "dno_attn_flashdec(");
+    let cb = kernel_body(ATTN_DEC_SRC, "dno_attn_flashdec_combine(");
+    assert!(
+        dec.contains("(size_t)(kh * n_split + sp) * group + hh) * (size_t)(dh + 2)"),
+        "part の添字 (kh, sp, hh) が変わった (combine と同時に更新すること)"
+    );
+    assert!(dec.contains("pp[0] = m_run;") && dec.contains("pp[1] = l_run;"));
+    assert!(
+        cb.contains("for (int sp = 0; sp < n_split; ++sp)"),
+        "combine が split 昇順に畳んでいない (決定論の根拠)"
+    );
+    assert!(cb.contains("pp[2 + d]"), "combine が acc を pp[2 + d] から読んでいない");
+    assert!(
+        cb.contains("__fdiv_rn(num, denom)"),
+        "combine の除算が明示の rn 除算でない"
+    );
+
+    // ---- block の形: 1 warp = 1 q head、block = 32 * group ----
+    assert!(dec.contains("blockIdx.y"), "kv head が blockIdx.y でない");
+    assert!(dec.contains("blockIdx.x"), "split が blockIdx.x でない");
+    assert!(
+        dec.contains("const int hh = threadIdx.x >> 5;"),
+        "warp = q head の割り当てが変わった"
+    );
+    assert!(dec.contains("const int lane = threadIdx.x & 31;"));
+    assert!(
+        CUDA_RS.contains("((32 * a.group) as u32, 1, 1)"),
+        "cuda.rs の block 形 (32 * group) がカーネルと不一致"
+    );
+    assert!(
+        CUDA_RS.contains("(n_split as u32, n_kv as u32, 1)"),
+        "cuda.rs の grid 形 (split, kv head) がカーネルと不一致"
+    );
+    assert!(
+        CUDA_RS.contains("(a.group as u32, nkv_c as u32, 1)"),
+        "combine の grid (q head, kv head) がカーネルと不一致"
+    );
+
+    // ---- GQA: 同じ kv head の行を 1 回だけ読む (q はレジスタ) ----
+    for pat in [
+        "reinterpret_cast<const float4 *>(qp + i)",
+        "reinterpret_cast<const float4 *>(krow + i)",
+        "reinterpret_cast<const float4 *>(vrow + i)",
+    ] {
+        assert!(dec.contains(pat), "16 バイトのベクトル読みが無い: {pat}");
+    }
+    // K/V の行頭は kv head のオフセット (kh * dh) から。q は warp の head。
+    assert!(dec.contains("const int kh_off = kh * dh;"));
+    assert!(dec.contains("const float *krow = kc + (size_t)j * kv_dim + kh_off;"));
+    assert!(dec.contains("const float *vrow = vc + (size_t)j * kv_dim + kh_off;"));
+    // 1 key = 1 回のスコア (tile 無し)・warp 内で閉じた online softmax。
+    assert!(
+        dec.contains("s += __shfl_xor_sync(0xffffffffu, s, 16);"),
+        "xor 縮約が無い (全 lane が同じスコアを持つ前提が崩れる)"
+    );
+    assert!(!dec.contains("__syncthreads"), "flashdec の block 内同期が増えた");
+
+    // ---- 分割の式: カーネルとホストが同じ ----
+    assert!(
+        dec.contains("const int chunk = (t_total + n_split - 1) / n_split;"),
+        "カーネルの分割式が変わった (q4_fdec_split と同時に更新すること)"
+    );
+    assert!(
+        CUDA_RS.contains("let chunk = t_total.div_ceil(n).max(1);"),
+        "q4_fdec_split の chunk 計算が変わった"
+    );
+    assert_eq!(
+        rust_const("ATTN_FDEC_SPLIT_MAX"),
+        64,
+        "分割数の上限は 64 (combine は split 昇順のループ)"
+    );
+
+    // ---- build_ptx.sh: 対象と -fmad=false (既存 attention と同じ丸め) ----
+    assert!(
+        BUILD_PTX_SH.contains("attn_dec)     echo \"kernels_attn_dec.cu|nofmad\""),
+        "build_ptx.sh の attn_dec が -fmad=false でない (PTX=attn_dec で生成する)"
+    );
+    assert!(
+        BUILD_PTX_SH.contains(" exp_iq_pf attn_dec)"),
+        "build_ptx.sh の targets_all に attn_dec が無い"
+    );
+}
+
+/// task 160: 生成済み PTX の entry 集合が .cu のカーネルと一致すること。
+/// PTX は lab (`PTX=attn_dec`) が生成して commit する。**未生成のときは明示的に
+/// 1 行出して skip** する (このコンテナに nvcc が無いため。生成後は必ず走る)。
+#[test]
+fn attn_flashdec_ptx_entries_match_cu() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("kernels")
+        .join("kernels_attn_dec.ptx");
+    let Ok(ptx) = std::fs::read_to_string(&path) else {
+        eprintln!(
+            "[kernel_invariants] {} が未生成 (lab の PTX=attn_dec で生成して commit する)",
+            path.display()
+        );
+        return;
+    };
+    let mut ptx_entries: Vec<String> = ptx
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix(".visible .entry "))
+        .map(|rest| rest.split('(').next().unwrap_or("").trim().to_string())
+        .collect();
+    let mut cu_entries: Vec<String> = Vec::new();
+    let code: String = ATTN_DEC_SRC
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut idx = 0usize;
+    while let Some(i) = code[idx..].find("__global__ void") {
+        let start = idx + i + "__global__ void".len();
+        let rest = code[start..].trim_start();
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            cu_entries.push(name);
+        }
+        idx = start;
+    }
+    ptx_entries.sort();
+    cu_entries.sort();
+    assert_eq!(
+        ptx_entries, cu_entries,
+        "kernels_attn_dec.ptx の entry 集合が .cu と違う (PTX 再生成が必要)"
+    );
+    assert_eq!(
+        ptx_entries,
+        vec![
+            "dno_attn_flashdec".to_string(),
+            "dno_attn_flashdec_combine".to_string()
+        ],
+        "PTX のカーネル名がローダ (cuda.rs の fdec_kernels) と違う"
+    );
+}

@@ -13915,6 +13915,245 @@ pub(crate) fn q4_dec_split(t_total: usize, n_split: usize) -> (usize, usize) {
     (t_total.div_ceil(chunk).max(1), chunk)
 }
 
+// ---- task 160: flash decoding (split-K・GQA まとめ読み) ---------------------
+//
+// 既存 `dno_attention_decode` は 1 block = (split, q head) で、GQA の group 本の
+// q head が同じ KV 行を group 回読む (L2 で拾えるが block 数も 24x8 しか無い)。
+// 新しい `kernels_attn_dec.cu` は 1 block = (split, kv head)、block 内の warp が
+// q head を 1 本ずつ持ち、行は L1 で共有する。詳細は .cu の先頭コメント。
+//
+// 既定は lab の結果で決める (`ATTN_FLASHDEC_DEFAULT` / `_MIN_CTX_DEFAULT`)。
+
+/// `.cu` の `DNO_FD_MAXB`。1 lane が 4 要素ずつ持つので dh <= MAXB * 128。
+const ATTN_FDEC_MAXB: usize = 4;
+/// part 1 エントリの float 数 = dh + 2 (先頭 2 つが m, l)。`.cu` と一致させる。
+const ATTN_FDEC_PART_EXTRA: usize = 2;
+/// 分割数の上限 (`.cu` の grid.x と combine のループ上限)。
+const ATTN_FDEC_SPLIT_MAX: usize = 64;
+/// 1 分割あたりの key 数の既定 (`DENNO_ATTN_FLASHDEC_CHUNK`)。
+const ATTN_FLASHDEC_CHUNK_DEFAULT: usize = 256;
+/// 1 分割の key 数の下限 (これ未満に割ると block だけ増えて無駄)。
+const ATTN_FLASHDEC_CHUNK_MIN: usize = 32;
+
+/// `DENNO_ATTN_FLASHDEC` の既定。lab t160a の結果で決める。
+const ATTN_FLASHDEC_DEFAULT: bool = false;
+/// この KV 本数未満は従来カーネル (`DENNO_ATTN_FLASHDEC_MIN_CTX`)。
+const ATTN_FLASHDEC_MIN_CTX_DEFAULT: usize = 1024;
+
+#[cfg(test)]
+static ATTN_FDEC_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+#[cfg(test)]
+static ATTN_FDEC_MIN_CTX_FORCE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+#[cfg(test)]
+static ATTN_FDEC_CHUNK_FORCE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// `DENNO_ATTN_FLASHDEC` の解釈 (純関数)。未設定・不正値は既定。
+fn parse_attn_flashdec(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => ATTN_FLASHDEC_DEFAULT,
+    }
+}
+
+/// `DENNO_ATTN_FLASHDEC_MIN_CTX` の解釈 (純関数)。
+fn parse_attn_flashdec_min_ctx(v: Option<&str>) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(n) => n,
+        None => ATTN_FLASHDEC_MIN_CTX_DEFAULT,
+    }
+}
+
+/// `DENNO_ATTN_FLASHDEC_CHUNK` の解釈 (純関数)。32..=4096 に丸める。
+fn parse_attn_flashdec_chunk(v: Option<&str>) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(n) => n.clamp(ATTN_FLASHDEC_CHUNK_MIN, 4096),
+        None => ATTN_FLASHDEC_CHUNK_DEFAULT,
+    }
+}
+
+/// テスト用: flash decoding のゲートを差し替える (`None` で env の解釈に戻す)。
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_attn_flashdec_for_test(on: Option<bool>) {
+    ATTN_FDEC_FORCE.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// テスト用: 短い文脈のしきい値を差し替える (`None` で env の解釈に戻す)。
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_attn_flashdec_min_ctx_for_test(n: Option<usize>) {
+    ATTN_FDEC_MIN_CTX_FORCE.store(n.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// テスト用: 1 分割の key 数を差し替える (`None` で env の解釈に戻す)。
+#[cfg(test)]
+#[doc(hidden)]
+pub fn set_attn_flashdec_chunk_for_test(n: Option<usize>) {
+    ATTN_FDEC_CHUNK_FORCE.store(n.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// flash decoding を使うか (`DENNO_ATTN_FLASHDEC`)。
+fn attn_flashdec_enabled() -> bool {
+    #[cfg(test)]
+    {
+        let f = ATTN_FDEC_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f >= 0 {
+            return f == 1;
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_attn_flashdec(std::env::var("DENNO_ATTN_FLASHDEC").ok().as_deref()))
+}
+
+/// この KV 本数未満では flash decoding を使わない (`DENNO_ATTN_FLASHDEC_MIN_CTX`)。
+fn attn_flashdec_min_ctx() -> usize {
+    #[cfg(test)]
+    {
+        let f = ATTN_FDEC_MIN_CTX_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f != usize::MAX {
+            return f;
+        }
+    }
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        parse_attn_flashdec_min_ctx(std::env::var("DENNO_ATTN_FLASHDEC_MIN_CTX").ok().as_deref())
+    })
+}
+
+/// 1 分割あたりの key 数 (`DENNO_ATTN_FLASHDEC_CHUNK`)。
+fn attn_flashdec_chunk() -> usize {
+    #[cfg(test)]
+    {
+        let f = ATTN_FDEC_CHUNK_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if f != usize::MAX {
+            return f;
+        }
+    }
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        parse_attn_flashdec_chunk(std::env::var("DENNO_ATTN_FLASHDEC_CHUNK").ok().as_deref())
+    })
+}
+
+/// 文脈長から分割数を決める (純関数)。カーネル側の
+/// `chunk = ceil(t_total / n_split)` と同じ式で、ホストとカーネルが同じ分割を見る。
+///
+/// block 数は `n_split x n_kv`。n_kv = 4 のモデルなら 256 key 分割で
+/// 14,139 -> 56 分割 = 224 block (SM 170) になり、全 SM が働く。
+pub(crate) fn q4_fdec_split(t_total: usize, chunk_keys: usize) -> (usize, usize) {
+    if t_total == 0 {
+        return (1, 1);
+    }
+    let keys = chunk_keys.max(ATTN_FLASHDEC_CHUNK_MIN);
+    let n = t_total.div_ceil(keys).clamp(1, ATTN_FDEC_SPLIT_MAX);
+    let chunk = t_total.div_ceil(n).max(1);
+    (t_total.div_ceil(chunk).max(1), chunk)
+}
+
+/// 分割数を 1 回だけログる (task 160 の "log it")。len は毎トークン変わるので
+/// 分割数が変わったときだけ出す (14k でも数十トークンに 1 行)。
+fn fdec_log(len: usize, n_split: usize, chunk: usize, kv_dim: usize, dh: usize, group: usize) {
+    static LAST: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    if LAST.load(std::sync::atomic::Ordering::Relaxed) == n_split {
+        return;
+    }
+    if LAST.swap(n_split, std::sync::atomic::Ordering::Relaxed) != n_split {
+        eprintln!(
+            "[attn-fdec] len={len} n_split={n_split} chunk={chunk} kv_dim={kv_dim} dh={dh} \
+             group={group} kv_bytes={:.1}MB",
+            (len * kv_dim * 4 * 2) as f64 / (1024.0 * 1024.0)
+        );
+    }
+}
+
+/// flash decoding の PTX (`kernels_attn_dec.ptx`)。`DENNO_ATTN_FLASHDEC_PTX` で
+/// 差し替え可 (lab は再生成した PTX をツリーに置いてから測る)。
+fn fdec_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_ATTN_FLASHDEC_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_attn_dec.ptx"),
+    }
+}
+
+/// flash decoding のカーネル 2 本。
+///
+/// `include_bytes!` せず実行時に 1 回だけ読む (このコンテナには nvcc が無く、
+/// PTX を先に置かないとビルドが通らないため。exp_iq / gemm_grouped と同じ方針)。
+/// 読めない・entry が無い場合は None を焼き付け、呼び出し側は従来カーネルへ落ちる。
+struct FdecKernels {
+    /// モジュールはプロセス終了まで保持する (unload しない)。
+    _module: CUmodule,
+    f_dec: CUfunction,
+    f_cb: CUfunction,
+}
+
+// 生ハンドル (module / function)。CudaCtx と同じ規約。
+unsafe impl Send for FdecKernels {}
+unsafe impl Sync for FdecKernels {}
+
+fn fdec_kernels() -> Option<&'static FdecKernels> {
+    static K: OnceLock<Option<FdecKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = fdec_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "[attn-fdec] PTX が読めない ({}) : {e} → 従来カーネルへ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                eprintln!("[attn-fdec] cuModuleLoadData 失敗 → 従来カーネルへ");
+                return None;
+            }
+        }
+        let mut f_dec: CUfunction = std::ptr::null_mut();
+        let mut f_cb: CUfunction = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_get_function)(
+                &mut f_dec,
+                module,
+                b"dno_attn_flashdec\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+                || (lib.module_get_function)(
+                    &mut f_cb,
+                    module,
+                    b"dno_attn_flashdec_combine\0".as_ptr() as *const c_char,
+                ) != CUDA_SUCCESS
+            {
+                eprintln!("[attn-fdec] PTX にカーネルが無い (再生成が必要) → 従来カーネルへ");
+                return None;
+            }
+        }
+        Some(FdecKernels {
+            _module: module,
+            f_dec,
+            f_cb,
+        })
+    })
+    .as_ref()
+}
+
 #[cfg(test)]
 static Q4_ATTN_KERNEL_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 #[cfg(test)]
@@ -14324,6 +14563,16 @@ pub fn q4_attn_decode(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
     if a.len < q4_gpu_attn_min() {
         return None;
     }
+    // task 160: flash decoding (split-K・GQA まとめ読み)。既定は
+    // `ATTN_FLASHDEC_DEFAULT` (lab の結果で決める)。短い文脈は従来カーネルの方が
+    // 速いので `DENNO_ATTN_FLASHDEC_MIN_CTX` で切る。PTX 不在・形状不一致は
+    // 静かに従来経路へ (数値の契約は同じ緩和枠)。
+    if attn_flashdec_enabled() && a.len >= attn_flashdec_min_ctx() {
+        match q4_attn_decode_flashdec(a) {
+            Some(v) => return Some(v),
+            None => q4attn_kprof::note_fdec_fallback(),
+        }
+    }
     match q4_gpu_attn_kernel() {
         Q4AttnKernel::Decode => q4_attn_decode_single(a),
         Q4AttnKernel::Prefill => q4_attn_decode_via_prefill(a),
@@ -14560,6 +14809,137 @@ fn q4_attn_decode_split(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
         q4attn_kprof::note_d2h(td, qbytes);
         q4attn_kprof::note_call();
         q4attn_kprof::note_split_call();
+        Some(outv)
+    })?;
+    Some(out)
+}
+
+/// task 160: decode 1 トークンを flash decoding (`dno_attn_flashdec` +
+/// `dno_attn_flashdec_combine`) で回す。
+///
+/// 既存 `dno_attention_decode` との違いは「誰が同じ KV 行を読むか」だけ:
+/// 既存は 1 block = (split, q head) で GQA の group 本の q head が同じ行を
+/// group 回読み、block も 4 warp しか無い。ここは 1 block = (split, kv head)・
+/// warp = q head 1 本で、行は block 内の L1 に 1 回だけ DRAM から来る。
+/// 分割は (t_total, n_split) だけで決まる固定分割・縮約は分割昇順なので
+/// **決定論** (CPU とはビット一致しない: attention の緩和枠)。
+///
+/// 同期は既存 split 経路と同じで層あたり 1 回 (`ctx.sync()`。出力をホストが
+/// 読むため)。カーネル 2 発は同じストリームに積むだけ。
+fn q4_attn_decode_flashdec(a: &Q4AttnCall<'_>) -> Option<Vec<f32>> {
+    if a.heads == 0 || a.group == 0 || a.heads % a.group != 0 || a.group > 32 {
+        return None;
+    }
+    // 1 lane が float4 (4 要素) ずつ持ち、1 巡で 128 要素。dh は 4 の倍数だけ。
+    if a.dh < 4 || a.dh % 4 != 0 || a.dh > ATTN_FDEC_MAXB * 128 {
+        return None;
+    }
+    if a.len == 0 || a.len > 65535 || a.layer >= a.n_layer {
+        return None;
+    }
+    let n_kv = a.heads / a.group;
+    if a.kv_dim != n_kv * a.dh || a.q.len() != a.heads * a.dh {
+        return None;
+    }
+    let rows = a.len.checked_mul(a.kv_dim)?;
+    if a.k.len() < rows || a.v.len() < rows {
+        return None;
+    }
+    let ctx = chain_ctx()?;
+    let k = fdec_kernels()?;
+    let (n_split, chunk) = q4_fdec_split(a.len, attn_flashdec_chunk());
+    fdec_log(a.len, n_split, chunk, a.kv_dim, a.dh, a.group);
+    let (f_dec, f_cb) = (k.f_dec, k.f_cb);
+
+    // ミラー同期は decode / prefill / split と同一の台帳 (1 行追記)。
+    let (kptr, vptr) = q4ok(q4_attn_mirror_prepare(
+        a.cache_id,
+        a.n_layer,
+        a.kv_dim,
+        a.layer,
+        a.layer_gen,
+        a.len,
+        a.k,
+        a.v,
+        false,
+    ))?;
+
+    let qd = a.heads * a.dh;
+    let mut kv_dim_c = a.kv_dim as c_int;
+    let mut t_c = a.len as c_int;
+    let mut group_c = a.group as c_int;
+    let mut dh_c = a.dh as c_int;
+    let mut scale_c = a.scale;
+    let mut nsplit_c = n_split as c_int;
+    let nkv_c = n_kv as c_int;
+    let out = Q4ATTN_SCRATCH.with(|cell| -> Option<Vec<f32>> {
+        let mut s = cell.borrow_mut();
+        let qbytes = qd.checked_mul(4)?;
+        let part_bytes = a
+            .heads
+            .checked_mul(n_split)?
+            .checked_mul(a.dh.checked_add(ATTN_FDEC_PART_EXTRA)?)?
+            .checked_mul(4)?;
+        q4ok(Scratch::ensure(&mut s.q, qbytes))?;
+        q4ok(Scratch::ensure(&mut s.out, qbytes))?;
+        q4ok(Scratch::ensure(&mut s.part, part_bytes))?;
+        let th = q4attn_kprof::stamp();
+        q4ok(s.q.as_ref().expect("ensure 済み").copy_from(a.q))?;
+        q4attn_kprof::note_q(th, qbytes);
+        let mut qptr = s.q.as_ref().expect("ensure 済み").ptr();
+        let mut aptr = s.out.as_ref().expect("ensure 済み").ptr();
+        let mut partptr = s.part.as_ref().expect("ensure 済み").ptr();
+        let mut kptr_c = kptr;
+        let mut vptr_c = vptr;
+        let mut args: Vec<*mut c_void> = vec![
+            &mut qptr as *mut _ as *mut c_void,
+            &mut kptr_c as *mut _ as *mut c_void,
+            &mut vptr_c as *mut _ as *mut c_void,
+            &mut partptr as *mut _ as *mut c_void,
+            &mut kv_dim_c as *mut _ as *mut c_void,
+            &mut t_c as *mut _ as *mut c_void,
+            &mut group_c as *mut _ as *mut c_void,
+            &mut dh_c as *mut _ as *mut c_void,
+            &mut scale_c as *mut _ as *mut c_void,
+            &mut nsplit_c as *mut _ as *mut c_void,
+        ];
+        let tl = q4attn_kprof::stamp();
+        q4ok(unsafe {
+            ctx.launch_async(
+                f_dec,
+                // split が最速次元 (同じ split の kv head が同時に走る)
+                (n_split as u32, n_kv as u32, 1),
+                // 1 warp = 1 q head
+                ((32 * a.group) as u32, 1, 1),
+                0,
+                &mut args,
+            )
+        })?;
+        let mut args2: Vec<*mut c_void> = vec![
+            &mut partptr as *mut _ as *mut c_void,
+            &mut aptr as *mut _ as *mut c_void,
+            &mut group_c as *mut _ as *mut c_void,
+            &mut dh_c as *mut _ as *mut c_void,
+            &mut nsplit_c as *mut _ as *mut c_void,
+        ];
+        q4ok(unsafe {
+            ctx.launch_async(
+                f_cb,
+                (a.group as u32, nkv_c as u32, 1),
+                (a.dh as u32, 1, 1),
+                0,
+                &mut args2,
+            )
+        })?;
+        q4attn_kprof::note_launch(tl);
+        let tw = q4attn_kprof::stamp();
+        q4ok(ctx.sync())?;
+        q4attn_kprof::note_wait(tw);
+        let td = q4attn_kprof::stamp();
+        let outv = q4ok(s.out.as_ref().expect("ensure 済み").to_vec::<f32>(qd))?;
+        q4attn_kprof::note_d2h(td, qbytes);
+        q4attn_kprof::note_call();
+        q4attn_kprof::note_fdec_call();
         Some(outv)
     })?;
     Some(out)
@@ -14928,6 +15308,25 @@ pub mod q4attn_kprof {
         }
     }
 
+    // ---- task 160: flash decoding のカウンタ --------------------------------
+    /// `dno_attn_flashdec` を回した回数 (= layer x decode token)
+    pub static FDEC_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// flash decoding を選んだが PTX / 形状の都合で従来カーネルへ落ちた回数
+    /// (この値が 0 でない run の decode は flash decoding の効果を含まない)。
+    pub static FDEC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn note_fdec_call() {
+        if on() {
+            FDEC_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn note_fdec_fallback() {
+        if on() {
+            FDEC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn note_pf_h2d(t: Option<std::time::Instant>, bytes: usize) {
         if !on() {
             return;
@@ -15004,7 +15403,7 @@ pub mod q4attn_kprof {
              mirror={entries} entries {:.0}MB / {}MB | \
              pf calls={pf_calls} h2d={:.1}MB q={:.1}MB out={:.1}MB | \
              pf h2d={:.1}ms launch={:.1}ms wait={:.1}ms d2h={:.1}ms | \
-             split calls={} fallback={}",
+             split calls={} fallback={} | fdec calls={} fallback={}",
             mb(SEED_BYTES.load(Ordering::Relaxed)),
             mb(ROW_BYTES.load(Ordering::Relaxed)),
             mb(Q_BYTES.load(Ordering::Relaxed)),
@@ -15029,6 +15428,8 @@ pub mod q4attn_kprof {
             ms(PF_D2H_NS.load(Ordering::Relaxed)),
             SPLIT_CALLS.load(Ordering::Relaxed),
             SPLIT_FALLBACKS.load(Ordering::Relaxed),
+            FDEC_CALLS.load(Ordering::Relaxed),
+            FDEC_FALLBACKS.load(Ordering::Relaxed),
         ))
     }
 
@@ -15047,6 +15448,8 @@ pub mod q4attn_kprof {
             &D2H_NS,
             &SPLIT_CALLS,
             &SPLIT_FALLBACKS,
+            &FDEC_CALLS,
+            &FDEC_FALLBACKS,
         ] {
             c.store(0, Ordering::Relaxed);
         }
@@ -18185,6 +18588,277 @@ mod q4_attn_tests {
                 );
             }
         }
+    }
+
+    /// task 160: flash decoding のアルゴリズム (kv head ごとに warp が q head 1 本を
+    /// 持ち、key を 1 本ずつ online softmax で畳んで split 昇順に combine する) を
+    /// CPU で書き下したもの。`kernels_attn_dec.cu` と同じ式・同じ分割
+    /// ([`q4_fdec_split`])・同じ part の添字を使う。
+    #[allow(clippy::too_many_arguments)]
+    fn flashdec_attention_cpu_ref(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        len: usize,
+        kv_dim: usize,
+        heads: usize,
+        group: usize,
+        dh: usize,
+        scale: f32,
+        chunk_keys: usize,
+    ) -> Vec<f32> {
+        let (ns, chunk) = q4_fdec_split(len, chunk_keys);
+        let n_kv = heads / group;
+        let stride = dh + ATTN_FDEC_PART_EXTRA;
+        // カーネルと同じ添字: part[(kh * ns + sp) * group + hh]
+        let mut part = vec![0f32; n_kv * ns * group * stride];
+        for kh in 0..n_kv {
+            let off = kh * dh;
+            for hh in 0..group {
+                let h = kh * group + hh;
+                for sp in 0..ns {
+                    let a = sp * chunk;
+                    let b = ((sp + 1) * chunk).min(len);
+                    let base = ((kh * ns + sp) * group + hh) * stride;
+                    let mut accs = vec![0f32; dh];
+                    let mut m = -3.402823466e+38f32;
+                    let mut l = 0f32;
+                    for j in a..b {
+                        let krow = &k[j * kv_dim + off..][..dh];
+                        let mut s = 0f32;
+                        for d in 0..dh {
+                            s += q[h * dh + d] * krow[d];
+                        }
+                        let sc = s * scale;
+                        let corr;
+                        let p;
+                        if sc > m {
+                            corr = ((m - sc) * std::f32::consts::LOG2_E).exp2();
+                            m = sc;
+                            p = 1.0f32; // exp2f(0) と厳密に同じ
+                        } else {
+                            corr = 1.0f32;
+                            p = ((sc - m) * std::f32::consts::LOG2_E).exp2();
+                        }
+                        l = l * corr + p;
+                        let vrow = &v[j * kv_dim + off..][..dh];
+                        for d in 0..dh {
+                            accs[d] = accs[d] * corr + p * vrow[d];
+                        }
+                    }
+                    part[base] = m;
+                    part[base + 1] = l;
+                    part[base + 2..][..dh].copy_from_slice(&accs);
+                }
+            }
+        }
+        // combine (split 昇順)
+        let mut out = vec![0f32; heads * dh];
+        for kh in 0..n_kv {
+            for hh in 0..group {
+                let h = kh * group + hh;
+                let base = ((kh * ns) * group + hh) * stride;
+                let step = group * stride;
+                let mut mg = -3.402823466e+38f32;
+                for sp in 0..ns {
+                    mg = mg.max(part[base + sp * step]);
+                }
+                for d in 0..dh {
+                    let mut denom = 0f32;
+                    let mut num = 0f32;
+                    for sp in 0..ns {
+                        let p = &part[base + sp * step..][..stride];
+                        let e = ((p[0] - mg) * std::f32::consts::LOG2_E).exp2();
+                        denom = p[1].mul_add(e, denom);
+                        num = p[2 + d].mul_add(e, num);
+                    }
+                    out[h * dh + d] = if denom > 0.0 { num / denom } else { 0.0 };
+                }
+            }
+        }
+        out
+    }
+
+    /// task 160: 文脈長からの分割数の選択。空の split を作らず、分割数が上限に
+    /// 収まり、返す chunk がカーネル側の `ceil(t_total / n_split)` と一致すること。
+    #[test]
+    fn q4_fdec_split_is_bounded_and_matches_kernel_formula() {
+        for t in [1usize, 2, 17, 511, 1024, 4096, 14139, 65535] {
+            for keys in [1usize, 32, 128, 256, 1024, 4096, 16384] {
+                let (ns, chunk) = q4_fdec_split(t, keys);
+                assert!(ns >= 1 && ns <= ATTN_FDEC_SPLIT_MAX, "t={t} keys={keys}");
+                // カーネルは自分で chunk = ceil(t_total / n_split) を計算する。
+                assert_eq!(chunk, t.div_ceil(ns), "kernel の chunk と不一致 (t={t} keys={keys})");
+                assert!(ns * chunk >= t, "区間が足りない (t={t} keys={keys})");
+                assert!(ns == 1 || (ns - 1) * chunk < t, "最後の split が空 (t={t})");
+            }
+        }
+        // 14,139 は 256 key 分割で 56 分割 = 224 block (n_kv = 4)
+        assert_eq!(q4_fdec_split(14139, 256), (56, 253));
+        assert_eq!(q4_fdec_split(3954, 256), (16, 248));
+        assert_eq!(q4_fdec_split(1, 256), (1, 1));
+        assert_eq!(q4_fdec_split(0, 256), (1, 1));
+    }
+
+    /// task 160: flash decoding のゲートの解釈 (純関数)。
+    #[test]
+    fn attn_flashdec_gate_parses() {
+        assert!(parse_attn_flashdec(Some("1")));
+        assert!(!parse_attn_flashdec(Some("0")));
+        assert_eq!(parse_attn_flashdec(Some("x")), ATTN_FLASHDEC_DEFAULT);
+        assert_eq!(parse_attn_flashdec(None), ATTN_FLASHDEC_DEFAULT);
+        assert_eq!(parse_attn_flashdec_min_ctx(Some("2048")), 2048);
+        assert_eq!(parse_attn_flashdec_min_ctx(Some("")), ATTN_FLASHDEC_MIN_CTX_DEFAULT);
+        assert_eq!(parse_attn_flashdec_min_ctx(None), ATTN_FLASHDEC_MIN_CTX_DEFAULT);
+        assert_eq!(parse_attn_flashdec_chunk(Some("8")), ATTN_FLASHDEC_CHUNK_MIN);
+        assert_eq!(parse_attn_flashdec_chunk(Some("99999")), 4096);
+        assert_eq!(parse_attn_flashdec_chunk(Some("128")), 128);
+        assert_eq!(parse_attn_flashdec_chunk(None), ATTN_FLASHDEC_CHUNK_DEFAULT);
+    }
+
+    /// task 160: flash decoding のアルゴリズムが dense softmax と一致すること
+    /// (許容差は task 144 の abs 1e-4 + rel 1e-5)。長さ 1 / 17 / 511 / 4,096 /
+    /// 14,000 — 分割の倍数でない長さ (17, 511, 14,000) を含む。
+    #[test]
+    fn q4_attn_flashdec_algorithm_matches_dense_softmax() {
+        for &(heads, n_kv, dh) in &[(6usize, 2usize, 64usize), (8, 2, 32), (24, 4, 32)] {
+            let group = heads / n_kv;
+            let kv_dim = n_kv * dh;
+            let scale = 1.0 / (dh as f32).sqrt();
+            for &len in &[1usize, 17, 511, 4096, 14000] {
+                let q = pseudo_random(heads * dh, 7 + len as u32);
+                let k = pseudo_random(len * kv_dim, 11 + len as u32);
+                let v = pseudo_random(len * kv_dim, 13 + len as u32);
+                let want = cpu_reference(&q, &k, &v, len, kv_dim, heads, group, dh, scale);
+                for &chunk in &[32usize, 256, 1024] {
+                    let got = flashdec_attention_cpu_ref(
+                        &q, &k, &v, len, kv_dim, heads, group, dh, scale, chunk,
+                    );
+                    let (ns, _) = q4_fdec_split(len, chunk);
+                    for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                        let tol = 1e-4 + 1e-5 * b.abs();
+                        assert!(
+                            (a - b).abs() <= tol,
+                            "len={len} heads={heads} n_kv={n_kv} chunk={chunk} n_split={ns} \
+                             i={i}: flashdec={a} dense={b} (diff {})",
+                            (a - b).abs()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// task 160: flash decoding を既存 split カーネルと CPU 参照に突き合わせる
+    /// (GPU が要る)。長さ 1 / 17 / 511 / 4,096 / 14,000、GQA 比 2 / 3 / 6。
+    /// 決定論 (同一入力でビット一致) と、分割数を変えても近いことも見る。
+    /// `cargo test --release --features cuda -p denno-engine --lib
+    /// q4_attn_flashdec -- --ignored --test-threads=1` でだけ回す。
+    #[test]
+    #[ignore = "GPU が必要"]
+    fn q4_attn_flashdec_matches_split_kernel() {
+        let _g = test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        enable_for_tests();
+        let _ = CudaCtx::new().expect("GPU が無い");
+        set_q4_gpu_attn_for_test(Some(true));
+        set_q4_gpu_attn_min_for_test(Some(0));
+        set_q4_gpu_attn_kernel_for_test(Some(Q4AttnKernel::Split));
+        set_q4_gpu_attn_split_for_test(Some(8));
+        set_attn_flashdec_min_ctx_for_test(Some(0));
+        set_attn_flashdec_chunk_for_test(Some(256));
+
+        for &(heads, n_kv, dh) in &[(4usize, 2usize, 64usize), (6, 2, 64), (24, 4, 32)] {
+            let group = heads / n_kv;
+            let kv_dim = n_kv * dh;
+            let scale = 1.0 / (dh as f32).sqrt();
+            for &len in &[1usize, 17, 511, 4096, 14000] {
+                let mut cache = AttnCache::new(1, n_kv, dh, len + 1).unwrap();
+                let mut lcg = {
+                    let mut s = 4242u64 ^ (len as u64);
+                    move || {
+                        s = s
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        ((s >> 33) as f32 / (1u64 << 30) as f32) - 1.0
+                    }
+                };
+                for _ in 0..len {
+                    let k: Vec<f32> = (0..kv_dim).map(|_| lcg()).collect();
+                    let v: Vec<f32> = (0..kv_dim).map(|_| lcg()).collect();
+                    cache.push(0, &k, &v).unwrap();
+                }
+                let q: Vec<f32> = (0..heads * dh).map(|_| lcg()).collect();
+                let call = Q4AttnCall {
+                    cache_id: cache.id(),
+                    n_layer: 1,
+                    layer: 0,
+                    layer_gen: cache.gen(0).unwrap(),
+                    len,
+                    kv_dim,
+                    heads,
+                    group,
+                    dh,
+                    scale,
+                    q: &q,
+                    k: cache.k(0).unwrap(),
+                    v: cache.v(0).unwrap(),
+                };
+                let want = cpu_reference(
+                    &q,
+                    cache.k(0).unwrap(),
+                    cache.v(0).unwrap(),
+                    len,
+                    kv_dim,
+                    heads,
+                    group,
+                    dh,
+                    scale,
+                );
+                // 1) flash decoding
+                set_attn_flashdec_for_test(Some(true));
+                let got = q4_attn_decode(&call).expect("flash decoding が発動していない");
+                // 2) 既存 split カーネル
+                set_attn_flashdec_for_test(Some(false));
+                let got_split = q4_attn_decode(&call).expect("split 経路が発動していない");
+                for (name, got) in [("fdec", &got), ("split", &got_split)] {
+                    for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                        let tol = 1e-4 + 1e-5 * b.abs();
+                        assert!(
+                            (a - b).abs() <= tol,
+                            "{name}: len={len} heads={heads} i={i}: {a} vs {b} (diff {})",
+                            (a - b).abs()
+                        );
+                    }
+                }
+                // 3) 2 つのカーネルは同じ答え (丸め順だけが違う)
+                for (i, (a, b)) in got.iter().zip(&got_split).enumerate() {
+                    let tol = 1e-4 + 1e-5 * b.abs();
+                    assert!((a - b).abs() <= tol, "fdec と split が違う: len={len} i={i}");
+                }
+                // 4) 決定論
+                set_attn_flashdec_for_test(Some(true));
+                let got2 = q4_attn_decode(&call).expect("flash decoding が発動していない");
+                assert_eq!(got, got2, "flash decoding が非決定論的 (len={len})");
+                // 5) 分割数を変えても近い
+                set_attn_flashdec_chunk_for_test(Some(64));
+                let got3 = q4_attn_decode(&call).expect("flash decoding が発動していない");
+                for (i, (a, b)) in got3.iter().zip(&want).enumerate() {
+                    let tol = 1e-4 + 1e-5 * b.abs();
+                    assert!((a - b).abs() <= tol, "chunk=64 で値が違う: len={len} i={i}");
+                }
+                set_attn_flashdec_chunk_for_test(Some(256));
+            }
+        }
+
+        set_attn_flashdec_for_test(None);
+        set_attn_flashdec_min_ctx_for_test(None);
+        set_attn_flashdec_chunk_for_test(None);
+        set_q4_gpu_attn_kernel_for_test(None);
+        set_q4_gpu_attn_split_for_test(None);
+        set_q4_gpu_attn_min_for_test(None);
+        set_q4_gpu_attn_for_test(None);
     }
 
     /// task 135: t 分割 decode attention を CPU 参照と突き合わせる (GPU が要る)。
