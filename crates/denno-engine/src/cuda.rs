@@ -10747,13 +10747,31 @@ const PF_NAMES: [&[u8]; 5] = [
     b"dno_pf_combine\0",
 ];
 
-/// `DENNO_PF_PTX` があればそれ、無ければクレート配下 `kernels/kernels_pf.ptx`。
-fn pf_ptx_path() -> std::path::PathBuf {
+/// task 154: 常駐連鎖の PTX。lab t154e が `PTX=pf` で `kernels_pf.cu` から
+/// 再生成したものをそのまま収録した (5 本の entry を含む)。
+///
+/// `include_bytes!` にする理由: 既定 on の経路なので、実行時にクレート配下の
+/// `kernels/` が無い配置でも黙って CPU へ落ちないようにする (task 151 の
+/// `kernels_exp_iq_pf.ptx` はファイル読みだが、あちらは既定 on の判断が後追い)。
+const PTX_PF: &[u8] = include_bytes!("../kernels/kernels_pf.ptx");
+
+/// `DENNO_PF_PTX` があればそのイメージ、無ければコミット済みの [`PTX_PF`]。
+fn pf_ptx_image() -> Option<Vec<u8>> {
     match std::env::var("DENNO_PF_PTX") {
-        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
-        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("kernels")
-            .join("kernels_pf.ptx"),
+        Ok(p) if !p.is_empty() => {
+            let path = std::path::Path::new(&p);
+            match std::fs::read(path) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    tracing::info!(
+                        "[pf] PTX が読めない ({}): {e} → CPU 経路",
+                        path.display()
+                    );
+                    None
+                }
+            }
+        }
+        _ => Some(PTX_PF.to_vec()),
     }
 }
 
@@ -10761,17 +10779,7 @@ fn pf_ptx_path() -> std::path::PathBuf {
 fn pf_kernels() -> Option<&'static PfKernels> {
     static K: OnceLock<Option<PfKernels>> = OnceLock::new();
     K.get_or_init(|| {
-        let path = pf_ptx_path();
-        let mut image = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::info!(
-                    "[pf] PTX が読めない ({}): {e} → CPU 経路",
-                    path.display()
-                );
-                return None;
-            }
-        };
+        let mut image = pf_ptx_image()?;
         image.push(0);
         let lib = lib().ok()?;
         let mut module: CUmodule = std::ptr::null_mut();

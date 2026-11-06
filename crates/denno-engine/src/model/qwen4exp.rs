@@ -9467,9 +9467,10 @@ fn prefill_batch_chunk() -> usize {
 // - `DENNO_PF_MIX_DEV`: hc mix (norm → down → lo → up → mixed → inject) と
 //   hc combine をデバイス上の 1 連鎖で回し、活性をチャンク中 GPU に置く
 //
-// の 2 つを 1 つの master ゲートで束ねる。既定は off (lab の採否で決める)。
+// の 2 つを 1 つの master ゲートで束ねる。**既定 on** (lab t154e で採用。
+// `DENNO_PF_RESIDENT=0` で従来経路に戻る)。
 
-/// master ゲートの解釈 (純関数)。明示的な真値だけ on。
+/// 副ゲートの解釈 (純関数)。明示的な真値だけ on (未設定は master を見る)。
 pub(crate) fn pf_on_from_value(v: Option<&str>) -> bool {
     match v {
         Some(s) => matches!(
@@ -9480,10 +9481,28 @@ pub(crate) fn pf_on_from_value(v: Option<&str>) -> bool {
     }
 }
 
-/// task 154: prefill を GPU 常駐にするか (`DENNO_PF_RESIDENT`、既定 off)。
+/// task 154: master ゲート (`DENNO_PF_RESIDENT`) の解釈 (純関数)。**既定 on**。
+///
+/// `0` / `off` / `false` / `no` のときだけ無効。未設定と空文字は既定 (on)。
+/// lab t154e (base = このゲート off) の実測: cold prefill 3,826 tok
+/// 63.05 -> 49.52 s (-21.5%)、14,018 tok 210.39 -> 153.69 s (-26.9%)、decode
+/// 54 -> 53 ms/tok。`DENNO_PF_RESIDENT=0` で従来経路に戻せる。
+pub(crate) fn pf_resident_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => true,
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+    }
+}
+
+/// task 154: prefill を GPU 常駐にするか (`DENNO_PF_RESIDENT`、既定 on)。
 pub(crate) fn pf_resident_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| pf_on_from_value(std::env::var("DENNO_PF_RESIDENT").ok().as_deref()))
+    *ON.get_or_init(|| {
+        pf_resident_from_value(std::env::var("DENNO_PF_RESIDENT").ok().as_deref())
+    })
 }
 
 /// 副ゲートの上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。テスト用。
@@ -16018,10 +16037,20 @@ mod tests {
             }
         }
 
-        /// task 154: `DENNO_PF_RESIDENT` / 副ゲートの真理値表 (既定 off)。
+        /// task 154: `DENNO_PF_RESIDENT` (master。既定 on) と副ゲートの真理値表。
         #[test]
         fn pf_gate_truth_table() {
-            assert!(!pf_on_from_value(None), "未設定は off");
+            // master: 未設定と空文字は既定 (on)、明示的な偽値だけ off。
+            assert!(pf_resident_from_value(None), "未設定は on (lab t154e で採用)");
+            assert!(pf_resident_from_value(Some("")), "空文字は既定 (on)");
+            for v in ["0", "off", "false", "no", " OFF ", " 0 "] {
+                assert!(!pf_resident_from_value(Some(v)), "{v:?} が on になった");
+            }
+            for v in ["1", "on", "true", "yes", " ON "] {
+                assert!(pf_resident_from_value(Some(v)), "{v:?} が off になった");
+            }
+            // 副ゲート: 未設定は master を見るので、ここでは明示値だけを固定する。
+            assert!(!pf_on_from_value(None), "未設定は off (副ゲートは master に従う)");
             for v in ["0", "off", "false", "no", "", " 0 "] {
                 assert!(!pf_on_from_value(Some(v)), "{v:?} が on になった");
             }
@@ -16193,7 +16222,9 @@ mod tests {
             for w in [PF_SUB_GDN, PF_SUB_MIX] {
                 set_pf_sub_for_test(w, Some(true));
             }
-            assert!(pf_resident_on() == false, "master が env 無しで on になっている");
+            // master は既定 on (真理値表は `pf_gate_truth_table`)。GPU / PTX が無い
+            // この環境では入口の `pf_begin` が false を返し、層を進めずに従来経路へ
+            // 落ちる。ここで見るのは「落ちたときの logits が off と同一」であること。
             let mut m2 = Qwen4Exp::new(&GgufFile::open(&path).expect("open")).expect("new");
             let on = m2.forward_prefill_with(&ctx, true).expect("prefill (on)");
             for w in [PF_SUB_GDN, PF_SUB_MIX] {
