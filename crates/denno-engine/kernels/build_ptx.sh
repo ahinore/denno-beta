@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf)
+targets_all=(int8 elem gdn moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf pf)
 
 # 名前 -> "ソース|fmad" (fmad: nofmad = -fmad=false / fmad = 既定)。未知は 1。
 spec() {
@@ -45,6 +45,9 @@ spec() {
         # task 148: prefill の m 行 expert GEMV。decode と同じくビット一致契約では
         # ない (1 行を 32 レーンで分割) ので FMA を許可する。
         exp_iq_pf)    echo "kernels_exp_iq_pf.cu|fmad" ;;
+        # task 154: prefill の hc mix / combine の要素カーネル。CPU 参照と 1 演算
+        # 1 丸めを合わせるため -fmad=false で作る (明示 __*_rn のみ)。
+        pf)           echo "kernels_pf.cu|nofmad" ;;
         gemm)         echo "kernels_gemm.cu|fmad" ;;
         gemm_grouped) echo "kernels_gemm_grouped.cu|fmad" ;;
         *)            return 1 ;;

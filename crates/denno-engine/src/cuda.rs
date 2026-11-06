@@ -10689,6 +10689,579 @@ pub fn maybe_gpu_mix_bf16_batch_into(
 }
 
 
+// ---------------------------------------------------------------------------
+// task 154: prefill のデバイス常駐 mix 連鎖 (`DENNO_PF_RESIDENT`)
+// ---------------------------------------------------------------------------
+//
+// 狙い: hc mix 1 回ごとの往復 (res H2D → down GEMM → lo D2H → lo H2D → up GEMM →
+// gate D2H → ホストで norm/silu/gating) を、デバイス上の 1 連鎖に置き換える。
+// 入力 `res` はチャンク開始時に 1 回だけ上げ、以後は層をまたいでデバイスに置く
+// (`pf_upload_res` / `pf_download_res` は呼び出し側が層の境界でだけ使う)。
+//
+// 使うカーネル:
+//   dno_pf_rmsgroup / dno_pf_lo / dno_pf_mixed / dno_pf_inj / dno_pf_combine
+//   (kernels_pf.cu、PTX は `bash build_ptx.sh pf`) と、既存の
+//   dno_gemm_bf16_mt (k=hc_dim→low_rank と low_rank→hc_dim と hc_dim→hc)。
+//
+// 数値: 要素演算は CPU 参照と 1 演算 1 丸めで一致するように書いてある
+// (二乗和は i 昇順の逐次)。GEMM は task 145 のバッチ mix と同じ
+// `dno_gemm_bf16_mt` なので、`DENNO_MIX_BATCH_GPU=1` のときの値と一致する。
+
+struct PfKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    rmsgroup: CUfunction,
+    lo: CUfunction,
+    mixed: CUfunction,
+    inj: CUfunction,
+    combine: CUfunction,
+}
+
+// 生ハンドル (CudaCtx / MoeBatchKernels と同じ規約)。
+unsafe impl Send for PfKernels {}
+unsafe impl Sync for PfKernels {}
+
+const PF_NAMES: [&[u8]; 5] = [
+    b"dno_pf_rmsgroup\0",
+    b"dno_pf_lo\0",
+    b"dno_pf_mixed\0",
+    b"dno_pf_inj\0",
+    b"dno_pf_combine\0",
+];
+
+/// `DENNO_PF_PTX` があればそれ、無ければクレート配下 `kernels/kernels_pf.ptx`。
+fn pf_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_pf.ptx"),
+    }
+}
+
+/// カーネル一式を読む (初回だけ。失敗は None を焼き付ける = 二度と試さない)。
+fn pf_kernels() -> Option<&'static PfKernels> {
+    static K: OnceLock<Option<PfKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = pf_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::info!(
+                    "[pf] PTX が読めない ({}): {e} → CPU 経路",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                tracing::info!("[pf] cuModuleLoadData 失敗 → CPU 経路");
+                return None;
+            }
+        }
+        let mut fns: [CUfunction; 5] = [std::ptr::null_mut(); 5];
+        for (i, name) in PF_NAMES.iter().enumerate() {
+            unsafe {
+                if (lib.module_get_function)(&mut fns[i], module, name.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    tracing::info!(
+                        "[pf] PTX に {} が無い → CPU 経路",
+                        String::from_utf8_lossy(&name[..name.len() - 1])
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(PfKernels {
+            module,
+            rmsgroup: fns[0],
+            lo: fns[1],
+            mixed: fns[2],
+            inj: fns[3],
+            combine: fns[4],
+        })
+    })
+    .as_ref()
+}
+
+/// 連鎖 1 回ぶんの失敗を 1 度だけ記録する (以降は CPU 経路に固定)。
+static PF_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn pf_fail(msg: &str) -> bool {
+    if !PF_BROKEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!("[pf] {msg} → 以降の prefill は CPU 経路");
+    }
+    false
+}
+
+/// 形状と作業域。層をまたいで再利用する (grow-only)。
+struct PfDev {
+    res: Option<DevBuffer>,   // [nt][hc][e]
+    xn: Option<DevBuffer>,    // [nt][hc][e]
+    lo: Option<DevBuffer>,    // [nt][low_rank]
+    gate: Option<DevBuffer>,  // [nt][hc][e]
+    mixed: Option<DevBuffer>, // [nt][e]
+    inj: Option<DevBuffer>,   // [nt][hc]
+    bo: Option<DevBuffer>,    // [nt][e]
+    gamma: Option<DevBuffer>, // [hc][e]
+    nt: usize,
+    hc: usize,
+    e: usize,
+    lr: usize,
+}
+
+impl PfDev {
+    const fn new() -> Self {
+        Self {
+            res: None,
+            xn: None,
+            lo: None,
+            gate: None,
+            mixed: None,
+            inj: None,
+            bo: None,
+            gamma: None,
+            nt: 0,
+            hc: 0,
+            e: 0,
+            lr: 0,
+        }
+    }
+}
+
+thread_local! {
+    static PF_DEV: std::cell::RefCell<PfDev> = const { std::cell::RefCell::new(PfDev::new()) };
+}
+
+/// task 154: チャンクぶんの作業域を用意する。`false` で CPU 経路へ。
+///
+/// 直前の `res` の中身は保証しない (呼び出し側が `pf_upload_res` で入れる)。
+pub fn pf_begin(nt: usize, hc: usize, e: usize, lr: usize) -> bool {
+    if PF_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if nt == 0 || hc == 0 || e == 0 || lr == 0 || hc * e > (1 << 20) {
+        return false;
+    }
+    if pf_kernels().is_none() {
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        return pf_fail("CUDA context が無い");
+    };
+    if ctx.make_current().is_err() {
+        return pf_fail("cuCtxSetCurrent 失敗");
+    }
+    if gemm_bf16_mt_fn(ctx).is_none() && gemm_f32_mt_fn(ctx).is_none() {
+        return pf_fail("GEMM カーネルが PTX に無い");
+    }
+    let r = PF_DEV.with(|cell| -> anyhow::Result<()> {
+        let mut d = cell.borrow_mut();
+        if d.nt != nt || d.hc != hc || d.e != e || d.lr != lr {
+            // 形が変わったら全部作り直す (古い領域を流用しない)。
+            d.res = None;
+            d.bo = None;
+            d.mixed = None;
+            d.inj = None;
+            d.nt = nt;
+            d.hc = hc;
+            d.e = e;
+            d.lr = lr;
+        }
+        let hc_dim = hc * e;
+        Scratch::ensure_tagged(&mut d.res, nt * hc_dim * 4, crate::mem_audit::TAG_OTHER)?;
+        Scratch::ensure_tagged(&mut d.xn, nt * hc_dim * 4, crate::mem_audit::TAG_OTHER)?;
+        Scratch::ensure_tagged(&mut d.lo, nt * lr * 4, crate::mem_audit::TAG_OTHER)?;
+        Scratch::ensure_tagged(&mut d.gate, nt * hc_dim * 4, crate::mem_audit::TAG_OTHER)?;
+        Scratch::ensure_tagged(&mut d.mixed, nt * e * 4, crate::mem_audit::TAG_OTHER)?;
+        Scratch::ensure_tagged(&mut d.inj, nt * hc * 4, crate::mem_audit::TAG_OTHER)?;
+        Scratch::ensure_tagged(&mut d.bo, nt * e * 4, crate::mem_audit::TAG_OTHER)?;
+        Scratch::ensure_tagged(&mut d.gamma, hc_dim * 4, crate::mem_audit::TAG_OTHER)?;
+        Ok(())
+    });
+    match r {
+        Ok(()) => true,
+        Err(e) => pf_fail(&format!("作業域の確保に失敗: {e:#}")),
+    }
+}
+
+/// task 154: チャンクの残差 (`[nt][hc][e]`) をデバイスへ置く。
+pub fn pf_upload_res(res: &[f32]) -> bool {
+    PF_DEV.with(|cell| -> bool {
+        let d = cell.borrow();
+        match d.res.as_ref() {
+            Some(b) if b.bytes() >= res.len() * 4 => b.copy_from(res).is_ok(),
+            _ => false,
+        }
+    })
+}
+
+/// task 154: デバイスの残差をホストへ戻す (`res` は [nt][hc][e])。
+pub fn pf_download_res(out: &mut [f32]) -> bool {
+    PF_DEV.with(|cell| -> bool {
+        let d = cell.borrow();
+        match d.res.as_ref() {
+            Some(b) if b.bytes() >= out.len() * 4 => match b.to_vec::<f32>(out.len()) {
+                Ok(v) => {
+                    out.copy_from_slice(&v);
+                    true
+                }
+                Err(_) => false,
+            },
+            _ => false,
+        }
+    })
+}
+
+/// task 154: デバイスの `mixed` (`[nt][n_embd]`) をホストへ戻す。
+pub fn pf_take_mixed(out: &mut [f32]) -> bool {
+    PF_DEV.with(|cell| -> bool {
+        let d = cell.borrow();
+        match d.mixed.as_ref() {
+            Some(b) if b.bytes() >= out.len() * 4 => match b.to_vec::<f32>(out.len()) {
+                Ok(v) => {
+                    out.copy_from_slice(&v);
+                    true
+                }
+                Err(_) => false,
+            },
+            _ => false,
+        }
+    })
+}
+
+/// F32 の重み (hc mix の inject など) の常駐表。`mix_gpu_weight` は BF16 専用なので
+/// F32 はそのままのバイト列を置く (1 本 40 KB)。
+static PF_F32_W: OnceLock<Mutex<std::collections::HashMap<u64, DevBuffer>>> = OnceLock::new();
+
+/// 重み 1 本を常駐させ、`(デバイスポインタ, BF16 のままか)` を返す。
+///
+/// - BF16: [`mix_gpu_weight`] (task 152。`want_bf16` が偽なら f32 に展開)
+/// - F32:  そのままのバイト列
+/// - それ以外: `None` (呼び出し側は層を進める前に従来経路へ)
+fn pf_weight(l: PfLin<'_>, want_bf16: bool) -> Option<(CUdeviceptr, bool)> {
+    use crate::kquant::GgmlType as T;
+    match l.ty {
+        T::Bf16 => {
+            if l.blocks.len() != l.k.saturating_mul(l.n).saturating_mul(2) {
+                return None;
+            }
+            match mix_gpu_weight(l.uid, l.blocks, l.k, l.n, want_bf16) {
+                Ok(w) => Some((w.ptr, want_bf16)),
+                Err(e) => {
+                    tracing::info!("[pf] 重みの常駐に失敗 (uid={}): {e:#}", l.uid);
+                    None
+                }
+            }
+        }
+        T::F32 => {
+            let want = l.k.checked_mul(l.n)?.checked_mul(4)?;
+            if l.blocks.len() != want {
+                return None;
+            }
+            let reg = PF_F32_W.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+            let mut m = match reg.lock() {
+                Ok(g) => g,
+                Err(_) => return None,
+            };
+            if let Some(b) = m.get(&l.uid) {
+                return Some((b.ptr(), false));
+            }
+            let b = DevBuffer::from_slice_tagged(l.blocks, crate::mem_audit::TAG_OTHER).ok()?;
+            let p = b.ptr();
+            m.insert(l.uid, b);
+            Some((p, false))
+        }
+        _ => None,
+    }
+}
+
+/// task 154: mix の 1 行列 (`GgufLinear` の素性)。
+#[derive(Clone, Copy)]
+pub struct PfLin<'a> {
+    /// `GgufLinear::uid` (常駐の鍵)。
+    pub uid: u64,
+    /// 重みの量子型 (BF16 だけ受ける)。
+    pub ty: crate::kquant::GgmlType,
+    /// 生の重みバイト列。
+    pub blocks: &'a [u8],
+    /// 入力次元。
+    pub k: usize,
+    /// 出力次元。
+    pub n: usize,
+}
+
+/// task 154: hc mix の 1 段 (norm → down → lo → up → mixed → inject) をデバイスで回し、
+/// `mixed` (と inject 列) をデバイスに残す。
+///
+/// 成功したら `pf_take_mixed` で `[nt][n_embd]` を取れる。`false` は CPU 経路へ。
+/// `res` は呼び出し側が `pf_upload_res` で入れたものを使う。
+#[allow(clippy::too_many_arguments)]
+pub fn pf_mix(
+    norm: &[f32],
+    down: PfLin<'_>,
+    up: PfLin<'_>,
+    inject: PfLin<'_>,
+    nt: usize,
+    hc: usize,
+    e: usize,
+    lr: usize,
+    eps: f32,
+) -> bool {
+    if PF_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let hc_dim = hc * e;
+    if norm.len() != hc_dim
+        || down.k != hc_dim
+        || down.n != lr
+        || up.k != lr
+        || up.n != hc_dim
+        || inject.k != hc_dim
+        || inject.n != hc
+    {
+        return pf_fail("mix の形が違う");
+    }
+    let Some(k) = pf_kernels() else {
+        return false;
+    };
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        return pf_fail("cuCtxSetCurrent 失敗");
+    }
+    let f_bf16 = gemm_bf16_mt_fn(ctx);
+    let f_f32 = gemm_f32_mt_fn(ctx);
+    let want_bf16 = mix_bf16_enabled() && f_bf16.is_some();
+    if f_f32.is_none() {
+        return pf_fail("f32 GEMM カーネルが無い");
+    }
+    let Some((pd, pd_bf16)) = pf_weight(down, want_bf16) else {
+        return false;
+    };
+    let Some((pu, pu_bf16)) = pf_weight(up, want_bf16) else {
+        return false;
+    };
+    let Some((pi, pi_bf16)) = pf_weight(inject, want_bf16) else {
+        return false;
+    };
+    let r = PF_DEV.with(|cell| -> Result<(), String> {
+        let d = cell.borrow();
+        if nt > d.nt || hc != d.hc || e != d.e || lr != d.lr {
+            return Err(format!(
+                "作業域の形が違う (要求 nt={nt} hc={hc} e={e} lr={lr} / 確保 nt={} hc={} e={} lr={})",
+                d.nt, d.hc, d.e, d.lr
+            ));
+        }
+        let (Some(res), Some(xn), Some(lo), Some(gate), Some(mixed), Some(inj), Some(gamma)) = (
+            d.res.as_ref(),
+            d.xn.as_ref(),
+            d.lo.as_ref(),
+            d.gate.as_ref(),
+            d.mixed.as_ref(),
+            d.inj.as_ref(),
+            d.gamma.as_ref(),
+        ) else {
+            return Err("作業域が無い".into());
+        };
+        gamma.copy_from(norm).map_err(|e| format!("norm H2D: {e:#}"))?;
+        let inv_hc = 1.0f32 / hc as f32;
+        let mut rows = (nt * hc) as i32;
+        let (mut pr, mut px, mut pl, mut pg, mut pm, mut pj, mut pw) =
+            (res.ptr(), xn.ptr(), lo.ptr(), gate.ptr(), mixed.ptr(), inj.ptr(), gamma.ptr());
+        // 1. grouped RMS norm (res → xn)
+        {
+            let (mut e_c, mut hc_c) = (e as i32, hc as i32);
+            let mut eps_c = eps;
+            let mut args = [
+                &mut pr as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut px as *mut _ as *mut c_void,
+                &mut rows as *mut _ as *mut c_void,
+                &mut e_c as *mut _ as *mut c_void,
+                &mut hc_c as *mut _ as *mut c_void,
+                &mut eps_c as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                ctx.launch_async(k.rmsgroup, (rows as u32, 1, 1), (128, 1, 1), 0, &mut args)
+                    .map_err(|e| format!("rmsgroup launch: {e:#}"))?;
+            }
+        }
+        // 2. down GEMM (xn → lo)
+        let gemm = |w: CUdeviceptr,
+                    x: CUdeviceptr,
+                    y: CUdeviceptr,
+                    kk: usize,
+                    nn: usize,
+                    as_bf16: bool|
+         -> Result<(), String> {
+            let f = if as_bf16 {
+                f_bf16.ok_or_else(|| "bf16 GEMM カーネルが無い".to_string())?
+            } else {
+                f_f32.ok_or_else(|| "f32 GEMM カーネルが無い".to_string())?
+            };
+            let (mut pw, mut px, mut py) = (w, x, y);
+            let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, kk as c_int, nn as c_int);
+            let mut args = [
+                &mut pw as *mut _ as *mut c_void,
+                &mut px as *mut _ as *mut c_void,
+                &mut py as *mut _ as *mut c_void,
+                &mut nt_c as *mut _ as *mut c_void,
+                &mut k_c as *mut _ as *mut c_void,
+                &mut n_c as *mut _ as *mut c_void,
+            ];
+            let grid = (
+                ((nn + GEMM_MT_ROWS - 1) / GEMM_MT_ROWS) as u32,
+                ((nt + GEMM_MT_TOKS - 1) / GEMM_MT_TOKS) as u32,
+                1,
+            );
+            unsafe {
+                ctx.launch_async(f, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)
+                    .map_err(|e| format!("gemm launch: {e:#}"))?;
+            }
+            Ok(())
+        };
+        gemm(pd, px, pl, hc_dim, lr, pd_bf16)?;
+        // 3. lo apply (in-place, nt*low_rank 要素)
+        {
+            let mut total = (nt * lr) as i64;
+            let mut inv_c = inv_hc;
+            let grid = ((nt * lr).div_ceil(256)) as u32;
+            let mut args = [
+                &mut pl as *mut _ as *mut c_void,
+                &mut total as *mut _ as *mut c_void,
+                &mut inv_c as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                ctx.launch_async(k.lo, (grid, 1, 1), (256, 1, 1), 0, &mut args)
+                    .map_err(|e| format!("lo launch: {e:#}"))?;
+            }
+        }
+        // 4. up GEMM (lo → gate)
+        gemm(pu, pl, pg, lr, hc_dim, pu_bf16)?;
+        // 5. mixed (xn, gate → mixed)
+        {
+            let (mut e_c, mut hc_c) = (e as i32, hc as i32);
+            let mut inv_c = inv_hc;
+            let grid = ((e.div_ceil(256)) as u32, nt as u32, 1);
+            let mut args = [
+                &mut px as *mut _ as *mut c_void,
+                &mut pg as *mut _ as *mut c_void,
+                &mut pm as *mut _ as *mut c_void,
+                &mut e_c as *mut _ as *mut c_void,
+                &mut hc_c as *mut _ as *mut c_void,
+                &mut inv_c as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                ctx.launch_async(k.mixed, grid, (256, 1, 1), 0, &mut args)
+                    .map_err(|e| format!("mixed launch: {e:#}"))?;
+            }
+        }
+        // 6. inject GEMM (xn → inj) + 1/hc
+        gemm(pi, px, pj, hc_dim, hc, pi_bf16)?;
+        {
+            let mut n_c = (nt * hc) as i32;
+            let mut inv_c = inv_hc;
+            let mut args = [
+                &mut pj as *mut _ as *mut c_void,
+                &mut n_c as *mut _ as *mut c_void,
+                &mut inv_c as *mut _ as *mut c_void,
+            ];
+            let grid = ((nt * hc).div_ceil(256)) as u32;
+            unsafe {
+                ctx.launch_async(k.inj, (grid, 1, 1), (256, 1, 1), 0, &mut args)
+                    .map_err(|e| format!("inj launch: {e:#}"))?;
+            }
+        }
+        ctx.sync().map_err(|e| format!("sync: {e:#}"))?;
+        Ok(())
+    });
+    match r {
+        Ok(()) => true,
+        Err(e) => pf_fail(&e),
+    }
+}
+
+/// task 154: hc combine (`res[i] += bo * (2*sigmoid(inj))`) をデバイスで回す。
+///
+/// `bo` は `[nt][n_embd]` (attn / ffn の出力)。`inj` は直前の [`pf_mix`] が残した
+/// デバイス上の値をそのまま使う。
+pub fn pf_combine(bo: &[f32], nt: usize, hc: usize, e: usize) -> bool {
+    if PF_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if bo.len() != nt * e {
+        return pf_fail("combine の bo 長が違う");
+    }
+    let Some(k) = pf_kernels() else {
+        return false;
+    };
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        return pf_fail("cuCtxSetCurrent 失敗");
+    }
+    let r = PF_DEV.with(|cell| -> Result<(), String> {
+        let d = cell.borrow();
+        if nt > d.nt || hc != d.hc || e != d.e {
+            return Err(format!("combine の形が違う (nt={nt} hc={hc} e={e})"));
+        }
+        let (Some(res), Some(dbo), Some(inj)) =
+            (d.res.as_ref(), d.bo.as_ref(), d.inj.as_ref())
+        else {
+            return Err("作業域が無い".into());
+        };
+        dbo.copy_from(bo).map_err(|e| format!("bo H2D: {e:#}"))?;
+        let (mut pr, mut pb, mut pj) = (res.ptr(), dbo.ptr(), inj.ptr());
+        let (mut e_c, mut hc_c) = (e as i32, hc as i32);
+        let grid = ((e.div_ceil(256)) as u32, (nt * hc) as u32, 1);
+        let mut args = [
+            &mut pr as *mut _ as *mut c_void,
+            &mut pb as *mut _ as *mut c_void,
+            &mut pj as *mut _ as *mut c_void,
+            &mut e_c as *mut _ as *mut c_void,
+            &mut hc_c as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            ctx.launch_async(k.combine, grid, (256, 1, 1), 0, &mut args)
+                .map_err(|e| format!("combine launch: {e:#}"))?;
+        }
+        ctx.sync().map_err(|e| format!("sync: {e:#}"))?;
+        Ok(())
+    });
+    match r {
+        Ok(()) => true,
+        Err(e) => pf_fail(&e),
+    }
+}
+
+/// task 154: 連鎖の作業域を解放する (VRAM を返す。prefill の終端で呼ぶ)。
+pub fn pf_release() {
+    PF_DEV.with(|cell| {
+        let mut d = cell.borrow_mut();
+        *d = PfDev::new();
+    });
+}
+
+/// task 154: 連鎖が 1 度でも失敗したか (テスト・診断用)。
+pub fn pf_broken() -> bool {
+    PF_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// task 154: テスト用にラッチを戻す。
+#[cfg(test)]
+pub fn pf_reset_for_test() {
+    PF_BROKEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    pf_release();
+}
+
 /// task 152: BF16 のまま読む mix カーネルの既定値 (**on**)。
 ///
 /// lab t152b の g22 条件で採否 OK (`REPORT_P152.md`)。`w:mix_f32` 2,425 MiB ->
