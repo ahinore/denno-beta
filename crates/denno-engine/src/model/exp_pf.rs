@@ -37,6 +37,7 @@
 //! (`moe_experts_flat`) をそのまま回す (fail closed)。
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::kquant::GgmlType;
 
@@ -370,9 +371,17 @@ pub fn stats_line() -> Option<String> {
     } else {
         0.0
     };
+    // 診断 (`DENNO_EXPERT_GPU_CHECK=1`) を回したときだけ、末尾に併記する。
+    let chk = match take_check() {
+        Some(c) => format!(
+            " check_rows={} check_argmax={} check_max_abs={:.3e} check_max_rel={:.3e}",
+            c.rows, c.argmax, c.max_abs, c.max_rel
+        ),
+        None => String::new(),
+    };
     Some(format!(
         "[exp-pf] lookups={lk} hit_rate={hr:.3} gpu_layers={layers} skip_layers={} experts={} \
-         rows={} gpu_ms={:.1} kern_ms={:.1} d2h_ms={:.1} add_ms={:.1} uploads={} up_ms={:.1} {vram}",
+         rows={} gpu_ms={:.1} kern_ms={:.1} d2h_ms={:.1} add_ms={:.1} uploads={} up_ms={:.1} {vram}{chk}",
         SKIP_LAYERS.load(Ordering::Relaxed),
         EXPERTS.load(Ordering::Relaxed),
         ROWS.load(Ordering::Relaxed),
@@ -403,6 +412,82 @@ pub fn stats_reset() {
     ] {
         c.store(0, Ordering::Relaxed);
     }
+    CHECK_LAYERS.store(0, Ordering::Relaxed);
+    if let Ok(mut g) = CHECK.lock() {
+        *g = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 診断: prefill の GPU 行と CPU 行の突き合わせ (`DENNO_EXPERT_GPU_CHECK=1`)
+// ---------------------------------------------------------------------------
+
+/// `DENNO_EXPERT_PF_CHECK_LAYERS`: 1 リクエストで突き合わせる層数 (既定 3)。
+pub const PF_CHECK_LAYERS_ENV: &str = "DENNO_EXPERT_PF_CHECK_LAYERS";
+
+/// `DENNO_EXPERT_PF_CHECK_ROWS`: 1 層で突き合わせる行数 (先頭から、既定 8)。
+pub const PF_CHECK_ROWS_ENV: &str = "DENNO_EXPERT_PF_CHECK_ROWS";
+
+/// [`PF_CHECK_LAYERS_ENV`] の既定値。
+pub const DEFAULT_CHECK_LAYERS: usize = 3;
+
+/// [`PF_CHECK_ROWS_ENV`] の既定値。
+pub const DEFAULT_CHECK_ROWS: usize = 8;
+
+/// 突き合わせの結果 (1 リクエストぶん)。`max_abs` は全要素の最大絶対差、
+/// `max_rel` は `|gpu-cpu| / max(|cpu|, 1e-6)` の最大、`argmax` は行ごとの
+/// argmax が一致した数。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PfCheck {
+    pub layers: u64,
+    pub rows: u64,
+    pub argmax: u64,
+    pub max_abs: f32,
+    pub max_rel: f32,
+}
+
+static CHECK: Mutex<Option<PfCheck>> = Mutex::new(None);
+static CHECK_LAYERS: AtomicU64 = AtomicU64::new(0);
+
+/// 突き合わせる層数 (`DENNO_EXPERT_PF_CHECK_LAYERS`、既定 3)。
+pub fn check_layers() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| env_usize(PF_CHECK_LAYERS_ENV, DEFAULT_CHECK_LAYERS))
+}
+
+/// 1 層で突き合わせる行数 (segment あたり、既定 4)。
+pub fn check_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| env_usize(PF_CHECK_ROWS_ENV, DEFAULT_CHECK_ROWS))
+}
+
+/// この層を突き合わせるか (1 リクエストで先頭 [`check_layers`] 層だけ)。
+pub fn claim_check_layer() -> bool {
+    let n = check_layers();
+    CHECK_LAYERS.fetch_add(1, Ordering::Relaxed) < n as u64
+}
+
+/// 1 層ぶんの結果を併合する。
+pub fn note_check(c: PfCheck) {
+    let mut g = match CHECK.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let a = g.get_or_insert_with(PfCheck::default);
+    a.layers += c.layers;
+    a.rows += c.rows;
+    a.argmax += c.argmax;
+    if c.max_abs > a.max_abs {
+        a.max_abs = c.max_abs;
+    }
+    if c.max_rel > a.max_rel {
+        a.max_rel = c.max_rel;
+    }
+}
+
+/// 溜めた結果を取り出す (リクエスト終端の 1 行で使う)。
+pub fn take_check() -> Option<PfCheck> {
+    CHECK.lock().ok()?.take()
 }
 
 /// 1 チャンクぶんの上げ直し予算 (本数)。層 0 で戻す。
@@ -584,6 +669,36 @@ mod tests {
             assert_eq!(count(name), Some(9), "{name} の引数の数が .cu と違う");
         }
         assert_eq!(count(SILU_KERNEL), Some(4), "{SILU_KERNEL} の引数の数");
+        // accum は task 151 でホスト側の足し込みに戻したので**現状未使用**。
+        // PTX には残っていて、ABI (引数の数) だけを固定する。
         assert_eq!(count(ACCUM_KERNEL), Some(7), "{ACCUM_KERNEL} の引数の数");
+    }
+
+    /// task 151: 診断の併合と取り出し (`DENNO_EXPERT_GPU_CHECK=1` の prefill 版)。
+    /// env を触らない部分だけ固定する。
+    #[test]
+    fn check_accumulates_and_takes() {
+        let _ = take_check();
+        note_check(PfCheck {
+            layers: 1,
+            rows: 8,
+            argmax: 8,
+            max_abs: 1.0e-6,
+            max_rel: 2.0e-6,
+        });
+        note_check(PfCheck {
+            layers: 1,
+            rows: 4,
+            argmax: 3,
+            max_abs: 5.0e-6,
+            max_rel: 1.0e-6,
+        });
+        let c = take_check().expect("溜まっている");
+        assert_eq!(c.layers, 2);
+        assert_eq!(c.rows, 12);
+        assert_eq!(c.argmax, 11);
+        assert_eq!(c.max_abs, 5.0e-6);
+        assert_eq!(c.max_rel, 2.0e-6);
+        assert!(take_check().is_none(), "取り出したら空になる");
     }
 }

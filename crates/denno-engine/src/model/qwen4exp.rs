@@ -9360,6 +9360,11 @@ fn moe_scratch_put(s: MoeScratch) {
 /// して 1 回だけ並列化する」形で計算し、`out` に重み付きで足し込む (呼び出し側で
 /// ゼロ初期化済み)。
 ///
+/// task 151: `capture` が `Some` のときは **`out` を触らず**、expert ごとの
+/// 出力行 `h` をその Vec へ返す (`tot × e`)。prefill の GPU 経路が
+/// 「ヒット (GPU) とミス (CPU) を expert index 昇順で 1 本ずつ足す」ために使う。
+/// 受け渡しは swap なので、層ごとの再確保は起きない。
+///
 /// 従来の [`moe_experts_legacy`] は expert 1 体につき gate / up / down で 3 回
 /// rayon の fork-join をしていた (86 expert × 3 × 48 層 = 12,384 回/chunk)。
 /// ここでは 1 層あたり「gate+up+silu 積」の 1 パスと「down」の 1 パスの計 2 回に減らす。
@@ -9390,6 +9395,7 @@ fn moe_experts_flat(
     rows: usize,
     out: &mut [f32],
     vnni: bool,
+    capture: Option<&mut Vec<f32>>,
 ) -> Result<()> {
     #[cfg(test)]
     MOE_FLAT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -9444,6 +9450,13 @@ fn moe_experts_flat(
         mut qsc,
         mut qgs,
     } = sc;
+    // task 151: `capture` があれば、呼び出し側のバッファを h として使う
+    // (結果は swap で返す)。長さは resize 済みなので両方 `tot * e`。
+    let mut cap = capture;
+    if let Some(v) = cap.as_deref_mut() {
+        v.resize(tot * e, 0.0);
+        std::mem::swap(&mut h, v);
+    }
 
     // 3. gather: expert ごとにトークンを詰め直す (legacy と同じ順序 = トークン昇順)。
     //    task 104: m の大きい expert は token チャンクに割って複数タスクにする
@@ -9718,7 +9731,8 @@ fn moe_experts_flat(
 
     // 8. 重み付きの足し込み。トークンごとに書く先が違う (`out[t*e..]`) ので
     //    トークン単位で並列化する。1 トークンの中は expert 昇順の逐次 = legacy と同順。
-    {
+    //    `capture` のときは足さない (呼び出し側がヒットと混ぜて 1 回だけ足す)。
+    if cap.is_none() {
         let nt = out.len() / e.max(1);
         // (pos, expert 内の添字, 重みの添字)。pos 昇順に積むので index 昇順が保たれる。
         let mut by_token: Vec<Vec<(u16, usize, u16)>> = vec![Vec::new(); nt];
@@ -9748,6 +9762,10 @@ fn moe_experts_flat(
         parts.into_iter().enumerate().for_each(scatter_one);
     }
     lap!("scatter");
+    if let Some(v) = cap.as_deref_mut() {
+        // 結果を呼び出し側へ、flat のバッファを scratch へ戻す。
+        std::mem::swap(&mut h, v);
+    }
     moe_scratch_put(MoeScratch {
         xin,
         act,
@@ -9825,7 +9843,7 @@ fn moe_experts_legacy(
     Ok(())
 }
 
-/// task 148: prefill の選択 expert を **m 行カーネル**で GPU に回す。
+/// task 148/151: prefill の選択 expert を **m 行カーネル**で GPU に回す。
 ///
 /// ヒット (VRAM 常駐) の expert だけを `kernels_exp_iq_pf` で回し、ミスは
 /// [`moe_experts_flat`] で CPU に回す。戻り値:
@@ -9833,13 +9851,16 @@ fn moe_experts_legacy(
 /// - `Ok(Some(hits))` — `out` に全 expert の寄与が入っている (GPU + CPU ミス)
 /// - `Ok(None)` — GPU を使わなかった。**`out` は触っていない** (呼び出し側が
 ///   従来の CPU 経路を回す)
-/// - `Err` — CPU ミスの計算そのものが失敗した (`out` は途中まで書かれている)
+/// - `Err` — CPU ミスの計算そのものが失敗した
 ///
-/// 足し込みの順序: トークンごとに **expert index 昇順** (ミスの flat が先に
-/// 全部書き、そのあとヒットを index 昇順で足す)。1 トークンの中は index 昇順の
-/// ままなので、CPU 版と違うのは「ミス全部 → ヒット全部」の 2 段になった点と、
-/// カーネル内の 32 レーン分割 (decode と同じ) だけ。task 148 は丸め順の変更を
-/// 許すので、この差は REPORT に書く。
+/// 足し込みの順序 (task 151 で修正): トークンごとに **expert index 昇順で 1 本
+/// ずつ** `out[t*e+d] += w * h[d]` する ([`exp_pf_add_all`])。ミスもヒットも同じ
+/// 列に並べて足すので、**和の順序が VRAM のヒット率に依存しない**。
+///
+/// 以前 (t148b/t148c) は「ミス全部を flat が `out` へ → GPU の加重和 1 回を
+/// `out` へ」だった。丸めの入り方がヒット/ミスの内訳で変わるため、同じ入力でも
+/// VRAM の中身が違えば最終ビットが変わり、greedy の 1 トークンが入れ替わった
+/// (`a1=0f63edea` / `a2=f0a01ec1`)。この形なら CPU だけの経路とビット一致する。
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn moe_experts_iq_pf_batch(
@@ -9926,21 +9947,6 @@ fn moe_experts_iq_pf_batch(
         ptr_table(ExpertMatrix::Up),
         ptr_table(ExpertMatrix::Down),
     );
-    // 加重和の表: 対 (t*k + j) → h の行。ミスした対は重み 0 にする
-    // (GPU は j 昇順に全部足すので、0 を足しても値は変わらない)。
-    let mut prow = vec![0u32; nt * k];
-    let mut wdev = vec![0.0f32; nt * k];
-    for (s, &ei) in plan.experts.iter().enumerate() {
-        let off = plan.seg[s * 4 + 1] as usize;
-        for (idx, &(t, j)) in by_expert[ei].iter().enumerate() {
-            prow[t * k + j] = (off + idx) as u32;
-            wdev[t * k + j] = weights[t * k + j];
-        }
-    }
-    // 加重和の出力 (nt × e) は層をまたいで使い回す (毎層 5 MB を確保すると
-    // ページフォルトだけで数 ms かかる)。
-    let mut od = PF_OD.with(|c| std::mem::take(&mut *c.borrow_mut()));
-    od.resize(nt * e, 0.0f32);
     // ミスは CPU の flat 経路で計算する。cuda 側は GPU を**起動した直後**に
     // これを呼ぶので、カーネルが走っている間に CPU が進む
     // (層あたり GPU ~6 ms / CPU ~57 ms)。
@@ -9952,9 +9958,46 @@ fn moe_experts_iq_pf_batch(
             miss_be.push(picks.clone());
         }
     }
+    // 足し込みの表: トークンごとに (重みの添字, 行番号, ヒットか) を
+    // **expert index 昇順**で並べる (flat の scatter と同じ順序)。
+    // 行番号はヒットなら GPU の h、ミスなら flat が返す h の添字。
+    let mut hoff = vec![usize::MAX; by_expert.len()];
+    for (s, &ei) in plan.experts.iter().enumerate() {
+        hoff[ei] = plan.seg[s * 4 + 1] as usize;
+    }
+    let mut moff = vec![usize::MAX; by_expert.len()];
+    {
+        let mut off = 0usize;
+        for (ei, picks) in miss_be.iter().enumerate() {
+            if picks.is_empty() {
+                continue;
+            }
+            moff[ei] = off;
+            off += picks.len();
+        }
+    }
+    let mut order: Vec<Vec<(u32, u32, bool)>> = vec![Vec::new(); nt];
+    for (ei, picks) in by_expert.iter().enumerate() {
+        let (ho, mo) = (hoff[ei], moff[ei]);
+        for (idx, &(t, j)) in picks.iter().enumerate() {
+            let wi = (t * k + j) as u32;
+            if ho != usize::MAX {
+                order[t].push((wi, (ho + idx) as u32, true));
+            } else {
+                order[t].push((wi, (mo + idx) as u32, false));
+            }
+        }
+    }
+    // GPU の行 (total_rows × e) と flat が返すミス行。どちらも層をまたいで
+    // バッファを使い回す (毎層 30 MB を確保するとページフォルトだけで数 ms)。
+    let mut hit_h = PF_H.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    hit_h.resize(plan.total_rows * e, 0.0);
+    let mut miss_h = PF_MH.with(|c| std::mem::take(&mut *c.borrow_mut()));
     let t_gpu = std::time::Instant::now();
     let ran = {
         let mut cpu_miss = || -> anyhow::Result<()> {
+            // capture 付き: `out` は触らず、h を `miss_h` に返す
+            // (足し込みは GPU の行と一緒にこの層の後半で 1 回だけ行う)。
             moe_experts_flat(
                 lw,
                 &miss_be,
@@ -9966,6 +10009,7 @@ fn moe_experts_iq_pf_batch(
                 MOE_FLAT_ROWS,
                 out,
                 moe_expert::vnni_enabled(),
+                Some(&mut miss_h),
             )
             .map_err(|e| anyhow::anyhow!("{e:?}"))
         };
@@ -9978,32 +10022,39 @@ fn moe_experts_iq_pf_batch(
             &pd,
             &plan.seg,
             &plan.rows,
-            &prow,
-            &wdev,
             xs,
             e,
             ff,
             e,
-            nt,
-            &mut od,
+            &mut hit_h,
             &mut cpu_miss,
         ) {
             Ok(v) => v,
             Err(err) => {
-                // cuda 側は「CPU ミスの計算そのものが落ちた」ときだけ Err を返す
-                // (`out` は途中まで書かれている)。隠さずに層を落とす。
+                // cuda 側は「CPU ミスの計算そのものが落ちた」ときだけ Err を返す。
+                // 隠さずに層を落とす。
+                PF_H.with(|c| *c.borrow_mut() = std::mem::take(&mut hit_h));
+                PF_MH.with(|c| *c.borrow_mut() = std::mem::take(&mut miss_h));
                 return Err(one(format!("層 {}: IQ prefill: {err:#}", lw.il)));
             }
         }
     };
-    PF_OD.with(|c| *c.borrow_mut() = std::mem::take(&mut od));
     if !ran {
+        // GPU を起動しなかった = `out` は 1 要素も書かれていない (fail closed)。
+        PF_H.with(|c| *c.borrow_mut() = std::mem::take(&mut hit_h));
+        PF_MH.with(|c| *c.borrow_mut() = std::mem::take(&mut miss_h));
         return Ok(None);
     }
     let gpu_ns = t_gpu.elapsed().as_nanos() as u64;
     crate::model::exp_pf::note_layer(plan.total_rows as u32, hits, gpu_ns);
     if std::env::var_os("DENNO_EXP_PF_DBG").is_some() {
         // 層ごとの内訳 (lab で「1 チャンク 1 層あたり何 ms か」を直接読むため)。
+        let miss_rows = by_expert
+            .iter()
+            .filter(|p| !p.is_empty())
+            .map(|p| p.len())
+            .sum::<usize>()
+            - plan.total_rows;
         eprintln!(
             "[exp-pf-dbg] layer={} nt={} nseg={} rows={} hits={} gpu_ms={:.3} \
              d2h_MB={:.2} miss_rows={}",
@@ -10013,31 +10064,161 @@ fn moe_experts_iq_pf_batch(
             plan.total_rows,
             hits,
             gpu_ns as f64 / 1e6,
-            (nt * e * 4) as f64 / 1e6,
-            by_expert
-                .iter()
-                .filter(|p| !p.is_empty())
-                .map(|p| p.len())
-                .sum::<usize>()
-                - plan.total_rows,
+            (plan.total_rows * e * 4) as f64 / 1e6,
+            miss_rows,
         );
     }
 
-    // 2. ヒットの寄与 (GPU がトークンごとに j 昇順で足したもの) を加える。
+    // 2. ヒット (GPU) とミス (CPU) を **expert index 昇順で 1 本ずつ**足す。
+    //    この順序は flat の scatter と同じなので、CPU だけの経路とビット一致する。
     let t_add = std::time::Instant::now();
-    for (o, d) in out.iter_mut().zip(od.iter()) {
-        *o += *d;
-    }
+    exp_pf_add_all(out, &order, &hit_h, &miss_h, weights, e);
     crate::model::exp_pf::note_add_ns(t_add.elapsed().as_nanos() as u64);
 
-    // 3. ミスを次のチャンクのために上げる (空きがある間だけ・上限つき)。
+    // 3. 診断 (`DENNO_EXPERT_GPU_CHECK=1`): GPU の行を CPU で引き直して比べる。
+    if crate::model::expert_vram::check_enabled() && crate::model::exp_pf::claim_check_layer() {
+        let c = iq_pf_check_layer(lw, &plan, xs, e, ff, &hit_h);
+        if c.rows > 0 {
+            eprintln!(
+                "[exp-pf-check] layer={} rows={} max_abs={:.3e} max_rel={:.3e} argmax={}/{}",
+                lw.il, c.rows, c.max_abs, c.max_rel, c.argmax, c.rows
+            );
+        }
+        crate::model::exp_pf::note_check(c);
+    }
+
+    // 4. ミスを次のチャンクのために上げる (空きがある間だけ・上限つき)。
     iq_pf_warm_misses(lw, by_expert, &pick, e, ff, p.n_layer);
+    PF_H.with(|c| *c.borrow_mut() = std::mem::take(&mut hit_h));
+    PF_MH.with(|c| *c.borrow_mut() = std::mem::take(&mut miss_h));
     Ok(Some(hits))
 }
 
+/// task 151: ヒット (GPU) とミス (CPU) の行を、**トークンごとに expert index
+/// 昇順で 1 本ずつ** `out` へ足す。
+///
+/// `order[t]` は (重みの添字, h の行番号, ヒットか) を expert index 昇順で並べた
+/// もの。`out` はゼロ初期化済みで、トークンは独立なので並列化しても値は変わらない。
+///
+/// これが「丸めが VRAM のヒット率に依存しない」ための中心で、ミスとヒットを
+/// 別々に足す (以前の形) と和の順序が内訳で変わってしまう。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn exp_pf_add_all(
+    out: &mut [f32],
+    order: &[Vec<(u32, u32, bool)>],
+    hit_h: &[f32],
+    miss_h: &[f32],
+    weights: &[f32],
+    e: usize,
+) {
+    let add_one = |(t, o): (usize, &mut [f32])| {
+        for &(wi, row, hit) in &order[t] {
+            let pe = weights[wi as usize];
+            let src = if hit { hit_h } else { miss_h };
+            let hh = &src[row as usize * e..(row as usize + 1) * e];
+            for d in 0..e {
+                o[d] += pe * hh[d];
+            }
+        }
+    };
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        out.par_chunks_mut(e.max(1)).enumerate().for_each(add_one);
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        out.chunks_mut(e.max(1)).enumerate().for_each(add_one);
+    }
+}
+
 thread_local! {
-    /// 加重和の出力 (nt × e)。層ごとに作り直さない (ページフォルトを避ける)。
-    static PF_OD: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// GPU の行 (total_rows × e)。層ごとに作り直さない (ページフォルトを避ける)。
+    static PF_H: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// CPU ミスの行 (ミスした行数 × e)。flat が capture で埋める。
+    static PF_MH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// task 151: prefill の GPU 行を CPU で引き直して比べる
+/// (`DENNO_EXPERT_GPU_CHECK=1`。診断専用・既定 off)。
+///
+/// 1 層あたり先頭から [`crate::model::exp_pf::check_rows`] 行だけ、decode と
+/// 同じ 1 行ずつの経路 (`gemv` + [`silu_mul`]) で計算し、GPU の行と比べる。
+/// 丸めの差 (max_abs が 1e-3 相対くらいまで) は正常、それより大きい差はバグ。
+#[cfg(feature = "cuda")]
+fn iq_pf_check_layer(
+    lw: &LayerW,
+    plan: &crate::model::exp_pf::PfPlan,
+    xs: &[f32],
+    e: usize,
+    ff: usize,
+    hit_h: &[f32],
+) -> crate::model::exp_pf::PfCheck {
+    let mut left = crate::model::exp_pf::check_rows();
+    let (mut g, mut u) = (vec![0.0f32; ff], vec![0.0f32; ff]);
+    let mut act = vec![0.0f32; ff];
+    let mut hc = vec![0.0f32; e];
+    let mut acc = crate::model::exp_pf::PfCheck {
+        layers: 1,
+        ..Default::default()
+    };
+    for (s, &ei) in plan.experts.iter().enumerate() {
+        if left == 0 {
+            break;
+        }
+        let m = plan.seg[s * 4] as usize;
+        let ro = plan.seg[s * 4 + 1] as usize;
+        for idx in 0..m.min(left) {
+            left -= 1;
+            let t = plan.rows[ro + idx] as usize;
+            let x = &xs[t * e..(t + 1) * e];
+            if lw.gate_exps.gemv(ei, x, &mut g).is_err() || lw.up_exps.gemv(ei, x, &mut u).is_err()
+            {
+                continue;
+            }
+            for r in 0..ff {
+                act[r] = silu_mul(g[r], u[r]);
+            }
+            if lw.down_exps.gemv(ei, &act, &mut hc).is_err() {
+                continue;
+            }
+            let gpu_row = &hit_h[(ro + idx) * e..(ro + idx + 1) * e];
+            let (mut ma, mut mr) = (0.0f32, 0.0f32);
+            for i in 0..e {
+                let d = (gpu_row[i] - hc[i]).abs();
+                if d > ma {
+                    ma = d;
+                }
+                let rel = d / hc[i].abs().max(1e-6);
+                if rel > mr {
+                    mr = rel;
+                }
+            }
+            if argmax_of(gpu_row) == argmax_of(&hc) {
+                acc.argmax += 1;
+            }
+            acc.rows += 1;
+            if ma > acc.max_abs {
+                acc.max_abs = ma;
+            }
+            if mr > acc.max_rel {
+                acc.max_rel = mr;
+            }
+        }
+    }
+    acc
+}
+
+/// 最初の最大値の添字 (NaN は無視 = 比較で負ける)。
+#[cfg(feature = "cuda")]
+fn argmax_of(v: &[f32]) -> usize {
+    let mut best = 0usize;
+    for (i, &x) in v.iter().enumerate() {
+        if x > v[best] {
+            best = i;
+        }
+    }
+    best
 }
 
 /// task 148: prefill のミス expert を **チャンク予算つき**で VRAM へ上げる。
@@ -10450,6 +10631,7 @@ fn moe_ffn_quant_batch_full(
                 MOE_FLAT_ROWS,
                 &mut out,
                 vnni,
+                None,
             )?;
         } else {
             moe_experts_legacy(lw, &by_expert, &weights, k, xs, e, ff, &mut out)?;
@@ -12763,6 +12945,140 @@ mod tests {
         // 4. ビット一致
         assert_bitwise_eq(&seq, &par, "par=0 vs par=1");
         set_expert_flat_decode_for_test(None);
+    }
+
+    /// task 151: prefill の GPU 経路は「ヒット (GPU) とミス (CPU) の行を
+    /// **expert index 昇順で 1 本ずつ**足す」ので、ヒット率が変わっても出力は
+    /// CPU だけの経路とビット一致する。
+    ///
+    /// GPU の無いここでは、ヒット側も同じ flat で計算して行を作る
+    /// (`exp_pf_add_all` の足し込み順・行表が flat の scatter と同じことを見る)。
+    #[test]
+    fn exp_pf_add_all_is_bit_identical_for_any_split() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("pf_add");
+        let (ne, k) = (8usize, 3usize);
+        let (e, ff) = (512usize, 640usize);
+        let path = write_expert_gguf_n(&dir, "pf_add.gguf", e, ff, ne, 1);
+        let f = GgufFile::open(&path).expect("open");
+        let p = params_dims(e, ff, ne, k);
+        let lw = layer_at(&f, &p, 0);
+        let nt = 6usize;
+        let xs = cache_test_x_seed(nt * e, 11);
+        // トークンごとの選択 (expert index 昇順 = 重みの添字 j の順)。
+        let mut weights = vec![0.0f32; nt * k];
+        let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
+        for t in 0..nt {
+            let mut sel: Vec<usize> = (0..k).map(|j| (t * 2 + j) % ne).collect();
+            sel.sort_unstable();
+            for (j, &ei) in sel.iter().enumerate() {
+                weights[t * k + j] = 0.3 - 0.01 * j as f32;
+                by_expert[ei].push((t, j));
+            }
+        }
+        // 参照: CPU だけの経路 (flat が h を out へ足す)。
+        let mut out_ref = vec![0.0f32; nt * e];
+        moe_experts_flat(
+            &lw,
+            &by_expert,
+            &weights,
+            k,
+            &xs,
+            e,
+            ff,
+            MOE_FLAT_ROWS,
+            &mut out_ref,
+            false,
+            None,
+        )
+        .expect("参照 flat");
+        assert!(
+            out_ref.iter().any(|v| *v != 0.0),
+            "参照が全 0 (経路の生死が分からない)"
+        );
+        // ヒットの内訳を変えて 3 通り (全部ミス / 半分 / 全部ヒット)。
+        for cut in [0usize, 3, ne] {
+            let pick: Vec<bool> = (0..ne).map(|ei| ei < cut).collect();
+            let mut miss_be: Vec<Vec<(usize, usize)>> = Vec::with_capacity(ne);
+            let mut hit_be: Vec<Vec<(usize, usize)>> = Vec::with_capacity(ne);
+            for (ei, picks) in by_expert.iter().enumerate() {
+                let hit = pick[ei];
+                miss_be.push(if hit { Vec::new() } else { picks.clone() });
+                hit_be.push(if hit { picks.clone() } else { Vec::new() });
+            }
+            let mut scratch = vec![0.0f32; nt * e];
+            let mut miss_h: Vec<f32> = Vec::new();
+            moe_experts_flat(
+                &lw,
+                &miss_be,
+                &weights,
+                k,
+                &xs,
+                e,
+                ff,
+                MOE_FLAT_ROWS,
+                &mut scratch,
+                false,
+                Some(&mut miss_h),
+            )
+            .expect("ミス flat");
+            assert!(
+                scratch.iter().all(|v| *v == 0.0),
+                "capture が out を触った (cut={cut})"
+            );
+            let mut hit_h: Vec<f32> = Vec::new();
+            moe_experts_flat(
+                &lw,
+                &hit_be,
+                &weights,
+                k,
+                &xs,
+                e,
+                ff,
+                MOE_FLAT_ROWS,
+                &mut scratch,
+                false,
+                Some(&mut hit_h),
+            )
+            .expect("ヒット flat");
+            // 行表と足し込み順 (`moe_experts_iq_pf_batch` と同じ規則)。
+            let plan = crate::model::exp_pf::build_plan(&by_expert, &pick);
+            let mut hoff = vec![usize::MAX; ne];
+            for (s, &ei) in plan.experts.iter().enumerate() {
+                hoff[ei] = plan.seg[s * 4 + 1] as usize;
+            }
+            let mut moff = vec![usize::MAX; ne];
+            let mut off = 0usize;
+            for (ei, picks) in miss_be.iter().enumerate() {
+                if picks.is_empty() {
+                    continue;
+                }
+                moff[ei] = off;
+                off += picks.len();
+            }
+            assert_eq!(off * e, miss_h.len(), "ミスの行数と h の長さが違う");
+            assert_eq!(
+                plan.total_rows * e,
+                hit_h.len(),
+                "ヒットの行数と h の長さが違う"
+            );
+            let mut order: Vec<Vec<(u32, u32, bool)>> = vec![Vec::new(); nt];
+            for (ei, picks) in by_expert.iter().enumerate() {
+                let (ho, mo) = (hoff[ei], moff[ei]);
+                for (idx, &(t, j)) in picks.iter().enumerate() {
+                    let wi = (t * k + j) as u32;
+                    if ho != usize::MAX {
+                        order[t].push((wi, (ho + idx) as u32, true));
+                    } else {
+                        assert_ne!(mo, usize::MAX, "ミスの行先が無い (expert {ei})");
+                        order[t].push((wi, (mo + idx) as u32, false));
+                    }
+                }
+            }
+            let mut out: Vec<f32> = vec![0.0f32; nt * e];
+            exp_pf_add_all(&mut out, &order, &hit_h, &miss_h, &weights, e);
+            assert_bitwise_eq(&out_ref, &out, &format!("hit cut={cut}"));
+        }
     }
 
     /// P64: `DENNO_EXPERT_LOOP` の値解釈。**既定は off**。
@@ -16820,6 +17136,7 @@ mod tests {
                 let mut out = vec![0.0f32; nt * n_in];
                 moe_experts_flat(
                     &lw, &by_expert, &weights, k, &xs, n_in, n_ff, MOE_FLAT_ROWS, &mut out, vnni,
+                    None,
                 )
                 .expect("flat");
                 out
@@ -16958,6 +17275,7 @@ mod tests {
                 }
                 moe_experts_flat(
                     &lw, &by_expert, &weights, k, &xs, n_in, n_ff, MOE_FLAT_ROWS, out, true,
+                    None,
                 )
                 .expect("flat");
             }
@@ -16976,6 +17294,7 @@ mod tests {
                     let t0 = std::time::Instant::now();
                     moe_experts_flat(
                         &lw, &by_expert, &weights, k, &xs, n_in, n_ff, MOE_FLAT_ROWS, out, true,
+                        None,
                     )
                     .expect("flat");
                     let us = t0.elapsed().as_secs_f64() * 1e6;
@@ -17179,6 +17498,7 @@ mod tests {
                         moe_experts_flat(
                             &lw, &by_expert, &weights, k, &xs, n_in, n_ff, widths[vi - 1], out,
                             false,
+                            None,
                         )
                         .expect("flat");
                     }
@@ -17206,6 +17526,7 @@ mod tests {
                             moe_experts_flat(
                                 &lw, &by_expert, &weights, k, &xs, n_in, n_ff, widths[vi - 1], out,
                                 false,
+                                None,
                             )
                             .expect("flat");
                         }

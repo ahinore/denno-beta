@@ -3905,8 +3905,6 @@ struct ExpPfKernels {
     fns: [CUfunction; crate::model::exp_pf::SLOTS],
     /// silu(g) * u
     silu: CUfunction,
-    /// ヒット行の加重和 (h → nt×e)
-    accum: CUfunction,
 }
 
 unsafe impl Send for ExpPfKernels {}
@@ -3980,23 +3978,7 @@ fn exp_pf_kernels() -> Option<&'static ExpPfKernels> {
                     return None;
                 }
             }
-            let mut accum: CUfunction = std::ptr::null_mut();
-            let mut cname = crate::model::exp_pf::ACCUM_KERNEL.as_bytes().to_vec();
-            cname.push(0);
-            unsafe {
-                if (lib.module_get_function)(&mut accum, module, cname.as_ptr() as *const c_char)
-                    != CUDA_SUCCESS
-                {
-                    eprintln!("[exp-pf] PTX に accum が無い → CPU 経路へ");
-                    return None;
-                }
-            }
-            Some(ExpPfKernels {
-                module,
-                fns,
-                silu,
-                accum,
-            })
+            Some(ExpPfKernels { module, fns, silu })
         })
         .as_ref()
 }
@@ -4028,9 +4010,6 @@ struct PfScratch {
     seg: Option<DevBuffer>,
     rows_gu: Option<DevBuffer>,
     rows_id: Option<DevBuffer>,
-    od: Option<DevBuffer>,
-    prow: Option<DevBuffer>,
-    wdev: Option<DevBuffer>,
 }
 
 impl PfScratch {
@@ -4047,9 +4026,6 @@ impl PfScratch {
             seg: None,
             rows_gu: None,
             rows_id: None,
-            od: None,
-            prow: None,
-            wdev: None,
         }
     }
 }
@@ -4062,8 +4038,15 @@ thread_local! {
 /// 1 層ぶんの expert FFN を m 行カーネルで回す。
 ///
 /// `seg` は 4 語 × nseg (m / rows の先頭 / 0 / 0)、`rows_gu` は行 → トークン番号
-/// (`exp_pf::build_plan`)、`out_h` は `total_rows * e` 要素。
-/// 呼び出し側は結果を expert index 昇順で足し込む。
+/// (`exp_pf::build_plan`)、`out_h` は `total_rows * e` 要素 (GPU の行を**そのまま**
+/// 返す)。
+/// 呼び出し側は「トークンごとに expert index 昇順で 1 本ずつ」足し込む
+/// ([`crate::model::qwen4exp`] の `exp_pf_add_all`)。
+///
+/// task 151: 以前は加重和を GPU (`dno_exp_pf_accum`) で閉じて `nt × e` だけ
+/// 返していたが、**和の順序がヒット/ミスの内訳に依存する**ため、同じ入力でも
+/// VRAM の中身が違うと出力が変わった (lab t148b/t148c の `a1 != a2`)。丸めを
+/// 一致させるには 1 本ずつ同じ順で足す必要があるので、行を返す形へ戻した。
 ///
 /// `Ok(false)` は「GPU でやらなかった」= 呼び出し側は CPU 経路へ (fail closed)。
 #[allow(clippy::too_many_arguments)]
@@ -4076,14 +4059,11 @@ pub fn moe_experts_iq_pf_layer(
     pd: &[u64],
     seg: &[u32],
     rows_gu: &[u32],
-    prow: &[u32],
-    wdev: &[f32],
     xs: &[f32],
     n_in: usize,
     ff: usize,
     e: usize,
-    nt: usize,
-    out_delta: &mut [f32],
+    out_h: &mut [f32],
     cpu_miss: &mut dyn FnMut() -> Result<()>,
 ) -> Result<bool> {
     if PF_DEAD.load(std::sync::atomic::Ordering::Relaxed) {
@@ -4091,17 +4071,14 @@ pub fn moe_experts_iq_pf_layer(
     }
     let nseg = pg.len();
     let total_rows = rows_gu.len();
-    let nh = nt * e;
+    let nh = total_rows * e;
     if nseg == 0
         || total_rows == 0
-        || nt == 0
         || pu.len() != nseg
         || pd.len() != nseg
         || seg.len() != nseg * 4
-        || prow.len() % nt != 0
-        || wdev.len() != prow.len()
         || xs.len() % n_in != 0
-        || out_delta.len() < nh
+        || out_h.len() < nh
     {
         return Ok(false);
     }
@@ -4132,7 +4109,7 @@ pub fn moe_experts_iq_pf_layer(
     };
     ctx.make_current()?;
 
-    // 行の総数 × 行列の幅。g / u / act は total_rows × ff、h / od は行と nt。
+    // 行の総数 × 行列の幅。g / u / act は total_rows × ff、h は total_rows × e。
     let ng = total_rows * ff;
     // CPU ミス (呼び出し側の flat) が落ちたか。落ちた場合は `out` が途中まで
     // 書かれているので **CPU 経路へ戻してはいけない** (Err で伝える)。
@@ -4144,16 +4121,13 @@ pub fn moe_experts_iq_pf_layer(
             MoeScratch::ensure(&mut sc.g, ng * 4)?;
             MoeScratch::ensure(&mut sc.u, ng * 4)?;
             MoeScratch::ensure(&mut sc.act, ng * 4)?;
-            MoeScratch::ensure(&mut sc.h, total_rows * e * 4)?;
-            MoeScratch::ensure(&mut sc.od, nh * 4)?;
+            MoeScratch::ensure(&mut sc.h, nh * 4)?;
             MoeScratch::ensure(&mut sc.pg, nseg * 8)?;
             MoeScratch::ensure(&mut sc.pu, nseg * 8)?;
             MoeScratch::ensure(&mut sc.pd, nseg * 8)?;
             MoeScratch::ensure(&mut sc.seg, nseg * 16)?;
             MoeScratch::ensure(&mut sc.rows_gu, total_rows * 4)?;
             MoeScratch::ensure(&mut sc.rows_id, total_rows * 4)?;
-            MoeScratch::ensure(&mut sc.prow, prow.len() * 4)?;
-            MoeScratch::ensure(&mut sc.wdev, wdev.len() * 4)?;
             {
                 let xb = sc.x.as_ref().expect("確保済み");
                 xb.copy_from(xs)?;
@@ -4164,14 +4138,11 @@ pub fn moe_experts_iq_pf_layer(
                 sc.rows_gu.as_ref().expect("確保済み").copy_from(rows_gu)?;
                 let id: Vec<u32> = exp_pf::identity_rows(total_rows);
                 sc.rows_id.as_ref().expect("確保済み").copy_from(&id)?;
-                sc.prow.as_ref().expect("確保済み").copy_from(prow)?;
-                sc.wdev.as_ref().expect("確保済み").copy_from(wdev)?;
                 dbg_htod(
                     xs.len() * 4
                         + nseg * 8 * 3
                         + nseg * 16
-                        + total_rows * 4 * 2
-                        + prow.len() * 8,
+                        + total_rows * 4 * 2,
                 );
             }
             let segb = sc.seg.as_ref().expect("確保済み");
@@ -4182,7 +4153,6 @@ pub fn moe_experts_iq_pf_layer(
             let u = sc.u.as_ref().expect("確保済み");
             let act = sc.act.as_ref().expect("確保済み");
             let h = sc.h.as_ref().expect("確保済み");
-            let od = sc.od.as_ref().expect("確保済み");
             let t_launch = std::time::Instant::now();
             unsafe {
                 // gate と up (同じ行表・同じ入力)。
@@ -4283,34 +4253,6 @@ pub fn moe_experts_iq_pf_layer(
                         &mut args,
                     )?;
                 }
-                // ヒット行の加重和 (h をホストへ戻さない): od = sum_j w * h[row_j]
-                let nt_l = nt;
-                {
-                    let kk = prow.len() / nt;
-                    let mut ph = h.ptr;
-                    let mut pprow = sc.prow.as_ref().expect("確保済み").ptr;
-                    let mut pw = sc.wdev.as_ref().expect("確保済み").ptr;
-                    let mut pod = od.ptr;
-                    let (mut pk, mut pe, mut pn) =
-                        (kk as c_int, e as c_int, nt_l as c_int);
-                    let mut args = [
-                        &mut ph as *mut _ as *mut c_void,
-                        &mut pprow as *mut _ as *mut c_void,
-                        &mut pw as *mut _ as *mut c_void,
-                        &mut pod as *mut _ as *mut c_void,
-                        &mut pk as *mut _ as *mut c_void,
-                        &mut pe as *mut _ as *mut c_void,
-                        &mut pn as *mut _ as *mut c_void,
-                    ];
-                    let threads = 256usize;
-                    ctx.launch_async(
-                        kernels.accum,
-                        (nt_l.max(1) as u32, 1, 1),
-                        (threads as u32, 1, 1),
-                        0,
-                        &mut args,
-                    )?;
-                }
             }
             exp_pf::note_kernel_ns(t_launch.elapsed().as_nanos() as u64);
             // GPU の計算が走っている間に CPU のミスを計算する (重ねる)。
@@ -4323,7 +4265,7 @@ pub fn moe_experts_iq_pf_layer(
             unsafe { ctx.sync()?; }
             exp_pf::note_kernel_ns(t_sync.elapsed().as_nanos() as u64);
             let t_d2h = std::time::Instant::now();
-            od.to_slice(&mut out_delta[..nh])?;
+            h.to_slice(&mut out_h[..nh])?;
             exp_pf::note_d2h_ns(t_d2h.elapsed().as_nanos() as u64);
             dbg_d2h(nh * 4);
             Ok(true)
