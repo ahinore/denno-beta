@@ -135,6 +135,13 @@ pub const STREAM_PIN_ENV: &str = "DENNO_PF_STREAM_PIN";
 /// 数値には触らない (デバイスへ渡るバイト列は同じ)。
 pub const STREAM_UT_ENV: &str = "DENNO_PF_STREAM_UT";
 
+/// `DENNO_PF_STREAM_WC`: pinned のバウンスを write-combined にするか (task 165)。
+///
+/// バウンスは CPU が書いて DMA が読むだけなので、write-combined にすると
+/// 書き込みの read-for-ownership が消える。既定 **0** (lab の A/B で決める)。
+/// 確保に失敗したら通常の pinned へ落ちる (数値は同じ)。
+pub const STREAM_WC_ENV: &str = "DENNO_PF_STREAM_WC";
+
 /// ストリーミング時の層ループのチャンク既定 (task 162 の lab t162c の最良)。
 ///
 /// `DENNO_PF_STREAM=1` のとき `DENNO_PREFILL_BATCH_CHUNK` 未設定ならこれを使う。
@@ -176,11 +183,16 @@ pub const DEFAULT_STREAM_GROUP: usize = 32;
 /// [`STREAM_PIN_ENV`] の既定値 (1 = pinned バウンス + 非同期)。
 pub const DEFAULT_STREAM_PIN: usize = 1;
 
-/// [`STREAM_UT_ENV`] の既定値 (true = 上げ専用スレッドへ出す)。
+/// [`STREAM_UT_ENV`] の既定値 (false = task 162 と同じ直列経路)。
 ///
-/// task 165: 写しと積み込みを計算スレッドから外すのが要点で、数値には触らない。
-/// `DENNO_PF_STREAM_UT=0` で task 162 と同じ直列経路に戻せる (A/B 用)。
-pub const DEFAULT_STREAM_UT: bool = true;
+/// task 165: **lab t165a で既定 off** (ut=1 は 14k cold 102.10 s、ut=0 は
+/// 99.97 s)。写しと DMA は同じメモリ帯域を食うので、スレッドを分けても
+/// 速くならず、DMA を 1 本しか積めないため enq が前の DMA の完了を待つ
+/// (t165a の enq_s=9.53)。A/B 用にゲートは残す。
+pub const DEFAULT_STREAM_UT: bool = false;
+
+/// [`STREAM_WC_ENV`] の既定値 (false = 通常の pinned)。
+pub const DEFAULT_STREAM_WC: bool = false;
 
 /// 1 回の起動で受ける行数 (`kernels_exp_iq_pf.cu` の `PF_MR`)。
 pub const ROWS_PER_LAUNCH: usize = 16;
@@ -325,6 +337,30 @@ pub fn stream_ut() -> bool {
         stream_ut_from_value(
             stream_enabled(),
             std::env::var(STREAM_UT_ENV).ok().as_deref(),
+        )
+    })
+}
+
+/// `DENNO_PF_STREAM_WC` の解釈 (純関数)。**明示的な真値だけ on**。
+///
+/// ストリーミング自体が無効なら常に偽。
+pub fn stream_wc_from_value(pf_on: bool, v: Option<&str>) -> bool {
+    if !pf_on {
+        return false;
+    }
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_STREAM_WC,
+        Some(s) => matches!(s, "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// バウンスを write-combined にするか (既定 false)。
+pub fn stream_wc() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        stream_wc_from_value(
+            stream_enabled(),
+            std::env::var(STREAM_WC_ENV).ok().as_deref(),
         )
     })
 }
@@ -785,7 +821,7 @@ pub fn stats_line() -> Option<String> {
             "\n[exp-pf-stream] layers={sl} groups={} experts={exps} rows={rows} \
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
              ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} \
-             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} ut={} group={} min_tok={}",
+             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} wc={} ut={} group={} min_tok={}",
             STREAM_GROUPS.load(Ordering::Relaxed),
             if exps > 0 {
                 rows as f64 / exps as f64
@@ -796,6 +832,7 @@ pub fn stats_line() -> Option<String> {
             STREAM_SPILL.load(Ordering::Relaxed),
             STREAM_CPU_MISS_NS.load(Ordering::Relaxed) as f64 / 1e6,
             stream_pin(),
+            u8::from(stream_wc()),
             u8::from(stream_ut()),
             stream_group(),
             stream_min_tok(),
@@ -1130,6 +1167,15 @@ mod tests {
         assert!(stream_ut_from_value(true, Some("1")));
         assert!(!stream_ut_from_value(true, Some("0")));
         assert!(!stream_ut_from_value(true, Some("off")));
+        // task 165: write-combined のバウンスは明示的な真値だけ on。
+        assert!(!stream_wc_from_value(false, Some("1")), "stream off なら動かない");
+        assert_eq!(stream_wc_from_value(true, None), DEFAULT_STREAM_WC);
+        assert_eq!(stream_wc_from_value(true, Some("")), DEFAULT_STREAM_WC);
+        assert!(stream_wc_from_value(true, Some("1")));
+        assert!(!stream_wc_from_value(true, Some("0")));
+        assert!(!stream_wc_from_value(true, Some(" ")), "空白だけは既定 (off)");
+        assert!(stream_wc_from_value(true, Some(" on ")), "前後の空白は無視する");
+        assert!(!stream_wc_from_value(true, Some("no")));
         assert_eq!(DEFAULT_PREFILL_CHUNK_STREAM, 1024, "lab t162c の最良");
         // 分け合った 1 枚 (cuda 側は 3 枚) が、既定のグループ (32 本) を
         // 載せられること。ここは 4 で割った保守側で見る。

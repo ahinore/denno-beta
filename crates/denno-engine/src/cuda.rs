@@ -5115,7 +5115,7 @@ fn pf_slot_prepare(
     if pinned {
         let cap = st.pin[s].as_ref().map(|p| p.bytes).unwrap_or(0);
         if cap < need {
-            st.pin[s] = Some(PinMem::alloc(need.max(1))?);
+            st.pin[s] = Some(PinMem::alloc_flags(need.max(1), exp_pf::stream_wc())?);
         }
         let mut cursor = 0usize;
         for (i, (_, b)) in items.iter().enumerate() {
@@ -6572,16 +6572,38 @@ unsafe impl Send for PinMem {}
 
 impl PinMem {
     fn alloc(bytes: usize) -> Result<Self> {
+        Self::alloc_flags(bytes, false)
+    }
+
+    /// task 165: `write_combined` は書き込み結合の pinned にする。
+    ///
+    /// ストリーミングのバウンスは **CPU が書いて DMA が読むだけ**なので、
+    /// write-combined にすると書き込みの read-for-ownership が消える
+    /// (キャッシュには載らない。CPU から読み直さないので問題ない)。
+    /// 確保に失敗したら通常の pinned へ落ちる (数値はどちらも同じ)。
+    fn alloc_flags(bytes: usize, write_combined: bool) -> Result<Self> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         // PORTABLE: どのコンテキストからでも有効 (保険)
         const CU_MEMHOSTALLOC_PORTABLE: u32 = 0x01;
+        const CU_MEMHOSTALLOC_WRITECOMBINED: u32 = 0x04;
+        let bytes = bytes.max(1);
+        let lib = lib()?;
+        if write_combined {
+            let flags = CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_WRITECOMBINED;
+            let ok = unsafe {
+                check((lib.mem_host_alloc)(&mut ptr, bytes, flags), "cuMemHostAlloc (wc)").is_ok()
+            };
+            if ok {
+                return Ok(Self { ptr, bytes });
+            }
+        }
         unsafe {
             check(
-                (lib()?.mem_host_alloc)(&mut ptr, bytes.max(1), CU_MEMHOSTALLOC_PORTABLE),
+                (lib.mem_host_alloc)(&mut ptr, bytes, CU_MEMHOSTALLOC_PORTABLE),
                 "cuMemHostAlloc",
             )?;
         }
-        Ok(Self { ptr, bytes: bytes.max(1) })
+        Ok(Self { ptr, bytes })
     }
 
     fn as_slice<T>(&self) -> &[T] {
