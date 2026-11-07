@@ -93,6 +93,39 @@ pub const EXPERT_IQ_PF_UPLOAD_MB_ENV: &str = "DENNO_EXPERT_IQ_PF_UPLOAD_MB";
 /// 載せるような真似をしない)。
 pub const EXPERT_IQ_PF_UPLOAD_ROWS_ENV: &str = "DENNO_EXPERT_IQ_PF_UPLOAD_ROWS";
 
+/// `DENNO_PF_STREAM=1`: prefill のミス expert を GPU のステージング領域へ
+/// 上げて m 行カーネルで回す (task 162、task 156 の移植)。
+///
+/// decode の VRAM 常駐 ([`crate::model::expert_vram`]) は **読むだけ** (peek)
+/// で、1 本も入れ替えない。ステージングは decode の在庫とは別の領域から取る。
+pub const STREAM_ENV: &str = "DENNO_PF_STREAM";
+
+/// `DENNO_PF_STREAM_MB`: ステージング領域の合計 (MiB、既定 512)。
+///
+/// 2 枚 (ダブルバッファ) に等分する。空き VRAM から取り、確保できなければ
+/// 小さいサイズへ落とし、それでも駄目ならこのリクエストではストリーミング
+/// しない (fail closed)。
+pub const STREAM_MB_ENV: &str = "DENNO_PF_STREAM_MB";
+
+/// `DENNO_PF_STREAM_MIN_TOK`: ストリーミングを始める最小トークン数 (既定 512)。
+///
+/// 19 トークンの next turn prefill と decode を変えないための床。
+pub const STREAM_MIN_TOK_ENV: &str = "DENNO_PF_STREAM_MIN_TOK";
+
+/// `DENNO_PF_STREAM_GROUP`: 1 回に上げる expert 数 (既定 32)。
+///
+/// 上げ (H2D) と m 行カーネルの計算を重ねる単位。小さいほど重なりは細かく
+/// なるが、発行とイベントの固定費が増える。
+pub const STREAM_GROUP_ENV: &str = "DENNO_PF_STREAM_GROUP";
+
+/// `DENNO_PF_STREAM_PIN`: 上げの経路 (既定 1)。
+///
+/// - `0` = pageable のまま同期コピー (task 156 と同じ。新リンク単体の効果を見る)
+/// - `1` = pinned のバウンスバッファ経由 + 別ストリームの非同期コピー (既定)
+///
+/// どちらもデバイスへ渡るバイト列は同じ (数値には触らない)。
+pub const STREAM_PIN_ENV: &str = "DENNO_PF_STREAM_PIN";
+
 /// [`EXPERT_IQ_PF_MIN_HITS_ENV`] の既定値。
 pub const DEFAULT_MIN_HITS: usize = 4;
 
@@ -101,6 +134,23 @@ pub const DEFAULT_UPLOAD_MB: usize = 0;
 
 /// [`EXPERT_IQ_PF_UPLOAD_ROWS_ENV`] の既定値。
 pub const DEFAULT_UPLOAD_ROWS: usize = 8;
+
+/// [`STREAM_ENV`] の既定値。
+///
+/// task 162: lab の採否で決める。**採用するなら true**。
+pub const DEFAULT_STREAM_ON: bool = false;
+
+/// [`STREAM_MB_ENV`] の既定値 (2 枚で 512 MiB)。
+pub const DEFAULT_STREAM_MB: usize = 512;
+
+/// [`STREAM_MIN_TOK_ENV`] の既定値 (これ未満は従来経路)。
+pub const DEFAULT_STREAM_MIN_TOK: usize = 512;
+
+/// [`STREAM_GROUP_ENV`] の既定値 (1 回に上げる expert 数)。
+pub const DEFAULT_STREAM_GROUP: usize = 32;
+
+/// [`STREAM_PIN_ENV`] の既定値 (1 = pinned バウンス + 非同期)。
+pub const DEFAULT_STREAM_PIN: usize = 1;
 
 /// 1 回の起動で受ける行数 (`kernels_exp_iq_pf.cu` の `PF_MR`)。
 pub const ROWS_PER_LAUNCH: usize = 16;
@@ -180,6 +230,49 @@ pub fn upload_mb() -> usize {
 pub fn upload_min_rows() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| env_usize(EXPERT_IQ_PF_UPLOAD_ROWS_ENV, DEFAULT_UPLOAD_ROWS))
+}
+
+/// `DENNO_PF_STREAM` の解釈 (純関数)。**`0` / `off` / `false` だけが偽**。
+///
+/// `pf_enabled()` (IQ ゲート + prefill ゲート) が偽なら常に偽。
+pub fn stream_from_value(pf_on: bool, v: Option<&str>) -> bool {
+    if !pf_on {
+        return false;
+    }
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_STREAM_ON,
+        Some(s) => !matches!(s, "0" | "off" | "false"),
+    }
+}
+
+/// ミス expert のストリーミングが有効か (プロセスで 1 回だけ env を読む)。
+pub fn stream_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| stream_from_value(pf_enabled(), std::env::var(STREAM_ENV).ok().as_deref()))
+}
+
+/// ステージング領域の合計 (バイト)。
+pub fn stream_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| env_usize(STREAM_MB_ENV, DEFAULT_STREAM_MB).saturating_mul(1 << 20))
+}
+
+/// ストリーミングを始める最小トークン数。
+pub fn stream_min_tok() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| env_usize(STREAM_MIN_TOK_ENV, DEFAULT_STREAM_MIN_TOK))
+}
+
+/// 1 回に上げる expert 数。
+pub fn stream_group() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| env_usize(STREAM_GROUP_ENV, DEFAULT_STREAM_GROUP).clamp(1, 256))
+}
+
+/// 上げの経路 (0 = pageable 同期 / 1 = pinned + 非同期)。
+pub fn stream_pin() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| env_usize(STREAM_PIN_ENV, DEFAULT_STREAM_PIN).min(1))
 }
 
 /// 型 → カーネルのスロット (decode の `kernels_exp_iq` と同じ順)。
@@ -318,6 +411,110 @@ pub fn identity_rows(n: usize) -> Vec<u32> {
     (0..n as u32).collect()
 }
 
+/// task 162: 行の加重和カーネルへ渡す行表 `prow[t * k + j]` = `h` の行番号。
+///
+/// `plan` は [`build_plan`] の結果。`pick` が false の expert は CPU に残るので、
+/// その (t, j) は `u32::MAX` のまま返す。呼び出し側は重みを 0 にして
+/// (`row_table_zero_slots`) 足し込みから外す。範囲外・重複があれば `None`。
+pub fn row_table_partial(
+    by_expert: &[Vec<(usize, usize)>],
+    plan: &PfPlan,
+    k: usize,
+    nt: usize,
+) -> Option<Vec<u32>> {
+    if k == 0 || nt == 0 || plan.seg.len() != plan.experts.len() * 4 {
+        return None;
+    }
+    let mut prow = vec![u32::MAX; nt * k];
+    let mut seg = 0usize;
+    for (ei, picks) in by_expert.iter().enumerate() {
+        if picks.is_empty() {
+            continue;
+        }
+        // plan は expert 昇順。i 番目の非空 expert が plan に無ければ CPU 側。
+        if plan.experts.get(seg).copied() != Some(ei) {
+            continue;
+        }
+        let off = plan.seg[seg * 4 + 1] as usize;
+        for (idx, &(t, j)) in picks.iter().enumerate() {
+            if t >= nt || j >= k {
+                return None;
+            }
+            let wi = t * k + j;
+            if prow[wi] != u32::MAX {
+                return None;
+            }
+            prow[wi] = (off + idx) as u32;
+        }
+        seg += 1;
+    }
+    if seg != plan.experts.len() {
+        return None;
+    }
+    Some(prow)
+}
+
+/// [`row_table_partial`] の**全行が載っている**版 (穴が 1 つでもあれば `None`)。
+pub fn row_table_full(
+    by_expert: &[Vec<(usize, usize)>],
+    plan: &PfPlan,
+    k: usize,
+    nt: usize,
+) -> Option<Vec<u32>> {
+    let prow = row_table_partial(by_expert, plan, k, nt)?;
+    if prow.contains(&u32::MAX) {
+        return None;
+    }
+    Some(prow)
+}
+
+/// task 162: 載っていない (t, j) を「重み 0・行 0」にして和から外す。
+///
+/// `prow` の穴を 0 で埋め、`weights` の同じ位置を 0.0 にする。0 × 有限値 = 0
+/// なので和は変わらない (CPU 側の寄与は呼び出し側が足す)。戻り値は穴の数。
+pub fn row_table_zero_slots(prow: &mut [u32], weights: &mut [f32]) -> usize {
+    let mut n = 0usize;
+    for (wi, p) in prow.iter_mut().enumerate() {
+        if *p == u32::MAX {
+            *p = 0;
+            weights[wi] = 0.0;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// task 162: ステージングへ 1 回に上げる範囲 (plan 添字の `[start, end)`) を切る。
+///
+/// `needs[i]` は plan 順の expert の必要バイト数 (常駐は 0)。1 範囲の合計が
+/// `cap` を超えず、本数が `max_group` を超えないように前から詰める。
+/// 1 本だけで `cap` を超える expert があれば `None` (この層はストリーミング
+/// しない = 呼び出し側が従来経路へ落ちる)。
+pub fn group_bounds(needs: &[usize], cap: usize, max_group: usize) -> Option<Vec<(usize, usize)>> {
+    if needs.is_empty() || cap == 0 {
+        return None;
+    }
+    let max_group = max_group.max(1);
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut sum = 0usize;
+    for (i, &need) in needs.iter().enumerate() {
+        if need > cap {
+            return None;
+        }
+        if i > start && (sum + need > cap || i - start >= max_group) {
+            out.push((start, i));
+            start = i;
+            sum = 0;
+        }
+        sum += need;
+    }
+    if start < needs.len() {
+        out.push((start, needs.len()));
+    }
+    Some(out)
+}
+
 // ---------------------------------------------------------------------------
 // 1 リクエストぶんの観測 (REPORT 用)
 // ---------------------------------------------------------------------------
@@ -334,6 +531,26 @@ static ADD_NS: AtomicU64 = AtomicU64::new(0);
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
 static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
 static SKIP_LAYERS: AtomicU64 = AtomicU64::new(0);
+/// task 162: ストリーミングで GPU に載せた層の数。
+static STREAM_LAYERS: AtomicU64 = AtomicU64::new(0);
+/// task 162: ステージングへ上げた expert 本数 (層またぎの再送を含む)。
+static STREAM_EXPERTS: AtomicU64 = AtomicU64::new(0);
+/// task 162: ステージングへ上げたバイト数。
+static STREAM_BYTES: AtomicU64 = AtomicU64::new(0);
+/// task 162: H2D の完了待ちで止まった時間 (重なりの指標)。
+static STREAM_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+/// task 162: ホストのバウンスバッファへの写しの所要。
+static STREAM_COPY_NS: AtomicU64 = AtomicU64::new(0);
+/// task 162: ステージングへ載せた expert の行数 (1 本あたりの行数を出すため)。
+static STREAM_ROWS: AtomicU64 = AtomicU64::new(0);
+/// task 162: 上げの回数 (グループ数)。
+static STREAM_GROUPS: AtomicU64 = AtomicU64::new(0);
+/// task 162: ステージングに載らず CPU に残した expert 本数。
+static STREAM_SPILL: AtomicU64 = AtomicU64::new(0);
+/// task 162: CPU に残したミスの計算に要した時間。
+static STREAM_CPU_MISS_NS: AtomicU64 = AtomicU64::new(0);
+/// task 162: 最初のグループで測った実 H2D 速度 (GB/s × 1000、0 = 未測)。
+static STREAM_PROBE_MBPS: AtomicU64 = AtomicU64::new(0);
 
 /// 1 層ぶんの参照を積む (`lookups` = 選択 expert 数、`hits` = 載っていた数)。
 pub fn note_lookup(lookups: u32, hits: u32) {
@@ -375,13 +592,70 @@ pub fn note_upload_ns(ns: u64) {
     UPLOAD_NS.fetch_add(ns, Ordering::Relaxed);
 }
 
+/// task 162: ステージングへ 1 グループ上げた。
+///
+/// `bytes` / `rows` / `experts` はこのグループの合計、`copy_ns` はホスト側の
+/// 写しの時間、`wait_ns` は H2D の完了待ちで止まった時間 (0 に近いほど重なっている)。
+pub fn note_stream_group(
+    bytes: usize,
+    rows: usize,
+    experts: usize,
+    copy_ns: u64,
+    wait_ns: u64,
+) {
+    STREAM_GROUPS.fetch_add(1, Ordering::Relaxed);
+    STREAM_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    STREAM_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+    STREAM_EXPERTS.fetch_add(experts as u64, Ordering::Relaxed);
+    STREAM_COPY_NS.fetch_add(copy_ns, Ordering::Relaxed);
+    STREAM_WAIT_NS.fetch_add(wait_ns, Ordering::Relaxed);
+}
+
+/// task 162: ストリーミングで 1 層を GPU に載せた。
+pub fn note_stream_layer() {
+    STREAM_LAYERS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// task 162: CPU に残したミスの計算時間。
+pub fn note_stream_cpu_miss_ns(ns: u64) {
+    STREAM_CPU_MISS_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// task 162: 最初のグループで測った実 H2D 速度 (bytes / ns)。
+pub fn note_stream_probe(bytes: usize, ns: u64) {
+    if bytes == 0 || ns == 0 {
+        return;
+    }
+    let mbs = (bytes as f64 / 1e6) / (ns as f64 / 1e9);
+    // 1000 倍して整数で持つ (AtomicF64 を使わない)。
+    let _ = STREAM_PROBE_MBPS.compare_exchange(
+        0,
+        (mbs * 1000.0) as u64,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+}
+
+/// task 162: ストリーミングの累計 (バイト, 本数, 行数, 待ち秒)。REPORT 用。
+pub fn stream_totals() -> (u64, u64, u64, f64) {
+    (
+        STREAM_BYTES.load(Ordering::Relaxed),
+        STREAM_EXPERTS.load(Ordering::Relaxed),
+        STREAM_ROWS.load(Ordering::Relaxed),
+        STREAM_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e9,
+    )
+}
+
 /// 1 リクエストぶんの 1 行。ゲート off / GPU 層 0 なら `None`。
 pub fn stats_line() -> Option<String> {
     if !pf_enabled() {
         return None;
     }
     let layers = LAYERS.load(Ordering::Relaxed);
-    if layers == 0 && SKIP_LAYERS.load(Ordering::Relaxed) == 0 {
+    if layers == 0
+        && SKIP_LAYERS.load(Ordering::Relaxed) == 0
+        && STREAM_LAYERS.load(Ordering::Relaxed) == 0
+    {
         return None;
     }
     let vram = match crate::model::expert_vram::budget_usage() {
@@ -407,7 +681,7 @@ pub fn stats_line() -> Option<String> {
         ),
         None => String::new(),
     };
-    Some(format!(
+    let mut out = format!(
         "[exp-pf] lookups={lk} hit_rate={hr:.3} gpu_layers={layers} skip_layers={} experts={} \
          rows={} gpu_ms={:.1} kern_ms={:.1} d2h_ms={:.1} add_ms={:.1} uploads={} up_ms={:.1} {vram}{chk}",
         SKIP_LAYERS.load(Ordering::Relaxed),
@@ -419,7 +693,37 @@ pub fn stats_line() -> Option<String> {
         ADD_NS.load(Ordering::Relaxed) as f64 / 1e6,
         UPLOADS.load(Ordering::Relaxed),
         UPLOAD_NS.load(Ordering::Relaxed) as f64 / 1e6,
-    ))
+    );
+    // task 162: ストリーミングの内訳 (task 7 の台帳)。
+    // 「1 本あたり何行を載せたか」「上げたバイトと実 H2D 速度」「CPU に残した
+    // ミスの ms」を 1 行で読めるようにする。
+    let sl = STREAM_LAYERS.load(Ordering::Relaxed);
+    if sl > 0 || STREAM_GROUPS.load(Ordering::Relaxed) > 0 {
+        let bytes = STREAM_BYTES.load(Ordering::Relaxed);
+        let wait = STREAM_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let copy = STREAM_COPY_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let exps = STREAM_EXPERTS.load(Ordering::Relaxed);
+        let rows = STREAM_ROWS.load(Ordering::Relaxed);
+        let probe = STREAM_PROBE_MBPS.load(Ordering::Relaxed) as f64 / 1000.0;
+        out.push_str(&format!(
+            "\n[exp-pf-stream] layers={sl} groups={} experts={exps} rows={rows} \
+             rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} wait_s={wait:.2} \
+             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} group={} min_tok={}",
+            STREAM_GROUPS.load(Ordering::Relaxed),
+            if exps > 0 {
+                rows as f64 / exps as f64
+            } else {
+                0.0
+            },
+            bytes as f64 / 1e6,
+            STREAM_SPILL.load(Ordering::Relaxed),
+            STREAM_CPU_MISS_NS.load(Ordering::Relaxed) as f64 / 1e6,
+            stream_pin(),
+            stream_group(),
+            stream_min_tok(),
+        ));
+    }
+    Some(out)
 }
 
 /// 積算を 0 に戻す (リクエスト終端)。
@@ -437,6 +741,16 @@ pub fn stats_reset() {
         &UPLOADS,
         &UPLOAD_NS,
         &SKIP_LAYERS,
+        &STREAM_LAYERS,
+        &STREAM_EXPERTS,
+        &STREAM_BYTES,
+        &STREAM_WAIT_NS,
+        &STREAM_COPY_NS,
+        &STREAM_ROWS,
+        &STREAM_GROUPS,
+        &STREAM_SPILL,
+        &STREAM_CPU_MISS_NS,
+        &STREAM_PROBE_MBPS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -638,6 +952,101 @@ mod tests {
     #[test]
     fn upload_budget_is_bytes_over_expert_size() {
         assert_eq!(upload_budget_experts(), (upload_mb() << 20) / 2_048_000);
+    }
+
+    /// task 162: 行表は「トークン × j」→ GPU の行番号。載っていない expert の
+    /// 位置は穴 (`u32::MAX`) のまま残り、`row_table_zero_slots` で 0 重みになる。
+    #[test]
+    fn stream_row_table_maps_and_zeroes_holes() {
+        let be = by_expert_fixture();
+        // expert 0,2,4 は GPU、1,3 は CPU (1 は空なので穴にならない)。
+        let pick = [true, true, true, false, true];
+        let plan = build_plan(&be, &pick);
+        assert_eq!(plan.experts, vec![0, 2, 4]);
+        assert_eq!(plan.seg[0..4], [3, 0, 0, 0]);
+        assert_eq!(plan.seg[4..8], [5, 3, 0, 0]);
+        assert_eq!(plan.seg[8..12], [2, 8, 0, 0]);
+        // k = 4、トークンは 0..=9 (fixture のトークン番号) → nt = 10。
+        let k = 4;
+        let nt = 10;
+        let mut prow = row_table_partial(&be, &plan, k, nt).expect("行表");
+        // expert 0 (先頭 0): トークン 2 の j=1 → 行 1。
+        assert_eq!(prow[2 * k + 1], 1);
+        // expert 2 (先頭 3): トークン 3 の j=3 は 3 番目の行 → 3 + 2 = 5。
+        assert_eq!(prow[3 * k + 3], 5);
+        // expert 4 (先頭 8): トークン 6 の j=1 は 2 番目の行 → 9。
+        assert_eq!(prow[6 * k + 1], 9);
+        // expert 3 (CPU) の (7,0) は穴。
+        assert_eq!(prow[7 * k], u32::MAX);
+        let mut w = vec![1.0f32; nt * k];
+        let holes = row_table_zero_slots(&mut prow, &mut w);
+        assert!(holes >= 1);
+        assert_eq!(prow[7 * k], 0);
+        assert_eq!(w[7 * k], 0.0);
+        assert!(
+            row_table_full(&be, &plan, k, nt).is_none(),
+            "穴があるのに full"
+        );
+        // 全部 GPU で全 (t, j) が埋まる表なら strict も通る。
+        let mut v: Vec<Vec<(usize, usize)>> = vec![Vec::new(); 2];
+        for t in 0..nt {
+            for j in 0..k {
+                v[(t + j) % 2].push((t, j));
+            }
+        }
+        let plan = build_plan(&v, &[true, true]);
+        assert!(row_table_full(&v, &plan, k, nt).is_some(), "全行が載っている");
+        assert!(row_table_partial(&be, &plan, 0, nt).is_none(), "k = 0 は表を作らない");
+    }
+
+    /// task 162: 上げのグループ分けは「容量」と「本数」の両方で切る。
+    /// 1 本だけで容量を超えるなら、その層はストリーミングしない (`None`)。
+    #[test]
+    fn stream_groups_respect_capacity_and_count() {
+        // 常駐 0 (10) と ミス 100 が交互。
+        let needs = [0usize, 100, 0, 100, 0, 100, 0, 100, 0, 100];
+        let g = group_bounds(&needs, 250, 3).expect("分けられる");
+        // 本数の上限 3 が先に効き、どの範囲もミス 2 本 (200 バイト) に収まる。
+        assert_eq!(g, vec![(0, 3), (3, 6), (6, 9), (9, 10)]);
+        for &(a, b) in &g {
+            let sum: usize = needs[a..b].iter().sum();
+            assert!(sum <= 250, "容量超過 {sum}");
+            assert!(b - a <= 3, "本数超過");
+        }
+        // 本数の上限だけで切る形。
+        let needs = [10usize; 7];
+        assert_eq!(
+            group_bounds(&needs, 1000, 3).expect("分けられる"),
+            vec![(0, 3), (3, 6), (6, 7)]
+        );
+        // 1 本で容量を超える → この層は上げない。
+        assert!(group_bounds(&[500, 10], 400, 8).is_none());
+        assert!(group_bounds(&[], 400, 8).is_none());
+        assert!(group_bounds(&[10], 0, 8).is_none());
+    }
+
+    /// task 162: ストリーミングのゲートは prefill ゲートの内側だけ。
+    /// 床 (min_tok) は 19 トークンの next turn prefill を巻き込まない。
+    #[test]
+    fn stream_gate_parses_values() {
+        assert!(!stream_from_value(false, Some("1")), "pf off なら動かない");
+        assert!(!stream_from_value(false, None));
+        assert_eq!(stream_from_value(true, None), DEFAULT_STREAM_ON);
+        assert_eq!(stream_from_value(true, Some("")), DEFAULT_STREAM_ON);
+        assert!(stream_from_value(true, Some("1")));
+        assert!(stream_from_value(true, Some("on")));
+        assert!(!stream_from_value(true, Some("0")));
+        assert!(!stream_from_value(true, Some("off")));
+        assert!(!stream_from_value(true, Some("false")));
+        assert!(stream_min_tok() > 19, "next turn prefill を巻き込む");
+        assert!(stream_bytes() >= 64 << 20, "ステージングが小さすぎる");
+        assert!(stream_group() >= 1);
+        assert!(stream_pin() <= 1);
+        // 2 枚に分けたときの 1 枚が、既定のグループ (32 本) を載せられること。
+        assert!(
+            (stream_bytes() / 2) / stream_group() >= 2_500_000,
+            "1 枚に 32 本 (2.05 MB/本) が載らない"
+        );
     }
 
     /// ホストが読む名前が .cu のカーネル名と一致する (実機でしか分からない

@@ -2844,6 +2844,10 @@ impl Qwen4Exp {
         // (mix / attn / router / shared / experts) は内側のガードで積む。
         // `other` は「全体 − 名前付き区間の和」の残差として `line_prefill` が出す。
         let _pf_total = q4ledger::total();
+        // task 162: この prefill が終わったらステージング領域を VRAM へ返す
+        // (エラーで抜けても Drop で戻る)。decode の間は抱えない。
+        #[cfg(feature = "cuda")]
+        let _pf_stream_guard = PfStreamGuard;
         let logits = if batch && self.attn.layer_major_safe() {
             self.forward_prefill_batch_tapped(ctx, prefill_batch_chunk(), tokens, on_layer, roles)?
         } else {
@@ -9693,10 +9697,17 @@ fn prefill_batch_enabled() -> bool {
 fn prefill_batch_chunk() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
+        // task 162: ストリーミング経路では層ループのチャンクを大きく取れる
+        // (ミス expert の上げ直しが 1 層 1 回に減る)。既定は従来どおり 512。
+        let hi = if crate::model::exp_pf::stream_enabled() {
+            65536
+        } else {
+            512
+        };
         std::env::var("DENNO_PREFILL_BATCH_CHUNK")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .map(|n| n.clamp(1, 512))
+            .map(|n| n.clamp(1, hi))
             .unwrap_or(512)
     })
 }
@@ -10819,14 +10830,41 @@ fn moe_experts_iq_pf_batch(
         .map_err(|err| one(format!("層 {}: expert VRAM 参照: {err:#}", lw.il)))?;
     let mut pick = vec![false; by_expert.len()];
     let mut devs: Vec<std::sync::Arc<expert_vram::ExpertDev>> = Vec::new();
+    // task 162: expert 番号 → 常駐 (ストリーミングの表を組むのに使う)。
+    let mut resident: Vec<Option<std::sync::Arc<expert_vram::ExpertDev>>> =
+        vec![None; by_expert.len()];
     for (i, g) in got.iter().enumerate() {
         if let Some(d) = g {
             pick[ids[i]] = true;
+            resident[ids[i]] = Some(std::sync::Arc::clone(d));
             devs.push(std::sync::Arc::clone(d));
         }
     }
     let hits = devs.len() as u32;
     crate::model::exp_pf::note_lookup(keys.len() as u32, hits);
+    // task 162: ミスをステージングへ上げ、行のある expert を**全部** GPU で回す。
+    // ヒット数に関係なく試す (ミスを載せられるならヒット 0 でも CPU より速い)。
+    // 載せられないときだけ従来の経路へ落ちる (`out` は触られていない)。
+    if crate::model::exp_pf::stream_enabled() && nt >= crate::model::exp_pf::stream_min_tok() {
+        {
+            static ONCE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[exp-pf-stream] 有効: min_tok={} group={} pin={} staging={}MiB                      (これ未満は従来経路)",
+                    crate::model::exp_pf::stream_min_tok(),
+                    crate::model::exp_pf::stream_group(),
+                    crate::model::exp_pf::stream_pin(),
+                    crate::model::exp_pf::stream_bytes() >> 20,
+                );
+            }
+        }
+        if let Some(gpu) =
+            iq_pf_stream_layer(lw, by_expert, &resident, weights, k, xs, nt, e, ff, out)?
+        {
+            return Ok(Some(gpu));
+        }
+    }
     if (hits as usize) < crate::model::exp_pf::min_hits_per_layer() {
         crate::model::exp_pf::note_skip_layer();
         return Ok(None);
@@ -10987,6 +11025,99 @@ fn moe_experts_iq_pf_batch(
     PF_H.with(|c| *c.borrow_mut() = std::mem::take(&mut hit_h));
     PF_MH.with(|c| *c.borrow_mut() = std::mem::take(&mut miss_h));
     Ok(Some(hits))
+}
+
+/// task 162: ミス expert をステージング領域へ上げ、**行のある expert を全部**
+/// m 行カーネルで GPU に回す。
+///
+/// 上げ直しと計算の重なりは [`crate::cuda::moe_experts_iq_pf_layer_stream`] が
+/// 持つ (グループごとのダブルバッファ)。ここは「どの expert が常駐で、どれが
+/// ミスか」を plan 順に並べ、行表を作るだけ。
+///
+/// 戻り値 `Some(本数)` = `out` に全 expert の寄与が入っている。
+/// `None` = この経路を使わなかった (`out` は触っていない)。
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn iq_pf_stream_layer(
+    lw: &LayerW,
+    by_expert: &[Vec<(usize, usize)>],
+    resident: &[Option<std::sync::Arc<crate::model::expert_vram::ExpertDev>>],
+    weights: &[f32],
+    k: usize,
+    xs: &[f32],
+    nt: usize,
+    e: usize,
+    ff: usize,
+    out: &mut [f32],
+) -> Result<Option<u32>> {
+    let ne = by_expert.len();
+    if ne == 0 || nt == 0 || k == 0 || weights.len() < nt * k {
+        return Ok(None);
+    }
+    // 行のある expert を **expert 昇順**に並べる (plan と同じ順)。
+    let mut pick = vec![false; ne];
+    let mut entries: Vec<crate::cuda::PfStreamEntry<'_>> = Vec::with_capacity(ne);
+    for (ei, picks) in by_expert.iter().enumerate() {
+        if picks.is_empty() {
+            continue;
+        }
+        pick[ei] = true;
+        match resident.get(ei).and_then(|r| r.as_ref()) {
+            Some(d) => {
+                entries.push(crate::cuda::PfStreamEntry {
+                    expert: ei as u16,
+                    dev: Some([
+                        d.ptr(ExpertMatrix::Gate),
+                        d.ptr(ExpertMatrix::Up),
+                        d.ptr(ExpertMatrix::Down),
+                    ]),
+                    host: None,
+                });
+            }
+            None => {
+                let host = [
+                    lw.gate_exps.slice(ei)?,
+                    lw.up_exps.slice(ei)?,
+                    lw.down_exps.slice(ei)?,
+                ];
+                entries.push(crate::cuda::PfStreamEntry {
+                    expert: ei as u16,
+                    dev: None,
+                    host: Some(host),
+                });
+            }
+        }
+    }
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let plan = crate::model::exp_pf::build_plan(by_expert, &pick);
+    if plan.total_rows == 0 || plan.nseg() != entries.len() {
+        return Ok(None);
+    }
+    // 全 expert が GPU に載るので、行表に穴は無い (穴があれば従来経路へ)。
+    let Some(prow) = crate::model::exp_pf::row_table_full(by_expert, &plan, k, nt) else {
+        return Ok(None);
+    };
+    crate::cuda::moe_experts_iq_pf_layer_stream(
+        lw.gate_exps.ty,
+        lw.up_exps.ty,
+        lw.down_exps.ty,
+        &entries,
+        &plan.seg,
+        &plan.rows,
+        xs,
+        e,
+        ff,
+        e,
+        nt,
+        k,
+        &prow,
+        &weights[..nt * k],
+        crate::model::exp_pf::stream_group(),
+        out,
+    )
+    .map_err(|err| one(format!("層 {}: expert streaming: {err:#}", lw.il)))
 }
 
 /// task 151: ヒット (GPU) とミス (CPU) の行を、**トークンごとに expert index
@@ -11260,6 +11391,20 @@ fn moe_ffn_quant_batch_tapped(
         roles,
         emit_router,
     )
+}
+
+/// task 162: prefill の終端でステージング領域を必ず返すためのガード。
+///
+/// decode のあいだステージング (既定 512 MiB) を抱えたままにすると、expert の
+/// LRU がその分だけ狭くなる。`forward_prefill_inner` の入口で作って Drop で返す。
+#[cfg(feature = "cuda")]
+struct PfStreamGuard;
+
+#[cfg(feature = "cuda")]
+impl Drop for PfStreamGuard {
+    fn drop(&mut self) {
+        crate::cuda::pf_stream_release();
+    }
 }
 
 /// [`moe_ffn_quant_batch`] の本体。expert ループの並べ方 (`sched`) を外から渡せる
