@@ -4332,6 +4332,690 @@ where
 }
 
 // ===========================================================================
+// task 158: decode のミス expert を GPU で計算する (DENNO_DEC_MISS_UP)
+// ===========================================================================
+//
+// ヒットは VRAM の LRU から、ミスは **pinned の bounce buffer** 経由で専用 scratch へ
+// 非同期 H2D して、ヒットと**同じカーネル・同じ segment 表の形**で回す。
+// ホストの写し (mmap → pinned) はヒットのカーネルを発行した後に行うので、GPU の
+// ヒット計算と重なる。同期は層あたり 1 回のまま (task 150 と同じ)。
+//
+// lab の実測は REPORT_P158.md。
+
+/// ミス 1 本ぶんの重み (mmap のスライス、ゲート / アップ / ダウン)。
+pub struct MissExpertBytes<'a> {
+    pub gate: &'a [u8],
+    pub up: &'a [u8],
+    pub down: &'a [u8],
+}
+
+/// [`moe_experts_iq_layer_miss_up`] の作業域 (grow-only・スレッドローカル)。
+struct MissUpScratch {
+    /// ミスの重み (ゲート / アップ / ダウン) を詰めたデバイス scratch。
+    dg: Option<DevBuffer>,
+    du: Option<DevBuffer>,
+    dd: Option<DevBuffer>,
+    /// bounce buffer (pinned)。mmap からここへ写してから H2D する。
+    pin_g: Option<PinMem>,
+    pin_u: Option<PinMem>,
+    pin_d: Option<PinMem>,
+    /// ミス用のポインタ表 (u64) と segment 表 (u32 x 4)。
+    pg: Option<DevBuffer>,
+    pu: Option<DevBuffer>,
+    pd: Option<DevBuffer>,
+    sgu: Option<DevBuffer>,
+    sgd: Option<DevBuffer>,
+    /// 重みの H2D 専用ストリームと完了イベント。
+    stream: Option<CopyStream>,
+    ev_ready: Option<CopyEvent>,
+}
+
+thread_local! {
+    static MISS_UP: std::cell::RefCell<MissUpScratch> = const {
+        std::cell::RefCell::new(MissUpScratch {
+            dg: None,
+            du: None,
+            dd: None,
+            pin_g: None,
+            pin_u: None,
+            pin_d: None,
+            pg: None,
+            pu: None,
+            pd: None,
+            sgu: None,
+            sgd: None,
+            stream: None,
+            ev_ready: None,
+        })
+    };
+}
+
+/// IQ 層一括 GEMV を 1 回積む (`kernels_exp_iq` の引数 8 個)。
+#[allow(clippy::too_many_arguments)]
+fn iq_launch_gemv(
+    ctx: &CudaCtx,
+    f: CUfunction,
+    plan: crate::model::exp_iq::IqLaunch,
+    pw: u64,
+    px: u64,
+    po: u64,
+    ps: u64,
+    nseg: usize,
+    n_in: usize,
+    n_out: usize,
+    rb: usize,
+) -> Result<()> {
+    unsafe {
+        let (mut pw, mut px, mut po, mut ps) = (pw, px, po, ps);
+        let (mut ns, mut ni, mut no, mut rb) = (
+            nseg as c_int,
+            n_in as c_int,
+            n_out as c_int,
+            rb as c_int,
+        );
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut no as *mut _ as *mut c_void,
+            &mut rb as *mut _ as *mut c_void,
+        ];
+        ctx.launch_async(f, plan.grid, plan.block, 0, &mut args)
+    }
+}
+
+/// `act = silu(g) * u` を `n` 要素だけ積む。
+fn iq_launch_silu(ctx: &CudaCtx, f: CUfunction, pg: u64, pu: u64, pa: u64, n: usize) -> Result<()> {
+    const THREADS: usize = 256;
+    if n == 0 {
+        return Ok(());
+    }
+    let blocks = n.div_ceil(THREADS) as u32;
+    unsafe {
+        let (mut pg, mut pu, mut pa) = (pg, pu, pa);
+        let mut pn = n as c_int;
+        let mut args = [
+            &mut pg as *mut _ as *mut c_void,
+            &mut pu as *mut _ as *mut c_void,
+            &mut pa as *mut _ as *mut c_void,
+            &mut pn as *mut _ as *mut c_void,
+        ];
+        ctx.launch_async(
+            f,
+            (blocks.max(1), 1, 1),
+            (THREADS as u32, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+}
+
+/// ミス expert の重みを GPU へ上げて、ヒットと同じカーネルで計算する (task 158)。
+///
+/// 戻り値 `Ok(true)`: `out_h` に `n_hit + n_miss` 本ぶんの寄与を書いた
+/// (並びは [ヒット..., ミス...])。`Ok(false)`: GPU でやらなかった =
+/// 呼び出し側は従来経路 (CPU でミス + 重ね打ち) へ落ちること (fail closed)。
+///
+/// 発行順 (すべて null ストリーム。同期は最後の 1 回だけ):
+///   1. x / ポインタ表 / segment 表の H2D (同期コピー。数百バイト)
+///   2. ヒットの gate+up → silu → down (nseg = `n_hit`)
+///   3. ホスト: ミスの重みを mmap から pinned へ写す (ヒットの GPU 計算と重なる)
+///   4. コピーストリーム: pinned → デバイス scratch (3 コピー) → 完了イベント
+///   5. null ストリームがイベントを待つ → ミスの gate+up → silu → down
+///   6. h 全体の D2H → 1 回だけ同期
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts_iq_layer_miss_up(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    ty_d: crate::kquant::GgmlType,
+    pg: &[u64],
+    pu: &[u64],
+    pd: &[u64],
+    ids_hit: &[u16],
+    miss: &[MissExpertBytes<'_>],
+    ids_miss: &[u16],
+    x: &[f32],
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    out_h: &mut Vec<f32>,
+) -> Result<bool> {
+    let n_hit = pg.len();
+    let n_miss = miss.len();
+    if n_miss == 0
+        || n_miss > crate::model::exp_miss_up::MAX_MISS
+        || n_hit == 0
+        || pu.len() != n_hit
+        || pd.len() != n_hit
+        || ids_hit.len() != n_hit
+        || ids_miss.len() != n_miss
+        || n_in == 0
+        || ff == 0
+        || e == 0
+        || x.len() < n_in
+    {
+        return Ok(false);
+    }
+    if !moe_gemv_iq_ready(ty_g, n_in)
+        || !moe_gemv_iq_ready(ty_u, n_in)
+        || !moe_gemv_iq_ready(ty_d, ff)
+    {
+        return Ok(false);
+    }
+    let (Some(slot_g), Some(slot_u), Some(slot_d)) = (
+        crate::model::exp_iq::slot(ty_g),
+        crate::model::exp_iq::slot(ty_u),
+        crate::model::exp_iq::slot(ty_d),
+    ) else {
+        return Ok(false);
+    };
+    let (Some(plan_gu_hit), Some(plan_d_hit), Some(plan_gu_miss), Some(plan_d_miss)) = (
+        crate::model::exp_iq::launch_plan(n_hit, ff),
+        crate::model::exp_iq::launch_plan(n_hit, e),
+        crate::model::exp_iq::launch_plan(n_miss, ff),
+        crate::model::exp_iq::launch_plan(n_miss, e),
+    ) else {
+        return Ok(false);
+    };
+    let Some(ctx) = shared_ctx() else {
+        return Ok(false);
+    };
+    let Some(kernels) = exp_iq_kernels() else {
+        return Ok(false);
+    };
+    let Ok(l) = lib() else {
+        return Ok(false);
+    };
+    let (
+        Some(stream_create),
+        Some(event_create),
+        Some(event_record),
+        Some(stream_wait_event),
+        Some(memcpy_htod_async),
+        Some(memcpy_dtoh_async),
+    ) = (
+        l.stream_create,
+        l.event_create,
+        l.event_record,
+        l.stream_wait_event,
+        Some(l.memcpy_htod_async),
+        Some(l.memcpy_dtoh_async),
+    )
+    else {
+        return Ok(false);
+    };
+    ctx.make_current()?;
+
+    let (Some(rb_g), Some(rb_u), Some(rb_d)) = (
+        crate::model::exp_iq::row_bytes(ty_g, n_in),
+        crate::model::exp_iq::row_bytes(ty_u, n_in),
+        crate::model::exp_iq::row_bytes(ty_d, ff),
+    ) else {
+        return Ok(false);
+    };
+    let (bytes_g, bytes_u, bytes_d) = (rb_g * ff, rb_u * ff, rb_d * e);
+    // 重みの長さが型・形と合わないミスが 1 本でもあれば CPU へ (fail closed)。
+    if miss
+        .iter()
+        .any(|m| m.gate.len() != bytes_g || m.up.len() != bytes_u || m.down.len() != bytes_d)
+    {
+        return Ok(false);
+    }
+
+    let n_all = n_hit + n_miss;
+    let ng_hit = n_hit * ff;
+    let ng_miss = n_miss * ff;
+    let ng_all = n_all * ff;
+    let nh_all = n_all * e;
+    let seg_gu_hit = crate::model::expert_batch::seg_table_shared_x(ids_hit, ff);
+    let seg_d_hit = crate::model::expert_batch::seg_table_per_act(ids_hit, ff, e);
+    let seg_gu_miss = crate::model::expert_batch::seg_table_shared_x(ids_miss, ff);
+    let seg_d_miss = crate::model::expert_batch::seg_table_per_act(ids_miss, ff, e);
+
+    let mut copied = 0u64;
+    let mut copy_ns = 0u64;
+    let t_layer = std::time::Instant::now();
+    IQ_SCRATCH.with(|cell| -> Result<()> {
+        let mut sc = cell.borrow_mut();
+        MoeScratch::ensure_tagged(&mut sc.x, n_in * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.g, ng_all * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.u, ng_all * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.act, ng_all * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.h, nh_all * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.pg, n_hit * 8, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.pu, n_hit * 8, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.pd, n_hit * 8, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.sgu, seg_gu_hit.len() * 4, crate::mem_audit::TAG_GDN_SC)?;
+        MoeScratch::ensure_tagged(&mut sc.sgd, seg_d_hit.len() * 4, crate::mem_audit::TAG_GDN_SC)?;
+        Scratch::ensure_pin(&mut sc.hpin, nh_all * 4)?;
+        {
+            let xb = sc.x.as_ref().expect("確保済み");
+            xb.copy_from(&x[..n_in])?;
+            dbg_htod(n_in * 4);
+            sc.pg.as_ref().expect("確保済み").copy_from(pg)?;
+            sc.pu.as_ref().expect("確保済み").copy_from(pu)?;
+            sc.pd.as_ref().expect("確保済み").copy_from(pd)?;
+            sc.sgu.as_ref().expect("確保済み").copy_from(&seg_gu_hit)?;
+            sc.sgd.as_ref().expect("確保済み").copy_from(&seg_d_hit)?;
+            dbg_htod(n_hit * 8 * 3 + (seg_gu_hit.len() + seg_d_hit.len()) * 4);
+        }
+
+        // 1.5 ミスの受け皿と表を**起動前**に用意する。`copy_from` は同期コピー
+        //     (`cuMemcpyHtoD`) なので、ヒットのカーネルを積んだ後に置くと null
+        //     ストリームの先行カーネルを待ってしまい、重ね打ちが消える。
+        MISS_UP.with(|mcell| -> Result<()> {
+            let mut ms = mcell.borrow_mut();
+            MoeScratch::ensure_tagged(
+                &mut ms.dg,
+                n_miss * bytes_g,
+                crate::mem_audit::TAG_GDN_SC,
+            )?;
+            MoeScratch::ensure_tagged(
+                &mut ms.du,
+                n_miss * bytes_u,
+                crate::mem_audit::TAG_GDN_SC,
+            )?;
+            MoeScratch::ensure_tagged(
+                &mut ms.dd,
+                n_miss * bytes_d,
+                crate::mem_audit::TAG_GDN_SC,
+            )?;
+            Scratch::ensure_pin(&mut ms.pin_g, n_miss * bytes_g)?;
+            Scratch::ensure_pin(&mut ms.pin_u, n_miss * bytes_u)?;
+            Scratch::ensure_pin(&mut ms.pin_d, n_miss * bytes_d)?;
+            MoeScratch::ensure_tagged(&mut ms.pg, n_miss * 8, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(&mut ms.pu, n_miss * 8, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(&mut ms.pd, n_miss * 8, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(
+                &mut ms.sgu,
+                seg_gu_miss.len() * 4,
+                crate::mem_audit::TAG_GDN_SC,
+            )?;
+            MoeScratch::ensure_tagged(
+                &mut ms.sgd,
+                seg_d_miss.len() * 4,
+                crate::mem_audit::TAG_GDN_SC,
+            )?;
+            if ms.stream.is_none() {
+                const CU_STREAM_NON_BLOCKING: u32 = 0x01;
+                let mut st: CUstream = std::ptr::null_mut();
+                if unsafe { stream_create(&mut st, CU_STREAM_NON_BLOCKING) } != CUDA_SUCCESS {
+                    bail!("cuStreamCreate (dec miss) が失敗");
+                }
+                let mut ev: CUevent = std::ptr::null_mut();
+                if unsafe { event_create(&mut ev, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+                    unsafe {
+                        if let Some(f) = l.stream_destroy {
+                            let _ = f(st);
+                        }
+                    }
+                    bail!("cuEventCreate (dec miss) が失敗");
+                }
+                ms.stream = Some(CopyStream(st));
+                ms.ev_ready = Some(CopyEvent(ev));
+            }
+            // ポインタ表 (scratch の先頭アドレス)。segment 表は scratch の並び。
+            let (dg_p, du_p, dd_p) = (
+                ms.dg.as_ref().expect("確保済み").ptr,
+                ms.du.as_ref().expect("確保済み").ptr,
+                ms.dd.as_ref().expect("確保済み").ptr,
+            );
+            let tpg: Vec<u64> = (0..n_miss)
+                .map(|j| dg_p + (j * bytes_g) as u64)
+                .collect();
+            let tpu: Vec<u64> = (0..n_miss)
+                .map(|j| du_p + (j * bytes_u) as u64)
+                .collect();
+            let tpd: Vec<u64> = (0..n_miss)
+                .map(|j| dd_p + (j * bytes_d) as u64)
+                .collect();
+            ms.pg.as_ref().expect("確保済み").copy_from(&tpg)?;
+            ms.pu.as_ref().expect("確保済み").copy_from(&tpu)?;
+            ms.pd.as_ref().expect("確保済み").copy_from(&tpd)?;
+            ms.sgu.as_ref().expect("確保済み").copy_from(&seg_gu_miss)?;
+            ms.sgd.as_ref().expect("確保済み").copy_from(&seg_d_miss)?;
+            dbg_htod(n_miss * 8 * 3 + (seg_gu_miss.len() + seg_d_miss.len()) * 4);
+            Ok(())
+        })?;
+
+        let xb = sc.x.as_ref().expect("確保済み");
+        let g = sc.g.as_ref().expect("確保済み");
+        let u = sc.u.as_ref().expect("確保済み");
+        let act = sc.act.as_ref().expect("確保済み");
+        let h = sc.h.as_ref().expect("確保済み");
+        // 1. ヒット (nseg = n_hit)。出力の先頭 n_hit*e。
+        iq_launch_gemv(
+            ctx,
+            kernels.fns[slot_g],
+            plan_gu_hit,
+            sc.pg.as_ref().expect("確保済み").ptr,
+            xb.ptr,
+            g.ptr,
+            sc.sgu.as_ref().expect("確保済み").ptr,
+            n_hit,
+            n_in,
+            ff,
+            rb_g,
+        )?;
+        iq_launch_gemv(
+            ctx,
+            kernels.fns[slot_u],
+            plan_gu_hit,
+            sc.pu.as_ref().expect("確保済み").ptr,
+            xb.ptr,
+            u.ptr,
+            sc.sgu.as_ref().expect("確保済み").ptr,
+            n_hit,
+            n_in,
+            ff,
+            rb_u,
+        )?;
+        iq_launch_silu(ctx, kernels.silu, g.ptr, u.ptr, act.ptr, ng_hit)?;
+        iq_launch_gemv(
+            ctx,
+            kernels.fns[slot_d],
+            plan_d_hit,
+            sc.pd.as_ref().expect("確保済み").ptr,
+            act.ptr,
+            h.ptr,
+            sc.sgd.as_ref().expect("確保済み").ptr,
+            n_hit,
+            ff,
+            e,
+            rb_d,
+        )?;
+
+        // 2. ミス: pinned へ写してから scratch へ非同期 H2D (ヒットの裏で走る)。
+        //    受け皿と表は 1.5 で用意済み (ここでは触らない)。
+        MISS_UP.with(|mcell| -> Result<()> {
+            let mut ms = mcell.borrow_mut();
+            let (dg_p, du_p, dd_p) = (
+                ms.dg.as_ref().expect("確保済み").ptr,
+                ms.du.as_ref().expect("確保済み").ptr,
+                ms.dd.as_ref().expect("確保済み").ptr,
+            );
+
+            // ホスト写し (mmap → pinned)。ここがヒットの GPU 計算と重なる区間。
+            // `ms` は RefMut なので 3 本を同時に借りない (1 本ずつ写す)。
+            let t0 = std::time::Instant::now();
+            for (j, m) in miss.iter().enumerate() {
+                ms.pin_g.as_mut().expect("確保済み").as_mut_slice::<u8>()
+                    [j * bytes_g..(j + 1) * bytes_g]
+                    .copy_from_slice(m.gate);
+            }
+            for (j, m) in miss.iter().enumerate() {
+                ms.pin_u.as_mut().expect("確保済み").as_mut_slice::<u8>()
+                    [j * bytes_u..(j + 1) * bytes_u]
+                    .copy_from_slice(m.up);
+            }
+            for (j, m) in miss.iter().enumerate() {
+                ms.pin_d.as_mut().expect("確保済み").as_mut_slice::<u8>()
+                    [j * bytes_d..(j + 1) * bytes_d]
+                    .copy_from_slice(m.down);
+            }
+            copy_ns = t0.elapsed().as_nanos() as u64;
+            copied = (n_miss * (bytes_g + bytes_u + bytes_d)) as u64;
+
+            let stream = ms.stream.as_ref().expect("作成済み").0;
+            let ev = ms.ev_ready.as_ref().expect("作成済み").0;
+            for (dst, src, bytes) in [
+                (
+                    dg_p,
+                    ms.pin_g.as_ref().expect("確保済み").ptr,
+                    n_miss * bytes_g,
+                ),
+                (
+                    du_p,
+                    ms.pin_u.as_ref().expect("確保済み").ptr,
+                    n_miss * bytes_u,
+                ),
+                (
+                    dd_p,
+                    ms.pin_d.as_ref().expect("確保済み").ptr,
+                    n_miss * bytes_d,
+                ),
+            ] {
+                if unsafe { memcpy_htod_async(dst, src as *const c_void, bytes, stream) }
+                    != CUDA_SUCCESS
+                {
+                    bail!("cuMemcpyHtoDAsync (dec miss) が失敗");
+                }
+            }
+            if unsafe { event_record(ev, stream) } != CUDA_SUCCESS {
+                bail!("cuEventRecord (dec miss) が失敗");
+            }
+            if unsafe { stream_wait_event(std::ptr::null_mut(), ev, 0) } != CUDA_SUCCESS {
+                bail!("cuStreamWaitEvent (dec miss) が失敗");
+            }
+            // 3. ミス (nseg = n_miss)。基底はヒットの後ろ。
+            iq_launch_gemv(
+                ctx,
+                kernels.fns[slot_g],
+                plan_gu_miss,
+                ms.pg.as_ref().expect("確保済み").ptr,
+                xb.ptr,
+                g.ptr + (ng_hit * 4) as u64,
+                ms.sgu.as_ref().expect("確保済み").ptr,
+                n_miss,
+                n_in,
+                ff,
+                rb_g,
+            )?;
+            iq_launch_gemv(
+                ctx,
+                kernels.fns[slot_u],
+                plan_gu_miss,
+                ms.pu.as_ref().expect("確保済み").ptr,
+                xb.ptr,
+                u.ptr + (ng_hit * 4) as u64,
+                ms.sgu.as_ref().expect("確保済み").ptr,
+                n_miss,
+                n_in,
+                ff,
+                rb_u,
+            )?;
+            iq_launch_silu(
+                ctx,
+                kernels.silu,
+                g.ptr + (ng_hit * 4) as u64,
+                u.ptr + (ng_hit * 4) as u64,
+                act.ptr + (ng_hit * 4) as u64,
+                ng_miss,
+            )?;
+            iq_launch_gemv(
+                ctx,
+                kernels.fns[slot_d],
+                plan_d_miss,
+                ms.pd.as_ref().expect("確保済み").ptr,
+                act.ptr + (ng_hit * 4) as u64,
+                h.ptr + (n_hit * e * 4) as u64,
+                ms.sgd.as_ref().expect("確保済み").ptr,
+                n_miss,
+                ff,
+                e,
+                rb_d,
+            )?;
+            Ok(())
+        })?;
+
+        // 4. h 全体 (ヒット + ミス) の D2H → 1 回だけ同期。
+        let h_ptr = h.ptr;
+        let pin = sc.hpin.as_mut().expect("確保済み");
+        unsafe {
+            check(
+                (memcpy_dtoh_async)(pin.ptr, h_ptr, nh_all * 4, std::ptr::null_mut()),
+                "cuMemcpyDtoHAsync (iq miss up)",
+            )?;
+        }
+        crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        sync_default_or_ctx(ctx, dec_overlap_enabled())?;
+        let pin = sc.hpin.as_ref().expect("確保済み");
+        out_h.resize(nh_all, 0.0);
+        out_h.copy_from_slice(&pin.as_slice::<f32>()[..nh_all]);
+        dbg_d2h(nh_all * 4);
+        Ok(())
+    })?;
+    crate::model::exp_miss_up::note_layer(n_miss as u32, copied);
+    if copy_ns > 0 {
+        crate::model::exp_miss_up::note_copy_ns(copy_ns);
+    }
+    crate::model::exp_miss_up::note_gpu_ns(t_layer.elapsed().as_nanos() as u64);
+    Ok(true)
+}
+
+/// task 158: ミス重みの H2D 実効レートを測る (`DENNO_DEC_MISS_PROBE=1`)。
+///
+/// decode のミスは「pinned の bounce buffer → デバイス scratch」の 1 本道なので、
+/// その実効レート (GB/s) を 1 回だけ測って 1 行出す。ホットパスには入らない。
+/// 2 MB を `REPS` 回、タイミング付きイベントで挟んで測る (warmup 2 回は除く)。
+///
+/// task 164: 新しい機材 (Gen5 x16) では「どの経路がいくらか」で損益が変わるので、
+/// 4 本まとめて測る:
+///
+/// - `gbs` — pinned → device の非同期 H2D (イベント計測)
+/// - `pg_gbs` — pageable (Vec) → device の H2D (現行 `iq_warm_misses` の経路)
+/// - `copy_gbs` — `src` (mmap の実スライス) → pinned のホスト写し (bounce の代価)
+/// - `direct_gbs` — `src` → device を直接 (bounce 無しの pageable H2D)
+pub fn dec_miss_probe_once(mb: usize, src: Option<&[u8]>) {
+    use std::sync::OnceLock;
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        if let Some(line) = dec_miss_probe_line(mb, src) {
+            eprintln!("{line}");
+        }
+    });
+}
+
+/// 1 バイト列を `reps` 回写して GB/s を返す (ホスト側の写しの実測)。
+fn host_copy_gbs(dst: &mut [u8], src: &[u8], reps: usize) -> f64 {
+    let t = std::time::Instant::now();
+    for _ in 0..reps {
+        dst.copy_from_slice(src);
+    }
+    let ns = t.elapsed().as_nanos() as f64;
+    if ns <= 0.0 {
+        return 0.0;
+    }
+    (reps * src.len()) as f64 / ns
+}
+
+/// [`dec_miss_probe_once`] の本体 (失敗したら `None`)。
+pub fn dec_miss_probe_line(mb: usize, src: Option<&[u8]>) -> Option<String> {
+    const REPS: usize = 8;
+    let bytes = mb.max(1) << 20;
+    let l = lib().ok()?;
+    let ctx = shared_ctx()?;
+    ctx.make_current().ok()?;
+    let mut pin = PinMem::alloc(bytes).ok()?;
+    let d = DevBuffer::alloc_tagged(bytes, crate::mem_audit::TAG_GDN_SC).ok()?;
+    let (create, record, esync, elapsed) = (
+        l.event_create?,
+        l.event_record?,
+        l.event_sync?,
+        l.event_elapsed_time?,
+    );
+    let mut ev0: CUevent = std::ptr::null_mut();
+    let mut ev1: CUevent = std::ptr::null_mut();
+    unsafe {
+        if create(&mut ev0, 0) != CUDA_SUCCESS || create(&mut ev1, 0) != CUDA_SUCCESS {
+            return None;
+        }
+    }
+    // warmup (pinned の実体化 + ドライバの初回準備) は測らない。
+    unsafe {
+        for _ in 0..2 {
+            let _ = (l.memcpy_htod_async)(d.ptr(), pin.ptr, bytes, std::ptr::null_mut());
+        }
+        let _ = ctx.sync();
+    }
+    let t = std::time::Instant::now();
+    unsafe {
+        if record(ev0, std::ptr::null_mut()) != CUDA_SUCCESS {
+            return None;
+        }
+        for _ in 0..REPS {
+            if (l.memcpy_htod_async)(d.ptr(), pin.ptr, bytes, std::ptr::null_mut()) != CUDA_SUCCESS
+            {
+                return None;
+            }
+        }
+        if record(ev1, std::ptr::null_mut()) != CUDA_SUCCESS || esync(ev1) != CUDA_SUCCESS {
+            return None;
+        }
+    }
+    let wall_ms = t.elapsed().as_secs_f64() * 1e3;
+    let mut ms: f32 = 0.0;
+    unsafe {
+        if elapsed(&mut ms, ev0, ev1) != CUDA_SUCCESS {
+            return None;
+        }
+        if let Some(destroy) = l.event_destroy {
+            let _ = destroy(ev0);
+            let _ = destroy(ev1);
+        }
+    }
+    let gbs = (REPS * bytes) as f64 / (ms as f64 * 1e6);
+
+    // pageable (Vec) → device。現行の上げ直しと同じ経路 (ドライバが内部で
+    // staging する)。呼び出しスレッドは終わるまで戻らない。
+    let pageable = vec![0u8; bytes];
+    let mut pg_gbs = 0.0f64;
+    {
+        let t = std::time::Instant::now();
+        let mut ok = true;
+        unsafe {
+            for _ in 0..REPS {
+                if (l.memcpy_htod_async)(d.ptr(), pageable.as_ptr() as *const c_void, bytes, std::ptr::null_mut())
+                    != CUDA_SUCCESS
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            let _ = ctx.sync();
+        }
+        let s = t.elapsed().as_secs_f64();
+        if ok && s > 0.0 {
+            pg_gbs = (REPS * bytes) as f64 / (s * 1e9);
+        }
+    }
+
+    // mmap の実スライス → pinned (bounce) と → device 直接。
+    // 実スライスは 2 MB より小さいことがある (gate 1 枚) ので、長さはスライスに合わせる。
+    let (mut copy_gbs, mut direct_gbs) = (0.0f64, 0.0f64);
+    if let Some(src) = src.filter(|s| !s.is_empty()) {
+        let n = src.len().min(bytes);
+        let src = &src[..n];
+        let bytes = n;
+        copy_gbs = host_copy_gbs(pin.as_mut_slice::<u8>(), src, REPS);
+        let t = std::time::Instant::now();
+        let mut ok = true;
+        unsafe {
+            for _ in 0..REPS {
+                if (l.memcpy_htod_async)(d.ptr(), src.as_ptr() as *const c_void, bytes, std::ptr::null_mut())
+                    != CUDA_SUCCESS
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            let _ = ctx.sync();
+        }
+        let s = t.elapsed().as_secs_f64();
+        if ok && s > 0.0 {
+            direct_gbs = (REPS * bytes) as f64 / (s * 1e9);
+        }
+    }
+    Some(format!(
+        "[dec-miss-probe] mb={mb} reps={REPS} h2d_ms={ms:.3} gbs={gbs:.2} pg_gbs={pg_gbs:.2} \
+         copy_gbs={copy_gbs:.2} direct_gbs={direct_gbs:.2} wall_ms={wall_ms:.3}"
+    ))
+}
+
+// ===========================================================================
 // task 148: prefill の m 行 expert GEMV (`kernels_exp_iq_pf.cu`)
 // ===========================================================================
 //
@@ -4743,6 +5427,63 @@ mod iq_overlap_tests {
     //! task 150: 重ね打ち経路の**契約**を GPU 無しで固定する。
     use super::*;
     use crate::kquant::GgmlType;
+
+    /// task 158: ミス GPU 経路は**起動前に落ちるとき**必ず `Ok(false)` を返し、
+    /// `out_h` を 1 要素も書かない (呼び出し側は従来経路へ戻せる)。
+    /// GPU の無いテスト環境では毎回ここに落ちるので、契約だけを固定できる。
+    #[test]
+    fn miss_up_fails_closed_before_launching() {
+        let x = vec![0.1f32; 8];
+        let g = vec![0u8; 4];
+        let mut out: Vec<f32> = vec![7.0f32; 3];
+        let hit = [0u64];
+        let ids_hit = [0u16];
+        let ids_miss = [1u16];
+        // ミス 0 本は「この経路ではやらない」。
+        let r = moe_experts_iq_layer_miss_up(
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            &hit,
+            &hit,
+            &hit,
+            &ids_hit,
+            &[],
+            &[],
+            &x,
+            8,
+            8,
+            8,
+            &mut out,
+        );
+        assert!(matches!(r, Ok(false)), "{r:?}");
+        assert_eq!(out, vec![7.0f32; 3]);
+        // 重みの長さが型・形と合わないミスは起動しない (型の取り違えを静かに
+        // 通さないための最後の砦)。
+        let miss = [MissExpertBytes {
+            gate: &g,
+            up: &g,
+            down: &g,
+        }];
+        let r = moe_experts_iq_layer_miss_up(
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            GgmlType::IQ2S,
+            &hit,
+            &hit,
+            &hit,
+            &ids_hit,
+            &miss,
+            &ids_miss,
+            &x,
+            8,
+            8,
+            8,
+            &mut out,
+        );
+        assert!(matches!(r, Ok(false)), "{r:?}");
+        assert_eq!(out, vec![7.0f32; 3]);
+    }
 
     /// 形状が不正なら起動前に `Ok(false)` を返し、**CPU ミスのコールバックを
     /// 呼ばない** (呼び出し側は全 expert を CPU で計算し直せる)。呼んでしまうと

@@ -3828,6 +3828,33 @@ fn mix_chain_enabled() -> bool {
     *ON.get_or_init(|| mix_chain_from_value(std::env::var("DENNO_MIX_CHAIN").ok().as_deref()))
 }
 
+/// task 158/164: `DENNO_MIX_INJ_EARLY` の値解釈 (純関数・テスト用)。**既定 off**。
+///
+/// task 158 では既定 on で lab に投入したが、base 条件に含めたため単独の差は
+/// 取れていない。task 164 では int-auto の既定を変えないため off から始める
+/// (on は明示的な真値だけ)。
+pub fn mix_inj_early_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// task 158: `hc_inject` の GEMV + 係数を、down/up の GPU chain を積む**前**に
+/// 計算するか (`DENNO_MIX_INJ_EARLY`)。
+///
+/// inject は `xn` だけで決まるので、chain の完了を待ってから計算すると、その間
+/// GPU が遊ぶ (mix は 1 トークンに 97 回)。値は変わらない (入力も演算順序も同じ)。
+/// lab t158a では base 条件に含めたため単独の差は取れていないが、全リクエストで
+/// md5 は SAME。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn mix_inj_early_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        mix_inj_early_from_value(std::env::var("DENNO_MIX_INJ_EARLY").ok().as_deref())
+    })
+}
+
 /// task 150: `DENNO_DECODE_CHAIN2` の値を解釈する (純関数・テスト用)。
 /// **既定 on** (`DENNO_MIX_CHAIN` と同じ規則。明示的な偽値 `0` / `off` / `false` /
 /// `no` だけ切る)。lab t150b で目標を満たしたため t150 の最終コミットで既定を
@@ -4332,6 +4359,37 @@ fn hc_mix_quant_fast(
         hyper::grouped_rms_norm_batch_into(std::slice::from_ref(res), norm, xn, hp);
         mix_kprof::mark(t, mix_kprof::GN);
 
+        // task 158: inject (`hc_inject` の GEMV + 係数) は **xn だけで決まる**。
+        // CPU 型 (F32 / F16 / BF16 = `gemv_impl` が GPU に奪わない型) なら
+        // down/up の GPU chain を積む前に済ませる。以前は chain の同期が返ってから
+        // 計算していたため、その間 GPU が遊んでいた (97 呼び出し/token)。
+        // 量子型は GPU 経路を持ち順序を変えると同期が増えるので従来位置のまま。
+        let inj_is_cpu = |w: &GgufLinear| {
+            matches!(
+                w.ty(),
+                crate::kquant::GgmlType::F32
+                    | crate::kquant::GgmlType::F16
+                    | crate::kquant::GgmlType::Bf16
+            )
+        };
+        let do_inj = |w: &GgufLinear| -> Result<Vec<f32>> {
+            let mut v = vec![0.0f32; w.n()];
+            let t = mix_kprof::stamp();
+            w.gemv_label("hc_inject", xn, &mut v)
+                .map_err(|err| one(format!("hc_mix inject: {err}")))?;
+            // task 96: inject GEMV 1 発の実行先と dtype (down/up と同じ `Instant`)。
+            mix_kprof::gemv::note_inj(t, w.ty());
+            mix_kprof::mark(t, mix_kprof::INJ);
+            let t = mix_kprof::stamp();
+            hyper::hc_inject_apply(&mut v, hp);
+            mix_kprof::mark(t, mix_kprof::INJ_APPLY);
+            Ok(v)
+        };
+        let mut inj_early = match inject {
+            Some(w) if mix_inj_early_enabled() && inj_is_cpu(w) => Some(do_inj(w)?),
+            _ => None,
+        };
+
         let lo = MixScratch::take(lo, down.n());
         let gate = MixScratch::take(gate, up.n());
         let t = mix_kprof::stamp();
@@ -4495,21 +4553,14 @@ fn hc_mix_quant_fast(
         };
         mix_kprof::mark(t, mix_kprof::MIXED);
 
-        let inj = match inject {
-            Some(w) => {
-                let mut v = vec![0.0f32; w.n()];
-                let t = mix_kprof::stamp();
-                w.gemv_label("hc_inject", xn, &mut v)
-                    .map_err(|err| one(format!("hc_mix inject: {err}")))?;
-                // task 96: inject GEMV 1 発の実行先と dtype (down/up と同じ `Instant`)。
-                mix_kprof::gemv::note_inj(t, w.ty());
-                mix_kprof::mark(t, mix_kprof::INJ);
-                let t = mix_kprof::stamp();
-                hyper::hc_inject_apply(&mut v, hp);
-                mix_kprof::mark(t, mix_kprof::INJ_APPLY);
-                v
-            }
-            None => vec![0.0f32; hp.hc],
+        // task 158: inject は CPU 型なら chain の前に計算済み (`inj_early`)。
+        // 量子型 (GPU 経路) は従来どおりここで計算する。
+        let inj = match inj_early.take() {
+            Some(v) => v,
+            None => match inject {
+                Some(w) => do_inj(w)?,
+                None => vec![0.0f32; hp.hc],
+            },
         };
         mix_kprof::mark(t_all, mix_kprof::TOTAL);
         mix_kprof::bump_call();
@@ -7829,7 +7880,12 @@ fn moe_ffn_quant_impl(
 
         #[cfg(feature = "cuda")]
         let iq_batched = if use_gpu && iq_mode {
-            moe_experts_iq_gpu_batched(lw, &sel, x, e, ff)?
+            // task 158: ミスを GPU で計算する経路 (`DENNO_DEC_MISS_UP`)。
+            // 不発 (`None`) なら従来の「ヒットだけ GPU / ミスは CPU」へ落ちる。
+            match moe_experts_iq_gpu_miss_up(lw, &sel, x, e, ff)? {
+                Some(v) => Some(v),
+                None => moe_experts_iq_gpu_batched(lw, &sel, x, e, ff)?,
+            }
         } else {
             None
         };
@@ -8449,6 +8505,12 @@ fn moe_experts_iq_gpu_batched(
     if sel.is_empty() {
         return Ok(None);
     }
+    // task 164: `DENNO_DEC_MISS_PROBE=1` なら 1 回だけ H2D の実効レートを測る
+    // (miss_up のゲートとは独立。計測は decode の最初の層で 1 回だけ)。
+    if crate::model::exp_miss_up::probe_enabled() {
+        let src = lw.gate_exps.slice(sel[0]).ok();
+        crate::cuda::dec_miss_probe_once(2, src);
+    }
     let shapes = [
         ExpertShape {
             ty: lw.gate_exps.ty,
@@ -8591,6 +8653,207 @@ fn moe_experts_iq_gpu_batched(
         }
     }
     Ok(Some((hs, hits)))
+}
+
+/// task 158: ミス expert を GPU で計算する decode 専用の入口。
+///
+/// 2 つの変種をゲート [`crate::model::exp_miss_up::ENV`] で選ぶ:
+///
+/// - `1` (scratch): ミスの重みを pinned の bounce buffer へ写してから専用の
+///   デバイス scratch へ非同期 H2D し、ヒットと**同じカーネル**で回す。VRAM の LRU は
+///   触らない。写し (mmap → pinned) はヒットのカーネル発行の後に行うので、GPU の
+///   ヒット計算と重なる。
+/// - `2` (cache): `expert_vram::acquire` の通常方針 (LRU・予算・追い出し) で
+///   キャッシュへ挿入してから回す。以後のトークンではヒットになる。
+///
+/// 戻り値は [`moe_experts_iq_gpu_batched`] と同じ形 (`hs` は `sel` の並び、
+/// `hits` は VRAM に載っていた本数 = ゲートのサンプル)。`Ok(None)` は
+/// 「この経路ではやらない」= 呼び出し側は従来経路 (CPU ミス + 重ね打ち) へ。
+///
+/// fail closed: scratch の確保失敗 / カーネル不発 / 型未対応 / ミスが
+/// [`crate::model::exp_miss_up::MAX_MISS`] 超 / ヒットが
+/// [`crate::model::exp_iq::min_hits_per_layer`] 未満 のいずれでも `None`。
+#[cfg(feature = "cuda")]
+fn moe_experts_iq_gpu_miss_up(
+    lw: &LayerW,
+    sel: &[usize],
+    x: &[f32],
+    e: usize,
+    ff: usize,
+) -> Result<Option<(Vec<Option<Vec<f32>>>, u32)>> {
+    use crate::model::exp_miss_up as mu;
+    use crate::model::expert_vram::ExpertShape;
+
+    if !mu::enabled() || sel.is_empty() {
+        return Ok(None);
+    }
+    let shapes = [
+        ExpertShape {
+            ty: lw.gate_exps.ty,
+            k: x.len(),
+            n: ff,
+        },
+        ExpertShape {
+            ty: lw.up_exps.ty,
+            k: x.len(),
+            n: ff,
+        },
+        ExpertShape {
+            ty: lw.down_exps.ty,
+            k: ff,
+            n: e,
+        },
+    ];
+    // 1. 載っている expert を集める (H2D しない)。
+    let mut devs = Vec::with_capacity(sel.len());
+    let mut pos: Vec<usize> = Vec::with_capacity(sel.len());
+    let mut miss_pos: Vec<usize> = Vec::new();
+    for (t, &ei) in sel.iter().enumerate() {
+        let key = ExpertKey {
+            layer: lw.il as u16,
+            expert: ei as u16,
+        };
+        let got = expert_vram::lookup(key, shapes)
+            .map_err(|err| one(format!("層 {}: expert {ei}: VRAM 参照: {err:#}", lw.il)))?;
+        match got {
+            Some(dev) => {
+                devs.push(dev);
+                pos.push(t);
+            }
+            None => miss_pos.push(t),
+        }
+    }
+    let n_hit = devs.len();
+    let n_miss = miss_pos.len();
+    // ヒットが閾値未満の層は従来経路 (層一括 = CPU へ落ちる) に任せる。
+    // ミスが scratch の本数を超える層も同じ (cold の 1 本目など)。
+    if n_hit == 0
+        || n_hit < crate::model::exp_iq::min_hits_per_layer()
+        || n_miss > mu::MAX_MISS
+    {
+        return Ok(None);
+    }
+    let ids_of = |ps: &[usize]| -> Vec<u16> { ps.iter().map(|&t| sel[t] as u16).collect() };
+    let ptrs = |m: ExpertMatrix| -> Vec<u64> { devs.iter().map(|d| d.ptr(m)).collect() };
+    // 全ヒットの層と `MODE_CACHE` は「全 expert が VRAM に載った状態で 1 回の
+    // 層一括」。全ヒットの層をここで処理するのは、呼び出し側に二度目の lookup を
+    // させないため (定常状態では大半の層がミス 0 本になる)。
+    if n_miss == 0 || mu::mode() == mu::MODE_CACHE {
+        let mut pg = ptrs(ExpertMatrix::Gate);
+        let mut pu = ptrs(ExpertMatrix::Up);
+        let mut pd = ptrs(ExpertMatrix::Down);
+        for &t in &miss_pos {
+            let ei = sel[t];
+            let key = ExpertKey {
+                layer: lw.il as u16,
+                expert: ei as u16,
+            };
+            // ミスは `acquire` (通常方針: LRU・予算・追い出し) でキャッシュへ挿入。
+            let got = expert_vram::acquire(key, shapes, || {
+                Ok([
+                    lw.gate_exps.slice(ei)?,
+                    lw.up_exps.slice(ei)?,
+                    lw.down_exps.slice(ei)?,
+                ])
+            })
+            .map_err(|err| {
+                one(format!(
+                    "層 {}: expert {ei}: VRAM 経路 (miss up): {err:#}",
+                    lw.il
+                ))
+            })?;
+            let Some(a) = got else {
+                return Ok(None);
+            };
+            pg.push(a.dev.ptr(ExpertMatrix::Gate));
+            pu.push(a.dev.ptr(ExpertMatrix::Up));
+            pd.push(a.dev.ptr(ExpertMatrix::Down));
+        }
+        let ids: Vec<u16> = sel.iter().map(|&ei| ei as u16).collect();
+        let seg_gu = crate::model::expert_batch::seg_table_shared_x(&ids, ff);
+        let seg_d = crate::model::expert_batch::seg_table_per_act(&ids, ff, e);
+        let mut h = vec![0.0f32; sel.len() * e];
+        let _l = crate::model::q4ledger::enter(crate::model::q4ledger::EXPERT);
+        let ran = crate::cuda::moe_experts_iq_layer(
+            lw.gate_exps.ty,
+            lw.up_exps.ty,
+            lw.down_exps.ty,
+            &pg,
+            &pu,
+            &pd,
+            &seg_gu,
+            &seg_d,
+            x,
+            x.len(),
+            ff,
+            e,
+            &mut h,
+        )
+        .map_err(|err| one(format!("層 {}: ミス GPU 経路 (全ヒット/挿入): {err:#}", lw.il)))?;
+        if !ran {
+            return Ok(None);
+        }
+        let hs: Vec<Option<Vec<f32>>> = h.chunks_exact(e).map(|c| Some(c.to_vec())).collect();
+        crate::model::exp_iq::note_gpu_layer(sel.len() as u32);
+        return Ok(Some((hs, n_hit as u32)));
+    }
+
+    // 2b. scratch 経路: ミスだけ pinned → デバイス scratch へ非同期 H2D。
+    let mut miss_bytes = Vec::with_capacity(n_miss);
+    for &t in &miss_pos {
+        let ei = sel[t];
+        miss_bytes.push(crate::cuda::MissExpertBytes {
+            gate: lw.gate_exps.slice(ei)?,
+            up: lw.up_exps.slice(ei)?,
+            down: lw.down_exps.slice(ei)?,
+        });
+    }
+    let pg_hit: Vec<u64> = devs.iter().map(|d| d.ptr(ExpertMatrix::Gate)).collect();
+    let pu_hit: Vec<u64> = devs.iter().map(|d| d.ptr(ExpertMatrix::Up)).collect();
+    let pd_hit: Vec<u64> = devs.iter().map(|d| d.ptr(ExpertMatrix::Down)).collect();
+    let ids_hit = ids_of(&pos);
+    let ids_miss = ids_of(&miss_pos);
+    let mut h: Vec<f32> = Vec::new();
+    let ran = crate::cuda::moe_experts_iq_layer_miss_up(
+        lw.gate_exps.ty,
+        lw.up_exps.ty,
+        lw.down_exps.ty,
+        &pg_hit,
+        &pu_hit,
+        &pd_hit,
+        &ids_hit,
+        &miss_bytes,
+        &ids_miss,
+        x,
+        x.len(),
+        ff,
+        e,
+        &mut h,
+    )
+    .map_err(|err| one(format!("層 {}: ミス GPU 経路 (scratch): {err:#}", lw.il)))?;
+    if !ran {
+        return Ok(None);
+    }
+    if h.len() != (n_hit + n_miss) * e {
+        return Err(one(format!(
+            "層 {}: ミス GPU 経路の寄与長 {} が (ヒット {} + ミス {}) * e {} と違う",
+            lw.il,
+            h.len(),
+            n_hit,
+            n_miss,
+            e
+        )));
+    }
+    let mut hs: Vec<Option<Vec<f32>>> = vec![None; sel.len()];
+    for (i, &t) in pos.iter().enumerate() {
+        hs[t] = Some(h[i * e..(i + 1) * e].to_vec());
+    }
+    let base = n_hit * e;
+    for (j, &t) in miss_pos.iter().enumerate() {
+        hs[t] = Some(h[base + j * e..base + (j + 1) * e].to_vec());
+    }
+    crate::model::exp_iq::note_gpu_layer((n_hit + n_miss) as u32);
+    Ok(Some((hs, n_hit as u32)))
 }
 
 /// task 144: ミスした expert を **トークンあたりの上限つき**で VRAM へ上げ直す。
