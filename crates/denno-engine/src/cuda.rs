@@ -4892,6 +4892,7 @@ pub fn dec_miss_probe_once(mb: usize, src: Option<&[u8]>) {
 /// 1 バイト列を `reps` 回写して GB/s を返す (ホスト側の写しの実測)。
 fn host_copy_gbs(dst: &mut [u8], src: &[u8], reps: usize) -> f64 {
     let t = std::time::Instant::now();
+    let dst = &mut dst[..src.len()];
     for _ in 0..reps {
         dst.copy_from_slice(src);
     }
@@ -5427,6 +5428,20 @@ mod iq_overlap_tests {
     //! task 150: 重ね打ち経路の**契約**を GPU 無しで固定する。
     use super::*;
     use crate::kquant::GgmlType;
+
+    /// task 164: プローブのホスト写しは**宛先が転送元より長い**ことを前提にする
+    /// (pinned の bounce は 2 MB 固定、実スライスは 1 枚ぶん)。lab t164a では
+    /// `copy_from_slice` の長さ不一致で panic した (tline / missup の 2 条件が
+    /// 丸ごと落ちた)。ここで長さの扱いだけを固定する。
+    #[test]
+    fn probe_host_copy_accepts_short_source() {
+        let mut dst = vec![0u8; 64];
+        let src = vec![7u8; 10];
+        let gbs = host_copy_gbs(&mut dst, &src, 4);
+        assert!(gbs > 0.0, "写しのレートが 0");
+        assert_eq!(&dst[..10], &src[..]);
+        assert_eq!(dst[10], 0, "転送元より後ろは触らない");
+    }
 
     /// task 158: ミス GPU 経路は**起動前に落ちるとき**必ず `Ok(false)` を返し、
     /// `out_h` を 1 要素も書かない (呼び出し側は従来経路へ戻せる)。
