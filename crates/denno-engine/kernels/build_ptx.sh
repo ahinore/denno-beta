@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf pf)
+targets_all=(int8 elem gdn moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf pf attn_dec)
 
 # 名前 -> "ソース|fmad" (fmad: nofmad = -fmad=false / fmad = 既定)。未知は 1。
 spec() {
@@ -48,6 +48,11 @@ spec() {
         # task 154: prefill の hc mix / combine の要素カーネル。CPU 参照と 1 演算
         # 1 丸めを合わせるため -fmad=false で作る (明示 __*_rn のみ)。
         pf)           echo "kernels_pf.cu|nofmad" ;;
+        # task 160: decode の flash decoding (split-K・GQA まとめ読み)。
+        # attention の緩和枠 (P17g) なので FMA は許可しない: 既存の attention
+        # カーネル (elem) と同じ -fmad=false で丸めを揃え、A/B の差を
+        # 「どこを読むか」だけにする。
+        attn_dec)     echo "kernels_attn_dec.cu|nofmad" ;;
         gemm)         echo "kernels_gemm.cu|fmad" ;;
         gemm_grouped) echo "kernels_gemm_grouped.cu|fmad" ;;
         *)            return 1 ;;
