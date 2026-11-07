@@ -4392,12 +4392,18 @@ where
 // リング (4 本) で使い回し、書き戻す前に前回のコピーの完了だけを待つ
 // (4 層ぶんの余裕があるので通常は即返る)。
 
-/// `DENNO_DEC_PRO_ASYNC`: 層 prologue を 1 回の非同期 H2D にまとめる。**既定 off**。
+/// `DENNO_DEC_PRO_ASYNC`: 層 prologue を 1 回の非同期 H2D にまとめる。
+///
+/// **既定 on** (lab t164c で目標を満たした)。明示的な偽値 `0` / `off` / `false` /
+/// `no` だけ切る。切り戻しはこの env で行う。
 pub fn dec_pro_async_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
 }
 
 /// [`dec_pro_async_from_value`] をプロセスで 1 回だけ読む。
@@ -5658,6 +5664,19 @@ mod iq_overlap_tests {
         assert!(gbs > 0.0, "写しのレートが 0");
         assert_eq!(&dst[..10], &src[..]);
         assert_eq!(dst[10], 0, "転送元より後ろは触らない");
+    }
+
+    /// task 164: prologue の非同期化は **既定 on**、明示的な偽値だけ切る。
+    /// lab t164c で decode -3.0〜-3.6% / md5 SAME だったので既定を on にした。
+    #[test]
+    fn dec_pro_async_gate_defaults_on() {
+        assert!(dec_pro_async_from_value(None));
+        assert!(dec_pro_async_from_value(Some("1")));
+        assert!(dec_pro_async_from_value(Some("ON")));
+        assert!(!dec_pro_async_from_value(Some("0")));
+        assert!(!dec_pro_async_from_value(Some("off")));
+        assert!(!dec_pro_async_from_value(Some(" FALSE ")));
+        assert!(!dec_pro_async_from_value(Some("no")));
     }
 
     /// task 164: prologue ステージングのレイアウトは 8 バイト整列で、各ブロックが
