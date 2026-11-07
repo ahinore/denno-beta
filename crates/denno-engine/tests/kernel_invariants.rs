@@ -6477,9 +6477,16 @@ fn attn_flashdec_kernel_matches_host() {
         BUILD_PTX_SH.contains("attn_dec)     echo \"kernels_attn_dec.cu|nofmad\""),
         "build_ptx.sh の attn_dec が -fmad=false でない (PTX=attn_dec で生成する)"
     );
+    // targets_all は int-auto 側でも増える (task 154 の pf) ので、行全体の
+    // 文字列一致ではなく要素として見る。
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("targets_all=("))
+        .expect("build_ptx.sh に targets_all が無い");
+    let names: Vec<&str> = targets.trim_end_matches(')').split_whitespace().collect();
     assert!(
-        BUILD_PTX_SH.contains(" exp_iq_pf attn_dec)"),
-        "build_ptx.sh の targets_all に attn_dec が無い"
+        names.contains(&"attn_dec"),
+        "build_ptx.sh の targets_all に attn_dec が無い: {targets}"
     );
 }
 
