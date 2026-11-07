@@ -2335,10 +2335,66 @@ impl CudaCtx {
         use crate::kquant::GgmlType as T;
         const ROWS: usize = 16; // kernels_gemm.cu の GEMM_ROWS
         const NTG_MAX: usize = 8; // kernels_gemm.cu の GEMM_NTG_MAX
+        // task 169: Q8_0 は BF16 テンソルコア GEMM (ゲート on・形が合うとき)。
+        // 従来カーネルは 1 起動 128 トークンまでだが、こちらは 2048 トークンまでを
+        // 1 起動で畳む (起動・同期・H2D/D2H の回数が 1/16 になる)。
+        if matches!(ty, T::Q8_0)
+            && pf_tc_gemm_on()
+            && pf_tc_gemm_eligible(nt, n_in, n_out, pf_tc_min_m())
+        {
+            let rb = (n_in / 32) * 34;
+            if x.len() != nt * n_in || out.len() != nt * n_out {
+                bail!(
+                    "moe_gemm_dev(tc): 形状が不正 (nt={nt}, n_in={n_in}, n_out={n_out}, \
+                     x={}, out={})",
+                    x.len(),
+                    out.len()
+                );
+            }
+            if dev_w.bytes() != n_out * rb {
+                bail!(
+                    "moe_gemm_dev(tc): 重みのデバイスバイト数 {} が n_out * row_bytes = {} と違う",
+                    dev_w.bytes(),
+                    n_out * rb
+                );
+            }
+            self.make_current()?;
+            if let Some(tc) = tc_gemm_kernels() {
+                MOE_SCRATCH.with(|cell| -> Result<()> {
+                    let mut s = cell.borrow_mut();
+                    MoeScratch::ensure_tagged(
+                        &mut s.x,
+                        nt * n_in * 4,
+                        crate::mem_audit::TAG_GEMV,
+                    )?;
+                    MoeScratch::ensure_tagged(
+                        &mut s.o,
+                        nt * n_out * 4,
+                        crate::mem_audit::TAG_GEMV,
+                    )?;
+                    let xb = s.x.as_ref().expect("x は ensure 済み");
+                    let ob = s.o.as_ref().expect("o は ensure 済み");
+                    xb.copy_from(x)?;
+                    dbg_htod(nt * n_in * 4);
+                    let t_sync = crate::model::devprof::sync_start();
+                    tc_gemm_launch(self, tc, dev_w.ptr, xb.ptr, ob.ptr, nt, n_in, n_out, rb)?;
+                    self.sync()?;
+                    let got: Vec<f32> = ob.to_vec(nt * n_out)?;
+                    if let Some(t) = t_sync {
+                        crate::model::devprof::note_sync(t.elapsed().as_nanos() as u64);
+                    }
+                    out[..nt * n_out].copy_from_slice(&got);
+                    Ok(())
+                })?;
+                return Ok(true);
+            }
+        }
         let Some(fs) = self.f_gemm_q else {
             return Ok(false);
         };
-        if nt <= 1 || nt > ROWS * NTG_MAX {
+        // 1 起動は 128 トークンまでだが、大きい nt は下で 128 ずつに割るので
+        // 上限は設けない (task 169 でプリフィルのまとめ幅を広げたため)。
+        if nt <= 1 {
             return Ok(false);
         }
         let (f, rb, blk) = match ty {
@@ -2385,20 +2441,41 @@ impl CudaCtx {
             dbg_htod(nt * n_in * 4);
             // devprof: 起動後の待ち (sync) + 結果読み出し (同期コピー) の実測。
             let t_sync = crate::model::devprof::sync_start();
+            // カーネルは 1 起動 128 トークンまで (`ntg` の上限)。TC 経路が使えず
+            // 呼び出し側が 2,048 行までまとめてきた場合も、ここで 128 ずつに割れば
+            // 同じ結果になる (x / out はデバイス上で連続)。
+            let step = ROWS * NTG_MAX;
+            let mut t0 = 0usize;
+            while t0 < nt {
+                let m = (nt - t0).min(step);
+                unsafe {
+                    let (mut pw, mut px, mut po) = (
+                        dev_w.ptr,
+                        xb.ptr + (t0 * n_in * 4) as CUdeviceptr,
+                        ob.ptr + (t0 * n_out * 4) as CUdeviceptr,
+                    );
+                    let (mut nt_c, mut ni_c, mut no_c, mut rb_c) =
+                        (m as c_int, n_in as c_int, n_out as c_int, rb as c_int);
+                    let mut args = [
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut px as *mut _ as *mut c_void,
+                        &mut po as *mut _ as *mut c_void,
+                        &mut nt_c as *mut _ as *mut c_void,
+                        &mut ni_c as *mut _ as *mut c_void,
+                        &mut no_c as *mut _ as *mut c_void,
+                        &mut rb_c as *mut _ as *mut c_void,
+                    ];
+                    self.launch_async(
+                        f,
+                        (grid, 1, 1),
+                        (ROWS as u32, 16, 1),
+                        shmem as u32,
+                        &mut args,
+                    )?;
+                }
+                t0 += m;
+            }
             unsafe {
-                let (mut pw, mut px, mut po) = (dev_w.ptr, xb.ptr, ob.ptr);
-                let (mut nt_c, mut ni_c, mut no_c, mut rb_c) =
-                    (nt as c_int, n_in as c_int, n_out as c_int, rb as c_int);
-                let mut args = [
-                    &mut pw as *mut _ as *mut c_void,
-                    &mut px as *mut _ as *mut c_void,
-                    &mut po as *mut _ as *mut c_void,
-                    &mut nt_c as *mut _ as *mut c_void,
-                    &mut ni_c as *mut _ as *mut c_void,
-                    &mut no_c as *mut _ as *mut c_void,
-                    &mut rb_c as *mut _ as *mut c_void,
-                ];
-                self.launch_async(f, (grid, 1, 1), (ROWS as u32, 16, 1), shmem as u32, &mut args)?;
                 self.sync()?;
             }
             let got: Vec<f32> = ob.to_vec(nt * n_out)?;
@@ -11575,13 +11652,15 @@ fn gemm_try(
         return skip(SKIP_TYPE);
     }
     // カーネルは 1 起動で 128 トークンまで (GEMM_ROWS × GEMM_NTG_MAX = 16 × 8)。
-    // それより大きい chunk はここで 128 ずつに割る (重みは VRAM 常駐なので
-    // 読み直しは VRAM 内で済む)。
-    const TILE: usize = 128;
-    if nt > TILE {
+    // それより大きい chunk はここで割る (重みは VRAM 常駐なので読み直しは
+    // VRAM 内で済む)。task 169: テンソルコア GEMM が使えるときは 1 起動
+    // 2,048 トークンまでまとめる (起動・同期・H2D/D2H の回数が 1/16 になる。
+    // プリフィルのチャンクは 512 なので実際は 1 回)。
+    let tile = gemm_try_tile_for(pf_tc_gemm_on(), ty, nt, k, n, pf_tc_min_m());
+    if nt > tile {
         let mut t0 = 0usize;
         while t0 < nt {
-            let t1 = (t0 + TILE).min(nt);
+            let t1 = (t0 + tile).min(nt);
             let m = t1 - t0;
             let ok = gemm_try(
                 uid,
@@ -11626,6 +11705,433 @@ fn gemm_try(
         Err(e) => {
             tracing::error!("gguf gemm failed (uid={uid}): {e:#}");
             skip(SKIP_ERR)
+        }
+    }
+}
+
+// ===========================================================================
+// task 169: prefill の射影を BF16 テンソルコア GEMM で回す (`DENNO_PF_TC_GEMM`)
+// ===========================================================================
+//
+// lab t167c (14,018 トークン cold prefill = 93.87 s) の台帳では、ssm の qkv
+// 投影が 16.3 s (全体の 17%)、full attention の射影が 9.2 s、shared expert が
+// 8.1 s を占めていた。どれも `kernels_gemm.cu` の「16 行 × 128 トークン」版
+// (f32 FMA・1 起動 128 トークンまで) で、計算量あたり 0.6〜2.6 TFLOP/s =
+// テンソルコアの 1/20 以下。ここでは重みタイルを共有メモリへ 1 回だけ展開し、
+// BF16 の mma (FP32 アキュムレート) で 128 トークン × 64 行ずつ畳む。
+//
+// 数値: prefill の射影はビット一致契約の外 (2026-10-28)。x と重みを BF16 に
+// 丸めるので既存カーネルとは値が変わる (丸めだけ。演算の意味は同じ)。
+// 既定 off (`DENNO_PF_TC_GEMM=1` で有効)。PTX は実行時読み込みで、無ければ
+// 従来カーネルへ fail closed (`[pf-tc]` の 1 行だけ出す)。
+//
+// PTX: `bash build_ptx.sh gemm_tc` (この target だけ arch = compute_90)。
+// このコンテナには nvcc が無いので生成は GPU 側 (lab は PTX=gemm_tc で行う)。
+
+/// 1 ブロックのタイル (`kernels_gemm_tc.cu` の TC_BM / TC_BN / TC_BK と一致)。
+const TC_BM: usize = 128;
+const TC_BN: usize = 64;
+const TC_BK: usize = 32;
+/// 1 起動でまとめるトークン数の上限 (重みタイルの再利用を効かせる)。
+const TC_MAX_TOKENS: usize = 2048;
+// 共有メモリはカーネル側の静的配列 (`__shared__`) なので、ホストからは
+// サイズを渡さない (取り違えようがない)。
+
+/// `DENNO_PF_TC_GEMM` の値の解釈 (純関数)。`0`・`off`・`false`・`no`・空文字だけが off。
+///
+/// **既定 on** (lab t169a で採用): 14,018 トークンの cold prefill が
+/// 96.55 → 70.68 s (-26.8%)、3,826 で 27.69 → 20.88 s (-24.6%)、decode と
+/// 19 トークン next turn は不変、errors 0・text sane。md5 は BF16 丸めで変わる。
+pub(crate) fn pf_tc_gemm_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// `DENNO_PF_TC_MIN_M` の値の解釈 (純関数)。0 や壊れた値は既定 64。
+pub(crate) fn pf_tc_min_m_from_value(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(64)
+}
+
+/// テンソルコア GEMM を使うか (**既定 off**)。
+pub(crate) fn pf_tc_gemm_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_TC_GEMM_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_tc_gemm_from_value(std::env::var("DENNO_PF_TC_GEMM").ok().as_deref()))
+}
+
+/// テンソルコア GEMM を使う最小の行数 (`DENNO_PF_TC_MIN_M`、既定 64)。
+///
+/// 19 トークンの next turn prefill のような小さい M は、従来カーネルの方が
+/// 起動もタイル効率も良いので切り替えない (decode と next turn を動かさない)。
+pub(crate) fn pf_tc_min_m() -> usize {
+    static MIN_M: OnceLock<usize> = OnceLock::new();
+    *MIN_M.get_or_init(|| pf_tc_min_m_from_value(std::env::var("DENNO_PF_TC_MIN_M").ok().as_deref()))
+}
+
+#[cfg(test)]
+static PF_TC_GEMM_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_tc_gemm_for_test(v: Option<bool>) {
+    PF_TC_GEMM_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// この形をテンソルコア GEMM で回せるか (純関数。カーネルの前提と同じ)。
+///
+/// `kernels_gemm_tc.cu` の前提: Q8_0 / `n_in % 32 == 0` / `n_out % 64 == 0`。
+/// 型は呼び出し側が Q8_0 に限る (このモデルの射影は全部 Q8_0)。
+pub(crate) fn pf_tc_gemm_eligible(nt: usize, n_in: usize, n_out: usize, min_m: usize) -> bool {
+    // 呼び出し側 (`gemm_try` は nt>1、GDN 連鎖は nt>=2) はどれも 2 以上でしか
+    // 来ない。nt=1 はカーネルとしても正しく動く (行が 1 本残るだけ) ので、
+    // 下限は `DENNO_PF_TC_MIN_M` だけで決める。
+    nt >= min_m.max(1)
+        && n_in > 0
+        && n_in % TC_BK == 0
+        && n_out >= TC_BN
+        && n_out % TC_BN == 0
+}
+
+/// `gemm_try` が 1 起動でまとめるトークン数 (純関数)。
+///
+/// 従来カーネルは 128 トークンまで (GEMM_ROWS × GEMM_NTG_MAX) なので、それより
+/// 大きいチャンクはここで割る。テンソルコア GEMM が使えるときだけ
+/// [`TC_MAX_TOKENS`] までまとめる (起動・同期・H2D/D2H の回数が減る)。
+fn gemm_try_tile_for(
+    tc_on: bool,
+    ty: crate::kquant::GgmlType,
+    nt: usize,
+    k: usize,
+    n: usize,
+    min_m: usize,
+) -> usize {
+    let tc = tc_on
+        && matches!(ty, crate::kquant::GgmlType::Q8_0)
+        && pf_tc_gemm_eligible(nt, k, n, min_m);
+    if tc {
+        TC_MAX_TOKENS
+    } else {
+        128
+    }
+}
+
+/// テンソルコア GEMM のカーネル (PTX は実行時読み込み)。
+struct TcGemm {
+    /// モジュールは生かしておく必要がある (関数ハンドルの持ち主)。
+    #[allow(dead_code)]
+    module: CUmodule,
+    q8_0: CUfunction,
+}
+
+unsafe impl Send for TcGemm {}
+unsafe impl Sync for TcGemm {}
+
+static TC_GEMM: OnceLock<Option<TcGemm>> = OnceLock::new();
+
+/// PTX の置き場所。`DENNO_PF_TC_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_gemm_tc.ptx`。
+fn tc_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_TC_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gemm_tc.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける
+/// (= 二度と試さない)。**current context を張った後に呼ぶこと**。
+fn tc_gemm_kernels() -> Option<&'static TcGemm> {
+    TC_GEMM
+        .get_or_init(|| {
+            let path = tc_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[pf-tc] PTX が読めない ({}) : {e} → 従来の GEMM へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0); // cuModuleLoadData は NUL 終端の PTX を期待する
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[pf-tc] cuModuleLoadData 失敗 → 従来の GEMM へ");
+                    return None;
+                }
+                // 変数名 `q8_0` は kernel_invariants の起動サイト表
+                // (`module_get_function(&mut X, ..)` と `fns.X` の対応) が読む。
+                let mut q8_0: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(
+                    &mut q8_0,
+                    module,
+                    b"dno_gemm_tc_q8_0_w\0".as_ptr() as *const c_char,
+                ) != CUDA_SUCCESS
+                {
+                    eprintln!("[pf-tc] PTX に dno_gemm_tc_q8_0_w が無い → 従来の GEMM へ");
+                    return None;
+                }
+                Some(TcGemm { module, q8_0 })
+            }
+        })
+        .as_ref()
+}
+
+/// テンソルコア GEMM を `TC_MAX_TOKENS` 行ずつ起動する (w / x / out はデバイス)。
+fn tc_gemm_launch(
+    ctx: &CudaCtx,
+    fns: &TcGemm,
+    wptr: CUdeviceptr,
+    xptr: CUdeviceptr,
+    optr: CUdeviceptr,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    row_bytes: usize,
+) -> Result<()> {
+    if nt == 0 {
+        return Ok(());
+    }
+    let grid_x = (n_out / TC_BN) as u32;
+    let mut t0 = 0usize;
+    while t0 < nt {
+        let m = (nt - t0).min(TC_MAX_TOKENS);
+        let grid_y = m.div_ceil(TC_BM) as u32;
+        let (mut pw, mut px, mut po) = (
+            wptr,
+            xptr + (t0 * n_in * 4) as CUdeviceptr,
+            optr + (t0 * n_out * 4) as CUdeviceptr,
+        );
+        let (mut m_c, mut ni_c, mut no_c, mut rb_c) = (
+            m as c_int,
+            n_in as c_int,
+            n_out as c_int,
+            row_bytes as c_int,
+        );
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut m_c as *mut _ as *mut c_void,
+            &mut ni_c as *mut _ as *mut c_void,
+            &mut no_c as *mut _ as *mut c_void,
+            &mut rb_c as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            ctx.launch_async(fns.q8_0, (grid_x, grid_y, 1), (256, 1, 1), 0, &mut args)?;
+        }
+        t0 += m;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod pf_tc_tests {
+    use super::*;
+
+    /// env の真理値表 (ゲートの解釈を固定する。既定は on)。
+    #[test]
+    fn pf_tc_gate_truth_table() {
+        assert!(pf_tc_gemm_from_value(None), "未設定は既定 on");
+        for v in ["0", "off", "false", "no", "", " OFF "] {
+            assert!(!pf_tc_gemm_from_value(Some(v)), "{v}");
+        }
+        for v in ["1", "on", "true", "yes", " ON "] {
+            assert!(pf_tc_gemm_from_value(Some(v)), "{v}");
+        }
+        assert_eq!(pf_tc_min_m_from_value(None), 64);
+        assert_eq!(pf_tc_min_m_from_value(Some("0")), 64);
+        assert_eq!(pf_tc_min_m_from_value(Some("abc")), 64);
+        assert_eq!(pf_tc_min_m_from_value(Some("1")), 1);
+        assert_eq!(pf_tc_min_m_from_value(Some(" 512 ")), 512);
+    }
+
+    /// ゲートが env/強制上書きで切り替わること (テストは 1 プロセス並列なので
+    /// 既定値だけを見る: 強制は set/戻しを対で行う)。
+    #[test]
+    fn pf_tc_gate_force_switch() {
+        let before = pf_tc_gemm_on();
+        set_pf_tc_gemm_for_test(Some(true));
+        assert!(pf_tc_gemm_on());
+        set_pf_tc_gemm_for_test(Some(false));
+        assert!(!pf_tc_gemm_on());
+        set_pf_tc_gemm_for_test(None);
+        assert_eq!(pf_tc_gemm_on(), before);
+    }
+
+    /// 実モデルの形 (ssm qkv 16384×2560 / full qkv 13312×2560 / out 2560×6144 /
+    /// shared 640×2560, 640×2560) がすべて前提を満たすこと。
+    #[test]
+    fn pf_tc_eligibility_real_shapes() {
+        for (n_in, n_out) in [
+            (2560usize, 16384usize),
+            (2560, 10240),
+            (2560, 6144),
+            (2560, 13312),
+            (6144, 2560),
+            (2560, 640),
+            (640, 2560),
+        ] {
+            assert!(
+                pf_tc_gemm_eligible(512, n_in, n_out, 64),
+                "k={n_in} n={n_out}"
+            );
+        }
+        // 19 トークンの next turn prefill は従来カーネル (M の下限)。
+        assert!(!pf_tc_gemm_eligible(19, 2560, 16384, 64));
+        assert!(pf_tc_gemm_eligible(19, 2560, 16384, 1));
+        // ブロック形に合わない形は fail closed。
+        for (n_in, n_out) in [(2559usize, 1024usize), (2560, 1024 + 1), (2560, 32)] {
+            assert!(!pf_tc_gemm_eligible(512, n_in, n_out, 64), "k={n_in} n={n_out}");
+        }
+    }
+
+    /// タイルの索引算術を CPU ミラーで確かめる (`kernels_gemm_tc.cu` の
+    /// デコード配置・warp の担当範囲・書き出し条件を 1 対 1 で写す)。
+    ///
+    /// GPU 実測の代わりではない。**どの要素がどのスレッド/warp/スロットに
+    /// 入るか**の取り違えだけが落ちる。
+    #[test]
+    fn pf_tc_tile_index_mirror() {
+        // 1. 重みタイル: 256 スレッド × 8 要素が [64][32] をちょうど 1 回覆う。
+        let mut seen = vec![false; TC_BN * TC_BK];
+        for tid in 0..256usize {
+            let e0 = tid * 8;
+            let row = e0 >> 5;
+            let j = e0 & 31;
+            assert!(row < TC_BN && j + 8 <= TC_BK);
+            for u in 0..8 {
+                let idx = row * TC_BK + j + u;
+                assert!(!seen[idx], "重みスロットの二重書き row={row} j={j}");
+                seen[idx] = true;
+            }
+        }
+        assert!(seen.iter().all(|&b| b), "重みスロットの取りこぼし");
+
+        // 2. 入力タイル: 256 スレッド × 16 要素 (8 × 2) が [128][32] を覆う。
+        let mut seen = vec![false; TC_BM * TC_BK];
+        for tid in 0..256usize {
+            for half in 0..2usize {
+                let e0 = (tid + half * 256) * 8;
+                let tok = e0 >> 5;
+                let j = e0 & 31;
+                assert!(tok < TC_BM && j + 8 <= TC_BK);
+                for u in 0..8 {
+                    let idx = tok * TC_BK + j + u;
+                    assert!(!seen[idx], "入力スロットの二重書き tok={tok} j={j}");
+                    seen[idx] = true;
+                }
+            }
+        }
+        assert!(seen.iter().all(|&b| b), "入力スロットの取りこぼし");
+
+        // 3. warp のアキュムレータ (4(M) × 2(N) の warp × 2 × 2 タイル) が
+        //    [128][64] をちょうど 1 回覆い、行/列の先頭が 16 の倍数であること。
+        let mut seen = vec![false; TC_BM * TC_BN];
+        for warp in 0..8usize {
+            let (wm, wn) = (warp & 3, warp >> 2);
+            for i in 0..2usize {
+                let mrow = wm * 32 + i * 16;
+                assert_eq!(mrow % 16, 0);
+                for j in 0..2usize {
+                    let ncol = wn * 32 + j * 16;
+                    assert_eq!(ncol % 16, 0);
+                    for r in 0..16usize {
+                        for c in 0..16usize {
+                            let idx = (mrow + r) * TC_BN + ncol + c;
+                            assert!(!seen[idx], "アキュムレータの二重担当");
+                            seen[idx] = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().all(|&b| b), "アキュムレータの取りこぼし");
+
+        // 4. 端数タイル: M が 128 の倍数でないとき、書き出す行が nt 未満だけに
+        //    なること (mrow + 16 > nt のタイルはステージ経由)。
+        for nt in [1usize, 17, 63, 65, 127, 128, 129, 194, 512, 1024, 2048] {
+            for warp in 0..8usize {
+                let mwarp = warp & 3;
+                for i in 0..2usize {
+                    let mrow = mwarp * 32 + i * 16;
+                    let direct = mrow + 16 <= nt;
+                    let staged = !direct && mrow < nt;
+                    if staged {
+                        assert!(nt - mrow < 16);
+                    }
+                    if direct {
+                        assert!(mrow + 16 <= nt);
+                    }
+                }
+            }
+        }
+
+        // 5. 静的共有メモリの見積り (カーネル側の宣言と対) が上限に収まること。
+        let smem = TC_BN * TC_BK * 2 + TC_BM * TC_BK * 2 + 8 * 16 * 16 * 4;
+        assert_eq!(smem, 20_480, "共有メモリの合計が 20 KiB でない");
+        assert!(smem <= 48 * 1024, "静的 smem の上限 (48 KiB) を超えない");
+    }
+
+    /// `gemm_try` のまとめ幅: TC が使えるときだけ 2048、それ以外は 128。
+    #[test]
+    fn pf_tc_gemm_try_tile() {
+        use crate::kquant::GgmlType as T;
+        for (k, n) in [
+            (2560usize, 16384usize),
+            (2560, 13312),
+            (6144, 2560),
+            (640, 2560),
+        ] {
+            assert_eq!(gemm_try_tile_for(true, T::Q8_0, 512, k, n, 64), TC_MAX_TOKENS);
+            assert_eq!(gemm_try_tile_for(false, T::Q8_0, 512, k, n, 64), 128);
+        }
+        // 19 トークンの next turn は従来の 128 のまま (1 回で収まる)。
+        assert_eq!(gemm_try_tile_for(true, T::Q8_0, 19, 2560, 16384, 64), 128);
+        // Q8_0 以外と、ブロック形が合わない形も従来のまま。
+        assert_eq!(gemm_try_tile_for(true, T::Q5K, 512, 2560, 16384, 64), 128);
+        assert_eq!(gemm_try_tile_for(true, T::Q8_0, 512, 2559, 16384, 64), 128);
+        assert_eq!(gemm_try_tile_for(true, T::Q8_0, 512, 2560, 1000, 64), 128);
+        assert_eq!(TC_MAX_TOKENS, 2048);
+    }
+
+    /// 端数 M のときにステージ経由で写す行数が 0..15 に収まること (境界の固定)。
+    #[test]
+    fn pf_tc_partial_rows() {
+        for nt in [1usize, 15, 16, 17, 128, 129, 2047, 2048] {
+            for warp in 0..8usize {
+                let mwarp = warp & 3;
+                for i in 0..2usize {
+                    let mrow = mwarp * 32 + i * 16;
+                    if mrow < nt && mrow + 16 > nt {
+                        let rows = nt - mrow;
+                        assert!(rows >= 1 && rows <= 15, "nt={nt} mrow={mrow}");
+                    }
+                }
+            }
         }
     }
 }
@@ -26865,6 +27371,19 @@ fn gguf_gemm_dev_launch(
     use crate::kquant::GgmlType as T;
     const ROWS: usize = 16; // kernels_gemm.cu の GEMM_ROWS
     const NTG_MAX: usize = 8; // kernels_gemm.cu の GEMM_NTG_MAX
+    // task 169: Q8_0 は BF16 テンソルコア GEMM (ゲート on・形が合うとき)。
+    // 従来カーネルの 128 トークン上限を外し、2048 トークンまで 1 起動で畳む。
+    if matches!(ty, T::Q8_0)
+        && pf_tc_gemm_on()
+        && pf_tc_gemm_eligible(nt, n_in, n_out, pf_tc_min_m())
+    {
+        if let Some(rb) = gguf_row_bytes(ty, n_in) {
+            if let Some(tc) = tc_gemm_kernels() {
+                tc_gemm_launch(ctx, tc, wptr, xptr, optr, nt, n_in, n_out, rb)?;
+                return Ok(true);
+            }
+        }
+    }
     let Some(fs) = ctx.f_gemm_q else {
         return Ok(false);
     };
@@ -27029,14 +27548,26 @@ pub fn gdn_pf_chain(
     })?;
     let (px, po, pqkv, pz, py, pb, pa) = (ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6]);
 
+    // task 169: 3 本の投影がすべてテンソルコア GEMM の前提を満たすときだけ、
+    // 1 起動でチャンク全体 (最大 TC_MAX_TOKENS 行) を回す。満たさないときは
+    // 従来どおり 128 トークンずつ (旧カーネルの上限)。
+    let tc_ready = pf_tc_gemm_on()
+        && matches!(wq.qkv.ty, crate::kquant::GgmlType::Q8_0)
+        && matches!(wq.gate.ty, crate::kquant::GgmlType::Q8_0)
+        && matches!(wout.ty, crate::kquant::GgmlType::Q8_0)
+        && pf_tc_gemm_eligible(nt, e, conv_dim, pf_tc_min_m())
+        && pf_tc_gemm_eligible(nt, e, vd, pf_tc_min_m())
+        && pf_tc_gemm_eligible(nt, vd, e, pf_tc_min_m())
+        && tc_gemm_kernels().is_some();
+    let gemm_tile = if tc_ready { TC_MAX_TOKENS } else { 128 };
+
     // ---- qkv / z 投影 (デバイス → デバイス) --------------------------------
     {
         let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_QKV);
         let t_ph = Instant::now();
-        const TILE: usize = 128;
         let mut t0 = 0usize;
         while t0 < nt {
-            let m = (nt - t0).min(TILE);
+            let m = (nt - t0).min(gemm_tile);
             let xo = px + (t0 * e * 4) as CUdeviceptr;
             let qo = pqkv + (t0 * conv_dim * 4) as CUdeviceptr;
             let zo = pz + (t0 * vd * 4) as CUdeviceptr;
@@ -27134,10 +27665,9 @@ pub fn gdn_pf_chain(
     let t_out = Instant::now();
     {
         let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_OUT);
-        const TILE: usize = 128;
         let mut t0 = 0usize;
         while t0 < nt {
-            let m = (nt - t0).min(TILE);
+            let m = (nt - t0).min(gemm_tile);
             let yo = py + (t0 * vd * 4) as CUdeviceptr;
             let oo = po + (t0 * e * 4) as CUdeviceptr;
             match gguf_gemm_dev_launch(&ctx, wout.ty, wo.buf.ptr(), yo, oo, m, vd, e) {
