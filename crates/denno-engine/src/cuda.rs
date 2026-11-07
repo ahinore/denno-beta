@@ -14647,8 +14647,10 @@ const ATTN_FLASHDEC_CHUNK_DEFAULT: usize = 64;
 /// 1 分割の key 数の下限 (これ未満に割ると block だけ増えて無駄)。
 const ATTN_FLASHDEC_CHUNK_MIN: usize = 32;
 
-/// `DENNO_ATTN_FLASHDEC` の既定。lab t160a の結果で決める。
-const ATTN_FLASHDEC_DEFAULT: bool = false;
+/// `DENNO_ATTN_FLASHDEC` の既定。lab t163a (新ホスト、depth8k) で採用:
+/// 14,157 next turn 31 -> 27 ms/tok (-12.9%)、3,965 27 -> 26 (-3.7%)、
+/// 短い decode と prefill は 2% 以内、md5 SAME。既定 on。
+const ATTN_FLASHDEC_DEFAULT: bool = true;
 /// この KV 本数未満は従来カーネル (`DENNO_ATTN_FLASHDEC_MIN_CTX`)。
 const ATTN_FLASHDEC_MIN_CTX_DEFAULT: usize = 1024;
 
@@ -19419,6 +19421,11 @@ mod q4_attn_tests {
     /// task 160: flash decoding のゲートの解釈 (純関数)。
     #[test]
     fn attn_flashdec_gate_parses() {
+        // task 163: lab t163a の結果で既定 on にした (うっかり戻したらここで落ちる)。
+        assert!(
+            ATTN_FLASHDEC_DEFAULT,
+            "flash decoding は t163a で採用済み (既定 on が契約)"
+        );
         assert!(parse_attn_flashdec(Some("1")));
         assert!(!parse_attn_flashdec(Some("0")));
         assert_eq!(parse_attn_flashdec(Some("x")), ATTN_FLASHDEC_DEFAULT);
