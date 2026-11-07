@@ -490,6 +490,8 @@ pub fn grouped_rms_norm_batch_into(
     assert!(e >= 1, "n_embd が 0");
     assert_eq!(w_norm.len(), hc_dim, "w_norm は [hc][n_embd] (変換器が 1+w に畳んだ値)");
     assert_eq!(out.len(), xs.len() * hc_dim, "out は [nt][hc][n_embd]");
+    // task 154: 台帳の副区間 (norm)。
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_NORM);
     for (t, x) in xs.iter().enumerate() {
         assert_eq!(x.hc, hc, "トークン {t}: ストリーム本数が hc と一致しない");
         assert_eq!(x.n_embd, e, "トークン {t}: ストリーム次元が n_embd と一致しない");
@@ -547,6 +549,7 @@ pub fn grouped_rms_norm_batch(xs: &[HyperStreams], w_norm: &[f32], p: &HyperPara
 pub fn hc_lo_apply_batch(lo: &mut [f32], nt: usize, p: &HyperParams) {
     assert!(p.low_rank >= 1, "low_rank が 0");
     assert_eq!(lo.len(), nt * p.low_rank, "lo は [nt][low_rank]");
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_ELEM);
     let inv_hc = 1.0f32 / p.hc as f32;
     for row in lo.chunks_exact_mut(p.low_rank) {
         for v in row.iter_mut() {
@@ -574,6 +577,8 @@ pub fn hc_mixed_batch_into(
     assert_eq!(xn.len(), nt * hc_dim, "xn は [nt][hc][n_embd]");
     assert_eq!(gate.len(), xn.len(), "gate は xn と同じ長さ ([nt][hc][n_embd])");
     assert_eq!(out.len(), nt * e, "out は [nt][n_embd]");
+    // task 154: 台帳の副区間 (gating / 残差の要素演算)。
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_ELEM);
 
     let inv_hc = 1.0f32 / hc as f32;
     let fill = |m: &mut [f32], x: &[f32], g: &[f32]| {
@@ -624,6 +629,7 @@ pub fn hc_mixed_batch(xn: &[f32], gate: &[f32], nt: usize, p: &HyperParams) -> V
 pub fn hc_inject_apply_batch(v: &mut [f32], nt: usize, p: &HyperParams) {
     assert!(p.hc >= 1, "hc が 0");
     assert_eq!(v.len(), nt * p.hc, "inject は [nt][hc]");
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_ELEM);
     let inv_hc = 1.0f32 / p.hc as f32;
     for row in v.chunks_exact_mut(p.hc) {
         for x in row.iter_mut() {
@@ -661,6 +667,7 @@ pub fn hc_combine_batch(
         );
     }
 
+    let _sub = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_ELEM);
     let fill = |r: &mut HyperStreams, bo: &[f32], inj: &[f32]| {
         for s in 0..hc {
             // 逐次版と同じ式・同じ順序: out = residual + block_out * (2*sigmoid(inject))
