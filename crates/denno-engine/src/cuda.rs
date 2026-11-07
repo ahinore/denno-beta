@@ -4356,6 +4356,9 @@ struct ExpPfKernels {
     fns: [CUfunction; crate::model::exp_pf::SLOTS],
     /// silu(g) * u
     silu: CUfunction,
+    /// task 162: 行の加重和 (`dno_exp_pf_accum`)。task 151 で未使用に戻した
+    /// カーネルで、PTX には定義だけ残っている。ストリーミング経路だけが使う。
+    accum: Option<CUfunction>,
 }
 
 unsafe impl Send for ExpPfKernels {}
@@ -4429,7 +4432,26 @@ fn exp_pf_kernels() -> Option<&'static ExpPfKernels> {
                     return None;
                 }
             }
-            Some(ExpPfKernels { module, fns, silu })
+            // task 162: 行の加重和カーネル。無くても通常の prefill は動くので
+            // 任意 (ストリーミング経路だけが `None` を見て CPU へ落ちる)。
+            let mut accum: CUfunction = std::ptr::null_mut();
+            let mut cname = crate::model::exp_pf::ACCUM_KERNEL.as_bytes().to_vec();
+            cname.push(0);
+            let accum = unsafe {
+                if (lib.module_get_function)(&mut accum, module, cname.as_ptr() as *const c_char)
+                    == CUDA_SUCCESS
+                {
+                    Some(accum)
+                } else {
+                    None
+                }
+            };
+            Some(ExpPfKernels {
+                module,
+                fns,
+                silu,
+                accum,
+            })
         })
         .as_ref()
 }
@@ -4461,6 +4483,10 @@ struct PfScratch {
     seg: Option<DevBuffer>,
     rows_gu: Option<DevBuffer>,
     rows_id: Option<DevBuffer>,
+    /// task 162: 行の加重和 (ストリーミング経路) 用。
+    prow: Option<DevBuffer>,
+    wrow: Option<DevBuffer>,
+    oacc: Option<DevBuffer>,
 }
 
 impl PfScratch {
@@ -4477,6 +4503,9 @@ impl PfScratch {
             seg: None,
             rows_gu: None,
             rows_id: None,
+            prow: None,
+            wrow: None,
+            oacc: None,
         }
     }
 }
@@ -4735,6 +4764,1041 @@ pub fn moe_experts_iq_pf_layer(
             }
             Ok(false)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 162: prefill のミス expert を載せるステージング (2 枚 + pinned + 別ストリーム)
+// ---------------------------------------------------------------------------
+//
+// task 156 のステージングを、新型ホスト (PCIe Gen5 x16、H2D 52.6 GB/s pinned /
+// 19.6 GB/s pageable) 向けに作り直したもの。task 156 との違いは 3 つ。
+//
+// 1. 2 枚のステージング (ダブルバッファ) に分け、グループ i+1 の H2D を
+//    グループ i の計算と重ねる。上げは専用の**非ブロッキング**ストリームへ積む
+//    (blocking にすると legacy の null ストリームと暗黙に同期して 1 バイトも
+//    重ならない)。計算側は自分のグループの完了イベントだけを待つ。
+// 2. pinned のバウンスバッファ経由 (`DENNO_PF_STREAM_PIN=1`、既定)。ホストの
+//    写しは rayon で並列化する (`0` は pageable の同期コピー = task 156 と同じ)。
+//    **注意**: pinned 経由は「ページキャッシュ → pinned」の写しがホストの
+//    DRAM 帯域を食うので、pageable の driver staging より速いとは限らない。
+//    実測は `[exp-pf-stream] probe_GBs=` (最初のグループを同期で測った実速度) で見る。
+// 3. ステージングは `cuMemAlloc` を直接叩き、**decode の LRU を 1 本も動かさない**。
+//    `DevBuffer::alloc_tagged` の確保失敗フォールバックは expert を追い出すので
+//    ここでは使わない。空きが 768 MiB を切らない範囲だけ使う (t156b の事故)。
+
+/// ステージングの行列先頭のアラインメント (カーネルの読み出しに十分な 256 B)。
+const PF_STAGE_ALIGN: usize = 256;
+
+/// カードに残す余裕 (MiB)。ステージングはこれを食い潰さない。
+const PF_STAGE_RESERVE_MB: usize = 768;
+
+/// ステージング 1 枚の最小サイズ (MiB)。これ未満しか取れないなら諦める。
+const PF_STAGE_MIN_MB: usize = 16;
+
+/// ステージングの枚数 (多重バッファ)。
+///
+/// 2 枚だと「グループ g+1 の写し」が「グループ g-1 の計算」の完了待ちに
+/// 引っかかり、ホストの写しと DMA が計算と直列になる (lab t162b: chunk 2048 で
+/// 1 グループ 4.4 ms = 計算 2.6 + 写し 0.9 + DMA 0.8 の和)。3 枚にすると
+/// 写しは 2 つ前のグループの計算と重なる。
+const PF_STAGE_SLOTS: usize = 3;
+
+fn pf_stage_align_up(x: usize) -> usize {
+    x.div_ceil(PF_STAGE_ALIGN) * PF_STAGE_ALIGN
+}
+
+/// ステージング 1 枚。
+struct PfSlot {
+    buf: Option<DevBuffer>,
+    cap: usize,
+    /// 一度でも H2D を発行したか (`ev_use` の有効性)。
+    used: bool,
+    /// この枚への H2D の完了。
+    ev_up: Option<CopyEvent>,
+    /// この枚を読むカーネルの完了 (再利用の前に待つ)。
+    ev_use: Option<CopyEvent>,
+}
+
+impl PfSlot {
+    fn new() -> Self {
+        PfSlot {
+            buf: None,
+            cap: 0,
+            used: false,
+            ev_up: None,
+            ev_use: None,
+        }
+    }
+}
+
+/// スレッドごとのステージング一式。
+struct PfStream {
+    slot: [PfSlot; PF_STAGE_SLOTS],
+    /// スロットごとの pinned バウンスバッファ (grow-only)。
+    pin: [Option<PinMem>; PF_STAGE_SLOTS],
+    /// H2D 専用の非ブロッキングストリーム。
+    up: Option<CopyStream>,
+    /// 実 H2D を 1 回だけ測る。
+    probed: bool,
+}
+
+impl PfStream {
+    fn new() -> Self {
+        PfStream {
+            slot: std::array::from_fn(|_| PfSlot::new()),
+            pin: std::array::from_fn(|_| None),
+            up: None,
+            probed: false,
+        }
+    }
+}
+
+thread_local! {
+    static PF_STREAM: std::cell::RefCell<PfStream> =
+        std::cell::RefCell::new(PfStream::new());
+    /// task 162: 活性 (`xs`, 層ごとに 20 MB 級) の pinned 転送元。
+    static PF_XPIN: std::cell::RefCell<Option<PinMem>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// ステージングを解放する (prefill の終端)。
+///
+/// decode のあいだ抱えたままだと expert の LRU がその分だけ狭くなるので、
+/// リクエストの終わりに必ず返す。
+pub fn pf_stream_release() {
+    let _ = PF_STREAM.try_with(|cell| {
+        let mut st = cell.borrow_mut();
+        for s in st.slot.iter_mut() {
+            *s = PfSlot::new();
+        }
+        for p in st.pin.iter_mut() {
+            *p = None;
+        }
+        st.up = None;
+        st.probed = false;
+    });
+}
+
+/// ステージングの現在の使用量 (確保バイト, 残り空き MiB)。診断用。
+pub fn pf_stage_usage() -> (usize, usize) {
+    PF_STREAM.with(|cell| {
+        let st = cell.borrow();
+        let cap: usize = st.slot.iter().map(|s| s.cap).sum();
+        (cap, dev_mem_mb().map(|(f, _)| f).unwrap_or(0))
+    })
+}
+
+/// 空き VRAM から余裕を引いた範囲で確保する (半分ずつ落とす)。
+///
+/// `DevBuffer::alloc_tagged` は失敗すると expert を追い出すので**使わない**
+/// (decode の在庫を動かさないのがこの経路の前提)。
+fn pf_stage_alloc(want: usize) -> Option<DevBuffer> {
+    if want == 0 {
+        return None;
+    }
+    let free_mb = dev_mem_mb().map(|(f, _)| f).unwrap_or(0);
+    let room = free_mb.saturating_sub(PF_STAGE_RESERVE_MB) << 20;
+    let mut want = want.min(room);
+    while want >= (PF_STAGE_MIN_MB << 20) {
+        if let Ok(ptr) = DevBuffer::raw_alloc(want) {
+            crate::mem_audit::note_alloc(crate::mem_audit::TAG_EXPERTS, want.max(1));
+            return Some(DevBuffer {
+                ptr,
+                bytes: want,
+                owned: true,
+                tag: crate::mem_audit::TAG_EXPERTS,
+            });
+        }
+        want /= 2;
+    }
+    None
+}
+
+/// 1 グループの上げの結果。
+struct PfPump {
+    /// グループ内の expert の (gate, up, down) デバイスポインタ (items と同じ順)。
+    ptrs: Vec<[u64; 3]>,
+    /// 上げたバイト数。
+    bytes: usize,
+    /// ホスト側の写しの時間。
+    copy_ns: u64,
+    /// 最初の 1 回だけ測った H2D (バイト, 時間)。
+    probe: Option<(usize, u64)>,
+}
+
+/// グループ `g` をスロット `g % 2` へ上げる。
+///
+/// `items` は (expert 番号, [gate, up, down] のホストバイト列)。
+/// **同じスロットを使った 2 つ前のグループの計算完了を待ってから**書き込む。
+fn pf_pump_in(
+    st: &mut PfStream,
+    g: u64,
+    items: &[(u16, [&[u8]; 3])],
+    pinned: bool,
+) -> Result<PfPump> {
+    let s = (g as usize) % PF_STAGE_SLOTS;
+    let mut lens: Vec<[usize; 3]> = Vec::with_capacity(items.len());
+    let mut need = 0usize;
+    for (_, b) in items {
+        let l = [b[0].len(), b[1].len(), b[2].len()];
+        need += l
+            .iter()
+            .map(|&x| pf_stage_align_up(x))
+            .sum::<usize>();
+        lens.push(l);
+    }
+    // 1. 再利用の前に、このスロットを読んだ計算の完了を待つ。
+    if st.slot[s].used {
+        if let Some(ev) = st.slot[s].ev_use.as_ref() {
+            let Some(es) = lib()?.event_sync else {
+                bail!("cuEventSynchronize が無い");
+            };
+            unsafe {
+                check(es(ev.0), "cuEventSynchronize (stage use)")?;
+            }
+        }
+    }
+    // 2. 確保 (足りなければこの 1 回だけ広げる)。
+    if st.slot[s].cap < need {
+        let want = need.max(PF_STAGE_MIN_MB << 20);
+        match pf_stage_alloc(want) {
+            Some(b) => {
+                st.slot[s].cap = b.bytes();
+                st.slot[s].buf = Some(b);
+            }
+            None => bail!(
+                "ステージング {} MiB を確保できない (空き {} MiB)",
+                want >> 20,
+                dev_mem_mb().map(|(f, _)| f).unwrap_or(0)
+            ),
+        }
+    }
+    // 確保できたサイズが必要量に足りないなら、このグループは上げない
+    // (呼び出し側が従来経路へ落ちる)。
+    if st.slot[s].cap < need {
+        bail!(
+            "ステージングが足りない (必要 {} MiB / 確保 {} MiB)",
+            need >> 20,
+            st.slot[s].cap >> 20
+        );
+    }
+    let base = st.slot[s].buf.as_ref().expect("確保済み").ptr();
+    // 3. デバイス側の置き場所を決める。
+    let mut cursor = 0usize;
+    let mut ptrs: Vec<[u64; 3]> = Vec::with_capacity(items.len());
+    for l in &lens {
+        let mut p = [0u64; 3];
+        for m in 0..3 {
+            p[m] = base + cursor as u64;
+            cursor += pf_stage_align_up(l[m]);
+        }
+        ptrs.push(p);
+    }
+    let t_copy = std::time::Instant::now();
+    let mut probe: Option<(usize, u64)> = None;
+    if pinned {
+        // 4a. pinned へ並列に写してから、非同期で H2D を積む。
+        let up = match st.up.as_ref() {
+            Some(u) => u.0,
+            None => {
+                let l = lib()?;
+                let (Some(create), Some(ec)) = (l.stream_create, l.event_create) else {
+                    bail!("cuStreamCreate / cuEventCreate が無い");
+                };
+                let mut h: CUstream = std::ptr::null_mut();
+                const CU_STREAM_NON_BLOCKING: u32 = 0x01;
+                unsafe {
+                    if create(&mut h, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS {
+                        bail!("cuStreamCreate が失敗");
+                    }
+                }
+                st.up = Some(CopyStream(h));
+                // イベントはスロットごとに 1 本ずつ。
+                for i in 0..PF_STAGE_SLOTS {
+                    if st.slot[i].ev_up.is_none() {
+                        let mut ev: CUevent = std::ptr::null_mut();
+                        const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
+                        unsafe {
+                            if ec(&mut ev, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS {
+                                bail!("cuEventCreate が失敗");
+                            }
+                        }
+                        st.slot[i].ev_up = Some(CopyEvent(ev));
+                    }
+                    if st.slot[i].ev_use.is_none() {
+                        let mut ev: CUevent = std::ptr::null_mut();
+                        const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
+                        unsafe {
+                            if ec(&mut ev, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS {
+                                bail!("cuEventCreate (use) が失敗");
+                            }
+                        }
+                        st.slot[i].ev_use = Some(CopyEvent(ev));
+                    }
+                }
+                h
+            }
+        };
+        {
+            let cap = st.pin[s].as_ref().map(|p| p.bytes).unwrap_or(0);
+            if cap < need {
+                st.pin[s] = Some(PinMem::alloc(need.max(1))?);
+            }
+        }
+        let pin = st.pin[s].as_ref().expect("確保済み");
+        let pin_base = pin.ptr as usize;
+        // (dst オフセット, バイト列) を並べる。
+        let mut parts: Vec<(usize, &[u8])> = Vec::with_capacity(items.len() * 3);
+        let mut cursor = 0usize;
+        for (i, (_, b)) in items.iter().enumerate() {
+            for m in 0..3 {
+                if !b[m].is_empty() {
+                    parts.push((cursor, b[m]));
+                }
+                cursor += pf_stage_align_up(lens[i][m]);
+            }
+        }
+        #[cfg(feature = "par")]
+        {
+            use rayon::prelude::*;
+            parts.par_iter().for_each(|&(off, bytes)| unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    (pin_base + off) as *mut u8,
+                    bytes.len(),
+                );
+            });
+        }
+        #[cfg(not(feature = "par"))]
+        {
+            for &(off, bytes) in parts.iter() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        (pin_base + off) as *mut u8,
+                        bytes.len(),
+                    );
+                }
+            }
+        }
+        let copy_ns = t_copy.elapsed().as_nanos() as u64;
+        // 5a. **グループ全体を 1 回の非同期コピーで積む**。
+        //     pinned のレイアウトはステージングのレイアウトと同じなので、行列ごとに
+        //     分ける必要が無い。1 本ずつ積むと 1 expert 3 回 = 1 グループ 96 回に
+        //     なり、`cuMemcpyHtoDAsync` の呼び出し固定費 (実測 ~20-70 us) が DMA の
+        //     実時間を上回る (lab t162a: chunk 2048 で 105 GB に 14 s)。
+        //     端数のパディングも一緒に運ぶが、カーネルは読まない。
+        let l = lib()?;
+        let t_dma = std::time::Instant::now();
+        if need > 0 {
+            unsafe {
+                check(
+                    (l.memcpy_htod_async)(base, pin.ptr, need, up),
+                    "cuMemcpyHtoDAsync (stage)",
+                )?;
+            }
+        }
+        dbg_htod(need);
+        // 6a. 完了イベントを積む。
+        let Some(record) = l.event_record else {
+            bail!("cuEventRecord が無い");
+        };
+        if let Some(ev) = st.slot[s].ev_up.as_ref() {
+            unsafe {
+                check(record(ev.0, up), "cuEventRecord (stage up)")?;
+            }
+        }
+        // 7a. 最初の 1 回だけ実速度を測る (同期して待つ)。
+        if !st.probed {
+            st.probed = true;
+            if let Some(ev) = st.slot[s].ev_up.as_ref() {
+                let Some(es) = l.event_sync else {
+                    bail!("cuEventSynchronize が無い");
+                };
+                unsafe {
+                    check(es(ev.0), "cuEventSynchronize (probe)")?;
+                }
+            }
+            let ns = t_dma.elapsed().as_nanos() as u64;
+            probe = Some((need, ns));
+        }
+        st.slot[s].used = true;
+        Ok(PfPump {
+            ptrs,
+            bytes: need,
+            copy_ns,
+            probe,
+        })
+    } else {
+        // 4b. pageable の同期コピー (task 156 と同じ)。重なりは無い。
+        let buf = st.slot[s].buf.as_ref().expect("確保済み");
+        let mut cursor = 0usize;
+        for (i, (_, b)) in items.iter().enumerate() {
+            for m in 0..3 {
+                if !b[m].is_empty() {
+                    buf.copy_from_at(cursor, b[m])?;
+                }
+                cursor += pf_stage_align_up(lens[i][m]);
+            }
+        }
+        let copy_ns = t_copy.elapsed().as_nanos() as u64;
+        dbg_htod(need);
+        st.slot[s].used = true;
+        Ok(PfPump {
+            ptrs,
+            bytes: need,
+            copy_ns,
+            probe: None,
+        })
+    }
+}
+
+/// グループ `g` の H2D 完了を待つ (ホスト)。待ち時間 (ns) を返す。
+fn pf_wait_up_in(st: &mut PfStream, g: u64, pinned: bool) -> Result<u64> {
+    if !pinned {
+        return Ok(0);
+    }
+    let s = (g as usize) % PF_STAGE_SLOTS;
+    let Some(ev) = st.slot[s].ev_up.as_ref() else {
+        return Ok(0);
+    };
+    let Some(es) = lib()?.event_sync else {
+        return Ok(0);
+    };
+    let t = std::time::Instant::now();
+    unsafe {
+        check(es(ev.0), "cuEventSynchronize (stage up)")?;
+    }
+    Ok(t.elapsed().as_nanos() as u64)
+}
+
+/// グループ `g` の計算を積んだ後に呼ぶ (スロットの再利用判定用)。
+fn pf_mark_used_in(st: &mut PfStream, g: u64, pinned: bool) {
+    if !pinned {
+        return;
+    }
+    let s = (g as usize) % PF_STAGE_SLOTS;
+    if let Some(ev) = st.slot[s].ev_use.as_ref() {
+        if let Ok(l) = lib() {
+            if let Some(record) = l.event_record {
+                unsafe {
+                    let _ = record(ev.0, std::ptr::null_mut());
+                }
+            }
+        }
+    }
+}
+
+/// 1 グループぶんの m 行カーネルを起動する (gate, up, silu, down)。
+///
+/// `seg` は**グループの先頭**を指し、`nseg` はそのグループの segment 数。
+/// `rows` は全体表のまま (row_off が絶対添字なので offsets を足さない)。
+/// 出力 (g / u / act / h) も絶対の行添字で書かれる。
+#[allow(clippy::too_many_arguments)]
+unsafe fn pf_launch_group(
+    ctx: &CudaCtx,
+    kernels: &ExpPfKernels,
+    slot_g: usize,
+    slot_u: usize,
+    slot_d: usize,
+    pg: CUdeviceptr,
+    pu: CUdeviceptr,
+    pd: CUdeviceptr,
+    xb: CUdeviceptr,
+    gb: CUdeviceptr,
+    ub: CUdeviceptr,
+    act: CUdeviceptr,
+    hb: CUdeviceptr,
+    seg: CUdeviceptr,
+    rows_gu: CUdeviceptr,
+    rows_id: CUdeviceptr,
+    nseg: usize,
+    ro_start: usize,
+    ro_end: usize,
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    rb_g: usize,
+    rb_u: usize,
+    rb_d: usize,
+) -> Result<()> {
+    let plan_g = exp_pf::launch_plan(slot_g, nseg, ff)
+        .ok_or_else(|| anyhow::anyhow!("gate の起動形が作れない (nseg={nseg}, ff={ff})"))?;
+    let plan_d = exp_pf::launch_plan(slot_d, nseg, e)
+        .ok_or_else(|| anyhow::anyhow!("down の起動形が作れない (nseg={nseg}, e={e})"))?;
+    // gate と up (同じ行表・同じ入力)。
+    for (f, pw0, pb, rb) in [
+        (kernels.fns[slot_g], pg, gb, rb_g),
+        (kernels.fns[slot_u], pu, ub, rb_u),
+    ] {
+        let mut pw = pw0;
+        let mut px = xb;
+        let mut po = pb;
+        let mut ps = seg;
+        let mut pr = rows_gu;
+        let (mut ns, mut ni, mut no, mut rbb) = (
+            nseg as c_int,
+            n_in as c_int,
+            ff as c_int,
+            rb as c_int,
+        );
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+            &mut pr as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut no as *mut _ as *mut c_void,
+            &mut rbb as *mut _ as *mut c_void,
+        ];
+        ctx.launch_async(f, plan_g.grid, plan_g.block, 0, &mut args)?;
+    }
+    // act = silu(g) * u (このグループの行の範囲だけ)。
+    {
+        let rows_here = ro_end.saturating_sub(ro_start);
+        if rows_here > 0 {
+            let n = rows_here * ff;
+            let threads = 256usize;
+            let blocks = n.div_ceil(threads) as u32;
+            let mut pgg = gb + (ro_start * ff * 4) as u64;
+            let mut puu = ub + (ro_start * ff * 4) as u64;
+            let mut paa = act + (ro_start * ff * 4) as u64;
+            let mut pn = n as c_int;
+            let mut args = [
+                &mut pgg as *mut _ as *mut c_void,
+                &mut puu as *mut _ as *mut c_void,
+                &mut paa as *mut _ as *mut c_void,
+                &mut pn as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(
+                kernels.silu,
+                (blocks.max(1), 1, 1),
+                (threads as u32, 1, 1),
+                0,
+                &mut args,
+            )?;
+        }
+    }
+    // down (入力は act の行が詰まった形 = rows_id)。
+    {
+        let mut pw = pd;
+        let mut px = act;
+        let mut po = hb;
+        let mut ps = seg;
+        let mut pr = rows_id;
+        let (mut ns, mut ni, mut no, mut rb) = (
+            nseg as c_int,
+            ff as c_int,
+            e as c_int,
+            rb_d as c_int,
+        );
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+            &mut pr as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut no as *mut _ as *mut c_void,
+            &mut rb as *mut _ as *mut c_void,
+        ];
+        ctx.launch_async(
+            kernels.fns[slot_d],
+            plan_d.grid,
+            plan_d.block,
+            0,
+            &mut args,
+        )?;
+    }
+    Ok(())
+}
+
+/// 1 層ぶんのストリーミング入力 (plan 順)。
+///
+/// `dev` は VRAM 常駐 (ヒット) のポインタ、`host` はミスのホストバイト列。
+/// どちらか一方だけが `Some`。
+pub struct PfStreamEntry<'a> {
+    pub expert: u16,
+    pub dev: Option<[u64; 3]>,
+    pub host: Option<[&'a [u8]; 3]>,
+}
+
+/// task 162: 1 層ぶんの expert FFN を、ミスをステージングへ上げながら回す。
+///
+/// - ミスは `DENNO_PF_STREAM_GROUP` 本ずつのグループに切り、2 枚のステージングを
+///   交互に使って H2D と計算を重ねる。H2D は専用ストリーム、計算は null ストリーム。
+/// - 行の加重和は GPU の `dno_exp_pf_accum` で閉じ、D2H は `ntok × e` だけ。
+///   **和の順序は (トークン, j 昇順) の 1 本**で、CPU 経路とは丸めが変わる
+///   (FMA の縮約。task 162 で許容。decode はこの経路を通らない)。
+/// - 載せられなかったミス (容量外・確保失敗) は呼び出し側が CPU で足す。
+///
+/// `Ok(None)` = 使わなかった (`out` は触っていない)。呼び出し側は従来経路へ。
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts_iq_pf_layer_stream(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    ty_d: crate::kquant::GgmlType,
+    entries: &[PfStreamEntry<'_>],
+    seg: &[u32],
+    rows_gu: &[u32],
+    xs: &[f32],
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    ntok: usize,
+    k: usize,
+    prow: &[u32],
+    wrow: &[f32],
+    group: usize,
+    out: &mut [f32],
+) -> Result<Option<u32>> {
+    if PF_DEAD.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let nseg = entries.len();
+    let total_rows = rows_gu.len();
+    if nseg == 0
+        || total_rows == 0
+        || ntok == 0
+        || k == 0
+        || seg.len() != nseg * 4
+        || xs.len() != ntok * n_in
+        || prow.len() != ntok * k
+        || wrow.len() < ntok * k
+        || out.len() < ntok * e
+    {
+        return Ok(None);
+    }
+    if !moe_gemv_iq_pf_ready(ty_g, n_in)
+        || !moe_gemv_iq_pf_ready(ty_u, n_in)
+        || !moe_gemv_iq_pf_ready(ty_d, ff)
+    {
+        return Ok(None);
+    }
+    let (Some(slot_g), Some(slot_u), Some(slot_d)) = (
+        exp_pf::slot(ty_g),
+        exp_pf::slot(ty_u),
+        exp_pf::slot(ty_d),
+    ) else {
+        return Ok(None);
+    };
+    let Some(ctx) = shared_ctx() else {
+        return Ok(None);
+    };
+    let Some(kernels) = exp_pf_kernels() else {
+        return Ok(None);
+    };
+    let Some(accum) = kernels.accum else {
+        return Ok(None);
+    };
+    if ctx.make_current().is_err() {
+        return Ok(None);
+    }
+    let (rb_g, rb_u, rb_d) = match (
+        exp_pf::row_bytes(ty_g, n_in),
+        exp_pf::row_bytes(ty_u, n_in),
+        exp_pf::row_bytes(ty_d, ff),
+    ) {
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+        _ => return Ok(None),
+    };
+    let pinned = exp_pf::stream_pin() == 1;
+    let ng = total_rows * ff;
+    let nh = total_rows * e;
+
+    let mut work = || -> Result<Option<u32>> {
+        PF_SCRATCH.with(|cell| -> Result<Option<u32>> {
+            let mut sc = cell.borrow_mut();
+            MoeScratch::ensure(&mut sc.x, xs.len() * 4)?;
+            MoeScratch::ensure(&mut sc.g, ng * 4)?;
+            MoeScratch::ensure(&mut sc.u, ng * 4)?;
+            MoeScratch::ensure(&mut sc.act, ng * 4)?;
+            MoeScratch::ensure(&mut sc.h, nh * 4)?;
+            MoeScratch::ensure(&mut sc.pg, nseg * 8)?;
+            MoeScratch::ensure(&mut sc.pu, nseg * 8)?;
+            MoeScratch::ensure(&mut sc.pd, nseg * 8)?;
+            MoeScratch::ensure(&mut sc.seg, nseg * 16)?;
+            MoeScratch::ensure(&mut sc.rows_gu, total_rows * 4)?;
+            MoeScratch::ensure(&mut sc.rows_id, total_rows * 4)?;
+            MoeScratch::ensure(&mut sc.prow, ntok * k * 4)?;
+            MoeScratch::ensure(&mut sc.wrow, ntok * k * 4)?;
+            MoeScratch::ensure(&mut sc.oacc, ntok * e * 4)?;
+            {
+                let xb = sc.x.as_ref().expect("確保済み");
+                // task 162: 活性 (nt x n_in) は層ごとに 20 MB 級なので、pinned に
+                // 写して非同期で積む (pageable の同期コピーは 1 MB あたりが重い)。
+                // null ストリームへ積むので、この後のカーネルは順序どおり待つ。
+                let mut done_pin = false;
+                if let Ok(l) = lib() {
+                    PF_XPIN.with(|cell| {
+                        let mut slot = cell.borrow_mut();
+                        if Scratch::ensure_pin(&mut slot, xs.len() * 4).is_ok() {
+                            let pin = slot.as_ref().expect("確保済み");
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    xs.as_ptr() as *const u8,
+                                    pin.ptr as *mut u8,
+                                    xs.len() * 4,
+                                );
+                                if (l.memcpy_htod_async)(
+                                    xb.ptr(),
+                                    pin.ptr,
+                                    xs.len() * 4,
+                                    std::ptr::null_mut(),
+                                ) == CUDA_SUCCESS
+                                {
+                                    done_pin = true;
+                                }
+                            }
+                        }
+                    });
+                }
+                if !done_pin {
+                    xb.copy_from(xs)?;
+                }
+                sc.seg.as_ref().expect("確保済み").copy_from(seg)?;
+                sc.rows_gu.as_ref().expect("確保済み").copy_from(rows_gu)?;
+                let id: Vec<u32> = exp_pf::identity_rows(total_rows);
+                sc.rows_id.as_ref().expect("確保済み").copy_from(&id)?;
+                sc.prow.as_ref().expect("確保済み").copy_from(prow)?;
+                sc.wrow
+                    .as_ref()
+                    .expect("確保済み")
+                    .copy_from(&wrow[..ntok * k])?;
+            }
+            dbg_htod(xs.len() * 4 + nseg * 16 + total_rows * 4 * 2 + ntok * k * 8);
+            let xb = sc.x.as_ref().expect("確保済み").ptr();
+            let gb = sc.g.as_ref().expect("確保済み").ptr();
+            let ub = sc.u.as_ref().expect("確保済み").ptr();
+            let act = sc.act.as_ref().expect("確保済み").ptr();
+            let hb = sc.h.as_ref().expect("確保済み").ptr();
+            let segb = sc.seg.as_ref().expect("確保済み").ptr();
+            let rg = sc.rows_gu.as_ref().expect("確保済み").ptr();
+            let rid = sc.rows_id.as_ref().expect("確保済み").ptr();
+
+            // 1. ミスの本数を数え、グループ分けを決める。
+            //    容量は「2 枚に分けたステージング 1 枚ぶん」。実際に確保できる
+            //    サイズで切るので、載せられない expert は出ない (spill 0)。
+            let mut needs = vec![0usize; nseg];
+            let mut miss_total = 0usize;
+            for (i, en) in entries.iter().enumerate() {
+                if en.dev.is_some() {
+                    continue;
+                }
+                let Some(h) = en.host else {
+                    return Ok(None);
+                };
+                let need = h
+                    .iter()
+                    .map(|b| pf_stage_align_up(b.len()))
+                    .sum::<usize>();
+                if need == 0 {
+                    return Ok(None);
+                }
+                needs[i] = need;
+                miss_total += need;
+            }
+            if miss_total == 0 {
+                return Ok(None);
+            }
+            let want_slot = miss_total.min((exp_pf::stream_bytes() / PF_STAGE_SLOTS).max(1 << 20));
+            // 全枚を同じ容量で確保し、その実サイズでグループを切る
+            // (1 枚だけ小さいと交互に使えない)。
+            let mut slot_cap = 0usize;
+            PF_STREAM.with(|cell| -> Result<()> {
+                let mut st = cell.borrow_mut();
+                for i in 0..PF_STAGE_SLOTS {
+                    if st.slot[i].cap >= want_slot && st.slot[i].buf.is_some() {
+                        continue;
+                    }
+                    if let Some(b) = pf_stage_alloc(want_slot) {
+                        st.slot[i].cap = b.bytes();
+                        st.slot[i].buf = Some(b);
+                    } else {
+                        break;
+                    }
+                }
+                // 全枚の最小がこの層で使える 1 グループの上限。1 枚でも欠けたら 0。
+                slot_cap = st
+                    .slot
+                    .iter()
+                    .map(|s| if s.buf.is_some() { s.cap } else { 0 })
+                    .min()
+                    .unwrap_or(0);
+                Ok(())
+            })?;
+            if slot_cap == 0 {
+                return Ok(None);
+            }
+            let Some(bounds) = exp_pf::group_bounds(&needs, slot_cap, group) else {
+                return Ok(None);
+            };
+            // 2. グループごとに上げて計算する。`pg/pu/pd` の表は全体を 1 本で持ち、
+            //    グループの先頭を指して起動する。
+            let pg_tab = sc.pg.as_ref().expect("確保済み");
+            let pu_tab = sc.pu.as_ref().expect("確保済み");
+            let pd_tab = sc.pd.as_ref().expect("確保済み");
+            for (gi, &(a, b)) in bounds.iter().enumerate() {
+                // (a) ミスの items を作って上げる (g = グローバル通し番号)。
+                let g = gi as u64;
+                let items: Vec<(u16, [&[u8]; 3])> = entries[a..b]
+                    .iter()
+                    .filter_map(|en| en.host.map(|h| (en.expert, h)))
+                    .collect();
+                let pump = if items.is_empty() {
+                    PfPump {
+                        ptrs: Vec::new(),
+                        bytes: 0,
+                        copy_ns: 0,
+                        probe: None,
+                    }
+                } else {
+                    PF_STREAM.with(|cell| -> Result<PfPump> {
+                        let mut st = cell.borrow_mut();
+                        pf_pump_in(&mut st, g, &items, pinned)
+                    })?
+                };
+                // (b) デバイスポインタの表を書く (ミスはステージング、ヒットは常駐)。
+                let mut ip = 0usize;
+                {
+                    let mut vg = vec![0u64; b - a];
+                    let mut vu = vec![0u64; b - a];
+                    let mut vd = vec![0u64; b - a];
+                    for (j, en) in entries[a..b].iter().enumerate() {
+                        if let Some(d) = en.dev {
+                            vg[j] = d[0];
+                            vu[j] = d[1];
+                            vd[j] = d[2];
+                        } else if ip < pump.ptrs.len() {
+                            vg[j] = pump.ptrs[ip][0];
+                            vu[j] = pump.ptrs[ip][1];
+                            vd[j] = pump.ptrs[ip][2];
+                            ip += 1;
+                        } else {
+                            // 表が足りない = 内部の不整合。この層は従来経路へ。
+                            return Ok(None);
+                        }
+                    }
+                    pg_tab.copy_from_at(a * 8, &vg)?;
+                    pu_tab.copy_from_at(a * 8, &vu)?;
+                    pd_tab.copy_from_at(a * 8, &vd)?;
+                }
+                // (c) 自分のグループの H2D 完了を待つ (ホスト)。
+                let w = PF_STREAM.with(|cell| -> Result<u64> {
+                    let mut st = cell.borrow_mut();
+                    pf_wait_up_in(&mut st, g, pinned)
+                })?;
+                // (d) カーネルを積む。
+                let ro_start = seg[a * 4 + 1] as usize;
+                let ro_end = if b > a {
+                    let last = b - 1;
+                    seg[last * 4 + 1] as usize + seg[last * 4] as usize
+                } else {
+                    ro_start
+                };
+                unsafe {
+                    pf_launch_group(
+                        ctx,
+                        kernels,
+                        slot_g,
+                        slot_u,
+                        slot_d,
+                        pg_tab.ptr() + (a * 8) as u64,
+                        pu_tab.ptr() + (a * 8) as u64,
+                        pd_tab.ptr() + (a * 8) as u64,
+                        xb,
+                        gb,
+                        ub,
+                        act,
+                        hb,
+                        segb + (a * 16) as u64,
+                        rg,
+                        rid,
+                        b - a,
+                        ro_start,
+                        ro_end,
+                        n_in,
+                        ff,
+                        e,
+                        rb_g,
+                        rb_u,
+                        rb_d,
+                    )?;
+                }
+                PF_STREAM.with(|cell| {
+                    let mut st = cell.borrow_mut();
+                    pf_mark_used_in(&mut st, g, pinned);
+                });
+                let rows_here = ro_end.saturating_sub(ro_start);
+                exp_pf::note_stream_group(
+                    pump.bytes,
+                    rows_here,
+                    items.len(),
+                    pump.copy_ns,
+                    w,
+                );
+                if let Some((pb, pn)) = pump.probe {
+                    exp_pf::note_stream_probe(pb, pn);
+                }
+            }
+            // 3. 行の加重和を GPU で閉じる。
+            {
+                let prowb = sc.prow.as_ref().expect("確保済み").ptr();
+                let wb = sc.wrow.as_ref().expect("確保済み").ptr();
+                let oacc = sc.oacc.as_ref().expect("確保済み");
+                let threads = 256usize;
+                let mut ph = hb;
+                let mut pp = prowb;
+                let mut pw = wb;
+                let mut po = oacc.ptr();
+                let (mut kk, mut ee, mut nn) = (k as c_int, e as c_int, ntok as c_int);
+                let mut args = [
+                    &mut ph as *mut _ as *mut c_void,
+                    &mut pp as *mut _ as *mut c_void,
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut po as *mut _ as *mut c_void,
+                    &mut kk as *mut _ as *mut c_void,
+                    &mut ee as *mut _ as *mut c_void,
+                    &mut nn as *mut _ as *mut c_void,
+                ];
+                let t_k = std::time::Instant::now();
+                unsafe {
+                    ctx.launch_async(
+                        accum,
+                        (ntok as u32, 1, 1),
+                        (threads as u32, 1, 1),
+                        0,
+                        &mut args,
+                    )?;
+                }
+                exp_pf::note_kernel_ns(t_k.elapsed().as_nanos() as u64);
+                let t_sync = std::time::Instant::now();
+                ctx.sync()?;
+                exp_pf::note_kernel_ns(t_sync.elapsed().as_nanos() as u64);
+                let t_d2h = std::time::Instant::now();
+                oacc.to_slice(&mut out[..ntok * e])?;
+                exp_pf::note_d2h_ns(t_d2h.elapsed().as_nanos() as u64);
+                dbg_d2h(ntok * e * 4);
+            }
+            exp_pf::note_stream_layer();
+            Ok(Some(nseg as u32))
+        })
+    };
+    match work() {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // 確保失敗・形の不整合はこのプロセスで 1 回だけ記録し、以後 CPU に固定する。
+            if !PF_DEAD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::error!("[exp-pf-stream] 使えないので以後 CPU 経路: {e:#}");
+            }
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod pf_stream_tests {
+    //! task 162: ストリーミング経路の**契約**を GPU 無しで固定する。
+
+    use super::*;
+    use crate::kquant::GgmlType;
+
+    /// GPU が無い (このコンテナ) ときは起動前に `Ok(None)` を返し、`out` を
+    /// 1 要素も書かない (呼び出し側は従来経路をそのまま回せる)。
+    #[test]
+    fn stream_declines_without_gpu_and_leaves_out_untouched() {
+        let host: Vec<u8> = vec![0u8; 256];
+        let entries = vec![PfStreamEntry {
+            expert: 3,
+            dev: None,
+            host: Some([host.as_slice(), host.as_slice(), host.as_slice()]),
+        }];
+        let seg = [1u32, 0, 0, 0];
+        let rows = [0u32];
+        let xs = vec![0.0f32; 8];
+        let prow = [0u32];
+        let wrow = [1.0f32];
+        let mut out = vec![7.0f32; 4];
+        let r = moe_experts_iq_pf_layer_stream(
+            GgmlType::IQ3S,
+            GgmlType::IQ3S,
+            GgmlType::IQ3S,
+            &entries,
+            &seg,
+            &rows,
+            &xs,
+            8,
+            16,
+            4,
+            1,
+            1,
+            &prow,
+            &wrow,
+            32,
+            &mut out,
+        )
+        .expect("GPU 無しでもエラーにしない");
+        assert!(r.is_none(), "GPU が無いのに起動した");
+        assert!(out.iter().all(|&v| v == 7.0), "out を書いてしまった: {out:?}");
+        // 形が合わないときも同じ (fail closed)。
+        let r2 = moe_experts_iq_pf_layer_stream(
+            GgmlType::IQ3S,
+            GgmlType::IQ3S,
+            GgmlType::IQ3S,
+            &entries,
+            &[1u32, 0, 0],
+            &rows,
+            &xs,
+            8,
+            16,
+            4,
+            1,
+            1,
+            &prow,
+            &wrow,
+            32,
+            &mut out,
+        );
+        assert!(r2.is_err() || r2.expect("shape").is_none());
+    }
+
+    /// task 162: GDN スキャンの分割は「単発の上限未満」「端数を出さない」
+    /// 「連続・重複なし・合計 nt」を満たす。
+    #[test]
+    fn gdn_sub_bounds_cover_nt_without_tiny_tail() {
+        let lim = gdn_sub_limit();
+        let min = gdn_sig_min();
+        for nt in [1usize, 19, 64, 512, 1024, 2047, 2048, 2049, 2100, 4096, 14018] {
+            let b = gdn_sub_bounds(nt);
+            assert!(!b.is_empty(), "nt={nt}");
+            assert_eq!(b[0].0, 0, "nt={nt}");
+            assert_eq!(b[b.len() - 1].1, nt, "nt={nt} の末尾");
+            let mut prev = 0usize;
+            for &(a, e) in b.iter() {
+                assert_eq!(a, prev, "nt={nt} が連続でない");
+                assert!(e > a, "nt={nt} に空の範囲");
+                assert!(e - a < lim, "nt={nt} に上限以上の範囲 {}", e - a);
+                if b.len() > 1 {
+                    assert!(e - a >= min, "nt={nt} に小さすぎる範囲 {}", e - a);
+                }
+                prev = e;
+            }
+            assert_eq!(prev, nt, "nt={nt} の合計");
+        }
+        assert!(gdn_sub_bounds(0).is_empty());
+        assert_eq!(gdn_sub_bounds(lim - 1), vec![(0, lim - 1)], "上限未満は 1 回");
+    }
+
+    /// ステージングは decode の LRU を追い出さない: 確保は `pf_stage_alloc`
+    /// (cuMemAlloc 直) だけで、`DevBuffer::alloc_tagged` のフォールバックを
+    /// 通らない。ここでは確保要求 0 で何も取らないことを固定する。
+    #[test]
+    fn stage_alloc_is_a_noop_for_zero() {
+        assert!(pf_stage_alloc(0).is_none());
     }
 }
 
@@ -23605,6 +24669,73 @@ fn gdn_scan_batch_inner(
 ///
 /// これ未満は CPU スキャンのほうが速い (起動 + 層状態の D2H が固定費)。
 pub(crate) const GDN_SIG_MIN_TOKENS: usize = 64;
+
+/// task 162: シグモイド版スキャンを 1 回の起動で回す最大トークン数
+/// (`DENNO_PF_GDN_SUB`、既定 1024)。
+///
+/// `dno_gdn_scan_sig` は `n < GDN_CHUNK_MIN_TOKENS (2048)` の単発経路しか無い
+/// (chunked は silu 固定) ので、prefill のチャンクを 2048 以上にすると CPU
+/// スキャンへ落ちる (lab t162a の `pchunk`: ssm の `scan` が 9.4 s)。ここで
+/// 2048 未満に切って順に呼ぶ。状態はカーネルが更新して毎回ホストへ戻るので、
+/// 切っても値は 1 ビットも変わらない (トークン順の逐次は同じ)。
+/// task 162: 単発スキャン (`dno_gdn_scan_sig`) が受けられる n の上限。
+///
+/// これ以上は chunked 経路 (silu 固定) の担当で、sigmoid 版は受けない。
+pub fn gdn_sub_limit() -> usize {
+    GDN_CHUNK_MIN_TOKENS
+}
+
+/// task 162: シグモイド版スキャンの最小トークン数 (これ未満は CPU のほうが速い)。
+pub fn gdn_sig_min() -> usize {
+    GDN_SIG_MIN_TOKENS
+}
+
+/// task 162: `nt` トークンのスキャンを何回に切るか (純関数)。
+///
+/// - `nt < gdn_sub_limit()` なら 1 回 (従来どおり)。
+/// - それ以上は `gdn_sig_sub_chunk()` ずつ。**末尾が最小トークン数
+///   ([`gdn_sig_min`]) を切る場合だけ**、最後の 2 つを併合する (小さい n は
+///   カーネルが受けず `None` になるため)。
+///
+/// 返り値は `(start, end)` の列で、連続・重複なし・合計 `nt`。
+pub fn gdn_sub_bounds(nt: usize) -> Vec<(usize, usize)> {
+    if nt == 0 {
+        return Vec::new();
+    }
+    // `dno_gdn_scan_sig` は n < GDN_CHUNK_MIN_TOKENS のときだけ受ける。
+    if nt < gdn_sub_limit() {
+        return vec![(0, nt)];
+    }
+    let sub = gdn_sig_sub_chunk().clamp(1, gdn_sub_limit() - 1);
+    let min = gdn_sig_min();
+    let mut out = Vec::new();
+    let mut t0 = 0usize;
+    while t0 < nt {
+        let left = nt - t0;
+        let end = if left <= sub {
+            nt
+        } else if left - sub < min {
+            // 端数が小さすぎる → この回で飲み込む (sub + min <= 上限)。
+            nt
+        } else {
+            t0 + sub
+        };
+        out.push((t0, end));
+        t0 = end;
+    }
+    out
+}
+
+pub fn gdn_sig_sub_chunk() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("DENNO_PF_GDN_SUB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(GDN_SIG_MIN_TOKENS, GDN_CHUNK_MIN_TOKENS - 1))
+            .unwrap_or(1024)
+    })
+}
 
 /// 実装 (同期コピー + 1 launch + 1 同期。prefill はリクエストあたり層数回しか
 /// 呼ばれないためピン留めパイプライン化の恩恵は小さい)。
