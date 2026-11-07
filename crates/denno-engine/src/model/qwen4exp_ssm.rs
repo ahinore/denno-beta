@@ -692,28 +692,61 @@ impl SsmLayer {
                 let dk = self.p.head_k_dim;
                 let dv = self.p.head_v_dim;
                 let q_scale = 1.0f32 / (dk as f32).sqrt();
-                crate::cuda::gdn_scan_batch_sig(
-                    &qkv,
-                    &z,
-                    &beta_raw,
-                    &alpha,
-                    &mut self.state.conv,
-                    &mut self.state.ssm,
-                    &self.conv1d,
-                    &self.ssm_a,
-                    &self.ssm_dt,
-                    &self.ssm_norm,
-                    nt,
-                    nk,
-                    nv,
-                    dk,
-                    dv,
-                    self.p.d_conv,
-                    self.p.eps,
-                    q_scale,
-                    self.il,
-                    0,
-                )
+                // task 162: 単発カーネルは n < 2048 の制約があるので、prefill の
+                // チャンクがそれを超えるときは 1024 ずつに切って順に回す
+                // (状態はホスト経由で持ち越す。トークン順の逐次は同じなので値は
+                // ビット一致)。切らずに済むなら従来どおり 1 回で呼ぶ。
+                let bounds = crate::cuda::gdn_sub_bounds(nt);
+                let mut out: Vec<f32> = Vec::with_capacity(nt * vd);
+                let mut ok = true;
+                let mut done = 0usize;
+                for &(a, b) in bounds.iter() {
+                    let (t0, t1) = (a, b);
+                    let m = t1 - t0;
+                    let y = crate::cuda::gdn_scan_batch_sig(
+                        &qkv[t0 * qd..t1 * qd],
+                        &z[t0 * vd..t1 * vd],
+                        &beta_raw[t0 * nh..t1 * nh],
+                        &alpha[t0 * nh..t1 * nh],
+                        &mut self.state.conv,
+                        &mut self.state.ssm,
+                        &self.conv1d,
+                        &self.ssm_a,
+                        &self.ssm_dt,
+                        &self.ssm_norm,
+                        m,
+                        nk,
+                        nv,
+                        dk,
+                        dv,
+                        self.p.d_conv,
+                        self.p.eps,
+                        q_scale,
+                        self.il,
+                        0,
+                    );
+                    match y {
+                        Some(y) => out.extend_from_slice(&y),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    done = t1;
+                }
+                if !ok && done > 0 {
+                    // 途中まで進んで落ちた = ホストの状態が途中まで進んでいる。
+                    // CPU で引き直すと状態が二重に進むので、要求を落とす。
+                    bail!(
+                        "SsmLayer::forward_batch: GDN の GPU スキャンが途中で落ちた (li={}, done={done}, nt={nt})",
+                        self.il
+                    );
+                }
+                if ok {
+                    Some(out)
+                } else {
+                    None
+                }
             };
             #[cfg(not(feature = "cuda"))]
             let gpu: Option<Vec<f32>> = None;

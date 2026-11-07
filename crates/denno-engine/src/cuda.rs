@@ -5075,27 +5075,20 @@ fn pf_pump_in(
             }
         }
         let copy_ns = t_copy.elapsed().as_nanos() as u64;
-        // 5a. 1 本の非同期コピーとして積む (行列ごとに分かれているので 3 回)。
+        // 5a. **グループ全体を 1 回の非同期コピーで積む**。
+        //     pinned のレイアウトはステージングのレイアウトと同じなので、行列ごとに
+        //     分ける必要が無い。1 本ずつ積むと 1 expert 3 回 = 1 グループ 96 回に
+        //     なり、`cuMemcpyHtoDAsync` の呼び出し固定費 (実測 ~20-70 us) が DMA の
+        //     実時間を上回る (lab t162a: chunk 2048 で 105 GB に 14 s)。
+        //     端数のパディングも一緒に運ぶが、カーネルは読まない。
         let l = lib()?;
         let t_dma = std::time::Instant::now();
-        let mut cursor = 0usize;
-        for (i, _) in items.iter().enumerate() {
-            for m in 0..3 {
-                let n = lens[i][m];
-                if n > 0 {
-                    unsafe {
-                        check(
-                            (l.memcpy_htod_async)(
-                                base + cursor as u64,
-                                (pin_base + cursor) as *const c_void,
-                                n,
-                                up,
-                            ),
-                            "cuMemcpyHtoDAsync (stage)",
-                        )?;
-                    }
-                }
-                cursor += pf_stage_align_up(n);
+        if need > 0 {
+            unsafe {
+                check(
+                    (l.memcpy_htod_async)(base, pin.ptr, need, up),
+                    "cuMemcpyHtoDAsync (stage)",
+                )?;
             }
         }
         dbg_htod(need);
@@ -5746,6 +5739,33 @@ mod pf_stream_tests {
             &mut out,
         );
         assert!(r2.is_err() || r2.expect("shape").is_none());
+    }
+
+    /// task 162: GDN スキャンの分割は「単発の上限未満」「端数を出さない」
+    /// 「連続・重複なし・合計 nt」を満たす。
+    #[test]
+    fn gdn_sub_bounds_cover_nt_without_tiny_tail() {
+        let lim = gdn_sub_limit();
+        let min = gdn_sig_min();
+        for nt in [1usize, 19, 64, 512, 1024, 2047, 2048, 2049, 2100, 4096, 14018] {
+            let b = gdn_sub_bounds(nt);
+            assert!(!b.is_empty(), "nt={nt}");
+            assert_eq!(b[0].0, 0, "nt={nt}");
+            assert_eq!(b[b.len() - 1].1, nt, "nt={nt} の末尾");
+            let mut prev = 0usize;
+            for &(a, e) in b.iter() {
+                assert_eq!(a, prev, "nt={nt} が連続でない");
+                assert!(e > a, "nt={nt} に空の範囲");
+                assert!(e - a < lim, "nt={nt} に上限以上の範囲 {}", e - a);
+                if b.len() > 1 {
+                    assert!(e - a >= min, "nt={nt} に小さすぎる範囲 {}", e - a);
+                }
+                prev = e;
+            }
+            assert_eq!(prev, nt, "nt={nt} の合計");
+        }
+        assert!(gdn_sub_bounds(0).is_empty());
+        assert_eq!(gdn_sub_bounds(lim - 1), vec![(0, lim - 1)], "上限未満は 1 回");
     }
 
     /// ステージングは decode の LRU を追い出さない: 確保は `pf_stage_alloc`
@@ -23929,6 +23949,73 @@ fn gdn_scan_batch_inner(
 ///
 /// これ未満は CPU スキャンのほうが速い (起動 + 層状態の D2H が固定費)。
 pub(crate) const GDN_SIG_MIN_TOKENS: usize = 64;
+
+/// task 162: シグモイド版スキャンを 1 回の起動で回す最大トークン数
+/// (`DENNO_PF_GDN_SUB`、既定 1024)。
+///
+/// `dno_gdn_scan_sig` は `n < GDN_CHUNK_MIN_TOKENS (2048)` の単発経路しか無い
+/// (chunked は silu 固定) ので、prefill のチャンクを 2048 以上にすると CPU
+/// スキャンへ落ちる (lab t162a の `pchunk`: ssm の `scan` が 9.4 s)。ここで
+/// 2048 未満に切って順に呼ぶ。状態はカーネルが更新して毎回ホストへ戻るので、
+/// 切っても値は 1 ビットも変わらない (トークン順の逐次は同じ)。
+/// task 162: 単発スキャン (`dno_gdn_scan_sig`) が受けられる n の上限。
+///
+/// これ以上は chunked 経路 (silu 固定) の担当で、sigmoid 版は受けない。
+pub fn gdn_sub_limit() -> usize {
+    GDN_CHUNK_MIN_TOKENS
+}
+
+/// task 162: シグモイド版スキャンの最小トークン数 (これ未満は CPU のほうが速い)。
+pub fn gdn_sig_min() -> usize {
+    GDN_SIG_MIN_TOKENS
+}
+
+/// task 162: `nt` トークンのスキャンを何回に切るか (純関数)。
+///
+/// - `nt < gdn_sub_limit()` なら 1 回 (従来どおり)。
+/// - それ以上は `gdn_sig_sub_chunk()` ずつ。**末尾が最小トークン数
+///   ([`gdn_sig_min`]) を切る場合だけ**、最後の 2 つを併合する (小さい n は
+///   カーネルが受けず `None` になるため)。
+///
+/// 返り値は `(start, end)` の列で、連続・重複なし・合計 `nt`。
+pub fn gdn_sub_bounds(nt: usize) -> Vec<(usize, usize)> {
+    if nt == 0 {
+        return Vec::new();
+    }
+    // `dno_gdn_scan_sig` は n < GDN_CHUNK_MIN_TOKENS のときだけ受ける。
+    if nt < gdn_sub_limit() {
+        return vec![(0, nt)];
+    }
+    let sub = gdn_sig_sub_chunk().clamp(1, gdn_sub_limit() - 1);
+    let min = gdn_sig_min();
+    let mut out = Vec::new();
+    let mut t0 = 0usize;
+    while t0 < nt {
+        let left = nt - t0;
+        let end = if left <= sub {
+            nt
+        } else if left - sub < min {
+            // 端数が小さすぎる → この回で飲み込む (sub + min <= 上限)。
+            nt
+        } else {
+            t0 + sub
+        };
+        out.push((t0, end));
+        t0 = end;
+    }
+    out
+}
+
+pub fn gdn_sig_sub_chunk() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("DENNO_PF_GDN_SUB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(GDN_SIG_MIN_TOKENS, GDN_CHUNK_MIN_TOKENS - 1))
+            .unwrap_or(1024)
+    })
+}
 
 /// 実装 (同期コピー + 1 launch + 1 同期。prefill はリクエストあたり層数回しか
 /// 呼ばれないためピン留めパイプライン化の恩恵は小さい)。
