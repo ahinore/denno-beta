@@ -4194,7 +4194,35 @@ where
         if overlap {
             Scratch::ensure_pin(&mut sc.hpin, nh * 4)?;
         }
-        {
+        // task 164: 層の prologue (x / ポインタ表 / segment 表) を pinned ring の
+        // 1 スロットへ詰め、**非同期 H2D 1 回**で送る (`DENNO_DEC_PRO_ASYNC`)。
+        // 現行は 6 本の同期 H2D で、そのたびに null ストリームの先行カーネルを
+        // 待つ (1 層 6 回 x 48 層 = 288 回/token)。1 本にまとめるとドライバ往復が
+        // 減り、転送が直前の層の GPU 仕事と重なる。**値は変わらない** (同じ表・
+        // 同じポインタを別の場所に置くだけ)。
+        let pro = dec_pro_async_enabled();
+        let lay = dec_stage_layout(n_in, nseg, seg_gu.len(), seg_d.len());
+        let mut stage_addr: Option<u64> = None;
+        if pro {
+            // 失敗したら従来の同期コピーへ落ちる (リクエストは落とさない)。
+            let staged = (|| -> Result<u64> {
+                let (dev, slot) = dec_stage_slot(lay.total)?;
+                unsafe {
+                    let sb = std::slice::from_raw_parts_mut(slot as *mut u8, lay.total);
+                    dec_stage_put(sb, lay.x, x.as_ptr() as *const u8, n_in * 4);
+                    dec_stage_put(sb, lay.pg, pg.as_ptr() as *const u8, nseg * 8);
+                    dec_stage_put(sb, lay.pu, pu.as_ptr() as *const u8, nseg * 8);
+                    dec_stage_put(sb, lay.pd, pd.as_ptr() as *const u8, nseg * 8);
+                    dec_stage_put(sb, lay.sgu, seg_gu.as_ptr() as *const u8, seg_gu.len() * 4);
+                    dec_stage_put(sb, lay.sgd, seg_d.as_ptr() as *const u8, seg_d.len() * 4);
+                }
+                dec_stage_issue(lay.total)?;
+                dbg_htod(lay.total);
+                Ok(dev as u64)
+            })();
+            stage_addr = staged.ok();
+        }
+        if stage_addr.is_none() {
             let xb = sc.x.as_ref().expect("確保済み");
             xb.copy_from(&x[..n_in])?;
             dbg_htod(n_in * 4);
@@ -4206,7 +4234,24 @@ where
             sc.sgd.as_ref().expect("確保済み").copy_from(seg_d)?;
             dbg_htod((seg_gu.len() + seg_d.len()) * 4);
         }
-        let xb = sc.x.as_ref().expect("確保済み");
+        let (x_addr, pg_addr, pu_addr, pd_addr, sgu_addr, sgd_addr) = match stage_addr {
+            Some(base) => (
+                base + lay.x as u64,
+                base + lay.pg as u64,
+                base + lay.pu as u64,
+                base + lay.pd as u64,
+                base + lay.sgu as u64,
+                base + lay.sgd as u64,
+            ),
+            None => (
+                sc.x.as_ref().expect("確保済み").ptr as u64,
+                sc.pg.as_ref().expect("確保済み").ptr as u64,
+                sc.pu.as_ref().expect("確保済み").ptr as u64,
+                sc.pd.as_ref().expect("確保済み").ptr as u64,
+                sc.sgu.as_ref().expect("確保済み").ptr as u64,
+                sc.sgd.as_ref().expect("確保済み").ptr as u64,
+            ),
+        };
         let g = sc.g.as_ref().expect("確保済み");
         let u = sc.u.as_ref().expect("確保済み");
         let act = sc.act.as_ref().expect("確保済み");
@@ -4216,13 +4261,13 @@ where
             let rb_g = crate::model::exp_iq::row_bytes(ty_g, n_in).unwrap_or(0);
             let rb_u = crate::model::exp_iq::row_bytes(ty_u, n_in).unwrap_or(0);
             for (f, ptrs, buf, rb) in [
-                (kernels.fns[slot_g], sc.pg.as_ref().expect("確保済み"), g, rb_g),
-                (kernels.fns[slot_u], sc.pu.as_ref().expect("確保済み"), u, rb_u),
+                (kernels.fns[slot_g], pg_addr, g, rb_g),
+                (kernels.fns[slot_u], pu_addr, u, rb_u),
             ] {
-                let mut pw = ptrs.ptr;
-                let mut px = xb.ptr;
+                let mut pw = ptrs as *mut c_void;
+                let mut px = x_addr as *mut c_void;
                 let mut po = buf.ptr;
-                let mut ps = sc.sgu.as_ref().expect("確保済み").ptr;
+                let mut ps = sgu_addr as *mut c_void;
                 let (mut ns, mut ni, mut no, mut rb) = (
                     nseg as c_int,
                     n_in as c_int,
@@ -4266,10 +4311,10 @@ where
             }
             // 3. down (expert ごとの act を読む)
             {
-                let mut pw = sc.pd.as_ref().expect("確保済み").ptr;
+                let mut pw = pd_addr as *mut c_void;
                 let mut px = act.ptr;
                 let mut po = h.ptr;
-                let mut ps = sc.sgd.as_ref().expect("確保済み").ptr;
+                let mut ps = sgd_addr as *mut c_void;
                 let (mut ns, mut ni, mut no, mut rb) = (
                     nseg as c_int,
                     ff as c_int,
@@ -4329,6 +4374,178 @@ where
         Ok(())
     })?;
     Ok(true)
+}
+
+// ===========================================================================
+// task 164: decode の expert 層 prologue を 1 回の非同期 H2D にまとめる
+// ===========================================================================
+//
+// 層ごとの prologue は「x (n_in f32) + ポインタ表 (nseg u64 x 3) + segment 表
+// (4 u32 x nseg x 2)」の 6 本を `cuMemcpyHtoD` (同期) で送っていた。同期コピーは
+// null ストリーム順序なので、**その時点で先行しているカーネルの完了を待つ**。
+// decode は 48 層 x 6 本 = 288 回/token になり、実測 (lab t164b の台帳) では
+// experts 区間の転送に 1.35 ms/token かかっていた (11.84 MB。28.5 GB/s なら
+// 0.42 ms なので、差分はドライバ往復と待ち)。
+//
+// ここでは 6 本を pinned の 1 スロットに詰め、**非同期 H2D 1 回**にする。
+// ホストは待たない (転送は直前の層の GPU 仕事と重なる)。pinned のスロットは
+// リング (4 本) で使い回し、書き戻す前に前回のコピーの完了だけを待つ
+// (4 層ぶんの余裕があるので通常は即返る)。
+
+/// `DENNO_DEC_PRO_ASYNC`: 層 prologue を 1 回の非同期 H2D にまとめる。**既定 off**。
+pub fn dec_pro_async_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// [`dec_pro_async_from_value`] をプロセスで 1 回だけ読む。
+pub fn dec_pro_async_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| dec_pro_async_from_value(std::env::var("DENNO_DEC_PRO_ASYNC").ok().as_deref()))
+}
+
+/// prologue の 1 ブロックのレイアウト (バイトオフセット)。全部 8 バイト整列。
+pub struct DecStageLayout {
+    pub x: usize,
+    pub pg: usize,
+    pub pu: usize,
+    pub pd: usize,
+    pub sgu: usize,
+    pub sgd: usize,
+    pub total: usize,
+}
+
+/// [`DecStageLayout`] を作る (純関数・テスト用)。
+pub fn dec_stage_layout(n_in: usize, nseg: usize, sgu_len: usize, sgd_len: usize) -> DecStageLayout {
+    let x = 0usize;
+    let pg = x + n_in * 4;
+    let pu = pg + nseg * 8;
+    let pd = pu + nseg * 8;
+    let sgu = pd + nseg * 8;
+    let sgd = sgu + sgu_len * 4;
+    let total = sgd + sgd_len * 4;
+    DecStageLayout {
+        x,
+        pg,
+        pu,
+        pd,
+        sgu,
+        sgd,
+        total,
+    }
+}
+
+/// ステージングへ 1 ブロック写す (ホスト側の memcpy。pinned なので速い)。
+///
+/// # Safety
+/// `src` は `n` バイト読めること。`off + n <= s.len()` を呼び側が保証する。
+pub unsafe fn dec_stage_put(s: &mut [u8], off: usize, src: *const u8, n: usize) {
+    s[off..off + n].copy_from_slice(std::slice::from_raw_parts(src, n));
+}
+
+/// pinned リングの本数 (層 4 つぶんの余裕)。
+const DEC_STAGE_SLOTS: usize = 4;
+
+struct DecStage {
+    pin: Vec<PinMem>,
+    ev: Vec<CopyEvent>,
+    /// 各スロットに「対応するコピーをまだ記録していない」場合は false。
+    used: Vec<bool>,
+    next: usize,
+    dev: Option<DevBuffer>,
+    bytes: usize,
+}
+
+thread_local! {
+    static DEC_STAGE: std::cell::RefCell<Option<DecStage>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// 次のスロットを用意して `(デバイスのベース, ホストのスロット先頭)` を返す。
+///
+/// デバイス側は grow-only の 1 本、ホスト側は pinned のリング。書き込む前に
+/// **前回そのスロットから出したコピーの完了**を待つ (待ちは通常ゼロ)。
+pub fn dec_stage_slot(total: usize) -> Result<(u64, *mut u8)> {
+    let l = lib()?;
+    let (Some(create), Some(esync)) = (l.event_create, l.event_sync) else {
+        bail!("event_create / event_sync が無い (dec stage)");
+    };
+    let total = total.max(1);
+    DEC_STAGE.with(|c| -> Result<(u64, *mut u8)> {
+        let mut c = c.borrow_mut();
+        if c.is_none() {
+            *c = Some(DecStage {
+                pin: Vec::new(),
+                ev: Vec::new(),
+                used: Vec::new(),
+                next: 0,
+                dev: None,
+                bytes: 0,
+            });
+        }
+        let st = c.as_mut().expect("直前に作った");
+        // デバイス側 (grow-only)。
+        if st.bytes < total || st.dev.is_none() {
+            let want = moe_scratch_alloc_bytes(st.bytes, total).unwrap_or(total);
+            st.dev = Some(DevBuffer::alloc_tagged(want, crate::mem_audit::TAG_GDN_SC)?);
+            st.bytes = want;
+        }
+        // ホスト側 (pinned リング)。ブロックは 10〜20 KB なので 1 MiB を下限に
+        // して作り、形が増えても作り直さない (作り直しは in-flight のコピーを
+        // 壊す危険があるため、下限を大きく取って経路を踏ませない)。
+        let cap = total.max(1 << 20);
+        while st.pin.len() < DEC_STAGE_SLOTS {
+            let mut ev: CUevent = std::ptr::null_mut();
+            if unsafe { create(&mut ev, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+                bail!("cuEventCreate (dec stage) が失敗");
+            }
+            st.pin.push(PinMem::alloc(cap)?);
+            st.ev.push(CopyEvent(ev));
+            st.used.push(false);
+        }
+        for i in 0..st.pin.len() {
+            if st.pin[i].bytes < total {
+                // 形が大きくなった層 (nseg 増) に備えて作り直す。未コピーの
+                // スロットだけなので安全。
+                st.pin[i] = PinMem::alloc(total)?;
+                st.used[i] = false;
+            }
+        }
+        let i = st.next % DEC_STAGE_SLOTS;
+        st.next = st.next.wrapping_add(1);
+        if st.used[i] && unsafe { esync(st.ev[i].0) } != CUDA_SUCCESS {
+            bail!("cuEventSynchronize (dec stage) が失敗");
+        }
+        Ok((st.dev.as_ref().expect("確保済み").ptr, st.pin[i].ptr as *mut u8))
+    })
+}
+
+/// 直前に [`dec_stage_slot`] が返したスロットから、非同期 H2D を 1 回出す。
+pub fn dec_stage_issue(total: usize) -> Result<()> {
+    let total = total.max(1);
+    let l = lib()?;
+    let (Some(rec), Some(htod)) = (l.event_record, Some(l.memcpy_htod_async)) else {
+        bail!("event_record / memcpy_htod_async が無い (dec stage)");
+    };
+    DEC_STAGE.with(|c| -> Result<()> {
+        let mut c = c.borrow_mut();
+        let st = c.as_mut().ok_or_else(|| anyhow::anyhow!("dec stage 未初期化"))?;
+        let i = (st.next + DEC_STAGE_SLOTS - 1) % DEC_STAGE_SLOTS;
+        let dev = st.dev.as_ref().expect("確保済み").ptr;
+        let src = st.pin[i].ptr;
+        check(
+            unsafe { htod(dev, src, total, std::ptr::null_mut()) },
+            "cuMemcpyHtoDAsync (dec stage)",
+        )?;
+        if unsafe { rec(st.ev[i].0, std::ptr::null_mut()) } != CUDA_SUCCESS {
+            bail!("cuEventRecord (dec stage) が失敗");
+        }
+        st.used[i] = true;
+        Ok(())
+    })
 }
 
 // ===========================================================================
@@ -5443,7 +5660,41 @@ mod iq_overlap_tests {
         assert_eq!(dst[10], 0, "転送元より後ろは触らない");
     }
 
-    /// task 158: ミス GPU 経路は**起動前に落ちるとき**必ず `Ok(false)` を返し、
+    /// task 164: prologue ステージングのレイアウトは 8 バイト整列で、各ブロックが
+    /// 重ならないこと。`u64` の表を `u64` として読むので整列が要る。
+    #[test]
+    fn dec_stage_layout_is_aligned_and_disjoint() {
+        let l = dec_stage_layout(2560, 10, 40, 40);
+        assert_eq!(l.x, 0);
+        assert_eq!(l.pg, 2560 * 4);
+        assert_eq!(l.pu, l.pg + 80);
+        assert_eq!(l.pd, l.pu + 80);
+        assert_eq!(l.sgu, l.pd + 80);
+        assert_eq!(l.sgd, l.sgu + 160);
+        assert_eq!(l.total, l.sgd + 160);
+        for off in [l.x, l.pg, l.pu, l.pd, l.sgu, l.sgd] {
+            assert_eq!(off % 8, 0, "オフセット {off} が 8 バイト整列でない");
+        }
+        // ブロックの境界が重ならない (前の終わり <= 次の始まり)。
+        assert!(l.x + 2560 * 4 <= l.pg);
+        assert!(l.sgd + 40 * 4 <= l.total);
+    }
+
+    /// task 164: ステージングへの書き込みは指定オフセットにだけ載る。
+    #[test]
+    fn dec_stage_put_writes_at_offset() {
+        let l = dec_stage_layout(4, 1, 4, 4);
+        let mut buf = vec![0u8; l.total];
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        unsafe {
+            dec_stage_put(&mut buf, l.x, x.as_ptr() as *const u8, 16);
+        }
+        assert_eq!(&buf[l.x..l.x + 4], &1.0f32.to_ne_bytes());
+        assert_eq!(&buf[l.x + 12..l.x + 16], &4.0f32.to_ne_bytes());
+        assert!(buf[l.pg..].iter().all(|&b| b == 0), "後続のブロックを汚した");
+    }
+
+    /// task 164: ミス GPU 経路は**起動前に落ちるとき**必ず `Ok(false)` を返し、
     /// `out_h` を 1 要素も書かない (呼び出し側は従来経路へ戻せる)。
     /// GPU の無いテスト環境では毎回ここに落ちるので、契約だけを固定できる。
     #[test]
