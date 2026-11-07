@@ -47,6 +47,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 構築時 (`from_gguf_with` とテストの構造体リテラル) に 1 回発号する。
 static DEVICE_NONCE: AtomicU64 = AtomicU64::new(1);
 
+/// task 167: 連鎖の入口に来た回数 (テストで分岐の発火を数える)。
+#[cfg(test)]
+pub(crate) static PF_CHAIN_ENTRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// task 128: SsmLayer インスタンスごとの nonce を発号する (構築時に 1 回だけ)。
 fn next_device_nonce() -> u64 {
     DEVICE_NONCE.fetch_add(1, Ordering::Relaxed)
@@ -620,12 +625,26 @@ impl SsmLayer {
                 ),
             }
         }
+        // task 167: ssm 層 1 チャンクを「qkv/z 投影 → GDN スキャン → out_proj」の
+        // デバイス連鎖で回す (中間をホストへ落とさない)。ゲート off・前提外・
+        // 連鎖の入口での失敗は従来経路へ (状態は 1 つも進めていない)。
+        #[cfg(feature = "cuda")]
+        if crate::model::qwen4exp::pf_gdn_chain_on() && !gdn::gdn_dbg_enabled_for(self.il as i64)
+        {
+            if let Some(outs) = self.forward_batch_chain(&flat, nt)? {
+                return Ok(outs.chunks_exact(e).map(|c| c.to_vec()).collect());
+            }
+        }
+
         // task 72: qkv と z、beta と alpha をそれぞれ 1 回のバッチ GEMV にまとめる。
         // トークンごとの値は個別に呼んだ場合と同じ (行の独立)。
         let mut qkv = vec![0f32; nt * qd];
         let mut z = vec![0f32; nt * vd];
-        self.qkv_gate
-            .gemv_batch_split(&flat, nt, &mut [&mut qkv[..], &mut z[..]])?;
+        {
+            let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_QKV);
+            self.qkv_gate
+                .gemv_batch_split(&flat, nt, &mut [&mut qkv[..], &mut z[..]])?;
+        }
         crate::model::qwen4exp::q4prof::mark(
             t,
             &crate::model::qwen4exp::q4prof::A_QKV,
@@ -637,8 +656,11 @@ impl SsmLayer {
         let t = crate::model::qwen4exp::q4prof::stamp();
         let mut beta_raw = vec![0f32; nt * nh];
         let mut alpha = vec![0f32; nt * nh];
-        self.beta_alpha
-            .gemv_batch_split(&flat, nt, &mut [&mut beta_raw[..], &mut alpha[..]])?;
+        {
+            let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_GATE);
+            self.beta_alpha
+                .gemv_batch_split(&flat, nt, &mut [&mut beta_raw[..], &mut alpha[..]])?;
+        }
         crate::model::qwen4exp::q4prof::mark(
             t,
             &crate::model::qwen4exp::q4prof::A_GATE,
@@ -656,104 +678,118 @@ impl SsmLayer {
         };
         // サブステージのダンプがこの層を指しているときだけトークン逐次に落ちる
         // (追記順 = llama.cpp の lchk と同一に保つ)。通常はチャンク一括。
-        let ys = if gdn::gdn_dbg_enabled_for(self.il as i64) {
-            let mut ys = Vec::with_capacity(nt * vd);
-            for i in 0..nt {
-                let y = gdn::forward_token_core_gate(
-                    &self.p,
-                    &cw,
-                    &qkv[i * qd..(i + 1) * qd],
-                    &z[i * vd..(i + 1) * vd],
-                    &beta_raw[i * nh..(i + 1) * nh],
-                    &alpha[i * nh..(i + 1) * nh],
-                    &mut self.state,
-                    gdn::GateKind::Sigmoid,
-                );
-                if y.len() != vd {
-                    bail!(
-                        "SsmLayer::forward_batch: GDN の出力長 {} が value_dim={vd} と違う",
-                        y.len()
+        let ys = {
+            let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_SCAN);
+            if gdn::gdn_dbg_enabled_for(self.il as i64) {
+                let mut ys = Vec::with_capacity(nt * vd);
+                for i in 0..nt {
+                    let y = gdn::forward_token_core_gate(
+                        &self.p,
+                        &cw,
+                        &qkv[i * qd..(i + 1) * qd],
+                        &z[i * vd..(i + 1) * vd],
+                        &beta_raw[i * nh..(i + 1) * nh],
+                        &alpha[i * nh..(i + 1) * nh],
+                        &mut self.state,
+                        gdn::GateKind::Sigmoid,
                     );
-                }
-                ys.extend_from_slice(&y);
-            }
-            ys
-        } else if crate::model::qwen4exp::pf_gdn_gpu_on() {
-            // task 154: GDN コアを GPU の sigmoid スキャン (task 137 のカーネル) で回す。
-            // チャンクは 512 トークン (< CHUNK_MIN_TOKENS=2048) なので単発カーネル。
-            // 状態はカーネルが更新し、`gdn_scan_impl` がホストへも書き戻す
-            // (次の decode / CPU 経路がホスト state を seed にするため)。
-            // `kv = 0` は「このプロセスの prefill 用スロット」の意味。層ごとに
-            // 別の鍵にすると GDN_STATE が毎層 invalidate されて state を H2D し直す。
-            #[cfg(feature = "cuda")]
-            let gpu: Option<Vec<f32>> = {
-                let nk = self.p.n_k_heads;
-                let nv = self.p.n_v_heads;
-                let dk = self.p.head_k_dim;
-                let dv = self.p.head_v_dim;
-                let q_scale = 1.0f32 / (dk as f32).sqrt();
-                // task 162: 単発カーネルは n < 2048 の制約があるので、prefill の
-                // チャンクがそれを超えるときは 1024 ずつに切って順に回す
-                // (状態はホスト経由で持ち越す。トークン順の逐次は同じなので値は
-                // ビット一致)。切らずに済むなら従来どおり 1 回で呼ぶ。
-                let bounds = crate::cuda::gdn_sub_bounds(nt);
-                let mut out: Vec<f32> = Vec::with_capacity(nt * vd);
-                let mut ok = true;
-                let mut done = 0usize;
-                for &(a, b) in bounds.iter() {
-                    let (t0, t1) = (a, b);
-                    let m = t1 - t0;
-                    let y = crate::cuda::gdn_scan_batch_sig(
-                        &qkv[t0 * qd..t1 * qd],
-                        &z[t0 * vd..t1 * vd],
-                        &beta_raw[t0 * nh..t1 * nh],
-                        &alpha[t0 * nh..t1 * nh],
-                        &mut self.state.conv,
-                        &mut self.state.ssm,
-                        &self.conv1d,
-                        &self.ssm_a,
-                        &self.ssm_dt,
-                        &self.ssm_norm,
-                        m,
-                        nk,
-                        nv,
-                        dk,
-                        dv,
-                        self.p.d_conv,
-                        self.p.eps,
-                        q_scale,
-                        self.il,
-                        0,
-                    );
-                    match y {
-                        Some(y) => out.extend_from_slice(&y),
-                        None => {
-                            ok = false;
-                            break;
-                        }
+                    if y.len() != vd {
+                        bail!(
+                            "SsmLayer::forward_batch: GDN の出力長 {} が value_dim={vd} と違う",
+                            y.len()
+                        );
                     }
-                    done = t1;
+                    ys.extend_from_slice(&y);
                 }
-                if !ok && done > 0 {
-                    // 途中まで進んで落ちた = ホストの状態が途中まで進んでいる。
-                    // CPU で引き直すと状態が二重に進むので、要求を落とす。
-                    bail!(
-                        "SsmLayer::forward_batch: GDN の GPU スキャンが途中で落ちた (li={}, done={done}, nt={nt})",
-                        self.il
-                    );
+                ys
+            } else if crate::model::qwen4exp::pf_gdn_gpu_on() {
+                // task 154: GDN コアを GPU の sigmoid スキャン (task 137 のカーネル) で回す。
+                // チャンクは 512 トークン (< CHUNK_MIN_TOKENS=2048) なので単発カーネル。
+                // 状態はカーネルが更新し、`gdn_scan_impl` がホストへも書き戻す
+                // (次の decode / CPU 経路がホスト state を seed にするため)。
+                // `kv = 0` は「このプロセスの prefill 用スロット」の意味。層ごとに
+                // 別の鍵にすると GDN_STATE が毎層 invalidate されて state を H2D し直す。
+                #[cfg(feature = "cuda")]
+                let gpu: Option<Vec<f32>> = {
+                    let nk = self.p.n_k_heads;
+                    let nv = self.p.n_v_heads;
+                    let dk = self.p.head_k_dim;
+                    let dv = self.p.head_v_dim;
+                    let q_scale = 1.0f32 / (dk as f32).sqrt();
+                    // task 162: 単発カーネルは n < 2048 の制約があるので、prefill の
+                    // チャンクがそれを超えるときは 1024 ずつに切って順に回す
+                    // (状態はホスト経由で持ち越す。トークン順の逐次は同じなので値は
+                    // ビット一致)。切らずに済むなら従来どおり 1 回で呼ぶ。
+                    let bounds = crate::cuda::gdn_sub_bounds(nt);
+                    let mut out: Vec<f32> = Vec::with_capacity(nt * vd);
+                    let mut ok = true;
+                    let mut done = 0usize;
+                    for &(a, b) in bounds.iter() {
+                        let (t0, t1) = (a, b);
+                        let m = t1 - t0;
+                        let y = crate::cuda::gdn_scan_batch_sig(
+                            &qkv[t0 * qd..t1 * qd],
+                            &z[t0 * vd..t1 * vd],
+                            &beta_raw[t0 * nh..t1 * nh],
+                            &alpha[t0 * nh..t1 * nh],
+                            &mut self.state.conv,
+                            &mut self.state.ssm,
+                            &self.conv1d,
+                            &self.ssm_a,
+                            &self.ssm_dt,
+                            &self.ssm_norm,
+                            m,
+                            nk,
+                            nv,
+                            dk,
+                            dv,
+                            self.p.d_conv,
+                            self.p.eps,
+                            q_scale,
+                            self.il,
+                            0,
+                        );
+                        match y {
+                            Some(y) => out.extend_from_slice(&y),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        done = t1;
+                    }
+                    if !ok && done > 0 {
+                        // 途中まで進んで落ちた = ホストの状態が途中まで進んでいる。
+                        // CPU で引き直すと状態が二重に進むので、要求を落とす。
+                        bail!(
+                            "SsmLayer::forward_batch: GDN の GPU スキャンが途中で落ちた (li={}, done={done}, nt={nt})",
+                            self.il
+                        );
+                    }
+                    if ok {
+                        Some(out)
+                    } else {
+                        None
+                    }
+                };
+                #[cfg(not(feature = "cuda"))]
+                let gpu: Option<Vec<f32>> = None;
+                match gpu {
+                    Some(y) => y,
+                    // 前提外 (dk != dv / 旧 PTX / GPU 無効) は従来の CPU へ。
+                    None => gdn::forward_batch_core_gate(
+                        &self.p,
+                        &cw,
+                        &qkv,
+                        &z,
+                        &beta_raw,
+                        &alpha,
+                        &mut self.state,
+                        gdn::GateKind::Sigmoid,
+                    ),
                 }
-                if ok {
-                    Some(out)
-                } else {
-                    None
-                }
-            };
-            #[cfg(not(feature = "cuda"))]
-            let gpu: Option<Vec<f32>> = None;
-            match gpu {
-                Some(y) => y,
-                // 前提外 (dk != dv / 旧 PTX / GPU 無効) は従来の CPU へ。
-                None => gdn::forward_batch_core_gate(
+            } else {
+                gdn::forward_batch_core_gate(
                     &self.p,
                     &cw,
                     &qkv,
@@ -762,19 +798,8 @@ impl SsmLayer {
                     &alpha,
                     &mut self.state,
                     gdn::GateKind::Sigmoid,
-                ),
+                )
             }
-        } else {
-            gdn::forward_batch_core_gate(
-                &self.p,
-                &cw,
-                &qkv,
-                &z,
-                &beta_raw,
-                &alpha,
-                &mut self.state,
-                gdn::GateKind::Sigmoid,
-            )
         };
         if ys.len() != nt * vd {
             bail!(
@@ -790,7 +815,10 @@ impl SsmLayer {
 
         let t = crate::model::qwen4exp::q4prof::stamp();
         let mut outs = vec![0f32; nt * e];
-        crate::model::qwen4exp::gemv_batch(&self.w_out, &ys, nt, &mut outs)?;
+        {
+            let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_OUT);
+            crate::model::qwen4exp::gemv_batch(&self.w_out, &ys, nt, &mut outs)?;
+        }
         crate::model::qwen4exp::q4prof::mark(
             t,
             &crate::model::qwen4exp::q4prof::A_OUT,
@@ -798,6 +826,105 @@ impl SsmLayer {
             crate::model::qwen4exp::q4prof::ST_OUT,
         );
         Ok(outs.chunks_exact(e).map(|c| c.to_vec()).collect())
+    }
+
+    /// task 167: ssm 層 1 チャンクをデバイス連鎖で回す
+    /// (`DENNO_GDN_PF_CHAIN`)。
+    ///
+    /// 戻り値 `None` は「連鎖を使わなかった」= 呼び出し側は従来経路へ
+    /// (この関数はモデルの状態を進めていない)。`Some` は層の出力
+    /// (`nt` 行 × `n_embd` の平坦化)。
+    ///
+    /// beta/alpha は F32 重みのホスト投影なので、ここで先に作って連鎖へ渡す
+    /// (連鎖の中間は qkv / z / y だけ = どれもホストでは使わない)。
+    #[cfg(feature = "cuda")]
+    fn forward_batch_chain(&mut self, flat: &[f32], nt: usize) -> Result<Option<Vec<f32>>> {
+        use crate::model::qwen4exp::q4prof;
+        #[cfg(test)]
+        PF_CHAIN_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let e = self.p.n_embd;
+        let nv = self.p.n_v_heads;
+        let nk = self.p.n_k_heads;
+        let dk = self.p.head_k_dim;
+        let dv = self.p.head_v_dim;
+        // 連鎖は「入力を共有する 2 本の投影が別々の重み」のときだけ使う
+        // (実モデルの ssm は attn_qkv = Q8_0 / attn_gate = Q4K で連結されない)。
+        let parts = self.qkv_gate.parts();
+        if parts.len() != 2 || parts[0].n() != self.p.qkv_dim() || parts[1].n() != self.p.value_dim()
+        {
+            return Ok(None);
+        }
+        fn pw<'a>(g: &'a crate::model::linear_gguf::GgufLinear) -> crate::cuda::PfChainW<'a> {
+            crate::cuda::PfChainW {
+                uid: g.uid(),
+                ty: g.ty(),
+                blocks: g.blocks().as_slice(),
+                k: g.k(),
+                n: g.n(),
+            }
+        }
+        let (wqkv, wgate, wout) = (pw(&parts[0]), pw(&parts[1]), pw(&self.w_out));
+        if !crate::cuda::gdn_pf_chain_ready(
+            &wqkv,
+            &wgate,
+            &wout,
+            nt,
+            e,
+            nk,
+            nv,
+            dk,
+            dv,
+            self.p.d_conv,
+        ) {
+            return Ok(None);
+        }
+        let t = q4prof::stamp();
+        let mut beta_raw = vec![0f32; nt * nv];
+        let mut alpha = vec![0f32; nt * nv];
+        {
+            let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_GATE);
+            self.beta_alpha
+                .gemv_batch_split(flat, nt, &mut [&mut beta_raw[..], &mut alpha[..]])?;
+        }
+        q4prof::mark(t, &q4prof::A_GATE, self.il, q4prof::ST_GATE);
+        let q_scale = 1.0f32 / (dk as f32).sqrt();
+        let mut outs = vec![0f32; nt * e];
+        let mut ph = [0u64; 3];
+        let done = crate::cuda::gdn_pf_chain(
+            wqkv,
+            wgate,
+            wout,
+            flat,
+            &beta_raw,
+            &alpha,
+            &mut self.state.conv,
+            &mut self.state.ssm,
+            &self.conv1d,
+            &self.ssm_a,
+            &self.ssm_dt,
+            &self.ssm_norm,
+            nt,
+            nk,
+            nv,
+            dk,
+            dv,
+            self.p.d_conv,
+            self.p.eps,
+            q_scale,
+            self.il,
+            0,
+            &mut outs,
+            &mut ph,
+        )?;
+        if !done {
+            return Ok(None);
+        }
+        // 段の内訳: 連鎖は 1 呼び出しなので、内側で測った 3 段をここで積む。
+        q4prof::add_ns(&q4prof::A_QKV, self.il, q4prof::ST_QKV, ph[0]);
+        q4prof::add_ns(&q4prof::A_GDN, self.il, q4prof::ST_GDN, ph[1]);
+        q4prof::add_ns(&q4prof::A_OUT, self.il, q4prof::ST_OUT, ph[2]);
+        q4prof::bump_nt(self.il, nt);
+        Ok(Some(outs))
     }
 
     /// `attn_qkv` の投影だけを行う (state は進めない)。
@@ -1320,6 +1447,93 @@ mod tests {
                 bits(&got[t]),
                 bits(&want[t]),
                 "トークン {t} がビット不一致 (GPU フォールバック)"
+            );
+        }
+        assert_eq!(bits(&seq.state.ssm), bits(&bat.state.ssm), "ssm 状態");
+        assert_eq!(bits(&seq.state.conv), bits(&bat.state.conv), "conv 状態");
+    }
+
+    /// Q8_0 の重みで [`GgufLinear`] を作る (連鎖の型の前提を通すため)。
+    /// ブロックは f16 スケール 0x3c00 (= 1.0) + int8 32 個。
+    fn q8_linear(k: usize, n: usize, rnd: &mut impl FnMut() -> f32) -> GgufLinear {
+        assert_eq!(k % 32, 0);
+        let mut bytes = Vec::with_capacity(n * (k / 32) * 34);
+        for _ in 0..n * (k / 32) {
+            bytes.extend_from_slice(&0x3c00u16.to_le_bytes());
+            for _ in 0..32 {
+                let q = ((rnd().abs() * 8.0) as i32).clamp(0, 12) as i8;
+                bytes.push(q as u8);
+            }
+        }
+        GgufLinear::new(GgmlType::Q8_0, k, n, WeightBlocks::from_vec(bytes))
+            .expect("GgufLinear (Q8_0)")
+    }
+
+    /// task 167: `DENNO_GDN_PF_CHAIN` を強制 on にしても、GPU が無い環境では
+    /// 連鎖の入口で落ちて従来経路へ戻り、出力・状態ともビット一致する。
+    /// 併せて「連鎖の入口に本当に来た」ことを数える (緑 = 分岐の発火ではない)。
+    #[test]
+    fn pf_gdn_chain_on_without_cuda_falls_back_bitexact() {
+        let make = || {
+            // Q8_0 は k が 32 の倍数であること (小さいモデルでは n_embd を 32 にする)。
+            let p = GdnParams {
+                n_embd: 32,
+                n_k_heads: 2,
+                n_v_heads: 4,
+                head_k_dim: 8,
+                head_v_dim: 8,
+                d_conv: 4,
+                eps: 1e-6,
+            };
+            let mut rnd = lcg_rng(0x0f0f_1234_5678_9abc);
+            let vd = p.value_dim();
+            let layer = SsmLayer {
+                il: 0,
+                nonce: next_device_nonce(),
+                p: p.clone(),
+                qkv_gate: FusedLinear::concat(vec![
+                    q8_linear(p.n_embd, p.qkv_dim(), &mut rnd),
+                    q8_linear(p.n_embd, vd, &mut rnd),
+                ]),
+                beta_alpha: FusedLinear::concat(vec![
+                    f32_linear(p.n_embd, p.n_v_heads, &mut rnd),
+                    f32_linear(p.n_embd, p.n_v_heads, &mut rnd),
+                ]),
+                w_out: q8_linear(vd, p.n_embd, &mut rnd),
+                conv1d: (0..p.conv_dim() * p.d_conv).map(|_| 0.4 * rnd()).collect(),
+                ssm_a: (0..p.n_v_heads).map(|_| -0.05 - 0.05 * rnd().abs()).collect(),
+                ssm_dt: (0..p.n_v_heads).map(|_| 0.1 * rnd()).collect(),
+                ssm_norm: (0..p.head_v_dim).map(|_| 0.5 + rnd().abs()).collect(),
+                state: GdnState::new(&p),
+            };
+            (layer, p)
+        };
+        let (mut seq, p) = make();
+        let (mut bat, _) = make();
+        // nt >= 64 (連鎖の下限) で回す。
+        let curs = inputs(&p, 70);
+        let want: Vec<Vec<f32>> = curs
+            .iter()
+            .map(|c| seq.forward_token(c).expect("forward_token"))
+            .collect();
+        let before = PF_CHAIN_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
+        crate::model::qwen4exp::set_pf_gdn_chain_for_test(Some(true));
+        assert!(
+            crate::model::qwen4exp::pf_gdn_chain_on(),
+            "連鎖のゲート上書きが効いていない"
+        );
+        let got = bat.forward_batch(&curs).expect("forward_batch");
+        crate::model::qwen4exp::set_pf_gdn_chain_for_test(None);
+        let after = PF_CHAIN_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after > before,
+            "連鎖の入口に来ていない (ゲートが効いていない)"
+        );
+        for t in 0..70 {
+            assert_eq!(
+                bits(&got[t]),
+                bits(&want[t]),
+                "トークン {t} がビット不一致 (連鎖フォールバック)"
             );
         }
         assert_eq!(bits(&seq.state.ssm), bits(&bat.state.ssm), "ssm 状態");

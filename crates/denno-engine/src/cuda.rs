@@ -7452,6 +7452,28 @@ impl GdnScratch {
         }
         Ok(())
     }
+    /// task 167: デバイス連鎖が必要とする分だけを確保する。
+    ///
+    /// 連鎖は q / z / beta / alpha / y を自前のバッファに持つので、
+    /// [`Self::ensure`] が確保する約 90 MB (nt=1024 の実形) を無駄に取らない。
+    fn ensure_chain(
+        &mut self,
+        conv_dim: usize,
+        nv: usize,
+        dk: usize,
+        dv: usize,
+        cs: usize,
+    ) -> Result<()> {
+        const F: usize = std::mem::size_of::<f32>();
+        Self::grow(&mut self.wc, conv_dim * 4 * F)?;
+        Self::grow(&mut self.wa, nv * F)?;
+        Self::grow(&mut self.wd, nv * F)?;
+        Self::grow(&mut self.wn, dv * F)?;
+        Self::grow(&mut self.conv_out, conv_dim * cs * F)?;
+        Self::grow(&mut self.ssm_out, nv * dk * dv * F)?;
+        Ok(())
+    }
+
     /// 形が変わらない限り何もしない (prefill の 24 層は全て同じ形)。
     fn ensure(
         &mut self,
@@ -21417,6 +21439,39 @@ mod tests {
     use super::*;
     use crate::tensor;
 
+    /// task 167: デバイス連鎖の形の判定 (純関数)。実モデル (e=2560 / nk=8 /
+    /// dk=dv=256 / nv=24 → conv_dim 10240, value_dim 6144) を通し、
+    /// 1 つでも外れたら落ちることを見る。
+    #[test]
+    fn gdn_pf_chain_shape_rules() {
+        use crate::kquant::GgmlType as T;
+        let (e, nk, nv, dk, dv) = (2560usize, 8usize, 24usize, 256usize, 256usize);
+        let (conv_dim, vd) = (2 * nk * dk + nv * dv, nv * dv);
+        assert_eq!((conv_dim, vd), (10240, 6144));
+        let blocks = vec![0u8; 64];
+        let wq = PfChainW { uid: 1, ty: T::Q8_0, blocks: &blocks, k: e, n: conv_dim };
+        let wg = PfChainW { uid: 2, ty: T::Q4K, blocks: &blocks, k: e, n: vd };
+        let wo = PfChainW { uid: 3, ty: T::Q8_0, blocks: &blocks, k: vd, n: e };
+        for nt in [64usize, 512, 1024, 2047] {
+            assert!(
+                gdn_pf_chain_shape_ok(&wq, &wg, &wo, nt, e, nk, nv, dk, dv, 4),
+                "nt={nt} は受けるはず"
+            );
+        }
+        // 短すぎる / 長すぎる (chunked 経路の領域) は受けない。
+        assert!(!gdn_pf_chain_shape_ok(&wq, &wg, &wo, 63, e, nk, nv, dk, dv, 4));
+        assert!(!gdn_pf_chain_shape_ok(&wq, &wg, &wo, 2048, e, nk, nv, dk, dv, 4));
+        // dk != dv / d_conv != 4 は単発カーネルの前提外。
+        assert!(!gdn_pf_chain_shape_ok(&wq, &wg, &wo, 512, e, nk, nv, 256, 128, 4));
+        assert!(!gdn_pf_chain_shape_ok(&wq, &wg, &wo, 512, e, nk, nv, dk, dv, 3));
+        // 形の不一致 (out の k が value_dim でない)。
+        let bad = PfChainW { k: e, ..wo };
+        assert!(!gdn_pf_chain_shape_ok(&wq, &wg, &bad, 512, e, nk, nv, dk, dv, 4));
+        // 型が GEMM の対象外 (F32 の qkv)。
+        let bad_ty = PfChainW { ty: T::F32, ..wq };
+        assert!(!gdn_pf_chain_shape_ok(&bad_ty, &wg, &wo, 512, e, nk, nv, dk, dv, 4));
+    }
+
     /// task 152: `DENNO_MIX_BF16` の真理値表。既定は off (lab の採否で決める)。
     #[test]
     fn mix_bf16_gate_truth_table() {
@@ -25501,6 +25556,496 @@ fn gdn_scan_impl(
     crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
     q.end();
     Ok(y)
+}
+
+// ---------------------------------------------------------------------------
+// task 167: prefill の ssm 層 (GDN) を 1 チャンクぶんデバイスで完結させる連鎖
+// ---------------------------------------------------------------------------
+//
+// 従来の prefill 経路 (lab t162c の台帳) は ssm 1 層 1 チャンクあたり
+//   ① qkv 投影 GEMM (ホスト入力 → ホスト出力)   H2D: nt*e*4   D2H: nt*qkv_dim*4
+//   ② z 投影 GEMM (同上)                        H2D: nt*e*4   D2H: nt*value_dim*4
+//   ③ スキャン (ホスト入力)                     H2D: nt*(qkv+z)*4  D2H: nt*vd*4 + 状態
+//   ④ out_proj GEMM (ホスト入力)                H2D: nt*vd*4  D2H: nt*e*4
+// を往復する。中間 (qkv / z / y) はホストでは何にも使わないのに、毎回
+// ホストへ落として上げ直していた (14k の prefill で約 105 GB)。
+//
+// この連鎖は ①②③④ をデバイス上でつなぎ、ホストと往復するのは
+//   - 入力の活性 (nt*e*4) 1 本
+//   - beta / alpha (nt*nv*4 × 2) 2 本
+//   - 出力 (nt*e*4) 1 本
+//   - GDN 状態のホスト写し (次の decode / CPU 経路が seed に使う)
+// だけにする。カーネル・引数・丸め順は従来と同一 (同じ `dno_gemm_*` と
+// 同じ `dno_gdn_scan_sig`) なので、値は 1 ビットも変わらない。
+//
+// 失敗の扱い: スキャンを起動する前の失敗は `Ok(false)` を返す (= 呼び出し側は
+// 従来経路へ。状態は 1 つも進んでいない)。スキャン起動後は状態が進むので
+// `Err` にして要求を落とす (黙って従来経路に戻すと状態が二重に進む)。
+
+/// 連鎖が使う GGUF 行列の記述 (`GgufLinear` から作る)。
+#[derive(Clone, Copy)]
+pub struct PfChainW<'a> {
+    pub uid: u64,
+    pub ty: crate::kquant::GgmlType,
+    pub blocks: &'a [u8],
+    pub k: usize,
+    pub n: usize,
+}
+
+/// 連鎖の作業域 (thread_local, grow-only)。`x`/`o` は [nt, e]、
+/// `qkv` は [nt, conv_dim]、`z` と `y` は [nt, vd]、`beta`/`alpha` は [nt, nv]。
+struct GdnPfChainBufs {
+    x: Option<DevBuffer>,
+    o: Option<DevBuffer>,
+    qkv: Option<DevBuffer>,
+    z: Option<DevBuffer>,
+    y: Option<DevBuffer>,
+    beta: Option<DevBuffer>,
+    alpha: Option<DevBuffer>,
+    nt: usize,
+    e: usize,
+    conv_dim: usize,
+    vd: usize,
+    nv: usize,
+}
+
+impl GdnPfChainBufs {
+    const fn empty() -> Self {
+        Self {
+            x: None,
+            o: None,
+            qkv: None,
+            z: None,
+            y: None,
+            beta: None,
+            alpha: None,
+            nt: 0,
+            e: 0,
+            conv_dim: 0,
+            vd: 0,
+            nv: 0,
+        }
+    }
+    /// 形が変わったら全バッファを grow し直す (prefill の 1 リクエストは
+    /// 同じ形のチャンクが続くので、2 チャンク目以降は何もしない)。
+    fn ensure(
+        &mut self,
+        nt: usize,
+        e: usize,
+        conv_dim: usize,
+        vd: usize,
+        nv: usize,
+    ) -> Result<()> {
+        const F: usize = std::mem::size_of::<f32>();
+        if self.nt >= nt
+            && self.e == e
+            && self.conv_dim == conv_dim
+            && self.vd == vd
+            && self.nv == nv
+            && self.x.is_some()
+        {
+            return Ok(());
+        }
+        let grow = |cap: &mut Option<DevBuffer>, bytes: usize| -> Result<()> {
+            if cap.as_ref().map(|b| b.bytes()).unwrap_or(0) < bytes {
+                *cap = Some(DevBuffer::alloc(bytes.max(1))?);
+            }
+            Ok(())
+        };
+        grow(&mut self.x, nt * e * F)?;
+        grow(&mut self.o, nt * e * F)?;
+        grow(&mut self.qkv, nt * conv_dim * F)?;
+        grow(&mut self.z, nt * vd * F)?;
+        grow(&mut self.y, nt * vd * F)?;
+        grow(&mut self.beta, nt * nv * F)?;
+        grow(&mut self.alpha, nt * nv * F)?;
+        self.nt = nt;
+        self.e = e;
+        self.conv_dim = conv_dim;
+        self.vd = vd;
+        self.nv = nv;
+        Ok(())
+    }
+    fn buf(&self, which: usize) -> CUdeviceptr {
+        let b = match which {
+            0 => &self.x,
+            1 => &self.o,
+            2 => &self.qkv,
+            3 => &self.z,
+            4 => &self.y,
+            5 => &self.beta,
+            _ => &self.alpha,
+        };
+        b.as_ref().expect("GdnPfChainBufs: 未確保").ptr()
+    }
+}
+
+thread_local! {
+    static GDN_PF_CHAIN_BUF: std::cell::RefCell<GdnPfChainBufs> =
+        const { std::cell::RefCell::new(GdnPfChainBufs::empty()) };
+}
+
+/// task 167: 連鎖の前提 (GPU を触らない純関数)。false なら従来経路へ。
+///
+/// 形は「ssm 層 1 本ぶんの投影 3 本とスキャン」がそのままつながることを要求する:
+/// qkv: [e → 2*nk*dk + nv*dv] / gate: [e → nv*dv] / out: [nv*dv → e]。
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_pf_chain_ready(
+    wqkv: &PfChainW<'_>,
+    wgate: &PfChainW<'_>,
+    wout: &PfChainW<'_>,
+    nt: usize,
+    e: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+) -> bool {
+    cuda_enabled() && gdn_pf_chain_shape_ok(wqkv, wgate, wout, nt, e, nk, nv, dk, dv, d_conv)
+}
+
+/// [`gdn_pf_chain_ready`] の形だけの判定 (GPU を触らない純関数)。
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_pf_chain_shape_ok(
+    wqkv: &PfChainW<'_>,
+    wgate: &PfChainW<'_>,
+    wout: &PfChainW<'_>,
+    nt: usize,
+    e: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+) -> bool {
+    use crate::kquant::GgmlType as T;
+    if nt == 0 || e == 0 || nk == 0 || nv == 0 {
+        return false;
+    }
+    // 単発の sigmoid スキャンが受ける範囲 (decode と同じ境界)。
+    if nt < GDN_SIG_MIN_TOKENS || nt >= GDN_CHUNK_MIN_TOKENS {
+        return false;
+    }
+    if dk != dv || dk > 256 || d_conv != 4 {
+        return false;
+    }
+    let conv_dim = 2 * nk * dk + nv * dv;
+    let vd = nv * dv;
+    let ok_ty = |w: &PfChainW<'_>| matches!(w.ty, T::Q8_0 | T::Q5_1 | T::Q4K | T::Q5K);
+    wqkv.k == e
+        && wqkv.n == conv_dim
+        && wgate.k == e
+        && wgate.n == vd
+        && wout.k == vd
+        && wout.n == e
+        && ok_ty(wqkv)
+        && ok_ty(wgate)
+        && ok_ty(wout)
+}
+
+/// task 167: デバイス入出力の GGUF GEMM を 1 発だけ撃つ (コピーもしない)。
+/// カーネル・引数・グリッドは [`CudaCtx::moe_gemm_dev`] と同一。
+fn gguf_gemm_dev_launch(
+    ctx: &CudaCtx,
+    ty: crate::kquant::GgmlType,
+    wptr: CUdeviceptr,
+    xptr: CUdeviceptr,
+    optr: CUdeviceptr,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+) -> Result<bool> {
+    use crate::kquant::GgmlType as T;
+    const ROWS: usize = 16; // kernels_gemm.cu の GEMM_ROWS
+    const NTG_MAX: usize = 8; // kernels_gemm.cu の GEMM_NTG_MAX
+    let Some(fs) = ctx.f_gemm_q else {
+        return Ok(false);
+    };
+    if nt == 0 || nt > ROWS * NTG_MAX || n_in == 0 || n_out == 0 {
+        return Ok(false);
+    }
+    let (f, blk) = match ty {
+        T::Q8_0 => (fs[0], 32usize),
+        T::Q5_1 => (fs[1], 32usize),
+        T::Q4K => (fs[2], 256usize),
+        T::Q5K => (fs[3], 256usize),
+        _ => return Ok(false),
+    };
+    if n_in % blk != 0 {
+        return Ok(false);
+    }
+    let Some(rb) = gguf_row_bytes(ty, n_in) else {
+        return Ok(false);
+    };
+    let shmem = ROWS * blk * 4;
+    if shmem > 46_000 {
+        return Ok(false);
+    }
+    let grid = ((n_out + ROWS - 1) / ROWS) as u32;
+    unsafe {
+        let (mut pw, mut px, mut po) = (wptr, xptr, optr);
+        let (mut nt_c, mut ni_c, mut no_c, mut rb_c) =
+            (nt as c_int, n_in as c_int, n_out as c_int, rb as c_int);
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut nt_c as *mut _ as *mut c_void,
+            &mut ni_c as *mut _ as *mut c_void,
+            &mut no_c as *mut _ as *mut c_void,
+            &mut rb_c as *mut _ as *mut c_void,
+        ];
+        ctx.launch_async(f, (grid, 1, 1), (ROWS as u32, 16, 1), shmem as u32, &mut args)?;
+    }
+    Ok(true)
+}
+
+/// task 167: ssm 層 1 チャンクを「qkv 投影 → z 投影 → GDN スキャン → out_proj」の
+/// デバイス連鎖で回す。成功したら `out` に層の出力 [nt, e] を書く。
+///
+/// 戻り値 `Ok(false)` は「何もしていない」= 呼び出し側は従来経路へ落ちてよい。
+/// スキャン起動後の失敗は `Err` (状態が進んでいるので要求を落とすこと)。
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_pf_chain(
+    wqkv: PfChainW<'_>,
+    wgate: PfChainW<'_>,
+    wout: PfChainW<'_>,
+    flat: &[f32],
+    beta: &[f32],
+    alpha: &[f32],
+    conv_st: &mut [f32],
+    ssm_st: &mut [f32],
+    wconv: &[f32],
+    wa: &[f32],
+    wdt: &[f32],
+    wnorm: &[f32],
+    nt: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    eps: f32,
+    q_scale: f32,
+    li: usize,
+    kv: u64,
+    out: &mut [f32],
+    phase_ns: &mut [u64; 3],
+) -> Result<bool> {
+    let e = wqkv.k;
+    let conv_dim = 2 * nk * dk + nv * dv;
+    let vd = nv * dv;
+    let cs = d_conv - 1;
+    if !gdn_pf_chain_ready(&wqkv, &wgate, &wout, nt, e, nk, nv, dk, dv, d_conv) {
+        return Ok(false);
+    }
+    // `DENNO_GPU_GEMM=0` は従来経路でも GEMM を CPU に落とす。連鎖も同じ扱いにする
+    // (ゲート off のときの木を 1 バイトも変えない)。
+    if !gpu_gemm_enabled() {
+        return Ok(false);
+    }
+    if flat.len() != nt * e
+        || beta.len() != nt * nv
+        || alpha.len() != nt * nv
+        || out.len() != nt * e
+        || conv_st.len() != conv_dim * cs
+        || ssm_st.len() != nv * dk * dv
+        || wconv.len() != conv_dim * d_conv
+        || wa.len() != nv
+        || wdt.len() != nv
+        || wnorm.len() != dv
+    {
+        return Ok(false);
+    }
+    let Some(ctx) = shared_ctx() else {
+        return Ok(false);
+    };
+    if let Err(err) = ctx.make_current() {
+        tracing::error!("CUDA cuCtxSetCurrent failed, GDN prefill chain skipped: {err:#}");
+        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Ok(false);
+    }
+    let Some(f_scan) = ctx.f_gdn_scan_sig else {
+        // 旧 PTX (sig 未収録) では黙って従来経路へ (ラッチはしない)。
+        return Ok(false);
+    };
+    // 重みは 3 本とも「デバイスに載る」ことを先に確かめる。ここまでの失敗は
+    // 状態を 1 つも触っていないので `Ok(false)` で従来経路に戻せる。
+    let (wq, wg, wo) = match (
+        weights_for_gguf(wqkv.uid, wqkv.ty, wqkv.blocks, wqkv.k, wqkv.n),
+        weights_for_gguf(wgate.uid, wgate.ty, wgate.blocks, wgate.k, wgate.n),
+        weights_for_gguf(wout.uid, wout.ty, wout.blocks, wout.k, wout.n),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        (a, b, c) => {
+            for r in [a.err(), b.err(), c.err()].into_iter().flatten() {
+                tracing::error!("GDN prefill chain: 重みの登録に失敗: {r:#}");
+            }
+            return Ok(false);
+        }
+    };
+    // ここから先はデバイスの作業域だけを触る (モデルの状態は不変)。
+    let ptrs = GDN_SCRATCH.with(|cell| -> Result<GdnPtrs> {
+        let mut s = cell.borrow_mut();
+        s.ensure_chain(conv_dim, nv, dk, dv, cs)?;
+        // スキャンカーネルは「書かない領域」を残すので従来どおりゼロ埋め。
+        s.buf(GdnBuf::ConvOut).fill_zero()?;
+        s.buf(GdnBuf::SsmOut).fill_zero()?;
+        s.wc.as_ref().unwrap().copy_from(wconv)?;
+        s.wa.as_ref().unwrap().copy_from(wa)?;
+        s.wd.as_ref().unwrap().copy_from(wdt)?;
+        s.wn.as_ref().unwrap().copy_from(wnorm)?;
+        Ok(s.ptrs())
+    })?;
+    let ptr = GDN_PF_CHAIN_BUF.with(|cell| -> Result<[CUdeviceptr; 7]> {
+        let mut b = cell.borrow_mut();
+        b.ensure(nt, e, conv_dim, vd, nv)?;
+        b.x.as_ref().unwrap().copy_from(flat)?;
+        b.beta.as_ref().unwrap().copy_from(beta)?;
+        b.alpha.as_ref().unwrap().copy_from(alpha)?;
+        Ok([
+            b.buf(0),
+            b.buf(1),
+            b.buf(2),
+            b.buf(3),
+            b.buf(4),
+            b.buf(5),
+            b.buf(6),
+        ])
+    })?;
+    let (px, po, pqkv, pz, py, pb, pa) = (ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6]);
+
+    // ---- qkv / z 投影 (デバイス → デバイス) --------------------------------
+    {
+        let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_QKV);
+        let t_ph = Instant::now();
+        const TILE: usize = 128;
+        let mut t0 = 0usize;
+        while t0 < nt {
+            let m = (nt - t0).min(TILE);
+            let xo = px + (t0 * e * 4) as CUdeviceptr;
+            let qo = pqkv + (t0 * conv_dim * 4) as CUdeviceptr;
+            let zo = pz + (t0 * vd * 4) as CUdeviceptr;
+            for (w, wty, n_out, o) in [
+                (wq.buf.ptr(), wqkv.ty, conv_dim, qo),
+                (wg.buf.ptr(), wgate.ty, vd, zo),
+            ] {
+                match gguf_gemm_dev_launch(&ctx, wty, w, xo, o, m, e, n_out) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(false),
+                    Err(err) => {
+                        tracing::error!("GDN prefill chain: 投影の起動に失敗: {err:#}");
+                        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(false);
+                    }
+                }
+            }
+            t0 += m;
+        }
+        // 段ごとの壁時計を意味のある値にするため、ここで 1 回だけ待つ
+        // (1 チャンク = 1 段 40 ms 級なので、同期の固定費は無視できる)。
+        ctx.sync()?;
+        phase_ns[0] = t_ph.elapsed().as_nanos() as u64;
+    }
+
+    // ---- GDN スキャン (状態はデバイス正本) ----------------------------------
+    let (pst_conv, pst_ssm) =
+        gdn_state_begin(kv, li, conv_st, ssm_st, conv_dim * cs, nv, dk * dv)?;
+    {
+        let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_SCAN);
+        let t_ph = Instant::now();
+        let (mut pq, mut pzz, mut pbb, mut paa) = (pqkv, pz, pb, pa);
+        let (mut pci, mut psi) = (pst_conv, pst_ssm);
+        let (mut pwc, mut pwa, mut pwd, mut pwn) = (ptrs.wc, ptrs.wa, ptrs.wd, ptrs.wn);
+        let (mut pyy, mut pco, mut pso) = (py, ptrs.conv_out, ptrs.ssm_out);
+        let (mut ni, mut nki, mut nvi, mut dki, mut dvi) = (
+            nt as c_int,
+            nk as c_int,
+            nv as c_int,
+            dk as c_int,
+            dv as c_int,
+        );
+        let (mut cdi, mut dci, mut csi) = (conv_dim as c_int, d_conv as c_int, cs as c_int);
+        let (mut epsi, mut qsi) = (eps, q_scale);
+        let mut args = [
+            &mut pq as *mut _ as *mut c_void,
+            &mut pzz as *mut _ as *mut c_void,
+            &mut pbb as *mut _ as *mut c_void,
+            &mut paa as *mut _ as *mut c_void,
+            &mut pci as *mut _ as *mut c_void,
+            &mut psi as *mut _ as *mut c_void,
+            &mut pwc as *mut _ as *mut c_void,
+            &mut pwa as *mut _ as *mut c_void,
+            &mut pwd as *mut _ as *mut c_void,
+            &mut pwn as *mut _ as *mut c_void,
+            &mut pyy as *mut _ as *mut c_void,
+            &mut pco as *mut _ as *mut c_void,
+            &mut pso as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut nki as *mut _ as *mut c_void,
+            &mut nvi as *mut _ as *mut c_void,
+            &mut dki as *mut _ as *mut c_void,
+            &mut dvi as *mut _ as *mut c_void,
+            &mut cdi as *mut _ as *mut c_void,
+            &mut dci as *mut _ as *mut c_void,
+            &mut csi as *mut _ as *mut c_void,
+            &mut epsi as *mut _ as *mut c_void,
+            &mut qsi as *mut _ as *mut c_void,
+        ];
+        let shmem = ((3 * dk + dv + 5) * 4) as u32;
+        unsafe {
+            ctx.launch_async(
+                f_scan,
+                (nv as u32, 1, 1),
+                (dk as u32, 1, 1),
+                shmem,
+                &mut args,
+            )?;
+        }
+        ctx.sync()?;
+        phase_ns[1] = t_ph.elapsed().as_nanos() as u64;
+    }
+
+    // ---- out_proj (デバイス → デバイス) ------------------------------------
+    let t_out = Instant::now();
+    {
+        let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_OUT);
+        const TILE: usize = 128;
+        let mut t0 = 0usize;
+        while t0 < nt {
+            let m = (nt - t0).min(TILE);
+            let yo = py + (t0 * vd * 4) as CUdeviceptr;
+            let oo = po + (t0 * e * 4) as CUdeviceptr;
+            match gguf_gemm_dev_launch(&ctx, wout.ty, wo.buf.ptr(), yo, oo, m, vd, e) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // スキャンは既に走っている → 状態が進んでいる。落とす。
+                    GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+                    bail!("GDN prefill chain: out_proj の形がカーネルの前提外 (スキャン後)");
+                }
+                Err(err) => {
+                    GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(err.context("GDN prefill chain: out_proj の起動に失敗"));
+                }
+            }
+            t0 += m;
+        }
+    }
+
+    // ---- 1 回だけ待って、層の出力と状態をホストへ --------------------------
+    ctx.sync()?;
+    phase_ns[2] = t_out.elapsed().as_nanos() as u64;
+    let got: Vec<f32> = GDN_PF_CHAIN_BUF.with(|cell| -> Result<Vec<f32>> {
+        let b = cell.borrow();
+        b.o.as_ref().expect("連鎖の出力").to_vec::<f32>(nt * e)
+    })?;
+    out[..nt * e].copy_from_slice(&got);
+    gdn_state_commit(li, ptrs.conv_out, ptrs.ssm_out, conv_dim * cs, nv, dk * dv)?;
+    // prefill のあとに decode (別ストア) や CPU 経路がホスト state を seed に
+    // するので、状態は毎回ホストへも戻す (従来の sig 経路と同じ)。
+    gdn_host_writeback(conv_st, ssm_st)?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------

@@ -5101,6 +5101,20 @@ pub mod q4prof {
         }
     }
 
+    /// task 167: 外で測った ns をグローバル束と層別束の両方へ足す
+    /// (デバイス連鎖は 1 呼び出しの中で段を測るので、`Instant` の外側では
+    /// 段の内訳が作れない)。
+    #[inline]
+    pub fn add_ns(c: &AtomicU64, layer: usize, stage: usize, ns: u64) {
+        if !timed() {
+            return;
+        }
+        if enabled() {
+            c.fetch_add(ns, Ordering::Relaxed);
+        }
+        mark_l_ns(layer, stage, ns);
+    }
+
     #[inline]
     fn mark_l_ns(layer: usize, stage: usize, ns: u64) {
         if !att_dbg() {
@@ -9801,6 +9815,48 @@ fn pf_sub_on(which: usize, env: &str) -> bool {
 /// ssm 層の GDN コアを GPU スキャンで回すか (`DENNO_PF_GDN_GPU`、未設定は master)。
 pub(crate) fn pf_gdn_gpu_on() -> bool {
     pf_sub_on(PF_SUB_GDN, "DENNO_PF_GDN_GPU")
+}
+
+/// task 167: ssm 層の prefill を「投影 → GDN → out_proj」のデバイス連鎖で回すか
+/// (`DENNO_GDN_PF_CHAIN`、既定 off)。off は 1 バイトも挙動が変わらない。
+///
+/// 連鎖は GPU スキャン (`pf_gdn_gpu_on`) と同じ前提の上でだけ動く。ゲートを
+/// 別に持つのは、数値の契約 (丸め順は同じ・中間をホストへ落とさない) と
+/// 経路の切り戻しを独立にできるようにするため。
+pub(crate) fn pf_gdn_chain_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_GDN_CHAIN_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_gdn_chain_from_value(std::env::var("DENNO_GDN_PF_CHAIN").ok().as_deref())
+    })
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+#[cfg(test)]
+static PF_GDN_CHAIN_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_gdn_chain_for_test(v: Option<bool>) {
+    PF_GDN_CHAIN_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// task 167: 連鎖のゲート値の解釈 (純関数・テスト用)。
+pub(crate) fn pf_gdn_chain_from_value(v: Option<&str>) -> bool {
+    matches!(v, Some("1") | Some("on") | Some("true"))
 }
 
 /// hc mix と hc combine をデバイス連鎖で回すか (`DENNO_PF_MIX_DEV`、未設定は master)。
@@ -16531,6 +16587,20 @@ mod tests {
             }
             for v in ["1", "on", "true", "yes", " ON "] {
                 assert!(pf_on_from_value(Some(v)), "{v:?} が off になった");
+            }
+        }
+
+        /// task 167: `DENNO_GDN_PF_CHAIN` の真理値表。既定 off。
+        /// 連鎖は GPU スキャンと同じ前提の上でだけ動くので、未設定は false。
+        #[test]
+        fn gdn_pf_chain_gate_truth_table() {
+            assert!(!pf_gdn_chain_from_value(None), "未設定は off");
+            assert!(!pf_gdn_chain_from_value(Some("")), "空文字は off");
+            for v in ["0", "off", "false", "no", " ON ", "2"] {
+                assert!(!pf_gdn_chain_from_value(Some(v)), "{v:?} が on になった");
+            }
+            for v in ["1", "on", "true"] {
+                assert!(pf_gdn_chain_from_value(Some(v)), "{v:?} が off になった");
             }
         }
 

@@ -380,6 +380,7 @@ pub fn note_sync(t: Option<Instant>) {
 #[inline]
 pub fn note_h2d(bytes: usize, t: Option<Instant>) {
     let Some(t) = t else { return };
+    sub_bytes(true, bytes);
     let r = &ROWS[cur()];
     r.h2d_calls.fetch_add(1, Ordering::Relaxed);
     r.h2d_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -391,6 +392,7 @@ pub fn note_h2d(bytes: usize, t: Option<Instant>) {
 #[inline]
 pub fn note_d2h(bytes: usize, t: Option<Instant>) {
     let Some(t) = t else { return };
+    sub_bytes(false, bytes);
     let r = &ROWS[cur()];
     r.d2h_calls.fetch_add(1, Ordering::Relaxed);
     r.d2h_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -471,8 +473,16 @@ pub const SUB_EMBED: usize = 8;
 pub const SUB_LAYOUT: usize = 9;
 /// ルータの softmax / top-k (ホスト)。
 pub const SUB_SOFTMAX: usize = 10;
+/// task 167: ssm 層の qkv (q/k/v) 投影 (バッチ GEMM)。
+pub const SUB_PF_QKV: usize = 11;
+/// task 167: ssm 層の beta/alpha 投影。
+pub const SUB_PF_GATE: usize = 12;
+/// task 167: GDN コア (GPU スキャン or CPU スキャン)。
+pub const SUB_PF_SCAN: usize = 13;
+/// task 167: ssm 層の出力投影 (out_proj)。
+pub const SUB_PF_OUT: usize = 14;
 /// 副区間の数。
-pub const SUB_N: usize = 11;
+pub const SUB_N: usize = 15;
 /// 副区間の名前 ([`SUB_NORM`] の順)。
 pub const SUB_NAMES: [&str; SUB_N] = [
     "norm",
@@ -486,10 +496,66 @@ pub const SUB_NAMES: [&str; SUB_N] = [
     "embed",
     "layout",
     "softmax",
+    "qkv_pf",
+    "beta_pf",
+    "scan_pf",
+    "out_pf",
 ];
 
 /// 親 × 副区間の壁時計 (ns)。
 static SUBS: [[AtomicU64; SUB_N]; N] = [const { [const { AtomicU64::new(0) }; SUB_N] }; N];
+
+// task 167: 副区間の中で起きた H2D / D2H を**その副区間にも**積む。
+// 台帳の行 (`ROWS`) は親の区間しか持たないので、「ssm の 105 GB のうち
+// どの段が何 MB 動かしたか」が読めなかった。転送の trampoline は
+// `note_h2d` / `note_d2h` に集約されているので、ここで副区間の
+// カウンタにも同じ値を足す (off は thread_local の Cell 読み 1 回)。
+static SUB_H2D_BYTES: [[AtomicU64; SUB_N]; N] = [const { [const { AtomicU64::new(0) }; SUB_N] }; N];
+static SUB_D2H_BYTES: [[AtomicU64; SUB_N]; N] = [const { [const { AtomicU64::new(0) }; SUB_N] }; N];
+static SUB_H2D_CALLS: [[AtomicU64; SUB_N]; N] = [const { [const { AtomicU64::new(0) }; SUB_N] }; N];
+static SUB_D2H_CALLS: [[AtomicU64; SUB_N]; N] = [const { [const { AtomicU64::new(0) }; SUB_N] }; N];
+
+/// 副区間を開いていないことを表す番兵。
+const NO_SUB: usize = usize::MAX;
+
+thread_local! {
+    /// いま開いている副区間 (ネストは「内側が勝つ」= 最も内側に積む)。
+    static CUR_SUB: std::cell::Cell<usize> = const { std::cell::Cell::new(NO_SUB) };
+}
+
+#[inline]
+fn sub_bytes(is_h2d: bool, bytes: usize) {
+    let item = CUR_SUB.with(|c| c.get());
+    if item == NO_SUB {
+        return;
+    }
+    let row = cur().min(N - 1);
+    let item = item.min(SUB_N - 1);
+    let (b, c) = if is_h2d {
+        (&SUB_H2D_BYTES, &SUB_H2D_CALLS)
+    } else {
+        (&SUB_D2H_BYTES, &SUB_D2H_CALLS)
+    };
+    b[row][item].fetch_add(bytes as u64, Ordering::Relaxed);
+    c[row][item].fetch_add(1, Ordering::Relaxed);
+}
+
+/// 副区間 `item` の転送 (バイト, 回数) を読む。`is_h2d` で向きを選ぶ。
+pub fn sub_bytes_of(parent: usize, item: usize, is_h2d: bool) -> (u64, u64) {
+    let row = parent.min(N - 1);
+    let item = item.min(SUB_N - 1);
+    if is_h2d {
+        (
+            SUB_H2D_BYTES[row][item].load(Ordering::Relaxed),
+            SUB_H2D_CALLS[row][item].load(Ordering::Relaxed),
+        )
+    } else {
+        (
+            SUB_D2H_BYTES[row][item].load(Ordering::Relaxed),
+            SUB_D2H_CALLS[row][item].load(Ordering::Relaxed),
+        )
+    }
+}
 
 /// 副区間を開く。`drop` で親の行に壁時計を積む (off では何もしない)。
 pub fn sub(item: usize) -> SubScope {
@@ -498,12 +564,15 @@ pub fn sub(item: usize) -> SubScope {
             parent: 0,
             item: 0,
             t: None,
+            prev_sub: NO_SUB,
         };
     }
+    let prev_sub = CUR_SUB.with(|c| c.replace(item));
     SubScope {
         parent: cur(),
         item,
         t: Some(Instant::now()),
+        prev_sub,
     }
 }
 
@@ -512,10 +581,14 @@ pub struct SubScope {
     parent: usize,
     item: usize,
     t: Option<Instant>,
+    prev_sub: usize,
 }
 
 impl Drop for SubScope {
     fn drop(&mut self) {
+        if self.prev_sub != NO_SUB || self.t.is_some() {
+            CUR_SUB.with(|c| c.set(self.prev_sub));
+        }
         let Some(t) = self.t else { return };
         SUBS[self.parent][self.item].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
@@ -757,6 +830,31 @@ pub fn line_prefill(tok: usize) -> Vec<String> {
             parts.join(" ")
         ));
     }
+    // task 167: ssm 層の中の 4 段 (qkv 投影 / beta/alpha 投影 / GDN コア / 出力投影)
+    // ごとの壁時計と転送量。`sub` の行は名前だけなので、ここでは
+    // 「どの段が何 MB 動かしたか」を独立の行で出す (段の和は ssm の wall 以下)。
+    let steps = [SUB_PF_QKV, SUB_PF_GATE, SUB_PF_SCAN, SUB_PF_OUT];
+    let any = steps
+        .iter()
+        .any(|&i| sub_ns(SSM, i) > 0 || sub_bytes_of(SSM, i, true).0 > 0);
+    if any {
+        out.push(
+            "[q4ledger-pf]   ssm step       wall_ms   h2d_MB/cnt     d2h_MB/cnt".to_string(),
+        );
+        for &i in steps.iter() {
+            let (hu, hc) = sub_bytes_of(SSM, i, true);
+            let (du, dc) = sub_bytes_of(SSM, i, false);
+            out.push(format!(
+                "[q4ledger-pf]   ssm {:<9} {:>9.1}   {:>8.2}/{:<6} {:>8.2}/{:<6}",
+                SUB_NAMES[i],
+                ms(sub_ns(SSM, i)),
+                hu as f64 / 1e6,
+                hc,
+                du as f64 / 1e6,
+                dc,
+            ));
+        }
+    }
     out
 }
 
@@ -786,6 +884,13 @@ pub fn reset() {
     for row in SUBS.iter() {
         for c in row.iter() {
             c.store(0, Ordering::Relaxed);
+        }
+    }
+    for grid in [&SUB_H2D_BYTES, &SUB_D2H_BYTES, &SUB_H2D_CALLS, &SUB_D2H_CALLS] {
+        for row in grid.iter() {
+            for c in row.iter() {
+                c.store(0, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -896,6 +1001,41 @@ mod tests {
         assert!(sync_floor_ns().is_some());
         reset();
         assert_eq!(sync_floor_ns(), None);
+        set_for_test(false);
+    }
+
+    /// task 167: 副区間の中の転送は、その副区間にも積まれる (親の行だけだと
+    /// 「ssm の 105 GB のうちどの段が何 MB か」が読めない)。副区間の外の転送は
+    /// 副区間に積まない。ネストは内側にだけ積む。
+    #[test]
+    fn sub_scope_counts_copies() {
+        let _g = lock();
+        set_for_test(true);
+        reset();
+        let _l = enter(SSM);
+        note_h2d(1000, stamp());
+        note_d2h(400, stamp());
+        {
+            let _s = sub(SUB_PF_QKV);
+            note_h2d(7000, stamp());
+            note_d2h(3000, stamp());
+            {
+                let _i = sub(SUB_PF_OUT);
+                note_d2h(11, stamp());
+            }
+            note_d2h(13, stamp());
+        }
+        note_d2h(21, stamp());
+        assert_eq!(sub_bytes_of(SSM, SUB_PF_QKV, true), (7000, 1));
+        assert_eq!(sub_bytes_of(SSM, SUB_PF_QKV, false), (3013, 2));
+        assert_eq!(sub_bytes_of(SSM, SUB_PF_OUT, false), (11, 1));
+        assert_eq!(sub_bytes_of(SSM, SUB_PF_SCAN, true), (0, 0));
+        // 親の行は副区間に関係なく全部を数える (従来どおり)。
+        let r = row(SSM);
+        assert_eq!(r.h2d_bytes, 8000);
+        assert_eq!(r.d2h_bytes, 400 + 3000 + 11 + 13 + 21);
+        reset();
+        assert_eq!(sub_bytes_of(SSM, SUB_PF_QKV, true), (0, 0), "reset で消えない");
         set_for_test(false);
     }
 
