@@ -126,19 +126,23 @@ pub const STREAM_GROUP_ENV: &str = "DENNO_PF_STREAM_GROUP";
 /// どちらもデバイスへ渡るバイト列は同じ (数値には触らない)。
 pub const STREAM_PIN_ENV: &str = "DENNO_PF_STREAM_PIN";
 
-/// `DENNO_PF_STREAM_UT`: 上げを専用スレッドへ出すか (task 165、既定 1)。
+/// `DENNO_PF_STREAM_UT`: 上げを専用スレッドへ出すか (task 165)。
 ///
 /// - `1` = ホストの写しと H2D の積み込みを上げ専用スレッドが行い、計算スレッドは
-///   グループ g のカーネルを積みながら g+1 の上げを進める (既定)
-/// - `0` = task 162 と同じ (写しと積み込みを計算スレッドが直列に行う)
+///   グループ g のカーネルを積みながら g+1 の上げを進める
+/// - `0` = task 162 と同じ (写しと積み込みを計算スレッドが直列に行う。**既定**)
 ///
+/// lab t165a の実測 (4 条件): ut=1 は 14k cold 102.10 s、ut=0 は 99.97 s。
+/// 写しと DMA が同じメモリ帯域を食うのでスレッドを分けても速くならず、DMA を
+/// 1 本しか積めないため `enq` が前の DMA の完了を待つ (enq_s 0.04 → 9.53)。
 /// 数値には触らない (デバイスへ渡るバイト列は同じ)。
 pub const STREAM_UT_ENV: &str = "DENNO_PF_STREAM_UT";
 
 /// `DENNO_PF_STREAM_WC`: pinned のバウンスを write-combined にするか (task 165)。
 ///
 /// バウンスは CPU が書いて DMA が読むだけなので、write-combined にすると
-/// 書き込みの read-for-ownership が消える。既定 **0** (lab の A/B で決める)。
+/// 書き込みの read-for-ownership が消え、DMA もキャッシュ coherence を
+/// 取らないぶん速くなる。既定 **on** (lab t165b/t165c で採用)。
 /// 確保に失敗したら通常の pinned へ落ちる (数値は同じ)。
 pub const STREAM_WC_ENV: &str = "DENNO_PF_STREAM_WC";
 
@@ -156,20 +160,22 @@ pub const DEFAULT_UPLOAD_MB: usize = 0;
 /// [`EXPERT_IQ_PF_UPLOAD_ROWS_ENV`] の既定値。
 pub const DEFAULT_UPLOAD_ROWS: usize = 8;
 
-/// [`STREAM_ENV`] の既定値。
+/// [`STREAM_ENV`] の既定値。**task 165 で採用して on**。
 ///
-/// task 162: **lab t162c で不採用** (既定 off のまま)。実測 (depth8k、int-auto):
+/// task 162 は lab t162c で不採用だった (14,018 が -12.4% で目標 -15% に届かず)。
+/// task 165 の lab で残りを詰めた (depth8k、比較は各 run の off に対して):
 ///
 /// | 条件 | 3,826 cold | 14,018 cold | decode |
 /// | --- | --- | --- | --- |
-/// | off (baseline) | 35.21 s | 113.01 s | 28 ms/tok |
-/// | stream + chunk 1024 | 28.54 s (-18.9%) | 99.05 s (-12.4%) | 28 ms/tok |
+/// | t165a ut=1 (スレッド) | 29.30 s | 102.10 s | 28 ms/tok |
+/// | t165a ut=0 (直列) | 28.68 s | 99.97 s | 28 ms/tok |
+/// | t165b g64+WC | 27.30 s (-22.5%) | 95.06 s (-15.3%) | 28 ms/tok |
+/// | t165c g64+WC | 27.32 s (-22.7%) | 95.31 s (-15.3%) | 28 ms/tok |
 ///
-/// 目標は両方 -15%。14,018 が 2.6 ポイント足りない。残りは「ホストの写しと
-/// DMA の積み込みが同じスレッドで直列になる」ぶんで、1 グループ 4.4 ms のうち
-/// 計算 2.6 / 写し 0.9 / 積み込み 0.8 が和になっている (3 枚にしても写しと
-/// 積み込みは同じスレッドなので直列のまま)。次の手は上げ専用のスレッド。
-pub const DEFAULT_STREAM_ON: bool = false;
+/// 効いたのは **write-combined のバウンス** (probe 26.8 → 53.5 GB/s、copy も
+/// 2 割減) と **グループ 64** (per-group の固定費が半分)。上げ専用スレッドは
+/// 効かなかった (`STREAM_UT_ENV` を見よ)。
+pub const DEFAULT_STREAM_ON: bool = true;
 
 /// [`STREAM_MB_ENV`] の既定値 (2 枚で 512 MiB)。
 pub const DEFAULT_STREAM_MB: usize = 512;
@@ -178,7 +184,12 @@ pub const DEFAULT_STREAM_MB: usize = 512;
 pub const DEFAULT_STREAM_MIN_TOK: usize = 512;
 
 /// [`STREAM_GROUP_ENV`] の既定値 (1 回に上げる expert 数)。
-pub const DEFAULT_STREAM_GROUP: usize = 32;
+///
+/// task 165: 32 → **64**。1 グループあたりの固定費 (3 本のポインタ表コピーと
+/// カーネル起動) が半分になる。ステージング 1 枚 (512 MiB / 3 = 170 MiB) に
+/// 64 本 (平均 2.05 MB/本で 131 MB) が載る。lab t165c: 14k cold は g32wc 96.81 s
+/// に対し g64wc 95.31 s。
+pub const DEFAULT_STREAM_GROUP: usize = 64;
 
 /// [`STREAM_PIN_ENV`] の既定値 (1 = pinned バウンス + 非同期)。
 pub const DEFAULT_STREAM_PIN: usize = 1;
@@ -191,8 +202,11 @@ pub const DEFAULT_STREAM_PIN: usize = 1;
 /// (t165a の enq_s=9.53)。A/B 用にゲートは残す。
 pub const DEFAULT_STREAM_UT: bool = false;
 
-/// [`STREAM_WC_ENV`] の既定値 (false = 通常の pinned)。
-pub const DEFAULT_STREAM_WC: bool = false;
+/// [`STREAM_WC_ENV`] の既定値 (true = write-combined のバウンス)。
+///
+/// lab t165b: グループ 64 で 14k cold が 100.01 s (wc=0) → 95.06 s (wc=1)、
+/// probe 27.3 → 53.5 GB/s。t165c でも 95.31 s で再現。
+pub const DEFAULT_STREAM_WC: bool = true;
 
 /// 1 回の起動で受ける行数 (`kernels_exp_iq_pf.cu` の `PF_MR`)。
 pub const ROWS_PER_LAUNCH: usize = 16;
@@ -1173,15 +1187,23 @@ mod tests {
         assert_eq!(stream_wc_from_value(true, Some("")), DEFAULT_STREAM_WC);
         assert!(stream_wc_from_value(true, Some("1")));
         assert!(!stream_wc_from_value(true, Some("0")));
-        assert!(!stream_wc_from_value(true, Some(" ")), "空白だけは既定 (off)");
+        assert_eq!(
+            stream_wc_from_value(true, Some(" ")),
+            DEFAULT_STREAM_WC,
+            "空白だけは既定"
+        );
         assert!(stream_wc_from_value(true, Some(" on ")), "前後の空白は無視する");
         assert!(!stream_wc_from_value(true, Some("no")));
         assert_eq!(DEFAULT_PREFILL_CHUNK_STREAM, 1024, "lab t162c の最良");
-        // 分け合った 1 枚 (cuda 側は 3 枚) が、既定のグループ (32 本) を
-        // 載せられること。ここは 4 で割った保守側で見る。
+        // task 165 で決めた既定 (lab t165b/t165c の最良)。
+        assert!(DEFAULT_STREAM_ON, "lab t165c で採用して既定 on");
+        assert!(DEFAULT_STREAM_WC, "write-combined のバウンスが効いた");
+        assert_eq!(stream_group(), 64, "グループ 64 が最良");
+        // 分け合った 1 枚 (cuda 側は 3 枚) に、既定のグループ (64 本、
+        // 平均 2.05 MB/本) が載ること。
         assert!(
-            (stream_bytes() / 4) / stream_group() >= 2_500_000,
-            "1 枚に 32 本 (2.05 MB/本) が載らない"
+            (stream_bytes() / 3) / stream_group() >= 2_500_000,
+            "1 枚に既定のグループが載らない"
         );
     }
 
