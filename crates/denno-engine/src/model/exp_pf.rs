@@ -137,7 +137,17 @@ pub const DEFAULT_UPLOAD_ROWS: usize = 8;
 
 /// [`STREAM_ENV`] の既定値。
 ///
-/// task 162: lab の採否で決める。**採用するなら true**。
+/// task 162: **lab t162c で不採用** (既定 off のまま)。実測 (depth8k、int-auto):
+///
+/// | 条件 | 3,826 cold | 14,018 cold | decode |
+/// | --- | --- | --- | --- |
+/// | off (baseline) | 35.21 s | 113.01 s | 28 ms/tok |
+/// | stream + chunk 1024 | 28.54 s (-18.9%) | 99.05 s (-12.4%) | 28 ms/tok |
+///
+/// 目標は両方 -15%。14,018 が 2.6 ポイント足りない。残りは「ホストの写しと
+/// DMA の積み込みが同じスレッドで直列になる」ぶんで、1 グループ 4.4 ms のうち
+/// 計算 2.6 / 写し 0.9 / 積み込み 0.8 が和になっている (3 枚にしても写しと
+/// 積み込みは同じスレッドなので直列のまま)。次の手は上げ専用のスレッド。
 pub const DEFAULT_STREAM_ON: bool = false;
 
 /// [`STREAM_MB_ENV`] の既定値 (2 枚で 512 MiB)。
@@ -626,11 +636,11 @@ pub fn note_stream_probe(bytes: usize, ns: u64) {
     if bytes == 0 || ns == 0 {
         return;
     }
-    let mbs = (bytes as f64 / 1e6) / (ns as f64 / 1e9);
-    // 1000 倍して整数で持つ (AtomicF64 を使わない)。
+    // MB/s を 1000 倍して整数で持つ (AtomicF64 を使わない)。
+    let mbps = (bytes as f64 / 1e6) / (ns as f64 / 1e9);
     let _ = STREAM_PROBE_MBPS.compare_exchange(
         0,
-        (mbs * 1000.0) as u64,
+        (mbps * 1000.0) as u64,
         Ordering::Relaxed,
         Ordering::Relaxed,
     );
@@ -704,7 +714,8 @@ pub fn stats_line() -> Option<String> {
         let copy = STREAM_COPY_NS.load(Ordering::Relaxed) as f64 / 1e9;
         let exps = STREAM_EXPERTS.load(Ordering::Relaxed);
         let rows = STREAM_ROWS.load(Ordering::Relaxed);
-        let probe = STREAM_PROBE_MBPS.load(Ordering::Relaxed) as f64 / 1000.0;
+        // 1000 倍して持っている MB/s を GB/s へ。
+        let probe = STREAM_PROBE_MBPS.load(Ordering::Relaxed) as f64 / 1e6;
         out.push_str(&format!(
             "\n[exp-pf-stream] layers={sl} groups={} experts={exps} rows={rows} \
              rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} wait_s={wait:.2} \
@@ -1042,9 +1053,10 @@ mod tests {
         assert!(stream_bytes() >= 64 << 20, "ステージングが小さすぎる");
         assert!(stream_group() >= 1);
         assert!(stream_pin() <= 1);
-        // 2 枚に分けたときの 1 枚が、既定のグループ (32 本) を載せられること。
+        // 分け合った 1 枚 (cuda 側は 3 枚) が、既定のグループ (32 本) を
+        // 載せられること。ここは 4 で割った保守側で見る。
         assert!(
-            (stream_bytes() / 2) / stream_group() >= 2_500_000,
+            (stream_bytes() / 4) / stream_group() >= 2_500_000,
             "1 枚に 32 本 (2.05 MB/本) が載らない"
         );
     }
