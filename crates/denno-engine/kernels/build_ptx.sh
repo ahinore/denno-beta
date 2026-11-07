@@ -25,9 +25,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf pf attn_dec)
+targets_all=(int8 elem gdn moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc)
 
-# 名前 -> "ソース|fmad" (fmad: nofmad = -fmad=false / fmad = 既定)。未知は 1。
+# 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
+# arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
 spec() {
     case "$1" in
         int8)         echo "kernels_int8.cu|nofmad" ;;
@@ -55,6 +56,11 @@ spec() {
         attn_dec)     echo "kernels_attn_dec.cu|nofmad" ;;
         gemm)         echo "kernels_gemm.cu|fmad" ;;
         gemm_grouped) echo "kernels_gemm_grouped.cu|fmad" ;;
+        # task 169: prefill の射影を BF16 の tensor core (wmma) で回す。
+        # bf16 の mma は compute_80 以降にしか無いので、この target だけ arch を
+        # 上げる (PTX は前方互換なので sm_120 で JIT される)。数値契約は無し
+        # (prefill の射影はビット一致契約の外)。
+        gemm_tc)      echo "kernels_gemm_tc.cu|fmad|compute_90" ;;
         *)            return 1 ;;
     esac
 }
@@ -64,15 +70,16 @@ require() {
 }
 
 compile() {
-    local name="$1" src mode
+    local name="$1" spec_str src mode arch
     require "$name"
-    src=$(spec "$name")
-    mode="${src##*|}"
-    src="${src%%|*}"
+    spec_str=$(spec "$name")
+    # "src|mode[|arch]" を分解する (arch 省略時は $ARCH)。
+    IFS='|' read -r src mode arch <<<"$spec_str"
+    [ -n "${arch:-}" ] || arch="$ARCH"
     [ -f "$src" ] || { echo "missing source: $src" >&2; exit 2; }
     case "$mode" in
-        nofmad) set -- -ptx -arch="$ARCH" -fmad=false -O3 "$src" -o "kernels_$name.ptx" ;;
-        fmad)   set -- -ptx -arch="$ARCH" -O3 "$src" -o "kernels_$name.ptx" ;;
+        nofmad) set -- -ptx -arch="$arch" -fmad=false -O3 "$src" -o "kernels_$name.ptx" ;;
+        fmad)   set -- -ptx -arch="$arch" -O3 "$src" -o "kernels_$name.ptx" ;;
     esac
     echo "+ nvcc $*"
     nvcc "$@"

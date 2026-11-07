@@ -6545,3 +6545,123 @@ fn attn_flashdec_ptx_entries_match_cu() {
         "PTX のカーネル名がローダ (cuda.rs の fdec_kernels) と違う"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 169: prefill の BF16 テンソルコア GEMM (`kernels_gemm_tc.cu`)
+// ---------------------------------------------------------------------------
+
+const TC_SRC: &str = include_str!("../kernels/kernels_gemm_tc.cu");
+
+/// カーネルとホストのタイル定数・共有メモリ・起動形状が一致すること。
+///
+/// GPU 無しでも「片側だけ直した」事故はここで落ちる。数値の正しさ
+/// (`wmma` の意味) は [`tests/pf_tc_gemm_gpu.rs`] の担当。
+#[test]
+fn pf_tc_gemm_tile_matches_host() {
+    let d = defines(TC_SRC);
+    let bm = eval_define("TC_BM", &d);
+    let bn = eval_define("TC_BN", &d);
+    let bk = eval_define("TC_BK", &d);
+    assert_eq!(bm, 128, "TC_BM が 128 でない");
+    assert_eq!(bn, 64, "TC_BN が 64 でない");
+    assert_eq!(bk, 32, "TC_BK が 32 でない (Q8_0 の 1 ブロック = 32 要素)");
+
+    // ホスト側のミラー定数 (cuda.rs) と一致すること。
+    assert_eq!(rust_const("TC_BM"), bm, "cuda.rs の TC_BM が不一致");
+    assert_eq!(rust_const("TC_BN"), bn, "cuda.rs の TC_BN が不一致");
+    assert_eq!(rust_const("TC_BK"), bk, "cuda.rs の TC_BK が不一致");
+
+    // warp の配置: (BM/32) × (BN/32) = 8 warp、1 warp あたり 2×2 タイル。
+    // 端数ステージは 1 warp あたり 16×16 f32 なので、その本数と一致する。
+    let warps = (bm / 32) * (bn / 32);
+    assert_eq!(warps, 8, "warp 数が 8 でない");
+    let stage_floats = warps * 16 * 16;
+    assert!(
+        TC_SRC.contains("float* st = sStage + warp * 256;"),
+        "カーネルの端数ステージの stride (warp * 256) が変わった"
+    );
+
+    // 1 ブロック = warp 数 × 32 スレッド。起動側 (cuda.rs) と一致すること。
+    let threads = warps * 32;
+    assert_eq!(threads, 256, "1 ブロックのスレッド数が 256 でない");
+    assert!(
+        CUDA_RS.contains("(256, 1, 1),"),
+        "cuda.rs の起動 block が (256, 1, 1) でない"
+    );
+
+    // 共有メモリはカーネルの静的配列 (ホストは動的 smem を渡さない)。
+    // 3 本の宣言とサイズを固定する: sW (BN×BK bf16) + sX (BM×BK bf16) +
+    // ステージ (warp × 16×16 f32)。
+    for decl in [
+        "__shared__ __align__(16) __nv_bfloat16 sW[TC_BN * TC_BK];",
+        "__shared__ __align__(16) __nv_bfloat16 sX[TC_BM * TC_BK];",
+        "__shared__ __align__(16) float sStage[8 * 16 * 16];",
+    ] {
+        assert!(
+            TC_SRC.contains(decl),
+            "共有メモリの宣言が変わった (静的配列であること): {decl}"
+        );
+    }
+    let expect_smem = bn * bk * 2 + bm * bk * 2 + stage_floats * 4;
+    assert!(
+        expect_smem <= 48 * 1024,
+        "静的共有メモリ {expect_smem} B が 48 KiB を超える"
+    );
+    assert!(
+        CUDA_RS.contains("(256, 1, 1), 0, &mut args)?;"),
+        "ホストが動的 smem を渡している (カーネルは静的配列なので 0 のはず)"
+    );
+}
+
+/// カーネルが本当に BF16 の tensor core 経路であること (f32 FMA への
+/// 取り違えを静的に止める) と、Q8_0 のブロック読みが ggml 仕様どおりであること。
+#[test]
+fn pf_tc_gemm_is_bf16_mma_q8_0() {
+    assert!(
+        TC_SRC.contains("#include <mma.h>") && TC_SRC.contains("__nv_bfloat16"),
+        "BF16 の wmma ヘッダ/型が無い"
+    );
+    assert!(
+        TC_SRC.contains("wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major>")
+            && TC_SRC
+                .contains("wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major>"),
+        "A が row_major / B が col_major の 16x16x16 bf16 でない (重みの行 = B の列)"
+    );
+    assert!(
+        TC_SRC.contains("wmma::fragment<wmma::accumulator, 16, 16, 16, float>")
+            && TC_SRC.contains("wmma::mma_sync("),
+        "FP32 アキュムレートの mma でない"
+    );
+    // Q8_0: 32 要素 = 34 B、スケールは先頭 2 B (f16)、量子値は 2 + j。
+    assert!(
+        TC_SRC.contains("(size_t)(k0 >> 5) * 34u"),
+        "Q8_0 のブロック先頭 (k0 >> 5) * 34 が変わった"
+    );
+    assert!(
+        TC_SRC.contains("blk + 2 + j"),
+        "Q8_0 の量子値の先頭 (blk + 2 + j) が変わった"
+    );
+    assert!(
+        CUDA_RS.contains("b\"dno_gemm_tc_q8_0_w\\0\""),
+        "cuda.rs が dno_gemm_tc_q8_0_w を読んでいない"
+    );
+
+    // build_ptx.sh: この target だけ arch を上げる (bf16 mma は compute_80 以降)。
+    assert!(
+        BUILD_PTX_SH.contains("gemm_tc)      echo \"kernels_gemm_tc.cu|fmad|compute_90\""),
+        "build_ptx.sh の gemm_tc が compute_90 でない (bf16 mma が生成できない)"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gemm_tc"),
+        "build_ptx.sh の targets_all に gemm_tc が無い: {targets}"
+    );
+    // 既存の gemm は compute_75 のまま (arch の上書きが漏れていないこと)。
+    assert!(
+        BUILD_PTX_SH.contains("gemm)         echo \"kernels_gemm.cu|fmad\" ;;"),
+        "gemm の spec 行が変わった (arch 上書きの巻き添えに注意)"
+    );
+}
