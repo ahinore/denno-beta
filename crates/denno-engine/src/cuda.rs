@@ -19442,9 +19442,16 @@ mod q4_attn_tests {
     /// task 160: flash decoding のアルゴリズムが dense softmax と一致すること
     /// (許容差は task 144 の abs 1e-4 + rel 1e-5)。長さ 1 / 17 / 511 / 4,096 /
     /// 14,000 — 分割の倍数でない長さ (17, 511, 14,000) を含む。
+    /// GQA 比 3 / 4 / 6 と、lab t163a/t163b で測った実形状 (24 heads / 2 kv /
+    /// dh 256 = 比 12) を通す。
     #[test]
     fn q4_attn_flashdec_algorithm_matches_dense_softmax() {
-        for &(heads, n_kv, dh) in &[(6usize, 2usize, 64usize), (8, 2, 32), (24, 4, 32)] {
+        for &(heads, n_kv, dh) in &[
+            (6usize, 2usize, 64usize),
+            (8, 2, 32),
+            (24, 4, 32),
+            (24, 2, 256),
+        ] {
             let group = heads / n_kv;
             let kv_dim = n_kv * dh;
             let scale = 1.0 / (dh as f32).sqrt();
