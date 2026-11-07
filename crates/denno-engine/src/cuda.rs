@@ -21466,24 +21466,43 @@ mod tests {
         let wq = PfChainW { uid: 1, ty: T::Q8_0, blocks: &blocks, k: e, n: conv_dim };
         let wg = PfChainW { uid: 2, ty: T::Q4K, blocks: &blocks, k: e, n: vd };
         let wo = PfChainW { uid: 3, ty: T::Q8_0, blocks: &blocks, k: vd, n: e };
+        let sep = PfChainQkv::separate(wq, wg);
         for nt in [64usize, 512, 1024, 2047] {
             assert!(
-                gdn_pf_chain_shape_ok(&wq, &wg, &wo, nt, e, nk, nv, dk, dv, 4),
+                gdn_pf_chain_shape_ok(&sep, &wo, nt, e, nk, nv, dk, dv, 4),
                 "nt={nt} は受けるはず"
             );
         }
         // 短すぎる / 長すぎる (chunked 経路の領域) は受けない。
-        assert!(!gdn_pf_chain_shape_ok(&wq, &wg, &wo, 63, e, nk, nv, dk, dv, 4));
-        assert!(!gdn_pf_chain_shape_ok(&wq, &wg, &wo, 2048, e, nk, nv, dk, dv, 4));
+        assert!(!gdn_pf_chain_shape_ok(&sep, &wo, 63, e, nk, nv, dk, dv, 4));
+        assert!(!gdn_pf_chain_shape_ok(&sep, &wo, 2048, e, nk, nv, dk, dv, 4));
         // dk != dv / d_conv != 4 は単発カーネルの前提外。
-        assert!(!gdn_pf_chain_shape_ok(&wq, &wg, &wo, 512, e, nk, nv, 256, 128, 4));
-        assert!(!gdn_pf_chain_shape_ok(&wq, &wg, &wo, 512, e, nk, nv, dk, dv, 3));
+        assert!(!gdn_pf_chain_shape_ok(&sep, &wo, 512, e, nk, nv, 256, 128, 4));
+        assert!(!gdn_pf_chain_shape_ok(&sep, &wo, 512, e, nk, nv, dk, dv, 3));
         // 形の不一致 (out の k が value_dim でない)。
         let bad = PfChainW { k: e, ..wo };
-        assert!(!gdn_pf_chain_shape_ok(&wq, &wg, &bad, 512, e, nk, nv, dk, dv, 4));
+        assert!(!gdn_pf_chain_shape_ok(&sep, &bad, 512, e, nk, nv, dk, dv, 4));
         // 型が GEMM の対象外 (F32 の qkv)。
         let bad_ty = PfChainW { ty: T::F32, ..wq };
-        assert!(!gdn_pf_chain_shape_ok(&bad_ty, &wg, &wo, 512, e, nk, nv, dk, dv, 4));
+        let bad_pair = PfChainQkv::separate(bad_ty, wg);
+        assert!(!gdn_pf_chain_shape_ok(&bad_pair, &wo, 512, e, nk, nv, dk, dv, 4));
+        // 連結済み (1 本の行列の行範囲): qkv が先頭・gate がその後ろ。
+        let wf = PfChainW {
+            uid: 4,
+            ty: T::Q8_0,
+            blocks: &blocks,
+            k: e,
+            n: conv_dim + vd,
+        };
+        let fus = PfChainQkv::fused(wf, 0, conv_dim);
+        assert!(gdn_pf_chain_shape_ok(&fus, &wo, 1024, e, nk, nv, dk, dv, 4));
+        // 連結の n が合計でない / 行範囲が重なる / はみ出す、は受けない。
+        let bad_fus = PfChainQkv::fused(PfChainW { n: conv_dim, ..wf }, 0, conv_dim);
+        assert!(!gdn_pf_chain_shape_ok(&bad_fus, &wo, 1024, e, nk, nv, dk, dv, 4));
+        let same_row = PfChainQkv::fused(wf, 0, 0);
+        assert!(!gdn_pf_chain_shape_ok(&same_row, &wo, 1024, e, nk, nv, dk, dv, 4));
+        let over = PfChainQkv::fused(wf, 7000, conv_dim);
+        assert!(!gdn_pf_chain_shape_ok(&over, &wo, 1024, e, nk, nv, dk, dv, 4));
     }
 
     /// task 152: `DENNO_MIX_BF16` の真理値表。既定は off (lab の採否で決める)。
@@ -25606,6 +25625,44 @@ pub struct PfChainW<'a> {
     pub n: usize,
 }
 
+/// qkv と gate の投影 (連結されていれば 1 本の重みを 2 回に分けて撃つ)。
+#[derive(Clone, Copy)]
+pub struct PfChainQkv<'a> {
+    /// qkv の重み (連結時は qkv+gate の連結行列)。
+    pub qkv: PfChainW<'a>,
+    /// gate の重み (連結時は qkv と同じ行列)。
+    pub gate: PfChainW<'a>,
+    /// `qkv` の行列のうち qkv 行が始まる行 (未連結は 0)。
+    pub qkv_row: usize,
+    /// 同上 gate。
+    pub gate_row: usize,
+}
+
+impl<'a> PfChainQkv<'a> {
+    /// 2 本をそのまま (連結なし)。
+    pub fn separate(qkv: PfChainW<'a>, gate: PfChainW<'a>) -> Self {
+        Self {
+            qkv,
+            gate,
+            qkv_row: 0,
+            gate_row: 0,
+        }
+    }
+    /// 連結済みの 1 本を行範囲つきで。
+    pub fn fused(w: PfChainW<'a>, qkv_row: usize, gate_row: usize) -> Self {
+        Self {
+            qkv: w,
+            gate: w,
+            qkv_row,
+            gate_row,
+        }
+    }
+    /// 同じ行列を指すか (連結済みか)。
+    fn is_fused(&self) -> bool {
+        self.qkv.uid == self.gate.uid
+    }
+}
+
 /// 連鎖の作業域 (thread_local, grow-only)。`x`/`o` は [nt, e]、
 /// `qkv` は [nt, conv_dim]、`z` と `y` は [nt, vd]、`beta`/`alpha` は [nt, nv]。
 struct GdnPfChainBufs {
@@ -25705,8 +25762,7 @@ thread_local! {
 /// qkv: [e → 2*nk*dk + nv*dv] / gate: [e → nv*dv] / out: [nv*dv → e]。
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_pf_chain_ready(
-    wqkv: &PfChainW<'_>,
-    wgate: &PfChainW<'_>,
+    wq: &PfChainQkv<'_>,
     wout: &PfChainW<'_>,
     nt: usize,
     e: usize,
@@ -25716,14 +25772,13 @@ pub fn gdn_pf_chain_ready(
     dv: usize,
     d_conv: usize,
 ) -> bool {
-    cuda_enabled() && gdn_pf_chain_shape_ok(wqkv, wgate, wout, nt, e, nk, nv, dk, dv, d_conv)
+    cuda_enabled() && gdn_pf_chain_shape_ok(wq, wout, nt, e, nk, nv, dk, dv, d_conv)
 }
 
 /// [`gdn_pf_chain_ready`] の形だけの判定 (GPU を触らない純関数)。
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_pf_chain_shape_ok(
-    wqkv: &PfChainW<'_>,
-    wgate: &PfChainW<'_>,
+    wq: &PfChainQkv<'_>,
     wout: &PfChainW<'_>,
     nt: usize,
     e: usize,
@@ -25747,15 +25802,26 @@ pub fn gdn_pf_chain_shape_ok(
     let conv_dim = 2 * nk * dk + nv * dv;
     let vd = nv * dv;
     let ok_ty = |w: &PfChainW<'_>| matches!(w.ty, T::Q8_0 | T::Q5_1 | T::Q4K | T::Q5K);
-    wqkv.k == e
-        && wqkv.n == conv_dim
-        && wgate.k == e
-        && wgate.n == vd
-        && wout.k == vd
-        && wout.n == e
-        && ok_ty(wqkv)
-        && ok_ty(wgate)
-        && ok_ty(wout)
+    let pair_ok = if wq.is_fused() {
+        // 連結済み: 1 本の行列の行範囲として qkv と gate が並んでいること。
+        wq.qkv.k == e
+            && wq.qkv.n == conv_dim + vd
+            && wq.gate.ty == wq.qkv.ty
+            && wq.gate.k == e
+            && wq.gate.n == conv_dim + vd
+            && wq.qkv_row + conv_dim <= wq.qkv.n
+            && wq.gate_row + vd <= wq.gate.n
+            && wq.qkv_row != wq.gate_row
+    } else {
+        // 別々: それぞれが単独の行列で、行オフセットは無い。
+        wq.qkv.k == e
+            && wq.qkv.n == conv_dim
+            && wq.gate.k == e
+            && wq.gate.n == vd
+            && wq.qkv_row == 0
+            && wq.gate_row == 0
+    };
+    pair_ok && wout.k == vd && wout.n == e && ok_ty(&wq.qkv) && ok_ty(&wq.gate) && ok_ty(wout)
 }
 
 /// task 167: デバイス入出力の GGUF GEMM を 1 発だけ撃つ (コピーもしない)。
@@ -25822,8 +25888,7 @@ fn gguf_gemm_dev_launch(
 /// スキャン起動後の失敗は `Err` (状態が進んでいるので要求を落とすこと)。
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_pf_chain(
-    wqkv: PfChainW<'_>,
-    wgate: PfChainW<'_>,
+    wq: PfChainQkv<'_>,
     wout: PfChainW<'_>,
     flat: &[f32],
     beta: &[f32],
@@ -25847,11 +25912,11 @@ pub fn gdn_pf_chain(
     out: &mut [f32],
     phase_ns: &mut [u64; 3],
 ) -> Result<bool> {
-    let e = wqkv.k;
+    let e = wq.qkv.k;
     let conv_dim = 2 * nk * dk + nv * dv;
     let vd = nv * dv;
     let cs = d_conv - 1;
-    if !gdn_pf_chain_ready(&wqkv, &wgate, &wout, nt, e, nk, nv, dk, dv, d_conv) {
+    if !gdn_pf_chain_ready(&wq, &wout, nt, e, nk, nv, dk, dv, d_conv) {
         return Ok(false);
     }
     // `DENNO_GPU_GEMM=0` は従来経路でも GEMM を CPU に落とす。連鎖も同じ扱いにする
@@ -25886,9 +25951,9 @@ pub fn gdn_pf_chain(
     };
     // 重みは 3 本とも「デバイスに載る」ことを先に確かめる。ここまでの失敗は
     // 状態を 1 つも触っていないので `Ok(false)` で従来経路に戻せる。
-    let (wq, wg, wo) = match (
-        weights_for_gguf(wqkv.uid, wqkv.ty, wqkv.blocks, wqkv.k, wqkv.n),
-        weights_for_gguf(wgate.uid, wgate.ty, wgate.blocks, wgate.k, wgate.n),
+    let (wqkv, wgate, wo) = match (
+        weights_for_gguf(wq.qkv.uid, wq.qkv.ty, wq.qkv.blocks, wq.qkv.k, wq.qkv.n),
+        weights_for_gguf(wq.gate.uid, wq.gate.ty, wq.gate.blocks, wq.gate.k, wq.gate.n),
         weights_for_gguf(wout.uid, wout.ty, wout.blocks, wout.k, wout.n),
     ) {
         (Ok(a), Ok(b), Ok(c)) => (a, b, c),
@@ -25899,6 +25964,14 @@ pub fn gdn_pf_chain(
             return Ok(false);
         }
     };
+    // 連結済みのときは qkv と gate が同じ行列を指す。行オフセットを
+    // バイトに直して GEMM の重み先頭をずらす (カーネルは `w + row*row_bytes`
+    // で行を読むので、部分行列をそのまま渡せる)。
+    let Some(rb_qkv) = gguf_row_bytes(wq.qkv.ty, e) else {
+        return Ok(false);
+    };
+    let qkv_woff = wq.qkv_row * rb_qkv;
+    let gate_woff = wq.gate_row * rb_qkv;
     // ここから先はデバイスの作業域だけを触る (モデルの状態は不変)。
     let ptrs = GDN_SCRATCH.with(|cell| -> Result<[CUdeviceptr; 6]> {
         let mut s = cell.borrow_mut();
@@ -25942,8 +26015,18 @@ pub fn gdn_pf_chain(
             let qo = pqkv + (t0 * conv_dim * 4) as CUdeviceptr;
             let zo = pz + (t0 * vd * 4) as CUdeviceptr;
             for (w, wty, n_out, o) in [
-                (wq.buf.ptr(), wqkv.ty, conv_dim, qo),
-                (wg.buf.ptr(), wgate.ty, vd, zo),
+                (
+                    wqkv.buf.ptr() + qkv_woff as CUdeviceptr,
+                    wq.qkv.ty,
+                    conv_dim,
+                    qo,
+                ),
+                (
+                    wgate.buf.ptr() + gate_woff as CUdeviceptr,
+                    wq.gate.ty,
+                    vd,
+                    zo,
+                ),
             ] {
                 match gguf_gemm_dev_launch(&ctx, wty, w, xo, o, m, e, n_out) {
                     Ok(true) => {}

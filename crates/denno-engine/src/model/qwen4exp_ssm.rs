@@ -47,6 +47,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 構築時 (`from_gguf_with` とテストの構造体リテラル) に 1 回発号する。
 static DEVICE_NONCE: AtomicU64 = AtomicU64::new(1);
 
+/// task 167: 連鎖の出力を受ける作業域 (thread_local, grow-only)。
+///
+/// `vec![0f32; nt * e]` を層チャンクごとに作ると、10.5 MB のゼロ埋め
+/// (初回タッチのページフォルト) を 504 回払う。D2H が全要素を上書きするので
+/// 中身は要らない = 容量だけ持ち回る。
+thread_local! {
+    static PF_CHAIN_OUT: std::cell::RefCell<Vec<f32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// task 167: 連鎖の入口に来た回数 (テストで分岐の発火を数える)。
 #[cfg(test)]
 pub(crate) static PF_CHAIN_ENTRIES: std::sync::atomic::AtomicU64 =
@@ -631,8 +641,8 @@ impl SsmLayer {
         #[cfg(feature = "cuda")]
         if crate::model::qwen4exp::pf_gdn_chain_on() && !gdn::gdn_dbg_enabled_for(self.il as i64)
         {
-            if let Some(outs) = self.forward_batch_chain(&flat, nt)? {
-                return Ok(outs.chunks_exact(e).map(|c| c.to_vec()).collect());
+            if let Some(rows) = self.forward_batch_chain(&flat, nt)? {
+                return Ok(rows);
             }
         }
 
@@ -832,13 +842,12 @@ impl SsmLayer {
     /// (`DENNO_GDN_PF_CHAIN`)。
     ///
     /// 戻り値 `None` は「連鎖を使わなかった」= 呼び出し側は従来経路へ
-    /// (この関数はモデルの状態を進めていない)。`Some` は層の出力
-    /// (`nt` 行 × `n_embd` の平坦化)。
+    /// (この関数はモデルの状態を進めていない)。`Some` は層の出力 (`nt` 行)。
     ///
     /// beta/alpha は F32 重みのホスト投影なので、ここで先に作って連鎖へ渡す
     /// (連鎖の中間は qkv / z / y だけ = どれもホストでは使わない)。
     #[cfg(feature = "cuda")]
-    fn forward_batch_chain(&mut self, flat: &[f32], nt: usize) -> Result<Option<Vec<f32>>> {
+    fn forward_batch_chain(&mut self, flat: &[f32], nt: usize) -> Result<Option<Vec<Vec<f32>>>> {
         use crate::model::qwen4exp::q4prof;
         #[cfg(test)]
         PF_CHAIN_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -847,13 +856,6 @@ impl SsmLayer {
         let nk = self.p.n_k_heads;
         let dk = self.p.head_k_dim;
         let dv = self.p.head_v_dim;
-        // 連鎖は「入力を共有する 2 本の投影が別々の重み」のときだけ使う
-        // (実モデルの ssm は attn_qkv = Q8_0 / attn_gate = Q4K で連結されない)。
-        let parts = self.qkv_gate.parts();
-        if parts.len() != 2 || parts[0].n() != self.p.qkv_dim() || parts[1].n() != self.p.value_dim()
-        {
-            return Ok(None);
-        }
         fn pw<'a>(g: &'a crate::model::linear_gguf::GgufLinear) -> crate::cuda::PfChainW<'a> {
             crate::cuda::PfChainW {
                 uid: g.uid(),
@@ -863,10 +865,25 @@ impl SsmLayer {
                 n: g.n(),
             }
         }
-        let (wqkv, wgate, wout) = (pw(&parts[0]), pw(&parts[1]), pw(&self.w_out));
+        // qkv と gate は実モデルでは**層によって型が揃う** (揃えば 1 本に連結される)。
+        // 連結された場合は 1 本の重みの行範囲を 2 回の GEMM に分けて撃つ。
+        let (conv_dim, vd) = (self.p.qkv_dim(), self.p.value_dim());
+        let pair = if let Some(inner) = self.qkv_gate.inner() {
+            let (r0, r1) = (self.qkv_gate.range(0), self.qkv_gate.range(1));
+            if r0.len() != conv_dim || r1.len() != vd {
+                return Ok(None);
+            }
+            crate::cuda::PfChainQkv::fused(pw(inner), r0.start, r1.start)
+        } else {
+            let parts = self.qkv_gate.parts();
+            if parts.len() != 2 || parts[0].n() != conv_dim || parts[1].n() != vd {
+                return Ok(None);
+            }
+            crate::cuda::PfChainQkv::separate(pw(&parts[0]), pw(&parts[1]))
+        };
+        let wout = pw(&self.w_out);
         if !crate::cuda::gdn_pf_chain_ready(
-            &wqkv,
-            &wgate,
+            &pair,
             &wout,
             nt,
             e,
@@ -888,11 +905,17 @@ impl SsmLayer {
         }
         q4prof::mark(t, &q4prof::A_GATE, self.il, q4prof::ST_GATE);
         let q_scale = 1.0f32 / (dk as f32).sqrt();
-        let mut outs = vec![0f32; nt * e];
+        // 出力は D2H が全要素を書くのでゼロ埋めしない (容量だけ持ち回る)。
+        let mut outs = PF_CHAIN_OUT.with(|c| {
+            let mut v = c.borrow_mut();
+            if v.len() < nt * e {
+                v.resize(nt * e, 0.0);
+            }
+            std::mem::take(&mut *v)
+        });
         let mut ph = [0u64; 3];
         let done = crate::cuda::gdn_pf_chain(
-            wqkv,
-            wgate,
+            pair,
             wout,
             flat,
             &beta_raw,
@@ -913,7 +936,7 @@ impl SsmLayer {
             q_scale,
             self.il,
             0,
-            &mut outs,
+            &mut outs[..nt * e],
             &mut ph,
         )?;
         if !done {
@@ -924,7 +947,15 @@ impl SsmLayer {
         q4prof::add_ns(&q4prof::A_GDN, self.il, q4prof::ST_GDN, ph[1]);
         q4prof::add_ns(&q4prof::A_OUT, self.il, q4prof::ST_OUT, ph[2]);
         q4prof::bump_nt(self.il, nt);
-        Ok(Some(outs))
+        let rows: Vec<Vec<f32>> = outs[..nt * e].chunks_exact(e).map(|c| c.to_vec()).collect();
+        // 作業域を返す (次の層チャンクが同じ容量を使い回す)。
+        PF_CHAIN_OUT.with(|c| {
+            let mut v = c.borrow_mut();
+            if v.len() < outs.len() {
+                *v = outs;
+            }
+        });
+        Ok(Some(rows))
     }
 
     /// `attn_qkv` の投影だけを行う (state は進めない)。

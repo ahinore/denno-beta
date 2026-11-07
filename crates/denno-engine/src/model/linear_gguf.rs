@@ -982,6 +982,14 @@ impl FusedLinear {
         self.splits.len()
     }
 
+    /// task 167: 連結済みの 1 本 (未連結なら `None`)。
+    ///
+    /// デバイス連鎖は「連結された qkv+gate を 1 本の重みとして扱い、行範囲
+    /// (`range(i)`) を渡して 2 回の GEMM に分ける」ので、連結側の記述が要る。
+    pub fn inner(&self) -> Option<&GgufLinear> {
+        self.inner.as_ref()
+    }
+
     /// task 167: 連結しなかったときの元の層 (呼び出し順)。連結済みなら空。
     ///
     /// デバイス連鎖は「入力を共有する 2 本の投影を別々の GEMM で撃つ」ので、
