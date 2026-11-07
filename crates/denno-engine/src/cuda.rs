@@ -7474,6 +7474,20 @@ impl GdnScratch {
         Ok(())
     }
 
+    /// task 167: 連鎖が要るポインタだけ ([`Self::ensure_chain`] が見る 6 本)。
+    /// `ptrs()` は q/z/beta/alpha/... まで全部を要求するので連鎖では使えない。
+    fn chain_ptrs(&self) -> [CUdeviceptr; 6] {
+        let p = |b: &Option<DevBuffer>| b.as_ref().expect("GdnScratch: 未確保").ptr();
+        [
+            p(&self.wc),
+            p(&self.wa),
+            p(&self.wd),
+            p(&self.wn),
+            p(&self.conv_out),
+            p(&self.ssm_out),
+        ]
+    }
+
     /// 形が変わらない限り何もしない (prefill の 24 層は全て同じ形)。
     fn ensure(
         &mut self,
@@ -25886,7 +25900,7 @@ pub fn gdn_pf_chain(
         }
     };
     // ここから先はデバイスの作業域だけを触る (モデルの状態は不変)。
-    let ptrs = GDN_SCRATCH.with(|cell| -> Result<GdnPtrs> {
+    let ptrs = GDN_SCRATCH.with(|cell| -> Result<[CUdeviceptr; 6]> {
         let mut s = cell.borrow_mut();
         s.ensure_chain(conv_dim, nv, dk, dv, cs)?;
         // スキャンカーネルは「書かない領域」を残すので従来どおりゼロ埋め。
@@ -25896,7 +25910,7 @@ pub fn gdn_pf_chain(
         s.wa.as_ref().unwrap().copy_from(wa)?;
         s.wd.as_ref().unwrap().copy_from(wdt)?;
         s.wn.as_ref().unwrap().copy_from(wnorm)?;
-        Ok(s.ptrs())
+        Ok(s.chain_ptrs())
     })?;
     let ptr = GDN_PF_CHAIN_BUF.with(|cell| -> Result<[CUdeviceptr; 7]> {
         let mut b = cell.borrow_mut();
@@ -25957,8 +25971,8 @@ pub fn gdn_pf_chain(
         let t_ph = Instant::now();
         let (mut pq, mut pzz, mut pbb, mut paa) = (pqkv, pz, pb, pa);
         let (mut pci, mut psi) = (pst_conv, pst_ssm);
-        let (mut pwc, mut pwa, mut pwd, mut pwn) = (ptrs.wc, ptrs.wa, ptrs.wd, ptrs.wn);
-        let (mut pyy, mut pco, mut pso) = (py, ptrs.conv_out, ptrs.ssm_out);
+        let (mut pwc, mut pwa, mut pwd, mut pwn) = (ptrs[0], ptrs[1], ptrs[2], ptrs[3]);
+        let (mut pyy, mut pco, mut pso) = (py, ptrs[4], ptrs[5]);
         let (mut ni, mut nki, mut nvi, mut dki, mut dvi) = (
             nt as c_int,
             nk as c_int,
@@ -26041,7 +26055,7 @@ pub fn gdn_pf_chain(
         b.o.as_ref().expect("連鎖の出力").to_vec::<f32>(nt * e)
     })?;
     out[..nt * e].copy_from_slice(&got);
-    gdn_state_commit(li, ptrs.conv_out, ptrs.ssm_out, conv_dim * cs, nv, dk * dv)?;
+    gdn_state_commit(li, ptrs[4], ptrs[5], conv_dim * cs, nv, dk * dv)?;
     // prefill のあとに decode (別ストア) や CPU 経路がホスト state を seed に
     // するので、状態は毎回ホストへも戻す (従来の sig 経路と同じ)。
     gdn_host_writeback(conv_st, ssm_st)?;
