@@ -4796,8 +4796,13 @@ const PF_STAGE_RESERVE_MB: usize = 768;
 /// ステージング 1 枚の最小サイズ (MiB)。これ未満しか取れないなら諦める。
 const PF_STAGE_MIN_MB: usize = 16;
 
-/// ステージングの枚数 (ダブルバッファ)。
-const PF_STAGE_SLOTS: usize = 2;
+/// ステージングの枚数 (多重バッファ)。
+///
+/// 2 枚だと「グループ g+1 の写し」が「グループ g-1 の計算」の完了待ちに
+/// 引っかかり、ホストの写しと DMA が計算と直列になる (lab t162b: chunk 2048 で
+/// 1 グループ 4.4 ms = 計算 2.6 + 写し 0.9 + DMA 0.8 の和)。3 枚にすると
+/// 写しは 2 つ前のグループの計算と重なる。
+const PF_STAGE_SLOTS: usize = 3;
 
 fn pf_stage_align_up(x: usize) -> usize {
     x.div_ceil(PF_STAGE_ALIGN) * PF_STAGE_ALIGN
@@ -4841,8 +4846,8 @@ struct PfStream {
 impl PfStream {
     fn new() -> Self {
         PfStream {
-            slot: [PfSlot::new(), PfSlot::new()],
-            pin: [None, None],
+            slot: std::array::from_fn(|_| PfSlot::new()),
+            pin: std::array::from_fn(|_| None),
             up: None,
             probed: false,
         }
@@ -4852,6 +4857,9 @@ impl PfStream {
 thread_local! {
     static PF_STREAM: std::cell::RefCell<PfStream> =
         std::cell::RefCell::new(PfStream::new());
+    /// task 162: 活性 (`xs`, 層ごとに 20 MB 級) の pinned 転送元。
+    static PF_XPIN: std::cell::RefCell<Option<PinMem>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// ステージングを解放する (prefill の終端)。
@@ -5421,7 +5429,37 @@ pub fn moe_experts_iq_pf_layer_stream(
             MoeScratch::ensure(&mut sc.oacc, ntok * e * 4)?;
             {
                 let xb = sc.x.as_ref().expect("確保済み");
-                xb.copy_from(xs)?;
+                // task 162: 活性 (nt x n_in) は層ごとに 20 MB 級なので、pinned に
+                // 写して非同期で積む (pageable の同期コピーは 1 MB あたりが重い)。
+                // null ストリームへ積むので、この後のカーネルは順序どおり待つ。
+                let mut done_pin = false;
+                if let Ok(l) = lib() {
+                    PF_XPIN.with(|cell| {
+                        let mut slot = cell.borrow_mut();
+                        if Scratch::ensure_pin(&mut slot, xs.len() * 4).is_ok() {
+                            let pin = slot.as_ref().expect("確保済み");
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    xs.as_ptr() as *const u8,
+                                    pin.ptr as *mut u8,
+                                    xs.len() * 4,
+                                );
+                                if (l.memcpy_htod_async)(
+                                    xb.ptr(),
+                                    pin.ptr,
+                                    xs.len() * 4,
+                                    std::ptr::null_mut(),
+                                ) == CUDA_SUCCESS
+                                {
+                                    done_pin = true;
+                                }
+                            }
+                        }
+                    });
+                }
+                if !done_pin {
+                    xb.copy_from(xs)?;
+                }
                 sc.seg.as_ref().expect("確保済み").copy_from(seg)?;
                 sc.rows_gu.as_ref().expect("確保済み").copy_from(rows_gu)?;
                 let id: Vec<u32> = exp_pf::identity_rows(total_rows);
@@ -5468,42 +5506,29 @@ pub fn moe_experts_iq_pf_layer_stream(
                 return Ok(None);
             }
             let want_slot = miss_total.min((exp_pf::stream_bytes() / PF_STAGE_SLOTS).max(1 << 20));
-            // 1 枚ぶんの容量を先に確保して、その実サイズでグループを切る。
+            // 全枚を同じ容量で確保し、その実サイズでグループを切る
+            // (1 枚だけ小さいと交互に使えない)。
             let mut slot_cap = 0usize;
             PF_STREAM.with(|cell| -> Result<()> {
                 let mut st = cell.borrow_mut();
-                if st.slot[0].cap < want_slot {
-                    match pf_stage_alloc(want_slot) {
-                        Some(b) => {
-                            st.slot[0].cap = b.bytes();
-                            st.slot[0].buf = Some(b);
-                        }
-                        None => return Ok(()),
+                for i in 0..PF_STAGE_SLOTS {
+                    if st.slot[i].cap >= want_slot && st.slot[i].buf.is_some() {
+                        continue;
+                    }
+                    if let Some(b) = pf_stage_alloc(want_slot) {
+                        st.slot[i].cap = b.bytes();
+                        st.slot[i].buf = Some(b);
+                    } else {
+                        break;
                     }
                 }
-                slot_cap = st.slot[0].cap;
-                Ok(())
-            })?;
-            if slot_cap == 0 {
-                return Ok(None);
-            }
-            // 2 枚目も同じ容量で確保する (片方だけ小さいと交互に使えない)。
-            PF_STREAM.with(|cell| -> Result<()> {
-                let mut st = cell.borrow_mut();
-                if st.slot[1].cap < slot_cap {
-                    match pf_stage_alloc(slot_cap) {
-                        Some(b) => {
-                            st.slot[1].cap = b.bytes();
-                            st.slot[1].buf = Some(b);
-                        }
-                        None => {
-                            slot_cap = st.slot[0].cap.min(st.slot[1].cap);
-                        }
-                    }
-                }
-                if st.slot[1].cap < slot_cap {
-                    slot_cap = st.slot[1].cap;
-                }
+                // 全枚の最小がこの層で使える 1 グループの上限。1 枚でも欠けたら 0。
+                slot_cap = st
+                    .slot
+                    .iter()
+                    .map(|s| if s.buf.is_some() { s.cap } else { 0 })
+                    .min()
+                    .unwrap_or(0);
                 Ok(())
             })?;
             if slot_cap == 0 {
