@@ -126,6 +126,20 @@ pub const STREAM_GROUP_ENV: &str = "DENNO_PF_STREAM_GROUP";
 /// どちらもデバイスへ渡るバイト列は同じ (数値には触らない)。
 pub const STREAM_PIN_ENV: &str = "DENNO_PF_STREAM_PIN";
 
+/// `DENNO_PF_STREAM_UT`: 上げを専用スレッドへ出すか (task 165、既定 1)。
+///
+/// - `1` = ホストの写しと H2D の積み込みを上げ専用スレッドが行い、計算スレッドは
+///   グループ g のカーネルを積みながら g+1 の上げを進める (既定)
+/// - `0` = task 162 と同じ (写しと積み込みを計算スレッドが直列に行う)
+///
+/// 数値には触らない (デバイスへ渡るバイト列は同じ)。
+pub const STREAM_UT_ENV: &str = "DENNO_PF_STREAM_UT";
+
+/// ストリーミング時の層ループのチャンク既定 (task 162 の lab t162c の最良)。
+///
+/// `DENNO_PF_STREAM=1` のとき `DENNO_PREFILL_BATCH_CHUNK` 未設定ならこれを使う。
+pub const DEFAULT_PREFILL_CHUNK_STREAM: usize = 1024;
+
 /// [`EXPERT_IQ_PF_MIN_HITS_ENV`] の既定値。
 pub const DEFAULT_MIN_HITS: usize = 4;
 
@@ -161,6 +175,12 @@ pub const DEFAULT_STREAM_GROUP: usize = 32;
 
 /// [`STREAM_PIN_ENV`] の既定値 (1 = pinned バウンス + 非同期)。
 pub const DEFAULT_STREAM_PIN: usize = 1;
+
+/// [`STREAM_UT_ENV`] の既定値 (true = 上げ専用スレッドへ出す)。
+///
+/// task 165: 写しと積み込みを計算スレッドから外すのが要点で、数値には触らない。
+/// `DENNO_PF_STREAM_UT=0` で task 162 と同じ直列経路に戻せる (A/B 用)。
+pub const DEFAULT_STREAM_UT: bool = true;
 
 /// 1 回の起動で受ける行数 (`kernels_exp_iq_pf.cu` の `PF_MR`)。
 pub const ROWS_PER_LAUNCH: usize = 16;
@@ -283,6 +303,30 @@ pub fn stream_group() -> usize {
 pub fn stream_pin() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| env_usize(STREAM_PIN_ENV, DEFAULT_STREAM_PIN).min(1))
+}
+
+/// `DENNO_PF_STREAM_UT` の解釈 (純関数)。**`0` / `off` / `false` だけが偽**。
+///
+/// ストリーミング自体が無効なら常に偽。
+pub fn stream_ut_from_value(pf_on: bool, v: Option<&str>) -> bool {
+    if !pf_on {
+        return false;
+    }
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT_STREAM_UT,
+        Some(s) => !matches!(s, "0" | "off" | "false"),
+    }
+}
+
+/// 上げ専用スレッドを使うか (プロセスで 1 回だけ env を読む)。
+pub fn stream_ut() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        stream_ut_from_value(
+            stream_enabled(),
+            std::env::var(STREAM_UT_ENV).ok().as_deref(),
+        )
+    })
 }
 
 /// 型 → カーネルのスロット (decode の `kernels_exp_iq` と同じ順)。
@@ -551,6 +595,12 @@ static STREAM_BYTES: AtomicU64 = AtomicU64::new(0);
 static STREAM_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ホストのバウンスバッファへの写しの所要。
 static STREAM_COPY_NS: AtomicU64 = AtomicU64::new(0);
+/// task 165: H2D の積み込み (cuMemcpyHtoDAsync + イベント記録) の所要。
+static STREAM_ENQ_NS: AtomicU64 = AtomicU64::new(0);
+/// task 165: 上げ専用スレッドの順番待ち (計算スレッドが ready を待った時間)。
+static STREAM_READY_NS: AtomicU64 = AtomicU64::new(0);
+/// task 165: ステージングの再利用待ち (前のグループの計算完了待ち)。
+static STREAM_SLOT_NS: AtomicU64 = AtomicU64::new(0);
 /// task 162: ステージングへ載せた expert の行数 (1 本あたりの行数を出すため)。
 static STREAM_ROWS: AtomicU64 = AtomicU64::new(0);
 /// task 162: 上げの回数 (グループ数)。
@@ -606,19 +656,31 @@ pub fn note_upload_ns(ns: u64) {
 ///
 /// `bytes` / `rows` / `experts` はこのグループの合計、`copy_ns` はホスト側の
 /// 写しの時間、`wait_ns` は H2D の完了待ちで止まった時間 (0 に近いほど重なっている)。
+///
+/// task 165: 上げ専用スレッドの内訳も同じ行に積む。
+/// `enq_ns` は積み込み (非同期コピー + イベント記録)、`ready_ns` は計算スレッドが
+/// ワーカーの順番待ちで止まった時間、`slot_ns` はワーカーがステージングの
+/// 再利用 (前のグループの計算完了) を待った時間。
+#[allow(clippy::too_many_arguments)]
 pub fn note_stream_group(
     bytes: usize,
     rows: usize,
     experts: usize,
     copy_ns: u64,
+    enq_ns: u64,
+    ready_ns: u64,
     wait_ns: u64,
+    slot_ns: u64,
 ) {
     STREAM_GROUPS.fetch_add(1, Ordering::Relaxed);
     STREAM_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
     STREAM_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
     STREAM_EXPERTS.fetch_add(experts as u64, Ordering::Relaxed);
     STREAM_COPY_NS.fetch_add(copy_ns, Ordering::Relaxed);
+    STREAM_ENQ_NS.fetch_add(enq_ns, Ordering::Relaxed);
+    STREAM_READY_NS.fetch_add(ready_ns, Ordering::Relaxed);
     STREAM_WAIT_NS.fetch_add(wait_ns, Ordering::Relaxed);
+    STREAM_SLOT_NS.fetch_add(slot_ns, Ordering::Relaxed);
 }
 
 /// task 162: ストリーミングで 1 層を GPU に載せた。
@@ -712,14 +774,18 @@ pub fn stats_line() -> Option<String> {
         let bytes = STREAM_BYTES.load(Ordering::Relaxed);
         let wait = STREAM_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e9;
         let copy = STREAM_COPY_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let enq = STREAM_ENQ_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let ready = STREAM_READY_NS.load(Ordering::Relaxed) as f64 / 1e9;
+        let slotw = STREAM_SLOT_NS.load(Ordering::Relaxed) as f64 / 1e9;
         let exps = STREAM_EXPERTS.load(Ordering::Relaxed);
         let rows = STREAM_ROWS.load(Ordering::Relaxed);
         // 1000 倍して持っている MB/s を GB/s へ。
         let probe = STREAM_PROBE_MBPS.load(Ordering::Relaxed) as f64 / 1e6;
         out.push_str(&format!(
             "\n[exp-pf-stream] layers={sl} groups={} experts={exps} rows={rows} \
-             rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} wait_s={wait:.2} \
-             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} group={} min_tok={}",
+             rows_per_expert={:.1} up_MB={:.1} copy_s={copy:.2} enq_s={enq:.2} \
+             ready_s={ready:.2} wait_s={wait:.2} slotwait_s={slotw:.2} \
+             probe_GBs={probe:.1} spill={} cpu_miss_ms={:.1} pin={} ut={} group={} min_tok={}",
             STREAM_GROUPS.load(Ordering::Relaxed),
             if exps > 0 {
                 rows as f64 / exps as f64
@@ -730,6 +796,7 @@ pub fn stats_line() -> Option<String> {
             STREAM_SPILL.load(Ordering::Relaxed),
             STREAM_CPU_MISS_NS.load(Ordering::Relaxed) as f64 / 1e6,
             stream_pin(),
+            u8::from(stream_ut()),
             stream_group(),
             stream_min_tok(),
         ));
@@ -757,6 +824,9 @@ pub fn stats_reset() {
         &STREAM_BYTES,
         &STREAM_WAIT_NS,
         &STREAM_COPY_NS,
+        &STREAM_ENQ_NS,
+        &STREAM_READY_NS,
+        &STREAM_SLOT_NS,
         &STREAM_ROWS,
         &STREAM_GROUPS,
         &STREAM_SPILL,
@@ -1053,6 +1123,14 @@ mod tests {
         assert!(stream_bytes() >= 64 << 20, "ステージングが小さすぎる");
         assert!(stream_group() >= 1);
         assert!(stream_pin() <= 1);
+        // task 165: 上げ専用スレッドのゲート (ストリーミングの内側)。
+        assert!(!stream_ut_from_value(false, Some("1")), "stream off なら動かない");
+        assert_eq!(stream_ut_from_value(true, None), DEFAULT_STREAM_UT);
+        assert_eq!(stream_ut_from_value(true, Some("")), DEFAULT_STREAM_UT);
+        assert!(stream_ut_from_value(true, Some("1")));
+        assert!(!stream_ut_from_value(true, Some("0")));
+        assert!(!stream_ut_from_value(true, Some("off")));
+        assert_eq!(DEFAULT_PREFILL_CHUNK_STREAM, 1024, "lab t162c の最良");
         // 分け合った 1 枚 (cuda 側は 3 枚) が、既定のグループ (32 本) を
         // 載せられること。ここは 4 で割った保守側で見る。
         assert!(

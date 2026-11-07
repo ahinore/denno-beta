@@ -9699,16 +9699,18 @@ fn prefill_batch_chunk() -> usize {
     *N.get_or_init(|| {
         // task 162: ストリーミング経路では層ループのチャンクを大きく取れる
         // (ミス expert の上げ直しが 1 層 1 回に減る)。既定は従来どおり 512。
-        let hi = if crate::model::exp_pf::stream_enabled() {
-            65536
+        // task 165: ストリーミング時は既定を 1024 にする (lab t162c の最良。
+        // 上げ専用スレッドを足した版でも 1024 を既定にする)。
+        let (hi, dflt) = if crate::model::exp_pf::stream_enabled() {
+            (65536, crate::model::exp_pf::DEFAULT_PREFILL_CHUNK_STREAM)
         } else {
-            512
+            (512, 512)
         };
         std::env::var("DENNO_PREFILL_BATCH_CHUNK")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .map(|n| n.clamp(1, hi))
-            .unwrap_or(512)
+            .unwrap_or(dflt)
     })
 }
 

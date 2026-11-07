@@ -4841,6 +4841,9 @@ struct PfStream {
     up: Option<CopyStream>,
     /// 実 H2D を 1 回だけ測る。
     probed: bool,
+    /// task 165: グループの通し番号 (層をまたいで増える。スロットの持ち主を
+    /// 一意にするため。0 に戻すと前の層の完了イベントを誤認する)。
+    next_g: u64,
 }
 
 impl PfStream {
@@ -4850,6 +4853,7 @@ impl PfStream {
             pin: std::array::from_fn(|_| None),
             up: None,
             probed: false,
+            next_g: 0,
         }
     }
 }
@@ -4866,7 +4870,15 @@ thread_local! {
 ///
 /// decode のあいだ抱えたままだと expert の LRU がその分だけ狭くなるので、
 /// リクエストの終わりに必ず返す。
+///
+/// task 165: 上げ専用スレッドを**先に**止めて join する (ステージングや pinned を
+/// 指したままにしない)。
 pub fn pf_stream_release() {
+    let _ = PF_UP.try_with(|cell| {
+        if let Ok(mut slot) = cell.try_borrow_mut() {
+            *slot = None;
+        }
+    });
     let _ = PF_STREAM.try_with(|cell| {
         let mut st = cell.borrow_mut();
         for s in st.slot.iter_mut() {
@@ -4877,6 +4889,7 @@ pub fn pf_stream_release() {
         }
         st.up = None;
         st.probed = false;
+        st.next_g = 0;
     });
 }
 
@@ -4915,7 +4928,7 @@ fn pf_stage_alloc(want: usize) -> Option<DevBuffer> {
     None
 }
 
-/// 1 グループの上げの結果。
+/// 1 グループの上げの結果 (従来経路 = 計算スレッドが直列に写す)。
 struct PfPump {
     /// グループ内の expert の (gate, up, down) デバイスポインタ (items と同じ順)。
     ptrs: Vec<[u64; 3]>,
@@ -4923,20 +4936,122 @@ struct PfPump {
     bytes: usize,
     /// ホスト側の写しの時間。
     copy_ns: u64,
+    /// 積み込み (非同期コピー + イベント記録) の時間。
+    enq_ns: u64,
     /// 最初の 1 回だけ測った H2D (バイト, 時間)。
     probe: Option<(usize, u64)>,
 }
 
-/// グループ `g` をスロット `g % 2` へ上げる。
+/// ホスト側の転送元 (mmap の 1 区間)。
+#[derive(Clone, Copy)]
+struct PfHostRange {
+    ptr: usize,
+    len: usize,
+}
+
+impl PfHostRange {
+    fn of(b: &[u8]) -> Self {
+        PfHostRange {
+            ptr: b.as_ptr() as usize,
+            len: b.len(),
+        }
+    }
+}
+
+/// (pinned 内のオフセット, 転送元) を pinned へ並列に写す。
 ///
-/// `items` は (expert 番号, [gate, up, down] のホストバイト列)。
-/// **同じスロットを使った 2 つ前のグループの計算完了を待ってから**書き込む。
-fn pf_pump_in(
+/// 計算スレッド (従来経路) と上げ専用スレッド (task 165) が同じ関数を使う
+/// (どちらもデバイスへ渡るバイト列は同じ)。
+fn pf_copy_into_pin(pin_base: usize, parts: &[(usize, PfHostRange)]) {
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        parts.par_iter().for_each(|&(off, r)| unsafe {
+            std::ptr::copy_nonoverlapping(r.ptr as *const u8, (pin_base + off) as *mut u8, r.len);
+        });
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        for &(off, r) in parts {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    r.ptr as *const u8,
+                    (pin_base + off) as *mut u8,
+                    r.len,
+                );
+            }
+        }
+    }
+}
+
+/// 1 グループぶんのスロット準備 (確保と配置)。
+struct PfSlotPlan {
+    slot: usize,
+    /// グループ内の expert の (gate, up, down) デバイスポインタ (items と同じ順)。
+    ptrs: Vec<[u64; 3]>,
+    /// 上げるバイト数 (ステージングの先頭から連続)。
+    need: usize,
+    /// 行列ごとのバイト数 (pageable 経路が使う)。
+    lens: Vec<[usize; 3]>,
+    /// pinned 内の (オフセット, 転送元) をステージングと同じ並びで並べたもの。
+    parts: Vec<(usize, PfHostRange)>,
+}
+
+/// H2D 用の非ブロッキングストリームとイベントを用意する (初回だけ)。
+///
+/// 戻り値はストリームの生ハンドル (上げ専用スレッドへ渡す)。
+fn pf_up_stream(st: &mut PfStream) -> Result<usize> {
+    if let Some(u) = st.up.as_ref() {
+        return Ok(u.0 as usize);
+    }
+    let l = lib()?;
+    let (Some(create), Some(ec)) = (l.stream_create, l.event_create) else {
+        bail!("cuStreamCreate / cuEventCreate が無い");
+    };
+    let mut h: CUstream = std::ptr::null_mut();
+    const CU_STREAM_NON_BLOCKING: u32 = 0x01;
+    unsafe {
+        if create(&mut h, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS {
+            bail!("cuStreamCreate が失敗");
+        }
+    }
+    st.up = Some(CopyStream(h));
+    // イベントはスロットごとに 1 本ずつ (上げの完了 / 計算の完了)。
+    for i in 0..PF_STAGE_SLOTS {
+        if st.slot[i].ev_up.is_none() {
+            let mut ev: CUevent = std::ptr::null_mut();
+            unsafe {
+                if ec(&mut ev, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS {
+                    bail!("cuEventCreate が失敗");
+                }
+            }
+            st.slot[i].ev_up = Some(CopyEvent(ev));
+        }
+        if st.slot[i].ev_use.is_none() {
+            let mut ev: CUevent = std::ptr::null_mut();
+            unsafe {
+                if ec(&mut ev, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS {
+                    bail!("cuEventCreate (use) が失敗");
+                }
+            }
+            st.slot[i].ev_use = Some(CopyEvent(ev));
+        }
+    }
+    Ok(h as usize)
+}
+
+/// グループ `g` のステージングと pinned を用意し、置き場所を決める。
+///
+/// **再利用待ちは呼び出し側の責任** (上げ専用スレッドは自分のスレッドで待つ)。
+/// ただしバッファを**広げる**ときだけ、ここで前のグループの計算完了を待つ
+/// (使用中のデバイスメモリを解放しないため)。広げるのは最初の数層だけで、
+/// 定常状態では 1 回も起きない。
+fn pf_slot_prepare(
     st: &mut PfStream,
     g: u64,
     items: &[(u16, [&[u8]; 3])],
     pinned: bool,
-) -> Result<PfPump> {
+) -> Result<PfSlotPlan> {
     let s = (g as usize) % PF_STAGE_SLOTS;
     let mut lens: Vec<[usize; 3]> = Vec::with_capacity(items.len());
     let mut need = 0usize;
@@ -4948,19 +5063,19 @@ fn pf_pump_in(
             .sum::<usize>();
         lens.push(l);
     }
-    // 1. 再利用の前に、このスロットを読んだ計算の完了を待つ。
-    if st.slot[s].used {
-        if let Some(ev) = st.slot[s].ev_use.as_ref() {
-            let Some(es) = lib()?.event_sync else {
-                bail!("cuEventSynchronize が無い");
-            };
-            unsafe {
-                check(es(ev.0), "cuEventSynchronize (stage use)")?;
+    // 1. 確保 (足りなければこの 1 回だけ広げる)。
+    if st.slot[s].cap < need {
+        // 使用中のバッファは解放しない: このスロットを読んだ計算の完了を待つ。
+        if st.slot[s].used {
+            if let Some(ev) = st.slot[s].ev_use.as_ref() {
+                let Some(es) = lib()?.event_sync else {
+                    bail!("cuEventSynchronize が無い");
+                };
+                unsafe {
+                    check(es(ev.0), "cuEventSynchronize (stage grow)")?;
+                }
             }
         }
-    }
-    // 2. 確保 (足りなければこの 1 回だけ広げる)。
-    if st.slot[s].cap < need {
         let want = need.max(PF_STAGE_MIN_MB << 20);
         match pf_stage_alloc(want) {
             Some(b) => {
@@ -4983,8 +5098,8 @@ fn pf_pump_in(
             st.slot[s].cap >> 20
         );
     }
+    // 2. デバイス側の置き場所を決める。
     let base = st.slot[s].buf.as_ref().expect("確保済み").ptr();
-    // 3. デバイス側の置き場所を決める。
     let mut cursor = 0usize;
     let mut ptrs: Vec<[u64; 3]> = Vec::with_capacity(items.len());
     for l in &lens {
@@ -4995,112 +5110,80 @@ fn pf_pump_in(
         }
         ptrs.push(p);
     }
-    let t_copy = std::time::Instant::now();
-    let mut probe: Option<(usize, u64)> = None;
+    // 3. pinned のバウンス (grow-only) と、その中の置き場所。
+    let mut parts: Vec<(usize, PfHostRange)> = Vec::with_capacity(items.len() * 3);
     if pinned {
-        // 4a. pinned へ並列に写してから、非同期で H2D を積む。
-        let up = match st.up.as_ref() {
-            Some(u) => u.0,
-            None => {
-                let l = lib()?;
-                let (Some(create), Some(ec)) = (l.stream_create, l.event_create) else {
-                    bail!("cuStreamCreate / cuEventCreate が無い");
-                };
-                let mut h: CUstream = std::ptr::null_mut();
-                const CU_STREAM_NON_BLOCKING: u32 = 0x01;
-                unsafe {
-                    if create(&mut h, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS {
-                        bail!("cuStreamCreate が失敗");
-                    }
-                }
-                st.up = Some(CopyStream(h));
-                // イベントはスロットごとに 1 本ずつ。
-                for i in 0..PF_STAGE_SLOTS {
-                    if st.slot[i].ev_up.is_none() {
-                        let mut ev: CUevent = std::ptr::null_mut();
-                        const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
-                        unsafe {
-                            if ec(&mut ev, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS {
-                                bail!("cuEventCreate が失敗");
-                            }
-                        }
-                        st.slot[i].ev_up = Some(CopyEvent(ev));
-                    }
-                    if st.slot[i].ev_use.is_none() {
-                        let mut ev: CUevent = std::ptr::null_mut();
-                        const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
-                        unsafe {
-                            if ec(&mut ev, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS {
-                                bail!("cuEventCreate (use) が失敗");
-                            }
-                        }
-                        st.slot[i].ev_use = Some(CopyEvent(ev));
-                    }
-                }
-                h
-            }
-        };
-        {
-            let cap = st.pin[s].as_ref().map(|p| p.bytes).unwrap_or(0);
-            if cap < need {
-                st.pin[s] = Some(PinMem::alloc(need.max(1))?);
-            }
+        let cap = st.pin[s].as_ref().map(|p| p.bytes).unwrap_or(0);
+        if cap < need {
+            st.pin[s] = Some(PinMem::alloc(need.max(1))?);
         }
-        let pin = st.pin[s].as_ref().expect("確保済み");
-        let pin_base = pin.ptr as usize;
-        // (dst オフセット, バイト列) を並べる。
-        let mut parts: Vec<(usize, &[u8])> = Vec::with_capacity(items.len() * 3);
         let mut cursor = 0usize;
         for (i, (_, b)) in items.iter().enumerate() {
             for m in 0..3 {
                 if !b[m].is_empty() {
-                    parts.push((cursor, b[m]));
+                    parts.push((cursor, PfHostRange::of(b[m])));
                 }
                 cursor += pf_stage_align_up(lens[i][m]);
             }
         }
-        #[cfg(feature = "par")]
-        {
-            use rayon::prelude::*;
-            parts.par_iter().for_each(|&(off, bytes)| unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    (pin_base + off) as *mut u8,
-                    bytes.len(),
-                );
-            });
-        }
-        #[cfg(not(feature = "par"))]
-        {
-            for &(off, bytes) in parts.iter() {
+    }
+    Ok(PfSlotPlan {
+        slot: s,
+        ptrs,
+        need,
+        lens,
+        parts,
+    })
+}
+
+/// グループ `g` をスロット `g % 3` へ上げる (計算スレッドが直列に行う経路)。
+///
+/// **同じスロットを使った 2 つ前のグループの計算完了を待ってから**書き込む。
+fn pf_pump_in(
+    st: &mut PfStream,
+    g: u64,
+    items: &[(u16, [&[u8]; 3])],
+    pinned: bool,
+) -> Result<PfPump> {
+    let plan = pf_slot_prepare(st, g, items, pinned)?;
+    let s = plan.slot;
+    let t_copy = std::time::Instant::now();
+    let mut probe: Option<(usize, u64)> = None;
+    let mut enq_ns = 0u64;
+    if pinned {
+        // 1. 再利用の前に、このスロットを読んだ計算の完了を待つ。
+        if st.slot[s].used {
+            if let Some(ev) = st.slot[s].ev_use.as_ref() {
+                let Some(es) = lib()?.event_sync else {
+                    bail!("cuEventSynchronize が無い");
+                };
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        (pin_base + off) as *mut u8,
-                        bytes.len(),
-                    );
+                    check(es(ev.0), "cuEventSynchronize (stage use)")?;
                 }
             }
         }
+        let up = pf_up_stream(st)? as CUstream;
+        // 2. pinned へ並列に写してから、非同期で H2D を積む。
+        let pin_ptr = st.pin[s].as_ref().expect("確保済み").ptr;
+        pf_copy_into_pin(pin_ptr as usize, &plan.parts);
         let copy_ns = t_copy.elapsed().as_nanos() as u64;
-        // 5a. **グループ全体を 1 回の非同期コピーで積む**。
-        //     pinned のレイアウトはステージングのレイアウトと同じなので、行列ごとに
-        //     分ける必要が無い。1 本ずつ積むと 1 expert 3 回 = 1 グループ 96 回に
-        //     なり、`cuMemcpyHtoDAsync` の呼び出し固定費 (実測 ~20-70 us) が DMA の
-        //     実時間を上回る (lab t162a: chunk 2048 で 105 GB に 14 s)。
-        //     端数のパディングも一緒に運ぶが、カーネルは読まない。
+        let base = st.slot[s].buf.as_ref().expect("確保済み").ptr();
         let l = lib()?;
         let t_dma = std::time::Instant::now();
-        if need > 0 {
+        let t_enq = std::time::Instant::now();
+        // 3. **グループ全体を 1 回の非同期コピーで積む**。
+        //    行列ごとに分けると 1 グループ 96 回になり、`cuMemcpyHtoDAsync` の
+        //    呼び出し固定費が DMA の実時間を上回る (lab t162a)。
+        if plan.need > 0 {
             unsafe {
                 check(
-                    (l.memcpy_htod_async)(base, pin.ptr, need, up),
+                    (l.memcpy_htod_async)(base, pin_ptr, plan.need, up),
                     "cuMemcpyHtoDAsync (stage)",
                 )?;
             }
         }
-        dbg_htod(need);
-        // 6a. 完了イベントを積む。
+        dbg_htod(plan.need);
+        // 4. 完了イベントを積む。
         let Some(record) = l.event_record else {
             bail!("cuEventRecord が無い");
         };
@@ -5109,7 +5192,8 @@ fn pf_pump_in(
                 check(record(ev.0, up), "cuEventRecord (stage up)")?;
             }
         }
-        // 7a. 最初の 1 回だけ実速度を測る (同期して待つ)。
+        enq_ns = t_enq.elapsed().as_nanos() as u64;
+        // 5. 最初の 1 回だけ実速度を測る (同期して待つ)。
         if !st.probed {
             st.probed = true;
             if let Some(ev) = st.slot[s].ev_up.as_ref() {
@@ -5120,18 +5204,18 @@ fn pf_pump_in(
                     check(es(ev.0), "cuEventSynchronize (probe)")?;
                 }
             }
-            let ns = t_dma.elapsed().as_nanos() as u64;
-            probe = Some((need, ns));
+            probe = Some((plan.need, t_dma.elapsed().as_nanos() as u64));
         }
         st.slot[s].used = true;
         Ok(PfPump {
-            ptrs,
-            bytes: need,
+            ptrs: plan.ptrs,
+            bytes: plan.need,
             copy_ns,
+            enq_ns,
             probe,
         })
     } else {
-        // 4b. pageable の同期コピー (task 156 と同じ)。重なりは無い。
+        // pageable の同期コピー (task 156 と同じ)。重なりは無い。
         let buf = st.slot[s].buf.as_ref().expect("確保済み");
         let mut cursor = 0usize;
         for (i, (_, b)) in items.iter().enumerate() {
@@ -5139,16 +5223,17 @@ fn pf_pump_in(
                 if !b[m].is_empty() {
                     buf.copy_from_at(cursor, b[m])?;
                 }
-                cursor += pf_stage_align_up(lens[i][m]);
+                cursor += pf_stage_align_up(plan.lens[i][m]);
             }
         }
         let copy_ns = t_copy.elapsed().as_nanos() as u64;
-        dbg_htod(need);
+        dbg_htod(plan.need);
         st.slot[s].used = true;
         Ok(PfPump {
-            ptrs,
-            bytes: need,
+            ptrs: plan.ptrs,
+            bytes: plan.need,
             copy_ns,
+            enq_ns,
             probe: None,
         })
     }
@@ -5188,6 +5273,383 @@ fn pf_mark_used_in(st: &mut PfStream, g: u64, pinned: bool) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// task 165: 上げ専用スレッド
+// ---------------------------------------------------------------------------
+//
+// task 162 の台帳は「1 グループ = 計算 2.6 + 写し 0.9 + 積み込み 0.8 ms の和」で、
+// 写しと積み込みが計算と同じホストスレッドに載っていた (直列)。ここでは
+// **グループ g+1 の写しと積み込みを専用スレッドへ出し**、計算スレッドは
+// グループ g のカーネルを積むだけにする。
+//
+// 受け渡しは mpsc 1 本 + Mutex/Condvar 1 組:
+// - 計算スレッド: スロットを用意して依頼を送る → `ready` が g を超えるのを待つ
+//   → ev_up を同期 → カーネルを積む → ev_use を記録
+// - 上げスレッド: 依頼を 1 本ずつ処理する。スロットの再利用 (前のグループの
+//   計算完了) を ev_use で待ち、pinned へ写し、非同期 H2D を積んで ev_up を
+//   記録する。イベントはスロット (= グループ) ごとなので、計算側は自分の
+//   グループの完了だけを待つ。
+
+/// 上げ専用スレッドへの 1 グループぶんの依頼。
+struct PfUpJob {
+    g: u64,
+    need: usize,
+    /// ステージング (デバイス) の先頭。
+    dst: u64,
+    /// pinned バウンスの先頭。
+    pin: usize,
+    /// (pinned 内のオフセット, 転送元)。
+    parts: Vec<(usize, PfHostRange)>,
+    /// H2D を積むストリーム。
+    stream: usize,
+    /// このスロットを前回読んだ計算の完了イベント (未使用なら 0)。
+    wait_ev: usize,
+    /// このグループの H2D 完了を知らせるイベント。
+    up_ev: usize,
+    /// 最初の 1 グループだけ、同期して実 H2D を測る。
+    probe: bool,
+}
+
+// SAFETY: 転送元は mmap 済みの expert 重みで、依頼を出した計算スレッドが
+// `ready` を待ってからこの層の処理を進める (呼び出しが終わるまで有効)。
+// 依頼は上げスレッドが 1 本ずつ処理し、Drop で必ず join する。
+unsafe impl Send for PfUpJob {}
+
+/// 上げ専用スレッドの進捗 (計算スレッドはここだけを見る)。
+struct PfUpState {
+    /// ev_up を記録し終えたグループの次。
+    ready: u64,
+    /// グループごとの (写し ns, 積み込み ns, スロット待ち ns)。
+    times: Vec<(u64, u64, u64)>,
+    /// 最初のグループで測った実 H2D (バイト, ns)。
+    probe: Option<(usize, u64)>,
+    /// ワーカーが落ちた理由 (あれば計算側も降りる)。
+    err: Option<String>,
+}
+
+/// グループ番号を通し番号で `n` 本ぶん確保する (task 165)。
+///
+/// 層ごとに 0 へ戻すと、スロットの持ち主 (`g % 3`) が前の層のグループと
+/// 重なり、**前の層の完了イベントを自分のグループの完了と誤認する**。
+/// ここはその不変条件を 1 か所に閉じるための純関数。
+fn pf_take_group_ids(next: &mut u64, n: usize) -> u64 {
+    let base = *next;
+    *next = next.saturating_add(n as u64);
+    base
+}
+
+/// 上げスレッドの進捗を 1 グループぶん公開する。
+///
+/// `ready` は単調 (遅れて届いた小さい番号で戻さない)。エラーは最初の 1 本を残す。
+fn pf_up_publish(
+    st: &(std::sync::Mutex<PfUpState>, std::sync::Condvar),
+    g: u64,
+    copy_ns: u64,
+    enq_ns: u64,
+    slot_ns: u64,
+    probe: Option<(usize, u64)>,
+    err: Option<String>,
+) {
+    let (m, cv) = st;
+    let mut s = m.lock().unwrap_or_else(|e| e.into_inner());
+    if s.times.len() <= g as usize {
+        s.times.resize(g as usize + 1, (0, 0, 0));
+    }
+    s.times[g as usize] = (copy_ns, enq_ns, slot_ns);
+    if let Some(p) = probe {
+        s.probe = Some(p);
+    }
+    if err.is_some() && s.err.is_none() {
+        s.err = err;
+    }
+    if s.ready <= g {
+        s.ready = g + 1;
+    }
+    cv.notify_all();
+}
+
+/// 上げ専用スレッド。
+struct PfUploader {
+    tx: Option<std::sync::mpsc::Sender<PfUpJob>>,
+    st: std::sync::Arc<(std::sync::Mutex<PfUpState>, std::sync::Condvar)>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PfUploader {
+    fn start(ctx: &'static CudaCtx) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PfUpJob>();
+        let st = std::sync::Arc::new((
+            std::sync::Mutex::new(PfUpState {
+                ready: 0,
+                times: Vec::new(),
+                probe: None,
+                err: None,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let st2 = std::sync::Arc::clone(&st);
+        let join = std::thread::Builder::new()
+            .name("pf-up".to_string())
+            .spawn(move || pf_up_worker(rx, st2, ctx))
+            .ok();
+        PfUploader {
+            tx: Some(tx),
+            st,
+            join,
+        }
+    }
+
+    /// 依頼を 1 本送る (待たない)。
+    fn submit(&self, job: PfUpJob) -> Result<()> {
+        let Some(tx) = self.tx.as_ref() else {
+            bail!("上げスレッドが居ない");
+        };
+        tx.send(job)
+            .map_err(|_| anyhow::anyhow!("上げスレッドが停止している"))
+    }
+
+    /// ワーカーがグループ `g` の H2D を積み終えるまで待つ (待ち ns を返す)。
+    fn wait_ready(&self, g: u64) -> Result<u64> {
+        let (m, cv) = &*self.st;
+        let mut s = m.lock().unwrap_or_else(|e| e.into_inner());
+        let t = std::time::Instant::now();
+        loop {
+            if let Some(e) = s.err.as_deref() {
+                bail!("上げスレッド: {e}");
+            }
+            if s.ready > g {
+                return Ok(t.elapsed().as_nanos() as u64);
+            }
+            let (s2, to) = cv
+                .wait_timeout(s, std::time::Duration::from_millis(200))
+                .unwrap_or_else(|e| e.into_inner());
+            s = s2;
+            if to.timed_out() {
+                // スレッドが落ちている (panic 等) なら待ち続けない。
+                let dead = self.join.as_ref().map(|j| j.is_finished()).unwrap_or(true);
+                if dead && s.ready <= g {
+                    bail!("上げスレッドが終了した (グループ {g} の依頼が処理されていない)");
+                }
+            }
+        }
+    }
+
+    /// グループ `g` の (写し ns, 積み込み ns, スロット待ち ns)。
+    fn times(&self, g: u64) -> (u64, u64, u64) {
+        let (m, _) = &*self.st;
+        let s = m.lock().unwrap_or_else(|e| e.into_inner());
+        s.times.get(g as usize).copied().unwrap_or((0, 0, 0))
+    }
+
+    /// 最初のグループで測った実 H2D。
+    fn probe(&self) -> Option<(usize, u64)> {
+        let (m, _) = &*self.st;
+        let s = m.lock().unwrap_or_else(|e| e.into_inner());
+        s.probe
+    }
+}
+
+impl Drop for PfUploader {
+    fn drop(&mut self) {
+        // 送信口を閉じるとワーカーの recv が Err で抜ける。
+        self.tx = None;
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+thread_local! {
+    /// task 165: このスレッドの prefill 用の上げ専用スレッド (初回だけ起動)。
+    static PF_UP: std::cell::RefCell<Option<PfUploader>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 上げ専用スレッドを 1 回だけ起動する。
+fn pf_up_ensure() {
+    PF_UP.with(|cell| {
+        if let Ok(mut slot) = cell.try_borrow_mut() {
+            if slot.is_none() {
+                if let Some(ctx) = shared_ctx() {
+                    *slot = Some(PfUploader::start(ctx));
+                }
+            }
+        }
+    });
+}
+
+/// グループ `g` の上げを専用スレッドへ依頼する (戻り値はデバイスポインタ表)。
+fn pf_submit_group(
+    g: u64,
+    items: &[(u16, [&[u8]; 3])],
+    probe: bool,
+) -> Result<Option<Vec<[u64; 3]>>> {
+    pf_up_ensure();
+    PF_STREAM.with(|cell| -> Result<Option<Vec<[u64; 3]>>> {
+        let mut st = cell.borrow_mut();
+        PF_UP.with(|uc| -> Result<Option<Vec<[u64; 3]>>> {
+            let slot = uc.borrow();
+            let Some(up) = slot.as_ref() else {
+                return Ok(None);
+            };
+            let plan = pf_slot_prepare(&mut st, g, items, true)?;
+            let s = plan.slot;
+            let stream = pf_up_stream(&mut st)?;
+            let base = st.slot[s].buf.as_ref().expect("確保済み").ptr();
+            let pin = st.pin[s].as_ref().expect("確保済み").ptr as usize;
+            // スロットを前回読んだ計算の完了イベント (ワーカーが待つ)。
+            let wait_ev = if st.slot[s].used {
+                st.slot[s]
+                    .ev_use
+                    .as_ref()
+                    .map(|e| e.0 as usize)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let up_ev = st.slot[s]
+                .ev_up
+                .as_ref()
+                .map(|e| e.0 as usize)
+                .unwrap_or(0);
+            if up_ev == 0 {
+                bail!("H2D 完了イベントが無い");
+            }
+            st.slot[s].used = true;
+            up.submit(PfUpJob {
+                g,
+                need: plan.need,
+                dst: base,
+                pin,
+                parts: plan.parts,
+                stream,
+                wait_ev,
+                up_ev,
+                probe,
+            })?;
+            Ok(Some(plan.ptrs))
+        })
+    })
+}
+
+/// グループ `g` の上げを待つ (ut 経路)。
+///
+/// 戻り値は (写し ns, 積み込み ns, 順番待ち ns, H2D 待ち ns, スロット待ち ns)。
+fn pf_wait_group(g: u64) -> Result<(u64, u64, u64, u64, u64)> {
+    let ready_ns = PF_UP.with(|cell| -> Result<u64> {
+        match cell.borrow().as_ref() {
+            Some(u) => u.wait_ready(g),
+            None => bail!("上げスレッドが居ない"),
+        }
+    })?;
+    let wait_ns = PF_STREAM.with(|cell| -> Result<u64> {
+        let mut st = cell.borrow_mut();
+        pf_wait_up_in(&mut st, g, true)
+    })?;
+    let (copy_ns, enq_ns, slot_ns) = PF_UP.with(|cell| match cell.borrow().as_ref() {
+        Some(u) => u.times(g),
+        None => (0, 0, 0),
+    });
+    Ok((copy_ns, enq_ns, ready_ns, wait_ns, slot_ns))
+}
+
+/// 上げ専用スレッドの本体。
+fn pf_up_worker(
+    rx: std::sync::mpsc::Receiver<PfUpJob>,
+    st: std::sync::Arc<(std::sync::Mutex<PfUpState>, std::sync::Condvar)>,
+    ctx: &'static CudaCtx,
+) {
+    // CUDA の current context はスレッドローカルなので、このスレッドでも張る。
+    let ctx_ok = ctx.make_current().is_ok();
+    loop {
+        let Ok(job) = rx.recv() else { break };
+        let mut copy_ns = 0u64;
+        let mut enq_ns = 0u64;
+        let mut slot_ns = 0u64;
+        let mut probe: Option<(usize, u64)> = None;
+        let mut bad: Option<String> = None;
+        if ctx_ok {
+            if let Err(e) = pf_up_run(&job, &mut copy_ns, &mut enq_ns, &mut slot_ns, &mut probe) {
+                bad = Some(format!("{e:#}"));
+            }
+        } else {
+            bad = Some("このスレッドで cuCtxSetCurrent が失敗".to_string());
+        }
+        pf_up_publish(&st, job.g, copy_ns, enq_ns, slot_ns, probe, bad);
+    }
+}
+
+/// 依頼 1 本を処理する (再利用待ち → 写し → 積み込み → 記録)。
+fn pf_up_run(
+    job: &PfUpJob,
+    copy_ns: &mut u64,
+    enq_ns: &mut u64,
+    slot_ns: &mut u64,
+    probe: &mut Option<(usize, u64)>,
+) -> Result<()> {
+    let l = lib()?;
+    // 1. このスロットを前回読んだ計算の完了を待つ。
+    if job.wait_ev != 0 {
+        let Some(es) = l.event_sync else {
+            bail!("cuEventSynchronize が無い");
+        };
+        let t = std::time::Instant::now();
+        unsafe {
+            check(
+                es(job.wait_ev as CUevent),
+                "cuEventSynchronize (stage reuse/上げスレッド)",
+            )?;
+        }
+        *slot_ns = t.elapsed().as_nanos() as u64;
+    }
+    // 2. pinned へ写す (計算スレッドと同じ並列写し)。
+    let t_copy = std::time::Instant::now();
+    pf_copy_into_pin(job.pin, &job.parts);
+    *copy_ns = t_copy.elapsed().as_nanos() as u64;
+    // 3. 非同期 H2D を積み、完了イベントを記録する。
+    let t_enq = std::time::Instant::now();
+    if job.need > 0 {
+        // 台帳 (q4ledger) はスレッドローカルの区間を持つので、ここでは素の
+        // 関数を呼ぶ (バイト数は [exp-pf-stream] が数える)。
+        let real = REAL_HTOD_ASYNC.load(Ordering::Relaxed);
+        if real.is_null() {
+            bail!("cuMemcpyHtoDAsync の実体が無い");
+        }
+        let f: FnCuMemcpyHtoDAsyncV2 = unsafe { std::mem::transmute(real) };
+        unsafe {
+            check(
+                f(job.dst, job.pin as *const c_void, job.need, job.stream as CUstream),
+                "cuMemcpyHtoDAsync (stage/上げスレッド)",
+            )?;
+        }
+    }
+    let Some(record) = l.event_record else {
+        bail!("cuEventRecord が無い");
+    };
+    unsafe {
+        check(
+            record(job.up_ev as CUevent, job.stream as CUstream),
+            "cuEventRecord (stage up/上げスレッド)",
+        )?;
+    }
+    *enq_ns = t_enq.elapsed().as_nanos() as u64;
+    // 4. 最初の 1 グループだけ、同期して実 H2D を測る。
+    if job.probe {
+        let Some(es) = l.event_sync else {
+            bail!("cuEventSynchronize が無い");
+        };
+        let t = std::time::Instant::now();
+        unsafe {
+            check(
+                es(job.up_ev as CUevent),
+                "cuEventSynchronize (probe/上げスレッド)",
+            )?;
+        }
+        *probe = Some((job.need, t.elapsed().as_nanos() as u64));
+    }
+    Ok(())
 }
 
 /// 1 グループぶんの m 行カーネルを起動する (gate, up, silu, down)。
@@ -5542,25 +6004,93 @@ pub fn moe_experts_iq_pf_layer_stream(
             let pg_tab = sc.pg.as_ref().expect("確保済み");
             let pu_tab = sc.pu.as_ref().expect("確保済み");
             let pd_tab = sc.pd.as_ref().expect("確保済み");
+            // task 165: 上げ (写し + 積み込み) を専用スレッドへ出すか。
+            // 出さないときは task 162 と同じく、このスレッドで直列に写して積む。
+            let ut = pinned && exp_pf::stream_ut();
+            // グループごとのミス (plan 順) と必要バイト。依頼を先に出せるよう先に作る。
+            let items_of: Vec<Vec<(u16, [&[u8]; 3])>> = bounds
+                .iter()
+                .map(|&(a, b)| {
+                    entries[a..b]
+                        .iter()
+                        .filter_map(|en| en.host.map(|h| (en.expert, h)))
+                        .collect()
+                })
+                .collect();
+            let need_of: Vec<usize> = items_of
+                .iter()
+                .map(|it| {
+                    it.iter()
+                        .map(|(_, h)| h.iter().map(|b| pf_stage_align_up(b.len())).sum::<usize>())
+                        .sum::<usize>()
+                })
+                .collect();
+            // 依頼済みグループのデバイスポインタ表 (ut 経路だけ)。
+            let mut ready_ptrs: Vec<Option<Vec<[u64; 3]>>> = vec![None; bounds.len()];
+            let mut submitted = 0usize;
+            // 探針 (実 H2D) はリクエストで 1 回だけ。前の層で測っていれば出さない。
+            let mut probe_sent = if ut {
+                PF_UP.with(|cell| {
+                    cell.borrow()
+                        .as_ref()
+                        .map(|u| u.probe().is_some())
+                        .unwrap_or(false)
+                })
+            } else {
+                true
+            };
+            // group id は層をまたいで通し番号にする (スロットの持ち主とイベントを
+            // 一意にするため。層ごとに 0 へ戻すと前の層の完了イベントを
+            // 「自分のグループの完了」と誤認する)。
+            let base_g = PF_STREAM.with(|cell| {
+                let mut st = cell.borrow_mut();
+                pf_take_group_ids(&mut st.next_g, bounds.len())
+            });
             for (gi, &(a, b)) in bounds.iter().enumerate() {
-                // (a) ミスの items を作って上げる (g = グローバル通し番号)。
-                let g = gi as u64;
-                let items: Vec<(u16, [&[u8]; 3])> = entries[a..b]
-                    .iter()
-                    .filter_map(|en| en.host.map(|h| (en.expert, h)))
-                    .collect();
-                let pump = if items.is_empty() {
-                    PfPump {
-                        ptrs: Vec::new(),
-                        bytes: 0,
-                        copy_ns: 0,
-                        probe: None,
+                let g = base_g + gi as u64;
+                let items = &items_of[gi];
+                // (a0) ut 経路: このグループと 1 つ先までを先に依頼する
+                //      (計算スレッドがグループ g のカーネルを積む間に、
+                //       上げスレッドが g+1 の写しと積み込みを進める)。
+                if ut {
+                    while submitted <= gi + 1 && submitted < bounds.len() {
+                        let k = submitted;
+                        if !items_of[k].is_empty() {
+                            let first = !probe_sent;
+                            ready_ptrs[k] =
+                                pf_submit_group(base_g + k as u64, &items_of[k], first)?;
+                            if ready_ptrs[k].is_some() {
+                                probe_sent = true;
+                            }
+                        }
+                        submitted = k + 1;
                     }
+                    if !items.is_empty() && ready_ptrs[gi].is_none() {
+                        // 上げスレッドが居ない → この層は従来経路へ。
+                        return Ok(None);
+                    }
+                }
+                // (a) 上げ。ut 経路は依頼済み (待つのは (c))。
+                let mut copy_ns = 0u64;
+                let mut enq_ns = 0u64;
+                let mut ready_ns = 0u64;
+                let mut wait_ns = 0u64;
+                let mut slot_ns = 0u64;
+                let (ptrs, bytes) = if ut {
+                    (ready_ptrs[gi].take().unwrap_or_default(), need_of[gi])
+                } else if items.is_empty() {
+                    (Vec::new(), 0)
                 } else {
-                    PF_STREAM.with(|cell| -> Result<PfPump> {
+                    let pump = PF_STREAM.with(|cell| -> Result<PfPump> {
                         let mut st = cell.borrow_mut();
-                        pf_pump_in(&mut st, g, &items, pinned)
-                    })?
+                        pf_pump_in(&mut st, g, items, pinned)
+                    })?;
+                    copy_ns = pump.copy_ns;
+                    enq_ns = pump.enq_ns;
+                    if let Some((pb, pn)) = pump.probe {
+                        exp_pf::note_stream_probe(pb, pn);
+                    }
+                    (pump.ptrs, pump.bytes)
                 };
                 // (b) デバイスポインタの表を書く (ミスはステージング、ヒットは常駐)。
                 let mut ip = 0usize;
@@ -5573,10 +6103,10 @@ pub fn moe_experts_iq_pf_layer_stream(
                             vg[j] = d[0];
                             vu[j] = d[1];
                             vd[j] = d[2];
-                        } else if ip < pump.ptrs.len() {
-                            vg[j] = pump.ptrs[ip][0];
-                            vu[j] = pump.ptrs[ip][1];
-                            vd[j] = pump.ptrs[ip][2];
+                        } else if ip < ptrs.len() {
+                            vg[j] = ptrs[ip][0];
+                            vu[j] = ptrs[ip][1];
+                            vd[j] = ptrs[ip][2];
                             ip += 1;
                         } else {
                             // 表が足りない = 内部の不整合。この層は従来経路へ。
@@ -5587,11 +6117,27 @@ pub fn moe_experts_iq_pf_layer_stream(
                     pu_tab.copy_from_at(a * 8, &vu)?;
                     pd_tab.copy_from_at(a * 8, &vd)?;
                 }
-                // (c) 自分のグループの H2D 完了を待つ (ホスト)。
-                let w = PF_STREAM.with(|cell| -> Result<u64> {
-                    let mut st = cell.borrow_mut();
-                    pf_wait_up_in(&mut st, g, pinned)
-                })?;
+                // (c) **自分のグループの H2D 完了だけ**を待つ (ホスト)。
+                if ut {
+                    if !items.is_empty() {
+                        let (c, e, r, w, sl) = pf_wait_group(g)?;
+                        copy_ns = c;
+                        enq_ns = e;
+                        ready_ns = r;
+                        wait_ns = w;
+                        slot_ns = sl;
+                        if let Some((pb, pn)) =
+                            PF_UP.with(|cell| cell.borrow().as_ref().and_then(|u| u.probe()))
+                        {
+                            exp_pf::note_stream_probe(pb, pn);
+                        }
+                    }
+                } else {
+                    wait_ns = PF_STREAM.with(|cell| -> Result<u64> {
+                        let mut st = cell.borrow_mut();
+                        pf_wait_up_in(&mut st, g, pinned)
+                    })?;
+                }
                 // (d) カーネルを積む。
                 let ro_start = seg[a * 4 + 1] as usize;
                 let ro_end = if b > a {
@@ -5635,15 +6181,15 @@ pub fn moe_experts_iq_pf_layer_stream(
                 });
                 let rows_here = ro_end.saturating_sub(ro_start);
                 exp_pf::note_stream_group(
-                    pump.bytes,
+                    bytes,
                     rows_here,
                     items.len(),
-                    pump.copy_ns,
-                    w,
+                    copy_ns,
+                    enq_ns,
+                    ready_ns,
+                    wait_ns,
+                    slot_ns,
                 );
-                if let Some((pb, pn)) = pump.probe {
-                    exp_pf::note_stream_probe(pb, pn);
-                }
             }
             // 3. 行の加重和を GPU で閉じる。
             {
@@ -5799,6 +6345,69 @@ mod pf_stream_tests {
     #[test]
     fn stage_alloc_is_a_noop_for_zero() {
         assert!(pf_stage_alloc(0).is_none());
+    }
+
+    /// task 165: グループ番号は層をまたいで単調 (連番) に増える。
+    ///
+    /// 層ごとに 0 へ戻すと、スロット (`g % 3`) の持ち主が前の層のグループと
+    /// 重なり、前の層の完了イベントを「自分のグループの完了」と誤認する。
+    /// ここでは 3 層ぶん確保して、番号が連続しスロットの持ち主が 3 つ前だけに
+    /// なることを固定する。
+    #[test]
+    fn group_ids_are_monotonic_across_layers() {
+        let sizes = [16usize, 7, 3];
+        let mut next = 0u64;
+        let mut bases = Vec::new();
+        let mut all: Vec<u64> = Vec::new();
+        for &n in sizes.iter() {
+            let base = pf_take_group_ids(&mut next, n);
+            bases.push(base);
+            all.extend((0..n as u64).map(|i| base + i));
+        }
+        assert_eq!(bases, vec![0, 16, 23], "層の先頭が前の層の続きでない: {bases:?}");
+        assert_eq!(all.len(), 26);
+        for w in all.windows(2) {
+            assert_eq!(w[1], w[0] + 1, "通し番号が連続でない: {all:?}");
+        }
+        // 同じスロットを共有するのは 3 グループ前だけ (番号が一意なので当然)。
+        for (i, &g) in all.iter().enumerate() {
+            assert_eq!(g as usize, i);
+            assert_eq!((g % 3) as usize, i % 3);
+        }
+        // 0 本でも番号は進めない (空の層で番号が飛ばない)。
+        let base = pf_take_group_ids(&mut next, 0);
+        assert_eq!(base, 26);
+        assert_eq!(next, 26);
+    }
+
+    /// task 165: 上げスレッドの進捗公開は単調で、エラーは最初の 1 本を残す。
+    #[test]
+    fn up_progress_publishes_in_order() {
+        let st = (
+            std::sync::Mutex::new(PfUpState {
+                ready: 0,
+                times: Vec::new(),
+                probe: None,
+                err: None,
+            }),
+            std::sync::Condvar::new(),
+        );
+        pf_up_publish(&st, 0, 10, 20, 30, Some((1_000, 5)), None);
+        pf_up_publish(&st, 1, 11, 21, 31, None, None);
+        {
+            let s = st.0.lock().expect("poisoned");
+            assert_eq!(s.ready, 2, "2 グループ目まで公開したら ready=2");
+            assert_eq!(s.times[0], (10, 20, 30));
+            assert_eq!(s.times[1], (11, 21, 31));
+            assert_eq!(s.probe, Some((1_000, 5)));
+        }
+        // 遅れて届いた小さい番号でも ready は戻らず、エラーは残る。
+        pf_up_publish(&st, 0, 0, 0, 0, None, Some("最初のエラー".to_string()));
+        pf_up_publish(&st, 2, 12, 22, 32, None, Some("2 本目".to_string()));
+        let s = st.0.lock().expect("poisoned");
+        assert_eq!(s.ready, 3, "ready が戻った");
+        assert_eq!(s.err.as_deref(), Some("最初のエラー"), "エラーが上書きされた");
+        assert_eq!(s.times[2], (12, 22, 32));
     }
 }
 
