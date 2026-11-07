@@ -26128,11 +26128,12 @@ pub fn gdn_pf_chain(
             }
             t0 += m;
         }
+        // out_proj の完了待ちもこの段に含める (台帳の行を「発行だけ」にしない)。
+        ctx.sync()?;
     }
-
-    // ---- 1 回だけ待って、層の出力と状態をホストへ --------------------------
-    ctx.sync()?;
     phase_ns[2] = t_out.elapsed().as_nanos() as u64;
+
+    // ---- 層の出力と状態をホストへ ------------------------------------------
     let got: Vec<f32> = GDN_PF_CHAIN_BUF.with(|cell| -> Result<Vec<f32>> {
         let b = cell.borrow();
         b.o.as_ref().expect("連鎖の出力").to_vec::<f32>(nt * e)
