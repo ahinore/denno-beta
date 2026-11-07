@@ -5101,6 +5101,20 @@ pub mod q4prof {
         }
     }
 
+    /// task 167: 外で測った ns をグローバル束と層別束の両方へ足す
+    /// (デバイス連鎖は 1 呼び出しの中で段を測るので、`Instant` の外側では
+    /// 段の内訳が作れない)。
+    #[inline]
+    pub fn add_ns(c: &AtomicU64, layer: usize, stage: usize, ns: u64) {
+        if !timed() {
+            return;
+        }
+        if enabled() {
+            c.fetch_add(ns, Ordering::Relaxed);
+        }
+        mark_l_ns(layer, stage, ns);
+    }
+
     #[inline]
     fn mark_l_ns(layer: usize, stage: usize, ns: u64) {
         if !att_dbg() {
@@ -9801,6 +9815,60 @@ fn pf_sub_on(which: usize, env: &str) -> bool {
 /// ssm 層の GDN コアを GPU スキャンで回すか (`DENNO_PF_GDN_GPU`、未設定は master)。
 pub(crate) fn pf_gdn_gpu_on() -> bool {
     pf_sub_on(PF_SUB_GDN, "DENNO_PF_GDN_GPU")
+}
+
+/// task 167: ssm 層の prefill を「投影 → GDN → out_proj」のデバイス連鎖で回すか
+/// (`DENNO_GDN_PF_CHAIN`、**既定 on**)。`0` / `off` / `false` で従来経路。
+///
+/// 連鎖は GPU スキャン (`pf_gdn_gpu_on`) と同じ前提の上でだけ動く。ゲートを
+/// 別に持つのは、数値の契約 (丸め順は同じ・中間をホストへ落とさない) と
+/// 経路の切り戻しを独立にできるようにするため。
+///
+/// 採用は lab t167c (2026-11-07): 14,018 の cold prefill -8.7%、3,826 で -8.0%、
+/// decode 全 depth と 19 トークン next turn prefill は不変、md5 は全リクエスト
+/// 一致。ssm の h2d 53.6 → 5.6 GB、d2h 53.9 → 8.5 GB、同期 10,798 → 3,024 回。
+pub(crate) fn pf_gdn_chain_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_GDN_CHAIN_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_gdn_chain_from_value(std::env::var("DENNO_GDN_PF_CHAIN").ok().as_deref())
+    })
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+#[cfg(test)]
+static PF_GDN_CHAIN_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_gdn_chain_for_test(v: Option<bool>) {
+    PF_GDN_CHAIN_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// task 167: 連鎖のゲート値の解釈 (純関数)。**未設定は on** (lab t167c で採用)、
+/// 明示的な偽値 (`0` / `off` / `false` / `no`。前後の空白と大小文字は無視) だけ off。
+/// 他の master ゲート ([`pf_resident_from_value`]) と同じ規約に揃える。
+pub(crate) fn pf_gdn_chain_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
 }
 
 /// hc mix と hc combine をデバイス連鎖で回すか (`DENNO_PF_MIX_DEV`、未設定は master)。
@@ -16531,6 +16599,20 @@ mod tests {
             }
             for v in ["1", "on", "true", "yes", " ON "] {
                 assert!(pf_on_from_value(Some(v)), "{v:?} が off になった");
+            }
+        }
+
+        /// task 167: `DENNO_GDN_PF_CHAIN` の真理値表。lab t167c で採用して**既定 on**、
+        /// 明示的な偽値だけ off。
+        #[test]
+        fn gdn_pf_chain_gate_truth_table() {
+            assert!(pf_gdn_chain_from_value(None), "未設定は on (採用済み)");
+            assert!(pf_gdn_chain_from_value(Some("")), "空文字は既定 (on)");
+            for v in ["0", "off", "false", "no", " OFF "] {
+                assert!(!pf_gdn_chain_from_value(Some(v)), "{v:?} が on になった");
+            }
+            for v in ["1", "on", "true", "yes"] {
+                assert!(pf_gdn_chain_from_value(Some(v)), "{v:?} が off になった");
             }
         }
 
