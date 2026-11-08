@@ -25791,6 +25791,129 @@ mod tests {
         }
     }
 
+    /// task 177: v4 (レーン可変) GEMV が CPU の逐次実装 (`expert_gemv_scalar`) と
+    /// 相対 1e-5 以内で一致し、NaN / Inf を作らないこと。
+    ///
+    /// 形が合う lanes (4 / 8 / 16 / 32) を全部回す。v4 が実際に走ったことは
+    /// 「v2 の結果とビット一致しない行がある」ことで確かめる (黙って v3 / v2 に
+    /// 落ちていたら 1 bit も変わらない)。
+    ///
+    /// 実行 (GPU のある環境):
+    ///   DENNO_GEMV_V4_PTX=$PWD/crates/denno-engine/kernels/kernels_moe_v4.ptx \
+    ///   cargo test --release --features cuda -- --ignored cuda_gemv_v4_matches_cpu
+    #[test]
+    #[ignore]
+    fn cuda_gemv_v4_matches_cpu() {
+        use crate::kquant::GgmlType as T;
+        let ctx = CudaCtx::new().unwrap();
+        println!("device: {}", ctx.info());
+        assert!(
+            moe_gemv_v4_loaded(),
+            "v4 の PTX が読めていない (DENNO_GEMV_V4_PTX / kernels_moe_v4.ptx を確認)"
+        );
+        // GDN decode の実形 (k=2560 の qkv 3 種 / k=6144 の attn_out) と、
+        // レーンが 4 までしか立たない形 (k=640)。
+        let cases: [(T, usize, usize); 5] = [
+            (T::Q8_0, 2560, 256),
+            (T::Q4K, 2560, 256),
+            (T::Q5K, 2560, 256),
+            (T::Q8_0, 6144, 256),
+            (T::Q5_1, 640, 2560),
+        ];
+        for (ty, n_in, n_out) in cases {
+            let rb = gguf_row_bytes(ty, n_in).expect("row_bytes");
+            let blk = ty.blck_size();
+            // v3 のテストと同じ合成行列 (d と dmin / m は f16 の 1.0 固定)。
+            let hdr = 4usize;
+            let mut w = vec![0u8; rb * n_out];
+            let mut s = 12345u32;
+            for r in 0..n_out {
+                let row = &mut w[r * rb..(r + 1) * rb];
+                for b in 0..(n_in / blk) {
+                    let base = b * ty.type_size();
+                    row[base] = 0x00;
+                    row[base + 1] = 0x3c;
+                    row[base + 2] = 0x00;
+                    row[base + 3] = 0x3c;
+                    for i in hdr..ty.type_size() {
+                        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        row[base + i] = (s >> 16) as u8;
+                    }
+                }
+            }
+            let x = pseudo_random(n_in, 7);
+            let mut want = vec![0f32; n_out];
+            crate::model::moe_expert::expert_gemv_scalar(ty, &w, n_in, n_out, &x, &mut want)
+                .expect("cpu 参照");
+            let dev_w = DevBuffer::from_slice(&w).unwrap();
+            let dev_x = DevBuffer::from_slice(&x).unwrap();
+            let mut got_v2 = vec![0f32; n_out];
+            assert!(
+                ctx.moe_gemv_dev_with(ty, &dev_w, &x, n_in, n_out, &mut got_v2, GemvKernelMode::V2)
+                    .unwrap(),
+                "{ty:?}: GPU 経路 (v2) が発動しなかった"
+            );
+            // cap を振って、実際に選ばれた lanes の種類だけを回す。
+            let mut tried: Vec<usize> = Vec::new();
+            for cap in [4usize, 8, 16, 32] {
+                let Some(plan) = ctx.plan_moe_gemv_v4(ty, n_in, n_out, cap) else {
+                    continue;
+                };
+                if tried.contains(&plan.lanes) {
+                    continue;
+                }
+                tried.push(plan.lanes);
+                let dev_out = DevBuffer::alloc(n_out * 4).unwrap();
+                gdn_launch_gemv_dev(
+                    &ctx,
+                    &plan,
+                    &dev_w,
+                    dev_x.ptr(),
+                    dev_out.ptr(),
+                    n_in,
+                    n_out,
+                )
+                .expect("v4 の起動");
+                ctx.sync().expect("sync");
+                let got = dev_out.to_vec::<f32>(n_out).unwrap();
+                let ndiff = (0..n_out)
+                    .filter(|&i| got[i].to_bits() != got_v2[i].to_bits())
+                    .count();
+                let mut maxd = 0f32;
+                let mut maxv = 0f32;
+                let mut nonfinite = 0usize;
+                for i in 0..n_out {
+                    if !got[i].is_finite() {
+                        nonfinite += 1;
+                        continue;
+                    }
+                    maxd = maxd.max((got[i] - want[i]).abs());
+                    maxv = maxv.max(want[i].abs());
+                }
+                let rel = maxd / maxv.max(f32::MIN_POSITIVE);
+                println!(
+                    "{ty:?} k={n_in} n={n_out} lanes={} block={}: max|diff|={maxd:e} \
+                     max|ref|={maxv:e} rel={rel:e} (v2 と {ndiff}/{n_out} 行がビット不一致)",
+                    plan.lanes, plan.block_dim
+                );
+                assert_eq!(nonfinite, 0, "{ty:?}: NaN / Inf が {nonfinite} 行");
+                assert!(
+                    rel < 1e-5,
+                    "{ty:?} lanes={}: 相対誤差 {rel:e} >= 1e-5 (max|diff|={maxd:e}, \
+                     max|ref|={maxv:e})",
+                    plan.lanes
+                );
+                assert!(
+                    ndiff > 0,
+                    "{ty:?} lanes={}: v4 の出力が v2 と 1 行も違わない = v4 が走っていない",
+                    plan.lanes
+                );
+            }
+            assert!(!tried.is_empty(), "{ty:?} k={n_in}: v4 の計画が 1 つも立たない");
+            println!("{ty:?} k={n_in}: v4 の lanes = {tried:?}");
+        }
+    }
+
     /// v3 のレーン数の適格判定と、`DENNO_GEMV_V3_ROWS` の真理値表 (GPU 無しで回る)。
     ///
     /// 実モデルの k (640 / 2560 / 5120 / 6144) は 4 レーン、320 (`hc_up`) は
