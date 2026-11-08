@@ -250,6 +250,31 @@ pub fn tline_end() {
     TLINE_ACTIVE.store(false, Ordering::Relaxed);
 }
 
+/// task 173: GDN prefill 連鎖の段ごとの GPU 時間 (`DENNO_GDN_PF_KPROF=1`) の 1 行。
+///
+/// 計測器は cuda.rs 側にあるので、cuda feature の有無をここで吸収する
+/// (denno-cli は feature を持たないため、cuda 無しでは常に空)。
+#[cfg(feature = "cuda")]
+pub fn gdn_pf_kprof_lines() -> Vec<String> {
+    crate::cuda::gdn_pf_kprof::lines()
+}
+
+/// task 173: cuda 無しは常に空。
+#[cfg(not(feature = "cuda"))]
+pub fn gdn_pf_kprof_lines() -> Vec<String> {
+    Vec::new()
+}
+
+/// task 173: 計測の積算を 0 に戻す (cuda 無しは何もしない)。
+#[cfg(feature = "cuda")]
+pub fn gdn_pf_kprof_reset() {
+    crate::cuda::gdn_pf_kprof::reset()
+}
+
+/// task 173: cuda 無しは何もしない。
+#[cfg(not(feature = "cuda"))]
+pub fn gdn_pf_kprof_reset() {}
+
 /// 区間を開く。戻り値の drop で壁時計を積み、前の区間へ戻す。
 ///
 /// off のときは `Instant` を取らず、[`CUR`] にも触らない (no-op)。

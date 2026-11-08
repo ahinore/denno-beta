@@ -6665,3 +6665,96 @@ fn pf_tc_gemm_is_bf16_mma_q8_0() {
         "gemm の spec 行が変わった (arch 上書きの巻き添えに注意)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 173: prefill GDN スキャン (`kernels_gdn_pf.cu`)
+// ---------------------------------------------------------------------------
+//
+// 新しい .cu は「cuda.rs が読んでいる」「build_ptx.sh が compute_90 で作る」
+// 「PTX の名前と Rust の launch サイトが同じカーネルを指す」の 3 点を固定する。
+// block 形状は 512 (= 128 列 × 4 レーン) で、カーネル側の #define と一致する。
+const GDN_PF_SRC: &str = include_str!("../kernels/kernels_gdn_pf.cu");
+
+#[test]
+fn gdn_pf_scan_kernel_is_wired() {
+    assert!(
+        CUDA_RS.contains("b\"dno_gdn_pf_scan128\\0\""),
+        "cuda.rs が dno_gdn_pf_scan128 を読んでいない"
+    );
+    assert!(
+        GDN_PF_SRC.contains("dno_gdn_pf_scan128"),
+        "kernels_gdn_pf.cu にカーネルが無い"
+    );
+    // カーネル側の前提 (レーン数・1 レーンの行数・スレッド数)
+    for line in [
+        "#define PF_DK 128",
+        "#define PF_LANES 4",
+        "#define PF_NR 32",
+        "#define PF_THREADS 512",
+        "#define PF_DCONV 4",
+        "#define PF_CS 3",
+    ] {
+        assert!(GDN_PF_SRC.contains(line), "{line} が無い");
+    }
+    // 状態はレジスタ常駐 (ローカル配列を共有メモリへ置かない)
+    assert!(
+        GDN_PF_SRC.contains("float S[PF_NR];"),
+        "状態配列がレジスタ常駐の形になっていない"
+    );
+    // 縮約は 4 レーン (xor 1 / xor 2) で作る
+    assert!(
+        GDN_PF_SRC.contains("__shfl_xor_sync(0xffffffffu, skv, 1)")
+            && GDN_PF_SRC.contains("__shfl_xor_sync(0xffffffffu, skv, 2)"),
+        "skv のレーン縮約が無い"
+    );
+    // build_ptx.sh: 新 target が compute_90 / -fmad=false
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf)       echo \"kernels_gdn_pf.cu|nofmad|compute_90\""),
+        "build_ptx.sh の gdn_pf が nofmad/compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gdn_pf"),
+        "build_ptx.sh の targets_all に gdn_pf が無い: {targets}"
+    );
+    // 起動サイト: block は 512 に静的解決できる (グリッドは nv なので動的でよい)
+    let map = launch_map_from_cuda(CUDA_RS);
+    assert_eq!(
+        map.block_status("dno_gdn_pf_scan128"),
+        ShapeStatus::Resolved([512, 1, 1]),
+        "dno_gdn_pf_scan128 の block 形状が解決できない: {}",
+        map.summary()
+    );
+    // Rust 側のスレッド数定数とカーネルの #define が一致する
+    assert!(
+        CUDA_RS.contains("const GDN_PF_SCAN_THREADS: usize = 512;"),
+        "GDN_PF_SCAN_THREADS が 512 でない"
+    );
+    assert!(
+        CUDA_RS.contains("const GDN_PF_DK: usize = 128;"),
+        "GDN_PF_DK が 128 でない"
+    );
+}
+
+/// ゲート (`DENNO_GDN_PF_FAST`) の既定は **on**。lab t174b (2026-11-08、SHA
+/// 99807fa7d) で採用: cold prefill 3,826 tok 20.55 -> 19.74 s、14,018 tok
+/// 71.70 -> 66.80 s、decode は合計で ±0.4% 以内、errors 0。off に戻すときは
+/// ここも直す (うっかり既定を戻したら落ちる)。
+#[test]
+fn gdn_pf_fast_gate_defaults_on() {
+    assert!(
+        CUDA_RS.contains("Some(s) => !matches!(s.as_str(), \"0\" | \"off\" | \"false\" | \"no\" | \"\"),"),
+        "gdn_pf_fast_from_value の真理値表が変わった"
+    );
+    let i = CUDA_RS
+        .find("pub(crate) fn gdn_pf_fast_from_value")
+        .expect("gdn_pf_fast_from_value が無い");
+    let body = &CUDA_RS[i..(i + 400).min(CUDA_RS.len())];
+    assert!(
+        body.contains("None => true,"),
+        "gdn_pf_fast_from_value(None) が on でない: {body}"
+    );
+}
