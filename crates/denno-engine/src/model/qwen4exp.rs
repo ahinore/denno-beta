@@ -10075,7 +10075,9 @@ pub(crate) fn pf_on_from_value(v: Option<&str>) -> bool {
             s.trim().to_ascii_lowercase().as_str(),
             "1" | "on" | "true" | "yes"
         ),
-        None => false,
+        // task 181: lab t181b で 3 本 + 小さい N + ミラー + D2H の組が目標
+        // (-8% / -8%) を満たしたので **既定 on**。明示的な偽値で切る。
+        None => true,
     }
 }
 
@@ -16417,12 +16419,13 @@ mod tests {
         }
 
 
-        /// task 172: 3 本のゲートは**既定 off** で、明示的な真値だけ on。
+        /// task 172 の 3 本は task 181 (lab t181b) で**既定 on**にした
+        /// (3 本 + 小さい N + ミラー + D2H の組で cold prefill -8.9% / -9.4%)。
         #[test]
-        fn pf2_dev_gates_default_off() {
-            assert!(!pf_full_dev_from_value(None), "未設定は off");
-            assert!(!pf_shared_dev_from_value(None), "未設定は off");
-            assert!(!pf_ple_gpu_from_value(None), "未設定は off");
+        fn pf2_dev_gates_default_on() {
+            assert!(pf_full_dev_from_value(None), "未設定は on (lab t181b)");
+            assert!(pf_shared_dev_from_value(None), "未設定は on (lab t181b)");
+            assert!(pf_ple_gpu_from_value(None), "未設定は on (lab t181b)");
             for v in ["0", "off", "false", "no", "", " 0 ", "OFF"] {
                 assert!(!pf_full_dev_from_value(Some(v)), "full: {v:?} が on になった");
                 assert!(!pf_shared_dev_from_value(Some(v)), "shared: {v:?} が on になった");
@@ -17094,9 +17097,9 @@ mod tests {
             for v in ["1", "on", "true", "yes", " ON "] {
                 assert!(pf_resident_from_value(Some(v)), "{v:?} が off になった");
             }
-            // 副ゲート: 未設定は master を見るので、ここでは明示値だけを固定する。
-            assert!(!pf_on_from_value(None), "未設定は off (副ゲートは master に従う)");
-            for v in ["0", "off", "false", "no", "", " 0 "] {
+            // 副ゲート: task 181 (lab t181b) で組として目標に届いたので **既定 on**。
+            assert!(pf_on_from_value(None), "未設定は on (lab t181b で採用)");
+            for v in ["0", "off", "false", "no", " OFF ", " 0 "] {
                 assert!(!pf_on_from_value(Some(v)), "{v:?} が on になった");
             }
             for v in ["1", "on", "true", "yes", " ON "] {

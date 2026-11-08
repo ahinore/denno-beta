@@ -12499,12 +12499,15 @@ const TC_SN_MAX_TOKENS: usize = 2048;
 const _: [(); TC_SN_SMEM_BYTES] =
     [(); 2 * TC_SN_BN * TC_SN_LD * 2 + 2 * TC_SN_BM * TC_SN_LD * 2];
 
-/// `DENNO_PF_TC_SMALLN` の値の解釈 (純関数)。`1`・`on`・`true`・`yes` だけが on。
+/// `DENNO_PF_TC_SMALLN` の値の解釈 (純関数)。明示的な偽値だけが off。
 ///
-/// **既定 off** (task 181 の lab で採否を決める)。
+/// **既定 on** (lab t181b で採用): 単独で cold prefill 3,826 tok 17.80 → 17.20 s
+/// (-3.4%)、14,018 tok 59.08 → 57.36 s (-2.9%)。shared expert の gpu が
+/// 3,508 → 1,276 ms。decode と 19 トークン next turn は不変、errors 0。
+/// md5 は BF16 丸めで変わる (prefill の射影は契約外)。
 pub(crate) fn pf_tc_smalln_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        None => false,
+        None => true,
         Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
@@ -12903,6 +12906,9 @@ mod pf_tc_tests {
     }
 
     /// `gemm_try` のまとめ幅: TC が使えるときだけ 2048、それ以外は 128。
+    ///
+    /// task 181 で小さい N 用 (N < 4096 の Q8_0 / Q4_K) が既定 on になったので、
+    /// 「TC を使わない」側は小さい N のゲートも明示的に切って測る。
     #[test]
     fn pf_tc_gemm_try_tile() {
         use crate::kquant::GgmlType as T;
@@ -12916,11 +12922,24 @@ mod pf_tc_tests {
                 gemm_try_tile_for(true, false, T::Q8_0, 512, k, n, 64),
                 TC_MAX_TOKENS
             );
+            // 小さい N のゲートも切れば 128 (従来のまとめ幅)。
+            set_pf_tc_smalln_for_test(Some(false));
+            let off = gemm_try_tile_for(false, false, T::Q8_0, 512, k, n, 64);
+            set_pf_tc_smalln_for_test(None);
+            assert_eq!(off, 128, "k={k} n={n}: 小さい N のゲートが切れていない");
+        }
+        // 小さい N 用が既定 on: N < 4096 の形は Q8_0 / Q4_K とも 2,048 まで。
+        for (k, n) in [(6144usize, 2560usize), (640, 2560)] {
             assert_eq!(
                 gemm_try_tile_for(false, false, T::Q8_0, 512, k, n, 64),
-                128
+                TC_MAX_TOKENS,
+                "k={k} n={n}: smallN がまとめ幅を広げていない"
             );
         }
+        assert_eq!(
+            gemm_try_tile_for(false, false, T::Q4K, 512, 2560, 640, 64),
+            TC_MAX_TOKENS
+        );
         // 19 トークンの next turn は従来の 128 のまま (1 回で収まる)。
         assert_eq!(
             gemm_try_tile_for(true, false, T::Q8_0, 19, 2560, 16384, 64),
@@ -12948,9 +12967,15 @@ mod pf_tc_tests {
             gemm_try_tile_for(false, true, T::Q4K, 512, 2560, 6144, 64),
             TC_MAX_TOKENS
         );
-        // v2 の条件 (出力行 128 の倍数・ブロック数) を満たさない形は 128 のまま。
+        // v2 の条件 (出力行 128 の倍数・ブロック数) を満たさない形は、task 181 の
+        // 小さい N 用 (N < 4096) が受けるので 2,048 までまとめる。
         assert_eq!(
             gemm_try_tile_for(false, true, T::Q8_0, 512, 6144, 2560, 64),
+            TC_MAX_TOKENS
+        );
+        // 64 の倍数でない出力行はどの TC 経路にも入らない (128 のまま)。
+        assert_eq!(
+            gemm_try_tile_for(false, true, T::Q8_0, 512, 6144, 2600, 64),
             128
         );
         assert_eq!(TC_MAX_TOKENS, 2048);
@@ -13055,10 +13080,10 @@ mod pf_tc_tests {
         assert_eq!(pf_tc2_blocks(512, 10240 + 64), 0);
     }
 
-    /// task 181: 小さい N 用のゲートは **既定 off** (`DENNO_PF_TC_SMALLN=1` で on)。
+    /// task 181: 小さい N 用のゲートは **既定 on** (`DENNO_PF_TC_SMALLN=0` で off)。
     #[test]
     fn pf_tc_smalln_gate_truth_table() {
-        assert!(!pf_tc_smalln_from_value(None), "未設定は既定 off");
+        assert!(pf_tc_smalln_from_value(None), "未設定は既定 on (lab t181b で採用)");
         for v in ["0", "off", "false", "no", "", " OFF "] {
             assert!(!pf_tc_smalln_from_value(Some(v)), "{v}");
         }
@@ -16553,14 +16578,15 @@ fn pf2_gemm(
 // full attention の前半: qkv 射影 + per-head RMSNorm + partial NeoX rope
 // ---------------------------------------------------------------------------
 
-/// `DENNO_PF_D2H_DIRECT` の値の解釈 (純関数)。明示的な真値だけ on。
+/// `DENNO_PF_D2H_DIRECT` の値の解釈 (純関数)。明示的な偽値だけ off。
 ///
-/// **既定 off** (task 181 の lab で採否を決める)。
+/// **既定 on** (lab t181b で採用): 単独で 14k の mix が 5,100 → 4,407 ms
+/// (cpu 676 → 4 ms)、cold prefill 59.06 → 58.31 s (-1.3%)、md5 SAME。
 pub(crate) fn pf_d2h_direct_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
 }
 
 /// task 181: デバイス → ホストを**呼び出し側のバッファへ直接**戻すか。
@@ -16599,14 +16625,16 @@ pub(crate) fn set_pf_d2h_direct_for_test(v: Option<bool>) {
     );
 }
 
-/// `DENNO_PF_MIRROR_DELTA` の値の解釈 (純関数)。明示的な真値だけ on。
+/// `DENNO_PF_MIRROR_DELTA` の値の解釈 (純関数)。明示的な偽値だけ off。
 ///
-/// **既定 off** (task 181 の lab で採否を決める)。
+/// **既定 on** (lab t181b で採用)。単独では ±0.1% (mirror の H2D は 14k で
+/// 657 MB = 38 ms しかない) だが、`pf_full_qkv` と `pf_full_out` の往復
+/// (D2H → ホスト積み → H2D) を D2D 1 回に置き換える。値は変わらない。
 pub(crate) fn pf_mirror_delta_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
 }
 
 /// task 181: KV ミラーを「チャンクの差分だけ」にするか (`DENNO_PF_MIRROR_DELTA`)。
@@ -24651,11 +24679,11 @@ mod q4_attn_tests {
         assert!(Q4_GPU_ATTN_PF_MIN_KV_DEFAULT > Q4_GPU_ATTN_MIN_DEFAULT);
     }
 
-    /// task 181: `DENNO_PF_D2H_DIRECT` の解釈 (既定 off。明示的な真値だけ on)。
+    /// task 181: `DENNO_PF_D2H_DIRECT` の解釈 (既定 on。明示的な偽値だけ off)。
     #[test]
     fn pf_d2h_direct_gate_parsing() {
-        assert!(!pf_d2h_direct_from_value(None), "未設定は既定 off");
-        for v in ["0", "off", "false", "no", "", " OFF ", "ON!"] {
+        assert!(pf_d2h_direct_from_value(None), "未設定は既定 on (lab t181b で採用)");
+        for v in ["0", "off", "false", "no", "", " OFF "] {
             assert!(!pf_d2h_direct_from_value(Some(v)), "{v}");
         }
         for v in ["1", "on", "true", "yes", " ON "] {
@@ -24670,11 +24698,11 @@ mod q4_attn_tests {
         assert_eq!(pf_d2h_direct_on(), before);
     }
 
-    /// task 181: `DENNO_PF_MIRROR_DELTA` の解釈 (既定 off。明示的な真値だけ on)。
+    /// task 181: `DENNO_PF_MIRROR_DELTA` の解釈 (既定 on。明示的な偽値だけ off)。
     #[test]
     fn pf_mirror_delta_gate_parsing() {
-        assert!(!pf_mirror_delta_from_value(None), "未設定は既定 off");
-        for v in ["0", "off", "false", "no", "", " OFF ", "ON!"]
+        assert!(pf_mirror_delta_from_value(None), "未設定は既定 on (lab t181b で採用)");
+        for v in ["0", "off", "false", "no", "", " OFF "]
         {
             assert!(!pf_mirror_delta_from_value(Some(v)), "{v}");
         }
