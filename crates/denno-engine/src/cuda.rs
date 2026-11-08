@@ -15471,6 +15471,142 @@ pub fn maybe_gpu_mix_bf16_batch_into(
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 182: prefill の router / PLE 射影 (F32 重み × m トークン) を GPU で回す
+// ---------------------------------------------------------------------------
+//
+// task 170 (br170) が層優先 prefill 用に書いたものと同じ経路。ここでは通常の
+// チャンク順 prefill から、層ごと・チャンクごとに 1 回ずつ呼ぶ:
+//   - router (`ffn_gate_inp`、実形 2,560 x 512 の F32) は 14k の prefill で 2.8 s
+//   - PLE の key / value 射影 (F32、`blk.1.ple_key/value`) は合わせて約 1.3 s
+// どちらも CPU の行バッチで回っていた。重みは `weights_for_f32` の常駐
+// (decode のルータ GEMV と同じ uid 表) に載せ、既存の `dno_gemm_f32_mt` で
+// m トークンをまとめて回す (.cu / PTX の変更なし)。
+//
+// 数値は FMA + タイル順なので CPU の `mul + add` 逐次とはビット一致しない
+// (prefill の行列積は速度優先の契約)。`false` = CPU のバッチ経路へ。
+
+struct F32GemmBatchSc {
+    x: Option<DevBuffer>,
+    out: Option<DevBuffer>,
+}
+
+thread_local! {
+    static F32_GEMM_BATCH_SC: std::cell::RefCell<F32GemmBatchSc> = const {
+        std::cell::RefCell::new(F32GemmBatchSc { x: None, out: None })
+    };
+}
+
+/// task 182: `maybe_gpu_f32_gemm_batch_into` の入口に入った回数 (テスト専用)。
+///
+/// このコンテナに GPU は無いので、計算は `cuda_enabled()` の所で CPU へ落ちる。
+/// ゲートと配線が生きていることを「入口の回数」で数える (decode の
+/// `router_gpu_attempts` と同じ規約)。
+#[cfg(test)]
+static F32_GEMM_BATCH_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn f32_gemm_batch_attempts() -> usize {
+    F32_GEMM_BATCH_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn f32_gemm_batch_attempts_reset() {
+    F32_GEMM_BATCH_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 182: `out[t * n + r] = dot(row r, xs[t])` を GPU の f32 GEMM で回す。
+///
+/// 重みは [`weights_for_f32`] の常駐 (router の 1 行 GEMV と同じ uid 表) を使う。
+/// `nt < 2`・形の不一致・GPU 無し・予算外・PTX 未収録はすべて `false` を返して
+/// CPU 経路へ落とす (panic しない)。
+pub fn maybe_gpu_f32_gemm_batch_into(
+    uid: u64,
+    bytes: &[u8],
+    k: usize,
+    n: usize,
+    xs: &[f32],
+    nt: usize,
+    out: &mut [f32],
+) -> bool {
+    #[cfg(test)]
+    F32_GEMM_BATCH_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !cuda_enabled() {
+        return false;
+    }
+    if k == 0
+        || n == 0
+        || nt < 2
+        || xs.len() != nt * k
+        || out.len() != nt * n
+        || bytes.len() != k.saturating_mul(n).saturating_mul(4)
+        || k > i32::MAX as usize
+        || n > i32::MAX as usize
+        || nt > i32::MAX as usize
+    {
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        return false;
+    }
+    let Some(f) = gemm_f32_mt_fn(ctx) else {
+        return false;
+    };
+    let w = match weights_for_f32(uid, bytes, k, n) {
+        Ok(w) => w,
+        Err(_) => return false,
+    };
+    let lib = match lib() {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    let r = F32_GEMM_BATCH_SC.with(|cell| -> Result<()> {
+        let mut s = cell.borrow_mut();
+        let F32GemmBatchSc { x: dx, out: dout } = &mut *s;
+        Scratch::ensure(dx, nt * k * 4)?;
+        Scratch::ensure(dout, nt * n * 4)?;
+        let (dx, dout) = (dx.as_ref().unwrap(), dout.as_ref().unwrap());
+        dx.copy_from(xs)?;
+        let wp = w.buf.ptr();
+        unsafe {
+            let (mut pw, mut px, mut po) = (wp, dx.ptr(), dout.ptr());
+            let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, k as c_int, n as c_int);
+            let mut args = [
+                &mut pw as *mut _ as *mut c_void,
+                &mut px as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut nt_c as *mut _ as *mut c_void,
+                &mut k_c as *mut _ as *mut c_void,
+                &mut n_c as *mut _ as *mut c_void,
+            ];
+            let grid = (
+                ((n + GEMM_MT_ROWS - 1) / GEMM_MT_ROWS) as u32,
+                ((nt + GEMM_MT_TOKS - 1) / GEMM_MT_TOKS) as u32,
+                1,
+            );
+            ctx.launch_async(f, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)?;
+            ctx.sync()?;
+            // D2H は同期コピーで `out` へ直接 (中間 Vec / pinned を作らない)。
+            check(
+                (lib.memcpy_dtoh)(
+                    out.as_mut_ptr() as *mut c_void,
+                    dout.ptr(),
+                    nt * n * 4,
+                ),
+                "cuMemcpyDtoH (f32 batch)",
+            )?;
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        }
+        Ok(())
+    });
+    r.is_ok()
+}
+
+
 
 // ---------------------------------------------------------------------------
 // task 154: prefill のデバイス常駐 mix 連鎖 (`DENNO_PF_RESIDENT`)

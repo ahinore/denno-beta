@@ -50,6 +50,10 @@ use crate::kquant::{self, GgmlType};
 /// 1 回のまとめ読みの上限 (要件: 64 KiB を超えない)。
 pub const DEFAULT_MAX_READ: usize = 64 * 1024;
 
+/// task 182: `PleTable::ram_enabled` のテスト用上書き (0 = env / 1 = off / 2 = on)。
+#[cfg(test)]
+static RAM_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// PLE 表の読み出しエラー。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PleError(pub String);
@@ -73,6 +77,10 @@ fn err<T>(msg: impl Into<String>) -> Result<T> {
 /// 表そのものは保持せず、パートの fd とテンソルの絶対オフセットだけを持つ。
 /// 1 行のデコードに使う作業バッファは `gather_rows` の呼び出しごとに確保する
 /// (最大 [`DEFAULT_MAX_READ`] バイト) ので、表のサイズに比例する常駐は無い。
+///
+/// task 182: `DENNO_PF_PLE_RAM=1` のときだけ、表全体を RAM (`ram`) に読む。
+/// 28.80 GB の表を SSD の pread (1 行 90 B のランダム読み) で引くと 14k prefill で
+/// 約 2.7 s かかる。RAM に置けば同じ 90 B を行バッファからデコードするだけになる。
 pub struct PleTable {
     /// テンソルが属するパートの読み取り専用ハンドル
     file: File,
@@ -87,6 +95,8 @@ pub struct PleTable {
     max_read: usize,
     /// 開いたパートのパス (診断用)
     path: PathBuf,
+    /// task 182: 表全体の RAM コピー (`DENNO_PF_PLE_RAM=1` のときだけ)
+    ram: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for PleTable {
@@ -221,7 +231,7 @@ impl PleTable {
             ));
         }
 
-        Ok(PleTable {
+        let mut t = PleTable {
             file: fh,
             base: off as u64,
             n_rows,
@@ -230,7 +240,102 @@ impl PleTable {
             ty: GgmlType::IQ4Nl,
             max_read: DEFAULT_MAX_READ,
             path,
-        })
+            ram: None,
+        };
+        // task 182: `DENNO_PF_PLE_RAM=1` なら表全体を RAM へ (モデルのロード時)。
+        // 失敗しても pread 経路で動く (fail-closed)。
+        if Self::ram_enabled() {
+            match t.load_ram() {
+                Ok(n) => eprintln!("[ple] DENNO_PF_PLE_RAM: {n} B を RAM 常駐にした"),
+                Err(e) => eprintln!("[ple] RAM 常駐を作らない (pread のまま): {e}"),
+            }
+        }
+        Ok(t)
+    }
+
+    /// task 182: `DENNO_PF_PLE_RAM` の解釈 (純関数)。**明示的な真値だけ on**。
+    ///
+    /// `DENNO_PF_PLE_RAM=1` で開いた時点 (モデルのロード) に表全体を RAM へ
+    /// 読む。既定 off は「RAM の使い方を変えない」ため。
+    pub fn ram_from_value(v: Option<&str>) -> bool {
+        match v {
+            Some(s) => matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "1" | "on" | "true" | "yes"
+            ),
+            None => false,
+        }
+    }
+
+    /// task 182: テスト用の強制上書き (0 = env / 1 = off / 2 = on)。
+    #[cfg(test)]
+    pub fn set_ram_for_test(v: Option<bool>) {
+        RAM_FORCE.store(
+            match v {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// task 182: 表全体を RAM へ読むか (`DENNO_PF_PLE_RAM`、既定 off)。
+    pub fn ram_enabled() -> bool {
+        #[cfg(test)]
+        match RAM_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| Self::ram_from_value(std::env::var("DENNO_PF_PLE_RAM").ok().as_deref()))
+    }
+
+    /// task 182: 表全体を RAM へ読む。戻り値は読んだバイト数。
+    ///
+    /// `open` が `DENNO_PF_PLE_RAM=1` のときに呼ぶ (モデルのロード時 = prefill の
+    /// 計測の外)。確保に失敗したら `Err` を返し、呼び出し側は pread のまま続ける
+    /// (黙って一部だけ持たない)。読み込みは 16 MiB ずつ、`pread` の同じ fd から。
+    pub fn load_ram(&mut self) -> Result<u64> {
+        if self.ram.is_some() {
+            return Ok(self.nbytes());
+        }
+        let total = usize::try_from(self.nbytes())
+            .map_err(|_| PleError(format!("表のバイト数 {} が usize に収まらない", self.nbytes())))?;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.try_reserve_exact(total)
+            .map_err(|e| PleError(format!("RAM の確保に失敗 ({total} B): {e}")))?;
+        buf.resize(total, 0);
+        const CHUNK: usize = 16 << 20;
+        let t0 = std::time::Instant::now();
+        let mut off = 0usize;
+        while off < total {
+            let n = (total - off).min(CHUNK);
+            if let Err(e) = self
+                .file
+                .read_exact_at(&mut buf[off..off + n], self.base + off as u64)
+            {
+                return err(format!(
+                    "RAM への読み込みに失敗 (off={off}, len={n}): {e}"
+                ));
+            }
+            off += n;
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        let gb = total as f64 / 1e9;
+        eprintln!(
+            "[ple] 表を RAM へ読み込み: {gb:.2} GB in {secs:.1} s ({:.2} GB/s) {}",
+            gb / secs.max(1e-9),
+            self.path.display()
+        );
+        self.ram = Some(buf);
+        Ok(total as u64)
+    }
+
+    /// task 182: RAM コピーを持っているか (診断・テスト用)。
+    pub fn has_ram(&self) -> bool {
+        self.ram.is_some()
     }
 
     /// 行数 (320001536)
@@ -330,24 +435,42 @@ impl PleTable {
             }
             let run_rows = j - i;
             let span = run_rows * self.row_bytes;
-            buf.clear();
-            buf.resize(span, 0);
-            let off = self.base + (start_row * self.row_bytes) as u64;
-            if let Err(e) = self.file.read_exact_at(&mut buf, off) {
-                return err(format!(
-                    "pread 失敗 (行 {start_row} から {run_rows} 行, off={off}, len={span}): {e}"
-                ));
-            }
+            // task 182: RAM 常駐があればそこから、無ければ pread。どちらも同じ
+            // バイト列を `dequant_row_into` に渡すので値はビット一致する。
+            let t_read = crate::model::prekprof::stamp();
+            let src: &[u8] = match &self.ram {
+                Some(ram) => {
+                    let s = start_row * self.row_bytes;
+                    &ram[s..s + span]
+                }
+                None => {
+                    buf.clear();
+                    buf.resize(span, 0);
+                    let off = self.base + (start_row * self.row_bytes) as u64;
+                    if let Err(e) = self.file.read_exact_at(&mut buf, off) {
+                        return err(format!(
+                            "pread 失敗 (行 {start_row} から {run_rows} 行, off={off}, len={span}): {e}"
+                        ));
+                    }
+                    &buf
+                }
+            };
+            crate::model::prekprof::mark(t_read, crate::model::prekprof::PLE_READ);
             if prof {
                 crate::model::prekprof::note_ple_pread(run_rows, span);
+                if self.ram.is_some() {
+                    crate::model::prekprof::note_ple_ram(span);
+                }
             }
+            let t_deq = crate::model::prekprof::stamp();
             for (k, &r) in rows[i..j].iter().enumerate() {
                 let rb = (r as usize - start_row) * self.row_bytes;
                 let o = &mut out[(i + k) * self.n_dim..(i + k + 1) * self.n_dim];
                 // 行境界 = ブロック境界なので、行単位のデコードは表全体の
                 // デコードと丸め順序が変わらない (`dequant_block` を再利用)。
-                kquant::dequant_row_into(self.ty, &buf[rb..rb + self.row_bytes], o);
+                kquant::dequant_row_into(self.ty, &src[rb..rb + self.row_bytes], o);
             }
+            crate::model::prekprof::mark(t_deq, crate::model::prekprof::PLE_DEQ);
             i = j;
         }
         Ok(())
@@ -694,6 +817,7 @@ impl PleNgram {
         }
 
         // 1. 窓ごとの行 index (出力と同じ順で並べる)。
+        let t_sort = crate::model::prekprof::stamp();
         let mut rows: Vec<u32> = Vec::with_capacity(ctxs.len() * n_heads);
         for c in ctxs {
             let idx = self.indices(c)?;
@@ -709,6 +833,7 @@ impl PleNgram {
         let mut uniq = rows.clone();
         uniq.sort_unstable();
         uniq.dedup();
+        crate::model::prekprof::mark(t_sort, crate::model::prekprof::PLE_SORT);
 
         // 3. 表を 1 行 1 回だけ読む。
         let parts = ple_par_parts(uniq.len());
@@ -716,12 +841,30 @@ impl PleNgram {
         table.gather_rows_par(&uniq, &mut buf, parts)?;
 
         // 4. 窓の順に配り直す (binary_search は uniq が昇順なので必ず当たる)。
+        let t_dist = crate::model::prekprof::stamp();
         for (i, &r) in rows.iter().enumerate() {
             let pos = uniq.binary_search(&r).map_err(|_| {
                 PleError(format!("行 {r} が重複排除の結果に無い (内部不整合)"))
             })?;
             out[i * n_dim..(i + 1) * n_dim].copy_from_slice(&buf[pos * n_dim..(pos + 1) * n_dim]);
         }
+        crate::model::prekprof::mark(t_dist, crate::model::prekprof::PLE_DIST);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// task 182: `DENNO_PF_PLE_RAM` のゲートは env を 1 回だけ読み、テストからは
+    /// 上書きできる (env は OnceLock なのでプロセス内で切り替えられない)。
+    #[test]
+    fn ram_gate_override() {
+        PleTable::set_ram_for_test(Some(true));
+        assert!(PleTable::ram_enabled(), "テスト上書き (on) が効いていない");
+        PleTable::set_ram_for_test(Some(false));
+        assert!(!PleTable::ram_enabled(), "テスト上書き (off) が効いていない");
+        PleTable::set_ram_for_test(None);
     }
 }

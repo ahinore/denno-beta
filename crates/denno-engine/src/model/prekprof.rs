@@ -43,8 +43,16 @@ pub const FINAL_NORM: usize = 5;
 pub const HEAD: usize = 6;
 /// 区間: decode のサンプリング (prefill wall の外)。
 pub const SAMPLE: usize = 7;
+/// task 182: PLE 表の読み (pread または RAM コピーからのコピー)。
+pub const PLE_READ: usize = 8;
+/// task 182: PLE 表の行デコード (`dequant_row_into`)。
+pub const PLE_DEQ: usize = 9;
+/// task 182: PLE の行 index 計算 + 昇順化 + 重複排除。
+pub const PLE_SORT: usize = 10;
+/// task 182: PLE の窓順への配り直し (コピー)。
+pub const PLE_DIST: usize = 11;
 /// 区間の数。
-pub const NSLOT: usize = 8;
+pub const NSLOT: usize = 12;
 
 /// 区間の名前 (レポートの列名)。
 pub const SLOT_NAMES: [&str; NSLOT] = [
@@ -56,6 +64,10 @@ pub const SLOT_NAMES: [&str; NSLOT] = [
     "final_norm",
     "head",
     "sample",
+    "ple_read",
+    "ple_deq",
+    "ple_sort",
+    "ple_dist",
 ];
 
 /// prefill wall (t1..t_prefill) に入る区間。`other = wall - この合計`。
@@ -71,6 +83,8 @@ static SAMPLES: AtomicU64 = AtomicU64::new(0);
 static PLE_READS: AtomicU64 = AtomicU64::new(0);
 static PLE_ROWS: AtomicU64 = AtomicU64::new(0);
 static PLE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// task 182: RAM 常駐から読んだバイト数 (0 なら pread 経路)。
+static PLE_RAM_BYTES: AtomicU64 = AtomicU64::new(0);
 /// PLE 区間のページフォルト差分 (`/proc/self/stat`)。
 static MINFLT: AtomicU64 = AtomicU64::new(0);
 static MAJFLT: AtomicU64 = AtomicU64::new(0);
@@ -154,6 +168,12 @@ pub fn note_ple_pread(rows: usize, bytes: usize) {
     PLE_READS.fetch_add(1, Ordering::Relaxed);
     PLE_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
     PLE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+/// task 182: RAM 常駐から読んだ 1 回ぶんのバイト数を積む (pread はしていない)。
+#[inline]
+pub fn note_ple_ram(bytes: usize) {
+    PLE_RAM_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
 /// `/proc/self/stat` の `(minflt, majflt)`。読めない環境では `None`。
@@ -275,10 +295,16 @@ pub fn report(tag: &str, tok: usize, wall_ns: u64) -> Vec<String> {
     };
     let l2 = format!(
         "[pre-kprof] {tag} outside-wall tokenize {:.1} | sample {:.1} ms ({per:.3} ms/tok x{samples}) | \
-         ple rows={rows} reads={reads} bytes={bytes} avg_read={per_read:.0}B \
+         ple rows={rows} reads={reads} bytes={bytes} avg_read={per_read:.0}B ram={}B \
+         read={:.1} deq={:.1} sort={:.1} dist={:.1} ms \
          minflt=+{} majflt=+{}",
         ms(TOKENIZE),
         sample_ms,
+        PLE_RAM_BYTES.load(Ordering::Relaxed),
+        ms(PLE_READ),
+        ms(PLE_DEQ),
+        ms(PLE_SORT),
+        ms(PLE_DIST),
         MINFLT.load(Ordering::Relaxed),
         MAJFLT.load(Ordering::Relaxed)
     );
@@ -297,6 +323,7 @@ pub fn reset() {
     PLE_READS.store(0, Ordering::Relaxed);
     PLE_ROWS.store(0, Ordering::Relaxed);
     PLE_BYTES.store(0, Ordering::Relaxed);
+    PLE_RAM_BYTES.store(0, Ordering::Relaxed);
     MINFLT.store(0, Ordering::Relaxed);
     MAJFLT.store(0, Ordering::Relaxed);
 }
