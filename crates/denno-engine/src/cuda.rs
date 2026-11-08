@@ -14716,6 +14716,22 @@ thread_local! {
 /// 失敗時の会計は `weights_for_gguf` と同一の規約で、違うのは行の単位
 /// (k * 4 バイト固定) だけ。
 fn weights_for_f32(uid: u64, bytes: &[u8], k: usize, n: usize) -> Result<GgufWRef> {
+    weights_for_gemm_f32(uid, bytes, k, n, crate::kquant::GgmlType::F32)
+}
+
+/// task 182: F32 / BF16 / F16 の重みを **行優先 f32 に開いて** VRAM へ上げる。
+///
+/// PLE の `ple_key` / `ple_value` は実ファイルで F32 か BF16 (目録は Q8_0) で、
+/// 量子型専用の `pf_ple_proj` は形の段階で断る。BF16 -> f32 は上位 16 bit の
+/// 複製 (誤差なし)、F16 -> f32 は `dequant_row_into`。VRAM 上は常に f32 なので、
+/// レジストリの型は F32 で登録する (ルータの 1 行 GEMV と同じ表を共有)。
+fn weights_for_gemm_f32(
+    uid: u64,
+    bytes: &[u8],
+    k: usize,
+    n: usize,
+    src: crate::kquant::GgmlType,
+) -> Result<GgufWRef> {
     use crate::kquant::GgmlType as T;
     let reg = gguf_registry();
     let mut g = reg
@@ -14739,11 +14755,19 @@ fn weights_for_f32(uid: u64, bytes: &[u8], k: usize, n: usize) -> Result<GgufWRe
         .checked_mul(k)
         .and_then(|v| v.checked_mul(4))
         .ok_or_else(|| anyhow::anyhow!("f32: n * k * 4 が usize を溢れる"))?;
-    if bytes.len() != want {
+    let bpp = match src {
+        T::F32 => 4usize,
+        T::Bf16 | T::F16 => 2,
+        other => bail!("f32 常駐: 未対応の元型 {other:?} (F32 / BF16 / F16 のみ)"),
+    };
+    let src_want = n
+        .checked_mul(k)
+        .and_then(|v| v.checked_mul(bpp))
+        .ok_or_else(|| anyhow::anyhow!("f32: n * k * {bpp} が usize を溢れる"))?;
+    if bytes.len() != src_want {
         bail!(
-            "f32: バイト数 {} が n * k * 4 = {} と違う (k={k}, n={n})",
-            bytes.len(),
-            want
+            "f32: 元型 {src:?} のバイト数 {} が n * k * {bpp} = {src_want} と違う (k={k}, n={n})",
+            bytes.len()
         );
     }
     // P46 と同じ: 確保の前に上限と空き VRAM を見て古い uid を解放する。
@@ -14769,9 +14793,32 @@ fn weights_for_f32(uid: u64, bytes: &[u8], k: usize, n: usize) -> Result<GgufWRe
     }
     // 生バイトのスライスは 4 バイト整列を保証しない (`Vec<u8>` / mmap の途中) ので、
     // CPU と同じ `from_le_bytes` で f32 に開いてから上げる (値は 1 bit も変わらない)。
+    // task 182: BF16 は上位 16 bit の複製 (誤差なし)、F16 は dequant_row_into。
     let mut host: Vec<f32> = Vec::with_capacity(k * n);
-    for c in bytes.chunks_exact(4) {
-        host.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    match src {
+        T::F32 => {
+            for c in bytes.chunks_exact(4) {
+                host.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+        }
+        T::Bf16 => {
+            for c in bytes.chunks_exact(2) {
+                let b = u16::from_le_bytes([c[0], c[1]]);
+                host.push(f32::from_bits((b as u32) << 16));
+            }
+        }
+        T::F16 => {
+            let mut row = vec![0f32; k];
+            for r in 0..n {
+                let s = r * k * 2;
+                crate::kquant::dequant_row_into(T::F16, &bytes[s..s + k * 2], &mut row);
+                host.extend_from_slice(&row);
+            }
+        }
+        other => bail!("f32 常駐: 未対応の元型 {other:?}"),
+    }
+    if host.len() != k * n {
+        bail!("f32 常駐: 展開後の要素数 {} が k*n = {} と違う", host.len(), k * n);
     }
     let buf = match DevBuffer::from_slice_tagged(&host, crate::mem_audit::TAG_ROUTER) {
         Ok(b) => b,
@@ -15529,18 +15576,24 @@ pub fn maybe_gpu_f32_gemm_batch_into(
     xs: &[f32],
     nt: usize,
     out: &mut [f32],
+    src_ty: crate::kquant::GgmlType,
 ) -> bool {
     #[cfg(test)]
     F32_GEMM_BATCH_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !cuda_enabled() {
         return false;
     }
+    let bpp = match src_ty {
+        crate::kquant::GgmlType::F32 => 4usize,
+        crate::kquant::GgmlType::Bf16 | crate::kquant::GgmlType::F16 => 2,
+        _ => return false,
+    };
     if k == 0
         || n == 0
         || nt < 2
         || xs.len() != nt * k
         || out.len() != nt * n
-        || bytes.len() != k.saturating_mul(n).saturating_mul(4)
+        || bytes.len() != k.saturating_mul(n).saturating_mul(bpp)
         || k > i32::MAX as usize
         || n > i32::MAX as usize
         || nt > i32::MAX as usize
@@ -15556,7 +15609,7 @@ pub fn maybe_gpu_f32_gemm_batch_into(
     let Some(f) = gemm_f32_mt_fn(ctx) else {
         return false;
     };
-    let w = match weights_for_f32(uid, bytes, k, n) {
+    let w = match weights_for_gemm_f32(uid, bytes, k, n, src_ty) {
         Ok(w) => w,
         Err(_) => return false,
     };

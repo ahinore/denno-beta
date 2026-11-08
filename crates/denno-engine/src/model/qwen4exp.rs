@@ -4855,7 +4855,17 @@ fn ple_inject_batch(
     // `dno_gemm_f32_mt` のバッチ GEMM に載せる (`DENNO_PF_PLE_F32_GPU`)。
     // 片方でも GPU に載らなければ両方 CPU で回し直す (混在させない)。
     if !ple_dev && pf_ple_f32_gpu_on() && nt >= PF_PLE_F32_GPU_MIN_TOK {
-        let f32_ok = matches!(pw.key.ty(), GgmlType::F32) && matches!(pw.value.ty(), GgmlType::F32);
+        // 実ファイルの型は F32 か BF16 (目録は Q8_0)。BF16 は f32 に開いてから
+        // 同じカーネルに載せる (VRAM は f32 で 2 倍になるが 105 MB 程度)。
+        let f32_ok = matches!(pw.key.ty(), GgmlType::F32 | GgmlType::Bf16 | GgmlType::F16)
+            && matches!(pw.value.ty(), GgmlType::F32 | GgmlType::Bf16 | GgmlType::F16);
+        PF182_LOG_PLE_TY.call_once(|| {
+            eprintln!(
+                "[pf182] ple key ty={:?} value ty={:?} (f32_ok={f32_ok})",
+                pw.key.ty(),
+                pw.value.ty()
+            )
+        });
         if f32_ok {
             let k_ok = crate::cuda::maybe_gpu_f32_gemm_batch_into(
                 pw.key.uid(),
@@ -4865,6 +4875,7 @@ fn ple_inject_batch(
                 &flat,
                 nt,
                 &mut key,
+                pw.key.ty(),
             );
             let v_ok = crate::cuda::maybe_gpu_f32_gemm_batch_into(
                 pw.value.uid(),
@@ -4874,6 +4885,7 @@ fn ple_inject_batch(
                 &flat,
                 nt,
                 &mut value,
+                pw.value.ty(),
             );
             ple_dev = k_ok && v_ok;
             if ple_dev {
@@ -10357,6 +10369,7 @@ pub(crate) fn pf182_from_value(v: Option<&str>) -> bool {
 /// (分岐が発火した証拠。off のときは何も出ない)。
 static PF182_LOG_ROUTER: std::sync::Once = std::sync::Once::new();
 static PF182_LOG_PLE_F32: std::sync::Once = std::sync::Once::new();
+static PF182_LOG_PLE_TY: std::sync::Once = std::sync::Once::new();
 
 /// テストが env を立てずに 2 本のゲートを強制するための上書き
 /// (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
@@ -12121,6 +12134,7 @@ fn moe_ffn_quant_batch_full(
             xs,
             nt,
             &mut probs,
+            GgmlType::F32,
         );
     #[cfg(not(feature = "cuda"))]
     let gpu_router = false;
@@ -13339,6 +13353,17 @@ mod tests {
             ple_head_vocab_sizes: Vec::new(),
             n_vocab: 8,
         }
+    }
+
+    /// 決定的な BF16 の重み (実モデルの ple_key / ple_value の候補型)。
+    fn bf16_linear(k: usize, n: usize, seed: f32) -> GgufLinear {
+        let mut v = Vec::with_capacity(k * n * 2);
+        for i in 0..k * n {
+            let x = seed + (i % 17) as f32 * 0.01;
+            v.extend_from_slice(&((x.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        GgufLinear::new(GgmlType::Bf16, k, n, WeightBlocks::from_vec(v))
+            .expect("GgufLinear::new (BF16)")
     }
 
     /// 決定的な f32 の重み (F32 の GgufLinear)。
@@ -16265,6 +16290,46 @@ mod tests {
                     a.data[i].to_bits(),
                     b.data[i].to_bits(),
                     "トークン {t} 要素 {i}: off={} on={}",
+                    a.data[i],
+                    b.data[i]
+                );
+            }
+        }
+
+        // 3. 実ファイルの型が BF16 でも配線が同じように生きること。
+        let pw16 = PleW {
+            key: bf16_linear(e, hc_dim, 0.1),
+            value: bf16_linear(e, e, 0.2),
+            norm_key: vec![1.0; hc_dim],
+            norm_query: vec![1.0; hc_dim],
+            norm_conv: vec![1.0; hc_dim],
+            conv1d: vec![0.25; 2 * hc_dim],
+            kern: 2,
+        };
+        set_pf182_for_test(PF182_GATE_PLE_F32, Some(false));
+        let mut r16_off = mk_res(&p);
+        let mut hist2b = vec![0.0f32; hc_dim];
+        crate::cuda::f32_gemm_batch_attempts_reset();
+        ple_inject_batch(&p, &pw16, &rows, &mut r16_off, &hp, &mut hist2b, None)
+            .expect("ple bf16 off");
+        assert_eq!(crate::cuda::f32_gemm_batch_attempts(), 0);
+        set_pf182_for_test(PF182_GATE_PLE_F32, Some(true));
+        let mut r16_on = mk_res(&p);
+        let mut hist3 = vec![0.0f32; hc_dim];
+        crate::cuda::f32_gemm_batch_attempts_reset();
+        ple_inject_batch(&p, &pw16, &rows, &mut r16_on, &hp, &mut hist3, None)
+            .expect("ple bf16 on");
+        assert_eq!(
+            crate::cuda::f32_gemm_batch_attempts(),
+            2,
+            "BF16 の PLE で GPU 入口が key/value の 2 回でない"
+        );
+        for (t, (a, b)) in r16_off.iter().zip(r16_on.iter()).enumerate() {
+            for i in 0..a.data.len() {
+                assert_eq!(
+                    a.data[i].to_bits(),
+                    b.data[i].to_bits(),
+                    "BF16 トークン {t} 要素 {i}: off={} on={}",
                     a.data[i],
                     b.data[i]
                 );
