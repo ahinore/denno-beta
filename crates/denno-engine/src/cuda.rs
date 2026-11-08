@@ -86,6 +86,8 @@ type FnCuMemcpyDtoDAsyncV2 =
 type FnCuMemcpyDtoD = unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult;
 type FnCuDeviceGetAttribute = unsafe extern "C" fn(*mut c_int, c_int, CUdevice) -> CUresult;
 type FnCuFuncSetAttribute = unsafe extern "C" fn(CUfunction, c_int, c_int) -> CUresult;
+// task 174: 診断 (DENNO_LAUNCH_DBG) で起動したカーネル名を出すための任意シンボル。
+type FnCuFuncGetName = unsafe extern "C" fn(*mut *const c_char, CUfunction) -> CUresult;
 // s167 (P6): h2 の D2H を専用コピーストリームへ載せるための driver API。
 // すべて Option で持つ — 古い driver で dlsym に失敗しても全体を落とさず、
 // 呼び出し側が従来の同期 D2H へフォールバックする (fail closed)。
@@ -143,6 +145,8 @@ struct CudaLib {
     // するが、dlsym 失敗でも全体を落とさないよう Option (無ければ 48KB 既定のまま)。
     device_get_attribute: Option<FnCuDeviceGetAttribute>,
     func_set_attribute: Option<FnCuFuncSetAttribute>,
+    // task 174: 診断専用 (DENNO_LAUNCH_DBG)。無ければアドレスで代用する。
+    func_get_name: Option<FnCuFuncGetName>,
     // s167 (P6): 専用コピーストリーム (h2 の D2H を qkv/z GEMM と重ねる)。
     stream_create: Option<FnCuStreamCreate>,
     stream_destroy: Option<FnCuStreamDestroy>,
@@ -498,6 +502,8 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuDeviceGetAttribute>(p) }),
         func_set_attribute: sym_opt(handle, "cuFuncSetAttribute")
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuFuncSetAttribute>(p) }),
+        func_get_name: sym_opt(handle, "cuFuncGetName")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuFuncGetName>(p) }),
         stream_create: sym_opt(handle, "cuStreamCreate")
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuStreamCreate>(p) }),
         // driver は v2 名で公開する (CUDA 3.2 以降)。無ければ無印を試す。
@@ -669,6 +675,91 @@ fn check(res: CUresult, what: &str) -> Result<()> {
     Ok(())
 }
 
+// ---- task 174: DENNO_LAUNCH_DBG (診断専用・既定 off) ------------------------
+//
+// decode で `cuCtxSynchronize` が error 700 (illegal address) を返す位置を
+// カーネル名で特定するための観測だけの仕掛け。on のときは**デバイス操作の
+// たびに**名前を輪へ積んでから同期し、最初に失敗した操作の名前と直前の履歴を
+// stderr に出す。数値・経路・起動形状は変えない (off は `on()` の分岐 1 回)。
+mod launch_dbg {
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::atomic::AtomicU64;
+
+    /// 輪に残す操作数 (失敗時に直近 24 件を出す)。
+    const RING: usize = 64;
+
+    /// `DENNO_LAUNCH_DBG=1` のときだけ有効。
+    pub(super) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            matches!(
+                std::env::var("DENNO_LAUNCH_DBG").ok().as_deref().map(str::trim),
+                Some("1")
+            )
+        })
+    }
+
+    thread_local! {
+        static RING_BUF: RefCell<Vec<(u64, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// 操作 1 件を輪へ積む (off は None)。ラベルは on のときだけ組み立てる。
+    #[inline]
+    pub(super) fn note(label: impl FnOnce() -> String) -> Option<u64> {
+        if !on() {
+            return None;
+        }
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let l = label();
+        RING_BUF.with(|b| {
+            let mut b = b.borrow_mut();
+            if b.len() >= RING {
+                b.remove(0);
+            }
+            b.push((seq, l));
+        });
+        Some(seq)
+    }
+
+    /// 直前の操作を同期し、失敗したら履歴を出して Err を返す (off は何もしない)。
+    pub(super) fn sync(seq: Option<u64>) -> Result<()> {
+        let Some(seq) = seq else {
+            return Ok(());
+        };
+        let lib = lib()?;
+        let res = unsafe { (lib.ctx_sync)() };
+        if res == CUDA_SUCCESS {
+            return Ok(());
+        }
+        let hist = RING_BUF.with(|b| b.borrow().clone());
+        eprintln!("[launch-dbg] cuCtxSynchronize が error {res} (最後の操作 seq={seq})");
+        eprintln!("[launch-dbg] 直前のデバイス操作 (古い順):");
+        let start = hist.len().saturating_sub(24);
+        for (s, l) in &hist[start..] {
+            eprintln!("[launch-dbg]   seq={s} {l}");
+        }
+        bail!("CUDA cuCtxSynchronize が失敗: error {res} (launch-dbg: seq={seq})")
+    }
+
+    /// カーネル名 (`cuFuncGetName`。取れなければアドレスで代用)。
+    pub(super) fn fn_name(f: CUfunction) -> String {
+        if let Ok(lib) = lib() {
+            if let Some(get) = lib.func_get_name {
+                let mut p: *const c_char = std::ptr::null();
+                if unsafe { get(&mut p, f) } == CUDA_SUCCESS && !p.is_null() {
+                    return unsafe { std::ffi::CStr::from_ptr(p) }
+                        .to_string_lossy()
+                        .into_owned();
+                }
+            }
+        }
+        format!("fn@{:x}", f as usize)
+    }
+}
+
 /// デバイスメモリバッファ (RAII: drop で cuMemFree)
 pub struct DevBuffer {
     ptr: CUdeviceptr,
@@ -692,6 +783,7 @@ impl DevBuffer {
         match Self::raw_alloc(bytes) {
             Ok(ptr) => {
                 crate::mem_audit::note_alloc(tag, bytes.max(1));
+                let _ = launch_dbg::note(|| format!("A tag={tag} bytes={bytes} ptr={ptr:#x}"));
                 Ok(Self {
                     ptr,
                     bytes,
@@ -919,6 +1011,7 @@ impl DevBuffer {
     pub fn copy_from<T: Copy>(&self, data: &[T]) -> Result<()> {
         let bytes = std::mem::size_of_val(data);
         assert!(bytes <= self.bytes, "DevBuffer::copy_from: size overflow");
+        let dbg = launch_dbg::note(|| format!("H2D ptr={:#x} bytes={bytes}", self.ptr));
         if bytes > 0 {
             unsafe {
                 check(
@@ -927,6 +1020,7 @@ impl DevBuffer {
                 )?;
             }
         }
+        launch_dbg::sync(dbg)?;
         Ok(())
     }
 
@@ -937,6 +1031,9 @@ impl DevBuffer {
             offset_bytes + bytes <= self.bytes,
             "DevBuffer::copy_from_at: size overflow"
         );
+        let dbg = launch_dbg::note(|| {
+            format!("H2D@ ptr={:#x}+{offset_bytes} bytes={bytes}", self.ptr)
+        });
         if bytes > 0 {
             unsafe {
                 check(
@@ -949,6 +1046,7 @@ impl DevBuffer {
                 )?;
             }
         }
+        launch_dbg::sync(dbg)?;
         Ok(())
     }
 
@@ -959,6 +1057,9 @@ impl DevBuffer {
     pub fn copy_from_dev(&self, src: CUdeviceptr, len: usize) -> Result<()> {
         let bytes = len * std::mem::size_of::<f32>();
         assert!(bytes <= self.bytes, "DevBuffer::copy_from_dev: size overflow");
+        let dbg = launch_dbg::note(|| {
+            format!("D2D dst={:#x} src={src:#x} bytes={bytes}", self.ptr)
+        });
         if bytes > 0 {
             unsafe {
                 check(
@@ -967,6 +1068,7 @@ impl DevBuffer {
                 )?;
             }
         }
+        launch_dbg::sync(dbg)?;
         Ok(())
     }
 
@@ -984,6 +1086,7 @@ impl Drop for DevBuffer {
     fn drop(&mut self) {
         // s165: ビュー (owned=false) は他バッファの一部なので解放しない
         if self.owned && self.ptr != 0 {
+            let _ = launch_dbg::note(|| format!("F ptr={:#x} bytes={}", self.ptr, self.bytes));
             unsafe {
                 let _ = (lib().unwrap().mem_free)(self.ptr);
             }
@@ -1652,6 +1755,20 @@ impl CudaCtx {
         let lib = lib()?;
         // s166 (P5): decode 1 ステップの launch 件数 (DENNO_DECODE_DBG=1・既定 OFF)
         dbg_launch(f);
+        // task 174: 診断 (DENNO_LAUNCH_DBG) の輪へ積む (off は None)。
+        let dbg_seq = launch_dbg::note(|| {
+            format!(
+                "K {} grid=({},{},{}) block=({},{},{}) shmem={}",
+                launch_dbg::fn_name(f),
+                grid.0,
+                grid.1,
+                grid.2,
+                block.0,
+                block.1,
+                block.2,
+                shmem
+            )
+        });
         // task 138: 台帳 (DENNO_Q4_PROFILE) への発行 1 件の計上。off は stamp が None。
         let tl = crate::model::q4ledger::stamp();
         // task 153: イベント時系列 (DENNO_Q4_TLINE + _K)。off は None で分岐 1 回。
@@ -1676,7 +1793,10 @@ impl CudaCtx {
             tline::launch_end(crate::model::q4ledger::current(), a);
         }
         crate::model::q4ledger::note_launch(tl);
-        r
+        // task 174: 診断時だけ起動ごとに同期して、最初に落ちたカーネルを名指しする。
+        r?;
+        launch_dbg::sync(dbg_seq)?;
+        Ok(())
     }
 
     /// デフォルトストリームの同期 (エンキュー済み全操作の完了待ち)
@@ -18394,6 +18514,34 @@ fn q4_attn_mirror_sync(
             bytes,
             crate::mem_audit::TAG_ATTN_MIRROR,
         )?);
+        // task 174: 片方でも作り直したら、その層は中身を失っている。台帳を
+        // 0 にして次の `have` で全行 H2D させる (古い行数を信じない)。
+        m.state.len[layer] = 0;
+    }
+    // task 174: カーネルへ渡す行数が実バッファに収まっていることを毎回確かめる
+    // (OOB 読みを「illegal address」ではなく明示エラーにする)。確保は
+    // grow-only なので普段は 1 回の比較で終わる。
+    if len > m.state.cap {
+        bail!(
+            "q4 attn mirror: len {len} が cap {} を超えた (層 {layer}, kv_dim {kv_dim})",
+            m.state.cap
+        );
+    }
+    let need_bytes = len
+        .checked_mul(kv_dim)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or_else(|| anyhow!("q4 attn mirror: len*kv_dim が溢れた ({len} x {kv_dim})"))?;
+    for (slot_name, slot) in [("k", &m.k[layer]), ("v", &m.v[layer])] {
+        match slot.as_ref() {
+            Some(b) if b.bytes() >= need_bytes => {}
+            Some(b) => bail!(
+                "q4 attn mirror: {slot_name} のバッファ {} B < 必要 {need_bytes} B \
+                 (層 {layer}, len {len}, cap {})",
+                b.bytes(),
+                m.state.cap
+            ),
+            None => bail!("q4 attn mirror: {slot_name} のバッファが無い (層 {layer})"),
+        }
     }
     let have = q4_mirror_have(&m.state, layer, len, gen);
     if have < len {
@@ -22134,6 +22282,83 @@ mod q4_attn_tests {
         // cap は t_total で倍々に育つ (prefill でも同じ規則)。
         assert_eq!(q4_mirror_cap(1024, 0), 1024);
         assert_eq!(q4_mirror_cap(1025, 1024), 2048);
+    }
+
+    /// task 174: 容量の段 (4,096 -> 8,192 -> 16,384) をまたぐ長さで、
+    /// (a) cap が必ず len 以上、(b) 成長しても**既に送った行数を捨てない**
+    /// (D2D で温存する行数 = keep)、(c) 追記ぶん [have, len) が連続している、
+    /// (d) flash decoding の分割と部分和バッファが len に収まる、を固定する。
+    ///
+    /// lab t173a / t172a の decode は 4,096 を超えた直後 (len=4,097) ではなく
+    /// **n_split が 63 -> 64 になる len=4,033** で error 700 を出したので、
+    /// 分割の側も同じ長さで見る。
+    #[test]
+    fn q4_mirror_growth_across_capacity_steps_keeps_rows() {
+        let (heads, n_kv, dh) = (24usize, 2usize, 256usize);
+        let kv_dim = n_kv * dh;
+        // 4,096 段の手前 / ちょうど / 直後、次の段、最終段。
+        let lens = [4095usize, 4096, 4097, 8192, 16384];
+        let mut st = Q4MirrorState {
+            cap: 0,
+            len: vec![0; 2],
+            gen: vec![0; 2],
+        };
+        let mut prev_len = 0usize;
+        for &len in &lens {
+            let old_cap = st.cap;
+            let new_cap = q4_mirror_cap(len, old_cap);
+            assert!(new_cap >= len, "cap {new_cap} < len {len}");
+            assert!(new_cap.is_power_of_two(), "cap {new_cap} が 2 の冪でない");
+            assert!(new_cap >= 1024, "cap {new_cap} が下限 1,024 未満");
+            // 成長時の D2D で温存する行数 (q4_attn_grow の keep と同じ式)。
+            let keep = st.len[0].min(new_cap);
+            assert_eq!(
+                keep, st.len[0],
+                "成長で送信済みの行が落ちる (len={len}, cap {old_cap} -> {new_cap})"
+            );
+            st.cap = new_cap;
+            // この長さまでは全行がデバイスにある、という台帳にする。
+            let have = q4_mirror_have(&st, 0, len, 0);
+            assert_eq!(have, prev_len.min(len), "have が前回の行数と違う (len={len})");
+            assert!(have <= len);
+            // 実際に H2D する範囲は [have, len) で、必ずバッファ内に収まる。
+            let end = len;
+            assert!(end * kv_dim * 4 <= st.cap * kv_dim * 4, "len={len} がバッファ外");
+            q4_mirror_note(&mut st, 0, len, 0);
+            assert_eq!(q4_mirror_have(&st, 0, len, 0), len);
+            assert_eq!(q4_mirror_have(&st, 0, len + 1, 0), len, "次トークンは追記 1 行");
+            prev_len = len;
+        }
+        // 段をまたいだ直後 (4,096 -> 4,097) でも全行を送り直さない。
+        let mut st2 = Q4MirrorState {
+            cap: 4096,
+            len: vec![4096; 1],
+            gen: vec![0; 1],
+        };
+        let cap2 = q4_mirror_cap(4097, st2.cap);
+        assert_eq!(cap2, 8192, "4,097 で 8,192 段へ上がる");
+        assert_eq!(q4_mirror_have(&st2, 0, 4097, 0), 4096, "4,096 行を温存する");
+        st2.cap = cap2;
+        // 使っていない層 (ssm) は 0 のまま = 確保もしない。
+        assert_eq!(q4_mirror_have(&st2, 1, 4097, 0), 0);
+
+        // flash decoding の分割と部分和バッファ: どの長さでも
+        // 最後の part 添字が heads * n_split * (dh + 2) - 1 に収まる。
+        for &len in &[1usize, 4032, 4033, 4095, 4096, 4097, 8192, 16384] {
+            let (n_split, chunk) = q4_fdec_split(len, ATTN_FLASHDEC_CHUNK_DEFAULT);
+            assert!(n_split >= 1 && n_split <= ATTN_FDEC_SPLIT_MAX);
+            assert_eq!(chunk, len.div_ceil(n_split), "chunk がカーネル式と違う");
+            assert!(n_split * chunk >= len, "区間が足りない (len={len})");
+            // カーネルの書き込み位置 (kh, sp, hh) の最大値。
+            let entries = heads * n_split;
+            let last = (entries - 1) * (dh + ATTN_FDEC_PART_EXTRA) + dh + ATTN_FDEC_PART_EXTRA - 1;
+            let part_floats = heads * n_split * (dh + ATTN_FDEC_PART_EXTRA);
+            assert_eq!(last, part_floats - 1, "part の末尾が 1 要素ずれる (len={len})");
+        }
+        // n_split が 64 に上がる境目 (lab の crash 点) の分割。
+        assert_eq!(q4_fdec_split(4032, 64), (63, 64));
+        assert_eq!(q4_fdec_split(4033, 64), (64, 64));
+        assert_eq!(q4_fdec_split(4097, 64), (65, 64));
     }
 
     /// GPU が要る実機テスト (task 134)。prefill の 1 チャンクを CPU 参照と
