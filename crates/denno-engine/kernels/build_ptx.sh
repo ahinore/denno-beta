@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 gemm_sn)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -85,6 +85,13 @@ spec() {
         # BN=64 タイル。tc2 と同じ bf16 wmma なので arch も同じ compute_90。
         # 数値契約は無し (prefill の射影はビット一致契約の外)。
         gemm_sn)      echo "kernels_gemm_sn.cu|fmad|compute_90" ;;
+        # task 183: 同じ BN=64 タイルで 1 ブロック 64 トークンにした版
+        # (shared expert の 40 ブロック → 80 ブロック)。数値は sn と同じ
+        # (k 昇順のアキュムレート) で、タイルの切り方だけが違う。
+        gemm_sn2)     echo "kernels_gemm_sn2.cu|fmad|compute_90" ;;
+        # task 183: 融合 qkv 1 本の GEMM の後処理 (出力ゲートと行の gather)。
+        # CPU 参照と 1 演算 1 丸めを合わせるため -fmad=false (明示 __*_rn のみ)。
+        pf3)          echo "kernels_pf3.cu|nofmad" ;;
         *)            return 1 ;;
     esac
 }
