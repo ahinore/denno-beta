@@ -4876,6 +4876,11 @@ fn ple_inject_batch(
                 &mut value,
             );
             ple_dev = k_ok && v_ok;
+            if ple_dev {
+                PF182_LOG_PLE_F32.call_once(|| {
+                    eprintln!("[pf182] PLE key/value: GPU f32 GEMM (DENNO_PF_PLE_F32_GPU)")
+                });
+            }
         }
     }
     if !ple_dev {
@@ -10334,16 +10339,24 @@ pub(crate) fn pf_ple_gpu_on() -> bool {
 // したときだけ効かせ、採否が決まるまで本番の既定挙動を変えない)。
 
 /// task 182: `DENNO_PF_ROUTER_GPU` / `DENNO_PF_PLE_F32_GPU` の解釈 (純関数)。
-/// 明示的な真値 (`1` / `on` / `true` / `yes`) だけ on。
-pub(crate) fn pf_opt_in_from_value(v: Option<&str>) -> bool {
+///
+/// task 182 の lab t182b (combo vs off) が cold prefill 3,826 tok -8.5%、
+/// 14,018 tok -9.3%、decode と 19 トークン next turn は ±2% 以内 (10 ms の差)、
+/// errors 0・text sane だったので **既定 on**。明示的な偽値だけ off。
+pub(crate) fn pf182_from_value(v: Option<&str>) -> bool {
     match v {
-        Some(s) => matches!(
+        Some(s) => !matches!(
             s.trim().to_ascii_lowercase().as_str(),
-            "1" | "on" | "true" | "yes"
+            "0" | "off" | "false" | "no" | ""
         ),
-        None => false,
+        None => true,
     }
 }
+
+/// task 182: 実際に GPU で回ったことを lab のログに 1 回だけ出す
+/// (分岐が発火した証拠。off のときは何も出ない)。
+static PF182_LOG_ROUTER: std::sync::Once = std::sync::Once::new();
+static PF182_LOG_PLE_F32: std::sync::Once = std::sync::Once::new();
 
 /// テストが env を立てずに 2 本のゲートを強制するための上書き
 /// (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
@@ -10377,25 +10390,25 @@ pub(crate) fn set_pf182_for_test(which: usize, v: Option<bool>) {
 }
 
 /// task 182: prefill の router (`ffn_gate_inp`、F32) を GPU の f32 GEMM で
-/// 回すか (`DENNO_PF_ROUTER_GPU`、既定 off)。
+/// 回すか (`DENNO_PF_ROUTER_GPU`、**既定 on**。`=0` で CPU バッチに戻る)。
+///
+/// lab t182a (3,826 tok): router 1,334 -> 380 ms、prefill -8.0%。
 pub(crate) fn pf_router_gpu_on() -> bool {
     if let Some(v) = pf182_forced(PF182_GATE_ROUTER) {
         return v;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| pf_opt_in_from_value(std::env::var("DENNO_PF_ROUTER_GPU").ok().as_deref()))
+    *ON.get_or_init(|| pf182_from_value(std::env::var("DENNO_PF_ROUTER_GPU").ok().as_deref()))
 }
 
 /// task 182: PLE の key / value 射影 (F32 重み) を GPU の f32 GEMM で回すか
-/// (`DENNO_PF_PLE_F32_GPU`、既定 off)。
+/// (`DENNO_PF_PLE_F32_GPU`、**既定 on**。`=0` で CPU バッチに戻る)。
 pub(crate) fn pf_ple_f32_gpu_on() -> bool {
     if let Some(v) = pf182_forced(PF182_GATE_PLE_F32) {
         return v;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        pf_opt_in_from_value(std::env::var("DENNO_PF_PLE_F32_GPU").ok().as_deref())
-    })
+    *ON.get_or_init(|| pf182_from_value(std::env::var("DENNO_PF_PLE_F32_GPU").ok().as_deref()))
 }
 
 /// task 182: router を GPU に載せる最小トークン数 (これ未満は CPU バッチ)。
@@ -12111,6 +12124,11 @@ fn moe_ffn_quant_batch_full(
         );
     #[cfg(not(feature = "cuda"))]
     let gpu_router = false;
+    if gpu_router {
+        PF182_LOG_ROUTER.call_once(|| {
+            eprintln!("[pf182] prefill router: GPU f32 GEMM (DENNO_PF_ROUTER_GPU)")
+        });
+    }
     if !gpu_router {
         gemv_batch(&lw.gate_inp, xs, nt, &mut probs)
             .map_err(|err| one(format!("層 {}: ffn_gate_inp (batch): {err}", lw.il)))?;
@@ -16034,23 +16052,15 @@ mod tests {
     }
 
     /// task 182: `DENNO_PF_ROUTER_GPU` / `DENNO_PF_PLE_F32_GPU` の解釈。
-    /// 未設定は off (task 181 以降の `pf_on_from_value` とは規約が違う)。
+    /// lab t182b で combo が目標を満たしたので **未設定は on**、明示的な偽値だけ off。
     #[test]
-    fn pf182_gates_are_opt_in() {
-        for v in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("off"),
-            Some("false"),
-            Some("no"),
-            Some(" 0 "),
-            Some("OFF"),
-        ] {
-            assert!(!pf_opt_in_from_value(v), "{v:?} が on になった");
+    fn pf182_gates_default_on() {
+        assert!(pf182_from_value(None), "未設定が off になった (lab t182b で既定 on)");
+        for v in ["0", "off", "false", "no", "", " 0 ", "OFF"] {
+            assert!(!pf182_from_value(Some(v)), "{v:?} が on になった");
         }
         for v in ["1", "on", "true", "yes", " ON ", "Yes"] {
-            assert!(pf_opt_in_from_value(Some(v)), "{v:?} が off になった");
+            assert!(pf182_from_value(Some(v)), "{v:?} が off になった");
         }
     }
 
