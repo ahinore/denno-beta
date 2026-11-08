@@ -10336,11 +10336,11 @@ pub(crate) fn pf_full_dev_on() -> bool {
     *ON.get_or_init(|| pf_full_dev_from_value(std::env::var("DENNO_PF_FULL_DEV").ok().as_deref()))
 }
 
-/// task 183: `DENNO_PF_FULL_FUSED` の解釈 (純関数)。明示的な真値だけ on。
+/// task 183: `DENNO_PF_FULL_FUSED` の解釈 (純関数)。明示的な偽値だけ off。
 pub(crate) fn pf_full_fused_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
-        None => false,
+        None => true,
     }
 }
 
@@ -10351,6 +10351,12 @@ pub(crate) fn pf_full_fused_from_value(v: Option<&str>) -> bool {
 /// (br172 の `DENNO_PF_FULL_DEV` と同じ連鎖。融合していない層も連鎖に載る)。
 /// 融合層は q|gate|k|v を 1 本のまま撃ち、q/k/v を行オフセットで読むので、
 /// 射影出力 (12 層で 8.96 GB) の D2H が消える。
+///
+/// **既定 on** (lab t183a で採用)。lab t183a (depth8k) の実測:
+/// cold prefill 3,826 tok 14.65 → 13.81 s (-6.0%)、14,018 tok 51.58 → 46.64 s
+/// (-9.6%)、decode は全点 ±0%、errors 0、text sane。台帳の full は
+/// wall 6,944 → 3,609 ms、cpu 2,933 → 316 ms、d2h 10.68 GB → 2.41 GB
+/// (h2d 7.7 → 1.8 GB)。md5 は射影の丸めで変わる (契約外)。
 pub(crate) fn pf_full_fused_on() -> bool {
     #[cfg(test)]
     {
@@ -16945,11 +16951,11 @@ mod tests {
             }
         }
 
-        /// task 183: `DENNO_PF_FULL_FUSED` は**既定 off** (明示的な真値だけ on)。
-        /// 融合 qkv を 1 回の GEMM で撃つ経路の切り戻しゲート。
+        /// task 183: `DENNO_PF_FULL_FUSED` は lab t183a で**既定 on**にした。
+        /// 融合 qkv を 1 回の GEMM で撃つ経路の切り戻しゲート (`0` で切る)。
         #[test]
-        fn pf_full_fused_gate_default_off() {
-            assert!(!pf_full_fused_from_value(None), "未設定は off");
+        fn pf_full_fused_gate_default_on() {
+            assert!(pf_full_fused_from_value(None), "未設定は on (lab t183a で採用)");
             for v in ["0", "off", "false", "no", "", " 0 ", "OFF"] {
                 assert!(!pf_full_fused_from_value(Some(v)), "{v:?} が on になった");
             }

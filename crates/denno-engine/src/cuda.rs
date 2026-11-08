@@ -15126,17 +15126,20 @@ const TC_SN2_MAX_TOKENS: usize = 2048;
 const _: [(); TC_SN2_SMEM_BYTES] =
     [(); 2 * TC_SN2_BN * TC_SN2_LD * 2 + 2 * TC_SN2_BM * TC_SN2_LD * 2];
 
-/// `DENNO_PF_TC_SHARED2` の値の解釈 (純関数)。明示的な真値だけ on。
+/// `DENNO_PF_TC_SHARED2` の値の解釈 (純関数)。明示的な偽値だけ off。
 ///
-/// **既定 off** (lab の結果で採否を決める)。off のときは sn (BM=128) のまま。
+/// **既定 on** (lab t183a で採用)。off のときは sn (BM=128) のまま。
+/// lab t183a (depth8k、14,018 トークン) の実測: sn2 単独で shared の gpu が
+/// 1,201.0 → 1,143.5 ms (-4.8%)、cold prefill 51.58 → 50.11 s、**md5 は base と
+/// 完全一致** (sn と同じ k 昇順のアキュムレートなので値が変わらない)。
 pub(crate) fn pf_tc_shared2_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
-        None => false,
+        None => true,
     }
 }
 
-/// shared expert の射影を BM=64 のカーネルで回すか (**既定 off**)。
+/// shared expert の射影を BM=64 のカーネルで回すか (**既定 on**。`0` で切る)。
 pub(crate) fn pf_tc_shared2_on() -> bool {
     #[cfg(test)]
     {
@@ -15884,7 +15887,7 @@ mod pf_tc_tests {
     /// task 183: `DENNO_PF_TC_SHARED2` の真理値表 (既定 off。明示的な真値だけ on)。
     #[test]
     fn pf_tc_shared2_gate_truth_table() {
-        assert!(!pf_tc_shared2_from_value(None), "未設定は既定 off");
+        assert!(pf_tc_shared2_from_value(None), "未設定は既定 on (lab t183a で採用)");
         for v in ["0", "off", "false", "no", "", " OFF "] {
             assert!(!pf_tc_shared2_from_value(Some(v)), "{v}");
         }
