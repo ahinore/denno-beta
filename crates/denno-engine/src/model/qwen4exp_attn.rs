@@ -1877,7 +1877,7 @@ impl FullAttn {
         let parts = l.qkv.parts();
         let qd = l.q_dim();
         let kv = l.kv_dim();
-        if parts[0].n() != qd || parts[1].n() != kv || parts[2].n() != kv {
+        if parts[0].n() != 2 * qd || parts[1].n() != kv || parts[2].n() != kv {
             crate::cuda::pf2_decline(1);
             return Ok(None);
         }

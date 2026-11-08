@@ -15094,7 +15094,29 @@ pub fn pf2_stats_reset() {
 
 #[inline]
 fn pf2_note(idx: usize) {
-    PF2_STATS[idx].fetch_add(1, Ordering::Relaxed);
+    let n = PF2_STATS[idx].fetch_add(1, Ordering::Relaxed);
+    // 成立した stage は最初の 1 回だけ 1 行出す (lab のログで発火を確認するため)。
+    if idx % 2 == 0 && n == 0 {
+        eprintln!(
+            "[pf2] {} 連鎖 発火 (nt={})",
+            ["full", "full", "shared", "shared", "ple", "ple"][idx.min(5)],
+            pf2_last_nt()
+        );
+    }
+}
+
+thread_local! {
+    /// 直前の連鎖呼び出しの行数 (ログ用)。
+    static PF2_LAST_NT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn pf2_last_nt() -> usize {
+    PF2_LAST_NT.with(|c| c.get())
+}
+
+/// ログ用に行数を控える (`pf_full_qkv` / `pf_shared` / `pf_ple_proj` の入口)。
+fn pf2_set_nt(nt: usize) {
+    PF2_LAST_NT.with(|c| c.set(nt));
 }
 
 /// 呼び出し側 (モデル層) の入口で断念したことを数える。
@@ -15336,6 +15358,7 @@ pub fn pf_full_qkv(
     k_out: &mut [f32],
     v_out: &mut [f32],
 ) -> bool {
+    pf2_set_nt(nt);
     let qd = heads * dh;
     let kv = kv_heads * dh;
     let ok_shape = nt >= PF2_MIN_ROWS
@@ -15518,6 +15541,7 @@ pub fn pf_full_out(
     e: usize,
     out: &mut [f32],
 ) -> bool {
+    pf2_set_nt(nt);
     let qd = heads * dh;
     let ok_shape = nt >= PF2_MIN_ROWS
         && dh >= ATTN_PF_BQ
@@ -15669,6 +15693,7 @@ pub fn pf_shared(
     down: PfLin<'_>,
     out: &mut [f32],
 ) -> bool {
+    pf2_set_nt(nt);
     let ok_shape = nt >= PF2_MIN_ROWS
         && e > 0
         && sff > 0
@@ -15704,16 +15729,19 @@ pub fn pf_shared(
         pf2_ensure(&mut d.ga, nt * sff * 4)?;
         pf2_ensure(&mut d.gu, nt * sff * 4)?;
         pf2_ensure(&mut d.sh, nt * e * 4)?;
+        // swiglu の出力は x の領域へ (gate/up を撃ったあとの x はもう不要。
+        // ga を in-place で上書きすると別名になるので避ける)。
         let xb = d.x.as_ref().expect("ensure 済み");
         let gab = d.ga.as_ref().expect("ensure 済み");
         let gub = d.gu.as_ref().expect("ensure 済み");
         let shb = d.sh.as_ref().expect("ensure 済み");
+        let swb = d.x.as_ref().expect("ensure 済み");
         xb.copy_from(x)?;
         pf2_gemm(ctx, pg, pg_k, xb.ptr(), gab.ptr(), nt, e, sff)?;
         pf2_gemm(ctx, pu, pu_k, xb.ptr(), gub.ptr(), nt, e, sff)?;
-        // swiglu: ga = silu(ga) * gu (elem の既存カーネル。CPU と同じ式)
+        // swiglu: x = silu(ga) * gu (elem の既存カーネル。CPU と同じ式)
         {
-            let (mut gp, mut up_p, mut op) = (gab.ptr(), gub.ptr(), gab.ptr());
+            let (mut gp, mut up_p, mut op) = (gab.ptr(), gub.ptr(), swb.ptr());
             let mut total = (nt * sff) as c_int;
             let grid = ((nt * sff).div_ceil(256)) as u32;
             let mut args = [
@@ -15726,7 +15754,7 @@ pub fn pf_shared(
                 ctx.launch_async(ctx.f_swiglu, (grid, 1, 1), (256, 1, 1), 0, &mut args)?;
             }
         }
-        pf2_gemm(ctx, pd, pd_k, gab.ptr(), shb.ptr(), nt, sff, e)?;
+        pf2_gemm(ctx, pd, pd_k, swb.ptr(), shb.ptr(), nt, sff, e)?;
         ctx.sync()?;
         let got: Vec<f32> = shb.to_vec(nt * e)?;
         out.copy_from_slice(&got);
@@ -15762,6 +15790,7 @@ pub fn pf_ple_proj(
     key_out: &mut [f32],
     value_out: &mut [f32],
 ) -> bool {
+    pf2_set_nt(nt);
     let ok_shape = nt > 0
         && e > 0
         && x.len() == nt * e
@@ -15778,6 +15807,14 @@ pub fn pf_ple_proj(
         return false;
     };
     if ctx.make_current().is_err() {
+        pf2_note(5);
+        return false;
+    }
+    // 量子型 (Q8_0 など) だけを受ける。F32 / BF16 は pf_weight が VRAM に
+    // 載せてしまうので、形の段階で断る (このモデルの ple_key/ple_value は F32)。
+    if !matches!(key.ty, crate::kquant::GgmlType::Q8_0 | crate::kquant::GgmlType::Q5_1 | crate::kquant::GgmlType::Q4K | crate::kquant::GgmlType::Q5K)
+        || !matches!(value.ty, crate::kquant::GgmlType::Q8_0 | crate::kquant::GgmlType::Q5_1 | crate::kquant::GgmlType::Q4K | crate::kquant::GgmlType::Q5K)
+    {
         pf2_note(5);
         return false;
     }
