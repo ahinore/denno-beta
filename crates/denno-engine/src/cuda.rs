@@ -22073,11 +22073,13 @@ mod q4_attn_tests {
         }
 
         /// cap 成長 (D2D で先頭 keep 行を温存)。行数は `q4_mirror_cap` と同じ規則。
+        /// task 174: 確保は実物と同じ cap + 投機読みの余白 (1 行)。
         fn grow(&mut self, new_cap: usize) {
+            let rows = q4_mirror_alloc_rows(new_cap);
             for l in 0..self.k.len() {
                 let keep = self.state.len[l].min(new_cap);
-                let mut nk = vec![f32::NAN; new_cap * self.row];
-                let mut nv = vec![f32::NAN; new_cap * self.row];
+                let mut nk = vec![f32::NAN; rows * self.row];
+                let mut nv = vec![f32::NAN; rows * self.row];
                 nk[..keep * self.row].copy_from_slice(&self.k[l][..keep * self.row]);
                 nv[..keep * self.row].copy_from_slice(&self.v[l][..keep * self.row]);
                 self.k[l] = nk;
@@ -22102,6 +22104,18 @@ mod q4_attn_tests {
             self.v[li][have * row..len * row]
                 .copy_from_slice(&cache.v(li).unwrap()[have * row..len * row]);
             q4_mirror_note(&mut self.state, li, len, gen);
+            // task 174: flashdec が踏む「分割の終端 + 1 行」(= len 行目) が
+            // 確保の内側にあること。実物は cap + 1 行なので常に成り立つ。
+            assert!(
+                (len + ATTN_MIRROR_GUARD_ROWS) * self.row <= self.k[li].len(),
+                "投機読みの {len} 行目が確保の外 (層 {li}, cap {})",
+                self.state.cap
+            );
+            assert!(
+                (len + ATTN_MIRROR_GUARD_ROWS) * self.row <= self.v[li].len(),
+                "投機読みの {len} 行目が確保の外 (層 {li}, cap {})",
+                self.state.cap
+            );
             have
         }
 
@@ -22144,6 +22158,29 @@ mod q4_attn_tests {
         assert_eq!(q4_mirror_cap(65536, 32768), 65536);
         // 縮む必要は無い (grow-only)
         assert_eq!(q4_mirror_cap(10, 1024), 1024);
+    }
+
+    /// task 174: lab の失敗と同じ形 (len = cap = 4,096) を CPU ミラーで通す。
+    /// flashdec は分割の終端の 1 行先 (= t_total 行目) を投機読みするので、
+    /// 確保が cap + 1 行でないとこの長さで確保の外を踏む。SimMirror::sync が
+    /// その行の存在を毎回 assert する。
+    #[test]
+    fn q4_mirror_sync_at_full_capacity_leaves_the_speculative_row_in_bounds() {
+        let (n_layer, row) = (1usize, 4usize);
+        let mut cache = AttnCache::new(n_layer, 2, 2, 8192).unwrap();
+        let mut mir = SimMirror::new(n_layer, row);
+        for i in 0..4096 {
+            push_rows(&mut cache, n_layer, row, i as f32);
+        }
+        assert_eq!(mir.sync(&cache, 0), 0, "初回は全行シード");
+        assert_eq!(mir.state.cap, 4096);
+        assert_eq!(cache.len(0).unwrap(), mir.state.cap, "テスト前提: len = cap ちょうど");
+        mir.assert_matches(&cache, 0, "cap ちょうど");
+        // 4,097 行目で 8,192 段へ伸びる。既存 4,096 行は D2D 温存で送らない。
+        push_rows(&mut cache, n_layer, row, 9999.0);
+        assert_eq!(mir.sync(&cache, 0), 4096, "段の直後は 1 行だけ送る");
+        assert_eq!(mir.state.cap, 8192);
+        mir.assert_matches(&cache, 0, "段の直後");
     }
 
     /// task 133 の本丸: clear / clear_all / truncate_layer のあとで
