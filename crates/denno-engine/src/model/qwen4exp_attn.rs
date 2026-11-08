@@ -510,6 +510,71 @@ pub fn attend_gqa_par_calls() -> usize {
     ATTN_GQA_PAR_CALLS.load(AtomicOrdering::Relaxed)
 }
 
+
+// ---------------------------------------------------------------------------
+// task 172: full attention 1 チャンクをデバイスで閉じるための表
+// ---------------------------------------------------------------------------
+
+/// pos ごとの rope 表 `[nt][n_rot]` (前半 half が cos、後半 half が sin)。
+///
+/// 角度の式は [`rope_neox_partial_tab`] と同じ `pos * theta^(-2j/n_rot)` を
+/// f32 の `powf` / `cos` / `sin` で出す (デバイス側はこの表を引くだけ)。
+/// 形が表引き版の前提外 (`half > ROPE_TAB_MAX` など) は `None`。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn rope_cs_table(nt: usize, base: usize, n_rot: usize, theta: f32) -> Option<Vec<f32>> {
+    let half = n_rot / 2;
+    if nt == 0 || n_rot == 0 || n_rot % 2 != 0 || half > ROPE_TAB_MAX {
+        return None;
+    }
+    let mut out = vec![0f32; nt * n_rot];
+    for t in 0..nt {
+        let posf = (base + t) as f32;
+        for j in 0..half {
+            let ang = posf * theta.powf(-2.0 * j as f32 / n_rot as f32);
+            out[t * n_rot + j] = ang.cos();
+            out[t * n_rot + half + j] = ang.sin();
+        }
+    }
+    Some(out)
+}
+
+thread_local! {
+    /// `(nt, base, n_rot, theta.to_bits())` を鍵にした cos/sin 表の使い回し。
+    /// 12 個の full 層が同じ (base, nt) を回すので、チャンク内は 1 回で済む。
+    static PF_CS_CACHE: std::cell::RefCell<Option<(usize, usize, usize, u32, Vec<f32>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`rope_cs_table`] をチャンク内で使い回す版 (同じ鍵なら clone だけ)。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn rope_cs_cached(nt: usize, base: usize, n_rot: usize, theta: f32) -> Option<Vec<f32>> {
+    let bits = theta.to_bits();
+    PF_CS_CACHE.with(|c| {
+        let mut slot = c.borrow_mut();
+        if let Some((n0, b0, r0, t0, v)) = slot.as_ref() {
+            if *n0 == nt && *b0 == base && *r0 == n_rot && *t0 == bits {
+                return Some(v.clone());
+            }
+        }
+        let v = rope_cs_table(nt, base, n_rot, theta)?;
+        *slot = Some((nt, base, n_rot, bits, v.clone()));
+        Some(v)
+    })
+}
+
+
+/// task 172: `GgufLinear` をデバイス連鎖の行列記述へ (qwen4exp.rs の `pf_lin` と同型)。
+#[cfg(feature = "cuda")]
+fn pf_lin_of(w: &GgufLinear) -> crate::cuda::PfLin<'_> {
+    crate::cuda::PfLin {
+        uid: w.uid(),
+        ty: w.ty(),
+        blocks: w.blocks().as_slice(),
+        k: w.k(),
+        n: w.n(),
+    }
+}
+
 /// full attention 層 1 つぶんの重み。
 pub struct AttnLayer {
     pub n_embd: usize,
@@ -1699,6 +1764,14 @@ impl FullAttn {
                 self.cache.max_ctx()
             );
         }
+        // task 172: 1 チャンクぶんの活性を GPU に置いたまま full 層を閉じる。
+        // (`DENNO_PF_FULL_DEV`。使えない形・環境では None が返り従来経路へ)
+        #[cfg(feature = "cuda")]
+        if crate::model::qwen4exp::pf_full_dev_on() {
+            if let Some(outs) = self.forward_batch_dev(layer, curs, base)? {
+                return Ok(outs);
+            }
+        }
         let n_embd = self.n_embd;
         let mut flat = Vec::with_capacity(nt * n_embd);
         for cur in curs {
@@ -1771,6 +1844,132 @@ impl FullAttn {
             self.pos = base + nt;
         }
         Ok(outs.chunks_exact(n_embd).map(|c| c.to_vec()).collect())
+    }
+
+    /// task 172: 1 チャンクの full attention を「入力 1 H2D / 出力 1 D2H」で閉じる。
+    ///
+    /// デバイスの中で qkv 3 射影 → q の per-head RMSNorm + partial NeoX rope →
+    /// attention → 出力ゲート → `attn_output` までを通し、ホストとの往復は
+    /// 入力行の H2D と出力行の D2H、そして KV をホストのキャッシュへ積むための
+    /// k / v の D2H だけにする。
+    ///
+    /// 使えない形・環境 (重みが融合済み / 量子型が違う / PTX が無い / nt が小さい)
+    /// では `Ok(None)` を返す。**ホストの状態は触らない**ので、呼び出し側は
+    /// そのまま従来経路を走らせてよい。
+    #[cfg(feature = "cuda")]
+    fn forward_batch_dev(
+        &mut self,
+        layer: usize,
+        curs: &[Vec<f32>],
+        base: usize,
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        let nt = curs.len();
+        let e = self.n_embd;
+        let l = match self.layers[layer].as_ref() {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        // 融合済み (`inner`) のときは行列ごとの重みポインタが取れない。
+        if l.qkv.is_fused() || l.qkv.parts().len() != 3 {
+            crate::cuda::pf2_decline(1);
+            return Ok(None);
+        }
+        let parts = l.qkv.parts();
+        let qd = l.q_dim();
+        let kv = l.kv_dim();
+        if parts[0].n() != 2 * qd || parts[1].n() != kv || parts[2].n() != kv {
+            crate::cuda::pf2_decline(1);
+            return Ok(None);
+        }
+        let (q_lin, k_lin, v_lin, wo_lin) = (
+            pf_lin_of(&parts[0]),
+            pf_lin_of(&parts[1]),
+            pf_lin_of(&parts[2]),
+            pf_lin_of(&l.wo),
+        );
+        let cs = match rope_cs_cached(nt, base, l.n_rot, l.rope_theta) {
+            Some(v) => v,
+            None => {
+                crate::cuda::pf2_decline(1);
+                return Ok(None);
+            }
+        };
+        let mut flat = Vec::with_capacity(nt * e);
+        for cur in curs {
+            flat.extend_from_slice(cur);
+        }
+        let mut ks = vec![0f32; nt * kv];
+        let mut vs = vec![0f32; nt * kv];
+        let cache_id = self.cache.id();
+        let n_layer = self.cache.n_layer();
+        let gen = self.cache.gen(layer)?;
+        let t_total = base + nt;
+        // 前半: qkv + qk norm/rope (k / v はホストへ戻る)
+        let ok = crate::cuda::pf_full_qkv(
+            &flat,
+            nt,
+            e,
+            q_lin,
+            k_lin,
+            v_lin,
+            &l.q_norm,
+            &l.k_norm,
+            &cs,
+            l.n_head,
+            l.n_head_kv,
+            l.head_dim,
+            l.n_rot,
+            l.rms_eps,
+            cache_id,
+            n_layer,
+            layer,
+            gen,
+            t_total,
+            base,
+            &mut ks,
+            &mut vs,
+        );
+        if !ok {
+            return Ok(None);
+        }
+        // KV は従来経路と同じ順序・同じ値でホストのキャッシュへ積む。
+        for t in 0..nt {
+            self.cache
+                .push(layer, &ks[t * kv..(t + 1) * kv], &vs[t * kv..(t + 1) * kv])?;
+        }
+        let kb = self.cache.k(layer)?;
+        let vb = self.cache.v(layer)?;
+        let mut flat_out = vec![0f32; nt * e];
+        let done = crate::cuda::pf_full_out(
+            cache_id,
+            n_layer,
+            layer,
+            gen,
+            t_total,
+            base,
+            nt,
+            l.n_head,
+            l.heads_per_kv(),
+            l.head_dim,
+            kv,
+            l.kq_scale,
+            kb,
+            vb,
+            wo_lin,
+            e,
+            &mut flat_out,
+        );
+        if !done {
+            // 後半で落ちたら積んだ KV を巻き戻す (従来経路が二重に積まない)。
+            self.cache.truncate_layer(layer, base)?;
+            return Ok(None);
+        }
+        if self.pos < base + nt {
+            self.pos = base + nt;
+        }
+        Ok(Some(
+            flat_out.chunks_exact(e).map(|c| c.to_vec()).collect(),
+        ))
     }
 }
 
@@ -2219,5 +2418,107 @@ mod p49 {
             1,
             "prefill の full タイマーが 1 本でない"
         );
+    }
+}
+
+#[cfg(test)]
+mod p172 {
+    //! task 172: デバイス連鎖の数値の契約。
+    //!
+    //! GPU の無いこのコンテナではカーネルを起動できないので、**カーネルの演算列
+    //! をスカラーで書き下した参照**を CPU の現行関数と突き合わせて固定する
+    //! (`dno_pf2_qknorm_rope` / `dno_pf2_gate_mul` の中身と同じ順序・同じ丸め)。
+
+    use super::*;
+
+    /// `dno_pf2_qknorm_rope` の 1 head ぶんをスカラーで再現する。
+    fn norm_rope_ref(x: &[f32], w: &[f32], cs_t: &[f32], dh: usize, n_rot: usize, eps: f32) -> Vec<f32> {
+        // 1) 2 乗和は i 昇順の逐次
+        let mut ss = 0.0f32;
+        for i in 0..dh {
+            ss += x[i] * x[i];
+        }
+        let ss = ss / dh as f32;
+        let inv = 1.0f32 / (ss + eps).sqrt();
+        let mut sh: Vec<f32> = (0..dh).map(|i| (x[i] * inv) * w[i]).collect();
+        // 2) partial NeoX rope (対 (j, j + half))
+        let half = n_rot / 2;
+        for j in 0..half {
+            let c = cs_t[j];
+            let s = cs_t[half + j];
+            let x0 = sh[j];
+            let x1 = sh[j + half];
+            sh[j] = x0 * c - x1 * s;
+            sh[j + half] = x0 * s + x1 * c;
+        }
+        sh
+    }
+
+    /// rope の表 + スカラー参照が、CPU の `qknorm_rows_inplace` + `rope_neox_partial`
+    /// と**ビット一致**する (実形: dh 256 / n_rot 64 / heads 3 / pos は 0 と 4,000)。
+    #[test]
+    fn pf2_qknorm_rope_ref_matches_cpu() {
+        let dh = 256usize;
+        let n_rot = 64usize;
+        let heads = 3usize;
+        let theta = 1_000_000.0f32;
+        let eps = 1e-6f32;
+        let w: Vec<f32> = (0..dh).map(|i| 0.5 + ((i * 7) % 13) as f32 * 0.05).collect();
+        let nt = 5usize;
+        let base = 4_000usize;
+        let cs = rope_cs_table(nt, base, n_rot, theta).expect("rope 表");
+        let x: Vec<f32> = (0..nt * heads * dh)
+            .map(|i| (((i * 31 + 7) % 29) as f32 - 14.0) * 0.017)
+            .collect();
+        // CPU 参照 (現行経路)
+        let mut cpu = x.clone();
+        for t in 0..nt {
+            let row = &mut cpu[t * heads * dh..(t + 1) * heads * dh];
+            crate::tensor::qknorm_rows_inplace(row, 1, heads, dh, &w, eps);
+            rope_neox_partial(row, heads, dh, n_rot, base + t, theta);
+        }
+        // カーネルの演算列
+        let mut dev = x.clone();
+        for t in 0..nt {
+            for h in 0..heads {
+                let i0 = t * heads * dh + h * dh;
+                let got = norm_rope_ref(
+                    &x[i0..i0 + dh],
+                    &w,
+                    &cs[t * n_rot..(t + 1) * n_rot],
+                    dh,
+                    n_rot,
+                    eps,
+                );
+                dev[i0..i0 + dh].copy_from_slice(&got);
+            }
+        }
+        for (i, (a, b)) in cpu.iter().zip(dev.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "要素 {i}: CPU {a} / カーネル列 {b}");
+        }
+    }
+
+    /// 出力ゲートの式 (`att * sigmoid(gate)`) が CPU と同一であること。
+    #[test]
+    fn pf2_gate_mul_ref_matches_cpu_sigmoid() {
+        for &g in &[-9.0f32, -1.5, -1e-7, 0.0, 0.3, 2.0, 11.0] {
+            for &a in &[-2.0f32, 0.0, 0.7, 13.5] {
+                let cpu = a * sigmoid(g);
+                // カーネル: __fmul_rn(a, __fdiv_rn(1, __fadd_rn(1, expf(-g))))
+                let dev = a * (1.0f32 / (1.0f32 + (-g).exp()));
+                assert_eq!(cpu.to_bits(), dev.to_bits(), "a={a} g={g}");
+            }
+        }
+    }
+
+    /// 表の鍵 (`nt` / `base` / `n_rot` / theta) が変わったら作り直されること。
+    #[test]
+    fn pf2_rope_cs_cache_keyed() {
+        let a = rope_cs_cached(3, 5, 64, 1e6).expect("表");
+        let b = rope_cs_cached(3, 6, 64, 1e6).expect("表");
+        assert_ne!(a, b, "base が違うのに同じ表を返した");
+        let c = rope_cs_cached(3, 5, 64, 1e6).expect("表");
+        assert_eq!(a, c, "同じ鍵で表が変わった");
+        assert!(rope_cs_table(3, 0, 63, 1e6).is_none(), "奇数 n_rot は表を作らない");
     }
 }
