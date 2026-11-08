@@ -100,7 +100,11 @@ spec() {
         # task 186: prefill GDN スキャン v2 (ヘッドあたり 2 ブロック・barrier 1 回)。
         # 値は gdn_pf とビット一致させたいので -fmad=false (式を変えないこと)。
         # arch は gdn_pf と同じ compute_90 に揃える (JIT 差を作らない)。
-        gdn_pf2)      echo "kernels_gdn_pf2.cu|nofmad|compute_90" ;;
+        # task 186 (2/n): v2 は -fmad を許可する (scan128 とは丸めが変わる)。
+        # 命令数が半分になる (mul+add の 2 命令 -> FMA 1 命令) ので、
+        # 状態更新の 3 ループが支配的なこのカーネルでは ~1.5 倍効く。
+        # 値は scan128 と 1 ulp 単位で変わる (丸めだけ。md5 は DIFF)。
+        gdn_pf2)      echo "kernels_gdn_pf2.cu|fmad|compute_90" ;;
         *)            return 1 ;;
     esac
 }

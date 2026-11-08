@@ -34441,6 +34441,116 @@ fn gdn_pf2_launch(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// task 186: ssm の beta/alpha 射影 (F32 重み) をデバイスで回す
+// (`DENNO_PF_SSM_GEMM_GPU`、既定 off)
+// ---------------------------------------------------------------------------
+//
+// lab t183a の 14k prefill で `beta_pf` は 712 ms (1008 呼び出し = 0.71 ms/回)。
+// CPU の `gemv_batch_split` は 0.25 GFLOP/回 を 16 スレッドで回しており、
+// 実効 0.36 TFLOP/s。同じ層の隣の qkv GEMM は 74.8 TFLOP/s なので 200 倍の差。
+// 入力 (x) は連鎖が既にデバイスへ上げており、出力 (beta/alpha) も連鎖がデバイスで
+// 使うので、**ホストを経由せずに** `dno_gemm_f32_mt` で作れる (転送 0)。
+// 丸めは FMA + タイル順なので CPU の mul+add 逐次とは一致しない (丸めだけの差)。
+
+/// task 186: beta/alpha 射影をデバイスで回すための指定 (連結済みの F32 重み)。
+#[derive(Clone)]
+pub struct PfBetaAlpha<'a> {
+    /// 連結済みの重み (`k = n_embd`, `n = beta 行 + alpha 行`)。
+    pub w: PfChainW<'a>,
+    /// beta の行範囲。
+    pub beta_rows: std::ops::Range<usize>,
+    /// alpha の行範囲。
+    pub alpha_rows: std::ops::Range<usize>,
+}
+
+/// `DENNO_PF_SSM_GEMM_GPU` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn pf_ssm_gemm_gpu_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+#[cfg(test)]
+static SSM_GEMM_GPU_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用にゲートを固定する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_pf_ssm_gemm_gpu_for_test(v: Option<bool>) {
+    SSM_GEMM_GPU_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// beta/alpha をデバイスで回すか (既定 off。lab の結果で決める)。
+pub(crate) fn pf_ssm_gemm_gpu_on() -> bool {
+    #[cfg(test)]
+    {
+        match SSM_GEMM_GPU_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_ssm_gemm_gpu_from_value(std::env::var("DENNO_PF_SSM_GEMM_GPU").ok().as_deref())
+    })
+}
+
+/// F32 重みをデバイスへ常駐させてポインタを返す (`PF_F32_W` の表を使う)。
+/// **current context を張った後に呼ぶこと**。形が合わなければ `None`。
+pub fn pf_f32_weight_dev(uid: u64, blocks: &[u8], k: usize, n: usize) -> Option<CUdeviceptr> {
+    let want = k.checked_mul(n)?.checked_mul(4)?;
+    if k == 0 || n == 0 || blocks.len() != want {
+        return None;
+    }
+    let reg = PF_F32_W.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut m = match reg.lock() {
+        Ok(g) => g,
+        Err(_) => return None,
+    };
+    if let Some(b) = m.get(&uid) {
+        return Some(b.ptr());
+    }
+    let b = DevBuffer::from_slice_tagged(blocks, crate::mem_audit::TAG_OTHER).ok()?;
+    let p = b.ptr();
+    m.insert(uid, b);
+    Some(p)
+}
+
+#[cfg(test)]
+mod ssm_gemm_gpu_tests {
+    use super::*;
+
+    #[test]
+    fn ssm_gemm_gpu_gate_truth_table() {
+        assert!(!pf_ssm_gemm_gpu_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!pf_ssm_gemm_gpu_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(pf_ssm_gemm_gpu_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+
+    #[test]
+    fn ssm_gemm_gpu_force_switch() {
+        set_pf_ssm_gemm_gpu_for_test(Some(true));
+        assert!(pf_ssm_gemm_gpu_on());
+        set_pf_ssm_gemm_gpu_for_test(Some(false));
+        assert!(!pf_ssm_gemm_gpu_on());
+        set_pf_ssm_gemm_gpu_for_test(None);
+        assert!(!pf_ssm_gemm_gpu_on(), "env 未設定の既定は off");
+    }
+}
+
 #[cfg(test)]
 mod gdn_pf2_tests {
     use super::*;
@@ -34783,6 +34893,9 @@ pub fn gdn_pf_chain(
     flat: &[f32],
     beta: &[f32],
     alpha: &[f32],
+    // task 186: Some のとき beta/alpha は **デバイスで作る** (`DENNO_PF_SSM_GEMM_GPU`)。
+    // そのとき `beta` / `alpha` は空でよい (ホスト側の計算を省く)。
+    beta_alpha: Option<PfBetaAlpha<'_>>,
     conv_st: &mut [f32],
     ssm_st: &mut [f32],
     wconv: &[f32],
@@ -34814,9 +34927,10 @@ pub fn gdn_pf_chain(
     if !gpu_gemm_enabled() {
         return Ok(false);
     }
+    let ba_dev_req = beta_alpha.is_some() && pf_ssm_gemm_gpu_on();
     if flat.len() != nt * e
-        || beta.len() != nt * nv
-        || alpha.len() != nt * nv
+        || (ba_dev_req && (!beta.is_empty() || !alpha.is_empty()))
+        || (!ba_dev_req && (beta.len() != nt * nv || alpha.len() != nt * nv))
         || out.len() != nt * e
         || conv_st.len() != conv_dim * cs
         || ssm_st.len() != nv * dk * dv
@@ -34875,13 +34989,38 @@ pub fn gdn_pf_chain(
         s.wn.as_ref().unwrap().copy_from(wnorm)?;
         Ok(s.chain_ptrs())
     })?;
+    // task 186: beta/alpha をデバイスで作る場合の重み常駐 (失敗は None → ホスト経路)。
+    let ba_dev = if ba_dev_req {
+        beta_alpha.and_then(|ba| {
+            let w = ba.w;
+            let ok = w.ty == crate::kquant::GgmlType::F32
+                && w.k == e
+                && ba.beta_rows.len() == nv
+                && ba.alpha_rows.len() == nv
+                && ba.beta_rows.end <= w.n
+                && ba.alpha_rows.end <= w.n;
+            if !ok {
+                return None;
+            }
+            let p = pf_f32_weight_dev(w.uid, w.blocks, w.k, w.n)?;
+            let rb = w.k * std::mem::size_of::<f32>();
+            Some((
+                p + (ba.beta_rows.start * rb) as CUdeviceptr,
+                p + (ba.alpha_rows.start * rb) as CUdeviceptr,
+            ))
+        })
+    } else {
+        None
+    };
     gdn_pf_kprof::begin(gdn_pf_kprof::X_H2D);
     let ptr = GDN_PF_CHAIN_BUF.with(|cell| -> Result<[CUdeviceptr; 7]> {
         let mut b = cell.borrow_mut();
         b.ensure(nt, e, conv_dim, vd, nv)?;
         b.x.as_ref().unwrap().copy_from(flat)?;
-        b.beta.as_ref().unwrap().copy_from(beta)?;
-        b.alpha.as_ref().unwrap().copy_from(alpha)?;
+        if ba_dev.is_none() {
+            b.beta.as_ref().unwrap().copy_from(beta)?;
+            b.alpha.as_ref().unwrap().copy_from(alpha)?;
+        }
         Ok([
             b.buf(0),
             b.buf(1),
@@ -34952,6 +35091,33 @@ pub fn gdn_pf_chain(
                 }
             }
             t0 += m;
+        }
+        // task 186: beta/alpha (F32) を同じ x から作る。入力も出力もデバイスに
+        // あるので転送は 0。無い/形が違うときは連鎖ごと従来経路へ (状態は未着手)。
+        if let Some((wbeta, walpha)) = ba_dev {
+            let Some(f32g) = gemm_f32_mt_fn(ctx) else {
+                return Ok(false);
+            };
+            for (w, o) in [(wbeta, pb), (walpha, pa)] {
+                let (mut pw, mut pxx, mut poo) = (w, px, o);
+                let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, e as c_int, nv as c_int);
+                let mut args = [
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut pxx as *mut _ as *mut c_void,
+                    &mut poo as *mut _ as *mut c_void,
+                    &mut nt_c as *mut _ as *mut c_void,
+                    &mut k_c as *mut _ as *mut c_void,
+                    &mut n_c as *mut _ as *mut c_void,
+                ];
+                let grid = (
+                    ((nv + GEMM_MT_ROWS - 1) / GEMM_MT_ROWS) as u32,
+                    ((nt + GEMM_MT_TOKS - 1) / GEMM_MT_TOKS) as u32,
+                    1,
+                );
+                unsafe {
+                    ctx.launch_async(f32g, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)?;
+                }
+            }
         }
         // 段ごとの壁時計を意味のある値にするため、ここで 1 回だけ待つ
         // (1 チャンク = 1 段 40 ms 級なので、同期の固定費は無視できる)。

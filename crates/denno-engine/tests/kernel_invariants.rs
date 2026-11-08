@@ -7528,9 +7528,10 @@ fn gdn_pf2_scan_kernel_is_wired() {
         "gated RMS norm の式が gdn_pf と違う"
     );
     // build_ptx.sh: compute_90 / -fmad=false
+    // task 186 (2/n): -fmad を許可した (scan128 とは丸めが変わる。命令数が半分)。
     assert!(
-        BUILD_PTX_SH.contains("gdn_pf2)      echo \"kernels_gdn_pf2.cu|nofmad|compute_90\""),
-        "build_ptx.sh の gdn_pf2 が nofmad/compute_90 でない"
+        BUILD_PTX_SH.contains("gdn_pf2)      echo \"kernels_gdn_pf2.cu|fmad|compute_90\""),
+        "build_ptx.sh の gdn_pf2 が fmad/compute_90 でない"
     );
     let targets = BUILD_PTX_SH
         .lines()
