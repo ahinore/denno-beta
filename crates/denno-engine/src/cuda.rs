@@ -1874,6 +1874,12 @@ pub(crate) mod dec_full_dev {
         /// 入力長 (= 全 unit 共通) と出力の合計行数。
         pub qkv_k: usize,
         pub qkv_n: usize,
+        /// q / k / v の部分が `qkv` バッファの何行目から始まるか (float 単位)。
+        /// カーネルは [q|gate][k][v] の並びを前提にするので、連結時に並びが
+        /// 変わった層 (fuse_parts の zero-copy reorder) はここで弾く。
+        pub q_off: usize,
+        pub k_off: usize,
+        pub v_off: usize,
         /// 出力投影
         pub wo_uid: u64,
         pub wo_ty: crate::kquant::GgmlType,
@@ -1958,6 +1964,10 @@ pub(crate) mod dec_full_dev {
                 && self.qkv_k > 0
                 && self.cur.len() == self.qkv_k
                 && self.units_ok()
+                // カーネルの前提: [q(2dh/head)][k][v] の並び。
+                && self.q_off == 0
+                && self.k_off == 2 * self.heads * self.dh
+                && self.v_off == 2 * self.heads * self.dh + self.kv_dim
                 && self.wo_k == self.heads * self.dh
                 && self.wo_n == self.n_embd
                 && self.n_embd > 0
@@ -2651,6 +2661,9 @@ pub(crate) mod dec_full_dev {
                 qkv_units: units,
                 qkv_k: 2_560,
                 qkv_n: 13_312,
+                q_off: 0,
+                k_off: 12_288,
+                v_off: 12_800,
                 wo_uid: 2,
                 wo_ty: crate::kquant::GgmlType::Q8_0,
                 wo_blocks: blocks,
@@ -2727,6 +2740,13 @@ pub(crate) mod dec_full_dev {
             // 空。
             let empty: Vec<Unit<'_>> = Vec::new();
             let c = call_with(&qn, &kn, &cur, &blocks, &empty);
+            assert!(!c.ok_shape());
+            // 連結時に並びが変わった層 (カーネルの前提と違う) は落ちる。
+            let one = one_unit(&blocks);
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &one);
+            assert!(c.ok_shape());
+            c.k_off = 0;
+            c.q_off = 512;
             assert!(!c.ok_shape());
         }
 
