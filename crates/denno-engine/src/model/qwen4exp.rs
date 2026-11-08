@@ -2576,6 +2576,9 @@ impl Qwen4Exp {
         emit_router: bool,
     ) -> Result<()> {
         let e = self.p.n_embd;
+        // task 177: 診断 (`DENNO_GDN_DEC_KPROF`) が mix の表に層番号を出すため。
+        #[cfg(feature = "cuda")]
+        crate::cuda::dec_kprof::set_layer(il);
         let lw = &self.layers[il];
         // task 155: 購読者が居ないフックは**呼び出しごと**飛ばす。`None` は
         // 「このランでは誰も層の中間値を見ない」= decode の通常経路。
@@ -4409,12 +4412,37 @@ fn hc_mix_quant_fast(
     let e = hp.n_embd;
     let t_all = mix_kprof::stamp();
     MIX_SCRATCH.with(|cell| {
+        // task 179: mix 1 回の内訳 (`DENNO_GDN_DEC_KPROF` の平均表)。窓は
+        // ホスト仕事 (norm / inject / 詰め替え) を含めるため、ここで開く。
+        #[cfg(feature = "cuda")]
+        let _kp_win = crate::cuda::dec_kprof::window(
+            crate::cuda::dec_kprof::MIX,
+            crate::cuda::dec_kprof::cur_layer(),
+            crate::cuda::dec_kprof::cur_pos(),
+            0,
+        );
+        // 計測 off では closure をそのまま呼ぶだけ。
+        macro_rules! kp_step {
+            ($name:expr, $e:expr) => {{
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda::dec_kprof::step($name, || $e)
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    $e
+                }
+            }};
+        }
         let mut b = cell.borrow_mut();
         let MixScratch { xn, lo, gate, .. } = &mut *b;
 
         let xn = MixScratch::take(xn, hc_dim);
         let t = mix_kprof::stamp();
-        hyper::grouped_rms_norm_batch_into(std::slice::from_ref(res), norm, xn, hp);
+        kp_step!(
+            "mix_norm",
+            hyper::grouped_rms_norm_batch_into(std::slice::from_ref(res), norm, xn, hp)
+        );
         mix_kprof::mark(t, mix_kprof::GN);
 
         // task 158: inject (`hc_inject` の GEMV + 係数) は **xn だけで決まる**。
@@ -4433,7 +4461,7 @@ fn hc_mix_quant_fast(
         let do_inj = |w: &GgufLinear| -> Result<Vec<f32>> {
             let mut v = vec![0.0f32; w.n()];
             let t = mix_kprof::stamp();
-            w.gemv_label("hc_inject", xn, &mut v)
+            kp_step!("mix_inj", w.gemv_label("hc_inject", xn, &mut v))
                 .map_err(|err| one(format!("hc_mix inject: {err}")))?;
             // task 96: inject GEMV 1 発の実行先と dtype (down/up と同じ `Instant`)。
             mix_kprof::gemv::note_inj(t, w.ty());
@@ -4467,7 +4495,7 @@ fn hc_mix_quant_fast(
             && down.ty() == crate::kquant::GgmlType::Bf16
             && up.ty() == crate::kquant::GgmlType::Bf16
         {
-            let mut m = vec![0.0f32; e];
+            let mut m = kp_step!("mix_alloc", vec![0.0f32; e]);
             if crate::cuda::maybe_gpu_mix_bf16_chain2_into(
                 down.uid(),
                 down.blocks().as_slice(),

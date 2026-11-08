@@ -422,6 +422,9 @@ impl Qwen4ExpDecoder {
         // task 132: step の入口 (push と窓の組み立て) を層の外として測る。
         let d_step = q4prof::dstamp();
         self.tokens.push(token);
+        // task 177: 診断 (`DENNO_GDN_DEC_KPROF`) 用の絶対位置 (prompt + 生成の通し)。
+        #[cfg(feature = "cuda")]
+        crate::cuda::dec_kprof::set_pos(self.tokens.len() as u64);
 
         // 末尾 `win` 個を古い順のまま渡す (窓を切っても末尾の意味は変わらない)。
         let start = self.tokens.len().saturating_sub(win);
@@ -462,6 +465,9 @@ impl Qwen4ExpDecoder {
             return Err(one("ple_window が 0 (PLE 索引の窓が無い)"));
         }
         self.tokens.push(token);
+        // task 177: 診断 (`DENNO_GDN_DEC_KPROF`) 用の絶対位置。
+        #[cfg(feature = "cuda")]
+        crate::cuda::dec_kprof::set_pos(self.tokens.len() as u64);
         let start = self.tokens.len().saturating_sub(win);
         let ctx: Vec<u32> = self.tokens[start..].to_vec();
         self.model.forward_token_at(&ctx, 0, 1, None, None)
