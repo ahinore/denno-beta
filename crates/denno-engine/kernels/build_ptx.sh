@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 moe_v5 mix_dev gdn_scan2)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -92,6 +92,16 @@ spec() {
         # task 183: 融合 qkv 1 本の GEMM の後処理 (出力ゲートと行の gather)。
         # CPU 参照と 1 演算 1 丸めを合わせるため -fmad=false (明示 __*_rn のみ)。
         pf3)          echo "kernels_pf3.cu|nofmad" ;;
+        # task 184: decode の GEMV をベクタロード + 複数アキュムレータ +
+        # 次ブロック先読みで回す第 5 版 (Q8_0 / Q4_K)。dequant の演算列は
+        # v3 / v4 と同じにするため -fmad=false。
+        moe_v5)       echo "kernels_moe_v5.cu|nofmad" ;;
+        # task 184: decode の hc mix の grouped RMS 正規化と inject の内積
+        # (ツリー縮約)。1 演算 1 丸めを保つため -fmad=false。
+        mix_dev)      echo "kernels_mix_dev.cu|nofmad" ;;
+        # task 184: decode の GDN スキャン第 2 版 (4 レーン + 列レジスタ)。
+        # 既存 dno_gdn_scan_sig と 1 演算 1 丸めを揃えるため -fmad=false。
+        gdn_scan2)    echo "kernels_gdn_scan2.cu|nofmad" ;;
         *)            return 1 ;;
     esac
 }
