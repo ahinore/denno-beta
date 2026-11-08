@@ -11999,7 +11999,7 @@ fn tc_gemm_launch(
 // を行う。数値契約は br169 と同じく無し (x と重みを BF16 に丸め、FP32 で
 // アキュムレートする。丸めだけの差で演算の意味は同じ)。
 //
-// 既定 off (`DENNO_PF_TC_GEMM2=1` で有効)。PTX は実行時読み込みで、無ければ
+// 既定 on (`DENNO_PF_TC_GEMM2=0` で切る)。PTX は実行時読み込みで、無ければ
 // br169 のカーネル → 従来カーネルへ fail closed (`[pf-tc2]` の 1 行だけ出す)。
 //
 // PTX: `bash build_ptx.sh gemm_tc2` (この target だけ arch = compute_90)。
@@ -12024,15 +12024,21 @@ const TC2_MIN_N: usize = 4096;
 /// (実行時コスト 0。片側だけ直した事故をここで落とす)。
 const _: [(); TC2_SMEM_BYTES] = [(); 2 * TC2_BN * TC2_LD * 2 + 2 * TC2_BM * TC2_LD * 2];
 
-/// `DENNO_PF_TC_GEMM2` の値の解釈 (純関数)。`1`・`on`・`true`・`yes` だけが on。
+/// `DENNO_PF_TC_GEMM2` の値の解釈 (純関数)。`0`・`off`・`false`・`no`・空文字だけが off。
+///
+/// **既定 on** (lab t176a で採用): 14,018 トークンの cold prefill が
+/// 72.28 → 63.05 s (-12.8%)、3,826 で 20.57 → 18.57 s (-9.7%)、ssm の
+/// qkv_pf が 6,268 → 579 ms (-90.8%)、out_pf が 667 → 271 ms、decode と
+/// 19 トークン next turn は不変、errors 0・text sane。md5 は BF16 丸め
+/// (と 4 層の Q5_K/Q4_K が f32 経路から TC 経路へ移ること) で変わる。
 pub(crate) fn pf_tc2_gemm_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        None => false,
-        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => true,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
 
-/// v2 カーネルを使うか (**既定 off**)。
+/// v2 カーネルを使うか (**既定 on**。`DENNO_PF_TC_GEMM2=0` で切る)。
 pub(crate) fn pf_tc2_gemm_on() -> bool {
     #[cfg(test)]
     {
@@ -12508,11 +12514,11 @@ mod pf_tc_tests {
     // task 176: v2 (kernels_gemm_tc2.cu) のゲート・適格性・索引ミラー
     // ------------------------------------------------------------------
 
-    /// `DENNO_PF_TC_GEMM2` の真理値表 (既定 off。v2 は lab で採否を決めるまで off)。
+    /// `DENNO_PF_TC_GEMM2` の真理値表 (既定 on。lab t176a で採用)。
     #[test]
     fn pf_tc2_gate_truth_table() {
-        assert!(!pf_tc2_gemm_from_value(None), "未設定は既定 off");
-        for v in ["0", "off", "false", "no", "", " OFF ", "2"] {
+        assert!(pf_tc2_gemm_from_value(None), "未設定は既定 on");
+        for v in ["0", "off", "false", "no", "", " OFF "] {
             assert!(!pf_tc2_gemm_from_value(Some(v)), "{v}");
         }
         for v in ["1", "on", "true", "yes", " ON "] {
