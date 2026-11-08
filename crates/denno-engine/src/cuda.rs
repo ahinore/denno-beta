@@ -1795,8 +1795,10 @@ pub(crate) mod dec_full_dev {
     use super::*;
     use std::cell::{Cell, RefCell};
 
-    /// 既定値 (lab の採否で切り替える)。
-    const DEFAULT_ON: bool = false;
+    /// 既定値。lab t179c の VERDICT (decode -5.5%、深い 2 点は -6.6/-6.4%、
+    /// md5 SAME、errors 0、prefill -0.8%) で採否を yes にしたので既定 on。
+    /// `DENNO_FULL_DEC_DEV=0` で従来経路へ戻る。
+    const DEFAULT_ON: bool = true;
 
     /// `DENNO_FULL_DEC_DEV` (既定 `DEFAULT_ON`)。
     pub(crate) fn on() -> bool {
@@ -2750,8 +2752,10 @@ pub(crate) mod dec_full_dev {
             assert!(!c.ok_shape());
         }
 
+        /// ゲートを off にすると GPU に一切触らない (従来経路へ)。
+        /// 既定は lab t179c の採否で on (下の `DEFAULT_ON`)。
         #[test]
-        fn off_by_default_and_forward_is_inert() {
+        fn gate_off_makes_forward_inert() {
             let _f = Force::set(Some(false));
             assert!(!on());
             let qn = vec![1f32; 256];
