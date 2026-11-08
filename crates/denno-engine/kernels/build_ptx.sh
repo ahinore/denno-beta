@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc gemm_tc2 pf2 gemm_sn)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 gemm_sn)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -38,6 +38,9 @@ spec() {
         moe_batch)    echo "kernels_moe_batch.cu|nofmad" ;;
         moe_v2)       echo "kernels_moe_v2.cu|nofmad" ;;
         moe_v3)       echo "kernels_moe_v3.cu|nofmad" ;;
+        # task 177: v3 のレーン数を可変にした版 (decode GDN の GEMV 用)。
+        # データの読み方と dequant の演算列は v3 と同一なので -fmad=false。
+        moe_v4)       echo "kernels_moe_v4.cu|nofmad" ;;
         moe_fp16)     echo "kernels_moe_fp16.cu|nofmad" ;;
         # task 144: IQ 系 (IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL / Q2_0) の
         # expert GEMV。数値契約は CPU とビット一致ではない (1 行を 32 レーンで
@@ -61,6 +64,10 @@ spec() {
         # 上げる (PTX は前方互換なので sm_120 で JIT される)。数値契約は無し
         # (prefill の射影はビット一致契約の外)。
         gemm_tc)      echo "kernels_gemm_tc.cu|fmad|compute_90" ;;
+        # task 179: decode の full attention 1 層をデバイスで閉じる (q/k 正規化 +
+        # rope + gate 取り出し + 出力ゲート)。CPU と 1 演算 1 丸めを合わせるため
+        # -fmad=false (明示 __*_rn のみ)。
+        dec_dev)      echo "kernels_dec_dev.cu|nofmad" ;;
         # task 173: prefill の GDN スキャン (状態レジスタ常駐 + 4 レーン分割)。
         # 丸めは要素ごとに既存カーネルと同一にしたいので -fmad=false。
         # bf16 を使う予定は無いが、gemm_tc と同じ arch に揃えておく

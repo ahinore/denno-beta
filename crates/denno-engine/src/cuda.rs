@@ -760,6 +760,2069 @@ mod launch_dbg {
     }
 }
 
+// ---- task 177/179: decode 層の操作別・層別 平均内訳 (DENNO_GDN_DEC_KPROF・既定 off)
+//
+// 背景 (task 179): lab t177a の 1 層 1 サンプル表は pos=3827 の full で
+// wall 557 us / gpu_sum 206 us / gap_sum 341 us を出し、そのうち 276 us が
+// 「qkv GEMV の同期のあと、最初の KV ミラー追記の前」の 1 個の隙間だった。
+// しかし [q4ledger] の full は 12 層で 3.58 ms/token = 層あたり 298 us なので、
+// その 1 サンプルは inflated (初回・cold・イベントの overhead)。1 サンプルで
+// 次を選ばないために、task 179 では **同じ帯の中で N 窓 (既定 64) の平均** を
+// 層番号ごとに出し、ホスト仕事を名前付きで分離する。
+//
+// ここでは submission の各操作 (起動 / H2D / D2H / D2D / 明示同期 / 非同期コピー)
+// の**直前と直後**に CUDA イベントを打ち、窓を閉じると集計へ畳む。列の意味:
+//   wall_us   = 窓のホスト側経過 (層 1 回ぶん)
+//   kern_us   = カーネルの GPU 時間の和
+//   copy_us   = コピーの GPU 時間 (DMA) の和
+//   gap_us    = 操作間の GPU 側の隙間の和 (ホスト仕事・待ちを含む)
+//   wait_us   = 明示同期 (sync) のホスト滞在 = 待ち時間
+//   launch_us = カーネル発行のホスト滞在 (driver 呼び出し)
+//   steps     = 名前付きホスト区間の和 (rotary / norm / split / mirror など)
+// gap は steps を**含む** (GPU が遊んでいる時間とホストが働いている時間は
+// 同じ区間なので、足し算ではなく読み分けに使う)。
+//
+// 数値経路: off のとき各サイトが払うのは thread-local の `Cell<bool>` 読み 1 回。
+// on でもカーネルの引数・起動形状・発行順・同期の位置は 1 つも変えず、イベントと
+// 時刻だけを足す。読み出しは窓の最後 (呼び出し側がすでに同期済みの点) に 1 回。
+//
+// 出すのは `DENNO_GDN_DEC_KPROF=1` のときだけ。表は 3 つの位置帯
+// (短い decode / 3,800..4,100 / 14,000..14,400 トークン) で、(帯, 種類) ごとに
+// 1 回だけ出す。N は `DENNO_GDN_DEC_KPROF_N` (既定 64)。
+// ---------------------------------------------------------------------------
+pub(crate) mod dec_kprof {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+
+    /// 種類: GDN (ssm) 層の submission。
+    pub(crate) const GDN: u8 = 1;
+    /// 種類: hc mix 1 回 (attn 側 / ffn 側で同じ層番号に 2 回)。
+    pub(crate) const MIX: u8 = 2;
+    /// 種類: full attention 層。
+    pub(crate) const FULL: u8 = 3;
+
+    /// `DENNO_GDN_DEC_KPROF` が立っているか (既定 off)。
+    pub(crate) fn on() -> bool {
+        if let Some(v) = force_for_test() {
+            return v;
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| match std::env::var("DENNO_GDN_DEC_KPROF").ok() {
+            None => false,
+            Some(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "" | "0" | "off" | "false" | "no")
+            }
+        })
+    }
+
+    /// 平均する窓の数 (既定 64、2..=4096 の外は既定へ)。
+    pub(crate) fn avg_n() -> u64 {
+        static N: OnceLock<u64> = OnceLock::new();
+        *N.get_or_init(|| match std::env::var("DENNO_GDN_DEC_KPROF_N").ok() {
+            None => 64,
+            Some(v) => match v.trim().parse::<u64>() {
+                Ok(n) if (2..=4096).contains(&n) => n,
+                _ => 64,
+            },
+        })
+    }
+
+    /// 表を出す位置帯 (0 = 短い decode、1 = 3.8k..4.1k、2 = 14.0k..14.4k)。
+    /// 帯の外は `None`。**純関数** (テストで真理値表を固定する)。
+    pub(crate) fn band(pos: u64) -> Option<u8> {
+        if pos < 400 {
+            Some(0)
+        } else if (3_800..=4_100).contains(&pos) {
+            Some(1)
+        } else if (14_000..=14_400).contains(&pos) {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
+    /// 帯の下端 (表の見出しに出す)。
+    fn band_lo(band: u8) -> u64 {
+        match band {
+            0 => 0,
+            1 => 3_800,
+            _ => 14_000,
+        }
+    }
+
+    /// 帯と種類の組を 1 bit にしたもの (出したかどうかの記憶に使う)。
+    ///
+    /// task 179: u8 だと帯 2 (bit 8..11) が入らず、`(8 + kind) & 7` に化けて
+    /// **帯 0 と同じ bit** になっていた (lab t179a で 14k の表が出なかった原因)。
+    fn mask(pos: u64, kind: u8) -> u16 {
+        match band(pos) {
+            Some(b) => 1u16 << ((b as u32) * 4 + kind as u32),
+            None => 0,
+        }
+    }
+
+    /// 計測を始めてよければ true。**純関数** (テストで真理値表を固定する)。
+    ///
+    /// `active` = すでに窓が開いている (入れ子は外側を優先)、`dead` = イベントを
+    /// 作れなかった、`printed` = このプロセスで出し終えた (帯, 種類) のビット、
+    /// `decode` = decode 窓の内側か (prefill の逐次 1 トークン経路で古い位置を
+    /// 使って表を出すと、その帯の本番の表を食ってしまうので必須)。
+    pub(crate) fn should_begin(
+        active: bool,
+        dead: bool,
+        printed: u16,
+        pos: u64,
+        kind: u8,
+        decode: bool,
+    ) -> bool {
+        if active || dead || !decode || band(pos).is_none() {
+            return false;
+        }
+        (printed & mask(pos, kind)) == 0
+    }
+
+    /// 1 操作ぶんの記録。
+    struct Entry {
+        name: String,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shmem: u32,
+        bytes: usize,
+        ev_in: u32,
+        ev_out: u32,
+        /// 前の操作のホスト戻りからこの操作のホスト入口まで (ns)。
+        hin_ns: u64,
+        /// この操作のホスト滞在 (ns)。
+        host_ns: u64,
+        t_host: Instant,
+    }
+
+    struct St {
+        kind: u8,
+        li: usize,
+        site: u32,
+        pos: u64,
+        /// 層の重みの実バイト (qkv + out。実効帯域を出すため)。
+        wbytes: usize,
+        entries: Vec<Entry>,
+        evs: Vec<CUevent>,
+        used: usize,
+        t0: Instant,
+        prev_end: Instant,
+        /// 名前付きホスト区間 (name, us)。窓の間に積む。
+        steps: Vec<(String, f64)>,
+        /// (帯, 種類) を出し終えたビット。
+        printed: u16,
+        dead: bool,
+    }
+
+    impl St {
+        fn new() -> Self {
+            let now = Instant::now();
+            Self {
+                kind: 0,
+                li: 0,
+                site: 0,
+                pos: 0,
+                wbytes: 0,
+                entries: Vec::new(),
+                evs: Vec::new(),
+                used: 0,
+                t0: now,
+                prev_end: now,
+                steps: Vec::new(),
+                printed: 0,
+                dead: false,
+            }
+        }
+    }
+
+    // ---- 集計 (N 窓の平均) -------------------------------------------------
+
+    /// 操作 1 種類ぶんの累計。
+    #[derive(Clone, Copy, Default)]
+    struct OpAgg {
+        calls: u64,
+        gpu_us: f64,
+        gap_us: f64,
+        hin_us: f64,
+        host_us: f64,
+        bytes: u64,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shmem: u32,
+    }
+
+    /// 1 レーン (層, 呼び出し位置) ぶんの累計。
+    #[derive(Default)]
+    struct LaneAgg {
+        calls: u64,
+        wall_us: f64,
+        kern_us: f64,
+        copy_us: f64,
+        gap_us: f64,
+        wait_us: f64,
+        launch_us: f64,
+        ops: BTreeMap<String, OpAgg>,
+        steps: BTreeMap<String, (u64, f64)>,
+    }
+
+    /// (帯, 種類) ぶんの累計。
+    #[derive(Default)]
+    struct Group {
+        n_win: u64,
+        lanes: BTreeMap<(usize, u32), LaneAgg>,
+    }
+
+    thread_local! {
+        static ST: RefCell<Option<St>> = const { RefCell::new(None) };
+        /// ホットパス用の鏡 (`St.active` と同じ)。off の分岐はここ 1 回。
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        /// 直近に居た層 (mix は層番号を知らないので `run_layer` が置く)。
+        static IL: Cell<usize> = const { Cell::new(0) };
+        /// 直近の decode の絶対位置 (`Qwen4ExpDecode` が置く)。
+        static POS: Cell<u64> = const { Cell::new(0) };
+        /// テスト用の強制 (None = env の解釈)。
+        static FORCE: Cell<Option<bool>> = const { Cell::new(None) };
+        /// 集計 (帯, 種類) -> レーン別。
+        static AGG: RefCell<Option<BTreeMap<(u8, u8), Group>>> = const { RefCell::new(None) };
+        /// 種類ごとの直近の帯 (帯を出たときに未出力の表を流すため)。
+        static LAST_BAND: RefCell<BTreeMap<u8, u8>> = const { RefCell::new(BTreeMap::new()) };
+    }
+
+    /// テストが env を立てずに on/off を強制する (panic しても戻すのは呼び出し側)。
+    #[cfg(test)]
+    pub(crate) fn set_force_for_test(v: Option<bool>) {
+        FORCE.with(|c| c.set(v));
+    }
+
+    fn force_for_test() -> Option<bool> {
+        #[cfg(test)]
+        {
+            return FORCE.with(|c| c.get());
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    /// `run_layer` が層番号を置く (mix の表に li を出すため)。
+    #[inline]
+    pub(crate) fn set_layer(il: usize) {
+        if on() {
+            IL.with(|c| c.set(il));
+        }
+    }
+
+    /// 直近の層番号。
+    pub(crate) fn cur_layer() -> usize {
+        IL.with(|c| c.get())
+    }
+
+    /// decode の絶対位置を置く (`Qwen4ExpDecode` の `step_inner` / `feed_one`)。
+    #[inline]
+    pub(crate) fn set_pos(pos: u64) {
+        if on() {
+            POS.with(|c| c.set(pos));
+        }
+    }
+
+    /// 直近の位置。
+    pub(crate) fn cur_pos() -> u64 {
+        POS.with(|c| c.get())
+    }
+
+    /// 窓を開く (開けなければ何もしない)。戻り値の guard が drop で表を出す。
+    ///
+    /// `site` は同じ層で複数回呼ばれる経路の区別 (mix の attn 側 / ffn 側など)。
+    pub(crate) fn window(kind: u8, li: usize, pos: u64, site: u32) -> Win {
+        let decode = crate::model::qwen4exp::gdn_gpu_win::active();
+        let want = on()
+            && ACTIVE.with(|c| !c.get())
+            && ST.with(|c| {
+                let slot = c.borrow();
+                match slot.as_ref() {
+                    None => should_begin(false, false, 0, pos, kind, decode),
+                    Some(s) => should_begin(false, s.dead, s.printed, pos, kind, decode),
+                }
+            });
+        if !want {
+            return Win { open: false };
+        }
+        // 帯をまたいだら、前の帯の (未出力の) 表を流す。
+        if let Some(b) = band(pos) {
+            let prev = LAST_BAND.with(|c| c.borrow_mut().insert(kind, b));
+            if let Some(p) = prev {
+                if p != b {
+                    flush_band(p, kind, 8);
+                }
+            }
+        }
+        ST.with(|c| {
+            let mut slot = c.borrow_mut();
+            let s = slot.get_or_insert_with(St::new);
+            s.kind = kind;
+            s.li = li;
+            s.site = site;
+            s.pos = pos;
+            s.wbytes = 0;
+            s.entries.clear();
+            s.steps.clear();
+            s.used = 0;
+            s.t0 = Instant::now();
+            s.prev_end = s.t0;
+        });
+        ACTIVE.with(|c| c.set(true));
+        Win { open: true }
+    }
+
+    /// 窓の guard (drop で表を出す)。開いていない guard は drop で何もしない
+    /// (入れ子の内側が外側の窓を閉じてしまう取り違えを防ぐ)。
+    pub(crate) struct Win {
+        open: bool,
+    }
+
+    impl Drop for Win {
+        fn drop(&mut self) {
+            if self.open {
+                finish();
+            }
+        }
+    }
+
+    /// 層の重みの実バイトを添える (表の `wbytes` 用)。
+    pub(crate) fn note_wbytes(n: usize) {
+        if !ACTIVE.with(|c| c.get()) {
+            return;
+        }
+        ST.with(|c| {
+            if let Some(s) = c.borrow_mut().as_mut() {
+                s.wbytes = s.wbytes.saturating_add(n);
+            }
+        });
+    }
+
+    /// 名前付きホスト区間。窓が開いていなければ closure を呼ぶだけ。
+    ///
+    /// ここで測るのは**ホストの仕事そのもの** (rotary / norm / split / mirror の
+    /// 帳簿 / 詰め替え)。GPU を待つ区間は入れない (それは `sync` の行に出る)。
+    #[inline]
+    pub(crate) fn step<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+        if !ACTIVE.with(|c| c.get()) {
+            return f();
+        }
+        let t = Instant::now();
+        let r = f();
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        ST.with(|c| {
+            if let Some(s) = c.borrow_mut().as_mut() {
+                s.steps.push((name.to_string(), us));
+            }
+        });
+        r
+    }
+
+    /// [`step`] の「区間の頭を先に取る」版 (途中に `?` や early return がある
+    /// 区間を測る)。窓が開いていなければ何もしない。
+    #[inline]
+    pub(crate) fn note_since(name: &'static str, t: Instant) {
+        if !ACTIVE.with(|c| c.get()) {
+            return;
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        ST.with(|c| {
+            if let Some(s) = c.borrow_mut().as_mut() {
+                s.steps.push((name.to_string(), us));
+            }
+        });
+    }
+
+    /// イベント 1 本を既定ストリームに打ち、pool の添字を返す。
+    fn record(s: &mut St) -> Option<u32> {
+        if s.dead {
+            return None;
+        }
+        if s.used >= s.evs.len() {
+            let want = s.evs.len() + 16;
+            let Some(create) = lib().ok().and_then(|l| l.event_create) else {
+                s.dead = true;
+                return None;
+            };
+            while s.evs.len() < want {
+                let mut ev: CUevent = std::ptr::null_mut();
+                // 0 = CU_EVENT_DEFAULT (計時有効)。
+                if unsafe { create(&mut ev, 0) } != CUDA_SUCCESS || ev.is_null() {
+                    s.dead = true;
+                    return None;
+                }
+                s.evs.push(ev);
+            }
+        }
+        let Some(rec) = lib().ok().and_then(|l| l.event_record) else {
+            s.dead = true;
+            return None;
+        };
+        let ev = s.evs[s.used];
+        if unsafe { rec(ev, std::ptr::null_mut()) } != CUDA_SUCCESS {
+            s.dead = true;
+            return None;
+        }
+        let i = s.used as u32;
+        s.used += 1;
+        Some(i)
+    }
+
+    /// 操作の入口 (窓が開いていなければ None = 分岐 1 回)。
+    #[inline]
+    pub(super) fn op_begin(
+        name: impl FnOnce() -> String,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shmem: u32,
+        bytes: usize,
+    ) -> Option<usize> {
+        if !ACTIVE.with(|c| c.get()) {
+            return None;
+        }
+        ST.with(|c| {
+            let mut slot = c.borrow_mut();
+            let s = slot.as_mut()?;
+            let ev_in = record(s)?;
+            let now = Instant::now();
+            let hin = now.saturating_duration_since(s.prev_end).as_nanos() as u64;
+            s.entries.push(Entry {
+                name: name(),
+                grid,
+                block,
+                shmem,
+                bytes,
+                ev_in,
+                ev_out: ev_in,
+                hin_ns: hin,
+                host_ns: 0,
+                t_host: now,
+            });
+            Some(s.entries.len() - 1)
+        })
+    }
+
+    /// 操作の出口 (入口が None なら何もしない)。
+    #[inline]
+    pub(super) fn op_end(idx: Option<usize>) {
+        let Some(idx) = idx else {
+            return;
+        };
+        ST.with(|c| {
+            let mut slot = c.borrow_mut();
+            let Some(s) = slot.as_mut() else {
+                return;
+            };
+            let ev = record(s);
+            let now = Instant::now();
+            if let Some(e) = s.entries.get_mut(idx) {
+                if let Some(ev) = ev {
+                    e.ev_out = ev;
+                }
+                e.host_ns = now.saturating_duration_since(e.t_host).as_nanos() as u64;
+            }
+            s.prev_end = now;
+        });
+    }
+
+    /// 2 イベント間の ms。
+    fn elapsed(evs: &[CUevent], a: u32, b: u32) -> Option<f32> {
+        let f = lib().ok().and_then(|l| l.event_elapsed_time)?;
+        let ea = *evs.get(a as usize)?;
+        let eb = *evs.get(b as usize)?;
+        let mut ms = 0.0f32;
+        if unsafe { f(&mut ms, ea, eb) } != CUDA_SUCCESS || !ms.is_finite() || ms < 0.0 {
+            return None;
+        }
+        Some(ms)
+    }
+
+    /// 表 1 行分 (GPU から切り離した値。整形だけをテストできるようにする)。
+    #[derive(Clone, Copy)]
+    struct Row<'a> {
+        name: &'a str,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shmem: u32,
+        bytes: usize,
+        gpu_us: f32,
+        gap_us: f32,
+        hin_us: f64,
+        host_us: f64,
+    }
+
+    fn kind_name(kind: u8) -> &'static str {
+        match kind {
+            GDN => "gdn",
+            MIX => "mix",
+            FULL => "full",
+            _ => "?",
+        }
+    }
+
+    /// コピーの行か (名前の先頭で見る)。
+    fn is_copy(name: &str) -> bool {
+        name.starts_with("H2D") || name.starts_with("D2H")
+    }
+
+    /// 窓を閉じる。開いていなければ何もしない。
+    fn finish() {
+        if !ACTIVE.with(|c| c.replace(false)) {
+            return;
+        }
+        ST.with(|c| {
+            let mut slot = c.borrow_mut();
+            let Some(s) = slot.as_mut() else {
+                return;
+            };
+            // 最後のイベントまで待つ。窓を閉じる点は呼び出し側がすでに同期して
+            // いるので待ちは発生しない (未完了なら下の elapsed が miss になる)。
+            if let (Some(done), Some(last)) = (
+                lib().ok().and_then(|l| l.event_sync),
+                s.evs.get(s.used.saturating_sub(1)),
+            ) {
+                unsafe { done(*last) };
+            }
+            let wall_us = s.t0.elapsed().as_secs_f64() * 1e6;
+            if s.dead || s.entries.is_empty() {
+                eprintln!(
+                    "[dec-kprof-avg] {} li={} pos={} wall_us={:.1} ops={} ev=unavailable \
+                     (cuEventCreate/Record が失敗)",
+                    kind_name(s.kind),
+                    s.li,
+                    s.pos,
+                    wall_us,
+                    s.entries.len()
+                );
+                s.printed |= mask(s.pos, s.kind);
+                s.entries.clear();
+                s.steps.clear();
+                s.used = 0;
+                return;
+            }
+            let mut rows: Vec<Row> = Vec::with_capacity(s.entries.len());
+            let mut prev_out: Option<u32> = None;
+            for e in &s.entries {
+                let gpu = elapsed(&s.evs, e.ev_in, e.ev_out).unwrap_or(f32::NAN);
+                let gap = match prev_out {
+                    Some(p) => elapsed(&s.evs, p, e.ev_in).unwrap_or(f32::NAN),
+                    None => 0.0,
+                };
+                rows.push(Row {
+                    name: &e.name,
+                    grid: e.grid,
+                    block: e.block,
+                    shmem: e.shmem,
+                    bytes: e.bytes,
+                    gpu_us: gpu * 1e3,
+                    gap_us: gap * 1e3,
+                    hin_us: e.hin_ns as f64 / 1e3,
+                    host_us: e.host_ns as f64 / 1e3,
+                });
+                prev_out = Some(e.ev_out);
+            }
+            if fold_window(s, wall_us, &rows) {
+                s.printed |= mask(s.pos, s.kind);
+            }
+            s.entries.clear();
+            s.steps.clear();
+            s.used = 0;
+        });
+    }
+
+    /// 1 窓を集計へ畳む。N 窓そろったら表を出して true。
+    fn fold_window(s: &St, wall_us: f64, rows: &[Row<'_>]) -> bool {
+        let Some(b) = band(s.pos) else {
+            return false;
+        };
+        let target = avg_n();
+        let ready = AGG.with(|c| {
+            let mut slot = c.borrow_mut();
+            let all = slot.get_or_insert_with(BTreeMap::new);
+            let grp = all.entry((b, s.kind)).or_default();
+            grp.n_win += 1;
+            let lane = grp.lanes.entry((s.li, s.site)).or_default();
+            lane.calls += 1;
+            lane.wall_us += wall_us;
+            for (i, r) in rows.iter().enumerate() {
+                if i > 0 {
+                    lane.gap_us += r.gap_us as f64;
+                }
+                if r.name == "sync" {
+                    lane.wait_us += r.host_us;
+                } else if r.name.starts_with("K ") {
+                    lane.kern_us += r.gpu_us as f64;
+                    lane.launch_us += r.host_us;
+                } else if is_copy(r.name) {
+                    lane.copy_us += r.gpu_us as f64;
+                }
+                let e = lane.ops.entry(r.name.to_string()).or_default();
+                e.calls += 1;
+                e.gpu_us += r.gpu_us as f64;
+                e.gap_us += r.gap_us as f64;
+                e.hin_us += r.hin_us;
+                e.host_us += r.host_us;
+                e.bytes += r.bytes as u64;
+                e.grid = r.grid;
+                e.block = r.block;
+                e.shmem = r.shmem;
+            }
+            for (name, us) in &s.steps {
+                let t = lane.steps.entry(name.clone()).or_insert((0, 0.0));
+                t.0 += 1;
+                t.1 += *us;
+            }
+            !grp.lanes.is_empty() && grp.lanes.values().all(|l| l.calls >= target)
+        });
+        if ready {
+            AGG.with(|c| {
+                let mut slot = c.borrow_mut();
+                if let Some(all) = slot.as_mut() {
+                    if let Some(grp) = all.remove(&(b, s.kind)) {
+                        for line in render_group(b, s.kind, &grp) {
+                            eprintln!("{line}");
+                        }
+                    }
+                }
+            });
+        }
+        ready
+    }
+
+    /// 帯を出たときに、まだ N 窓に届いていない表を流す (`calls >= min_calls`)。
+    fn flush_band(b: u8, kind: u8, min_calls: u64) {
+        let mut out: Vec<String> = Vec::new();
+        AGG.with(|c| {
+            let mut slot = c.borrow_mut();
+            let Some(all) = slot.as_mut() else {
+                return;
+            };
+            let Some(grp) = all.get(&(b, kind)) else {
+                return;
+            };
+            let most = grp.lanes.values().map(|l| l.calls).max().unwrap_or(0);
+            if most >= min_calls {
+                if let Some(grp) = all.remove(&(b, kind)) {
+                    out = render_group(b, kind, &grp);
+                }
+            } else {
+                all.remove(&(b, kind));
+            }
+        });
+        for line in out {
+            eprintln!("{line}");
+        }
+    }
+
+    /// 表を組み立てる (整形だけ。GPU に触らない = テストできる)。
+    fn render_group(b: u8, kind: u8, grp: &Group) -> Vec<String> {
+        let mut out = Vec::new();
+        out.push(format!(
+            "[dec-kprof-avg] {} band={} windows={} lanes={} (us/窓。窓 = 1 層 1 回)",
+            kind_name(kind),
+            band_lo(b),
+            grp.n_win,
+            grp.lanes.len()
+        ));
+        out.push(
+            "[dec-kprof-avg]   li s calls   wall   kern   copy    gap   wait launch  steps"
+                .to_string(),
+        );
+        for ((li, site), l) in &grp.lanes {
+            let steps: f64 = l.steps.values().map(|(_, us)| *us).sum::<f64>();
+            out.push(format!(
+                "[dec-kprof-avg]   {:>2} {} {:>5} {:>6.1} {:>6.1} {:>6.1} {:>6.1} {:>6.1} {:>6.1} {:>6.1}",
+                li,
+                site,
+                l.calls,
+                l.wall_us / l.calls as f64,
+                l.kern_us / l.calls as f64,
+                l.copy_us / l.calls as f64,
+                l.gap_us / l.calls as f64,
+                l.wait_us / l.calls as f64,
+                l.launch_us / l.calls as f64,
+                steps / l.calls as f64
+            ));
+        }
+        // 操作別 (全レーン合計 / 窓数)。
+        out.push("[dec-kprof-avg]   op (全レーン。us は 1 窓あたりの平均)".to_string());
+        let mut ops: BTreeMap<&str, OpAgg> = BTreeMap::new();
+        for l in grp.lanes.values() {
+            for (name, e) in &l.ops {
+                let t = ops.entry(name.as_str()).or_default();
+                t.calls += e.calls;
+                t.gpu_us += e.gpu_us;
+                t.gap_us += e.gap_us;
+                t.hin_us += e.hin_us;
+                t.host_us += e.host_us;
+                t.bytes += e.bytes;
+                t.grid = e.grid;
+                t.block = e.block;
+                t.shmem = e.shmem;
+            }
+        }
+        for (name, e) in &ops {
+            let n = e.calls.max(1) as f64;
+            out.push(format!(
+                "[dec-kprof-avg]   op {} grid={} block={} shmem={} bytes={} n={} gpu={:.1} gap={:.1} hin={:.1} host={:.1}",
+                name,
+                grid_s(e.grid),
+                block_s(e.block),
+                e.shmem,
+                e.bytes / (e.calls.max(1) / grp.lanes.len().max(1) as u64).max(1),
+                e.calls,
+                e.gpu_us / n,
+                e.gap_us / n,
+                e.hin_us / n,
+                e.host_us / n
+            ));
+        }
+        // 名前付きホスト区間。
+        let mut steps: BTreeMap<&str, (u64, f64)> = BTreeMap::new();
+        for l in grp.lanes.values() {
+            for (name, (n, us)) in &l.steps {
+                let t = steps.entry(name.as_str()).or_insert((0, 0.0));
+                t.0 += n;
+                t.1 += us;
+            }
+        }
+        if !steps.is_empty() {
+            out.push("[dec-kprof-avg]   host step (全レーン。us は 1 回あたり)".to_string());
+            for (name, (n, us)) in &steps {
+                out.push(format!(
+                    "[dec-kprof-avg]   step {} n={} us={:.1} (総 {:.1} us)",
+                    name,
+                    n,
+                    us / (*n).max(1) as f64,
+                    us
+                ));
+            }
+        }
+        out
+    }
+
+    fn grid_s(g: (u32, u32, u32)) -> String {
+        if g == (0, 0, 0) {
+            "-".to_string()
+        } else {
+            format!("{}x{}x{}", g.0, g.1, g.2)
+        }
+    }
+
+    fn block_s(b: (u32, u32, u32)) -> String {
+        if b == (0, 0, 0) {
+            "-".to_string()
+        } else {
+            format!("{}x{}x{}", b.0, b.1, b.2)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// env を見ずに on/off を固定する (assert が落ちても戻す)。
+        struct Force(Option<bool>);
+        impl Force {
+            fn set(v: Option<bool>) -> Self {
+                let prev = FORCE.with(|c| c.get());
+                FORCE.with(|c| c.set(v));
+                Force(prev)
+            }
+        }
+        impl Drop for Force {
+            fn drop(&mut self) {
+                FORCE.with(|c| c.set(self.0));
+            }
+        }
+
+        /// task 177: GDN decode GEMV の env 解釈 (task 179 で既定だけ v4 に変えた)。
+        #[test]
+        fn gdn_dec_gemv_parse_truth_table() {
+            // 未設定・空・明示 off は Default (この既定が v4 を意味する)。
+            for raw in [
+                None,
+                Some(""),
+                Some("  "),
+                Some("0"),
+                Some("off"),
+                Some("false"),
+                Some("no"),
+                Some("v5"),
+                Some("x"),
+            ] {
+                assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::Default, "raw={raw:?}");
+            }
+            // 明示指定 (大小文字と前後空白は無視)。
+            assert_eq!(parse_gdn_dec_gemv(Some("v2")), GdnDecGemv::V2);
+            assert_eq!(parse_gdn_dec_gemv(Some(" V2 ")), GdnDecGemv::V2);
+            assert_eq!(parse_gdn_dec_gemv(Some("V3")), GdnDecGemv::V3);
+            assert_eq!(parse_gdn_dec_gemv(Some("fp16")), GdnDecGemv::Fp16);
+            assert_eq!(parse_gdn_dec_gemv(Some("v4")), GdnDecGemv::V4);
+            assert_eq!(parse_gdn_dec_gemv(Some("V4")), GdnDecGemv::V4);
+            // Default のときも gemv_kernel_mode() 側の選択肢に収まる。
+            assert!(matches!(
+                gdn_dec_gemv_mode_eff(),
+                GemvKernelMode::V2 | GemvKernelMode::V3 | GemvKernelMode::Fp16
+            ));
+            // task 179: 既定 (env 未設定) は v4 を選ぶ (lab t177c の -1.8% を採る)。
+            assert!(gdn_dec_gemv_v4_on());
+        }
+
+        #[test]
+        fn gdn_dec_v4_lanes_parse_and_shape_rule() {
+            // 既定 32、4..32 に丸める。
+            assert_eq!(parse_gdn_dec_v4_lanes(None), 32);
+            assert_eq!(parse_gdn_dec_v4_lanes(Some("")), 32);
+            assert_eq!(parse_gdn_dec_v4_lanes(Some("x")), 32);
+            assert_eq!(parse_gdn_dec_v4_lanes(Some("2")), 4);
+            assert_eq!(parse_gdn_dec_v4_lanes(Some("16")), 16);
+            assert_eq!(parse_gdn_dec_v4_lanes(Some("32")), 32);
+            assert_eq!(parse_gdn_dec_v4_lanes(Some("64")), 32);
+            // 形の規則: n_in % (lanes*32) == 0 を満たす最大の 2 の冪。
+            // 実形 k=2560 (qkv / gate): 16 が上限 (2560/16 = 160 = 32*5)。
+            assert_eq!(v4_lanes_for(2_560, 32), 16);
+            assert_eq!(v4_lanes_for(2_560, 16), 16);
+            assert_eq!(v4_lanes_for(2_560, 8), 8);
+            assert_eq!(v4_lanes_for(2_560, 4), 4);
+            // 実形 k=6144 (attn_out): 32 まで行ける。
+            assert_eq!(v4_lanes_for(6_144, 32), 32);
+            assert_eq!(v4_lanes_for(6_144, 16), 16);
+            // 32 の倍数でない k は v3 に任せる (0)。
+            assert_eq!(v4_lanes_for(2_560 + 16, 32), 0);
+            // 4 未満しか無い形も v3 に任せる。
+            assert_eq!(v4_lanes_for(64, 32), 0);
+            // 2 の冪でない上限は切り下げる。
+            assert_eq!(v4_lanes_for(6_144, 20), 16);
+        }
+
+        #[test]
+        fn band_covers_the_three_measured_points() {
+            assert_eq!(band(0), Some(0));
+            assert_eq!(band(1), Some(0));
+            assert_eq!(band(399), Some(0));
+            assert_eq!(band(400), None);
+            assert_eq!(band(2_000), None);
+            assert_eq!(band(3_799), None);
+            assert_eq!(band(3_800), Some(1));
+            assert_eq!(band(3_965), Some(1));
+            assert_eq!(band(4_100), Some(1));
+            assert_eq!(band(4_101), None);
+            assert_eq!(band(13_999), None);
+            assert_eq!(band(14_000), Some(2));
+            assert_eq!(band(14_159), Some(2));
+            assert_eq!(band(14_400), Some(2));
+            assert_eq!(band(14_401), None);
+        }
+
+        #[test]
+        fn should_begin_truth_table() {
+            // 窓が開いていれば入れ子は開かない。
+            assert!(!should_begin(true, false, 0, 1, GDN, true));
+            // イベントを作れなかったら以後は開かない (静かに no-op にしない)。
+            assert!(!should_begin(false, true, 0, 1, GDN, true));
+            // 帯の外は開かない。
+            assert!(!should_begin(false, false, 0, 2_000, GDN, true));
+            // decode 窓の外 (prefill の逐次 1 トークン) は開かない。
+            assert!(!should_begin(false, false, 0, 1, GDN, false));
+            // 帯の中なら開く。
+            assert!(should_begin(false, false, 0, 1, GDN, true));
+            assert!(should_begin(false, false, 0, 3_965, GDN, true));
+            assert!(should_begin(false, false, 0, 14_159, FULL, true));
+            // 同じ (帯, 種類) を出した後は開かない。
+            let m = mask(3_965, GDN);
+            assert!(!should_begin(false, false, m, 3_970, GDN, true));
+            // 違う種類は開く。
+            assert!(should_begin(false, false, m, 3_970, MIX, true));
+            // 違う帯は開く。
+            assert!(should_begin(false, false, m, 14_159, GDN, true));
+            // mask は帯と種類で別のビット。
+            assert_ne!(mask(1, GDN), mask(3_965, GDN));
+            assert_ne!(mask(1, GDN), mask(1, MIX));
+            assert_ne!(mask(3_965, GDN), mask(14_159, GDN));
+            // task 179 の回帰: 帯 0 を出した後でも帯 2 は開く
+            // (u8 の mask では (8 + kind) & 7 に化けて帯 0 と同じ bit になり、
+            //  14k の表が 1 度も出なかった)。
+            let m0 = mask(1, FULL);
+            assert!(should_begin(false, false, m0, 14_159, FULL, true));
+            assert!(!should_begin(false, false, m0, 1, FULL, true));
+            // 3 帯 x 3 種類のビットが全て異なる。
+            let mut bits = std::collections::BTreeSet::new();
+            for pos in [1u64, 3_965, 14_159] {
+                for kind in [GDN, MIX, FULL] {
+                    assert!(bits.insert(mask(pos, kind)), "bit が衝突: pos={pos} kind={kind}");
+                }
+            }
+        }
+
+        /// コピーの判定 (表の列分けの規則)。
+        #[test]
+        fn copy_rows_are_classified_by_prefix() {
+            for n in ["H2D", "H2D@", "H2D@a", "D2H", "D2H@a"] {
+                assert!(is_copy(n), "{n}");
+            }
+            for n in ["K dno_gemv_q8_0_v3", "sync", "D2D", "step"] {
+                assert!(!is_copy(n), "{n}");
+            }
+        }
+
+        /// 平均の組み立て: 2 レーン x 2 窓の合成データで、列の意味
+        /// (kern/copy/gap/wait/launch/steps) と平均値が合うこと。
+        #[test]
+        fn render_averages_the_columns() {
+            let mut grp = Group::default();
+            grp.n_win = 2;
+            for (li, wall, kern) in [(3usize, 300.0f64, 200.0f64), (7, 200.0, 150.0)] {
+                let l = grp.lanes.entry((li, 0)).or_default();
+                l.calls = 2;
+                l.wall_us = wall * 2.0;
+                l.kern_us = kern * 2.0;
+                l.copy_us = 20.0 * 2.0;
+                l.gap_us = 30.0 * 2.0;
+                l.wait_us = 50.0 * 2.0;
+                l.launch_us = 4.0 * 2.0;
+                l.steps
+                    .insert("rope_q".to_string(), (2, 12.0 * 2.0));
+                let mut e = OpAgg::default();
+                e.calls = 2;
+                e.gpu_us = kern * 2.0;
+                e.host_us = 4.0 * 2.0;
+                e.grid = (320, 1, 1);
+                e.block = (32, 1, 1);
+                l.ops.insert("K dno_gemv_q8_0_v3".to_string(), e);
+            }
+            let lines = render_group(1, FULL, &grp);
+            let all = lines.join("\n");
+            assert!(all.contains("full band=3800 windows=2 lanes=2"), "{all}");
+            assert!(all.contains("li s calls"), "{all}");
+            // li=3: wall 300 / kern 200 / copy 20 / gap 30 / wait 50 / launch 4 / steps 12
+            assert!(
+                all.contains("3 0     2  300.0  200.0   20.0   30.0   50.0    4.0   12.0"),
+                "{all}"
+            );
+            assert!(all.contains("7 0     2  200.0  150.0"), "{all}");
+            // 操作別: 2 レーン x 2 窓 = 4 回。gpu は 1 窓あたりに戻す。
+            assert!(all.contains("op K dno_gemv_q8_0_v3"), "{all}");
+            assert!(all.contains("n=4"), "{all}");
+            assert!(all.contains("gpu=175.0"), "{all}");
+            // step は 1 回あたり。
+            assert!(all.contains("step rope_q n=4 us=12.0"), "{all}");
+        }
+
+        /// off のときは窓が開かず、`op_begin` が 1 件も積まないこと
+        /// (既定 off が「静かに計測する」に化けていないことの確認)。
+        #[test]
+        fn off_opens_no_window_and_records_nothing() {
+            let _f = Force::set(Some(false));
+            let _w = window(GDN, 7, 3_965, 0);
+            assert_eq!(
+                op_begin(|| "x".to_string(), (1, 1, 1), (1, 1, 1), 0, 0),
+                None
+            );
+            let n = ST.with(|c| c.borrow().as_ref().map(|s| s.entries.len()));
+            assert!(n.unwrap_or(0) == 0, "off で記録が積まれた");
+        }
+
+        /// 入れ子の guard が外側の窓を閉じないこと (task 179 で直した取り違え)。
+        #[test]
+        fn nested_window_guard_does_not_close_the_outer_one() {
+            let _f = Force::set(Some(true));
+            // decode 窓を開く (window は decode の内側でしか開かない)。
+            crate::model::qwen4exp::gdn_gpu_win::set_window_for_test(true);
+            // このコンテナには GPU が無いので、窓は開いてもすぐ dead になる。
+            // それでも guard の所有権 (open) は外側だけが持つ。
+            let outer = window(FULL, 3, 3_965, 0);
+            assert!(ACTIVE.with(|c| c.get()), "外側の窓が開かない");
+            let inner = window(MIX, 0, 3_965, 0);
+            assert!(ACTIVE.with(|c| c.get()));
+            drop(inner);
+            assert!(ACTIVE.with(|c| c.get()), "内側の drop で外側が閉じた");
+            drop(outer);
+            assert!(!ACTIVE.with(|c| c.get()), "外側の drop で閉じない");
+            crate::model::qwen4exp::gdn_gpu_win::set_window_for_test(false);
+        }
+
+        /// GPU が無い環境ではイベントを作れない = dead になり、2 回目以降は
+        /// 窓を開かない (無限に試さない)。
+        #[test]
+        fn gpu_less_host_marks_dead_after_the_first_attempt() {
+            let _f = Force::set(Some(true));
+            let _w = window(GDN, 0, 3_965, 0);
+            // イベントが作れない環境 (このコンテナ) では dead が立つ。
+            let dead = ST.with(|c| c.borrow().as_ref().map(|s| s.dead))
+                .unwrap_or(false);
+            if dead {
+                assert!(!should_begin(false, true, 0, 3_970, GDN, true));
+            }
+        }
+    }
+}
+
+
+// ---- task 179: decode の full attention 1 層をデバイスで閉じる -----------------
+//
+// 背景 (lab t179a の平均表): full 層 1 回の wall ~264 us の内訳は
+//   GPU カーネル 176 / コピー 43 / gap 28 / ホスト仕事 31 (うち gate_mul 10.4,
+//   rope_q 3.8, kv_split 1.1, rope_k 0.6, mirror_book 0.5, cache_push 0.4)
+// だった。qkv GEMV の出力をホストへ戻す → 正規化 + rope → ミラーへ H2D →
+// attention → D2H → 出力ゲート → 出力投影 H2D → D2H という往復が、
+// コピーとホスト仕事と GPU の gap を層ごとに作っている。
+//
+// ここでは 1 層を**デバイスで閉じる**: qkv GEMV (デバイス出力) → q/k 正規化 +
+// rope + gate 取り出し (kernels_dec_dev.cu) → KV ミラー 1 行を D2D →
+// attention (デバイス入力・出力) → 出力ゲート → 出力投影 GEMV (デバイス入力)
+// → 最後に 2 本の D2H (層出力と KV 行) と 1 回の同期だけ。
+//
+// 数値: 既存経路と**ビット一致**する。
+// - rope の cos/sin はホストで CPU と同じ式 (`theta.powf(-2j/n_rot)` の f32) で
+//   作り、カーネル引数として**値渡し**する (デバイスの powf/cosf は使わない)。
+// - 正規化の二乗和は thread 0 の逐次 (CPU と同じ順)、`(x*inv)*w` の左結合。
+// - 出力ゲートは dno_expf (glibc expf の再現) + `1/(1+e)` + 乗算。
+// - GEMV は既存と同じカーネル・同じ起動形状 (`plan_moe_gemv`) を使う。
+//
+// フォールバック (None): ゲート off / 形が合わない / PTX が無い / ミラーが
+// 全行シードを要する (cap 成長・新しい層・世代違い) / 起動に失敗。呼び出し側は
+// 従来のホスト経路をそのまま走らせる (数値は従来どおり)。
+// ---------------------------------------------------------------------------
+pub(crate) mod dec_full_dev {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    /// 既定値。lab t179c の VERDICT (decode -5.5%、深い 2 点は -6.6/-6.4%、
+    /// md5 SAME、errors 0、prefill -0.8%) で採否を yes にしたので既定 on。
+    /// `DENNO_FULL_DEC_DEV=0` で従来経路へ戻る。
+    const DEFAULT_ON: bool = true;
+
+    /// `DENNO_FULL_DEC_DEV` (既定 `DEFAULT_ON`)。
+    pub(crate) fn on() -> bool {
+        if let Some(v) = force_for_test() {
+            return v;
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| match std::env::var("DENNO_FULL_DEC_DEV").ok() {
+            None => DEFAULT_ON,
+            Some(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "" | "0" | "off" | "false" | "no")
+            }
+        })
+    }
+
+    fn force_for_test() -> Option<bool> {
+        #[cfg(test)]
+        {
+            return FORCE.with(|c| c.get());
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    /// テストが env を立てずに on/off を強制する。
+    #[cfg(test)]
+    pub(crate) fn set_force_for_test(v: Option<bool>) {
+        FORCE.with(|c| c.set(v));
+    }
+
+    /// rope の cos/sin 表の上限 (対の本数)。`n_rot <= 2 * CS_MAX`。
+    const CS_MAX: usize = 64;
+
+    thread_local! {
+        static FORCE: Cell<Option<bool>> = const { Cell::new(None) };
+        static ST: RefCell<St> = const { RefCell::new(St::new()) };
+    }
+
+    /// qkv の融合 GEMV 1 発ぶんの記述 (連結できない層は 3 本に分かれる)。
+    #[derive(Clone, Copy)]
+    pub(crate) struct Unit<'a> {
+        pub uid: u64,
+        pub ty: crate::kquant::GgmlType,
+        pub blocks: &'a [u8],
+        pub k: usize,
+        pub n: usize,
+        /// 出力 (`qkv` バッファ) の何行目から書くか。
+        pub out_row: usize,
+    }
+
+    /// 呼び出し 1 回ぶんの入力 (すべてホスト側の値)。
+    pub(crate) struct Call<'a> {
+        pub cache_id: u64,
+        pub n_layer: usize,
+        pub layer: usize,
+        pub layer_gen: u64,
+        /// push 後の行数 (= pos + 1)
+        pub len: usize,
+        pub kv_dim: usize,
+        pub heads: usize,
+        pub group: usize,
+        pub dh: usize,
+        pub scale: f32,
+        pub n_rot: usize,
+        pub pos: usize,
+        pub theta: f32,
+        pub eps: f32,
+        pub q_norm: &'a [f32],
+        pub k_norm: &'a [f32],
+        /// qkv の GEMV (q|gate|k|v)。連結できた層は 1 本、できない層は 3 本。
+        pub qkv_units: &'a [Unit<'a>],
+        /// 入力長 (= 全 unit 共通) と出力の合計行数。
+        pub qkv_k: usize,
+        pub qkv_n: usize,
+        /// q / k / v の部分が `qkv` バッファの何行目から始まるか (float 単位)。
+        /// カーネルは [q|gate][k][v] の並びを前提にするので、連結時に並びが
+        /// 変わった層 (fuse_parts の zero-copy reorder) はここで弾く。
+        pub q_off: usize,
+        pub k_off: usize,
+        pub v_off: usize,
+        /// 出力投影
+        pub wo_uid: u64,
+        pub wo_ty: crate::kquant::GgmlType,
+        pub wo_blocks: &'a [u8],
+        pub wo_k: usize,
+        pub wo_n: usize,
+        pub n_embd: usize,
+        /// 層の入力 (ホスト)
+        pub cur: &'a [f32],
+    }
+
+    /// 戻り (層の出力と、ホスト KV キャッシュへ push する行)。
+    pub(crate) struct Out {
+        pub out: Vec<f32>,
+        pub k: Vec<f32>,
+        pub v: Vec<f32>,
+    }
+
+    /// 層ごとの norm 重み (ホスト側ポインタが変わったら上げ直す)。
+    struct Norms {
+        key: (usize, usize),
+        q: DevBuffer,
+        k: DevBuffer,
+    }
+
+    struct St {
+        qkv_in: Option<DevBuffer>,
+        qkv: Option<DevBuffer>,
+        qout: Option<DevBuffer>,
+        gate: Option<DevBuffer>,
+        kout: Option<DevBuffer>,
+        kv: Option<DevBuffer>,
+        out: Option<DevBuffer>,
+        pin_x: Option<PinMem>,
+        pin_out: Option<PinMem>,
+        pin_kv: Option<PinMem>,
+        norms: Vec<Option<Norms>>,
+    }
+
+    impl St {
+        const fn new() -> Self {
+            Self {
+                qkv_in: None,
+                qkv: None,
+                qout: None,
+                gate: None,
+                kout: None,
+                kv: None,
+                out: None,
+                pin_x: None,
+                pin_out: None,
+                pin_kv: None,
+                norms: Vec::new(),
+            }
+        }
+    }
+
+    impl<'a> Call<'a> {
+        /// 形が dev 経路で扱えるか (ホスト側だけで判定できる)。
+        fn ok_shape(&self) -> bool {
+            let nkv = if self.group > 0 {
+                self.heads / self.group
+            } else {
+                0
+            };
+            self.len > 0
+                && self.len <= 65535
+                && self.heads > 0
+                && self.group > 0
+                && self.group <= 32
+                && self.heads % self.group == 0
+                && self.dh >= 32
+                && self.dh <= 1024
+                && self.dh % 4 == 0
+                && self.kv_dim == nkv * self.dh
+                && self.n_rot % 2 == 0
+                && self.n_rot <= self.dh
+                && self.n_rot / 2 <= CS_MAX
+                && self.q_norm.len() == self.dh
+                && self.k_norm.len() == self.dh
+                && self.qkv_n == 2 * self.heads * self.dh + 2 * self.kv_dim
+                && self.qkv_k > 0
+                && self.cur.len() == self.qkv_k
+                && self.units_ok()
+                // カーネルの前提: [q(2dh/head)][k][v] の並び。
+                && self.q_off == 0
+                && self.k_off == 2 * self.heads * self.dh
+                && self.v_off == 2 * self.heads * self.dh + self.kv_dim
+                && self.wo_k == self.heads * self.dh
+                && self.wo_n == self.n_embd
+                && self.n_embd > 0
+        }
+
+        /// qkv の unit 列が「同じ入力長・隙間なく qkv_n 行」を満たすか。
+        fn units_ok(&self) -> bool {
+            if self.qkv_units.is_empty() || self.qkv_units.len() > 4 {
+                return false;
+            }
+            let mut at = 0usize;
+            for u in self.qkv_units {
+                if u.k != self.qkv_k || u.n == 0 || u.out_row != at {
+                    return false;
+                }
+                at += u.n;
+            }
+            at == self.qkv_n
+        }
+    }
+
+    /// この経路の attention の下限行数 (既定 1 = 常に GPU)。
+    fn full_dec_attn_min() -> usize {
+        static N: OnceLock<usize> = OnceLock::new();
+        *N.get_or_init(|| match std::env::var("DENNO_FULL_DEC_ATTN_MIN").ok() {
+            Some(v) => v.trim().parse::<usize>().unwrap_or(1),
+            None => 1,
+        })
+    }
+
+    /// 1 行だけログる (フォールバックの理由。既定は出さない)。
+    fn note_fallback(why: &str) {
+        static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[full-dec-dev] 従来経路へ: {why}");
+        }
+    }
+
+    /// 1 層をデバイスで回す。`None` = この回は従来経路。
+    pub(crate) fn forward(a: &Call<'_>) -> Option<Out> {
+        if !on() {
+            return None;
+        }
+        // GPU attention のゲートを従来経路と揃える (無効なら CPU へ落ちるので
+        // ここで何もせず None を返す)。
+        if !cuda_enabled() || !gpu_attention_enabled() || !q4_gpu_attn_enabled() {
+            return None;
+        }
+        // task 179: 従来経路は `len < q4_gpu_attn_min()` (既定 64) で CPU へ
+        // 落ちるが、この経路は attention が同じ submission に載るので起動の
+        // 追加コストが無い。短い文脈でも GPU の split カーネルを使う
+        // (丸め順は CPU と違う。attention は P17g から緩和済みの契約)。
+        // `DENNO_FULL_DEC_ATTN_MIN` で下限を戻せる。
+        if a.len < full_dec_attn_min() {
+            return None;
+        }
+        if !a.ok_shape() {
+            note_fallback("形が合わない");
+            return None;
+        }
+        let Some(ctx) = chain_ctx() else {
+            note_fallback("chain_ctx が無い");
+            return None;
+        };
+        if let Err(e) = ctx.make_current() {
+            note_fallback(&format!("cuCtxSetCurrent: {e:#}"));
+            return None;
+        }
+        match ST.with(|cell| forward_inner(&ctx, a, &mut cell.borrow_mut())) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                note_fallback(&format!("{e:#}"));
+                None
+            }
+        }
+    }
+
+    fn forward_inner(ctx: &CudaCtx, a: &Call<'_>, st: &mut St) -> Result<Out> {
+        let qd = a.heads * a.dh;
+        let kv_dim = a.kv_dim;
+        let nkv = a.heads / a.group;
+
+        // 1) qkv GEMV: ホスト cur -> デバイス (D2H しない)
+        Scratch::ensure(&mut st.qkv_in, a.qkv_k * 4)?;
+        Scratch::ensure(&mut st.qkv, a.qkv_n * 4)?;
+        Scratch::ensure_pin(&mut st.pin_x, a.qkv_k * 4)?;
+        {
+            let px = st.pin_x.as_mut().expect("ensure 済み");
+            px.as_mut_slice::<f32>()[..a.qkv_k].copy_from_slice(a.cur);
+        }
+        let x_ptr = st.qkv_in.as_ref().expect("ensure 済み").ptr();
+        let qkv_ptr = st.qkv.as_ref().expect("ensure 済み").ptr();
+        {
+            let lib = lib()?;
+            let pin = st.pin_x.as_ref().expect("ensure 済み");
+            unsafe {
+                check(
+                    (lib.memcpy_htod_async)(
+                        x_ptr,
+                        pin.ptr as *const c_void,
+                        a.qkv_k * 4,
+                        std::ptr::null_mut(),
+                    ),
+                    "cuMemcpyHtoDAsync (full dec dev)",
+                )?;
+            }
+        }
+        for u in a.qkv_units {
+            let w = weights_for_gguf(u.uid, u.ty, u.blocks, u.k, u.n)?;
+            let Some(plan) = ctx.plan_moe_gemv(u.ty, u.k, u.n, gemv_kernel_mode())? else {
+                bail!("qkv GEMV の plan が無い ({:?})", u.ty);
+            };
+            if w.buf.bytes() != u.n * plan.rb {
+                bail!("qkv 重みのバイト数が合わない ({:?})", u.ty);
+            }
+            launch_plan(
+                ctx,
+                &plan,
+                w.buf.ptr(),
+                x_ptr,
+                qkv_ptr + (u.out_row * 4) as u64,
+                u.k,
+                u.n,
+            )?;
+        }
+
+        // 2) q/k 正規化 + rope + gate 取り出し
+        let kernels = dev_kernels()?;
+        Scratch::ensure(&mut st.qout, qd * 4)?;
+        Scratch::ensure(&mut st.gate, qd * 4)?;
+        Scratch::ensure(&mut st.kout, kv_dim * 4)?;
+        Scratch::ensure(&mut st.kv, 2 * kv_dim * 4)?;
+        upload_norms(st, a)?;
+        let half = a.n_rot / 2;
+        let mut cs = [0f32; 2 * CS_MAX];
+        {
+            let posf = a.pos as f32;
+            for j in 0..half {
+                let ang = posf * a.theta.powf(-2.0 * j as f32 / a.n_rot as f32);
+                cs[j * 2] = ang.cos();
+                cs[j * 2 + 1] = ang.sin();
+            }
+        }
+        let (qout, gout, kout, kv) = (
+            st.qout.as_ref().expect("ensure 済み").ptr(),
+            st.gate.as_ref().expect("ensure 済み").ptr(),
+            st.kout.as_ref().expect("ensure 済み").ptr(),
+            st.kv.as_ref().expect("ensure 済み").ptr(),
+        );
+        {
+            let norms = st.norms[a.layer].as_ref().expect("直前に用意した");
+            let (mut p_qkv, mut p_q, mut p_g, mut p_k, mut p_kv) =
+                (qkv_ptr, qout, gout, kout, kv);
+            let (mut p_wq, mut p_wk) = (norms.q.ptr(), norms.k.ptr());
+            let mut p_cs = cs;
+            let (mut heads_c, mut nkv_c, mut dh_c) =
+                (a.heads as c_int, nkv as c_int, a.dh as c_int);
+            let (mut nrot_c, mut qg_c, mut kvd_c) =
+                (a.n_rot as c_int, (2 * qd) as c_int, kv_dim as c_int);
+            let mut eps_c = a.eps;
+            let mut args: Vec<*mut c_void> = vec![
+                &mut p_qkv as *mut _ as *mut c_void,
+                &mut p_q as *mut _ as *mut c_void,
+                &mut p_g as *mut _ as *mut c_void,
+                &mut p_k as *mut _ as *mut c_void,
+                &mut p_kv as *mut _ as *mut c_void,
+                &mut p_wq as *mut _ as *mut c_void,
+                &mut p_wk as *mut _ as *mut c_void,
+                &mut p_cs as *mut _ as *mut c_void,
+                &mut heads_c as *mut _ as *mut c_void,
+                &mut nkv_c as *mut _ as *mut c_void,
+                &mut dh_c as *mut _ as *mut c_void,
+                &mut nrot_c as *mut _ as *mut c_void,
+                &mut qg_c as *mut _ as *mut c_void,
+                &mut kvd_c as *mut _ as *mut c_void,
+                &mut eps_c as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                ctx.launch_async(
+                    kernels.f_norm,
+                    ((a.heads + nkv) as u32, 1, 1),
+                    (a.dh as u32, 1, 1),
+                    (2 * a.dh * 4) as u32,
+                    &mut args,
+                )?;
+            }
+        }
+
+        // 3) KV ミラー 1 行を D2D で追記
+        let (mkptr, mvptr) = mirror_append(
+            a.cache_id,
+            a.n_layer,
+            kv_dim,
+            a.layer,
+            a.layer_gen,
+            a.len,
+            kout,
+            kv + (kv_dim * 4) as u64,
+        )
+        .ok_or_else(|| anyhow!("ミラーの 1 行追記ができない (全行シードが必要)"))?;
+
+        // 4) attention (デバイス入力・出力)
+        let aptr = attn_launch(
+            ctx, qout, mkptr, mvptr, a.len, kv_dim, a.heads, a.group, a.dh, a.scale,
+        )?;
+
+        // 5) 出力ゲート (デバイス)
+        {
+            let mut p_out = aptr;
+            let mut p_gate = gout;
+            let mut n_c = qd as c_int;
+            let mut args: Vec<*mut c_void> = vec![
+                &mut p_out as *mut _ as *mut c_void,
+                &mut p_gate as *mut _ as *mut c_void,
+                &mut n_c as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                ctx.launch_async(
+                    kernels.f_gate,
+                    ((qd as u32).div_ceil(256), 1, 1),
+                    (256, 1, 1),
+                    0,
+                    &mut args,
+                )?;
+            }
+        }
+
+        // 6) 出力投影 (デバイス入力)。既定は v4 (レーン数可変) — lab t177c で
+        //    同じ形 (k=6144 Q8_0 / n=2560) が 51.2 -> 25.7 us。形が合わない・
+        //    PTX が無いときは従来 (v3) の plan へ。
+        let w_wo = weights_for_gguf(a.wo_uid, a.wo_ty, a.wo_blocks, a.wo_k, a.wo_n)?;
+        let plan_wo = wo_plan(ctx, a)?;
+        let Some(plan_wo) = plan_wo else {
+            bail!("出力投影の plan が無い ({:?})", a.wo_ty);
+        };
+        if w_wo.buf.bytes() != a.wo_n * plan_wo.rb {
+            bail!("出力投影の重みのバイト数が合わない");
+        }
+        Scratch::ensure(&mut st.out, a.wo_n * 4)?;
+        let optr = st.out.as_ref().expect("ensure 済み").ptr();
+        launch_plan(ctx, &plan_wo, w_wo.buf.ptr(), aptr, optr, a.wo_k, a.wo_n)?;
+
+        // 7) D2H 2 本 + 1 回の同期
+        Scratch::ensure_pin(&mut st.pin_out, a.wo_n * 4)?;
+        Scratch::ensure_pin(&mut st.pin_kv, 2 * kv_dim * 4)?;
+        {
+            let lib = lib()?;
+            let po = st.pin_out.as_ref().expect("ensure 済み");
+            let pk = st.pin_kv.as_ref().expect("ensure 済み");
+            unsafe {
+                check(
+                    (lib.memcpy_dtoh_async)(po.ptr, optr, a.wo_n * 4, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (full dec dev out)",
+                )?;
+                check(
+                    (lib.memcpy_dtoh_async)(pk.ptr, kv, 2 * kv_dim * 4, std::ptr::null_mut()),
+                    "cuMemcpyDtoHAsync (full dec dev kv)",
+                )?;
+            }
+        }
+        ctx.sync()?;
+        let out: Vec<f32> = st
+            .pin_out
+            .as_ref()
+            .expect("ensure 済み")
+            .as_slice::<f32>()[..a.wo_n]
+            .to_vec();
+        let kvh: Vec<f32> = st
+            .pin_kv
+            .as_ref()
+            .expect("ensure 済み")
+            .as_slice::<f32>()[..2 * kv_dim]
+            .to_vec();
+        let k = kvh[..kv_dim].to_vec();
+        let v = kvh[kv_dim..].to_vec();
+        Ok(Out { out, k, v })
+    }
+
+    /// norm 重みを層ごとに 1 回だけ上げる (ポインタが変われば上げ直す)。
+    fn upload_norms(st: &mut St, a: &Call<'_>) -> Result<()> {
+        let key = (a.q_norm.as_ptr() as usize, a.k_norm.as_ptr() as usize);
+        if st.norms.len() <= a.layer {
+            st.norms.resize_with(a.layer + 1, || None);
+        }
+        let need = match &st.norms[a.layer] {
+            Some(n) => n.key != key,
+            None => true,
+        };
+        if need {
+            let q = DevBuffer::alloc_tagged(a.dh * 4, crate::mem_audit::TAG_OTHER)?;
+            q.copy_from(a.q_norm)?;
+            let k = DevBuffer::alloc_tagged(a.dh * 4, crate::mem_audit::TAG_OTHER)?;
+            k.copy_from(a.k_norm)?;
+            st.norms[a.layer] = Some(Norms { key, q, k });
+        }
+        Ok(())
+    }
+
+    /// 出力投影の plan。既定は v4 (`DENNO_FULL_DEC_GEMV=v3` で従来へ)。
+    fn wo_plan(ctx: &CudaCtx, a: &Call<'_>) -> Result<Option<MoeGemvPlan>> {
+        static V4: OnceLock<bool> = OnceLock::new();
+        let v4_on = *V4.get_or_init(|| {
+            !matches!(
+                std::env::var("DENNO_FULL_DEC_GEMV").ok().as_deref(),
+                Some("v3") | Some("0") | Some("off") | Some("false")
+            )
+        });
+        if v4_on {
+            if let Some(p) = ctx.plan_moe_gemv_v4(a.wo_ty, a.wo_k, a.wo_n, gdn_dec_v4_lanes_cap()) {
+                return Ok(Some(p));
+            }
+        }
+        ctx.plan_moe_gemv(a.wo_ty, a.wo_k, a.wo_n, gemv_kernel_mode())
+    }
+
+    /// GEMV の起動 (引数は `moe_gemv_dev_with` と同一)。
+    fn launch_plan(
+        ctx: &CudaCtx,
+        plan: &MoeGemvPlan,
+        wptr: CUdeviceptr,
+        xptr: CUdeviceptr,
+        optr: CUdeviceptr,
+        n_in: usize,
+        n_out: usize,
+    ) -> Result<()> {
+        let (mut pw, mut px, mut po) = (wptr, xptr, optr);
+        let (mut n_in_c, mut n_out_c, mut rb_c) =
+            (n_in as c_int, n_out as c_int, plan.rb as c_int);
+        let (mut rows_c, mut lanes_c) = (plan.rows_per_block as c_int, plan.lanes as c_int);
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut n_in_c as *mut _ as *mut c_void,
+            &mut n_out_c as *mut _ as *mut c_void,
+            &mut rb_c as *mut _ as *mut c_void,
+            &mut rows_c as *mut _ as *mut c_void,
+            &mut lanes_c as *mut _ as *mut c_void,
+        ];
+        let nargs = if plan.lanes > 1 { 8 } else { 6 };
+        unsafe {
+            ctx.launch_async(
+                plan.f,
+                (plan.grid, 1, 1),
+                (plan.block_dim, 1, 1),
+                plan.shmem,
+                &mut args[..nargs],
+            )
+        }
+    }
+
+    /// ミラーへ 1 行だけ D2D で追記する。全行シードが要るときは None。
+    #[allow(clippy::too_many_arguments)]
+    fn mirror_append(
+        cache_id: u64,
+        n_layer: usize,
+        kv_dim: usize,
+        layer: usize,
+        gen: u64,
+        len: usize,
+        src_k: CUdeviceptr,
+        src_v: CUdeviceptr,
+    ) -> Option<(CUdeviceptr, CUdeviceptr)> {
+        if len == 0 || layer >= n_layer {
+            return None;
+        }
+        let mirrors = Q4_ATTN_MIRRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        let mut ms = match mirrors.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let now = std::time::Instant::now();
+        let mut meta: Vec<MirrorMeta> = ms
+            .iter()
+            .map(|(k, m, t)| MirrorMeta {
+                key: *k,
+                bytes: m.bytes(),
+                last: *t,
+                pending: false,
+            })
+            .collect();
+        let evicted = lru_evict_keys(&mut meta, q4_attn_mirror_limit_bytes(), cache_id);
+        if !evicted.is_empty() {
+            ms.retain(|(k, _, _)| !evicted.contains(k));
+        }
+        let idx = match ms.iter().position(|(k, _, _)| *k == cache_id) {
+            Some(i) => {
+                ms[i].2 = now;
+                i
+            }
+            None => {
+                ms.push((cache_id, Q4AttnMirror::new(n_layer, kv_dim), now));
+                ms.len() - 1
+            }
+        };
+        if ms[idx].1.kv_dim != kv_dim || ms[idx].1.state.len.len() != n_layer {
+            ms[idx].1 = Q4AttnMirror::new(n_layer, kv_dim);
+        }
+        let m = &mut ms[idx].1;
+        if m.k[layer].is_none() || m.v[layer].is_none() {
+            return None;
+        }
+        if len > m.state.cap || q4_mirror_cap(len, m.state.cap) > m.state.cap {
+            return None;
+        }
+        let have = q4_mirror_have(&m.state, layer, len, gen);
+        if have + 1 != len {
+            return None;
+        }
+        let row_bytes = kv_dim * 4;
+        let need = len * row_bytes;
+        let (kb, vb) = (m.k[layer].as_ref()?, m.v[layer].as_ref()?);
+        if kb.bytes() < need || vb.bytes() < need {
+            return None;
+        }
+        let off = ((len - 1) * row_bytes) as u64;
+        let lib = lib().ok()?;
+        unsafe {
+            if (lib.memcpy_dtod_async)(kb.ptr() + off, src_k, row_bytes, std::ptr::null_mut())
+                != CUDA_SUCCESS
+            {
+                return None;
+            }
+            if (lib.memcpy_dtod_async)(vb.ptr() + off, src_v, row_bytes, std::ptr::null_mut())
+                != CUDA_SUCCESS
+            {
+                return None;
+            }
+        }
+        q4_mirror_note(&mut m.state, layer, len, gen);
+        Some((kb.ptr(), vb.ptr()))
+    }
+
+    /// attention をデバイス入出力で 2 発打ち、出力のデバイスポインタを返す。
+    #[allow(clippy::too_many_arguments)]
+    fn attn_launch(
+        ctx: &CudaCtx,
+        qptr: CUdeviceptr,
+        kptr: CUdeviceptr,
+        vptr: CUdeviceptr,
+        len: usize,
+        kv_dim: usize,
+        heads: usize,
+        group: usize,
+        dh: usize,
+        scale: f32,
+    ) -> Result<CUdeviceptr> {
+        let n_kv = heads / group;
+        let qd = heads * dh;
+        let mut kv_dim_c = kv_dim as c_int;
+        let mut t_c = len as c_int;
+        let mut group_c = group as c_int;
+        let mut dh_c = dh as c_int;
+        let mut scale_c = scale;
+        let mut heads_c = heads as c_int;
+        let mut nsplit_c;
+        // 既定 (t179a の log と同じ) は「1024 未満は split・以上は flashdec」。
+        if attn_flashdec_enabled() && len >= attn_flashdec_min_ctx() {
+            if let Some(k) = fdec_kernels() {
+                let (n_split, chunk) = q4_fdec_split(len, attn_flashdec_chunk());
+                fdec_log(len, n_split, chunk, kv_dim, dh, group);
+                nsplit_c = n_split as c_int;
+                let nkv_c = n_kv as c_int;
+                let part_bytes = heads * n_split * (dh + ATTN_FDEC_PART_EXTRA) * 4;
+                return Q4ATTN_SCRATCH.with(|cell| -> Result<CUdeviceptr> {
+                    let mut s = cell.borrow_mut();
+                    Scratch::ensure(&mut s.out, qd * 4)?;
+                    Scratch::ensure(&mut s.part, part_bytes)?;
+                    let mut qptr_c = qptr;
+                    let aptr = s.out.as_ref().expect("ensure 済み").ptr();
+                    let mut aptr_c = aptr;
+                    let mut partptr = s.part.as_ref().expect("ensure 済み").ptr();
+                    let mut kptr_c = kptr;
+                    let mut vptr_c = vptr;
+                    let mut args: Vec<*mut c_void> = vec![
+                        &mut qptr_c as *mut _ as *mut c_void,
+                        &mut kptr_c as *mut _ as *mut c_void,
+                        &mut vptr_c as *mut _ as *mut c_void,
+                        &mut partptr as *mut _ as *mut c_void,
+                        &mut kv_dim_c as *mut _ as *mut c_void,
+                        &mut t_c as *mut _ as *mut c_void,
+                        &mut group_c as *mut _ as *mut c_void,
+                        &mut dh_c as *mut _ as *mut c_void,
+                        &mut scale_c as *mut _ as *mut c_void,
+                        &mut nsplit_c as *mut _ as *mut c_void,
+                    ];
+                    let tl = q4attn_kprof::stamp();
+                    unsafe {
+                        ctx.launch_async(
+                            k.f_dec,
+                            (n_split as u32, n_kv as u32, 1),
+                            ((32 * group) as u32, 1, 1),
+                            0,
+                            &mut args,
+                        )?;
+                    }
+                    let mut args2: Vec<*mut c_void> = vec![
+                        &mut partptr as *mut _ as *mut c_void,
+                        &mut aptr_c as *mut _ as *mut c_void,
+                        &mut group_c as *mut _ as *mut c_void,
+                        &mut dh_c as *mut _ as *mut c_void,
+                        &mut nsplit_c as *mut _ as *mut c_void,
+                    ];
+                    unsafe {
+                        ctx.launch_async(
+                            k.f_cb,
+                            (group as u32, nkv_c as u32, 1),
+                            (dh as u32, 1, 1),
+                            0,
+                            &mut args2,
+                        )?;
+                    }
+                    q4attn_kprof::note_launch(tl);
+                    q4attn_kprof::note_call();
+                    q4attn_kprof::note_fdec_call();
+                    Ok(aptr)
+                });
+            }
+        }
+        // 従来の split 経路 (短い文脈はこちらが既定)。
+        let (f_dec, f_cb) = match (ctx.f_attn_dec, ctx.f_attn_dec_cb) {
+            (Some(a), Some(b)) => (a, b),
+            _ => bail!("attention の split カーネルが無い"),
+        };
+        let (n_split, _chunk) = q4_dec_split(len, q4_gpu_attn_split());
+        nsplit_c = n_split as c_int;
+        let shmem = (q4_dec_sh_f(dh) * 4) as u32;
+        Q4ATTN_SCRATCH.with(|cell| -> Result<CUdeviceptr> {
+            let mut s = cell.borrow_mut();
+            let part_bytes = heads * n_split * (dh + 2) * 4;
+            Scratch::ensure(&mut s.out, qd * 4)?;
+            Scratch::ensure(&mut s.part, part_bytes)?;
+            let mut qptr_c = qptr;
+            let aptr = s.out.as_ref().expect("ensure 済み").ptr();
+            let mut aptr_c = aptr;
+            let mut partptr = s.part.as_ref().expect("ensure 済み").ptr();
+            let mut kptr_c = kptr;
+            let mut vptr_c = vptr;
+            let mut args: Vec<*mut c_void> = vec![
+                &mut qptr_c as *mut _ as *mut c_void,
+                &mut kptr_c as *mut _ as *mut c_void,
+                &mut vptr_c as *mut _ as *mut c_void,
+                &mut partptr as *mut _ as *mut c_void,
+                &mut kv_dim_c as *mut _ as *mut c_void,
+                &mut t_c as *mut _ as *mut c_void,
+                &mut group_c as *mut _ as *mut c_void,
+                &mut dh_c as *mut _ as *mut c_void,
+                &mut scale_c as *mut _ as *mut c_void,
+                &mut nsplit_c as *mut _ as *mut c_void,
+            ];
+            let tl = q4attn_kprof::stamp();
+            unsafe {
+                ctx.launch_async(
+                    f_dec,
+                    (n_split as u32, heads_c as u32, 1),
+                    (dh as u32, 1, 1),
+                    shmem,
+                    &mut args,
+                )?;
+            }
+            let mut args2: Vec<*mut c_void> = vec![
+                &mut partptr as *mut _ as *mut c_void,
+                &mut aptr_c as *mut _ as *mut c_void,
+                &mut nsplit_c as *mut _ as *mut c_void,
+                &mut dh_c as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                ctx.launch_async(f_cb, (heads as u32, 1, 1), (dh as u32, 1, 1), 0, &mut args2)?;
+            }
+            q4attn_kprof::note_launch(tl);
+            q4attn_kprof::note_call();
+            q4attn_kprof::note_split_call();
+            Ok(aptr)
+        })
+    }
+
+    /// 新しい .cu (`kernels_dec_dev.ptx`) のカーネル。
+    struct DevKernels {
+        _module: CUmodule,
+        f_norm: CUfunction,
+        f_gate: CUfunction,
+    }
+
+    unsafe impl Send for DevKernels {}
+    unsafe impl Sync for DevKernels {}
+
+    fn dev_kernels() -> Result<&'static DevKernels> {
+        static K: OnceLock<Option<DevKernels>> = OnceLock::new();
+        let got = K.get_or_init(|| {
+            let path = dec_dev_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[full-dec-dev] PTX が読めない ({}) : {e}", path.display());
+                    return None;
+                }
+            };
+            image.push(0);
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[full-dec-dev] cuModuleLoadData 失敗");
+                    return None;
+                }
+            }
+            let mut f_norm: CUfunction = std::ptr::null_mut();
+            let mut f_gate: CUfunction = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_get_function)(
+                    &mut f_norm,
+                    module,
+                    b"dno_dec_qknorm_rope\0".as_ptr() as *const c_char,
+                ) != CUDA_SUCCESS
+                    || (lib.module_get_function)(
+                        &mut f_gate,
+                        module,
+                        b"dno_dec_gate_mul\0".as_ptr() as *const c_char,
+                    ) != CUDA_SUCCESS
+                {
+                    eprintln!("[full-dec-dev] カーネルが PTX に無い");
+                    return None;
+                }
+            }
+            Some(DevKernels {
+                _module: module,
+                f_norm,
+                f_gate,
+            })
+        });
+        got.as_ref()
+            .ok_or_else(|| anyhow!("kernels_dec_dev.ptx が無い"))
+    }
+
+    /// `DENNO_DEC_DEV_PTX` (デバッグ用) → 既定は manifest からの相対。
+    fn dec_dev_ptx_path() -> std::path::PathBuf {
+        if let Ok(p) = std::env::var("DENNO_DEC_DEV_PTX") {
+            return std::path::PathBuf::from(p);
+        }
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_dec_dev.ptx")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// env を見ずに on/off を固定する (assert が落ちても戻す)。
+        struct Force(Option<bool>);
+        impl Force {
+            fn set(v: Option<bool>) -> Self {
+                let prev = FORCE.with(|c| c.get());
+                FORCE.with(|c| c.set(v));
+                Force(prev)
+            }
+        }
+        impl Drop for Force {
+            fn drop(&mut self) {
+                FORCE.with(|c| c.set(self.0));
+            }
+        }
+
+        /// 実形 (n_embd 2560 / 24 q head / 2 kv head / dh 256 / n_rot 64) の入力。
+        fn call_with<'a>(
+            q_norm: &'a [f32],
+            k_norm: &'a [f32],
+            cur: &'a [f32],
+            blocks: &'a [u8],
+            units: &'a [Unit<'a>],
+        ) -> Call<'a> {
+            Call {
+                cache_id: 1,
+                n_layer: 48,
+                layer: 3,
+                layer_gen: 0,
+                len: 3_965,
+                kv_dim: 512,
+                heads: 24,
+                group: 12,
+                dh: 256,
+                scale: 0.0625,
+                n_rot: 64,
+                pos: 3_964,
+                theta: 10_000.0,
+                eps: 1e-6,
+                q_norm,
+                k_norm,
+                qkv_units: units,
+                qkv_k: 2_560,
+                qkv_n: 13_312,
+                q_off: 0,
+                k_off: 12_288,
+                v_off: 12_800,
+                wo_uid: 2,
+                wo_ty: crate::kquant::GgmlType::Q8_0,
+                wo_blocks: blocks,
+                wo_k: 6_144,
+                wo_n: 2_560,
+                n_embd: 2_560,
+                cur,
+            }
+        }
+
+        /// 実形の unit 1 本 (連結できた層と同じ形)。
+        fn one_unit<'a>(blocks: &'a [u8]) -> Vec<Unit<'a>> {
+            vec![Unit {
+                uid: 1,
+                ty: crate::kquant::GgmlType::Q8_0,
+                blocks,
+                k: 2_560,
+                n: 13_312,
+                out_row: 0,
+            }]
+        }
+
+        /// 連結できない層 (3 本) も unit 列として通ること、隙間・行数違いは落ちること。
+        #[test]
+        fn units_gate_truth_table() {
+            let qn = vec![1f32; 256];
+            let kn = vec![1f32; 256];
+            let cur = vec![0f32; 2_560];
+            let blocks = vec![0u8; 1024];
+            // 3 本 (q|gate / k / v) に分かれた形: 12,288 + 512 + 512 = 13,312。
+            let three = vec![
+                Unit {
+                    uid: 1,
+                    ty: crate::kquant::GgmlType::Q8_0,
+                    blocks: &blocks,
+                    k: 2_560,
+                    n: 12_288,
+                    out_row: 0,
+                },
+                Unit {
+                    uid: 2,
+                    ty: crate::kquant::GgmlType::Q5K,
+                    blocks: &blocks,
+                    k: 2_560,
+                    n: 512,
+                    out_row: 12_288,
+                },
+                Unit {
+                    uid: 3,
+                    ty: crate::kquant::GgmlType::Q5K,
+                    blocks: &blocks,
+                    k: 2_560,
+                    n: 512,
+                    out_row: 12_800,
+                },
+            ];
+            let c = call_with(&qn, &kn, &cur, &blocks, &three);
+            assert!(c.ok_shape(), "3 本に分かれた形が通らない");
+            // 行の隙間。
+            let mut gap = three.clone();
+            gap[1].out_row = 12_289;
+            let c = call_with(&qn, &kn, &cur, &blocks, &gap);
+            assert!(!c.ok_shape());
+            // 合計行数が足りない。
+            let mut short = three.clone();
+            short.pop();
+            let c = call_with(&qn, &kn, &cur, &blocks, &short);
+            assert!(!c.ok_shape());
+            // 入力長が違う。
+            let mut badk = three.clone();
+            badk[2].k = 2_304;
+            let c = call_with(&qn, &kn, &cur, &blocks, &badk);
+            assert!(!c.ok_shape());
+            // 空。
+            let empty: Vec<Unit<'_>> = Vec::new();
+            let c = call_with(&qn, &kn, &cur, &blocks, &empty);
+            assert!(!c.ok_shape());
+            // 連結時に並びが変わった層 (カーネルの前提と違う) は落ちる。
+            let one = one_unit(&blocks);
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &one);
+            assert!(c.ok_shape());
+            c.k_off = 0;
+            c.q_off = 512;
+            assert!(!c.ok_shape());
+        }
+
+        /// ゲートを off にすると GPU に一切触らない (従来経路へ)。
+        /// 既定は lab t179c の採否で on (下の `DEFAULT_ON`)。
+        #[test]
+        fn gate_off_makes_forward_inert() {
+            let _f = Force::set(Some(false));
+            assert!(!on());
+            let qn = vec![1f32; 256];
+            let kn = vec![1f32; 256];
+            let cur = vec![0f32; 2_560];
+            let blocks = vec![0u8; 1024];
+            let units = one_unit(&blocks);
+            let c = call_with(&qn, &kn, &cur, &blocks, &units);
+            assert!(c.ok_shape(), "実形がゲートを通らない");
+            // off のときは GPU に一切触らず None (従来経路へ)。
+            assert!(forward(&c).is_none());
+        }
+
+        #[test]
+        fn shape_gate_truth_table() {
+            let qn = vec![1f32; 256];
+            let kn = vec![1f32; 256];
+            let cur = vec![0f32; 2_560];
+            let blocks = vec![0u8; 1024];
+            let units = one_unit(&blocks);
+            let base = call_with(&qn, &kn, &cur, &blocks, &units);
+            assert!(base.ok_shape());
+            // n_rot が表の上限 (128) を超える。
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
+            c.n_rot = 130;
+            assert!(!c.ok_shape());
+            // kv_dim が n_kv * dh と違う。
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
+            c.kv_dim = 256;
+            assert!(!c.ok_shape());
+            // qkv の行数が [q|gate|k|v] と違う。
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
+            c.qkv_n = 12_288;
+            assert!(!c.ok_shape());
+            // 入力長が k と違う。
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
+            c.qkv_k = 2_304;
+            assert!(!c.ok_shape());
+            // 出力投影の入力長が q_dim と違う。
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
+            c.wo_k = 6_400;
+            assert!(!c.ok_shape());
+            // head 数が group で割り切れない。
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
+            c.group = 5;
+            assert!(!c.ok_shape());
+            // len が 0 / 65536。
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
+            c.len = 0;
+            assert!(!c.ok_shape());
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
+            c.len = 65_536;
+            assert!(!c.ok_shape());
+        }
+
+        /// ミラーが「全行シードが要る」状況では None を返す (呼び出し側が従来経路へ)。
+        /// このコンテナには GPU が無いので、ミラーが空のまま = None が正しい。
+        #[test]
+        fn mirror_append_refuses_without_a_seeded_mirror() {
+            let r = mirror_append(0xdead_beef, 48, 512, 3, 0, 2, 0, 0);
+            assert!(r.is_none(), "種の無いミラーへ 1 行だけ書こうとした");
+            // len = 0 / 層が範囲外も None。
+            assert!(mirror_append(0xdead_beef, 48, 512, 3, 0, 0, 0, 0).is_none());
+            assert!(mirror_append(0xdead_beef, 48, 512, 48, 0, 1, 0, 0).is_none());
+        }
+    }
+}
 /// デバイスメモリバッファ (RAII: drop で cuMemFree)
 pub struct DevBuffer {
     ptr: CUdeviceptr,
@@ -981,13 +3044,17 @@ impl DevBuffer {
         // (47MB で数 ms)。未初期化領域へ直接 D2H し、コピー完了後に set_len する
         // (cuMemcpyDtoH は同期コピーなので戻った時点で全要素が埋まっている)。
         let mut out: Vec<T> = Vec::with_capacity(len);
-        unsafe {
+        // task 177: 層の内訳 (`DENNO_GDN_DEC_KPROF`)。off は分岐 1 回。
+        let kp = dec_kprof::op_begin(|| "D2H".to_string(), (0, 0, 0), (0, 0, 0), 0, bytes);
+        let res = unsafe {
             check(
                 (lib()?.memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, self.ptr, bytes),
                 "cuMemcpyDtoH",
-            )?;
-            out.set_len(len);
-        }
+            )
+        };
+        dec_kprof::op_end(kp);
+        res?;
+        unsafe { out.set_len(len) };
         Ok(out)
     }
 
@@ -997,12 +3064,16 @@ impl DevBuffer {
         let bytes = std::mem::size_of_val(out);
         assert!(bytes <= self.bytes, "DevBuffer::to_slice: size overflow");
         if bytes > 0 {
-            unsafe {
+            // task 177: 層の内訳 (`DENNO_GDN_DEC_KPROF`)。off は分岐 1 回。
+            let kp = dec_kprof::op_begin(|| "D2H".to_string(), (0, 0, 0), (0, 0, 0), 0, bytes);
+            let res = unsafe {
                 check(
                     (lib()?.memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, self.ptr, bytes),
                     "cuMemcpyDtoH",
-                )?;
-            }
+                )
+            };
+            dec_kprof::op_end(kp);
+            res?;
         }
         Ok(())
     }
@@ -1012,14 +3083,20 @@ impl DevBuffer {
         let bytes = std::mem::size_of_val(data);
         assert!(bytes <= self.bytes, "DevBuffer::copy_from: size overflow");
         let dbg = launch_dbg::note(|| format!("H2D ptr={:#x} bytes={bytes}", self.ptr));
-        if bytes > 0 {
+        // task 177: 層の内訳 (`DENNO_GDN_DEC_KPROF`)。off は分岐 1 回。
+        let kp = dec_kprof::op_begin(|| "H2D".to_string(), (0, 0, 0), (0, 0, 0), 0, bytes);
+        let res = if bytes > 0 {
             unsafe {
                 check(
                     (lib()?.memcpy_htod)(self.ptr, data.as_ptr() as *const c_void, bytes),
                     "cuMemcpyHtoD",
-                )?;
+                )
             }
-        }
+        } else {
+            Ok(())
+        };
+        dec_kprof::op_end(kp);
+        res?;
         launch_dbg::sync(dbg)?;
         Ok(())
     }
@@ -1034,7 +3111,9 @@ impl DevBuffer {
         let dbg = launch_dbg::note(|| {
             format!("H2D@ ptr={:#x}+{offset_bytes} bytes={bytes}", self.ptr)
         });
-        if bytes > 0 {
+        // task 177: 層の内訳 (`DENNO_GDN_DEC_KPROF`)。off は分岐 1 回。
+        let kp = dec_kprof::op_begin(|| "H2D@".to_string(), (0, 0, 0), (0, 0, 0), 0, bytes);
+        let res = if bytes > 0 {
             unsafe {
                 check(
                     (lib()?.memcpy_htod)(
@@ -1043,9 +3122,13 @@ impl DevBuffer {
                         bytes,
                     ),
                     "cuMemcpyHtoD",
-                )?;
+                )
             }
-        }
+        } else {
+            Ok(())
+        };
+        dec_kprof::op_end(kp);
+        res?;
         launch_dbg::sync(dbg)?;
         Ok(())
     }
@@ -1802,6 +3885,14 @@ impl CudaCtx {
         let tl = crate::model::q4ledger::stamp();
         // task 153: イベント時系列 (DENNO_Q4_TLINE + _K)。off は None で分岐 1 回。
         let ev0 = tline::launch_begin();
+        // task 177: decode 層の操作別内訳 (DENNO_GDN_DEC_KPROF)。off は分岐 1 回。
+        let kp = dec_kprof::op_begin(
+            || format!("K {}", launch_dbg::fn_name(f)),
+            grid,
+            block,
+            shmem,
+            0,
+        );
         let r = check(
             (lib.launch)(
                 f,
@@ -1818,6 +3909,7 @@ impl CudaCtx {
             ),
             "cuLaunchKernel",
         );
+        dec_kprof::op_end(kp);
         if let Some(a) = ev0 {
             tline::launch_end(crate::model::q4ledger::current(), a);
         }
@@ -1833,7 +3925,10 @@ impl CudaCtx {
         let lib = lib()?;
         // task 138: 台帳へ待ち時間を積む (off は stamp が None で計測しない)。
         let t = crate::model::q4ledger::stamp();
+        // task 177: 層の内訳 (`DENNO_GDN_DEC_KPROF`)。off は分岐 1 回。
+        let kp = dec_kprof::op_begin(|| "sync".to_string(), (0, 0, 0), (0, 0, 0), 0, 0);
         let r = unsafe { check((lib.ctx_sync)(), "cuCtxSynchronize") };
+        dec_kprof::op_end(kp);
         crate::model::q4ledger::note_sync(t);
         r
     }
@@ -2177,6 +4272,47 @@ impl CudaCtx {
         }))
     }
 
+    /// task 177: v4 (レーン数可変) の計画。形が合わない / PTX が無いときは `None`
+    /// (呼び出し側は v3 へ落ちる)。
+    ///
+    /// 1 ブロック 8 行は v3 の既定 (`MOE_V3_ROWS_DEFAULT = 8`) と同じ。blockDim は
+    /// `rows * lanes` になるので、lanes=32 で 256、lanes=16 で 128。
+    fn plan_moe_gemv_v4(
+        &self,
+        ty: crate::kquant::GgmlType,
+        n_in: usize,
+        n_out: usize,
+        lanes_cap: usize,
+    ) -> Option<MoeGemvPlan> {
+        use crate::kquant::GgmlType as T;
+        let ki = match ty {
+            T::Q8_0 => 0usize,
+            T::Q5_1 => 1usize,
+            T::Q4K => 2usize,
+            T::Q5K => 3usize,
+            _ => return None,
+        };
+        let rb = gguf_row_bytes(ty, n_in)?;
+        if n_out == 0 {
+            return None;
+        }
+        let lanes = v4_lanes_for(n_in, lanes_cap);
+        if lanes == 0 {
+            return None;
+        }
+        let k = gemv_v4_kernels()?;
+        const ROWS: usize = 8;
+        Some(MoeGemvPlan {
+            f: k.f[ki],
+            rows_per_block: ROWS,
+            block_dim: (ROWS * lanes) as u32,
+            shmem: 0,
+            lanes,
+            rb,
+            grid: n_out.div_ceil(ROWS) as u32,
+        })
+    }
+
     /// decode GEMV を 1 本積む (task 124 の重ね打ち経路)。
     ///
     /// 引数の並びは [`Self::moe_gemv_dev_with`] が組むものと同一
@@ -2290,8 +4426,18 @@ impl CudaCtx {
                 // 3 回入っていた。カーネル・引数・発行順・丸め順は従来と同一。
                 {
                     let px = s.pin_x.as_mut().expect("pin_x は ensure 済み");
-                    px.as_mut_slice::<f32>()[..n_in].copy_from_slice(x);
+                    dec_kprof::step("gemv_h2d_pack", || {
+                        px.as_mut_slice::<f32>()[..n_in].copy_from_slice(x)
+                    });
                     let lib = lib()?;
+                    // task 179: 非同期コピーも表に出す (`H2D@a`)。
+                    let kp_cp = dec_kprof::op_begin(
+                        || "H2D@a".to_string(),
+                        (0, 0, 0),
+                        (0, 0, 0),
+                        0,
+                        n_in * 4,
+                    );
                     unsafe {
                         check(
                             (lib.memcpy_htod_async)(
@@ -2303,6 +4449,7 @@ impl CudaCtx {
                             "cuMemcpyHtoDAsync (moe gemv)",
                         )?;
                     }
+                    dec_kprof::op_end(kp_cp);
                 }
                 dbg_htod(n_in * 4);
                 let t1 = t0.map(|_| std::time::Instant::now());
@@ -2336,6 +4483,14 @@ impl CudaCtx {
                 {
                     let po = s.pin_o.as_mut().expect("pin_o は ensure 済み");
                     let lib = lib()?;
+                    // task 179: 非同期コピーも表に出す (`D2H@a`)。
+                    let kp_cp = dec_kprof::op_begin(
+                        || "D2H@a".to_string(),
+                        (0, 0, 0),
+                        (0, 0, 0),
+                        0,
+                        n_out * 4,
+                    );
                     unsafe {
                         check(
                             (lib.memcpy_dtoh_async)(
@@ -2347,6 +4502,7 @@ impl CudaCtx {
                             "cuMemcpyDtoHAsync (moe gemv)",
                         )?;
                     }
+                    dec_kprof::op_end(kp_cp);
                 }
                 self.sync()?;
                 let t3 = t0.map(|_| std::time::Instant::now());
@@ -2354,7 +4510,9 @@ impl CudaCtx {
                     crate::model::devprof::note_sync(t.elapsed().as_nanos() as u64);
                 }
                 let po = s.pin_o.as_ref().expect("pin_o は ensure 済み");
-                out.copy_from_slice(&po.as_slice::<f32>()[..n_out]);
+                dec_kprof::step("gemv_pack", || {
+                    out.copy_from_slice(&po.as_slice::<f32>()[..n_out])
+                });
                 if let (Some(a), Some(b), Some(c), Some(d)) = (t0, t1, t2, t3) {
                     eprintln!(
                         "[gemvt] {}x{} async=1 h2d={} launch={} sync={} copy={}us",
@@ -2985,6 +5143,142 @@ pub(crate) fn moe_gemv_v3_loaded() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// task 177: v4 (レーン数可変) GEMV (`kernels_moe_v4.cu`)
+//
+// v3 は 1 行を 4 レーン (または 2) で固定して分けるので、同時に立つスレッド数が
+// `n_out * 4` で頭打ちになる。lab t177a の実測では out 投影 (n=2,560 / k=6,144)
+// が 320 warp = 1.9 warp/SM で 328 GB/s しか出ていなかった。v4 は lanes を
+// カーネル引数で受け、8 / 16 / 32 でも回せる (データの読み方と dequant の
+// 演算列は v3 と同一。変わるのはレーン分割と合計の段数だけ)。
+//
+// 使うのは今のところ GDN decode の submission だけ (`DENNO_GDN_DEC_GEMV=v4`)。
+// PTX が無い / 形が合わないときは None を返し、呼び出し側は v3 へ落ちる
+// (fail closed。CPU へは落とさない)。
+// ---------------------------------------------------------------------------
+
+/// v4 のカーネル名 (`ki` の順 = Q8_0 / Q5_1 / Q4_K / Q5_K)。
+const V4_KERNEL_NAMES: [&str; 4] = [
+    "dno_gemv_q8_0_v4",
+    "dno_gemv_q5_1_v4",
+    "dno_gemv_q4k_v4",
+    "dno_gemv_q5k_v4",
+];
+
+/// v4 の引数の数 (v3 と同じ 8 本: w, x, out, n_in, n_out, row_bytes,
+/// rows_per_block, lanes)。
+const V4_NARGS: usize = 8;
+
+/// v4 カーネル一式。4 本そろって初めて `Some`。
+struct V4Kernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: [CUfunction; 4],
+}
+
+unsafe impl Send for V4Kernels {}
+unsafe impl Sync for V4Kernels {}
+
+static V4_KERNELS: OnceLock<Option<V4Kernels>> = OnceLock::new();
+
+/// PTX の置き場所。`DENNO_GEMV_V4_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_moe_v4.ptx` (v3 と同じ規約)。
+fn gemv_v4_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_GEMV_V4_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_moe_v4.ptx"),
+    }
+}
+
+/// v4 のカーネルを取得する (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+/// 呼ぶ前に必ず context を current にしておくこと (`cuModuleLoadData` は
+/// current context に入る)。
+fn gemv_v4_kernels() -> Option<&'static V4Kernels> {
+    V4_KERNELS
+        .get_or_init(|| {
+            let path = gemv_v4_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[gemv-v4] PTX が読めない ({}) : {e} → v3 へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            // ABI (引数の数) を **モジュールを読む前**に確かめる。合わない PTX を
+            // 読むと rows/lanes を渡さないまま起動して黙って別の行を書く。
+            let text = String::from_utf8_lossy(&image);
+            let mut short: Vec<&str> = Vec::new();
+            for name in V4_KERNEL_NAMES {
+                if ptx_entry_params(&text, name) != Some(V4_NARGS) {
+                    short.push(name);
+                }
+            }
+            if !short.is_empty() {
+                eprintln!(
+                    "[gemv-v4] PTX の引数が {} 本でない ({}) → v3 へ。\
+                     `bash build_ptx.sh moe_v4` で再生成する",
+                    V4_NARGS,
+                    short.join(", ")
+                );
+                return None;
+            }
+            image.push(0); // cuModuleLoadData は NUL 終端の PTX を期待する
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[gemv-v4] cuModuleLoadData 失敗 → v3 へ");
+                    return None;
+                }
+                let mut f: [CUfunction; 4] = [std::ptr::null_mut(); 4];
+                for (k, name) in V4_KERNEL_NAMES.iter().enumerate() {
+                    let mut cname = name.as_bytes().to_vec();
+                    cname.push(0); // cuModuleGetFunction は NUL 終端の名前を期待する
+                    if (lib.module_get_function)(&mut f[k], module, cname.as_ptr() as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!("[gemv-v4] PTX に {name} が無い → v3 へ");
+                        return None;
+                    }
+                }
+                Some(V4Kernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+/// 形からレーン数を決める (純関数)。`cap` は上限 (4..32 に丸める)。
+///
+/// レーン l は k を l 等分した連続区間を持つので、区間長が量子ブロック (32 要素)
+/// の倍数でなければならない = `n_in % (l * 32) == 0`。満たす最大の 2 の冪を
+/// 返し、4 以上が無ければ 0 (= v3 に任せる)。
+fn v4_lanes_for(n_in: usize, cap: usize) -> usize {
+    let mut l = cap.clamp(4, 32);
+    while l & (l - 1) != 0 {
+        l -= 1; // 2 の冪へ切り下げる
+    }
+    while l >= 4 {
+        if n_in % (l * 32) == 0 {
+            return l;
+        }
+        l >>= 1;
+    }
+    0
+}
+
+/// v4 が載っているか (テスト専用。context を current にしてから呼ぶこと)。
+#[cfg(test)]
+pub(crate) fn moe_gemv_v4_loaded() -> bool {
+    gemv_v4_kernels().is_some()
+}
+
+// ---------------------------------------------------------------------------
 // P-fp16 (task 108): fast mode の fp16 GEMV (`kernels_moe_fp16.cu`)
 // ---------------------------------------------------------------------------
 
@@ -3006,6 +5300,85 @@ pub(crate) enum GemvKernelMode {
 /// `DENNO_GEMV_FP16` の生値 → fast mode の on/off (純関数。真理値表はテストで固定)。
 fn parse_gemv_fp16(raw: Option<&str>) -> bool {
     matches!(raw, Some("1") | Some("on") | Some("true"))
+}
+
+/// task 177: GDN decode submission の GEMV だけカーネルを差し替える
+/// (`DENNO_GDN_DEC_GEMV=v2|v3|fp16`。未設定・空・`0`/`off` は従来 =
+/// [`gemv_kernel_mode`])。
+///
+/// 動機 (lab t177a の `[dec-kprof]` 実測、pos=3827 の ssm 層 1 本):
+/// `dno_gemv_q8_0_v3` (grid=1280, block=32) が 42.5 us / 27.9 MB = 656 GB/s、
+/// `dno_gemv_q4k_v3` (grid=768, block=32) が 31.8 us / 8.9 MB = 278 GB/s、
+/// `dno_gemv_q8_0_v3` (grid=320, block=32) が 50.9 us / 16.7 MB = 328 GB/s。
+/// v3 は 1 行を `lanes` 本で分けるので **スレッド数が n_out x lanes で固定**
+/// (out 投影は 2,560 x 4 = 10,240 スレッド = 5090 の 170 SM に 1.9 warp/SM)。
+/// v2 (`kernels_moe.cu`、4 行/ブロック・256 スレッド・行を 64 本で shared へ
+/// 積んでから 1 本が畳む) は **n_out x 64 スレッド**で、同じ形でも一桁多い。
+/// どちらが速いかは形に依るので、既定は従来のまま env で切り替える。
+/// `DENNO_GDN_DEC_GEMV` の解釈 (純関数。真理値表はテストで固定)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GdnDecGemv {
+    /// 未設定・空・`0`/`off` = 従来 (`gemv_kernel_mode()`)。
+    Default,
+    V2,
+    V3,
+    Fp16,
+    /// v4 (レーン数可変。`kernels_moe_v4.cu`)。
+    V4,
+}
+
+fn parse_gdn_dec_gemv(raw: Option<&str>) -> GdnDecGemv {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("v2") => GdnDecGemv::V2,
+        Some("v3") => GdnDecGemv::V3,
+        Some("fp16") => GdnDecGemv::Fp16,
+        Some("v4") => GdnDecGemv::V4,
+        _ => GdnDecGemv::Default,
+    }
+}
+
+/// [`parse_gdn_dec_gemv`] を env から 1 回だけ読む。
+fn gdn_dec_gemv_choice() -> GdnDecGemv {
+    static C: OnceLock<GdnDecGemv> = OnceLock::new();
+    *C.get_or_init(|| parse_gdn_dec_gemv(std::env::var("DENNO_GDN_DEC_GEMV").ok().as_deref()))
+}
+
+/// GDN decode の submission が使う GEMV モード (ゲートが無ければ従来)。
+fn gdn_dec_gemv_mode_eff() -> GemvKernelMode {
+    match gdn_dec_gemv_choice() {
+        GdnDecGemv::V2 => GemvKernelMode::V2,
+        GdnDecGemv::V3 => GemvKernelMode::V3,
+        GdnDecGemv::Fp16 => GemvKernelMode::Fp16,
+        _ => gemv_kernel_mode(),
+    }
+}
+
+/// v4 を選んでいるか。
+///
+/// task 179: env 未設定の既定を v4 にした (lab t177c: decode -1.8%・md5 SAME。
+/// 形が合わない単位は v3 へ落ちる)。従来へ戻すのは `DENNO_GDN_DEC_GEMV=v3`
+/// (または `v2` / `fp16` / `default`)。
+fn gdn_dec_gemv_v4_on() -> bool {
+    match gdn_dec_gemv_choice() {
+        GdnDecGemv::V4 | GdnDecGemv::Default => true,
+        GdnDecGemv::V2 | GdnDecGemv::V3 | GdnDecGemv::Fp16 => false,
+    }
+}
+
+/// `DENNO_GDN_DEC_GEMV_LANES` の解釈 (純関数)。既定 32、4..32 に丸める。
+fn parse_gdn_dec_v4_lanes(raw: Option<&str>) -> usize {
+    match raw.map(|s| s.trim().parse::<usize>()) {
+        Some(Ok(v)) => v.clamp(4, 32),
+        _ => 32,
+    }
+}
+
+/// v4 のレーン上限 (env から 1 回だけ読む)。
+fn gdn_dec_v4_lanes_cap() -> usize {
+    static L: OnceLock<usize> = OnceLock::new();
+    *L.get_or_init(|| {
+        parse_gdn_dec_v4_lanes(std::env::var("DENNO_GDN_DEC_GEMV_LANES").ok().as_deref())
+    })
 }
 
 /// decode GEMV が使うカーネル一式を env から決める (`moe_gemv_dev` と
@@ -15260,6 +17633,13 @@ pub fn maybe_gpu_mix_bf16_into(
         Scratch::ensure_pin(ho, bytes_out)?;
         let (dx, dout) = (dx.as_ref().unwrap(), dout.as_ref().unwrap());
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        // task 177: mix 1 回の操作別内訳 (`DENNO_GDN_DEC_KPROF`・既定 off)。
+        let _kp_win = dec_kprof::window(
+            dec_kprof::MIX,
+            dec_kprof::cur_layer(),
+            dec_kprof::cur_pos(),
+            0,
+        );
         hx.as_mut_slice::<f32>()[..k].copy_from_slice(x);
         unsafe {
             check(
@@ -17600,6 +19980,14 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
     };
     const MIXED_THREADS: usize = 256;
     let r = MIX_GPU_SC.with(|cell| -> Result<()> {
+        // task 177: mix 1 回の操作別内訳 (`DENNO_GDN_DEC_KPROF`・既定 off)。
+        // decode の mix 本線はこの chain2 経路 (down + lo_apply → up → hc_mixed)。
+        let _kp_win = dec_kprof::window(
+            dec_kprof::MIX,
+            dec_kprof::cur_layer(),
+            dec_kprof::cur_pos(),
+            1,
+        );
         let mut s = cell.borrow_mut();
         let MixGpuScratch {
             x: dx,
@@ -17622,7 +20010,16 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
             dm.as_ref().unwrap(),
         );
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
-        hx.as_mut_slice::<f32>()[..k1].copy_from_slice(x);
+        dec_kprof::step("mix_h2d_pack", || {
+            hx.as_mut_slice::<f32>()[..k1].copy_from_slice(x)
+        });
+        let kp_cp = dec_kprof::op_begin(
+            || "H2D@a".to_string(),
+            (0, 0, 0),
+            (0, 0, 0),
+            0,
+            k1 * 4,
+        );
         unsafe {
             check(
                 (lib.memcpy_htod_async)(
@@ -17677,14 +20074,24 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
                 0,
                 &mut args3,
             )?;
+            let kp_cp = dec_kprof::op_begin(
+                || "D2H@a".to_string(),
+                (0, 0, 0),
+                (0, 0, 0),
+                0,
+                e * 4,
+            );
             check(
                 (lib.memcpy_dtoh_async)(ho.ptr, dm.ptr(), e * 4, std::ptr::null_mut()),
                 "cuMemcpyDtoHAsync (mix chain2)",
             )?;
+            dec_kprof::op_end(kp_cp);
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
         ctx.sync()?;
-        out.copy_from_slice(&ho.as_slice::<f32>()[..e]);
+        dec_kprof::step("mix_pack", || {
+            out.copy_from_slice(&ho.as_slice::<f32>()[..e])
+        });
         Ok(())
     });
     match r {
@@ -20705,12 +23112,17 @@ fn q4_attn_mirror_prepare(
     v: &[f32],
     pf: bool,
 ) -> Result<(CUdeviceptr, CUdeviceptr)> {
+    // task 179: ミラーの帳簿 (mutex / LRU / 環境変数) を名前付きで測る。
+    let t_book = dec_kprof::on().then(std::time::Instant::now);
     let mirrors = Q4_ATTN_MIRRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
     let mut ms = match mirrors.lock() {
         Ok(g) => g,
         Err(e) => e.into_inner(),
     };
     let idx = q4_attn_mirror_entry(&mut ms, cache_id, n_layer, kv_dim);
+    if let Some(t) = t_book {
+        dec_kprof::note_since("mirror_book", t);
+    }
     match q4_attn_mirror_sync(&mut ms[idx].1, layer, len, gen, kv_dim, k, v, pf) {
         Ok(p) => Ok(p),
         Err(e) => {
@@ -27191,6 +29603,129 @@ mod tests {
                 );
             }
             set_v3_rows_for_test(0);
+        }
+    }
+
+    /// task 177: v4 (レーン可変) GEMV が CPU の逐次実装 (`expert_gemv_scalar`) と
+    /// 相対 1e-5 以内で一致し、NaN / Inf を作らないこと。
+    ///
+    /// 形が合う lanes (4 / 8 / 16 / 32) を全部回す。v4 が実際に走ったことは
+    /// 「v2 の結果とビット一致しない行がある」ことで確かめる (黙って v3 / v2 に
+    /// 落ちていたら 1 bit も変わらない)。
+    ///
+    /// 実行 (GPU のある環境):
+    ///   DENNO_GEMV_V4_PTX=$PWD/crates/denno-engine/kernels/kernels_moe_v4.ptx \
+    ///   cargo test --release --features cuda -- --ignored cuda_gemv_v4_matches_cpu
+    #[test]
+    #[ignore]
+    fn cuda_gemv_v4_matches_cpu() {
+        use crate::kquant::GgmlType as T;
+        let ctx = CudaCtx::new().unwrap();
+        println!("device: {}", ctx.info());
+        assert!(
+            moe_gemv_v4_loaded(),
+            "v4 の PTX が読めていない (DENNO_GEMV_V4_PTX / kernels_moe_v4.ptx を確認)"
+        );
+        // GDN decode の実形 (k=2560 の qkv 3 種 / k=6144 の attn_out) と、
+        // レーンが 4 までしか立たない形 (k=640)。
+        let cases: [(T, usize, usize); 5] = [
+            (T::Q8_0, 2560, 256),
+            (T::Q4K, 2560, 256),
+            (T::Q5K, 2560, 256),
+            (T::Q8_0, 6144, 256),
+            (T::Q5_1, 640, 2560),
+        ];
+        for (ty, n_in, n_out) in cases {
+            let rb = gguf_row_bytes(ty, n_in).expect("row_bytes");
+            let blk = ty.blck_size();
+            // v3 のテストと同じ合成行列 (d と dmin / m は f16 の 1.0 固定)。
+            let hdr = 4usize;
+            let mut w = vec![0u8; rb * n_out];
+            let mut s = 12345u32;
+            for r in 0..n_out {
+                let row = &mut w[r * rb..(r + 1) * rb];
+                for b in 0..(n_in / blk) {
+                    let base = b * ty.type_size();
+                    row[base] = 0x00;
+                    row[base + 1] = 0x3c;
+                    row[base + 2] = 0x00;
+                    row[base + 3] = 0x3c;
+                    for i in hdr..ty.type_size() {
+                        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        row[base + i] = (s >> 16) as u8;
+                    }
+                }
+            }
+            let x = pseudo_random(n_in, 7);
+            let mut want = vec![0f32; n_out];
+            crate::model::moe_expert::expert_gemv_scalar(ty, &w, n_in, n_out, &x, &mut want)
+                .expect("cpu 参照");
+            let dev_w = DevBuffer::from_slice(&w).unwrap();
+            let dev_x = DevBuffer::from_slice(&x).unwrap();
+            let mut got_v2 = vec![0f32; n_out];
+            assert!(
+                ctx.moe_gemv_dev_with(ty, &dev_w, &x, n_in, n_out, &mut got_v2, GemvKernelMode::V2)
+                    .unwrap(),
+                "{ty:?}: GPU 経路 (v2) が発動しなかった"
+            );
+            // cap を振って、実際に選ばれた lanes の種類だけを回す。
+            let mut tried: Vec<usize> = Vec::new();
+            for cap in [4usize, 8, 16, 32] {
+                let Some(plan) = ctx.plan_moe_gemv_v4(ty, n_in, n_out, cap) else {
+                    continue;
+                };
+                if tried.contains(&plan.lanes) {
+                    continue;
+                }
+                tried.push(plan.lanes);
+                let dev_out = DevBuffer::alloc(n_out * 4).unwrap();
+                gdn_launch_gemv_dev(
+                    &ctx,
+                    &plan,
+                    &dev_w,
+                    dev_x.ptr(),
+                    dev_out.ptr(),
+                    n_in,
+                    n_out,
+                )
+                .expect("v4 の起動");
+                ctx.sync().expect("sync");
+                let got = dev_out.to_vec::<f32>(n_out).unwrap();
+                let ndiff = (0..n_out)
+                    .filter(|&i| got[i].to_bits() != got_v2[i].to_bits())
+                    .count();
+                let mut maxd = 0f32;
+                let mut maxv = 0f32;
+                let mut nonfinite = 0usize;
+                for i in 0..n_out {
+                    if !got[i].is_finite() {
+                        nonfinite += 1;
+                        continue;
+                    }
+                    maxd = maxd.max((got[i] - want[i]).abs());
+                    maxv = maxv.max(want[i].abs());
+                }
+                let rel = maxd / maxv.max(f32::MIN_POSITIVE);
+                println!(
+                    "{ty:?} k={n_in} n={n_out} lanes={} block={}: max|diff|={maxd:e} \
+                     max|ref|={maxv:e} rel={rel:e} (v2 と {ndiff}/{n_out} 行がビット不一致)",
+                    plan.lanes, plan.block_dim
+                );
+                assert_eq!(nonfinite, 0, "{ty:?}: NaN / Inf が {nonfinite} 行");
+                assert!(
+                    rel < 1e-5,
+                    "{ty:?} lanes={}: 相対誤差 {rel:e} >= 1e-5 (max|diff|={maxd:e}, \
+                     max|ref|={maxv:e})",
+                    plan.lanes
+                );
+                assert!(
+                    ndiff > 0,
+                    "{ty:?} lanes={}: v4 の出力が v2 と 1 行も違わない = v4 が走っていない",
+                    plan.lanes
+                );
+            }
+            assert!(!tried.is_empty(), "{ty:?} k={n_in}: v4 の計画が 1 つも立たない");
+            println!("{ty:?} k={n_in}: v4 の lanes = {tried:?}");
         }
     }
 
@@ -36364,17 +38899,23 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         return GdnDecodeRes::cpu();
     };
     // GEMV のカーネル選択は intercept 経路と同じ規約 (fp16 → v3 → v2)。
-    let mode = gemv_kernel_mode();
+    // task 177: この経路だけ `DENNO_GDN_DEC_GEMV` で差し替えられる (既定は従来)。
+    // v4 を選んでいても、その単位で形が合わなければ v3 へ落ちる (CPU へは落とさない)。
+    let mode = gdn_dec_gemv_mode_eff();
+    let v4 = gdn_dec_gemv_v4_on().then(gdn_dec_v4_lanes_cap);
+    let plan = |ty: crate::kquant::GgmlType, k: usize, n: usize| {
+        v4.and_then(|cap| ctx.plan_moe_gemv_v4(ty, k, n, cap))
+            .or_else(|| ctx.plan_moe_gemv(ty, k, n, mode).ok().flatten())
+    };
     let mut qcfg = Vec::with_capacity(req.qkv_units.len());
     for (u, _) in req.qkv_units {
-        match ctx.plan_moe_gemv(u.ty, u.k, u.n, mode) {
-            Ok(Some(c)) => qcfg.push(c),
-            _ => return GdnDecodeRes::cpu(),
+        match plan(u.ty, u.k, u.n) {
+            Some(c) => qcfg.push(c),
+            None => return GdnDecodeRes::cpu(),
         }
     }
-    let ocfg = match ctx.plan_moe_gemv(req.out_unit.ty, req.out_unit.k, req.out_unit.n, mode) {
-        Ok(Some(c)) => c,
-        _ => return GdnDecodeRes::cpu(),
+    let Some(ocfg) = plan(req.out_unit.ty, req.out_unit.k, req.out_unit.n) else {
+        return GdnDecodeRes::cpu();
     };
     // 重みは常駐登録簿から (intercept 経路と同じ uid → 同じ VRAM を共有)。
     let mut qw = Vec::with_capacity(req.qkv_units.len());
@@ -36561,6 +39102,19 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         };
     }
     let run = || -> Result<(Vec<f32>, Option<(Vec<f32>, Vec<f32>)>)> {
+        // task 177: この submission の操作別内訳 (`DENNO_GDN_DEC_KPROF`・既定 off)。
+        // guard の drop (この closure の出口) で表を出す。
+        let _kp_win = dec_kprof::window(dec_kprof::GDN, req.li, dec_kprof::cur_pos(), 0);
+        {
+            // 重みの実バイト (qkv の各単位 + attn_out)。実効帯域の分母に使う。
+            let q: usize = req
+                .qkv_units
+                .iter()
+                .zip(qcfg.iter())
+                .map(|((u, _), c)| u.n.saturating_mul(c.rb))
+                .sum();
+            dec_kprof::note_wbytes(q.saturating_add(req.out_unit.n.saturating_mul(ocfg.rb)));
+        }
         let (_, e) = &store_lock[idx];
         // task 140: cur / beta / alpha を 1 本の staging に詰めて **H2D 1 回**で
         // 上げる (以前は同期 H2D 3 回。値・並びは同一で、カーネルへ渡す
