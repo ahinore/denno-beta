@@ -9080,15 +9080,16 @@ fn moe_experts_iq_gpu_batched(
             },
         )
         .map_err(|err| one(format!("層 {}: IQ 層一括 GEMV (sum): {err:#}", lw.il)))?;
-        if !ran {
-            return Ok(None);
+        if ran {
+            return Ok(Some(IqBatchOut::Sum {
+                sum,
+                miss_pos,
+                miss_h: miss_s,
+                hits,
+            }));
         }
-        return Ok(Some(IqBatchOut::Sum {
-            sum,
-            miss_pos,
-            miss_h: miss_s,
-            hits,
-        }));
+        // 和のカーネル (PTX) が無い / 形が合わないときは**従来の寄与経路**へ落ちる
+        // (per-expert 経路へは落とさない: そちらは IQ 型を CPU で回すので遅い)。
     }
     let ran = if overlap {
         // 台帳の exp_iq 区間は取らない (同期が CPU ミスの後ろへ移るので、GPU の
