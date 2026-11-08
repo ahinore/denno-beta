@@ -540,3 +540,66 @@ fn ple_gather_timing_real_gguf() {
         rss_after as i64 - rss_before as i64
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 182: 表全体の RAM 常駐 (`DENNO_PF_PLE_RAM`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ram_gate_is_opt_in() {
+    assert!(!PleTable::ram_from_value(None), "未設定が on になった");
+    for v in ["0", "off", "false", "no", "", " 0 "] {
+        assert!(!PleTable::ram_from_value(Some(v)), "{v:?} が on になった");
+    }
+    for v in ["1", "on", "true", "yes", " ON "] {
+        assert!(PleTable::ram_from_value(Some(v)), "{v:?} が off になった");
+    }
+}
+
+/// `load_ram` の前後で gather が**ビット一致**すること (同じ一時ファイル)。
+///
+/// 1 行のデコードは `ram` の有無に関わらず同じ `dequant_row_into` に同じ
+/// バイト列を渡す (行境界 = ブロック境界)。並列 gather も同じ値になる。
+#[test]
+fn ram_cache_matches_pread_bitwise() {
+    let (_dir, path, _data) = setup("ram", ROWS, 0x5eed_1234);
+    let gguf = GgufFile::open(&path).expect("open gguf");
+    let tref = gguf.tensor_ref(PLE_NAME).expect("tensor_ref");
+    let mut ple = PleTable::open(&tref, &gguf).expect("PleTable::open");
+    assert!(!ple.has_ram(), "既定で RAM 常駐になっている");
+
+    let sel: Vec<u32> = (0..ROWS as u32).filter(|r| r % 3 != 1).collect();
+    let mut before = vec![0f32; sel.len() * DIM];
+    ple.gather_rows(&sel, &mut before).expect("gather (pread)");
+
+    let got = ple.load_ram().expect("load_ram");
+    assert_eq!(got, (ROWS * ROW_BYTES) as u64, "読んだバイト数が表のサイズと違う");
+    assert!(ple.has_ram());
+    // 2 回目は読み直さない (同じバイト数を返す)
+    assert_eq!(ple.load_ram().expect("load_ram 2"), got);
+
+    let mut after = vec![0f32; sel.len() * DIM];
+    ple.gather_rows(&sel, &mut after).expect("gather (ram)");
+    for i in 0..before.len() {
+        assert_eq!(
+            before[i].to_bits(),
+            after[i].to_bits(),
+            "要素 {i}: pread={} ram={}",
+            before[i],
+            after[i]
+        );
+    }
+
+    // 並列 gather も同じ値
+    let mut par = vec![0f32; sel.len() * DIM];
+    ple.gather_rows_par(&sel, &mut par, 4).expect("gather_rows_par");
+    for i in 0..before.len() {
+        assert_eq!(before[i].to_bits(), par[i].to_bits(), "要素 {i} (par)");
+    }
+
+    // RAM 経路でも範囲外はエラー (黙って 0 にしない)
+    let e = ple
+        .gather_rows(&[ROWS as u32], &mut vec![0f32; DIM])
+        .expect_err("範囲外はエラー");
+    assert!(e.0.contains("範囲外"), "{:?}", e.0);
+}

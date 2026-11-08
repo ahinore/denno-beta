@@ -17089,6 +17089,22 @@ thread_local! {
 /// 失敗時の会計は `weights_for_gguf` と同一の規約で、違うのは行の単位
 /// (k * 4 バイト固定) だけ。
 fn weights_for_f32(uid: u64, bytes: &[u8], k: usize, n: usize) -> Result<GgufWRef> {
+    weights_for_gemm_f32(uid, bytes, k, n, crate::kquant::GgmlType::F32)
+}
+
+/// task 182: F32 / BF16 / F16 の重みを **行優先 f32 に開いて** VRAM へ上げる。
+///
+/// PLE の `ple_key` / `ple_value` は実ファイルで F32 か BF16 (目録は Q8_0) で、
+/// 量子型専用の `pf_ple_proj` は形の段階で断る。BF16 -> f32 は上位 16 bit の
+/// 複製 (誤差なし)、F16 -> f32 は `dequant_row_into`。VRAM 上は常に f32 なので、
+/// レジストリの型は F32 で登録する (ルータの 1 行 GEMV と同じ表を共有)。
+fn weights_for_gemm_f32(
+    uid: u64,
+    bytes: &[u8],
+    k: usize,
+    n: usize,
+    src: crate::kquant::GgmlType,
+) -> Result<GgufWRef> {
     use crate::kquant::GgmlType as T;
     let reg = gguf_registry();
     let mut g = reg
@@ -17112,11 +17128,19 @@ fn weights_for_f32(uid: u64, bytes: &[u8], k: usize, n: usize) -> Result<GgufWRe
         .checked_mul(k)
         .and_then(|v| v.checked_mul(4))
         .ok_or_else(|| anyhow::anyhow!("f32: n * k * 4 が usize を溢れる"))?;
-    if bytes.len() != want {
+    let bpp = match src {
+        T::F32 => 4usize,
+        T::Bf16 | T::F16 => 2,
+        other => bail!("f32 常駐: 未対応の元型 {other:?} (F32 / BF16 / F16 のみ)"),
+    };
+    let src_want = n
+        .checked_mul(k)
+        .and_then(|v| v.checked_mul(bpp))
+        .ok_or_else(|| anyhow::anyhow!("f32: n * k * {bpp} が usize を溢れる"))?;
+    if bytes.len() != src_want {
         bail!(
-            "f32: バイト数 {} が n * k * 4 = {} と違う (k={k}, n={n})",
-            bytes.len(),
-            want
+            "f32: 元型 {src:?} のバイト数 {} が n * k * {bpp} = {src_want} と違う (k={k}, n={n})",
+            bytes.len()
         );
     }
     // P46 と同じ: 確保の前に上限と空き VRAM を見て古い uid を解放する。
@@ -17142,9 +17166,32 @@ fn weights_for_f32(uid: u64, bytes: &[u8], k: usize, n: usize) -> Result<GgufWRe
     }
     // 生バイトのスライスは 4 バイト整列を保証しない (`Vec<u8>` / mmap の途中) ので、
     // CPU と同じ `from_le_bytes` で f32 に開いてから上げる (値は 1 bit も変わらない)。
+    // task 182: BF16 は上位 16 bit の複製 (誤差なし)、F16 は dequant_row_into。
     let mut host: Vec<f32> = Vec::with_capacity(k * n);
-    for c in bytes.chunks_exact(4) {
-        host.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    match src {
+        T::F32 => {
+            for c in bytes.chunks_exact(4) {
+                host.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+        }
+        T::Bf16 => {
+            for c in bytes.chunks_exact(2) {
+                let b = u16::from_le_bytes([c[0], c[1]]);
+                host.push(f32::from_bits((b as u32) << 16));
+            }
+        }
+        T::F16 => {
+            let mut row = vec![0f32; k];
+            for r in 0..n {
+                let s = r * k * 2;
+                crate::kquant::dequant_row_into(T::F16, &bytes[s..s + k * 2], &mut row);
+                host.extend_from_slice(&row);
+            }
+        }
+        other => bail!("f32 常駐: 未対応の元型 {other:?}"),
+    }
+    if host.len() != k * n {
+        bail!("f32 常駐: 展開後の要素数 {} が k*n = {} と違う", host.len(), k * n);
     }
     let buf = match DevBuffer::from_slice_tagged(&host, crate::mem_audit::TAG_ROUTER) {
         Ok(b) => b,
@@ -17850,6 +17897,148 @@ pub fn maybe_gpu_mix_bf16_batch_into(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// task 182: prefill の router / PLE 射影 (F32 重み × m トークン) を GPU で回す
+// ---------------------------------------------------------------------------
+//
+// task 170 (br170) が層優先 prefill 用に書いたものと同じ経路。ここでは通常の
+// チャンク順 prefill から、層ごと・チャンクごとに 1 回ずつ呼ぶ:
+//   - router (`ffn_gate_inp`、実形 2,560 x 512 の F32) は 14k の prefill で 2.8 s
+//   - PLE の key / value 射影 (F32、`blk.1.ple_key/value`) は合わせて約 1.3 s
+// どちらも CPU の行バッチで回っていた。重みは `weights_for_f32` の常駐
+// (decode のルータ GEMV と同じ uid 表) に載せ、既存の `dno_gemm_f32_mt` で
+// m トークンをまとめて回す (.cu / PTX の変更なし)。
+//
+// 数値は FMA + タイル順なので CPU の `mul + add` 逐次とはビット一致しない
+// (prefill の行列積は速度優先の契約)。`false` = CPU のバッチ経路へ。
+
+struct F32GemmBatchSc {
+    x: Option<DevBuffer>,
+    out: Option<DevBuffer>,
+}
+
+thread_local! {
+    static F32_GEMM_BATCH_SC: std::cell::RefCell<F32GemmBatchSc> = const {
+        std::cell::RefCell::new(F32GemmBatchSc { x: None, out: None })
+    };
+}
+
+/// task 182: `maybe_gpu_f32_gemm_batch_into` の入口に入った回数 (テスト専用)。
+///
+/// このコンテナに GPU は無いので、計算は `cuda_enabled()` の所で CPU へ落ちる。
+/// ゲートと配線が生きていることを「入口の回数」で数える (decode の
+/// `router_gpu_attempts` と同じ規約)。
+#[cfg(test)]
+static F32_GEMM_BATCH_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn f32_gemm_batch_attempts() -> usize {
+    F32_GEMM_BATCH_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn f32_gemm_batch_attempts_reset() {
+    F32_GEMM_BATCH_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// task 182: `out[t * n + r] = dot(row r, xs[t])` を GPU の f32 GEMM で回す。
+///
+/// 重みは [`weights_for_f32`] の常駐 (router の 1 行 GEMV と同じ uid 表) を使う。
+/// `nt < 2`・形の不一致・GPU 無し・予算外・PTX 未収録はすべて `false` を返して
+/// CPU 経路へ落とす (panic しない)。
+pub fn maybe_gpu_f32_gemm_batch_into(
+    uid: u64,
+    bytes: &[u8],
+    k: usize,
+    n: usize,
+    xs: &[f32],
+    nt: usize,
+    out: &mut [f32],
+    src_ty: crate::kquant::GgmlType,
+) -> bool {
+    #[cfg(test)]
+    F32_GEMM_BATCH_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !cuda_enabled() {
+        return false;
+    }
+    let bpp = match src_ty {
+        crate::kquant::GgmlType::F32 => 4usize,
+        crate::kquant::GgmlType::Bf16 | crate::kquant::GgmlType::F16 => 2,
+        _ => return false,
+    };
+    if k == 0
+        || n == 0
+        || nt < 2
+        || xs.len() != nt * k
+        || out.len() != nt * n
+        || bytes.len() != k.saturating_mul(n).saturating_mul(bpp)
+        || k > i32::MAX as usize
+        || n > i32::MAX as usize
+        || nt > i32::MAX as usize
+    {
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        return false;
+    }
+    let Some(f) = gemm_f32_mt_fn(ctx) else {
+        return false;
+    };
+    let w = match weights_for_gemm_f32(uid, bytes, k, n, src_ty) {
+        Ok(w) => w,
+        Err(_) => return false,
+    };
+    let lib = match lib() {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    let r = F32_GEMM_BATCH_SC.with(|cell| -> Result<()> {
+        let mut s = cell.borrow_mut();
+        let F32GemmBatchSc { x: dx, out: dout } = &mut *s;
+        Scratch::ensure(dx, nt * k * 4)?;
+        Scratch::ensure(dout, nt * n * 4)?;
+        let (dx, dout) = (dx.as_ref().unwrap(), dout.as_ref().unwrap());
+        dx.copy_from(xs)?;
+        let wp = w.buf.ptr();
+        unsafe {
+            let (mut pw, mut px, mut po) = (wp, dx.ptr(), dout.ptr());
+            let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, k as c_int, n as c_int);
+            let mut args = [
+                &mut pw as *mut _ as *mut c_void,
+                &mut px as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut nt_c as *mut _ as *mut c_void,
+                &mut k_c as *mut _ as *mut c_void,
+                &mut n_c as *mut _ as *mut c_void,
+            ];
+            let grid = (
+                ((n + GEMM_MT_ROWS - 1) / GEMM_MT_ROWS) as u32,
+                ((nt + GEMM_MT_TOKS - 1) / GEMM_MT_TOKS) as u32,
+                1,
+            );
+            ctx.launch_async(f, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)?;
+            ctx.sync()?;
+            // D2H は同期コピーで `out` へ直接 (中間 Vec / pinned を作らない)。
+            check(
+                (lib.memcpy_dtoh)(
+                    out.as_mut_ptr() as *mut c_void,
+                    dout.ptr(),
+                    nt * n * 4,
+                ),
+                "cuMemcpyDtoH (f32 batch)",
+            )?;
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        }
+        Ok(())
+    });
+    r.is_ok()
+}
+
 
 
 // ---------------------------------------------------------------------------

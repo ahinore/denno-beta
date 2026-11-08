@@ -4878,6 +4878,51 @@ fn ple_inject_batch(
     if pf_ple_gpu_on() {
         ple_dev = Qwen4Exp::pf_ple_dev_run(pw, &flat, nt, e, &mut key, &mut value);
     }
+    // task 182: 実モデルの ple_key / ple_value は **F32** (目録は Q8_0) なので、
+    // 上の量子型専用経路は形の段階で断られる (t172b/t172c)。F32 は同じ
+    // `dno_gemm_f32_mt` のバッチ GEMM に載せる (`DENNO_PF_PLE_F32_GPU`)。
+    // 片方でも GPU に載らなければ両方 CPU で回し直す (混在させない)。
+    if !ple_dev && pf_ple_f32_gpu_on() && nt >= PF_PLE_F32_GPU_MIN_TOK {
+        // 実ファイルの型は F32 か BF16 (目録は Q8_0)。BF16 は f32 に開いてから
+        // 同じカーネルに載せる (VRAM は f32 で 2 倍になるが 105 MB 程度)。
+        let f32_ok = matches!(pw.key.ty(), GgmlType::F32 | GgmlType::Bf16 | GgmlType::F16)
+            && matches!(pw.value.ty(), GgmlType::F32 | GgmlType::Bf16 | GgmlType::F16);
+        PF182_LOG_PLE_TY.call_once(|| {
+            eprintln!(
+                "[pf182] ple key ty={:?} value ty={:?} (f32_ok={f32_ok})",
+                pw.key.ty(),
+                pw.value.ty()
+            )
+        });
+        if f32_ok {
+            let k_ok = crate::cuda::maybe_gpu_f32_gemm_batch_into(
+                pw.key.uid(),
+                pw.key.blocks().as_slice(),
+                pw.key.k(),
+                pw.key.n(),
+                &flat,
+                nt,
+                &mut key,
+                pw.key.ty(),
+            );
+            let v_ok = crate::cuda::maybe_gpu_f32_gemm_batch_into(
+                pw.value.uid(),
+                pw.value.blocks().as_slice(),
+                pw.value.k(),
+                pw.value.n(),
+                &flat,
+                nt,
+                &mut value,
+                pw.value.ty(),
+            );
+            ple_dev = k_ok && v_ok;
+            if ple_dev {
+                PF182_LOG_PLE_F32.call_once(|| {
+                    eprintln!("[pf182] PLE key/value: GPU f32 GEMM (DENNO_PF_PLE_F32_GPU)")
+                });
+            }
+        }
+    }
     if !ple_dev {
         gemv_batch_cpu(&pw.key, &flat, nt, &mut key)
             .map_err(|err| one(format!("ple_key (batch): {err}")))?;
@@ -10325,6 +10370,98 @@ pub(crate) fn pf_ple_gpu_on() -> bool {
     *ON.get_or_init(|| pf_ple_gpu_from_value(std::env::var("DENNO_PF_PLE_GPU").ok().as_deref()))
 }
 
+// ---------------------------------------------------------------------------
+// task 182: prefill の router / PLE 射影 (F32) を GPU で回すゲート (2 本)
+// ---------------------------------------------------------------------------
+//
+// どちらも **明示的な真値だけ on** (既定 off)。`pf_on_from_value` は task 181
+// 以降「未設定 = on」なので、ここでは使わない (lab の COND で明示的に on に
+// したときだけ効かせ、採否が決まるまで本番の既定挙動を変えない)。
+
+/// task 182: `DENNO_PF_ROUTER_GPU` / `DENNO_PF_PLE_F32_GPU` の解釈 (純関数)。
+///
+/// task 182 の lab t182b (combo vs off) が cold prefill 3,826 tok -8.5%、
+/// 14,018 tok -9.3%、decode と 19 トークン next turn は ±2% 以内 (10 ms の差)、
+/// errors 0・text sane だったので **既定 on**。明示的な偽値だけ off。
+pub(crate) fn pf182_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no" | ""
+        ),
+        None => true,
+    }
+}
+
+/// task 182: 実際に GPU で回ったことを lab のログに 1 回だけ出す
+/// (分岐が発火した証拠。off のときは何も出ない)。
+static PF182_LOG_ROUTER: std::sync::Once = std::sync::Once::new();
+static PF182_LOG_PLE_F32: std::sync::Once = std::sync::Once::new();
+static PF182_LOG_PLE_TY: std::sync::Once = std::sync::Once::new();
+
+/// テストが env を立てずに 2 本のゲートを強制するための上書き
+/// (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+static PF182_FORCE: [std::sync::atomic::AtomicU8; 2] =
+    [const { std::sync::atomic::AtomicU8::new(0) }; 2];
+
+/// task 182: ゲート番号 (router)。
+pub(crate) const PF182_GATE_ROUTER: usize = 0;
+/// task 182: ゲート番号 (PLE の F32 射影)。
+pub(crate) const PF182_GATE_PLE_F32: usize = 1;
+
+fn pf182_forced(which: usize) -> Option<bool> {
+    match PF182_FORCE[which.min(1)].load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+/// テスト専用: ゲートの on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_pf182_for_test(which: usize, v: Option<bool>) {
+    PF182_FORCE[which.min(1)].store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// task 182: prefill の router (`ffn_gate_inp`、F32) を GPU の f32 GEMM で
+/// 回すか (`DENNO_PF_ROUTER_GPU`、**既定 on**。`=0` で CPU バッチに戻る)。
+///
+/// lab t182a (3,826 tok): router 1,334 -> 380 ms、prefill -8.0%。
+pub(crate) fn pf_router_gpu_on() -> bool {
+    if let Some(v) = pf182_forced(PF182_GATE_ROUTER) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf182_from_value(std::env::var("DENNO_PF_ROUTER_GPU").ok().as_deref()))
+}
+
+/// task 182: PLE の key / value 射影 (F32 重み) を GPU の f32 GEMM で回すか
+/// (`DENNO_PF_PLE_F32_GPU`、**既定 on**。`=0` で CPU バッチに戻る)。
+pub(crate) fn pf_ple_f32_gpu_on() -> bool {
+    if let Some(v) = pf182_forced(PF182_GATE_PLE_F32) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf182_from_value(std::env::var("DENNO_PF_PLE_F32_GPU").ok().as_deref()))
+}
+
+/// task 182: router を GPU に載せる最小トークン数 (これ未満は CPU バッチ)。
+///
+/// 19 トークンの next turn prefill はここで CPU のまま (= 従来とビット一致) に
+/// なる。64 トークンでも CPU は約 12 ms、GPU は固定費 1 ms 未満なので境界は 64。
+pub(crate) const PF_ROUTER_GPU_MIN_TOK: usize = 64;
+
+/// task 182: PLE の F32 射影を GPU に載せる最小トークン数。
+pub(crate) const PF_PLE_F32_GPU_MIN_TOK: usize = 64;
+
+
 
 /// `DENNO_PLE_BATCH` の値の解釈 (純粋関数)。**既定 on**。
 ///
@@ -12012,8 +12149,32 @@ fn moe_ffn_quant_batch_full(
     let _l_router = q4ledger::enter(q4ledger::ROUTER);
     let t_router = std::time::Instant::now();
     let mut probs = vec![0.0f32; nt * ne];
-    gemv_batch(&lw.gate_inp, xs, nt, &mut probs)
-        .map_err(|err| one(format!("層 {}: ffn_gate_inp (batch): {err}", lw.il)))?;
+    // task 182: router (`ffn_gate_inp`、F32) を GPU の f32 GEMM で回す
+    // (`DENNO_PF_ROUTER_GPU=1` のときだけ。失敗・前提外は CPU バッチへ)。
+    #[cfg(feature = "cuda")]
+    let gpu_router = pf_router_gpu_on()
+        && nt >= PF_ROUTER_GPU_MIN_TOK
+        && crate::cuda::maybe_gpu_f32_gemm_batch_into(
+            lw.gate_inp.uid(),
+            lw.gate_inp.blocks().as_slice(),
+            lw.gate_inp.k(),
+            lw.gate_inp.n(),
+            xs,
+            nt,
+            &mut probs,
+            GgmlType::F32,
+        );
+    #[cfg(not(feature = "cuda"))]
+    let gpu_router = false;
+    if gpu_router {
+        PF182_LOG_ROUTER.call_once(|| {
+            eprintln!("[pf182] prefill router: GPU f32 GEMM (DENNO_PF_ROUTER_GPU)")
+        });
+    }
+    if !gpu_router {
+        gemv_batch(&lw.gate_inp, xs, nt, &mut probs)
+            .map_err(|err| one(format!("層 {}: ffn_gate_inp (batch): {err}", lw.il)))?;
+    }
 
     // 2. トークンごとの softmax (行は独立なので並列化しても値は変わらない)
     // task 154: 台帳の副区間 (softmax + top-k)。
@@ -13220,6 +13381,17 @@ mod tests {
             ple_head_vocab_sizes: Vec::new(),
             n_vocab: 8,
         }
+    }
+
+    /// 決定的な BF16 の重み (実モデルの ple_key / ple_value の候補型)。
+    fn bf16_linear(k: usize, n: usize, seed: f32) -> GgufLinear {
+        let mut v = Vec::with_capacity(k * n * 2);
+        for i in 0..k * n {
+            let x = seed + (i % 17) as f32 * 0.01;
+            v.extend_from_slice(&((x.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        GgufLinear::new(GgmlType::Bf16, k, n, WeightBlocks::from_vec(v))
+            .expect("GgufLinear::new (BF16)")
     }
 
     /// 決定的な f32 の重み (F32 の GgufLinear)。
@@ -15930,6 +16102,268 @@ mod tests {
         ] {
             assert!(!on, "{name} までルータ扱いになっている");
         }
+    }
+
+    /// task 182: `DENNO_PF_ROUTER_GPU` / `DENNO_PF_PLE_F32_GPU` の解釈。
+    /// lab t182b で combo が目標を満たしたので **未設定は on**、明示的な偽値だけ off。
+    #[test]
+    fn pf182_gates_default_on() {
+        assert!(pf182_from_value(None), "未設定が off になった (lab t182b で既定 on)");
+        for v in ["0", "off", "false", "no", "", " 0 ", "OFF"] {
+            assert!(!pf182_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", " ON ", "Yes"] {
+            assert!(pf182_from_value(Some(v)), "{v:?} が off になった");
+        }
+    }
+
+    /// task 182: 通常順 prefill の router GPU 入口が層 1 回ぶんだけ呼ばれ、
+    /// GPU の無いこの環境では CPU とビット一致すること。
+    ///
+    /// 最小トークン数未満 (19 トークンの next turn 相当) では入口に入らない
+    /// ことも数える。GPU 入口のカウンタは `cuda_enabled()` より前で増えるので、
+    /// 配線が生きている証拠になる。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn pf182_router_batch_gate_wiring() {
+        let _m = moe_test_guard();
+        let dir = TempDir::new("pf182_router");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = cache_test_layer(&f, &p);
+        let nt = PF_ROUTER_GPU_MIN_TOK;
+        let xs = cache_test_x(nt * p.n_embd);
+
+        // 1. ゲート off: 入口に 1 回も入らない。
+        set_pf182_for_test(PF182_GATE_ROUTER, Some(false));
+        crate::cuda::f32_gemm_batch_attempts_reset();
+        let off = moe_ffn_quant_batch_opts(&p, &lw, &xs, nt, None, moe_schedule(), false)
+            .expect("batch (off)");
+        assert_eq!(
+            crate::cuda::f32_gemm_batch_attempts(),
+            0,
+            "ゲート off なのに router の GPU 入口に入った"
+        );
+
+        // 2. ゲート on: 層 1 回 = 1 回。GPU が無いので中で CPU に落ちる。
+        set_pf182_for_test(PF182_GATE_ROUTER, Some(true));
+        crate::cuda::f32_gemm_batch_attempts_reset();
+        let on = moe_ffn_quant_batch_opts(&p, &lw, &xs, nt, None, moe_schedule(), false)
+            .expect("batch (on)");
+        assert_eq!(
+            crate::cuda::f32_gemm_batch_attempts(),
+            1,
+            "router GPU 入口の回数が層数と違う (配線が切れている)"
+        );
+        assert_eq!(off.len(), on.len());
+        for i in 0..off.len() {
+            assert_eq!(
+                off[i].to_bits(),
+                on[i].to_bits(),
+                "要素 {i}: off={} on={}",
+                off[i],
+                on[i]
+            );
+        }
+
+        // 3. 最小トークン数未満は入口に入らない (19 トークンの next turn を
+        //    従来どおり CPU のままにする境界)。
+        let nt2 = PF_ROUTER_GPU_MIN_TOK - 1;
+        let xs2 = cache_test_x(nt2 * p.n_embd);
+        crate::cuda::f32_gemm_batch_attempts_reset();
+        let _ = moe_ffn_quant_batch_opts(&p, &lw, &xs2, nt2, None, moe_schedule(), false)
+            .expect("batch (small)");
+        assert_eq!(
+            crate::cuda::f32_gemm_batch_attempts(),
+            0,
+            "nt={nt2} で router の GPU 入口に入った"
+        );
+        set_pf182_for_test(PF182_GATE_ROUTER, None);
+    }
+
+    /// task 182: ルータの丸めが top-k の**選択**を変えるのは、k 番目と k+1 番目の
+    /// 確率が丸めの幅に収まる同値のときだけであること。
+    ///
+    /// 実形 (2,560 -> 512、n_expert_used = 5) で、CPU のバッチ経路と GPU の
+    /// `dno_gemm_f32_mt` と同じ演算列 (FMA・k 昇順) の確率を出して top-k を比べる。
+    /// 変わった行は必ず「境界の差が 8 ulp 以内」であることを要求する。
+    #[test]
+    fn pf182_router_topk_rounding_only_flips_ties() {
+        let (k, n, nt, kk) = (2560usize, 512usize, 16usize, 5usize);
+        let w = f32_linear(k, n, 0.001);
+        let xs = cache_test_x(nt * k);
+        // CPU のバッチ経路 (実装が prefill で使う経路そのもの)
+        let mut cpu = vec![0.0f32; nt * n];
+        gemv_batch(&w, &xs, nt, &mut cpu).expect("gemv_batch");
+        // GPU カーネルと同じ演算列: 1 出力につき k 昇順の `fma(w, x, acc)`。
+        // (`kernels_elem.cu` の `dno_gemm_f32_mt` は `__fmaf_rn` を kk 昇順に
+        //  32 要素ずつ、k0 タイル昇順で回す = 全体で k 昇順の 1 本の鎖。)
+        let bytes = w.blocks().as_slice();
+        let mut gpu = vec![0.0f32; nt * n];
+        for t in 0..nt {
+            for r in 0..n {
+                let row = &bytes[r * k * 4..(r + 1) * k * 4];
+                let xr = &xs[t * k..(t + 1) * k];
+                let mut acc = 0.0f32;
+                for i in 0..k {
+                    let wv = f32::from_le_bytes([
+                        row[i * 4],
+                        row[i * 4 + 1],
+                        row[i * 4 + 2],
+                        row[i * 4 + 3],
+                    ]);
+                    acc = wv.mul_add(xr[i], acc);
+                }
+                gpu[t * n + r] = acc;
+            }
+        }
+        let mut diff_rows = 0usize;
+        let mut buf = Vec::new();
+        for t in 0..nt {
+            let mut pc = cpu[t * n..(t + 1) * n].to_vec();
+            let mut pg = gpu[t * n..(t + 1) * n].to_vec();
+            softmax(&mut pc);
+            softmax(&mut pg);
+            let mut sc = vec![0usize; kk];
+            let mut sg = vec![0usize; kk];
+            select_topk_into(&pc, kk, &mut buf, &mut sc);
+            select_topk_into(&pg, kk, &mut buf, &mut sg);
+            if sc != sg {
+                diff_rows += 1;
+                let mut sorted = pc.clone();
+                sorted.sort_by(|a, b| b.partial_cmp(a).expect("確率に NaN"));
+                let gap = sorted[kk - 1] - sorted[kk];
+                let scale = sorted[kk - 1].abs().max(1e-30);
+                assert!(
+                    gap <= 8.0 * f32::EPSILON * scale,
+                    "行 {t}: 同値でないのに top-k が変わった (gap={gap:e}, p={scale:e})"
+                );
+            }
+        }
+        eprintln!("[pf182] router top-k が丸めで変わった行: {diff_rows}/{nt}");
+        assert!(
+            diff_rows <= nt / 2,
+            "丸めだけで半数以上の行の top-k が変わった ({diff_rows}/{nt})"
+        );
+    }
+
+    /// task 182: PLE の key / value 射影 (F32) の GPU 入口がチャンク 1 回で
+    /// 2 回 (key + value) 呼ばれ、GPU の無いこの環境では CPU とビット一致すること。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn pf182_ple_f32_gate_wiring() {
+        let _m = moe_test_guard();
+        let mut p = cache_test_params();
+        // conv 履歴の長さは `(kern-1) * ngram_size * hc_dim`。
+        p.ple_conv_kernel = 2;
+        p.ple_ngram_size = 1;
+        let hp = HyperParams {
+            hc: p.n_hc,
+            n_embd: p.n_embd,
+            low_rank: p.hc_low_rank,
+            eps: p.rms_eps,
+        };
+        let e = p.n_embd;
+        let hc_dim = p.hc_dim();
+        let pw = PleW {
+            key: f32_linear(e, hc_dim, 0.1),
+            value: f32_linear(e, e, 0.2),
+            norm_key: vec![1.0; hc_dim],
+            norm_query: vec![1.0; hc_dim],
+            norm_conv: vec![1.0; hc_dim],
+            conv1d: vec![0.25; 2 * hc_dim],
+            kern: 2,
+        };
+        let nt = PF_PLE_F32_GPU_MIN_TOK;
+        let flat: Vec<f32> = cache_test_x(nt * e);
+        let rows: Vec<&[f32]> = (0..nt).map(|t| &flat[t * e..(t + 1) * e]).collect();
+        let mk_res = |p: &Qwen4ExpParams| -> Vec<HyperStreams> {
+            (0..nt)
+                .map(|t| HyperStreams {
+                    data: cache_test_x_seed(p.hc_dim(), t),
+                    hc: p.n_hc,
+                    n_embd: p.n_embd,
+                })
+                .collect()
+        };
+        let mut hist = vec![0.0f32; hc_dim];
+
+        // 1. ゲート off: 入口に入らない。
+        set_pf182_for_test(PF182_GATE_PLE_F32, Some(false));
+        let mut r_off = mk_res(&p);
+        crate::cuda::f32_gemm_batch_attempts_reset();
+        ple_inject_batch(&p, &pw, &rows, &mut r_off, &hp, &mut hist, None).expect("ple off");
+        assert_eq!(
+            crate::cuda::f32_gemm_batch_attempts(),
+            0,
+            "ゲート off なのに PLE の GPU 入口に入った"
+        );
+
+        // 2. ゲート on: key と value で 2 回。GPU が無いので CPU に落ちる。
+        set_pf182_for_test(PF182_GATE_PLE_F32, Some(true));
+        let mut r_on = mk_res(&p);
+        let mut hist2 = vec![0.0f32; hc_dim];
+        crate::cuda::f32_gemm_batch_attempts_reset();
+        ple_inject_batch(&p, &pw, &rows, &mut r_on, &hp, &mut hist2, None).expect("ple on");
+        assert_eq!(
+            crate::cuda::f32_gemm_batch_attempts(),
+            2,
+            "PLE の GPU 入口が key/value の 2 回でない (配線が切れている)"
+        );
+        for (t, (a, b)) in r_off.iter().zip(r_on.iter()).enumerate() {
+            assert_eq!(a.data.len(), b.data.len());
+            for i in 0..a.data.len() {
+                assert_eq!(
+                    a.data[i].to_bits(),
+                    b.data[i].to_bits(),
+                    "トークン {t} 要素 {i}: off={} on={}",
+                    a.data[i],
+                    b.data[i]
+                );
+            }
+        }
+
+        // 3. 実ファイルの型が BF16 でも配線が同じように生きること。
+        let pw16 = PleW {
+            key: bf16_linear(e, hc_dim, 0.1),
+            value: bf16_linear(e, e, 0.2),
+            norm_key: vec![1.0; hc_dim],
+            norm_query: vec![1.0; hc_dim],
+            norm_conv: vec![1.0; hc_dim],
+            conv1d: vec![0.25; 2 * hc_dim],
+            kern: 2,
+        };
+        set_pf182_for_test(PF182_GATE_PLE_F32, Some(false));
+        let mut r16_off = mk_res(&p);
+        let mut hist2b = vec![0.0f32; hc_dim];
+        crate::cuda::f32_gemm_batch_attempts_reset();
+        ple_inject_batch(&p, &pw16, &rows, &mut r16_off, &hp, &mut hist2b, None)
+            .expect("ple bf16 off");
+        assert_eq!(crate::cuda::f32_gemm_batch_attempts(), 0);
+        set_pf182_for_test(PF182_GATE_PLE_F32, Some(true));
+        let mut r16_on = mk_res(&p);
+        let mut hist3 = vec![0.0f32; hc_dim];
+        crate::cuda::f32_gemm_batch_attempts_reset();
+        ple_inject_batch(&p, &pw16, &rows, &mut r16_on, &hp, &mut hist3, None)
+            .expect("ple bf16 on");
+        assert_eq!(
+            crate::cuda::f32_gemm_batch_attempts(),
+            2,
+            "BF16 の PLE で GPU 入口が key/value の 2 回でない"
+        );
+        for (t, (a, b)) in r16_off.iter().zip(r16_on.iter()).enumerate() {
+            for i in 0..a.data.len() {
+                assert_eq!(
+                    a.data[i].to_bits(),
+                    b.data[i].to_bits(),
+                    "BF16 トークン {t} 要素 {i}: off={} on={}",
+                    a.data[i],
+                    b.data[i]
+                );
+            }
+        }
+        set_pf182_for_test(PF182_GATE_PLE_F32, None);
     }
 
     #[test]
