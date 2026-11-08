@@ -1606,6 +1606,13 @@ impl FullAttn {
 
     /// [`LayerAttn::forward`] の anyhow 版 (テストと F5 の合成から使う)。
     pub fn forward_token(&mut self, layer: usize, cur: &[f32]) -> Result<Vec<f32>> {
+        // task 177: full attention 1 層の操作別内訳 (`DENNO_GDN_DEC_KPROF`・既定 off)。
+        // guard の drop (この関数の出口) で表を出す。
+        let _kp_win = crate::cuda::dec_kprof::window(
+            crate::cuda::dec_kprof::FULL,
+            layer,
+            crate::cuda::dec_kprof::cur_pos(),
+        );
         if cur.len() != self.n_embd {
             bail!(
                 "FullAttn::forward: 入力長 {} が n_embd = {} と違う",

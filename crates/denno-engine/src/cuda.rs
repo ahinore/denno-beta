@@ -760,6 +760,655 @@ mod launch_dbg {
     }
 }
 
+// ---- task 177: decode 1 層の操作別内訳 (DENNO_GDN_DEC_KPROF・既定 off) --------
+//
+// 背景: lab t169b の [q4ledger] では ssm が 6.42 ms/token (36 GDN 層 = 178 us/層)
+// なのに host cpu は 0.86 ms/token で、同期も 0 回と数えられていた。t166 は
+// 「1 submission 154 us のうちカーネルは 49 us」と測っており、層あたり 100 us
+// 前後が「同じ submission の別の GPU 仕事 (conv/norm/gate/小コピー/複数起動)」
+// 「発行間のホスト仕事」「層出力の同期 D2H とその待ち」のどれなのかが
+// 分かっていなかった。t166b/t166c (pinned async コピー・別ストリーム) と
+// t171a (待ちのモード) は 0% だったので、当て推量で次を選ばないための計測。
+//
+// ここでは submission の各操作 (起動 / H2D / D2H / D2D / 明示同期) の**直前と
+// 直後**に CUDA イベントを打ち、層 1 本ぶんの表を出す。列の意味:
+//   gpu_us  = その操作の GPU 時間 (イベント 2 点の差。コピーなら DMA の時間)
+//   gap_us  = 前の操作の終わりからこの操作の始まりまでの GPU 側の隙間
+//   hin_us  = 前の操作のホスト戻りからこの操作のホスト入口までの経過
+//   host_us = この操作のホスト滞在時間 (同期コピー・同期なら待ちを含む)
+// 読み方: `gpu_us` の和が `wall_us` に近ければ GPU は実際に働いている
+// (= 削るべきはカーネルの中身)。`host_us`/`gap_us` が大きければホスト
+// (driver 呼び出し) が GPU を遊ばせている (= 発行回数とコピーを削る)。
+//
+// 数値経路: off のとき各サイトが払うのは thread-local の `Cell<bool>` 読み 1 回。
+// on でもカーネルの引数・起動形状・発行順・同期の位置は 1 つも変えず、
+// イベントを打つ位置だけを足す (イベントは既定ストリームに挿入されるが、
+// 時刻を記録するだけでデータを動かさない)。読み出しは窓の最後
+// (呼び出し側がすでに同期済みの点) に 1 回だけ `cuEventSynchronize` を打つ。
+//
+// 出すのは `DENNO_GDN_DEC_KPROF=1` のときだけ。表は 3 つの位置帯
+// (短い decode / 3,800..4,100 / 14,000..14,400 トークン) で、帯と種類ごとに
+// 1 回だけ出す (同じ帯で 36 層ぶん出さない)。
+// ---------------------------------------------------------------------------
+pub(crate) mod dec_kprof {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::time::Instant;
+
+    /// 種類: GDN (ssm) 層の submission。
+    pub(crate) const GDN: u8 = 1;
+    /// 種類: hc mix (attn 側 / ffn 側のどちらでも最初の 1 回)。
+    pub(crate) const MIX: u8 = 2;
+    /// 種類: full attention 層。
+    pub(crate) const FULL: u8 = 3;
+
+    /// `DENNO_GDN_DEC_KPROF` が立っているか (既定 off)。
+    pub(crate) fn on() -> bool {
+        if let Some(v) = force_for_test() {
+            return v;
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| match std::env::var("DENNO_GDN_DEC_KPROF").ok() {
+            None => false,
+            Some(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "" | "0" | "off" | "false" | "no")
+            }
+        })
+    }
+
+    /// 表を出す位置帯 (0 = 短い decode、1 = 3.8k..4.1k、2 = 14.0k..14.4k)。
+    /// 帯の外は `None`。**純関数** (テストで真理値表を固定する)。
+    pub(crate) fn band(pos: u64) -> Option<u8> {
+        if pos < 400 {
+            Some(0)
+        } else if (3_800..=4_100).contains(&pos) {
+            Some(1)
+        } else if (14_000..=14_400).contains(&pos) {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
+    /// 帯と種類の組を 1 bit にしたもの (出したかどうかの記憶に使う)。
+    fn mask(pos: u64, kind: u8) -> u8 {
+        match band(pos) {
+            Some(b) => 1u8 << ((b as u32) * 4 + kind as u32),
+            None => 0,
+        }
+    }
+
+    /// 計測を始めてよければ true。**純関数** (テストで真理値表を固定する)。
+    ///
+    /// `active` = すでに窓が開いている (入れ子は外側を優先)、`dead` = イベントを
+    /// 作れなかった、`printed` = このプロセスで出し終えた (帯, 種類) のビット、
+    /// `decode` = decode 窓の内側か (prefill の逐次 1 トークン経路で古い位置を
+    /// 使って表を出すと、その帯の本番の表を食ってしまうので必須)。
+    pub(crate) fn should_begin(
+        active: bool,
+        dead: bool,
+        printed: u8,
+        pos: u64,
+        kind: u8,
+        decode: bool,
+    ) -> bool {
+        if active || dead || !decode || band(pos).is_none() {
+            return false;
+        }
+        (printed & mask(pos, kind)) == 0
+    }
+
+    thread_local! {
+        static ST: RefCell<Option<St>> = const { RefCell::new(None) };
+        /// ホットパス用の鏡 (`St.active` と同じ)。off の分岐はここ 1 回。
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        /// 直近に居た層 (mix は層番号を知らないので `run_layer` が置く)。
+        static IL: Cell<usize> = const { Cell::new(0) };
+        /// 直近の decode の絶対位置 (`Qwen4ExpDecode` が置く)。
+        static POS: Cell<u64> = const { Cell::new(0) };
+        /// テスト用の強制 (None = env の解釈)。
+        static FORCE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    /// 1 操作ぶんの記録。
+    struct Entry {
+        name: String,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shmem: u32,
+        bytes: usize,
+        ev_in: u32,
+        ev_out: u32,
+        /// 前の操作のホスト戻りからこの操作のホスト入口まで (ns)。
+        hin_ns: u64,
+        /// この操作のホスト滞在 (ns)。
+        host_ns: u64,
+        t_host: Instant,
+    }
+
+    struct St {
+        kind: u8,
+        li: usize,
+        pos: u64,
+        /// 層の重みの実バイト (qkv + out。実効帯域を出すため)。
+        wbytes: usize,
+        entries: Vec<Entry>,
+        evs: Vec<CUevent>,
+        used: usize,
+        t0: Instant,
+        prev_end: Instant,
+        /// (帯, 種類) を出し終えたビット。
+        printed: u8,
+        dead: bool,
+    }
+
+    impl St {
+        fn new() -> Self {
+            let now = Instant::now();
+            Self {
+                kind: 0,
+                li: 0,
+                pos: 0,
+                wbytes: 0,
+                entries: Vec::new(),
+                evs: Vec::new(),
+                used: 0,
+                t0: now,
+                prev_end: now,
+                printed: 0,
+                dead: false,
+            }
+        }
+    }
+
+    /// テストが env を立てずに on/off を強制する (panic しても戻すのは呼び出し側)。
+    #[cfg(test)]
+    pub(crate) fn set_force_for_test(v: Option<bool>) {
+        FORCE.with(|c| c.set(v));
+    }
+
+    fn force_for_test() -> Option<bool> {
+        #[cfg(test)]
+        {
+            return FORCE.with(|c| c.get());
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    /// `run_layer` が層番号を置く (mix の表に li を出すため)。
+    #[inline]
+    pub(crate) fn set_layer(il: usize) {
+        if on() {
+            IL.with(|c| c.set(il));
+        }
+    }
+
+    /// 直近の層番号。
+    pub(crate) fn cur_layer() -> usize {
+        IL.with(|c| c.get())
+    }
+
+    /// decode の絶対位置を置く (`Qwen4ExpDecode` の `step_inner` / `feed_one`)。
+    #[inline]
+    pub(crate) fn set_pos(pos: u64) {
+        if on() {
+            POS.with(|c| c.set(pos));
+        }
+    }
+
+    /// 直近の位置。
+    pub(crate) fn cur_pos() -> u64 {
+        POS.with(|c| c.get())
+    }
+
+    /// 窓を開く (開けなければ何もしない)。戻り値の guard が drop で表を出す。
+    pub(crate) fn window(kind: u8, li: usize, pos: u64) -> Win {
+        let decode = crate::model::qwen4exp::gdn_gpu_win::active();
+        let want = on()
+            && ACTIVE.with(|c| !c.get())
+            && ST.with(|c| {
+                let slot = c.borrow();
+                match slot.as_ref() {
+                    None => should_begin(false, false, 0, pos, kind, decode),
+                    Some(s) => should_begin(false, s.dead, s.printed, pos, kind, decode),
+                }
+            });
+        if !want {
+            return Win;
+        }
+        ST.with(|c| {
+            let mut slot = c.borrow_mut();
+            let s = slot.get_or_insert_with(St::new);
+            s.kind = kind;
+            s.li = li;
+            s.pos = pos;
+            s.wbytes = 0;
+            s.entries.clear();
+            s.used = 0;
+            s.t0 = Instant::now();
+            s.prev_end = s.t0;
+        });
+        ACTIVE.with(|c| c.set(true));
+        Win
+    }
+
+    /// 窓の guard (drop で表を出す)。表を出さない回は何もしない。
+    pub(crate) struct Win;
+
+    impl Drop for Win {
+        fn drop(&mut self) {
+            finish();
+        }
+    }
+
+    /// 層の重みの実バイトを添える (表の `wbytes` / `gbps` 用)。
+    pub(crate) fn note_wbytes(n: usize) {
+        if !ACTIVE.with(|c| c.get()) {
+            return;
+        }
+        ST.with(|c| {
+            if let Some(s) = c.borrow_mut().as_mut() {
+                s.wbytes = s.wbytes.saturating_add(n);
+            }
+        });
+    }
+
+    /// イベント 1 本を既定ストリームに打ち、pool の添字を返す。
+    fn record(s: &mut St) -> Option<u32> {
+        if s.dead {
+            return None;
+        }
+        if s.used >= s.evs.len() {
+            let want = s.evs.len() + 16;
+            let Some(create) = lib().ok().and_then(|l| l.event_create) else {
+                s.dead = true;
+                return None;
+            };
+            while s.evs.len() < want {
+                let mut ev: CUevent = std::ptr::null_mut();
+                // 0 = CU_EVENT_DEFAULT (計時有効)。
+                if unsafe { create(&mut ev, 0) } != CUDA_SUCCESS || ev.is_null() {
+                    s.dead = true;
+                    return None;
+                }
+                s.evs.push(ev);
+            }
+        }
+        let Some(rec) = lib().ok().and_then(|l| l.event_record) else {
+            s.dead = true;
+            return None;
+        };
+        let ev = s.evs[s.used];
+        if unsafe { rec(ev, std::ptr::null_mut()) } != CUDA_SUCCESS {
+            s.dead = true;
+            return None;
+        }
+        let i = s.used as u32;
+        s.used += 1;
+        Some(i)
+    }
+
+    /// 操作の入口 (窓が開いていなければ None = 分岐 1 回)。
+    #[inline]
+    pub(super) fn op_begin(
+        name: impl FnOnce() -> String,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shmem: u32,
+        bytes: usize,
+    ) -> Option<usize> {
+        if !ACTIVE.with(|c| c.get()) {
+            return None;
+        }
+        ST.with(|c| {
+            let mut slot = c.borrow_mut();
+            let s = slot.as_mut()?;
+            let ev_in = record(s)?;
+            let now = Instant::now();
+            let hin = now.saturating_duration_since(s.prev_end).as_nanos() as u64;
+            s.entries.push(Entry {
+                name: name(),
+                grid,
+                block,
+                shmem,
+                bytes,
+                ev_in,
+                ev_out: ev_in,
+                hin_ns: hin,
+                host_ns: 0,
+                t_host: now,
+            });
+            Some(s.entries.len() - 1)
+        })
+    }
+
+    /// 操作の出口 (入口が None なら何もしない)。
+    #[inline]
+    pub(super) fn op_end(idx: Option<usize>) {
+        let Some(idx) = idx else {
+            return;
+        };
+        ST.with(|c| {
+            let mut slot = c.borrow_mut();
+            let Some(s) = slot.as_mut() else {
+                return;
+            };
+            let ev = record(s);
+            let now = Instant::now();
+            if let Some(e) = s.entries.get_mut(idx) {
+                if let Some(ev) = ev {
+                    e.ev_out = ev;
+                }
+                e.host_ns = now.saturating_duration_since(e.t_host).as_nanos() as u64;
+            }
+            s.prev_end = now;
+        });
+    }
+
+    /// 2 イベント間の ms。
+    fn elapsed(evs: &[CUevent], a: u32, b: u32) -> Option<f32> {
+        let f = lib().ok().and_then(|l| l.event_elapsed_time)?;
+        let ea = *evs.get(a as usize)?;
+        let eb = *evs.get(b as usize)?;
+        let mut ms = 0.0f32;
+        if unsafe { f(&mut ms, ea, eb) } != CUDA_SUCCESS || !ms.is_finite() || ms < 0.0 {
+            return None;
+        }
+        Some(ms)
+    }
+
+    /// 表 1 行分 (GPU から切り離した値。整形だけをテストできるようにする)。
+    #[derive(Clone, Copy)]
+    struct Row<'a> {
+        name: &'a str,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shmem: u32,
+        bytes: usize,
+        gpu_us: f32,
+        gap_us: f32,
+        hin_us: f64,
+        host_us: f64,
+    }
+
+    fn kind_name(kind: u8) -> &'static str {
+        match kind {
+            GDN => "gdn",
+            MIX => "mix",
+            FULL => "full",
+            _ => "?",
+        }
+    }
+
+    fn grid_s(g: (u32, u32, u32)) -> String {
+        if g == (0, 0, 0) {
+            "-".to_string()
+        } else {
+            format!("{}x{}x{}", g.0, g.1, g.2)
+        }
+    }
+
+    fn block_s(b: (u32, u32, u32)) -> String {
+        if b == (0, 0, 0) {
+            "-".to_string()
+        } else {
+            format!("{}x{}x{}", b.0, b.1, b.2)
+        }
+    }
+
+    fn head_line(kind: u8, li: usize, pos: u64, wall_us: f64, ops: usize, rows: &[Row]) -> String {
+        let gpu_sum: f32 = rows.iter().map(|r| r.gpu_us).sum();
+        let host_sum: f64 = rows.iter().map(|r| r.host_us).sum();
+        let gaps: f32 = rows.iter().skip(1).map(|r| r.gap_us).sum();
+        format!(
+            "[dec-kprof] {} li={} pos={} wall_us={:.1} ops={} gpu_sum_us={:.1} gap_sum_us={:.1} host_sum_us={:.1}",
+            kind_name(kind),
+            li,
+            pos,
+            wall_us,
+            ops,
+            gpu_sum,
+            gaps,
+            host_sum
+        )
+    }
+
+    fn row_line(i: usize, r: &Row) -> String {
+        format!(
+            "[dec-kprof]   {} {} grid={} block={} shmem={} bytes={} gpu_us={:.2} gap_us={:.2} hin_us={:.1} host_us={:.1}",
+            i,
+            r.name,
+            grid_s(r.grid),
+            block_s(r.block),
+            r.shmem,
+            r.bytes,
+            r.gpu_us,
+            r.gap_us,
+            r.hin_us,
+            r.host_us
+        )
+    }
+
+    /// 窓を閉じて表を出す (開いていなければ何もしない)。
+    fn finish() {
+        if !ACTIVE.with(|c| c.replace(false)) {
+            return;
+        }
+        ST.with(|c| {
+            let mut slot = c.borrow_mut();
+            let Some(s) = slot.as_mut() else {
+                return;
+            };
+            // 最後のイベントまで待つ。窓を閉じる点は呼び出し側がすでに同期して
+            // いるので待ちは発生しない (未完了なら下の elapsed が miss になる)。
+            if let (Some(done), Some(last)) = (
+                lib().ok().and_then(|l| l.event_sync),
+                s.evs.get(s.used.saturating_sub(1)),
+            ) {
+                unsafe { done(*last) };
+            }
+            let wall_us = s.t0.elapsed().as_secs_f64() * 1e6;
+            if s.dead || s.entries.is_empty() {
+                eprintln!(
+                    "[dec-kprof] {} li={} pos={} wall_us={:.1} ops={} ev=unavailable (cuEventCreate/Record が失敗)",
+                    kind_name(s.kind),
+                    s.li,
+                    s.pos,
+                    wall_us,
+                    s.entries.len()
+                );
+                s.printed |= mask(s.pos, s.kind);
+                s.entries.clear();
+                s.used = 0;
+                return;
+            }
+            let mut rows: Vec<Row> = Vec::with_capacity(s.entries.len());
+            let mut prev_out: Option<u32> = None;
+            for e in &s.entries {
+                let gpu = elapsed(&s.evs, e.ev_in, e.ev_out).unwrap_or(f32::NAN);
+                let gap = match prev_out {
+                    Some(p) => elapsed(&s.evs, p, e.ev_in).unwrap_or(f32::NAN),
+                    None => 0.0,
+                };
+                rows.push(Row {
+                    name: &e.name,
+                    grid: e.grid,
+                    block: e.block,
+                    shmem: e.shmem,
+                    bytes: e.bytes,
+                    gpu_us: gpu * 1e3,
+                    gap_us: gap * 1e3,
+                    hin_us: e.hin_ns as f64 / 1e3,
+                    host_us: e.host_ns as f64 / 1e3,
+                });
+                prev_out = Some(e.ev_out);
+            }
+            eprintln!(
+                "{}",
+                head_line(s.kind, s.li, s.pos, wall_us, rows.len(), &rows)
+            );
+            if s.wbytes > 0 {
+                let gpu_sum: f32 = rows.iter().map(|r| r.gpu_us).sum();
+                let gbps = if gpu_sum > 0.0 {
+                    s.wbytes as f64 / gpu_sum as f64 / 1e3
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[dec-kprof]   wbytes={} w_gbps={:.1} (重みの実バイト / gpu_sum_us)",
+                    s.wbytes, gbps
+                );
+            }
+            for (i, r) in rows.iter().enumerate() {
+                eprintln!("{}", row_line(i, r));
+            }
+            s.printed |= mask(s.pos, s.kind);
+            s.entries.clear();
+            s.used = 0;
+        });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// env を見ずに on/off を固定する (assert が落ちても戻す)。
+        struct Force(Option<bool>);
+        impl Force {
+            fn set(v: Option<bool>) -> Self {
+                let prev = FORCE.with(|c| c.get());
+                FORCE.with(|c| c.set(v));
+                Force(prev)
+            }
+        }
+        impl Drop for Force {
+            fn drop(&mut self) {
+                FORCE.with(|c| c.set(self.0));
+            }
+        }
+
+        #[test]
+        fn band_covers_the_three_measured_points() {
+            assert_eq!(band(0), Some(0));
+            assert_eq!(band(1), Some(0));
+            assert_eq!(band(399), Some(0));
+            assert_eq!(band(400), None);
+            assert_eq!(band(2_000), None);
+            assert_eq!(band(3_799), None);
+            assert_eq!(band(3_800), Some(1));
+            assert_eq!(band(3_965), Some(1));
+            assert_eq!(band(4_100), Some(1));
+            assert_eq!(band(4_101), None);
+            assert_eq!(band(13_999), None);
+            assert_eq!(band(14_000), Some(2));
+            assert_eq!(band(14_159), Some(2));
+            assert_eq!(band(14_400), Some(2));
+            assert_eq!(band(14_401), None);
+        }
+
+        #[test]
+        fn should_begin_truth_table() {
+            // 窓が開いていれば入れ子は開かない。
+            assert!(!should_begin(true, false, 0, 1, GDN, true));
+            // イベントを作れなかったら以後は開かない (静かに no-op にしない)。
+            assert!(!should_begin(false, true, 0, 1, GDN, true));
+            // 帯の外は開かない。
+            assert!(!should_begin(false, false, 0, 2_000, GDN, true));
+            // decode 窓の外 (prefill の逐次 1 トークン) は開かない。
+            assert!(!should_begin(false, false, 0, 1, GDN, false));
+            // 帯の中なら開く。
+            assert!(should_begin(false, false, 0, 1, GDN, true));
+            assert!(should_begin(false, false, 0, 3_965, GDN, true));
+            assert!(should_begin(false, false, 0, 14_159, FULL, true));
+            // 同じ (帯, 種類) を出した後は開かない。
+            let m = mask(3_965, GDN);
+            assert!(!should_begin(false, false, m, 3_970, GDN, true));
+            // 違う種類は開く。
+            assert!(should_begin(false, false, m, 3_970, MIX, true));
+            // 違う帯は開く。
+            assert!(should_begin(false, false, m, 14_159, GDN, true));
+            // mask は帯と種類で別のビット。
+            assert_ne!(mask(1, GDN), mask(3_965, GDN));
+            assert_ne!(mask(1, GDN), mask(1, MIX));
+            assert_ne!(mask(3_965, GDN), mask(14_159, GDN));
+        }
+
+        #[test]
+        fn render_has_the_columns_the_task_asked_for() {
+            let rows = [
+                Row {
+                    name: "H2D",
+                    grid: (0, 0, 0),
+                    block: (0, 0, 0),
+                    shmem: 0,
+                    bytes: 20_480,
+                    gpu_us: 2.5,
+                    gap_us: 0.0,
+                    hin_us: 0.4,
+                    host_us: 31.25,
+                },
+                Row {
+                    name: "K dno_gemv_q8_0c4",
+                    grid: (2_560, 1, 1),
+                    block: (256, 1, 1),
+                    shmem: 0,
+                    bytes: 0,
+                    gpu_us: 40.0,
+                    gap_us: 1.5,
+                    hin_us: 2.0,
+                    host_us: 3.0,
+                },
+            ];
+            let head = head_line(GDN, 0, 3_965, 120.0, rows.len(), &rows);
+            assert!(head.contains("gdn li=0 pos=3965"), "{head}");
+            assert!(head.contains("ops=2"), "{head}");
+            // gpu_sum = 42.5 / gap_sum = 1.5 (先頭の gap は数えない)
+            assert!(head.contains("gpu_sum_us=42.5"), "{head}");
+            assert!(head.contains("gap_sum_us=1.5"), "{head}");
+            assert!(head.contains("host_sum_us=34.2"), "{head}");
+            let l0 = row_line(0, &rows[0]);
+            for k in [
+                " 0 H2D", "grid=-", "block=-", "bytes=20480", "gpu_us=2.50", "gap_us=0.00",
+                "hin_us=0.4", "host_us=31.2",
+            ] {
+                assert!(l0.contains(k), "{l0} に {k} が無い");
+            }
+            let l1 = row_line(1, &rows[1]);
+            assert!(l1.contains("grid=2560x1x1"), "{l1}");
+            assert!(l1.contains("block=256x1x1"), "{l1}");
+            assert!(l1.contains("gap_us=1.50"), "{l1}");
+        }
+
+        /// off のときは窓が開かず、`op_begin` が 1 件も積まないこと
+        /// (既定 off が「静かに計測する」に化けていないことの確認)。
+        #[test]
+        fn off_opens_no_window_and_records_nothing() {
+            let _f = Force::set(Some(false));
+            let _w = window(GDN, 7, 3_965);
+            assert_eq!(op_begin(|| "x".to_string(), (1, 1, 1), (1, 1, 1), 0, 0), None);
+            let n = ST.with(|c| c.borrow().as_ref().map(|s| s.entries.len()));
+            assert!(n.unwrap_or(0) == 0, "off で記録が積まれた");
+        }
+
+        /// on でも GPU が無い環境ではイベントを作れない = dead になり、
+        /// 2 回目以降は窓を開かない (無限に試さない)。
+        #[test]
+        fn gpu_less_host_marks_dead_after_the_first_attempt() {
+            let _f = Force::set(Some(true));
+            let _w = window(GDN, 0, 3_965);
+            // イベントが作れない環境 (このコンテナ) では dead が立つ。
+            let dead = ST.with(|c| c.borrow().as_ref().map(|s| s.dead)).unwrap_or(false);
+            if dead {
+                assert!(!should_begin(false, true, 0, 3_970, GDN, true));
+            }
+        }
+    }
+}
+
 /// デバイスメモリバッファ (RAII: drop で cuMemFree)
 pub struct DevBuffer {
     ptr: CUdeviceptr,
@@ -981,13 +1630,17 @@ impl DevBuffer {
         // (47MB で数 ms)。未初期化領域へ直接 D2H し、コピー完了後に set_len する
         // (cuMemcpyDtoH は同期コピーなので戻った時点で全要素が埋まっている)。
         let mut out: Vec<T> = Vec::with_capacity(len);
-        unsafe {
+        // task 177: 層の内訳 (`DENNO_GDN_DEC_KPROF`)。off は分岐 1 回。
+        let kp = dec_kprof::op_begin(|| "D2H".to_string(), (0, 0, 0), (0, 0, 0), 0, bytes);
+        let res = unsafe {
             check(
                 (lib()?.memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, self.ptr, bytes),
                 "cuMemcpyDtoH",
-            )?;
-            out.set_len(len);
-        }
+            )
+        };
+        dec_kprof::op_end(kp);
+        res?;
+        unsafe { out.set_len(len) };
         Ok(out)
     }
 
@@ -997,12 +1650,16 @@ impl DevBuffer {
         let bytes = std::mem::size_of_val(out);
         assert!(bytes <= self.bytes, "DevBuffer::to_slice: size overflow");
         if bytes > 0 {
-            unsafe {
+            // task 177: 層の内訳 (`DENNO_GDN_DEC_KPROF`)。off は分岐 1 回。
+            let kp = dec_kprof::op_begin(|| "D2H".to_string(), (0, 0, 0), (0, 0, 0), 0, bytes);
+            let res = unsafe {
                 check(
                     (lib()?.memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, self.ptr, bytes),
                     "cuMemcpyDtoH",
-                )?;
-            }
+                )
+            };
+            dec_kprof::op_end(kp);
+            res?;
         }
         Ok(())
     }
@@ -1012,14 +1669,20 @@ impl DevBuffer {
         let bytes = std::mem::size_of_val(data);
         assert!(bytes <= self.bytes, "DevBuffer::copy_from: size overflow");
         let dbg = launch_dbg::note(|| format!("H2D ptr={:#x} bytes={bytes}", self.ptr));
-        if bytes > 0 {
+        // task 177: 層の内訳 (`DENNO_GDN_DEC_KPROF`)。off は分岐 1 回。
+        let kp = dec_kprof::op_begin(|| "H2D".to_string(), (0, 0, 0), (0, 0, 0), 0, bytes);
+        let res = if bytes > 0 {
             unsafe {
                 check(
                     (lib()?.memcpy_htod)(self.ptr, data.as_ptr() as *const c_void, bytes),
                     "cuMemcpyHtoD",
-                )?;
+                )
             }
-        }
+        } else {
+            Ok(())
+        };
+        dec_kprof::op_end(kp);
+        res?;
         launch_dbg::sync(dbg)?;
         Ok(())
     }
@@ -1034,7 +1697,9 @@ impl DevBuffer {
         let dbg = launch_dbg::note(|| {
             format!("H2D@ ptr={:#x}+{offset_bytes} bytes={bytes}", self.ptr)
         });
-        if bytes > 0 {
+        // task 177: 層の内訳 (`DENNO_GDN_DEC_KPROF`)。off は分岐 1 回。
+        let kp = dec_kprof::op_begin(|| "H2D@".to_string(), (0, 0, 0), (0, 0, 0), 0, bytes);
+        let res = if bytes > 0 {
             unsafe {
                 check(
                     (lib()?.memcpy_htod)(
@@ -1043,9 +1708,13 @@ impl DevBuffer {
                         bytes,
                     ),
                     "cuMemcpyHtoD",
-                )?;
+                )
             }
-        }
+        } else {
+            Ok(())
+        };
+        dec_kprof::op_end(kp);
+        res?;
         launch_dbg::sync(dbg)?;
         Ok(())
     }
@@ -1773,6 +2442,14 @@ impl CudaCtx {
         let tl = crate::model::q4ledger::stamp();
         // task 153: イベント時系列 (DENNO_Q4_TLINE + _K)。off は None で分岐 1 回。
         let ev0 = tline::launch_begin();
+        // task 177: decode 層の操作別内訳 (DENNO_GDN_DEC_KPROF)。off は分岐 1 回。
+        let kp = dec_kprof::op_begin(
+            || format!("K {}", launch_dbg::fn_name(f)),
+            grid,
+            block,
+            shmem,
+            0,
+        );
         let r = check(
             (lib.launch)(
                 f,
@@ -1789,6 +2466,7 @@ impl CudaCtx {
             ),
             "cuLaunchKernel",
         );
+        dec_kprof::op_end(kp);
         if let Some(a) = ev0 {
             tline::launch_end(crate::model::q4ledger::current(), a);
         }
@@ -1804,7 +2482,10 @@ impl CudaCtx {
         let lib = lib()?;
         // task 138: 台帳へ待ち時間を積む (off は stamp が None で計測しない)。
         let t = crate::model::q4ledger::stamp();
+        // task 177: 層の内訳 (`DENNO_GDN_DEC_KPROF`)。off は分岐 1 回。
+        let kp = dec_kprof::op_begin(|| "sync".to_string(), (0, 0, 0), (0, 0, 0), 0, 0);
         let r = unsafe { check((lib.ctx_sync)(), "cuCtxSynchronize") };
+        dec_kprof::op_end(kp);
         crate::model::q4ledger::note_sync(t);
         r
     }
@@ -14191,6 +14872,12 @@ pub fn maybe_gpu_mix_bf16_into(
         Scratch::ensure_pin(ho, bytes_out)?;
         let (dx, dout) = (dx.as_ref().unwrap(), dout.as_ref().unwrap());
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        // task 177: mix 1 回の操作別内訳 (`DENNO_GDN_DEC_KPROF`・既定 off)。
+        let _kp_win = dec_kprof::window(
+            dec_kprof::MIX,
+            dec_kprof::cur_layer(),
+            dec_kprof::cur_pos(),
+        );
         hx.as_mut_slice::<f32>()[..k].copy_from_slice(x);
         unsafe {
             check(
@@ -34141,6 +34828,19 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         };
     }
     let run = || -> Result<(Vec<f32>, Option<(Vec<f32>, Vec<f32>)>)> {
+        // task 177: この submission の操作別内訳 (`DENNO_GDN_DEC_KPROF`・既定 off)。
+        // guard の drop (この closure の出口) で表を出す。
+        let _kp_win = dec_kprof::window(dec_kprof::GDN, req.li, dec_kprof::cur_pos());
+        {
+            // 重みの実バイト (qkv の各単位 + attn_out)。実効帯域の分母に使う。
+            let q: usize = req
+                .qkv_units
+                .iter()
+                .zip(qcfg.iter())
+                .map(|((u, _), c)| u.n.saturating_mul(c.rb))
+                .sum();
+            dec_kprof::note_wbytes(q.saturating_add(req.out_unit.n.saturating_mul(ocfg.rb)));
+        }
         let (_, e) = &store_lock[idx];
         // task 140: cur / beta / alpha を 1 本の staging に詰めて **H2D 1 回**で
         // 上げる (以前は同期 H2D 3 回。値・並びは同一で、カーネルへ渡す

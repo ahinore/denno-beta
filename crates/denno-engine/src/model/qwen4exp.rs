@@ -2576,6 +2576,9 @@ impl Qwen4Exp {
         emit_router: bool,
     ) -> Result<()> {
         let e = self.p.n_embd;
+        // task 177: 診断 (`DENNO_GDN_DEC_KPROF`) が mix の表に層番号を出すため。
+        #[cfg(feature = "cuda")]
+        crate::cuda::dec_kprof::set_layer(il);
         let lw = &self.layers[il];
         // task 155: 購読者が居ないフックは**呼び出しごと**飛ばす。`None` は
         // 「このランでは誰も層の中間値を見ない」= decode の通常経路。
