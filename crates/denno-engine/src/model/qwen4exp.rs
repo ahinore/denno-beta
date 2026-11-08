@@ -3964,6 +3964,52 @@ fn decode_chain2_enabled() -> bool {
     })
 }
 
+/// task 187: `DENNO_DEC_SHARED_DEV` の値を解釈する (純関数・テスト用)。
+///
+/// **既定 off**。on のときだけ shared expert の gate → up → silu*up → down を
+/// router の時点で 1 本のサイドストリームに積み、down の出力だけを join する。
+/// silu を CUDA の `__expf` で計算するので、ホストの `f32::exp` とは丸めが違う。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn dec_shared_dev_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true")
+    )
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+static DEC_SHARED_DEV_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// [`dec_shared_dev_from_value`] をプロセスで 1 回だけ読む。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn dec_shared_dev_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match DEC_SHARED_DEV_OVERRIDE.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        dec_shared_dev_from_value(std::env::var("DENNO_DEC_SHARED_DEV").ok().as_deref())
+    })
+}
+
+/// テスト専用: 4 発経路の on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+fn set_dec_shared_dev_for_test(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    DEC_SHARED_DEV_OVERRIDE.store(
+        match v {
+            Some(false) => 1,
+            Some(true) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// task 187: `kernels_dec_epi.cu` の `dno_dec_exp_sum` と**同じ順序・同じ丸め**の
 /// ホスト実装 (テストと仕様の固定用)。
 ///
@@ -7652,6 +7698,10 @@ struct SharedExpertOverlap {
     pending: crate::cuda::SharedPending,
     /// 積んだときの gate/up の出力長 (join の検査用。0 = 積んでいない)
     lens: [usize; 2],
+    /// task 187: down までデバイスで積んだか (`DENNO_DEC_SHARED_DEV`)。
+    full: bool,
+    /// down の出力長 (full のときだけ意味がある)。
+    down_n: usize,
 }
 
 impl SharedExpertOverlap {
@@ -7660,6 +7710,32 @@ impl SharedExpertOverlap {
             #[cfg(feature = "cuda")]
             pending: crate::cuda::SharedPending::none(),
             lens: [0, 0],
+            full: false,
+            down_n: 0,
+        }
+    }
+
+    /// task 187: down までデバイスで積んだか (呼び出し側は `finish_shared` を使う)。
+    fn has_down(&self) -> bool {
+        self.full
+    }
+
+    /// task 187: デバイスで積んだ down の出力を `sh` へ写す。
+    ///
+    /// `false` = 取れなかった (呼び出し側は従来の 2 段経路へ落ちる)。
+    fn finish_shared(&mut self, sh: &mut [f32]) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            if !self.full || self.pending.is_empty() || sh.len() < self.down_n {
+                return false;
+            }
+            let mut outs: [&mut [f32]; 1] = [sh];
+            return crate::cuda::shared_gemv_finish(&mut self.pending, &mut outs);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = sh;
+            false
         }
     }
 
@@ -7686,10 +7762,31 @@ impl SharedExpertOverlap {
                     n: lw.up_shexp.n(),
                 },
             ];
+            // task 187: 4 発 (gate/up/silu/down) を 1 回で積む経路を先に試す。
+            if dec_shared_dev_enabled() {
+                let down = crate::cuda::SharedGemvJob {
+                    uid: lw.down_shexp.uid(),
+                    ty: lw.down_shexp.ty(),
+                    blocks: lw.down_shexp.blocks().as_slice(),
+                    k: lw.down_shexp.k(),
+                    n: lw.down_shexp.n(),
+                };
+                let pending = crate::cuda::shared_expert_begin(x, &jobs[0], &jobs[1], &down);
+                if !pending.is_empty() {
+                    return Self {
+                        pending,
+                        lens: [jobs[0].n, jobs[1].n],
+                        full: true,
+                        down_n: down.n,
+                    };
+                }
+            }
             let pending = crate::cuda::shared_gemv_begin(x, &jobs);
             return Self {
                 pending,
                 lens: [jobs[0].n, jobs[1].n],
+                full: false,
+                down_n: 0,
             };
         }
         #[cfg(not(feature = "cuda"))]
@@ -8371,53 +8468,72 @@ fn moe_ffn_quant_impl(
     let _l_shared = q4ledger::enter(q4ledger::SHARED);
     let t_shared = std::time::Instant::now();
     let sff = lw.gate_shexp.n();
-    // task 187: 台帳の副区間 (作業域の確保)。
-    let s_elem = q4ledger::sub(q4ledger::SUB_SH_ELEM);
-    let mut sact = vec![0.0f32; sff];
-    let mut sup = vec![0.0f32; sff];
-    drop(s_elem);
-    // task 124: router の前に積んだ gate/up をここで回収する (間に合っていれば
-    // 待ちはほぼ 0)。取れなければ従来どおりこの場で同期して計算する。
-    // 従来の文の順序 (gate → silu → up → 積) は `!overlapped` 側でそのまま。
-    let overlapped = shed_ov.finish(&mut sact, &mut sup);
-    if !overlapped {
-        lw.gate_shexp
-            .gemv_label("shared_gate", x, &mut sact)
-            .map_err(|err| one(format!("層 {}: ffn_gate_shexp: {err}", lw.il)))?;
-    }
-    {
-        // task 187: 台帳の副区間 (silu と積)。
-        let _s = q4ledger::sub(q4ledger::SUB_SH_ELEM);
-        silu_inplace(&mut sact);
-        if !overlapped {
-            lw.up_shexp
-                .gemv_label("shared_up", x, &mut sup)
-                .map_err(|err| one(format!("層 {}: ffn_up_shexp: {err}", lw.il)))?;
-        }
-        for r in 0..sff {
-            sact[r] *= sup[r];
-        }
-    }
     let mut sh = vec![0.0f32; e];
-    // task 155: down は**サイドストリーム**に先に積み、その完了を待つ間に
-    // gate_inp (null ストリーム) を回す (層あたり 2 往復 → 1 往復)。
-    // 積めない型/環境では `finish` が false を返すので従来の同期経路に戻る。
-    let mut sdown = {
-        let _s = q4ledger::sub(q4ledger::SUB_SH_SDOWN);
-        SharedDownOverlap::begin(lw, &sact, e)
-    };
     let mut sg = vec![0.0f32; lw.gate_inp_shexp.n()];
-    {
-        // task 187: 台帳の副区間 (F32・1 行の GEMV)。
+    // task 187: `DENNO_DEC_SHARED_DEV` では gate → up → silu*up → down を router の
+    // 時点で 1 本のサイドストリームに積んである。ここでは down の出力を join する
+    // だけ (ホストの silu/mul・down の再発行・待ちが消える)。
+    let dev_shared = if shed_ov.has_down() {
+        let _s = q4ledger::sub(q4ledger::SUB_SH_WAIT);
+        shed_ov.finish_shared(&mut sh)
+    } else {
+        false
+    };
+    if !dev_shared {
+        // 従来 (task 124 / 155): gate/up をホストで受け、silu/mul を回し、
+        // down をサイドストリームへ先に積んでから gate_inp を回す。
+        // task 187: 台帳の副区間 (作業域の確保)。
+        let s_elem = q4ledger::sub(q4ledger::SUB_SH_ELEM);
+        let mut sact = vec![0.0f32; sff];
+        let mut sup = vec![0.0f32; sff];
+        drop(s_elem);
+        // task 124: router の前に積んだ gate/up をここで回収する (間に合っていれば
+        // 待ちはほぼ 0)。取れなければ従来どおりこの場で同期して計算する。
+        // 従来の文の順序 (gate → silu → up → 積) は `!overlapped` 側でそのまま。
+        let overlapped = shed_ov.finish(&mut sact, &mut sup);
+        if !overlapped {
+            lw.gate_shexp
+                .gemv_label("shared_gate", x, &mut sact)
+                .map_err(|err| one(format!("層 {}: ffn_gate_shexp: {err}", lw.il)))?;
+        }
+        {
+            // task 187: 台帳の副区間 (silu と積)。
+            let _s = q4ledger::sub(q4ledger::SUB_SH_ELEM);
+            silu_inplace(&mut sact);
+            if !overlapped {
+                lw.up_shexp
+                    .gemv_label("shared_up", x, &mut sup)
+                    .map_err(|err| one(format!("層 {}: ffn_up_shexp: {err}", lw.il)))?;
+            }
+            for r in 0..sff {
+                sact[r] *= sup[r];
+            }
+        }
+        // task 155: down は**サイドストリーム**に先に積み、その完了を待つ間に
+        // gate_inp (null ストリーム) を回す (層あたり 2 往復 → 1 往復)。
+        // 積めない型/環境では `finish` が false を返すので従来の同期経路に戻る。
+        let mut sdown = {
+            let _s = q4ledger::sub(q4ledger::SUB_SH_SDOWN);
+            SharedDownOverlap::begin(lw, &sact, e)
+        };
+        {
+            // task 187: 台帳の副区間 (F32・1 行の GEMV)。
+            let _s = q4ledger::sub(q4ledger::SUB_SH_SG);
+            lw.gate_inp_shexp
+                .gemv_label("shared_gate_inp", x, &mut sg)
+                .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp: {err}", lw.il)))?;
+        }
+        if !sdown.finish(&mut sh) {
+            lw.down_shexp
+                .gemv_label("shared_down", &sact, &mut sh)
+                .map_err(|err| one(format!("層 {}: ffn_down_shexp: {err}", lw.il)))?;
+        }
+    } else {
+        // 係数 `sigmoid(gate_inp_shexp @ x)` はホストで要る (1 行の GEMV)。
         let _s = q4ledger::sub(q4ledger::SUB_SH_SG);
         lw.gate_inp_shexp
             .gemv_label("shared_gate_inp", x, &mut sg)
             .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp: {err}", lw.il)))?;
-    }
-    if !sdown.finish(&mut sh) {
-        lw.down_shexp
-            .gemv_label("shared_down", &sact, &mut sh)
-            .map_err(|err| one(format!("層 {}: ffn_down_shexp: {err}", lw.il)))?;
     }
     let sgw = hyper::sigmoid(sg[0]);
     {
@@ -14066,6 +14182,52 @@ mod tests {
         lw.up_shexp = q8(p.n_embd, p.n_ff_shexp, 13);
         lw.down_shexp = q8(p.n_ff_shexp, p.n_embd, 17);
         lw
+    }
+
+    /// task 187: 4 発経路 (`DENNO_DEC_SHARED_DEV`) の偽 GPU 実行。
+    /// gate → up → silu*up → down を 1 本のサイドストリームに積む経路を、
+    /// ホストの `expert_gemv` で計算して join する。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn shared_dev_fires_and_matches_two_step_path() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("shared_dev");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = overlap_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        // 1) 従来 (2 段) 経路。
+        set_dec_shared_dev_for_test(Some(false));
+        set_shared_overlap_for_test(None);
+        let want = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu)
+            .expect("従来経路");
+        let s0 = crate::cuda::shared_overlap_stats();
+
+        // 2) 4 発経路 (偽 GPU)。
+        set_dec_shared_dev_for_test(Some(true));
+        let _fake = crate::cuda::SharedOverlapFakeGuard::new();
+        set_shared_overlap_for_test(Some(true));
+        let got = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu)
+            .expect("4 発経路");
+        let s1 = crate::cuda::shared_overlap_stats();
+        set_shared_overlap_for_test(None);
+        set_dec_shared_dev_for_test(None);
+
+        assert!(
+            s1.taken > s0.taken,
+            "4 発経路が GPU へ積まれていない (taken {} -> {})",
+            s0.taken,
+            s1.taken
+        );
+        assert!(
+            s1.joined > s0.joined,
+            "4 発経路の join が起きていない (joined {} -> {})",
+            s0.joined,
+            s1.joined
+        );
+        assert_bitwise_eq(&want, &got, "4 発経路 vs 2 段経路");
     }
 
     /// task 124: 偽 GPU を立てたままゲート on で MoE を 1 回回す。

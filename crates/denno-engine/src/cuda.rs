@@ -13969,6 +13969,10 @@ struct SharedOverlapState {
     ev_done: Option<CopyEvent>,
     dx: Option<DevBuffer>,
     pin_x: Option<PinMem>,
+    /// task 187: gate / up の出力と silu*up をデバイスに残すための作業域。
+    dg: Option<DevBuffer>,
+    du: Option<DevBuffer>,
+    dact: Option<DevBuffer>,
     slots: Vec<SharedSlotBuf>,
     /// in-flight の間だけ重みを pin する
     pins: Vec<GgufWRef>,
@@ -13987,6 +13991,9 @@ impl SharedOverlapState {
             ev_done: None,
             dx: None,
             pin_x: None,
+            dg: None,
+            du: None,
+            dact: None,
             slots: Vec::new(),
             pins: Vec::new(),
             in_flight: 0,
@@ -14138,6 +14145,48 @@ impl Drop for SharedPending {
     }
 }
 
+/// 重ね打ち用のストリームとイベントを用意する (初回だけ)。blocking ストリームだと
+/// legacy (null) ストリームと暗黙に同期し、expert の GEMV と 1 バイトも重ならない。
+fn shared_overlap_ensure_stream(s: &mut SharedOverlapState, l: &CudaLib) -> Result<()> {
+    if s.stream.is_some() {
+        return Ok(());
+    }
+    const CU_STREAM_NON_BLOCKING: u32 = 0x01;
+    const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
+    let (Some(stream_create), Some(event_create)) = (l.stream_create, l.event_create) else {
+        bail!("cuStreamCreate / cuEventCreate が無い");
+    };
+    let mut st: CUstream = std::ptr::null_mut();
+    if unsafe { stream_create(&mut st, CU_STREAM_NON_BLOCKING) } != CUDA_SUCCESS {
+        bail!("cuStreamCreate が失敗");
+    }
+    let mut ev_ready: CUevent = std::ptr::null_mut();
+    if unsafe { event_create(&mut ev_ready, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+        unsafe {
+            if let Some(f) = l.stream_destroy {
+                let _ = f(st);
+            }
+        }
+        bail!("cuEventCreate (ready) が失敗");
+    }
+    let mut ev_done: CUevent = std::ptr::null_mut();
+    if unsafe { event_create(&mut ev_done, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
+        unsafe {
+            if let Some(f) = l.stream_destroy {
+                let _ = f(st);
+            }
+            if let Some(f) = l.event_destroy {
+                let _ = f(ev_ready);
+            }
+        }
+        bail!("cuEventCreate (done) が失敗");
+    }
+    s.stream = Some(CopyStream(st));
+    s.ev_ready = Some(CopyEvent(ev_ready));
+    s.ev_done = Some(CopyEvent(ev_done));
+    Ok(())
+}
+
 /// 依頼の検査と発行 (GPU 操作の前に全部そろえる = all-or-nothing)。
 #[allow(clippy::too_many_arguments)]
 fn shared_overlap_enqueue(
@@ -14158,43 +14207,7 @@ fn shared_overlap_enqueue(
         );
     }
     // 1) 専用の非ブロッキングストリーム + イベント (初回だけ)。
-    //    blocking で作ると legacy (null) ストリームと暗黙に同期し、expert の
-    //    GPU GEMV や mix のカーネルと 1 バイトも重ならない。
-    if s.stream.is_none() {
-        const CU_STREAM_NON_BLOCKING: u32 = 0x01;
-        const CU_EVENT_DISABLE_TIMING: u32 = 0x02;
-        let (Some(stream_create), Some(event_create)) = (l.stream_create, l.event_create) else {
-            bail!("cuStreamCreate / cuEventCreate が無い");
-        };
-        let mut st: CUstream = std::ptr::null_mut();
-        if unsafe { stream_create(&mut st, CU_STREAM_NON_BLOCKING) } != CUDA_SUCCESS {
-            bail!("cuStreamCreate が失敗");
-        }
-        let mut ev_ready: CUevent = std::ptr::null_mut();
-        if unsafe { event_create(&mut ev_ready, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
-            unsafe {
-                if let Some(f) = l.stream_destroy {
-                    let _ = f(st);
-                }
-            }
-            bail!("cuEventCreate (ready) が失敗");
-        }
-        let mut ev_done: CUevent = std::ptr::null_mut();
-        if unsafe { event_create(&mut ev_done, CU_EVENT_DISABLE_TIMING) } != CUDA_SUCCESS {
-            unsafe {
-                if let Some(f) = l.stream_destroy {
-                    let _ = f(st);
-                }
-                if let Some(f) = l.event_destroy {
-                    let _ = f(ev_ready);
-                }
-            }
-            bail!("cuEventCreate (done) が失敗");
-        }
-        s.stream = Some(CopyStream(st));
-        s.ev_ready = Some(CopyEvent(ev_ready));
-        s.ev_done = Some(CopyEvent(ev_done));
-    }
+    shared_overlap_ensure_stream(s, l)?;
     // 2) grow-only の入出力 (MOE_SCRATCH とは別)。
     let bytes_x = x.len() * 4;
     Scratch::ensure(&mut s.dx, bytes_x)?;
@@ -14327,6 +14340,259 @@ pub fn shared_gemv_begin(x: &[f32], jobs: &[SharedGemvJob<'_>]) -> SharedPending
                 s.broken = true;
                 SharedPending::none()
             }
+        }
+    })
+}
+
+/// task 187: shared expert の 4 発をサイドストリームへ**まとめて**積む。
+///
+///   x H2D → gate → up → silu(gate)*up → down → D2H(down の出力)
+///
+/// 従来 (task 124/155) は gate/up の出力をホストへ戻して `silu*mul` をホストで
+/// 計算し、down を**あとから**積んでいた。そのため down の完了待ち (実測
+/// 0.64 ms/token) が expert 段の後に残っていた。ここでは 4 発を最初に積むので、
+/// 待ちは expert 段の GPU 仕事の裏に隠れる。
+///
+/// 数値: `dno_dec_silu_mul` は CUDA の `__expf` を使うので、ホストの
+/// `silu_inplace` (f32::exp) とは **ビット一致しない** (丸めの差だけ)。
+/// 既定 off のゲート `DENNO_DEC_SHARED_DEV` で切り替える。
+///
+/// `Ok` 以外の経路 (型・PTX・確保・形) は空のハンドルを返す = 呼び出し側は
+/// 従来の 2 段経路へ落ちる (fail closed)。
+pub fn shared_expert_begin(
+    x: &[f32],
+    gate: &SharedGemvJob<'_>,
+    up: &SharedGemvJob<'_>,
+    down: &SharedGemvJob<'_>,
+) -> SharedPending {
+    OVERLAP_BEGIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 形の検査 (全部そろってから GPU に触る)。
+    if gate.n == 0
+        || up.n == 0
+        || down.n == 0
+        || up.n != gate.n
+        || gate.k != up.k
+        || down.k != gate.n
+        || x.len() != gate.k
+        || gate.k == 0
+    {
+        return SharedPending::none();
+    }
+    #[cfg(test)]
+    if SHARED_OVERLAP_FAKE.load(std::sync::atomic::Ordering::Relaxed) {
+        return shared_expert_begin_fake(x, gate, up, down);
+    }
+    if !cuda_enabled() {
+        return SharedPending::none();
+    }
+    let Some(ctx) = shared_ctx() else {
+        return SharedPending::none();
+    };
+    if ctx.make_current().is_err() {
+        return SharedPending::none();
+    }
+    let Ok(l) = lib() else {
+        return SharedPending::none();
+    };
+    if l.stream_create.is_none()
+        || l.stream_wait_event.is_none()
+        || l.event_create.is_none()
+        || l.event_record.is_none()
+        || l.event_sync.is_none()
+    {
+        return SharedPending::none();
+    }
+    // silu カーネル (kernels_dec_epi.ptx) が無ければ従来経路へ。
+    let Some(epi) = dec_epi_kernels() else {
+        return SharedPending::none();
+    };
+    let mode = gemv_kernel_mode();
+    let jobs: [&SharedGemvJob<'_>; 3] = [gate, up, down];
+    let mut plans = Vec::with_capacity(3);
+    let mut pins = Vec::with_capacity(3);
+    let mut uploaded = false;
+    for j in jobs {
+        if j.k % j.ty.blck_size() != 0 {
+            return SharedPending::none();
+        }
+        let plan = match ctx.plan_moe_gemv(j.ty, j.k, j.n, mode) {
+            Ok(Some(p)) => p,
+            _ => return SharedPending::none(),
+        };
+        let existed = gguf_registry()
+            .lock()
+            .map(|g| g.map.contains_key(&j.uid))
+            .unwrap_or(false);
+        let w = match weights_for_gguf(j.uid, j.ty, j.blocks, j.k, j.n) {
+            Ok(w) => w,
+            Err(_) => return SharedPending::none(),
+        };
+        if w.buf.bytes() != j.n.saturating_mul(plan.rb) {
+            return SharedPending::none();
+        }
+        uploaded |= !existed;
+        plans.push(plan);
+        pins.push(w);
+    }
+    SHARED_OVERLAP.with(|cell| {
+        let mut s = cell.borrow_mut();
+        match shared_expert_enqueue(&mut s, ctx, l, x, &jobs, &plans, &pins, uploaded, epi) {
+            Ok(()) => {
+                s.pins = pins;
+                s.in_flight = 1;
+                OVERLAP_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                SharedPending {
+                    n: 1,
+                    _not_send: std::marker::PhantomData,
+                }
+            }
+            Err(_) => {
+                let _ = shared_overlap_drain(&mut s);
+                s.broken = true;
+                SharedPending::none()
+            }
+        }
+    })
+}
+
+/// [`shared_expert_begin`] の発行本体 (検査の後にだけ呼ぶ)。
+#[allow(clippy::too_many_arguments)]
+fn shared_expert_enqueue(
+    s: &mut SharedOverlapState,
+    ctx: &CudaCtx,
+    l: &CudaLib,
+    x: &[f32],
+    jobs: &[&SharedGemvJob<'_>; 3],
+    plans: &[MoeGemvPlan],
+    pins: &[GgufWRef],
+    uploaded: bool,
+    epi: &DecEpiKernels,
+) -> Result<()> {
+    if s.broken || s.in_flight != 0 {
+        bail!("重ね打ちは使わない (in_flight={})", s.in_flight);
+    }
+    shared_overlap_ensure_stream(s, l)?;
+    let (gate, up, down) = (jobs[0], jobs[1], jobs[2]);
+    let bytes_x = x.len() * 4;
+    Scratch::ensure(&mut s.dx, bytes_x)?;
+    Scratch::ensure_pin(&mut s.pin_x, bytes_x)?;
+    Scratch::ensure(&mut s.dg, gate.n * 4)?;
+    Scratch::ensure(&mut s.du, up.n * 4)?;
+    Scratch::ensure(&mut s.dact, gate.n * 4)?;
+    while s.slots.is_empty() {
+        s.slots.push(SharedSlotBuf::new());
+    }
+    Scratch::ensure(&mut s.slots[0].dout, down.n * 4)?;
+    Scratch::ensure_pin(&mut s.slots[0].pin_o, down.n * 4)?;
+    s.slots[0].n = down.n;
+
+    let stream = s.stream.as_ref().expect("作成済み").0;
+    let ev_ready = s.ev_ready.as_ref().expect("作成済み").0;
+    let ev_done = s.ev_done.as_ref().expect("作成済み").0;
+    {
+        let px = s.pin_x.as_mut().expect("ensure 済み");
+        px.as_mut_slice::<f32>()[..x.len()].copy_from_slice(x);
+    }
+    let px_ptr = s.pin_x.as_ref().expect("ensure 済み").ptr;
+    let dx = s.dx.as_ref().expect("ensure 済み").ptr();
+    let dg = s.dg.as_ref().expect("ensure 済み").ptr();
+    let du = s.du.as_ref().expect("ensure 済み").ptr();
+    let dact = s.dact.as_ref().expect("ensure 済み").ptr();
+    let dout = s.slots[0].dout.as_ref().expect("ensure 済み").ptr();
+    let po = s.slots[0].pin_o.as_ref().expect("ensure 済み").ptr;
+    let (Some(event_record), Some(stream_wait_event)) = (l.event_record, l.stream_wait_event) else {
+        bail!("cuEventRecord / cuStreamWaitEvent が無い");
+    };
+    if uploaded {
+        if unsafe { event_record(ev_ready, std::ptr::null_mut()) } != CUDA_SUCCESS {
+            bail!("cuEventRecord (ready) が失敗");
+        }
+        if unsafe { stream_wait_event(stream, ev_ready, 0) } != CUDA_SUCCESS {
+            bail!("cuStreamWaitEvent が失敗");
+        }
+    }
+    if unsafe { (l.memcpy_htod_async)(dx, px_ptr as *const c_void, bytes_x, stream) }
+        != CUDA_SUCCESS
+    {
+        bail!("cuMemcpyHtoDAsync (shared x) が失敗");
+    }
+    // gate → up → silu*up → down (すべて同じサイドストリーム)。
+    ctx.launch_moe_gemv_on(&plans[0], pins[0].buf.ptr, dx, dg, gate.k, gate.n, stream)?;
+    ctx.launch_moe_gemv_on(&plans[1], pins[1].buf.ptr, dx, du, up.k, up.n, stream)?;
+    unsafe {
+        let (mut pg, mut pu, mut pa, mut pn) = (
+            dg as *mut c_void,
+            du as *mut c_void,
+            dact as *mut c_void,
+            gate.n as c_int,
+        );
+        let mut args = [
+            &mut pg as *mut _ as *mut c_void,
+            &mut pu as *mut _ as *mut c_void,
+            &mut pa as *mut _ as *mut c_void,
+            &mut pn as *mut _ as *mut c_void,
+        ];
+        let threads = 256usize;
+        let blocks = gate.n.div_ceil(threads) as u32;
+        ctx.launch_async_on(
+            stream,
+            epi.silu,
+            (blocks.max(1), 1, 1),
+            (threads as u32, 1, 1),
+            0,
+            &mut args,
+        )?;
+    }
+    ctx.launch_moe_gemv_on(&plans[2], pins[2].buf.ptr, dact, dout, down.k, down.n, stream)?;
+    if unsafe { (l.memcpy_dtoh_async)(po, dout, down.n * 4, stream) } != CUDA_SUCCESS {
+        bail!("cuMemcpyDtoHAsync (shared down) が失敗");
+    }
+    if unsafe { event_record(ev_done, stream) } != CUDA_SUCCESS {
+        bail!("cuEventRecord (done) が失敗");
+    }
+    Ok(())
+}
+
+/// テスト用の偽 GPU 経路 (デバイスを 1 つも触らない)。ホストの `expert_gemv` と
+/// `silu_inplace` で同じ計算をする (丸めはホストのまま = 参照値)。
+#[cfg(test)]
+fn shared_expert_begin_fake(
+    x: &[f32],
+    gate: &SharedGemvJob<'_>,
+    up: &SharedGemvJob<'_>,
+    down: &SharedGemvJob<'_>,
+) -> SharedPending {
+    let mut g = vec![0f32; gate.n];
+    let mut u = vec![0f32; up.n];
+    if crate::model::moe_expert::expert_gemv(gate.ty, gate.blocks, gate.k, gate.n, x, &mut g)
+        .is_err()
+        || crate::model::moe_expert::expert_gemv(up.ty, up.blocks, up.k, up.n, x, &mut u).is_err()
+    {
+        return SharedPending::none();
+    }
+    crate::tensor::silu_inplace(&mut g);
+    for r in 0..g.len() {
+        g[r] *= u[r];
+    }
+    let mut h = vec![0f32; down.n];
+    if crate::model::moe_expert::expert_gemv(down.ty, down.blocks, down.k, down.n, &g, &mut h)
+        .is_err()
+    {
+        return SharedPending::none();
+    }
+    SHARED_OVERLAP.with(|cell| {
+        let mut s = cell.borrow_mut();
+        while s.slots.is_empty() {
+            s.slots.push(SharedSlotBuf::new());
+        }
+        s.slots[0].n = h.len();
+        s.slots[0].fake = h;
+        s.fake = true;
+        s.in_flight = 1;
+        OVERLAP_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SharedPending {
+            n: 1,
+            _not_send: std::marker::PhantomData,
         }
     })
 }
