@@ -760,44 +760,44 @@ mod launch_dbg {
     }
 }
 
-// ---- task 177: decode 1 層の操作別内訳 (DENNO_GDN_DEC_KPROF・既定 off) --------
+// ---- task 177/179: decode 層の操作別・層別 平均内訳 (DENNO_GDN_DEC_KPROF・既定 off)
 //
-// 背景: lab t169b の [q4ledger] では ssm が 6.42 ms/token (36 GDN 層 = 178 us/層)
-// なのに host cpu は 0.86 ms/token で、同期も 0 回と数えられていた。t166 は
-// 「1 submission 154 us のうちカーネルは 49 us」と測っており、層あたり 100 us
-// 前後が「同じ submission の別の GPU 仕事 (conv/norm/gate/小コピー/複数起動)」
-// 「発行間のホスト仕事」「層出力の同期 D2H とその待ち」のどれなのかが
-// 分かっていなかった。t166b/t166c (pinned async コピー・別ストリーム) と
-// t171a (待ちのモード) は 0% だったので、当て推量で次を選ばないための計測。
+// 背景 (task 179): lab t177a の 1 層 1 サンプル表は pos=3827 の full で
+// wall 557 us / gpu_sum 206 us / gap_sum 341 us を出し、そのうち 276 us が
+// 「qkv GEMV の同期のあと、最初の KV ミラー追記の前」の 1 個の隙間だった。
+// しかし [q4ledger] の full は 12 層で 3.58 ms/token = 層あたり 298 us なので、
+// その 1 サンプルは inflated (初回・cold・イベントの overhead)。1 サンプルで
+// 次を選ばないために、task 179 では **同じ帯の中で N 窓 (既定 64) の平均** を
+// 層番号ごとに出し、ホスト仕事を名前付きで分離する。
 //
-// ここでは submission の各操作 (起動 / H2D / D2H / D2D / 明示同期) の**直前と
-// 直後**に CUDA イベントを打ち、層 1 本ぶんの表を出す。列の意味:
-//   gpu_us  = その操作の GPU 時間 (イベント 2 点の差。コピーなら DMA の時間)
-//   gap_us  = 前の操作の終わりからこの操作の始まりまでの GPU 側の隙間
-//   hin_us  = 前の操作のホスト戻りからこの操作のホスト入口までの経過
-//   host_us = この操作のホスト滞在時間 (同期コピー・同期なら待ちを含む)
-// 読み方: `gpu_us` の和が `wall_us` に近ければ GPU は実際に働いている
-// (= 削るべきはカーネルの中身)。`host_us`/`gap_us` が大きければホスト
-// (driver 呼び出し) が GPU を遊ばせている (= 発行回数とコピーを削る)。
+// ここでは submission の各操作 (起動 / H2D / D2H / D2D / 明示同期 / 非同期コピー)
+// の**直前と直後**に CUDA イベントを打ち、窓を閉じると集計へ畳む。列の意味:
+//   wall_us   = 窓のホスト側経過 (層 1 回ぶん)
+//   kern_us   = カーネルの GPU 時間の和
+//   copy_us   = コピーの GPU 時間 (DMA) の和
+//   gap_us    = 操作間の GPU 側の隙間の和 (ホスト仕事・待ちを含む)
+//   wait_us   = 明示同期 (sync) のホスト滞在 = 待ち時間
+//   launch_us = カーネル発行のホスト滞在 (driver 呼び出し)
+//   steps     = 名前付きホスト区間の和 (rotary / norm / split / mirror など)
+// gap は steps を**含む** (GPU が遊んでいる時間とホストが働いている時間は
+// 同じ区間なので、足し算ではなく読み分けに使う)。
 //
 // 数値経路: off のとき各サイトが払うのは thread-local の `Cell<bool>` 読み 1 回。
-// on でもカーネルの引数・起動形状・発行順・同期の位置は 1 つも変えず、
-// イベントを打つ位置だけを足す (イベントは既定ストリームに挿入されるが、
-// 時刻を記録するだけでデータを動かさない)。読み出しは窓の最後
-// (呼び出し側がすでに同期済みの点) に 1 回だけ `cuEventSynchronize` を打つ。
+// on でもカーネルの引数・起動形状・発行順・同期の位置は 1 つも変えず、イベントと
+// 時刻だけを足す。読み出しは窓の最後 (呼び出し側がすでに同期済みの点) に 1 回。
 //
 // 出すのは `DENNO_GDN_DEC_KPROF=1` のときだけ。表は 3 つの位置帯
-// (短い decode / 3,800..4,100 / 14,000..14,400 トークン) で、帯と種類ごとに
-// 1 回だけ出す (同じ帯で 36 層ぶん出さない)。
+// (短い decode / 3,800..4,100 / 14,000..14,400 トークン) で、(帯, 種類) ごとに
+// 1 回だけ出す。N は `DENNO_GDN_DEC_KPROF_N` (既定 64)。
 // ---------------------------------------------------------------------------
 pub(crate) mod dec_kprof {
     use super::*;
     use std::cell::{Cell, RefCell};
-    use std::time::Instant;
+    use std::collections::BTreeMap;
 
     /// 種類: GDN (ssm) 層の submission。
     pub(crate) const GDN: u8 = 1;
-    /// 種類: hc mix (attn 側 / ffn 側のどちらでも最初の 1 回)。
+    /// 種類: hc mix 1 回 (attn 側 / ffn 側で同じ層番号に 2 回)。
     pub(crate) const MIX: u8 = 2;
     /// 種類: full attention 層。
     pub(crate) const FULL: u8 = 3;
@@ -817,6 +817,18 @@ pub(crate) mod dec_kprof {
         })
     }
 
+    /// 平均する窓の数 (既定 64、2..=4096 の外は既定へ)。
+    pub(crate) fn avg_n() -> u64 {
+        static N: OnceLock<u64> = OnceLock::new();
+        *N.get_or_init(|| match std::env::var("DENNO_GDN_DEC_KPROF_N").ok() {
+            None => 64,
+            Some(v) => match v.trim().parse::<u64>() {
+                Ok(n) if (2..=4096).contains(&n) => n,
+                _ => 64,
+            },
+        })
+    }
+
     /// 表を出す位置帯 (0 = 短い decode、1 = 3.8k..4.1k、2 = 14.0k..14.4k)。
     /// 帯の外は `None`。**純関数** (テストで真理値表を固定する)。
     pub(crate) fn band(pos: u64) -> Option<u8> {
@@ -828,6 +840,15 @@ pub(crate) mod dec_kprof {
             Some(2)
         } else {
             None
+        }
+    }
+
+    /// 帯の下端 (表の見出しに出す)。
+    fn band_lo(band: u8) -> u64 {
+        match band {
+            0 => 0,
+            1 => 3_800,
+            _ => 14_000,
         }
     }
 
@@ -859,18 +880,6 @@ pub(crate) mod dec_kprof {
         (printed & mask(pos, kind)) == 0
     }
 
-    thread_local! {
-        static ST: RefCell<Option<St>> = const { RefCell::new(None) };
-        /// ホットパス用の鏡 (`St.active` と同じ)。off の分岐はここ 1 回。
-        static ACTIVE: Cell<bool> = const { Cell::new(false) };
-        /// 直近に居た層 (mix は層番号を知らないので `run_layer` が置く)。
-        static IL: Cell<usize> = const { Cell::new(0) };
-        /// 直近の decode の絶対位置 (`Qwen4ExpDecode` が置く)。
-        static POS: Cell<u64> = const { Cell::new(0) };
-        /// テスト用の強制 (None = env の解釈)。
-        static FORCE: Cell<Option<bool>> = const { Cell::new(None) };
-    }
-
     /// 1 操作ぶんの記録。
     struct Entry {
         name: String,
@@ -890,6 +899,7 @@ pub(crate) mod dec_kprof {
     struct St {
         kind: u8,
         li: usize,
+        site: u32,
         pos: u64,
         /// 層の重みの実バイト (qkv + out。実効帯域を出すため)。
         wbytes: usize,
@@ -898,6 +908,8 @@ pub(crate) mod dec_kprof {
         used: usize,
         t0: Instant,
         prev_end: Instant,
+        /// 名前付きホスト区間 (name, us)。窓の間に積む。
+        steps: Vec<(String, f64)>,
         /// (帯, 種類) を出し終えたビット。
         printed: u8,
         dead: bool,
@@ -909,6 +921,7 @@ pub(crate) mod dec_kprof {
             Self {
                 kind: 0,
                 li: 0,
+                site: 0,
                 pos: 0,
                 wbytes: 0,
                 entries: Vec::new(),
@@ -916,10 +929,64 @@ pub(crate) mod dec_kprof {
                 used: 0,
                 t0: now,
                 prev_end: now,
+                steps: Vec::new(),
                 printed: 0,
                 dead: false,
             }
         }
+    }
+
+    // ---- 集計 (N 窓の平均) -------------------------------------------------
+
+    /// 操作 1 種類ぶんの累計。
+    #[derive(Clone, Copy, Default)]
+    struct OpAgg {
+        calls: u64,
+        gpu_us: f64,
+        gap_us: f64,
+        hin_us: f64,
+        host_us: f64,
+        bytes: u64,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shmem: u32,
+    }
+
+    /// 1 レーン (層, 呼び出し位置) ぶんの累計。
+    #[derive(Default)]
+    struct LaneAgg {
+        calls: u64,
+        wall_us: f64,
+        kern_us: f64,
+        copy_us: f64,
+        gap_us: f64,
+        wait_us: f64,
+        launch_us: f64,
+        ops: BTreeMap<String, OpAgg>,
+        steps: BTreeMap<String, (u64, f64)>,
+    }
+
+    /// (帯, 種類) ぶんの累計。
+    #[derive(Default)]
+    struct Group {
+        n_win: u64,
+        lanes: BTreeMap<(usize, u32), LaneAgg>,
+    }
+
+    thread_local! {
+        static ST: RefCell<Option<St>> = const { RefCell::new(None) };
+        /// ホットパス用の鏡 (`St.active` と同じ)。off の分岐はここ 1 回。
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        /// 直近に居た層 (mix は層番号を知らないので `run_layer` が置く)。
+        static IL: Cell<usize> = const { Cell::new(0) };
+        /// 直近の decode の絶対位置 (`Qwen4ExpDecode` が置く)。
+        static POS: Cell<u64> = const { Cell::new(0) };
+        /// テスト用の強制 (None = env の解釈)。
+        static FORCE: Cell<Option<bool>> = const { Cell::new(None) };
+        /// 集計 (帯, 種類) -> レーン別。
+        static AGG: RefCell<Option<BTreeMap<(u8, u8), Group>>> = const { RefCell::new(None) };
+        /// 種類ごとの直近の帯 (帯を出たときに未出力の表を流すため)。
+        static LAST_BAND: RefCell<BTreeMap<u8, u8>> = const { RefCell::new(BTreeMap::new()) };
     }
 
     /// テストが env を立てずに on/off を強制する (panic しても戻すのは呼び出し側)。
@@ -966,7 +1033,9 @@ pub(crate) mod dec_kprof {
     }
 
     /// 窓を開く (開けなければ何もしない)。戻り値の guard が drop で表を出す。
-    pub(crate) fn window(kind: u8, li: usize, pos: u64) -> Win {
+    ///
+    /// `site` は同じ層で複数回呼ばれる経路の区別 (mix の attn 側 / ffn 側など)。
+    pub(crate) fn window(kind: u8, li: usize, pos: u64, site: u32) -> Win {
         let decode = crate::model::qwen4exp::gdn_gpu_win::active();
         let want = on()
             && ACTIVE.with(|c| !c.get())
@@ -978,34 +1047,50 @@ pub(crate) mod dec_kprof {
                 }
             });
         if !want {
-            return Win;
+            return Win { open: false };
+        }
+        // 帯をまたいだら、前の帯の (未出力の) 表を流す。
+        if let Some(b) = band(pos) {
+            let prev = LAST_BAND.with(|c| c.borrow_mut().insert(kind, b));
+            if let Some(p) = prev {
+                if p != b {
+                    flush_band(p, kind, 8);
+                }
+            }
         }
         ST.with(|c| {
             let mut slot = c.borrow_mut();
             let s = slot.get_or_insert_with(St::new);
             s.kind = kind;
             s.li = li;
+            s.site = site;
             s.pos = pos;
             s.wbytes = 0;
             s.entries.clear();
+            s.steps.clear();
             s.used = 0;
             s.t0 = Instant::now();
             s.prev_end = s.t0;
         });
         ACTIVE.with(|c| c.set(true));
-        Win
+        Win { open: true }
     }
 
-    /// 窓の guard (drop で表を出す)。表を出さない回は何もしない。
-    pub(crate) struct Win;
+    /// 窓の guard (drop で表を出す)。開いていない guard は drop で何もしない
+    /// (入れ子の内側が外側の窓を閉じてしまう取り違えを防ぐ)。
+    pub(crate) struct Win {
+        open: bool,
+    }
 
     impl Drop for Win {
         fn drop(&mut self) {
-            finish();
+            if self.open {
+                finish();
+            }
         }
     }
 
-    /// 層の重みの実バイトを添える (表の `wbytes` / `gbps` 用)。
+    /// 層の重みの実バイトを添える (表の `wbytes` 用)。
     pub(crate) fn note_wbytes(n: usize) {
         if !ACTIVE.with(|c| c.get()) {
             return;
@@ -1013,6 +1098,41 @@ pub(crate) mod dec_kprof {
         ST.with(|c| {
             if let Some(s) = c.borrow_mut().as_mut() {
                 s.wbytes = s.wbytes.saturating_add(n);
+            }
+        });
+    }
+
+    /// 名前付きホスト区間。窓が開いていなければ closure を呼ぶだけ。
+    ///
+    /// ここで測るのは**ホストの仕事そのもの** (rotary / norm / split / mirror の
+    /// 帳簿 / 詰め替え)。GPU を待つ区間は入れない (それは `sync` の行に出る)。
+    #[inline]
+    pub(crate) fn step<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+        if !ACTIVE.with(|c| c.get()) {
+            return f();
+        }
+        let t = Instant::now();
+        let r = f();
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        ST.with(|c| {
+            if let Some(s) = c.borrow_mut().as_mut() {
+                s.steps.push((name.to_string(), us));
+            }
+        });
+        r
+    }
+
+    /// [`step`] の「区間の頭を先に取る」版 (途中に `?` や early return がある
+    /// 区間を測る)。窓が開いていなければ何もしない。
+    #[inline]
+    pub(crate) fn note_since(name: &'static str, t: Instant) {
+        if !ACTIVE.with(|c| c.get()) {
+            return;
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        ST.with(|c| {
+            if let Some(s) = c.borrow_mut().as_mut() {
+                s.steps.push((name.to_string(), us));
             }
         });
     }
@@ -1144,56 +1264,12 @@ pub(crate) mod dec_kprof {
         }
     }
 
-    fn grid_s(g: (u32, u32, u32)) -> String {
-        if g == (0, 0, 0) {
-            "-".to_string()
-        } else {
-            format!("{}x{}x{}", g.0, g.1, g.2)
-        }
+    /// コピーの行か (名前の先頭で見る)。
+    fn is_copy(name: &str) -> bool {
+        name.starts_with("H2D") || name.starts_with("D2H")
     }
 
-    fn block_s(b: (u32, u32, u32)) -> String {
-        if b == (0, 0, 0) {
-            "-".to_string()
-        } else {
-            format!("{}x{}x{}", b.0, b.1, b.2)
-        }
-    }
-
-    fn head_line(kind: u8, li: usize, pos: u64, wall_us: f64, ops: usize, rows: &[Row]) -> String {
-        let gpu_sum: f32 = rows.iter().map(|r| r.gpu_us).sum();
-        let host_sum: f64 = rows.iter().map(|r| r.host_us).sum();
-        let gaps: f32 = rows.iter().skip(1).map(|r| r.gap_us).sum();
-        format!(
-            "[dec-kprof] {} li={} pos={} wall_us={:.1} ops={} gpu_sum_us={:.1} gap_sum_us={:.1} host_sum_us={:.1}",
-            kind_name(kind),
-            li,
-            pos,
-            wall_us,
-            ops,
-            gpu_sum,
-            gaps,
-            host_sum
-        )
-    }
-
-    fn row_line(i: usize, r: &Row) -> String {
-        format!(
-            "[dec-kprof]   {} {} grid={} block={} shmem={} bytes={} gpu_us={:.2} gap_us={:.2} hin_us={:.1} host_us={:.1}",
-            i,
-            r.name,
-            grid_s(r.grid),
-            block_s(r.block),
-            r.shmem,
-            r.bytes,
-            r.gpu_us,
-            r.gap_us,
-            r.hin_us,
-            r.host_us
-        )
-    }
-
-    /// 窓を閉じて表を出す (開いていなければ何もしない)。
+    /// 窓を閉じる。開いていなければ何もしない。
     fn finish() {
         if !ACTIVE.with(|c| c.replace(false)) {
             return;
@@ -1214,7 +1290,8 @@ pub(crate) mod dec_kprof {
             let wall_us = s.t0.elapsed().as_secs_f64() * 1e6;
             if s.dead || s.entries.is_empty() {
                 eprintln!(
-                    "[dec-kprof] {} li={} pos={} wall_us={:.1} ops={} ev=unavailable (cuEventCreate/Record が失敗)",
+                    "[dec-kprof-avg] {} li={} pos={} wall_us={:.1} ops={} ev=unavailable \
+                     (cuEventCreate/Record が失敗)",
                     kind_name(s.kind),
                     s.li,
                     s.pos,
@@ -1223,6 +1300,7 @@ pub(crate) mod dec_kprof {
                 );
                 s.printed |= mask(s.pos, s.kind);
                 s.entries.clear();
+                s.steps.clear();
                 s.used = 0;
                 return;
             }
@@ -1247,29 +1325,200 @@ pub(crate) mod dec_kprof {
                 });
                 prev_out = Some(e.ev_out);
             }
-            eprintln!(
-                "{}",
-                head_line(s.kind, s.li, s.pos, wall_us, rows.len(), &rows)
-            );
-            if s.wbytes > 0 {
-                let gpu_sum: f32 = rows.iter().map(|r| r.gpu_us).sum();
-                let gbps = if gpu_sum > 0.0 {
-                    s.wbytes as f64 / gpu_sum as f64 / 1e3
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "[dec-kprof]   wbytes={} w_gbps={:.1} (重みの実バイト / gpu_sum_us)",
-                    s.wbytes, gbps
-                );
+            if fold_window(s, wall_us, &rows) {
+                s.printed |= mask(s.pos, s.kind);
             }
-            for (i, r) in rows.iter().enumerate() {
-                eprintln!("{}", row_line(i, r));
-            }
-            s.printed |= mask(s.pos, s.kind);
             s.entries.clear();
+            s.steps.clear();
             s.used = 0;
         });
+    }
+
+    /// 1 窓を集計へ畳む。N 窓そろったら表を出して true。
+    fn fold_window(s: &St, wall_us: f64, rows: &[Row<'_>]) -> bool {
+        let Some(b) = band(s.pos) else {
+            return false;
+        };
+        let target = avg_n();
+        let ready = AGG.with(|c| {
+            let mut slot = c.borrow_mut();
+            let all = slot.get_or_insert_with(BTreeMap::new);
+            let grp = all.entry((b, s.kind)).or_default();
+            grp.n_win += 1;
+            let lane = grp.lanes.entry((s.li, s.site)).or_default();
+            lane.calls += 1;
+            lane.wall_us += wall_us;
+            for (i, r) in rows.iter().enumerate() {
+                if i > 0 {
+                    lane.gap_us += r.gap_us as f64;
+                }
+                if r.name == "sync" {
+                    lane.wait_us += r.host_us;
+                } else if r.name.starts_with("K ") {
+                    lane.kern_us += r.gpu_us as f64;
+                    lane.launch_us += r.host_us;
+                } else if is_copy(r.name) {
+                    lane.copy_us += r.gpu_us as f64;
+                }
+                let e = lane.ops.entry(r.name.to_string()).or_default();
+                e.calls += 1;
+                e.gpu_us += r.gpu_us as f64;
+                e.gap_us += r.gap_us as f64;
+                e.hin_us += r.hin_us;
+                e.host_us += r.host_us;
+                e.bytes += r.bytes as u64;
+                e.grid = r.grid;
+                e.block = r.block;
+                e.shmem = r.shmem;
+            }
+            for (name, us) in &s.steps {
+                let t = lane.steps.entry(name.clone()).or_insert((0, 0.0));
+                t.0 += 1;
+                t.1 += *us;
+            }
+            !grp.lanes.is_empty() && grp.lanes.values().all(|l| l.calls >= target)
+        });
+        if ready {
+            AGG.with(|c| {
+                let mut slot = c.borrow_mut();
+                if let Some(all) = slot.as_mut() {
+                    if let Some(grp) = all.remove(&(b, s.kind)) {
+                        for line in render_group(b, s.kind, &grp) {
+                            eprintln!("{line}");
+                        }
+                    }
+                }
+            });
+        }
+        ready
+    }
+
+    /// 帯を出たときに、まだ N 窓に届いていない表を流す (`calls >= min_calls`)。
+    fn flush_band(b: u8, kind: u8, min_calls: u64) {
+        let mut out: Vec<String> = Vec::new();
+        AGG.with(|c| {
+            let mut slot = c.borrow_mut();
+            let Some(all) = slot.as_mut() else {
+                return;
+            };
+            let Some(grp) = all.get(&(b, kind)) else {
+                return;
+            };
+            let most = grp.lanes.values().map(|l| l.calls).max().unwrap_or(0);
+            if most >= min_calls {
+                if let Some(grp) = all.remove(&(b, kind)) {
+                    out = render_group(b, kind, &grp);
+                }
+            } else {
+                all.remove(&(b, kind));
+            }
+        });
+        for line in out {
+            eprintln!("{line}");
+        }
+    }
+
+    /// 表を組み立てる (整形だけ。GPU に触らない = テストできる)。
+    fn render_group(b: u8, kind: u8, grp: &Group) -> Vec<String> {
+        let mut out = Vec::new();
+        out.push(format!(
+            "[dec-kprof-avg] {} band={} windows={} lanes={} (us/窓。窓 = 1 層 1 回)",
+            kind_name(kind),
+            band_lo(b),
+            grp.n_win,
+            grp.lanes.len()
+        ));
+        out.push(
+            "[dec-kprof-avg]   li s calls   wall   kern   copy    gap   wait launch  steps"
+                .to_string(),
+        );
+        for ((li, site), l) in &grp.lanes {
+            let steps: f64 = l.steps.values().map(|(_, us)| *us).sum::<f64>();
+            out.push(format!(
+                "[dec-kprof-avg]   {:>2} {} {:>5} {:>6.1} {:>6.1} {:>6.1} {:>6.1} {:>6.1} {:>6.1} {:>6.1}",
+                li,
+                site,
+                l.calls,
+                l.wall_us / l.calls as f64,
+                l.kern_us / l.calls as f64,
+                l.copy_us / l.calls as f64,
+                l.gap_us / l.calls as f64,
+                l.wait_us / l.calls as f64,
+                l.launch_us / l.calls as f64,
+                steps / l.calls as f64
+            ));
+        }
+        // 操作別 (全レーン合計 / 窓数)。
+        out.push("[dec-kprof-avg]   op (全レーン。us は 1 窓あたりの平均)".to_string());
+        let mut ops: BTreeMap<&str, OpAgg> = BTreeMap::new();
+        for l in grp.lanes.values() {
+            for (name, e) in &l.ops {
+                let t = ops.entry(name.as_str()).or_default();
+                t.calls += e.calls;
+                t.gpu_us += e.gpu_us;
+                t.gap_us += e.gap_us;
+                t.hin_us += e.hin_us;
+                t.host_us += e.host_us;
+                t.bytes += e.bytes;
+                t.grid = e.grid;
+                t.block = e.block;
+                t.shmem = e.shmem;
+            }
+        }
+        for (name, e) in &ops {
+            let n = e.calls.max(1) as f64;
+            out.push(format!(
+                "[dec-kprof-avg]   op {} grid={} block={} shmem={} bytes={} n={} gpu={:.1} gap={:.1} hin={:.1} host={:.1}",
+                name,
+                grid_s(e.grid),
+                block_s(e.block),
+                e.shmem,
+                e.bytes / (e.calls.max(1) / grp.lanes.len().max(1) as u64).max(1),
+                e.calls,
+                e.gpu_us / n,
+                e.gap_us / n,
+                e.hin_us / n,
+                e.host_us / n
+            ));
+        }
+        // 名前付きホスト区間。
+        let mut steps: BTreeMap<&str, (u64, f64)> = BTreeMap::new();
+        for l in grp.lanes.values() {
+            for (name, (n, us)) in &l.steps {
+                let t = steps.entry(name.as_str()).or_insert((0, 0.0));
+                t.0 += n;
+                t.1 += us;
+            }
+        }
+        if !steps.is_empty() {
+            out.push("[dec-kprof-avg]   host step (全レーン。us は 1 回あたり)".to_string());
+            for (name, (n, us)) in &steps {
+                out.push(format!(
+                    "[dec-kprof-avg]   step {} n={} us={:.1} (総 {:.1} us)",
+                    name,
+                    n,
+                    us / (*n).max(1) as f64,
+                    us
+                ));
+            }
+        }
+        out
+    }
+
+    fn grid_s(g: (u32, u32, u32)) -> String {
+        if g == (0, 0, 0) {
+            "-".to_string()
+        } else {
+            format!("{}x{}x{}", g.0, g.1, g.2)
+        }
+    }
+
+    fn block_s(b: (u32, u32, u32)) -> String {
+        if b == (0, 0, 0) {
+            "-".to_string()
+        } else {
+            format!("{}x{}x{}", b.0, b.1, b.2)
+        }
     }
 
     #[cfg(test)]
@@ -1289,65 +1538,6 @@ pub(crate) mod dec_kprof {
             fn drop(&mut self) {
                 FORCE.with(|c| c.set(self.0));
             }
-        }
-
-        #[test]
-        fn gdn_dec_gemv_parse_truth_table() {
-            // 未設定・空・明示 off は「従来のまま」(Default)。
-            for raw in [
-                None,
-                Some(""),
-                Some("  "),
-                Some("0"),
-                Some("off"),
-                Some("false"),
-                Some("no"),
-                Some("v5"),
-                Some("x"),
-            ] {
-                assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::Default, "raw={raw:?}");
-            }
-            // 明示指定 (大小文字と前後空白は無視)。
-            assert_eq!(parse_gdn_dec_gemv(Some("v2")), GdnDecGemv::V2);
-            assert_eq!(parse_gdn_dec_gemv(Some(" V2 ")), GdnDecGemv::V2);
-            assert_eq!(parse_gdn_dec_gemv(Some("V3")), GdnDecGemv::V3);
-            assert_eq!(parse_gdn_dec_gemv(Some("fp16")), GdnDecGemv::Fp16);
-            assert_eq!(parse_gdn_dec_gemv(Some("v4")), GdnDecGemv::V4);
-            assert_eq!(parse_gdn_dec_gemv(Some("V4")), GdnDecGemv::V4);
-            // Default のときは従来の選択に一致する (env 既定 = v3)。
-            assert!(matches!(
-                gdn_dec_gemv_mode_eff(),
-                GemvKernelMode::V2 | GemvKernelMode::V3 | GemvKernelMode::Fp16
-            ));
-            // 既定では v4 は選ばれない (= 既定 off)。
-            assert!(!gdn_dec_gemv_v4_on());
-        }
-
-        #[test]
-        fn gdn_dec_v4_lanes_parse_and_shape_rule() {
-            // 既定 32、4..32 に丸める。
-            assert_eq!(parse_gdn_dec_v4_lanes(None), 32);
-            assert_eq!(parse_gdn_dec_v4_lanes(Some("")), 32);
-            assert_eq!(parse_gdn_dec_v4_lanes(Some("x")), 32);
-            assert_eq!(parse_gdn_dec_v4_lanes(Some("2")), 4);
-            assert_eq!(parse_gdn_dec_v4_lanes(Some("16")), 16);
-            assert_eq!(parse_gdn_dec_v4_lanes(Some("32")), 32);
-            assert_eq!(parse_gdn_dec_v4_lanes(Some("64")), 32);
-            // 形の規則: n_in % (lanes*32) == 0 を満たす最大の 2 の冪。
-            // 実形 k=2560 (qkv / gate): 16 が上限 (2560/16 = 160 = 32*5)。
-            assert_eq!(v4_lanes_for(2_560, 32), 16);
-            assert_eq!(v4_lanes_for(2_560, 16), 16);
-            assert_eq!(v4_lanes_for(2_560, 8), 8);
-            assert_eq!(v4_lanes_for(2_560, 4), 4);
-            // 実形 k=6144 (attn_out): 32 まで行ける。
-            assert_eq!(v4_lanes_for(6_144, 32), 32);
-            assert_eq!(v4_lanes_for(6_144, 16), 16);
-            // 32 の倍数でない k は v3 に任せる (0)。
-            assert_eq!(v4_lanes_for(2_560 + 16, 32), 0);
-            // 4 未満しか無い形も v3 に任せる。
-            assert_eq!(v4_lanes_for(64, 32), 0);
-            // 2 の冪でない上限は切り下げる。
-            assert_eq!(v4_lanes_for(6_144, 20), 16);
         }
 
         #[test]
@@ -1396,50 +1586,58 @@ pub(crate) mod dec_kprof {
             assert_ne!(mask(3_965, GDN), mask(14_159, GDN));
         }
 
+        /// コピーの判定 (表の列分けの規則)。
         #[test]
-        fn render_has_the_columns_the_task_asked_for() {
-            let rows = [
-                Row {
-                    name: "H2D",
-                    grid: (0, 0, 0),
-                    block: (0, 0, 0),
-                    shmem: 0,
-                    bytes: 20_480,
-                    gpu_us: 2.5,
-                    gap_us: 0.0,
-                    hin_us: 0.4,
-                    host_us: 31.25,
-                },
-                Row {
-                    name: "K dno_gemv_q8_0c4",
-                    grid: (2_560, 1, 1),
-                    block: (256, 1, 1),
-                    shmem: 0,
-                    bytes: 0,
-                    gpu_us: 40.0,
-                    gap_us: 1.5,
-                    hin_us: 2.0,
-                    host_us: 3.0,
-                },
-            ];
-            let head = head_line(GDN, 0, 3_965, 120.0, rows.len(), &rows);
-            assert!(head.contains("gdn li=0 pos=3965"), "{head}");
-            assert!(head.contains("ops=2"), "{head}");
-            // gpu_sum = 42.5 / gap_sum = 1.5 (先頭の gap は数えない)
-            assert!(head.contains("gpu_sum_us=42.5"), "{head}");
-            assert!(head.contains("gap_sum_us=1.5"), "{head}");
-            assert!(head.contains("host_sum_us=34.2"), "{head}");
-            let l0 = row_line(0, &rows[0]);
-            for k in [
-                " 0 H2D", "grid=-", "block=-", "bytes=20480", "gpu_us=2.50", "gap_us=0.00",
-                "hin_us=0.4", "host_us=31.2",
-            ] {
-                assert!(l0.contains(k), "{l0} に {k} が無い");
+        fn copy_rows_are_classified_by_prefix() {
+            for n in ["H2D", "H2D@", "H2D@a", "D2H", "D2H@a"] {
+                assert!(is_copy(n), "{n}");
             }
-            let l1 = row_line(1, &rows[1]);
-            assert!(l1.contains("grid=2560x1x1"), "{l1}");
-            assert!(l1.contains("block=256x1x1"), "{l1}");
-            assert!(l1.contains("gap_us=1.50"), "{l1}");
+            for n in ["K dno_gemv_q8_0_v3", "sync", "D2D", "step"] {
+                assert!(!is_copy(n), "{n}");
+            }
+        }
+
+        /// 平均の組み立て: 2 レーン x 2 窓の合成データで、列の意味
+        /// (kern/copy/gap/wait/launch/steps) と平均値が合うこと。
+        #[test]
+        fn render_averages_the_columns() {
+            let mut grp = Group::default();
+            grp.n_win = 2;
+            for (li, wall, kern) in [(3usize, 300.0f64, 200.0f64), (7, 200.0, 150.0)] {
+                let l = grp.lanes.entry((li, 0)).or_default();
+                l.calls = 2;
+                l.wall_us = wall * 2.0;
+                l.kern_us = kern * 2.0;
+                l.copy_us = 20.0 * 2.0;
+                l.gap_us = 30.0 * 2.0;
+                l.wait_us = 50.0 * 2.0;
+                l.launch_us = 4.0 * 2.0;
+                l.steps
+                    .insert("rope_q".to_string(), (2, 12.0 * 2.0));
+                let mut e = OpAgg::default();
+                e.calls = 2;
+                e.gpu_us = kern * 2.0;
+                e.host_us = 4.0 * 2.0;
+                e.grid = (320, 1, 1);
+                e.block = (32, 1, 1);
+                l.ops.insert("K dno_gemv_q8_0_v3".to_string(), e);
+            }
+            let lines = render_group(1, FULL, &grp);
+            let all = lines.join("\n");
+            assert!(all.contains("full band=3800 windows=2 lanes=2"), "{all}");
+            assert!(all.contains("li s calls"), "{all}");
+            // li=3: wall 300 / kern 200 / copy 20 / gap 30 / wait 50 / launch 4 / steps 12
+            assert!(
+                all.contains("3 0     2  300.0  200.0   20.0   30.0   50.0    4.0   12.0"),
+                "{all}"
+            );
+            assert!(all.contains("7 0     2  200.0  150.0"), "{all}");
+            // 操作別: 2 レーン x 2 窓 = 4 回。gpu は 1 窓あたりに戻す。
+            assert!(all.contains("op K dno_gemv_q8_0_v3"), "{all}");
+            assert!(all.contains("n=4"), "{all}");
+            assert!(all.contains("gpu=175.0"), "{all}");
+            // step は 1 回あたり。
+            assert!(all.contains("step rope_q n=4 us=12.0"), "{all}");
         }
 
         /// off のときは窓が開かず、`op_begin` が 1 件も積まないこと
@@ -1447,20 +1645,43 @@ pub(crate) mod dec_kprof {
         #[test]
         fn off_opens_no_window_and_records_nothing() {
             let _f = Force::set(Some(false));
-            let _w = window(GDN, 7, 3_965);
-            assert_eq!(op_begin(|| "x".to_string(), (1, 1, 1), (1, 1, 1), 0, 0), None);
+            let _w = window(GDN, 7, 3_965, 0);
+            assert_eq!(
+                op_begin(|| "x".to_string(), (1, 1, 1), (1, 1, 1), 0, 0),
+                None
+            );
             let n = ST.with(|c| c.borrow().as_ref().map(|s| s.entries.len()));
             assert!(n.unwrap_or(0) == 0, "off で記録が積まれた");
         }
 
-        /// on でも GPU が無い環境ではイベントを作れない = dead になり、
-        /// 2 回目以降は窓を開かない (無限に試さない)。
+        /// 入れ子の guard が外側の窓を閉じないこと (task 179 で直した取り違え)。
+        #[test]
+        fn nested_window_guard_does_not_close_the_outer_one() {
+            let _f = Force::set(Some(true));
+            // decode 窓を開く (window は decode の内側でしか開かない)。
+            crate::model::qwen4exp::gdn_gpu_win::set_window_for_test(true);
+            // このコンテナには GPU が無いので、窓は開いてもすぐ dead になる。
+            // それでも guard の所有権 (open) は外側だけが持つ。
+            let outer = window(FULL, 3, 3_965, 0);
+            assert!(ACTIVE.with(|c| c.get()), "外側の窓が開かない");
+            let inner = window(MIX, 0, 3_965, 0);
+            assert!(ACTIVE.with(|c| c.get()));
+            drop(inner);
+            assert!(ACTIVE.with(|c| c.get()), "内側の drop で外側が閉じた");
+            drop(outer);
+            assert!(!ACTIVE.with(|c| c.get()), "外側の drop で閉じない");
+            crate::model::qwen4exp::gdn_gpu_win::set_window_for_test(false);
+        }
+
+        /// GPU が無い環境ではイベントを作れない = dead になり、2 回目以降は
+        /// 窓を開かない (無限に試さない)。
         #[test]
         fn gpu_less_host_marks_dead_after_the_first_attempt() {
             let _f = Force::set(Some(true));
-            let _w = window(GDN, 0, 3_965);
+            let _w = window(GDN, 0, 3_965, 0);
             // イベントが作れない環境 (このコンテナ) では dead が立つ。
-            let dead = ST.with(|c| c.borrow().as_ref().map(|s| s.dead)).unwrap_or(false);
+            let dead = ST.with(|c| c.borrow().as_ref().map(|s| s.dead))
+                .unwrap_or(false);
             if dead {
                 assert!(!should_begin(false, true, 0, 3_970, GDN, true));
             }
@@ -3042,8 +3263,18 @@ impl CudaCtx {
                 // 3 回入っていた。カーネル・引数・発行順・丸め順は従来と同一。
                 {
                     let px = s.pin_x.as_mut().expect("pin_x は ensure 済み");
-                    px.as_mut_slice::<f32>()[..n_in].copy_from_slice(x);
+                    dec_kprof::step("gemv_h2d_pack", || {
+                        px.as_mut_slice::<f32>()[..n_in].copy_from_slice(x)
+                    });
                     let lib = lib()?;
+                    // task 179: 非同期コピーも表に出す (`H2D@a`)。
+                    let kp_cp = dec_kprof::op_begin(
+                        || "H2D@a".to_string(),
+                        (0, 0, 0),
+                        (0, 0, 0),
+                        0,
+                        n_in * 4,
+                    );
                     unsafe {
                         check(
                             (lib.memcpy_htod_async)(
@@ -3055,6 +3286,7 @@ impl CudaCtx {
                             "cuMemcpyHtoDAsync (moe gemv)",
                         )?;
                     }
+                    dec_kprof::op_end(kp_cp);
                 }
                 dbg_htod(n_in * 4);
                 let t1 = t0.map(|_| std::time::Instant::now());
@@ -3088,6 +3320,14 @@ impl CudaCtx {
                 {
                     let po = s.pin_o.as_mut().expect("pin_o は ensure 済み");
                     let lib = lib()?;
+                    // task 179: 非同期コピーも表に出す (`D2H@a`)。
+                    let kp_cp = dec_kprof::op_begin(
+                        || "D2H@a".to_string(),
+                        (0, 0, 0),
+                        (0, 0, 0),
+                        0,
+                        n_out * 4,
+                    );
                     unsafe {
                         check(
                             (lib.memcpy_dtoh_async)(
@@ -3099,6 +3339,7 @@ impl CudaCtx {
                             "cuMemcpyDtoHAsync (moe gemv)",
                         )?;
                     }
+                    dec_kprof::op_end(kp_cp);
                 }
                 self.sync()?;
                 let t3 = t0.map(|_| std::time::Instant::now());
@@ -3106,7 +3347,9 @@ impl CudaCtx {
                     crate::model::devprof::note_sync(t.elapsed().as_nanos() as u64);
                 }
                 let po = s.pin_o.as_ref().expect("pin_o は ensure 済み");
-                out.copy_from_slice(&po.as_slice::<f32>()[..n_out]);
+                dec_kprof::step("gemv_pack", || {
+                    out.copy_from_slice(&po.as_slice::<f32>()[..n_out])
+                });
                 if let (Some(a), Some(b), Some(c), Some(d)) = (t0, t1, t2, t3) {
                     eprintln!(
                         "[gemvt] {}x{} async=1 h2d={} launch={} sync={} copy={}us",
@@ -15185,6 +15428,7 @@ pub fn maybe_gpu_mix_bf16_into(
             dec_kprof::MIX,
             dec_kprof::cur_layer(),
             dec_kprof::cur_pos(),
+            0,
         );
         hx.as_mut_slice::<f32>()[..k].copy_from_slice(x);
         unsafe {
@@ -16500,6 +16744,7 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
             dec_kprof::MIX,
             dec_kprof::cur_layer(),
             dec_kprof::cur_pos(),
+            1,
         );
         let mut s = cell.borrow_mut();
         let MixGpuScratch {
@@ -16523,7 +16768,16 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
             dm.as_ref().unwrap(),
         );
         let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
-        hx.as_mut_slice::<f32>()[..k1].copy_from_slice(x);
+        dec_kprof::step("mix_h2d_pack", || {
+            hx.as_mut_slice::<f32>()[..k1].copy_from_slice(x)
+        });
+        let kp_cp = dec_kprof::op_begin(
+            || "H2D@a".to_string(),
+            (0, 0, 0),
+            (0, 0, 0),
+            0,
+            k1 * 4,
+        );
         unsafe {
             check(
                 (lib.memcpy_htod_async)(
@@ -16578,14 +16832,24 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
                 0,
                 &mut args3,
             )?;
+            let kp_cp = dec_kprof::op_begin(
+                || "D2H@a".to_string(),
+                (0, 0, 0),
+                (0, 0, 0),
+                0,
+                e * 4,
+            );
             check(
                 (lib.memcpy_dtoh_async)(ho.ptr, dm.ptr(), e * 4, std::ptr::null_mut()),
                 "cuMemcpyDtoHAsync (mix chain2)",
             )?;
+            dec_kprof::op_end(kp_cp);
             crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
         }
         ctx.sync()?;
-        out.copy_from_slice(&ho.as_slice::<f32>()[..e]);
+        dec_kprof::step("mix_pack", || {
+            out.copy_from_slice(&ho.as_slice::<f32>()[..e])
+        });
         Ok(())
     });
     match r {
@@ -19606,6 +19870,8 @@ fn q4_attn_mirror_prepare(
     v: &[f32],
     pf: bool,
 ) -> Result<(CUdeviceptr, CUdeviceptr)> {
+    // task 179: ミラーの帳簿 (mutex / LRU / 環境変数) を名前付きで測る。
+    let t_book = dec_kprof::on().then(std::time::Instant::now);
     let mirrors = Q4_ATTN_MIRRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
     let mut ms = match mirrors.lock() {
         Ok(g) => g,
@@ -19638,6 +19904,9 @@ fn q4_attn_mirror_prepare(
     };
     if ms[idx].1.kv_dim != kv_dim || ms[idx].1.state.len.len() != n_layer {
         ms[idx].1 = Q4AttnMirror::new(n_layer, kv_dim);
+    }
+    if let Some(t) = t_book {
+        dec_kprof::note_since("mirror_book", t);
     }
     match q4_attn_mirror_sync(&mut ms[idx].1, layer, len, gen, kv_dim, k, v, pf) {
         Ok(p) => Ok(p),
@@ -35274,7 +35543,7 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
     let run = || -> Result<(Vec<f32>, Option<(Vec<f32>, Vec<f32>)>)> {
         // task 177: この submission の操作別内訳 (`DENNO_GDN_DEC_KPROF`・既定 off)。
         // guard の drop (この closure の出口) で表を出す。
-        let _kp_win = dec_kprof::window(dec_kprof::GDN, req.li, dec_kprof::cur_pos());
+        let _kp_win = dec_kprof::window(dec_kprof::GDN, req.li, dec_kprof::cur_pos(), 0);
         {
             // 重みの実バイト (qkv の各単位 + attn_out)。実効帯域の分母に使う。
             let q: usize = req

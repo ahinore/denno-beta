@@ -1413,20 +1413,34 @@ impl AttnLayer {
         // task 72: q / k / v は同じ入力 cur を取るので 1 回の GEMV で得る。
         // 行は独立なので、個別に投影した場合とビット一致する。
         let proj = self.project_qkv_concat(cur)?;
-        let (mut q, gate) = self.split_q_gate(self.proj_part(&proj, 0))?;
-        self.norm_rope_q(&mut q, pos)?;
+        // task 179: ホスト仕事を名前付きで測る (`DENNO_GDN_DEC_KPROF` の平均表)。
+        // 計測が off のときは closure をそのまま呼ぶだけ (分岐 1 回)。
+        macro_rules! kp_step {
+            ($name:expr, $e:expr) => {{
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda::dec_kprof::step($name, || $e)
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    $e
+                }
+            }};
+        }
+        let (mut q, gate) = kp_step!("kv_split", self.split_q_gate(self.proj_part(&proj, 0)))?;
+        kp_step!("rope_q", self.norm_rope_q(&mut q, pos))?;
 
-        let mut k = self.proj_part(&proj, 1).to_vec();
-        self.norm_rope_k(&mut k, pos)?;
-        let v = self.proj_part(&proj, 2).to_vec();
+        let mut k = kp_step!("k_take", self.proj_part(&proj, 1).to_vec());
+        kp_step!("rope_k", self.norm_rope_k(&mut k, pos))?;
+        let v = kp_step!("v_take", self.proj_part(&proj, 2).to_vec());
 
         // 積んでから全 len に対して attention (参照実装の KV 書き込みと同じ順)。
-        cache.push(layer, &k, &v)?;
+        kp_step!("cache_push", cache.push(layer, &k, &v))?;
         let attn = match cells {
             None => self.attend_decode(&q, cache, layer)?,
             Some(c) => self.attend_visible(&q, cache, layer, c)?,
         };
-        let gated = self.gate_mul(&attn, &gate)?;
+        let gated = kp_step!("gate_mul", self.gate_mul(&attn, &gate))?;
         let out = self.project_out(&gated)?;
         if let Some(t) = t_all {
             q4prof::add(&q4prof::A_FULL, t);
@@ -1614,6 +1628,7 @@ impl FullAttn {
             crate::cuda::dec_kprof::FULL,
             layer,
             crate::cuda::dec_kprof::cur_pos(),
+            0,
         );
         if cur.len() != self.n_embd {
             bail!(
