@@ -15500,8 +15500,10 @@ pub fn pf_full_qkv(
         k_out.copy_from_slice(&kgot);
         let vgot: Vec<f32> = vdb.to_vec(nt * kv)?;
         v_out.copy_from_slice(&vgot);
-        // 5. attention の K/V ミラーへ積む (ホスト側の台帳もここで進む)
-        q4_attn_mirror_prepare(cache_id, n_layer, kv, layer, gen, t_total, k_out, v_out, true)?;
+        // 5. ミラーへの追記はここではやらない。この関数が持っている k/v は
+        //    チャンクぶん (nt 行) だけで、ミラーは `[0..t_total)` を要求する。
+        //    呼び出し側がホストの KV へ積んだあと、`pf_full_out` が
+        //    キャッシュ全体を渡して追記する (転送内容は従来経路と同じ)。
         Ok(())
     });
     match r {
