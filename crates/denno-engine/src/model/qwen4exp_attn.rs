@@ -1386,6 +1386,64 @@ impl AttnLayer {
         self.forward_token_impl(cur, cache, layer, pos, Some(cells))
     }
 
+    /// task 179: 1 層をデバイスで閉じる経路 (`DENNO_FULL_DEC_DEV`・既定 off)。
+    ///
+    /// `None` = この回は従来のホスト経路 (形・ミラー・PTX のどれかが欠けた)。
+    /// 成功したらホスト KV キャッシュへ行を push してから層の出力を返す。
+    #[allow(clippy::too_many_arguments)]
+    fn dev_forward(
+        &mut self,
+        cur: &[f32],
+        cache: &mut AttnCache,
+        layer: usize,
+        pos: usize,
+        cells: Option<&[usize]>,
+    ) -> Result<Option<Vec<f32>>> {
+        #[cfg(feature = "cuda")]
+        {
+            if cells.is_none() && crate::cuda::dec_full_dev::on() {
+                if let Some(inner) = self.qkv.inner() {
+                    let call = crate::cuda::dec_full_dev::Call {
+                        cache_id: cache.id(),
+                        n_layer: cache.n_layer(),
+                        layer,
+                        layer_gen: cache.gen(layer)?,
+                        len: cache.len(layer)? + 1,
+                        kv_dim: self.kv_dim(),
+                        heads: self.n_head,
+                        group: self.heads_per_kv(),
+                        dh: self.head_dim,
+                        scale: self.kq_scale,
+                        n_rot: self.n_rot,
+                        pos,
+                        theta: self.rope_theta,
+                        eps: self.rms_eps,
+                        q_norm: &self.q_norm,
+                        k_norm: &self.k_norm,
+                        qkv_uid: inner.uid(),
+                        qkv_ty: inner.ty(),
+                        qkv_blocks: inner.blocks().as_slice(),
+                        qkv_k: inner.k(),
+                        qkv_n: inner.n(),
+                        wo_uid: self.wo.uid(),
+                        wo_ty: self.wo.ty(),
+                        wo_blocks: self.wo.blocks().as_slice(),
+                        wo_k: self.wo.k(),
+                        wo_n: self.wo.n(),
+                        n_embd: self.n_embd,
+                        cur,
+                    };
+                    if let Some(o) = crate::cuda::dec_full_dev::forward(&call) {
+                        cache.push(layer, &o.k, &o.v)?;
+                        return Ok(Some(o.out));
+                    }
+                }
+            }
+        }
+        let _ = (cur, cache, layer, pos, cells);
+        Ok(None)
+    }
+
     fn forward_token_impl(
         &mut self,
         cur: &[f32],
@@ -1408,40 +1466,45 @@ impl AttnLayer {
                 self.n_embd
             );
         }
-        // task 133: full 層の合計 (`[q4prof] ... full=`) を decode でも積む。
-        // 計測は DENNO_Q4_PROFILE / DENNO_PF_ATT_DBG のときだけ (stamp が None)。
-        // task 72: q / k / v は同じ入力 cur を取るので 1 回の GEMV で得る。
-        // 行は独立なので、個別に投影した場合とビット一致する。
-        let proj = self.project_qkv_concat(cur)?;
-        // task 179: ホスト仕事を名前付きで測る (`DENNO_GDN_DEC_KPROF` の平均表)。
-        // 計測が off のときは closure をそのまま呼ぶだけ (分岐 1 回)。
-        macro_rules! kp_step {
-            ($name:expr, $e:expr) => {{
-                #[cfg(feature = "cuda")]
-                {
-                    crate::cuda::dec_kprof::step($name, || $e)
+        // task 179: デバイス経路 (成功したらそこで層が終わる)。
+        let out = match self.dev_forward(cur, cache, layer, pos, cells)? {
+            Some(o) => o,
+            None => {
+                // task 72: q / k / v は同じ入力 cur を取るので 1 回の GEMV で得る。
+                // 行は独立なので、個別に投影した場合とビット一致する。
+                let proj = self.project_qkv_concat(cur)?;
+                // task 179: ホスト仕事を名前付きで測る (`DENNO_GDN_DEC_KPROF`)。
+                // 計測が off のときは closure をそのまま呼ぶだけ (分岐 1 回)。
+                macro_rules! kp_step {
+                    ($name:expr, $e:expr) => {{
+                        #[cfg(feature = "cuda")]
+                        {
+                            crate::cuda::dec_kprof::step($name, || $e)
+                        }
+                        #[cfg(not(feature = "cuda"))]
+                        {
+                            $e
+                        }
+                    }};
                 }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    $e
-                }
-            }};
-        }
-        let (mut q, gate) = kp_step!("kv_split", self.split_q_gate(self.proj_part(&proj, 0)))?;
-        kp_step!("rope_q", self.norm_rope_q(&mut q, pos))?;
+                let (mut q, gate) =
+                    kp_step!("kv_split", self.split_q_gate(self.proj_part(&proj, 0)))?;
+                kp_step!("rope_q", self.norm_rope_q(&mut q, pos))?;
 
-        let mut k = kp_step!("k_take", self.proj_part(&proj, 1).to_vec());
-        kp_step!("rope_k", self.norm_rope_k(&mut k, pos))?;
-        let v = kp_step!("v_take", self.proj_part(&proj, 2).to_vec());
+                let mut k = kp_step!("k_take", self.proj_part(&proj, 1).to_vec());
+                kp_step!("rope_k", self.norm_rope_k(&mut k, pos))?;
+                let v = kp_step!("v_take", self.proj_part(&proj, 2).to_vec());
 
-        // 積んでから全 len に対して attention (参照実装の KV 書き込みと同じ順)。
-        kp_step!("cache_push", cache.push(layer, &k, &v))?;
-        let attn = match cells {
-            None => self.attend_decode(&q, cache, layer)?,
-            Some(c) => self.attend_visible(&q, cache, layer, c)?,
+                // 積んでから全 len に対して attention (参照実装の KV 書き込みと同じ順)。
+                kp_step!("cache_push", cache.push(layer, &k, &v))?;
+                let attn = match cells {
+                    None => self.attend_decode(&q, cache, layer)?,
+                    Some(c) => self.attend_visible(&q, cache, layer, c)?,
+                };
+                let gated = kp_step!("gate_mul", self.gate_mul(&attn, &gate))?;
+                self.project_out(&gated)?
+            }
         };
-        let gated = kp_step!("gate_mul", self.gate_mul(&attn, &gate))?;
-        let out = self.project_out(&gated)?;
         if let Some(t) = t_all {
             q4prof::add(&q4prof::A_FULL, t);
         }
