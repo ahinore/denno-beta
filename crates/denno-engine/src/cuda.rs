@@ -12151,6 +12151,9 @@ const _: [(); TC2_SMEM_BYTES] = [(); 2 * TC2_BN * TC2_LD * 2 + 2 * TC2_BM * TC2_
 /// qkv_pf が 6,268 → 579 ms (-90.8%)、out_pf が 667 → 271 ms、decode と
 /// 19 トークン next turn は不変、errors 0・text sane。md5 は BF16 丸め
 /// (と 4 層の Q5_K/Q4_K が f32 経路から TC 経路へ移ること) で変わる。
+/// br178 (int-auto `5d2238843` に br176 をマージした木) の lab t178a でも
+/// 同じ: 3,826 で 19.76 → 17.83 s (-9.8%)、14,018 で 66.65 → 59.02 s
+/// (-11.4%)、decode 27 → 27 ms/tok、errors 0、text sane。
 pub(crate) fn pf_tc2_gemm_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         None => true,
