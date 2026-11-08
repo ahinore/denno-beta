@@ -7793,6 +7793,8 @@ fn moe_ffn_quant_impl(
     // task 138: この発行は台帳では shared に数える。
     let mut shed_ov = {
         let _l = q4ledger::enter(q4ledger::SHARED);
+        // task 187: 台帳の副区間 (shared gate/up の enqueue)。
+        let _s = q4ledger::sub(q4ledger::SUB_SH_BEGIN);
         SharedExpertOverlap::begin(lw, x)
     };
 
@@ -8104,6 +8106,8 @@ fn moe_ffn_quant_impl(
                 Vec::new()
             } else {
                 let ids: Vec<usize> = miss_pos.iter().map(|&t| sel[t]).collect();
+                // task 187: 台帳の副区間 (ミスの CPU 計算)。
+                let _s = q4ledger::sub(q4ledger::SUB_EXP_MISS);
                 expert_contribs_par(lw, &ids, x, e, ff, None)?
             };
             #[cfg(not(feature = "par"))]
@@ -8126,6 +8130,8 @@ fn moe_ffn_quant_impl(
                 v
             };
             let mut mi = 0usize;
+            // task 187: 台帳の副区間 (host の重み付き足し込み)。
+            let _s_sum = q4ledger::sub(q4ledger::SUB_EXP_SUM);
             for (t, &_ei) in sel.iter().enumerate() {
                 let pe = weights[t];
                 let v: &[f32] = match hs[t].as_deref() {
@@ -8147,6 +8153,8 @@ fn moe_ffn_quant_impl(
             // P45: 層一括経路も「何本が載っていたか」を返す (ゲートの 1 サンプル)。
             gpu_hits = hits;
             debug_assert_eq!(hs.len(), sel.len(), "寄与の本数が選択 expert と違う");
+            // task 187: 台帳の副区間 (host の重み付き足し込み)。
+            let _s_sum = q4ledger::sub(q4ledger::SUB_EXP_SUM);
             for (t, _) in sel.iter().enumerate() {
                 let pe = weights[t];
                 let hh = &hs[t];
@@ -8221,6 +8229,8 @@ fn moe_ffn_quant_impl(
         // ヒット率が永久に 0 のままになる)。
         #[cfg(feature = "cuda")]
         if vram_mode && iq_mode {
+            // task 187: 台帳の副区間 (ミス expert の上げ直し = ページフォルト + H2D)。
+            let _s = q4ledger::sub(q4ledger::SUB_EXP_UPLOAD);
             iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
         }
     }
@@ -8263,8 +8273,11 @@ fn moe_ffn_quant_impl(
     let _l_shared = q4ledger::enter(q4ledger::SHARED);
     let t_shared = std::time::Instant::now();
     let sff = lw.gate_shexp.n();
+    // task 187: 台帳の副区間 (作業域の確保)。
+    let s_elem = q4ledger::sub(q4ledger::SUB_SH_ELEM);
     let mut sact = vec![0.0f32; sff];
     let mut sup = vec![0.0f32; sff];
+    drop(s_elem);
     // task 124: router の前に積んだ gate/up をここで回収する (間に合っていれば
     // 待ちはほぼ 0)。取れなければ従来どおりこの場で同期して計算する。
     // 従来の文の順序 (gate → silu → up → 積) は `!overlapped` 側でそのまま。
@@ -8274,37 +8287,52 @@ fn moe_ffn_quant_impl(
             .gemv_label("shared_gate", x, &mut sact)
             .map_err(|err| one(format!("層 {}: ffn_gate_shexp: {err}", lw.il)))?;
     }
-    silu_inplace(&mut sact);
-    if !overlapped {
-        lw.up_shexp
-            .gemv_label("shared_up", x, &mut sup)
-            .map_err(|err| one(format!("層 {}: ffn_up_shexp: {err}", lw.il)))?;
-    }
-    for r in 0..sff {
-        sact[r] *= sup[r];
+    {
+        // task 187: 台帳の副区間 (silu と積)。
+        let _s = q4ledger::sub(q4ledger::SUB_SH_ELEM);
+        silu_inplace(&mut sact);
+        if !overlapped {
+            lw.up_shexp
+                .gemv_label("shared_up", x, &mut sup)
+                .map_err(|err| one(format!("層 {}: ffn_up_shexp: {err}", lw.il)))?;
+        }
+        for r in 0..sff {
+            sact[r] *= sup[r];
+        }
     }
     let mut sh = vec![0.0f32; e];
     // task 155: down は**サイドストリーム**に先に積み、その完了を待つ間に
     // gate_inp (null ストリーム) を回す (層あたり 2 往復 → 1 往復)。
     // 積めない型/環境では `finish` が false を返すので従来の同期経路に戻る。
-    let mut sdown = SharedDownOverlap::begin(lw, &sact, e);
+    let mut sdown = {
+        let _s = q4ledger::sub(q4ledger::SUB_SH_SDOWN);
+        SharedDownOverlap::begin(lw, &sact, e)
+    };
     let mut sg = vec![0.0f32; lw.gate_inp_shexp.n()];
-    lw.gate_inp_shexp
-        .gemv_label("shared_gate_inp", x, &mut sg)
-        .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp: {err}", lw.il)))?;
+    {
+        // task 187: 台帳の副区間 (F32・1 行の GEMV)。
+        let _s = q4ledger::sub(q4ledger::SUB_SH_SG);
+        lw.gate_inp_shexp
+            .gemv_label("shared_gate_inp", x, &mut sg)
+            .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp: {err}", lw.il)))?;
+    }
     if !sdown.finish(&mut sh) {
         lw.down_shexp
             .gemv_label("shared_down", &sact, &mut sh)
             .map_err(|err| one(format!("層 {}: ffn_down_shexp: {err}", lw.il)))?;
     }
     let sgw = hyper::sigmoid(sg[0]);
-    for j in 0..e {
-        out[j] += sh[j] * sgw;
-    }
-    // P54: shared expert の出力そのもの (`ffn_down_shexp` の出力) の RMS。
-    // 係数 `sgw` は掛ける前の値を見る (expert の寄与の大きさを測るため)。
-    if let Some(r) = roles.as_deref_mut() {
-        r.shex = rms_of(&sh);
+    {
+        // task 187: 台帳の副区間 (shared 出力の足し込み + RMS)。
+        let _s = q4ledger::sub(q4ledger::SUB_SH_ADD);
+        for j in 0..e {
+            out[j] += sh[j] * sgw;
+        }
+        // P54: shared expert の出力そのもの (`ffn_down_shexp` の出力) の RMS。
+        // 係数 `sgw` は掛ける前の値を見る (expert の寄与の大きさを測るため)。
+        if let Some(r) = roles.as_deref_mut() {
+            r.shex = rms_of(&sh);
+        }
     }
     moe_sub_add(2, t_shared.elapsed());
 
@@ -8725,6 +8753,8 @@ fn moe_experts_iq_gpu_batched(
     let mut devs = Vec::with_capacity(sel.len());
     let mut ids: Vec<u16> = Vec::with_capacity(sel.len());
     let mut pos: Vec<usize> = Vec::with_capacity(sel.len());
+    // task 187: 台帳の副区間 (VRAM 参照)。`experts` の cpu 列の中身。
+    let s_lookup = q4ledger::sub(q4ledger::SUB_EXP_LOOKUP);
     for (t, &ei) in sel.iter().enumerate() {
         let key = ExpertKey {
             layer: lw.il as u16,
@@ -8738,6 +8768,7 @@ fn moe_experts_iq_gpu_batched(
             pos.push(t);
         }
     }
+    drop(s_lookup);
     if devs.is_empty() {
         return Ok(None);
     }
@@ -8760,7 +8791,9 @@ fn moe_experts_iq_gpu_batched(
     );
     let seg_gu = crate::model::expert_batch::seg_table_shared_x(&ids, ff);
     let seg_d = crate::model::expert_batch::seg_table_per_act(&ids, ff, e);
+    let s_alloc = q4ledger::sub(q4ledger::SUB_EXP_ALLOC);
     let mut h = vec![0.0f32; devs.len() * e];
+    drop(s_alloc);
     // task 150 (`DENNO_DECODE_CHAIN2_EXP`): ミス (VRAM に載っていない expert) の寄与を
     // GPU の完了前に CPU で計算し、同期をその裏へ隠す。ミスの位置と id を先に作り、
     // overlap 経路ではコールバックの中で `miss_h` へ書かせる (足し込みは従来どおり
@@ -8795,6 +8828,8 @@ fn moe_experts_iq_gpu_batched(
             e,
             &mut h,
             || {
+                // task 187: 台帳の副区間 (ミスの CPU 計算。GPU の裏で走る)。
+                let _s = q4ledger::sub(q4ledger::SUB_EXP_MISS);
                 expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_h)
                     .map_err(anyhow::Error::from)
             },
@@ -8823,10 +8858,12 @@ fn moe_experts_iq_gpu_batched(
         return Ok(None);
     }
 
+    let s_alloc = q4ledger::sub(q4ledger::SUB_EXP_ALLOC);
     let mut hs: Vec<Option<Vec<f32>>> = vec![None; sel.len()];
     // task 150: overlap のときはミスも CPU で計算済みなので、両方をここで揃える
     // (呼び出し側は `None` を見ない = CPU を二度回さない)。
     scatter_contribs(&mut hs, &pos, &h, miss_slice, &miss_h, e)?;
+    drop(s_alloc);
 
     // 3. DENNO_EXPERT_GPU_CHECK=1: CPU の 3 行列と突き合わせる (層ごとに 1 行)。
     if expert_vram::check_enabled() {

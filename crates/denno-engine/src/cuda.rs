@@ -7003,6 +7003,8 @@ where
         // 待つ (1 層 6 回 x 48 層 = 288 回/token)。1 本にまとめるとドライバ往復が
         // 減り、転送が直前の層の GPU 仕事と重なる。**値は変わらない** (同じ表・
         // 同じポインタを別の場所に置くだけ)。
+        // task 187: 台帳の副区間 (prologue の H2D)。「7 MB の h2d のうち入力はいくらか」。
+        let s_pro = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_EXP_PRO);
         let pro = dec_pro_async_enabled();
         let lay = dec_stage_layout(n_in, nseg, seg_gu.len(), seg_d.len());
         let mut stage_addr: Option<u64> = None;
@@ -7037,6 +7039,7 @@ where
             sc.sgd.as_ref().expect("確保済み").copy_from(seg_d)?;
             dbg_htod((seg_gu.len() + seg_d.len()) * 4);
         }
+        drop(s_pro);
         let (x_addr, pg_addr, pu_addr, pd_addr, sgu_addr, sgd_addr) = match stage_addr {
             Some(base) => (
                 base + lay.x as u64,
@@ -7061,8 +7064,11 @@ where
         let h = sc.h.as_ref().expect("確保済み");
         unsafe {
             // 1. gate と up (同じ segment 表 = 同じ入力 x)
+            // task 187: 層内の GPU 時間をイベントで段ごとに測る (PROFILE のときだけ)。
+            dec_exp_kprof::begin_layer(nseg as u32);
             let rb_g = crate::model::exp_iq::row_bytes(ty_g, n_in).unwrap_or(0);
             let rb_u = crate::model::exp_iq::row_bytes(ty_u, n_in).unwrap_or(0);
+            let mut gu = 0usize;
             for (f, ptrs, buf, rb) in [
                 (kernels.fns[slot_g], pg_addr, g, rb_g),
                 (kernels.fns[slot_u], pu_addr, u, rb_u),
@@ -7088,6 +7094,13 @@ where
                     &mut rb as *mut _ as *mut c_void,
                 ];
                 ctx.launch_async(f, plan_g.grid, plan_g.block, 0, &mut args)?;
+                // 1 本目 = gate、2 本目 = up。
+                dec_exp_kprof::mark(if gu == 0 {
+                    dec_exp_kprof::GATE
+                } else {
+                    dec_exp_kprof::UP
+                });
+                gu += 1;
             }
             // 2. act = silu(g) * u
             {
@@ -7111,6 +7124,7 @@ where
                     0,
                     &mut args,
                 )?;
+                dec_exp_kprof::mark(dec_exp_kprof::SILU);
             }
             // 3. down (expert ごとの act を読む)
             {
@@ -7141,6 +7155,7 @@ where
                     0,
                     &mut args,
                 )?;
+                dec_exp_kprof::mark(dec_exp_kprof::DOWN);
             }
             // 4. 同期は 1 回だけ (層あたり)。task 150 の overlap 経路では D2H を
             //    非同期で先に出し、`middle` (CPU ミス) を挟んでから同期する。
@@ -7155,6 +7170,7 @@ where
                     "cuMemcpyDtoHAsync (iq layer overlap)",
                 )?;
                 crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+                dec_exp_kprof::mark(dec_exp_kprof::D2H);
             } else {
                 // task 155: 逐次版も null ストリームぶんだけをイベントで待つ。
                 sync_default_or_ctx(ctx, dec_overlap_enabled())?;
@@ -7171,9 +7187,12 @@ where
         } else {
             let got: Vec<f32> = sc.h.as_ref().expect("確保済み").to_vec(nh)?;
             out_h[..nh].copy_from_slice(&got);
+            dec_exp_kprof::mark(dec_exp_kprof::D2H);
             middle()?;
         }
         dbg_d2h(nh * 4);
+        // ここまでで GPU は同期済み (両経路とも) = イベントが完了している。
+        dec_exp_kprof::end_layer();
         Ok(())
     })?;
     Ok(true)
@@ -14093,16 +14112,23 @@ pub fn shared_gemv_finish(p: &mut SharedPending, outs: &mut [&mut [f32]]) -> boo
             s.broken = true;
             return false;
         };
-        if unsafe { event_sync(ev) } != CUDA_SUCCESS {
-            let _ = shared_overlap_drain(&mut s);
-            s.broken = true;
-            OVERLAP_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return false;
+        // task 187: 台帳の副区間 (join の待ち / 写し)。
+        {
+            let _w = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_SH_WAIT);
+            if unsafe { event_sync(ev) } != CUDA_SUCCESS {
+                let _ = shared_overlap_drain(&mut s);
+                s.broken = true;
+                OVERLAP_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
         }
-        for (i, out) in outs.iter_mut().enumerate().take(n) {
-            let len = s.slots[i].n;
-            let pin = s.slots[i].pin_o.as_ref().expect("ensure 済み");
-            out[..len].copy_from_slice(&pin.as_slice::<f32>()[..len]);
+        {
+            let _c = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_SH_COPY);
+            for (i, out) in outs.iter_mut().enumerate().take(n) {
+                let len = s.slots[i].n;
+                let pin = s.slots[i].pin_o.as_ref().expect("ensure 済み");
+                out[..len].copy_from_slice(&pin.as_slice::<f32>()[..len]);
+            }
         }
         s.in_flight = 0;
         s.pins.clear();
@@ -34943,6 +34969,208 @@ pub mod gdn_pf_kprof {
         });
         // イベントは先頭から使い直す (プールは数十本で足りる)。
         P.with(|c| c.borrow_mut().used = 0);
+    }
+}
+
+// ===========================================================================
+// task 187: decode の IQ expert 段 (1 層 4 起動 + D2H) の GPU 時間をイベントで
+// 段ごとに測る。`DENNO_Q4_PROFILE` のときだけ動く (台帳と同じ窓)。
+//
+// 目的 (task 187 の表): 「experts の gpu 3.3 ms は expert 数とカーネルごとに
+// いくらか」を実測で割る。ヒット本数ごとの層数も一緒に積む。
+// ===========================================================================
+pub mod dec_exp_kprof {
+    use super::*;
+
+    /// 段の番号 (この順で 1 行に出す)。
+    pub const GATE: usize = 0;
+    pub const UP: usize = 1;
+    pub const SILU: usize = 2;
+    pub const DOWN: usize = 3;
+    pub const D2H: usize = 4;
+    pub const N: usize = 5;
+    pub const NAMES: [&str; N] = ["gate", "up", "silu", "down", "d2h"];
+    /// ヒット本数の上限 (n_expert_used = 10 まで数える)。
+    pub const MAX_HITS: usize = 10;
+
+    static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static CNT: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// ヒット本数ごとの層数と合計 ns。
+    static BUCKET_N: [AtomicU64; MAX_HITS + 1] = [const { AtomicU64::new(0) }; MAX_HITS + 1];
+    static BUCKET_NS: [AtomicU64; MAX_HITS + 1] = [const { AtomicU64::new(0) }; MAX_HITS + 1];
+
+    /// 計測するか (台帳と同じ `DENNO_Q4_PROFILE`。テストの強制も含む)。
+    pub fn on() -> bool {
+        crate::model::q4ledger::enabled()
+    }
+
+    /// 積算を 0 に戻す。
+    pub fn reset() {
+        for i in 0..N {
+            NS[i].store(0, Ordering::Relaxed);
+            CNT[i].store(0, Ordering::Relaxed);
+        }
+        for i in 0..=MAX_HITS {
+            BUCKET_N[i].store(0, Ordering::Relaxed);
+            BUCKET_NS[i].store(0, Ordering::Relaxed);
+        }
+        POOL_DEAD.with(|d| d.set(false));
+    }
+
+    /// 1 行にまとめる (1 本も打っていなければ `None`)。
+    pub fn lines() -> Vec<String> {
+        if !on() {
+            return Vec::new();
+        }
+        let cnt: u64 = CNT.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        if cnt == 0 {
+            return Vec::new();
+        }
+        let mut s = String::from("[dec-exp-kprof] 層内の GPU 時間 (イベント計測)");
+        for i in 0..N {
+            let ns = NS[i].load(Ordering::Relaxed);
+            let n = CNT[i].load(Ordering::Relaxed);
+            if n == 0 {
+                continue;
+            }
+            s.push_str(&format!(
+                " | {} {:.2}ms/{:.0} ({:.1}us/層)",
+                NAMES[i],
+                ns as f64 / 1e6,
+                n,
+                ns as f64 / 1e3 / n as f64
+            ));
+        }
+        let mut out = vec![s];
+        let mut b = String::from("[dec-exp-kprof] ヒット本数ごと (層数 / 合計 ms / 1 層 us)");
+        for h in 0..=MAX_HITS {
+            let n = BUCKET_N[h].load(Ordering::Relaxed);
+            if n == 0 {
+                continue;
+            }
+            let ns = BUCKET_NS[h].load(Ordering::Relaxed);
+            b.push_str(&format!(
+                " | h{h} {n}層 {:.2}ms {:.1}us",
+                ns as f64 / 1e6,
+                ns as f64 / 1e3 / n as f64
+            ));
+        }
+        out.push(b);
+        out
+    }
+
+    thread_local! {
+        /// イベントのプール。層ごとに先頭から使い直す。
+        static POOL: std::cell::RefCell<Vec<CUevent>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+        static POOL_USED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// 直前のイベント (段の開始点) と、収集待ちの (段, 入口, 出口)。
+        static LAST: std::cell::Cell<Option<CUevent>> = const { std::cell::Cell::new(None) };
+        static PEND: std::cell::RefCell<Vec<(usize, CUevent, CUevent)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+        /// この層のヒット本数 (end で束へ積む)。
+        static HITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    thread_local! {
+        static POOL_DEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// 層の入口。`hits` は GPU で回した expert 数。
+    pub fn begin_layer(hits: u32) {
+        if !on() {
+            return;
+        }
+        HITS.with(|c| c.set(hits));
+        POOL_USED.with(|c| c.set(0));
+        PEND.with(|c| c.borrow_mut().clear());
+        let ev = record();
+        LAST.with(|c| c.set(ev));
+    }
+
+    /// 段 `item` の終わり (イベントを 1 本打って差を**収集待ち**に積む)。
+    ///
+    /// 経過は [`end_layer`] で読む: overlap 経路では D2H のイベントを同期の
+    /// **前**に打つので、ここで `cuEventElapsedTime` を呼ぶと未完了で失敗する。
+    pub fn mark(item: usize) {
+        if !on() || item >= N {
+            return;
+        }
+        let Some(prev) = LAST.with(|c| c.get()) else {
+            return;
+        };
+        let Some(cur) = record() else { return };
+        PEND.with(|c| c.borrow_mut().push((item, prev, cur)));
+        LAST.with(|c| c.set(Some(cur)));
+    }
+
+    /// 層の出口 (**同期の後**に呼ぶ)。
+    pub fn end_layer() {
+        if !on() {
+            return;
+        }
+        LAST.with(|c| c.set(None));
+        let Some(f) = lib().ok().and_then(|l| l.event_elapsed_time) else {
+            PEND.with(|c| c.borrow_mut().clear());
+            return;
+        };
+        let pend = PEND.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let mut acc = [0u64; N];
+        let mut sum = 0u64;
+        for (item, a, b) in pend {
+            let mut ms = 0.0f32;
+            if unsafe { f(&mut ms, a, b) } == CUDA_SUCCESS && ms.is_finite() && ms >= 0.0 {
+                let ns = (ms as f64 * 1e6) as u64;
+                acc[item] += ns;
+                sum += ns;
+            }
+        }
+        for i in 0..N {
+            if acc[i] == 0 {
+                continue;
+            }
+            NS[i].fetch_add(acc[i], Ordering::Relaxed);
+            CNT[i].fetch_add(1, Ordering::Relaxed);
+        }
+        let h = (HITS.with(|c| c.get()) as usize).min(MAX_HITS);
+        BUCKET_N[h].fetch_add(1, Ordering::Relaxed);
+        BUCKET_NS[h].fetch_add(sum, Ordering::Relaxed);
+    }
+
+    /// イベントを 1 本打つ (プールから取る)。
+    fn record() -> Option<CUevent> {
+        if !on() || POOL_DEAD.with(|d| d.get()) {
+            return None;
+        }
+        let Some(rec) = lib().ok().and_then(|l| l.event_record) else {
+            POOL_DEAD.with(|d| d.set(true));
+            return None;
+        };
+        POOL.with(|c| {
+            let mut p = c.borrow_mut();
+            let i = POOL_USED.with(|u| u.get());
+            if i >= p.len() {
+                let Some(create) = lib().ok().and_then(|l| l.event_create) else {
+                    POOL_DEAD.with(|d| d.set(true));
+                    return None;
+                };
+                let mut ev: CUevent = std::ptr::null_mut();
+                // CU_EVENT_DEFAULT (0) = 計時有効。
+                if unsafe { create(&mut ev, 0) } != CUDA_SUCCESS || ev.is_null() {
+                    POOL_DEAD.with(|d| d.set(true));
+                    return None;
+                }
+                p.push(ev);
+            }
+            POOL_USED.with(|u| u.set(i + 1));
+            let ev = p[i];
+            if unsafe { rec(ev, std::ptr::null_mut()) } != CUDA_SUCCESS {
+                POOL_DEAD.with(|d| d.set(true));
+                return None;
+            }
+            Some(ev)
+        })
     }
 }
 
