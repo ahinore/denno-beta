@@ -10248,6 +10248,11 @@ pub(crate) fn pf_full_dev_from_value(v: Option<&str>) -> bool {
 
 /// task 172: full attention 層の 1 チャンクを「入力 1 H2D / 出力 1 D2H」で
 /// 閉じるか (`DENNO_PF_FULL_DEV`、既定 off)。
+///
+/// task 175 (lab t175b) の実測: int-auto + br172 + br176 の既定 (base) に対し
+/// cold prefill 3,826 tok 17.76 → 17.41 s (-2.0%)、14,018 tok 60.05 → 57.73 s
+/// (-3.9%)、decode と 19 トークン next turn は ±2% 以内、errors 0・text sane。
+/// 目標 (-10%) に届かないので **off のまま**。理由は REPORT_P175.md。
 pub(crate) fn pf_full_dev_on() -> bool {
     if let Some(v) = pf2_forced(PF2_GATE_FULL) {
         return v;
@@ -10263,6 +10268,11 @@ pub(crate) fn pf_shared_dev_from_value(v: Option<&str>) -> bool {
 
 /// task 172: shared expert の 3 射影を 1 チャンクぶんデバイスで回すか
 /// (`DENNO_PF_SHARED_DEV`、既定 off)。
+///
+/// task 175 (lab t175b) の実測: 同じ base に対し cold prefill 3,826 tok
+/// 17.76 → 17.35 s (-2.3%)、14,018 tok 60.05 → 57.50 s (-4.2%)、出力は
+/// base と md5 一致 (丸めも同じ)、errors 0。目標 (-10%) に届かないので
+/// **off のまま**。理由は REPORT_P175.md。
 pub(crate) fn pf_shared_dev_on() -> bool {
     if let Some(v) = pf2_forced(PF2_GATE_SHARED) {
         return v;
