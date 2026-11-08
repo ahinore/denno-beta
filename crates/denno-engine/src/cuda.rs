@@ -12475,6 +12475,37 @@ mod pf_tc_tests {
         }
     }
 
+    /// task 175: テンソルコア経路の選択は **型** も見る。
+    ///
+    /// v1 カーネル (`dno_gemm_tc_q8_0_w`) は Q8_0 専用。Q4_K / Q5_K / Q5_1 の
+    /// 重みを渡すとバイト列を Q8_0 として読むので出力が壊れる。lab t175a では
+    /// shared expert の gate が Q4_K だったため、br172 の `pf2_gemm` が形だけで
+    /// v1 を選び、prefill の出力が全部 `!` になった。
+    #[test]
+    fn pf2_tc_kind_respects_weight_type() {
+        use crate::kquant::GgmlType as T;
+        // shared expert の実形 (gate/up = 2560→640 / down = 640→2560)。
+        // N が小さいので v2 の対象外。Q4_K を v1 に流してはいけない。
+        assert_eq!(
+            pf2_tc_kind(T::Q4K, 512, 2560, 640),
+            0,
+            "Q4_K を Q8_0 専用の v1 に流した"
+        );
+        assert_eq!(pf2_tc_kind(T::Q5K, 512, 2560, 640), 0);
+        assert_eq!(pf2_tc_kind(T::Q5_1, 512, 2560, 640), 0);
+        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 2560, 640), 1, "Q8_0 は v1");
+        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 640, 2560), 1);
+        // N >= TC2_MIN_N (4096) は v2 (Q8_0 / Q4_K / Q5_K を型で切り替える)。
+        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 2560, 10240), 2);
+        assert_eq!(pf2_tc_kind(T::Q4K, 512, 2560, 10240), 2);
+        assert_eq!(pf2_tc_kind(T::Q5K, 512, 2560, 10240), 2);
+        // v2 が扱えない型は v1 にも流さない (従来カーネルへ)。
+        assert_eq!(pf2_tc_kind(T::Q5_1, 512, 2560, 10240), 0);
+        // 形が前提に合わないものは従来。
+        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 2559, 640), 0);
+        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 2560, 641), 0);
+    }
+
     /// タイルの索引算術を CPU ミラーで確かめる (`kernels_gemm_tc.cu` の
     /// デコード配置・warp の担当範囲・書き出し条件を 1 対 1 で写す)。
     ///
@@ -15244,8 +15275,13 @@ enum PfWKind {
     Bf16,
     /// `dno_gemm_f32_mt` (f32 に展開済み / 元から F32)。
     F32,
-    /// `dno_gemm_q8_0` 系 (`f_gemm_q` の添字, 1 行の生バイト数, 量子ブロック長)。
-    Quant(usize, usize, usize),
+    /// 量子型 (`f_gemm_q` の添字, 1 行の生バイト数, 量子ブロック長) と **型そのもの**。
+    ///
+    /// 型を持つのはテンソルコア GEMM の選択に要るため (task 175)。v1 カーネル
+    /// (`dno_gemm_tc_q8_0_w`) は Q8_0 専用で、Q4_K / Q5_1 の重みを渡すと別の型
+    /// として読んで出力が壊れる (lab t175a で実際に踏んだ: shared expert の
+    /// gate は Q4_K)。
+    Quant(crate::kquant::GgmlType, usize, usize, usize),
 }
 
 /// 重み 1 本を常駐させる。
@@ -15306,7 +15342,7 @@ fn pf_weight(l: PfLin<'_>, want_bf16: bool) -> Option<(CUdeviceptr, PfWKind)> {
                 return None;
             }
             match weights_for_gguf(l.uid, ty, l.blocks, l.k, l.n) {
-                Ok(w) => Some((w.buf.ptr(), PfWKind::Quant(slot, rb, blk))),
+                Ok(w) => Some((w.buf.ptr(), PfWKind::Quant(ty, slot, rb, blk))),
                 Err(e) => {
                     tracing::info!("[pf] 量子重みの常駐に失敗 (uid={}): {e:#}", l.uid);
                     None
@@ -15463,7 +15499,7 @@ pub fn pf_mix(
                             .map_err(|e| format!("gemm launch: {e:#}"))?;
                     }
                 }
-                PfWKind::Quant(slot, rb, blk) => {
+                PfWKind::Quant(_ty, slot, rb, blk) => {
                     // 量子 GEMM は 1 起動 128 トークンまで (`moe_gemm_dev` と同じ)。
                     let f = ctx
                         .f_gemm_q
@@ -15690,6 +15726,867 @@ fn mix_gpu_weight(uid: u64, bytes: &[u8], k: usize, n: usize, want_bf16: bool) -
             );
             map.insert(uid, MixGpuW { buf, k, n, bf16: want_bf16 });
             Ok(MixW { ptr: p })
+        }
+    }
+}
+
+// ===========================================================================
+// task 172: prefill の full attention / shared expert / PLE をデバイス連鎖で回す
+// (`DENNO_PF_FULL_DEV` / `DENNO_PF_SHARED_DEV` / `DENNO_PF_PLE_GPU`)
+// ===========================================================================
+//
+// lab t169b (int-auto 既定・14,018 トークン cold prefill = 69.57 s) の台帳:
+// - full 9,765 ms: sync 1,724 回 (gpu 4,328 ms)・cpu 4,072 ms・h2d 11.8 GB / d2h 14.8 GB。
+//   中身は qkv 3 行列 (TC GEMM 各 1 同期) + attention (1 同期) + 出力投影 (1 同期) で、
+//   トークンごとの split_q_gate / per-head RMSNorm / rope / 出力ゲートが全部 CPU。
+// - shared 6,455 ms: sync 7,476 回 (gpu 3,496 ms)・cpu 1,685 ms・h2d 15.5 GB / d2h 10.3 GB。
+//   gate / up / down の 3 GEMM をそれぞれ H2D → 同期 → D2H し、silu と積は CPU。
+// - other のうち ple 2,676 ms (SSD の pread) と gemm_cpu 1,287 ms (PLE の key/value 射影)。
+//
+// ここでは**チャンクぶんの活性を GPU に置いたまま** stage を閉じる:
+// - full:   1 H2D (入力行) → qkv 3 GEMM → qknorm+rope → (k/v だけ D2H) → attention →
+//           出力ゲート → 出力投影 → 1 D2H。同期は 2 回 (k/v をホストの KV に積むため)。
+// - shared: 1 H2D → gate/up GEMM → swiglu (elem の既存カーネル) → down GEMM → 1 D2H。
+// - ple:    1 H2D (集めた行) → key/value の 2 GEMM → 1 D2H (残りは CPU のまま)。
+//
+// 数値: GEMM は既存の TC 経路と同じ (BF16 丸め)、qknorm/rope/出力ゲートは CPU と
+// 同じ式・同じ順 (`__*_rn` を明示・-fmad=false)。expf だけ CUDA の libm なので
+// CPU の glibc expf と 1 ULP ずれうる = prefill の md5 は変わりうる
+// (prefill の射影はビット一致契約の外。decode はこの経路を通らない)。
+//
+// すべて fail closed: PTX が無い / 形が違う / 重みが VRAM に載らない / 起動に失敗、
+// のどれでも `false` を返し、呼び出し側は従来経路をそのまま走らせる。
+
+/// 連鎖を使う最小の行数。これ未満 (19 トークンの next turn prefill など) は
+/// 従来経路のほうが速いので切り替えない。
+const PF2_MIN_ROWS: usize = 64;
+
+/// 連鎖が動かなかった理由を 1 行だけ出す (プロセスで 1 回)。
+static PF2_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn pf2_warn(msg: &str) {
+    if !PF2_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!("[pf2] {msg} → 従来経路");
+        eprintln!("[pf2] {msg} → 従来経路");
+    }
+}
+
+/// 発火の集計 (テストと lab の切り分け用)。0=full 成立 / 1=full 断念 /
+/// 2=shared 成立 / 3=shared 断念 / 4=ple 成立 / 5=ple 断念。
+pub static PF2_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// [`PF2_STATS`] の読み出し。
+pub fn pf2_stats() -> [u64; 6] {
+    let mut out = [0u64; 6];
+    for (i, c) in PF2_STATS.iter().enumerate() {
+        out[i] = c.load(Ordering::Relaxed);
+    }
+    out
+}
+
+/// [`PF2_STATS`] を 0 に戻す。
+pub fn pf2_stats_reset() {
+    for c in PF2_STATS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn pf2_note(idx: usize) {
+    let n = PF2_STATS[idx].fetch_add(1, Ordering::Relaxed);
+    // 成立した stage は最初の 1 回だけ 1 行出す (lab のログで発火を確認するため)。
+    if idx % 2 == 0 && n == 0 {
+        eprintln!(
+            "[pf2] {} 連鎖 発火 (nt={})",
+            ["full", "full", "shared", "shared", "ple", "ple"][idx.min(5)],
+            pf2_last_nt()
+        );
+    }
+}
+
+thread_local! {
+    /// 直前の連鎖呼び出しの行数 (ログ用)。
+    static PF2_LAST_NT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn pf2_last_nt() -> usize {
+    PF2_LAST_NT.with(|c| c.get())
+}
+
+/// ログ用に行数を控える (`pf_full_qkv` / `pf_shared` / `pf_ple_proj` の入口)。
+fn pf2_set_nt(nt: usize) {
+    PF2_LAST_NT.with(|c| c.set(nt));
+}
+
+/// 呼び出し側 (モデル層) の入口で断念したことを数える。
+///
+/// `0` = full の成立 / `1` = full の断念 / `2`/`3` = shared / `4`/`5` = ple。
+/// 形状や重みの融合など、ここでしか分からない理由で落ちたとき用。
+pub fn pf2_decline(idx: usize) {
+    pf2_note(idx.min(5));
+}
+
+// ---------------------------------------------------------------------------
+// カーネル (実行時読み込み。無ければ fail closed)
+// ---------------------------------------------------------------------------
+
+const PF2_NAMES: [&[u8]; 2] = [b"dno_pf2_qknorm_rope\0", b"dno_pf2_gate_mul\0"];
+
+struct Pf2Kernels {
+    /// モジュールは生かしておく必要がある (関数ハンドルの持ち主)。
+    #[allow(dead_code)]
+    module: CUmodule,
+    qknorm_rope: CUfunction,
+    gate_mul: CUfunction,
+}
+
+unsafe impl Send for Pf2Kernels {}
+unsafe impl Sync for Pf2Kernels {}
+
+/// PTX の置き場所。`DENNO_PF2_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_pf2.ptx`。
+fn pf2_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF2_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_pf2.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+/// **current context を張った後に呼ぶこと**。
+fn pf2_kernels() -> Option<&'static Pf2Kernels> {
+    static K: OnceLock<Option<Pf2Kernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = pf2_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                pf2_warn(&format!("PTX が読めない ({}) : {e}", path.display()));
+                return None;
+            }
+        };
+        image.push(0);
+        let lib = match lib() {
+            Ok(l) => l,
+            Err(_) => return None,
+        };
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                pf2_warn("cuModuleLoadData 失敗");
+                return None;
+            }
+            let mut fns: [CUfunction; 2] = [std::ptr::null_mut(); 2];
+            for (i, name) in PF2_NAMES.iter().enumerate() {
+                if (lib.module_get_function)(&mut fns[i], module, name.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    pf2_warn(&format!(
+                        "PTX に {} が無い",
+                        String::from_utf8_lossy(&name[..name.len() - 1])
+                    ));
+                    return None;
+                }
+            }
+            Some(Pf2Kernels {
+                module,
+                qknorm_rope: fns[0],
+                gate_mul: fns[1],
+            })
+        }
+    })
+    .as_ref()
+}
+
+// ---------------------------------------------------------------------------
+// 作業域 (thread_local, grow-only)
+// ---------------------------------------------------------------------------
+
+struct Pf2Dev {
+    x: Option<DevBuffer>,   // [nt][e]
+    qg: Option<DevBuffer>,  // [nt][2*heads*dh]  (attn_q の生の射影)
+    q: Option<DevBuffer>,   // [nt][heads*dh]    (norm+rope 済み)
+    kd: Option<DevBuffer>,  // [nt][kv_dim]
+    vd: Option<DevBuffer>,  // [nt][kv_dim]
+    att: Option<DevBuffer>, // [nt][heads*dh]
+    o: Option<DevBuffer>,   // [nt][e]
+    cs: Option<DevBuffer>,  // [nt][n_rot]
+    qn: Option<DevBuffer>,  // [dh]
+    kn: Option<DevBuffer>,  // [dh]
+    ga: Option<DevBuffer>,  // [nt][sff] (shared の gate)
+    gu: Option<DevBuffer>,  // [nt][sff] (shared の up)
+    sh: Option<DevBuffer>,  // [nt][e]   (shared の down 出力)
+}
+
+impl Pf2Dev {
+    const fn new() -> Self {
+        Self {
+            x: None,
+            qg: None,
+            q: None,
+            kd: None,
+            vd: None,
+            att: None,
+            o: None,
+            cs: None,
+            qn: None,
+            kn: None,
+            ga: None,
+            gu: None,
+            sh: None,
+        }
+    }
+}
+
+thread_local! {
+    static PF2_DEV: std::cell::RefCell<Pf2Dev> = const { std::cell::RefCell::new(Pf2Dev::new()) };
+}
+
+/// 必要バイト数まで育てる (grow-only。中身は保証しない)。
+fn pf2_ensure(slot: &mut Option<DevBuffer>, bytes: usize) -> Result<()> {
+    let need = bytes.max(4);
+    if slot.as_ref().map(|b| b.bytes()).unwrap_or(0) < need {
+        *slot = Some(DevBuffer::alloc_tagged(need, crate::mem_audit::TAG_GEMV)?);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 同期しないデバイス GEMM
+// ---------------------------------------------------------------------------
+
+/// task 175: `pf2_gemm` が選ぶテンソルコア経路 (純関数)。0 = 従来、1 = v1、2 = v2。
+///
+/// **型を必ず見る**のが要点。v1 カーネル (`dno_gemm_tc_q8_0_w`) は Q8_0 専用で、
+/// Q4_K / Q5_1 の重みを渡すとバイト列を別の型として読む (= 出力が壊れる)。
+/// task 172 の `pf2_gemm` は形だけで v1 を選んでいたため、shared expert の
+/// gate (このモデルでは Q4_K) が壊れ、prefill の出力が全部 `!` になった
+/// (lab t175a)。v2 は Q8_0 / Q4_K / Q5_K を型で切り替える。
+///
+/// 環境ゲート (`DENNO_PF_TC_GEMM` / `DENNO_PF_TC_GEMM2`) は呼び出し側で見る。
+pub(crate) fn pf2_tc_kind(
+    ty: crate::kquant::GgmlType,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+) -> u8 {
+    if pf_tc2_eligible(ty, nt, n_in, n_out, 1) {
+        2
+    } else if matches!(ty, crate::kquant::GgmlType::Q8_0) && pf_tc_gemm_eligible(nt, n_in, n_out, 1)
+    {
+        1
+    } else {
+        0
+    }
+}
+
+/// 1 行列ぶんのデバイス GEMM (`x` / `y` はデバイス。**同期しない**)。
+///
+/// 型と形が tensor core の前提に合えば `kernels_gemm_tc` / `kernels_gemm_tc2` を
+/// 1 起動 (2,048 行まで)、合わなければ従来の量子 GEMM (`f_gemm_q`) を 128 行ずつ
+/// 並べる。どちらも起動を並べるだけで、待つのは呼び出し側の最後の 1 回。
+#[allow(clippy::too_many_arguments)]
+fn pf2_gemm(
+    ctx: &CudaCtx,
+    w: CUdeviceptr,
+    kind: PfWKind,
+    x: CUdeviceptr,
+    y: CUdeviceptr,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+) -> Result<()> {
+    let PfWKind::Quant(ty, slot, rb, blk) = kind else {
+        bail!("pf2_gemm: 量子型の重みだけを受ける")
+    };
+    if nt == 0 || n_in == 0 || n_out == 0 || n_in % blk != 0 {
+        bail!("pf2_gemm: 形が不正 (nt={nt}, n_in={n_in}, n_out={n_out}, blk={blk})");
+    }
+    // 1. v2 (Q8_0 / Q4_K / Q5_K。型ごとにカーネルを選ぶ)。
+    if pf2_tc_kind(ty, nt, n_in, n_out) == 2 && pf_tc2_gemm_on() {
+        if let Some(tc2) = tc2_gemm_kernels() {
+            return tc2_gemm_launch(ctx, tc2, ty, w, x, y, nt, n_in, n_out, rb);
+        }
+    }
+    // 2. v1 (Q8_0 専用)。
+    if matches!(ty, crate::kquant::GgmlType::Q8_0)
+        && pf_tc_gemm_on()
+        && pf_tc_gemm_eligible(nt, n_in, n_out, 1)
+    {
+        if let Some(tc) = tc_gemm_kernels() {
+            return tc_gemm_launch(ctx, tc, w, x, y, nt, n_in, n_out, rb);
+        }
+    }
+    // 3. 従来の量子 GEMM (型ごとのスロット)。
+    let fs = ctx
+        .f_gemm_q
+        .ok_or_else(|| anyhow!("量子 GEMM カーネルが無い"))?;
+    let f = fs[slot.min(fs.len() - 1)];
+    const ROWS: usize = 16;
+    const NTG_MAX: usize = 8;
+    let shmem = (ROWS * blk * 4) as u32;
+    let grid = (((n_out + ROWS - 1) / ROWS) as u32, 1, 1);
+    let step = ROWS * NTG_MAX;
+    let mut t0 = 0usize;
+    while t0 < nt {
+        let m = (nt - t0).min(step);
+        let (mut pw, mut px, mut py) = (
+            w,
+            x + (t0 * n_in * 4) as CUdeviceptr,
+            y + (t0 * n_out * 4) as CUdeviceptr,
+        );
+        let (mut m_c, mut ni_c, mut no_c, mut rb_c) =
+            (m as c_int, n_in as c_int, n_out as c_int, rb as c_int);
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut py as *mut _ as *mut c_void,
+            &mut m_c as *mut _ as *mut c_void,
+            &mut ni_c as *mut _ as *mut c_void,
+            &mut no_c as *mut _ as *mut c_void,
+            &mut rb_c as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            ctx.launch_async(f, grid, (ROWS as u32, 16, 1), shmem, &mut args)?;
+        }
+        t0 += m;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// full attention の前半: qkv 射影 + per-head RMSNorm + partial NeoX rope
+// ---------------------------------------------------------------------------
+
+/// task 172: full 層 1 チャンクの前半をデバイスで回す。
+///
+/// 入力行 `x` を 1 回だけ H2D し、`attn_q` / `attn_k` / `attn_v` の 3 射影を
+/// デバイスで続けて撃ち、q と k に per-head RMSNorm + partial NeoX rope を掛ける。
+/// その後 k / v だけをホストへ戻して KV ミラーへ積む (ホストの `AttnCache` が
+/// 正で、decode はそれを読む)。q (と gate) はデバイスに残す。
+///
+/// 戻り値 `false` は「この形/環境では連鎖を使わない」。呼び出し側は従来経路を
+/// そのまま走らせる (副作用なし)。
+#[allow(clippy::too_many_arguments)]
+pub fn pf_full_qkv(
+    x: &[f32],
+    nt: usize,
+    e: usize,
+    q: PfLin<'_>,
+    k: PfLin<'_>,
+    v: PfLin<'_>,
+    q_norm: &[f32],
+    k_norm: &[f32],
+    cs: &[f32],
+    heads: usize,
+    kv_heads: usize,
+    dh: usize,
+    n_rot: usize,
+    eps: f32,
+    cache_id: u64,
+    n_layer: usize,
+    layer: usize,
+    gen: u64,
+    t_total: usize,
+    k_out: &mut [f32],
+    v_out: &mut [f32],
+) -> bool {
+    pf2_set_nt(nt);
+    let qd = heads * dh;
+    let kv = kv_heads * dh;
+    let ok_shape = nt >= PF2_MIN_ROWS
+        && e > 0
+        && dh >= ATTN_PF_BQ
+        && dh <= 1024
+        && n_rot % 2 == 0
+        && n_rot <= dh
+        && x.len() == nt * e
+        && k_out.len() == nt * kv
+        && v_out.len() == nt * kv
+        && q_norm.len() == dh
+        && k_norm.len() == dh
+        && cs.len() == nt * n_rot
+        && q.k == e
+        && q.n == 2 * qd
+        && k.k == e
+        && k.n == kv
+        && v.k == e
+        && v.n == kv
+        && t_total >= nt;
+    if !ok_shape {
+        pf2_note(1);
+        return false;
+    }
+    if !attn_prefill_shape_ok(nt, dh, t_total, ATTN_Q4_PF_MIN_ROWS) {
+        pf2_note(1);
+        return false;
+    }
+    let Some(kr) = pf2_kernels() else {
+        pf2_note(1);
+        return false;
+    };
+    let Some(ctx) = shared_ctx() else {
+        pf2_note(1);
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        pf2_note(1);
+        return false;
+    }
+    let (Some((pq, pq_k)), Some((pk, pk_k)), Some((pv, pv_k))) =
+        (pf_weight(q, false), pf_weight(k, false), pf_weight(v, false))
+    else {
+        pf2_note(1);
+        return false;
+    };
+    let r = PF2_DEV.with(|cell| -> Result<()> {
+        let mut d = cell.borrow_mut();
+        pf2_ensure(&mut d.x, nt * e * 4)?;
+        pf2_ensure(&mut d.qg, nt * 2 * qd * 4)?;
+        pf2_ensure(&mut d.q, nt * qd * 4)?;
+        pf2_ensure(&mut d.kd, nt * kv * 4)?;
+        pf2_ensure(&mut d.vd, nt * kv * 4)?;
+        pf2_ensure(&mut d.cs, nt * n_rot * 4)?;
+        pf2_ensure(&mut d.qn, dh * 4)?;
+        pf2_ensure(&mut d.kn, dh * 4)?;
+        let xb = d.x.as_ref().expect("ensure 済み");
+        let qgb = d.qg.as_ref().expect("ensure 済み");
+        let qb = d.q.as_ref().expect("ensure 済み");
+        let kdb = d.kd.as_ref().expect("ensure 済み");
+        let vdb = d.vd.as_ref().expect("ensure 済み");
+        let csb = d.cs.as_ref().expect("ensure 済み");
+        let qnb = d.qn.as_ref().expect("ensure 済み");
+        let knb = d.kn.as_ref().expect("ensure 済み");
+        xb.copy_from(x)?;
+        csb.copy_from(cs)?;
+        qnb.copy_from(q_norm)?;
+        knb.copy_from(k_norm)?;
+        // 1. q / k / v の射影 (デバイス。同期しない)
+        pf2_gemm(ctx, pq, pq_k, xb.ptr(), qgb.ptr(), nt, e, 2 * qd)?;
+        pf2_gemm(ctx, pk, pk_k, xb.ptr(), kdb.ptr(), nt, e, kv)?;
+        pf2_gemm(ctx, pv, pv_k, xb.ptr(), vdb.ptr(), nt, e, kv)?;
+        // 2. q: [q|gate] 融合の生出力 → (norm+rope 済み q) へ詰め替え
+        {
+            let shmem = (dh * 4) as u32;
+            let (mut src, mut dst, mut w, mut tab) =
+                (qgb.ptr(), qb.ptr(), qnb.ptr(), csb.ptr());
+            let (mut x_stride, mut hstride, mut out_stride) =
+                ((2 * qd) as c_int, (2 * dh) as c_int, qd as c_int);
+            let (mut cols, mut nrot) = (dh as c_int, n_rot as c_int);
+            let mut eps_c = eps;
+            let mut args = [
+                &mut src as *mut _ as *mut c_void,
+                &mut x_stride as *mut _ as *mut c_void,
+                &mut hstride as *mut _ as *mut c_void,
+                &mut w as *mut _ as *mut c_void,
+                &mut tab as *mut _ as *mut c_void,
+                &mut dst as *mut _ as *mut c_void,
+                &mut out_stride as *mut _ as *mut c_void,
+                &mut cols as *mut _ as *mut c_void,
+                &mut nrot as *mut _ as *mut c_void,
+                &mut eps_c as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                ctx.launch_async(
+                    kr.qknorm_rope,
+                    (nt as u32, heads as u32, 1),
+                    (dh as u32, 1, 1),
+                    shmem,
+                    &mut args,
+                )?;
+            }
+        }
+        // 3. k: 同じカーネルを in-place で (kv_heads 本)
+        {
+            let shmem = (dh * 4) as u32;
+            let (mut src, mut dst, mut w, mut tab) =
+                (kdb.ptr(), kdb.ptr(), knb.ptr(), csb.ptr());
+            let (mut x_stride, mut hstride, mut out_stride) =
+                (kv as c_int, dh as c_int, kv as c_int);
+            let (mut cols, mut nrot) = (dh as c_int, n_rot as c_int);
+            let mut eps_c = eps;
+            let mut args = [
+                &mut src as *mut _ as *mut c_void,
+                &mut x_stride as *mut _ as *mut c_void,
+                &mut hstride as *mut _ as *mut c_void,
+                &mut w as *mut _ as *mut c_void,
+                &mut tab as *mut _ as *mut c_void,
+                &mut dst as *mut _ as *mut c_void,
+                &mut out_stride as *mut _ as *mut c_void,
+                &mut cols as *mut _ as *mut c_void,
+                &mut nrot as *mut _ as *mut c_void,
+                &mut eps_c as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                ctx.launch_async(
+                    kr.qknorm_rope,
+                    (nt as u32, kv_heads as u32, 1),
+                    (dh as u32, 1, 1),
+                    shmem,
+                    &mut args,
+                )?;
+            }
+        }
+        ctx.sync()?;
+        // 4. k / v だけ戻す (ホストの KV が正)
+        let kgot: Vec<f32> = kdb.to_vec(nt * kv)?;
+        k_out.copy_from_slice(&kgot);
+        let vgot: Vec<f32> = vdb.to_vec(nt * kv)?;
+        v_out.copy_from_slice(&vgot);
+        // 5. ミラーへの追記はここではやらない。この関数が持っている k/v は
+        //    チャンクぶん (nt 行) だけで、ミラーは `[0..t_total)` を要求する。
+        //    呼び出し側がホストの KV へ積んだあと、`pf_full_out` が
+        //    キャッシュ全体を渡して追記する (転送内容は従来経路と同じ)。
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            pf2_note(0);
+            true
+        }
+        Err(e) => {
+            pf2_warn(&format!("full qkv: {e:#}"));
+            pf2_note(1);
+            false
+        }
+    }
+}
+
+/// task 172: full 層 1 チャンクの後半 (attention → 出力ゲート → 出力投影)。
+///
+/// `pf_full_qkv` がデバイスに残した q / qg を使う。K/V はミラーから読む
+/// (`k_cpu` / `v_cpu` は台帳を進めるためだけに渡す。既に積んであるので転送は起きない)。
+#[allow(clippy::too_many_arguments)]
+pub fn pf_full_out(
+    cache_id: u64,
+    n_layer: usize,
+    layer: usize,
+    gen: u64,
+    t_total: usize,
+    pos0: usize,
+    nt: usize,
+    heads: usize,
+    group: usize,
+    dh: usize,
+    kv_dim: usize,
+    scale: f32,
+    k_cpu: &[f32],
+    v_cpu: &[f32],
+    wo: PfLin<'_>,
+    e: usize,
+    out: &mut [f32],
+) -> bool {
+    pf2_set_nt(nt);
+    let qd = heads * dh;
+    let ok_shape = nt >= PF2_MIN_ROWS
+        && dh >= ATTN_PF_BQ
+        && dh <= 1024
+        && heads > 0
+        && group > 0
+        && heads % group == 0
+        && kv_dim == (heads / group) * dh
+        && pos0 + nt == t_total
+        && k_cpu.len() >= t_total * kv_dim
+        && v_cpu.len() >= t_total * kv_dim
+        && wo.k == qd
+        && wo.n == e
+        && out.len() == nt * e;
+    if !ok_shape {
+        pf2_note(1);
+        return false;
+    }
+    if !attn_prefill_shape_ok(nt, dh, t_total, ATTN_Q4_PF_MIN_ROWS) {
+        pf2_note(1);
+        return false;
+    }
+    let Some(kr) = pf2_kernels() else {
+        pf2_note(1);
+        return false;
+    };
+    let Some(ctx) = shared_ctx() else {
+        pf2_note(1);
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        pf2_note(1);
+        return false;
+    }
+    let Some((pw, pw_k)) = pf_weight(wo, false) else {
+        pf2_note(1);
+        return false;
+    };
+    let r = (|| -> Result<()> {
+        let (kptr, vptr) =
+            q4_attn_mirror_prepare(cache_id, n_layer, kv_dim, layer, gen, t_total, k_cpu, v_cpu, true)?;
+        PF2_DEV.with(|cell| -> Result<()> {
+            let mut d = cell.borrow_mut();
+            pf2_ensure(&mut d.att, nt * qd * 4)?;
+            pf2_ensure(&mut d.o, nt * e * 4)?;
+            let qgb = d.qg.as_ref().ok_or_else(|| anyhow!("qg が無い"))?;
+            let qb = d.q.as_ref().ok_or_else(|| anyhow!("q が無い"))?;
+            let attb = d.att.as_ref().expect("ensure 済み");
+            let ob = d.o.as_ref().expect("ensure 済み");
+            if qgb.bytes() < nt * 2 * qd * 4 || qb.bytes() < nt * qd * 4 {
+                bail!("q / qg の作業域が小さい (qkv を先に呼ぶこと)");
+            }
+            // 1. attention (K/V はミラー、q はデバイス)
+            {
+                let shmem = (attn_pf_sh_f(dh) * 4) as u32;
+                let (mut qp, mut kp, mut vp, mut ap) =
+                    (qb.ptr(), kptr, vptr, attb.ptr());
+                let (mut heads_c, mut n_c, mut pos0_c) =
+                    (heads as c_int, nt as c_int, pos0 as c_int);
+                let (mut kvd_c, mut t_c, mut group_c, mut dh_c) = (
+                    kv_dim as c_int,
+                    t_total as c_int,
+                    group as c_int,
+                    dh as c_int,
+                );
+                let mut scale_c = scale;
+                let mut args = [
+                    &mut qp as *mut _ as *mut c_void,
+                    &mut kp as *mut _ as *mut c_void,
+                    &mut vp as *mut _ as *mut c_void,
+                    &mut ap as *mut _ as *mut c_void,
+                    &mut heads_c as *mut _ as *mut c_void,
+                    &mut n_c as *mut _ as *mut c_void,
+                    &mut pos0_c as *mut _ as *mut c_void,
+                    &mut kvd_c as *mut _ as *mut c_void,
+                    &mut t_c as *mut _ as *mut c_void,
+                    &mut group_c as *mut _ as *mut c_void,
+                    &mut dh_c as *mut _ as *mut c_void,
+                    &mut scale_c as *mut _ as *mut c_void,
+                ];
+                unsafe {
+                    ctx.launch_async(
+                        ctx.f_attn_pf,
+                        (nt.div_ceil(ATTN_PF_BQ) as u32, heads as u32, 1),
+                        (dh as u32, 1, 1),
+                        shmem,
+                        &mut args,
+                    )?;
+                }
+            }
+            // 2. 出力ゲート (att *= sigmoid(gate))
+            {
+                let (mut ap, mut gptr) = (attb.ptr(), qgb.ptr());
+                let (mut h_c, mut dh_c) = (heads as c_int, dh as c_int);
+                let mut args = [
+                    &mut ap as *mut _ as *mut c_void,
+                    &mut gptr as *mut _ as *mut c_void,
+                    &mut h_c as *mut _ as *mut c_void,
+                    &mut dh_c as *mut _ as *mut c_void,
+                ];
+                unsafe {
+                    ctx.launch_async(
+                        kr.gate_mul,
+                        (nt as u32, heads as u32, 1),
+                        (dh as u32, 1, 1),
+                        0,
+                        &mut args,
+                    )?;
+                }
+            }
+            // 3. 出力投影 (同期しない) → 最後に 1 回だけ待って 1 回で戻す
+            pf2_gemm(ctx, pw, pw_k, attb.ptr(), ob.ptr(), nt, qd, e)?;
+            ctx.sync()?;
+            let got: Vec<f32> = ob.to_vec(nt * e)?;
+            out.copy_from_slice(&got);
+            Ok(())
+        })
+    })();
+    match r {
+        Ok(()) => {
+            pf2_note(0);
+            true
+        }
+        Err(e) => {
+            pf2_warn(&format!("full out: {e:#}"));
+            pf2_note(1);
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// shared expert (gate → silu*up → down) をデバイスで閉じる
+// ---------------------------------------------------------------------------
+
+/// task 172: shared expert の 3 射影を 1 チャンクぶんまとめてデバイスで回す。
+///
+/// `out` には `down_shexp(silu(gate_shexp(x)) * up_shexp(x))` を書く。ゲート
+/// (`gate_inp_shexp`) と sigmoid の足し込みは呼び出し側が従来どおり CPU でやる
+/// (重みが 1 行なので GPU に載せる意味が無い)。
+#[allow(clippy::too_many_arguments)]
+pub fn pf_shared(
+    x: &[f32],
+    nt: usize,
+    e: usize,
+    sff: usize,
+    gate: PfLin<'_>,
+    up: PfLin<'_>,
+    down: PfLin<'_>,
+    out: &mut [f32],
+) -> bool {
+    pf2_set_nt(nt);
+    let ok_shape = nt >= PF2_MIN_ROWS
+        && e > 0
+        && sff > 0
+        && x.len() == nt * e
+        && out.len() == nt * e
+        && gate.k == e
+        && gate.n == sff
+        && up.k == e
+        && up.n == sff
+        && down.k == sff
+        && down.n == e;
+    if !ok_shape {
+        pf2_note(3);
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        pf2_note(3);
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        pf2_note(3);
+        return false;
+    }
+    let (Some((pg, pg_k)), Some((pu, pu_k)), Some((pd, pd_k))) =
+        (pf_weight(gate, false), pf_weight(up, false), pf_weight(down, false))
+    else {
+        pf2_note(3);
+        return false;
+    };
+    let r = PF2_DEV.with(|cell| -> Result<()> {
+        let mut d = cell.borrow_mut();
+        pf2_ensure(&mut d.x, nt * e * 4)?;
+        pf2_ensure(&mut d.ga, nt * sff * 4)?;
+        pf2_ensure(&mut d.gu, nt * sff * 4)?;
+        pf2_ensure(&mut d.sh, nt * e * 4)?;
+        // swiglu の出力は x の領域へ (gate/up を撃ったあとの x はもう不要。
+        // ga を in-place で上書きすると別名になるので避ける)。
+        let xb = d.x.as_ref().expect("ensure 済み");
+        let gab = d.ga.as_ref().expect("ensure 済み");
+        let gub = d.gu.as_ref().expect("ensure 済み");
+        let shb = d.sh.as_ref().expect("ensure 済み");
+        let swb = d.x.as_ref().expect("ensure 済み");
+        xb.copy_from(x)?;
+        pf2_gemm(ctx, pg, pg_k, xb.ptr(), gab.ptr(), nt, e, sff)?;
+        pf2_gemm(ctx, pu, pu_k, xb.ptr(), gub.ptr(), nt, e, sff)?;
+        // swiglu: x = silu(ga) * gu (elem の既存カーネル。CPU と同じ式)
+        {
+            let (mut gp, mut up_p, mut op) = (gab.ptr(), gub.ptr(), swb.ptr());
+            let mut total = (nt * sff) as c_int;
+            let grid = ((nt * sff).div_ceil(256)) as u32;
+            let mut args = [
+                &mut gp as *mut _ as *mut c_void,
+                &mut up_p as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut total as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                ctx.launch_async(ctx.f_swiglu, (grid, 1, 1), (256, 1, 1), 0, &mut args)?;
+            }
+        }
+        pf2_gemm(ctx, pd, pd_k, swb.ptr(), shb.ptr(), nt, sff, e)?;
+        ctx.sync()?;
+        let got: Vec<f32> = shb.to_vec(nt * e)?;
+        out.copy_from_slice(&got);
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            pf2_note(2);
+            true
+        }
+        Err(e) => {
+            pf2_warn(&format!("shared: {e:#}"));
+            pf2_note(3);
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PLE の key / value 射影をデバイスで回す
+// ---------------------------------------------------------------------------
+
+/// task 172: PLE の key / value 射影 (層 1 の 1 チャンク) を GPU で回す。
+///
+/// 表の pread は SSD なので CPU のまま (gather は呼び出し側)。ここは
+/// `gemv_batch_cpu` を置き換えるだけで、値は gemv_batch_cpu と同じ行独立の和。
+pub fn pf_ple_proj(
+    x: &[f32],
+    nt: usize,
+    e: usize,
+    key: PfLin<'_>,
+    value: PfLin<'_>,
+    key_out: &mut [f32],
+    value_out: &mut [f32],
+) -> bool {
+    pf2_set_nt(nt);
+    let ok_shape = nt > 0
+        && e > 0
+        && x.len() == nt * e
+        && key.k == e
+        && key_out.len() == nt * key.n
+        && value.k == e
+        && value_out.len() == nt * value.n;
+    if !ok_shape {
+        pf2_note(5);
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        pf2_note(5);
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        pf2_note(5);
+        return false;
+    }
+    // 量子型 (Q8_0 など) だけを受ける。F32 / BF16 は pf_weight が VRAM に
+    // 載せてしまうので、形の段階で断る (このモデルの ple_key/ple_value は F32)。
+    if !matches!(key.ty, crate::kquant::GgmlType::Q8_0 | crate::kquant::GgmlType::Q5_1 | crate::kquant::GgmlType::Q4K | crate::kquant::GgmlType::Q5K)
+        || !matches!(value.ty, crate::kquant::GgmlType::Q8_0 | crate::kquant::GgmlType::Q5_1 | crate::kquant::GgmlType::Q4K | crate::kquant::GgmlType::Q5K)
+    {
+        pf2_note(5);
+        return false;
+    }
+    let (Some((pk, pk_k)), Some((pv, pv_k))) =
+        (pf_weight(key, false), pf_weight(value, false))
+    else {
+        pf2_note(5);
+        return false;
+    };
+    let r = PF2_DEV.with(|cell| -> Result<()> {
+        let mut d = cell.borrow_mut();
+        pf2_ensure(&mut d.x, nt * e * 4)?;
+        pf2_ensure(&mut d.o, nt * (key.n + value.n) * 4)?;
+        let xb = d.x.as_ref().expect("ensure 済み");
+        let ob = d.o.as_ref().expect("ensure 済み");
+        xb.copy_from(x)?;
+        pf2_gemm(ctx, pk, pk_k, xb.ptr(), ob.ptr(), nt, e, key.n)?;
+        let kn = key.n;
+        pf2_gemm(ctx, pv, pv_k, xb.ptr(), ob.ptr() + (nt * kn * 4) as CUdeviceptr, nt, e, value.n)?;
+        ctx.sync()?;
+        let kk: Vec<f32> = ob.to_vec(nt * kn)?;
+        key_out.copy_from_slice(&kk);
+        let vv: Vec<f32> = ob.view_at(nt * kn * 4, nt * value.n * 4).to_vec(nt * value.n)?;
+        value_out.copy_from_slice(&vv);
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            pf2_note(4);
+            true
+        }
+        Err(e) => {
+            pf2_warn(&format!("ple proj: {e:#}"));
+            pf2_note(5);
+            false
         }
     }
 }

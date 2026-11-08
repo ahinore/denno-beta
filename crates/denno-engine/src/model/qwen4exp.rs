@@ -3027,6 +3027,60 @@ fn pf_lin(w: &GgufLinear) -> crate::cuda::PfLin<'_> {
     }
 }
 
+/// task 172: shared expert の 3 射影をデバイスで回す (`cuda` feature 無しは常に false)。
+#[cfg(feature = "cuda")]
+fn pf_shared_dev_run(lw: &LayerW, xs: &[f32], nt: usize, e: usize, sff: usize, sh: &mut [f32]) -> bool {
+    crate::cuda::pf_shared(
+        xs,
+        nt,
+        e,
+        sff,
+        Self::pf_lin(&lw.gate_shexp),
+        Self::pf_lin(&lw.up_shexp),
+        Self::pf_lin(&lw.down_shexp),
+        sh,
+    )
+}
+
+/// task 172: `cuda` feature 無しの shared 連鎖 (常に従来経路)。
+#[cfg(not(feature = "cuda"))]
+fn pf_shared_dev_run(
+    _lw: &LayerW,
+    _xs: &[f32],
+    _nt: usize,
+    _e: usize,
+    _sff: usize,
+    _sh: &mut [f32],
+) -> bool {
+    false
+}
+
+/// task 172: PLE の key / value 射影をデバイスで回す (`cuda` feature 無しは常に false)。
+#[cfg(feature = "cuda")]
+fn pf_ple_dev_run(
+    pw: &PleW,
+    flat: &[f32],
+    nt: usize,
+    e: usize,
+    key: &mut [f32],
+    value: &mut [f32],
+) -> bool {
+    crate::cuda::pf_ple_proj(flat, nt, e, Self::pf_lin(&pw.key), Self::pf_lin(&pw.value), key, value)
+}
+
+/// task 172: `cuda` feature 無しの PLE 射影 (常に従来経路)。
+#[cfg(not(feature = "cuda"))]
+fn pf_ple_dev_run(
+    _pw: &PleW,
+    _flat: &[f32],
+    _nt: usize,
+    _e: usize,
+    _key: &mut [f32],
+    _value: &mut [f32],
+) -> bool {
+    false
+}
+
 /// task 154: この層の hc mix 6 本が常駐連鎖で回せるか (形と型)。
 ///
 /// 連鎖が使う GEMM は BF16 (model の mix 本体) と F32 (inject 級) の 2 つ。
@@ -4789,11 +4843,19 @@ fn ple_inject_batch(
         flat.extend_from_slice(r);
     }
     let mut key = vec![0.0f32; nt * hc_dim];
-    gemv_batch_cpu(&pw.key, &flat, nt, &mut key)
-        .map_err(|err| one(format!("ple_key (batch): {err}")))?;
     let mut value = vec![0.0f32; nt * e];
-    gemv_batch_cpu(&pw.value, &flat, nt, &mut value)
-        .map_err(|err| one(format!("ple_value (batch): {err}")))?;
+    // task 172: 2 射影 (key / value) を GPU で回す (`DENNO_PF_PLE_GPU`)。
+    // 表の pread は SSD なので CPU のまま (gather は呼び出し側)。
+    let mut ple_dev = false;
+    if pf_ple_gpu_on() {
+        ple_dev = Qwen4Exp::pf_ple_dev_run(pw, &flat, nt, e, &mut key, &mut value);
+    }
+    if !ple_dev {
+        gemv_batch_cpu(&pw.key, &flat, nt, &mut key)
+            .map_err(|err| one(format!("ple_key (batch): {err}")))?;
+        gemv_batch_cpu(&pw.value, &flat, nt, &mut value)
+            .map_err(|err| one(format!("ple_value (batch): {err}")))?;
+    }
     for t in 0..nt {
         let want = last_rms.is_some() && t + 1 == nt;
         let mut contrib = 0.0f32;
@@ -10139,6 +10201,101 @@ pub(crate) fn pf_mix_dev_on() -> bool {
     pf_sub_on(PF_SUB_MIX, "DENNO_PF_MIX_DEV")
 }
 
+// ---------------------------------------------------------------------------
+// task 172: prefill の stage をデバイスで閉じるゲート (3 本)
+// ---------------------------------------------------------------------------
+//
+// どれも **既定 off**。lab で採否を決めたら既定 on にする (採否は task の
+// 規則: cold prefill 3,826 / 14,018 の両方が 10% 以上速い・他が 2% 超悪化しない・
+// text が正常)。off のときは 1 回の env 読み (OnceLock) だけで従来経路。
+
+/// テストが env を立てずに 3 本のゲートを強制するための上書き
+/// (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。番号は [`PF2_GATE_FULL`] など。
+static PF2_FORCE: [std::sync::atomic::AtomicU8; 3] = [const { std::sync::atomic::AtomicU8::new(0) }; 3];
+
+/// task 172: ゲート番号 (full)。
+pub(crate) const PF2_GATE_FULL: usize = 0;
+/// task 172: ゲート番号 (shared)。
+pub(crate) const PF2_GATE_SHARED: usize = 1;
+/// task 172: ゲート番号 (ple)。
+pub(crate) const PF2_GATE_PLE: usize = 2;
+
+/// task 172: テスト専用: ゲートの on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_pf2_for_test(which: usize, v: Option<bool>) {
+    PF2_FORCE[which.min(2)].store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn pf2_forced(which: usize) -> Option<bool> {
+    match PF2_FORCE[which.min(2)].load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+/// task 172: `DENNO_PF_FULL_DEV` の解釈 (純関数)。明示的な真値だけ on。
+pub(crate) fn pf_full_dev_from_value(v: Option<&str>) -> bool {
+    pf_on_from_value(v)
+}
+
+/// task 172: full attention 層の 1 チャンクを「入力 1 H2D / 出力 1 D2H」で
+/// 閉じるか (`DENNO_PF_FULL_DEV`、既定 off)。
+///
+/// task 175 (lab t175b) の実測: int-auto + br172 + br176 の既定 (base) に対し
+/// cold prefill 3,826 tok 17.76 → 17.41 s (-2.0%)、14,018 tok 60.05 → 57.73 s
+/// (-3.9%)、decode と 19 トークン next turn は ±2% 以内、errors 0・text sane。
+/// 目標 (-10%) に届かないので **off のまま**。理由は REPORT_P175.md。
+pub(crate) fn pf_full_dev_on() -> bool {
+    if let Some(v) = pf2_forced(PF2_GATE_FULL) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_full_dev_from_value(std::env::var("DENNO_PF_FULL_DEV").ok().as_deref()))
+}
+
+/// task 172: `DENNO_PF_SHARED_DEV` の解釈 (純関数)。明示的な真値だけ on。
+pub(crate) fn pf_shared_dev_from_value(v: Option<&str>) -> bool {
+    pf_on_from_value(v)
+}
+
+/// task 172: shared expert の 3 射影を 1 チャンクぶんデバイスで回すか
+/// (`DENNO_PF_SHARED_DEV`、既定 off)。
+///
+/// task 175 (lab t175b) の実測: 同じ base に対し cold prefill 3,826 tok
+/// 17.76 → 17.35 s (-2.3%)、14,018 tok 60.05 → 57.50 s (-4.2%)、出力は
+/// base と md5 一致 (丸めも同じ)、errors 0。目標 (-10%) に届かないので
+/// **off のまま**。理由は REPORT_P175.md。
+pub(crate) fn pf_shared_dev_on() -> bool {
+    if let Some(v) = pf2_forced(PF2_GATE_SHARED) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_shared_dev_from_value(std::env::var("DENNO_PF_SHARED_DEV").ok().as_deref()))
+}
+
+/// task 172: `DENNO_PF_PLE_GPU` の解釈 (純関数)。明示的な真値だけ on。
+pub(crate) fn pf_ple_gpu_from_value(v: Option<&str>) -> bool {
+    pf_on_from_value(v)
+}
+
+/// task 172: PLE の key / value 射影を GPU で回すか (`DENNO_PF_PLE_GPU`、既定 off)。
+pub(crate) fn pf_ple_gpu_on() -> bool {
+    if let Some(v) = pf2_forced(PF2_GATE_PLE) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_ple_gpu_from_value(std::env::var("DENNO_PF_PLE_GPU").ok().as_deref()))
+}
+
+
 /// `DENNO_PLE_BATCH` の値の解釈 (純粋関数)。**既定 on**。
 ///
 /// `0` / `false` / `off` のときだけ無効 (トークンごとに 1 回ずつ引く旧経路)。
@@ -12022,19 +12179,28 @@ fn moe_ffn_quant_batch_full(
     let _l_shared = q4ledger::enter(q4ledger::SHARED);
     let t_shared = std::time::Instant::now();
     let sff = lw.gate_shexp.n();
-    let mut sact = vec![0.0f32; nt * sff];
-    gemv_batch(&lw.gate_shexp, xs, nt, &mut sact)
-        .map_err(|err| one(format!("層 {}: ffn_gate_shexp (batch): {err}", lw.il)))?;
-    silu_inplace(&mut sact);
-    let mut sup = vec![0.0f32; nt * sff];
-    gemv_batch(&lw.up_shexp, xs, nt, &mut sup)
-        .map_err(|err| one(format!("層 {}: ffn_up_shexp (batch): {err}", lw.il)))?;
-    for r in 0..nt * sff {
-        sact[r] *= sup[r];
-    }
     let mut sh = vec![0.0f32; nt * e];
-    gemv_batch(&lw.down_shexp, &sact, nt, &mut sh)
-        .map_err(|err| one(format!("層 {}: ffn_down_shexp (batch): {err}", lw.il)))?;
+    // task 172: 3 射影 (gate / up / down) を 1 チャンクぶんデバイスで回す
+    // (活性を GPU に置いたまま。silu と積は elem の swiglu カーネル)。
+    // 使えない形・環境では false が返り、下の従来経路がそのまま走る。
+    let mut shared_dev = false;
+    if pf_shared_dev_on() {
+        shared_dev = Qwen4Exp::pf_shared_dev_run(lw, xs, nt, e, sff, &mut sh);
+    }
+    if !shared_dev {
+        let mut sact = vec![0.0f32; nt * sff];
+        gemv_batch(&lw.gate_shexp, xs, nt, &mut sact)
+            .map_err(|err| one(format!("層 {}: ffn_gate_shexp (batch): {err}", lw.il)))?;
+        silu_inplace(&mut sact);
+        let mut sup = vec![0.0f32; nt * sff];
+        gemv_batch(&lw.up_shexp, xs, nt, &mut sup)
+            .map_err(|err| one(format!("層 {}: ffn_up_shexp (batch): {err}", lw.il)))?;
+        for r in 0..nt * sff {
+            sact[r] *= sup[r];
+        }
+        gemv_batch(&lw.down_shexp, &sact, nt, &mut sh)
+            .map_err(|err| one(format!("層 {}: ffn_down_shexp (batch): {err}", lw.il)))?;
+    }
     let gn = lw.gate_inp_shexp.n();
     let mut sg = vec![0.0f32; nt * gn];
     gemv_batch(&lw.gate_inp_shexp, xs, nt, &mut sg)
@@ -16248,6 +16414,79 @@ mod tests {
                 PREFILL_BATCH_CALLS.load(Ordering::Relaxed) - b0,
                 GEMV_BATCH_CALLS.load(Ordering::Relaxed) - g0,
             )
+        }
+
+
+        /// task 172: 3 本のゲートは**既定 off** で、明示的な真値だけ on。
+        #[test]
+        fn pf2_dev_gates_default_off() {
+            assert!(!pf_full_dev_from_value(None), "未設定は off");
+            assert!(!pf_shared_dev_from_value(None), "未設定は off");
+            assert!(!pf_ple_gpu_from_value(None), "未設定は off");
+            for v in ["0", "off", "false", "no", "", " 0 ", "OFF"] {
+                assert!(!pf_full_dev_from_value(Some(v)), "full: {v:?} が on になった");
+                assert!(!pf_shared_dev_from_value(Some(v)), "shared: {v:?} が on になった");
+                assert!(!pf_ple_gpu_from_value(Some(v)), "ple: {v:?} が on になった");
+            }
+            for v in ["1", "on", "true", "yes", " ON "] {
+                assert!(pf_full_dev_from_value(Some(v)), "full: {v:?} が off になった");
+                assert!(pf_shared_dev_from_value(Some(v)), "shared: {v:?} が off になった");
+                assert!(pf_ple_gpu_from_value(Some(v)), "ple: {v:?} が off になった");
+            }
+        }
+
+        /// task 172: デバイス連鎖のゲートを on にしても、GPU の無いこの環境では
+        /// fail closed で従来経路と**ビット一致**する。断念が数えられたことも見る
+        /// (ゲートが実際に読まれた証拠)。
+        ///
+        /// 実モデルと同じ構成 (`SsmAttn` が `FullAttn` へ委譲する) を組む。
+        #[cfg(feature = "cuda")]
+        #[test]
+        fn pf2_dev_chain_falls_back_without_gpu() {
+            use crate::model::qwen4exp_attn::FullAttn;
+            use crate::model::qwen4exp_ssm::SsmAttn;
+            let _g = moe_test_guard();
+            moe_expert::set_vnni_for_test(Some(false));
+            let dir = TempDir::new("pf2_dev_chain");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("GGUF を開けない");
+            let p = Qwen4ExpParams::from_meta(&f).expect("from_meta");
+            // 1 回ぶんのバッチ prefill (毎回モデルを組み直す)。
+            let run_full = |ctx: &[u32], chunk: usize| -> Vec<f32> {
+                let full = FullAttn::from_gguf(&f, &p, 2048).expect("FullAttn");
+                let attn = SsmAttn::with_full(&f, &p, Box::new(full)).expect("SsmAttn");
+                let mut m = Qwen4Exp::with_attn(&f, Box::new(attn)).expect("モデルを組めない");
+                m.forward_prefill_batch(ctx, chunk).expect("バッチ prefill")
+            };
+            // M = 17 (連鎖の下限未満) / 512・1,024 (実チャンク)
+            for &(n, chunk) in &[(17usize, 17usize), (512, 512), (1024, 512)] {
+                let ctx: Vec<u32> = (0..n).map(|i| (i % VOCAB) as u32).collect();
+                set_pf2_for_test(PF2_GATE_FULL, Some(false));
+                set_pf2_for_test(PF2_GATE_SHARED, Some(false));
+                set_pf2_for_test(PF2_GATE_PLE, Some(false));
+                let off = run_full(&ctx, chunk);
+                set_pf2_for_test(PF2_GATE_FULL, Some(true));
+                set_pf2_for_test(PF2_GATE_SHARED, Some(true));
+                set_pf2_for_test(PF2_GATE_PLE, Some(true));
+                crate::cuda::pf2_stats_reset();
+                let on = run_full(&ctx, chunk);
+                set_pf2_for_test(PF2_GATE_FULL, None);
+                set_pf2_for_test(PF2_GATE_SHARED, None);
+                set_pf2_for_test(PF2_GATE_PLE, None);
+                assert_eq!(
+                    off, on,
+                    "M={n} chunk={chunk}: ゲート on で logits が変わった (fail closed していない)"
+                );
+                let st = crate::cuda::pf2_stats();
+                assert!(
+                    st[1] >= 1,
+                    "M={n}: full 連鎖の断念が数えられていない (ゲートが読まれていない): {st:?}"
+                );
+                assert!(
+                    st[3] >= 1,
+                    "M={n}: shared 連鎖の断念が数えられていない (ゲートが読まれていない): {st:?}"
+                );
+            }
         }
 
         #[test]
