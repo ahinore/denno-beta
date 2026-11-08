@@ -12472,6 +12472,37 @@ mod pf_tc_tests {
         }
     }
 
+    /// task 175: テンソルコア経路の選択は **型** も見る。
+    ///
+    /// v1 カーネル (`dno_gemm_tc_q8_0_w`) は Q8_0 専用。Q4_K / Q5_K / Q5_1 の
+    /// 重みを渡すとバイト列を Q8_0 として読むので出力が壊れる。lab t175a では
+    /// shared expert の gate が Q4_K だったため、br172 の `pf2_gemm` が形だけで
+    /// v1 を選び、prefill の出力が全部 `!` になった。
+    #[test]
+    fn pf2_tc_kind_respects_weight_type() {
+        use crate::kquant::GgmlType as T;
+        // shared expert の実形 (gate/up = 2560→640 / down = 640→2560)。
+        // N が小さいので v2 の対象外。Q4_K を v1 に流してはいけない。
+        assert_eq!(
+            pf2_tc_kind(T::Q4K, 512, 2560, 640),
+            0,
+            "Q4_K を Q8_0 専用の v1 に流した"
+        );
+        assert_eq!(pf2_tc_kind(T::Q5K, 512, 2560, 640), 0);
+        assert_eq!(pf2_tc_kind(T::Q5_1, 512, 2560, 640), 0);
+        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 2560, 640), 1, "Q8_0 は v1");
+        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 640, 2560), 1);
+        // N >= TC2_MIN_N (4096) は v2 (Q8_0 / Q4_K / Q5_K を型で切り替える)。
+        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 2560, 10240), 2);
+        assert_eq!(pf2_tc_kind(T::Q4K, 512, 2560, 10240), 2);
+        assert_eq!(pf2_tc_kind(T::Q5K, 512, 2560, 10240), 2);
+        // v2 が扱えない型は v1 にも流さない (従来カーネルへ)。
+        assert_eq!(pf2_tc_kind(T::Q5_1, 512, 2560, 10240), 0);
+        // 形が前提に合わないものは従来。
+        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 2559, 640), 0);
+        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 2560, 641), 0);
+    }
+
     /// タイルの索引算術を CPU ミラーで確かめる (`kernels_gemm_tc.cu` の
     /// デコード配置・warp の担当範囲・書き出し条件を 1 対 1 で写す)。
     ///
@@ -15241,8 +15272,13 @@ enum PfWKind {
     Bf16,
     /// `dno_gemm_f32_mt` (f32 に展開済み / 元から F32)。
     F32,
-    /// `dno_gemm_q8_0` 系 (`f_gemm_q` の添字, 1 行の生バイト数, 量子ブロック長)。
-    Quant(usize, usize, usize),
+    /// 量子型 (`f_gemm_q` の添字, 1 行の生バイト数, 量子ブロック長) と **型そのもの**。
+    ///
+    /// 型を持つのはテンソルコア GEMM の選択に要るため (task 175)。v1 カーネル
+    /// (`dno_gemm_tc_q8_0_w`) は Q8_0 専用で、Q4_K / Q5_1 の重みを渡すと別の型
+    /// として読んで出力が壊れる (lab t175a で実際に踏んだ: shared expert の
+    /// gate は Q4_K)。
+    Quant(crate::kquant::GgmlType, usize, usize, usize),
 }
 
 /// 重み 1 本を常駐させる。
@@ -15303,7 +15339,7 @@ fn pf_weight(l: PfLin<'_>, want_bf16: bool) -> Option<(CUdeviceptr, PfWKind)> {
                 return None;
             }
             match weights_for_gguf(l.uid, ty, l.blocks, l.k, l.n) {
-                Ok(w) => Some((w.buf.ptr(), PfWKind::Quant(slot, rb, blk))),
+                Ok(w) => Some((w.buf.ptr(), PfWKind::Quant(ty, slot, rb, blk))),
                 Err(e) => {
                     tracing::info!("[pf] 量子重みの常駐に失敗 (uid={}): {e:#}", l.uid);
                     None
@@ -15460,7 +15496,7 @@ pub fn pf_mix(
                             .map_err(|e| format!("gemm launch: {e:#}"))?;
                     }
                 }
-                PfWKind::Quant(slot, rb, blk) => {
+                PfWKind::Quant(_ty, slot, rb, blk) => {
                     // 量子 GEMM は 1 起動 128 トークンまで (`moe_gemm_dev` と同じ)。
                     let f = ctx
                         .f_gemm_q
@@ -15918,11 +15954,36 @@ fn pf2_ensure(slot: &mut Option<DevBuffer>, bytes: usize) -> Result<()> {
 // 同期しないデバイス GEMM
 // ---------------------------------------------------------------------------
 
+/// task 175: `pf2_gemm` が選ぶテンソルコア経路 (純関数)。0 = 従来、1 = v1、2 = v2。
+///
+/// **型を必ず見る**のが要点。v1 カーネル (`dno_gemm_tc_q8_0_w`) は Q8_0 専用で、
+/// Q4_K / Q5_1 の重みを渡すとバイト列を別の型として読む (= 出力が壊れる)。
+/// task 172 の `pf2_gemm` は形だけで v1 を選んでいたため、shared expert の
+/// gate (このモデルでは Q4_K) が壊れ、prefill の出力が全部 `!` になった
+/// (lab t175a)。v2 は Q8_0 / Q4_K / Q5_K を型で切り替える。
+///
+/// 環境ゲート (`DENNO_PF_TC_GEMM` / `DENNO_PF_TC_GEMM2`) は呼び出し側で見る。
+pub(crate) fn pf2_tc_kind(
+    ty: crate::kquant::GgmlType,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+) -> u8 {
+    if pf_tc2_eligible(ty, nt, n_in, n_out, 1) {
+        2
+    } else if matches!(ty, crate::kquant::GgmlType::Q8_0) && pf_tc_gemm_eligible(nt, n_in, n_out, 1)
+    {
+        1
+    } else {
+        0
+    }
+}
+
 /// 1 行列ぶんのデバイス GEMM (`x` / `y` はデバイス。**同期しない**)。
 ///
-/// 形が tensor core の前提に合えば `kernels_gemm_tc` を 1 起動 (2,048 行まで)、
-/// 合わなければ従来の量子 GEMM (`f_gemm_q`) を 128 行ずつ並べる。どちらも
-/// 起動を並べるだけで、待つのは呼び出し側の最後の 1 回。
+/// 型と形が tensor core の前提に合えば `kernels_gemm_tc` / `kernels_gemm_tc2` を
+/// 1 起動 (2,048 行まで)、合わなければ従来の量子 GEMM (`f_gemm_q`) を 128 行ずつ
+/// 並べる。どちらも起動を並べるだけで、待つのは呼び出し側の最後の 1 回。
 #[allow(clippy::too_many_arguments)]
 fn pf2_gemm(
     ctx: &CudaCtx,
@@ -15934,17 +15995,28 @@ fn pf2_gemm(
     n_in: usize,
     n_out: usize,
 ) -> Result<()> {
-    let PfWKind::Quant(slot, rb, blk) = kind else {
-        bail!("pf2_gemm: 量子型の重みだけを受ける");
+    let PfWKind::Quant(ty, slot, rb, blk) = kind else {
+        bail!("pf2_gemm: 量子型の重みだけを受ける")
     };
     if nt == 0 || n_in == 0 || n_out == 0 || n_in % blk != 0 {
         bail!("pf2_gemm: 形が不正 (nt={nt}, n_in={n_in}, n_out={n_out}, blk={blk})");
     }
-    if pf_tc_gemm_eligible(nt, n_in, n_out, 1) {
+    // 1. v2 (Q8_0 / Q4_K / Q5_K。型ごとにカーネルを選ぶ)。
+    if pf2_tc_kind(ty, nt, n_in, n_out) == 2 && pf_tc2_gemm_on() {
+        if let Some(tc2) = tc2_gemm_kernels() {
+            return tc2_gemm_launch(ctx, tc2, ty, w, x, y, nt, n_in, n_out, rb);
+        }
+    }
+    // 2. v1 (Q8_0 専用)。
+    if matches!(ty, crate::kquant::GgmlType::Q8_0)
+        && pf_tc_gemm_on()
+        && pf_tc_gemm_eligible(nt, n_in, n_out, 1)
+    {
         if let Some(tc) = tc_gemm_kernels() {
             return tc_gemm_launch(ctx, tc, w, x, y, nt, n_in, n_out, rb);
         }
     }
+    // 3. 従来の量子 GEMM (型ごとのスロット)。
     let fs = ctx
         .f_gemm_q
         .ok_or_else(|| anyhow!("量子 GEMM カーネルが無い"))?;
