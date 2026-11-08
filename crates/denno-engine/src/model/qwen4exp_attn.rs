@@ -1925,6 +1925,7 @@ impl FullAttn {
             layer,
             gen,
             t_total,
+            base,
             &mut ks,
             &mut vs,
         );

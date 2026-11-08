@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc gemm_tc2 pf2)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc gemm_tc2 pf2 gemm_sn)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -74,6 +74,10 @@ spec() {
         # smem の行ストライド 40・Q4_K / Q5_K も扱う)。arch は gemm_tc と同じ理由で
         # compute_90。数値契約は無し (prefill の射影はビット一致契約の外)。
         gemm_tc2)     echo "kernels_gemm_tc2.cu|fmad|compute_90" ;;
+        # task 181: prefill の N が小さい射影 (shared expert 640 / out 2560) 用の
+        # BN=64 タイル。tc2 と同じ bf16 wmma なので arch も同じ compute_90。
+        # 数値契約は無し (prefill の射影はビット一致契約の外)。
+        gemm_sn)      echo "kernels_gemm_sn.cu|fmad|compute_90" ;;
         *)            return 1 ;;
     esac
 }

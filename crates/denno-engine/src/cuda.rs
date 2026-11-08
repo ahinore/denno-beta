@@ -1072,6 +1072,35 @@ impl DevBuffer {
         Ok(())
     }
 
+    /// task 181: 既存バッファの**バイトオフセット位置**へデバイスから移す (D2D)。
+    ///
+    /// `src` の先頭 `len` 要素 (f32) をこのバッファの `dst_offset_bytes` へ
+    /// 書く。KV ミラーへチャンクの k / v を直接積むのに使う
+    /// (D2H → ホスト積み → H2D の往復をしない)。
+    pub fn copy_from_dev_at(&self, dst_offset_bytes: usize, src: CUdeviceptr, len: usize) -> Result<()> {
+        let bytes = len * std::mem::size_of::<f32>();
+        assert!(
+            dst_offset_bytes + bytes <= self.bytes,
+            "DevBuffer::copy_from_dev_at: size overflow"
+        );
+        let dbg = launch_dbg::note(|| {
+            format!(
+                "D2D@ dst={:#x}+{dst_offset_bytes} src={src:#x} bytes={bytes}",
+                self.ptr
+            )
+        });
+        if bytes > 0 {
+            unsafe {
+                check(
+                    (lib()?.memcpy_dtod)(self.ptr + dst_offset_bytes as CUdeviceptr, src, bytes),
+                    "cuMemcpyDtoD",
+                )?;
+            }
+        }
+        launch_dbg::sync(dbg)?;
+        Ok(())
+    }
+
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -2466,6 +2495,13 @@ impl CudaCtx {
                 tc_sel = Some(TcSel::V2(f));
             }
         }
+        // task 181: N が小さい形 (shared expert 640 / out_proj 2560) は BN=64 版。
+        if tc_sel.is_none() && pf_tc_smalln_on() && pf_tc_smalln_eligible(ty, nt, n_in, n_out, pf_tc_min_m())
+        {
+            if let Some(f) = tc_smalln_kernels() {
+                tc_sel = Some(TcSel::Sn(f));
+            }
+        }
         if tc_sel.is_none()
             && matches!(ty, T::Q8_0)
             && pf_tc_gemm_on()
@@ -2506,6 +2542,9 @@ impl CudaCtx {
                 let t_sync = crate::model::devprof::sync_start();
                 match sel {
                     TcSel::V2(f) => tc2_gemm_launch(
+                        self, f, ty, dev_w.ptr, xb.ptr, ob.ptr, nt, n_in, n_out, rb,
+                    )?,
+                    TcSel::Sn(f) => sn_gemm_launch(
                         self, f, ty, dev_w.ptr, xb.ptr, ob.ptr, nt, n_in, n_out, rb,
                     )?,
                     TcSel::V1(f) => {
@@ -11969,7 +12008,10 @@ fn gemm_try_tile_for(
         && pf_tc_gemm_eligible(nt, k, n, min_m);
     // task 176: v2 カーネルも 2,048 トークンまで 1 起動で畳める (Q4_K / Q5_K も含む)。
     let tc2 = tc2_on && pf_tc2_eligible(ty, nt, k, n, min_m);
-    if tc || tc2 {
+    // task 181: N が小さい形 (shared 640 / out 2560) も BN=64 のカーネルで
+    // 2,048 トークンまで畳める (ゲートは env。既定 off)。
+    let sn = pf_tc_smalln_on() && pf_tc_smalln_eligible(ty, nt, k, n, min_m);
+    if tc || tc2 || sn {
         TC_MAX_TOKENS
     } else {
         128
@@ -11987,10 +12029,11 @@ struct TcGemm {
 unsafe impl Send for TcGemm {}
 unsafe impl Sync for TcGemm {}
 
-/// テンソルコア GEMM のどちらを使うか (br169 / task 176 の v2)。
+/// テンソルコア GEMM のどちらを使うか (br169 / task 176 の v2 / task 181 の小さい N 用)。
 enum TcSel {
     V1(&'static TcGemm),
     V2(&'static Tc2Gemm),
+    Sn(&'static SnGemm),
 }
 
 static TC_GEMM: OnceLock<Option<TcGemm>> = OnceLock::new();
@@ -12252,6 +12295,13 @@ fn pf_gemm_fast_ok(
     {
         return true;
     }
+    // task 181: N が小さい形も 1 起動で 2,048 行まで畳める (BN=64 タイル)。
+    if pf_tc_smalln_on()
+        && pf_tc_smalln_eligible(ty, nt, n_in, n_out, min_m)
+        && tc_smalln_kernels().is_some()
+    {
+        return true;
+    }
     matches!(ty, crate::kquant::GgmlType::Q8_0)
         && pf_tc_gemm_on()
         && pf_tc_gemm_eligible(nt, n_in, n_out, min_m)
@@ -12414,6 +12464,264 @@ fn tc2_gemm_launch(
     Ok(())
 }
 
+// ===========================================================================
+// task 181: prefill の **N が小さい** 射影を BF16 テンソルコア GEMM で回す
+// ===========================================================================
+//
+// lab t175b の台帳 (14,018 トークン cold prefill、br172 の 3 ゲート on) では
+//   shared expert  gpu 3,542 ms (= 1.9 TFLOP/s)
+//   ssm out_pf           270 ms (= 24 TFLOP/s、br169)
+// だった。shared の行列は N = 640 / 2560 で v2 の下限 TC2_MIN_N = 4096 に
+// 入らないため、Q8_0 の up / down は br169 (BN=64・プリフェッチ無し)、
+// Q4_K の gate は f32 カーネル (`dno_gemm_q4k_w`) に落ちていた。
+// br169 でも N=640 は 640/64 = 10 行タイル x (M=512 で 4) = 40 ブロックで、
+// 170 SM の 24% しか使わない。ここでは tc2 と同じ 2 段プリフェッチ +
+// smem ストライド 40 のまま **BN=64** にして、N=640 で 40、
+// N=2560 で 160 ブロックを出す (N=2560 は 1 波で埋まる)。
+//
+// 既定 off (`DENNO_PF_TC_SMALLN=1` で on)。PTX は実行時読み込みで、無ければ
+// 従来経路へ fail closed (`[pf-sn]` の 1 行だけ出す)。
+//
+// PTX: `bash build_ptx.sh gemm_sn` (この target だけ arch = compute_90)。
+
+/// 1 ブロックのタイル (`kernels_gemm_sn.cu` の TC_SN_BM / BN / BK と一致)。
+const TC_SN_BM: usize = 128;
+const TC_SN_BN: usize = 64;
+const TC_SN_BK: usize = 32;
+/// 共有メモリの行ストライド (`TC_SN_LD`。tc2 と同じ 8 要素の詰め物)。
+const TC_SN_LD: usize = 40;
+/// 静的共有メモリの合計 (`TC_SN_SMEM_BYTES` = sW 2 x 64 x 40 x 2 + sX 2 x 128 x 40 x 2)。
+const TC_SN_SMEM_BYTES: usize = 30_720;
+/// 1 起動でまとめるトークン数の上限 (tc2 と同じ)。
+const TC_SN_MAX_TOKENS: usize = 2048;
+
+/// smem の見積りがカーネル側の `TC_SN_SMEM_BYTES` と一致することのコンパイル時検査。
+const _: [(); TC_SN_SMEM_BYTES] =
+    [(); 2 * TC_SN_BN * TC_SN_LD * 2 + 2 * TC_SN_BM * TC_SN_LD * 2];
+
+/// `DENNO_PF_TC_SMALLN` の値の解釈 (純関数)。`1`・`on`・`true`・`yes` だけが on。
+///
+/// **既定 off** (task 181 の lab で採否を決める)。
+pub(crate) fn pf_tc_smalln_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => false,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// 小さい N 用のカーネルを使うか (**既定 off**。`DENNO_PF_TC_SMALLN=1` で on)。
+pub(crate) fn pf_tc_smalln_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_TC_SN_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_tc_smalln_from_value(std::env::var("DENNO_PF_TC_SMALLN").ok().as_deref())
+    })
+}
+
+#[cfg(test)]
+static PF_TC_SN_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_tc_smalln_for_test(v: Option<bool>) {
+    PF_TC_SN_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// 小さい N 用カーネルが扱える型か (純関数)。Q4_K を含むのが要点
+/// (shared expert の gate は Q4_K。br169 は Q8_0 専用)。
+pub(crate) fn pf_tc_smalln_type_ok(ty: crate::kquant::GgmlType) -> bool {
+    use crate::kquant::GgmlType as T;
+    matches!(ty, T::Q8_0 | T::Q4K)
+}
+
+/// この形を小さい N 用カーネルで回せるか (純関数。カーネルの前提と同じ)。
+///
+/// 型 (Q8_0 / Q4_K)・k の倍数・`n_out % 64 == 0`・`n_out < TC2_MIN_N`。
+/// `N >= 4096` は tc2 の担当 (128 行タイルの方が仕事が 2 倍 = 固定費が半分)。
+pub(crate) fn pf_tc_smalln_eligible(
+    ty: crate::kquant::GgmlType,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    min_m: usize,
+) -> bool {
+    pf_tc_smalln_type_ok(ty)
+        && pf_tc2_k_ok(ty, n_in)
+        && nt >= min_m.max(1)
+        && n_out > 0
+        && n_out % TC_SN_BN == 0
+        && n_out < TC2_MIN_N
+}
+
+/// 立つブロック数 (純関数。診断・テスト用)。
+#[cfg(test)]
+pub(crate) fn pf_tc_smalln_blocks(nt: usize, n_out: usize) -> usize {
+    if n_out % TC_SN_BN != 0 {
+        return 0;
+    }
+    (n_out / TC_SN_BN) * nt.div_ceil(TC_SN_BM)
+}
+
+/// 小さい N 用カーネル (PTX は実行時読み込み)。
+struct SnGemm {
+    /// モジュールは生かしておく必要がある (関数ハンドルの持ち主)。
+    #[allow(dead_code)]
+    module: CUmodule,
+    q8_0: CUfunction,
+    q4k: CUfunction,
+}
+
+unsafe impl Send for SnGemm {}
+unsafe impl Sync for SnGemm {}
+
+static SN_GEMM: OnceLock<Option<SnGemm>> = OnceLock::new();
+
+/// PTX の置き場所。`DENNO_PF_SN_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_gemm_sn.ptx`。
+fn sn_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_SN_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gemm_sn.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+/// **current context を張った後に呼ぶこと**。
+fn tc_smalln_kernels() -> Option<&'static SnGemm> {
+    SN_GEMM
+        .get_or_init(|| {
+            let path = sn_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[pf-sn] PTX が読めない ({}) : {e} → 従来の GEMM へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0); // cuModuleLoadData は NUL 終端の PTX を期待する
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[pf-sn] cuModuleLoadData 失敗 → 従来の GEMM へ");
+                    return None;
+                }
+                // 変数名は kernel_invariants の起動サイト表 (`module_get_function` と
+                // `fns.X` の対応) が読む。
+                let mut q8_0: CUfunction = std::ptr::null_mut();
+                let mut q4k: CUfunction = std::ptr::null_mut();
+                for (dst, name, label) in [
+                    (
+                        &mut q8_0,
+                        b"dno_gemm_sn_q8_0_w\0".as_ptr(),
+                        "dno_gemm_sn_q8_0_w",
+                    ),
+                    (
+                        &mut q4k,
+                        b"dno_gemm_sn_q4k_w\0".as_ptr(),
+                        "dno_gemm_sn_q4k_w",
+                    ),
+                ] {
+                    if (lib.module_get_function)(dst, module, name as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!("[pf-sn] PTX に {label} が無い → 従来の GEMM へ");
+                        return None;
+                    }
+                }
+                Some(SnGemm {
+                    module,
+                    q8_0,
+                    q4k,
+                })
+            }
+        })
+        .as_ref()
+}
+
+/// 型ごとのカーネル (純関数)。
+fn sn_func(fns: &SnGemm, ty: crate::kquant::GgmlType) -> Option<CUfunction> {
+    use crate::kquant::GgmlType as T;
+    match ty {
+        T::Q8_0 => Some(fns.q8_0),
+        T::Q4K => Some(fns.q4k),
+        _ => None,
+    }
+}
+
+/// 小さい N 用カーネルを `TC_SN_MAX_TOKENS` 行ずつ起動する (w / x / out はデバイス)。
+#[allow(clippy::too_many_arguments)]
+fn sn_gemm_launch(
+    ctx: &CudaCtx,
+    fns: &SnGemm,
+    ty: crate::kquant::GgmlType,
+    wptr: CUdeviceptr,
+    xptr: CUdeviceptr,
+    optr: CUdeviceptr,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    row_bytes: usize,
+) -> Result<()> {
+    if nt == 0 {
+        return Ok(());
+    }
+    let Some(f) = sn_func(fns, ty) else {
+        bail!("sn_gemm_launch: 未対応の型 {ty:?}");
+    };
+    let grid_x = (n_out / TC_SN_BN) as u32;
+    let mut t0 = 0usize;
+    while t0 < nt {
+        let m = (nt - t0).min(TC_SN_MAX_TOKENS);
+        let grid_y = m.div_ceil(TC_SN_BM) as u32;
+        let (mut pw, mut px, mut po) = (
+            wptr,
+            xptr + (t0 * n_in * 4) as CUdeviceptr,
+            optr + (t0 * n_out * 4) as CUdeviceptr,
+        );
+        let (mut m_c, mut ni_c, mut no_c, mut rb_c) = (
+            m as c_int,
+            n_in as c_int,
+            n_out as c_int,
+            row_bytes as c_int,
+        );
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut m_c as *mut _ as *mut c_void,
+            &mut ni_c as *mut _ as *mut c_void,
+            &mut no_c as *mut _ as *mut c_void,
+            &mut rb_c as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            ctx.launch_async(f, (grid_x, grid_y, 1), (256, 1, 1), 0, &mut args)?;
+        }
+        t0 += m;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod pf_tc_tests {
     use super::*;
@@ -12485,16 +12793,17 @@ mod pf_tc_tests {
     fn pf2_tc_kind_respects_weight_type() {
         use crate::kquant::GgmlType as T;
         // shared expert の実形 (gate/up = 2560→640 / down = 640→2560)。
-        // N が小さいので v2 の対象外。Q4_K を v1 に流してはいけない。
+        // task 181 で N < 4096 の形は kind 3 (BN=64 の小さい N 用) が受ける。
+        // どれも **型を見て** 選ぶ (Q4_K を Q8_0 専用の v1 に流してはいけない)。
         assert_eq!(
             pf2_tc_kind(T::Q4K, 512, 2560, 640),
-            0,
+            3,
             "Q4_K を Q8_0 専用の v1 に流した"
         );
         assert_eq!(pf2_tc_kind(T::Q5K, 512, 2560, 640), 0);
         assert_eq!(pf2_tc_kind(T::Q5_1, 512, 2560, 640), 0);
-        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 2560, 640), 1, "Q8_0 は v1");
-        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 640, 2560), 1);
+        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 2560, 640), 3, "N=640 は kind 3");
+        assert_eq!(pf2_tc_kind(T::Q8_0, 512, 640, 2560), 3);
         // N >= TC2_MIN_N (4096) は v2 (Q8_0 / Q4_K / Q5_K を型で切り替える)。
         assert_eq!(pf2_tc_kind(T::Q8_0, 512, 2560, 10240), 2);
         assert_eq!(pf2_tc_kind(T::Q4K, 512, 2560, 10240), 2);
@@ -12744,6 +13053,167 @@ mod pf_tc_tests {
         assert_eq!(pf_tc2_blocks(2048, 10240), 80 * 16);
         // 出力行が 128 の倍数でない形は 0 (適格判定で落ちる)。
         assert_eq!(pf_tc2_blocks(512, 10240 + 64), 0);
+    }
+
+    /// task 181: 小さい N 用のゲートは **既定 off** (`DENNO_PF_TC_SMALLN=1` で on)。
+    #[test]
+    fn pf_tc_smalln_gate_truth_table() {
+        assert!(!pf_tc_smalln_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " OFF "] {
+            assert!(!pf_tc_smalln_from_value(Some(v)), "{v}");
+        }
+        for v in ["1", "on", "true", "yes", " ON "] {
+            assert!(pf_tc_smalln_from_value(Some(v)), "{v}");
+        }
+    }
+
+    /// 強制上書きが効くこと (set/戻しを対で行う)。
+    #[test]
+    fn pf_tc_smalln_gate_force_switch() {
+        let before = pf_tc_smalln_on();
+        set_pf_tc_smalln_for_test(Some(true));
+        assert!(pf_tc_smalln_on());
+        set_pf_tc_smalln_for_test(Some(false));
+        assert!(!pf_tc_smalln_on());
+        set_pf_tc_smalln_for_test(None);
+        assert_eq!(pf_tc_smalln_on(), before);
+    }
+
+    /// task 181: 実モデルの小さい N の形 (shared 640 / out 2560) が適格で、
+    /// N >= 4096 (v2 の担当) と Q5_K (v2 / v1 の担当) は落ちること。
+    #[test]
+    fn pf_tc_smalln_eligibility_real_shapes() {
+        use crate::kquant::GgmlType as T;
+        // shared expert: gate (Q4_K) 2560→640 / up (Q8_0) 2560→640 / down 640→2560。
+        for (ty, k, n) in [
+            (T::Q4K, 2560usize, 640usize),
+            (T::Q8_0, 2560, 640),
+            (T::Q8_0, 640, 2560),
+            // ssm out_proj (N 2560, K 6144)。
+            (T::Q8_0, 6144, 2560),
+        ] {
+            assert!(pf_tc_smalln_eligible(ty, 512, k, n, 64), "{ty:?} k={k} n={n}");
+            assert!(pf_tc_smalln_eligible(ty, 1, k, n, 1), "{ty:?} M=1 k={k} n={n}");
+        }
+        // N >= TC2_MIN_N は v2 の担当 (ここでは適格にしない)。
+        assert!(!pf_tc_smalln_eligible(T::Q8_0, 512, 2560, 10240, 64));
+        assert!(!pf_tc_smalln_eligible(T::Q4K, 512, 2560, 4096, 64));
+        // 型: Q5_K / Q5_1 は扱わない (v2 / 従来へ)。
+        assert!(!pf_tc_smalln_eligible(T::Q5K, 512, 2560, 640, 64));
+        assert!(!pf_tc_smalln_eligible(T::Q5_1, 512, 2560, 640, 64));
+        // k の倍数 (Q8_0 = 32 / Q4_K = 256) と出力行 64 の倍数。
+        assert!(!pf_tc_smalln_eligible(T::Q8_0, 512, 2559, 640, 64));
+        assert!(!pf_tc_smalln_eligible(T::Q4K, 512, 2400, 640, 64));
+        assert!(!pf_tc_smalln_eligible(T::Q8_0, 512, 2560, 641, 64));
+        assert!(!pf_tc_smalln_eligible(T::Q8_0, 512, 2560, 32, 64));
+        // M の下限 (19 トークンの next turn は従来経路)。
+        assert!(!pf_tc_smalln_eligible(T::Q8_0, 19, 2560, 640, 64));
+        assert!(pf_tc_smalln_eligible(T::Q8_0, 19, 2560, 640, 1));
+        // 2048 トークン (まとめ幅の上限) でも適格。
+        assert!(pf_tc_smalln_eligible(T::Q8_0, 2048, 2560, 640, 64));
+    }
+
+    /// task 181: ブロック数が並列度の根拠になっていること (BN=64 の意味)。
+    #[test]
+    fn pf_tc_smalln_blocks_count() {
+        // M=512 の 1 チャンク: shared の gate/up は 40、down は 160 ブロック。
+        assert_eq!(pf_tc_smalln_blocks(512, 640), 10 * 4);
+        assert_eq!(pf_tc_smalln_blocks(512, 2560), 40 * 4);
+        assert_eq!(pf_tc_smalln_blocks(19, 640), 10);
+        assert_eq!(pf_tc_smalln_blocks(2048, 640), 10 * 16);
+        // 同じ形を v2 (BN=128) で撃つと 5 x 4 = 20 ブロックしか出ない (比較の固定)。
+        assert_eq!(pf_tc2_blocks(512, 640), 5 * 4);
+        // 64 の倍数でない形は 0。
+        assert_eq!(pf_tc_smalln_blocks(512, 641), 0);
+    }
+
+    /// task 181: 小さい N 用カーネルの索引算術を CPU ミラーで確かめる
+    /// (`kernels_gemm_sn.cu` のステージ担当・warp の担当範囲・端数の条件を
+    /// 1 対 1 で写す)。GPU 実測の代わりではない。
+    #[test]
+    fn pf_tc_smalln_tile_index_mirror() {
+        // 1. 重みタイル: 256 スレッド × 8 要素 × **1 組** が [64][32] を
+        //    ちょうど 1 回覆う (tc2 は 2 組 = 128 行)。行 = tid>>2、列 = (tid&3)*8。
+        let mut seen = vec![false; TC_SN_BN * TC_SN_BK];
+        for tid in 0..256usize {
+            let row = tid >> 2;
+            let j = (tid & 3) * 8;
+            assert!(row < TC_SN_BN && j + 8 <= TC_SN_BK, "row={row} j={j}");
+            for u in 0..8usize {
+                let idx = row * TC_SN_BK + j + u;
+                assert!(!seen[idx], "重みスロットの二重書き row={row} j={j}");
+                seen[idx] = true;
+            }
+        }
+        assert!(seen.iter().all(|&b| b), "重みスロットの取りこぼし");
+
+        // 2. 入力タイル: 256 スレッド × 8 要素 × 2 組が [128][32] を覆う。
+        let mut seen = vec![false; TC_SN_BM * TC_SN_BK];
+        for tid in 0..256usize {
+            for hf in 0..2usize {
+                let row = (tid >> 2) + hf * 64;
+                let j = (tid & 3) * 8;
+                assert!(row < TC_SN_BM && j + 8 <= TC_SN_BK, "row={row} j={j}");
+                for u in 0..8usize {
+                    let idx = row * TC_SN_BK + j + u;
+                    assert!(!seen[idx], "入力スロットの二重書き row={row} j={j}");
+                    seen[idx] = true;
+                }
+            }
+        }
+        assert!(seen.iter().all(|&b| b), "入力スロットの取りこぼし");
+
+        // 3. warp のアキュムレータ (4 トークン群 × 2 行群 × 2 × 2 タイル) が
+        //    [128][64] をちょうど 1 回覆い、行/列の先頭が 16 の倍数であること。
+        let mut seen = vec![false; TC_SN_BM * TC_SN_BN];
+        for warp in 0..8usize {
+            let (wm, wn) = (warp & 3, warp >> 2);
+            assert_eq!(wn, warp / 4);
+            for i in 0..2usize {
+                let mrow = wm * 32 + i * 16;
+                assert_eq!(mrow % 16, 0);
+                for j in 0..2usize {
+                    let ncol = wn * 32 + j * 16;
+                    assert_eq!(ncol % 16, 0);
+                    for r in 0..16usize {
+                        for c in 0..16usize {
+                            let idx = (mrow + r) * TC_SN_BN + ncol + c;
+                            assert!(!seen[idx], "アキュムレータの二重担当");
+                            seen[idx] = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().all(|&b| b), "アキュムレータの取りこぼし");
+
+        // 4. 行ストライド (ldm は bf16 で 16 バイトの倍数が要る) と smem の見積り。
+        assert_eq!(TC_SN_LD % 8, 0);
+        assert_eq!(TC_SN_LD * 2 % 16, 0);
+        assert!(TC_SN_LD > TC_SN_BK, "詰め物が無い (バンク衝突)");
+        let smem = 2 * TC_SN_BN * TC_SN_LD * 2 + 2 * TC_SN_BM * TC_SN_LD * 2;
+        assert_eq!(smem, TC_SN_SMEM_BYTES, "共有メモリの合計が .cu と違う");
+        assert_eq!(smem, 30_720);
+        assert!(smem <= 48 * 1024);
+        let stage_floats = 8 * 256;
+        assert!(
+            stage_floats * 4 <= 2 * TC_SN_BM * TC_SN_LD * 2,
+            "端数ステージが sX に収まらない"
+        );
+
+        // 5. 端数タイル: 128 の倍数でない M で、ステージ経由の行数が 0..15。
+        for nt in [1usize, 15, 16, 17, 127, 128, 129, 2047, 2048] {
+            for warp in 0..8usize {
+                let wm = warp & 3;
+                for i in 0..2usize {
+                    let mrow = wm * 32 + i * 16;
+                    if mrow < nt && mrow + 16 > nt {
+                        let rows = nt - mrow;
+                        assert!((1..=15).contains(&rows), "nt={nt} mrow={mrow}");
+                    }
+                }
+            }
+        }
     }
 
     /// v2 カーネルの索引算術を CPU ミラーで確かめる
@@ -15918,6 +16388,10 @@ struct Pf2Dev {
     ga: Option<DevBuffer>,  // [nt][sff] (shared の gate)
     gu: Option<DevBuffer>,  // [nt][sff] (shared の up)
     sh: Option<DevBuffer>,  // [nt][e]   (shared の down 出力)
+    /// task 181: 直前の `pf_full_qkv` が KV ミラーへ直接書いた範囲
+    /// `(cache_id, layer, gen, t_total)`。`pf_full_out` がこれを見て
+    /// ミラーの H2D を飛ばす (`DENNO_PF_MIRROR_DELTA`)。
+    mir: Option<(u64, usize, u64, usize)>,
 }
 
 impl Pf2Dev {
@@ -15936,6 +16410,7 @@ impl Pf2Dev {
             ga: None,
             gu: None,
             sh: None,
+            mir: None,
         }
     }
 }
@@ -15957,7 +16432,8 @@ fn pf2_ensure(slot: &mut Option<DevBuffer>, bytes: usize) -> Result<()> {
 // 同期しないデバイス GEMM
 // ---------------------------------------------------------------------------
 
-/// task 175: `pf2_gemm` が選ぶテンソルコア経路 (純関数)。0 = 従来、1 = v1、2 = v2。
+/// task 175: `pf2_gemm` が選ぶテンソルコア経路 (純関数)。0 = 従来、1 = v1、2 = v2、
+/// 3 = 小さい N 用 (task 181。BN=64)。
 ///
 /// **型を必ず見る**のが要点。v1 カーネル (`dno_gemm_tc_q8_0_w`) は Q8_0 専用で、
 /// Q4_K / Q5_1 の重みを渡すとバイト列を別の型として読む (= 出力が壊れる)。
@@ -15965,7 +16441,8 @@ fn pf2_ensure(slot: &mut Option<DevBuffer>, bytes: usize) -> Result<()> {
 /// gate (このモデルでは Q4_K) が壊れ、prefill の出力が全部 `!` になった
 /// (lab t175a)。v2 は Q8_0 / Q4_K / Q5_K を型で切り替える。
 ///
-/// 環境ゲート (`DENNO_PF_TC_GEMM` / `DENNO_PF_TC_GEMM2`) は呼び出し側で見る。
+/// 環境ゲート (`DENNO_PF_TC_GEMM` / `DENNO_PF_TC_GEMM2` / `DENNO_PF_TC_SMALLN`)
+/// は呼び出し側で見る。ゲートが off のとき kind 3 は v1 → 従来カーネルへ落ちる。
 pub(crate) fn pf2_tc_kind(
     ty: crate::kquant::GgmlType,
     nt: usize,
@@ -15974,6 +16451,8 @@ pub(crate) fn pf2_tc_kind(
 ) -> u8 {
     if pf_tc2_eligible(ty, nt, n_in, n_out, 1) {
         2
+    } else if pf_tc_smalln_eligible(ty, nt, n_in, n_out, 1) {
+        3
     } else if matches!(ty, crate::kquant::GgmlType::Q8_0) && pf_tc_gemm_eligible(nt, n_in, n_out, 1)
     {
         1
@@ -16005,9 +16484,17 @@ fn pf2_gemm(
         bail!("pf2_gemm: 形が不正 (nt={nt}, n_in={n_in}, n_out={n_out}, blk={blk})");
     }
     // 1. v2 (Q8_0 / Q4_K / Q5_K。型ごとにカーネルを選ぶ)。
-    if pf2_tc_kind(ty, nt, n_in, n_out) == 2 && pf_tc2_gemm_on() {
+    let tc_kind = pf2_tc_kind(ty, nt, n_in, n_out);
+    if tc_kind == 2 && pf_tc2_gemm_on() {
         if let Some(tc2) = tc2_gemm_kernels() {
             return tc2_gemm_launch(ctx, tc2, ty, w, x, y, nt, n_in, n_out, rb);
+        }
+    }
+    // 1b. task 181: N が小さい形 (shared expert 640 / out_proj 2560) の BN=64 版。
+    //     ゲートが off・PTX が無いときは下の v1 / 従来カーネルへ落ちる。
+    if tc_kind == 3 && pf_tc_smalln_on() {
+        if let Some(sn) = tc_smalln_kernels() {
+            return sn_gemm_launch(ctx, sn, ty, w, x, y, nt, n_in, n_out, rb);
         }
     }
     // 2. v1 (Q8_0 専用)。
@@ -16060,6 +16547,51 @@ fn pf2_gemm(
 // full attention の前半: qkv 射影 + per-head RMSNorm + partial NeoX rope
 // ---------------------------------------------------------------------------
 
+/// `DENNO_PF_MIRROR_DELTA` の値の解釈 (純関数)。明示的な真値だけ on。
+///
+/// **既定 off** (task 181 の lab で採否を決める)。
+pub(crate) fn pf_mirror_delta_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// task 181: KV ミラーを「チャンクの差分だけ」にするか (`DENNO_PF_MIRROR_DELTA`)。
+///
+/// off のときは従来どおり `pf_full_qkv` が k / v を D2H し、`pf_full_out` が
+/// ミラーへ H2D し直す。on にすると `pf_full_qkv` が **デバイスの k / v を
+/// そのままミラーへ D2D で書き**、`pf_full_out` は H2D をしない。
+pub(crate) fn pf_mirror_delta_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_MIRROR_DELTA_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_mirror_delta_from_value(std::env::var("DENNO_PF_MIRROR_DELTA").ok().as_deref())
+    })
+}
+
+#[cfg(test)]
+static PF_MIRROR_DELTA_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_mirror_delta_for_test(v: Option<bool>) {
+    PF_MIRROR_DELTA_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// task 172: full 層 1 チャンクの前半をデバイスで回す。
 ///
 /// 入力行 `x` を 1 回だけ H2D し、`attn_q` / `attn_k` / `attn_v` の 3 射影を
@@ -16090,6 +16622,7 @@ pub fn pf_full_qkv(
     layer: usize,
     gen: u64,
     t_total: usize,
+    pos0: usize,
     k_out: &mut [f32],
     v_out: &mut [f32],
 ) -> bool {
@@ -16114,7 +16647,7 @@ pub fn pf_full_qkv(
         && k.n == kv
         && v.k == e
         && v.n == kv
-        && t_total >= nt;
+        && pos0.checked_add(nt) == Some(t_total);
     if !ok_shape {
         pf2_note(1);
         return false;
@@ -16235,10 +16768,20 @@ pub fn pf_full_qkv(
         k_out.copy_from_slice(&kgot);
         let vgot: Vec<f32> = vdb.to_vec(nt * kv)?;
         v_out.copy_from_slice(&vgot);
-        // 5. ミラーへの追記はここではやらない。この関数が持っている k/v は
-        //    チャンクぶん (nt 行) だけで、ミラーは `[0..t_total)` を要求する。
-        //    呼び出し側がホストの KV へ積んだあと、`pf_full_out` が
-        //    キャッシュ全体を渡して追記する (転送内容は従来経路と同じ)。
+        // 5. task 181: ミラーへは**チャンクの行だけ**を直接書く (D2D)。
+        //    ミラーが行 [0, pos0) を持っていない (最初のチャンク・世代が変わった)
+        //    ときは `Err` が返るので、`pf_full_out` が従来の H2D 経路へ戻る。
+        //    ここで失敗しても値は壊れない (ホストの KV は既に積んである)。
+        let mut staged = None;
+        if pf_mirror_delta_on() {
+            match q4_attn_mirror_stage_dev(
+                cache_id, n_layer, kv, layer, gen, pos0, t_total, kdb.ptr(), vdb.ptr(),
+            ) {
+                Ok(_) => staged = Some((cache_id, layer, gen, t_total)),
+                Err(e) => pf2_warn(&format!("full qkv: ミラーへの直接書き: {e:#}")),
+            }
+        }
+        d.mir = staged;
         Ok(())
     });
     match r {
@@ -16318,8 +16861,25 @@ pub fn pf_full_out(
         return false;
     };
     let r = (|| -> Result<()> {
-        let (kptr, vptr) =
-            q4_attn_mirror_prepare(cache_id, n_layer, kv_dim, layer, gen, t_total, k_cpu, v_cpu, true)?;
+        // task 181: `pf_full_qkv` がミラーへ直接書いていれば H2D をしない
+        // (`DENNO_PF_MIRROR_DELTA`)。台帳が一致しないときは従来の差分 H2D。
+        let staged = PF2_DEV.with(|c| c.borrow().mir);
+        let mirror_direct = matches!(
+            staged,
+            Some((cid, li, g, tt)) if cid == cache_id && li == layer && g == gen && tt == t_total
+        );
+        let (kptr, vptr) = match mirror_direct {
+            true => match q4_attn_mirror_ready(cache_id, kv_dim, layer, gen, t_total) {
+                Some(p) => p,
+                // 台帳は合うがバッファが無い (LRU で落ちた等) → 従来経路で作り直す。
+                None => q4_attn_mirror_prepare(
+                    cache_id, n_layer, kv_dim, layer, gen, t_total, k_cpu, v_cpu, true,
+                )?,
+            },
+            false => q4_attn_mirror_prepare(
+                cache_id, n_layer, kv_dim, layer, gen, t_total, k_cpu, v_cpu, true,
+            )?,
+        };
         PF2_DEV.with(|cell| -> Result<()> {
             let mut d = cell.borrow_mut();
             pf2_ensure(&mut d.att, nt * qd * 4)?;
@@ -16397,6 +16957,8 @@ pub fn pf_full_out(
             Ok(())
         })
     })();
+    // task 181: 直接書きの印は 1 チャンク限り (次のチャンクへ持ち越さない)。
+    PF2_DEV.with(|c| c.borrow_mut().mir = None);
     match r {
         Ok(()) => {
             pf2_note(0);
@@ -20049,6 +20611,26 @@ fn q4_attn_mirror_prepare(
         Ok(g) => g,
         Err(e) => e.into_inner(),
     };
+    let idx = q4_attn_mirror_entry(&mut ms, cache_id, n_layer, kv_dim);
+    match q4_attn_mirror_sync(&mut ms[idx].1, layer, len, gen, kv_dim, k, v, pf) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            ms.retain(|(k, _, _)| *k != cache_id);
+            Err(e)
+        }
+    }
+}
+
+/// ミラーのエントリ (鍵 = `AttnCache::id()`) を引き、無ければ作り、
+/// 予算超過分を LRU で落とす。`idx` を返す。
+///
+/// task 133 の decode と task 134 / 181 の prefill の共通部分。
+fn q4_attn_mirror_entry(
+    ms: &mut Vec<(u64, Q4AttnMirror, std::time::Instant)>,
+    cache_id: u64,
+    n_layer: usize,
+    kv_dim: usize,
+) -> usize {
     let now = std::time::Instant::now();
     // 予算超過分を LRU で落とす (自分は落とさない)。
     let mut meta: Vec<MirrorMeta> = ms
@@ -20077,13 +20659,138 @@ fn q4_attn_mirror_prepare(
     if ms[idx].1.kv_dim != kv_dim || ms[idx].1.state.len.len() != n_layer {
         ms[idx].1 = Q4AttnMirror::new(n_layer, kv_dim);
     }
-    match q4_attn_mirror_sync(&mut ms[idx].1, layer, len, gen, kv_dim, k, v, pf) {
-        Ok(p) => Ok(p),
+    idx
+}
+
+/// task 181: チャンクの k / v (**デバイスに既にある**) をミラーの行
+/// `[pos0, t_total)` へ直接書く (D2D)。
+///
+/// 従来は `pf_full_qkv` が k / v を D2H し、ホストの `AttnCache` へ積み、
+/// `pf_full_out` が `q4_attn_mirror_prepare` で **同じ行を H2D し直して**いた。
+/// 行 `[0, pos0)` がミラーに正しく載っていれば、残りの行はデバイス間コピーで
+/// 足りる (H2D 0 B)。載っていなければ `Err` を返し、呼び出し側は従来経路
+/// (= 差分 H2D) へ戻る。
+///
+/// 台帳 (`Q4MirrorState`) の扱いは [`q4_attn_mirror_sync`] と同じ:
+/// 世代が変わった層・縮んだ層は「持っていない」と見なす (task 133)。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn q4_attn_mirror_stage_dev(
+    cache_id: u64,
+    n_layer: usize,
+    kv_dim: usize,
+    layer: usize,
+    gen: u64,
+    pos0: usize,
+    t_total: usize,
+    kdev: CUdeviceptr,
+    vdev: CUdeviceptr,
+) -> Result<(CUdeviceptr, CUdeviceptr)> {
+    if t_total < pos0 {
+        bail!("q4 attn mirror stage: pos0 {pos0} が t_total {t_total} を超える");
+    }
+    let mirrors = Q4_ATTN_MIRRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut ms = match mirrors.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let idx = q4_attn_mirror_entry(&mut ms, cache_id, n_layer, kv_dim);
+    let r = (|| -> Result<()> {
+        let m = &mut ms[idx].1;
+        let new_cap = q4_mirror_cap(t_total, m.state.cap);
+        if new_cap > m.state.cap {
+            // 成長は旧バッファの有効行を D2D で温存する (task 174 の余白込み)。
+            q4_attn_grow(m, new_cap, kv_dim)?;
+        }
+        if m.k[layer].is_none() || m.v[layer].is_none() {
+            let bytes = q4_mirror_alloc_rows(m.state.cap) * kv_dim * 4;
+            m.k[layer] = Some(DevBuffer::alloc_tagged(
+                bytes,
+                crate::mem_audit::TAG_ATTN_MIRROR,
+            )?);
+            m.v[layer] = Some(DevBuffer::alloc_tagged(
+                bytes,
+                crate::mem_audit::TAG_ATTN_MIRROR,
+            )?);
+            m.state.len[layer] = 0;
+        }
+        if t_total > m.state.cap {
+            bail!(
+                "q4 attn mirror stage: len {t_total} が cap {} を超えた (層 {layer})",
+                m.state.cap
+            );
+        }
+        // 行 [0, pos0) がこの世代の内容で載っているか (載っていなければ H2D 経路へ)。
+        let have = q4_mirror_have(&m.state, layer, pos0, gen);
+        if have != pos0 {
+            bail!("q4 attn mirror stage: 行 [0,{pos0}) が無い (have={have}, gen={gen})");
+        }
+        let nb = t_total - pos0;
+        if nb > 0 {
+            let need_bytes = t_total * kv_dim * 4;
+            for (slot_name, slot) in [("k", &m.k[layer]), ("v", &m.v[layer])] {
+                match slot.as_ref() {
+                    Some(b) if b.bytes() >= need_bytes => {}
+                    _ => bail!("q4 attn mirror stage: {slot_name} のバッファが足りない"),
+                }
+            }
+            let kb = m.k[layer].as_ref().expect("直前に確認した");
+            let vb = m.v[layer].as_ref().expect("直前に確認した");
+            kb.copy_from_dev_at(pos0 * kv_dim * 4, kdev, nb * kv_dim)?;
+            vb.copy_from_dev_at(pos0 * kv_dim * 4, vdev, nb * kv_dim)?;
+        }
+        q4_mirror_note(&mut m.state, layer, t_total, gen);
+        Ok(())
+    })();
+    match r {
+        Ok(()) => Ok((
+            ms[idx].1.k[layer]
+                .as_ref()
+                .ok_or_else(|| anyhow!("q4 attn mirror stage: k が無い"))?
+                .ptr(),
+            ms[idx].1.v[layer]
+                .as_ref()
+                .ok_or_else(|| anyhow!("q4 attn mirror stage: v が無い"))?
+                .ptr(),
+        )),
         Err(e) => {
+            // 中途半端なミラーを持たない (次回は全行シードから)。
             ms.retain(|(k, _, _)| *k != cache_id);
             Err(e)
         }
     }
+}
+
+/// task 181: `q4_attn_mirror_stage_dev` が既に置いたミラーのポインタを引く
+/// (**コピーもしない**)。台帳が `(layer, gen, t_total)` と一致するときだけ
+/// `Some`。呼び出し側はこれが `None` のとき従来の `prepare` を使う。
+fn q4_attn_mirror_ready(
+    cache_id: u64,
+    kv_dim: usize,
+    layer: usize,
+    gen: u64,
+    t_total: usize,
+) -> Option<(CUdeviceptr, CUdeviceptr)> {
+    let mirrors = Q4_ATTN_MIRRORS.get()?;
+    let mut ms = match mirrors.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let now = std::time::Instant::now();
+    let idx = ms.iter().position(|(k, _, _)| *k == cache_id)?;
+    ms[idx].2 = now;
+    let m = &ms[idx].1;
+    if m.kv_dim != kv_dim || layer >= m.state.len.len() {
+        return None;
+    }
+    if m.state.len[layer] != t_total || m.state.gen[layer] != gen {
+        return None;
+    }
+    let kb = m.k[layer].as_ref()?;
+    let vb = m.v[layer].as_ref()?;
+    if kb.bytes() < t_total * kv_dim * 4 || vb.bytes() < t_total * kv_dim * 4 {
+        return None;
+    }
+    Some((kb.ptr(), vb.ptr()))
 }
 
 struct Q4AttnScratch {
@@ -23559,6 +24266,40 @@ mod q4_attn_tests {
             have
         }
 
+        /// task 181: 本番の `q4_attn_mirror_stage_dev` と同じ手順
+        /// (cap 成長 → 行 [0, pos0) の確認 → チャンクの行だけ書く → note)。
+        ///
+        /// `Err` は本番と同じ意味で、「ミラーが行 [0, pos0) を持っていないので
+        /// 呼び出し側は従来の `sync` (差分 H2D) へ戻る」。
+        fn stage(&mut self, cache: &AttnCache, li: usize, pos0: usize) -> Result<usize, String> {
+            let len = cache.len(li).unwrap();
+            let gen = cache.gen(li).unwrap();
+            if len < pos0 {
+                return Err(format!("len {len} < pos0 {pos0}"));
+            }
+            let new_cap = q4_mirror_cap(len, self.state.cap);
+            if new_cap > self.state.cap {
+                self.grow(new_cap);
+            }
+            let have = q4_mirror_have(&self.state, li, pos0, gen);
+            if have != pos0 {
+                return Err(format!("行 [0,{pos0}) が無い (have={have}, gen={gen})"));
+            }
+            let row = self.row;
+            let need = (len) * row;
+            assert!(
+                self.k[li].len() >= need,
+                "ミラーのバッファが足りない (len={len}, cap={})",
+                self.state.cap
+            );
+            self.k[li][pos0 * row..len * row]
+                .copy_from_slice(&cache.k(li).unwrap()[pos0 * row..len * row]);
+            self.v[li][pos0 * row..len * row]
+                .copy_from_slice(&cache.v(li).unwrap()[pos0 * row..len * row]);
+            q4_mirror_note(&mut self.state, li, len, gen);
+            Ok(len - pos0)
+        }
+
         fn assert_matches(&self, cache: &AttnCache, li: usize, what: &str) {
             let len = cache.len(li).unwrap();
             let row = self.row;
@@ -23621,6 +24362,91 @@ mod q4_attn_tests {
         assert_eq!(mir.sync(&cache, 0), 4096, "段の直後は 1 行だけ送る");
         assert_eq!(mir.state.cap, 8192);
         mir.assert_matches(&cache, 0, "段の直後");
+    }
+
+    /// task 181: ミラーの差分経路 (`q4_attn_mirror_stage_dev`) が**全行コピーと
+    /// 同じ内容**になること。チャンク 1,000 行で 4,096 行まで積み、途中で
+    /// cap が 1,024 -> 2,048 -> 4,096 と伸びる (プロンプトの真ん中で grow)、
+    /// 最後は len = cap ちょうどで終わる。
+    ///
+    /// 最初のチャンクだけは台帳が空なので直接書きが `Err` になり、従来の差分
+    /// H2D (= 全行) に戻る。2 チャンク目以降はチャンクの行だけを書き、毎回
+    /// ホストの KV と行単位で一致することを確かめる。
+    #[test]
+    fn q4_mirror_delta_matches_full_copy_across_growth() {
+        let (n_layer, row) = (2usize, 4usize);
+        let chunk = 1000usize;
+        let total = 4096usize;
+        let mut cache = AttnCache::new(n_layer, 2, 2, 8192).unwrap();
+        let mut mir = SimMirror::new(n_layer, row);
+        let mut pos = 0usize;
+        let mut fell_back = 0usize;
+        let mut staged_rows = 0usize;
+        while pos < total {
+            let n = chunk.min(total - pos);
+            for i in 0..n {
+                push_rows(&mut cache, n_layer, row, (pos + i) as f32);
+            }
+            for l in 0..n_layer {
+                match mir.stage(&cache, l, pos) {
+                    Ok(nb) => {
+                        assert_eq!(nb, n, "直接書きの行数がチャンクと違う");
+                        staged_rows += nb;
+                    }
+                    Err(_) => {
+                        // 従来経路: 台帳の差分だけ H2D する (初回は全行)。
+                        mir.sync(&cache, l);
+                        fell_back += 1;
+                    }
+                }
+                mir.assert_matches(&cache, l, "差分経路");
+            }
+            pos += n;
+        }
+        assert_eq!(pos, total);
+        assert_eq!(mir.state.cap, 4096, "len = cap ちょうどで終わること");
+        // 台帳の have は pos0 で一致するので、**最初のチャンクから** チャンクの行
+        // だけを直接書ける (最初は have(0) == 0 == pos0)。
+        assert_eq!(fell_back, 0, "直接書きに戻った回数");
+        assert_eq!(staged_rows, total * n_layer, "直接書きした行数");
+        // 世代が変わった (clear / truncate 相当) あとは、pos0 > 0 の直接書きを
+        // 断る (呼び出し側は従来の全行 H2D へ戻る)。
+        cache.clear_all();
+        for i in 0..600 {
+            push_rows(&mut cache, n_layer, row, 100.0 + i as f32);
+        }
+        assert!(mir.stage(&cache, 0, 512).is_err(), "世代が違うのに直接書いた");
+        // pos0 = 0 は「全行の書き直し」になるので通る (こちらも内容は一致する)。
+        assert_eq!(mir.stage(&cache, 0, 0).unwrap(), 600);
+        mir.assert_matches(&cache, 0, "clear 後");
+    }
+
+    /// task 181: 直接書きは「行 [0, pos0) をミラーが既に持っている」ときだけ。
+    /// 空のミラーに pos0 > 0 を要求したら断る (呼び出し側は H2D 経路へ)。
+    #[test]
+    fn q4_mirror_delta_declines_when_prefix_is_missing() {
+        let (n_layer, row) = (1usize, 4usize);
+        let mut cache = AttnCache::new(n_layer, 2, 2, 4096).unwrap();
+        let mut mir = SimMirror::new(n_layer, row);
+        for i in 0..512 {
+            push_rows(&mut cache, n_layer, row, i as f32);
+        }
+        // 空のミラーに pos0 = 512 は無理。
+        assert!(mir.stage(&cache, 0, 512).is_err());
+        // pos0 = 0 なら書ける (全行)。
+        assert_eq!(mir.stage(&cache, 0, 0).unwrap(), 512);
+        mir.assert_matches(&cache, 0, "全行");
+        // 次のチャンクは先頭 512 行が載っているので、512 行だけ書けばよい。
+        for i in 512..1024 {
+            push_rows(&mut cache, n_layer, row, i as f32);
+        }
+        assert_eq!(mir.stage(&cache, 0, 512).unwrap(), 512);
+        mir.assert_matches(&cache, 0, "差分");
+        // pos0 = 0 を同じ世代で要求すると「全行を書き直す」になる (台帳の have は
+        // 0 を返すため)。本番の `pf_full_qkv` は必ず pos0 = t_total - nt で呼び、
+        // 書く行数はチャンクの nt 行なので、これは無害な書き直しになる。
+        assert_eq!(mir.stage(&cache, 0, 0).unwrap(), 1024);
+        mir.assert_matches(&cache, 0, "全行の書き直し");
     }
 
     /// task 133 の本丸: clear / clear_all / truncate_layer のあとで
@@ -23752,6 +24578,27 @@ mod q4_attn_tests {
         assert_eq!(Q4_GPU_ATTN_PF_MIN_DEFAULT, 8);
         assert!(ATTN_Q4_PF_MIN_ROWS < gemm_min_m());
         assert!(Q4_GPU_ATTN_PF_MIN_KV_DEFAULT > Q4_GPU_ATTN_MIN_DEFAULT);
+    }
+
+    /// task 181: `DENNO_PF_MIRROR_DELTA` の解釈 (既定 off。明示的な真値だけ on)。
+    #[test]
+    fn pf_mirror_delta_gate_parsing() {
+        assert!(!pf_mirror_delta_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " OFF ", "ON!"]
+        {
+            assert!(!pf_mirror_delta_from_value(Some(v)), "{v}");
+        }
+        for v in ["1", "on", "true", "yes", " ON "] {
+            assert!(pf_mirror_delta_from_value(Some(v)), "{v}");
+        }
+        // 強制上書き (テストは 1 プロセス並列なので set/戻しを対で行う)。
+        let before = pf_mirror_delta_on();
+        set_pf_mirror_delta_for_test(Some(true));
+        assert!(pf_mirror_delta_on());
+        set_pf_mirror_delta_for_test(Some(false));
+        assert!(!pf_mirror_delta_on());
+        set_pf_mirror_delta_for_test(None);
+        assert_eq!(pf_mirror_delta_on(), before);
     }
 
     /// task 134: prefill がチャンクを積んだ後、**最初の decode トークンは
@@ -29153,6 +30000,15 @@ fn gguf_gemm_dev_launch(
         if let Some(rb) = gguf_row_bytes(ty, n_in) {
             if let Some(tc) = tc2_gemm_kernels() {
                 tc2_gemm_launch(ctx, tc, ty, wptr, xptr, optr, nt, n_in, n_out, rb)?;
+                return Ok(true);
+            }
+        }
+    }
+    // task 181: N が小さい形 (ssm out_proj 2560 / shared 640) は BN=64 版。
+    if pf_tc_smalln_on() && pf_tc_smalln_eligible(ty, nt, n_in, n_out, pf_tc_min_m()) {
+        if let Some(rb) = gguf_row_bytes(ty, n_in) {
+            if let Some(sn) = tc_smalln_kernels() {
+                sn_gemm_launch(ctx, sn, ty, wptr, xptr, optr, nt, n_in, n_out, rb)?;
                 return Ok(true);
             }
         }
