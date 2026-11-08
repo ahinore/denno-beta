@@ -6665,3 +6665,197 @@ fn pf_tc_gemm_is_bf16_mma_q8_0() {
         "gemm の spec 行が変わった (arch 上書きの巻き添えに注意)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 176: prefill の BF16 テンソルコア GEMM v2 (`kernels_gemm_tc2.cu`)
+// ---------------------------------------------------------------------------
+
+const TC2_SRC: &str = include_str!("../kernels/kernels_gemm_tc2.cu");
+
+/// カーネルとホストのタイル定数・共有メモリ・起動形状が一致すること。
+///
+/// GPU 無しでも「片側だけ直した」事故はここで落ちる。数値の正しさ
+/// (`wmma` の意味) は [`tests/pf_tc2_gemm_gpu.rs`] の担当。
+#[test]
+fn pf_tc2_gemm_tile_matches_host() {
+    let d = defines(TC2_SRC);
+    let bm = eval_define("TC2_BM", &d);
+    let bn = eval_define("TC2_BN", &d);
+    let bk = eval_define("TC2_BK", &d);
+    let ld = eval_define("TC2_LD", &d);
+    let thr = eval_define("TC2_THREADS", &d);
+    let smem_def = eval_define("TC2_SMEM_BYTES", &d);
+    assert_eq!(bm, 128, "TC2_BM が 128 でない");
+    assert_eq!(bn, 128, "TC2_BN が 128 でない (br169 の 64 から倍にする)");
+    assert_eq!(bk, 32, "TC2_BK が 32 でない (Q8_0 の 1 ブロック = 32 要素)");
+    assert_eq!(ld, 40, "TC2_LD が 40 でない (32 + 8 の詰め物)");
+    assert_eq!(thr, 256, "TC2_THREADS が 256 でない");
+
+    // ホスト側のミラー定数 (cuda.rs) と一致すること。
+    assert_eq!(rust_const("TC2_BM"), bm, "cuda.rs の TC2_BM が不一致");
+    assert_eq!(rust_const("TC2_BN"), bn, "cuda.rs の TC2_BN が不一致");
+    assert_eq!(rust_const("TC2_BK"), bk, "cuda.rs の TC2_BK が不一致");
+    assert_eq!(rust_const("TC2_LD"), ld, "cuda.rs の TC2_LD が不一致");
+    assert_eq!(
+        rust_const("TC2_SMEM_BYTES"),
+        smem_def,
+        "cuda.rs の TC2_SMEM_BYTES が不一致"
+    );
+
+    // warp の配置: (BM/32) トークン群 × (BN/64) 行群 = 8 warp、1 warp あたり 2×4 タイル。
+    let warps = (bm / 32) * (bn / 64);
+    assert_eq!(warps, 8, "warp 数が 8 でない");
+    assert_eq!(warps * 32, thr, "1 ブロックのスレッド数が warps * 32 でない");
+    assert!(
+        TC2_SRC.contains("wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];"),
+        "アキュムレータが 2×4 の 16x16 でない"
+    );
+
+    // 共有メモリはカーネルの静的配列 (ホストは動的 smem を渡さない)。
+    for decl in [
+        "__shared__ __align__(32) __nv_bfloat16 sW[2 * TC2_BN * TC2_LD];",
+        "__shared__ __align__(32) __nv_bfloat16 sX[2 * TC2_BM * TC2_LD];",
+    ] {
+        assert!(TC2_SRC.contains(decl), "共有メモリの宣言が変わった: {decl}");
+    }
+    // 2 段バッファぶんの要素数 (define) が宣言と一致すること。
+    assert_eq!(eval_define("TC2_SW_ELEMS", &d), 2 * bn * ld);
+    assert_eq!(eval_define("TC2_SX_ELEMS", &d), 2 * bm * ld);
+    let expect_smem = 2 * bn * ld * 2 + 2 * bm * ld * 2;
+    assert_eq!(expect_smem, smem_def, "TC2_SMEM_BYTES の見積りが違う");
+    assert!(
+        expect_smem <= 48 * 1024,
+        "静的共有メモリ {expect_smem} B が 48 KiB を超える"
+    );
+    // 端数ステージは sX を作業域に再利用する (追加の smem を持たない)。
+    assert!(
+        TC2_SRC.contains("float* st = reinterpret_cast<float*>(sX) + warp * 256;"),
+        "端数ステージが sX の再利用になっていない"
+    );
+    assert!(
+        !TC2_SRC.contains("sStage"),
+        "端数ステージ用の追加配列ができている (smem が 48 KiB を超える)"
+    );
+
+    // 起動形状: blockDim 256・動的 smem 0 (カーネルは静的配列)。
+    assert!(
+        CUDA_RS.contains("(256, 1, 1), 0, &mut args)?;"),
+        "ホストが動的 smem を渡している (カーネルは静的配列なので 0 のはず)"
+    );
+    assert!(
+        CUDA_RS.contains("const TC2_BN: usize = 128;"),
+        "cuda.rs に TC2_BN のミラーが無い"
+    );
+}
+
+/// カーネルが BF16 の tensor core 経路であり、3 つの型の入口と
+/// Q4_K / Q5_K のビット配置が ggml 仕様どおりであること。
+#[test]
+fn pf_tc2_gemm_is_bf16_mma_and_kquant() {
+    assert!(
+        TC2_SRC.contains("#include <mma.h>") && TC2_SRC.contains("#include <cuda_bf16.h>"),
+        "BF16 の wmma ヘッダが無い"
+    );
+    assert!(
+        TC2_SRC
+            .contains("wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major>")
+            && TC2_SRC.contains(
+                "wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major>"
+            ),
+        "A が row_major / B が col_major の 16x16x16 bf16 でない (重みの行 = B の列)"
+    );
+    assert!(
+        TC2_SRC.contains("wmma::fill_fragment(acc[i][j], 0.0f);")
+            && TC2_SRC.contains("wmma::mma_sync("),
+        "FP32 アキュムレートの mma でない"
+    );
+
+    // 3 つの型の入口 (extern "C" なので PTX の名前がそのまま引ける)。
+    for name in [
+        "dno_gemm_tc2_q8_0_w",
+        "dno_gemm_tc2_q4k_w",
+        "dno_gemm_tc2_q5k_w",
+    ] {
+        assert!(
+            TC2_SRC.contains(&format!("extern \"C\" __global__ void {name}(")),
+            "入口 {name} が無い"
+        );
+        assert!(
+            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            "cuda.rs が {name} を読んでいない"
+        );
+    }
+
+    // Q8_0: 32 要素 = 34 B、スケールは先頭 2 B (f16)、量子値は 2 + j。
+    assert!(
+        TC2_SRC.contains("(size_t)(k0 >> 5) * 34u"),
+        "Q8_0 のブロック先頭 (k0 >> 5) * 34 が変わった"
+    );
+    assert!(
+        TC2_SRC.contains("blk + 2 + j"),
+        "Q8_0 の量子値の先頭 (blk + 2 + j) が変わった"
+    );
+
+    // Q4_K / Q5_K: 144 / 176 B のスーパーブロック、6bit scale/min、
+    // nibble は「1 バイト 1 個」(要素 0..31 が下ニブル、32..63 が上ニブル)、
+    // Q5_K の 5bit 目は qh[j+u] の bit sub。
+    assert!(
+        TC2_SRC.contains("(TY == 1 ? 144u : 176u)"),
+        "Q4_K / Q5_K のスーパーブロック長が変わった"
+    );
+    assert!(
+        TC2_SRC.contains("dno_tc2_scale_min_k4"),
+        "6bit scale/min の展開が無い"
+    );
+    assert!(
+        TC2_SRC.contains("if (j < 4) {")
+            && TC2_SRC.contains("(q[j + 4] & 0x0fu) | ((unsigned int)(q[j - 4] >> 6) << 4)"),
+        "get_scale_min_k4 の式が kernels_gemm.cu と違う"
+    );
+    assert!(
+        TC2_SRC.contains("const int shift = (sub & 1) ? 4 : 0;"),
+        "サブブロックの nibble 選択が無い"
+    );
+    assert!(
+        TC2_SRC.contains("blk[16 + j + u] >> sub) & 1u) << 4"),
+        "Q5_K の 5bit 目の取り出しが変わった"
+    );
+
+    // 2 段プリフェッチ: k ループの中で「次のステップを先に読む」こと。
+    let loop_at = TC2_SRC
+        .find("for (int k = 0; k < kb; ++k)")
+        .expect("k ループが無い");
+    let body = &TC2_SRC[loop_at..];
+    let load_w = body.find("dno_tc2_load_w<TY>(").expect("ループ内に重みの先読みが無い");
+    let mma = body.find("wmma::mma_sync(").expect("ループ内に mma が無い");
+    let store = body
+        .find("dno_tc2_store8(sW + nxt")
+        .expect("ループ内に smem への書き込みが無い");
+    assert!(
+        load_w < mma && mma < store,
+        "プリフェッチの順序が「読む → mma → 書く」でない (レイテンシが隠れない)"
+    );
+    assert!(
+        body.contains("const bool more = (k + 1) < kb;"),
+        "最終ステップのガードが無い"
+    );
+
+    // build_ptx.sh: この target だけ arch を上げる (bf16 mma は compute_80 以降)。
+    assert!(
+        BUILD_PTX_SH.contains("gemm_tc2)     echo \"kernels_gemm_tc2.cu|fmad|compute_90\""),
+        "build_ptx.sh の gemm_tc2 が compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gemm_tc2"),
+        "build_ptx.sh の targets_all に gemm_tc2 が無い: {targets}"
+    );
+    // 既存の gemm_tc はそのまま (br169 の経路を壊していないこと)。
+    assert!(
+        BUILD_PTX_SH.contains("gemm_tc)      echo \"kernels_gemm_tc.cu|fmad|compute_90\""),
+        "gemm_tc の spec 行が変わった"
+    );
+}

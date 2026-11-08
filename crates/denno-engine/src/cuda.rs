@@ -2338,11 +2338,27 @@ impl CudaCtx {
         // task 169: Q8_0 は BF16 テンソルコア GEMM (ゲート on・形が合うとき)。
         // 従来カーネルは 1 起動 128 トークンまでだが、こちらは 2048 トークンまでを
         // 1 起動で畳む (起動・同期・H2D/D2H の回数が 1/16 になる)。
-        if matches!(ty, T::Q8_0)
+        // task 176: v2 カーネルが使える形 (Q8_0 / Q4_K / Q5_K・出力行 128 の倍数・
+        // 十分なブロック数) は v2 を優先し、だめなら br169 のカーネルへ。
+        let mut tc_sel: Option<TcSel> = None;
+        if pf_tc2_gemm_on() && pf_tc2_eligible(ty, nt, n_in, n_out, pf_tc_min_m()) {
+            if let Some(f) = tc2_gemm_kernels() {
+                tc_sel = Some(TcSel::V2(f));
+            }
+        }
+        if tc_sel.is_none()
+            && matches!(ty, T::Q8_0)
             && pf_tc_gemm_on()
             && pf_tc_gemm_eligible(nt, n_in, n_out, pf_tc_min_m())
         {
-            let rb = (n_in / 32) * 34;
+            if let Some(f) = tc_gemm_kernels() {
+                tc_sel = Some(TcSel::V1(f));
+            }
+        }
+        if let Some(sel) = tc_sel {
+            let Some(rb) = gguf_row_bytes(ty, n_in) else {
+                return Ok(false);
+            };
             if x.len() != nt * n_in || out.len() != nt * n_out {
                 bail!(
                     "moe_gemm_dev(tc): 形状が不正 (nt={nt}, n_in={n_in}, n_out={n_out}, \
@@ -2359,35 +2375,32 @@ impl CudaCtx {
                 );
             }
             self.make_current()?;
-            if let Some(tc) = tc_gemm_kernels() {
-                MOE_SCRATCH.with(|cell| -> Result<()> {
-                    let mut s = cell.borrow_mut();
-                    MoeScratch::ensure_tagged(
-                        &mut s.x,
-                        nt * n_in * 4,
-                        crate::mem_audit::TAG_GEMV,
-                    )?;
-                    MoeScratch::ensure_tagged(
-                        &mut s.o,
-                        nt * n_out * 4,
-                        crate::mem_audit::TAG_GEMV,
-                    )?;
-                    let xb = s.x.as_ref().expect("x は ensure 済み");
-                    let ob = s.o.as_ref().expect("o は ensure 済み");
-                    xb.copy_from(x)?;
-                    dbg_htod(nt * n_in * 4);
-                    let t_sync = crate::model::devprof::sync_start();
-                    tc_gemm_launch(self, tc, dev_w.ptr, xb.ptr, ob.ptr, nt, n_in, n_out, rb)?;
-                    self.sync()?;
-                    let got: Vec<f32> = ob.to_vec(nt * n_out)?;
-                    if let Some(t) = t_sync {
-                        crate::model::devprof::note_sync(t.elapsed().as_nanos() as u64);
+            MOE_SCRATCH.with(|cell| -> Result<()> {
+                let mut s = cell.borrow_mut();
+                MoeScratch::ensure_tagged(&mut s.x, nt * n_in * 4, crate::mem_audit::TAG_GEMV)?;
+                MoeScratch::ensure_tagged(&mut s.o, nt * n_out * 4, crate::mem_audit::TAG_GEMV)?;
+                let xb = s.x.as_ref().expect("x は ensure 済み");
+                let ob = s.o.as_ref().expect("o は ensure 済み");
+                xb.copy_from(x)?;
+                dbg_htod(nt * n_in * 4);
+                let t_sync = crate::model::devprof::sync_start();
+                match sel {
+                    TcSel::V2(f) => tc2_gemm_launch(
+                        self, f, ty, dev_w.ptr, xb.ptr, ob.ptr, nt, n_in, n_out, rb,
+                    )?,
+                    TcSel::V1(f) => {
+                        tc_gemm_launch(self, f, dev_w.ptr, xb.ptr, ob.ptr, nt, n_in, n_out, rb)?
                     }
-                    out[..nt * n_out].copy_from_slice(&got);
-                    Ok(())
-                })?;
-                return Ok(true);
-            }
+                }
+                self.sync()?;
+                let got: Vec<f32> = ob.to_vec(nt * n_out)?;
+                if let Some(t) = t_sync {
+                    crate::model::devprof::note_sync(t.elapsed().as_nanos() as u64);
+                }
+                out[..nt * n_out].copy_from_slice(&got);
+                Ok(())
+            })?;
+            return Ok(true);
         }
         let Some(fs) = self.f_gemm_q else {
             return Ok(false);
@@ -11656,7 +11669,15 @@ fn gemm_try(
     // VRAM 内で済む)。task 169: テンソルコア GEMM が使えるときは 1 起動
     // 2,048 トークンまでまとめる (起動・同期・H2D/D2H の回数が 1/16 になる。
     // プリフィルのチャンクは 512 なので実際は 1 回)。
-    let tile = gemm_try_tile_for(pf_tc_gemm_on(), ty, nt, k, n, pf_tc_min_m());
+    let tile = gemm_try_tile_for(
+        pf_tc_gemm_on(),
+        pf_tc2_gemm_on(),
+        ty,
+        nt,
+        k,
+        n,
+        pf_tc_min_m(),
+    );
     if nt > tile {
         let mut t0 = 0usize;
         while t0 < nt {
@@ -11816,6 +11837,7 @@ pub(crate) fn pf_tc_gemm_eligible(nt: usize, n_in: usize, n_out: usize, min_m: u
 /// [`TC_MAX_TOKENS`] までまとめる (起動・同期・H2D/D2H の回数が減る)。
 fn gemm_try_tile_for(
     tc_on: bool,
+    tc2_on: bool,
     ty: crate::kquant::GgmlType,
     nt: usize,
     k: usize,
@@ -11825,7 +11847,9 @@ fn gemm_try_tile_for(
     let tc = tc_on
         && matches!(ty, crate::kquant::GgmlType::Q8_0)
         && pf_tc_gemm_eligible(nt, k, n, min_m);
-    if tc {
+    // task 176: v2 カーネルも 2,048 トークンまで 1 起動で畳める (Q4_K / Q5_K も含む)。
+    let tc2 = tc2_on && pf_tc2_eligible(ty, nt, k, n, min_m);
+    if tc || tc2 {
         TC_MAX_TOKENS
     } else {
         128
@@ -11842,6 +11866,12 @@ struct TcGemm {
 
 unsafe impl Send for TcGemm {}
 unsafe impl Sync for TcGemm {}
+
+/// テンソルコア GEMM のどちらを使うか (br169 / task 176 の v2)。
+enum TcSel {
+    V1(&'static TcGemm),
+    V2(&'static Tc2Gemm),
+}
 
 static TC_GEMM: OnceLock<Option<TcGemm>> = OnceLock::new();
 
@@ -11942,6 +11972,313 @@ fn tc_gemm_launch(
         ];
         unsafe {
             ctx.launch_async(fns.q8_0, (grid_x, grid_y, 1), (256, 1, 1), 0, &mut args)?;
+        }
+        t0 += m;
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// task 176: prefill の射影を BF16 テンソルコア GEMM v2 で回す (`DENNO_PF_TC_GEMM2`)
+// ===========================================================================
+//
+// br169 (`kernels_gemm_tc.cu`) は 1 ブロック = 128 トークン × 64 行で、k ステップ
+// ごとに「global 読み → smem 書き → 同期 → mma → 同期」を直列に回していた
+// (プリフェッチ無し)。lab t169b の台帳 (14,018 トークン cold prefill) では
+//   ssm qkv  512 x 2560 x 10240  3,371 ms → 8.0 TFLOP/s
+//   z        512 x 2560 x  6144  2,896 ms → 5.6 TFLOP/s
+//   out      512 x 6144 x  2560    667 ms → 24.3 TFLOP/s
+// と同じカーネルでも K 2560 の形だけが極端に遅く、1 ステップの露出レイテンシが
+// 固定費として効いている。v2 では
+//   1. 出力行 64 → 128 (1 ブロックの仕事が 2 倍 = 固定費が半分)
+//   2. 2 段のレジスタプリフェッチ (次の k を先に読み、その mma と重ねる)
+//   3. smem の行ストライド 40 (バンク衝突の回避)
+//   4. Q4_K / Q5_K も同じカーネルで扱う (実モデルの ssm qkv は 4 層だけ Q5_K、
+//      z は Q4_K。br169 はこの 4 層を f32 カーネルへ落としていた = 14k の
+//      qkv_pf 6,268 ms のうち約 1.8 s がこの 4 層)
+// を行う。数値契約は br169 と同じく無し (x と重みを BF16 に丸め、FP32 で
+// アキュムレートする。丸めだけの差で演算の意味は同じ)。
+//
+// 既定 off (`DENNO_PF_TC_GEMM2=1` で有効)。PTX は実行時読み込みで、無ければ
+// br169 のカーネル → 従来カーネルへ fail closed (`[pf-tc2]` の 1 行だけ出す)。
+//
+// PTX: `bash build_ptx.sh gemm_tc2` (この target だけ arch = compute_90)。
+// このコンテナには nvcc が無いので生成は GPU 側 (lab は PTX=gemm_tc2 で行う)。
+
+/// 1 ブロックのタイル (`kernels_gemm_tc2.cu` の TC2_BM / TC2_BN / TC2_BK と一致)。
+const TC2_BM: usize = 128;
+const TC2_BN: usize = 128;
+const TC2_BK: usize = 32;
+/// 共有メモリの行ストライド (`TC2_LD`。8 要素の詰め物でバンク衝突を避ける)。
+const TC2_LD: usize = 40;
+/// 静的共有メモリの合計 (`TC2_SMEM_BYTES` = sW 2 x 128 x 40 x 2 + sX 同)。
+const TC2_SMEM_BYTES: usize = 40_960;
+/// 1 起動でまとめるトークン数の上限 (br169 と同じ)。
+const TC2_MAX_TOKENS: usize = 2048;
+/// v2 を使う最小の出力行数。**K 2560 で N が大きい形だけ**を v2 にし、
+/// out_proj (N 2560) と shared expert (N 640) は br169 のまま残す
+/// (br169 は K 6144 の形で 24.3 TFLOP/s 出ているので、触らない方が安全)。
+const TC2_MIN_N: usize = 4096;
+
+/// smem の見積りがカーネル側の `TC2_SMEM_BYTES` と一致することのコンパイル時検査
+/// (実行時コスト 0。片側だけ直した事故をここで落とす)。
+const _: [(); TC2_SMEM_BYTES] = [(); 2 * TC2_BN * TC2_LD * 2 + 2 * TC2_BM * TC2_LD * 2];
+
+/// `DENNO_PF_TC_GEMM2` の値の解釈 (純関数)。`1`・`on`・`true`・`yes` だけが on。
+pub(crate) fn pf_tc2_gemm_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => false,
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+    }
+}
+
+/// v2 カーネルを使うか (**既定 off**)。
+pub(crate) fn pf_tc2_gemm_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_TC2_GEMM_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_tc2_gemm_from_value(std::env::var("DENNO_PF_TC_GEMM2").ok().as_deref()))
+}
+
+#[cfg(test)]
+static PF_TC2_GEMM_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_tc2_gemm_for_test(v: Option<bool>) {
+    PF_TC2_GEMM_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// v2 カーネルが扱える型か (純関数)。
+pub(crate) fn pf_tc2_type_ok(ty: crate::kquant::GgmlType) -> bool {
+    use crate::kquant::GgmlType as T;
+    matches!(ty, T::Q8_0 | T::Q4K | T::Q5K)
+}
+
+/// v2 カーネルの k の前提 (純関数)。Q8_0 は 32、K-quant は 256 の倍数。
+pub(crate) fn pf_tc2_k_ok(ty: crate::kquant::GgmlType, n_in: usize) -> bool {
+    use crate::kquant::GgmlType as T;
+    match ty {
+        T::Q8_0 => n_in > 0 && n_in % TC2_BK == 0,
+        T::Q4K | T::Q5K => n_in > 0 && n_in % 256 == 0,
+        _ => false,
+    }
+}
+
+/// 立つブロック数 (純関数。診断・テスト用)。
+#[cfg(test)]
+pub(crate) fn pf_tc2_blocks(nt: usize, n_out: usize) -> usize {
+    if n_out % TC2_BN != 0 {
+        return 0;
+    }
+    (n_out / TC2_BN) * nt.div_ceil(TC2_BM)
+}
+
+/// この形を v2 カーネルで回せるか (純関数。カーネルの前提と同じ)。
+///
+/// 型 (Q8_0 / Q4_K / Q5_K)・k の倍数・出力行 128 の倍数・`N >= TC2_MIN_N`。
+/// 小さい N (out_proj 2560 / shared expert 640) はブロック数が足りず v2 の
+/// 利点が無いので br169 に任せる。
+pub(crate) fn pf_tc2_eligible(
+    ty: crate::kquant::GgmlType,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    min_m: usize,
+) -> bool {
+    pf_tc2_type_ok(ty)
+        && pf_tc2_k_ok(ty, n_in)
+        && nt >= min_m.max(1)
+        && n_out >= TC2_MIN_N
+        && n_out % TC2_BN == 0
+}
+
+/// この形を**何らかの**テンソルコア GEMM で回せるか (PTX が読めることも見る)。
+///
+/// `gemm_try` / GDN 連鎖の「1 起動でまとめる幅」の判定に使う。どちらの
+/// カーネルも使えないときは従来カーネル (1 起動 128 トークン) なので、
+/// まとめ幅を広げてはいけない (広げると呼び出し側が CPU へ落ちる)。
+fn pf_gemm_fast_ok(
+    ty: crate::kquant::GgmlType,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    min_m: usize,
+) -> bool {
+    if pf_tc2_gemm_on()
+        && pf_tc2_eligible(ty, nt, n_in, n_out, min_m)
+        && tc2_gemm_kernels().is_some()
+    {
+        return true;
+    }
+    matches!(ty, crate::kquant::GgmlType::Q8_0)
+        && pf_tc_gemm_on()
+        && pf_tc_gemm_eligible(nt, n_in, n_out, min_m)
+        && tc_gemm_kernels().is_some()
+}
+
+/// v2 カーネル (PTX は実行時読み込み)。
+struct Tc2Gemm {
+    /// モジュールは生かしておく必要がある (関数ハンドルの持ち主)。
+    #[allow(dead_code)]
+    module: CUmodule,
+    q8_0: CUfunction,
+    q4k: CUfunction,
+    q5k: CUfunction,
+}
+
+unsafe impl Send for Tc2Gemm {}
+unsafe impl Sync for Tc2Gemm {}
+
+static TC2_GEMM: OnceLock<Option<Tc2Gemm>> = OnceLock::new();
+
+/// PTX の置き場所。`DENNO_PF_TC2_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_gemm_tc2.ptx`。
+fn tc2_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_TC2_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gemm_tc2.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける
+/// (= 二度と試さない)。**current context を張った後に呼ぶこと**。
+fn tc2_gemm_kernels() -> Option<&'static Tc2Gemm> {
+    TC2_GEMM
+        .get_or_init(|| {
+            let path = tc2_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[pf-tc2] PTX が読めない ({}) : {e} → 従来の GEMM へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0); // cuModuleLoadData は NUL 終端の PTX を期待する
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[pf-tc2] cuModuleLoadData 失敗 → 従来の GEMM へ");
+                    return None;
+                }
+                // 変数名は kernel_invariants の起動サイト表 (`module_get_function` と
+                // `fns.X` の対応) が読む。
+                let mut q8_0: CUfunction = std::ptr::null_mut();
+                let mut q4k: CUfunction = std::ptr::null_mut();
+                let mut q5k: CUfunction = std::ptr::null_mut();
+                for (dst, name, label) in [
+                    (
+                        &mut q8_0,
+                        b"dno_gemm_tc2_q8_0_w\0".as_ptr(),
+                        "dno_gemm_tc2_q8_0_w",
+                    ),
+                    (
+                        &mut q4k,
+                        b"dno_gemm_tc2_q4k_w\0".as_ptr(),
+                        "dno_gemm_tc2_q4k_w",
+                    ),
+                    (
+                        &mut q5k,
+                        b"dno_gemm_tc2_q5k_w\0".as_ptr(),
+                        "dno_gemm_tc2_q5k_w",
+                    ),
+                ] {
+                    if (lib.module_get_function)(dst, module, name as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!("[pf-tc2] PTX に {label} が無い → 従来の GEMM へ");
+                        return None;
+                    }
+                }
+                Some(Tc2Gemm {
+                    module,
+                    q8_0,
+                    q4k,
+                    q5k,
+                })
+            }
+        })
+        .as_ref()
+}
+
+/// 型ごとのカーネル (純関数)。
+fn tc2_func(fns: &Tc2Gemm, ty: crate::kquant::GgmlType) -> Option<CUfunction> {
+    use crate::kquant::GgmlType as T;
+    match ty {
+        T::Q8_0 => Some(fns.q8_0),
+        T::Q4K => Some(fns.q4k),
+        T::Q5K => Some(fns.q5k),
+        _ => None,
+    }
+}
+
+/// v2 カーネルを `TC2_MAX_TOKENS` 行ずつ起動する (w / x / out はデバイス)。
+#[allow(clippy::too_many_arguments)]
+fn tc2_gemm_launch(
+    ctx: &CudaCtx,
+    fns: &Tc2Gemm,
+    ty: crate::kquant::GgmlType,
+    wptr: CUdeviceptr,
+    xptr: CUdeviceptr,
+    optr: CUdeviceptr,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    row_bytes: usize,
+) -> Result<()> {
+    if nt == 0 {
+        return Ok(());
+    }
+    let Some(f) = tc2_func(fns, ty) else {
+        bail!("tc2_gemm_launch: 未対応の型 {ty:?}");
+    };
+    let grid_x = (n_out / TC2_BN) as u32;
+    let mut t0 = 0usize;
+    while t0 < nt {
+        let m = (nt - t0).min(TC2_MAX_TOKENS);
+        let grid_y = m.div_ceil(TC2_BM) as u32;
+        let (mut pw, mut px, mut po) = (
+            wptr,
+            xptr + (t0 * n_in * 4) as CUdeviceptr,
+            optr + (t0 * n_out * 4) as CUdeviceptr,
+        );
+        let (mut m_c, mut ni_c, mut no_c, mut rb_c) = (
+            m as c_int,
+            n_in as c_int,
+            n_out as c_int,
+            row_bytes as c_int,
+        );
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut m_c as *mut _ as *mut c_void,
+            &mut ni_c as *mut _ as *mut c_void,
+            &mut no_c as *mut _ as *mut c_void,
+            &mut rb_c as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            ctx.launch_async(f, (grid_x, grid_y, 1), (256, 1, 1), 0, &mut args)?;
         }
         t0 += m;
     }
@@ -12106,15 +12443,47 @@ mod pf_tc_tests {
             (6144, 2560),
             (640, 2560),
         ] {
-            assert_eq!(gemm_try_tile_for(true, T::Q8_0, 512, k, n, 64), TC_MAX_TOKENS);
-            assert_eq!(gemm_try_tile_for(false, T::Q8_0, 512, k, n, 64), 128);
+            assert_eq!(
+                gemm_try_tile_for(true, false, T::Q8_0, 512, k, n, 64),
+                TC_MAX_TOKENS
+            );
+            assert_eq!(
+                gemm_try_tile_for(false, false, T::Q8_0, 512, k, n, 64),
+                128
+            );
         }
         // 19 トークンの next turn は従来の 128 のまま (1 回で収まる)。
-        assert_eq!(gemm_try_tile_for(true, T::Q8_0, 19, 2560, 16384, 64), 128);
+        assert_eq!(
+            gemm_try_tile_for(true, false, T::Q8_0, 19, 2560, 16384, 64),
+            128
+        );
         // Q8_0 以外と、ブロック形が合わない形も従来のまま。
-        assert_eq!(gemm_try_tile_for(true, T::Q5K, 512, 2560, 16384, 64), 128);
-        assert_eq!(gemm_try_tile_for(true, T::Q8_0, 512, 2559, 16384, 64), 128);
-        assert_eq!(gemm_try_tile_for(true, T::Q8_0, 512, 2560, 1000, 64), 128);
+        assert_eq!(
+            gemm_try_tile_for(true, false, T::Q5K, 512, 2560, 16384, 64),
+            128
+        );
+        assert_eq!(
+            gemm_try_tile_for(true, false, T::Q8_0, 512, 2559, 16384, 64),
+            128
+        );
+        assert_eq!(
+            gemm_try_tile_for(true, false, T::Q8_0, 512, 2560, 1000, 64),
+            128
+        );
+        // task 176: v2 だけが使える形 (Q5K / Q4K) でも 2,048 までまとめる。
+        assert_eq!(
+            gemm_try_tile_for(false, true, T::Q5K, 512, 2560, 10240, 64),
+            TC_MAX_TOKENS
+        );
+        assert_eq!(
+            gemm_try_tile_for(false, true, T::Q4K, 512, 2560, 6144, 64),
+            TC_MAX_TOKENS
+        );
+        // v2 の条件 (出力行 128 の倍数・ブロック数) を満たさない形は 128 のまま。
+        assert_eq!(
+            gemm_try_tile_for(false, true, T::Q8_0, 512, 6144, 2560, 64),
+            128
+        );
         assert_eq!(TC_MAX_TOKENS, 2048);
     }
 
@@ -12126,6 +12495,171 @@ mod pf_tc_tests {
                 let mwarp = warp & 3;
                 for i in 0..2usize {
                     let mrow = mwarp * 32 + i * 16;
+                    if mrow < nt && mrow + 16 > nt {
+                        let rows = nt - mrow;
+                        assert!(rows >= 1 && rows <= 15, "nt={nt} mrow={mrow}");
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // task 176: v2 (kernels_gemm_tc2.cu) のゲート・適格性・索引ミラー
+    // ------------------------------------------------------------------
+
+    /// `DENNO_PF_TC_GEMM2` の真理値表 (既定 off。v2 は lab で採否を決めるまで off)。
+    #[test]
+    fn pf_tc2_gate_truth_table() {
+        assert!(!pf_tc2_gemm_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " OFF ", "2"] {
+            assert!(!pf_tc2_gemm_from_value(Some(v)), "{v}");
+        }
+        for v in ["1", "on", "true", "yes", " ON "] {
+            assert!(pf_tc2_gemm_from_value(Some(v)), "{v}");
+        }
+    }
+
+    /// 強制上書きが効くこと (テストは 1 プロセス並列なので set/戻しを対で行う)。
+    #[test]
+    fn pf_tc2_gate_force_switch() {
+        let before = pf_tc2_gemm_on();
+        set_pf_tc2_gemm_for_test(Some(true));
+        assert!(pf_tc2_gemm_on());
+        set_pf_tc2_gemm_for_test(Some(false));
+        assert!(!pf_tc2_gemm_on());
+        set_pf_tc2_gemm_for_test(None);
+        assert_eq!(pf_tc2_gemm_on(), before);
+    }
+
+    /// 実モデルの形で v2 の適格性が期待どおりになること。
+    ///
+    /// 14k cold prefill の 1 チャンク (nt=512) の 3 本:
+    ///   ssm qkv  512 x 2560 x 10240 (Q8_0 / 4 層だけ Q5_K) → v2
+    ///   z        512 x 2560 x  6144 (Q8_0 / 4 層だけ Q4_K)  → v2
+    ///   out      512 x 6144 x  2560                          → br169 (N が小さい)
+    #[test]
+    fn pf_tc2_eligibility_real_shapes() {
+        use crate::kquant::GgmlType as T;
+        // v2 が担当する形 (N >= 4096)。M は 1 でも形の条件は満たす
+        // (GPU 検算テストが M=1/17 を v2 に通せるようにするため)。
+        for (ty, k, n) in [
+            (T::Q8_0, 2560usize, 10240usize),
+            (T::Q5K, 2560, 10240),
+            (T::Q8_0, 2560, 6144),
+            (T::Q4K, 2560, 6144),
+            (T::Q8_0, 2560, 13312),
+        ] {
+            assert!(pf_tc2_eligible(ty, 512, k, n, 64), "{ty:?} k={k} n={n}");
+            assert!(pf_tc2_eligible(ty, 1, k, n, 1), "{ty:?} M=1 k={k} n={n}");
+            assert!(pf_tc2_blocks(512, n) >= 48);
+        }
+        // 出力行が小さい形は br169 に任せる (out_proj 2560 / shared 640)。
+        for (k, n) in [(6144usize, 2560usize), (2560, 640), (2560, 1024)] {
+            assert!(
+                !pf_tc2_eligible(T::Q8_0, 512, k, n, 64),
+                "k={k} n={n} が v2 適格になっている"
+            );
+        }
+        // 型・k の倍数・M の下限。
+        assert!(!pf_tc2_eligible(T::Q5_1, 512, 2560, 10240, 64));
+        assert!(!pf_tc2_eligible(T::Q8_0, 512, 2559, 10240, 64));
+        assert!(!pf_tc2_eligible(T::Q5K, 512, 2560, 10240, 513));
+        assert!(!pf_tc2_eligible(T::Q4K, 512, 2400, 10240, 64), "256 の倍数でない");
+        assert!(pf_tc2_eligible(T::Q4K, 512, 2560, 10240, 64));
+        assert!(pf_tc2_eligible(T::Q5K, 512, 5120, 10240, 64));
+        // 2048 トークン (まとめ幅の上限) でも適格。
+        assert!(pf_tc2_eligible(T::Q8_0, 2048, 2560, 10240, 64));
+        // 出力行が 128 の倍数でない形は落ちる。
+        assert!(!pf_tc2_eligible(T::Q8_0, 512, 2560, 10240 + 64, 64));
+    }
+
+    /// `pf_tc2_blocks` の数え方 (純関数)。
+    #[test]
+    fn pf_tc2_blocks_count() {
+        assert_eq!(pf_tc2_blocks(512, 10240), 80 * 4);
+        assert_eq!(pf_tc2_blocks(512, 6144), 48 * 4);
+        assert_eq!(pf_tc2_blocks(512, 2560), 20 * 4);
+        assert_eq!(pf_tc2_blocks(19, 10240), 80 * 1);
+        assert_eq!(pf_tc2_blocks(2048, 10240), 80 * 16);
+        // 出力行が 128 の倍数でない形は 0 (適格判定で落ちる)。
+        assert_eq!(pf_tc2_blocks(512, 10240 + 64), 0);
+    }
+
+    /// v2 カーネルの索引算術を CPU ミラーで確かめる
+    /// (`kernels_gemm_tc2.cu` のステージ担当・warp の担当範囲・端数の条件を
+    /// 1 対 1 で写す)。GPU 実測の代わりではない。
+    #[test]
+    fn pf_tc2_tile_index_mirror() {
+        // 1. 重み / 入力タイル: 256 スレッド × 8 要素 × 2 組が [128][32] を
+        //    ちょうど 1 回覆う。行 = (tid>>2) + 64*hf、列 j = (tid&3)*8。
+        for (bm, what) in [(TC2_BN, "重み"), (TC2_BM, "入力")] {
+            let mut seen = vec![false; bm * TC2_BK];
+            for tid in 0..256usize {
+                for hf in 0..2usize {
+                    let row = (tid >> 2) + hf * 64;
+                    let j = (tid & 3) * 8;
+                    assert!(row < bm && j + 8 <= TC2_BK, "{what}: row={row} j={j}");
+                    for u in 0..8usize {
+                        let idx = row * TC2_BK + j + u;
+                        assert!(!seen[idx], "{what}スロットの二重書き row={row} j={j}");
+                        seen[idx] = true;
+                    }
+                }
+            }
+            assert!(seen.iter().all(|&b| b), "{what}スロットの取りこぼし");
+        }
+
+        // 2. warp のアキュムレータ (4 トークン群 × 2 行群 × 2 × 4 タイル) が
+        //    [128][128] をちょうど 1 回覆い、行/列の先頭が 16 の倍数であること。
+        let mut seen = vec![false; TC2_BM * TC2_BN];
+        let mut warps = 0usize;
+        for warp in 0..8usize {
+            warps += 1;
+            let (wm, wn) = (warp & 3, warp >> 2);
+            for i in 0..2usize {
+                let mrow = wm * 32 + i * 16;
+                assert_eq!(mrow % 16, 0);
+                for j in 0..4usize {
+                    let ncol = wn * 64 + j * 16;
+                    assert_eq!(ncol % 16, 0);
+                    for r in 0..16usize {
+                        for c in 0..16usize {
+                            let idx = (mrow + r) * TC2_BN + ncol + c;
+                            assert!(!seen[idx], "アキュムレータの二重担当");
+                            seen[idx] = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(warps, 8, "warp 数が 8 でない");
+        assert!(seen.iter().all(|&b| b), "アキュムレータの取りこぼし");
+
+        // 3. 行ストライドの詰め物: ldm は bf16 で 16 バイトの倍数が要る
+        //    (wmma::load_matrix_sync の前提)。40 * 2 = 80 B は 16 の倍数。
+        assert_eq!(TC2_LD % 8, 0, "TC2_LD が 8 の倍数でない (ldm の 16B 整列)");
+        assert_eq!(TC2_LD * 2 % 16, 0);
+        assert!(TC2_LD > TC2_BK, "詰め物が無い (バンク衝突)");
+
+        // 4. 静的共有メモリの見積りがカーネル側の宣言と一致し、48 KiB に収まる。
+        let smem = 2 * TC2_BN * TC2_LD * 2 + 2 * TC2_BM * TC2_LD * 2;
+        assert_eq!(smem, TC2_SMEM_BYTES, "共有メモリの合計が .cu と違う");
+        assert_eq!(smem, 40_960);
+        assert!(smem <= 48 * 1024, "静的 smem の上限 (48 KiB) を超える");
+        // 端数ステージ (warp ごとに 16x16 f32) が sX に収まること。
+        let stage_floats = 8 * 256;
+        assert!(
+            stage_floats * 4 <= 2 * TC2_BM * TC2_LD * 2,
+            "端数ステージが sX に収まらない"
+        );
+
+        // 5. 端数タイル: 128 の倍数でない M で、ステージ経由の行数が 0..15。
+        for nt in [1usize, 15, 16, 17, 127, 128, 129, 2047, 2048] {
+            for warp in 0..8usize {
+                let wm = warp & 3;
+                for i in 0..2usize {
+                    let mrow = wm * 32 + i * 16;
                     if mrow < nt && mrow + 16 > nt {
                         let rows = nt - mrow;
                         assert!(rows >= 1 && rows <= 15, "nt={nt} mrow={mrow}");
@@ -27371,6 +27905,15 @@ fn gguf_gemm_dev_launch(
     use crate::kquant::GgmlType as T;
     const ROWS: usize = 16; // kernels_gemm.cu の GEMM_ROWS
     const NTG_MAX: usize = 8; // kernels_gemm.cu の GEMM_NTG_MAX
+    // task 176: v2 カーネル (Q8_0 / Q4_K / Q5_K・出力行 128・2 段プリフェッチ)。
+    if pf_tc2_gemm_on() && pf_tc2_eligible(ty, nt, n_in, n_out, pf_tc_min_m()) {
+        if let Some(rb) = gguf_row_bytes(ty, n_in) {
+            if let Some(tc) = tc2_gemm_kernels() {
+                tc2_gemm_launch(ctx, tc, ty, wptr, xptr, optr, nt, n_in, n_out, rb)?;
+                return Ok(true);
+            }
+        }
+    }
     // task 169: Q8_0 は BF16 テンソルコア GEMM (ゲート on・形が合うとき)。
     // 従来カーネルの 128 トークン上限を外し、2048 トークンまで 1 起動で畳む。
     if matches!(ty, T::Q8_0)
@@ -27551,14 +28094,11 @@ pub fn gdn_pf_chain(
     // task 169: 3 本の投影がすべてテンソルコア GEMM の前提を満たすときだけ、
     // 1 起動でチャンク全体 (最大 TC_MAX_TOKENS 行) を回す。満たさないときは
     // 従来どおり 128 トークンずつ (旧カーネルの上限)。
-    let tc_ready = pf_tc_gemm_on()
-        && matches!(wq.qkv.ty, crate::kquant::GgmlType::Q8_0)
-        && matches!(wq.gate.ty, crate::kquant::GgmlType::Q8_0)
-        && matches!(wout.ty, crate::kquant::GgmlType::Q8_0)
-        && pf_tc_gemm_eligible(nt, e, conv_dim, pf_tc_min_m())
-        && pf_tc_gemm_eligible(nt, e, vd, pf_tc_min_m())
-        && pf_tc_gemm_eligible(nt, vd, e, pf_tc_min_m())
-        && tc_gemm_kernels().is_some();
+    // task 176: v2 カーネルは Q4_K / Q5_K も扱えるので、判定は
+    // `pf_gemm_fast_ok` (v2 → br169 の順) に任せる。
+    let tc_ready = pf_gemm_fast_ok(wq.qkv.ty, nt, e, conv_dim, pf_tc_min_m())
+        && pf_gemm_fast_ok(wq.gate.ty, nt, e, vd, pf_tc_min_m())
+        && pf_gemm_fast_ok(wout.ty, nt, vd, e, pf_tc_min_m());
     let gemm_tile = if tc_ready { TC_MAX_TOKENS } else { 128 };
 
     // ---- qkv / z 投影 (デバイス → デバイス) --------------------------------
