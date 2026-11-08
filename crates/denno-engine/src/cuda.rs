@@ -27426,6 +27426,550 @@ fn gguf_gemm_dev_launch(
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// task 173: prefill の GDN スキャンを「状態レジスタ常駐 + 4 レーン分割」へ
+// ---------------------------------------------------------------------------
+//
+// 既存 `dno_gdn_scan_sig` (gdn.cu) は 1 ブロック = dk スレッドで、状態の列
+// (dk = 128 float = 1 KiB) をスレッドローカルの配列に持つ。作業集合 128 KiB が
+// L1 に収まらず毎トークン L2 へ落ちるため、lab t169b の実測は 10.7 us/token
+// (1 層 1 チャンク 512 トークンで 5.5 ms = 14k prefill の 5.5 s)。
+//
+// `kernels_gdn_pf.cu` の `dno_gdn_pf_scan128` は同じ演算を 512 スレッド
+// (128 列 × 4 レーン) で回し、状態をレジスタに置く (ローカルメモリ往復なし)。
+// 要素ごとの更新は同一の丸め、縮約 (q/k ノルム・skv・o・出力 RMS) だけが
+// 4 本の部分和の結合になる (丸め順の差のみ)。
+//
+// PTX: `bash build_ptx.sh gdn_pf` (lab は `PTX=gdn_pf` で再生成する)。
+// このコンテナには nvcc が無いので生成は GPU 側。
+
+/// 新カーネルの 1 ヘッド次元 (`kernels_gdn_pf.cu` の PF_DK と一致)。
+const GDN_PF_DK: usize = 128;
+/// 新カーネルのスレッド数 (`PF_DK * PF_LANES` = 128 * 4)。
+const GDN_PF_SCAN_THREADS: usize = 512;
+
+/// `DENNO_GDN_PF_FAST` の値の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+///
+/// 既定 off: lab で採否を決めてから on にする (task 173)。
+pub(crate) fn gdn_pf_fast_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => false,
+        Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// 新しいスキャンカーネルを使うか (既定 off)。
+pub(crate) fn gdn_pf_fast_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_FAST_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| gdn_pf_fast_from_value(std::env::var("DENNO_GDN_PF_FAST").ok().as_deref()))
+}
+
+#[cfg(test)]
+static PF_FAST_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用にゲートを固定する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_gdn_pf_fast_for_test(v: Option<bool>) {
+    PF_FAST_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// 新しいスキャンカーネルが受ける形か (純関数。カーネルの前提と同じ)。
+pub(crate) fn gdn_pf_fast_eligible(
+    nt: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    conv_dim: usize,
+) -> bool {
+    nt >= 1
+        && nk >= 1
+        && nv >= 1
+        && dk == GDN_PF_DK
+        && dv == GDN_PF_DK
+        && d_conv == 4
+        && conv_dim == 2 * nk * dk + nv * dv
+}
+
+#[cfg(test)]
+mod gdn_pf_fast_tests {
+    use super::*;
+
+    /// ゲートの真理値表 (既定は off)。
+    #[test]
+    fn gate_truth_table() {
+        assert!(!gdn_pf_fast_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " OFF "] {
+            assert!(!gdn_pf_fast_from_value(Some(v)), "{v}");
+        }
+        for v in ["1", "on", "true", "yes", "anything"] {
+            assert!(gdn_pf_fast_from_value(Some(v)), "{v}");
+        }
+    }
+
+    /// 形のゲート: 実モデル (nk=16 / nv=48 / dk=dv=128) だけを受ける。
+    #[test]
+    fn shape_gate() {
+        let conv_dim = 2 * 16 * 128 + 48 * 128;
+        assert_eq!(conv_dim, 10240);
+        assert!(gdn_pf_fast_eligible(1, 16, 48, 128, 128, 4, conv_dim));
+        assert!(gdn_pf_fast_eligible(512, 16, 48, 128, 128, 4, conv_dim));
+        assert!(gdn_pf_fast_eligible(2048, 16, 48, 128, 128, 4, conv_dim));
+        // dk != 128 / d_conv != 4 / conv_dim 不一致 / nt=0 は受けない。
+        assert!(!gdn_pf_fast_eligible(512, 16, 48, 64, 64, 4, 2 * 16 * 64 + 48 * 64));
+        assert!(!gdn_pf_fast_eligible(512, 16, 48, 128, 128, 3, conv_dim));
+        assert!(!gdn_pf_fast_eligible(512, 16, 48, 128, 128, 4, conv_dim + 1));
+        assert!(!gdn_pf_fast_eligible(0, 16, 48, 128, 128, 4, conv_dim));
+        assert!(!gdn_pf_fast_eligible(512, 0, 48, 128, 128, 4, conv_dim));
+    }
+
+    /// テスト用の強制スイッチが env 解決を上書きする (戻し忘れない)。
+    #[test]
+    fn force_switch_overrides_env() {
+        set_gdn_pf_fast_for_test(Some(true));
+        assert!(gdn_pf_fast_on());
+        set_gdn_pf_fast_for_test(Some(false));
+        assert!(!gdn_pf_fast_on());
+        set_gdn_pf_fast_for_test(None);
+    }
+}
+
+/// 新しいスキャンカーネルのモジュール (PTX は実行時読み込み)。
+struct GdnPfKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    scan128: CUfunction,
+}
+
+unsafe impl Send for GdnPfKernels {}
+unsafe impl Sync for GdnPfKernels {}
+
+static GDN_PF_K: OnceLock<Option<GdnPfKernels>> = OnceLock::new();
+
+/// PTX の置き場所。`DENNO_GDN_PF_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_gdn_pf.ptx`。
+fn gdn_pf_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_GDN_PF_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gdn_pf.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+/// **current context を張った後に呼ぶこと**。
+fn gdn_pf_kernels() -> Option<&'static GdnPfKernels> {
+    GDN_PF_K
+        .get_or_init(|| {
+            let path = gdn_pf_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[gdn-pf] PTX が読めない ({}) : {e} → 従来のスキャンへ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0);
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[gdn-pf] cuModuleLoadData 失敗 → 従来のスキャンへ");
+                    return None;
+                }
+                let mut scan128: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(
+                    &mut scan128,
+                    module,
+                    b"dno_gdn_pf_scan128\0".as_ptr() as *const c_char,
+                ) != CUDA_SUCCESS
+                {
+                    eprintln!("[gdn-pf] PTX に dno_gdn_pf_scan128 が無い → 従来のスキャンへ");
+                    return None;
+                }
+                Some(GdnPfKernels { module, scan128 })
+            }
+        })
+        .as_ref()
+}
+
+/// task 173: レジスタ常駐スキャンを 1 回撃つ (引数はカーネルの並び)。
+///
+/// 起動サイトは `fns.scan128` なので、kernel_invariants の起動サイト表が
+/// カーネル名 (`dno_gdn_pf_scan128`) と block 形状 (512) に解決できる。
+#[allow(clippy::too_many_arguments)]
+fn gdn_pf_scan128_launch(
+    ctx: &CudaCtx,
+    fns: &GdnPfKernels,
+    qkv: CUdeviceptr,
+    z: CUdeviceptr,
+    beta: CUdeviceptr,
+    alpha: CUdeviceptr,
+    conv_st_in: CUdeviceptr,
+    ssm_in: CUdeviceptr,
+    wconv: CUdeviceptr,
+    wa: CUdeviceptr,
+    wdt: CUdeviceptr,
+    wnorm: CUdeviceptr,
+    y_out: CUdeviceptr,
+    conv_st_out: CUdeviceptr,
+    ssm_out: CUdeviceptr,
+    n: usize,
+    nk: usize,
+    nv: usize,
+    conv_dim: usize,
+    eps: f32,
+    q_scale: f32,
+) -> Result<()> {
+    let (mut pq, mut pzz, mut pbb, mut paa) = (qkv, z, beta, alpha);
+    let (mut pci, mut psi) = (conv_st_in, ssm_in);
+    let (mut pwc, mut pwa, mut pwd, mut pwn) = (wconv, wa, wdt, wnorm);
+    let (mut pyy, mut pco, mut pso) = (y_out, conv_st_out, ssm_out);
+    let (mut ni, mut nki, mut nvi) = (n as c_int, nk as c_int, nv as c_int);
+    let (mut cdi, mut epsi, mut qsi) = (conv_dim as c_int, eps, q_scale);
+    let mut args = [
+        &mut pq as *mut _ as *mut c_void,
+        &mut pzz as *mut _ as *mut c_void,
+        &mut pbb as *mut _ as *mut c_void,
+        &mut paa as *mut _ as *mut c_void,
+        &mut pci as *mut _ as *mut c_void,
+        &mut psi as *mut _ as *mut c_void,
+        &mut pwc as *mut _ as *mut c_void,
+        &mut pwa as *mut _ as *mut c_void,
+        &mut pwd as *mut _ as *mut c_void,
+        &mut pwn as *mut _ as *mut c_void,
+        &mut pyy as *mut _ as *mut c_void,
+        &mut pco as *mut _ as *mut c_void,
+        &mut pso as *mut _ as *mut c_void,
+        &mut ni as *mut _ as *mut c_void,
+        &mut nki as *mut _ as *mut c_void,
+        &mut nvi as *mut _ as *mut c_void,
+        &mut cdi as *mut _ as *mut c_void,
+        &mut epsi as *mut _ as *mut c_void,
+        &mut qsi as *mut _ as *mut c_void,
+    ];
+    unsafe {
+        ctx.launch_async(
+            fns.scan128,
+            (nv as u32, 1, 1),
+            (GDN_PF_SCAN_THREADS as u32, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+}
+
+/// task 173: レジスタ常駐スキャンを「ホスト入力 → ホスト出力」で 1 回だけ回す
+/// (検算用。prefill の本線は連鎖 [`gdn_pf_chain`] の中から呼ぶ)。
+///
+/// 戻り値 `None` は「GPU・PTX・形の前提が無い」(呼び出し側はスキップしてよい)。
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_pf_scan128_host(
+    qkv: &[f32],
+    z: &[f32],
+    beta: &[f32],
+    alpha: &[f32],
+    conv_st: &mut [f32],
+    ssm_st: &mut [f32],
+    wconv: &[f32],
+    wa: &[f32],
+    wdt: &[f32],
+    wnorm: &[f32],
+    n: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    eps: f32,
+    q_scale: f32,
+) -> Option<Vec<f32>> {
+    let cs = d_conv - 1;
+    let conv_dim = 2 * nk * dk + nv * dv;
+    let vd = nv * dv;
+    if !gdn_pf_fast_eligible(n, nk, nv, dk, dv, d_conv, conv_dim)
+        || qkv.len() != n * conv_dim
+        || z.len() != n * vd
+        || beta.len() != n * nv
+        || alpha.len() != n * nv
+        || conv_st.len() != conv_dim * cs
+        || ssm_st.len() != nv * dk * dv
+        || wconv.len() != conv_dim * d_conv
+        || wa.len() != nv
+        || wdt.len() != nv
+        || wnorm.len() != dv
+    {
+        return None;
+    }
+    if !cuda_enabled() {
+        return None;
+    }
+    let ctx = shared_ctx()?;
+    if ctx.make_current().is_err() {
+        return None;
+    }
+    let fns = gdn_pf_kernels()?;
+    let d_qkv = DevBuffer::from_slice(qkv).ok()?;
+    let d_z = DevBuffer::from_slice(z).ok()?;
+    let d_beta = DevBuffer::from_slice(beta).ok()?;
+    let d_alpha = DevBuffer::from_slice(alpha).ok()?;
+    let d_cst = DevBuffer::from_slice(conv_st).ok()?;
+    let d_sst = DevBuffer::from_slice(ssm_st).ok()?;
+    let d_wc = DevBuffer::from_slice(wconv).ok()?;
+    let d_wa = DevBuffer::from_slice(wa).ok()?;
+    let d_wd = DevBuffer::from_slice(wdt).ok()?;
+    let d_wn = DevBuffer::from_slice(wnorm).ok()?;
+    let d_y = DevBuffer::alloc(n * vd * 4).ok()?;
+    let d_co = DevBuffer::alloc(conv_dim * cs * 4).ok()?;
+    let d_so = DevBuffer::alloc(nv * dk * dv * 4).ok()?;
+    gdn_pf_scan128_launch(
+        &ctx,
+        fns,
+        d_qkv.ptr(),
+        d_z.ptr(),
+        d_beta.ptr(),
+        d_alpha.ptr(),
+        d_cst.ptr(),
+        d_sst.ptr(),
+        d_wc.ptr(),
+        d_wa.ptr(),
+        d_wd.ptr(),
+        d_wn.ptr(),
+        d_y.ptr(),
+        d_co.ptr(),
+        d_so.ptr(),
+        n,
+        nk,
+        nv,
+        conv_dim,
+        eps,
+        q_scale,
+    )
+    .ok()?;
+    ctx.sync().ok()?;
+    let y = d_y.to_vec::<f32>(n * vd).ok()?;
+    let co = d_co.to_vec::<f32>(conv_dim * cs).ok()?;
+    let so = d_so.to_vec::<f32>(nv * dk * dv).ok()?;
+    conv_st.copy_from_slice(&co);
+    ssm_st.copy_from_slice(&so);
+    Some(y)
+}
+
+// ---------------------------------------------------------------------------
+// task 173: 連鎖の段ごとの GPU 時間 (`DENNO_GDN_PF_KPROF=1`・既定 off)
+// ---------------------------------------------------------------------------
+//
+// 台帳の段 (`qkv_pf` / `scan_pf` / `out_pf`) は「発行 + 同期の待ち」を含む壁時計
+// なので、**待ち**が混ざると中身が読めない (expert の別ストリームが走っている
+// 間の `cuCtxSynchronize` はその完了も待つ)。ここでは段の前後に CUDA イベントを
+// 打ち、`cuEventElapsedTime` で「その段の GPU 時間」だけを積む。段の壁時計との
+// 差が「他人の仕事を待っていた時間」になる。
+pub mod gdn_pf_kprof {
+    use super::*;
+
+    /// 段の番号 (この順で 1 行に出す)。
+    pub const X_H2D: usize = 0;
+    pub const QKV_GEMM: usize = 1;
+    pub const Z_GEMM: usize = 2;
+    pub const SCAN: usize = 3;
+    pub const OUT_GEMM: usize = 4;
+    pub const OUT_D2H: usize = 5;
+    pub const ST_D2H: usize = 6;
+    pub const N: usize = 7;
+    pub const NAMES: [&str; N] = [
+        "x_h2d", "qkv_gemm", "z_gemm", "scan", "out_gemm", "out_d2h", "st_d2h",
+    ];
+
+    static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static CNT: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+
+    /// 計測するか (`DENNO_GDN_PF_KPROF` があるとき)。
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DENNO_GDN_PF_KPROF").is_some())
+    }
+
+    /// 積算を 0 に戻す。
+    pub fn reset() {
+        for i in 0..N {
+            NS[i].store(0, Ordering::Relaxed);
+            CNT[i].store(0, Ordering::Relaxed);
+        }
+        open_reset();
+    }
+
+    /// 1 行にまとめる (1 本も打っていなければ `None`)。
+    pub fn lines() -> Vec<String> {
+        if !on() {
+            return Vec::new();
+        }
+        let cnt: u64 = CNT.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        if cnt == 0 {
+            return Vec::new();
+        }
+        let mut s = String::from("[gdn-pf-kprof] 段ごとの GPU 時間 (イベント計測)");
+        for i in 0..N {
+            let ns = NS[i].load(Ordering::Relaxed);
+            let n = CNT[i].load(Ordering::Relaxed);
+            if n == 0 {
+                continue;
+            }
+            s.push_str(&format!(
+                " | {} {:.1}ms/{}",
+                NAMES[i],
+                ns as f64 / 1e6,
+                n
+            ));
+        }
+        vec![s]
+    }
+
+    fn add_ns(i: usize, ns: u64) {
+        if i >= N {
+            return;
+        }
+        NS[i].fetch_add(ns, Ordering::Relaxed);
+        CNT[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// イベントのプール (スレッドローカル)。収集のたびに先頭から使い直す。
+    struct Pool {
+        evs: Vec<CUevent>,
+        used: usize,
+        dead: bool,
+    }
+
+    thread_local! {
+        static P: std::cell::RefCell<Pool> = const {
+            std::cell::RefCell::new(Pool { evs: Vec::new(), used: 0, dead: false })
+        };
+        /// 段ごとの入口イベント番号。
+        static OPEN: std::cell::RefCell<[Option<u32>; N]> = const {
+            std::cell::RefCell::new([None; N])
+        };
+        /// 収集待ちの (段, 入口, 出口)。
+        static PEND: std::cell::RefCell<Vec<(u8, u32, u32)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn mark() -> Option<u32> {
+        P.with(|c| {
+            let mut p = c.borrow_mut();
+            if p.dead {
+                return None;
+            }
+            if p.used >= p.evs.len() {
+                let Some(create) = lib().ok().and_then(|l| l.event_create) else {
+                    p.dead = true;
+                    return None;
+                };
+                let mut ev: CUevent = std::ptr::null_mut();
+                // CU_EVENT_DEFAULT (0) = 計時有効。
+                if unsafe { create(&mut ev, 0) } != CUDA_SUCCESS || ev.is_null() {
+                    p.dead = true;
+                    return None;
+                }
+                p.evs.push(ev);
+            }
+            let Some(rec) = lib().ok().and_then(|l| l.event_record) else {
+                p.dead = true;
+                return None;
+            };
+            let ev = p.evs[p.used];
+            if unsafe { rec(ev, std::ptr::null_mut()) } != CUDA_SUCCESS {
+                p.dead = true;
+                return None;
+            }
+            let i = p.used as u32;
+            p.used += 1;
+            Some(i)
+        })
+    }
+
+    fn open_reset() {
+        OPEN.with(|c| {
+            let mut o = c.borrow_mut();
+            for v in o.iter_mut() {
+                *v = None;
+            }
+        });
+        PEND.with(|c| c.borrow_mut().clear());
+        P.with(|c| c.borrow_mut().used = 0);
+    }
+
+    /// 段の入口 (on でなければ 1 分岐)。
+    pub fn begin(item: usize) {
+        if !on() || item >= N {
+            return;
+        }
+        let a = mark();
+        OPEN.with(|c| c.borrow_mut()[item] = a);
+    }
+
+    /// 段の出口。
+    pub fn end(item: usize) {
+        if !on() || item >= N {
+            return;
+        }
+        let a = OPEN.with(|c| c.borrow_mut()[item].take());
+        let Some(a) = a else { return };
+        if let Some(b) = mark() {
+            PEND.with(|c| c.borrow_mut().push((item as u8, a, b)));
+        }
+    }
+
+    /// 積算する (**同期の後**に呼ぶ。イベントが完了している必要がある)。
+    pub fn collect() {
+        if !on() {
+            return;
+        }
+        let Some(f) = lib().ok().and_then(|l| l.event_elapsed_time) else {
+            return;
+        };
+        let pend = PEND.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if pend.is_empty() {
+            return;
+        }
+        P.with(|c| {
+            let p = c.borrow();
+            for (item, a, b) in pend {
+                let (Some(&ea), Some(&eb)) = (p.evs.get(a as usize), p.evs.get(b as usize))
+                else {
+                    continue;
+                };
+                let mut ms = 0.0f32;
+                if unsafe { f(&mut ms, ea, eb) } == CUDA_SUCCESS && ms.is_finite() && ms >= 0.0 {
+                    add_ns(item as usize, (ms as f64 * 1e6) as u64);
+                }
+            }
+        });
+        // イベントは先頭から使い直す (プールは数十本で足りる)。
+        P.with(|c| c.borrow_mut().used = 0);
+    }
+}
+
 /// task 167: ssm 層 1 チャンクを「qkv 投影 → z 投影 → GDN スキャン → out_proj」の
 /// デバイス連鎖で回す。成功したら `out` に層の出力 [nt, e] を書く。
 ///
@@ -27530,6 +28074,7 @@ pub fn gdn_pf_chain(
         s.wn.as_ref().unwrap().copy_from(wnorm)?;
         Ok(s.chain_ptrs())
     })?;
+    gdn_pf_kprof::begin(gdn_pf_kprof::X_H2D);
     let ptr = GDN_PF_CHAIN_BUF.with(|cell| -> Result<[CUdeviceptr; 7]> {
         let mut b = cell.borrow_mut();
         b.ensure(nt, e, conv_dim, vd, nv)?;
@@ -27546,6 +28091,7 @@ pub fn gdn_pf_chain(
             b.buf(6),
         ])
     })?;
+    gdn_pf_kprof::end(gdn_pf_kprof::X_H2D);
     let (px, po, pqkv, pz, py, pb, pa) = (ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6]);
 
     // task 169: 3 本の投影がすべてテンソルコア GEMM の前提を満たすときだけ、
@@ -27571,7 +28117,7 @@ pub fn gdn_pf_chain(
             let xo = px + (t0 * e * 4) as CUdeviceptr;
             let qo = pqkv + (t0 * conv_dim * 4) as CUdeviceptr;
             let zo = pz + (t0 * vd * 4) as CUdeviceptr;
-            for (w, wty, n_out, o) in [
+            for (idx, (w, wty, n_out, o)) in [
                 (
                     wqkv.buf.ptr() + qkv_woff as CUdeviceptr,
                     wq.qkv.ty,
@@ -27584,8 +28130,20 @@ pub fn gdn_pf_chain(
                     vd,
                     zo,
                 ),
-            ] {
-                match gguf_gemm_dev_launch(&ctx, wty, w, xo, o, m, e, n_out) {
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                // task 173: 段ごとの GPU 時間 (イベント)。qkv と z を分けて積む。
+                let kp = if idx == 0 {
+                    gdn_pf_kprof::QKV_GEMM
+                } else {
+                    gdn_pf_kprof::Z_GEMM
+                };
+                gdn_pf_kprof::begin(kp);
+                let r = gguf_gemm_dev_launch(&ctx, wty, w, xo, o, m, e, n_out);
+                gdn_pf_kprof::end(kp);
+                match r {
                     Ok(true) => {}
                     Ok(false) => return Ok(false),
                     Err(err) => {
@@ -27606,56 +28164,77 @@ pub fn gdn_pf_chain(
     // ---- GDN スキャン (状態はデバイス正本) ----------------------------------
     let (pst_conv, pst_ssm) =
         gdn_state_begin(kv, li, conv_st, ssm_st, conv_dim * cs, nv, dk * dv)?;
+    // task 173: レジスタ常駐 + 4 レーンのスキャンが使えるならそちらで回す
+    // (`DENNO_GDN_PF_FAST`)。形が合わない・PTX が無いときは従来カーネルへ
+    // fail closed (この時点でモデルの状態は 1 つも進んでいない)。
+    let pf_scan_fast = if gdn_pf_fast_on()
+        && gdn_pf_fast_eligible(nt, nk, nv, dk, dv, d_conv, conv_dim)
+    {
+        gdn_pf_kernels()
+    } else {
+        None
+    };
     {
         let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_SCAN);
         let t_ph = Instant::now();
-        let (mut pq, mut pzz, mut pbb, mut paa) = (pqkv, pz, pb, pa);
-        let (mut pci, mut psi) = (pst_conv, pst_ssm);
-        let (mut pwc, mut pwa, mut pwd, mut pwn) = (ptrs[0], ptrs[1], ptrs[2], ptrs[3]);
-        let (mut pyy, mut pco, mut pso) = (py, ptrs[4], ptrs[5]);
-        let (mut ni, mut nki, mut nvi, mut dki, mut dvi) = (
-            nt as c_int,
-            nk as c_int,
-            nv as c_int,
-            dk as c_int,
-            dv as c_int,
-        );
-        let (mut cdi, mut dci, mut csi) = (conv_dim as c_int, d_conv as c_int, cs as c_int);
-        let (mut epsi, mut qsi) = (eps, q_scale);
-        let mut args = [
-            &mut pq as *mut _ as *mut c_void,
-            &mut pzz as *mut _ as *mut c_void,
-            &mut pbb as *mut _ as *mut c_void,
-            &mut paa as *mut _ as *mut c_void,
-            &mut pci as *mut _ as *mut c_void,
-            &mut psi as *mut _ as *mut c_void,
-            &mut pwc as *mut _ as *mut c_void,
-            &mut pwa as *mut _ as *mut c_void,
-            &mut pwd as *mut _ as *mut c_void,
-            &mut pwn as *mut _ as *mut c_void,
-            &mut pyy as *mut _ as *mut c_void,
-            &mut pco as *mut _ as *mut c_void,
-            &mut pso as *mut _ as *mut c_void,
-            &mut ni as *mut _ as *mut c_void,
-            &mut nki as *mut _ as *mut c_void,
-            &mut nvi as *mut _ as *mut c_void,
-            &mut dki as *mut _ as *mut c_void,
-            &mut dvi as *mut _ as *mut c_void,
-            &mut cdi as *mut _ as *mut c_void,
-            &mut dci as *mut _ as *mut c_void,
-            &mut csi as *mut _ as *mut c_void,
-            &mut epsi as *mut _ as *mut c_void,
-            &mut qsi as *mut _ as *mut c_void,
-        ];
-        let shmem = ((3 * dk + dv + 5) * 4) as u32;
-        unsafe {
-            ctx.launch_async(
-                f_scan,
-                (nv as u32, 1, 1),
-                (dk as u32, 1, 1),
-                shmem,
-                &mut args,
+        if let Some(fns) = pf_scan_fast {
+            gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
+            gdn_pf_scan128_launch(
+                &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],
+                ptrs[3], py, ptrs[4], ptrs[5], nt, nk, nv, conv_dim, eps, q_scale,
             )?;
+            gdn_pf_kprof::end(gdn_pf_kprof::SCAN);
+        } else {
+            let (mut pq, mut pzz, mut pbb, mut paa) = (pqkv, pz, pb, pa);
+            let (mut pci, mut psi) = (pst_conv, pst_ssm);
+            let (mut pwc, mut pwa, mut pwd, mut pwn) = (ptrs[0], ptrs[1], ptrs[2], ptrs[3]);
+            let (mut pyy, mut pco, mut pso) = (py, ptrs[4], ptrs[5]);
+            let (mut ni, mut nki, mut nvi, mut dki, mut dvi) = (
+                nt as c_int,
+                nk as c_int,
+                nv as c_int,
+                dk as c_int,
+                dv as c_int,
+            );
+            let (mut cdi, mut dci, mut csi) = (conv_dim as c_int, d_conv as c_int, cs as c_int);
+            let (mut epsi, mut qsi) = (eps, q_scale);
+            let mut args = [
+                &mut pq as *mut _ as *mut c_void,
+                &mut pzz as *mut _ as *mut c_void,
+                &mut pbb as *mut _ as *mut c_void,
+                &mut paa as *mut _ as *mut c_void,
+                &mut pci as *mut _ as *mut c_void,
+                &mut psi as *mut _ as *mut c_void,
+                &mut pwc as *mut _ as *mut c_void,
+                &mut pwa as *mut _ as *mut c_void,
+                &mut pwd as *mut _ as *mut c_void,
+                &mut pwn as *mut _ as *mut c_void,
+                &mut pyy as *mut _ as *mut c_void,
+                &mut pco as *mut _ as *mut c_void,
+                &mut pso as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+                &mut nki as *mut _ as *mut c_void,
+                &mut nvi as *mut _ as *mut c_void,
+                &mut dki as *mut _ as *mut c_void,
+                &mut dvi as *mut _ as *mut c_void,
+                &mut cdi as *mut _ as *mut c_void,
+                &mut dci as *mut _ as *mut c_void,
+                &mut csi as *mut _ as *mut c_void,
+                &mut epsi as *mut _ as *mut c_void,
+                &mut qsi as *mut _ as *mut c_void,
+            ];
+            let shmem = ((3 * dk + dv + 5) * 4) as u32;
+            gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
+            unsafe {
+                ctx.launch_async(
+                    f_scan,
+                    (nv as u32, 1, 1),
+                    (dk as u32, 1, 1),
+                    shmem,
+                    &mut args,
+                )?;
+            }
+            gdn_pf_kprof::end(gdn_pf_kprof::SCAN);
         }
         ctx.sync()?;
         phase_ns[1] = t_ph.elapsed().as_nanos() as u64;
@@ -27670,7 +28249,10 @@ pub fn gdn_pf_chain(
             let m = (nt - t0).min(gemm_tile);
             let yo = py + (t0 * vd * 4) as CUdeviceptr;
             let oo = po + (t0 * e * 4) as CUdeviceptr;
-            match gguf_gemm_dev_launch(&ctx, wout.ty, wo.buf.ptr(), yo, oo, m, vd, e) {
+            gdn_pf_kprof::begin(gdn_pf_kprof::OUT_GEMM);
+            let r = gguf_gemm_dev_launch(&ctx, wout.ty, wo.buf.ptr(), yo, oo, m, vd, e);
+            gdn_pf_kprof::end(gdn_pf_kprof::OUT_GEMM);
+            match r {
                 Ok(true) => {}
                 Ok(false) => {
                     // スキャンは既に走っている → 状態が進んでいる。落とす。
@@ -27690,15 +28272,21 @@ pub fn gdn_pf_chain(
     phase_ns[2] = t_out.elapsed().as_nanos() as u64;
 
     // ---- 層の出力と状態をホストへ ------------------------------------------
+    gdn_pf_kprof::begin(gdn_pf_kprof::OUT_D2H);
     let got: Vec<f32> = GDN_PF_CHAIN_BUF.with(|cell| -> Result<Vec<f32>> {
         let b = cell.borrow();
         b.o.as_ref().expect("連鎖の出力").to_vec::<f32>(nt * e)
     })?;
+    gdn_pf_kprof::end(gdn_pf_kprof::OUT_D2H);
     out[..nt * e].copy_from_slice(&got);
     gdn_state_commit(li, ptrs[4], ptrs[5], conv_dim * cs, nv, dk * dv)?;
     // prefill のあとに decode (別ストア) や CPU 経路がホスト state を seed に
     // するので、状態は毎回ホストへも戻す (従来の sig 経路と同じ)。
+    gdn_pf_kprof::begin(gdn_pf_kprof::ST_D2H);
     gdn_host_writeback(conv_st, ssm_st)?;
+    gdn_pf_kprof::end(gdn_pf_kprof::ST_D2H);
+    // task 173: 段ごとの GPU 時間を回収する (この時点で全イベントが完了している)。
+    gdn_pf_kprof::collect();
     Ok(true)
 }
 

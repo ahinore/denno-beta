@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -61,6 +61,11 @@ spec() {
         # 上げる (PTX は前方互換なので sm_120 で JIT される)。数値契約は無し
         # (prefill の射影はビット一致契約の外)。
         gemm_tc)      echo "kernels_gemm_tc.cu|fmad|compute_90" ;;
+        # task 173: prefill の GDN スキャン (状態レジスタ常駐 + 4 レーン分割)。
+        # 丸めは要素ごとに既存カーネルと同一にしたいので -fmad=false。
+        # bf16 を使う予定は無いが、gemm_tc と同じ arch に揃えておく
+        # (compute_75 でも動くが、lab の JIT 差を作らない)。
+        gdn_pf)       echo "kernels_gdn_pf.cu|nofmad|compute_90" ;;
         *)            return 1 ;;
     esac
 }
