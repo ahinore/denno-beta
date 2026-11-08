@@ -1292,6 +1292,46 @@ pub(crate) mod dec_kprof {
         }
 
         #[test]
+        fn gdn_dec_gemv_parse_truth_table() {
+            // 未設定・空・明示 off は「従来のまま」(None)。
+            for raw in [
+                None,
+                Some(""),
+                Some("  "),
+                Some("0"),
+                Some("off"),
+                Some("false"),
+                Some("no"),
+                Some("v4"),
+                Some("x"),
+            ] {
+                assert_eq!(parse_gdn_dec_gemv(raw), None, "raw={raw:?}");
+            }
+            // 3 つは明示指定 (大小文字と前後空白は無視)。
+            assert!(matches!(
+                parse_gdn_dec_gemv(Some("v2")),
+                Some(GemvKernelMode::V2)
+            ));
+            assert!(matches!(
+                parse_gdn_dec_gemv(Some(" V2 ")),
+                Some(GemvKernelMode::V2)
+            ));
+            assert!(matches!(
+                parse_gdn_dec_gemv(Some("V3")),
+                Some(GemvKernelMode::V3)
+            ));
+            assert!(matches!(
+                parse_gdn_dec_gemv(Some("fp16")),
+                Some(GemvKernelMode::Fp16)
+            ));
+            // ゲートが無ければ従来の選択に一致する (env 既定 = v3)。
+            assert!(matches!(
+                gdn_dec_gemv_mode_eff(),
+                GemvKernelMode::V2 | GemvKernelMode::V3 | GemvKernelMode::Fp16
+            ));
+        }
+
+        #[test]
         fn band_covers_the_three_measured_points() {
             assert_eq!(band(0), Some(0));
             assert_eq!(band(1), Some(0));
@@ -3635,6 +3675,39 @@ pub(crate) enum GemvKernelMode {
 /// `DENNO_GEMV_FP16` の生値 → fast mode の on/off (純関数。真理値表はテストで固定)。
 fn parse_gemv_fp16(raw: Option<&str>) -> bool {
     matches!(raw, Some("1") | Some("on") | Some("true"))
+}
+
+/// task 177: GDN decode submission の GEMV だけカーネルを差し替える
+/// (`DENNO_GDN_DEC_GEMV=v2|v3|fp16`。未設定・空・`0`/`off` は従来 =
+/// [`gemv_kernel_mode`])。
+///
+/// 動機 (lab t177a の `[dec-kprof]` 実測、pos=3827 の ssm 層 1 本):
+/// `dno_gemv_q8_0_v3` (grid=1280, block=32) が 42.5 us / 27.9 MB = 656 GB/s、
+/// `dno_gemv_q4k_v3` (grid=768, block=32) が 31.8 us / 8.9 MB = 278 GB/s、
+/// `dno_gemv_q8_0_v3` (grid=320, block=32) が 50.9 us / 16.7 MB = 328 GB/s。
+/// v3 は 1 行を `lanes` 本で分けるので **スレッド数が n_out x lanes で固定**
+/// (out 投影は 2,560 x 4 = 10,240 スレッド = 5090 の 170 SM に 1.9 warp/SM)。
+/// v2 (`kernels_moe.cu`、4 行/ブロック・256 スレッド・行を 64 本で shared へ
+/// 積んでから 1 本が畳む) は **n_out x 64 スレッド**で、同じ形でも一桁多い。
+/// どちらが速いかは形に依るので、既定は従来のまま env で切り替える。
+fn parse_gdn_dec_gemv(raw: Option<&str>) -> Option<GemvKernelMode> {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("v2") => Some(GemvKernelMode::V2),
+        Some("v3") => Some(GemvKernelMode::V3),
+        Some("fp16") => Some(GemvKernelMode::Fp16),
+        _ => None,
+    }
+}
+
+/// [`parse_gdn_dec_gemv`] を env から 1 回だけ読む (未設定なら None)。
+fn gdn_dec_gemv_mode() -> Option<GemvKernelMode> {
+    static M: OnceLock<Option<GemvKernelMode>> = OnceLock::new();
+    *M.get_or_init(|| parse_gdn_dec_gemv(std::env::var("DENNO_GDN_DEC_GEMV").ok().as_deref()))
+}
+
+/// GDN decode の submission が使う GEMV モード (ゲートが無ければ従来)。
+fn gdn_dec_gemv_mode_eff() -> GemvKernelMode {
+    gdn_dec_gemv_mode().unwrap_or_else(gemv_kernel_mode)
 }
 
 /// decode GEMV が使うカーネル一式を env から決める (`moe_gemv_dev` と
@@ -16186,6 +16259,13 @@ pub fn maybe_gpu_mix_bf16_chain2_into(
     };
     const MIXED_THREADS: usize = 256;
     let r = MIX_GPU_SC.with(|cell| -> Result<()> {
+        // task 177: mix 1 回の操作別内訳 (`DENNO_GDN_DEC_KPROF`・既定 off)。
+        // decode の mix 本線はこの chain2 経路 (down + lo_apply → up → hc_mixed)。
+        let _kp_win = dec_kprof::window(
+            dec_kprof::MIX,
+            dec_kprof::cur_layer(),
+            dec_kprof::cur_pos(),
+        );
         let mut s = cell.borrow_mut();
         let MixGpuScratch {
             x: dx,
@@ -34631,7 +34711,8 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         return GdnDecodeRes::cpu();
     };
     // GEMV のカーネル選択は intercept 経路と同じ規約 (fp16 → v3 → v2)。
-    let mode = gemv_kernel_mode();
+    // task 177: この経路だけ `DENNO_GDN_DEC_GEMV` で差し替えられる (既定は従来)。
+    let mode = gdn_dec_gemv_mode_eff();
     let mut qcfg = Vec::with_capacity(req.qkv_units.len());
     for (u, _) in req.qkv_units {
         match ctx.plan_moe_gemv(u.ty, u.k, u.n, mode) {
