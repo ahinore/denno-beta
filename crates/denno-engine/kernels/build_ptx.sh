@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 mix_pf gdn_pf2)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -92,6 +92,15 @@ spec() {
         # task 183: 融合 qkv 1 本の GEMM の後処理 (出力ゲートと行の gather)。
         # CPU 参照と 1 演算 1 丸めを合わせるため -fmad=false (明示 __*_rn のみ)。
         pf3)          echo "kernels_pf3.cu|nofmad" ;;
+        # task 186: prefill の hc mix (down / up) を BF16 重みのまま回す GEMM。
+        # 出力 1 要素 1 アキュムレータ・k 昇順の __fmaf_rn で、既存の
+        # dno_gemm_bf16_mt とビット一致 (値は丸め順まで同一)。FMA は明示
+        # intrinsic なので -fmad は既定 (gemm 系と同じ) でよい。
+        mix_pf)       echo "kernels_mix_pf.cu|fmad" ;;
+        # task 186: prefill GDN スキャン v2 (ヘッドあたり 2 ブロック・barrier 1 回)。
+        # 値は gdn_pf とビット一致させたいので -fmad=false (式を変えないこと)。
+        # arch は gdn_pf と同じ compute_90 に揃える (JIT 差を作らない)。
+        gdn_pf2)      echo "kernels_gdn_pf2.cu|nofmad|compute_90" ;;
         *)            return 1 ;;
     esac
 }
