@@ -3966,15 +3966,19 @@ fn decode_chain2_enabled() -> bool {
 
 /// task 187: `DENNO_DEC_SHARED_DEV` の値を解釈する (純関数・テスト用)。
 ///
-/// **既定 off**。on のときだけ shared expert の gate → up → silu*up → down を
+/// **既定 on** (lab t187c: shared の wall 1.46 → 0.63 ms/tok、decode -8.0%)。
+/// 明示的な偽値だけ切る。on のときは shared expert の gate → up → silu*up → down を
 /// router の時点で 1 本のサイドストリームに積み、down の出力だけを join する。
-/// silu を CUDA の `__expf` で計算するので、ホストの `f32::exp` とは丸めが違う。
+/// silu を CUDA の `ex2.approx` で計算するので、ホストの `f32::exp` とは丸めが違う。
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn dec_shared_dev_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
 }
 
 /// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
@@ -4038,14 +4042,19 @@ fn dec_exp_sum_mirror(
 
 /// task 187: `DENNO_DEC_EXP_SUMDEV` の値を解釈する (純関数・テスト用)。
 ///
-/// **既定 off**。on のときだけ、ヒットした expert の寄与をデバイスで重み付き和に
-/// して `e` 要素だけ D2H する (`kernels_dec_epi.cu` の `dno_dec_exp_sum`)。
-/// PTX が無い / 形が合わないときは従来経路へ落ちる (数値は変わらない)。
+/// **既定 on** (lab t187c で採否 yes: decode -8.0%、prefill +0.4%、md5 SAME)。
+/// 明示的な偽値 `0` / `off` / `false` / `no` だけ切る。on のときは、ヒットした
+/// expert の寄与をデバイスで重み付き和にして `e` 要素だけ D2H する
+/// (`kernels_dec_epi.cu` の `dno_dec_exp_sum`)。PTX が無い / 形が合わないときは
+/// 従来経路へ落ちる (数値は変わらない)。
 fn dec_exp_sumdev_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
 }
 
 /// [`dec_exp_sumdev_from_value`] をプロセスで 1 回だけ読む。
@@ -14344,7 +14353,11 @@ mod tests {
         {
             let _fake = crate::cuda::SharedOverlapFakeGuard::new();
             set_shared_overlap_for_test(Some(true));
+            // ここは 2 段経路 (gate/up の 2 本) の契約を見るテスト。task 187 の
+            // 4 発経路は既定 on なので、明示的に切って 2 本を固定する。
+            set_dec_shared_dev_for_test(Some(false));
             let ov = SharedExpertOverlap::begin(&lw, &x);
+            set_dec_shared_dev_for_test(None);
             set_shared_overlap_for_test(None);
             assert!(!ov.pending.is_empty(), "偽 GPU で積めていない");
             assert_eq!(ov.pending.len(), 2, "積んだ本数が 2 でない");
@@ -14916,21 +14929,17 @@ mod tests {
         denno_telemetry::set_enabled_for_tests(prev_on);
     }
 
-    /// task 187: `DENNO_DEC_EXP_SUMDEV` の真理値表 (純関数)。
+    /// task 187: `DENNO_DEC_EXP_SUMDEV` / `DENNO_DEC_SHARED_DEV` の真理値表。
+    /// どちらも lab t187c の採否で**既定 on** (明示的な偽値だけ切る)。
     #[test]
     fn dec_exp_sumdev_gate_truth_table() {
-        for v in [Some("1"), Some("on"), Some("true"), Some(" ON ")] {
+        for v in [None, Some("1"), Some("on"), Some("true"), Some(" ON "), Some("2")] {
             assert!(dec_exp_sumdev_from_value(v), "{v:?} が on にならない");
+            assert!(dec_shared_dev_from_value(v), "{v:?} が on にならない");
         }
-        for v in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("off"),
-            Some("false"),
-            Some("2"),
-        ] {
+        for v in [Some("0"), Some("off"), Some("false"), Some("no"), Some(" OFF ")] {
             assert!(!dec_exp_sumdev_from_value(v), "{v:?} が on になる");
+            assert!(!dec_shared_dev_from_value(v), "{v:?} が on になる");
         }
     }
 

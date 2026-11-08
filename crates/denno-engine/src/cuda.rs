@@ -7410,14 +7410,21 @@ pub fn dec_epi_ready() -> bool {
 // 現行の v2 カーネル (`kernels_moe.cu`) は 1 バイトずつの共有メモリ staging で、
 // ピーク (1.79 TB/s) の 36% しか出ていない。v5 (task 184。ベクタロード +
 // 4 アキュムレータ) に差し替えると **丸め順が変わる** (v2 とビット不一致)。
-// そのため既定 off のゲート `DENNO_DEC_HEAD_FAST` で切り替える。
+// lab t187c で 1.05 → 0.71 ms/token になり、md5 は SAME だったので既定 on。
+// 切り戻しは `DENNO_DEC_HEAD_FAST=0`。
 
-/// `DENNO_DEC_HEAD_FAST` の値を解釈する (純関数)。`1` / `on` / `true` だけが真。
+/// `DENNO_DEC_HEAD_FAST` の値を解釈する (純関数)。
+///
+/// **既定 on** (lab t187c: head の wall 1.08 → 0.74 ms/tok、decode -8.0%)。
+/// 明示的な偽値 `0` / `off` / `false` / `no` だけ切る。
 pub fn head_fast_from_value(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
 }
 
 /// [`head_fast_from_value`] をプロセスで 1 回だけ読む。
