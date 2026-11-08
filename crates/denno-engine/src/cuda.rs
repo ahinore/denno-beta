@@ -1838,6 +1838,18 @@ pub(crate) mod dec_full_dev {
         static ST: RefCell<St> = const { RefCell::new(St::new()) };
     }
 
+    /// qkv の融合 GEMV 1 発ぶんの記述 (連結できない層は 3 本に分かれる)。
+    #[derive(Clone, Copy)]
+    pub(crate) struct Unit<'a> {
+        pub uid: u64,
+        pub ty: crate::kquant::GgmlType,
+        pub blocks: &'a [u8],
+        pub k: usize,
+        pub n: usize,
+        /// 出力 (`qkv` バッファ) の何行目から書くか。
+        pub out_row: usize,
+    }
+
     /// 呼び出し 1 回ぶんの入力 (すべてホスト側の値)。
     pub(crate) struct Call<'a> {
         pub cache_id: u64,
@@ -1857,10 +1869,9 @@ pub(crate) mod dec_full_dev {
         pub eps: f32,
         pub q_norm: &'a [f32],
         pub k_norm: &'a [f32],
-        /// qkv の融合 GEMV (q|gate|k|v)
-        pub qkv_uid: u64,
-        pub qkv_ty: crate::kquant::GgmlType,
-        pub qkv_blocks: &'a [u8],
+        /// qkv の GEMV (q|gate|k|v)。連結できた層は 1 本、できない層は 3 本。
+        pub qkv_units: &'a [Unit<'a>],
+        /// 入力長 (= 全 unit 共通) と出力の合計行数。
         pub qkv_k: usize,
         pub qkv_n: usize,
         /// 出力投影
@@ -1946,10 +1957,35 @@ pub(crate) mod dec_full_dev {
                 && self.qkv_n == 2 * self.heads * self.dh + 2 * self.kv_dim
                 && self.qkv_k > 0
                 && self.cur.len() == self.qkv_k
+                && self.units_ok()
                 && self.wo_k == self.heads * self.dh
                 && self.wo_n == self.n_embd
                 && self.n_embd > 0
         }
+
+        /// qkv の unit 列が「同じ入力長・隙間なく qkv_n 行」を満たすか。
+        fn units_ok(&self) -> bool {
+            if self.qkv_units.is_empty() || self.qkv_units.len() > 4 {
+                return false;
+            }
+            let mut at = 0usize;
+            for u in self.qkv_units {
+                if u.k != self.qkv_k || u.n == 0 || u.out_row != at {
+                    return false;
+                }
+                at += u.n;
+            }
+            at == self.qkv_n
+        }
+    }
+
+    /// この経路の attention の下限行数 (既定 1 = 常に GPU)。
+    fn full_dec_attn_min() -> usize {
+        static N: OnceLock<usize> = OnceLock::new();
+        *N.get_or_init(|| match std::env::var("DENNO_FULL_DEC_ATTN_MIN").ok() {
+            Some(v) => v.trim().parse::<usize>().unwrap_or(1),
+            None => 1,
+        })
     }
 
     /// 1 行だけログる (フォールバックの理由。既定は出さない)。
@@ -1970,7 +2006,12 @@ pub(crate) mod dec_full_dev {
         if !cuda_enabled() || !gpu_attention_enabled() || !q4_gpu_attn_enabled() {
             return None;
         }
-        if a.len < q4_gpu_attn_min() {
+        // task 179: 従来経路は `len < q4_gpu_attn_min()` (既定 64) で CPU へ
+        // 落ちるが、この経路は attention が同じ submission に載るので起動の
+        // 追加コストが無い。短い文脈でも GPU の split カーネルを使う
+        // (丸め順は CPU と違う。attention は P17g から緩和済みの契約)。
+        // `DENNO_FULL_DEC_ATTN_MIN` で下限を戻せる。
+        if a.len < full_dec_attn_min() {
             return None;
         }
         if !a.ok_shape() {
@@ -2000,14 +2041,6 @@ pub(crate) mod dec_full_dev {
         let nkv = a.heads / a.group;
 
         // 1) qkv GEMV: ホスト cur -> デバイス (D2H しない)
-        let w_qkv = weights_for_gguf(a.qkv_uid, a.qkv_ty, a.qkv_blocks, a.qkv_k, a.qkv_n)?;
-        let Some(plan_qkv) = ctx.plan_moe_gemv(a.qkv_ty, a.qkv_k, a.qkv_n, gemv_kernel_mode())?
-        else {
-            bail!("qkv GEMV の plan が無い ({:?})", a.qkv_ty);
-        };
-        if w_qkv.buf.bytes() != a.qkv_n * plan_qkv.rb {
-            bail!("qkv 重みのバイト数が合わない");
-        }
         Scratch::ensure(&mut st.qkv_in, a.qkv_k * 4)?;
         Scratch::ensure(&mut st.qkv, a.qkv_n * 4)?;
         Scratch::ensure_pin(&mut st.pin_x, a.qkv_k * 4)?;
@@ -2032,7 +2065,24 @@ pub(crate) mod dec_full_dev {
                 )?;
             }
         }
-        launch_plan(ctx, &plan_qkv, w_qkv.buf.ptr(), x_ptr, qkv_ptr, a.qkv_k, a.qkv_n)?;
+        for u in a.qkv_units {
+            let w = weights_for_gguf(u.uid, u.ty, u.blocks, u.k, u.n)?;
+            let Some(plan) = ctx.plan_moe_gemv(u.ty, u.k, u.n, gemv_kernel_mode())? else {
+                bail!("qkv GEMV の plan が無い ({:?})", u.ty);
+            };
+            if w.buf.bytes() != u.n * plan.rb {
+                bail!("qkv 重みのバイト数が合わない ({:?})", u.ty);
+            }
+            launch_plan(
+                ctx,
+                &plan,
+                w.buf.ptr(),
+                x_ptr,
+                qkv_ptr + (u.out_row * 4) as u64,
+                u.k,
+                u.n,
+            )?;
+        }
 
         // 2) q/k 正規化 + rope + gate 取り出し
         let kernels = dev_kernels()?;
@@ -2135,9 +2185,12 @@ pub(crate) mod dec_full_dev {
             }
         }
 
-        // 6) 出力投影 (デバイス入力)
+        // 6) 出力投影 (デバイス入力)。既定は v4 (レーン数可変) — lab t177c で
+        //    同じ形 (k=6144 Q8_0 / n=2560) が 51.2 -> 25.7 us。形が合わない・
+        //    PTX が無いときは従来 (v3) の plan へ。
         let w_wo = weights_for_gguf(a.wo_uid, a.wo_ty, a.wo_blocks, a.wo_k, a.wo_n)?;
-        let Some(plan_wo) = ctx.plan_moe_gemv(a.wo_ty, a.wo_k, a.wo_n, gemv_kernel_mode())? else {
+        let plan_wo = wo_plan(ctx, a)?;
+        let Some(plan_wo) = plan_wo else {
             bail!("出力投影の plan が無い ({:?})", a.wo_ty);
         };
         if w_wo.buf.bytes() != a.wo_n * plan_wo.rb {
@@ -2201,6 +2254,23 @@ pub(crate) mod dec_full_dev {
             st.norms[a.layer] = Some(Norms { key, q, k });
         }
         Ok(())
+    }
+
+    /// 出力投影の plan。既定は v4 (`DENNO_FULL_DEC_GEMV=v3` で従来へ)。
+    fn wo_plan(ctx: &CudaCtx, a: &Call<'_>) -> Result<Option<MoeGemvPlan>> {
+        static V4: OnceLock<bool> = OnceLock::new();
+        let v4_on = *V4.get_or_init(|| {
+            !matches!(
+                std::env::var("DENNO_FULL_DEC_GEMV").ok().as_deref(),
+                Some("v3") | Some("0") | Some("off") | Some("false")
+            )
+        });
+        if v4_on {
+            if let Some(p) = ctx.plan_moe_gemv_v4(a.wo_ty, a.wo_k, a.wo_n, gdn_dec_v4_lanes_cap()) {
+                return Ok(Some(p));
+            }
+        }
+        ctx.plan_moe_gemv(a.wo_ty, a.wo_k, a.wo_n, gemv_kernel_mode())
     }
 
     /// GEMV の起動 (引数は `moe_gemv_dev_with` と同一)。
@@ -2559,6 +2629,7 @@ pub(crate) mod dec_full_dev {
             k_norm: &'a [f32],
             cur: &'a [f32],
             blocks: &'a [u8],
+            units: &'a [Unit<'a>],
         ) -> Call<'a> {
             Call {
                 cache_id: 1,
@@ -2577,9 +2648,7 @@ pub(crate) mod dec_full_dev {
                 eps: 1e-6,
                 q_norm,
                 k_norm,
-                qkv_uid: 1,
-                qkv_ty: crate::kquant::GgmlType::Q8_0,
-                qkv_blocks: blocks,
+                qkv_units: units,
                 qkv_k: 2_560,
                 qkv_n: 13_312,
                 wo_uid: 2,
@@ -2592,6 +2661,75 @@ pub(crate) mod dec_full_dev {
             }
         }
 
+        /// 実形の unit 1 本 (連結できた層と同じ形)。
+        fn one_unit<'a>(blocks: &'a [u8]) -> Vec<Unit<'a>> {
+            vec![Unit {
+                uid: 1,
+                ty: crate::kquant::GgmlType::Q8_0,
+                blocks,
+                k: 2_560,
+                n: 13_312,
+                out_row: 0,
+            }]
+        }
+
+        /// 連結できない層 (3 本) も unit 列として通ること、隙間・行数違いは落ちること。
+        #[test]
+        fn units_gate_truth_table() {
+            let qn = vec![1f32; 256];
+            let kn = vec![1f32; 256];
+            let cur = vec![0f32; 2_560];
+            let blocks = vec![0u8; 1024];
+            // 3 本 (q|gate / k / v) に分かれた形: 12,288 + 512 + 512 = 13,312。
+            let three = vec![
+                Unit {
+                    uid: 1,
+                    ty: crate::kquant::GgmlType::Q8_0,
+                    blocks: &blocks,
+                    k: 2_560,
+                    n: 12_288,
+                    out_row: 0,
+                },
+                Unit {
+                    uid: 2,
+                    ty: crate::kquant::GgmlType::Q5K,
+                    blocks: &blocks,
+                    k: 2_560,
+                    n: 512,
+                    out_row: 12_288,
+                },
+                Unit {
+                    uid: 3,
+                    ty: crate::kquant::GgmlType::Q5K,
+                    blocks: &blocks,
+                    k: 2_560,
+                    n: 512,
+                    out_row: 12_800,
+                },
+            ];
+            let c = call_with(&qn, &kn, &cur, &blocks, &three);
+            assert!(c.ok_shape(), "3 本に分かれた形が通らない");
+            // 行の隙間。
+            let mut gap = three.clone();
+            gap[1].out_row = 12_289;
+            let c = call_with(&qn, &kn, &cur, &blocks, &gap);
+            assert!(!c.ok_shape());
+            // 合計行数が足りない。
+            let mut short = three.clone();
+            short.pop();
+            let c = call_with(&qn, &kn, &cur, &blocks, &short);
+            assert!(!c.ok_shape());
+            // 入力長が違う。
+            let mut badk = three.clone();
+            badk[2].k = 2_304;
+            let c = call_with(&qn, &kn, &cur, &blocks, &badk);
+            assert!(!c.ok_shape());
+            // 空。
+            let empty: Vec<Unit<'_>> = Vec::new();
+            let c = call_with(&qn, &kn, &cur, &blocks, &empty);
+            assert!(!c.ok_shape());
+        }
+
         #[test]
         fn off_by_default_and_forward_is_inert() {
             let _f = Force::set(Some(false));
@@ -2600,7 +2738,8 @@ pub(crate) mod dec_full_dev {
             let kn = vec![1f32; 256];
             let cur = vec![0f32; 2_560];
             let blocks = vec![0u8; 1024];
-            let c = call_with(&qn, &kn, &cur, &blocks);
+            let units = one_unit(&blocks);
+            let c = call_with(&qn, &kn, &cur, &blocks, &units);
             assert!(c.ok_shape(), "実形がゲートを通らない");
             // off のときは GPU に一切触らず None (従来経路へ)。
             assert!(forward(&c).is_none());
@@ -2612,37 +2751,38 @@ pub(crate) mod dec_full_dev {
             let kn = vec![1f32; 256];
             let cur = vec![0f32; 2_560];
             let blocks = vec![0u8; 1024];
-            let base = call_with(&qn, &kn, &cur, &blocks);
+            let units = one_unit(&blocks);
+            let base = call_with(&qn, &kn, &cur, &blocks, &units);
             assert!(base.ok_shape());
             // n_rot が表の上限 (128) を超える。
-            let mut c = call_with(&qn, &kn, &cur, &blocks);
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
             c.n_rot = 130;
             assert!(!c.ok_shape());
             // kv_dim が n_kv * dh と違う。
-            let mut c = call_with(&qn, &kn, &cur, &blocks);
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
             c.kv_dim = 256;
             assert!(!c.ok_shape());
             // qkv の行数が [q|gate|k|v] と違う。
-            let mut c = call_with(&qn, &kn, &cur, &blocks);
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
             c.qkv_n = 12_288;
             assert!(!c.ok_shape());
             // 入力長が k と違う。
-            let mut c = call_with(&qn, &kn, &cur, &blocks);
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
             c.qkv_k = 2_304;
             assert!(!c.ok_shape());
             // 出力投影の入力長が q_dim と違う。
-            let mut c = call_with(&qn, &kn, &cur, &blocks);
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
             c.wo_k = 6_400;
             assert!(!c.ok_shape());
             // head 数が group で割り切れない。
-            let mut c = call_with(&qn, &kn, &cur, &blocks);
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
             c.group = 5;
             assert!(!c.ok_shape());
             // len が 0 / 65536。
-            let mut c = call_with(&qn, &kn, &cur, &blocks);
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
             c.len = 0;
             assert!(!c.ok_shape());
-            let mut c = call_with(&qn, &kn, &cur, &blocks);
+            let mut c = call_with(&qn, &kn, &cur, &blocks, &units);
             c.len = 65_536;
             assert!(!c.ok_shape());
         }

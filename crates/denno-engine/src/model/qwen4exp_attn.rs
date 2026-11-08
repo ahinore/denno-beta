@@ -1402,7 +1402,23 @@ impl AttnLayer {
         #[cfg(feature = "cuda")]
         {
             if cells.is_none() && crate::cuda::dec_full_dev::on() {
-                if let Some(inner) = self.qkv.inner() {
+                // 連結できた層は 1 本、できない層 (q/k/v で型が違う) は 3 本。
+                // どちらも同じ入力 cur を取り、`qkv` バッファの行範囲へ書く。
+                let units: Vec<crate::cuda::dec_full_dev::Unit<'_>> = self
+                    .qkv
+                    .gemv_units()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, u)| crate::cuda::dec_full_dev::Unit {
+                        uid: u.uid(),
+                        ty: u.ty(),
+                        blocks: u.blocks().as_slice(),
+                        k: u.k(),
+                        n: u.n(),
+                        out_row: self.qkv.range(i).start,
+                    })
+                    .collect();
+                {
                     let call = crate::cuda::dec_full_dev::Call {
                         cache_id: cache.id(),
                         n_layer: cache.n_layer(),
@@ -1420,11 +1436,9 @@ impl AttnLayer {
                         eps: self.rms_eps,
                         q_norm: &self.q_norm,
                         k_norm: &self.k_norm,
-                        qkv_uid: inner.uid(),
-                        qkv_ty: inner.ty(),
-                        qkv_blocks: inner.blocks().as_slice(),
-                        qkv_k: inner.k(),
-                        qkv_n: inner.n(),
+                        qkv_units: &units,
+                        qkv_k: self.qkv.k(),
+                        qkv_n: self.qkv.n(),
                         wo_uid: self.wo.uid(),
                         wo_ty: self.wo.ty(),
                         wo_blocks: self.wo.blocks().as_slice(),
