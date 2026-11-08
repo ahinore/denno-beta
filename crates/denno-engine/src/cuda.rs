@@ -1543,21 +1543,19 @@ pub(crate) mod dec_kprof {
             }
         }
 
-        /// task 177: GDN decode GEMV の env 解釈 (task 179 で既定だけ v4 に変えた)。
+        /// task 177: GDN decode GEMV の env 解釈。
+        ///
+        /// task 179 で既定を v4 に、task 184 (lab t184a) で v5 にした。v5 の形が
+        /// 合わない単位は v4 へ落ちるので、既定は「v5 を試す」でよい。
         #[test]
         fn gdn_dec_gemv_parse_truth_table() {
-            // 未設定・空・明示 off は Default (この既定が v4 を意味する)。
-            for raw in [
-                None,
-                Some(""),
-                Some("  "),
-                Some("0"),
-                Some("off"),
-                Some("false"),
-                Some("no"),
-                Some("x"),
-            ] {
-                assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::Default, "raw={raw:?}");
+            // 未設定・空・未知の値は既定 (v5)。
+            for raw in [None, Some(""), Some("  "), Some("x")] {
+                assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::V5, "raw={raw:?}");
+            }
+            // 明示 off は v5 以前の既定 = v4。
+            for raw in [Some("0"), Some("off"), Some("false"), Some("no")] {
+                assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::V4, "raw={raw:?}");
             }
             // 明示指定 (大小文字と前後空白は無視)。
             assert_eq!(parse_gdn_dec_gemv(Some("v2")), GdnDecGemv::V2);
@@ -5485,8 +5483,14 @@ enum GdnDecGemv {
     V5,
 }
 
-/// task 184: v5 を既定にするか (lab の採否で決める。採否前は false)。
-const GDN_DEC_GEMV5_DEFAULT: bool = false;
+/// task 184: v5 を既定にするか。
+///
+/// lab t184a (depth8k) で採否 yes: 128 トークンの生 decode 秒が
+/// 3.39/2.93 -> 3.25/2.82 (短)、3.05 -> 2.93 (3,965)、3.07 -> 2.96 (14,157)
+/// = -3.6..-4.1%。kprof の 1 発あたりは gate Q4_K 36.3 -> 22.1 us、
+/// Q8_0 (qkv の一部 + out) 40.8 -> 30.2 us。**Q5_K の qkv は v5 が無い**ので
+/// その層は v4 のまま (53.6 us で不変)。戻すのは `DENNO_GDN_DEC_GEMV=v4`。
+const GDN_DEC_GEMV5_DEFAULT: bool = true;
 
 /// `DENNO_GDN_DEC_GEMV` の解釈 (未設定・空・`0`/`off` は既定 = v4)。
 fn parse_gdn_dec_gemv(raw: Option<&str>) -> GdnDecGemv {
@@ -5496,6 +5500,8 @@ fn parse_gdn_dec_gemv(raw: Option<&str>) -> GdnDecGemv {
         Some("fp16") => GdnDecGemv::Fp16,
         Some("v4") => GdnDecGemv::V4,
         Some("v5") => GdnDecGemv::V5,
+        // 明示 off は「v5 以前の既定」= v4 (task 179 の既定)。
+        Some("0") | Some("off") | Some("false") | Some("no") => GdnDecGemv::V4,
         _ => {
             if GDN_DEC_GEMV5_DEFAULT {
                 GdnDecGemv::V5
@@ -21319,8 +21325,12 @@ fn mix_dec_dev_from_value(v: Option<&str>, default_on: bool) -> bool {
 }
 
 /// task 184: mix の norm / inject をデバイスで回すか (`DENNO_MIX_DEC_DEV`)。
-/// 採否前は既定 off (lab の A/B で決める)。
-const MIX_DEC_DEV_DEFAULT: bool = false;
+///
+/// lab t184a (depth8k) で採否 yes: 128 トークンの生 decode 秒が
+/// 3.39/2.93 -> 3.33/2.88 (短)、3.05 -> 2.99 (3,965)、3.07 -> 3.03 (14,157)
+/// = -1.3..-2.0%。単独でも効き、3 ゲート同時でも加算的だった (mix 単独 -1.8%)。
+/// 戻すのは `DENNO_MIX_DEC_DEV=0`。
+const MIX_DEC_DEV_DEFAULT: bool = true;
 
 pub(crate) fn mix_dec_dev_enabled() -> bool {
     #[cfg(test)]
@@ -40531,20 +40541,30 @@ fn gdn_launch_gemv_dev(
 
 /// task 184: GDN decode のスキャンを第 2 版 (`kernels_gdn_scan2.cu` の
 /// `dno_gdn_scan_sig2`、4 レーン + 列レジスタ) に差し替えるか (`DENNO_GDN_SCAN2`)。
-/// 採否前は既定 off (lab の A/B で決める)。
+/// lab t184a で採否 yes → 既定 on。
 ///
 /// 第 2 版は dk == dv == 128 / d_conv == 4 のときだけ使う (それ以外は従来の
 /// `dno_gdn_scan_sig` へ fail closed)。丸めは skv / o の縮約順が変わる。
-fn gdn_scan2_from_value(v: Option<&str>) -> bool {
+fn gdn_scan2_from_value(v: Option<&str>, default_on: bool) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) if matches!(s.as_str(), "1" | "true" | "on" | "yes") => true,
-        _ => false,
+        Some(s) if matches!(s.as_str(), "0" | "false" | "off" | "no") => false,
+        _ => default_on,
     }
 }
 
+/// lab t184a (depth8k) で採否 yes: scan 1 発が 25.0 -> 12.7 us
+/// (128 トークンの生 decode 秒で -1.8..-2.3%)。戻すのは `DENNO_GDN_SCAN2=0`。
+const GDN_SCAN2_DEFAULT: bool = true;
+
 fn gdn_scan2_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| gdn_scan2_from_value(std::env::var("DENNO_GDN_SCAN2").ok().as_deref()))
+    *ON.get_or_init(|| {
+        gdn_scan2_from_value(
+            std::env::var("DENNO_GDN_SCAN2").ok().as_deref(),
+            GDN_SCAN2_DEFAULT,
+        )
+    })
 }
 
 /// kernels_gdn_scan2.ptx の `dno_gdn_scan_sig2`。
@@ -41724,11 +41744,12 @@ mod task184_tests {
         ] {
             assert_eq!(mix_dec_dev_from_value(raw, false), want, "raw={raw:?}");
         }
-        // 既定 on を渡したときの解釈 (採否後に使う)。
+        // 既定 on を渡したときの解釈 (採否後)。
         assert!(mix_dec_dev_from_value(None, true));
         assert!(!mix_dec_dev_from_value(Some("0"), true));
-        // 実効ゲートは既定 off。
-        assert!(!mix_dec_dev_enabled(), "DENNO_MIX_DEC_DEV が既定 on になっている");
+        // 実効ゲートは lab t184a の採否で既定 on。切るのは明示的な偽値。
+        assert!(mix_dec_dev_enabled(), "DENNO_MIX_DEC_DEV が既定 off に戻っている");
+        assert_eq!(MIX_DEC_DEV_DEFAULT, true);
     }
 
     /// norm 重みの指紋は「内容が変われば変わる」。常駐の載せ替え判定に使う。
@@ -41762,23 +41783,27 @@ mod task184_tests {
         assert_eq!(v5_lanes_div(0, 8), 0, "0 を割り切る扱いにしない");
     }
 
-    /// `DENNO_GDN_SCAN2` は既定 off。明示的な真値だけ on。
+    /// `DENNO_GDN_SCAN2` は lab t184a の採否で既定 on。切るのは明示的な偽値。
     #[test]
     fn gdn_scan2_truth_table() {
         for (raw, want) in [
-            (None, false),
-            (Some(""), false),
+            (None, true),
+            (Some(""), true),
+            (Some("  "), true),
+            (Some("x"), true),
             (Some("0"), false),
             (Some("off"), false),
+            (Some("false"), false),
+            (Some("no"), false),
             (Some("1"), true),
             (Some("on"), true),
             (Some("TRUE"), true),
             (Some("yes"), true),
-            (Some("x"), false),
         ] {
-            assert_eq!(gdn_scan2_from_value(raw), want, "raw={raw:?}");
+            assert_eq!(gdn_scan2_from_value(raw, GDN_SCAN2_DEFAULT), want, "raw={raw:?}");
         }
-        assert!(!gdn_scan2_on(), "DENNO_GDN_SCAN2 が既定 on になっている");
+        assert_eq!(GDN_SCAN2_DEFAULT, true);
+        assert!(gdn_scan2_on(), "DENNO_GDN_SCAN2 が既定 off に戻っている");
     }
 
     /// 形状の門番: scan2 は dk == dv == 128 のときだけ選ばれる。

@@ -7451,8 +7451,8 @@ fn gemv_v5_is_opt_in_through_the_existing_selector() {
         "DENNO_GDN_DEC_GEMV=v5 の解釈が無い"
     );
     assert!(
-        CUDA_RS.contains("const GDN_DEC_GEMV5_DEFAULT: bool = false;"),
-        "v5 が既定 on になっている (lab の採否前は off)"
+        CUDA_RS.contains("const GDN_DEC_GEMV5_DEFAULT: bool = true;"),
+        "v5 が既定 on でない (lab t184a で採否 yes)"
     );
     assert!(
         CUDA_RS.contains("kernels_moe_v5.ptx"),
@@ -7510,8 +7510,8 @@ fn mix_dev_kernels_abi_and_gate() {
     }
     // ゲートは既定 off (採否前)。
     assert!(
-        CUDA_RS.contains("const MIX_DEC_DEV_DEFAULT: bool = false;"),
-        "DENNO_MIX_DEC_DEV が既定 on になっている (lab の採否前は off)"
+        CUDA_RS.contains("const MIX_DEC_DEV_DEFAULT: bool = true;"),
+        "DENNO_MIX_DEC_DEV が既定 on でない (lab t184a で採否 yes)"
     );
     // build_ptx.sh: mix_dev が nofmad で targets に入っている。
     assert!(
@@ -7570,11 +7570,15 @@ fn gdn_scan2_kernel_is_wired() {
         CUDA_RS.contains("(scan_thr, 1, 1),"),
         "起動が scan_thr を使っていない"
     );
-    // ゲートは既定 off (採否前)。
+    // ゲートは lab t184a の採否で既定 on。
+    assert!(
+        CUDA_RS.contains("const GDN_SCAN2_DEFAULT: bool = true;"),
+        "scan2 が既定 on でない (lab t184a で採否 yes)"
+    );
     let gate = fn_body(CUDA_RS, "fn gdn_scan2_from_value(");
     assert!(
-        !gate.contains(r#""0" | "off" | "false" | "no""#),
-        "scan2 の真理値表が既定 on になっている (採否前は off)"
+        gate.contains(r#""0" | "false" | "off" | "no""#),
+        "scan2 の真理値表に明示 off が無い"
     );
     assert!(
         BUILD_PTX_SH.contains(r#"gdn_scan2)    echo "kernels_gdn_scan2.cu|nofmad" ;;"#),
