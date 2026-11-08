@@ -35012,6 +35012,12 @@ pub fn gdn_pf_chain(
     } else {
         None
     };
+    // ホスト側の beta/alpha を作らせたのにデバイス版が使えない場合は、ここで
+    // 連鎖を諦める (状態は未着手。呼び出し側が従来経路で作り直す)。空のスライスで
+    // H2D すると古い中身のままスキャンに入ってしまうので、必ず落とす。
+    if ba_dev_req && ba_dev.is_none() {
+        return Ok(false);
+    }
     gdn_pf_kprof::begin(gdn_pf_kprof::X_H2D);
     let ptr = GDN_PF_CHAIN_BUF.with(|cell| -> Result<[CUdeviceptr; 7]> {
         let mut b = cell.borrow_mut();
