@@ -7375,3 +7375,221 @@ fn pf3_kernels_gate_and_gather() {
         "pf2 の spec 行が変わった"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 184: decode の GEMV v5 / mix の norm・inject / GDN scan 第 2 版
+// ---------------------------------------------------------------------------
+
+const MOE_V5_SRC: &str = include_str!("../kernels/kernels_moe_v5.cu");
+const MIX_DEV_SRC: &str = include_str!("../kernels/kernels_mix_dev.cu");
+const GDN_SCAN2_SRC: &str = include_str!("../kernels/kernels_gdn_scan2.cu");
+
+/// v5 の 2 本は v3 / v4 と同じ 8 引数 ABI で、cuda.rs の起動側と同じ並び。
+///
+/// 並びが 1 つでも入れ替わると rows_per_block と lanes を取り違えて
+/// **黙って別の行を書く** (t140a の 700 と同じ class) ので、ソースの並びを固定する。
+#[test]
+fn gemv_v5_kernels_have_the_v4_abi() {
+    for name in ["dno_gemv_q8_0_v5", "dno_gemv_q4k_v5"] {
+        let p = kernel_params(MOE_V5_SRC, name);
+        assert_eq!(
+            p,
+            vec!["w", "x", "out", "n_in", "n_out", "row_bytes", "rows_per_block", "lanes"],
+            "{name} の引数が v4 ABI と違う: {p:?}"
+        );
+    }
+    // cuda.rs 側のカーネル名と ABI 検査 (8 本) が揃っている。
+    assert!(
+        CUDA_RS.contains(r#"const V5_KERNEL_NAMES: [&str; 2] = ["dno_gemv_q8_0_v5", "dno_gemv_q4k_v5"];"#),
+        "cuda.rs の V5_KERNEL_NAMES が 2 本揃っていない"
+    );
+    assert!(
+        CUDA_RS.contains("const V5_NARGS: usize = 8;"),
+        "v5 の ABI 検査が 8 引数でない"
+    );
+    // 起動は v4 と同じ `gdn_launch_gemv_dev` (引数の並びを共有する)。
+    let body = fn_body(CUDA_RS, "fn gdn_launch_gemv_dev(");
+    for line in [
+        "let (mut pw, mut px, mut po) = (dev_w.ptr(), x_dev, out_dev);",
+        "let (mut n_in_c, mut n_out_c, mut rb_c) = (n_in as c_int, n_out as c_int, rb as c_int);",
+        "let (mut rows_c, mut lanes_c) = (rows_per_block as c_int, lanes as c_int);",
+    ] {
+        assert!(body.contains(line), "gdn_launch_gemv_dev の引数組み立てが変わった: {line}");
+    }
+    // 計画: 8 行/ブロック・レーンは「担当単位が割り切れる最大の 2 の冪」。
+    let plan = fn_body(CUDA_RS, "fn plan_moe_gemv_v5(");
+    assert!(plan.contains("const ROWS: usize = 8;"), "v5 の rows が 8 でない");
+    assert!(
+        plan.contains("let lanes = v5_lanes_div(per_unit, 8);"),
+        "v5 のレーン決定が per_unit / 8 でない"
+    );
+    assert!(
+        plan.contains("if nb < 2 || nb % 2 != 0 {"),
+        "Q8_0 のブロック対の前提 (偶数) が抜けた"
+    );
+    // build_ptx.sh: moe_v5 が nofmad で targets に入っている。
+    assert!(
+        BUILD_PTX_SH.contains(r#"moe_v5)       echo "kernels_moe_v5.cu|nofmad" ;;"#),
+        "build_ptx.sh の moe_v5 が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(targets.contains("moe_v5"), "targets_all に moe_v5 が無い: {targets}");
+}
+
+/// v5 の PTX を読む口と、既定のセレクタ (v5 は opt-in) が揃っている。
+#[test]
+fn gemv_v5_is_opt_in_through_the_existing_selector() {
+    assert!(
+        CUDA_RS.contains(r#""DENNO_GDN_DEC_GEMV""#),
+        "既存のセレクタ env が無い"
+    );
+    assert!(
+        CUDA_RS.contains(r#"Some("v5") => GdnDecGemv::V5,"#),
+        "DENNO_GDN_DEC_GEMV=v5 の解釈が無い"
+    );
+    assert!(
+        CUDA_RS.contains("const GDN_DEC_GEMV5_DEFAULT: bool = true;"),
+        "v5 が既定 on でない (lab t184a で採否 yes)"
+    );
+    assert!(
+        CUDA_RS.contains("kernels_moe_v5.ptx"),
+        "v5 の PTX パスが無い"
+    );
+    // v5 の形が合わない単位は v4 へ落ちる (CPU へは落とさない)。
+    let v4on = fn_body(CUDA_RS, "fn gdn_dec_gemv_v4_on(");
+    assert!(
+        v4on.contains("GdnDecGemv::V5"),
+        "v5 選択時に v4 へ落ちる経路が無い"
+    );
+}
+
+/// mix の norm / inject カーネルの ABI と、ホスト側の起動引数の並び。
+#[test]
+fn mix_dev_kernels_abi_and_gate() {
+    let n = kernel_params(MIX_DEV_SRC, "dno_mix_norm");
+    assert_eq!(
+        n,
+        vec!["x", "gamma", "out", "e", "eps"],
+        "dno_mix_norm の引数が違う: {n:?}"
+    );
+    let i = kernel_params(MIX_DEV_SRC, "dno_mix_inj");
+    assert_eq!(
+        i,
+        vec!["w", "x", "out", "k", "n"],
+        "dno_mix_inj の引数が違う: {i:?}"
+    );
+    // host 側: 5 引数ずつで起動している (並びはカーネルと同じ)。
+    assert!(
+        CUDA_RS.contains(r#"if ptx_entry_params(&text, "dno_mix_norm") != Some(5)"#),
+        "norm の ABI 検査が無い"
+    );
+    assert!(
+        CUDA_RS.contains(r#"|| ptx_entry_params(&text, "dno_mix_inj") != Some(5)"#),
+        "inject の ABI 検査が無い"
+    );
+    let chain3 = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    for line in [
+        "let (mut px, mut pg, mut po) = (dx.ptr(), wpg, dx.ptr());",
+        "let (mut ec, mut epsc) = (e as c_int, eps);",
+        "let (mut pw, mut px, mut po) = (pwj, dx.ptr(), pinj);",
+        "let (mut kc, mut nc) = (k1 as c_int, hc as c_int);",
+    ] {
+        assert!(chain3.contains(line), "chain3 の起動引数が変わった: {line}");
+    }
+    // 順序: norm → inject → down → up → hc_mixed → D2H (同じ stream で直列)。
+    let order = ["f_dev.norm", "f_dev.inj", "f_down", "f_up", "f_mixed", "(e + hc) * 4"];
+    let mut at = 0usize;
+    for k in order {
+        let Some(off) = chain3[at..].find(k) else {
+            panic!("chain3 に {k} が無い (順序が崩れた)");
+        };
+        at += off + k.len();
+    }
+    // ゲートは既定 off (採否前)。
+    assert!(
+        CUDA_RS.contains("const MIX_DEC_DEV_DEFAULT: bool = true;"),
+        "DENNO_MIX_DEC_DEV が既定 on でない (lab t184a で採否 yes)"
+    );
+    // build_ptx.sh: mix_dev が nofmad で targets に入っている。
+    assert!(
+        BUILD_PTX_SH.contains(r#"mix_dev)      echo "kernels_mix_dev.cu|nofmad" ;;"#),
+        "build_ptx.sh の mix_dev が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(targets.contains("mix_dev"), "targets_all に mix_dev が無い: {targets}");
+}
+
+/// scan 第 2 版の前提 (dk=dv=128 / 4 レーン / 512 スレッド) と起動。
+#[test]
+fn gdn_scan2_kernel_is_wired() {
+    assert!(
+        GDN_SCAN2_SRC.contains("#define DNO_S2_DK 128"),
+        "scan2 の dk 前提が無い"
+    );
+    assert!(
+        GDN_SCAN2_SRC.contains("#define DNO_S2_NS 32"),
+        "scan2 の 1 レーン行数 (32) が無い"
+    );
+    // 状態はレジスタ (固定長配列 + 全展開)。
+    assert!(
+        GDN_SCAN2_SRC.contains("float S[DNO_S2_NS];"),
+        "scan2 の状態がレジスタ配列でない"
+    );
+    assert!(
+        GDN_SCAN2_SRC.contains("__shfl_down_sync(0xffffffffu, v, 1, 4)")
+            && GDN_SCAN2_SRC.contains("__shfl_down_sync(0xffffffffu, v, 2, 4)"),
+        "scan2 の 4 レーン縮約が無い"
+    );
+    assert!(
+        GDN_SCAN2_SRC.contains("const int c = t >> 2;") && GDN_SCAN2_SRC.contains("const int lane = t & 3;"),
+        "scan2 のスレッド割り当て (列 = t/4、レーン = t%4) が変わった"
+    );
+    let p = kernel_params(GDN_SCAN2_SRC, "dno_gdn_scan_sig2");
+    assert_eq!(p.len(), 23, "scan2 の引数が 23 本でない: {}", p.len());
+    // ホスト側: dk == dv == 128 のときだけ選び、block は 4*dk。
+    let pick = fn_body(CUDA_RS, "fn gdn_scan_pick(");
+    assert!(
+        pick.contains("dk == 128 && dv == 128"),
+        "scan2 の形の門番が無い"
+    );
+    assert!(
+        pick.contains("return (f, (4 * dk) as u32);"),
+        "scan2 の block が 4*dk でない"
+    );
+    assert!(
+        CUDA_RS.contains(r#"if ptx_entry_params(&text, "dno_gdn_scan_sig2") != Some(23)"#),
+        "scan2 の ABI 検査が無い"
+    );
+    assert!(
+        CUDA_RS.contains("(scan_thr, 1, 1),"),
+        "起動が scan_thr を使っていない"
+    );
+    // ゲートは lab t184a の採否で既定 on。
+    assert!(
+        CUDA_RS.contains("const GDN_SCAN2_DEFAULT: bool = true;"),
+        "scan2 が既定 on でない (lab t184a で採否 yes)"
+    );
+    let gate = fn_body(CUDA_RS, "fn gdn_scan2_from_value(");
+    assert!(
+        gate.contains(r#""0" | "false" | "off" | "no""#),
+        "scan2 の真理値表に明示 off が無い"
+    );
+    assert!(
+        BUILD_PTX_SH.contains(r#"gdn_scan2)    echo "kernels_gdn_scan2.cu|nofmad" ;;"#),
+        "build_ptx.sh の gdn_scan2 が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gdn_scan2"),
+        "targets_all に gdn_scan2 が無い: {targets}"
+    );
+}

@@ -1543,22 +1543,19 @@ pub(crate) mod dec_kprof {
             }
         }
 
-        /// task 177: GDN decode GEMV の env 解釈 (task 179 で既定だけ v4 に変えた)。
+        /// task 177: GDN decode GEMV の env 解釈。
+        ///
+        /// task 179 で既定を v4 に、task 184 (lab t184a) で v5 にした。v5 の形が
+        /// 合わない単位は v4 へ落ちるので、既定は「v5 を試す」でよい。
         #[test]
         fn gdn_dec_gemv_parse_truth_table() {
-            // 未設定・空・明示 off は Default (この既定が v4 を意味する)。
-            for raw in [
-                None,
-                Some(""),
-                Some("  "),
-                Some("0"),
-                Some("off"),
-                Some("false"),
-                Some("no"),
-                Some("v5"),
-                Some("x"),
-            ] {
-                assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::Default, "raw={raw:?}");
+            // 未設定・空・未知の値は既定 (v5)。
+            for raw in [None, Some(""), Some("  "), Some("x")] {
+                assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::V5, "raw={raw:?}");
+            }
+            // 明示 off は v5 以前の既定 = v4。
+            for raw in [Some("0"), Some("off"), Some("false"), Some("no")] {
+                assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::V4, "raw={raw:?}");
             }
             // 明示指定 (大小文字と前後空白は無視)。
             assert_eq!(parse_gdn_dec_gemv(Some("v2")), GdnDecGemv::V2);
@@ -1567,6 +1564,9 @@ pub(crate) mod dec_kprof {
             assert_eq!(parse_gdn_dec_gemv(Some("fp16")), GdnDecGemv::Fp16);
             assert_eq!(parse_gdn_dec_gemv(Some("v4")), GdnDecGemv::V4);
             assert_eq!(parse_gdn_dec_gemv(Some("V4")), GdnDecGemv::V4);
+            // task 184: v5 (ベクタロード + 複数アキュムレータ + 先読み)。
+            assert_eq!(parse_gdn_dec_gemv(Some("v5")), GdnDecGemv::V5);
+            assert_eq!(parse_gdn_dec_gemv(Some(" V5 ")), GdnDecGemv::V5);
             // Default のときも gemv_kernel_mode() 側の選択肢に収まる。
             assert!(matches!(
                 gdn_dec_gemv_mode_eff(),
@@ -4313,6 +4313,59 @@ impl CudaCtx {
         })
     }
 
+    /// task 184: v5 (ベクタロード + 複数アキュムレータ + 先読み) の計画。
+    /// 形が合わない / PTX が無いときは `None` (呼び出し側は v4 へ落ちる)。
+    ///
+    /// レーン数は「レーンの担当単位が割り切れる」最大の 2 の冪:
+    /// - Q8_0: ブロック対 (nb = n_in/32 が偶数であること) を `np = nb/2` 個
+    /// - Q4_K: スーパーブロック (nb = n_in/256) を `nb` 個
+    /// 1 ブロック 8 行は v4 と同じ。
+    fn plan_moe_gemv_v5(
+        &self,
+        ty: crate::kquant::GgmlType,
+        n_in: usize,
+        n_out: usize,
+    ) -> Option<MoeGemvPlan> {
+        use crate::kquant::GgmlType as T;
+        let ki = match ty {
+            T::Q8_0 => 0usize,
+            T::Q4K => 1usize,
+            _ => return None,
+        };
+        let rb = gguf_row_bytes(ty, n_in)?;
+        if n_out == 0 || n_in == 0 {
+            return None;
+        }
+        let per_unit = if ki == 0 {
+            let nb = n_in / 32;
+            if nb < 2 || nb % 2 != 0 {
+                return None;
+            }
+            nb / 2
+        } else {
+            let nb = n_in / 256;
+            if nb == 0 {
+                return None;
+            }
+            nb
+        };
+        let lanes = v5_lanes_div(per_unit, 8);
+        if lanes == 0 {
+            return None;
+        }
+        let k = gemv_v5_kernels()?;
+        const ROWS: usize = 8;
+        Some(MoeGemvPlan {
+            f: k.f[ki],
+            rows_per_block: ROWS,
+            block_dim: (ROWS * lanes) as u32,
+            shmem: 0,
+            lanes,
+            rb,
+            grid: n_out.div_ceil(ROWS) as u32,
+        })
+    }
+
     /// decode GEMV を 1 本積む (task 124 の重ね打ち経路)。
     ///
     /// 引数の並びは [`Self::moe_gemv_dev_with`] が組むものと同一
@@ -5279,6 +5332,107 @@ pub(crate) fn moe_gemv_v4_loaded() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// task 184: v5 (`kernels_moe_v5.cu`) — ベクタロード + 複数アキュムレータ +
+// 次ブロック先読み。Q8_0 は 2 ブロック (68 B) を 17 ワード、Q4_K は 1 スーパー
+// ブロック (144 B) を 9 uint4 で読む。
+// ---------------------------------------------------------------------------
+
+/// v5 のカーネル名 (`ki` の順 = Q8_0 / Q4_K)。
+const V5_KERNEL_NAMES: [&str; 2] = ["dno_gemv_q8_0_v5", "dno_gemv_q4k_v5"];
+
+/// v5 の引数の数 (v3 / v4 と同じ 8 本)。
+const V5_NARGS: usize = 8;
+
+struct V5Kernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: [CUfunction; 2],
+}
+
+unsafe impl Send for V5Kernels {}
+unsafe impl Sync for V5Kernels {}
+
+static V5_KERNELS: OnceLock<Option<V5Kernels>> = OnceLock::new();
+
+fn gemv_v5_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_GEMV_V5_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_moe_v5.ptx"),
+    }
+}
+
+/// v5 のカーネルを取得する (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+fn gemv_v5_kernels() -> Option<&'static V5Kernels> {
+    V5_KERNELS
+        .get_or_init(|| {
+            let path = gemv_v5_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let text = String::from_utf8_lossy(&image).to_string();
+            for name in V5_KERNEL_NAMES {
+                if ptx_entry_params(&text, name) != Some(V5_NARGS) {
+                    eprintln!(
+                        "[gemv-v5] PTX の引数が {V5_NARGS} 本でない ({name}) → v4 へ。\
+                         `bash build_ptx.sh moe_v5` で再生成する"
+                    );
+                    return None;
+                }
+            }
+            image.push(0);
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                let mut f: [CUfunction; 2] = [std::ptr::null_mut(); 2];
+                for (k, name) in V5_KERNEL_NAMES.iter().enumerate() {
+                    let mut cname = name.as_bytes().to_vec();
+                    cname.push(0);
+                    if (lib.module_get_function)(&mut f[k], module, cname.as_ptr() as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!("[gemv-v5] PTX に {name} が無い → v4 へ");
+                        return None;
+                    }
+                }
+                Some(V5Kernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+/// v5 が載っているか (テスト専用)。
+#[cfg(test)]
+pub(crate) fn moe_gemv_v5_loaded() -> bool {
+    gemv_v5_kernels().is_some()
+}
+
+/// 割り切れる最大の 2 の冪 (1 以上、`cap` 以下)。無ければ 0。
+fn v5_lanes_div(n: usize, cap: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut l = cap.clamp(1, 32);
+    while l & (l - 1) != 0 {
+        l -= 1;
+    }
+    while l >= 1 {
+        if l > 0 && n % l == 0 {
+            return l;
+        }
+        l >>= 1;
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
 // P-fp16 (task 108): fast mode の fp16 GEMV (`kernels_moe_fp16.cu`)
 // ---------------------------------------------------------------------------
 
@@ -5325,15 +5479,36 @@ enum GdnDecGemv {
     Fp16,
     /// v4 (レーン数可変。`kernels_moe_v4.cu`)。
     V4,
+    /// v5 (ベクタロード + 複数アキュムレータ + 先読み。`kernels_moe_v5.cu`)。
+    V5,
 }
 
+/// task 184: v5 を既定にするか。
+///
+/// lab t184a (depth8k) で採否 yes: 128 トークンの生 decode 秒が
+/// 3.39/2.93 -> 3.25/2.82 (短)、3.05 -> 2.93 (3,965)、3.07 -> 2.96 (14,157)
+/// = -3.6..-4.1%。kprof の 1 発あたりは gate Q4_K 36.3 -> 22.1 us、
+/// Q8_0 (qkv の一部 + out) 40.8 -> 30.2 us。**Q5_K の qkv は v5 が無い**ので
+/// その層は v4 のまま (53.6 us で不変)。戻すのは `DENNO_GDN_DEC_GEMV=v4`。
+const GDN_DEC_GEMV5_DEFAULT: bool = true;
+
+/// `DENNO_GDN_DEC_GEMV` の解釈 (未設定・空・`0`/`off` は既定 = v4)。
 fn parse_gdn_dec_gemv(raw: Option<&str>) -> GdnDecGemv {
     match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         Some("v2") => GdnDecGemv::V2,
         Some("v3") => GdnDecGemv::V3,
         Some("fp16") => GdnDecGemv::Fp16,
         Some("v4") => GdnDecGemv::V4,
-        _ => GdnDecGemv::Default,
+        Some("v5") => GdnDecGemv::V5,
+        // 明示 off は「v5 以前の既定」= v4 (task 179 の既定)。
+        Some("0") | Some("off") | Some("false") | Some("no") => GdnDecGemv::V4,
+        _ => {
+            if GDN_DEC_GEMV5_DEFAULT {
+                GdnDecGemv::V5
+            } else {
+                GdnDecGemv::Default
+            }
+        }
     }
 }
 
@@ -5360,9 +5535,15 @@ fn gdn_dec_gemv_mode_eff() -> GemvKernelMode {
 /// (または `v2` / `fp16` / `default`)。
 fn gdn_dec_gemv_v4_on() -> bool {
     match gdn_dec_gemv_choice() {
-        GdnDecGemv::V4 | GdnDecGemv::Default => true,
+        // task 184: v5 の形が合わない単位は v4 へ落とす (CPU へは落とさない)。
+        GdnDecGemv::V4 | GdnDecGemv::V5 | GdnDecGemv::Default => true,
         GdnDecGemv::V2 | GdnDecGemv::V3 | GdnDecGemv::Fp16 => false,
     }
+}
+
+/// task 184: v5 を選んでいるか。
+fn gdn_dec_gemv_v5_on() -> bool {
+    matches!(gdn_dec_gemv_choice(), GdnDecGemv::V5)
 }
 
 /// `DENNO_GDN_DEC_GEMV_LANES` の解釈 (純関数)。既定 32、4..32 に丸める。
@@ -21115,6 +21296,505 @@ pub fn mix_gpu_unregister(uid: u64) {
         map.remove(&uid);
     }
 }
+
+// ===========================================================================
+// task 184: mix の norm / inject をデバイスへ (`DENNO_MIX_DEC_DEV`)
+// ===========================================================================
+//
+// 背景 (lab t179a の平均表 `DENNO_GDN_DEC_KPROF`): mix 1 回のホスト仕事は
+// mix_norm 5.1 us + mix_inj 3.8 us = 8.9 us で、decode は 1 トークンに
+// 2*n_layer+1 = 97 回 mix を呼ぶ (0.86 ms/token)。どちらも「1 スレッドの逐次和」
+// なので、デバイスのツリー縮約に置き換えて mix の submission に畳む。
+//
+// ホストが回していた順序 (norm → inject と down/up の直列) を、1 回の同期で
+// 閉じる 1 本の submission にする:
+//   H2D x → dno_mix_norm → (dno_mix_inj | down+silu → up → hc_mixed)
+//   → D2H mixed[e] + inj[hc] → 同期 1 回
+//
+// 値: 縮約がツリーになるので CPU の逐次和とは丸め順が変わる (md5 は DIFF しうる)。
+// 要素ごとの演算列は CPU と同じ。fail closed (PTX 無し / 形違い / 確保失敗 →
+// `false` を返し、呼び出し側は従来のホスト経路をそのまま走らせる)。
+
+/// `DENNO_MIX_DEC_DEV` の解釈 (純関数)。既定は [`MIX_DEC_DEV_DEFAULT`]。
+fn mix_dec_dev_from_value(v: Option<&str>, default_on: bool) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) if matches!(s.as_str(), "1" | "true" | "on" | "yes") => true,
+        Some(s) if matches!(s.as_str(), "0" | "false" | "off" | "no") => false,
+        _ => default_on,
+    }
+}
+
+/// task 184: mix の norm / inject をデバイスで回すか (`DENNO_MIX_DEC_DEV`)。
+///
+/// lab t184a (depth8k) で採否 yes: 128 トークンの生 decode 秒が
+/// 3.39/2.93 -> 3.33/2.88 (短)、3.05 -> 2.99 (3,965)、3.07 -> 3.03 (14,157)
+/// = -1.3..-2.0%。単独でも効き、3 ゲート同時でも加算的だった (mix 単独 -1.8%)。
+/// 戻すのは `DENNO_MIX_DEC_DEV=0`。
+const MIX_DEC_DEV_DEFAULT: bool = true;
+
+pub(crate) fn mix_dec_dev_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = MIX_DEC_DEV_FORCE.with(|c| c.get()) {
+        return v;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        mix_dec_dev_from_value(
+            std::env::var("DENNO_MIX_DEC_DEV").ok().as_deref(),
+            MIX_DEC_DEV_DEFAULT,
+        )
+    })
+}
+
+/// テスト用: ゲートの強制 (None = env の解釈)。
+#[cfg(test)]
+thread_local! {
+    static MIX_DEC_DEV_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn mix_dec_dev_set_for_test(v: Option<bool>) {
+    MIX_DEC_DEV_FORCE.with(|c| c.set(v));
+}
+
+/// task 184: chain3 の入口に入った回数 (テスト専用)。ゲートを足したが分岐が
+/// 通っていない、を GPU 無しで検出するために `cuda_enabled()` の判定より前に数える。
+#[cfg(test)]
+static MIX_DEV_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// task 184: [`MIX_DEV_ATTEMPTS`] を読む (テスト専用)。
+#[cfg(test)]
+pub(crate) fn mix_dev_attempts() -> usize {
+    MIX_DEV_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// task 184: 入口のカウンタを 0 に戻す (テスト専用)。
+#[cfg(test)]
+pub(crate) fn mix_dev_attempts_reset() {
+    MIX_DEV_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// kernels_mix_dev.ptx のカーネル一式 (2 本そろって初めて `Some`)。
+struct MixDevKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    norm: CUfunction,
+    inj: CUfunction,
+}
+
+unsafe impl Send for MixDevKernels {}
+unsafe impl Sync for MixDevKernels {}
+
+static MIX_DEV_KERNELS: OnceLock<Option<MixDevKernels>> = OnceLock::new();
+
+fn mix_dev_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MIX_DEV_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_mix_dev.ptx"),
+    }
+}
+
+/// mix_dev のカーネルを取得する (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+fn mix_dev_kernels() -> Option<&'static MixDevKernels> {
+    MIX_DEV_KERNELS
+        .get_or_init(|| {
+            let path = mix_dev_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let text = String::from_utf8_lossy(&image).to_string();
+            // ABI: dno_mix_norm は (x, gamma, out, e, eps) の 5 本、
+            // dno_mix_inj は (w, x, out, k, n) の 5 本。
+            if ptx_entry_params(&text, "dno_mix_norm") != Some(5)
+                || ptx_entry_params(&text, "dno_mix_inj") != Some(5)
+            {
+                return None;
+            }
+            image.push(0);
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                let get = |name: &[u8]| -> Option<CUfunction> {
+                    let mut f: CUfunction = std::ptr::null_mut();
+                    let r = (lib.module_get_function)(
+                        &mut f,
+                        module,
+                        name.as_ptr() as *const c_char,
+                    );
+                    if r == CUDA_SUCCESS {
+                        Some(f)
+                    } else {
+                        None
+                    }
+                };
+                let norm = get(b"dno_mix_norm\0")?;
+                let inj = get(b"dno_mix_inj\0")?;
+                Some(MixDevKernels { module, norm, inj })
+            }
+        })
+        .as_ref()
+}
+
+/// norm 重み (host の `[hc][e]` f32) の常駐。キーは (ポインタ, 長さ) で、
+/// 内容の指紋 (16 点サンプル) が変われば載せ替える。
+///
+/// `norm` は `GgufLinear` ではなく素のスライスなので uid が無い。プロセス内で
+/// モデルを建て直すとアドレスが再利用されうるため、ポインタだけを鍵にしない
+/// (指紋が違えば再アップロードする)。
+struct MixNormW {
+    buf: DevBuffer,
+    fp: u64,
+}
+
+static MIX_NORM_W: OnceLock<std::sync::Mutex<std::collections::HashMap<(usize, usize), MixNormW>>> =
+    OnceLock::new();
+
+/// 16 点サンプル + 長さ + ポインタの指紋 (内容が違えば必ず変わる実用上の鍵)。
+fn mix_norm_fingerprint(norm: &[f32], ptr: usize) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (norm.len() as u64);
+    let n = norm.len();
+    for i in 0..16u64 {
+        let idx = if n == 0 {
+            0
+        } else {
+            ((i * (n as u64 - 1)) / 16) as usize
+        };
+        let v = norm.get(idx).copied().unwrap_or(0.0);
+        h ^= v.to_bits() as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^= ptr as u64;
+    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    h
+}
+
+/// norm 重みを VRAM に載せて (初回だけ) ポインタを返す。
+fn mix_norm_weight(norm: &[f32]) -> Result<CUdeviceptr> {
+    let reg = MIX_NORM_W.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = match reg.lock() {
+        Ok(g) => g,
+        Err(_) => bail!("mix norm 重みの登録簿が poisoned"),
+    };
+    let key = (norm.as_ptr() as usize, norm.len());
+    let fp = mix_norm_fingerprint(norm, key.0);
+    if let Some(w) = map.get(&key) {
+        if w.fp == fp {
+            return Ok(w.buf.ptr());
+        }
+        map.remove(&key);
+    }
+    let buf = DevBuffer::from_slice_tagged(norm, crate::mem_audit::TAG_MIX_F32)?;
+    let ptr = buf.ptr();
+    map.insert(key, MixNormW { buf, fp });
+    Ok(ptr)
+}
+
+/// task 184: decode の hc mix を norm から inject まで 1 回の submission で閉じる。
+///
+/// `x` は mix の入力 (`[hc][e]` = 残差ストリーム)。`mixed` は `[e]`、
+/// `inj_out` は `[hc]` (1/hc は掛けない。呼び出し側が `hc_inject_apply` する)。
+/// `inject` が None のとき (head の mix) は inject を撃たず `inj_out` を 0 で埋める。
+///
+/// `false` = 従来経路 (ホストの norm / inject + chain2) を使うこと。
+#[allow(clippy::too_many_arguments)]
+pub fn maybe_gpu_mix_bf16_chain3_into(
+    down_uid: u64,
+    down_bytes: &[u8],
+    k1: usize,
+    n1: usize,
+    up_uid: u64,
+    up_bytes: &[u8],
+    k2: usize,
+    n2: usize,
+    inject: Option<(u64, usize, usize, &[u8])>,
+    norm: &[f32],
+    eps: f32,
+    inv_hc: f32,
+    e: usize,
+    hc: usize,
+    x: &[f32],
+    mixed: &mut [f32],
+    inj_out: &mut [f32],
+) -> bool {
+    use std::sync::atomic::Ordering as AO;
+    #[cfg(test)]
+    MIX_DEV_ATTEMPTS.fetch_add(1, AO::Relaxed);
+    if !cuda_enabled() || MIX_GPU_BROKEN.load(AO::Relaxed) {
+        return false;
+    }
+    if k1 == 0
+        || n1 == 0
+        || n2 == 0
+        || e == 0
+        || hc == 0
+        || k2 != n1
+        || n2 != k1
+        || n2 / e != hc
+        || norm.len() != k1
+        || x.len() != k1
+        || mixed.len() != e
+        || inj_out.len() != hc
+        || k1 < n1
+        || down_bytes.len() != k1.saturating_mul(n1).saturating_mul(2)
+        || up_bytes.len() != n1.saturating_mul(n2).saturating_mul(2)
+    {
+        return false;
+    }
+    if let Some((_, ik, inn, ib)) = inject {
+        if ik != k1 || inn != hc || ib.len() != ik.saturating_mul(inn).saturating_mul(2) {
+            return false;
+        }
+    }
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if let Err(err) = ctx.make_current() {
+        mix_gpu_broken_once(&format!("cuCtxSetCurrent (chain3): {err:#}"));
+        return false;
+    }
+    // デバイスの norm / inject と BF16 の mix 重みは同じ前提 (BF16 常駐)。
+    if !mix_bf16_enabled() {
+        return false;
+    }
+    let Some(f_dev) = mix_dev_kernels() else {
+        return false;
+    };
+    let Some(f_mixed) = hc_mixed_f32_fn(ctx) else {
+        return false;
+    };
+    let Some(f_down) = matvec_bf16_r_silu_fn(ctx) else {
+        return false;
+    };
+    let up_reduce = mix_up_reduce_enabled();
+    let f_up = if up_reduce {
+        matvec_bf16_r_fn(ctx)
+    } else {
+        matvec_bf16_fn(ctx)
+    };
+    let Some(f_up) = f_up else {
+        return false;
+    };
+    let up_thr: u32 = if up_reduce { 256 } else { 1 };
+    let wp1 = match mix_gpu_weight(down_uid, down_bytes, k1, n1, true) {
+        Ok(w) => w.ptr,
+        Err(err) => {
+            mix_gpu_broken_once(&format!("chain3 down 重みの常駐に失敗: {err:#}"));
+            return false;
+        }
+    };
+    let wp2 = match mix_gpu_weight(up_uid, up_bytes, n1, n2, true) {
+        Ok(w) => w.ptr,
+        Err(err) => {
+            mix_gpu_broken_once(&format!("chain3 up 重みの常駐に失敗: {err:#}"));
+            return false;
+        }
+    };
+    let wpj = match inject {
+        Some((uid, ik, inn, ib)) => match mix_gpu_weight(uid, ib, ik, inn, true) {
+            Ok(w) => Some(w.ptr),
+            Err(err) => {
+                mix_gpu_broken_once(&format!("chain3 inject 重みの常駐に失敗: {err:#}"));
+                return false;
+            }
+        },
+        None => None,
+    };
+    let wpg = match mix_norm_weight(norm) {
+        Ok(p) => p,
+        Err(err) => {
+            mix_gpu_broken_once(&format!("chain3 norm 重みの常駐に失敗: {err:#}"));
+            return false;
+        }
+    };
+    let Some(lib) = lib().ok() else {
+        return false;
+    };
+    const THREADS: usize = 256;
+    let r = MIX_GPU_SC.with(|cell| -> Result<()> {
+        // task 177: mix 1 回の操作別内訳 (`DENNO_GDN_DEC_KPROF`・既定 off)。
+        // site 2 = norm/inject までデバイスで閉じる経路。
+        let _kp_win = dec_kprof::window(
+            dec_kprof::MIX,
+            dec_kprof::cur_layer(),
+            dec_kprof::cur_pos(),
+            2,
+        );
+        let mut s = cell.borrow_mut();
+        let MixGpuScratch {
+            x: dx,
+            lo: dlo,
+            out: dout,
+            mixed: dm,
+            hx,
+            ho,
+        } = &mut *s;
+        Scratch::ensure(dx, k1 * 4)?;
+        Scratch::ensure(dlo, n1 * 4)?;
+        Scratch::ensure(dout, n2 * 4)?;
+        // mixed[e] の後ろに inj[hc] を続けて置き、D2H を 1 本で済ませる。
+        Scratch::ensure(dm, e * 4 + hc * 4)?;
+        Scratch::ensure_pin(hx, k1 * 4)?;
+        Scratch::ensure_pin(ho, e * 4 + hc * 4)?;
+        let (dx, dlo, dout, dm) = (
+            dx.as_ref().unwrap(),
+            dlo.as_ref().unwrap(),
+            dout.as_ref().unwrap(),
+            dm.as_ref().unwrap(),
+        );
+        let (hx, ho) = (hx.as_mut().unwrap(), ho.as_mut().unwrap());
+        // inject の出力は mixed の直後 (down の出力 dlo とは別領域)。
+        let pinj = dm.ptr() + (e * 4) as CUdeviceptr;
+        dec_kprof::step("mix_h2d_pack", || {
+            hx.as_mut_slice::<f32>()[..k1].copy_from_slice(x)
+        });
+        let kp_cp = dec_kprof::op_begin(
+            || "H2D@a".to_string(),
+            (0, 0, 0),
+            (0, 0, 0),
+            0,
+            k1 * 4,
+        );
+        unsafe {
+            check(
+                (lib.memcpy_htod_async)(
+                    dx.ptr(),
+                    hx.ptr as *const c_void,
+                    k1 * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyHtoDAsync (mix chain3)",
+            )?;
+            // 1. grouped RMS 正規化 (x → xn、in-place)。block = 1 ストリーム。
+            {
+                let (mut px, mut pg, mut po) = (dx.ptr(), wpg, dx.ptr());
+                let (mut ec, mut epsc) = (e as c_int, eps);
+                let mut args = [
+                    &mut px as *mut _ as *mut c_void,
+                    &mut pg as *mut _ as *mut c_void,
+                    &mut po as *mut _ as *mut c_void,
+                    &mut ec as *mut _ as *mut c_void,
+                    &mut epsc as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(
+                    f_dev.norm,
+                    (hc as u32, 1, 1),
+                    (THREADS as u32, 1, 1),
+                    0,
+                    &mut args,
+                )?;
+            }
+            // 2. inject の内積 (xn → inj)。inject が無い層は撃たない。
+            if let (Some(pwj), Some(_)) = (wpj, inject) {
+                let (mut pw, mut px, mut po) = (pwj, dx.ptr(), pinj);
+                let (mut kc, mut nc) = (k1 as c_int, hc as c_int);
+                let mut args = [
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut px as *mut _ as *mut c_void,
+                    &mut po as *mut _ as *mut c_void,
+                    &mut kc as *mut _ as *mut c_void,
+                    &mut nc as *mut _ as *mut c_void,
+                ];
+                ctx.launch_async(
+                    f_dev.inj,
+                    (hc as u32, 1, 1),
+                    (THREADS as u32, 1, 1),
+                    0,
+                    &mut args,
+                )?;
+            }
+            // 3. down + lo_apply (silu 込み) → lo はデバイスに残る。
+            let (mut ph, mut pw, mut po) = (dx.ptr(), wp1, dlo.ptr());
+            let (mut kc, mut nc) = (k1 as c_int, n1 as c_int);
+            let mut invc = inv_hc;
+            let mut args = [
+                &mut ph as *mut _ as *mut c_void,
+                &mut pw as *mut _ as *mut c_void,
+                &mut po as *mut _ as *mut c_void,
+                &mut kc as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+                &mut invc as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(f_down, (n1 as u32, 1, 1), (256, 1, 1), 0, &mut args)?;
+            // 4. up: 入力は lo_apply 済みの lo。
+            let (mut ph2, mut pw2, mut po2) = (dlo.ptr(), wp2, dout.ptr());
+            let (mut kc2, mut nc2) = (n1 as c_int, n2 as c_int);
+            let mut args2 = [
+                &mut ph2 as *mut _ as *mut c_void,
+                &mut pw2 as *mut _ as *mut c_void,
+                &mut po2 as *mut _ as *mut c_void,
+                &mut kc2 as *mut _ as *mut c_void,
+                &mut nc2 as *mut _ as *mut c_void,
+            ];
+            ctx.launch_async(f_up, (n2 as u32, 1, 1), (up_thr, 1, 1), 0, &mut args2)?;
+            // 5. hc_mixed: xn と gate から mixed を作る。
+            let (mut px, mut pg, mut pm) = (dx.ptr(), dout.ptr(), dm.ptr());
+            let (mut ec, mut hcc) = (e as c_int, hc as c_int);
+            let mut invc2 = inv_hc;
+            let mut args3 = [
+                &mut px as *mut _ as *mut c_void,
+                &mut pg as *mut _ as *mut c_void,
+                &mut pm as *mut _ as *mut c_void,
+                &mut ec as *mut _ as *mut c_void,
+                &mut hcc as *mut _ as *mut c_void,
+                &mut invc2 as *mut _ as *mut c_void,
+            ];
+            let grid = (e.div_ceil(256).max(1) as u32, 1, 1);
+            ctx.launch_async(f_mixed, grid, (256, 1, 1), 0, &mut args3)?;
+            // 6. D2H 1 本 (mixed[e] + inj[hc] は同じバッファに連続で置いてある)。
+            let kp_cp = dec_kprof::op_begin(
+                || "D2H@a".to_string(),
+                (0, 0, 0),
+                (0, 0, 0),
+                0,
+                (e + hc) * 4,
+            );
+            check(
+                (lib.memcpy_dtoh_async)(
+                    ho.ptr,
+                    dm.ptr(),
+                    (e + hc) * 4,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyDtoHAsync (mix chain3)",
+            )?;
+            dec_kprof::op_end(kp_cp);
+            crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
+        }
+        ctx.sync()?;
+        dec_kprof::step("mix_pack", || {
+            let got = ho.as_slice::<f32>();
+            mixed.copy_from_slice(&got[..e]);
+            if wpj.is_some() {
+                inj_out.copy_from_slice(&got[e..e + hc]);
+            } else {
+                for v in inj_out.iter_mut() {
+                    *v = 0.0;
+                }
+            }
+        });
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            set_last_linear_ran_on_gpu(true);
+            true
+        }
+        Err(e) => {
+            mix_gpu_broken_once(&format!("hc mix chain3 failed: {e:#}"));
+            false
+        }
+    }
+}
+
 
 // ===========================================================================
 // P17d: decode chain (隠れ状態デバイス常駐 + 要素演算融合)
@@ -39859,6 +40539,107 @@ fn gdn_launch_gemv_dev(
     }
 }
 
+/// task 184: GDN decode のスキャンを第 2 版 (`kernels_gdn_scan2.cu` の
+/// `dno_gdn_scan_sig2`、4 レーン + 列レジスタ) に差し替えるか (`DENNO_GDN_SCAN2`)。
+/// lab t184a で採否 yes → 既定 on。
+///
+/// 第 2 版は dk == dv == 128 / d_conv == 4 のときだけ使う (それ以外は従来の
+/// `dno_gdn_scan_sig` へ fail closed)。丸めは skv / o の縮約順が変わる。
+fn gdn_scan2_from_value(v: Option<&str>, default_on: bool) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) if matches!(s.as_str(), "1" | "true" | "on" | "yes") => true,
+        Some(s) if matches!(s.as_str(), "0" | "false" | "off" | "no") => false,
+        _ => default_on,
+    }
+}
+
+/// lab t184a (depth8k) で採否 yes: scan 1 発が 25.0 -> 12.7 us
+/// (128 トークンの生 decode 秒で -1.8..-2.3%)。戻すのは `DENNO_GDN_SCAN2=0`。
+const GDN_SCAN2_DEFAULT: bool = true;
+
+fn gdn_scan2_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        gdn_scan2_from_value(
+            std::env::var("DENNO_GDN_SCAN2").ok().as_deref(),
+            GDN_SCAN2_DEFAULT,
+        )
+    })
+}
+
+/// kernels_gdn_scan2.ptx の `dno_gdn_scan_sig2`。
+struct Scan2Kernel {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: CUfunction,
+}
+
+unsafe impl Send for Scan2Kernel {}
+unsafe impl Sync for Scan2Kernel {}
+
+static GDN_SCAN2_KERNEL: OnceLock<Option<Scan2Kernel>> = OnceLock::new();
+
+fn scan2_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_GDN_SCAN2_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gdn_scan2.ptx"),
+    }
+}
+
+/// 第 2 版のカーネル (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+fn gdn_scan2_kernel() -> Option<CUfunction> {
+    GDN_SCAN2_KERNEL
+        .get_or_init(|| {
+            let path = scan2_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let text = String::from_utf8_lossy(&image).to_string();
+            if ptx_entry_params(&text, "dno_gdn_scan_sig2") != Some(23) {
+                eprintln!("[gdn-scan2] PTX の引数が 23 本でない → 従来 scan へ");
+                return None;
+            }
+            image.push(0);
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                let mut f: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(
+                    &mut f,
+                    module,
+                    b"dno_gdn_scan_sig2\0".as_ptr() as *const c_char,
+                ) != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                Some(Scan2Kernel { module, f })
+            }
+        })
+        .as_ref()
+        .map(|k| k.f)
+}
+
+/// `gdn_decode_submit` が使う scan カーネルと blockDim.x。
+///
+/// 第 2 版は 1 列を 4 レーンで持つので block は dk の 4 倍。形が合わない /
+/// PTX が無いときは従来カーネル (block = dk) をそのまま返す。
+fn gdn_scan_pick(base: CUfunction, dk: usize, dv: usize) -> (CUfunction, u32) {
+    if gdn_scan2_on() && dk == 128 && dv == 128 {
+        if let Some(f) = gdn_scan2_kernel() {
+            return (f, (4 * dk) as u32);
+        }
+    }
+    (base, dk as u32)
+}
+
 /// デコードの ssm 層 1 層ぶんを 1 つの GPU submission にまとめる。
 ///
 /// 成功なら `out: Some(層出力)` を返す。失敗なら `out: None` で従来の CPU
@@ -39889,20 +40670,26 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
         GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
         return GdnDecodeRes::cpu();
     }
-    let Some(f_scan) = ctx.f_gdn_scan_sig else {
+    let Some(f_scan_base) = ctx.f_gdn_scan_sig else {
         // コミット済み PTX に dno_gdn_scan_sig が無い (再生成待ち)。
         gdn_note_once(
             "dno_gdn_scan_sig が使う PTX に無い (旧 kernels_gdn.ptx) → CPU 経路",
         );
         return GdnDecodeRes::cpu();
     };
+    // task 184: scan 第 2 版 (`DENNO_GDN_SCAN2`)。形が合わない / PTX が無い
+    // ときは従来カーネルへ落ちる (数値は従来どおり)。
+    let (f_scan, scan_thr) = gdn_scan_pick(f_scan_base, req.dk, req.dv);
     // GEMV のカーネル選択は intercept 経路と同じ規約 (fp16 → v3 → v2)。
     // task 177: この経路だけ `DENNO_GDN_DEC_GEMV` で差し替えられる (既定は従来)。
     // v4 を選んでいても、その単位で形が合わなければ v3 へ落ちる (CPU へは落とさない)。
     let mode = gdn_dec_gemv_mode_eff();
     let v4 = gdn_dec_gemv_v4_on().then(gdn_dec_v4_lanes_cap);
+    let v5 = gdn_dec_gemv_v5_on();
     let plan = |ty: crate::kquant::GgmlType, k: usize, n: usize| {
-        v4.and_then(|cap| ctx.plan_moe_gemv_v4(ty, k, n, cap))
+        v5.then(|| ctx.plan_moe_gemv_v5(ty, k, n))
+            .flatten()
+            .or_else(|| v4.and_then(|cap| ctx.plan_moe_gemv_v4(ty, k, n, cap)))
             .or_else(|| ctx.plan_moe_gemv(ty, k, n, mode).ok().flatten())
     };
     let mut qcfg = Vec::with_capacity(req.qkv_units.len());
@@ -40194,7 +40981,7 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
             ctx.launch_async(
                 f_scan,
                 (req.nv as u32, 1, 1),
-                (req.dk as u32, 1, 1),
+                (scan_thr, 1, 1),
                 shmem,
                 &mut args,
             )?;
@@ -40928,6 +41715,109 @@ mod p59_dedup_tests {
                 }
             );
             mix_gpu_unregister(uid);
+        }
+    }
+}
+
+
+/// task 184: mix / GEMV v5 / scan 第 2 版のゲートと純関数 (GPU 不要)。
+#[cfg(test)]
+mod task184_tests {
+    use super::*;
+
+    /// `DENNO_MIX_DEC_DEV` の真理値表。既定は off (採否前)。
+    #[test]
+    fn mix_dec_dev_truth_table() {
+        for (raw, want) in [
+            (None, false),
+            (Some(""), false),
+            (Some("  "), false),
+            (Some("0"), false),
+            (Some("off"), false),
+            (Some("false"), false),
+            (Some("no"), false),
+            (Some("1"), true),
+            (Some("on"), true),
+            (Some(" TRUE "), true),
+            (Some("yes"), true),
+            (Some("x"), false),
+        ] {
+            assert_eq!(mix_dec_dev_from_value(raw, false), want, "raw={raw:?}");
+        }
+        // 既定 on を渡したときの解釈 (採否後)。
+        assert!(mix_dec_dev_from_value(None, true));
+        assert!(!mix_dec_dev_from_value(Some("0"), true));
+        // 実効ゲートは lab t184a の採否で既定 on。切るのは明示的な偽値。
+        assert!(mix_dec_dev_enabled(), "DENNO_MIX_DEC_DEV が既定 off に戻っている");
+        assert_eq!(MIX_DEC_DEV_DEFAULT, true);
+    }
+
+    /// norm 重みの指紋は「内容が変われば変わる」。常駐の載せ替え判定に使う。
+    #[test]
+    fn mix_norm_fingerprint_tracks_content() {
+        let mut a: Vec<f32> = (0..40).map(|i| i as f32 * 0.25).collect();
+        let ptr = a.as_ptr() as usize;
+        let fa = mix_norm_fingerprint(&a, ptr);
+        assert_eq!(fa, mix_norm_fingerprint(&a, ptr), "同じ内容で指紋が動いた");
+        assert_ne!(fa, mix_norm_fingerprint(&a, ptr + 8), "ポインタ差を無視している");
+        // サンプル点 (i * (n-1) / 16) の 1 つを書き換える。
+        let idx = 9usize * 39 / 16;
+        a[idx] += 1.0;
+        assert_ne!(fa, mix_norm_fingerprint(&a, ptr), "内容差を無視している");
+        // 違う長さも別。
+        let b: Vec<f32> = a[..39].to_vec();
+        assert_ne!(fa, mix_norm_fingerprint(&b, b.as_ptr() as usize));
+    }
+
+    /// v5 のレーン決定: レーンの担当単位 (ブロック対 / スーパーブロック) を
+    /// 割り切る最大の 2 の冪。実形 k=2560 の Q8_0 は np=40 → 8、
+    /// Q4_K は nb=10 → 2。
+    #[test]
+    fn v5_lane_choice_covers_the_real_shapes() {
+        assert_eq!(v5_lanes_div(40, 8), 8);
+        assert_eq!(v5_lanes_div(96, 8), 8); // k=6144 の Q8_0 (nb=192)
+        assert_eq!(v5_lanes_div(10, 8), 2); // k=2560 の Q4_K (nb=10)
+        assert_eq!(v5_lanes_div(5, 8), 1);
+        assert_eq!(v5_lanes_div(7, 8), 1);
+        assert_eq!(v5_lanes_div(40, 4), 4);
+        assert_eq!(v5_lanes_div(0, 8), 0, "0 を割り切る扱いにしない");
+    }
+
+    /// `DENNO_GDN_SCAN2` は lab t184a の採否で既定 on。切るのは明示的な偽値。
+    #[test]
+    fn gdn_scan2_truth_table() {
+        for (raw, want) in [
+            (None, true),
+            (Some(""), true),
+            (Some("  "), true),
+            (Some("x"), true),
+            (Some("0"), false),
+            (Some("off"), false),
+            (Some("false"), false),
+            (Some("no"), false),
+            (Some("1"), true),
+            (Some("on"), true),
+            (Some("TRUE"), true),
+            (Some("yes"), true),
+        ] {
+            assert_eq!(gdn_scan2_from_value(raw, GDN_SCAN2_DEFAULT), want, "raw={raw:?}");
+        }
+        assert_eq!(GDN_SCAN2_DEFAULT, true);
+        assert!(gdn_scan2_on(), "DENNO_GDN_SCAN2 が既定 off に戻っている");
+    }
+
+    /// 形状の門番: scan2 は dk == dv == 128 のときだけ選ばれる。
+    ///
+    /// GPU 無しでは PTX を読んでもカーネルを起動しない (base がそのまま返る)
+    /// ので、「128 以外は必ず従来」だけを固定する。
+    #[test]
+    fn gdn_scan_pick_keeps_the_old_kernel_for_other_shapes() {
+        let base: CUfunction = 0x1234 as CUfunction;
+        // 形が違えばゲートが on でも base。
+        for (dk, dv) in [(96usize, 96usize), (128, 256), (256, 256)] {
+            let (f, thr) = gdn_scan_pick(base, dk, dv);
+            assert_eq!(f, base, "dk={dk} dv={dv} で従来カーネルになっていない");
+            assert_eq!(thr, dk as u32);
         }
     }
 }

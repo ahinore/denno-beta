@@ -4411,6 +4411,46 @@ fn hc_mix_quant_fast(
     let hc_dim = hp.hc * hp.n_embd;
     let e = hp.n_embd;
     let t_all = mix_kprof::stamp();
+    // task 184: norm と inject をデバイスで回す経路 (`DENNO_MIX_DEC_DEV`)。
+    // 通ればホストの mix_norm / mix_inj と down/up の chain を丸ごと置き換え、
+    // mixed[e] と inj[hc] だけを受け取る (同期 1 回)。縮約がツリーになるので
+    // 丸め順は従来と変わる。失敗したら下のホスト経路へそのまま落ちる。
+    #[cfg(feature = "cuda")]
+    if crate::cuda::mix_dec_dev_enabled()
+        && down.ty() == crate::kquant::GgmlType::Bf16
+        && up.ty() == crate::kquant::GgmlType::Bf16
+        && inject
+            .map(|w| w.ty() == crate::kquant::GgmlType::Bf16)
+            .unwrap_or(true)
+    {
+        let mut m = vec![0.0f32; e];
+        let mut ij = vec![0.0f32; hp.hc];
+        let inj_arg = inject.map(|w| (w.uid(), w.k(), w.n(), w.blocks().as_slice()));
+        if crate::cuda::maybe_gpu_mix_bf16_chain3_into(
+            down.uid(),
+            down.blocks().as_slice(),
+            down.k(),
+            down.n(),
+            up.uid(),
+            up.blocks().as_slice(),
+            up.k(),
+            up.n(),
+            inj_arg,
+            norm,
+            hp.eps,
+            1.0f32 / hp.hc as f32,
+            e,
+            hp.hc,
+            &res.data,
+            &mut m,
+            &mut ij,
+        ) {
+            hyper::hc_inject_apply(&mut ij, hp);
+            mix_kprof::mark(t_all, mix_kprof::TOTAL);
+            mix_kprof::bump_call();
+            return Ok((m, ij));
+        }
+    }
     MIX_SCRATCH.with(|cell| {
         // task 179: mix 1 回の内訳 (`DENNO_GDN_DEC_KPROF` の平均表)。窓は
         // ホスト仕事 (norm / inject / 詰め替え) を含めるため、ここで開く。
@@ -18560,6 +18600,40 @@ mod tests {
                 hc_mix_quant_ref(&res, &norm, &down, &up, Some(&inject), &hp).expect("ref");
             assert_bitwise_eq(&m_fast, &m_ref, "BF16 down/up (mixed)");
             assert_bitwise_eq(&i_fast, &i_ref, "BF16 down/up (inject)");
+            assert!(
+                m_fast.iter().any(|v| *v != 0.0),
+                "mixed が全 0 (経路の生死が分からない)"
+            );
+        }
+
+        /// task 184: `DENNO_MIX_DEC_DEV` が立つと fast 経路が **デバイス経路を試す**
+        /// (GPU 無しでは入口で false になり、従来のホスト経路へ落ちる)。
+        ///
+        /// 「緑 = 分岐が発火した証拠」にしないため、入口のカウンタ ([`crate::cuda::
+        /// mix_dev_attempts`]) が増えたことを数える。GPU が無い環境では従来経路の
+        /// 値が ref とビット一致する (縮約はツリーに変わらない = デバイスは走らない)。
+        #[test]
+        fn mix_dec_dev_gate_attempts_then_falls_back_without_gpu() {
+            let _lk = mix_gpu_test_lock();
+            let (hp, norm, down, up, inject, res) = mix_bf16_case(4, 320, 64);
+            crate::cuda::mix_dev_attempts_reset();
+            crate::cuda::mix_dec_dev_set_for_test(Some(true));
+            let got = hc_mix_quant(&res, &norm, &down, &up, Some(&inject), &hp);
+            let attempts = crate::cuda::mix_dev_attempts();
+            crate::cuda::mix_dec_dev_set_for_test(None);
+            let (m_fast, i_fast) = got.expect("fast");
+            assert!(
+                attempts >= 1,
+                "DENNO_MIX_DEC_DEV を立てたのにデバイス経路の入口に来ていない"
+            );
+            // GPU が無い (= 入口で false) ときだけビット一致を主張できる。
+            if crate::cuda::cuda_enabled() {
+                return;
+            }
+            let (m_ref, i_ref) =
+                hc_mix_quant_ref(&res, &norm, &down, &up, Some(&inject), &hp).expect("ref");
+            assert_bitwise_eq(&m_fast, &m_ref, "device 不発の fallback (mixed)");
+            assert_bitwise_eq(&i_fast, &i_ref, "device 不発の fallback (inject)");
             assert!(
                 m_fast.iter().any(|v| *v != 0.0),
                 "mixed が全 0 (経路の生死が分からない)"
