@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -38,6 +38,9 @@ spec() {
         moe_batch)    echo "kernels_moe_batch.cu|nofmad" ;;
         moe_v2)       echo "kernels_moe_v2.cu|nofmad" ;;
         moe_v3)       echo "kernels_moe_v3.cu|nofmad" ;;
+        # task 177: v3 のレーン数を可変にした版 (decode GDN の GEMV 用)。
+        # データの読み方と dequant の演算列は v3 と同一なので -fmad=false。
+        moe_v4)       echo "kernels_moe_v4.cu|nofmad" ;;
         moe_fp16)     echo "kernels_moe_fp16.cu|nofmad" ;;
         # task 144: IQ 系 (IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL / Q2_0) の
         # expert GEMV。数値契約は CPU とビット一致ではない (1 行を 32 レーンで

@@ -1293,7 +1293,7 @@ pub(crate) mod dec_kprof {
 
         #[test]
         fn gdn_dec_gemv_parse_truth_table() {
-            // 未設定・空・明示 off は「従来のまま」(None)。
+            // 未設定・空・明示 off は「従来のまま」(Default)。
             for raw in [
                 None,
                 Some(""),
@@ -1302,33 +1302,52 @@ pub(crate) mod dec_kprof {
                 Some("off"),
                 Some("false"),
                 Some("no"),
-                Some("v4"),
+                Some("v5"),
                 Some("x"),
             ] {
-                assert_eq!(parse_gdn_dec_gemv(raw), None, "raw={raw:?}");
+                assert_eq!(parse_gdn_dec_gemv(raw), GdnDecGemv::Default, "raw={raw:?}");
             }
-            // 3 つは明示指定 (大小文字と前後空白は無視)。
-            assert!(matches!(
-                parse_gdn_dec_gemv(Some("v2")),
-                Some(GemvKernelMode::V2)
-            ));
-            assert!(matches!(
-                parse_gdn_dec_gemv(Some(" V2 ")),
-                Some(GemvKernelMode::V2)
-            ));
-            assert!(matches!(
-                parse_gdn_dec_gemv(Some("V3")),
-                Some(GemvKernelMode::V3)
-            ));
-            assert!(matches!(
-                parse_gdn_dec_gemv(Some("fp16")),
-                Some(GemvKernelMode::Fp16)
-            ));
-            // ゲートが無ければ従来の選択に一致する (env 既定 = v3)。
+            // 明示指定 (大小文字と前後空白は無視)。
+            assert_eq!(parse_gdn_dec_gemv(Some("v2")), GdnDecGemv::V2);
+            assert_eq!(parse_gdn_dec_gemv(Some(" V2 ")), GdnDecGemv::V2);
+            assert_eq!(parse_gdn_dec_gemv(Some("V3")), GdnDecGemv::V3);
+            assert_eq!(parse_gdn_dec_gemv(Some("fp16")), GdnDecGemv::Fp16);
+            assert_eq!(parse_gdn_dec_gemv(Some("v4")), GdnDecGemv::V4);
+            assert_eq!(parse_gdn_dec_gemv(Some("V4")), GdnDecGemv::V4);
+            // Default のときは従来の選択に一致する (env 既定 = v3)。
             assert!(matches!(
                 gdn_dec_gemv_mode_eff(),
                 GemvKernelMode::V2 | GemvKernelMode::V3 | GemvKernelMode::Fp16
             ));
+            // 既定では v4 は選ばれない (= 既定 off)。
+            assert!(!gdn_dec_gemv_v4_on());
+        }
+
+        #[test]
+        fn gdn_dec_v4_lanes_parse_and_shape_rule() {
+            // 既定 32、4..32 に丸める。
+            assert_eq!(parse_gdn_dec_v4_lanes(None), 32);
+            assert_eq!(parse_gdn_dec_v4_lanes(Some("")), 32);
+            assert_eq!(parse_gdn_dec_v4_lanes(Some("x")), 32);
+            assert_eq!(parse_gdn_dec_v4_lanes(Some("2")), 4);
+            assert_eq!(parse_gdn_dec_v4_lanes(Some("16")), 16);
+            assert_eq!(parse_gdn_dec_v4_lanes(Some("32")), 32);
+            assert_eq!(parse_gdn_dec_v4_lanes(Some("64")), 32);
+            // 形の規則: n_in % (lanes*32) == 0 を満たす最大の 2 の冪。
+            // 実形 k=2560 (qkv / gate): 16 が上限 (2560/16 = 160 = 32*5)。
+            assert_eq!(v4_lanes_for(2_560, 32), 16);
+            assert_eq!(v4_lanes_for(2_560, 16), 16);
+            assert_eq!(v4_lanes_for(2_560, 8), 8);
+            assert_eq!(v4_lanes_for(2_560, 4), 4);
+            // 実形 k=6144 (attn_out): 32 まで行ける。
+            assert_eq!(v4_lanes_for(6_144, 32), 32);
+            assert_eq!(v4_lanes_for(6_144, 16), 16);
+            // 32 の倍数でない k は v3 に任せる (0)。
+            assert_eq!(v4_lanes_for(2_560 + 16, 32), 0);
+            // 4 未満しか無い形も v3 に任せる。
+            assert_eq!(v4_lanes_for(64, 32), 0);
+            // 2 の冪でない上限は切り下げる。
+            assert_eq!(v4_lanes_for(6_144, 20), 16);
         }
 
         #[test]
@@ -2869,6 +2888,47 @@ impl CudaCtx {
         }))
     }
 
+    /// task 177: v4 (レーン数可変) の計画。形が合わない / PTX が無いときは `None`
+    /// (呼び出し側は v3 へ落ちる)。
+    ///
+    /// 1 ブロック 8 行は v3 の既定 (`MOE_V3_ROWS_DEFAULT = 8`) と同じ。blockDim は
+    /// `rows * lanes` になるので、lanes=32 で 256、lanes=16 で 128。
+    fn plan_moe_gemv_v4(
+        &self,
+        ty: crate::kquant::GgmlType,
+        n_in: usize,
+        n_out: usize,
+        lanes_cap: usize,
+    ) -> Option<MoeGemvPlan> {
+        use crate::kquant::GgmlType as T;
+        let ki = match ty {
+            T::Q8_0 => 0usize,
+            T::Q5_1 => 1usize,
+            T::Q4K => 2usize,
+            T::Q5K => 3usize,
+            _ => return None,
+        };
+        let rb = gguf_row_bytes(ty, n_in)?;
+        if n_out == 0 {
+            return None;
+        }
+        let lanes = v4_lanes_for(n_in, lanes_cap);
+        if lanes == 0 {
+            return None;
+        }
+        let k = gemv_v4_kernels()?;
+        const ROWS: usize = 8;
+        Some(MoeGemvPlan {
+            f: k.f[ki],
+            rows_per_block: ROWS,
+            block_dim: (ROWS * lanes) as u32,
+            shmem: 0,
+            lanes,
+            rb,
+            grid: n_out.div_ceil(ROWS) as u32,
+        })
+    }
+
     /// decode GEMV を 1 本積む (task 124 の重ね打ち経路)。
     ///
     /// 引数の並びは [`Self::moe_gemv_dev_with`] が組むものと同一
@@ -3654,6 +3714,142 @@ pub(crate) fn moe_gemv_v3_loaded() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// task 177: v4 (レーン数可変) GEMV (`kernels_moe_v4.cu`)
+//
+// v3 は 1 行を 4 レーン (または 2) で固定して分けるので、同時に立つスレッド数が
+// `n_out * 4` で頭打ちになる。lab t177a の実測では out 投影 (n=2,560 / k=6,144)
+// が 320 warp = 1.9 warp/SM で 328 GB/s しか出ていなかった。v4 は lanes を
+// カーネル引数で受け、8 / 16 / 32 でも回せる (データの読み方と dequant の
+// 演算列は v3 と同一。変わるのはレーン分割と合計の段数だけ)。
+//
+// 使うのは今のところ GDN decode の submission だけ (`DENNO_GDN_DEC_GEMV=v4`)。
+// PTX が無い / 形が合わないときは None を返し、呼び出し側は v3 へ落ちる
+// (fail closed。CPU へは落とさない)。
+// ---------------------------------------------------------------------------
+
+/// v4 のカーネル名 (`ki` の順 = Q8_0 / Q5_1 / Q4_K / Q5_K)。
+const V4_KERNEL_NAMES: [&str; 4] = [
+    "dno_gemv_q8_0_v4",
+    "dno_gemv_q5_1_v4",
+    "dno_gemv_q4k_v4",
+    "dno_gemv_q5k_v4",
+];
+
+/// v4 の引数の数 (v3 と同じ 8 本: w, x, out, n_in, n_out, row_bytes,
+/// rows_per_block, lanes)。
+const V4_NARGS: usize = 8;
+
+/// v4 カーネル一式。4 本そろって初めて `Some`。
+struct V4Kernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: [CUfunction; 4],
+}
+
+unsafe impl Send for V4Kernels {}
+unsafe impl Sync for V4Kernels {}
+
+static V4_KERNELS: OnceLock<Option<V4Kernels>> = OnceLock::new();
+
+/// PTX の置き場所。`DENNO_GEMV_V4_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_moe_v4.ptx` (v3 と同じ規約)。
+fn gemv_v4_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_GEMV_V4_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_moe_v4.ptx"),
+    }
+}
+
+/// v4 のカーネルを取得する (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+/// 呼ぶ前に必ず context を current にしておくこと (`cuModuleLoadData` は
+/// current context に入る)。
+fn gemv_v4_kernels() -> Option<&'static V4Kernels> {
+    V4_KERNELS
+        .get_or_init(|| {
+            let path = gemv_v4_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[gemv-v4] PTX が読めない ({}) : {e} → v3 へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            // ABI (引数の数) を **モジュールを読む前**に確かめる。合わない PTX を
+            // 読むと rows/lanes を渡さないまま起動して黙って別の行を書く。
+            let text = String::from_utf8_lossy(&image);
+            let mut short: Vec<&str> = Vec::new();
+            for name in V4_KERNEL_NAMES {
+                if ptx_entry_params(&text, name) != Some(V4_NARGS) {
+                    short.push(name);
+                }
+            }
+            if !short.is_empty() {
+                eprintln!(
+                    "[gemv-v4] PTX の引数が {} 本でない ({}) → v3 へ。\
+                     `bash build_ptx.sh moe_v4` で再生成する",
+                    V4_NARGS,
+                    short.join(", ")
+                );
+                return None;
+            }
+            image.push(0); // cuModuleLoadData は NUL 終端の PTX を期待する
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[gemv-v4] cuModuleLoadData 失敗 → v3 へ");
+                    return None;
+                }
+                let mut f: [CUfunction; 4] = [std::ptr::null_mut(); 4];
+                for (k, name) in V4_KERNEL_NAMES.iter().enumerate() {
+                    let mut cname = name.as_bytes().to_vec();
+                    cname.push(0); // cuModuleGetFunction は NUL 終端の名前を期待する
+                    if (lib.module_get_function)(&mut f[k], module, cname.as_ptr() as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!("[gemv-v4] PTX に {name} が無い → v3 へ");
+                        return None;
+                    }
+                }
+                Some(V4Kernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+/// 形からレーン数を決める (純関数)。`cap` は上限 (4..32 に丸める)。
+///
+/// レーン l は k を l 等分した連続区間を持つので、区間長が量子ブロック (32 要素)
+/// の倍数でなければならない = `n_in % (l * 32) == 0`。満たす最大の 2 の冪を
+/// 返し、4 以上が無ければ 0 (= v3 に任せる)。
+fn v4_lanes_for(n_in: usize, cap: usize) -> usize {
+    let mut l = cap.clamp(4, 32);
+    while l & (l - 1) != 0 {
+        l -= 1; // 2 の冪へ切り下げる
+    }
+    while l >= 4 {
+        if n_in % (l * 32) == 0 {
+            return l;
+        }
+        l >>= 1;
+    }
+    0
+}
+
+/// v4 が載っているか (テスト専用。context を current にしてから呼ぶこと)。
+#[cfg(test)]
+pub(crate) fn moe_gemv_v4_loaded() -> bool {
+    gemv_v4_kernels().is_some()
+}
+
+// ---------------------------------------------------------------------------
 // P-fp16 (task 108): fast mode の fp16 GEMV (`kernels_moe_fp16.cu`)
 // ---------------------------------------------------------------------------
 
@@ -3690,24 +3886,63 @@ fn parse_gemv_fp16(raw: Option<&str>) -> bool {
 /// v2 (`kernels_moe.cu`、4 行/ブロック・256 スレッド・行を 64 本で shared へ
 /// 積んでから 1 本が畳む) は **n_out x 64 スレッド**で、同じ形でも一桁多い。
 /// どちらが速いかは形に依るので、既定は従来のまま env で切り替える。
-fn parse_gdn_dec_gemv(raw: Option<&str>) -> Option<GemvKernelMode> {
+/// `DENNO_GDN_DEC_GEMV` の解釈 (純関数。真理値表はテストで固定)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GdnDecGemv {
+    /// 未設定・空・`0`/`off` = 従来 (`gemv_kernel_mode()`)。
+    Default,
+    V2,
+    V3,
+    Fp16,
+    /// v4 (レーン数可変。`kernels_moe_v4.cu`)。
+    V4,
+}
+
+fn parse_gdn_dec_gemv(raw: Option<&str>) -> GdnDecGemv {
     match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        Some("v2") => Some(GemvKernelMode::V2),
-        Some("v3") => Some(GemvKernelMode::V3),
-        Some("fp16") => Some(GemvKernelMode::Fp16),
-        _ => None,
+        Some("v2") => GdnDecGemv::V2,
+        Some("v3") => GdnDecGemv::V3,
+        Some("fp16") => GdnDecGemv::Fp16,
+        Some("v4") => GdnDecGemv::V4,
+        _ => GdnDecGemv::Default,
     }
 }
 
-/// [`parse_gdn_dec_gemv`] を env から 1 回だけ読む (未設定なら None)。
-fn gdn_dec_gemv_mode() -> Option<GemvKernelMode> {
-    static M: OnceLock<Option<GemvKernelMode>> = OnceLock::new();
-    *M.get_or_init(|| parse_gdn_dec_gemv(std::env::var("DENNO_GDN_DEC_GEMV").ok().as_deref()))
+/// [`parse_gdn_dec_gemv`] を env から 1 回だけ読む。
+fn gdn_dec_gemv_choice() -> GdnDecGemv {
+    static C: OnceLock<GdnDecGemv> = OnceLock::new();
+    *C.get_or_init(|| parse_gdn_dec_gemv(std::env::var("DENNO_GDN_DEC_GEMV").ok().as_deref()))
 }
 
 /// GDN decode の submission が使う GEMV モード (ゲートが無ければ従来)。
 fn gdn_dec_gemv_mode_eff() -> GemvKernelMode {
-    gdn_dec_gemv_mode().unwrap_or_else(gemv_kernel_mode)
+    match gdn_dec_gemv_choice() {
+        GdnDecGemv::V2 => GemvKernelMode::V2,
+        GdnDecGemv::V3 => GemvKernelMode::V3,
+        GdnDecGemv::Fp16 => GemvKernelMode::Fp16,
+        _ => gemv_kernel_mode(),
+    }
+}
+
+/// v4 を選んでいるか。
+fn gdn_dec_gemv_v4_on() -> bool {
+    matches!(gdn_dec_gemv_choice(), GdnDecGemv::V4)
+}
+
+/// `DENNO_GDN_DEC_GEMV_LANES` の解釈 (純関数)。既定 32、4..32 に丸める。
+fn parse_gdn_dec_v4_lanes(raw: Option<&str>) -> usize {
+    match raw.map(|s| s.trim().parse::<usize>()) {
+        Some(Ok(v)) => v.clamp(4, 32),
+        _ => 32,
+    }
+}
+
+/// v4 のレーン上限 (env から 1 回だけ読む)。
+fn gdn_dec_v4_lanes_cap() -> usize {
+    static L: OnceLock<usize> = OnceLock::new();
+    *L.get_or_init(|| {
+        parse_gdn_dec_v4_lanes(std::env::var("DENNO_GDN_DEC_GEMV_LANES").ok().as_deref())
+    })
 }
 
 /// decode GEMV が使うカーネル一式を env から決める (`moe_gemv_dev` と
@@ -34712,17 +34947,22 @@ pub fn gdn_decode_submit(req: &GdnDecodeReq) -> GdnDecodeRes {
     };
     // GEMV のカーネル選択は intercept 経路と同じ規約 (fp16 → v3 → v2)。
     // task 177: この経路だけ `DENNO_GDN_DEC_GEMV` で差し替えられる (既定は従来)。
+    // v4 を選んでいても、その単位で形が合わなければ v3 へ落ちる (CPU へは落とさない)。
     let mode = gdn_dec_gemv_mode_eff();
+    let v4 = gdn_dec_gemv_v4_on().then(gdn_dec_v4_lanes_cap);
+    let plan = |ty: crate::kquant::GgmlType, k: usize, n: usize| {
+        v4.and_then(|cap| ctx.plan_moe_gemv_v4(ty, k, n, cap))
+            .or_else(|| ctx.plan_moe_gemv(ty, k, n, mode).ok().flatten())
+    };
     let mut qcfg = Vec::with_capacity(req.qkv_units.len());
     for (u, _) in req.qkv_units {
-        match ctx.plan_moe_gemv(u.ty, u.k, u.n, mode) {
-            Ok(Some(c)) => qcfg.push(c),
-            _ => return GdnDecodeRes::cpu(),
+        match plan(u.ty, u.k, u.n) {
+            Some(c) => qcfg.push(c),
+            None => return GdnDecodeRes::cpu(),
         }
     }
-    let ocfg = match ctx.plan_moe_gemv(req.out_unit.ty, req.out_unit.k, req.out_unit.n, mode) {
-        Ok(Some(c)) => c,
-        _ => return GdnDecodeRes::cpu(),
+    let Some(ocfg) = plan(req.out_unit.ty, req.out_unit.k, req.out_unit.n) else {
+        return GdnDecodeRes::cpu();
     };
     // 重みは常駐登録簿から (intercept 経路と同じ uid → 同じ VRAM を共有)。
     let mut qw = Vec::with_capacity(req.qkv_units.len());
