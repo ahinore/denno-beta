@@ -853,9 +853,12 @@ pub(crate) mod dec_kprof {
     }
 
     /// 帯と種類の組を 1 bit にしたもの (出したかどうかの記憶に使う)。
-    fn mask(pos: u64, kind: u8) -> u8 {
+    ///
+    /// task 179: u8 だと帯 2 (bit 8..11) が入らず、`(8 + kind) & 7` に化けて
+    /// **帯 0 と同じ bit** になっていた (lab t179a で 14k の表が出なかった原因)。
+    fn mask(pos: u64, kind: u8) -> u16 {
         match band(pos) {
-            Some(b) => 1u8 << ((b as u32) * 4 + kind as u32),
+            Some(b) => 1u16 << ((b as u32) * 4 + kind as u32),
             None => 0,
         }
     }
@@ -869,7 +872,7 @@ pub(crate) mod dec_kprof {
     pub(crate) fn should_begin(
         active: bool,
         dead: bool,
-        printed: u8,
+        printed: u16,
         pos: u64,
         kind: u8,
         decode: bool,
@@ -911,7 +914,7 @@ pub(crate) mod dec_kprof {
         /// 名前付きホスト区間 (name, us)。窓の間に積む。
         steps: Vec<(String, f64)>,
         /// (帯, 種類) を出し終えたビット。
-        printed: u8,
+        printed: u16,
         dead: bool,
     }
 
@@ -1644,6 +1647,19 @@ pub(crate) mod dec_kprof {
             assert_ne!(mask(1, GDN), mask(3_965, GDN));
             assert_ne!(mask(1, GDN), mask(1, MIX));
             assert_ne!(mask(3_965, GDN), mask(14_159, GDN));
+            // task 179 の回帰: 帯 0 を出した後でも帯 2 は開く
+            // (u8 の mask では (8 + kind) & 7 に化けて帯 0 と同じ bit になり、
+            //  14k の表が 1 度も出なかった)。
+            let m0 = mask(1, FULL);
+            assert!(should_begin(false, false, m0, 14_159, FULL, true));
+            assert!(!should_begin(false, false, m0, 1, FULL, true));
+            // 3 帯 x 3 種類のビットが全て異なる。
+            let mut bits = std::collections::BTreeSet::new();
+            for pos in [1u64, 3_965, 14_159] {
+                for kind in [GDN, MIX, FULL] {
+                    assert!(bits.insert(mask(pos, kind)), "bit が衝突: pos={pos} kind={kind}");
+                }
+            }
         }
 
         /// コピーの判定 (表の列分けの規則)。
