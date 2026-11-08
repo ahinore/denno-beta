@@ -7593,3 +7593,89 @@ fn gdn_scan2_kernel_is_wired() {
         "targets_all に gdn_scan2 が無い: {targets}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 187: decode の epilogue カーネル (`kernels_dec_epi.cu`)
+//
+// `cuda.rs` は `cuLaunchKernel` の引数を**手で並べる**ので、カーネルの引数順が
+// 変わると型だけ合って値が入れ替わる (静かに別の値を計算する)。ここで .cu の
+// 引数名と Rust 側の起動配列の並びを突き合わせる。
+// ---------------------------------------------------------------------------
+const DEC_EPI_SRC: &str = include_str!("../kernels/kernels_dec_epi.cu");
+
+/// `src` の `name(` の引数名を並び順で返す (最終トークンの `*` / `&` を落とす)。
+fn kernel_arg_names(src: &str, name: &str) -> Vec<String> {
+    let start = match src.find(&format!("{name}(")) {
+        Some(i) => i + name.len() + 1,
+        None => return Vec::new(),
+    };
+    let rest = &src[start..];
+    let end = match rest.find(')') {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    rest[..end]
+        .split(',')
+        .map(|p| {
+            p.split_whitespace()
+                .last()
+                .unwrap_or("")
+                .trim_start_matches(['*', '&'])
+                .trim_start_matches("__restrict__")
+                .trim_start_matches(['*', '&'])
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+#[test]
+fn dec_epi_kernels_exist_with_expected_abi() {
+    // dno_dec_exp_sum(h, w, sh, sgw, out, e, nseg, has_sh)
+    let sum = kernel_arg_names(DEC_EPI_SRC, "dno_dec_exp_sum");
+    assert_eq!(
+        sum,
+        ["h", "w", "sh", "sgw", "out", "e", "nseg", "has_sh"],
+        "dno_dec_exp_sum の引数が変わった (cuda.rs の起動配列も直すこと): {sum:?}"
+    );
+    // dno_dec_silu_mul(g, u, act, n)
+    let silu = kernel_arg_names(DEC_EPI_SRC, "dno_dec_silu_mul");
+    assert_eq!(
+        silu,
+        ["g", "u", "act", "n"],
+        "dno_dec_silu_mul の引数が変わった: {silu:?}"
+    );
+}
+
+#[test]
+fn dec_epi_kernel_is_registered_in_build_ptx() {
+    assert!(
+        DEC_EPI_SRC.contains("-fmad=false"),
+        "カーネルは -fmad=false (ホストと同じ 2 演算) で作ること"
+    );
+    assert!(
+        BUILD_PTX_SH.contains(r#"dec_epi)      echo "kernels_dec_epi.cu|nofmad" ;;"#),
+        "build_ptx.sh に dec_epi が nofmad で登録されていない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("dec_epi"),
+        "targets_all に dec_epi が無い: {targets}"
+    );
+    // Rust 側は同じ 8 引数をこの順で渡す (h, w, sh, sgw, out, e, nseg, has_sh)。
+    let body = fn_body(CUDA_RS, "fn iq_layer_run<F>(");
+    let launch = &body[body.find("dno_dec_exp_sum").unwrap_or(0)..];
+    for p in ["let mut ph = h.ptr;", "let mut pwv = w_addr", "let mut psh = std::ptr::null_mut"] {
+        assert!(launch.contains(p), "起動配列に {p} が無い");
+    }
+    assert!(
+        launch.contains("&mut ph as *mut _ as *mut c_void")
+            && launch.contains("&mut pwv as *mut _ as *mut c_void")
+            && launch.contains("&mut pw as *mut _ as *mut c_void")
+            && launch.contains("&mut po as *mut _ as *mut c_void"),
+        "起動配列の並びが変わった (h, w, sh, sgw, out の順)"
+    );
+}

@@ -1572,6 +1572,8 @@ pub(crate) mod dec_kprof {
                 gdn_dec_gemv_mode_eff(),
                 GemvKernelMode::V2 | GemvKernelMode::V3 | GemvKernelMode::Fp16
             ));
+            // task 187: head 用の V5 は明示指定のみ (既定の選択には出ない)。
+            assert!(!matches!(gemv_kernel_mode(), GemvKernelMode::V5));
             // task 179: 既定 (env 未設定) は v4 を選ぶ (lab t177c の -1.8% を採る)。
             assert!(gdn_dec_gemv_v4_on());
         }
@@ -4205,6 +4207,13 @@ impl CudaCtx {
         mode: GemvKernelMode,
     ) -> Result<Option<MoeGemvPlan>> {
         use crate::kquant::GgmlType as T;
+        // task 187: v5 を明示されたときは v5 の計画を先に試す (形が合わなければ
+        // 従来どおり v2 へ落ちる)。
+        if matches!(mode, GemvKernelMode::V5) {
+            if let Some(p) = self.plan_moe_gemv_v5(ty, n_in, n_out) {
+                return Ok(Some(p));
+            }
+        }
         let fs_v12 = match self.pick_moe_kernels() {
             Some(f) => f,
             None => return Ok(None),
@@ -5449,6 +5458,8 @@ pub(crate) enum GemvKernelMode {
     V2,
     V3,
     Fp16,
+    /// task 187: v5 (`kernels_moe_v5.cu`)。使えない形なら v2 へ落ちる。
+    V5,
 }
 
 /// `DENNO_GEMV_FP16` の生値 → fast mode の on/off (純関数。真理値表はテストで固定)。
@@ -6820,6 +6831,9 @@ struct IqScratch {
     sgd: Option<DevBuffer>,
     /// task 150: `h` の D2H を非同期で受ける pinned staging (overlap 経路だけ)。
     hpin: Option<PinMem>,
+    /// task 187: 和モードの重み (nseg 本) と和の出力 (e 要素)。
+    wt: Option<DevBuffer>,
+    psum: Option<DevBuffer>,
 }
 
 impl IqScratch {
@@ -6836,6 +6850,8 @@ impl IqScratch {
             sgu: None,
             sgd: None,
             hpin: None,
+            wt: None,
+            psum: None,
         }
     }
 }
@@ -6869,7 +6885,8 @@ pub fn moe_experts_iq_layer(
     out_h: &mut [f32],
 ) -> Result<bool> {
     iq_layer_run(
-        ty_g, ty_u, ty_d, pg, pu, pd, seg_gu, seg_d, x, n_in, ff, e, out_h, false, || Ok(()),
+        ty_g, ty_u, ty_d, pg, pu, pd, seg_gu, seg_d, x, n_in, ff, e, out_h, &[], 0, false,
+        || Ok(()),
     )
 }
 
@@ -6906,7 +6923,43 @@ where
     F: FnOnce() -> Result<()>,
 {
     iq_layer_run(
-        ty_g, ty_u, ty_d, pg, pu, pd, seg_gu, seg_d, x, n_in, ff, e, out_h, true, cpu_miss,
+        ty_g, ty_u, ty_d, pg, pu, pd, seg_gu, seg_d, x, n_in, ff, e, out_h, &[], 0, true,
+        cpu_miss,
+    )
+}
+
+/// task 187: [`moe_experts_iq_layer_overlap`] の**デバイス和**版。
+///
+/// gate/up/silu/down を積んだあとに `dno_dec_exp_sum` を 1 発積み、
+/// `out` (`e` 要素) へ `sum_t w[t] * h[t*e+j]` を書いて **e 要素だけ** D2H する。
+/// 寄与 (`nseg * e` 要素 = 約 100 KB/層) はホストへ戻さない。
+///
+/// `w` は `pg` と同じ並び (segment = 選択順) の重み。`Ok(false)` は
+/// 「GPU でやらなかった」= 呼び出し側は従来経路へ (このとき `out` は 1 要素も
+/// 書かれない)。
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts_iq_layer_sum_overlap<F>(
+    ty_g: crate::kquant::GgmlType,
+    ty_u: crate::kquant::GgmlType,
+    ty_d: crate::kquant::GgmlType,
+    pg: &[u64],
+    pu: &[u64],
+    pd: &[u64],
+    seg_gu: &[u32],
+    seg_d: &[u32],
+    x: &[f32],
+    n_in: usize,
+    ff: usize,
+    e: usize,
+    w: &[f32],
+    out: &mut [f32],
+    cpu_miss: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Result<()>,
+{
+    iq_layer_run(
+        ty_g, ty_u, ty_d, pg, pu, pd, seg_gu, seg_d, x, n_in, ff, e, out, w, e, true, cpu_miss,
     )
 }
 
@@ -6927,6 +6980,8 @@ fn iq_layer_run<F>(
     ff: usize,
     e: usize,
     out_h: &mut [f32],
+    sw: &[f32],
+    sum_e: usize,
     overlap: bool,
     middle: F,
 ) -> Result<bool>
@@ -6934,6 +6989,10 @@ where
     F: FnOnce() -> Result<()>,
 {
     let nseg = pg.len();
+    // task 187: `sum_e != 0` は「ヒットの寄与をデバイスで重み付き和にして
+    // `sum_e` 要素だけ返す」モード (`dno_dec_exp_sum`)。`sw` はその重み。
+    let sum_mode = sum_e != 0;
+    let nout = if sum_mode { sum_e } else { nseg * e };
     if nseg == 0
         || pu.len() != nseg
         || pd.len() != nseg
@@ -6943,6 +7002,12 @@ where
         || seg_d.len() / 4 != nseg
     {
         return Ok(false);
+    }
+    if sum_mode && sw.len() != nseg {
+        bail!(
+            "moe_experts_iq_layer: 重みの本数 {} が segment 数 {nseg} と違う",
+            sw.len()
+        );
     }
     if !moe_gemv_iq_ready(ty_g, n_in)
         || !moe_gemv_iq_ready(ty_u, n_in)
@@ -6956,12 +7021,11 @@ where
     ) else {
         return Ok(false);
     };
-    if x.len() < n_in || out_h.len() < nseg * e {
+    if x.len() < n_in || out_h.len() < nout {
         bail!(
-            "moe_experts_iq_layer: 入出力長が足りない (x={}/{n_in}, out={}/{})",
+            "moe_experts_iq_layer: 入出力長が足りない (x={}/{n_in}, out={}/{nout})",
             x.len(),
-            out_h.len(),
-            nseg * e
+            out_h.len()
         );
     }
     let Some(ctx) = shared_ctx() else {
@@ -6969,6 +7033,15 @@ where
     };
     let Some(kernels) = exp_iq_kernels() else {
         return Ok(false);
+    };
+    // task 187: 和のカーネル (PTX が無ければ `Ok(false)` = 呼び出し側は従来経路へ)。
+    let sumk = if sum_mode {
+        match dec_epi_kernels() {
+            Some(k) => Some(k),
+            None => return Ok(false),
+        }
+    } else {
+        None
     };
     let (Some(slot_g), Some(slot_u), Some(slot_d)) = (
         crate::model::exp_iq::slot(ty_g),
@@ -6993,9 +7066,14 @@ where
         MoeScratch::ensure_tagged(&mut sc.pd, nseg * 8, crate::mem_audit::TAG_GDN_SC)?;
         MoeScratch::ensure_tagged(&mut sc.sgu, seg_gu.len() * 4, crate::mem_audit::TAG_GDN_SC)?;
         MoeScratch::ensure_tagged(&mut sc.sgd, seg_d.len() * 4, crate::mem_audit::TAG_GDN_SC)?;
+        // task 187: 和モードの作業域 (重み nseg 本 / 和の出力 nout 要素)。
+        if sum_mode {
+            MoeScratch::ensure_tagged(&mut sc.wt, nseg * 4, crate::mem_audit::TAG_GDN_SC)?;
+            MoeScratch::ensure_tagged(&mut sc.psum, nout * 4, crate::mem_audit::TAG_GDN_SC)?;
+        }
         // task 150: overlap 経路だけ pinned staging を用意する (grow-only)。
         if overlap {
-            Scratch::ensure_pin(&mut sc.hpin, nh * 4)?;
+            Scratch::ensure_pin(&mut sc.hpin, nout * 4)?;
         }
         // task 164: 層の prologue (x / ポインタ表 / segment 表) を pinned ring の
         // 1 スロットへ詰め、**非同期 H2D 1 回**で送る (`DENNO_DEC_PRO_ASYNC`)。
@@ -7006,7 +7084,7 @@ where
         // task 187: 台帳の副区間 (prologue の H2D)。「7 MB の h2d のうち入力はいくらか」。
         let s_pro = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_EXP_PRO);
         let pro = dec_pro_async_enabled();
-        let lay = dec_stage_layout(n_in, nseg, seg_gu.len(), seg_d.len());
+        let lay = dec_stage_layout(n_in, nseg, seg_gu.len(), seg_d.len(), if sum_mode { nseg } else { 0 });
         let mut stage_addr: Option<u64> = None;
         if pro {
             // 失敗したら従来の同期コピーへ落ちる (リクエストは落とさない)。
@@ -7020,6 +7098,10 @@ where
                     dec_stage_put(sb, lay.pd, pd.as_ptr() as *const u8, nseg * 8);
                     dec_stage_put(sb, lay.sgu, seg_gu.as_ptr() as *const u8, seg_gu.len() * 4);
                     dec_stage_put(sb, lay.sgd, seg_d.as_ptr() as *const u8, seg_d.len() * 4);
+                    if sum_mode {
+                        // task 187: 和の重みも同じ 1 回の H2D に載せる (追加の往復をしない)。
+                        dec_stage_put(sb, lay.w, sw.as_ptr() as *const u8, nseg * 4);
+                    }
                 }
                 dec_stage_issue(lay.total)?;
                 dbg_htod(lay.total);
@@ -7038,9 +7120,13 @@ where
             sc.sgu.as_ref().expect("確保済み").copy_from(seg_gu)?;
             sc.sgd.as_ref().expect("確保済み").copy_from(seg_d)?;
             dbg_htod((seg_gu.len() + seg_d.len()) * 4);
+            if sum_mode {
+                sc.wt.as_ref().expect("確保済み").copy_from(sw)?;
+                dbg_htod(nseg * 4);
+            }
         }
         drop(s_pro);
-        let (x_addr, pg_addr, pu_addr, pd_addr, sgu_addr, sgd_addr) = match stage_addr {
+        let (x_addr, pg_addr, pu_addr, pd_addr, sgu_addr, sgd_addr, w_addr) = match stage_addr {
             Some(base) => (
                 base + lay.x as u64,
                 base + lay.pg as u64,
@@ -7048,6 +7134,7 @@ where
                 base + lay.pd as u64,
                 base + lay.sgu as u64,
                 base + lay.sgd as u64,
+                base + lay.w as u64,
             ),
             None => (
                 sc.x.as_ref().expect("確保済み").ptr as u64,
@@ -7056,6 +7143,7 @@ where
                 sc.pd.as_ref().expect("確保済み").ptr as u64,
                 sc.sgu.as_ref().expect("確保済み").ptr as u64,
                 sc.sgd.as_ref().expect("確保済み").ptr as u64,
+                sc.wt.as_ref().map(|b| b.ptr as u64).unwrap_or(0),
             ),
         };
         let g = sc.g.as_ref().expect("確保済み");
@@ -7157,16 +7245,44 @@ where
                 )?;
                 dec_exp_kprof::mark(dec_exp_kprof::DOWN);
             }
+            // 3.5 task 187: ヒットの寄与をデバイスで重み付き和にする
+            //     (`out[j] = sum_t w[t] * h[t*e+j]`)。t 昇順の 1 アキュムレータ
+            //     なので、ミスの無い層ではホストの足し込みとビット一致する。
+            let src_ptr = if let Some(sk) = sumk {
+                let psum = sc.psum.as_ref().expect("確保済み");
+                let mut ph = h.ptr;
+                let mut pwv = w_addr as *mut c_void;
+                let mut psh = std::ptr::null_mut::<c_void>();
+                let mut pw = 0.0f32;
+                let mut po = psum.ptr;
+                let (mut pe, mut pn, mut phs) = (e as c_int, nseg as c_int, 0 as c_int);
+                let mut args = [
+                    &mut ph as *mut _ as *mut c_void,
+                    &mut pwv as *mut _ as *mut c_void,
+                    &mut psh as *mut _ as *mut c_void,
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut po as *mut _ as *mut c_void,
+                    &mut pe as *mut _ as *mut c_void,
+                    &mut pn as *mut _ as *mut c_void,
+                    &mut phs as *mut _ as *mut c_void,
+                ];
+                let threads = 256usize;
+                let blocks = sum_e.div_ceil(threads) as u32;
+                ctx.launch_async(sk.sum, (blocks.max(1), 1, 1), (threads as u32, 1, 1), 0, &mut args)?;
+                dec_exp_kprof::mark(dec_exp_kprof::SUM);
+                psum.ptr
+            } else {
+                h.ptr
+            };
             // 4. 同期は 1 回だけ (層あたり)。task 150 の overlap 経路では D2H を
             //    非同期で先に出し、`middle` (CPU ミス) を挟んでから同期する。
             //    カーネル・引数・発行順は逐次版と同一 (変わるのは待つ位置だけ)。
             if overlap {
                 // `h` の借用をここで切る (pinned は別 field なので `sc` を丸ごと
                 // 借り直さないよう、アドレスを先に写す)。
-                let h_ptr = h.ptr;
                 let pin = sc.hpin.as_mut().expect("確保済み");
                 check(
-                    (lib()?.memcpy_dtoh_async)(pin.ptr, h_ptr, nh * 4, std::ptr::null_mut()),
+                    (lib()?.memcpy_dtoh_async)(pin.ptr, src_ptr, nout * 4, std::ptr::null_mut()),
                     "cuMemcpyDtoHAsync (iq layer overlap)",
                 )?;
                 crate::prof::mark_d2h_src(crate::prof::D2H_SRC_LINEAR);
@@ -7183,19 +7299,173 @@ where
             // だけ。shared expert のサイドストリームは join まで待たない。
             sync_default_or_ctx(ctx, dec_overlap_enabled())?;
             let pin = sc.hpin.as_ref().expect("確保済み");
-            out_h[..nh].copy_from_slice(&pin.as_slice::<f32>()[..nh]);
+            out_h[..nout].copy_from_slice(&pin.as_slice::<f32>()[..nout]);
         } else {
-            let got: Vec<f32> = sc.h.as_ref().expect("確保済み").to_vec(nh)?;
-            out_h[..nh].copy_from_slice(&got);
+            let src = if sum_mode {
+                sc.psum.as_ref().expect("確保済み")
+            } else {
+                sc.h.as_ref().expect("確保済み")
+            };
+            let got: Vec<f32> = src.to_vec(nout)?;
+            out_h[..nout].copy_from_slice(&got);
             dec_exp_kprof::mark(dec_exp_kprof::D2H);
             middle()?;
         }
-        dbg_d2h(nh * 4);
+        dbg_d2h(nout * 4);
         // ここまでで GPU は同期済み (両経路とも) = イベントが完了している。
         dec_exp_kprof::end_layer();
         Ok(())
     })?;
     Ok(true)
+}
+
+// ===========================================================================
+// task 187: decode の epilogue カーネル (`kernels_dec_epi.cu` → `.ptx`)
+// ===========================================================================
+//
+// - `dno_dec_exp_sum`: ヒットした expert の寄与を **デバイスで**重み付き和にする。
+//   従来は 1 層あたり `nseg * e` 要素 (約 100 KB) を D2H してホストで足していた。
+//   t 昇順の 1 アキュムレータなので、ミスの無い層ではホストの足し込みとビット一致。
+// - `dno_dec_silu_mul`: shared expert の `silu(gate) * up` をデバイスで作る
+//   (将来 shared 段をデバイスで閉じるためのもの。今回は未使用でも PTX は読む)。
+//
+// PTX が無い / 読めないときは `dec_epi_kernels()` が `None` を返し、呼び出し側は
+// 従来経路へ落ちる (fail closed。数値は変わらない)。
+
+struct DecEpiKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    /// ヒットの寄与 + shared の足し込み
+    sum: CUfunction,
+    /// silu(g) * u
+    #[allow(dead_code)]
+    silu: CUfunction,
+}
+
+unsafe impl Send for DecEpiKernels {}
+unsafe impl Sync for DecEpiKernels {}
+
+static DEC_EPI_KERNELS: OnceLock<Option<DecEpiKernels>> = OnceLock::new();
+
+/// PTX の置き場所。`DENNO_DEC_EPI_PTX` があればそれ、無ければクレート配下
+/// `kernels/kernels_dec_epi.ptx`。
+fn dec_epi_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_DEC_EPI_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_dec_epi.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む。失敗は None を焼き付ける)。
+fn dec_epi_kernels() -> Option<&'static DecEpiKernels> {
+    DEC_EPI_KERNELS
+        .get_or_init(|| {
+            let path = dec_epi_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            image.push(0);
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+            }
+            let get = |module: CUmodule, name: &str| -> Option<CUfunction> {
+                let mut cname = name.as_bytes().to_vec();
+                cname.push(0);
+                let mut f: CUfunction = std::ptr::null_mut();
+                unsafe {
+                    if (lib.module_get_function)(&mut f, module, cname.as_ptr() as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        return None;
+                    }
+                }
+                Some(f)
+            };
+            let sum = get(module, "dno_dec_exp_sum")?;
+            let silu = get(module, "dno_dec_silu_mul")?;
+            Some(DecEpiKernels { module, sum, silu })
+        })
+        .as_ref()
+}
+
+/// 和のカーネルが使えるか (PTX があるか)。
+pub fn dec_epi_ready() -> bool {
+    cuda_enabled() && dec_epi_kernels().is_some()
+}
+
+// ---------------------------------------------------------------------------
+// task 187: decode の head (語彙 GEMV) を v5 カーネルで回す
+// ---------------------------------------------------------------------------
+//
+// 台帳 t187a の実測: head は 675.4 MB を 1.05 ms で読む = 643 GB/s。
+// 現行の v2 カーネル (`kernels_moe.cu`) は 1 バイトずつの共有メモリ staging で、
+// ピーク (1.79 TB/s) の 36% しか出ていない。v5 (task 184。ベクタロード +
+// 4 アキュムレータ) に差し替えると **丸め順が変わる** (v2 とビット不一致)。
+// そのため既定 off のゲート `DENNO_DEC_HEAD_FAST` で切り替える。
+
+/// `DENNO_DEC_HEAD_FAST` の値を解釈する (純関数)。`1` / `on` / `true` だけが真。
+pub fn head_fast_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true")
+    )
+}
+
+/// [`head_fast_from_value`] をプロセスで 1 回だけ読む。
+pub fn head_fast_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| head_fast_from_value(std::env::var("DENNO_DEC_HEAD_FAST").ok().as_deref()))
+}
+
+/// 語彙 GEMV (head) を v5 カーネルで回す。`false` = 従来経路へ。
+pub fn maybe_gpu_head_gemv_v5(
+    uid: u64,
+    ty: crate::kquant::GgmlType,
+    blocks: &[u8],
+    k: usize,
+    n: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> bool {
+    use crate::kquant::GgmlType as T;
+    set_last_linear_ran_on_gpu(false);
+    if !head_fast_enabled() || !cuda_enabled() {
+        return false;
+    }
+    // v5 が読める型だけ (Q8_0 / Q4_K)。
+    if !matches!(ty, T::Q8_0 | T::Q4K) {
+        return false;
+    }
+    if x.len() != k || out.len() != n {
+        return false;
+    }
+    let Some(ctx) = shared_ctx() else {
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        GPU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    let w = match weights_for_gguf(uid, ty, blocks, k, n) {
+        Ok(w) => w,
+        Err(_) => return false,
+    };
+    match ctx.moe_gemv_dev_with(ty, &w.buf, x, k, n, out, GemvKernelMode::V5) {
+        Ok(true) => {
+            set_last_linear_ran_on_gpu(true);
+            true
+        }
+        _ => false,
+    }
 }
 
 // ===========================================================================
@@ -7242,18 +7512,30 @@ pub struct DecStageLayout {
     pub pd: usize,
     pub sgu: usize,
     pub sgd: usize,
+    /// task 187: 和モードの重み (`nseg` 本の f32)。
+    pub w: usize,
     pub total: usize,
 }
 
 /// [`DecStageLayout`] を作る (純関数・テスト用)。
-pub fn dec_stage_layout(n_in: usize, nseg: usize, sgu_len: usize, sgd_len: usize) -> DecStageLayout {
+///
+/// task 187: 末尾に和モードの重み (`nseg` 本の f32) のブロックを足した。
+/// 使わないときは 0 バイト書くだけなので、従来の経路の転送量は増えない。
+pub fn dec_stage_layout(
+    n_in: usize,
+    nseg: usize,
+    sgu_len: usize,
+    sgd_len: usize,
+    w_len: usize,
+) -> DecStageLayout {
     let x = 0usize;
     let pg = x + n_in * 4;
     let pu = pg + nseg * 8;
     let pd = pu + nseg * 8;
     let sgu = pd + nseg * 8;
     let sgd = sgu + sgu_len * 4;
-    let total = sgd + sgd_len * 4;
+    let w = sgd + sgd_len * 4;
+    let total = w + w_len * 4;
     DecStageLayout {
         x,
         pg,
@@ -7261,6 +7543,7 @@ pub fn dec_stage_layout(n_in: usize, nseg: usize, sgu_len: usize, sgd_len: usize
         pd,
         sgu,
         sgd,
+        w,
         total,
     }
 }
@@ -10178,26 +10461,28 @@ mod iq_overlap_tests {
     /// 重ならないこと。`u64` の表を `u64` として読むので整列が要る。
     #[test]
     fn dec_stage_layout_is_aligned_and_disjoint() {
-        let l = dec_stage_layout(2560, 10, 40, 40);
+        let l = dec_stage_layout(2560, 10, 40, 40, 10);
         assert_eq!(l.x, 0);
         assert_eq!(l.pg, 2560 * 4);
         assert_eq!(l.pu, l.pg + 80);
         assert_eq!(l.pd, l.pu + 80);
         assert_eq!(l.sgu, l.pd + 80);
         assert_eq!(l.sgd, l.sgu + 160);
-        assert_eq!(l.total, l.sgd + 160);
-        for off in [l.x, l.pg, l.pu, l.pd, l.sgu, l.sgd] {
+        assert_eq!(l.w, l.sgd + 160);
+        assert_eq!(l.total, l.w + 40);
+        for off in [l.x, l.pg, l.pu, l.pd, l.sgu, l.sgd, l.w] {
             assert_eq!(off % 8, 0, "オフセット {off} が 8 バイト整列でない");
         }
         // ブロックの境界が重ならない (前の終わり <= 次の始まり)。
         assert!(l.x + 2560 * 4 <= l.pg);
-        assert!(l.sgd + 40 * 4 <= l.total);
+        assert!(l.sgd + 40 * 4 <= l.w);
+        assert!(l.w + 10 * 4 <= l.total);
     }
 
     /// task 164: ステージングへの書き込みは指定オフセットにだけ載る。
     #[test]
     fn dec_stage_put_writes_at_offset() {
-        let l = dec_stage_layout(4, 1, 4, 4);
+        let l = dec_stage_layout(4, 1, 4, 4, 0);
         let mut buf = vec![0u8; l.total];
         let x = [1.0f32, 2.0, 3.0, 4.0];
         unsafe {
@@ -34988,8 +35273,10 @@ pub mod dec_exp_kprof {
     pub const SILU: usize = 2;
     pub const DOWN: usize = 3;
     pub const D2H: usize = 4;
-    pub const N: usize = 5;
-    pub const NAMES: [&str; N] = ["gate", "up", "silu", "down", "d2h"];
+    /// task 187: デバイス和 (`dno_dec_exp_sum`)。
+    pub const SUM: usize = 5;
+    pub const N: usize = 6;
+    pub const NAMES: [&str; N] = ["gate", "up", "silu", "down", "d2h", "sum"];
     /// ヒット本数の上限 (n_expert_used = 10 まで数える)。
     pub const MAX_HITS: usize = 10;
 
