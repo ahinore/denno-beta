@@ -2339,6 +2339,27 @@ impl Qwen4Exp {
     fn head_logits_into(&self, x: &[f32], out: &mut [f32]) -> Result<()> {
         let t = headprof::stamp();
         let bytes = self.head.output.weight_bytes() as u64;
+        // task 187: `DENNO_DEC_HEAD_FAST=1` のときだけ v5 カーネル (ベクタロード +
+        // 4 アキュムレータ) で回す。v2 とは丸め順が違う (ビット不一致)。
+        // 使えない形 (型・PTX) のときは下の従来経路へ落ちる。
+        #[cfg(feature = "cuda")]
+        {
+            let o = &self.head.output;
+            if crate::cuda::head_fast_enabled()
+                && crate::cuda::maybe_gpu_head_gemv_v5(
+                    o.uid(),
+                    o.ty(),
+                    o.blocks().as_slice(),
+                    o.k(),
+                    o.n(),
+                    x,
+                    out,
+                )
+            {
+                headprof::mark(headprof::GEMV, t, bytes);
+                return Ok(());
+            }
+        }
         let row_min = head_row_par_min();
         let r = if row_min == 0 {
             self.head.output.gemv_label("output", x, out)
@@ -3940,6 +3961,107 @@ fn decode_chain2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         decode_chain2_from_value(std::env::var("DENNO_DECODE_CHAIN2").ok().as_deref())
+    })
+}
+
+/// task 187: `DENNO_DEC_SHARED_DEV` の値を解釈する (純関数・テスト用)。
+///
+/// **既定 on** (lab t187c: shared の wall 1.46 → 0.63 ms/tok、decode -8.0%)。
+/// 明示的な偽値だけ切る。on のときは shared expert の gate → up → silu*up → down を
+/// router の時点で 1 本のサイドストリームに積み、down の出力だけを join する。
+/// silu を CUDA の `ex2.approx` で計算するので、ホストの `f32::exp` とは丸めが違う。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn dec_shared_dev_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// テスト用の上書き (0 = env を見る / 1 = 強制 off / 2 = 強制 on)。
+static DEC_SHARED_DEV_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// [`dec_shared_dev_from_value`] をプロセスで 1 回だけ読む。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn dec_shared_dev_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match DEC_SHARED_DEV_OVERRIDE.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        dec_shared_dev_from_value(std::env::var("DENNO_DEC_SHARED_DEV").ok().as_deref())
+    })
+}
+
+/// テスト専用: 4 発経路の on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+fn set_dec_shared_dev_for_test(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    DEC_SHARED_DEV_OVERRIDE.store(
+        match v {
+            Some(false) => 1,
+            Some(true) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// task 187: `kernels_dec_epi.cu` の `dno_dec_exp_sum` と**同じ順序・同じ丸め**の
+/// ホスト実装 (テストと仕様の固定用)。
+///
+/// `out[j] = sum_{t<nseg} w[t] * h[t*e+j]` を t 昇順の 1 アキュムレータで積み、
+/// 最後に `out[j] += sgw * sh[j]` を足す。カーネルは `-fmad=false` なので積と和は
+/// 別の丸め (ホストの `pe * hh[j]` + `+=` と同じ 2 演算)。
+fn dec_exp_sum_mirror(
+    h: &[f32],
+    w: &[f32],
+    e: usize,
+    sh: Option<(&[f32], f32)>,
+    out: &mut [f32],
+) {
+    debug_assert!(h.len() >= w.len() * e);
+    for (j, o) in out.iter_mut().enumerate().take(e) {
+        let mut acc = 0.0f32;
+        for (t, &pe) in w.iter().enumerate() {
+            acc += pe * h[t * e + j];
+        }
+        if let Some((shv, sgw)) = sh {
+            acc += sgw * shv[j];
+        }
+        *o = acc;
+    }
+}
+
+/// task 187: `DENNO_DEC_EXP_SUMDEV` の値を解釈する (純関数・テスト用)。
+///
+/// **既定 on** (lab t187c で採否 yes: decode -8.0%、prefill +0.4%、md5 SAME)。
+/// 明示的な偽値 `0` / `off` / `false` / `no` だけ切る。on のときは、ヒットした
+/// expert の寄与をデバイスで重み付き和にして `e` 要素だけ D2H する
+/// (`kernels_dec_epi.cu` の `dno_dec_exp_sum`)。PTX が無い / 形が合わないときは
+/// 従来経路へ落ちる (数値は変わらない)。
+fn dec_exp_sumdev_from_value(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// [`dec_exp_sumdev_from_value`] をプロセスで 1 回だけ読む。
+fn dec_exp_sumdev_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        dec_exp_sumdev_from_value(std::env::var("DENNO_DEC_EXP_SUMDEV").ok().as_deref())
     })
 }
 
@@ -7585,6 +7707,10 @@ struct SharedExpertOverlap {
     pending: crate::cuda::SharedPending,
     /// 積んだときの gate/up の出力長 (join の検査用。0 = 積んでいない)
     lens: [usize; 2],
+    /// task 187: down までデバイスで積んだか (`DENNO_DEC_SHARED_DEV`)。
+    full: bool,
+    /// down の出力長 (full のときだけ意味がある)。
+    down_n: usize,
 }
 
 impl SharedExpertOverlap {
@@ -7593,6 +7719,32 @@ impl SharedExpertOverlap {
             #[cfg(feature = "cuda")]
             pending: crate::cuda::SharedPending::none(),
             lens: [0, 0],
+            full: false,
+            down_n: 0,
+        }
+    }
+
+    /// task 187: down までデバイスで積んだか (呼び出し側は `finish_shared` を使う)。
+    fn has_down(&self) -> bool {
+        self.full
+    }
+
+    /// task 187: デバイスで積んだ down の出力を `sh` へ写す。
+    ///
+    /// `false` = 取れなかった (呼び出し側は従来の 2 段経路へ落ちる)。
+    fn finish_shared(&mut self, sh: &mut [f32]) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            if !self.full || self.pending.is_empty() || sh.len() < self.down_n {
+                return false;
+            }
+            let mut outs: [&mut [f32]; 1] = [sh];
+            return crate::cuda::shared_gemv_finish(&mut self.pending, &mut outs);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = sh;
+            false
         }
     }
 
@@ -7619,10 +7771,31 @@ impl SharedExpertOverlap {
                     n: lw.up_shexp.n(),
                 },
             ];
+            // task 187: 4 発 (gate/up/silu/down) を 1 回で積む経路を先に試す。
+            if dec_shared_dev_enabled() {
+                let down = crate::cuda::SharedGemvJob {
+                    uid: lw.down_shexp.uid(),
+                    ty: lw.down_shexp.ty(),
+                    blocks: lw.down_shexp.blocks().as_slice(),
+                    k: lw.down_shexp.k(),
+                    n: lw.down_shexp.n(),
+                };
+                let pending = crate::cuda::shared_expert_begin(x, &jobs[0], &jobs[1], &down);
+                if !pending.is_empty() {
+                    return Self {
+                        pending,
+                        lens: [jobs[0].n, jobs[1].n],
+                        full: true,
+                        down_n: down.n,
+                    };
+                }
+            }
             let pending = crate::cuda::shared_gemv_begin(x, &jobs);
             return Self {
                 pending,
                 lens: [jobs[0].n, jobs[1].n],
+                full: false,
+                down_n: 0,
             };
         }
         #[cfg(not(feature = "cuda"))]
@@ -7793,6 +7966,8 @@ fn moe_ffn_quant_impl(
     // task 138: この発行は台帳では shared に数える。
     let mut shed_ov = {
         let _l = q4ledger::enter(q4ledger::SHARED);
+        // task 187: 台帳の副区間 (shared gate/up の enqueue)。
+        let _s = q4ledger::sub(q4ledger::SUB_SH_BEGIN);
         SharedExpertOverlap::begin(lw, x)
     };
 
@@ -8071,26 +8246,57 @@ fn moe_ffn_quant_impl(
         #[cfg(not(feature = "cuda"))]
         let iq_mode = false;
 
+        // task 187: ヒットの寄与をデバイスで和にする (`DENNO_DEC_EXP_SUMDEV`)。
+        // PTX が無い / 形が合わないときは `moe_experts_iq_gpu_batched` が従来経路へ落ちる。
+        #[cfg(feature = "cuda")]
+        let sumdev = dec_exp_sumdev_enabled();
+        #[cfg(not(feature = "cuda"))]
+        let sumdev = {
+            let _ = ();
+            false
+        };
+
         #[cfg(feature = "cuda")]
         let iq_batched = if use_gpu && iq_mode {
             // task 158: ミスを GPU で計算する経路 (`DENNO_DEC_MISS_UP`)。
             // 不発 (`None`) なら従来の「ヒットだけ GPU / ミスは CPU」へ落ちる。
             match moe_experts_iq_gpu_miss_up(lw, &sel, x, e, ff)? {
-                Some(v) => Some(v),
-                None => moe_experts_iq_gpu_batched(lw, &sel, x, e, ff)?,
+                Some(v) => Some(IqBatchOut::Contribs(v.0, v.1)),
+                None => moe_experts_iq_gpu_batched(lw, &sel, &weights, x, e, ff, sumdev)?,
             }
         } else {
             None
         };
         #[cfg(not(feature = "cuda"))]
-        let iq_batched: Option<(Vec<Option<Vec<f32>>>, u32)> = None;
+        let iq_batched: Option<IqBatchOut> = None;
 
         let batched = if use_gpu && !iq_mode {
             moe_experts_gpu_batched(lw, &sel, x, e, ff)?
         } else {
             None
         };
-        if let Some((hs, hits)) = iq_batched {
+        if let Some(IqBatchOut::Sum {
+            sum,
+            miss_pos,
+            miss_h,
+            hits,
+        }) = iq_batched
+        {
+            // task 187: ヒットぶんはデバイスで和にしてある (重み付き・選択順)。
+            // ミスだけホストで足す (ミスの無い層では従来の足し込みとビット一致)。
+            gpu_hits = hits;
+            out.copy_from_slice(&sum[..e]);
+            if !miss_pos.is_empty() {
+                let _s_sum = q4ledger::sub(q4ledger::SUB_EXP_SUM);
+                for (i, &t) in miss_pos.iter().enumerate() {
+                    let pe = weights[t];
+                    let v = &miss_h[i * e..(i + 1) * e];
+                    for j in 0..e {
+                        out[j] += pe * v[j];
+                    }
+                }
+            }
+        } else if let Some(IqBatchOut::Contribs(hs, hits)) = iq_batched {
             // GPU で回せた expert はその寄与、回せなかった expert は CPU で 3 行列。
             // 足し込みは今までと同じ **expert index 昇順の逐次** (同じ位置で同じ重み)。
             //
@@ -8104,6 +8310,8 @@ fn moe_ffn_quant_impl(
                 Vec::new()
             } else {
                 let ids: Vec<usize> = miss_pos.iter().map(|&t| sel[t]).collect();
+                // task 187: 台帳の副区間 (ミスの CPU 計算)。
+                let _s = q4ledger::sub(q4ledger::SUB_EXP_MISS);
                 expert_contribs_par(lw, &ids, x, e, ff, None)?
             };
             #[cfg(not(feature = "par"))]
@@ -8126,6 +8334,8 @@ fn moe_ffn_quant_impl(
                 v
             };
             let mut mi = 0usize;
+            // task 187: 台帳の副区間 (host の重み付き足し込み)。
+            let _s_sum = q4ledger::sub(q4ledger::SUB_EXP_SUM);
             for (t, &_ei) in sel.iter().enumerate() {
                 let pe = weights[t];
                 let v: &[f32] = match hs[t].as_deref() {
@@ -8147,6 +8357,8 @@ fn moe_ffn_quant_impl(
             // P45: 層一括経路も「何本が載っていたか」を返す (ゲートの 1 サンプル)。
             gpu_hits = hits;
             debug_assert_eq!(hs.len(), sel.len(), "寄与の本数が選択 expert と違う");
+            // task 187: 台帳の副区間 (host の重み付き足し込み)。
+            let _s_sum = q4ledger::sub(q4ledger::SUB_EXP_SUM);
             for (t, _) in sel.iter().enumerate() {
                 let pe = weights[t];
                 let hh = &hs[t];
@@ -8221,6 +8433,8 @@ fn moe_ffn_quant_impl(
         // ヒット率が永久に 0 のままになる)。
         #[cfg(feature = "cuda")]
         if vram_mode && iq_mode {
+            // task 187: 台帳の副区間 (ミス expert の上げ直し = ページフォルト + H2D)。
+            let _s = q4ledger::sub(q4ledger::SUB_EXP_UPLOAD);
             iq_warm_misses(lw, &sel, x.len(), e, ff, p.n_layer);
         }
     }
@@ -8263,48 +8477,85 @@ fn moe_ffn_quant_impl(
     let _l_shared = q4ledger::enter(q4ledger::SHARED);
     let t_shared = std::time::Instant::now();
     let sff = lw.gate_shexp.n();
-    let mut sact = vec![0.0f32; sff];
-    let mut sup = vec![0.0f32; sff];
-    // task 124: router の前に積んだ gate/up をここで回収する (間に合っていれば
-    // 待ちはほぼ 0)。取れなければ従来どおりこの場で同期して計算する。
-    // 従来の文の順序 (gate → silu → up → 積) は `!overlapped` 側でそのまま。
-    let overlapped = shed_ov.finish(&mut sact, &mut sup);
-    if !overlapped {
-        lw.gate_shexp
-            .gemv_label("shared_gate", x, &mut sact)
-            .map_err(|err| one(format!("層 {}: ffn_gate_shexp: {err}", lw.il)))?;
-    }
-    silu_inplace(&mut sact);
-    if !overlapped {
-        lw.up_shexp
-            .gemv_label("shared_up", x, &mut sup)
-            .map_err(|err| one(format!("層 {}: ffn_up_shexp: {err}", lw.il)))?;
-    }
-    for r in 0..sff {
-        sact[r] *= sup[r];
-    }
     let mut sh = vec![0.0f32; e];
-    // task 155: down は**サイドストリーム**に先に積み、その完了を待つ間に
-    // gate_inp (null ストリーム) を回す (層あたり 2 往復 → 1 往復)。
-    // 積めない型/環境では `finish` が false を返すので従来の同期経路に戻る。
-    let mut sdown = SharedDownOverlap::begin(lw, &sact, e);
     let mut sg = vec![0.0f32; lw.gate_inp_shexp.n()];
-    lw.gate_inp_shexp
-        .gemv_label("shared_gate_inp", x, &mut sg)
-        .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp: {err}", lw.il)))?;
-    if !sdown.finish(&mut sh) {
-        lw.down_shexp
-            .gemv_label("shared_down", &sact, &mut sh)
-            .map_err(|err| one(format!("層 {}: ffn_down_shexp: {err}", lw.il)))?;
+    // task 187: `DENNO_DEC_SHARED_DEV` では gate → up → silu*up → down を router の
+    // 時点で 1 本のサイドストリームに積んである。ここでは down の出力を join する
+    // だけ (ホストの silu/mul・down の再発行・待ちが消える)。
+    let dev_shared = if shed_ov.has_down() {
+        let _s = q4ledger::sub(q4ledger::SUB_SH_WAIT);
+        shed_ov.finish_shared(&mut sh)
+    } else {
+        false
+    };
+    if !dev_shared {
+        // 従来 (task 124 / 155): gate/up をホストで受け、silu/mul を回し、
+        // down をサイドストリームへ先に積んでから gate_inp を回す。
+        // task 187: 台帳の副区間 (作業域の確保)。
+        let s_elem = q4ledger::sub(q4ledger::SUB_SH_ELEM);
+        let mut sact = vec![0.0f32; sff];
+        let mut sup = vec![0.0f32; sff];
+        drop(s_elem);
+        // task 124: router の前に積んだ gate/up をここで回収する (間に合っていれば
+        // 待ちはほぼ 0)。取れなければ従来どおりこの場で同期して計算する。
+        // 従来の文の順序 (gate → silu → up → 積) は `!overlapped` 側でそのまま。
+        let overlapped = shed_ov.finish(&mut sact, &mut sup);
+        if !overlapped {
+            lw.gate_shexp
+                .gemv_label("shared_gate", x, &mut sact)
+                .map_err(|err| one(format!("層 {}: ffn_gate_shexp: {err}", lw.il)))?;
+        }
+        {
+            // task 187: 台帳の副区間 (silu と積)。
+            let _s = q4ledger::sub(q4ledger::SUB_SH_ELEM);
+            silu_inplace(&mut sact);
+            if !overlapped {
+                lw.up_shexp
+                    .gemv_label("shared_up", x, &mut sup)
+                    .map_err(|err| one(format!("層 {}: ffn_up_shexp: {err}", lw.il)))?;
+            }
+            for r in 0..sff {
+                sact[r] *= sup[r];
+            }
+        }
+        // task 155: down は**サイドストリーム**に先に積み、その完了を待つ間に
+        // gate_inp (null ストリーム) を回す (層あたり 2 往復 → 1 往復)。
+        // 積めない型/環境では `finish` が false を返すので従来の同期経路に戻る。
+        let mut sdown = {
+            let _s = q4ledger::sub(q4ledger::SUB_SH_SDOWN);
+            SharedDownOverlap::begin(lw, &sact, e)
+        };
+        {
+            // task 187: 台帳の副区間 (F32・1 行の GEMV)。
+            let _s = q4ledger::sub(q4ledger::SUB_SH_SG);
+            lw.gate_inp_shexp
+                .gemv_label("shared_gate_inp", x, &mut sg)
+                .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp: {err}", lw.il)))?;
+        }
+        if !sdown.finish(&mut sh) {
+            lw.down_shexp
+                .gemv_label("shared_down", &sact, &mut sh)
+                .map_err(|err| one(format!("層 {}: ffn_down_shexp: {err}", lw.il)))?;
+        }
+    } else {
+        // 係数 `sigmoid(gate_inp_shexp @ x)` はホストで要る (1 行の GEMV)。
+        let _s = q4ledger::sub(q4ledger::SUB_SH_SG);
+        lw.gate_inp_shexp
+            .gemv_label("shared_gate_inp", x, &mut sg)
+            .map_err(|err| one(format!("層 {}: ffn_gate_inp_shexp: {err}", lw.il)))?;
     }
     let sgw = hyper::sigmoid(sg[0]);
-    for j in 0..e {
-        out[j] += sh[j] * sgw;
-    }
-    // P54: shared expert の出力そのもの (`ffn_down_shexp` の出力) の RMS。
-    // 係数 `sgw` は掛ける前の値を見る (expert の寄与の大きさを測るため)。
-    if let Some(r) = roles.as_deref_mut() {
-        r.shex = rms_of(&sh);
+    {
+        // task 187: 台帳の副区間 (shared 出力の足し込み + RMS)。
+        let _s = q4ledger::sub(q4ledger::SUB_SH_ADD);
+        for j in 0..e {
+            out[j] += sh[j] * sgw;
+        }
+        // P54: shared expert の出力そのもの (`ffn_down_shexp` の出力) の RMS。
+        // 係数 `sgw` は掛ける前の値を見る (expert の寄与の大きさを測るため)。
+        if let Some(r) = roles.as_deref_mut() {
+            r.shex = rms_of(&sh);
+        }
     }
     moe_sub_add(2, t_shared.elapsed());
 
@@ -8685,14 +8936,31 @@ fn scatter_contribs(
 /// 戻り値: `Some((hs, hits))` の `hs[t]` は `sel[t]` の寄与 (GPU で回したものだけ
 /// `Some`)。GPU のカーネルが無い / 型が未対応 / 1 本も載っていないなら `None`
 /// (呼び出し側は per-expert = CPU 経路へ)。
+/// task 187: IQ 層一括経路の戻り値。
+///
+/// - [`IqBatchOut::Contribs`] は従来 (task 144) の形: `sel` の並びの寄与。
+/// - [`IqBatchOut::Sum`] は `DENNO_DEC_EXP_SUMDEV` の形: ヒットぶんを**デバイスで**
+///   重み付き和にした `e` 要素と、ミスの位置・寄与 (ホストで足す)。
+enum IqBatchOut {
+    Contribs(Vec<Option<Vec<f32>>>, u32),
+    Sum {
+        sum: Vec<f32>,
+        miss_pos: Vec<usize>,
+        miss_h: Vec<f32>,
+        hits: u32,
+    },
+}
+
 #[cfg(feature = "cuda")]
 fn moe_experts_iq_gpu_batched(
     lw: &LayerW,
     sel: &[usize],
+    weights: &[f32],
     x: &[f32],
     e: usize,
     ff: usize,
-) -> Result<Option<(Vec<Option<Vec<f32>>>, u32)>> {
+    sumdev: bool,
+) -> Result<Option<IqBatchOut>> {
     use crate::model::expert_vram::ExpertShape;
 
     if sel.is_empty() {
@@ -8725,6 +8993,8 @@ fn moe_experts_iq_gpu_batched(
     let mut devs = Vec::with_capacity(sel.len());
     let mut ids: Vec<u16> = Vec::with_capacity(sel.len());
     let mut pos: Vec<usize> = Vec::with_capacity(sel.len());
+    // task 187: 台帳の副区間 (VRAM 参照)。`experts` の cpu 列の中身。
+    let s_lookup = q4ledger::sub(q4ledger::SUB_EXP_LOOKUP);
     for (t, &ei) in sel.iter().enumerate() {
         let key = ExpertKey {
             layer: lw.il as u16,
@@ -8738,6 +9008,7 @@ fn moe_experts_iq_gpu_batched(
             pos.push(t);
         }
     }
+    drop(s_lookup);
     if devs.is_empty() {
         return Ok(None);
     }
@@ -8747,7 +9018,7 @@ fn moe_experts_iq_gpu_batched(
     // **全 expert を CPU 並列**へ回す (呼び出し側は `None` を見て CPU を回す)。
     let min_hits = crate::model::exp_iq::min_hits_per_layer();
     if (hits as usize) < min_hits {
-        return Ok(Some((vec![None; sel.len()], 0)));
+        return Ok(Some(IqBatchOut::Contribs(vec![None; sel.len()], 0)));
     }
     crate::model::exp_iq::note_gpu_layer(hits);
 
@@ -8760,7 +9031,9 @@ fn moe_experts_iq_gpu_batched(
     );
     let seg_gu = crate::model::expert_batch::seg_table_shared_x(&ids, ff);
     let seg_d = crate::model::expert_batch::seg_table_per_act(&ids, ff, e);
+    let s_alloc = q4ledger::sub(q4ledger::SUB_EXP_ALLOC);
     let mut h = vec![0.0f32; devs.len() * e];
+    drop(s_alloc);
     // task 150 (`DENNO_DECODE_CHAIN2_EXP`): ミス (VRAM に載っていない expert) の寄与を
     // GPU の完了前に CPU で計算し、同期をその裏へ隠す。ミスの位置と id を先に作り、
     // overlap 経路ではコールバックの中で `miss_h` へ書かせる (足し込みは従来どおり
@@ -8777,6 +9050,47 @@ fn moe_experts_iq_gpu_batched(
     let n_miss_used = miss_slots(overlap, miss_pos.len());
     let miss_slice: &[usize] = &miss_pos[..n_miss_used];
     let mut miss_h = vec![0.0f32; n_miss_used * e];
+    // task 187: `DENNO_DEC_EXP_SUMDEV` ではヒットの寄与をデバイスで和にして
+    // `e` 要素だけ D2H する (ミスはホストで足す)。重みは選択順 (pos の順) に詰める。
+    if sumdev {
+        let hw: Vec<f32> = pos.iter().map(|&t| weights[t]).collect();
+        let mut sum = vec![0.0f32; e];
+        // ミスの寄与は常にこの関数の中で計算して返す (overlap の有無に依らない)。
+        let mut miss_s = vec![0.0f32; miss_pos.len() * e];
+        let ran = crate::cuda::moe_experts_iq_layer_sum_overlap(
+            lw.gate_exps.ty,
+            lw.up_exps.ty,
+            lw.down_exps.ty,
+            &pg,
+            &pu,
+            &pd,
+            &seg_gu,
+            &seg_d,
+            x,
+            x.len(),
+            ff,
+            e,
+            &hw,
+            &mut sum,
+            || {
+                // task 187: 台帳の副区間 (ミスの CPU 計算。GPU の裏で走る)。
+                let _s = q4ledger::sub(q4ledger::SUB_EXP_MISS);
+                expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_s)
+                    .map_err(anyhow::Error::from)
+            },
+        )
+        .map_err(|err| one(format!("層 {}: IQ 層一括 GEMV (sum): {err:#}", lw.il)))?;
+        if ran {
+            return Ok(Some(IqBatchOut::Sum {
+                sum,
+                miss_pos,
+                miss_h: miss_s,
+                hits,
+            }));
+        }
+        // 和のカーネル (PTX) が無い / 形が合わないときは**従来の寄与経路**へ落ちる
+        // (per-expert 経路へは落とさない: そちらは IQ 型を CPU で回すので遅い)。
+    }
     let ran = if overlap {
         // 台帳の exp_iq 区間は取らない (同期が CPU ミスの後ろへ移るので、GPU の
         // 待ちだけを切り出せない)。起動と同期は `experts` 行に入る。
@@ -8795,6 +9109,8 @@ fn moe_experts_iq_gpu_batched(
             e,
             &mut h,
             || {
+                // task 187: 台帳の副区間 (ミスの CPU 計算。GPU の裏で走る)。
+                let _s = q4ledger::sub(q4ledger::SUB_EXP_MISS);
                 expert_miss_contribs_into(lw, &miss_ids, x, e, ff, &mut miss_h)
                     .map_err(anyhow::Error::from)
             },
@@ -8823,10 +9139,12 @@ fn moe_experts_iq_gpu_batched(
         return Ok(None);
     }
 
+    let s_alloc = q4ledger::sub(q4ledger::SUB_EXP_ALLOC);
     let mut hs: Vec<Option<Vec<f32>>> = vec![None; sel.len()];
     // task 150: overlap のときはミスも CPU で計算済みなので、両方をここで揃える
     // (呼び出し側は `None` を見ない = CPU を二度回さない)。
     scatter_contribs(&mut hs, &pos, &h, miss_slice, &miss_h, e)?;
+    drop(s_alloc);
 
     // 3. DENNO_EXPERT_GPU_CHECK=1: CPU の 3 行列と突き合わせる (層ごとに 1 行)。
     if expert_vram::check_enabled() {
@@ -8845,7 +9163,7 @@ fn moe_experts_iq_gpu_batched(
             expert_vram::note_check(&h[i * e..(i + 1) * e], &h_c);
         }
     }
-    Ok(Some((hs, hits)))
+    Ok(Some(IqBatchOut::Contribs(hs, hits)))
 }
 
 /// task 158: ミス expert を GPU で計算する decode 専用の入口。
@@ -13876,6 +14194,52 @@ mod tests {
         lw
     }
 
+    /// task 187: 4 発経路 (`DENNO_DEC_SHARED_DEV`) の偽 GPU 実行。
+    /// gate → up → silu*up → down を 1 本のサイドストリームに積む経路を、
+    /// ホストの `expert_gemv` で計算して join する。
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn shared_dev_fires_and_matches_two_step_path() {
+        let _g = moe_test_guard();
+        let dir = TempDir::new("shared_dev");
+        let path = write_expert_gguf(&dir);
+        let f = GgufFile::open(&path).expect("open");
+        let p = cache_test_params();
+        let lw = overlap_test_layer(&f, &p);
+        let x = cache_test_x(p.n_embd);
+
+        // 1) 従来 (2 段) 経路。
+        set_dec_shared_dev_for_test(Some(false));
+        set_shared_overlap_for_test(None);
+        let want = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu)
+            .expect("従来経路");
+        let s0 = crate::cuda::shared_overlap_stats();
+
+        // 2) 4 発経路 (偽 GPU)。
+        set_dec_shared_dev_for_test(Some(true));
+        let _fake = crate::cuda::SharedOverlapFakeGuard::new();
+        set_shared_overlap_for_test(Some(true));
+        let got = moe_ffn_quant_with(&p, &lw, &x, None, false, Route::Cpu)
+            .expect("4 発経路");
+        let s1 = crate::cuda::shared_overlap_stats();
+        set_shared_overlap_for_test(None);
+        set_dec_shared_dev_for_test(None);
+
+        assert!(
+            s1.taken > s0.taken,
+            "4 発経路が GPU へ積まれていない (taken {} -> {})",
+            s0.taken,
+            s1.taken
+        );
+        assert!(
+            s1.joined > s0.joined,
+            "4 発経路の join が起きていない (joined {} -> {})",
+            s0.joined,
+            s1.joined
+        );
+        assert_bitwise_eq(&want, &got, "4 発経路 vs 2 段経路");
+    }
+
     /// task 124: 偽 GPU を立てたままゲート on で MoE を 1 回回す。
     #[cfg(feature = "cuda")]
     fn shared_overlap_run(p: &Qwen4ExpParams, lw: &LayerW, x: &[f32]) -> Vec<f32> {
@@ -13990,7 +14354,11 @@ mod tests {
         {
             let _fake = crate::cuda::SharedOverlapFakeGuard::new();
             set_shared_overlap_for_test(Some(true));
+            // ここは 2 段経路 (gate/up の 2 本) の契約を見るテスト。task 187 の
+            // 4 発経路は既定 on なので、明示的に切って 2 本を固定する。
+            set_dec_shared_dev_for_test(Some(false));
             let ov = SharedExpertOverlap::begin(&lw, &x);
+            set_dec_shared_dev_for_test(None);
             set_shared_overlap_for_test(None);
             assert!(!ov.pending.is_empty(), "偽 GPU で積めていない");
             assert_eq!(ov.pending.len(), 2, "積んだ本数が 2 でない");
@@ -14560,6 +14928,113 @@ mod tests {
         // env 由来の状態に戻す (他のテストに漏らさない)
         denno_telemetry::set_arch_for_tests(prev_arch);
         denno_telemetry::set_enabled_for_tests(prev_on);
+    }
+
+    /// task 187: `DENNO_DEC_EXP_SUMDEV` / `DENNO_DEC_SHARED_DEV` の真理値表。
+    /// どちらも lab t187c の採否で**既定 on** (明示的な偽値だけ切る)。
+    #[test]
+    fn dec_exp_sumdev_gate_truth_table() {
+        for v in [None, Some("1"), Some("on"), Some("true"), Some(" ON "), Some("2")] {
+            assert!(dec_exp_sumdev_from_value(v), "{v:?} が on にならない");
+            assert!(dec_shared_dev_from_value(v), "{v:?} が on にならない");
+        }
+        for v in [Some("0"), Some("off"), Some("false"), Some("no"), Some(" OFF ")] {
+            assert!(!dec_exp_sumdev_from_value(v), "{v:?} が on になる");
+            assert!(!dec_shared_dev_from_value(v), "{v:?} が on になる");
+        }
+    }
+
+    /// task 187: デバイス和のミラー (`dno_dec_exp_sum` と同じ順序) が、**ミスの無い
+    /// 層では従来のホスト足し込みとビット一致**すること。
+    ///
+    /// 実形 (e = 2,560 / top-k = 10) で 3 トークンぶん、重みと寄与と shared の係数を
+    /// トークンごとに変えて回す (状態を持ち越す)。ここが崩れると md5 が動く。
+    #[test]
+    fn dec_exp_sum_mirror_matches_host_order_without_misses() {
+        let e = 2560usize;
+        let nseg = 10usize;
+        let mut st = 0x1234_5678_9abc_def0u64;
+        let mut rnd = move || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((st >> 33) as f32 / 2147483648.0) - 0.5
+        };
+        for tok in 0..3usize {
+            let mut h = vec![0.0f32; nseg * e];
+            for v in h.iter_mut() {
+                *v = rnd();
+            }
+            let w: Vec<f32> = (0..nseg)
+                .map(|t| (t as f32 + 1.0 + tok as f32) / 55.0)
+                .collect();
+            let sh: Vec<f32> = (0..e).map(|_| rnd()).collect();
+            let sgw = 0.31f32 + tok as f32 * 0.17;
+            // 従来: ホストの逐次足し込み (index 昇順 → shared)。
+            let mut host = vec![0.0f32; e];
+            for (t, &pe) in w.iter().enumerate() {
+                for j in 0..e {
+                    host[j] += pe * h[t * e + j];
+                }
+            }
+            for j in 0..e {
+                host[j] += sh[j] * sgw;
+            }
+            // カーネルと同じ順序。
+            let mut dev = vec![0.0f32; e];
+            dec_exp_sum_mirror(&h, &w, e, Some((&sh, sgw)), &mut dev);
+            assert_eq!(host, dev, "tok {tok}: ミスの無い層でホストと一致しない");
+        }
+    }
+
+    /// task 187: ミスのある層では「ヒットを先に全部足してからミス」になる
+    /// (丸め順が変わる)。差は f32 の丸めだけ (相対 1e-6 以内) であることを固定する。
+    #[test]
+    fn dec_exp_sum_mirror_with_miss_stays_within_rounding() {
+        let e = 64usize;
+        let nseg = 4usize;
+        let mut h = vec![0.0f32; nseg * e];
+        for (i, v) in h.iter_mut().enumerate() {
+            *v = ((i % 37) as f32 - 18.0) * 0.013;
+        }
+        let w = [0.4f32, 0.3, 0.2, 0.1];
+        let sh = vec![0.5f32; e];
+        let sgw = 0.7f32;
+        // 従来: 3 本目 (index 2) がミスで、その寄与をホストで足す。
+        let mut miss = vec![0.0f32; e];
+        for (j, m) in miss.iter_mut().enumerate() {
+            *m = 0.02 * (j as f32 + 1.0);
+        }
+        let mut host = vec![0.0f32; e];
+        for (t, &pe) in w.iter().enumerate() {
+            let src: &[f32] = if t == 2 { &miss } else { &h[t * e..(t + 1) * e] };
+            for j in 0..e {
+                host[j] += pe * src[j];
+            }
+        }
+        for j in 0..e {
+            host[j] += sh[j] * sgw;
+        }
+        // SUMDEV: ヒット (0,1,3) を先に和にしてからミスを足す。
+        let hits = [0usize, 1, 3];
+        let hh: Vec<f32> = hits
+            .iter()
+            .flat_map(|&t| h[t * e..(t + 1) * e].to_vec())
+            .collect();
+        let hw: Vec<f32> = hits.iter().map(|&t| w[t]).collect();
+        let mut dev = vec![0.0f32; e];
+        dec_exp_sum_mirror(&hh, &hw, e, None, &mut dev);
+        for j in 0..e {
+            dev[j] += w[2] * miss[j];
+        }
+        // shared の足し込みは呼び出し側の共通コード (従来と同じ 1 演算)。
+        for j in 0..e {
+            dev[j] += sh[j] * sgw;
+        }
+        for (j, (a, b)) in host.iter().zip(dev.iter()).enumerate() {
+            let rel = (a - b).abs() / a.abs().max(1e-30);
+            assert!(rel <= 1e-6, "j={j}: host={a} dev={b} rel={rel}");
+        }
     }
 
     /// P43: GPU 経路 (`Route::Vram`) を要求しても、CUDA が無い / expert が VRAM に

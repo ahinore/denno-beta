@@ -265,6 +265,30 @@ pub fn gdn_pf_kprof_lines() -> Vec<String> {
     Vec::new()
 }
 
+/// task 187: decode の IQ expert 段の層内 GPU 時間 (イベント計測) の 1 行。
+///
+/// 計測器は cuda.rs 側にあるので、cuda feature の有無をここで吸収する。
+#[cfg(feature = "cuda")]
+pub fn dec_exp_kprof_lines() -> Vec<String> {
+    crate::cuda::dec_exp_kprof::lines()
+}
+
+/// task 187: cuda 無しは常に空。
+#[cfg(not(feature = "cuda"))]
+pub fn dec_exp_kprof_lines() -> Vec<String> {
+    Vec::new()
+}
+
+/// task 187: 積算を 0 に戻す (cuda 無しは何もしない)。
+#[cfg(feature = "cuda")]
+pub fn dec_exp_kprof_reset() {
+    crate::cuda::dec_exp_kprof::reset()
+}
+
+/// task 187: cuda 無しは何もしない。
+#[cfg(not(feature = "cuda"))]
+pub fn dec_exp_kprof_reset() {}
+
 /// task 173: 計測の積算を 0 に戻す (cuda 無しは何もしない)。
 #[cfg(feature = "cuda")]
 pub fn gdn_pf_kprof_reset() {
@@ -506,8 +530,34 @@ pub const SUB_PF_GATE: usize = 12;
 pub const SUB_PF_SCAN: usize = 13;
 /// task 167: ssm 層の出力投影 (out_proj)。
 pub const SUB_PF_OUT: usize = 14;
+/// task 187: decode の expert 段の VRAM 参照 + segment 表の組み立て。
+pub const SUB_EXP_LOOKUP: usize = 15;
+/// task 187: decode の expert 段の作業域の確保 (`h` / `hs`)。
+pub const SUB_EXP_ALLOC: usize = 16;
+/// task 187: decode の expert ミスぶんの CPU 計算。
+pub const SUB_EXP_MISS: usize = 17;
+/// task 187: decode の expert 寄与のホスト足し込み (`out += w*h` / shared の足し込み)。
+pub const SUB_EXP_SUM: usize = 18;
+/// task 187: decode のミス expert の上げ直し (ページフォルト + H2D)。
+pub const SUB_EXP_UPLOAD: usize = 19;
+/// task 187: shared expert の gate/up の enqueue (router 期に積むぶん)。
+pub const SUB_SH_BEGIN: usize = 20;
+/// task 187: shared expert の join の**待ち**。
+pub const SUB_SH_WAIT: usize = 21;
+/// task 187: shared expert の join の**写し**。
+pub const SUB_SH_COPY: usize = 22;
+/// task 187: shared expert の silu / 積 / 作業域の確保。
+pub const SUB_SH_ELEM: usize = 23;
+/// task 187: shared expert の down の enqueue。
+pub const SUB_SH_SDOWN: usize = 24;
+/// task 187: shared expert の `gate_inp_shexp` (F32・1 行) の GEMV。
+pub const SUB_SH_SG: usize = 25;
+/// task 187: shared expert の出力の足し込み (`out += sh*sgw`) と RMS。
+pub const SUB_SH_ADD: usize = 26;
+/// task 187: decode の IQ expert 段の prologue (x / ポインタ表 / segment 表の H2D)。
+pub const SUB_EXP_PRO: usize = 27;
 /// 副区間の数。
-pub const SUB_N: usize = 15;
+pub const SUB_N: usize = 28;
 /// 副区間の名前 ([`SUB_NORM`] の順)。
 pub const SUB_NAMES: [&str; SUB_N] = [
     "norm",
@@ -525,6 +575,19 @@ pub const SUB_NAMES: [&str; SUB_N] = [
     "beta_pf",
     "scan_pf",
     "out_pf",
+    "exp_lookup",
+    "exp_alloc",
+    "exp_miss",
+    "exp_sum",
+    "exp_upload",
+    "sh_begin",
+    "sh_wait",
+    "sh_copy",
+    "sh_elem",
+    "sh_sdown",
+    "sh_sg",
+    "sh_add",
+    "exp_pro",
 ];
 
 /// 親 × 副区間の壁時計 (ns)。
@@ -682,6 +745,34 @@ pub fn line(tok: usize, wall_ns: u64) -> Vec<String> {
             r.h2d_calls as f64 / d,
             r.d2h_bytes as f64 / 1e6 / d,
             r.d2h_calls as f64 / d,
+        ));
+    }
+    // task 187: decode の副区間 (親ごとの内訳)。`cpu` 列 (wall - launch - sync -
+    // コピー) の中身を名前で割るためのもの。0 でないものだけ出し、`*` は
+    // 「他の副区間の内側にも入る」もの。
+    let nested = [SUB_DEQUANT];
+    let sub_ms = |ns: u64| ns as f64 / 1e6 / d;
+    for &p in &[MIX, ROUTER, SHARED, FULL, SSM, EXPERTS, HEAD, OTHER] {
+        let mut parts: Vec<String> = Vec::new();
+        let mut sum = 0u64;
+        for i in 0..SUB_N {
+            let ns = SUBS[p][i].load(Ordering::Relaxed);
+            if ns == 0 {
+                continue;
+            }
+            sum += ns;
+            let mark = if nested.contains(&i) { "*" } else { "" };
+            parts.push(format!("{}{}={:.2}", SUB_NAMES[i], mark, sub_ms(ns)));
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        out.push(format!(
+            "[q4ledger]   sub {:<7} sum={:.2} of {:.2}ms/tok  {}",
+            NAMES[p],
+            sub_ms(sum),
+            sub_ms(rows[p].wall_ns),
+            parts.join(" ")
         ));
     }
     // task 153: イベント時系列 (GPU の span / busy / idle)。`DENNO_Q4_TLINE` のときだけ。
@@ -1061,6 +1152,48 @@ mod tests {
         assert_eq!(r.d2h_bytes, 400 + 3000 + 11 + 13 + 21);
         reset();
         assert_eq!(sub_bytes_of(SSM, SUB_PF_QKV, true), (0, 0), "reset で消えない");
+        set_for_test(false);
+    }
+
+    /// task 187: decode の `line` も副区間の行を出す (cpu 列の中身を名前で割る)。
+    ///
+    /// 親は `experts` / `shared` の 2 本。0 の副区間は出さない。
+    #[test]
+    fn decode_line_prints_expert_and_shared_subs() {
+        let _g = lock();
+        set_for_test(true);
+        reset();
+        {
+            let _e = enter(EXPERTS);
+            {
+                let _s = sub(SUB_EXP_LOOKUP);
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            {
+                let _s = sub(SUB_EXP_SUM);
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+        {
+            let _h = enter(SHARED);
+            let _s = sub(SUB_SH_WAIT);
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        let lines = line(2, 20_000_000);
+        let exp = lines
+            .iter()
+            .find(|l| l.contains("sub experts"))
+            .expect("experts の副区間の行が無い");
+        assert!(exp.contains("exp_lookup="), "{exp}");
+        assert!(exp.contains("exp_sum="), "{exp}");
+        let sh = lines
+            .iter()
+            .find(|l| l.contains("sub shared"))
+            .expect("shared の副区間の行が無い");
+        assert!(sh.contains("sh_wait="), "{sh}");
+        // 積んでいない副区間は出ない (列が増えない)。
+        assert!(!exp.contains("exp_miss="), "{exp}");
+        reset();
         set_for_test(false);
     }
 

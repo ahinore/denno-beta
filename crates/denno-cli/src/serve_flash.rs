@@ -467,6 +467,13 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
             eprintln!("{line}");
         }
     }
+    // task 187: decode の IQ expert 段の層内 GPU 時間 (PROFILE のときだけ)。
+    if tag == "decode" {
+        for line in denno_engine::model::q4ledger::dec_exp_kprof_lines() {
+            eprintln!("{line}");
+        }
+        denno_engine::model::q4ledger::dec_exp_kprof_reset();
+    }
     // task 173: GDN prefill 連鎖の段ごとの GPU 時間 (`DENNO_GDN_PF_KPROF=1`)。
     // 台帳の `qkv_pf` / `scan_pf` / `out_pf` は「発行 + 同期の待ち」の壁時計なので、
     // イベントで測った段の GPU 時間と並べると「待ち」が分離できる。
