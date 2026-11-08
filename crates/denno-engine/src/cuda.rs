@@ -27787,15 +27787,18 @@ const GDN_PF_SCAN_THREADS: usize = 512;
 
 /// `DENNO_GDN_PF_FAST` の値の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
 ///
-/// 既定 off: lab で採否を決めてから on にする (task 173)。
+/// 既定 on: lab t174b (SHA 99807fa7d、新ホスト、SCENARIO=depth8k、PROFILE=1) で採用。
+/// cold prefill 3,826 tok 20.55 -> 19.74 s (-4.0%)、14,018 tok 71.70 -> 66.80 s (-6.8%)、
+/// decode は 1 トークンあたりの合計で -0.4 〜 +0.4% (median の ±1 ms は量子化)、
+/// base COND は errors 0 のまま。md5 DIFF は縮約順の差 (仕様)。
 pub(crate) fn gdn_pf_fast_from_value(v: Option<&str>) -> bool {
     match v.map(|s| s.trim().to_ascii_lowercase()) {
-        None => false,
+        None => true,
         Some(s) => !matches!(s.as_str(), "0" | "off" | "false" | "no" | ""),
     }
 }
 
-/// 新しいスキャンカーネルを使うか (既定 off)。
+/// 新しいスキャンカーネルを使うか (既定 on)。
 pub(crate) fn gdn_pf_fast_on() -> bool {
     #[cfg(test)]
     {
@@ -27848,10 +27851,10 @@ pub(crate) fn gdn_pf_fast_eligible(
 mod gdn_pf_fast_tests {
     use super::*;
 
-    /// ゲートの真理値表 (既定は off)。
+    /// ゲートの真理値表 (既定は on。lab t174b で採用)。
     #[test]
     fn gate_truth_table() {
-        assert!(!gdn_pf_fast_from_value(None), "未設定は既定 off");
+        assert!(gdn_pf_fast_from_value(None), "未設定は既定 on");
         for v in ["0", "off", "false", "no", "", " OFF "] {
             assert!(!gdn_pf_fast_from_value(Some(v)), "{v}");
         }

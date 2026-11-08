@@ -6739,15 +6739,22 @@ fn gdn_pf_scan_kernel_is_wired() {
     );
 }
 
-/// ゲート (`DENNO_GDN_PF_FAST`) の既定は off。採否を lab で決めるまで on にしない。
+/// ゲート (`DENNO_GDN_PF_FAST`) の既定は **on**。lab t174b (2026-11-08、SHA
+/// 99807fa7d) で採用: cold prefill 3,826 tok 20.55 -> 19.74 s、14,018 tok
+/// 71.70 -> 66.80 s、decode は合計で ±0.4% 以内、errors 0。off に戻すときは
+/// ここも直す (うっかり既定を戻したら落ちる)。
 #[test]
-fn gdn_pf_fast_gate_defaults_off() {
+fn gdn_pf_fast_gate_defaults_on() {
     assert!(
         CUDA_RS.contains("Some(s) => !matches!(s.as_str(), \"0\" | \"off\" | \"false\" | \"no\" | \"\"),"),
         "gdn_pf_fast_from_value の真理値表が変わった"
     );
+    let i = CUDA_RS
+        .find("pub(crate) fn gdn_pf_fast_from_value")
+        .expect("gdn_pf_fast_from_value が無い");
+    let body = &CUDA_RS[i..(i + 400).min(CUDA_RS.len())];
     assert!(
-        CUDA_RS.contains("None => false,"),
-        "gdn_pf_fast_from_value(None) が off でない"
+        body.contains("None => true,"),
+        "gdn_pf_fast_from_value(None) が on でない: {body}"
     );
 }
