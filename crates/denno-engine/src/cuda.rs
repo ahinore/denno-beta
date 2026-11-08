@@ -18382,6 +18382,25 @@ pub(crate) fn q4_mirror_cap(need: usize, old: usize) -> usize {
     target.max(old.saturating_mul(2))
 }
 
+/// task 174: 投機読み 1 行ぶんの余白。
+///
+/// flashdec (`kernels_attn_dec.cu` の `dno_attn_flashdec`) は 2 段パイプラインの
+/// 先読みで**分割の終端の 1 行先** `jhi` を読む。最終分割ではそれが `t_total`
+/// 行目 = テンソルの外で、読んだ値は使わない (ループはその手前で終わる) が、
+/// `t_total` がミラーの cap とちょうど等しいとき (len = 4,096 / cap = 4,096 など)
+/// にその 1 行が**確保の外**を踏み、`cuCtxSynchronize` が error 700 になる。
+/// lab t174a の失敗はまさに len=4,096 (= cap) の 1 回目で、1 行先を指す
+/// `H2D@ ... +8,386,560 B` (= 4,095 行目) の直後だった。
+///
+/// ミラーの確保だけ cap + 1 行に増やして、この投機読みを確保の内側に収める
+/// (台帳の cap は変えないので、成長の段も分割数も今までどおり)。
+const ATTN_MIRROR_GUARD_ROWS: usize = 1;
+
+/// ミラー 1 本の確保行数 (台帳の cap + 投機読みの余白)。
+fn q4_mirror_alloc_rows(cap: usize) -> usize {
+    cap.saturating_add(ATTN_MIRROR_GUARD_ROWS)
+}
+
 /// ミラーが既に正しく持っている行数。世代が違う / 縮んだら 0 (全行 H2D)。
 pub(crate) fn q4_mirror_have(st: &Q4MirrorState, li: usize, len: usize, gen: u64) -> usize {
     if li >= st.len.len() {
@@ -18404,8 +18423,10 @@ pub(crate) fn q4_mirror_note(st: &mut Q4MirrorState, li: usize, len: usize, gen:
 
 /// ミラーの使用バイト数 `cap 行 x kv_dim x 4 B x K/V x 使った層数`。
 /// 使っていない層 (ssm 層) は確保しないので、その分は数えない。
+/// task 174: 実確保は投機読みの余白 (`ATTN_MIRROR_GUARD_ROWS`) を含む。
 pub(crate) fn q4_mirror_bytes(cap: usize, kv_dim: usize, used_layers: usize) -> usize {
-    cap.saturating_mul(kv_dim)
+    q4_mirror_alloc_rows(cap)
+        .saturating_mul(kv_dim)
         .saturating_mul(4)
         .saturating_mul(2)
         .saturating_mul(used_layers)
@@ -18462,7 +18483,7 @@ pub fn q4_attn_mirror_stats() -> Option<(usize, usize, usize)> {
 /// ここで絞らないと VRAM が 4 倍になる (65,536 行で 12 GiB)。
 /// 失敗したら呼び出し側がエントリごと捨てる。
 fn q4_attn_grow(m: &mut Q4AttnMirror, new_cap: usize, kv_dim: usize) -> Result<()> {
-    let bytes = new_cap
+    let bytes = q4_mirror_alloc_rows(new_cap)
         .checked_mul(kv_dim)
         .and_then(|v| v.checked_mul(4))
         .ok_or_else(|| anyhow!("q4 attn mirror: cap {new_cap} が大きすぎる"))?;
@@ -18505,7 +18526,7 @@ fn q4_attn_mirror_sync(
         q4_attn_grow(m, new_cap, kv_dim)?;
     }
     if m.k[layer].is_none() || m.v[layer].is_none() {
-        let bytes = m.state.cap * kv_dim * 4;
+        let bytes = q4_mirror_alloc_rows(m.state.cap) * kv_dim * 4;
         m.k[layer] = Some(DevBuffer::alloc_tagged(
             bytes,
             crate::mem_audit::TAG_ATTN_MIRROR,
@@ -18527,7 +18548,7 @@ fn q4_attn_mirror_sync(
             m.state.cap
         );
     }
-    let need_bytes = len
+    let need_bytes = q4_mirror_alloc_rows(len)
         .checked_mul(kv_dim)
         .and_then(|v| v.checked_mul(4))
         .ok_or_else(|| anyhow!("q4 attn mirror: len*kv_dim が溢れた ({len} x {kv_dim})"))?;
@@ -22310,6 +22331,13 @@ mod q4_attn_tests {
             assert!(new_cap >= len, "cap {new_cap} < len {len}");
             assert!(new_cap.is_power_of_two(), "cap {new_cap} が 2 の冪でない");
             assert!(new_cap >= 1024, "cap {new_cap} が下限 1,024 未満");
+            // task 174: flashdec は分割の終端の 1 行先を投機読みする。確保は
+            // cap + 余白なので、len が cap とちょうど等しくても (4,096) 読める。
+            assert!(
+                q4_mirror_alloc_rows(new_cap) > len,
+                "len={len}, cap={new_cap}: 投機読み 1 行ぶんの余白が無い"
+            );
+            assert_eq!(q4_mirror_alloc_rows(new_cap), new_cap + 1);
             // 成長時の D2D で温存する行数 (q4_attn_grow の keep と同じ式)。
             let keep = st.len[0].min(new_cap);
             assert_eq!(
@@ -22355,6 +22383,49 @@ mod q4_attn_tests {
             let part_floats = heads * n_split * (dh + ATTN_FDEC_PART_EXTRA);
             assert_eq!(last, part_floats - 1, "part の末尾が 1 要素ずれる (len={len})");
         }
+        // task 174: 失敗の直接原因。flashdec の 2 段パイプラインは `++j` のあと
+        // `if (j < jhi)` で `j + 1` を先読みするので、**分割の終端 jhi の 1 行先**
+        // まで読む。最終分割では jhi = t_total なので、確保が t_total 行ちょうど
+        // (len = cap = 4,096) だと確保の外を踏む。ここではその最大行を数える。
+        for &len in &[4033usize, 4096, 8192] {
+            let (n_split, _) = q4_fdec_split(len, ATTN_FLASHDEC_CHUNK_DEFAULT);
+            let chunk = len.div_ceil(n_split);
+            let mut max_read = 0usize;
+            for sp in 0..n_split {
+                let jlo = sp * chunk;
+                let jhi = (jlo + chunk).min(len);
+                let mut j = jlo;
+                if j < jhi {
+                    max_read = max_read.max(j);
+                }
+                if j + 1 < jhi {
+                    max_read = max_read.max(j + 1);
+                }
+                while j < jhi {
+                    j += 1;
+                    if j < jhi {
+                        max_read = max_read.max(j + 1); // A の先読み
+                    }
+                    if j >= jhi {
+                        break;
+                    }
+                    j += 1;
+                    if j < jhi {
+                        max_read = max_read.max(j + 1); // B の先読み
+                    }
+                }
+            }
+            assert!(max_read <= len, "先読みが len を超えた (len={len}, max={max_read})");
+            // 最終分割に 2 行以上あれば、その先読みは t_total 行目 (= len) を踏む。
+            if len - (n_split - 1) * chunk >= 2 {
+                assert_eq!(max_read, len, "先読みの最大行が len でない (len={len})");
+            }
+            assert!(
+                q4_mirror_alloc_rows(len) > max_read,
+                "len={len}: 先読みの {max_read} 行目が確保の外"
+            );
+        }
+
         // n_split が 64 に上がる境目 (lab の crash 点) の分割。
         assert_eq!(q4_fdec_split(4032, 64), (63, 64));
         assert_eq!(q4_fdec_split(4033, 64), (64, 64));
@@ -22504,7 +22575,11 @@ mod q4_attn_tests {
     fn q4_mirror_bytes_bounds_vram_at_max_ctx() {
         let (cap, kv_dim, full_layers, n_layer) = (65_536usize, 512usize, 12usize, 48usize);
         let used = q4_mirror_bytes(cap, kv_dim, full_layers);
-        assert_eq!(used, 3_221_225_472, "65,536 行 x 512 x 4 B x K/V x 12 層");
+        // task 174: 実確保は投機読みの余白 1 行を含む (65,537 行)。
+        assert_eq!(
+            used, 3_221_274_624,
+            "65,536 行 (+ 余白 1 行) x 512 x 4 B x K/V x 12 層"
+        );
         assert!(used < 3_300_000_000, "3.3 GB 未満でない: {used}");
         assert!(
             used <= q4_attn_mirror_limit_from(None),
