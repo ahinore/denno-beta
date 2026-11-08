@@ -7154,3 +7154,224 @@ fn pf_sn_gemm_is_bf16_mma_and_q4k() {
         "gemm_tc2 の spec 行が変わった"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 183: shared expert の BM=64 版 (`kernels_gemm_sn2.cu`)
+// ---------------------------------------------------------------------------
+
+const SN2_SRC: &str = include_str!("../kernels/kernels_gemm_sn2.cu");
+
+/// タイル定数・共有メモリ・起動形状がホスト (cuda.rs) と一致すること。
+///
+/// GPU 無しでも「片側だけ直した」事故はここで落ちる。数値の正しさ
+/// (`wmma` の意味) は GPU テストの担当。
+#[test]
+fn pf_sn2_gemm_tile_matches_host() {
+    let d = defines(SN2_SRC);
+    let bm = eval_define("TC_SN2_BM", &d);
+    let bn = eval_define("TC_SN2_BN", &d);
+    let bk = eval_define("TC_SN2_BK", &d);
+    let ld = eval_define("TC_SN2_LD", &d);
+    let thr = eval_define("TC_SN2_THREADS", &d);
+    let smem_def = eval_define("TC_SN2_SMEM_BYTES", &d);
+    // BM=64 が要点: N=640 で 10 x (M=512/64 = 8) = 80 ブロック (sn は 40)。
+    assert_eq!(bm, 64, "TC_SN2_BM が 64 でない (sn と同じ並列度になる)");
+    assert_eq!(bn, 64, "TC_SN2_BN が 64 でない (N=640 の並列度の根拠)");
+    assert_eq!(bk, 32, "TC_SN2_BK が 32 でない (Q8_0 の 1 ブロック = 32 要素)");
+    assert_eq!(ld, 40, "TC_SN2_LD が 40 でない (32 + 8 の詰め物)");
+    assert_eq!(thr, 256, "TC_SN2_THREADS が 256 でない");
+
+    // ホスト側のミラー定数 (cuda.rs) と一致すること。
+    assert_eq!(rust_const("TC_SN2_BM"), bm, "cuda.rs の TC_SN2_BM が不一致");
+    assert_eq!(rust_const("TC_SN2_BN"), bn, "cuda.rs の TC_SN2_BN が不一致");
+    assert_eq!(rust_const("TC_SN2_BK"), bk, "cuda.rs の TC_SN2_BK が不一致");
+    assert_eq!(rust_const("TC_SN2_LD"), ld, "cuda.rs の TC_SN2_LD が不一致");
+    assert_eq!(
+        rust_const("TC_SN2_SMEM_BYTES"),
+        smem_def,
+        "cuda.rs の TC_SN2_SMEM_BYTES が不一致"
+    );
+    assert_eq!(
+        rust_const("TC_SN2_MAX_TOKENS"),
+        2048,
+        "まとめ幅が sn / tc2 と違う (gemm_try の分割規則が変わる)"
+    );
+
+    // warp の配置: (BM/32) トークン群 × (BN/16) 行群 = 8 warp、1 warp あたり 2 タイル。
+    let warps = (bm / 32) * (bn / 16);
+    assert_eq!(warps, 8, "warp 数が 8 でない");
+    assert_eq!(warps * 32, thr, "1 ブロックのスレッド数が warps * 32 でない");
+    assert!(
+        SN2_SRC.contains("wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];"),
+        "アキュムレータが 2 個の 16x16 でない (BM=64 の 2 トークンタイル)"
+    );
+
+    // 共有メモリはカーネルの静的配列 (ホストは動的 smem を渡さない)。
+    for decl in [
+        "__shared__ __align__(32) __nv_bfloat16 sW[2 * TC_SN2_BN * TC_SN2_LD];",
+        "__shared__ __align__(32) __nv_bfloat16 sX[2 * TC_SN2_BM * TC_SN2_LD];",
+    ] {
+        assert!(SN2_SRC.contains(decl), "共有メモリの宣言が変わった: {decl}");
+    }
+    assert_eq!(eval_define("TC_SN2_SW_ELEMS", &d), 2 * bn * ld);
+    assert_eq!(eval_define("TC_SN2_SX_ELEMS", &d), 2 * bm * ld);
+    let expect_smem = 2 * bn * ld * 2 + 2 * bm * ld * 2;
+    assert_eq!(expect_smem, smem_def, "TC_SN2_SMEM_BYTES の見積りが違う");
+    assert!(
+        expect_smem <= 48 * 1024,
+        "静的共有メモリ {expect_smem} B が 48 KiB を超える"
+    );
+    // 端数ステージは sX を作業域に再利用する (追加の smem を持たない)。
+    assert!(
+        SN2_SRC.contains("float* st = reinterpret_cast<float*>(sX) + warp * 256;"),
+        "端数ステージが sX の再利用になっていない"
+    );
+
+    // 起動形状: blockDim 256・動的 smem 0・grid x は n_out / TC_SN2_BN。
+    assert!(
+        SN2_SRC.contains("const int n0 = blockIdx.x * TC_SN2_BN;"),
+        "1 ブロックの列範囲が TC_SN2_BN でない"
+    );
+    assert!(
+        CUDA_RS.contains("let grid_x = (n_out / TC_SN2_BN) as u32;"),
+        "ホストの grid x が TC_SN2_BN で割っていない"
+    );
+    assert!(
+        CUDA_RS.contains("const TC_SN2_BN: usize = 64;"),
+        "cuda.rs に TC_SN2_BN のミラーが無い"
+    );
+    assert!(
+        SN2_SRC.contains("const int row = tid >> 2;   // 0..63"),
+        "重みステージの行範囲が 64 行でない"
+    );
+}
+
+/// BF16 の tensor core 経路・2 つの型の入口・Q4_K のビット配置 (sn と同一)。
+#[test]
+fn pf_sn2_gemm_is_bf16_mma_and_q4k() {
+    assert!(
+        SN2_SRC.contains("#include <mma.h>") && SN2_SRC.contains("#include <cuda_bf16.h>"),
+        "BF16 の wmma ヘッダが無い"
+    );
+    assert!(
+        SN2_SRC.contains(
+            "wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major>"
+        ) && SN2_SRC
+            .contains("wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major>"),
+        "A が row_major / B が col_major の 16x16x16 bf16 でない (重みの行 = B の列)"
+    );
+    for name in ["dno_gemm_sn2_q8_0_w", "dno_gemm_sn2_q4k_w"] {
+        assert!(
+            SN2_SRC.contains(&format!("extern \"C\" __global__ void {name}(")),
+            "入口 {name} が無い"
+        );
+        assert!(
+            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            "cuda.rs が {name} を読んでいない"
+        );
+    }
+    assert!(
+        SN2_SRC.contains("(size_t)(k0 >> 5) * 34u") && SN2_SRC.contains("blk + 2 + j"),
+        "Q8_0 のブロック配置が sn と違う"
+    );
+    assert!(
+        SN2_SRC.contains("(size_t)sb * 144u") && SN2_SRC.contains("dno_sn2_scale_min_k4"),
+        "Q4_K のスーパーブロック / 6bit scale の展開が sn と違う"
+    );
+    assert!(
+        SN2_SRC.contains("const int shift = (sub & 1) ? 4 : 0;"),
+        "サブブロックの nibble 選択が無い"
+    );
+    // 2 段プリフェッチ: 読む → mma → 書く の順。
+    let loop_at = SN2_SRC
+        .find("for (int k = 0; k < kb; ++k)")
+        .expect("k ループが無い");
+    let body = &SN2_SRC[loop_at..];
+    let load_w = body
+        .find("dno_sn2_load_w<TY>(")
+        .expect("ループ内に重みの先読みが無い");
+    let mma = body.find("wmma::mma_sync(").expect("ループ内に mma が無い");
+    let store = body
+        .find("dno_sn2_store8(sW + nxt")
+        .expect("ループ内に smem への書き込みが無い");
+    assert!(
+        load_w < mma && mma < store,
+        "プリフェッチの順序が「読む → mma → 書く」でない (レイテンシが隠れない)"
+    );
+    // build_ptx.sh: compute_90 (bf16 mma) で targets_all に入っていること。
+    assert!(
+        BUILD_PTX_SH.contains("gemm_sn2)     echo \"kernels_gemm_sn2.cu|fmad|compute_90\""),
+        "build_ptx.sh の gemm_sn2 が compute_90 でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gemm_sn2"),
+        "build_ptx.sh の targets_all に gemm_sn2 が無い: {targets}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 183: 融合 qkv の後処理 (`kernels_pf3.cu`)
+// ---------------------------------------------------------------------------
+
+const PF3_SRC: &str = include_str!("../kernels/kernels_pf3.cu");
+
+/// 融合バッファの行ストライド `ld` を受ける 2 本の入口と、その式。
+///
+/// 式は kernels_pf2.cu の同名カーネルと同じでなければならない
+/// (gate は sigmoid の掛け算、gather は行のコピー)。
+#[test]
+fn pf3_kernels_gate_and_gather() {
+    assert!(
+        PF3_SRC.contains("extern \"C\" __global__ void dno_pf3_gate_mul("),
+        "dno_pf3_gate_mul が無い"
+    );
+    assert!(
+        PF3_SRC.contains("extern \"C\" __global__ void dno_pf3_gather("),
+        "dno_pf3_gather が無い"
+    );
+    assert!(
+        CUDA_RS.contains("b\"dno_pf3_gate_mul\\0\"") && CUDA_RS.contains("b\"dno_pf3_gather\\0\""),
+        "cuda.rs が pf3 の入口を読んでいない"
+    );
+    // gate: qg の 1 トークンあたりの行数は ld (融合 1 本なら 13,312)。
+    assert!(
+        PF3_SRC.contains("int ld)") && PF3_SRC.contains("(size_t)t * (size_t)ld"),
+        "gate が ld を受けていない (融合バッファを読めない)"
+    );
+    assert!(
+        PF3_SRC.contains("((size_t)h * 2 + 1) * (size_t)dh"),
+        "gate の列位置が [q|gate] の後半 (h*2*dh + dh) でない"
+    );
+    assert!(
+        PF3_SRC.contains("__fdiv_rn(1.0f, __fadd_rn(1.0f, e))"),
+        "gate の sigmoid の式が pf2 と違う"
+    );
+    // gather: dst[t][i] = src[t][ld + off + i]。
+    assert!(
+        PF3_SRC.contains("dst[(size_t)t * (size_t)n + (size_t)i] =")
+            && PF3_SRC.contains("src[(size_t)t * (size_t)ld + (size_t)off + (size_t)i];"),
+        "gather の索引が「行 t / 列 off + i」でない"
+    );
+    // 両方 -fmad=false (pf2 と同じ丸め)。build_ptx.sh の target も見る。
+    assert!(
+        BUILD_PTX_SH.contains("pf3)          echo \"kernels_pf3.cu|nofmad\""),
+        "build_ptx.sh の pf3 が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("pf3"),
+        "build_ptx.sh の targets_all に pf3 が無い: {targets}"
+    );
+    // 既存の pf2 の spec はそのまま (既存カーネルの丸めを変えていないこと)。
+    assert!(
+        BUILD_PTX_SH.contains("pf2)          echo \"kernels_pf2.cu|nofmad\""),
+        "pf2 の spec 行が変わった"
+    );
+}

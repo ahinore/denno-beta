@@ -15098,6 +15098,276 @@ fn sn_gemm_launch(
     Ok(())
 }
 
+// ===========================================================================
+// task 183: shared expert の射影を 1 ブロック 64 トークンで回す (`DENNO_PF_TC_SHARED2`)
+// ===========================================================================
+//
+// lab t181c の台帳 (14,018 トークン cold prefill、既定) では shared が
+// 2,406 ms (gpu 1,220 ms = 5.4 TFLOP/s) で、まだレイテンシ律速だった。
+// sn (BM=128) の N=640 は M=512 のチャンクで 10 行タイル x 4 = 40 ブロック
+// しか出ず、RTX 5090 の 170 SM の 24% しか埋めない。BM=64 にすると
+// 10 x 8 = 80 ブロック (47%) になる。加算順は sn と同じ (k 昇順) なので
+// sn とビット一致し、md5 は sn のまま (lab で確認する)。
+//
+// PTX: `bash build_ptx.sh gemm_sn2` (compute_90)。
+
+/// 1 ブロックのタイル (`kernels_gemm_sn2.cu` の TC_SN2_BM / BN / BK と一致)。
+const TC_SN2_BM: usize = 64;
+const TC_SN2_BN: usize = 64;
+const TC_SN2_BK: usize = 32;
+/// 共有メモリの行ストライド (`TC_SN2_LD`。tc2 / sn と同じ 8 要素の詰め物)。
+const TC_SN2_LD: usize = 40;
+/// 静的共有メモリの合計 (`TC_SN2_SMEM_BYTES` = sW 2 x 64 x 40 x 2 + sX 2 x 64 x 40 x 2)。
+const TC_SN2_SMEM_BYTES: usize = 20_480;
+/// 1 起動でまとめるトークン数の上限 (sn と同じ)。
+const TC_SN2_MAX_TOKENS: usize = 2048;
+
+/// smem の見積りがカーネル側の `TC_SN2_SMEM_BYTES` と一致することのコンパイル時検査。
+const _: [(); TC_SN2_SMEM_BYTES] =
+    [(); 2 * TC_SN2_BN * TC_SN2_LD * 2 + 2 * TC_SN2_BM * TC_SN2_LD * 2];
+
+/// `DENNO_PF_TC_SHARED2` の値の解釈 (純関数)。明示的な偽値だけ off。
+///
+/// **既定 on** (lab t183a で採用)。off のときは sn (BM=128) のまま。
+/// lab t183a (depth8k、14,018 トークン) の実測: sn2 単独で shared の gpu が
+/// 1,201.0 → 1,143.5 ms (-4.8%)、cold prefill 51.58 → 50.11 s、**md5 は base と
+/// 完全一致** (sn と同じ k 昇順のアキュムレートなので値が変わらない)。
+pub(crate) fn pf_tc_shared2_from_value(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) => matches!(s.as_str(), "1" | "on" | "true" | "yes"),
+        None => true,
+    }
+}
+
+/// shared expert の射影を BM=64 のカーネルで回すか (**既定 on**。`0` で切る)。
+pub(crate) fn pf_tc_shared2_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_TC_SN2_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_tc_shared2_from_value(std::env::var("DENNO_PF_TC_SHARED2").ok().as_deref())
+    })
+}
+
+#[cfg(test)]
+static PF_TC_SN2_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_tc_shared2_for_test(v: Option<bool>) {
+    PF_TC_SN2_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// この形を BM=64 のカーネルで回せるか (純関数。sn と同じ条件 + 行数)。
+///
+/// `nt >= TC_SN2_BM` を要求する: それ未満 (19 トークンの next turn prefill など)
+/// ではタイルが埋まらず、sn (BM=128) と仕事量が変わらないため。
+pub(crate) fn pf_tc_smalln2_eligible(
+    ty: crate::kquant::GgmlType,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    min_m: usize,
+) -> bool {
+    pf_tc_smalln_type_ok(ty)
+        && pf_tc2_k_ok(ty, n_in)
+        && nt >= min_m.max(TC_SN2_BM)
+        && n_out > 0
+        && n_out % TC_SN2_BN == 0
+        && n_out < TC2_MIN_N
+}
+
+/// 立つブロック数 (純関数。診断・テスト用)。
+#[cfg(test)]
+pub(crate) fn pf_tc_smalln2_blocks(nt: usize, n_out: usize) -> usize {
+    if n_out % TC_SN2_BN != 0 {
+        return 0;
+    }
+    (n_out / TC_SN2_BN) * nt.div_ceil(TC_SN2_BM)
+}
+
+/// BM=64 のカーネル (PTX は実行時読み込み)。
+struct Sn2Gemm {
+    /// モジュールは生かしておく必要がある (関数ハンドルの持ち主)。
+    #[allow(dead_code)]
+    module: CUmodule,
+    q8_0: CUfunction,
+    q4k: CUfunction,
+}
+
+unsafe impl Send for Sn2Gemm {}
+unsafe impl Sync for Sn2Gemm {}
+
+static SN2_GEMM: OnceLock<Option<Sn2Gemm>> = OnceLock::new();
+
+/// PTX の置き場所。`DENNO_PF_SN2_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_gemm_sn2.ptx`。
+fn sn2_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF_SN2_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gemm_sn2.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+/// **current context を張った後に呼ぶこと**。
+fn tc_smalln2_kernels() -> Option<&'static Sn2Gemm> {
+    SN2_GEMM
+        .get_or_init(|| {
+            let path = sn2_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[pf-sn2] PTX が読めない ({}) : {e} → sn / 従来の GEMM へ",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            image.push(0);
+            let lib = lib().ok()?;
+            let mut module: CUmodule = std::ptr::null_mut();
+            unsafe {
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[pf-sn2] cuModuleLoadData 失敗 → sn / 従来の GEMM へ");
+                    return None;
+                }
+                let mut q8_0: CUfunction = std::ptr::null_mut();
+                let mut q4k: CUfunction = std::ptr::null_mut();
+                for (dst, name, label) in [
+                    (
+                        &mut q8_0,
+                        b"dno_gemm_sn2_q8_0_w\0".as_ptr(),
+                        "dno_gemm_sn2_q8_0_w",
+                    ),
+                    (
+                        &mut q4k,
+                        b"dno_gemm_sn2_q4k_w\0".as_ptr(),
+                        "dno_gemm_sn2_q4k_w",
+                    ),
+                ] {
+                    if (lib.module_get_function)(dst, module, name as *const c_char)
+                        != CUDA_SUCCESS
+                    {
+                        eprintln!("[pf-sn2] PTX に {label} が無い → sn / 従来の GEMM へ");
+                        return None;
+                    }
+                }
+                Some(Sn2Gemm {
+                    module,
+                    q8_0,
+                    q4k,
+                })
+            }
+        })
+        .as_ref()
+}
+
+/// 型ごとのカーネル (純関数)。
+fn sn2_func(fns: &Sn2Gemm, ty: crate::kquant::GgmlType) -> Option<CUfunction> {
+    use crate::kquant::GgmlType as T;
+    match ty {
+        T::Q8_0 => Some(fns.q8_0),
+        T::Q4K => Some(fns.q4k),
+        _ => None,
+    }
+}
+
+/// BM=64 のカーネルを `TC_SN2_MAX_TOKENS` 行ずつ起動する (w / x / out はデバイス)。
+#[allow(clippy::too_many_arguments)]
+fn sn2_gemm_launch(
+    ctx: &CudaCtx,
+    fns: &Sn2Gemm,
+    ty: crate::kquant::GgmlType,
+    wptr: CUdeviceptr,
+    xptr: CUdeviceptr,
+    optr: CUdeviceptr,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+    row_bytes: usize,
+) -> Result<()> {
+    if nt == 0 {
+        return Ok(());
+    }
+    let Some(f) = sn2_func(fns, ty) else {
+        bail!("sn2_gemm_launch: 未対応の型 {ty:?}");
+    };
+    let grid_x = (n_out / TC_SN2_BN) as u32;
+    let mut t0 = 0usize;
+    while t0 < nt {
+        let m = (nt - t0).min(TC_SN2_MAX_TOKENS);
+        let grid_y = m.div_ceil(TC_SN2_BM) as u32;
+        let (mut pw, mut px, mut po) = (
+            wptr,
+            xptr + (t0 * n_in * 4) as CUdeviceptr,
+            optr + (t0 * n_out * 4) as CUdeviceptr,
+        );
+        let (mut m_c, mut ni_c, mut no_c, mut rb_c) = (
+            m as c_int,
+            n_in as c_int,
+            n_out as c_int,
+            row_bytes as c_int,
+        );
+        let mut args = [
+            &mut pw as *mut _ as *mut c_void,
+            &mut px as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut m_c as *mut _ as *mut c_void,
+            &mut ni_c as *mut _ as *mut c_void,
+            &mut no_c as *mut _ as *mut c_void,
+            &mut rb_c as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            ctx.launch_async(f, (grid_x, grid_y, 1), (256, 1, 1), 0, &mut args)?;
+        }
+        t0 += m;
+    }
+    Ok(())
+}
+
+/// shared expert 用の GEMM 入口 (task 183)。
+///
+/// `DENNO_PF_TC_SHARED2` が on で形が合えば BM=64 のカーネル、それ以外は
+/// 従来の [`pf2_gemm`] (sn / v2 / v1 / 従来カーネルの順)。同期はしない。
+#[allow(clippy::too_many_arguments)]
+fn pf2_gemm_shared(
+    ctx: &CudaCtx,
+    w: CUdeviceptr,
+    kind: PfWKind,
+    x: CUdeviceptr,
+    y: CUdeviceptr,
+    nt: usize,
+    n_in: usize,
+    n_out: usize,
+) -> Result<()> {
+    if let PfWKind::Quant(ty, _, rb, _) = kind {
+        if pf_tc_shared2_on() && pf_tc_smalln2_eligible(ty, nt, n_in, n_out, 1) {
+            if let Some(sn2) = tc_smalln2_kernels() {
+                return sn2_gemm_launch(ctx, sn2, ty, w, x, y, nt, n_in, n_out, rb);
+            }
+        }
+    }
+    pf2_gemm(ctx, w, kind, x, y, nt, n_in, n_out)
+}
+
 #[cfg(test)]
 mod pf_tc_tests {
     use super::*;
@@ -15609,6 +15879,179 @@ mod pf_tc_tests {
                         let rows = nt - mrow;
                         assert!((1..=15).contains(&rows), "nt={nt} mrow={mrow}");
                     }
+                }
+            }
+        }
+    }
+
+    /// task 183: `DENNO_PF_TC_SHARED2` の真理値表 (既定 off。明示的な真値だけ on)。
+    #[test]
+    fn pf_tc_shared2_gate_truth_table() {
+        assert!(pf_tc_shared2_from_value(None), "未設定は既定 on (lab t183a で採用)");
+        for v in ["0", "off", "false", "no", "", " OFF "] {
+            assert!(!pf_tc_shared2_from_value(Some(v)), "{v}");
+        }
+        for v in ["1", "on", "true", "yes", " ON "] {
+            assert!(pf_tc_shared2_from_value(Some(v)), "{v}");
+        }
+    }
+
+    /// task 183: テスト用の強制上書きが効き、戻すと env に戻ること。
+    #[test]
+    fn pf_tc_shared2_gate_force_switch() {
+        let before = pf_tc_shared2_on();
+        set_pf_tc_shared2_for_test(Some(true));
+        assert!(pf_tc_shared2_on());
+        set_pf_tc_shared2_for_test(Some(false));
+        assert!(!pf_tc_shared2_on());
+        set_pf_tc_shared2_for_test(None);
+        assert_eq!(pf_tc_shared2_on(), before);
+    }
+
+    /// task 183: 実形 (shared の gate/up = 2560->640、down = 640->2560) で
+    /// BM=64 のカーネルが選ばれること。19 トークンの next turn は sn に残す。
+    #[test]
+    fn pf_tc_smalln2_eligibility_real_shapes() {
+        use crate::kquant::GgmlType as T;
+        // 実形: gate/up は k=2560 -> n=640、down は k=640 -> n=2560。
+        // Q4_K は k が 256 の倍数のときだけ扱える (down の k=640 は Q8_0 のみ)。
+        for (ty, k, n) in [
+            (T::Q8_0, 2560usize, 640usize),
+            (T::Q8_0, 640, 2560),
+            (T::Q4K, 2560, 640),
+        ] {
+            assert!(
+                pf_tc_smalln2_eligible(ty, 512, k, n, 1),
+                "{ty:?} k={k} n={n}"
+            );
+            // 19 トークンはタイルが埋まらないので sn / 従来へ。
+            assert!(!pf_tc_smalln2_eligible(ty, 19, k, n, 1), "{ty:?} nt=19");
+            assert!(pf_tc_smalln2_eligible(ty, 64, k, n, 1), "{ty:?} nt=64");
+        }
+        // N >= 4096 は tc2 の担当、割り切れない N と未対応の型は受けない。
+        assert!(!pf_tc_smalln2_eligible(T::Q8_0, 512, 2560, 10240, 1));
+        assert!(!pf_tc_smalln2_eligible(T::Q8_0, 512, 2560, 641, 1));
+        assert!(!pf_tc_smalln2_eligible(T::Q5K, 512, 2560, 640, 1));
+        // k が 256 の倍数でない Q4_K は受けない (down の k=640 がこれ)。
+        assert!(!pf_tc_smalln2_eligible(T::Q4K, 512, 640, 2560, 1));
+    }
+
+    /// task 183: 立つブロック数。N=640 の M=512 で sn は 40、sn2 は 80。
+    #[test]
+    fn pf_tc_smalln2_blocks_count() {
+        assert_eq!(pf_tc_smalln2_blocks(512, 640), 80);
+        assert_eq!(pf_tc_smalln2_blocks(512, 2560), 320);
+        assert_eq!(pf_tc_smalln2_blocks(194, 640), 40);
+        assert_eq!(pf_tc_smalln2_blocks(64, 640), 10);
+        assert_eq!(pf_tc_smalln2_blocks(63, 640), 10);
+        assert_eq!(pf_tc_smalln2_blocks(512, 641), 0);
+        // sn (BM=128) との比較: 40 -> 80 になること (タスクの根拠)。
+        assert_eq!(pf_tc_smalln_blocks(512, 640), 40);
+        assert_eq!(pf_tc_smalln2_blocks(512, 640), 2 * pf_tc_smalln_blocks(512, 640));
+    }
+
+    /// task 183: BM=64 カーネルの索引算術を CPU ミラーで確かめる
+    /// (`kernels_gemm_sn2.cu` のステージ担当・warp の担当範囲・端数の条件)。
+    #[test]
+    fn pf_tc_smalln2_tile_index_mirror() {
+        // 1. 重みタイルと入力タイル: 256 スレッド × 8 要素 × 1 組が
+        //    [64][32] をちょうど 1 回覆う (sn は入力が 2 組)。
+        for what in ["重み", "入力"] {
+            let mut seen = vec![false; TC_SN2_BM * TC_SN2_BK];
+            for tid in 0..256usize {
+                let row = tid >> 2;
+                let j = (tid & 3) * 8;
+                assert!(row < TC_SN2_BM && j + 8 <= TC_SN2_BK, "{what}: row={row} j={j}");
+                for u in 0..8usize {
+                    let idx = row * TC_SN2_BK + j + u;
+                    assert!(!seen[idx], "{what}スロットの二重書き row={row} j={j}");
+                    seen[idx] = true;
+                }
+            }
+            assert!(seen.iter().all(|&b| b), "{what}スロットの取りこぼし");
+        }
+
+        // 2. warp のアキュムレータ (2 トークン群 × 4 行群 × 2 タイル) が
+        //    [64][64] をちょうど 1 回覆う。
+        let mut seen = vec![false; TC_SN2_BM * TC_SN2_BN];
+        for warp in 0..8usize {
+            let (wm, wn) = (warp & 1, warp >> 1);
+            assert_eq!(wn, warp / 2);
+            for i in 0..2usize {
+                let mrow = wm * 32 + i * 16;
+                assert_eq!(mrow % 16, 0);
+                let ncol = wn * 16;
+                assert_eq!(ncol % 16, 0);
+                for r in 0..16usize {
+                    for c in 0..16usize {
+                        let idx = (mrow + r) * TC_SN2_BN + ncol + c;
+                        assert!(!seen[idx], "アキュムレータの二重担当");
+                        seen[idx] = true;
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().all(|&b| b), "アキュムレータの取りこぼし");
+
+        // 3. 行ストライド (bf16 の ldm は 16 バイトの倍数) と smem の見積り。
+        assert_eq!(TC_SN2_LD % 8, 0);
+        assert_eq!(TC_SN2_LD * 2 % 16, 0);
+        assert!(TC_SN2_LD > TC_SN2_BK, "詰め物が無い (バンク衝突)");
+        let smem = 2 * TC_SN2_BN * TC_SN2_LD * 2 + 2 * TC_SN2_BM * TC_SN2_LD * 2;
+        assert_eq!(smem, TC_SN2_SMEM_BYTES, "共有メモリの合計が .cu と違う");
+        assert_eq!(smem, 20_480);
+        assert!(smem <= 48 * 1024);
+        assert!(
+            8 * 256 * 4 <= 2 * TC_SN2_BM * TC_SN2_LD * 2,
+            "端数ステージが sX に収まらない"
+        );
+
+        // 4. 端数タイル: 64 の倍数でない M で、ステージ経由の行数が 0..15。
+        for nt in [17usize, 63, 64, 65, 127, 193, 194, 511, 512, 513] {
+            for warp in 0..8usize {
+                let wm = warp & 1;
+                for i in 0..2usize {
+                    let mrow = wm * 32 + i * 16;
+                    if mrow < nt && mrow + 16 > nt {
+                        let rows = nt - mrow;
+                        assert!((1..=15).contains(&rows), "nt={nt} mrow={mrow}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// task 183: `dno_pf3_gather` の索引 (dst[t][i] = src[t][ld + off + i]) を
+    /// CPU で写して、融合バッファから v 行だけが抜けることを確かめる。
+    #[test]
+    fn pf3_gather_index_mirror() {
+        let (rows, ld, off, n) = (5usize, 13usize, 10usize, 3usize);
+        let src: Vec<f32> = (0..rows * ld).map(|i| i as f32).collect();
+        let mut dst = vec![0f32; rows * n];
+        for t in 0..rows {
+            for i in 0..n {
+                dst[t * n + i] = src[t * ld + off + i];
+            }
+        }
+        for t in 0..rows {
+            for i in 0..n {
+                assert_eq!(dst[t * n + i], (t * ld + off + i) as f32, "t={t} i={i}");
+            }
+        }
+        // gate の列位置: [q|gate] の gate は h*2*dh + dh + i。
+        let (heads, dh) = (2usize, 4usize);
+        let gate_ld = 2 * heads * dh + 2 * 2;
+        let mut qg = vec![0f32; 3 * gate_ld];
+        for t in 0..3 {
+            for c in 0..gate_ld {
+                qg[t * gate_ld + c] = (t * 1000 + c) as f32;
+            }
+        }
+        for t in 0..3 {
+            for h in 0..heads {
+                for i in 0..dh {
+                    let got = qg[t * gate_ld + (h * 2 + 1) * dh + i];
+                    assert_eq!(got, (t * 1000 + (h * 2 + 1) * dh + i) as f32);
                 }
             }
         }
@@ -18977,6 +19420,9 @@ fn pf2_kernels() -> Option<&'static Pf2Kernels> {
 struct Pf2Dev {
     x: Option<DevBuffer>,   // [nt][e]
     qg: Option<DevBuffer>,  // [nt][2*heads*dh]  (attn_q の生の射影)
+    /// task 183: 融合 qkv 1 本の生の射影 [nt][n_all] (n_all = 2*qd + 2*kv)。
+    /// `pf_full_qkv_fused` が撃ち、`pf_full_out` が gate をここから読む。
+    qkv: Option<DevBuffer>,
     q: Option<DevBuffer>,   // [nt][heads*dh]    (norm+rope 済み)
     kd: Option<DevBuffer>,  // [nt][kv_dim]
     vd: Option<DevBuffer>,  // [nt][kv_dim]
@@ -18999,6 +19445,7 @@ impl Pf2Dev {
         Self {
             x: None,
             qg: None,
+            qkv: None,
             q: None,
             kd: None,
             vd: None,
@@ -19453,6 +19900,328 @@ pub fn pf_full_qkv(
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 183: 融合済み qkv (ファイル上で q|gate|k|v が 1 本) の full 層 1 チャンク
+// ---------------------------------------------------------------------------
+//
+// lab t181c (14,018 トークン cold prefill 53.18 s、既定) の台帳では full が
+// 6,964 ms (gpu 3,059 / cpu 2,922 / h2d 7.7 GB / d2h 10.7 GB) で、d2h の
+// 10.68 GB は **qkv の射影出力 8.96 GB + 出力投影 1.72 GB** とぴったり一致する
+// (12 層 x 14,018 トークン x (13,312 + 2,560) x 4 B)。内訳は REPORT_P183.md の表。
+//
+// 12 本の full 層のうち 8 本は attn_q が k=2560 n=13312 の 1 本に融合していて
+// `pf_full_qkv` の「行列ごとに重みポインタが取れる」前提を満たさない
+// (`FusedLinear::is_fused()` が真 → br172 の連鎖は断念していた)。ここでは
+// **融合 1 本を 1 回の GEMM で撃ち**、q / k / gate / v を**行オフセット**で読む。
+// q は norm+rope 済みでデバイスに残し、k / v は詰めてミラーとホストへ、
+// gate は `pf_full_out` が `dno_pf3_gate_mul` で読む (ld = 融合の行数)。
+//
+// 数値: GEMM は他の pf 連鎖と同じ BF16 テンソルコア (prefill の射影はビット一致
+// 契約の外)。qknorm/rope は pf2 のカーネル (CPU と同じ式)。ゲートと gather は
+// kernels_pf3.cu (-fmad=false、明示 __*_rn)。丸めだけの差で md5 は変わりうる。
+
+/// task 183: 融合 qkv の後処理カーネル (`kernels_pf3.cu`。PTX は実行時読み込み)。
+struct Pf3Kernels {
+    /// モジュールは生かしておく必要がある (関数ハンドルの持ち主)。
+    #[allow(dead_code)]
+    module: CUmodule,
+    gate_mul: CUfunction,
+    gather: CUfunction,
+}
+
+unsafe impl Send for Pf3Kernels {}
+unsafe impl Sync for Pf3Kernels {}
+
+/// PTX の置き場所。`DENNO_PF3_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_pf3.ptx`。
+fn pf3_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_PF3_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_pf3.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+/// **current context を張った後に呼ぶこと**。
+fn pf3_kernels() -> Option<&'static Pf3Kernels> {
+    static K: OnceLock<Option<Pf3Kernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = pf3_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                pf2_warn(&format!("pf3 PTX が読めない ({}) : {e}", path.display()));
+                return None;
+            }
+        };
+        image.push(0);
+        let lib = match lib() {
+            Ok(l) => l,
+            Err(_) => return None,
+        };
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                pf2_warn("pf3 cuModuleLoadData 失敗");
+                return None;
+            }
+            let mut gate_mul: CUfunction = std::ptr::null_mut();
+            let mut gather: CUfunction = std::ptr::null_mut();
+            for (dst, name, label) in [
+                (
+                    &mut gate_mul,
+                    b"dno_pf3_gate_mul\0".as_ptr(),
+                    "dno_pf3_gate_mul",
+                ),
+                (&mut gather, b"dno_pf3_gather\0".as_ptr(), "dno_pf3_gather"),
+            ] {
+                if (lib.module_get_function)(dst, module, name as *const c_char) != CUDA_SUCCESS {
+                    pf2_warn(&format!("pf3 PTX に {label} が無い"));
+                    return None;
+                }
+            }
+            Some(Pf3Kernels {
+                module,
+                gate_mul,
+                gather,
+            })
+        }
+    })
+    .as_ref()
+}
+
+/// task 183: 融合済み qkv 1 本の射影 (1 回の GEMM) と q / k の norm+rope。
+///
+/// `w` は q|gate|k|v が連続した 1 本 (`w.n` 行)。行範囲は
+/// `q_off..q_off+2*qd` (q|gate)、`k_off..k_off+kv`、`v_off..v_off+kv` で、
+/// `v_off + kv == w.n` を要求する。戻り値 `false` は「この形/環境では
+/// 連鎖を使わない」(副作用なし。呼び出し側は従来経路をそのまま走らせる)。
+///
+/// 成功したら q (norm+rope 済み) と gate (生の射影) をデバイスに残す。
+/// k / v は詰めた形でデバイスに置き、ホストへ戻してミラーへも D2D で書く。
+#[allow(clippy::too_many_arguments)]
+pub fn pf_full_qkv_fused(
+    x: &[f32],
+    nt: usize,
+    e: usize,
+    w: PfLin<'_>,
+    q_off: usize,
+    k_off: usize,
+    v_off: usize,
+    q_norm: &[f32],
+    k_norm: &[f32],
+    cs: &[f32],
+    heads: usize,
+    kv_heads: usize,
+    dh: usize,
+    n_rot: usize,
+    eps: f32,
+    cache_id: u64,
+    n_layer: usize,
+    layer: usize,
+    gen: u64,
+    t_total: usize,
+    pos0: usize,
+    k_out: &mut [f32],
+    v_out: &mut [f32],
+) -> bool {
+    pf2_set_nt(nt);
+    let qd = heads * dh;
+    let kv = kv_heads * dh;
+    let n_all = w.n;
+    let ok_shape = nt >= PF2_MIN_ROWS
+        && e > 0
+        && dh >= ATTN_PF_BQ
+        && dh <= 1024
+        && n_rot % 2 == 0
+        && n_rot <= dh
+        && heads > 0
+        && kv_heads > 0
+        && kv <= 1024
+        && x.len() == nt * e
+        && k_out.len() == nt * kv
+        && v_out.len() == nt * kv
+        && q_norm.len() == dh
+        && k_norm.len() == dh
+        && cs.len() == nt * n_rot
+        && w.k == e
+        && q_off == 0
+        && q_off + 2 * qd <= k_off
+        && k_off + kv <= v_off
+        && v_off.checked_add(kv) == Some(n_all)
+        && pos0.checked_add(nt) == Some(t_total);
+    if !ok_shape {
+        pf2_note(1);
+        return false;
+    }
+    if !attn_prefill_shape_ok(nt, dh, t_total, ATTN_Q4_PF_MIN_ROWS) {
+        pf2_note(1);
+        return false;
+    }
+    let Some(kr) = pf2_kernels() else {
+        pf2_note(1);
+        return false;
+    };
+    let Some(kr3) = pf3_kernels() else {
+        // pf3 の PTX が無い環境 (未再生成) では従来経路へ落とす。
+        pf2_note(1);
+        return false;
+    };
+    let Some(ctx) = shared_ctx() else {
+        pf2_note(1);
+        return false;
+    };
+    if ctx.make_current().is_err() {
+        pf2_note(1);
+        return false;
+    }
+    let Some((pw, pw_k)) = pf_weight(w, false) else {
+        pf2_note(1);
+        return false;
+    };
+    let r = PF2_DEV.with(|cell| -> Result<()> {
+        let mut d = cell.borrow_mut();
+        pf2_ensure(&mut d.x, nt * e * 4)?;
+        pf2_ensure(&mut d.qkv, nt * n_all * 4)?;
+        pf2_ensure(&mut d.q, nt * qd * 4)?;
+        pf2_ensure(&mut d.kd, nt * kv * 4)?;
+        pf2_ensure(&mut d.vd, nt * kv * 4)?;
+        pf2_ensure(&mut d.cs, nt * n_rot * 4)?;
+        pf2_ensure(&mut d.qn, dh * 4)?;
+        pf2_ensure(&mut d.kn, dh * 4)?;
+        let xb = d.x.as_ref().expect("ensure 済み");
+        let qkvb = d.qkv.as_ref().expect("ensure 済み");
+        let qb = d.q.as_ref().expect("ensure 済み");
+        let kdb = d.kd.as_ref().expect("ensure 済み");
+        let vdb = d.vd.as_ref().expect("ensure 済み");
+        let csb = d.cs.as_ref().expect("ensure 済み");
+        let qnb = d.qn.as_ref().expect("ensure 済み");
+        let knb = d.kn.as_ref().expect("ensure 済み");
+        xb.copy_from(x)?;
+        csb.copy_from(cs)?;
+        qnb.copy_from(q_norm)?;
+        knb.copy_from(k_norm)?;
+        // 1. 融合 1 本の射影 (**1 回の GEMM**。同期しない)
+        pf2_gemm(ctx, pw, pw_k, xb.ptr(), qkvb.ptr(), nt, e, n_all)?;
+        // 2. q: 融合バッファの q_off 行から [q|gate] を読み、norm+rope して q へ
+        {
+            let shmem = (dh * 4) as u32;
+            let (mut src, mut dst, mut wgt, mut tab) =
+                (qkvb.ptr() + (q_off * 4) as CUdeviceptr, qb.ptr(), qnb.ptr(), csb.ptr());
+            let (mut x_stride, mut hstride, mut out_stride) =
+                (n_all as c_int, (2 * dh) as c_int, qd as c_int);
+            let (mut cols, mut nrot) = (dh as c_int, n_rot as c_int);
+            let mut eps_c = eps;
+            let mut args = [
+                &mut src as *mut _ as *mut c_void,
+                &mut x_stride as *mut _ as *mut c_void,
+                &mut hstride as *mut _ as *mut c_void,
+                &mut wgt as *mut _ as *mut c_void,
+                &mut tab as *mut _ as *mut c_void,
+                &mut dst as *mut _ as *mut c_void,
+                &mut out_stride as *mut _ as *mut c_void,
+                &mut cols as *mut _ as *mut c_void,
+                &mut nrot as *mut _ as *mut c_void,
+                &mut eps_c as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                ctx.launch_async(
+                    kr.qknorm_rope,
+                    (nt as u32, heads as u32, 1),
+                    (dh as u32, 1, 1),
+                    shmem,
+                    &mut args,
+                )?;
+            }
+        }
+        // 3. k: 同じカーネルで融合バッファ → 詰めた kd (out_stride = kv)
+        {
+            let shmem = (dh * 4) as u32;
+            let (mut src, mut dst, mut wgt, mut tab) =
+                (qkvb.ptr() + (k_off * 4) as CUdeviceptr, kdb.ptr(), knb.ptr(), csb.ptr());
+            let (mut x_stride, mut hstride, mut out_stride) =
+                (n_all as c_int, dh as c_int, kv as c_int);
+            let (mut cols, mut nrot) = (dh as c_int, n_rot as c_int);
+            let mut eps_c = eps;
+            let mut args = [
+                &mut src as *mut _ as *mut c_void,
+                &mut x_stride as *mut _ as *mut c_void,
+                &mut hstride as *mut _ as *mut c_void,
+                &mut wgt as *mut _ as *mut c_void,
+                &mut tab as *mut _ as *mut c_void,
+                &mut dst as *mut _ as *mut c_void,
+                &mut out_stride as *mut _ as *mut c_void,
+                &mut cols as *mut _ as *mut c_void,
+                &mut nrot as *mut _ as *mut c_void,
+                &mut eps_c as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                ctx.launch_async(
+                    kr.qknorm_rope,
+                    (nt as u32, kv_heads as u32, 1),
+                    (dh as u32, 1, 1),
+                    shmem,
+                    &mut args,
+                )?;
+            }
+        }
+        // 4. v: 融合バッファの v_off 列を詰めて vd へ (D2D の gather)
+        {
+            let (mut src, mut dst) =
+                (qkvb.ptr() + (v_off * 4) as CUdeviceptr, vdb.ptr());
+            let (mut rows_c, mut ld_c, mut off_c, mut n_c) =
+                (nt as c_int, n_all as c_int, 0 as c_int, kv as c_int);
+            let mut args = [
+                &mut src as *mut _ as *mut c_void,
+                &mut dst as *mut _ as *mut c_void,
+                &mut rows_c as *mut _ as *mut c_void,
+                &mut ld_c as *mut _ as *mut c_void,
+                &mut off_c as *mut _ as *mut c_void,
+                &mut n_c as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                ctx.launch_async(kr3.gather, (nt as u32, 1, 1), (kv as u32, 1, 1), 0, &mut args)?;
+            }
+        }
+        ctx.sync()?;
+        // 5. k / v だけ戻す (ホストの KV が正。値は従来経路と同じ)
+        if pf_d2h_direct_on() {
+            kdb.to_slice(&mut k_out[..nt * kv])?;
+            vdb.to_slice(&mut v_out[..nt * kv])?;
+        } else {
+            let kgot: Vec<f32> = kdb.to_vec(nt * kv)?;
+            k_out.copy_from_slice(&kgot);
+            let vgot: Vec<f32> = vdb.to_vec(nt * kv)?;
+            v_out.copy_from_slice(&vgot);
+        }
+        // 6. ミラーへはチャンクの行だけを直接書く (D2D。`DENNO_PF_MIRROR_DELTA`)
+        let mut staged = None;
+        if pf_mirror_delta_on() {
+            match q4_attn_mirror_stage_dev(
+                cache_id, n_layer, kv, layer, gen, pos0, t_total, kdb.ptr(), vdb.ptr(),
+            ) {
+                Ok(_) => staged = Some((cache_id, layer, gen, t_total)),
+                Err(e) => pf2_warn(&format!("full qkv (融合): ミラーへの直接書き: {e:#}")),
+            }
+        }
+        d.mir = staged;
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            pf2_note(0);
+            true
+        }
+        Err(e) => {
+            pf2_warn(&format!("full qkv (融合): {e:#}"));
+            pf2_note(1);
+            false
+        }
+    }
+}
+
 /// task 172: full 層 1 チャンクの後半 (attention → 出力ゲート → 出力投影)。
 ///
 /// `pf_full_qkv` がデバイスに残した q / qg を使う。K/V はミラーから読む
@@ -19475,6 +20244,11 @@ pub fn pf_full_out(
     v_cpu: &[f32],
     wo: PfLin<'_>,
     e: usize,
+    // task 183: 融合 qkv 経路のとき true。gate を `d.qkv` の
+    // `gate_off` 行から `gate_ld` ストライドで読む (pf3 のカーネル)。
+    fused_gate: bool,
+    gate_off: usize,
+    gate_ld: usize,
     out: &mut [f32],
 ) -> bool {
     pf2_set_nt(nt);
@@ -19540,13 +20314,22 @@ pub fn pf_full_out(
             let mut d = cell.borrow_mut();
             pf2_ensure(&mut d.att, nt * qd * 4)?;
             pf2_ensure(&mut d.o, nt * e * 4)?;
-            let qgb = d.qg.as_ref().ok_or_else(|| anyhow!("qg が無い"))?;
+            // task 183: 融合 qkv 経路では gate が `d.qkv` の中にあるので、qg は
+            // 要らない (q は norm+rope 済みの詰めたバッファ)。
             let qb = d.q.as_ref().ok_or_else(|| anyhow!("q が無い"))?;
+            if fused_gate {
+                let qkvb = d.qkv.as_ref().ok_or_else(|| anyhow!("qkv が無い"))?;
+                if qkvb.bytes() < nt * gate_ld * 4 || qb.bytes() < nt * qd * 4 {
+                    bail!("q / qkv の作業域が小さい (融合 qkv を先に呼ぶこと)");
+                }
+            } else {
+                let qgb = d.qg.as_ref().ok_or_else(|| anyhow!("qg が無い"))?;
+                if qgb.bytes() < nt * 2 * qd * 4 || qb.bytes() < nt * qd * 4 {
+                    bail!("q / qg の作業域が小さい (qkv を先に呼ぶこと)");
+                }
+            }
             let attb = d.att.as_ref().expect("ensure 済み");
             let ob = d.o.as_ref().expect("ensure 済み");
-            if qgb.bytes() < nt * 2 * qd * 4 || qb.bytes() < nt * qd * 4 {
-                bail!("q / qg の作業域が小さい (qkv を先に呼ぶこと)");
-            }
             // 1. attention (K/V はミラー、q はデバイス)
             {
                 let shmem = (attn_pf_sh_f(dh) * 4) as u32;
@@ -19586,7 +20369,32 @@ pub fn pf_full_out(
                 }
             }
             // 2. 出力ゲート (att *= sigmoid(gate))
-            {
+            if fused_gate {
+                // task 183: 融合バッファ (ld = 融合 1 本の行数) から読む。
+                let kr3 = pf3_kernels().ok_or_else(|| anyhow!("pf3 のカーネルが無い"))?;
+                let qkvb = d.qkv.as_ref().ok_or_else(|| anyhow!("qkv が無い"))?;
+                let (mut ap, mut gptr) =
+                    (attb.ptr(), qkvb.ptr() + (gate_off * 4) as CUdeviceptr);
+                let (mut h_c, mut dh_c, mut ld_c) =
+                    (heads as c_int, dh as c_int, gate_ld as c_int);
+                let mut args = [
+                    &mut ap as *mut _ as *mut c_void,
+                    &mut gptr as *mut _ as *mut c_void,
+                    &mut h_c as *mut _ as *mut c_void,
+                    &mut dh_c as *mut _ as *mut c_void,
+                    &mut ld_c as *mut _ as *mut c_void,
+                ];
+                unsafe {
+                    ctx.launch_async(
+                        kr3.gate_mul,
+                        (nt as u32, heads as u32, 1),
+                        (dh as u32, 1, 1),
+                        0,
+                        &mut args,
+                    )?;
+                }
+            } else {
+                let qgb = d.qg.as_ref().ok_or_else(|| anyhow!("qg が無い"))?;
                 let (mut ap, mut gptr) = (attb.ptr(), qgb.ptr());
                 let (mut h_c, mut dh_c) = (heads as c_int, dh as c_int);
                 let mut args = [
@@ -19697,8 +20505,9 @@ pub fn pf_shared(
         let shb = d.sh.as_ref().expect("ensure 済み");
         let swb = d.x.as_ref().expect("ensure 済み");
         xb.copy_from(x)?;
-        pf2_gemm(ctx, pg, pg_k, xb.ptr(), gab.ptr(), nt, e, sff)?;
-        pf2_gemm(ctx, pu, pu_k, xb.ptr(), gub.ptr(), nt, e, sff)?;
+        // task 183: `DENNO_PF_TC_SHARED2` が on なら BM=64 のカーネルで撃つ。
+        pf2_gemm_shared(ctx, pg, pg_k, xb.ptr(), gab.ptr(), nt, e, sff)?;
+        pf2_gemm_shared(ctx, pu, pu_k, xb.ptr(), gub.ptr(), nt, e, sff)?;
         // swiglu: x = silu(ga) * gu (elem の既存カーネル。CPU と同じ式)
         {
             let (mut gp, mut up_p, mut op) = (gab.ptr(), gub.ptr(), swb.ptr());
@@ -19714,7 +20523,7 @@ pub fn pf_shared(
                 ctx.launch_async(ctx.f_swiglu, (grid, 1, 1), (256, 1, 1), 0, &mut args)?;
             }
         }
-        pf2_gemm(ctx, pd, pd_k, swb.ptr(), shb.ptr(), nt, sff, e)?;
+        pf2_gemm_shared(ctx, pd, pd_k, swb.ptr(), shb.ptr(), nt, sff, e)?;
         ctx.sync()?;
         // task 181: ホストへは**呼び出し側のバッファへ直接**戻す
         // (`DENNO_PF_D2H_DIRECT`)。`to_vec` + `copy_from_slice` は毎層 5 MB の

@@ -1869,9 +1869,13 @@ impl FullAttn {
             );
         }
         // task 172: 1 チャンクぶんの活性を GPU に置いたまま full 層を閉じる。
+        // task 183: `DENNO_PF_FULL_FUSED` は融合 qkv もこの連鎖に載せる
+        // (融合 1 本を 1 回の GEMM で撃ち、行オフセットで q/k/v を読む)。
         // (`DENNO_PF_FULL_DEV`。使えない形・環境では None が返り従来経路へ)
         #[cfg(feature = "cuda")]
-        if crate::model::qwen4exp::pf_full_dev_on() {
+        if crate::model::qwen4exp::pf_full_dev_on()
+            || crate::model::qwen4exp::pf_full_fused_on()
+        {
             if let Some(outs) = self.forward_batch_dev(layer, curs, base)? {
                 return Ok(outs);
             }
@@ -1973,24 +1977,44 @@ impl FullAttn {
             Some(l) => l,
             None => return Ok(None),
         };
-        // 融合済み (`inner`) のときは行列ごとの重みポインタが取れない。
-        if l.qkv.is_fused() || l.qkv.parts().len() != 3 {
+        let fused = l.qkv.is_fused();
+        // task 183: 融合済み qkv は `DENNO_PF_FULL_FUSED` のときだけ連鎖に載せる
+        // (1 回の GEMM + 行オフセットで読む)。融合していない層は従来どおり
+        // `DENNO_PF_FULL_DEV` (または FULL_FUSED) で連鎖に載る。
+        if fused && !crate::model::qwen4exp::pf_full_fused_on() {
             crate::cuda::pf2_decline(1);
             return Ok(None);
         }
-        let parts = l.qkv.parts();
+        if !fused && !crate::model::qwen4exp::pf_full_dev_on() && !crate::model::qwen4exp::pf_full_fused_on() {
+            crate::cuda::pf2_decline(1);
+            return Ok(None);
+        }
+        if !fused && l.qkv.parts().len() != 3 {
+            crate::cuda::pf2_decline(1);
+            return Ok(None);
+        }
         let qd = l.q_dim();
         let kv = l.kv_dim();
-        if parts[0].n() != 2 * qd || parts[1].n() != kv || parts[2].n() != kv {
-            crate::cuda::pf2_decline(1);
-            return Ok(None);
-        }
-        let (q_lin, k_lin, v_lin, wo_lin) = (
-            pf_lin_of(&parts[0]),
-            pf_lin_of(&parts[1]),
-            pf_lin_of(&parts[2]),
-            pf_lin_of(&l.wo),
-        );
+        let gate_src = if fused {
+            // 融合 1 本: q|gate (2*qd 行) / k (kv 行) / v (kv 行) が連続。
+            let inner = match l.qkv.inner() {
+                Some(i) => i,
+                None => {
+                    crate::cuda::pf2_decline(1);
+                    return Ok(None);
+                }
+            };
+            let (r0, r1, r2) = (l.qkv.range(0), l.qkv.range(1), l.qkv.range(2));
+            let n_all = inner.n();
+            if r0.len() != 2 * qd || r1.len() != kv || r2.len() != kv || r2.end != n_all {
+                crate::cuda::pf2_decline(1);
+                return Ok(None);
+            }
+            Some((pf_lin_of(inner), r0.start, r1.start, r2.start, n_all))
+        } else {
+            None
+        };
+        let wo_lin = pf_lin_of(&l.wo);
         let cs = match rope_cs_cached(nt, base, l.n_rot, l.rope_theta) {
             Some(v) => v,
             None => {
@@ -2008,31 +2032,65 @@ impl FullAttn {
         let n_layer = self.cache.n_layer();
         let gen = self.cache.gen(layer)?;
         let t_total = base + nt;
-        // 前半: qkv + qk norm/rope (k / v はホストへ戻る)
-        let ok = crate::cuda::pf_full_qkv(
-            &flat,
-            nt,
-            e,
-            q_lin,
-            k_lin,
-            v_lin,
-            &l.q_norm,
-            &l.k_norm,
-            &cs,
-            l.n_head,
-            l.n_head_kv,
-            l.head_dim,
-            l.n_rot,
-            l.rms_eps,
-            cache_id,
-            n_layer,
-            layer,
-            gen,
-            t_total,
-            base,
-            &mut ks,
-            &mut vs,
-        );
+        // 前半: qkv (+ qk norm/rope)。k / v はホストへ戻る。
+        let ok = if let Some((lin, q_off, k_off, v_off, _n_all)) = gate_src {
+            crate::cuda::pf_full_qkv_fused(
+                &flat,
+                nt,
+                e,
+                lin,
+                q_off,
+                k_off,
+                v_off,
+                &l.q_norm,
+                &l.k_norm,
+                &cs,
+                l.n_head,
+                l.n_head_kv,
+                l.head_dim,
+                l.n_rot,
+                l.rms_eps,
+                cache_id,
+                n_layer,
+                layer,
+                gen,
+                t_total,
+                base,
+                &mut ks,
+                &mut vs,
+            )
+        } else {
+            let parts = l.qkv.parts();
+            let (q_lin, k_lin, v_lin) = (
+                pf_lin_of(&parts[0]),
+                pf_lin_of(&parts[1]),
+                pf_lin_of(&parts[2]),
+            );
+            crate::cuda::pf_full_qkv(
+                &flat,
+                nt,
+                e,
+                q_lin,
+                k_lin,
+                v_lin,
+                &l.q_norm,
+                &l.k_norm,
+                &cs,
+                l.n_head,
+                l.n_head_kv,
+                l.head_dim,
+                l.n_rot,
+                l.rms_eps,
+                cache_id,
+                n_layer,
+                layer,
+                gen,
+                t_total,
+                base,
+                &mut ks,
+                &mut vs,
+            )
+        };
         if !ok {
             return Ok(None);
         }
@@ -2061,6 +2119,9 @@ impl FullAttn {
             vb,
             wo_lin,
             e,
+            gate_src.is_some(),
+            gate_src.map(|g| g.1).unwrap_or(0),
+            gate_src.map(|g| g.4).unwrap_or(0),
             &mut flat_out,
         );
         if !done {
