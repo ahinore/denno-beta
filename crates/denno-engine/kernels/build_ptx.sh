@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc pf2)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_fp16 exp_iq exp_iq_pf pf attn_dec gemm_tc gemm_tc2 pf2)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -70,6 +70,10 @@ spec() {
         # NeoX rope / 出力ゲート)。CPU 参照と 1 演算 1 丸めを合わせるため
         # -fmad=false で作る (明示 __*_rn のみ。expf だけは CUDA の libm)。
         pf2)          echo "kernels_pf2.cu|nofmad" ;;
+        # task 176: 同じ wmma 経路の第 2 版 (出力行 128・2 段プリフェッチ・
+        # smem の行ストライド 40・Q4_K / Q5_K も扱う)。arch は gemm_tc と同じ理由で
+        # compute_90。数値契約は無し (prefill の射影はビット一致契約の外)。
+        gemm_tc2)     echo "kernels_gemm_tc2.cu|fmad|compute_90" ;;
         *)            return 1 ;;
     esac
 }
