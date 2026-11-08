@@ -15722,13 +15722,19 @@ pub fn pf_take_mixed(out: &mut [f32]) -> bool {
     PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
         match d.mixed.as_ref() {
-            Some(b) if b.bytes() >= out.len() * 4 => match b.to_vec::<f32>(out.len()) {
-                Ok(v) => {
-                    out.copy_from_slice(&v);
-                    true
+            Some(b) if b.bytes() >= out.len() * 4 => {
+                if pf_d2h_direct_on() {
+                    // task 181: 中間 Vec を作らず直接 D2H (値は同じ)。
+                    return b.to_slice(out).is_ok();
                 }
-                Err(_) => false,
-            },
+                match b.to_vec::<f32>(out.len()) {
+                    Ok(v) => {
+                        out.copy_from_slice(&v);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
             _ => false,
         }
     })
@@ -16547,6 +16553,52 @@ fn pf2_gemm(
 // full attention の前半: qkv 射影 + per-head RMSNorm + partial NeoX rope
 // ---------------------------------------------------------------------------
 
+/// `DENNO_PF_D2H_DIRECT` の値の解釈 (純関数)。明示的な真値だけ on。
+///
+/// **既定 off** (task 181 の lab で採否を決める)。
+pub(crate) fn pf_d2h_direct_from_value(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// task 181: デバイス → ホストを**呼び出し側のバッファへ直接**戻すか。
+///
+/// off のときは従来どおり `to_vec` で中間 Vec を作って `copy_from_slice` する。
+/// 毎層 5 MB の Vec 確保 (ページフォルト) と memcpy がもう 1 回入るので、
+/// 14,018 トークン cold prefill では shared / full / mix の 3 経路で
+/// 合計 20 GB 級の無駄なホストコピーになる (**値は 1 ビットも変わらない**)。
+pub(crate) fn pf_d2h_direct_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_D2H_DIRECT_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_d2h_direct_from_value(std::env::var("DENNO_PF_D2H_DIRECT").ok().as_deref())
+    })
+}
+
+#[cfg(test)]
+static PF_D2H_DIRECT_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_d2h_direct_for_test(v: Option<bool>) {
+    PF_D2H_DIRECT_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// `DENNO_PF_MIRROR_DELTA` の値の解釈 (純関数)。明示的な真値だけ on。
 ///
 /// **既定 off** (task 181 の lab で採否を決める)。
@@ -16764,10 +16816,17 @@ pub fn pf_full_qkv(
         }
         ctx.sync()?;
         // 4. k / v だけ戻す (ホストの KV が正)
-        let kgot: Vec<f32> = kdb.to_vec(nt * kv)?;
-        k_out.copy_from_slice(&kgot);
-        let vgot: Vec<f32> = vdb.to_vec(nt * kv)?;
-        v_out.copy_from_slice(&vgot);
+        //    task 181: `DENNO_PF_D2H_DIRECT` なら中間 Vec を作らず caller の
+        //    バッファへ直接 D2H する (値は同じ。毎チャンク 2 x 1 MB の確保を消す)。
+        if pf_d2h_direct_on() {
+            kdb.to_slice(&mut k_out[..nt * kv])?;
+            vdb.to_slice(&mut v_out[..nt * kv])?;
+        } else {
+            let kgot: Vec<f32> = kdb.to_vec(nt * kv)?;
+            k_out.copy_from_slice(&kgot);
+            let vgot: Vec<f32> = vdb.to_vec(nt * kv)?;
+            v_out.copy_from_slice(&vgot);
+        }
         // 5. task 181: ミラーへは**チャンクの行だけ**を直接書く (D2D)。
         //    ミラーが行 [0, pos0) を持っていない (最初のチャンク・世代が変わった)
         //    ときは `Err` が返るので、`pf_full_out` が従来の H2D 経路へ戻る。
@@ -16952,8 +17011,13 @@ pub fn pf_full_out(
             // 3. 出力投影 (同期しない) → 最後に 1 回だけ待って 1 回で戻す
             pf2_gemm(ctx, pw, pw_k, attb.ptr(), ob.ptr(), nt, qd, e)?;
             ctx.sync()?;
-            let got: Vec<f32> = ob.to_vec(nt * e)?;
-            out.copy_from_slice(&got);
+            // task 181: `DENNO_PF_D2H_DIRECT` は中間 Vec を作らない (値は同じ)。
+            if pf_d2h_direct_on() {
+                ob.to_slice(&mut out[..nt * e])?;
+            } else {
+                let got: Vec<f32> = ob.to_vec(nt * e)?;
+                out.copy_from_slice(&got);
+            }
             Ok(())
         })
     })();
@@ -17055,8 +17119,15 @@ pub fn pf_shared(
         }
         pf2_gemm(ctx, pd, pd_k, swb.ptr(), shb.ptr(), nt, sff, e)?;
         ctx.sync()?;
-        let got: Vec<f32> = shb.to_vec(nt * e)?;
-        out.copy_from_slice(&got);
+        // task 181: ホストへは**呼び出し側のバッファへ直接**戻す
+        // (`DENNO_PF_D2H_DIRECT`)。`to_vec` + `copy_from_slice` は毎層 5 MB の
+        // Vec 確保 (= ページフォルト) と memcpy をもう 1 回する。
+        if pf_d2h_direct_on() {
+            shb.to_slice(&mut out[..nt * e])?;
+        } else {
+            let got: Vec<f32> = shb.to_vec(nt * e)?;
+            out.copy_from_slice(&got);
+        }
         Ok(())
     });
     match r {
@@ -24578,6 +24649,25 @@ mod q4_attn_tests {
         assert_eq!(Q4_GPU_ATTN_PF_MIN_DEFAULT, 8);
         assert!(ATTN_Q4_PF_MIN_ROWS < gemm_min_m());
         assert!(Q4_GPU_ATTN_PF_MIN_KV_DEFAULT > Q4_GPU_ATTN_MIN_DEFAULT);
+    }
+
+    /// task 181: `DENNO_PF_D2H_DIRECT` の解釈 (既定 off。明示的な真値だけ on)。
+    #[test]
+    fn pf_d2h_direct_gate_parsing() {
+        assert!(!pf_d2h_direct_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " OFF ", "ON!"] {
+            assert!(!pf_d2h_direct_from_value(Some(v)), "{v}");
+        }
+        for v in ["1", "on", "true", "yes", " ON "] {
+            assert!(pf_d2h_direct_from_value(Some(v)), "{v}");
+        }
+        let before = pf_d2h_direct_on();
+        set_pf_d2h_direct_for_test(Some(true));
+        assert!(pf_d2h_direct_on());
+        set_pf_d2h_direct_for_test(Some(false));
+        assert!(!pf_d2h_direct_on());
+        set_pf_d2h_direct_for_test(None);
+        assert_eq!(pf_d2h_direct_on(), before);
     }
 
     /// task 181: `DENNO_PF_MIRROR_DELTA` の解釈 (既定 off。明示的な真値だけ on)。
