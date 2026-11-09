@@ -895,10 +895,35 @@ impl SsmLayer {
         ) {
             return Ok(None);
         }
+        // task 186: beta/alpha 射影をデバイスで回す (`DENNO_PF_SSM_GEMM_GPU`)。
+        // 連鎖の入力 x も出力 beta/alpha もデバイスにあるので、転送を挟まずに
+        // F32 GEMM 2 本で作れる (lab t183a の `beta_pf` は 712 ms = 0.71 ms/回)。
+        // 形が合わない (連結でない / F32 でない) ときはホスト経路のまま。
+        let ba_desc = if crate::cuda::pf_ssm_gemm_gpu_on() {
+            match self.beta_alpha.inner() {
+                Some(inner) => {
+                    let (r0, r1) = (self.beta_alpha.range(0), self.beta_alpha.range(1));
+                    if r0.len() == nv && r1.len() == nv {
+                        Some(crate::cuda::PfBetaAlpha {
+                            w: pw(inner),
+                            beta_rows: r0,
+                            alpha_rows: r1,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let t = q4prof::stamp();
-        let mut beta_raw = vec![0f32; nt * nv];
-        let mut alpha = vec![0f32; nt * nv];
-        {
+        let mut beta_raw = Vec::new();
+        let mut alpha = Vec::new();
+        if ba_desc.is_none() {
+            beta_raw = vec![0f32; nt * nv];
+            alpha = vec![0f32; nt * nv];
             let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_GATE);
             self.beta_alpha
                 .gemv_batch_split(flat, nt, &mut [&mut beta_raw[..], &mut alpha[..]])?;
@@ -920,6 +945,7 @@ impl SsmLayer {
             flat,
             &beta_raw,
             &alpha,
+            ba_desc,
             &mut self.state.conv,
             &mut self.state.ssm,
             &self.conv1d,

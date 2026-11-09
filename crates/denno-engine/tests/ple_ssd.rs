@@ -284,6 +284,38 @@ fn contiguous_gather_equals_split_gather() {
     assert!(p.set_max_read(0).is_err());
 }
 
+/// 2c. task 189: 並列度 (`DENNO_PF_PLE_PAR`) を変えても**バイトが同じ**であること。
+///
+/// 行は独立で、1 行のデコードは `gather_rows` と同じ関数・同じバイト列。
+/// 割り方 (parts) を 1 ..= 16 で振って、逐次版と `to_bits` まで一致することを
+/// 固定する。ここが崩れると prefill の PLE 表引きが黙って別の値になる。
+#[test]
+fn parallel_gather_is_bitwise_identical_for_every_part_count() {
+    let (_dir, path, _data) = setup("par", ROWS, 0x0f1e_2d3c);
+    let gguf = GgufFile::open(&path).expect("open gguf");
+    let tref = gguf.tensor_ref(PLE_NAME).expect("tensor_ref");
+
+    // 重複・飛び・端を含む行列 (まとめ読みの分割と重複排除の両方を通す)。
+    let rows: Vec<u32> = vec![0, 5, 6, 7, 31, 32, 33, 63, 0, 63, 12];
+    let mut seq = vec![0f32; rows.len() * DIM];
+    let ple = PleTable::open(&tref, &gguf).expect("PleTable::open");
+    ple.gather_rows(&rows, &mut seq).expect("gather (seq)");
+
+    for parts in [1usize, 2, 3, 4, 7, 8, 11, 16, 64] {
+        let p = PleTable::open(&tref, &gguf).expect("PleTable::open");
+        let mut par = vec![0f32; rows.len() * DIM];
+        p.gather_rows_par(&rows, &mut par, parts)
+            .expect("gather_rows_par");
+        for i in 0..par.len() {
+            assert_eq!(
+                seq[i].to_bits(),
+                par[i].to_bits(),
+                "parts={parts} 要素 {i} が逐次版と違う"
+            );
+        }
+    }
+}
+
 /// 3. 範囲外 index はエラー (黙って 0 にしない)。
 #[test]
 fn out_of_range_index_is_error() {

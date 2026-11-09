@@ -299,6 +299,30 @@ pub fn gdn_pf_kprof_reset() {
 #[cfg(not(feature = "cuda"))]
 pub fn gdn_pf_kprof_reset() {}
 
+/// task 189: prefill の mix 1 呼び出しの内訳 (`DENNO_PF_MIX_KPROF=1`) の 1 行。
+///
+/// 計測器は cuda.rs 側にあるので、cuda feature の有無をここで吸収する。
+#[cfg(feature = "cuda")]
+pub fn pf_mix_kprof_lines() -> Vec<String> {
+    crate::cuda::pf_mix_kprof::lines()
+}
+
+/// task 189: cuda 無しは常に空。
+#[cfg(not(feature = "cuda"))]
+pub fn pf_mix_kprof_lines() -> Vec<String> {
+    Vec::new()
+}
+
+/// task 189: cuda 無しは何もしない。
+#[cfg(feature = "cuda")]
+pub fn pf_mix_kprof_reset() {
+    crate::cuda::pf_mix_kprof::reset()
+}
+
+/// task 189: cuda 無しは何もしない。
+#[cfg(not(feature = "cuda"))]
+pub fn pf_mix_kprof_reset() {}
+
 /// 区間を開く。戻り値の drop で壁時計を積み、前の区間へ戻す。
 ///
 /// off のときは `Instant` を取らず、[`CUR`] にも触らない (no-op)。

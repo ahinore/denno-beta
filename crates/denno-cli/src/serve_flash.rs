@@ -482,6 +482,13 @@ fn prof_flash_q4(tag: &str, tok: usize, wall_ns: u64) {
             eprintln!("{line}");
         }
         denno_engine::model::q4ledger::gdn_pf_kprof_reset();
+        // task 189: mix 1 呼び出しの段ごとの内訳 (`DENNO_PF_MIX_KPROF=1`)。
+        // 台帳の `mix` 行は「発行 + 同期の待ち」なので、段の GPU 時間と
+        // `sync_own` / `sync_other` を並べて「誰を待っていたか」を分離する。
+        for line in denno_engine::model::q4ledger::pf_mix_kprof_lines() {
+            eprintln!("{line}");
+        }
+        denno_engine::model::q4ledger::pf_mix_kprof_reset();
     }
     denno_engine::model::q4ledger::reset();
     // task 144: IQ expert のヒット率 / GPU で回した層と本数 / 上げ直し / VRAM

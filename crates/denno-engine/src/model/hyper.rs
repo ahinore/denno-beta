@@ -226,6 +226,28 @@ pub fn grouped_rms_norm(x: &HyperStreams, w_norm: &[f32], p: &HyperParams) -> Ve
     normed_streams(x, w_norm, p)
 }
 
+/// task 189: [`grouped_rms_norm`] の書き込み先を呼び出し側が持つ版。
+///
+/// `x` は `[hc][n_embd]` の連続スライス (=[`HyperStreams::data`])。ストリーム
+/// `s` の昇順に `rmsnorm` を当てるので、値は `grouped_rms_norm` とビット一致する。
+pub fn grouped_rms_norm_into(x: &[f32], w_norm: &[f32], p: &HyperParams, out: &mut [f32]) {
+    let e = p.n_embd;
+    let hc = p.hc;
+    assert_eq!(x.len(), hc * e, "x は [hc][n_embd]");
+    assert_eq!(w_norm.len(), hc * e, "w_norm は [hc][n_embd]");
+    assert_eq!(out.len(), hc * e, "out は [hc][n_embd]");
+    for s in 0..hc {
+        let gamma = &w_norm[s * e..(s + 1) * e];
+        crate::tensor::rmsnorm_into(
+            &x[s * e..(s + 1) * e],
+            gamma,
+            e,
+            p.eps,
+            &mut out[s * e..(s + 1) * e],
+        );
+    }
+}
+
 /// `hc_mix` の手順 4-5 を in-place で当てる: `lo[r] = silu(lo[r] * (1/hc))`。
 ///
 /// 入力は `w_down @ xn` の**生の内積** (量子化重みの GEMV の出力をそのまま渡せる)。

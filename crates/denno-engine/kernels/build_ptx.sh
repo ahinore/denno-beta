@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ARCH="${DENNO_PTX_ARCH:-compute_75}"
-targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 moe_v5 mix_dev gdn_scan2 dec_epi)
+targets_all=(int8 elem gdn gdn_pf moe moe_batch moe_v2 gemm gemm_grouped moe_v3 moe_v4 moe_fp16 exp_iq exp_iq_v2 exp_iq_pf pf attn_dec gemm_tc gemm_tc2 dec_dev pf2 pf3 gemm_sn gemm_sn2 moe_v5 mix_dev gdn_scan2 dec_epi mix_pf gdn_pf2 mix_inj)
 
 # 名前 -> "ソース|fmad[|arch]" (fmad: nofmad = -fmad=false / fmad = 既定。
 # arch を書いたときはその target だけ $ARCH を上書きする)。未知は 1。
@@ -109,6 +109,23 @@ spec() {
         # task 184: decode の GDN スキャン第 2 版 (4 レーン + 列レジスタ)。
         # 既存 dno_gdn_scan_sig と 1 演算 1 丸めを揃えるため -fmad=false。
         gdn_scan2)    echo "kernels_gdn_scan2.cu|nofmad" ;;
+        # task 186: prefill の hc mix (down / up) を BF16 重みのまま回す GEMM。
+        # 出力 1 要素 1 アキュムレータ・k 昇順の __fmaf_rn で、既存の
+        # dno_gemm_bf16_mt とビット一致 (値は丸め順まで同一)。FMA は明示
+        # intrinsic なので -fmad は既定 (gemm 系と同じ) でよい。
+        mix_pf)       echo "kernels_mix_pf.cu|fmad" ;;
+        # task 186: prefill GDN スキャン v2 (ヘッドあたり 2 ブロック・barrier 1 回)。
+        # 値は gdn_pf とビット一致させたいので -fmad=false (式を変えないこと)。
+        # arch は gdn_pf と同じ compute_90 に揃える (JIT 差を作らない)。
+        # task 186 (3/n): -fmad を許可する版も lab t186b で測ったが、scan_pf は
+        # 1295 -> 1277 ms (-1.4%) だけで wall は動かなかった。このカーネルは
+        # 命令数ではなく SM あたりの仕事量で決まるので、丸めを変える価値が無い。
+        # **nofmad に戻す** (scan128 とビット一致を保つ)。
+        gdn_pf2)      echo "kernels_gdn_pf2.cu|nofmad|compute_90" ;;
+        # task 189: prefill の mix inject (n = hc <= 8) を 1 スレッド 1 出力で
+        # 回す GEMV。出力 1 要素 1 アキュムレータ・k 昇順の明示 __fmaf_rn なので
+        # -fmad=false で作る (既存 dno_gemm_bf16_mt と丸め順まで同一)。
+        mix_inj)      echo "kernels_mix_inj.cu|nofmad" ;;
         *)            return 1 ;;
     esac
 }
