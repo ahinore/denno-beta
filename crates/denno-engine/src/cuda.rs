@@ -19510,6 +19510,324 @@ mod mix_pf_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 189: mix 1 呼び出しの段ごとの内訳 (`DENNO_PF_MIX_KPROF=1`・既定 off)
+// ---------------------------------------------------------------------------
+//
+// 台帳の `mix` 行は「発行 + 同期の待ち」の壁時計で、`gpu` は
+// `cuCtxSynchronize` の待ちから空 sync の床を引いただけなので、**別ストリーム
+// (prefill の expert upload) の完了待ち**も同じ欄に入る。REPORT_P186 はこれを
+// mix のカーネル時間と読み違えた。ここでは段の前後に CUDA イベントを打って
+// 段の GPU 時間だけを積み、同期は
+//
+// - `sync_own`: null ストリーム (mix 自身の 6 起動) の完了待ち
+// - `sync_other`: そのあと `cuCtxSynchronize` が**別ストリーム**を待った分
+//
+// に分けて積む。`sync_other` が大きければ待ちの正体は expert upload。
+pub mod pf_mix_kprof {
+    use super::*;
+
+    /// 段の番号 (この順で 1 行に出す)。
+    pub const NORM: usize = 0;
+    pub const DOWN: usize = 1;
+    pub const LO: usize = 2;
+    pub const UP: usize = 3;
+    pub const MIXED: usize = 4;
+    pub const INJ: usize = 5;
+    pub const SYNC_OWN: usize = 6;
+    pub const SYNC_OTHER: usize = 7;
+    pub const D2H: usize = 8;
+    pub const N: usize = 9;
+    pub const NAMES: [&str; N] = [
+        "norm", "down", "lo", "up", "mixed", "inj", "sync_own", "sync_other", "d2h",
+    ];
+
+    static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static CNT: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// mix 呼び出しの回数 (1 回あたりに割る分母)。
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// 計測するか (`DENNO_PF_MIX_KPROF` があるとき)。
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DENNO_PF_MIX_KPROF").is_some())
+    }
+
+    /// 積算を 0 に戻す。
+    pub fn reset() {
+        for i in 0..N {
+            NS[i].store(0, Ordering::Relaxed);
+            CNT[i].store(0, Ordering::Relaxed);
+        }
+        CALLS.store(0, Ordering::Relaxed);
+        open_reset();
+    }
+
+    /// mix 1 呼び出しを数える。
+    pub fn note_call() {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_ns(i: usize, ns: u64) {
+        if i >= N {
+            return;
+        }
+        NS[i].fetch_add(ns, Ordering::Relaxed);
+        CNT[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// ホストで測った区間 (同期の待ち・D2H) を積む。
+    pub fn add_host(i: usize, t: Option<std::time::Instant>) {
+        if !on() {
+            return;
+        }
+        if let Some(t) = t {
+            add_ns(i, t.elapsed().as_nanos() as u64);
+        }
+    }
+
+    /// 1 行にまとめる (1 本も打っていなければ `None`)。
+    pub fn lines() -> Vec<String> {
+        if !on() {
+            return Vec::new();
+        }
+        let calls = CALLS.load(Ordering::Relaxed);
+        if calls == 0 {
+            return Vec::new();
+        }
+        let mut s = format!(
+            "[pf-mix-kprof] calls={calls} (1 呼び出し平均 us / 合計 ms, イベント + ホスト計測)"
+        );
+        for i in 0..N {
+            let n = CNT[i].load(Ordering::Relaxed);
+            if n == 0 {
+                continue;
+            }
+            let ns = NS[i].load(Ordering::Relaxed);
+            s.push_str(&format!(
+                " | {} {:.1}/{:.1}",
+                NAMES[i],
+                ns as f64 / 1e3 / n as f64,
+                ns as f64 / 1e6
+            ));
+        }
+        vec![s]
+    }
+
+    /// イベントのプール (スレッドローカル)。収集のたびに先頭から使い直す。
+    struct Pool {
+        evs: Vec<CUevent>,
+        used: usize,
+        dead: bool,
+    }
+
+    thread_local! {
+        static P: std::cell::RefCell<Pool> = const {
+            std::cell::RefCell::new(Pool { evs: Vec::new(), used: 0, dead: false })
+        };
+        static OPEN: std::cell::RefCell<[Option<u32>; N]> = const {
+            std::cell::RefCell::new([None; N])
+        };
+        static PEND: std::cell::RefCell<Vec<(u8, u32, u32)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn mark() -> Option<u32> {
+        P.with(|c| {
+            let mut p = c.borrow_mut();
+            if p.dead {
+                return None;
+            }
+            if p.used >= p.evs.len() {
+                let Some(create) = lib().ok().and_then(|l| l.event_create) else {
+                    p.dead = true;
+                    return None;
+                };
+                let mut ev: CUevent = std::ptr::null_mut();
+                // CU_EVENT_DEFAULT (0) = 計時有効。
+                if unsafe { create(&mut ev, 0) } != CUDA_SUCCESS || ev.is_null() {
+                    p.dead = true;
+                    return None;
+                }
+                p.evs.push(ev);
+            }
+            let Some(rec) = lib().ok().and_then(|l| l.event_record) else {
+                p.dead = true;
+                return None;
+            };
+            let ev = p.evs[p.used];
+            if unsafe { rec(ev, std::ptr::null_mut()) } != CUDA_SUCCESS {
+                p.dead = true;
+                return None;
+            }
+            let i = p.used as u32;
+            p.used += 1;
+            Some(i)
+        })
+    }
+
+    fn open_reset() {
+        OPEN.with(|c| {
+            let mut o = c.borrow_mut();
+            for v in o.iter_mut() {
+                *v = None;
+            }
+        });
+        PEND.with(|c| c.borrow_mut().clear());
+        P.with(|c| c.borrow_mut().used = 0);
+    }
+
+    /// 段の入口 (on でなければ 1 分岐)。
+    pub fn begin(item: usize) {
+        if !on() || item >= N {
+            return;
+        }
+        let a = mark();
+        OPEN.with(|c| c.borrow_mut()[item] = a);
+    }
+
+    /// 段の出口。
+    pub fn end(item: usize) {
+        if !on() || item >= N {
+            return;
+        }
+        let a = OPEN.with(|c| c.borrow_mut()[item].take());
+        let Some(a) = a else { return };
+        if let Some(b) = mark() {
+            PEND.with(|c| c.borrow_mut().push((item as u8, a, b)));
+        }
+    }
+
+    /// 積算する (**同期の後**に呼ぶ。イベントが完了している必要がある)。
+    pub fn collect() {
+        if !on() {
+            return;
+        }
+        let Some(f) = lib().ok().and_then(|l| l.event_elapsed_time) else {
+            return;
+        };
+        let pend = PEND.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if pend.is_empty() {
+            return;
+        }
+        P.with(|c| {
+            let p = c.borrow();
+            for (item, a, b) in pend {
+                let (Some(&ea), Some(&eb)) = (p.evs.get(a as usize), p.evs.get(b as usize)) else {
+                    continue;
+                };
+                let mut ms = 0.0f32;
+                if unsafe { f(&mut ms, ea, eb) } == CUDA_SUCCESS && ms.is_finite() && ms >= 0.0 {
+                    add_ns(item as usize, (ms as f64 * 1e6) as u64);
+                }
+            }
+        });
+        // イベントは先頭から使い直す (プールは 20 本で足りる)。
+        P.with(|c| c.borrow_mut().used = 0);
+    }
+}
+
+/// task 189: `DENNO_PF_MIX_STAGE` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn mix_stage_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// task 189: mix / combine の同期を**自ストリームだけ**にするか
+/// (`DENNO_PF_MIX_STAGE`、既定 off。lab の結果で決める)。
+pub(crate) fn mix_stage_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| mix_stage_from_value(std::env::var("DENNO_PF_MIX_STAGE").ok().as_deref()))
+}
+
+#[cfg(test)]
+mod pf_stage_tests {
+    use super::*;
+
+    /// task 189: `DENNO_PF_MIX_STAGE` は明示的な真値だけ on (既定 off)。
+    #[test]
+    fn mix_stage_gate_truth_table() {
+        assert!(!mix_stage_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!mix_stage_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(mix_stage_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+}
+
+thread_local! {
+    /// task 189: 自ストリーム同期用のイベント (計時不要)。
+    static PF_SYNC_EV: std::cell::Cell<CUevent> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// task 189: null ストリーム (mix / combine の起動先) の完了だけを待つ。
+///
+/// `cuCtxSynchronize` は**コンテキスト内の全ストリーム**を待つので、prefill の
+/// expert upload 用の非ブロッキングストリーム (最大 14 s ぶん enqueue される) の
+/// 完了も待ってしまう。イベントを null ストリームに打って `cuEventSynchronize`
+/// すれば、待つのは自ストリームの仕事だけになる (legacy default stream の暗黙
+/// 同期は**ブロッキング**ストリームだけが対象で、upload は
+/// `CU_STREAM_NON_BLOCKING` なので係らない)。
+fn pf_sync_own_stream() -> Result<()> {
+    let l = lib()?;
+    let (Some(create), Some(rec), Some(es)) = (l.event_create, l.event_record, l.event_sync) else {
+        bail!("cuEventCreate / cuEventRecord / cuEventSynchronize が無い");
+    };
+    let ev = PF_SYNC_EV.with(|c| {
+        let mut ev = c.get();
+        if ev.is_null() {
+            let mut e: CUevent = std::ptr::null_mut();
+            // CU_EVENT_DISABLE_TIMING = 0x02
+            if unsafe { create(&mut e, 0x02) } != CUDA_SUCCESS || e.is_null() {
+                return std::ptr::null_mut();
+            }
+            c.set(e);
+            ev = e;
+        }
+        ev
+    });
+    if ev.is_null() {
+        bail!("同期用イベントを作れない");
+    }
+    unsafe {
+        check(rec(ev, std::ptr::null_mut()), "cuEventRecord (pf stage)")?;
+        check(es(ev), "cuEventSynchronize (pf stage)")?;
+    }
+    Ok(())
+}
+
+/// task 189: mix / combine の同期。ゲートが on なら自ストリームだけを待つ。
+///
+/// 戻り値は「別ストリームを待った時間」を測るための `Instant` (ゲート off / 計測
+/// off では `None`)。呼び出し側は `pf_mix_kprof::add_host(SYNC_OTHER, t)` に渡す。
+fn pf_stage_sync(ctx: &CudaCtx) -> Result<Option<std::time::Instant>> {
+    if !mix_stage_on() {
+        let t = if pf_mix_kprof::on() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        ctx.sync()?;
+        return Ok(t);
+    }
+    // 1. 自ストリーム (mix の 6 起動) の完了だけを待つ。
+    let t_own = pf_mix_kprof::on().then(std::time::Instant::now);
+    pf_sync_own_stream()?;
+    pf_mix_kprof::add_host(pf_mix_kprof::SYNC_OWN, t_own);
+    // 2. 計測時だけ、そのあと全体を待って「別ストリームの残り」を測る
+    //    (診断専用。ゲート on の実経路では 2 回目の同期はしない)。
+    if pf_mix_kprof::on() {
+        let t = Some(std::time::Instant::now());
+        ctx.sync()?;
+        return Ok(t);
+    }
+    Ok(None)
+}
+
 fn pf_fail(msg: &str) -> bool {
     if !PF_BROKEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::info!("[pf] {msg} → 以降の prefill は CPU 経路");
@@ -19671,7 +19989,9 @@ pub fn pf_download_res_row(t: usize, hc_dim: usize, out: &mut [f32]) -> bool {
 
 /// task 154: デバイスの `mixed` (`[nt][n_embd]`) をホストへ戻す。
 pub fn pf_take_mixed(out: &mut [f32]) -> bool {
-    PF_DEV.with(|cell| -> bool {
+    // task 189: mix 1 呼び出しの D2H (mixed の 5.1 MB) も段として積む。
+    let t_d2h = pf_mix_kprof::on().then(std::time::Instant::now);
+    let r = PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
         match d.mixed.as_ref() {
             Some(b) if b.bytes() >= out.len() * 4 => {
@@ -19689,7 +20009,9 @@ pub fn pf_take_mixed(out: &mut [f32]) -> bool {
             }
             _ => false,
         }
-    })
+    });
+    pf_mix_kprof::add_host(pf_mix_kprof::D2H, t_d2h);
+    r
 }
 
 /// F32 の重み (hc mix の inject など) の常駐表。`mix_gpu_weight` は BF16 専用なので
@@ -19850,6 +20172,9 @@ pub fn pf_mix(
     let Some((pi, pi_k)) = pf_weight(inject, want_bf16) else {
         return false;
     };
+    if pf_mix_kprof::on() {
+        pf_mix_kprof::note_call();
+    }
     let r = PF_DEV.with(|cell| -> Result<(), String> {
         let d = cell.borrow();
         if nt > d.nt || hc != d.hc || e != d.e || lr != d.lr {
@@ -19875,6 +20200,7 @@ pub fn pf_mix(
         let (mut pr, mut px, mut pl, mut pg, mut pm, mut pj, mut pw) =
             (res.ptr(), xn.ptr(), lo.ptr(), gate.ptr(), mixed.ptr(), inj.ptr(), gamma.ptr());
         // 1. grouped RMS norm (res → xn)
+        pf_mix_kprof::begin(pf_mix_kprof::NORM);
         {
             let (mut e_c, mut hc_c) = (e as i32, hc as i32);
             let mut eps_c = eps;
@@ -19892,6 +20218,7 @@ pub fn pf_mix(
                     .map_err(|e| format!("rmsgroup launch: {e:#}"))?;
             }
         }
+        pf_mix_kprof::end(pf_mix_kprof::NORM);
         // 2. down GEMM (xn → lo)
         let gemm = |w: CUdeviceptr,
                     x: CUdeviceptr,
@@ -19992,8 +20319,11 @@ pub fn pf_mix(
             }
             Ok(())
         };
+        pf_mix_kprof::begin(pf_mix_kprof::DOWN);
         gemm(pd, px, pl, hc_dim, lr, pd_k)?;
+        pf_mix_kprof::end(pf_mix_kprof::DOWN);
         // 3. lo apply (in-place, nt*low_rank 要素)
+        pf_mix_kprof::begin(pf_mix_kprof::LO);
         {
             let mut total = (nt * lr) as i64;
             let mut inv_c = inv_hc;
@@ -20008,9 +20338,13 @@ pub fn pf_mix(
                     .map_err(|e| format!("lo launch: {e:#}"))?;
             }
         }
+        pf_mix_kprof::end(pf_mix_kprof::LO);
         // 4. up GEMM (lo → gate)
+        pf_mix_kprof::begin(pf_mix_kprof::UP);
         gemm(pu, pl, pg, lr, hc_dim, pu_k)?;
+        pf_mix_kprof::end(pf_mix_kprof::UP);
         // 5. mixed (xn, gate → mixed)
+        pf_mix_kprof::begin(pf_mix_kprof::MIXED);
         {
             let (mut e_c, mut hc_c) = (e as i32, hc as i32);
             let mut inv_c = inv_hc;
@@ -20028,7 +20362,9 @@ pub fn pf_mix(
                     .map_err(|e| format!("mixed launch: {e:#}"))?;
             }
         }
+        pf_mix_kprof::end(pf_mix_kprof::MIXED);
         // 6. inject GEMM (xn → inj) + 1/hc
+        pf_mix_kprof::begin(pf_mix_kprof::INJ);
         gemm(pi, px, pj, hc_dim, hc, pi_k)?;
         {
             let mut n_c = (nt * hc) as i32;
@@ -20044,7 +20380,11 @@ pub fn pf_mix(
                     .map_err(|e| format!("inj launch: {e:#}"))?;
             }
         }
-        ctx.sync().map_err(|e| format!("sync: {e:#}"))?;
+        pf_mix_kprof::end(pf_mix_kprof::INJ);
+        // task 189: 同期は `DENNO_PF_MIX_STAGE` で自ストリームだけにできる。
+        let t_other = pf_stage_sync(ctx).map_err(|e| format!("sync: {e:#}"))?;
+        pf_mix_kprof::add_host(pf_mix_kprof::SYNC_OTHER, t_other);
+        pf_mix_kprof::collect();
         Ok(())
     });
     match r {
@@ -20098,7 +20438,10 @@ pub fn pf_combine(bo: &[f32], nt: usize, hc: usize, e: usize) -> bool {
             ctx.launch_async(k.combine, grid, (256, 1, 1), 0, &mut args)
                 .map_err(|e| format!("combine launch: {e:#}"))?;
         }
-        ctx.sync().map_err(|e| format!("sync: {e:#}"))?;
+        // task 189: mix と同じく、expert upload の別ストリームを待たない。
+        let t_other = pf_stage_sync(ctx).map_err(|e| format!("sync: {e:#}"))?;
+        pf_mix_kprof::add_host(pf_mix_kprof::SYNC_OTHER, t_other);
+        pf_mix_kprof::collect();
         Ok(())
     });
     match r {
@@ -35558,9 +35901,13 @@ fn gdn_pf2_kernels() -> Option<&'static GdnPf2Kernels> {
 }
 
 /// `DENNO_PF_SCAN_FAST` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+///
+/// task 189: **既定 on**。lab t187c で scan_pf 2,853 -> 1,295 ms (md5 SAME)、
+/// wall -3.2% を確認済み (task 186 では目標未達だったため off のままだった)。
+/// `DENNO_PF_SCAN_FAST=0` で従来の `gdn_pf` スキャンに戻る。
 pub(crate) fn gdn_pf2_from_value(v: Option<&str>) -> bool {
     match v {
-        None => false,
+        None => true,
         Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
     }
 }
@@ -35581,7 +35928,7 @@ pub(crate) fn set_gdn_pf2_for_test(v: Option<bool>) {
     );
 }
 
-/// v2 スキャンを使うか (既定 off。lab の結果で決める)。
+/// v2 スキャンを使うか (既定 on。`DENNO_PF_SCAN_FAST=0` で off)。
 pub(crate) fn gdn_pf2_on() -> bool {
     #[cfg(test)]
     {
@@ -35822,7 +36169,7 @@ mod gdn_pf2_tests {
     /// ゲートの真理値表 (既定 off。lab の結果で on にする)。
     #[test]
     fn gdn_pf2_gate_truth_table() {
-        assert!(!gdn_pf2_from_value(None), "未設定は既定 off");
+        assert!(gdn_pf2_from_value(None), "未設定は既定 on (task 189)");
         for v in ["0", "off", "false", "no", "", " off "] {
             assert!(!gdn_pf2_from_value(Some(v)), "{v:?} が on になった");
         }
@@ -35852,7 +36199,8 @@ mod gdn_pf2_tests {
         set_gdn_pf2_for_test(Some(false));
         assert!(!gdn_pf2_on());
         set_gdn_pf2_for_test(None);
-        assert!(!gdn_pf2_on(), "env 未設定の既定は off");
+        // task 189: 既定を on に反転した (lab t187c: scan_pf 2,853 -> 1,295 ms)。
+        assert!(gdn_pf2_on(), "env 未設定の既定は on");
     }
 }
 

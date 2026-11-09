@@ -506,15 +506,60 @@ impl PleTable {
 /// PLE 表のテンソル名 (行索引が指す先)。
 pub const PLE_TABLE_NAME: &str = "per_layer_token_embd.weight";
 
+/// task 189: `DENNO_PF_PLE_PAR` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn pf_ple_par_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// テストが env を立てずにゲートを強制するための上書き (0 = env / 1 = off / 2 = on)。
+static PF_PLE_PAR_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト専用: ゲートの on/off を強制する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_pf_ple_par_for_test(v: Option<bool>) {
+    PF_PLE_PAR_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// task 189: PLE のまとめ引きを rayon のワーカー数まで並列にするか
+/// (`DENNO_PF_PLE_PAR`、既定 off。lab の結果で決める)。
+pub(crate) fn pf_ple_par_on() -> bool {
+    match PF_PLE_PAR_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pf_ple_par_from_value(std::env::var("DENNO_PF_PLE_PAR").ok().as_deref()))
+}
+
 /// まとめ引き (`PleNgram::gather_many`) の並列度 (`DENNO_PLE_PAR`)。
 ///
 /// 既定 8。`0` / `1` で逐次 (1 行 1 pread を順に出す)。行数が
 /// [`PLE_PAR_MIN_ROWS`] 未満のときは並列にしない (起動のほうが高い)。
+///
+/// task 189: `DENNO_PF_PLE_PAR=1` のときは rayon のワーカー数
+/// (`RAYON_NUM_THREADS` 由来。実機は 14) まで使う。`parts` は行の割り方
+/// だけで、1 行のデコードは同じ関数・同じバイト列なので値はビット一致する。
 fn ple_par_parts(rows: usize) -> usize {
     /// これ未満は並列にしない (1 回のまとめ引きの行数)。
     const PLE_PAR_MIN_ROWS: usize = 64;
     if rows < PLE_PAR_MIN_ROWS {
         return 1;
+    }
+    if pf_ple_par_on() {
+        let n = rayon::current_num_threads().clamp(1, 16);
+        // 1 パートあたり最低 16 行は残す (細かく割りすぎると pread が増える)。
+        return n.min(rows / 16).max(1);
     }
     static N: OnceLock<usize> = OnceLock::new();
     let n = *N.get_or_init(|| {
@@ -535,6 +580,13 @@ fn ple_par_parts(rows: usize) -> usize {
 /// 独立した上限として置いている (参照実装の規則そのものではない)。
 const MAX_N_GRAM: usize = 32;
 const MAX_N_HEADS: usize = 4096;
+
+thread_local! {
+    /// task 189: まとめ引きの作業域 (grow-only)。中身は毎回全部書き直す。
+    static PLE_SCRATCH: std::cell::RefCell<Vec<f32>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
 
 /// PLE の n-gram 索引計算 (参照実装 `qwen4exp.cpp` の `build_ple_indices` 相当)。
 ///
@@ -837,8 +889,22 @@ impl PleNgram {
 
         // 3. 表を 1 行 1 回だけ読む。
         let parts = ple_par_parts(uniq.len());
-        let mut buf = vec![0f32; uniq.len() * n_dim];
-        table.gather_rows_par(&uniq, &mut buf, parts)?;
+        let need = uniq.len() * n_dim;
+        let reuse = pf_ple_par_on();
+        // task 189: ゲートが on なら作業域をスレッドローカルで使い回す。実形は
+        // 8,000 行 x n_dim の f32 (47 MB) で、毎チャンクの確保 + 初回タッチの
+        // ページフォルトだけで 10 ms 級になる。**全行を書き直す**ので前回の
+        // 残りは値に影響しない (バイト一致)。
+        let mut scratch: Vec<f32> = if reuse {
+            let mut b = PLE_SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            if b.len() < need {
+                b.resize(need, 0.0);
+            }
+            b
+        } else {
+            vec![0f32; need]
+        };
+        table.gather_rows_par(&uniq, &mut scratch[..need], parts)?;
 
         // 4. 窓の順に配り直す (binary_search は uniq が昇順なので必ず当たる)。
         let t_dist = crate::model::prekprof::stamp();
@@ -846,9 +912,13 @@ impl PleNgram {
             let pos = uniq.binary_search(&r).map_err(|_| {
                 PleError(format!("行 {r} が重複排除の結果に無い (内部不整合)"))
             })?;
-            out[i * n_dim..(i + 1) * n_dim].copy_from_slice(&buf[pos * n_dim..(pos + 1) * n_dim]);
+            out[i * n_dim..(i + 1) * n_dim].copy_from_slice(&scratch[pos * n_dim..(pos + 1) * n_dim]);
         }
         crate::model::prekprof::mark(t_dist, crate::model::prekprof::PLE_DIST);
+        if reuse {
+            // 次のチャンクのために返す (grow-only)。
+            PLE_SCRATCH.with(|c| *c.borrow_mut() = std::mem::take(&mut scratch));
+        }
         Ok(out)
     }
 }
@@ -859,6 +929,24 @@ mod tests {
 
     /// task 182: `DENNO_PF_PLE_RAM` のゲートは env を 1 回だけ読み、テストからは
     /// 上書きできる (env は OnceLock なのでプロセス内で切り替えられない)。
+    /// task 189: `DENNO_PF_PLE_PAR` は明示的な真値だけ on (既定 off)。
+    #[test]
+    fn pf_ple_par_gate_truth_table() {
+        assert!(!pf_ple_par_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!pf_ple_par_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(pf_ple_par_from_value(Some(v)), "{v:?} が off のまま");
+        }
+        // テスト上書きが env より優先される (A/B 用)。
+        set_pf_ple_par_for_test(Some(true));
+        assert!(pf_ple_par_on());
+        set_pf_ple_par_for_test(Some(false));
+        assert!(!pf_ple_par_on());
+        set_pf_ple_par_for_test(None);
+    }
+
     #[test]
     fn ram_gate_override() {
         PleTable::set_ram_for_test(Some(true));

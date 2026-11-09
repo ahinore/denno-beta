@@ -7431,6 +7431,10 @@ fn gemv_v5_kernels_have_the_v4_abi() {
     assert!(
         BUILD_PTX_SH.contains(r#"moe_v5)       echo "kernels_moe_v5.cu|nofmad" ;;"#),
         "build_ptx.sh の moe_v5 が nofmad でない"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // task 186: prefill hc mix の down / up GEMM (`kernels_mix_pf.cu`)
 // ---------------------------------------------------------------------------
 //
@@ -7833,6 +7837,15 @@ fn dec_epi_kernel_is_registered_in_build_ptx() {
             && launch.contains("&mut pw as *mut _ as *mut c_void")
             && launch.contains("&mut po as *mut _ as *mut c_void"),
         "起動配列の並びが変わった (h, w, sh, sgw, out の順)"
+    );
+}
+
+#[test]
+fn gdn_pf2_kernel_is_wired() {
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
     assert!(
         targets.contains("gdn_pf2"),
         "build_ptx.sh の targets_all に gdn_pf2 が無い: {targets}"
@@ -7861,15 +7874,61 @@ fn dec_epi_kernel_is_registered_in_build_ptx() {
     }
 }
 
-/// ゲート (`DENNO_PF_SCAN_FAST`) の既定は **off** (lab の結果で決める)。
+/// ゲート (`DENNO_PF_SCAN_FAST`) の既定は **on** (task 189: lab t187c で
+/// scan_pf 2,853 -> 1,295 ms・wall -3.2%・md5 SAME を確認して既定を反転した)。
 #[test]
-fn gdn_pf2_gate_defaults_off() {
+fn gdn_pf2_gate_defaults_on() {
     let i = CUDA_RS
         .find("pub(crate) fn gdn_pf2_from_value")
         .expect("gdn_pf2_from_value が無い");
-    let body: String = CUDA_RS[i..].chars().take(200).collect();
+    let body: String = CUDA_RS[i..].chars().take(400).collect();
     assert!(
-        body.contains("None => false,"),
-        "gdn_pf2_from_value(None) が off でない: {body}"
+        body.contains("None => true,"),
+        "gdn_pf2_from_value(None) が on でない: {body}"
     );
+    // `=0` などの明示 off は従来どおり効く (A/B と切り戻しのため)。
+    for v in ["\"0\"", "\"off\"", "\"false\""] {
+        assert!(body.contains(v), "明示 off の解釈 ({v}) が消えた: {body}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 189: mix / combine の同期を自ストリームだけにする (`DENNO_PF_MIX_STAGE`)
+// ---------------------------------------------------------------------------
+
+/// ゲートの実体が「cuCtxSynchronize ではなくイベント同期」であること。
+///
+/// ここが `ctx.sync()` に戻ると、prefill の expert upload (非ブロッキング
+/// ストリーム) の完了待ちが mix の壁時計に戻る (t187c の 3.6 s)。
+#[test]
+fn pf_mix_stage_sync_uses_an_event() {
+    let body = fn_body(CUDA_RS, "fn pf_sync_own_stream");
+    assert!(
+        body.contains("check(es(ev)"),
+        "cuEventSynchronize を呼んでいない: {body}"
+    );
+    assert!(
+        body.contains("create(&mut e, 0x02)"),
+        "CU_EVENT_DISABLE_TIMING でイベントを作っていない: {body}"
+    );
+    assert!(
+        CUDA_RS.contains("CU_STREAM_NON_BLOCKING"),
+        "upload が非ブロッキングである根拠 (と 0x01 の定義) が消えた"
+    );
+    // mix と combine の両方がこの同期を通る (片方だけだと待ちが残る)。
+    assert_eq!(
+        CUDA_RS.matches("pf_stage_sync(ctx)").count(),
+        2,
+        "pf_mix / pf_combine の両方が pf_stage_sync を通っていない"
+    );
+    // 計測器 (DENNO_PF_MIX_KPROF) は段の前後にイベントを打っている。
+    for k in [
+        "pf_mix_kprof::begin(pf_mix_kprof::NORM)",
+        "pf_mix_kprof::begin(pf_mix_kprof::DOWN)",
+        "pf_mix_kprof::begin(pf_mix_kprof::UP)",
+        "pf_mix_kprof::begin(pf_mix_kprof::INJ)",
+        "pf_mix_kprof::collect()",
+    ] {
+        assert!(CUDA_RS.contains(k), "mix の段計測 {k} が無い");
+    }
 }

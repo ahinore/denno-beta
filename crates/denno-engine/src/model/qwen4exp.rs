@@ -10861,6 +10861,25 @@ pub(crate) fn pf_ple_f32_gpu_on() -> bool {
     *ON.get_or_init(|| pf182_from_value(std::env::var("DENNO_PF_PLE_F32_GPU").ok().as_deref()))
 }
 
+/// task 189: `DENNO_PF_ROUTER_SM` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn pf_router_sm_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// task 189: router の softmax と top-k を「1 行 1 rayon タスク」ではなく
+/// 「トークンをワーカー数で割ったブロック」で回す (`DENNO_PF_ROUTER_SM`、既定 off)。
+///
+/// `par_chunks_mut(ne)` は 1 行 (ne=512 要素) ごとに 1 タスクを作るので、
+/// 1 チャンク 512 トークン × 48 層 × 28 チャンク = 68.8 万タスクになる。
+/// 行は独立なので割り方だけを変えれば値はビット一致する。
+pub(crate) fn pf_router_sm_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_router_sm_from_value(std::env::var("DENNO_PF_ROUTER_SM").ok().as_deref()))
+}
+
 /// task 182: router を GPU に載せる最小トークン数 (これ未満は CPU バッチ)。
 ///
 /// 19 トークンの next turn prefill はここで CPU のまま (= 従来とビット一致) に
@@ -12459,6 +12478,180 @@ fn moe_ffn_quant_batch_tapped(
     )
 }
 
+/// task 189: router のソフトマックスの行割り。
+///
+/// `Some(n)` は「トークンを n ブロックに割って 1 タスク 1 ブロック」、
+/// `None` は従来の「1 行 1 タスク」。行は独立なので値はどちらでも同じ。
+fn router_sm_block() -> Option<usize> {
+    #[cfg(feature = "par")]
+    {
+        if pf_router_sm_on() {
+            return Some(rayon::current_num_threads().max(1));
+        }
+    }
+    None
+}
+
+/// top-k の再正規化 (選択 index 昇順に逐次加算した和で割る)。
+fn router_renorm(pr: &[f32], sel: &[usize], w: &mut [f32]) {
+    let mut sum = 0.0f32;
+    for &i in sel {
+        sum += pr[i];
+    }
+    for (j, &i) in sel.iter().enumerate() {
+        w[j] = pr[i] / sum;
+    }
+}
+
+/// task 189: 行ごとの softmax (block が `Some` ならトークンをブロックで割る)。
+fn router_softmax_rows(probs: &mut [f32], ne: usize, block: Option<usize>) {
+    let nt = probs.len() / ne.max(1);
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        match block {
+            Some(n) => {
+                let per = nt.div_ceil(n.max(1)).max(1);
+                probs.par_chunks_mut(per * ne).for_each(|c| {
+                    for row in c.chunks_mut(ne) {
+                        softmax(row);
+                    }
+                });
+            }
+            None => probs.par_chunks_mut(ne).for_each(softmax),
+        }
+        return;
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        let _ = block;
+        for t in 0..nt {
+            softmax(&mut probs[t * ne..(t + 1) * ne]);
+        }
+    }
+}
+
+/// task 189: 行ごとの top-k + 再正規化 (block が `Some` ならトークンを割る)。
+#[allow(clippy::too_many_arguments)]
+fn router_topk_rows(
+    probs: &[f32],
+    ne: usize,
+    k: usize,
+    sels: &mut [usize],
+    weights: &mut [f32],
+    block: Option<usize>,
+) {
+    let nt = probs.len() / ne.max(1);
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        match block {
+            Some(n) => {
+                let per = nt.div_ceil(n.max(1)).max(1);
+                sels.par_chunks_mut(per * k)
+                    .zip(weights.par_chunks_mut(per * k))
+                    .enumerate()
+                    .for_each_init(Vec::<u32>::new, |buf, (ci, (s, w))| {
+                        let base = ci * per;
+                        for j in 0..s.len() / k {
+                            let t = base + j;
+                            let pr = &probs[t * ne..(t + 1) * ne];
+                            let (sj, wj) =
+                                (&mut s[j * k..(j + 1) * k], &mut w[j * k..(j + 1) * k]);
+                            select_topk_into(pr, k, buf, sj);
+                            router_renorm(pr, sj, wj);
+                        }
+                    });
+            }
+            None => {
+                sels.par_chunks_mut(k)
+                    .zip(weights.par_chunks_mut(k))
+                    .enumerate()
+                    .for_each_init(Vec::<u32>::new, |buf, (t, (s, w))| {
+                        let pr = &probs[t * ne..(t + 1) * ne];
+                        select_topk_into(pr, k, buf, s);
+                        router_renorm(pr, s, w);
+                    });
+            }
+        }
+        return;
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        let _ = block;
+        let mut buf: Vec<u32> = Vec::new();
+        for t in 0..nt {
+            let pr = &probs[t * ne..(t + 1) * ne];
+            select_topk_into(pr, k, &mut buf, &mut sels[t * k..(t + 1) * k]);
+            router_renorm(pr, &sels[t * k..(t + 1) * k], &mut weights[t * k..(t + 1) * k]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod router_sm_tests {
+    use super::*;
+
+    /// task 189: 行の割り方 (1 行 1 タスク / n ブロック) を変えても
+    /// softmax・top-k・再正規化の値がビット一致すること。
+    ///
+    /// 端数が出る形 (nt=7, ne=8, k=3, ブロック数 3) にして、最後の切れ端と
+    /// `base` の計算も通す。同値の選択規則 (小さい index が先) も固定する。
+    #[test]
+    fn blocked_rows_match_per_row() {
+        let (nt, ne, k) = (7usize, 8usize, 3usize);
+        let xs: Vec<f32> = (0..nt * ne)
+            .map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5)
+            .collect();
+
+        let mut a = xs.clone();
+        router_softmax_rows(&mut a, ne, None);
+        let mut b = xs.clone();
+        router_softmax_rows(&mut b, ne, Some(3));
+        for i in 0..a.len() {
+            assert_eq!(a[i].to_bits(), b[i].to_bits(), "softmax 要素 {i}");
+        }
+        // 各行の和は 1 (softmax が実際に効いている)。
+        for t in 0..nt {
+            let s: f32 = a[t * ne..(t + 1) * ne].iter().sum();
+            assert!((s - 1.0).abs() < 1e-5, "行 {t} の和 {s}");
+        }
+
+        let mut s1 = vec![0usize; nt * k];
+        let mut w1 = vec![0f32; nt * k];
+        router_topk_rows(&a, ne, k, &mut s1, &mut w1, None);
+        let mut s2 = vec![0usize; nt * k];
+        let mut w2 = vec![0f32; nt * k];
+        router_topk_rows(&a, ne, k, &mut s2, &mut w2, Some(3));
+        assert_eq!(s1, s2, "top-k の選択が割り方で変わった");
+        for i in 0..w1.len() {
+            assert_eq!(w1[i].to_bits(), w2[i].to_bits(), "重み 要素 {i}");
+        }
+
+        // 同値だらけの行: 小さい index から k 個 (task 182 の規則)。
+        let flat = vec![1.0f32; ne];
+        let mut s3 = vec![0usize; k];
+        let mut w3 = vec![0f32; k];
+        router_topk_rows(&flat, ne, k, &mut s3, &mut w3, None);
+        assert_eq!(s3, vec![0, 1, 2], "同値のとき小さい index が先でない");
+        for v in w3 {
+            assert!((v - 1.0 / 3.0).abs() < 1e-6, "再正規化の重み {v}");
+        }
+    }
+
+    /// task 189: `DENNO_PF_ROUTER_SM` は明示的な真値だけ on (既定 off)。
+    #[test]
+    fn router_sm_gate_truth_table() {
+        assert!(!pf_router_sm_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!pf_router_sm_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(pf_router_sm_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+}
+
 /// task 162: prefill の終端でステージング領域を必ず返すためのガード。
 ///
 /// decode のあいだステージング (既定 512 MiB) を抱えたままにすると、expert の
@@ -12588,15 +12781,9 @@ fn moe_ffn_quant_batch_full(
     // 2. トークンごとの softmax (行は独立なので並列化しても値は変わらない)
     // task 154: 台帳の副区間 (softmax + top-k)。
     let _sub_sm = q4ledger::sub(q4ledger::SUB_SOFTMAX);
-    #[cfg(feature = "par")]
-    {
-        use rayon::prelude::*;
-        probs.par_chunks_mut(ne).for_each(softmax);
-    }
-    #[cfg(not(feature = "par"))]
-    for t in 0..nt {
-        softmax(&mut probs[t * ne..(t + 1) * ne]);
-    }
+    // task 189: `DENNO_PF_ROUTER_SM` のときは行ごとのタスク生成をやめる。
+    let sm_block = router_sm_block();
+    router_softmax_rows(&mut probs, ne, sm_block);
 
     // 3. top-k (index 昇順) + 再正規化 (選択 index 昇順に逐次加算した和で割る)。
     //    P33: トークンごとの `Vec` を作らず、平らな配列へ直接書く (1 層あたり
@@ -12604,36 +12791,7 @@ fn moe_ffn_quant_batch_full(
     //    [`select_topk`] と同じ (同値は小さい index) なので値は変わらない。
     let mut sels: Vec<usize> = vec![0; nt * k];
     let mut weights: Vec<f32> = vec![0.0; nt * k];
-    let renorm = |pr: &[f32], sel: &[usize], w: &mut [f32]| {
-        let mut sum = 0.0f32;
-        for &i in sel {
-            sum += pr[i];
-        }
-        for (j, &i) in sel.iter().enumerate() {
-            w[j] = pr[i] / sum;
-        }
-    };
-    #[cfg(feature = "par")]
-    {
-        use rayon::prelude::*;
-        sels.par_chunks_mut(k)
-            .zip(weights.par_chunks_mut(k))
-            .enumerate()
-            .for_each_init(Vec::<u32>::new, |buf, (t, (s, w))| {
-                let pr = &probs[t * ne..(t + 1) * ne];
-                select_topk_into(pr, k, buf, s);
-                renorm(pr, s, w);
-            });
-    }
-    #[cfg(not(feature = "par"))]
-    {
-        let mut buf: Vec<u32> = Vec::new();
-        for t in 0..nt {
-            let pr = &probs[t * ne..(t + 1) * ne];
-            select_topk_into(pr, k, &mut buf, &mut sels[t * k..(t + 1) * k]);
-            renorm(pr, &sels[t * k..(t + 1) * k], &mut weights[t * k..(t + 1) * k]);
-        }
-    }
+    router_topk_rows(&probs, ne, k, &mut sels, &mut weights, sm_block);
     drop(_sub_sm);
     moe_sub_add(0, t_router.elapsed());
     // 区間を閉じる (experts の時間を router に二重計上しない)。
