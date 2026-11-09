@@ -1592,6 +1592,82 @@ pub trait LayerAttn: Send {
     ) -> std::result::Result<(), Qwen4ExpError> {
         Ok(())
     }
+
+    /// task 206: 系列状態を **move で** 差し替えられる実装か。
+    ///
+    /// serve は 1 つのモデル (重み) を共有したまま、文脈ごとの系列状態
+    /// (KV / GDN conv+ssm / PLE conv / pos) だけを入れ替えて持ち回る。
+    /// 状態を持たない実装と、QSA 有効の [`FullAttn`] (indexer の生キーが
+    /// 文脈長ぶんあり、move の口が無い) は `false` を返す。
+    fn seq_state_supported(&self) -> bool {
+        false
+    }
+
+    /// task 206: 系列状態を丸ごと取り出し、この実装を「新しい系列の先頭」に戻す。
+    ///
+    /// 取り出した状態は [`Self::seq_state_put`] で戻すまで保持してよい
+    /// (別の状態を載せて別の文脈を回しても、取り出した状態は壊れない)。
+    /// 取り出しは **コピーしない** (KV は Vec ごと移す)。対応しない実装は
+    /// `None` (状態は変わらない)。
+    fn seq_state_take(&mut self) -> Option<SeqState> {
+        None
+    }
+
+    /// task 206: [`Self::seq_state_take`] で取り出した状態へ戻す。
+    /// 取り出したあとの空の状態は捨てる。
+    fn seq_state_put(&mut self, _st: SeqState) -> std::result::Result<(), Qwen4ExpError> {
+        Err(one(
+            "seq_state_put: この実装は系列状態の差し替えに対応していない",
+        ))
+    }
+}
+
+/// task 206: 1 つの文脈 (会話) ぶんの系列状態を運ぶ入れ物。
+///
+/// 中身は実装固有 ([`crate::model::qwen4exp_attn::FullSeqState`] /
+/// [`crate::model::qwen4exp_ssm::SsmSeqState`]) で、作ったモデルにしか戻せない。
+/// `bytes` は取り出した時点の RAM 使用量 (KV の容量ベース。確保済みの分を含む)。
+pub struct SeqState {
+    inner: Box<dyn std::any::Any + Send>,
+    bytes: usize,
+}
+
+impl SeqState {
+    pub(crate) fn new(inner: Box<dyn std::any::Any + Send>, bytes: usize) -> Self {
+        Self { inner, bytes }
+    }
+
+    /// この状態が持っている RAM バイト数 (KV の Vec 容量 + 付随データ)。
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// 中身を取り出す (`seq_state_put` の実装が downcast する)。
+    pub(crate) fn into_inner(self) -> Box<dyn std::any::Any + Send> {
+        self.inner
+    }
+}
+
+/// task 206: 1 つの文脈ぶんの **モデル全体** の系列状態。
+///
+/// PLE の conv 履歴 (`Qwen4Exp::ple_conv_state`) と attention 側の状態
+/// ([`SeqState`]) をまとめたもの。重み・expert キャッシュ・PLE の表は含まない。
+pub struct ModelSeqState {
+    ple: Vec<Option<Vec<f32>>>,
+    attn: SeqState,
+}
+
+impl ModelSeqState {
+    /// この状態が持っている RAM バイト数。
+    pub fn bytes(&self) -> usize {
+        let ple: usize = self
+            .ple
+            .iter()
+            .flatten()
+            .map(|b| b.capacity() * std::mem::size_of::<f32>())
+            .sum();
+        self.attn.bytes() + ple
+    }
 }
 
 /// P109: [`crate::model::qwen4exp_attn::FullAttn`] の spec スナップショット。
@@ -2294,6 +2370,62 @@ impl Qwen4Exp {
         self.reset_ple_conv();
         self.attn.reset();
         self.arch_emit = ArchEmit::default();
+    }
+
+    /// task 206: 系列状態の差し替えに対応しているか ([`LayerAttn::seq_state_supported`])。
+    pub fn seq_state_supported(&self) -> bool {
+        self.attn.seq_state_supported()
+    }
+
+    /// task 206: 系列状態 (PLE conv + attention) を move で取り出し、
+    /// このモデルを新しい系列の先頭に戻す。
+    ///
+    /// 取り出しはコピーしない (KV は `Vec` ごと移す)。attention 側が非対応
+    /// (QSA 有効など) なら `None` を返し、状態は変えない。
+    pub fn seq_state_take(&mut self) -> Option<ModelSeqState> {
+        let attn = self.attn.seq_state_take()?;
+        // 空の PLE conv 履歴を置いて、今の中身を移す。
+        let fresh: Vec<Option<Vec<f32>>> = self
+            .ple_conv_state
+            .iter()
+            .map(|b| b.as_ref().map(|v| vec![0.0; v.len()]))
+            .collect();
+        let ple = std::mem::replace(&mut self.ple_conv_state, fresh);
+        Some(ModelSeqState { ple, attn })
+    }
+
+    /// task 206: [`Self::seq_state_take`] で取り出した状態へ戻す。
+    /// 今の (空の) 状態は捨てる。形状が違えば `Err` (状態は変えない)。
+    pub fn seq_state_put(&mut self, st: ModelSeqState) -> Result<()> {
+        if st.ple.len() != self.ple_conv_state.len() {
+            return Err(one(format!(
+                "seq_state_put: PLE conv の層数 {} が現在の層数 {} と違う",
+                st.ple.len(),
+                self.ple_conv_state.len()
+            )));
+        }
+        for (i, (dst, src)) in self.ple_conv_state.iter().zip(st.ple.iter()).enumerate() {
+            match (dst, src) {
+                (Some(d), Some(s)) if d.len() == s.len() => {}
+                (None, None) => {}
+                (Some(d), Some(s)) => {
+                    return Err(one(format!(
+                        "seq_state_put: 層 {i} の PLE conv 長 {} が {} と違う",
+                        s.len(),
+                        d.len()
+                    )))
+                }
+                _ => {
+                    return Err(one(format!(
+                        "seq_state_put: 層 {i} の PLE conv の有無が現在のモデルと違う"
+                    )))
+                }
+            }
+        }
+        // 先に attention 側を戻す (失敗したら PLE を触らない)。
+        self.attn.seq_state_put(st.attn)?;
+        self.ple_conv_state = st.ple;
+        Ok(())
     }
 
     /// 諸元（読み取り専用）。

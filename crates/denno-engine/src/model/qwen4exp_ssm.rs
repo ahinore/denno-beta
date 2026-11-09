@@ -36,7 +36,7 @@ use crate::gguf::GgufFile;
 use crate::kquant::GgmlType;
 use crate::model::linear_gguf::{FusedLinear, GgufLinear};
 use crate::model::qwen4exp::{
-    one, IdentityAttn, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams, SpecGdnSnap,
+    one, IdentityAttn, LayerAttn, LayerKind, Qwen4ExpError, Qwen4ExpParams, SeqState, SpecGdnSnap,
 };
 use crate::quant::WeightBlocks;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1262,6 +1262,16 @@ impl SsmAttn {
     }
 }
 
+/// task 206: [`SsmAttn`] の系列状態 (GDN の conv / ssm と full attention 側)。
+///
+/// 重みは含まない。GDN の状態は文脈長に依存しない (層あたり conv + ssm の固定長)。
+pub struct SsmSeqState {
+    /// 層ごとの GDN 状態 (full attention 層は `None`)。
+    gdn: Vec<Option<(Vec<f32>, Vec<f32>)>>,
+    /// 委譲先 (full attention 実装) の状態。
+    full: SeqState,
+}
+
 impl LayerAttn for SsmAttn {
     fn forward(
         &mut self,
@@ -1414,6 +1424,134 @@ impl LayerAttn for SsmAttn {
             }
         }
         self.full.spec_restore(&*s.full)
+    }
+
+    /// task 206: full attention 側が対応しているときだけ対応する。
+    fn seq_state_supported(&self) -> bool {
+        self.full.seq_state_supported()
+    }
+
+    /// task 206: GDN の conv / ssm を層ごとに取り出し、full attention 側も取り出す。
+    ///
+    /// デバイスが正本のとき (直前の decode を GPU が処理した直後) は D2H で
+    /// 最新の値を取る ([`Self::spec_snapshot`] と同じ規約)。取り出したあとの
+    /// ホスト状態は 0 に戻し、デバイス側のコピーは捨てる (次の decode 1 トークン目で
+    /// ホストから再シードする)。
+    fn seq_state_take(&mut self) -> Option<SeqState> {
+        // full attention 側が非対応なら、何も触らずに諦める。
+        if !self.full.seq_state_supported() {
+            return None;
+        }
+        // 1) まず読むだけ (デバイスが正本の層は D2H)。読めなかったら何も変えない
+        //    — 半端に消えた状態を残さない (br114 の `!!!!` と同じ失敗を避ける)。
+        let n = self.layers.len();
+        let mut dev: Vec<Option<(Vec<f32>, Vec<f32>)>> = (0..n).map(|_| None).collect();
+        #[allow(unused_mut)]
+        let mut lost = false;
+        for (i, l) in self.layers.iter().enumerate() {
+            let Some(s) = l.as_ref() else { continue };
+            #[cfg(feature = "cuda")]
+            if crate::cuda::gdn_gpu_scan_on() {
+                match crate::cuda::gdn_decode_state_read(s.nonce, s.il) {
+                    crate::cuda::GdnDecodeRead::Device(conv, ssm) => {
+                        dev[i] = Some((conv, ssm));
+                    }
+                    crate::cuda::GdnDecodeRead::Lost => lost = true,
+                    crate::cuda::GdnDecodeRead::HostCurrent => {}
+                }
+            }
+        }
+        if lost {
+            tracing::error!(
+                "[gdn-gpu-scan] 系列状態の読み取り (D2H) に失敗。文脈を持ち回らない"
+            );
+            return None;
+        }
+        // 2) 取り出す (ホスト state は move、デバイス正本だった層は 0 に戻す)。
+        let mut gdn: Vec<Option<(Vec<f32>, Vec<f32>)>> = Vec::with_capacity(n);
+        let mut bytes = 0usize;
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            match l.as_mut() {
+                Some(s) => {
+                    let pair = match dev[i].take() {
+                        Some(pair) => pair,
+                        None => {
+                            let n_conv = s.state.conv.len();
+                            let n_ssm = s.state.ssm.len();
+                            (
+                                std::mem::replace(&mut s.state.conv, vec![0.0; n_conv]),
+                                std::mem::replace(&mut s.state.ssm, vec![0.0; n_ssm]),
+                            )
+                        }
+                    };
+                    bytes += (pair.0.capacity() + pair.1.capacity()) * 4;
+                    #[cfg(feature = "cuda")]
+                    if crate::cuda::gdn_gpu_scan_on() {
+                        crate::cuda::gdn_decode_state_invalidate(s.nonce, s.il);
+                    }
+                    gdn.push(Some(pair));
+                }
+                None => gdn.push(None),
+            }
+        }
+        // task 154: prefill の GPU スキャンも同じ鍵で状態を持つので、系列の切れ目で
+        // デバイス側を捨てる (reset と同じ扱い)。
+        #[cfg(feature = "cuda")]
+        crate::cuda::gdn_state_release();
+        let full = self.full.seq_state_take()?;
+        bytes += full.bytes();
+        Some(SeqState::new(Box::new(SsmSeqState { gdn, full }), bytes))
+    }
+
+    /// task 206: GDN の conv / ssm と full attention 側の状態を戻す。
+    fn seq_state_put(&mut self, st: SeqState) -> std::result::Result<(), Qwen4ExpError> {
+        let s = st
+            .into_inner()
+            .downcast::<SsmSeqState>()
+            .map_err(|_| one("SsmAttn::seq_state_put: 状態の型が違う"))?;
+        if s.gdn.len() != self.layers.len() {
+            return Err(one(format!(
+                "SsmAttn::seq_state_put: 層数 {} が現在の層数 {} と違う",
+                s.gdn.len(),
+                self.layers.len()
+            )));
+        }
+        // 形状を全部検査してから差し替える (途中で失敗して半端な状態にしない)。
+        for (il, (l, src)) in self.layers.iter().zip(s.gdn.iter()).enumerate() {
+            match (l.as_ref(), src.as_ref()) {
+                (None, None) => {}
+                (Some(layer), Some((conv, ssm))) => {
+                    if conv.len() != layer.state.conv.len() || ssm.len() != layer.state.ssm.len() {
+                        return Err(one(format!(
+                            "SsmAttn::seq_state_put: 層 {il} の状態長 {} / {} が {} / {} と違う",
+                            conv.len(),
+                            ssm.len(),
+                            layer.state.conv.len(),
+                            layer.state.ssm.len()
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(one(format!(
+                        "SsmAttn::seq_state_put: 層 {il} の種別が状態と違う"
+                    )))
+                }
+            }
+        }
+        for (l, src) in self.layers.iter_mut().zip(s.gdn.into_iter()) {
+            if let (Some(layer), Some((conv, ssm))) = (l.as_mut(), src) {
+                layer.state.conv = conv;
+                layer.state.ssm = ssm;
+                // task 128: ホスト状態を差し替えたので、デバイス側のコピーはもう正でない。
+                #[cfg(feature = "cuda")]
+                if crate::cuda::gdn_gpu_scan_on() {
+                    crate::cuda::gdn_decode_state_invalidate(layer.nonce, layer.il);
+                }
+            }
+        }
+        #[cfg(feature = "cuda")]
+        crate::cuda::gdn_state_release();
+        self.full.seq_state_put(s.full)
     }
 }
 

@@ -30,7 +30,7 @@
 //! このモジュールは古い順のまま渡してよい。
 
 use crate::model::qwen4exp::{
-    one, q4prof, LayerOut, Qwen4Exp, Qwen4ExpError, RoleRms, TapTokens,
+    one, q4prof, LayerOut, ModelSeqState, Qwen4Exp, Qwen4ExpError, RoleRms, TapTokens,
 };
 
 /// `qwen4exp.rs` と同じ「1 行 1 件」のエラー型を使う。
@@ -110,6 +110,29 @@ pub struct SpecStep {
     pub n_accepted: usize,
 }
 
+/// task 206: 1 つの文脈 (会話) ぶんの decoder 状態 = トークン列 + モデルの系列状態。
+///
+/// [`Qwen4ExpDecoder::take_seq_state`] で取り出し、
+/// [`Qwen4ExpDecoder::put_seq_state`] で戻す。取り出し / 復元はどちらも
+/// **コピーしない** (KV は `Vec` ごと移す)。重みは含まないので、同じモデルを
+/// 共有したまま複数の文脈を持ち回れる。
+pub struct DecoderSeqState {
+    tokens: Vec<u32>,
+    model: ModelSeqState,
+}
+
+impl DecoderSeqState {
+    /// この状態が食ったトークン列 (古い順)。
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    /// この状態が持っている RAM バイト数 (KV の容量 + GDN + PLE conv + トークン列)。
+    pub fn bytes(&self) -> usize {
+        self.model.bytes() + self.tokens.capacity() * std::mem::size_of::<u32>()
+    }
+}
+
 /// プロンプトを食わせて N トークン貪欲に伸ばす駆動部。
 pub struct Qwen4ExpDecoder {
     model: Qwen4Exp,
@@ -151,6 +174,31 @@ impl Qwen4ExpDecoder {
     pub fn reset(&mut self) {
         self.tokens.clear();
         self.model.reset();
+    }
+
+    /// task 206: 系列状態の差し替えに対応しているか
+    /// ([`Qwen4Exp::seq_state_supported`])。
+    pub fn seq_state_supported(&self) -> bool {
+        self.model.seq_state_supported()
+    }
+
+    /// task 206: この decoder の系列状態 (トークン列 + KV / GDN / PLE conv) を
+    /// 取り出し、decoder を新規構築直後と同じ状態に戻す。
+    ///
+    /// コピーしない (KV は `Vec` ごと移す)。非対応 (QSA 有効など) なら `None` を
+    /// 返し、状態は変えない。取り出した状態は [`Self::put_seq_state`] で戻せる。
+    pub fn take_seq_state(&mut self) -> Option<DecoderSeqState> {
+        let model = self.model.seq_state_take()?;
+        let tokens = std::mem::take(&mut self.tokens);
+        Some(DecoderSeqState { tokens, model })
+    }
+
+    /// task 206: [`Self::take_seq_state`] で取り出した状態へ戻す。
+    /// 今の (空の) 状態は捨てる。形状が違えば `Err` (状態は変えない)。
+    pub fn put_seq_state(&mut self, st: DecoderSeqState) -> Result<()> {
+        self.model.seq_state_put(st.model)?;
+        self.tokens = st.tokens;
+        Ok(())
     }
 
     /// 層数 (P54: expert 在庫スナップショットの本数)。
