@@ -2290,6 +2290,41 @@ pub enum TapTokens {
     Last,
 }
 
+/// task 209: prefill の resident 経路を出るときに「mixed のホスト/デバイス対応」
+/// の記録を消す (`DENNO_PF_MIXDEVIN` が古い記録を拾わないため)。
+#[cfg(feature = "cuda")]
+struct PfMixedMarkGuard;
+
+#[cfg(feature = "cuda")]
+impl Drop for PfMixedMarkGuard {
+    fn drop(&mut self) {
+        crate::cuda::pf_mixed_mark_clear();
+    }
+}
+
+/// task 209: prefill の活性ホストバッファ。`cuda` feature では pinned を試す
+/// ([`crate::cuda::PfHostBuf`])、無いときは普通の `Vec`。
+#[cfg(feature = "cuda")]
+use crate::cuda::PfHostBuf as PfHostBuf;
+
+/// task 209: `cuda` feature 無しのホストバッファ (常に `Vec`)。
+#[cfg(not(feature = "cuda"))]
+struct PfHostBuf {
+    v: Vec<f32>,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl PfHostBuf {
+    fn new(len: usize) -> Self {
+        Self {
+            v: vec![0.0f32; len],
+        }
+    }
+    fn as_mut_slice(&mut self) -> &mut [f32] {
+        &mut self.v
+    }
+}
+
 impl Qwen4Exp {
     /// 実 GGUF から組む。**全テンソルの存在・形状・量子型を先に検査**して、
     /// 1 本でも欠けたら `Err` にする (黙って 0 で埋めない)。
@@ -3245,6 +3280,20 @@ fn pf_lin(w: &GgufLinear) -> crate::cuda::PfLin<'_> {
 /// task 172: shared expert の 3 射影をデバイスで回す (`cuda` feature 無しは常に false)。
 #[cfg(feature = "cuda")]
 fn pf_shared_dev_run(lw: &LayerW, xs: &[f32], nt: usize, e: usize, sff: usize, sh: &mut [f32]) -> bool {
+    // task 209: 入力が直近の `pf_mix` の出力そのものなら、H2D をせずに
+    // デバイスの `mixed` を読む (`DENNO_PF_MIXDEVIN`)。
+    if let Some(dp) = crate::cuda::pf_mixed_dev_in_ptr(xs.as_ptr(), nt, e) {
+        return crate::cuda::pf_shared_dev(
+            dp,
+            nt,
+            e,
+            sff,
+            Self::pf_lin(&lw.gate_shexp),
+            Self::pf_lin(&lw.up_shexp),
+            Self::pf_lin(&lw.down_shexp),
+            sh,
+        );
+    }
     crate::cuda::pf_shared(
         xs,
         nt,
@@ -3438,6 +3487,14 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             Self::pf_note_decline("作業域/PTX/GPU の前提外");
             return Ok(None);
         }
+        // task 209: `DENNO_PF_PIN` のときは mix の出力 (mix の D2H の宛先、
+        // router と shared の H2D の元) を pinned ホストメモリに置く。同じ
+        // バイト列がページャブル経由より速く動く (値は 1 bit も変わらない)。
+        // 1 リクエスト 1 本 (チャンクで使い回す)。
+        let mut mixed_buf = PfHostBuf::new(first_nt * e);
+        // task 209: 「このホスト配列はデバイスの mixed と同一」の記録は
+        // この関数を出るときに必ず消す (非常駐経路が古い記録を拾わない)。
+        let _mixed_mark = PfMixedMarkGuard;
         // P78: チャンクぶんの PLE は行単位でまとめて引く (従来と同じ)。
         let ple_batch = ple_batch_enabled();
         let mut last: Option<HyperStreams> = None;
@@ -3470,7 +3527,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
             if !crate::cuda::pf_upload_res(&res_flat) {
                 Self::pf_bail("res の H2D に失敗")?;
             }
-            let mut mixed_flat = vec![0.0f32; nt * e];
+            let mixed_flat: &mut [f32] = &mut mixed_buf.as_mut_slice()[..nt * e];
             let t_lay = prekprof::stamp();
             for il in 0..n_layer {
                 let lw = &self.layers[il];
@@ -3577,9 +3634,12 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     ) {
                         Self::pf_bail("attn mix の連鎖に失敗")?;
                     }
-                    if !crate::cuda::pf_take_mixed(&mut mixed_flat) {
+                    if !crate::cuda::pf_take_mixed(mixed_flat) {
                         Self::pf_bail("attn mix の mixed D2H に失敗")?;
                     }
+                    // task 209: デバイスの `mixed` とこのホスト配列は同じ内容
+                    // (`DENNO_PF_MIXDEVIN` の router / shared が読む)。
+                    crate::cuda::pf_mixed_mark(mixed_flat.as_ptr(), nt, e);
                 }
                 q4prof::add(&q4prof::MIX, t_mix);
                 // task 200: `DENNO_PF_ATTN_FLAT` は活性を平坦なまま attn へ渡し、
@@ -3609,7 +3669,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     let r = Self::prefill_attn_chunk(
                         self.attn.as_mut(),
                         il,
-                        &mixed_flat,
+                        mixed_flat,
                         &curs,
                         nt,
                         e,
@@ -3659,9 +3719,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     ) {
                         Self::pf_bail("ffn mix の連鎖に失敗")?;
                     }
-                    if !crate::cuda::pf_take_mixed(&mut mixed_flat) {
+                    if !crate::cuda::pf_take_mixed(mixed_flat) {
                         Self::pf_bail("ffn mix の mixed D2H に失敗")?;
                     }
+                    crate::cuda::pf_mixed_mark(mixed_flat.as_ptr(), nt, e);
                 }
                 q4prof::add(&q4prof::MIX, t_mix);
                 let t_moe = std::time::Instant::now();
@@ -14135,18 +14196,38 @@ fn moe_ffn_quant_batch_full(
     // task 182: router (`ffn_gate_inp`、F32) を GPU の f32 GEMM で回す
     // (`DENNO_PF_ROUTER_GPU=1` のときだけ。失敗・前提外は CPU バッチへ)。
     #[cfg(feature = "cuda")]
+    let dev_router_in = if lw.gate_inp.k() == e {
+        crate::cuda::pf_mixed_dev_in_ptr(xs.as_ptr(), nt, e)
+    } else {
+        None
+    };
+    #[cfg(feature = "cuda")]
     let gpu_router = pf_router_gpu_on()
         && nt >= PF_ROUTER_GPU_MIN_TOK
-        && crate::cuda::maybe_gpu_f32_gemm_batch_into(
-            lw.gate_inp.uid(),
-            lw.gate_inp.blocks().as_slice(),
-            lw.gate_inp.k(),
-            lw.gate_inp.n(),
-            xs,
-            nt,
-            &mut probs,
-            GgmlType::F32,
-        );
+        && match dev_router_in {
+            // task 209: 入力が直近の mix の出力なら、デバイスの `mixed` を直接読む
+            // (`DENNO_PF_MIXDEVIN`)。値はホストから上げるのと同じバイト列。
+            Some(dp) => crate::cuda::maybe_gpu_f32_gemm_batch_dev_into(
+                lw.gate_inp.uid(),
+                lw.gate_inp.blocks().as_slice(),
+                lw.gate_inp.k(),
+                lw.gate_inp.n(),
+                dp,
+                nt,
+                &mut probs,
+                GgmlType::F32,
+            ),
+            None => crate::cuda::maybe_gpu_f32_gemm_batch_into(
+                lw.gate_inp.uid(),
+                lw.gate_inp.blocks().as_slice(),
+                lw.gate_inp.k(),
+                lw.gate_inp.n(),
+                xs,
+                nt,
+                &mut probs,
+                GgmlType::F32,
+            ),
+        };
     #[cfg(not(feature = "cuda"))]
     let gpu_router = false;
     if gpu_router {
@@ -14326,13 +14407,16 @@ fn moe_ffn_quant_batch_full(
     let _l_shared = q4ledger::enter(q4ledger::SHARED);
     let t_shared = std::time::Instant::now();
     let sff = lw.gate_shexp.n();
-    let mut sh = vec![0.0f32; nt * e];
+    // task 209: shared の出力はデバイスからの D2H の宛先なので pinned に置く
+    // (`DENNO_PF_PIN`)。中身は下のどちらの経路も全要素を書く。
+    let mut sh_buf = PfHostBuf::new(nt * e);
+    let sh = sh_buf.as_mut_slice();
     // task 172: 3 射影 (gate / up / down) を 1 チャンクぶんデバイスで回す
     // (活性を GPU に置いたまま。silu と積は elem の swiglu カーネル)。
     // 使えない形・環境では false が返り、下の従来経路がそのまま走る。
     let mut shared_dev = false;
     if pf_shared_dev_on() {
-        shared_dev = Qwen4Exp::pf_shared_dev_run(lw, xs, nt, e, sff, &mut sh);
+        shared_dev = Qwen4Exp::pf_shared_dev_run(lw, xs, nt, e, sff, sh);
     }
     if !shared_dev {
         let mut sact = vec![0.0f32; nt * sff];
@@ -14345,7 +14429,7 @@ fn moe_ffn_quant_batch_full(
         for r in 0..nt * sff {
             sact[r] *= sup[r];
         }
-        gemv_batch(&lw.down_shexp, &sact, nt, &mut sh)
+        gemv_batch(&lw.down_shexp, &sact, nt, sh)
             .map_err(|err| one(format!("層 {}: ffn_down_shexp (batch): {err}", lw.il)))?;
     }
     let gn = lw.gate_inp_shexp.n();
