@@ -1623,20 +1623,24 @@ pub(crate) mod dec_kprof {
                 assert!(parse_gdn_dec_gemv_q5k(raw), "q5k raw={raw:?}");
                 assert!(parse_mix_dec_fold(raw), "fold raw={raw:?}");
                 assert!(dec_full_dev::parse_full_dec_fast(raw), "fast raw={raw:?}");
-                assert!(parse_dec_router_early(raw), "early raw={raw:?}");
             }
             for raw in [Some("0"), Some("off"), Some("false"), Some("no")] {
                 assert!(!parse_gdn_dec_gemv_q5k(raw), "q5k raw={raw:?}");
                 assert!(!parse_mix_dec_fold(raw), "fold raw={raw:?}");
                 assert!(!dec_full_dev::parse_full_dec_fast(raw), "fast raw={raw:?}");
-                assert!(!parse_dec_router_early(raw), "early raw={raw:?}");
             }
             // 大小文字と前後の空白は無視する。
             for raw in [Some("OFF"), Some(" Off "), Some("NO")] {
                 assert!(!parse_gdn_dec_gemv_q5k(raw), "q5k raw={raw:?}");
                 assert!(!parse_mix_dec_fold(raw), "fold raw={raw:?}");
                 assert!(!dec_full_dev::parse_full_dec_fast(raw), "fast raw={raw:?}");
+            }
+            // task 192: router early は lab t192a で +0.0% だったので **既定 off**。
+            for raw in [None, Some(""), Some("0"), Some("off"), Some("false"), Some("no"), Some("x")] {
                 assert!(!parse_dec_router_early(raw), "early raw={raw:?}");
+            }
+            for raw in [Some("1"), Some("on"), Some(" ON "), Some("true")] {
+                assert!(parse_dec_router_early(raw), "early raw={raw:?}");
             }
         }
 
@@ -18726,11 +18730,13 @@ pub fn unregister_f32_weights(uid: u64) {
 
 /// task 192: `DENNO_DEC_ROUTER_EARLY` の解釈 (純関数)。
 ///
-/// 既定 on。**明示的な偽値だけが off** (未設定・空は既定)。
+/// **既定 off**。lab t192a では decode +0.0% で、ルータ GEMV を先に積んでも
+/// 待ちは縮まらなかった (GPU のキューが既に詰まっていて、積む順は効かない)。
+/// 明示指定 (`1` / `on` / `true`) のときだけ on。
 fn parse_dec_router_early(raw: Option<&str>) -> bool {
-    !matches!(
+    matches!(
         raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("0") | Some("off") | Some("false") | Some("no")
+        Some("1") | Some("on") | Some("true")
     )
 }
 
@@ -23129,6 +23135,90 @@ pub(crate) fn mix_fold_loaded() -> bool {
     mix_fold_kernels().is_some()
 }
 
+// ---------------------------------------------------------------------------
+// task 192: mix の up 投影 (BF16) を 1 warp = 1 行で回す `kernels_mix_up.cu`。
+//
+// lab t192a の mix 表: `dno_matvec_bf16_r` (up、10,240 行 x k=320) が 14.0 us
+// (実効 468 GB/s)。1 ブロック 256 スレッドで 1 行 (320 要素) なので 1 スレッド
+// 1.25 要素で、起動と縮約の固定費が支配的だった。1 warp = 1 行にする。
+// ---------------------------------------------------------------------------
+
+/// up 版のカーネル名。
+const MIX_UP_KERNEL_NAME: &str = "dno_mix_up_bf16";
+
+/// up 版の引数の数 (w, x, out, k, n)。
+const MIX_UP_NARGS: usize = 5;
+
+/// up 版の 1 ブロックの行数 (`kernels_mix_up.cu` の DNO_MIXUP_WARPS)。
+const MIX_UP_ROWS: usize = 8;
+
+struct MixUpKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    f: CUfunction,
+}
+
+unsafe impl Send for MixUpKernels {}
+unsafe impl Sync for MixUpKernels {}
+
+static MIX_UP_KERNELS: OnceLock<Option<MixUpKernels>> = OnceLock::new();
+
+fn mix_up_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MIX_UP_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_mix_up.ptx"),
+    }
+}
+
+/// up 版のカーネルを取得する (初回だけ PTX を読む。失敗は `None` を焼き付ける)。
+fn mix_up_kernels() -> Option<&'static MixUpKernels> {
+    MIX_UP_KERNELS
+        .get_or_init(|| {
+            let path = mix_up_ptx_path();
+            let mut image = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let text = String::from_utf8_lossy(&image).to_string();
+            if ptx_entry_params(&text, MIX_UP_KERNEL_NAME) != Some(MIX_UP_NARGS) {
+                eprintln!(
+                    "[mix-up] PTX の引数が {MIX_UP_NARGS} 本でない → 従来カーネルへ。\
+                     `bash build_ptx.sh mix_up` で再生成する"
+                );
+                return None;
+            }
+            image.push(0);
+            let lib = lib().ok()?;
+            unsafe {
+                let mut module: CUmodule = std::ptr::null_mut();
+                if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void)
+                    != CUDA_SUCCESS
+                {
+                    return None;
+                }
+                let mut cname = MIX_UP_KERNEL_NAME.as_bytes().to_vec();
+                cname.push(0);
+                let mut f: CUfunction = std::ptr::null_mut();
+                if (lib.module_get_function)(&mut f, module, cname.as_ptr() as *const c_char)
+                    != CUDA_SUCCESS
+                {
+                    eprintln!("[mix-up] PTX に {MIX_UP_KERNEL_NAME} が無い → 従来カーネルへ");
+                    return None;
+                }
+                Some(MixUpKernels { module, f })
+            }
+        })
+        .as_ref()
+}
+
+/// up 版が載っているか (テスト専用)。
+#[cfg(test)]
+pub(crate) fn mix_up_loaded() -> bool {
+    mix_up_kernels().is_some()
+}
+
 /// norm 重み (host の `[hc][e]` f32) の常駐。キーは (ポインタ, 長さ) で、
 /// 内容の指紋 (16 点サンプル) が変われば載せ替える。
 ///
@@ -23260,7 +23350,16 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
         return false;
     };
     let up_reduce = mix_up_reduce_enabled();
-    let f_up = if up_reduce {
+    // task 192: `DENNO_MIX_DEC_FOLD` では up を 1 warp = 1 行の版で回す
+    // (k が 8 の倍数のときだけ。形が違えば従来カーネルへ)。
+    let up_fast = if mix_dec_fold_on() && up_reduce && k2 % 8 == 0 {
+        mix_up_kernels().map(|k| k.f)
+    } else {
+        None
+    };
+    let f_up = if up_fast.is_some() {
+        up_fast
+    } else if up_reduce {
         matvec_bf16_r_fn(ctx)
     } else {
         matvec_bf16_fn(ctx)
@@ -23268,7 +23367,18 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
     let Some(f_up) = f_up else {
         return false;
     };
-    let up_thr: u32 = if up_reduce { 256 } else { 1 };
+    let up_thr: u32 = if up_fast.is_some() {
+        256
+    } else if up_reduce {
+        256
+    } else {
+        1
+    };
+    let up_grid: u32 = if up_fast.is_some() {
+        n2.div_ceil(MIX_UP_ROWS) as u32
+    } else {
+        n2 as u32
+    };
     let wp1 = match mix_gpu_weight(down_uid, down_bytes, k1, n1, true) {
         Ok(w) => w.ptr,
         Err(err) => {
@@ -23361,7 +23471,8 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
             // 1. grouped RMS 正規化 (x → xn、in-place)。block = 1 ストリーム。
             // task 192: `DENNO_MIX_DEC_FOLD` では norm と inject を 1 本に畳む
             // (hc 方向を 1 ブロックへ。値は 2 本版とビット一致)。
-            let folded = if mix_dec_fold_on() && hc <= 8 {
+            // hc は block = 256 * hc に畳む (グループ = ストリーム)。
+            let folded = if mix_dec_fold_on() && hc <= 4 {
                 mix_fold_kernels().map(|k| k.f)
             } else {
                 None
@@ -23388,7 +23499,7 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
                 ctx.launch_async(
                     f_fold,
                     (1, 1, 1),
-                    (THREADS as u32, 1, 1),
+                    ((THREADS * hc) as u32, 1, 1),
                     0,
                     &mut args,
                 )?;
@@ -23454,7 +23565,7 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
                 &mut kc2 as *mut _ as *mut c_void,
                 &mut nc2 as *mut _ as *mut c_void,
             ];
-            ctx.launch_async(f_up, (n2 as u32, 1, 1), (up_thr, 1, 1), 0, &mut args2)?;
+            ctx.launch_async(f_up, (up_grid, 1, 1), (up_thr, 1, 1), 0, &mut args2)?;
             // 5. hc_mixed: xn と gate から mixed を作る。
             let (mut px, mut pg, mut pm) = (dx.ptr(), dout.ptr(), dm.ptr());
             let (mut ec, mut hcc) = (e as c_int, hc as c_int);

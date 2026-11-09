@@ -8139,11 +8139,15 @@ fn mix_fold_kernel_is_wired() {
     );
     // hc 方向を 1 ブロックに畳む (grid = 1) ので、ストリームのループは定数上限。
     assert!(
-        MIX_DEV2_SRC.contains("#define DNO_MIX2_HC_MAX 8"),
+        MIX_DEV2_SRC.contains("#define DNO_MIX2_HC_MAX 4"),
         "hc の上限が無い"
     );
     assert!(
-        MIX_DEV2_SRC.contains("if (hc <= 0 || hc > DNO_MIX2_HC_MAX)"),
+        MIX_DEV2_SRC.contains("#define DNO_MIX2_THREADS 256"),
+        "グループ幅 (256) が無い"
+    );
+    assert!(
+        MIX_DEV2_SRC.contains("if (hc <= 0 || hc > DNO_MIX2_HC_MAX || g >= hc)"),
         "hc の門番が無い"
     );
     // norm と inject の間に 1 回だけ barrier を置く (正規化の書き終わりを待つ)。
@@ -8157,11 +8161,11 @@ fn mix_fold_kernel_is_wired() {
         "warp 縮約が 2 本版と違う"
     );
     assert!(
-        MIX_DEV2_SRC.contains("__fadd_rn(ss[s], __fmul_rn(v, v))"),
+        MIX_DEV2_SRC.contains("__fadd_rn(ss, __fmul_rn(v, v))"),
         "二乗和の演算列が 2 本版と違う"
     );
     assert!(
-        MIX_DEV2_SRC.contains("__fmul_rn(__fmul_rn(x[j], iv), gamma[j])"),
+        MIX_DEV2_SRC.contains("__fmul_rn(__fmul_rn(src[i], iv), gm[i])"),
         "正規化の乗算順が 2 本版と違う"
     );
     assert!(
@@ -8179,8 +8183,8 @@ fn mix_fold_kernel_is_wired() {
     );
     let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
     assert!(
-        body.contains("mix_dec_fold_on() && hc <= 8"),
-        "fold 版の門番 (hc <= 8) が無い"
+        body.contains("mix_dec_fold_on() && hc <= 4"),
+        "fold 版の門番 (hc <= 4) が無い"
     );
     assert!(
         body.contains("let folded = if mix_dec_fold_on()"),
@@ -8189,6 +8193,10 @@ fn mix_fold_kernel_is_wired() {
     assert!(
         body.contains("f_fold,") && body.contains("(1, 1, 1),"),
         "fold 版が grid 1 で起動されていない"
+    );
+    assert!(
+        body.contains("((THREADS * hc) as u32, 1, 1),"),
+        "fold 版の block が 256 * hc でない (並列度が 2 本版より落ちる)"
     );
     // build_ptx.sh
     assert!(
@@ -8269,5 +8277,75 @@ fn dec_router_early_splits_begin_and_finish() {
     assert!(
         CUDA_RS.contains(r#"std::env::var("DENNO_DEC_ROUTER_EARLY")"#),
         "DENNO_DEC_ROUTER_EARLY の読み取りが無い"
+    );
+}
+
+/// task 192: mix の up (BF16) は 1 warp = 1 行。cuda.rs が
+/// `DENNO_MIX_DEC_FOLD` の下で grid = n/8 を渡すこと。
+const MIX_UP_SRC: &str = include_str!("../kernels/kernels_mix_up.cu");
+
+#[test]
+fn mix_up_warp_per_row_kernel_is_wired() {
+    let p = kernel_params(MIX_UP_SRC, "dno_mix_up_bf16");
+    assert_eq!(
+        p,
+        vec!["w", "x", "out", "k", "n"],
+        "dno_mix_up_bf16 の引数が従来 (w, x, out, k, n) と違う: {p:?}"
+    );
+    assert!(
+        MIX_UP_SRC.contains("const int row = blockIdx.x * DNO_MIXUP_WARPS + warp;"),
+        "1 warp = 1 行の割り当てが変わった"
+    );
+    assert!(
+        MIX_UP_SRC.contains("#define DNO_MIXUP_WARPS 8"),
+        "1 ブロックの行数が 8 でない"
+    );
+    // uint4 = 8 BF16 のベクタロード (バイト読みではない)。
+    assert!(
+        MIX_UP_SRC.contains("*reinterpret_cast<const uint4*>(rowp + c)"),
+        "8 要素のベクタロードが無い"
+    );
+    // BF16 -> f32 は上位 16 bit の複製と 1 演算 1 丸め。
+    assert!(
+        MIX_UP_SRC.contains("__uint_as_float(h << 16)"),
+        "BF16 の展開が上位 16 bit の複製でない"
+    );
+    assert!(
+        MIX_UP_SRC.contains("acc = __fadd_rn(acc, __fmul_rn("),
+        "積和が明示の 2 演算でない"
+    );
+    // cuda.rs: 別ファイル・5 引数・fold ゲート・grid = n/8。
+    assert!(
+        CUDA_RS.contains("kernels_mix_up.ptx"),
+        "cuda.rs が kernels_mix_up.ptx を読んでいない"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_UP_NARGS: usize = 5;"),
+        "up 版の ABI 検査が 5 引数でない"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_UP_ROWS: usize = 8;"),
+        "up 版の行数ミラーが無い"
+    );
+    let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    assert!(
+        body.contains("mix_dec_fold_on() && up_reduce && k2 % 8 == 0"),
+        "up 版の門番 (fold / k % 8) が無い"
+    );
+    assert!(
+        body.contains("n2.div_ceil(MIX_UP_ROWS) as u32"),
+        "up 版の grid が n/8 でない"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("mix_up)       echo \"kernels_mix_up.cu|nofmad\" ;;"),
+        "build_ptx.sh の mix_up が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("mix_up"),
+        "build_ptx.sh の targets_all に mix_up が無い: {targets}"
     );
 }
