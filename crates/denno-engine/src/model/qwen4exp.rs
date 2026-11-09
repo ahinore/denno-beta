@@ -10699,6 +10699,12 @@ fn prefill_batch_enabled() -> bool {
 fn prefill_batch_chunk() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
+        // task 197: `DENNO_PF_CHUNK` があれば最優先 (層ループのチャンク上書き)。
+        // ストリーミング経路は 1 層 1 チャンクでミス expert を上げるので、チャンクを
+        // 大きくすると同じ重みを上げる回数が減る (台帳の最大項目が消える)。
+        if let Some(n) = crate::model::exp_pf::chunk_override() {
+            return n;
+        }
         // task 162: ストリーミング経路では層ループのチャンクを大きく取れる
         // (ミス expert の上げ直しが 1 層 1 回に減る)。既定は従来どおり 512。
         // task 165: ストリーミング時は既定を 1024 にする (lab t162c の最良。

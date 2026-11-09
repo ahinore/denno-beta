@@ -151,6 +151,39 @@ pub const STREAM_WC_ENV: &str = "DENNO_PF_STREAM_WC";
 /// `DENNO_PF_STREAM=1` のとき `DENNO_PREFILL_BATCH_CHUNK` 未設定ならこれを使う。
 pub const DEFAULT_PREFILL_CHUNK_STREAM: usize = 1024;
 
+/// `DENNO_PF_CHUNK`: prefill の層ループのチャンク (トークン数) を上書きする (task 197)。
+///
+/// 既定 **0 = 上書きしない** (従来どおり `DENNO_PREFILL_BATCH_CHUNK` と上の既定)。
+///
+/// なぜ効くか: ストリーミング経路は「1 層 1 チャンク」でミス expert を VRAM へ
+/// 上げる。1 チャンク 512 トークンでも全 expert が選ばれるので、**チャンクを
+/// 2 倍にすると同じ重みを上げる回数が半分になる** (アップロード量がほぼ半減)。
+/// 台帳 (lab t199a の base) では 3,826 トークンで 105.5 GB / copy 7.11 s、
+/// 14,018 トークンで 357.8 GB / copy 17.04 s を上げており、これが cold prefill の
+/// 最大項目。`DEFAULT_PREFILL_CHUNK_STREAM` が 1024 なのに本番 env が 512 を
+/// 明示しているため、1024 の利得が今は出ていない。
+pub const PF_CHUNK_ENV: &str = "DENNO_PF_CHUNK";
+
+/// [`PF_CHUNK_ENV`] の解釈 (純関数)。0・空・解析不能は `None` (= 上書きしない)。
+pub fn chunk_override_from_value(v: Option<&str>) -> Option<usize> {
+    let s = v?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let n: usize = s.parse().ok()?;
+    if n == 0 {
+        None
+    } else {
+        Some(n.clamp(1, 65536))
+    }
+}
+
+/// [`PF_CHUNK_ENV`] の上書き値 (プロセスで 1 回だけ読む)。
+pub fn chunk_override() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| chunk_override_from_value(std::env::var(PF_CHUNK_ENV).ok().as_deref()))
+}
+
 /// [`EXPERT_IQ_PF_MIN_HITS_ENV`] の既定値。
 pub const DEFAULT_MIN_HITS: usize = 4;
 
@@ -1195,6 +1228,16 @@ mod tests {
         assert!(stream_wc_from_value(true, Some(" on ")), "前後の空白は無視する");
         assert!(!stream_wc_from_value(true, Some("no")));
         assert_eq!(DEFAULT_PREFILL_CHUNK_STREAM, 1024, "lab t162c の最良");
+        // task 197: チャンク上書きは「明示した正の数だけ」効く。
+        assert_eq!(chunk_override_from_value(None), None);
+        assert_eq!(chunk_override_from_value(Some("")), None, "空は上書きしない");
+        assert_eq!(chunk_override_from_value(Some("   ")), None);
+        assert_eq!(chunk_override_from_value(Some("0")), None, "0 は無効");
+        assert_eq!(chunk_override_from_value(Some("abc")), None);
+        assert_eq!(chunk_override_from_value(Some("1024")), Some(1024));
+        assert_eq!(chunk_override_from_value(Some(" 1536 ")), Some(1536));
+        assert_eq!(chunk_override_from_value(Some("999999")), Some(65536), "上限で切る");
+        assert_eq!(chunk_override_from_value(Some("1")), Some(1));
         // task 165 で決めた既定 (lab t165b/t165c の最良)。
         assert!(DEFAULT_STREAM_ON, "lab t165c で採用して既定 on");
         assert!(DEFAULT_STREAM_WC, "write-combined のバウンスが効いた");
