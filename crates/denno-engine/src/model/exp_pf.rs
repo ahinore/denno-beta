@@ -153,7 +153,8 @@ pub const DEFAULT_PREFILL_CHUNK_STREAM: usize = 1024;
 
 /// `DENNO_PF_CHUNK`: prefill の層ループのチャンク (トークン数) を上書きする (task 197)。
 ///
-/// 既定 **0 = 上書きしない** (従来どおり `DENNO_PREFILL_BATCH_CHUNK` と上の既定)。
+/// **既定 = [`DEFAULT_PF_CHUNK_STREAM`] (1536、ストリーミング経路のとき)**。
+/// `0` / `off` / 空 / 解析不能で旧経路 (`DENNO_PREFILL_BATCH_CHUNK` と既存の既定) に戻る。
 ///
 /// なぜ効くか: ストリーミング経路は「1 層 1 チャンク」でミス expert を VRAM へ
 /// 上げる。1 チャンク 512 トークンでも全 expert が選ばれるので、**チャンクを
@@ -162,12 +163,35 @@ pub const DEFAULT_PREFILL_CHUNK_STREAM: usize = 1024;
 /// 14,018 トークンで 357.8 GB / copy 17.04 s を上げており、これが cold prefill の
 /// 最大項目。`DEFAULT_PREFILL_CHUNK_STREAM` が 1024 なのに本番 env が 512 を
 /// 明示しているため、1024 の利得が今は出ていない。
+///
+/// lab t197a (5 COND、depth8k、比較は base と base2 の両方):
+///
+/// | COND | 3,826 cold | 14,018 cold | 上げた量 (3.8k / 14k) | copy_s | md5 |
+/// | --- | --- | --- | --- | --- | --- |
+/// | base (chunk 512) | 13.21 s | 50.01 s | 105.5 / 357.8 GB | 4.13 / 14.78 | — |
+/// | chunk 1024 | 10.36 s (-21.6%) | 36.87 s (-26.3%) | 71.0 / 223.6 GB | 2.78 / 8.70 | DIFF |
+/// | chunk 1536 | 9.89 s (-25.1%) | 35.44 s (-29.1%) | 56.4 / 158.0 GB | 2.21 / 6.17 | DIFF |
+/// | chunk 2048 | 13.22 s (+0.1%) | 69.81 s (+39.6%) | 41.6 / 92.3 GB | 1.68 / — | DIFF |
+///
+/// 2048 が落ちるのは容量ではなく `gdn_pf_chain_shape_ok` の
+/// `nt >= GDN_CHUNK_MIN_TOKENS (2048)` で ssm のデバイス連鎖が外れるため
+/// (ssm が 3.96 → 24.7 s、d2h 39.6 → 124.7 GB)。1536 はこの境界の 3/4 で、
+/// 構造的に余裕がある。
 pub const PF_CHUNK_ENV: &str = "DENNO_PF_CHUNK";
 
-/// [`PF_CHUNK_ENV`] の解釈 (純関数)。0・空・解析不能は `None` (= 上書きしない)。
+/// [`PF_CHUNK_ENV`] の既定 (ストリーミング経路のとき)。lab t197a の最良。
+pub const DEFAULT_PF_CHUNK_STREAM: usize = 1536;
+
+/// [`PF_CHUNK_ENV`] の解釈 (純関数)。0・空・偽値・解析不能は `None` (= 上書きしない)。
 pub fn chunk_override_from_value(v: Option<&str>) -> Option<usize> {
     let s = v?.trim();
     if s.is_empty() {
+        return None;
+    }
+    if matches!(
+        s.to_ascii_lowercase().as_str(),
+        "0" | "off" | "false" | "no"
+    ) {
         return None;
     }
     let n: usize = s.parse().ok()?;
@@ -178,10 +202,18 @@ pub fn chunk_override_from_value(v: Option<&str>) -> Option<usize> {
     }
 }
 
-/// [`PF_CHUNK_ENV`] の上書き値 (プロセスで 1 回だけ読む)。
+/// 実際に使う上書き値。
+///
+/// 優先順: `DENNO_PF_CHUNK` (明示) > ストリーミング経路の既定
+/// ([`DEFAULT_PF_CHUNK_STREAM`]) > 上書きなし (`DENNO_PREFILL_BATCH_CHUNK` の経路)。
 pub fn chunk_override() -> Option<usize> {
     static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *N.get_or_init(|| chunk_override_from_value(std::env::var(PF_CHUNK_ENV).ok().as_deref()))
+    *N.get_or_init(|| match std::env::var(PF_CHUNK_ENV).ok().as_deref() {
+        Some(s) => chunk_override_from_value(Some(s)),
+        // 未設定: ストリーミング経路 (1 層 1 チャンクで上げる) のときだけ既定を当てる。
+        // stream off では従来の `DENNO_PREFILL_BATCH_CHUNK` をそのまま使う。
+        None => stream_enabled().then_some(DEFAULT_PF_CHUNK_STREAM),
+    })
 }
 
 /// [`EXPERT_IQ_PF_MIN_HITS_ENV`] の既定値。
@@ -1233,11 +1265,19 @@ mod tests {
         assert_eq!(chunk_override_from_value(Some("")), None, "空は上書きしない");
         assert_eq!(chunk_override_from_value(Some("   ")), None);
         assert_eq!(chunk_override_from_value(Some("0")), None, "0 は無効");
+        assert_eq!(chunk_override_from_value(Some("off")), None);
+        assert_eq!(chunk_override_from_value(Some("false")), None);
         assert_eq!(chunk_override_from_value(Some("abc")), None);
         assert_eq!(chunk_override_from_value(Some("1024")), Some(1024));
         assert_eq!(chunk_override_from_value(Some(" 1536 ")), Some(1536));
         assert_eq!(chunk_override_from_value(Some("999999")), Some(65536), "上限で切る");
         assert_eq!(chunk_override_from_value(Some("1")), Some(1));
+        // task 197: 既定 1536 は ssm のデバイス連鎖の形の境界 (< 2048) の内側にある。
+        assert_eq!(DEFAULT_PF_CHUNK_STREAM, 1536, "lab t197a の最良");
+        assert!(
+            DEFAULT_PF_CHUNK_STREAM < crate::cuda::GDN_CHUNK_MIN_TOKENS,
+            "既定チャンクが GDN 連鎖の境界 (2048) に触ると ssm がホスト経路へ落ちる"
+        );
         // task 165 で決めた既定 (lab t165b/t165c の最良)。
         assert!(DEFAULT_STREAM_ON, "lab t165c で採用して既定 on");
         assert!(DEFAULT_STREAM_WC, "write-combined のバウンスが効いた");
