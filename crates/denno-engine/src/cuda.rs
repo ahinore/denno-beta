@@ -19479,6 +19479,136 @@ pub(crate) fn mix_pf_ok(k: usize, n: usize, nt: usize, bf16: bool) -> bool {
     bf16 && k > 0 && n >= MIX_PF_BN && nt >= MIX_PF_MIN_TOK
 }
 
+// ---------------------------------------------------------------------------
+// task 189: mix の inject (n = hc <= 8) を 1 スレッド 1 出力の GEMV で回す
+// ---------------------------------------------------------------------------
+//
+// `dno_gemm_bf16_mt` は 1 ブロック 16 行 x 32 トークンなので、n=4 の inject では
+// grid.x = 1 (16 行のうち 4 行だけ有効)・ブロック数 16 本になり、21 M MAC の
+// 仕事に 329 us/呼び出し (2,688 呼び出しで 884 ms) かかっていた (lab t189a の
+// `[pf-mix-kprof] inj`)。詳細は `kernels/kernels_mix_inj.cu` の先頭。
+
+/// 1 ブロックのスレッド数 (カーネルの `MIXINJ_THREADS` と一致させる)。
+pub(crate) const MIX_INJ_THREADS: usize = 128;
+/// この n 以下を新しいカーネルで回す (inject の実形は hc=4)。
+pub(crate) const MIX_INJ_MAX_N: usize = 8;
+/// これ未満のトークン数は従来カーネル (起動のほうが高い)。
+pub const MIX_INJ_MIN_TOK: usize = 32;
+
+fn mix_inj_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MIX_INJ_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_mix_inj.ptx"),
+    }
+}
+
+struct MixInjKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    gemv: CUfunction,
+}
+
+// 生ハンドル (MixPfKernels / PfKernels と同じ規約)。
+unsafe impl Send for MixInjKernels {}
+unsafe impl Sync for MixInjKernels {}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+/// **current context を張った後に呼ぶこと**。
+fn mix_inj_kernels() -> Option<&'static MixInjKernels> {
+    static K: OnceLock<Option<MixInjKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = mix_inj_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::info!(
+                    "[mix-inj] PTX が読めない ({}) : {e} → 従来の GEMM へ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                tracing::info!("[mix-inj] cuModuleLoadData 失敗 → 従来の GEMM へ");
+                return None;
+            }
+            let mut gemv: CUfunction = std::ptr::null_mut();
+            if (lib.module_get_function)(
+                &mut gemv,
+                module,
+                b"dno_mix_inj_bf16\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                tracing::info!("[mix-inj] PTX に dno_mix_inj_bf16 が無い → 従来の GEMM へ");
+                return None;
+            }
+            log_kernel_attr(lib, gemv, "dno_mix_inj_bf16");
+            Some(MixInjKernels { module, gemv })
+        }
+    })
+    .as_ref()
+}
+
+/// task 189: `DENNO_PF_MIX_INJ` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn mix_inj_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// 新しい inject GEMV を使うか (`DENNO_PF_MIX_INJ`、既定 off。lab で決める)。
+pub(crate) fn mix_inj_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| mix_inj_from_value(std::env::var("DENNO_PF_MIX_INJ").ok().as_deref()))
+}
+
+/// task 189: その形を新しいカーネルで回してよいか (純関数)。
+///
+/// BF16 重み・1 <= n <= [`MIX_INJ_MAX_N`]・nt >= [`MIX_INJ_MIN_TOK`]・k > 0。
+pub(crate) fn mix_inj_ok(k: usize, n: usize, nt: usize, bf16: bool) -> bool {
+    bf16 && k > 0 && n >= 1 && n <= MIX_INJ_MAX_N && nt >= MIX_INJ_MIN_TOK
+}
+
+#[cfg(test)]
+mod mix_inj_tests {
+    use super::*;
+
+    #[test]
+    fn mix_inj_gate_truth_table() {
+        assert!(!mix_inj_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!mix_inj_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(mix_inj_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+
+    #[test]
+    fn mix_inj_ok_checks_shape() {
+        // 実形の inject: k = hc*e = 10240, n = hc = 4, nt = 512
+        assert!(mix_inj_ok(10240, 4, 512, true));
+        assert!(mix_inj_ok(10240, 8, 512, true));
+        // down (n=320) / up (n=10240) は対象外 (従来の GEMM のほうが速い)
+        assert!(!mix_inj_ok(2560, 320, 512, true));
+        assert!(!mix_inj_ok(320, 10240, 512, true));
+        // f32 展開した重みは対象外
+        assert!(!mix_inj_ok(10240, 4, 512, false));
+        // 短い prefill は従来カーネル
+        assert!(!mix_inj_ok(10240, 4, 19, true));
+        assert!(!mix_inj_ok(0, 4, 512, true));
+        assert!(!mix_inj_ok(10240, 0, 512, true));
+        assert!(!mix_inj_ok(10240, 9, 512, true));
+    }
+}
+
 #[cfg(test)]
 mod mix_pf_tests {
     use super::*;
@@ -20229,6 +20359,33 @@ pub fn pf_mix(
          -> Result<(), String> {
             // task 186: BF16 の down / up を広いタイルのカーネルで回す
             // (`DENNO_PF_MIX_FAST`・既定 off。値は従来カーネルとビット一致)。
+            // task 189: inject (n <= 8) は 1 スレッド 1 出力の GEMV で回す。
+            if mix_inj_on() && mix_inj_ok(kk, nn, nt, kind == PfWKind::Bf16) {
+                if let Some(fns) = mix_inj_kernels() {
+                    let (mut pw, mut px, mut py) = (w, x, y);
+                    let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, kk as c_int, nn as c_int);
+                    let mut args = [
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut px as *mut _ as *mut c_void,
+                        &mut py as *mut _ as *mut c_void,
+                        &mut nt_c as *mut _ as *mut c_void,
+                        &mut k_c as *mut _ as *mut c_void,
+                        &mut n_c as *mut _ as *mut c_void,
+                    ];
+                    let grid = (((nt * nn).div_ceil(MIX_INJ_THREADS)) as u32, 1, 1);
+                    unsafe {
+                        ctx.launch_async(
+                            fns.gemv,
+                            grid,
+                            (MIX_INJ_THREADS as u32, 1, 1),
+                            0,
+                            &mut args,
+                        )
+                        .map_err(|e| format!("mix_inj gemv launch: {e:#}"))?;
+                    }
+                    return Ok(());
+                }
+            }
             let fast_bf16 = kind == PfWKind::Bf16 && mix_pf_fast_on() && mix_pf_ok(kk, nn, nt, true);
             let fast_fn = if fast_bf16 { mix_pf_kernels() } else { None };
             if let Some(fns) = fast_fn {

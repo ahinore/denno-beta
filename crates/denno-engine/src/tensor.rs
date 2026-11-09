@@ -1114,6 +1114,16 @@ pub fn layernorm(x: &[f32], w: &[f32], b: &[f32], cols: usize, eps: f32) -> Vec<
 /// RMSNorm (Llama/Qwen系)
 pub fn rmsnorm(x: &[f32], w: &[f32], cols: usize, eps: f32) -> Vec<f32> {
     let mut out = vec![0.0f32; x.len()];
+    rmsnorm_into(x, w, cols, eps, &mut out);
+    out
+}
+
+/// task 189: [`rmsnorm`] の書き込み先を呼び出し側が持つ版。
+///
+/// 演算列は `rmsnorm` と 1 つも変わらない (2 乗和 → rsqrt → x*inv*w の同じ順)。
+/// 毎トークン 40 KB 級の確保を避けるために prefill の PLE 注入から使う。
+pub fn rmsnorm_into(x: &[f32], w: &[f32], cols: usize, eps: f32, out: &mut [f32]) {
+    assert_eq!(out.len(), x.len(), "rmsnorm_into: out の長さが x と違う");
     for (row_in, row_out) in x.chunks(cols).zip(out.chunks_mut(cols)) {
         let ss = row_in.iter().map(|v| v * v).sum::<f32>() / cols as f32;
         let inv = 1.0 / (ss + eps).sqrt();
@@ -1121,7 +1131,6 @@ pub fn rmsnorm(x: &[f32], w: &[f32], cols: usize, eps: f32) -> Vec<f32> {
             row_out[i] = row_in[i] * inv * w[i];
         }
     }
-    out
 }
 
 /// QK-Norm (Qwen3): 各ヘッドの head_dim ベクトルに RMSNorm を適用する

@@ -7522,6 +7522,76 @@ fn mix_pf_fast_gate_defaults_off() {
 }
 
 // ---------------------------------------------------------------------------
+// task 189: mix の inject GEMV (`kernels_mix_inj.cu`)
+// ---------------------------------------------------------------------------
+//
+// 「cuda.rs が読んでいる」「build_ptx.sh が nofmad で作る」「起動サイトの block
+// 形状が #define と一致する」「1 出力 1 アキュムレータ・k 昇順の fma」を固定する。
+const MIX_INJ_SRC: &str = include_str!("../kernels/kernels_mix_inj.cu");
+
+#[test]
+fn mix_inj_gemv_kernel_is_wired() {
+    assert!(
+        CUDA_RS.contains("b\"dno_mix_inj_bf16\\0\""),
+        "cuda.rs が dno_mix_inj_bf16 を読んでいない"
+    );
+    assert!(
+        MIX_INJ_SRC.contains("dno_mix_inj_bf16"),
+        "kernels_mix_inj.cu にカーネルが無い"
+    );
+    for line in ["#define MIXINJ_THREADS 128", "#define MIXINJ_MAX_N 8"] {
+        assert!(MIX_INJ_SRC.contains(line), "{line} が無い");
+    }
+    // 値の契約: 出力 1 要素 1 アキュムレータ・k 昇順の fma (既存 GEMM と同一順)。
+    assert!(
+        MIX_INJ_SRC.contains("acc = __fmaf_rn(mixinj_bf16_to_f32(row[d]), xr[d], acc);"),
+        "アキュムレートが 1 出力 1 アキュムレータの fma でない"
+    );
+    assert!(
+        MIX_INJ_SRC.contains("__uint_as_float((unsigned int)b << 16)"),
+        "BF16 の展開が上位 16 bit の複製でない"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("mix_inj)      echo \"kernels_mix_inj.cu|nofmad\""),
+        "build_ptx.sh の mix_inj の spec 行が変わった"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("mix_inj"),
+        "build_ptx.sh の targets_all に mix_inj が無い: {targets}"
+    );
+    let map = launch_map_from_cuda(CUDA_RS);
+    assert_eq!(
+        map.block_status("dno_mix_inj_bf16"),
+        ShapeStatus::Resolved([128, 1, 1]),
+        "dno_mix_inj_bf16 の block 形状が解決できない: {}",
+        map.summary()
+    );
+    for line in [
+        "pub(crate) const MIX_INJ_THREADS: usize = 128;",
+        "pub(crate) const MIX_INJ_MAX_N: usize = 8;",
+    ] {
+        assert!(CUDA_RS.contains(line), "{line} が無い");
+    }
+}
+
+/// ゲート (`DENNO_PF_MIX_INJ`) の既定は **off** (lab の結果で決める)。
+#[test]
+fn mix_inj_gate_defaults_off() {
+    let i = CUDA_RS
+        .find("pub(crate) fn mix_inj_from_value")
+        .expect("mix_inj_from_value が無い");
+    let body: String = CUDA_RS[i..].chars().take(300).collect();
+    assert!(
+        body.contains("None => false,"),
+        "mix_inj_from_value(None) が off でない: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // task 186: prefill GDN スキャン v2 (`kernels_gdn_pf2.cu`)
 // ---------------------------------------------------------------------------
 //

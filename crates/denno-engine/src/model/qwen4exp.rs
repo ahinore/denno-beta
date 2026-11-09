@@ -5114,6 +5114,59 @@ fn ple_inject_batch(
     Ok(())
 }
 
+/// task 189: PLE 注入の per-token 作業域 (grow-only)。
+///
+/// 実形は hc_dim = 10,240 (40 KB) で、`ple_inject_from_kv` は 1 トークンあたり
+/// key_n / query_n / gated / その clone / conv / 中間 rmsnorm で約 280 KB を
+/// 確保していた。14,336 トークン (14k プロンプト) では 4 GB ぶんの確保と
+/// 初回タッチのフォールトになり、実測で ple 1,541 ms の大半がこれだった。
+#[derive(Default)]
+struct PleInjScratch {
+    key_n: Vec<f32>,
+    query_n: Vec<f32>,
+    gated: Vec<f32>,
+    nx: Vec<f32>,
+    conv: Vec<f32>,
+}
+
+impl PleInjScratch {
+    fn zeros(hc_dim: usize) -> Self {
+        Self {
+            key_n: vec![0.0; hc_dim],
+            query_n: vec![0.0; hc_dim],
+            gated: vec![0.0; hc_dim],
+            nx: vec![0.0; hc_dim],
+            conv: vec![0.0; hc_dim],
+        }
+    }
+
+    /// スレッドローカルから取り出す (足りなければ伸ばす)。中身は毎回全部書く。
+    fn take(hc_dim: usize) -> Self {
+        let mut s = PLE_INJ_SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        for v in [
+            &mut s.key_n,
+            &mut s.query_n,
+            &mut s.gated,
+            &mut s.nx,
+            &mut s.conv,
+        ] {
+            if v.len() < hc_dim {
+                v.resize(hc_dim, 0.0);
+            }
+        }
+        s
+    }
+
+    fn put(self) {
+        PLE_INJ_SCRATCH.with(|c| *c.borrow_mut() = self);
+    }
+}
+
+thread_local! {
+    static PLE_INJ_SCRATCH: std::cell::RefCell<PleInjScratch> =
+        std::cell::RefCell::new(PleInjScratch::default());
+}
+
 /// task 154: 射影済みの key / value から PLE の残り (RMS → gating → conv → 加算)。
 ///
 /// [`ple_inject`] の GEMV をチャンクでまとめるために切り出した。値は
@@ -5127,7 +5180,34 @@ fn ple_inject_from_kv(
     res: &HyperStreams,
     hp: &HyperParams,
     hist_buf: &mut Vec<f32>,
+    contrib_rms: Option<&mut f32>,
+) -> Result<HyperStreams> {
+    let hc_dim = p.hc_dim();
+    // task 189: `DENNO_PF_PLE_PAR` のときだけ作業域を使い回す。
+    // どちらの経路も同じ関数 (`ple_inject_into`) を通るので値は同一。
+    if crate::ple::pf_ple_par_on() {
+        let mut sc = PleInjScratch::take(hc_dim);
+        let out = ple_inject_into(p, pw, &key, &value, res, hp, hist_buf, contrib_rms, &mut sc);
+        sc.put();
+        out
+    } else {
+        let mut sc = PleInjScratch::zeros(hc_dim);
+        ple_inject_into(p, pw, &key, &value, res, hp, hist_buf, contrib_rms, &mut sc)
+    }
+}
+
+/// [`ple_inject_from_kv`] の本体。作業域は呼び出し側が持つ。
+#[allow(clippy::too_many_arguments)]
+fn ple_inject_into(
+    p: &Qwen4ExpParams,
+    pw: &PleW,
+    key: &[f32],
+    value: &[f32],
+    res: &HyperStreams,
+    hp: &HyperParams,
+    hist_buf: &mut Vec<f32>,
     mut contrib_rms: Option<&mut f32>,
+    sc: &mut PleInjScratch,
 ) -> Result<HyperStreams> {
     let e = p.n_embd;
     let hc = p.n_hc;
@@ -5146,17 +5226,18 @@ fn ple_inject_from_kv(
     }
 
     // 2. grouped RMS (key は [hc][n_embd] と見る)
-    let key_streams = HyperStreams {
-        data: key,
-        hc,
-        n_embd: e,
-    };
-    let key_n = hyper::grouped_rms_norm(&key_streams, &pw.norm_key, hp);
-    let query_n = hyper::grouped_rms_norm(res, &pw.norm_query, hp);
+    // task 189: 中間の rmsnorm もスレッドの作業域へ直接書く (確保しない)。
+    hyper::grouped_rms_norm_into(key, &pw.norm_key, hp, &mut sc.key_n[..hc_dim]);
+    hyper::grouped_rms_norm_into(&res.data, &pw.norm_query, hp, &mut sc.query_n[..hc_dim]);
+    let key_n = &sc.key_n[..hc_dim];
+    let query_n = &sc.query_n[..hc_dim];
 
     // 3. ストリームごとの内積 → 符号付き平方根 → sigmoid
     let inv_sqrt_e = 1.0f32 / (e as f32).sqrt();
-    let mut gate = Vec::with_capacity(hc);
+    let mut gate = [0.0f32; 8];
+    if hc > gate.len() {
+        return Err(one(format!("ple_inject: hc {hc} が上限を超えた")));
+    }
     for s in 0..hc {
         let mut acc = 0.0f32;
         for i in 0..e {
@@ -5172,24 +5253,20 @@ fn ple_inject_from_kv(
         } else {
             0.0f32
         };
-        gate.push(hyper::sigmoid(sign * mag));
+        gate[s] = hyper::sigmoid(sign * mag);
     }
 
     // 4. gated[s][d] = value[d] * gate[s]
-    let mut gated = vec![0.0f32; hc_dim];
-    for (s, &g) in gate.iter().enumerate() {
+    for (s, &g) in gate[..hc].iter().enumerate() {
         for d in 0..e {
-            gated[s * e + d] = value[d] * g;
+            sc.gated[s * e + d] = value[d] * g;
         }
     }
 
     // 5. grouped RMS → depthwise 因果 conv → silu
-    let gated_streams = HyperStreams {
-        data: gated.clone(),
-        hc,
-        n_embd: e,
-    };
-    let x = hyper::grouped_rms_norm(&gated_streams, &pw.norm_conv, hp);
+    let gated = &sc.gated[..hc_dim];
+    hyper::grouped_rms_norm_into(gated, &pw.norm_conv, hp, &mut sc.nx[..hc_dim]);
+    let x = &sc.nx[..hc_dim];
     let kern = pw.kern;
     if pw.conv1d.len() != kern * hc_dim {
         return Err(one(format!(
@@ -5205,7 +5282,6 @@ fn ple_inject_from_kv(
             hist_buf.len()
         )));
     }
-    let mut conv = vec![0.0f32; hc_dim];
     for c in 0..hc_dim {
         // out[c] = Σ_k w[k][c] * x[c, t - (kern-1-k)*dil]
         // GGUF の ne は [kern, hc_dim] なので、列 c の k 番目は conv1d[c*kern + k]。
@@ -5221,15 +5297,17 @@ fn ple_inject_from_kv(
             };
             acc += pw.conv1d[c * kern + k] * v;
         }
-        conv[c] = hyper::silu(acc);
+        sc.conv[c] = hyper::silu(acc);
     }
     // 履歴を 1 トークン進める (古い側を捨て、末尾に今の x を入れる)。
     if hist > 0 {
         hist_buf.copy_within(hc_dim.., 0);
-        hist_buf[(hist - 1) * hc_dim..].copy_from_slice(&x);
+        hist_buf[(hist - 1) * hc_dim..].copy_from_slice(x);
     }
 
     // 6. res + (gated + conv)
+    let conv = &sc.conv[..hc_dim];
+    let gated = &sc.gated[..hc_dim];
     let mut out = Vec::with_capacity(hc_dim);
     let want_rms = contrib_rms.is_some();
     let mut sq = 0.0f32;
@@ -18449,27 +18527,37 @@ mod tests {
                     })
                     .collect()
             };
-            let mut a = mk(&base);
-            let mut b = mk(&base);
             let hist_len = (pw.kern - 1) * m.p.ple_ngram_size * hc_dim;
-            let mut hist_a: Vec<f32> = (0..hist_len)
+            let hist0: Vec<f32> = (0..hist_len)
                 .map(|i| 0.05 * (((i * 7) % 13) as f32 - 6.0))
                 .collect();
-            let mut hist_b = hist_a.clone();
+            let rows: Vec<&[f32]> = (0..nt).map(|t| &emb[t * emb_len..(t + 1) * emb_len]).collect();
+            // 基準: 1 トークンずつ (task 189 の作業域を使わない = 毎回確保する経路)。
+            crate::ple::set_pf_ple_par_for_test(Some(false));
+            let mut a = mk(&base);
+            let mut hist_a = hist0.clone();
             for t in 0..nt {
                 let pe = &emb[t * emb_len..(t + 1) * emb_len];
                 a[t] = ple_inject(&m.p, pw, pe, &a[t], &hp, &mut hist_a, None).expect("逐次");
             }
-            let rows: Vec<&[f32]> = (0..nt).map(|t| &emb[t * emb_len..(t + 1) * emb_len]).collect();
-            ple_inject_batch(&m.p, pw, &rows, &mut b, &hp, &mut hist_b, None).expect("バッチ");
-            for t in 0..nt {
-                let want: Vec<u32> = a[t].data.iter().map(|v| v.to_bits()).collect();
-                let got: Vec<u32> = b[t].data.iter().map(|v| v.to_bits()).collect();
-                assert_eq!(want, got, "トークン {t} の出力がビット不一致");
+            // task 189: バッチ経路を作業域の確保あり / 使い回し (冷・温) で回し、
+            // どれも逐次版とビット一致することを固定する。
+            for gate in [Some(false), Some(true), Some(true)] {
+                let mut b = mk(&base);
+                let mut hist_b = hist0.clone();
+                crate::ple::set_pf_ple_par_for_test(gate);
+                ple_inject_batch(&m.p, pw, &rows, &mut b, &hp, &mut hist_b, None)
+                    .expect("バッチ");
+                for t in 0..nt {
+                    let want: Vec<u32> = a[t].data.iter().map(|v| v.to_bits()).collect();
+                    let got: Vec<u32> = b[t].data.iter().map(|v| v.to_bits()).collect();
+                    assert_eq!(want, got, "gate={gate:?} トークン {t} の出力がビット不一致");
+                }
+                let want: Vec<u32> = hist_a.iter().map(|v| v.to_bits()).collect();
+                let got: Vec<u32> = hist_b.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(want, got, "gate={gate:?} の conv 履歴がビット不一致");
             }
-            let want: Vec<u32> = hist_a.iter().map(|v| v.to_bits()).collect();
-            let got: Vec<u32> = hist_b.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(want, got, "conv 履歴がビット不一致");
+            crate::ple::set_pf_ple_par_for_test(None);
         }
 
         /// task 154: 常駐ゲートを on にしても、GPU / PTX / 形の前提が無ければ
