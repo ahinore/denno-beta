@@ -1501,6 +1501,44 @@ pub trait LayerAttn: Send {
         Ok(outs)
     }
 
+    /// 平坦な入力 (`nt` 行 × 幅を連結したもの) をそのまま受け取り、平坦な出力を返す。
+    ///
+    /// task 200: 層優先バッチ prefill の層ループは活性を**もともと平坦な配列**で
+    /// 持っている (`mixed_flat`)。従来はここでトークンごとの `Vec<f32>` を作り、
+    /// 実装側がまた平坦に戻していたため、1 層チャンクあたり 4 回ぶんの
+    /// コピーと `nt` 個のアロケーションが乗っていた。
+    ///
+    /// 既定は [`Self::forward_batch`] に `Vec<Vec<f32>>` を作って渡し、結果を
+    /// 平坦に戻すだけ (数値は同じ)。`Vec<Vec<f32>>` を作らずに回せる実装
+    /// ([`crate::model::qwen4exp_attn::FullAttn`] /
+    /// [`crate::model::qwen4exp_ssm::SsmAttn`]) が上書きする。
+    /// 呼び出し側は `DENNO_PF_ATTN_FLAT` で切り替える。
+    fn forward_batch_flat(&mut self, layer: usize, flat: &[f32], nt: usize) -> Result<Vec<f32>> {
+        if nt == 0 {
+            return Ok(Vec::new());
+        }
+        if flat.len() % nt != 0 {
+            return Err(one(format!(
+                "forward_batch_flat: 入力長 {} が nt={nt} で割り切れない",
+                flat.len()
+            )));
+        }
+        let w = flat.len() / nt;
+        let curs: Vec<Vec<f32>> = flat.chunks_exact(w).map(|c| c.to_vec()).collect();
+        let outs = self.forward_batch(layer, &curs)?;
+        let mut out = Vec::with_capacity(nt * w);
+        for (i, r) in outs.iter().enumerate() {
+            if r.len() != w {
+                return Err(one(format!(
+                    "forward_batch_flat: 出力 {i} の長さ {} が {w} と違う",
+                    r.len()
+                )));
+            }
+            out.extend_from_slice(r);
+        }
+        Ok(out)
+    }
+
     /// 層をまたいで呼び出し順を入れ替えても状態が壊れないか。
     ///
     /// 層優先 (トークンをまとめて層ごとに回す) のバッチ prefill は、1 層ぶんの
@@ -3171,6 +3209,57 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
     /// 実行できないときは **層を 1 つも進めずに** `Ok(None)` を返す (呼び出し側が
     /// 従来経路をそのまま走らせる)。開始後に失敗したら `Err` にする — attention の
     /// KV/GDN 状態は既に進んでいるので、黙って従来経路へ落ちると状態が二重に進む。
+
+    /// task 200: 層優先 prefill の 1 層ぶんの attn 呼び出し。
+    ///
+    /// `flat_attn` が true なら平坦な入口 ([`LayerAttn::forward_batch_flat`]) を
+    /// 通り、`mixed_flat` をそのまま渡して平坦な出力を返す (トークンごとの
+    /// `Vec<f32>` を作らない)。false なら従来の行入口
+    /// ([`LayerAttn::forward_batch`]) + [`flatten_rows`]。
+    /// 戻り値はどちらも平坦な活性 (`nt` 行 × `e`)、値はビット一致する。
+    fn prefill_attn_chunk(
+        attn: &mut dyn LayerAttn,
+        il: usize,
+        mixed_flat: &[f32],
+        curs: &[Vec<f32>],
+        nt: usize,
+        e: usize,
+        flat_attn: bool,
+    ) -> Result<Vec<f32>> {
+        #[cfg(test)]
+        if flat_attn {
+            PF_ATTN_FLAT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            PF_ATTN_ROWS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if flat_attn {
+            let f = attn.forward_batch_flat(il, mixed_flat, nt)?;
+            if f.len() != nt * e {
+                return Err(one(format!(
+                    "層 {il}: attention の出力長 {} が nt {nt} * n_embd {e} と違う",
+                    f.len()
+                )));
+            }
+            return Ok(f);
+        }
+        let outs = attn.forward_batch(il, curs)?;
+        for o in &outs {
+            if o.len() != e {
+                return Err(one(format!(
+                    "層 {il}: attention の出力長 {} が n_embd {e} と違う",
+                    o.len()
+                )));
+            }
+        }
+        if outs.len() != nt {
+            return Err(one(format!(
+                "層 {il}: attention の出力本数 {} が nt {nt} と違う",
+                outs.len()
+            )));
+        }
+        flatten_rows(&outs, e)
+    }
+
     #[cfg(feature = "cuda")]
     fn forward_prefill_batch_resident(
         &mut self,
@@ -3356,9 +3445,16 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                     }
                 }
                 q4prof::add(&q4prof::MIX, t_mix);
-                let curs: Vec<Vec<f32>> = mixed_flat.chunks_exact(e).map(|c| c.to_vec()).collect();
+                // task 200: `DENNO_PF_ATTN_FLAT` は活性を平坦なまま attn へ渡し、
+                // 平坦なまま受け取る (トークンごとの Vec を作らない)。
+                let flat_attn = pf_attn_flat_on();
+                let curs: Vec<Vec<f32>> = if flat_attn {
+                    Vec::new()
+                } else {
+                    mixed_flat.chunks_exact(e).map(|c| c.to_vec()).collect()
+                };
                 let t_attn = std::time::Instant::now();
-                let outs = {
+                let flat_outs = {
                     let item = if q4ledger::enabled() {
                         match self.p.layer_kind(il) {
                             Ok(LayerKind::FullAttn) => q4ledger::FULL,
@@ -3368,24 +3464,17 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                         q4ledger::OTHER
                     };
                     let _l = q4ledger::enter(item);
-                    self.attn.forward_batch(il, &curs)?
+                    Self::prefill_attn_chunk(
+                        self.attn.as_mut(),
+                        il,
+                        &mixed_flat,
+                        &curs,
+                        nt,
+                        e,
+                        flat_attn,
+                    )?
                 };
-                for o in &outs {
-                    if o.len() != e {
-                        return Err(one(format!(
-                            "層 {il}: attention の出力長 {} が n_embd {e} と違う",
-                            o.len()
-                        )));
-                    }
-                }
                 q4prof::add(&q4prof::ATTN, t_attn);
-                if outs.len() != nt {
-                    return Err(one(format!(
-                        "層 {il}: attention の出力本数 {} が nt {nt} と違う",
-                        outs.len()
-                    )));
-                }
-                let flat_outs = flatten_rows(&outs, e)?;
                 if let Some(r) = roles.as_deref_mut() {
                     let t = nt - 1;
                     let v = rms_of(&flat_outs[t * e..(t + 1) * e]);
@@ -11394,6 +11483,14 @@ fn flatten_rows(rows: &[Vec<f32>], width: usize) -> Result<Vec<f32>> {
 #[cfg(test)]
 pub(crate) static PREFILL_BATCH_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// task 200: 層優先 prefill で平坦な attn 入口が何層走ったか (テスト用)。
+#[cfg(test)]
+pub(crate) static PF_ATTN_FLAT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// task 200: 同じく従来の行入口 (`Vec<Vec<f32>>`) が何層走ったか (テスト用)。
+#[cfg(test)]
+pub(crate) static PF_ATTN_ROWS_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 pub(crate) static GEMV_BATCH_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -11713,6 +11810,65 @@ static PF_FULL_FUSED_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::Ato
 #[cfg(test)]
 pub(crate) fn set_pf_full_fused_for_test(v: Option<bool>) {
     PF_FULL_FUSED_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 200: 層優先 prefill の活性を平坦なまま attn へ渡す
+// ---------------------------------------------------------------------------
+//
+// 動機 (REPORT_P198.md の 14,018 prefill 台帳): 層ループは mix の出力を
+// `mixed_flat` (`nt × n_embd`) で受け取り、`pf_combine` にも平坦な配列で
+// 渡している。その間に attn の口だけが `Vec<Vec<f32>>` なので、
+// 1 層チャンクあたり
+//
+//   mixed_flat → curs (nt 個の Vec) → 実装内で平坦に戻す → 出力 (nt 個の Vec)
+//   → flatten_rows で平坦に戻す
+//
+// と 4 回のコピー + 2 * nt 個のアロケーションが乗っていた。台帳の
+// `other` の未計測分 (0.10 ms/tok) と `layout` (245 ms) がこれにあたる。
+// 平坦な入口 [`LayerAttn::forward_batch_flat`] を通すと往復が消える。
+// 数値は同じ (コピーの有無だけ)。既定は off で lab の結果から決める。
+
+/// task 200: `DENNO_PF_ATTN_FLAT` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが
+/// off で、**未設定も off** (lab の結果で既定を決める)。
+pub(crate) fn pf_attn_flat_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no" | ""
+        ),
+    }
+}
+
+/// task 200: 層優先 prefill で attn へ平坦な活性をそのまま渡すか
+/// (`DENNO_PF_ATTN_FLAT`、既定 off)。
+pub(crate) fn pf_attn_flat_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_ATTN_FLAT_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_attn_flat_from_value(std::env::var("DENNO_PF_ATTN_FLAT").ok().as_deref()))
+}
+
+#[cfg(test)]
+static PF_ATTN_FLAT_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_attn_flat_for_test(v: Option<bool>) {
+    PF_ATTN_FLAT_FORCE.store(
         match v {
             None => 0,
             Some(false) => 1,
@@ -18642,6 +18798,19 @@ mod tests {
             }
         }
 
+        /// task 200: `DENNO_PF_ATTN_FLAT` は明示的な真値だけ on (既定 off)。
+        /// lab の結果で既定を決めるので、ここでは「明示 off が効く」ことも固定する。
+        #[test]
+        fn pf_attn_flat_gate_values() {
+            assert!(!pf_attn_flat_from_value(None), "未設定は既定 off");
+            for v in ["0", "off", "false", "no", "", " 0 ", "OFF"] {
+                assert!(!pf_attn_flat_from_value(Some(v)), "{v:?} が on になった");
+            }
+            for v in ["1", "on", "true", "yes", " ON "] {
+                assert!(pf_attn_flat_from_value(Some(v)), "{v:?} が off のまま");
+            }
+        }
+
         /// task 183: `DENNO_PF_FULL_FUSED` は lab t183a で**既定 on**にした。
         /// 融合 qkv を 1 回の GEMM で撃つ経路の切り戻しゲート (`0` で切る)。
         #[test]
@@ -22329,6 +22498,68 @@ mod tests {
                 assert_bitwise_eq(&seq, &bat, &format!("chunk {chunk}"));
             }
             moe_expert::set_vnni_for_test(None);
+        }
+
+        /// task 200: 平坦な attn 入口 (`DENNO_PF_ATTN_FLAT` の分岐) が
+        /// 行入口と同じ値を返し、**両方の分岐が実際に走る**ことを固定する。
+        ///
+        /// 層ループ本体 (常駐経路) は GPU が要るので CPU では通らない。ここでは
+        /// 層ループが呼ぶのと同じ関数 [`Qwen4Exp::prefill_attn_chunk`] を 2 つの
+        /// モデルで 1 回ずつ呼び、値と通過カウンタを見る。
+        #[test]
+        fn prefill_attn_flat_matches_rows_and_fires() {
+            let _g = moe_test_guard();
+            let dir = TempDir::new("h2attnflat");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("合成モデルを開けない");
+            let p = Qwen4ExpParams::from_meta(&f).expect("from_meta");
+            let e = p.n_embd;
+            let n_layer = p.n_layer;
+            let nt = 3usize;
+            // 行ごとに違う 0 でない入力。
+            let flat: Vec<f32> = (0..nt * e)
+                .map(|i| 0.25 * (((i * 7) % 11) as f32) - 1.0)
+                .collect();
+            let curs: Vec<Vec<f32>> = flat.chunks_exact(e).map(|c| c.to_vec()).collect();
+
+            let mut m_rows = Qwen4Exp::new(&f).expect("Qwen4Exp::new (rows)");
+            let mut m_flat = Qwen4Exp::new(&f).expect("Qwen4Exp::new (flat)");
+            let r0 = PF_ATTN_ROWS_CALLS.load(Ordering::Relaxed);
+            let f0 = PF_ATTN_FLAT_CALLS.load(Ordering::Relaxed);
+            for il in 0..n_layer {
+                let a = Qwen4Exp::prefill_attn_chunk(
+                    m_rows.attn.as_mut(),
+                    il,
+                    &flat,
+                    &curs,
+                    nt,
+                    e,
+                    false,
+                )
+                .expect("行入口");
+                let b = Qwen4Exp::prefill_attn_chunk(
+                    m_flat.attn.as_mut(),
+                    il,
+                    &flat,
+                    &curs,
+                    nt,
+                    e,
+                    true,
+                )
+                .expect("平坦入口");
+                assert_eq!(a.len(), nt * e, "層 {il}: 出力長");
+                assert_bitwise_eq(&a, &b, &format!("層 {il} 行入口 vs 平坦入口"));
+            }
+            assert_eq!(
+                PF_ATTN_ROWS_CALLS.load(Ordering::Relaxed) - r0,
+                n_layer,
+                "行入口の通過数"
+            );
+            assert_eq!(
+                PF_ATTN_FLAT_CALLS.load(Ordering::Relaxed) - f0,
+                n_layer,
+                "平坦入口の通過数"
+            );
         }
 
         /// task 134: prefill の full attention が GPU の分岐に入り、**短い

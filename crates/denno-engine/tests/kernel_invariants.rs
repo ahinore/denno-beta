@@ -8580,3 +8580,49 @@ fn pf195_router_fast_is_wired() {
         "moe.rs に select_topk_into_fast が無い"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 200: 平坦な attn 入口 (`DENNO_PF_ATTN_FLAT`)
+// ---------------------------------------------------------------------------
+
+const SSM_SRC: &str = include_str!("../src/model/qwen4exp_ssm.rs");
+const ATTN_SRC: &str = include_str!("../src/model/qwen4exp_attn.rs");
+
+/// `DENNO_PF_ATTN_FLAT` は**既定 off** (lab の結果で決める)。
+/// 併せて、層ループが平坦な入口を実際に呼び、通過カウンタで発火を数える
+/// ことを固定する (ゲートを足したら発火を数える)。
+#[test]
+fn pf_attn_flat_gate_defaults_off_and_is_wired() {
+    let i = QWEN_SRC
+        .find("pub(crate) fn pf_attn_flat_from_value")
+        .expect("pf_attn_flat_from_value が無い");
+    let body: String = QWEN_SRC[i..].chars().take(260).collect();
+    assert!(
+        body.contains("None => false,"),
+        "pf_attn_flat_from_value(None) が off でない: {body}"
+    );
+    assert!(
+        body.contains("\"off\"") && body.contains("\"false\"") && body.contains("\"no\""),
+        "明示 off の表が無い: {body}"
+    );
+    // 層ループ (常駐経路) が平坦入口を呼び、両分岐の通過を数えていること。
+    for k in [
+        "Self::prefill_attn_chunk(",
+        "attn.forward_batch_flat(il, mixed_flat, nt)",
+        "PF_ATTN_FLAT_CALLS.fetch_add",
+        "PF_ATTN_ROWS_CALLS.fetch_add",
+    ] {
+        assert!(QWEN_SRC.contains(k), "qwen4exp.rs に {k} が無い");
+    }
+    // 平坦入口そのものが ssm / full の両方に実装されていること。
+    assert!(
+        QWEN_SRC.contains("fn forward_batch_flat("),
+        "trait に forward_batch_flat が無い"
+    );
+    for (src, name) in [(SSM_SRC, "SsmLayer"), (ATTN_SRC, "FullAttn")] {
+        assert!(
+            src.contains("fn forward_batch_flat("),
+            "{name}::forward_batch_flat が無い"
+        );
+    }
+}

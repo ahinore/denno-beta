@@ -1832,39 +1832,67 @@ impl FullAttn {
     /// 逐次経路 ([`FullAttn::forward_token`]) に任せる。QSA の選択結果は
     /// トークンごとに依存するので dense のバッチ経路と混ぜない。
     pub fn forward_batch(&mut self, layer: usize, curs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
-        let nt = curs.len();
+        let e = self.n_embd;
+        let mut flat = Vec::with_capacity(curs.len() * e);
+        for (i, cur) in curs.iter().enumerate() {
+            if cur.len() != e {
+                bail!(
+                    "FullAttn::forward_batch: トークン {i} の入力長 {} が n_embd = {e} と違う",
+                    cur.len()
+                );
+            }
+            flat.extend_from_slice(cur);
+        }
+        let outs = self.forward_batch_flat(layer, &flat, curs.len())?;
+        Ok(outs.chunks_exact(e).map(|c| c.to_vec()).collect())
+    }
+
+    /// task 200: [`Self::forward_batch`] の平坦版。入力 `flat` (`nt` 行 ×
+    /// `n_embd`) をそのまま使い、出力も平坦な 1 本で返す (トークンごとの
+    /// `Vec<f32>` を作らない)。数値は [`Self::forward_batch`] とビット一致する。
+    pub fn forward_batch_flat(
+        &mut self,
+        layer: usize,
+        flat: &[f32],
+        nt: usize,
+    ) -> Result<Vec<f32>> {
+        let n_embd = self.n_embd;
         if nt == 0 {
             return Ok(Vec::new());
         }
-        for (i, cur) in curs.iter().enumerate() {
-            if cur.len() != self.n_embd {
-                bail!(
-                    "FullAttn::forward_batch: トークン {i} の入力長 {} が n_embd = {} と違う",
-                    cur.len(),
-                    self.n_embd
-                );
-            }
+        if flat.len() != nt * n_embd {
+            bail!(
+                "FullAttn::forward_batch_flat: 入力長 {} が nt={nt} * n_embd={n_embd} と違う",
+                flat.len()
+            );
         }
         let Some(slot) = self.layers.get(layer) else {
             bail!(
-                "FullAttn::forward_batch: 層 {layer} は範囲外 (n_layer = {})",
+                "FullAttn::forward_batch_flat: 層 {layer} は範囲外 (n_layer = {})",
                 self.layers.len()
             );
         };
         if slot.is_none() {
-            bail!("FullAttn::forward_batch: 層 {layer} は ssm 層で full attention の担当外");
+            bail!("FullAttn::forward_batch_flat: 層 {layer} は ssm 層で full attention の担当外");
         }
         if nt == 1 || matches!(&self.qsa, Some(q) if q.is_qsa(layer)) {
-            let mut outs = Vec::with_capacity(nt);
-            for cur in curs {
-                outs.push(self.forward_token(layer, cur)?);
+            let mut out = Vec::with_capacity(nt * n_embd);
+            for t in 0..nt {
+                let o = self.forward_token(layer, &flat[t * n_embd..(t + 1) * n_embd])?;
+                if o.len() != n_embd {
+                    bail!(
+                        "FullAttn::forward_batch_flat: トークン {t} の出力長 {} が n_embd = {n_embd} と違う",
+                        o.len()
+                    );
+                }
+                out.extend_from_slice(&o);
             }
-            return Ok(outs);
+            return Ok(out);
         }
         let base = self.cache.len(layer)?;
         if base + nt > self.cache.max_ctx() {
             bail!(
-                "FullAttn::forward_batch: 層 {layer} が容量 max_ctx = {} を超える ({base} + {nt})",
+                "FullAttn::forward_batch_flat: 層 {layer} が容量 max_ctx = {} を超える ({base} + {nt})",
                 self.cache.max_ctx()
             );
         }
@@ -1876,15 +1904,11 @@ impl FullAttn {
         if crate::model::qwen4exp::pf_full_dev_on()
             || crate::model::qwen4exp::pf_full_fused_on()
         {
-            if let Some(outs) = self.forward_batch_dev(layer, curs, base)? {
-                return Ok(outs);
+            if let Some(flat_out) = self.forward_batch_dev(layer, flat, nt, base)? {
+                return Ok(flat_out);
             }
         }
-        let n_embd = self.n_embd;
-        let mut flat = Vec::with_capacity(nt * n_embd);
-        for cur in curs {
-            flat.extend_from_slice(cur);
-        }
+        // task 200: 入力は呼び出し側の平坦な配列をそのまま読む (連結コピー無し)。
 
         // P49: 段別の時間 (`DENNO_Q4_PROFILE` か `DENNO_PF_ATT_DBG` のときだけ取る)。
         let t_all = q4prof::stamp();
@@ -1904,7 +1928,7 @@ impl FullAttn {
         let mut ks = vec![0f32; nt * kv];
         let mut vs = vec![0f32; nt * kv];
         l.qkv
-            .gemv_batch_split(&flat, nt, &mut [&mut qgs[..], &mut ks[..], &mut vs[..]])?;
+            .gemv_batch_split(flat, nt, &mut [&mut qgs[..], &mut ks[..], &mut vs[..]])?;
         q4prof::mark_l(t_qkv, layer, q4prof::ST_QKV);
 
         // 正規化 + rope はトークンごと (pos が違う)。k は rope 後にキャッシュへ積む。
@@ -1951,7 +1975,7 @@ impl FullAttn {
         if self.pos < base + nt {
             self.pos = base + nt;
         }
-        Ok(outs.chunks_exact(n_embd).map(|c| c.to_vec()).collect())
+        Ok(outs)
     }
 
     /// task 172: 1 チャンクの full attention を「入力 1 H2D / 出力 1 D2H」で閉じる。
@@ -1964,14 +1988,16 @@ impl FullAttn {
     /// 使えない形・環境 (重みが融合済み / 量子型が違う / PTX が無い / nt が小さい)
     /// では `Ok(None)` を返す。**ホストの状態は触らない**ので、呼び出し側は
     /// そのまま従来経路を走らせてよい。
+    /// task 200: 入力は平坦な配列 (`nt` 行 × `n_embd`) をそのまま受け取り、
+    /// 出力も平坦な 1 本で返す (トークンごとの `Vec<f32>` を作らない)。
     #[cfg(feature = "cuda")]
     fn forward_batch_dev(
         &mut self,
         layer: usize,
-        curs: &[Vec<f32>],
+        flat: &[f32],
+        nt: usize,
         base: usize,
-    ) -> Result<Option<Vec<Vec<f32>>>> {
-        let nt = curs.len();
+    ) -> Result<Option<Vec<f32>>> {
         let e = self.n_embd;
         let l = match self.layers[layer].as_ref() {
             Some(l) => l,
@@ -2022,10 +2048,6 @@ impl FullAttn {
                 return Ok(None);
             }
         };
-        let mut flat = Vec::with_capacity(nt * e);
-        for cur in curs {
-            flat.extend_from_slice(cur);
-        }
         let mut ks = vec![0f32; nt * kv];
         let mut vs = vec![0f32; nt * kv];
         let cache_id = self.cache.id();
@@ -2132,9 +2154,7 @@ impl FullAttn {
         if self.pos < base + nt {
             self.pos = base + nt;
         }
-        Ok(Some(
-            flat_out.chunks_exact(e).map(|c| c.to_vec()).collect(),
-        ))
+        Ok(Some(flat_out))
     }
 }
 
@@ -2156,6 +2176,17 @@ impl LayerAttn for FullAttn {
         curs: &[Vec<f32>],
     ) -> std::result::Result<Vec<Vec<f32>>, Qwen4ExpError> {
         FullAttn::forward_batch(self, layer, curs)
+            .map_err(|e| Qwen4ExpError(vec![format!("{e:#}")]))
+    }
+
+    /// task 200: 平坦なまま受けて平坦なまま返す ([`FullAttn::forward_batch_flat`])。
+    fn forward_batch_flat(
+        &mut self,
+        layer: usize,
+        flat: &[f32],
+        nt: usize,
+    ) -> std::result::Result<Vec<f32>, Qwen4ExpError> {
+        FullAttn::forward_batch_flat(self, layer, flat, nt)
             .map_err(|e| Qwen4ExpError(vec![format!("{e:#}")]))
     }
 
