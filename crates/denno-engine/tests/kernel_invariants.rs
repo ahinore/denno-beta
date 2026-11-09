@@ -8052,3 +8052,307 @@ fn pf_mix_stage_sync_uses_an_event() {
         assert!(CUDA_RS.contains(k), "mix の段計測 {k} が無い");
     }
 }
+
+// ---------------------------------------------------------------------------
+// task 192: v5 の Q5_K (`kernels_moe_v5_q5k.cu`) と mix の fold (`kernels_mix_dev2.cu`)
+// ---------------------------------------------------------------------------
+
+const MOE_V5_Q5K_SRC: &str = include_str!("../kernels/kernels_moe_v5_q5k.cu");
+const QWEN4EXP_RS: &str = include_str!("../src/model/qwen4exp.rs");
+const MIX_DEV2_SRC: &str = include_str!("../kernels/kernels_mix_dev2.cu");
+
+/// Q5_K の v5 カーネルは v3 / v4 / v5 と同じ 8 引数 ABI で、cuda.rs が
+/// 別モジュール (`kernels_moe_v5_q5k.ptx`) として読んでいること。
+#[test]
+fn gemv_v5_q5k_kernel_is_wired() {
+    let p = kernel_params(MOE_V5_Q5K_SRC, "dno_gemv_q5k_v5");
+    assert_eq!(
+        p,
+        vec!["w", "x", "out", "n_in", "n_out", "row_bytes", "rows_per_block", "lanes"],
+        "dno_gemv_q5k_v5 の引数が v4 ABI と違う: {p:?}"
+    );
+    // 176 B のスーパーブロックを 11 本の uint4 で読む (v4 のバイト読みではない)。
+    assert!(
+        MOE_V5_Q5K_SRC.contains("uint4 u[11];"),
+        "Q5_K のスーパーブロックを uint4 x11 で読んでいない"
+    );
+    assert!(
+        MOE_V5_Q5K_SRC.contains("for (int i = 0; i < 11; ++i) u[i] = src[i];"),
+        "11 本のベクタロードが無い"
+    );
+    // 5 ビット目は qh[l] の bit s (CPU / v4 と同じ位置)。
+    assert!(
+        MOE_V5_Q5K_SRC.contains("(hw >> (((l & 3) * 8) + s)) & 1u"),
+        "Q5_K の 5 ビット目の取り出しが変わった"
+    );
+    assert!(
+        MOE_V5_Q5K_SRC.contains("__fsub_rn(__fmul_rn(ds, (float)(nib + hb)), ms)"),
+        "dequant の演算列 (ds*(nib+hb)-ms) が変わった"
+    );
+    // cuda.rs: 別ファイルを読み、名前と 8 引数を検査している。
+    assert!(
+        CUDA_RS.contains("kernels_moe_v5_q5k.ptx"),
+        "cuda.rs が kernels_moe_v5_q5k.ptx を読んでいない"
+    );
+    assert!(
+        CUDA_RS.contains(r#"const V5_Q5K_KERNEL_NAME: &str = "dno_gemv_q5k_v5";"#),
+        "cuda.rs のカーネル名が変わった"
+    );
+    assert!(
+        CUDA_RS.contains("ptx_entry_params(&text, V5_Q5K_KERNEL_NAME) != Some(V5_NARGS)"),
+        "Q5_K の ABI (8 引数) 検査が無い"
+    );
+    // 計画: Q5_K は Q4_K と同じくスーパーブロック単位・v5 のゲートで切れる。
+    let plan = fn_body(CUDA_RS, "fn plan_moe_gemv_v5(");
+    assert!(
+        plan.contains("T::Q5K => {"),
+        "plan_moe_gemv_v5 に Q5_K の腕が無い"
+    );
+    assert!(
+        plan.contains("if !gdn_dec_gemv_q5k_on() {"),
+        "Q5_K の切り戻しゲートが計画に入っていない"
+    );
+    // build_ptx.sh: nofmad で targets_all に入っている。
+    assert!(
+        BUILD_PTX_SH.contains("moe_v5_q5k)   echo \"kernels_moe_v5_q5k.cu|nofmad\" ;;"),
+        "build_ptx.sh の moe_v5_q5k が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("moe_v5_q5k"),
+        "build_ptx.sh の targets_all に moe_v5_q5k が無い: {targets}"
+    );
+}
+
+/// mix の fold 版は 9 引数で、cuda.rs が `DENNO_MIX_DEC_FOLD` の下で
+/// 1 ブロック起動していること。
+#[test]
+fn mix_fold_kernel_is_wired() {
+    let p = kernel_params(MIX_DEV2_SRC, "dno_mix_norm_inj");
+    assert_eq!(
+        p,
+        vec!["x", "gamma", "out", "w", "inj", "e", "hc", "k", "eps"],
+        "dno_mix_norm_inj の引数が違う: {p:?}"
+    );
+    // hc 方向を 1 ブロックに畳む (grid = 1) ので、ストリームのループは定数上限。
+    assert!(
+        MIX_DEV2_SRC.contains("#define DNO_MIX2_HC_MAX 4"),
+        "hc の上限が無い"
+    );
+    assert!(
+        MIX_DEV2_SRC.contains("#define DNO_MIX2_THREADS 256"),
+        "グループ幅 (256) が無い"
+    );
+    assert!(
+        MIX_DEV2_SRC.contains("if (hc <= 0 || hc > DNO_MIX2_HC_MAX || g >= hc)"),
+        "hc の門番が無い"
+    );
+    // norm と inject の間に 1 回だけ barrier を置く (正規化の書き終わりを待つ)。
+    assert!(
+        MIX_DEV2_SRC.contains("// inject は正規化後の out を全部読むので、書き終わるまで待つ。"),
+        "norm -> inject の barrier が無い"
+    );
+    // 2 本版と同じ縮約木 (ビット一致の根拠)。
+    assert!(
+        MIX_DEV2_SRC.contains("__shfl_down_sync(0xffffffffu, v, off)"),
+        "warp 縮約が 2 本版と違う"
+    );
+    assert!(
+        MIX_DEV2_SRC.contains("__fadd_rn(ss, __fmul_rn(v, v))"),
+        "二乗和の演算列が 2 本版と違う"
+    );
+    assert!(
+        MIX_DEV2_SRC.contains("__fmul_rn(__fmul_rn(src[i], iv), gm[i])"),
+        "正規化の乗算順が 2 本版と違う"
+    );
+    assert!(
+        MIX_DEV2_SRC.contains("__fadd_rn(acc, __fmul_rn(wv, out[i]))"),
+        "inject の内積が 2 本版と違う"
+    );
+    // cuda.rs: 別ファイル・9 引数・ゲート・起動 (grid 1 / block 256)。
+    assert!(
+        CUDA_RS.contains("kernels_mix_dev2.ptx"),
+        "cuda.rs が kernels_mix_dev2.ptx を読んでいない"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_FOLD_NARGS: usize = 9;"),
+        "fold 版の ABI 検査が 9 引数でない"
+    );
+    let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    assert!(
+        body.contains("mix_dec_fold_on() && hc <= 4"),
+        "fold 版の門番 (hc <= 4) が無い"
+    );
+    assert!(
+        body.contains("let folded = if mix_dec_fold_on()"),
+        "fold 版の分岐が無い"
+    );
+    assert!(
+        body.contains("f_fold,") && body.contains("(1, 1, 1),"),
+        "fold 版が grid 1 で起動されていない"
+    );
+    assert!(
+        body.contains("((THREADS * hc) as u32, 1, 1),"),
+        "fold 版の block が 256 * hc でない (並列度が 2 本版より落ちる)"
+    );
+    // build_ptx.sh
+    assert!(
+        BUILD_PTX_SH.contains("mix_dev2)     echo \"kernels_mix_dev2.cu|nofmad\" ;;"),
+        "build_ptx.sh の mix_dev2 が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("mix_dev2"),
+        "build_ptx.sh の targets_all に mix_dev2 が無い: {targets}"
+    );
+}
+
+/// task 192: full 層の GEMV は `DENNO_FULL_DEC_FAST` の下で v5 -> v4 -> 従来。
+#[test]
+fn full_dec_fast_plans_v5_first() {
+    let plan = fn_body(CUDA_RS, "fn dec_plan(");
+    let v5 = plan.find("plan_moe_gemv_v5").unwrap_or(usize::MAX);
+    let v4 = plan.find("plan_moe_gemv_v4").unwrap_or(usize::MAX);
+    let old = plan.find("plan_moe_gemv(ty, k, n, gemv_kernel_mode())").unwrap_or(usize::MAX);
+    assert!(v5 < v4 && v4 < old, "dec_plan の優先順が v5 -> v4 -> 従来でない");
+    let body = fn_body(CUDA_RS, "fn forward_inner(");
+    assert!(
+        body.contains("dec_plan(ctx, u.ty, u.k, u.n)?"),
+        "full の qkv GEMV が dec_plan を通っていない"
+    );
+    let wo = fn_body(CUDA_RS, "fn wo_plan(");
+    assert!(
+        wo.contains("plan_moe_gemv_v5(a.wo_ty, a.wo_k, a.wo_n)"),
+        "wo の plan が v5 を先に試していない"
+    );
+    assert!(
+        CUDA_RS.contains(r#"std::env::var("DENNO_FULL_DEC_FAST")"#),
+        "DENNO_FULL_DEC_FAST の読み取りが無い"
+    );
+}
+
+/// task 192: ルータは「積む」と「待つ」に分かれ、decode の early 経路が
+/// 共有 expert の enqueue より前に `begin` を通ること。
+#[test]
+fn dec_router_early_splits_begin_and_finish() {
+    let begin = fn_body(CUDA_RS, "pub fn maybe_gpu_router_gemv_begin(");
+    assert!(
+        !begin.contains("sync_default_or_ctx"),
+        "begin が同期している (early の意味が無い)"
+    );
+    assert!(
+        begin.contains("ROUTER_PENDING_N.with(|c| c.set(n));"),
+        "begin が pending を記録していない"
+    );
+    let fin = fn_body(CUDA_RS, "pub fn maybe_gpu_router_gemv_finish(");
+    assert!(
+        fin.contains("sync_default_or_ctx(ctx, router_fused_enabled())?"),
+        "finish が既定ストリームだけを待っていない"
+    );
+    assert!(
+        fin.contains("out.copy_from_slice(&ho.as_slice::<f32>()[..n]);"),
+        "finish がロジットを写していない"
+    );
+    let into = fn_body(CUDA_RS, "pub fn maybe_gpu_router_gemv_into(");
+    assert!(
+        into.contains("maybe_gpu_router_gemv_begin(uid, bytes, k, n, x)")
+            && into.contains("maybe_gpu_router_gemv_finish(out)"),
+        "into が begin -> finish に分かれていない"
+    );
+    // 呼び出し側: begin が SharedExpertOverlap::begin より前にある。
+    let f = fn_body(QWEN4EXP_RS, "fn moe_ffn_quant_impl(");
+    let early = f.find("maybe_gpu_router_gemv_begin(").expect("begin の呼び出しが無い");
+    let shed = f.find("SharedExpertOverlap::begin(lw, x)").expect("shared の enqueue が無い");
+    assert!(early < shed, "ルータの begin が共有 expert の後ろにある");
+    assert!(
+        f.contains("maybe_gpu_router_gemv_finish(&mut probs)"),
+        "finish の呼び出しが無い"
+    );
+    assert!(
+        CUDA_RS.contains(r#"std::env::var("DENNO_DEC_ROUTER_EARLY")"#),
+        "DENNO_DEC_ROUTER_EARLY の読み取りが無い"
+    );
+}
+
+/// task 192: mix の up (BF16) は 1 warp = 1 行。cuda.rs が
+/// `DENNO_MIX_DEC_FOLD` の下で grid = n/8 を渡すこと。
+const MIX_UP_SRC: &str = include_str!("../kernels/kernels_mix_up.cu");
+
+#[test]
+fn mix_up_warp_per_row_kernel_is_wired() {
+    let p = kernel_params(MIX_UP_SRC, "dno_mix_up_bf16");
+    // **先頭が入力 x、次が重み** (既存 dno_matvec_bf16_r と同じ並び)。lab t192b で
+    // ここを (w, x, ...) にしていて、重みを入力として読む E700 を出した。
+    assert_eq!(
+        p,
+        vec!["x", "w", "out", "k", "n"],
+        "dno_mix_up_bf16 の引数が (x, w, out, k, n) と違う: {p:?}"
+    );
+    let launch = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    assert!(
+        launch.contains("let (mut ph2, mut pw2, mut po2) = (dlo.ptr(), wp2, dout.ptr());"),
+        "up の起動が (入力, 重み, 出力) の順でない"
+    );
+    assert!(
+        MIX_UP_SRC.contains("const int row = blockIdx.x * DNO_MIXUP_WARPS + warp;"),
+        "1 warp = 1 行の割り当てが変わった"
+    );
+    assert!(
+        MIX_UP_SRC.contains("#define DNO_MIXUP_WARPS 8"),
+        "1 ブロックの行数が 8 でない"
+    );
+    // uint4 = 8 BF16 のベクタロード (バイト読みではない)。
+    assert!(
+        MIX_UP_SRC.contains("*reinterpret_cast<const uint4*>(rowp + c)"),
+        "8 要素のベクタロードが無い"
+    );
+    // BF16 -> f32 は上位 16 bit の複製と 1 演算 1 丸め。
+    assert!(
+        MIX_UP_SRC.contains("__uint_as_float(h << 16)"),
+        "BF16 の展開が上位 16 bit の複製でない"
+    );
+    assert!(
+        MIX_UP_SRC.contains("acc = __fadd_rn(acc, __fmul_rn("),
+        "積和が明示の 2 演算でない"
+    );
+    // cuda.rs: 別ファイル・5 引数・fold ゲート・grid = n/8。
+    assert!(
+        CUDA_RS.contains("kernels_mix_up.ptx"),
+        "cuda.rs が kernels_mix_up.ptx を読んでいない"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_UP_NARGS: usize = 5;"),
+        "up 版の ABI 検査が 5 引数でない"
+    );
+    assert!(
+        CUDA_RS.contains("const MIX_UP_ROWS: usize = 8;"),
+        "up 版の行数ミラーが無い"
+    );
+    let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    assert!(
+        body.contains("mix_dec_upw_on() && up_reduce && k2 % 8 == 0"),
+        "up 版の門番 (upw / k % 8) が無い"
+    );
+    assert!(
+        body.contains("n2.div_ceil(MIX_UP_ROWS) as u32"),
+        "up 版の grid が n/8 でない"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("mix_up)       echo \"kernels_mix_up.cu|nofmad\" ;;"),
+        "build_ptx.sh の mix_up が nofmad でない"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("mix_up"),
+        "build_ptx.sh の targets_all に mix_up が無い: {targets}"
+    );
+}
