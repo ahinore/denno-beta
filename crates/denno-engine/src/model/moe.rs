@@ -91,6 +91,54 @@ pub(crate) fn select_topk(probs: &[f32], k: usize) -> Vec<usize> {
     out
 }
 
+/// task 195: [`select_topk_into`] と同じ選択 (値の降順・同値は小さい index・
+/// 出力は index 昇順) を**挿入法**で返す。
+///
+/// lab t189c の prefill router は `sub router softmax` が 597 ms (14,018 トークン)
+/// で、内訳をこのコンテナで測ると (ne=512, k=8, 512 行の相対マイクロベンチ)
+/// softmax 0.75 ms / `select_nth_unstable_by` 2.15 ms / 挿入法 0.35 ms だった。
+/// つまりコストの 7 割は top-k の側で、比較関数 (`partial_cmp`) の呼び出しが
+/// 重い。挿入法は「k 本目の値以下なら捨てる」で早期に打ち切るので比較回数が
+/// 実測で 1 行あたり ne 回程度になり、**結果は select_nth 版と同一**。
+///
+/// 選択規則は [`select_topk_scan`] と同じ (同値は小さい index)。NaN 入りだけは
+/// 順序が定まらないので従来どおり [`select_topk_scan`] へ落とす。
+pub(crate) fn select_topk_into_fast(probs: &[f32], k: usize, out: &mut [usize]) {
+    const MAX_K: usize = 32;
+    let n = probs.len();
+    assert!(k >= 1 && k <= n, "k={} は 1..={} の範囲外", k, n);
+    assert_eq!(out.len(), k, "out.len() は k と一致する必要がある");
+    if k > MAX_K || probs.iter().any(|v| v.is_nan()) {
+        let mut buf: Vec<u32> = Vec::new();
+        select_topk_into(probs, k, &mut buf, out);
+        return;
+    }
+    let mut idx = [0usize; MAX_K];
+    let mut val = [0f32; MAX_K];
+    let mut cnt = 0usize;
+    for (i, &p) in probs.iter().enumerate() {
+        if cnt == k && !(p > val[k - 1]) {
+            continue;
+        }
+        // 挿入位置を探す (値の降順、同値なら小さい index が先)。
+        let mut pos = if cnt < k { cnt } else { k - 1 };
+        while pos > 0 && (p > val[pos - 1] || (p == val[pos - 1] && i < idx[pos - 1])) {
+            val[pos] = val[pos - 1];
+            idx[pos] = idx[pos - 1];
+            pos -= 1;
+        }
+        val[pos] = p;
+        idx[pos] = i;
+        if cnt < k {
+            cnt += 1;
+        }
+    }
+    // 出力は index 昇順 (従来の `sort_unstable` と同じ並び)。
+    let mut sel = idx;
+    sel[..cnt].sort_unstable();
+    out.copy_from_slice(&sel[..k]);
+}
+
 /// [`select_topk`] の作業域版。`buf` を使い回すのでトークンごとの確保が無い。
 /// `out` には **index 昇順** で k 個を書く。
 pub(crate) fn select_topk_into(probs: &[f32], k: usize, buf: &mut Vec<u32>, out: &mut [usize]) {
