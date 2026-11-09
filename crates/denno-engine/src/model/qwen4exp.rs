@@ -1862,19 +1862,40 @@ struct PleW {
     conv1d: Vec<f32>,
     /// conv のカーネル長 (GGUF の `ple.conv_kernel`)
     kern: usize,
+    /// `conv1d` を **kern 優先**に並べ直したもの (`conv1d_t[k*hc_dim + c]`)。
+    ///
+    /// task 195: `ple_conv_silu` の内側のループは `w[c*kern + k]` を読むので
+    /// c 方向に stride kern の間隔が空き、ベクトル化できない (実測 27 us/トークン、
+    /// 14k で 384 ms = PLE 注入の 42%)。kern 優先にすると k ごとの内側ループが
+    /// 連続になり、同じ足し算の順序 (k 昇順・c 昇順) のまま速くなる。
+    conv1d_t: Vec<f32>,
 }
 
 impl PleW {
     fn load(f: &GgufFile, il: usize, p: &Qwen4ExpParams) -> Result<Self> {
         let name = |s: &str| format!("blk.{il}.{s}");
+        // task 195: conv1d は [hc_dim][kern] なので kern 優先にも並べておく
+        // (`ple_conv_silu_t` が使う。値は同じで、読む順だけが連続になる)。
+        let conv1d = f32_tensor(f, &name("ple_conv1d.weight"))?;
+        let hc_dim = p.hc_dim();
+        let kern = p.ple_conv_kernel;
+        let mut conv1d_t = vec![0.0f32; conv1d.len()];
+        if kern > 0 && conv1d.len() == kern * hc_dim {
+            for c in 0..hc_dim {
+                for k in 0..kern {
+                    conv1d_t[k * hc_dim + c] = conv1d[c * kern + k];
+                }
+            }
+        }
         Ok(PleW {
             key: linear(f, &name("ple_key.weight"))?,
             value: linear(f, &name("ple_value.weight"))?,
             norm_key: f32_tensor(f, &name("ple_norm_key.weight"))?,
             norm_query: f32_tensor(f, &name("ple_norm_query.weight"))?,
             norm_conv: f32_tensor(f, &name("ple_norm_conv.weight"))?,
-            conv1d: f32_tensor(f, &name("ple_conv1d.weight"))?,
-            kern: p.ple_conv_kernel,
+            conv1d: conv1d.clone(),
+            conv1d_t,
+            kern,
         })
     }
 }
@@ -3258,16 +3279,29 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                         .ok_or_else(|| one(format!("層 {il}: PLE の conv 履歴が無い")))?;
                     // task 195: `DENNO_PF_PLE_FAST` は平坦な res をその場で更新する
                     // (トークンごとの `HyperStreams` の確保と書き戻しをしない)。
+                    // トークンが多いときは 2 段に分けて並列に回す。
                     if pf_ple_fast_on() {
-                        ple_inject_batch_flat(
-                            &self.p,
-                            pw,
-                            &rows,
-                            &mut back,
-                            &hp,
-                            hist,
-                            want.then_some(&mut contrib),
-                        )?;
+                        if nt >= PLE_PAR_MIN_TOK {
+                            ple_inject_batch_par(
+                                &self.p,
+                                pw,
+                                &rows,
+                                &mut back,
+                                &hp,
+                                hist,
+                                want.then_some(&mut contrib),
+                            )?;
+                        } else {
+                            ple_inject_batch_flat(
+                                &self.p,
+                                pw,
+                                &rows,
+                                &mut back,
+                                &hp,
+                                hist,
+                                want.then_some(&mut contrib),
+                            )?;
+                        }
                     } else {
                         let mut streams: Vec<HyperStreams> = (0..nt)
                             .map(|t| HyperStreams {
@@ -5122,6 +5156,12 @@ pub(crate) fn pf_ple_fast_on() -> bool {
     *ON.get_or_init(|| pf_ple_fast_from_value(std::env::var("DENNO_PF_PLE_FAST").ok().as_deref()))
 }
 
+/// task 195: 並列版 (`ple_inject_batch_par`) を使う最小トークン数。
+///
+/// 1 チャンク = 512 トークン (実形) なので常に並列版。次のターンの 19 トークン
+/// のような短い prefill は rayon の起動のほうが高いので逐次平坦版にする。
+pub(crate) const PLE_PAR_MIN_TOK: usize = 32;
+
 /// task 195: PLE 射影 (`key` / `value`) を 1 チャンクぶん回す。
 ///
 /// 経路は task 172 / 182 と同じ: `DENNO_PF_PLE_GPU` (量子型) → だめなら
@@ -5349,6 +5389,311 @@ fn ple_inject_batch_flat(
     r
 }
 
+/// task 195: チャンク内のトークンを並列に回す PLE 注入 (`DENNO_PF_PLE_FAST`)。
+///
+/// lab t195a の `[pf-ple-kprof]` (14,018 + 3,826 トークン) で、PLE 注入 1,163 ms の
+/// 内訳は conv 489 / rms 171 / rmsc 83 / dot 75 / gated 11 / out 12 ms だった。
+/// どれも**トークンごとに独立**なので (conv は「前のトークンの x」を読むだけで、
+/// x は先に全トークンぶん作れる)、2 段に分けて rayon で並列化する:
+///
+/// 1. 射影 (key / value) → 全トークンの x (= grouped RMS 後の gated) を作る
+/// 2. 全トークンの conv + 加算 (x は手元にあるので履歴待ちが無い)
+///
+/// 履歴は `win = [直前の hist 行][このチャンクの x]` として先頭に連結するので、
+/// conv は win の線形添字だけで引ける。値は逐次版とビット一致する
+/// (1 トークンあたりの演算列を変えない)。
+fn ple_inject_batch_par(
+    p: &Qwen4ExpParams,
+    pw: &PleW,
+    ple_rows: &[&[f32]],
+    res_flat: &mut [f32],
+    hp: &HyperParams,
+    hist_buf: &mut Vec<f32>,
+    mut last_rms: Option<&mut f32>,
+) -> Result<()> {
+    let nt = ple_rows.len();
+    let e = p.n_embd;
+    let hc = p.n_hc;
+    let hc_dim = p.hc_dim();
+    if nt == 0 || res_flat.len() != nt * hc_dim {
+        return Err(one(format!(
+            "ple_inject_batch_par: 形が違う (rows={nt} res={} hc_dim={hc_dim})",
+            res_flat.len()
+        )));
+    }
+    let kern = pw.kern;
+    let dil = p.ple_ngram_size;
+    let hist = (kern - 1) * dil;
+    if pw.conv1d_t.len() != kern * hc_dim {
+        return Err(one(format!(
+            "ple_inject_batch_par: conv1d_t の長さ {} が kern({kern}) * hc_dim({hc_dim}) と違う",
+            pw.conv1d_t.len()
+        )));
+    }
+    if hist_buf.len() != hist * hc_dim {
+        return Err(one(format!(
+            "ple_inject_batch_par: 履歴の長さ {} が hist({hist}) * hc_dim({hc_dim}) と違う",
+            hist_buf.len()
+        )));
+    }
+    let _sub = q4ledger::sub(q4ledger::SUB_PLE);
+    let t_all = pf_ple_kprof::t0();
+    let kdim = ple_rows.first().map(|r| r.len()).unwrap_or(0);
+    if ple_rows.iter().any(|r| r.len() != kdim) {
+        return Err(one("ple_inject_batch_par: ple_emb の長さが揃っていない"));
+    }
+    let t_flat = pf_ple_kprof::t0();
+    let mut flat = Vec::with_capacity(nt * kdim);
+    for r in ple_rows {
+        flat.extend_from_slice(r);
+    }
+    pf_ple_kprof::add(pf_ple_kprof::FLAT, t_flat);
+    let mut key = vec![0.0f32; nt * hc_dim];
+    let mut value = vec![0.0f32; nt * e];
+    ple_project_kv(pw, &flat, nt, e, &mut key, &mut value, pf_ple_kprof::t0())?;
+
+    // 作業域 (grow-only): win = (hist + nt) 行、gated = nt 行。
+    let (mut win, mut gated) = PLE_PAR_SCRATCH.with(|c| {
+        let mut b = c.borrow_mut();
+        (std::mem::take(&mut b.0), std::mem::take(&mut b.1))
+    });
+    let need_win = (hist + nt) * hc_dim;
+    if win.len() < need_win {
+        win.resize(need_win, 0.0);
+    }
+    if gated.len() < nt * hc_dim {
+        gated.resize(nt * hc_dim, 0.0);
+    }
+    win[..hist * hc_dim].copy_from_slice(hist_buf);
+
+    let t_tok = pf_ple_kprof::t0();
+    let want_rms = last_rms.is_some();
+    // 段 1: x (= grouped RMS 後の gated) を全トークンぶん作る。
+    {
+        let nrm_k: &[f32] = &pw.norm_key;
+        let nrm_q: &[f32] = &pw.norm_query;
+        let nrm_c: &[f32] = &pw.norm_conv;
+        let inv_sqrt_e = 1.0f32 / (e as f32).sqrt();
+        let gated_all: &mut [f32] = &mut gated[..nt * hc_dim];
+        let x_all: &mut [f32] = &mut win[hist * hc_dim..(hist + nt) * hc_dim];
+        #[cfg(feature = "par")]
+        {
+            use rayon::prelude::*;
+            gated_all
+                .par_chunks_mut(hc_dim)
+                .zip(x_all.par_chunks_mut(hc_dim))
+                .enumerate()
+                .for_each_init(
+                    || (vec![0.0f32; hc_dim], vec![0.0f32; hc_dim]),
+                    |(key_n, query_n), (t, (grow, nx))| {
+                        let krow = &key[t * hc_dim..(t + 1) * hc_dim];
+                        let rrow = &res_flat[t * hc_dim..(t + 1) * hc_dim];
+                        hyper::grouped_rms_norm_into(krow, nrm_k, hp, key_n);
+                        hyper::grouped_rms_norm_into(rrow, nrm_q, hp, query_n);
+                        // 2. ストリームごとの内積 → 符号付き平方根 → sigmoid
+                        let mut gate = [0.0f32; 8];
+                        for s in 0..hc {
+                            let mut acc = 0.0f32;
+                            for i in 0..e {
+                                let j = s * e + i;
+                                acc += key_n[j] * query_n[j];
+                            }
+                            let sv = acc * inv_sqrt_e;
+                            let mag = sv.abs().max(1e-6).sqrt();
+                            let sign = if sv > 0.0 {
+                                1.0f32
+                            } else if sv < 0.0 {
+                                -1.0f32
+                            } else {
+                                0.0f32
+                            };
+                            gate[s] = hyper::sigmoid(sign * mag);
+                        }
+                        // 3. gated = value * gate
+                        let vrow = &value[t * e..(t + 1) * e];
+                        for (s, &g) in gate[..hc].iter().enumerate() {
+                            for d in 0..e {
+                                grow[s * e + d] = vrow[d] * g;
+                            }
+                        }
+                        // 4. grouped RMS → x
+                        hyper::grouped_rms_norm_into(grow, nrm_c, hp, nx);
+                    },
+                );
+        }
+        #[cfg(not(feature = "par"))]
+        {
+            let mut key_n = vec![0.0f32; hc_dim];
+            let mut query_n = vec![0.0f32; hc_dim];
+            for t in 0..nt {
+                let krow = &key[t * hc_dim..(t + 1) * hc_dim];
+                let rrow = &res_flat[t * hc_dim..(t + 1) * hc_dim];
+                hyper::grouped_rms_norm_into(krow, nrm_k, hp, &mut key_n);
+                hyper::grouped_rms_norm_into(rrow, nrm_q, hp, &mut query_n);
+                let mut gate = [0.0f32; 8];
+                for s in 0..hc {
+                    let mut acc = 0.0f32;
+                    for i in 0..e {
+                        let j = s * e + i;
+                        acc += key_n[j] * query_n[j];
+                    }
+                    let sv = acc * inv_sqrt_e;
+                    let mag = sv.abs().max(1e-6).sqrt();
+                    let sign = if sv > 0.0 {
+                        1.0f32
+                    } else if sv < 0.0 {
+                        -1.0f32
+                    } else {
+                        0.0f32
+                    };
+                    gate[s] = hyper::sigmoid(sign * mag);
+                }
+                let grow = &mut gated_all[t * hc_dim..(t + 1) * hc_dim];
+                let vrow = &value[t * e..(t + 1) * e];
+                for (s, &g) in gate[..hc].iter().enumerate() {
+                    for d in 0..e {
+                        grow[s * e + d] = vrow[d] * g;
+                    }
+                }
+                let nx = &mut x_all[t * hc_dim..(t + 1) * hc_dim];
+                hyper::grouped_rms_norm_into(grow, nrm_c, hp, nx);
+            }
+        }
+    }
+    // 段 2: conv + silu + 加算。最後のトークンだけ寄与 RMS も取る。
+    {
+        let win_all: &[f32] = &win[..(hist + nt) * hc_dim];
+        let gated_all: &[f32] = &gated[..nt * hc_dim];
+        let wt: &[f32] = &pw.conv1d_t;
+        let par_nt = if want_rms { nt - 1 } else { nt };
+        #[cfg(feature = "par")]
+        {
+            use rayon::prelude::*;
+            res_flat[..par_nt * hc_dim]
+                .par_chunks_mut(hc_dim)
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0f32; hc_dim],
+                    |conv, (t, r)| {
+                        ple_conv_silu_win(
+                            conv.as_mut_slice(),
+                            win_all,
+                            hist + t,
+                            wt,
+                            kern,
+                            dil,
+                            hc_dim,
+                        );
+                        let _ = ple_add_token(
+                            r,
+                            &gated_all[t * hc_dim..(t + 1) * hc_dim],
+                            conv.as_slice(),
+                            false,
+                        );
+                    },
+                );
+        }
+        #[cfg(not(feature = "par"))]
+        {
+            let mut conv = vec![0.0f32; hc_dim];
+            for t in 0..par_nt {
+                ple_conv_silu_win(&mut conv, win_all, hist + t, wt, kern, dil, hc_dim);
+                let _ = ple_add_token(
+                    &mut res_flat[t * hc_dim..(t + 1) * hc_dim],
+                    &gated_all[t * hc_dim..(t + 1) * hc_dim],
+                    &conv,
+                    false,
+                );
+            }
+        }
+        if want_rms {
+            let t = nt - 1;
+            let mut conv = vec![0.0f32; hc_dim];
+            ple_conv_silu_win(&mut conv, win_all, hist + t, wt, kern, dil, hc_dim);
+            let sq = ple_add_token(
+                &mut res_flat[t * hc_dim..(t + 1) * hc_dim],
+                &gated_all[t * hc_dim..(t + 1) * hc_dim],
+                &conv,
+                true,
+            );
+            if let Some(d) = last_rms.as_deref_mut() {
+                *d = if hc_dim == 0 {
+                    0.0
+                } else {
+                    (sq / hc_dim as f32).sqrt()
+                };
+            }
+        }
+    }
+    // 履歴を進める: 新しい履歴 = [直前 ++ このチャンク] の末尾 hist 行。
+    if hist > 0 {
+        hist_buf.copy_from_slice(&win[nt * hc_dim..(nt + hist) * hc_dim]);
+    }
+    pf_ple_kprof::add(pf_ple_kprof::TOK, t_tok);
+    // 作業域を返す。
+    PLE_PAR_SCRATCH.with(|c| {
+        let mut b = c.borrow_mut();
+        b.0 = win;
+        b.1 = gated;
+    });
+    pf_ple_kprof::add(pf_ple_kprof::ALL, t_all);
+    pf_ple_kprof::note_call(nt);
+    pf_ple_kprof::emit();
+    Ok(())
+}
+
+thread_local! {
+    /// task 195: 並列 PLE の作業域 (win, gated)。grow-only。
+    static PLE_PAR_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// task 195: 並列 PLE の加算 (res += gated + conv)。`want_rms` のときだけ
+/// 寄与の二乗和を返す (逐次版と同じ順序 = i 昇順で `add*add` を足す)。
+#[inline]
+fn ple_add_token(res: &mut [f32], gated: &[f32], conv: &[f32], want_rms: bool) -> f32 {
+    let mut sq = 0.0f32;
+    for i in 0..res.len() {
+        let add = gated[i] + conv[i];
+        if want_rms {
+            sq += add * add;
+        }
+        res[i] = res[i] + add;
+    }
+    sq
+}
+
+/// task 195: conv + silu の窓版。`win` は `[履歴 hist 行][今のチャンク nt 行]` を
+/// 連結したもので、`t_off` が今のトークンの行 (hist + t)。
+/// `back` トークン前の x は `win[(t_off - back) * hc_dim ..]` で引ける。
+#[allow(clippy::too_many_arguments)]
+fn ple_conv_silu_win(
+    out: &mut [f32],
+    win: &[f32],
+    t_off: usize,
+    wt: &[f32],
+    kern: usize,
+    dil: usize,
+    hc_dim: usize,
+) {
+    assert_eq!(out.len(), hc_dim, "conv の出力長は hc_dim");
+    assert!(t_off < win.len() / hc_dim, "conv の窓の添字が範囲外");
+    for v in out.iter_mut() {
+        *v = 0.0f32;
+    }
+    for k in 0..kern {
+        let back = (kern - 1 - k) * dil;
+        let src = &win[(t_off - back) * hc_dim..][..hc_dim];
+        let wk = &wt[k * hc_dim..(k + 1) * hc_dim];
+        for c in 0..hc_dim {
+            out[c] += wk[c] * src[c];
+        }
+    }
+    for v in out.iter_mut() {
+        *v = hyper::silu(*v);
+    }
+}
+
 /// task 189: PLE 注入の per-token 作業域 (grow-only)。
 ///
 /// 実形は hc_dim = 10,240 (40 KB) で、`ple_inject_from_kv` は 1 トークンあたり
@@ -5504,6 +5849,51 @@ fn ple_conv_silu(
         };
         for c in 0..hc_dim {
             out[c] += w[c * kern + k] * src[c];
+        }
+    }
+    for v in out.iter_mut() {
+        *v = hyper::silu(*v);
+    }
+}
+
+/// task 195: [`ple_conv_silu`] の **kern 優先の重み**版 (`wt[k*hc_dim + c]`)。
+///
+/// 演算は同じ (k 昇順に `out[c] += wt * src`、最後に silu) なので [`ple_conv_silu`]
+/// とビット一致する。重みの並びだけが違うので、内側のループが連続読みになり
+/// ベクトル化できる (実測 27 us/トークン → 数 us)。
+fn ple_conv_silu_t(
+    out: &mut [f32],
+    x: &[f32],
+    hist_buf: &[f32],
+    head: usize,
+    wt: &[f32],
+    kern: usize,
+    dil: usize,
+    hc_dim: usize,
+) {
+    assert_eq!(out.len(), hc_dim, "conv の出力長は hc_dim");
+    assert_eq!(x.len(), hc_dim, "conv の入力長は hc_dim");
+    assert_eq!(wt.len(), kern * hc_dim, "conv の重み長は kern*hc_dim");
+    let hist = (kern - 1) * dil;
+    assert_eq!(hist_buf.len(), hist * hc_dim, "conv の履歴長は hist*hc_dim");
+    assert!(
+        hist == 0 || head < hist,
+        "履歴の ring head が範囲外 (head={head} hist={hist})"
+    );
+    for v in out.iter_mut() {
+        *v = 0.0f32;
+    }
+    for k in 0..kern {
+        let back = (kern - 1 - k) * dil;
+        let src: &[f32] = if back == 0 {
+            x
+        } else {
+            let slot = (head + hist - back) % hist;
+            &hist_buf[slot * hc_dim..][..hc_dim]
+        };
+        let wk = &wt[k * hc_dim..(k + 1) * hc_dim];
+        for c in 0..hc_dim {
+            out[c] += wk[c] * src[c];
         }
     }
     for v in out.iter_mut() {
@@ -5691,16 +6081,30 @@ fn ple_inject_into(
         )));
     }
     let t_conv = pf_ple_kprof::t0();
-    ple_conv_silu(
-        &mut sc.conv[..hc_dim],
-        x,
-        hist_buf,
-        if ring { *hist_head } else { 0 },
-        &pw.conv1d,
-        kern,
-        dil,
-        hc_dim,
-    );
+    // task 195: `DENNO_PF_PLE_FAST` は kern 優先の重みで回す (値は同じ)。
+    if pf_ple_fast_on() && pw.conv1d_t.len() == kern * hc_dim {
+        ple_conv_silu_t(
+            &mut sc.conv[..hc_dim],
+            x,
+            hist_buf,
+            if ring { *hist_head } else { 0 },
+            &pw.conv1d_t,
+            kern,
+            dil,
+            hc_dim,
+        );
+    } else {
+        ple_conv_silu(
+            &mut sc.conv[..hc_dim],
+            x,
+            hist_buf,
+            if ring { *hist_head } else { 0 },
+            &pw.conv1d,
+            kern,
+            dil,
+            hc_dim,
+        );
+    }
     pf_ple_kprof::add(pf_ple_kprof::CONV, t_conv);
     // 履歴を 1 トークン進める (ring = 上書き + head 前進 / 線形 = 先頭を詰める)。
     if hist > 0 {
@@ -17558,6 +17962,7 @@ mod tests {
             norm_query: vec![1.0; hc_dim],
             norm_conv: vec![1.0; hc_dim],
             conv1d: vec![0.25; 2 * hc_dim],
+            conv1d_t: vec![0.25; 2 * hc_dim],
             kern: 2,
         };
         let nt = PF_PLE_F32_GPU_MIN_TOK;
@@ -17617,6 +18022,7 @@ mod tests {
             norm_query: vec![1.0; hc_dim],
             norm_conv: vec![1.0; hc_dim],
             conv1d: vec![0.25; 2 * hc_dim],
+            conv1d_t: vec![0.25; 2 * hc_dim],
             kern: 2,
         };
         set_pf182_for_test(PF182_GATE_PLE_F32, Some(false));
@@ -19111,6 +19517,89 @@ mod tests {
             crate::ple::set_pf_ple_par_for_test(None);
         }
 
+        /// task 195: 並列版 (`ple_inject_batch_par`) も逐次版とビット一致すること。
+        #[test]
+        fn ple_inject_batch_par_matches_per_token_bits() {
+            let _g = moe_test_guard();
+            let dir = TempDir::new("ple_inject_par");
+            let path = build(&dir);
+            let f = GgufFile::open(&path).expect("open");
+            let m = Qwen4Exp::new(&f).expect("new");
+            let il = PLE_LAYER;
+            let pw = m.layers[il].ple.as_ref().expect("PLE 層");
+            let hp = m.hp();
+            let e = m.p.n_embd;
+            let hc = hp.hc;
+            let hc_dim = hc * e;
+            let nt = 37usize; // 端数 (rayon のチャンク割りが割り切れない)
+            let chunks = 2usize;
+            let mut rnd = 0x1950_0bad_c0ffee01u64;
+            let mut next = move || {
+                rnd = rnd
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((rnd >> 33) as f32) / (u32::MAX as f32) - 0.5
+            };
+            let emb_len = pw.key.k();
+            let hist_len = (pw.kern - 1) * m.p.ple_ngram_size * hc_dim;
+            let hist0: Vec<f32> = (0..hist_len)
+                .map(|i| 0.05 * (((i * 7) % 13) as f32 - 6.0))
+                .collect();
+            let mut hist_a = hist0.clone();
+            let mut hist_b = hist0.clone();
+            let mut rms_ref = 0.0f32;
+            for c in 0..chunks {
+                let base: Vec<f32> = (0..nt * hc_dim).map(|_| 0.2 * next()).collect();
+                let emb: Vec<f32> = (0..nt * emb_len).map(|_| 0.2 * next()).collect();
+                let rows: Vec<&[f32]> =
+                    (0..nt).map(|t| &emb[t * emb_len..(t + 1) * emb_len]).collect();
+                let mut a: Vec<HyperStreams> = (0..nt)
+                    .map(|t| HyperStreams {
+                        data: base[t * hc_dim..(t + 1) * hc_dim].to_vec(),
+                        hc,
+                        n_embd: e,
+                    })
+                    .collect();
+                crate::ple::set_pf_ple_par_for_test(Some(false));
+                for t in 0..nt {
+                    let pe = &emb[t * emb_len..(t + 1) * emb_len];
+                    let want_rms = t + 1 == nt;
+                    a[t] = ple_inject(
+                        &m.p,
+                        pw,
+                        pe,
+                        &a[t],
+                        &hp,
+                        &mut hist_a,
+                        want_rms.then_some(&mut rms_ref),
+                    )
+                    .expect("逐次");
+                }
+                let mut b = base.clone();
+                let mut last = 0.0f32;
+                ple_inject_batch_par(&m.p, pw, &rows, &mut b, &hp, &mut hist_b, Some(&mut last))
+                    .expect("並列");
+                for t in 0..nt {
+                    let want: Vec<u32> = a[t].data.iter().map(|v| v.to_bits()).collect();
+                    let got: Vec<u32> = b[t * hc_dim..(t + 1) * hc_dim]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect();
+                    assert_eq!(want, got, "チャンク {c} トークン {t} の出力がビット不一致");
+                }
+                let want: Vec<u32> = hist_a.iter().map(|v| v.to_bits()).collect();
+                let got: Vec<u32> = hist_b.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(want, got, "チャンク {c} の conv 履歴がビット不一致");
+                // 寄与 RMS も逐次版と一致すること (最後のトークンで取る)。
+                assert_eq!(
+                    last.to_bits(),
+                    rms_ref.to_bits(),
+                    "チャンク {c} の寄与 RMS がビット不一致"
+                );
+            }
+            crate::ple::set_pf_ple_par_for_test(None);
+        }
+
         /// task 195: conv の履歴はリングでも線形でも同じ値になること
         /// (head をずらしながら 1 トークンずつ進め、線形版と突き合わせる)。
         #[test]
@@ -19138,6 +19627,22 @@ mod tests {
                     ple_conv_silu(&mut b, &x, &ring, head, &w, kern, dil, hc_dim);
                     for c in 0..hc_dim {
                         assert_eq!(a[c].to_bits(), b[c].to_bits(), "conv がビット不一致");
+                    }
+                    // task 195: kern 優先の重み版 (`conv1d_t`) も同じ値になること。
+                    let mut wt = vec![0.0f32; w.len()];
+                    for c in 0..hc_dim {
+                        for k in 0..kern {
+                            wt[k * hc_dim + c] = w[c * kern + k];
+                        }
+                    }
+                    let mut t = vec![0.0f32; hc_dim];
+                    ple_conv_silu_t(&mut t, &x, &ring, head, &wt, kern, dil, hc_dim);
+                    for c in 0..hc_dim {
+                        assert_eq!(
+                            b[c].to_bits(),
+                            t[c].to_bits(),
+                            "kern 優先の重みで conv がビット不一致"
+                        );
                     }
                     if hist > 0 {
                         ple_hist_push_shift(&mut lin, &x, hc_dim);
