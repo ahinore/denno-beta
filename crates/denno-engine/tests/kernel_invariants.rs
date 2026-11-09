@@ -8675,7 +8675,7 @@ fn pf_attn_devres_gate_defaults_on_and_is_wired() {
 /// 出力も `PfHostBuf` に落とす、(3) router と shared は記録が一致したときだけ
 /// デバイスの `mixed` を直接読む。
 #[test]
-fn pf209_pin_and_mixdevin_gates_default_off_and_are_wired() {
+fn pf209_pin_and_mixdevin_gates_default_on_and_are_wired() {
     for name in [
         "fn pf_pin_from_value",
         "fn pf_dev_in_from_value",
