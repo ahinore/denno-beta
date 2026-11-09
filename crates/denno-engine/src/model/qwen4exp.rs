@@ -8270,6 +8270,9 @@ fn moe_ffn_quant_impl(
 
     // task 138: router の区間はここまで (expert の CPU 仕事は台帳の外 = other)。
     drop(_l_router);
+    // task 192: kprof の窓もここで閉じる (expert 段の操作を混ぜない)。
+    #[cfg(feature = "cuda")]
+    drop(_kp_router);
 
     // task 155: router と experts の間の下ごしらえ (使用回数の記録 / ゲート判定 /
     // 出力の確保 / 経路フラグ) を台帳の `loop` 行に分ける。以前は `step` の残差に
