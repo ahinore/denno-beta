@@ -8356,3 +8356,310 @@ fn mix_up_warp_per_row_kernel_is_wired() {
         "build_ptx.sh の targets_all に mix_up が無い: {targets}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// task 195: mix の n 分割 GEMM (`kernels_mix_split.cu`)
+// ---------------------------------------------------------------------------
+//
+// 「cuda.rs が読んでいる」「build_ptx.sh が mix_split を作る」「起動サイトの
+// block 形状が #define と一致する」「1 出力 1 アキュムレータ・k 昇順の fma」
+// (= 既存 GEMM とビット一致する根拠) を固定する。
+const MIX_SPLIT_SRC: &str = include_str!("../kernels/kernels_mix_split.cu");
+
+#[test]
+fn mix_split_gemm_kernel_is_wired() {
+    assert!(
+        CUDA_RS.contains("b\"dno_mix_split_gemm\\0\""),
+        "cuda.rs が dno_mix_split_gemm を読んでいない"
+    );
+    assert!(
+        MIX_SPLIT_SRC.contains("dno_mix_split_gemm"),
+        "kernels_mix_split.cu にカーネルが無い"
+    );
+    for line in [
+        "#define MXS_BM 32",
+        "#define MXS_BN 32",
+        "#define MXS_BK 32",
+        "#define MXS_THREADS 128",
+        "#define MXS_PAD 33",
+    ] {
+        assert!(MIX_SPLIT_SRC.contains(line), "{line} が無い");
+    }
+    // 値の契約: 出力 1 要素 1 アキュムレータ・k 昇順の fma (既存 GEMM と同一順)。
+    assert!(
+        MIX_SPLIT_SRC.contains("acc[r][t] = __fmaf_rn(wv[r], xv[t], acc[r][t]);"),
+        "アキュムレートが 1 出力 1 アキュムレータの fma でない"
+    );
+    assert!(
+        MIX_SPLIT_SRC.contains("__uint_as_float((unsigned int)b << 16)"),
+        "BF16 の展開が上位 16 bit の複製でない"
+    );
+    assert!(
+        !MIX_SPLIT_SRC.contains("atomicAdd"),
+        "n 分割カーネルに atomicAdd が入っている (決定論が崩れる)"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("mix_split)    echo \"kernels_mix_split.cu|fmad\""),
+        "build_ptx.sh の mix_split の spec 行が変わった"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("mix_split"),
+        "build_ptx.sh の targets_all に mix_split が無い: {targets}"
+    );
+    for line in [
+        "pub(crate) const MIX_SPLIT_BN: usize = 32;",
+        "pub(crate) const MIX_SPLIT_BM: usize = 32;",
+        "pub(crate) const MIX_SPLIT_THREADS: usize = 128;",
+    ] {
+        assert!(CUDA_RS.contains(line), "{line} が無い");
+    }
+    let map = launch_map_from_cuda(CUDA_RS);
+    assert_eq!(
+        map.block_status("dno_mix_split_gemm"),
+        ShapeStatus::Resolved([128, 1, 1]),
+        "dno_mix_split_gemm の block 形状が解決できない: {}",
+        map.summary()
+    );
+}
+
+/// ゲート (`DENNO_PF_MIX_SPLIT`) の既定は **on** (task 198 で反転。明示 off は効く)。
+#[test]
+fn mix_split_gate_defaults_on() {
+    let i = CUDA_RS
+        .find("pub(crate) fn mix_split_from_value")
+        .expect("mix_split_from_value が無い");
+    let body: String = CUDA_RS[i..].chars().take(300).collect();
+    assert!(
+        body.contains("None => true,"),
+        "mix_split_from_value(None) が on でない: {body}"
+    );
+    assert!(
+        body.contains("\"off\"") && body.contains("\"false\"") && body.contains("\"no\""),
+        "明示 off の表が変わった: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 195: mix の inject を k 分割する GEMV (`kernels_mix_inj2.cu`)
+// ---------------------------------------------------------------------------
+//
+// 「cuda.rs が読んでいる」「build_ptx.sh が nofmad で作る」「起動サイトの block
+// 形状が #define と一致する」「縮約が固定木 (atomic 無し = 決定論的)」を固定する。
+const MIX_INJ2_SRC: &str = include_str!("../kernels/kernels_mix_inj2.cu");
+
+#[test]
+fn mix_inj2_gemv_kernel_is_wired() {
+    assert!(
+        CUDA_RS.contains("b\"dno_mix_inj2_bf16\\0\""),
+        "cuda.rs が dno_mix_inj2_bf16 を読んでいない"
+    );
+    assert!(
+        MIX_INJ2_SRC.contains("dno_mix_inj2_bf16"),
+        "kernels_mix_inj2.cu にカーネルが無い"
+    );
+    for line in ["#define MXI2_THREADS 256", "#define MXI2_MAX_N 8"] {
+        assert!(MIX_INJ2_SRC.contains(line), "{line} が無い");
+    }
+    assert!(
+        !MIX_INJ2_SRC.contains("atomicAdd"),
+        "k 分割カーネルに atomicAdd が入っている (決定論が崩れる)"
+    );
+    assert!(
+        MIX_INJ2_SRC.contains("for (int stride = MXI2_THREADS / 2; stride > 0; stride >>= 1)"),
+        "縮約が固定木でない"
+    );
+    assert!(
+        MIX_INJ2_SRC.contains("acc[j] = __fmaf_rn(mixi2_bf16_to_f32("),
+        "部分和が明示 fma でない"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("mix_inj2)     echo \"kernels_mix_inj2.cu|nofmad\""),
+        "build_ptx.sh の mix_inj2 の spec 行が変わった"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("mix_inj2"),
+        "build_ptx.sh の targets_all に mix_inj2 が無い: {targets}"
+    );
+    for line in [
+        "pub(crate) const MIX_INJ2_THREADS: usize = 256;",
+        "pub(crate) const MIX_INJ2_MAX_N: usize = 8;",
+    ] {
+        assert!(CUDA_RS.contains(line), "{line} が無い");
+    }
+    let map = launch_map_from_cuda(CUDA_RS);
+    assert_eq!(
+        map.block_status("dno_mix_inj2_bf16"),
+        ShapeStatus::Resolved([256, 1, 1]),
+        "dno_mix_inj2_bf16 の block 形状が解決できない: {}",
+        map.summary()
+    );
+}
+
+/// ゲート (`DENNO_PF_MIX_INJ2`) の既定は **on** (task 198 で反転。明示 off は効く)。
+#[test]
+fn mix_inj2_gate_defaults_on() {
+    let i = CUDA_RS
+        .find("pub(crate) fn mix_inj2_from_value")
+        .expect("mix_inj2_from_value が無い");
+    let body: String = CUDA_RS[i..].chars().take(300).collect();
+    assert!(
+        body.contains("None => true,"),
+        "mix_inj2_from_value(None) が on でない: {body}"
+    );
+    assert!(
+        body.contains("\"off\"") && body.contains("\"false\"") && body.contains("\"no\""),
+        "明示 off の表が変わった: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 195: PLE 注入と router のゲート (既定 off・数値はビット一致)
+// ---------------------------------------------------------------------------
+
+const QWEN_SRC: &str = include_str!("../src/model/qwen4exp.rs");
+const MOE_SRC: &str = include_str!("../src/model/moe.rs");
+
+/// `DENNO_PF_PLE_FAST` / `DENNO_PF_ROUTER_FAST` の既定は **on** (task 198 で反転)。
+#[test]
+fn pf195_gates_default_on() {
+    for (src, name) in [
+        (QWEN_SRC, "fn pf_ple_fast_from_value"),
+        (QWEN_SRC, "fn pf_router_fast_from_value"),
+    ] {
+        let i = src
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} が無い"));
+        let body: String = src[i..].chars().take(300).collect();
+        assert!(
+            body.contains("None => true,"),
+            "{name} の既定が on でない: {body}"
+        );
+        assert!(
+            body.contains("\"off\"") && body.contains("\"false\"") && body.contains("\"no\""),
+            "{name} の明示 off の表が変わった: {body}"
+        );
+    }
+}
+
+/// PLE の平坦経路 (`ple_inject_batch_flat`) とリング履歴が存在し、
+/// 呼び出し側がゲートで切り替えていること (分岐が死んでいない証拠)。
+#[test]
+fn pf195_ple_fast_is_wired() {
+    for k in [
+        "fn ple_inject_batch_flat(",
+        "fn ple_hist_push_ring(",
+        "fn ple_hist_to_linear(",
+        "if pf_ple_fast_on() {",
+        "ple_inject_batch_flat(",
+    ] {
+        assert!(QWEN_SRC.contains(k), "qwen4exp.rs に {k} が無い");
+    }
+}
+
+/// router の top-k がゲートで挿入法に切り替わること。
+#[test]
+fn pf195_router_fast_is_wired() {
+    assert!(
+        QWEN_SRC.contains("select_topk_into_fast(pr, k, s)"),
+        "router_topk_rows が挿入法を使っていない"
+    );
+    assert!(
+        QWEN_SRC.contains("pf_router_fast_on(),"),
+        "呼び出し側がゲートを渡していない"
+    );
+    assert!(
+        MOE_SRC.contains("pub(crate) fn select_topk_into_fast("),
+        "moe.rs に select_topk_into_fast が無い"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 200: 平坦な attn 入口 (`DENNO_PF_ATTN_FLAT`)
+// ---------------------------------------------------------------------------
+
+const SSM_SRC: &str = include_str!("../src/model/qwen4exp_ssm.rs");
+const ATTN_SRC: &str = include_str!("../src/model/qwen4exp_attn.rs");
+
+/// `DENNO_PF_ATTN_FLAT` は **既定 on** (lab t200a の flat で採用)。
+/// 併せて、層ループが平坦な入口を実際に呼び、通過カウンタで発火を数える
+/// ことを固定する (ゲートを足したら発火を数える)。
+#[test]
+fn pf_attn_flat_gate_defaults_on_and_is_wired() {
+    let i = QWEN_SRC
+        .find("pub(crate) fn pf_attn_flat_from_value")
+        .expect("pf_attn_flat_from_value が無い");
+    let body: String = QWEN_SRC[i..].chars().take(260).collect();
+    assert!(
+        body.contains("None => true,"),
+        "pf_attn_flat_from_value(None) が on でない: {body}"
+    );
+    assert!(
+        body.contains("\"off\"") && body.contains("\"false\"") && body.contains("\"no\""),
+        "明示 off の表が無い: {body}"
+    );
+    // 層ループ (常駐経路) が平坦入口を呼び、両分岐の通過を数えていること。
+    for k in [
+        "Self::prefill_attn_chunk(",
+        "attn.forward_batch_flat(il, mixed_flat, nt)",
+        "PF_ATTN_FLAT_CALLS.fetch_add",
+        "PF_ATTN_ROWS_CALLS.fetch_add",
+    ] {
+        assert!(QWEN_SRC.contains(k), "qwen4exp.rs に {k} が無い");
+    }
+    // 平坦入口そのものが ssm / full の両方に実装されていること。
+    assert!(
+        QWEN_SRC.contains("fn forward_batch_flat("),
+        "trait に forward_batch_flat が無い"
+    );
+    for (src, name) in [(SSM_SRC, "SsmLayer"), (ATTN_SRC, "FullAttn")] {
+        assert!(
+            src.contains("fn forward_batch_flat("),
+            "{name}::forward_batch_flat が無い"
+        );
+    }
+}
+
+/// `DENNO_PF_ATTN_DEVRES` は **既定 on** (lab t200b の flatdev で採用)。
+/// ssm 連鎖が層出力をデバイスに残し、combine が転送なしで読む配線を固定する。
+#[test]
+fn pf_attn_devres_gate_defaults_on_and_is_wired() {
+    let i = QWEN_SRC
+        .find("pub(crate) fn pf_attn_devres_from_value")
+        .expect("pf_attn_devres_from_value が無い");
+    let body: String = QWEN_SRC[i..].chars().take(260).collect();
+    assert!(
+        body.contains("None => true,"),
+        "pf_attn_devres_from_value(None) が on でない: {body}"
+    );
+    for k in [
+        // 呼び出し側: 要求を立てる / 空の出力をデバイス出力として受ける / combine。
+        "pf_attn_dev_request(attn_dev)",
+        "pf_attn_dev_clear();",
+        "pf_combine_dev(nt, hc, e)",
+        "let dev_out = flat_outs.is_empty();",
+    ] {
+        assert!(QWEN_SRC.contains(k), "qwen4exp.rs に {k} が無い");
+    }
+    // 連鎖側: 要求とゲートの両方が立ったときだけ D2H を飛ばす。
+    for k in [
+        "fn pf_combine_dev(",
+        "fn pf_attn_dev_store(",
+        "fn pf_attn_dev_requested(",
+        "pf_attn_dev_requested() && crate::model::qwen4exp::pf_attn_devres_on()",
+        "pf_attn_dev_store(po, nt, e)",
+    ] {
+        assert!(CUDA_RS.contains(k), "cuda.rs に {k} が無い");
+    }
+    assert!(
+        SSM_SRC.contains("if kept_dev {"),
+        "SsmLayer が kept_dev を見ていない"
+    );
+}
