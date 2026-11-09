@@ -11856,13 +11856,14 @@ pub(crate) fn set_pf_full_fused_for_test(v: Option<bool>) {
 // と 4 回のコピー + 2 * nt 個のアロケーションが乗っていた。台帳の
 // `other` の未計測分 (0.10 ms/tok) と `layout` (245 ms) がこれにあたる。
 // 平坦な入口 [`LayerAttn::forward_batch_flat`] を通すと往復が消える。
-// 数値は同じ (コピーの有無だけ)。既定は off で lab の結果から決める。
+// 数値は同じ (コピーの有無だけ)。lab t200a の flat で 14,018 -5.6% /
+// 3,826 -2.9% だったので **既定 on** (明示的な偽値で切る)。
 
 /// task 200: `DENNO_PF_ATTN_FLAT` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが
-/// off で、**未設定も off** (lab の結果で既定を決める)。
+/// off。**未設定は on** (lab t200b の flatdev が目標内なので既定にした)。
 pub(crate) fn pf_attn_flat_from_value(v: Option<&str>) -> bool {
     match v {
-        None => false,
+        None => true,
         Some(s) => !matches!(
             s.trim().to_ascii_lowercase().as_str(),
             "0" | "off" | "false" | "no" | ""
@@ -11871,7 +11872,7 @@ pub(crate) fn pf_attn_flat_from_value(v: Option<&str>) -> bool {
 }
 
 /// task 200: 層優先 prefill で attn へ平坦な活性をそのまま渡すか
-/// (`DENNO_PF_ATTN_FLAT`、既定 off)。
+/// (`DENNO_PF_ATTN_FLAT`、**既定 on**)。
 pub(crate) fn pf_attn_flat_on() -> bool {
     #[cfg(test)]
     {
@@ -11909,12 +11910,14 @@ pub(crate) fn set_pf_attn_flat_for_test(v: Option<bool>) {
 // ssm 層の attention は `DENNO_GDN_PF_CHAIN` の連鎖が**デバイスで**出力を作って
 // いるのに、いったん D2H してから combine でもう一度 H2D している。
 // 連鎖の出力バッファをそのまま combine に読ませれば往復が消える。
-// 数値は同じ (combine は同じカーネル・同じ入力)。既定 off。
+// 数値は同じ (combine は同じカーネル・同じ入力)。lab t200b の flatdev で
+// 14,018 -4.9% / 3,826 -4.8% (base2 比) だったので **既定 on**。
 
-/// task 200: `DENNO_PF_ATTN_DEVRES` の解釈 (純関数)。未設定は off。
+/// task 200: `DENNO_PF_ATTN_DEVRES` の解釈 (純関数)。未設定は on
+/// (lab t200b の flatdev が目標内なので既定にした)。明示的な偽値だけ off。
 pub(crate) fn pf_attn_devres_from_value(v: Option<&str>) -> bool {
     match v {
-        None => false,
+        None => true,
         Some(s) => !matches!(
             s.trim().to_ascii_lowercase().as_str(),
             "0" | "off" | "false" | "no" | ""
@@ -11923,7 +11926,7 @@ pub(crate) fn pf_attn_devres_from_value(v: Option<&str>) -> bool {
 }
 
 /// task 200: ssm 連鎖の出力をデバイスに残し、直後の combine にそのまま読ませるか
-/// (`DENNO_PF_ATTN_DEVRES`、既定 off)。
+/// (`DENNO_PF_ATTN_DEVRES`、**既定 on**)。
 pub(crate) fn pf_attn_devres_on() -> bool {
     #[cfg(test)]
     {
@@ -18874,16 +18877,19 @@ mod tests {
             }
         }
 
-        /// task 200: `DENNO_PF_ATTN_FLAT` は明示的な真値だけ on (既定 off)。
-        /// lab の結果で既定を決めるので、ここでは「明示 off が効く」ことも固定する。
+        /// task 200: `DENNO_PF_ATTN_FLAT` / `DENNO_PF_ATTN_DEVRES` は lab t200b で
+        /// **既定 on** にした。明示 off の表が残っていることも固定する。
         #[test]
         fn pf_attn_flat_gate_values() {
-            assert!(!pf_attn_flat_from_value(None), "未設定は既定 off");
+            assert!(pf_attn_flat_from_value(None), "未設定は on (lab t200b)");
+            assert!(pf_attn_devres_from_value(None), "未設定は on (lab t200b)");
             for v in ["0", "off", "false", "no", "", " 0 ", "OFF"] {
                 assert!(!pf_attn_flat_from_value(Some(v)), "{v:?} が on になった");
+                assert!(!pf_attn_devres_from_value(Some(v)), "{v:?} が on になった");
             }
             for v in ["1", "on", "true", "yes", " ON "] {
                 assert!(pf_attn_flat_from_value(Some(v)), "{v:?} が off のまま");
+                assert!(pf_attn_devres_from_value(Some(v)), "{v:?} が off のまま");
             }
         }
 

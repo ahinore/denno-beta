@@ -8588,18 +8588,18 @@ fn pf195_router_fast_is_wired() {
 const SSM_SRC: &str = include_str!("../src/model/qwen4exp_ssm.rs");
 const ATTN_SRC: &str = include_str!("../src/model/qwen4exp_attn.rs");
 
-/// `DENNO_PF_ATTN_FLAT` は**既定 off** (lab の結果で決める)。
+/// `DENNO_PF_ATTN_FLAT` は **既定 on** (lab t200a の flat で採用)。
 /// 併せて、層ループが平坦な入口を実際に呼び、通過カウンタで発火を数える
 /// ことを固定する (ゲートを足したら発火を数える)。
 #[test]
-fn pf_attn_flat_gate_defaults_off_and_is_wired() {
+fn pf_attn_flat_gate_defaults_on_and_is_wired() {
     let i = QWEN_SRC
         .find("pub(crate) fn pf_attn_flat_from_value")
         .expect("pf_attn_flat_from_value が無い");
     let body: String = QWEN_SRC[i..].chars().take(260).collect();
     assert!(
-        body.contains("None => false,"),
-        "pf_attn_flat_from_value(None) が off でない: {body}"
+        body.contains("None => true,"),
+        "pf_attn_flat_from_value(None) が on でない: {body}"
     );
     assert!(
         body.contains("\"off\"") && body.contains("\"false\"") && body.contains("\"no\""),
@@ -8627,17 +8627,17 @@ fn pf_attn_flat_gate_defaults_off_and_is_wired() {
     }
 }
 
-/// `DENNO_PF_ATTN_DEVRES` は**既定 off** (lab の結果で決める)。
+/// `DENNO_PF_ATTN_DEVRES` は **既定 on** (lab t200b の flatdev で採用)。
 /// ssm 連鎖が層出力をデバイスに残し、combine が転送なしで読む配線を固定する。
 #[test]
-fn pf_attn_devres_gate_defaults_off_and_is_wired() {
+fn pf_attn_devres_gate_defaults_on_and_is_wired() {
     let i = QWEN_SRC
         .find("pub(crate) fn pf_attn_devres_from_value")
         .expect("pf_attn_devres_from_value が無い");
     let body: String = QWEN_SRC[i..].chars().take(260).collect();
     assert!(
-        body.contains("None => false,"),
-        "pf_attn_devres_from_value(None) が off でない: {body}"
+        body.contains("None => true,"),
+        "pf_attn_devres_from_value(None) が on でない: {body}"
     );
     for k in [
         // 呼び出し側: 要求を立てる / 空の出力をデバイス出力として受ける / combine。
