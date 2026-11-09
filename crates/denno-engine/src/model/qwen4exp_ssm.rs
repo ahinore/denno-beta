@@ -953,6 +953,7 @@ impl SsmLayer {
             std::mem::take(&mut *v)
         });
         let mut ph = [0u64; 3];
+        let mut kept_dev = false;
         let done = crate::cuda::gdn_pf_chain(
             pair,
             wout,
@@ -977,6 +978,7 @@ impl SsmLayer {
             self.il,
             0,
             &mut outs[..nt * e],
+            &mut kept_dev,
             &mut ph,
         )?;
         if !done {
@@ -987,6 +989,17 @@ impl SsmLayer {
         q4prof::add_ns(&q4prof::A_GDN, self.il, q4prof::ST_GDN, ph[1]);
         q4prof::add_ns(&q4prof::A_OUT, self.il, q4prof::ST_OUT, ph[2]);
         q4prof::bump_nt(self.il, nt);
+        // task 200: 出力をデバイスに残したときは作業域だけ返して空を返す
+        // (呼び出し側 `prefill_attn_chunk` が `pf_combine_dev` に回す)。
+        if kept_dev {
+            PF_CHAIN_OUT.with(|c| {
+                let mut v = c.borrow_mut();
+                if v.len() < outs.len() {
+                    *v = outs;
+                }
+            });
+            return Ok(Some(Vec::new()));
+        }
         // task 200: 平坦な出力を 1 本だけ返す (トークンごとの Vec を作らない)。
         let out = outs[..nt * e].to_vec();
         // 作業域を返す (次の層チャンクが同じ容量を使い回す)。

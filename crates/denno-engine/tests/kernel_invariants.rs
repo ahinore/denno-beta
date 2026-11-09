@@ -8626,3 +8626,40 @@ fn pf_attn_flat_gate_defaults_off_and_is_wired() {
         );
     }
 }
+
+/// `DENNO_PF_ATTN_DEVRES` は**既定 off** (lab の結果で決める)。
+/// ssm 連鎖が層出力をデバイスに残し、combine が転送なしで読む配線を固定する。
+#[test]
+fn pf_attn_devres_gate_defaults_off_and_is_wired() {
+    let i = QWEN_SRC
+        .find("pub(crate) fn pf_attn_devres_from_value")
+        .expect("pf_attn_devres_from_value が無い");
+    let body: String = QWEN_SRC[i..].chars().take(260).collect();
+    assert!(
+        body.contains("None => false,"),
+        "pf_attn_devres_from_value(None) が off でない: {body}"
+    );
+    for k in [
+        // 呼び出し側: 要求を立てる / 空の出力をデバイス出力として受ける / combine。
+        "pf_attn_dev_request(attn_dev)",
+        "pf_attn_dev_clear();",
+        "pf_combine_dev(nt, hc, e)",
+        "let dev_out = flat_outs.is_empty();",
+    ] {
+        assert!(QWEN_SRC.contains(k), "qwen4exp.rs に {k} が無い");
+    }
+    // 連鎖側: 要求とゲートの両方が立ったときだけ D2H を飛ばす。
+    for k in [
+        "fn pf_combine_dev(",
+        "fn pf_attn_dev_store(",
+        "fn pf_attn_dev_requested(",
+        "pf_attn_dev_requested() && crate::model::qwen4exp::pf_attn_devres_on()",
+        "pf_attn_dev_store(po, nt, e)",
+    ] {
+        assert!(CUDA_RS.contains(k), "cuda.rs に {k} が無い");
+    }
+    assert!(
+        SSM_SRC.contains("if kept_dev {"),
+        "SsmLayer が kept_dev を見ていない"
+    );
+}

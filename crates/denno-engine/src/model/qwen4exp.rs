@@ -3225,6 +3225,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         nt: usize,
         e: usize,
         flat_attn: bool,
+        allow_dev: bool,
     ) -> Result<Vec<f32>> {
         #[cfg(test)]
         if flat_attn {
@@ -3234,6 +3235,10 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
         }
         if flat_attn {
             let f = attn.forward_batch_flat(il, mixed_flat, nt)?;
+            // 空 = 実装が層出力をデバイスに残した (呼び出し側が combine で読む)。
+            if f.is_empty() && allow_dev {
+                return Ok(f);
+            }
             if f.len() != nt * e {
                 return Err(one(format!(
                     "層 {il}: attention の出力長 {} が nt {nt} * n_embd {e} と違う",
@@ -3448,12 +3453,17 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                 // task 200: `DENNO_PF_ATTN_FLAT` は活性を平坦なまま attn へ渡し、
                 // 平坦なまま受け取る (トークンごとの Vec を作らない)。
                 let flat_attn = pf_attn_flat_on();
+                // task 200: `DENNO_PF_ATTN_DEVRES` は ssm 連鎖の層出力をデバイスに
+                // 残し、直後の combine にそのまま読ませる (roles を取るときはホストが要る)。
+                let attn_dev = flat_attn && pf_attn_devres_on() && roles.is_none();
                 let curs: Vec<Vec<f32>> = if flat_attn {
                     Vec::new()
                 } else {
                     mixed_flat.chunks_exact(e).map(|c| c.to_vec()).collect()
                 };
                 let t_attn = std::time::Instant::now();
+                crate::cuda::pf_attn_dev_clear();
+                crate::cuda::pf_attn_dev_request(attn_dev);
                 let flat_outs = {
                     let item = if q4ledger::enabled() {
                         match self.p.layer_kind(il) {
@@ -3464,7 +3474,7 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                         q4ledger::OTHER
                     };
                     let _l = q4ledger::enter(item);
-                    Self::prefill_attn_chunk(
+                    let r = Self::prefill_attn_chunk(
                         self.attn.as_mut(),
                         il,
                         &mixed_flat,
@@ -3472,19 +3482,31 @@ fn pf_lin_ok(w: &GgufLinear, k: usize, n: usize) -> bool {
                         nt,
                         e,
                         flat_attn,
-                    )?
+                        attn_dev,
+                    );
+                    crate::cuda::pf_attn_dev_request(false);
+                    r?
                 };
                 q4prof::add(&q4prof::ATTN, t_attn);
+                // 空の出力 = 層出力はデバイスに残っている (combine が直接読む)。
+                let dev_out = flat_outs.is_empty();
                 if let Some(r) = roles.as_deref_mut() {
-                    let t = nt - 1;
-                    let v = rms_of(&flat_outs[t * e..(t + 1) * e]);
-                    if matches!(self.p.layer_kind(il), Ok(LayerKind::FullAttn)) {
-                        r.attn = v;
-                    } else {
-                        r.gdn = v;
+                    if !dev_out {
+                        let t = nt - 1;
+                        let v = rms_of(&flat_outs[t * e..(t + 1) * e]);
+                        if matches!(self.p.layer_kind(il), Ok(LayerKind::FullAttn)) {
+                            r.attn = v;
+                        } else {
+                            r.gdn = v;
+                        }
                     }
                 }
-                if !crate::cuda::pf_combine(&flat_outs, nt, hc, e) {
+                let combined = if dev_out {
+                    crate::cuda::pf_combine_dev(nt, hc, e)
+                } else {
+                    crate::cuda::pf_combine(&flat_outs, nt, hc, e)
+                };
+                if !combined {
                     Self::pf_bail("attn の combine に失敗")?;
                 }
 
@@ -11869,6 +11891,60 @@ static PF_ATTN_FLAT_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::Atom
 #[cfg(test)]
 pub(crate) fn set_pf_attn_flat_for_test(v: Option<bool>) {
     PF_ATTN_FLAT_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 200: attn の出力をデバイスに残したまま combine する
+// ---------------------------------------------------------------------------
+//
+// 動機 (lab t200a の 14,018 / 3,826 prefill 台帳): `other` の残差は 1,278 ms /
+// 334 ms で、中身はほぼ `pf_combine` の H2D (1 層チャンク 2 回 × nt*n_embd) だった。
+// ssm 層の attention は `DENNO_GDN_PF_CHAIN` の連鎖が**デバイスで**出力を作って
+// いるのに、いったん D2H してから combine でもう一度 H2D している。
+// 連鎖の出力バッファをそのまま combine に読ませれば往復が消える。
+// 数値は同じ (combine は同じカーネル・同じ入力)。既定 off。
+
+/// task 200: `DENNO_PF_ATTN_DEVRES` の解釈 (純関数)。未設定は off。
+pub(crate) fn pf_attn_devres_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no" | ""
+        ),
+    }
+}
+
+/// task 200: ssm 連鎖の出力をデバイスに残し、直後の combine にそのまま読ませるか
+/// (`DENNO_PF_ATTN_DEVRES`、既定 off)。
+pub(crate) fn pf_attn_devres_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF_ATTN_DEVRES_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_attn_devres_from_value(std::env::var("DENNO_PF_ATTN_DEVRES").ok().as_deref())
+    })
+}
+
+#[cfg(test)]
+static PF_ATTN_DEVRES_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_pf_attn_devres_for_test(v: Option<bool>) {
+    PF_ATTN_DEVRES_FORCE.store(
         match v {
             None => 0,
             Some(false) => 1,
@@ -22535,6 +22611,7 @@ mod tests {
                     nt,
                     e,
                     false,
+                    false,
                 )
                 .expect("行入口");
                 let b = Qwen4Exp::prefill_attn_chunk(
@@ -22545,6 +22622,7 @@ mod tests {
                     nt,
                     e,
                     true,
+                    false,
                 )
                 .expect("平坦入口");
                 assert_eq!(a.len(), nt * e, "層 {il}: 出力長");
