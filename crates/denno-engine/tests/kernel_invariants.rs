@@ -7432,6 +7432,236 @@ fn gemv_v5_kernels_have_the_v4_abi() {
         BUILD_PTX_SH.contains(r#"moe_v5)       echo "kernels_moe_v5.cu|nofmad" ;;"#),
         "build_ptx.sh の moe_v5 が nofmad でない"
     );
+}
+
+// ---------------------------------------------------------------------------
+// task 186: prefill hc mix の down / up GEMM (`kernels_mix_pf.cu`)
+// ---------------------------------------------------------------------------
+//
+// 新しい .cu は「cuda.rs が読んでいる」「build_ptx.sh が作る」「起動サイトの
+// block 形状がカーネルの #define と一致する」の 3 点を固定する。値の一致
+// (既存 `dno_gemm_bf16_mt` とビット一致) は GPU 側の検算テストの担当。
+const MIX_PF_SRC: &str = include_str!("../kernels/kernels_mix_pf.cu");
+
+#[test]
+fn mix_pf_gemm_kernel_is_wired() {
+    assert!(
+        CUDA_RS.contains("b\"dno_mix_pf_gemm\\0\""),
+        "cuda.rs が dno_mix_pf_gemm を読んでいない"
+    );
+    assert!(
+        MIX_PF_SRC.contains("dno_mix_pf_gemm"),
+        "kernels_mix_pf.cu にカーネルが無い"
+    );
+    for line in [
+        "#define MIXP_BM 32",
+        "#define MIXP_BN 64",
+        "#define MIXP_BK 16",
+        "#define MIXP_TX 16",
+        "#define MIXP_TY 8",
+        "#define MIXP_TPT 4",
+        "#define MIXP_RPT 4",
+        "#define MIXP_THREADS 128",
+        "#define MIXP_PAD 17",
+    ] {
+        assert!(MIX_PF_SRC.contains(line), "{line} が無い");
+    }
+    // 値の契約: 出力 1 要素 1 アキュムレータ・k 昇順の fma (既存カーネルと同一)。
+    assert!(
+        MIX_PF_SRC.contains("acc[r][t] = __fmaf_rn(wv[r], xv[t], acc[r][t]);"),
+        "アキュムレートが 1 出力 1 アキュムレータの fma でない"
+    );
+    // BF16 -> f32 は上位 16 bit の複製 (CPU の dequant と同一)。
+    assert!(
+        MIX_PF_SRC.contains("__uint_as_float((unsigned int)b << 16)"),
+        "BF16 の展開が上位 16 bit の複製でない"
+    );
+    // build_ptx.sh: 新 target (fmad は明示 intrinsic なので既定でよい)
+    assert!(
+        BUILD_PTX_SH.contains("mix_pf)       echo \"kernels_mix_pf.cu|fmad\""),
+        "build_ptx.sh の mix_pf の spec 行が変わった"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("mix_pf"),
+        "build_ptx.sh の targets_all に mix_pf が無い: {targets}"
+    );
+    // 起動サイト: block は 128 に静的解決できる
+    let map = launch_map_from_cuda(CUDA_RS);
+    assert_eq!(
+        map.block_status("dno_mix_pf_gemm"),
+        ShapeStatus::Resolved([128, 1, 1]),
+        "dno_mix_pf_gemm の block 形状が解決できない: {}",
+        map.summary()
+    );
+    // Rust 側のミラー定数がカーネルの #define と一致する
+    for line in [
+        "pub(crate) const MIX_PF_BN: usize = 64;",
+        "pub(crate) const MIX_PF_BM: usize = 32;",
+        "pub(crate) const MIX_PF_THREADS: usize = 128;",
+    ] {
+        assert!(CUDA_RS.contains(line), "{line} が無い");
+    }
+}
+
+/// ゲート (`DENNO_PF_MIX_FAST`) の既定は **off**。lab の結果が出るまで切っておく
+/// (採択したらこのテストも on 側へ直す)。
+#[test]
+fn mix_pf_fast_gate_defaults_off() {
+    let i = CUDA_RS
+        .find("pub(crate) fn mix_pf_fast_from_value")
+        .expect("mix_pf_fast_from_value が無い");
+    let body: String = CUDA_RS[i..].chars().take(200).collect();
+    assert!(
+        body.contains("None => false,"),
+        "mix_pf_fast_from_value(None) が off でない: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 189: mix の inject GEMV (`kernels_mix_inj.cu`)
+// ---------------------------------------------------------------------------
+//
+// 「cuda.rs が読んでいる」「build_ptx.sh が nofmad で作る」「起動サイトの block
+// 形状が #define と一致する」「1 出力 1 アキュムレータ・k 昇順の fma」を固定する。
+const MIX_INJ_SRC: &str = include_str!("../kernels/kernels_mix_inj.cu");
+
+#[test]
+fn mix_inj_gemv_kernel_is_wired() {
+    assert!(
+        CUDA_RS.contains("b\"dno_mix_inj_bf16\\0\""),
+        "cuda.rs が dno_mix_inj_bf16 を読んでいない"
+    );
+    assert!(
+        MIX_INJ_SRC.contains("dno_mix_inj_bf16"),
+        "kernels_mix_inj.cu にカーネルが無い"
+    );
+    for line in ["#define MIXINJ_THREADS 128", "#define MIXINJ_MAX_N 8"] {
+        assert!(MIX_INJ_SRC.contains(line), "{line} が無い");
+    }
+    // 値の契約: 出力 1 要素 1 アキュムレータ・k 昇順の fma (既存 GEMM と同一順)。
+    assert!(
+        MIX_INJ_SRC.contains("acc = __fmaf_rn(mixinj_bf16_to_f32(row[d]), xr[d], acc);"),
+        "アキュムレートが 1 出力 1 アキュムレータの fma でない"
+    );
+    assert!(
+        MIX_INJ_SRC.contains("__uint_as_float((unsigned int)b << 16)"),
+        "BF16 の展開が上位 16 bit の複製でない"
+    );
+    assert!(
+        BUILD_PTX_SH.contains("mix_inj)      echo \"kernels_mix_inj.cu|nofmad\""),
+        "build_ptx.sh の mix_inj の spec 行が変わった"
+    );
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("mix_inj"),
+        "build_ptx.sh の targets_all に mix_inj が無い: {targets}"
+    );
+    let map = launch_map_from_cuda(CUDA_RS);
+    assert_eq!(
+        map.block_status("dno_mix_inj_bf16"),
+        ShapeStatus::Resolved([128, 1, 1]),
+        "dno_mix_inj_bf16 の block 形状が解決できない: {}",
+        map.summary()
+    );
+    for line in [
+        "pub(crate) const MIX_INJ_THREADS: usize = 128;",
+        "pub(crate) const MIX_INJ_MAX_N: usize = 8;",
+    ] {
+        assert!(CUDA_RS.contains(line), "{line} が無い");
+    }
+}
+
+/// ゲート (`DENNO_PF_MIX_INJ`) の既定は **off** (lab の結果で決める)。
+#[test]
+fn mix_inj_gate_defaults_off() {
+    let i = CUDA_RS
+        .find("pub(crate) fn mix_inj_from_value")
+        .expect("mix_inj_from_value が無い");
+    let body: String = CUDA_RS[i..].chars().take(300).collect();
+    assert!(
+        body.contains("None => false,"),
+        "mix_inj_from_value(None) が off でない: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 186: prefill GDN スキャン v2 (`kernels_gdn_pf2.cu`)
+// ---------------------------------------------------------------------------
+//
+// 「cuda.rs が読んでいる」「build_ptx.sh が compute_90 / -fmad=false で作る」
+// 「起動サイトの block 形状が #define と一致する」を固定する。値の一致
+// (gdn_pf の scan128 とビット一致) は GPU 側の検算の担当。
+const GDN_PF2_SRC: &str = include_str!("../kernels/kernels_gdn_pf2.cu");
+
+#[test]
+fn gdn_pf2_scan_kernel_is_wired() {
+    for name in ["dno_gdn_pf_scan64", "dno_gdn_pf_norm128"] {
+        assert!(
+            GDN_PF2_SRC.contains(name),
+            "kernels_gdn_pf2.cu に {name} が無い"
+        );
+        assert!(
+            CUDA_RS.contains(&format!("b\"{name}\\0\"")),
+            "cuda.rs が {name} を読んでいない"
+        );
+    }
+    for line in [
+        "#define PF2_DK 128",
+        "#define PF2_LANES 4",
+        "#define PF2_NR 32",
+        "#define PF2_COLS 64",
+        "#define PF2_THREADS 256",
+        "#define PF2_DCONV 4",
+        "#define PF2_CS 3",
+        "#define PF2_RING 3",
+        "#define PF2_NORM_THREADS 128",
+        "#define PF2_OFF_K 128",
+        "#define PF2_OFF_V 256",
+        "#define PF2_OFF_G 320",
+    ] {
+        assert!(GDN_PF2_SRC.contains(line), "{line} が無い");
+    }
+    // 状態はレジスタ常駐・縮約は 4 レーン (scan128 と同じ木)
+    assert!(
+        GDN_PF2_SRC.contains("float S[PF2_NR];"),
+        "状態配列がレジスタ常駐の形になっていない"
+    );
+    for what in ["sq", "sk2", "skv", "o", "ss"] {
+        assert!(
+            GDN_PF2_SRC.contains(&format!("__shfl_xor_sync(0xffffffffu, {what}, 1)"))
+                && GDN_PF2_SRC.contains(&format!("__shfl_xor_sync(0xffffffffu, {what}, 2)")),
+            "{what} のレーン縮約が無い"
+        );
+    }
+    // 1 トークン 1 barrier (末尾にだけ置く) と、リング経由の先読み。
+    assert_eq!(
+        GDN_PF2_SRC.matches("__syncthreads()").count(),
+        2,
+        "barrier が「プロローグ 1 + ループ末尾 1」の 2 個でない"
+    );
+    assert!(
+        GDN_PF2_SRC.contains("#define PF2_FILL(T, B)"),
+        "conv の手順がマクロ化されていない (式の順序を 1 箇所に保つ)"
+    );
+    // 出力 RMS は gdn_pf と同じ木 ((s0+s1)+(s2+s3))・同じ式。
+    assert!(
+        GDN_PF2_SRC.contains("oy[k] = oy[k] * rms * wnorm[c] * (1.0f / (1.0f + expf(-zv)));"),
+        "gated RMS norm の式が gdn_pf と違う"
+    );
+    // build_ptx.sh: compute_90 / -fmad=false
+    // task 186 (3/n): -fmad 可版は lab t186b で scan_pf -1.4% だけだったので
+    // nofmad に戻した (scan128 とビット一致を保つ)。
+    assert!(
+        BUILD_PTX_SH.contains("gdn_pf2)      echo \"kernels_gdn_pf2.cu|nofmad|compute_90\""),
+        "build_ptx.sh の gdn_pf2 が nofmad/compute_90 でない"
+    );
     let targets = BUILD_PTX_SH
         .lines()
         .find(|l| l.starts_with("targets_all="))
@@ -7678,4 +7908,97 @@ fn dec_epi_kernel_is_registered_in_build_ptx() {
             && launch.contains("&mut po as *mut _ as *mut c_void"),
         "起動配列の並びが変わった (h, w, sh, sgw, out の順)"
     );
+}
+
+#[test]
+fn gdn_pf2_kernel_is_wired() {
+    let targets = BUILD_PTX_SH
+        .lines()
+        .find(|l| l.starts_with("targets_all="))
+        .unwrap_or("");
+    assert!(
+        targets.contains("gdn_pf2"),
+        "build_ptx.sh の targets_all に gdn_pf2 が無い: {targets}"
+    );
+    // 起動サイトの block 形状
+    let map = launch_map_from_cuda(CUDA_RS);
+    assert_eq!(
+        map.block_status("dno_gdn_pf_scan64"),
+        ShapeStatus::Resolved([256, 1, 1]),
+        "dno_gdn_pf_scan64 の block 形状が解決できない: {}",
+        map.summary()
+    );
+    assert_eq!(
+        map.block_status("dno_gdn_pf_norm128"),
+        ShapeStatus::Resolved([128, 1, 1]),
+        "dno_gdn_pf_norm128 の block 形状が解決できない: {}",
+        map.summary()
+    );
+    // Rust 側のミラー定数
+    for line in [
+        "pub(crate) const GDN_PF2_THREADS: usize = 256;",
+        "pub(crate) const GDN_PF2_COLS: usize = 64;",
+        "pub(crate) const GDN_PF2_NORM_THREADS: usize = 128;",
+    ] {
+        assert!(CUDA_RS.contains(line), "{line} が無い");
+    }
+}
+
+/// ゲート (`DENNO_PF_SCAN_FAST`) の既定は **on** (task 189: lab t187c で
+/// scan_pf 2,853 -> 1,295 ms・wall -3.2%・md5 SAME を確認して既定を反転した)。
+#[test]
+fn gdn_pf2_gate_defaults_on() {
+    let i = CUDA_RS
+        .find("pub(crate) fn gdn_pf2_from_value")
+        .expect("gdn_pf2_from_value が無い");
+    let body: String = CUDA_RS[i..].chars().take(400).collect();
+    assert!(
+        body.contains("None => true,"),
+        "gdn_pf2_from_value(None) が on でない: {body}"
+    );
+    // `=0` などの明示 off は従来どおり効く (A/B と切り戻しのため)。
+    for v in ["\"0\"", "\"off\"", "\"false\""] {
+        assert!(body.contains(v), "明示 off の解釈 ({v}) が消えた: {body}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 189: mix / combine の同期を自ストリームだけにする (`DENNO_PF_MIX_STAGE`)
+// ---------------------------------------------------------------------------
+
+/// ゲートの実体が「cuCtxSynchronize ではなくイベント同期」であること。
+///
+/// ここが `ctx.sync()` に戻ると、prefill の expert upload (非ブロッキング
+/// ストリーム) の完了待ちが mix の壁時計に戻る (t187c の 3.6 s)。
+#[test]
+fn pf_mix_stage_sync_uses_an_event() {
+    let body = fn_body(CUDA_RS, "fn pf_sync_own_stream");
+    assert!(
+        body.contains("check(es(ev)"),
+        "cuEventSynchronize を呼んでいない: {body}"
+    );
+    assert!(
+        body.contains("create(&mut e, 0x02)"),
+        "CU_EVENT_DISABLE_TIMING でイベントを作っていない: {body}"
+    );
+    assert!(
+        CUDA_RS.contains("CU_STREAM_NON_BLOCKING"),
+        "upload が非ブロッキングである根拠 (と 0x01 の定義) が消えた"
+    );
+    // mix と combine の両方がこの同期を通る (片方だけだと待ちが残る)。
+    assert_eq!(
+        CUDA_RS.matches("pf_stage_sync(ctx)").count(),
+        2,
+        "pf_mix / pf_combine の両方が pf_stage_sync を通っていない"
+    );
+    // 計測器 (DENNO_PF_MIX_KPROF) は段の前後にイベントを打っている。
+    for k in [
+        "pf_mix_kprof::begin(pf_mix_kprof::NORM)",
+        "pf_mix_kprof::begin(pf_mix_kprof::DOWN)",
+        "pf_mix_kprof::begin(pf_mix_kprof::UP)",
+        "pf_mix_kprof::begin(pf_mix_kprof::INJ)",
+        "pf_mix_kprof::collect()",
+    ] {
+        assert!(CUDA_RS.contains(k), "mix の段計測 {k} が無い");
+    }
 }

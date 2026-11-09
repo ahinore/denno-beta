@@ -69,6 +69,8 @@ type FnCuDriverGetVersion = unsafe extern "C" fn(*mut c_int) -> CUresult;
 type FnCuModuleLoadData = unsafe extern "C" fn(*mut CUmodule, *const c_void) -> CUresult;
 type FnCuModuleGetFunction =
     unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult;
+// task 186: カーネル属性 (レジスタ数・ローカルメモリ) の読み出し。診断専用。
+type FnCuFuncGetAttribute = unsafe extern "C" fn(*mut c_int, c_int, CUfunction) -> CUresult;
 type FnCuMemAllocV2 = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
 type FnCuMemFreeV2 = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
 type FnCuMemsetD32Async = unsafe extern "C" fn(CUdeviceptr, u32, usize, CUstream) -> CUresult;
@@ -147,6 +149,8 @@ struct CudaLib {
     func_set_attribute: Option<FnCuFuncSetAttribute>,
     // task 174: 診断専用 (DENNO_LAUNCH_DBG)。無ければアドレスで代用する。
     func_get_name: Option<FnCuFuncGetName>,
+    // task 186: 診断専用 (DENNO_KERNEL_ATTR)。JIT 後の実レジスタ数とローカル量。
+    func_get_attribute: Option<FnCuFuncGetAttribute>,
     // s167 (P6): 専用コピーストリーム (h2 の D2H を qkv/z GEMM と重ねる)。
     stream_create: Option<FnCuStreamCreate>,
     stream_destroy: Option<FnCuStreamDestroy>,
@@ -504,6 +508,8 @@ unsafe fn open_libcuda() -> Result<CudaLib> {
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuFuncSetAttribute>(p) }),
         func_get_name: sym_opt(handle, "cuFuncGetName")
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuFuncGetName>(p) }),
+        func_get_attribute: sym_opt(handle, "cuFuncGetAttribute")
+            .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuFuncGetAttribute>(p) }),
         stream_create: sym_opt(handle, "cuStreamCreate")
             .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnCuStreamCreate>(p) }),
         // driver は v2 名で公開する (CUDA 3.2 以降)。無ければ無印を試す。
@@ -19360,6 +19366,598 @@ fn pf_kernels() -> Option<&'static PfKernels> {
 /// 連鎖 1 回ぶんの失敗を 1 度だけ記録する (以降は CPU 経路に固定)。
 static PF_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// ---------------------------------------------------------------------------
+// task 186: prefill hc mix の down / up 用 GEMM (`kernels_mix_pf.cu`、既定 off)
+// ---------------------------------------------------------------------------
+//
+// 既存 `dno_gemm_bf16_mt` は 1 ブロック = 16 行 x 32 トークンで、k タイル 32 ごとに
+// `__syncthreads` を 2 回打つ (barrier あたりの FMA が 64)。lab t183a の 14k
+// prefill で mix の down + up は 4.2 GFLOP を 1.27 ms = 3.1 TFLOP/s (fp32 山の 3%)
+// で回っており、同じホストの隣の GEMM は 70-75 TFLOP/s。mix の 146 MB / 1.34 ms は
+// 109 GB/s なので帯域律速でもない ([REPORT_P186.md] 0.1 の表)。
+//
+// 新しい `dno_mix_pf_gemm` は 32 トークン x 64 行 x k タイル 16 で、barrier あたりの
+// FMA が 256。**値は既存カーネルとビット一致** (1 出力 1 アキュムレータ・k 昇順の
+// `__fmaf_rn`、BF16 -> f32 は上位 16 bit の複製で CPU の dequant と同一) なので、
+// 採否は速度だけで決まる。
+//
+// PTX はクレートの `kernels/kernels_mix_pf.ptx` (lab が `bash build_ptx.sh mix_pf`
+// で生成) を実行時に読む。無い・読めない・entry が無いときは従来カーネルへ
+// fail closed (ゲート on でも既定 off と同じ経路・同じ値)。
+
+/// 1 ブロックの出力行数 (カーネルの MIXP_BN)。
+pub(crate) const MIX_PF_BN: usize = 64;
+/// 1 ブロックのトークン数 (カーネルの MIXP_BM)。
+pub(crate) const MIX_PF_BM: usize = 32;
+/// スレッド数 (カーネルの MIXP_THREADS)。
+pub(crate) const MIX_PF_THREADS: usize = 128;
+/// 新しいカーネルを使う最小トークン数 (それ未満は既存カーネルのほうが速い)。
+pub const MIX_PF_MIN_TOK: usize = 64;
+
+/// task 186: `kernels_mix_pf.cu` の関数一式。
+struct MixPfKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    gemm: CUfunction,
+}
+
+// 生ハンドル (PfKernels と同じ規約)。
+unsafe impl Send for MixPfKernels {}
+unsafe impl Sync for MixPfKernels {}
+
+/// PTX の置き場所。`DENNO_MIX_PF_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_mix_pf.ptx`。
+fn mix_pf_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MIX_PF_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_mix_pf.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+/// **current context を張った後に呼ぶこと**。
+fn mix_pf_kernels() -> Option<&'static MixPfKernels> {
+    static K: OnceLock<Option<MixPfKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = mix_pf_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::info!(
+                    "[mix-pf] PTX が読めない ({}) : {e} → 従来の GEMM へ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                tracing::info!("[mix-pf] cuModuleLoadData 失敗 → 従来の GEMM へ");
+                return None;
+            }
+            let mut gemm: CUfunction = std::ptr::null_mut();
+            if (lib.module_get_function)(
+                &mut gemm,
+                module,
+                b"dno_mix_pf_gemm\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                tracing::info!("[mix-pf] PTX に dno_mix_pf_gemm が無い → 従来の GEMM へ");
+                return None;
+            }
+            log_kernel_attr(lib, gemm, "dno_mix_pf_gemm");
+            Some(MixPfKernels { module, gemm })
+        }
+    })
+    .as_ref()
+}
+
+/// task 186: `DENNO_PF_MIX_FAST` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn mix_pf_fast_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// ゲートが on か (プロセスで 1 回だけ読む)。
+pub(crate) fn mix_pf_fast_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| mix_pf_fast_from_value(std::env::var("DENNO_PF_MIX_FAST").ok().as_deref()))
+}
+
+/// task 186: その形を新しいカーネルで回してよいか (純関数)。
+///
+/// BF16 重み・n が 1 タイル以上・nt が [`MIX_PF_MIN_TOK`] 以上・k が 1 以上。
+/// inject (n=4) のような小さい N は従来カーネル (grid を 16 行で割る) のほうが速い。
+pub(crate) fn mix_pf_ok(k: usize, n: usize, nt: usize, bf16: bool) -> bool {
+    bf16 && k > 0 && n >= MIX_PF_BN && nt >= MIX_PF_MIN_TOK
+}
+
+// ---------------------------------------------------------------------------
+// task 189: mix の inject (n = hc <= 8) を 1 スレッド 1 出力の GEMV で回す
+// ---------------------------------------------------------------------------
+//
+// `dno_gemm_bf16_mt` は 1 ブロック 16 行 x 32 トークンなので、n=4 の inject では
+// grid.x = 1 (16 行のうち 4 行だけ有効)・ブロック数 16 本になり、21 M MAC の
+// 仕事に 329 us/呼び出し (2,688 呼び出しで 884 ms) かかっていた (lab t189a の
+// `[pf-mix-kprof] inj`)。詳細は `kernels/kernels_mix_inj.cu` の先頭。
+
+/// 1 ブロックのスレッド数 (カーネルの `MIXINJ_THREADS` と一致させる)。
+pub(crate) const MIX_INJ_THREADS: usize = 128;
+/// この n 以下を新しいカーネルで回す (inject の実形は hc=4)。
+pub(crate) const MIX_INJ_MAX_N: usize = 8;
+/// これ未満のトークン数は従来カーネル (起動のほうが高い)。
+pub const MIX_INJ_MIN_TOK: usize = 32;
+
+fn mix_inj_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_MIX_INJ_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_mix_inj.ptx"),
+    }
+}
+
+struct MixInjKernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    gemv: CUfunction,
+}
+
+// 生ハンドル (MixPfKernels / PfKernels と同じ規約)。
+unsafe impl Send for MixInjKernels {}
+unsafe impl Sync for MixInjKernels {}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+/// **current context を張った後に呼ぶこと**。
+fn mix_inj_kernels() -> Option<&'static MixInjKernels> {
+    static K: OnceLock<Option<MixInjKernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = mix_inj_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::info!(
+                    "[mix-inj] PTX が読めない ({}) : {e} → 従来の GEMM へ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                tracing::info!("[mix-inj] cuModuleLoadData 失敗 → 従来の GEMM へ");
+                return None;
+            }
+            let mut gemv: CUfunction = std::ptr::null_mut();
+            if (lib.module_get_function)(
+                &mut gemv,
+                module,
+                b"dno_mix_inj_bf16\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                tracing::info!("[mix-inj] PTX に dno_mix_inj_bf16 が無い → 従来の GEMM へ");
+                return None;
+            }
+            log_kernel_attr(lib, gemv, "dno_mix_inj_bf16");
+            Some(MixInjKernels { module, gemv })
+        }
+    })
+    .as_ref()
+}
+
+/// task 189: `DENNO_PF_MIX_INJ` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn mix_inj_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// 新しい inject GEMV を使うか (`DENNO_PF_MIX_INJ`、既定 off。lab で決める)。
+pub(crate) fn mix_inj_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| mix_inj_from_value(std::env::var("DENNO_PF_MIX_INJ").ok().as_deref()))
+}
+
+/// task 189: その形を新しいカーネルで回してよいか (純関数)。
+///
+/// BF16 重み・1 <= n <= [`MIX_INJ_MAX_N`]・nt >= [`MIX_INJ_MIN_TOK`]・k > 0。
+pub(crate) fn mix_inj_ok(k: usize, n: usize, nt: usize, bf16: bool) -> bool {
+    bf16 && k > 0 && n >= 1 && n <= MIX_INJ_MAX_N && nt >= MIX_INJ_MIN_TOK
+}
+
+#[cfg(test)]
+mod mix_inj_tests {
+    use super::*;
+
+    #[test]
+    fn mix_inj_gate_truth_table() {
+        assert!(!mix_inj_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!mix_inj_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(mix_inj_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+
+    #[test]
+    fn mix_inj_ok_checks_shape() {
+        // 実形の inject: k = hc*e = 10240, n = hc = 4, nt = 512
+        assert!(mix_inj_ok(10240, 4, 512, true));
+        assert!(mix_inj_ok(10240, 8, 512, true));
+        // down (n=320) / up (n=10240) は対象外 (従来の GEMM のほうが速い)
+        assert!(!mix_inj_ok(2560, 320, 512, true));
+        assert!(!mix_inj_ok(320, 10240, 512, true));
+        // f32 展開した重みは対象外
+        assert!(!mix_inj_ok(10240, 4, 512, false));
+        // 短い prefill は従来カーネル
+        assert!(!mix_inj_ok(10240, 4, 19, true));
+        assert!(!mix_inj_ok(0, 4, 512, true));
+        assert!(!mix_inj_ok(10240, 0, 512, true));
+        assert!(!mix_inj_ok(10240, 9, 512, true));
+    }
+}
+
+#[cfg(test)]
+mod mix_pf_tests {
+    use super::*;
+
+    #[test]
+    fn mix_pf_fast_gate_truth_table() {
+        assert!(!mix_pf_fast_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!mix_pf_fast_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(mix_pf_fast_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+
+    #[test]
+    fn mix_pf_ok_checks_shape() {
+        // 実形: down (k=2560, n=320) / up (k=320, n=10240)
+        assert!(mix_pf_ok(2560, 320, 512, true));
+        assert!(mix_pf_ok(320, 10240, 512, true));
+        // inject (n=4) は従来カーネル
+        assert!(!mix_pf_ok(10240, 4, 512, true));
+        // f32 展開した重みは対象外 (PfWKind::F32 は従来カーネル)
+        assert!(!mix_pf_ok(2560, 320, 512, false));
+        // 短い prefill (次のターンの 19 トークン) は従来カーネル
+        assert!(!mix_pf_ok(2560, 320, 19, true));
+        assert!(!mix_pf_ok(0, 320, 512, true));
+        assert!(!mix_pf_ok(2560, 0, 512, true));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 189: mix 1 呼び出しの段ごとの内訳 (`DENNO_PF_MIX_KPROF=1`・既定 off)
+// ---------------------------------------------------------------------------
+//
+// 台帳の `mix` 行は「発行 + 同期の待ち」の壁時計で、`gpu` は
+// `cuCtxSynchronize` の待ちから空 sync の床を引いただけなので、**別ストリーム
+// (prefill の expert upload) の完了待ち**も同じ欄に入る。REPORT_P186 はこれを
+// mix のカーネル時間と読み違えた。ここでは段の前後に CUDA イベントを打って
+// 段の GPU 時間だけを積み、同期は
+//
+// - `sync_own`: null ストリーム (mix 自身の 6 起動) の完了待ち
+// - `sync_other`: そのあと `cuCtxSynchronize` が**別ストリーム**を待った分
+//
+// に分けて積む。`sync_other` が大きければ待ちの正体は expert upload。
+pub mod pf_mix_kprof {
+    use super::*;
+
+    /// 段の番号 (この順で 1 行に出す)。
+    pub const NORM: usize = 0;
+    pub const DOWN: usize = 1;
+    pub const LO: usize = 2;
+    pub const UP: usize = 3;
+    pub const MIXED: usize = 4;
+    pub const INJ: usize = 5;
+    pub const SYNC_OWN: usize = 6;
+    pub const SYNC_OTHER: usize = 7;
+    pub const D2H: usize = 8;
+    pub const N: usize = 9;
+    pub const NAMES: [&str; N] = [
+        "norm", "down", "lo", "up", "mixed", "inj", "sync_own", "sync_other", "d2h",
+    ];
+
+    static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static CNT: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// mix 呼び出しの回数 (1 回あたりに割る分母)。
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// 計測するか (`DENNO_PF_MIX_KPROF` があるとき)。
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DENNO_PF_MIX_KPROF").is_some())
+    }
+
+    /// 積算を 0 に戻す。
+    pub fn reset() {
+        for i in 0..N {
+            NS[i].store(0, Ordering::Relaxed);
+            CNT[i].store(0, Ordering::Relaxed);
+        }
+        CALLS.store(0, Ordering::Relaxed);
+        open_reset();
+    }
+
+    /// mix 1 呼び出しを数える。
+    pub fn note_call() {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_ns(i: usize, ns: u64) {
+        if i >= N {
+            return;
+        }
+        NS[i].fetch_add(ns, Ordering::Relaxed);
+        CNT[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// ホストで測った区間 (同期の待ち・D2H) を積む。
+    pub fn add_host(i: usize, t: Option<std::time::Instant>) {
+        if !on() {
+            return;
+        }
+        if let Some(t) = t {
+            add_ns(i, t.elapsed().as_nanos() as u64);
+        }
+    }
+
+    /// 1 行にまとめる (1 本も打っていなければ `None`)。
+    pub fn lines() -> Vec<String> {
+        if !on() {
+            return Vec::new();
+        }
+        let calls = CALLS.load(Ordering::Relaxed);
+        if calls == 0 {
+            return Vec::new();
+        }
+        let mut s = format!(
+            "[pf-mix-kprof] calls={calls} (1 呼び出し平均 us / 合計 ms, イベント + ホスト計測)"
+        );
+        for i in 0..N {
+            let n = CNT[i].load(Ordering::Relaxed);
+            if n == 0 {
+                continue;
+            }
+            let ns = NS[i].load(Ordering::Relaxed);
+            s.push_str(&format!(
+                " | {} {:.1}/{:.1}",
+                NAMES[i],
+                ns as f64 / 1e3 / n as f64,
+                ns as f64 / 1e6
+            ));
+        }
+        vec![s]
+    }
+
+    /// イベントのプール (スレッドローカル)。収集のたびに先頭から使い直す。
+    struct Pool {
+        evs: Vec<CUevent>,
+        used: usize,
+        dead: bool,
+    }
+
+    thread_local! {
+        static P: std::cell::RefCell<Pool> = const {
+            std::cell::RefCell::new(Pool { evs: Vec::new(), used: 0, dead: false })
+        };
+        static OPEN: std::cell::RefCell<[Option<u32>; N]> = const {
+            std::cell::RefCell::new([None; N])
+        };
+        static PEND: std::cell::RefCell<Vec<(u8, u32, u32)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn mark() -> Option<u32> {
+        P.with(|c| {
+            let mut p = c.borrow_mut();
+            if p.dead {
+                return None;
+            }
+            if p.used >= p.evs.len() {
+                let Some(create) = lib().ok().and_then(|l| l.event_create) else {
+                    p.dead = true;
+                    return None;
+                };
+                let mut ev: CUevent = std::ptr::null_mut();
+                // CU_EVENT_DEFAULT (0) = 計時有効。
+                if unsafe { create(&mut ev, 0) } != CUDA_SUCCESS || ev.is_null() {
+                    p.dead = true;
+                    return None;
+                }
+                p.evs.push(ev);
+            }
+            let Some(rec) = lib().ok().and_then(|l| l.event_record) else {
+                p.dead = true;
+                return None;
+            };
+            let ev = p.evs[p.used];
+            if unsafe { rec(ev, std::ptr::null_mut()) } != CUDA_SUCCESS {
+                p.dead = true;
+                return None;
+            }
+            let i = p.used as u32;
+            p.used += 1;
+            Some(i)
+        })
+    }
+
+    fn open_reset() {
+        OPEN.with(|c| {
+            let mut o = c.borrow_mut();
+            for v in o.iter_mut() {
+                *v = None;
+            }
+        });
+        PEND.with(|c| c.borrow_mut().clear());
+        P.with(|c| c.borrow_mut().used = 0);
+    }
+
+    /// 段の入口 (on でなければ 1 分岐)。
+    pub fn begin(item: usize) {
+        if !on() || item >= N {
+            return;
+        }
+        let a = mark();
+        OPEN.with(|c| c.borrow_mut()[item] = a);
+    }
+
+    /// 段の出口。
+    pub fn end(item: usize) {
+        if !on() || item >= N {
+            return;
+        }
+        let a = OPEN.with(|c| c.borrow_mut()[item].take());
+        let Some(a) = a else { return };
+        if let Some(b) = mark() {
+            PEND.with(|c| c.borrow_mut().push((item as u8, a, b)));
+        }
+    }
+
+    /// 積算する (**同期の後**に呼ぶ。イベントが完了している必要がある)。
+    pub fn collect() {
+        if !on() {
+            return;
+        }
+        let Some(f) = lib().ok().and_then(|l| l.event_elapsed_time) else {
+            return;
+        };
+        let pend = PEND.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if pend.is_empty() {
+            return;
+        }
+        P.with(|c| {
+            let p = c.borrow();
+            for (item, a, b) in pend {
+                let (Some(&ea), Some(&eb)) = (p.evs.get(a as usize), p.evs.get(b as usize)) else {
+                    continue;
+                };
+                let mut ms = 0.0f32;
+                if unsafe { f(&mut ms, ea, eb) } == CUDA_SUCCESS && ms.is_finite() && ms >= 0.0 {
+                    add_ns(item as usize, (ms as f64 * 1e6) as u64);
+                }
+            }
+        });
+        // イベントは先頭から使い直す (プールは 20 本で足りる)。
+        P.with(|c| c.borrow_mut().used = 0);
+    }
+}
+
+/// task 189: `DENNO_PF_MIX_STAGE` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn mix_stage_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// task 189: mix / combine の同期を**自ストリームだけ**にするか
+/// (`DENNO_PF_MIX_STAGE`、既定 off。lab の結果で決める)。
+pub(crate) fn mix_stage_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| mix_stage_from_value(std::env::var("DENNO_PF_MIX_STAGE").ok().as_deref()))
+}
+
+#[cfg(test)]
+mod pf_stage_tests {
+    use super::*;
+
+    /// task 189: `DENNO_PF_MIX_STAGE` は明示的な真値だけ on (既定 off)。
+    #[test]
+    fn mix_stage_gate_truth_table() {
+        assert!(!mix_stage_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!mix_stage_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(mix_stage_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+}
+
+thread_local! {
+    /// task 189: 自ストリーム同期用のイベント (計時不要)。
+    static PF_SYNC_EV: std::cell::Cell<CUevent> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// task 189: null ストリーム (mix / combine の起動先) の完了だけを待つ。
+///
+/// `cuCtxSynchronize` は**コンテキスト内の全ストリーム**を待つので、prefill の
+/// expert upload 用の非ブロッキングストリーム (最大 14 s ぶん enqueue される) の
+/// 完了も待ってしまう。イベントを null ストリームに打って `cuEventSynchronize`
+/// すれば、待つのは自ストリームの仕事だけになる (legacy default stream の暗黙
+/// 同期は**ブロッキング**ストリームだけが対象で、upload は
+/// `CU_STREAM_NON_BLOCKING` なので係らない)。
+fn pf_sync_own_stream() -> Result<()> {
+    let l = lib()?;
+    let (Some(create), Some(rec), Some(es)) = (l.event_create, l.event_record, l.event_sync) else {
+        bail!("cuEventCreate / cuEventRecord / cuEventSynchronize が無い");
+    };
+    let ev = PF_SYNC_EV.with(|c| {
+        let mut ev = c.get();
+        if ev.is_null() {
+            let mut e: CUevent = std::ptr::null_mut();
+            // CU_EVENT_DISABLE_TIMING = 0x02
+            if unsafe { create(&mut e, 0x02) } != CUDA_SUCCESS || e.is_null() {
+                return std::ptr::null_mut();
+            }
+            c.set(e);
+            ev = e;
+        }
+        ev
+    });
+    if ev.is_null() {
+        bail!("同期用イベントを作れない");
+    }
+    unsafe {
+        check(rec(ev, std::ptr::null_mut()), "cuEventRecord (pf stage)")?;
+        check(es(ev), "cuEventSynchronize (pf stage)")?;
+    }
+    Ok(())
+}
+
+/// task 189: mix / combine の同期。ゲートが on なら自ストリームだけを待つ。
+///
+/// 戻り値は「別ストリームを待った時間」を測るための `Instant` (ゲート off / 計測
+/// off では `None`)。呼び出し側は `pf_mix_kprof::add_host(SYNC_OTHER, t)` に渡す。
+fn pf_stage_sync(ctx: &CudaCtx) -> Result<Option<std::time::Instant>> {
+    if !mix_stage_on() {
+        let t = if pf_mix_kprof::on() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        ctx.sync()?;
+        return Ok(t);
+    }
+    // 1. 自ストリーム (mix の 6 起動) の完了だけを待つ。
+    let t_own = pf_mix_kprof::on().then(std::time::Instant::now);
+    pf_sync_own_stream()?;
+    pf_mix_kprof::add_host(pf_mix_kprof::SYNC_OWN, t_own);
+    // 2. 計測時だけ、そのあと全体を待って「別ストリームの残り」を測る
+    //    (診断専用。ゲート on の実経路では 2 回目の同期はしない)。
+    if pf_mix_kprof::on() {
+        let t = Some(std::time::Instant::now());
+        ctx.sync()?;
+        return Ok(t);
+    }
+    Ok(None)
+}
+
 fn pf_fail(msg: &str) -> bool {
     if !PF_BROKEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::info!("[pf] {msg} → 以降の prefill は CPU 経路");
@@ -19521,7 +20119,9 @@ pub fn pf_download_res_row(t: usize, hc_dim: usize, out: &mut [f32]) -> bool {
 
 /// task 154: デバイスの `mixed` (`[nt][n_embd]`) をホストへ戻す。
 pub fn pf_take_mixed(out: &mut [f32]) -> bool {
-    PF_DEV.with(|cell| -> bool {
+    // task 189: mix 1 呼び出しの D2H (mixed の 5.1 MB) も段として積む。
+    let t_d2h = pf_mix_kprof::on().then(std::time::Instant::now);
+    let r = PF_DEV.with(|cell| -> bool {
         let d = cell.borrow();
         match d.mixed.as_ref() {
             Some(b) if b.bytes() >= out.len() * 4 => {
@@ -19539,7 +20139,9 @@ pub fn pf_take_mixed(out: &mut [f32]) -> bool {
             }
             _ => false,
         }
-    })
+    });
+    pf_mix_kprof::add_host(pf_mix_kprof::D2H, t_d2h);
+    r
 }
 
 /// F32 の重み (hc mix の inject など) の常駐表。`mix_gpu_weight` は BF16 専用なので
@@ -19700,6 +20302,9 @@ pub fn pf_mix(
     let Some((pi, pi_k)) = pf_weight(inject, want_bf16) else {
         return false;
     };
+    if pf_mix_kprof::on() {
+        pf_mix_kprof::note_call();
+    }
     let r = PF_DEV.with(|cell| -> Result<(), String> {
         let d = cell.borrow();
         if nt > d.nt || hc != d.hc || e != d.e || lr != d.lr {
@@ -19725,6 +20330,7 @@ pub fn pf_mix(
         let (mut pr, mut px, mut pl, mut pg, mut pm, mut pj, mut pw) =
             (res.ptr(), xn.ptr(), lo.ptr(), gate.ptr(), mixed.ptr(), inj.ptr(), gamma.ptr());
         // 1. grouped RMS norm (res → xn)
+        pf_mix_kprof::begin(pf_mix_kprof::NORM);
         {
             let (mut e_c, mut hc_c) = (e as i32, hc as i32);
             let mut eps_c = eps;
@@ -19742,6 +20348,7 @@ pub fn pf_mix(
                     .map_err(|e| format!("rmsgroup launch: {e:#}"))?;
             }
         }
+        pf_mix_kprof::end(pf_mix_kprof::NORM);
         // 2. down GEMM (xn → lo)
         let gemm = |w: CUdeviceptr,
                     x: CUdeviceptr,
@@ -19750,6 +20357,59 @@ pub fn pf_mix(
                     nn: usize,
                     kind: PfWKind|
          -> Result<(), String> {
+            // task 186: BF16 の down / up を広いタイルのカーネルで回す
+            // (`DENNO_PF_MIX_FAST`・既定 off。値は従来カーネルとビット一致)。
+            // task 189: inject (n <= 8) は 1 スレッド 1 出力の GEMV で回す。
+            if mix_inj_on() && mix_inj_ok(kk, nn, nt, kind == PfWKind::Bf16) {
+                if let Some(fns) = mix_inj_kernels() {
+                    let (mut pw, mut px, mut py) = (w, x, y);
+                    let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, kk as c_int, nn as c_int);
+                    let mut args = [
+                        &mut pw as *mut _ as *mut c_void,
+                        &mut px as *mut _ as *mut c_void,
+                        &mut py as *mut _ as *mut c_void,
+                        &mut nt_c as *mut _ as *mut c_void,
+                        &mut k_c as *mut _ as *mut c_void,
+                        &mut n_c as *mut _ as *mut c_void,
+                    ];
+                    let grid = (((nt * nn).div_ceil(MIX_INJ_THREADS)) as u32, 1, 1);
+                    unsafe {
+                        ctx.launch_async(
+                            fns.gemv,
+                            grid,
+                            (MIX_INJ_THREADS as u32, 1, 1),
+                            0,
+                            &mut args,
+                        )
+                        .map_err(|e| format!("mix_inj gemv launch: {e:#}"))?;
+                    }
+                    return Ok(());
+                }
+            }
+            let fast_bf16 = kind == PfWKind::Bf16 && mix_pf_fast_on() && mix_pf_ok(kk, nn, nt, true);
+            let fast_fn = if fast_bf16 { mix_pf_kernels() } else { None };
+            if let Some(fns) = fast_fn {
+                let (mut pw, mut px, mut py) = (w, x, y);
+                let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, kk as c_int, nn as c_int);
+                let mut args = [
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut px as *mut _ as *mut c_void,
+                    &mut py as *mut _ as *mut c_void,
+                    &mut nt_c as *mut _ as *mut c_void,
+                    &mut k_c as *mut _ as *mut c_void,
+                    &mut n_c as *mut _ as *mut c_void,
+                ];
+                let grid = (
+                    ((nn + MIX_PF_BN - 1) / MIX_PF_BN) as u32,
+                    ((nt + MIX_PF_BM - 1) / MIX_PF_BM) as u32,
+                    1,
+                );
+                unsafe {
+                    ctx.launch_async(fns.gemm, grid, (MIX_PF_THREADS as u32, 1, 1), 0, &mut args)
+                        .map_err(|e| format!("mix_pf gemm launch: {e:#}"))?;
+                }
+                return Ok(());
+            }
             match kind {
                 PfWKind::Bf16 | PfWKind::F32 => {
                     let f = if kind == PfWKind::Bf16 {
@@ -19816,8 +20476,11 @@ pub fn pf_mix(
             }
             Ok(())
         };
+        pf_mix_kprof::begin(pf_mix_kprof::DOWN);
         gemm(pd, px, pl, hc_dim, lr, pd_k)?;
+        pf_mix_kprof::end(pf_mix_kprof::DOWN);
         // 3. lo apply (in-place, nt*low_rank 要素)
+        pf_mix_kprof::begin(pf_mix_kprof::LO);
         {
             let mut total = (nt * lr) as i64;
             let mut inv_c = inv_hc;
@@ -19832,9 +20495,13 @@ pub fn pf_mix(
                     .map_err(|e| format!("lo launch: {e:#}"))?;
             }
         }
+        pf_mix_kprof::end(pf_mix_kprof::LO);
         // 4. up GEMM (lo → gate)
+        pf_mix_kprof::begin(pf_mix_kprof::UP);
         gemm(pu, pl, pg, lr, hc_dim, pu_k)?;
+        pf_mix_kprof::end(pf_mix_kprof::UP);
         // 5. mixed (xn, gate → mixed)
+        pf_mix_kprof::begin(pf_mix_kprof::MIXED);
         {
             let (mut e_c, mut hc_c) = (e as i32, hc as i32);
             let mut inv_c = inv_hc;
@@ -19852,7 +20519,9 @@ pub fn pf_mix(
                     .map_err(|e| format!("mixed launch: {e:#}"))?;
             }
         }
+        pf_mix_kprof::end(pf_mix_kprof::MIXED);
         // 6. inject GEMM (xn → inj) + 1/hc
+        pf_mix_kprof::begin(pf_mix_kprof::INJ);
         gemm(pi, px, pj, hc_dim, hc, pi_k)?;
         {
             let mut n_c = (nt * hc) as i32;
@@ -19868,7 +20537,11 @@ pub fn pf_mix(
                     .map_err(|e| format!("inj launch: {e:#}"))?;
             }
         }
-        ctx.sync().map_err(|e| format!("sync: {e:#}"))?;
+        pf_mix_kprof::end(pf_mix_kprof::INJ);
+        // task 189: 同期は `DENNO_PF_MIX_STAGE` で自ストリームだけにできる。
+        let t_other = pf_stage_sync(ctx).map_err(|e| format!("sync: {e:#}"))?;
+        pf_mix_kprof::add_host(pf_mix_kprof::SYNC_OTHER, t_other);
+        pf_mix_kprof::collect();
         Ok(())
     });
     match r {
@@ -19922,7 +20595,10 @@ pub fn pf_combine(bo: &[f32], nt: usize, hc: usize, e: usize) -> bool {
             ctx.launch_async(k.combine, grid, (256, 1, 1), 0, &mut args)
                 .map_err(|e| format!("combine launch: {e:#}"))?;
         }
-        ctx.sync().map_err(|e| format!("sync: {e:#}"))?;
+        // task 189: mix と同じく、expert upload の別ストリームを待たない。
+        let t_other = pf_stage_sync(ctx).map_err(|e| format!("sync: {e:#}"))?;
+        pf_mix_kprof::add_host(pf_mix_kprof::SYNC_OTHER, t_other);
+        pf_mix_kprof::collect();
         Ok(())
     });
     match r {
@@ -35169,6 +35845,7 @@ fn gdn_pf_kernels() -> Option<&'static GdnPfKernels> {
                     eprintln!("[gdn-pf] PTX に dno_gdn_pf_scan128 が無い → 従来のスキャンへ");
                     return None;
                 }
+                log_kernel_attr(lib, scan128, "dno_gdn_pf_scan128");
                 Some(GdnPfKernels { module, scan128 })
             }
         })
@@ -35238,6 +35915,449 @@ fn gdn_pf_scan128_launch(
             0,
             &mut args,
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task 186: カーネル属性の診断 (DENNO_KERNEL_ATTR=1 のとき 1 行)
+// ---------------------------------------------------------------------------
+//
+// PTX の仮想レジスタ数 (`%f<1161>` など) は NVVM の SSA 形なので実際の割り当ては
+// 分からない。JIT 後の実体を `cuFuncGetAttribute` で読むと、ptxas が割り当てた
+// レジスタ数とローカルメモリ (スピル) のバイト数が読める。scan が「レジスタに
+// 載っていない」疑いを潰すための計測 (既定 off)。
+fn log_kernel_attr(lib: &CudaLib, f: CUfunction, name: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("DENNO_KERNEL_ATTR").is_some()) {
+        return;
+    }
+    let Some(g) = lib.func_get_attribute else {
+        return;
+    };
+    // CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK=0 / SHARED_SIZE_BYTES=1 /
+    // LOCAL_SIZE_BYTES=3 / NUM_REGS=4。
+    let (mut regs, mut local, mut smem, mut maxthr) = (-1i32, -1i32, -1i32, -1i32);
+    unsafe {
+        if g(&mut regs, 4, f) != CUDA_SUCCESS {
+            regs = -1;
+        }
+        if g(&mut local, 3, f) != CUDA_SUCCESS {
+            local = -1;
+        }
+        if g(&mut smem, 1, f) != CUDA_SUCCESS {
+            smem = -1;
+        }
+        if g(&mut maxthr, 0, f) != CUDA_SUCCESS {
+            maxthr = -1;
+        }
+    }
+    eprintln!(
+        "[kattr] {name}: num_regs={regs} local_bytes={local} shared_bytes={smem} max_threads={maxthr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task 186: prefill GDN スキャン v2 (`kernels_gdn_pf2.cu`、DENNO_PF_SCAN_FAST)
+// ---------------------------------------------------------------------------
+//
+// `dno_gdn_pf_scan128` は 1 ブロック = 1 ヘッド (128 列) で 48 ブロックしかなく、
+// 1 トークンあたり barrier 3 回と単一スレッドの超越関数を払う。lab t183a の実測は
+// 5.53 us/トークン (16.3 GB/s, 0.85 TFLOP/s)。v2 は
+//   - 1 ブロック = 64 列 (2 ブロックで 1 ヘッド) → 96 ブロック
+//   - conv の窓をレーンごとに 1 チャネルずつ分散し、3 段リングで 2 トークン先を
+//     先に埋める (barrier は 1 トークン 1 回)
+//   - 出力の gated RMS norm は別カーネル `dno_gdn_pf_norm128`
+// で回す。値は `dno_gdn_pf_scan128` とビット一致 (同じ状態の持ち方・同じ縮約の木・
+// 同じ式) なので、採否は速度だけで決まる。PTX は
+// `kernels/kernels_gdn_pf2.ptx` を実行時に読む (無ければ従来へ fail closed)。
+
+/// v2 スキャンのスレッド数 (カーネルの PF2_THREADS)。
+pub(crate) const GDN_PF2_THREADS: usize = 256;
+/// v2 スキャンの 1 ブロックあたりの列数 (カーネルの PF2_COLS)。
+pub(crate) const GDN_PF2_COLS: usize = 64;
+/// RMS norm カーネルのスレッド数 (カーネルの PF2_NORM_THREADS)。
+pub(crate) const GDN_PF2_NORM_THREADS: usize = 128;
+
+/// task 186: `kernels_gdn_pf2.cu` の関数一式。
+struct GdnPf2Kernels {
+    #[allow(dead_code)]
+    module: CUmodule,
+    scan64: CUfunction,
+    norm: CUfunction,
+}
+
+// 生ハンドル (GdnPfKernels と同じ規約)。
+unsafe impl Send for GdnPf2Kernels {}
+unsafe impl Sync for GdnPf2Kernels {}
+
+/// PTX の置き場所。`DENNO_GDN_PF2_PTX` があればそれ、無ければクレートの
+/// `kernels/kernels_gdn_pf2.ptx`。
+fn gdn_pf2_ptx_path() -> std::path::PathBuf {
+    match std::env::var("DENNO_GDN_PF2_PTX") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("kernels_gdn_pf2.ptx"),
+    }
+}
+
+/// カーネルを取得する (初回だけ PTX を読む)。失敗は None を焼き付ける。
+/// **current context を張った後に呼ぶこと**。
+fn gdn_pf2_kernels() -> Option<&'static GdnPf2Kernels> {
+    static K: OnceLock<Option<GdnPf2Kernels>> = OnceLock::new();
+    K.get_or_init(|| {
+        let path = gdn_pf2_ptx_path();
+        let mut image = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "[gdn-pf2] PTX が読めない ({}) : {e} → 従来のスキャンへ",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        image.push(0);
+        let lib = lib().ok()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            if (lib.module_load_data)(&mut module, image.as_ptr() as *const c_void) != CUDA_SUCCESS {
+                eprintln!("[gdn-pf2] cuModuleLoadData 失敗 → 従来のスキャンへ");
+                return None;
+            }
+            let mut scan64: CUfunction = std::ptr::null_mut();
+            if (lib.module_get_function)(
+                &mut scan64,
+                module,
+                b"dno_gdn_pf_scan64\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                eprintln!("[gdn-pf2] PTX に dno_gdn_pf_scan64 が無い → 従来のスキャンへ");
+                return None;
+            }
+            let mut norm: CUfunction = std::ptr::null_mut();
+            if (lib.module_get_function)(
+                &mut norm,
+                module,
+                b"dno_gdn_pf_norm128\0".as_ptr() as *const c_char,
+            ) != CUDA_SUCCESS
+            {
+                eprintln!("[gdn-pf2] PTX に dno_gdn_pf_norm128 が無い → 従来のスキャンへ");
+                return None;
+            }
+            log_kernel_attr(lib, scan64, "dno_gdn_pf_scan64");
+            log_kernel_attr(lib, norm, "dno_gdn_pf_norm128");
+            Some(GdnPf2Kernels {
+                module,
+                scan64,
+                norm,
+            })
+        }
+    })
+    .as_ref()
+}
+
+/// `DENNO_PF_SCAN_FAST` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+///
+/// task 189: **既定 on**。lab t187c で scan_pf 2,853 -> 1,295 ms (md5 SAME)、
+/// wall -3.2% を確認済み (task 186 では目標未達だったため off のままだった)。
+/// `DENNO_PF_SCAN_FAST=0` で従来の `gdn_pf` スキャンに戻る。
+pub(crate) fn gdn_pf2_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => true,
+        Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+#[cfg(test)]
+static PF2_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用にゲートを固定する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_gdn_pf2_for_test(v: Option<bool>) {
+    PF2_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// v2 スキャンを使うか (既定 on。`DENNO_PF_SCAN_FAST=0` で off)。
+pub(crate) fn gdn_pf2_on() -> bool {
+    #[cfg(test)]
+    {
+        match PF2_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| gdn_pf2_from_value(std::env::var("DENNO_PF_SCAN_FAST").ok().as_deref()))
+}
+
+/// v2 スキャンが受ける形か (純関数。カーネルの前提と同じ)。
+pub(crate) fn gdn_pf2_ok(
+    nt: usize,
+    nk: usize,
+    nv: usize,
+    dk: usize,
+    dv: usize,
+    d_conv: usize,
+    conv_dim: usize,
+) -> bool {
+    nt >= 1
+        && nk >= 1
+        && nv >= 1
+        && dk == GDN_PF_DK
+        && dv == GDN_PF_DK
+        && d_conv == 4
+        && conv_dim == 2 * nk * dk + nv * dv
+}
+
+/// task 186: v2 スキャンを撃つ (scan64 → norm128 の 2 起動)。引数の並びは
+/// カーネルの宣言順。`o_out` と `y_out` は同じバッファでよい (norm は in-place)。
+#[allow(clippy::too_many_arguments)]
+fn gdn_pf2_launch(
+    ctx: &CudaCtx,
+    fns: &GdnPf2Kernels,
+    qkv: CUdeviceptr,
+    z: CUdeviceptr,
+    beta: CUdeviceptr,
+    alpha: CUdeviceptr,
+    conv_st_in: CUdeviceptr,
+    ssm_in: CUdeviceptr,
+    wconv: CUdeviceptr,
+    wa: CUdeviceptr,
+    wdt: CUdeviceptr,
+    wnorm: CUdeviceptr,
+    y_out: CUdeviceptr,
+    conv_st_out: CUdeviceptr,
+    ssm_out: CUdeviceptr,
+    n: usize,
+    nk: usize,
+    nv: usize,
+    conv_dim: usize,
+    eps: f32,
+    q_scale: f32,
+) -> Result<()> {
+    {
+        let (mut pq, mut pb, mut pa) = (qkv, beta, alpha);
+        let (mut pci, mut psi) = (conv_st_in, ssm_in);
+        let (mut pwc, mut pwa, mut pwd) = (wconv, wa, wdt);
+        let (mut py, mut pco, mut pso) = (y_out, conv_st_out, ssm_out);
+        let (mut ni, mut nki, mut nvi) = (n as c_int, nk as c_int, nv as c_int);
+        let (mut cdi, mut epsi, mut qsi) = (conv_dim as c_int, eps, q_scale);
+        let mut args = [
+            &mut pq as *mut _ as *mut c_void,
+            &mut pb as *mut _ as *mut c_void,
+            &mut pa as *mut _ as *mut c_void,
+            &mut pci as *mut _ as *mut c_void,
+            &mut psi as *mut _ as *mut c_void,
+            &mut pwc as *mut _ as *mut c_void,
+            &mut pwa as *mut _ as *mut c_void,
+            &mut pwd as *mut _ as *mut c_void,
+            &mut py as *mut _ as *mut c_void,
+            &mut pco as *mut _ as *mut c_void,
+            &mut pso as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut nki as *mut _ as *mut c_void,
+            &mut nvi as *mut _ as *mut c_void,
+            &mut cdi as *mut _ as *mut c_void,
+            &mut epsi as *mut _ as *mut c_void,
+            &mut qsi as *mut _ as *mut c_void,
+        ];
+        // 1 ヘッドを 2 ブロックが分担する (64 列ずつ)。
+        unsafe {
+            ctx.launch_async(
+                fns.scan64,
+                (nv as u32, 2, 1),
+                (GDN_PF2_THREADS as u32, 1, 1),
+                0,
+                &mut args,
+            )?;
+        }
+    }
+    {
+        let (mut py, mut pz, mut pwn) = (y_out, z, wnorm);
+        let (mut ni, mut nvi) = (n as c_int, nv as c_int);
+        let mut epsi = eps;
+        let mut args = [
+            &mut py as *mut _ as *mut c_void,
+            &mut pz as *mut _ as *mut c_void,
+            &mut pwn as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut nvi as *mut _ as *mut c_void,
+            &mut epsi as *mut _ as *mut c_void,
+        ];
+        let groups = n.saturating_mul(nv);
+        let per_block = GDN_PF2_NORM_THREADS / 4;
+        let grid = (groups.div_ceil(per_block)) as u32;
+        unsafe {
+            ctx.launch_async(
+                fns.norm,
+                (grid, 1, 1),
+                (GDN_PF2_NORM_THREADS as u32, 1, 1),
+                0,
+                &mut args,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// task 186: ssm の beta/alpha 射影 (F32 重み) をデバイスで回す
+// (`DENNO_PF_SSM_GEMM_GPU`、既定 off)
+// ---------------------------------------------------------------------------
+//
+// lab t183a の 14k prefill で `beta_pf` は 712 ms (1008 呼び出し = 0.71 ms/回)。
+// CPU の `gemv_batch_split` は 0.25 GFLOP/回 を 16 スレッドで回しており、
+// 実効 0.36 TFLOP/s。同じ層の隣の qkv GEMM は 74.8 TFLOP/s なので 200 倍の差。
+// 入力 (x) は連鎖が既にデバイスへ上げており、出力 (beta/alpha) も連鎖がデバイスで
+// 使うので、**ホストを経由せずに** `dno_gemm_f32_mt` で作れる (転送 0)。
+// 丸めは FMA + タイル順なので CPU の mul+add 逐次とは一致しない (丸めだけの差)。
+
+/// task 186: beta/alpha 射影をデバイスで回すための指定 (連結済みの F32 重み)。
+#[derive(Clone)]
+pub struct PfBetaAlpha<'a> {
+    /// 連結済みの重み (`k = n_embd`, `n = beta 行 + alpha 行`)。
+    pub w: PfChainW<'a>,
+    /// beta の行範囲。
+    pub beta_rows: std::ops::Range<usize>,
+    /// alpha の行範囲。
+    pub alpha_rows: std::ops::Range<usize>,
+}
+
+/// `DENNO_PF_SSM_GEMM_GPU` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn pf_ssm_gemm_gpu_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+#[cfg(test)]
+static SSM_GEMM_GPU_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// テスト用にゲートを固定する (`None` で env に戻す)。
+#[cfg(test)]
+pub(crate) fn set_pf_ssm_gemm_gpu_for_test(v: Option<bool>) {
+    SSM_GEMM_GPU_FORCE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// beta/alpha をデバイスで回すか (既定 off。lab の結果で決める)。
+pub(crate) fn pf_ssm_gemm_gpu_on() -> bool {
+    #[cfg(test)]
+    {
+        match SSM_GEMM_GPU_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        pf_ssm_gemm_gpu_from_value(std::env::var("DENNO_PF_SSM_GEMM_GPU").ok().as_deref())
+    })
+}
+
+/// F32 重みをデバイスへ常駐させてポインタを返す (`PF_F32_W` の表を使う)。
+/// **current context を張った後に呼ぶこと**。形が合わなければ `None`。
+pub fn pf_f32_weight_dev(uid: u64, blocks: &[u8], k: usize, n: usize) -> Option<CUdeviceptr> {
+    let want = k.checked_mul(n)?.checked_mul(4)?;
+    if k == 0 || n == 0 || blocks.len() != want {
+        return None;
+    }
+    let reg = PF_F32_W.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut m = match reg.lock() {
+        Ok(g) => g,
+        Err(_) => return None,
+    };
+    if let Some(b) = m.get(&uid) {
+        return Some(b.ptr());
+    }
+    let b = DevBuffer::from_slice_tagged(blocks, crate::mem_audit::TAG_OTHER).ok()?;
+    let p = b.ptr();
+    m.insert(uid, b);
+    Some(p)
+}
+
+#[cfg(test)]
+mod ssm_gemm_gpu_tests {
+    use super::*;
+
+    #[test]
+    fn ssm_gemm_gpu_gate_truth_table() {
+        assert!(!pf_ssm_gemm_gpu_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!pf_ssm_gemm_gpu_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(pf_ssm_gemm_gpu_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+
+    #[test]
+    fn ssm_gemm_gpu_force_switch() {
+        set_pf_ssm_gemm_gpu_for_test(Some(true));
+        assert!(pf_ssm_gemm_gpu_on());
+        set_pf_ssm_gemm_gpu_for_test(Some(false));
+        assert!(!pf_ssm_gemm_gpu_on());
+        set_pf_ssm_gemm_gpu_for_test(None);
+        assert!(!pf_ssm_gemm_gpu_on(), "env 未設定の既定は off");
+    }
+}
+
+#[cfg(test)]
+mod gdn_pf2_tests {
+    use super::*;
+
+    /// ゲートの真理値表 (既定 off。lab の結果で on にする)。
+    #[test]
+    fn gdn_pf2_gate_truth_table() {
+        assert!(gdn_pf2_from_value(None), "未設定は既定 on (task 189)");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!gdn_pf2_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(gdn_pf2_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+
+    /// 形のゲートは scan128 と同じ前提 (dk=dv=128 / d_conv=4 / conv_dim 一致)。
+    #[test]
+    fn gdn_pf2_ok_checks_shape() {
+        let conv_dim = 2 * 16 * 128 + 48 * 128;
+        assert!(gdn_pf2_ok(1, 16, 48, 128, 128, 4, conv_dim));
+        assert!(gdn_pf2_ok(512, 16, 48, 128, 128, 4, conv_dim));
+        assert!(!gdn_pf2_ok(512, 16, 48, 64, 64, 4, 2 * 16 * 64 + 48 * 64));
+        assert!(!gdn_pf2_ok(512, 16, 48, 128, 128, 3, conv_dim));
+        assert!(!gdn_pf2_ok(512, 16, 48, 128, 128, 4, conv_dim + 1));
+        assert!(!gdn_pf2_ok(0, 16, 48, 128, 128, 4, conv_dim));
+        assert!(!gdn_pf2_ok(512, 0, 48, 128, 128, 4, conv_dim));
+    }
+
+    /// 強制スイッチ (テスト用) が効く。
+    #[test]
+    fn gdn_pf2_force_switch() {
+        set_gdn_pf2_for_test(Some(true));
+        assert!(gdn_pf2_on());
+        set_gdn_pf2_for_test(Some(false));
+        assert!(!gdn_pf2_on());
+        set_gdn_pf2_for_test(None);
+        // task 189: 既定を on に反転した (lab t187c: scan_pf 2,853 -> 1,295 ms)。
+        assert!(gdn_pf2_on(), "env 未設定の既定は on");
     }
 }
 
@@ -35746,6 +36866,9 @@ pub fn gdn_pf_chain(
     flat: &[f32],
     beta: &[f32],
     alpha: &[f32],
+    // task 186: Some のとき beta/alpha は **デバイスで作る** (`DENNO_PF_SSM_GEMM_GPU`)。
+    // そのとき `beta` / `alpha` は空でよい (ホスト側の計算を省く)。
+    beta_alpha: Option<PfBetaAlpha<'_>>,
     conv_st: &mut [f32],
     ssm_st: &mut [f32],
     wconv: &[f32],
@@ -35777,9 +36900,10 @@ pub fn gdn_pf_chain(
     if !gpu_gemm_enabled() {
         return Ok(false);
     }
+    let ba_dev_req = beta_alpha.is_some() && pf_ssm_gemm_gpu_on();
     if flat.len() != nt * e
-        || beta.len() != nt * nv
-        || alpha.len() != nt * nv
+        || (ba_dev_req && (!beta.is_empty() || !alpha.is_empty()))
+        || (!ba_dev_req && (beta.len() != nt * nv || alpha.len() != nt * nv))
         || out.len() != nt * e
         || conv_st.len() != conv_dim * cs
         || ssm_st.len() != nv * dk * dv
@@ -35838,13 +36962,44 @@ pub fn gdn_pf_chain(
         s.wn.as_ref().unwrap().copy_from(wnorm)?;
         Ok(s.chain_ptrs())
     })?;
+    // task 186: beta/alpha をデバイスで作る場合の重み常駐 (失敗は None → ホスト経路)。
+    let ba_dev = if ba_dev_req {
+        beta_alpha.and_then(|ba| {
+            let w = ba.w;
+            let ok = w.ty == crate::kquant::GgmlType::F32
+                && w.k == e
+                && ba.beta_rows.len() == nv
+                && ba.alpha_rows.len() == nv
+                && ba.beta_rows.end <= w.n
+                && ba.alpha_rows.end <= w.n;
+            if !ok {
+                return None;
+            }
+            let p = pf_f32_weight_dev(w.uid, w.blocks, w.k, w.n)?;
+            let rb = w.k * std::mem::size_of::<f32>();
+            Some((
+                p + (ba.beta_rows.start * rb) as CUdeviceptr,
+                p + (ba.alpha_rows.start * rb) as CUdeviceptr,
+            ))
+        })
+    } else {
+        None
+    };
+    // ホスト側の beta/alpha を作らせたのにデバイス版が使えない場合は、ここで
+    // 連鎖を諦める (状態は未着手。呼び出し側が従来経路で作り直す)。空のスライスで
+    // H2D すると古い中身のままスキャンに入ってしまうので、必ず落とす。
+    if ba_dev_req && ba_dev.is_none() {
+        return Ok(false);
+    }
     gdn_pf_kprof::begin(gdn_pf_kprof::X_H2D);
     let ptr = GDN_PF_CHAIN_BUF.with(|cell| -> Result<[CUdeviceptr; 7]> {
         let mut b = cell.borrow_mut();
         b.ensure(nt, e, conv_dim, vd, nv)?;
         b.x.as_ref().unwrap().copy_from(flat)?;
-        b.beta.as_ref().unwrap().copy_from(beta)?;
-        b.alpha.as_ref().unwrap().copy_from(alpha)?;
+        if ba_dev.is_none() {
+            b.beta.as_ref().unwrap().copy_from(beta)?;
+            b.alpha.as_ref().unwrap().copy_from(alpha)?;
+        }
         Ok([
             b.buf(0),
             b.buf(1),
@@ -35916,6 +37071,33 @@ pub fn gdn_pf_chain(
             }
             t0 += m;
         }
+        // task 186: beta/alpha (F32) を同じ x から作る。入力も出力もデバイスに
+        // あるので転送は 0。無い/形が違うときは連鎖ごと従来経路へ (状態は未着手)。
+        if let Some((wbeta, walpha)) = ba_dev {
+            let Some(f32g) = gemm_f32_mt_fn(ctx) else {
+                return Ok(false);
+            };
+            for (w, o) in [(wbeta, pb), (walpha, pa)] {
+                let (mut pw, mut pxx, mut poo) = (w, px, o);
+                let (mut nt_c, mut k_c, mut n_c) = (nt as c_int, e as c_int, nv as c_int);
+                let mut args = [
+                    &mut pw as *mut _ as *mut c_void,
+                    &mut pxx as *mut _ as *mut c_void,
+                    &mut poo as *mut _ as *mut c_void,
+                    &mut nt_c as *mut _ as *mut c_void,
+                    &mut k_c as *mut _ as *mut c_void,
+                    &mut n_c as *mut _ as *mut c_void,
+                ];
+                let grid = (
+                    ((nv + GEMM_MT_ROWS - 1) / GEMM_MT_ROWS) as u32,
+                    ((nt + GEMM_MT_TOKS - 1) / GEMM_MT_TOKS) as u32,
+                    1,
+                );
+                unsafe {
+                    ctx.launch_async(f32g, grid, (GEMM_MT_ROWS as u32, 16, 1), 0, &mut args)?;
+                }
+            }
+        }
         // 段ごとの壁時計を意味のある値にするため、ここで 1 回だけ待つ
         // (1 チャンク = 1 段 40 ms 級なので、同期の固定費は無視できる)。
         ctx.sync()?;
@@ -35928,7 +37110,15 @@ pub fn gdn_pf_chain(
     // task 173: レジスタ常駐 + 4 レーンのスキャンが使えるならそちらで回す
     // (`DENNO_GDN_PF_FAST`)。形が合わない・PTX が無いときは従来カーネルへ
     // fail closed (この時点でモデルの状態は 1 つも進んでいない)。
-    let pf_scan_fast = if gdn_pf_fast_on()
+    // task 186: v2 (ヘッドあたり 2 ブロック + RMS norm の分離)。既定 off。
+    // 形が合わない・PTX が無いときは v1 (従来のレジスタ常駐版) → CPU へ fail closed。
+    let pf_scan_fast2 = if gdn_pf2_on() && gdn_pf2_ok(nt, nk, nv, dk, dv, d_conv, conv_dim) {
+        gdn_pf2_kernels()
+    } else {
+        None
+    };
+    let pf_scan_fast = if pf_scan_fast2.is_none()
+        && gdn_pf_fast_on()
         && gdn_pf_fast_eligible(nt, nk, nv, dk, dv, d_conv, conv_dim)
     {
         gdn_pf_kernels()
@@ -35938,7 +37128,14 @@ pub fn gdn_pf_chain(
     {
         let _s = crate::model::q4ledger::sub(crate::model::q4ledger::SUB_PF_SCAN);
         let t_ph = Instant::now();
-        if let Some(fns) = pf_scan_fast {
+        if let Some(fns) = pf_scan_fast2 {
+            gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
+            gdn_pf2_launch(
+                &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],
+                ptrs[3], py, ptrs[4], ptrs[5], nt, nk, nv, conv_dim, eps, q_scale,
+            )?;
+            gdn_pf_kprof::end(gdn_pf_kprof::SCAN);
+        } else if let Some(fns) = pf_scan_fast {
             gdn_pf_kprof::begin(gdn_pf_kprof::SCAN);
             gdn_pf_scan128_launch(
                 &ctx, fns, pqkv, pz, pb, pa, pst_conv, pst_ssm, ptrs[0], ptrs[1], ptrs[2],

@@ -5114,6 +5114,59 @@ fn ple_inject_batch(
     Ok(())
 }
 
+/// task 189: PLE 注入の per-token 作業域 (grow-only)。
+///
+/// 実形は hc_dim = 10,240 (40 KB) で、`ple_inject_from_kv` は 1 トークンあたり
+/// key_n / query_n / gated / その clone / conv / 中間 rmsnorm で約 280 KB を
+/// 確保していた。14,336 トークン (14k プロンプト) では 4 GB ぶんの確保と
+/// 初回タッチのフォールトになり、実測で ple 1,541 ms の大半がこれだった。
+#[derive(Default)]
+struct PleInjScratch {
+    key_n: Vec<f32>,
+    query_n: Vec<f32>,
+    gated: Vec<f32>,
+    nx: Vec<f32>,
+    conv: Vec<f32>,
+}
+
+impl PleInjScratch {
+    fn zeros(hc_dim: usize) -> Self {
+        Self {
+            key_n: vec![0.0; hc_dim],
+            query_n: vec![0.0; hc_dim],
+            gated: vec![0.0; hc_dim],
+            nx: vec![0.0; hc_dim],
+            conv: vec![0.0; hc_dim],
+        }
+    }
+
+    /// スレッドローカルから取り出す (足りなければ伸ばす)。中身は毎回全部書く。
+    fn take(hc_dim: usize) -> Self {
+        let mut s = PLE_INJ_SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        for v in [
+            &mut s.key_n,
+            &mut s.query_n,
+            &mut s.gated,
+            &mut s.nx,
+            &mut s.conv,
+        ] {
+            if v.len() < hc_dim {
+                v.resize(hc_dim, 0.0);
+            }
+        }
+        s
+    }
+
+    fn put(self) {
+        PLE_INJ_SCRATCH.with(|c| *c.borrow_mut() = self);
+    }
+}
+
+thread_local! {
+    static PLE_INJ_SCRATCH: std::cell::RefCell<PleInjScratch> =
+        std::cell::RefCell::new(PleInjScratch::default());
+}
+
 /// task 154: 射影済みの key / value から PLE の残り (RMS → gating → conv → 加算)。
 ///
 /// [`ple_inject`] の GEMV をチャンクでまとめるために切り出した。値は
@@ -5127,7 +5180,107 @@ fn ple_inject_from_kv(
     res: &HyperStreams,
     hp: &HyperParams,
     hist_buf: &mut Vec<f32>,
+    contrib_rms: Option<&mut f32>,
+) -> Result<HyperStreams> {
+    let hc_dim = p.hc_dim();
+    // task 189: `DENNO_PF_PLE_PAR` のときだけ作業域を使い回す。
+    // どちらの経路も同じ関数 (`ple_inject_into`) を通るので値は同一。
+    if crate::ple::pf_ple_par_on() {
+        let mut sc = PleInjScratch::take(hc_dim);
+        let out = ple_inject_into(p, pw, &key, &value, res, hp, hist_buf, contrib_rms, &mut sc);
+        sc.put();
+        out
+    } else {
+        let mut sc = PleInjScratch::zeros(hc_dim);
+        ple_inject_into(p, pw, &key, &value, res, hp, hist_buf, contrib_rms, &mut sc)
+    }
+}
+
+/// PLE の手順 5: depthwise 因果 conv → silu。
+///
+/// `out[c] = silu( Σ_k w[c*kern + k] * x[c, t - (kern-1-k)*dil] )`。
+/// 参照実装は履歴を `padded = [hist + n_tokens]` として前置きするので、`back`
+/// トークン前の値は `hist_buf` の `(hist - back)` 番目のスロット。
+///
+/// task 189: k を外側・c を内側に置く。各 c の加算は k 昇順のままで c は独立
+/// なので値はビット一致する。旧ループは内側に `back == 0` の分岐があり、c 方向
+/// にベクトル化できなかった (実形 kern 4 x hc_dim 10,240 x 14,336 トークン
+/// = 5.9 億回が ple 1,152 ms の主因)。
+fn ple_conv_silu(
+    out: &mut [f32],
+    x: &[f32],
+    hist_buf: &[f32],
+    w: &[f32],
+    kern: usize,
+    dil: usize,
+    hc_dim: usize,
+) {
+    assert_eq!(out.len(), hc_dim, "conv の出力長は hc_dim");
+    assert_eq!(x.len(), hc_dim, "conv の入力長は hc_dim");
+    assert_eq!(w.len(), kern * hc_dim, "conv の重み長は kern*hc_dim");
+    let hist = (kern - 1) * dil;
+    assert_eq!(hist_buf.len(), hist * hc_dim, "conv の履歴長は hist*hc_dim");
+    for v in out.iter_mut() {
+        *v = 0.0f32;
+    }
+    for k in 0..kern {
+        let back = (kern - 1 - k) * dil;
+        // back == 0 の項だけは履歴ではなく現在の x。
+        let src: &[f32] = if back == 0 {
+            x
+        } else {
+            &hist_buf[(hist - back) * hc_dim..][..hc_dim]
+        };
+        for c in 0..hc_dim {
+            out[c] += w[c * kern + k] * src[c];
+        }
+    }
+    for v in out.iter_mut() {
+        *v = hyper::silu(*v);
+    }
+}
+
+/// task 189: [`ple_conv_silu`] の参照実装 (旧ループ: c 外側・k 内側・分岐あり)。
+/// テストでビット一致を固定するためだけに置く。
+#[cfg(test)]
+fn ple_conv_silu_ref(
+    x: &[f32],
+    hist_buf: &[f32],
+    w: &[f32],
+    kern: usize,
+    dil: usize,
+    hc_dim: usize,
+) -> Vec<f32> {
+    let hist = (kern - 1) * dil;
+    let mut v = vec![0.0f32; hc_dim];
+    for c in 0..hc_dim {
+        let mut acc = 0.0f32;
+        for k in 0..kern {
+            let back = (kern - 1 - k) * dil;
+            let s = if back == 0 {
+                x[c]
+            } else {
+                hist_buf[(hist - back) * hc_dim + c]
+            };
+            acc += w[c * kern + k] * s;
+        }
+        v[c] = hyper::silu(acc);
+    }
+    v
+}
+
+/// [`ple_inject_from_kv`] の本体。作業域は呼び出し側が持つ。
+#[allow(clippy::too_many_arguments)]
+fn ple_inject_into(
+    p: &Qwen4ExpParams,
+    pw: &PleW,
+    key: &[f32],
+    value: &[f32],
+    res: &HyperStreams,
+    hp: &HyperParams,
+    hist_buf: &mut Vec<f32>,
     mut contrib_rms: Option<&mut f32>,
+    sc: &mut PleInjScratch,
 ) -> Result<HyperStreams> {
     let e = p.n_embd;
     let hc = p.n_hc;
@@ -5146,17 +5299,18 @@ fn ple_inject_from_kv(
     }
 
     // 2. grouped RMS (key は [hc][n_embd] と見る)
-    let key_streams = HyperStreams {
-        data: key,
-        hc,
-        n_embd: e,
-    };
-    let key_n = hyper::grouped_rms_norm(&key_streams, &pw.norm_key, hp);
-    let query_n = hyper::grouped_rms_norm(res, &pw.norm_query, hp);
+    // task 189: 中間の rmsnorm もスレッドの作業域へ直接書く (確保しない)。
+    hyper::grouped_rms_norm_into(key, &pw.norm_key, hp, &mut sc.key_n[..hc_dim]);
+    hyper::grouped_rms_norm_into(&res.data, &pw.norm_query, hp, &mut sc.query_n[..hc_dim]);
+    let key_n = &sc.key_n[..hc_dim];
+    let query_n = &sc.query_n[..hc_dim];
 
     // 3. ストリームごとの内積 → 符号付き平方根 → sigmoid
     let inv_sqrt_e = 1.0f32 / (e as f32).sqrt();
-    let mut gate = Vec::with_capacity(hc);
+    let mut gate = [0.0f32; 8];
+    if hc > gate.len() {
+        return Err(one(format!("ple_inject: hc {hc} が上限を超えた")));
+    }
     for s in 0..hc {
         let mut acc = 0.0f32;
         for i in 0..e {
@@ -5172,24 +5326,20 @@ fn ple_inject_from_kv(
         } else {
             0.0f32
         };
-        gate.push(hyper::sigmoid(sign * mag));
+        gate[s] = hyper::sigmoid(sign * mag);
     }
 
     // 4. gated[s][d] = value[d] * gate[s]
-    let mut gated = vec![0.0f32; hc_dim];
-    for (s, &g) in gate.iter().enumerate() {
+    for (s, &g) in gate[..hc].iter().enumerate() {
         for d in 0..e {
-            gated[s * e + d] = value[d] * g;
+            sc.gated[s * e + d] = value[d] * g;
         }
     }
 
     // 5. grouped RMS → depthwise 因果 conv → silu
-    let gated_streams = HyperStreams {
-        data: gated.clone(),
-        hc,
-        n_embd: e,
-    };
-    let x = hyper::grouped_rms_norm(&gated_streams, &pw.norm_conv, hp);
+    let gated = &sc.gated[..hc_dim];
+    hyper::grouped_rms_norm_into(gated, &pw.norm_conv, hp, &mut sc.nx[..hc_dim]);
+    let x = &sc.nx[..hc_dim];
     let kern = pw.kern;
     if pw.conv1d.len() != kern * hc_dim {
         return Err(one(format!(
@@ -5205,31 +5355,24 @@ fn ple_inject_from_kv(
             hist_buf.len()
         )));
     }
-    let mut conv = vec![0.0f32; hc_dim];
-    for c in 0..hc_dim {
-        // out[c] = Σ_k w[k][c] * x[c, t - (kern-1-k)*dil]
-        // GGUF の ne は [kern, hc_dim] なので、列 c の k 番目は conv1d[c*kern + k]。
-        // 参照実装は履歴を `padded = [hist + n_tokens]` として前置きするので、
-        // `back` トークン前の値は hist_buf の (hist - back) 番目のスロット。
-        let mut acc = 0.0f32;
-        for k in 0..kern {
-            let back = (kern - 1 - k) * dil;
-            let v = if back == 0 {
-                x[c]
-            } else {
-                hist_buf[(hist - back) * hc_dim + c]
-            };
-            acc += pw.conv1d[c * kern + k] * v;
-        }
-        conv[c] = hyper::silu(acc);
-    }
+    ple_conv_silu(
+        &mut sc.conv[..hc_dim],
+        x,
+        hist_buf,
+        &pw.conv1d,
+        kern,
+        dil,
+        hc_dim,
+    );
     // 履歴を 1 トークン進める (古い側を捨て、末尾に今の x を入れる)。
     if hist > 0 {
         hist_buf.copy_within(hc_dim.., 0);
-        hist_buf[(hist - 1) * hc_dim..].copy_from_slice(&x);
+        hist_buf[(hist - 1) * hc_dim..].copy_from_slice(x);
     }
 
     // 6. res + (gated + conv)
+    let conv = &sc.conv[..hc_dim];
+    let gated = &sc.gated[..hc_dim];
     let mut out = Vec::with_capacity(hc_dim);
     let want_rms = contrib_rms.is_some();
     let mut sq = 0.0f32;
@@ -10861,6 +11004,25 @@ pub(crate) fn pf_ple_f32_gpu_on() -> bool {
     *ON.get_or_init(|| pf182_from_value(std::env::var("DENNO_PF_PLE_F32_GPU").ok().as_deref()))
 }
 
+/// task 189: `DENNO_PF_ROUTER_SM` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+pub(crate) fn pf_router_sm_from_value(v: Option<&str>) -> bool {
+    match v {
+        None => false,
+        Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
+    }
+}
+
+/// task 189: router の softmax と top-k を「1 行 1 rayon タスク」ではなく
+/// 「トークンをワーカー数で割ったブロック」で回す (`DENNO_PF_ROUTER_SM`、既定 off)。
+///
+/// `par_chunks_mut(ne)` は 1 行 (ne=512 要素) ごとに 1 タスクを作るので、
+/// 1 チャンク 512 トークン × 48 層 × 28 チャンク = 68.8 万タスクになる。
+/// 行は独立なので割り方だけを変えれば値はビット一致する。
+pub(crate) fn pf_router_sm_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_router_sm_from_value(std::env::var("DENNO_PF_ROUTER_SM").ok().as_deref()))
+}
+
 /// task 182: router を GPU に載せる最小トークン数 (これ未満は CPU バッチ)。
 ///
 /// 19 トークンの next turn prefill はここで CPU のまま (= 従来とビット一致) に
@@ -12459,6 +12621,180 @@ fn moe_ffn_quant_batch_tapped(
     )
 }
 
+/// task 189: router のソフトマックスの行割り。
+///
+/// `Some(n)` は「トークンを n ブロックに割って 1 タスク 1 ブロック」、
+/// `None` は従来の「1 行 1 タスク」。行は独立なので値はどちらでも同じ。
+fn router_sm_block() -> Option<usize> {
+    #[cfg(feature = "par")]
+    {
+        if pf_router_sm_on() {
+            return Some(rayon::current_num_threads().max(1));
+        }
+    }
+    None
+}
+
+/// top-k の再正規化 (選択 index 昇順に逐次加算した和で割る)。
+fn router_renorm(pr: &[f32], sel: &[usize], w: &mut [f32]) {
+    let mut sum = 0.0f32;
+    for &i in sel {
+        sum += pr[i];
+    }
+    for (j, &i) in sel.iter().enumerate() {
+        w[j] = pr[i] / sum;
+    }
+}
+
+/// task 189: 行ごとの softmax (block が `Some` ならトークンをブロックで割る)。
+fn router_softmax_rows(probs: &mut [f32], ne: usize, block: Option<usize>) {
+    let nt = probs.len() / ne.max(1);
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        match block {
+            Some(n) => {
+                let per = nt.div_ceil(n.max(1)).max(1);
+                probs.par_chunks_mut(per * ne).for_each(|c| {
+                    for row in c.chunks_mut(ne) {
+                        softmax(row);
+                    }
+                });
+            }
+            None => probs.par_chunks_mut(ne).for_each(softmax),
+        }
+        return;
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        let _ = block;
+        for t in 0..nt {
+            softmax(&mut probs[t * ne..(t + 1) * ne]);
+        }
+    }
+}
+
+/// task 189: 行ごとの top-k + 再正規化 (block が `Some` ならトークンを割る)。
+#[allow(clippy::too_many_arguments)]
+fn router_topk_rows(
+    probs: &[f32],
+    ne: usize,
+    k: usize,
+    sels: &mut [usize],
+    weights: &mut [f32],
+    block: Option<usize>,
+) {
+    let nt = probs.len() / ne.max(1);
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        match block {
+            Some(n) => {
+                let per = nt.div_ceil(n.max(1)).max(1);
+                sels.par_chunks_mut(per * k)
+                    .zip(weights.par_chunks_mut(per * k))
+                    .enumerate()
+                    .for_each_init(Vec::<u32>::new, |buf, (ci, (s, w))| {
+                        let base = ci * per;
+                        for j in 0..s.len() / k {
+                            let t = base + j;
+                            let pr = &probs[t * ne..(t + 1) * ne];
+                            let (sj, wj) =
+                                (&mut s[j * k..(j + 1) * k], &mut w[j * k..(j + 1) * k]);
+                            select_topk_into(pr, k, buf, sj);
+                            router_renorm(pr, sj, wj);
+                        }
+                    });
+            }
+            None => {
+                sels.par_chunks_mut(k)
+                    .zip(weights.par_chunks_mut(k))
+                    .enumerate()
+                    .for_each_init(Vec::<u32>::new, |buf, (t, (s, w))| {
+                        let pr = &probs[t * ne..(t + 1) * ne];
+                        select_topk_into(pr, k, buf, s);
+                        router_renorm(pr, s, w);
+                    });
+            }
+        }
+        return;
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        let _ = block;
+        let mut buf: Vec<u32> = Vec::new();
+        for t in 0..nt {
+            let pr = &probs[t * ne..(t + 1) * ne];
+            select_topk_into(pr, k, &mut buf, &mut sels[t * k..(t + 1) * k]);
+            router_renorm(pr, &sels[t * k..(t + 1) * k], &mut weights[t * k..(t + 1) * k]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod router_sm_tests {
+    use super::*;
+
+    /// task 189: 行の割り方 (1 行 1 タスク / n ブロック) を変えても
+    /// softmax・top-k・再正規化の値がビット一致すること。
+    ///
+    /// 端数が出る形 (nt=7, ne=8, k=3, ブロック数 3) にして、最後の切れ端と
+    /// `base` の計算も通す。同値の選択規則 (小さい index が先) も固定する。
+    #[test]
+    fn blocked_rows_match_per_row() {
+        let (nt, ne, k) = (7usize, 8usize, 3usize);
+        let xs: Vec<f32> = (0..nt * ne)
+            .map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5)
+            .collect();
+
+        let mut a = xs.clone();
+        router_softmax_rows(&mut a, ne, None);
+        let mut b = xs.clone();
+        router_softmax_rows(&mut b, ne, Some(3));
+        for i in 0..a.len() {
+            assert_eq!(a[i].to_bits(), b[i].to_bits(), "softmax 要素 {i}");
+        }
+        // 各行の和は 1 (softmax が実際に効いている)。
+        for t in 0..nt {
+            let s: f32 = a[t * ne..(t + 1) * ne].iter().sum();
+            assert!((s - 1.0).abs() < 1e-5, "行 {t} の和 {s}");
+        }
+
+        let mut s1 = vec![0usize; nt * k];
+        let mut w1 = vec![0f32; nt * k];
+        router_topk_rows(&a, ne, k, &mut s1, &mut w1, None);
+        let mut s2 = vec![0usize; nt * k];
+        let mut w2 = vec![0f32; nt * k];
+        router_topk_rows(&a, ne, k, &mut s2, &mut w2, Some(3));
+        assert_eq!(s1, s2, "top-k の選択が割り方で変わった");
+        for i in 0..w1.len() {
+            assert_eq!(w1[i].to_bits(), w2[i].to_bits(), "重み 要素 {i}");
+        }
+
+        // 同値だらけの行: 小さい index から k 個 (task 182 の規則)。
+        let flat = vec![1.0f32; ne];
+        let mut s3 = vec![0usize; k];
+        let mut w3 = vec![0f32; k];
+        router_topk_rows(&flat, ne, k, &mut s3, &mut w3, None);
+        assert_eq!(s3, vec![0, 1, 2], "同値のとき小さい index が先でない");
+        for v in w3 {
+            assert!((v - 1.0 / 3.0).abs() < 1e-6, "再正規化の重み {v}");
+        }
+    }
+
+    /// task 189: `DENNO_PF_ROUTER_SM` は明示的な真値だけ on (既定 off)。
+    #[test]
+    fn router_sm_gate_truth_table() {
+        assert!(!pf_router_sm_from_value(None), "未設定は既定 off");
+        for v in ["0", "off", "false", "no", "", " off "] {
+            assert!(!pf_router_sm_from_value(Some(v)), "{v:?} が on になった");
+        }
+        for v in ["1", "on", "true", "yes", "2"] {
+            assert!(pf_router_sm_from_value(Some(v)), "{v:?} が off のまま");
+        }
+    }
+}
+
 /// task 162: prefill の終端でステージング領域を必ず返すためのガード。
 ///
 /// decode のあいだステージング (既定 512 MiB) を抱えたままにすると、expert の
@@ -12588,15 +12924,9 @@ fn moe_ffn_quant_batch_full(
     // 2. トークンごとの softmax (行は独立なので並列化しても値は変わらない)
     // task 154: 台帳の副区間 (softmax + top-k)。
     let _sub_sm = q4ledger::sub(q4ledger::SUB_SOFTMAX);
-    #[cfg(feature = "par")]
-    {
-        use rayon::prelude::*;
-        probs.par_chunks_mut(ne).for_each(softmax);
-    }
-    #[cfg(not(feature = "par"))]
-    for t in 0..nt {
-        softmax(&mut probs[t * ne..(t + 1) * ne]);
-    }
+    // task 189: `DENNO_PF_ROUTER_SM` のときは行ごとのタスク生成をやめる。
+    let sm_block = router_sm_block();
+    router_softmax_rows(&mut probs, ne, sm_block);
 
     // 3. top-k (index 昇順) + 再正規化 (選択 index 昇順に逐次加算した和で割る)。
     //    P33: トークンごとの `Vec` を作らず、平らな配列へ直接書く (1 層あたり
@@ -12604,36 +12934,7 @@ fn moe_ffn_quant_batch_full(
     //    [`select_topk`] と同じ (同値は小さい index) なので値は変わらない。
     let mut sels: Vec<usize> = vec![0; nt * k];
     let mut weights: Vec<f32> = vec![0.0; nt * k];
-    let renorm = |pr: &[f32], sel: &[usize], w: &mut [f32]| {
-        let mut sum = 0.0f32;
-        for &i in sel {
-            sum += pr[i];
-        }
-        for (j, &i) in sel.iter().enumerate() {
-            w[j] = pr[i] / sum;
-        }
-    };
-    #[cfg(feature = "par")]
-    {
-        use rayon::prelude::*;
-        sels.par_chunks_mut(k)
-            .zip(weights.par_chunks_mut(k))
-            .enumerate()
-            .for_each_init(Vec::<u32>::new, |buf, (t, (s, w))| {
-                let pr = &probs[t * ne..(t + 1) * ne];
-                select_topk_into(pr, k, buf, s);
-                renorm(pr, s, w);
-            });
-    }
-    #[cfg(not(feature = "par"))]
-    {
-        let mut buf: Vec<u32> = Vec::new();
-        for t in 0..nt {
-            let pr = &probs[t * ne..(t + 1) * ne];
-            select_topk_into(pr, k, &mut buf, &mut sels[t * k..(t + 1) * k]);
-            renorm(pr, &sels[t * k..(t + 1) * k], &mut weights[t * k..(t + 1) * k]);
-        }
-    }
+    router_topk_rows(&probs, ne, k, &mut sels, &mut weights, sm_block);
     drop(_sub_sm);
     moe_sub_add(0, t_router.elapsed());
     // 区間を閉じる (experts の時間を router に二重計上しない)。
@@ -18291,30 +18592,71 @@ mod tests {
                     })
                     .collect()
             };
-            let mut a = mk(&base);
-            let mut b = mk(&base);
             let hist_len = (pw.kern - 1) * m.p.ple_ngram_size * hc_dim;
-            let mut hist_a: Vec<f32> = (0..hist_len)
+            let hist0: Vec<f32> = (0..hist_len)
                 .map(|i| 0.05 * (((i * 7) % 13) as f32 - 6.0))
                 .collect();
-            let mut hist_b = hist_a.clone();
+            let rows: Vec<&[f32]> = (0..nt).map(|t| &emb[t * emb_len..(t + 1) * emb_len]).collect();
+            // 基準: 1 トークンずつ (task 189 の作業域を使わない = 毎回確保する経路)。
+            crate::ple::set_pf_ple_par_for_test(Some(false));
+            let mut a = mk(&base);
+            let mut hist_a = hist0.clone();
             for t in 0..nt {
                 let pe = &emb[t * emb_len..(t + 1) * emb_len];
                 a[t] = ple_inject(&m.p, pw, pe, &a[t], &hp, &mut hist_a, None).expect("逐次");
             }
-            let rows: Vec<&[f32]> = (0..nt).map(|t| &emb[t * emb_len..(t + 1) * emb_len]).collect();
-            ple_inject_batch(&m.p, pw, &rows, &mut b, &hp, &mut hist_b, None).expect("バッチ");
-            for t in 0..nt {
-                let want: Vec<u32> = a[t].data.iter().map(|v| v.to_bits()).collect();
-                let got: Vec<u32> = b[t].data.iter().map(|v| v.to_bits()).collect();
-                assert_eq!(want, got, "トークン {t} の出力がビット不一致");
+            // task 189: バッチ経路を作業域の確保あり / 使い回し (冷・温) で回し、
+            // どれも逐次版とビット一致することを固定する。
+            for gate in [Some(false), Some(true), Some(true)] {
+                let mut b = mk(&base);
+                let mut hist_b = hist0.clone();
+                crate::ple::set_pf_ple_par_for_test(gate);
+                ple_inject_batch(&m.p, pw, &rows, &mut b, &hp, &mut hist_b, None)
+                    .expect("バッチ");
+                for t in 0..nt {
+                    let want: Vec<u32> = a[t].data.iter().map(|v| v.to_bits()).collect();
+                    let got: Vec<u32> = b[t].data.iter().map(|v| v.to_bits()).collect();
+                    assert_eq!(want, got, "gate={gate:?} トークン {t} の出力がビット不一致");
+                }
+                let want: Vec<u32> = hist_a.iter().map(|v| v.to_bits()).collect();
+                let got: Vec<u32> = hist_b.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(want, got, "gate={gate:?} の conv 履歴がビット不一致");
             }
-            let want: Vec<u32> = hist_a.iter().map(|v| v.to_bits()).collect();
-            let got: Vec<u32> = hist_b.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(want, got, "conv 履歴がビット不一致");
+            crate::ple::set_pf_ple_par_for_test(None);
         }
 
-        /// task 154: 常駐ゲートを on にしても、GPU / PTX / 形の前提が無ければ
+            /// task 189: conv のループ入れ替え (k 外側) が旧ループとビット一致すること。
+        #[test]
+        fn ple_conv_loop_interchange_is_bit_exact() {
+            let mut rnd = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = move || {
+                rnd = rnd
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((rnd >> 33) as f32) / (u32::MAX as f32) - 0.5
+            };
+            for &(kern, dil) in &[(4usize, 3usize), (4, 1), (2, 1), (3, 2), (5, 4), (1, 3)] {
+                let hc_dim = 37usize; // 端数 (8 の倍数でない) も通す
+                let hist = (kern - 1) * dil;
+                let x: Vec<f32> = (0..hc_dim).map(|_| next()).collect();
+                let hb: Vec<f32> = (0..hist * hc_dim).map(|_| next()).collect();
+                let w: Vec<f32> = (0..hc_dim * kern).map(|_| next()).collect();
+                let want = ple_conv_silu_ref(&x, &hb, &w, kern, dil, hc_dim);
+                let mut got = vec![0.0f32; hc_dim];
+                ple_conv_silu(&mut got, &x, &hb, &w, kern, dil, hc_dim);
+                for c in 0..hc_dim {
+                    assert_eq!(
+                        want[c].to_bits(),
+                        got[c].to_bits(),
+                        "kern={kern} dil={dil} c={c}: {} != {}",
+                        want[c],
+                        got[c]
+                    );
+                }
+            }
+        }
+
+    /// task 154: 常駐ゲートを on にしても、GPU / PTX / 形の前提が無ければ
         /// 常駐経路は **層を 1 つも進めずに** 従来経路へ戻る (logits はビット一致・
         /// attention の状態も 1 回ぶんだけ進む)。
         #[test]
