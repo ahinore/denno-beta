@@ -8122,16 +8122,20 @@ fn mix_split_gemm_kernel_is_wired() {
     );
 }
 
-/// ゲート (`DENNO_PF_MIX_SPLIT`) の既定は **off** (lab の結果で決める)。
+/// ゲート (`DENNO_PF_MIX_SPLIT`) の既定は **on** (task 198 で反転。明示 off は効く)。
 #[test]
-fn mix_split_gate_defaults_off() {
+fn mix_split_gate_defaults_on() {
     let i = CUDA_RS
         .find("pub(crate) fn mix_split_from_value")
         .expect("mix_split_from_value が無い");
     let body: String = CUDA_RS[i..].chars().take(300).collect();
     assert!(
-        body.contains("None => false,"),
-        "mix_split_from_value(None) が off でない: {body}"
+        body.contains("None => true,"),
+        "mix_split_from_value(None) が on でない: {body}"
+    );
+    assert!(
+        body.contains("\"off\"") && body.contains("\"false\"") && body.contains("\"no\""),
+        "明示 off の表が変わった: {body}"
     );
 }
 
@@ -8195,16 +8199,20 @@ fn mix_inj2_gemv_kernel_is_wired() {
     );
 }
 
-/// ゲート (`DENNO_PF_MIX_INJ2`) の既定は **off** (lab の結果で決める)。
+/// ゲート (`DENNO_PF_MIX_INJ2`) の既定は **on** (task 198 で反転。明示 off は効く)。
 #[test]
-fn mix_inj2_gate_defaults_off() {
+fn mix_inj2_gate_defaults_on() {
     let i = CUDA_RS
         .find("pub(crate) fn mix_inj2_from_value")
         .expect("mix_inj2_from_value が無い");
     let body: String = CUDA_RS[i..].chars().take(300).collect();
     assert!(
-        body.contains("None => false,"),
-        "mix_inj2_from_value(None) が off でない: {body}"
+        body.contains("None => true,"),
+        "mix_inj2_from_value(None) が on でない: {body}"
+    );
+    assert!(
+        body.contains("\"off\"") && body.contains("\"false\"") && body.contains("\"no\""),
+        "明示 off の表が変わった: {body}"
     );
 }
 
@@ -8215,9 +8223,9 @@ fn mix_inj2_gate_defaults_off() {
 const QWEN_SRC: &str = include_str!("../src/model/qwen4exp.rs");
 const MOE_SRC: &str = include_str!("../src/model/moe.rs");
 
-/// `DENNO_PF_PLE_FAST` / `DENNO_PF_ROUTER_FAST` の既定は **off**。
+/// `DENNO_PF_PLE_FAST` / `DENNO_PF_ROUTER_FAST` の既定は **on** (task 198 で反転)。
 #[test]
-fn pf195_gates_default_off() {
+fn pf195_gates_default_on() {
     for (src, name) in [
         (QWEN_SRC, "fn pf_ple_fast_from_value"),
         (QWEN_SRC, "fn pf_router_fast_from_value"),
@@ -8227,8 +8235,12 @@ fn pf195_gates_default_off() {
             .unwrap_or_else(|| panic!("{name} が無い"));
         let body: String = src[i..].chars().take(300).collect();
         assert!(
-            body.contains("None => false,"),
-            "{name} の既定が off でない: {body}"
+            body.contains("None => true,"),
+            "{name} の既定が on でない: {body}"
+        );
+        assert!(
+            body.contains("\"off\"") && body.contains("\"false\"") && body.contains("\"no\""),
+            "{name} の明示 off の表が変わった: {body}"
         );
     }
 }

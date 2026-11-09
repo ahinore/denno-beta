@@ -5142,15 +5142,17 @@ pub mod pf_ple_kprof {
 }
 
 /// task 195: `DENNO_PF_PLE_FAST` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+///
+/// **既定 on** (lab t195a/t195b: 単独で -1.4%、値はビット一致)。
 pub(crate) fn pf_ple_fast_from_value(v: Option<&str>) -> bool {
     match v {
-        None => false,
+        None => true,
         Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
     }
 }
 
 /// task 195: 平坦な res をその場で更新する PLE 注入を使うか
-/// (`DENNO_PF_PLE_FAST`。lab の結果で既定を決める)。
+/// (`DENNO_PF_PLE_FAST`。task 198 で既定 on)。
 pub(crate) fn pf_ple_fast_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| pf_ple_fast_from_value(std::env::var("DENNO_PF_PLE_FAST").ok().as_deref()))
@@ -11809,9 +11811,11 @@ pub(crate) fn pf_router_sm_on() -> bool {
 }
 
 /// task 195: `DENNO_PF_ROUTER_FAST` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+///
+/// **既定 on** (lab t195a: -1.1%/-0.5%、選択規則は従来と同一 = md5 SAME)。
 pub(crate) fn pf_router_fast_from_value(v: Option<&str>) -> bool {
     match v {
-        None => false,
+        None => true,
         Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
     }
 }
@@ -11819,7 +11823,7 @@ pub(crate) fn pf_router_fast_from_value(v: Option<&str>) -> bool {
 /// task 195: prefill router の top-k を挿入法で回す (`DENNO_PF_ROUTER_FAST`)。
 ///
 /// 選択規則は従来と同一なので値はビット一致する (変わるのは比較の回数だけ)。
-/// 既定は lab の結果で決める。
+/// task 198 で既定 on。
 pub(crate) fn pf_router_fast_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -19663,11 +19667,11 @@ mod tests {
             }
         }
 
-        /// task 195: 新しいゲートの真理値表 (未設定は既定 off)。
+        /// task 195: 新しいゲートの真理値表 (task 198 で未設定は既定 on)。
         #[test]
         fn pf195_gate_truth_tables() {
-            assert!(!pf_ple_fast_from_value(None));
-            assert!(!pf_router_fast_from_value(None));
+            assert!(pf_ple_fast_from_value(None), "未設定は既定 on");
+            assert!(pf_router_fast_from_value(None), "未設定は既定 on");
             for v in ["0", "off", "false", "no", "", " off "] {
                 assert!(!pf_ple_fast_from_value(Some(v)), "{v:?} が on");
                 assert!(!pf_router_fast_from_value(Some(v)), "{v:?} が on");

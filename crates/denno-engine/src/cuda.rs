@@ -19743,14 +19743,16 @@ fn mix_split_kernels() -> Option<&'static MixSplitKernels> {
 }
 
 /// task 195: `DENNO_PF_MIX_SPLIT` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+///
+/// **既定 on** (lab t195a/t195b: 単独で -2.0%/-2.3%、4 ゲート同時で -6%)。
 pub(crate) fn mix_split_from_value(v: Option<&str>) -> bool {
     match v {
-        None => false,
+        None => true,
         Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
     }
 }
 
-/// 新しい n 分割 GEMM を使うか (`DENNO_PF_MIX_SPLIT`。lab の結果で既定を決める)。
+/// 新しい n 分割 GEMM を使うか (`DENNO_PF_MIX_SPLIT`。task 198 で既定 on)。
 pub(crate) fn mix_split_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| mix_split_from_value(std::env::var("DENNO_PF_MIX_SPLIT").ok().as_deref()))
@@ -19839,14 +19841,16 @@ fn mix_inj2_kernels() -> Option<&'static MixInj2Kernels> {
 }
 
 /// task 195: `DENNO_PF_MIX_INJ2` の解釈 (純関数)。`0`/`off`/`false`/`no`/空だけが off。
+///
+/// **既定 on** (lab t195a: -2.4%/-1.8%。丸め順が変わる = md5 DIFF はこのゲート由来)。
 pub(crate) fn mix_inj2_from_value(v: Option<&str>) -> bool {
     match v {
-        None => false,
+        None => true,
         Some(s) => !matches!(s.trim(), "0" | "off" | "false" | "no" | ""),
     }
 }
 
-/// 新しい inject GEMV (k 分割) を使うか (`DENNO_PF_MIX_INJ2`。lab で既定を決める)。
+/// 新しい inject GEMV (k 分割) を使うか (`DENNO_PF_MIX_INJ2`。task 198 で既定 on)。
 pub(crate) fn mix_inj2_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| mix_inj2_from_value(std::env::var("DENNO_PF_MIX_INJ2").ok().as_deref()))
@@ -19866,7 +19870,10 @@ mod mix_split_inj2_tests {
 
     #[test]
     fn mix_split_gate_truth_table() {
-        assert!(!mix_split_from_value(None), "未設定は既定 off");
+        assert!(
+            mix_split_from_value(None),
+            "未設定は既定 on (task 198 で反転。明示 off は下の表)"
+        );
         for v in ["0", "off", "false", "no", "", " off "] {
             assert!(!mix_split_from_value(Some(v)), "{v:?} が on になった");
         }
@@ -19892,7 +19899,10 @@ mod mix_split_inj2_tests {
 
     #[test]
     fn mix_inj2_gate_truth_table() {
-        assert!(!mix_inj2_from_value(None), "未設定は既定 off");
+        assert!(
+            mix_inj2_from_value(None),
+            "未設定は既定 on (task 198 で反転。明示 off は下の表)"
+        );
         for v in ["0", "off", "false", "no", "", " off "] {
             assert!(!mix_inj2_from_value(Some(v)), "{v:?} が on になった");
         }
