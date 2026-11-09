@@ -1623,17 +1623,20 @@ pub(crate) mod dec_kprof {
                 assert!(parse_gdn_dec_gemv_q5k(raw), "q5k raw={raw:?}");
                 assert!(parse_mix_dec_fold(raw), "fold raw={raw:?}");
                 assert!(dec_full_dev::parse_full_dec_fast(raw), "fast raw={raw:?}");
+                assert!(parse_mix_dec_upw(raw), "upw raw={raw:?}");
             }
             for raw in [Some("0"), Some("off"), Some("false"), Some("no")] {
                 assert!(!parse_gdn_dec_gemv_q5k(raw), "q5k raw={raw:?}");
                 assert!(!parse_mix_dec_fold(raw), "fold raw={raw:?}");
                 assert!(!dec_full_dev::parse_full_dec_fast(raw), "fast raw={raw:?}");
+                assert!(!parse_mix_dec_upw(raw), "upw raw={raw:?}");
             }
             // 大小文字と前後の空白は無視する。
             for raw in [Some("OFF"), Some(" Off "), Some("NO")] {
                 assert!(!parse_gdn_dec_gemv_q5k(raw), "q5k raw={raw:?}");
                 assert!(!parse_mix_dec_fold(raw), "fold raw={raw:?}");
                 assert!(!dec_full_dev::parse_full_dec_fast(raw), "fast raw={raw:?}");
+                assert!(!parse_mix_dec_upw(raw), "upw raw={raw:?}");
             }
             // task 192: router early は lab t192a で +0.0% だったので **既定 off**。
             for raw in [None, Some(""), Some("0"), Some("off"), Some("false"), Some("no"), Some("x")] {
@@ -23062,6 +23065,23 @@ fn parse_mix_dec_fold(raw: Option<&str>) -> bool {
     )
 }
 
+/// `DENNO_MIX_DEC_UPW` の解釈 (純関数)。
+///
+/// mix の up 投影を 1 warp = 1 行の版で回すか。既定 on。明示的な偽値だけ off。
+/// fold (`DENNO_MIX_DEC_FOLD`) とは独立に切れる (別の cond で測るため)。
+fn parse_mix_dec_upw(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+/// up を 1 warp = 1 行の版で回すか (`DENNO_MIX_DEC_UPW`)。
+fn mix_dec_upw_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_mix_dec_upw(std::env::var("DENNO_MIX_DEC_UPW").ok().as_deref()))
+}
+
 /// hc 方向を畳んだ norm+inject を使うか (`DENNO_MIX_DEC_FOLD`)。
 fn mix_dec_fold_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -23352,7 +23372,7 @@ pub fn maybe_gpu_mix_bf16_chain3_into(
     let up_reduce = mix_up_reduce_enabled();
     // task 192: `DENNO_MIX_DEC_FOLD` では up を 1 warp = 1 行の版で回す
     // (k が 8 の倍数のときだけ。形が違えば従来カーネルへ)。
-    let up_fast = if mix_dec_fold_on() && up_reduce && k2 % 8 == 0 {
+    let up_fast = if mix_dec_upw_on() && up_reduce && k2 % 8 == 0 {
         mix_up_kernels().map(|k| k.f)
     } else {
         None

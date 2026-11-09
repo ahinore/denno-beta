@@ -8287,10 +8287,17 @@ const MIX_UP_SRC: &str = include_str!("../kernels/kernels_mix_up.cu");
 #[test]
 fn mix_up_warp_per_row_kernel_is_wired() {
     let p = kernel_params(MIX_UP_SRC, "dno_mix_up_bf16");
+    // **先頭が入力 x、次が重み** (既存 dno_matvec_bf16_r と同じ並び)。lab t192b で
+    // ここを (w, x, ...) にしていて、重みを入力として読む E700 を出した。
     assert_eq!(
         p,
-        vec!["w", "x", "out", "k", "n"],
-        "dno_mix_up_bf16 の引数が従来 (w, x, out, k, n) と違う: {p:?}"
+        vec!["x", "w", "out", "k", "n"],
+        "dno_mix_up_bf16 の引数が (x, w, out, k, n) と違う: {p:?}"
+    );
+    let launch = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
+    assert!(
+        launch.contains("let (mut ph2, mut pw2, mut po2) = (dlo.ptr(), wp2, dout.ptr());"),
+        "up の起動が (入力, 重み, 出力) の順でない"
     );
     assert!(
         MIX_UP_SRC.contains("const int row = blockIdx.x * DNO_MIXUP_WARPS + warp;"),
@@ -8329,8 +8336,8 @@ fn mix_up_warp_per_row_kernel_is_wired() {
     );
     let body = fn_body(CUDA_RS, "pub fn maybe_gpu_mix_bf16_chain3_into(");
     assert!(
-        body.contains("mix_dec_fold_on() && up_reduce && k2 % 8 == 0"),
-        "up 版の門番 (fold / k % 8) が無い"
+        body.contains("mix_dec_upw_on() && up_reduce && k2 % 8 == 0"),
+        "up 版の門番 (upw / k % 8) が無い"
     );
     assert!(
         body.contains("n2.div_ceil(MIX_UP_ROWS) as u32"),

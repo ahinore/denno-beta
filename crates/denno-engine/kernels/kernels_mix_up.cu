@@ -26,11 +26,13 @@ __device__ __forceinline__ float dno_mixup_bf16(unsigned int h)
 // ---------------------------------------------------------------------------
 // out[r] = Σ_i w[r][i] * x[i]   (w は BF16 の生バイト [n][k]、行優先)
 //
+// **引数の並びは既存の `dno_matvec_bf16_r(h, w, out, k, n)` と同じ**
+// (先頭が入力 x、次が重み)。ホストの起動コードをそのまま使うため。
 // grid = ceil(n / 8)、block = 256。k は 8 の倍数であること (ホストが門番)。
 // ---------------------------------------------------------------------------
 extern "C" __global__ void dno_mix_up_bf16(
-    const unsigned char* __restrict__ w,  // [n][k] BF16
     const float* __restrict__ x,          // [k]
+    const unsigned char* __restrict__ w,  // [n][k] BF16
     float* __restrict__ out,              // [n]
     int k, int n)
 {
