@@ -126,17 +126,25 @@ pub fn iq_gpu_enabled() -> bool {
     *ON.get_or_init(|| iq_gpu_from_value(std::env::var(EXPERT_IQ_GPU_ENV).ok().as_deref()))
 }
 
-/// task 190: `DENNO_EXP_IQ_V2=1` — 層一括 GEMV を v2 カーネル
-/// (`kernels_exp_iq_v2.ptx`) で回す。**既定 off** (lab の採否で切り替える)。
+/// task 190: `DENNO_EXP_IQ_V2` — 層一括 GEMV を v2 カーネル
+/// (`kernels_exp_iq_v2.ptx`) で回す。**既定 on** (lab t190c で採否 yes。
+/// decode 短/3.9k/14k で -4.3〜-4.8%、prefill ±1%、md5 SAME)。
 ///
 /// v2 は v1 と同じ segment 表・同じ起動形で、中の実装だけが違う
 /// (ベクタロード / 次ブロックの先読み / アキュムレータ 4 本 / 表を shared へ /
 /// IQ4_NL・Q2_0 のレーン分割)。PTX が無いときは v1 へ落ちる (fail closed)。
+/// 明示的な偽値 `0` / `off` / `false` / `no` だけ切る。
 pub const EXPERT_IQ_V2_ENV: &str = "DENNO_EXP_IQ_V2";
 
-/// [`EXPERT_IQ_V2_ENV`] の解釈 (純関数)。
+/// [`EXPERT_IQ_V2_ENV`] の解釈 (純関数)。既定 on。
 pub fn iq_v2_from_value(v: Option<&str>) -> bool {
-    crate::model::expert_vram::flag_on(v)
+    match v {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
 }
 
 /// v2 カーネルを使うか (プロセスで 1 回だけ env を読む)。
@@ -850,15 +858,18 @@ mod tests {
         assert_eq!(count(SILU_KERNEL), Some(4), "{SILU_KERNEL} の引数の数");
     }
 
-    /// task 190: v2 ゲートは既定 off (`DENNO_EXP_IQ_V2`)。PTX があれば
-    /// 引数の数も v1 と同じ 8 / silu は 4 であることを固定する。
+    /// task 190: v2 ゲートは**既定 on** (`DENNO_EXP_IQ_V2`、lab t190c で採用)。
+    /// PTX があれば引数の数も v1 と同じ 8 / silu は 4 であることを固定する。
     #[test]
     fn v2_gate_and_ptx_params() {
-        assert!(!iq_v2_from_value(None));
-        assert!(!iq_v2_from_value(Some("0")));
-        assert!(!iq_v2_from_value(Some("off")));
+        assert!(iq_v2_from_value(None));
         assert!(iq_v2_from_value(Some("1")));
         assert!(iq_v2_from_value(Some("on")));
+        assert!(iq_v2_from_value(Some(" ON ")));
+        assert!(!iq_v2_from_value(Some("0")));
+        assert!(!iq_v2_from_value(Some("off")));
+        assert!(!iq_v2_from_value(Some("false")));
+        assert!(!iq_v2_from_value(Some("no")));
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
         let Ok(ptx) = std::fs::read_to_string(dir.join("kernels_exp_iq_v2.ptx")) else {
             return;
